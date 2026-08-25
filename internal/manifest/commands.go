@@ -5,16 +5,20 @@ import "github.com/cozy-creator/cozy-creator-v2/internal/exit"
 // FoundationTokens are the capability tokens this binary's CLI foundation carries,
 // independent of any one command. Scripts gate on tokens, never version strings.
 var FoundationTokens = []string{
-	"cli.manifest",        // one declarative surface, startup self-checked
-	"cli.noninteractive",  // no interactive prompt anywhere; --yes gates destructive acts
-	"errors.typed",        // error(<name>) + remedy + next:
-	"exit.matrix.v1",      // the shared cozy-runtime exit matrix, 0-14
-	"install.generations", // installs are immutable generations + a pin per (endpoint, major)
-	"install.transaction", // generation insert and pin activation commit together
-	"output.fields",       // --fields
-	"output.full",         // --full
-	"output.json",         // --json
-	"records.libsql",      // ONE local Turso/libSQL lifecycle database
+	"cli.manifest",         // one declarative surface, startup self-checked
+	"cli.noninteractive",   // no interactive prompt anywhere; --yes gates destructive acts
+	"errors.typed",         // error(<name>) + remedy + next:
+	"exit.matrix.v1",       // the shared cozy-runtime exit matrix, 0-14
+	"install.generations",  // installs are immutable generations + a pin per (endpoint, major)
+	"install.transaction",  // generation insert and pin activation commit together
+	"output.fields",        // --fields
+	"output.full",          // --full
+	"output.json",          // --json
+	"records.libsql",       // ONE local Turso/libSQL lifecycle database
+	"service.lock",         // liveness is an OS advisory lock the owner holds
+	"worker.protocol.v1",   // the cozy.worker.v1 server over a unix socket
+	"coordinator.local",    // local dispatch: request -> attempt -> terminal -> visible output
+	"terminal.transaction", // terminal accepted + output visible commit together
 }
 
 var yesFlag = Flag{Name: "--yes", Summary: "confirm and execute; there is no prompt anywhere"}
@@ -32,16 +36,16 @@ var Commands = []Command{
 	},
 	{
 		Path: []string{"version"}, Group: "meta",
-		Summary: "tag + commit + protocol/contract versions",
-		MaxArgs: 0,
-		Exits:   []exit.Code{exit.OK},
+		Summary:    "tag + commit + protocol/contract versions",
+		MaxArgs:    0,
+		Exits:      []exit.Code{exit.OK},
 		Capability: "cmd.version", Status: Implemented, Handler: "version",
 	},
 	{
 		Path: []string{"capabilities"}, Group: "meta",
-		Summary: "feature tokens this binary supports — the one gate surface for scripts",
-		MaxArgs: 0,
-		Exits:   []exit.Code{exit.OK},
+		Summary:    "feature tokens this binary supports — the one gate surface for scripts",
+		MaxArgs:    0,
+		Exits:      []exit.Code{exit.OK},
 		Capability: "cmd.capabilities", Status: Implemented, Handler: "capabilities",
 	},
 	{
@@ -59,7 +63,7 @@ var Commands = []Command{
 		Capability: "cmd.help", Status: Implemented, Handler: "help",
 	},
 
-	// ---- service (cl-010) ----
+	// ---- service (cl-001: the LocalService's own lifecycle) ----
 	{
 		Path: []string{"up"}, Group: "service",
 		Summary: "start the one LocalService (foreground; -d detaches)",
@@ -69,17 +73,17 @@ var Commands = []Command{
 			{Name: "--open", Summary: "open the stub UI page with the per-launch token"},
 			{Name: "--yield", Arg: "<smart|always|never>", Summary: "GPU yield policy (default smart)"},
 		},
-		MaxArgs: 0,
-		Exits:   []exit.Code{exit.OK, exit.Conflict},
-		Capability: "cmd.up", Status: Planned, Issue: "cl-010",
+		MaxArgs:    0,
+		Exits:      []exit.Code{exit.OK, exit.Conflict},
+		Capability: "cmd.up", Status: Implemented, Handler: "up",
 	},
 	{
 		Path: []string{"down"}, Group: "service",
-		Summary: "stop the LocalService, draining endpoint processes",
-		Flags:   []Flag{{Name: "--timeout", Arg: "<dur>", Summary: "drain bound (default 30s)"}},
-		MaxArgs: 0,
-		Exits:   []exit.Code{exit.OK},
-		Capability: "cmd.down", Status: Planned, Issue: "cl-010",
+		Summary:    "stop the LocalService, draining endpoint processes",
+		Flags:      []Flag{{Name: "--timeout", Arg: "<dur>", Summary: "drain bound (default 30s)"}},
+		MaxArgs:    0,
+		Exits:      []exit.Code{exit.OK},
+		Capability: "cmd.down", Status: Implemented, Handler: "down",
 	},
 
 	// ---- endpoints (cl-009) ----
@@ -101,33 +105,33 @@ var Commands = []Command{
 	},
 	{
 		Path: []string{"ls"}, Group: "endpoints",
-		Summary: "installed endpoints: pin, version, disk (read from the install record)",
-		MaxArgs: 0,
-		Exits:   []exit.Code{exit.OK, exit.Usage},
+		Summary:    "installed endpoints: pin, version, disk (read from the install record)",
+		MaxArgs:    0,
+		Exits:      []exit.Code{exit.OK, exit.Usage},
 		Capability: "cmd.ls", Status: Implemented, Handler: "ls",
 	},
 	{
 		Path: []string{"rm"}, Group: "endpoints",
 		Summary: "remove an install (venv + pin); the generation record stays until gc",
 		Args:    "<org/endpoint[@vN]> …", MinArgs: 1, MaxArgs: -1,
-		Flags:   []Flag{yesFlag},
-		Exits:   []exit.Code{exit.OK, exit.Usage, exit.Confirm, exit.Conflict},
+		Flags:      []Flag{yesFlag},
+		Exits:      []exit.Code{exit.OK, exit.Usage, exit.Confirm, exit.Conflict},
 		Capability: "cmd.rm", Destructive: true, Status: Implemented, Handler: "rm",
 	},
 	{
 		Path: []string{"gc"}, Group: "endpoints",
-		Summary: "without --yes the reclaim plan (a read); with --yes it executes",
-		Flags:   []Flag{yesFlag},
-		MaxArgs: 0,
-		Exits:   []exit.Code{exit.OK, exit.Conflict},
+		Summary:    "without --yes the reclaim plan (a read); with --yes it executes",
+		Flags:      []Flag{yesFlag},
+		MaxArgs:    0,
+		Exits:      []exit.Code{exit.OK, exit.Conflict},
 		Capability: "cmd.gc", PlanFirst: true, Status: Implemented, Handler: "gc",
 	},
 	{
 		Path: []string{"start"}, Group: "endpoints",
 		Summary: "lifecycle/prewarm: make an endpoint worker resident (never a second invoke path)",
 		Args:    "<org/endpoint[@vN]>", MinArgs: 1, MaxArgs: 1,
-		Flags:   []Flag{{Name: "--detach", Short: "-d", Summary: "leave it warm in the background"}},
-		Exits:   []exit.Code{exit.OK, exit.NotFound, exit.Unavailable},
+		Flags:      []Flag{{Name: "--detach", Short: "-d", Summary: "leave it warm in the background"}},
+		Exits:      []exit.Code{exit.OK, exit.NotFound, exit.Unavailable},
 		Capability: "cmd.start", NeedsServer: true, Status: Planned, Issue: "cl-010",
 	},
 	{
@@ -171,21 +175,21 @@ var Commands = []Command{
 			{Name: "--local", Summary: "run on this host (default)"},
 			{Name: "--cloud", Summary: "submit to tensorhub under the account"},
 		},
-		Exits:       []exit.Code{exit.OK, exit.Validation, exit.NotFound, exit.Credential, exit.Structural, exit.OfflineMiss, exit.Unavailable, exit.Deadline, exit.Failed, exit.Canceled, exit.Capacity},
-		Capability:  "cmd.run", NeedsServer: true, Status: Planned, Issue: "cl-010",
+		Exits:      []exit.Code{exit.OK, exit.Validation, exit.NotFound, exit.Credential, exit.Structural, exit.OfflineMiss, exit.Unavailable, exit.Deadline, exit.Failed, exit.Canceled, exit.Capacity},
+		Capability: "cmd.run", NeedsServer: true, Status: Planned, Issue: "cl-010",
 	},
 	{
 		Path: []string{"describe"}, Group: "invocation",
 		Summary: "the endpoint descriptor: installed delegates to the runtime, else the catalog",
 		Args:    "<org/endpoint[@vN][/function]>", MinArgs: 1, MaxArgs: 1,
-		Exits:   []exit.Code{exit.OK, exit.NotFound, exit.Unavailable},
+		Exits:      []exit.Code{exit.OK, exit.NotFound, exit.Unavailable},
 		Capability: "cmd.describe", NeedsServer: true, Status: Planned, Issue: "cl-010",
 	},
 	{
 		Path: []string{"doctor"}, Group: "invocation",
-		Summary: "host facts plus per-installed-endpoint fit verdicts",
-		MaxArgs: 0,
-		Exits:   []exit.Code{exit.OK, exit.Unavailable},
+		Summary:    "host facts plus per-installed-endpoint fit verdicts",
+		MaxArgs:    0,
+		Exits:      []exit.Code{exit.OK, exit.Unavailable},
 		Capability: "cmd.doctor", NeedsServer: true, Status: Planned, Issue: "cl-010",
 	},
 	{
@@ -203,8 +207,8 @@ var Commands = []Command{
 		Path: []string{"search"}, Group: "invocation",
 		Summary: "hub catalog discovery (public reads need no login)",
 		Args:    "<query>", MinArgs: 1, MaxArgs: -1,
-		Flags:   []Flag{{Name: "--kind", Arg: "<endpoint|model>", Summary: "restrict the kind"}},
-		Exits:   []exit.Code{exit.OK, exit.Unavailable},
+		Flags:      []Flag{{Name: "--kind", Arg: "<endpoint|model>", Summary: "restrict the kind"}},
+		Exits:      []exit.Code{exit.OK, exit.Unavailable},
 		Capability: "cmd.search", Status: Planned, Issue: "cl-011",
 	},
 
@@ -228,7 +232,7 @@ var Commands = []Command{
 		Path: []string{"job", "status"}, Group: "jobs",
 		Summary: "state, progress, elapsed, the running bill where a rate exists, terminal",
 		Args:    "<job-id>", MinArgs: 1, MaxArgs: 1,
-		Exits:   []exit.Code{exit.OK, exit.NotFound, exit.Unavailable},
+		Exits:      []exit.Code{exit.OK, exit.NotFound, exit.Unavailable},
 		Capability: "cmd.job.status", NeedsServer: true, Status: Planned, Issue: "cl-004",
 	},
 	{
@@ -238,22 +242,22 @@ var Commands = []Command{
 			{Name: "--state", Arg: "<s>", Summary: "filter by state"},
 			{Name: "--endpoint", Arg: "<e>", Summary: "filter by endpoint"},
 		},
-		MaxArgs: 0,
-		Exits:   []exit.Code{exit.OK, exit.Unavailable},
+		MaxArgs:    0,
+		Exits:      []exit.Code{exit.OK, exit.Unavailable},
 		Capability: "cmd.job.ls", NeedsServer: true, Status: Planned, Issue: "cl-004",
 	},
 	{
 		Path: []string{"job", "follow"}, Group: "jobs",
 		Summary: "attach to the progress/metric stream; exits with the terminal mapping",
 		Args:    "<job-id>", MinArgs: 1, MaxArgs: 1,
-		Exits:   []exit.Code{exit.OK, exit.NotFound, exit.Unavailable, exit.Deadline, exit.Failed, exit.Canceled},
+		Exits:      []exit.Code{exit.OK, exit.NotFound, exit.Unavailable, exit.Deadline, exit.Failed, exit.Canceled},
 		Capability: "cmd.job.follow", NeedsServer: true, Terminals: true, Status: Planned, Issue: "cl-004",
 	},
 	{
 		Path: []string{"job", "cancel"}, Group: "jobs",
 		Summary: "request cancel and block until the canceled terminal",
 		Args:    "<job-id>", MinArgs: 1, MaxArgs: 1,
-		Exits:   []exit.Code{exit.OK, exit.NotFound, exit.Unavailable},
+		Exits:      []exit.Code{exit.OK, exit.NotFound, exit.Unavailable},
 		Capability: "cmd.job.cancel", NeedsServer: true, Status: Planned, Issue: "cl-004",
 	},
 
@@ -275,30 +279,30 @@ var Commands = []Command{
 		Path: []string{"push"}, Group: "transfer",
 		Summary: "declare-first upload of models, LoRAs and datasets",
 		Args:    "<org/repo> <path|local-ref> …", MinArgs: 2, MaxArgs: -1,
-		Flags:   []Flag{{Name: "--dry-run", Summary: "print the transfer plan"}},
-		Exits:   []exit.Code{exit.OK, exit.NotFound, exit.Credential},
+		Flags:      []Flag{{Name: "--dry-run", Summary: "print the transfer plan"}},
+		Exits:      []exit.Code{exit.OK, exit.NotFound, exit.Credential},
 		Capability: "cmd.push", NeedsServer: true, Status: Planned, Issue: "cl-012",
 	},
 	{
 		Path: []string{"datasets", "push"}, Group: "transfer",
 		Summary: "the dataset dialect of push",
 		Args:    "<path> <org/repo>", MinArgs: 2, MaxArgs: 2,
-		Exits:   []exit.Code{exit.OK, exit.NotFound, exit.Credential},
+		Exits:      []exit.Code{exit.OK, exit.NotFound, exit.Credential},
 		Capability: "cmd.datasets.push", NeedsServer: true, Status: Planned, Issue: "cl-012",
 	},
 	{
 		Path: []string{"datasets", "pull"}, Group: "transfer",
 		Summary: "the dataset dialect of pull; --out materializes a tree from the CAS",
 		Args:    "<org/repo[@release|@digest]>", MinArgs: 1, MaxArgs: 1,
-		Flags:   []Flag{{Name: "--out", Arg: "<dir>", Summary: "materialize here"}},
-		Exits:   []exit.Code{exit.OK, exit.NotFound, exit.Credential},
+		Flags:      []Flag{{Name: "--out", Arg: "<dir>", Summary: "materialize here"}},
+		Exits:      []exit.Code{exit.OK, exit.NotFound, exit.Credential},
 		Capability: "cmd.datasets.pull", NeedsServer: true, Status: Planned, Issue: "cl-012",
 	},
 	{
 		Path: []string{"export"}, Group: "transfer",
 		Summary: "authorized local checkpoint export through the coordinator surface",
 		Args:    "<ref>", MinArgs: 1, MaxArgs: 1,
-		Exits:   []exit.Code{exit.OK, exit.NotFound, exit.Unavailable},
+		Exits:      []exit.Code{exit.OK, exit.NotFound, exit.Unavailable},
 		Capability: "cmd.export", NeedsServer: true, Status: Planned, Issue: "cl-008",
 	},
 	{
@@ -316,8 +320,8 @@ var Commands = []Command{
 		Path: []string{"promote"}, Group: "transfer",
 		Summary: "move the serving pointer; rollback is promote with an older release",
 		Args:    "<org/endpoint> <release-id>", MinArgs: 2, MaxArgs: 2,
-		Flags:   []Flag{{Name: "--serve", Arg: "<major>", Summary: "required; no default"}},
-		Exits:   []exit.Code{exit.OK, exit.Usage, exit.NotFound, exit.Credential},
+		Flags:      []Flag{{Name: "--serve", Arg: "<major>", Summary: "required; no default"}},
+		Exits:      []exit.Code{exit.OK, exit.Usage, exit.NotFound, exit.Credential},
 		Capability: "cmd.promote", Status: Planned, Issue: "cl-012",
 	},
 
@@ -336,9 +340,9 @@ var Commands = []Command{
 	},
 	{
 		Path: []string{"login", "ls"}, Group: "account",
-		Summary: "credential rows: source, kind, state",
-		MaxArgs: 0,
-		Exits:   []exit.Code{exit.OK},
+		Summary:    "credential rows: source, kind, state",
+		MaxArgs:    0,
+		Exits:      []exit.Code{exit.OK},
 		Capability: "cmd.login.ls", Status: Planned, Issue: "cl-011",
 	},
 	{

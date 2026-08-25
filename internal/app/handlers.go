@@ -9,7 +9,9 @@ import (
 	"strings"
 
 	"github.com/cozy-creator/cozy-creator-v2/internal/exit"
+	"github.com/cozy-creator/cozy-creator-v2/internal/home"
 	"github.com/cozy-creator/cozy-creator-v2/internal/manifest"
+	"github.com/cozy-creator/cozy-creator-v2/internal/records"
 	"github.com/cozy-creator/cozy-creator-v2/internal/render"
 	"github.com/cozy-creator/cozy-creator-v2/internal/service"
 )
@@ -37,6 +39,8 @@ var handlers = map[string]Handler{
 	"ls":           handleLs,
 	"rm":           handleRm,
 	"gc":           handleGC,
+	"up":           handleUp,
+	"down":         handleDown,
 }
 
 func handlerNames() []string {
@@ -70,7 +74,28 @@ func handleStatus(ctx *Context) *exit.Error {
 		},
 	}
 	if st.Up {
-		rec.Notes = []string{"endpoint, worker and job listings arrive with the local client API (cl-006)"}
+		// The live facts come from the ONE authority, read directly. A second reader of
+		// the same rows is a read, never a second store.
+		if l, e := home.Open(ctx.Cfg.Home); e == nil {
+			if store, e := records.Open(l.DB); e == nil {
+				defer store.Close()
+				if counts, e := store.Counts(); e == nil {
+					rec.Fields = []render.Field{
+						{K: "service", V: "up"},
+						{K: "address", V: st.Addr},
+						{K: "socket", V: st.Socket},
+						{K: "pid", V: st.PID},
+						{K: "workers", V: counts["workers"]},
+						{K: "requests", V: counts["requests"]},
+						{K: "attempts", V: counts["attempts"]},
+						{K: "live_attempts", V: counts["live"]},
+						{K: "recovered_open", V: counts["recovered"]},
+						{K: "outputs", V: counts["outputs"]},
+					}
+				}
+			}
+		}
+		rec.Notes = []string{"endpoint and job listings arrive with the local client API (cl-006)"}
 		rec.Next = []string{"cozy commands"}
 	} else {
 		rec.Notes = []string{"installed endpoints, workers and jobs are readable only while the service runs"}

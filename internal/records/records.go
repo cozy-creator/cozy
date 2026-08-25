@@ -62,7 +62,7 @@ type Store struct{ db *sql.DB }
 
 // schema is applied one statement at a time: the driver executes a single
 // statement per call.
-var schema = []string{`
+var schema = append([]string{`
 CREATE TABLE IF NOT EXISTS install_generations (
   id            TEXT PRIMARY KEY,
   endpoint      TEXT    NOT NULL,
@@ -92,7 +92,7 @@ CREATE TABLE IF NOT EXISTS pins (
   generation   TEXT    NOT NULL REFERENCES install_generations(id),
   activated_at TEXT    NOT NULL,
   PRIMARY KEY (endpoint, major)
-)`}
+)`}, coordSchema...)
 
 func Open(path string) (*Store, *exit.Error) {
 	db, err := sql.Open("libsql", "file:"+path)
