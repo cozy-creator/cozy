@@ -95,6 +95,16 @@
 //!   tfs verify-compat <request> <response>   the hermetic verifier: one file in, one out
 //!   tfs verify-consume <request> <response>  the hub's side; partial output mints nothing
 //!
+//! The cloud publish protocol (tfs-017), GREEN branch. Core links no HTTP: these emit what
+//! a coordinator must sign and consume what the backend reported.
+//! Flags: --out <f> --expires-at <t> --length <n>
+//!
+//!   tfs cloud closure <root> <snap> <session>   DECLARE FIRST: the exact object set
+//!   tfs cloud grant <closure> <object-id>       both conditions, derived, not optional
+//!   tfs cloud verified <grant> <version> <etag> <checksum-b64>
+//!   tfs cloud conflict <grant> <resident-checksum>   honest duplicate, or quarantine
+//!   tfs cloud publish <closure> <facts-dir>     the atomic root, over facts only
+//!
 //! Roots, holds and local GC (tfs-006). Flags: --kind <k> --expect-generation <n>
 //! --hub-published --source-url <u> --hold-secs <s> --ready <p> --limit <n> --dry-run
 //! --allow-empty --free <b> --reserve <b>
@@ -234,6 +244,11 @@ fn main() -> ExitCode {
         ["gc", "refs", r] => roots::cmd_gc(Path::new(r), "refs", &flags),
         ["gc", "pressure", r] => roots::cmd_gc(Path::new(r), "pressure", &flags),
         ["gc", "arms", r] => roots::cmd_arms(Path::new(r)),
+        ["cloud", "closure", r, h, s] => cloud::cmd_closure(Path::new(r), h, s, &flags),
+        ["cloud", "grant", c, i] => cloud::cmd_grant(Path::new(c), i, &flags),
+        ["cloud", "verified", g, v, e, c] => cloud::cmd_verified(Path::new(g), v, e, c, &flags),
+        ["cloud", "conflict", g, r] => cloud::cmd_conflict(Path::new(g), r),
+        ["cloud", "publish", c, d] => cloud::cmd_publish(Path::new(c), Path::new(d), &flags),
         ["compat", "import", r] => layout::cmd_import(Path::new(r), &flags),
         ["compat", "topology", r, h] => layout::cmd_topology(Path::new(r), h, &flags),
         ["compat", "check", c, h] => layout::cmd_check(Path::new(c), Path::new(h), &flags),
@@ -309,6 +324,7 @@ macro_rules! ok {
 }
 
 mod ckpt;
+mod cloud;
 mod conform;
 mod fixtures;
 mod ingest;

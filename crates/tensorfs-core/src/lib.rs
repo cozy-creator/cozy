@@ -7,6 +7,7 @@ pub mod b64;
 pub mod canon;
 pub mod capability;
 pub mod checkpoint;
+pub mod cloud;
 pub mod compat;
 pub mod corpus;
 pub mod dtype;

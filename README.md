@@ -171,6 +171,41 @@ documents and says on every run that the logical facts are real and the part obj
 placeholders. No weight bytes transit this machine, and nothing below the topology layer is
 read by the decision.
 
+## cloud publish (tfs-017)
+
+The invariant is no-corrupt/no-clobber, and HOW it is enforced was a qualification outcome
+rather than an assumption. The gate ran first, against live R2, and came back **GREEN
+(10/10)**: a SigV4-signed `x-amz-checksum-sha256` binds the body to its digest — a wrong
+body is `400 BadDigest`, a header the client strips is `403 SignatureDoesNotMatch` — and
+`If-None-Match: *` refuses replacement with `412 PreconditionFailed`, eight concurrent
+same-key writers producing exactly one `200`. A 64 MiB segment goes in one conditional
+request, so multipart, the one surface with no conditional form, is unreachable by
+construction. The red arm is banked too: an UNCONDITIONAL same-key PUT really does replace
+verified bytes, which is why no such grant is representable here.
+
+So publish is `declare closure -> conditional checksummed PUTs at final keys ->
+verify-resident-on-conflict -> VerifiedObject facts -> atomic catalog-root publication`.
+**There is no staging namespace, staged-verifier pass or promotion copy** — that was the
+fallback for a RED gate, and a seventh fence keeps its vocabulary out of the tree.
+
+```bash
+tfs cloud closure <root> <snap> <session>       declare first: the exact object set
+tfs cloud grant <closure> <object-id>           both conditions, DERIVED, not optional
+tfs cloud verified <grant> <version> <etag> <checksum-b64>
+tfs cloud conflict <grant> <resident-checksum>  honest duplicate, or quarantine
+tfs cloud publish <closure> <facts-dir>         the atomic root, over facts only
+scripts/r2-qualify.py --env <f>                 the gate
+scripts/r2-qualify.py --env <f> --publish <store> <snap>   the race matrix, live
+```
+
+Core links no HTTP, no cloud SDK and no credentials — the coordinator executes the
+requests. What TensorFS owns is the SHAPE, and the shape is where the invariant is held:
+`PublishGrant` has no field for the conditions because they are derived from the digest, so
+an unconditional or unchecksummed final-key grant has no representation. The v1 ruling this
+reverses did not fail because someone forgot a flag; it failed because a flag existed.
+
+Verdicts and arms are frozen under `vectors/qualification/`.
+
 ## the Python facade (tfs-007)
 
 One wheel, abi3-py311, `py.typed`. The compiled half owns every byte-level fact; the Python

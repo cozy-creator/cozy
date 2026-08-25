@@ -1,0 +1,68 @@
+{
+ "bucket": "dataset-cas",
+ "prefix": "qualification/279ce299b8c8",
+ "endpoint_host": "327b4294d98bb480834acd2660b423d4.r2.cloudflarestorage.com",
+ "verdict": "GREEN",
+ "arms": [
+  {
+   "arm": "the declared body is accepted",
+   "ok": true,
+   "observed": 200,
+   "detail": ""
+  },
+  {
+   "arm": "a WRONG body under the same signed digest",
+   "ok": true,
+   "observed": 400,
+   "detail": "<?xml version=\"1.0\" encoding=\"UTF-8\"?><Error><Code>BadDigest</Code><Message>The SHA-256 checksum you specified did not m"
+  },
+  {
+   "arm": "the signed header STRIPPED by the client",
+   "ok": true,
+   "observed": 403,
+   "detail": "<?xml version=\"1.0\" encoding=\"UTF-8\"?><Error><Code>SignatureDoesNotMatch</Code><Message>The request signature we calcula"
+  },
+  {
+   "arm": "first conditional write of a fresh key",
+   "ok": true,
+   "observed": 200,
+   "detail": ""
+  },
+  {
+   "arm": "a second, DIFFERENT body at the same key",
+   "ok": true,
+   "observed": 412,
+   "detail": "<?xml version=\"1.0\" encoding=\"UTF-8\"?><Error><Code>PreconditionFailed</Code><Message>At least one of"
+  },
+  {
+   "arm": "exactly one of 8 concurrent writers wins",
+   "ok": true,
+   "observed": 1,
+   "detail": "codes [200, 412, 412, 412, 412, 412, 412, 412]"
+  },
+  {
+   "arm": "the winner's bytes are what is resident",
+   "ok": true,
+   "observed": true,
+   "detail": "20 B"
+  },
+  {
+   "arm": "an unconditional PUT REPLACES verified bytes",
+   "ok": true,
+   "observed": true,
+   "detail": "last-writer-wins, exactly as the P0 correction says"
+  },
+  {
+   "arm": "HEAD returns the resident object's sha256",
+   "ok": true,
+   "observed": "MjG1QoM7VsAlvmFxNNOPHjmIKQsH0CbNeLHT7GBiMbY=",
+   "detail": "so a losing publisher CONFIRMS rather than re-uploads"
+  },
+  {
+   "arm": "64 MiB conditional checksummed PUT",
+   "ok": true,
+   "observed": 200,
+   "detail": "67108864 B in one request; multipart is unreachable by construction"
+  }
+ ]
+}

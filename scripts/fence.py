@@ -134,6 +134,11 @@ CODEC_OWNERS = {
     "tensorfs.grade_decision/1": {"crates/tensorfs-core/src/grade.rs"},
     "tensorfs.verify_request/1": {"crates/tensorfs-core/src/verifier.rs"},
     "tensorfs.verify_response/1": {"crates/tensorfs-core/src/verifier.rs"},
+    # the cloud publish protocol (tfs-017)
+    "tensorfs.publish_closure/1": {"crates/tensorfs-core/src/cloud.rs"},
+    "tensorfs.publish_grant/1": {"crates/tensorfs-core/src/cloud.rs"},
+    "tensorfs.verified_object/1": {"crates/tensorfs-core/src/cloud.rs"},
+    "tensorfs.catalog_root/1": {"crates/tensorfs-core/src/cloud.rs"},
 }
 CODEC_MARKS = list(CODEC_OWNERS)
 GRAMMAR_TAGS = ["ceil_block", "elements_div", "ceil_div"]
@@ -389,6 +394,34 @@ def fence_grading():
     return bad, (f"{len(GRADE_VOCAB)} grade words confined to {len(GRADE_HOME)} files")
 
 
+# ------------------------------------------------- 7. the staged fallback stays unbuilt
+
+# tfs-017's fence. The gate came back GREEN against live R2, so publish writes CONDITIONAL
+# CHECKSUMMED PUTs at final keys and the 5-part staged protocol — session-scoped staging
+# keys, a staged-verifier pass, a promotion copy — is the fallback that was NOT built. A
+# staging namespace appearing later would be a second write path with a second set of
+# races, arriving without the qualification that would justify it.
+#
+# Re-arming is a code change here plus a RED gate to point at, which is the point.
+STAGING_VOCAB = ["staging_key", "staging_keys", "staging_namespace", "staged_verifier",
+                 "promotion_copy", "promote_staged", "stage_upload", "StagingKey",
+                 "StagedObject", "PromotionCopy"]
+
+
+def fence_staging():
+    bad = []
+    for p in sorted((ROOT / "crates").glob("**/*.rs")):
+        r = str(rel(p))
+        for i, s in code_lines(p.read_text(errors="ignore")):
+            if not s:
+                continue
+            for w in STAGING_VOCAB:
+                if re.search(r"(?<![\w])" + re.escape(w) + r"(?![\w])", s):
+                    bad.append(f"{r}:{i}: names staged-protocol vocabulary '{w}' — the "
+                               "qualification was GREEN, so the staged fallback is not built")
+    return bad, f"{len(STAGING_VOCAB)} staged-protocol words, none built"
+
+
 # ----------------------------------------------------------------------------
 
 def rel(p):
@@ -400,7 +433,8 @@ FENCES = [("forbidden dependencies", fence_dependencies),
           ("marshal-only facade", fence_facade),
           ("one codec, one evaluator", fence_one_codec),
           ("serve path, pinned buffers, one transform", fence_serve_path),
-          ("no grading below the hub", fence_grading)]
+          ("no grading below the hub", fence_grading),
+          ("the staged fallback stays unbuilt", fence_staging)]
 
 red = 0
 for title, fn in FENCES:
