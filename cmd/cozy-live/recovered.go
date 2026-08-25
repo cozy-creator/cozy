@@ -16,7 +16,7 @@ import (
 //
 // The kill is a real `kill -9` of the real supervisor mid-attempt. Nothing is planted.
 func sectionRecovered() {
-	idle := gpuUsedMiB()
+	idle := requireFreeGPU()
 	lv := hostCoordinator("recovered", true)
 	defer lv.close()
 
@@ -40,7 +40,7 @@ func sectionRecovered() {
 	// 48 denoising steps: long enough that a kill lands INSIDE the attempt rather than
 	// racing its end.
 	body := payload(map[string]any{"steps": 48, "latent": 64, "seed": 7})
-	sub := submissionKey(instance, planID, body, "idem-recovered")
+	sub := submissionKey(planID, body, "idem-recovered")
 	requestID, attempt, e := lv.c.Submit(sub)
 	if e != nil {
 		check("submit", false, briefly(e))
@@ -72,37 +72,35 @@ func sectionRecovered() {
 	check("nothing became visible", len(outs) == 0, fmt.Sprintf("%d output(s)", len(outs)))
 
 	head("the law: no next ordinal until the recovered attempt is closed")
-	// A spinner asks for the next ordinal as fast as it can, from BEFORE the restart
-	// until it succeeds. Every refusal it collects is the law being enforced under
-	// contention rather than in a quiet moment chosen by the harness.
+	// A spinner asks the coordinator's OWN ordinal gate for the next ordinal, as fast as
+	// it can, from BEFORE the restart. Every refusal it collects is the law being
+	// enforced under contention rather than in a quiet moment chosen by the harness.
 	var (
-		mu        sync.Mutex
-		refusals  []string
-		succeeded time.Time
-		nextAtt   uint64
-		stop      = make(chan struct{})
-		done      = make(chan struct{})
+		mu       sync.Mutex
+		refusals []string
+		lawSeen  time.Time
+		stop     = make(chan struct{})
 	)
 	go func() {
-		defer close(done)
 		for {
 			select {
 			case <-stop:
 				return
 			default:
 			}
-			_, att, e := lv.c.Submit(sub)
-			mu.Lock()
-			if e == nil {
-				succeeded, nextAtt = time.Now(), att
+			if _, e := lv.store.NextOrdinal(requestID); e != nil {
+				mu.Lock()
+				refusals = append(refusals, e.Message)
+				if strings.Contains(e.Message, "recovered attempt") && lawSeen.IsZero() {
+					lawSeen = time.Now()
+				}
 				mu.Unlock()
-				return
 			}
-			refusals = append(refusals, e.Message)
-			mu.Unlock()
-			time.Sleep(5 * time.Millisecond)
+			// No sleep: the recovered window is milliseconds wide, and a poll that
+			// pauses inside it observes nothing.
 		}
 	}()
+	defer close(stop)
 
 	restartAt := time.Now()
 	if _, e := lv.c.StartWorker(spec); e != nil {
@@ -125,39 +123,28 @@ func sectionRecovered() {
 	closeLine, ok := waitEvent(lv, "applied in", 180*time.Second)
 	check("the recovered attempt was closed by a journaled terminal", ok, trimLog(closeLine))
 
-	select {
-	case <-done:
-	case <-time.After(120 * time.Second):
-		close(stop)
-	}
 	mu.Lock()
-	sawLaw := false
-	for _, r := range refusals {
-		if strings.Contains(r, "recovered attempt") {
-			sawLaw = true
-		}
-	}
-	firstOrdinalAt, nextOrdinal, tries := succeeded, nextAtt, len(refusals)
+	sawLaw, tries, lawAt := !lawSeen.IsZero(), len(refusals), lawSeen
 	mu.Unlock()
-
+	when := "never"
+	if sawLaw {
+		when = ms(lawAt.Sub(restartAt)) + " after the restart"
+	}
 	check("a next ordinal was REFUSED while the recovered attempt was open", sawLaw,
-		fmt.Sprintf("%d refusals across %s of contention", tries,
-			ms(firstOrdinalAt.Sub(restartAt))))
-	check("the next ordinal was minted only AFTER the terminal closed it",
-		!firstOrdinalAt.IsZero() && nextOrdinal == attempt+1,
-		fmt.Sprintf("attempt %d, %s after the restart", nextOrdinal, ms(firstOrdinalAt.Sub(restartAt))))
+		fmt.Sprintf("%d refusals of the ordinal gate, the recovered one first seen %s", tries, when))
 	check("the coordinator's own log orders closure BEFORE the next dispatch",
-		orderedBefore(lv, "applied in", fmt.Sprintf("StartAttempt %s#%d", requestID, attempt+1)), "")
+		orderedBefore(lv, "applied in", fmt.Sprintf("StartAttempt %s#%d", requestID, attempt+1)),
+		"the requeue projection dispatches attempt 2 only after attempt 1's terminal committed")
 
-	head("attempt 2 runs to a visible output")
-	result, e := lv.c.Await(requestID, nextOrdinal, 180*time.Second)
+	head("the coordinator's own requeue projection runs attempt 2 to a visible output")
+	result, e := lv.c.AwaitSettled(requestID, 240*time.Second)
 	if e != nil {
-		check("attempt 2 terminal", false, briefly(e))
+		check("the request settled", false, briefly(e))
 		fmt.Println(tail(lv.c.WorkerLog(instance), 20))
 	} else {
-		check("attempt 2 succeeded", result.Status == "SUCCEEDED",
-			fmt.Sprintf("%s/%s", result.Status, result.Cause))
-		check("its output is visible, and it is the only one", len(result.Outputs) >= 1,
+		check("the request settled SUCCEEDED on its requeued ordinal", result.Status == "SUCCEEDED",
+			fmt.Sprintf("attempt %d, %s/%s", result.Attempt, result.Status, result.Cause))
+		check("its output is visible", len(result.Outputs) >= 1,
 			fmt.Sprintf("%d output(s)", len(result.Outputs)))
 	}
 	all, _ := lv.store.Attempts(requestID)
@@ -167,6 +154,9 @@ func sectionRecovered() {
 	}
 	check("the request's attempt history is exact: no duplicate, no silence",
 		len(all) == 2, strings.Join(states, " · "))
+	first, _ := lv.store.VisibleOutputsOf(requestID, int64(attempt))
+	check("the killed attempt published nothing, ever", len(first) == 0,
+		fmt.Sprintf("attempt %d: %d visible output(s)", attempt, len(first)))
 
 	head("scenario B: an output written under the grant, with no accepted terminal")
 	scenarioB(lv, instance, planID)
@@ -188,7 +178,7 @@ func sectionRecovered() {
 // terminal, in the same transaction, or never.
 func scenarioB(lv *live, instance, planID string) {
 	body := payload(map[string]any{"steps": 6, "latent": 64, "seed": 11})
-	sub := submissionKey(instance, planID, body, "idem-written-not-visible")
+	sub := submissionKey(planID, body, "idem-written-not-visible")
 	requestID, attempt, e := lv.c.Submit(sub)
 	if e != nil {
 		check("submit", false, briefly(e))
@@ -220,7 +210,7 @@ func scenarioB(lv *live, instance, planID string) {
 	}
 	check("the runtime wrote bytes under the grant, and the supervisor was killed at once",
 		size > 0, fmt.Sprintf("%d B at %s", size, path))
-	outs, _ := lv.store.VisibleOutputs(requestID)
+	outs, _ := lv.store.VisibleOutputsOf(requestID, int64(attempt))
 	check("those bytes are NOT a visible output", len(outs) == 0,
 		"the coordinator accepted no terminal for them")
 
@@ -244,7 +234,7 @@ func scenarioB(lv *live, instance, planID string) {
 		}
 		return false
 	}, 240*time.Second)
-	outs, _ = lv.store.VisibleOutputs(requestID)
+	outs, _ = lv.store.VisibleOutputsOf(requestID, int64(attempt))
 	switch status {
 	case "SUCCEEDED":
 		check("the journaled terminal replayed, and the bytes became visible WITH it",

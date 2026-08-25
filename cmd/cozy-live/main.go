@@ -149,6 +149,9 @@ func hostCoordinator(name string, fresh bool) *live {
 	c, e := coord.Open(coord.Options{
 		Cfg: cfg, Layout: l, Store: st, Socket: filepath.Join(root, "worker.sock"),
 		Yield: "smart", Log: logFile,
+		ImageDigest:  "sha256:" + strings.Repeat("11", 32),
+		ConfigDigest: "sha256:" + strings.Repeat("22", 32),
+		MaxOutputMiB: 8,
 	})
 	if e != nil {
 		must("coordinator", e)
@@ -189,15 +192,16 @@ func ms(d time.Duration) string { return fmt.Sprintf("%.1f ms", float64(d.Micros
 // section files read as prose rather than as a struct literal repeated five times.
 type coordSubmission = coord.Submission
 
-func submissionKey(instance, planID string, body []byte, idem string) coordSubmission {
+func submission(planID string, body []byte) coordSubmission {
+	return submissionKey(planID, body, "idem-"+fmt.Sprint(time.Now().UnixNano()))
+}
+
+func submissionKey(planID string, body []byte, idem string) coordSubmission {
 	return coordSubmission{
 		IdemKey: idem, Endpoint: "cozy/sdxl-unet", Entrypoint: "denoise",
-		InstanceID: instance, PlanID: planID, Payload: body,
+		PlanID: planID, Payload: body,
 		// One destination per RESULT FIELD PATH. `denoise` returns `image`.
-		Outputs:      []string{"image"},
-		ImageDigest:  "sha256:" + strings.Repeat("11", 32),
-		ConfigDigest: "sha256:" + strings.Repeat("22", 32),
-		MaxOutputMiB: 8,
+		Outputs: []string{"image"},
 	}
 }
 

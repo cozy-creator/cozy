@@ -46,6 +46,15 @@ type Options struct {
 	// Yield is the GPU yield policy: smart | always | never.
 	Yield string
 	Log   io.Writer
+
+	// ImageDigest and ConfigDigest ride INSIDE every ExecutionSpec document: the exact
+	// execution environment (class b) and the evaluated-config document's identity
+	// (class a, cr-003's). They are frozen per service, never per request — a request
+	// cannot choose the environment it is admitted under.
+	ImageDigest  string
+	ConfigDigest string
+	GrantTTL     time.Duration
+	MaxOutputMiB int64
 }
 
 // Coordinator is the LocalService's scheduling role.
@@ -59,7 +68,11 @@ type Coordinator struct {
 	sessions map[string]*session // by session_id
 	workers  map[string]*worker  // by instance_id
 	waits    map[string]*wait    // by request#attempt
-	revision uint64              // hub-owned, monotonic; every Directive bumps it
+	// pending is the dispatch queue: requests that have no ready worker YET. A requeue
+	// with nowhere to go WAITS for capacity instead of evaporating — the alternative is
+	// a request that quietly stops existing because a worker was still loading.
+	pending  []string
+	revision uint64 // hub-owned, monotonic; every Directive bumps it
 	events   []string
 }
 
@@ -167,6 +180,55 @@ func (c *Coordinator) waitFor(k string) *wait {
 	}
 	return w
 }
+
+// enqueue parks a request until some worker advertises its binding as ready.
+func (c *Coordinator) enqueue(requestID string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	for _, id := range c.pending {
+		if id == requestID {
+			return
+		}
+	}
+	c.pending = append(c.pending, requestID)
+}
+
+// drain dispatches everything the newly-ready capacity can now take. Called when a
+// worker reports READY, which is the only event that can change the answer.
+func (c *Coordinator) drain() {
+	c.mu.Lock()
+	queued := append([]string(nil), c.pending...)
+	c.mu.Unlock()
+	for _, id := range queued {
+		req, e := c.opt.Store.RequestRow(id)
+		if e != nil || req == nil {
+			c.forget(id)
+			continue
+		}
+		attempt, e := c.dispatch(*req)
+		if e != nil {
+			continue // still no capacity, or an ordinal the law will not mint yet
+		}
+		c.forget(id)
+		c.logf("%s left the dispatch queue as attempt %d", id, attempt)
+	}
+}
+
+func (c *Coordinator) forget(requestID string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	out := c.pending[:0]
+	for _, id := range c.pending {
+		if id != requestID {
+			out = append(out, id)
+		}
+	}
+	c.pending = out
+}
+
+// waitRequest is the REQUEST-level wait: it closes when the request settles, which may
+// be several attempts after the one a caller first saw.
+func (c *Coordinator) waitRequest(requestID string) *wait { return c.waitFor("request:" + requestID) }
 
 func (w *wait) markAccepted() { w.onceA.Do(func() { close(w.accepted) }) }
 func (w *wait) markClosed(e *exit.Error) {

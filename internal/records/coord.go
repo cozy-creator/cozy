@@ -54,8 +54,10 @@ CREATE TABLE IF NOT EXISTS requests (
   entrypoint   TEXT    NOT NULL,
   plan_id      TEXT    NOT NULL,
   payload      BLOB    NOT NULL,
+  outputs      TEXT    NOT NULL DEFAULT '',
   state        TEXT    NOT NULL,
   ordinal      INTEGER NOT NULL DEFAULT 0,
+  requeues     INTEGER NOT NULL DEFAULT 0,
   created_at   TEXT    NOT NULL
 )`, `
 CREATE TABLE IF NOT EXISTS attempts (
@@ -302,21 +304,71 @@ type Request struct {
 	Entrypoint string
 	PlanID     string
 	Payload    []byte
-	State      string
-	Ordinal    int64
-	CreatedAt  string
+	// Outputs names one destination per RESULT FIELD PATH. It lives on the request
+	// because a REQUEUE re-derives the same grant shape without a client saying so again.
+	Outputs   string
+	State     string
+	Ordinal   int64
+	Requeues  int64
+	CreatedAt string
+}
+
+const requestCols = `id,idem_key,body_digest,endpoint,entrypoint,plan_id,payload,outputs,
+	state,ordinal,requeues,created_at`
+
+func scanRequest(row interface{ Scan(...any) error }) (Request, error) {
+	var r Request
+	err := row.Scan(&r.ID, &r.IdemKey, &r.BodyDigest, &r.Endpoint, &r.Entrypoint, &r.PlanID,
+		&r.Payload, &r.Outputs, &r.State, &r.Ordinal, &r.Requeues, &r.CreatedAt)
+	return r, err
+}
+
+// RequestRow reads one request back. Requeue re-derives its dispatch from this row and
+// from nothing a caller has to repeat.
+func (s *Store) RequestRow(id string) (*Request, *exit.Error) {
+	r, err := scanRequest(s.db.QueryRow(`SELECT `+requestCols+` FROM requests WHERE id=?`, id))
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, exit.Internalf("cannot read request %s: %s", id, err)
+	}
+	return &r, nil
+}
+
+// SettleRequest records the request's final state. Only a terminal the coordinator
+// ACCEPTED can settle one.
+func (s *Store) SettleRequest(id, state string) *exit.Error {
+	if _, err := s.db.Exec(`UPDATE requests SET state=? WHERE id=?`, state, id); err != nil {
+		return exit.Internalf("cannot settle request %s: %s", id, err)
+	}
+	return nil
+}
+
+// ChargeRequeue consumes one unit of the request's durable requeue budget. Retry is
+// BOUNDED and the bound is durable: a worker that dies on every attempt exhausts it
+// instead of running forever.
+func (s *Store) ChargeRequeue(id string, max int64) (int64, *exit.Error) {
+	res, err := s.db.Exec(`UPDATE requests SET requeues=requeues+1 WHERE id=? AND requeues<?`, id, max)
+	if err != nil {
+		return 0, exit.Internalf("cannot charge a requeue for %s: %s", id, err)
+	}
+	if n, _ := res.RowsAffected(); n != 1 {
+		return max, exit.New(exit.Failed, "%s exhausted its requeue budget of %d", id, max)
+	}
+	r, e := s.RequestRow(id)
+	if e != nil {
+		return 0, e
+	}
+	return r.Requeues, nil
 }
 
 // Submit records one durable request under its idempotency key. The same key with the
 // same body digest answers the SAME request; the same key with a different body is a
 // conflict, never a second execution wearing one name.
 func (s *Store) Submit(r Request) (Request, bool, *exit.Error) {
-	var existing Request
-	err := s.db.QueryRow(`SELECT id,idem_key,body_digest,endpoint,entrypoint,plan_id,payload,
-		state,ordinal,created_at FROM requests WHERE idem_key=?`, r.IdemKey).
-		Scan(&existing.ID, &existing.IdemKey, &existing.BodyDigest, &existing.Endpoint,
-			&existing.Entrypoint, &existing.PlanID, &existing.Payload, &existing.State,
-			&existing.Ordinal, &existing.CreatedAt)
+	existing, err := scanRequest(s.db.QueryRow(
+		`SELECT `+requestCols+` FROM requests WHERE idem_key=?`, r.IdemKey))
 	if err == nil {
 		if existing.BodyDigest != r.BodyDigest {
 			return Request{}, false, exit.New(exit.Conflict,
@@ -332,9 +384,9 @@ func (s *Store) Submit(r Request) (Request, bool, *exit.Error) {
 	r.CreatedAt = now()
 	r.State = "submitted"
 	if _, err := s.db.Exec(`INSERT INTO requests(id,idem_key,body_digest,endpoint,entrypoint,
-		plan_id,payload,state,ordinal,created_at) VALUES(?,?,?,?,?,?,?,?,0,?)`,
+		plan_id,payload,outputs,state,ordinal,requeues,created_at) VALUES(?,?,?,?,?,?,?,?,?,0,0,?)`,
 		r.ID, r.IdemKey, r.BodyDigest, r.Endpoint, r.Entrypoint, r.PlanID, r.Payload,
-		r.State, r.CreatedAt); err != nil {
+		r.Outputs, r.State, r.CreatedAt); err != nil {
 		return Request{}, false, exit.Internalf("cannot record request %s: %s", r.ID, err)
 	}
 	return r, true, nil
@@ -653,6 +705,28 @@ func (s *Store) VisibleOutputs(requestID string) ([]Output, *exit.Error) {
 		ORDER BY o.attempt, o.output_id`, requestID)
 	if err != nil {
 		return nil, exit.Internalf("cannot read the outputs of %s: %s", requestID, err)
+	}
+	defer rows.Close()
+	var out []Output
+	for rows.Next() {
+		var o Output
+		if err := rows.Scan(&o.OutputID, &o.Path, &o.Digest, &o.Length, &o.MimeType); err != nil {
+			return nil, exit.Internalf("cannot read an output row: %s", err)
+		}
+		out = append(out, o)
+	}
+	return out, nil
+}
+
+// VisibleOutputsOf narrows visibility to ONE attempt — what a crash arm asks when it
+// wants to know whether the bytes THAT attempt wrote ever became a result.
+func (s *Store) VisibleOutputsOf(requestID string, attempt int64) ([]Output, *exit.Error) {
+	rows, err := s.db.Query(`SELECT o.output_id,o.path,o.digest,o.length,o.mime_type
+		FROM outputs o JOIN attempts a ON a.request_id=o.request_id AND a.attempt=o.attempt
+		WHERE o.request_id=? AND o.attempt=? AND a.state IN ('terminal','closed')
+		ORDER BY o.output_id`, requestID, attempt)
+	if err != nil {
+		return nil, exit.Internalf("cannot read the outputs of %s#%d: %s", requestID, attempt, err)
 	}
 	defer rows.Close()
 	var out []Output

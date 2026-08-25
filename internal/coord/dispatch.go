@@ -3,6 +3,7 @@ package coord
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 
 	"github.com/cozy-creator/cozy-creator-v2/internal/canonical"
@@ -17,7 +18,6 @@ type Submission struct {
 	IdemKey    string // the caller's idempotency key
 	Endpoint   string // org/name
 	Entrypoint string // the function
-	InstanceID string // the worker this request is placed on
 	PlanID     string // the entrypoint_binding_plan_id this attempt binds
 
 	// Payload is the request body, verbatim. It rides the DeliveryGrant as the input
@@ -29,12 +29,6 @@ type Submission struct {
 	// by field path with exact set equality is what makes a two-output result
 	// unswappable; a positional grant would silently cross them (decisions #248).
 	Outputs []string
-
-	ImageDigest  string // class (b): the execution environment's content digest
-	ConfigDigest string // class (a): the evaluated-config document identity (cr-003's)
-	DeadlineMS   uint64
-	MaxOutputMiB int64
-	GrantTTL     time.Duration
 }
 
 // Result is what one closed attempt produced.
@@ -48,8 +42,15 @@ type Result struct {
 	Body       []byte // the TerminalBody document, exactly as it was digested
 }
 
-// Submit records the request and dispatches its next attempt. Cold and warm runs
-// traverse the same states: a warm worker changes latency, never the path.
+// MaxRequeues is the durable per-request requeue bound. Retry is bounded and the bound
+// is a ROW, not a counter in memory: a worker that dies on every attempt exhausts it
+// instead of dispatching forever.
+const MaxRequeues = 3
+
+// Submit records the request and dispatches its FIRST attempt. It is idempotent in the
+// strong sense: the same key with the same body answers with the recorded request and
+// its current attempt, and never starts a second execution. Re-dispatch is the
+// coordinator's requeue PROJECTION over a terminal, never a client repeating itself.
 func (c *Coordinator) Submit(s Submission) (string, uint64, *exit.Error) {
 	bodyDigest, err := canonical.Spell(canonical.Digest(s.Payload))
 	if err != nil {
@@ -58,21 +59,53 @@ func (c *Coordinator) Submit(s Submission) (string, uint64, *exit.Error) {
 	req, fresh, e := c.opt.Store.Submit(records.Request{
 		ID: records.NewID("req"), IdemKey: s.IdemKey, BodyDigest: bodyDigest,
 		Endpoint: s.Endpoint, Entrypoint: s.Entrypoint, PlanID: s.PlanID, Payload: s.Payload,
+		Outputs: strings.Join(s.Outputs, ","),
 	})
 	if e != nil {
 		return "", 0, e
 	}
 	if !fresh {
-		c.logf("request %s is the recorded answer for idempotency key %s", req.ID, s.IdemKey)
+		// The recorded answer. A settled request is settled; a live one is already
+		// running the attempt this call would otherwise duplicate.
+		c.logf("request %s is the recorded answer for idempotency key %s (state %s, attempt %d)",
+			req.ID, s.IdemKey, req.State, req.Ordinal)
+		return req.ID, uint64(req.Ordinal), nil
 	}
-	attempt, e := c.dispatch(req, s)
+	attempt, e := c.dispatch(req)
 	if e != nil {
 		return req.ID, 0, e
 	}
 	return req.ID, attempt, nil
 }
 
-func (c *Coordinator) dispatch(req records.Request, s Submission) (uint64, *exit.Error) {
+// Requeue is the coordinator's PROJECTION over a neutral terminal: an ABANDONED attempt
+// or an infra-class failure earns a NEW ordinal, a fresh grant and a fresh execution —
+// never a patch to the one that died. It is charged against the request's durable budget.
+func (c *Coordinator) Requeue(requestID, why string) {
+	n, e := c.opt.Store.ChargeRequeue(requestID, MaxRequeues)
+	if e != nil {
+		c.logf("%s NOT requeued (%s): %s", requestID, why, e.Message)
+		_ = c.opt.Store.SettleRequest(requestID, "failed")
+		c.waitRequest(requestID).markClosed(e)
+		return
+	}
+	req, e := c.opt.Store.RequestRow(requestID)
+	if e != nil || req == nil {
+		return
+	}
+	attempt, e := c.dispatch(*req)
+	if e != nil {
+		// No capacity yet: the request WAITS. A requeue that cannot be placed is queued,
+		// never dropped — dispatch resumes the moment a worker reports the binding ready.
+		c.enqueue(requestID)
+		c.logf("%s requeued %d/%d and QUEUED for capacity: %s", requestID, n, MaxRequeues, e.Message)
+		return
+	}
+	c.logf("%s requeued as attempt %d (%d/%d of the budget, cause %s)",
+		requestID, attempt, n, MaxRequeues, why)
+}
+
+func (c *Coordinator) dispatch(req records.Request) (uint64, *exit.Error) {
 	// THE LAW, enforced here: NextOrdinal refuses while any recovered attempt for this
 	// request id is still an open obligation.
 	ordinal, e := c.opt.Store.NextOrdinal(req.ID)
@@ -81,33 +114,24 @@ func (c *Coordinator) dispatch(req records.Request, s Submission) (uint64, *exit
 	}
 	attempt := uint64(ordinal)
 
-	c.mu.Lock()
-	w := c.workers[s.InstanceID]
-	sess := (*session)(nil)
-	if w != nil {
-		sess = c.sessions[w.sessionID]
-	}
-	c.mu.Unlock()
-	if w == nil || sess == nil {
-		return 0, exit.Unavailablef("no registered worker %s to dispatch %s to", s.InstanceID, req.ID)
-	}
-	if w.intake != pb.IntakeState_INTAKE_STATE_READY || !w.ready[s.PlanID] {
-		return 0, exit.Unavailablef("worker %s does not advertise %s as ready (intake %s)",
-			s.InstanceID, s.PlanID, pb.IntakeState_name[int32(w.intake)])
+	// PLACEMENT is the coordinator's: the caller names the binding, and dispatch picks a
+	// worker that advertises it as dispatchable NOW.
+	w, sess, e := c.pick(req.PlanID)
+	if e != nil {
+		return 0, e
 	}
 
 	// The ExecutionSpec DOCUMENT. Its key set is closed and is exactly this message's
 	// fields: no human model ref, no service class, no local extension has a slot.
 	spec := &pb.ExecutionSpec{
 		EndpointReleaseId: w.spec.ReleaseID,
-		ImageDigest:       s.ImageDigest,
-		ConfigDigest:      s.ConfigDigest,
-		DeadlineUnixMs:    s.DeadlineMS,
+		ImageDigest:       c.opt.ImageDigest,
+		ConfigDigest:      c.opt.ConfigDigest,
 		Spec: &pb.ExecutionSpec_Serving{Serving: &pb.ServingExecutionSpec{
-			EntrypointBindingPlanId: s.PlanID,
+			EntrypointBindingPlanId: req.PlanID,
 			// With no adapters the binding IS the plan, so the two ids are equal by
 			// construction rather than by copying a value around.
-			AttemptBindingId: s.PlanID,
+			AttemptBindingId: req.PlanID,
 		}},
 	}
 	canonicalBytes, digest, err := canonical.Identity(spec)
@@ -116,7 +140,7 @@ func (c *Coordinator) dispatch(req records.Request, s Submission) (uint64, *exit
 	}
 	spelled, _ := canonical.Spell(digest)
 
-	grant, e := c.grant(req.ID, attempt, s)
+	grant, e := c.grant(req.ID, attempt, req)
 	if e != nil {
 		return 0, e
 	}
@@ -124,7 +148,7 @@ func (c *Coordinator) dispatch(req records.Request, s Submission) (uint64, *exit
 	// Journal the assignment BEFORE StartAttempt: a terminal crossing a restart is
 	// authorized by the persisted assignment, and nothing else.
 	if e := c.opt.Store.Dispatch(records.Attempt{
-		RequestID: req.ID, Attempt: ordinal, InstanceID: s.InstanceID,
+		RequestID: req.ID, Attempt: ordinal, InstanceID: w.instanceID,
 		SessionID: w.sessionID, ExecSpecDigest: spelled, ExecSpec: canonicalBytes,
 	}); e != nil {
 		return 0, e
@@ -136,30 +160,46 @@ func (c *Coordinator) dispatch(req records.Request, s Submission) (uint64, *exit
 			RequestId: req.ID, Attempt: attempt, ExecSpecDigest: digest,
 			Grant: grant, ExecSpecCanonical: canonicalBytes,
 		}}})
-	c.logf("StartAttempt %s#%d spec=%s (%d canonical bytes) outputs=%v",
-		req.ID, attempt, shortDigest(spelled), len(canonicalBytes), s.Outputs)
+	c.logf("StartAttempt %s#%d spec=%s (%d canonical bytes) outputs=%s on %s",
+		req.ID, attempt, shortDigest(spelled), len(canonicalBytes), req.Outputs, w.instanceID)
 	return attempt, nil
+}
+
+// pick resolves a worker that advertises this binding as READY. Compatibility and
+// capacity matching stay here, in the coordinator, exactly as they do in the cloud.
+func (c *Coordinator) pick(planID string) (*worker, *session, *exit.Error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	for _, w := range c.workers {
+		if w.intake != pb.IntakeState_INTAKE_STATE_READY || !w.ready[planID] {
+			continue
+		}
+		if sess := c.sessions[w.sessionID]; sess != nil {
+			return w, sess, nil
+		}
+	}
+	return nil, nil, exit.Unavailablef("no registered worker advertises %s as ready", planID)
 }
 
 // grant builds the LOCAL delivery grant: a payload input and one destination per result
 // field path, under this attempt's own directory. There is no credential — a local grant
 // is a CAS root plus an output dir, and a fabricated token would be a lie about
 // authority nobody issued.
-func (c *Coordinator) grant(requestID string, attempt uint64, s Submission) (*pb.DeliveryGrant, *exit.Error) {
+func (c *Coordinator) grant(requestID string, attempt uint64, req records.Request) (*pb.DeliveryGrant, *exit.Error) {
 	dir := c.opt.Layout.AttemptDir(requestID, attempt)
 	inDir := filepath.Join(dir, "in")
 	if err := os.MkdirAll(inDir, 0o755); err != nil {
 		return nil, exit.Internalf("cannot create the attempt directory %s: %s", dir, err)
 	}
 	payloadPath := filepath.Join(inDir, "payload")
-	if err := os.WriteFile(payloadPath, s.Payload, 0o644); err != nil {
+	if err := os.WriteFile(payloadPath, req.Payload, 0o644); err != nil {
 		return nil, exit.Internalf("cannot stage the request payload: %s", err)
 	}
-	ttl := s.GrantTTL
+	ttl := c.opt.GrantTTL
 	if ttl <= 0 {
 		ttl = 10 * time.Minute
 	}
-	maxBytes := s.MaxOutputMiB
+	maxBytes := c.opt.MaxOutputMiB
 	if maxBytes <= 0 {
 		maxBytes = 64
 	}
@@ -167,14 +207,17 @@ func (c *Coordinator) grant(requestID string, attempt uint64, s Submission) (*pb
 		FileBaseUrl:   "file://" + dir,
 		ExpiresAtUnix: uint64(time.Now().Add(ttl).Unix()),
 		Inputs: []*pb.InputLocation{{
-			Digest:   canonical.Digest(s.Payload),
+			Digest:   canonical.Digest(req.Payload),
 			Url:      "file://" + payloadPath,
-			Length:   uint64(len(s.Payload)),
+			Length:   uint64(len(req.Payload)),
 			InputId:  "payload",
 			KindMime: "application/json",
 		}},
 	}
-	for _, id := range s.Outputs {
+	for _, id := range strings.Split(req.Outputs, ",") {
+		if id == "" {
+			continue
+		}
 		g.Outputs = append(g.Outputs, &pb.OutputDestination{
 			OutputId: id,
 			Url:      "file://" + filepath.Join(dir, id),
@@ -210,6 +253,36 @@ func (c *Coordinator) Await(requestID string, attempt uint64, timeout time.Durat
 		RequestID: requestID, Attempt: attempt, AttemptKey: row.AttemptKey,
 		Status: row.TerminalStatus, Cause: row.TerminalCause,
 		Outputs: outs, Body: row.TerminalBody,
+	}, w.err
+}
+
+// AwaitSettled blocks until the REQUEST settles — through however many requeued
+// ordinals the coordinator's projection minted. This is what a caller waits on; an
+// individual attempt is the coordinator's business.
+func (c *Coordinator) AwaitSettled(requestID string, timeout time.Duration) (*Result, *exit.Error) {
+	w := c.waitRequest(requestID)
+	select {
+	case <-w.closed:
+	case <-time.After(timeout):
+		return nil, exit.New(exit.Deadline, "%s did not settle in %s", requestID, timeout)
+	}
+	row, e := c.opt.Store.RequestRow(requestID)
+	if e != nil || row == nil {
+		return nil, exit.Internalf("%s settled with no row", requestID)
+	}
+	attempts, e := c.opt.Store.Attempts(requestID)
+	if e != nil || len(attempts) == 0 {
+		return nil, exit.Internalf("%s settled with no attempt", requestID)
+	}
+	last := attempts[len(attempts)-1]
+	outs, e := c.opt.Store.VisibleOutputs(requestID)
+	if e != nil {
+		return nil, e
+	}
+	return &Result{
+		RequestID: requestID, Attempt: uint64(last.Attempt), AttemptKey: last.AttemptKey,
+		Status: last.TerminalStatus, Cause: last.TerminalCause, Outputs: outs,
+		Body: last.TerminalBody,
 	}, w.err
 }
 

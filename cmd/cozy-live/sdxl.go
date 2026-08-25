@@ -120,6 +120,17 @@ func fileDigest(path string) (string, int64) {
 	return "sha256:" + hex.EncodeToString(sum[:]), int64(len(data))
 }
 
+// requireFreeGPU refuses to start when someone else already holds the card. This box is
+// shared with other agents' live runs, and two 6 GiB reservations on an 8 GiB card is not
+// a verification, it is an OOM.
+func requireFreeGPU() int {
+	used := gpuUsedMiB()
+	if used > 900 {
+		must("the GPU", fmt.Errorf("%d MiB is already in use on device 0 — wait for the card", used))
+	}
+	return used
+}
+
 func gpuUsedMiB() int {
 	out, err := runOut("nvidia-smi", "--query-gpu=memory.used", "--format=csv,noheader,nounits")
 	if err != nil {

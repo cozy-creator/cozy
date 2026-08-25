@@ -24,7 +24,7 @@ func runOut(name string, args ...string) (string, error) {
 // worker-live.py's scripted Hub, driving the REAL two-process runtime through one real
 // GPU attempt, and making the terminal and its output visible in ONE transaction.
 func sectionAttempt() {
-	idle := gpuUsedMiB()
+	idle := requireFreeGPU()
 	lv := hostCoordinator("attempt", true)
 	defer lv.close()
 
@@ -59,7 +59,7 @@ func sectionAttempt() {
 	head("one real GPU attempt: submit -> accepted -> terminal -> visible output")
 	body := payload(map[string]any{"steps": 4, "latent": 64, "seed": 1005})
 	submitAt := time.Now()
-	requestID, attempt, e := lv.c.Submit(submission(instance, planID, body))
+	requestID, attempt, e := lv.c.Submit(submissionKey(planID, body, "idem-attempt-1"))
 	if e != nil {
 		check("submit", false, e.Message)
 		return
@@ -77,7 +77,7 @@ func sectionAttempt() {
 	check("no output is visible before the terminal is accepted", len(beforeOutputs) == 0,
 		fmt.Sprintf("%d visible", len(beforeOutputs)))
 
-	result, e := lv.c.Await(requestID, attempt, 120*time.Second)
+	result, e := lv.c.AwaitSettled(requestID, 120*time.Second)
 	total := time.Since(submitAt)
 	if e != nil {
 		check("terminal", false, e.Message)
@@ -133,23 +133,26 @@ func sectionAttempt() {
 		byKey != nil && byKey.RequestID == requestID, row.AttemptKey)
 
 	head("idempotency and ordinal arithmetic")
-	_, _, e = lv.c.Submit(submissionKey(instance, planID, body, "idem-attempt-1"))
-	check("the same key with the same body is the SAME request", e != nil &&
-		strings.Contains(e.Message, "live attempt") || e == nil, briefly(e))
-	_, _, e = lv.c.Submit(submissionKey(instance, planID,
+	again, againAtt, e := lv.c.Submit(submissionKey(planID, body, "idem-attempt-1"))
+	check("the same key with the same body answers with the SAME request and no new attempt",
+		e == nil && again == requestID && againAtt == attempt,
+		fmt.Sprintf("%s#%d", again, againAtt))
+	all, _ := lv.store.Attempts(requestID)
+	check("re-submitting started nothing", len(all) == 1, fmt.Sprintf("%d attempt(s)", len(all)))
+	_, _, e = lv.c.Submit(submissionKey(planID,
 		payload(map[string]any{"steps": 2}), "idem-attempt-1"))
 	check("the same key with a DIFFERENT body refuses", e != nil &&
 		strings.Contains(e.Message, "different body"), briefly(e))
 
 	head("a warm second attempt: same path, different latency")
 	warmStart := time.Now()
-	rid2, att2, e := lv.c.Submit(submissionKey(instance, planID, body, "idem-attempt-2"))
+	rid2, att2, e := lv.c.Submit(submissionKey(planID, body, "idem-attempt-2"))
 	must("second submit", errOf(e))
 	warmAccepted := time.Since(warmStart)
 	if e := lv.c.AwaitAccepted(rid2, att2, 60*time.Second); e != nil {
 		check("second accepted", false, e.Message)
 	}
-	r2, e := lv.c.Await(rid2, att2, 120*time.Second)
+	r2, e := lv.c.AwaitSettled(rid2, 120*time.Second)
 	warmTotal := time.Since(warmStart)
 	check("the warm attempt succeeded through the same states", e == nil && r2.Status == "SUCCEEDED",
 		fmt.Sprintf("%s (dispatch %s)", ms(warmTotal), ms(warmAccepted)))
@@ -177,10 +180,6 @@ func sectionAttempt() {
 	now := gpuUsedMiB()
 	check("the GPU is back at its idle baseline", now <= idle+40,
 		fmt.Sprintf("%d MiB now, %d MiB before", now, idle))
-}
-
-func submission(instance, planID string, body []byte) coordSubmission {
-	return submissionKey(instance, planID, body, "idem-"+fmt.Sprint(time.Now().UnixNano()))
 }
 
 func tail(path string, n int) string {

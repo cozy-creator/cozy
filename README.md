@@ -58,11 +58,46 @@ executes with it, reclaiming only what nothing references.
 `--from <archive>` is the pre-hub source door standing in for the hub resolve (cl-011);
 `scripts/pack.py` is the pre-hub packager `cozy deploy` (cl-012) replaces.
 
+## The LocalService and LocalCoordinator (cl-001)
+
+`cozy up` starts the ONE long-lived process; `cozy down` stops it. Its scheduling role is
+the **LocalCoordinator** (`internal/coord`): the worker protocol's **SERVER** over a unix
+socket — the cozy-runtime supervisor dials a stable address — plus local dispatch, the
+device ledger, and output publication authority.
+
+- **Identity is canonical bytes.** `internal/canonical` is the document plane: the writer
+  is adapted from worker-protocol's own independent Go canonicalizer, the reader is this
+  repo's and refuses everything the writer could not have produced. `protocol/` carries
+  the generated `cozy.worker.v1` bindings, COPIED (never imported as a module).
+- **One transaction.** "terminal accepted + output visible" commits together, and only
+  then is `TerminalAck` sent. A crash between them replays; it cannot half-apply.
+- **The recovered-attempts law** (worker-protocol/02 §6.2): the attempts a restarted
+  supervisor reports on `Register` are OPEN OBLIGATIONS, and no next ordinal for their
+  request ids is minted until each is closed by its own journaled terminal.
+- **Device grants** are an attribute of the worker process row, admitted by one atomic
+  statement. Two concurrent starts cannot both consume an envelope.
+- **Liveness is an OS fact.** The service holds an exclusive `flock` on
+  `$COZY_HOME/service.lock` for its life; a reader that can TAKE the lock has proof of
+  absence. No pidfile, no heartbeat, no grace period. Worker adoption uses the protocol's
+  own identities plus `/proc` process-birth — a reused pid is never signalled.
+- **No credential is minted anywhere.** A local grant is a CAS root plus an output
+  directory; the payload rides it as the input `payload`, and one `OutputDestination` is
+  named per result FIELD PATH.
+- `internal/config` is the ONE environment reader: `Load()` reads once and freezes, and
+  it is also the child-env allowlist.
+
 ## Verification
 
-No automated tests. `scripts/redarm.py` builds each hostile input for real, runs the real
-binary and observes the typed refusal (16 arms). `scripts/fence.py` enforces five
-families: forbidden deps, byte-plane vocabulary (TensorFS owns storage/residency),
-interactive prompts, exit-matrix parity, and a manifest lint — a reclaiming verb must
-declare `Destructive` (exit 7 without `--yes`) or `PlanFirst` (a read without it).
-Doors are greppable: `//cozy:allow`, `//cozy:stdin-value`.
+No automated tests. Verification is running the real thing:
+
+- `scripts/redarm.py` builds each hostile input for real, runs the real binary and
+  observes the typed refusal (16 arms).
+- `cmd/cozy-live` drives the REAL coordinator against real peers:
+  `canonical` (worker-protocol's frozen corpus, byte-for-byte, plus every semantic twin
+  refused by its own code), `arms` (the refusal matrix against `fakeworker`, a second
+  independent Go implementation of the worker side), `attempt` and `recovered` (the real
+  cozy-runtime supervisor + executor on a real GPU).
+- `scripts/fence.py` enforces eight families: forbidden deps, byte-plane vocabulary
+  (TensorFS owns storage/residency), interactive prompts, exit-matrix parity, a manifest
+  lint, the env-read fence (one reader), no lifecycle sidecar, and no cloud emulation or
+  minted credential. Doors are greppable: `//cozy:allow`, `//cozy:stdin-value`.

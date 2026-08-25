@@ -147,7 +147,7 @@ func sectionArms() {
 
 	head("attempt-level refusals: a held attempt, and a stranger's terminal")
 	bodyA := payload(map[string]any{"held": true})
-	subA := submissionKey(instanceA, planA, bodyA, "idem-held")
+	subA := submissionKey(planA, bodyA, "idem-held")
 	subA.Endpoint, subA.Entrypoint = "fake/victim", "fake"
 	requestA, attemptA, e := lv.c.Submit(subA)
 	check("A accepts and HOLDS an attempt", e == nil, briefly(e))
@@ -162,9 +162,14 @@ func sectionArms() {
 	}
 
 	// A NEW ordinal over a live attempt: supersession is explicit, never implicit.
-	_, _, e = lv.c.Submit(subA)
-	check("a next ordinal over a LIVE attempt refuses", e != nil &&
-		strings.Contains(e.Message, "supersession is explicit"), briefly(e))
+	_, ordErr := lv.store.NextOrdinal(requestA)
+	check("a next ordinal over a LIVE attempt refuses", ordErr != nil &&
+		strings.Contains(ordErr.Message, "supersession is explicit"), briefly(ordErr))
+	// And a re-submit of the same key does not become one: it answers with the request
+	// that is already running.
+	sameID, sameAtt, e := lv.c.Submit(subA)
+	check("re-submitting the same key starts nothing", e == nil && sameID == requestA &&
+		sameAtt == attemptA, fmt.Sprintf("%s#%d", sameID, sameAtt))
 
 	// A second session writing another session's attempt row.
 	thief := fakeSpec("thief", "4", "--arm", "steal", "--request", requestA,
@@ -186,7 +191,7 @@ func sectionArms() {
 		check("worker B ready", false, e.Message)
 		return
 	}
-	subB := submissionKey(instanceB, planB, payload(map[string]any{"arms": true}), "idem-arms")
+	subB := submissionKey(planB, payload(map[string]any{"arms": true}), "idem-arms")
 	subB.Endpoint, subB.Entrypoint = "fake/badterminal", "fake"
 	requestB, attemptB, e := lv.c.Submit(subB)
 	check("B is dispatched an attempt", e == nil, briefly(e))

@@ -257,6 +257,9 @@ func (c *Coordinator) onReport(s *session, r *pb.Report) {
 	for _, a := range r.Activity {
 		c.logf("activity seq=%d %s: %s", a.Seq, a.Kind, a.Step)
 	}
+	if r.IntakeState == pb.IntakeState_INTAKE_STATE_READY {
+		go c.drain()
+	}
 	c.logf("Report intake=%s revision=%d epoch=%d ready=%d in_flight=%d",
 		pb.IntakeState_name[int32(r.IntakeState)], r.AppliedRevision, r.ReadinessEpoch,
 		len(r.GetServingCapacity().GetReadyEntrypointBindingPlanIds()), len(r.ActiveAttempts))
@@ -367,7 +370,37 @@ func (c *Coordinator) onTerminal(s *session, t *pb.AttemptTerminal) {
 			TerminalId: t.TerminalId, TerminalDigest: t.TerminalDigest,
 		}}})
 	_ = c.opt.Store.Closed(t.RequestId, int64(t.Attempt))
-	c.waitFor(key(t.RequestId, t.Attempt)).markClosed(terminalError(status, cause, doc.Str("safe_message")))
+	outcome := terminalError(status, cause, doc.Str("safe_message"))
+	c.waitFor(key(t.RequestId, t.Attempt)).markClosed(outcome)
+	if !applied {
+		return // a replay settles nothing twice and requeues nothing twice
+	}
+
+	// The requeue PROJECTION over (status, cause). Retryability is never a wire
+	// observation: this is the only place the neutral facts become a decision.
+	if requeueable(status, cause) {
+		c.Requeue(t.RequestId, status+"/"+cause)
+		return
+	}
+	_ = c.opt.Store.SettleRequest(t.RequestId, strings.ToLower(status))
+	c.waitRequest(t.RequestId).markClosed(outcome)
+}
+
+// requeueable is the coordinator's projection: an accepted-but-incomplete attempt and
+// the infra-class failures earn a new ordinal. A deterministic body failure and every
+// refusal are terminal — re-running them would only fail again.
+func requeueable(status, cause string) bool {
+	if status == "ABANDONED" {
+		return true
+	}
+	if status != "FAILED" {
+		return false
+	}
+	switch cause {
+	case "EXECUTOR_FAULT", "GRANT_EXPIRED", "ARTIFACT_UNFETCHABLE", "CAPABILITY_UNAVAILABLE":
+		return true
+	}
+	return false
 }
 
 // outputsOf joins the manifest's entries to the destinations THIS coordinator granted.
