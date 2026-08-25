@@ -65,7 +65,7 @@
 //!   tfs ingest converters | golden           reviewed converters; geometry run live
 //!
 //! The gguf-v1 PLANNER (tfs-011) — a PLAN over a metadata region, never a second door.
-//! Flags: --tensors <n> --twin <rows.json>
+//! Flags: --probe (the input is a bounded metadata region) --tensors <n> --twin <rows.json>
 //!
 //!   tfs gguf plan <file>                     carrier-blob + per-tensor views, 0 weight bytes
 //!   tfs gguf admit <file>                    the same, then the admission verdict (refuses)
@@ -88,6 +88,7 @@
 //!
 //! The layout plane (tfs-009) — Stamp is at the border; this is the SECOND operation.
 //! Flags: --contract <name> --closure <a,b> --pin <d,...> --lane canonical|local_unbordered
+//! --survey (every measured role set and the spec it selects, instead of the first gap)
 //! --registry <a,b> --corpus <f> --out <f> --truncate-at <n>
 //!
 //!   tfs compat import <rows.json>            measured rows -> canonical header + contract
