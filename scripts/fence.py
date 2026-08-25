@@ -1,26 +1,153 @@
 #!/usr/bin/env python3
-"""Boundary fence (boundaries.md): forbidden-dependency scan. Architecture enforcement, not a test."""
+"""Boundary fence (boundaries.md). Architecture enforcement, not a test.
+
+Four families:
+  deps      forbidden dependencies (raw lines, incl. import paths and go.mod)
+  impl      storage/chunk/loader/residency/tensor implementation vocabulary — cozy-creator
+            renders and coordinates, it never implements the byte plane (TensorFS owns it)
+  prompt    interactive prompts: no cozy command may ever ask a question (AXI)
+  matrix    internal/exit/exit.go must equal docs/exit-matrix.md row for row
+
+Identifier families scan Go source with comments and string literals removed, so a
+word inside help text or a doc comment is never a violation. Doors, both greppable:
+  //cozy:allow        this line is exempt from the impl family (state the reason)
+  //cozy:stdin-value  this line reads stdin as a VALUE (e.g. --token-stdin), never a prompt
+"""
 import pathlib, re, sys
 
-DENY = ["tensorhub-v2", "varena"]
 SCAN = ["go.mod", "cmd/**/*.go", "internal/**/*.go"]
 
-violations = []
-for glob in SCAN:
-    for p in sorted(pathlib.Path(".").glob(glob)):
-        if not p.is_file():
-            continue
-        for i, line in enumerate(p.read_text(errors="ignore").splitlines(), 1):
+DENY_DEPS = ["tensorhub-v2", "varena"]
+
+DENY_IMPL = [
+    "safetensors", "cozytensor", "tensorbytes", "tensorchunk", "chunk", "residency",
+    "mmap", "dtype", "quantiz", "gguf", "loadtensor", "weightbytes", "pagein",
+]
+
+# Exact identifiers: stdlib input readers and prompt-library qualifiers. Import paths
+# are string literals and are stripped, so a prompt library shows up as its qualifier.
+DENY_PROMPT = {
+    "Scan", "Scanln", "Scanf", "Fscan", "Fscanln", "Fscanf", "ReadPassword",
+    "readline", "promptui", "survey",
+}
+
+ALLOW_DOOR = "//cozy:allow"
+STDIN_DOOR = "//cozy:stdin-value"
+
+IDENT = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
+
+
+def strip_go(src: str) -> str:
+    """Blank out comments, string and rune literals; keep offsets and newlines."""
+    out, i, n = [], 0, len(src)
+    while i < n:
+        c = src[i]
+        two = src[i:i + 2]
+        if two == "//":
+            j = src.find("\n", i)
+            j = n if j < 0 else j
+            out.append(" " * (j - i)); i = j
+        elif two == "/*":
+            j = src.find("*/", i + 2)
+            j = n if j < 0 else j + 2
+            out.append("".join(ch if ch == "\n" else " " for ch in src[i:j])); i = j
+        elif c in ('"', "'", "`"):
+            j = i + 1
+            while j < n:
+                if src[j] == "\\" and c != "`":
+                    j += 2; continue
+                if src[j] == c:
+                    j += 1; break
+                j += 1
+            out.append("".join(ch if ch == "\n" else " " for ch in src[i:j])); i = j
+        else:
+            out.append(c); i += 1
+    return "".join(out)
+
+
+def files():
+    for glob in SCAN:
+        for p in sorted(pathlib.Path(".").glob(glob)):
+            if p.is_file():
+                yield p
+
+
+def check_sources():
+    bad = []
+    for p in files():
+        raw = p.read_text(errors="ignore")
+        raw_lines = raw.splitlines()
+        for i, line in enumerate(raw_lines, 1):
             s = line.strip()
             if s.startswith(("#", "//")):
                 continue
-            for d in DENY:
+            for d in DENY_DEPS:
                 if re.search(r"(?<![\w.-])" + re.escape(d) + r"(?![\w-])", s, re.I):
-                    violations.append(f"{p}:{i}: forbidden dependency '{d}': {s}")
+                    bad.append(f"{p}:{i}: [deps] forbidden dependency '{d}': {s}")
+        if p.suffix != ".go":
+            continue
+        for i, line in enumerate(strip_go(raw).splitlines(), 1):
+            src_line = raw_lines[i - 1] if i <= len(raw_lines) else ""
+            idents = IDENT.findall(line)
+            low = line.lower()
+            if ALLOW_DOOR not in src_line:
+                for d in DENY_IMPL:
+                    if d in low:
+                        bad.append(f"{p}:{i}: [impl] byte-plane vocabulary '{d}' — TensorFS owns it: {line.strip()}")
+            for ident in idents:
+                if ident in DENY_PROMPT:
+                    bad.append(f"{p}:{i}: [prompt] '{ident}' reads input — no cozy command may prompt: {line.strip()}")
+                if ident == "Stdin" and STDIN_DOOR not in src_line:
+                    bad.append(f"{p}:{i}: [prompt] stdin read without the {STDIN_DOOR} door: {line.strip()}")
+    return bad
 
+
+def parse_doc_matrix(path: pathlib.Path):
+    rows = []
+    for line in path.read_text().splitlines():
+        m = re.match(r"^\|\s*(\d+)\s*\|\s*([a-z_]+)\s*\|\s*(.+?)\s*\|$", line.strip())
+        if m:
+            rows.append((int(m.group(1)), m.group(2), m.group(3)))
+    return rows
+
+
+def parse_go_matrix(path: pathlib.Path):
+    src = path.read_text()
+    consts = dict(re.findall(r"^\t([A-Za-z]+)\s+Code = (\d+)$", src, re.M))
+    rows = []
+    for name, label, meaning in re.findall(r'^\t\{([A-Za-z]+), "([a-z_]+)", "(.*)"\},$', src, re.M):
+        if name not in consts:
+            return None, f"matrix entry {label} uses undeclared constant {name}"
+        rows.append((int(consts[name]), label, meaning.replace('\\"', '"')))
+    return rows, None
+
+
+def check_matrix():
+    doc, go = pathlib.Path("docs/exit-matrix.md"), pathlib.Path("internal/exit/exit.go")
+    if not doc.exists() or not go.exists():
+        return [f"[matrix] missing {doc if not doc.exists() else go}"]
+    expected = parse_doc_matrix(doc)
+    got, err = parse_go_matrix(go)
+    if err:
+        return [f"[matrix] {err}"]
+    if not expected:
+        return ["[matrix] docs/exit-matrix.md has no table rows"]
+    bad = []
+    if len(expected) != len(got):
+        bad.append(f"[matrix] {len(expected)} rows frozen in {doc}, {len(got)} in {go}")
+    for e, g in zip(expected, got):
+        if e != g:
+            bad.append(f"[matrix] frozen {e} != code {g}")
+    return bad
+
+
+violations = check_sources() + check_matrix()
 if violations:
-    print("FENCE RED — forbidden dependencies (boundaries.md):", file=sys.stderr)
+    print("FENCE RED (boundaries.md):", file=sys.stderr)
     for v in violations:
         print("  " + v, file=sys.stderr)
     sys.exit(1)
-print(f"fence green ({len(DENY)} forbidden tokens, {len(SCAN)} scan globs)")
+print(
+    f"fence green — deps({len(DENY_DEPS)}) impl({len(DENY_IMPL)}) "
+    f"prompt({len(DENY_PROMPT) + 1}) matrix(15 rows)"
+)

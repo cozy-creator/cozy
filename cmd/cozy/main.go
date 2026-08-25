@@ -1,8 +1,12 @@
-// cozy — the cozy-creator CLI + LocalService. Skeleton (th-023); surface lands with cl-002/cl-001.
+// cozy — the cozy-creator CLI. Everything lives behind the manifest in internal/app.
 package main
 
-import "fmt"
+import (
+	"os"
+
+	"github.com/cozy-creator/cozy-creator-v2/internal/app"
+)
 
 func main() {
-	fmt.Println("cozy 0.0.1 (v2 scaffold)")
+	os.Exit(app.Run(os.Args[1:], os.Stdout, os.Stderr))
 }
