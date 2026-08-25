@@ -68,7 +68,7 @@ func main() {
 	args := os.Args[1:]
 	if len(args) == 0 {
 		fmt.Fprintln(os.Stderr, "usage: cozy-live "+
-			"<canonical|attempt|recovered|arms|api|apiarms|apicrash|fakeworker> [--flag value]")
+			"<canonical|attempt|recovered|arms|api|apiarms|apicrash|verbs|journey|fakeworker> [--flag value]")
 		os.Exit(2)
 	}
 	section := args[0]
@@ -102,6 +102,10 @@ func main() {
 		sectionAPI()
 	case "apicrash":
 		sectionAPICrash()
+	case "verbs":
+		sectionVerbs()
+	case "journey":
+		sectionJourney()
 	default:
 		fmt.Fprintf(os.Stderr, "cozy-live: unknown section %q\n", section)
 		os.Exit(2)

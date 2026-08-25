@@ -338,14 +338,14 @@ def main():
     if on("push"):
         section("push — declare-first, upload only what the hub lacks")
         rc, plan, r = cozy.json(pub, "push", "acme/small", small,
-                                "--family", "sdxl", "--reason", "cl-012 plan", "--dry-run")
+                                "--reason", "cl-012 plan", "--dry-run")
         check(rc == 0, "push --dry-run", f"exit {rc}")
         check(plan.get("kind") == "push plan", "the plan is the HUB's answer",
               f"{plan.get('missing')} missing / {plan.get('held')} held, {plan.get('moved')} to move")
 
         t0 = time.perf_counter()
         rc, doc, r = cozy.json(pub, "push", "acme/small", small,
-                               "--family", "sdxl", "--reason", "cl-012 first publish")
+                               "--reason", "cl-012 first publish")
         wall = time.perf_counter() - t0
         check(rc == 0, "push round trip", f"exit {rc} in {wall:.2f}s")
         if rc != 0:
@@ -369,7 +369,7 @@ def main():
         section("dedup — a second publish of the same set moves 0 bytes")
         t0 = time.perf_counter()
         rc, doc, r = cozy.json(pub, "push", "acme/twin", small,
-                               "--family", "sdxl", "--reason", "cl-012 dedup arm")
+                               "--reason", "cl-012 dedup arm")
         wall = time.perf_counter() - t0
         check(rc == 0, "publish the same set into a second repo", f"exit {rc} in {wall:.2f}s")
         check(doc.get("moved") == "0B", "0 bytes moved", f"moved {doc.get('moved')} · deduped {doc.get('deduped')}")
@@ -381,7 +381,7 @@ def main():
         result["dedup_wall"] = wall
 
         rc2, doc2, r2 = cozy.json(pub, "push", "acme/small", small,
-                                  "--family", "sdxl", "--reason", "cl-012 duplicate completion")
+                                  "--reason", "cl-012 duplicate completion")
         check(rc2 == 0 and doc2.get("duplicate") is True,
               "an exact duplicate completion replays the ledger", f"duplicate={doc2.get('duplicate')}")
         check(doc2.get("catalog_root") == result.get("small", {}).get("catalog_root"),
@@ -394,7 +394,7 @@ def main():
         note(f"artifact {mid[:19]}… {mid_bytes/2**20:.1f} MiB")
         rc, doc, r = cozy.json(pub, "repo", "create", "acme/resume", "--kind", "model",
                                "--reason", "cl-012 resume arm")
-        rc, doc, r = cozy.json(pub, "push", "acme/resume", mid, "--family", "sdxl",
+        rc, doc, r = cozy.json(pub, "push", "acme/resume", mid,
                                "--reason", "cl-012 interrupted publish", "--crash-after", "3")
         check(rc == 1, "the publish was killed mid-upload", f"exit {rc}")
         check("crash_after_upload" in (r.stderr + r.stdout), "and said so typed")
@@ -403,7 +403,7 @@ def main():
         check(not any(c["snapshot_id"] == mid for c in mid_state.get("checkpoints", [])),
               "no root is visible after the kill", "0 checkpoints")
 
-        rc, doc, r = cozy.json(pub, "push", "acme/resume", mid, "--family", "sdxl",
+        rc, doc, r = cozy.json(pub, "push", "acme/resume", mid,
                                "--reason", "cl-012 resumed publish")
         check(rc == 0, "the re-run completes", f"exit {rc}")
         check(doc.get("deduped") != "0B",
@@ -471,7 +471,7 @@ def main():
         if not mid:
             mid, mid_bytes = build_artifact(a.tfs, pub + "/cas", 1, 2, 11)
             cozy.json(pub, "repo", "create", "acme/resume", "--kind", "model", "--reason", "cl-012")
-            cozy.json(pub, "push", "acme/resume", mid, "--family", "sdxl", "--reason", "cl-012")
+            cozy.json(pub, "push", "acme/resume", mid, "--reason", "cl-012")
         home = str(work / "puller2")
         pathlib.Path(home).mkdir(parents=True, exist_ok=True)
         rc, doc, r = cozy.json(home, "pull", "acme/resume@" + mid, "--crash-after", "4")
@@ -501,11 +501,11 @@ def main():
                   f"exit {r.returncode}: " + first(r))
 
         arm("tokenless push refuses BEFORE the dial", 5, "hub.token_missing",
-            pub, "push", "acme/small", small, "--family", "sdxl", "--reason", "x", token=False)
-        r = cozy.run(pub, "push", "acme/small", small, "--family", "sdxl", "--reason", "x",
+            pub, "push", "acme/small", small, "--reason", "x", token=False)
+        r = cozy.run(pub, "push", "acme/small", small, "--reason", "x",
                      token=False, stdin="not-the-token")
         # A wrong credential is the hub's own refusal, verbatim.
-        r = subprocess.run([a.cozy, "push", "acme/small", small, "--family", "sdxl",
+        r = subprocess.run([a.cozy, "push", "acme/small", small,
                             "--reason", "x", "--token-stdin"],
                            env=cozy.env(pub, token=False), input="not-the-token",
                            capture_output=True, text=True)
@@ -517,27 +517,26 @@ def main():
               "and the credential appears in no byte of the output")
 
         arm("--token-stdin with empty stdin", 5, "token.empty_stdin",
-            pub, "push", "acme/small", small, "--family", "sdxl", "--reason", "x",
+            pub, "push", "acme/small", small, "--reason", "x",
             "--token-stdin", token=False, stdin="")
-        arm("push without --family", 2, "needs --family",
-            pub, "push", "acme/small", small, "--reason", "x")
         arm("push without --reason", 2, "needs --reason",
-            pub, "push", "acme/small", small, "--family", "sdxl")
+            pub, "push", "acme/small", small)
         arm("a PATH is not publishable", 2, "not publishable",
-            pub, "push", "acme/small", "./some/dir", "--family", "sdxl", "--reason", "x")
+            pub, "push", "acme/small", "./some/dir", "--reason", "x")
         arm("a malformed snapshot id", 2, "is not a snapshot id",
-            pub, "push", "acme/small", "sha256:nope", "--family", "sdxl", "--reason", "x")
+            pub, "push", "acme/small", "sha256:nope", "--reason", "x")
         arm("an unknown repo", 4, "not_found",
-            pub, "push", "acme/absent", small, "--family", "sdxl", "--reason", "x")
+            pub, "push", "acme/absent", small, "--reason", "x")
         arm("an unknown checkpoint", 4, "holds no checkpoint",
             dst, "pull", "acme/small@" + "0" * 64)
         arm("a release pinned BY NAME", 2, "th-003",
             dst, "pull", "acme/small@v1")
         arm("an unknown repo on pull", 4, "not_found", dst, "pull", "acme/absent")
 
-        # The family lock: a second family into a locked repo.
-        arm("a second model family into a locked repo", 13, "family_locked",
-            pub, "push", "acme/small", small, "--family", "wan", "--reason", "cl-012 lock arm")
+        # RETIRED with `--family` (cl-010): th-003's hub CLASSIFIES the family from the
+        # artifact's topology digest, so a client cannot declare a second one to lock
+        # against. `repo.family_locked` is still the hub's refusal — it now fires on what
+        # the classifier DERIVED, which is a tensorhub-side arm, not a client one.
 
         # A hub that serves no read plane: point pull at the REAL hub, past the shim.
         # It must run against an EMPTY store — a puller that already holds every object
@@ -583,7 +582,7 @@ def main():
               first(r))
 
         # A hub that is not there.
-        r = cozy.run(pub, "push", "acme/small", small, "--family", "sdxl", "--reason", "x",
+        r = cozy.run(pub, "push", "acme/small", small, "--reason", "x",
                      url="http://127.0.0.1:1")
         check(r.returncode == 9, "an unreachable hub is exit 9",
               first(r))
@@ -605,13 +604,13 @@ def main():
         cozy.json(pub, "repo", "create", "acme/bench", "--kind", "model", "--reason", "cl-012 bench")
 
         t0 = time.perf_counter()
-        rc, doc, r = cozy.json(pub, "push", "acme/bench", big, "--family", "sdxl", "--reason", "cl-012 bench push")
+        rc, doc, r = cozy.json(pub, "push", "acme/bench", big, "--reason", "cl-012 bench push")
         push_wall = time.perf_counter() - t0
         check(rc == 0, "push a large set", f"exit {rc}")
         note(f"push {big_bytes/2**20:.1f} MiB in {push_wall:.2f}s = {big_bytes/2**20/push_wall:.2f} MiB/s")
 
         t0 = time.perf_counter()
-        rc2, doc2, _ = cozy.json(pub, "push", "acme/bench", big, "--family", "sdxl",
+        rc2, doc2, _ = cozy.json(pub, "push", "acme/bench", big,
                                  "--reason", "cl-012 dedup-hit latency")
         dedup_wall = time.perf_counter() - t0
         note(f"dedup-hit publish (duplicate completion): {dedup_wall*1000:.0f} ms")
@@ -637,7 +636,7 @@ def main():
         section("show — what a person actually sees")
         cozy.json(pub, "repo", "create", "acme/show", "--kind", "model", "--reason", "cl-012 show")
         shown, _ = build_artifact(a.tfs, pub + "/cas", 1, 4, 41)
-        r = cozy.run(pub, "push", "acme/show", shown, "--family", "sdxl",
+        r = cozy.run(pub, "push", "acme/show", shown,
                      "--reason", "cl-012 human-readable output")
         for line in r.stdout.rstrip().splitlines():
             out("  | " + line)

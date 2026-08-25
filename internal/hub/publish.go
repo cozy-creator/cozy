@@ -24,6 +24,14 @@ import (
 // tfs produced; `manifest` is the exact snapshot manifest object, which is NOT in the
 // closure (tensorfs's PublishClosure covers what a publish MOVES and names the
 // snapshot separately) and therefore rides the declaration.
+//
+// THE MODEL FAMILY IS NOT DECLARED (th-003, tensorhub 1353e53). th-002 took it as a
+// declaration because no classifier existed; th-003 derives it at completion by
+// comparing the installed checkpoint's topology_digest against the structure fixtures
+// tfs banks — family is detectable from artifacts, never self-declared. The hub
+// decodes with DisallowUnknownFields, so a client that still sends the field cannot
+// publish at all; cl-006's real-hub side-check found exactly that and cl-010 removed
+// it, along with `cozy push --family`.
 type BeginRequest struct {
 	Session      string   `json:"session"`
 	Closure      string   `json:"closure"`
@@ -32,7 +40,6 @@ type BeginRequest struct {
 	Manifest     string   `json:"manifest"`
 	HeaderID     string   `json:"header_id"`
 	Objects      []Object `json:"objects"`
-	ModelFamily  string   `json:"model_family"`
 	RawCarrier   bool     `json:"raw_carrier"`
 }
 
@@ -328,7 +335,7 @@ func (c *Client) Reads(ctx context.Context, ref Ref, snapshot string, ids []stri
 			"the hub at %s serves no object-read route: POST %s answered %q", c.base,
 			"…/checkpoints/{snapshot}/reads", e.Name).
 			WithRemedy("this hub can take custody of bytes and cannot hand them back yet; the read grant is the missing half of th-002's transfer protocol").
-			WithNext("cozy push <org/repo> <sha256:…>", "cozy pull --dry-run " + ref.String())
+			WithNext("cozy push <org/repo> <sha256:…>", "cozy pull --dry-run "+ref.String())
 	}
 	return out.Reads, e
 }

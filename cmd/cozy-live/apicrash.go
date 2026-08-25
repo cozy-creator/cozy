@@ -39,13 +39,11 @@ func sectionAPICrash() {
 	must("clearing the service root", os.RemoveAll(root))
 	must("creating the service root", os.MkdirAll(root, 0o755))
 
-	spec := sdxlSpec("denoise")
-	spec.Bindings[0].Outputs = []string{"image"}
-	devSpec := writeDevSpec(root, spec)
+	installEndpoint(root)
 	port := freePort(2851)
 
 	head("a REAL LocalService, in its own process")
-	svc := startService(root, port, devSpec, false)
+	svc := startService(root, port, false)
 	check("the API answers on "+svc.addr, svc.alive(), fmt.Sprintf("pid %d", svc.cmd.Process.Pid))
 
 	start := svc.call("POST", "/v1/local/workers", map[string]any{"endpoint": "cozy/sdxl-unet"})
@@ -95,7 +93,7 @@ func sectionAPICrash() {
 	restartAt := time.Now()
 	// NOT fresh. The whole claim is that the authority and the supervisor's journal
 	// survived; wiping the root would be arranging the answer.
-	svc = startService(root, port, devSpec, false)
+	svc = startService(root, port, false)
 	check("the SAME root comes back up", svc.alive(), ms(time.Since(restartAt)))
 
 	// The request survived, and so did its history.

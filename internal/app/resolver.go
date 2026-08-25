@@ -1,98 +1,165 @@
 package app
 
 import (
-	"encoding/json"
-	"os"
 	"sort"
+	"strings"
 	"sync"
 
 	"github.com/cozy-creator/cozy-creator-v2/internal/api"
+	"github.com/cozy-creator/cozy-creator-v2/internal/config"
 	"github.com/cozy-creator/cozy-creator-v2/internal/coord"
 	"github.com/cozy-creator/cozy-creator-v2/internal/exit"
+	"github.com/cozy-creator/cozy-creator-v2/internal/launch"
 	"github.com/cozy-creator/cozy-creator-v2/internal/records"
 )
 
 // The LOCAL module's endpoint resolver: `org/name` -> the spec that makes its worker
-// resident. Two sources, in this order:
+// resident. ONE source, and it is the only one a user's machine will ever use — the
+// INSTALL GENERATION and its pin (cl-009's rows), resolved through internal/launch.
 //
-//  1. The INSTALL GENERATION and its pin (cl-009's rows). This is the real one, and it is
-//     the only one a user's machine will ever use.
-//  2. A DEV SPEC named at launch with `--dev-endpoint <file>`. It exists for exactly one
-//     reason and it is a named consumer, not a convenience: cl-001's coordinator-kill
-//     crash arm cannot be armed without a SEPARATE `cozy up` process to kill, and driving
-//     a separate process means the driver must be able to ask the running service to make
-//     a worker resident. Until cl-009's generation carries the launch facts a supervisor
-//     needs (interpreter, argv, imposed env, binding records), the driver hands them over
-//     as a document.
-//
-// cl-010 replaces (2)'s reason, not its shape: `cozy start` is a client of the same
-// route, and the day the generation resolves fully, the dev door has no caller and goes.
+// cl-006 shipped a second source, `--dev-endpoint <file>`: a hand-written EndpointSpec
+// document, because the generation could not yet carry the launch facts a supervisor
+// needs and guessing an interpreter would have been worse than refusing. cl-010 DELETES
+// it — a generation carries a venv, a proven descriptor and a binding table, which is
+// every fact that document supplied. Nothing coexists "temporarily": the flag, the
+// loader, and the driver's writer are all gone, and the live driver installs an endpoint
+// exactly as a user does.
 
 // Resolver is the LocalService's endpoint resolver.
 type Resolver struct {
 	mu    sync.Mutex
 	store *records.Store
-	dev   map[string]coord.EndpointSpec
+	cfg   config.Config
+	// cache holds the specs already derived this launch. Deriving one reads a descriptor
+	// and asks the runtime for its artifact index; a generation is IMMUTABLE, so doing it
+	// twice would answer the same thing twice.
+	cache map[string]coord.EndpointSpec
+	// Devices is the device envelope a worker this host launches may SEE.
+	Devices []string
 }
 
 // NewResolver builds the resolver over the lifecycle authority.
-func NewResolver(store *records.Store) *Resolver {
-	return &Resolver{store: store, dev: map[string]coord.EndpointSpec{}}
-}
-
-// LoadDev reads one dev spec document. The file is a `coord.EndpointSpec` as JSON; a
-// malformed one refuses at launch rather than at the first submission.
-func (r *Resolver) LoadDev(path string) *exit.Error {
-	data, err := os.ReadFile(path)
-	if err != nil {
-		return exit.New(exit.NotFound, "cannot read the dev endpoint spec %s: %s", path, err).
-			WithRemedy("--dev-endpoint takes a JSON EndpointSpec; it is a development door")
+func NewResolver(store *records.Store, cfg config.Config) *Resolver {
+	return &Resolver{
+		store: store, cfg: cfg,
+		cache:   map[string]coord.EndpointSpec{},
+		Devices: []string{"0"},
 	}
-	var spec coord.EndpointSpec
-	if err := json.Unmarshal(data, &spec); err != nil {
-		return exit.New(exit.Validation, "%s is not an EndpointSpec: %s", path, err)
-	}
-	if spec.Endpoint == "" || len(spec.Bindings) == 0 {
-		return exit.New(exit.Validation, "%s names no endpoint or no binding", path)
-	}
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	r.dev[spec.Endpoint] = spec
-	return nil
 }
 
 // Resolve answers with the spec for one endpoint ref.
 func (r *Resolver) Resolve(endpoint string) (coord.EndpointSpec, *exit.Error) {
+	endpoint = strings.TrimSpace(endpoint)
 	r.mu.Lock()
-	spec, ok := r.dev[endpoint]
+	spec, ok := r.cache[endpoint]
 	r.mu.Unlock()
 	if ok {
 		return spec, nil
 	}
-	// The generation half: the pin exists and names a built venv, but the launch facts a
-	// supervisor needs are cr-016's stable runtime verb, which this host does not call
-	// yet (cl-001's seam names it as a one-line change to EndpointSpec.Args). Rather than
-	// guess an interpreter and an argv, this refuses BY NAME.
-	if r.store != nil {
-		pins, e := r.store.Pins(endpoint)
-		if e == nil && len(pins) > 0 {
-			return coord.EndpointSpec{}, exit.New(exit.Unavailable,
-				"%s is installed (generation %s) but this build cannot launch an installed generation",
-				endpoint, pins[0].Generation).
-				WithRemedy("the launch facts come from cr-016's runtime verb; cl-010 wires them")
-		}
+	gen, e := r.generation(endpoint)
+	if e != nil {
+		return coord.EndpointSpec{}, e
 	}
-	return coord.EndpointSpec{}, api.UnknownEndpoint(endpoint)
+	facts, e := launch.Read(*gen, r.cfg.Home, r.cfg.Tool())
+	if e != nil {
+		return coord.EndpointSpec{}, e
+	}
+	spec, e = facts.Spec(r.Devices)
+	if e != nil {
+		return coord.EndpointSpec{}, e
+	}
+	r.mu.Lock()
+	r.cache[endpoint] = spec
+	r.mu.Unlock()
+	return spec, nil
+}
+
+// generation resolves the ACTIVE pin for an endpoint. A ref may name its major
+// (`org/name@v2`); without one, a single pinned major answers and several refuse rather
+// than picking.
+func (r *Resolver) generation(ref string) (*records.Generation, *exit.Error) {
+	endpoint, major, hasMajor := splitMajor(ref)
+	if r.store == nil {
+		return nil, exit.Unavailablef("this LocalService has no install records")
+	}
+	pins, e := r.store.Pins(endpoint)
+	if e != nil {
+		return nil, e
+	}
+	if len(pins) == 0 {
+		return nil, api.UnknownEndpoint(endpoint)
+	}
+	chosen := pins[0]
+	if hasMajor {
+		found := false
+		for _, p := range pins {
+			if p.Major == major {
+				chosen, found = p, true
+			}
+		}
+		if !found {
+			return nil, exit.New(exit.NotFound, "%s is installed, but not at v%d", endpoint, major).
+				WithRemedy("installed majors: %s", majorsOf(pins)).
+				WithNext("cozy ls")
+		}
+	} else if len(pins) > 1 {
+		return nil, exit.Usagef("%s is installed at several majors and a ref must name one", endpoint).
+			WithRemedy("majors: %s — a major is a required path segment, never a default", majorsOf(pins)).
+			WithNext("cozy ls")
+	}
+	gen, e := r.store.Generation(chosen.Generation)
+	if e != nil {
+		return nil, e
+	}
+	if gen == nil {
+		return nil, exit.Internalf("%s is pinned to generation %s and that row is gone",
+			endpoint, chosen.Generation)
+	}
+	return gen, nil
+}
+
+// splitMajor cuts `org/name@vN` into its parts.
+func splitMajor(ref string) (endpoint string, major int, ok bool) {
+	name, suffix, cut := strings.Cut(ref, "@v")
+	if !cut {
+		return ref, 0, false
+	}
+	n := 0
+	for _, c := range suffix {
+		if c < '0' || c > '9' {
+			return ref, 0, false
+		}
+		n = n*10 + int(c-'0')
+	}
+	return name, n, true
+}
+
+func majorsOf(pins []records.Pin) string {
+	out := make([]string, 0, len(pins))
+	for _, p := range pins {
+		out = append(out, "v"+itoa(p.Major))
+	}
+	sort.Strings(out)
+	return strings.Join(out, ", ")
+}
+
+func itoa(n int) string {
+	if n == 0 {
+		return "0"
+	}
+	var b [20]byte
+	i := len(b)
+	for n > 0 {
+		i--
+		b[i] = byte('0' + n%10)
+		n /= 10
+	}
+	return string(b[i:])
 }
 
 // List names every endpoint this host can resolve.
 func (r *Resolver) List() []string {
 	out := []string{}
-	r.mu.Lock()
-	for name := range r.dev {
-		out = append(out, name)
-	}
-	r.mu.Unlock()
 	if r.store != nil {
 		if installed, e := r.store.Installed(); e == nil {
 			for _, g := range installed {

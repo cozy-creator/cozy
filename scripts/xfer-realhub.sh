@@ -1,6 +1,12 @@
 #!/usr/bin/env bash
-# cl-006 side-check (coordinator request): `cozy push` -> `cozy pull` against the REAL
-# tensorhub read plane, with NO SHIM anywhere.
+# `cozy push` -> `cozy pull` against the REAL tensorhub, with NO SHIM anywhere.
+#
+# cl-006's run of this script found the write side one field behind: th-003 REMOVED
+# `model_family` from the publish declaration (the hub classifies the family from the
+# artifact's topology digest) and decodes with DisallowUnknownFields, so every `cozy push`
+# was `request.malformed_body`, exit 3, before a byte moved. cl-010 removed the field and
+# `--family` with it; this script is the closure, and the push below is now a real arm
+# rather than a recorded follow-up.
 #
 # cl-012 proved pull against a 40-line forwarding shim, because th-002 had landed the
 # whole write side and no read side. th-003 (tensorhub 1353e53) landed the real one:
@@ -152,28 +158,25 @@ COZY_HOME="$PUB" "$WORK/cozy" repo create cl006/realhub --kind model \
   --reason "cl-006 side-check: real read plane" 2>&1 | sed 's/^/  /'
 PUSH_START=$(date +%s.%N)
 COZY_HOME="$PUB" "$WORK/cozy" push cl006/realhub "$SNAP" \
-  --family sdxl --reason "cl-006 side-check" 2>&1 | tee "$WORK/push.txt" | sed 's/^/  /'
+  --reason "cl-010 push closure" 2>&1 | tee "$WORK/push.txt" | sed 's/^/  /'
 PUSH_RC=${PIPESTATUS[0]}
 PUSH_MS=$(python3 -c "print(f'{($(date +%s.%N)-$PUSH_START)*1000:.0f}')")
 if [ "$PUSH_RC" = "0" ]; then
-  ok "push exited 0 in ${PUSH_MS} ms"
+  ok "cozy push exited 0 in ${PUSH_MS} ms — the artifact is installed in the REAL catalog"
 else
-  bad "push exited $PUSH_RC — $(grep -m1 'error(' "$WORK/push.txt" | head -c 140)"
-  note "RECORDED as a cl-012 follow-up: th-003 REMOVED model_family from BeginRequest"
-  note "(the hub classifies the family from the artifact) and decodes with"
-  note "DisallowUnknownFields, so the client's non-omitempty field is a hard refusal."
+  bad "push exited $PUSH_RC — $(grep -m1 'error(' "$WORK/push.txt" | head -c 200)"
 fi
+grep -q "model_family" "$WORK/push.txt" && bad "the client still mentions model_family" \
+  || ok "no model_family anywhere in the exchange — the hub CLASSIFIES the family"
+# The classifier's verdict is the hub's, printed by the client from the completion answer.
+grep -qiE "grade|satisfaction" "$WORK/push.txt" \
+  && ok "completion carried the hermetic verifier's verdict" \
+  || note "completion printed no grade line; see $WORK/push.txt"
 
-step "publish anyway, with the HUB'S OWN client — so the READ side can still be proven"
-# The read plane is what this side-check exists to exercise. The write-side field drift
-# above is a separate, now-named defect; publishing through tensorhub's own harness
-# isolates it so `cozy pull` still meets REAL grants at REAL final content keys.
-python3 "$WORK/hub/scripts/publish-client.py" --base "$BASE" --token "$ADMIN_TOKEN" \
-  --tfs "$TFS_BIN" --store "$PUB/cas" --snapshot "${SNAP#sha256:}" --repo cl006/realhub \
-  --work "$WORK/hubclient" 2>&1 | tail -6 | sed 's/^/  /'
-HUBPUB_RC=${PIPESTATUS[0]}
-[ "$HUBPUB_RC" = "0" ] && ok "the artifact is installed in the real catalog" \
-                      || { bad "the hub's own client could not publish either"; }
+step "the family the hub DERIVED — never one the client declared"
+FAMILY=$(curl -fsS "$BASE/v1/repos/cl006/realhub" 2>/dev/null | python3 -c \
+  "import json,sys; d=json.load(sys.stdin); print((d.get('repo') or d).get('model_family') or 'none')" 2>/dev/null || echo "unreadable")
+note "repo card model_family: $FAMILY"
 
 step "the hub's own read grants — real lengths, no shim"
 READS=$(curl -fsS -X POST "$BASE/v1/repos/cl006/realhub/checkpoints/$SNAP/reads" \

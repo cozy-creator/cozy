@@ -257,3 +257,28 @@ Recorded, not accidental.
 7. **Model/lane/adapter overrides are ADMISSIBLE here and refuse `501
    override_unresolved`.** The local binding resolver is cl-005's. An override that is
    silently ignored is the worse bug, so the field refuses rather than being dropped.
+
+## 10. The status→exit projection (cl-010)
+
+Every host's refusal envelope carries the refusal's own NAME; the shared exit-matrix code
+comes from the HTTP status. `api.CodeOf` is the inverse of `statusOf` and lives beside it
+so the two cannot drift, and a client on any of the three hosts reads it the same way:
+
+| status | matrix code |
+|---|---|
+| 200 · 201 · 202 | 0 ok |
+| 400 | 3 validation |
+| 401 · 403 | 5 credential |
+| 404 · 410 | 4 not_found |
+| 409 | 13 conflict |
+| 413 · 422 | 6 structural |
+| 428 | 7 confirm |
+| 501 | 2 usage (`not_implemented`) |
+| 503 | 9 unavailable |
+| 504 · 408 | 10 deadline |
+| 507 | 14 capacity |
+
+**A FAILED or CANCELED terminal never comes back through this table.** It is answered
+`200` on purpose — a terminal is an answer, not a transport failure — and a client maps
+the terminal's own status with the job-terminal mapping instead (succeeded 0 · failed 11 ·
+canceled 12 · deadline 10).

@@ -97,12 +97,6 @@ func handlePush(ctx *Context) *exit.Error {
 	if e != nil {
 		return e
 	}
-	family := strings.TrimSpace(ctx.Inv.Value("--family"))
-	if family == "" {
-		return exit.Usagef("`cozy push` needs --family <name>").
-			WithRemedy("the hub locks a model repo to one family at its first weight-bearing publish and refuses an undeclared one").
-			WithNext("cozy help push")
-	}
 	reason := strings.TrimSpace(ctx.Inv.Value("--reason"))
 	if reason == "" {
 		return exit.Usagef("`cozy push` needs --reason <why>").
@@ -127,7 +121,7 @@ func handlePush(ctx *Context) *exit.Error {
 	}
 	p := &transfer.Publish{
 		Tool: tool, Hub: c, Ref: ref, Snapshot: snapshot, Session: session,
-		Family: family, Reason: reason, DryRun: ctx.Inv.Bool("--dry-run"),
+		Reason: reason, DryRun: ctx.Inv.Bool("--dry-run"),
 		Progress: progress(ctx), Scratch: scratch(layout, snapshot), FailAfter: failAfter,
 	}
 	hctx, cancel := hub.LongContext()
@@ -153,7 +147,7 @@ func handlePush(ctx *Context) *exit.Error {
 				render.Field{K: "held", V: res.Totals.HeldObjects},
 				render.Field{K: "hub", V: c.Base()}),
 			Notes: []string{"--dry-run declared and stopped: the plan is the HUB's answer, not a local guess"},
-			Next:  []string{"cozy push " + ref.String() + " " + snapshot + " --family " + family + " --reason <why>"},
+			Next:  []string{"cozy push " + ref.String() + " " + snapshot + " --reason <why>"},
 		})
 	}
 	fields = append(fields,

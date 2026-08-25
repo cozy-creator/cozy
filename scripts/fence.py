@@ -130,6 +130,15 @@ CAS_PATH = re.compile(r'objects\s*[/",\s]+\s*sha256', re.I)
 TFS_SITES = {"internal/config/config.go", "internal/tfs/tfs.go"}
 TFS_FIELD = re.compile(r"\.Tfs\b")
 
+# (cl-010) The two files that may reach an endpoint's own cozy-runtime, and the CLOSED set
+# of verbs they may name. `install.go` runs `describe --check` at install; `artifacts.go`
+# asks for the artifact index, host facts and fit verdicts. Nothing executes a model
+# through this door — that is what the coordinator and the worker protocol are for.
+RUNTIME_SITES = {"internal/install/install.go", "internal/launch/artifacts.go"}
+RUNTIME_BIN = re.compile(r'"cozy-runtime"')
+RUNTIME_VERBS_OK = {"describe", "list", "doctor", "fit"}
+RUNTIME_VERBS_DENY = {"run", "job", "serve", "rm", "pull", "ingest", "new"}
+
 IDENT = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
 
 
@@ -227,6 +236,17 @@ def check_sources():
                         bad.append(f"{p}:{i}: [cas] '{call}' in the transfer plane — a digest computed "
                                    f"while moving bytes is a client receipt, and a client receipt proves "
                                    f"nothing (law 18): {line.strip()}")
+            if rel not in RUNTIME_SITES and RUNTIME_BIN.search(src_line) and \
+                    ALLOW_DOOR not in src_line:
+                bad.append(f"{p}:{i}: [runtime] the cozy-runtime binary is reached outside "
+                           f"{' / '.join(sorted(RUNTIME_SITES))} — one execution path: a run goes "
+                           f"coordinator -> worker protocol -> runtime, never a shell-out: {src_line.strip()}")
+            if rel in RUNTIME_SITES:
+                for verb in sorted(RUNTIME_VERBS_DENY):
+                    if re.search(r'"' + verb + r'"', src_line):
+                        bad.append(f"{p}:{i}: [runtime] this file may name only the READ verbs "
+                                   f"({', '.join(sorted(RUNTIME_VERBS_OK))}); '{verb}' would be a "
+                                   f"second execution door: {src_line.strip()}")
             if rel not in TFS_SITES and TFS_FIELD.search(line):
                 bad.append(f"{p}:{i}: [tensor] the tensorfs CLI is reached outside "
                            f"{' / '.join(sorted(TFS_SITES))} — one byte-plane door, one vocabulary: {line.strip()}")
@@ -392,5 +412,6 @@ print(
     f"manifest({RECLAIM_VERB.pattern}) secret({SECRET_FLAG.pattern} + Reveal@{len(REVEAL_SITES)}) "
     f"cas({len(DENY_DIGEST)} digests@{len(DIGEST_FREE)} + store-path) tensor(tfs@{len(TFS_SITES)}) "
     f"api({len(DENY_COOKIE)} cookie + cors + listen@{LISTEN_SITE}) "
+    f"runtime({len(RUNTIME_VERBS_DENY)} denied verbs@{len(RUNTIME_SITES)}) "
     f"contract({len(parse_go_routes(pathlib.Path('internal/api/routes.go')))} routes)"
 )

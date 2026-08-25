@@ -53,7 +53,7 @@ func handleUp(ctx *Context) *exit.Error {
 	}
 
 	if ctx.Inv.Bool("--detach") {
-		return detach(ctx, port, yield, ctx.Inv.Value("--dev-endpoint"))
+		return detach(ctx, port, yield)
 	}
 
 	socket := l.Root + "/worker.sock"
@@ -92,8 +92,14 @@ func handleUp(ctx *Context) *exit.Error {
 	}
 	defer st.Close()
 
+	// The resolver is built BEFORE the coordinator, because the coordinator holds it:
+	// select-or-start is the scheduler's act, and a request whose binding no live worker
+	// advertises makes one rather than queueing for capacity nothing would create.
+	resolver := NewResolver(st, ctx.Cfg)
+
 	c, e := coord.Open(coord.Options{
 		Cfg: ctx.Cfg, Layout: l, Store: st, Socket: socket, Yield: yield, Log: ctx.Out,
+		Endpoints: resolver,
 	})
 	if e != nil {
 		closeListeners()
@@ -112,14 +118,6 @@ func handleUp(ctx *Context) *exit.Error {
 	if e != nil {
 		closeListeners()
 		return e
-	}
-
-	resolver := NewResolver(st)
-	if spec := ctx.Inv.Value("--dev-endpoint"); spec != "" {
-		if e := resolver.LoadDev(spec); e != nil {
-			closeListeners()
-			return e
-		}
 	}
 
 	server := api.New(api.Options{
@@ -180,13 +178,10 @@ func openStub(ctx *Context, creds api.Credentials, addr string) {
 
 // detach re-runs this binary as the service in its own session, then waits for the
 // LOCK to be held — the same proof every other reader uses, never a sleep.
-func detach(ctx *Context, port int, yield, devEndpoint string) *exit.Error {
+func detach(ctx *Context, port int, yield string) *exit.Error {
 	args := []string{"up", "--port", strconv.Itoa(port)}
 	if yield != "" {
 		args = append(args, "--yield", yield)
-	}
-	if devEndpoint != "" {
-		args = append(args, "--dev-endpoint", devEndpoint)
 	}
 	self, err := os.Executable()
 	if err != nil {

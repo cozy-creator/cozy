@@ -347,6 +347,45 @@ func statusOf(code exit.Code) int {
 	return http.StatusInternalServerError
 }
 
+// CodeOf is statusOf's INVERSE, and it lives here so the two cannot drift: a client that
+// reads this API's refusals turns the status back into the shared matrix code the server
+// mapped out of. The envelope's `code` stays the refusal's own NAME (`override_unresolved`,
+// `bundle_corrupt`) — a name is more specific than a matrix row and is never flattened
+// into one. cl-010's CLI is the consumer; th-021's other hosts get the same projection.
+//
+// 200 for a FAILED or CANCELED terminal is deliberate on the way out (a terminal is an
+// answer, not a transport failure) and therefore never comes back through here: a client
+// reads the terminal's own status and maps it with exit.JobTerminal.
+func CodeOf(status int) exit.Code {
+	switch status {
+	case http.StatusOK, http.StatusAccepted, http.StatusCreated:
+		return exit.OK
+	case http.StatusBadRequest:
+		return exit.Validation
+	case http.StatusUnauthorized, http.StatusForbidden:
+		return exit.Credential
+	case http.StatusNotFound, http.StatusGone:
+		return exit.NotFound
+	case http.StatusConflict:
+		return exit.Conflict
+	case http.StatusPreconditionRequired:
+		return exit.Confirm
+	case http.StatusRequestEntityTooLarge, http.StatusUnprocessableEntity:
+		return exit.Structural
+	case http.StatusInsufficientStorage:
+		return exit.Capacity
+	case http.StatusServiceUnavailable:
+		return exit.Unavailable
+	case http.StatusNotImplemented:
+		// cl-002's spelling: "advertised, not carried by this build" is a USAGE
+		// refusal naming the issue that lands it, never an outage.
+		return exit.Usage
+	case http.StatusGatewayTimeout, http.StatusRequestTimeout:
+		return exit.Deadline
+	}
+	return exit.Internal
+}
+
 func (s *Server) unknownRoute(w http.ResponseWriter, r *http.Request) {
 	s.refuse(w, r, http.StatusNotFound, "unknown_route",
 		fmt.Sprintf("this host serves no %s %s", r.Method, r.URL.Path),

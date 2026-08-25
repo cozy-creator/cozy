@@ -52,6 +52,13 @@ var handlers = map[string]Handler{
 	"hub.config":   handleHubConfig,
 	"push":         handlePush,
 	"pull":         handlePull,
+	"start":        handleStart,
+	"stop":         handleStop,
+	"logs":         handleLogs,
+	"run":          handleRun,
+	"describe":     handleDescribe,
+	"doctor":       handleDoctor,
+	"fit":          handleFit,
 }
 
 func handlerNames() []string {
@@ -106,8 +113,34 @@ func handleStatus(ctx *Context) *exit.Error {
 				}
 			}
 		}
-		rec.Notes = []string{st.Details,
-			"endpoint and job listings arrive with the local client API (cl-006)"}
+		// The ENDPOINT and WORKER listings are the API's, because they are facts only the
+		// running service holds (cl-010: `cozy status` is a client of /v1/local/*). A
+		// credential that cannot be read is reported, never fatal — bare `cozy` is
+		// content-first and answers with what it could learn.
+		ctx.Service = st
+		if c, e := dial(ctx); e == nil {
+			if rows, e := c.Endpoints(); e == nil {
+				names := make([]string, 0, len(rows))
+				for _, row := range rows {
+					state := "cold"
+					if row.Resident {
+						state = "running"
+					}
+					names = append(names, row.Endpoint+" ("+state+")")
+				}
+				rec.Fields = append(rec.Fields, render.Field{K: "endpoints", V: names})
+			}
+			if workers, e := c.Workers(); e == nil {
+				live := make([]string, 0, len(workers))
+				for _, w := range workers {
+					live = append(live, w.Endpoint+" "+w.InstanceID+" "+w.Intake)
+				}
+				rec.Fields = append(rec.Fields, render.Field{K: "live_workers", V: live})
+			}
+		} else {
+			rec.Notes = append(rec.Notes, "the local client credential is unreadable: "+e.Message)
+		}
+		rec.Notes = append(rec.Notes, st.Details)
 		rec.Next = []string{"cozy commands"}
 	} else {
 		rec.Notes = []string{st.Details,

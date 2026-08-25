@@ -3,6 +3,7 @@ package api
 import (
 	"fmt"
 	"net"
+	"net/http"
 	"net/url"
 	"os"
 
@@ -68,6 +69,51 @@ func (c Credentials) Admits(presented string) bool {
 	browser := c.Browser.Equal(presented)
 	cli := c.CLI.Equal(presented)
 	return browser || cli
+}
+
+// ClientCredential is the CLI side of the 0600 handoff (cl-010, the file's first reader).
+// It is deliberately here and not in the client package: this file is the credential's
+// carrier site, so the raw value is read where it becomes a carrier and nowhere else —
+// the `secret` fence family holds that.
+//
+// A missing file means the LocalService is not running or is running on another root.
+// That is exactly the exit-9 condition every server-backed verb already shares, so it
+// refuses with the same remedy rather than inventing a credential vocabulary.
+func ClientCredential(l home.Layout) (secret.Value, *exit.Error) {
+	info, err := os.Stat(l.Client)
+	if err != nil {
+		return secret.Value{}, exit.Unavailablef(
+			"no local client credential at %s", l.Client).
+			WithRemedy("the LocalService writes it at launch and it dies with the process").
+			WithNext("cozy up", "cozy status")
+	}
+	// The mode is CHECKED, not assumed. A credential that became group- or
+	// world-readable (an inherited umask, a careless copy) is a refusal: reading it
+	// anyway would be the client agreeing to a leak the server tried to prevent.
+	if perm := info.Mode().Perm(); perm&0o077 != 0 {
+		return secret.Value{}, exit.New(exit.Credential,
+			"%s is mode %#o; the local client credential is 0600 or it is not used", l.Client, perm).
+			WithRemedy("restart the LocalService: every launch mints a fresh pair").
+			WithNext("cozy down", "cozy up")
+	}
+	data, err := os.ReadFile(l.Client)
+	if err != nil {
+		return secret.Value{}, exit.New(exit.Credential,
+			"the local client credential is unreadable: %s", err)
+	}
+	v := secret.New(string(data))
+	if !v.Present() {
+		return secret.Value{}, exit.New(exit.Credential,
+			"the local client credential at %s is empty", l.Client).
+			WithNext("cozy down", "cozy up")
+	}
+	return v, nil
+}
+
+// Authorize puts a credential onto one outbound request. It is the ONLY place a local
+// client credential becomes a header, which is why it lives beside the writer.
+func Authorize(r *http.Request, v secret.Value) {
+	r.Header.Set("Authorization", "Bearer "+v.Reveal())
 }
 
 // OpenURL is what `--open` hands the browser: the stub page with the browser credential

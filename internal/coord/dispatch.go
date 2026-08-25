@@ -109,6 +109,7 @@ func (c *Coordinator) SubmitDetail(s Submission) (string, uint64, bool, *exit.Er
 		c.enqueue(req.ID)
 		c.emit(req.ID, "request.queued", 0, map[string]any{"reason": e.Message})
 		c.logf("%s QUEUED for capacity: %s", req.ID, e.Message)
+		c.selectOrStart(req)
 		return req.ID, 0, true, nil
 	}
 	return req.ID, attempt, true, nil
@@ -144,10 +145,85 @@ func (c *Coordinator) Requeue(requestID, why string) {
 		c.enqueue(requestID)
 		c.emit(requestID, "request.queued", 0, map[string]any{"reason": e.Message, "requeues": n})
 		c.logf("%s requeued %d/%d and QUEUED for capacity: %s", requestID, n, MaxRequeues, e.Message)
+		c.selectOrStart(*req)
 		return
 	}
 	c.logf("%s requeued as attempt %d (%d/%d of the budget, cause %s)",
 		requestID, attempt, n, MaxRequeues, why)
+}
+
+// selectOrStart makes a queued request's endpoint resident. It is the half of `cozy run`
+// that "cold and warm traverse the same states" rests on: SELECT the worker that already
+// advertises the binding, or START one — never a second invocation mechanism, and never a
+// client's job. `cozy start` is the same act made explicit for prewarming.
+//
+// It runs off the caller's goroutine because a cold start is a 4.782 GiB fill, and the
+// submitting client is already watching the event stream that will say when it lands. The
+// dispatch itself is still `drain`'s, triggered by the worker reporting READY: this
+// function never dispatches, so there is exactly one placement path.
+//
+// A worker that cannot become dispatchable is a TERMINAL condition for the request, not a
+// longer wait. A request that queues forever behind a worker that died on boot is the
+// worst of both: no output and no answer.
+func (c *Coordinator) selectOrStart(req records.Request) {
+	if c.opt.Endpoints == nil {
+		return
+	}
+	c.mu.Lock()
+	if c.starting[req.Endpoint] {
+		c.mu.Unlock()
+		return
+	}
+	for _, w := range c.workers {
+		if w.spec.Endpoint == req.Endpoint && !w.exited {
+			// One is already resident or loading. Its READY drains the queue.
+			c.mu.Unlock()
+			return
+		}
+	}
+	c.starting[req.Endpoint] = true
+	c.mu.Unlock()
+
+	go func() {
+		defer func() {
+			c.mu.Lock()
+			delete(c.starting, req.Endpoint)
+			c.mu.Unlock()
+		}()
+		spec, e := c.opt.Endpoints.Resolve(req.Endpoint)
+		if e != nil {
+			c.failQueued(req.ID, e)
+			return
+		}
+		instance, e := c.StartWorker(spec)
+		if e != nil {
+			c.failQueued(req.ID, e)
+			return
+		}
+		c.logf("%s: started %s for the queued request", req.Endpoint, instance)
+		if e := c.WaitReady(instance, req.PlanID, 30*time.Minute); e != nil {
+			c.failQueued(req.ID, e)
+			return
+		}
+		c.drain()
+	}()
+}
+
+// failQueued settles a request that can never be placed. It is a request-level terminal:
+// no attempt was ever dispatched, so there is no attempt terminal to replay and the
+// request row is what settles.
+func (c *Coordinator) failQueued(requestID string, cause *exit.Error) {
+	c.forget(requestID)
+	if e := c.opt.Store.SettleRequest(requestID, "failed"); e != nil {
+		c.logf("%s could not be settled: %s", requestID, e.Message)
+	}
+	c.emit(requestID, "request.failed", 0, map[string]any{
+		"status": "FAILED", "cause": cause.ErrName(),
+		"error_type": cause.ErrName(), "error": cause.Message,
+		"outputs": []any{}, "requeuing": false,
+	})
+	c.logf("%s FAILED before any attempt: %s", requestID, cause.Message)
+	c.waitRequest(requestID).markClosed(cause)
 }
 
 func (c *Coordinator) dispatch(req records.Request) (uint64, *exit.Error) {

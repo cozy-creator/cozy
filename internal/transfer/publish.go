@@ -41,7 +41,6 @@ type Publish struct {
 	// Snapshot is the local canonical snapshot being published: `sha256:<64 hex>`.
 	Snapshot string
 	Session  string
-	Family   string
 	Reason   string
 	DryRun   bool
 	// Progress receives one line per phase. It is where the honest accounting is
@@ -68,14 +67,14 @@ type Result struct {
 	Verified  int
 	// Moved is bytes this invocation actually put on the wire; Deduped is what the
 	// hub already held. Their sum is the artifact.
-	Moved   int64
-	Deduped int64
-	Sources []string
-	Root    hub.Root
-	Grade   string
-	Verdict string
-	Dup     bool
-	MS      map[string]int64
+	Moved    int64
+	Deduped  int64
+	Sources  []string
+	Root     hub.Root
+	Grade    string
+	Verdict  string
+	Dup      bool
+	MS       map[string]int64
 	Reingest int
 }
 
@@ -126,7 +125,6 @@ func (p *Publish) Run(ctx context.Context) (Result, *exit.Error) {
 		SnapshotID:   p.Snapshot,
 		Manifest:     hub.B64(manifest),
 		HeaderID:     "sha256:" + header,
-		ModelFamily:  p.Family,
 	}
 	for _, o := range objects {
 		decl.Objects = append(decl.Objects, hub.Object{ID: o.ID, Length: o.Length})

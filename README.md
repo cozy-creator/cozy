@@ -128,8 +128,58 @@ runtime: every submission still flows coordinator → worker protocol → runtim
 
 Live drivers: `./cozy-live apiarms` (35 door/refusal checks, no GPU), `./cozy-live api`
 (51 checks, real SDXL end to end), `./cozy-live apicrash` (23 checks — `kill -9` the
-coordinator mid-attempt and watch the recovered-attempts law from the client's seat).
-Pin the runtime with `--runtime <git archive> --venv <venv>`.
+coordinator mid-attempt and watch the recovered-attempts law from the client's seat). All
+three install the endpoint through `cozy install`; the runtime they run is the one the
+RELEASE pinned (`scripts/sdxl-release.sh` builds it from a read-only `git archive`), so a
+verification's peer cannot move underneath it.
+
+## Lifecycle and request verbs (cl-010)
+
+`start` / `stop` / `logs` / `run` / `describe` / `doctor` / `fit` — the CLI as the local
+client API's **first client**. `internal/client` is the ONE way any of them reaches the
+service, so there is no temporary direct-Go path for the HTTP API to later wrap:
+
+    cozy run  = POST /v1/requests + GET /v1/requests/{id}/events + GET /v1/media/{id}
+    cozy start/stop = POST / DELETE /v1/local/workers
+    cozy logs <attempt> = GET /v1/local/attempts/{key}/triage
+    cozy doctor = GET /v1/local/doctor
+
+- **ONE EXECUTION PATH, and cold and warm traverse the same states.** A request whose
+  binding no live worker advertises does not queue for capacity that nothing would create:
+  the coordinator SELECTS-OR-STARTS (`coord.selectOrStart`), the worker's READY drains the
+  queue, and dispatch stays the one placement path. `cozy start` is the same act made
+  explicit for prewarming — never a second invocation mechanism. A worker that cannot
+  become dispatchable settles the request FAILED rather than leaving it queued forever.
+- **The CLI reads a 0600 credential**, never argv and never an env value. The file's mode
+  is CHECKED: one that became group- or world-readable is exit 5, because reading it anyway
+  would be the client agreeing to a leak the server tried to prevent.
+- **Every API refusal renders typed.** `api.CodeOf` is `statusOf`'s inverse and lives
+  beside it, so the server's status maps back to the shared matrix code while the
+  envelope's own NAME survives (`override_unresolved`, `bundle_corrupt`).
+- **An installed generation is the only source of launch facts** (`internal/launch`), and
+  `--dev-endpoint` is DELETED with its loader and its writer. A generation carries the
+  venv that runs it, the descriptor its own runtime derived and the install verified, and
+  the `endpoint.toml` binding table that selects its artifact; the local artifact index
+  answers where the bytes are. cozy-creator mints the local pinned-binding record from
+  those three (th-004 owns the real EntrypointBindingPlan document — the named seam).
+- **The payload is typed against the recorded schema**, client-side, before a request
+  exists: `steps=2` is an int because the surface says int, an undeclared key is exit 3
+  naming what the release declares, and none of it costs a subprocess or a round trip.
+- **`--out` writes by DECLARED FIELD PATH** (`image`, `detail.thumb`) — a consequence of
+  the endpoint's declared result, not a convention. The file gets no invented extension:
+  the worker's manifest hard-codes `application/octet-stream` today, so the run degrades
+  loudly and names the seam instead of sniffing the bytes.
+- **SIGINT cancels, it does not abandon.** The client asks the coordinator to cancel and
+  keeps watching, because the attempt's own journaled terminal settles the request; the
+  exit code is the terminal's, through `exit.JobTerminal` (0 · 11 · 12 · 10).
+- `describe` renders the surface the install already verified (re-deriving it per
+  invocation would import the endpoint's whole module graph for a proven fact); `fit`
+  always delegates, because a verdict prices against the card's measured free bytes now.
+
+Live drivers: `./cozy-live verbs` (25 refusal arms, no GPU) and `./cozy-live journey`
+(the whole user path on the real card). `scripts/sdxl-release.sh` builds the SDXL endpoint
+RELEASE they install — source, a lock over its whole closure, and the two wheels that are
+not on an index yet, with cozy-runtime built from a pinned read-only `git archive`.
 
 ## Catalog and first-party publish (cl-011)
 
@@ -172,11 +222,13 @@ Two verbs move a canonical checkpoint between the local store and the hub. Neith
 a byte or a protocol — `internal/tfs` is the ONE door to a byte-plane fact and
 `internal/hub` the ONE door to the hub — so `internal/transfer` owns only the SEQUENCE.
 
-**`cozy push <org/repo> <sha256:snapshot> --family <f> --reason <why>`** drives th-002's
+**`cozy push <org/repo> <sha256:snapshot> --reason <why>`** drives th-002's
 declare-first protocol: declare the exact object set before a byte moves → the hub
 answers what it lacks → write only those, straight to their FINAL content keys under
 every condition the grant signed → the hub streams each object back and hashes it
-ITSELF → complete runs the hermetic verifier and installs one root. A path refuses by
+ITSELF → complete runs the hermetic verifier and installs one root. **The model family is
+not declared** — th-003's hub CLASSIFIES it from the artifact's topology digest and refuses
+an unknown field, so `--family` is gone (cl-010 closed cl-006's finding). A path refuses by
 name: only a canonical snapshot is publishable, and the border runs where the bytes are
 (`tfs ingest`). `--dry-run` declares and stops — the plan is the hub's answer, not a
 local guess.
@@ -202,13 +254,11 @@ becomes a named local root only after `tfs snapshot verify` proves every declare
 - `--token-stdin` takes this invocation's credential as a VALUE on stdin. It is not a
   prompt and never argv.
 
-**`cozy pull` needs one hub route that does not exist.** th-002 landed the whole write
-side and no read side: the hub signs PUTs at final keys and streams objects back for its
-own verification, but exposes no route handing a client a presigned GET. Against such a
-hub `pull` refuses `hub.no_read_plane` by name rather than inventing a bucket URL or
-reaching storage with a credential of its own — a second custody authority is exactly
-what law 2 forbids. `scripts/xfer-live.py` supplies that one route (and nothing else) so
-the rest of the path can be proved on real bytes.
+**The read plane is real.** th-003 landed `POST …/checkpoints/{snapshot}/reads` and
+`scripts/xfer-realhub.sh` proves push → pull end to end against a hub built from that
+commit, with no shim anywhere. Against an OLDER hub `pull` still refuses
+`hub.no_read_plane` by name rather than inventing a bucket URL or reaching storage with a
+credential of its own — a second custody authority is exactly what law 2 forbids.
 
 `deploy` and `promote` stay advertised-not-built: releases arrive with th-003 (the hub's
 own promote route answers `promote.not_armed` today) and the leased build that turns a
@@ -228,7 +278,9 @@ No automated tests. Verification is running the real thing:
   `canonical` (worker-protocol's frozen corpus, byte-for-byte, plus every semantic twin
   refused by its own code), `arms` (the refusal matrix against `fakeworker`, a second
   independent Go implementation of the worker side), `attempt` and `recovered` (the real
-  cozy-runtime supervisor + executor on a real GPU).
+  cozy-runtime supervisor + executor on a real GPU), `api`/`apiarms`/`apicrash` (the local
+  client API from a client's seat), and `verbs`/`journey` (the CLI as a user types it,
+  against an INSTALLED endpoint — no hand-written spec document anywhere).
 - `scripts/verify-cl012.sh` + `scripts/xfer-live.py` drive the real `cozy` against a
   real tensorhub (built from a PINNED commit through a read-only `git archive`, because
   that repo has a concurrent writer), its own Postgres container, real R2 under
@@ -236,7 +288,7 @@ No automated tests. Verification is running the real thing:
   0-byte dedup publish, an interrupted publish and an interrupted fetch each converging
   on a re-run, the whole refusal matrix, and the benchmarks. Everything it writes to R2
   is swept and the sweep is re-listed to prove it.
-- `scripts/fence.py` enforces eleven families: forbidden deps, byte-plane vocabulary
+- `scripts/fence.py` enforces thirteen families: forbidden deps, byte-plane vocabulary
   (TensorFS owns storage/residency), interactive prompts, exit-matrix parity, a manifest
   lint, the env-read fence (one reader), no lifecycle sidecar, no cloud emulation or
   minted credential, the secret fence (no credential-shaped flag takes an argv value;

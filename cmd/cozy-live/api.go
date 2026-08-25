@@ -24,7 +24,7 @@ import (
 func sectionAPIArms() {
 	root := flag("home", filepath.Join(os.TempDir(), "cozy-live", "api-arms"))
 	port := freePort(2790)
-	svc := startService(root, port, "", true)
+	svc := startService(root, port, true)
 	defer svc.stop()
 
 	head("the door: loopback, Host, Origin, bearer")
@@ -203,13 +203,10 @@ func sectionAPI() {
 	must("clearing the service root", os.RemoveAll(root))
 	must("creating the service root", os.MkdirAll(root, 0o755))
 
-	spec := sdxlSpec("denoise", "pair")
-	spec.Bindings[0].Outputs = []string{"image"}
-	spec.Bindings[1].Outputs = []string{"preview", "detail.thumb"}
-	devSpec := writeDevSpec(root, spec)
+	installEndpoint(root)
 
 	port := freePort(2801)
-	svc := startService(root, port, devSpec, false)
+	svc := startService(root, port, false)
 	defer svc.stop()
 
 	head("the LOCAL module: an endpoint this host can serve, and a worker to serve it")

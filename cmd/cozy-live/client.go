@@ -16,7 +16,6 @@ import (
 	"time"
 
 	"github.com/cozy-creator/cozy-creator-v2/internal/config"
-	"github.com/cozy-creator/cozy-creator-v2/internal/coord"
 )
 
 // The cl-006 driver's own HTTP client, and a SEPARATE `cozy up` process to point it at.
@@ -41,7 +40,7 @@ type liveService struct {
 // startService launches a REAL `cozy up` in its own process group and waits for the API
 // to answer. `fresh` wipes the root; a restart after a kill must NOT, because the whole
 // point is that the authority and the worker journal survived.
-func startService(root string, port int, devSpec string, fresh bool) *liveService {
+func startService(root string, port int, fresh bool) *liveService {
 	if fresh {
 		must("clearing the service root", os.RemoveAll(root))
 	}
@@ -60,9 +59,6 @@ func startService(root string, port int, devSpec string, fresh bool) *liveServic
 	defer logFile.Close()
 
 	args := []string{"up", "--port", fmt.Sprint(port)}
-	if devSpec != "" {
-		args = append(args, "--dev-endpoint", devSpec)
-	}
 	// nice(1) is the DRIVER's resource discipline on a shared box, imposed on the launch
 	// rather than baked into the product.
 	cmd := exec.Command("/usr/bin/nice", append([]string{"-n", "19", abs}, args...)...)
@@ -370,19 +366,6 @@ func (st *sseStream) find(kind string) *sseEvent {
 		}
 	}
 	return nil
-}
-
-// ---------------------------------------------------------------------- the dev spec
-
-// writeDevSpec renders cl-001's real SDXL EndpointSpec as the document `cozy up
-// --dev-endpoint` reads. It is how a SEPARATE service process gets the launch facts an
-// installed generation will carry once cr-016's runtime verb lands.
-func writeDevSpec(root string, spec coord.EndpointSpec) string {
-	path := filepath.Join(root, "dev-endpoint.json")
-	data, err := json.MarshalIndent(spec, "", "  ")
-	must("rendering the dev endpoint spec", err)
-	must("writing the dev endpoint spec", os.WriteFile(path, data, 0o644))
-	return path
 }
 
 func freePort(preferred int) int {

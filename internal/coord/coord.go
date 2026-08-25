@@ -47,6 +47,13 @@ type Options struct {
 	Yield string
 	Log   io.Writer
 
+	// Endpoints resolves `org/name` to the spec that makes its worker resident. It is the
+	// START-OR-SELECT half of the one execution path (cl-010): a request whose binding no
+	// live worker advertises MAKES one, so a cold invocation and a warm one traverse the
+	// same states and differ only in latency. Without it a cold request queues for
+	// capacity that nothing would ever create.
+	Endpoints Launcher
+
 	// ImageDigest and ConfigDigest ride INSIDE every ExecutionSpec document: the exact
 	// execution environment (class b) and the evaluated-config document's identity
 	// (class a, cr-003's). They are frozen per service, never per request — a request
@@ -55,6 +62,14 @@ type Options struct {
 	ConfigDigest string
 	GrantTTL     time.Duration
 	MaxOutputMiB int64
+}
+
+// Launcher resolves an endpoint ref to the spec that starts its worker. The coordinator
+// holds it to SELECT-OR-START and for nothing else: it never resolves a name itself, and
+// the object that does is the LOCAL module's install-generation resolver (cl-010) or, on
+// a pod, cl-014's.
+type Launcher interface {
+	Resolve(endpoint string) (EndpointSpec, *exit.Error)
 }
 
 // Coordinator is the LocalService's scheduling role.
@@ -71,7 +86,11 @@ type Coordinator struct {
 	// pending is the dispatch queue: requests that have no ready worker YET. A requeue
 	// with nowhere to go WAITS for capacity instead of evaporating — the alternative is
 	// a request that quietly stops existing because a worker was still loading.
-	pending  []string
+	pending []string
+	// starting names the endpoints a select-or-start is already making resident. One
+	// launch per endpoint: three cold requests for one endpoint must not spawn three
+	// workers and three device grants for a card that serves one attempt at a time.
+	starting map[string]bool
 	revision uint64 // hub-owned, monotonic; every Directive bumps it
 	events   []string
 
@@ -102,6 +121,7 @@ func Open(opt Options) (*Coordinator, *exit.Error) {
 		sessions: map[string]*session{},
 		workers:  map[string]*worker{},
 		waits:    map[string]*wait{},
+		starting: map[string]bool{},
 		frames:   newFanout(),
 	}
 	// A stale socket file is a leftover, never evidence: the service lock already proved

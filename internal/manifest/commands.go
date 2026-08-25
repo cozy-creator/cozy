@@ -24,6 +24,13 @@ var FoundationTokens = []string{
 	"transfer.declare_first", // publish declares the whole object set before a byte moves
 	"transfer.resumable",     // an interrupted transfer resumes from verified state, not a local journal
 	"transfer.verified_cas",  // every fetched byte enters the local store under its declared identity
+	"cli.api_client",         // every lifecycle/request verb speaks the local client API, never a direct path
+	"cli.credential.file",    // the CLI reads a 0600 handoff file; never argv, never an env value
+	"run.one_path",           // one execution path: request -> attempt -> terminal -> accepted output
+	"run.idempotency",        // `cozy run` carries a key; the same key returns the same request
+	"run.payload.schema",     // payload typed against the recorded surface, before a request exists
+	"run.media.save",         // `--out` writes accepted outputs by opaque id and declared field path
+	"endpoint.generations",   // an installed generation is the ONLY source of launch facts
 }
 
 // APITokens are the local client API's own tokens (cl-006). They live in internal/api's
@@ -87,7 +94,6 @@ var Commands = []Command{
 			{Name: "--port", Arg: "<n>", Summary: "local client API port (default 2699, loopback only)"},
 			{Name: "--open", Summary: "open the stub UI page with the per-launch token"},
 			{Name: "--yield", Arg: "<smart|always|never>", Summary: "GPU yield policy (default smart)"},
-			{Name: "--dev-endpoint", Arg: "<spec.json>", Summary: "development: serve one uninstalled endpoint from a spec document (cl-010 replaces it)"},
 		},
 		MaxArgs:    0,
 		Exits:      []exit.Code{exit.OK, exit.Conflict},
@@ -146,9 +152,10 @@ var Commands = []Command{
 		Path: []string{"start"}, Group: "endpoints",
 		Summary: "lifecycle/prewarm: make an endpoint worker resident (never a second invoke path)",
 		Args:    "<org/endpoint[@vN]>", MinArgs: 1, MaxArgs: 1,
-		Flags:      []Flag{{Name: "--detach", Short: "-d", Summary: "leave it warm in the background"}},
-		Exits:      []exit.Code{exit.OK, exit.NotFound, exit.Unavailable},
-		Capability: "cmd.start", NeedsServer: true, Status: Planned, Issue: "cl-010",
+		Flags: []Flag{{Name: "--detach", Short: "-d", Summary: "leave it warm in the background"}},
+		Exits: []exit.Code{exit.OK, exit.Usage, exit.Validation, exit.NotFound, exit.Structural,
+			exit.Unavailable, exit.Deadline, exit.Failed, exit.Conflict},
+		Capability: "cmd.start", NeedsServer: true, Status: Implemented, Handler: "start",
 	},
 	{
 		Path: []string{"stop"}, Group: "endpoints",
@@ -158,8 +165,8 @@ var Commands = []Command{
 			{Name: "--all", Summary: "every endpoint process"},
 			{Name: "--timeout", Arg: "<dur>", Summary: "cooperative phase bound"},
 		},
-		Exits:      []exit.Code{exit.OK, exit.Unavailable},
-		Capability: "cmd.stop", NeedsServer: true, Status: Planned, Issue: "cl-010",
+		Exits:      []exit.Code{exit.OK, exit.Usage, exit.Unavailable},
+		Capability: "cmd.stop", NeedsServer: true, Status: Implemented, Handler: "stop",
 	},
 	{
 		Path: []string{"logs"}, Group: "endpoints",
@@ -169,8 +176,8 @@ var Commands = []Command{
 			{Name: "--follow", Short: "-f", Summary: "follow"},
 			{Name: "--lines", Short: "-n", Arg: "<count>", Summary: "tail count (default 100)"},
 		},
-		Exits:      []exit.Code{exit.OK, exit.Usage, exit.NotFound, exit.Unavailable},
-		Capability: "cmd.logs", NeedsServer: true, Status: Planned, Issue: "cl-010",
+		Exits:      []exit.Code{exit.OK, exit.Usage, exit.NotFound, exit.Unavailable, exit.Conflict},
+		Capability: "cmd.logs", NeedsServer: true, Status: Implemented, Handler: "logs",
 	},
 
 	// ---- invocation (cl-010) ----
@@ -190,34 +197,43 @@ var Commands = []Command{
 			{Name: "--in", Arg: "<file>", Summary: "whole payload as JSON"},
 			{Name: "--local", Summary: "run on this host (default)"},
 			{Name: "--cloud", Summary: "submit to tensorhub under the account"},
+			// One key names one request forever. A bare `run` mints its own, so retry
+			// safety across a process restart is the caller's explicit act.
+			{Name: "--idempotency-key", Arg: "<k>", Summary: "reuse a key: the same key returns the same request"},
 		},
-		Exits:      []exit.Code{exit.OK, exit.Validation, exit.NotFound, exit.Credential, exit.Structural, exit.OfflineMiss, exit.Unavailable, exit.Deadline, exit.Failed, exit.Canceled, exit.Capacity},
-		Capability: "cmd.run", NeedsServer: true, Status: Planned, Issue: "cl-010",
+		Exits: []exit.Code{exit.OK, exit.Usage, exit.Validation, exit.NotFound, exit.Credential,
+			exit.Structural, exit.OfflineMiss, exit.Unavailable, exit.Deadline, exit.Failed,
+			exit.Canceled, exit.Conflict, exit.Capacity},
+		Capability: "cmd.run", NeedsServer: true, Terminals: true, Status: Implemented, Handler: "run",
 	},
 	{
 		Path: []string{"describe"}, Group: "invocation",
-		Summary: "the endpoint descriptor: installed delegates to the runtime, else the catalog",
+		Summary: "the endpoint descriptor: the surface this release's own runtime derived and the install verified",
 		Args:    "<org/endpoint[@vN][/function]>", MinArgs: 1, MaxArgs: 1,
-		Exits:      []exit.Code{exit.OK, exit.NotFound, exit.Unavailable},
-		Capability: "cmd.describe", NeedsServer: true, Status: Planned, Issue: "cl-010",
+		Exits: []exit.Code{exit.OK, exit.Usage, exit.Validation, exit.NotFound, exit.Structural, exit.Conflict},
+		// A records-plane read (cl-009's D3 rule): the descriptor is a verified document
+		// in the generation, so the LocalService is not on the path to reading it.
+		Capability: "cmd.describe", Status: Implemented, Handler: "describe",
 	},
 	{
 		Path: []string{"doctor"}, Group: "invocation",
 		Summary:    "host facts plus per-installed-endpoint fit verdicts",
 		MaxArgs:    0,
 		Exits:      []exit.Code{exit.OK, exit.Unavailable},
-		Capability: "cmd.doctor", NeedsServer: true, Status: Planned, Issue: "cl-010",
+		Capability: "cmd.doctor", NeedsServer: true, Status: Implemented, Handler: "doctor",
 	},
 	{
 		Path: []string{"fit"}, Group: "invocation",
 		Summary: "fit verdicts for one endpoint/binding: fits / degraded / structural / capacity",
-		Args:    "<org/endpoint[@vN]>", MinArgs: 1, MaxArgs: 1,
+		Args:    "<org/endpoint[@vN][/function]>", MinArgs: 1, MaxArgs: 1,
 		Flags: []Flag{
 			{Name: "--model", Arg: "<ref>", Summary: "binding override"},
 			{Name: "--lane", Arg: "<l>", Summary: "lane"},
 		},
-		Exits:      []exit.Code{exit.OK, exit.NotFound, exit.Unavailable},
-		Capability: "cmd.fit", NeedsServer: true, Status: Planned, Issue: "cl-010",
+		// ADVISORY above the physical floor (a degradable shortfall degrades and exits 0);
+		// 14 below it with the runtime's quantified shortfall; 6 structural.
+		Exits:      []exit.Code{exit.OK, exit.Usage, exit.NotFound, exit.Structural, exit.Capacity},
+		Capability: "cmd.fit", Status: Implemented, Handler: "fit",
 	},
 
 	// ---- jobs (cl-004) ----
@@ -341,7 +357,9 @@ var Commands = []Command{
 		Summary: "declare-first upload of a local canonical snapshot; only missing bytes move",
 		Args:    "<org/repo> <sha256:snapshot>", MinArgs: 2, MaxArgs: 2,
 		Flags: []Flag{
-			{Name: "--family", Arg: "<name>", Summary: "required; the hub locks a repo to one model family"},
+			// No `--family`: th-003's hub CLASSIFIES the family from the artifact's
+			// topology digest and refuses an unknown field, so a declared family is
+			// both unnecessary and fatal (cl-006's real-hub side-check, closed here).
 			{Name: "--reason", Arg: "<why>", Summary: "required; the hub records it durably before it acts"},
 			{Name: "--session", Arg: "<name>", Summary: "publish session name (default derived from the snapshot)"},
 			{Name: "--dry-run", Summary: "declare and stop: the hub's own transfer plan"},
