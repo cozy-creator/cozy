@@ -1,0 +1,4 @@
+doc: capability
+expect: ok
+id: sha256:47c72f0255ab1c5b8702f0aa9094f12f98724e8f091027bb83fb6583ae3f0f0f
+note: one qualified (encoding, device) pair per vectored spec; every other pair refuses

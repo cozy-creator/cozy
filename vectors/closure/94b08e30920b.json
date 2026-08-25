@@ -1,1 +1,0 @@
-{"doc":"value[i,j] = data[i,j] * scale[i]. Per-output-row fp8 e4m3 weights with one f32 scale per row.","format":"tensorfs.encoding_spec/1","logical_dtypes":["bf16","f16","f32"],"logical_rank":2,"roles":{"data":{"carrier":{"dtypes":["f8_e4m3fn"],"t":"set"},"shape":{"t":"same"}},"scale":{"carrier":{"dtypes":["f32"],"t":"set"},"shape":{"dims":[{"axis":0,"t":"axis"}],"t":"dims"}}}}

@@ -1,0 +1,4 @@
+doc: structure
+expect: refuse
+code: UNKNOWN_FIELD
+note: provenance is real or synthetic, never a third thing

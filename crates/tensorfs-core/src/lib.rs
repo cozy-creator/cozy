@@ -5,6 +5,7 @@
 
 pub mod b64;
 pub mod canon;
+pub mod capability;
 pub mod checkpoint;
 pub mod dtype;
 pub mod err;
@@ -18,4 +19,5 @@ pub mod relation;
 pub mod sha256;
 pub mod spec;
 pub mod store;
+pub mod structure;
 pub mod vectors;

@@ -377,6 +377,41 @@ impl Tensor {
     }
 }
 
+/// The ONE topology projection: component → key → logical {dtype, shape}. A real header and
+/// a banked structure fixture must produce the same bytes for the same structure, so they
+/// call the same function over the same iterator shape rather than each building a map.
+pub fn topology_value<'a>(
+    items: impl Iterator<Item = (&'a str, &'a str, Dtype, &'a [u64])>,
+) -> Value {
+    let mut comps: Vec<(String, Vec<(String, Value)>)> = Vec::new();
+    for (c, k, dtype, shape) in items {
+        let leaf = Value::obj(vec![
+            ("dtype", Value::str(dtype.name())),
+            ("shape", shape_value(shape)),
+        ]);
+        match comps.iter_mut().find(|(n, _)| n == c) {
+            Some((_, ks)) => ks.push((k.to_string(), leaf)),
+            None => comps.push((c.to_string(), vec![(k.to_string(), leaf)])),
+        }
+    }
+    Value::obj(vec![
+        (
+            "components",
+            Value::map(
+                comps
+                    .into_iter()
+                    .map(|(c, ks)| (c, Value::map(ks)))
+                    .collect(),
+            ),
+        ),
+        ("projection", Value::str("cozytensors.topology/1")),
+    ])
+}
+
+pub fn topology_digest_of(v: &Value) -> String {
+    crate::ids::object_id(&crate::canon::write(v))
+}
+
 impl Header {
     pub fn tensors(&self) -> impl Iterator<Item = (&String, &String, &Tensor)> {
         self.components
@@ -384,41 +419,15 @@ impl Header {
             .flat_map(|(c, ts)| ts.iter().map(move |(k, t)| (c, k, t)))
     }
 
-    /// The frozen topology projection: component → key → logical {dtype, shape}.
     pub fn topology_value(&self) -> Value {
-        Value::obj(vec![
-            ("projection", Value::str("cozytensors.topology/1")),
-            (
-                "components",
-                Value::map(
-                    self.components
-                        .iter()
-                        .map(|(c, ts)| {
-                            (
-                                c.clone(),
-                                Value::map(
-                                    ts.iter()
-                                        .map(|(k, t)| {
-                                            (
-                                                k.clone(),
-                                                Value::obj(vec![
-                                                    ("dtype", Value::str(t.dtype.name())),
-                                                    ("shape", shape_value(&t.shape)),
-                                                ]),
-                                            )
-                                        })
-                                        .collect(),
-                                ),
-                            )
-                        })
-                        .collect(),
-                ),
-            ),
-        ])
+        topology_value(
+            self.tensors()
+                .map(|(c, k, t)| (c.as_str(), k.as_str(), t.dtype, t.shape.as_slice())),
+        )
     }
 
     pub fn topology_digest(&self) -> String {
-        crate::ids::object_id(&crate::canon::write(&self.topology_value()))
+        topology_digest_of(&self.topology_value())
     }
 
     /// Structural validation against the checkpoint's spec closure.

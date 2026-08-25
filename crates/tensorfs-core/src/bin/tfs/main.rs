@@ -21,6 +21,14 @@
 //!   tfs fill <root> <plan>       resumable fill: skip only verified objects
 //!   tfs bench-store <root>       put/read/range/rehash throughput + peak RSS
 //!
+//! Structure fixtures (tfs-008). Flags: --provenance real|synthetic --source <name>
+//! --source-sha256 <hex> --note <text>
+//!
+//!   tfs structure bank <rows> <family> <variant>        bank TRANSCRIBED evidence rows
+//!   tfs structure bank-header <root> <hex> <fam> <var>  bank from a live header
+//!   tfs structure list                                  the bank, with provenance
+//!   tfs structure match <root> <hex>                    does this checkpoint match one?
+//!
 //! The snapshot plane (tfs-004). Flags: --iters <n>
 //!
 //!   tfs snapshot show <root> <hex>           strict decode, decode->re-encode identity, entries
@@ -84,6 +92,18 @@ fn main() -> ExitCode {
             &flags,
         ),
         ["checkpoint", "admit", r, h] => ckpt::cmd_admit(Path::new(r), h, &flags),
+        ["conform"] => conform::cmd_conform(None, &flags),
+        ["conform", w] => conform::cmd_conform(Some(w), &flags),
+        ["capability", e, d] => conform::cmd_capability(e, d, &flags),
+        ["vectors", "mine", rows, name] => conform::cmd_mine(Path::new(rows), name, &flags),
+        ["structure", "bank", rows, fam, var] => {
+            fixtures::cmd_bank_rows(Path::new(rows), fam, var, &flags)
+        }
+        ["structure", "bank-header", r, h, fam, var] => {
+            fixtures::cmd_bank_header(Path::new(r), h, fam, var, &flags)
+        }
+        ["structure", "list"] => fixtures::cmd_list(),
+        ["structure", "match", r, h] => fixtures::cmd_match(Path::new(r), h),
         ["snapshot", "show", r, h] => snap::cmd_show(Path::new(r), h),
         ["snapshot", "walk", r, h] => snap::cmd_walk(Path::new(r), h),
         ["snapshot", "verify", r, h] => snap::cmd_verify(Path::new(r), h),
@@ -166,6 +186,8 @@ macro_rules! ok {
 }
 
 mod ckpt;
+mod conform;
+mod fixtures;
 mod snap;
 
 fn cmd_store(root: &Path, verb: &str) -> ExitCode {
@@ -1703,6 +1725,96 @@ fn build_corpus() -> (Vec<Case>, Vec<EncodingSpec>) {
         "segments that claim more bytes than the blob has",
     ));
 
+    // --- structure fixtures + capability records (tfs-008)
+    let g = "structure";
+    let fx = tensorfs_core::structure::StructureFixture {
+        task_family: "corpus".to_string(),
+        structural_variant: "two-component".to_string(),
+        provenance: tensorfs_core::structure::Provenance {
+            kind: tensorfs_core::structure::SYNTHETIC.to_string(),
+            source: "the vector corpus".to_string(),
+            source_sha256: None,
+            note: "a minimal banked projection: two components, three logical keys".to_string(),
+        },
+        components: vec![
+            (
+                "transformer".to_string(),
+                vec![
+                    (
+                        "blocks.0.attn.to_q.weight".to_string(),
+                        tensorfs_core::structure::Logical {
+                            dtype: Dtype::Bf16,
+                            shape: vec![64, 128],
+                        },
+                    ),
+                    (
+                        "blocks.0.norm.weight".to_string(),
+                        tensorfs_core::structure::Logical {
+                            dtype: Dtype::Bf16,
+                            shape: vec![128],
+                        },
+                    ),
+                ],
+            ),
+            (
+                "vae".to_string(),
+                vec![(
+                    "decoder.conv_in.weight".to_string(),
+                    tensorfs_core::structure::Logical {
+                        dtype: Dtype::F32,
+                        shape: vec![8, 8],
+                    },
+                )],
+            ),
+        ],
+    };
+    let fx_bytes = fx.canonical_bytes();
+    cases.push(ok_case(
+        g,
+        "fixture-synthetic",
+        "structure",
+        fx_bytes.clone(),
+        "banked projection + topology_digest, provenance stated in the same bytes",
+    ));
+    cases.push(red_case(
+        "structure-red",
+        "provenance-real-undigested",
+        "structure",
+        sub(&fx_bytes, "\"kind\":\"synthetic\"", "\"kind\":\"real\""),
+        "MISSING_FIELD",
+        "a claim of realness with no source digest is unfalsifiable",
+    ));
+    cases.push(red_case(
+        "structure-red",
+        "provenance-unknown-kind",
+        "structure",
+        sub(&fx_bytes, "\"kind\":\"synthetic\"", "\"kind\":\"probably\""),
+        "UNKNOWN_FIELD",
+        "provenance is real or synthetic, never a third thing",
+    ));
+
+    let g = "capability";
+    let caps = tensorfs_core::registry::capability_records();
+    let cap_bytes = caps.canonical_bytes();
+    cases.push(ok_case(
+        g,
+        "records",
+        "capability",
+        cap_bytes.clone(),
+        "one qualified (encoding, device) pair per vectored spec; every other pair refuses",
+    ));
+    let dup = tensorfs_core::capability::CapabilityRecords {
+        records: vec![caps.records[0].clone(), caps.records[0].clone()],
+    };
+    cases.push(red_case(
+        "capability-red",
+        "duplicate-pair",
+        "capability",
+        dup.canonical_bytes(),
+        "DUPLICATE_KEY",
+        "one (encoding, device) pair cannot have two verdicts",
+    ));
+
     // --- ingest reds
     let g = "ingest-red";
     let refused_dialect = profile_normal(vec![plain.object_ref()], "pickle");
@@ -1785,7 +1897,11 @@ fn uppercase_digest(bytes: &[u8]) -> Vec<u8> {
 
 fn cmd_gen(dir: &Path) -> ExitCode {
     let (cases, specs) = build_corpus();
-    let _ = fs::remove_dir_all(dir);
+    // Regenerate only what the corpus OWNS. `mined/` (producer-mined vectors) and
+    // `structure/` (banked fixtures) are evidence with their own provenance and their own
+    // banking commands; a corpus rebuild must never be able to delete them.
+    let _ = fs::remove_dir_all(dir.join("cases"));
+    let _ = fs::remove_dir_all(dir.join("closure"));
     fs::create_dir_all(dir.join("closure")).unwrap();
     for s in &specs {
         let id = s.object_id();
@@ -1859,6 +1975,13 @@ fn run_doc(doc: &str, bytes: &[u8], closure: &Closure, platform: &[String]) -> O
             v.check(&plain)?;
             Ok((None, None))
         }),
+        // A structure fixture's banked key is its topology_digest, so that is what the
+        // corpus freezes: a fixture whose projection drifts announces itself here.
+        "structure" => tensorfs_core::structure::StructureFixture::parse(bytes)
+            .map(|f| (Some(f.topology_digest()), None)),
+        "capability" => {
+            tensorfs_core::capability::CapabilityRecords::parse(bytes).map(|_| (None, None))
+        }
         "manifest" => SnapshotManifest::parse(bytes).and_then(|m| {
             m.validate()?;
             Ok((None, m.checkpoint_id().ok()))

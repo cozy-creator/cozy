@@ -1,5 +1,5 @@
 doc: manifest
 expect: ok
-id: sha256:9e0a9d14ed171d73059dfa3f2110c8b6a7cf94d83a0cfae1e1fcc7a0f5e988a1
-checkpoint: sha256:9e0a9d14ed171d73059dfa3f2110c8b6a7cf94d83a0cfae1e1fcc7a0f5e988a1
+id: sha256:c35c21eb0a92866362c8c0de475117b3b88a7111e35326814687e4c6bd412cff
+checkpoint: sha256:c35c21eb0a92866362c8c0de475117b3b88a7111e35326814687e4c6bd412cff
 note: one more sibling file: new checkpoint_id, same header id
