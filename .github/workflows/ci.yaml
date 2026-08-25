@@ -8,9 +8,11 @@ jobs:
       - uses: actions/setup-go@v5
         with:
           go-version: stable
-      # The embedded libSQL driver is CGO-based (cl-009). cl-013's `release` job below is
-      # what qualifies the shipped artifact per platform.
-      - run: CGO_ENABLED=1 go build ./...
+      # CGO_ENABLED=0 is the LAW, not a default: `internal/records` drives SQLite through
+      # modernc.org/sqlite and nothing in this binary is C. Building with it off here is
+      # what keeps a C dependency from arriving unnoticed and silently ending the
+      # cross-compiles cl-013's `release` job depends on.
+      - run: CGO_ENABLED=0 go build ./...
       - run: go vet ./...
       - run: python3 scripts/fence.py
 
