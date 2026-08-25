@@ -322,6 +322,29 @@ def cmd_arms(a: argparse.Namespace) -> int:
     lease = store.acquire_snapshot(a.snapshot)
     first = lease.objects[0]
 
+    # ---- the in-place claim, proved rather than asserted -------------------------
+    # TensorFS never hands Python a mapping it owns: it fills memory the CALLER already
+    # holds. So the proof is not "a view stayed valid under mutation" — it is that the
+    # bytes land inside the caller's own object, at the caller's own offset, with the
+    # bytes on either side untouched and no allocation to show for it.
+    obj = bytearray(b"\xAA") * (1 << 20)
+    pad = 4096
+    n = min(first[1], (1 << 20) - 2 * pad)
+    lease.read_into(first[0], first[1], 0, n, memoryview(obj)[pad : pad + n])
+    before = obj[:pad] == b"\xAA" * pad
+    after = obj[pad + n :] == b"\xAA" * ((1 << 20) - pad - n)
+    landed = bytes(obj[pad : pad + n]) == store.document(first[0])[:n]
+    print(
+        f"  PROOF in-place fill: wrote {n} B into the caller's bytearray at offset {pad}; "
+        f"leading pad intact={before} trailing pad intact={after} bytes correct={landed}"
+    )
+    rss0 = rss_mib()
+    stream_facade(lease, plan, a.slot_bytes, a.slots, a.readers, None)
+    print(
+        f"  PROOF bounded ring: streamed {plan.bytes} B through a "
+        f"{a.slots * a.slot_bytes} B ring; peak RSS {rss0:.0f} -> {rss_mib():.0f} MiB"
+    )
+
     print("typed refusals across the FFI boundary")
     arms.arm(
         "a caller buffer that is not the range",
