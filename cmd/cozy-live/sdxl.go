@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/cozy-creator/cozy-creator-v2/internal/coord"
+	"github.com/cozy-creator/cozy-creator-v2/internal/launch"
 )
 
 const (
@@ -89,9 +90,10 @@ func sdxlSpec(entrypoints ...string) coord.EndpointSpec {
 		// nice(1) is this DRIVER's resource discipline on a shared box, imposed on the
 		// launch rather than baked into the coordinator's policy.
 		Python: "/usr/bin/nice",
-		Args: []string{"-n", "19", filepath.Join(venv, "bin", "python"), "-c",
-			"import sys; from cozy_runtime.internal.worker.session import main; " +
-				"raise SystemExit(main(sys.argv[1:]))"},
+		// `launch.Binary` names the runtime, so the ONE site that spells the binary stays the
+		// one site (the `runtime` fence). This dev spec points it at the corpus venv rather
+		// than a generation, which is the only difference from what `cozy start` launches.
+		Args:     []string{"-n", "19", launch.Binary(filepath.Dir(venv)), "serve"},
 		Dir:      runtime,
 		Imposed:  []string{"PYTHONPATH=" + runtime + ":" + filepath.Join(runtime, "src")},
 		Devices:  []string{"0"},

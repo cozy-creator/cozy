@@ -95,18 +95,15 @@ func (f *Facts) Spec(devices []string) (coord.EndpointSpec, *exit.Error) {
 		Endpoint:   f.Generation.Endpoint,
 		ReleaseID:  ReleaseID(f.Generation),
 		Generation: f.Generation.ID,
-		Python:     filepath.Join(f.Generation.Dir, "venv", "bin", "python"),
-		// THE SUPERVISOR ENTRY, and it is still the module rather than the verb. cr-016
-		// gave `cozy-runtime serve` the full launch flag set precisely so this import
-		// could delete, and cl-004 tried to: `serve` is DEAD ON ARRIVAL on both `bac8e5e`
-		// and runtime HEAD — the CLI reads the config at its entrypoint and then
-		// `session.main` reads it again, which the runtime's own one-authority rule
-		// refuses (`config_authority: read_config() called twice`). Observed live: every
-		// worker exits 1 before registering. The deletion is one runtime line away and is
-		// recorded as owed; a broken documented entry is not an entry.
-		Args: []string{"-c",
-			"import sys; from cozy_runtime.internal.worker.session import main; " +
-				"raise SystemExit(main(sys.argv[1:]))"},
+		// THE SUPERVISOR ENTRY, and it is now the VERB. cl-004 recorded the private
+		// `internal.worker.session:main` import as owed: `serve` was dead on arrival
+		// because the CLI read the config at its entrypoint and `session.main` read it
+		// again, which the runtime's own one-authority rule refuses. cozy-runtime
+		// `db4ab8a` passes the config it already read into `session.supervise`, so the
+		// import — a second process entry into one loop, across a private module path a
+		// release is free to move — deletes.
+		Python:   Binary(f.Generation.Dir),
+		Args:     []string{"serve"},
 		Dir:      f.Source,
 		Devices:  devices,
 		GraceSec: 3,

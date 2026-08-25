@@ -15,9 +15,10 @@
 set -euo pipefail
 
 RUNTIME_REPO="${RUNTIME_REPO:-$HOME/cozy_v2/cozy-runtime}"
-# cr-007's head at the time cl-013 pinned it. A fixture whose peer can move underneath it
-# is not a fixture; ONE sha is archived for a whole release.
-RUNTIME_SHA="${RUNTIME_SHA:-872799f}"
+# 503907a: the head cl-013 pinned. It is a FLOOR, not a preference — this host enters the
+# supervisor through `cozy-runtime serve` (db4ab8a) and reads `job_descriptor_id` off
+# `describe` (4485f27), so a release pinning an older runtime cannot be served at all.
+RUNTIME_SHA="${RUNTIME_SHA:-503907a}"
 OUT="${OUT:-$HOME/.cache/cozy/cl-013}"
 VERSION="${VERSION:-1.0.0}"
 ENDPOINT="${ENDPOINT:-cozy/weightless}"

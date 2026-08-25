@@ -160,10 +160,14 @@ service, so there is no temporary direct-Go path for the HTTP API to later wrap:
   --json` and `bindings --json` are the runtime's own verbs, and cozy-creator reads their
   documents rather than growing second readers of the same grammars: cl-010's
   `[bindings]` table reader and its fit-row parser are both DELETED (cr-016 built the
-  replacements for exactly that). One second implementation survives and is owed: the
-  supervisor is still entered through its module `main` because `cozy-runtime serve` is
-  dead on arrival — the CLI reads the config and `session.main` reads it again, which the
-  runtime's own one-authority rule refuses.
+  replacements for exactly that), and so are the last two: the supervisor is entered
+  through the PUBLIC verb `cozy-runtime serve` rather than a private
+  `internal.worker.session:main` import (runtime `db4ab8a` passes its already-read config
+  into `supervise`), so the coordinator speaks the verb's own closed launch grammar
+  (`--socket`/`--out`); and `job_descriptor_id` is READ from `describe <job> --json`
+  (runtime `4485f27`) rather than re-derived, which deletes cl-004's Go reimplementation
+  of the canonical form along with the refusals it owed for values the protocol profile
+  cannot spell.
 - **An installed generation is the only source of launch facts** (`internal/launch`), and
   `--dev-endpoint` is DELETED with its loader and its writer. A generation carries the
   venv that runs it, the descriptor its own runtime derived and the install verified, and
@@ -227,11 +231,12 @@ capacity, and a grant that writes somewhere a reclaim cannot reach.
   plus select-or-start, not a warm worker — warm persistence is a serving concern.
   Submission never answers "busy": no capacity is a queued STATE, `queue_position` says
   where, and a submission with a non-empty queue JOINS it rather than overtaking it.
-- **`job_descriptor_id` is derived, never read.** It is absent from the descriptor by
-  design (a digest in a source-stable surface has no clock), so this host reproduces
-  `internal/descriptor.py::job_descriptor_id` under tfs-013's writer rules — verified
-  byte-identical against the runtime's own derivation, and checked again every run because
-  the worker resolves its local plan record BY that string.
+- **`job_descriptor_id` is read from its owner.** It is absent from the descriptor by
+  design (a digest in a source-stable surface has no clock), so cl-004 reproduced
+  `internal/descriptor.py::job_descriptor_id` here in Go. cr-016's `describe <job> --json`
+  now carries it, so the second implementation is DELETED: the id comes from the runtime
+  that derives it, and a release pinning a runtime too old to say it refuses by name
+  rather than being handed a plausible digest.
 - **No fabricated `$0.00`.** The bill exists only where `COZY_LOCAL_RATE_MICRO_USD_PER_HOUR`
   configured one; otherwise the field is absent and the rendering says why.
 - **The durable checkpoint exchange** is journaled here as a SECOND observation (law 9):

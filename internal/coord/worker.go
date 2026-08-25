@@ -236,10 +236,14 @@ func (c *Coordinator) StartWorker(spec EndpointSpec) (string, *exit.Error) {
 		return "", e
 	}
 
+	// `cozy-runtime serve`'s CLOSED flag set — the launch facts nothing can discover for a
+	// coordinator. It is the runtime's PUBLIC launch grammar, so this is the only spelling
+	// the coordinator knows: `--socket`/`--out` are the path grants the verb translates
+	// into the supervisor's own `--hub`/`--root`.
 	args := append([]string{}, spec.Args...)
 	args = append(args,
-		"--hub", "unix:"+c.opt.Socket,
-		"--root", filepath.Join(root, "run"),
+		"--socket", c.opt.Socket,
+		"--out", filepath.Join(root, "run"),
 		"--instance-id", instanceID,
 		"--release-id", spec.ReleaseID,
 		"--devices", strings.Join(spec.Devices, ","),

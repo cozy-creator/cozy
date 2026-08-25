@@ -25,7 +25,9 @@ import (
 // It also proves something the SDXL run cannot: the coordinator interoperates with a
 // worker it did not co-develop against, over the committed contract alone.
 func fakeWorker() int {
-	hub := flag("hub", "")
+	// `--socket`, because that is what the coordinator now speaks: `cozy-runtime serve`'s
+	// public launch grammar. The adversary reads the same flags the real supervisor does.
+	socket := flag("socket", "")
 	// --fake-instance wins over the --instance-id StartWorker appends, so an arm can
 	// claim an instance this coordinator never spawned.
 	instance := flag("fake-instance", flag("instance-id", ""))
@@ -38,13 +40,13 @@ func fakeWorker() int {
 		os.Stdout.Sync()
 	}
 
-	target := hub
-	if len(target) > 5 && target[:5] == "unix:" {
-		target = "unix://" + target[5:]
+	target := "unix://" + socket
+	if len(socket) > 5 && socket[:5] == "unix:" {
+		target = "unix://" + socket[5:]
 	}
 	conn, err := grpc.NewClient(target, grpc.WithTransportCredentials(insecure.NewCredentials()))
 	if err != nil {
-		say("cannot dial %s: %v", hub, err)
+		say("cannot dial %s: %v", socket, err)
 		return 1
 	}
 	defer conn.Close()

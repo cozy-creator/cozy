@@ -12,10 +12,10 @@
 set -euo pipefail
 
 RUNTIME_REPO="${RUNTIME_REPO:-$HOME/cozy_v2/cozy-runtime}"
-# bac8e5e: cr-016's head, CI-green, and the peer this proof pinned. cl-003 proved f188993;
-# bac8e5e adds cr-008c/012/016 and neither of the two serving-path defects under repair
-# touches the job lane. A verification whose peer can move underneath it measures nothing.
-RUNTIME_SHA="${RUNTIME_SHA:-bac8e5e}"
+# 503907a: the head cl-013 pinned. It is a FLOOR, not a preference — this host enters the
+# supervisor through `cozy-runtime serve` (db4ab8a) and reads `job_descriptor_id` off
+# `describe` (4485f27), so a release pinning an older runtime cannot be served at all.
+RUNTIME_SHA="${RUNTIME_SHA:-503907a}"
 TENSORFS_WHEEL="${TENSORFS_WHEEL:-/tmp/cozy-wheels-cl003/tensorfs-0.0.1-cp311-abi3-linux_x86_64.whl}"
 DESCRIBE_PY="${DESCRIBE_PY:-$RUNTIME_REPO/corpus/.venv/bin/python}"
 OUT="${OUT:-$HOME/.cache/cozy/cl-004}"

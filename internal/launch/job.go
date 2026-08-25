@@ -2,10 +2,8 @@ package launch
 
 import (
 	"encoding/json"
-	"fmt"
 	"strings"
 
-	"github.com/cozy-creator/cozy-creator-v2/internal/canonical"
 	"github.com/cozy-creator/cozy-creator-v2/internal/coord"
 	"github.com/cozy-creator/cozy-creator-v2/internal/exit"
 )
@@ -63,11 +61,9 @@ func (f *Facts) JobSpec(function string, devices []string) (coord.EndpointSpec, 
 		Endpoint:   f.Generation.Endpoint,
 		ReleaseID:  ReleaseID(f.Generation),
 		Generation: f.Generation.ID,
-		Python:     f.Generation.Dir + "/venv/bin/python",
-		// The same entry the serving lane uses, and the same owed deletion (spec.go).
-		Args: []string{"-c",
-			"import sys; from cozy_runtime.internal.worker.session import main; " +
-				"raise SystemExit(main(sys.argv[1:]))"},
+		// The same entry the serving lane uses: the runtime's own public verb (spec.go).
+		Python:   Binary(f.Generation.Dir),
+		Args:     []string{"serve"},
 		Dir:      f.Source,
 		Devices:  devices,
 		GraceSec: 3,
@@ -95,13 +91,14 @@ func (f *Facts) JobSpec(function string, devices []string) (coord.EndpointSpec, 
 	return spec, facts, nil
 }
 
-// Job resolves one declared `@job` and derives its descriptor id.
+// Job resolves one declared `@job` and READS its descriptor id from the runtime that owns
+// the derivation. cl-004 reproduced `internal/descriptor.py::job_descriptor_id` here in Go
+// because no verb would say it; cr-016's `describe <job> --json` now carries it beside the
+// entry, so the second implementation of the canonical form — and the whole class of
+// refusals it owed for values the protocol profile cannot spell (a float bound, a null
+// default) — deletes with it.
 func (f *Facts) Job(function string) (*JobFacts, *exit.Error) {
 	entry, e := f.jobEntry(function)
-	if e != nil {
-		return nil, e
-	}
-	id, e := jobDescriptorID(entry)
 	if e != nil {
 		return nil, e
 	}
@@ -109,8 +106,19 @@ func (f *Facts) Job(function string) (*JobFacts, *exit.Error) {
 	if err := json.Unmarshal(entry, &declared); err != nil {
 		return nil, exit.Internalf("the descriptor's job entry for %q is unreadable: %s", function, err)
 	}
+	var said struct {
+		DescriptorID string `json:"job_descriptor_id"`
+	}
+	if e := f.Runtime.call(&said, "describe", function); e != nil {
+		return nil, e
+	}
+	if said.DescriptorID == "" {
+		return nil, exit.Named(exit.Structural, "job_descriptor_id_absent",
+			"`cozy-runtime describe %s` named no job_descriptor_id", function).
+			WithRemedy("the id is the runtime's own derivation (cr-016); a release pinning an older runtime cannot be dispatched by it")
+	}
 	facts := &JobFacts{
-		Name: function, DescriptorID: id, Outputs: AssetPaths(declared.Result),
+		Name: function, DescriptorID: said.DescriptorID, Outputs: AssetPaths(declared.Result),
 	}
 	var shape struct {
 		Publishes bool `json:"publishes"`
@@ -154,89 +162,4 @@ func (f *Facts) jobEntry(function string) (json.RawMessage, *exit.Error) {
 		"%s registers no job named %q", f.Generation.Endpoint, function).
 		WithRemedy("it registers: %s", known).
 		WithNext("cozy describe " + f.Generation.Endpoint)
-}
-
-// jobDescriptorID reproduces `internal/descriptor.py::job_descriptor_id` — sha256 over
-// the canonical bytes of the job's own entry under its format tag.
-//
-// It is DERIVED here rather than read, because the id is deliberately absent from the
-// document (`_fixed_point` refuses a digest anywhere in a source-stable surface). The
-// derivation is checked the only way it can be: the worker resolves its local record BY
-// this string, so a wrong one is `unresolved_job_descriptor` on the very first Report and
-// never a silently mismatched attempt.
-//
-// SEAM (cr-016): this host's canonical writer is the PROTOCOL profile — integer-only,
-// printable ASCII, no null — and a descriptor may legitimately carry a float bound or a
-// None default (cozy-runtime's own writer implements full JCS for those three). Such a
-// job refuses HERE, by name, rather than being handed a plausible wrong digest. The fix
-// is `cozy-runtime describe` printing the id it already knows how to derive.
-func jobDescriptorID(entry json.RawMessage) (string, *exit.Error) {
-	var decoded map[string]any
-	dec := json.NewDecoder(strings.NewReader(string(entry)))
-	if err := dec.Decode(&decoded); err != nil {
-		return "", exit.Internalf("a descriptor job entry is not an object: %s", err)
-	}
-	doc := map[string]canonical.Value{}
-	for k, v := range decoded {
-		value, err := canonicalOf(k, v)
-		if err != nil {
-			return "", exit.Named(exit.Structural, "job_descriptor_id_underivable",
-				"this job's descriptor entry carries %s", err).
-				WithRemedy("this host derives the id under the protocol's integer-only ASCII profile; " +
-					"the runtime that owns the derivation should print it (cr-016 seam)")
-		}
-		doc[k] = value
-	}
-	doc["format"] = "cozy.runtime.JobDescriptor/1"
-	data, err := canonical.Write(doc)
-	if err != nil {
-		return "", exit.Named(exit.Structural, "job_descriptor_id_underivable",
-			"the job's descriptor entry does not canonicalize: %s", err)
-	}
-	spelled, err := canonical.Spell(canonical.Digest(data))
-	if err != nil {
-		return "", exit.Internalf("cannot spell the job descriptor id: %s", err)
-	}
-	return spelled, nil
-}
-
-// canonicalOf converts one decoded JSON value into a canonical Value, or names why it
-// cannot. `encoding/json` decodes every number as a float64, so an integral one is the
-// integer it spells and a fractional one refuses — the same rule `coord.Binding.PlanID`
-// applies to a record that crossed JSON.
-func canonicalOf(path string, v any) (canonical.Value, error) {
-	switch t := v.(type) {
-	case nil:
-		return nil, fmt.Errorf("a null at %s, which these documents cannot spell", path)
-	case bool:
-		return t, nil
-	case string:
-		return t, nil
-	case float64:
-		if t != float64(int64(t)) {
-			return nil, fmt.Errorf("the fractional number %v at %s", t, path)
-		}
-		return int64(t), nil
-	case []any:
-		out := make([]canonical.Value, 0, len(t))
-		for i, e := range t {
-			value, err := canonicalOf(fmt.Sprintf("%s[%d]", path, i), e)
-			if err != nil {
-				return nil, err
-			}
-			out = append(out, value)
-		}
-		return out, nil
-	case map[string]any:
-		out := map[string]canonical.Value{}
-		for k, e := range t {
-			value, err := canonicalOf(path+"."+k, e)
-			if err != nil {
-				return nil, err
-			}
-			out[k] = value
-		}
-		return out, nil
-	}
-	return nil, fmt.Errorf("a %T at %s", v, path)
 }

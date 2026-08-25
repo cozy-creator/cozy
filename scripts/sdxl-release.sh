@@ -26,9 +26,10 @@
 set -euo pipefail
 
 RUNTIME_REPO="${RUNTIME_REPO:-$HOME/cozy_v2/cozy-runtime}"
-# f188993: cr-006's launch tier, the head this proof pinned. A verification whose peer can
-# move underneath it measures nothing, so ONE sha is archived for a whole run.
-RUNTIME_SHA="${RUNTIME_SHA:-f188993}"
+# 503907a: the head cl-013 pinned. It is a FLOOR, not a preference — this host enters the
+# supervisor through `cozy-runtime serve` (db4ab8a) and reads `job_descriptor_id` off
+# `describe` (4485f27), so a release pinning an older runtime cannot be served at all.
+RUNTIME_SHA="${RUNTIME_SHA:-503907a}"
 # tfs-007's compiled facade, built from a PINNED read-only `git archive` of tensorfs
 # 846532c. The wheel is not incidental: cozytensors' ENCODING REGISTRY ships inside it, so
 # the release's pinned tensorfs is what decides which encodings this endpoint can read
