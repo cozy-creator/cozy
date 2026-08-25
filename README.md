@@ -47,6 +47,38 @@ scripts/snapshot-runs.sh all        # the whole plane plus its red arms
 and their vector sets) live at `closure/<digest>.json`, where the path terminal IS the
 digest; the header attachment is TYPED and must be projected at exactly one path.
 
+## reads and projection (tfs-005)
+
+`read_into(range, caller_buffer, lease)` is the one byte door. The caller owns every buffer;
+TensorFS owns range validation, verified identity, short reads and the lease. There is no
+call that takes a bare digest and returns bytes, so `contains` cannot become a resume
+predicate. Reader depth is load-bearing: 0.32 GB/s cold at queue depth 1 against 1.82 at 16.
+
+```bash
+tfs read lease <root> <snap>            # acquire, verify, release ONE ReadLease
+tfs read plan|fill <root> <snap>        # destination order; the pooled fill into a ring
+tfs read verify-fill|prove <root> <snap>  # the sequential path; delivered bytes vs the header
+tfs read span <root> <snap> <c> <k> <role> <off> <len>
+tfs read arms|tear <root> <snap>        # red arms; tear a verified object UNDER a live lease
+tfs project <root> <snap> <dest>        # tier 2: relative symlinks, never a weight path
+tfs materialize <root> <file> <dest>    # tier 3: stream a RETAINED carrier blob
+scripts/read-runs.sh arms|real|bench
+```
+
+## roots, holds and GC (tfs-006)
+
+`meta/state.json` under `meta/LOCK` is the SOLE root authority; `refs/` is a rendering with
+none. A hold is reapable exactly when its owner is PROVABLY dead — the kernel drops the
+owner's lock on SIGKILL, so there is no wall-clock grace. `exclusive` is a promise: deleting
+a root reclaims exactly those bytes.
+
+```bash
+tfs root list|register|release|open|note|reconcile <root> ...
+tfs hold take|reap|steal <root> ...     # owner-liveness holds
+tfs gc mark|usage|sweep|reap|refs|pressure|arms <root>
+scripts/gc-runs.sh full|arms
+```
+
 ## ingest (tfs-003)
 
 The only normal tensor-ingest door. `inspect` and `plan` read HEADERS only — every
