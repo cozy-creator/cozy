@@ -642,12 +642,6 @@ func (s *Store) Recover(requestID string, attempt int64, sessionID string) *exit
 	return nil
 }
 
-// OpenRecovered is every unclosed recovered obligation — what `cozy status` shows and
-// what dispatch waits on.
-func (s *Store) OpenRecovered() ([]Attempt, *exit.Error) {
-	return s.attemptsWhere(`state='recovered_open'`)
-}
-
 func (s *Store) AttemptRow(requestID string, attempt int64) (*Attempt, *exit.Error) {
 	rows, e := s.attemptsWhere(`request_id=? AND attempt=?`, requestID, attempt)
 	if e != nil || len(rows) == 0 {

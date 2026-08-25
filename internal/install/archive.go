@@ -320,4 +320,3 @@ func short(s string) string {
 	}
 	return s
 }
-

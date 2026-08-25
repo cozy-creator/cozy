@@ -95,10 +95,12 @@ func handleStatus(ctx *Context) *exit.Error {
 				}
 			}
 		}
-		rec.Notes = []string{"endpoint and job listings arrive with the local client API (cl-006)"}
+		rec.Notes = []string{st.Details,
+			"endpoint and job listings arrive with the local client API (cl-006)"}
 		rec.Next = []string{"cozy commands"}
 	} else {
-		rec.Notes = []string{"installed endpoints, workers and jobs are readable only while the service runs"}
+		rec.Notes = []string{st.Details,
+			"installed endpoints, workers and jobs are readable only while the service runs"}
 		rec.Next = []string{"cozy up"}
 	}
 	return emit(ctx, rec)

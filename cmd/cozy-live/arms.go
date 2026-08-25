@@ -12,6 +12,7 @@ import (
 	"github.com/cozy-creator/cozy-creator-v2/internal/coord"
 	"github.com/cozy-creator/cozy-creator-v2/internal/exit"
 	"github.com/cozy-creator/cozy-creator-v2/internal/service"
+	pb "github.com/cozy-creator/cozy-creator-v2/protocol/cozy/worker/v1"
 )
 
 // fakeSpec is a worker slot whose process is THIS binary speaking raw protocol. It is a
@@ -47,16 +48,6 @@ func waitEvent(lv *live, substr string, timeout time.Duration) (string, bool) {
 		time.Sleep(25 * time.Millisecond)
 	}
 	return "", false
-}
-
-func lastEvent(lv *live, substr string) string {
-	out := ""
-	for _, line := range lv.c.Events() {
-		if strings.Contains(line, substr) {
-			out = line
-		}
-	}
-	return out
 }
 
 func countEvents(lv *live, substr string) int {
@@ -180,6 +171,17 @@ func sectionArms() {
 	rowA2, _ := lv.store.AttemptRow(requestA, int64(attemptA))
 	check("the held attempt is untouched by the refusal", rowA2.State == "accepted" &&
 		rowA2.TerminalID == "", "state "+rowA2.State)
+
+	// Supersession is EXPLICIT: a cancel naming the full attempt triple, sent to the
+	// session that holds it. The idle fake ignores it — which is the point of the
+	// cooperative/forceful split on the worker side — but the coordinator's obligation
+	// is to send a digest-fenced cancel and nothing else.
+	must("cancel", errOf(lv.c.Cancel(requestA, attemptA, pb.CancelReason_CANCEL_REASON_SUPERSEDED, 1000)))
+	line, ok = waitEvent(lv, "CancelAttempt "+requestA, 10*time.Second)
+	check("supersession is an explicit digest-fenced CancelAttempt", ok, trimLog(line))
+	_, ordErr2 := lv.store.NextOrdinal(requestA)
+	check("and until its journaled terminal arrives, the ordinal STILL refuses",
+		ordErr2 != nil, briefly(ordErr2))
 
 	head("terminal-level refusals: the digest fence, the document fence, the replay")
 	badspec := fakeSpec("badterminal", "3", "--arm", "badterminal")
