@@ -18,12 +18,19 @@ import (
 	"strings"
 
 	"github.com/cozy-creator/cozy-creator-v2/internal/exit"
+	"github.com/cozy-creator/cozy-creator-v2/internal/secret"
 )
 
 // Inherited is the CLOSED set of variables a child process may see from this process's
 // own environment. Everything else a child needs is IMPOSED by its launcher as an
 // explicit value (COZY_HOME, the device grant, the socket) — never inherited.
 var Inherited = []string{"PATH", "HOME", "LANG", "LC_ALL", "TMPDIR", "SSL_CERT_FILE", "SSL_CERT_DIR"}
+
+// DefaultHubURL is where the catalog verbs look when nothing says otherwise. There is
+// no deployed tensorhub yet (Launch 1 is being built), so the default names a hub on
+// this host rather than inventing a production hostname a user cannot reach. `cozy hub
+// status` always prints the URL AND where it came from, so the default is never silent.
+const DefaultHubURL = "http://127.0.0.1:8080"
 
 // Config is the frozen typed value. Every field is decided once, at Load.
 type Config struct {
@@ -33,6 +40,17 @@ type Config struct {
 	Port int
 	// Yield is the GPU yield policy: smart | always | never (cozy-creator.md).
 	Yield string
+
+	// HubURL is the catalog host the cl-011 verbs read and write (TENSORHUB_URL).
+	HubURL string
+	// HubToken is the ONE static admin token Launch-1 tensorhub admits writes with
+	// (TENSORHUB_TOKEN). Reads need no credential. There is no login act and no
+	// identity plane until th-031 — the env carries a VALUE, never a decision.
+	HubToken secret.Value
+	// Source of each, for rendering: "default" or "env". An operator debugging a 401
+	// needs to know which file lied to them, and a value with no provenance is a guess.
+	HubURLSource   string
+	HubTokenSource string
 
 	inherited []string // the allowlisted snapshot, captured at Load
 }
@@ -45,7 +63,15 @@ func Load() (Config, *exit.Error) {
 	if frozen.Home != "" {
 		return frozen, nil
 	}
-	c := Config{Port: 2699, Yield: "smart"}
+	c := Config{Port: 2699, Yield: "smart",
+		HubURL: DefaultHubURL, HubURLSource: "default", HubTokenSource: "unset"}
+
+	if v := strings.TrimSpace(os.Getenv("TENSORHUB_URL")); v != "" {
+		c.HubURL, c.HubURLSource = strings.TrimRight(v, "/"), "env"
+	}
+	if v := os.Getenv("TENSORHUB_TOKEN"); strings.TrimSpace(v) != "" {
+		c.HubToken, c.HubTokenSource = secret.New(v), "env"
+	}
 
 	if v := strings.TrimSpace(os.Getenv("COZY_HOME")); v != "" {
 		abs, err := filepath.Abs(v)

@@ -19,6 +19,8 @@ var FoundationTokens = []string{
 	"worker.protocol.v1",   // the cozy.worker.v1 server over a unix socket
 	"coordinator.local",    // local dispatch: request -> attempt -> terminal -> visible output
 	"terminal.transaction", // terminal accepted + output visible commit together
+	"catalog.public_reads", // hub catalog reads carry no credential
+	"hub.static_token",     // first-party writes carry ONE static admin token; no login act exists
 }
 
 var yesFlag = Flag{Name: "--yes", Summary: "confirm and execute; there is no prompt anywhere"}
@@ -92,7 +94,7 @@ var Commands = []Command{
 		Summary: "resolve, verify, build and pin an endpoint as an immutable generation",
 		Args:    "<org/endpoint[@vN]>", MinArgs: 1, MaxArgs: 1,
 		Flags: []Flag{
-			{Name: "--from", Arg: "<archive.tar.gz>", Summary: "a local release archive (the pre-hub source door; cl-011 resolves releases instead)"},
+			{Name: "--from", Arg: "<archive.tar.gz>", Summary: "a local release archive (the pre-hub source door; hub release resolve lands with th-003)"},
 			{Name: "--digest", Arg: "<sha256:…>", Summary: "the source digest the release declares — verified before anything executes"},
 			{Name: "--prefetch", Summary: "eagerly pull weights"},
 			{Name: "--all-variants", Summary: "with --prefetch, pull every admissible lane"},
@@ -203,14 +205,6 @@ var Commands = []Command{
 		Exits:      []exit.Code{exit.OK, exit.NotFound, exit.Unavailable},
 		Capability: "cmd.fit", NeedsServer: true, Status: Planned, Issue: "cl-010",
 	},
-	{
-		Path: []string{"search"}, Group: "invocation",
-		Summary: "hub catalog discovery (public reads need no login)",
-		Args:    "<query>", MinArgs: 1, MaxArgs: -1,
-		Flags:      []Flag{{Name: "--kind", Arg: "<endpoint|model>", Summary: "restrict the kind"}},
-		Exits:      []exit.Code{exit.OK, exit.Unavailable},
-		Capability: "cmd.search", Status: Planned, Issue: "cl-011",
-	},
 
 	// ---- jobs (cl-004) ----
 	{
@@ -261,6 +255,53 @@ var Commands = []Command{
 		Capability: "cmd.job.cancel", NeedsServer: true, Status: Planned, Issue: "cl-004",
 	},
 
+	// ---- catalog (cl-011) ----
+	// Launch-1 tensorhub is a headless distribution hub with NO identity plane
+	// (decisions #229): reads are public and carry no credential, first-party writes
+	// carry the ONE static admin token from TENSORHUB_TOKEN.
+	{
+		Path: []string{"search"}, Group: "catalog",
+		Summary: "hub catalog discovery — public, no credential",
+		Args:    "[<query>]", MaxArgs: -1,
+		Flags:      []Flag{{Name: "--kind", Arg: "<endpoint|model>", Summary: "restrict the kind"}},
+		Exits:      []exit.Code{exit.OK, exit.Usage, exit.Unavailable, exit.Deadline},
+		Capability: "cmd.search", Status: Implemented, Handler: "search",
+	},
+	{
+		Path: []string{"repo", "show"}, Group: "catalog",
+		Summary: "resolve one repo ref against the catalog — public, no credential",
+		Args:    "<org/name>", MinArgs: 1, MaxArgs: 1,
+		Exits:      []exit.Code{exit.OK, exit.Usage, exit.NotFound, exit.Unavailable, exit.Deadline},
+		Capability: "cmd.repo.show", Status: Implemented, Handler: "repo.show",
+	},
+	{
+		Path: []string{"repo", "create"}, Group: "catalog",
+		Summary: "create a model or endpoint repo — first-party, admin token",
+		Args:    "<org/name>", MinArgs: 1, MaxArgs: 1,
+		Flags: []Flag{
+			{Name: "--kind", Arg: "<model|endpoint>", Summary: "required; the hub locks a repo's kind at creation"},
+			{Name: "--reason", Arg: "<why>", Summary: "required; the hub records it durably before it acts"},
+		},
+		Exits:      []exit.Code{exit.OK, exit.Usage, exit.Validation, exit.Credential, exit.Unavailable, exit.Deadline, exit.Conflict},
+		Capability: "cmd.repo.create", Status: Implemented, Handler: "repo.create",
+	},
+	{
+		Path: []string{"hub", "status"}, Group: "catalog",
+		Summary: "the configured hub: URL, credential digest, reachability, catalog size",
+		MaxArgs: 0,
+		// Content-first like bare `cozy`: an unreachable hub is a STATE this verb
+		// reports, not a refusal it raises.
+		Exits:      []exit.Code{exit.OK},
+		Capability: "cmd.hub.status", Status: Implemented, Handler: "hub.status",
+	},
+	{
+		Path: []string{"hub", "config"}, Group: "catalog",
+		Summary: "the hub's running config with per-key provenance — admin token; secrets digested",
+		MaxArgs: 0,
+		Exits:      []exit.Code{exit.OK, exit.Usage, exit.Credential, exit.Unavailable, exit.Deadline},
+		Capability: "cmd.hub.config", Status: Implemented, Handler: "hub.config",
+	},
+
 	// ---- transfer (cl-012, cl-008) ----
 	{
 		Path: []string{"pull"}, Group: "transfer",
@@ -270,7 +311,10 @@ var Commands = []Command{
 			{Name: "--lane", Arg: "<label>", Summary: "lane"},
 			{Name: "--all-variants", Summary: "every admissible lane"},
 			{Name: "--dry-run", Summary: "print the plan without moving bytes"},
-			{Name: "--token", Arg: "<t>", Summary: "this invocation's source credential"},
+			// cl-011's law, enforced by the `secret` fence family: a credential never
+			// rides argv. cozy-creator.md still spells this `--token <t>`; the doc is
+			// the drift, not this row.
+			{Name: "--token-stdin", Summary: "read this invocation's source credential from stdin (never argv)"},
 		},
 		Exits:      []exit.Code{exit.OK, exit.NotFound, exit.Credential},
 		Capability: "cmd.pull", NeedsServer: true, Status: Planned, Issue: "cl-012",
@@ -325,10 +369,16 @@ var Commands = []Command{
 		Capability: "cmd.promote", Status: Planned, Issue: "cl-012",
 	},
 
-	// ---- account (cl-011) ----
+	// ---- account (th-031, Wave 2) ----
+	// DEFERRED, not unbuilt-by-accident: Launch-1 tensorhub has NO identity plane
+	// (owner ruling, decisions #229) — no accounts, no sessions, no orgs, so there is
+	// nothing for a PKCE flow to authenticate against. Catalog reads are public and
+	// first-party writes carry TENSORHUB_TOKEN (a value, never a login act).
+	// These rows keep the surface honest: `cozy login` says what is true rather than
+	// the verb quietly not existing.
 	{
 		Path: []string{"login"}, Group: "account",
-		Summary: "browser/device PKCE against the hub; nothing reads stdin as a prompt",
+		Summary: "hub login — deferred: Launch 1 has no identity plane; writes use TENSORHUB_TOKEN",
 		MaxArgs: 0,
 		Flags: []Flag{
 			{Name: "--no-browser", Summary: "print the URL + user code and poll"},
@@ -336,24 +386,24 @@ var Commands = []Command{
 			{Name: "--token-stdin", Summary: "read the token value from stdin (never argv)"},
 		},
 		Exits:      []exit.Code{exit.OK, exit.Credential, exit.Unavailable},
-		Capability: "cmd.login", Status: Planned, Issue: "cl-011",
+		Capability: "cmd.login", Status: Planned, Issue: "th-031",
 	},
 	{
 		Path: []string{"login", "ls"}, Group: "account",
-		Summary:    "credential rows: source, kind, state",
+		Summary:    "credential rows — deferred with login; `cozy hub status` shows the configured token",
 		MaxArgs:    0,
 		Exits:      []exit.Code{exit.OK},
-		Capability: "cmd.login.ls", Status: Planned, Issue: "cl-011",
+		Capability: "cmd.login.ls", Status: Planned, Issue: "th-031",
 	},
 	{
 		Path: []string{"logout"}, Group: "account",
-		Summary: "remove the hub session, a per-source row, or everything",
+		Summary: "remove a stored credential — deferred with login; nothing is stored yet",
 		MaxArgs: 0,
 		Flags: []Flag{
 			{Name: "--source", Arg: "<name>", Summary: "one source row"},
 			{Name: "--all", Summary: "every stored credential"},
 		},
 		Exits:      []exit.Code{exit.OK},
-		Capability: "cmd.logout", Status: Planned, Issue: "cl-011",
+		Capability: "cmd.logout", Status: Planned, Issue: "th-031",
 	},
 }

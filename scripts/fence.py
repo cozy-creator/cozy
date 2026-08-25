@@ -15,6 +15,10 @@ Eight families:
   store     (cl-001) no second lifecycle store: the ONE local libSQL database is the
             authority, so a state.json/pidfile-class sidecar name is a violation wherever
             it appears — those sidecars outlive their launcher and lie.
+  secret    (cl-011) a credential never rides argv and has ONE raw reader: a manifest flag
+            whose name is credential-shaped may not take a value (process lists leak;
+            `--token-stdin` is the shape that does not), and `secret.Value.Reveal()` may
+            be called only where the value becomes an Authorization header.
   cloud     (cl-001) no Tensorhub implementation and no cloud policy here: cozy-creator
             shares schemas and the client contract, and emulates nothing. Local grants are
             a CAS root plus an output dir; a minted bearer/JWT token would be a fake.
@@ -55,6 +59,14 @@ DENY_STORE = ["state.json", "status.json", "workers.json", "sessions.json", "pid
 
 # Cloud emulation and fabricated credentials, as bare identifiers.
 DENY_CLOUD = {"tensorhub", "jwt", "Bearer", "SignedString", "mintToken", "ServiceClass"}
+
+# (cl-011) A credential-shaped flag NAME. `--token-stdin` and `--no-browser` are not
+# credential values; `--token <t>` is, and argv is world-readable on this planet.
+SECRET_FLAG = re.compile(r"token|secret|password|api[-_]?key|credential", re.I)
+
+# The ONE raw reader of a secret.Value: the request builder that turns it into an
+# Authorization header. The definition itself is the only other legal site.
+REVEAL_SITES = {"internal/secret/secret.go", "internal/hub/hub.go"}
 
 ALLOW_DOOR = "//cozy:allow"
 STDIN_DOOR = "//cozy:stdin-value"
@@ -139,6 +151,26 @@ def check_sources():
                     bad.append(f"{p}:{i}: [prompt] '{ident}' reads input — no cozy command may prompt: {line.strip()}")
                 if ident == "Stdin" and STDIN_DOOR not in src_line:
                     bad.append(f"{p}:{i}: [prompt] stdin read without the {STDIN_DOOR} door: {line.strip()}")
+            if str(p).replace("\\", "/") not in REVEAL_SITES and re.search(r"\.Reveal\s*\(", line):
+                bad.append(f"{p}:{i}: [secret] Reveal() outside {' / '.join(sorted(REVEAL_SITES))} — a "
+                           f"credential's raw value is read where it becomes a header, nowhere else: {line.strip()}")
+    return bad
+
+
+def check_secret_flags():
+    """No manifest flag may carry a credential as an argv VALUE (cl-011)."""
+    src_path = pathlib.Path("internal/manifest/commands.go")
+    if not src_path.exists():
+        return ["[secret] missing internal/manifest/commands.go"]
+    bad = []
+    for i, line in enumerate(src_path.read_text().splitlines(), 1):
+        m = re.search(r'Name:\s*"(--[A-Za-z0-9-]+)"', line)
+        if not m or not SECRET_FLAG.search(m.group(1)):
+            continue
+        if re.search(r'Arg:\s*"', line):
+            bad.append(f"internal/manifest/commands.go:{i}: [secret] flag '{m.group(1)}' takes an "
+                       "argv value and is credential-shaped — argv is world-readable; take it on "
+                       "stdin (--token-stdin) or through an OS-protected handoff")
     return bad
 
 
@@ -214,7 +246,7 @@ def check_matrix():
     return bad
 
 
-violations = check_sources() + check_matrix() + check_manifest()
+violations = check_sources() + check_matrix() + check_manifest() + check_secret_flags()
 if violations:
     print("FENCE RED (boundaries.md):", file=sys.stderr)
     for v in violations:
@@ -224,5 +256,5 @@ print(
     f"fence green — deps({len(DENY_DEPS)}) impl({len(DENY_IMPL)}) "
     f"prompt({len(DENY_PROMPT) + len(DENY_PROMPT_CALLS) + 1}) matrix(15 rows) "
     f"env({len(DENY_ENV_CALLS)}) store({len(DENY_STORE)}) cloud({len(DENY_CLOUD)}) "
-    f"manifest({RECLAIM_VERB.pattern})"
+    f"manifest({RECLAIM_VERB.pattern}) secret({SECRET_FLAG.pattern} + Reveal@{len(REVEAL_SITES)})"
 )

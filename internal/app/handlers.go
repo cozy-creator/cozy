@@ -41,6 +41,11 @@ var handlers = map[string]Handler{
 	"gc":           handleGC,
 	"up":           handleUp,
 	"down":         handleDown,
+	"search":       handleSearch,
+	"repo.show":    handleRepoShow,
+	"repo.create":  handleRepoCreate,
+	"hub.status":   handleHubStatus,
+	"hub.config":   handleHubConfig,
 }
 
 func handlerNames() []string {

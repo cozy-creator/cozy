@@ -87,18 +87,59 @@ device ledger, and output publication authority.
 - `internal/config` is the ONE environment reader: `Load()` reads once and freezes, and
   it is also the child-env allowlist.
 
+## Catalog and first-party publish (cl-011)
+
+`internal/hub` is the ONE client onto tensorhub's HTTP API. Launch-1 tensorhub has **no
+identity plane** (owner ruling, decisions #229): there are no accounts, no sessions and
+no orgs, so the surface splits exactly two ways.
+
+- **Reads are public.** `cozy search [<query>] [--kind]` and `cozy repo show <org/name>`
+  carry no credential at all. A miss is exit 0 with an empty state; an unknown ref is
+  exit 4.
+- **First-party writes carry ONE static admin token.** `cozy repo create <org/name>
+  --kind <model|endpoint> --reason <why>` and `cozy hub config` send
+  `Authorization: Bearer $TENSORHUB_TOKEN`. `--reason` is required because the hub
+  records why every admin mutation happened *before* it performs it.
+- **`cozy hub status`** names the configured URL and the credential's digest with the
+  provenance of each, and reports reachability as a STATE (exit 0) — an unreachable hub
+  is what you asked about, not a refusal.
+- **`cozy login` / `logout` are DEFERRED to th-031**, not forgotten: the manifest rows
+  say so, and there is nothing for a PKCE flow to authenticate against. The env carries
+  a value, never a login act.
+
+Configuration is the frozen `internal/config` value: `TENSORHUB_URL` (default
+`http://127.0.0.1:8080`) and `TENSORHUB_TOKEN`. The token is a `secret.Value` — it
+renders as `sha256:<12 hex>`, the same spelling the hub uses for its own redacted keys,
+so `cozy hub status` and `cozy hub config` can be compared without either end printing
+it. `Reveal()` has exactly one caller: the line that builds the Authorization header.
+
+Hub refusals reach the user **verbatim** — the hub's `{code, message, remedy}` envelope
+under a code from the shared exit matrix: 401/403 → 5, 404 → 4, 409 → 13, 4xx → 3,
+5xx/unreachable → 9, no answer at all → 10. An answer that is not a typed envelope
+(an unknown route, a proxy, a login page) says so rather than being invented into one.
+
+Not built here, and named: upload sessions, grants and byte transfer (cl-012 over
+th-002), release/lane resolution and the `--lane` grammar (th-003), per-source
+credential rows for `hf`/`civitai`/`comfy` (cl-012's `pull`, on stdin — never argv).
+
 ## Verification
 
 No automated tests. Verification is running the real thing:
 
 - `scripts/redarm.py` builds each hostile input for real, runs the real binary and
   observes the typed refusal (16 arms).
+- `scripts/hub-live.py` drives the real `cozy` against a REAL tensorhub: public reads,
+  admin writes, every refusal arm (wrong token, absent repo, closed port, a hub that
+  accepts and never answers, a 200 that is not our document), and a cumulative secrecy
+  check that the raw credential appears in no byte the session printed.
 - `cmd/cozy-live` drives the REAL coordinator against real peers:
   `canonical` (worker-protocol's frozen corpus, byte-for-byte, plus every semantic twin
   refused by its own code), `arms` (the refusal matrix against `fakeworker`, a second
   independent Go implementation of the worker side), `attempt` and `recovered` (the real
   cozy-runtime supervisor + executor on a real GPU).
-- `scripts/fence.py` enforces eight families: forbidden deps, byte-plane vocabulary
+- `scripts/fence.py` enforces nine families: forbidden deps, byte-plane vocabulary
   (TensorFS owns storage/residency), interactive prompts, exit-matrix parity, a manifest
-  lint, the env-read fence (one reader), no lifecycle sidecar, and no cloud emulation or
-  minted credential. Doors are greppable: `//cozy:allow`, `//cozy:stdin-value`.
+  lint, the env-read fence (one reader), no lifecycle sidecar, no cloud emulation or
+  minted credential, and the secret fence (no credential-shaped flag takes an argv
+  value; `Reveal()` only where the value becomes a header). Doors are greppable:
+  `//cozy:allow`, `//cozy:stdin-value`.
