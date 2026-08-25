@@ -1,5 +1,14 @@
 //! SnapshotManifest — directories and regular file→object/blob entries only.
 //! `checkpoint_id = snapshot_id`, unconditionally.
+//!
+//! Path semantics are REDUCED (tensorfs.md §2): no symlinks, hardlink groups, sparse holes
+//! or executable bits — an entry kind outside {dir, file, blob} refuses decode, so the
+//! richer facts of a foreign source tree are unrepresentable rather than merely unused.
+//!
+//! NFC, without a normalization table: decisions row "tfs-013 canonical layer divergences"
+//! makes every tensorfs document field printable-ASCII, which is strictly STRONGER than NFC
+//! (an NFC twin and an NFD twin of one name are both red, at the canon layer, before any
+//! path law runs). There is no table here for a normalizer to disagree with.
 
 use crate::canon::{as_arr, as_str, Fields, Value};
 use crate::err::{refuse, Code, Result};
@@ -7,6 +16,16 @@ use crate::ids::{check_format, Doc, ObjectRef};
 use crate::limits;
 
 pub const SEGMENT_PROFILE: &str = "fixed-64m/1";
+
+/// Content-addressed contained documents (EncodingSpec objects and their conformance-vector
+/// sets) live under ONE directory whose leaf names ARE their digests. The path terminal is
+/// therefore checkable against the object it names, with no second naming authority.
+pub const CLOSURE_DIR: &str = "closure";
+
+/// The canonical path of one contained document.
+pub fn closure_path(sha256: &str) -> String {
+    format!("{CLOSURE_DIR}/{sha256}.json")
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BlobDescriptor {
@@ -144,11 +163,43 @@ fn check_path(p: &str) -> Result<()> {
     Ok(())
 }
 
+/// One contained-document path whose terminal must equal the digest it names.
+fn check_content_addressed(path: &str, entry: &Entry) -> Result<()> {
+    let leaf = match path.strip_prefix(CLOSURE_DIR) {
+        Some(rest) => match rest.strip_prefix('/') {
+            Some(l) => l,
+            None => return Ok(()), // a sibling like "closure-notes.txt" is an ordinary path
+        },
+        None => return Ok(()),
+    };
+    let obj = match entry {
+        Entry::File(o) => o,
+        _ => {
+            return refuse(
+                Code::PATH_DIGEST_MISMATCH,
+                format!("{path:?}: contained documents are bounded canonical FILE objects"),
+            )
+        }
+    };
+    match leaf.strip_suffix(".json") {
+        Some(stem) if stem == obj.sha256 => Ok(()),
+        _ => refuse(
+            Code::PATH_DIGEST_MISMATCH,
+            format!(
+                "{path:?}: content-addressed terminal does not name {}",
+                obj.id()
+            ),
+        ),
+    }
+}
+
 impl SnapshotManifest {
     /// The pinned atom. Every checkpoint has a snapshot — the id is the snapshot's.
     pub fn snapshot_id(&self) -> String {
         self.object_id()
     }
+    /// UNCONDITIONAL: one derivation, zero consumer branching. A tensors-only checkpoint
+    /// lists exactly one `model.cozytensors` file and its id derives identically.
     pub fn checkpoint_id(&self) -> Result<String> {
         match self.header {
             Some(_) => Ok(self.snapshot_id()),
@@ -159,10 +210,45 @@ impl SnapshotManifest {
         }
     }
 
+    pub fn get(&self, path: &str) -> Option<&Entry> {
+        self.entries.iter().find(|(p, _)| p == path).map(|(_, e)| e)
+    }
+
+    /// Is this exact object listed as a file entry, and at how many paths?
+    pub fn listings(&self, r: &ObjectRef) -> Vec<&str> {
+        self.entries
+            .iter()
+            .filter(|(_, e)| matches!(e, Entry::File(o) if o == r))
+            .map(|(p, _)| p.as_str())
+            .collect()
+    }
+
+    /// Every object this manifest's own bytes name, in entry order. The transitive root
+    /// walk (checkpoint.rs) continues from here THROUGH the header.
+    pub fn direct_objects(&self) -> Vec<ObjectRef> {
+        let mut v = Vec::new();
+        for (_, e) in &self.entries {
+            match e {
+                Entry::Dir => {}
+                Entry::File(o) => v.push(o.clone()),
+                Entry::Blob(b) => v.extend(b.segments.iter().cloned()),
+            }
+        }
+        v
+    }
+
+    /// The path law, run as part of every decode. Strictly ascending raw bytes gives
+    /// duplicate-path refusal and parent-before-child for free; `dirs` is a subsequence of
+    /// an ascending sequence, so the parent lookup is a binary search rather than a scan.
     pub fn validate(&self) -> Result<()> {
-        let mut folded: Vec<String> = Vec::new();
+        if self.entries.is_empty() {
+            return refuse(Code::MISSING_FIELD, "a snapshot lists at least one entry");
+        }
         let mut dirs: Vec<&str> = Vec::new();
         let mut prev: Option<&str> = None;
+        let mut folded: Vec<String> = Vec::with_capacity(self.entries.len());
+        let mut header_listings: Vec<&str> = Vec::new();
+
         for (path, entry) in &self.entries {
             check_path(path)?;
             if let Some(p) = prev {
@@ -174,26 +260,46 @@ impl SnapshotManifest {
                 }
             }
             prev = Some(path);
-            let fold = path.to_ascii_lowercase();
-            if folded.contains(&fold) {
-                return refuse(
-                    Code::PATH_CASE_COLLISION,
-                    format!("{path:?} case-folds onto an earlier entry"),
-                );
-            }
-            folded.push(fold);
+            folded.push(path.to_ascii_lowercase());
             if let Some(idx) = path.rfind('/') {
                 let parent = &path[..idx];
-                if !dirs.contains(&parent) {
+                if dirs.binary_search(&parent).is_err() {
                     return refuse(
                         Code::PATH_PARENT_MISSING,
                         format!("{path:?}: no directory entry for {parent:?}"),
                     );
                 }
             }
-            if matches!(entry, Entry::Dir) {
-                dirs.push(path);
+            check_content_addressed(path, entry)?;
+            match entry {
+                Entry::Dir => dirs.push(path),
+                Entry::File(o) => {
+                    if self.header.as_ref() == Some(o) {
+                        header_listings.push(path);
+                    }
+                }
+                Entry::Blob(_) => {}
             }
+        }
+
+        folded.sort();
+        if let Some(w) = folded.windows(2).find(|w| w[0] == w[1]) {
+            return refuse(
+                Code::PATH_CASE_COLLISION,
+                format!("two entries case-fold onto {:?}", w[0]),
+            );
+        }
+
+        // The attachment is TYPED, never found by pathname — but the object it names must
+        // be in the tree exactly once, or the projected checkout has zero or two headers.
+        if self.header.is_some() && header_listings.len() != 1 {
+            return refuse(
+                Code::ATTACHMENT_CARDINALITY,
+                format!(
+                    "the attached CozyTensorsHeader is listed at {} paths {header_listings:?}, not 1",
+                    header_listings.len()
+                ),
+            );
         }
         Ok(())
     }
@@ -222,8 +328,20 @@ impl Doc for SnapshotManifest {
             }
             None => None,
         };
-        let mut entries = Vec::new();
-        for e in as_arr("SnapshotManifest", "entries", f.req("entries")?)? {
+        let raw = as_arr("SnapshotManifest", "entries", f.req("entries")?)?;
+        // Refuse BEFORE allocation: the entry vector is sized only once the count is legal.
+        if raw.len() > limits::MAX_ENTRIES {
+            return refuse(
+                Code::COUNT_CAP,
+                format!(
+                    "entry count {} over the {} cap",
+                    raw.len(),
+                    limits::MAX_ENTRIES
+                ),
+            );
+        }
+        let mut entries = Vec::with_capacity(raw.len());
+        for e in raw {
             let mut ef = Fields::new("SnapshotManifest.entry", e)?;
             let kind = as_str("entry", "kind", ef.req("kind")?)?.to_string();
             let path = ef.req_str("path")?.to_string();
@@ -242,10 +360,11 @@ impl Doc for SnapshotManifest {
             entries.push((path, entry));
         }
         f.done()?;
-        if entries.len() > limits::MAX_TENSORS {
-            return refuse(Code::COUNT_CAP, "entry count over cap");
-        }
-        Ok(SnapshotManifest { header, entries })
+        // Strict decode IS the path law: a manifest that parses but violates it never exists
+        // as a value, so no caller can forget to validate one.
+        let m = SnapshotManifest { header, entries };
+        m.validate()?;
+        Ok(m)
     }
 
     fn to_value(&self) -> Value {

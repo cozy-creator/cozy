@@ -13,10 +13,11 @@ use std::time::Instant;
 
 use tensorfs_core::checkpoint as ck;
 use tensorfs_core::dtype::Dtype;
+use tensorfs_core::err::Result as TfsResult;
 use tensorfs_core::header::{Body, Closure, Header, Located, Part, Tensor};
 use tensorfs_core::ids::{ConfigRef, Doc, ObjectRef};
 use tensorfs_core::limits;
-use tensorfs_core::manifest::{Entry, SnapshotManifest};
+use tensorfs_core::manifest::{closure_path, Entry, SnapshotManifest, CLOSURE_DIR};
 use tensorfs_core::registry;
 use tensorfs_core::relation::Carrier;
 use tensorfs_core::sha256;
@@ -191,12 +192,58 @@ fn seed_of(it: &Item, role: &str) -> String {
     }
 }
 
-fn spec_of(alias: &str) -> EncodingSpec {
+fn registry_seed(alias: &str) -> registry::Seed {
     registry::seeds()
         .into_iter()
         .find(|s| s.alias == alias)
         .expect("seed alias")
-        .spec
+}
+
+fn spec_of(alias: &str) -> EncodingSpec {
+    registry_seed(alias).spec
+}
+
+/// The projected tree a checkpoint commits. Contained documents (EncodingSpec objects and
+/// their conformance-vector sets) go under `closure/` at paths whose terminal IS the digest,
+/// so the tree is self-describing on any host and every reference is checkable against the
+/// path that carries it.
+pub fn build_snapshot(
+    header: &Header,
+    href: &ObjectRef,
+    closure: &Closure,
+) -> TfsResult<SnapshotManifest> {
+    let mut entries: Vec<(String, Entry)> =
+        vec![("model.cozytensors".to_string(), Entry::File(href.clone()))];
+    let mut contained: Vec<(String, Entry)> = Vec::new();
+    for r in &header.encodings {
+        contained.push((closure_path(&r.sha256), Entry::File(r.clone())));
+        if let Some(v) = closure.get(&r.id()).and_then(|s| s.vectors.clone()) {
+            contained.push((closure_path(&v.sha256), Entry::File(v)));
+        }
+    }
+    if !contained.is_empty() {
+        entries.push((CLOSURE_DIR.to_string(), Entry::Dir));
+        entries.extend(contained);
+    }
+    for (name, c) in &header.configs {
+        entries.push((name.clone(), Entry::Dir));
+        entries.push((
+            format!("{name}/config.json"),
+            Entry::File(ObjectRef {
+                sha256: c.sha256.clone(),
+                length: c.length,
+            }),
+        ));
+    }
+    entries.sort_by(|a, b| a.0.cmp(&b.0));
+    // Two specs may cite the SAME vector set: one object, one path, listed once.
+    entries.dedup_by(|a, b| a.0 == b.0);
+    let m = SnapshotManifest {
+        header: Some(href.clone()),
+        entries,
+    };
+    m.validate()?;
+    Ok(m)
 }
 
 fn carrier_dtype(c: &Carrier, logical: Dtype) -> Dtype {
@@ -231,9 +278,13 @@ pub fn cmd_write(root: &Path, f: &Flags) -> ExitCode {
     let mut closure = Closure::default();
     let mut enc_refs = Vec::new();
     for a in &aliases {
-        let s = spec_of(a);
-        enc_refs.push(ok!(ck::put_doc(&store, &s)));
-        closure.insert(s);
+        let sd = registry_seed(a);
+        // A spec's `vectors` reference must resolve INSIDE the closure it ships with.
+        if let Some(v) = &sd.vectors {
+            ok!(ck::put_doc(&store, v));
+        }
+        enc_refs.push(ok!(ck::put_doc(&store, &sd.spec)));
+        closure.insert(sd.spec);
     }
     enc_refs.sort_by(|a: &ObjectRef, b: &ObjectRef| a.sha256.cmp(&b.sha256));
 
@@ -306,23 +357,7 @@ pub fn cmd_write(root: &Path, f: &Flags) -> ExitCode {
     let href = ok!(ck::put_doc(&store, &header));
 
     // The snapshot is unconditional: checkpoint_id is its ObjectId, one derivation always.
-    let mut entries: Vec<(String, Entry)> =
-        vec![("model.cozytensors".to_string(), Entry::File(href.clone()))];
-    for (name, c) in &header.configs {
-        entries.push((name.clone(), Entry::Dir));
-        entries.push((
-            format!("{name}/config.json"),
-            Entry::File(ObjectRef {
-                sha256: c.sha256.clone(),
-                length: c.length,
-            }),
-        ));
-    }
-    entries.sort_by(|a, b| a.0.cmp(&b.0));
-    let snap = SnapshotManifest {
-        header: Some(href.clone()),
-        entries,
-    };
+    let snap = ok!(build_snapshot(&header, &href, &closure));
     let sref = ok!(ck::put_doc(&store, &snap));
 
     let mb = bytes as f64 / (1024.0 * 1024.0);

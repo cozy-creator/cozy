@@ -1,0 +1,4 @@
+doc: manifest
+expect: refuse
+code: ATTACHMENT_CARDINALITY
+note: two pathnames for one header: which one is the checkpoint?

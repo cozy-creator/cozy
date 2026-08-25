@@ -1,0 +1,4 @@
+doc: manifest
+expect: refuse
+code: PATH_ILLEGAL
+note: traversal by the other separator

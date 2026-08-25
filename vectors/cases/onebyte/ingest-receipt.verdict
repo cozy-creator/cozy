@@ -1,3 +1,3 @@
 doc: receipt
 expect: mutant
-note: one byte flipped at offset 225 of sha256:72519dcd8b24cccd21ece0054c0a6dd7b86d05076e6644ac8e5c0aa316dc364c
+note: one byte flipped at offset 225 of sha256:3186ff1f0cef7b7f8afe9bfd67bd69f25807c2e1d0f0211138568c38cb25c977

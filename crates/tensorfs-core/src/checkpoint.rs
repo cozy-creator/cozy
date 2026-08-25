@@ -14,6 +14,7 @@ use crate::err::{refuse, Code, Refusal, Result};
 use crate::header::{Body, Closure, Header, Located, Part};
 use crate::ids::{Doc, ObjectRef};
 use crate::limits;
+use crate::manifest::{BlobDescriptor, SnapshotManifest};
 use crate::sha256::{self, Sha256};
 use crate::spec::EncodingSpec;
 use crate::store::{Fault, Store};
@@ -242,4 +243,208 @@ pub fn load_closure(store: &Store, h: &Header) -> Result<Closure> {
         )?)?);
     }
     Ok(c)
+}
+
+pub fn load_manifest(store: &Store, r: &ObjectRef) -> Result<SnapshotManifest> {
+    SnapshotManifest::parse(&read_object(store, r, limits::DOC_MAX_BYTES)?)
+}
+
+// ------------------------------------------------------------------ blobs
+
+/// A blob's whole digest is its file identity; the ordered segment list is its read plan.
+/// Both are checked: a repaired or swapped segment under an unchanged `whole_sha256` is
+/// exactly the failure this verifies away.
+pub fn read_blob<W: Write>(store: &Store, what: &str, b: &BlobDescriptor, w: &mut W) -> Result<()> {
+    let mut h = Sha256::new();
+    let mut total = 0u64;
+    for (i, s) in b.segments.iter().enumerate() {
+        let mut t = TeeW { w, h: &mut h };
+        let n = store.read_into(&s.sha256, &mut t)?;
+        if n != s.length {
+            return refuse(
+                Code::LENGTH_MISMATCH,
+                format!(
+                    "{what}: segment {i} delivered {n} B, its record promised {}",
+                    s.length
+                ),
+            );
+        }
+        total += n;
+    }
+    let got = sha256::hex(&h.finish());
+    if total != b.logical_size {
+        return refuse(
+            Code::BYTE_LENGTH_MISMATCH,
+            format!("{what}: {total} B read, logical_size {}", b.logical_size),
+        );
+    }
+    if got != b.whole_sha256 {
+        return refuse(
+            Code::WHOLE_DIGEST_MISMATCH,
+            format!(
+                "{what}: segments reassemble to sha256:{got}, the descriptor claims sha256:{}",
+                b.whole_sha256
+            ),
+        );
+    }
+    Ok(())
+}
+
+// ------------------------------------------------------------------ the transitive root
+
+/// What one object was reached AS. The kind is the reason it is live, not a property of
+/// its bytes: the same object can be a config here and a plain asset there.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Reached {
+    pub kind: &'static str,
+    pub obj: ObjectRef,
+}
+
+#[derive(Debug, Default)]
+pub struct Walk {
+    pub objects: Vec<Reached>,
+    pub tensors: usize,
+    pub parts: usize,
+    /// Entries that are neither the header, a config, nor a contained document: SIBLING
+    /// ASSETS, admitted only for a named reason (cozytensors.md §3 — non-JSON bytes or
+    /// genuine mutability). Counted and listed, never silently absorbed.
+    pub siblings: Vec<String>,
+}
+
+impl Walk {
+    pub fn count(&self, kind: &str) -> usize {
+        self.objects.iter().filter(|r| r.kind == kind).count()
+    }
+    pub fn bytes(&self) -> u64 {
+        self.objects.iter().map(|r| r.obj.length).sum()
+    }
+    /// Distinct objects — repeated files and aliased runs reference the same object once.
+    pub fn distinct(&self) -> Vec<&ObjectRef> {
+        let mut v: Vec<&ObjectRef> = self.objects.iter().map(|r| &r.obj).collect();
+        v.sort_by(|a, b| a.sha256.cmp(&b.sha256));
+        v.dedup_by(|a, b| a.sha256 == b.sha256);
+        v
+    }
+}
+
+/// SnapshotManifest → CozyTensorsHeader → contained tensor rules → storage-part object runs.
+/// Reaches every and only the objects this snapshot commits, and refuses when a reference
+/// the header makes is not CONTAINED in the snapshot that carries it.
+pub fn walk(store: &Store, snap: &SnapshotManifest) -> Result<Walk> {
+    snap.validate()?;
+    let mut w = Walk::default();
+    let href = match &snap.header {
+        Some(h) => h.clone(),
+        None => {
+            return refuse(
+                Code::ATTACHMENT_CARDINALITY,
+                "not a checkpoint snapshot: no cozytensors header attachment",
+            )
+        }
+    };
+    w.objects.push(Reached {
+        kind: "header",
+        obj: href.clone(),
+    });
+    let header = load_header(store, &href)?;
+
+    // Every contained document must be listed, and content-addressed ones at their digest.
+    let contained = |kind: &'static str, r: &ObjectRef, addressed: bool| -> Result<()> {
+        let want = crate::manifest::closure_path(&r.sha256);
+        let paths = snap.listings(r);
+        if addressed {
+            if paths != [want.as_str()] {
+                return refuse(
+                    Code::NOT_CONTAINED,
+                    format!(
+                        "{kind} {} resolves to {paths:?}, not exactly one {want:?}",
+                        r.id()
+                    ),
+                );
+            }
+        } else if paths.len() != 1 {
+            return refuse(
+                Code::NOT_CONTAINED,
+                format!(
+                    "{kind} {} is listed at {} paths, not 1",
+                    r.id(),
+                    paths.len()
+                ),
+            );
+        }
+        Ok(())
+    };
+
+    for (name, c) in &header.configs {
+        let r = ObjectRef {
+            sha256: c.sha256.clone(),
+            length: c.length,
+        };
+        contained("config", &r, false)?;
+        let _ = name;
+        w.objects.push(Reached {
+            kind: "config",
+            obj: r,
+        });
+    }
+
+    let mut closure = Closure::default();
+    for r in &header.encodings {
+        contained("EncodingSpec", r, true)?;
+        let spec = EncodingSpec::parse(&read_object(store, r, limits::SPEC_MAX_BYTES)?)?;
+        if let Some(v) = &spec.vectors {
+            contained("EncodingVectors", v, true)?;
+            w.objects.push(Reached {
+                kind: "vectors",
+                obj: v.clone(),
+            });
+        }
+        w.objects.push(Reached {
+            kind: "spec",
+            obj: r.clone(),
+        });
+        closure.insert(spec);
+    }
+
+    header.validate(&closure)?;
+    for (comp, key, t) in header.tensors() {
+        w.tensors += 1;
+        for (role, part) in &t.parts {
+            w.parts += 1;
+            let _ = (comp, key, role);
+            for s in part.segments() {
+                w.objects.push(Reached {
+                    kind: "part",
+                    obj: s.clone(),
+                });
+            }
+        }
+    }
+
+    // Anything listed that the header does not account for is a sibling asset.
+    let accounted: Vec<String> = w.objects.iter().map(|r| r.obj.sha256.clone()).collect();
+    for (path, e) in &snap.entries {
+        match e {
+            crate::manifest::Entry::Dir => {}
+            crate::manifest::Entry::File(o) => {
+                if !accounted.contains(&o.sha256) {
+                    w.siblings.push(path.clone());
+                    w.objects.push(Reached {
+                        kind: "asset",
+                        obj: o.clone(),
+                    });
+                }
+            }
+            crate::manifest::Entry::Blob(b) => {
+                w.siblings.push(path.clone());
+                for s in &b.segments {
+                    w.objects.push(Reached {
+                        kind: "blob",
+                        obj: s.clone(),
+                    });
+                }
+            }
+        }
+    }
+    Ok(w)
 }

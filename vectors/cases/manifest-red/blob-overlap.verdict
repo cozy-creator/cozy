@@ -1,0 +1,4 @@
+doc: manifest
+expect: refuse
+code: BYTE_LENGTH_MISMATCH
+note: segments that claim more bytes than the blob has

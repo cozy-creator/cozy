@@ -1,0 +1,4 @@
+doc: manifest
+expect: refuse
+code: TRAILING_BYTES
+note: one trailing byte: a semantic twin is never READ as a snapshot

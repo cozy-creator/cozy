@@ -21,6 +21,15 @@
 //!   tfs fill <root> <plan>       resumable fill: skip only verified objects
 //!   tfs bench-store <root>       put/read/range/rehash throughput + peak RSS
 //!
+//! The snapshot plane (tfs-004). Flags: --iters <n>
+//!
+//!   tfs snapshot show <root> <hex>           strict decode, decode->re-encode identity, entries
+//!   tfs snapshot walk <root> <hex>           transitive root; every-and-only vs the store census
+//!   tfs snapshot verify <root> <hex>         full-checkpoint verify: every declared byte
+//!   tfs snapshot flip <root> <hex>           what moves checkpoint_id / header_digest / topology
+//!   tfs snapshot fuzz <root> <hex>           bounded mutation fuzz over canonical bytes
+//!   tfs snapshot blob put|read|repair <root> <file> [i]
+//!
 //! The checkpoint plane (tfs-015). Flags: --blocks <n> --pin <alias|empty> --seed <s>
 //!
 //!   tfs checkpoint write <root>              objectize a synthetic tree, emit the header
@@ -75,6 +84,18 @@ fn main() -> ExitCode {
             &flags,
         ),
         ["checkpoint", "admit", r, h] => ckpt::cmd_admit(Path::new(r), h, &flags),
+        ["snapshot", "show", r, h] => snap::cmd_show(Path::new(r), h),
+        ["snapshot", "walk", r, h] => snap::cmd_walk(Path::new(r), h),
+        ["snapshot", "verify", r, h] => snap::cmd_verify(Path::new(r), h),
+        ["snapshot", "flip", r, h] => snap::cmd_flip(Path::new(r), h, &flags),
+        ["snapshot", "fuzz", r, h] => {
+            snap::cmd_fuzz(Path::new(r), h, flag_num(&flags, "iters", 20000))
+        }
+        ["snapshot", "blob", "put", r, f] => snap::cmd_blob_put(Path::new(r), Path::new(f)),
+        ["snapshot", "blob", "read", r, f] => snap::cmd_blob_read(Path::new(r), Path::new(f)),
+        ["snapshot", "blob", "repair", r, f, i] => {
+            snap::cmd_blob_repair(Path::new(r), Path::new(f), i.parse().unwrap_or(0))
+        }
         ["checkpoint", "caps"] => ckpt::cmd_caps(),
         ["checkpoint", "size"] => ckpt::cmd_size(3699),
         ["checkpoint", "size", n] => ckpt::cmd_size(n.parse().unwrap_or(3699)),
@@ -143,6 +164,7 @@ macro_rules! ok {
 }
 
 mod ckpt;
+mod snap;
 
 fn cmd_store(root: &Path, verb: &str) -> ExitCode {
     let mut s = match verb {
@@ -605,6 +627,11 @@ fn header_nvfp4() -> (Header, EncodingSpec) {
 fn manifest_checkpoint(header: &Header, extra_file: bool) -> SnapshotManifest {
     let blob = BlobDescriptor::of(&pattern(4096));
     let mut entries = vec![
+        // The attachment is TYPED; this is the one path the same object is projected to.
+        (
+            "model.cozytensors".to_string(),
+            Entry::File(header.object_ref()),
+        ),
         ("tokenizer.model".to_string(), Entry::Blob(blob)),
         ("transformer".to_string(), Entry::Dir),
         (
@@ -1447,6 +1474,7 @@ fn build_corpus() -> (Vec<Case>, Vec<EncodingSpec>) {
 
     // --- manifest reds
     let g = "manifest-red";
+    let header_ref = ha.object_ref();
     let mut m = snap.clone();
     m.entries.swap(0, 1);
     cases.push(red_case(
@@ -1482,7 +1510,7 @@ fn build_corpus() -> (Vec<Case>, Vec<EncodingSpec>) {
         "case-fold collision inside one tree",
     ));
     let mut m = snap.clone();
-    m.entries[0].0 = "../escape.bin".to_string();
+    m.entries[1].0 = "../escape.bin".to_string();
     m.entries.sort_by(|a, b| a.0.cmp(&b.0));
     cases.push(red_case(
         g,
@@ -1493,7 +1521,7 @@ fn build_corpus() -> (Vec<Case>, Vec<EncodingSpec>) {
         "dot component",
     ));
     let mut m = snap.clone();
-    m.entries[0].0 = "nul.bin".to_string();
+    m.entries[1].0 = "nul.bin".to_string();
     m.entries.sort_by(|a, b| a.0.cmp(&b.0));
     cases.push(red_case(
         g,
@@ -1504,7 +1532,7 @@ fn build_corpus() -> (Vec<Case>, Vec<EncodingSpec>) {
         "reserved stem",
     ));
     let mut m = snap.clone();
-    if let Entry::Blob(b) = &mut m.entries[0].1 {
+    if let Entry::Blob(b) = &mut m.entries[1].1 {
         b.logical_size += 1;
     }
     cases.push(red_case(
@@ -1513,7 +1541,164 @@ fn build_corpus() -> (Vec<Case>, Vec<EncodingSpec>) {
         "manifest",
         m.canonical_bytes(),
         "BYTE_LENGTH_MISMATCH",
-        "segment total != logical size",
+        "a GAP: the descriptor claims a byte the segments never deliver",
+    ));
+
+    // tfs-004: the reduced path semantics, the typed attachment, and the content-addressed
+    // closure. Every one of these is a document a foreign tree could ask us to represent.
+    let snap_bytes = snap.canonical_bytes();
+    cases.push(red_case(
+        g,
+        "entry-kind-symlink",
+        "manifest",
+        sub(&snap_bytes, "\"kind\":\"dir\"", "\"kind\":\"symlink\""),
+        "UNKNOWN_FIELD",
+        "REDUCED semantics: symlinks are unrepresentable, not merely unused",
+    ));
+    cases.push(red_case(
+        g,
+        "entry-executable-bit",
+        "manifest",
+        sub(
+            &snap_bytes,
+            "\"kind\":\"dir\"",
+            "\"executable\":true,\"kind\":\"dir\"",
+        ),
+        "UNKNOWN_FIELD",
+        "no executable bit: a mode is not a storage fact",
+    ));
+    cases.push(red_case(
+        g,
+        "unknown-version",
+        "manifest",
+        sub(&snap_bytes, "tensorfs.snapshot/1", "tensorfs.snapshot/2"),
+        "UNKNOWN_FORMAT",
+        "an unknown snapshot version refuses, never degrades",
+    ));
+    cases.push(red_case(
+        g,
+        "trailing-bytes",
+        "manifest",
+        [snap_bytes.clone(), b"{}".to_vec()].concat(),
+        "TRAILING_BYTES",
+        "one trailing byte: a semantic twin is never READ as a snapshot",
+    ));
+    cases.push(red_case(
+        g,
+        "path-backslash",
+        "manifest",
+        sub(
+            &snap_bytes,
+            "transformer/config.json",
+            "transformer\\\\up.json",
+        ),
+        "PATH_ILLEGAL",
+        "traversal by the other separator",
+    ));
+    let mut m = snap.clone();
+    m.entries.push((
+        "transformer/config.json".to_string(),
+        Entry::File(ObjectRef::of(b"twin")),
+    ));
+    m.entries.sort_by(|a, b| a.0.cmp(&b.0));
+    cases.push(red_case(
+        g,
+        "duplicate-path",
+        "manifest",
+        m.canonical_bytes(),
+        "PATH_ORDER",
+        "one path, one entry: strict ascent IS the duplicate refusal",
+    ));
+    let mut m = snap.clone();
+    m.entries.retain(|(p, _)| p != "model.cozytensors");
+    cases.push(red_case(
+        g,
+        "attachment-unlisted",
+        "manifest",
+        m.canonical_bytes(),
+        "ATTACHMENT_CARDINALITY",
+        "a header the projected tree does not contain",
+    ));
+    let mut m = snap.clone();
+    m.entries.push((
+        "model2.cozytensors".to_string(),
+        Entry::File(header_ref.clone()),
+    ));
+    m.entries.sort_by(|a, b| a.0.cmp(&b.0));
+    cases.push(red_case(
+        g,
+        "attachment-twice",
+        "manifest",
+        m.canonical_bytes(),
+        "ATTACHMENT_CARDINALITY",
+        "two pathnames for one header: which one is the checkpoint?",
+    ));
+    let mut m = snap.clone();
+    m.entries = vec![];
+    cases.push(red_case(
+        g,
+        "entries-empty",
+        "manifest",
+        m.canonical_bytes(),
+        "MISSING_FIELD",
+        "a snapshot with nothing in it",
+    ));
+    let mut m = snap.clone();
+    let spec_obj = plain.object_ref();
+    m.entries
+        .push((tensorfs_core::manifest::CLOSURE_DIR.to_string(), Entry::Dir));
+    m.entries.push((
+        tensorfs_core::manifest::closure_path(&spec_obj.sha256),
+        Entry::File(spec_obj.clone()),
+    ));
+    m.entries.sort_by(|a, b| a.0.cmp(&b.0));
+    cases.push(ok_case(
+        g,
+        "closure-contained",
+        "manifest",
+        m.canonical_bytes(),
+        "a contained EncodingSpec at the path whose terminal IS its digest",
+    ));
+    let good = m.canonical_bytes();
+    let mut wrong = spec_obj.sha256.clone();
+    wrong.replace_range(0..1, if wrong.starts_with('a') { "b" } else { "a" });
+    cases.push(red_case(
+        g,
+        "closure-digest-mismatch",
+        "manifest",
+        sub(
+            &good,
+            &format!("closure/{}.json", spec_obj.sha256),
+            &format!("closure/{wrong}.json"),
+        ),
+        "PATH_DIGEST_MISMATCH",
+        "a content-addressed path that names something else",
+    ));
+    let mut m = snap.clone();
+    if let Entry::Blob(b) = &mut m.entries[1].1 {
+        // a HOLE: a non-final segment short of the profile grid
+        b.segments.push(b.segments[0].clone());
+        b.logical_size *= 2;
+    }
+    cases.push(red_case(
+        g,
+        "blob-hole",
+        "manifest",
+        m.canonical_bytes(),
+        "BYTE_LENGTH_MISMATCH",
+        "sparse holes are unrepresentable: the profile fixes every boundary",
+    ));
+    let mut m = snap.clone();
+    if let Entry::Blob(b) = &mut m.entries[1].1 {
+        b.logical_size -= 1;
+    }
+    cases.push(red_case(
+        g,
+        "blob-overlap",
+        "manifest",
+        m.canonical_bytes(),
+        "BYTE_LENGTH_MISMATCH",
+        "segments that claim more bytes than the blob has",
     ));
 
     // --- ingest reds

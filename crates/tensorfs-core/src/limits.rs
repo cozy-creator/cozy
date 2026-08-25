@@ -33,6 +33,9 @@ pub const MAX_RANK: usize = 32;
 pub const MAX_KEY_BYTES: usize = 4096;
 pub const MAX_NAME_BYTES: usize = 128;
 pub const MAX_SEGMENTS: usize = 65_536;
+/// Snapshot file-map entries. A real checkpoint tree is ~10; the cap bounds a hostile map
+/// BEFORE the entry vector is allocated.
+pub const MAX_ENTRIES: usize = 65_536;
 /// Whole-DOCUMENT totals, not only per-part counts: a header may not multiply small legal
 /// parts into an unbounded fetch plan or an unbounded byte claim.
 pub const MAX_TOTAL_REFS: usize = 65_536;

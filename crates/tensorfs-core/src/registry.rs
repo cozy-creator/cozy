@@ -63,9 +63,20 @@ pub fn plain_vectors() -> EncodingVectors {
     }
 }
 
+/// A registry entry: the canonical spec object plus, when it has been PRODUCER-MINED, the
+/// exact vector document whose digest the spec references. Carrying both together is what
+/// makes it impossible to ship a spec pointing at vector bytes nobody stores.
 pub struct Seed {
     pub alias: &'static str,
     pub spec: EncodingSpec,
+    pub vectors: Option<EncodingVectors>,
+}
+
+impl Seed {
+    /// The contained documents this entry contributes to a checkpoint closure.
+    pub fn vectors_ref(&self) -> Option<ObjectRef> {
+        self.spec.vectors.clone()
+    }
 }
 
 fn spec(
@@ -82,6 +93,26 @@ fn spec(
         logical_rank,
         roles: r,
         doc: Some(doc.to_string()),
+        vectors,
+    }
+}
+
+/// One seed, with the spec's `vectors` reference DERIVED from the vector document rather
+/// than transcribed beside it.
+fn seed(
+    alias: &'static str,
+    logical_dtypes: Vec<Dtype>,
+    logical_rank: Option<u64>,
+    roles: Vec<(&str, Role)>,
+    doc: &str,
+    vectors: Option<EncodingVectors>,
+) -> Seed {
+    let vref = vectors
+        .as_ref()
+        .map(|v| ObjectRef::of(&v.canonical_bytes()));
+    Seed {
+        alias,
+        spec: spec(logical_dtypes, logical_rank, roles, doc, vref),
         vectors,
     }
 }
@@ -105,21 +136,19 @@ pub fn seeds() -> Vec<Seed> {
         Dtype::Bool,
     ]);
     let float = logical(&[Dtype::Bf16, Dtype::F16, Dtype::F32]);
-    let vec_ref = ObjectRef::of(&plain_vectors().canonical_bytes());
 
     let mut out = vec![
-        Seed {
-            alias: "plain/1",
-            spec: spec(
+        seed(
+            "plain/1",
                 all,
                 None,
                 vec![("value", role(Carrier::SameAsLogical, Relation::Same))],
                 "Plain little-endian row-major storage: one `value` role carrying the logical bytes verbatim. Entry zero of the registry; not a special absent form.",
-                Some(vec_ref),
-            ),
-        },
+                Some(plain_vectors()),
+        ),
         Seed {
             alias: "fp8-rowwise/1",
+            vectors: None,
             spec: spec(
                 float.clone(),
                 Some(2),
@@ -133,6 +162,7 @@ pub fn seeds() -> Vec<Seed> {
         },
         Seed {
             alias: "w8a8-perchannel/1",
+            vectors: None,
             spec: spec(
                 float.clone(),
                 Some(2),
@@ -146,6 +176,7 @@ pub fn seeds() -> Vec<Seed> {
         },
         Seed {
             alias: "mxfp8/1",
+            vectors: None,
             spec: spec(
                 float.clone(),
                 Some(2),
@@ -162,6 +193,7 @@ pub fn seeds() -> Vec<Seed> {
         },
         Seed {
             alias: "svdq-microscale/1",
+            vectors: None,
             spec: spec(
                 float.clone(),
                 Some(2),
@@ -241,6 +273,7 @@ pub fn seeds() -> Vec<Seed> {
         let full = format!("{doc} Variant roles: base{suffix}.");
         out.push(Seed {
             alias: "nvfp4-w4a4/1",
+            vectors: None,
             spec: spec(
                 logical(&[Dtype::Bf16, Dtype::F16]),
                 Some(2),

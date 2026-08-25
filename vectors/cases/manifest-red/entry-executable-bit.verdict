@@ -1,0 +1,4 @@
+doc: manifest
+expect: refuse
+code: UNKNOWN_FIELD
+note: no executable bit: a mode is not a storage fact

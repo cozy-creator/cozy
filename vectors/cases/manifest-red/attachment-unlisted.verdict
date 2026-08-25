@@ -1,0 +1,4 @@
+doc: manifest
+expect: refuse
+code: ATTACHMENT_CARDINALITY
+note: a header the projected tree does not contain

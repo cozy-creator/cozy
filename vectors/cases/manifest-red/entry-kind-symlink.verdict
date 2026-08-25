@@ -1,0 +1,4 @@
+doc: manifest
+expect: refuse
+code: UNKNOWN_FIELD
+note: REDUCED semantics: symlinks are unrepresentable, not merely unused

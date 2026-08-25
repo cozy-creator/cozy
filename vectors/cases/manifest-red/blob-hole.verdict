@@ -1,0 +1,4 @@
+doc: manifest
+expect: refuse
+code: BYTE_LENGTH_MISMATCH
+note: sparse holes are unrepresentable: the profile fixes every boundary
