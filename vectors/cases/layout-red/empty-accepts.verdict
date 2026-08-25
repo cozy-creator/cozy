@@ -1,0 +1,4 @@
+doc: code_topology
+expect: refuse
+code: MISSING_FIELD
+note: an empty accepts list admits nothing and says nothing

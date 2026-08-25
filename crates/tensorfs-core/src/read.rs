@@ -145,7 +145,7 @@ pub fn acquire(
                     );
                 }
             }
-            Err(why) => match store.verify(&o.sha256, false) {
+            Err(why) => match store.verify(&o.sha256) {
                 Ok(Verdict::Quarantined { to, why: w }) => {
                     let _ = hold.release(meta);
                     return refuse(

@@ -110,7 +110,7 @@ red_section() {
 
   hr "RED 3 — a spec object missing from the closure: cannot install as self-describing"
   local spec; spec=$("$TFS" checkpoint info "$RED" "$h" | grep '^encoding' | head -1 | hex)
-  cp "$(objpath "$RED" "$spec")" "$WORK/spec.bak"
+  rm -f "$WORK/spec.bak"; cp "$(objpath "$RED" "$spec")" "$WORK/spec.bak"
   rm -f "$(objpath "$RED" "$spec")"
   "$TFS" checkpoint read "$RED" "$h" --blocks 1
   cp "$WORK/spec.bak" "$(objpath "$RED" "$spec")"; chmod 444 "$(objpath "$RED" "$spec")"
@@ -120,7 +120,7 @@ red_section() {
   seg=$("$TFS" checkpoint locate "$RED" "$h" unet blocks.0.attn1.to_out.0.weight value 0 8 \
         | grep 'segment 0' | grep -o 'sha256:[0-9a-f]*' | cut -d: -f2)
   seg=$(find "$RED/objects" -name "${seg}*" -printf '%f\n' | head -1)
-  cp "$(objpath "$RED" "$seg")" "$WORK/seg.bak"
+  rm -f "$WORK/seg.bak"; cp "$(objpath "$RED" "$seg")" "$WORK/seg.bak"
   chmod u+w "$(objpath "$RED" "$seg")"
   printf 'tampered' | dd of="$(objpath "$RED" "$seg")" bs=1 seek=1000 conv=notrunc status=none
   "$TFS" checkpoint read "$RED" "$h" --blocks 1 2>&1 | head -3

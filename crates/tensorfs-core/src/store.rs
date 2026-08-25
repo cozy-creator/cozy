@@ -531,7 +531,7 @@ impl Store {
     /// A verified handle: trusted from a valid record, otherwise rehashed. Bytes that
     /// disagree with their id are quarantined, never returned.
     pub fn open_verified(&self, hex: &str) -> Result<File> {
-        match self.verify(hex, false)? {
+        match self.verify(hex)? {
             Verdict::Quarantined { to, why } => refuse(
                 Code::OBJECT_CORRUPT,
                 format!("sha256:{hex} quarantined to {}: {why}", to.display()),
@@ -577,20 +577,37 @@ impl Store {
 
     // ------------------------------------------------------------ verify / quarantine
 
-    /// `paranoid` always rehashes. Otherwise a valid record is the answer and a rehash
-    /// happens exactly when the record is missing or any bound fact moved.
-    pub fn verify(&self, hex: &str, paranoid: bool) -> Result<Verdict> {
+    /// A valid verification record IS the answer; a rehash happens exactly when the record
+    /// is missing or any bound fact moved. That rehash is CORRECTNESS, not paranoia, and it
+    /// is not optional.
+    ///
+    /// PARANOID MODE IS DELETED (owner ruling 2026-08-25). The per-read full-rehash option
+    /// was 16.6x slower, had no consumer, and gave integrity checking a second home.
+    /// `scrub` — the rate-knobbed whole-store sweep — is now the ONLY deliberate
+    /// full-rehash door, and it reaches the forced path through `rehash` below rather than
+    /// through a flag anyone can pass on a read.
+    pub fn verify(&self, hex: &str) -> Result<Verdict> {
+        self.verify_inner(hex, false)
+    }
+
+    /// The scrub's door: rehash this object whatever its record says. Not reachable from
+    /// the read path, the CLI, or the wheel — only from `scrub`.
+    fn rehash(&self, hex: &str) -> Result<Verdict> {
+        self.verify_inner(hex, true)
+    }
+
+    fn verify_inner(&self, hex: &str, force: bool) -> Result<Verdict> {
         let md = stat(&self.object_path(hex))?;
         let disagreement = match self.record(hex) {
             None => Some("no verification record".to_string()),
             Some(rec) => rec.disagreement(hex, &md, self.marker.generation),
         };
-        if disagreement.is_none() && !paranoid {
+        if disagreement.is_none() && !force {
             return Ok(Verdict::Verified { rehashed: false });
         }
         let got = self.hash_object(hex)?;
         if got != hex {
-            let why = disagreement.unwrap_or_else(|| "paranoid rehash".to_string());
+            let why = disagreement.unwrap_or_else(|| "scrub rehash".to_string());
             let to = self.quarantine(hex)?;
             return Ok(Verdict::Quarantined {
                 to,
@@ -654,9 +671,10 @@ impl Store {
         Ok(out)
     }
 
-    /// ONE knob. `rate` is the fraction of objects rehashed this pass, chosen
-    /// deterministically from (pass, id). Everything else gets its record checked, and a
-    /// record that disagrees is rehashed anyway — so there is no second paranoia dial.
+    /// ONE knob, and since the 2026-08-25 owner ruling the ONE deliberate full-rehash door.
+    /// `rate` is the fraction of objects rehashed this pass, chosen deterministically from
+    /// (pass, id). Everything else gets its record checked, and a record that disagrees is
+    /// rehashed anyway.
     pub fn scrub(&self, rate: f64, pass: u64) -> Result<Scrub> {
         let mut s = Scrub::default();
         for hex in self.objects()? {
@@ -666,7 +684,11 @@ impl Store {
                 s.sampled += 1;
             }
             let size = stat(&self.object_path(&hex)).map(|m| m.len()).unwrap_or(0);
-            match self.verify(&hex, sampled)? {
+            match if sampled {
+                self.rehash(&hex)?
+            } else {
+                self.verify(&hex)?
+            } {
                 Verdict::Verified { rehashed } => {
                     if rehashed {
                         s.rehashed += 1;

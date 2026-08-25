@@ -1,0 +1,3 @@
+doc: compat_report
+expect: mutant
+note: one byte flipped at offset 362 of sha256:2cd00bfa4efb25c73c55de4d5fd2a126f46a16c21d9a8c236048ca5f4bebd38a

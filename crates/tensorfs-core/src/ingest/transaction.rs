@@ -185,6 +185,7 @@ pub fn install(
     subject: &super::IngestSubject,
     snap: &SnapshotManifest,
     header: &Header,
+    stamp: &super::stamp::Stamp,
 ) -> Result<String> {
     let root = read_root(store.root(), session)?;
     if root.expires_at <= now_secs() {
@@ -197,7 +198,7 @@ pub fn install(
             ),
         );
     }
-    receipt.binds(subject, snap, header)?;
+    receipt.binds(subject, snap, header, stamp)?;
     let walk = ck::walk(store, snap)?;
     let id = snap.checkpoint_id()?;
     let hex_id = id.strip_prefix("sha256:").unwrap_or(&id).to_string();
@@ -216,6 +217,7 @@ pub fn install(
     // complete mark collects the receipt that proves this artifact was verified.
     let mut evidence = vec![
         receipt.object_ref().sha256.clone(),
+        stamp.object_ref().sha256.clone(),
         subject.object_ref().sha256.clone(),
         subject.profile.sha256.clone(),
     ];

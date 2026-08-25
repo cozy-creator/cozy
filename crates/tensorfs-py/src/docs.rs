@@ -130,7 +130,7 @@ pub fn run_doc<'p>(
     Ok(d)
 }
 
-/// The receipt binds its exact subject/snapshot/header — the cross-vector assertion.
+/// The receipt binds its exact subject/snapshot/header/stamp — the cross-vector assertion.
 #[pyfunction]
 pub fn receipt_binds(
     py: Python<'_>,
@@ -138,8 +138,9 @@ pub fn receipt_binds(
     subject: &[u8],
     manifest: &[u8],
     header: &[u8],
+    stamp: &[u8],
 ) -> PyResult<()> {
-    corpus::receipt_binds(receipt, subject, manifest, header).or_refuse(py)
+    corpus::receipt_binds(receipt, subject, manifest, header, stamp).or_refuse(py)
 }
 
 #[pyfunction]

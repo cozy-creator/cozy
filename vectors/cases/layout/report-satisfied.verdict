@@ -1,0 +1,4 @@
+doc: compat_report
+expect: ok
+id: sha256:2cd00bfa4efb25c73c55de4d5fd2a126f46a16c21d9a8c236048ca5f4bebd38a
+note: Satisfied, with the component-granular encoding facts grading needs

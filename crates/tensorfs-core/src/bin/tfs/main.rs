@@ -8,7 +8,7 @@
 //!   tfs id <file>                object id (+ derived ids) of a stored document
 //!
 //! The object store (tfs-002). Flags: --expect <hex> --expect-length <n> --out <path>
-//! --range <off>:<len> --paranoid --rate <f> --pass <n> --max-age <s> --slow-ms <n>
+//! --range <off>:<len> --rate <f> --pass <n> --max-age <s> --slow-ms <n>
 //! --size <bytes> --small <n>, plus the dev-only kill points --fault <stage> --ready <path>.
 //!
 //!   tfs store init|info|bump <root>
@@ -59,6 +59,7 @@
 //!   tfs ingest run <root> <c=alias,...>      spawn the isolated worker; candidate + receipt
 //!   tfs ingest-worker <root> <c=alias,...>   the hermetic child (invoked by `run`)
 //!   tfs ingest install <root> <session>      the coordinator promotes ONE root
+//!   tfs ingest restamp <root> <session>      re-verify a candidate; --plant <what> for arms
 //!   tfs ingest reingest <root> <hex> <target>  inherit by object reference: 0 bytes hashed
 //!   tfs ingest roots|reap <root>             candidates are not checkpoints
 //!   tfs ingest converters | golden           reviewed converters; geometry run live
@@ -79,6 +80,21 @@
 //!   tfs materialize <root> <file> <dest>     tier 3: stream a RETAINED carrier blob
 //!   tfs render <root> <hex>                  pretty PROJECTION of a canonical document
 //!
+//! The layout plane (tfs-009) — Stamp is at the border; this is the SECOND operation.
+//! Flags: --contract <name> --closure <a,b> --pin <d,...> --lane canonical|local_unbordered
+//! --registry <a,b> --corpus <f> --out <f> --truncate-at <n>
+//!
+//!   tfs compat import <rows.json>            measured rows -> canonical header + contract
+//!   tfs compat topology <root> <hex>         a header's own topology as a code contract
+//!   tfs compat check <code.json> <header.json>   Satisfied | Mismatch(details) + the facts
+//!   tfs compat release-cut <report.json>     unclassified extras never cut a release
+//!   tfs grade <report.json>                  COMPATIBLE|CONVERTIBLE|PRODUCIBLE|INCOMPATIBLE
+//!   tfs grade register <name> <kind> <spec>  the registration ACT: runs A->B->A
+//!   tfs grade decision <file>                read one grade decision, or refuse
+//!   tfs verify-request <code.json> <header.json>   build the bounded request document
+//!   tfs verify-compat <request> <response>   the hermetic verifier: one file in, one out
+//!   tfs verify-consume <request> <response>  the hub's side; partial output mints nothing
+//!
 //! Roots, holds and local GC (tfs-006). Flags: --kind <k> --expect-generation <n>
 //! --hub-published --source-url <u> --hold-secs <s> --ready <p> --limit <n> --dry-run
 //! --allow-empty --free <b> --reserve <b>
@@ -97,10 +113,13 @@ use std::process::ExitCode;
 use std::time::Instant;
 
 use tensorfs_core::canon::{self, Value};
+use tensorfs_core::compat::{self, Accepts, CodeTopology, CompatibilityReport, Lane, Requirement};
 use tensorfs_core::dtype::Dtype;
 use tensorfs_core::err::Refusal;
+use tensorfs_core::grade::{self, ConversionRegistration, Mapping};
 use tensorfs_core::header::{Body, Closure, Header, Part, Tensor};
 use tensorfs_core::ids::{ConfigRef, Doc, ObjectRef};
+use tensorfs_core::ingest::stamp::Stamp;
 use tensorfs_core::ingest::{Evidence, IngestProfile, IngestSubject, IngestVerificationReceipt};
 use tensorfs_core::manifest::{BlobDescriptor, Draft, Entry, SnapshotManifest};
 use tensorfs_core::registry;
@@ -173,6 +192,7 @@ fn main() -> ExitCode {
         ["ingest-worker", r, t] => ingest::cmd_worker(Path::new(r), t, &flags),
         ["ingest", "reingest", r, h, t] => ingest::cmd_reingest(Path::new(r), h, t, &flags),
         ["ingest", "install", r, s] => ingest::cmd_install(Path::new(r), s),
+        ["ingest", "restamp", r, s] => ingest::cmd_restamp(Path::new(r), s, &flags),
         ["ingest", "reap", r] => ingest::cmd_reap(Path::new(r), &flags),
         ["ingest", "roots", r] => ingest::cmd_roots(Path::new(r)),
         ["read", "lease", r, h] => rd::cmd_lease(Path::new(r), h, &flags),
@@ -214,6 +234,16 @@ fn main() -> ExitCode {
         ["gc", "refs", r] => roots::cmd_gc(Path::new(r), "refs", &flags),
         ["gc", "pressure", r] => roots::cmd_gc(Path::new(r), "pressure", &flags),
         ["gc", "arms", r] => roots::cmd_arms(Path::new(r)),
+        ["compat", "import", r] => layout::cmd_import(Path::new(r), &flags),
+        ["compat", "topology", r, h] => layout::cmd_topology(Path::new(r), h, &flags),
+        ["compat", "check", c, h] => layout::cmd_check(Path::new(c), Path::new(h), &flags),
+        ["compat", "release-cut", r] => layout::cmd_release_cut(Path::new(r)),
+        ["grade", "decision", d] => layout::cmd_decision(Path::new(d)),
+        ["grade", r] => layout::cmd_grade(Path::new(r), &flags),
+        ["grade", "register", n, k, s] => layout::cmd_register(n, k, s, &flags),
+        ["verify-request", c, h] => layout::cmd_request(Path::new(c), Path::new(h), &flags),
+        ["verify-compat", q, o] => layout::cmd_verify(Path::new(q), Path::new(o), &flags),
+        ["verify-consume", q, o] => layout::cmd_consume(Path::new(q), Path::new(o)),
         ["registry"] => cmd_registry(),
         ["vectors", "gen"] => cmd_gen(&default_dir()),
         ["vectors", "gen", d] => cmd_gen(Path::new(d)),
@@ -282,6 +312,7 @@ mod ckpt;
 mod conform;
 mod fixtures;
 mod ingest;
+mod layout;
 mod rd;
 mod roots;
 mod snap;
@@ -359,7 +390,18 @@ fn cmd_contains(root: &Path, hex: &str) -> ExitCode {
 
 fn cmd_verify_object(root: &Path, hex: &str, f: &Flags) -> ExitCode {
     let s = ok!(Store::open(root));
-    let v = ok!(s.verify(hex, flag_on(f, "paranoid")));
+    // Deleted 2026-08-25 (owner ruling). A flag that silently does nothing is worse than
+    // one that is gone, so passing it says where the door moved to.
+    if flag_on(f, "paranoid") {
+        eprintln!(
+            "REFUSED UNKNOWN_FIELD: --paranoid is DELETED (owner ruling 2026-08-25). A read \
+             rehashes exactly when its verification record is missing or stale, which is \
+             correctness and is not optional; the deliberate full-rehash door is \
+             `tfs scrub <root> --rate 1.0`."
+        );
+        return ExitCode::FAILURE;
+    }
+    let v = ok!(s.verify(hex));
     match &v {
         Verdict::Verified { rehashed } => {
             println!("VERIFIED sha256:{hex} (rehashed: {rehashed})");
@@ -472,7 +514,7 @@ fn cmd_fill(root: &Path, plan: &Path, f: &Flags) -> ExitCode {
             // admission means a corrupt squatter would silently survive a re-put — so the
             // rehash happens HERE: good bytes resume, bad bytes are quarantined out of the
             // way and the object is admitted afresh.
-            Err(why) if s.contains(hex) => match ok!(s.verify(hex, false)) {
+            Err(why) if s.contains(hex) => match ok!(s.verify(hex)) {
                 Verdict::Quarantined { to, .. } => {
                     println!(
                         "requeue sha256:{hex} ({why}; quarantined to {})",
@@ -796,16 +838,95 @@ fn subject(profile: &IngestProfile, header: &Header, tenant: &str) -> IngestSubj
     }
 }
 
+/// The corpus twin of what `ingest::stamp::stamp` mints. The vector exists so the LEDGER's
+/// canonical bytes are frozen alongside the receipt that names them.
+fn stamp_doc(
+    prof: &IngestProfile,
+    sub: &IngestSubject,
+    snap: &SnapshotManifest,
+    header: &Header,
+) -> Stamp {
+    Stamp {
+        subject: sub.object_ref(),
+        profile: prof.object_ref(),
+        header: header.object_ref(),
+        snapshot: snap.object_ref(),
+        topology_digest: header.topology_digest(),
+        converter_build: prof.converter_build.clone(),
+        converter_recipe: prof.converter_recipe.clone(),
+        candidate_set: tensorfs_core::ingest::stamp::candidate_set_digest(
+            &sub.candidates.iter().map(|c| c.id()).collect::<Vec<_>>(),
+        ),
+        golden: tensorfs_core::ingest::stamp::GOLDEN_PASS.to_string(),
+        isolation_tier: 1,
+        sources: sub.sources.clone(),
+        accounting: vec![
+            ("bytes_written".to_string(), 1 << 20),
+            ("tensors".to_string(), 2),
+        ],
+    }
+}
+
+/// The layout plane's three frozen documents, all derived from the corpus header so the
+/// vector and the live path cannot describe different things. The code topology is the
+/// header's OWN topology (a contract that asks for exactly what is there is the Satisfied
+/// case), and the registration is run, not asserted.
+fn layout_plane_docs(
+    h: &Header,
+    closure: &Closure,
+) -> (CodeTopology, CompatibilityReport, ConversionRegistration) {
+    let code = CodeTopology {
+        contract: tensorfs_core::ids::object_id(b"ModelConstructionContract:corpus"),
+        components: h
+            .components
+            .iter()
+            .map(|(c, ts)| {
+                (
+                    c.clone(),
+                    ts.iter()
+                        .map(|(k, t)| {
+                            (
+                                k.clone(),
+                                Requirement {
+                                    dtype: t.dtype,
+                                    shape: t.shape.clone(),
+                                    accepts: Accepts::Any,
+                                },
+                            )
+                        })
+                        .collect(),
+                )
+            })
+            .collect(),
+    };
+    let pin: Vec<String> = h.encodings.iter().map(|e| e.id()).collect();
+    let out = compat::check_compatibility(&code, h, closure, &pin, Lane::Canonical, &[])
+        .expect("the corpus header is a legal checkpoint by construction");
+    let report = CompatibilityReport::of(&code, h, Lane::Canonical, &out);
+    let reg = ConversionRegistration::register(
+        "bf16-to-f32",
+        Mapping::Widen {
+            from: Dtype::Bf16,
+            to: Dtype::F32,
+        },
+        &grade::complete_domain_16(),
+    )
+    .expect("bf16 -> f32 -> bf16 is the identity on every bit pattern");
+    (code, report, reg)
+}
+
 fn receipt(
     sub: &IngestSubject,
     snap: &SnapshotManifest,
     header: &Header,
+    stamp: &Stamp,
     signer: &str,
 ) -> IngestVerificationReceipt {
     IngestVerificationReceipt {
         subject: sub.object_ref(),
         snapshot: snap.object_ref(),
         header: header.object_ref(),
+        stamp: stamp.object_ref(),
         evidence: Evidence::ApprovedProducer {
             implementation: tensorfs_core::ids::object_id(b"converter-impl"),
             recipe: ObjectRef::of(b"recipe"),
@@ -915,8 +1036,8 @@ fn build_corpus() -> (Vec<Case>, Vec<EncodingSpec>) {
     let mut specs: Vec<EncodingSpec> = registry::seeds().into_iter().map(|s| s.spec).collect();
     for s in closure
         .specs
-        .into_iter()
-        .map(|(_, s)| s)
+        .iter()
+        .map(|(_, s)| s.clone())
         .chain([probe_spec()])
     {
         if !specs.iter().any(|x| x.object_id() == s.object_id()) {
@@ -998,7 +1119,8 @@ fn build_corpus() -> (Vec<Case>, Vec<EncodingSpec>) {
         "safetensors.diffusers",
     );
     let sub_doc = subject(&prof, &ha, "acme");
-    let rcpt = receipt(&sub_doc, &snap, &ha, "platform-key-1");
+    let stmp = stamp_doc(&prof, &sub_doc, &snap, &ha);
+    let rcpt = receipt(&sub_doc, &snap, &ha, &stmp, "platform-key-1");
     cases.push(ok_case(
         "ingest",
         "profile-normal",
@@ -1015,10 +1137,73 @@ fn build_corpus() -> (Vec<Case>, Vec<EncodingSpec>) {
     ));
     cases.push(ok_case(
         "ingest",
+        "stamp",
+        "stamp",
+        stmp.canonical_bytes(),
+        "the verified ledger: topology, candidate set, converter, golden, accounting",
+    ));
+    cases.push(ok_case(
+        "ingest",
         "receipt",
         "receipt",
         rcpt.canonical_bytes(),
-        "one evidence arm; signer in the envelope",
+        "one evidence arm; signer in the envelope; binds its stamp",
+    ));
+
+    // --- the layout plane (tfs-009): code topology, report, registration
+    let (code, report, reg) = layout_plane_docs(&ha, &closure);
+    cases.push(ok_case(
+        "layout",
+        "code-topology",
+        "code_topology",
+        code.canonical_bytes(),
+        "the bounded projection of a ModelConstructionContract",
+    ));
+    cases.push(ok_case(
+        "layout",
+        "report-satisfied",
+        "compat_report",
+        report.canonical_bytes(),
+        "Satisfied, with the component-granular encoding facts grading needs",
+    ));
+    cases.push(ok_case(
+        "layout",
+        "registration-widen",
+        "conversion_registration",
+        reg.canonical_bytes(),
+        "bf16->f32, round trip run over the COMPLETE 16-bit domain",
+    ));
+    cases.push(red_case(
+        "layout-red",
+        "third-verdict",
+        "compat_report",
+        sub(
+            &report.canonical_bytes(),
+            "\"t\":\"satisfied\"",
+            "\"t\":\"derivable\"",
+        ),
+        "UNKNOWN_FIELD",
+        "a third satisfaction verdict below the hub",
+    ));
+    cases.push(red_case(
+        "layout-red",
+        "empty-accepts",
+        "code_topology",
+        sub(
+            &code.canonical_bytes(),
+            "\"accepts\":\"any\"",
+            "\"accepts\":[]",
+        ),
+        "MISSING_FIELD",
+        "an empty accepts list admits nothing and says nothing",
+    ));
+    cases.push(red_case(
+        "layout-red",
+        "unrun-registration",
+        "conversion_registration",
+        sub(&reg.canonical_bytes(), "\"cases\":1", "\"cases\":0"),
+        "MISSING_FIELD",
+        "a registration that ran no round trip proved nothing",
     ));
 
     // --- canonical-byte semantic twins (all red)
@@ -2475,14 +2660,15 @@ fn cmd_verify(dir: &Path) -> ExitCode {
         "safetensors.diffusers",
     );
     let csub = subject(&cprof, &cha, "acme");
-    let crcpt = receipt(&csub, &csnap, &cha, "platform-key-1");
+    let cstamp = stamp_doc(&cprof, &csub, &csnap, &cha);
+    let crcpt = receipt(&csub, &csnap, &cha, &cstamp, "platform-key-1");
     cross.push((
-        "receipt binds its exact subject/snapshot/header".into(),
-        crcpt.binds(&csub, &csnap, &cha).is_ok(),
+        "receipt binds its exact subject/snapshot/header/stamp".into(),
+        crcpt.binds(&csub, &csnap, &cha, &cstamp).is_ok(),
         String::new(),
     ));
     let other = subject(&cprof, &cha, "other-tenant");
-    let replay = crcpt.binds(&other, &csnap, &cha);
+    let replay = crcpt.binds(&other, &csnap, &cha, &cstamp);
     cross.push((
         "cross-subject replay refuses".into(),
         replay.as_ref().err().map(|e| e.code)
@@ -2664,7 +2850,8 @@ fn cmd_flip() -> ExitCode {
         "safetensors.diffusers",
     );
     let sub0 = subject(&prof, &ha, "acme");
-    let r0 = receipt(&sub0, &snap, &ha, "platform-key-1");
+    let st0 = stamp_doc(&prof, &sub0, &snap, &ha);
+    let r0 = receipt(&sub0, &snap, &ha, &st0, "platform-key-1");
 
     let base = (
         ha.object_id(),
@@ -2755,7 +2942,7 @@ fn cmd_flip() -> ExitCode {
         [false, false, false, true, false],
     ));
 
-    let r1 = receipt(&sub0, &snap, &ha, "platform-key-2-rotated");
+    let r1 = receipt(&sub0, &snap, &ha, &st0, "platform-key-2-rotated");
     rows.push((
         "signer rotation",
         (

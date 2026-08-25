@@ -128,6 +128,18 @@ codes![
     PLATFORM_UNSUPPORTED,
     PROJECTION_WEIGHT_PATH,
     BLOB_NOT_RETAINED,
+    // the layout plane: check_compatibility (tfs-009)
+    MISSING_COMPONENT,
+    EXTRA_COMPONENT,
+    EXTRA_TENSOR,
+    UNCLASSIFIED_EXTRAS,
+    // the layout plane: Stamp and the hermetic verifier (tfs-009)
+    STAMP_MISMATCH,
+    EVIDENCE_NOT_RESIDENT,
+    VERIFIER_OUTPUT_INCOMPLETE,
+    // the layout plane: hub grading (tfs-009)
+    ROUND_TRIP_LOSSY,
+    UNREGISTERED_CONVERSION,
     // roots, holds and GC (tfs-006)
     LOCK_CONTENDED,
     ROOT_GENERATION,

@@ -15,6 +15,7 @@
 pub mod carrier;
 pub mod convert;
 pub mod fingerprint;
+pub mod stamp;
 pub mod transaction;
 
 use crate::canon::{as_arr, as_str, Fields, Value};
@@ -259,6 +260,10 @@ pub struct IngestVerificationReceipt {
     pub subject: ObjectRef,
     pub snapshot: ObjectRef,
     pub header: ObjectRef,
+    /// The ledger of what Stamp actually verified (tfs-009). The receipt attests; the
+    /// stamp records the facts a consumer would otherwise have to re-derive — which is how
+    /// a second decision layer gets built by accident.
+    pub stamp: ObjectRef,
     pub evidence: Evidence,
     pub signer: String,
     pub signature: String,
@@ -266,17 +271,19 @@ pub struct IngestVerificationReceipt {
 }
 
 impl IngestVerificationReceipt {
-    /// A receipt is evidence about ONE exact subject/snapshot/header triple.
+    /// A receipt is evidence about ONE exact subject/snapshot/header/stamp tuple.
     pub fn binds(
         &self,
         subject: &IngestSubject,
         snapshot: &crate::manifest::SnapshotManifest,
         header: &crate::header::Header,
+        stamp: &stamp::Stamp,
     ) -> Result<()> {
         for (what, got, want) in [
             ("subject", self.subject.clone(), subject.object_ref()),
             ("snapshot", self.snapshot.clone(), snapshot.object_ref()),
             ("header", self.header.clone(), header.object_ref()),
+            ("stamp", self.stamp.clone(), stamp.object_ref()),
         ] {
             if got != want {
                 return refuse(
@@ -348,12 +355,14 @@ impl Doc for IngestVerificationReceipt {
         let signature = f.req_str("signature")?.to_string();
         let signer = f.req_str("signer")?.to_string();
         let snapshot = ObjectRef::from_value("receipt.snapshot", f.req("snapshot")?)?;
+        let stamp = ObjectRef::from_value("receipt.stamp", f.req("stamp")?)?;
         let subject = ObjectRef::from_value("receipt.subject", f.req("subject")?)?;
         f.done()?;
         Ok(IngestVerificationReceipt {
             subject,
             snapshot,
             header,
+            stamp,
             evidence,
             signer,
             signature,
@@ -396,6 +405,7 @@ impl Doc for IngestVerificationReceipt {
             ("signature", Value::str(self.signature.clone())),
             ("signer", Value::str(self.signer.clone())),
             ("snapshot", self.snapshot.to_value()),
+            ("stamp", self.stamp.to_value()),
             ("subject", self.subject.to_value()),
         ])
     }

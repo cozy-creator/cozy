@@ -182,12 +182,9 @@ impl PyStore {
         Ok(d)
     }
 
-    #[pyo3(signature = (hex, paranoid=false))]
-    fn verify<'p>(&self, py: Python<'p>, hex: &str, paranoid: bool) -> PyResult<Bound<'p, PyDict>> {
+    fn verify<'p>(&self, py: Python<'p>, hex: &str) -> PyResult<Bound<'p, PyDict>> {
         let hex = hex.trim_start_matches("sha256:").to_string();
-        let v = py
-            .allow_threads(|| self.store.verify(&hex, paranoid))
-            .or_refuse(py)?;
+        let v = py.allow_threads(|| self.store.verify(&hex)).or_refuse(py)?;
         let d = PyDict::new(py);
         match v {
             Verdict::Verified { rehashed } => {

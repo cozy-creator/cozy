@@ -417,10 +417,27 @@ pub fn evidence_stamps(h: &SourceHeader) -> Result<Vec<(String, String)>> {
     Ok(out)
 }
 
-/// The `.comfy_quant` marker's payload is 64 bytes of JSON hidden inside a U8 tensor. It is
-/// decoded through the SAME bounded reader as everything else, into an explicit encoding
-/// role name, or refused. It never survives into the canonical header.
-pub fn decode_comfy_quant(key: &str, bytes: &[u8]) -> Result<String> {
+/// What a `.comfy_quant` marker actually says, decoded through the SAME bounded reader as
+/// everything else. It never survives into the canonical header.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ComfyQuant {
+    /// The carrier format the producer named, e.g. `float8_e4m3fn`.
+    pub format: String,
+    /// Set on the modules whose matmul stays in full precision. MEASURED as the fact that
+    /// separates the two role sets: on the real fl2va DiT the 50 modules carrying it are
+    /// exactly the `mlp.fc2` ones, and exactly the 50 with no `.input_scale`.
+    pub full_precision_matrix_mult: bool,
+}
+
+/// Decode one marker payload.
+///
+/// VOCABULARY CORRECTED 2026-08-25 (decisions #267, tfs-018's pod arm). This decoder
+/// required a `quant_algo` field and documented a 64-byte payload. The real payloads on
+/// `Comfy-Org/MiniMax-H3@4cc1d817` are `{"format": "float8_e4m3fn"}` (150 markers, 27 B)
+/// and `{"format": "float8_e4m3fn", "full_precision_matrix_mult": true}` (50, 63 B) — no
+/// `quant_algo` anywhere. The old field was modelled from a description rather than from
+/// bytes, and the artifact it was written for is the one it could not read.
+pub fn decode_comfy_quant(key: &str, bytes: &[u8]) -> Result<ComfyQuant> {
     if bytes.len() > limits::MAX_DOC_TEXT_BYTES {
         return refuse(
             Code::SIZE_CAP,
@@ -428,21 +445,38 @@ pub fn decode_comfy_quant(key: &str, bytes: &[u8]) -> Result<String> {
         );
     }
     // The payload is a NUL-padded JSON blob inside a U8 tensor. Take the text, then the one
-    // bounded reader; every field but the algorithm name is discarded by construction.
+    // bounded reader; every field but the two below is discarded by construction.
     let end = bytes.iter().position(|b| *b == 0).unwrap_or(bytes.len());
     let v = crate::canon::parse(&bytes[..end], limits::MAX_DOC_TEXT_BYTES)?;
-    let algo = match as_obj("comfy_quant", key, &v)?
-        .iter()
-        .find(|(k, _)| k == "quant_algo")
-    {
-        Some((_, x)) => as_str("comfy_quant", "quant_algo", x)?.to_string(),
+    let fields = as_obj("comfy_quant", key, &v)?;
+    let format = match fields.iter().find(|(k, _)| k == "format") {
+        Some((_, x)) => as_str("comfy_quant", "format", x)?.to_string(),
         None => {
             return refuse(
                 Code::MISSING_FIELD,
-                format!("{key}: marker carries no quant_algo — nothing decodable into a role"),
+                format!("{key}: marker carries no `format` — nothing decodable into a role"),
             )
         }
     };
-    ascii_name("comfy_quant.quant_algo", &algo, limits::MAX_NAME_BYTES)?;
-    Ok(algo)
+    let full_precision_matrix_mult = match fields
+        .iter()
+        .find(|(k, _)| k == "full_precision_matrix_mult")
+    {
+        Some((_, crate::canon::Value::Bool(b))) => *b,
+        Some((_, o)) => {
+            return refuse(
+                Code::WRONG_TYPE,
+                format!(
+                    "{key}: full_precision_matrix_mult is a bool, got {}",
+                    o.kind()
+                ),
+            )
+        }
+        None => false,
+    };
+    ascii_name("comfy_quant.format", &format, limits::MAX_NAME_BYTES)?;
+    Ok(ComfyQuant {
+        format,
+        full_precision_matrix_mult,
+    })
 }

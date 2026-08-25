@@ -163,12 +163,21 @@ pub fn seeds() -> Vec<Seed> {
                 "value[i,j] = data[i,j] * scale[i]. Per-output-row fp8 e4m3 weights with one f32 scale per row; scale[i] = amax(|W[i,:]|)/448 floored at 1e-12, and the quantizer clamps to +/-448 BEFORE the e4m3 cast because that cast does not saturate. This is what v1 shipped as `fp8-w8a8` (convert/writer.py:546) -- the ecosystem's `w8a8` is fp8, not int8.",
                 Some(mined("fp8-rowwise")),
         ),
-        // The SAME alias, a DIFFERENT physical variant -- and this one is what the real
-        // shipped H3 DiT actually contains. Its scale is rank-2 `[out, 1]`, not rank-1
-        // `[out]` (evidence: examples/safetensors-headers/minimax_h3_fl2va_fp8_scaled --
-        // all 362 `.weight_scale` siblings are F32 [out, 1]). Roles are EXACT, so this is
-        // its own spec digest rather than an `optional`/loose shape on the one above; the
-        // alias groups the two for display, exactly as it does nvfp4's four.
+        // The SAME alias, a DIFFERENT physical variant: rank-2 `[out, 1]` rather than
+        // rank-1 `[out]`. Roles are EXACT, so this is its own spec digest rather than an
+        // `optional`/loose shape on the one above; the alias groups the two for display,
+        // exactly as it does nvfp4's four.
+        //
+        // PROVENANCE CORRECTED 2026-08-25 (tfs-009, decisions #243/#244). This doc used to
+        // cite `examples/safetensors-headers/minimax_h3_fl2va_fp8_scaled` and its "362
+        // `.weight_scale` siblings at F32 [out, 1]" as the shipped H3 DiT's geometry. That
+        // header was measured WRONG and retired: no publisher ever shipped it. The rank-2
+        // `[out, 1]` geometry is real and stays -- its vectors are producer-mined from v1's
+        // own quantizer (decisions #187, the Cozy-produced hub tree) -- but it is NOT what
+        // ComfyUI's fp8_scaled ships. The real per-producer facts, measured off pinned
+        // bytes in h3-evidence: Comfy `fp8_scaled` = rank-0 SCALAR weight_scale + rank-0
+        // input_scale (the entry below); Comfy `int8_convrot` = rank-2 [out, 1]; Comfy
+        // `nvfp4_awq` = rank-2 F8_E4M3 block scales. Scale rank is a per-producer fact.
         seed(
             "fp8-rowwise/1",
                 float.clone(),
@@ -183,8 +192,51 @@ pub fn seeds() -> Vec<Seed> {
                         ),
                     ),
                 ],
-                "value[i,j] = data[i,j] * scale[i,0]. Per-output-row fp8 e4m3 with a KEPT trailing unit axis on the scale -- the ComfyUI comfy_quant `scaled_fp8` shape the shipped H3 FL2VA DiT uses. Physically distinct from the rank-1 variant: a reader that assumes [out] mis-strides this and a reader that assumes [out,1] mis-strides that, which is precisely why they are two digests.",
+                "value[i,j] = data[i,j] * scale[i,0]. Per-output-row fp8 e4m3 with a KEPT trailing unit axis on the scale -- v1's own quantizer output (decisions #187). Physically distinct from the rank-1 variant: a reader that assumes [out] mis-strides this and a reader that assumes [out,1] mis-strides that, which is precisely why they are two digests.",
                 Some(mined("fp8-rowwise-keepdim")),
+        ),
+        // A THIRD physical variant of the same alias, and the one the largest H3
+        // distribution by download count actually ships. MEASURED, not inferred, from
+        // `Comfy-Org/MiniMax-H3@4cc1d817` `minimax_h3_fl2va_pruned_fp8_scaled.safetensors`
+        // (header bytes sha256 f2331000434d1e54..., pinned in h3-evidence): 200 F8_E4M3
+        // weights, 200 rank-0 SCALAR F32 `.weight_scale`, 150 rank-0 scalar F32
+        // `.input_scale`. A reader keyed on "fp8 implies rank-2" mis-strides every one of
+        // them -- which is the whole reason scale rank is a spec fact and never a dtype
+        // inference (decisions #244, narrowing #187 rather than contradicting it).
+        //
+        // VECTORLESS on purpose: qualifying an implementation needs raw bits from the
+        // PRODUCER, and producing them means running ComfyUI's quantizer over weights that
+        // do not transit this machine. It stores and inspects and refuses execution, which
+        // is the honest state, not a gap to paper over.
+        seed(
+            "fp8-scaled-scalar/1",
+                float.clone(),
+                Some(2),
+                vec![
+                    ("data", role(set(&[Dtype::F8E4M3FN]), Relation::Same)),
+                    ("input_scale", role(set(&[Dtype::F32]), dims(vec![]))),
+                    ("weight_scale", role(set(&[Dtype::F32]), dims(vec![]))),
+                ],
+                "value[i,j] = data[i,j] * weight_scale, with a separate rank-0 activation `input_scale`. Both scales are SCALARS -- rank 0, one number for the whole tensor -- which is what ComfyUI's `scaled_fp8` comfy_quant marker convention emits for the H3 DiT. Not a degenerate spelling of the rank-2 variant: the byte layouts differ and so do the digests.",
+                None,
+        ),
+        // A FOURTH variant, and the one that vindicates "no `optional: true`" on real bytes.
+        // The SAME file carries both: measured on the pinned pruned fp8_scaled DiT, 200
+        // tensors have `.weight_scale` and only 150 have `.input_scale` -- `out_proj`,
+        // `qkv_proj` and `mlp.fc1` carry both, `mlp.fc2` carries the weight scale alone
+        // (150 both / 50 weight-only / 0 input-only, no overlap ambiguity). One artifact,
+        // one alias, TWO physical role sets. An `optional` flag would have collapsed them
+        // into one digest that describes neither tensor exactly; two digests describe both.
+        seed(
+            "fp8-scaled-scalar/1",
+                float.clone(),
+                Some(2),
+                vec![
+                    ("data", role(set(&[Dtype::F8E4M3FN]), Relation::Same)),
+                    ("weight_scale", role(set(&[Dtype::F32]), dims(vec![]))),
+                ],
+                "value[i,j] = data[i,j] * weight_scale, weight scale only -- no activation scale role at all. ComfyUI's scaled_fp8 emits this for the H3 DiT's `mlp.fc2` while emitting the input_scale variant for `out_proj`/`qkv_proj`/`mlp.fc1` in the same file.",
+                None,
         ),
         // DELETED (tfs-008 deletion pass): the int8 `w8a8-perchannel/1` seed. It had no
         // producer, no consumer, and a NAME that actively misleads -- everything in this

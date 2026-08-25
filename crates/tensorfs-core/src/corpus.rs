@@ -43,8 +43,12 @@ pub const DOC_KINDS: &[&str] = &[
     "registry",
     "root",
     "receipt",
+    "stamp",
     "meta",
     "operation_receipt",
+    "code_topology",
+    "compat_report",
+    "conversion_registration",
 ];
 
 pub fn run_doc(
@@ -90,8 +94,20 @@ pub fn run_doc(
         "registry" => FingerprintRegistry::parse(bytes).map(|_| (None, None))?,
         "root" => IngestRoot::parse(bytes).map(|_| (None, None))?,
         "receipt" => IngestVerificationReceipt::parse(bytes).map(|_| (None, None))?,
+        "stamp" => crate::ingest::stamp::Stamp::parse(bytes).map(|_| (None, None))?,
         "meta" => State::parse(bytes).map(|_| (None, None))?,
         "operation_receipt" => Receipt::parse(bytes).map(|_| (None, None))?,
+        // The layout plane's documents (tfs-009). A code topology projects to the SAME
+        // frozen projection a header does, so its digest is reported here too.
+        "code_topology" => {
+            crate::compat::CodeTopology::parse(bytes).map(|c| (Some(c.topology_digest()), None))?
+        }
+        "compat_report" => {
+            crate::compat::CompatibilityReport::parse(bytes).map(|_| (None, None))?
+        }
+        "conversion_registration" => {
+            crate::grade::ConversionRegistration::parse(bytes).map(|_| (None, None))?
+        }
         other => {
             return refuse(
                 Code::UNKNOWN_FORMAT,
@@ -106,17 +122,19 @@ pub fn run_doc(
     })
 }
 
-/// The receipt's binding check over four documents that arrive as bytes — the cross-vector
+/// The receipt's binding check over five documents that arrive as bytes — the cross-vector
 /// assertion, reachable from either harness.
 pub fn receipt_binds(
     receipt: &[u8],
     subject: &[u8],
     manifest: &[u8],
     header: &[u8],
+    stamp: &[u8],
 ) -> std::result::Result<(), Refusal> {
     let r = IngestVerificationReceipt::parse(receipt)?;
     let s = IngestSubject::parse(subject)?;
     let m = SnapshotManifest::parse(manifest)?;
     let h = Header::parse(header)?;
-    r.binds(&s, &m, &h)
+    let t = crate::ingest::stamp::Stamp::parse(stamp)?;
+    r.binds(&s, &m, &h, &t)
 }

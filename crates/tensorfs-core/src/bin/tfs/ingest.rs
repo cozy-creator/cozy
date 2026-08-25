@@ -29,6 +29,7 @@ use tensorfs_core::ids::{ConfigRef, Doc, ObjectRef};
 use tensorfs_core::ingest::carrier::{self, SourceHeader};
 use tensorfs_core::ingest::convert::{self, Class, Converter, Effect, Plan, Rekey, Source, Target};
 use tensorfs_core::ingest::fingerprint::{self, Banked, Fingerprint, FingerprintRegistry};
+use tensorfs_core::ingest::stamp::{self, Stamp};
 use tensorfs_core::ingest::transaction::{self as tx, SourceFile};
 use tensorfs_core::ingest::{Evidence, IngestProfile, IngestSubject, IngestVerificationReceipt};
 use tensorfs_core::limits;
@@ -781,52 +782,83 @@ pub fn cmd_worker(root: &Path, target: &str, f: &Flags) -> ExitCode {
             .map(|(sf, raw)| (source_digest(&sf.header, raw), 1u64))
             .collect(),
         proposed_header: out.header_ref.clone(),
-        candidates: vec![out.header_ref.clone(), out.snapshot_ref.clone()],
+        // The candidate set is EVERY AND ONLY what the snapshot reaches. Stamp re-walks it
+        // and refuses on any difference, so a hand-written short list would simply fail.
+        candidates: ok!(ck::walk(&store, &out.snapshot))
+            .distinct()
+            .into_iter()
+            .cloned()
+            .collect(),
     };
     let subject_ref = ok!(ck::put_doc(&store, &subject));
 
-    let mut obs = out.obs.clone();
-    obs.push(("source_bytes".to_string(), profile.max_source_bytes as i64));
-    obs.push(("golden_cases".to_string(), golden as i64));
-    obs.push((
-        "isolation_tier".to_string(),
-        std::env::var("TFS_ISOLATION_TIER")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(1),
-    ));
-    obs.push(("peak_rss_kb".to_string(), rss_kb("VmHWM") as i64));
-    obs.push(("elapsed_ms".to_string(), t0.elapsed().as_millis() as i64));
-    obs.push((
+    let isolation_tier: u64 = std::env::var("TFS_ISOLATION_TIER")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(1);
+    let mut out = out;
+    out.obs
+        .push(("source_bytes".to_string(), profile.max_source_bytes as i64));
+    out.obs.push(("golden_cases".to_string(), golden as i64));
+    out.obs
+        .push(("isolation_tier".to_string(), isolation_tier as i64));
+    out.obs
+        .push(("peak_rss_kb".to_string(), rss_kb("VmHWM") as i64));
+    out.obs
+        .push(("elapsed_ms".to_string(), t0.elapsed().as_millis() as i64));
+    out.obs.push((
         "converter_validated_on_real_bytes".to_string(),
         i64::from(p.conv.validated_on_real_bytes),
     ));
-    obs.sort();
+    out.obs.sort();
 
-    let receipt = IngestVerificationReceipt {
-        subject: subject_ref.clone(),
-        snapshot: out.snapshot_ref.clone(),
-        header: out.header_ref.clone(),
-        evidence: Evidence::ApprovedProducer {
-            implementation: build,
-            recipe,
-        },
-        signer: format!("tfs-ingest-worker/{}", env!("CARGO_PKG_VERSION")),
-        signature: "unsigned:dev".to_string(),
-        observations: obs,
+    // THE STAMP. Nothing here builds a receipt by hand any more: the receipt is what
+    // `stamp` returns after re-deriving every fact from bytes the store holds, so a run
+    // that reported success but wrote something else mints nothing.
+    // `golden_suite` REFUSES on any reassembly mismatch, so reaching here means it ran
+    // clean. The case COUNT rides the accounting; the verdict is what it is. `absent` has a
+    // real producer: a VALUE-MOVING converter with no banked fixtures never ran a suite at
+    // all, and a suite that did not run is not a suite that passed. An identity converter
+    // moves no value and has nothing to reassemble, so zero cases is its complete suite.
+    let golden_verdict = if golden > 0 || p.conv.class == Class::Identity {
+        stamp::GOLDEN_PASS
+    } else {
+        stamp::GOLDEN_ABSENT
     };
+    let stamped = ok!(stamp::stamp(
+        &store,
+        stamp::Presented {
+            subject: &subject,
+            profile: &profile,
+            profile_ref: &subject.profile.clone(),
+            outcome: &out,
+            golden: golden_verdict,
+            isolation_tier,
+            evidence: Evidence::ApprovedProducer {
+                implementation: build,
+                recipe,
+            },
+            signer: &format!("tfs-ingest-worker/{}", env!("CARGO_PKG_VERSION")),
+            signature: "unsigned:dev",
+            pin: &registry::platform_digests(),
+        }
+    ));
+    let stamp_ref = ok!(ck::put_doc(&store, &stamped.stamp));
+    let receipt = stamped.receipt;
     let receipt_ref = ok!(ck::put_doc(&store, &receipt));
 
     ingest_root.candidates = vec![
         out.header_ref.clone(),
         out.snapshot_ref.clone(),
         subject_ref,
+        stamp_ref.clone(),
         receipt_ref.clone(),
     ];
     ok!(tx::write_root(store.root(), &ingest_root));
     let dir = tx::quarantine_dir(store.root(), &session);
     for (name, bytes) in [
         ("receipt.json", receipt.canonical_bytes()),
+        ("stamp.json", stamped.stamp.canonical_bytes()),
         ("subject.json", subject.canonical_bytes()),
         ("profile.json", profile.canonical_bytes()),
     ] {
@@ -841,6 +873,10 @@ pub fn cmd_worker(root: &Path, target: &str, f: &Flags) -> ExitCode {
     }
     println!("candidate    header {}", out.header_ref.id());
     println!("candidate    snapshot {}", out.snapshot_ref.id());
+    println!("stamp        {}", stamp_ref.id());
+    println!("  topology   {}", stamped.stamp.topology_digest);
+    println!("  candidates {}", stamped.stamp.candidate_set);
+    println!("  golden     {}", stamped.stamp.golden);
     println!("receipt      {}", receipt_ref.id());
     println!(
         "quarantine   {} expires at {} — NOT a checkpoint until `tfs ingest install`",
@@ -1014,8 +1050,12 @@ pub fn cmd_install(root: &Path, session: &str) -> ExitCode {
     let store = ok!(Store::open(root));
     let dir = tx::quarantine_dir(store.root(), session);
     let read = |n: &str| fs::read(dir.join(n));
-    let (rb, sb) = match (read("receipt.json"), read("subject.json")) {
-        (Ok(a), Ok(b)) => (a, b),
+    let (rb, sb, tb) = match (
+        read("receipt.json"),
+        read("subject.json"),
+        read("stamp.json"),
+    ) {
+        (Ok(a), Ok(b), Ok(c)) => (a, b, c),
         _ => {
             eprintln!(
                 "REFUSED ROOT_ABSENT: no candidate {session:?} — reaped, never created, or \
@@ -1026,10 +1066,11 @@ pub fn cmd_install(root: &Path, session: &str) -> ExitCode {
     };
     let receipt = ok!(IngestVerificationReceipt::parse(&rb));
     let subject = ok!(IngestSubject::parse(&sb));
+    let stamp_doc = ok!(Stamp::parse(&tb));
     let snap = ok!(ck::load_manifest(&store, &receipt.snapshot));
     let header = ok!(ck::load_header(&store, &receipt.header));
     let id = ok!(tx::install(
-        &store, session, &receipt, &subject, &snap, &header
+        &store, session, &receipt, &subject, &snap, &header, &stamp_doc
     ));
     println!("installed    {id}");
     println!("             from receipt {}", receipt.object_ref().id());
@@ -1164,5 +1205,138 @@ pub fn cmd_converters() -> ExitCode {
         }
     }
     let _ = (Dtype::U8, Class::Identity);
+    ExitCode::SUCCESS
+}
+
+// ------------------------------------------------------------------ restamp
+
+/// Re-run `Stamp` over a quarantine session's documents, against the bytes the store holds.
+///
+/// Two jobs. It is the RE-VERIFICATION surface a coordinator has (th-002 verifies a receipt
+/// against exactly these facts and must never build a second checker), and it is where the
+/// harness plants defects: `--plant <what>` corrupts ONE presented fact and the run shows
+/// which refusal that fact is protected by. The plants live in this binary, beside tfs-002's
+/// `--fault` kill points and never in the library — a library that can be told to lie is a
+/// library nobody can trust in production.
+pub fn cmd_restamp(root: &Path, session: &str, flags: &Flags) -> ExitCode {
+    let store = ok!(Store::open(root));
+    let dir = tx::quarantine_dir(store.root(), session);
+    let read = |n: &str| match fs::read(dir.join(n)) {
+        Ok(b) => Ok(b),
+        Err(_) => {
+            eprintln!("REFUSED ROOT_ABSENT: no candidate {session:?} document {n:?}");
+            Err(ExitCode::FAILURE)
+        }
+    };
+    let (pb, sb, rb) = match (
+        read("profile.json"),
+        read("subject.json"),
+        read("receipt.json"),
+    ) {
+        (Ok(a), Ok(b), Ok(c)) => (a, b, c),
+        _ => return ExitCode::FAILURE,
+    };
+    let mut profile = ok!(IngestProfile::parse(&pb));
+    let mut subject = ok!(IngestSubject::parse(&sb));
+    let receipt = ok!(IngestVerificationReceipt::parse(&rb));
+
+    // The outcome, reconstructed from the store rather than remembered: the header and
+    // snapshot are objects, and the accounting rode the receipt.
+    let header = ok!(ck::load_header(&store, &subject.proposed_header));
+    let closure = ok!(ck::load_closure(&store, &header));
+    let snapshot = ok!(ck::load_manifest(&store, &receipt.snapshot));
+    let mut out = tx::Outcome {
+        header_ref: subject.proposed_header.clone(),
+        snapshot_ref: receipt.snapshot.clone(),
+        header,
+        closure,
+        snapshot,
+        obs: receipt.observations.clone(),
+    };
+    let mut evidence = receipt.evidence.clone();
+    let mut golden = flag(flags, "golden")
+        .unwrap_or(stamp::GOLDEN_PASS)
+        .to_string();
+
+    let plant = flag(flags, "plant").unwrap_or("");
+    match plant {
+        "" => {}
+        "topology" => profile.expected_topology_digest = tensorfs_core::ids::object_id(b"other"),
+        "candidate" => {
+            subject.candidates.pop();
+        }
+        "candidate-surplus" => subject
+            .candidates
+            .push(ObjectRef::of(b"an object nothing reaches")),
+        "encoding" => profile.allowed_encodings.clear(),
+        "quota-tensors" => profile.max_tensors = 1,
+        "quota-bytes" => profile.max_source_bytes = 1,
+        "converter" => {
+            evidence = Evidence::ApprovedProducer {
+                implementation: profile.converter_build.clone(),
+                recipe: ObjectRef::of(b"a recipe this store never admitted"),
+            }
+        }
+        "evidence-metadata" => {
+            // The header-invisible claim: a source's own `__metadata__` saying "quantized by
+            // X" is restated as an evidence arm. It names a digest of the CLAIM, and the
+            // store holds no such object, so it resolves to nothing.
+            evidence = Evidence::IndependentNumerical {
+                verifier_build: tensorfs_core::ids::object_id(b"verifier"),
+                report: ObjectRef::of(br#"{"quantized_by":"trust me","method":"fp8"}"#),
+            }
+        }
+        "golden-absent" => golden = stamp::GOLDEN_ABSENT.to_string(),
+        // The profile is DIGEST-BOUND to its subject, so altering it alone is caught before
+        // any of its contents are read. This plant proves that binding on its own.
+        "profile-bytes" => profile.max_tensors += 1,
+        "structure" => {
+            // One tensor's logical shape moved: the header no longer projects the topology
+            // the profile pinned, and the snapshot no longer describes what is in the store.
+            if let Some((_, ts)) = out.header.components.first_mut() {
+                if let Some((_, t)) = ts.first_mut() {
+                    t.shape.push(1);
+                }
+            }
+        }
+        o => {
+            eprintln!("REFUSED UNKNOWN_FIELD: no plant {o:?}");
+            return ExitCode::FAILURE;
+        }
+    }
+    if !plant.is_empty() {
+        println!("plant        {plant}");
+    }
+    // A plant that alters the PROFILE re-points the subject at it, so the run exercises the
+    // check that fact is protected by rather than stopping at the digest binding. The
+    // `profile-bytes` plant is the one that deliberately does not, and proves the binding.
+    if matches!(
+        plant,
+        "topology" | "encoding" | "quota-tensors" | "quota-bytes"
+    ) {
+        subject.profile = profile.object_ref();
+    }
+    let stamped = ok!(stamp::stamp(
+        &store,
+        stamp::Presented {
+            profile_ref: &subject.profile.clone(),
+            subject: &subject,
+            profile: &profile,
+            outcome: &out,
+            golden: &golden,
+            isolation_tier: 1,
+            evidence,
+            signer: &receipt.signer,
+            signature: &receipt.signature,
+            pin: &registry::platform_digests(),
+        }
+    ));
+    println!("restamped    {}", stamped.stamp.object_id());
+    println!("  topology   {}", stamped.stamp.topology_digest);
+    println!("  candidates {}", stamped.stamp.candidate_set);
+    println!("receipt      {}", stamped.receipt.object_id());
+    if stamped.receipt.object_id() == receipt.object_id() {
+        println!("             IDENTICAL to the receipt the border minted");
+    }
     ExitCode::SUCCESS
 }

@@ -126,6 +126,14 @@ CODEC_OWNERS = {
     "tensorfs.encoding_vectors/1": {"crates/tensorfs-core/src/vectors.rs"},
     "tensorfs.meta/1": {"crates/tensorfs-core/src/meta.rs"},
     "tensorfs.operation_receipt/1": {"crates/tensorfs-core/src/receipt.rs"},
+    # the layout plane (tfs-009)
+    "tensorfs.stamp/1": {"crates/tensorfs-core/src/ingest/stamp.rs"},
+    "cozytensors.code_topology/1": {"crates/tensorfs-core/src/compat.rs"},
+    "tensorfs.compatibility_report/1": {"crates/tensorfs-core/src/compat.rs"},
+    "tensorfs.conversion_registration/1": {"crates/tensorfs-core/src/grade.rs"},
+    "tensorfs.grade_decision/1": {"crates/tensorfs-core/src/grade.rs"},
+    "tensorfs.verify_request/1": {"crates/tensorfs-core/src/verifier.rs"},
+    "tensorfs.verify_response/1": {"crates/tensorfs-core/src/verifier.rs"},
 }
 CODEC_MARKS = list(CODEC_OWNERS)
 GRAMMAR_TAGS = ["ceil_block", "elements_div", "ceil_div"]
@@ -145,13 +153,66 @@ EXCLUDED = ["arrangement", "morphism", "quant_rule", "source_layout", "expressio
 
 
 def code_only(line):
-    """The line with comments and string literals removed — what the code SAYS, not what
-    it carries as data."""
+    """One line with comments and string literals removed — what the code SAYS, not what
+    it carries as data. Line-local, so it cannot see a literal that spans lines; use
+    `code_lines` for anything scanning a whole file."""
     s = line.strip()
     if s.startswith(("//", "//!", "#")):
         return ""
     s = re.sub(r'"(?:[^"\\]|\\.)*"', '""', s)
     return s
+
+
+def code_lines(text):
+    """(lineno, code) over a WHOLE file, with comments and string literals blanked by a
+    single pass that carries state across newlines.
+
+    The line-local version was blind to Rust's `"..." \\` continuations, so a refusal message
+    wrapped over two lines read as code and fired every prose-matching fence below. A fence
+    that cannot tell a sentence from an identifier is a fence people learn to route around.
+    """
+    out, buf = [], []
+    i, n = 0, len(text)
+    state = "code"       # code | line_comment | block_comment | string | raw_string
+    while i < n:
+        c = text[i]
+        nxt = text[i + 1] if i + 1 < n else ""
+        if state == "code":
+            if c == "/" and nxt == "/":
+                state, i = "line_comment", i + 2
+                continue
+            if c == "/" and nxt == "*":
+                state, i = "block_comment", i + 2
+                continue
+            if c == '"':
+                state, i = "string", i + 1
+                buf.append('""')
+                continue
+            buf.append(c)
+        elif state == "line_comment":
+            if c == "\n":
+                state = "code"
+                buf.append(c)
+                i += 1
+                continue
+        elif state == "block_comment":
+            if c == "*" and nxt == "/":
+                state, i = "code", i + 2
+                continue
+            if c == "\n":
+                buf.append(c)
+        elif state == "string":
+            if c == "\\":
+                i += 2
+                continue
+            if c == '"':
+                state = "code"
+            elif c == "\n":
+                buf.append(c)
+        i += 1
+    for no, line in enumerate("".join(buf).splitlines(), 1):
+        out.append((no, line.strip()))
+    return out
 
 
 def fence_one_codec():
@@ -232,9 +293,14 @@ def fence_one_codec():
 #     already decided it once — the v1 two-deciders defect with the expensive half moved to
 #     the latency path. `tfs-003` confines foreign CONTAINERS to the border already; this
 #     confines the border's own decision vocabulary.
+# `compat.rs` joins the list at tfs-009: check_compatibility is what a WORKER runs at bind,
+# before any allocation, and a marker taxonomy or a fingerprinter reachable from there would
+# be exactly the border's decision made a second time on the latency path. The marker
+# vocabulary it needs arrives as DATA from the caller.
 SERVE_PATH = ["crates/tensorfs-core/src/read.rs", "crates/tensorfs-core/src/fill.rs",
               "crates/tensorfs-core/src/project.rs", "crates/tensorfs-core/src/meta.rs",
-              "crates/tensorfs-core/src/gc.rs", "crates/tensorfs-core/src/receipt.rs"]
+              "crates/tensorfs-core/src/gc.rs", "crates/tensorfs-core/src/receipt.rs",
+              "crates/tensorfs-core/src/compat.rs"]
 # Module PATHS and type names, not the English nouns: tier 3 legitimately streams "a
 # retained carrier blob" in its refusal prose, and a fence that cannot tell a noun from an
 # import is a fence people route around.
@@ -294,6 +360,35 @@ def fence_serve_path():
                  f"{len(PINNED_VOCAB)} pinned-buffer words, one Xform in {XFORM_HOME}")
 
 
+# ------------------------------------------------- 6. no grading below the hub
+
+# tfs-009's fence. There is ONE grading layer and it is the hub's. `check_compatibility`
+# returns the ONE runtime-satisfaction vocabulary — `Satisfied | Mismatch(details)` — and a
+# `verdict`, `grade` or `remedy` field anywhere in it would be a third vocabulary for one
+# decision chain, which is precisely the earlier mandatory-`derivable` design the audit
+# removed. The four-verdict ladder lives in ONE module; the CLI may print it.
+GRADE_VOCAB = ["COMPATIBLE", "CONVERTIBLE", "PRODUCIBLE", "INCOMPATIBLE",
+               "Compatible", "Convertible", "Producible", "Incompatible", "remedy"]
+GRADE_HOME = {"crates/tensorfs-core/src/grade.rs",
+              "crates/tensorfs-core/src/bin/tfs/layout.rs"}
+
+
+def fence_grading():
+    bad = []
+    for p in sorted((ROOT / "crates").glob("**/*.rs")):
+        r = str(rel(p))
+        if r in GRADE_HOME:
+            continue
+        for i, s in code_lines(p.read_text(errors="ignore")):
+            if not s:
+                continue
+            for w in GRADE_VOCAB:
+                if re.search(r"(?<![\w])" + re.escape(w) + r"(?![\w])", s):
+                    bad.append(f"{r}:{i}: names grading vocabulary '{w}' outside "
+                               f"{sorted(GRADE_HOME)} — grading a mismatch is the HUB's job")
+    return bad, (f"{len(GRADE_VOCAB)} grade words confined to {len(GRADE_HOME)} files")
+
+
 # ----------------------------------------------------------------------------
 
 def rel(p):
@@ -304,7 +399,8 @@ FENCES = [("forbidden dependencies", fence_dependencies),
           ("no upward imports", fence_layering),
           ("marshal-only facade", fence_facade),
           ("one codec, one evaluator", fence_one_codec),
-          ("serve path, pinned buffers, one transform", fence_serve_path)]
+          ("serve path, pinned buffers, one transform", fence_serve_path),
+          ("no grading below the hub", fence_grading)]
 
 red = 0
 for title, fn in FENCES:

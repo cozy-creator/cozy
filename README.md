@@ -128,6 +128,49 @@ structure fixtures. `vectors gen` regenerates only `cases/` and `closure/` — t
 are evidence with their own provenance and their own banking commands.
 Caps in `limits.rs` are PROVISIONAL until proto-001's real H3+SDXL corpus ratifies them.
 
+## the layout plane (tfs-009)
+
+Two operations. **Stamp** runs inside isolated ingest and is the only thing that can mint an
+`IngestVerificationReceipt`: it re-derives the subject/profile binding, source generations,
+converter build/lock/recipe, the canonical header, the computed `topology_digest`, the
+encoding part roles, the candidate object set (every-and-only against the snapshot walk),
+the golden verdict and the bounded accounting — from bytes the store holds, never from what
+the run reported. Its ledger is its own document (`tensorfs.stamp/1`) and the receipt binds
+it. A receipt is still not a publication.
+
+**`check_compatibility`** compares a bound model's code topology with a checkpoint's and
+returns the ONE runtime vocabulary, `Satisfied | Mismatch(details)`, naming the first
+disagreeing tensor with both sides plus the component-granular encoding facts. It plans
+nothing and names no remedy: grading a mismatch into
+`COMPATIBLE | CONVERTIBLE | PRODUCIBLE | INCOMPATIBLE` is the HUB's job, and a sixth fence
+in `scripts/fence.py` keeps that vocabulary out of `compat.rs`.
+
+```bash
+tfs compat import <rows.json>          measured rows -> canonical header + code topology
+tfs compat check <code> <header>       Satisfied | Mismatch(details) + the facts
+tfs compat release-cut <report>        unclassified extras never cut a release
+tfs grade <report>                     the four-verdict ladder, from headers alone
+tfs grade register <name> <kind> <sp>  the registration ACT: it RUNS A->B->A
+tfs verify-request | verify-compat | verify-consume    the hermetic seam
+tfs ingest restamp <root> <session>    re-verify a candidate; --plant <what> for arms
+scripts/compat-runs.sh all             real banked H3 pairs + 55 arms + benchmarks
+```
+
+A CONVERTIBLE grade names a REGISTERED lossless mapping, and registering one EXECUTES the
+round trip here — over the complete 16-bit domain for a 16-bit cast, so the claim is proved
+rather than sampled. A re-quantization cannot register: `f32 -> f16` refuses
+`ROUND_TRIP_LOSSY`, and `bf16 -> f8_e4m3fn` is not expressible in the mapping vocabulary at
+all. The verifier goes further than grading a report: it APPLIES the registration to the
+code topology and re-checks, so CONVERTIBLE means the mapped topology satisfies, not that
+one key happened to match.
+
+The pairs are REAL. `scripts/h3-pairs.py` transcribes pinned upstream headers out of
+`~/cozy_v2/h3-evidence` (33 artifacts, each pinned to a repo revision and a sha256 of the
+exact bytes read) into neutral measured rows; `tfs compat import` turns those into canonical
+documents and says on every run that the logical facts are real and the part object ids are
+placeholders. No weight bytes transit this machine, and nothing below the topology layer is
+read by the decision.
+
 ## the Python facade (tfs-007)
 
 One wheel, abi3-py311, `py.typed`. The compiled half owns every byte-level fact; the Python

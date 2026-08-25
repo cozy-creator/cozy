@@ -72,7 +72,10 @@ race_section() {
   echo "objects under objects/: $(count_objects "$S")"
   echo "verification records:   $(find "$S/verified" -type f | wc -l)"
   "$TFS" contains "$S" "$want"
-  "$TFS" verify "$S" "$want" --paranoid
+  # Paranoid mode is DELETED (owner ruling 2026-08-25): a read rehashes when its record
+  # is missing or stale, and `scrub --rate 1.0` is the deliberate full-rehash door.
+  "$TFS" verify "$S" "$want"
+  "$TFS" scrub "$S" --rate 1.0
   echo "stored bytes match source: $(cmp -s "$SRC" "$S/objects/sha256/${want:0:2}/${want:2:2}/$want" && echo yes || echo NO)"
 }
 
