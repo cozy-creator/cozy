@@ -496,11 +496,14 @@ pathlib.Path('$W/unknown-geometry.rows.json').write_text(json.dumps({
 
 case "$SECTION" in
   pairs)    fixtures; pairs_section ;;
-  arms)     fixtures; arms_section ;;
+  arms)     fixtures; pairs_section >/dev/null; fixtures; arms_section ;;
   verifier) fixtures; pairs_section >/dev/null; verifier_section ;;
   stamp)    fixtures; stamp_section ;;
   bench)    fixtures; bench_section ;;
-  all)      fixtures; pairs_section; arms_section; verifier_section; stamp_section; bench_section ;;
+  # `fixtures` runs TWICE on purpose: three planted defects are mutations of reports that
+  # `pairs_section` produces, so on a cold work directory they have nothing to mutate yet.
+  # An arm that only fires on a warm run is not an arm.
+  all)      fixtures; pairs_section; fixtures; arms_section; verifier_section; stamp_section; bench_section ;;
   *) echo "sections: pairs | arms | verifier | stamp | bench | all"; exit 2 ;;
 esac
 

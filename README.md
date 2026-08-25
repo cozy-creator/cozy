@@ -153,7 +153,7 @@ tfs grade <report>                     the four-verdict ladder, from headers alo
 tfs grade register <name> <kind> <sp>  the registration ACT: it RUNS A->B->A
 tfs verify-request | verify-compat | verify-consume    the hermetic seam
 tfs ingest restamp <root> <session>    re-verify a candidate; --plant <what> for arms
-scripts/compat-runs.sh all             real banked H3 pairs + 55 arms + benchmarks
+scripts/compat-runs.sh all             real banked H3 pairs + 61 arms + benchmarks
 ```
 
 A CONVERTIBLE grade names a REGISTERED lossless mapping, and registering one EXECUTES the
