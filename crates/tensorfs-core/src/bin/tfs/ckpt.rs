@@ -11,13 +11,11 @@ use std::path::Path;
 use std::process::ExitCode;
 use std::time::Instant;
 
-use tensorfs_core::checkpoint as ck;
+use tensorfs_core::checkpoint::{self as ck, build_snapshot};
 use tensorfs_core::dtype::Dtype;
-use tensorfs_core::err::Result as TfsResult;
 use tensorfs_core::header::{Body, Closure, Header, Located, Part, Tensor};
 use tensorfs_core::ids::{ConfigRef, Doc, ObjectRef};
 use tensorfs_core::limits;
-use tensorfs_core::manifest::{closure_path, Entry, SnapshotManifest, CLOSURE_DIR};
 use tensorfs_core::registry;
 use tensorfs_core::relation::Carrier;
 use tensorfs_core::sha256;
@@ -201,49 +199,6 @@ fn registry_seed(alias: &str) -> registry::Seed {
 
 fn spec_of(alias: &str) -> EncodingSpec {
     registry_seed(alias).spec
-}
-
-/// The projected tree a checkpoint commits. Contained documents (EncodingSpec objects and
-/// their conformance-vector sets) go under `closure/` at paths whose terminal IS the digest,
-/// so the tree is self-describing on any host and every reference is checkable against the
-/// path that carries it.
-pub fn build_snapshot(
-    header: &Header,
-    href: &ObjectRef,
-    closure: &Closure,
-) -> TfsResult<SnapshotManifest> {
-    let mut entries: Vec<(String, Entry)> =
-        vec![("model.cozytensors".to_string(), Entry::File(href.clone()))];
-    let mut contained: Vec<(String, Entry)> = Vec::new();
-    for r in &header.encodings {
-        contained.push((closure_path(&r.sha256), Entry::File(r.clone())));
-        if let Some(v) = closure.get(&r.id()).and_then(|s| s.vectors.clone()) {
-            contained.push((closure_path(&v.sha256), Entry::File(v)));
-        }
-    }
-    if !contained.is_empty() {
-        entries.push((CLOSURE_DIR.to_string(), Entry::Dir));
-        entries.extend(contained);
-    }
-    for (name, c) in &header.configs {
-        entries.push((name.clone(), Entry::Dir));
-        entries.push((
-            format!("{name}/config.json"),
-            Entry::File(ObjectRef {
-                sha256: c.sha256.clone(),
-                length: c.length,
-            }),
-        ));
-    }
-    entries.sort_by(|a, b| a.0.cmp(&b.0));
-    // Two specs may cite the SAME vector set: one object, one path, listed once.
-    entries.dedup_by(|a, b| a.0 == b.0);
-    let m = SnapshotManifest {
-        header: Some(href.clone()),
-        entries,
-    };
-    m.validate()?;
-    Ok(m)
 }
 
 fn carrier_dtype(c: &Carrier, logical: Dtype) -> Dtype {

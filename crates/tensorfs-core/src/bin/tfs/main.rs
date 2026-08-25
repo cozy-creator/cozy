@@ -59,7 +59,7 @@ use tensorfs_core::err::Refusal;
 use tensorfs_core::header::{Body, Closure, Header, Part, Tensor};
 use tensorfs_core::ids::{ConfigRef, Doc, ObjectRef};
 use tensorfs_core::ingest::{Evidence, IngestProfile, IngestSubject, IngestVerificationReceipt};
-use tensorfs_core::manifest::{BlobDescriptor, Entry, SnapshotManifest};
+use tensorfs_core::manifest::{BlobDescriptor, Draft, Entry, SnapshotManifest};
 use tensorfs_core::registry;
 use tensorfs_core::spec::EncodingSpec;
 use tensorfs_core::store::{Fault, Store, Verdict, FAULT_STAGES};
@@ -108,6 +108,7 @@ fn main() -> ExitCode {
         ["snapshot", "walk", r, h] => snap::cmd_walk(Path::new(r), h),
         ["snapshot", "verify", r, h] => snap::cmd_verify(Path::new(r), h),
         ["snapshot", "flip", r, h] => snap::cmd_flip(Path::new(r), h, &flags),
+        ["snapshot", "arms", r, h] => snap::cmd_arms(Path::new(r), h),
         ["snapshot", "fuzz", r, h] => {
             snap::cmd_fuzz(Path::new(r), h, flag_num(&flags, "iters", 20000))
         }
@@ -669,10 +670,12 @@ fn manifest_checkpoint(header: &Header, extra_file: bool) -> SnapshotManifest {
             Entry::File(ObjectRef::of(br#"{"steps":30}"#)),
         ));
     }
-    SnapshotManifest {
+    Draft {
         header: Some(header.object_ref()),
         entries,
     }
+    .seal()
+    .expect("the corpus's positive manifest is a legal tree by construction")
 }
 
 fn profile_normal(allowed: Vec<ObjectRef>, dialect: &str) -> IngestProfile {
@@ -1499,7 +1502,7 @@ fn build_corpus() -> (Vec<Case>, Vec<EncodingSpec>) {
     // --- manifest reds
     let g = "manifest-red";
     let header_ref = ha.object_ref();
-    let mut m = snap.clone();
+    let mut m = Draft::of(&snap);
     m.entries.swap(0, 1);
     cases.push(red_case(
         g,
@@ -1509,7 +1512,7 @@ fn build_corpus() -> (Vec<Case>, Vec<EncodingSpec>) {
         "PATH_ORDER",
         "entries must strictly ascend by bytes",
     ));
-    let mut m = snap.clone();
+    let mut m = Draft::of(&snap);
     m.entries.retain(|(p, _)| p != "transformer");
     cases.push(red_case(
         g,
@@ -1519,7 +1522,7 @@ fn build_corpus() -> (Vec<Case>, Vec<EncodingSpec>) {
         "PATH_PARENT_MISSING",
         "parents-before-children",
     ));
-    let mut m = snap.clone();
+    let mut m = Draft::of(&snap);
     m.entries.push((
         "transformer/CONFIG.json".to_string(),
         Entry::File(ObjectRef::of(b"x")),
@@ -1533,7 +1536,7 @@ fn build_corpus() -> (Vec<Case>, Vec<EncodingSpec>) {
         "PATH_CASE_COLLISION",
         "case-fold collision inside one tree",
     ));
-    let mut m = snap.clone();
+    let mut m = Draft::of(&snap);
     m.entries[1].0 = "../escape.bin".to_string();
     m.entries.sort_by(|a, b| a.0.cmp(&b.0));
     cases.push(red_case(
@@ -1544,7 +1547,7 @@ fn build_corpus() -> (Vec<Case>, Vec<EncodingSpec>) {
         "PATH_ILLEGAL",
         "dot component",
     ));
-    let mut m = snap.clone();
+    let mut m = Draft::of(&snap);
     m.entries[1].0 = "nul.bin".to_string();
     m.entries.sort_by(|a, b| a.0.cmp(&b.0));
     cases.push(red_case(
@@ -1555,7 +1558,7 @@ fn build_corpus() -> (Vec<Case>, Vec<EncodingSpec>) {
         "PATH_RESERVED",
         "reserved stem",
     ));
-    let mut m = snap.clone();
+    let mut m = Draft::of(&snap);
     if let Entry::Blob(b) = &mut m.entries[1].1 {
         b.logical_size += 1;
     }
@@ -1619,7 +1622,7 @@ fn build_corpus() -> (Vec<Case>, Vec<EncodingSpec>) {
         "PATH_ILLEGAL",
         "traversal by the other separator",
     ));
-    let mut m = snap.clone();
+    let mut m = Draft::of(&snap);
     m.entries.push((
         "transformer/config.json".to_string(),
         Entry::File(ObjectRef::of(b"twin")),
@@ -1633,7 +1636,7 @@ fn build_corpus() -> (Vec<Case>, Vec<EncodingSpec>) {
         "PATH_ORDER",
         "one path, one entry: strict ascent IS the duplicate refusal",
     ));
-    let mut m = snap.clone();
+    let mut m = Draft::of(&snap);
     m.entries.retain(|(p, _)| p != "model.cozytensors");
     cases.push(red_case(
         g,
@@ -1643,7 +1646,7 @@ fn build_corpus() -> (Vec<Case>, Vec<EncodingSpec>) {
         "ATTACHMENT_CARDINALITY",
         "a header the projected tree does not contain",
     ));
-    let mut m = snap.clone();
+    let mut m = Draft::of(&snap);
     m.entries.push((
         "model2.cozytensors".to_string(),
         Entry::File(header_ref.clone()),
@@ -1657,7 +1660,7 @@ fn build_corpus() -> (Vec<Case>, Vec<EncodingSpec>) {
         "ATTACHMENT_CARDINALITY",
         "two pathnames for one header: which one is the checkpoint?",
     ));
-    let mut m = snap.clone();
+    let mut m = Draft::of(&snap);
     m.entries = vec![];
     cases.push(red_case(
         g,
@@ -1667,7 +1670,7 @@ fn build_corpus() -> (Vec<Case>, Vec<EncodingSpec>) {
         "MISSING_FIELD",
         "a snapshot with nothing in it",
     ));
-    let mut m = snap.clone();
+    let mut m = Draft::of(&snap);
     let spec_obj = plain.object_ref();
     m.entries
         .push((tensorfs_core::manifest::CLOSURE_DIR.to_string(), Entry::Dir));
@@ -1698,7 +1701,7 @@ fn build_corpus() -> (Vec<Case>, Vec<EncodingSpec>) {
         "PATH_DIGEST_MISMATCH",
         "a content-addressed path that names something else",
     ));
-    let mut m = snap.clone();
+    let mut m = Draft::of(&snap);
     if let Entry::Blob(b) = &mut m.entries[1].1 {
         // a HOLE: a non-final segment short of the profile grid
         b.segments.push(b.segments[0].clone());
@@ -1712,7 +1715,7 @@ fn build_corpus() -> (Vec<Case>, Vec<EncodingSpec>) {
         "BYTE_LENGTH_MISMATCH",
         "sparse holes are unrepresentable: the profile fixes every boundary",
     ));
-    let mut m = snap.clone();
+    let mut m = Draft::of(&snap);
     if let Entry::Blob(b) = &mut m.entries[1].1 {
         b.logical_size -= 1;
     }
@@ -1982,10 +1985,9 @@ fn run_doc(doc: &str, bytes: &[u8], closure: &Closure, platform: &[String]) -> O
         "capability" => {
             tensorfs_core::capability::CapabilityRecords::parse(bytes).map(|_| (None, None))
         }
-        "manifest" => SnapshotManifest::parse(bytes).and_then(|m| {
-            m.validate()?;
-            Ok((None, m.checkpoint_id().ok()))
-        }),
+        // A decode IS the path law now: `SnapshotManifest` cannot exist unvalidated, so
+        // parsing is the whole check and there is no second validate() to forget.
+        "manifest" => SnapshotManifest::parse(bytes).map(|m| (None, m.checkpoint_id().ok())),
         "profile" => IngestProfile::parse(bytes).and_then(|p| {
             p.validate(platform)?;
             Ok((None, None))

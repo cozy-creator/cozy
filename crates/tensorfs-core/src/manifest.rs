@@ -118,11 +118,50 @@ pub enum Entry {
     Blob(BlobDescriptor),
 }
 
+/// A manifest UNDER CONSTRUCTION. Mutable, renderable, and deliberately identity-free: a
+/// draft can be built wrong on purpose (that is what a planted red arm is), and the one
+/// thing it can never do is advertise an id for a tree that does not satisfy the path law.
+///
+/// Audit fix (external review, folded in at tfs-003): `SnapshotManifest` used to carry
+/// public mutable fields while `snapshot_id`/`checkpoint_id` hashed WITHOUT validating, so
+/// a programmatically-built invalid manifest could obtain an id and be stored under it.
+/// Identity now exists only on the sealed type.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
-pub struct SnapshotManifest {
-    /// Structural, never by pathname: a checkpoint snapshot carries exactly one.
+pub struct Draft {
     pub header: Option<ObjectRef>,
     pub entries: Vec<(String, Entry)>,
+}
+
+impl Draft {
+    pub fn of(m: &SnapshotManifest) -> Draft {
+        Draft {
+            header: m.header.clone(),
+            entries: m.entries.clone(),
+        }
+    }
+    /// The canonical rendering of a draft. Bytes for a decoder to refuse — never an id.
+    pub fn canonical_bytes(&self) -> Vec<u8> {
+        crate::canon::write(&manifest_value(&self.header, &self.entries))
+    }
+    /// The ONLY programmatic path to a manifest: the path law runs, or nothing is produced.
+    pub fn seal(self) -> Result<SnapshotManifest> {
+        let m = SnapshotManifest {
+            header: self.header,
+            entries: self.entries,
+        };
+        m.validate()?;
+        Ok(m)
+    }
+}
+
+/// A VALIDATED snapshot tree. Constructible only through `Draft::seal` or a strict decode,
+/// so every instance that exists has already satisfied the path law — which is what makes
+/// `snapshot_id()` infallible AND honest.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SnapshotManifest {
+    /// Structural, never by pathname: a checkpoint snapshot carries exactly one.
+    header: Option<ObjectRef>,
+    entries: Vec<(String, Entry)>,
 }
 
 const RESERVED: [&str; 22] = [
@@ -194,7 +233,14 @@ fn check_content_addressed(path: &str, entry: &Entry) -> Result<()> {
 }
 
 impl SnapshotManifest {
+    pub fn header(&self) -> Option<&ObjectRef> {
+        self.header.as_ref()
+    }
+    pub fn entries(&self) -> &[(String, Entry)] {
+        &self.entries
+    }
     /// The pinned atom. Every checkpoint has a snapshot — the id is the snapshot's.
+    /// Infallible because the type cannot exist unvalidated.
     pub fn snapshot_id(&self) -> String {
         self.object_id()
     }
@@ -219,10 +265,12 @@ impl SnapshotManifest {
             .collect()
     }
 
-    /// The path law, run as part of every decode. Strictly ascending raw bytes gives
+    /// The path law, run by `Draft::seal` and by every decode — the two doors into the
+    /// type, which is why it is private: there is no instance that skipped it.
+    /// Strictly ascending raw bytes gives
     /// duplicate-path refusal and parent-before-child for free; `dirs` is a subsequence of
     /// an ascending sequence, so the parent lookup is a binary search rather than a scan.
-    pub fn validate(&self) -> Result<()> {
+    fn validate(&self) -> Result<()> {
         if self.entries.is_empty() {
             return refuse(Code::MISSING_FIELD, "a snapshot lists at least one entry");
         }
@@ -344,44 +392,48 @@ impl Doc for SnapshotManifest {
         f.done()?;
         // Strict decode IS the path law: a manifest that parses but violates it never exists
         // as a value, so no caller can forget to validate one.
-        let m = SnapshotManifest { header, entries };
-        m.validate()?;
-        Ok(m)
+        Draft { header, entries }.seal()
     }
 
     fn to_value(&self) -> Value {
-        let mut fields = vec![
-            ("format", Value::str(Self::FORMAT)),
-            (
-                "entries",
-                Value::arr(
-                    self.entries
-                        .iter()
-                        .map(|(p, e)| {
-                            let mut f = vec![("path", Value::str(p.clone()))];
-                            match e {
-                                Entry::Dir => f.push(("kind", Value::str("dir"))),
-                                Entry::File(o) => {
-                                    f.push(("kind", Value::str("file")));
-                                    f.push(("object", o.to_value()));
-                                }
-                                Entry::Blob(b) => {
-                                    f.push(("blob", b.to_value()));
-                                    f.push(("kind", Value::str("blob")));
-                                }
-                            }
-                            Value::obj(f)
-                        })
-                        .collect(),
-                ),
-            ),
-        ];
-        if let Some(h) = &self.header {
-            fields.push((
-                "attachments",
-                Value::obj(vec![("cozytensors_header", h.to_value())]),
-            ));
-        }
-        Value::obj(fields)
+        manifest_value(&self.header, &self.entries)
     }
+}
+
+/// ONE rendering, shared by the draft and the sealed manifest. Two spellings of the same
+/// document is the drift this repo is built against.
+fn manifest_value(header: &Option<ObjectRef>, entries: &[(String, Entry)]) -> Value {
+    let mut fields = vec![
+        ("format", Value::str(SnapshotManifest::FORMAT)),
+        (
+            "entries",
+            Value::arr(
+                entries
+                    .iter()
+                    .map(|(p, e)| {
+                        let mut f = vec![("path", Value::str(p.clone()))];
+                        match e {
+                            Entry::Dir => f.push(("kind", Value::str("dir"))),
+                            Entry::File(o) => {
+                                f.push(("kind", Value::str("file")));
+                                f.push(("object", o.to_value()));
+                            }
+                            Entry::Blob(b) => {
+                                f.push(("blob", b.to_value()));
+                                f.push(("kind", Value::str("blob")));
+                            }
+                        }
+                        Value::obj(f)
+                    })
+                    .collect(),
+            ),
+        ),
+    ];
+    if let Some(h) = header {
+        fields.push((
+            "attachments",
+            Value::obj(vec![("cozytensors_header", h.to_value())]),
+        ));
+    }
+    Value::obj(fields)
 }

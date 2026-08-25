@@ -290,6 +290,64 @@ pub fn read_blob<W: Write>(store: &Store, what: &str, b: &BlobDescriptor, w: &mu
     Ok(())
 }
 
+// ------------------------------------------------------------------ the projected tree
+
+/// The tree a checkpoint commits. Contained documents (EncodingSpec objects and their
+/// conformance-vector sets) go under `closure/` at paths whose terminal IS the digest, so
+/// the tree is self-describing on any host and every reference is checkable against the
+/// path that carries it.
+///
+/// One writer, two consumers (the synthetic checkpoint plane and the ingest border) — the
+/// alternative is two spellings of one tree, which `walk` would then have to forgive.
+pub fn build_snapshot(
+    header: &Header,
+    href: &ObjectRef,
+    closure: &Closure,
+) -> Result<SnapshotManifest> {
+    let mut entries: Vec<(String, crate::manifest::Entry)> = vec![(
+        "model.cozytensors".to_string(),
+        crate::manifest::Entry::File(href.clone()),
+    )];
+    let mut contained: Vec<(String, crate::manifest::Entry)> = Vec::new();
+    for r in &header.encodings {
+        contained.push((
+            crate::manifest::closure_path(&r.sha256),
+            crate::manifest::Entry::File(r.clone()),
+        ));
+        if let Some(v) = closure.get(&r.id()).and_then(|s| s.vectors.clone()) {
+            contained.push((
+                crate::manifest::closure_path(&v.sha256),
+                crate::manifest::Entry::File(v),
+            ));
+        }
+    }
+    if !contained.is_empty() {
+        entries.push((
+            crate::manifest::CLOSURE_DIR.to_string(),
+            crate::manifest::Entry::Dir,
+        ));
+        entries.extend(contained);
+    }
+    for (name, c) in &header.configs {
+        entries.push((name.clone(), crate::manifest::Entry::Dir));
+        entries.push((
+            format!("{name}/config.json"),
+            crate::manifest::Entry::File(ObjectRef {
+                sha256: c.sha256.clone(),
+                length: c.length,
+            }),
+        ));
+    }
+    entries.sort_by(|a, b| a.0.cmp(&b.0));
+    // Two specs may cite the SAME vector set: one object, one path, listed once.
+    entries.dedup_by(|a, b| a.0 == b.0);
+    crate::manifest::Draft {
+        header: Some(href.clone()),
+        entries,
+    }
+    .seal()
+}
+
 // ------------------------------------------------------------------ the transitive root
 
 /// What one object was reached AS. The kind is the reason it is live, not a property of
@@ -331,9 +389,9 @@ impl Walk {
 /// Reaches every and only the objects this snapshot commits, and refuses when a reference
 /// the header makes is not CONTAINED in the snapshot that carries it.
 pub fn walk(store: &Store, snap: &SnapshotManifest) -> Result<Walk> {
-    snap.validate()?;
+    // The path law already ran: a SnapshotManifest cannot exist unvalidated (manifest.rs).
     let mut w = Walk::default();
-    let href = match &snap.header {
+    let href = match snap.header() {
         Some(h) => h.clone(),
         None => {
             return refuse(
@@ -421,13 +479,38 @@ pub fn walk(store: &Store, snap: &SnapshotManifest) -> Result<Walk> {
         }
     }
 
-    // Anything listed that the header does not account for is a sibling asset.
-    let accounted: Vec<String> = w.objects.iter().map(|r| r.obj.sha256.clone()).collect();
-    for (path, e) in &snap.entries {
+    // Anything listed that the header does not account for is a sibling asset — with two
+    // audit-driven tightenings (external review, folded in at tfs-003):
+    //
+    // 1. Comparison is by the WHOLE length-bearing ObjectRef. Matching on the digest alone
+    //    let an entry claim a different length for the same bytes and still read as
+    //    accounted, which is the one field a fetch plan is sized from.
+    // 2. `closure/` is the CONTAINED-DOCUMENT namespace. An entry there that no header
+    //    reference reaches is an orphan, not an asset: it is a canonical document the
+    //    checkpoint does not commit to, sitting at a path that asserts it does. Silently
+    //    absorbing it as a "sibling" is how a stale or planted spec rides along.
+    let accounted: Vec<ObjectRef> = w.objects.iter().map(|r| r.obj.clone()).collect();
+    for (path, e) in snap.entries() {
+        let contained_ns = path
+            .strip_prefix(crate::manifest::CLOSURE_DIR)
+            .and_then(|r| r.strip_prefix('/'))
+            .is_some();
         match e {
             crate::manifest::Entry::Dir => {}
             crate::manifest::Entry::File(o) => {
-                if !accounted.contains(&o.sha256) {
+                if !accounted.contains(o) {
+                    if contained_ns {
+                        return refuse(
+                            Code::NOT_CONTAINED,
+                            format!(
+                                "{path:?}: an orphan under {}/ — {} is reached by no header \
+                                 reference, so the checkpoint does not commit the document \
+                                 the path claims it does",
+                                crate::manifest::CLOSURE_DIR,
+                                o.id()
+                            ),
+                        );
+                    }
                     w.siblings.push(path.clone());
                     w.objects.push(Reached {
                         kind: "asset",

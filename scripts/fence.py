@@ -112,15 +112,28 @@ def fence_facade():
 
 # A SECOND implementation of an identity-bearing codec is the defect class this repo is
 # built against: two readers that disagree produce a green suite and a wrong artifact.
-# The fingerprints below are the format strings and grammar tags themselves — anything
-# that names them is either the one implementation or a rival to it.
-CODEC_MARKS = ["tensorfs.snapshot/1", "cozytensors/1"]
+#
+# STRUCTURAL OWNERSHIP (audit fix, tfs-003). The previous rule banned every .go/.java/.rb/
+# .ts/.js file in the repository outright — a proxy so coarse it would reject a build script
+# while a rival codec written in Rust or Python walked past. What actually matters is who
+# OWNS each identity-bearing format: a file that names a format mark is either that format's
+# one implementation or a rival to it, whatever language it is written in.
+CODEC_OWNERS = {
+    "tensorfs.snapshot/1": {"crates/tensorfs-core/src/manifest.rs"},
+    "cozytensors/1": {"crates/tensorfs-core/src/header.rs"},
+    "cozytensors.topology/1": {"crates/tensorfs-core/src/header.rs"},
+    "tensorfs.encoding_spec/1": {"crates/tensorfs-core/src/spec.rs"},
+    "tensorfs.encoding_vectors/1": {"crates/tensorfs-core/src/vectors.rs"},
+}
+CODEC_MARKS = list(CODEC_OWNERS)
 GRAMMAR_TAGS = ["ceil_block", "elements_div", "ceil_div"]
-# Foreign containers belong to tfs-003's isolated ingest converter, nowhere else. Matched
+# Foreign containers belong to tfs-003's isolated ingest border, nowhere else. Matched
 # against CODE with string literals stripped: a dialect NAME in a string is data the border
 # legitimately carries ("pickle" is a refused dialect); an identifier is a parser.
 FOREIGN = ["safetensors", "gguf", "pickle", "unpickle", "zipfile", "ZipArchive", "npz"]
-INGEST_OK = {"crates/tensorfs-core/src/ingest.rs"}
+# The border is a MODULE, not a file: carrier decode, classification, converters and the
+# quarantine transaction each own one stage, and all four are inside the same fence.
+INGEST_OK_PREFIX = "crates/tensorfs-core/src/ingest"
 # The fence must be free to NAME what it forbids.
 SELF = {"scripts/fence.py"}
 GRAMMAR_HOME = {"crates/tensorfs-core/src/relation.rs"}
@@ -141,30 +154,42 @@ def code_only(line):
 
 def fence_one_codec():
     bad = []
-    # (a) no second codec in another language, anywhere in the repo
+    # (a) each identity-bearing format has ONE owning module. Two tiers, because naming a
+    #     format and IMPLEMENTING it are different acts:
+    #       outside the owning crate — naming a mark at all is a rival, in any language;
+    #       inside it — the CLI legitimately prints marks and PLANTS them into byte streams
+    #       to arm the one implementation's refusals, so the rival signal is naming a mark
+    #       while also defining a canonical codec for it (`impl Doc for`).
     for p in sorted(ROOT.glob("**/*")):
         if not p.is_file() or ".git" in p.parts or "target" in p.parts:
             continue
-        if str(rel(p)) in SELF:
+        r = str(rel(p))
+        if r in SELF or r.startswith("vectors/"):   # frozen DATA carries its own marks
             continue
-        if p.suffix in (".go", ".java", ".rb", ".ts", ".js"):
-            bad.append(f"{rel(p)}: a {p.suffix} source file — the codec has ONE implementation")
-            continue
-        if p.suffix not in (".rs", ".py"):
+        # Languages a codec could actually be HOSTED in. Shell orchestration is excluded on
+        # purpose: `scripts/*.sh` plant format strings into byte streams to arm the one
+        # implementation's refusals, which is driving the codec, not rivalling it.
+        if p.suffix not in (".rs", ".py", ".go", ".java", ".rb", ".ts", ".js", ".c", ".cpp",
+                            ".cs", ".swift", ".kt"):
             continue
         text = p.read_text(errors="ignore")
-        r = str(rel(p))
-        if p.suffix == ".py":
-            for m in CODEC_MARKS:
-                if m in text:
-                    bad.append(f"{r}: Python names '{m}' — a second codec, not a facade")
+        inside = r.startswith("crates/")
+        implements = "impl Doc for" in text
+        for m, owners in CODEC_OWNERS.items():
+            if m not in text or r in owners:
+                continue
+            if inside and not implements:
+                continue    # a consumer naming or planting the mark, not a second codec
+            bad.append(f"{r}: names format '{m}' owned by {sorted(owners)} and "
+                       + ("defines its own Doc codec" if inside else "sits outside the owning crate")
+                       + " — a rival implementation of an identity-bearing codec")
         # (b) grammar tags live in exactly one file
         if r not in GRAMMAR_HOME:
             for t in GRAMMAR_TAGS:
                 if re.search(r'"' + t + r'"', text):
                     bad.append(f"{r}: emits grammar tag '{t}' — a SECOND shape evaluator")
         # (c) foreign container parsing lives only at the ingest border
-        if r not in INGEST_OK and r.startswith("crates/"):
+        if not r.startswith(INGEST_OK_PREFIX) and r.startswith("crates/"):
             for f in FOREIGN:
                 for i, line in enumerate(text.splitlines(), 1):
                     s = code_only(line)
@@ -181,9 +206,9 @@ def fence_one_codec():
                         continue
                     if re.search(r"(?<![\w])" + w + r"(?![\w])", s):
                         bad.append(f"{r}:{i}: deleted vocabulary '{w}': {s}")
-    return bad, (f"{len(CODEC_MARKS)} codec marks, {len(GRAMMAR_TAGS)} grammar tags in "
-                 f"{len(GRAMMAR_HOME)} file, {len(FOREIGN)} foreign parsers, "
-                 f"{len(EXCLUDED)} deleted words")
+    return bad, (f"{len(CODEC_MARKS)} owned formats, {len(GRAMMAR_TAGS)} grammar tags in "
+                 f"{len(GRAMMAR_HOME)} file, {len(FOREIGN)} foreign parsers confined to "
+                 f"{INGEST_OK_PREFIX}, {len(EXCLUDED)} deleted words")
 
 
 # ----------------------------------------------------------------------------

@@ -11,7 +11,8 @@ use std::time::Instant;
 
 use tensorfs_core::checkpoint as ck;
 use tensorfs_core::ids::{Doc, ObjectRef};
-use tensorfs_core::manifest::{BlobDescriptor, Entry, SnapshotManifest};
+use tensorfs_core::err::Result as TfsResult;
+use tensorfs_core::manifest::{BlobDescriptor, Draft, Entry, SnapshotManifest};
 use tensorfs_core::sha256;
 use tensorfs_core::store::Store;
 
@@ -84,11 +85,11 @@ pub fn cmd_show(root: &Path, hex: &str) -> ExitCode {
         Ok(c) => println!("  checkpoint_id   {c}   (= snapshot_id, unconditional)"),
         Err(e) => println!("  checkpoint_id   —    {e}"),
     }
-    if let Some(h) = &snap.header {
+    if let Some(h) = snap.header() {
         println!("  attachment      {} (TYPED, not by pathname)", h.id());
     }
-    println!("  {} entries", snap.entries.len());
-    for (p, e) in &snap.entries {
+    println!("  {} entries", snap.entries().len());
+    for (p, e) in snap.entries() {
         match e {
             Entry::Dir => println!("    dir   {p}/"),
             Entry::File(o) => println!("    file  {p}  {} ({} B)", o.id(), o.length),
@@ -184,7 +185,7 @@ pub fn cmd_verify(root: &Path, hex: &str) -> ExitCode {
     let (store, sref) = got!(opened(root, hex));
     let snap = ok!(ck::load_manifest(&store, &sref));
     let w = ok!(ck::walk(&store, &snap));
-    let header = ok!(ck::load_header(&store, snap.header.as_ref().unwrap()));
+    let header = ok!(ck::load_header(&store, snap.header().unwrap()));
 
     let t = Instant::now();
     let (mut bytes, mut parts, mut blobs) = (0u64, 0usize, 0usize);
@@ -197,7 +198,7 @@ pub fn cmd_verify(root: &Path, hex: &str) -> ExitCode {
             parts += 1;
         }
     }
-    for (path, e) in &snap.entries {
+    for (path, e) in snap.entries() {
         match e {
             Entry::Blob(b) => {
                 let mut sink = Sink(0);
@@ -485,16 +486,17 @@ pub fn cmd_fuzz(root: &Path, hex: &str, iters: u64) -> ExitCode {
 
 /// Swap in a different header object: both the TYPED attachment and the one path that
 /// projects it move together, because they are the same object seen two ways.
-fn reheader(snap: &SnapshotManifest, href: &ObjectRef) -> SnapshotManifest {
-    let mut m = snap.clone();
+fn reheader(snap: &SnapshotManifest, href: &ObjectRef) -> TfsResult<SnapshotManifest> {
+    let mut m = Draft::of(snap);
     let old = m.header.clone();
     for (_, e) in m.entries.iter_mut() {
-        if matches!(e, Entry::File(o) if Some(&*o) == old.as_ref()) {
+        if matches!(e, Entry::File(o) if Some(&*o) == old.as_ref().map(|x| &*x)) {
             *e = Entry::File(href.clone());
         }
     }
     m.header = Some(href.clone());
-    m
+    // Sealing IS the validation: an identity is only ever asked of a legal tree.
+    m.seal()
 }
 
 fn snap_id(bytes: &[u8]) -> String {
@@ -509,7 +511,7 @@ pub fn cmd_flip(root: &Path, hex: &str, f: &Flags) -> ExitCode {
     let _ = flag_num::<u64>(f, "blocks", 12);
     let (store, sref) = got!(opened(root, hex));
     let snap = ok!(ck::load_manifest(&store, &sref));
-    let href = snap.header.clone().unwrap();
+    let href = snap.header().unwrap().clone();
     let header = ok!(ck::load_header(&store, &href));
 
     let base_ck = ok!(snap.checkpoint_id());
@@ -531,13 +533,13 @@ pub fn cmd_flip(root: &Path, hex: &str, f: &Flags) -> ExitCode {
     println!("  base checkpoint {base_ck}");
 
     // a sibling asset appears: the tree changed, the header did not
-    let mut m = snap.clone();
+    let mut m = Draft::of(&snap);
     m.entries.push((
         "NOTICE.txt".to_string(),
         Entry::File(ObjectRef::of(b"a sibling asset with a named reason")),
     ));
     m.entries.sort_by(|a, b| a.0.cmp(&b.0));
-    ok!(m.validate());
+    let m = ok!(m.seal());
     row(
         "sibling asset added",
         &base_h,
@@ -551,8 +553,7 @@ pub fn cmd_flip(root: &Path, hex: &str, f: &Flags) -> ExitCode {
         c.sha256 = sha256::hex_digest(b"a different config object");
     }
     let h2ref = h2.object_ref();
-    let m2 = reheader(&snap, &h2ref);
-    ok!(m2.validate());
+    let m2 = ok!(reheader(&snap, &h2ref));
     row(
         "config object changed",
         &h2ref.id(),
@@ -566,8 +567,7 @@ pub fn cmd_flip(root: &Path, hex: &str, f: &Flags) -> ExitCode {
         e.sha256 = sha256::hex_digest(b"a different EncodingSpec object");
     }
     let h3ref = h3.object_ref();
-    let m3 = reheader(&snap, &h3ref);
-    ok!(m3.validate());
+    let m3 = ok!(reheader(&snap, &h3ref));
     row(
         "EncodingSpec object changed",
         &h3ref.id(),
@@ -583,8 +583,7 @@ pub fn cmd_flip(root: &Path, hex: &str, f: &Flags) -> ExitCode {
         }
     }
     let h4ref = h4.object_ref();
-    let m4 = reheader(&snap, &h4ref);
-    ok!(m4.validate());
+    let m4 = ok!(reheader(&snap, &h4ref));
     row(
         "logical dtype changed",
         &h4ref.id(),
@@ -607,4 +606,105 @@ pub fn cmd_flip(root: &Path, hex: &str, f: &Flags) -> ExitCode {
         &sha256::hex_digest(pretty.as_bytes())[..12]
     );
     ExitCode::SUCCESS
+}
+
+// ------------------------------------------------------------------ audit arms
+
+/// The two structural tightenings an external audit found, armed against the LIVE store.
+/// Every arm plants the exact defect the fix names and prints the refusal it produced.
+///
+/// 1. A manifest could carry public mutable fields AND derive an id without validating, so
+///    a programmatically-built illegal tree could be stored under a real-looking id. The
+///    identity methods now exist only on the sealed type; a `Draft` has none, which the
+///    compiler enforces — these arms show the sealing refusals that replace them.
+/// 2. `walk` classified every unaccounted file as a sibling asset (so an orphan
+///    `closure/<digest>.json` rode along as an "asset") and compared accounted objects by
+///    DIGEST ALONE, ignoring the length a fetch plan is sized from.
+pub fn cmd_arms(root: &Path, hex: &str) -> ExitCode {
+    let (store, sref) = got!(opened(root, hex));
+    let snap = ok!(ck::load_manifest(&store, &sref));
+    let header = ok!(ck::load_header(&store, snap.header().unwrap()));
+    let mut red = 0usize;
+
+    let mut arm = |what: &str, d: Draft, walk_it: bool| {
+        match d.seal() {
+            Err(e) => {
+                red += 1;
+                println!("  RED  {what:<44} seal refused {}", e.code.as_str());
+            }
+            Ok(m) => {
+                if !walk_it {
+                    println!("  ??   {what:<44} SEALED as {} — arm did not fire", m.snapshot_id());
+                    return;
+                }
+                match ck::walk(&store, &m) {
+                    Err(e) => {
+                        red += 1;
+                        println!("  RED  {what:<44} walk refused {}", e.code.as_str());
+                    }
+                    Ok(w) => println!(
+                        "  ??   {what:<44} walked {} objects, {} siblings — arm did not fire",
+                        w.objects.len(),
+                        w.siblings.len()
+                    ),
+                }
+            }
+        }
+    };
+
+    println!("audit arms against {}", sref.id());
+
+    // (1) illegal trees cannot become an identity-bearing manifest at all.
+    let mut d = Draft::of(&snap);
+    d.entries.swap(0, 1);
+    arm("draft: entries out of ascending order", d, false);
+
+    let mut d = Draft::of(&snap);
+    d.entries.clear();
+    arm("draft: no entries at all", d, false);
+
+    let mut d = Draft::of(&snap);
+    d.entries.retain(|(p, _)| p != "model.cozytensors");
+    arm("draft: attachment listed at zero paths", d, false);
+
+    let mut d = Draft::of(&snap);
+    d.entries.push((
+        "model2.cozytensors".to_string(),
+        Entry::File(snap.header().unwrap().clone()),
+    ));
+    d.entries.sort_by(|a, b| a.0.cmp(&b.0));
+    arm("draft: attachment listed at two paths", d, false);
+
+    // (2a) an orphan contained document: a legal PATH carrying a document the header does
+    // not reach. The path law alone cannot see this — only the walk can.
+    let orphan = ObjectRef::of(br#"{"format":"tensorfs.encoding_spec/1"}"#);
+    let mut d = Draft::of(&snap);
+    d.entries.push((
+        tensorfs_core::manifest::closure_path(&orphan.sha256),
+        Entry::File(orphan),
+    ));
+    d.entries.sort_by(|a, b| a.0.cmp(&b.0));
+    arm("walk: orphan closure/<digest>.json", d, true);
+
+    // (2b) the SAME digest at the WRONG length. Digest-only accounting called this
+    // accounted and moved on; whole-ObjectRef accounting sees an object the header never
+    // committed, sitting in the contained-document namespace.
+    let real = header.encodings[0].clone();
+    let mut d = Draft::of(&snap);
+    for (p, e) in d.entries.iter_mut() {
+        if p == &tensorfs_core::manifest::closure_path(&real.sha256) {
+            *e = Entry::File(ObjectRef {
+                sha256: real.sha256.clone(),
+                length: real.length + 1,
+            });
+        }
+    }
+    arm("walk: right digest, wrong length", d, true);
+
+    println!("  {red}/6 arms fired");
+    if red == 6 {
+        ExitCode::SUCCESS
+    } else {
+        ExitCode::FAILURE
+    }
 }
