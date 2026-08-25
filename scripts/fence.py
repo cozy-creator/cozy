@@ -136,7 +136,7 @@ TFS_FIELD = re.compile(r"\.Tfs\b")
 # through this door — that is what the coordinator and the worker protocol are for.
 RUNTIME_SITES = {"internal/install/install.go", "internal/launch/artifacts.go"}
 RUNTIME_BIN = re.compile(r'"cozy-runtime"')
-RUNTIME_VERBS_OK = {"describe", "list", "doctor", "fit"}
+RUNTIME_VERBS_OK = {"describe", "list", "doctor", "fit", "bindings"}
 RUNTIME_VERBS_DENY = {"run", "job", "serve", "rm", "pull", "ingest", "new"}
 
 IDENT = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")

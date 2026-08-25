@@ -2,6 +2,7 @@ package launch
 
 import (
 	"path/filepath"
+	"sort"
 	"strings"
 
 	"github.com/cozy-creator/cozy-creator-v2/internal/coord"
@@ -78,21 +79,31 @@ func ReleaseID(gen records.Generation) string {
 // release's own lock, so the cozy-runtime that serves an endpoint is the one the release
 // pinned and never this host's. That is the whole reason a generation is a venv.
 func (f *Facts) Spec(devices []string) (coord.EndpointSpec, *exit.Error) {
-	table, e := ReadBindings(f.Source)
+	// THE RESOLVED SELECTION, from the one resolver that owns the grammar
+	// (`cozy-runtime bindings`). cl-010 read `endpoint.toml`'s `[bindings]` table here
+	// because no runtime verb emitted the resolved record; cr-016 added the verb, and this
+	// host's second reader of that closed grammar is deleted rather than kept in step.
+	resolved, e := f.Runtime.Bindings()
 	if e != nil {
 		return coord.EndpointSpec{}, e
+	}
+	table := map[string]Binding{}
+	for _, b := range resolved {
+		table[b.Path] = b
 	}
 	spec := coord.EndpointSpec{
 		Endpoint:   f.Generation.Endpoint,
 		ReleaseID:  ReleaseID(f.Generation),
 		Generation: f.Generation.ID,
 		Python:     filepath.Join(f.Generation.Dir, "venv", "bin", "python"),
-		// THE SUPERVISOR ENTRY. `cozy-runtime serve` is cr-016's documented process entry
-		// but takes only --socket/--cas/--out, and the coordinator must name the instance,
-		// the release, the device envelope and the grace clock — so this launches the
-		// supervisor's own main with the full flag set the protocol needs. Recorded as
-		// cl-010's seam for cr-016: when `serve` carries those flags it becomes the entry
-		// and this argv collapses to `[serve, --socket, …]`.
+		// THE SUPERVISOR ENTRY, and it is still the module rather than the verb. cr-016
+		// gave `cozy-runtime serve` the full launch flag set precisely so this import
+		// could delete, and cl-004 tried to: `serve` is DEAD ON ARRIVAL on both `bac8e5e`
+		// and runtime HEAD — the CLI reads the config at its entrypoint and then
+		// `session.main` reads it again, which the runtime's own one-authority rule
+		// refuses (`config_authority: read_config() called twice`). Observed live: every
+		// worker exits 1 before registering. The deletion is one runtime line away and is
+		// recorded as owed; a broken documented entry is not an entry.
 		Args: []string{"-c",
 			"import sys; from cozy_runtime.internal.worker.session import main; " +
 				"raise SystemExit(main(sys.argv[1:]))"},
@@ -123,7 +134,7 @@ func (f *Facts) Spec(devices []string) (coord.EndpointSpec, *exit.Error) {
 // binding mints ONE entrypoint's local pinned-binding record. A weightless entrypoint
 // (no declared model slot) still gets a record: it names the project and the entrypoint,
 // which is all the runtime needs to construct nothing.
-func (f *Facts) binding(ep *Entrypoint, table map[string]Selection) (*coord.Binding, *exit.Error) {
+func (f *Facts) binding(ep *Entrypoint, table map[string]Binding) (*coord.Binding, *exit.Error) {
 	record := map[string]any{
 		"project":                   f.Source,
 		"entrypoint":                ep.Name,
@@ -150,11 +161,21 @@ func (f *Facts) binding(ep *Entrypoint, table map[string]Selection) (*coord.Bind
 	}
 
 	slot := ep.Models[0]
-	selection, e := Select(table, slot)
-	if e != nil {
-		return nil, e
+	selected, ok := table[slot.Path]
+	if !ok {
+		known := make([]string, 0, len(table))
+		for path := range table {
+			known = append(known, path)
+		}
+		sort.Strings(known)
+		return nil, exit.Named(exit.Structural, "unbound_slot",
+			"%s binds %s and the release's own resolver reports no selection for it",
+			ep.Name, slot.Path).
+			WithRemedy("it resolves: %s — code states capability, bindings state selection",
+				strings.Join(known, ", ")).
+			WithNext("cozy describe " + f.Generation.Endpoint)
 	}
-	artifact, e := f.Runtime.Find(selection.Ref())
+	artifact, e := f.Runtime.Find(selected.Ref)
 	if e != nil {
 		return nil, e
 	}

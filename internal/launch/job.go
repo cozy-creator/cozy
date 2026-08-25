@@ -64,6 +64,7 @@ func (f *Facts) JobSpec(function string, devices []string) (coord.EndpointSpec, 
 		ReleaseID:  ReleaseID(f.Generation),
 		Generation: f.Generation.ID,
 		Python:     f.Generation.Dir + "/venv/bin/python",
+		// The same entry the serving lane uses, and the same owed deletion (spec.go).
 		Args: []string{"-c",
 			"import sys; from cozy_runtime.internal.worker.session import main; " +
 				"raise SystemExit(main(sys.argv[1:]))"},

@@ -204,15 +204,17 @@ func sectionJourney() {
 	check("the SSE progress was RENDERED as it happened",
 		strings.Contains(out, "progress") || strings.Contains(out, "accepted"), "")
 	check("the typed result came back inline", strings.Contains(out, "result"), "")
-	// Named by the DECLARED FIELD PATH plus whatever type the manifest declared. It
-	// declares none — the worker hard-codes application/octet-stream — so there is no
-	// extension, and the run says so rather than inventing one (cr-016 seam).
-	saved := filepath.Join(outDir, "image")
+	// Named by the DECLARED FIELD PATH plus the type the MANIFEST declares. cl-010 landed
+	// against a runtime that hard-coded `application/octet-stream` on every OutputEntry,
+	// so the file arrived as `image` with no extension and the run degraded loudly about
+	// it; the pinned peer declares the real type, so the seam is closed and the name is
+	// complete. The client still invents nothing — the suffix comes from the mime.
+	saved := filepath.Join(outDir, "image.png")
 	info, err := os.Stat(saved)
-	check("the image is on disk under its DECLARED field path",
+	check("the image is on disk under its DECLARED field path, named by its DECLARED type",
 		err == nil && info != nil && info.Size() > 1000, saved+" "+sizeOf(info))
-	check("and the run degraded LOUDLY about the missing media type",
-		strings.Contains(out, "declares no media type"), "")
+	check("and the run does NOT degrade about a missing media type — the manifest has one",
+		!strings.Contains(out, "declares no media type"), "")
 	check("the PNG the endpoint encoded is what landed",
 		err == nil && isPNG(saved), "")
 	attempt := field(out, "attempt_key")

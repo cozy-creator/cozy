@@ -156,6 +156,14 @@ service, so there is no temporary direct-Go path for the HTTP API to later wrap:
 - **Every API refusal renders typed.** `api.CodeOf` is `statusOf`'s inverse and lives
   beside it, so the server's status maps back to the shared matrix code while the
   envelope's own NAME survives (`override_unresolved`, `bundle_corrupt`).
+- **The runtime answers questions about itself.** `describe`, `list`, `doctor`, `fit
+  --json` and `bindings --json` are the runtime's own verbs, and cozy-creator reads their
+  documents rather than growing second readers of the same grammars: cl-010's
+  `[bindings]` table reader and its fit-row parser are both DELETED (cr-016 built the
+  replacements for exactly that). One second implementation survives and is owed: the
+  supervisor is still entered through its module `main` because `cozy-runtime serve` is
+  dead on arrival — the CLI reads the config and `session.main` reads it again, which the
+  runtime's own one-authority rule refuses.
 - **An installed generation is the only source of launch facts** (`internal/launch`), and
   `--dev-endpoint` is DELETED with its loader and its writer. A generation carries the
   venv that runs it, the descriptor its own runtime derived and the install verified, and
@@ -166,9 +174,11 @@ service, so there is no temporary direct-Go path for the HTTP API to later wrap:
   exists: `steps=2` is an int because the surface says int, an undeclared key is exit 3
   naming what the release declares, and none of it costs a subprocess or a round trip.
 - **`--out` writes by DECLARED FIELD PATH** (`image`, `detail.thumb`) — a consequence of
-  the endpoint's declared result, not a convention. The file gets no invented extension:
-  the worker's manifest hard-codes `application/octet-stream` today, so the run degrades
-  loudly and names the seam instead of sniffing the bytes.
+  the endpoint's declared result, not a convention. The extension comes from the type the
+  MANIFEST declares and from nothing else: the client sniffs no bytes, and an output that
+  declares no type is written without a suffix and says so. (cl-010 landed against a
+  runtime that hard-coded `application/octet-stream`; the pinned peer declares the real
+  type, so the file is `image.png`.)
 - **SIGINT cancels, it does not abandon.** The client asks the coordinator to cancel and
   keeps watching, because the attempt's own journaled terminal settles the request; the
   exit code is the terminal's, through `exit.JobTerminal` (0 · 11 · 12 · 10).

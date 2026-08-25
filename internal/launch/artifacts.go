@@ -172,54 +172,63 @@ func (r Runtime) Find(ref string) (Artifact, *exit.Error) {
 		WithNext("cozy pull " + ref)
 }
 
-// Row is one `key: value` line of a runtime verb's own rendering.
-type Row struct{ Key, Value string }
+// Binding is one RESOLVED binding record, exactly as `cozy-runtime bindings` reports it.
+// It is the runtime's own resolution of `endpoint.toml`'s selection grammar against the
+// declared slots and the local artifact index. cozy-creator asks the owner rather than
+// reading the table itself: cr-016 built this verb so that second reader could delete.
+type Binding struct {
+	Path       string            `json:"binding_path"`
+	Param      string            `json:"param"`
+	ModelClass string            `json:"model_class"`
+	Ref        string            `json:"ref"`
+	Lane       string            `json:"lane"`
+	Source     string            `json:"source"`
+	Components []string          `json:"components"`
+	Store      string            `json:"store"`
+	Snapshots  map[string]string `json:"snapshots"`
+	Custody    string            `json:"custody"`
+	Installed  bool              `json:"installed"`
+}
 
-// Verdicts runs `fit` and hands back the runtime's own ROWS, verbatim. cozy-creator
-// renders them; it derives no verdict of its own (cozy-creator.md: "the runtime derives").
-//
-// DELIBERATELY NOT `--json`, and the reason is a live defect rather than a preference:
-// `cozy-runtime fit --json` faults on this build — `HostFacts` is a slotted dataclass and
-// the document builder reads `facts.__dict__` — so `--json` is exit 1 `internal` for every
-// invocation. The row rendering is the same verdict from the same walk. Recorded as
-// cl-010's finding for cr-016; when the document works this reads it instead.
-func (r Runtime) Verdicts(function string, payload []string) ([]Row, *exit.Error) {
+// Bindings is what this project SELECTS, resolved by the one resolver that owns the
+// grammar. It constructs nothing, touches no device and loads no weights.
+func (r Runtime) Bindings() ([]Binding, *exit.Error) {
+	var doc struct {
+		Bindings []Binding `json:"bindings"`
+	}
+	if e := r.call(&doc, "bindings"); e != nil {
+		return nil, e
+	}
+	return doc.Bindings, nil
+}
+
+// Verdict is one function's fit verdict, as the runtime's own document carries it.
+type Verdict struct {
+	Function string `json:"function"`
+	Verdict  string `json:"verdict"`
+	Rendered string `json:"rendered"`
+	Exact    bool   `json:"exact"`
+}
+
+// Fit runs `fit --json` and hands back the runtime's own HOST FACTS and VERDICTS.
+// cozy-creator renders them and derives no verdict of its own. cl-010 had to parse the
+// row RENDERING because `fit --json` faulted on that build (a slotted dataclass read
+// through `__dict__`); cr-016 fixed it, and reading the document is what deletes the
+// parser.
+func (r Runtime) Fit(function string, payload []string) (map[string]any, []Verdict, *exit.Error) {
+	var doc struct {
+		Host     map[string]any `json:"host"`
+		Verdicts []Verdict      `json:"verdicts"`
+	}
 	verb := []string{"fit"}
 	if function != "" {
 		verb = append(verb, function)
 	}
 	verb = append(verb, payload...)
-	out, e := r.lines("fit", verb...)
-	if e != nil {
-		return nil, e
+	if e := r.call(&doc, verb...); e != nil {
+		return nil, nil, e
 	}
-	rows := []Row{}
-	for _, line := range strings.Split(out, "\n") {
-		key, value, ok := strings.Cut(strings.TrimRight(line, "\n"), ":")
-		if !ok || strings.HasPrefix(line, " ") {
-			continue
-		}
-		rows = append(rows, Row{strings.TrimSpace(key), strings.TrimSpace(value)})
-	}
-	return rows, nil
-}
-
-// lines runs one verb WITHOUT --json and returns its stdout.
-func (r Runtime) lines(name string, verb ...string) (string, *exit.Error) {
-	args := append([]string{"--dir", r.Dir}, verb...)
-	cmd := exec.Command(r.Bin, args...)
-	cmd.Env = append(append([]string{}, r.Env...), "COZY_HOME="+r.Home)
-	var stdout, stderr strings.Builder
-	cmd.Stdout, cmd.Stderr = &stdout, &stderr
-	err := cmd.Run()
-	if cmd.ProcessState == nil {
-		return "", exit.Named(exit.Structural, "runtime_missing",
-			"cannot run %s: %s", r.Bin, err)
-	}
-	if code := cmd.ProcessState.ExitCode(); code != 0 {
-		return "", runtimeRefusal(code, name, stdout.String(), stderr.String())
-	}
-	return stdout.String(), nil
+	return doc.Host, doc.Verdicts, nil
 }
 
 // HostFacts runs `doctor` — device/driver/CUDA tri-state, encoder capability, CAS and

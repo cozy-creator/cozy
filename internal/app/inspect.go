@@ -228,51 +228,43 @@ func handleFit(ctx *Context) *exit.Error {
 	if e != nil {
 		return e
 	}
-	rows, e := facts.Runtime.Verdicts(function, nil)
+	hostFacts, verdicts, e := facts.Runtime.Fit(function, nil)
 	if e != nil {
 		return e
 	}
-	// The runtime prints host facts first (`device`, `allocatable`), then one row per
-	// FUNCTION, then its own note and next lines. All of it is ITS words; a row is a
-	// verdict when its key is a function this release registers, which is a fact from the
-	// descriptor rather than a guess about the shape of a line.
-	declared := map[string]bool{}
-	for _, name := range facts.Descriptor.Names() {
-		declared[name] = true
-	}
-	host, verdicts, worst := []render.Field{}, []map[string]string{}, exit.OK
-	notes := []string{"verdicts are the runtime's own — the same arithmetic `run` prices with"}
-	hints := []string{}
-	for _, row := range rows {
-		switch {
-		case row.Key == "device" || row.Key == "allocatable":
-			host = append(host, render.Field{K: row.Key, V: row.Value})
-			continue
-		case row.Key == "next":
-			// The runtime's own next-step hint, kept as one.
-			hints = append(hints, row.Value)
-			continue
-		case !declared[row.Key]:
-			// The runtime's own trailing lines. Carried, never re-worded.
-			notes = append(notes, row.Value)
-			continue
+	// THE RUNTIME'S OWN DOCUMENT, rendered. There is no parser here and no second
+	// arithmetic: `verdict` is the word the runtime chose, `rendered` is its own line, and
+	// the only thing this side derives is the CLI's exit code over them.
+	host := []render.Field{}
+	for _, key := range []string{"device", "allocatable_bytes", "free_bytes", "total_bytes"} {
+		if v, ok := hostFacts[key]; ok {
+			host = append(host, render.Field{K: key, V: v})
 		}
-		verdict := verdictOf(row.Value)
-		verdicts = append(verdicts, map[string]string{
-			"function": row.Key, "verdict": verdict, "rendered": row.Value,
+	}
+	rows, worst := []map[string]string{}, exit.OK
+	exact := false
+	for _, v := range verdicts {
+		rows = append(rows, map[string]string{
+			"function": v.Function, "verdict": v.Verdict, "rendered": v.Rendered,
 		})
-		if code := fitExit(verdict); code > worst {
+		exact = exact || v.Exact
+		if code := fitExit(v.Verdict); code > worst {
 			worst = code
 		}
+	}
+	notes := []string{"verdicts are the runtime's own — the same arithmetic `run` prices with"}
+	if !exact {
+		notes = append(notes,
+			"no payload given — structural/range information only, not an exact fit")
 	}
 	l := render.List{Kind: "fit",
 		Fields:     []string{"function", "verdict", "rendered"},
 		AllFields:  []string{"function", "verdict", "rendered"},
-		Rows:       verdicts,
+		Rows:       rows,
 		Empty:      "0 fit verdicts",
 		Aggregates: append([]render.Field{{K: "endpoint", V: endpoint}}, host...),
 		Notes:      notes,
-		Next:       hints,
+		Next:       []string{"cozy run " + endpoint + "/vN/<function>"},
 	}
 	if worst == exit.OK {
 		return emit(ctx, l)
@@ -290,17 +282,6 @@ func handleFit(ctx *Context) *exit.Error {
 		"%s has no fitting plan on this host", endpoint).
 		WithRemedy("the rows above carry the runtime's quantified verdict").
 		WithNext("cozy doctor")
-}
-
-// verdictOf reads the verdict word off the head of the runtime's own rendering:
-// `fits(native, all_resident) · …`, `fits-degraded(…)`, `capacity(…)`,
-// `structurally-incompatible`, `unbound — …`.
-func verdictOf(rendered string) string {
-	word := rendered
-	if i := strings.IndexAny(word, "( —·"); i > 0 {
-		word = word[:i]
-	}
-	return strings.TrimSpace(word)
 }
 
 func fitExit(verdict string) exit.Code {
