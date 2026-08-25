@@ -178,19 +178,48 @@ func orEmpty(s []string) []string {
 	return s
 }
 
+// selected narrows a record to `--fields`, in the order asked for. A record is the same
+// surface a listing is, one row wide: a flag that parses and prints everything anyway is
+// the bug cl-010 named, so an unknown name refuses here exactly as it does for a List.
+func (r Record) selected(m Mode) ([]Field, error) {
+	if len(m.Fields) == 0 {
+		return r.Fields, nil
+	}
+	have := map[string]Field{}
+	names := make([]string, 0, len(r.Fields))
+	for _, f := range r.Fields {
+		have[f.K] = f
+		names = append(names, f.K)
+	}
+	out := make([]Field, 0, len(m.Fields))
+	for _, want := range m.Fields {
+		f, ok := have[want]
+		if !ok {
+			return nil, exit.Usagef("unknown field %q for `%s`", want, r.Kind).
+				WithRemedy("available fields: %s", strings.Join(names, ", "))
+		}
+		out = append(out, f)
+	}
+	return out, nil
+}
+
 func (r Record) Emit(w io.Writer, m Mode) error {
+	fields, err := r.selected(m)
+	if err != nil {
+		return err
+	}
 	if m.JSON {
 		f := []Field{{"kind", r.Kind}}
-		f = append(f, r.Fields...)
+		f = append(f, fields...)
 		return writeJSON(w, tail(f, r.Notes, r.Next))
 	}
 	width := 0
-	for _, f := range r.Fields {
+	for _, f := range fields {
 		if len(f.K) > width {
 			width = len(f.K)
 		}
 	}
-	for _, f := range r.Fields {
+	for _, f := range fields {
 		fmt.Fprintf(w, "%-*s %s\n", width+1, f.K+":", Elide(text(f.V), m.Full))
 	}
 	writeTail(w, r.Notes, r.Next)
