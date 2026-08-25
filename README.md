@@ -171,6 +171,51 @@ documents and says on every run that the logical facts are real and the part obj
 placeholders. No weight bytes transit this machine, and nothing below the topology layer is
 read by the decision.
 
+## the evidence bank, reconciled (tfs-010)
+
+```bash
+scripts/bank-reconcile.py              20 cases: banked verdict vs admission verdict
+scripts/bank-reconcile.py --bank DIR   run against another copy of the bank (the red arm)
+tfs compat import <rows> --survey      every measured role set and the spec it selects
+```
+
+Two independent routes to one answer. The BANKED column is computed from the evidence
+bank's own recorded facts and re-reads no header byte; the ADMISSION column is observed by
+running the binary over the same pinned bytes. The recorded relationship between them is
+the fence — 14 agree, 6 disagree, and a disagreement is a finding with a code
+(`REGISTRY_GAP`, `UNDER_INFORMED`, `READER_KILLED`, `LANE_TIERS_EXTRAS`), never something to
+average away. It found that the bank's ninth key dialect does not exist: 450 nvfp4 encoding
+ROLES had been counted as tensors, and folded correctly that artifact is the text encoder's
+own 902 keys, 250 of them matching the registry's producer-mined `nvfp4-w4a4/1` on real
+shipped bytes. 2.4 s, 34 MiB, whole table.
+
+`--survey` exists because an artifact mixes encodings per tensor: the refusal names the
+first gap, the survey names them all.
+
+## the gguf-v1 planner (tfs-011)
+
+```bash
+tfs gguf plan <file> --probe [--twin <rows.json>] [--tensors N]
+tfs gguf admit <file> --probe          the admission verdict — refuses, today
+scripts/gguf-runs.sh all               the plan, the twins, the labels, 10 planted arms
+```
+
+A PLAN, not a second door: `carrier::sniff` still refuses `GGUF_REFUSED` on the normal
+path, in the same run. From the metadata region alone (33–75 KB probes of 15–36 GB
+carriers) it derives both views a lane gets — the retained carrier BLOB an engine streams
+whole, and the decomposed per-tensor byte ranges — plus each tensor's ggml type, block
+count, logical shape AND the source of that shape. 1.7 ms and 5 MiB for 902 tensors.
+
+Mapping a quant family to a reviewed EncodingSpec is BLOCKED and says so: a spec is a
+digest identity needing producer-mined vectors and a lane that names it, so `admit` refuses
+`GGUF_ENCODING_NOT_REVIEWED` until se-007 or job-008 selects encodings.
+
+Labels are never evidence, and the corpus proves it rather than the docs asserting it: the
+plan digest is filename-independent, a DiT shipped as `-Q4_K_M` carries zero Q5_K/Q6_K, and
+one publisher's H3 DiT declares `general.architecture = "wan"`. What identifies an artifact
+is its tensor table — every logical shape in all five checkable carriers agrees exactly
+with its pinned safetensors twin (535/535/535/532/902).
+
 ## cloud publish (tfs-017)
 
 The invariant is no-corrupt/no-clobber, and HOW it is enforced was a qualification outcome
