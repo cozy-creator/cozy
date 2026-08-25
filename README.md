@@ -2,8 +2,9 @@
 
 Canonical tensor byte plane: CAS, cozytensors headers, snapshots, ingest. Design authority:
 [tracker-v2](https://github.com/cozy-creator/tracker-v2) `tensorfs.md` / `cozytensors.md`; issues `tracker/tensorfs/`.
-Rust workspace: `tensorfs-core` (torch/CUDA/HTTP/SQL-free), `tensorfs-layout`, `tensorfs-py` (marshal-only PyO3, later).
-No automated tests (decisions.md #160): verification = live runs + benchmarks.
+Rust workspace: `tensorfs-core` (torch/CUDA/HTTP/SQL-free) and `tensorfs-py` (marshal-only PyO3).
+No automated tests (decisions.md #160): verification = live runs + benchmarks. Static analysis
+IS required: `cargo clippy -D warnings`, `cargo fmt --check`, `mypy --strict`, `scripts/fence.py`.
 
 ## tfs (tfs-013)
 
@@ -126,3 +127,45 @@ holds each vector's exact stored bytes plus a `.verdict` (expected outcome, froz
 structure fixtures. `vectors gen` regenerates only `cases/` and `closure/` — the other two
 are evidence with their own provenance and their own banking commands.
 Caps in `limits.rs` are PROVISIONAL until proto-001's real H3+SDXL corpus ratifies them.
+
+## the Python facade (tfs-007)
+
+One wheel, abi3-py311, `py.typed`. The compiled half owns every byte-level fact; the Python
+package is types and names, and `scripts/fence.py` enforces it. **Torch is outside the
+boundary**: a read fills a buffer you already own and hands back plain data; element sizes
+come from `tensorfs.DTYPES`, which is the compiled dtype enum exported exactly once.
+
+```python
+import tensorfs
+store = tensorfs.Store.open(root)
+snap  = store.snapshot(snapshot_id)                    # manifest + header, canonical bytes
+plan  = tensorfs.plan(snap["header"], traversal, window=1 << 22)
+
+with store.acquire_snapshot(snapshot_id) as lease:     # verified, hold registered first
+    def on_batch(b: tensorfs.Batch) -> None:
+        issue_h2d(slots[b.slot][: b.nbytes])           # asynchronous
+        b.release()                                    # after the completion event
+    lease.stream(plan, slots, on_batch, readers=8)
+```
+
+`stream` is a CONTINUOUS slot ring, not a batch-at-a-time call: `execute` per batch drains
+every reader at each boundary (tfs-005 measured 1.24 GB/s through a 64 MiB ring against
+1.37 through a 1 GiB one), and a streaming consumer pays that per tile. The ring keeps the
+pool running while the consumer holds a slot, and `release()` is a positive act — a slot
+returns when the H2D event fires, never when a Python statement ends. Every slot held and
+none released is `SLOT_STARVED`, not a hang.
+
+Every refusal crosses TYPED: one Python exception class per `err::Code`, generated at import
+from the Rust list, so `except tensorfs.errors.ShortRead` and `e.code` both work and neither
+language can drift.
+
+```bash
+scripts/wheel-smoke.sh                  # build, install into a fresh venv, read a NAMED
+                                        # tensor out of vectors/store, match the banked digest
+scripts/facade-conform.py               # the 122 shared vectors, verdict-for-verdict
+scripts/facade-runs.py arms|real|bench <store> <snap>
+scripts/facade-h2d-smoke.py <store> <snap>   # cr-005's fill loop with the facade as reader
+```
+
+`vectors/store/` is a committed 176 KB snapshot (`tfs checkpoint write ... --blocks 1
+--scale 32`) so every wheel in the matrix exercises a real read rather than an import.

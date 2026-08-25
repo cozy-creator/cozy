@@ -1,5 +1,7 @@
 name: ci
-# Build + fences only (tracker README #160: no test steps anywhere in v2).
+# Build + static analysis + fences only (tracker README #160: no test steps anywhere in
+# v2; static analysis IS required, owner directive 2026-08-25). The live verification
+# scripts — vectors, red arms, benchmarks — are run by builders against real stores.
 on: [push, pull_request]
 jobs:
   checks:
@@ -7,18 +9,62 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
       - run: cargo build --workspace
       - run: cargo fmt --check
+      - run: cargo clippy --workspace --all-targets -- -D warnings
       - run: python3 scripts/fence.py
-  wheel:
+
+  types:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
-      - run: pip install "maturin>=1.7,<2"
-      # Builds the abi3 wheel, installs it into a fresh venv, imports the facade and
-      # asserts torch never enters sys.modules. A build proof, not a test suite.
-      - run: bash scripts/wheel-smoke.sh
+      - run: pip install "mypy==1.*"
+      # --strict over the py.typed surface AND the drivers that consume it. No per-module
+      # suppressions: a facade that needs one is a facade whose types are wrong.
+      - run: mypy --strict python/tensorfs scripts/facade-conform.py scripts/facade-runs.py
+
+  # The wheel matrix exists so it cannot rot: every platform we publish for is BUILT here,
+  # and the native one is installed and made to read a real named tensor out of the
+  # committed store (scripts/wheel-smoke.sh) on the abi3 floor AND on the newest CPython.
+  wheels:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { os: ubuntu-latest, target: x86_64, native: true }
+          - { os: ubuntu-latest, target: aarch64, native: false }
+          - { os: macos-latest, target: aarch64, native: true }
+          - { os: macos-13, target: x86_64, native: true }
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: |
+            3.11
+            3.14
+      - uses: PyO3/maturin-action@v1
+        with:
+          target: ${{ matrix.target }}
+          args: --release --out dist
+          manylinux: auto
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wheel-${{ matrix.os }}-${{ matrix.target }}
+          path: dist
+      # A real read, on the floor version and on the newest one. Cross-built wheels are
+      # built and archived; they cannot be executed on this runner and say so.
+      - if: matrix.native
+        run: |
+          for v in 3.11 3.14; do
+            echo "=== CPython $v"
+            SKIP_BUILD=1 WHEEL_DIR="$PWD/dist" bash scripts/wheel-smoke.sh \
+              "${RUNNER_TEMP}/smoke-$v" "python$v"
+          done
+      - if: ${{ !matrix.native }}
+        run: echo "cross-built for ${{ matrix.target }} — archived, not executed here"

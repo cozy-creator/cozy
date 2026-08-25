@@ -143,7 +143,10 @@ pub fn project_snapshot(
                         "symlink-fell-back-to-copy",
                         snap_hex,
                         store.generation(),
-                        format!("{path:?}: {} bytes copied — dedup lost, correctness kept", o.length),
+                        format!(
+                            "{path:?}: {} bytes copied — dedup lost, correctness kept",
+                            o.length
+                        ),
                     ));
                 }
                 p.bytes += o.length;
@@ -168,12 +171,7 @@ pub fn project_snapshot(
 /// Tier 3. A private streamed copy of an ALREADY-RETAINED opaque carrier or document:
 /// O(one segment) resident, atomic by rename, and never a synthesis — a carrier that was
 /// never retained is `export_checkpoint` in a named exporter package (tfs-016), not this.
-pub fn materialize_blob(
-    store: &Store,
-    what: &str,
-    b: &BlobDescriptor,
-    dest: &Path,
-) -> Result<u64> {
+pub fn materialize_blob(store: &Store, what: &str, b: &BlobDescriptor, dest: &Path) -> Result<u64> {
     for (i, s) in b.segments.iter().enumerate() {
         if !store.contains(&s.sha256) {
             return refuse(
@@ -191,7 +189,7 @@ pub fn materialize_blob(
     let tmp = dir.join(format!(
         ".materialize-{}-{}",
         std::process::id(),
-        b.whole_sha256[0..12].to_string()
+        &b.whole_sha256[0..12]
     ));
     let mut f = File::create(&tmp).map_err(|e| io("create materialize temp", e))?;
     // read_blob checks every segment length AND the whole digest as the bytes pass.

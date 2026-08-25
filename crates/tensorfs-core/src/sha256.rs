@@ -91,8 +91,8 @@ impl Sha256 {
             v[1] = v[0];
             v[0] = t1.wrapping_add(t2);
         }
-        for i in 0..8 {
-            self.h[i] = self.h[i].wrapping_add(v[i]);
+        for (h, x) in self.h.iter_mut().zip(v.iter()) {
+            *h = h.wrapping_add(*x);
         }
     }
 

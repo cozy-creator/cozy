@@ -217,7 +217,10 @@ impl Doc for State {
             ascii_name("State.root.name", &name, limits::MAX_NAME_BYTES)?;
             ascii_name("State.root.kind", &kind, limits::MAX_NAME_BYTES)?;
             if evidence.len() > MAX_HOLD_OBJECTS {
-                return refuse(Code::COUNT_CAP, format!("root {name:?} pins too much evidence"));
+                return refuse(
+                    Code::COUNT_CAP,
+                    format!("root {name:?} pins too much evidence"),
+                );
             }
             roots.push(RootRow {
                 name,
@@ -476,11 +479,10 @@ impl Txn<'_> {
         self.state.normalize();
         let bytes = self.state.canonical_bytes();
         let p = self.meta.state_path();
-        let tmp = self.meta.dir.join(format!(
-            ".state.{}.{}",
-            std::process::id(),
-            now_secs()
-        ));
+        let tmp = self
+            .meta
+            .dir
+            .join(format!(".state.{}.{}", std::process::id(), now_secs()));
         let mut f = File::create(&tmp).map_err(|e| io("create state temp", e))?;
         f.write_all(&bytes).map_err(|e| io("write state", e))?;
         f.sync_all().map_err(|e| io("fsync state", e))?;
@@ -568,7 +570,12 @@ impl Txn<'_> {
     ) -> Result<()> {
         hex64("snapshot", snapshot)?;
         let now = now_secs();
-        match self.state.snapshots.iter_mut().find(|s| s.snapshot == snapshot) {
+        match self
+            .state
+            .snapshots
+            .iter_mut()
+            .find(|s| s.snapshot == snapshot)
+        {
             Some(s) => {
                 s.hub_published = hub_published;
                 if !source_url.is_empty() {
@@ -657,12 +664,7 @@ impl Drop for Hold {
 impl Meta {
     /// Register a hold BEFORE the first fetch (tensorfs.md §2, pin root class 2): GC racing
     /// a starting fill is fenced by construction, not by timing.
-    pub fn acquire_hold(
-        &self,
-        kind: &str,
-        snapshot: &str,
-        objects: Vec<String>,
-    ) -> Result<Hold> {
+    pub fn acquire_hold(&self, kind: &str, snapshot: &str, objects: Vec<String>) -> Result<Hold> {
         ascii_name("hold kind", kind, limits::MAX_NAME_BYTES)?;
         if !snapshot.is_empty() {
             hex64("hold snapshot", snapshot)?;
@@ -738,14 +740,12 @@ impl Meta {
                     continue;
                 }
             };
-            match f.try_lock() {
-                Ok(()) => {
-                    let _ = f.unlock();
-                    drop(f);
-                    let _ = fs::remove_file(&p);
-                    reaped.push(h.id.clone());
-                }
-                Err(_) => {} // owner alive — the hold stands, whatever its age
+            // owner alive (Err) — the hold stands, whatever its age
+            if f.try_lock().is_ok() {
+                let _ = f.unlock();
+                drop(f);
+                let _ = fs::remove_file(&p);
+                reaped.push(h.id.clone());
             }
         }
         if reaped.is_empty() {

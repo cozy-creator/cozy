@@ -72,7 +72,10 @@ pub fn cmd_root(root: &Path, verb: &str, args: &[&str], f: &Flags) -> ExitCode {
             let mut t = ok!(meta.txn());
             let snap = ok!(t.release_root(args[0]));
             let g = ok!(t.commit());
-            println!("root {:?} released (was sha256:{snap}) at generation {g}", args[0]);
+            println!(
+                "root {:?} released (was sha256:{snap}) at generation {g}",
+                args[0]
+            );
             println!("bytes are NOT freed by this — a later complete mark decides that");
         }
         "open" => {
@@ -114,7 +117,10 @@ pub fn cmd_root(root: &Path, verb: &str, args: &[&str], f: &Flags) -> ExitCode {
             let st = ok!(meta.read());
             println!("generation: {}", st.generation);
             for r in &st.roots {
-                println!("  root  {:<24} {:<10} sha256:{}", r.name, r.kind, r.snapshot);
+                println!(
+                    "  root  {:<24} {:<10} sha256:{}",
+                    r.name, r.kind, r.snapshot
+                );
             }
             for h in &st.holds {
                 println!(
@@ -123,7 +129,11 @@ pub fn cmd_root(root: &Path, verb: &str, args: &[&str], f: &Flags) -> ExitCode {
                     h.kind,
                     h.owner_pid,
                     h.boot_epoch,
-                    if h.snapshot.is_empty() { "-".into() } else { h.snapshot.clone() }
+                    if h.snapshot.is_empty() {
+                        "-".into()
+                    } else {
+                        h.snapshot.clone()
+                    }
                 );
             }
             for q in &st.quarantine {
@@ -177,7 +187,10 @@ pub fn cmd_hold(root: &Path, verb: &str, args: &[&str], f: &Flags) -> ExitCode {
         }
         "steal" => {
             ok!(meta.steal_hold(args[0]));
-            println!("hold {:?} removed WITHOUT the owner-liveness proof (dev-only red arm)", args[0]);
+            println!(
+                "hold {:?} removed WITHOUT the owner-liveness proof (dev-only red arm)",
+                args[0]
+            );
         }
         _ => return ExitCode::from(2),
     }
@@ -202,7 +215,19 @@ pub fn cmd_gc(root: &Path, verb: &str, f: &Flags) -> ExitCode {
                 c.bytes(),
                 t0.elapsed().as_millis()
             );
-            for kind in ["snapshot", "header", "config", "spec", "vectors", "part", "asset", "blob", "evidence", "hold-object", "ingest-candidate"] {
+            for kind in [
+                "snapshot",
+                "header",
+                "config",
+                "spec",
+                "vectors",
+                "part",
+                "asset",
+                "blob",
+                "evidence",
+                "hold-object",
+                "ingest-candidate",
+            ] {
                 let n = c.live.iter().filter(|l| l.kind == kind).count();
                 if n > 0 {
                     println!("  {kind:<18} {n}");
@@ -244,7 +269,12 @@ pub fn cmd_gc(root: &Path, verb: &str, f: &Flags) -> ExitCode {
                 t0.elapsed().as_millis()
             );
             println!("claim generation {}", sw.claim_generation);
-            println!("census reached {} objects via {} roots / {} holds", c.distinct(), c.roots, c.holds);
+            println!(
+                "census reached {} objects via {} roots / {} holds",
+                c.distinct(),
+                c.roots,
+                c.holds
+            );
             if flag_on(f, "dry-run") {
                 println!("(dry run — nothing was removed)");
             }
@@ -256,7 +286,11 @@ pub fn cmd_gc(root: &Path, verb: &str, f: &Flags) -> ExitCode {
         "refs" => {
             let st = ok!(meta.read());
             let d = ok!(gc::render_refs(&s, &st));
-            println!("rendered {} refs to {} — CACHE, zero authority", st.roots.len(), d.display());
+            println!(
+                "rendered {} refs to {} — CACHE, zero authority",
+                st.roots.len(),
+                d.display()
+            );
         }
         "pressure" => {
             let st = ok!(meta.read());
@@ -265,9 +299,15 @@ pub fn cmd_gc(root: &Path, verb: &str, f: &Flags) -> ExitCode {
             let free: u64 = flag_num(f, "free", 0);
             let floor: u64 = flag_num(f, "reserve", 0);
             let p = gc::pressure_plan(&st, &u, free, floor);
-            println!("free {free} B, reserve floor {floor} B -> need {} B", p.need);
+            println!(
+                "free {free} B, reserve floor {floor} B -> need {} B",
+                p.need
+            );
             for e in &p.plan {
-                println!("  EVICT sha256:{} {} B (last used {})", e.snapshot, e.bytes, e.last_used);
+                println!(
+                    "  EVICT sha256:{} {} B (last used {})",
+                    e.snapshot, e.bytes, e.last_used
+                );
             }
             for (snap, why) in &p.protected {
                 println!("  KEEP  sha256:{} — {why}", snap);
@@ -341,7 +381,10 @@ pub fn cmd_arms(root: &Path) -> ExitCode {
     // 4. an address prefix outside the sweep set: unreachable AND uncollectable
     let alien = s.root().join("objects/blake3/aa/bb");
     let _ = std::fs::create_dir_all(&alien);
-    let _ = std::fs::write(alien.join("f".repeat(64)), b"an address this sweep cannot reach");
+    let _ = std::fs::write(
+        alien.join("f".repeat(64)),
+        b"an address this sweep cannot reach",
+    );
     arm(
         "an unswept address prefix",
         Code::SWEEP_SET_INCOMPLETE,

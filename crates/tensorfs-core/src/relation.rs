@@ -167,7 +167,7 @@ impl Dim {
             }
         };
         let exact = |n: u64, by: u64| -> Result<u64> {
-            if n % by != 0 {
+            if !n.is_multiple_of(by) {
                 return refuse(
                     Code::DIVISION_REMAINDER,
                     format!("{n} is not divisible by {by}"),

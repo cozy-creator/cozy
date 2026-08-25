@@ -286,7 +286,7 @@ pub fn guard_block_granular(what: &str, unit_elements: u64, block_elements: u64)
     if block_elements <= 1 {
         return Ok(());
     }
-    if unit_elements == 0 || unit_elements % block_elements != 0 {
+    if unit_elements == 0 || !unit_elements.is_multiple_of(block_elements) {
         return refuse(
             Code::PERMUTE_NOT_BLOCK_GRANULAR,
             format!(

@@ -222,7 +222,11 @@ impl Plan {
     pub fn inherited(&self) -> usize {
         self.ops
             .iter()
-            .filter(|o| o.roles.iter().all(|r| matches!(r.bytes, Bytes::Inherit { .. })))
+            .filter(|o| {
+                o.roles
+                    .iter()
+                    .all(|r| matches!(r.bytes, Bytes::Inherit { .. }))
+            })
             .count()
     }
     pub fn declared_bytes(&self) -> Result<u64> {
@@ -341,7 +345,8 @@ pub fn plan(
     if p.ops.is_empty() {
         return refuse(Code::MISSING_TENSOR, "the plan produces no tensor");
     }
-    p.ops.sort_by(|a, b| (&a.component, &a.out_key).cmp(&(&b.component, &b.out_key)));
+    p.ops
+        .sort_by(|a, b| (&a.component, &a.out_key).cmp(&(&b.component, &b.out_key)));
     Ok(p)
 }
 
@@ -425,6 +430,7 @@ pub fn role_map(alias: &str) -> Result<&'static RoleMap> {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn plan_carrier(
     conv: &Converter,
     component: &str,
@@ -451,7 +457,11 @@ fn plan_carrier(
     // one where 361 tensors carry scales and the 362nd does not is a TORN source.
     let component_is_encoded = h.tensors.iter().any(|t| {
         module_of(&t.key)
-            .map(|m| map.companions.iter().any(|(s, _)| h.get(&format!("{m}{s}")).is_some()))
+            .map(|m| {
+                map.companions
+                    .iter()
+                    .any(|(s, _)| h.get(&format!("{m}{s}")).is_some())
+            })
             .unwrap_or(false)
     });
 
@@ -485,7 +495,9 @@ fn plan_carrier(
             Some(m) => map
                 .companions
                 .iter()
-                .filter_map(|(sfx, role)| h.get(&format!("{m}{sfx}")).map(|x| (role.to_string(), x)))
+                .filter_map(|(sfx, role)| {
+                    h.get(&format!("{m}{sfx}")).map(|x| (role.to_string(), x))
+                })
                 .collect(),
         };
         // A sibling the target has no role for is an encoding fact on the wrong side of the
@@ -604,12 +616,13 @@ fn plan_carrier(
             None => {
                 return refuse(
                     Code::ROLE_SET_MISMATCH,
-                    format!("{use_alias}: the reviewed map names data role {data:?}, absent from the spec"),
+                    format!(
+                    "{use_alias}: the reviewed map names data role {data:?}, absent from the spec"
+                ),
                 )
             }
         };
-        let logical_dtype = match &use_spec.roles[data_pos].1.carrier
-        {
+        let logical_dtype = match &use_spec.roles[data_pos].1.carrier {
             crate::relation::Carrier::SameAsLogical => t.dtype,
             crate::relation::Carrier::Set(_) => match base_float(h) {
                 Some(d) => d,
@@ -900,7 +913,7 @@ pub fn h3_geometry(
             )
         }
     };
-    if head_dim == 0 || rows % (3 * head_dim) != 0 {
+    if head_dim == 0 || !rows.is_multiple_of(3 * head_dim) {
         return refuse(
             Code::DIVISION_REMAINDER,
             format!("{fused_key}: {rows} rows do not divide into 3 x {head_dim}"),

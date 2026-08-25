@@ -1,58 +1,94 @@
-//! tensorfs-py — the marshal boundary (tensorfs.md §10). The compiled half owns every
-//! byte-level fact; Python owns none. Deliberately tiny: tfs-007 owns the full facade.
+//! tensorfs-py — the marshal boundary (tensorfs.md §10, tfs-007).
+//!
+//! The compiled half owns every byte-level fact: hashing, canonical bytes, geometry,
+//! verification, leases and the reader pool. Python owns typing and ergonomics and nothing
+//! else, which `scripts/fence.py` enforces rather than merely asking for.
+//!
+//! Torch stays OUTSIDE this boundary. Nothing here imports it, links it or knows it exists:
+//! a consumer gets a filled buffer plus dtype/shape/geometry as plain data and calls
+//! `torch.frombuffer` itself. The dtype table crosses exactly once, from `dtypes()`.
 
-use pyo3::exceptions::PyValueError;
+mod docs;
+mod errors;
+mod store;
+
 use pyo3::prelude::*;
-use pyo3::types::{PyDict, PyList};
-use tensorfs_core::canon::Value;
-use tensorfs_core::err::Refusal;
-use tensorfs_core::header::Header;
-use tensorfs_core::ids::{self, Doc};
+use tensorfs_core::err::{refuse, Code, Result as TResult};
 
-fn refused(e: Refusal) -> PyErr {
-    PyValueError::new_err(format!("{}: {}", e.code.as_str(), e.detail))
+/// The supported platforms, checked against the platform the interpreter reports.
+///
+/// Windows has no `fcntl`, and this store's hold liveness IS an OS fact — an exclusive lock
+/// the kernel drops when the owner dies, SIGKILL included (tfs-006). A Windows build without
+/// that replacement would have to fall back to a wall clock, which is exactly the v1 defect
+/// that stranded roots forever. So the import refuses and names the supported set, rather
+/// than importing into a store whose `Taken | Absent | Deferred` contract it cannot honour.
+///
+/// It is a FUNCTION taking the platform name so the refusal is observable from any platform:
+/// a gate nobody can fire is a gate nobody has checked.
+fn platform_gate(platform: &str) -> TResult<()> {
+    const SUPPORTED: &[&str] = &["linux", "darwin", "freebsd"];
+    if SUPPORTED.contains(&platform) {
+        return Ok(());
+    }
+    refuse(
+        Code::PLATFORM_UNSUPPORTED,
+        format!(
+            "{platform:?} is not supported: hold liveness is an advisory-lock fact the kernel \
+             releases on process death, and the POSIX-lock replacement has not landed. \
+             Supported: {SUPPORTED:?}"
+        ),
+    )
 }
 
-/// Canonical Value -> plain Python data. No Python-side schema knowledge required.
-fn marshal<'p>(py: Python<'p>, v: &Value) -> PyResult<Bound<'p, PyAny>> {
-    Ok(match v {
-        Value::Bool(b) => b.into_pyobject(py)?.to_owned().into_any(),
-        Value::Int(i) => i.into_pyobject(py)?.into_any(),
-        Value::Str(s) => s.into_pyobject(py)?.into_any(),
-        Value::Arr(a) => {
-            let l = PyList::empty(py);
-            for x in a {
-                l.append(marshal(py, x)?)?;
-            }
-            l.into_any()
-        }
-        Value::Obj(m) => {
-            let d = PyDict::new(py);
-            for (k, x) in m {
-                d.set_item(k, marshal(py, x)?)?;
-            }
-            d.into_any()
-        }
-    })
-}
-
-/// `sha256:<hex>` of exactly these bytes — the universal object identity.
-#[pyfunction]
-fn object_id(data: &[u8]) -> String {
-    ids::object_id(data)
-}
-
-/// Validate canonical CozyTensorsHeader bytes; return them as plain Python data.
-#[pyfunction]
-fn parse_header<'p>(py: Python<'p>, data: &[u8]) -> PyResult<Bound<'p, PyAny>> {
-    let h = Header::parse(data).map_err(refused)?;
-    marshal(py, &h.to_value())
+#[pyfunction(name = "platform_gate")]
+fn py_platform_gate(py: Python<'_>, platform: &str) -> PyResult<()> {
+    platform_gate(platform).map_err(|e| errors::to_py(py, &e))
 }
 
 #[pymodule]
 fn _ext(m: &Bound<'_, PyModule>) -> PyResult<()> {
+    let py = m.py();
+    errors::install(m)?;
+
+    // The gate runs at import, against the real platform, through the same function the
+    // arm calls.
+    let plat: String = py
+        .import("sys")?
+        .getattr("platform")?
+        .extract()
+        .unwrap_or_else(|_| "unknown".to_string());
+    let plat = plat
+        .trim_end_matches(|c: char| c.is_ascii_digit())
+        .to_string();
+    platform_gate(&plat).map_err(|e| errors::to_py(py, &e))?;
+
     m.add("__version__", env!("CARGO_PKG_VERSION"))?;
-    m.add_function(wrap_pyfunction!(object_id, m)?)?;
-    m.add_function(wrap_pyfunction!(parse_header, m)?)?;
+    m.add("ERA", tensorfs_core::store::ERA)?;
+    m.add_function(wrap_pyfunction!(py_platform_gate, m)?)?;
+
+    m.add_function(wrap_pyfunction!(docs::object_id, m)?)?;
+    m.add_function(wrap_pyfunction!(docs::parse_header, m)?)?;
+    m.add_function(wrap_pyfunction!(docs::parse_manifest, m)?)?;
+    m.add_function(wrap_pyfunction!(docs::topology_digest, m)?)?;
+    m.add_function(wrap_pyfunction!(docs::run_doc, m)?)?;
+    m.add_function(wrap_pyfunction!(docs::receipt_binds, m)?)?;
+    m.add_function(wrap_pyfunction!(docs::doc_kinds, m)?)?;
+    m.add_function(wrap_pyfunction!(docs::platform_digests, m)?)?;
+    m.add_function(wrap_pyfunction!(docs::seed_digests, m)?)?;
+    m.add_function(wrap_pyfunction!(docs::dtypes, m)?)?;
+    m.add_function(wrap_pyfunction!(docs::render, m)?)?;
+    m.add_function(wrap_pyfunction!(docs::recanonicalize, m)?)?;
+    m.add_class::<docs::PyClosure>()?;
+
+    m.add_function(wrap_pyfunction!(store::plan, m)?)?;
+    m.add_function(wrap_pyfunction!(store::plan_in_key_order, m)?)?;
+    m.add_function(wrap_pyfunction!(store::ingest_open_root, m)?)?;
+    m.add_function(wrap_pyfunction!(store::ingest_read_root, m)?)?;
+    m.add_function(wrap_pyfunction!(store::ingest_reap, m)?)?;
+    m.add_function(wrap_pyfunction!(store::ingest_installed, m)?)?;
+    m.add_class::<store::PyStore>()?;
+    m.add_class::<store::PyLease>()?;
+    m.add_class::<store::PyPlan>()?;
+    m.add_class::<store::PyBatch>()?;
     Ok(())
 }

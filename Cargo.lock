@@ -158,19 +158,11 @@ name = "tensorfs-core"
 version = "0.0.1"
 
 [[package]]
-name = "tensorfs-layout"
-version = "0.0.1"
-dependencies = [
- "tensorfs-core",
-]
-
-[[package]]
 name = "tensorfs-py"
 version = "0.0.1"
 dependencies = [
  "pyo3",
  "tensorfs-core",
- "tensorfs-layout",
 ]
 
 [[package]]

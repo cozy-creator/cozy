@@ -81,7 +81,10 @@ fn sources(f: &Flags) -> Result<Vec<(String, PathBuf)>, ExitCode> {
 /// actually admits, and the ones it does not admit are not part of this identity.
 fn source_digest(h: &SourceHeader, raw_header: &[u8]) -> String {
     tensorfs_core::ids::object_id(&canon::write(&Value::obj(vec![
-        ("carrier_header_sha256", Value::str(tensorfs_core::sha256::hex_digest(raw_header))),
+        (
+            "carrier_header_sha256",
+            Value::str(tensorfs_core::sha256::hex_digest(raw_header)),
+        ),
         ("data_start", Value::uint(h.data_start)),
         ("file_len", Value::uint(h.file_len)),
         ("tensors", Value::uint(h.tensors.len() as u64)),
@@ -115,10 +118,11 @@ fn read_carrier(p: &Path) -> tensorfs_core::err::Result<(SourceHeader, Vec<u8>)>
         detail: format!("reopen {}: {e}", p.display()),
     })?;
     let mut raw = vec![0u8; h.header_bytes as usize + 8];
-    f.read_exact(&mut raw).map_err(|e| tensorfs_core::err::Refusal {
-        code: tensorfs_core::err::Code::IO_FAILED,
-        detail: format!("reread header of {}: {e}", p.display()),
-    })?;
+    f.read_exact(&mut raw)
+        .map_err(|e| tensorfs_core::err::Refusal {
+            code: tensorfs_core::err::Code::IO_FAILED,
+            detail: format!("reread header of {}: {e}", p.display()),
+        })?;
     Ok((h, raw))
 }
 
@@ -236,10 +240,7 @@ pub fn cmd_inspect(f: &Flags) -> ExitCode {
         let stamps = ok!(fingerprint::evidence_stamps(&h));
         println!(
             "  carrier      {} B header, data at {}, {} B file, {} B unclaimed",
-            h.header_bytes,
-            h.data_start,
-            h.file_len,
-            h.gap_bytes
+            h.header_bytes, h.data_start, h.file_len, h.gap_bytes
         );
         println!(
             "  keys         {} logical + {} role + {} marker = {}",
@@ -291,7 +292,13 @@ pub fn cmd_inspect(f: &Flags) -> ExitCode {
 
 /// Bank a reviewed registry entry. This is the REVIEW ACT, performed by a platform operator
 /// against bytes they have in hand — never by an uploader and never from a filename.
-pub fn cmd_bank(dialect: &str, family: &str, variant: &str, converter: &str, f: &Flags) -> ExitCode {
+pub fn cmd_bank(
+    dialect: &str,
+    family: &str,
+    variant: &str,
+    converter: &str,
+    f: &Flags,
+) -> ExitCode {
     let srcs = match sources(f) {
         Ok(s) => s,
         Err(c) => return c,
@@ -324,7 +331,9 @@ pub fn cmd_bank(dialect: &str, family: &str, variant: &str, converter: &str, f: 
             logical_keys: fp.logical_keys as u64,
             provenance: Provenance {
                 kind: REAL.to_string(),
-                source: flag(f, "source-name").unwrap_or("local carrier").to_string(),
+                source: flag(f, "source-name")
+                    .unwrap_or("local carrier")
+                    .to_string(),
                 source_sha256: Some(sd.trim_start_matches("sha256:").to_string()),
                 note: format!(
                     "banked from a real carrier: {} logical keys, {} role keys, {} markers; \
@@ -334,7 +343,10 @@ pub fn cmd_bank(dialect: &str, family: &str, variant: &str, converter: &str, f: 
                 ),
             },
         });
-        println!("banked {component}  {}  {}", fp.keyset_digest, fp.topology_digest);
+        println!(
+            "banked {component}  {}  {}",
+            fp.keyset_digest, fp.topology_digest
+        );
     }
     if let Some(dir) = p.parent() {
         let _ = fs::create_dir_all(dir);
@@ -372,7 +384,8 @@ fn prepare(f: &Flags, target: &str) -> Result<Prepared, ExitCode> {
     let seeds = specs_for(&target, f)?;
     let specs = plain_specs(&seeds);
 
-    let (mut files, mut raws, mut verdicts, mut fps) = (Vec::new(), Vec::new(), Vec::new(), Vec::new());
+    let (mut files, mut raws, mut verdicts, mut fps) =
+        (Vec::new(), Vec::new(), Vec::new(), Vec::new());
     for (component, path) in &srcs {
         let (h, raw) = match read_carrier(path) {
             Ok(v) => v,
@@ -508,7 +521,10 @@ fn isolation(argv: &[String], f: &Flags) -> (Command, i64, String) {
     let me = std::env::current_exe()
         .map(|p| p.display().to_string())
         .unwrap_or_else(|_| "tfs".to_string());
-    let quoted: Vec<String> = argv.iter().map(|a| format!("'{}'", a.replace('\'', "'\\''"))).collect();
+    let quoted: Vec<String> = argv
+        .iter()
+        .map(|a| format!("'{}'", a.replace('\'', "'\\''")))
+        .collect();
     let as_kb: u64 = flag_num(f, "rlimit-as-mb", 2048) * 1024;
     let cpu_s: u64 = flag_num(f, "rlimit-cpu-s", 3600);
     let fsz_kb: u64 = flag_num(f, "rlimit-fsize-mb", 65536) * 1024;
@@ -529,14 +545,20 @@ fn isolation(argv: &[String], f: &Flags) -> (Command, i64, String) {
     if netns {
         let mut c = Command::new("unshare");
         c.args(["-rn", "/bin/sh", "-c", &inner]);
-        (c, 2, format!("netns + rlimits (as {as_kb} KiB, cpu {cpu_s} s)"))
+        (
+            c,
+            2,
+            format!("netns + rlimits (as {as_kb} KiB, cpu {cpu_s} s)"),
+        )
     } else {
         let mut c = Command::new("/bin/sh");
         c.args(["-c", &inner]);
         (
             c,
             1,
-            format!("separate process + rlimits (as {as_kb} KiB, cpu {cpu_s} s); no netns on this host"),
+            format!(
+                "separate process + rlimits (as {as_kb} KiB, cpu {cpu_s} s); no netns on this host"
+            ),
         )
     }
 }
@@ -557,7 +579,10 @@ fn session_of(f: &Flags, p: &Prepared) -> String {
                     .collect(),
             ),
         ),
-        ("topology", Value::str(topology_digest_of(&plan_topology(&p.plan)))),
+        (
+            "topology",
+            Value::str(topology_digest_of(&plan_topology(&p.plan))),
+        ),
     ]);
     tensorfs_core::ids::object_id(&canon::write(&v))
         .trim_start_matches("sha256:")
@@ -588,7 +613,10 @@ pub fn cmd_run(root: &Path, target: &str, f: &Flags) -> ExitCode {
         session.clone(),
     ];
     for (k, v) in f.iter() {
-        if matches!(k.as_str(), "source" | "config" | "registry" | "spec-variant" | "tenant" | "ttl") {
+        if matches!(
+            k.as_str(),
+            "source" | "config" | "registry" | "spec-variant" | "tenant" | "ttl"
+        ) {
             argv.push(format!("--{k}"));
             argv.push(v.clone());
         }
@@ -685,7 +713,13 @@ pub fn cmd_worker(root: &Path, target: &str, f: &Flags) -> ExitCode {
             ok!(ck::put_doc(&store, v));
         }
     }
-    let out = ok!(tx::execute(&store, &p.plan, &p.files, &plain_specs(&p.seeds), &configs));
+    let out = ok!(tx::execute(
+        &store,
+        &p.plan,
+        &p.files,
+        &plain_specs(&p.seeds),
+        &configs
+    ));
     let got = out.header.topology_digest();
     if got != predicted {
         eprintln!(
@@ -756,7 +790,10 @@ pub fn cmd_worker(root: &Path, target: &str, f: &Flags) -> ExitCode {
     obs.push(("golden_cases".to_string(), golden as i64));
     obs.push((
         "isolation_tier".to_string(),
-        std::env::var("TFS_ISOLATION_TIER").ok().and_then(|v| v.parse().ok()).unwrap_or(1),
+        std::env::var("TFS_ISOLATION_TIER")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(1),
     ));
     obs.push(("peak_rss_kb".to_string(), rss_kb("VmHWM") as i64));
     obs.push(("elapsed_ms".to_string(), t0.elapsed().as_millis() as i64));
@@ -823,7 +860,9 @@ pub fn cmd_worker(root: &Path, target: &str, f: &Flags) -> ExitCode {
 fn golden_bytes(seed: &str, n: u64) -> Vec<u8> {
     use std::io::Read;
     let mut v = vec![0u8; n as usize];
-    crate::ckpt::Noise::new(seed, n).read_exact(&mut v).expect("keyed stream");
+    crate::ckpt::Noise::new(seed, n)
+        .read_exact(&mut v)
+        .expect("keyed stream");
     v
 }
 
@@ -838,7 +877,10 @@ fn golden_suite(c: &Converter) -> tensorfs_core::err::Result<usize> {
         if !x.reassembles(&src)? {
             return tensorfs_core::err::refuse(
                 tensorfs_core::err::Code::GOLDEN_MISMATCH,
-                format!("{}: golden case {name} does not reassemble its own input", c.name),
+                format!(
+                    "{}: golden case {name} does not reassemble its own input",
+                    c.name
+                ),
             );
         }
         n += 1;
@@ -891,7 +933,13 @@ pub fn cmd_reingest(root: &Path, header_hex: &str, target: &str, f: &Flags) -> E
         })
         .collect();
     let conv = ok!(convert::converter("cozytensors.inherit/1"));
-    let plan = ok!(convert::plan(conv, &views, &target, &plain_specs(&seeds), &rekey));
+    let plan = ok!(convert::plan(
+        conv,
+        &views,
+        &target,
+        &plain_specs(&seeds),
+        &rekey
+    ));
     drop(views);
 
     println!("converter    {} ({})", plan.converter, plan.class_name);
@@ -980,7 +1028,9 @@ pub fn cmd_install(root: &Path, session: &str) -> ExitCode {
     let subject = ok!(IngestSubject::parse(&sb));
     let snap = ok!(ck::load_manifest(&store, &receipt.snapshot));
     let header = ok!(ck::load_header(&store, &receipt.header));
-    let id = ok!(tx::install(&store, session, &receipt, &subject, &snap, &header));
+    let id = ok!(tx::install(
+        &store, session, &receipt, &subject, &snap, &header
+    ));
     println!("installed    {id}");
     println!("             from receipt {}", receipt.object_ref().id());
     ExitCode::SUCCESS
@@ -1036,7 +1086,12 @@ pub fn cmd_golden() -> ExitCode {
             match x.reassembles(&src) {
                 Ok(true) => {
                     pass += 1;
-                    println!("  ok   {:<50} {} B -> {} B", name, x.in_bytes(), x.out_bytes());
+                    println!(
+                        "  ok   {:<50} {} B -> {} B",
+                        name,
+                        x.in_bytes(),
+                        x.out_bytes()
+                    );
                 }
                 Ok(false) => println!("  FAIL {name}: does not reassemble its own input"),
                 Err(e) => println!("  FAIL {name}: {}", e.code.as_str()),
@@ -1101,7 +1156,11 @@ pub fn cmd_converters() -> ExitCode {
         );
         println!("  {}", c.doc);
         for (name, x) in convert::golden_cases(c) {
-            println!("  golden {name:<34} {} B in, {} B out", x.in_bytes(), x.out_bytes());
+            println!(
+                "  golden {name:<34} {} B in, {} B out",
+                x.in_bytes(),
+                x.out_bytes()
+            );
         }
     }
     let _ = (Dtype::U8, Class::Identity);

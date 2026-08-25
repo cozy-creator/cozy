@@ -110,7 +110,12 @@ fn item(
 
 /// SDXL-shaped: three components, four encodings, parts on both sides of the inline
 /// threshold, one part over the 64 MiB grid, one rank-0 scalar, one byte-identical pair.
-fn plan(blocks: u64) -> Vec<Item> {
+/// `scale` divides every dimension (floor 2), so the same SHAPE of corpus can be written
+/// at a size a repository can carry: the committed wheel-smoke store is this plan at
+/// scale 32, ~40 KB, and it exercises the same encodings, the same inline/segment split
+/// and the same path law as the full one.
+fn plan(blocks: u64, scale: u64) -> Vec<Item> {
+    let d = |dims: Vec<u64>| -> Vec<u64> { dims.iter().map(|x| (x / scale).max(2)).collect() };
     let mut v = Vec::new();
     for i in 0..blocks {
         let k = |s: &str| format!("blocks.{i}.{s}");
@@ -119,35 +124,35 @@ fn plan(blocks: u64) -> Vec<Item> {
             k("attn1.to_q.weight"),
             "fp8-rowwise/1",
             Dtype::Bf16,
-            vec![2048, 2048],
+            d(vec![2048, 2048]),
         ));
         v.push(item(
             "unet",
             k("attn1.to_out.0.weight"),
             "plain/1",
             Dtype::Bf16,
-            vec![2048, 2048],
+            d(vec![2048, 2048]),
         ));
         v.push(item(
             "unet",
             k("ff.net.0.proj.weight"),
             "nvfp4-w4a4/1",
             Dtype::Bf16,
-            vec![2048, 8192],
+            d(vec![2048, 8192]),
         ));
         v.push(item(
             "unet",
             k("norm1.weight"),
             "plain/1",
             Dtype::Bf16,
-            vec![2048],
+            d(vec![2048]),
         ));
         v.push(item(
             "unet",
             k("attn1.norm_q.weight"),
             "plain/1",
             Dtype::Bf16,
-            vec![64],
+            d(vec![64]),
         ));
     }
     v.push(item(
@@ -155,28 +160,28 @@ fn plan(blocks: u64) -> Vec<Item> {
         "embeddings.weight".into(),
         "plain/1",
         Dtype::Bf16,
-        vec![8192, 8192],
+        d(vec![8192, 8192]),
     ));
     v.push(item(
         "text_encoder",
         "final_norm.weight".into(),
         "plain/1",
         Dtype::F32,
-        vec![1024],
+        d(vec![1024]),
     ));
     v.push(item(
         "vae",
         "decoder.conv_in.weight".into(),
         "plain/1",
         Dtype::F32,
-        vec![512, 512],
+        d(vec![512, 512]),
     ));
     let mut twin = item(
         "vae",
         "decoder.conv_out.weight".into(),
         "plain/1",
         Dtype::F32,
-        vec![512, 512],
+        d(vec![512, 512]),
     );
     twin.seed = Some("vae/decoder.conv_in.weight".to_string());
     v.push(twin);
@@ -222,8 +227,9 @@ fn configs() -> Vec<(&'static str, &'static [u8])> {
 
 pub fn cmd_write(root: &Path, f: &Flags) -> ExitCode {
     let blocks: u64 = flag_num(f, "blocks", 12);
+    let scale: u64 = flag_num::<u64>(f, "scale", 1).max(1);
     let store = ok!(Store::init(root));
-    let items = plan(blocks);
+    let items = plan(blocks, scale);
 
     // The closure first: spec objects and config objects are ordinary CAS objects, and the
     // header commits them BY REFERENCE.
@@ -400,6 +406,7 @@ macro_rules! opened {
 pub fn cmd_read(root: &Path, hex: &str, f: &Flags) -> ExitCode {
     let (store, href) = opened!(root, hex);
     let blocks: u64 = flag_num(f, "blocks", 12);
+    let scale: u64 = flag_num::<u64>(f, "scale", 1).max(1);
 
     let t = Instant::now();
     let header = ok!(ck::load_header(&store, &href));
@@ -410,7 +417,7 @@ pub fn cmd_read(root: &Path, hex: &str, f: &Flags) -> ExitCode {
     let validate_ms = t.elapsed().as_secs_f64() * 1000.0;
 
     // Expected whole-part digests, regenerated from the plan — never read from the store.
-    let items = plan(blocks);
+    let items = plan(blocks, scale);
     let mut expect: Vec<(String, String)> = Vec::new();
     for it in &items {
         let spec = spec_of(it.alias);

@@ -39,7 +39,7 @@ def fence_dependencies():
 
 # ---------------------------------------------------------------- 2. no upward imports
 
-RANK = {"tensorfs-core": 0, "tensorfs-layout": 1, "tensorfs-py": 2}
+RANK = {"tensorfs-core": 0, "tensorfs-py": 1}
 
 
 def fence_layering():

@@ -28,7 +28,7 @@ pub fn encode(data: &[u8]) -> String {
 /// Strict decode: padded, no whitespace, canonical (re-encode must reproduce the input).
 pub fn decode(s: &str) -> Result<Vec<u8>> {
     let b = s.as_bytes();
-    if b.len() % 4 != 0 {
+    if !b.len().is_multiple_of(4) {
         return refuse(
             Code::BAD_BASE64,
             format!("length {} not a multiple of 4", b.len()),

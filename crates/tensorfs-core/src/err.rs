@@ -11,6 +11,10 @@ macro_rules! codes {
             pub fn as_str(self) -> &'static str {
                 match self { $(Code::$v => stringify!($v)),* }
             }
+            /// Every code, in declaration order. The binding layer builds one Python
+            /// exception class per entry from THIS list, so the two languages cannot
+            /// drift: a code added here appears in Python without anyone editing Python.
+            pub const ALL: &'static [Code] = &[$(Code::$v),*];
         }
     };
 }
@@ -120,6 +124,8 @@ codes![
     LEASE_REVOKED,
     TRAVERSAL_INCOMPLETE,
     PERMUTE_NOT_BLOCK_GRANULAR,
+    SLOT_STARVED,
+    PLATFORM_UNSUPPORTED,
     PROJECTION_WEIGHT_PATH,
     BLOB_NOT_RETAINED,
     // roots, holds and GC (tfs-006)

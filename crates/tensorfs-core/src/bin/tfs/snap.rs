@@ -10,8 +10,8 @@ use std::process::ExitCode;
 use std::time::Instant;
 
 use tensorfs_core::checkpoint as ck;
-use tensorfs_core::ids::{Doc, ObjectRef};
 use tensorfs_core::err::Result as TfsResult;
+use tensorfs_core::ids::{Doc, ObjectRef};
 use tensorfs_core::manifest::{BlobDescriptor, Draft, Entry, SnapshotManifest};
 use tensorfs_core::sha256;
 use tensorfs_core::store::Store;
@@ -490,7 +490,7 @@ fn reheader(snap: &SnapshotManifest, href: &ObjectRef) -> TfsResult<SnapshotMani
     let mut m = Draft::of(snap);
     let old = m.header.clone();
     for (_, e) in m.entries.iter_mut() {
-        if matches!(e, Entry::File(o) if Some(&*o) == old.as_ref().map(|x| &*x)) {
+        if matches!(e, Entry::File(o) if Some(&*o) == old.as_ref()) {
             *e = Entry::File(href.clone());
         }
     }
@@ -626,28 +626,29 @@ pub fn cmd_arms(root: &Path, hex: &str) -> ExitCode {
     let header = ok!(ck::load_header(&store, snap.header().unwrap()));
     let mut red = 0usize;
 
-    let mut arm = |what: &str, d: Draft, walk_it: bool| {
-        match d.seal() {
-            Err(e) => {
-                red += 1;
-                println!("  RED  {what:<44} seal refused {}", e.code.as_str());
+    let mut arm = |what: &str, d: Draft, walk_it: bool| match d.seal() {
+        Err(e) => {
+            red += 1;
+            println!("  RED  {what:<44} seal refused {}", e.code.as_str());
+        }
+        Ok(m) => {
+            if !walk_it {
+                println!(
+                    "  ??   {what:<44} SEALED as {} — arm did not fire",
+                    m.snapshot_id()
+                );
+                return;
             }
-            Ok(m) => {
-                if !walk_it {
-                    println!("  ??   {what:<44} SEALED as {} — arm did not fire", m.snapshot_id());
-                    return;
+            match ck::walk(&store, &m) {
+                Err(e) => {
+                    red += 1;
+                    println!("  RED  {what:<44} walk refused {}", e.code.as_str());
                 }
-                match ck::walk(&store, &m) {
-                    Err(e) => {
-                        red += 1;
-                        println!("  RED  {what:<44} walk refused {}", e.code.as_str());
-                    }
-                    Ok(w) => println!(
-                        "  ??   {what:<44} walked {} objects, {} siblings — arm did not fire",
-                        w.objects.len(),
-                        w.siblings.len()
-                    ),
-                }
+                Ok(w) => println!(
+                    "  ??   {what:<44} walked {} objects, {} siblings — arm did not fire",
+                    w.objects.len(),
+                    w.siblings.len()
+                ),
             }
         }
     };

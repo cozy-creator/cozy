@@ -154,7 +154,9 @@ pub fn reap(store_root: &Path, now: u64) -> Result<(Vec<String>, Vec<String>)> {
         let expired = match fs::read(e.path().join("root.json")) {
             // An unparsable or headless root directory is debris by construction: nothing
             // can install from it, so it reaps rather than living forever.
-            Ok(b) => IngestRoot::parse(&b).map(|r| r.expires_at <= now).unwrap_or(true),
+            Ok(b) => IngestRoot::parse(&b)
+                .map(|r| r.expires_at <= now)
+                .unwrap_or(true),
             Err(_) => true,
         };
         if expired {
@@ -446,10 +448,16 @@ pub fn execute(
         ("parts".to_string(), parts as i64),
         ("segments".to_string(), segments as i64),
         ("inline_parts".to_string(), inlines as i64),
-        ("markers_dropped".to_string(), plan.dropped_markers.len() as i64),
+        (
+            "markers_dropped".to_string(),
+            plan.dropped_markers.len() as i64,
+        ),
         ("roles_folded".to_string(), plan.folded_roles.len() as i64),
         ("carrier_header_bytes".to_string(), plan.header_bytes as i64),
-        ("convert_elapsed_ms".to_string(), t0.elapsed().as_millis() as i64),
+        (
+            "convert_elapsed_ms".to_string(),
+            t0.elapsed().as_millis() as i64,
+        ),
     ];
 
     Ok(Outcome {

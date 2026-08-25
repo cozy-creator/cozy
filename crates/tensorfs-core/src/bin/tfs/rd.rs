@@ -49,7 +49,10 @@ fn load(root: &Path, hex: &str) -> Result<(Store, SnapshotManifest, Header), Ref
 /// runtime supplies the true one and TensorFS guarantees only that it uses what it is given.
 /// It is here because the difference from key order is the whole point of the contract.
 fn module_order(h: &Header) -> Vec<(String, String)> {
-    let mut v: Vec<(String, String)> = h.tensors().map(|(c, k, _)| (c.clone(), k.clone())).collect();
+    let mut v: Vec<(String, String)> = h
+        .tensors()
+        .map(|(c, k, _)| (c.clone(), k.clone()))
+        .collect();
     let comp_index = |c: &String| h.components.iter().position(|(n, _)| n == c).unwrap_or(0);
     v.sort_by(|a, b| {
         comp_index(&a.0)
@@ -91,7 +94,11 @@ pub fn cmd_lease(root: &Path, hex: &str, f: &Flags) -> ExitCode {
         if let Some(p) = flag(f, "ready") {
             let _ = std::fs::write(p, format!("{}\n", lease.hold_id()));
         }
-        println!("HOLDING {} for {secs}s pid={}", lease.hold_id(), std::process::id());
+        println!(
+            "HOLDING {} for {secs}s pid={}",
+            lease.hold_id(),
+            std::process::id()
+        );
         std::thread::sleep(std::time::Duration::from_secs(secs));
     }
     if flag_on(f, "drop-unreleased") {
@@ -176,7 +183,11 @@ pub fn cmd_plan(root: &Path, hex: &str, f: &Flags) -> ExitCode {
     };
     println!(
         "contract:   plan follows the caller's traversal exactly: {} ({} spans)",
-        if got == expect { "YES" } else { "NO — DEFECT" },
+        if got == expect {
+            "YES"
+        } else {
+            "NO — DEFECT"
+        },
         got.len()
     );
     let differs = dest
@@ -219,7 +230,8 @@ pub fn cmd_fill(root: &Path, hex: &str, f: &Flags) -> ExitCode {
             hex,
             s.generation(),
             "O_DIRECT requested; the v1 buffered baselines are unbeaten and the page cache is \
-             what makes warm reloads nearly free — served buffered".to_string(),
+             what makes warm reloads nearly free — served buffered"
+                .to_string(),
         ));
     }
     rx.print();
@@ -255,7 +267,10 @@ pub fn cmd_fill(root: &Path, hex: &str, f: &Flags) -> ExitCode {
     ok!(lease.release(&meta));
 
     println!("order:      {}", plan.order.as_str());
-    println!("workers:    {workers}   window {} B   ring {ring} B", flag_num::<u64>(f, "window", 16 << 20));
+    println!(
+        "workers:    {workers}   window {} B   ring {ring} B",
+        flag_num::<u64>(f, "window", 16 << 20)
+    );
     println!("batches:    {}", batches.len());
     println!("filled:     {items} items, {bytes} B ({io} B disk leg) in {ms} ms");
     println!(
@@ -269,6 +284,73 @@ pub fn cmd_fill(root: &Path, hex: &str, f: &Flags) -> ExitCode {
         println!("fill sha256:{digest}");
     }
     ExitCode::SUCCESS
+}
+
+/// `tfs read stream` — the SAME plan through the continuous slot ring (`read::pump`).
+/// This exists so the ring can be measured against `read fill`'s per-batch `execute` on the
+/// same bytes in the same minutes, and so the Python facade's number has a Rust arm running
+/// the identical mechanism rather than a differently-shaped one.
+pub fn cmd_stream(root: &Path, hex: &str, f: &Flags) -> ExitCode {
+    let (s, m, h) = ok!(load(root, hex));
+    let meta = ok!(Meta::open(&s));
+    let plan = ok!(plan_of(&h, f));
+    let workers: usize = flag_num(f, "workers", 4);
+    let nslots: usize = flag_num(f, "slots", 4);
+    let slot_bytes: usize = flag_num(f, "slot-bytes", 16 << 20);
+    let (lease, rx) = ok!(read::acquire_snapshot(&s, &meta, &m));
+    rx.print();
+
+    let mut owned: Vec<Vec<u8>> = (0..nslots).map(|_| vec![0u8; slot_bytes]).collect();
+    let slots: Vec<&mut [u8]> = owned.iter_mut().map(|v| &mut v[..]).collect();
+    let digest_it = !flag_on(f, "no-digest");
+    let mut hasher = Sha256::new();
+    let mut batches = 0usize;
+    let mut hash_ms = 0u128;
+    let t0 = Instant::now();
+    let r = read::pump(&s, &lease, &plan, slots, workers, |fl, slot| {
+        batches += 1;
+        if digest_it {
+            // The consumer reads its slot BEFORE releasing it: an explicit release is what
+            // keeps these bytes valid across an asynchronous consumer.
+            let t1 = Instant::now();
+            hasher.update(fl.bytes);
+            hash_ms += t1.elapsed().as_millis();
+        }
+        slot.release();
+        Ok(())
+    });
+    let wall = t0.elapsed().as_millis();
+    let ms = wall.saturating_sub(hash_ms);
+    match r {
+        Ok(st) => {
+            ok!(lease.release(&meta));
+            println!("order:      {}", plan.order.as_str());
+            println!(
+                "ring:       {nslots} slots x {slot_bytes} B, {workers} readers, {batches} batches"
+            );
+            println!(
+                "filled:     {} items, {} B ({} B disk leg) in {ms} ms",
+                st.items, st.bytes, st.io_bytes
+            );
+            println!(
+                "throughput: {:.3} GB/s ({:.0} MiB/s) over the disk leg",
+                st.io_bytes as f64 / 1e9 / (ms as f64 / 1000.0),
+                st.io_bytes as f64 / 1048576.0 / (ms as f64 / 1000.0)
+            );
+            println!("peak buf:   {} B (caller-owned ring)", nslots * slot_bytes);
+            if digest_it {
+                println!(
+                    "digest:     {hash_ms} ms OUTSIDE the read clock (our sha256, not the read)"
+                );
+                println!("fill sha256:{}", sha256::hex(&hasher.finish()));
+            }
+            ExitCode::SUCCESS
+        }
+        Err(e) => {
+            let _ = lease.release(&meta);
+            bail(e)
+        }
+    }
 }
 
 /// The independent check: the same bytes, in the same order, reconstructed through the
@@ -314,13 +396,7 @@ pub fn cmd_verify_fill(root: &Path, hex: &str, f: &Flags) -> ExitCode {
 
 // ---------------------------------------------------------------- span
 
-pub fn cmd_span(
-    root: &Path,
-    hex: &str,
-    ck: [&str; 3],
-    off: u64,
-    len: u64,
-) -> ExitCode {
+pub fn cmd_span(root: &Path, hex: &str, ck: [&str; 3], off: u64, len: u64) -> ExitCode {
     let (s, m, h) = ok!(load(root, hex));
     let meta = ok!(Meta::open(&s));
     let t = h
@@ -411,7 +487,11 @@ pub fn cmd_render(root: &Path, hex: &str) -> ExitCode {
     let pretty = ok!(project::render(&bytes, 1 << 26));
     println!("{pretty}");
     println!("--- projection only ---");
-    println!("canonical:  sha256:{} ({} B)", sha256::hex_digest(&bytes), bytes.len());
+    println!(
+        "canonical:  sha256:{} ({} B)",
+        sha256::hex_digest(&bytes),
+        bytes.len()
+    );
     println!(
         "pretty:     sha256:{} ({} B) — a different object, and no decoder admits it",
         sha256::hex_digest(pretty.as_bytes()),
@@ -466,14 +546,19 @@ pub fn cmd_transform() -> ExitCode {
             d.class.as_str()
         );
         if d.class == Class::Gather {
-            println!("     gather-class: planned as real work (v1 measured 0.12 GiB/s), never free");
+            println!(
+                "     gather-class: planned as real work (v1 measured 0.12 GiB/s), never free"
+            );
         }
     }
     println!("\nblock-granularity boundary rule:");
     for (unit, block) in [(32u64, 32u64), (64, 32), (16, 32)] {
         match guard_block_granular("permute", unit, block) {
             Ok(()) => println!("  unit {unit:3} el over {block}-el blocks: fill-applicable"),
-            Err(e) => println!("  unit {unit:3} el over {block}-el blocks: REFUSED {}", e.code.as_str()),
+            Err(e) => println!(
+                "  unit {unit:3} el over {block}-el blocks: REFUSED {}",
+                e.code.as_str()
+            ),
         }
     }
     ExitCode::SUCCESS
@@ -524,16 +609,26 @@ pub fn cmd_prove(root: &Path, hex: &str, f: &Flags) -> ExitCode {
             bytes += o.length;
             if got != o.sha256 {
                 bad += 1;
-                println!("  MISMATCH {what}: delivered sha256:{got}, header declares {}", o.id());
+                println!(
+                    "  MISMATCH {what}: delivered sha256:{got}, header declares {}",
+                    o.id()
+                );
             }
         }
     }
     ok!(lease.release(&meta));
-    println!("sampled:    {checked} of {} parts (every {step}th)", parts.len());
+    println!(
+        "sampled:    {checked} of {} parts (every {step}th)",
+        parts.len()
+    );
     println!("segments:   {segs}, {bytes} B rehashed from the DELIVERED buffers");
     println!(
         "identity:   {} — reconstructed bytes hash to the digest the header declares",
-        if bad == 0 { "0 mismatches" } else { "MISMATCHES" }
+        if bad == 0 {
+            "0 mismatches"
+        } else {
+            "MISMATCHES"
+        }
     );
     if bad > 0 {
         return ExitCode::FAILURE;
@@ -613,7 +708,11 @@ pub fn cmd_tear(root: &Path, hex: &str) -> ExitCode {
     let _ = std::fs::set_permissions(&path, perms);
     ok!(lease.release(&meta));
 
-    println!("torn object: {} ({} B, truncated by 1)", seg.id(), seg.length);
+    println!(
+        "torn object: {} ({} B, truncated by 1)",
+        seg.id(),
+        seg.length
+    );
     match torn {
         Err(e) if e.code == Code::SHORT_READ => {
             println!("  FIRED  torn read: SHORT_READ — {}", e.detail);
@@ -657,7 +756,10 @@ impl Arms {
             }
             Ok(_) => {
                 self.missed += 1;
-                println!("  MISSED {name}: wanted {}, the call SUCCEEDED", want.as_str());
+                println!(
+                    "  MISSED {name}: wanted {}, the call SUCCEEDED",
+                    want.as_str()
+                );
             }
         }
     }
@@ -666,7 +768,10 @@ impl Arms {
 pub fn cmd_arms(root: &Path, hex: &str) -> ExitCode {
     let (s, m, h) = ok!(load(root, hex));
     let meta = ok!(Meta::open(&s));
-    let mut a = Arms { fired: 0, missed: 0 };
+    let mut a = Arms {
+        fired: 0,
+        missed: 0,
+    };
     let (lease, _) = ok!(read::acquire_snapshot(&s, &meta, &m));
     let first = lease.objects()[0].clone();
 
@@ -786,11 +891,7 @@ pub fn cmd_arms(root: &Path, hex: &str) -> ExitCode {
     }
 
     // 8. a pretty twin is a projection, never a stored document
-    let hb = ok!(checkpoint::read_object(
-        &s,
-        m.header().unwrap(),
-        1 << 26
-    ));
+    let hb = ok!(checkpoint::read_object(&s, m.header().unwrap(), 1 << 26));
     let pretty = ok!(project::render(&hb, 1 << 26));
     a.arm(
         "pretty header decoded as a document",

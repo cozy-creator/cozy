@@ -17,8 +17,10 @@
 //! benchmark-gated upgrades behind this unchanged API, and none of them appears in any
 //! contract — tfs-018's banked baselines are the bar they would have to miss.
 
+use std::collections::BTreeMap;
 use std::os::unix::fs::FileExt;
-use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Condvar, Mutex};
 use std::time::Instant;
 
 use crate::checkpoint;
@@ -401,7 +403,12 @@ impl ReadPlan {
     }
 }
 
-fn build(header: &Header, keys: &[(String, String)], order: Order, window: u64) -> Result<ReadPlan> {
+fn build(
+    header: &Header,
+    keys: &[(String, String)],
+    order: Order,
+    window: u64,
+) -> Result<ReadPlan> {
     let mut items = Vec::new();
     let mut dest: u64 = 0;
     for (comp, key) in keys {
@@ -416,7 +423,9 @@ fn build(header: &Header, keys: &[(String, String)], order: Order, window: u64) 
             None => {
                 return refuse(
                     Code::TRAVERSAL_INCOMPLETE,
-                    format!("{comp}/{key}: the traversal names a tensor this header does not carry"),
+                    format!(
+                        "{comp}/{key}: the traversal names a tensor this header does not carry"
+                    ),
                 )
             }
         };
@@ -604,7 +613,11 @@ pub fn execute(
                         if v.len() != buf.len() {
                             return refuse(
                                 Code::BYTE_LENGTH_MISMATCH,
-                                format!("inline decodes to {} B for a {} B span", v.len(), buf.len()),
+                                format!(
+                                    "inline decodes to {} B for a {} B span",
+                                    v.len(),
+                                    buf.len()
+                                ),
                             );
                         }
                         buf.copy_from_slice(&v);
@@ -624,6 +637,284 @@ pub fn execute(
     if let Some(e) = errs.into_inner().unwrap().into_iter().next() {
         return Err(e);
     }
+    Ok(Stats {
+        items: plan.items.len(),
+        bytes: plan.bytes,
+        io_bytes: plan.io_bytes,
+        workers,
+        elapsed_ms: t0.elapsed().as_millis(),
+    })
+}
+
+// ---------------------------------------------------------------- the slot ring
+
+/// **The reader pool must not stop at a batch boundary.** tfs-005 measured the cost of one
+/// that does: the same plan through a 64 MiB caller ring reads at 1.24 GB/s and through a
+/// 1 GiB ring at 1.37, because `execute` per batch drains every reader at the batch's last
+/// item and refills from cold. A consumer that streams — a runtime tiling a 5 GiB
+/// checkpoint through a bounded staging ring — pays that drain once per tile.
+///
+/// `pump` removes the boundary without removing the bound. The plan is cut into slot-sized
+/// batches exactly as before, but the slots are a RING with independent lifetimes: a worker
+/// claims (next batch, free slot) as one indivisible act, so claim order is batch order,
+/// and while the consumer holds one filled slot the other workers are already filling the
+/// next ones. Nothing waits for the consumer except the batch the consumer is holding.
+///
+/// The slot's lifetime is the CALLER's, exactly like the lease: `Slot::release` is the only
+/// thing that returns it to the ring. A consumer that never releases does not get a silent
+/// stall — when every slot is outstanding and no reader is in flight, the ring refuses
+/// `SLOT_STARVED` and names the batch it was waiting for. Release is explicit here for the
+/// same reason it is explicit on the lease: the runtime's H2D completion event, not the end
+/// of a Python statement, is when the source bytes stop being needed.
+pub struct Ring {
+    m: Mutex<RingState>,
+    cv: Condvar,
+}
+
+struct RingState {
+    next: usize,
+    nbatches: usize,
+    nslots: usize,
+    free: Vec<usize>,
+    inflight: usize,
+    done: BTreeMap<usize, Done>,
+    stop: bool,
+}
+
+struct Done {
+    slot: usize,
+    err: Option<Refusal>,
+    ms: u128,
+}
+
+impl Ring {
+    fn new(nbatches: usize, nslots: usize) -> Arc<Ring> {
+        Arc::new(Ring {
+            m: Mutex::new(RingState {
+                next: 0,
+                nbatches,
+                nslots,
+                free: (0..nslots).rev().collect(),
+                inflight: 0,
+                done: BTreeMap::new(),
+                stop: false,
+            }),
+            cv: Condvar::new(),
+        })
+    }
+
+    /// One indivisible claim of (next batch, free slot). Taking them together is what makes
+    /// claim order batch order — a worker can never hold a later batch's slot hostage.
+    fn claim(&self) -> Option<(usize, usize)> {
+        let mut st = self.m.lock().unwrap();
+        loop {
+            if st.stop || st.next >= st.nbatches {
+                return None;
+            }
+            if let Some(slot) = st.free.pop() {
+                let b = st.next;
+                st.next += 1;
+                st.inflight += 1;
+                return Some((b, slot));
+            }
+            st = self.cv.wait(st).unwrap();
+        }
+    }
+
+    fn finish(&self, batch: usize, slot: usize, err: Option<Refusal>, ms: u128) {
+        let mut st = self.m.lock().unwrap();
+        st.inflight -= 1;
+        st.done.insert(batch, Done { slot, err, ms });
+        drop(st);
+        self.cv.notify_all();
+    }
+
+    fn wait_done(&self, batch: usize) -> Result<Done> {
+        let mut st = self.m.lock().unwrap();
+        loop {
+            if let Some(d) = st.done.remove(&batch) {
+                return Ok(d);
+            }
+            if st.stop {
+                return refuse(Code::SLOT_STARVED, "the ring was aborted");
+            }
+            if st.inflight == 0 && st.free.is_empty() {
+                return refuse(
+                    Code::SLOT_STARVED,
+                    format!(
+                        "batch {batch} cannot start: all {} slots are outstanding with the \
+                         consumer and no reader is in flight — a slot returns to the ring \
+                         only when the caller releases it",
+                        st.nslots
+                    ),
+                );
+            }
+            st = self.cv.wait(st).unwrap();
+        }
+    }
+
+    fn abort(&self) {
+        self.m.lock().unwrap().stop = true;
+        self.cv.notify_all();
+    }
+
+    fn give_back(&self, slot: usize) {
+        let mut st = self.m.lock().unwrap();
+        if !st.free.contains(&slot) {
+            st.free.push(slot);
+        }
+        drop(st);
+        self.cv.notify_all();
+    }
+}
+
+/// The caller's end of one filled slot. Held across an asynchronous H2D exactly like the
+/// lease: `release` is a positive act, and dropping this without releasing keeps the slot
+/// out of the ring (over-keeping, the only permitted direction) until the ring refuses.
+pub struct Slot {
+    ring: Arc<Ring>,
+    slot: usize,
+    released: AtomicBool,
+}
+
+impl Slot {
+    pub fn index(&self) -> usize {
+        self.slot
+    }
+    /// Returns false if this slot was already released — a double release is a caller bug
+    /// worth naming, never a second slot.
+    pub fn release(&self) -> bool {
+        if self.released.swap(true, Ordering::SeqCst) {
+            return false;
+        }
+        self.ring.give_back(self.slot);
+        true
+    }
+    pub fn is_released(&self) -> bool {
+        self.released.load(Ordering::SeqCst)
+    }
+}
+
+/// One filled batch, described in the caller's own terms: which slot holds it, how many
+/// bytes are live in that slot, and which plan items landed where inside it.
+pub struct Filled<'a> {
+    pub index: usize,
+    pub batch: &'a ReadPlan,
+    /// The delivered bytes, in the caller's own slot. Valid for the callback and for as
+    /// long as the caller holds the slot — which is precisely what an explicit release is
+    /// for. TensorFS copies nothing to produce this.
+    pub bytes: &'a [u8],
+    pub read_ms: u128,
+}
+
+/// Stream a plan through a caller-owned slot ring. `slots` are the caller's buffers — all
+/// the same length, and that length is the tile size. TensorFS allocates nothing.
+///
+/// `on_batch` is called on THIS thread, in batch order, once per filled slot. The readers
+/// keep going while it runs.
+pub fn pump<F>(
+    store: &Store,
+    lease: &ReadLease,
+    plan: &ReadPlan,
+    slots: Vec<&mut [u8]>,
+    workers: usize,
+    mut on_batch: F,
+) -> Result<Stats>
+where
+    F: FnMut(&Filled, Arc<Slot>) -> Result<()>,
+{
+    if slots.is_empty() {
+        return refuse(Code::BUFFER_SIZE, "a slot ring needs at least one slot");
+    }
+    let cap = slots[0].len();
+    if cap == 0 || slots.iter().any(|s| s.len() != cap) {
+        return refuse(
+            Code::BUFFER_SIZE,
+            format!(
+                "every slot must be the same non-zero length; got {:?}",
+                slots.iter().map(|s| s.len()).collect::<Vec<_>>()
+            ),
+        );
+    }
+    let batches = plan.batches(cap as u64);
+    if let Some(b) = batches.iter().find(|b| b.bytes > cap as u64) {
+        return refuse(
+            Code::BUFFER_SIZE,
+            format!(
+                "one plan item is {} B and the slot is {cap} B — a slot cannot hold a single \
+                 item; use a larger slot or a smaller transfer window",
+                b.bytes
+            ),
+        );
+    }
+    let workers = workers.max(1);
+    let ring = Ring::new(batches.len(), slots.len());
+    let park: Vec<Mutex<Option<&mut [u8]>>> =
+        slots.into_iter().map(|s| Mutex::new(Some(s))).collect();
+    let t0 = Instant::now();
+
+    let out = std::thread::scope(|sc| -> Result<()> {
+        for _ in 0..workers {
+            let ring = ring.clone();
+            let park = &park;
+            let batches = &batches;
+            sc.spawn(move || {
+                while let Some((b, slot)) = ring.claim() {
+                    let t = Instant::now();
+                    let r = {
+                        let mut g = park[slot].lock().unwrap();
+                        let buf = g.as_mut().expect("slot buffer parked");
+                        execute(
+                            store,
+                            lease,
+                            &batches[b],
+                            &mut buf[..batches[b].bytes as usize],
+                            1,
+                        )
+                    };
+                    ring.finish(b, slot, r.err(), t.elapsed().as_millis());
+                }
+            });
+        }
+        let mut r = Ok(());
+        for i in 0..batches.len() {
+            let d = match ring.wait_done(i) {
+                Ok(d) => d,
+                Err(e) => {
+                    r = Err(e);
+                    break;
+                }
+            };
+            if let Some(e) = d.err {
+                r = Err(e);
+                break;
+            }
+            let held = Arc::new(Slot {
+                ring: ring.clone(),
+                slot: d.slot,
+                released: AtomicBool::new(false),
+            });
+            // The park entry is locked for the callback's duration: nothing may write a
+            // slot the consumer is reading, even after the consumer releases it.
+            let mut g = park[d.slot].lock().unwrap();
+            let buf = g.as_mut().expect("slot buffer parked");
+            let f = Filled {
+                index: i,
+                batch: &batches[i],
+                bytes: &buf[..batches[i].bytes as usize],
+                read_ms: d.ms,
+            };
+            let cb = on_batch(&f, held);
+            drop(g);
+            if let Err(e) = cb {
+                r = Err(e);
+                break;
+            }
+        }
+        ring.abort();
+        r
+    });
+    out?;
     Ok(Stats {
         items: plan.items.len(),
         bytes: plan.bytes,

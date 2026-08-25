@@ -1,49 +1,88 @@
 #!/usr/bin/env bash
-# Wheel smoke (tfs-001): build the abi3 wheel, install it into a FRESH venv, import the
-# facade, prove torch never enters sys.modules, and marshal a real golden header through
-# the compiled core. A live run, not a test — see tracker README #160.
+# Wheel smoke (tfs-001, extended by tfs-007): build the abi3 wheel, install it into a FRESH
+# venv, and READ A REAL NAMED TENSOR out of the committed store at vectors/store — a lease,
+# a plan in the caller's traversal order, a slot ring, and the digest the Rust path banks.
+#
+# An import smoke proves the wheel loads. This proves the wheel WORKS, which is the only
+# thing that stops a matrix entry from rotting quietly. A live run, not a test — see
+# tracker README #160.
+#
+#   scripts/wheel-smoke.sh [workdir] [python]
 set -euo pipefail
 cd "$(dirname "$0")/.."
 work="${1:-$(mktemp -d)}"
+py="${2:-python3}"
 mkdir -p "$work"
 
-export CARGO_BUILD_JOBS="${CARGO_BUILD_JOBS:-2}"
-nice -n 19 maturin build --release --out "$work/wheels" >"$work/build.log" 2>&1 || {
-    tail -20 "$work/build.log"; exit 1; }
-wheel=$(ls "$work"/wheels/tensorfs-*.whl)
+# The committed fixture: `tfs checkpoint write vectors/store --blocks 1 --scale 32`.
+SNAP=beb936f23bacbb5679d5cfbc207302503660f53fe543b34a3d752a7e5a38c4ee
+DIGEST=c578846256ffce1447da8787c83315b13005977721f11a00f8084afd09098185
+
+wheels="${WHEEL_DIR:-$work/wheels}"
+if [ -z "${SKIP_BUILD:-}" ]; then
+    export CARGO_BUILD_JOBS="${CARGO_BUILD_JOBS:-2}"
+    nice -n 19 maturin build --release --out "$wheels" >"$work/build.log" 2>&1 || {
+        tail -20 "$work/build.log"; exit 1; }
+fi
+wheel=$(ls "$wheels"/tensorfs-*.whl | head -1)
 echo "wheel: $(basename "$wheel")"
 
 rm -rf "$work/venv"
-python3 -m venv "$work/venv"
+"$py" -m venv "$work/venv"
 "$work/venv/bin/pip" install --quiet "$wheel"
 echo "installed into fresh venv: $("$work/venv/bin/python" -V)"
 
-"$work/venv/bin/python" - "$PWD" <<'PY'
-import sys, pathlib
-repo = pathlib.Path(sys.argv[1])
-assert "tensorfs" not in [p for p in sys.path if "cozy_v2" in p], "repo on sys.path"
+"$work/venv/bin/python" - "$PWD" "$SNAP" "$DIGEST" <<'PY'
+import hashlib, pathlib, sys
 
+repo, snap, want = pathlib.Path(sys.argv[1]), sys.argv[2], sys.argv[3]
 import tensorfs
-print("import tensorfs OK ->", tensorfs.__file__)
-print("version:", tensorfs.__version__)
+print("import tensorfs OK ->", tensorfs.__file__, tensorfs.__version__)
 
-leaked = sorted(m for m in sys.modules if m.split(".")[0] in
-                {"torch", "numpy", "hashlib", "json", "struct"})
 assert "torch" not in sys.modules, "torch leaked into sys.modules"
-print("torch in sys.modules:", "torch" in sys.modules, "| heavy/marshal modules:", leaked)
+print("torch in sys.modules:", "torch" in sys.modules, "| dtypes:", len(tensorfs.DTYPES))
 
-case = repo / "vectors/cases/header/plain-fp8.json"
-raw = case.read_bytes()
-oid = tensorfs.object_id(raw)
-want = [l.split(": ", 1)[1] for l in
-        (repo / "vectors/cases/header/plain-fp8.verdict").read_text().splitlines()
-        if l.startswith("id: ")][0]
-print("object_id:", oid)
-assert oid == want, f"{oid} != {want}"
+store = tensorfs.Store.open(str(repo / "vectors/store"))
+info = store.snapshot(snap)
+assert info["checkpoint_id"] == info["snapshot_id"] == "sha256:" + snap
+header = tensorfs.parse_header(info["header"])
+assert tensorfs.object_id(info["manifest"]) == "sha256:" + snap
 
-doc = tensorfs.parse_header(raw)
-assert isinstance(doc, dict), type(doc)
-names = list(doc["components"]["transformer"])
-print("parse_header -> dict, components/transformer tensors:", len(names), names[:2])
+# One NAMED tensor, end to end: the traversal is the caller's, the lease is verified, the
+# buffer is the caller's, and the bytes are checked against the part digest the header
+# declares.
+names = [(c, k) for c in header["components"] for k in header["components"][c]]
+comp, key = sorted(names)[0]
+tensor = header["components"][comp][key]
+print(f"named tensor: {comp}/{key} {tensor['logical']['dtype']} {tensor['logical']['shape']}")
+
+order = sorted(names)
+plan = tensorfs.plan(info["header"], order, window=1 << 16)
+slots = [memoryview(bytearray(1 << 18)) for _ in range(3)]
+digest = hashlib.sha256()
+
+with store.acquire_snapshot(snap) as lease:
+    print(f"lease: {len(lease.objects)} objects, {lease.bytes} B verified")
+
+    def on_batch(b):
+        digest.update(slots[b.slot][: b.nbytes])
+        b.release()
+
+    st = lease.stream(plan, slots, on_batch, readers=2)
+
+got = digest.hexdigest()
+print(f"streamed {st['items']} items, {st['bytes']} B -> sha256 {got[:16]}…")
+assert got == want, f"{got} != banked {want}"
+
+try:
+    tensorfs.platform_gate("win32")
+except tensorfs.errors.PlatformUnsupported as e:
+    print("platform gate:", e.code)
+
+try:
+    tensorfs.parse_header(info["manifest"])
+except tensorfs.errors.UnknownFormat as e:
+    print("typed refusal :", e.code, "|", e.detail[:60])
+
 print("SMOKE GREEN")
 PY

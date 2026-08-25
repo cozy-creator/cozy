@@ -193,7 +193,12 @@ impl FingerprintRegistry {
             1 => Verdict::Authorized(Box::new(hits[0].clone())),
             _ => Verdict::Ambiguous(
                 hits.iter()
-                    .map(|e| format!("{}/{} via {}", e.task_family, e.structural_variant, e.dialect))
+                    .map(|e| {
+                        format!(
+                            "{}/{} via {}",
+                            e.task_family, e.structural_variant, e.dialect
+                        )
+                    })
                     .collect(),
             ),
         }
@@ -232,8 +237,9 @@ impl FingerprintRegistry {
             Some(slot) => *slot = e,
             None => self.entries.push(e),
         }
-        self.entries
-            .sort_by(|a, b| (&a.keyset_digest, &a.component).cmp(&(&b.keyset_digest, &b.component)));
+        self.entries.sort_by(|a, b| {
+            (&a.keyset_digest, &a.component).cmp(&(&b.keyset_digest, &b.component))
+        });
     }
 }
 
@@ -392,10 +398,10 @@ pub fn evidence_stamps(h: &SourceHeader) -> Result<Vec<(String, String)>> {
     ];
     let mut out = Vec::new();
     for (k, v) in &h.metadata {
-        if k == "quantization_config" || k == "bnb_quantization_config" {
-            if v.contains("bitsandbytes") || v.contains("bnb") {
-                return refuse_bnb("__metadata__.quantization_config");
-            }
+        if (k == "quantization_config" || k == "bnb_quantization_config")
+            && (v.contains("bitsandbytes") || v.contains("bnb"))
+        {
+            return refuse_bnb("__metadata__.quantization_config");
         }
         if KEPT.contains(&k.as_str()) {
             if v.len() > limits::MAX_NAME_BYTES {

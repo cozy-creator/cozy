@@ -37,7 +37,13 @@ pub struct Receipt {
 }
 
 impl Receipt {
-    pub fn new(op: &str, degraded: &str, snapshot: &str, generation: u64, detail: String) -> Receipt {
+    pub fn new(
+        op: &str,
+        degraded: &str,
+        snapshot: &str,
+        generation: u64,
+        detail: String,
+    ) -> Receipt {
         Receipt {
             op: op.to_string(),
             degraded: degraded.to_string(),

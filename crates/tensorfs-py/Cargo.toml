@@ -9,7 +9,6 @@ crate-type = ["cdylib", "rlib"]
 
 [dependencies]
 tensorfs-core = { path = "../tensorfs-core" }
-tensorfs-layout = { path = "../tensorfs-layout" }
 pyo3 = { version = "0.25", features = ["abi3-py311"] }
 
 [features]

@@ -96,7 +96,10 @@ pub fn sniff(head: &[u8]) -> Result<()> {
              publisher class imported",
         );
     }
-    if matches!(head.first(), Some(b'(') | Some(b']') | Some(b'}') | Some(b'c')) {
+    if matches!(
+        head.first(),
+        Some(b'(') | Some(b']') | Some(b'}') | Some(b'c')
+    ) {
         return refuse(
             Code::PICKLE_REFUSED,
             "protocol-0/1 pickle opening opcode: refused on the magic, nothing interpreted",
@@ -163,10 +166,7 @@ impl SourceHeader {
 /// `8 + CARRIER_HEADER_MAX_BYTES` bytes and never touches the data region.
 pub fn read_header(path: &Path) -> Result<SourceHeader> {
     let mut f = File::open(path).map_err(|e| io(format!("open {}", path.display()), e))?;
-    let file_len = f
-        .metadata()
-        .map_err(|e| io("stat", e))?
-        .len();
+    let file_len = f.metadata().map_err(|e| io("stat", e))?.len();
 
     let mut head = [0u8; 16];
     let n = read_upto(&mut f, &mut head)?;
@@ -229,7 +229,11 @@ pub fn parse_header(bytes: &[u8], data_start: u64, file_len: Option<u64>) -> Res
     if entries.len() > limits::MAX_TENSORS {
         return refuse(
             Code::COUNT_CAP,
-            format!("carrier header holds {} keys, cap {}", entries.len(), limits::MAX_TENSORS),
+            format!(
+                "carrier header holds {} keys, cap {}",
+                entries.len(),
+                limits::MAX_TENSORS
+            ),
         );
     }
 

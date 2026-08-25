@@ -4,3 +4,7 @@ __pycache__/
 .venv/
 dist/
 *.egg-info/
+vectors/store/meta/
+vectors/store/verified/
+vectors/store/tmp/
+vectors/store/quarantine/

@@ -179,7 +179,11 @@ impl Census {
         v.len()
     }
     pub fn bytes(&self) -> u64 {
-        let mut v: Vec<(&str, u64)> = self.live.iter().map(|l| (l.object.as_str(), l.length)).collect();
+        let mut v: Vec<(&str, u64)> = self
+            .live
+            .iter()
+            .map(|l| (l.object.as_str(), l.length))
+            .collect();
         v.sort();
         v.dedup_by(|a, b| a.0 == b.0);
         v.iter().map(|(_, n)| n).sum()
@@ -193,9 +197,11 @@ impl Census {
 /// A rooted snapshot that cannot be loaded or walked fails the WHOLE census: a partial mark
 /// is exactly the state from which deleting is wrong, so it refuses instead.
 pub fn mark(store: &Store, state: &State) -> Result<Census> {
-    let mut c = Census::default();
-    c.roots = state.roots.len();
-    c.holds = state.holds.len();
+    let mut c = Census {
+        roots: state.roots.len(),
+        holds: state.holds.len(),
+        ..Default::default()
+    };
 
     let pin_sites = state.pinned_snapshots();
     let mut subjects: Vec<(String, Option<String>)> = pin_sites
@@ -273,7 +279,9 @@ pub fn mark(store: &Store, state: &State) -> Result<Census> {
     // the numeric proof obligation catching a real error rather than a rounding one.
     for r in &state.roots {
         for e in &r.evidence {
-            let length = fs::metadata(store.object_path(e)).map(|m| m.len()).unwrap_or(0);
+            let length = fs::metadata(store.object_path(e))
+                .map(|m| m.len())
+                .unwrap_or(0);
             c.live.push(Live {
                 object: e.clone(),
                 length,
@@ -294,7 +302,9 @@ pub fn mark(store: &Store, state: &State) -> Result<Census> {
     // Holds that name explicit objects rather than a snapshot (a partial fill).
     for h in &state.holds {
         for o in &h.objects {
-            let len = fs::metadata(store.object_path(o)).map(|m| m.len()).unwrap_or(0);
+            let len = fs::metadata(store.object_path(o))
+                .map(|m| m.len())
+                .unwrap_or(0);
             c.live.push(Live {
                 object: o.clone(),
                 length: len,
@@ -601,11 +611,13 @@ pub fn pressure_plan(
     for row in &state.snapshots {
         let s = row.snapshot.as_str();
         if rooted.contains(&s) {
-            p.protected.push((row.snapshot.clone(), "pinned by a root".into()));
+            p.protected
+                .push((row.snapshot.clone(), "pinned by a root".into()));
             continue;
         }
         if held.contains(&s) {
-            p.protected.push((row.snapshot.clone(), "under a live hold".into()));
+            p.protected
+                .push((row.snapshot.clone(), "under a live hold".into()));
             continue;
         }
         if !row.hub_published {

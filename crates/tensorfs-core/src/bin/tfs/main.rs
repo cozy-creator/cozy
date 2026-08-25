@@ -106,7 +106,6 @@ use tensorfs_core::manifest::{BlobDescriptor, Draft, Entry, SnapshotManifest};
 use tensorfs_core::registry;
 use tensorfs_core::spec::EncodingSpec;
 use tensorfs_core::store::{Fault, Store, Verdict, FAULT_STAGES};
-use tensorfs_core::vectors::EncodingVectors;
 
 fn main() -> ExitCode {
     let (args, flags) = split_flags(std::env::args().skip(1).collect());
@@ -179,6 +178,7 @@ fn main() -> ExitCode {
         ["read", "lease", r, h] => rd::cmd_lease(Path::new(r), h, &flags),
         ["read", "plan", r, h] => rd::cmd_plan(Path::new(r), h, &flags),
         ["read", "fill", r, h] => rd::cmd_fill(Path::new(r), h, &flags),
+        ["read", "stream", r, h] => rd::cmd_stream(Path::new(r), h, &flags),
         ["read", "verify-fill", r, h] => rd::cmd_verify_fill(Path::new(r), h, &flags),
         ["read", "span", r, h, c, k, role, off, len] => rd::cmd_span(
             Path::new(r),
@@ -279,9 +279,9 @@ macro_rules! ok {
 }
 
 mod ckpt;
-mod ingest;
 mod conform;
 mod fixtures;
+mod ingest;
 mod rd;
 mod roots;
 mod snap;
@@ -521,11 +521,11 @@ fn cmd_bench_store(root: &Path, f: &Flags) -> ExitCode {
         let mut w = std::io::BufWriter::new(fs::File::create(&src).unwrap());
         let mut block = vec![0u8; 1 << 20];
         let mut x: u64 = 0x243f6a8885a308d3;
-        for i in 0..block.len() {
+        for b in block.iter_mut() {
             x ^= x << 13;
             x ^= x >> 7;
             x ^= x << 17;
-            block[i] = (x >> 24) as u8;
+            *b = (x >> 24) as u8;
         }
         let mut left = size;
         while left > 0 {
@@ -2115,12 +2115,7 @@ fn meta_cases() -> Vec<Case> {
 
     // Order is part of the document: an unsorted twin re-encodes differently, so it can
     // neither round-trip nor be believed. Two authorities disagreeing is what this refuses.
-    let unsorted = String::from_utf8(bytes.clone())
-        .unwrap()
-        .replace(
-            &format!("\"snapshot\":\"{snap}\"}},{{\"hub_published\":false"),
-            &format!("\"snapshot\":\"{snap}\"}},{{\"hub_published\":false"),
-        );
+    let unsorted = String::from_utf8(bytes.clone()).unwrap();
     let swapped = {
         // Emit the snapshots array with the two rows exchanged, by rendering a state whose
         // decode order is reversed. Canonical writing sorts, so plant the bytes directly.
@@ -2148,7 +2143,11 @@ fn meta_cases() -> Vec<Case> {
         "meta",
         String::from_utf8(bytes.clone())
             .unwrap()
-            .replacen(&format!("\"snapshot\":\"{other}\""), "\"snapshot\":\"latest\"", 1)
+            .replacen(
+                &format!("\"snapshot\":\"{other}\""),
+                "\"snapshot\":\"latest\"",
+                1,
+            )
             .into_bytes(),
         "MALFORMED_DIGEST",
         "a hold pinning a NAME instead of an immutable snapshot id",
@@ -2278,55 +2277,12 @@ enum Outcome {
 }
 
 fn run_doc(doc: &str, bytes: &[u8], closure: &Closure, platform: &[String]) -> Outcome {
-    let id = tensorfs_core::ids::object_id(bytes);
-    let r: Result<(Option<String>, Option<String>), Refusal> = match doc {
-        "header" => Header::parse(bytes).and_then(|h| {
-            h.validate(closure)?;
-            Ok((Some(h.topology_digest()), None))
-        }),
-        // Serving admission is a SECOND gate over the same bytes: `header` says the document
-        // is valid data, `header-serving` says this runtime may execute it.
-        "header-serving" => Header::parse(bytes).and_then(|h| {
-            h.admit_for_serving(closure, platform)?;
-            Ok((Some(h.topology_digest()), None))
-        }),
-        "spec" => EncodingSpec::parse(bytes).map(|_| (None, None)),
-        "vectors" => EncodingVectors::parse(bytes).and_then(|v| {
-            let plain = seed_spec("plain/1", 0);
-            v.check(&plain)?;
-            Ok((None, None))
-        }),
-        // A structure fixture's banked key is its topology_digest, so that is what the
-        // corpus freezes: a fixture whose projection drifts announces itself here.
-        "structure" => tensorfs_core::structure::StructureFixture::parse(bytes)
-            .map(|f| (Some(f.topology_digest()), None)),
-        "capability" => {
-            tensorfs_core::capability::CapabilityRecords::parse(bytes).map(|_| (None, None))
-        }
-        // A decode IS the path law now: `SnapshotManifest` cannot exist unvalidated, so
-        // parsing is the whole check and there is no second validate() to forget.
-        "manifest" => SnapshotManifest::parse(bytes).map(|m| (None, m.checkpoint_id().ok())),
-        "profile" => IngestProfile::parse(bytes).and_then(|p| {
-            p.validate(platform)?;
-            Ok((None, None))
-        }),
-        "subject" => IngestSubject::parse(bytes).map(|_| (None, None)),
-        "registry" => {
-            tensorfs_core::ingest::fingerprint::FingerprintRegistry::parse(bytes).map(|_| (None, None))
-        }
-        "root" => tensorfs_core::ingest::transaction::IngestRoot::parse(bytes).map(|_| (None, None)),
-        "receipt" => IngestVerificationReceipt::parse(bytes).map(|_| (None, None)),
-        "meta" => tensorfs_core::meta::State::parse(bytes).map(|_| (None, None)),
-        "operation_receipt" => {
-            tensorfs_core::receipt::Receipt::parse(bytes).map(|_| (None, None))
-        }
-        other => panic!("unknown doc kind {other}"),
-    };
-    match r {
-        Ok((topology, checkpoint)) => Outcome::Ok {
-            id,
-            topology,
-            checkpoint,
+    // ONE dispatch, shared with the Python facade's harness (tensorfs_core::corpus).
+    match tensorfs_core::corpus::run_doc(doc, bytes, closure, platform) {
+        Ok(o) => Outcome::Ok {
+            id: o.id,
+            topology: o.topology,
+            checkpoint: o.checkpoint,
         },
         Err(e) => Outcome::Refused(e),
     }
@@ -2718,7 +2674,13 @@ fn cmd_flip() -> ExitCode {
         r0.object_id(),
     );
 
-    let mut rows: Vec<(&str, (String, String, String, String, String), [bool; 5])> = Vec::new();
+    // (what changed, the five ids it produced, which of the five flipped)
+    type FlipRow = (
+        &'static str,
+        (String, String, String, String, String),
+        [bool; 5],
+    );
+    let mut rows: Vec<FlipRow> = Vec::new();
 
     let mut h = ha.clone();
     if let Body::Segments(s) = &mut h.components[0].1[0].1.parts[0].1.body {
