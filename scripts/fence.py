@@ -135,8 +135,8 @@ def check_manifest():
             bad.append(f"[manifest] '{name}' reclaims or removes but declares neither "
                        "Destructive nor PlanFirst — a bare invocation would mutate silently")
         if has_yes and destructive == plan_first:
-            bad.append(f"[manifest] '{name}' takes --yes but is {'both' if destructive else 'neither'} "
-                       "Destructive and PlanFirst — exactly one")
+            joined = "both Destructive and PlanFirst" if destructive else "neither Destructive nor PlanFirst"
+            bad.append(f"[manifest] '{name}' takes --yes but is {joined} — exactly one")
         if (destructive or plan_first) and not has_yes:
             bad.append(f"[manifest] '{name}' is gated on --yes but advertises no --yes flag")
     if not rows:
