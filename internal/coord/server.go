@@ -276,6 +276,19 @@ func (c *Coordinator) onReport(s *session, r *pb.Report) {
 			ready[id] = true
 		}
 		w.ready = ready
+		// A worker that says ERROR is timed from the FIRST time it said so, and the clock
+		// resets the moment it stops. Its reason is the worker's own — this side echoes
+		// the fault it reported and never composes one.
+		if r.IntakeState == pb.IntakeState_INTAKE_STATE_ERROR {
+			if w.errorSince.IsZero() {
+				w.errorSince = time.Now()
+			}
+		} else {
+			w.errorSince = time.Time{}
+		}
+		for _, f := range r.Faults {
+			w.fault = fmt.Sprintf("%s: %s", f.Reason, brief(f.Detail, 240))
+		}
 	}
 	c.mu.Unlock()
 	_ = c.opt.Store.ReportWorker(s.id, pb.IntakeState_name[int32(r.IntakeState)],
@@ -604,6 +617,15 @@ func (c *Coordinator) outputsOf(requestID string, attempt uint64, doc canonical.
 		})
 	}
 	return out
+}
+
+// brief keeps a worker's own words readable in one line without editing them.
+func brief(s string, n int) string {
+	s = strings.Join(strings.Fields(s), " ")
+	if len(s) > n {
+		return s[:n] + "…"
+	}
+	return s
 }
 
 func terminalStatus(n int64) string {

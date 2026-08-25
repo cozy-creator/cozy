@@ -152,7 +152,10 @@ var Commands = []Command{
 		Path: []string{"start"}, Group: "endpoints",
 		Summary: "lifecycle/prewarm: make an endpoint worker resident (never a second invoke path)",
 		Args:    "<org/endpoint[@vN]>", MinArgs: 1, MaxArgs: 1,
-		Flags: []Flag{{Name: "--detach", Short: "-d", Summary: "leave it warm in the background"}},
+		Flags: []Flag{
+			{Name: "--detach", Short: "-d", Summary: "leave it warm in the background"},
+			{Name: "--no-warm", Summary: "skip the boot warm pass (an entrypoint whose warm shape does not fit degrades its binding for nothing)"},
+		},
 		Exits: []exit.Code{exit.OK, exit.Usage, exit.Validation, exit.NotFound, exit.Structural,
 			exit.Unavailable, exit.Deadline, exit.Failed, exit.Conflict},
 		Capability: "cmd.start", NeedsServer: true, Status: Implemented, Handler: "start",

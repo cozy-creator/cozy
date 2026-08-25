@@ -139,6 +139,11 @@ type worker struct {
 	intake      pb.IntakeState
 	ready       map[string]bool
 	revision    uint64
+	// The worker's own last reason for not serving, and when it first said so. A worker
+	// that reports ERROR has not answered "not yet" — it has answered "I cannot", and a
+	// client waiting on it needs that answer rather than a longer wait.
+	fault      string
+	errorSince time.Time
 }
 
 // StartWorker journals the device grant, stages the binding records, and spawns the
@@ -284,6 +289,14 @@ func graceOr(v float64) float64 {
 
 // WaitReady blocks until the worker advertises this plan id as dispatchable — a real
 // forward completed, never merely "connected".
+// ErrorGrace is how long a worker may stay in INTAKE_STATE_ERROR before the wait gives
+// up on it. A shortfall on a shared card is often transient — a neighbouring process gives
+// the device back and the next boot succeeds — so the state is not instantly fatal. What
+// is fatal is staying there: cl-003 watched a worker whose fill was refused
+// `device_shortfall` report ERROR every two seconds for eleven minutes while a `cozy run`
+// waited out the full thirty-minute readiness window with nothing on its event stream.
+const ErrorGrace = 90 * time.Second
+
 func (c *Coordinator) WaitReady(instanceID, planID string, timeout time.Duration) *exit.Error {
 	deadline := time.Now().Add(timeout)
 	for time.Now().Before(deadline) {
@@ -291,9 +304,12 @@ func (c *Coordinator) WaitReady(instanceID, planID string, timeout time.Duration
 		w := c.workers[instanceID]
 		ok := w != nil && !w.exited && w.intake == pb.IntakeState_INTAKE_STATE_READY && w.ready[planID]
 		gone := w == nil || w.exited
-		logPath := ""
+		logPath, fault, stuck := "", "", time.Duration(0)
 		if w != nil {
-			logPath = w.logPath
+			logPath, fault = w.logPath, w.fault
+			if !w.errorSince.IsZero() {
+				stuck = time.Since(w.errorSince)
+			}
 		}
 		c.mu.Unlock()
 		if ok {
@@ -303,10 +319,34 @@ func (c *Coordinator) WaitReady(instanceID, planID string, timeout time.Duration
 			return exit.New(exit.Failed, "the endpoint worker exited before reporting ready").
 				WithRemedy("its log is %s", logPath)
 		}
+		if stuck > ErrorGrace {
+			// The worker's OWN words, under the code its reason projects to. Waiting
+			// longer on a worker that has been saying "I cannot" for a minute and a half
+			// is not patience, it is a client with no answer.
+			return workerError(fault, stuck).WithRemedy("its log is %s", logPath)
+		}
 		time.Sleep(20 * time.Millisecond)
 	}
 	return exit.New(exit.Deadline, "the endpoint worker did not report %s ready in %s",
 		planID, timeout).WithRemedy("its log is %s", c.WorkerLog(instanceID))
+}
+
+// workerError is the coordinator's PROJECTION over a worker's fault reason. The reasons
+// are the runtime's neutral vocabulary; deciding what a user should do about one is this
+// side's job, exactly as it is for a terminal's (status, cause).
+func workerError(fault string, stuck time.Duration) *exit.Error {
+	said := fault
+	if said == "" {
+		said = "no reason reported"
+	}
+	if strings.Contains(fault, "shortfall") || strings.Contains(fault, "capacity") {
+		return exit.New(exit.Capacity,
+			"the endpoint worker cannot make its binding resident on this device (%s, for %s)",
+			said, stuck.Round(time.Second))
+	}
+	return exit.New(exit.Failed,
+		"the endpoint worker reported ERROR for %s and never became dispatchable: %s",
+		stuck.Round(time.Second), said)
 }
 
 func (c *Coordinator) WorkerLog(instanceID string) string {

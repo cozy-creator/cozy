@@ -121,8 +121,20 @@ func (c *Coordinator) SubmitDetail(s Submission) (string, uint64, bool, *exit.Er
 func (c *Coordinator) Requeue(requestID, why string) {
 	n, e := c.opt.Store.ChargeRequeue(requestID, MaxRequeues)
 	if e != nil {
+		// THE REQUEST ENDS HERE, and it has to SAY so. Settling the row without emitting a
+		// terminal event left a client watching the durable stream with `attempt_failed
+		// (requeuing: true)` as its last frame and nothing after it — the contract's
+		// terminal-stop rule never fired, and `cozy run` waited on a request that had been
+		// settled for ten minutes. Observed live, in cl-003's ARM 3.
 		c.logf("%s NOT requeued (%s): %s", requestID, why, e.Message)
+		c.forget(requestID)
 		_ = c.opt.Store.SettleRequest(requestID, "failed")
+		c.frames.forget(requestID)
+		c.emit(requestID, "request.failed", 0, map[string]any{
+			"status": "FAILED", "cause": "REQUEUE_BUDGET_EXHAUSTED",
+			"error_type": e.ErrName(), "error": e.Message,
+			"outputs": []any{}, "requeuing": false,
+		})
 		c.waitRequest(requestID).markClosed(e)
 		return
 	}
@@ -202,6 +214,11 @@ func (c *Coordinator) selectOrStart(req records.Request) {
 		}
 		c.logf("%s: started %s for the queued request", req.Endpoint, instance)
 		if e := c.WaitReady(instance, req.PlanID, 30*time.Minute); e != nil {
+			// AND THE WORKER GOES. A process that cannot make its binding resident still
+			// holds a device grant, and `selectOrStart` returns early whenever a worker
+			// for the endpoint exists — so leaving it would hang the NEXT request behind a
+			// worker that will never serve it, with nothing to start a replacement.
+			c.StopWorker(instance, 20*time.Second)
 			c.failQueued(req.ID, e)
 			return
 		}
@@ -227,14 +244,6 @@ func (c *Coordinator) failQueued(requestID string, cause *exit.Error) {
 }
 
 func (c *Coordinator) dispatch(req records.Request) (uint64, *exit.Error) {
-	// THE LAW, enforced here: NextOrdinal refuses while any recovered attempt for this
-	// request id is still an open obligation.
-	ordinal, e := c.opt.Store.NextOrdinal(req.ID)
-	if e != nil {
-		return 0, e
-	}
-	attempt := uint64(ordinal)
-
 	// PLACEMENT is the coordinator's: the caller names the binding, and dispatch picks a
 	// worker that advertises it as dispatchable NOW.
 	w, sess, e := c.pick(req.PlanID)
@@ -261,17 +270,25 @@ func (c *Coordinator) dispatch(req records.Request) (uint64, *exit.Error) {
 	}
 	spelled, _ := canonical.Spell(digest)
 
-	grant, e := c.grant(req.ID, attempt, req)
+	// THE LAW AND THE ORDINAL, in ONE transaction that also journals the assignment: a
+	// terminal crossing a restart is authorized by the persisted assignment, and an ordinal
+	// that is minted outside the write that records it is a race (cl-003's finding — two
+	// `drain()` goroutines minted 1 and 2 for one request across the old split call).
+	ordinal, e := c.opt.Store.Dispatch(records.Attempt{
+		RequestID: req.ID, InstanceID: w.instanceID,
+		SessionID: w.sessionID, ExecSpecDigest: spelled, ExecSpec: canonicalBytes,
+	})
 	if e != nil {
 		return 0, e
 	}
+	attempt := uint64(ordinal)
 
-	// Journal the assignment BEFORE StartAttempt: a terminal crossing a restart is
-	// authorized by the persisted assignment, and nothing else.
-	if e := c.opt.Store.Dispatch(records.Attempt{
-		RequestID: req.ID, Attempt: ordinal, InstanceID: w.instanceID,
-		SessionID: w.sessionID, ExecSpecDigest: spelled, ExecSpec: canonicalBytes,
-	}); e != nil {
+	// The grant names this attempt's own directory, so it is built after the ordinal is
+	// real. A failure here is a broken local filesystem under our own root: the journaled
+	// row stands as the record of a dispatch that could not be granted, and the request
+	// answers with the error rather than silently retrying into the same disk.
+	grant, e := c.grant(req.ID, attempt, req)
+	if e != nil {
 		return 0, e
 	}
 

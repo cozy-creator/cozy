@@ -79,6 +79,10 @@ type Coordinator struct {
 	grpc     *grpc.Server
 	listener net.Listener
 
+	// drainMu serializes the dispatch queue's drain. It is separate from `mu` because a
+	// drain dispatches — it talks to the store and to a session — and holding the state
+	// lock across that would serialize every report behind one 4.8 GiB fill.
+	drainMu  sync.Mutex
 	mu       sync.Mutex
 	sessions map[string]*session // by session_id
 	workers  map[string]*worker  // by instance_id
@@ -235,7 +239,15 @@ func (c *Coordinator) enqueue(requestID string) {
 
 // drain dispatches everything the newly-ready capacity can now take. Called when a
 // worker reports READY, which is the only event that can change the answer.
+//
+// ONE DRAIN AT A TIME. A worker's READY report and `selectOrStart`'s own post-WaitReady
+// drain both fire within milliseconds of the same fact, and two concurrent drains read the
+// same queue snapshot: the durable ordinal law is what refuses the duplicate, but doing the
+// work twice and relying on a refusal is not a design. The lock makes the second drain read
+// a queue the first one has already emptied.
 func (c *Coordinator) drain() {
+	c.drainMu.Lock()
+	defer c.drainMu.Unlock()
 	c.mu.Lock()
 	queued := append([]string(nil), c.pending...)
 	c.mu.Unlock()

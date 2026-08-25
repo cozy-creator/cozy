@@ -461,13 +461,12 @@ type Attempt struct {
 	ClosedAt       string
 }
 
-// NextOrdinal mints the next attempt ordinal for a request — and REFUSES while that
-// request still has an open recovered attempt (02 §6.2). A new session_id never
-// manufactures absence: the coordinator closes what Register reported before it invents
-// the next ordinal.
-func (s *Store) NextOrdinal(requestID string) (int64, *exit.Error) {
+// ordinalLaws is the ordinal-minting law, read INSIDE the caller's transaction. It refuses
+// while the request holds an open recovered attempt (02 §6.2) or a live one: a new
+// session_id never manufactures absence, and supersession is explicit.
+func ordinalLaws(tx *sql.Tx, requestID string) (int64, *exit.Error) {
 	var open int
-	if err := s.db.QueryRow(`SELECT COUNT(*) FROM attempts
+	if err := tx.QueryRow(`SELECT COUNT(*) FROM attempts
 		WHERE request_id=? AND state='recovered_open'`, requestID).Scan(&open); err != nil {
 		return 0, exit.Internalf("cannot read the recovered attempts of %s: %s", requestID, err)
 	}
@@ -477,7 +476,7 @@ func (s *Store) NextOrdinal(requestID string) (int64, *exit.Error) {
 			WithRemedy("a recovered attempt is closed by its own journaled terminal, never by assumption")
 	}
 	var live int
-	if err := s.db.QueryRow(`SELECT COUNT(*) FROM attempts
+	if err := tx.QueryRow(`SELECT COUNT(*) FROM attempts
 		WHERE request_id=? AND state IN ('dispatching','accepted')`, requestID).Scan(&live); err != nil {
 		return 0, exit.Internalf("cannot read the live attempts of %s: %s", requestID, err)
 	}
@@ -487,41 +486,69 @@ func (s *Store) NextOrdinal(requestID string) (int64, *exit.Error) {
 			WithRemedy("cancel the held attempt (SUPERSEDED) and wait for its journaled terminal")
 	}
 	var max sql.NullInt64
-	if err := s.db.QueryRow(`SELECT MAX(attempt) FROM attempts WHERE request_id=?`, requestID).
+	if err := tx.QueryRow(`SELECT MAX(attempt) FROM attempts WHERE request_id=?`, requestID).
 		Scan(&max); err != nil {
 		return 0, exit.Internalf("cannot read the attempt ordinals of %s: %s", requestID, err)
 	}
 	return max.Int64 + 1, nil
 }
 
-// Dispatch journals the assignment BEFORE StartAttempt goes out: a terminal may only
-// cross a restart when the persisted assignment authorizes it.
-func (s *Store) Dispatch(a Attempt) *exit.Error {
+// NextOrdinal answers what the next ordinal WOULD be, under the same laws. It is a
+// question, not a claim: minting is `Dispatch`'s, in the transaction that writes the row.
+func (s *Store) NextOrdinal(requestID string) (int64, *exit.Error) {
+	tx, err := s.db.Begin()
+	if err != nil {
+		return 0, exit.Internalf("cannot begin the ordinal transaction: %s", err)
+	}
+	defer tx.Rollback()
+	return ordinalLaws(tx, requestID)
+}
+
+// Dispatch MINTS the ordinal and journals the assignment in ONE transaction, before
+// StartAttempt goes out: a terminal may only cross a restart when the persisted assignment
+// authorizes it, and an ordinal may only exist when its row does.
+//
+// The two used to be separate calls (`NextOrdinal` then `Dispatch`), and cl-003's very
+// first cold four-component run found what that costs. Two `drain()` goroutines — one from
+// the worker's READY report, one from `selectOrStart` — raced across the THREE unrelated
+// reads inside the old `NextOrdinal`: the second read (is an attempt live?) ran before the
+// first goroutine's insert committed, and the third (what is the highest ordinal?) ran
+// after it. So the law said "nothing is live" and the arithmetic said "one exists", and
+// the coordinator dispatched attempt 2 of a request whose attempt 1 was starting. The
+// worker refused it — `live_attempt_supersession`, which is the runtime's own fence doing
+// its job — and the request FAILED. The ordinal is now minted by the writer that owns the
+// row, which is the only place it can be minted atomically.
+func (s *Store) Dispatch(a Attempt) (int64, *exit.Error) {
 	a.DispatchedAt = now()
 	if a.AttemptKey == "" {
 		a.AttemptKey = NewID("att")
 	}
 	tx, err := s.db.Begin()
 	if err != nil {
-		return exit.Internalf("cannot begin the dispatch transaction: %s", err)
+		return 0, exit.Internalf("cannot begin the dispatch transaction: %s", err)
 	}
 	defer tx.Rollback()
+	ordinal, e := ordinalLaws(tx, a.RequestID)
+	if e != nil {
+		return 0, e
+	}
+	a.Attempt = ordinal
 	if _, err := tx.Exec(`INSERT INTO attempts(request_id,attempt,attempt_key,instance_id,
 		session_id,exec_spec_digest,exec_spec,state,dispatched_at)
 		VALUES(?,?,?,?,?,?,?,'dispatching',?)`,
 		a.RequestID, a.Attempt, a.AttemptKey, a.InstanceID, a.SessionID,
 		a.ExecSpecDigest, a.ExecSpec, a.DispatchedAt); err != nil {
-		return exit.New(exit.Conflict, "cannot journal attempt %s#%d: %s", a.RequestID, a.Attempt, err).
+		return 0, exit.New(exit.Conflict, "cannot journal attempt %s#%d: %s", a.RequestID, a.Attempt, err).
 			WithRemedy("an attempt ordinal is written once")
 	}
 	if _, err := tx.Exec(`UPDATE requests SET state='dispatching', ordinal=? WHERE id=?`,
 		a.Attempt, a.RequestID); err != nil {
-		return exit.Internalf("cannot advance request %s: %s", a.RequestID, err)
+		return 0, exit.Internalf("cannot advance request %s: %s", a.RequestID, err)
 	}
 	if err := tx.Commit(); err != nil {
-		return exit.Internalf("the dispatch transaction did not commit: %s", err)
+		return 0, exit.Internalf("the dispatch transaction did not commit: %s", err)
 	}
-	return nil
+	return ordinal, nil
 }
 
 // Accepted records AttemptAccepted's journaled digests. They never move afterwards.

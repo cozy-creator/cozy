@@ -269,10 +269,16 @@ type StartResult struct {
 	Note       string `json:"note"`
 }
 
-func (c *Client) StartWorker(endpoint string) (StartResult, *exit.Error) {
+// StartWorker makes an endpoint resident. `warm` false asks the worker to skip its boot
+// warm pass — the route's `warm` field is omitted entirely when it is true, so the wire
+// carries a choice only when one was made.
+func (c *Client) StartWorker(endpoint string, warm bool) (StartResult, *exit.Error) {
 	var res StartResult
-	e := c.call("POST", "/v1/local/workers",
-		map[string]string{"endpoint": endpoint}, &res)
+	body := map[string]any{"endpoint": endpoint}
+	if !warm {
+		body["warm"] = false
+	}
+	e := c.call("POST", "/v1/local/workers", body, &res)
 	return res, e
 }
 

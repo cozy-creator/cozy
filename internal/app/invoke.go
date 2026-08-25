@@ -53,7 +53,7 @@ func handleStart(ctx *Context) *exit.Error {
 	}
 	ref := ctx.Inv.Args[0]
 	began := time.Now()
-	res, e := c.StartWorker(ref)
+	res, e := c.StartWorker(ref, !ctx.Inv.Bool("--no-warm"))
 	if e != nil {
 		return e
 	}

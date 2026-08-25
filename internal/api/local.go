@@ -60,13 +60,16 @@ func (s *Server) localWorkers(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) startWorker(w http.ResponseWriter, r *http.Request) {
+	// `warm` is a POINTER so its absence is a fact: unspecified means WARM, which is the
+	// serving default, and only an explicit `false` turns the boot warm pass off.
 	var body struct {
 		Endpoint string `json:"endpoint"`
+		Warm     *bool  `json:"warm"`
 	}
 	data, _ := io.ReadAll(io.LimitReader(r.Body, 1<<16))
 	if err := json.Unmarshal(data, &body); err != nil || body.Endpoint == "" {
 		s.refuse(w, r, http.StatusBadRequest, "invalid_request",
-			`this route takes {"endpoint":"org/name"}`,
+			`this route takes {"endpoint":"org/name"} and optionally {"warm":false}`,
 			"a client names an ENDPOINT; resolving it to an interpreter and a binding is this host's job")
 		return
 	}
@@ -80,12 +83,29 @@ func (s *Server) startWorker(w http.ResponseWriter, r *http.Request) {
 		s.refuseTyped(w, r, e)
 		return
 	}
+	// THE BOOT WARM PASS, off by request. It normally earns its keep — it pays the
+	// first-call tax (960-1380 ms on the four-component SDXL pipeline) before a user's
+	// first request instead of inside it. cl-003 found the two cases where it does not:
+	// an entrypoint whose warm shape does not fit degrades its binding at boot for
+	// nothing (observed: `condition` OOMs the 1024px decode with every component
+	// resident), and the warm pass is a BIT-LEVEL input to the first real image, because
+	// the device-memory history it leaves is what cuDNN's algorithm selection reads.
+	if body.Warm != nil && !*body.Warm {
+		spec.NoWarm = true
+	}
 	// Already resident is an IDEMPOTENT 200 (cozy-creator.md: "already serving = 0").
 	for _, f := range s.coord.Workers() {
 		if f.Endpoint == spec.Endpoint {
+			note := "already resident: this route is idempotent"
+			if spec.NoWarm {
+				// The flag asked for a boot that has already happened. Saying so is the
+				// difference between an idempotent verb and one that quietly ignores an
+				// argument — the same defect as a flag that parses and does nothing.
+				note += "; `warm:false` changed nothing — the resident worker was booted with its own warm setting"
+			}
 			s.ok(w, r, http.StatusOK, map[string]any{
 				"instance_id": f.InstanceID, "endpoint": f.Endpoint, "resident": true,
-				"note": "already resident: this route is idempotent",
+				"note": note,
 			})
 			return
 		}

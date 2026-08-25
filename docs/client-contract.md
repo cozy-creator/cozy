@@ -203,7 +203,7 @@ none of these.
 |---|---|---|---|
 | `GET /v1/local/endpoints` | local | yes | installed endpoints and their functions |
 | `GET /v1/local/workers` | local | yes | live workers: protocol identities, devices, intake |
-| `POST /v1/local/workers` | local | yes | make one endpoint resident (idempotent) |
+| `POST /v1/local/workers` | local | yes | make one endpoint resident (idempotent); `{"endpoint":…, "warm":false}` skips the boot warm pass |
 | `DELETE /v1/local/workers/{instance_id}` | local | yes | drain and stop the process group |
 | `GET /v1/local/doctor` | local | yes | host facts, bound families, counts |
 | `GET /v1/local/attempts/{attempt_key}/triage` | local | yes | the retained WorkerTriageBundle |
