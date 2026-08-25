@@ -67,7 +67,8 @@ func must(what string, err error) {
 func main() {
 	args := os.Args[1:]
 	if len(args) == 0 {
-		fmt.Fprintln(os.Stderr, "usage: cozy-live <canonical|attempt|recovered|arms|fakeworker> [--flag value]")
+		fmt.Fprintln(os.Stderr, "usage: cozy-live "+
+			"<canonical|attempt|recovered|arms|api|apiarms|apicrash|fakeworker> [--flag value]")
 		os.Exit(2)
 	}
 	section := args[0]
@@ -95,6 +96,12 @@ func main() {
 		sectionRecovered()
 	case "arms":
 		sectionArms()
+	case "apiarms":
+		sectionAPIArms()
+	case "api":
+		sectionAPI()
+	case "apicrash":
+		sectionAPICrash()
 	default:
 		fmt.Fprintf(os.Stderr, "cozy-live: unknown section %q\n", section)
 		os.Exit(2)

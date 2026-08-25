@@ -1,0 +1,32 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="referrer" content="no-referrer">
+<title>cozy — local</title>
+<link rel="stylesheet" href="/app.css">
+</head>
+<body>
+<h1>cozy LocalService</h1>
+<p class="muted">The stub page (cl-006 / cl-007's stub half). It proves the serving path,
+the localhost security posture, and the client-API wiring — nothing more. The real UI is
+deliberately undesigned and lands behind its own gate.</p>
+
+<dl>
+  <dt>credential</dt><dd id="cred">reading the launch fragment…</dd>
+  <dt>service</dt><dd id="svc">…</dd>
+  <dt>capabilities</dt><dd id="caps">…</dd>
+  <dt>endpoints</dt><dd id="eps">…</dd>
+  <dt>requests</dt><dd id="reqs">…</dd>
+  <dt>events</dt><dd id="ev">…</dd>
+</dl>
+
+<p class="muted">This page holds its credential in memory only. It arrived in the URL
+FRAGMENT — never the query string, so it was not sent to the server, is not in any access
+log, and cannot leak through <code>Referer</code> — and the fragment is scrubbed from the
+address bar below before anything else runs.</p>
+
+<script src="/app.js"></script>
+</body>
+</html>

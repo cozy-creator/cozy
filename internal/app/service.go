@@ -1,17 +1,17 @@
 package app
 
 import (
-	"encoding/json"
 	"fmt"
-	"net"
 	"net/http"
 	"os"
 	"os/exec"
 	"os/signal"
 	"strconv"
+	"strings"
 	"syscall"
 	"time"
 
+	"github.com/cozy-creator/cozy-creator-v2/internal/api"
 	"github.com/cozy-creator/cozy-creator-v2/internal/coord"
 	"github.com/cozy-creator/cozy-creator-v2/internal/exit"
 	"github.com/cozy-creator/cozy-creator-v2/internal/home"
@@ -53,30 +53,41 @@ func handleUp(ctx *Context) *exit.Error {
 	}
 
 	if ctx.Inv.Bool("--detach") {
-		return detach(ctx, port, yield)
+		return detach(ctx, port, yield, ctx.Inv.Value("--dev-endpoint"))
 	}
 
-	addr := fmt.Sprintf("127.0.0.1:%d", port)
 	socket := l.Root + "/worker.sock"
 
-	// The claim comes FIRST: a second service on this root fails here, before it can
-	// bind a port, spawn a worker, or write a row.
+	// LOOPBACK-ONLY, and the bind happens before anything durable does. internal/api
+	// owns the only net.Listen("tcp", …) in this binary; there is no flag that widens
+	// it, because the LAN door is deferred behind TLS and its own threat review.
+	v4, v6, addr, e := api.Listeners(port)
+	if e != nil {
+		return e
+	}
+	bound := []string{"ipv4"}
+	if v6 != nil {
+		bound = append(bound, "ipv6")
+	}
+	closeListeners := func() {
+		v4.Close()
+		if v6 != nil {
+			v6.Close()
+		}
+	}
+
+	// The claim: a second service on this root fails here. It comes after the bind so a
+	// port conflict is reported as a port conflict, and before anything is written.
 	held, e := service.Hold(l, addr, socket)
 	if e != nil {
+		closeListeners()
 		return e
 	}
 	defer held.Release()
 
-	// Loopback only, and the port is checked before anything durable happens.
-	ln, err := net.Listen("tcp", addr)
-	if err != nil {
-		return exit.New(exit.Conflict, "%s is held by another process: %s", addr, err).
-			WithRemedy("choose another port with --port, or stop what holds it")
-	}
-
 	st, e := records.Open(l.DB)
 	if e != nil {
-		ln.Close()
+		closeListeners()
 		return e
 	}
 	defer st.Close()
@@ -85,70 +96,97 @@ func handleUp(ctx *Context) *exit.Error {
 		Cfg: ctx.Cfg, Layout: l, Store: st, Socket: socket, Yield: yield, Log: ctx.Out,
 	})
 	if e != nil {
-		ln.Close()
+		closeListeners()
 		return e
 	}
 	killed, forgotten, e := c.Reconcile()
 	if e != nil {
-		ln.Close()
+		closeListeners()
 		return e
 	}
 
-	fmt.Fprintf(ctx.Out, "cozy LocalService up: api %s (loopback only) · worker socket %s\n",
-		addr, socket)
+	// Two per-launch credentials: one for the browser (handed over in the `--open` URL's
+	// FRAGMENT) and one for CLI clients (handed over through a 0600 file). Neither is
+	// ever printed, logged, or placed on argv, and both die with this process.
+	creds, e := api.Mint(l)
+	if e != nil {
+		closeListeners()
+		return e
+	}
+
+	resolver := NewResolver(st)
+	if spec := ctx.Inv.Value("--dev-endpoint"); spec != "" {
+		if e := resolver.LoadDev(spec); e != nil {
+			closeListeners()
+			return e
+		}
+	}
+
+	server := api.New(api.Options{
+		Coordinator: c, Cfg: ctx.Cfg, Creds: creds, Addr: addr,
+		Log: ctx.Out, Endpoints: resolver, Bound: bound,
+	})
+	handler, e := server.Handler()
+	if e != nil {
+		closeListeners()
+		return e
+	}
+
+	fmt.Fprintf(ctx.Out, "cozy LocalService up: api %s (%s, loopback only) · worker socket %s\n",
+		addr, strings.Join(bound, "+"), socket)
 	fmt.Fprintf(ctx.Out, "  records %s · yield %s · reconcile killed %d orphan(s), forgot %d stale row(s)\n",
 		l.DB, yield, killed, forgotten)
+	fmt.Fprintf(ctx.Out, "  client credential %s (%s, mode 0600)\n", creds.CLI.Digest(), l.Client)
 	fmt.Fprintf(ctx.Out, "  next: cozy status · stop with cozy down\n")
 
-	go func() { _ = http.Serve(ln, loopback(c, st, addr)) }()
+	go func() { _ = http.Serve(v4, handler) }()
+	if v6 != nil {
+		go func() { _ = http.Serve(v6, handler) }()
+	}
 	go func() { _ = c.Serve() }()
+
+	if ctx.Inv.Bool("--open") {
+		openStub(ctx, creds, addr)
+	}
 
 	stop := make(chan os.Signal, 1)
 	signal.Notify(stop, syscall.SIGINT, syscall.SIGTERM)
 	<-stop
 	fmt.Fprintln(ctx.Out, "draining endpoint processes…")
 	c.Close(30 * time.Second)
-	ln.Close()
+	closeListeners()
 	return nil
 }
 
-// loopback is the LocalService's HTTP transport. cl-006 owns the client-contract routes;
-// what exists here is the reachability surface plus the invariants that are launch
-// surface from the first line: LOOPBACK ONLY, a Host-header allowlist (the DNS-rebinding
-// kill switch), nosniff, and no permissive CORS.
-func loopback(c *coord.Coordinator, st *records.Store, addr string) http.Handler {
-	mux := http.NewServeMux()
-	mux.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {
-		counts, _ := st.Counts()
-		w.Header().Set("Content-Type", "application/json")
-		_ = json.NewEncoder(w).Encode(map[string]any{
-			"service": "up", "address": addr, "counts": counts,
-		})
-	})
-	return hostAllowlist(addr, mux)
-}
-
-func hostAllowlist(addr string, next http.Handler) http.Handler {
-	_, port, _ := net.SplitHostPort(addr)
-	allowed := map[string]bool{
-		"127.0.0.1:" + port: true, "localhost:" + port: true, "[::1]:" + port: true,
+// open hands the browser the stub page with the per-launch credential in the URL's
+// FRAGMENT. The URL is never printed in full and never logged — the fragment IS the
+// credential, and a token in a terminal scrollback is a token in a terminal scrollback.
+func openStub(ctx *Context, creds api.Credentials, addr string) {
+	if !api.StubReachable() {
+		fmt.Fprintln(ctx.Out, "  --open: this build embeds no stub page")
+		return
 	}
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("X-Content-Type-Options", "nosniff")
-		if !allowed[r.Host] {
-			http.Error(w, "host not allowed", http.StatusForbidden)
-			return
-		}
-		next.ServeHTTP(w, r)
-	})
+	url := creds.OpenURL(addr)
+	cmd := exec.Command("xdg-open", url)
+	cmd.Env = ctx.Cfg.Tool()
+	if err := cmd.Start(); err != nil {
+		fmt.Fprintf(ctx.Out, "  --open: no browser could be launched (%s)\n", err)
+		return
+	}
+	go func() { _ = cmd.Wait() }()
+	fmt.Fprintf(ctx.Out, "  --open: the stub page was opened with the browser credential %s\n",
+		creds.Browser.Digest())
 }
 
 // detach re-runs this binary as the service in its own session, then waits for the
 // LOCK to be held — the same proof every other reader uses, never a sleep.
-func detach(ctx *Context, port int, yield string) *exit.Error {
+func detach(ctx *Context, port int, yield, devEndpoint string) *exit.Error {
 	args := []string{"up", "--port", strconv.Itoa(port)}
 	if yield != "" {
 		args = append(args, "--yield", yield)
+	}
+	if devEndpoint != "" {
+		args = append(args, "--dev-endpoint", devEndpoint)
 	}
 	self, err := os.Executable()
 	if err != nil {

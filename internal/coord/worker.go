@@ -27,9 +27,15 @@ import (
 // pretend hub: when th-004 lands, the id keeps being the digest of a canonical document
 // and only the document changes.
 type Binding struct {
-	Entrypoint string
-	Record     map[string]any
+	Entrypoint string         `json:"entrypoint"`
+	Record     map[string]any `json:"record"`
 	planID     string
+	// Outputs names this entrypoint's RESULT FIELD PATHS (`image`, `preview`,
+	// `detail.thumb`). It is not part of the binding record's canonical bytes — it is
+	// the LAUNCHER's knowledge of the entrypoint's declared result shape, which cl-006
+	// needs so a client is not forced to restate it on every submission. cr-003's
+	// descriptor is where it comes from once an installed generation exists.
+	Outputs []string `json:"outputs,omitempty"`
 }
 
 // PlanID is the binding's identity: sha256 over the canonical bytes of the record
@@ -52,6 +58,16 @@ func (b *Binding) PlanID() (string, *exit.Error) {
 			doc[k] = t
 		case bool:
 			doc[k] = t
+		case float64:
+			// A record that crossed JSON (the dev-spec door) arrives with float64 where
+			// the author wrote an integer. These documents are INTEGER-ONLY, exactly as
+			// the canonical writer is, so an integral float is the integer it spells and
+			// a fractional one is a refusal rather than a rounding.
+			if t != float64(int64(t)) {
+				return "", exit.Internalf(
+					"binding record field %q is %v; these documents are integer-only", k, t)
+			}
+			doc[k] = int64(t)
 		default:
 			return "", exit.Internalf("binding record field %q has no canonical spelling (%T)", k, v)
 		}
@@ -73,17 +89,17 @@ func (b *Binding) PlanID() (string, *exit.Error) {
 // The caller (cl-010's `start`, or cl-001's live driver) resolves it from the install
 // generation; the coordinator itself resolves nothing about Python.
 type EndpointSpec struct {
-	Endpoint   string // org/name
-	ReleaseID  string
-	Generation string // the install generation this worker serves ("" = an uninstalled dev tree)
-	Python     string // the interpreter inside the endpoint's own venv
-	Args       []string
-	Dir        string
-	Imposed    []string // exact env values the launcher imposes, never inherited
-	Devices    []string // the device envelope this process may SEE
-	Bindings   []*Binding
-	GraceSec   float64
-	NoWarm     bool
+	Endpoint   string     `json:"endpoint"` // org/name
+	ReleaseID  string     `json:"release_id"`
+	Generation string     `json:"generation"` // the install generation ("" = an uninstalled dev tree)
+	Python     string     `json:"python"`     // the interpreter inside the endpoint's own venv
+	Args       []string   `json:"args"`
+	Dir        string     `json:"dir"`
+	Imposed    []string   `json:"imposed"` // exact env values the launcher imposes, never inherited
+	Devices    []string   `json:"devices"` // the device envelope this process may SEE
+	Bindings   []*Binding `json:"bindings"`
+	GraceSec   float64    `json:"grace_sec"`
+	NoWarm     bool       `json:"no_warm"`
 }
 
 // InstanceID is the endpoint's local worker SLOT identity, and it is deliberately STABLE
@@ -91,6 +107,16 @@ type EndpointSpec struct {
 // terminal replay across a restart is authorized by that identity (02 §2). A slot keeps
 // its journal root, which is what lets a restarted supervisor report `recovered_attempts`
 // at all. A NEW install generation is a genuinely new instance and gets a new id.
+// OutputsFor names one entrypoint's declared result field paths.
+func (s EndpointSpec) OutputsFor(entrypoint string) []string {
+	for _, b := range s.Bindings {
+		if b.Entrypoint == entrypoint {
+			return b.Outputs
+		}
+	}
+	return nil
+}
+
 func (s EndpointSpec) InstanceID() string {
 	sum := sha256.Sum256([]byte("slot/" + s.Endpoint + "/" + s.Generation))
 	return "ins-" + hex.EncodeToString(sum[:12])
@@ -295,15 +321,18 @@ func (c *Coordinator) WorkerLog(instanceID string) string {
 // WorkerFacts is what status renders: the protocol's own identities plus the OS
 // process-birth identity. There is no local synonym tuple.
 type WorkerFacts struct {
-	InstanceID  string
-	SessionID   string
-	PID         int
-	Incarnation uint64
-	Epoch       uint64
-	Revision    uint64
-	Intake      string
-	Devices     []string
-	Ready       []string
+	InstanceID  string   `json:"instance_id"`
+	Endpoint    string   `json:"endpoint"`
+	ReleaseID   string   `json:"release_id"`
+	SessionID   string   `json:"session_id"`
+	PID         int      `json:"pid"`
+	Incarnation uint64   `json:"executor_incarnation"`
+	Epoch       uint64   `json:"readiness_epoch"`
+	Revision    uint64   `json:"applied_revision"`
+	Intake      string   `json:"intake_state"`
+	Exited      bool     `json:"exited"`
+	Devices     []string `json:"devices"`
+	Ready       []string `json:"ready_plans"`
 }
 
 func (c *Coordinator) Worker(instanceID string) *WorkerFacts {
@@ -313,10 +342,31 @@ func (c *Coordinator) Worker(instanceID string) *WorkerFacts {
 	if w == nil {
 		return nil
 	}
-	f := &WorkerFacts{
-		InstanceID: w.instanceID, SessionID: w.sessionID, PID: w.cmd.Process.Pid,
-		Incarnation: w.incarnation, Epoch: w.epoch, Revision: w.revision,
-		Intake: pb.IntakeState_name[int32(w.intake)], Devices: w.spec.Devices,
+	f := factsOf(w)
+	return &f
+}
+
+// Workers is every worker this service currently owns — the LOCAL extension module's
+// listing (cl-006) and `cozy status`'s source.
+func (c *Coordinator) Workers() []WorkerFacts {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	out := make([]WorkerFacts, 0, len(c.workers))
+	for _, w := range c.workers {
+		out = append(out, factsOf(w))
+	}
+	return out
+}
+
+func factsOf(w *worker) WorkerFacts {
+	f := WorkerFacts{
+		InstanceID: w.instanceID, Endpoint: w.spec.Endpoint, ReleaseID: w.spec.ReleaseID,
+		SessionID: w.sessionID, Incarnation: w.incarnation, Epoch: w.epoch,
+		Revision: w.revision, Intake: pb.IntakeState_name[int32(w.intake)],
+		Exited: w.exited, Devices: w.spec.Devices, Ready: []string{},
+	}
+	if w.cmd != nil && w.cmd.Process != nil {
+		f.PID = w.cmd.Process.Pid
 	}
 	for id, ok := range w.ready {
 		if ok {

@@ -78,6 +78,9 @@ CREATE TABLE IF NOT EXISTS attempts (
   terminal_cause   TEXT    NOT NULL DEFAULT '',
   safe_message     TEXT    NOT NULL DEFAULT '',
   triage_subject   TEXT    NOT NULL DEFAULT '',
+  triage_digest    TEXT    NOT NULL DEFAULT '',
+  triage_length    INTEGER NOT NULL DEFAULT 0,
+  triage_path      TEXT    NOT NULL DEFAULT '',
   terminal_body    BLOB,
   dispatched_at    TEXT    NOT NULL,
   accepted_at      TEXT    NOT NULL DEFAULT '',
@@ -88,6 +91,7 @@ CREATE TABLE IF NOT EXISTS outputs (
   request_id TEXT    NOT NULL,
   attempt    INTEGER NOT NULL,
   output_id  TEXT    NOT NULL,
+  media_id   TEXT    NOT NULL UNIQUE,
   path       TEXT    NOT NULL,
   digest     TEXT    NOT NULL,
   length     INTEGER NOT NULL,
@@ -336,6 +340,33 @@ func (s *Store) RequestRow(id string) (*Request, *exit.Error) {
 	return &r, nil
 }
 
+// Requests lists rows newest-first, optionally filtered by state. `state=""` is every
+// request; the client contract's listing route reads exactly this.
+func (s *Store) Requests(state string, limit int) ([]Request, *exit.Error) {
+	query := `SELECT ` + requestCols + ` FROM requests`
+	args := []any{}
+	if state != "" {
+		query += ` WHERE state=?`
+		args = append(args, state)
+	}
+	query += ` ORDER BY created_at DESC, id DESC LIMIT ?`
+	args = append(args, limit)
+	rows, err := s.db.Query(query, args...)
+	if err != nil {
+		return nil, exit.Internalf("cannot list requests: %s", err)
+	}
+	defer rows.Close()
+	var out []Request
+	for rows.Next() {
+		r, err := scanRequest(rows)
+		if err != nil {
+			return nil, exit.Internalf("cannot read a request row: %s", err)
+		}
+		out = append(out, r)
+	}
+	return out, nil
+}
+
 // SettleRequest records the request's final state. Only a terminal the coordinator
 // ACCEPTED can settle one.
 func (s *Store) SettleRequest(id, state string) *exit.Error {
@@ -421,6 +452,9 @@ type Attempt struct {
 	TerminalCause  string
 	SafeMessage    string
 	TriageSubject  string
+	TriageDigest   string
+	TriageLength   int64
+	TriagePath     string
 	TerminalBody   []byte
 	DispatchedAt   string
 	AcceptedAt     string
@@ -509,8 +543,15 @@ func (s *Store) Accepted(requestID string, attempt int64, sessionID, planDigest,
 }
 
 // Output is one written asset, bound to the result FIELD PATH it came from.
+//
+// `MediaID` is the client's ONLY handle on the bytes (cl-006). It is minted here, inside
+// the terminal transaction, and it is opaque: the client contract's media route takes a
+// media id and nothing else, so there is no representation of "fetch this path" for a
+// caller to shape. `Path` is the coordinator's own knowledge of where the runtime was
+// granted to write, and it never leaves this process.
 type Output struct {
 	OutputID string
+	MediaID  string
 	Path     string
 	Digest   string
 	Length   int64
@@ -529,8 +570,25 @@ type Terminal struct {
 	Cause          string
 	SafeMessage    string
 	TriageSubject  string
-	Body           []byte
-	Outputs        []Output
+	// TriageDigest/TriageLength/TriagePath are cl-006's PERSISTENCE of the worker's
+	// bundle: the bytes are copied out of the worker root and verified against the
+	// terminal's own TriageBundleRef before this transaction runs. A one-shot run
+	// deletes its worker root (cr-011 §8), so a bundle worth keeping is the client's
+	// to keep — and "the client" is this coordinator.
+	TriageDigest string
+	TriageLength int64
+	TriagePath   string
+	Body         []byte
+	Outputs      []Output
+	// Event is the attempt-end lifecycle event, appended INSIDE this transaction so the
+	// stream cannot disagree with the authority about whether the request ended.
+	EventType    string
+	EventPayload map[string]any
+	// RequestState is what the REQUEST row becomes. It is not always the attempt's own
+	// status: an attempt the coordinator will requeue leaves the request QUEUED, and
+	// writing `abandoned` there would make the status document say `failed` for a
+	// request that is still going.
+	RequestState string
 }
 
 // AcceptTerminal is THE transaction cl-001 exists for: the terminal becomes
@@ -580,10 +638,11 @@ func (s *Store) AcceptTerminal(t Terminal) (applied bool, e *exit.Error) {
 	}
 
 	res, err := tx.Exec(`UPDATE attempts SET state='terminal', terminal_id=?, terminal_digest=?,
-		terminal_status=?, terminal_cause=?, safe_message=?, triage_subject=?, terminal_body=?,
-		closed_at=?
+		terminal_status=?, terminal_cause=?, safe_message=?, triage_subject=?, triage_digest=?,
+		triage_length=?, triage_path=?, terminal_body=?, closed_at=?
 		WHERE request_id=? AND attempt=? AND session_id=? AND state IN ('dispatching','accepted','recovered_open')`,
 		t.TerminalID, t.TerminalDigest, t.Status, t.Cause, t.SafeMessage, t.TriageSubject,
+		t.TriageDigest, t.TriageLength, t.TriagePath,
 		t.Body, now(), t.RequestID, t.Attempt, t.SessionID)
 	if err != nil {
 		return false, exit.Internalf("cannot apply the terminal of %s#%d: %s", t.RequestID, t.Attempt, err)
@@ -593,17 +652,35 @@ func (s *Store) AcceptTerminal(t Terminal) (applied bool, e *exit.Error) {
 			"terminal for %s#%d refused: the attempt row is in state %q", t.RequestID, t.Attempt, state)
 	}
 	visible := now()
-	for _, o := range t.Outputs {
-		if _, err := tx.Exec(`INSERT INTO outputs(request_id,attempt,output_id,path,digest,
-			length,mime_type,visible_at) VALUES(?,?,?,?,?,?,?,?)`,
-			t.RequestID, t.Attempt, o.OutputID, o.Path, o.Digest, o.Length, o.MimeType, visible); err != nil {
+	for i, o := range t.Outputs {
+		if o.MediaID == "" {
+			o.MediaID = NewID("med")
+			t.Outputs[i].MediaID = o.MediaID
+		}
+		if _, err := tx.Exec(`INSERT INTO outputs(request_id,attempt,output_id,media_id,path,digest,
+			length,mime_type,visible_at) VALUES(?,?,?,?,?,?,?,?,?)`,
+			t.RequestID, t.Attempt, o.OutputID, o.MediaID, o.Path, o.Digest, o.Length,
+			o.MimeType, visible); err != nil {
 			return false, exit.Internalf("cannot publish output %s of %s#%d: %s",
 				o.OutputID, t.RequestID, t.Attempt, err)
 		}
 	}
+	requestState := t.RequestState
+	if requestState == "" {
+		requestState = strings.ToLower(t.Status)
+	}
 	if _, err := tx.Exec(`UPDATE requests SET state=? WHERE id=?`,
-		strings.ToLower(t.Status), t.RequestID); err != nil {
+		requestState, t.RequestID); err != nil {
 		return false, exit.Internalf("cannot settle request %s: %s", t.RequestID, err)
+	}
+	// The terminal EVENT rides the same transaction as the terminal fact and its outputs
+	// (cl-006). A stream that announced a terminal the authority had not committed — or an
+	// authority that committed one the stream never announced — is unrepresentable.
+	if t.EventType != "" {
+		if err := appendEventTx(tx, t.RequestID, t.EventType, t.Attempt, t.EventPayload); err != nil {
+			return false, exit.Internalf("cannot append the terminal event of %s#%d: %s",
+				t.RequestID, t.Attempt, err)
+		}
 	}
 	if err := tx.Commit(); err != nil {
 		return false, exit.New(exit.Conflict,
@@ -668,6 +745,7 @@ func (s *Store) attemptsWhere(where string, args ...any) ([]Attempt, *exit.Error
 	rows, err := s.db.Query(`SELECT request_id,attempt,attempt_key,instance_id,session_id,
 		exec_spec_digest,exec_spec,state,plan_digest,construction,plan_summary,terminal_id,
 		terminal_digest,terminal_status,terminal_cause,safe_message,triage_subject,
+		triage_digest,triage_length,triage_path,
 		COALESCE(terminal_body,x''),dispatched_at,accepted_at,closed_at
 		FROM attempts WHERE `+where+` ORDER BY request_id, attempt`, args...)
 	if err != nil {
@@ -680,8 +758,8 @@ func (s *Store) attemptsWhere(where string, args ...any) ([]Attempt, *exit.Error
 		if err := rows.Scan(&a.RequestID, &a.Attempt, &a.AttemptKey, &a.InstanceID, &a.SessionID,
 			&a.ExecSpecDigest, &a.ExecSpec, &a.State, &a.PlanDigest, &a.Construction,
 			&a.PlanSummary, &a.TerminalID, &a.TerminalDigest, &a.TerminalStatus, &a.TerminalCause,
-			&a.SafeMessage, &a.TriageSubject, &a.TerminalBody, &a.DispatchedAt, &a.AcceptedAt,
-			&a.ClosedAt); err != nil {
+			&a.SafeMessage, &a.TriageSubject, &a.TriageDigest, &a.TriageLength, &a.TriagePath,
+			&a.TerminalBody, &a.DispatchedAt, &a.AcceptedAt, &a.ClosedAt); err != nil {
 			return nil, exit.Internalf("cannot read an attempt row: %s", err)
 		}
 		out = append(out, a)
@@ -693,7 +771,7 @@ func (s *Store) attemptsWhere(where string, args ...any) ([]Attempt, *exit.Error
 // The join is the invariant: an output row exists only inside the terminal transaction,
 // so "visible without a terminal" has no representation.
 func (s *Store) VisibleOutputs(requestID string) ([]Output, *exit.Error) {
-	rows, err := s.db.Query(`SELECT o.output_id,o.path,o.digest,o.length,o.mime_type
+	rows, err := s.db.Query(`SELECT o.output_id,o.media_id,o.path,o.digest,o.length,o.mime_type
 		FROM outputs o JOIN attempts a ON a.request_id=o.request_id AND a.attempt=o.attempt
 		WHERE o.request_id=? AND a.state IN ('terminal','closed')
 		ORDER BY o.attempt, o.output_id`, requestID)
@@ -704,7 +782,7 @@ func (s *Store) VisibleOutputs(requestID string) ([]Output, *exit.Error) {
 	var out []Output
 	for rows.Next() {
 		var o Output
-		if err := rows.Scan(&o.OutputID, &o.Path, &o.Digest, &o.Length, &o.MimeType); err != nil {
+		if err := rows.Scan(&o.OutputID, &o.MediaID, &o.Path, &o.Digest, &o.Length, &o.MimeType); err != nil {
 			return nil, exit.Internalf("cannot read an output row: %s", err)
 		}
 		out = append(out, o)
@@ -715,7 +793,7 @@ func (s *Store) VisibleOutputs(requestID string) ([]Output, *exit.Error) {
 // VisibleOutputsOf narrows visibility to ONE attempt — what a crash arm asks when it
 // wants to know whether the bytes THAT attempt wrote ever became a result.
 func (s *Store) VisibleOutputsOf(requestID string, attempt int64) ([]Output, *exit.Error) {
-	rows, err := s.db.Query(`SELECT o.output_id,o.path,o.digest,o.length,o.mime_type
+	rows, err := s.db.Query(`SELECT o.output_id,o.media_id,o.path,o.digest,o.length,o.mime_type
 		FROM outputs o JOIN attempts a ON a.request_id=o.request_id AND a.attempt=o.attempt
 		WHERE o.request_id=? AND o.attempt=? AND a.state IN ('terminal','closed')
 		ORDER BY o.output_id`, requestID, attempt)
@@ -726,12 +804,36 @@ func (s *Store) VisibleOutputsOf(requestID string, attempt int64) ([]Output, *ex
 	var out []Output
 	for rows.Next() {
 		var o Output
-		if err := rows.Scan(&o.OutputID, &o.Path, &o.Digest, &o.Length, &o.MimeType); err != nil {
+		if err := rows.Scan(&o.OutputID, &o.MediaID, &o.Path, &o.Digest, &o.Length, &o.MimeType); err != nil {
 			return nil, exit.Internalf("cannot read an output row: %s", err)
 		}
 		out = append(out, o)
 	}
 	return out, nil
+}
+
+// Media is the OPAQUE-ID read (cl-006). The client contract's media route takes a media
+// id and resolves it HERE, against a row that exists only because a terminal was accepted.
+// Three properties fall out of that and none of them is a check the handler performs:
+// a path cannot be asked for (there is no route shape that takes one), an output that no
+// terminal published has no id at all, and an id is unguessable.
+func (s *Store) Media(mediaID string) (*Output, string, int64, *exit.Error) {
+	var o Output
+	var requestID string
+	var attempt int64
+	err := s.db.QueryRow(`SELECT o.output_id,o.media_id,o.path,o.digest,o.length,o.mime_type,
+		o.request_id,o.attempt
+		FROM outputs o JOIN attempts a ON a.request_id=o.request_id AND a.attempt=o.attempt
+		WHERE o.media_id=? AND a.state IN ('terminal','closed')`, mediaID).
+		Scan(&o.OutputID, &o.MediaID, &o.Path, &o.Digest, &o.Length, &o.MimeType,
+			&requestID, &attempt)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, "", 0, nil
+	}
+	if err != nil {
+		return nil, "", 0, exit.Internalf("cannot read media %s: %s", mediaID, err)
+	}
+	return &o, requestID, attempt, nil
 }
 
 // Counts is what bare `cozy` renders: one line of live facts, read from the authority.

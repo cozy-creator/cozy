@@ -146,7 +146,7 @@ func editDistance(a, b string) int {
 // IMPLEMENTED row. A planned row contributes nothing — tokens describe what this
 // binary can actually do.
 func Capabilities() []string {
-	out := append([]string{}, FoundationTokens...)
+	out := Tokens()
 	for i := range Commands {
 		c := &Commands[i]
 		if c.Status == Implemented && c.Capability != "" {

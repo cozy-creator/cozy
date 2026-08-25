@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Boundary fence (boundaries.md). Architecture enforcement, not a test.
 
-Eleven families:
+Thirteen families:
   deps      forbidden dependencies (raw lines, incl. import paths and go.mod)
   impl      storage/chunk/loader/residency/tensor implementation vocabulary — cozy-creator
             renders and coordinates, it never implements the byte plane (TensorFS owns it)
@@ -26,6 +26,13 @@ Eleven families:
             A digest computed while moving bytes could only become a client receipt, and a
             client receipt substitutes for nothing (law 18); a hand-built
             `objects/sha256/…` path would be a second spelling of TensorFS's own layout.
+  api       (cl-006) a loopback bind is not a boundary: NO cookie is read anywhere
+            (bearer only — a cookie is ambient authority a browser attaches cross-site),
+            NO Access-Control-Allow-* header is ever set, and there is exactly ONE
+            net.Listen("tcp", …) site, which refuses a non-loopback address.
+  contract  (cl-006) internal/api/routes.go and docs/client-contract.md are ONE surface,
+            row for row, scope for scope. The document is what th-021's other two hosts
+            implement against, so drift is a shared-contract defect, not a doc lag.
   tensor    (cl-012) the tensorfs CLI has ONE caller: internal/tfs. The configured binary
             is read there and in the config authority, nowhere else — a second package
             shelling out to `tfs` is a second byte-plane door with its own vocabulary.
@@ -71,9 +78,38 @@ DENY_CLOUD = {"tensorhub", "jwt", "Bearer", "SignedString", "mintToken", "Servic
 # credential values; `--token <t>` is, and argv is world-readable on this planet.
 SECRET_FLAG = re.compile(r"token|secret|password|api[-_]?key|credential", re.I)
 
-# The ONE raw reader of a secret.Value: the request builder that turns it into an
-# Authorization header. The definition itself is the only other legal site.
-REVEAL_SITES = {"internal/secret/secret.go", "internal/hub/hub.go"}
+# The raw readers of a secret.Value: the sites where a credential becomes its CARRIER,
+# and nowhere else. There are exactly three, each named for what it carries the value
+# INTO, and each is one function long:
+#   secret.go        the definition itself
+#   hub/hub.go       an outbound Authorization header (cl-011)
+#   api/credentials  the 0600 handoff file and the --open URL FRAGMENT (cl-006)
+# Note what is NOT here: the local API's own bearer CHECK. It compares full digests
+# (secret.Value.Equal), so the server that authenticates a token never reads one.
+REVEAL_SITES = {
+    "internal/secret/secret.go",
+    "internal/hub/hub.go",
+    "internal/api/credentials.go",
+}
+
+# The contract document's own tables use `| \`METHOD /path\` | scope |`, which the CAS
+# and CORS raw scans would never look at — the document is markdown, not Go — but the
+# route freeze reads both and compares them.
+
+# (cl-006) The local client API's own discipline. A loopback bind is not a boundary, so
+# the properties that make it defensible are fenced rather than reviewed:
+#   - NO COOKIE is read anywhere. Cookies are ambient authority: the browser attaches
+#     them to a cross-site request whether or not the page meant it. A bearer is not
+#     ambient. (cl-007's session-cookie ceremony lands behind its real-UI gate and will
+#     move this line WITH a recorded decision — not quietly.)
+#   - NO CORS header is ever set. Not a narrow allowlist: none.
+#   - ONE net.Listen("tcp", ...) site in the whole binary, in internal/api/listen.go,
+#     which refuses a non-loopback address. A second one would be the LAN door arriving
+#     as an accident.
+DENY_COOKIE = ["http.Cookie", "SetCookie", "http.SetCookie", ".Cookies", ".Cookie("]
+CORS_HEADER = re.compile(r"Access-Control-Allow-", re.I)
+LISTEN_SITE = "internal/api/listen.go"
+LISTEN_CALL = re.compile(r'net\.Listen\s*\(\s*"tcp')
 
 ALLOW_DOOR = "//cozy:allow"
 STDIN_DOOR = "//cozy:stdin-value"
@@ -153,6 +189,11 @@ def check_sources():
             if CAS_PATH.search(s):
                 bad.append(f"{p}:{i}: [cas] a store path is composed here — TensorFS owns the "
                            f"CAS layout, and `tfs get`/`tfs put` are how an object is reached: {s}")
+            # RAW: a CORS header is a string LITERAL, so the identifier scan (which blanks
+            # literals) would never see one.
+            if CORS_HEADER.search(s) and ALLOW_DOOR not in line:
+                bad.append(f"{p}:{i}: [api] an Access-Control-Allow-* header — this API sets NO CORS "
+                           f"header at all, so a foreign page cannot read what it is handed: {s}")
         if p.suffix != ".go":
             continue
         for i, line in enumerate(strip_go(raw).splitlines(), 1):
@@ -191,7 +232,16 @@ def check_sources():
                            f"{' / '.join(sorted(TFS_SITES))} — one byte-plane door, one vocabulary: {line.strip()}")
             if rel not in REVEAL_SITES and re.search(r"\.Reveal\s*\(", line):
                 bad.append(f"{p}:{i}: [secret] Reveal() outside {' / '.join(sorted(REVEAL_SITES))} — a "
-                           f"credential's raw value is read where it becomes a header, nowhere else: {line.strip()}")
+                           f"credential's raw value is read where it becomes a carrier, nowhere else: {line.strip()}")
+            for call in DENY_COOKIE:
+                if call in line:
+                    bad.append(f"{p}:{i}: [api] '{call}' — the local client API is BEARER ONLY. A cookie "
+                               f"is ambient authority the browser attaches cross-site; cl-007's session "
+                               f"ceremony is a recorded decision, not a quiet import: {line.strip()}")
+            if rel != LISTEN_SITE and LISTEN_CALL.search(line) and ALLOW_DOOR not in src_line:
+                bad.append(f"{p}:{i}: [api] net.Listen(\"tcp\", …) outside {LISTEN_SITE} — one bind site, "
+                           f"and it REFUSES a non-loopback address. The LAN door is deferred behind TLS "
+                           f"and its own threat review, never a second listener: {line.strip()}")
     return bad
 
 
@@ -284,7 +334,52 @@ def check_matrix():
     return bad
 
 
-violations = check_sources() + check_matrix() + check_manifest() + check_secret_flags()
+def parse_doc_routes(path: pathlib.Path):
+    """Route rows out of the contract document's two tables."""
+    rows = []
+    for line in path.read_text().splitlines():
+        m = re.match(r"^\|\s*`([A-Z]+) (/[^`]*)`\s*\|\s*([a-z]+)\s*\|", line.strip())
+        if m:
+            rows.append((m.group(1), m.group(2), m.group(3)))
+    return rows
+
+
+def parse_go_routes(path: pathlib.Path):
+    rows = []
+    for method, route_path, scope in re.findall(
+        r'^\t\{"([A-Z]+)", "([^"]+)", (Core|Local),', path.read_text(), re.M
+    ):
+        rows.append((method, route_path, scope.lower()))
+    return rows
+
+
+def check_contract():
+    """(cl-006) The route table and the contract document are ONE surface.
+
+    docs/client-contract.md is what th-021's other two hosts implement against, so a route
+    that exists in code and not in the document — or the reverse — is drift in a SHARED
+    contract, not a local doc lag. The scope column is checked too: moving a route between
+    the shared CORE and the LOCAL extension is the single most consequential edit anyone
+    can make here, and it must be visible in both places at once.
+    """
+    doc = pathlib.Path("docs/client-contract.md")
+    go = pathlib.Path("internal/api/routes.go")
+    if not doc.exists() or not go.exists():
+        return [f"[contract] missing {doc if not doc.exists() else go}"]
+    expected, got = parse_doc_routes(doc), parse_go_routes(go)
+    if not expected:
+        return ["[contract] docs/client-contract.md has no route rows"]
+    bad = []
+    if len(expected) != len(got):
+        bad.append(f"[contract] {len(expected)} routes in {doc}, {len(got)} in {go}")
+    for e, g in zip(expected, got):
+        if e != g:
+            bad.append(f"[contract] documented {e} != served {g}")
+    return bad
+
+
+violations = (check_sources() + check_matrix() + check_manifest() + check_secret_flags()
+              + check_contract())
 if violations:
     print("FENCE RED (boundaries.md):", file=sys.stderr)
     for v in violations:
@@ -295,5 +390,7 @@ print(
     f"prompt({len(DENY_PROMPT) + len(DENY_PROMPT_CALLS) + 1}) matrix(15 rows) "
     f"env({len(DENY_ENV_CALLS)}) store({len(DENY_STORE)}) cloud({len(DENY_CLOUD)}) "
     f"manifest({RECLAIM_VERB.pattern}) secret({SECRET_FLAG.pattern} + Reveal@{len(REVEAL_SITES)}) "
-    f"cas({len(DENY_DIGEST)} digests@{len(DIGEST_FREE)} + store-path) tensor(tfs@{len(TFS_SITES)})"
+    f"cas({len(DENY_DIGEST)} digests@{len(DIGEST_FREE)} + store-path) tensor(tfs@{len(TFS_SITES)}) "
+    f"api({len(DENY_COOKIE)} cookie + cors + listen@{LISTEN_SITE}) "
+    f"contract({len(parse_go_routes(pathlib.Path('internal/api/routes.go')))} routes)"
 )

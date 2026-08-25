@@ -92,7 +92,7 @@ CREATE TABLE IF NOT EXISTS pins (
   generation   TEXT    NOT NULL REFERENCES install_generations(id),
   activated_at TEXT    NOT NULL,
   PRIMARY KEY (endpoint, major)
-)`}, coordSchema...)
+)`}, append(coordSchema, eventSchema...)...)
 
 func Open(path string) (*Store, *exit.Error) {
 	db, err := sql.Open("libsql", "file:"+path)

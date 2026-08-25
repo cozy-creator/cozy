@@ -9,7 +9,9 @@
 package secret
 
 import (
+	"crypto/rand"
 	"crypto/sha256"
+	"crypto/subtle"
 	"encoding/hex"
 	"encoding/json"
 	"strings"
@@ -48,3 +50,31 @@ func (v Value) MarshalJSON() ([]byte, error) { return json.Marshal(v.Digest()) }
 // Reveal is the ONE raw read. Its only legitimate caller is the code that puts the
 // value into an Authorization header; the fence enforces that.
 func (v Value) Reveal() string { return v.raw }
+
+// Equal compares a presented credential against this one in constant time, over the
+// FULL sha256 of each rather than over the raw bytes.
+//
+// It exists so the local API server (cl-006) can authenticate a bearer without ever
+// calling Reveal: the verifier holds a Value, the presented string is hashed, and the
+// comparison is between two digests. A timing oracle over the raw token is impossible
+// because the raw token is never one side of a comparison, and the `secret` fence keeps
+// Reveal out of the server entirely.
+func (v Value) Equal(presented string) bool {
+	if v.raw == "" {
+		return false // an unset credential authenticates nothing, including ""
+	}
+	mine := sha256.Sum256([]byte(v.raw))
+	theirs := sha256.Sum256([]byte(strings.TrimSpace(presented)))
+	return subtle.ConstantTimeCompare(mine[:], theirs[:]) == 1
+}
+
+// Mint generates a fresh high-entropy credential. 32 bytes of crypto/rand, hex-spelled:
+// unguessable, URL-safe, and shaped so it can ride an Authorization header, a 0600 file
+// or a URL FRAGMENT without escaping.
+func Mint() Value {
+	var b [32]byte
+	if _, err := rand.Read(b[:]); err != nil {
+		panic("cozy: the OS refused to produce randomness for a credential: " + err.Error())
+	}
+	return Value{raw: hex.EncodeToString(b[:])}
+}

@@ -8,6 +8,7 @@ import (
 	"sort"
 	"strings"
 
+	"github.com/cozy-creator/cozy-creator-v2/internal/api"
 	"github.com/cozy-creator/cozy-creator-v2/internal/exit"
 	"github.com/cozy-creator/cozy-creator-v2/internal/home"
 	"github.com/cozy-creator/cozy-creator-v2/internal/manifest"
@@ -24,7 +25,10 @@ var (
 	// The published worker protocol (worker-protocol-v2, th-024). Asserted here as a
 	// constant; the binding link to a running worker arrives with cl-001.
 	protocolVersion = "cozy.worker.v1 (wire_minor 0)"
-	contractVersion = "pending-cl-006" // local client API contract — lands with cl-006
+	// The local client API contract this binary serves (cl-006). It is the SHARED
+	// contract's core version, not a local build number: the same string is what
+	// Tensorhub's host and the pod profile answer with when they serve the same core.
+	contractVersion = api.ContractVersion
 )
 
 // handlers is the registry the manifest's Handler keys bind to. Adding one here

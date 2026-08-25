@@ -29,6 +29,14 @@ type Submission struct {
 	// by field path with exact set equality is what makes a two-output result
 	// unswappable; a positional grant would silently cross them (decisions #248).
 	Outputs []string
+
+	// BodyDigest is the caller's own digest of the WHOLE submission it is making
+	// idempotent, not merely of the payload. cl-006 supplies the digest of
+	// (endpoint, function, input, outputs) so that one key naming a different ENDPOINT
+	// conflicts as loudly as one naming different input — a digest over the payload
+	// alone would let a key be reused across functions and mean two different things.
+	// Empty falls back to the payload's digest.
+	BodyDigest string
 }
 
 // Result is what one closed attempt produced.
@@ -52,9 +60,22 @@ const MaxRequeues = 3
 // its current attempt, and never starts a second execution. Re-dispatch is the
 // coordinator's requeue PROJECTION over a terminal, never a client repeating itself.
 func (c *Coordinator) Submit(s Submission) (string, uint64, *exit.Error) {
-	bodyDigest, err := canonical.Spell(canonical.Digest(s.Payload))
-	if err != nil {
-		return "", 0, exit.Internalf("cannot digest the request body: %s", err)
+	id, attempt, _, e := c.SubmitDetail(s)
+	return id, attempt, e
+}
+
+// SubmitDetail is Submit plus the one fact an HTTP host must not guess: whether THIS
+// call started the work. A client that retried a timed-out POST needs "202, I started it"
+// and "200, this key was already yours" to be different answers, and inferring it from
+// equal request ids is a race.
+func (c *Coordinator) SubmitDetail(s Submission) (string, uint64, bool, *exit.Error) {
+	bodyDigest := s.BodyDigest
+	if bodyDigest == "" {
+		spelled, err := canonical.Spell(canonical.Digest(s.Payload))
+		if err != nil {
+			return "", 0, false, exit.Internalf("cannot digest the request body: %s", err)
+		}
+		bodyDigest = spelled
 	}
 	req, fresh, e := c.opt.Store.Submit(records.Request{
 		ID: records.NewID("req"), IdemKey: s.IdemKey, BodyDigest: bodyDigest,
@@ -62,20 +83,35 @@ func (c *Coordinator) Submit(s Submission) (string, uint64, *exit.Error) {
 		Outputs: strings.Join(s.Outputs, ","),
 	})
 	if e != nil {
-		return "", 0, e
+		return "", 0, false, e
 	}
 	if !fresh {
 		// The recorded answer. A settled request is settled; a live one is already
 		// running the attempt this call would otherwise duplicate.
 		c.logf("request %s is the recorded answer for idempotency key %s (state %s, attempt %d)",
 			req.ID, s.IdemKey, req.State, req.Ordinal)
-		return req.ID, uint64(req.Ordinal), nil
+		return req.ID, uint64(req.Ordinal), false, nil
 	}
+	c.emit(req.ID, "request.submitted", 0, map[string]any{
+		"endpoint": s.Endpoint, "function": s.Entrypoint,
+		"body_digest": bodyDigest, "plan_id": s.PlanID, "outputs": s.Outputs,
+	})
 	attempt, e := c.dispatch(req)
 	if e != nil {
-		return req.ID, 0, e
+		// NO CAPACITY is a STATE, not a failure (cl-006): the request row is already
+		// durable, so refusing it here would mean the client holds an id for something
+		// that never runs. It waits for capacity exactly as a requeue does — one queue,
+		// one projection. Every OTHER refusal (an open recovered obligation, a live
+		// attempt) is a real conflict and still refuses.
+		if e.Code != exit.Unavailable {
+			return req.ID, 0, true, e
+		}
+		c.enqueue(req.ID)
+		c.emit(req.ID, "request.queued", 0, map[string]any{"reason": e.Message})
+		c.logf("%s QUEUED for capacity: %s", req.ID, e.Message)
+		return req.ID, 0, true, nil
 	}
-	return req.ID, attempt, nil
+	return req.ID, attempt, true, nil
 }
 
 // Requeue is the coordinator's PROJECTION over a neutral terminal: an ABANDONED attempt
@@ -93,11 +129,20 @@ func (c *Coordinator) Requeue(requestID, why string) {
 	if e != nil || req == nil {
 		return
 	}
+	// THE REQUEUE IS A FACT THE MOMENT THE BUDGET IS CHARGED, and it is announced here —
+	// before dispatch, which may or may not find capacity. Announcing it only on the
+	// successful branch lost the fact exactly when it mattered most: the coordinator-kill
+	// arm requeued into a worker that was still loading, so the stream said `queued` and
+	// never said WHY, and a client could not tell a first dispatch from a retry.
+	c.emit(requestID, "request.requeued", 0, map[string]any{
+		"cause": why, "requeues": n, "budget": MaxRequeues,
+	})
 	attempt, e := c.dispatch(*req)
 	if e != nil {
 		// No capacity yet: the request WAITS. A requeue that cannot be placed is queued,
 		// never dropped — dispatch resumes the moment a worker reports the binding ready.
 		c.enqueue(requestID)
+		c.emit(requestID, "request.queued", 0, map[string]any{"reason": e.Message, "requeues": n})
 		c.logf("%s requeued %d/%d and QUEUED for capacity: %s", requestID, n, MaxRequeues, e.Message)
 		return
 	}
@@ -162,6 +207,9 @@ func (c *Coordinator) dispatch(req records.Request) (uint64, *exit.Error) {
 		}}})
 	c.logf("StartAttempt %s#%d spec=%s (%d canonical bytes) outputs=%s on %s",
 		req.ID, attempt, shortDigest(spelled), len(canonicalBytes), req.Outputs, w.instanceID)
+	c.emit(req.ID, "request.dispatched", attempt, map[string]any{
+		"instance_id": w.instanceID, "exec_spec_digest": spelled,
+	})
 	return attempt, nil
 }
 

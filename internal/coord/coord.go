@@ -74,6 +74,10 @@ type Coordinator struct {
 	pending  []string
 	revision uint64 // hub-owned, monotonic; every Directive bumps it
 	events   []string
+
+	// frames is the LOSSY live lane's fanout (stream.go). The durable lane is rows in
+	// the records authority; these two are the whole event surface cl-006 serves.
+	frames *fanout
 }
 
 type wait struct {
@@ -98,6 +102,7 @@ func Open(opt Options) (*Coordinator, *exit.Error) {
 		sessions: map[string]*session{},
 		workers:  map[string]*worker{},
 		waits:    map[string]*wait{},
+		frames:   newFanout(),
 	}
 	// A stale socket file is a leftover, never evidence: the service lock already proved
 	// no live owner exists on this root, so removing it is safe and required.
@@ -155,6 +160,21 @@ func (c *Coordinator) Events() []string {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	return append([]string(nil), c.events...)
+}
+
+// Store is the lifecycle authority this coordinator writes. cl-006's API reads requests,
+// attempts, outputs and durable events through it — the same rows, never a second copy.
+func (c *Coordinator) Store() *records.Store { return c.opt.Store }
+
+// Layout is the local root this coordinator grants into.
+func (c *Coordinator) Layout() home.Layout { return c.opt.Layout }
+
+// emit appends ONE durable lifecycle event. A failure to append is logged and never
+// fatal: the authority's own row is the fact, and the stream is its announcement.
+func (c *Coordinator) emit(requestID, eventType string, attempt uint64, payload map[string]any) {
+	if e := c.opt.Store.AppendEvent(requestID, eventType, int64(attempt), payload); e != nil {
+		c.logf("event %s for %s NOT appended: %s", eventType, requestID, e.Message)
+	}
 }
 
 // nextRevision mints the Directive revision. The hub owns it; it is monotonic, and a

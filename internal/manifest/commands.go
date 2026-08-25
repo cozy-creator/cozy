@@ -5,25 +5,35 @@ import "github.com/cozy-creator/cozy-creator-v2/internal/exit"
 // FoundationTokens are the capability tokens this binary's CLI foundation carries,
 // independent of any one command. Scripts gate on tokens, never version strings.
 var FoundationTokens = []string{
-	"cli.manifest",         // one declarative surface, startup self-checked
-	"cli.noninteractive",   // no interactive prompt anywhere; --yes gates destructive acts
-	"errors.typed",         // error(<name>) + remedy + next:
-	"exit.matrix.v1",       // the shared cozy-runtime exit matrix, 0-14
-	"install.generations",  // installs are immutable generations + a pin per (endpoint, major)
-	"install.transaction",  // generation insert and pin activation commit together
-	"output.fields",        // --fields
-	"output.full",          // --full
-	"output.json",          // --json
-	"records.libsql",       // ONE local Turso/libSQL lifecycle database
-	"service.lock",         // liveness is an OS advisory lock the owner holds
-	"worker.protocol.v1",   // the cozy.worker.v1 server over a unix socket
-	"coordinator.local",    // local dispatch: request -> attempt -> terminal -> visible output
-	"terminal.transaction", // terminal accepted + output visible commit together
-	"catalog.public_reads", // hub catalog reads carry no credential
-	"hub.static_token",     // first-party writes carry ONE static admin token; no login act exists
+	"cli.manifest",           // one declarative surface, startup self-checked
+	"cli.noninteractive",     // no interactive prompt anywhere; --yes gates destructive acts
+	"errors.typed",           // error(<name>) + remedy + next:
+	"exit.matrix.v1",         // the shared cozy-runtime exit matrix, 0-14
+	"install.generations",    // installs are immutable generations + a pin per (endpoint, major)
+	"install.transaction",    // generation insert and pin activation commit together
+	"output.fields",          // --fields
+	"output.full",            // --full
+	"output.json",            // --json
+	"records.libsql",         // ONE local Turso/libSQL lifecycle database
+	"service.lock",           // liveness is an OS advisory lock the owner holds
+	"worker.protocol.v1",     // the cozy.worker.v1 server over a unix socket
+	"coordinator.local",      // local dispatch: request -> attempt -> terminal -> visible output
+	"terminal.transaction",   // terminal accepted + output visible commit together
+	"catalog.public_reads",   // hub catalog reads carry no credential
+	"hub.static_token",       // first-party writes carry ONE static admin token; no login act exists
 	"transfer.declare_first", // publish declares the whole object set before a byte moves
 	"transfer.resumable",     // an interrupted transfer resumes from verified state, not a local journal
 	"transfer.verified_cas",  // every fetched byte enters the local store under its declared identity
+}
+
+// APITokens are the local client API's own tokens (cl-006). They live in internal/api's
+// route table — ONE registry — and are folded in here so `cozy capabilities` and
+// `GET /v1/capabilities` cannot disagree about what this binary carries.
+var APITokens []string
+
+// Tokens is the whole capability surface: the CLI foundation plus the API's own.
+func Tokens() []string {
+	return append(append([]string{}, FoundationTokens...), APITokens...)
 }
 
 var yesFlag = Flag{Name: "--yes", Summary: "confirm and execute; there is no prompt anywhere"}
@@ -77,6 +87,7 @@ var Commands = []Command{
 			{Name: "--port", Arg: "<n>", Summary: "local client API port (default 2699, loopback only)"},
 			{Name: "--open", Summary: "open the stub UI page with the per-launch token"},
 			{Name: "--yield", Arg: "<smart|always|never>", Summary: "GPU yield policy (default smart)"},
+			{Name: "--dev-endpoint", Arg: "<spec.json>", Summary: "development: serve one uninstalled endpoint from a spec document (cl-010 replaces it)"},
 		},
 		MaxArgs:    0,
 		Exits:      []exit.Code{exit.OK, exit.Conflict},
@@ -299,8 +310,8 @@ var Commands = []Command{
 	},
 	{
 		Path: []string{"hub", "config"}, Group: "catalog",
-		Summary: "the hub's running config with per-key provenance — admin token; secrets digested",
-		MaxArgs: 0,
+		Summary:    "the hub's running config with per-key provenance — admin token; secrets digested",
+		MaxArgs:    0,
 		Exits:      []exit.Code{exit.OK, exit.Usage, exit.Credential, exit.Unavailable, exit.Deadline},
 		Capability: "cmd.hub.config", Status: Implemented, Handler: "hub.config",
 	},

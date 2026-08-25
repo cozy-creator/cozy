@@ -1,0 +1,259 @@
+# The shared client contract — core v1
+
+**One contract, three hosts.** `cozy-creator` local (this host, the reference
+implementation), Tensorhub cloud (th-021), and the private-deployment pod profile
+(cl-014, `private-deployments.md` §1). The CORE below is byte-identical on all three.
+Extension modules are not: this host adds a LOCAL module, Tensorhub adds catalog,
+billing and org routes, the pod adds owner-token and output-store routes — and none of
+them ever pretends to be the core.
+
+Not invented here. This is the `/v1/requests` submit / status / cancel + SSE surface
+cozy.art already speaks against Tensorhub, taken verbatim. Every divergence from it is a
+recorded decision, and the ones this host made are in §7.
+
+`internal/api/routes.go` is the machine-readable form of the tables below and
+`scripts/fence.py`'s `contract` family checks them against each other, row for row.
+A route in one and not the other is CI-red.
+
+## 1. Transport and identity
+
+| | |
+|---|---|
+| version | `cozy.client.v1` (`GET /v1/capabilities` → `core`) |
+| encoding | JSON, UTF-8. SSE for streams. |
+| auth | `Authorization: Bearer <token>`. **Never a cookie**, on any host. |
+| idempotency | `Idempotency-Key` header on submit; required. |
+| errors | one envelope, §6 |
+
+Bearer-only is a contract property, not a local choice: it is what makes CORS simple on
+the pod host (a browser talks to the pod directly) and what keeps a cross-site request
+from carrying ambient authority on the local host.
+
+## 2. Core routes
+
+| route | scope | auth | notes |
+|---|---|---|---|
+| `POST /v1/requests` | core | yes | submit; `Idempotency-Key` required; 202 fresh / 200 replay |
+| `GET /v1/requests` | core | yes | listing, newest first; `?status=`, `?limit=` |
+| `GET /v1/requests/{id}` | core | yes | the lifecycle document |
+| `POST /v1/requests/{id}/cancel` | core | yes | requests cancellation; `?grace_ms=` |
+| `GET /v1/requests/{id}/events` | core | yes | SSE, one request, terminal-stop; `?cursor=` |
+| `GET /v1/events` | core | yes | SSE, multiplexed, never terminal; `?cursor=`, `?from=now` |
+| `GET /v1/media/{media_id}` | core | yes | bytes by opaque id; `HEAD`; one `Range` |
+| `GET /v1/capabilities` | core | yes | feature tokens |
+
+### Submit
+
+```json
+POST /v1/requests
+Idempotency-Key: <caller's key>
+
+{"endpoint": "org/name", "function": "denoise", "input": {…},
+ "outputs": ["image"], "model": "org/repo@release", "lane": "auto"}
+```
+
+`input` is the endpoint's own typed payload and is carried verbatim to the runtime.
+`outputs` names result FIELD PATHS (`image`, `detail.thumb`) and defaults to the
+entrypoint's declared set — binding by field path is what makes a two-output result
+unswappable.
+
+**The idempotency key names one request forever.** The host records the key beside a
+digest of the whole submission — endpoint, function, input, outputs — so the same key
+with a different FUNCTION conflicts as loudly as one with different input. Answers:
+
+| | |
+|---|---|
+| `202` | this call started the work; `idempotent_replay: false` |
+| `200` | the key was already recorded; the SAME request, nothing started |
+| `409 idempotency_conflict` | the key names a request with a different body |
+
+```json
+{"request_id": "req-…", "status": "queued", "attempt": 1,
+ "status_url": "/v1/requests/req-…", "response_url": "/v1/requests/req-…",
+ "cancel_url": "/v1/requests/req-…/cancel", "events_url": "/v1/requests/req-…/events",
+ "idempotent_replay": false}
+```
+
+`status`: `queued` · `in_progress` · `completed` · `failed` · `canceled`.
+
+### Status
+
+```json
+{"request_id": "req-…", "status": "completed", "endpoint": "org/name",
+ "function": "denoise", "attempt": 1, "attempts": 1,
+ "metrics": {"runtime_ms": 401, "handler_ms": 398, "peak_vram_bytes": 6…},
+ "result": {…the endpoint's typed result…},
+ "outputs": [{"output_id": "image", "media_id": "med-…", "url": "/v1/media/med-…",
+              "mime_type": "image/png", "length": 11134, "digest": "sha256:…"}],
+ "triage": {"attempt_key": "att-…", "subject_id": "trb-…",
+            "url": "/v1/local/attempts/att-…/triage", "length": 4994, "kept": true}}
+```
+
+A failed request carries `error_type` (the terminal's cause code) and `error` (the
+worker's safe message) instead of `result`.
+
+### Cancel
+
+`202 {"status": "cancel_requested"}`. A cancel is a REQUEST for cancellation, never a
+verdict: the attempt's own journaled terminal settles it, and a non-cooperative handler
+may still succeed. A cancel arriving after the terminal is an idempotent `200` with the
+lifecycle document.
+
+## 3. Events
+
+One envelope for every event, durable or live:
+
+```json
+{"type": "request.accepted", "request_id": "req-…", "attempt": 1,
+ "event_id": 42, "at": "2026-08-25T…", "payload": {…}}
+```
+
+**Durable** events are rows in the host's authority. They are monotonic, totally ordered
+across all requests, and replayable: reconnect with `?cursor=<event_id>` and everything
+after it arrives in order, across a host restart. `id:` carries the cursor on the wire.
+
+| type | payload |
+|---|---|
+| `request.submitted` | `endpoint`, `function`, `body_digest`, `plan_id`, `outputs` |
+| `request.queued` | `reason` |
+| `request.dispatched` | `instance_id`, `exec_spec_digest` |
+| `request.accepted` | `plan_digest`, `construction_digest`, `plan` |
+| `request.attempt_failed` | one ATTEMPT ended and the request did NOT — `status`, `cause`, `requeuing: true` |
+| `request.requeued` | `cause`, `requeues`, `budget` |
+| `request.completed` | `status`, `cause`, `outputs[]` (media ids), `triage_subject` |
+| `request.failed` | the above plus `error_type`, `error` |
+| `request.canceled` | the above |
+
+**Live** events (`event_id: 0`, `payload.live: true`) are the lossy lane: never durable,
+never replayed from a cursor. The LATEST tick is replayed immediately on connect so a
+mid-run subscriber renders current state. `request.progress` carries `value` (a fraction)
+and `seq`; `request.log`, `request.stage` and `request.metric` carry the worker's own.
+
+Three rules a client may rely on:
+
+1. **Terminal-stop.** On the per-request stream a terminal event is ABSORBING: the host
+   closes and the client must not reconnect. The terminal set is exactly
+   `request.completed` · `request.failed` · `request.canceled`. **An attempt ending is
+   not a request ending**: an attempt the host will requeue emits `request.attempt_failed`
+   — deliberately outside that set — because a client that stopped there would report a
+   failure for a request that goes on to succeed.
+2. **A close is not a verdict.** A stream that ends without a terminal means reconnect
+   from the cursor. It never means the request failed.
+3. **A flood cannot delay a terminal.** Live frames are shed at a bounded buffer; durable
+   rows are drained to exhaustion before a terminal is written.
+
+**Media is announced, never pushed.** A terminal event carries `media_id`s. Bytes are
+fetched from the media route. No frame on any stream carries base64 image data, and the
+event envelope has no field that could.
+
+## 4. Media
+
+`GET /v1/media/{media_id}` and nothing else. The id is minted inside the terminal
+transaction, so an output no terminal published has no id at all.
+
+**There is no path form.** Not a rejected one — none. The route's only input is an opaque
+id, which is what makes the ComfyUI `/view` traversal class structurally absent rather
+than defended against.
+
+Responses carry `X-Content-Type-Options: nosniff`, `X-Cozy-Digest` (the digest the
+manifest declared, so a client verifies rather than trusts), and
+`Content-Disposition` with a filename derived from the id. An explicit MIME allowlist is
+served inline; anything else becomes `application/octet-stream; attachment`.
+`image/svg+xml` is never served inline — an SVG is an executable document. `HEAD` gives
+the size. `Range` honours exactly ONE range; a multi-range request is `416`.
+
+## 5. Capabilities
+
+```json
+{"core": "cozy.client.v1", "host": "cozy-creator.local", "tokens": ["api.…", …]}
+```
+
+Feature presence is a TOKEN. A client never infers a feature from a version string.
+
+## 6. The error envelope
+
+```json
+{"error": {"code": "idempotency_conflict", "message": "…", "remedy": "…",
+           "request_id": "req-…"}}
+```
+
+`code` is the name from the shared exit matrix (`docs/exit-matrix.md`), which is also
+what the CLI exits with — one vocabulary from HTTP status to shell exit code. Every
+refusal renders through it, including an unknown route: a client that parses one envelope
+parses every answer.
+
+| matrix | HTTP |
+|---|---|
+| usage · validation | 400 |
+| credential | 401 |
+| not_found · offline_miss | 404 |
+| structural | 422 |
+| conflict | 409 |
+| capacity | 507 |
+| unavailable | 503 |
+| deadline | 504 |
+| failed · canceled | **200** — a terminal is an answer, not a transport failure |
+
+## 7. Local extension module
+
+Mounted under `/v1/local/` so the boundary is visible in the URL. The cloud host serves
+none of these.
+
+| route | scope | auth | notes |
+|---|---|---|---|
+| `GET /v1/local/endpoints` | local | yes | installed endpoints and their functions |
+| `GET /v1/local/workers` | local | yes | live workers: protocol identities, devices, intake |
+| `POST /v1/local/workers` | local | yes | make one endpoint resident (idempotent) |
+| `DELETE /v1/local/workers/{instance_id}` | local | yes | drain and stop the process group |
+| `GET /v1/local/doctor` | local | yes | host facts, bound families, counts |
+| `GET /v1/local/attempts/{attempt_key}/triage` | local | yes | the retained WorkerTriageBundle |
+| `GET /healthz` | local | no | liveness ONLY; says nothing about any request |
+| `GET /{$}` | local | no | the embedded stub page |
+| `GET /app.js` | local | no | the stub's script — a FILE, so no inline-script CSP |
+| `GET /app.css` | local | no | the stub's style, for the same reason |
+
+Triage is served by the OPAQUE attempt key and verified on read against the digest its
+terminal declared. A bundle whose bytes moved is `409 bundle_corrupt`, never a plausible
+story.
+
+## 8. Local host security posture
+
+A loopback bind is not a boundary — Ollama's DNS-rebinding CVE is the standing proof.
+This host's chain, in order:
+
+1. **Loopback-only bind**, IPv4 and IPv6, with no flag that widens it. The LAN door is
+   deferred behind TLS, durable auth and its own threat review.
+2. **Host allowlist** — three exact spellings; a rebinding request carries the attacker's
+   hostname and is refused before routing.
+3. **Origin check** on every mutation and every stream open.
+4. **Bearer auth**, no cookie read anywhere.
+5. **No CORS headers at all**, and a strict CSP on every response.
+
+Two per-launch credentials, both dying with the process: the BROWSER token rides
+`--open`'s URL FRAGMENT (never the query string — a fragment reaches neither the server
+nor an access log nor a `Referer`), and the CLI credential is handed over through a 0600
+file. Neither ever appears in argv, a log line, or a rendered error.
+
+## 9. Divergences from the cozy.art/Tensorhub surface
+
+Recorded, not accidental.
+
+1. **`GET /v1/events`, the multiplexed stream, is NEW.** cozy.art opens one EventSource
+   per request; a browser caps concurrent connections per origin at six, so a gallery
+   watching ten requests silently stops receiving four of them. Same envelope, same
+   cursor, one connection. The per-request route is unchanged and still terminal-stops.
+2. **`events_url` is added to the submit handle.** cozy.art derives it by string
+   concatenation; naming it is what lets a host move the stream later.
+3. **`idempotent_replay` is added, and 200-vs-202 is load-bearing.** A client that
+   retried a timed-out POST must be able to tell "I started it" from "this key was
+   already mine" without comparing ids.
+4. **The body digest covers the whole submission**, not the payload alone.
+5. **Media is served by opaque id rather than a presigned URL.** The cloud host presigns
+   because its bytes are in object storage; the local host's are on this disk. The
+   CLIENT-VISIBLE shape is the same — an opaque handle in a document, a fetch to get
+   bytes — which is what the contract actually requires.
+6. **No estimate surface.** th-021's price-and-wait quote has no local meaning: nothing
+   bills and the queue depth is one card.
+7. **Model/lane/adapter overrides are ADMISSIBLE here and refuse `501
+   override_unresolved`.** The local binding resolver is cl-005's. An override that is
+   silently ignored is the worse bug, so the field refuses rather than being dropped.

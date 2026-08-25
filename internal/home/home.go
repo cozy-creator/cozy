@@ -27,6 +27,14 @@ type Layout struct {
 	// verification records are (a transfer resumes from what is VERIFIED, never from
 	// what happens to be lying in a temp directory).
 	Transfer string
+	// Triage holds WorkerTriageBundles copied out of worker roots (cl-006). A worker
+	// root does not outlive its worker — a one-shot run deletes it — so the bundle
+	// worth keeping is kept HERE, by the client that wanted it.
+	Triage string
+	// Client is the CLI's local credential file, mode 0600. A credential never rides
+	// argv (cl-011's rule), so the handoff is an OS-protected file the LocalService
+	// writes and its own CLI reads.
+	Client string
 }
 
 func Open(root string) (Layout, *exit.Error) {
@@ -43,8 +51,10 @@ func Open(root string) (Layout, *exit.Error) {
 		Outputs:     filepath.Join(root, "outputs"),
 		CAS:         filepath.Join(root, "cas"),
 		Transfer:    filepath.Join(root, "transfer"),
+		Triage:      filepath.Join(root, "triage"),
+		Client:      filepath.Join(root, "client.cred"),
 	}
-	for _, dir := range []string{l.Generations, l.Workers, l.Outputs} {
+	for _, dir := range []string{l.Generations, l.Workers, l.Outputs, l.Triage} {
 		if err := os.MkdirAll(dir, 0o755); err != nil {
 			return Layout{}, exit.Internalf("cannot create %s: %s", dir, err)
 		}
@@ -58,6 +68,12 @@ func (l Layout) GenerationDir(id string) string { return filepath.Join(l.Generat
 // WorkerDir is one worker session's own root: its journal, its log, and the binding
 // plan records the runtime resolves out of its COZY_HOME.
 func (l Layout) WorkerDir(session string) string { return filepath.Join(l.Workers, session) }
+
+// TriageFile is where one kept bundle lives, named by its OPAQUE subject and by
+// nothing a client can shape.
+func (l Layout) TriageFile(subject string) string {
+	return filepath.Join(l.Triage, subject+".json")
+}
 
 // AttemptDir is the local output namespace for one attempt. The coordinator grants
 // exactly this directory and nothing above it; the runtime writes under the grant and

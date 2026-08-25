@@ -87,6 +87,50 @@ device ledger, and output publication authority.
 - `internal/config` is the ONE environment reader: `Load()` reads once and freezes, and
   it is also the child-env allowlist.
 
+## The local client API (cl-006)
+
+`cozy up` serves the **shared client contract's CORE** on loopback — the same surface
+Tensorhub (th-021) and the private-deployment pod (cl-014) serve, byte for byte. Full
+contract: [`docs/client-contract.md`](docs/client-contract.md), which
+`scripts/fence.py`'s `contract` family checks against `internal/api/routes.go` row for
+row. `internal/api` is a CLIENT of `internal/coord` and opens no second door into the
+runtime: every submission still flows coordinator → worker protocol → runtime.
+
+- **Submit / status / cancel** (`/v1/requests`). The idempotency key names one request
+  forever; the body digest covers the WHOLE submission, so one key naming a different
+  function conflicts as loudly as one with different input. 202 started it, 200 is a
+  replay, 409 is a changed body.
+- **Two SSE routes over one event model.** Durable lifecycle rows live in the same
+  authority as the requests they describe — monotonic, totally ordered, resumable from
+  `?cursor=` across a restart — and the terminal event is appended INSIDE the terminal
+  transaction. Live progress is the lossy lane: never durable, never replayed, latest
+  tick replayed on connect. `/v1/events` multiplexes every request onto one connection
+  (a browser caps six per origin); `/v1/requests/{id}/events` terminal-stops.
+  **An attempt ending is not a request ending**: an attempt the coordinator will requeue
+  emits `request.attempt_failed`, deliberately outside the terminal set.
+- **Media by OPAQUE id only.** The id is minted inside the terminal transaction, so an
+  output no terminal published has no id at all — the ComfyUI `/view` traversal class is
+  structurally absent rather than defended against. MIME allowlist, no inline SVG,
+  `nosniff`, one bounded `Range`.
+- **Triage** (`/v1/local/attempts/{key}/triage`). cl-006 owns what cr-011 deliberately did
+  not: the bundle is COPIED out of the worker root at terminal time, verified against the
+  digest the accepted TERMINAL declared (stronger than the worker's own journal), and
+  re-verified on every read — an edited bundle is `bundle_corrupt`, never a story.
+- **A loopback bind is not a boundary.** Loopback-only, IPv4 and IPv6, with no flag that
+  widens it; a `Host` allowlist (the DNS-rebinding kill switch); `Origin` checks on every
+  mutation and stream open; **bearer only, no cookie read anywhere**; no CORS header at
+  all; a strict CSP. Two per-launch credentials die with the process — the browser's rides
+  `--open`'s URL FRAGMENT (never the query string, so it reaches neither the server nor a
+  log nor a `Referer`), the CLI's a 0600 file. Neither ever enters argv, a log, or an
+  error. The `api` fence family proves the cookie, CORS and single-bind-site invariants.
+- The **stub page** (cl-007's unblocked half) is embedded with `go:embed`, three files so
+  its CSP needs no inline script.
+
+Live drivers: `./cozy-live apiarms` (35 door/refusal checks, no GPU), `./cozy-live api`
+(51 checks, real SDXL end to end), `./cozy-live apicrash` (23 checks — `kill -9` the
+coordinator mid-attempt and watch the recovered-attempts law from the client's seat).
+Pin the runtime with `--runtime <git archive> --venv <venv>`.
+
 ## Catalog and first-party publish (cl-011)
 
 `internal/hub` is the ONE client onto tensorhub's HTTP API. Launch-1 tensorhub has **no

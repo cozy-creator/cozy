@@ -3,6 +3,7 @@ package coord
 import (
 	"bytes"
 	"fmt"
+	"os"
 	"path/filepath"
 	"strings"
 	"time"
@@ -99,8 +100,10 @@ func (h *hub) StreamProgress(stream pb.Worker_StreamProgressServer) error {
 		if err != nil {
 			return stream.SendAndClose(&emptypb.Empty{})
 		}
-		h.c.logf("progress %s#%d seq=%d %s %dB", p.RequestId, p.Attempt, p.Seq,
-			p.ContentType, len(p.Data))
+		// The lossy lane's ONE consumer: the live fanout cl-006 serves as
+		// `request.progress`. It never touches the authority and never blocks this
+		// reader — a slow SSE client sheds frames, it does not slow the protocol.
+		h.c.frames.publish(frameOf(p))
 	}
 }
 
@@ -315,6 +318,9 @@ func (c *Coordinator) onAccepted(s *session, a *pb.AttemptAccepted) {
 	}
 	c.logf("AttemptAccepted %s#%d plan=%s construction=%s [%s]",
 		a.RequestId, a.Attempt, shortDigest(planDigest), shortDigest(construction), summary)
+	c.emit(a.RequestId, "request.accepted", a.Attempt, map[string]any{
+		"plan_digest": planDigest, "construction_digest": construction, "plan": summary,
+	})
 	c.waitFor(key(a.RequestId, a.Attempt)).markAccepted()
 }
 
@@ -365,6 +371,19 @@ func (c *Coordinator) onTerminal(s *session, t *pb.AttemptTerminal) {
 	status := terminalStatus(doc.Int("status"))
 	cause := causeCode(doc.Sub("cause").Int("code"))
 	outputs := c.outputsOf(t.RequestId, t.Attempt, doc)
+	// cl-006 OWNS TRIAGE PERSISTENCE (cr-011's seam): the bundle lives in the worker's
+	// own root, and a worker root does not outlive its worker. Copy it out and verify it
+	// against the terminal document's OWN TriageBundleRef before the transaction runs.
+	triage := c.captureTriage(s, t.RequestId, t.Attempt, doc.Sub("triage_bundle"))
+	// WHETHER THIS ATTEMPT ENDS THE REQUEST is decided BEFORE the event is written, not
+	// after. An ABANDONED attempt that the requeue projection will re-dispatch has ended
+	// an ATTEMPT, not a REQUEST — and the contract's terminal-stop rule means a client
+	// that saw `request.failed` would close its stream and report a failure for a request
+	// that goes on to succeed. Found live by the coordinator-kill arm: the killed
+	// attempt's ABANDONED terminal stopped the client's stream while attempt 2 was still
+	// being minted.
+	requeuing := requeueable(status, cause)
+	kept := triage.keep(status, cause, doc.Str("safe_message"), outputs, requeuing)
 
 	began := time.Now()
 	applied, e := c.opt.Store.AcceptTerminal(records.Terminal{
@@ -372,8 +391,14 @@ func (c *Coordinator) onTerminal(s *session, t *pb.AttemptTerminal) {
 		ExecSpecDigest: spelledSpec, TerminalID: t.TerminalId,
 		TerminalDigest: shortNone(t.TerminalDigest), Status: status, Cause: cause,
 		SafeMessage:   doc.Str("safe_message"),
-		TriageSubject: doc.Sub("triage_bundle").Str("subject_id"),
-		Body:          t.TerminalCanonical, Outputs: outputs,
+		TriageSubject: triage.Subject, TriageDigest: triage.Digest,
+		TriageLength: triage.Length, TriagePath: triage.Path,
+		Body: t.TerminalCanonical, Outputs: outputs,
+		EventType: kept.Type, EventPayload: kept.Payload,
+		// A requeueing request is QUEUED for its next ordinal, not failed. Writing the
+		// attempt's own status onto the request row would make the status document say
+		// `failed` for a request that is still going.
+		RequestState: requeueState(status, requeuing),
 	})
 	if e != nil {
 		refuse("%s", e.Message)
@@ -409,8 +434,127 @@ func (c *Coordinator) onTerminal(s *session, t *pb.AttemptTerminal) {
 		c.Requeue(t.RequestId, status+"/"+cause)
 		return
 	}
+	c.frames.forget(t.RequestId)
 	_ = c.opt.Store.SettleRequest(t.RequestId, strings.ToLower(status))
 	c.waitRequest(t.RequestId).markClosed(outcome)
+}
+
+// Triage is what cl-006 persisted for one attempt. An empty Subject means the terminal
+// named no bundle, which is a fact, not a failure.
+type Triage struct {
+	Subject string
+	Digest  string
+	Length  int64
+	Path    string
+	Fault   string // why the bytes were not kept, when a subject was named and they were not
+}
+
+// terminalEvent is the durable lifecycle event that rides the terminal transaction.
+type terminalEvent struct {
+	Type    string
+	Payload map[string]any
+}
+
+// requeueState is the REQUEST's state after one attempt ended. A requeueing request is
+// queued for its next ordinal; anything else takes the attempt's own status.
+func requeueState(status string, requeuing bool) string {
+	if requeuing {
+		return "queued"
+	}
+	return strings.ToLower(status)
+}
+
+// keep renders the attempt-end event's closed payload. It carries an OPAQUE handle for
+// every asset (media id) and for triage (subject) — never a path, never bytes, and never
+// base64. That is what makes "no client-supplied path exists" a property of the schema
+// rather than of a validator.
+//
+// `requeuing` decides whether this is a TERMINAL event at all. `request.attempt_failed`
+// is deliberately not in the terminal set: it says an attempt ended and the request did
+// not, which is precisely the state the recovered-attempts law creates.
+func (tr Triage) keep(status, cause, safeMessage string, outputs []records.Output, requeuing bool) terminalEvent {
+	eventType := "request.failed"
+	switch {
+	case requeuing:
+		eventType = "request.attempt_failed"
+	case status == "SUCCEEDED":
+		eventType = "request.completed"
+	case status == "CANCELED":
+		eventType = "request.canceled"
+	}
+	media := make([]map[string]any, 0, len(outputs))
+	for _, o := range outputs {
+		media = append(media, map[string]any{
+			"output_id": o.OutputID, "media_id": o.MediaID,
+			"mime_type": o.MimeType, "length": o.Length, "digest": o.Digest,
+		})
+	}
+	payload := map[string]any{
+		"status": status, "cause": cause, "outputs": media, "requeuing": requeuing,
+	}
+	if status != "SUCCEEDED" {
+		payload["error_type"] = cause
+		payload["error"] = safeMessage
+	}
+	if tr.Subject != "" {
+		payload["triage_subject"] = tr.Subject
+	}
+	if tr.Fault != "" {
+		payload["triage_fault"] = tr.Fault
+	}
+	return terminalEvent{Type: eventType, Payload: payload}
+}
+
+// captureTriage copies the worker's bundle into cozy-creator's own store, verified
+// against the TERMINAL DOCUMENT's reference rather than against the worker's journal.
+//
+// That choice is deliberate and stronger than cr-011's own reader: this coordinator has
+// already recomputed the terminal digest over the resident bytes and parsed the document
+// under unknown-field refusal, so `triage_bundle.write_receipt_digest` is a fact it
+// ACCEPTED. Reading the worker's journal instead would be trusting a file the worker can
+// still write. A mismatch is recorded as a fault on the attempt and the bytes are not
+// kept — a bundle that does not hash to what the terminal claimed is not evidence.
+func (c *Coordinator) captureTriage(s *session, requestID string, attempt uint64, ref canonical.Doc) Triage {
+	tr := Triage{Subject: ref.Str("subject_id")}
+	if tr.Subject == "" {
+		return tr
+	}
+	tr.Digest, tr.Length = ref.Str("write_receipt_digest"), ref.Int("length")
+
+	c.mu.Lock()
+	w := c.workers[s.instanceID]
+	c.mu.Unlock()
+	if w == nil {
+		tr.Fault = "the worker that wrote it is gone before its bundle could be copied"
+		return tr
+	}
+	source := filepath.Join(c.opt.Layout.WorkerDir(w.instanceID), "run", "triage", tr.Subject+".json")
+	data, err := os.ReadFile(source)
+	if err != nil {
+		tr.Fault = "bundle_absent: the terminal names a bundle that is not on disk"
+		c.logf("triage %s for %s#%d NOT kept: %s", tr.Subject, requestID, attempt, err)
+		return tr
+	}
+	spelled, _ := canonical.Spell(canonical.Digest(data))
+	if int64(len(data)) != tr.Length || spelled != tr.Digest {
+		tr.Fault = fmt.Sprintf("bundle_corrupt: %d B hashing to %s does not match the terminal's %d B / %s",
+			len(data), shortDigest(spelled), tr.Length, shortDigest(tr.Digest))
+		c.logf("triage %s for %s#%d REFUSED: %s", tr.Subject, requestID, attempt, tr.Fault)
+		return tr
+	}
+	dest := c.opt.Layout.TriageFile(tr.Subject)
+	if err := os.MkdirAll(filepath.Dir(dest), 0o755); err != nil {
+		tr.Fault = "the local triage store is unwritable: " + err.Error()
+		return tr
+	}
+	if err := os.WriteFile(dest, data, 0o600); err != nil {
+		tr.Fault = "the bundle could not be kept: " + err.Error()
+		return tr
+	}
+	tr.Path = dest
+	c.logf("triage %s kept for %s#%d (%d B, %s)", tr.Subject, requestID, attempt,
+		tr.Length, shortDigest(tr.Digest))
+	return tr
 }
 
 // requeueable is the coordinator's projection: an accepted-but-incomplete attempt and
@@ -447,6 +591,12 @@ func (c *Coordinator) outputsOf(requestID string, attempt uint64, doc canonical.
 		id := e.Str("output_id")
 		out = append(out, records.Output{
 			OutputID: id,
+			// The OPAQUE media id is minted HERE, before the terminal transaction, so
+			// the terminal EVENT can announce it in the same commit that publishes the
+			// row. Minting it inside the transaction instead left the announcement with
+			// an empty handle — found live by the arm that reads the event's own
+			// `outputs`, which is exactly the field a UI would render from.
+			MediaID:  records.NewID("med"),
 			Path:     filepath.Join(dir, id),
 			Digest:   e.Str("digest"),
 			Length:   e.Int("length"),

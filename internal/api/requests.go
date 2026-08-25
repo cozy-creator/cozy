@@ -1,0 +1,434 @@
+package api
+
+import (
+	"encoding/base64"
+	"encoding/json"
+	"io"
+	"net/http"
+	"strconv"
+	"strings"
+
+	"github.com/cozy-creator/cozy-creator-v2/internal/canonical"
+	"github.com/cozy-creator/cozy-creator-v2/internal/coord"
+	"github.com/cozy-creator/cozy-creator-v2/internal/exit"
+	"github.com/cozy-creator/cozy-creator-v2/internal/records"
+	pb "github.com/cozy-creator/cozy-creator-v2/protocol/cozy/worker/v1"
+)
+
+// The CONTRACT CORE, taken from the surface cozy.art already speaks against Tensorhub:
+// a 202 handle out of submit, a lifecycle document out of status, an explicit cancel.
+// The shapes below are that surface's, field for field — `status_url` / `response_url` /
+// `cancel_url` are not this host's inventions and are not renamed for local taste. Where
+// this host adds a field it is ADDITIVE and named as such in docs/client-contract.md.
+
+// Submission is the request body. `input` is the endpoint's own typed payload and is
+// carried VERBATIM: the coordinator digests exactly the bytes the client sent, so a
+// re-submit under one key compares the same digest a hub would have compared.
+type Submission struct {
+	Endpoint   string          `json:"endpoint"`
+	Function   string          `json:"function"`
+	Input      json.RawMessage `json:"input"`
+	Outputs    []string        `json:"outputs,omitempty"`
+	Model      string          `json:"model,omitempty"`
+	Lane       string          `json:"lane,omitempty"`
+	Adapter    string          `json:"adapter,omitempty"`
+	PlanID     string          `json:"plan_id,omitempty"`
+	AttemptKey string          `json:"-"`
+}
+
+// Handle is the 202 answer: the request's id and where to go next. Verbatim from the
+// AsyncRequestHandle cozy.art consumes, plus `attempt` (which a local client can act on
+// because there is no queue-position story to tell yet).
+type Handle struct {
+	RequestID     string `json:"request_id"`
+	Status        string `json:"status"`
+	Attempt       uint64 `json:"attempt"`
+	StatusURL     string `json:"status_url"`
+	ResponseURL   string `json:"response_url"`
+	CancelURL     string `json:"cancel_url"`
+	EventsURL     string `json:"events_url"`
+	QueuePosition *int   `json:"queue_position,omitempty"`
+	// Replay is true when this key was already recorded: the SAME request answers, and
+	// nothing new was started. A client that retried a timed-out POST needs to know it
+	// did not create a second execution, and inferring it from equal ids is a guess.
+	Replay bool `json:"idempotent_replay"`
+}
+
+func (s *Server) submit(w http.ResponseWriter, r *http.Request) {
+	body, err := io.ReadAll(io.LimitReader(r.Body, MaxBody+1))
+	if err != nil {
+		s.refuse(w, r, http.StatusBadRequest, "unreadable_body",
+			"the request body could not be read: "+err.Error(), "")
+		return
+	}
+	if len(body) > MaxBody {
+		s.refuse(w, r, http.StatusRequestEntityTooLarge, "body_too_large",
+			"a submission body is bounded at "+strconv.Itoa(MaxBody)+" bytes",
+			"typed input only; assets arrive as references")
+		return
+	}
+	var sub Submission
+	if err := json.Unmarshal(body, &sub); err != nil {
+		s.refuse(w, r, http.StatusBadRequest, "malformed_body",
+			"the submission is not a JSON object: "+err.Error(), "")
+		return
+	}
+	if sub.Endpoint == "" || sub.Function == "" {
+		s.refuse(w, r, http.StatusBadRequest, "invalid_request",
+			"a submission names an endpoint and a function",
+			`{"endpoint":"org/name","function":"denoise","input":{…}}`)
+		return
+	}
+	// Overrides are ADMISSIBLE HERE and refuse typed on public serving (th-021's
+	// surface scoping). Locally the override is always available — but the machinery
+	// that resolves one is cl-005's, so this host refuses the FIELD rather than
+	// pretending to honour it. An override that is silently ignored is the worse bug.
+	if sub.Model != "" || sub.Lane != "" || sub.Adapter != "" {
+		s.refuse(w, r, http.StatusNotImplemented, "override_unresolved",
+			"model/lane/adapter overrides are admissible on this host but nothing resolves one yet",
+			"the local binding resolver lands with cl-005; this host refuses rather than ignoring it")
+		return
+	}
+
+	spec, e := s.resolvePlan(sub)
+	if e != nil {
+		s.refuseTyped(w, r, e)
+		return
+	}
+	spec.IdemKey = strings.TrimSpace(r.Header.Get("Idempotency-Key"))
+	// THE BODY DIGEST is over the whole submission the key names, not over the payload
+	// alone: one key that named a different FUNCTION must conflict as loudly as one
+	// that named different input. The canonical document is the digest's subject, so
+	// two clients that spell the same submission differently still agree.
+	digest, e := submissionDigest(spec)
+	if e != nil {
+		s.refuseTyped(w, r, e)
+		return
+	}
+	spec.BodyDigest = digest
+
+	requestID, attempt, fresh, e := s.coord.SubmitDetail(spec)
+	if e != nil {
+		s.refuseTyped(w, r, e)
+		return
+	}
+	row, e := s.store.RequestRow(requestID)
+	if e != nil || row == nil {
+		s.refuse(w, r, http.StatusInternalServerError, "internal",
+			"the request was recorded and cannot be read back", "")
+		return
+	}
+	handle := s.handleOf(*row, attempt)
+	handle.Replay = !fresh
+	// 202 means "this host started work", and it may not be said twice for one key.
+	// A recorded answer is a 200 with the same handle: the client already has it.
+	status := http.StatusAccepted
+	if handle.Replay {
+		status = http.StatusOK
+	}
+	s.ok(w, r, status, handle)
+}
+
+// submissionDigest is the canonical identity of one submission. It uses the SAME writer
+// the protocol documents use, so the digest a client can reproduce is the digest the
+// authority recorded.
+func submissionDigest(spec coord.Submission) (string, *exit.Error) {
+	doc := map[string]canonical.Value{
+		"format":   "cozy.client.Submission/1",
+		"endpoint": spec.Endpoint,
+		"function": spec.Entrypoint,
+		"plan_id":  spec.PlanID,
+		"input":    base64.StdEncoding.EncodeToString(spec.Payload),
+		"outputs":  strings.Join(spec.Outputs, ","),
+	}
+	data, err := canonical.Write(doc)
+	if err != nil {
+		return "", exit.Internalf("cannot canonicalize the submission: %s", err)
+	}
+	spelled, err := canonical.Spell(canonical.Digest(data))
+	if err != nil {
+		return "", exit.Internalf("cannot digest the submission: %s", err)
+	}
+	return spelled, nil
+}
+
+func (s *Server) handleOf(row records.Request, attempt uint64) Handle {
+	base := "/v1/requests/" + row.ID
+	h := Handle{
+		RequestID: row.ID, Status: contractStatus(row.State), Attempt: attempt,
+		StatusURL: base, ResponseURL: base, CancelURL: base + "/cancel",
+		EventsURL: base + "/events",
+	}
+	if h.Status == "queued" {
+		position := 0
+		h.QueuePosition = &position
+	}
+	return h
+}
+
+// contractStatus projects the authority's own state names onto the contract's vocabulary.
+// The two are deliberately not the same word list: the store records what happened to a
+// row, the contract says what a client should do next.
+func contractStatus(state string) string {
+	switch state {
+	case "submitted", "queued":
+		// `queued` is BOTH "never dispatched" and "an attempt ended and the coordinator
+		// is minting the next ordinal". From a client's seat those are the same fact:
+		// work is owed and nothing has settled.
+		return "queued"
+	case "dispatching":
+		return "in_progress"
+	case "succeeded":
+		return "completed"
+	case "failed", "abandoned", "refused":
+		return "failed"
+	case "canceled":
+		return "canceled"
+	}
+	return state
+}
+
+// resolvePlan turns the client's endpoint/function into the coordinator's Submission.
+// The plan id is resolved through the LOCAL resolver — the same object `start` uses — so
+// a client never names a plan digest and a submission can never bind a binding this host
+// did not install.
+func (s *Server) resolvePlan(sub Submission) (coord.Submission, *exit.Error) {
+	out := coord.Submission{
+		Endpoint: sub.Endpoint, Entrypoint: sub.Function, Payload: []byte(sub.Input),
+		Outputs: sub.Outputs, PlanID: sub.PlanID,
+	}
+	if len(out.Payload) == 0 {
+		out.Payload = []byte("{}")
+	}
+	if out.PlanID == "" {
+		if s.endpoints == nil {
+			return out, exit.Unavailablef("this LocalService resolves no endpoints")
+		}
+		spec, e := s.endpoints.Resolve(sub.Endpoint)
+		if e != nil {
+			return out, e
+		}
+		for _, b := range spec.Bindings {
+			if b.Entrypoint != sub.Function {
+				continue
+			}
+			id, e := b.PlanID()
+			if e != nil {
+				return out, e
+			}
+			out.PlanID = id
+		}
+		if out.PlanID == "" {
+			return out, exit.New(exit.NotFound, "%s has no function %q", sub.Endpoint, sub.Function).
+				WithRemedy("GET /v1/local/endpoints lists the functions this host serves")
+		}
+		if len(out.Outputs) == 0 {
+			out.Outputs = spec.OutputsFor(sub.Function)
+		}
+	}
+	return out, nil
+}
+
+// ------------------------------------------------------------------------- status
+
+// Lifecycle is the status document. Verbatim from RequestLifecycleResponse plus the
+// fields a local client has and a cloud one does not need to presign: the typed result,
+// the visible media by OPAQUE id, and the triage handle.
+type Lifecycle struct {
+	RequestID   string         `json:"request_id"`
+	Status      string         `json:"status"`
+	Endpoint    string         `json:"endpoint"`
+	Function    string         `json:"function"`
+	Attempt     uint64         `json:"attempt"`
+	Attempts    int            `json:"attempts"`
+	ResponseURL string         `json:"response_url"`
+	Metrics     map[string]any `json:"metrics,omitempty"`
+	ErrorType   string         `json:"error_type,omitempty"`
+	Error       string         `json:"error,omitempty"`
+	Result      any            `json:"result,omitempty"`
+	Outputs     []MediaRef     `json:"outputs"`
+	Triage      *TriageRef     `json:"triage,omitempty"`
+	CreatedAt   string         `json:"created_at"`
+}
+
+// MediaRef is how bytes are named in EVERY document this API emits: an opaque id and its
+// facts. There is no `path` field, and there is no route that would accept one.
+type MediaRef struct {
+	OutputID string `json:"output_id"`
+	MediaID  string `json:"media_id"`
+	URL      string `json:"url"`
+	MimeType string `json:"mime_type"`
+	Length   int64  `json:"length"`
+	Digest   string `json:"digest"`
+}
+
+// TriageRef is the handle onto a retained bundle. `attempt_key` is the coordinator's own
+// opaque key; `subject_id` is the runtime's. Neither is a path.
+type TriageRef struct {
+	AttemptKey string `json:"attempt_key"`
+	SubjectID  string `json:"subject_id"`
+	URL        string `json:"url"`
+	Length     int64  `json:"length"`
+	Kept       bool   `json:"kept"`
+	Fault      string `json:"fault,omitempty"`
+}
+
+func (s *Server) getRequest(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	row, e := s.store.RequestRow(id)
+	if e != nil {
+		s.refuseTyped(w, r, e)
+		return
+	}
+	if row == nil {
+		s.refuse(w, r, http.StatusNotFound, "not_found",
+			"no request "+id+" on this host", "")
+		return
+	}
+	s.ok(w, r, http.StatusOK, s.lifecycleOf(*row))
+}
+
+func (s *Server) lifecycleOf(row records.Request) Lifecycle {
+	life := Lifecycle{
+		RequestID: row.ID, Status: contractStatus(row.State), Endpoint: row.Endpoint,
+		Function: row.Entrypoint, Attempt: uint64(row.Ordinal),
+		ResponseURL: "/v1/requests/" + row.ID, CreatedAt: row.CreatedAt,
+		Outputs: []MediaRef{},
+	}
+	attempts, _ := s.store.Attempts(row.ID)
+	life.Attempts = len(attempts)
+	outs, _ := s.store.VisibleOutputs(row.ID)
+	for _, o := range outs {
+		life.Outputs = append(life.Outputs, MediaRef{
+			OutputID: o.OutputID, MediaID: o.MediaID, URL: "/v1/media/" + o.MediaID,
+			MimeType: o.MimeType, Length: o.Length, Digest: o.Digest,
+		})
+	}
+	if len(attempts) == 0 {
+		return life
+	}
+	last := attempts[len(attempts)-1]
+	if last.TriageSubject != "" {
+		life.Triage = &TriageRef{
+			AttemptKey: last.AttemptKey, SubjectID: last.TriageSubject,
+			URL:    "/v1/local/attempts/" + last.AttemptKey + "/triage",
+			Length: last.TriageLength, Kept: last.TriagePath != "",
+		}
+	}
+	if len(last.TerminalBody) == 0 {
+		return life
+	}
+	doc, err := canonical.Read(last.TerminalBody, &pb.TerminalBody{})
+	if err != nil {
+		return life
+	}
+	metrics := doc.Sub("metrics")
+	life.Metrics = map[string]any{
+		"runtime_ms": metrics.Int("runtime_ms"), "queue_ms": metrics.Int("queue_ms"),
+		"handler_ms": metrics.Int("handler_ms"), "device_lease_ms": metrics.Int("device_lease_ms"),
+		"finalization_ms": metrics.Int("finalization_ms"),
+		"peak_vram_bytes": metrics.Int("peak_vram_bytes"),
+	}
+	if last.TerminalStatus != "SUCCEEDED" {
+		life.ErrorType, life.Error = last.TerminalCause, last.SafeMessage
+	}
+	// The typed result rides the terminal INLINE (cl-001's proof). It is base64 in the
+	// canonical document; the contract hands the client the decoded JSON so a browser
+	// never decodes a transport encoding to read a result.
+	if inline := doc.Sub("result").Str("inline_result"); inline != "" {
+		if decoded, err := base64.StdEncoding.DecodeString(inline); err == nil {
+			var typed any
+			if json.Unmarshal(decoded, &typed) == nil {
+				life.Result = typed
+			}
+		}
+	}
+	return life
+}
+
+func (s *Server) listRequests(w http.ResponseWriter, r *http.Request) {
+	limit := 50
+	if v := r.URL.Query().Get("limit"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 && n <= 500 {
+			limit = n
+		}
+	}
+	state := ""
+	switch strings.TrimSpace(r.URL.Query().Get("status")) {
+	case "", "any":
+	case "queued":
+		state = "submitted"
+	case "in_progress":
+		state = "dispatching"
+	case "completed":
+		state = "succeeded"
+	case "failed":
+		state = "failed"
+	case "canceled":
+		state = "canceled"
+	default:
+		s.refuse(w, r, http.StatusBadRequest, "invalid_status",
+			"unknown status filter", "any | queued | in_progress | completed | failed | canceled")
+		return
+	}
+	rows, e := s.store.Requests(state, limit)
+	if e != nil {
+		s.refuseTyped(w, r, e)
+		return
+	}
+	out := make([]Lifecycle, 0, len(rows))
+	for _, row := range rows {
+		out = append(out, s.lifecycleOf(row))
+	}
+	s.ok(w, r, http.StatusOK, map[string]any{"requests": out, "count": len(out)})
+}
+
+// ------------------------------------------------------------------------- cancel
+
+func (s *Server) cancelRequest(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	row, e := s.store.RequestRow(id)
+	if e != nil {
+		s.refuseTyped(w, r, e)
+		return
+	}
+	if row == nil {
+		s.refuse(w, r, http.StatusNotFound, "not_found", "no request "+id+" on this host", "")
+		return
+	}
+	attempts, e := s.store.Attempts(id)
+	if e != nil {
+		s.refuseTyped(w, r, e)
+		return
+	}
+	if len(attempts) == 0 {
+		s.refuse(w, r, http.StatusConflict, "not_cancelable",
+			"request "+id+" has no attempt to cancel",
+			"a queued request has nothing running; it will not start once the worker is gone")
+		return
+	}
+	last := attempts[len(attempts)-1]
+	if last.State == "terminal" || last.State == "closed" {
+		// Already settled. Idempotent 200 with the lifecycle — a cancel that arrives
+		// after the terminal is not an error, it is late.
+		s.ok(w, r, http.StatusOK, s.lifecycleOf(*row))
+		return
+	}
+	grace := uint64(5000)
+	if v := r.URL.Query().Get("grace_ms"); v != "" {
+		if n, err := strconv.ParseUint(v, 10, 64); err == nil && n <= 120000 {
+			grace = n
+		}
+	}
+	if e := s.coord.Cancel(id, uint64(last.Attempt), pb.CancelReason_CANCEL_REASON_CLIENT, grace); e != nil {
+		s.refuseTyped(w, r, e)
+		return
+	}
+	// A cancel is a REQUEST for cancellation, never a verdict. The attempt's own
+	// journaled terminal is what settles it, and a non-cooperative handler may still
+	// succeed. Saying "canceled" here would be exactly the lie the protocol refuses.
+	s.ok(w, r, http.StatusAccepted, map[string]any{
+		"request_id": id, "attempt": last.Attempt, "status": "cancel_requested",
+		"note": "the attempt's own journaled terminal settles it; watch the event stream",
+	})
+}

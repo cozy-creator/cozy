@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"time"
 
 	"github.com/cozy-creator/cozy-creator-v2/internal/coord"
 )
@@ -28,8 +29,16 @@ const (
 // coordinator owns, staged into the worker's COZY_HOME, and the plan id on the wire is
 // the digest of its canonical bytes. th-004 replaces the document later; the identity
 // rule does not move.
+// PIN THE RUNTIME. `--runtime` may name a `git archive` of a pinned cozy-runtime commit
+// rather than the live checkout, and `--venv` then supplies the interpreter (a venv is
+// not in a git archive). Found by being bitten, mid-run: another agent's UNCOMMITTED
+// cr-009 edit added `job_capacity=` beside `serving_capacity=` in the supervisor's
+// Report, and `capacity` is a proto ONEOF — so every Report advertised zero ready
+// serving plans and no coordinator could ever dispatch. A verification whose peer moves
+// underneath it measures nothing, and the pin is what makes a number readable.
 func sdxlSpec(entrypoints ...string) coord.EndpointSpec {
 	runtime := flag("runtime", "/home/fidika/cozy_v2/cozy-runtime")
+	venv := flag("venv", filepath.Join(runtime, "corpus", ".venv"))
 	bench := flag("bench", "/home/fidika/cozy_v2/tensorfs-bench")
 	if len(entrypoints) == 0 {
 		entrypoints = []string{"denoise"}
@@ -80,7 +89,7 @@ func sdxlSpec(entrypoints ...string) coord.EndpointSpec {
 		// nice(1) is this DRIVER's resource discipline on a shared box, imposed on the
 		// launch rather than baked into the coordinator's policy.
 		Python: "/usr/bin/nice",
-		Args: []string{"-n", "19", filepath.Join(runtime, "corpus", ".venv", "bin", "python"), "-c",
+		Args: []string{"-n", "19", filepath.Join(venv, "bin", "python"), "-c",
 			"import sys; from cozy_runtime.internal.worker.session import main; " +
 				"raise SystemExit(main(sys.argv[1:]))"},
 		Dir:      runtime,
@@ -140,4 +149,21 @@ func gpuUsedMiB() int {
 	n := 0
 	fmt.Sscanf(strings.TrimSpace(strings.Split(out, "\n")[0]), "%d", &n)
 	return n
+}
+
+// gpuReleased polls until the card is back at its baseline. A fixed sleep was wrong:
+// the CUDA context is torn down by the DRIVER after the process exits, and on a shared
+// box that can take longer than a guess. Waiting on the fact rather than on a clock is
+// the same discipline the rest of this repository uses for liveness.
+func gpuReleased(idle int, timeout time.Duration) int {
+	deadline := time.Now().Add(timeout)
+	used := gpuUsedMiB()
+	for time.Now().Before(deadline) {
+		if used <= idle+40 {
+			return used
+		}
+		time.Sleep(500 * time.Millisecond)
+		used = gpuUsedMiB()
+	}
+	return used
 }
