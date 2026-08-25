@@ -71,6 +71,7 @@ codes![
     PICKLE_REFUSED,
     UNREGISTERED_ENCODING,
     EVIDENCE_ARM_AMBIGUOUS,
+    CROSS_SUBJECT_REPLAY,
 ];
 
 #[derive(Debug, Clone)]

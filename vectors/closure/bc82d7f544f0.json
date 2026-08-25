@@ -1,0 +1,1 @@
+{"doc":"limit probe: legal geometry that overflows checked 64-bit arithmetic","format":"tensorfs.encoding_spec/1","logical_dtypes":["bf16"],"logical_rank":2,"roles":{"value":{"carrier":{"dtypes":["u8"],"t":"set"},"shape":{"dims":[{"axis":0,"block":1,"mul":9007199254740991,"t":"ceil_block"},{"axis":1,"t":"axis"}],"t":"dims"}}}}

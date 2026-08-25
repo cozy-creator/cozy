@@ -250,6 +250,30 @@ pub struct IngestVerificationReceipt {
     pub observations: Vec<(String, i64)>,
 }
 
+impl IngestVerificationReceipt {
+    /// A receipt is evidence about ONE exact subject/snapshot/header triple.
+    pub fn binds(
+        &self,
+        subject: &IngestSubject,
+        snapshot: &crate::manifest::SnapshotManifest,
+        header: &crate::header::Header,
+    ) -> Result<()> {
+        for (what, got, want) in [
+            ("subject", self.subject.clone(), subject.object_ref()),
+            ("snapshot", self.snapshot.clone(), snapshot.object_ref()),
+            ("header", self.header.clone(), header.object_ref()),
+        ] {
+            if got != want {
+                return refuse(
+                    Code::CROSS_SUBJECT_REPLAY,
+                    format!("receipt {what} {} != presented {}", got.id(), want.id()),
+                );
+            }
+        }
+        Ok(())
+    }
+}
+
 impl Doc for IngestVerificationReceipt {
     const FORMAT: &'static str = "tensorfs.ingest_receipt/1";
     const MAX_BYTES: usize = limits::SPEC_MAX_BYTES;

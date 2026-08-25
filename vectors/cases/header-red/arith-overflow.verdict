@@ -1,0 +1,4 @@
+doc: header
+expect: refuse
+code: ARITH_OVERFLOW
+note: checked 64-bit geometry arithmetic in the relation evaluator

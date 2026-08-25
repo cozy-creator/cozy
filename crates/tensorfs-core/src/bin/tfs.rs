@@ -83,6 +83,34 @@ fn seed_spec(alias: &str, nth: usize) -> EncodingSpec {
         .spec
 }
 
+/// A legal spec whose geometry overflows u64 on a modest logical shape: the corpus's
+/// checked-arithmetic probe. Never a platform alias.
+fn probe_spec() -> EncodingSpec {
+    use tensorfs_core::relation::{Carrier, Dim, Relation};
+    EncodingSpec {
+        logical_dtypes: vec![Dtype::Bf16],
+        logical_rank: Some(2),
+        roles: vec![(
+            "value".to_string(),
+            tensorfs_core::spec::Role {
+                carrier: Carrier::Set(vec![Dtype::U8]),
+                shape: Relation::Dims(vec![
+                    Dim::CeilBlock {
+                        axis: 0,
+                        block: 1,
+                        mul: 9007199254740991,
+                    },
+                    Dim::Axis { axis: 1 },
+                ]),
+            },
+        )],
+        doc: Some(
+            "limit probe: legal geometry that overflows checked 64-bit arithmetic".to_string(),
+        ),
+        vectors: None,
+    }
+}
+
 fn pattern(n: usize) -> Vec<u8> {
     (0..n).map(|i| (i * 31 + 7) as u8).collect()
 }
@@ -340,7 +368,12 @@ fn build_corpus() -> (Vec<Case>, Vec<EncodingSpec>) {
     let svdq = seed_spec("svdq-microscale/1", 0);
     // the corpus closure ships the WHOLE platform namespace, not only the cited specs
     let mut specs: Vec<EncodingSpec> = registry::seeds().into_iter().map(|s| s.spec).collect();
-    for (_, s) in closure.specs {
+    for s in closure
+        .specs
+        .into_iter()
+        .map(|(_, s)| s)
+        .chain([probe_spec()])
+    {
         if !specs.iter().any(|x| x.object_id() == s.object_id()) {
             specs.push(s);
         }
@@ -736,6 +769,50 @@ fn build_corpus() -> (Vec<Case>, Vec<EncodingSpec>) {
         h.canonical_bytes(),
         "DIVISION_REMAINDER",
         "in/2 with an odd in",
+    ));
+    let mut h = ha.clone();
+    h.components[0].1[1].1.shape = vec![67108864, 67108864];
+    cases.push(red_case(
+        g,
+        "element-count-cap",
+        "header",
+        h.canonical_bytes(),
+        "COUNT_CAP",
+        "aggregate element limit",
+    ));
+    // the element cap fires before any product can overflow, so the checked-arithmetic arm
+    // is reached through a legal-but-extreme relation instead (probe spec, in the closure)
+    let probe = probe_spec();
+    let h = Header {
+        configs: vec![],
+        encodings: encodings_of(&[&probe]),
+        components: vec![(
+            "transformer".to_string(),
+            vec![(
+                "probe.weight".to_string(),
+                Tensor {
+                    dtype: Dtype::Bf16,
+                    shape: vec![4096, 8],
+                    encoding: probe.object_id(),
+                    parts: vec![(
+                        "value".to_string(),
+                        Part {
+                            dtype: Dtype::U8,
+                            shape: vec![1],
+                            body: Body::Inline(tensorfs_core::b64::encode(&[0u8])),
+                        },
+                    )],
+                },
+            )],
+        )],
+    };
+    cases.push(red_case(
+        g,
+        "arith-overflow",
+        "header",
+        h.canonical_bytes(),
+        "ARITH_OVERFLOW",
+        "checked 64-bit geometry arithmetic in the relation evaluator",
     ));
     let mut h = ha.clone();
     h.components[0].1[1].1.dtype = Dtype::I8;
@@ -1215,6 +1292,27 @@ fn cmd_verify(dir: &Path) -> ExitCode {
         "one more sibling file flips checkpoint_id only".into(),
         cpof("manifest/checkpoint") != cpof("manifest/checkpoint-extra-file"),
         cpof("manifest/checkpoint-extra-file"),
+    ));
+    let (cha, _) = header_a(Some(config_ref()));
+    let csnap = manifest_checkpoint(&cha, false);
+    let cprof = profile_normal(
+        vec![seed_spec("plain/1", 0).object_ref()],
+        "safetensors.diffusers",
+    );
+    let csub = subject(&cprof, &cha, "acme");
+    let crcpt = receipt(&csub, &csnap, &cha, "platform-key-1");
+    cross.push((
+        "receipt binds its exact subject/snapshot/header".into(),
+        crcpt.binds(&csub, &csnap, &cha).is_ok(),
+        String::new(),
+    ));
+    let other = subject(&cprof, &cha, "other-tenant");
+    let replay = crcpt.binds(&other, &csnap, &cha);
+    cross.push((
+        "cross-subject replay refuses".into(),
+        replay.as_ref().err().map(|e| e.code)
+            == Some(tensorfs_core::err::Code::CROSS_SUBJECT_REPLAY),
+        replay.err().map(|e| e.detail).unwrap_or_default(),
     ));
     let seeds_match = registry::seeds()
         .iter()
