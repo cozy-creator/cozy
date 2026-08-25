@@ -222,6 +222,23 @@ pub fn read_object(store: &Store, r: &ObjectRef, max: usize) -> Result<Vec<u8>> 
 /// advertises is the id the store installed.
 pub fn put_doc<D: Doc>(store: &Store, d: &D) -> Result<ObjectRef> {
     let bytes = d.canonical_bytes();
+    // A document that cannot be read back must not be written. `Doc::parse` enforces
+    // `MAX_BYTES` and this side did not, so an over-cap document stored happily and then
+    // refused SIZE_CAP on the way back in — a write/read asymmetry that turns a bounds
+    // decision into a corrupt-looking store. Observed live: the ingest subject's candidate
+    // set at 2,601 objects.
+    if bytes.len() > D::MAX_BYTES {
+        return refuse(
+            Code::SIZE_CAP,
+            format!(
+                "{}: {} canonical bytes over the {} B document cap — refused at WRITE, \
+                 because this store would never be able to read it back",
+                D::FORMAT,
+                bytes.len(),
+                D::MAX_BYTES
+            ),
+        );
+    }
     let want = ObjectRef::of(&bytes);
     let put = store.put_stream(&mut bytes.as_slice(), Some(&want), &Fault::default())?;
     Ok(put.obj)

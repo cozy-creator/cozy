@@ -174,7 +174,12 @@ pub struct IngestSubject {
 
 impl Doc for IngestSubject {
     const FORMAT: &'static str = "tensorfs.ingest_subject/1";
-    const MAX_BYTES: usize = limits::SPEC_MAX_BYTES;
+    // The subject's `candidates` is EVERY object the snapshot reaches, so it scales with the
+    // artifact exactly as the header and the manifest do — 2,601 refs for a 6.9 GB SDXL
+    // tree, 244 KiB of canonical bytes. It shared the fixed 64 KiB spec cap and therefore
+    // WROTE fine and REFUSED SIZE_CAP on the way back in, which made `install` impossible
+    // for any artifact over ~700 objects. Same cap as the other object-set documents.
+    const MAX_BYTES: usize = limits::DOC_MAX_BYTES;
 
     fn from_value(v: &Value) -> Result<Self> {
         let mut f = Fields::new("IngestSubject", v)?;

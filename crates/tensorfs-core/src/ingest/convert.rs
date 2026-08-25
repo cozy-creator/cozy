@@ -181,7 +181,12 @@ pub struct RolePlan {
 pub struct Op {
     pub component: String,
     pub out_key: String,
+    /// The alias, for display only. An alias may group several physically distinct specs
+    /// (the two `fp8-scaled-scalar/1` role sets one artifact carries), so it is NOT an
+    /// identity and nothing resolves a spec through it.
     pub encoding: String,
+    /// The selected spec's object digest — the encoding's real identity, chosen PER TENSOR.
+    pub encoding_id: String,
     pub logical_dtype: Dtype,
     pub logical_shape: Vec<u64>,
     pub roles: Vec<RolePlan>,
@@ -229,6 +234,25 @@ impl Plan {
             })
             .count()
     }
+    /// The encodings this plan actually selected, in first-appearance order:
+    /// `(alias, spec digest, role names, tensor count)`. With per-tensor selection one
+    /// component routinely cites several — the real fp8_scaled DiT cites three.
+    pub fn encodings(&self) -> Vec<(String, String, Vec<String>, usize)> {
+        let mut out: Vec<(String, String, Vec<String>, usize)> = Vec::new();
+        for o in &self.ops {
+            match out.iter_mut().find(|(_, id, _, _)| *id == o.encoding_id) {
+                Some((_, _, _, n)) => *n += 1,
+                None => out.push((
+                    o.encoding.clone(),
+                    o.encoding_id.clone(),
+                    o.roles.iter().map(|r| r.role.clone()).collect(),
+                    1,
+                )),
+            }
+        }
+        out
+    }
+
     pub fn declared_bytes(&self) -> Result<u64> {
         let mut n = 0u64;
         for o in &self.ops {
@@ -286,7 +310,54 @@ impl Source<'_> {
 
 // ---------------------------------------------------------------- planning
 
+/// The candidate encodings one component may resolve to. An alias that groups several
+/// PHYSICALLY distinct specs contributes one candidate per variant, and `plain/1` is always
+/// in the closure because a real component is mixed. Nothing here picks: the carrier's own
+/// sibling roles pick, per tensor.
+struct Candidates<'a> {
+    /// `(alias, spec)`, alias repeated once per physical variant it groups.
+    encoded: Vec<(&'a str, &'a EncodingSpec)>,
+    plain: &'a EncodingSpec,
+}
+
+impl Candidates<'_> {
+    /// Every carrier suffix ANY candidate names — the component-level "is this encoded at
+    /// all" question, which separates scale-free storage from a torn source.
+    fn suffixes(&self) -> Result<Vec<&'static str>> {
+        let mut v: Vec<&'static str> = Vec::new();
+        for (alias, _) in &self.encoded {
+            for (sfx, _) in role_map(alias)?.companions {
+                if !v.contains(sfx) {
+                    v.push(sfx);
+                }
+            }
+        }
+        Ok(v)
+    }
+    /// Every companion ROLE any candidate declares, for the refusal messages.
+    fn companion_roles(&self) -> Result<Vec<String>> {
+        let mut v: Vec<String> = Vec::new();
+        for (alias, spec) in &self.encoded {
+            let data = role_map(alias)?.data;
+            for (n, _) in &spec.roles {
+                if n != data && !v.contains(n) {
+                    v.push(n.clone());
+                }
+            }
+        }
+        v.sort();
+        Ok(v)
+    }
+}
+
+fn short(id: &str) -> String {
+    id.chars().skip(7).take(12).collect()
+}
+
 /// Plan one conversion. Headers in, plan out — no path is opened and no tensor byte is read.
+///
+/// `specs` is the CANDIDATE SET: `(alias, spec)` pairs, and one alias may appear more than
+/// once when it groups several physical variants. Selection happens per TENSOR.
 pub fn plan(
     conv: &Converter,
     sources: &[Source<'_>],
@@ -311,34 +382,37 @@ pub fn plan(
         ..Default::default()
     };
 
+    let plain = match specs.iter().find(|(a, _)| a == "plain/1") {
+        Some((_, sp)) => sp,
+        None => {
+            return refuse(
+                Code::UNKNOWN_ENCODING,
+                "plain/1 must be in the resolved spec set: a real component is mixed, and \
+                 its unencoded tensors are plain storage",
+            )
+        }
+    };
     for s in sources {
         let component = s.component().to_string();
         let alias = target.get(&component)?;
-        let spec = match specs.iter().find(|(a, _)| a == alias) {
-            Some((_, sp)) => sp,
-            None => {
-                return refuse(
-                    Code::UNKNOWN_ENCODING,
-                    format!("{component}: target encoding {alias:?} is not a platform alias"),
-                )
-            }
-        };
+        let encoded: Vec<(&str, &EncodingSpec)> = specs
+            .iter()
+            .filter(|(a, _)| a == alias && a != "plain/1")
+            .map(|(a, sp)| (a.as_str(), sp))
+            .collect();
+        if encoded.is_empty() && alias != "plain/1" {
+            return refuse(
+                Code::UNKNOWN_ENCODING,
+                format!("{component}: target encoding {alias:?} is not a platform alias"),
+            );
+        }
+        let cands = Candidates { encoded, plain };
         match s {
             Source::Carrier { file, header, .. } => {
-                let plain = match specs.iter().find(|(a, _)| a == "plain/1") {
-                    Some((_, sp)) => sp,
-                    None => {
-                        return refuse(
-                            Code::UNKNOWN_ENCODING,
-                            "plain/1 must be in the resolved spec set: a real component is \
-                             mixed, and its unencoded tensors are plain storage",
-                        )
-                    }
-                };
-                plan_carrier(conv, &component, *file, header, alias, spec, plain, &mut p)?
+                plan_carrier(conv, &component, *file, header, alias, &cands, &mut p)?
             }
             Source::Canonical { header, .. } => {
-                plan_canonical(&component, header, alias, spec, rekey, &mut p)?
+                plan_canonical(&component, header, alias, &cands, rekey, &mut p)?
             }
         }
     }
@@ -352,13 +426,26 @@ pub fn plan(
 
 /// The dtype this artifact's UNENCODED float weights are in — the evidence a quantized
 /// tensor's logical type is read from. Ties refuse by returning None rather than picking.
+///
+/// Role siblings and markers are NOT weights and are excluded. They were not, and on the
+/// real fp8_scaled DiT that was load-bearing: its 350 F32 scale siblings outnumber its 220
+/// BF16 weights, so the majority vote returned F32 and every quantized tensor would have
+/// been stamped with a logical dtype the artifact does not have — every name, shape and
+/// dtype spelling plausible, the numbers silently mis-typed.
 fn base_float(h: &SourceHeader) -> Option<Dtype> {
     let mut counts: Vec<(Dtype, usize)> = Vec::new();
     for t in &h.tensors {
+        if is_marker(&t.key) || role_of(&t.key).is_some() {
+            continue;
+        }
         if matches!(t.dtype, Dtype::Bf16 | Dtype::F16 | Dtype::F32 | Dtype::F64)
-            && module_of(&t.key)
-                .and_then(|m| h.get(&format!("{m}.weight_scale")))
-                .is_none()
+            && !module_of(&t.key)
+                .map(|m| {
+                    super::fingerprint::ROLE_SUFFIXES
+                        .iter()
+                        .any(|s| h.get(&format!("{m}{s}")).is_some())
+                })
+                .unwrap_or(false)
         {
             match counts.iter_mut().find(|(d, _)| *d == t.dtype) {
                 Some((_, n)) => *n += 1,
@@ -388,11 +475,23 @@ pub struct RoleMap {
     pub companions: &'static [(&'static str, &'static str)],
 }
 
-pub const ROLE_MAPS: [RoleMap; 4] = [
+pub const ROLE_MAPS: [RoleMap; 5] = [
     RoleMap {
         alias: "plain/1",
         data: "value",
         companions: &[],
+    },
+    // ComfyUI's `scaled_fp8` convention, MEASURED on `Comfy-Org/MiniMax-H3@4cc1d817`. The
+    // alias groups two physical role sets — 150 modules carry both scales, the 50 `mlp.fc2`
+    // ones carry the weight scale alone — so this map names the alias's FULL carrier
+    // vocabulary and each spec's exact role set decides which tensor is which.
+    RoleMap {
+        alias: "fp8-scaled-scalar/1",
+        data: "data",
+        companions: &[
+            (".weight_scale", "weight_scale"),
+            (".input_scale", "input_scale"),
+        ],
     },
     RoleMap {
         alias: "fp8-rowwise/1",
@@ -430,37 +529,258 @@ pub fn role_map(alias: &str) -> Result<&'static RoleMap> {
     }
 }
 
-#[allow(clippy::too_many_arguments)]
+// ---------------------------------------------------------------- per-tensor selection
+
+/// Why ONE candidate did not fit ONE tensor. Kept rather than collapsed to a bool, because
+/// the refusal has to name the roles found AND every candidate tried with its reason — a
+/// bare "no encoding matched" would send a reader back to the bytes this planner just read.
+#[derive(Debug, Clone)]
+enum Reject {
+    /// The carrier supplies a sibling this candidate's dialect has no role for at all.
+    Surplus(String),
+    /// Role names present vs the candidate's EXACT set.
+    RoleSet {
+        got: Vec<String>,
+        want: Vec<String>,
+    },
+    Shape {
+        role: String,
+        got: Vec<u64>,
+        want: Vec<u64>,
+    },
+    Carrier {
+        role: String,
+        got: &'static str,
+    },
+    Rank {
+        want: u64,
+        got: usize,
+    },
+    Logical(&'static str),
+}
+
+impl std::fmt::Display for Reject {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Reject::Surplus(s) => write!(f, "no role for a {s} sibling"),
+            Reject::RoleSet { got, want } => {
+                write!(f, "declares roles {want:?}, carrier supplies {got:?}")
+            }
+            Reject::Shape { role, got, want } => {
+                write!(
+                    f,
+                    "role {role}: carrier shape {got:?} != the spec's relation {want:?}"
+                )
+            }
+            Reject::Carrier { role, got } => {
+                write!(f, "role {role}: carrier dtype {got} outside the spec's set")
+            }
+            Reject::Rank { want, got } => write!(f, "logical rank {got} != the spec's {want}"),
+            Reject::Logical(d) => write!(f, "logical dtype {d} outside the spec's logical set"),
+        }
+    }
+}
+
+/// The refusal CODE for a tensor no candidate fits. Ordered so the most structural
+/// disagreement wins: a missing companion (a torn source) outranks a surplus one (an
+/// encoding fact the target has no room for), which outranks geometry, which outranks
+/// dtype. Every one of these was a separate refusal class before selection became
+/// per-tensor and every one is still reachable.
+fn code_for(rejects: &[(String, Reject)]) -> Code {
+    // The target declares no encoded variant at all and the carrier supplies roles anyway:
+    // encoded bytes offered as plain storage, which is the double-encode class exactly.
+    if rejects.is_empty() {
+        return Code::DOUBLE_ENCODE;
+    }
+    let (mut extra, mut missing) = (false, false);
+    for (_, r) in rejects {
+        match r {
+            Reject::Surplus(_) => extra = true,
+            Reject::RoleSet { got, want } => {
+                if want.iter().all(|w| got.contains(w)) {
+                    extra = true;
+                } else {
+                    missing = true;
+                }
+            }
+            _ => {}
+        }
+    }
+    if missing {
+        return Code::MISSING_COMPANION_ROLE;
+    }
+    if extra {
+        return Code::DOUBLE_ENCODE;
+    }
+    if rejects
+        .iter()
+        .any(|(_, r)| matches!(r, Reject::Shape { .. }))
+    {
+        return Code::SHAPE_MISMATCH;
+    }
+    if rejects.iter().any(|(_, r)| {
+        matches!(
+            r,
+            Reject::Carrier { .. } | Reject::Rank { .. } | Reject::Logical(_)
+        )
+    }) {
+        return Code::DTYPE_MISMATCH;
+    }
+    Code::UNKNOWN_ENCODING
+}
+
+/// One tensor's chosen encoding and the carrier tensors its companion roles come from.
+struct Chosen<'a> {
+    alias: &'a str,
+    spec: &'a EncodingSpec,
+    data_role: &'static str,
+    /// The dtype the tensor STANDS FOR, resolved from the chosen spec's data-role carrier.
+    logical: Dtype,
+    present: Vec<(String, &'a super::carrier::SourceTensor)>,
+}
+
+/// Try ONE candidate against ONE tensor's observed siblings. Returns the fit or the reason.
+#[allow(clippy::type_complexity)]
+fn fit<'a>(
+    alias: &'a str,
+    spec: &'a EncodingSpec,
+    t: &super::carrier::SourceTensor,
+    siblings: &[(&'static str, &'a super::carrier::SourceTensor)],
+    base: Option<Dtype>,
+) -> Result<std::result::Result<Chosen<'a>, Reject>> {
+    let map = role_map(alias)?;
+    let mut present: Vec<(String, &super::carrier::SourceTensor)> = Vec::new();
+    for (sfx, st) in siblings {
+        match map.companions.iter().find(|(s, _)| s == sfx) {
+            Some((_, role)) => present.push((role.to_string(), st)),
+            None => return Ok(Err(Reject::Surplus(sfx.to_string()))),
+        }
+    }
+    // Roles are EXACT: a spec with a different role set is a different digest, so the
+    // observed set must BE the candidate's, never a subset and never a superset.
+    let want: Vec<String> = spec
+        .roles
+        .iter()
+        .map(|(n, _)| n.clone())
+        .filter(|n| n != map.data)
+        .collect();
+    let mut got: Vec<String> = present.iter().map(|(n, _)| n.clone()).collect();
+    let (mut a, mut b) = (got.clone(), want.clone());
+    a.sort();
+    b.sort();
+    if a != b {
+        got.sort();
+        return Ok(Err(Reject::RoleSet { got, want: b }));
+    }
+    if let Some(r) = spec.logical_rank {
+        if r as usize != t.shape.len() {
+            return Ok(Err(Reject::Rank {
+                want: r,
+                got: t.shape.len(),
+            }));
+        }
+    }
+    // The data role's own carrier type. Keyed on the SPEC, never on the dtype spelling: fp8
+    // storage with scales and fp8 storage without declare the same element type.
+    let data_role = match spec.role(map.data) {
+        Some(r) => r,
+        None => {
+            return refuse(
+                Code::ROLE_SET_MISMATCH,
+                format!(
+                    "{alias}: the reviewed map names data role {:?}, absent from the spec",
+                    map.data
+                ),
+            )
+        }
+    };
+    // A spec that stores its OWN carrier type keeps the logical dtype out of the file, so it
+    // is read off this artifact's unencoded float weights — or refused. Never assumed.
+    let logical = match &data_role.carrier {
+        crate::relation::Carrier::SameAsLogical => t.dtype,
+        crate::relation::Carrier::Set(_) => match base {
+            Some(d) => d,
+            None => {
+                return refuse(
+                    Code::DTYPE_UNKNOWN,
+                    format!(
+                        "{}: target {alias} stores {} carrier bytes, so the logical dtype is                          not in the file — and this carrier holds no unencoded float weight                          to read it from. The logical type is homeless; an explicit profile                          must state it.",
+                        t.key,
+                        t.dtype.name()
+                    ),
+                )
+            }
+        },
+    };
+    if !spec.admits_logical(logical) {
+        return Ok(Err(Reject::Logical(logical.name())));
+    }
+    if !data_role.carrier.admits(logical, t.dtype) {
+        return Ok(Err(Reject::Carrier {
+            role: map.data.to_string(),
+            got: t.dtype.name(),
+        }));
+    }
+    // Companion geometry against the spec's own relation, checked here rather than after
+    // 5 GB have moved. Two scale geometries under one alias are two DIGESTS: a reader that
+    // assumes the other mis-strides every row and yields plausible, wrong numbers.
+    let elements = crate::dtype::checked_elements(&t.key, &t.shape)?;
+    for (name, st) in &present {
+        let role = match spec.role(name) {
+            Some(r) => r,
+            None => unreachable!("the role set was just compared"),
+        };
+        let want_shape = role.shape.eval(&t.shape, elements)?;
+        if want_shape != st.shape {
+            return Ok(Err(Reject::Shape {
+                role: name.clone(),
+                got: st.shape.clone(),
+                want: want_shape,
+            }));
+        }
+        if !role.carrier.admits(logical, st.dtype) {
+            return Ok(Err(Reject::Carrier {
+                role: name.clone(),
+                got: st.dtype.name(),
+            }));
+        }
+    }
+    Ok(Ok(Chosen {
+        alias,
+        spec,
+        data_role: map.data,
+        logical,
+        present,
+    }))
+}
+
 fn plan_carrier(
     conv: &Converter,
     component: &str,
     file: usize,
     h: &SourceHeader,
     alias: &str,
-    spec: &EncodingSpec,
-    plain: &EncodingSpec,
+    cands: &Candidates<'_>,
     p: &mut Plan,
 ) -> Result<()> {
     p.header_bytes += h.header_bytes;
-    let map = role_map(alias)?;
     let plain_map = role_map("plain/1")?;
-    let companions: Vec<&str> = spec
-        .roles
-        .iter()
-        .map(|(n, _)| n.as_str())
-        .filter(|n| *n != map.data)
-        .collect();
+    let cand_suffixes = cands.suffixes()?;
+    let companions = cands.companion_roles()?;
     let mut encoded_tensors = 0usize;
-    // Does ANYTHING in this component carry the target's roles? The answer separates two
+    // Read ONCE per component: it is a whole-header majority vote, and re-running it per
+    // tensor per candidate makes the planner quadratic in the key count for no new fact.
+    let base = base_float(h);
+    // Does ANYTHING in this component carry a candidate's roles? The answer separates two
     // refusals that look identical per-tensor and mean opposite things: a component where
     // nothing carries scales is scale-free STORAGE (and converting it is arithmetic), while
-    // one where 361 tensors carry scales and the 362nd does not is a TORN source.
+    // one where 199 tensors carry scales and the 200th does not is a TORN source.
     let component_is_encoded = h.tensors.iter().any(|t| {
         module_of(&t.key)
             .map(|m| {
-                map.companions
+                cand_suffixes
                     .iter()
-                    .any(|(s, _)| h.get(&format!("{m}{s}")).is_some())
+                    .any(|s| h.get(&format!("{m}{s}")).is_some())
             })
             .unwrap_or(false)
     });
@@ -485,173 +805,117 @@ fn plan_carrier(
             continue;
         }
 
-        // What roles does this tensor actually HAVE in the carrier? This is the observation,
-        // and it is what decides whether the tensor is encoded — never the target, never a
-        // name list, and never the dtype spelling alone (the v1 quarry's lane table was
-        // keyed on the dtype and that WAS a real defect: scale-free fp8 storage and scaled
-        // fp8 rowwise declare the same element type and execute in different lanes).
-        let present: Vec<(String, &super::carrier::SourceTensor)> = match module_of(&t.key) {
+        // What roles does THIS TENSOR actually have in the carrier? This is the whole
+        // observation, and it is what decides the encoding — never the component, never the
+        // target, never a `.comfy_quant` marker (whose payload is tensor BYTES this planner
+        // structurally does not read), and never the dtype spelling alone (v1's lane table
+        // was keyed on the dtype and that WAS a real defect: scale-free fp8 storage and
+        // scaled fp8 rowwise declare the same element type and execute in different lanes).
+        let siblings: Vec<(&'static str, &super::carrier::SourceTensor)> = match module_of(&t.key) {
             None => Vec::new(),
-            Some(m) => map
-                .companions
+            Some(m) => super::fingerprint::ROLE_SUFFIXES
                 .iter()
-                .filter_map(|(sfx, role)| {
-                    h.get(&format!("{m}{sfx}")).map(|x| (role.to_string(), x))
-                })
+                .filter_map(|s| h.get(&format!("{m}{s}")).map(|st| (*s, st)))
                 .collect(),
         };
-        // A sibling the target has no role for is an encoding fact on the wrong side of the
-        // boundary — counted, never absorbed.
-        if let Some(m) = module_of(&t.key) {
-            for sfx in super::fingerprint::ROLE_SUFFIXES.iter() {
-                if h.get(&format!("{m}{sfx}")).is_some()
-                    && !map.companions.iter().any(|(s, _)| s == sfx)
-                {
-                    return refuse(
-                        Code::DOUBLE_ENCODE,
-                        format!(
-                            "{}: the carrier supplies a {sfx} sibling that target {alias} has \
-                             no role for",
-                            t.key
-                        ),
-                    );
-                }
-            }
-        }
+        let present_sfx: Vec<&'static str> = siblings.iter().map(|(s, _)| *s).collect();
 
         // A real component is MIXED: a quantized weight sits beside its own unquantized
-        // bias and the norms the producer's eligibility predicate skipped. The component's
-        // target names what its ENCODED tensors carry; everything else is plain storage.
-        // One rule over every tensor in a tree is the shape this design explicitly rejects.
-        let (use_spec, use_alias, use_map) = if present.is_empty() {
-            (plain, "plain/1", plain_map)
-        } else {
-            encoded_tensors += 1;
-            (spec, alias, map)
-        };
-
-        if use_alias == "plain/1" && !present.is_empty() {
-            unreachable!("present is empty on this arm");
-        }
-        if use_alias != "plain/1" {
-            // The observed role set must be EXACTLY the target's. Roles are exact by
-            // construction — a spec with a different role set is a different digest.
-            let mut got: Vec<&str> = present.iter().map(|(n, _)| n.as_str()).collect();
-            let mut want = companions.clone();
-            got.sort_unstable();
-            want.sort_unstable();
-            if got != want {
-                let missing: Vec<&&str> = want.iter().filter(|c| !got.contains(c)).collect();
-                return refuse(
-                    if missing.is_empty() {
-                        Code::DOUBLE_ENCODE
-                    } else {
-                        Code::MISSING_COMPANION_ROLE
-                    },
-                    format!(
-                        "{}: target {alias} declares roles {want:?}; the carrier supplies \
-                         {got:?}. A partial role set is a TORN source, not a convertible one \
-                         — the missing bytes are arithmetic, and the remedy derives from the \
-                         target's contract, never from what happened to be observed.",
-                        t.key
-                    ),
-                );
-            }
-            // Companion geometry must satisfy the spec's own relation, checked here rather
-            // than after 5 GB have moved.
-            let elements = crate::dtype::checked_elements(&t.key, &t.shape)?;
-            for (name, st) in &present {
-                let role = match use_spec.role(name) {
-                    Some(r) => r,
-                    None => unreachable!("role set was just compared"),
-                };
-                let want_shape = role.shape.eval(&t.shape, elements)?;
-                if want_shape != st.shape {
+        // bias and the norms the producer's eligibility predicate skipped. A tensor with NO
+        // companion roles is plain storage. One rule over every tensor in a tree is the
+        // shape this design explicitly rejects.
+        let chosen = if siblings.is_empty() {
+            if matches!(t.dtype, Dtype::F8E4M3FN | Dtype::F8E5M2) && !companions.is_empty() {
+                if component_is_encoded {
                     return refuse(
-                        Code::SHAPE_MISMATCH,
+                        Code::MISSING_COMPANION_ROLE,
                         format!(
-                            "{}#{name}: carrier shape {:?} != the target spec's relation \
-                             result {want_shape:?}. Two scale geometries under one alias are \
-                             two DIGESTS: a reader that assumes the other mis-reads every \
-                             row and yields plausible, wrong numbers.",
-                            t.key, st.shape
-                        ),
-                    );
-                }
-            }
-        } else if matches!(t.dtype, Dtype::F8E4M3FN | Dtype::F8E5M2)
-            && !companions.is_empty()
-            && component_is_encoded
-        {
-            return refuse(
-                Code::MISSING_COMPANION_ROLE,
-                format!(
-                    "{}: an encoded {} weight with no {companions:?} sibling, in a component \
-                     where other tensors have theirs. That is a TORN source, not scale-free \
-                     storage — the bytes exist and their scale does not.",
-                    t.key,
-                    t.dtype.name()
-                ),
-            );
-        } else if matches!(t.dtype, Dtype::F8E4M3FN | Dtype::F8E5M2) && !companions.is_empty() {
-            // Scale-FREE fp8 offered under a scaled target. The absence of scales IS an
-            // identity: the two have the same element type and the same tensor names, and a
-            // reader that takes one for the other either divides by scales that are not
-            // there or fails to divide by scales that are. Both are silent.
-            return refuse(
-                Code::REMEDY_FROM_TARGET,
-                format!(
-                    "{}: scale-free {} storage offered under target {alias}, which requires \
-                     {companions:?}. The absence of scales is the identity, not an omission \
-                     — producing them is the priced PRODUCIBLE quantize job.",
-                    t.key,
-                    t.dtype.name()
-                ),
-            );
-        }
-
-        let data = use_map.data.to_string();
-        let data_pos = match use_spec.roles.iter().position(|(n, _)| *n == data) {
-            Some(i) => i,
-            None => {
-                return refuse(
-                    Code::ROLE_SET_MISMATCH,
-                    format!(
-                    "{use_alias}: the reviewed map names data role {data:?}, absent from the spec"
-                ),
-                )
-            }
-        };
-        let logical_dtype = match &use_spec.roles[data_pos].1.carrier {
-            crate::relation::Carrier::SameAsLogical => t.dtype,
-            crate::relation::Carrier::Set(_) => match base_float(h) {
-                Some(d) => d,
-                None => {
-                    return refuse(
-                        Code::DTYPE_UNKNOWN,
-                        format!(
-                            "{}: target {use_alias} stores {} carrier bytes, so the logical \
-                             dtype is not in the file — and this carrier holds no unencoded \
-                             float weight to read it from. The logical type is homeless; an \
-                             explicit profile must state it.",
+                            "{}: an encoded {} weight with no {companions:?} sibling, in a \
+                             component where other tensors have theirs. That is a TORN \
+                             source, not scale-free storage — the bytes exist and their \
+                             scale does not.",
                             t.key,
                             t.dtype.name()
                         ),
+                    );
+                }
+                // Scale-FREE fp8 offered under a scaled target. The absence of scales IS an
+                // identity: the two have the same element type and the same tensor names,
+                // and a reader that takes one for the other either divides by scales that
+                // are not there or fails to divide by scales that are. Both are silent.
+                return refuse(
+                    Code::REMEDY_FROM_TARGET,
+                    format!(
+                        "{}: scale-free {} storage offered under target {alias}, which \
+                         requires {companions:?}. The absence of scales is the identity, not \
+                         an omission — producing them is the priced PRODUCIBLE quantize job.",
+                        t.key,
+                        t.dtype.name()
+                    ),
+                );
+            }
+            Chosen {
+                alias: "plain/1",
+                spec: cands.plain,
+                data_role: plain_map.data,
+                logical: t.dtype,
+                present: Vec::new(),
+            }
+        } else {
+            let mut fits: Vec<Chosen<'_>> = Vec::new();
+            let mut rejects: Vec<(String, Reject)> = Vec::new();
+            for (a, sp) in &cands.encoded {
+                match fit(a, sp, t, &siblings, base)? {
+                    Ok(c) => fits.push(c),
+                    Err(r) => rejects.push((format!("{a} {}", short(&sp.object_id())), r)),
+                }
+            }
+            match fits.len() {
+                1 => {
+                    encoded_tensors += 1;
+                    fits.pop().unwrap()
+                }
+                0 => {
+                    let tried: Vec<String> =
+                        rejects.iter().map(|(n, r)| format!("{n} ({r})")).collect();
+                    return refuse(
+                        code_for(&rejects),
+                        format!(
+                            "{}: the carrier supplies roles {present_sfx:?} for this tensor \
+                             and no candidate of target {alias} takes exactly those. Tried: \
+                             {}. Selection is per TENSOR and reads the siblings PRESENT — a \
+                             partial role set is a TORN source and a surplus one is an \
+                             encoding fact the target has no room for; neither is guessed \
+                             past, and the remedy derives from the target's contract, never \
+                             from what happened to be observed.",
+                            t.key,
+                            if tried.is_empty() {
+                                format!("nothing — {alias} declares no encoded variant")
+                            } else {
+                                tried.join("; ")
+                            }
+                        ),
+                    );
+                }
+                n => {
+                    return refuse(
+                        Code::AMBIGUOUS_CLASSIFICATION,
+                        format!(
+                            "{}: roles {present_sfx:?} fit {n} physically distinct specs of \
+                             {alias} — {:?}. Two specs that admit the same bytes is a REGISTRY \
+                             defect, not a tiebreak.",
+                            t.key,
+                            fits.iter()
+                                .map(|c| short(&c.spec.object_id()))
+                                .collect::<Vec<_>>()
+                        ),
                     )
                 }
-            },
+            }
         };
-        if !use_spec.admits_logical(logical_dtype) {
-            return refuse(
-                Code::DTYPE_MISMATCH,
-                format!(
-                    "{}: logical dtype {} is outside target {use_alias}'s logical set",
-                    t.key,
-                    logical_dtype.name()
-                ),
-            );
-        }
 
+        let logical_dtype = chosen.logical;
+        let data = chosen.data_role.to_string();
         let mut roles = vec![RolePlan {
             role: data.clone(),
             dtype: t.dtype,
@@ -661,7 +925,7 @@ fn plan_carrier(
                 key: t.key.clone(),
             },
         }];
-        for (name, st) in &present {
+        for (name, st) in &chosen.present {
             roles.push(RolePlan {
                 role: name.clone(),
                 dtype: st.dtype,
@@ -674,7 +938,8 @@ fn plan_carrier(
         }
         // The spec's declared role ORDER is the header's role order.
         roles.sort_by_key(|r| {
-            use_spec
+            chosen
+                .spec
                 .roles
                 .iter()
                 .position(|(n, _)| *n == r.role)
@@ -690,7 +955,8 @@ fn plan_carrier(
         p.ops.push(Op {
             component: component.to_string(),
             out_key,
-            encoding: use_alias.to_string(),
+            encoding: chosen.alias.to_string(),
+            encoding_id: chosen.spec.object_id(),
             logical_dtype,
             logical_shape: t.shape.clone(),
             roles,
@@ -764,26 +1030,35 @@ fn plan_canonical(
     component: &str,
     h: &Header,
     alias: &str,
-    spec: &EncodingSpec,
+    cands: &Candidates<'_>,
     rekey: &Rekey,
     p: &mut Plan,
 ) -> Result<()> {
-    let want = spec.object_id();
+    // The candidate set, by DIGEST — an already-canonical component is mixed exactly as its
+    // carrier was, so a re-ingest matches each tensor against every candidate, not one.
+    let mut ids: Vec<(String, &str)> = vec![(cands.plain.object_id(), "plain/1")];
+    for (a, sp) in &cands.encoded {
+        ids.push((sp.object_id(), a));
+    }
     for (comp, key, t) in h.tensors() {
         if comp != component {
             continue;
         }
-        if t.encoding != want {
-            return refuse(
-                Code::DOUBLE_ENCODE,
-                format!(
-                    "{comp}/{key}: already encoded under {} and the target asks for {alias} \
-                     ({want}) — re-encoding already-encoded bytes needs the priced job, not \
-                     the border",
-                    t.encoding
-                ),
-            );
-        }
+        let chosen = match ids.iter().find(|(id, _)| *id == t.encoding) {
+            Some((_, a)) => *a,
+            None => {
+                return refuse(
+                    Code::DOUBLE_ENCODE,
+                    format!(
+                        "{comp}/{key}: already encoded under {} and the target asks for \
+                         {alias} ({:?}) — re-encoding already-encoded bytes needs the priced \
+                         job, not the border",
+                        t.encoding,
+                        ids.iter().map(|(i, _)| short(i)).collect::<Vec<_>>()
+                    ),
+                );
+            }
+        };
         let out_key = rekey.apply(component, key);
         let effect = if out_key == *key {
             Effect::None
@@ -793,7 +1068,8 @@ fn plan_canonical(
         p.ops.push(Op {
             component: component.to_string(),
             out_key,
-            encoding: alias.to_string(),
+            encoding: chosen.to_string(),
+            encoding_id: t.encoding.clone(),
             logical_dtype: t.dtype,
             logical_shape: t.shape.clone(),
             roles: t

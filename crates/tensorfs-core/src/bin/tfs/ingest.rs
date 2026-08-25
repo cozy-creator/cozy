@@ -154,10 +154,15 @@ fn load_registry(f: &Flags) -> Result<FingerprintRegistry, ExitCode> {
     }
 }
 
-/// alias -> the ONE spec it names. An alias that groups several physical variants (the two
-/// `fp8-rowwise/1` scale geometries) is ambiguous by construction and refuses unless the
-/// caller pins a variant.
-fn spec_of(alias: &str, variant: Option<usize>) -> tensorfs_core::err::Result<registry::Seed> {
+/// alias -> the CANDIDATE SET it names. An alias that groups several physical variants (the
+/// two `fp8-rowwise/1` scale geometries, the two `fp8-scaled-scalar/1` role sets one real
+/// artifact carries) contributes all of them: the alias is no longer ambiguous at the
+/// component, because selection happens per TENSOR from the siblings the carrier supplies.
+/// `--spec-variant` still pins ONE, which is exactly the old single-spec path.
+fn specs_of(
+    alias: &str,
+    variant: Option<usize>,
+) -> tensorfs_core::err::Result<Vec<registry::Seed>> {
     let hits: Vec<registry::Seed> = registry::seeds()
         .into_iter()
         .filter(|s| s.alias == alias)
@@ -167,15 +172,12 @@ fn spec_of(alias: &str, variant: Option<usize>) -> tensorfs_core::err::Result<re
             tensorfs_core::err::Code::UNKNOWN_ENCODING,
             format!("{alias:?} is not a platform alias"),
         ),
-        (1, _) => Ok(hits.into_iter().next().unwrap()),
-        (_, Some(i)) if i < hits.len() => Ok(hits.into_iter().nth(i).unwrap()),
-        (n, _) => tensorfs_core::err::refuse(
-            tensorfs_core::err::Code::AMBIGUOUS_CLASSIFICATION,
-            format!(
-                "{alias:?} groups {n} physically distinct specs (roles are EXACT, so each is \
-                 its own digest) — pass --spec-variant to name one",
-            ),
+        (n, Some(i)) if i < n => Ok(vec![hits.into_iter().nth(i).unwrap()]),
+        (n, Some(i)) => tensorfs_core::err::refuse(
+            tensorfs_core::err::Code::UNKNOWN_ENCODING,
+            format!("{alias:?} groups {n} specs; --spec-variant {i} names none of them"),
         ),
+        (_, None) => Ok(hits),
     }
 }
 
@@ -183,16 +185,16 @@ fn specs_for(t: &Target, f: &Flags) -> Result<Vec<(String, registry::Seed)>, Exi
     let variant: Option<usize> = flag(f, "spec-variant").and_then(|s| s.parse().ok());
     // plain/1 is always resolved: a real component is MIXED, and the tensors its producer's
     // eligibility predicate skipped are plain storage beside the encoded ones.
-    let mut out: Vec<(String, registry::Seed)> = match spec_of("plain/1", None) {
-        Ok(s) => vec![("plain/1".to_string(), s)],
+    let mut out: Vec<(String, registry::Seed)> = match specs_of("plain/1", None) {
+        Ok(s) => s.into_iter().map(|s| ("plain/1".to_string(), s)).collect(),
         Err(e) => return Err(bail(e)),
     };
     for (_, alias) in &t.components {
         if out.iter().any(|(a, _)| a == alias) {
             continue;
         }
-        match spec_of(alias, variant) {
-            Ok(s) => out.push((alias.clone(), s)),
+        match specs_of(alias, variant) {
+            Ok(v) => out.extend(v.into_iter().map(|s| (alias.clone(), s))),
             Err(e) => return Err(bail(e)),
         }
     }
@@ -475,6 +477,16 @@ fn print_plan(p: &Prepared) {
         pl.dropped_markers.len(),
         pl.folded_roles.len()
     );
+    // Selection is PER TENSOR, so one component routinely cites several encodings. Printing
+    // the count per SPEC DIGEST is the claim: an alias is a display name, never an identity.
+    let encs = pl.encodings();
+    println!("encodings    {} selected, per tensor:", encs.len());
+    for (alias, id, roles, n) in &encs {
+        println!(
+            "  {n:>6}     {alias}  {}  roles {roles:?}",
+            id.chars().skip(7).take(12).collect::<String>()
+        );
+    }
     match pl.declared_bytes() {
         Ok(n) => println!("declared     {n} B will be written"),
         Err(e) => println!("declared     REFUSED {}: {}", e.code.as_str(), e.detail),

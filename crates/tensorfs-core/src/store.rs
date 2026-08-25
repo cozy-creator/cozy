@@ -329,19 +329,26 @@ impl Store {
         Ok(self.marker.generation)
     }
 
-    pub fn object_path(&self, hex: &str) -> PathBuf {
+    /// A malformed id has NO path in this store. `hex[0..2]` panics on a short string, and a
+    /// panic is not a refusal — an empty argument from a shell pipeline reached this and
+    /// aborted the process instead of producing `OBJECT_ABSENT`. The sentinel never exists
+    /// and never embeds the caller's string, so `..` or a leading `/` cannot travel with it;
+    /// the caller's own absent-object refusal then names the id it was handed.
+    fn shard(&self, base: &str, hex: &str) -> PathBuf {
+        if crate::ids::hex64("object id", hex).is_err() {
+            return self.root.join(base).join(".malformed-id");
+        }
         self.root
-            .join("objects/sha256")
+            .join(base)
             .join(&hex[0..2])
             .join(&hex[2..4])
             .join(hex)
     }
+    pub fn object_path(&self, hex: &str) -> PathBuf {
+        self.shard("objects/sha256", hex)
+    }
     fn record_path(&self, hex: &str) -> PathBuf {
-        self.root
-            .join("verified")
-            .join(&hex[0..2])
-            .join(&hex[2..4])
-            .join(hex)
+        self.shard("verified", hex)
     }
 
     /// PRESENCE HINT ONLY. True says an object file exists at that id; it says nothing

@@ -314,13 +314,21 @@ pub fn execute(
     let (mut written, mut inherited, mut hashed, mut deduped) = (0u64, 0u64, 0u64, 0u64);
     let (mut segments, mut inlines, mut parts) = (0usize, 0usize, 0usize);
 
+    // Resolved by DIGEST, never by alias: one alias groups several physical specs, and the
+    // plan already selected exactly one PER TENSOR. Computed once, not per op.
+    let by_id: Vec<(String, &EncodingSpec)> =
+        specs.iter().map(|(_, s)| (s.object_id(), s)).collect();
+
     for op in &plan.ops {
-        let spec = match specs.iter().find(|(a, _)| *a == op.encoding) {
-            Some((_, s)) => s.clone(),
+        let spec = match by_id.iter().find(|(id, _)| *id == op.encoding_id) {
+            Some((_, s)) => (*s).clone(),
             None => {
                 return refuse(
                     Code::UNKNOWN_ENCODING,
-                    format!("{}: no spec for target {:?}", op.out_key, op.encoding),
+                    format!(
+                        "{}: the plan selected spec {} ({}), which is not in the resolved set",
+                        op.out_key, op.encoding_id, op.encoding
+                    ),
                 )
             }
         };

@@ -13,7 +13,7 @@ ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 TFS="$ROOT/target/release/tfs"
 WORK="${WORK:-/tmp/tfs-003-runs}"
 SDXL="${SDXL:-/home/fidika/cozy_v2/tensorfs-bench/hf/sdxl}"
-H3="${H3:-$ROOT/../tracker-v2/examples/safetensors-headers/minimax_h3_fl2va_fp8_scaled.header.json}"
+H3="${H3:-$ROOT/../tracker-v2/examples/safetensors-headers/minimax_h3_fl2va_pruned_fp8_scaled.header.json}"
 REG="$WORK/registry.json"
 MODE="${1:-all}"
 PASS=0; MISS=0
@@ -48,7 +48,8 @@ green() {
 
 rm -rf "$WORK"; mkdir -p "$WORK/carriers"
 for v in good pickle pickle-proto0 zip gguf gzip header-cap truncated geometry overlap gap \
-         dtype-unknown float-dim no-tensors bnb deep; do
+         dtype-unknown float-dim no-tensors bnb deep \
+         mixed-fp8 mixed-fp8-spoof rowwise-keepdim; do
   python3 "$ROOT/scripts/make-carrier.py" "$v" "$WORK/carriers/$v.safetensors"
 done
 
@@ -57,6 +58,15 @@ done
 "$TFS" ingest bank safetensors.diffusers toy v1 diffusers.identity/1 \
   --source toy="$WORK/carriers/good.safetensors" --registry "$REG" \
   --source-name synthetic-toy-carrier >/dev/null
+# Two synthetic MIXED carriers with real bytes: the per-tensor split in miniature (one
+# module with both scales, one with the weight scale alone, plain tensors beside them) and
+# the other scale geometry under the fp8-rowwise alias.
+"$TFS" ingest bank safetensors.diffusers toy mixed-fp8 diffusers.identity/1 \
+  --source mix="$WORK/carriers/mixed-fp8.safetensors" --registry "$REG" \
+  --source-name synthetic-mixed-fp8 >/dev/null
+"$TFS" ingest bank safetensors.diffusers toy rowwise-keepdim diffusers.identity/1 \
+  --source kd="$WORK/carriers/rowwise-keepdim.safetensors" --registry "$REG" \
+  --source-name synthetic-rowwise-keepdim >/dev/null
 
 if [ "$MODE" = all ] || [ "$MODE" = red ]; then
 
@@ -113,15 +123,62 @@ red AMBIGUOUS_CLASSIFICATION "one key set, two reviewed entries" \
 banner "RED 6 — conversion refusal classes, decided from headers alone"
 red REMEDY_FROM_TARGET "plain bf16 offered as fp8-rowwise (the CAST class)" \
     "$TFS" ingest plan toy=fp8-rowwise/1 --spec-variant 1 --source toy="$WORK/carriers/good.safetensors" --registry "$REG"
+red SHAPE_MISMATCH "the OTHER scale geometry under the same alias" \
+    "$TFS" ingest plan kd=fp8-rowwise/1 --spec-variant 0 --source kd="$WORK/carriers/rowwise-keepdim.safetensors" --registry "$REG"
+
+banner "RED 6a — per-tensor selection: the candidate set, and what it cannot be told"
+# A candidate set of ONE is exactly the old single-spec path: the same carrier that refuses
+# under the wrong pinned geometry plans green under the right one, and the UNPINNED set of
+# two reaches the same topology by reading the carrier's own scale shape.
+green "candidate set of one, correct geometry pinned" \
+    "$TFS" ingest plan kd=fp8-rowwise/1 --spec-variant 1 --source kd="$WORK/carriers/rowwise-keepdim.safetensors" --registry "$REG"
+A=$("$TFS" ingest plan kd=fp8-rowwise/1 --spec-variant 1 --source kd="$WORK/carriers/rowwise-keepdim.safetensors" --registry "$REG" | grep '^topology')
+B=$("$TFS" ingest plan kd=fp8-rowwise/1 --source kd="$WORK/carriers/rowwise-keepdim.safetensors" --registry "$REG" | grep '^topology')
+if [ "$A" = "$B" ] && [ -n "$A" ]; then
+  PASS=$((PASS+1)); printf '  ok   %s\n' "the unpinned set of two reaches the SAME topology as the pinned one"
+else
+  MISS=$((MISS+1)); printf '  MISS %-42s pinned %s vs unpinned %s\n' "candidate-set-of-two topology" "$A" "$B"
+fi
+echo "  the mixed synthetic carrier, three encodings from four tensors:"
+"$TFS" ingest plan mix=fp8-scaled-scalar/1 --source mix="$WORK/carriers/mixed-fp8.safetensors" --registry "$REG" \
+  | grep -E "^encodings|^ +[0-9]+ +|^topology"
+# A marker naming an encoding whose companions are ABSENT cannot promote a tensor. It is not
+# believed and not consulted: its payload is tensor BYTES, and the plan reads zero of those.
+S1=$("$TFS" ingest plan mix=fp8-scaled-scalar/1 --source mix="$WORK/carriers/mixed-fp8.safetensors" --registry "$REG" | grep -E '^topology|^ +[0-9]+ +')
+S2=$("$TFS" ingest plan mix=fp8-scaled-scalar/1 --source mix="$WORK/carriers/mixed-fp8-spoof.safetensors" --registry "$REG" | grep -E '^topology|^ +[0-9]+ +')
+if [ "$S1" = "$S2" ] && [ -n "$S1" ]; then
+  PASS=$((PASS+1)); printf '  RED  %-42s marker dropped, plan identical\n' "a marker claiming fp8 over absent companions"
+  echo "       $(grep -c . <<<"$S2") lines identical, topology unchanged by the planted marker"
+else
+  MISS=$((MISS+1)); printf '  MISS %-42s the planted marker moved the plan\n' "marker spoof"
+fi
+
 if [ -f "$H3" ]; then
-  "$TFS" ingest bank safetensors.diffusers h3.fl2va fp8-scaled diffusers.identity/1 \
+  "$TFS" ingest bank safetensors.diffusers h3.fl2va pruned-fp8-scaled diffusers.identity/1 \
     --source transformer="$H3" --registry "$REG" --source-name h3-shipped-header >/dev/null
-  red SHAPE_MISMATCH "the OTHER scale geometry under the same alias" \
-      "$TFS" ingest plan transformer=fp8-rowwise/1 --spec-variant 0 --source transformer="$H3" --registry "$REG"
   red DOUBLE_ENCODE "an fp8-with-scales tree offered as plain storage" \
       "$TFS" ingest plan transformer=plain/1 --source transformer="$H3" --registry "$REG"
-  banner "GREEN — the REAL shipped H3 DiT header, planned with zero tensor bytes read"
-  "$TFS" ingest plan transformer=fp8-rowwise/1 --spec-variant 1 --source transformer="$H3" --registry "$REG"
+  red DOUBLE_ENCODE "the real DiT as fp8-rowwise: no role for .input_scale" \
+      "$TFS" ingest plan transformer=fp8-rowwise/1 --source transformer="$H3" --registry "$REG"
+  red MISSING_COMPANION_ROLE "candidate set pinned to the +input_scale variant" \
+      "$TFS" ingest plan transformer=fp8-scaled-scalar/1 --spec-variant 0 --source transformer="$H3" --registry "$REG"
+  red DOUBLE_ENCODE "candidate set pinned to the weight-scale-only variant" \
+      "$TFS" ingest plan transformer=fp8-scaled-scalar/1 --spec-variant 1 --source transformer="$H3" --registry "$REG"
+  # A planted MIXED carrier whose roles match no candidate: one module's .input_scale
+  # becomes a .pre_quant_scale — same bytes, same geometry, same logical key set, a role set
+  # no fp8-scaled-scalar variant declares.
+  python3 - "$H3" "$WORK/h3-unknown-roles.json" <<'PY'
+import json, sys
+h = json.load(open(sys.argv[1]))
+victim = next(k for k in h if k.endswith(".input_scale"))
+h[victim[: -len(".input_scale")] + ".pre_quant_scale"] = h.pop(victim)
+json.dump(h, open(sys.argv[2], "w"))
+print("reroled", victim)
+PY
+  red DOUBLE_ENCODE "one tensor's roles match NO candidate (a .pre_quant_scale)" \
+      "$TFS" ingest plan transformer=fp8-scaled-scalar/1 --source transformer="$WORK/h3-unknown-roles.json" --registry "$REG"
+  banner "GREEN — the REAL shipped H3 DiT header: per-tensor selection, 0 tensor bytes read"
+  "$TFS" ingest plan transformer=fp8-scaled-scalar/1 --source transformer="$H3" --registry "$REG"
   python3 - "$H3" "$WORK/h3-torn.json" <<'PY'
 import json, sys
 h = json.load(open(sys.argv[1]))
@@ -136,10 +193,31 @@ json.dump(h, open(sys.argv[2], "w"))
 print("removed", victim)
 PY
   red MISSING_COMPANION_ROLE "an fp8 weight whose scale twin was removed" \
-      "$TFS" ingest plan transformer=fp8-rowwise/1 --spec-variant 1 --source transformer="$WORK/h3-torn.json" --registry "$REG"
+      "$TFS" ingest plan transformer=fp8-scaled-scalar/1 --source transformer="$WORK/h3-torn.json" --registry "$REG"
 else
   echo "  (no H3 header at $H3 — skipping the fp8 arms)"
 fi
+
+banner "REAL 0 — the per-tensor split through the REAL transaction, on real bytes"
+# Small carrier, real bytes, the whole border: isolated worker -> CAS -> canonical header ->
+# Stamp -> receipt -> install -> transitive walk -> delivered-bytes identity. The 20 GB
+# artifact's split is proven byte-for-byte here; at scale it stays a pod arm (tfs-018).
+MIXSTORE="$WORK/mixstore"
+"$TFS" ingest run "$MIXSTORE" mix=fp8-scaled-scalar/1 --registry "$REG" --session mix \
+  --source mix="$WORK/carriers/mixed-fp8.safetensors" 2>&1 \
+  | grep -E "^encodings|^ +[0-9]+ +|^topology|^stamp|^receipt|parts |tensors "
+green "install the mixed candidate" "$TFS" ingest install "$MIXSTORE" mix
+MIXSNAP=$("$TFS" ingest roots "$MIXSTORE" | grep installed | head -1 | awk '{print $2}' | cut -d: -f2)
+"$TFS" snapshot walk "$MIXSTORE" "$MIXSNAP" | sed -n '2,3p'
+green "delivered bytes hash to the digests the header declares" \
+    "$TFS" read prove "$MIXSTORE" "$MIXSNAP"
+"$TFS" read prove "$MIXSTORE" "$MIXSNAP" | sed 's/^/    /'
+MIXHDR=$("$TFS" snapshot show "$MIXSTORE" "$MIXSNAP" | grep attachment | grep -oE '[0-9a-f]{64}')
+red CONVERTS_NOTHING "re-ingest of the mixed result changes nothing" \
+    "$TFS" ingest reingest "$MIXSTORE" "$MIXHDR" mix=fp8-scaled-scalar/1 --session m0
+echo "  a MIXED canonical header re-keyed: three encodings matched by DIGEST, zero bytes hashed"
+"$TFS" ingest reingest "$MIXSTORE" "$MIXHDR" mix=fp8-scaled-scalar/1 \
+  --rekey mix=qkv.:attn.qkv. --session m1 2>&1 | grep -E "^ops|^objects|bytes_hashed|bytes_inherited" | sed 's/^/    /'
 
 banner "RED 6b — converter geometry: the golden suite and its wrong-order twin"
 "$ROOT/target/release/tfs" ingest golden
@@ -204,7 +282,17 @@ banner "REAL 4 — a candidate is NOT a checkpoint"
 "$TFS" ingest roots "$STORE"
 
 banner "REAL 5 — install: the coordinator's act, against the receipt"
-"$TFS" ingest install "$STORE" sdxl
+# An ARM, not a bare command. This step printed `REFUSED SIZE_CAP` for a whole release and
+# nothing counted it, because a bare line's refusal is invisible: the subject's candidate
+# set is EVERY object the snapshot reaches — 2,601 for this tree — against a 64 KiB cap it
+# shared with the fixed-size documents. A step whose failure is not an arm is not verified.
+INS=$("$TFS" ingest install "$STORE" sdxl 2>&1)
+if grep -q REFUSED <<<"$INS"; then
+  MISS=$((MISS+1)); printf '  MISS %-42s %s\n' "install a 2,601-object candidate" "$(head -1 <<<"$INS")"
+else
+  PASS=$((PASS+1)); printf '  ok   %s\n' "install a 2,601-object candidate (the subject's real candidate set)"
+fi
+sed 's/^/    /' <<<"$INS"
 "$TFS" ingest roots "$STORE"
 
 CK=$("$TFS" ingest roots "$STORE" | grep installed | head -1 | awk '{print $2}' | cut -d: -f2)
