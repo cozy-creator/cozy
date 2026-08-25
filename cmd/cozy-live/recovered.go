@@ -113,6 +113,8 @@ func sectionRecovered() {
 
 	line, ok := waitEvent(lv, "OPEN OBLIGATION", 120*time.Second)
 	check("Register carried the recovered attempt", ok, trimLog(line))
+	check("at the moment the obligation was taken, the ordinal gate REFUSED",
+		strings.Contains(line, "recovered attempt(s) still open"), trimLog(line))
 	secondSession := lv.c.Worker(instance).SessionID
 	check("it is a NEW session over the SAME instance", secondSession != firstSession &&
 		secondSession != "", firstSession+" -> "+secondSession)
@@ -130,8 +132,11 @@ func sectionRecovered() {
 	if sawLaw {
 		when = ms(lawAt.Sub(restartAt)) + " after the restart"
 	}
-	check("a next ordinal was REFUSED while the recovered attempt was open", sawLaw,
-		fmt.Sprintf("%d refusals of the ordinal gate, the recovered one first seen %s", tries, when))
+	// The spinner is the same law seen from OUTSIDE, under contention. Its window is
+	// milliseconds wide, so it is reported rather than required.
+	fmt.Printf("  ---- an external spinner hammered the same gate: %d refusals, the recovered "+
+		"one first seen %s\n", tries, when)
+	_ = sawLaw
 	check("the coordinator's own log orders closure BEFORE the next dispatch",
 		orderedBefore(lv, "applied in", fmt.Sprintf("StartAttempt %s#%d", requestID, attempt+1)),
 		"the requeue projection dispatches attempt 2 only after attempt 1's terminal committed")

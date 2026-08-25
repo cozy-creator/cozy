@@ -198,9 +198,14 @@ func (c *Coordinator) onRegister(stream pb.Worker_ControlServer, r *pb.Register)
 			c.logf("recovered attempt %s#%d REFUSED: %s", ra.RequestId, ra.Attempt, e.Message)
 			continue
 		}
-		c.logf("recovered attempt %s#%d (%s) is an OPEN OBLIGATION: no next ordinal for %s "+
-			"until its terminal closes it", ra.RequestId, ra.Attempt,
-			pb.AttemptState_name[int32(ra.State)], ra.RequestId)
+		// Assert the obligation at the moment it is taken: ask this coordinator's own
+		// ordinal gate what it now answers for that request id. The refusal is the law
+		// as an OBSERVED fact rather than an inference from the row's state, and it is
+		// recorded here because the window it holds for is milliseconds wide.
+		_, blocked := c.opt.Store.NextOrdinal(ra.RequestId)
+		c.logf("recovered attempt %s#%d (%s) is an OPEN OBLIGATION — the ordinal gate now "+
+			"refuses: %s", ra.RequestId, ra.Attempt,
+			pb.AttemptState_name[int32(ra.State)], briefOf(blocked))
 	}
 
 	s.send(&pb.CoordinatorMessage{Msg: &pb.CoordinatorMessage_RegisterAck{
@@ -457,6 +462,13 @@ func terminalError(status, cause, message string) *exit.Error {
 	default:
 		return exit.New(exit.Failed, "the attempt failed (%s): %s", cause, message)
 	}
+}
+
+func briefOf(e *exit.Error) string {
+	if e == nil {
+		return "NOT REFUSED — the gate is open, which would be the law failing"
+	}
+	return e.Message
 }
 
 func shortDigest(s string) string {
