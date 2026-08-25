@@ -124,6 +124,8 @@ CODEC_OWNERS = {
     "cozytensors.topology/1": {"crates/tensorfs-core/src/header.rs"},
     "tensorfs.encoding_spec/1": {"crates/tensorfs-core/src/spec.rs"},
     "tensorfs.encoding_vectors/1": {"crates/tensorfs-core/src/vectors.rs"},
+    "tensorfs.meta/1": {"crates/tensorfs-core/src/meta.rs"},
+    "tensorfs.operation_receipt/1": {"crates/tensorfs-core/src/receipt.rs"},
 }
 CODEC_MARKS = list(CODEC_OWNERS)
 GRAMMAR_TAGS = ["ceil_block", "elements_div", "ceil_div"]
@@ -220,6 +222,68 @@ def fence_one_codec():
                  f"{INGEST_OK_PREFIX}, {len(EXCLUDED)} deleted words")
 
 
+# ------------------------------------------------- 5. the serve path stays a serve path
+
+# tfs-005's fence, in two halves.
+#
+# (a) SERVE-PATH PURITY. The read/fill/projection/metadata modules are what a warm worker
+#     runs. A carrier parser, a fingerprinter or a classifier reachable from there means an
+#     artifact's LAYOUT is being re-decided at serve time, from bytes, after the border
+#     already decided it once — the v1 two-deciders defect with the expensive half moved to
+#     the latency path. `tfs-003` confines foreign CONTAINERS to the border already; this
+#     confines the border's own decision vocabulary.
+SERVE_PATH = ["crates/tensorfs-core/src/read.rs", "crates/tensorfs-core/src/fill.rs",
+              "crates/tensorfs-core/src/project.rs", "crates/tensorfs-core/src/meta.rs",
+              "crates/tensorfs-core/src/gc.rs", "crates/tensorfs-core/src/receipt.rs"]
+# Module PATHS and type names, not the English nouns: tier 3 legitimately streams "a
+# retained carrier blob" in its refusal prose, and a fence that cannot tell a noun from an
+# import is a fence people route around.
+BORDER_VOCAB = ["ingest::", "carrier::", "fingerprint::", "convert::", "SourceHeader",
+                "IngestProfile", "Converter", "classify", "topology_fingerprint"]
+
+# (b) PINNED BUFFERS ARE NOT OURS. boundaries.md gives TensorFS bytes and leases and gives
+#     the runtime GPU memory and pinned staging. Exactly ONE budgeted pinned pool per
+#     executor lives with the CALLER (the v1 FillSink lesson); the moment core names a pinned
+#     pool it has taken a policy it cannot budget and an allocation it cannot free.
+PINNED_VOCAB = ["pinned", "pin_memory", "cudaHostAlloc", "page_locked", "PinnedPool",
+                "staging_pool", "host_register"]
+
+# (c) ONE TRANSFORM. The fill transform is defined once; everyone else re-exports it.
+XFORM_HOME = "crates/tensorfs-core/src/fill.rs"
+
+
+def fence_serve_path():
+    bad = []
+    for p in sorted((ROOT / "crates").glob("**/*.rs")):
+        r = str(rel(p))
+        text = p.read_text(errors="ignore")
+        lines = list(enumerate(text.splitlines(), 1))
+        if r in SERVE_PATH:
+            for i, line in lines:
+                s = code_only(line)
+                if not s:
+                    continue
+                for w in BORDER_VOCAB:
+                    hit = w in s if "::" in w else re.search(
+                        r"(?<![\w])" + re.escape(w) + r"(?![\w])", s)
+                    if hit:
+                        bad.append(f"{r}:{i}: serve path names border vocabulary '{w}' — "
+                                   "layout is decided once, at the border, never at read time")
+        for i, line in lines:
+            s = code_only(line)
+            if not s:
+                continue
+            for w in PINNED_VOCAB:
+                if re.search(r"(?<![\w])" + re.escape(w) + r"(?![\w])", s):
+                    bad.append(f"{r}:{i}: core names '{w}' — pinned staging belongs to the "
+                               "caller's one budgeted pool, never to TensorFS")
+        if r != XFORM_HOME and re.search(r"(enum|impl)\s+Xform\b", text):
+            bad.append(f"{r}: defines Xform outside {XFORM_HOME} — the fill transform has "
+                       "ONE implementation; every other site re-exports it")
+    return bad, (f"{len(SERVE_PATH)} serve-path files, {len(BORDER_VOCAB)} border words, "
+                 f"{len(PINNED_VOCAB)} pinned-buffer words, one Xform in {XFORM_HOME}")
+
+
 # ----------------------------------------------------------------------------
 
 def rel(p):
@@ -229,7 +293,8 @@ def rel(p):
 FENCES = [("forbidden dependencies", fence_dependencies),
           ("no upward imports", fence_layering),
           ("marshal-only facade", fence_facade),
-          ("one codec, one evaluator", fence_one_codec)]
+          ("one codec, one evaluator", fence_one_codec),
+          ("serve path, pinned buffers, one transform", fence_serve_path)]
 
 red = 0
 for title, fn in FENCES:

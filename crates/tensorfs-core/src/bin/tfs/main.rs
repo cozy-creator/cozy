@@ -62,6 +62,22 @@
 //!   tfs ingest reingest <root> <hex> <target>  inherit by object reference: 0 bytes hashed
 //!   tfs ingest roots|reap <root>             candidates are not checkpoints
 //!   tfs ingest converters | golden           reviewed converters; geometry run live
+//!
+//! Reads and projection (tfs-005). Flags: --workers <n> --window <b> --ring <b>
+//! --order module|key --hold-secs <s> --drop-unreleased --no-symlink
+//!
+//!   tfs read lease <root> <snap>             acquire/verify/release one ReadLease
+//!   tfs read plan <root> <snap>              destination order vs header key order
+//!   tfs read fill <root> <snap>              the pooled fill into a caller-owned ring
+//!   tfs read verify-fill <root> <snap>       the same bytes through the sequential path
+//!   tfs read span <root> <snap> <c> <k> <role> <off> <len>
+//!   tfs read arms <root> <snap>              the read/projection red arms, planted live
+//!   tfs read tear <root> <snap>              tear a verified object UNDER a live lease
+//!   tfs read prove <root> <snap>             delivered bytes vs the digests the header declares
+//!   tfs read transform                       run decomposition + the block-granularity rule
+//!   tfs project <root> <snap> <dest>         tier 2: relative-symlink tree, no weight paths
+//!   tfs materialize <root> <file> <dest>     tier 3: stream a RETAINED carrier blob
+//!   tfs render <root> <hex>                  pretty PROJECTION of a canonical document
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -148,6 +164,24 @@ fn main() -> ExitCode {
         ["ingest", "install", r, s] => ingest::cmd_install(Path::new(r), s),
         ["ingest", "reap", r] => ingest::cmd_reap(Path::new(r), &flags),
         ["ingest", "roots", r] => ingest::cmd_roots(Path::new(r)),
+        ["read", "lease", r, h] => rd::cmd_lease(Path::new(r), h, &flags),
+        ["read", "plan", r, h] => rd::cmd_plan(Path::new(r), h, &flags),
+        ["read", "fill", r, h] => rd::cmd_fill(Path::new(r), h, &flags),
+        ["read", "verify-fill", r, h] => rd::cmd_verify_fill(Path::new(r), h, &flags),
+        ["read", "span", r, h, c, k, role, off, len] => rd::cmd_span(
+            Path::new(r),
+            h,
+            [c, k, role],
+            off.parse().unwrap_or(0),
+            len.parse().unwrap_or(0),
+        ),
+        ["read", "arms", r, h] => rd::cmd_arms(Path::new(r), h),
+        ["read", "tear", r, h] => rd::cmd_tear(Path::new(r), h),
+        ["read", "prove", r, h] => rd::cmd_prove(Path::new(r), h, &flags),
+        ["read", "transform"] => rd::cmd_transform(),
+        ["project", r, h, d] => rd::cmd_project(Path::new(r), h, Path::new(d), &flags),
+        ["materialize", r, f, d] => rd::cmd_materialize(Path::new(r), Path::new(f), Path::new(d)),
+        ["render", r, h] => rd::cmd_render(Path::new(r), h),
         ["registry"] => cmd_registry(),
         ["vectors", "gen"] => cmd_gen(&default_dir()),
         ["vectors", "gen", d] => cmd_gen(Path::new(d)),
@@ -216,6 +250,7 @@ mod ckpt;
 mod ingest;
 mod conform;
 mod fixtures;
+mod rd;
 mod snap;
 
 fn cmd_store(root: &Path, verb: &str) -> ExitCode {
@@ -1983,7 +2018,140 @@ fn build_corpus() -> (Vec<Case>, Vec<EncodingSpec>) {
         });
     }
 
+    cases.extend(meta_cases());
     (cases, specs)
+}
+
+/// The metadata authority document (tfs-006) and the degraded-behaviour receipt (tfs-005).
+/// The authority is the one document that decides what may be deleted, so its decoder is
+/// frozen here with the same discipline as the header's.
+fn meta_cases() -> Vec<Case> {
+    use tensorfs_core::meta::{HoldRow, QRow, RootRow, SnapshotRow, State};
+    use tensorfs_core::receipt::Receipt;
+
+    let snap = "a".repeat(64);
+    let other = "b".repeat(64);
+    let full = State {
+        generation: 7,
+        snapshots: vec![
+            SnapshotRow {
+                snapshot: snap.clone(),
+                known_at: 100,
+                hub_published: true,
+                source_url: String::new(),
+                last_used: 140,
+            },
+            SnapshotRow {
+                snapshot: other.clone(),
+                known_at: 101,
+                hub_published: false,
+                source_url: "https://example.invalid/m".to_string(),
+                last_used: 141,
+            },
+        ],
+        roots: vec![RootRow {
+            name: "binding-0".to_string(),
+            snapshot: snap.clone(),
+            kind: "binding".to_string(),
+            created: 120,
+        }],
+        holds: vec![HoldRow {
+            id: "read-1-2".to_string(),
+            kind: "read".to_string(),
+            snapshot: other.clone(),
+            objects: vec!["c".repeat(64)],
+            owner_pid: 4242,
+            boot_epoch: 1700000000,
+            acquired: 130,
+        }],
+        quarantine: vec![QRow {
+            object: "d".repeat(64),
+            claim_generation: 6,
+        }],
+    };
+    let bytes = full.canonical_bytes();
+    let mut out = vec![ok_case(
+        "meta",
+        "authority-full",
+        "meta",
+        bytes.clone(),
+        "all four record kinds in one transaction document",
+    )];
+
+    // Order is part of the document: an unsorted twin re-encodes differently, so it can
+    // neither round-trip nor be believed. Two authorities disagreeing is what this refuses.
+    let unsorted = String::from_utf8(bytes.clone())
+        .unwrap()
+        .replace(
+            &format!("\"snapshot\":\"{snap}\"}},{{\"hub_published\":false"),
+            &format!("\"snapshot\":\"{snap}\"}},{{\"hub_published\":false"),
+        );
+    let swapped = {
+        // Emit the snapshots array with the two rows exchanged, by rendering a state whose
+        // decode order is reversed. Canonical writing sorts, so plant the bytes directly.
+        let mut s = unsorted.clone();
+        let a = format!("\"snapshot\":\"{snap}\"");
+        let b = format!("\"snapshot\":\"{other}\"");
+        let (ia, ib) = (s.find(&a).unwrap(), s.rfind(&b).unwrap());
+        if ia < ib {
+            s.replace_range(ib..ib + b.len(), &a);
+            s.replace_range(ia..ia + a.len(), &b);
+        }
+        s
+    };
+    out.push(red_case(
+        "meta-red",
+        "records-out-of-order",
+        "meta",
+        swapped.into_bytes(),
+        "SORT_ORDER",
+        "two snapshot rows in descending order — an unsorted authority is refused",
+    ));
+    out.push(red_case(
+        "meta-red",
+        "hold-nonhex-snapshot",
+        "meta",
+        String::from_utf8(bytes.clone())
+            .unwrap()
+            .replacen(&format!("\"snapshot\":\"{other}\""), "\"snapshot\":\"latest\"", 1)
+            .into_bytes(),
+        "MALFORMED_DIGEST",
+        "a hold pinning a NAME instead of an immutable snapshot id",
+    ));
+    out.push(red_case(
+        "meta-red",
+        "unknown-record-field",
+        "meta",
+        String::from_utf8(bytes)
+            .unwrap()
+            // Inserted in SORTED position on purpose: out of order it would be refused one
+            // layer earlier, by the canonical reader, and this arm is about the FIELD.
+            .replacen(
+                "\"boot_epoch\":1700000000",
+                "\"boot_epoch\":1700000000,\"expires_at\":999",
+                1,
+            )
+            .into_bytes(),
+        "UNKNOWN_FIELD",
+        "a wall-clock expiry smuggled onto a LOCAL hold — local liveness is owner-evidence",
+    ));
+
+    out.push(ok_case(
+        "meta",
+        "degraded-receipt",
+        "operation_receipt",
+        Receipt::new(
+            "project_snapshot",
+            "symlink-fell-back-to-copy",
+            &snap,
+            9,
+            "a filesystem without symlinks: dedup lost, correctness kept".to_string(),
+        )
+        .on("host")
+        .canonical_bytes(),
+        "a fallback that changes performance or trust says so",
+    ));
+    out
 }
 
 fn uppercase_digest(bytes: &[u8]) -> Vec<u8> {
@@ -2098,6 +2266,10 @@ fn run_doc(doc: &str, bytes: &[u8], closure: &Closure, platform: &[String]) -> O
         }
         "root" => tensorfs_core::ingest::transaction::IngestRoot::parse(bytes).map(|_| (None, None)),
         "receipt" => IngestVerificationReceipt::parse(bytes).map(|_| (None, None)),
+        "meta" => tensorfs_core::meta::State::parse(bytes).map(|_| (None, None)),
+        "operation_receipt" => {
+            tensorfs_core::receipt::Receipt::parse(bytes).map(|_| (None, None))
+        }
         other => panic!("unknown doc kind {other}"),
     };
     match r {

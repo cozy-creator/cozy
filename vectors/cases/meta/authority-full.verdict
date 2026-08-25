@@ -1,0 +1,4 @@
+doc: meta
+expect: ok
+id: sha256:e40a3d9fc132315ddb5597df9db93f9619856804f5a5212f5a7cc9494b1e1185
+note: all four record kinds in one transaction document

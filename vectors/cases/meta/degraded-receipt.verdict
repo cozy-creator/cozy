@@ -1,0 +1,4 @@
+doc: operation_receipt
+expect: ok
+id: sha256:0be4f08137916fddc29127bcb8a4894954d0364f9054eb356484816c59e3e79d
+note: a fallback that changes performance or trust says so
