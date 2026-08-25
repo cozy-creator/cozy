@@ -1,6 +1,21 @@
-//! Ingest documents: profile (dialect + converter + limits), subject (tenant + exact source
-//! generations + proposed header), and the ONE merged verification receipt.
-//! Receipts are evidence, never publication authority.
+//! The ingest border (tfs-003) — the ONLY place in this repo that parses a foreign
+//! carrier. Everything under `ingest/` is inside the fourth fence; nothing outside it may
+//! name a foreign container.
+//!
+//! This file holds the ingest DOCUMENTS: profile (dialect + converter + limits), subject
+//! (tenant + exact source generations + proposed header), and the ONE merged verification
+//! receipt. Receipts are evidence, never publication authority.
+//!
+//! The border's four stages, each its own file:
+//!   carrier     — strict bounded foreign-carrier decode (refuse before allocation)
+//!   fingerprint — classification into a reviewed registry verdict; ambiguity refuses
+//!   convert     — the PLAN (pure function of headers + target) and the reviewed converters
+//!   transaction — quarantine-rooted write through the real CAS, receipt, install/reap
+
+pub mod carrier;
+pub mod convert;
+pub mod fingerprint;
+pub mod transaction;
 
 use crate::canon::{as_arr, as_str, Fields, Value};
 use crate::err::{refuse, Code, Result};

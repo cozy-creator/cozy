@@ -47,6 +47,32 @@ scripts/snapshot-runs.sh all        # the whole plane plus its red arms
 and their vector sets) live at `closure/<digest>.json`, where the path terminal IS the
 digest; the header attachment is TYPED and must be projected at exactly one path.
 
+## ingest (tfs-003)
+
+The only normal tensor-ingest door. `inspect` and `plan` read HEADERS only — every
+structural refusal is decidable for a few hundred KiB, before a GPU is rented. `run` hands
+the job to an isolated child; `install` is the coordinator's separate act; everything that
+never reaches it reaps.
+
+```
+tfs ingest inspect --source unet=<file> [--source vae=<file> ...]   # hermetic bounded decode
+tfs ingest bank <dialect> <family> <variant> <converter> --source c=<file>   # the REVIEW act
+tfs ingest plan  <component=alias,...> --source c=<file>            # zero tensor bytes read
+tfs ingest run   <store> <component=alias,...> --source c=<file> [--config c=<file>]
+tfs ingest install <store> <session>        # the coordinator promotes ONE root
+tfs ingest roots|reap <store> [--now]       # candidates are not checkpoints
+tfs ingest reingest <store> <header> <target> [--rekey c=from:to]   # inherit by reference
+tfs ingest converters | golden              # reviewed converters + their geometry, live
+scripts/ingest-runs.sh all                  # the border plus 26 planted red arms
+```
+
+A `--source` names its component; a FILENAME never authorizes anything. Classification is
+a key-set fingerprint against a reviewed registry (`vectors/fingerprints/`), and both
+absence and ambiguity refuse. Measured on a real 6.94 GB SDXL fp16 tree: **84 MB/s
+end-to-end at a 13.2 MiB peak RSS** (streaming, never whole-file), planned in 30 ms from
+336 KiB of headers. Re-ingesting an already-canonical component inherits every object by
+reference: 167 MB carried, **zero bytes hashed**.
+
 ## registry (tfs-008)
 
 ```
@@ -61,7 +87,8 @@ Vectors are PRODUCER-MINED: `scripts/mine-vectors.py` runs v1's own quantizers (
 under `~/cozy`) and transcribes raw bytes; `tfs vectors mine` canonicalises them. A
 vectorless spec stores and inspects and can never qualify an implementation.
 
-`vectors/` is frozen DATA: `closure/` holds the platform EncodingSpec objects, `cases/<group>/`
+`vectors/` is frozen DATA: `closure/` holds the platform EncodingSpec objects, `fingerprints/`
+the reviewed classification registry, `cases/<group>/`
 holds each vector's exact stored bytes plus a `.verdict` (expected outcome, frozen ids),
 `mined/` holds the producer-mined conformance vectors and `structure/` the banked
 structure fixtures. `vectors gen` regenerates only `cases/` and `closure/` — the other two

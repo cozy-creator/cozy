@@ -44,6 +44,22 @@ pub const MAX_RELATION_NODES: usize = 64;
 pub const MAX_DOC_TEXT_BYTES: usize = 4096;
 pub const MAX_ELEMENTS: u64 = 1 << 48;
 
+// ---------------------------------------------------------------- ingest border (tfs-003)
+
+/// Foreign carrier header cap, enforced BEFORE the allocation: an 8-byte length field is
+/// read, checked, and only then is a buffer made. Real evidence: the shipped H3 DiT header
+/// is 486 KiB over 1,667 keys and SDXL's largest is 121 KiB over 2,516 — 16 MiB leaves 30x.
+pub const CARRIER_HEADER_MAX_BYTES: usize = 16 * 1024 * 1024;
+/// A permutation-class op needs the whole logical tensor resident (a head interleave is not
+/// a streaming transform). Above this a converter refuses rather than growing without bound;
+/// identity/inherit ops never buffer and are not subject to it.
+pub const CONVERT_TENSOR_MAX_BYTES: u64 = 512 * 1024 * 1024;
+/// Quarantine roots expire. A crash, a timeout, or a walked-away session leaves only a
+/// reapable root and never an installed checkpoint.
+pub const INGEST_ROOT_TTL_SECS: u64 = 3600;
+/// Streaming copy buffer at the border — the peak-RSS floor of an identity-class ingest.
+pub const INGEST_STREAM_BUF: usize = 4 * 1024 * 1024;
+
 /// Interoperable integer range (I-JSON): numbers outside it refuse.
 pub const INT_MAX: i64 = (1i64 << 53) - 1;
 pub const INT_MIN: i64 = -((1i64 << 53) - 1);

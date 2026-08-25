@@ -47,6 +47,21 @@
 //!   tfs checkpoint admit <root> <hex>        serving admission against the local pin
 //!   tfs checkpoint caps                      whole-document total caps, armed live
 //!   tfs checkpoint size [n]                  uniform-form header cost at H3 cardinality
+//!
+//! The ingest border (tfs-003) — the ONE normal tensor-ingest door. A `--source` names its
+//! component; a filename never authorizes anything. Flags: --source <c>=<path> (repeated)
+//! --config <c>=<path> --registry <path> --spec-variant <n> --session <s> --tenant <t>
+//! --ttl <s> --rekey <c>=<from>:<to> --rlimit-as-mb/-cpu-s/-fsize-mb --no-netns --now
+//!
+//!   tfs ingest inspect                       hermetic bounded decode + classification
+//!   tfs ingest bank <dialect> <fam> <var> <converter>   the REVIEW act: bank a fingerprint
+//!   tfs ingest plan <c=alias,...>            the plan, from headers alone: 0 tensor bytes
+//!   tfs ingest run <root> <c=alias,...>      spawn the isolated worker; candidate + receipt
+//!   tfs ingest-worker <root> <c=alias,...>   the hermetic child (invoked by `run`)
+//!   tfs ingest install <root> <session>      the coordinator promotes ONE root
+//!   tfs ingest reingest <root> <hex> <target>  inherit by object reference: 0 bytes hashed
+//!   tfs ingest roots|reap <root>             candidates are not checkpoints
+//!   tfs ingest converters | golden           reviewed converters; geometry run live
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -122,6 +137,17 @@ fn main() -> ExitCode {
         ["checkpoint", "caps"] => ckpt::cmd_caps(),
         ["checkpoint", "size"] => ckpt::cmd_size(3699),
         ["checkpoint", "size", n] => ckpt::cmd_size(n.parse().unwrap_or(3699)),
+        ["ingest", "inspect"] => ingest::cmd_inspect(&flags),
+        ["ingest", "converters"] => ingest::cmd_converters(),
+        ["ingest", "golden"] => ingest::cmd_golden(),
+        ["ingest", "bank", dia, fam, var, conv] => ingest::cmd_bank(dia, fam, var, conv, &flags),
+        ["ingest", "plan", t] => ingest::cmd_plan(t, &flags),
+        ["ingest", "run", r, t] => ingest::cmd_run(Path::new(r), t, &flags),
+        ["ingest-worker", r, t] => ingest::cmd_worker(Path::new(r), t, &flags),
+        ["ingest", "reingest", r, h, t] => ingest::cmd_reingest(Path::new(r), h, t, &flags),
+        ["ingest", "install", r, s] => ingest::cmd_install(Path::new(r), s),
+        ["ingest", "reap", r] => ingest::cmd_reap(Path::new(r), &flags),
+        ["ingest", "roots", r] => ingest::cmd_roots(Path::new(r)),
         ["registry"] => cmd_registry(),
         ["vectors", "gen"] => cmd_gen(&default_dir()),
         ["vectors", "gen", d] => cmd_gen(Path::new(d)),
@@ -187,6 +213,7 @@ macro_rules! ok {
 }
 
 mod ckpt;
+mod ingest;
 mod conform;
 mod fixtures;
 mod snap;
@@ -1818,8 +1845,81 @@ fn build_corpus() -> (Vec<Case>, Vec<EncodingSpec>) {
         "one (encoding, device) pair cannot have two verdicts",
     ));
 
+    // --- the border's own documents (tfs-003)
+    let g = "ingest";
+    let banked = tensorfs_core::ingest::fingerprint::Banked {
+        keyset_digest: tensorfs_core::ids::object_id(b"a reviewed key set"),
+        dialect: "safetensors.diffusers".to_string(),
+        task_family: "sdxl".to_string(),
+        structural_variant: "base-1.0-fp16".to_string(),
+        component: "vae".to_string(),
+        converter: "diffusers.identity/1".to_string(),
+        topology_digest: tensorfs_core::ids::object_id(b"a projected topology"),
+        logical_keys: 248,
+        provenance: tensorfs_core::structure::Provenance {
+            kind: tensorfs_core::structure::REAL.to_string(),
+            source: "stabilityai/stable-diffusion-xl-base-1.0".to_string(),
+            source_sha256: Some(tensorfs_core::sha256::hex_digest(b"the exact carrier")),
+            note: "banked from a real carrier".to_string(),
+        },
+    };
+    let reg = tensorfs_core::ingest::fingerprint::FingerprintRegistry {
+        entries: vec![banked.clone()],
+    };
+    cases.push(ok_case(
+        g,
+        "fingerprint-registry",
+        "registry",
+        reg.canonical_bytes(),
+        "a reviewed entry: the review happened when this was banked",
+    ));
+    let root = tensorfs_core::ingest::transaction::IngestRoot {
+        session: "e3b0c44298fc1c14".to_string(),
+        tenant: "acme".to_string(),
+        created: 1787600000,
+        expires_at: 1787603600,
+        candidates: vec![ObjectRef::of(b"a candidate header")],
+    };
+    cases.push(ok_case(
+        g,
+        "ingest-root",
+        "root",
+        root.canonical_bytes(),
+        "an expiring quarantine root: a candidate is never a checkpoint",
+    ));
+
     // --- ingest reds
     let g = "ingest-red";
+    let mut unfalsifiable = reg.clone();
+    unfalsifiable.entries[0].provenance.source_sha256 = None;
+    cases.push(red_case(
+        g,
+        "registry-real-without-digest",
+        "registry",
+        unfalsifiable.canonical_bytes(),
+        "MISSING_FIELD",
+        "a `real` claim naming no bytes is unfalsifiable",
+    ));
+    let mut twinned = reg.clone();
+    twinned.entries.push(banked.clone());
+    cases.push(red_case(
+        g,
+        "registry-duplicate-entry",
+        "registry",
+        twinned.canonical_bytes(),
+        "DUPLICATE_KEY",
+        "one (key set, component) is banked once — twice is a review defect",
+    ));
+    let mut future = root.clone();
+    future.session = "not a session name".to_string();
+    cases.push(red_case(
+        g,
+        "root-session-grammar",
+        "root",
+        future.canonical_bytes(),
+        "KEY_GRAMMAR",
+        "a session id is an ASCII name, never free text",
+    ));
     let refused_dialect = profile_normal(vec![plain.object_ref()], "pickle");
     cases.push(red_case(
         g,
@@ -1993,6 +2093,10 @@ fn run_doc(doc: &str, bytes: &[u8], closure: &Closure, platform: &[String]) -> O
             Ok((None, None))
         }),
         "subject" => IngestSubject::parse(bytes).map(|_| (None, None)),
+        "registry" => {
+            tensorfs_core::ingest::fingerprint::FingerprintRegistry::parse(bytes).map(|_| (None, None))
+        }
+        "root" => tensorfs_core::ingest::transaction::IngestRoot::parse(bytes).map(|_| (None, None)),
         "receipt" => IngestVerificationReceipt::parse(bytes).map(|_| (None, None)),
         other => panic!("unknown doc kind {other}"),
     };

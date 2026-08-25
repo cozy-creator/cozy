@@ -88,6 +88,31 @@ codes![
     UNREGISTERED_ENCODING,
     EVIDENCE_ARM_AMBIGUOUS,
     CROSS_SUBJECT_REPLAY,
+    // ingest border (tfs-003): carrier
+    ARCHIVE_REFUSED,
+    GGUF_REFUSED,
+    CARRIER_HEADER_CAP,
+    CARRIER_GEOMETRY,
+    CARRIER_TRUNCATED,
+    CARRIER_OVERLAP,
+    // ingest border: classification and authorization
+    UNREGISTERED_FINGERPRINT,
+    AMBIGUOUS_CLASSIFICATION,
+    PROFILE_REQUIRED,
+    TOPOLOGY_MISMATCH,
+    DIALECT_MISMATCH,
+    // ingest border: conversion
+    CONVERTS_NOTHING,
+    MISSING_COMPANION_ROLE,
+    DOUBLE_ENCODE,
+    REMEDY_FROM_TARGET,
+    GOLDEN_MISMATCH,
+    PLACEMENT_UNFIT,
+    CONVERT_SIZE_CAP,
+    // ingest border: the quarantine transaction
+    QUOTA_EXHAUSTED,
+    ROOT_EXPIRED,
+    ROOT_ABSENT,
 ];
 
 #[derive(Debug, Clone)]
