@@ -108,6 +108,84 @@ def fence_facade():
                  f"{len(BANNED_NAMES)} names banned, literal cap {LITERAL_CAP}")
 
 
+# ------------------------------------------------- 4. one codec, one evaluator
+
+# A SECOND implementation of an identity-bearing codec is the defect class this repo is
+# built against: two readers that disagree produce a green suite and a wrong artifact.
+# The fingerprints below are the format strings and grammar tags themselves — anything
+# that names them is either the one implementation or a rival to it.
+CODEC_MARKS = ["tensorfs.snapshot/1", "cozytensors/1"]
+GRAMMAR_TAGS = ["ceil_block", "elements_div", "ceil_div"]
+# Foreign containers belong to tfs-003's isolated ingest converter, nowhere else. Matched
+# against CODE with string literals stripped: a dialect NAME in a string is data the border
+# legitimately carries ("pickle" is a refused dialect); an identifier is a parser.
+FOREIGN = ["safetensors", "gguf", "pickle", "unpickle", "zipfile", "ZipArchive", "npz"]
+INGEST_OK = {"crates/tensorfs-core/src/ingest.rs"}
+# The fence must be free to NAME what it forbids.
+SELF = {"scripts/fence.py"}
+GRAMMAR_HOME = {"crates/tensorfs-core/src/relation.rs"}
+# The design's deleted vocabulary: a rule VM, arrangements, morphisms, source layouts.
+EXCLUDED = ["arrangement", "morphism", "quant_rule", "source_layout", "expression_language",
+            "rule_vm", "strides"]
+
+
+def code_only(line):
+    """The line with comments and string literals removed — what the code SAYS, not what
+    it carries as data."""
+    s = line.strip()
+    if s.startswith(("//", "//!", "#")):
+        return ""
+    s = re.sub(r'"(?:[^"\\]|\\.)*"', '""', s)
+    return s
+
+
+def fence_one_codec():
+    bad = []
+    # (a) no second codec in another language, anywhere in the repo
+    for p in sorted(ROOT.glob("**/*")):
+        if not p.is_file() or ".git" in p.parts or "target" in p.parts:
+            continue
+        if str(rel(p)) in SELF:
+            continue
+        if p.suffix in (".go", ".java", ".rb", ".ts", ".js"):
+            bad.append(f"{rel(p)}: a {p.suffix} source file — the codec has ONE implementation")
+            continue
+        if p.suffix not in (".rs", ".py"):
+            continue
+        text = p.read_text(errors="ignore")
+        r = str(rel(p))
+        if p.suffix == ".py":
+            for m in CODEC_MARKS:
+                if m in text:
+                    bad.append(f"{r}: Python names '{m}' — a second codec, not a facade")
+        # (b) grammar tags live in exactly one file
+        if r not in GRAMMAR_HOME:
+            for t in GRAMMAR_TAGS:
+                if re.search(r'"' + t + r'"', text):
+                    bad.append(f"{r}: emits grammar tag '{t}' — a SECOND shape evaluator")
+        # (c) foreign container parsing lives only at the ingest border
+        if r not in INGEST_OK and r.startswith("crates/"):
+            for f in FOREIGN:
+                for i, line in enumerate(text.splitlines(), 1):
+                    s = code_only(line)
+                    if not s:
+                        continue
+                    if re.search(r"(?<![\w])" + re.escape(f) + r"(?![\w])", s):
+                        bad.append(f"{r}:{i}: foreign container '{f}' outside tfs-003's border")
+        # (d) deleted vocabulary stays deleted
+        if r.startswith("crates/"):
+            for w in EXCLUDED:
+                for i, line in enumerate(text.splitlines(), 1):
+                    s = code_only(line)
+                    if not s:
+                        continue
+                    if re.search(r"(?<![\w])" + w + r"(?![\w])", s):
+                        bad.append(f"{r}:{i}: deleted vocabulary '{w}': {s}")
+    return bad, (f"{len(CODEC_MARKS)} codec marks, {len(GRAMMAR_TAGS)} grammar tags in "
+                 f"{len(GRAMMAR_HOME)} file, {len(FOREIGN)} foreign parsers, "
+                 f"{len(EXCLUDED)} deleted words")
+
+
 # ----------------------------------------------------------------------------
 
 def rel(p):
@@ -116,7 +194,8 @@ def rel(p):
 
 FENCES = [("forbidden dependencies", fence_dependencies),
           ("no upward imports", fence_layering),
-          ("marshal-only facade", fence_facade)]
+          ("marshal-only facade", fence_facade),
+          ("one codec, one evaluator", fence_one_codec)]
 
 red = 0
 for title, fn in FENCES:

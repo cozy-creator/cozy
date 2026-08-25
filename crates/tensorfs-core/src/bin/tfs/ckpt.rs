@@ -24,7 +24,7 @@ use tensorfs_core::sha256;
 use tensorfs_core::spec::EncodingSpec;
 use tensorfs_core::store::Store;
 
-use crate::{bail, flag, flag_num, rss_kb, Flags};
+use crate::{bail, flag, flag_num, flag_on, rss_kb, Flags};
 
 // ------------------------------------------------------------------ tensor bytes
 
@@ -288,8 +288,15 @@ pub fn cmd_write(root: &Path, f: &Flags) -> ExitCode {
     }
     enc_refs.sort_by(|a: &ObjectRef, b: &ObjectRef| a.sha256.cmp(&b.sha256));
 
+    // --no-configs is the TENSORS-ONLY shape: one header plus its closure, zero sibling
+    // assets. `checkpoint_id` derives identically — there is no "has a snapshot" branch.
     let mut cfg_refs: Vec<(String, ConfigRef)> = Vec::new();
-    for (name, bytes) in configs() {
+    let cfgs = if flag_on(f, "no-configs") {
+        Vec::new()
+    } else {
+        configs()
+    };
+    for (name, bytes) in cfgs {
         let put = ok!(store.put_stream(
             &mut &bytes[..],
             Some(&ObjectRef::of(bytes)),

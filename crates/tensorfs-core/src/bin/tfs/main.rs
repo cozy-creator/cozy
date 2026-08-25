@@ -92,7 +92,9 @@ fn main() -> ExitCode {
             snap::cmd_fuzz(Path::new(r), h, flag_num(&flags, "iters", 20000))
         }
         ["snapshot", "blob", "put", r, f] => snap::cmd_blob_put(Path::new(r), Path::new(f)),
-        ["snapshot", "blob", "read", r, f] => snap::cmd_blob_read(Path::new(r), Path::new(f)),
+        ["snapshot", "blob", "read", r, f] => {
+            snap::cmd_blob_read(Path::new(r), Path::new(f), &flags)
+        }
         ["snapshot", "blob", "repair", r, f, i] => {
             snap::cmd_blob_repair(Path::new(r), Path::new(f), i.parse().unwrap_or(0))
         }
@@ -1703,12 +1705,12 @@ fn build_corpus() -> (Vec<Case>, Vec<EncodingSpec>) {
 
     // --- ingest reds
     let g = "ingest-red";
-    let pickle = profile_normal(vec![plain.object_ref()], "pickle");
+    let refused_dialect = profile_normal(vec![plain.object_ref()], "pickle");
     cases.push(red_case(
         g,
         "pickle-normal-profile",
         "profile",
-        pickle.canonical_bytes(),
+        refused_dialect.canonical_bytes(),
         "PICKLE_REFUSED",
         "pickle always refuses normal ingest",
     ));

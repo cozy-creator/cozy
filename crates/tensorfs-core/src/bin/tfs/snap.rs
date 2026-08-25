@@ -332,9 +332,14 @@ pub fn cmd_blob_put(root: &Path, src: &Path) -> ExitCode {
 
 /// Read a blob back through a descriptor RE-DERIVED from the source file, so verification
 /// compares the store against the file rather than against itself.
-pub fn cmd_blob_read(root: &Path, src: &Path) -> ExitCode {
+pub fn cmd_blob_read(root: &Path, src: &Path, f: &Flags) -> ExitCode {
     let store = ok!(Store::open(root));
-    let (d, _) = ok!(describe(src, None));
+    let (mut d, _) = ok!(describe(src, None));
+    // --whole plants a lie IN THE DESCRIPTOR rather than in the store: every segment digest
+    // still verifies, so only the whole digest can catch it. That is the whole digest's job.
+    if let Some(h) = crate::flag(f, "whole") {
+        d.whole_sha256 = h.to_string();
+    }
     let mut sink = Sink(0);
     let t = Instant::now();
     ok!(ck::read_blob(&store, "blob", &d, &mut sink));
