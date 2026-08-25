@@ -149,11 +149,12 @@ for ring in 67108864 268435456 1073741824; do
   printf '  ring %-11s %s\n' "$ring" "$v"
 done
 
-say "the denominator: the SAME object files, same depth, no tensorfs"
-python3 - "$WORK/bench" 16 <<'PY'
+say "the denominator: the SAME object files, at the SAME depth, no tensorfs"
+# Cold-vs-cold or it is not a comparison: the raw arm gets its own eviction.
+cat > "$WORK/raw.py" <<'RAWPY'
 import os, sys, time, pathlib, concurrent.futures as cf
 root, workers = pathlib.Path(sys.argv[1]), int(sys.argv[2])
-files = sorted(p for p in (root/"objects/sha256").rglob("*") if p.is_file())
+files = sorted(p for p in (root / "objects/sha256").rglob("*") if p.is_file())
 def rd(p):
     n = 0
     with open(p, "rb", buffering=0) as f:
@@ -166,5 +167,18 @@ t0 = time.time()
 with cf.ThreadPoolExecutor(workers) as ex:
     total = sum(ex.map(rd, files))
 d = time.time() - t0
-print(f"  raw qd{workers}: {total} B in {d:.2f}s = {total/1e9/d:.3f} GB/s")
-PY
+print(f"{total/1e9/d:.3f}")
+RAWPY
+printf '%-6s %-10s %-10s %-10s %-10s\n' depth tfs-cold raw-cold tfs-warm raw-warm
+for d in 1 4 16; do
+  evict "$WORK/bench" > /dev/null
+  tc=$(nice -n 19 "$TFS" read fill "$WORK/bench" "$BENCH_SNAP" --workers "$d" --window 4194304 --ring 1073741824 --no-digest | grep throughput | awk '{print $2}')
+  tw=$(nice -n 19 "$TFS" read fill "$WORK/bench" "$BENCH_SNAP" --workers "$d" --window 4194304 --ring 1073741824 --no-digest | grep throughput | awk '{print $2}')
+  evict "$WORK/bench" > /dev/null
+  rc=$(nice -n 19 python3 "$WORK/raw.py" "$WORK/bench" "$d")
+  rw=$(nice -n 19 python3 "$WORK/raw.py" "$WORK/bench" "$d")
+  printf '%-6s %-10s %-10s %-10s %-10s GB/s\n' "qd$d" "$tc" "$rc" "$tw" "$rw"
+done
+echo
+echo "COLD is the storage result. Warm figures above ~6 GB/s are host memory bandwidth,"
+echo "not a device measurement, and both arms converge there at depth."
