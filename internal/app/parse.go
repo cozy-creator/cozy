@@ -22,13 +22,6 @@ type Invocation struct {
 
 func (i *Invocation) Bool(name string) bool { return i.Bools[name] }
 
-func (i *Invocation) Value(name string) string {
-	if v := i.Values[name]; len(v) > 0 {
-		return v[len(v)-1]
-	}
-	return ""
-}
-
 // prescanJSON finds --json before parsing so even a parse refusal renders in the
 // mode the caller asked for.
 func prescanJSON(args []string) bool {

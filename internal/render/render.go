@@ -7,7 +7,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
-	"sort"
 	"strings"
 
 	"github.com/cozy-creator/cozy-creator-v2/internal/exit"
@@ -345,14 +344,4 @@ func EmitError(stdout, stderr io.Writer, e *exit.Error, m Mode) {
 	for _, n := range trimNext(e.Next) {
 		fmt.Fprintf(stderr, "next: %s\n", n)
 	}
-}
-
-// SortedKeys is a helper for deterministic map rendering.
-func SortedKeys[V any](m map[string]V) []string {
-	out := make([]string, 0, len(m))
-	for k := range m {
-		out = append(out, k)
-	}
-	sort.Strings(out)
-	return out
 }

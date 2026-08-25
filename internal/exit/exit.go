@@ -71,16 +71,6 @@ func (c Code) Valid() bool {
 	return false
 }
 
-// ByName resolves a matrix name; ok is false for anything outside the matrix.
-func ByName(name string) (Code, bool) {
-	for _, r := range Matrix {
-		if r.Name == name {
-			return r.Code, true
-		}
-	}
-	return Internal, false
-}
-
 // JobTerminal maps a job/attempt terminal state onto the shared matrix:
 // succeeded 0 · failed 11 · canceled 12 · deadline 10. The one home for that
 // mapping; `cozy help job follow` renders it from here.

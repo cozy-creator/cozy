@@ -22,7 +22,6 @@ type Flag struct {
 	Name    string // long form, e.g. "--json"
 	Short   string // optional, e.g. "-d"
 	Arg     string // "" = boolean, else the value placeholder
-	Repeat  bool
 	Summary string
 }
 

@@ -153,9 +153,9 @@ var Commands = []Command{
 		Summary: "invoke one function through the coordinator — the one invocation path",
 		Args:    "<org/endpoint/vN/function> [<primary>] [key=value …]", MinArgs: 1, MaxArgs: -1,
 		Flags: []Flag{
-			{Name: "--model", Arg: "<[binding-path=]ref|path>", Repeat: true, Summary: "override a model binding"},
+			{Name: "--model", Arg: "<[binding-path=]ref|path>", Summary: "override a model binding (repeatable)"},
 			{Name: "--lane", Arg: "<contract-expr|auto>", Summary: "pin a release lane"},
-			{Name: "--adapter", Arg: "<ref[:scale]>", Repeat: true, Summary: "stack an adapter"},
+			{Name: "--adapter", Arg: "<ref[:scale]>", Summary: "stack an adapter (repeatable; order = stack order)"},
 			{Name: "--seed", Arg: "<n>", Summary: "deterministic RNG"},
 			{Name: "--out", Arg: "<dir>", Summary: "output directory"},
 			{Name: "--offline", Summary: "CAS-only; a miss is exit 8"},
@@ -210,7 +210,7 @@ var Commands = []Command{
 		Flags: []Flag{
 			{Name: "--local", Summary: "run on this host"},
 			{Name: "--cloud", Summary: "submit to tensorhub"},
-			{Name: "--model", Arg: "<ref>", Repeat: true, Summary: "override a model binding"},
+			{Name: "--model", Arg: "<ref>", Summary: "override a model binding (repeatable)"},
 			{Name: "--out", Arg: "<dir>", Summary: "output directory"},
 			{Name: "--in", Arg: "<file>", Summary: "whole payload as JSON"},
 			{Name: "--follow", Summary: "attach immediately and exit with the terminal mapping"},
