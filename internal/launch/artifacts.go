@@ -177,8 +177,8 @@ func (r Runtime) Find(ref string) (Artifact, *exit.Error) {
 // declared slots and the local artifact index. cozy-creator asks the owner rather than
 // reading the table itself: cr-016 built this verb so that second reader could delete.
 type Binding struct {
-	Path       string            `json:"binding_path"`
-	Param      string            `json:"param"`
+	Path       string            `json:"model_binding_path"`
+	Param      string            `json:"model_parameter_name"`
 	ModelClass string            `json:"model_class"`
 	Ref        string            `json:"ref"`
 	Lane       string            `json:"lane"`

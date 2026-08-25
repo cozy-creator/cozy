@@ -26,11 +26,12 @@
 set -euo pipefail
 
 RUNTIME_REPO="${RUNTIME_REPO:-$HOME/cozy_v2/cozy-runtime}"
-# a3c3d72: the floor, not a preference — this host enters the supervisor through
-# `cozy-runtime serve` (db4ab8a), reads `job_descriptor_id` off `describe` (4485f27) and
-# stages WEIGHTLESS binding records (a3c3d72), so a release pinning an older runtime either
-# cannot be served at all or cannot serve a modelless entrypoint.
-RUNTIME_SHA="${RUNTIME_SHA:-a3c3d72}"
+# f1625f9: the floor, not a preference — this host enters the supervisor through
+# `cozy-runtime serve` (db4ab8a), reads `job_descriptor_id` off `describe` (4485f27), stages
+# WEIGHTLESS binding records (a3c3d72) and writes the record's NEW key set (f1625f9), so a
+# release pinning an older runtime either cannot be served at all or reads a record whose
+# every key it refuses as unknown.
+RUNTIME_SHA="${RUNTIME_SHA:-f1625f9}"
 # tfs-007's compiled facade, built from a PINNED read-only `git archive` of tensorfs
 # 846532c. The wheel is not incidental: cozytensors' ENCODING REGISTRY ships inside it, so
 # the release's pinned tensorfs is what decides which encodings this endpoint can read

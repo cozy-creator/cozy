@@ -199,23 +199,25 @@ func (f *Facts) binding(ep *Entrypoint, table map[string]Binding) (*coord.Bindin
 			components = narrowed
 		}
 	}
-	pairs := make([]string, 0, len(artifact.Snapshots))
+	// REAL SETS in the record: the component order is a list and the per-component
+	// snapshots are a map. They were comma-packed strings, which is a second grammar both
+	// sides had to agree about by hand (cr-008b's deferred break, taken 2026-08-25).
+	snapshots := make(map[string]string, len(artifact.Snapshots))
 	for _, name := range artifact.Components() {
-		pairs = append(pairs, name+"="+artifact.Snapshots[name])
+		snapshots[name] = artifact.Snapshots[name]
 	}
 	floor := artifact.VRAMFloorBytes
 	if floor == 0 {
 		floor = vramFloor
 	}
 	record["model_class"] = slot.Class
-	record["binding_path"] = slot.Path
-	record["param"] = slot.Param
-	record["component"] = components[0]
-	record["components"] = strings.Join(components, ",")
+	record["model_binding_path"] = slot.Path
+	record["model_parameter_name"] = slot.Param
+	record["components"] = components
 	record["store"] = artifact.Store
 	record["config"] = artifact.Config
 	record["snapshot"] = artifact.Snapshots[components[0]]
-	record["snapshots"] = strings.Join(pairs, ",")
+	record["snapshots"] = snapshots
 	record["release"] = artifact.Ref
 	record["variant"] = artifact.Variant
 	record["vram_bytes"] = int64(vramBudget)

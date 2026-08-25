@@ -46,7 +46,7 @@ func (b *Binding) PlanID() (string, *exit.Error) {
 	}
 	doc := map[string]canonical.Value{}
 	for k, v := range b.Record {
-		if k == "plan_id" {
+		if k == "entrypoint_binding_plan_id" {
 			continue
 		}
 		switch t := v.(type) {
@@ -68,6 +68,21 @@ func (b *Binding) PlanID() (string, *exit.Error) {
 					"binding record field %q is %v; these documents are integer-only", k, t)
 			}
 			doc[k] = int64(t)
+		case []string:
+			// The record carries REAL SETS now — the ordered component list and the
+			// per-component snapshot map — instead of comma-packed strings that both
+			// sides had to agree how to split.
+			items := make([]canonical.Value, 0, len(t))
+			for _, item := range t {
+				items = append(items, item)
+			}
+			doc[k] = items
+		case map[string]string:
+			pairs := map[string]canonical.Value{}
+			for name, value := range t {
+				pairs[name] = value
+			}
+			doc[k] = pairs
 		default:
 			return "", exit.Internalf("binding record field %q has no canonical spelling (%T)", k, v)
 		}
@@ -195,7 +210,7 @@ func (c *Coordinator) StartWorker(spec EndpointSpec) (string, *exit.Error) {
 		for k, v := range b.Record {
 			record[k] = v
 		}
-		record["plan_id"] = id
+		record["entrypoint_binding_plan_id"] = id
 		data, err := json.MarshalIndent(record, "", "  ")
 		if err != nil {
 			return "", exit.Internalf("cannot render the binding record: %s", err)
