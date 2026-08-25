@@ -132,8 +132,17 @@ func writeTail(w io.Writer, notes, next []string) {
 
 func writeJSON(w io.Writer, ordered []Field) error {
 	var b strings.Builder
+	seen := make(map[string]bool, len(ordered))
 	b.WriteByte('{')
 	for i, f := range ordered {
+		// A document key emitted twice is a silent lie to every machine consumer:
+		// most JSON readers keep the LAST value, so `.kind` would answer with the
+		// wrong one and nothing would say so. Found live on cl-011's repo document,
+		// whose own "kind" collided with the envelope's. Refuse instead.
+		if seen[f.K] {
+			return fmt.Errorf("document key %q is emitted twice; a JSON reader would keep only one", f.K)
+		}
+		seen[f.K] = true
 		if i > 0 {
 			b.WriteByte(',')
 		}
