@@ -153,7 +153,7 @@ def rows(path, keys, source, fold, logical_from=None):
             # The producer's file never names the data carrier's ROLE — it names only the
             # siblings. The role name is OUR registry's choice, and it is not uniform:
             # "data" in the fp8/mx specs, "weight" in nvfp4. Selected on the measured
-            # sibling set, never guessed (tfs-010 finding; decisions #288).
+            # sibling set, never guessed (tfs-010 finding; decisions #298).
             base_role = "weight" if any(n == "weight_scale_2" for n, _ in roles[k]) else "data"
             row["roles"] = sorted(
                 [{"role": base_role, "dtype": dt, "shape": v["shape"]}]

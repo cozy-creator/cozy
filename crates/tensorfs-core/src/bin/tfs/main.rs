@@ -64,6 +64,12 @@
 //!   tfs ingest roots|reap <root>             candidates are not checkpoints
 //!   tfs ingest converters | golden           reviewed converters; geometry run live
 //!
+//! The gguf-v1 PLANNER (tfs-011) — a PLAN over a metadata region, never a second door.
+//! Flags: --tensors <n> --twin <rows.json>
+//!
+//!   tfs gguf plan <file>                     carrier-blob + per-tensor views, 0 weight bytes
+//!   tfs gguf admit <file>                    the same, then the admission verdict (refuses)
+//!
 //! Reads and projection (tfs-005). Flags: --workers <n> --window <b> --ring <b>
 //! --order module|key --hold-secs <s> --drop-unreleased --no-symlink
 //!
@@ -194,6 +200,8 @@ fn main() -> ExitCode {
         ["checkpoint", "size"] => ckpt::cmd_size(3699),
         ["checkpoint", "size", n] => ckpt::cmd_size(n.parse().unwrap_or(3699)),
         ["ingest", "inspect"] => ingest::cmd_inspect(&flags),
+        ["gguf", "plan", f] => ingest::cmd_gguf_plan(Path::new(f), false, &flags),
+        ["gguf", "admit", f] => ingest::cmd_gguf_plan(Path::new(f), true, &flags),
         ["ingest", "converters"] => ingest::cmd_converters(),
         ["ingest", "golden"] => ingest::cmd_golden(),
         ["ingest", "bank", dia, fam, var, conv] => ingest::cmd_bank(dia, fam, var, conv, &flags),

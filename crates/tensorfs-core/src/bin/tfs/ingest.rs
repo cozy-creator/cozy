@@ -1352,3 +1352,111 @@ pub fn cmd_restamp(root: &Path, session: &str, flags: &Flags) -> ExitCode {
     }
     ExitCode::SUCCESS
 }
+
+// ---------------------------------------------------------------- the gguf-v1 planner
+
+/// `tfs gguf plan <file>` — derive what a serving lane would take, from the metadata
+/// region alone. `tfs gguf admit <file>` runs the same derivation and then asks the plan
+/// for its admission verdict, which today refuses for every real artifact.
+///
+/// The report is deterministic and carries no path: the same bytes under any name produce
+/// the same `plan` digest, which is the filename-Q-label arm made checkable rather than
+/// argued.
+pub fn cmd_gguf_plan(path: &Path, admit: bool, flags: &Flags) -> ExitCode {
+    let plan = ok!(tensorfs_core::ingest::gguf_plan(
+        path,
+        flag_on(flags, "probe")
+    ));
+    let mut r = String::new();
+    let hist = plan.type_histogram();
+    let (mut reversed, mut from_kv) = (0u64, 0u64);
+    for t in &plan.tensors {
+        match t.shape_source {
+            tensorfs_core::ingest::ShapeSource::DimsReversed => reversed += 1,
+            tensorfs_core::ingest::ShapeSource::OrigShapeKv => from_kv += 1,
+        }
+    }
+    r += &format!(
+        "plan         GGUF v{}, {} tensors, alignment {}\n",
+        plan.version,
+        plan.tensors.len(),
+        plan.alignment
+    );
+    r += &format!(
+        "architecture {:?} — DECLARED by the producer, never admission evidence\n",
+        plan.architecture
+    );
+    r += &format!(
+        "labels       file_type {} — recorded, never consulted; the histogram below is \
+         measured off the tensor info table\n",
+        plan.file_type_label.clone().unwrap_or("(absent)".into())
+    );
+    r += &format!(
+        "metadata     {} B, {} KV of which {} orig_shape\n",
+        plan.metadata_bytes, plan.kv_count, plan.orig_shape_kvs
+    );
+    r += &format!(
+        "carrier blob {} B whole, opaque, streamed by a path-consuming engine{}\n",
+        plan.carrier_blob_bytes(),
+        match plan.probe {
+            true => " (DERIVED: the input is a bounded metadata probe, bytes not present)",
+            false => " (present on disk)",
+        }
+    );
+    r += &format!(
+        "decomposed   {} objects over a {} B data region at offset {}\n",
+        plan.tensors.len(),
+        plan.data_bytes,
+        plan.data_offset
+    );
+    r += &format!(
+        "shapes       {reversed} from reversed dims, {from_kv} from the producer's \
+         orig_shape KV\n"
+    );
+    for (name, n, bytes) in &hist {
+        let spec = plan
+            .tensors
+            .iter()
+            .find(|t| &t.type_name == name)
+            .and_then(|t| t.plain_dtype)
+            .map(|d| format!("plain/1 {d}"))
+            .unwrap_or_else(|| "UNREVIEWED — no EncodingSpec describes it".into());
+        r += &format!("  {name:<8} {n:>5} tensors {bytes:>15} B  {spec}\n");
+    }
+    let show: usize = flag(flags, "tensors")
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0);
+    for t in plan.tensors.iter().take(show) {
+        r += &format!(
+            "  {:<52} {:<7} carrier {:?} -> logical {:?} {} blocks @{} +{}\n",
+            t.name, t.type_name, t.carrier_dims, t.logical_shape, t.blocks, t.offset, t.nbytes
+        );
+    }
+    print!("{r}");
+    println!(
+        "plan digest  {}",
+        tensorfs_core::ids::object_id(r.as_bytes())
+    );
+    if let Some(twin) = flag(flags, "twin") {
+        let bytes = match fs::read(twin) {
+            Ok(b) => b,
+            Err(e) => {
+                eprintln!("REFUSED IO_FAILED: read {twin}: {e}");
+                return ExitCode::FAILURE;
+            }
+        };
+        let n = ok!(tensorfs_core::ingest::gguf_check_twin(&plan, &bytes));
+        println!("twin         {n} logical shapes agree with {twin}");
+    }
+    match plan.admission() {
+        Ok(()) => {
+            println!("admission    every tensor is described by a reviewed spec");
+            ExitCode::SUCCESS
+        }
+        Err(e) if admit => bail(e),
+        Err(e) => {
+            println!("admission    NOT OPEN — {e}");
+            ExitCode::SUCCESS
+        }
+    }
+}

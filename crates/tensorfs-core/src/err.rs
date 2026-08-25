@@ -99,6 +99,17 @@ codes![
     CARRIER_GEOMETRY,
     CARRIER_TRUNCATED,
     CARRIER_OVERLAP,
+    // the gguf-v1 planner (tfs-011): a planner's refusals, never a second door's
+    GGUF_MAGIC_ABSENT,
+    GGUF_VERSION_UNSUPPORTED,
+    GGUF_METADATA_TRUNCATED,
+    GGUF_TYPE_UNKNOWN,
+    GGUF_GEOMETRY,
+    GGUF_ARCH_UNDECLARED,
+    GGUF_ARCH_MIXED,
+    GGUF_SHAPE_UNRECOVERABLE,
+    GGUF_CARRIER_TRUNCATED,
+    GGUF_ENCODING_NOT_REVIEWED,
     // ingest border: classification and authorization
     UNREGISTERED_FINGERPRINT,
     AMBIGUOUS_CLASSIFICATION,

@@ -15,8 +15,15 @@
 pub mod carrier;
 pub mod convert;
 pub mod fingerprint;
+pub mod gguf;
 pub mod stamp;
 pub mod transaction;
+
+// The gguf-v1 PLANNER (tfs-011) is inside this fence because it parses a foreign
+// container, and NOT because it is a door: `carrier::sniff` still refuses GGUF on the
+// normal path. Re-exported so a caller outside the border can name the entry point
+// without naming the container.
+pub use gguf::{check_twin as gguf_check_twin, plan as gguf_plan, GgufPlan, ShapeSource};
 
 use crate::canon::{as_arr, as_str, Fields, Value};
 use crate::err::{refuse, Code, Result};
