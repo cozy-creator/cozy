@@ -276,7 +276,10 @@ func sectionPipeline() {
 		return
 	}
 	pixels := resultField(doc, "digest")
-	saved := filepath.Join(outDir, "image")
+	// `image.png`, not `image`. cl-010's debt 3: the runtime carries the AUTHOR's declared
+	// media type through the output transaction, so the last mile writes a name a client
+	// can open without sniffing (cozy-runtime bac8e5e). This expectation predated it.
+	saved := filepath.Join(outDir, "image.png")
 	info, err := os.Stat(saved)
 	check("a real 1024px PNG landed under its declared field path",
 		err == nil && info != nil && info.Size() > 1_000_000 && isPNG(saved),
@@ -299,15 +302,16 @@ func sectionPipeline() {
 		pixels[:16]+"… twice, cold, on a worker built from scratch each time")
 	fmt.Printf("  bench second COLD wall: %d ms\n", cold2MS)
 
-	head("the banked fence — and the boot warm pass is an input to it")
-	// The product's digest is stable with itself and DIFFERENT from cr-008b's banked one.
-	// The cause is the BOOT WARM PASS, which the harness disables and a serving worker
-	// runs: it leaves a different device-memory history, and cuDNN's algorithm selection
-	// reads that history. Same picture, different bits — so the claim is proven from both
-	// ends: with the warm pass off the product reproduces the banked artifact BYTE FOR
-	// BYTE, and with it on the two images differ by at most 1/255.
-	check("with the warm pass ON, the product does NOT reproduce the banked digest",
-		pixels != bankedPixels, pixels[:16]+"… vs banked "+bankedPixels[:16]+"…")
+	head("the banked fence — the product reproduces it with the warm pass either way")
+	// cl-003 measured the product's digest as DIFFERENT from cr-008b's banked one with the
+	// boot warm pass on, and named the cause: the warm pass leaves a different
+	// device-memory history and cuDNN's algorithm selection reads it. That difference is
+	// GONE as of cozy-runtime f1625f9 — the decode leg now fences its scratch on the
+	// stream before freeing it (9b13141), which is a real change to that history. The
+	// observation was never an invariant; the invariant is the banked artifact, and the
+	// product now reaches it from both ends rather than only with the warm pass off.
+	check("with the warm pass ON, the product reproduces cr-008b's BANKED pixel digest",
+		pixels == bankedPixels, pixels[:16]+"… vs banked "+bankedPixels[:16]+"…")
 	// The drain is not decoration: `start` on a resident worker is an idempotent 200, so
 	// asking for `--no-warm` while the warm worker is up changes nothing at all. Found by
 	// running it — the "no-warm" run was the second 1024px request on the warm worker.
@@ -322,7 +326,7 @@ func sectionPipeline() {
 	check("the no-warm run exits 0", code == 0, firstLine(raw))
 	check("and reproduces cr-008b's BANKED pixel digest exactly",
 		resultField(doc, "digest") == bankedPixels, resultField(doc, "digest"))
-	nowarmInfo, _ := os.Stat(filepath.Join(nowarmOut, "image"))
+	nowarmInfo, _ := os.Stat(filepath.Join(nowarmOut, "image.png"))
 	check("and the banked PNG's byte length with it",
 		nowarmInfo != nil && nowarmInfo.Size() == bankedPNG, sizeOf(nowarmInfo))
 	comparePixels(root, saved, flag("banked-image", bankedImage))
