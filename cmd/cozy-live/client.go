@@ -70,7 +70,7 @@ func startService(root string, port int, fresh bool) *liveService {
 	must("config", errOf(e))
 	cmd.Env = cfg.Child("COZY_HOME=" + root)
 	cmd.Stdout, cmd.Stderr = logFile, logFile
-	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	setProcessGroup(cmd)
 	must("starting cozy up", cmd.Start())
 
 	s := &liveService{
@@ -108,7 +108,7 @@ func (s *liveService) alive() bool {
 // kill9 is the COORDINATOR-KILL arm's own instrument: SIGKILL to the whole process
 // group, so nothing runs a shutdown path. What survives is what was durable.
 func (s *liveService) kill9() {
-	_ = syscall.Kill(-s.cmd.Process.Pid, syscall.SIGKILL)
+	_ = killGroup(s.cmd.Process.Pid, syscall.SIGKILL)
 	deadline := time.Now().Add(10 * time.Second)
 	for time.Now().Before(deadline) && s.alive() {
 		time.Sleep(50 * time.Millisecond)
@@ -120,12 +120,12 @@ func (s *liveService) stop() {
 	if s.cmd == nil || s.cmd.Process == nil {
 		return
 	}
-	_ = syscall.Kill(-s.cmd.Process.Pid, syscall.SIGTERM)
+	_ = killGroup(s.cmd.Process.Pid, syscall.SIGTERM)
 	deadline := time.Now().Add(45 * time.Second)
 	for time.Now().Before(deadline) && s.alive() {
 		time.Sleep(100 * time.Millisecond)
 	}
-	_ = syscall.Kill(-s.cmd.Process.Pid, syscall.SIGKILL)
+	_ = killGroup(s.cmd.Process.Pid, syscall.SIGKILL)
 	go func() { _ = s.cmd.Wait() }()
 }
 

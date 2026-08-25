@@ -54,7 +54,7 @@ func sectionRecovered() {
 
 	pid := lv.c.Worker(instance).PID
 	time.Sleep(600 * time.Millisecond) // let the attempt get properly under way
-	must("killing the supervisor", syscall.Kill(pid, syscall.SIGKILL))
+	must("killing the supervisor", killProcess(pid, syscall.SIGKILL))
 	check("kill -9 the supervisor mid-attempt", true, fmt.Sprintf("pid %d", pid))
 
 	waitFor(func() bool {
@@ -199,7 +199,7 @@ func scenarioB(lv *live, instance, planID string) {
 	killed := false
 	for time.Now().Before(deadline) {
 		if st, err := os.Stat(path); err == nil && st.Size() > 0 {
-			_ = syscall.Kill(pid, syscall.SIGKILL)
+			_ = killProcess(pid, syscall.SIGKILL)
 			killed = true
 			break
 		}

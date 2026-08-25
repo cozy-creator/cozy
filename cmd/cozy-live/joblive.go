@@ -452,7 +452,7 @@ func killMidJob(svc *liveService, root, ref, payloadPath string) string {
 		// The worker's own process group, found through the coordinator's listing rather
 		// than through a pid this driver remembered.
 		if pid := jobWorkerPID(svc); pid > 0 {
-			_ = syscall.Kill(-pid, syscall.SIGKILL)
+			_ = killGroup(pid, syscall.SIGKILL)
 			log.WriteString(fmt.Sprintf("kill -9 the job worker's process group (pid %d) mid-derivation\n", pid))
 			killed = true
 		}

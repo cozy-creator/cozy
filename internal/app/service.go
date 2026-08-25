@@ -196,7 +196,7 @@ func detach(ctx *Context, port int, yield string) *exit.Error {
 	cmd := exec.Command(self, args...)
 	cmd.Env = ctx.Cfg.Child("COZY_HOME=" + ctx.Cfg.Home)
 	cmd.Stdout, cmd.Stderr = logFile, logFile
-	cmd.SysProcAttr = &syscall.SysProcAttr{Setsid: true}
+	detachProcess(cmd)
 	if err := cmd.Start(); err != nil {
 		return exit.Internalf("cannot start the detached LocalService: %s", err)
 	}
@@ -235,7 +235,7 @@ func handleDown(ctx *Context) *exit.Error {
 	if st.PID <= 0 {
 		return exit.Internalf("the service lock is held but names no pid")
 	}
-	if err := syscall.Kill(st.PID, syscall.SIGTERM); err != nil {
+	if err := signalProcess(st.PID, syscall.SIGTERM); err != nil {
 		return exit.Internalf("cannot signal the LocalService (pid %d): %s", st.PID, err)
 	}
 	// The proof of exit is the LOCK becoming free, not the pid disappearing and not a
@@ -249,7 +249,7 @@ func handleDown(ctx *Context) *exit.Error {
 		}
 		time.Sleep(50 * time.Millisecond)
 	}
-	_ = syscall.Kill(st.PID, syscall.SIGKILL)
+	_ = signalProcess(st.PID, syscall.SIGKILL)
 	hard := time.Now().Add(5 * time.Second)
 	for time.Now().Before(hard) && service.Probe(ctx.Cfg).Up {
 		time.Sleep(50 * time.Millisecond)

@@ -261,7 +261,7 @@ func (c *Coordinator) StartWorker(spec EndpointSpec) (string, *exit.Error) {
 		"CUDA_VISIBLE_DEVICES=" + strings.Join(spec.Devices, ","),
 	}, spec.Imposed...)...)
 	cmd.Stdout, cmd.Stderr = logFile, logFile
-	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	setProcessGroup(cmd)
 
 	w := &worker{
 		instanceID: instanceID, spec: spec, cmd: cmd, logPath: logPath,
@@ -281,6 +281,10 @@ func (c *Coordinator) StartWorker(spec EndpointSpec) (string, *exit.Error) {
 		logFile.Close()
 		return "", exit.Internalf("cannot start the endpoint worker: %s", err)
 	}
+	// The group is established at fork on Unix and must be ATTACHED after start on Windows,
+	// where the analogue is a job object. Here, before the child has spawned anything of
+	// its own, is the one moment both platforms can agree on.
+	adoptProcessGroup(cmd)
 	c.mu.Lock()
 	w.pid = cmd.Process.Pid
 	c.mu.Unlock()
@@ -483,7 +487,7 @@ func (c *Coordinator) StopWorker(instanceID string, grace time.Duration) {
 		return
 	}
 	if w.cmd.Process != nil && !w.exited {
-		_ = syscall.Kill(-w.cmd.Process.Pid, syscall.SIGTERM)
+		_ = killGroup(w.cmd.Process.Pid, syscall.SIGTERM)
 		deadline := time.Now().Add(grace)
 		for time.Now().Before(deadline) {
 			if !alive(w.cmd.Process.Pid) {
@@ -492,7 +496,7 @@ func (c *Coordinator) StopWorker(instanceID string, grace time.Duration) {
 			time.Sleep(20 * time.Millisecond)
 		}
 		if alive(w.cmd.Process.Pid) {
-			_ = syscall.Kill(-w.cmd.Process.Pid, syscall.SIGKILL)
+			_ = killGroup(w.cmd.Process.Pid, syscall.SIGKILL)
 		}
 	}
 	_ = c.opt.Store.CloseWorker(instanceID)
@@ -518,7 +522,7 @@ func (c *Coordinator) Reconcile() (killed, forgotten int, e *exit.Error) {
 	}
 	for _, row := range rows {
 		if row.PID > 0 && birthOf(row.PID) == row.Birth && row.Birth != "" {
-			_ = syscall.Kill(-row.PID, syscall.SIGKILL)
+			_ = killGroup(row.PID, syscall.SIGKILL)
 			killed++
 			c.logf("orphan worker %s (pid %d, birth %s) killed on reconcile",
 				row.InstanceID, row.PID, row.Birth)
@@ -567,8 +571,6 @@ func (c *Coordinator) Reconcile() (killed, forgotten int, e *exit.Error) {
 	}
 	return killed, forgotten, nil
 }
-
-func alive(pid int) bool { return syscall.Kill(pid, 0) == nil }
 
 // birthOf is the OS process-birth identity: /proc/<pid>/stat field 22, the kernel's own
 // start time in clock ticks. A reused pid has a different birth, which is why a pid
