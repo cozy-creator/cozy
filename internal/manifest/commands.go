@@ -14,7 +14,7 @@ var FoundationTokens = []string{
 	"output.fields",          // --fields
 	"output.full",            // --full
 	"output.json",            // --json
-	"records.libsql",         // ONE local Turso/libSQL lifecycle database
+	"records.sqlite",         // ONE local SQLite lifecycle database, pure-Go driver
 	"service.lock",           // liveness is an OS advisory lock the owner holds
 	"worker.protocol.v1",     // the cozy.worker.v1 server over a unix socket
 	"coordinator.local",      // local dispatch: request -> attempt -> terminal -> visible output

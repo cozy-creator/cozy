@@ -30,10 +30,15 @@ through one staged transaction:
     stage → verify source → build venv → descriptor → activate
 
 `internal/records` is the ONE local lifecycle authority: `install_generations` and
-`pins` rows in one local Turso/libSQL database (`$COZY_HOME/records.db`, default
-`~/.cozy`). No `state.json`, no second store. cl-001's LocalService adopts this package
-and adds its own tables to the same database. Driver: `github.com/tursodatabase/go-libsql`
-(embedded libSQL, **CGO_ENABLED=1**) — never vanilla SQLite.
+`pins` rows in one local SQLite database (`$COZY_HOME/records.db`, default `~/.cozy`).
+No `state.json`, no second store. cl-001's LocalService adopts this package and adds its
+own tables to the same database. Driver: `modernc.org/sqlite` — SQLite transpiled to Go,
+so the binary is **CGO_ENABLED=0** and cross-compiles everywhere. The store uses no
+engine-specific feature, so the driver is a distribution decision and pure Go settles it;
+the file is plain `SQLite format 3`, so a `records.db` an earlier libSQL-linked build
+wrote opens here untouched. Pragmas ride the DSN (`busy_timeout`, `foreign_keys`,
+`journal_mode=WAL`) because a pragma is a property of a connection and `database/sql`
+may redial one at any moment.
 
 `internal/install` owns the pipeline. **stage** extracts a `.tar.gz` release under
 compressed/expanded/file-count/path-length bounds and refuses traversal, absolute paths,
@@ -346,14 +351,21 @@ installed-binary state and release state are four distinct evidence axes, so a g
   and compared; a platform that does not reproduce is reported as UNBUILT rather than
   shipped. The tarball is deterministic (sorted, epoch mtimes, `gzip -n`) — otherwise the
   checksum would be a fact about the clock.
-- **UNBUILT is part of the output.** `RELEASE.json` names every platform that was not built
-  and why, because an absent artifact and an artifact nobody attempted look identical in a
-  directory listing. `internal/records` is the ONE lifecycle authority and its driver is
-  embedded libSQL, so **every platform wall is a C wall**: `go-libsql` ships static archives
-  for `linux_amd64`, `linux_arm64` and `darwin_arm64` and **none for Windows**, and the two
-  it does ship need a cross C toolchain to build from here. A Windows binary is therefore
-  not a cross-compile away — the driver has no port, and `internal/service` holds the
-  liveness law with `syscall.Flock`, which Windows does not have.
+- **UNBUILT is part of the output, and it is now empty.** `RELEASE.json` names every
+  platform that was not built and why, because an absent artifact and an artifact nobody
+  attempted look identical in a directory listing. There is no longer a wall to name:
+  `cozy` is pure Go, so `linux/amd64`, `linux/arm64`, `darwin/arm64`, `darwin/amd64` and
+  `windows/amd64` are five cross-compiles from one host. The per-OS facts that used to be
+  C are Go build tags now — `internal/flock` (flock vs `LockFileEx`), `internal/install`
+  (statfs vs `GetDiskFreeSpaceEx`, `st_dev`/`st_nlink` vs the volume serial), and
+  `internal/coord`'s peer credential (`SO_PEERCRED`, Darwin's `LOCAL_PEERCRED`, and no
+  answer at all elsewhere, which `peerPID` already reads as 0).
+- **A build is not a run, and `RELEASE.json` says which it was.** Each artifact row carries
+  `binary_sha256`, `binary_bytes`, the `format` line `file` printed, and `executed` — and
+  on a Linux builder only the `linux/amd64` row can say it ran. The macOS and Windows
+  binaries are static evidence until a runner of that platform drives `scripts/accept.sh`
+  against them. `scripts/install.sh` is a POSIX installer and the Windows tarball carries
+  `cozy.exe`, so Windows also still owes an installer of its own.
 - **`scripts/install.sh` verifies the checksum BEFORE anything is replaced**, then stages
   inside the target directory so the final move is a rename on one filesystem. A corrupted
   asset is exit 13 with both digests named and the working installation untouched — the
@@ -401,7 +413,7 @@ No automated tests. Verification is running the real thing:
 - `scripts/clean-machine.sh` runs `scripts/accept.sh` inside a throwaway container with a
   fresh user, an empty home, no toolchain and no mount of this repository but `scripts/`:
   the corrupted-asset red arm, the checksum-verified install, the tag and commit the
-  binary carries, the service-down refusals, `cozy up` building its libSQL records on a
+  binary carries, the service-down refusals, `cozy up` building its records database on a
   machine that never had one, the weightless endpoint install and its whole serve —
   a READY worker with no weights to fill, a typed `completed` terminal, a published PNG,
   zero reserved VRAM and an empty construction digest, plus the typed failure terminal —

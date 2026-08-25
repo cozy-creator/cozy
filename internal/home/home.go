@@ -13,7 +13,7 @@ import (
 // Layout is the resolved set of paths every cl-009 verb works against.
 type Layout struct {
 	Root        string
-	DB          string // the one local libSQL lifecycle database
+	DB          string // the one local SQLite lifecycle database
 	Generations string // one immutable directory per install generation
 	Lock        string // the single-writer flock file
 	Service     string // the LocalService's liveness lock (cl-001; held, never read)

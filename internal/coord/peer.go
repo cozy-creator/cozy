@@ -4,7 +4,6 @@ import (
 	"context"
 	"errors"
 	"net"
-	"syscall"
 
 	"google.golang.org/grpc/credentials"
 	"google.golang.org/grpc/peer"
@@ -42,14 +41,14 @@ func (unixPeer) ServerHandshake(raw net.Conn) (net.Conn, credentials.AuthInfo, e
 	if err != nil {
 		return raw, peerIdentity{}, nil
 	}
-	var cred *syscall.Ucred
-	var inner error
+	var id peerIdentity
+	var ok2 bool
 	if err := rc.Control(func(fd uintptr) {
-		cred, inner = syscall.GetsockoptUcred(int(fd), syscall.SOL_SOCKET, syscall.SO_PEERCRED)
-	}); err != nil || inner != nil || cred == nil {
+		id, ok2 = peerCred(fd)
+	}); err != nil || !ok2 {
 		return raw, peerIdentity{}, nil
 	}
-	return raw, peerIdentity{PID: cred.Pid, UID: cred.Uid}, nil
+	return raw, id, nil
 }
 
 func (unixPeer) ClientHandshake(context.Context, string, net.Conn) (net.Conn, credentials.AuthInfo, error) {

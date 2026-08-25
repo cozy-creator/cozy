@@ -41,7 +41,7 @@ const (
 	// COMMENT frame, so it can never be mistaken for an event.
 	heartbeat = 15 * time.Second
 	// pollInterval is how often the durable table is re-read. The authority is a local
-	// libSQL file and a query for "rows after N" on an indexed key costs microseconds;
+	// SQLite file and a query for "rows after N" on an indexed key costs microseconds;
 	// a notification plane would be a second mechanism for the same fact.
 	pollInterval = 40 * time.Millisecond
 )

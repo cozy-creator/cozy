@@ -3,9 +3,9 @@ package install
 import (
 	"os"
 	"path/filepath"
-	"syscall"
 
 	"github.com/cozy-creator/cozy-creator-v2/internal/exit"
+	"github.com/cozy-creator/cozy-creator-v2/internal/flock"
 	"github.com/cozy-creator/cozy-creator-v2/internal/home"
 	"github.com/cozy-creator/cozy-creator-v2/internal/records"
 )
@@ -19,7 +19,7 @@ func Lock(l home.Layout) (*Writer, *exit.Error) {
 	if err != nil {
 		return nil, exit.Internalf("cannot open the writer lock %s: %s", l.Lock, err)
 	}
-	if err := syscall.Flock(int(f.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
+	if err := flock.Exclusive(f); err != nil {
 		f.Close()
 		return nil, exit.New(exit.Conflict, "another cozy writer holds %s", l.Lock).
 			WithRemedy("one writer per local records database; wait for it to finish").
@@ -29,7 +29,7 @@ func Lock(l home.Layout) (*Writer, *exit.Error) {
 }
 
 func (w *Writer) Unlock() {
-	_ = syscall.Flock(int(w.f.Fd()), syscall.LOCK_UN)
+	_ = flock.Release(w.f)
 	_ = w.f.Close()
 }
 

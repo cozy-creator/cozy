@@ -12,7 +12,7 @@ Thirteen families:
             advertise --yes. Nothing removes bytes on a bare invocation.
   env       (cl-001) the environment is read in internal/config/config.go and NOWHERE else:
             one entrypoint reader, a frozen typed value thereafter.
-  store     (cl-001) no second lifecycle store: the ONE local libSQL database is the
+  store     (cl-001) no second lifecycle store: the ONE local SQLite database is the
             authority, so a state.json/pidfile-class sidecar name is a violation wherever
             it appears — those sidecars outlive their launcher and lie.
   secret    (cl-011) a credential never rides argv and has ONE raw reader: a manifest flag
@@ -68,7 +68,7 @@ ENV_READER = "internal/config/config.go"
 DENY_ENV_CALLS = ["os.Getenv", "os.LookupEnv", "os.Environ", "syscall.Getenv", "syscall.Environ"]
 
 # Lifecycle-sidecar names, matched on RAW lines (a comment naming one is still a plan to
-# write one). The libSQL database is the sole lifecycle authority.
+# write one). The SQLite database is the sole lifecycle authority.
 DENY_STORE = ["state.json", "status.json", "workers.json", "sessions.json", "pidfile", ".pidfile"]
 
 # Cloud emulation and fabricated credentials, as bare identifiers.
@@ -191,7 +191,7 @@ def check_sources():
                     bad.append(f"{p}:{i}: [deps] forbidden dependency '{d}': {s}")
             for d in DENY_STORE:
                 if d in s.lower():
-                    bad.append(f"{p}:{i}: [store] lifecycle sidecar '{d}' — the one libSQL "
+                    bad.append(f"{p}:{i}: [store] lifecycle sidecar '{d}' — the one SQLite "
                                f"database is the authority: {s}")
             # RAW, not stripped: a content key IS a string literal, so the identifier
             # scan (which blanks literals) would never see one.

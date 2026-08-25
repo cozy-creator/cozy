@@ -1,16 +1,18 @@
 // Package records is the ONE local lifecycle authority: install generations and the
-// active pin per (endpoint, major), as rows in ONE local Turso/libSQL database
-// (cozy-creator.md "Records" — Turso, never vanilla SQLite). There is no state.json
-// and no second lifecycle store; any JSON output is a derived read.
+// active pin per (endpoint, major), as rows in ONE local SQLite database
+// (cozy-creator.md "Records"). There is no state.json and no second lifecycle store;
+// any JSON output is a derived read.
 //
 // Seam for cl-001: the LocalService adopts THIS package as its lifecycle store and
 // adds its own tables (worker sessions, requests, attempts, outputs) to the same
 // database. Nothing here assumes a CLI caller; Open takes a path.
 //
-// Driver (settles cozy-creator.md's OPEN ENGINEERING QUESTION for the local-file
-// case): github.com/tursodatabase/go-libsql, the embedded libSQL driver. It is
-// CGO-based, so `cozy` builds with CGO_ENABLED=1; qualifying that per platform for
-// the static-binary requirement is cl-013's distribution work.
+// Driver: modernc.org/sqlite — SQLite itself, transpiled to Go. The store uses no
+// engine-specific feature (this is one open of one local file), so the driver is a
+// DISTRIBUTION decision, and pure Go is the whole answer: `cozy` builds and
+// cross-compiles with CGO_ENABLED=0 for every platform Go targets. The file format is
+// unchanged — plain `SQLite format 3`, which is what the previous embedded-libSQL
+// driver wrote too, so a records.db an older binary created opens here as it is.
 package records
 
 import (
@@ -20,7 +22,7 @@ import (
 	"time"
 
 	"github.com/cozy-creator/cozy-creator-v2/internal/exit"
-	_ "github.com/tursodatabase/go-libsql"
+	_ "modernc.org/sqlite"
 )
 
 // Generation is one immutable install: a built environment plus the evidence that
@@ -60,8 +62,8 @@ type Pin struct {
 
 type Store struct{ db *sql.DB }
 
-// schema is applied one statement at a time: the driver executes a single
-// statement per call.
+// schema is applied one statement at a time, so a refusal names the one table that
+// refused rather than the whole script.
 var schema = append([]string{`
 CREATE TABLE IF NOT EXISTS install_generations (
   id            TEXT PRIMARY KEY,
@@ -94,25 +96,31 @@ CREATE TABLE IF NOT EXISTS pins (
   PRIMARY KEY (endpoint, major)
 )`}, append(coordSchema, eventSchema...)...)
 
+// pragmas ride the DSN rather than being executed after the open, because a pragma is a
+// property of a CONNECTION and database/sql may discard and redial one at any moment: a
+// re-dialled connection with foreign_keys OFF would silently accept the delete Forget
+// exists to refuse. The driver replays them on every connection it opens.
+//
+//	busy_timeout  a reader in another process (a bare `cozy` reading counts while the
+//	              service writes) waits instead of failing
+//	foreign_keys  the pin -> generation reference is enforced, not decorative
+//	journal_mode  WAL, so those cross-process readers do not block on the writer at all;
+//	              it is persistent, so an older root converts on its first open here
+const pragmas = "?_pragma=busy_timeout(5000)&_pragma=foreign_keys(1)&_pragma=journal_mode(WAL)"
+
 func Open(path string) (*Store, *exit.Error) {
-	db, err := sql.Open("libsql", "file:"+path)
+	// No `file:` prefix: the driver hands an unprefixed name to SQLite verbatim, so a
+	// local root containing `%` or `#` stays a path instead of becoming a URI to decode.
+	db, err := sql.Open("sqlite", path+pragmas)
 	if err != nil {
 		return nil, exit.Internalf("cannot open the local records database %s: %s", path, err)
 	}
 	// ONE writer: the lifecycle authority is a single-writer store, so serializing every
-	// statement on one connection is the honest shape rather than a tuning choice. The
-	// busy timeout covers the other direction — a reader in another process (a `cozy
-	// status` while the service runs) waits instead of failing.
+	// statement on one connection is the honest shape rather than a tuning choice.
 	db.SetMaxOpenConns(1)
-	if _, err := db.Exec("PRAGMA foreign_keys=ON"); err != nil {
+	if err := db.Ping(); err != nil {
 		db.Close()
-		return nil, exit.Internalf("cannot enable foreign keys on %s: %s", path, err)
-	}
-	// busy_timeout answers with a row, so it is a Query rather than an Exec.
-	var busy int
-	if err := db.QueryRow("PRAGMA busy_timeout=5000").Scan(&busy); err != nil {
-		db.Close()
-		return nil, exit.Internalf("cannot set the busy timeout on %s: %s", path, err)
+		return nil, exit.Internalf("cannot open the local records database %s: %s", path, err)
 	}
 	for _, stmt := range schema {
 		if _, err := db.Exec(stmt); err != nil {

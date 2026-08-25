@@ -14,7 +14,6 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
-	"syscall"
 	"time"
 
 	"github.com/cozy-creator/cozy-creator-v2/internal/config"
@@ -77,9 +76,12 @@ func Run(l home.Layout, st *records.Store, req Request) (*Result, *exit.Error) {
 		res.Timings = append(res.Timings, Timing{stage, time.Since(clock)})
 		clock = time.Now()
 		if req.CrashAfter == stage {
-			// A real SIGKILL, not an orderly exit: the crash matrix is only
-			// evidence if the process actually dies where a crash would.
-			_ = syscall.Kill(os.Getpid(), syscall.SIGKILL)
+			// A real KILL, not an orderly exit: the crash matrix is only evidence
+			// if the process actually dies where a crash would. os.Process.Kill is
+			// SIGKILL on unix and TerminateProcess on Windows — unblockable on both.
+			if self, err := os.FindProcess(os.Getpid()); err == nil {
+				_ = self.Kill()
+			}
 		}
 		return nil
 	}
@@ -338,11 +340,10 @@ func resolveTarget(gen *records.Generation, ref Ref) *exit.Error {
 // checkCapacity refuses BELOW the physical floor with a quantified shortfall
 // rather than filling the disk halfway through a venv build.
 func checkCapacity(dir string, staged int64) *exit.Error {
-	var fs syscall.Statfs_t
-	if err := syscall.Statfs(dir, &fs); err != nil {
+	free, ok := freeBytes(dir)
+	if !ok {
 		return nil
 	}
-	free := int64(fs.Bavail) * int64(fs.Bsize)
 	need := staged*2 + (256 << 20)
 	if free >= need {
 		return nil

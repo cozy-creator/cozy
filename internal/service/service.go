@@ -17,11 +17,11 @@ import (
 	"os"
 	"strconv"
 	"strings"
-	"syscall"
 	"time"
 
 	"github.com/cozy-creator/cozy-creator-v2/internal/config"
 	"github.com/cozy-creator/cozy-creator-v2/internal/exit"
+	"github.com/cozy-creator/cozy-creator-v2/internal/flock"
 	"github.com/cozy-creator/cozy-creator-v2/internal/home"
 )
 
@@ -52,10 +52,10 @@ func Probe(cfg config.Config) State {
 		return st
 	}
 	defer f.Close()
-	if err := syscall.Flock(int(f.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err == nil {
+	if err := flock.Exclusive(f); err == nil {
 		// Taking it IS the proof of absence. Release immediately: probing must never
 		// look like holding.
-		_ = syscall.Flock(int(f.Fd()), syscall.LOCK_UN)
+		_ = flock.Release(f)
 		st.Details = "the service lock is free — no LocalService owns this root"
 		return st
 	}
@@ -92,7 +92,7 @@ func Hold(l home.Layout, addr, socket string) (*Held, *exit.Error) {
 	if err != nil {
 		return nil, exit.Internalf("cannot open the service lock %s: %s", l.Service, err)
 	}
-	if err := syscall.Flock(int(f.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
+	if err := flock.Exclusive(f); err != nil {
 		f.Close()
 		return nil, exit.New(exit.Conflict,
 			"another cozy LocalService already owns %s", l.Root).
@@ -118,7 +118,7 @@ func (h *Held) Release() {
 	if h == nil || h.f == nil {
 		return
 	}
-	_ = syscall.Flock(int(h.f.Fd()), syscall.LOCK_UN)
+	_ = flock.Release(h.f)
 	_ = h.f.Close()
 	h.f = nil
 }

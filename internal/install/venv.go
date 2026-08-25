@@ -15,7 +15,6 @@ import (
 	"runtime"
 	"strconv"
 	"strings"
-	"syscall"
 
 	"github.com/cozy-creator/cozy-creator-v2/internal/config"
 	"github.com/cozy-creator/cozy-creator-v2/internal/exit"
@@ -100,8 +99,7 @@ func Disk(dir string) (exclusive, shared int64) {
 		if err != nil {
 			return nil
 		}
-		st, ok := info.Sys().(*syscall.Stat_t)
-		if ok && st.Nlink > 1 {
+		if hardlinked(info) {
 			shared += info.Size()
 			return nil
 		}
@@ -291,18 +289,6 @@ func firstExistingParent(p string) string {
 		}
 		p = parent
 	}
-}
-
-func deviceOf(p string) (uint64, bool) {
-	info, err := os.Stat(p)
-	if err != nil {
-		return 0, false
-	}
-	st, ok := info.Sys().(*syscall.Stat_t)
-	if !ok {
-		return 0, false
-	}
-	return uint64(st.Dev), true
 }
 
 func pythonVersion(venvDir string) string {

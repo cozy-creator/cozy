@@ -14,11 +14,18 @@
 # Output (`dist/<tag>/`):
 #   cozy-<tag>-<os>-<arch>.tar.gz   the product artifact
 #   SHA256SUMS                       what scripts/install.sh verifies BEFORE replacement
-#   RELEASE.json                     tag, commit, toolchain, and the UNBUILT table
+#   RELEASE.json                     tag, commit, toolchain, the artifact table with a
+#                                    sha256 per platform, and the UNBUILT table
 #
 # UNBUILT is a first-class part of the output. A platform this repository cannot build is
 # named with the reason rather than omitted, because an absent artifact and an artifact
-# nobody tried to build look identical in a directory listing.
+# nobody tried to build look identical in a directory listing. It is now expected to be
+# EMPTY: `cozy` is pure Go (CGO_ENABLED=0), so every target below is a cross-compile from
+# one host and there is no C wall left to hit.
+#
+# What a build is NOT: proof the binary RUNS. This host executes linux/amd64 and nothing
+# else, so the macOS and Windows rows are static evidence — bytes, size, checksum — until
+# a runner of that platform runs `scripts/accept.sh` against them.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -54,10 +61,11 @@ mkdir -p "$D"
 STAMP="github.com/cozy-creator/cozy-creator-v2/internal/app"
 LDFLAGS="-s -w -X $STAMP.tag=$TAG -X $STAMP.commit=$COMMIT"
 
-# One row per target: GOOS GOARCH CGO CC. CGO is not optional — `internal/records` is the
-# ONE local lifecycle authority and its driver is embedded libSQL (cl-009), which is a C
-# library. Every wall below is therefore a C wall, not a Go one.
-TARGETS="linux/amd64 linux/arm64 darwin/arm64 windows/amd64"
+# One row per target. CGO is OFF for all of them: `internal/records` drives its SQLite
+# through modernc.org/sqlite (SQLite transpiled to Go) and `internal/service` holds the
+# liveness lock through a per-OS pair, so there is no C in this binary and every target is
+# a plain cross-compile from this one host.
+TARGETS="linux/amd64 linux/arm64 darwin/arm64 darwin/amd64 windows/amd64"
 BUILT=""
 UNBUILT=""
 
@@ -65,29 +73,18 @@ note_unbuilt() { UNBUILT="$UNBUILT{\"platform\":\"$1\",\"reason\":\"$2\"},"; ech
 
 for target in $TARGETS; do
   goos="${target%%/*}"; goarch="${target##*/}"
-  # The prebuilt static libSQL archives go-libsql ships. No archive, no platform: this is a
-  # DEPENDENCY wall, and it is checked before a compiler is invoked so the reason names the
-  # real cause instead of whatever cc says next.
-  lib="$(go list -m -f '{{.Dir}}' github.com/tursodatabase/go-libsql)/lib/${goos}_${goarch}/libsql_experimental.a"
-  if [ ! -f "$lib" ]; then
-    note_unbuilt "$target" "go-libsql ships no static libsql_experimental.a for ${goos}_${goarch}; the embedded libSQL driver (cl-009) has no port here"
-    continue
-  fi
-  if [ "$goos/$goarch" != "$(go env GOOS)/$(go env GOARCH)" ]; then
-    note_unbuilt "$target" "cross-compiling CGO needs a ${goos}/${goarch} C toolchain this builder does not have; build it on a ${goos}/${goarch} runner"
-    continue
-  fi
+  exe="cozy"; [ "$goos" != windows ] || exe="cozy.exe"
 
   ok=1
   for pass in a b; do
     mkdir -p "$D/.build-$pass"
-    nice -n 19 env GOOS="$goos" GOARCH="$goarch" CGO_ENABLED=1 \
-      go build -trimpath -ldflags "$LDFLAGS" -o "$D/.build-$pass/cozy" ./cmd/cozy || { ok=0; break; }
+    nice -n 19 env GOOS="$goos" GOARCH="$goarch" CGO_ENABLED=0 \
+      go build -trimpath -ldflags "$LDFLAGS" -o "$D/.build-$pass/$exe" ./cmd/cozy || { ok=0; break; }
   done
   [ "$ok" = 1 ] || { note_unbuilt "$target" "the build failed on this host"; continue; }
 
-  a="$(sha256sum "$D/.build-a/cozy" | cut -d' ' -f1)"
-  b="$(sha256sum "$D/.build-b/cozy" | cut -d' ' -f1)"
+  a="$(sha256sum "$D/.build-a/$exe" | cut -d' ' -f1)"
+  b="$(sha256sum "$D/.build-b/$exe" | cut -d' ' -f1)"
   if [ "$a" != "$b" ]; then
     note_unbuilt "$target" "two identical builds produced different bytes ($a vs $b) — not reproducible"
     continue
@@ -98,9 +95,18 @@ for target in $TARGETS; do
   # its own timestamp. Otherwise the tarball's digest changes on every run and the checksum
   # the installer verifies would be a fact about the clock.
   tar --sort=name --mtime=@0 --owner=0 --group=0 --numeric-owner \
-      -C "$D/.build-a" -cf - cozy | gzip -n -9 > "$D/$name"
-  echo "  built   $target -> $name (binary sha256:$a, reproduced)"
-  BUILT="$BUILT{\"platform\":\"$target\",\"artifact\":\"$name\",\"binary_sha256\":\"$a\"},"
+      -C "$D/.build-a" -cf - "$exe" | gzip -n -9 > "$D/$name"
+  # `file` on the binary, recorded per platform: this host runs linux/amd64 only, so for
+  # the other four the format line and the checksum ARE the verification.
+  kind="$(file -b "$D/.build-a/$exe" 2>/dev/null | cut -d, -f1-2 || echo unknown)"
+  size="$(stat -c%s "$D/.build-a/$exe")"
+  ran="no (this builder is $(go env GOOS)/$(go env GOARCH))"
+  if [ "$goos/$goarch" = "$(go env GOOS)/$(go env GOARCH)" ]; then
+    got="$("$D/.build-a/$exe" version --fields tag 2>/dev/null | sed -n 's/^tag: *//p' || true)"
+    ran="ran here, reports tag ${got:-<none>}"
+  fi
+  echo "  built   $target -> $name (binary sha256:$a, reproduced, $ran)"
+  BUILT="$BUILT{\"platform\":\"$target\",\"artifact\":\"$name\",\"binary_sha256\":\"$a\",\"binary_bytes\":$size,\"format\":\"$kind\",\"executed\":\"$ran\"},"
   rm -rf "$D/.build-a" "$D/.build-b"
 done
 

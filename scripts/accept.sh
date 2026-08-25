@@ -117,7 +117,7 @@ for _ in $(seq 1 60); do "$COZY" --json 2>/dev/null | grep -q '"service":"up"' &
 run --json
 check "bare cozy reports the service up with a pid" \
   "$(printf '%s' "$OUT" | grep -q '"service":"up"' && echo 1 || echo 0)" "$(first "$OUT")"
-check "the ONE local record database exists (embedded libSQL, CGO)" \
+check "the ONE local record database exists (SQLite, pure-Go driver)" \
   "$([ -f "$COZY_HOME/records.db" ] && echo 1 || echo 0)" \
   "$COZY_HOME/records.db ($(stat -c%s "$COZY_HOME/records.db" 2>/dev/null || echo 0) B)"
 check "the service lock is a real file this process holds" \
