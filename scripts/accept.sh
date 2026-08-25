@@ -38,7 +38,7 @@ COZY="$PREFIX/bin/cozy"
 export COZY_HOME="$HOME_DIR"
 PASS=0; FAIL=0
 
-head() { printf '\n=== %s\n' "$1"; }
+section() { printf '\n=== %s\n' "$1"; }
 check() { # check <label> <ok?> <detail>
   if [ "$2" = 1 ]; then PASS=$((PASS+1)); printf '  ok   %s' "$1"
   else FAIL=$((FAIL+1)); printf '  FAIL %s' "$1"; fi
@@ -46,14 +46,14 @@ check() { # check <label> <ok?> <detail>
   printf '\n'
 }
 run() { OUT="$("$COZY" "$@" 2>&1)"; CODE=$?; return 0; }
-first() { printf '%s' "$1" | head -1; }
+first() { printf '%s' "$1" | sed -n 1p; }
 
 echo "cl-013 release acceptance"
 echo "  machine: $(uname -srm) · $(id -un)@$(hostname) · $(date -u +%FT%TZ)"
 echo "  prefix:  $PREFIX"
 echo "  home:    $COZY_HOME"
 
-head "the machine is CLEAN: nothing of this product is installed or running"
+section "the machine is CLEAN: nothing of this product is installed or running"
 check "no cozy on PATH" "$([ -z "$(command -v cozy || true)" ] && echo 1 || echo 0)" "$(command -v cozy || echo 'not found')"
 check "no prior COZY_HOME" "$([ ! -e "$COZY_HOME" ] && echo 1 || echo 0)" "$COZY_HOME"
 # Reported, never an arm: a toolchain on the machine gives this product no state, and
@@ -61,7 +61,7 @@ check "no prior COZY_HOME" "$([ ! -e "$COZY_HOME" ] && echo 1 || echo 0)" "$COZY
 # would only stop the fixture from running where it is most useful — on a CI runner.
 echo "  note toolchain: go=$(command -v go || echo none) python3=$(command -v python3 || echo none) uv=$(command -v uv || echo none)"
 
-head "RED ARM: a corrupted asset refuses BEFORE anything is replaced"
+section "RED ARM: a corrupted asset refuses BEFORE anything is replaced"
 BAD="$(mktemp -d)/bad.tar.gz"
 cp "$DIST/$ASSET" "$BAD"
 printf '\x00' | dd of="$BAD" bs=1 seek=64 count=1 conv=notrunc status=none
@@ -71,12 +71,12 @@ check "a flipped byte refuses exit 13 naming both digests" \
   "$(first "$OUT") [exit $CODE]"
 check "and nothing was installed" "$([ ! -e "$COZY" ] && echo 1 || echo 0)" "$COZY"
 
-head "install from the release asset — the checksum is verified against SHA256SUMS"
+section "install from the release asset — the checksum is verified against SHA256SUMS"
 OUT="$("$INSTALL" --asset "$DIST/$ASSET" --prefix "$PREFIX" 2>&1)"; CODE=$?
 printf '%s\n' "$OUT" | sed 's/^/    /'
 check "install exits 0 and lands a binary" "$([ "$CODE" = 0 ] && [ -x "$COZY" ] && echo 1 || echo 0)" "exit $CODE"
 
-head "the release binary provably carries its commit"
+section "the release binary provably carries its commit"
 # RELEASE.json is read with sed, not python: this fixture's whole dependency list is bash,
 # coreutils and tar, so the clean machine it runs on needs nothing preinstalled.
 WANT_TAG="$(sed -n 's/^ *"tag": "\(.*\)",\?$/\1/p' "$DIST/RELEASE.json")"
@@ -90,17 +90,17 @@ check "and the protocol and contract versions it serves" \
   "$(printf '%s' "$OUT" | grep -q '"protocol"' && printf '%s' "$OUT" | grep -q '"contract"' && echo 1 || echo 0)" \
   "$(printf '%s' "$OUT" | tr ',' '\n' | grep -E '"(protocol|contract)"' | tr '\n' ' ')"
 
-head "the surface answers for itself before any service exists"
-run capabilities
+section "the surface answers for itself before any service exists"
+run capabilities --full
 check "cozy capabilities lists this binary's tokens" \
   "$([ "$CODE" = 0 ] && printf '%s' "$OUT" | grep -q 'cmd.version' && echo 1 || echo 0)" \
-  "$(printf '%s' "$OUT" | grep -c 'cmd\.') tokens"
+  "$(printf '%s' "$OUT" | grep -c '^cmd\.') cmd tokens of $(printf '%s' "$OUT" | grep -c '^[a-z]')"
 run commands
 check "cozy commands is the manifest inventory" "$([ "$CODE" = 0 ] && echo 1 || echo 0)" "$(first "$OUT")"
 run --help
 check "cozy --help exits 0 and dials nothing" "$([ "$CODE" = 0 ] && echo 1 || echo 0)" "$(first "$OUT")"
 
-head "the service is DOWN: server-backed verbs refuse typed, with the remedy"
+section "the service is DOWN: server-backed verbs refuse typed, with the remedy"
 for verb in doctor "start cozy/weightless"; do
   # shellcheck disable=SC2086
   run $verb
@@ -109,7 +109,7 @@ for verb in doctor "start cozy/weightless"; do
     "$(first "$OUT") [exit $CODE]"
 done
 
-head "cozy up — the LocalService on a machine that has never run one"
+section "cozy up — the LocalService on a machine that has never run one"
 "$COZY" up >/tmp/accept-up.log 2>&1 &
 UP=$!
 trap '"$COZY" down >/dev/null 2>&1 || true; kill '"$UP"' 2>/dev/null || true' EXIT
@@ -122,14 +122,14 @@ check "the ONE local record database exists (embedded libSQL, CGO)" \
   "$COZY_HOME/records.db ($(stat -c%s "$COZY_HOME/records.db" 2>/dev/null || echo 0) B)"
 check "the service lock is a real file this process holds" \
   "$([ -f "$COZY_HOME/service.lock" ] && echo 1 || echo 0)" "$COZY_HOME/service.lock"
-check "the CLI credential is 0600" \
-  "$([ "$(find "$COZY_HOME" -name 'client*' -maxdepth 2 -printf '%m\n' 2>/dev/null | head -1)" = 600 ] && echo 1 || echo 0)" \
-  "$(find "$COZY_HOME" -name 'client*' -maxdepth 2 -printf '%m %p\n' 2>/dev/null | head -1)"
+check "the CLI credential is 0600 — reading a widened one would be agreeing to a leak" \
+  "$([ "$(stat -c%a "$COZY_HOME/client.cred" 2>/dev/null)" = 600 ] && echo 1 || echo 0)" \
+  "$COZY_HOME/client.cred mode $(stat -c%a "$COZY_HOME/client.cred" 2>/dev/null || echo absent)"
 run doctor
 check "cozy doctor answers from the running service" "$([ "$CODE" = 0 ] && echo 1 || echo 0)" "$(first "$OUT")"
 
 if [ -n "$ENDPOINT" ] && [ -f "$ENDPOINT" ]; then
-  head "endpoint install — the weightless release, on this machine's own venv"
+  section "endpoint install — the weightless release, on this machine's own venv"
   DIGEST="sha256:$(sha256sum "$ENDPOINT" | cut -d' ' -f1)"
   START=$(date +%s%3N)
   run install cozy/weightless --from "$ENDPOINT" --digest "$DIGEST"
@@ -147,7 +147,7 @@ if [ -n "$ENDPOINT" ] && [ -f "$ENDPOINT" ]; then
   check "cozy describe renders the surface the install verified" \
     "$([ "$CODE" = 0 ] && printf '%s' "$OUT" | grep -q 'tile' && echo 1 || echo 0)" "$(first "$OUT")"
 
-  head "the WEIGHTLESS INVOKE — cl-010's named seam, still open"
+  section "the WEIGHTLESS INVOKE — cl-010's named seam, still open"
   run run cozy/weightless/v1/tile size=32 seed=7
   # An arm that asserts the CURRENT truth by name. `no_servable_function` is the local
   # coordinator saying it has no plan vocabulary for a modelless entrypoint: the worker's
@@ -159,7 +159,7 @@ if [ -n "$ENDPOINT" ] && [ -f "$ENDPOINT" ]; then
     "$(first "$OUT") [exit $CODE]"
 fi
 
-head "cozy down — liveness is an OS fact, so absence is provable"
+section "cozy down — liveness is an OS fact, so absence is provable"
 run down
 check "cozy down stops it and proves the lock is free" \
   "$([ "$CODE" = 0 ] && printf '%s' "$OUT" | grep -q 'provably gone' && echo 1 || echo 0)" "$(first "$OUT")"
@@ -167,7 +167,7 @@ run doctor
 check "and the server-backed verbs refuse 9 again" "$([ "$CODE" = 9 ] && echo 1 || echo 0)" "$(first "$OUT")"
 
 if [ -n "$UPGRADE" ] && [ -f "$UPGRADE" ]; then
-  head "UPGRADE — the same verify-then-rename, pointed at a different asset"
+  section "UPGRADE — the same verify-then-rename, pointed at a different asset"
   BEFORE="$("$COZY" version --fields tag | grep '^tag:')"
   OUT="$("$INSTALL" --asset "$UPGRADE" --prefix "$PREFIX" 2>&1)"; CODE=$?
   printf '%s\n' "$OUT" | sed 's/^/    /'
