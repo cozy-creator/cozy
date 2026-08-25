@@ -173,16 +173,25 @@ def fence_one_codec():
                             ".cs", ".swift", ".kt"):
             continue
         text = p.read_text(errors="ignore")
-        inside = r.startswith("crates/")
+        # The exemption below is for RUST files inside the Rust crate — the CLI is a
+        # consumer of the one implementation. A Go, Python or TS file sitting in the Rust
+        # source tree and naming a format is unambiguously a second implementation, whatever
+        # else it does or does not define.
+        inside = r.startswith("crates/") and p.suffix == ".rs"
         implements = "impl Doc for" in text
         for m, owners in CODEC_OWNERS.items():
             if m not in text or r in owners:
                 continue
             if inside and not implements:
                 continue    # a consumer naming or planting the mark, not a second codec
-            bad.append(f"{r}: names format '{m}' owned by {sorted(owners)} and "
-                       + ("defines its own Doc codec" if inside else "sits outside the owning crate")
-                       + " — a rival implementation of an identity-bearing codec")
+            if inside:
+                why = "defines its own Doc codec"
+            elif r.startswith("crates/"):
+                why = f"is a {p.suffix} file inside the Rust crate"
+            else:
+                why = "sits outside the owning crate"
+            bad.append(f"{r}: names format '{m}' owned by {sorted(owners)} and {why}"
+                       " — a rival implementation of an identity-bearing codec")
         # (b) grammar tags live in exactly one file
         if r not in GRAMMAR_HOME:
             for t in GRAMMAR_TAGS:
