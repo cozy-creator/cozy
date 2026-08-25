@@ -364,12 +364,15 @@ installed-binary state and release state are four distinct evidence axes, so a g
   nothing else — no Go toolchain, no repository, no build tree. `scripts/clean-machine.sh`
   is that file plus a throwaway container with an empty home to run it on.
 - **`fixtures/weightless/`** is an endpoint with no `Model` parameter, so `gpu` derives
-  False and its release depends on the BASE cozy-runtime wheel alone — a real install and a
-  real descriptor derivation in tens of megabytes and half a second, on any machine. It is
-  what a Windows runner would exercise. Serving it is **not yet possible**: the supervisor
-  boots by running `prepare` for every staged binding, and a modelless plan has nothing to
-  prepare, so `launch.Spec` refuses `no_servable_function` by name. That is cl-010's named
-  seam, and the fixture asserts the refusal so the arm goes red the day it closes.
+  False and its release depends on the BASE cozy-runtime wheel alone — no torch anywhere in
+  its venv. It **serves**: cozy-runtime `a3c3d72` reads a binding record carrying none of
+  the seven model keys as WEIGHTLESS and returns from `prepare` before the torch import, so
+  `launch.binding` mints that record for a modelless entrypoint instead of refusing
+  `no_servable_function`. cl-010's named seam is closed. The fixture drives the whole
+  product path — install, `start`, invoke, typed result, published PNG, and the failure
+  terminal on the same path — with nothing to load, which is the only claim a machine with
+  no card can make for itself. `no_servable_function` survives for its one remaining case:
+  a release whose descriptor registers no entrypoint at all.
 
 ## Verification
 
@@ -399,8 +402,10 @@ No automated tests. Verification is running the real thing:
   fresh user, an empty home, no toolchain and no mount of this repository but `scripts/`:
   the corrupted-asset red arm, the checksum-verified install, the tag and commit the
   binary carries, the service-down refusals, `cozy up` building its libSQL records on a
-  machine that never had one, the weightless endpoint install, the not-yet-servable
-  refusal, `cozy down`'s proof of absence, and the verified upgrade.
+  machine that never had one, the weightless endpoint install and its whole serve —
+  a READY worker with no weights to fill, a typed `completed` terminal, a published PNG,
+  zero reserved VRAM and an empty construction digest, plus the typed failure terminal —
+  `cozy down`'s proof of absence, and the verified upgrade.
 - `scripts/fence.py` enforces thirteen families: forbidden deps, byte-plane vocabulary
   (TensorFS owns storage/residency), interactive prompts, exit-matrix parity, a manifest
   lint, the env-read fence (one reader), no lifecycle sidecar, no cloud emulation or

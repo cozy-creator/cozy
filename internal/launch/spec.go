@@ -114,15 +114,16 @@ func (f *Facts) Spec(devices []string) (coord.EndpointSpec, *exit.Error) {
 		if e != nil {
 			return coord.EndpointSpec{}, e
 		}
-		if binding != nil {
-			spec.Bindings = append(spec.Bindings, binding)
-		}
+		spec.Bindings = append(spec.Bindings, binding)
 	}
 	if len(spec.Bindings) == 0 {
+		// Every entrypoint mints a record now — weightless included — so this is the one
+		// remaining case: a release whose descriptor registers no entrypoint at all. A job
+		// function is not one; it is served through `cozy job`, on a spec of its own.
 		return coord.EndpointSpec{}, exit.Named(exit.Structural, "no_servable_function",
-			"%s registers no function with a model binding, and a weightless function has no plan to dispatch by",
+			"%s registers no entrypoint, and a worker with no plan to advertise has nothing to serve",
 			f.Generation.Endpoint).
-			WithRemedy("its functions: %s — serve one with `cozy-runtime run` in its own venv",
+			WithRemedy("its functions: %s — an `@app.entrypoint` is what a request dispatches to",
 				strings.Join(f.Descriptor.Names(), ", "))
 	}
 	return spec, nil
@@ -147,14 +148,20 @@ func (f *Facts) binding(ep *Entrypoint, table map[string]Binding) (*coord.Bindin
 			WithRemedy("multi-slot local serving lands with th-004's EntrypointBindingPlan document")
 	}
 	if len(ep.Models) == 0 {
-		// A WEIGHTLESS entrypoint has no binding-plan record to stage, and a worker
-		// advertises exactly the plans it loaded — so this coordinator has no digest to
-		// dispatch it by. It is not served here, and it is not silently missing either:
-		// `cozy describe` lists it and says so. The runtime's own one-shot `run` serves
-		// it today (its attempt carries zero binding plans), and serving one THROUGH the
-		// protocol wants a modelless plan in the plan vocabulary — cl-010's named seam,
-		// not a record with empty paths in it.
-		return nil, nil
+		// A WEIGHTLESS entrypoint declares no model, so its record declares none either —
+		// and that IS the record, not an absence of one. cozy-runtime `a3c3d72` reads a
+		// record carrying none of the seven model keys as weightless, keys its executor by
+		// release and project, and returns from `prepare` before the torch import. So the
+		// coordinator gets a plan digest to dispatch by, and a machine with no card and no
+		// bench store can serve something. That was cl-010's named seam and it is closed.
+		//
+		// `release` is the endpoint release rather than an artifact ref because there is no
+		// artifact: every weightless entrypoint of one install generation shares one
+		// executor, which is exactly what the runtime's construction key spells.
+		record["release"] = ReleaseID(f.Generation)
+		return &coord.Binding{
+			Entrypoint: ep.Name, Record: record, Outputs: AssetPaths(ep.Result),
+		}, nil
 	}
 
 	slot := ep.Models[0]

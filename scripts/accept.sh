@@ -147,16 +147,48 @@ if [ -n "$ENDPOINT" ] && [ -f "$ENDPOINT" ]; then
   check "cozy describe renders the surface the install verified" \
     "$([ "$CODE" = 0 ] && printf '%s' "$OUT" | grep -q 'tile' && echo 1 || echo 0)" "$(first "$OUT")"
 
-  section "the WEIGHTLESS INVOKE — cl-010's named seam, still open"
-  run run cozy/weightless/v1/tile size=32 seed=7
-  # An arm that asserts the CURRENT truth by name. `no_servable_function` is the local
-  # coordinator saying it has no plan vocabulary for a modelless entrypoint: the worker's
-  # boot runs `prepare` for every staged binding, and a plan with no model has nothing to
-  # prepare. When cozy-runtime lands the modelless plan this line goes red, which is the
-  # correct way for a fixture to notice that its own blocker was removed.
-  check "it refuses 6 no_servable_function — NOT YET SERVABLE, named" \
-    "$([ "$CODE" = 6 ] && printf '%s' "$OUT" | grep -q 'no_servable_function' && echo 1 || echo 0)" \
-    "$(first "$OUT") [exit $CODE]"
+  section "the WEIGHTLESS SERVE — a real worker on a machine with no card"
+  # cl-010's named seam is CLOSED (cozy-runtime a3c3d72): a binding record declaring none
+  # of the seven model keys is weightless, its `prepare` returns before the torch import,
+  # and this host mints that record instead of refusing `no_servable_function`. What the
+  # arms below establish is the only claim a cardless machine — a Windows runner, this
+  # container — can ever make for itself: the whole product path, end to end, with nothing
+  # to load.
+  check "the generation's venv contains NO TORCH — the point of a weightless endpoint" \
+    "$([ -z "$(find "$COZY_HOME/generations" -maxdepth 6 -name 'torch' -o -maxdepth 6 -name 'torch-*' 2>/dev/null)" ] && echo 1 || echo 0)" \
+    "$(find "$COZY_HOME/generations" -maxdepth 6 -name 'nvidia*' -o -maxdepth 6 -name 'torch*' 2>/dev/null | wc -l) torch/cuda entries in the venv"
+  START=$(date +%s%3N)
+  run start cozy/weightless
+  ELAPSED=$(( $(date +%s%3N) - START ))
+  printf '%s\n' "$OUT" | sed 's/^/    /'
+  check "cozy start makes the worker READY with no weights to fill" \
+    "$([ "$CODE" = 0 ] && printf '%s' "$OUT" | grep -qE 'state: +ready' && echo 1 || echo 0)" \
+    "${ELAPSED} ms, $(printf '%s' "$OUT" | grep -E '^ready_plans:' | tr -s ' ')"
+
+  run run cozy/weightless/v1/tile size=32 seed=7 --full --out "$COZY_HOME/out"
+  printf '%s\n' "$OUT" | sed 's/^/    /'
+  check "the invoke exits 0 on a TYPED terminal — the coordinator's success transaction" \
+    "$([ "$CODE" = 0 ] && printf '%s' "$OUT" | grep -qE 'status: +completed' && echo 1 || echo 0)" \
+    "$(printf '%s' "$OUT" | grep -E '^status:' | tr -s ' ') [exit $CODE]"
+  check "the typed result is the handler's own struct, not a blob" \
+    "$(printf '%s' "$OUT" | grep -q 'size:32' && printf '%s' "$OUT" | grep -q 'pixels:1024' && echo 1 || echo 0)" \
+    "$(printf '%s' "$OUT" | grep -oE 'digest:[0-9a-f]{16}' | head -1)"
+  check "it reserved NO VRAM and constructed NOTHING (empty construction digest)" \
+    "$(printf '%s' "$OUT" | grep -q 'peak_vram_bytes:0' && printf '%s' "$OUT" | grep -q 'construction_digest= ' && echo 1 || echo 0)" \
+    "$(printf '%s' "$OUT" | grep -oE 'vram=[0-9A-Za-z]+ host=[0-9A-Za-z]+' | head -1)"
+  # The output is a REAL published asset: a media id, a length, and a file on this disk
+  # whose first bytes are a PNG signature. `cozy run --out` is the last mile of the path.
+  PNG="$COZY_HOME/out/image.png"
+  check "the published output is a real PNG this machine can open" \
+    "$([ -s "$PNG" ] && [ "$(head -c 4 "$PNG" | tr -d '\000-\010\013\014\016-\037\177-\377')" = "PNG" ] && echo 1 || echo 0)" \
+    "$PNG ($(stat -c%s "$PNG" 2>/dev/null || echo 0) B)"
+
+  # The FAILED terminal on the SAME weightless path, so the fixture observes both verdicts
+  # of the terminal transaction rather than only the happy one.
+  run run cozy/weightless/v1/refuse
+  check "and the failure terminal is typed too — 11 invalid_request, named" \
+    "$([ "$CODE" = 11 ] && printf '%s' "$OUT" | grep -q 'invalid_request' && echo 1 || echo 0)" \
+    "$(printf '%s' "$OUT" | grep '^error' | head -1) [exit $CODE]"
 fi
 
 section "cozy down — liveness is an OS fact, so absence is provable"
