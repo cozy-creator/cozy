@@ -68,7 +68,8 @@ func main() {
 	args := os.Args[1:]
 	if len(args) == 0 {
 		fmt.Fprintln(os.Stderr, "usage: cozy-live "+
-			"<canonical|attempt|recovered|arms|api|apiarms|apicrash|verbs|journey|fakeworker> [--flag value]")
+			"<canonical|attempt|recovered|arms|api|apiarms|apicrash|verbs|journey|"+
+			"pipeline|m4arms|dropack|fakeworker> [--flag value]")
 		os.Exit(2)
 	}
 	section := args[0]
@@ -106,6 +107,12 @@ func main() {
 		sectionVerbs()
 	case "journey":
 		sectionJourney()
+	case "pipeline":
+		sectionPipeline()
+	case "m4arms":
+		sectionM4Arms()
+	case "dropack":
+		sectionDropAck()
 	default:
 		fmt.Fprintf(os.Stderr, "cozy-live: unknown section %q\n", section)
 		os.Exit(2)

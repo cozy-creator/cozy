@@ -2,15 +2,18 @@ package main
 
 import (
 	"context"
+	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
 	"os"
+	"path/filepath"
 	"time"
 
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
 
 	"github.com/cozy-creator/cozy-creator-v2/internal/canonical"
+	"github.com/cozy-creator/cozy-creator-v2/internal/home"
 	pb "github.com/cozy-creator/cozy-creator-v2/protocol/cozy/worker/v1"
 )
 
@@ -67,6 +70,7 @@ func fakeWorker() int {
 	say("Register sent: session=%s instance=%s release=%s", session, instance, releaseID)
 
 	var planIDs []string
+	var dropAck *pb.AttemptTerminal
 	for {
 		msg, err := stream.Recv()
 		if err != nil {
@@ -115,12 +119,26 @@ func fakeWorker() int {
 			if arm == "badterminal" {
 				badTerminals(send, session, start, say)
 			}
+			if arm == "dropack" {
+				dropAck = droppedAckTerminal(send, session, start, say)
+			}
 		case *pb.CoordinatorMessage_TerminalAck:
 			say("TerminalAck for %s#%d digest=%s", m.TerminalAck.RequestId,
 				m.TerminalAck.Attempt, hex.EncodeToString(m.TerminalAck.TerminalDigest)[:16])
 			if arm == "badterminal" {
 				time.Sleep(500 * time.Millisecond)
 				return 0
+			}
+			if arm == "dropack" && dropAck != nil {
+				// THE DROP. A worker whose ack never arrived is a worker that keeps
+				// replaying its journaled terminal — byte for byte, because the document
+				// is what it journaled and not something it re-derives. Ignoring the ack
+				// here is what a lost one looks like from the coordinator's side.
+				say("ARM: the TerminalAck is DROPPED, and the journaled terminal is replayed")
+				send(&pb.WorkerMessage{Msg: &pb.WorkerMessage_AttemptTerminal{
+					AttemptTerminal: dropAck}})
+				dropAck = nil
+				go func() { time.Sleep(3 * time.Second); os.Exit(0) }()
 			}
 		case *pb.CoordinatorMessage_CancelAttempt:
 			say("CancelAttempt %s#%d", m.CancelAttempt.RequestId, m.CancelAttempt.Attempt)
@@ -207,6 +225,69 @@ func badTerminals(send func(*pb.WorkerMessage), session string, start *pb.StartA
 	say("ARM 5: the same terminal replayed")
 	emit(t)
 }
+
+// droppedAckTerminal writes ONE real output under the attempt's granted directory and
+// sends a SUCCEEDED terminal that declares it. It returns the identical envelope, which
+// the caller replays when the ack arrives — the coordinator half of a lost TerminalAck.
+//
+// The output matters: "applied exactly once" is only interesting if applying it twice
+// would publish the bytes twice, so the terminal has to carry bytes.
+func droppedAckTerminal(send func(*pb.WorkerMessage), session string, start *pb.StartAttempt,
+	say func(string, ...any)) *pb.AttemptTerminal {
+	// The grant is the coordinator's own attempt directory, derived from the root this
+	// worker was launched against — the same namespace the real runtime writes under.
+	// The root is a FLAG, not the environment: this repository reads the environment
+	// once, at the product entrypoint, and a driver is not it.
+	layout, e := home.Open(flag("cozy-home", ""))
+	if e != nil {
+		say("no layout: %s", e.Message)
+		return nil
+	}
+	dir := layout.AttemptDir(start.RequestId, start.Attempt)
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		say("cannot write under the grant: %v", err)
+		return nil
+	}
+	// A minimal, real PNG: an output is bytes on disk, not a claim in a document.
+	body, err := hex.DecodeString(onePixelPNG)
+	if err != nil {
+		say("bad fixture: %v", err)
+		return nil
+	}
+	if err := os.WriteFile(filepath.Join(dir, "image"), body, 0o644); err != nil {
+		say("cannot write the output: %v", err)
+		return nil
+	}
+	sum := sha256.Sum256(body)
+	t, _ := terminalFor(session, start.RequestId, start.Attempt, start.ExecSpecDigest,
+		pb.TerminalStatus_TERMINAL_STATUS_SUCCEEDED, "one output, and an ack that will be lost")
+	doc, err := canonical.Read(t.TerminalCanonical, &pb.TerminalBody{})
+	if err != nil {
+		say("cannot read back the terminal: %v", err)
+		return nil
+	}
+	raw := map[string]canonical.Value(doc)
+	raw["output_manifest"] = map[string]canonical.Value{
+		"manifest_id": "man-" + start.RequestId,
+		"outputs": []canonical.Value{map[string]canonical.Value{
+			"output_id": "image", "digest": "sha256:" + hex.EncodeToString(sum[:]),
+			"length": int64(len(body)), "mime_type": "image/png",
+		}},
+	}
+	written, err := canonical.Write(raw)
+	if err != nil {
+		say("cannot canonicalize the manifest: %v", err)
+		return nil
+	}
+	t.TerminalCanonical, t.TerminalDigest = written, canonical.Digest(written)
+	say("terminal with ONE %d B output under %s", len(body), dir)
+	send(&pb.WorkerMessage{Msg: &pb.WorkerMessage_AttemptTerminal{AttemptTerminal: t}})
+	return t
+}
+
+// onePixelPNG is a 1x1 PNG, hex-encoded: the smallest thing that is really an image.
+const onePixelPNG = "89504e470d0a1a0a0000000d4948445200000001000000010806000000" +
+	"1f15c4890000000d49444154789c6360000002000100ffff03000006000557bfabd40000000049454e44ae426082"
 
 // stealTerminal is a SECOND session trying to write another session's attempt row.
 func stealTerminal(send func(*pb.WorkerMessage), session string, say func(string, ...any)) {
