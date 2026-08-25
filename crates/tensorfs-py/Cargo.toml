@@ -1,0 +1,8 @@
+[package]
+name = "tensorfs-py"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+tensorfs-core = { path = "../tensorfs-core" }
+tensorfs-layout = { path = "../tensorfs-layout" }

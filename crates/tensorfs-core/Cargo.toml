@@ -1,0 +1,6 @@
+[package]
+name = "tensorfs-core"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]

@@ -1,0 +1,7 @@
+[package]
+name = "tensorfs-layout"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+tensorfs-core = { path = "../tensorfs-core" }
