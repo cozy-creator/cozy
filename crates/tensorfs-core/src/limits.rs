@@ -7,9 +7,10 @@ pub const PROVISIONAL: &str = "provisional: awaiting proto-001 H3+SDXL corpus (t
 //
 // tfs-013: the 64 MiB DOC_MAX_BYTES cap binds at ~85,000 tensors, so MAX_TENSORS (100,000)
 //   is unreachable — the two caps are not mutually consistent (decisions row 167).
-// tfs-015: the ONE uniform tensor form costs 453 B/tensor over a mixed plain/fp8/nvfp4 tree
-//   — 1.60 MiB at the real selected-H3 cardinality (3,699 tensors), 1.09 MiB at SDXL
-//   (2,515). Both are ~2.5% of DOC_MAX_BYTES: the uniform form is not what pressures it.
+// tfs-015: the ONE uniform tensor form costs 467 B/tensor over a mixed plain/fp8/nvfp4 tree
+//   with REAL-length H3 keys (the shipped DiT header's 943 logical keys average 37.7 B) —
+//   1.65 MiB at the real selected-H3 cardinality (3,699 tensors), 1.12 MiB at SDXL (2,515).
+//   Both are ~2.5% of DOC_MAX_BYTES: the uniform form is not what pressures it.
 // tfs-015: a real 382 MiB, 64-tensor, 100-part checkpoint produced 77 segments and 24 inline
 //   bodies under GRID_BYTES=64 MiB / INLINE_MAX_BYTES=256 B. The 256 B threshold caught
 //   every norm-scale and rank-0 scalar role and no weight role, which is the intent; a

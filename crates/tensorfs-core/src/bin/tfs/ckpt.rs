@@ -725,11 +725,19 @@ pub fn cmd_size(n: usize) -> ExitCode {
             _ => vec![4096, 8192],
         };
         let elements = shape.iter().product::<u64>();
-        let key = format!(
-            "blocks.{}.attn.to_{}.weight",
-            i / 4,
-            "qkvo".as_bytes()[i % 4] as char
-        );
+        // Key LENGTH drives header size, so the keys are shaped like the real ones:
+        // `examples/safetensors-headers/minimax_h3_fl2va_fp8_scaled.header.json` carries 943
+        // logical DiT keys averaging 37.7 bytes (max 43). Synthetic short keys understate
+        // the cost by ~11 B/tensor.
+        const SUFFIX: [&str; 6] = [
+            "attn.to_q.weight",
+            "attn.to_k.weight",
+            "attn.to_v.weight",
+            "attn.to_out.0.weight",
+            "ff.net.0.proj.weight",
+            "norm1.linear.weight",
+        ];
+        let key = format!("transformer_blocks.{}.{}", i / 6, SUFFIX[i % 6]);
         let mut parts = Vec::new();
         for (role, r) in &spec.roles {
             let sshape = ok!(r.shape.eval(&shape, elements));
