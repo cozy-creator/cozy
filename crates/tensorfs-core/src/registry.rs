@@ -118,6 +118,10 @@ fn mined(name: &str) -> EncodingVectors {
     let bytes: &[u8] = match name {
         "fp8-rowwise" => include_bytes!("../../../vectors/mined/fp8-rowwise.json"),
         "fp8-rowwise-keepdim" => include_bytes!("../../../vectors/mined/fp8-rowwise-keepdim.json"),
+        "fp8-scaled-scalar" => include_bytes!("../../../vectors/mined/fp8-scaled-scalar.json"),
+        "fp8-scaled-scalar-weight-only" => {
+            include_bytes!("../../../vectors/mined/fp8-scaled-scalar-weight-only.json")
+        }
         "nvfp4-w4a4" => include_bytes!("../../../vectors/mined/nvfp4-w4a4.json"),
         "mxfp8" => include_bytes!("../../../vectors/mined/mxfp8.json"),
         other => panic!("no mined vector set {other:?}"),
@@ -204,10 +208,14 @@ pub fn seeds() -> Vec<Seed> {
         // them -- which is the whole reason scale rank is a spec fact and never a dtype
         // inference (decisions #244, narrowing #187 rather than contradicting it).
         //
-        // VECTORLESS on purpose: qualifying an implementation needs raw bits from the
-        // PRODUCER, and producing them means running ComfyUI's quantizer over weights that
-        // do not transit this machine. It stores and inspects and refuses execution, which
-        // is the honest state, not a gap to paper over.
+        // VECTORED 2026-08-25 (job-001's open conformance clause). The old note said
+        // qualifying this needed ComfyUI's quantizer over weights that cannot transit this
+        // machine. Half of that was true and the wrong half was load-bearing: the QUANTIZER
+        // is not the weights. ComfyUI v0.33.0 (`2f35f4a0`) and comfy_kitchen's compiled
+        // `quantize_fp8`/`dequantize_fp8` run on CPU, so `scripts/mine-vectors.py` IMPORTS
+        // the real producer class and quantizes a 16x32 synthetic tensor with the planted
+        // values that break decoders. Not a second implementation and not a transcription —
+        // the producer itself, on bytes that were never a model.
         seed(
             "fp8-scaled-scalar/1",
                 float.clone(),
@@ -217,8 +225,8 @@ pub fn seeds() -> Vec<Seed> {
                     ("input_scale", role(set(&[Dtype::F32]), dims(vec![]))),
                     ("weight_scale", role(set(&[Dtype::F32]), dims(vec![]))),
                 ],
-                "value[i,j] = data[i,j] * weight_scale, with a separate rank-0 activation `input_scale`. Both scales are SCALARS -- rank 0, one number for the whole tensor -- which is what ComfyUI's `scaled_fp8` comfy_quant marker convention emits for the H3 DiT. Not a degenerate spelling of the rank-2 variant: the byte layouts differ and so do the digests.",
-                None,
+                "value[i,j] = data[i,j] * weight_scale, with a separate rank-0 activation `input_scale`. Both scales are SCALARS -- rank 0, one number for the whole tensor -- which is what ComfyUI's `scaled_fp8` comfy_quant marker convention emits for the H3 DiT. Not a degenerate spelling of the rank-2 variant: the byte layouts differ and so do the digests. The `input_scale` takes NO part in reconstructing the weight -- it is the activation quantizer's scale, and the vectors pin that by carrying a value a folded-in reader gets wrong. The scale is NARROWED TO THE LOGICAL DTYPE BEFORE the multiply, not multiplied in f32 and rounded once: the producer's dequant is `narrow(weight_scale) * e4m3(data)`, and the difference is a full ulp on 132 of 512 bf16 elements.",
+                Some(mined("fp8-scaled-scalar")),
         ),
         // A FOURTH variant, and the one that vindicates "no `optional: true`" on real bytes.
         // The SAME file carries both: measured on the pinned pruned fp8_scaled DiT, 200
@@ -235,8 +243,8 @@ pub fn seeds() -> Vec<Seed> {
                     ("data", role(set(&[Dtype::F8E4M3FN]), Relation::Same)),
                     ("weight_scale", role(set(&[Dtype::F32]), dims(vec![]))),
                 ],
-                "value[i,j] = data[i,j] * weight_scale, weight scale only -- no activation scale role at all. ComfyUI's scaled_fp8 emits this for the H3 DiT's `mlp.fc2` while emitting the input_scale variant for `out_proj`/`qkv_proj`/`mlp.fc1` in the same file.",
-                None,
+                "value[i,j] = data[i,j] * weight_scale, weight scale only -- no activation scale role at all. ComfyUI's scaled_fp8 emits this for the H3 DiT's `mlp.fc2` while emitting the input_scale variant for `out_proj`/`qkv_proj`/`mlp.fc1` in the same file. Same narrowing rule as the sibling variant: the scale lands in the logical dtype before the multiply.",
+                Some(mined("fp8-scaled-scalar-weight-only")),
         ),
         // DELETED (tfs-008 deletion pass): the int8 `w8a8-perchannel/1` seed. It had no
         // producer, no consumer, and a NAME that actively misleads -- everything in this

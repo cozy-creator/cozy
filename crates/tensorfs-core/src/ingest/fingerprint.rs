@@ -7,8 +7,13 @@
 //! * **A registry entry is platform-reviewed DATA, not uploader input.** Entries are banked
 //!   documents with the same closed provenance rule as tfs-008's structure fixtures: a
 //!   `real` claim without its source digest is an unfalsifiable claim and refuses.
-//! * **Surviving ambiguity refuses loudly.** Two entries matching one key set is not a
+//! * **Surviving ambiguity refuses loudly.** Two entries matching one carrier is not a
 //!   tiebreak, it is a review defect; the border names both and stops.
+//! * **A key set does not name a component.** MiniMax-H3 ships `transformer` and
+//!   `transformer_ref` as 532 identical keys with BYTE-IDENTICAL headers — one cached
+//!   header serves both files — so the key set can never decide which one a carrier is.
+//!   The component the caller declares participates in the match, and a key set banked
+//!   only under other components refuses by naming them.
 
 use crate::canon::{as_arr, as_obj, as_str, Fields, Value};
 use crate::dtype::Dtype;
@@ -93,6 +98,10 @@ pub fn refuse_bnb<T>(key: &str) -> Result<T> {
 /// space as a banked structure fixture and a real header's projection.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Fingerprint {
+    /// What the caller is ingesting this carrier AS. Carried on the observation rather than
+    /// passed to `classify` separately, so a fingerprint can never be classified as a
+    /// component other than the one its `topology_digest` was projected under.
+    pub component: String,
     pub keyset_digest: String,
     pub topology_digest: String,
     pub logical_keys: usize,
@@ -138,6 +147,7 @@ pub fn fingerprint(component: &str, h: &SourceHeader) -> Result<Fingerprint> {
     let topo = topology_value(logical.iter().map(|(k, d, s)| (component, *k, *d, *s)));
 
     Ok(Fingerprint {
+        component: component.to_string(),
         keyset_digest: object_id(&crate::canon::write(&keys)),
         topology_digest: topology_digest_of(&topo),
         logical_keys: logical.len(),
@@ -170,50 +180,79 @@ pub struct FingerprintRegistry {
     pub entries: Vec<Banked>,
 }
 
-/// What the border concluded. There is no fourth state and no default.
+/// What the border concluded. There is no fifth state and no default.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Verdict {
-    /// Exactly one reviewed entry matched.
+    /// Exactly one reviewed entry matched (key set AND component).
     Authorized(Box<Banked>),
-    /// More than one matched: a review defect, refused loudly by name.
+    /// The key set is reviewed, but never under the component the caller declared. The key
+    /// set ALONE cannot decide — it is banked under the components named here — so this is
+    /// a typed ambiguity, not an absence: the remedy is a review act, not a rename.
+    ComponentAmbiguous {
+        /// `task_family/structural_variant as <component>` for every entry on this key set.
+        banked_as: Vec<String>,
+    },
+    /// More than one entry banks the same (key set, component): a review defect, refused
+    /// loudly by name. A parsed registry cannot contain this (the document refuses a
+    /// duplicated pair); an in-memory one built by hand can.
     Ambiguous(Vec<String>),
     /// Nothing matched. A filename, a directory, or a config would all be guesses.
     Unregistered,
 }
 
+fn name_of(e: &Banked) -> String {
+    format!(
+        "{}/{} as {} via {}",
+        e.task_family, e.structural_variant, e.component, e.dialect
+    )
+}
+
 impl FingerprintRegistry {
     pub fn classify(&self, fp: &Fingerprint) -> Verdict {
-        let hits: Vec<&Banked> = self
+        let keyset: Vec<&Banked> = self
             .entries
             .iter()
             .filter(|e| e.keyset_digest == fp.keyset_digest)
             .collect();
+        if keyset.is_empty() {
+            return Verdict::Unregistered;
+        }
+        let hits: Vec<&&Banked> = keyset
+            .iter()
+            .filter(|e| e.component == fp.component)
+            .collect();
         match hits.len() {
-            0 => Verdict::Unregistered,
-            1 => Verdict::Authorized(Box::new(hits[0].clone())),
-            _ => Verdict::Ambiguous(
-                hits.iter()
-                    .map(|e| {
-                        format!(
-                            "{}/{} via {}",
-                            e.task_family, e.structural_variant, e.dialect
-                        )
-                    })
-                    .collect(),
-            ),
+            0 => Verdict::ComponentAmbiguous {
+                banked_as: keyset.iter().map(|e| name_of(e)).collect(),
+            },
+            1 => Verdict::Authorized(Box::new((*hits[0]).clone())),
+            _ => Verdict::Ambiguous(hits.iter().map(|e| name_of(e)).collect()),
         }
     }
 
-    /// The verdict as an authorization, with the two refusals spelled out at one site.
+    /// The verdict as an authorization, with the three refusals spelled out at one site.
     pub fn authorize(&self, what: &str, fp: &Fingerprint) -> Result<Banked> {
         match self.classify(fp) {
             Verdict::Authorized(b) => Ok(*b),
+            Verdict::ComponentAmbiguous { banked_as } => refuse(
+                Code::AMBIGUOUS_CLASSIFICATION,
+                format!(
+                    "{what}: key set {} is reviewed, but never as component {:?} — it is \
+                     banked as {banked_as:?}. A key set does not name a component (H3's \
+                     `transformer` and `transformer_ref` are the same 532 keys in \
+                     byte-identical headers), so the component is reviewed data: bank this \
+                     one, or ingest under a component that is.",
+                    fp.keyset_digest, fp.component
+                ),
+            ),
             Verdict::Ambiguous(names) => refuse(
                 Code::AMBIGUOUS_CLASSIFICATION,
                 format!(
-                    "{what}: key set {} matches {} reviewed entries {names:?} — surviving \
-                     ambiguity refuses; an explicit profile must name exactly one",
+                    "{what}: (key set {}, component {:?}) matches {} reviewed entries \
+                     {names:?} — surviving ambiguity refuses; an explicit profile must name \
+                     exactly one",
                     fp.keyset_digest,
+                    fp.component,
                     names.len()
                 ),
             ),

@@ -11,9 +11,15 @@ actually shipped — not what v2's Rust reader believes.
     ~/cozy/python-gen-worker/src/gen_worker/models/w4a4.py          quantize_nvfp4_tensor
     ~/cozy/python-gen-worker/src/gen_worker/convert/writer.py:546   the fp8 w8a8 quantizer
 
-Run under v1's venv, which has the real torch:
+`fp8-scaled-scalar` is mined a step further: nothing is copied at all. The producer class
+is IMPORTED and CALLED — ComfyUI's own `TensorCoreFP8E4M3Layout.quantize(..., "recalculate")`
+and comfy_kitchen's own `quantize_fp8` / `dequantize_fp8` kernels, which run on CPU. It
+needs ComfyUI's venv rather than v1's:
 
-    ~/cozy/python-gen-worker/.venv/bin/python scripts/mine-vectors.py <alias> > out.rows
+    ~/cozy_v2/comfy-bench/ComfyUI/.venv/bin/python scripts/mine-vectors.py <alias> > out.rows
+
+Everything else runs under either. Weights never enter this: the material is a 16x32 random
+tensor with the values that break decoders planted in it.
 
 Output is a deliberately dumb line format, NOT JSON: canonical bytes have exactly one
 writer in this repo and it is the Rust one. `tfs vectors mine` turns these rows into the
@@ -26,6 +32,8 @@ canonical EncodingVectors document.
 """
 
 import base64
+import os
+import pathlib
 import sys
 
 import torch
@@ -214,10 +222,67 @@ def mine_mxfp8():
         })
 
 
+# ---------------------------------------------------------------- ComfyUI, imported
+
+# ComfyUI v0.33.0, 2f35f4a08176d993cded35dac3332be4f7287f41; comfy_kitchen 0.2.31.
+COMFY = os.environ.get("COMFY_ROOT") or str(pathlib.Path.home() / "cozy_v2/comfy-bench/ComfyUI")
+
+
+def _comfy_fp8_layout():
+    """ComfyUI's own per-tensor fp8 layout class, imported rather than reimplemented.
+
+    `quantize(t, scale="recalculate")` is comfy/quant_ops.py:118 — scale =
+    amax(|t|)/finfo(e4m3).max as an f32 SCALAR, then comfy_kitchen's compiled
+    `quantize_fp8`. That scalar is what ComfyUI stores as `<module>.weight_scale`, and it is
+    the whole reason `fp8-scaled-scalar/1` is a different spec from the rank-2 variants.
+    """
+    if COMFY not in sys.path:
+        sys.path.insert(0, COMFY)
+    import comfy.quant_ops as qo
+
+    return qo.TensorCoreFP8E4M3Layout
+
+
+def mine_fp8_scaled_scalar():
+    """The two role sets ComfyUI's `scaled_fp8` emits in ONE file, mined separately.
+
+    Measured on the pinned pruned fp8 H3 DiT: 150 modules carry `.weight_scale` AND
+    `.input_scale` (out_proj, qkv_proj, mlp.fc1) and 50 carry the weight scale alone
+    (mlp.fc2, the `full_precision_matrix_mult` ones — no activation is quantized there, so
+    there is no activation scale to store). Two role sets, two spec digests, two vector
+    documents.
+
+    The activation scale is produced by the SAME producer call on a synthetic activation
+    batch, because that is what it is: `QuantizedTensor.from_float(input, layout, scale=...)`
+    (comfy/ops.py:1408). It takes no part in reconstructing the weight, which is precisely
+    the fact these vectors pin — a decoder that folds it in is one of the wrong arms.
+    """
+    import comfy_kitchen as ck
+
+    layout = _comfy_fp8_layout()
+    w = material(16, 32, 4)
+    # one large-but-not-448 outlier so the recalculated scale is nowhere near 1.0: a scale
+    # of exactly 1 would let a scale-ignoring decoder pass and prove nothing
+    w[3, 7] = -137.5
+    act = material(8, 32, 5) * 3.25
+    for lg, dt in (("f32", torch.float32), ("bf16", torch.bfloat16), ("f16", torch.float16)):
+        q, params = layout.quantize(w.to(dt), scale="recalculate")
+        _, aparams = layout.quantize(act.to(dt), scale="recalculate")
+        deq = ck.dequantize_per_tensor_fp8(q, params.scale, dt)
+        roles = {
+            "data": ("f8_e4m3fn", [16, 32], raw(q)),
+            "weight_scale": ("f32", [], raw(params.scale.reshape(()))),
+        }
+        emit(f"fp8-scaled-scalar-wonly-16x32-{lg}", lg, [16, 32], raw(deq), dict(roles))
+        roles["input_scale"] = ("f32", [], raw(aparams.scale.reshape(())))
+        emit(f"fp8-scaled-scalar-16x32-{lg}", lg, [16, 32], raw(deq), roles)
+
+
 MINERS = {
     "fp8-rowwise": mine_fp8_rowwise,
     "nvfp4-w4a4": mine_nvfp4,
     "mxfp8": mine_mxfp8,
+    "fp8-scaled-scalar": mine_fp8_scaled_scalar,
 }
 
 if __name__ == "__main__":

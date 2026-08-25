@@ -382,6 +382,10 @@ pub fn cmd_inspect(f: &Flags) -> ExitCode {
                     "  verdict      AUTHORIZED {}/{} via {} -> {}",
                     b.task_family, b.structural_variant, b.dialect, b.converter
                 ),
+                fingerprint::Verdict::ComponentAmbiguous { banked_as } => println!(
+                    "  verdict      AMBIGUOUS — this key set is reviewed, but not as \
+                     {component:?}; banked as {banked_as:?} — refuses"
+                ),
                 fingerprint::Verdict::Ambiguous(n) => {
                     println!("  verdict      AMBIGUOUS {n:?} — refuses")
                 }
@@ -466,7 +470,12 @@ pub fn cmd_bank(
     if let Some(dir) = p.parent() {
         let _ = fs::create_dir_all(dir);
     }
-    if let Err(e) = fs::write(&p, reg.canonical_bytes()) {
+    // The REVIEW ACT does not get to leave behind a document the border cannot read. A
+    // `--source-name` with one em dash in it wrote a registry that every later run refused
+    // NON_ASCII_FIELD, at the far end of the pipeline and with the review already "done".
+    let bytes = reg.canonical_bytes();
+    ok!(FingerprintRegistry::parse(&bytes));
+    if let Err(e) = fs::write(&p, &bytes) {
         eprintln!("REFUSED IO_FAILED: write {}: {e}", p.display());
         return ExitCode::FAILURE;
     }

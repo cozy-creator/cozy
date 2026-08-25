@@ -114,20 +114,30 @@ red UNREGISTERED_FINGERPRINT "an authoritative-looking FILENAME over unknown key
 green "the same bytes under a lying filename still classify by KEYS" \
     "$TFS" ingest plan toy=plain/1 --source toy="$WORK/carriers/sdxl_base_1.0_official.safetensors" --registry "$REG"
 
-banner "RED 5 — surviving ambiguity refuses loudly"
-python3 - "$REG" "$WORK/ambiguous.json" <<'PY'
+banner "RED 5 — surviving ambiguity refuses loudly, at whichever door catches it"
+# Two shapes, and they are caught in two different places now that classification is
+# (key set, COMPONENT). Planted exactly as they would arrive — two operators banking the
+# same architecture, once under the same name and once under a rival one.
+python3 - "$REG" "$WORK/ambiguous.json" "$WORK/rival.json" <<'PY'
 import json, sys
-# A SECOND reviewed entry for the same key set under the same component: a review defect,
-# planted here exactly as one would arrive — by two operators banking the same architecture.
 r = json.load(open(sys.argv[1]))
 e = [x for x in r["entries"] if x["component"] == "toy"][0]
-twin = dict(e, task_family="toy-rival", structural_variant="v2", component="toy-rival")
-r["entries"] = sorted(r["entries"] + [twin],
-                      key=lambda x: (x["keyset_digest"], x["component"]))
-json.dump(r, open(sys.argv[2], "w"), separators=(",", ":"), sort_keys=True)
+def write(path, twin):
+    out = dict(r, entries=sorted(r["entries"] + [twin],
+                                 key=lambda x: (x["keyset_digest"], x["component"])))
+    json.dump(out, open(path, "w"), separators=(",", ":"), sort_keys=True)
+# same key set AND same component: the DOCUMENT cannot hold it
+write(sys.argv[2], dict(e, task_family="toy-rival", structural_variant="v2"))
+# same key set, a rival component: a real review can look like this, so it parses
+write(sys.argv[3], dict(e, task_family="toy-rival", structural_variant="v2",
+                        component="toy-rival"))
 PY
-red AMBIGUOUS_CLASSIFICATION "one key set, two reviewed entries" \
+red DUPLICATE_KEY "two entries bank one (key set, component)" \
     "$TFS" ingest plan toy=plain/1 --source toy="$WORK/carriers/good.safetensors" --registry "$WORK/ambiguous.json"
+green "a rival component on the same key set does not shadow toy" \
+    "$TFS" ingest plan toy=plain/1 --source toy="$WORK/carriers/good.safetensors" --registry "$WORK/rival.json"
+red AMBIGUOUS_CLASSIFICATION "a key set reviewed only under OTHER components" \
+    "$TFS" ingest plan stranger=plain/1 --source stranger="$WORK/carriers/good.safetensors" --registry "$WORK/rival.json"
 
 banner "RED 6 — conversion refusal classes, decided from headers alone"
 red REMEDY_FROM_TARGET "plain bf16 offered as fp8-rowwise (the CAST class)" \
@@ -163,8 +173,28 @@ else
 fi
 
 if [ -f "$H3" ]; then
-  "$TFS" ingest bank safetensors.diffusers h3.fl2va pruned-fp8-scaled diffusers.identity/1 \
+  "$TFS" ingest bank safetensors.diffusers h3.fl2va adaln-curve-fp8-scaled diffusers.identity/1 \
     --source transformer="$H3" --registry "$REG" --source-name h3-shipped-header >/dev/null
+
+  # The DUAL. `transformer` and `transformer_ref` are 532 identical keys in BYTE-IDENTICAL
+  # headers — h3-evidence banks ONE cached blob for both files — so the key set can never
+  # say which partition a carrier is. Classification is (key set, component); banking the
+  # second one used to make BOTH ambiguous (job-001's report).
+  "$TFS" ingest bank safetensors.diffusers h3.ref2va adaln-curve-fp8-scaled diffusers.identity/1 \
+    --source transformer_ref="$H3" --registry "$REG" --source-name h3-shipped-header-ref2va >/dev/null
+  for pair in transformer:h3.fl2va transformer_ref:h3.ref2va; do
+    comp=${pair%%:*}; fam=${pair##*:}
+    if "$TFS" ingest inspect --source "$comp=$H3" --registry "$REG" \
+         | grep -q "AUTHORIZED $fam/adaln-curve-fp8-scaled"; then
+      PASS=$((PASS+1)); printf '  ok   %s\n' "the dual's $comp authorizes as $fam on a shared key set"
+    else
+      MISS=$((MISS+1)); printf '  MISS %-42s\n' "$comp did not authorize as $fam"
+    fi
+  done
+  # A THIRD component on the same reviewed key set is not authorized by proximity.
+  red AMBIGUOUS_CLASSIFICATION "the dual's key set offered as a third component" \
+      "$TFS" ingest plan unet=fp8-scaled-scalar/1 --source unet="$H3" --registry "$REG"
+
   red DOUBLE_ENCODE "an fp8-with-scales tree offered as plain storage" \
       "$TFS" ingest plan transformer=plain/1 --source transformer="$H3" --registry "$REG"
   red DOUBLE_ENCODE "the real DiT as fp8-rowwise: no role for .input_scale" \
@@ -217,6 +247,12 @@ MIXSTORE="$WORK/mixstore"
   | grep -E "^encodings|^ +[0-9]+ +|^topology|^stamp|^receipt|parts |tensors "
 green "install the mixed candidate" "$TFS" ingest install "$MIXSTORE" mix
 MIXSNAP=$("$TFS" ingest roots "$MIXSTORE" | grep installed | head -1 | awk '{print $2}' | cut -d: -f2)
+# ONE spelling both directions: the id `ingest roots` PRINTED, pasted back verbatim.
+green "the printed sha256: id is accepted as itself" \
+    "$TFS" snapshot show "$MIXSTORE" "sha256:$MIXSNAP"
+# and ONLY that spelling: the prefix is accepted as itself, not stripped off anything
+red OBJECT_ABSENT "an id spelled any other way resolves to nothing" \
+    "$TFS" snapshot show "$MIXSTORE" "SHA256:$MIXSNAP"
 "$TFS" snapshot walk "$MIXSTORE" "$MIXSNAP" | sed -n '2,3p'
 green "delivered bytes hash to the digests the header declares" \
     "$TFS" read prove "$MIXSTORE" "$MIXSNAP"

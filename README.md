@@ -96,12 +96,16 @@ tfs ingest install <store> <session>        # the coordinator promotes ONE root
 tfs ingest roots|reap <store> [--now]       # candidates are not checkpoints
 tfs ingest reingest <store> <header> <target> [--rekey c=from:to]   # inherit by reference
 tfs ingest converters | golden              # reviewed converters + their geometry, live
-scripts/ingest-runs.sh all                  # the border plus 49 planted arms
+scripts/ingest-runs.sh all                  # the border plus 56 planted arms
 ```
 
 A `--source` names its component; a FILENAME never authorizes anything. Classification is
-a key-set fingerprint against a reviewed registry (`vectors/fingerprints/`), and both
-absence and ambiguity refuse. Measured on a real 6.94 GB SDXL fp16 tree: **84 MB/s
+(key set, COMPONENT) against a reviewed registry (`vectors/fingerprints/`), and absence and
+both shapes of ambiguity refuse. The component is in the match because a key set cannot
+carry one: H3's `transformer` and `transformer_ref` are 532 identical keys in byte-identical
+headers, so which task partition a carrier is, is reviewed data and nothing else.
+
+Measured on a real 6.94 GB SDXL fp16 tree: **84 MB/s
 end-to-end at a 13.2 MiB peak RSS** (streaming, never whole-file), planned in 30 ms from
 336 KiB of headers. Re-ingesting an already-canonical component inherits every object by
 reference: 167 MB carried, **zero bytes hashed**.
@@ -126,8 +130,12 @@ scripts/registry-runs.sh all                  # fixtures, mining, conformance, r
 ```
 
 Vectors are PRODUCER-MINED: `scripts/mine-vectors.py` runs v1's own quantizers (the quarry
-under `~/cozy`) and transcribes raw bytes; `tfs vectors mine` canonicalises them. A
-vectorless spec stores and inspects and can never qualify an implementation.
+under `~/cozy`) and, for `fp8-scaled-scalar/1`, imports and calls ComfyUI's own layout class
+on the CPU; `tfs vectors mine` canonicalises the raw bytes. Two producer venvs, so
+`registry-runs.sh mine` uses `$V1PY` and `$COMFYPY`. A vectorless spec stores and inspects
+and can never qualify an implementation; four still are (`svdq-microscale/1` and nvfp4's
+three non-base variants). Adding vectors CHANGES the spec digest — an immutable object
+gained normative content — so anything that pinned the old one must re-derive.
 
 `vectors/` is frozen DATA: `closure/` holds the platform EncodingSpec objects, `fingerprints/`
 the reviewed classification registry, `cases/<group>/`

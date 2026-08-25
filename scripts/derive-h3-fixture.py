@@ -27,7 +27,11 @@ The three derivations, unchanged as a method:
    nothing left to say.
 2. A quantized weight's LOGICAL dtype is bf16, not its F8_E4M3 carrier. The carrier is
    storage; the logical type is the encoding-invariant meaning.
-3. `.weight_scale` siblings are DROPPED — a ROLE of one cozytensors tensor, not a tensor.
+3. `.weight_scale` AND `.input_scale` siblings are DROPPED — ROLES of one cozytensors
+   tensor, not tensors. `.input_scale` was added 2026-08-25 when the retired 943-key source
+   was replaced by the pinned CURVE fp8 header, which carries 150 of them; the border's own
+   vocabulary (`fingerprint::ROLE_SUFFIXES`) has always called it a role, and the rule
+   extension is that one word, made explicit here rather than assumed.
 
 Any OTHER role suffix refuses: a role this script has no rule for would otherwise be
 transcribed as a logical tensor of its own, which is how a fixture quietly stops describing
@@ -48,7 +52,7 @@ PROVENANCE = "tracker-v2/examples/safetensors-headers/PROVENANCE.md"
 DTYPE = {"BF16": "bf16", "F32": "f32", "F16": "f16", "F8_E4M3": "f8_e4m3fn",
          "F8_E5M2": "f8_e5m2", "I64": "i64", "I32": "i32", "I16": "i16", "I8": "i8",
          "U8": "u8", "BOOL": "bool"}
-DROPPED_ROLES = (".weight_scale", ".comfy_quant")
+DROPPED_ROLES = (".weight_scale", ".input_scale", ".comfy_quant")
 
 
 def refuse(why: str) -> None:
@@ -85,11 +89,16 @@ if digest.startswith(RETIRED_DIGESTS):
 h = json.loads(raw)
 h.pop("__metadata__", None)
 
-quantized = {k[: -len(".weight_scale")] for k in h if k.endswith(".weight_scale")}
+# The KEY the scale belongs to, not the MODULE. This used to strip ".weight_scale"
+# whole, leaving `blocks.0.attn.out_proj`, which matches no key — so rule 2 never fired
+# once in the life of this script. It was invisible while the source was the fabricated
+# header, whose tensors were declared BF16 anyway; against a real fp8 carrier it banks 200
+# F8_E4M3 CARRIER dtypes into a document whose whole subject is the logical structure.
+quantized = {k[: -len("_scale")] for k in h if k.endswith(".weight_scale")}
 unknown = sorted(
     k for k in h
     if "." in k.rsplit(".", 1)[0] + "."
-    and k.endswith(tuple(f".{r}" for r in ("input_scale", "smooth_factor", "bias_scale",
+    and k.endswith(tuple(f".{r}" for r in ("smooth_factor", "bias_scale",
                                            "pre_quant_scale", "weight_scale_2")))
 )
 if unknown:

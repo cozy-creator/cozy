@@ -8,6 +8,7 @@ cd "$(dirname "$0")/.."
 TFS=${TFS:-target/release/tfs}
 WORK=${WORK:-/tmp/tfs-008-runs}
 V1PY=${V1PY:-$HOME/cozy/python-gen-worker/.venv/bin/python}
+COMFYPY=${COMFYPY:-$HOME/cozy_v2/comfy-bench/ComfyUI/.venv/bin/python}
 SECTION=${1:-all}
 
 hr() { printf '\n===== %s =====\n' "$*"; }
@@ -26,24 +27,31 @@ fixtures_section() {
   hr "the banked structure fixtures, with provenance"
   "$TFS" structure list
 
-  hr "the REAL H3 fixture is derived from the real shipped header, and says so"
-  "$V1PY" - <<'PY'
+  hr "the REAL H3 fixture is derived from the PINNED shipped header, and says so"
+  # Source corrected 2026-08-25: this read `minimax_h3_fl2va_fp8_scaled.header.json`, which
+  # tfs-010 measured FABRICATED and deleted. The pinned replacement is a CURVE artifact, so
+  # the stamp name moved with it — `full-adaln` would have been false about the topology.
+  python3 - <<'PY'
 import json, hashlib, pathlib
-p = pathlib.Path.home() / "cozy_v2/tracker-v2/examples/safetensors-headers/minimax_h3_fl2va_fp8_scaled.header.json"
+p = (pathlib.Path.home()
+     / "cozy_v2/tracker-v2/examples/safetensors-headers/minimax_h3_fl2va_pruned_fp8_scaled.header.json")
 raw = p.read_bytes()
 h = json.loads(raw); h.pop("__metadata__", None)
+roles = (".weight_scale", ".input_scale", ".comfy_quant")
 print(f"  source            {p.name}")
 print(f"  source sha256     {hashlib.sha256(raw).hexdigest()}")
 print(f"  keys in the file  {len(h)}")
-print(f"  .weight_scale     {sum(1 for k in h if k.endswith('.weight_scale'))}")
-print(f"  .comfy_quant      {sum(1 for k in h if k.endswith('.comfy_quant'))}")
-print(f"  logical tensors   {sum(1 for k in h if not k.endswith(('.weight_scale', '.comfy_quant')))}")
+for r in roles:
+    print(f"  {r:<17} {sum(1 for k in h if k.endswith(r))}")
+print(f"  logical tensors   {sum(1 for k in h if not k.endswith(roles))}")
 PY
   python3 -c "
-import json,sys,pathlib
-p=pathlib.Path('vectors/structure/h3.fl2va-full-adaln.json')
-d=json.loads(p.read_text())
-print('  banked keys      ', sum(len(v) for v in d['components'].values()))
+import json,pathlib
+from collections import Counter
+d=json.loads(pathlib.Path('vectors/structure/h3.fl2va-adaln-curve-fp8-scaled.json').read_text())
+ts=[v for c in d['components'].values() for v in c.values()]
+print('  banked keys      ', len(ts))
+print('  logical dtypes   ', dict(Counter(t['dtype'] for t in ts)))
 print('  provenance       ', d['provenance']['kind'], d['provenance']['source_sha256'][:16]+'...')
 print('  note             ', d['provenance']['note'][:110]+'...')
 "
@@ -58,18 +66,37 @@ print('  note             ', d['provenance']['note'][:110]+'...')
 }
 
 mine_section() {
-  hr "PRODUCER-MINED vectors: v1's own quantizers, run here, transcribed to raw bytes"
-  echo "  producer venv: $V1PY"
-  "$V1PY" -c "import torch; print('  torch', torch.__version__)"
-  nice -n 19 "$V1PY" scripts/mine-vectors.py all > "$WORK/mined.rows" 2> "$WORK/mined.err"
-  cat "$WORK/mined.err" | sed 's/^/  /'
+  # TWO producer venvs. v1's quarry quantizers need v1's torch; `fp8-scaled-scalar` needs
+  # ComfyUI's, because it imports ComfyUI's own layout class and comfy_kitchen's compiled
+  # fp8 kernels rather than copying them. Mining them into ONE rows file under one venv is
+  # what this section used to do, and the import error made every stability check below
+  # vacuous while still printing STABLE — 0 cases mined, 0 cases compared, all green.
+  hr "PRODUCER-MINED vectors: the producers' own quantizers, run here, transcribed to raw bytes"
+  : > "$WORK/mined.rows"
+  for pair in "$V1PY:fp8-rowwise nvfp4-w4a4 mxfp8" "$COMFYPY:fp8-scaled-scalar"; do
+    py=${pair%%:*}; aliases=${pair#*:}
+    if [ ! -x "$py" ]; then echo "  MISSING PRODUCER VENV $py — cannot mine$aliases"; continue; fi
+    echo "  producer venv: $py"
+    "$py" -c "import torch; print('  torch', torch.__version__)"
+    for a in $aliases; do
+      nice -n 19 "$py" scripts/mine-vectors.py "$a" > "$WORK/$a.rows" 2> "$WORK/$a.err" \
+        || { echo "  MINER FAILED $a"; sed 's/^/    /' "$WORK/$a.err"; continue; }
+      sed 's/^/  /' "$WORK/$a.err"
+      cat "$WORK/$a.rows" >> "$WORK/mined.rows"
+    done
+  done
   echo "  rows: $(wc -l < "$WORK/mined.rows"), cases: $(grep -c '^case ' "$WORK/mined.rows")"
 
   hr "re-mining is byte-stable (the producers are deterministic)"
   for n in fp8-rowwise:fp8-rowwise-16x32 fp8-rowwise-keepdim:fp8-rowwise-keepdim \
-           nvfp4-w4a4:nvfp4-w4a4 mxfp8:mxfp8; do
+           nvfp4-w4a4:nvfp4-w4a4 mxfp8:mxfp8 \
+           fp8-scaled-scalar:fp8-scaled-scalar-16x32 \
+           fp8-scaled-scalar-weight-only:wonly; do
     before=$(sha256sum "vectors/mined/${n%%:*}.json" | cut -d' ' -f1)
-    "$TFS" vectors mine "$WORK/mined.rows" "${n%%:*}" --match "${n##*:}" > /dev/null
+    # a re-mine that matched NOTHING leaves the file untouched, which is not stability
+    if ! "$TFS" vectors mine "$WORK/mined.rows" "${n%%:*}" --match "${n##*:}" > /dev/null 2>&1; then
+      echo "  ${n%%:*}: NOT RE-MINED — no case matched ${n##*:}"; continue
+    fi
     after=$(sha256sum "vectors/mined/${n%%:*}.json" | cut -d' ' -f1)
     if [ "$before" = "$after" ]; then echo "  ${n%%:*}: STABLE $after"; else
       echo "  ${n%%:*}: CHANGED $before -> $after"; fi

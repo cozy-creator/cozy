@@ -72,6 +72,32 @@ fn f32_from_e8m0(b: u8) -> f32 {
     2f32.powi(b as i32 - 127)
 }
 
+fn f32_from_half(b: [u8; 2]) -> f32 {
+    let h = u16::from_le_bytes(b) as u32;
+    let (sign, exp, man) = ((h >> 15) & 1, (h >> 10) & 0x1f, h & 0x3ff);
+    let bits = match exp {
+        0 if man == 0 => sign << 31,
+        0 => {
+            // subnormal: renormalise into f32's exponent field
+            let shift = man.leading_zeros() - 21;
+            (sign << 31) | ((127 - 15 - shift) << 23) | ((man << (shift + 1)) & 0x007f_ffff)
+        }
+        0x1f => (sign << 31) | 0x7f80_0000 | (man << 13),
+        e => (sign << 31) | ((e + 127 - 15) << 23) | (man << 13),
+    };
+    f32::from_bits(bits)
+}
+
+/// The value narrowed to the logical dtype and read back. Some producers multiply in the
+/// LOGICAL dtype rather than in f32, so where a scale lands is part of the byte contract.
+fn logical_round(dt: Dtype, v: f32) -> f32 {
+    match dt {
+        Dtype::Bf16 => f32::from_bits((u16::from_le_bytes(bf16_from_f32(v)) as u32) << 16),
+        Dtype::F16 => f32_from_half(half_from_f32(v)),
+        _ => v,
+    }
+}
+
 fn put_logical(dt: Dtype, v: f32, out: &mut Vec<u8>) {
     match dt {
         Dtype::F32 => out.extend_from_slice(&f32_bits(v)),
@@ -176,6 +202,52 @@ fn fp8_inner(c: &Case, wrong_axis: bool, skip_scale: bool) -> Option<Vec<u8>> {
     Some(out)
 }
 
+/// ComfyUI `scaled_fp8`, per-TENSOR scalar: value[i,j] = e4m3(data[i,j]) * weight_scale.
+/// ONE decoder serves both physical variants, because the second scale is not a weight
+/// scale: `input_scale` belongs to the activation quantizer and never touches these bytes.
+fn fp8_scaled_scalar(c: &Case) -> Option<Vec<u8>> {
+    fp8_scalar_inner(c, false, false, true)
+}
+/// The reader that treats the two role sets as one loose spec and folds the activation
+/// scale into the weight. It gets the +input_scale cases numerically wrong and produces
+/// NOTHING for the weight-scale-only ones — which is the "no optional roles" rule, live.
+fn fp8_scaled_input_folded(c: &Case) -> Option<Vec<u8>> {
+    fp8_scalar_inner(c, true, false, true)
+}
+fn fp8_scaled_no_scale(c: &Case) -> Option<Vec<u8>> {
+    fp8_scalar_inner(c, false, true, true)
+}
+/// The plausible reading, and the one this harness was written with before the vectors
+/// contradicted it: multiply in f32 and round ONCE at the end. ComfyUI narrows the scale
+/// into the logical dtype FIRST, so this arm is a full ulp out on 132 of 512 bf16 elements
+/// and bit-exact on every f32 one — wrong in exactly the way review can never catch.
+fn fp8_scaled_f32_math(c: &Case) -> Option<Vec<u8>> {
+    fp8_scalar_inner(c, false, false, false)
+}
+
+fn fp8_scalar_inner(c: &Case, fold_input: bool, skip_scale: bool, narrow: bool) -> Option<Vec<u8>> {
+    let d = role(c, "data")?;
+    let ws = role(c, "weight_scale")?;
+    let mut s = if skip_scale {
+        1.0
+    } else {
+        f32::from_le_bytes(ws.bits[0..4].try_into().ok()?)
+    };
+    if fold_input {
+        // absent on the weight-scale-only spec: this arm cannot decode that contract at all
+        let i = role(c, "input_scale")?;
+        s *= f32::from_le_bytes(i.bits[0..4].try_into().ok()?);
+    }
+    if narrow {
+        s = logical_round(c.logical_dtype, s);
+    }
+    let mut out = Vec::new();
+    for b in &d.bits {
+        put_logical(c.logical_dtype, f32_from_e4m3fn(*b) * s, &mut out);
+    }
+    Some(out)
+}
+
 /// MXFP8: value[i,j] = e4m3(data[i,j]) * 2^(E8M0(scale[i, j/32]) - 127)
 fn mxfp8(c: &Case) -> Option<Vec<u8>> {
     mxfp8_inner(c, 32)
@@ -259,6 +331,20 @@ pub fn candidates(alias: &str) -> Vec<Candidate> {
             mk("fp8-rowwise:scale-by-column", true, fp8_wrong_axis),
             mk("fp8-rowwise:scale-ignored", true, fp8_no_scale),
         ],
+        "fp8-scaled-scalar/1" => vec![
+            mk(
+                "fp8-scaled-scalar",
+                false,
+                fp8_scaled_scalar as fn(&Case) -> Option<Vec<u8>>,
+            ),
+            mk(
+                "fp8-scaled-scalar:input-scale-folded",
+                true,
+                fp8_scaled_input_folded,
+            ),
+            mk("fp8-scaled-scalar:scale-ignored", true, fp8_scaled_no_scale),
+            mk("fp8-scaled-scalar:f32-math", true, fp8_scaled_f32_math),
+        ],
         "mxfp8/1" => vec![
             mk("mxfp8", false, mxfp8),
             mk("mxfp8:block-16", true, mxfp8_wrong_block),
@@ -334,11 +420,13 @@ fn qualify(alias: &str, spec: &EncodingSpec, v: &EncodingVectors) -> (usize, usi
     (good_pass, arms_failed_correctly, ok)
 }
 
+/// Byte-bounded, CHAR-safe. It used to slice at byte `n` and panicked the moment a refusal
+/// line carried a multi-byte character within the first 60 bytes — which the fp8-scaled
+/// arms' own elision marker does. A reporting path is not allowed to be the thing that dies.
 fn truncate(s: &str, n: usize) -> String {
-    if s.len() <= n {
-        s.to_string()
-    } else {
-        format!("{}…", &s[..n])
+    match s.char_indices().nth(n) {
+        None => s.to_string(),
+        Some((i, _)) => format!("{}…", &s[..i]),
     }
 }
 
@@ -549,6 +637,11 @@ pub fn cmd_capability(encoding: &str, device: &str, f: &Flags) -> ExitCode {
                 return ExitCode::from(2);
             }
         },
+        // A spec id is prefixed BY DEFINITION, and the CLI hands every digest argument over
+        // bare (`accept_printed_ids`), so put the one spelling back.
+        None if tensorfs_core::ids::hex64("encoding", encoding).is_ok() => {
+            format!("sha256:{encoding}")
+        }
         None => encoding.to_string(),
     };
     match recs.admit(&enc, device) {

@@ -145,8 +145,28 @@ use tensorfs_core::registry;
 use tensorfs_core::spec::EncodingSpec;
 use tensorfs_core::store::{Fault, Store, Verdict, FAULT_STAGES};
 
+/// ONE spelling in both directions, on the POSITIONAL surface. Every id this tool prints is
+/// `sha256:<hex>`, and a positional digest used to be bare hex only, so an id copied out of
+/// one command could not be pasted into the next (job-001 stripped the prefix at every
+/// hand-off). A positional argument that is exactly a printed id is now accepted as itself.
+///
+/// FLAG values are deliberately untouched: `--pin` and its kind already take the prefixed
+/// spelling on the way in, so they were never the inconsistent half, and rewriting them
+/// broke `verify-compat` the first time this was applied to the whole argv. And only the
+/// CLI is loosened either way — a canonical DOCUMENT still holds each field to its one
+/// spelling, which is what keeps digests stable.
+fn accept_printed_ids(args: Vec<String>) -> Vec<String> {
+    args.into_iter()
+        .map(|t| match t.strip_prefix("sha256:") {
+            Some(h) if tensorfs_core::ids::hex64("argument", h).is_ok() => h.to_string(),
+            _ => t,
+        })
+        .collect()
+}
+
 fn main() -> ExitCode {
     let (args, flags) = split_flags(std::env::args().skip(1).collect());
+    let args = accept_printed_ids(args);
     let a: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
     match a.as_slice() {
         ["store", "init", r] => cmd_store(Path::new(r), "init"),

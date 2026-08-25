@@ -1,4 +1,4 @@
 doc: capability
 expect: ok
-id: sha256:baad5985eb76bc2d010420285cf4ed1759c049953a4026c1f035d76c963ecd01
+id: sha256:1048303c20e4c5944b1f39d5eb3e60ba301ca0eba63b2a97c3b35e095fb60689
 note: one qualified (encoding, device) pair per vectored spec; every other pair refuses
