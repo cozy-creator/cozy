@@ -43,7 +43,7 @@ type Generation struct {
 	LinkMode     string // "hardlink" | "copy" (cross-mount degradation)
 	Packages     int
 	Closure      string // one "name==version" per line
-	Descriptor   string // "pending-cr-003" until the runtime's describe exists
+	Descriptor   string // surface_digest, checked in this generation's own venv
 	BytesExcl    int64
 	BytesShared  int64
 	CreatedAt    string

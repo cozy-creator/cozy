@@ -96,8 +96,6 @@ func handleInstall(ctx *Context) *exit.Error {
 			"the superseded generation is untouched on disk until `cozy gc` reclaims it")
 	}
 	rec.Notes = append(rec.Notes, res.Warnings...)
-	rec.Notes = append(rec.Notes,
-		"descriptor verification is a pending stage until cozy-runtime's describe exists (cr-003/cr-016)")
 	rec.Next = []string{"cozy ls"}
 	return emit(ctx, rec)
 }

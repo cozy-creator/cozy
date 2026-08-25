@@ -42,8 +42,12 @@ declare; the declaration is the archive's *first* entry, so an undeclared entry 
 before it is written. **verify** settles source identity before any code executes —
 `--digest` by default, `--allow-unsigned` the development door, `--dir` the editable
 trust path with a source-snapshot digest. **venv** runs `uv sync --locked`: no resolve,
-no relaxed fallback, no lock rewrite. **descriptor** is a labelled pending seam
-(`pending-cr-003`) — nothing is faked. **activate** inserts the generation row and swaps
+no relaxed fallback, no lock rewrite. **descriptor** runs `cozy-runtime describe --check`
+in the generation's own venv (cr-003): the release's own runtime derives its surface
+without loading weights and compares it against the committed `endpoint.descriptor.json`,
+so a descriptor that disagrees with the code refuses the install (exit 13, naming which
+pair diverged) and a passing check records its `surface_digest`. There is no door.
+**activate** inserts the generation row and swaps
 the pin in ONE transaction, so a kill at any earlier stage leaves the prior pin runnable.
 
 Hardlink dedup is uv's link mode, not a second pool; it degrades to copies with a loud

@@ -8,8 +8,10 @@ package install
 import (
 	"crypto/rand"
 	"encoding/hex"
+	"encoding/json"
 	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"syscall"
@@ -23,10 +25,6 @@ import (
 // Stages, in order. `--crash-after <stage>` kills the process after the named one;
 // that is how the crash matrix is observed on the real binary.
 var Stages = []string{"stage", "verify", "venv", "descriptor", "activate"}
-
-// DescriptorPending is what the environment record carries until the runtime can
-// derive a descriptor. cr-003 defines the descriptor; cr-016 lands the verb.
-const DescriptorPending = "pending-cr-003"
 
 type Request struct {
 	Ref           Ref
@@ -170,7 +168,8 @@ func Run(l home.Layout, st *records.Store, req Request) (*Result, *exit.Error) {
 	}
 
 	// ---- venv: the first code-executing step, on verified source only ----
-	env, err := BuildVenv(sourceDir, filepath.Join(genDir, "venv"))
+	venvDir := filepath.Join(genDir, "venv")
+	env, err := BuildVenv(sourceDir, venvDir)
 	if err != nil {
 		return guard(err)
 	}
@@ -182,8 +181,12 @@ func Run(l home.Layout, st *records.Store, req Request) (*Result, *exit.Error) {
 		return guard(err)
 	}
 
-	// ---- descriptor: a typed, labelled pending stage (see deriveDescriptor) ----
-	gen.Descriptor = deriveDescriptor()
+	// ---- descriptor: the release's OWN runtime checks its OWN committed surface ----
+	digest, e := deriveDescriptor(venvDir, sourceDir)
+	if e != nil {
+		return guard(e)
+	}
+	gen.Descriptor = digest
 	if err := mark("descriptor"); err != nil {
 		return guard(err)
 	}
@@ -203,15 +206,70 @@ func Run(l home.Layout, st *records.Store, req Request) (*Result, *exit.Error) {
 	return res, nil
 }
 
-// deriveDescriptor is the descriptor stage's seam, deliberately pending.
-//
-// When cr-016 lands, this stage runs `cozy-runtime describe --write-descriptor` in
-// the generation's own venv and compares the derived descriptor against the
-// release's declared descriptor evidence, refusing typed on disagreement. Until
-// cr-003 defines that descriptor there is nothing to derive and nothing to compare,
-// so the stage records the pending marker and refuses nothing. A fabricated
-// descriptor would be worse than an honest gap.
-func deriveDescriptor() string { return DescriptorPending }
+// deriveDescriptor runs `cozy-runtime describe --check` in the generation's OWN venv
+// over the generation's OWN source (cr-003). The runtime imports the app, derives the
+// surface without loading weights, and compares it against the committed
+// endpoint.descriptor.json: `--check` IS the comparison, so nothing is re-derived or
+// re-compared here. Exit 0 hands back the `surface_digest` the release's own runtime
+// vouched for, and the install records it; 13 and 3 are its typed refusals, passed
+// through with the runtime's own words. No door widens either one — a descriptor that
+// disagrees with the code that built the venv refuses the install.
+func deriveDescriptor(venvDir, sourceDir string) (string, *exit.Error) {
+	bin := filepath.Join(venvDir, "bin", "cozy-runtime")
+	if _, err := os.Stat(bin); err != nil {
+		return "", exit.Named(exit.Structural, "runtime_missing",
+			"this generation's venv provides no cozy-runtime at %s", bin).
+			WithRemedy("an endpoint depends on cozy-runtime; its surface is described by the runtime the release itself pinned, never this host's").
+			WithNext("cozy help install")
+	}
+	cmd := exec.Command(bin, "--json", "--dir", sourceDir, "describe", "--check")
+	cmd.Env = append(os.Environ(), "NO_COLOR=1")
+	var stdout, stderr strings.Builder
+	cmd.Stdout, cmd.Stderr = &stdout, &stderr
+	err := cmd.Run()
+	if cmd.ProcessState == nil {
+		return "", exit.Internalf("cannot run %s: %s", bin, err)
+	}
+	if code := cmd.ProcessState.ExitCode(); code != 0 {
+		return "", describeRefusal(code, stderr.String())
+	}
+	var doc struct {
+		Digest string `json:"surface_digest"`
+	}
+	if json.Unmarshal([]byte(stdout.String()), &doc) != nil || doc.Digest == "" {
+		return "", exit.Internalf(
+			"`cozy-runtime describe --check` passed but named no surface_digest: %s", condense(stdout.String()))
+	}
+	return doc.Digest, nil
+}
+
+// describeRefusal renders the runtime's typed refusal as this install's refusal: its
+// code, its name, its words. 13 = the committed descriptor and the built surface
+// diverge (the runtime names which pair); 3 = the surface itself is invalid.
+func describeRefusal(code int, stderr string) *exit.Error {
+	var doc struct {
+		Error struct{ Name, Message, Remedy string } `json:"error"`
+	}
+	c := exit.Code(code)
+	if !c.Valid() {
+		c = exit.Internal
+	}
+	name := "descriptor_refused"
+	switch c {
+	case exit.Conflict:
+		name = "descriptor_stale"
+	case exit.Validation:
+		name = "descriptor_invalid"
+	}
+	if json.Unmarshal([]byte(stderr), &doc) != nil || doc.Error.Message == "" {
+		return exit.Named(c, name,
+			"`cozy-runtime describe --check` refused this generation (exit %d)", code).
+			WithRemedy("%s", condense(stderr))
+	}
+	return exit.Named(c, name, "%s", doc.Error.Message).
+		WithRemedy("%s", doc.Error.Remedy).
+		WithNext("cozy help install")
+}
 
 // verifySource settles source identity before any build backend or import can run.
 func verifySource(gen *records.Generation, req Request, warn *[]string) *exit.Error {
