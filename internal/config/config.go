@@ -52,6 +52,11 @@ type Config struct {
 	HubURLSource   string
 	HubTokenSource string
 
+	// Tfs is the tensorfs CLI this binary asks every byte-plane question of (COZY_TFS).
+	// cozy-creator owns no byte plane (boundaries.md); it coordinates one.
+	Tfs       string
+	TfsSource string
+
 	inherited []string // the allowlisted snapshot, captured at Load
 }
 
@@ -64,7 +69,12 @@ func Load() (Config, *exit.Error) {
 		return frozen, nil
 	}
 	c := Config{Port: 2699, Yield: "smart",
-		HubURL: DefaultHubURL, HubURLSource: "default", HubTokenSource: "unset"}
+		HubURL: DefaultHubURL, HubURLSource: "default", HubTokenSource: "unset",
+		Tfs: "tfs", TfsSource: "default"}
+
+	if v := strings.TrimSpace(os.Getenv("COZY_TFS")); v != "" {
+		c.Tfs, c.TfsSource = v, "env"
+	}
 
 	if v := strings.TrimSpace(os.Getenv("TENSORHUB_URL")); v != "" {
 		c.HubURL, c.HubURLSource = strings.TrimRight(v, "/"), "env"

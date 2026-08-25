@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Boundary fence (boundaries.md). Architecture enforcement, not a test.
 
-Eight families:
+Eleven families:
   deps      forbidden dependencies (raw lines, incl. import paths and go.mod)
   impl      storage/chunk/loader/residency/tensor implementation vocabulary — cozy-creator
             renders and coordinates, it never implements the byte plane (TensorFS owns it)
@@ -22,6 +22,13 @@ Eight families:
   cloud     (cl-001) no Tensorhub implementation and no cloud policy here: cozy-creator
             shares schemas and the client contract, and emulates nothing. Local grants are
             a CAS root plus an output dir; a minted bearer/JWT token would be a fake.
+  cas       (cl-012) the TRANSFER plane hashes nothing and nobody composes a store path.
+            A digest computed while moving bytes could only become a client receipt, and a
+            client receipt substitutes for nothing (law 18); a hand-built
+            `objects/sha256/…` path would be a second spelling of TensorFS's own layout.
+  tensor    (cl-012) the tensorfs CLI has ONE caller: internal/tfs. The configured binary
+            is read there and in the config authority, nowhere else — a second package
+            shelling out to `tfs` is a second byte-plane door with its own vocabulary.
 
 Identifier families scan Go source with comments and string literals removed, so a
 word inside help text or a doc comment is never a violation. Doors, both greppable:
@@ -70,6 +77,22 @@ REVEAL_SITES = {"internal/secret/secret.go", "internal/hub/hub.go"}
 
 ALLOW_DOOR = "//cozy:allow"
 STDIN_DOOR = "//cozy:stdin-value"
+
+# (cl-012) The TRANSFER plane hashes nothing. Elsewhere cozy-creator legitimately
+# digests its own subjects (a release archive, an execution spec, a credential), but a
+# hash computed while moving canonical bytes could only become a client-side receipt —
+# and a client receipt never substitutes for the hub's or the store's own proof
+# (README law 18). The temptation lives exactly here, so the fence does too.
+DIGEST_FREE = ["internal/transfer/", "internal/tfs/", "internal/hub/"]
+DENY_DIGEST = ["sha256.New", "sha256.Sum256", "sha512.New", "sha1.New", "md5.New"]
+
+# (cl-012) The CAS layout is TensorFS's. A path composed here would drift from it the
+# first time either side changed, and the drift would present as a corrupt store.
+CAS_PATH = re.compile(r'objects\s*[/",\s]+\s*sha256', re.I)
+
+# (cl-012) The ONE caller of the tensorfs CLI.
+TFS_SITES = {"internal/config/config.go", "internal/tfs/tfs.go"}
+TFS_FIELD = re.compile(r"\.Tfs\b")
 
 IDENT = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
 
@@ -125,6 +148,11 @@ def check_sources():
                 if d in s.lower():
                     bad.append(f"{p}:{i}: [store] lifecycle sidecar '{d}' — the one libSQL "
                                f"database is the authority: {s}")
+            # RAW, not stripped: a content key IS a string literal, so the identifier
+            # scan (which blanks literals) would never see one.
+            if CAS_PATH.search(s):
+                bad.append(f"{p}:{i}: [cas] a store path is composed here — TensorFS owns the "
+                           f"CAS layout, and `tfs get`/`tfs put` are how an object is reached: {s}")
         if p.suffix != ".go":
             continue
         for i, line in enumerate(strip_go(raw).splitlines(), 1):
@@ -151,7 +179,17 @@ def check_sources():
                     bad.append(f"{p}:{i}: [prompt] '{ident}' reads input — no cozy command may prompt: {line.strip()}")
                 if ident == "Stdin" and STDIN_DOOR not in src_line:
                     bad.append(f"{p}:{i}: [prompt] stdin read without the {STDIN_DOOR} door: {line.strip()}")
-            if str(p).replace("\\", "/") not in REVEAL_SITES and re.search(r"\.Reveal\s*\(", line):
+            rel = str(p).replace("\\", "/")
+            if any(rel.startswith(d) for d in DIGEST_FREE):
+                for call in DENY_DIGEST:
+                    if re.search(r"(?<![\w.])" + re.escape(call) + r"\s*\(", line):
+                        bad.append(f"{p}:{i}: [cas] '{call}' in the transfer plane — a digest computed "
+                                   f"while moving bytes is a client receipt, and a client receipt proves "
+                                   f"nothing (law 18): {line.strip()}")
+            if rel not in TFS_SITES and TFS_FIELD.search(line):
+                bad.append(f"{p}:{i}: [tensor] the tensorfs CLI is reached outside "
+                           f"{' / '.join(sorted(TFS_SITES))} — one byte-plane door, one vocabulary: {line.strip()}")
+            if rel not in REVEAL_SITES and re.search(r"\.Reveal\s*\(", line):
                 bad.append(f"{p}:{i}: [secret] Reveal() outside {' / '.join(sorted(REVEAL_SITES))} — a "
                            f"credential's raw value is read where it becomes a header, nowhere else: {line.strip()}")
     return bad
@@ -256,5 +294,6 @@ print(
     f"fence green — deps({len(DENY_DEPS)}) impl({len(DENY_IMPL)}) "
     f"prompt({len(DENY_PROMPT) + len(DENY_PROMPT_CALLS) + 1}) matrix(15 rows) "
     f"env({len(DENY_ENV_CALLS)}) store({len(DENY_STORE)}) cloud({len(DENY_CLOUD)}) "
-    f"manifest({RECLAIM_VERB.pattern}) secret({SECRET_FLAG.pattern} + Reveal@{len(REVEAL_SITES)})"
+    f"manifest({RECLAIM_VERB.pattern}) secret({SECRET_FLAG.pattern} + Reveal@{len(REVEAL_SITES)}) "
+    f"cas({len(DENY_DIGEST)} digests@{len(DIGEST_FREE)} + store-path) tensor(tfs@{len(TFS_SITES)})"
 )

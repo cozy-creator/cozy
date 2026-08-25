@@ -19,6 +19,14 @@ type Layout struct {
 	Service     string // the LocalService's liveness lock (cl-001; held, never read)
 	Workers     string // per-worker roots: journal, logs, staged binding plans
 	Outputs     string // the local output namespace the coordinator grants into
+	// CAS is the shared local tensorfs store: the one place canonical bytes live on
+	// this host. cozy-creator names it and never writes into it — every byte crosses
+	// through the tfs binary (cl-012).
+	CAS string
+	// Transfer is scratch for bytes in flight. It is not a journal: the CAS's own
+	// verification records are (a transfer resumes from what is VERIFIED, never from
+	// what happens to be lying in a temp directory).
+	Transfer string
 }
 
 func Open(root string) (Layout, *exit.Error) {
@@ -33,6 +41,8 @@ func Open(root string) (Layout, *exit.Error) {
 		Service:     filepath.Join(root, "service.lock"),
 		Workers:     filepath.Join(root, "workers"),
 		Outputs:     filepath.Join(root, "outputs"),
+		CAS:         filepath.Join(root, "cas"),
+		Transfer:    filepath.Join(root, "transfer"),
 	}
 	for _, dir := range []string{l.Generations, l.Workers, l.Outputs} {
 		if err := os.MkdirAll(dir, 0o755); err != nil {

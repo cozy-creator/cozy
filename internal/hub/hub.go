@@ -38,6 +38,14 @@ const Timeout = 10 * time.Second
 // streams something enormous at us is a fault, not a listing.
 const maxBody = 4 << 20
 
+// maxDocument caps a canonical document read back verbatim (a snapshot manifest).
+// It is the hub's own declaration-document ceiling: a manifest larger than the hub
+// would accept cannot be one the hub installed.
+const maxDocument = 64 << 20
+
+// Transfer bounds one call whose work is proportional to the bytes it moves.
+const Transfer = 30 * time.Minute
+
 // Client is one configured hub endpoint. It holds no state between calls.
 type Client struct {
 	base   string
@@ -94,6 +102,24 @@ type call struct {
 	body   any
 	admin  bool   // carries the admin token
 	reason string // X-Tensorhub-Reason; the hub refuses a mutation without one
+	// timeout overrides Timeout for a call whose work is bounded by BYTES rather
+	// than by the hub's own latency (completion re-streams and re-hashes every
+	// declared object). A catalog read that is slow is broken; a completion that
+	// is slow is working.
+	timeout time.Duration
+	// raw takes the answer's exact bytes instead of decoding it. The snapshot
+	// manifest route answers a canonical document verbatim, and this client must
+	// carry it the same way — nothing here re-encodes one.
+	raw *[]byte
+}
+
+// WithToken returns a copy of the client carrying a credential supplied for this
+// invocation (`--token-stdin`) instead of the configured one. The value never
+// reaches argv, a record, or a log line — the secret fence keeps Reveal() here.
+func (c *Client) WithToken(v secret.Value, source string) *Client {
+	d := *c
+	d.token, d.source = v, source
+	return &d
 }
 
 // Health reads the hub's liveness. Public.
@@ -178,18 +204,32 @@ func (c *Client) do(ctx context.Context, cl call, out any) *exit.Error {
 		req.Header.Set("Authorization", "Bearer "+c.token.Reveal())
 	}
 
-	resp, err := c.http.Do(req)
+	client := c.http
+	if cl.timeout > 0 {
+		wider := *c.http
+		wider.Timeout = cl.timeout
+		client = &wider
+	}
+	resp, err := client.Do(req)
 	if err != nil {
 		return c.transport(err)
 	}
 	defer resp.Body.Close()
 
-	raw, err := io.ReadAll(io.LimitReader(resp.Body, maxBody))
+	cap := int64(maxBody)
+	if cl.raw != nil {
+		cap = maxDocument
+	}
+	raw, err := io.ReadAll(io.LimitReader(resp.Body, cap))
 	if err != nil {
 		return c.transport(err)
 	}
 	if resp.StatusCode >= 400 {
 		return c.refusal(resp.StatusCode, raw)
+	}
+	if cl.raw != nil {
+		*cl.raw = raw
+		return nil
 	}
 	if out != nil {
 		if err := json.Unmarshal(raw, out); err != nil {
@@ -333,4 +373,11 @@ func CheckKind(kind string) *exit.Error {
 // Context bounds one hub call. Handlers never build their own.
 func Context() (context.Context, context.CancelFunc) {
 	return context.WithTimeout(context.Background(), Timeout)
+}
+
+// LongContext bounds a whole transfer — many calls, some of them proportional to the
+// bytes moved. A catalog read that takes minutes is broken; a publish that does is
+// working, and one deadline cannot mean both.
+func LongContext() (context.Context, context.CancelFunc) {
+	return context.WithTimeout(context.Background(), Transfer)
 }

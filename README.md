@@ -56,7 +56,7 @@ walks the tree. `rm --yes` drops the pin and venv; `gc` is the plan without `--y
 executes with it, reclaiming only what nothing references.
 
 `--from <archive>` is the pre-hub source door standing in for the hub resolve (cl-011);
-`scripts/pack.py` is the pre-hub packager `cozy deploy` (cl-012) replaces.
+`scripts/pack.py` is the pre-hub packager an endpoint-release publish (th-003/th-004) replaces.
 
 ## The LocalService and LocalCoordinator (cl-001)
 
@@ -118,9 +118,57 @@ under a code from the shared exit matrix: 401/403 → 5, 404 → 4, 409 → 13, 
 5xx/unreachable → 9, no answer at all → 10. An answer that is not a typed envelope
 (an unknown route, a proxy, a login page) says so rather than being invented into one.
 
-Not built here, and named: upload sessions, grants and byte transfer (cl-012 over
-th-002), release/lane resolution and the `--lane` grammar (th-003), per-source
-credential rows for `hf`/`civitai`/`comfy` (cl-012's `pull`, on stdin — never argv).
+Not built here, and named: release/lane resolution and the `--lane` grammar (th-003),
+per-source credential rows for `hf`/`civitai`/`comfy` (they need a source that is not
+the hub, which arrives with cr-016's fetcher).
+
+## Transfer: push and pull (cl-012)
+
+Two verbs move a canonical checkpoint between the local store and the hub. Neither owns
+a byte or a protocol — `internal/tfs` is the ONE door to a byte-plane fact and
+`internal/hub` the ONE door to the hub — so `internal/transfer` owns only the SEQUENCE.
+
+**`cozy push <org/repo> <sha256:snapshot> --family <f> --reason <why>`** drives th-002's
+declare-first protocol: declare the exact object set before a byte moves → the hub
+answers what it lacks → write only those, straight to their FINAL content keys under
+every condition the grant signed → the hub streams each object back and hashes it
+ITSELF → complete runs the hermetic verifier and installs one root. A path refuses by
+name: only a canonical snapshot is publishable, and the border runs where the bytes are
+(`tfs ingest`). `--dry-run` declares and stops — the plan is the hub's answer, not a
+local guess.
+
+**`cozy pull <org/repo>[@sha256:…]`** is the inverse, and it needs no route that lists a
+checkpoint's objects, because the artifact declares itself: the manifest arrives first
+and is admitted only if it hashes to the id asked for; then everything the manifest
+names directly; then the transitive closure the byte plane computes from those
+documents. `tfs fill` admits every object under its declared identity, and the snapshot
+becomes a named local root only after `tfs snapshot verify` proves every declared byte
+— cl-009's transactional install with a different source.
+
+- **Resumability is not a feature, it is the absence of one.** There is no client-side
+  journal. A publish resumes because the hub re-plans a re-declared closure server-side
+  (`Begin` is idempotent on the closure digest); a fetch resumes because the store's own
+  verification records already say which objects are good. A third opinion about what is
+  done is always the wrong one.
+- **Accounting separates MOVED from DEDUPED** on every line, and an object is counted
+  once per run even though the fetch rounds overlap by construction.
+- **The transfer plane hashes nothing** (fence family `cas`). A digest computed while
+  moving bytes could only become a client receipt, and a client receipt substitutes for
+  nothing — the hub re-verifies every object it already held, and says how many.
+- `--token-stdin` takes this invocation's credential as a VALUE on stdin. It is not a
+  prompt and never argv.
+
+**`cozy pull` needs one hub route that does not exist.** th-002 landed the whole write
+side and no read side: the hub signs PUTs at final keys and streams objects back for its
+own verification, but exposes no route handing a client a presigned GET. Against such a
+hub `pull` refuses `hub.no_read_plane` by name rather than inventing a bucket URL or
+reaching storage with a credential of its own — a second custody authority is exactly
+what law 2 forbids. `scripts/xfer-live.py` supplies that one route (and nothing else) so
+the rest of the path can be proved on real bytes.
+
+`deploy` and `promote` stay advertised-not-built: releases arrive with th-003 (the hub's
+own promote route answers `promote.not_armed` today) and the leased build that turns a
+source snapshot into a release with th-004. `datasets push|pull` waits on th-035.
 
 ## Verification
 
@@ -137,9 +185,17 @@ No automated tests. Verification is running the real thing:
   refused by its own code), `arms` (the refusal matrix against `fakeworker`, a second
   independent Go implementation of the worker side), `attempt` and `recovered` (the real
   cozy-runtime supervisor + executor on a real GPU).
-- `scripts/fence.py` enforces nine families: forbidden deps, byte-plane vocabulary
+- `scripts/verify-cl012.sh` + `scripts/xfer-live.py` drive the real `cozy` against a
+  real tensorhub (built from a PINNED commit through a read-only `git archive`, because
+  that repo has a concurrent writer), its own Postgres container, real R2 under
+  `v2/cl-012/<run>/`, and real artifacts written by `tfs`: the publish round trip, the
+  0-byte dedup publish, an interrupted publish and an interrupted fetch each converging
+  on a re-run, the whole refusal matrix, and the benchmarks. Everything it writes to R2
+  is swept and the sweep is re-listed to prove it.
+- `scripts/fence.py` enforces eleven families: forbidden deps, byte-plane vocabulary
   (TensorFS owns storage/residency), interactive prompts, exit-matrix parity, a manifest
   lint, the env-read fence (one reader), no lifecycle sidecar, no cloud emulation or
-  minted credential, and the secret fence (no credential-shaped flag takes an argv
-  value; `Reveal()` only where the value becomes a header). Doors are greppable:
-  `//cozy:allow`, `//cozy:stdin-value`.
+  minted credential, the secret fence (no credential-shaped flag takes an argv value;
+  `Reveal()` only where the value becomes a header), the `cas` fence (the transfer plane
+  hashes nothing; nobody composes a store path) and the `tensor` fence (the tensorfs CLI
+  has one caller). Doors are greppable: `//cozy:allow`, `//cozy:stdin-value`.

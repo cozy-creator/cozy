@@ -21,6 +21,9 @@ var FoundationTokens = []string{
 	"terminal.transaction", // terminal accepted + output visible commit together
 	"catalog.public_reads", // hub catalog reads carry no credential
 	"hub.static_token",     // first-party writes carry ONE static admin token; no login act exists
+	"transfer.declare_first", // publish declares the whole object set before a byte moves
+	"transfer.resumable",     // an interrupted transfer resumes from verified state, not a local journal
+	"transfer.verified_cas",  // every fetched byte enters the local store under its declared identity
 }
 
 var yesFlag = Flag{Name: "--yes", Summary: "confirm and execute; there is no prompt anywhere"}
@@ -303,44 +306,55 @@ var Commands = []Command{
 	},
 
 	// ---- transfer (cl-012, cl-008) ----
+	// cl-012's two transfer verbs are records-plane acts, not process-plane ones:
+	// they move bytes between the local canonical store and the hub and never touch
+	// an endpoint process, so neither needs the LocalService (cl-009's D3 rule).
 	{
 		Path: []string{"pull"}, Group: "transfer",
-		Summary: "fetch checkpoints/adapters into the shared local CAS",
-		Args:    "<ref> …", MinArgs: 1, MaxArgs: -1,
+		Summary: "fetch a hub checkpoint into the shared local store — verified, resumable",
+		Args:    "<org/repo[@sha256:…]>", MinArgs: 1, MaxArgs: 1,
 		Flags: []Flag{
-			{Name: "--lane", Arg: "<label>", Summary: "lane"},
-			{Name: "--all-variants", Summary: "every admissible lane"},
 			{Name: "--dry-run", Summary: "print the plan without moving bytes"},
 			// cl-011's law, enforced by the `secret` fence family: a credential never
 			// rides argv. cozy-creator.md still spells this `--token <t>`; the doc is
 			// the drift, not this row.
-			{Name: "--token-stdin", Summary: "read this invocation's source credential from stdin (never argv)"},
+			{Name: "--token-stdin", Summary: "read this invocation's hub credential from stdin (never argv)"},
+			{Name: "--crash-after", Arg: "<n>", Summary: "development: stop after n objects (resume verification)"},
 		},
-		Exits:      []exit.Code{exit.OK, exit.NotFound, exit.Credential},
-		Capability: "cmd.pull", NeedsServer: true, Status: Planned, Issue: "cl-012",
+		Exits: []exit.Code{exit.OK, exit.Usage, exit.Validation, exit.NotFound, exit.Credential,
+			exit.Structural, exit.Unavailable, exit.Deadline},
+		Capability: "cmd.pull", Status: Implemented, Handler: "pull",
 	},
 	{
 		Path: []string{"push"}, Group: "transfer",
-		Summary: "declare-first upload of models, LoRAs and datasets",
-		Args:    "<org/repo> <path|local-ref> …", MinArgs: 2, MaxArgs: -1,
-		Flags:      []Flag{{Name: "--dry-run", Summary: "print the transfer plan"}},
-		Exits:      []exit.Code{exit.OK, exit.NotFound, exit.Credential},
-		Capability: "cmd.push", NeedsServer: true, Status: Planned, Issue: "cl-012",
+		Summary: "declare-first upload of a local canonical snapshot; only missing bytes move",
+		Args:    "<org/repo> <sha256:snapshot>", MinArgs: 2, MaxArgs: 2,
+		Flags: []Flag{
+			{Name: "--family", Arg: "<name>", Summary: "required; the hub locks a repo to one model family"},
+			{Name: "--reason", Arg: "<why>", Summary: "required; the hub records it durably before it acts"},
+			{Name: "--session", Arg: "<name>", Summary: "publish session name (default derived from the snapshot)"},
+			{Name: "--dry-run", Summary: "declare and stop: the hub's own transfer plan"},
+			{Name: "--token-stdin", Summary: "read this invocation's hub credential from stdin (never argv)"},
+			{Name: "--crash-after", Arg: "<n>", Summary: "development: stop after n objects (resume verification)"},
+		},
+		Exits: []exit.Code{exit.OK, exit.Usage, exit.Validation, exit.NotFound, exit.Credential,
+			exit.Structural, exit.Unavailable, exit.Deadline, exit.Failed, exit.Conflict},
+		Capability: "cmd.push", Status: Implemented, Handler: "push",
 	},
 	{
 		Path: []string{"datasets", "push"}, Group: "transfer",
-		Summary: "the dataset dialect of push",
+		Summary: "the dataset dialect of push — deferred: there is no datasets plane to push into",
 		Args:    "<path> <org/repo>", MinArgs: 2, MaxArgs: 2,
 		Exits:      []exit.Code{exit.OK, exit.NotFound, exit.Credential},
-		Capability: "cmd.datasets.push", NeedsServer: true, Status: Planned, Issue: "cl-012",
+		Capability: "cmd.datasets.push", Status: Planned, Issue: "th-035",
 	},
 	{
 		Path: []string{"datasets", "pull"}, Group: "transfer",
-		Summary: "the dataset dialect of pull; --out materializes a tree from the CAS",
+		Summary: "the dataset dialect of pull — deferred with the datasets plane",
 		Args:    "<org/repo[@release|@digest]>", MinArgs: 1, MaxArgs: 1,
 		Flags:      []Flag{{Name: "--out", Arg: "<dir>", Summary: "materialize here"}},
 		Exits:      []exit.Code{exit.OK, exit.NotFound, exit.Credential},
-		Capability: "cmd.datasets.pull", NeedsServer: true, Status: Planned, Issue: "cl-012",
+		Capability: "cmd.datasets.pull", Status: Planned, Issue: "th-035",
 	},
 	{
 		Path: []string{"export"}, Group: "transfer",
@@ -349,24 +363,30 @@ var Commands = []Command{
 		Exits:      []exit.Code{exit.OK, exit.NotFound, exit.Unavailable},
 		Capability: "cmd.export", NeedsServer: true, Status: Planned, Issue: "cl-008",
 	},
+	// `deploy` and `promote` publish and point at an ENDPOINT RELEASE. Neither
+	// referent exists yet: releases arrive with th-003 (the hub's own promote route
+	// refuses `promote.not_armed` by name today) and the leased build that turns a
+	// source snapshot into a release arrives with th-004. Advertised, not built —
+	// a clean-commit snapshot uploaded into a plane with no release to cut would be
+	// machinery with no consumer (law 13).
 	{
 		Path: []string{"deploy"}, Group: "transfer",
-		Summary: "publish a release: git manifest, declare digests, then follow the build",
+		Summary: "publish an endpoint release — deferred: there is no release plane to cut into",
 		MaxArgs: 0,
 		Flags: []Flag{
 			{Name: "--create", Summary: "required for the first publish of a new name"},
 			{Name: "--detach", Summary: "return after upload"},
 		},
 		Exits:      []exit.Code{exit.OK, exit.NotFound, exit.Credential, exit.Failed},
-		Capability: "cmd.deploy", Status: Planned, Issue: "cl-012",
+		Capability: "cmd.deploy", Status: Planned, Issue: "th-003",
 	},
 	{
 		Path: []string{"promote"}, Group: "transfer",
-		Summary: "move the serving pointer; rollback is promote with an older release",
+		Summary: "move the serving pointer — deferred: the hub refuses promote.not_armed until releases exist",
 		Args:    "<org/endpoint> <release-id>", MinArgs: 2, MaxArgs: 2,
 		Flags:      []Flag{{Name: "--serve", Arg: "<major>", Summary: "required; no default"}},
 		Exits:      []exit.Code{exit.OK, exit.Usage, exit.NotFound, exit.Credential},
-		Capability: "cmd.promote", Status: Planned, Issue: "cl-012",
+		Capability: "cmd.promote", Status: Planned, Issue: "th-003",
 	},
 
 	// ---- account (th-031, Wave 2) ----
