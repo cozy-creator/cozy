@@ -19,7 +19,9 @@ import (
 var (
 	tag             = "0.0.0-dev"
 	commit          = ""
-	protocolVersion = "pending-th-024" // worker protocol semver — lands with th-024
+	// The published worker protocol (worker-protocol-v2, th-024). Asserted here as a
+	// constant; the binding link to a running worker arrives with cl-001.
+	protocolVersion = "cozy.worker.v1 (wire_minor 0)"
 	contractVersion = "pending-cl-006" // local client API contract — lands with cl-006
 )
 
@@ -31,6 +33,10 @@ var handlers = map[string]Handler{
 	"capabilities": handleCapabilities,
 	"commands":     handleCommands,
 	"help":         handleHelp,
+	"install":      handleInstall,
+	"ls":           handleLs,
+	"rm":           handleRm,
+	"gc":           handleGC,
 }
 
 func handlerNames() []string {

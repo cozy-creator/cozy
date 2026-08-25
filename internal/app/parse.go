@@ -22,6 +22,15 @@ type Invocation struct {
 
 func (i *Invocation) Bool(name string) bool { return i.Bools[name] }
 
+// Value is the last value given for a value-taking flag, or "".
+func (i *Invocation) Value(name string) string {
+	v := i.Values[name]
+	if len(v) == 0 {
+		return ""
+	}
+	return v[len(v)-1]
+}
+
 // prescanJSON finds --json before parsing so even a parse refusal renders in the
 // mode the caller asked for.
 func prescanJSON(args []string) bool {

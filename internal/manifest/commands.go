@@ -9,9 +9,12 @@ var FoundationTokens = []string{
 	"cli.noninteractive",  // no interactive prompt anywhere; --yes gates destructive acts
 	"errors.typed",        // error(<name>) + remedy + next:
 	"exit.matrix.v1",      // the shared cozy-runtime exit matrix, 0-14
+	"install.generations", // installs are immutable generations + a pin per (endpoint, major)
+	"install.transaction", // generation insert and pin activation commit together
 	"output.fields",       // --fields
 	"output.full",         // --full
 	"output.json",         // --json
+	"records.libsql",      // ONE local Turso/libSQL lifecycle database
 }
 
 var yesFlag = Flag{Name: "--yes", Summary: "confirm a destructive act (no prompt exists)"}
@@ -85,36 +88,39 @@ var Commands = []Command{
 		Summary: "resolve, verify, build and pin an endpoint as an immutable generation",
 		Args:    "<org/endpoint[@vN]>", MinArgs: 1, MaxArgs: 1,
 		Flags: []Flag{
+			{Name: "--from", Arg: "<archive.tar.gz>", Summary: "a local release archive (the pre-hub source door; cl-011 resolves releases instead)"},
+			{Name: "--digest", Arg: "<sha256:…>", Summary: "the source digest the release declares — verified before anything executes"},
 			{Name: "--prefetch", Summary: "eagerly pull weights"},
 			{Name: "--all-variants", Summary: "with --prefetch, pull every admissible lane"},
 			{Name: "--force", Summary: "build a new generation and swap the pin"},
 			{Name: "--allow-unsigned", Summary: "development-only door past source verification"},
+			{Name: "--crash-after", Arg: "<stage>", Summary: "development: SIGKILL after stage|verify|venv|descriptor|activate (crash-matrix verification)"},
 		},
-		Exits:       []exit.Code{exit.OK, exit.NotFound, exit.Credential, exit.Structural, exit.Conflict, exit.Capacity},
-		Capability:  "cmd.install", NeedsServer: true, Status: Planned, Issue: "cl-009",
+		Exits:      []exit.Code{exit.OK, exit.Usage, exit.Validation, exit.NotFound, exit.Credential, exit.Structural, exit.Conflict, exit.Capacity},
+		Capability: "cmd.install", Status: Implemented, Handler: "install",
 	},
 	{
 		Path: []string{"ls"}, Group: "endpoints",
-		Summary: "installed endpoints: pin, state, disk (read from the install record)",
+		Summary: "installed endpoints: pin, version, disk (read from the install record)",
 		MaxArgs: 0,
-		Exits:   []exit.Code{exit.OK},
-		Capability: "cmd.ls", NeedsServer: true, Status: Planned, Issue: "cl-009",
+		Exits:   []exit.Code{exit.OK, exit.Usage},
+		Capability: "cmd.ls", Status: Implemented, Handler: "ls",
 	},
 	{
 		Path: []string{"rm"}, Group: "endpoints",
-		Summary: "remove an install (venv + pin + records); CAS weights stay until gc",
-		Args:    "<org/endpoint>", MinArgs: 1, MaxArgs: -1,
+		Summary: "remove an install (venv + pin); the generation record stays until gc",
+		Args:    "<org/endpoint[@vN]> …", MinArgs: 1, MaxArgs: -1,
 		Flags:   []Flag{yesFlag},
-		Exits:   []exit.Code{exit.OK, exit.Confirm},
-		Capability: "cmd.rm", Destructive: true, NeedsServer: true, Status: Planned, Issue: "cl-009",
+		Exits:   []exit.Code{exit.OK, exit.Usage, exit.Confirm, exit.Conflict},
+		Capability: "cmd.rm", Destructive: true, Status: Implemented, Handler: "rm",
 	},
 	{
 		Path: []string{"gc"}, Group: "endpoints",
 		Summary: "without --yes the reclaim plan (a read); with --yes it executes",
 		Flags:   []Flag{yesFlag},
 		MaxArgs: 0,
-		Exits:   []exit.Code{exit.OK},
-		Capability: "cmd.gc", NeedsServer: true, Status: Planned, Issue: "cl-009",
+		Exits:   []exit.Code{exit.OK, exit.Conflict},
+		Capability: "cmd.gc", PlanFirst: true, Status: Implemented, Handler: "gc",
 	},
 	{
 		Path: []string{"start"}, Group: "endpoints",

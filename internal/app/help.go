@@ -44,6 +44,9 @@ func renderHelp(ctx *Context, c *manifest.Command) *exit.Error {
 	if c.Destructive {
 		fmt.Fprintln(w, "destructive: refuses without --yes (exit 7) — no prompt exists")
 	}
+	if c.PlanFirst {
+		fmt.Fprintln(w, "plan-first: without --yes it prints the plan and exits 0; --yes executes it")
+	}
 	if c.NeedsServer {
 		fmt.Fprintln(w, "requires: the LocalService (exit 9 while it is down)")
 	}

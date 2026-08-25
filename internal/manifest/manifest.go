@@ -38,6 +38,7 @@ type Command struct {
 	Exits       []exit.Code
 	Capability  string
 	Destructive bool // refuses without --yes (exit 7)
+	PlanFirst   bool // carries --yes but is NOT destructive: bare it prints the plan, exit 0
 	NeedsServer bool // refuses with unavailable (exit 9) while the LocalService is down
 	Terminals   bool // help renders the job terminal mapping
 	Status      Status
@@ -101,6 +102,15 @@ func Suggest(word string) []string {
 		out = out[:3]
 	}
 	return out
+}
+
+func hasYes(c *Command) bool {
+	for _, f := range c.Flags {
+		if f.Name == "--yes" {
+			return true
+		}
+	}
+	return false
 }
 
 func containsStr(s []string, v string) bool {
@@ -175,6 +185,15 @@ func SelfCheck(handlers []string) *exit.Error {
 			if !e.Valid() {
 				problems = append(problems, fmt.Sprintf("%q advertises exit %d, outside the shared matrix", name, int(e)))
 			}
+		}
+		// A --yes row is either destructive (exit 7 without it) or plan-first
+		// (a read without it) — never both, never neither, never silent.
+		if hasYes(c) && c.Destructive == c.PlanFirst {
+			problems = append(problems, fmt.Sprintf(
+				"%q takes --yes but is neither Destructive nor PlanFirst (exactly one)", name))
+		}
+		if c.Destructive && !hasYes(c) {
+			problems = append(problems, fmt.Sprintf("%q is destructive but advertises no --yes flag", name))
 		}
 		switch c.Status {
 		case Implemented:

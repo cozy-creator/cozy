@@ -1,12 +1,15 @@
 #!/usr/bin/env python3
 """Boundary fence (boundaries.md). Architecture enforcement, not a test.
 
-Four families:
+Five families:
   deps      forbidden dependencies (raw lines, incl. import paths and go.mod)
   impl      storage/chunk/loader/residency/tensor implementation vocabulary — cozy-creator
             renders and coordinates, it never implements the byte plane (TensorFS owns it)
   prompt    interactive prompts: no cozy command may ever ask a question (AXI)
   matrix    internal/exit/exit.go must equal docs/exit-matrix.md row for row
+  manifest  a reclaiming/removing verb must DECLARE its gate: Destructive (exit 7 without
+            --yes) or PlanFirst (a read without --yes) — exactly one, and it must
+            advertise --yes. Nothing removes bytes on a bare invocation.
 
 Identifier families scan Go source with comments and string literals removed, so a
 word inside help text or a doc comment is never a violation. Doors, both greppable:
@@ -24,12 +27,15 @@ DENY_IMPL = [
     "mmap", "dtype", "quantiz", "gguf", "loadtensor", "weightbytes", "pagein",
 ]
 
-# Exact identifiers: stdlib input readers and prompt-library qualifiers. Import paths
+# Prompt-library qualifiers and password readers, as bare identifiers. Import paths
 # are string literals and are stripped, so a prompt library shows up as its qualifier.
-DENY_PROMPT = {
-    "Scan", "Scanln", "Scanf", "Fscan", "Fscanln", "Fscanf", "ReadPassword",
-    "readline", "promptui", "survey",
-}
+DENY_PROMPT = {"ReadPassword", "readline", "promptui", "survey"}
+
+# fmt's scanners, QUALIFIED: `Scan` alone is also database/sql and bufio, neither of
+# which reads a terminal. A scanner pointed at stdin is caught by the Stdin rule.
+DENY_PROMPT_CALLS = [
+    "fmt.Scan", "fmt.Scanln", "fmt.Scanf", "fmt.Fscan", "fmt.Fscanln", "fmt.Fscanf",
+]
 
 ALLOW_DOOR = "//cozy:allow"
 STDIN_DOOR = "//cozy:stdin-value"
@@ -94,11 +100,47 @@ def check_sources():
                 for d in DENY_IMPL:
                     if d in low:
                         bad.append(f"{p}:{i}: [impl] byte-plane vocabulary '{d}' — TensorFS owns it: {line.strip()}")
+            for call in DENY_PROMPT_CALLS:
+                if re.search(r"(?<![\w.])" + re.escape(call) + r"\s*\(", line):
+                    bad.append(f"{p}:{i}: [prompt] '{call}' reads input — no cozy command may prompt: {line.strip()}")
             for ident in idents:
                 if ident in DENY_PROMPT:
                     bad.append(f"{p}:{i}: [prompt] '{ident}' reads input — no cozy command may prompt: {line.strip()}")
                 if ident == "Stdin" and STDIN_DOOR not in src_line:
                     bad.append(f"{p}:{i}: [prompt] stdin read without the {STDIN_DOOR} door: {line.strip()}")
+    return bad
+
+
+# A verb whose name reclaims or removes must declare how it is gated.
+RECLAIM_VERB = re.compile(r"\b(rm|gc|purge|delete|destroy|prune|reset|clean)\b")
+
+
+def check_manifest():
+    src_path = pathlib.Path("internal/manifest/commands.go")
+    if not src_path.exists():
+        return ["[manifest] missing internal/manifest/commands.go"]
+    blocks = src_path.read_text().split("\n\t{\n")[1:]
+    bad, rows = [], 0
+    for block in blocks:
+        body = block.split("\n\t},")[0]
+        m = re.search(r"Path:\s*\[\]string\{([^}]*)\}", body)
+        if not m:
+            continue
+        rows += 1
+        name = " ".join(re.findall(r'"([^"]+)"', m.group(1)))
+        destructive = "Destructive: true" in body
+        plan_first = "PlanFirst: true" in body
+        has_yes = "yesFlag" in body or '"--yes"' in body
+        if RECLAIM_VERB.search(name) and not (destructive or plan_first):
+            bad.append(f"[manifest] '{name}' reclaims or removes but declares neither "
+                       "Destructive nor PlanFirst — a bare invocation would mutate silently")
+        if has_yes and destructive == plan_first:
+            bad.append(f"[manifest] '{name}' takes --yes but is {'both' if destructive else 'neither'} "
+                       "Destructive and PlanFirst — exactly one")
+        if (destructive or plan_first) and not has_yes:
+            bad.append(f"[manifest] '{name}' is gated on --yes but advertises no --yes flag")
+    if not rows:
+        return ["[manifest] no command rows parsed out of commands.go"]
     return bad
 
 
@@ -141,7 +183,7 @@ def check_matrix():
     return bad
 
 
-violations = check_sources() + check_matrix()
+violations = check_sources() + check_matrix() + check_manifest()
 if violations:
     print("FENCE RED (boundaries.md):", file=sys.stderr)
     for v in violations:
@@ -149,5 +191,6 @@ if violations:
     sys.exit(1)
 print(
     f"fence green — deps({len(DENY_DEPS)}) impl({len(DENY_IMPL)}) "
-    f"prompt({len(DENY_PROMPT) + 1}) matrix(15 rows)"
+    f"prompt({len(DENY_PROMPT) + len(DENY_PROMPT_CALLS) + 1}) matrix(15 rows) "
+    f"manifest({RECLAIM_VERB.pattern})"
 )
