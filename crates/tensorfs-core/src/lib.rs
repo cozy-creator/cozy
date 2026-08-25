@@ -10,6 +10,7 @@ pub mod checkpoint;
 pub mod dtype;
 pub mod err;
 pub mod fill;
+pub mod gc;
 pub mod header;
 pub mod ids;
 pub mod ingest;

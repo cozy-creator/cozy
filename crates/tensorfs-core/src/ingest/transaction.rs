@@ -169,8 +169,13 @@ pub fn reap(store_root: &Path, now: u64) -> Result<(Vec<String>, Vec<String>)> {
     Ok((gone, kept))
 }
 
-/// The coordinator's act, and the ONLY writer of `roots/`. The receipt must bind the exact
-/// triple it is presented with, the snapshot must walk, and the root must not have expired.
+/// The coordinator's act. The receipt must bind the exact triple it is presented with, the
+/// snapshot must walk, and the root must not have expired.
+///
+/// The root itself goes into the METADATA AUTHORITY (tfs-006), which is the only thing that
+/// pins anything. `roots/<hex>.json` beside it is a human-readable RENDERING with zero
+/// authority: GC never reads it, and deleting or forging one changes nothing about what is
+/// collected or served.
 pub fn install(
     store: &Store,
     session: &str,
@@ -193,11 +198,45 @@ pub fn install(
     receipt.binds(subject, snap, header)?;
     let walk = ck::walk(store, snap)?;
     let id = snap.checkpoint_id()?;
+    let hex_id = id.strip_prefix("sha256:").unwrap_or(&id).to_string();
+
+    // The pin, in one transaction against the sole authority. `source_url` is recorded as
+    // PROVENANCE and never as durability: a snapshot arriving from a URL is not evictable
+    // until a hub publication says its bytes can be got back.
+    let meta = crate::meta::Meta::open(store)?;
+    let mut t = meta.txn()?;
+    // No source URL yet: the per-source FETCH legs are deferred (tfs-003 divergence 4), so
+    // nothing here has one to record. The column exists because pressure eviction reads it,
+    // and an empty one is the honest state — never a claim of local origin.
+    t.note_snapshot(&hex_id, false, "")?;
+    // The root pins its EVIDENCE too. Everything below binds TO the checkpoint rather than
+    // being referenced BY it, so nothing else can keep it alive: without this the first
+    // complete mark collects the receipt that proves this artifact was verified.
+    let mut evidence = vec![
+        receipt.object_ref().sha256.clone(),
+        subject.object_ref().sha256.clone(),
+        subject.profile.sha256.clone(),
+    ];
+    if let Ok(p) = super::IngestProfile::parse(&ck::read_object(
+        store,
+        &subject.profile,
+        limits::SPEC_MAX_BYTES,
+    )?) {
+        evidence.push(p.converter_recipe.sha256.clone());
+    }
+    t.register_root(
+        &format!("ingest.{session}"),
+        &hex_id,
+        "ingest",
+        None,
+        &evidence,
+    )?;
+    t.commit()?;
+
     let dir = installed_dir(store.root());
     fs::create_dir_all(&dir).map_err(|e| io("mkdir roots", e))?;
-    let hex = id.strip_prefix("sha256:").unwrap_or(&id);
     fs::write(
-        dir.join(format!("{hex}.json")),
+        dir.join(format!("{hex_id}.json")),
         crate::canon::write(&Value::obj(vec![
             ("checkpoint", Value::str(id.clone())),
             ("header", header.object_ref().to_value()),
@@ -213,17 +252,15 @@ pub fn install(
     Ok(id)
 }
 
-/// Installed checkpoints — the VISIBLE set. A crash mid-ingest must leave this unchanged.
-pub fn installed(store_root: &Path) -> Vec<String> {
-    let mut out = Vec::new();
-    if let Ok(rd) = fs::read_dir(installed_dir(store_root)) {
-        for e in rd.flatten() {
-            if let Some(n) = e.file_name().to_string_lossy().strip_suffix(".json") {
-                out.push(n.to_string());
-            }
-        }
-    }
+/// Installed checkpoints — the VISIBLE set, read from the AUTHORITY rather than from the
+/// rendering beside it. A crash mid-ingest must leave this unchanged.
+pub fn installed(store: &Store) -> Vec<String> {
+    let mut out: Vec<String> = match crate::meta::Meta::open(store).and_then(|m| m.read()) {
+        Ok(s) => s.roots.iter().map(|r| r.snapshot.clone()).collect(),
+        Err(_) => Vec::new(),
+    };
     out.sort();
+    out.dedup();
     out
 }
 

@@ -1,0 +1,1 @@
+{"build":"0.0.1","degraded":"something-else-happened","detail":"an open-ended degradation is not a receipt","device":"host","format":"tensorfs.operation_receipt/1","generation":9,"op":"read_fill","snapshot":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}

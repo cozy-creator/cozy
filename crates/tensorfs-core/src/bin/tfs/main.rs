@@ -78,6 +78,18 @@
 //!   tfs project <root> <snap> <dest>         tier 2: relative-symlink tree, no weight paths
 //!   tfs materialize <root> <file> <dest>     tier 3: stream a RETAINED carrier blob
 //!   tfs render <root> <hex>                  pretty PROJECTION of a canonical document
+//!
+//! Roots, holds and local GC (tfs-006). Flags: --kind <k> --expect-generation <n>
+//! --hub-published --source-url <u> --hold-secs <s> --ready <p> --limit <n> --dry-run
+//! --allow-empty --free <b> --reserve <b>
+//!
+//!   tfs root list|register|release|open <root> [name] [snap]
+//!   tfs root note <root> <snap> --hub-published    durability WITHOUT pinning
+//!   tfs root reconcile <root> <name>=<snap>...   the supervisor's binding set
+//!   tfs hold take|reap|steal <root> [snap|id]    owner-liveness holds
+//!   tfs gc mark|usage|sweep|reap|refs <root>     the census, the numbers, the cycle
+//!   tfs gc pressure <root> --free <b> --reserve <b>
+//!   tfs gc arms <root>                           the roots/GC red arms, planted live
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -182,6 +194,26 @@ fn main() -> ExitCode {
         ["project", r, h, d] => rd::cmd_project(Path::new(r), h, Path::new(d), &flags),
         ["materialize", r, f, d] => rd::cmd_materialize(Path::new(r), Path::new(f), Path::new(d)),
         ["render", r, h] => rd::cmd_render(Path::new(r), h),
+        ["root", v] => roots::cmd_root(Path::new(v), "list", &[], &flags),
+        ["root", "list", r] => roots::cmd_root(Path::new(r), "list", &[], &flags),
+        ["root", "register", r, n, h] => roots::cmd_root(Path::new(r), "register", &[n, h], &flags),
+        ["root", "note", r, h] => roots::cmd_root(Path::new(r), "note", &[h], &flags),
+        ["root", "release", r, n] => roots::cmd_root(Path::new(r), "release", &[n], &flags),
+        ["root", "open", r, n] => roots::cmd_root(Path::new(r), "open", &[n], &flags),
+        ["root", "reconcile", r, rest @ ..] => {
+            roots::cmd_root(Path::new(r), "reconcile", rest, &flags)
+        }
+        ["hold", "take", r] => roots::cmd_hold(Path::new(r), "take", &[], &flags),
+        ["hold", "take", r, h] => roots::cmd_hold(Path::new(r), "take", &[h], &flags),
+        ["hold", "reap", r] => roots::cmd_hold(Path::new(r), "reap", &[], &flags),
+        ["hold", "steal", r, i] => roots::cmd_hold(Path::new(r), "steal", &[i], &flags),
+        ["gc", "mark", r] => roots::cmd_gc(Path::new(r), "mark", &flags),
+        ["gc", "usage", r] => roots::cmd_gc(Path::new(r), "usage", &flags),
+        ["gc", "sweep", r] => roots::cmd_gc(Path::new(r), "sweep", &flags),
+        ["gc", "reap", r] => roots::cmd_gc(Path::new(r), "reap", &flags),
+        ["gc", "refs", r] => roots::cmd_gc(Path::new(r), "refs", &flags),
+        ["gc", "pressure", r] => roots::cmd_gc(Path::new(r), "pressure", &flags),
+        ["gc", "arms", r] => roots::cmd_arms(Path::new(r)),
         ["registry"] => cmd_registry(),
         ["vectors", "gen"] => cmd_gen(&default_dir()),
         ["vectors", "gen", d] => cmd_gen(Path::new(d)),
@@ -251,6 +283,7 @@ mod ingest;
 mod conform;
 mod fixtures;
 mod rd;
+mod roots;
 mod snap;
 
 fn cmd_store(root: &Path, verb: &str) -> ExitCode {
@@ -2054,6 +2087,8 @@ fn meta_cases() -> Vec<Case> {
             snapshot: snap.clone(),
             kind: "binding".to_string(),
             created: 120,
+            // The ingest receipt this root pins beside the snapshot's transitive graph.
+            evidence: vec!["e".repeat(64)],
         }],
         holds: vec![HoldRow {
             id: "read-1-2".to_string(),
@@ -2150,6 +2185,21 @@ fn meta_cases() -> Vec<Case> {
         .on("host")
         .canonical_bytes(),
         "a fallback that changes performance or trust says so",
+    ));
+    out.push(red_case(
+        "meta-red",
+        "receipt-open-ended-kind",
+        "operation_receipt",
+        Receipt::new(
+            "read_fill",
+            "something-else-happened",
+            &snap,
+            9,
+            "an open-ended degradation is not a receipt".to_string(),
+        )
+        .canonical_bytes(),
+        "UNKNOWN_FIELD",
+        "a degradation outside the closed set — an unnamed fallback is not observable",
     ));
     out
 }

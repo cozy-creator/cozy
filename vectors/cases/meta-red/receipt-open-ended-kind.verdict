@@ -1,0 +1,4 @@
+doc: operation_receipt
+expect: refuse
+code: UNKNOWN_FIELD
+note: a degradation outside the closed set — an unnamed fallback is not observable

@@ -89,12 +89,20 @@ pub struct SnapshotRow {
 }
 
 /// A durable named pin: one per live binding, per workspace/pull.
+///
+/// `evidence` is the set of objects this root pins BESIDES its snapshot's transitive graph:
+/// the ingest receipt, subject, profile and converter declaration that attest how the
+/// checkpoint came to exist. They are found live by running the sweep on real ingested
+/// snapshots — every one of them was unrooted, so the first complete mark would have
+/// collected the provenance of the artifact it was protecting. A receipt nothing pins is
+/// garbage by construction.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RootRow {
     pub name: String,
     pub snapshot: String,
     pub kind: String,
     pub created: u64,
+    pub evidence: Vec<String>,
 }
 
 /// Process/request/fill/ingest liveness, including the lease-until-CUDA-event read hold.
@@ -195,17 +203,28 @@ impl Doc for State {
         for r in as_arr("State", "roots", f.req("roots")?)? {
             let mut rf = Fields::new("State.root", r)?;
             let created = rf.req_uint("created")?;
+            let mut evidence = Vec::new();
+            for e in as_arr("State.root", "evidence", rf.req("evidence")?)? {
+                evidence.push(hex64(
+                    "State.root.evidence",
+                    crate::canon::as_str("State.root", "evidence", e)?,
+                )?);
+            }
             let kind = rf.req_str("kind")?.to_string();
             let name = rf.req_str("name")?.to_string();
             let snapshot = hex64("State.root.snapshot", rf.req_str("snapshot")?)?;
             rf.done()?;
             ascii_name("State.root.name", &name, limits::MAX_NAME_BYTES)?;
             ascii_name("State.root.kind", &kind, limits::MAX_NAME_BYTES)?;
+            if evidence.len() > MAX_HOLD_OBJECTS {
+                return refuse(Code::COUNT_CAP, format!("root {name:?} pins too much evidence"));
+            }
             roots.push(RootRow {
                 name,
                 snapshot,
                 kind,
                 created,
+                evidence,
             });
         }
 
@@ -302,6 +321,12 @@ impl Doc for State {
                         .map(|r| {
                             Value::obj(vec![
                                 ("created", Value::uint(r.created)),
+                                (
+                                    "evidence",
+                                    Value::arr(
+                                        r.evidence.iter().map(|e| Value::str(e.clone())).collect(),
+                                    ),
+                                ),
                                 ("kind", Value::str(r.kind.clone())),
                                 ("name", Value::str(r.name.clone())),
                                 ("snapshot", Value::str(r.snapshot.clone())),
@@ -435,6 +460,18 @@ impl Txn<'_> {
     /// Commit: bump the generation, then fsync-rename the whole document. This rename is
     /// the visibility linearization point for every record kind at once.
     pub fn commit(mut self) -> Result<u64> {
+        self.write()
+    }
+
+    /// Write the document and KEEP the lock. This is what lets a GC claim become durable
+    /// before any byte is unlinked while still excluding every other writer: no root can be
+    /// registered between the claim and the deletion, so a new complete root can never
+    /// reference an object this sweep is taking.
+    pub fn checkpoint(&mut self) -> Result<u64> {
+        self.write()
+    }
+
+    fn write(&mut self) -> Result<u64> {
         self.state.generation += 1;
         self.state.normalize();
         let bytes = self.state.canonical_bytes();
@@ -463,6 +500,7 @@ impl Txn<'_> {
         snapshot: &str,
         kind: &str,
         expected: Option<u64>,
+        evidence: &[String],
     ) -> Result<()> {
         ascii_name("root name", name, limits::MAX_NAME_BYTES)?;
         ascii_name("root kind", kind, limits::MAX_NAME_BYTES)?;
@@ -478,18 +516,26 @@ impl Txn<'_> {
                 );
             }
         }
+        let mut evidence: Vec<String> = evidence.to_vec();
+        for e in &evidence {
+            hex64("root evidence", e)?;
+        }
+        evidence.sort();
+        evidence.dedup();
         let now = now_secs();
         match self.state.roots.iter_mut().find(|r| r.name == name) {
             Some(r) => {
                 r.snapshot = snapshot.to_string();
                 r.kind = kind.to_string();
                 r.created = now;
+                r.evidence = evidence;
             }
             None => self.state.roots.push(RootRow {
                 name: name.to_string(),
                 snapshot: snapshot.to_string(),
                 kind: kind.to_string(),
                 created: now,
+                evidence,
             }),
         }
         if self.state.snapshot(snapshot).is_none() {
@@ -551,7 +597,6 @@ impl Txn<'_> {
 pub struct Hold {
     pub row: HoldRow,
     lock: Option<File>,
-    dir: PathBuf,
     released: bool,
 }
 
@@ -605,7 +650,6 @@ impl Drop for Hold {
                  reaper; a caller that owns a device copy must release after its fence",
                 self.row.id, self.row.kind
             );
-            let _ = &self.dir;
         }
     }
 }
@@ -674,7 +718,6 @@ impl Meta {
         Ok(Hold {
             row,
             lock: Some(lock),
-            dir: self.dir.clone(),
             released: false,
         })
     }

@@ -40,10 +40,6 @@ pub struct ObjectRange {
 }
 
 impl ObjectRange {
-    pub fn whole(obj: ObjectRef) -> ObjectRange {
-        let len = obj.length;
-        ObjectRange { obj, off: 0, len }
-    }
     fn check(&self) -> Result<()> {
         let end = self.off.checked_add(self.len).ok_or(Refusal {
             code: Code::RANGE_BOUNDS,
@@ -78,7 +74,6 @@ pub struct ReadLease {
     hold: Hold,
     pub snapshot: String,
     objects: Vec<ObjectRef>,
-    pub store_generation: u64,
 }
 
 impl ReadLease {
@@ -170,13 +165,11 @@ pub fn acquire(
             },
         }
     }
-    let store_generation = store.generation();
     Ok((
         ReadLease {
             hold,
             snapshot: snapshot.to_string(),
             objects,
-            store_generation,
         },
         rx,
     ))
@@ -540,15 +533,6 @@ pub struct Stats {
     pub io_bytes: u64,
     pub workers: usize,
     pub elapsed_ms: u128,
-}
-
-impl Stats {
-    pub fn gib_s(&self) -> f64 {
-        if self.elapsed_ms == 0 {
-            return 0.0;
-        }
-        (self.io_bytes as f64 / (1u64 << 30) as f64) / (self.elapsed_ms as f64 / 1000.0)
-    }
 }
 
 /// Execute a plan into ONE caller-owned destination buffer with `workers` concurrent

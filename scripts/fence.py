@@ -238,15 +238,25 @@ SERVE_PATH = ["crates/tensorfs-core/src/read.rs", "crates/tensorfs-core/src/fill
 # Module PATHS and type names, not the English nouns: tier 3 legitimately streams "a
 # retained carrier blob" in its refusal prose, and a fence that cannot tell a noun from an
 # import is a fence people route around.
-BORDER_VOCAB = ["ingest::", "carrier::", "fingerprint::", "convert::", "SourceHeader",
-                "IngestProfile", "Converter", "classify", "topology_fingerprint"]
+BORDER_VOCAB = ["ingest::carrier", "ingest::convert", "ingest::fingerprint", "carrier::",
+                "fingerprint::", "convert::", "SourceHeader", "IngestProfile", "Converter",
+                "classify", "topology_fingerprint"]
+# `ingest::transaction` is deliberately NOT on that list. GC must mark the border's expiring
+# quarantine roots — they are pin root class 4 (tensorfs.md §2) — so the ROOT plane is a real
+# seam between the two. What stays banned is the DECIDING half: carrier decode, conversion
+# planning and classification. A fence that cannot tell a root from a parser would force the
+# GC to re-implement the root reader, which is the duplication it exists to prevent.
 
 # (b) PINNED BUFFERS ARE NOT OURS. boundaries.md gives TensorFS bytes and leases and gives
 #     the runtime GPU memory and pinned staging. Exactly ONE budgeted pinned pool per
 #     executor lives with the CALLER (the v1 FillSink lesson); the moment core names a pinned
 #     pool it has taken a policy it cannot budget and an allocation it cannot free.
-PINNED_VOCAB = ["pinned", "pin_memory", "cudaHostAlloc", "page_locked", "PinnedPool",
-                "staging_pool", "host_register"]
+# The MEMORY sense only. Bare "pinned" was over-broad: pinned-by-a-root is this file's
+# central concept and a fence that cannot tell it from pinned host memory just teaches people
+# to spell it `pinned_by`. What is actually forbidden is owning a host staging allocation.
+PINNED_VOCAB = ["pinned_pool", "pinned_buffer", "pinned_buffers", "pinned_staging",
+                "pinned_memory", "pin_memory", "cudaHostAlloc", "page_locked", "PinnedPool",
+                "StagingPool", "staging_pool", "host_register", "mlock"]
 
 # (c) ONE TRANSFORM. The fill transform is defined once; everyone else re-exports it.
 XFORM_HOME = "crates/tensorfs-core/src/fill.rs"

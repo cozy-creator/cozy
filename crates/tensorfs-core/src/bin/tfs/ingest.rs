@@ -1002,14 +1002,14 @@ pub fn cmd_reap(root: &Path, f: &Flags) -> ExitCode {
         "{} reaped, {} live, {} installed checkpoints (unchanged by reaping)",
         gone.len(),
         kept.len(),
-        tx::installed(store.root()).len()
+        tx::installed(&store).len()
     );
     ExitCode::SUCCESS
 }
 
 pub fn cmd_roots(root: &Path) -> ExitCode {
     let store = ok!(Store::open(root));
-    let installed = tx::installed(store.root());
+    let installed = tx::installed(&store);
     for i in &installed {
         println!("installed    sha256:{i}");
     }

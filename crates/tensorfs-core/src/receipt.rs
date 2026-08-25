@@ -14,8 +14,8 @@ use crate::err::Result;
 use crate::ids::{check_format, Doc};
 use crate::limits;
 
-/// The closed set of degradations. A new one is a code change here, which is the point:
-/// "some other fallback happened" is not a receipt.
+/// The closed set of degradations, ENFORCED by the decoder below. A new one is a code change
+/// here, which is the point: "some other fallback happened" is not a receipt.
 pub const KINDS: &[&str] = &[
     "symlink-fell-back-to-copy",
     "buffered-instead-of-direct",
@@ -71,6 +71,12 @@ impl Doc for Receipt {
         let op = f.req_str("op")?.to_string();
         let snapshot = f.req_str("snapshot")?.to_string();
         f.done()?;
+        if !KINDS.contains(&degraded.as_str()) {
+            return crate::err::refuse(
+                crate::err::Code::UNKNOWN_FIELD,
+                format!("degraded kind {degraded:?} is outside the closed set {KINDS:?}"),
+            );
+        }
         Ok(Receipt {
             op,
             degraded,
