@@ -6,6 +6,20 @@
 //!   tfs bench [tensors] [reps]   canonical-writer throughput + peak RSS
 //!   tfs flip                     identity-flip matrix over live documents
 //!   tfs id <file>                object id (+ derived ids) of a stored document
+//!
+//! The object store (tfs-002). Flags: --expect <hex> --expect-length <n> --out <path>
+//! --range <off>:<len> --paranoid --rate <f> --pass <n> --max-age <s> --slow-ms <n>
+//! --size <bytes> --small <n>, plus the dev-only kill points --fault <stage> --ready <path>.
+//!
+//!   tfs store init|info|bump <root>
+//!   tfs put <root> <file>        stream one object in (any shape)
+//!   tfs get <root> <hex>         verified read, whole or ranged
+//!   tfs contains <root> <hex>    the presence HINT, and what it is worth
+//!   tfs verify <root> <hex>      verification record or rehash; quarantine on disagreement
+//!   tfs scrub <root>             one rate knob over the whole store
+//!   tfs reap <root>              age-bounded temp reap
+//!   tfs fill <root> <plan>       resumable fill: skip only verified objects
+//!   tfs bench-store <root>       put/read/range/rehash throughput + peak RSS
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -21,12 +35,24 @@ use tensorfs_core::ingest::{Evidence, IngestProfile, IngestSubject, IngestVerifi
 use tensorfs_core::manifest::{BlobDescriptor, Entry, SnapshotManifest};
 use tensorfs_core::registry;
 use tensorfs_core::spec::EncodingSpec;
+use tensorfs_core::store::{Fault, Store, Verdict, FAULT_STAGES};
 use tensorfs_core::vectors::EncodingVectors;
 
 fn main() -> ExitCode {
-    let args: Vec<String> = std::env::args().skip(1).collect();
+    let (args, flags) = split_flags(std::env::args().skip(1).collect());
     let a: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
     match a.as_slice() {
+        ["store", "init", r] => cmd_store(Path::new(r), "init"),
+        ["store", "info", r] => cmd_store(Path::new(r), "info"),
+        ["store", "bump", r] => cmd_store(Path::new(r), "bump"),
+        ["put", r, f] => cmd_put(Path::new(r), Path::new(f), &flags),
+        ["get", r, h] => cmd_get(Path::new(r), h, &flags),
+        ["contains", r, h] => cmd_contains(Path::new(r), h),
+        ["verify", r, h] => cmd_verify_object(Path::new(r), h, &flags),
+        ["scrub", r] => cmd_scrub(Path::new(r), &flags),
+        ["reap", r] => cmd_reap(Path::new(r), &flags),
+        ["fill", r, p] => cmd_fill(Path::new(r), Path::new(p), &flags),
+        ["bench-store", r] => cmd_bench_store(Path::new(r), &flags),
         ["registry"] => cmd_registry(),
         ["vectors", "gen"] => cmd_gen(&default_dir()),
         ["vectors", "gen", d] => cmd_gen(Path::new(d)),
@@ -38,10 +64,353 @@ fn main() -> ExitCode {
         ["flip"] => cmd_flip(),
         ["id", f] => cmd_id(Path::new(f)),
         _ => {
-            eprintln!("usage: tfs registry | vectors gen|verify [dir] | bench [n] [reps] | flip | id <file>");
+            eprintln!("usage: see the header of {}", file!());
             ExitCode::from(2)
         }
     }
+}
+
+// ------------------------------------------------------------------ store CLI
+
+/// `--key value` pairs and bare `--flag` switches, split out of the positionals.
+type Flags = Vec<(String, String)>;
+
+fn split_flags(argv: Vec<String>) -> (Vec<String>, Flags) {
+    let (mut pos, mut flags) = (Vec::new(), Flags::new());
+    let mut it = argv.into_iter().peekable();
+    while let Some(t) = it.next() {
+        match t.strip_prefix("--") {
+            None => pos.push(t),
+            Some(k) => {
+                let v = match it.peek() {
+                    Some(n) if !n.starts_with("--") => it.next().unwrap(),
+                    _ => "1".to_string(),
+                };
+                flags.push((k.to_string(), v));
+            }
+        }
+    }
+    (pos, flags)
+}
+
+fn flag<'a>(f: &'a Flags, k: &str) -> Option<&'a str> {
+    f.iter().find(|(a, _)| a == k).map(|(_, v)| v.as_str())
+}
+fn flag_on(f: &Flags, k: &str) -> bool {
+    flag(f, k).is_some()
+}
+fn flag_num<T: std::str::FromStr>(f: &Flags, k: &str, d: T) -> T {
+    flag(f, k).and_then(|v| v.parse().ok()).unwrap_or(d)
+}
+
+fn bail(e: Refusal) -> ExitCode {
+    eprintln!("REFUSED {e}");
+    ExitCode::FAILURE
+}
+
+macro_rules! ok {
+    ($e:expr) => {
+        match $e {
+            Ok(v) => v,
+            Err(e) => return bail(e),
+        }
+    };
+}
+
+fn cmd_store(root: &Path, verb: &str) -> ExitCode {
+    let mut s = match verb {
+        "init" => ok!(Store::init(root)),
+        _ => ok!(Store::open(root)),
+    };
+    if verb == "bump" {
+        let g = ok!(s.bump_generation());
+        println!("generation bumped to {g} — every verification record is now stale");
+    }
+    println!("root:       {}", s.root().display());
+    println!("era:        {}", tensorfs_core::store::ERA);
+    println!("generation: {}", s.generation());
+    println!("objects:    {}", ok!(s.objects()).len());
+    ExitCode::SUCCESS
+}
+
+fn fault_of(f: &Flags) -> Fault {
+    Fault {
+        stage: flag(f, "fault").map(|s| s.to_string()),
+        ready: flag(f, "ready").map(PathBuf::from),
+    }
+}
+
+fn cmd_put(root: &Path, src: &Path, f: &Flags) -> ExitCode {
+    let s = ok!(Store::open(root));
+    let expect = match (flag(f, "expect"), flag(f, "expect-length")) {
+        (None, _) => None,
+        (Some(_), None) => {
+            eprintln!("--expect requires --expect-length: an ObjectRef is length-bearing");
+            return ExitCode::from(2);
+        }
+        (Some(h), Some(l)) => Some(ObjectRef {
+            sha256: h.trim_start_matches("sha256:").to_string(),
+            length: l.parse().unwrap_or(u64::MAX),
+        }),
+    };
+    let fault = fault_of(f);
+    if let Some(st) = &fault.stage {
+        if !FAULT_STAGES.contains(&st.as_str()) {
+            eprintln!("--fault {st}: stages are {FAULT_STAGES:?}");
+            return ExitCode::from(2);
+        }
+    }
+    let p = ok!(s.put_file(src, expect.as_ref(), &fault));
+    println!(
+        "{} sha256:{} length={}",
+        if p.admitted {
+            "admitted"
+        } else {
+            "present (lost the admission race; this process claims nothing about its bytes)"
+        },
+        p.obj.sha256,
+        p.obj.length
+    );
+    ExitCode::SUCCESS
+}
+
+fn cmd_contains(root: &Path, hex: &str) -> ExitCode {
+    let s = ok!(Store::open(root));
+    let present = s.contains(hex);
+    println!("contains:  {present}   (presence HINT only)");
+    match s.record_valid(hex) {
+        Ok(r) => println!(
+            "record:    valid (dev:ino {}:{}, {} bytes, generation {})",
+            r.dev, r.ino, r.length, r.generation
+        ),
+        Err(why) => println!("record:    INVALID — {why}"),
+    }
+    ExitCode::SUCCESS
+}
+
+fn cmd_verify_object(root: &Path, hex: &str, f: &Flags) -> ExitCode {
+    let s = ok!(Store::open(root));
+    let v = ok!(s.verify(hex, flag_on(f, "paranoid")));
+    match &v {
+        Verdict::Verified { rehashed } => {
+            println!("VERIFIED sha256:{hex} (rehashed: {rehashed})");
+            ExitCode::SUCCESS
+        }
+        Verdict::Invalidated { why, .. } => {
+            println!("RECORD INVALIDATED ({why}) — rehashed, bytes are good, record refreshed");
+            ExitCode::SUCCESS
+        }
+        Verdict::Quarantined { to, why } => {
+            eprintln!("QUARANTINED sha256:{hex} -> {} ({why})", to.display());
+            ExitCode::FAILURE
+        }
+    }
+}
+
+fn cmd_get(root: &Path, hex: &str, f: &Flags) -> ExitCode {
+    let s = ok!(Store::open(root));
+    let t = Instant::now();
+    if let Some(r) = flag(f, "range") {
+        let (o, l) = r.split_once(':').unwrap_or((r, "1"));
+        let bytes = ok!(s.read_range(hex, o.parse().unwrap_or(0), l.parse().unwrap_or(1)));
+        println!(
+            "range {} bytes in {:.3} s, sha256:{}",
+            bytes.len(),
+            t.elapsed().as_secs_f64(),
+            tensorfs_core::sha256::hex_digest(&bytes)
+        );
+        return ExitCode::SUCCESS;
+    }
+    let mut sink: Box<dyn std::io::Write> = match flag(f, "out") {
+        Some(p) => Box::new(match fs::File::create(p) {
+            Ok(fh) => fh,
+            Err(e) => {
+                eprintln!("{p}: {e}");
+                return ExitCode::FAILURE;
+            }
+        }),
+        None => Box::new(Counting(0)),
+    };
+    let n = ok!(s.read_into(hex, &mut sink));
+    let secs = t.elapsed().as_secs_f64();
+    println!(
+        "read {n} verified bytes in {secs:.3} s ({:.1} MiB/s)",
+        n as f64 / secs / 1048576.0
+    );
+    ExitCode::SUCCESS
+}
+
+struct Counting(u64);
+impl std::io::Write for Counting {
+    fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+        self.0 += b.len() as u64;
+        Ok(b.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+fn cmd_scrub(root: &Path, f: &Flags) -> ExitCode {
+    let s = ok!(Store::open(root));
+    let (rate, pass) = (flag_num(f, "rate", 0.1f64), flag_num(f, "pass", 0u64));
+    let t = Instant::now();
+    let r = ok!(s.scrub(rate, pass));
+    let secs = t.elapsed().as_secs_f64();
+    println!(
+        "scrub rate={rate} pass={pass}: scanned {} sampled {} rehashed {} quarantined {} ({:.1} MiB hashed, {secs:.3} s, {:.1} MiB/s)",
+        r.scanned,
+        r.sampled,
+        r.rehashed,
+        r.quarantined,
+        r.bytes_hashed as f64 / 1048576.0,
+        r.bytes_hashed as f64 / secs.max(1e-9) / 1048576.0
+    );
+    ExitCode::from(if r.quarantined > 0 { 1 } else { 0 })
+}
+
+fn cmd_reap(root: &Path, f: &Flags) -> ExitCode {
+    let s = ok!(Store::open(root));
+    let age = flag_num(f, "max-age", 3600u64);
+    let (gone, kept) = ok!(s.reap(age));
+    println!("reap max-age={age}s: removed {gone} temps, kept {kept}");
+    ExitCode::SUCCESS
+}
+
+/// Plan lines are `<hex> <length> <path>`. Resume skips an object ONLY under a valid
+/// verification record — presence alone is never enough.
+fn cmd_fill(root: &Path, plan: &Path, f: &Flags) -> ExitCode {
+    let s = ok!(Store::open(root));
+    let text = match fs::read_to_string(plan) {
+        Ok(t) => t,
+        Err(e) => {
+            eprintln!("{}: {e}", plan.display());
+            return ExitCode::FAILURE;
+        }
+    };
+    let slow = flag_num(f, "slow-ms", 0u64);
+    let (mut put, mut skipped, mut refused) = (0, 0, 0);
+    for line in text.lines().filter(|l| !l.trim().is_empty()) {
+        let p: Vec<&str> = line.split_whitespace().collect();
+        let (hex, len, src) = (p[0], p[1].parse::<u64>().unwrap_or(0), p[2]);
+        match s.record_valid(hex) {
+            Ok(_) => {
+                skipped += 1;
+                println!("skip   sha256:{hex} (valid verification record)");
+                continue;
+            }
+            // Present but unverified. Presence alone never resumes, and no-clobber
+            // admission means a corrupt squatter would silently survive a re-put — so the
+            // rehash happens HERE: good bytes resume, bad bytes are quarantined out of the
+            // way and the object is admitted afresh.
+            Err(why) if s.contains(hex) => match ok!(s.verify(hex, false)) {
+                Verdict::Quarantined { to, .. } => {
+                    println!(
+                        "requeue sha256:{hex} ({why}; quarantined to {})",
+                        to.display()
+                    )
+                }
+                _ => {
+                    skipped += 1;
+                    println!("skip   sha256:{hex} ({why}; rehash agreed, record refreshed)");
+                    continue;
+                }
+            },
+            Err(_) => {}
+        }
+        let want = ObjectRef {
+            sha256: hex.to_string(),
+            length: len,
+        };
+        match s.put_file(Path::new(src), Some(&want), &fault_of(f)) {
+            Ok(_) => {
+                put += 1;
+                println!("put    sha256:{hex}");
+            }
+            Err(e) => {
+                refused += 1;
+                println!("REFUSE sha256:{hex} {e}");
+            }
+        }
+        if slow > 0 {
+            std::thread::sleep(std::time::Duration::from_millis(slow));
+        }
+    }
+    println!("fill: put {put}, skipped {skipped}, refused {refused}");
+    ExitCode::from(if refused > 0 { 1 } else { 0 })
+}
+
+fn cmd_bench_store(root: &Path, f: &Flags) -> ExitCode {
+    let s = ok!(Store::open(root));
+    let size: u64 = flag_num(f, "size", 1u64 << 30);
+    let small: usize = flag_num(f, "small", 2000);
+    let src = root.join("bench.src");
+    print!("synthesizing {:.0} MiB … ", size as f64 / 1048576.0);
+    let _ = std::io::Write::flush(&mut std::io::stdout());
+    let t = Instant::now();
+    {
+        let mut w = std::io::BufWriter::new(fs::File::create(&src).unwrap());
+        let mut block = vec![0u8; 1 << 20];
+        let mut x: u64 = 0x243f6a8885a308d3;
+        for i in 0..block.len() {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            block[i] = (x >> 24) as u8;
+        }
+        let mut left = size;
+        while left > 0 {
+            let n = left.min(block.len() as u64) as usize;
+            block[0] = (left >> 20) as u8; // defeat whole-file dedup across runs
+            std::io::Write::write_all(&mut w, &block[..n]).unwrap();
+            left -= n as u64;
+        }
+    }
+    println!("{:.2} s", t.elapsed().as_secs_f64());
+
+    let mib = |b: u64, s: f64| b as f64 / s / 1048576.0;
+    let row = |what: &str, bytes: u64, secs: f64| {
+        println!("  {what:<34} {secs:8.3} s   {:9.1} MiB/s", mib(bytes, secs));
+    };
+
+    let t = Instant::now();
+    let p = ok!(s.put_file(&src, None, &Fault::default()));
+    let put_s = t.elapsed().as_secs_f64();
+    row("streaming put (hash+fsync)", size, put_s);
+    let hex = p.obj.sha256.clone();
+
+    let t = Instant::now();
+    let n = ok!(s.read_into(&hex, &mut Counting(0)));
+    row("verified read (record hit)", n, t.elapsed().as_secs_f64());
+
+    let t = Instant::now();
+    let mut got = 0u64;
+    for i in 0..256u64 {
+        let off = (i * 7_919_393) % (size - (1 << 20));
+        got += ok!(s.read_range(&hex, off, 1 << 20)).len() as u64;
+    }
+    row("range reads (256 x 1 MiB)", got, t.elapsed().as_secs_f64());
+
+    let t = Instant::now();
+    ok!(s.hash_object(&hex));
+    row("rehash (scrub rate)", size, t.elapsed().as_secs_f64());
+
+    let t = Instant::now();
+    let mut blob = vec![0u8; 4096];
+    for i in 0..small {
+        blob[0..8].copy_from_slice(&(i as u64).to_le_bytes());
+        ok!(s.put_stream(&mut &blob[..], None, &Fault::default()));
+    }
+    let secs = t.elapsed().as_secs_f64();
+    println!(
+        "  {:<34} {secs:8.3} s   {:9.1} put/s   ({:.2} ms each)",
+        format!("small puts ({small} x 4 KiB)"),
+        small as f64 / secs,
+        secs * 1000.0 / small as f64
+    );
+    println!("  peak RSS {:.1} MiB", rss_kb("VmHWM") as f64 / 1024.0);
+    let _ = fs::remove_file(&src);
+    ExitCode::SUCCESS
 }
 
 fn default_dir() -> PathBuf {
@@ -1656,6 +2025,11 @@ fn cmd_id(p: &Path) -> ExitCode {
         }
     } else if let Ok(s) = EncodingSpec::parse(&bytes) {
         println!("kind:      encoding spec ({} roles)", s.roles.len());
+    } else {
+        println!(
+            "kind:      NOT a tensorfs document — {}",
+            Header::parse(&bytes).err().unwrap()
+        );
     }
     ExitCode::SUCCESS
 }

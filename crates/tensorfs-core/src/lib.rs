@@ -16,4 +16,5 @@ pub mod registry;
 pub mod relation;
 pub mod sha256;
 pub mod spec;
+pub mod store;
 pub mod vectors;
