@@ -73,7 +73,16 @@ fn foreign_dtype(key: &str, name: &str) -> Result<Dtype> {
 /// with a little-endian length), so it is the fallthrough — which is why every hostile shape
 /// must be named here explicitly rather than inferred from "not one of ours".
 pub fn sniff(head: &[u8]) -> Result<()> {
-    if head.starts_with(b"PK\x03\x04") || head.starts_with(b"PK\x05\x06") {
+    // `PK\x01\x02` is the CENTRAL DIRECTORY header. A whole `.bin` opens with the local
+    // header, but a bounded probe of one — the range fetch that reads a torchao pickle's
+    // directory without pulling 30 GB, which is exactly what the H3 evidence bank does —
+    // starts here. Without this magic such a fragment fell through to the length-prefix
+    // arithmetic and refused CARRIER_HEADER_CAP: a refusal, but for the wrong reason
+    // (tfs-010 stamp arm, on real banked bytes).
+    if head.starts_with(b"PK\x03\x04")
+        || head.starts_with(b"PK\x05\x06")
+        || head.starts_with(b"PK\x01\x02")
+    {
         return refuse(
             Code::ARCHIVE_REFUSED,
             "zip archive (a pickled `.pt`/`.bin` object graph): normal ingest opens no archive \

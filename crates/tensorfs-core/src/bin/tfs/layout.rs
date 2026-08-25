@@ -142,6 +142,15 @@ pub fn cmd_import(rows_p: &Path, flags: &Flags) -> ExitCode {
 
     let seeds = registry::seeds();
 
+    // `--survey` reports EVERY distinct measured role set and the spec each one selects,
+    // instead of stopping at the first the registry does not describe. An artifact can mix
+    // encodings per tensor (tfs-003 f474111), so "the first gap" is not the answer to "what
+    // is in this file" — and a survey is an observation, never an admission: it writes no
+    // document and mints nothing.
+    let survey = flag(flags, "survey").is_some();
+    let mut seen: std::collections::BTreeMap<String, (Option<String>, u64, String)> =
+        std::collections::BTreeMap::new();
+
     let mut closure = tensorfs_core::header::Closure::default();
     let mut out: Vec<(String, tensorfs_core::header::Tensor)> = Vec::new();
     let mut reqs: Vec<(String, Requirement)> = Vec::new();
@@ -168,18 +177,26 @@ pub fn cmd_import(rows_p: &Path, flags: &Flags) -> ExitCode {
         let shape = ok!(uints(ok!(tf.req("shape"))));
         roles.sort_by(|a, b| a.0.cmp(&b.0));
 
-        let spec =
-            match roles.is_empty() {
-                true => seeds
-                    .iter()
-                    .map(|s| &s.spec)
-                    .find(|s| s.roles.len() == 1 && s.roles[0].0 == "value")
-                    .cloned()
-                    .expect("plain/1 is entry zero of the platform namespace"),
-                false => match pick(&seeds, dtype, &shape, &roles) {
-                    Some(s) => s,
-                    None => {
-                        eprintln!(
+        let measured = match roles.is_empty() {
+            true => format!("plain {}", dtype.name()),
+            false => roles
+                .iter()
+                .map(|(n, d, _)| format!("{n}:{}", d.name()))
+                .collect::<Vec<_>>()
+                .join(" "),
+        };
+        let spec = match roles.is_empty() {
+            true => seeds
+                .iter()
+                .map(|s| &s.spec)
+                .find(|s| s.roles.len() == 1 && s.roles[0].0 == "value")
+                .cloned()
+                .expect("plain/1 is entry zero of the platform namespace"),
+            false => match pick(&seeds, dtype, &shape, &roles) {
+                Some(s) => s,
+                None => {
+                    let detail =
+                        format!(
                         "REFUSED UNKNOWN_ENCODING: {key}: no platform spec has roles {:?} with \
                          these carriers — the measured geometry is real and the registry does \
                          not describe it, which is a registry gap, never a reason to round it \
@@ -187,10 +204,29 @@ pub fn cmd_import(rows_p: &Path, flags: &Flags) -> ExitCode {
                         roles.iter().map(|(n, d, s)| format!("{n}:{}/{:?}", d.name(), s))
                             .collect::<Vec<_>>()
                     );
+                    if !survey {
+                        eprintln!("{detail}");
                         return ExitCode::FAILURE;
                     }
-                },
-            };
+                    let e = seen.entry(measured).or_insert((None, 0, key.clone()));
+                    e.1 += 1;
+                    continue;
+                }
+            },
+        };
+        if survey {
+            let alias = seeds
+                .iter()
+                .find(|s| s.spec.object_id() == spec.object_id())
+                .map(|s| s.alias)
+                .unwrap_or("?");
+            let e = seen.entry(measured).or_insert((
+                Some(format!("{alias} {}", &spec.object_id()[7..19])),
+                0,
+                key.clone(),
+            ));
+            e.1 += 1;
+        }
         let sid = spec.object_id();
         if closure.get(&sid).is_none() {
             closure.insert(spec.clone());
@@ -231,6 +267,27 @@ pub fn cmd_import(rows_p: &Path, flags: &Flags) -> ExitCode {
                 accepts: Accepts::OneOf(vec![sid]),
             },
         ));
+    }
+    if survey {
+        println!("survey       {provenance}");
+        let (mut ok, mut gap) = (0u64, 0u64);
+        for (measured, (spec, n, first)) in &seen {
+            match spec {
+                Some(s) => {
+                    ok += n;
+                    println!("  {n:5}  {measured:<52} {s}");
+                }
+                None => {
+                    gap += n;
+                    println!("  {n:5}  {measured:<52} GAP — {first}");
+                }
+            }
+        }
+        println!(
+            "  {ok} tensors described, {gap} in {} registry gap(s)",
+            seen.values().filter(|(s, _, _)| s.is_none()).count()
+        );
+        return ExitCode::SUCCESS;
     }
     out.sort_by(|a, b| a.0.cmp(&b.0));
     reqs.sort_by(|a, b| a.0.cmp(&b.0));
