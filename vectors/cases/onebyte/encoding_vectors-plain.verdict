@@ -1,0 +1,3 @@
+doc: vectors
+expect: mutant
+note: one byte flipped at offset 185 of sha256:d53aefb93615b37b3c254a86019bbd4451b7040451ede7a4c12d7a266f7f3448

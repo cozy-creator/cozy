@@ -1,0 +1,5 @@
+doc: manifest
+expect: ok
+id: sha256:58d79e23463129f9e259917494bf138215c7f080a1a1538c6f4c58e650029d01
+checkpoint: sha256:58d79e23463129f9e259917494bf138215c7f080a1a1538c6f4c58e650029d01
+note: one more sibling file: new checkpoint_id, same header id

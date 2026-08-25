@@ -1,0 +1,4 @@
+doc: receipt
+expect: ok
+id: sha256:72519dcd8b24cccd21ece0054c0a6dd7b86d05076e6644ac8e5c0aa316dc364c
+note: one evidence arm; signer in the envelope

@@ -1,0 +1,4 @@
+doc: profile
+expect: refuse
+code: UNREGISTERED_ENCODING
+note: launch border admits platform-aliased digests only

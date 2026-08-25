@@ -1,0 +1,4 @@
+doc: header
+expect: refuse
+code: BYTE_LENGTH_MISMATCH
+note: segment total off by one byte

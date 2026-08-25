@@ -1,0 +1,4 @@
+doc: header
+expect: refuse
+code: INLINE_EXCLUSIVE
+note: both bodies present

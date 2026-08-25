@@ -1,0 +1,5 @@
+doc: header
+expect: ok
+id: sha256:093b48b33d834f1ad8cb5a8d9227686409a221b7c0787f27f2446234476e95a8
+topology: sha256:392389bcf0afa2c5d7086d70be65a7a105b80a0ef9493d0983d0230dfa6c7b22
+note: nvfp4 W4A4 base variant, rank-0 scalar role

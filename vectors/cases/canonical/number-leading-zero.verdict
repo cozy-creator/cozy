@@ -1,0 +1,4 @@
+doc: header
+expect: refuse
+code: NON_INTEGER_NUMBER
+note: non-canonical integer spelling

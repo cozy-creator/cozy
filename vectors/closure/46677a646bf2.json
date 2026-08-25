@@ -1,0 +1,1 @@
+{"doc":"Transitional int8 W8A8: value[i,j] = data[i,j] * scale[i], per-output-channel f32 scales.","format":"tensorfs.encoding_spec/1","logical_dtypes":["bf16","f16","f32"],"logical_rank":2,"roles":{"data":{"carrier":{"dtypes":["i8"],"t":"set"},"shape":{"t":"same"}},"scale":{"carrier":{"dtypes":["f32"],"t":"set"},"shape":{"dims":[{"axis":0,"t":"axis"}],"t":"dims"}}}}

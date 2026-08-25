@@ -1,0 +1,4 @@
+doc: header
+expect: refuse
+code: ENCODING_MISMATCH
+note: cited digest missing from `encodings`

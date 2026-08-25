@@ -1,0 +1,4 @@
+doc: manifest
+expect: refuse
+code: PATH_CASE_COLLISION
+note: case-fold collision inside one tree

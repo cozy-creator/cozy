@@ -1,0 +1,4 @@
+doc: header
+expect: refuse
+code: ROLE_SET_MISMATCH
+note: spec role set is EXACT

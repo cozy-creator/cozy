@@ -1,0 +1,162 @@
+//! Identity: ObjectId = sha256 of the exact resident canonical bytes, universally.
+
+use crate::canon::{self, Fields, Value};
+use crate::err::{refuse, Code, Result};
+use crate::sha256;
+
+/// Bare lowercase 64-hex digest (ObjectRef form).
+pub fn hex64(what: &str, s: &str) -> Result<String> {
+    if s.len() != 64
+        || !s
+            .bytes()
+            .all(|c| c.is_ascii_digit() || (b'a'..=b'f').contains(&c))
+    {
+        return refuse(
+            Code::MALFORMED_DIGEST,
+            format!("{what}: {s:?} is not 64 lowercase hex"),
+        );
+    }
+    Ok(s.to_string())
+}
+
+/// Prefixed `sha256:<hex>` form (the `encoding` field and every id we print).
+pub fn prefixed(what: &str, s: &str) -> Result<String> {
+    match s.strip_prefix("sha256:") {
+        Some(h) => {
+            hex64(what, h)?;
+            Ok(s.to_string())
+        }
+        None => refuse(
+            Code::MALFORMED_DIGEST,
+            format!("{what}: {s:?} lacks the lowercase `sha256:` prefix"),
+        ),
+    }
+}
+
+pub fn object_id(bytes: &[u8]) -> String {
+    format!("sha256:{}", sha256::hex_digest(bytes))
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ObjectRef {
+    pub sha256: String,
+    pub length: u64,
+}
+
+impl ObjectRef {
+    pub fn of(bytes: &[u8]) -> ObjectRef {
+        ObjectRef {
+            sha256: sha256::hex_digest(bytes),
+            length: bytes.len() as u64,
+        }
+    }
+    pub fn id(&self) -> String {
+        format!("sha256:{}", self.sha256)
+    }
+    pub fn from_value(what: &'static str, v: &Value) -> Result<ObjectRef> {
+        let mut f = Fields::new(what, v)?;
+        let length = f.req_uint("length")?;
+        let sha256 = hex64(what, f.req_str("sha256")?)?;
+        f.done()?;
+        Ok(ObjectRef { sha256, length })
+    }
+    pub fn to_value(&self) -> Value {
+        Value::obj(vec![
+            ("length", Value::uint(self.length)),
+            ("sha256", Value::str(self.sha256.clone())),
+        ])
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConfigRef {
+    pub sha256: String,
+    pub length: u64,
+    pub media_type: String,
+}
+
+impl ConfigRef {
+    pub fn from_value(v: &Value) -> Result<ConfigRef> {
+        let mut f = Fields::new("ConfigRef", v)?;
+        let length = f.req_uint("length")?;
+        let media_type = f.req_str("media_type")?.to_string();
+        let sha256 = hex64("ConfigRef", f.req_str("sha256")?)?;
+        f.done()?;
+        if media_type.is_empty() || media_type.len() > 128 {
+            return refuse(Code::KEY_GRAMMAR, "ConfigRef.media_type out of bounds");
+        }
+        Ok(ConfigRef {
+            sha256,
+            length,
+            media_type,
+        })
+    }
+    pub fn to_value(&self) -> Value {
+        Value::obj(vec![
+            ("length", Value::uint(self.length)),
+            ("media_type", Value::str(self.media_type.clone())),
+            ("sha256", Value::str(self.sha256.clone())),
+        ])
+    }
+}
+
+/// Every identity-bearing tensorfs document: one canonical encoding, one id.
+pub trait Doc: Sized {
+    const FORMAT: &'static str;
+    const MAX_BYTES: usize;
+
+    fn from_value(v: &Value) -> Result<Self>;
+    fn to_value(&self) -> Value;
+
+    fn canonical_bytes(&self) -> Vec<u8> {
+        canon::write(&self.to_value())
+    }
+    fn object_id(&self) -> String {
+        object_id(&self.canonical_bytes())
+    }
+    fn object_ref(&self) -> ObjectRef {
+        ObjectRef::of(&self.canonical_bytes())
+    }
+    /// The universal law: stored bytes are the canonical bytes.
+    fn parse(bytes: &[u8]) -> Result<Self> {
+        let v = canon::parse_canonical(bytes, Self::MAX_BYTES)?;
+        let doc = Self::from_value(&v)?;
+        if doc.canonical_bytes() != bytes {
+            return refuse(
+                Code::NONCANONICAL_ENCODING,
+                "re-emitted bytes differ from stored bytes",
+            );
+        }
+        Ok(doc)
+    }
+}
+
+pub fn check_format(what: &'static str, got: &str, want: &str) -> Result<()> {
+    if got != want {
+        return refuse(
+            Code::UNKNOWN_FORMAT,
+            format!("{what}: format {got:?} != {want:?}"),
+        );
+    }
+    Ok(())
+}
+
+/// ASCII name grammar for component/role names and tenant/dialect ids.
+pub fn ascii_name(what: &str, s: &str, max: usize) -> Result<()> {
+    if s.is_empty() || s.len() > max {
+        return refuse(
+            Code::KEY_GRAMMAR,
+            format!("{what}: name length {} out of bounds", s.len()),
+        );
+    }
+    if !s
+        .bytes()
+        .all(|c| c.is_ascii_alphanumeric() || matches!(c, b'_' | b'-' | b'.' | b'/'))
+    {
+        return refuse(
+            Code::KEY_GRAMMAR,
+            format!("{what}: {s:?} leaves the ASCII name grammar"),
+        );
+    }
+    Ok(())
+}

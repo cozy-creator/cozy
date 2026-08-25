@@ -1,0 +1,5 @@
+doc: manifest
+expect: ok
+id: sha256:b52248989f7c77d3230dad033c246d987256f53fcb66725214fac803775dca63
+checkpoint: sha256:b52248989f7c77d3230dad033c246d987256f53fcb66725214fac803775dca63
+note: checkpoint_id = snapshot_id, header attached structurally

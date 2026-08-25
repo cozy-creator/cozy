@@ -1,0 +1,4 @@
+doc: manifest
+expect: refuse
+code: BYTE_LENGTH_MISMATCH
+note: segment total != logical size

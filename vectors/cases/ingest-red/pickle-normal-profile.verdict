@@ -1,0 +1,4 @@
+doc: profile
+expect: refuse
+code: PICKLE_REFUSED
+note: pickle always refuses normal ingest

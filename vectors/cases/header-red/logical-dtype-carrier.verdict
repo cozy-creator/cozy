@@ -1,0 +1,4 @@
+doc: header
+expect: refuse
+code: DTYPE_MISMATCH
+note: carrier no longer equals the logical dtype

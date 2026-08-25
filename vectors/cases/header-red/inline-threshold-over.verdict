@@ -1,0 +1,4 @@
+doc: header
+expect: refuse
+code: INLINE_THRESHOLD
+note: 260 B stored inline

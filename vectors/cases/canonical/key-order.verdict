@@ -1,0 +1,4 @@
+doc: header
+expect: refuse
+code: NONCANONICAL_ENCODING
+note: reversed object key order

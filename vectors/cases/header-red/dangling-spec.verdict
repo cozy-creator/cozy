@@ -1,0 +1,4 @@
+doc: header
+expect: refuse
+code: UNKNOWN_ENCODING
+note: cited digest absent from the closure
