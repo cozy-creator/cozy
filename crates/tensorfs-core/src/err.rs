@@ -124,6 +124,7 @@ codes![
     GOLDEN_MISMATCH,
     PLACEMENT_UNFIT,
     CONVERT_SIZE_CAP,
+    SEAM_UNBANKED,
     // ingest border: the quarantine transaction
     QUOTA_EXHAUSTED,
     ROOT_EXPIRED,

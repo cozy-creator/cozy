@@ -14,6 +14,13 @@ TFS="$ROOT/target/release/tfs"
 WORK="${WORK:-/tmp/tfs-003-runs}"
 SDXL="${SDXL:-/home/fidika/cozy_v2/tensorfs-bench/hf/sdxl}"
 H3="${H3:-$ROOT/../tracker-v2/examples/safetensors-headers/minimax_h3_fl2va_pruned_fp8_scaled.header.json}"
+# The pinned OFFICIAL NATIVE FL2VA header and the official Diffusers index, exactly as
+# h3-evidence banked them (read-only). The cache is content-addressed, so the paths ARE
+# the digests: shard 1 of 13 of `FL2VA/transformer` and `transformer/...index.json` at
+# MiniMaxAI/MiniMax-H3@42ed227e.
+BANK="${BANK:-$HOME/cozy_v2/h3-evidence}"
+NATIVE_HDR="$BANK/cache/3ac8763fb32ed28e1848f2d5f115d96f6dfc84e1ab8e0421f855f3ed0abcc91a"
+DIFFUSERS_IDX="$BANK/cache/ac30a3b58963f2e735d493475fbb81853a5735ec947619648b3e045acda6783e"
 REG="$WORK/registry.json"
 MODE="${1:-all}"
 PASS=0; MISS=0
@@ -49,7 +56,9 @@ green() {
 rm -rf "$WORK"; mkdir -p "$WORK/carriers"
 for v in good pickle pickle-proto0 zip gguf gzip header-cap truncated geometry overlap gap \
          dtype-unknown float-dim no-tensors bnb deep \
-         mixed-fp8 mixed-fp8-spoof rowwise-keepdim; do
+         mixed-fp8 mixed-fp8-spoof rowwise-keepdim \
+         native-qkv native-qkv-nonorm native-qkv-odd native-qkv-encoded native-qkv-vae \
+         marker-malformed; do
   python3 "$ROOT/scripts/make-carrier.py" "$v" "$WORK/carriers/$v.safetensors"
 done
 
@@ -225,6 +234,94 @@ if "$ROOT/target/release/tfs" ingest golden | grep -q "^  RED"; then
   PASS=$((PASS+1))
 else
   MISS=$((MISS+1)); echo "  MISS the wrong-order arm did not fire"
+fi
+
+banner "RED 6c — the H3 native SEAM: the banked permutation reaches the plan"
+# tfs-003 banked the geometry and `plan_carrier` never asked for it: `h3.native/1` planned
+# 535 recontain and ZERO permutes (proto-001 #322). These arms are that gap, closed.
+NREG="$WORK/native.json"
+"$TFS" ingest bank safetensors.h3_native h3.fl2va native-mini h3.native/1 \
+  --source transformer="$WORK/carriers/native-qkv.safetensors" --registry "$NREG" \
+  --source-name synthetic-native-miniature >/dev/null
+echo "  the miniature native carrier — both attention module families, real bytes:"
+"$TFS" ingest plan transformer=plain/1 --source transformer="$WORK/carriers/native-qkv.safetensors" \
+  --registry "$NREG" | grep -E "^ops|^permute" | sed 's/^/    /'
+if "$TFS" ingest plan transformer=plain/1 --source transformer="$WORK/carriers/native-qkv.safetensors" \
+     --registry "$NREG" | grep -q "6 permute"; then
+  PASS=$((PASS+1)); printf '  ok   %s\n' "2 fused keys x 3 members = 6 permute ops planned"
+else
+  MISS=$((MISS+1)); printf '  MISS %-42s no permute in the plan\n' "the seam reaches the plan"
+fi
+
+for arm in "nonorm MISSING_COMPANION_ROLE the head dim's own sibling removed" \
+           "odd DIVISION_REMAINDER 25 rows do not divide into 3 x head_dim" \
+           "encoded SEAM_UNBANKED a fused key carrying an encoding role" \
+           "vae SEAM_UNBANKED a fused spelling this converter banks no seam for"; do
+  set -- $arm; kind=$1; code=$2; shift 2
+  "$TFS" ingest bank safetensors.h3_native h3.fl2va "n-$kind" h3.native/1 \
+    --source transformer="$WORK/carriers/native-qkv-$kind.safetensors" --registry "$NREG" \
+    --source-name plant >/dev/null
+  red "$code" "$*" \
+      "$TFS" ingest plan transformer=plain/1 \
+      --source transformer="$WORK/carriers/native-qkv-$kind.safetensors" --registry "$NREG"
+done
+
+banner "REAL 0b — the seam over the PINNED REAL native FL2VA header (h3-evidence)"
+if [ -f "$NATIVE_HDR" ]; then
+  cp "$NATIVE_HDR" "$WORK/native_fl2va_shard1.header.json"
+  "$TFS" ingest bank safetensors.h3_native h3.fl2va native-bf16 h3.native/1 \
+    --source transformer="$WORK/native_fl2va_shard1.header.json" --registry "$NREG" \
+    --source-name "MiniMaxAI/MiniMax-H3@42ed227e FL2VA/transformer/model-00001-of-00013" >/dev/null
+  "$TFS" ingest plan transformer=plain/1 --source transformer="$WORK/native_fl2va_shard1.header.json" \
+    --registry "$NREG" | grep -E "^ops|^permute|^declared|^cost"
+  # THE NUMBER. proto-001 measured the real seam's run at 1,376,256 B and called the 256 B
+  # figure the converter used to print a synthetic artifact of a 128-wide fixture.
+  if "$TFS" ingest plan transformer=plain/1 --source transformer="$WORK/native_fl2va_shard1.header.json" \
+       --registry "$NREG" | grep -q "mean run 1376256 B, class long-run"; then
+    PASS=$((PASS+1)); printf '  ok   %s\n' "mean run 1,376,256 B, class long-run — the pod's number, from the plan"
+  else
+    MISS=$((MISS+1)); printf '  MISS %-42s the real geometry did not reproduce\n' "1,376,256 B long-run"
+  fi
+  # CROSS-PACKAGING: the canonical keys this plan produces, against the official Diffusers
+  # index's own 638. The rekey map lives in Rust only; nothing here re-implements it.
+  if [ -f "$DIFFUSERS_IDX" ]; then
+    LC_ALL=C "$TFS" ingest plan transformer=plain/1 \
+      --source transformer="$WORK/native_fl2va_shard1.header.json" --registry "$NREG" --keys \
+      | awk '/^key /{print $2}' | LC_ALL=C sort > "$WORK/canon.keys"
+    python3 -c "import json,sys; print('\n'.join(json.load(open(sys.argv[1]))['weight_map']))" \
+      "$DIFFUSERS_IDX" | LC_ALL=C sort > "$WORK/diffusers.keys"
+    HIT=$(LC_ALL=C comm -12 "$WORK/canon.keys" "$WORK/diffusers.keys" | wc -l)
+    OWN=$(LC_ALL=C comm -23 "$WORK/canon.keys" "$WORK/diffusers.keys" | wc -l)
+    printf '  ok   %s\n' "$HIT of $((HIT+OWN)) canonical keys are literally in the official Diffusers 638"
+    printf '       %s\n' "$OWN native-only top-level keys pass through unrenamed — the ratified map claims no counterpart"
+    PASS=$((PASS+1))
+  fi
+else
+  echo "  (no h3-evidence bank at $BANK — skipping the real native header arms)"
+fi
+
+banner "REAL 0c — the permuted bytes through the REAL transaction, streamed"
+NSTORE="$WORK/nstore"
+"$TFS" ingest run "$NSTORE" transformer=plain/1 --registry "$NREG" --session nat \
+  --source transformer="$WORK/carriers/native-qkv.safetensors" 2>&1 \
+  | grep -E "segments|inline_parts|peak_rss_kb|bytes_written" | sed 's/^/  /'
+green "install the native candidate" "$TFS" ingest install "$NSTORE" nat
+NSNAP=$("$TFS" ingest roots "$NSTORE" | grep installed | head -1 | awk '{print $2}' | cut -d: -f2)
+green "permuted bytes hash to the digests the header declares" \
+    "$TFS" read prove "$NSTORE" "$NSNAP"
+"$TFS" read prove "$NSTORE" "$NSNAP" | sed 's/^/    /'
+
+banner "RED 6d — marker evidence: the comfy_quant decoder has a consumer"
+echo "  the producer's own claim, decoded and JOINED to the roles the border selects on:"
+"$TFS" ingest inspect --markers --source mix="$WORK/carriers/mixed-fp8.safetensors" \
+  | grep -E "markers|cross-check|format float8|read .* marker" | sed 's/^/  /'
+red MISSING_FIELD "a marker payload outside the decoder's vocabulary" \
+    "$TFS" ingest inspect --markers --source m="$WORK/carriers/marker-malformed.safetensors"
+# The default is unchanged: without --markers the border reads HEADERS and nothing else.
+if "$TFS" ingest inspect --source mix="$WORK/carriers/mixed-fp8.safetensors" | grep -q "zero tensor bytes"; then
+  PASS=$((PASS+1)); printf '  ok   %s\n' "without --markers, inspect still reads zero tensor bytes"
+else
+  MISS=$((MISS+1)); printf '  MISS %-42s the default read tensor bytes\n' "inspect stays header-only"
 fi
 
 banner "RED 7 — the fourth fence: foreign parsing lives only at the border"

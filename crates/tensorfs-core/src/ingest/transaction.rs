@@ -8,7 +8,6 @@
 //! exact subject/snapshot/header triple, and it is the only writer of `roots/`.
 
 use std::fs;
-use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
@@ -380,14 +379,13 @@ pub fn execute(
                         }
                     };
                     check_permute_size(&what, t.nbytes())?;
-                    let mut src = Vec::with_capacity(t.nbytes() as usize);
-                    carrier::Region::open(&f.path, f.header.data_start, t)?
-                        .read_to_end(&mut src)
-                        .map_err(|e| io(format!("{what}: read run"), e))?;
-                    let mut out = Vec::with_capacity(xform.out_bytes() as usize);
-                    xform.apply(&src, &mut out)?;
-                    drop(src);
-                    let w = ck::objectize(store, &what, r.dtype, r.shape.clone(), &mut &out[..])?;
+                    // STREAMED, not buffered: the member's runs are read straight out of the
+                    // carrier in destination order, so a permute costs the same constant
+                    // memory an identity stream does. Holding the fused tensor would make
+                    // peak RSS a function of the artifact (231 MB on the real H3 QKV).
+                    let mut region =
+                        carrier::RunRegion::open(&f.path, f.header.data_start, t, xform.runs())?;
+                    let w = ck::objectize(store, &what, r.dtype, r.shape.clone(), &mut region)?;
                     written += w.bytes;
                     hashed += w.bytes;
                     deduped += w.deduped;

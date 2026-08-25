@@ -88,15 +88,15 @@ the job to an isolated child; `install` is the coordinator's separate act; every
 never reaches it reaps.
 
 ```
-tfs ingest inspect --source unet=<file> [--source vae=<file> ...]   # hermetic bounded decode
+tfs ingest inspect [--markers] --source unet=<file> [--source vae=<file> ...]  # bounded decode
 tfs ingest bank <dialect> <family> <variant> <converter> --source c=<file>   # the REVIEW act
-tfs ingest plan  <component=alias,...> --source c=<file>            # zero tensor bytes read
+tfs ingest plan  <component=alias,...> --source c=<file> [--keys]   # zero tensor bytes read
 tfs ingest run   <store> <component=alias,...> --source c=<file> [--config c=<file>]
 tfs ingest install <store> <session>        # the coordinator promotes ONE root
 tfs ingest roots|reap <store> [--now]       # candidates are not checkpoints
 tfs ingest reingest <store> <header> <target> [--rekey c=from:to]   # inherit by reference
 tfs ingest converters | golden              # reviewed converters + their geometry, live
-scripts/ingest-runs.sh all                  # the border plus 26 planted red arms
+scripts/ingest-runs.sh all                  # the border plus 49 planted arms
 ```
 
 A `--source` names its component; a FILENAME never authorizes anything. Classification is
@@ -105,6 +105,15 @@ absence and ambiguity refuse. Measured on a real 6.94 GB SDXL fp16 tree: **84 MB
 end-to-end at a 13.2 MiB peak RSS** (streaming, never whole-file), planned in 30 ms from
 336 KiB of headers. Re-ingesting an already-canonical component inherits every object by
 reference: 167 MB carried, **zero bytes hashed**.
+
+`h3.native/1` is the one PERMUTATION converter: every `attn.qkv_proj.weight` becomes
+canonical `to_q|to_k|to_v` under the ratified head-interleaved seam, with the head dim read
+off the module's own `q_norm` and never a constant. Over the pinned official native FL2VA
+header the seam plans **12 permute ops, 672 runs, mean run 1,376,256 B, long-run** — and the
+members stream out of the carrier one run at a time, so a permute costs the same constant
+memory an identity stream does (6.3 MiB peak on both arms of a 352 MB pair). A fused
+attention key with no banked seam, or one carrying encoding roles, refuses `SEAM_UNBANKED`
+rather than carrying through.
 
 ## registry (tfs-008)
 

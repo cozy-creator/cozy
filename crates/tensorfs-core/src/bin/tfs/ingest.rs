@@ -4,6 +4,9 @@
 //!
 //!   `inspect` / `plan`   read HEADERS only. Zero tensor bytes, so every structural
 //!                        refusal is decidable for the cost of a few hundred KiB.
+//!                        `inspect --markers` is the ONE opt-in exception and it says so in
+//!                        bytes: marker payloads ARE tensor bytes (tiny U8 JSON blobs), the
+//!                        plan structurally cannot read them, and evidence is their home.
 //!   `run`                spawns an ISOLATED child. The parent never parses the carrier.
 //!   `ingest-worker`      the hermetic child: it parses, converts, writes candidates under
 //!                        an expiring quarantine root, and emits a receipt. It cannot
@@ -222,6 +225,98 @@ fn plan_topology(p: &Plan) -> Value {
     }))
 }
 
+// ------------------------------------------------------------------ marker evidence
+
+/// One decoded `.comfy_quant` payload, JOINED to the companion roles its own module
+/// supplies. The join is the point: the marker is the PRODUCER's claim about the bytes and
+/// the roles are what the border actually selects on, so holding them side by side is the
+/// only way a disagreement between the two becomes visible instead of assumed away.
+type Marker = (String, fingerprint::ComfyQuant, Vec<&'static str>);
+
+/// Read exactly the marker tensors' own bytes — nothing else in the data region is touched.
+/// Bounded BEFORE allocation: a payload over the text cap refuses without being read.
+fn marker_evidence(
+    path: &Path,
+    h: &SourceHeader,
+) -> tensorfs_core::err::Result<(Vec<Marker>, u64)> {
+    let (mut out, mut read) = (Vec::new(), 0u64);
+    for t in &h.tensors {
+        if !t.key.ends_with(".comfy_quant") {
+            continue;
+        }
+        if t.nbytes() > limits::MAX_DOC_TEXT_BYTES as u64 {
+            return tensorfs_core::err::refuse(
+                tensorfs_core::err::Code::SIZE_CAP,
+                format!(
+                    "{}: marker payload declares {} B, over the {} B text cap — refused \
+                     before it is read, not after",
+                    t.key,
+                    t.nbytes(),
+                    limits::MAX_DOC_TEXT_BYTES
+                ),
+            );
+        }
+        let mut buf = Vec::with_capacity(t.nbytes() as usize);
+        carrier::Region::open(path, h.data_start, t)?
+            .read_to_end(&mut buf)
+            .map_err(|e| tensorfs_core::err::Refusal {
+                code: tensorfs_core::err::Code::IO_FAILED,
+                detail: format!("{}: read marker payload: {e}", t.key),
+            })?;
+        read += buf.len() as u64;
+        let q = fingerprint::decode_comfy_quant(&t.key, &buf)?;
+        let module = &t.key[..t.key.len() - ".comfy_quant".len()];
+        let roles: Vec<&'static str> = fingerprint::ROLE_SUFFIXES
+            .iter()
+            .filter(|s| h.get(&format!("{module}{s}")).is_some())
+            .copied()
+            .collect();
+        out.push((t.key.clone(), q, roles));
+    }
+    Ok((out, read))
+}
+
+/// Print the decoded markers as typed evidence, grouped, plus the one cross-check worth
+/// having: the producer says which modules keep a full-precision matmul, and the carrier's
+/// own roles say which modules have no `.input_scale`. On the real fl2va DiT those are the
+/// same 50 modules. A divergence would mean the marker and the bytes disagree — which is
+/// exactly why selection reads the roles and never the marker.
+fn print_markers(rows: &[Marker], read: u64) {
+    let mut groups: Vec<(String, bool, Vec<&'static str>, usize)> = Vec::new();
+    let mut divergent = 0usize;
+    for (_, q, roles) in rows {
+        if q.full_precision_matrix_mult == roles.contains(&".input_scale") {
+            divergent += 1;
+        }
+        match groups
+            .iter_mut()
+            .find(|(f, b, r, _)| *f == q.format && *b == q.full_precision_matrix_mult && r == roles)
+        {
+            Some((_, _, _, n)) => *n += 1,
+            None => groups.push((
+                q.format.clone(),
+                q.full_precision_matrix_mult,
+                roles.clone(),
+                1,
+            )),
+        }
+    }
+    groups.sort_by_key(|(_, _, _, n)| std::cmp::Reverse(*n));
+    println!(
+        "  markers      {} .comfy_quant payloads decoded, {read} tensor B read",
+        rows.len()
+    );
+    for (fmt, fp, roles, n) in &groups {
+        println!("    {n:>6}     format {fmt} · full_precision_matrix_mult {fp} · roles {roles:?}");
+    }
+    println!(
+        "    cross-check  {} of {} agree with the carrier's own roles ({divergent} diverge) — \
+         the border selects on the ROLES either way",
+        rows.len() - divergent,
+        rows.len()
+    );
+}
+
 // ------------------------------------------------------------------ inspect
 
 /// Hermetic bounded decode plus classification. The pickle / archive / GGUF refusals are
@@ -233,7 +328,7 @@ pub fn cmd_inspect(f: &Flags) -> ExitCode {
     };
     let reg = load_registry(f).ok();
     let t0 = Instant::now();
-    let mut total_header = 0u64;
+    let (mut total_header, mut marker_bytes) = (0u64, 0u64);
 
     for (component, path) in &srcs {
         println!("{component}  {}", path.display());
@@ -267,6 +362,19 @@ pub fn cmd_inspect(f: &Flags) -> ExitCode {
                 println!("  stamp        {k} = {v:?}");
             }
         }
+        if flag_on(f, "markers") {
+            if path.extension().map(|e| e == "json").unwrap_or(false) {
+                println!("  markers      (a header-only evidence file has no data region to read)");
+            } else {
+                let (rows, read) = ok!(marker_evidence(path, &h));
+                marker_bytes += read;
+                if rows.is_empty() {
+                    println!("  markers      none");
+                } else {
+                    print_markers(&rows, read);
+                }
+            }
+        }
         match &reg {
             None => println!("  verdict      (no registry loaded)"),
             Some(r) => match r.classify(&fp) {
@@ -284,8 +392,12 @@ pub fn cmd_inspect(f: &Flags) -> ExitCode {
         }
     }
     println!(
-        "read {total_header} B of headers in {:.1} ms, zero tensor bytes, peak RSS {:.1} MiB",
+        "read {total_header} B of headers in {:.1} ms, {} tensor bytes, peak RSS {:.1} MiB",
         t0.elapsed().as_secs_f64() * 1000.0,
+        match marker_bytes {
+            0 => "zero".to_string(),
+            n => format!("{n} marker"),
+        },
         rss_kb("VmHWM") as f64 / 1024.0
     );
     ExitCode::SUCCESS
@@ -472,6 +584,15 @@ fn print_plan(p: &Prepared) {
         "inherit      {} tensors carry by object reference (zero re-hash)",
         pl.inherited()
     );
+    // The seam's own decomposition. proto-001 #322 measured the real one at 1,376,256 B
+    // runs — 5,376x the synthetic fixture's 256 B — so the class printed here is the
+    // difference between a copy that rides the staging pass and real budgeted work.
+    if let Some((ops, bytes, runs, mean, class)) = pl.permutes() {
+        println!(
+            "permute      {ops} ops over {bytes} source B — {runs} runs, mean run {mean} B, \
+             class {class}"
+        );
+    }
     println!(
         "dropped      {} marker tensors, {} role siblings folded into their base",
         pl.dropped_markers.len(),
@@ -512,6 +633,15 @@ pub fn cmd_plan(target: &str, f: &Flags) -> ExitCode {
         );
     }
     print_plan(&p);
+    // The canonical key set this plan produces, for cross-plane comparison against another
+    // packaging's index. Emitted on request rather than always: it is 639 lines on the real
+    // native DiT, and it exists so the convergence claim can be CHECKED by a caller that
+    // holds the other packaging, without a second copy of the rekey map anywhere.
+    if flag_on(f, "keys") {
+        for o in &p.plan.ops {
+            println!("key          {}", o.out_key);
+        }
+    }
     // The refusal a preview exists to deliver: a bit-identical copy must never stamp as a
     // new encoding, and finding that out costs a header read rather than a rented GPU.
     if let Err(e) = p.plan.check_converts_something() {
@@ -1208,6 +1338,12 @@ pub fn cmd_converters() -> ExitCode {
             }
         );
         println!("  {}", c.doc);
+        for s in convert::seams(c) {
+            println!(
+                "  seam   {:<34} head dim from {}, members {:?}",
+                s.fused, s.norm, s.members
+            );
+        }
         for (name, x) in convert::golden_cases(c) {
             println!(
                 "  golden {name:<34} {} B in, {} B out",

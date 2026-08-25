@@ -53,7 +53,9 @@
 //! --config <c>=<path> --registry <path> --spec-variant <n> --session <s> --tenant <t>
 //! --ttl <s> --rekey <c>=<from>:<to> --rlimit-as-mb/-cpu-s/-fsize-mb --no-netns --now
 //!
-//!   tfs ingest inspect                       hermetic bounded decode + classification
+//!   tfs ingest inspect [--markers]           hermetic bounded decode + classification
+//!                                            --markers also decodes the `.comfy_quant`
+//!                                            payloads — the only tensor bytes inspect reads
 //!   tfs ingest bank <dialect> <fam> <var> <converter>   the REVIEW act: bank a fingerprint
 //!   tfs ingest plan <c=alias,...>            the plan, from headers alone: 0 tensor bytes
 //!   tfs ingest run <root> <c=alias,...>      spawn the isolated worker; candidate + receipt

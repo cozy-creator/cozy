@@ -81,11 +81,16 @@ pub const CONVERTERS: [Converter; 4] = [
     },
     Converter {
         name: "h3.native/1",
-        dialect: "safetensors.single_file",
+        dialect: "safetensors.h3_native",
         class: Class::Permutation,
-        doc: "H3 native spelling: head-interleaved fused QKV split into canonical per-head \
-              contiguous Q|K|V, SwiGLU fused MLP halves put in canonical (gate, up) order, \
-              video-VAE fused QKV and `w1` mapped. Reordering only — never arithmetic.",
+        doc: "H3 native spelling: every head-interleaved fused `attn.qkv_proj` split into the \
+              canonical per-head contiguous to_q|to_k|to_v, and the ratified rekey rows moved \
+              with it. Reordering only — never arithmetic. A fused attention key this \
+              converter has NO banked seam for refuses rather than carrying through.",
+        // The GEOMETRY is now read from the real native header and the split runs on real
+        // bytes at miniature scale — but the 66 GB native tensors have never met it, and
+        // nothing has compared a produced `to_q` against the diffusers packaging's own.
+        // That convergence is what flips this, and it needs both trees' weights.
         validated_on_real_bytes: false,
     },
 ];
@@ -251,6 +256,35 @@ impl Plan {
             }
         }
         out
+    }
+
+    /// The decomposition this plan's permutes actually buy — the number #322 says is the
+    /// whole question: `(ops, source bytes, runs, mean run, class)`. Computed from the
+    /// declared geometry in O(ops), and it is what tells a reader whether the seam rides a
+    /// copy at ~zero marginal cost or is real work with its own budget.
+    pub fn permutes(&self) -> Option<(usize, u64, usize, u64, &'static str)> {
+        let (mut ops, mut bytes, mut runs, mut gather) = (0usize, 0u64, 0usize, false);
+        for o in &self.ops {
+            for r in &o.roles {
+                if let Bytes::Permute { xform, .. } = &r.bytes {
+                    let d = xform.runs();
+                    ops += 1;
+                    bytes += d.bytes;
+                    runs += d.runs.len();
+                    gather |= d.class == crate::fill::Class::Gather;
+                }
+            }
+        }
+        match runs {
+            0 => None,
+            n => Some((
+                ops,
+                bytes,
+                n,
+                bytes / n as u64,
+                if gather { "gather" } else { "long-run" },
+            )),
+        }
     }
 
     pub fn declared_bytes(&self) -> Result<u64> {
@@ -820,6 +854,30 @@ fn plan_carrier(
         };
         let present_sfx: Vec<&'static str> = siblings.iter().map(|(s, _)| *s).collect();
 
+        // A reviewed SEAM: this fused key is not ONE output tensor, it is several, and the
+        // geometry that cuts it is read off the carrier's own sibling norm.
+        if let Some(seam) = seams(conv).iter().find(|s| t.key.ends_with(s.fused)) {
+            plan_seam(conv, component, file, h, seam, t, &siblings, cands.plain, p)?;
+            continue;
+        }
+        // A permutation converter that carried a fused attention key THROUGH would emit a
+        // canonical tensor with the right name, dtype and shape and a packing no destination
+        // expects — the same silent class as a flat three-way split, one level up.
+        if conv.class == Class::Permutation && is_fused_attention(&t.key) {
+            return refuse(
+                Code::SEAM_UNBANKED,
+                format!(
+                    "{}: a fused attention projection, and {} banks no seam for it. Its \
+                     reviewed seams are {:?}. A permutation converter does not carry a fused \
+                     key through — the head geometry of THIS module family has never been \
+                     measured, and guessing it is the ~90% numerical error that does not crash.",
+                    t.key,
+                    conv.name,
+                    seams(conv).iter().map(|s| s.fused).collect::<Vec<_>>()
+                ),
+            );
+        }
+
         // A real component is MIXED: a quantized weight sits beside its own unquantized
         // bias and the norms the producer's eligibility predicate skipped. A tensor with NO
         // companion roles is plain storage. One rule over every tensor in a tree is the
@@ -982,6 +1040,90 @@ fn plan_carrier(
     Ok(())
 }
 
+/// Plan ONE fused key into its members. Nothing is read: the cut comes from the declared
+/// geometry plus the sibling norm's width, both header facts.
+#[allow(clippy::too_many_arguments)]
+fn plan_seam(
+    conv: &Converter,
+    component: &str,
+    file: usize,
+    h: &SourceHeader,
+    seam: &Seam,
+    t: &super::carrier::SourceTensor,
+    siblings: &[(&'static str, &super::carrier::SourceTensor)],
+    plain: &EncodingSpec,
+    p: &mut Plan,
+) -> Result<()> {
+    if !siblings.is_empty() {
+        return refuse(
+            Code::SEAM_UNBANKED,
+            format!(
+                "{}: a fused attention key carrying encoding roles {:?}. The banked seam cuts \
+                 the DATA role on whole head groups; where the same cut lands on a companion \
+                 scale is banked for no artifact that exists, and splitting a weight while \
+                 leaving its scale whole is the silent-wrong-numbers class exactly. The \
+                 remedy derives from the target: the priced job over the plain source.",
+                t.key,
+                siblings.iter().map(|(s, _)| *s).collect::<Vec<_>>()
+            ),
+        );
+    }
+    if !plain.admits_logical(t.dtype) {
+        return refuse(
+            Code::DTYPE_MISMATCH,
+            format!(
+                "{}: plain/1 does not admit logical {}",
+                t.key,
+                t.dtype.name()
+            ),
+        );
+    }
+    let rows = match t.shape.first() {
+        Some(r) => *r,
+        None => {
+            return refuse(
+                Code::SHAPE_MISMATCH,
+                format!("{}: a rank-0 tensor has no fused axis", t.key),
+            )
+        }
+    };
+    let base = &t.key[..t.key.len() - seam.fused.len()];
+    let row_bytes = checked_bytes(&t.key, &t.shape[1..], t.dtype)?;
+    let (groups, unit_bytes) =
+        h3_geometry(h, &t.key, &format!("{base}{}", seam.norm), rows, row_bytes)?;
+    check_permute_size(&t.key, t.nbytes())?;
+
+    let mut shape = t.shape.clone();
+    shape[0] = rows / 3;
+    for (i, leaf) in seam.members.iter().enumerate() {
+        p.ops.push(Op {
+            component: component.to_string(),
+            out_key: rekey(conv, &format!("{base}{leaf}")),
+            encoding: "plain/1".to_string(),
+            encoding_id: plain.object_id(),
+            logical_dtype: t.dtype,
+            logical_shape: shape.clone(),
+            roles: vec![RolePlan {
+                role: role_map("plain/1")?.data.to_string(),
+                dtype: t.dtype,
+                shape: shape.clone(),
+                bytes: Bytes::Permute {
+                    file,
+                    key: t.key.clone(),
+                    xform: Xform::QkvSplit {
+                        groups,
+                        shares: [1, 1, 1],
+                        take: i as u8,
+                        unit_bytes,
+                    },
+                },
+            }],
+            effect: Effect::Permute,
+        });
+    }
+    Ok(())
+}
+
 /// A reviewed tier-1 REKEY: a prefix substitution that moves keys and no bytes.
 ///
 /// This is the v1 quarry's `anima.net-to-prefixed@1` shape — "a new manifest over the same
@@ -1099,8 +1241,100 @@ fn rekey(conv: &Converter, key: &str) -> String {
             .find(|(from, _)| key.starts_with(*from))
             .map(|(from, to)| format!("{to}{}", &key[from.len()..]))
             .unwrap_or_else(|| key.to_string()),
+        // Leaf first, then the block prefix — the two halves of the ratified map's own
+        // `rekey` block, applied in the order it lists them.
+        "h3.native/1" => {
+            let leafed = H3_NATIVE_LEAVES
+                .iter()
+                .find(|(from, _)| key.ends_with(*from))
+                .map(|(from, to)| format!("{}{to}", &key[..key.len() - from.len()]))
+                .unwrap_or_else(|| key.to_string());
+            H3_NATIVE_PREFIXES
+                .iter()
+                .find(|(from, _)| leafed.starts_with(*from))
+                .map(|(from, to)| format!("{to}{}", &leafed[from.len()..]))
+                .unwrap_or(leafed)
+        }
         _ => key.to_string(),
     }
+}
+
+/// The ratified H3 native → canonical (Diffusers) key map, INVERTED from the v1 seam
+/// registry `minimax-h3.split-to-fused-qkv.v1.json` (`digest 18ed116c…`, banked in
+/// h3-evidence's reconciliation row). Its `rekey` block is these five leaf rewrites plus the
+/// block prefix; nothing here is inferred from a name similarity.
+///
+/// The 18 native top-level keys the ratified map does NOT cover (`rope.inv_freq`,
+/// `audio_patch_proj`, `video_patch_proj`, `condition_proj`, `final_layer.*`,
+/// `time_embedder.proj_in/out`) pass through UNRENAMED, exactly as an unlisted single-file
+/// prefix does. The Diffusers packaging has 17 top-level keys nothing reaches
+/// (`audio_proj_in/out`, `context_embedder`, `norm_out.*`, `proj_in/out`,
+/// `time_embedder.linear_1/2`) and native carries one extra buffer — which IS the
+/// reconciliation's `-4 unfused token_refiner keys +1 buffer` residual, arithmetic that
+/// closes only because the correspondence is left unclaimed rather than guessed.
+const H3_NATIVE_LEAVES: [(&str, &str); 5] = [
+    (".attn.out_proj.weight", ".attn.to_out.0.weight"),
+    (".attn.q_norm.weight", ".attn.norm_q.weight"),
+    (".attn.k_norm.weight", ".attn.norm_k.weight"),
+    (".mlp.fc1.weight", ".ff.net.0.proj.weight"),
+    (".mlp.fc2.weight", ".ff.net.2.weight"),
+];
+
+const H3_NATIVE_PREFIXES: [(&str, &str); 2] = [
+    ("token_refiner.blocks.", "token_refiner.refiner_blocks."),
+    ("blocks.", "transformer_blocks."),
+];
+
+/// A reviewed SEAM: one fused carrier key becomes several canonical keys under a
+/// permutation rule, and the geometry is READ from a named sibling rather than assumed.
+///
+/// Keyed on the module LEAF, not on a block family. v1's seam enumerated
+/// `blocks.{i}.attn.qkv_proj.weight` and therefore covered 50 of the real artifact's 52
+/// fused modules — the two `token_refiner` attentions fell out, and a converter that fuses
+/// 50 produces a key set the real native artifact does not have (h3-evidence reconciliation,
+/// `action_for_tfs_003`). A leaf-keyed seam covers every attention module family there is,
+/// and each one's head dim comes from its OWN `q_norm`.
+pub struct Seam {
+    pub fused: &'static str,
+    /// The sibling whose width IS the head dim. Never a constant (see `h3_geometry`).
+    pub norm: &'static str,
+    /// Canonical leaf per member, in SOURCE order: the fused axis is (q, k, v) per head.
+    pub members: [&'static str; 3],
+}
+
+pub const H3_ATTENTION_SEAM: [Seam; 1] = [Seam {
+    fused: ".attn.qkv_proj.weight",
+    norm: ".attn.q_norm.weight",
+    members: [
+        ".attn.to_q.weight",
+        ".attn.to_k.weight",
+        ".attn.to_v.weight",
+    ],
+}];
+
+pub fn seams(c: &Converter) -> &'static [Seam] {
+    match c.name {
+        "h3.native/1" => &H3_ATTENTION_SEAM,
+        _ => &[],
+    }
+}
+
+/// Does this key name a FUSED attention projection at all? The spellings are the ones the
+/// pinned H3 tree actually ships: the DiT's `attn.qkv_proj`, the video VAE's 1x1-conv
+/// `attn.to_qkv`, the text encoder's and audio VAE's `attn.qkv`.
+///
+/// A PERMUTATION-class converter that leaves one of these unsplit would emit a canonical
+/// tensor whose every name, dtype and shape is right and whose contents are a packing no
+/// destination expects. Identity converters are not governed: for them "bytes as arrived"
+/// IS the contract, and the fused key stays fused and says so.
+pub fn is_fused_attention(key: &str) -> bool {
+    let base = key
+        .strip_suffix(".weight")
+        .or_else(|| key.strip_suffix(".bias"))
+        .unwrap_or(key);
+    base.ends_with(".attn.qkv_proj")
+        || base.ends_with(".attn.to_qkv")
+        || base.ends_with(".attn.qkv")
 }
 
 /// The reviewed single-file → canonical component prefix map. Data, not inference: a prefix

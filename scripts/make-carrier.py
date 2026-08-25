@@ -3,7 +3,8 @@
 
 Not a codec and not a second implementation: it writes ONE tiny well-formed safetensors
 file and then damages it in exactly one named way, so the border's refusal can be observed
-against a defect whose shape is known. Every variant is 3 tensors and a few hundred bytes.
+against a defect whose shape is known. Most variants are a handful of tensors and a few
+hundred bytes; the `native-qkv` family is ~64 KB so its permuted members clear the inline cap.
 """
 import json
 import struct
@@ -14,12 +15,16 @@ VARIANTS = [
     "header-cap", "truncated", "geometry", "overlap", "gap",
     "dtype-unknown", "duplicate-key", "float-dim", "no-tensors", "bnb", "deep",
     "mixed-fp8", "mixed-fp8-spoof", "rowwise-keepdim",
+    "native-qkv", "native-qkv-nonorm", "native-qkv-odd", "native-qkv-encoded",
+    "native-qkv-vae",
+    "marker-malformed",
 ]
 
 # One module's worth of ComfyUI `scaled_fp8` marker payload, byte-for-byte the shape the
 # real artifact ships. The planner never reads these bytes — they are here so a marker CAN
 # lie and be seen not to matter.
 MARKER = b'{"format": "float8_e4m3fn"}'
+MARKER_FP = b'{"format": "float8_e4m3fn", "full_precision_matrix_mult": true}'
 
 
 def mixed_fp8(spoof):
@@ -36,6 +41,10 @@ def mixed_fp8(spoof):
         "qkv.weight": ("F8_E4M3", [4, 8], 32),
         "qkv.weight_scale": ("F32", [], 4),
     }
+    # The real 150/50 shape: the module with both scales carries the plain marker, the
+    # weight-scale-only module carries `full_precision_matrix_mult`. On the real fl2va DiT
+    # those 50 are exactly the `mlp.fc2` ones — the fact `inspect --markers` cross-checks.
+    t["fc2.comfy_quant"] = ("U8", [len(MARKER_FP)], len(MARKER_FP))
     if spoof:
         # A marker on a PLAIN bf16 tensor that has no companion role anywhere, naming an
         # encoding whose siblings are absent. Selection reads siblings, not markers.
@@ -43,12 +52,55 @@ def mixed_fp8(spoof):
     return dict(sorted(t.items()))
 
 
-def body(tensors):
+def native_qkv(kind):
+    """H3 native spelling in miniature, with REAL bytes.
+
+    head_dim comes from `q_norm` (4), the fused axis is 24 = 2 groups x 3 x 4, and one row is
+    64 BF16 elements = 128 B — so the seam's unit is 512 B and each member is 1,024 B, over
+    the 256 B inline threshold, which is what puts the permuted bytes through the real object
+    path rather than into the header. The real artifact's numbers are 56 x 128 x 10,752 B;
+    the SHAPE of the fact is reproduced here at a size the transaction runs in milliseconds.
+
+    Both attention module families are present, which is the 50-vs-52 defect the v1 seam had.
+    """
+    def block(p):
+        return {
+            f"{p}.attn.q_norm.weight": ("BF16", [4], 8),
+            f"{p}.attn.k_norm.weight": ("BF16", [4], 8),
+            f"{p}.attn.qkv_proj.weight": ("BF16", [24, 64], 3072),
+            f"{p}.attn.out_proj.weight": ("BF16", [64, 32], 4096),
+            f"{p}.mlp.fc1.weight": ("BF16", [128, 64], 16384),
+            f"{p}.mlp.fc2.weight": ("BF16", [64, 64], 8192),
+            f"{p}.norm1.weight": ("BF16", [64], 128),
+        }
+    t = {"rope.inv_freq": ("F32", [2], 8)}
+    t.update(block("blocks.0"))
+    t.update(block("token_refiner.blocks.0"))
+    if kind == "nonorm":
+        # The head dim is READ, never assumed: remove the sibling it is read from.
+        t.pop("blocks.0.attn.q_norm.weight")
+    if kind == "odd":
+        # 25 rows do not divide into 3 x 4. Geometry refuses; nothing is guessed.
+        t["blocks.0.attn.qkv_proj.weight"] = ("BF16", [25, 64], 3200)
+    if kind == "vae":
+        # The video VAE's 1x1-conv spelling. A fused attention projection whose head
+        # geometry this converter banks no seam for — it must refuse, never carry through.
+        t["decoder.transformer_blocks.0.attn.to_qkv.weight"] = ("BF16", [24, 64], 3072)
+    if kind == "encoded":
+        # A fused key carrying an encoding role: where the head-group cut lands on a scale
+        # is banked for no artifact that exists.
+        t["blocks.0.attn.qkv_proj.weight"] = ("F8_E4M3", [24, 64], 1536)
+        t["blocks.0.attn.qkv_proj.weight_scale"] = ("F32", [], 4)
+    return dict(sorted(t.items()))
+
+
+def body(tensors, payloads=None):
     """{name: (dtype, shape, nbytes)} -> (header dict, payload)"""
     header, blob, off = {}, bytearray(), 0
     for name, (dt, shape, n) in tensors.items():
         header[name] = {"dtype": dt, "shape": list(shape), "data_offsets": [off, off + n]}
-        blob += bytes((i * 37 + 11) % 256 for i in range(n))
+        fixed = (payloads or {}).get(name)
+        blob += fixed if fixed is not None else bytes((i * 37 + 11) % 256 for i in range(n))
         off += n
     return header, bytes(blob)
 
@@ -113,7 +165,21 @@ def main(variant, path):
         h2, blob2 = body(b2)
         write(path, h2, blob2)
     elif variant in ("mixed-fp8", "mixed-fp8-spoof"):
-        h2, blob2 = body(mixed_fp8(variant.endswith("spoof")))
+        pay = {"qkv.comfy_quant": MARKER, "fc2.comfy_quant": MARKER_FP,
+               "norm.comfy_quant": MARKER}
+        h2, blob2 = body(mixed_fp8(variant.endswith("spoof")), pay)
+        write(path, h2, blob2)
+    elif variant == "marker-malformed":
+        # A payload that is not the marker vocabulary: `format` absent. The decoder refuses
+        # typed rather than defaulting a format nobody wrote.
+        bad = b'{"quant_algo": "fp8"}'
+        h2, blob2 = body({"a.weight": ("F16", [4, 8], 64),
+                          "a.comfy_quant": ("U8", [len(bad)], len(bad))},
+                         {"a.comfy_quant": bad})
+        write(path, h2, blob2)
+    elif variant.startswith("native-qkv"):
+        kind = variant[len("native-qkv"):].lstrip("-")
+        h2, blob2 = body(native_qkv(kind))
         write(path, h2, blob2)
     elif variant == "rowwise-keepdim":
         h2, blob2 = body(dict(sorted({

@@ -406,6 +406,58 @@ pub struct Region {
     left: u64,
 }
 
+/// A reader over ONE MEMBER of a fused tensor, taken from the carrier in DESTINATION order,
+/// one contiguous run at a time.
+///
+/// This is what keeps a permutation-class converter inside the border's constant-memory
+/// claim. The decomposition is arithmetic (`crate::fill`), so every run's source offset is
+/// known before a byte moves — there is no reason to hold the fused tensor. Buffering it
+/// would make peak RSS a function of the artifact: the real H3 `attn.qkv_proj.weight` is
+/// 231,211,008 B, which is 33x the whole SDXL ingest's measured peak. Here the resident cost
+/// is ONE RUN — 1,376,256 B on that same tensor — and the writer downstream cannot be handed
+/// more bytes than the geometry promised, exactly as with `Region`.
+pub struct RunRegion {
+    f: File,
+    base: u64,
+    runs: std::vec::IntoIter<crate::fill::Run>,
+    left: u64,
+}
+
+impl RunRegion {
+    pub fn open(
+        path: &Path,
+        data_start: u64,
+        t: &SourceTensor,
+        d: crate::fill::Decomposition,
+    ) -> Result<RunRegion> {
+        let f = File::open(path).map_err(|e| io(format!("open {}", path.display()), e))?;
+        Ok(RunRegion {
+            f,
+            base: data_start + t.begin,
+            runs: d.runs.into_iter(),
+            left: 0,
+        })
+    }
+}
+
+impl Read for RunRegion {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        while self.left == 0 {
+            match self.runs.next() {
+                None => return Ok(0),
+                Some(r) => {
+                    self.f.seek(SeekFrom::Start(self.base + r.src_off))?;
+                    self.left = r.len;
+                }
+            }
+        }
+        let cap = (buf.len() as u64).min(self.left) as usize;
+        let n = self.f.read(&mut buf[..cap])?;
+        self.left -= n as u64;
+        Ok(n)
+    }
+}
+
 impl Region {
     pub fn open(path: &Path, data_start: u64, t: &SourceTensor) -> Result<Region> {
         let mut f = File::open(path).map_err(|e| io(format!("open {}", path.display()), e))?;

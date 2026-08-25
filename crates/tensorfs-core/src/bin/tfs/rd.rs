@@ -506,12 +506,18 @@ pub fn cmd_transform() -> ExitCode {
     println!("the ONE fill-transform implementation — decomposition is arithmetic, not a walk\n");
     let cases: [(&str, Xform, u64); 3] = [
         (
-            "h3 fused qkv, 56 head-major groups",
+            // THE REAL GEOMETRY (proto-001 #322). This case used to carry unit_bytes 256 —
+            // a 128-wide row — and printed `class gather`, which is where the whole
+            // "the fill-transform rides the staging copy because a gather is expensive"
+            // prior came from. The real `blocks.{i}.attn.qkv_proj.weight` is [21504, 5376]
+            // BF16: the unit is 128 rows x 10,752 B = 1,376,256 B, 5,376x longer, and the
+            // seam is squarely LONG-RUN.
+            "h3 fused qkv, 56 head-major groups, [21504, 5376] bf16",
             Xform::QkvSplit {
                 groups: 56,
                 shares: [1, 1, 1],
                 take: 0,
-                unit_bytes: 256,
+                unit_bytes: 128 * 5376 * 2,
             },
             1,
         ),
