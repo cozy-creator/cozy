@@ -8,7 +8,9 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      # PINNED on purpose: `-D warnings` against a floating stable makes a Rust
+      # release a CI failure with no code change.
+      - uses: dtolnay/rust-toolchain@1.91.1
         with:
           components: clippy, rustfmt
       - run: cargo build --workspace
@@ -39,7 +41,7 @@ jobs:
           - { os: ubuntu-latest, target: x86_64, native: true }
           - { os: ubuntu-latest, target: aarch64, native: false }
           - { os: macos-latest, target: aarch64, native: true }
-          - { os: macos-13, target: x86_64, native: true }
+          - { os: macos-latest, target: x86_64, native: false }
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4

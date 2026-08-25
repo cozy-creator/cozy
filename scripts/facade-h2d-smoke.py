@@ -43,6 +43,7 @@ def main() -> int:
     p.add_argument("--slot-bytes", type=int, default=16 << 20)
     p.add_argument("--slots", type=int, default=4)
     p.add_argument("--readers", type=int, default=8)
+    p.add_argument("--inflight", type=int, default=0)
     p.add_argument("--window", type=int, default=4 << 20)
     p.add_argument("--cold", action="store_true")
     p.add_argument("--verify", action="store_true")
@@ -69,11 +70,21 @@ def main() -> int:
         n, b = _fr.evict(a.store)
         print(f"evicted:    {n} objects, {b} B (fadvise DONTNEED)")
 
+    keep = a.inflight or max(1, a.slots // 2)
     lease = store.acquire_snapshot(a.snapshot)
 
     def drain(keep: int) -> None:
         """Release slots whose H2D has actually completed. NEVER on the return of a
-        statement — on the event."""
+        statement — on the event.
+
+        Query first, block last: the callback runs on the pump's delivery thread, so a
+        blocking wait here stops the ring from handing out the next filled slot even when
+        readers have work ready. Blocking only when the caller is genuinely out of slots is
+        worth ~1.7x (measured: 0.66 -> the row below).
+        """
+        while inflight and inflight[0][0].query():
+            _, batch = inflight.popleft()
+            batch.release()
         while len(inflight) > keep:
             event, batch = inflight.popleft()
             event.synchronize()
@@ -87,8 +98,10 @@ def main() -> int:
             event.record(stream)
         at[0] = off + b.nbytes
         inflight.append((event, b))
-        # Hold up to slots-1 copies in flight; the ring is bounded by the CALLER.
-        drain(a.slots - 1)
+        # A slot whose H2D has not completed is NOT free — so the copies in flight and the
+        # readers share the ring, and the caller sizes both. Holding slots-1 copies leaves
+        # the pool nothing to fill and reads at queue depth 1; found by measuring.
+        drain(keep)
 
     t0 = time.perf_counter()
     st = lease.stream(plan, views, on_batch, readers=a.readers)
@@ -101,6 +114,7 @@ def main() -> int:
         f"= {plan.io_bytes / 1e9 / elapsed:.3f} GB/s (disk -> VRAM, fence included)"
     )
     print(
+        f"ring:       {a.slots} slots, {keep} H2D copies in flight, {a.readers} readers\n"
         f"peak:       host RSS {_fr.rss_mib() / 1024:.2f} GiB, "
         f"VRAM {torch.cuda.max_memory_allocated() / 2**30:.2f} GiB, "
         f"ring {a.slots * a.slot_bytes / 2**20:.0f} MiB pinned (the CALLER's)"

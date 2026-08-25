@@ -464,7 +464,7 @@ pub fn cmd_fuzz(root: &Path, hex: &str, iters: u64) -> ExitCode {
         }
     }
     let secs = t.elapsed().as_secs_f64();
-    codes.sort_by(|a, b| b.1.cmp(&a.1));
+    codes.sort_by_key(|c| std::cmp::Reverse(c.1));
     println!(
         "fuzz: {iters} mutants of a {} B canonical snapshot in {secs:.2}s ({:.0} µs each)",
         base.len(),
