@@ -8,6 +8,8 @@ jobs:
       - uses: actions/setup-go@v5
         with:
           go-version: stable
-      - run: go build ./...
+      # The embedded libSQL driver is CGO-based (cl-009); qualifying the static
+      # cross-platform build per platform is cl-013's distribution work.
+      - run: CGO_ENABLED=1 go build ./...
       - run: go vet ./...
       - run: python3 scripts/fence.py
