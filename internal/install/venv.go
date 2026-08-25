@@ -17,6 +17,7 @@ import (
 	"strings"
 	"syscall"
 
+	"github.com/cozy-creator/cozy-creator-v2/internal/config"
 	"github.com/cozy-creator/cozy-creator-v2/internal/exit"
 )
 
@@ -68,10 +69,9 @@ func BuildVenv(sourceDir, venvDir string) (*Env, *exit.Error) {
 	}
 	cmd := exec.Command("uv", args...)
 	cmd.Dir = sourceDir
-	cmd.Env = append(os.Environ(),
+	cmd.Env = config.Frozen().Tool(
 		"UV_PROJECT_ENVIRONMENT="+venvDir,
 		"UV_LINK_MODE="+env.LinkMode,
-		"NO_COLOR=1",
 	)
 	var out strings.Builder
 	cmd.Stdout, cmd.Stderr = &out, &out
@@ -330,7 +330,7 @@ func toolVersion(name string, args ...string) string {
 
 func runOut(name string, args ...string) string {
 	cmd := exec.Command(name, args...)
-	cmd.Env = append(os.Environ(), "NO_COLOR=1")
+	cmd.Env = config.Frozen().Tool()
 	out, err := cmd.Output()
 	if err != nil {
 		return ""

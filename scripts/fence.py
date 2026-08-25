@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Boundary fence (boundaries.md). Architecture enforcement, not a test.
 
-Five families:
+Eight families:
   deps      forbidden dependencies (raw lines, incl. import paths and go.mod)
   impl      storage/chunk/loader/residency/tensor implementation vocabulary — cozy-creator
             renders and coordinates, it never implements the byte plane (TensorFS owns it)
@@ -10,6 +10,14 @@ Five families:
   manifest  a reclaiming/removing verb must DECLARE its gate: Destructive (exit 7 without
             --yes) or PlanFirst (a read without --yes) — exactly one, and it must
             advertise --yes. Nothing removes bytes on a bare invocation.
+  env       (cl-001) the environment is read in internal/config/config.go and NOWHERE else:
+            one entrypoint reader, a frozen typed value thereafter.
+  store     (cl-001) no second lifecycle store: the ONE local libSQL database is the
+            authority, so a state.json/pidfile-class sidecar name is a violation wherever
+            it appears — those sidecars outlive their launcher and lie.
+  cloud     (cl-001) no Tensorhub implementation and no cloud policy here: cozy-creator
+            shares schemas and the client contract, and emulates nothing. Local grants are
+            a CAS root plus an output dir; a minted bearer/JWT token would be a fake.
 
 Identifier families scan Go source with comments and string literals removed, so a
 word inside help text or a doc comment is never a violation. Doors, both greppable:
@@ -36,6 +44,17 @@ DENY_PROMPT = {"ReadPassword", "readline", "promptui", "survey"}
 DENY_PROMPT_CALLS = [
     "fmt.Scan", "fmt.Scanln", "fmt.Scanf", "fmt.Fscan", "fmt.Fscanln", "fmt.Fscanf",
 ]
+
+# The ONE environment reader. Every other package takes the frozen typed value.
+ENV_READER = "internal/config/config.go"
+DENY_ENV_CALLS = ["os.Getenv", "os.LookupEnv", "os.Environ", "syscall.Getenv", "syscall.Environ"]
+
+# Lifecycle-sidecar names, matched on RAW lines (a comment naming one is still a plan to
+# write one). The libSQL database is the sole lifecycle authority.
+DENY_STORE = ["state.json", "status.json", "workers.json", "sessions.json", "pidfile", ".pidfile"]
+
+# Cloud emulation and fabricated credentials, as bare identifiers.
+DENY_CLOUD = {"tensorhub", "jwt", "Bearer", "SignedString", "mintToken", "ServiceClass"}
 
 ALLOW_DOOR = "//cozy:allow"
 STDIN_DOOR = "//cozy:stdin-value"
@@ -90,6 +109,10 @@ def check_sources():
             for d in DENY_DEPS:
                 if re.search(r"(?<![\w.-])" + re.escape(d) + r"(?![\w-])", s, re.I):
                     bad.append(f"{p}:{i}: [deps] forbidden dependency '{d}': {s}")
+            for d in DENY_STORE:
+                if d in s.lower():
+                    bad.append(f"{p}:{i}: [store] lifecycle sidecar '{d}' — the one libSQL "
+                               f"database is the authority: {s}")
         if p.suffix != ".go":
             continue
         for i, line in enumerate(strip_go(raw).splitlines(), 1):
@@ -103,7 +126,15 @@ def check_sources():
             for call in DENY_PROMPT_CALLS:
                 if re.search(r"(?<![\w.])" + re.escape(call) + r"\s*\(", line):
                     bad.append(f"{p}:{i}: [prompt] '{call}' reads input — no cozy command may prompt: {line.strip()}")
+            if str(p).replace("\\", "/") != ENV_READER:
+                for call in DENY_ENV_CALLS:
+                    if re.search(r"(?<![\w.])" + re.escape(call) + r"\s*\(", line):
+                        bad.append(f"{p}:{i}: [env] '{call}' outside {ENV_READER} — the "
+                                   f"environment is read once, at the entrypoint: {line.strip()}")
             for ident in idents:
+                if ident in DENY_CLOUD:
+                    bad.append(f"{p}:{i}: [cloud] '{ident}' — cozy-creator emulates no cloud "
+                               f"policy and mints no credential: {line.strip()}")
                 if ident in DENY_PROMPT:
                     bad.append(f"{p}:{i}: [prompt] '{ident}' reads input — no cozy command may prompt: {line.strip()}")
                 if ident == "Stdin" and STDIN_DOOR not in src_line:
@@ -192,5 +223,6 @@ if violations:
 print(
     f"fence green — deps({len(DENY_DEPS)}) impl({len(DENY_IMPL)}) "
     f"prompt({len(DENY_PROMPT) + len(DENY_PROMPT_CALLS) + 1}) matrix(15 rows) "
+    f"env({len(DENY_ENV_CALLS)}) store({len(DENY_STORE)}) cloud({len(DENY_CLOUD)}) "
     f"manifest({RECLAIM_VERB.pattern})"
 )

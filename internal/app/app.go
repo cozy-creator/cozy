@@ -7,6 +7,7 @@ import (
 	"io"
 	"strings"
 
+	"github.com/cozy-creator/cozy-creator-v2/internal/config"
 	"github.com/cozy-creator/cozy-creator-v2/internal/exit"
 	"github.com/cozy-creator/cozy-creator-v2/internal/manifest"
 	"github.com/cozy-creator/cozy-creator-v2/internal/render"
@@ -16,9 +17,12 @@ import (
 // Context is what a handler gets. Handlers never parse argv and never probe the
 // service themselves — the gates did both.
 type Context struct {
-	Inv     *Invocation
-	Out     io.Writer
-	Err     io.Writer
+	Inv *Invocation
+	Out io.Writer
+	Err io.Writer
+	// Cfg is the frozen typed value internal/config read ONCE at startup. No handler
+	// reads the environment; the env-read fence proves it.
+	Cfg     config.Config
 	Service service.State
 }
 
@@ -40,7 +44,14 @@ func Run(args []string, stdout, stderr io.Writer) int {
 		return int(exit.Of(e))
 	}
 
-	ctx := &Context{Inv: inv, Out: stdout, Err: stderr}
+	// The ONE environment read of this process, before any handler runs.
+	cfg, e := config.Load()
+	if e != nil {
+		render.EmitError(stdout, stderr, e, inv.Mode)
+		return int(exit.Of(e))
+	}
+
+	ctx := &Context{Inv: inv, Out: stdout, Err: stderr, Cfg: cfg}
 
 	// -h/--help short-circuits before every gate: help never mutates, never dials.
 	if inv.Help {
@@ -85,7 +96,7 @@ func gate(ctx *Context) *exit.Error {
 
 	// 9 — the LocalService is the only door to server-backed verbs.
 	if c.NeedsServer {
-		ctx.Service = service.Probe()
+		ctx.Service = service.Probe(ctx.Cfg)
 		if !ctx.Service.Up {
 			return ctx.Service.Unavailable()
 		}

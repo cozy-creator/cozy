@@ -17,8 +17,8 @@ import (
 // Build identity. tag/commit may be stamped with -ldflags -X; otherwise the Go
 // VCS stamp answers.
 var (
-	tag             = "0.0.0-dev"
-	commit          = ""
+	tag    = "0.0.0-dev"
+	commit = ""
 	// The published worker protocol (worker-protocol-v2, th-024). Asserted here as a
 	// constant; the binding link to a running worker arrives with cl-001.
 	protocolVersion = "cozy.worker.v1 (wire_minor 0)"
@@ -48,7 +48,9 @@ func handlerNames() []string {
 	return out
 }
 
-func emit(ctx *Context, d interface{ Emit(w io.Writer, m render.Mode) error }) *exit.Error {
+func emit(ctx *Context, d interface {
+	Emit(w io.Writer, m render.Mode) error
+}) *exit.Error {
 	if err := d.Emit(ctx.Out, ctx.Mode()); err != nil {
 		return exit.As(err)
 	}
@@ -56,7 +58,7 @@ func emit(ctx *Context, d interface{ Emit(w io.Writer, m render.Mode) error }) *
 }
 
 func handleStatus(ctx *Context) *exit.Error {
-	st := service.Probe()
+	st := service.Probe(ctx.Cfg)
 	rec := render.Record{
 		Kind: "status",
 		Fields: []render.Field{
@@ -118,7 +120,7 @@ func handleVersion(ctx *Context) *exit.Error {
 }
 
 func handleCapabilities(ctx *Context) *exit.Error {
-	st := service.Probe()
+	st := service.Probe(ctx.Cfg)
 	l := render.Lines{
 		Kind:  "capabilities",
 		Key:   "capabilities",

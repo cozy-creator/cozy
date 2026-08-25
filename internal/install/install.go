@@ -17,6 +17,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/cozy-creator/cozy-creator-v2/internal/config"
 	"github.com/cozy-creator/cozy-creator-v2/internal/exit"
 	"github.com/cozy-creator/cozy-creator-v2/internal/home"
 	"github.com/cozy-creator/cozy-creator-v2/internal/records"
@@ -223,7 +224,7 @@ func deriveDescriptor(venvDir, sourceDir string) (string, *exit.Error) {
 			WithNext("cozy help install")
 	}
 	cmd := exec.Command(bin, "--json", "--dir", sourceDir, "describe", "--check")
-	cmd.Env = append(os.Environ(), "NO_COLOR=1")
+	cmd.Env = config.Frozen().Tool()
 	var stdout, stderr strings.Builder
 	cmd.Stdout, cmd.Stderr = &stdout, &stderr
 	err := cmd.Run()
@@ -397,4 +398,3 @@ func containsStage(s string) bool {
 	}
 	return false
 }
-

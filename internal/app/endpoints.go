@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"strings"
 
+	"github.com/cozy-creator/cozy-creator-v2/internal/config"
 	"github.com/cozy-creator/cozy-creator-v2/internal/exit"
 	"github.com/cozy-creator/cozy-creator-v2/internal/home"
 	"github.com/cozy-creator/cozy-creator-v2/internal/install"
@@ -13,8 +14,8 @@ import (
 
 // open resolves the local layout and the ONE lifecycle database. Mutating verbs
 // additionally take the single-writer lock.
-func open(write bool) (home.Layout, *records.Store, *install.Writer, *exit.Error) {
-	l, e := home.Open()
+func open(cfg config.Config, write bool) (home.Layout, *records.Store, *install.Writer, *exit.Error) {
+	l, e := home.Open(cfg.Home)
 	if e != nil {
 		return l, nil, nil, e
 	}
@@ -39,7 +40,7 @@ func handleInstall(ctx *Context) *exit.Error {
 	if e != nil {
 		return e
 	}
-	l, st, w, e := open(true)
+	l, st, w, e := open(ctx.Cfg, true)
 	if e != nil {
 		return e
 	}
@@ -101,7 +102,7 @@ func handleInstall(ctx *Context) *exit.Error {
 }
 
 func handleLs(ctx *Context) *exit.Error {
-	_, st, _, e := open(false)
+	_, st, _, e := open(ctx.Cfg, false)
 	if e != nil {
 		return e
 	}
@@ -154,7 +155,7 @@ func handleLs(ctx *Context) *exit.Error {
 }
 
 func handleRm(ctx *Context) *exit.Error {
-	_, st, w, e := open(true)
+	_, st, w, e := open(ctx.Cfg, true)
 	if e != nil {
 		return e
 	}
@@ -210,7 +211,7 @@ func handleRm(ctx *Context) *exit.Error {
 
 func handleGC(ctx *Context) *exit.Error {
 	write := ctx.Inv.Bool("--yes")
-	l, st, w, e := open(write)
+	l, st, w, e := open(ctx.Cfg, write)
 	if e != nil {
 		return e
 	}
