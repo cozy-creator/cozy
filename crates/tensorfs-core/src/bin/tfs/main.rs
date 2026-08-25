@@ -20,6 +20,16 @@
 //!   tfs reap <root>              age-bounded temp reap
 //!   tfs fill <root> <plan>       resumable fill: skip only verified objects
 //!   tfs bench-store <root>       put/read/range/rehash throughput + peak RSS
+//!
+//! The checkpoint plane (tfs-015). Flags: --blocks <n> --pin <alias|empty> --seed <s>
+//!
+//!   tfs checkpoint write <root>              objectize a synthetic tree, emit the header
+//!   tfs checkpoint read <root> <hex>         reconstruct every part, byte-identity checked
+//!   tfs checkpoint info <root> <hex>         component/scope query, zero tensor-byte reads
+//!   tfs checkpoint locate <root> <hex> <component> <key> <role> <off> <len>
+//!   tfs checkpoint admit <root> <hex>        serving admission against the local pin
+//!   tfs checkpoint caps                      whole-document total caps, armed live
+//!   tfs checkpoint size [n]                  uniform-form header cost at H3 cardinality
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -53,6 +63,21 @@ fn main() -> ExitCode {
         ["reap", r] => cmd_reap(Path::new(r), &flags),
         ["fill", r, p] => cmd_fill(Path::new(r), Path::new(p), &flags),
         ["bench-store", r] => cmd_bench_store(Path::new(r), &flags),
+        ["checkpoint", "write", r] => ckpt::cmd_write(Path::new(r), &flags),
+        ["checkpoint", "read", r, h] => ckpt::cmd_read(Path::new(r), h, &flags),
+        ["checkpoint", "info", r, h] => ckpt::cmd_info(Path::new(r), h),
+        ["checkpoint", "locate", r, h, c, k, role, off, len] => ckpt::cmd_locate(
+            Path::new(r),
+            h,
+            [c, k, role],
+            off.parse().unwrap_or(0),
+            len.parse().unwrap_or(0),
+            &flags,
+        ),
+        ["checkpoint", "admit", r, h] => ckpt::cmd_admit(Path::new(r), h, &flags),
+        ["checkpoint", "caps"] => ckpt::cmd_caps(),
+        ["checkpoint", "size"] => ckpt::cmd_size(3699),
+        ["checkpoint", "size", n] => ckpt::cmd_size(n.parse().unwrap_or(3699)),
         ["registry"] => cmd_registry(),
         ["vectors", "gen"] => cmd_gen(&default_dir()),
         ["vectors", "gen", d] => cmd_gen(Path::new(d)),
@@ -116,6 +141,8 @@ macro_rules! ok {
         }
     };
 }
+
+mod ckpt;
 
 fn cmd_store(root: &Path, verb: &str) -> ExitCode {
     let mut s = match verb {
@@ -1129,6 +1156,185 @@ fn build_corpus() -> (Vec<Case>, Vec<EncodingSpec>) {
         "EMPTY_COMPONENTS",
         "no components",
     ));
+
+    // ---- tfs-015: hostile bodies, hostile keys, whole-document totals, capability ----
+
+    // The inline body's grammar is exact: one canonical spelling per byte run.
+    let inline_b64 = tensorfs_core::b64::encode(&pattern(256));
+    for (name, twin, note) in [
+        (
+            "base64-unpadded",
+            inline_b64.trim_end_matches('=').to_string(),
+            "padding stripped",
+        ),
+        (
+            "base64-whitespace",
+            format!("{} {}", &inline_b64[..8], &inline_b64[8..]),
+            "a space inside the body",
+        ),
+        (
+            "base64-urlsafe",
+            inline_b64.replace('+', "-").replace('/', "_"),
+            "url-safe alphabet",
+        ),
+    ] {
+        cases.push(red_case(
+            g,
+            name,
+            "header",
+            sub(&ha_bytes, &inline_b64, &twin),
+            "BAD_BASE64",
+            note,
+        ));
+    }
+    // A last quantum whose unused low bits are set decodes to the same bytes and re-encodes
+    // differently — the classic base64 malleability channel.
+    let tail = tensorfs_core::b64::encode(&pattern(2));
+    let alphabet = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut evil = tail.clone().into_bytes();
+    // Two data bytes leave the final sextet's low TWO bits unused; canonical encoding
+    // clears them, so setting one decodes identically and re-encodes differently.
+    let i = alphabet.iter().position(|c| *c == evil[2]).unwrap();
+    evil[2] = alphabet[i | 1];
+    let mut h = ha.clone();
+    h.components[0].1[1].1.shape = vec![1];
+    h.components[0].1[1].1.parts[0].1 = Part {
+        dtype: Dtype::Bf16,
+        shape: vec![1],
+        body: Body::Inline(tail.clone()),
+    };
+    cases.push(red_case(
+        g,
+        "base64-noncanonical-tail",
+        "header",
+        sub(
+            &h.canonical_bytes(),
+            &tail,
+            &String::from_utf8(evil).unwrap(),
+        ),
+        "BAD_BASE64",
+        "unused low bits set in the final quantum",
+    ));
+
+    // Tensor keys are data-shaped and therefore the hostile-input surface.
+    for (name, key, code, note) in [
+        ("key-empty", "", "KEY_GRAMMAR", "the empty key"),
+        (
+            "key-non-ascii",
+            "blocks.0.attn.tö_q.weight",
+            "NON_ASCII_FIELD",
+            "a non-ASCII tensor key",
+        ),
+    ] {
+        cases.push(red_case(
+            g,
+            name,
+            "header",
+            sub(&ha_bytes, "blocks.0.attn.to_q.weight", key),
+            code,
+            note,
+        ));
+    }
+
+    // Endianness is a format GLOBAL: there is no field to disagree with.
+    cases.push(red_case(
+        g,
+        "endian-field",
+        "header",
+        sub(
+            &ha_bytes,
+            "\"dtype\":\"f8_e4m3fn\"",
+            "\"dtype\":\"f8_e4m3fn\",\"endian\":\"little\"",
+        ),
+        "UNKNOWN_FIELD",
+        "a part claiming its own byte order",
+    ));
+
+    // A zero-length segment is a fetch that can never satisfy the anchor equation.
+    cases.push(red_case(
+        g,
+        "segment-zero-length",
+        "header",
+        sub(&ha_bytes, "\"length\":8192", "\"length\":0"),
+        "ZERO_ELEMENT",
+        "an empty segment record",
+    ));
+
+    // Whole-DOCUMENT byte total, not just this part's.
+    let huge = Header {
+        configs: vec![],
+        encodings: encodings_of(&[&plain]),
+        components: vec![(
+            "transformer".to_string(),
+            vec![(
+                "huge.weight".to_string(),
+                Tensor {
+                    dtype: Dtype::F64,
+                    shape: vec![1 << 48],
+                    encoding: plain.object_id(),
+                    parts: vec![(
+                        "value".to_string(),
+                        Part {
+                            dtype: Dtype::F64,
+                            shape: vec![1 << 48],
+                            body: Body::Segments(vec![ObjectRef {
+                                sha256: "0".repeat(64),
+                                length: 1u64 << 51,
+                            }]),
+                        },
+                    )],
+                },
+            )],
+        )],
+    };
+    cases.push(red_case(
+        g,
+        "total-bytes-cap",
+        "header",
+        huge.canonical_bytes(),
+        "TOTAL_BYTES_CAP",
+        "one legal tensor over the whole-document byte total",
+    ));
+
+    // A spec object present in the closure that this runtime's pin does not alias: valid
+    // DATA, unsupported EXECUTION. `header` accepts the same bytes; only serving refuses.
+    let foreign = {
+        let mut s = seed_spec("plain/1", 0);
+        s.doc = Some("a spec object no platform alias names".to_string());
+        s
+    };
+    let hf = Header {
+        configs: vec![],
+        encodings: encodings_of(&[&foreign]),
+        components: vec![(
+            "transformer".to_string(),
+            vec![(
+                "blocks.0.norm.weight".to_string(),
+                Tensor {
+                    dtype: Dtype::Bf16,
+                    shape: vec![128],
+                    encoding: foreign.object_id(),
+                    parts: vec![("value".to_string(), part_of(Dtype::Bf16, vec![128]))],
+                },
+            )],
+        )],
+    };
+    cases.push(ok_case(
+        g,
+        "unaliased-spec-stores",
+        "header",
+        hf.canonical_bytes(),
+        "a pin-absent spec object validates as data",
+    ));
+    cases.push(red_case(
+        g,
+        "unaliased-spec-serving",
+        "header-serving",
+        hf.canonical_bytes(),
+        "UNKNOWN_TO_LOCAL_CAPABILITY",
+        "the same bytes refused for SERVING against the local pin",
+    ));
+    specs.push(foreign);
     let mut h = hn.clone();
     h.components[0].1[0].1.shape = vec![256, 511];
     cases.push(red_case(
@@ -1452,6 +1658,12 @@ fn run_doc(doc: &str, bytes: &[u8], closure: &Closure, platform: &[String]) -> O
     let r: Result<(Option<String>, Option<String>), Refusal> = match doc {
         "header" => Header::parse(bytes).and_then(|h| {
             h.validate(closure)?;
+            Ok((Some(h.topology_digest()), None))
+        }),
+        // Serving admission is a SECOND gate over the same bytes: `header` says the document
+        // is valid data, `header-serving` says this runtime may execute it.
+        "header-serving" => Header::parse(bytes).and_then(|h| {
+            h.admit_for_serving(closure, platform)?;
             Ok((Some(h.topology_digest()), None))
         }),
         "spec" => EncodingSpec::parse(bytes).map(|_| (None, None)),

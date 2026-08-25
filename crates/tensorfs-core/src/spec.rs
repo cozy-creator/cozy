@@ -165,9 +165,8 @@ impl Doc for EncodingSpec {
             ),
             (
                 "roles",
-                Value::Obj({
-                    let mut v: Vec<(String, Value)> = self
-                        .roles
+                Value::map(
+                    self.roles
                         .iter()
                         .map(|(n, r)| {
                             (
@@ -178,10 +177,8 @@ impl Doc for EncodingSpec {
                                 ]),
                             )
                         })
-                        .collect();
-                    v.sort_by(|a, b| a.0.cmp(&b.0));
-                    v
-                }),
+                        .collect(),
+                ),
             ),
         ];
         if let Some(r) = self.logical_rank {

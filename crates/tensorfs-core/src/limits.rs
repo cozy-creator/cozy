@@ -3,6 +3,21 @@
 
 pub const PROVISIONAL: &str = "provisional: awaiting proto-001 H3+SDXL corpus (tfs-013/tfs-015)";
 
+// Measured evidence banked toward ratification — recorded, never treated as ratification:
+//
+// tfs-013: the 64 MiB DOC_MAX_BYTES cap binds at ~85,000 tensors, so MAX_TENSORS (100,000)
+//   is unreachable — the two caps are not mutually consistent (decisions row 167).
+// tfs-015: the ONE uniform tensor form costs 453 B/tensor over a mixed plain/fp8/nvfp4 tree
+//   — 1.60 MiB at the real selected-H3 cardinality (3,699 tensors), 1.09 MiB at SDXL
+//   (2,515). Both are ~2.5% of DOC_MAX_BYTES: the uniform form is not what pressures it.
+// tfs-015: a real 382 MiB, 64-tensor, 100-part checkpoint produced 77 segments and 24 inline
+//   bodies under GRID_BYTES=64 MiB / INLINE_MAX_BYTES=256 B. The 256 B threshold caught
+//   every norm-scale and rank-0 scalar role and no weight role, which is the intent; a
+//   real H3 tree at proto-001 is what decides whether it should move.
+// tfs-015: MAX_TOTAL_REFS=65,536 is the whole-document reference total. A 500 GB artifact on
+//   the 64 MiB grid needs ~8,000 — the cap leaves 8x headroom while bounding the fetch plan
+//   a single header can demand.
+
 pub const GRID_BYTES: u64 = 64 * 1024 * 1024;
 pub const INLINE_MAX_BYTES: u64 = 256;
 
@@ -17,6 +32,10 @@ pub const MAX_RANK: usize = 32;
 pub const MAX_KEY_BYTES: usize = 4096;
 pub const MAX_NAME_BYTES: usize = 128;
 pub const MAX_SEGMENTS: usize = 65_536;
+/// Whole-DOCUMENT totals, not only per-part counts: a header may not multiply small legal
+/// parts into an unbounded fetch plan or an unbounded byte claim.
+pub const MAX_TOTAL_REFS: usize = 65_536;
+pub const MAX_TOTAL_BYTES: u64 = 1 << 50;
 pub const MAX_RELATION_NODES: usize = 64;
 pub const MAX_DOC_TEXT_BYTES: usize = 4096;
 pub const MAX_ELEMENTS: u64 = 1 << 48;

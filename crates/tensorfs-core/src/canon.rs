@@ -27,6 +27,15 @@ impl Value {
         v.sort_by(|a, b| a.0.cmp(&b.0));
         Value::Obj(v)
     }
+    /// The dynamic-key form. Every map whose keys come from DATA (component names, tensor
+    /// keys, role names) must be built through this: a hand-sorted `Value::Obj` is the one
+    /// way a projection can disagree with the document it projects (found live at tfs-015,
+    /// where the in-memory header and its parsed twin gave different topology digests).
+    pub fn map(pairs: Vec<(String, Value)>) -> Value {
+        let mut v = pairs;
+        v.sort_by(|a, b| a.0.cmp(&b.0));
+        Value::Obj(v)
+    }
     pub fn str(s: impl Into<String>) -> Value {
         Value::Str(s.into())
     }

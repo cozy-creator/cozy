@@ -1,0 +1,4 @@
+doc: header
+expect: refuse
+code: BAD_BASE64
+note: unused low bits set in the final quantum

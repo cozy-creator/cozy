@@ -190,9 +190,8 @@ impl Doc for EncodingVectors {
                                 ("name", Value::str(c.name.clone())),
                                 (
                                     "roles",
-                                    Value::Obj({
-                                        let mut v: Vec<(String, Value)> = c
-                                            .roles
+                                    Value::map({
+                                        c.roles
                                             .iter()
                                             .map(|(n, r)| {
                                                 (
@@ -204,9 +203,7 @@ impl Doc for EncodingVectors {
                                                     ]),
                                                 )
                                             })
-                                            .collect();
-                                        v.sort_by(|a, b| a.0.cmp(&b.0));
-                                        v
+                                            .collect()
                                     }),
                                 ),
                             ])

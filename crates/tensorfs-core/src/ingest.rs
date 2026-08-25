@@ -371,15 +371,12 @@ impl Doc for IngestVerificationReceipt {
             ("header", self.header.to_value()),
             (
                 "observations",
-                Value::Obj({
-                    let mut v: Vec<(String, Value)> = self
-                        .observations
+                Value::map(
+                    self.observations
                         .iter()
                         .map(|(k, i)| (k.clone(), Value::Int(*i)))
-                        .collect();
-                    v.sort_by(|a, b| a.0.cmp(&b.0));
-                    v
-                }),
+                        .collect(),
+                ),
             ),
             ("signature", Value::str(self.signature.clone())),
             ("signer", Value::str(self.signer.clone())),

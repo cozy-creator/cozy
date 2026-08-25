@@ -1,0 +1,4 @@
+doc: header
+expect: refuse
+code: KEY_GRAMMAR
+note: the empty key

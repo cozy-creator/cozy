@@ -22,6 +22,70 @@ pub struct Part {
     pub body: Body,
 }
 
+/// One segment slice covering part of a requested byte range.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Span {
+    pub index: usize,
+    pub obj: ObjectRef,
+    /// offset INSIDE that segment
+    pub off: u64,
+    pub len: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Located {
+    Inline { off: u64, len: u64 },
+    Segments(Vec<Span>),
+}
+
+/// Derived from the length list alone — never from a path, a grid assumption, or a fetch.
+/// `stride` is set when the run is uniform (what the writer's grid produces), which makes
+/// the start index one division; otherwise the start is a binary search over `starts`.
+#[derive(Debug, Clone)]
+pub struct SegIndex {
+    starts: Vec<u64>,
+    total: u64,
+    stride: Option<u64>,
+}
+
+impl SegIndex {
+    fn of(segs: &[ObjectRef]) -> SegIndex {
+        let mut starts = Vec::with_capacity(segs.len());
+        let mut total = 0u64;
+        for s in segs {
+            starts.push(total);
+            total = total.saturating_add(s.length);
+        }
+        let first = segs[0].length;
+        let uniform = segs[..segs.len() - 1].iter().all(|s| s.length == first)
+            && segs[segs.len() - 1].length <= first;
+        SegIndex {
+            starts,
+            total,
+            stride: if uniform { Some(first) } else { None },
+        }
+    }
+
+    pub fn total(&self) -> u64 {
+        self.total
+    }
+
+    /// O(1) on a uniform run, O(log n) otherwise. Zero fetches either way.
+    pub fn at(&self, off: u64) -> usize {
+        match self.stride {
+            Some(s) => ((off / s) as usize).min(self.starts.len() - 1),
+            None => match self.starts.binary_search(&off) {
+                Ok(i) => i,
+                Err(i) => i - 1,
+            },
+        }
+    }
+
+    pub fn start(&self, i: usize) -> u64 {
+        self.starts[i]
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Tensor {
     pub dtype: Dtype,
@@ -67,9 +131,17 @@ fn shape_value(s: &[u64]) -> Value {
 }
 
 impl Part {
-    /// Deterministic writer law: at or under the inline cap → inline; above → grid segments.
+    /// The ONE deterministic inline/segment decision. Never author-selectable and never
+    /// spelled twice: the streaming writer (`checkpoint::objectize`), this in-memory twin,
+    /// the validator, and any size model all ask this same function.
+    pub fn is_inline(nbytes: u64) -> bool {
+        nbytes <= limits::INLINE_MAX_BYTES
+    }
+
+    /// In-memory twin of `checkpoint::objectize`, for building frozen vectors where no store
+    /// exists. Same law, same grid; it just cannot admit the bytes anywhere.
     pub fn plan(dtype: Dtype, shape: Vec<u64>, bytes: &[u8]) -> Part {
-        let body = if bytes.len() as u64 <= limits::INLINE_MAX_BYTES {
+        let body = if Part::is_inline(bytes.len() as u64) {
             Body::Inline(b64::encode(bytes))
         } else {
             Body::Segments(
@@ -140,8 +212,66 @@ impl Part {
         Value::obj(fields)
     }
 
+    /// The anchor equation's left side: `checked_prod(shape) × sizeof(dtype)`.
+    pub fn nbytes(&self, what: &str) -> Result<u64> {
+        checked_bytes(what, &self.shape, self.dtype)
+    }
+
+    pub fn segments(&self) -> &[ObjectRef] {
+        match &self.body {
+            Body::Segments(s) => s,
+            Body::Inline(_) => &[],
+        }
+    }
+
+    /// Build the offset index. Only meaningful for a segmented part.
+    pub fn index(&self) -> Option<SegIndex> {
+        match &self.body {
+            Body::Segments(s) => Some(SegIndex::of(s)),
+            Body::Inline(_) => None,
+        }
+    }
+
+    /// Byte range → the exact ordered slices that cover it, with no body fetched. The anchor
+    /// equation is checked FIRST, so a range is bounded by the declaration, not by a file.
+    pub fn locate(&self, what: &str, off: u64, len: u64) -> Result<Located> {
+        let total = self.nbytes(what)?;
+        let end = off.checked_add(len).ok_or_else(|| crate::err::Refusal {
+            code: Code::RANGE_BOUNDS,
+            detail: format!("{what}: offset {off} + length {len} overflows"),
+        })?;
+        if end > total {
+            return refuse(
+                Code::RANGE_BOUNDS,
+                format!("{what}: range [{off}, {end}) leaves the part's {total} declared bytes"),
+            );
+        }
+        let segs = match &self.body {
+            Body::Inline(_) => return Ok(Located::Inline { off, len }),
+            Body::Segments(s) => s,
+        };
+        let idx = SegIndex::of(segs);
+        let mut out = Vec::new();
+        let mut cur = off;
+        let mut i = idx.at(off);
+        while cur < end {
+            let s = &segs[i];
+            let base = idx.start(i);
+            let take = (base + s.length).min(end) - cur;
+            out.push(Span {
+                index: i,
+                obj: s.clone(),
+                off: cur - base,
+                len: take,
+            });
+            cur += take;
+            i += 1;
+        }
+        Ok(Located::Segments(out))
+    }
+
     /// Anchor equation + the deterministic inline/segment split.
-    fn check_bytes(&self, what: &str) -> Result<()> {
+    pub fn check_bytes(&self, what: &str) -> Result<()> {
         let want = checked_bytes(what, &self.shape, self.dtype)?;
         match &self.body {
             Body::Inline(b) => {
@@ -154,7 +284,7 @@ impl Part {
                         ),
                     );
                 }
-                if want > limits::INLINE_MAX_BYTES {
+                if !Part::is_inline(want) {
                     return refuse(
                         Code::INLINE_THRESHOLD,
                         format!(
@@ -180,7 +310,7 @@ impl Part {
                         format!("{what}: segments total {got} B, anchor equation wants {want} B"),
                     );
                 }
-                if want <= limits::INLINE_MAX_BYTES {
+                if Part::is_inline(want) {
                     return refuse(
                         Code::INLINE_THRESHOLD,
                         format!("{what}: {want} B is at or under the inline cap — must be inline"),
@@ -236,15 +366,12 @@ impl Tensor {
             ),
             (
                 "parts",
-                Value::Obj({
-                    let mut v: Vec<(String, Value)> = self
-                        .parts
+                Value::map(
+                    self.parts
                         .iter()
                         .map(|(n, p)| (n.clone(), p.to_value()))
-                        .collect();
-                    v.sort_by(|a, b| a.0.cmp(&b.0));
-                    v
-                }),
+                        .collect(),
+                ),
             ),
         ])
     }
@@ -263,13 +390,13 @@ impl Header {
             ("projection", Value::str("cozytensors.topology/1")),
             (
                 "components",
-                Value::Obj(
+                Value::map(
                     self.components
                         .iter()
                         .map(|(c, ts)| {
                             (
                                 c.clone(),
-                                Value::Obj(
+                                Value::map(
                                     ts.iter()
                                         .map(|(k, t)| {
                                             (
@@ -316,6 +443,14 @@ impl Header {
         }
         let mut cited: Vec<String> = Vec::new();
         let mut count = 0usize;
+        // Whole-DOCUMENT totals, not only per-part counts.
+        let mut refs = self.configs.len() + self.encodings.len();
+        let mut total_bytes: u64 = self
+            .configs
+            .iter()
+            .map(|(_, c)| c.length)
+            .chain(self.encodings.iter().map(|r| r.length))
+            .sum();
 
         for (comp, tensors) in &self.components {
             ascii_name("component", comp, limits::MAX_NAME_BYTES)?;
@@ -413,15 +548,65 @@ impl Header {
                         );
                     }
                     part.check_bytes(&pw)?;
+                    refs += part.segments().len();
+                    if refs > limits::MAX_TOTAL_REFS {
+                        return refuse(
+                            Code::TOTAL_REFS_CAP,
+                            format!(
+                                "{pw}: whole-document reference total passes {}",
+                                limits::MAX_TOTAL_REFS
+                            ),
+                        );
+                    }
+                    total_bytes = total_bytes.checked_add(part.nbytes(&pw)?).ok_or_else(|| {
+                        crate::err::Refusal {
+                            code: Code::ARITH_OVERFLOW,
+                            detail: format!("{pw}: whole-document byte total overflows"),
+                        }
+                    })?;
+                    if total_bytes > limits::MAX_TOTAL_BYTES {
+                        return refuse(
+                            Code::TOTAL_BYTES_CAP,
+                            format!(
+                                "{pw}: whole-document byte total {total_bytes} passes {}",
+                                limits::MAX_TOTAL_BYTES
+                            ),
+                        );
+                    }
                 }
             }
         }
+        let _ = refs;
         for r in &self.encodings {
             if !cited.contains(&r.id()) {
                 return refuse(
                     Code::UNCITED_ENCODING,
                     format!(
                         "`encodings` lists {} which no tensor cites (derivable-fact law)",
+                        r.id()
+                    ),
+                );
+            }
+        }
+        Ok(())
+    }
+
+    /// SERVING admission, which is not validation. cozytensors.md §4 keeps three states
+    /// apart: a MISSING spec object never installs (`UNKNOWN_ENCODING`, in `validate`); a
+    /// closure that CONTAINS a spec the local pin does not alias is valid DATA and
+    /// unsupported EXECUTION — it stores and validates, and only serving refuses, naming
+    /// the digest. Offline honesty: a local pin cannot tell "unregistered" from
+    /// "newer than my pin", so the refusal says exactly that and nothing more.
+    pub fn admit_for_serving(&self, closure: &Closure, pin: &[String]) -> Result<()> {
+        self.validate(closure)?;
+        for r in &self.encodings {
+            if !pin.contains(&r.id()) {
+                return refuse(
+                    Code::UNKNOWN_TO_LOCAL_CAPABILITY,
+                    format!(
+                        "spec {} carries no alias in this runtime's pin — unregistered and \
+                         newer-than-pin are indistinguishable offline; the checkpoint is \
+                         valid data, its execution is unsupported here",
                         r.id()
                     ),
                 );
@@ -478,34 +663,30 @@ impl Doc for Header {
             ),
             (
                 "components",
-                Value::Obj({
-                    let mut v: Vec<(String, Value)> = self
-                        .components
+                Value::map(
+                    self.components
                         .iter()
                         .map(|(c, ts)| {
-                            let mut inner: Vec<(String, Value)> =
-                                ts.iter().map(|(k, t)| (k.clone(), t.to_value())).collect();
-                            inner.sort_by(|a, b| a.0.cmp(&b.0));
-                            (c.clone(), Value::Obj(inner))
+                            (
+                                c.clone(),
+                                Value::map(
+                                    ts.iter().map(|(k, t)| (k.clone(), t.to_value())).collect(),
+                                ),
+                            )
                         })
-                        .collect();
-                    v.sort_by(|a, b| a.0.cmp(&b.0));
-                    v
-                }),
+                        .collect(),
+                ),
             ),
         ];
         if !self.configs.is_empty() {
             fields.push((
                 "configs",
-                Value::Obj({
-                    let mut v: Vec<(String, Value)> = self
-                        .configs
+                Value::map(
+                    self.configs
                         .iter()
                         .map(|(n, c)| (n.clone(), c.to_value()))
-                        .collect();
-                    v.sort_by(|a, b| a.0.cmp(&b.0));
-                    v
-                }),
+                        .collect(),
+                ),
             ));
         }
         Value::obj(fields)

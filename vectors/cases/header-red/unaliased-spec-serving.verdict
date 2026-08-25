@@ -1,0 +1,4 @@
+doc: header-serving
+expect: refuse
+code: UNKNOWN_TO_LOCAL_CAPABILITY
+note: the same bytes refused for SERVING against the local pin
