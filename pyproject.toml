@@ -1,0 +1,16 @@
+[build-system]
+requires = ["maturin>=1.7,<2"]
+build-backend = "maturin"
+
+[project]
+name = "tensorfs"
+version = "0.0.1"
+description = "TensorFS — canonical tensor artifact substrate"
+requires-python = ">=3.11"
+classifiers = ["Programming Language :: Rust"]
+
+[tool.maturin]
+manifest-path = "crates/tensorfs-py/Cargo.toml"
+module-name = "tensorfs._ext"
+python-source = "python"
+features = ["extension-module"]

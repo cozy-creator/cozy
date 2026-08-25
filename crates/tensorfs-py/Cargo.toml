@@ -3,6 +3,14 @@ name = "tensorfs-py"
 version.workspace = true
 edition.workspace = true
 
+[lib]
+name = "_ext"
+crate-type = ["cdylib", "rlib"]
+
 [dependencies]
 tensorfs-core = { path = "../tensorfs-core" }
 tensorfs-layout = { path = "../tensorfs-layout" }
+pyo3 = { version = "0.25", features = ["abi3-py311"] }
+
+[features]
+extension-module = ["pyo3/extension-module"]

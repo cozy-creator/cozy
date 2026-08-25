@@ -1,4 +1,5 @@
 name: ci
+# Build + fences only (tracker README #160: no test steps anywhere in v2).
 on: [push, pull_request]
 jobs:
   checks:
@@ -9,3 +10,15 @@ jobs:
       - run: cargo build --workspace
       - run: cargo fmt --check
       - run: python3 scripts/fence.py
+  wheel:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: pip install "maturin>=1.7,<2"
+      # Builds the abi3 wheel, installs it into a fresh venv, imports the facade and
+      # asserts torch never enters sys.modules. A build proof, not a test suite.
+      - run: bash scripts/wheel-smoke.sh
