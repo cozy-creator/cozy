@@ -53,7 +53,7 @@ func (h *hub) Control(stream pb.Worker_ControlServer) error {
 				h.c.logf("REFUSED: a second Register on a bound stream (session %s)", s.id)
 				continue
 			}
-			s = h.c.onRegister(stream, m.Register)
+			s = h.c.onRegister(stream, m.Register, peerPID(stream.Context()))
 		case *pb.WorkerMessage_BootFailure:
 			h.c.logf("BOOT FAILURE from %s: %s (%s)", m.BootFailure.InstanceId,
 				pb.BootFailureReason_name[int32(m.BootFailure.Reason)], m.BootFailure.Detail)
@@ -145,7 +145,7 @@ func (c *Coordinator) dropSession(s *session) {
 
 // --------------------------------------------------------------------------- register
 
-func (c *Coordinator) onRegister(stream pb.Worker_ControlServer, r *pb.Register) *session {
+func (c *Coordinator) onRegister(stream pb.Worker_ControlServer, r *pb.Register, pid int32) *session {
 	s := &session{id: r.SessionId, instanceID: r.InstanceId, out: make(chan *pb.CoordinatorMessage, 32)}
 	go func() {
 		for m := range s.out {
@@ -174,6 +174,22 @@ func (c *Coordinator) onRegister(stream pb.Worker_ControlServer, r *pb.Register)
 	if w.spec.ReleaseID != "" && r.ReleaseId != w.spec.ReleaseID {
 		return reject(pb.RegisterRejection_REGISTER_REJECTION_RELEASE_ID_MISMATCH,
 			"release "+r.ReleaseId+" is not the pinned "+w.spec.ReleaseID)
+	}
+	// The kernel-attested pid. A supervisor from a PREVIOUS LocalService, still
+	// reconnecting on its backoff, dials the same socket path and presents a perfectly
+	// valid instance_id — its own. Only the process this coordinator started may bind
+	// this slot, and only the kernel can say which one that is.
+	c.mu.Lock()
+	want, bound := w.pid, w.sessionID
+	c.mu.Unlock()
+	if pid != 0 && want != 0 && int(pid) != want {
+		return reject(pb.RegisterRejection_REGISTER_REJECTION_STALE_SESSION,
+			fmt.Sprintf("pid %d is not the process this LocalService started for %s (pid %d)",
+				pid, r.InstanceId, want))
+	}
+	if bound != "" && bound != r.SessionId {
+		return reject(pb.RegisterRejection_REGISTER_REJECTION_SESSION_COLLISION,
+			"instance "+r.InstanceId+" already has the live session "+bound)
 	}
 	if e := c.opt.Store.BindSession(r.InstanceId, r.SessionId, int64(r.ExecutorIncarnation)); e != nil {
 		return reject(pb.RegisterRejection_REGISTER_REJECTION_SESSION_COLLISION, e.Message)
@@ -241,6 +257,12 @@ func (c *Coordinator) sendDirective(s *session, w *worker) {
 func (c *Coordinator) onReport(s *session, r *pb.Report) {
 	c.mu.Lock()
 	w := c.workers[s.instanceID]
+	if w != nil && w.sessionID != s.id {
+		// A superseded session's Report is a fact about a worker that no longer exists.
+		c.mu.Unlock()
+		c.logf("DROPPED: Report from superseded session %s (the live one is %s)", s.id, w.sessionID)
+		return
+	}
 	if w != nil {
 		w.incarnation = r.ExecutorIncarnation
 		w.epoch = r.ReadinessEpoch

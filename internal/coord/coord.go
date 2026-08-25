@@ -108,7 +108,7 @@ func Open(opt Options) (*Coordinator, *exit.Error) {
 			WithRemedy("another LocalService may own this root; `cozy status`")
 	}
 	c.listener = ln
-	c.grpc = grpc.NewServer()
+	c.grpc = grpc.NewServer(grpc.Creds(unixPeer{}))
 	pb.RegisterWorkerServer(c.grpc, &hub{c: c})
 	return c, nil
 }

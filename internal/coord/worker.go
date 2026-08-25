@@ -106,6 +106,7 @@ type worker struct {
 
 	// what the worker itself reported; the coordinator echoes, never invents
 	exited      bool
+	pid         int // the process THIS coordinator started; the only one that may register
 	sessionID   string
 	incarnation uint64
 	epoch       uint64
@@ -212,6 +213,9 @@ func (c *Coordinator) StartWorker(spec EndpointSpec) (string, *exit.Error) {
 		logFile.Close()
 		return "", exit.Internalf("cannot start the endpoint worker: %s", err)
 	}
+	c.mu.Lock()
+	w.pid = cmd.Process.Pid
+	c.mu.Unlock()
 	if e := c.opt.Store.WorkerStarted(instanceID, cmd.Process.Pid, birthOf(cmd.Process.Pid)); e != nil {
 		return "", e
 	}

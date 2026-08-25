@@ -124,6 +124,19 @@ func sectionArms() {
 	line, ok := waitEvent(lv, "WORKER_ID_MISMATCH", 10*time.Second)
 	check("an unspawned instance_id is refused at Register", ok, trimLog(line))
 
+	// The stale-supervisor arm, and it is not hypothetical: a supervisor from a PREVIOUS
+	// LocalService reconnecting on its backoff dials the same socket path and presents a
+	// perfectly valid instance_id — its own. Here a different process claims worker A's
+	// live slot; only the process this coordinator started may bind it, and only the
+	// kernel can say which one that is.
+	impostor := fakeSpec("impostor", "8", "--arm", "idle", "--fake-instance", instanceA)
+	_, _ = lv.c.StartWorker(impostor)
+	line, ok = waitEvent(lv, "STALE_SESSION", 10*time.Second)
+	check("a DIFFERENT process claiming a live instance is refused (SO_PEERCRED)", ok, trimLog(line))
+	check("worker A's session is untouched by the impostor",
+		lv.c.Worker(instanceA) != nil && lv.c.Worker(instanceA).SessionID == factsA.SessionID,
+		factsA.SessionID)
+
 	// A worker registering under a release that is not the pinned one.
 	badrel := fakeSpec("badrelease", "6", "--arm", "badrelease")
 	_, _ = lv.c.StartWorker(badrel)
