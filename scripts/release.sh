@@ -19,9 +19,10 @@
 #
 # UNBUILT is a first-class part of the output. A platform this repository cannot build is
 # named with the reason rather than omitted, because an absent artifact and an artifact
-# nobody tried to build look identical in a directory listing. It is now expected to be
-# EMPTY: `cozy` is pure Go (CGO_ENABLED=0), so every target below is a cross-compile from
-# one host and there is no C wall left to hit.
+# nobody tried to build look identical in a directory listing. There is no C wall left to
+# name — `cozy` is pure Go (CGO_ENABLED=0) and every target below is a cross-compile from
+# this one host — so what remains in the table is Go source that still spells a Unix
+# syscall directly, and the reason quotes the compiler saying which.
 #
 # What a build is NOT: proof the binary RUNS. This host executes linux/amd64 and nothing
 # else, so the macOS and Windows rows are static evidence — bytes, size, checksum — until
@@ -75,13 +76,15 @@ for target in $TARGETS; do
   goos="${target%%/*}"; goarch="${target##*/}"
   exe="cozy"; [ "$goos" != windows ] || exe="cozy.exe"
 
-  ok=1
+  ok=1; why=""
   for pass in a b; do
     mkdir -p "$D/.build-$pass"
-    nice -n 19 env GOOS="$goos" GOARCH="$goarch" CGO_ENABLED=0 \
-      go build -trimpath -ldflags "$LDFLAGS" -o "$D/.build-$pass/$exe" ./cmd/cozy || { ok=0; break; }
+    why="$(nice -n 19 env GOOS="$goos" GOARCH="$goarch" CGO_ENABLED=0 \
+      go build -trimpath -ldflags "$LDFLAGS" -o "$D/.build-$pass/$exe" ./cmd/cozy 2>&1)" || { ok=0; break; }
   done
-  [ "$ok" = 1 ] || { note_unbuilt "$target" "the build failed on this host"; continue; }
+  # The compiler's OWN first line, quoted into the reason. "the build failed" names
+  # nothing; `undefined: syscall.Kill` names the file that still owes this platform a port.
+  [ "$ok" = 1 ] || { note_unbuilt "$target" "$(printf '%s' "$why" | grep -v '^#' | head -1 | tr -d '"' | cut -c1-200)"; continue; }
 
   a="$(sha256sum "$D/.build-a/$exe" | cut -d' ' -f1)"
   b="$(sha256sum "$D/.build-b/$exe" | cut -d' ' -f1)"

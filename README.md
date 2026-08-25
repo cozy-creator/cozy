@@ -351,15 +351,19 @@ installed-binary state and release state are four distinct evidence axes, so a g
   and compared; a platform that does not reproduce is reported as UNBUILT rather than
   shipped. The tarball is deterministic (sorted, epoch mtimes, `gzip -n`) — otherwise the
   checksum would be a fact about the clock.
-- **UNBUILT is part of the output, and it is now empty.** `RELEASE.json` names every
-  platform that was not built and why, because an absent artifact and an artifact nobody
-  attempted look identical in a directory listing. There is no longer a wall to name:
-  `cozy` is pure Go, so `linux/amd64`, `linux/arm64`, `darwin/arm64`, `darwin/amd64` and
-  `windows/amd64` are five cross-compiles from one host. The per-OS facts that used to be
-  C are Go build tags now — `internal/flock` (flock vs `LockFileEx`), `internal/install`
-  (statfs vs `GetDiskFreeSpaceEx`, `st_dev`/`st_nlink` vs the volume serial), and
-  `internal/coord`'s peer credential (`SO_PEERCRED`, Darwin's `LOCAL_PEERCRED`, and no
-  answer at all elsewhere, which `peerPID` already reads as 0).
+- **UNBUILT is part of the output, and the C wall is gone from it.** `RELEASE.json` names
+  every platform that was not built and why, because an absent artifact and an artifact
+  nobody attempted look identical in a directory listing. `cozy` is pure Go, so
+  `linux/amd64`, `linux/arm64`, `darwin/arm64` and `darwin/amd64` are four cross-compiles
+  from one host. The per-OS facts that used to be C are Go build tags now —
+  `internal/flock` (flock vs `LockFileEx`), `internal/install` (statfs vs
+  `GetDiskFreeSpaceEx`, `st_dev`/`st_nlink` vs the volume serial), and `internal/coord`'s
+  peer credential (`SO_PEERCRED`, Darwin's `LOCAL_PEERCRED`, and no answer at all
+  elsewhere, which `peerPID` already reads as 0). `windows/amd64` is the one row left, and
+  it is no longer a dependency: `internal/coord/worker.go` spells the worker's process
+  group and its kills as `syscall.SysProcAttr{Setpgid}` and `syscall.Kill`, which Windows
+  answers with Job Objects instead. The UNBUILT reason quotes the compiler naming those
+  five lines, which is a port of one file rather than a wall.
 - **A build is not a run, and `RELEASE.json` says which it was.** Each artifact row carries
   `binary_sha256`, `binary_bytes`, the `format` line `file` printed, and `executed` — and
   on a Linux builder only the `linux/amd64` row can say it ran. The macOS and Windows
