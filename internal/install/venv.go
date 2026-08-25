@@ -185,15 +185,6 @@ func fileDigest(p string) (string, error) {
 	return hex.EncodeToString(h.Sum(nil)), nil
 }
 
-// FileDigest is the archive-identity helper the verify step uses.
-func FileDigest(p string) (string, *exit.Error) {
-	d, err := fileDigest(p)
-	if err != nil {
-		return "", exit.New(exit.NotFound, "cannot read %s: %s", p, err)
-	}
-	return "sha256:" + d, nil
-}
-
 var extraName = regexp.MustCompile(`^\s*(cu\d{2,4})\s*=`)
 
 // pickCUDAExtra chooses the declared CUDA extra this host's driver can actually

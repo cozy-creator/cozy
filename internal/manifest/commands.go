@@ -17,7 +17,7 @@ var FoundationTokens = []string{
 	"records.libsql",      // ONE local Turso/libSQL lifecycle database
 }
 
-var yesFlag = Flag{Name: "--yes", Summary: "confirm a destructive act (no prompt exists)"}
+var yesFlag = Flag{Name: "--yes", Summary: "confirm and execute; there is no prompt anywhere"}
 
 // Commands is THE command surface. Implemented rows name a handler; planned rows
 // name the issue that lands them. Nothing registers a command anywhere else.

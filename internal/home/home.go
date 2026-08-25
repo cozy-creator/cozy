@@ -9,8 +9,8 @@ import (
 	"github.com/cozy-creator/cozy-creator-v2/internal/exit"
 )
 
-// Root is $COZY_HOME, or ~/.cozy.
-func Root() (string, *exit.Error) {
+// root is $COZY_HOME, or ~/.cozy.
+func root() (string, *exit.Error) {
 	if v := os.Getenv("COZY_HOME"); v != "" {
 		abs, err := filepath.Abs(v)
 		if err != nil {
@@ -34,15 +34,15 @@ type Layout struct {
 }
 
 func Open() (Layout, *exit.Error) {
-	root, e := Root()
+	r, e := root()
 	if e != nil {
 		return Layout{}, e
 	}
 	l := Layout{
-		Root:        root,
-		DB:          filepath.Join(root, "records.db"),
-		Generations: filepath.Join(root, "generations"),
-		Lock:        filepath.Join(root, "writer.lock"),
+		Root:        r,
+		DB:          filepath.Join(r, "records.db"),
+		Generations: filepath.Join(r, "generations"),
+		Lock:        filepath.Join(r, "writer.lock"),
 	}
 	if err := os.MkdirAll(l.Generations, 0o755); err != nil {
 		return Layout{}, exit.Internalf("cannot create %s: %s", l.Generations, err)

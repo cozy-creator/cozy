@@ -22,6 +22,43 @@ No automated tests (decisions.md #160): verification = live runs + benchmarks.
 
 Gates run most-durable-refusal-first: confirm (7) → service (9) → not-implemented (2).
 
-`scripts/fence.py` enforces four families: forbidden deps, byte-plane vocabulary
-(TensorFS owns storage/chunking/residency), interactive prompts, and exit-matrix parity.
+## Install, pins and maintenance (cl-009)
+
+An install is an **immutable generation** plus a **pin per `(endpoint, major)`**, built
+through one staged transaction:
+
+    stage → verify source → build venv → descriptor → activate
+
+`internal/records` is the ONE local lifecycle authority: `install_generations` and
+`pins` rows in one local Turso/libSQL database (`$COZY_HOME/records.db`, default
+`~/.cozy`). No `state.json`, no second store. cl-001's LocalService adopts this package
+and adds its own tables to the same database. Driver: `github.com/tursodatabase/go-libsql`
+(embedded libSQL, **CGO_ENABLED=1**) — never vanilla SQLite.
+
+`internal/install` owns the pipeline. **stage** extracts a `.tar.gz` release under
+compressed/expanded/file-count/path-length bounds and refuses traversal, absolute paths,
+links, devices, duplicate and case-folding names, and entries the release does not
+declare; the declaration is the archive's *first* entry, so an undeclared entry refuses
+before it is written. **verify** settles source identity before any code executes —
+`--digest` by default, `--allow-unsigned` the development door, `--dir` the editable
+trust path with a source-snapshot digest. **venv** runs `uv sync --locked`: no resolve,
+no relaxed fallback, no lock rewrite. **descriptor** is a labelled pending seam
+(`pending-cr-003`) — nothing is faked. **activate** inserts the generation row and swaps
+the pin in ONE transaction, so a kill at any earlier stage leaves the prior pin runnable.
+
+Hardlink dedup is uv's link mode, not a second pool; it degrades to copies with a loud
+warning across mounts. Disk is measured once at install — `ls` reads the record and never
+walks the tree. `rm --yes` drops the pin and venv; `gc` is the plan without `--yes` and
+executes with it, reclaiming only what nothing references.
+
+`--from <archive>` is the pre-hub source door standing in for the hub resolve (cl-011);
+`scripts/pack.py` is the pre-hub packager `cozy deploy` (cl-012) replaces.
+
+## Verification
+
+No automated tests. `scripts/redarm.py` builds each hostile input for real, runs the real
+binary and observes the typed refusal (16 arms). `scripts/fence.py` enforces five
+families: forbidden deps, byte-plane vocabulary (TensorFS owns storage/residency),
+interactive prompts, exit-matrix parity, and a manifest lint — a reclaiming verb must
+declare `Destructive` (exit 7 without `--yes`) or `PlanFirst` (a read without it).
 Doors are greppable: `//cozy:allow`, `//cozy:stdin-value`.

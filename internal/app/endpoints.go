@@ -76,6 +76,7 @@ func handleInstall(ctx *Context) *exit.Error {
 			{K: "cuda_extra", V: orNone(g.Extra)},
 			{K: "link_mode", V: g.LinkMode},
 			{K: "packages", V: g.Packages},
+			{K: "closure", V: strings.ReplaceAll(g.Closure, "\n", " ")},
 			{K: "descriptor", V: g.Descriptor},
 			{K: "disk", V: diskText(g)},
 		},
@@ -86,7 +87,7 @@ func handleInstall(ctx *Context) *exit.Error {
 		return emit(ctx, rec)
 	}
 	rec.Fields = append(rec.Fields,
-		render.Field{K: "staged", V: fmt.Sprintf("%d files, %s", res.Files, install.Bytes(res.Bytes))},
+		render.Field{K: "staged", V: fmt.Sprintf("%d files, %s expanded, %s compressed", res.Files, render.Bytes(res.Bytes), render.Bytes(res.Compressed))},
 		render.Field{K: "timings", V: timingsText(res.Timings)},
 	)
 	if res.Superseded != "" {
@@ -114,7 +115,7 @@ func handleLs(ctx *Context) *exit.Error {
 	l := render.List{
 		Kind:      "ls",
 		Fields:    []string{"endpoint", "major", "version", "disk"},
-		AllFields: []string{"endpoint", "major", "version", "generation", "disk", "exclusive", "shared", "python", "uv", "cuda_extra", "link_mode", "packages", "descriptor", "source", "verified", "installed"},
+		AllFields: []string{"endpoint", "major", "version", "generation", "disk", "exclusive", "shared", "python", "uv", "cuda_extra", "link_mode", "packages", "closure", "descriptor", "source", "verified", "installed"},
 		Empty:     "0 endpoints installed",
 	}
 	var excl, shared int64
@@ -127,13 +128,14 @@ func handleLs(ctx *Context) *exit.Error {
 			"version":    g.Version,
 			"generation": g.ID,
 			"disk":       diskText(g),
-			"exclusive":  install.Bytes(g.BytesExcl),
-			"shared":     install.Bytes(g.BytesShared),
+			"exclusive":  render.Bytes(g.BytesExcl),
+			"shared":     render.Bytes(g.BytesShared),
 			"python":     g.Python,
 			"uv":         g.UV,
 			"cuda_extra": orNone(g.Extra),
 			"link_mode":  g.LinkMode,
 			"packages":   fmt.Sprintf("%d", g.Packages),
+			"closure":    strings.ReplaceAll(g.Closure, "\n", " "),
 			"descriptor": g.Descriptor,
 			"source":     g.SourceKind + " " + g.SourceRef,
 			"verified":   fmt.Sprintf("%t", g.Verified),
@@ -146,15 +148,15 @@ func handleLs(ctx *Context) *exit.Error {
 	}
 	l.Aggregates = []render.Field{
 		{K: "endpoints", V: len(l.Rows)},
-		{K: "exclusive", V: install.Bytes(excl)},
-		{K: "hardlink-shared", V: install.Bytes(shared)},
+		{K: "exclusive", V: render.Bytes(excl)},
+		{K: "hardlink-shared", V: render.Bytes(shared)},
 	}
 	l.Notes = []string{"read from the install records; no directory was walked"}
 	return emit(ctx, l)
 }
 
 func handleRm(ctx *Context) *exit.Error {
-	l, st, w, e := open(true)
+	_, st, w, e := open(true)
 	if e != nil {
 		return e
 	}
@@ -181,7 +183,7 @@ func handleRm(ctx *Context) *exit.Error {
 			if ref.HasMajor && p.Major != ref.Major {
 				continue
 			}
-			n, e := install.Remove(l, st, p.Endpoint, p.Major)
+			n, e := install.Remove(st, p.Endpoint, p.Major)
 			if e != nil {
 				return e
 			}
@@ -190,7 +192,7 @@ func handleRm(ctx *Context) *exit.Error {
 				"endpoint":   p.Endpoint,
 				"major":      fmt.Sprintf("v%d", p.Major),
 				"generation": p.Generation,
-				"reclaimed":  install.Bytes(n),
+				"reclaimed":  render.Bytes(n),
 			})
 		}
 	}
@@ -201,7 +203,7 @@ func handleRm(ctx *Context) *exit.Error {
 	}
 	removed.Aggregates = []render.Field{
 		{K: "removed", V: len(removed.Rows)},
-		{K: "reclaimed", V: install.Bytes(freed)},
+		{K: "reclaimed", V: render.Bytes(freed)},
 	}
 	removed.Notes = []string{"shared-CAS weights are untouched; `cozy gc` reclaims what nothing references"}
 	removed.Next = []string{"cozy gc"}
@@ -233,12 +235,12 @@ func handleGC(ctx *Context) *exit.Error {
 		total += r.Bytes
 		out.Rows = append(out.Rows, map[string]string{
 			"kind": r.Kind, "id": r.ID, "endpoint": r.Endpoint, "version": r.Version,
-			"bytes": install.Bytes(r.Bytes), "reason": r.Reason,
+			"bytes": render.Bytes(r.Bytes), "reason": r.Reason,
 		})
 	}
 	if !write {
 		out.Aggregates = []render.Field{
-			{K: "reclaimable", V: install.Bytes(total)},
+			{K: "reclaimable", V: render.Bytes(total)},
 			{K: "items", V: len(plan)},
 			{K: "cas", V: "0 objects (the shared weights CAS lands with cl-012)"},
 		}
@@ -255,7 +257,7 @@ func handleGC(ctx *Context) *exit.Error {
 		return e
 	}
 	out.Aggregates = []render.Field{
-		{K: "freed", V: install.Bytes(freed)},
+		{K: "freed", V: render.Bytes(freed)},
 		{K: "items", V: len(plan)},
 	}
 	if len(plan) > 0 {
@@ -266,9 +268,9 @@ func handleGC(ctx *Context) *exit.Error {
 
 func diskText(g records.Generation) string {
 	if g.BytesShared == 0 {
-		return install.Bytes(g.BytesExcl)
+		return render.Bytes(g.BytesExcl)
 	}
-	return fmt.Sprintf("%s (+%s shared)", install.Bytes(g.BytesExcl), install.Bytes(g.BytesShared))
+	return fmt.Sprintf("%s (+%s shared)", render.Bytes(g.BytesExcl), render.Bytes(g.BytesShared))
 }
 
 func orNone(s string) string {

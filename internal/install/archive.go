@@ -6,7 +6,6 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
-	"fmt"
 	"io"
 	"os"
 	"path"
@@ -14,6 +13,7 @@ import (
 	"strings"
 
 	"github.com/cozy-creator/cozy-creator-v2/internal/exit"
+	"github.com/cozy-creator/cozy-creator-v2/internal/render"
 )
 
 // Bounds every staged release archive is read under. A hostile archive is refused
@@ -312,6 +312,8 @@ func safeName(name string) (string, *exit.Error) {
 	return clean, nil
 }
 
+func bytesText(n int64) string { return render.Bytes(n) }
+
 func short(s string) string {
 	if len(s) > 19 {
 		return s[:19] + "…"
@@ -319,15 +321,3 @@ func short(s string) string {
 	return s
 }
 
-func bytesText(n int64) string {
-	const unit = 1024
-	if n < unit {
-		return fmt.Sprintf("%dB", n)
-	}
-	div, exp := int64(unit), 0
-	for v := n / unit; v >= unit; v /= unit {
-		div *= unit
-		exp++
-	}
-	return fmt.Sprintf("%.1f%ciB", float64(n)/float64(div), "KMGTPE"[exp])
-}

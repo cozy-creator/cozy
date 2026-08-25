@@ -298,7 +298,7 @@ func checkCapacity(dir string, staged int64) *exit.Error {
 // Remove drops one install: the pin and the generation directory. The generation
 // row survives as unreferenced until `cozy gc` reclaims it, and shared-CAS weights
 // are never touched here.
-func Remove(l home.Layout, st *records.Store, endpoint string, major int) (int64, *exit.Error) {
+func Remove(st *records.Store, endpoint string, major int) (int64, *exit.Error) {
 	pin, gen, e := st.ActivePin(endpoint, major)
 	if e != nil || pin == nil {
 		return 0, e
@@ -340,5 +340,3 @@ func containsStage(s string) bool {
 	return false
 }
 
-// Bytes renders a byte count the way every cl-009 surface renders it.
-func Bytes(n int64) string { return bytesText(n) }

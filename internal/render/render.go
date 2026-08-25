@@ -90,13 +90,14 @@ func text(v any) string {
 	}
 }
 
-func humanBytes(n int) string {
+// Bytes is the ONE byte-count rendering every cozy surface shares.
+func Bytes(n int64) string {
 	const unit = 1024
 	if n < unit {
 		return fmt.Sprintf("%dB", n)
 	}
 	div, exp := int64(unit), 0
-	for n := int64(n) / unit; n >= unit; n /= unit {
+	for v := n / unit; v >= unit; v /= unit {
 		div *= unit
 		exp++
 	}
@@ -113,7 +114,7 @@ func Elide(s string, full bool) string {
 		return s
 	}
 	kept := string(r[:valueCap-1])
-	out := fmt.Sprintf("%s… (+%s, --full)", kept, humanBytes(len(s)-len(kept)))
+	out := fmt.Sprintf("%s… (+%s, --full)", kept, Bytes(int64(len(s)-len(kept))))
 	if len(out) >= len(s) {
 		return s // eliding would print more, not less
 	}

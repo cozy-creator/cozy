@@ -16,7 +16,6 @@ package records
 import (
 	"database/sql"
 	"errors"
-	"fmt"
 	"strings"
 	"time"
 
@@ -58,8 +57,6 @@ type Pin struct {
 	Generation  string
 	ActivatedAt string
 }
-
-func (p Pin) Target() string { return fmt.Sprintf("%s@v%d", p.Endpoint, p.Major) }
 
 type Store struct{ db *sql.DB }
 
