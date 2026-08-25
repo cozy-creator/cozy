@@ -99,9 +99,20 @@ func Open(path string) (*Store, *exit.Error) {
 	if err != nil {
 		return nil, exit.Internalf("cannot open the local records database %s: %s", path, err)
 	}
+	// ONE writer: the lifecycle authority is a single-writer store, so serializing every
+	// statement on one connection is the honest shape rather than a tuning choice. The
+	// busy timeout covers the other direction — a reader in another process (a `cozy
+	// status` while the service runs) waits instead of failing.
+	db.SetMaxOpenConns(1)
 	if _, err := db.Exec("PRAGMA foreign_keys=ON"); err != nil {
 		db.Close()
 		return nil, exit.Internalf("cannot enable foreign keys on %s: %s", path, err)
+	}
+	// busy_timeout answers with a row, so it is a Query rather than an Exec.
+	var busy int
+	if err := db.QueryRow("PRAGMA busy_timeout=5000").Scan(&busy); err != nil {
+		db.Close()
+		return nil, exit.Internalf("cannot set the busy timeout on %s: %s", path, err)
 	}
 	for _, stmt := range schema {
 		if _, err := db.Exec(stmt); err != nil {

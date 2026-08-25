@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"path/filepath"
 	"strings"
+	"time"
 
 	"google.golang.org/protobuf/types/known/emptypb"
 
@@ -335,6 +336,7 @@ func (c *Coordinator) onTerminal(s *session, t *pb.AttemptTerminal) {
 	cause := causeCode(doc.Sub("cause").Int("code"))
 	outputs := c.outputsOf(t.RequestId, t.Attempt, doc)
 
+	began := time.Now()
 	applied, e := c.opt.Store.AcceptTerminal(records.Terminal{
 		RequestID: t.RequestId, Attempt: int64(t.Attempt), SessionID: s.id,
 		ExecSpecDigest: spelledSpec, TerminalID: t.TerminalId,
@@ -348,8 +350,9 @@ func (c *Coordinator) onTerminal(s *session, t *pb.AttemptTerminal) {
 		return
 	}
 	if applied {
-		c.logf("AttemptTerminal %s#%d %s/%s applied: %d output(s) became visible in the "+
-			"SAME transaction", t.RequestId, t.Attempt, status, cause, len(outputs))
+		c.logf("AttemptTerminal %s#%d %s/%s applied in %.2f ms: %d output(s) became visible "+
+			"in the SAME transaction", t.RequestId, t.Attempt, status, cause,
+			float64(time.Since(began).Microseconds())/1000, len(outputs))
 	} else {
 		c.logf("AttemptTerminal %s#%d is an exact replay of a closed terminal: re-acked, "+
 			"nothing applied twice", t.RequestId, t.Attempt)

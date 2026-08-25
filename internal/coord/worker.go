@@ -1,6 +1,8 @@
 package coord
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"os"
 	"os/exec"
@@ -84,6 +86,16 @@ type EndpointSpec struct {
 	NoWarm     bool
 }
 
+// InstanceID is the endpoint's local worker SLOT identity, and it is deliberately STABLE
+// across supervisor restarts: `instance_id` names one provisioned instance lifetime, and
+// terminal replay across a restart is authorized by that identity (02 §2). A slot keeps
+// its journal root, which is what lets a restarted supervisor report `recovered_attempts`
+// at all. A NEW install generation is a genuinely new instance and gets a new id.
+func (s EndpointSpec) InstanceID() string {
+	sum := sha256.Sum256([]byte("slot/" + s.Endpoint + "/" + s.Generation))
+	return "ins-" + hex.EncodeToString(sum[:12])
+}
+
 type worker struct {
 	instanceID string
 	spec       EndpointSpec
@@ -105,7 +117,10 @@ type worker struct {
 // supervisor. The grant is journaled BEFORE the process exists: a process that was never
 // granted an envelope cannot appear, and two concurrent starts cannot both consume one.
 func (c *Coordinator) StartWorker(spec EndpointSpec) (string, *exit.Error) {
-	instanceID := records.NewID("ins")
+	instanceID := spec.InstanceID()
+	// The slot's root is REUSED on purpose: the supervisor journal under it is what a
+	// restarted worker replays as `recovered_attempts`. Wiping it would manufacture the
+	// absence this protocol refuses to manufacture.
 	root := c.opt.Layout.WorkerDir(instanceID)
 	workerHome := filepath.Join(root, "home")
 	if err := os.MkdirAll(filepath.Join(workerHome, "binding-plans"), 0o755); err != nil {
@@ -136,9 +151,23 @@ func (c *Coordinator) StartWorker(spec EndpointSpec) (string, *exit.Error) {
 	sortStrings(planIDs) // the wire field is sorted lexicographic ascending
 
 	logPath := filepath.Join(root, "worker.log")
-	logFile, err := os.Create(logPath)
+	logFile, err := os.OpenFile(logPath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644)
 	if err != nil {
 		return "", exit.Internalf("cannot open the worker log %s: %s", logPath, err)
+	}
+
+	// The GRANT IS JOURNALED FIRST, before any process exists. An admission that
+	// refuses here means nothing was started, which is why the refusal has no cleanup.
+	if e := c.opt.Store.SpawnWorker(records.WorkerProcess{
+		InstanceID: instanceID,
+		Endpoint:   spec.Endpoint,
+		Generation: spec.Generation,
+		ReleaseID:  spec.ReleaseID,
+		WorkerID:   "local",
+		Devices:    spec.Devices,
+	}); e != nil {
+		logFile.Close()
+		return "", e
 	}
 
 	args := append([]string{}, spec.Args...)
@@ -164,43 +193,48 @@ func (c *Coordinator) StartWorker(spec EndpointSpec) (string, *exit.Error) {
 	cmd.Stdout, cmd.Stderr = logFile, logFile
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 
-	if err := cmd.Start(); err != nil {
-		logFile.Close()
-		return "", exit.Internalf("cannot start the endpoint worker: %s", err)
-	}
-	birth := birthOf(cmd.Process.Pid)
-
-	// The ledger admission. If it refuses, the process we just started has no grant, so
-	// it is killed here rather than left running against an envelope it does not hold.
-	if e := c.opt.Store.SpawnWorker(records.WorkerProcess{
-		InstanceID: instanceID,
-		Endpoint:   spec.Endpoint,
-		Generation: spec.Generation,
-		ReleaseID:  spec.ReleaseID,
-		WorkerID:   "local",
-		Devices:    spec.Devices,
-		PID:        cmd.Process.Pid,
-		Birth:      birth,
-	}); e != nil {
-		_ = syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
-		_, _ = cmd.Process.Wait()
-		logFile.Close()
-		return "", e
-	}
-
 	w := &worker{
 		instanceID: instanceID, spec: spec, cmd: cmd, logPath: logPath,
 		home: workerHome, planIDs: planIDs, ready: map[string]bool{},
 	}
+	// Registered BEFORE the process can dial: a worker that registers faster than its
+	// launcher can record it would be refused as an instance nobody spawned.
 	c.mu.Lock()
 	c.workers[instanceID] = w
 	c.mu.Unlock()
+
+	if err := cmd.Start(); err != nil {
+		c.mu.Lock()
+		delete(c.workers, instanceID)
+		c.mu.Unlock()
+		_ = c.opt.Store.CloseWorker(instanceID)
+		logFile.Close()
+		return "", exit.Internalf("cannot start the endpoint worker: %s", err)
+	}
+	if e := c.opt.Store.WorkerStarted(instanceID, cmd.Process.Pid, birthOf(cmd.Process.Pid)); e != nil {
+		return "", e
+	}
 	c.logf("worker %s spawned pid=%d devices=[%s] plans=%d",
 		instanceID, cmd.Process.Pid, strings.Join(spec.Devices, ","), len(planIDs))
 
+	// A worker row outliving its process is exactly the sidecar bug this design refuses:
+	// the row holds a device grant, so it dies with the process that held it.
 	go func() {
-		_ = cmd.Wait()
+		err := cmd.Wait()
 		logFile.Close()
+		c.mu.Lock()
+		current, live := c.workers[instanceID]
+		if live && current == w {
+			delete(c.workers, instanceID)
+			if w.sessionID != "" {
+				delete(c.sessions, w.sessionID)
+			}
+		}
+		c.mu.Unlock()
+		if live && current == w {
+			_ = c.opt.Store.CloseWorker(instanceID)
+			c.logf("worker %s exited (%v); its device grant is released", instanceID, err)
+		}
 	}()
 	return instanceID, nil
 }

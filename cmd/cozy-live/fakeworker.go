@@ -1,0 +1,231 @@
+package main
+
+import (
+	"context"
+	"encoding/hex"
+	"fmt"
+	"os"
+	"time"
+
+	"google.golang.org/grpc"
+	"google.golang.org/grpc/credentials/insecure"
+
+	"github.com/cozy-creator/cozy-creator-v2/internal/canonical"
+	pb "github.com/cozy-creator/cozy-creator-v2/protocol/cozy/worker/v1"
+)
+
+// fakeWorker is the ADVERSARY: a second, independent implementation of the worker side
+// of `cozy.worker.v1`, in Go, that dials the real coordinator socket exactly as the real
+// supervisor does. It exists so the coordinator's refusal arms have someone to refuse —
+// a real peer sending real bytes, never a plant inside the coordinator.
+//
+// It also proves something the SDXL run cannot: the coordinator interoperates with a
+// worker it did not co-develop against, over the committed contract alone.
+func fakeWorker() int {
+	hub := flag("hub", "")
+	// --fake-instance wins over the --instance-id StartWorker appends, so an arm can
+	// claim an instance this coordinator never spawned.
+	instance := flag("fake-instance", flag("instance-id", ""))
+	releaseID := flag("release-id", "")
+	arm := flag("arm", "idle")
+	session := flag("session", "fake-"+randomHex(8))
+
+	say := func(format string, args ...any) {
+		fmt.Printf("[fake %s] %s\n", arm, fmt.Sprintf(format, args...))
+		os.Stdout.Sync()
+	}
+
+	target := hub
+	if len(target) > 5 && target[:5] == "unix:" {
+		target = "unix://" + target[5:]
+	}
+	conn, err := grpc.NewClient(target, grpc.WithTransportCredentials(insecure.NewCredentials()))
+	if err != nil {
+		say("cannot dial %s: %v", hub, err)
+		return 1
+	}
+	defer conn.Close()
+	stream, err := pb.NewWorkerClient(conn).Control(context.Background())
+	if err != nil {
+		say("cannot open Control: %v", err)
+		return 1
+	}
+
+	if arm == "badrelease" {
+		releaseID = "cozy/not-the-pinned-release@v0"
+	}
+	send := func(m *pb.WorkerMessage) {
+		if err := stream.Send(m); err != nil {
+			say("send failed: %v", err)
+		}
+	}
+	send(&pb.WorkerMessage{Msg: &pb.WorkerMessage_Register{Register: &pb.Register{
+		SessionId: session, ExecutorIncarnation: 1, WireMinor: pb.WireMinor,
+		WorkerId: "local", InstanceId: instance, ReleaseId: releaseID,
+		Resources: &pb.WorkerResources{GpuCount: 0, Platform: "fake"},
+	}}})
+	say("Register sent: session=%s instance=%s release=%s", session, instance, releaseID)
+
+	var planIDs []string
+	for {
+		msg, err := stream.Recv()
+		if err != nil {
+			say("stream closed: %v", err)
+			return 0
+		}
+		switch m := msg.Msg.(type) {
+		case *pb.CoordinatorMessage_RegisterAck:
+			if !m.RegisterAck.Accepted {
+				say("REGISTER REFUSED: %s",
+					pb.RegisterRejection_name[int32(m.RegisterAck.Rejection)])
+				return 0
+			}
+			say("RegisterAck accepted, wire_minor=%d", m.RegisterAck.WireMinor)
+		case *pb.CoordinatorMessage_Directive:
+			planIDs = m.Directive.GetServing().GetEntrypointBindingPlanIds()
+			say("Directive revision=%d plans=%d", m.Directive.Revision, len(planIDs))
+			send(&pb.WorkerMessage{Msg: &pb.WorkerMessage_Report{Report: &pb.Report{
+				SessionId: session, ExecutorIncarnation: 1,
+				AppliedRevision: m.Directive.Revision,
+				IntakeState:     pb.IntakeState_INTAKE_STATE_READY,
+				ReadinessEpoch:  1, AppliedWireMinor: pb.WireMinor,
+				Capacity: &pb.Report_ServingCapacity{ServingCapacity: &pb.ServingCapacity{
+					ReadyEntrypointBindingPlanIds: planIDs, FreeVramBytes: 1 << 30,
+				}},
+			}}})
+			say("Report READY for %d plan(s)", len(planIDs))
+			if arm == "steal" {
+				stealTerminal(send, session, say)
+				time.Sleep(2 * time.Second)
+				return 0
+			}
+		case *pb.CoordinatorMessage_StartAttempt:
+			start := m.StartAttempt
+			say("StartAttempt %s#%d spec=%s", start.RequestId, start.Attempt,
+				hex.EncodeToString(start.ExecSpecDigest)[:16])
+			send(&pb.WorkerMessage{Msg: &pb.WorkerMessage_AttemptAccepted{
+				AttemptAccepted: &pb.AttemptAccepted{
+					SessionId: session, ExecutorIncarnation: 1,
+					RequestId: start.RequestId, Attempt: start.Attempt,
+					ExecSpecDigest:          start.ExecSpecDigest,
+					PlanDigest:              canonical.Digest([]byte("fake-plan")),
+					ModelConstructionDigest: canonical.Digest([]byte("fake-construction")),
+					Plan:                    &pb.AttemptPlanSummary{Delivery: "native", Placement: "all_resident"},
+				}}})
+			if arm == "badterminal" {
+				badTerminals(send, session, start, say)
+			}
+		case *pb.CoordinatorMessage_TerminalAck:
+			say("TerminalAck for %s#%d digest=%s", m.TerminalAck.RequestId,
+				m.TerminalAck.Attempt, hex.EncodeToString(m.TerminalAck.TerminalDigest)[:16])
+			if arm == "badterminal" {
+				time.Sleep(500 * time.Millisecond)
+				return 0
+			}
+		case *pb.CoordinatorMessage_CancelAttempt:
+			say("CancelAttempt %s#%d", m.CancelAttempt.RequestId, m.CancelAttempt.Attempt)
+		}
+	}
+}
+
+// terminalFor builds one journaled TerminalBody and its envelope, the way a worker does:
+// the document is canonicalized once, the digest is over exactly those bytes, and the
+// envelope's routing copies are copies of the document's own fields.
+func terminalFor(session string, requestID string, attempt uint64, spec []byte,
+	status pb.TerminalStatus, message string) (*pb.AttemptTerminal, []byte) {
+	body := &pb.TerminalBody{
+		RequestId: requestID, Attempt: attempt, ExecSpecDigest: spec, Status: status,
+		SafeMessage: message,
+		Cause: &pb.TerminalCause{
+			Code:   pb.CauseCode_CAUSE_CODE_AUTHOR_EXCEPTION,
+			Origin: pb.CauseOrigin_CAUSE_ORIGIN_AUTHOR,
+			Detail: "a fake worker's terminal",
+		},
+	}
+	if status == pb.TerminalStatus_TERMINAL_STATUS_SUCCEEDED {
+		body.Cause = &pb.TerminalCause{Origin: pb.CauseOrigin_CAUSE_ORIGIN_RUNTIME}
+	}
+	data, digest, err := canonical.Identity(body)
+	if err != nil {
+		panic(err)
+	}
+	return &pb.AttemptTerminal{
+		SessionId: session, ExecutorIncarnation: 1, RequestId: requestID, Attempt: attempt,
+		ExecSpecDigest: spec, TerminalId: "trm-" + randomHex(8), TerminalDigest: digest,
+		TerminalCanonical: data,
+	}, data
+}
+
+// badTerminals is the refusal matrix, sent in order. Only the LAST one is admissible,
+// and the ack that follows it is the coordinator saying so.
+func badTerminals(send func(*pb.WorkerMessage), session string, start *pb.StartAttempt,
+	say func(string, ...any)) {
+	emit := func(t *pb.AttemptTerminal) {
+		send(&pb.WorkerMessage{Msg: &pb.WorkerMessage_AttemptTerminal{AttemptTerminal: t}})
+		time.Sleep(400 * time.Millisecond)
+	}
+
+	// 1. A terminal_digest that does not hash the resident bytes. The receiver
+	//    RECOMPUTES; a digest never bypasses the lower check.
+	t, _ := terminalFor(session, start.RequestId, start.Attempt, start.ExecSpecDigest,
+		pb.TerminalStatus_TERMINAL_STATUS_SUCCEEDED, "planted digest")
+	t.TerminalDigest = canonical.Digest([]byte("not the body"))
+	say("ARM 1: terminal_digest planted")
+	emit(t)
+
+	// 2. The envelope's routing copies disagree with the document. The DOCUMENT is
+	//    authoritative, so divergence refuses rather than picking a winner.
+	t, _ = terminalFor(session, start.RequestId, start.Attempt+7, start.ExecSpecDigest,
+		pb.TerminalStatus_TERMINAL_STATUS_SUCCEEDED, "divergent envelope")
+	t.Attempt = start.Attempt // the envelope says N, the document says N+7
+	say("ARM 2: envelope/document divergence")
+	emit(t)
+
+	// 3. A key the closed document has no slot for, written BY HAND because the schema
+	//    cannot express it — which is the point of the arm.
+	t, data := terminalFor(session, start.RequestId, start.Attempt, start.ExecSpecDigest,
+		pb.TerminalStatus_TERMINAL_STATUS_SUCCEEDED, "planted key")
+	doc, err := canonical.Read(data, &pb.TerminalBody{})
+	if err == nil {
+		raw := map[string]canonical.Value(doc)
+		raw["service_class"] = "priority"
+		planted, werr := canonical.Write(raw)
+		if werr == nil {
+			t.TerminalCanonical = planted
+			t.TerminalDigest = canonical.Digest(planted)
+		}
+	}
+	say("ARM 3: a planted key in the terminal document")
+	emit(t)
+
+	// 4. An admissible terminal for an attempt this session does hold.
+	t, _ = terminalFor(session, start.RequestId, start.Attempt, start.ExecSpecDigest,
+		pb.TerminalStatus_TERMINAL_STATUS_FAILED, "the fake worker has no GPU")
+	say("ARM 4: an admissible terminal")
+	emit(t)
+	// 5. The exact same terminal again: a replay must re-ack and apply nothing twice.
+	say("ARM 5: the same terminal replayed")
+	emit(t)
+}
+
+// stealTerminal is a SECOND session trying to write another session's attempt row.
+func stealTerminal(send func(*pb.WorkerMessage), session string, say func(string, ...any)) {
+	requestID := flag("request", "")
+	var attempt uint64
+	fmt.Sscanf(flag("attempt", "1"), "%d", &attempt)
+	spec, _ := hex.DecodeString(flag("spec", ""))
+	t, _ := terminalFor(session, requestID, attempt, spec,
+		pb.TerminalStatus_TERMINAL_STATUS_SUCCEEDED, "a terminal from a session that does not own it")
+	say("ARM: session %s claims %s#%d, which it was never assigned", session, requestID, attempt)
+	send(&pb.WorkerMessage{Msg: &pb.WorkerMessage_AttemptTerminal{AttemptTerminal: t}})
+}
+
+func randomHex(n int) string {
+	b := make([]byte, n)
+	f, err := os.Open("/dev/urandom")
+	if err == nil {
+		_, _ = f.Read(b)
+		f.Close()
+	}
+	return hex.EncodeToString(b)
+}

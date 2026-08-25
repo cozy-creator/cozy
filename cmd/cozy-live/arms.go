@@ -1,0 +1,235 @@
+package main
+
+import (
+	"encoding/hex"
+	"fmt"
+	"os"
+	"strings"
+	"sync"
+	"time"
+
+	"github.com/cozy-creator/cozy-creator-v2/internal/canonical"
+	"github.com/cozy-creator/cozy-creator-v2/internal/coord"
+	"github.com/cozy-creator/cozy-creator-v2/internal/exit"
+	"github.com/cozy-creator/cozy-creator-v2/internal/service"
+)
+
+// fakeSpec is a worker slot whose process is THIS binary speaking raw protocol. It is a
+// real process dialing the real socket over the committed contract — the adversary, not
+// a plant.
+func fakeSpec(name string, device string, args ...string) coord.EndpointSpec {
+	self, err := os.Executable()
+	must("locating this binary", err)
+	return coord.EndpointSpec{
+		Endpoint:   "fake/" + name,
+		ReleaseID:  release,
+		Generation: "",
+		Python:     self,
+		Args:       append([]string{"fakeworker"}, args...),
+		Devices:    []string{device},
+		Bindings: []*coord.Binding{{
+			Entrypoint: "fake",
+			Record: map[string]any{
+				"entrypoint": "fake", "release": release, "slot": name,
+			},
+		}},
+	}
+}
+
+func waitEvent(lv *live, substr string, timeout time.Duration) (string, bool) {
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		for _, line := range lv.c.Events() {
+			if strings.Contains(line, substr) {
+				return line, true
+			}
+		}
+		time.Sleep(25 * time.Millisecond)
+	}
+	return "", false
+}
+
+func lastEvent(lv *live, substr string) string {
+	out := ""
+	for _, line := range lv.c.Events() {
+		if strings.Contains(line, substr) {
+			out = line
+		}
+	}
+	return out
+}
+
+func countEvents(lv *live, substr string) int {
+	n := 0
+	for _, line := range lv.c.Events() {
+		if strings.Contains(line, substr) {
+			n++
+		}
+	}
+	return n
+}
+
+// sectionArms is the refusal matrix, every arm planted by a REAL peer or a REAL second
+// process and observed against the real coordinator.
+func sectionArms() {
+	var e *exit.Error
+	lv := hostCoordinator("arms", true)
+	defer lv.close()
+
+	head("the service claim: one LocalService per local root")
+	first, e1 := service.Hold(lv.l, "127.0.0.1:2699", "sock")
+	check("the first claim on this root succeeds", e1 == nil, briefly(e1))
+	_, e2 := service.Hold(lv.l, "127.0.0.1:2699", "sock")
+	check("a SECOND LocalService on the same root refuses", e2 != nil &&
+		e2.Code == exit.Conflict, briefly(e2))
+	first.Release()
+	third, e3 := service.Hold(lv.l, "127.0.0.1:2699", "sock")
+	check("releasing the claim frees the root again", e3 == nil, briefly(e3))
+	third.Release()
+
+	head("the device ledger: an envelope cannot be consumed twice")
+	victim := fakeSpec("victim", "0", "--arm", "idle")
+	instanceA, e := lv.c.StartWorker(victim)
+	check("worker A holds device 0", e == nil, briefly(e))
+	rival := fakeSpec("rival", "0", "--arm", "idle")
+	_, e = lv.c.StartWorker(rival)
+	check("a second start against device 0 REFUSES", e != nil && e.Code == exit.Conflict,
+		briefly(e))
+
+	// The same statement under real concurrency: two starts racing one envelope.
+	var wg sync.WaitGroup
+	results := make([]*exit.Error, 2)
+	for i := 0; i < 2; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			_, results[i] = lv.c.StartWorker(fakeSpec(fmt.Sprintf("racer%d", i), "9", "--arm", "idle"))
+		}(i)
+	}
+	wg.Wait()
+	won := 0
+	for _, r := range results {
+		if r == nil {
+			won++
+		}
+	}
+	check("two CONCURRENT starts on one envelope: exactly one wins", won == 1,
+		fmt.Sprintf("%d won, refusals: %v", won, briefly(results[0])+" / "+briefly(results[1])))
+
+	planA := planIDOf(victim, "fake")
+	if e := lv.c.WaitReady(instanceA, planA, 30*time.Second); e != nil {
+		check("worker A ready", false, e.Message)
+		return
+	}
+	factsA := lv.c.Worker(instanceA)
+	check("worker A registered over raw protocol bytes", factsA.SessionID != "",
+		"session "+factsA.SessionID)
+
+	head("register-level refusals")
+	// A worker this LocalService never spawned cannot register: the coordinator knows
+	// exactly which instances it launched.
+	ghost := fakeSpec("ghost", "7", "--arm", "idle", "--fake-instance", "ins-never-spawned")
+	_, _ = lv.c.StartWorker(ghost)
+	line, ok := waitEvent(lv, "WORKER_ID_MISMATCH", 10*time.Second)
+	check("an unspawned instance_id is refused at Register", ok, trimLog(line))
+
+	// A worker registering under a release that is not the pinned one.
+	badrel := fakeSpec("badrelease", "6", "--arm", "badrelease")
+	_, _ = lv.c.StartWorker(badrel)
+	line, ok = waitEvent(lv, "RELEASE_ID_MISMATCH", 10*time.Second)
+	check("a release that is not the pinned one is refused", ok, trimLog(line))
+
+	// A second live worker claiming a bound session_id.
+	collide := fakeSpec("collide", "5", "--arm", "idle", "--session", factsA.SessionID)
+	_, _ = lv.c.StartWorker(collide)
+	line, ok = waitEvent(lv, "SESSION_COLLISION", 10*time.Second)
+	check("two live workers cannot share a session_id", ok, trimLog(line))
+
+	head("attempt-level refusals: a held attempt, and a stranger's terminal")
+	bodyA := payload(map[string]any{"held": true})
+	subA := submissionKey(instanceA, planA, bodyA, "idem-held")
+	subA.Endpoint, subA.Entrypoint = "fake/victim", "fake"
+	requestA, attemptA, e := lv.c.Submit(subA)
+	check("A accepts and HOLDS an attempt", e == nil, briefly(e))
+	if e := lv.c.AwaitAccepted(requestA, attemptA, 15*time.Second); e != nil {
+		check("A's acceptance journaled", false, e.Message)
+		return
+	}
+	rowA, _ := lv.store.AttemptRow(requestA, int64(attemptA))
+	specHex := ""
+	if raw, err := canonical.Raw(rowA.ExecSpecDigest); err == nil {
+		specHex = hex.EncodeToString(raw)
+	}
+
+	// A NEW ordinal over a live attempt: supersession is explicit, never implicit.
+	_, _, e = lv.c.Submit(subA)
+	check("a next ordinal over a LIVE attempt refuses", e != nil &&
+		strings.Contains(e.Message, "supersession is explicit"), briefly(e))
+
+	// A second session writing another session's attempt row.
+	thief := fakeSpec("thief", "4", "--arm", "steal", "--request", requestA,
+		"--attempt", fmt.Sprint(attemptA), "--spec", specHex)
+	_, _ = lv.c.StartWorker(thief)
+	line, ok = waitEvent(lv, "does not own that attempt row", 15*time.Second)
+	check("a SECOND WRITER on the same attempt row refuses", ok, trimLog(line))
+	rowA2, _ := lv.store.AttemptRow(requestA, int64(attemptA))
+	check("the held attempt is untouched by the refusal", rowA2.State == "accepted" &&
+		rowA2.TerminalID == "", "state "+rowA2.State)
+
+	head("terminal-level refusals: the digest fence, the document fence, the replay")
+	badspec := fakeSpec("badterminal", "3", "--arm", "badterminal")
+	instanceB, e := lv.c.StartWorker(badspec)
+	_ = instanceA
+	check("worker B up", e == nil, briefly(e))
+	planB := planIDOf(badspec, "fake")
+	if e := lv.c.WaitReady(instanceB, planB, 30*time.Second); e != nil {
+		check("worker B ready", false, e.Message)
+		return
+	}
+	subB := submissionKey(instanceB, planB, payload(map[string]any{"arms": true}), "idem-arms")
+	subB.Endpoint, subB.Entrypoint = "fake/badterminal", "fake"
+	requestB, attemptB, e := lv.c.Submit(subB)
+	check("B is dispatched an attempt", e == nil, briefly(e))
+
+	result, e := lv.c.Await(requestB, attemptB, 30*time.Second)
+	_ = result
+	check("B's attempt closes on its ONE admissible terminal", e != nil &&
+		strings.Contains(e.Message, "no GPU"), briefly(e))
+
+	line, ok = waitEvent(lv, "does not hash the", 5*time.Second)
+	check("a planted terminal_digest refuses (recomputed over the resident bytes)", ok, trimLog(line))
+	line, ok = waitEvent(lv, "envelope/document divergence", 5*time.Second)
+	check("envelope routing copies that disagree with the document refuse", ok, trimLog(line))
+	line, ok = waitEvent(lv, "unknown field", 5*time.Second)
+	check("a planted key in the terminal document refuses", ok, trimLog(line))
+	line, ok = waitEvent(lv, "exact replay", 5*time.Second)
+	check("an exact replay is re-acked and applied ONCE", ok, trimLog(line))
+	check("exactly one terminal was applied for B", countEvents(lv, "applied in") == 1,
+		fmt.Sprintf("%d apply line(s)", countEvents(lv, "applied in")))
+
+	rowB, _ := lv.store.AttemptRow(requestB, int64(attemptB))
+	check("B's row carries the ONE terminal that was admissible",
+		rowB.TerminalStatus == "FAILED" && rowB.State == "closed",
+		fmt.Sprintf("%s/%s, %s", rowB.TerminalStatus, rowB.TerminalCause, rowB.State))
+	outs, _ := lv.store.VisibleOutputs(requestB)
+	check("a FAILED terminal published no output", len(outs) == 0,
+		fmt.Sprintf("%d output(s)", len(outs)))
+
+	head("teardown")
+	live, _ := lv.store.LiveWorkers()
+	for _, row := range live {
+		lv.c.StopWorker(row.InstanceID, 10*time.Second)
+	}
+	rows, _ := lv.store.LiveWorkers()
+	check("every device grant is released", len(rows) == 0, fmt.Sprintf("%d live row(s)", len(rows)))
+}
+
+func trimLog(line string) string {
+	if i := strings.Index(line, "] "); i >= 0 {
+		line = line[i+2:]
+	}
+	if len(line) > 150 {
+		line = line[:150] + "…"
+	}
+	return line
+}
