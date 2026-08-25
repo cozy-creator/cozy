@@ -328,6 +328,44 @@ credential of its own — a second custody authority is exactly what law 2 forbi
 own promote route answers `promote.not_armed` today) and the leased build that turns a
 source snapshot into a release with th-004. `datasets push|pull` waits on th-035.
 
+## Release and distribution (cl-013)
+
+Distribution is ACCEPTANCE, not packaging residue. Source state, tracker state,
+installed-binary state and release state are four distinct evidence axes, so a green
+`master` is not a shipped product and CI says so with two separate jobs.
+
+- **`scripts/release.sh` refuses a dirty tree.** A release binary must provably carry its
+  commit, and a stamp naming a commit whose bytes were not the bytes built is a lie the
+  installer would propagate. `--allow-dirty` is the development door and puts `+dirty` in
+  the tag, so the artifact confesses. Every target is built TWICE into separate directories
+  and compared; a platform that does not reproduce is reported as UNBUILT rather than
+  shipped. The tarball is deterministic (sorted, epoch mtimes, `gzip -n`) — otherwise the
+  checksum would be a fact about the clock.
+- **UNBUILT is part of the output.** `RELEASE.json` names every platform that was not built
+  and why, because an absent artifact and an artifact nobody attempted look identical in a
+  directory listing. `internal/records` is the ONE lifecycle authority and its driver is
+  embedded libSQL, so **every platform wall is a C wall**: `go-libsql` ships static archives
+  for `linux_amd64`, `linux_arm64` and `darwin_arm64` and **none for Windows**, and the two
+  it does ship need a cross C toolchain to build from here. A Windows binary is therefore
+  not a cross-compile away — the driver has no port, and `internal/service` holds the
+  liveness law with `syscall.Flock`, which Windows does not have.
+- **`scripts/install.sh` verifies the checksum BEFORE anything is replaced**, then stages
+  inside the target directory so the final move is a rename on one filesystem. A corrupted
+  asset is exit 13 with both digests named and the working installation untouched — the
+  matrix's own reading of 13, "failed replacement kept the working state". Install and
+  upgrade are ONE act: point it at a different asset. There is no download and no channel;
+  `latest` and rollback are the first-external-user tier.
+- **`scripts/accept.sh` is the fixture the guard runs**, and it drives the release asset and
+  nothing else — no Go toolchain, no repository, no build tree. `scripts/clean-machine.sh`
+  is that file plus a throwaway container with an empty home to run it on.
+- **`fixtures/weightless/`** is an endpoint with no `Model` parameter, so `gpu` derives
+  False and its release depends on the BASE cozy-runtime wheel alone — a real install and a
+  real descriptor derivation in tens of megabytes and half a second, on any machine. It is
+  what a Windows runner would exercise. Serving it is **not yet possible**: the supervisor
+  boots by running `prepare` for every staged binding, and a modelless plan has nothing to
+  prepare, so `launch.Spec` refuses `no_servable_function` by name. That is cl-010's named
+  seam, and the fixture asserts the refusal so the arm goes red the day it closes.
+
 ## Verification
 
 No automated tests. Verification is running the real thing:
@@ -352,6 +390,12 @@ No automated tests. Verification is running the real thing:
   0-byte dedup publish, an interrupted publish and an interrupted fetch each converging
   on a re-run, the whole refusal matrix, and the benchmarks. Everything it writes to R2
   is swept and the sweep is re-listed to prove it.
+- `scripts/clean-machine.sh` runs `scripts/accept.sh` inside a throwaway container with a
+  fresh user, an empty home, no toolchain and no mount of this repository but `scripts/`:
+  the corrupted-asset red arm, the checksum-verified install, the tag and commit the
+  binary carries, the service-down refusals, `cozy up` building its libSQL records on a
+  machine that never had one, the weightless endpoint install, the not-yet-servable
+  refusal, `cozy down`'s proof of absence, and the verified upgrade.
 - `scripts/fence.py` enforces thirteen families: forbidden deps, byte-plane vocabulary
   (TensorFS owns storage/residency), interactive prompts, exit-matrix parity, a manifest
   lint, the env-read fence (one reader), no lifecycle sidecar, no cloud emulation or

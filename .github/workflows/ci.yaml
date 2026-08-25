@@ -8,8 +8,31 @@ jobs:
       - uses: actions/setup-go@v5
         with:
           go-version: stable
-      # The embedded libSQL driver is CGO-based (cl-009); qualifying the static
-      # cross-platform build per platform is cl-013's distribution work.
+      # The embedded libSQL driver is CGO-based (cl-009). cl-013's `release` job below is
+      # what qualifies the shipped artifact per platform.
       - run: CGO_ENABLED=1 go build ./...
       - run: go vet ./...
       - run: python3 scripts/fence.py
+
+  # cl-013's SHIPPED GUARD. A green `checks` is a fact about the source tree; this job is a
+  # fact about the artifact a user would install. They are separate evidence axes and a
+  # master-only green may not stand in for this one.
+  #
+  # The weightless ENDPOINT leg is deliberately absent here: it needs the cozy-runtime peer
+  # to build its release, which this runner does not have. `scripts/clean-machine.sh` runs
+  # the same fixture with `--endpoint` on a machine that does.
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: stable
+      - run: scripts/release.sh --tag ci-$GITHUB_SHA
+      - run: scripts/release.sh --tag ci-$GITHUB_SHA-next
+      - run: |
+          scripts/accept.sh \
+            --dist "dist/ci-$GITHUB_SHA" \
+            --asset "cozy-ci-$GITHUB_SHA-linux-amd64.tar.gz" \
+            --upgrade "dist/ci-$GITHUB_SHA-next/cozy-ci-$GITHUB_SHA-next-linux-amd64.tar.gz" \
+            --prefix "$RUNNER_TEMP/prefix" --home "$RUNNER_TEMP/cozy-home"
