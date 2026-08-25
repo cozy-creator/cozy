@@ -171,7 +171,7 @@ func (c *Coordinator) pick(planID string) (*worker, *session, *exit.Error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	for _, w := range c.workers {
-		if w.intake != pb.IntakeState_INTAKE_STATE_READY || !w.ready[planID] {
+		if w.exited || w.intake != pb.IntakeState_INTAKE_STATE_READY || !w.ready[planID] {
 			continue
 		}
 		if sess := c.sessions[w.sessionID]; sess != nil {

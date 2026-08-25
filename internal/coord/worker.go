@@ -105,6 +105,7 @@ type worker struct {
 	planIDs    []string
 
 	// what the worker itself reported; the coordinator echoes, never invents
+	exited      bool
 	sessionID   string
 	incarnation uint64
 	epoch       uint64
@@ -224,16 +225,21 @@ func (c *Coordinator) StartWorker(spec EndpointSpec) (string, *exit.Error) {
 		logFile.Close()
 		c.mu.Lock()
 		current, live := c.workers[instanceID]
-		if live && current == w {
-			delete(c.workers, instanceID)
+		mine := live && current == w
+		if mine {
+			// The entry STAYS, marked exited: a caller waiting on readiness needs to
+			// learn the worker is gone and where its log is, and a row that vanishes
+			// silently is the same lie as a row that outlives its process.
+			w.exited = true
 			if w.sessionID != "" {
 				delete(c.sessions, w.sessionID)
 			}
 		}
 		c.mu.Unlock()
-		if live && current == w {
+		if mine {
 			_ = c.opt.Store.CloseWorker(instanceID)
-			c.logf("worker %s exited (%v); its device grant is released", instanceID, err)
+			c.logf("worker %s exited (%v); its device grant is released — log %s",
+				instanceID, err, logPath)
 		}
 	}()
 	return instanceID, nil
@@ -253,15 +259,19 @@ func (c *Coordinator) WaitReady(instanceID, planID string, timeout time.Duration
 	for time.Now().Before(deadline) {
 		c.mu.Lock()
 		w := c.workers[instanceID]
-		ok := w != nil && w.intake == pb.IntakeState_INTAKE_STATE_READY && w.ready[planID]
-		gone := w != nil && w.cmd.ProcessState != nil
+		ok := w != nil && !w.exited && w.intake == pb.IntakeState_INTAKE_STATE_READY && w.ready[planID]
+		gone := w == nil || w.exited
+		logPath := ""
+		if w != nil {
+			logPath = w.logPath
+		}
 		c.mu.Unlock()
 		if ok {
 			return nil
 		}
 		if gone {
 			return exit.New(exit.Failed, "the endpoint worker exited before reporting ready").
-				WithRemedy("its log is %s", c.WorkerLog(instanceID))
+				WithRemedy("its log is %s", logPath)
 		}
 		time.Sleep(20 * time.Millisecond)
 	}
@@ -323,7 +333,7 @@ func (c *Coordinator) StopWorker(instanceID string, grace time.Duration) {
 	if w == nil {
 		return
 	}
-	if w.cmd.Process != nil {
+	if w.cmd.Process != nil && !w.exited {
 		_ = syscall.Kill(-w.cmd.Process.Pid, syscall.SIGTERM)
 		deadline := time.Now().Add(grace)
 		for time.Now().Before(deadline) {
@@ -338,6 +348,7 @@ func (c *Coordinator) StopWorker(instanceID string, grace time.Duration) {
 	}
 	_ = c.opt.Store.CloseWorker(instanceID)
 	c.mu.Lock()
+	w.exited = true
 	delete(c.workers, instanceID)
 	if w.sessionID != "" {
 		delete(c.sessions, w.sessionID)

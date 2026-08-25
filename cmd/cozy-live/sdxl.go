@@ -58,7 +58,6 @@ func sdxlSpec(entrypoints ...string) coord.EndpointSpec {
 				"param":                     "model",
 				"component":                 "unet",
 				"store":                     filepath.Join(bench, "store"),
-				"plan":                      filepath.Join(bench, "results", "read.plan"),
 				"config":                    filepath.Join(bench, "hf", "sdxl", "unet", "config.json"),
 				"snapshot":                  snapshot,
 				"release":                   release,
