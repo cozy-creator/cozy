@@ -242,25 +242,27 @@ var Commands = []Command{
 	// ---- jobs (cl-004) ----
 	{
 		Path: []string{"job", "submit"}, Group: "jobs",
-		Summary: "submit a @job; prints the job id",
+		Summary: "submit a @job; prints the job id and its publication repo",
 		Args:    "<org/endpoint/vN/function> [key=value …]", MinArgs: 1, MaxArgs: -1,
 		Flags: []Flag{
 			{Name: "--local", Summary: "run on this host"},
 			{Name: "--cloud", Summary: "submit to tensorhub"},
 			{Name: "--model", Arg: "<ref>", Summary: "override a model binding (repeatable)"},
-			{Name: "--out", Arg: "<dir>", Summary: "output directory"},
+			{Name: "--input", Arg: "<ref>=<dir>", Summary: "a typed input TREE, granted as a read capability (repeatable)"},
+			{Name: "--org", Arg: "<name>", Summary: "the org whose scratch repo this job publishes into (default local)"},
 			{Name: "--in", Arg: "<file>", Summary: "whole payload as JSON"},
+			{Name: "--idempotency-key", Arg: "<key>", Summary: "name this job forever; a repeat answers the same one"},
 			{Name: "--follow", Summary: "attach immediately and exit with the terminal mapping"},
 		},
 		Exits:      []exit.Code{exit.OK, exit.Validation, exit.NotFound, exit.Unavailable, exit.Deadline, exit.Failed, exit.Canceled},
-		Capability: "cmd.job.submit", NeedsServer: true, Terminals: true, Status: Planned, Issue: "cl-004",
+		Capability: "cmd.job.submit", NeedsServer: true, Terminals: true, Status: Implemented, Handler: "job.submit",
 	},
 	{
 		Path: []string{"job", "status"}, Group: "jobs",
 		Summary: "state, progress, elapsed, the running bill where a rate exists, terminal",
 		Args:    "<job-id>", MinArgs: 1, MaxArgs: 1,
 		Exits:      []exit.Code{exit.OK, exit.NotFound, exit.Unavailable},
-		Capability: "cmd.job.status", NeedsServer: true, Status: Planned, Issue: "cl-004",
+		Capability: "cmd.job.status", NeedsServer: true, Status: Implemented, Handler: "job.status",
 	},
 	{
 		Path: []string{"job", "ls"}, Group: "jobs",
@@ -271,21 +273,21 @@ var Commands = []Command{
 		},
 		MaxArgs:    0,
 		Exits:      []exit.Code{exit.OK, exit.Unavailable},
-		Capability: "cmd.job.ls", NeedsServer: true, Status: Planned, Issue: "cl-004",
+		Capability: "cmd.job.ls", NeedsServer: true, Status: Implemented, Handler: "job.ls",
 	},
 	{
 		Path: []string{"job", "follow"}, Group: "jobs",
 		Summary: "attach to the progress/metric stream; exits with the terminal mapping",
 		Args:    "<job-id>", MinArgs: 1, MaxArgs: 1,
 		Exits:      []exit.Code{exit.OK, exit.NotFound, exit.Unavailable, exit.Deadline, exit.Failed, exit.Canceled},
-		Capability: "cmd.job.follow", NeedsServer: true, Terminals: true, Status: Planned, Issue: "cl-004",
+		Capability: "cmd.job.follow", NeedsServer: true, Terminals: true, Status: Implemented, Handler: "job.follow",
 	},
 	{
 		Path: []string{"job", "cancel"}, Group: "jobs",
 		Summary: "request cancel and block until the canceled terminal",
 		Args:    "<job-id>", MinArgs: 1, MaxArgs: 1,
 		Exits:      []exit.Code{exit.OK, exit.NotFound, exit.Unavailable},
-		Capability: "cmd.job.cancel", NeedsServer: true, Status: Planned, Issue: "cl-004",
+		Capability: "cmd.job.cancel", NeedsServer: true, Status: Implemented, Handler: "job.cancel",
 	},
 
 	// ---- catalog (cl-011) ----

@@ -147,7 +147,11 @@ func typed(ep *Entrypoint, key, raw string) (json.RawMessage, *exit.Error) {
 			return json.RawMessage(raw), nil
 		}
 		return nil, wrongType(ep, key, raw, "bool")
-	case "scalar:str":
+	case "scalar:str", "tree":
+		// A TREE's wire value IS its ref (cr-009): the path rides the field VALUE at the
+		// far end, hydrated from the grant, and a ref the grant does not cover never
+		// reaches a filesystem. So the scalar spelling is the ref, and `--input
+		// <ref>=<dir>` is what grants the read.
 		encoded, err := json.Marshal(raw)
 		if err != nil {
 			return nil, exit.Internalf("cannot carry %s: %s", key, err)

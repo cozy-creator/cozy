@@ -207,6 +207,10 @@ none of these.
 | `DELETE /v1/local/workers/{instance_id}` | local | yes | drain and stop the process group |
 | `GET /v1/local/doctor` | local | yes | host facts, bound families, counts |
 | `GET /v1/local/attempts/{attempt_key}/triage` | local | yes | the retained WorkerTriageBundle |
+| `POST /v1/local/jobs` | local | yes | submit one bounded job; `Idempotency-Key`; 202 with the handle and its publication repo |
+| `GET /v1/local/jobs` | local | yes | jobs newest-first with per-state counts; `?status=`, `?endpoint=` |
+| `GET /v1/local/jobs/{id}` | local | yes | one job: state, queue position, retry budget, publication, checkpoints, bill where a rate exists |
+| `POST /v1/local/jobs/{id}/cancel` | local | yes | request cancellation; a queued job leaves the queue, a running one gets its terminal |
 | `GET /healthz` | local | no | liveness ONLY; says nothing about any request |
 | `GET /{$}` | local | no | the embedded stub page |
 | `GET /app.js` | local | no | the stub's script — a FILE, so no inline-script CSP |
@@ -215,6 +219,39 @@ none of these.
 Triage is served by the OPAQUE attempt key and verified on read against the digest its
 terminal declared. A bundle whose bytes moved is `409 bundle_corrupt`, never a plausible
 story.
+
+### The job family is LOCAL, deliberately (cl-004)
+
+A job is an ATTEMPT CLASS on the same coordinator, not a second scheduler: it is a row in
+the same request table, it takes an ordinal under the same law, it settles through the same
+terminal transaction, and it streams over the same durable event route
+(`GET /v1/requests/{id}/events` — there is no second event authority anywhere, and
+`cozy job follow` is that route's client).
+
+The FAMILY is nonetheless local rather than core, for two reasons that are about honesty:
+the hub's job plane is th-008's, so a core route only one of the three hosts served would
+make this document a description of this host; and a job's typed input TREES are
+directories the caller already owns (`{"trees":["<ref>=<dir>"]}`), which is exactly the
+parameter shape the core must never take. A cloud host materializes trees from digests.
+
+Two answers a job carries that a request does not:
+
+- **`publication`** — the durable publication the job's landed writes became:
+  `{repo, root, status, entries, bytes, committed_at}` under the scratch repo
+  `<org>/_job-<job-id>`. An attempt writes into a per-attempt STAGE and the coordinator
+  promotes it into the addressable root after the terminal is verified; the row is written
+  INSIDE the terminal transaction, so a publication a terminal did not commit does not
+  exist. `status` is the terminal's verdict STAMPED as metadata; a failed run's landed
+  writes still land. Published CHECKPOINTS are absent by design: the publication
+  transaction for canonical bytes is the runtime's, and this host will root and project
+  ONE typed receipt from that border when it exists.
+- **`bill`** — ABSENT unless the host was configured with an explicit local rate. There is
+  no `$0.00`: a fabricated zero is a claim about money nobody measured.
+
+`queue_position` and `requeues`/`retry_budget` are the coordinator's own scheduling facts
+made visible: several jobs submitted at once queue against one worker and drain in
+submission order, and the retry projection over the neutral outcomes spends a durable
+budget that the settlement names when it is exhausted.
 
 ## 8. Local host security posture
 

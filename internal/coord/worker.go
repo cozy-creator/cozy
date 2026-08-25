@@ -100,7 +100,15 @@ type EndpointSpec struct {
 	Bindings   []*Binding `json:"bindings"`
 	GraceSec   float64    `json:"grace_sec"`
 	NoWarm     bool       `json:"no_warm"`
+	// Jobs is the JOB-mode declaration (cl-004). A worker is in exactly ONE mode — the
+	// Directive's own oneof says which — so a spec carries bindings or jobs, never both,
+	// and `IsJob` is read from the spec rather than re-derived from what happens to be
+	// populated later.
+	Jobs []*JobPlan `json:"jobs,omitempty"`
 }
+
+// IsJob answers the worker's mode.
+func (s EndpointSpec) IsJob() bool { return len(s.Jobs) > 0 }
 
 // InstanceID is the endpoint's local worker SLOT identity, and it is deliberately STABLE
 // across supervisor restarts: `instance_id` names one provisioned instance lifetime, and
@@ -118,7 +126,15 @@ func (s EndpointSpec) OutputsFor(entrypoint string) []string {
 }
 
 func (s EndpointSpec) InstanceID() string {
-	sum := sha256.Sum256([]byte("slot/" + s.Endpoint + "/" + s.Generation))
+	slot := "slot/" + s.Endpoint + "/" + s.Generation
+	if s.IsJob() {
+		// A JOB worker is its own slot: one worker per (endpoint, generation, job
+		// function), because a JobDirective names ONE job and a worker is in one mode.
+		// It is also what lets a serving worker and a job worker of the same endpoint
+		// coexist instead of fighting over one instance id.
+		slot += "/job/" + s.Jobs[0].Function
+	}
+	sum := sha256.Sum256([]byte(slot))
 	return "ins-" + hex.EncodeToString(sum[:12])
 }
 
@@ -131,14 +147,23 @@ type worker struct {
 	planIDs    []string
 
 	// what the worker itself reported; the coordinator echoes, never invents
-	exited      bool
+	exited bool
+	// exitCode is the process's own disposition. RECYCLE is not a death (cr-009): a
+	// run-once job worker exits with it the moment its terminal is acknowledged, and
+	// reading that as "the worker died" turns a completed job into a failed request.
+	exitCode    int
 	pid         int // the process THIS coordinator started; the only one that may register
 	sessionID   string
 	incarnation uint64
 	epoch       uint64
 	intake      pb.IntakeState
 	ready       map[string]bool
-	revision    uint64
+	// jobsAvail is the worker's own last `jobs_available`. It is RESERVED at dispatch
+	// and corrected by the next Report: without the reservation one drain pass would
+	// hand two queued jobs to the same one-attempt worker on one stale reading, and
+	// relying on the worker to refuse the second is not a design.
+	jobsAvail int
+	revision  uint64
 	// The worker's own last reason for not serving, and when it first said so. A worker
 	// that reports ERROR has not answered "not yet" — it has answered "I cannot", and a
 	// client waiting on it needs that answer rather than a longer wait.
@@ -182,6 +207,14 @@ func (c *Coordinator) StartWorker(spec EndpointSpec) (string, *exit.Error) {
 		planIDs = append(planIDs, id)
 	}
 	sortStrings(planIDs) // the wire field is sorted lexicographic ascending
+	if spec.IsJob() {
+		if e := stageJobPlans(workerHome, spec.Jobs); e != nil {
+			return "", e
+		}
+		for _, p := range spec.Jobs {
+			planIDs = append(planIDs, p.DescriptorID)
+		}
+	}
 
 	logPath := filepath.Join(root, "worker.log")
 	logFile, err := os.OpenFile(logPath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644)
@@ -262,6 +295,7 @@ func (c *Coordinator) StartWorker(spec EndpointSpec) (string, *exit.Error) {
 		current, live := c.workers[instanceID]
 		mine := live && current == w
 		if mine {
+			w.exitCode = cmd.ProcessState.ExitCode()
 			// The entry STAYS, marked exited: a caller waiting on readiness needs to
 			// learn the worker is gone and where its log is, and a row that vanishes
 			// silently is the same lie as a row that outlives its process.
@@ -275,6 +309,9 @@ func (c *Coordinator) StartWorker(spec EndpointSpec) (string, *exit.Error) {
 			_ = c.opt.Store.CloseWorker(instanceID)
 			c.logf("worker %s exited (%v); its device grant is released — log %s",
 				instanceID, err, logPath)
+			// The queue's answer to "does capacity exist" just changed, and so has the
+			// fate of anything this worker was RUNNING.
+			go c.recoverWorker(w.spec)
 		}
 	}()
 	return instanceID, nil
@@ -304,9 +341,9 @@ func (c *Coordinator) WaitReady(instanceID, planID string, timeout time.Duration
 		w := c.workers[instanceID]
 		ok := w != nil && !w.exited && w.intake == pb.IntakeState_INTAKE_STATE_READY && w.ready[planID]
 		gone := w == nil || w.exited
-		logPath, fault, stuck := "", "", time.Duration(0)
+		logPath, fault, stuck, code := "", "", time.Duration(0), 0
 		if w != nil {
-			logPath, fault = w.logPath, w.fault
+			logPath, fault, code = w.logPath, w.fault, w.exitCode
 			if !w.errorSince.IsZero() {
 				stuck = time.Since(w.errorSince)
 			}
@@ -316,6 +353,15 @@ func (c *Coordinator) WaitReady(instanceID, planID string, timeout time.Duration
 			return nil
 		}
 		if gone {
+			if code == RecycleExit {
+				// NOT A DEATH. The worker finished its bounded attempt and recycled; the
+				// request this wait was started for is either settled already or back on
+				// the queue, and its exit has ALREADY asked the queue for a replacement.
+				// Calling this a failure settled a requeued job as `failed` after ONE of
+				// its three budgeted attempts (observed live).
+				return exit.Named(exit.Unavailable, "worker_recycled",
+					"the job worker recycled (exit %d) after its bounded attempt", RecycleExit)
+			}
 			return exit.New(exit.Failed, "the endpoint worker exited before reporting ready").
 				WithRemedy("its log is %s", logPath)
 		}
@@ -330,6 +376,11 @@ func (c *Coordinator) WaitReady(instanceID, planID string, timeout time.Duration
 	return exit.New(exit.Deadline, "the endpoint worker did not report %s ready in %s",
 		planID, timeout).WithRemedy("its log is %s", c.WorkerLog(instanceID))
 }
+
+// RecycleExit is the run-once COMPLETION disposition (cr-009, v1 rc 75). A job worker
+// exits with it after its terminal is acknowledged: the process ending is the successful
+// end of the work, and it is deliberately distinct from any death.
+const RecycleExit = 75
 
 // workerError is the coordinator's PROJECTION over a worker's fault reason. The reasons
 // are the runtime's neutral vocabulary; deciding what a user should do about one is this
@@ -449,6 +500,7 @@ func (c *Coordinator) StopWorker(instanceID string, grace time.Duration) {
 	}
 	c.mu.Unlock()
 	c.logf("worker %s stopped; its device grant is released", instanceID)
+	go c.reviveQueue()
 }
 
 // Reconcile runs at boot, before anything is served. Rows describing processes from a
@@ -474,6 +526,40 @@ func (c *Coordinator) Reconcile() (killed, forgotten int, e *exit.Error) {
 		if e := c.opt.Store.CloseWorker(row.InstanceID); e != nil {
 			return killed, forgotten, e
 		}
+	}
+	// THE DISPATCH QUEUE IS MEMORY, AND THE AUTHORITY IS NOT. A request recorded as owed
+	// work before the crash has no attempt and no queue entry after it — it simply stopped
+	// existing as far as scheduling was concerned, while its row went on saying `queued`
+	// forever. Found live by cl-004's crash arm: a job submitted moments before the
+	// coordinator was `kill -9`ed never ran again. Rebuilding the queue from the authority
+	// is the only place the two can be made to agree, and it happens before anything is
+	// served. Order is the authority's own (created_at), so FIFO survives a crash too.
+	owed, e := c.opt.Store.Owed()
+	if e != nil {
+		return killed, forgotten, e
+	}
+	for _, req := range owed {
+		c.enqueue(req.ID)
+		c.logf("%s was owed work before the restart; it is back on the dispatch queue", req.ID)
+	}
+	if len(owed) > 0 {
+		go c.reviveQueue()
+	}
+	// AND THE ATTEMPTS THAT OWE A TERMINAL. Killing an orphan is only half of a restart:
+	// the attempts it held are unsettled, and the ONE thing that can settle them is the
+	// supervisor's own journal replayed by a worker in the SAME SLOT (02 §6.2). Nothing
+	// else in this process will ask for that slot — the requests are not queued, they have
+	// ordinals — so a job dispatched moments before a `kill -9` of the coordinator hung
+	// forever. Found live by cl-004's crash arm; cl-006's own crash section had been
+	// POSTing /v1/local/workers by hand to work around it.
+	unsettled, e := c.opt.Store.Unsettled()
+	if e != nil {
+		return killed, forgotten, e
+	}
+	for _, req := range unsettled {
+		c.logf("%s holds an attempt with no terminal; making its slot resident so the "+
+			"supervisor journal replays", req.ID)
+		c.selectOrStart(req)
 	}
 	return killed, forgotten, nil
 }

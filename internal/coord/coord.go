@@ -70,6 +70,12 @@ type Options struct {
 // a pod, cl-014's.
 type Launcher interface {
 	Resolve(endpoint string) (EndpointSpec, *exit.Error)
+	// ResolveJob is the JOB lane's half: `org/name` plus a job function to the spec that
+	// makes THAT job's worker resident. It is a separate method rather than a flag
+	// because the two produce different Directives and different worker slots — the
+	// mode is a fact about the worker, and a resolver that returned "either" would push
+	// the choice into the coordinator, which resolves nothing.
+	ResolveJob(endpoint, function string) (EndpointSpec, *exit.Error)
 }
 
 // Coordinator is the LocalService's scheduling role.
@@ -91,10 +97,16 @@ type Coordinator struct {
 	// with nowhere to go WAITS for capacity instead of evaporating — the alternative is
 	// a request that quietly stops existing because a worker was still loading.
 	pending []string
+	// closing is set by Close: a worker stopped during shutdown must not make the queue
+	// ask for a replacement, because the service that would run it is going away.
+	closing bool
 	// starting names the endpoints a select-or-start is already making resident. One
 	// launch per endpoint: three cold requests for one endpoint must not spawn three
 	// workers and three device grants for a card that serves one attempt at a time.
 	starting map[string]bool
+	// stalls is when each RESIDENT-but-undispatchable worker first failed to serve the
+	// head of the queue. It is the stall watchdog's only state (see checkStall).
+	stalls   map[string]time.Time
 	revision uint64 // hub-owned, monotonic; every Directive bumps it
 	events   []string
 
@@ -126,6 +138,7 @@ func Open(opt Options) (*Coordinator, *exit.Error) {
 		workers:  map[string]*worker{},
 		waits:    map[string]*wait{},
 		starting: map[string]bool{},
+		stalls:   map[string]time.Time{},
 		frames:   newFanout(),
 	}
 	// A stale socket file is a leftover, never evidence: the service lock already proved
@@ -149,6 +162,9 @@ func (c *Coordinator) Serve() error { return c.grpc.Serve(c.listener) }
 // launcher is exactly the class of bug the birth identity exists to catch, so `down`
 // stops what it started rather than orphaning it.
 func (c *Coordinator) Close(grace time.Duration) {
+	c.mu.Lock()
+	c.closing = true
+	c.mu.Unlock()
 	for _, w := range c.workerList() {
 		c.StopWorker(w.instanceID, grace)
 	}
@@ -259,11 +275,207 @@ func (c *Coordinator) drain() {
 		}
 		attempt, e := c.dispatch(*req)
 		if e != nil {
-			continue // still no capacity, or an ordinal the law will not mint yet
+			// NO CAPACITY and AN ORDINAL THE LAW WILL NOT MINT YET are both "wait"; every
+			// other refusal is the request's ANSWER, and leaving it queued would be the
+			// failure mode this queue exists to prevent. Found live by cl-004's
+			// publication-escape arm: a request whose GRANT can never be built (a
+			// destination outside its own publication root) queued forever, because
+			// `dispatch` refuses AFTER `pick` succeeded and the only branch here was
+			// `continue`.
+			if e.Code == exit.Unavailable || e.Code == exit.Conflict {
+				continue
+			}
+			c.failQueued(id, e)
+			continue
 		}
 		c.forget(id)
 		c.logf("%s left the dispatch queue as attempt %d", id, attempt)
 	}
+}
+
+// QueuePosition is where a waiting request sits in the dispatch queue, counted from 1.
+// Zero means it is not waiting — either it never queued or it already has an attempt.
+// The queue is a slice appended in submission order and drained in that order, so the
+// position is the real thing rather than an estimate (cr-019: many queued jobs against
+// one worker drain FIFO, and a client can watch it happen).
+func (c *Coordinator) QueuePosition(requestID string) int {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	for i, id := range c.pending {
+		if id == requestID {
+			return i + 1
+		}
+	}
+	return 0
+}
+
+// reviveQueue re-asks select-or-start for the HEAD of the dispatch queue. It runs when
+// the answer to "does the capacity this request needs exist?" has just changed: a worker's
+// process went, or a launch finished.
+//
+// It exists because `selectOrStart` returns early twice over — while a launch is in
+// FLIGHT, and while any worker for the slot is resident — and neither early return leaves
+// anything behind to ask again. cl-004's live run met both: six queued jobs sat forever
+// behind a launch that was for a DIFFERENT plan, and again behind a worker that had been
+// `kill -9`ed moments after they queued.
+//
+// THE HEAD, and only the head. Reviving every waiting request would let two requests
+// needing different plans stop each other's worker in turn; the FIFO head is the one that
+// gets capacity next, so it is the one whose need is asked about. Nothing is dispatched
+// here — `drain` is still the one placement path.
+func (c *Coordinator) reviveQueue() {
+	c.mu.Lock()
+	closing, head := c.closing, ""
+	if len(c.pending) > 0 {
+		head = c.pending[0]
+	}
+	c.mu.Unlock()
+	if closing || head == "" {
+		return
+	}
+	req, e := c.opt.Store.RequestRow(head)
+	if e != nil || req == nil {
+		return
+	}
+	c.selectOrStart(*req)
+}
+
+// recoverWorker is what happens when a worker's PROCESS dies. Two different things are
+// owed, and only one of them is the queue's:
+//
+//   - the attempts that worker was RUNNING owe a terminal, and the only thing that can
+//     produce one is the supervisor's own journal replayed by a worker in the SAME SLOT
+//     (worker-protocol/02 §6.2). So the slot is started again — its root, and therefore
+//     its journal, is deliberately reused — and the recovered attempt arrives on Register
+//     as an open obligation exactly as the law says.
+//   - anything merely WAITING needs capacity asked for, which is `reviveQueue`.
+//
+// Without the first half a `kill -9` of a job worker left its in-flight attempt with no
+// terminal forever: the request was not queued (it had an ordinal), so nothing looked at
+// it again. Found live by cl-004's kill arm, which only converged when a LATER submission
+// happened to restart the same slot.
+func (c *Coordinator) recoverWorker(spec EndpointSpec) {
+	c.mu.Lock()
+	closing := c.closing
+	c.mu.Unlock()
+	if closing {
+		return
+	}
+	open, e := c.opt.Store.OpenAttemptsOf(spec.InstanceID())
+	if e != nil {
+		c.logf("cannot read the open attempts of %s: %s", spec.InstanceID(), e.Message)
+	}
+	if len(open) == 0 {
+		c.reviveQueue()
+		return
+	}
+	c.logf("worker %s died owing %d terminal(s); restarting the slot so its journal replays",
+		spec.InstanceID(), len(open))
+	if _, e := c.StartWorker(spec); e != nil {
+		// The slot cannot come back. The attempts it holds are unsettleable, and saying so
+		// beats leaving a client on a stream that will never close.
+		c.logf("the slot %s could not be restarted (%s); its %d open attempt(s) cannot settle",
+			spec.InstanceID(), e.Message, len(open))
+	}
+	c.reviveQueue()
+}
+
+// StallGrace is how long a RESIDENT worker may go on not being dispatchable for the
+// request at the head of its own queue before it is replaced. It is deliberately the same
+// clock `WaitReady` gives a worker reporting ERROR: a worker that has not become able to
+// serve its queue in a minute and a half has answered, whatever state it is reporting.
+const StallGrace = 90 * time.Second
+
+// checkStall replaces a worker that is resident, alive, staged for the head of the queue,
+// and STILL not dispatchable. It runs on every Report, because a Report is the only thing
+// a stuck worker keeps producing.
+//
+// The condition is real and was met live: `kill -9` of a job executor mid-attempt left the
+// supervisor rebuilding, its Report pinned at INTAKE_STATE_LOADING with jobs_available=0,
+// and the queue behind it waiting forever. `drain` could not help — it only runs on READY,
+// which is exactly what never came. Nothing here decides WHY a worker is stuck: the
+// coordinator's business is that a request has been owed capacity for too long by a
+// process it started, and the one thing it owns is whether that process keeps the slot.
+func (c *Coordinator) checkStall() {
+	c.mu.Lock()
+	head := ""
+	if len(c.pending) > 0 {
+		head = c.pending[0]
+	}
+	c.mu.Unlock()
+	if head == "" {
+		return
+	}
+	req, e := c.opt.Store.RequestRow(head)
+	if e != nil || req == nil {
+		return
+	}
+	c.mu.Lock()
+	var victim *worker
+	for _, w := range c.workers {
+		if w.exited || !staged(w, req.PlanID) {
+			continue
+		}
+		if w.intake == pb.IntakeState_INTAKE_STATE_READY && w.ready[req.PlanID] {
+			// Dispatchable. The queue is waiting on placement, not on this worker.
+			delete(c.stalls, w.instanceID)
+			c.mu.Unlock()
+			return
+		}
+		victim = w
+	}
+	if victim == nil {
+		c.mu.Unlock()
+		return
+	}
+	first, seen := c.stalls[victim.instanceID]
+	if !seen {
+		c.stalls[victim.instanceID] = time.Now()
+		c.mu.Unlock()
+		return
+	}
+	stuck, intake := time.Since(first), pb.IntakeState_name[int32(victim.intake)]
+	instance := victim.instanceID
+	c.mu.Unlock()
+	if stuck < StallGrace {
+		return
+	}
+	c.logf("worker %s has been %s and undispatchable for %s while %s waits; replacing it",
+		instance, intake, stuck.Round(time.Second), head)
+	c.mu.Lock()
+	delete(c.stalls, instance)
+	c.mu.Unlock()
+	// StopWorker's own reviveQueue asks for the replacement, so the request the watchdog
+	// fired for is the one whose need gets re-asked.
+	c.StopWorker(instance, 20*time.Second)
+}
+
+// queueDepth is how many requests are waiting for capacity right now.
+func (c *Coordinator) queueDepth() int {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return len(c.pending)
+}
+
+// CancelQueued settles a request that is WAITING and has no attempt to cancel. It leaves
+// the queue and is settled canceled — a client that asked for a cancel is owed an answer,
+// and "it will start later anyway" is not one.
+func (c *Coordinator) CancelQueued(requestID string) {
+	c.forget(requestID)
+	if e := c.opt.Store.SettleRequest(requestID, "canceled"); e != nil {
+		c.logf("%s could not be settled canceled: %s", requestID, e.Message)
+		return
+	}
+	c.frames.forget(requestID)
+	c.emit(requestID, "request.canceled", 0, map[string]any{
+		"status": "CANCELED", "cause": "CLIENT_CANCELED",
+		"error_type": "CLIENT_CANCELED",
+		"error":      "canceled from the dispatch queue before any attempt was dispatched",
+		"outputs":    []any{}, "requeuing": false,
+	})
+	c.logf("%s left the dispatch queue: canceled before any attempt", requestID)
+	c.waitRequest(requestID).markClosed(
+		exit.New(exit.Canceled, "%s was canceled before any attempt was dispatched", requestID))
 }
 
 func (c *Coordinator) forget(requestID string) {

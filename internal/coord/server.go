@@ -75,19 +75,20 @@ func (h *hub) Control(stream pb.Worker_ControlServer) error {
 			}
 			h.c.onTerminal(s, m.AttemptTerminal)
 		case *pb.WorkerMessage_CheckpointRequest:
-			// Serving attempts have no checkpoint lane; the refusal is typed, not silence.
 			r := m.CheckpointRequest
-			s.send(&pb.CoordinatorMessage{Msg: &pb.CoordinatorMessage_CheckpointReceipt{
-				CheckpointReceipt: &pb.JobCheckpointReceipt{
-					SessionId: r.SessionId, ExecutorIncarnation: r.ExecutorIncarnation,
-					RequestId: r.RequestId, Attempt: r.Attempt, OperationKey: r.OperationKey,
-					LogicalKey: r.LogicalKey, ContentDigest: r.ContentDigest,
-					Outcome: pb.CheckpointOutcome_CHECKPOINT_OUTCOME_REFUSED,
-					Fault: &pb.CheckpointFault{
-						Code:   pb.CheckpointFaultCode_CHECKPOINT_FAULT_CODE_NOT_JOB_MODE,
-						Detail: "this coordinator dispatches serving attempts; job mode is cl-004",
-					},
-				}}})
+			if h.c.fenced(s, r.SessionId, r.ExecutorIncarnation, false) {
+				continue
+			}
+			// A SERVING attempt has no checkpoint lane, and the refusal is typed rather
+			// than silence. The mode is the worker's own, read off the spec this service
+			// launched it under.
+			if !h.c.jobMode(s) {
+				s.send(checkpointReceipt(r, "", pb.CheckpointOutcome_CHECKPOINT_OUTCOME_REFUSED,
+					pb.CheckpointFaultCode_CHECKPOINT_FAULT_CODE_NOT_JOB_MODE,
+					"this worker is in serving mode; the checkpoint lane is the job lane's"))
+				continue
+			}
+			h.c.onCheckpoint(s, r)
 		}
 	}
 }
@@ -232,8 +233,26 @@ func (c *Coordinator) onRegister(stream pb.Worker_ControlServer, r *pb.Register,
 			SessionId: r.SessionId, ExecutorIncarnation: r.ExecutorIncarnation,
 			WireMinor: pb.WireMinor, Accepted: true,
 		}}})
-	c.sendDirective(s, w)
+	// ONE MODE, chosen from the spec this service launched. Sending the mode the worker
+	// is in — rather than setting both members of the Directive's oneof — is the same
+	// lesson cr-009's `fabd6fc` recorded on the Report side.
+	if w.spec.IsJob() {
+		c.sendJobDirective(s, w)
+	} else {
+		c.sendDirective(s, w)
+	}
 	return s
+}
+
+// jobMode answers whether the worker behind this session was launched in job mode.
+func (c *Coordinator) jobMode(s *session) bool {
+	if s == nil {
+		return false
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	w := c.workers[s.instanceID]
+	return w != nil && w.spec.IsJob()
 }
 
 // sendDirective issues the full-replace Directive. It carries NO credential: a local
@@ -272,8 +291,21 @@ func (c *Coordinator) onReport(s *session, r *pb.Report) {
 		w.intake = r.IntakeState
 		w.revision = r.AppliedRevision
 		ready := map[string]bool{}
-		for _, id := range r.GetServingCapacity().GetReadyEntrypointBindingPlanIds() {
-			ready[id] = true
+		if w.spec.IsJob() {
+			// THE JOB LANE READS JOB CAPACITY. `jobs_available` is the worker's own
+			// answer to "can I take an attempt right now" — law 8 in the job lane, so a
+			// worker with a live attempt reports zero and its queue simply waits. The
+			// coordinator dispatches by the SAME map the serving lane uses, keyed on the
+			// job descriptor id, so there is one placement path and not two.
+			avail := r.GetJobCapacity().GetJobsAvailable()
+			w.jobsAvail = int(avail)
+			for _, p := range w.spec.Jobs {
+				ready[p.DescriptorID] = avail > 0
+			}
+		} else {
+			for _, id := range r.GetServingCapacity().GetReadyEntrypointBindingPlanIds() {
+				ready[id] = true
+			}
 		}
 		w.ready = ready
 		// A worker that says ERROR is timed from the FIRST time it said so, and the clock
@@ -302,6 +334,15 @@ func (c *Coordinator) onReport(s *session, r *pb.Report) {
 	}
 	if r.IntakeState == pb.IntakeState_INTAKE_STATE_READY {
 		go c.drain()
+	}
+	// A Report is the only thing a STUCK worker keeps producing, so it is where the stall
+	// watchdog runs.
+	go c.checkStall()
+	if r.GetJobCapacity() != nil {
+		c.logf("Report intake=%s revision=%d epoch=%d jobs_available=%d jobs_in_flight=%d",
+			pb.IntakeState_name[int32(r.IntakeState)], r.AppliedRevision, r.ReadinessEpoch,
+			r.GetJobCapacity().GetJobsAvailable(), r.GetJobCapacity().GetJobsInFlight())
+		return
 	}
 	c.logf("Report intake=%s revision=%d epoch=%d ready=%d in_flight=%d",
 		pb.IntakeState_name[int32(r.IntakeState)], r.AppliedRevision, r.ReadinessEpoch,
@@ -383,7 +424,12 @@ func (c *Coordinator) onTerminal(s *session, t *pb.AttemptTerminal) {
 
 	status := terminalStatus(doc.Int("status"))
 	cause := causeCode(doc.Sub("cause").Int("code"))
-	outputs := c.outputsOf(t.RequestId, t.Attempt, doc)
+	req, e := c.opt.Store.RequestRow(t.RequestId)
+	if e != nil || req == nil {
+		refuse("no request row to settle")
+		return
+	}
+	outputs := c.outputsOf(*req, t.Attempt, doc)
 	// cl-006 OWNS TRIAGE PERSISTENCE (cr-011's seam): the bundle lives in the worker's
 	// own root, and a worker root does not outlive its worker. Copy it out and verify it
 	// against the terminal document's OWN TriageBundleRef before the transaction runs.
@@ -397,6 +443,26 @@ func (c *Coordinator) onTerminal(s *session, t *pb.AttemptTerminal) {
 	// being minted.
 	requeuing := requeueable(status, cause)
 	kept := triage.keep(status, cause, doc.Str("safe_message"), outputs, requeuing)
+
+	// THE PUBLICATION, for a job. The attempt's staged writes are PROMOTED into the
+	// addressable publication root first, and the row that makes the publication exist
+	// rides the very transaction that accepts the terminal. A kill before that commit
+	// therefore exposes no publication at all — not in the authority and not at the
+	// addressable path — and a kill after it has already preserved one.
+	//
+	// A REQUEUEING attempt writes NO publication. Its terminal ended an attempt, not the
+	// request, so a row stamped ABANDONED with zero entries would be a claim about a
+	// publication that does not exist — and it would be overwritten by the ordinal that
+	// goes on to succeed. Observed live: attempt 1 of a killed job committed an empty
+	// `local/_job-…` publication seconds before attempt 2 published the real one.
+	var publication *records.Publication
+	if req.IsJob() && !requeuing {
+		if e := c.promote(*req, t.Attempt, outputs); e != nil {
+			refuse("%s", e.Message)
+			return
+		}
+		publication = c.publicationOf(*req, t.Attempt, status, cause, outputs)
+	}
 
 	began := time.Now()
 	applied, e := c.opt.Store.AcceptTerminal(records.Terminal{
@@ -412,6 +478,7 @@ func (c *Coordinator) onTerminal(s *session, t *pb.AttemptTerminal) {
 		// attempt's own status onto the request row would make the status document say
 		// `failed` for a request that is still going.
 		RequestState: requeueState(status, requeuing),
+		Publication:  publication,
 	})
 	if e != nil {
 		refuse("%s", e.Message)
@@ -421,6 +488,10 @@ func (c *Coordinator) onTerminal(s *session, t *pb.AttemptTerminal) {
 		c.logf("AttemptTerminal %s#%d %s/%s applied in %.2f ms: %d output(s) became visible "+
 			"in the SAME transaction", t.RequestId, t.Attempt, status, cause,
 			float64(time.Since(began).Microseconds())/1000, len(outputs))
+		if publication != nil {
+			c.logf("publication %s committed: %d entr(y|ies), %d B, root %s",
+				publication.Repo, publication.Entries, publication.Bytes, publication.Root)
+		}
 	} else {
 		c.logf("AttemptTerminal %s#%d is an exact replay of a closed terminal: re-acked, "+
 			"nothing applied twice", t.RequestId, t.Attempt)
@@ -590,10 +661,18 @@ func requeueable(status, cause string) bool {
 // outputsOf joins the manifest's entries to the destinations THIS coordinator granted.
 // The runtime names what it wrote; the coordinator names where it was allowed to write
 // and decides that the result is visible. Neither half can do the other's job.
-func (c *Coordinator) outputsOf(requestID string, attempt uint64, doc canonical.Doc) []records.Output {
+func (c *Coordinator) outputsOf(req records.Request, attempt uint64, doc canonical.Doc) []records.Output {
 	manifest := doc.Sub("output_manifest")
 	list, _ := manifest["outputs"].([]canonical.Value)
-	dir := c.opt.Layout.AttemptDir(requestID, attempt)
+	// WHERE THE COORDINATOR GRANTED. A serving attempt writes into its own disposable
+	// attempt directory; a job writes into the durable publication root, which is the
+	// same fact stated at the other end of the same grant.
+	dir := c.opt.Layout.AttemptDir(req.ID, attempt)
+	if req.IsJob() {
+		// Where the coordinator GRANTED: an attempt in flight writes into its stage, and
+		// `promote` rewrites these paths when the bundle crosses into the publication.
+		dir = c.opt.Layout.PublicationStage(req.Org, req.ID, attempt)
+	}
 	out := make([]records.Output, 0, len(list))
 	for _, item := range list {
 		entry, ok := item.(map[string]canonical.Value)

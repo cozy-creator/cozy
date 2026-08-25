@@ -15,6 +15,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 
 	"github.com/cozy-creator/cozy-creator-v2/internal/exit"
@@ -57,6 +58,16 @@ type Config struct {
 	Tfs       string
 	TfsSource string
 
+	// LocalRateMicroUSDPerHour is the rate a user CONFIGURED for their own machine
+	// (COZY_LOCAL_RATE_MICRO_USD_PER_HOUR), as an integer of micro-USD because a cost
+	// fact that cannot be canonicalized cannot be journaled (cr-009's Budget rule).
+	//
+	// ZERO MEANS ABSENT, and absent means the bill is not rendered at all. A local job
+	// costs electricity nobody metered, so `$0.00` would be a fabricated fact — the one
+	// thing cl-004 says a rateless job must never print.
+	LocalRateMicroUSDPerHour int64
+	LocalRateSource          string
+
 	inherited []string // the allowlisted snapshot, captured at Load
 }
 
@@ -74,6 +85,17 @@ func Load() (Config, *exit.Error) {
 
 	if v := strings.TrimSpace(os.Getenv("COZY_TFS")); v != "" {
 		c.Tfs, c.TfsSource = v, "env"
+	}
+
+	c.LocalRateSource = "unset"
+	if v := strings.TrimSpace(os.Getenv("COZY_LOCAL_RATE_MICRO_USD_PER_HOUR")); v != "" {
+		n, err := strconv.ParseInt(v, 10, 64)
+		if err != nil || n < 0 {
+			return Config{}, exit.Usagef(
+				"COZY_LOCAL_RATE_MICRO_USD_PER_HOUR=%q is not a non-negative integer of micro-USD", v).
+				WithRemedy("these documents are integer-only; 250000 is $0.25/hour")
+		}
+		c.LocalRateMicroUSDPerHour, c.LocalRateSource = n, "env"
 	}
 
 	if v := strings.TrimSpace(os.Getenv("TENSORHUB_URL")); v != "" {
@@ -111,6 +133,14 @@ func Load() (Config, *exit.Error) {
 // exact values the launcher imposes. The result is sorted and deduplicated on the
 // variable name, imposed values winning — a child never sees two spellings of one name.
 func (c Config) Child(imposed ...string) []string {
+	// THE BYTE-PLANE DOOR travels with the launcher, because it is a resolved TOOL PATH
+	// this process already decided and not a decision a child may make again. Without it a
+	// detached `cozy up` — or a driver-started one — came up with no `tfs` on its PATH and
+	// silently could not root a job's declared checkpoints. It is imposed only when it was
+	// configured; the default (`tfs`, found on PATH) needs no help.
+	if c.TfsSource == "env" && c.Tfs != "" {
+		imposed = append([]string{"COZY_TFS=" + c.Tfs}, imposed...)
+	}
 	seen := map[string]string{}
 	for _, kv := range c.inherited {
 		name, value, _ := strings.Cut(kv, "=")

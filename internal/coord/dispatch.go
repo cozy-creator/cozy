@@ -8,6 +8,7 @@ import (
 
 	"github.com/cozy-creator/cozy-creator-v2/internal/canonical"
 	"github.com/cozy-creator/cozy-creator-v2/internal/exit"
+	"github.com/cozy-creator/cozy-creator-v2/internal/home"
 	"github.com/cozy-creator/cozy-creator-v2/internal/records"
 	pb "github.com/cozy-creator/cozy-creator-v2/protocol/cozy/worker/v1"
 )
@@ -37,6 +38,14 @@ type Submission struct {
 	// alone would let a key be reused across functions and mean two different things.
 	// Empty falls back to the payload's digest.
 	BodyDigest string
+
+	// Kind is the ATTEMPT CLASS: "" or `serving`, or `job`. A job carries two more facts
+	// a serving request has no version of.
+	Kind string
+	// Org is the publishing org whose scratch repo this job publishes into.
+	Org string
+	// Trees are the job's typed input TREES as `ref=dir`, one grant input each.
+	Trees []string
 }
 
 // Result is what one closed attempt produced.
@@ -77,10 +86,15 @@ func (c *Coordinator) SubmitDetail(s Submission) (string, uint64, bool, *exit.Er
 		}
 		bodyDigest = spelled
 	}
+	id := records.NewID("req")
+	if s.Kind == "job" {
+		id = records.NewID("job")
+	}
 	req, fresh, e := c.opt.Store.Submit(records.Request{
-		ID: records.NewID("req"), IdemKey: s.IdemKey, BodyDigest: bodyDigest,
+		ID: id, IdemKey: s.IdemKey, BodyDigest: bodyDigest,
 		Endpoint: s.Endpoint, Entrypoint: s.Entrypoint, PlanID: s.PlanID, Payload: s.Payload,
 		Outputs: strings.Join(s.Outputs, ","),
+		Kind:    s.Kind, Org: s.Org, Trees: strings.Join(s.Trees, ","),
 	})
 	if e != nil {
 		return "", 0, false, e
@@ -96,6 +110,23 @@ func (c *Coordinator) SubmitDetail(s Submission) (string, uint64, bool, *exit.Er
 		"endpoint": s.Endpoint, "function": s.Entrypoint,
 		"body_digest": bodyDigest, "plan_id": s.PlanID, "outputs": s.Outputs,
 	})
+	// A SUBMISSION NEVER OVERTAKES WORK ALREADY WAITING. Dispatching straight from submit
+	// is what keeps a warm request fast, and it is exactly what breaks FIFO when a queue
+	// exists: a request arriving while six are parked would take the free slot the head of
+	// the queue is waiting for. Found live by cl-004's depth pass — the LAST of six
+	// submissions settled FIRST. So: with a queue, join it; the drain below still runs
+	// immediately, so the head goes out now rather than at the next Report (cr-019).
+	if c.queueDepth() > 0 {
+		c.enqueue(req.ID)
+		c.emit(req.ID, "request.queued", 0, map[string]any{
+			"reason":   "the dispatch queue is not empty; this request joins it in submission order",
+			"position": c.QueuePosition(req.ID),
+		})
+		c.logf("%s QUEUED behind %d waiting request(s)", req.ID, c.QueuePosition(req.ID)-1)
+		c.selectOrStart(req)
+		go c.drain()
+		return req.ID, 0, true, nil
+	}
 	attempt, e := c.dispatch(req)
 	if e != nil {
 		// NO CAPACITY is a STATE, not a failure (cl-006): the request row is already
@@ -181,34 +212,69 @@ func (c *Coordinator) selectOrStart(req records.Request) {
 	if c.opt.Endpoints == nil {
 		return
 	}
+	// A JOB names its own slot — one worker per (endpoint, job function) — so the
+	// "already starting" and "already resident" questions are asked about that slot and
+	// not about the endpoint. Without this, submitting a job while a serving worker of
+	// the same endpoint is up would decide a job worker already existed.
+	slot := req.Endpoint
+	if req.IsJob() {
+		slot += "/job/" + req.Entrypoint
+	}
 	c.mu.Lock()
-	if c.starting[req.Endpoint] {
+	if c.starting[slot] {
 		c.mu.Unlock()
 		return
 	}
+	stale := ""
 	for _, w := range c.workers {
-		if w.spec.Endpoint == req.Endpoint && !w.exited {
-			// One is already resident or loading. Its READY drains the queue.
-			c.mu.Unlock()
-			return
+		if w.exited || w.spec.Endpoint != req.Endpoint || w.spec.IsJob() != req.IsJob() {
+			continue
+		}
+		if !req.IsJob() || w.spec.Jobs[0].Function == req.Entrypoint {
+			// RESIDENCY IS ABOUT THE PLAN, not about the slot. A worker that STAGED this
+			// request's plan is already resident or loading, and its READY drains the
+			// queue — which is exactly how several submitted jobs queue against ONE
+			// worker (cr-019). A worker in the same slot that staged a DIFFERENT plan is
+			// STALE: the generation's surface moved under it, and treating it as capacity
+			// queues the request behind a worker that will never advertise what it needs.
+			// Found live by cl-004's escape arm, which changes the descriptor and
+			// therefore the job descriptor id: six queued jobs waited on a worker holding
+			// the previous digest, forever.
+			if staged(w, req.PlanID) {
+				c.mu.Unlock()
+				return
+			}
+			stale = w.instanceID
 		}
 	}
-	c.starting[req.Endpoint] = true
+	c.starting[slot] = true
 	c.mu.Unlock()
+	if stale != "" {
+		c.logf("worker %s staged no plan for %s and is STALE; replacing it", stale, req.PlanID)
+		c.StopWorker(stale, 20*time.Second)
+	}
 
 	go func() {
-		defer func() {
+		// THE LAUNCH FLAG IS CLEARED BEFORE THE QUEUE IS RE-ASKED, and the order is the
+		// whole point: `selectOrStart` returns early while `starting[slot]` is set, so a
+		// revive that ran under a deferred clear would ALWAYS no-op on its own guard.
+		// Found live — six queued jobs arrived during an in-flight launch for a different
+		// plan, every one of them bounced off the flag, and the revive at the end of that
+		// launch bounced off it too.
+		done := func() {
 			c.mu.Lock()
-			delete(c.starting, req.Endpoint)
+			delete(c.starting, slot)
 			c.mu.Unlock()
-		}()
-		spec, e := c.opt.Endpoints.Resolve(req.Endpoint)
+		}
+		spec, e := c.resolveFor(req)
 		if e != nil {
+			done()
 			c.failQueued(req.ID, e)
 			return
 		}
 		instance, e := c.StartWorker(spec)
 		if e != nil {
+			done()
 			c.failQueued(req.ID, e)
 			return
 		}
@@ -218,12 +284,56 @@ func (c *Coordinator) selectOrStart(req records.Request) {
 			// holds a device grant, and `selectOrStart` returns early whenever a worker
 			// for the endpoint exists — so leaving it would hang the NEXT request behind a
 			// worker that will never serve it, with nothing to start a replacement.
+			if e.ErrName() == "worker_recycled" {
+				// A COMPLETION, not a failure. The worker's own exit already asked the
+				// queue for a replacement; failing the request here would settle a
+				// requeued job after one of its budgeted attempts.
+				c.logf("%s: the worker for %s recycled; the queue asks for the next one",
+					req.Endpoint, req.ID)
+				done()
+				return
+			}
 			c.StopWorker(instance, 20*time.Second)
+			done()
 			c.failQueued(req.ID, e)
 			return
 		}
 		c.drain()
+		done()
+		// The launch is over and the queue's world has changed: whatever is at the head now
+		// gets its own question asked, which is what closes the loop when this launch was
+		// for a plan the head does not need.
+		c.reviveQueue()
 	}()
+}
+
+// staged answers whether this worker was launched with the given plan id staged for it.
+// It reads what the LAUNCHER wrote, not what the worker has got around to advertising: a
+// worker still filling is capacity, a worker holding a different digest is not.
+func staged(w *worker, planID string) bool {
+	for _, id := range w.planIDs {
+		if id == planID {
+			return true
+		}
+	}
+	return false
+}
+
+// settledState answers whether the authority has already recorded this request's outcome.
+func settledState(state string) bool {
+	switch state {
+	case "succeeded", "failed", "canceled", "refused", "abandoned":
+		return true
+	}
+	return false
+}
+
+// resolveFor asks the launcher for the spec of the LANE this request runs in.
+func (c *Coordinator) resolveFor(req records.Request) (EndpointSpec, *exit.Error) {
+	if req.IsJob() {
+		return c.opt.Endpoints.ResolveJob(req.Endpoint, req.Entrypoint)
+	}
+	return c.opt.Endpoints.Resolve(req.Endpoint)
 }
 
 // failQueued settles a request that can never be placed. It is a request-level terminal:
@@ -231,6 +341,22 @@ func (c *Coordinator) selectOrStart(req records.Request) {
 // request row is what settles.
 func (c *Coordinator) failQueued(requestID string, cause *exit.Error) {
 	c.forget(requestID)
+	// A REQUEST THAT ALREADY SETTLED IS NOT FAILED BY A LATER OBSERVATION. The launch
+	// goroutine that made this request's worker resident OUTLIVES the request: a job
+	// worker is terminal-and-reclaim, so it EXITS the moment its terminal is acknowledged,
+	// and `WaitReady` then answers "the endpoint worker exited before reporting ready" —
+	// about a process whose exit was the successful end of the work.
+	//
+	// Observed live in cl-004's crash arm, and it is the worst failure class this system
+	// has: `request.completed` followed by `request.failed` on ONE request, with the row
+	// overwritten to `failed` after its publication had already committed. The request's
+	// own settled state is the authority; nothing that happens to a process afterwards may
+	// contradict it.
+	if row, e := c.opt.Store.RequestRow(requestID); e == nil && row != nil && settledState(row.State) {
+		c.logf("%s already settled %s — NOT failing it over: %s",
+			requestID, row.State, cause.Message)
+		return
+	}
 	if e := c.opt.Store.SettleRequest(requestID, "failed"); e != nil {
 		c.logf("%s could not be settled: %s", requestID, e.Message)
 	}
@@ -264,6 +390,19 @@ func (c *Coordinator) dispatch(req records.Request) (uint64, *exit.Error) {
 			AttemptBindingId: req.PlanID,
 		}},
 	}
+	if req.IsJob() {
+		// ONE mode names ONE spec. The per-attempt publication contract names THIS
+		// request's scratch repo, which is why a queue-serving worker can hold one
+		// directive and still publish each attempt into its own place.
+		spec.Spec = &pb.ExecutionSpec_Job{Job: &pb.JobExecutionSpec{
+			BuildId:         w.spec.ReleaseID,
+			JobDescriptorId: req.PlanID,
+			PublicationContract: &pb.PublicationContract{
+				GrantId: home.ScratchRepo(req.Org, req.ID),
+				Outputs: outputSpecs(splitList(req.Outputs)),
+			},
+		}}
+	}
 	canonicalBytes, digest, err := canonical.Identity(spec)
 	if err != nil {
 		return 0, exit.Internalf("cannot mint the ExecutionSpec document: %s", err)
@@ -287,7 +426,11 @@ func (c *Coordinator) dispatch(req records.Request) (uint64, *exit.Error) {
 	// real. A failure here is a broken local filesystem under our own root: the journaled
 	// row stands as the record of a dispatch that could not be granted, and the request
 	// answers with the error rather than silently retrying into the same disk.
-	grant, e := c.grant(req.ID, attempt, req)
+	//
+	// A JOB's grant names the DURABLE PUBLICATION ROOT instead, and the destination fence
+	// runs HERE — before StartAttempt, so an escaping destination is never a capability
+	// anybody held.
+	grant, e := c.grantFor(req, attempt)
 	if e != nil {
 		return 0, e
 	}
@@ -316,10 +459,30 @@ func (c *Coordinator) pick(planID string) (*worker, *session, *exit.Error) {
 			continue
 		}
 		if sess := c.sessions[w.sessionID]; sess != nil {
+			if w.spec.IsJob() {
+				// RESERVE the slot this dispatch is about to consume. The worker's own
+				// next Report is still the authority — this only stops ONE drain pass
+				// from handing two queued jobs to a one-attempt worker on one reading.
+				w.jobsAvail--
+				if w.jobsAvail <= 0 {
+					w.ready[planID] = false
+				}
+			}
 			return w, sess, nil
 		}
 	}
 	return nil, nil, exit.Unavailablef("no registered worker advertises %s as ready", planID)
+}
+
+// grantFor picks the lane's grant. The two differ in exactly one thing that matters —
+// WHERE the destinations are — and that difference is the whole point of the job lane's:
+// a bounded job's writes must outlive the reclaim that ends it.
+func (c *Coordinator) grantFor(req records.Request, attempt uint64) (*pb.DeliveryGrant, *exit.Error) {
+	if req.IsJob() {
+		g, _, e := c.jobGrant(req, attempt)
+		return g, e
+	}
+	return c.grant(req.ID, attempt, req)
 }
 
 // grant builds the LOCAL delivery grant: a payload input and one destination per result
@@ -439,6 +602,12 @@ func (c *Coordinator) AwaitAccepted(requestID string, attempt uint64, timeout ti
 	case <-time.After(timeout):
 		return exit.New(exit.Deadline, "%s#%d was not accepted in %s", requestID, attempt, timeout)
 	}
+}
+
+// CancelClient is the client-reason cancel, for the callers that have no business
+// naming a protocol enum.
+func (c *Coordinator) CancelClient(requestID string, attempt, graceMS uint64) *exit.Error {
+	return c.Cancel(requestID, attempt, pb.CancelReason_CANCEL_REASON_CLIENT, graceMS)
 }
 
 // Cancel is the only way to supersede a live attempt: explicit, digest-fenced, and

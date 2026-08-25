@@ -120,6 +120,16 @@ func Open(path string) (*Store, *exit.Error) {
 			return nil, exit.Internalf("cannot apply the records schema to %s: %s", path, err)
 		}
 	}
+	// A column added to a table an older root already created. `CREATE TABLE IF NOT
+	// EXISTS` is a no-op on that root, so the new column would never appear; adding it
+	// here is the whole migration story a pre-launch single-writer store needs. A
+	// duplicate-column answer is the statement already having been applied.
+	for _, stmt := range widen {
+		if _, err := db.Exec(stmt); err != nil && !strings.Contains(err.Error(), "duplicate column") {
+			db.Close()
+			return nil, exit.Internalf("cannot widen the records schema in %s: %s", path, err)
+		}
+	}
 	return &Store{db: db}, nil
 }
 

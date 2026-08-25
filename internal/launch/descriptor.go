@@ -181,6 +181,11 @@ func typeOf(raw json.RawMessage) (kind string, nested Struct) {
 	if _, ok := object["asset"]; ok {
 		return "asset", Struct{}
 	}
+	// A job's typed INPUT tree (cr-009). It is not an asset and not a scalar struct: its
+	// wire value is a REF, and the grant is what turns that ref into a readable path.
+	if kind, ok := object["input"]; ok && string(kind) == `"tree"` {
+		return "tree", Struct{}
+	}
 	if _, ok := object["fields"]; ok {
 		var s Struct
 		if json.Unmarshal(raw, &s) == nil {

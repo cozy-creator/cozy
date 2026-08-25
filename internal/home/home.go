@@ -31,6 +31,12 @@ type Layout struct {
 	// root does not outlive its worker — a one-shot run deletes it — so the bundle
 	// worth keeping is kept HERE, by the client that wanted it.
 	Triage string
+	// Publications is the DURABLE PUBLICATION PLANE (cl-004): one directory per job
+	// scratch repo, and the only place a job is ever granted to write. It is
+	// deliberately NOT under Outputs or Workers — a bounded job is reclaimed at its
+	// terminal, and a bundle that lived inside what reclaim removes would be destroyed
+	// by the very act that ends the job that produced it.
+	Publications string
 	// Client is the CLI's local credential file, mode 0600. A credential never rides
 	// argv (cl-011's rule), so the handoff is an OS-protected file the LocalService
 	// writes and its own CLI reads.
@@ -54,7 +60,8 @@ func Open(root string) (Layout, *exit.Error) {
 		Triage:      filepath.Join(root, "triage"),
 		Client:      filepath.Join(root, "client.cred"),
 	}
-	for _, dir := range []string{l.Generations, l.Workers, l.Outputs, l.Triage} {
+	l.Publications = filepath.Join(root, "publications")
+	for _, dir := range []string{l.Generations, l.Workers, l.Outputs, l.Triage, l.Publications} {
 		if err := os.MkdirAll(dir, 0o755); err != nil {
 			return Layout{}, exit.Internalf("cannot create %s: %s", dir, err)
 		}
@@ -73,6 +80,29 @@ func (l Layout) WorkerDir(session string) string { return filepath.Join(l.Worker
 // nothing a client can shape.
 func (l Layout) TriageFile(subject string) string {
 	return filepath.Join(l.Triage, subject+".json")
+}
+
+// ScratchRepo is the job SCRATCH repo one request publishes into:
+// `<org>/_job-<request-id>`. The underscore is deliberately outside the public repo
+// grammar, so no user ref can ever squat a job's scratch, and promotion OUT of it is an
+// explicit later act (jobs.md; cr-009's `LocalCoordinator.scratch_repo`).
+func ScratchRepo(org, requestID string) string {
+	return org + "/_job-" + requestID
+}
+
+// PublicationRoot is the one directory a job of this request may be granted to write
+// into. Every OutputDestination the coordinator mints resolves under it, and the fence
+// that proves so is `coord.publicationDest`.
+func (l Layout) PublicationRoot(org, requestID string) string {
+	return filepath.Join(l.Publications, org, "_job-"+requestID)
+}
+
+// PublicationStage is where ONE attempt of a job is granted to write. It is under the
+// publication root but is not the addressable publication: `.staging` is outside the
+// output-id namespace (an output id is a declared result FIELD PATH and cannot begin with
+// a dot), so a committed bundle and an attempt in flight never share a name.
+func (l Layout) PublicationStage(org, requestID string, attempt uint64) string {
+	return filepath.Join(l.PublicationRoot(org, requestID), ".staging", "a"+itoa(attempt))
 }
 
 // AttemptDir is the local output namespace for one attempt. The coordinator grants

@@ -74,6 +74,47 @@ func (r *Resolver) Resolve(endpoint string) (coord.EndpointSpec, *exit.Error) {
 	return spec, nil
 }
 
+// ResolveJob answers with the spec that makes ONE job function's worker resident. It is
+// the same generation, the same venv and the same device envelope as `Resolve` — what
+// differs is the plan record staged for it and the Directive mode it boots into.
+//
+// It is NOT cached: a job spec is per-function, and caching by endpoint alone was exactly
+// the shape that would hand a serving spec to a job.
+func (r *Resolver) ResolveJob(endpoint, function string) (coord.EndpointSpec, *exit.Error) {
+	gen, e := r.generation(strings.TrimSpace(endpoint))
+	if e != nil {
+		return coord.EndpointSpec{}, e
+	}
+	facts, e := launch.Read(*gen, r.cfg.Home, r.cfg.Tool())
+	if e != nil {
+		return coord.EndpointSpec{}, e
+	}
+	spec, _, e := facts.JobSpec(function, r.Devices)
+	return spec, e
+}
+
+// Jobs names the `@job` functions one installed endpoint registers, with the descriptor
+// id each resolves to. `cozy job ls` and the API's job listing read it.
+func (r *Resolver) Jobs(endpoint string) ([]launch.JobFacts, *exit.Error) {
+	gen, e := r.generation(strings.TrimSpace(endpoint))
+	if e != nil {
+		return nil, e
+	}
+	facts, e := launch.Read(*gen, r.cfg.Home, r.cfg.Tool())
+	if e != nil {
+		return nil, e
+	}
+	out := []launch.JobFacts{}
+	for _, job := range facts.Descriptor.Jobs {
+		one, e := facts.Job(job.Name)
+		if e != nil {
+			return nil, e
+		}
+		out = append(out, *one)
+	}
+	return out, nil
+}
+
 // generation resolves the ACTIVE pin for an endpoint. A ref may name its major
 // (`org/name@v2`); without one, a single pinned major answers and several refuse rather
 // than picking.

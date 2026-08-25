@@ -58,7 +58,42 @@ CREATE TABLE IF NOT EXISTS requests (
   state        TEXT    NOT NULL,
   ordinal      INTEGER NOT NULL DEFAULT 0,
   requeues     INTEGER NOT NULL DEFAULT 0,
-  created_at   TEXT    NOT NULL
+  created_at   TEXT    NOT NULL,
+  kind         TEXT    NOT NULL DEFAULT 'serving',
+  org          TEXT    NOT NULL DEFAULT '',
+  trees        TEXT    NOT NULL DEFAULT ''
+)`, `
+-- The PUBLICATION (cl-004). One row per job request, written INSIDE the terminal
+-- transaction: a publication that a terminal did not commit does not exist, which is
+-- what "killing before commit exposes no partial bundle" means as a schema property
+-- rather than as a check. The status column is the terminal's own verdict STAMPED as
+-- metadata: a failed run's landed writes still land (jobs.md), and nothing here gates it.
+CREATE TABLE IF NOT EXISTS publications (
+  request_id   TEXT PRIMARY KEY REFERENCES requests(id),
+  attempt      INTEGER NOT NULL,
+  repo         TEXT    NOT NULL,
+  root         TEXT    NOT NULL,
+  status       TEXT    NOT NULL,
+  cause        TEXT    NOT NULL DEFAULT '',
+  entries      INTEGER NOT NULL DEFAULT 0,
+  bytes        INTEGER NOT NULL DEFAULT 0,
+  committed_at TEXT    NOT NULL
+)`, `
+-- The DURABLE checkpoint exchange's coordinator half (cr-009 §Checkpoints). The worker
+-- has already made the save durable in its OWN journal; this is a SECOND observation,
+-- at-least-once like every other durable message (law 9). The identity is closed:
+-- repeating it replays the receipt, and the same key with different bytes CONFLICTS —
+-- a coordinator conflict is a journaled fault and never un-writes the worker's fact.
+CREATE TABLE IF NOT EXISTS job_checkpoints (
+  request_id    TEXT    NOT NULL,
+  attempt       INTEGER NOT NULL,
+  operation_key TEXT    NOT NULL,
+  logical_key   TEXT    NOT NULL,
+  content_digest TEXT   NOT NULL,
+  receipt_id    TEXT    NOT NULL,
+  outcome       TEXT    NOT NULL,
+  recorded_at   TEXT    NOT NULL,
+  PRIMARY KEY (request_id, operation_key, logical_key)
 )`, `
 CREATE TABLE IF NOT EXISTS attempts (
   request_id       TEXT    NOT NULL REFERENCES requests(id),
@@ -100,6 +135,14 @@ CREATE TABLE IF NOT EXISTS outputs (
   PRIMARY KEY (request_id, attempt, output_id),
   FOREIGN KEY (request_id, attempt) REFERENCES attempts(request_id, attempt)
 )`}
+
+// widen carries the columns a table gained after some root already created it. Applied
+// after `schema`, and a duplicate-column answer means it is already there.
+var widen = []string{
+	`ALTER TABLE requests ADD COLUMN kind TEXT NOT NULL DEFAULT 'serving'`,
+	`ALTER TABLE requests ADD COLUMN org TEXT NOT NULL DEFAULT ''`,
+	`ALTER TABLE requests ADD COLUMN trees TEXT NOT NULL DEFAULT ''`,
+}
 
 func now() string { return time.Now().UTC().Format(time.RFC3339Nano) }
 
@@ -160,13 +203,20 @@ func (s *Store) SpawnWorker(w WorkerProcess) *exit.Error {
 		clauses = append(clauses, "w.devices LIKE ?")
 		args = append(args, "%"+deviceMark(d)+"%")
 	}
+	// THE ADMISSION ASKS ABOUT ANOTHER PROCESS, which is why the slot's own row is
+	// excluded. A slot restarting itself — the recovered-attempts path, where a dead
+	// worker's journal must be replayed by a worker in the SAME slot — is not a second
+	// consumer of the envelope, and refusing it deadlocked exactly the recovery it was
+	// meant to protect. Concurrency within one slot is serialized by `selectOrStart`;
+	// this statement is the fence against a DIFFERENT slot.
+	args = append(args, w.InstanceID)
 	res, err := s.db.Exec(`
 		INSERT INTO worker_processes(instance_id,endpoint,generation,release_id,worker_id,
 		  devices,pid,birth,state,opened_at)
 		SELECT ?,?,?,?,?,?,?,?,?,?
 		WHERE NOT EXISTS (
 		  SELECT 1 FROM worker_processes w WHERE w.state != 'closed' AND (`+
-		strings.Join(clauses, " OR ")+`))
+		strings.Join(clauses, " OR ")+`) AND w.instance_id != ?)
 		ON CONFLICT(instance_id) DO UPDATE SET
 		  pid=excluded.pid, birth=excluded.birth, devices=excluded.devices,
 		  generation=excluded.generation, release_id=excluded.release_id,
@@ -315,17 +365,33 @@ type Request struct {
 	Ordinal   int64
 	Requeues  int64
 	CreatedAt string
+	// Kind is the ATTEMPT CLASS: `serving` or `job`. It is the one discriminator the
+	// whole job branch hangs off, and it lives on the request because a requeue must
+	// re-derive the same class without a client saying so again (cr-009: a job is an
+	// attempt class on the one machinery, not a second runtime).
+	Kind string
+	// Org is the publishing org a job's scratch repo is named under. Empty for serving.
+	Org string
+	// Trees are the job's typed input TREES, `ref=dir` joined by commas. Each becomes
+	// one grant input `tree:<ref>`; a field naming a ref the grant does not cover never
+	// reaches a filesystem.
+	Trees string
 }
 
 const requestCols = `id,idem_key,body_digest,endpoint,entrypoint,plan_id,payload,outputs,
-	state,ordinal,requeues,created_at`
+	state,ordinal,requeues,created_at,kind,org,trees`
 
 func scanRequest(row interface{ Scan(...any) error }) (Request, error) {
 	var r Request
 	err := row.Scan(&r.ID, &r.IdemKey, &r.BodyDigest, &r.Endpoint, &r.Entrypoint, &r.PlanID,
-		&r.Payload, &r.Outputs, &r.State, &r.Ordinal, &r.Requeues, &r.CreatedAt)
+		&r.Payload, &r.Outputs, &r.State, &r.Ordinal, &r.Requeues, &r.CreatedAt,
+		&r.Kind, &r.Org, &r.Trees)
 	return r, err
 }
+
+// IsJob answers the attempt class. The default spelling is `serving` so a row written
+// before the column existed reads as what it was.
+func (r Request) IsJob() bool { return r.Kind == "job" }
 
 // RequestRow reads one request back. Requeue re-derives its dispatch from this row and
 // from nothing a caller has to repeat.
@@ -343,11 +409,25 @@ func (s *Store) RequestRow(id string) (*Request, *exit.Error) {
 // Requests lists rows newest-first, optionally filtered by state. `state=""` is every
 // request; the client contract's listing route reads exactly this.
 func (s *Store) Requests(state string, limit int) ([]Request, *exit.Error) {
+	return s.RequestsOfKind("", state, limit)
+}
+
+// RequestsOfKind narrows the same listing to one ATTEMPT CLASS. `cozy job ls` reads jobs
+// and the request listing reads serving rows — one table, one reader, two questions.
+func (s *Store) RequestsOfKind(kind, state string, limit int) ([]Request, *exit.Error) {
 	query := `SELECT ` + requestCols + ` FROM requests`
+	where := []string{}
 	args := []any{}
+	if kind != "" {
+		where = append(where, `kind=?`)
+		args = append(args, kind)
+	}
 	if state != "" {
-		query += ` WHERE state=?`
+		where = append(where, `state=?`)
 		args = append(args, state)
+	}
+	if len(where) > 0 {
+		query += ` WHERE ` + strings.Join(where, " AND ")
 	}
 	query += ` ORDER BY created_at DESC, id DESC LIMIT ?`
 	args = append(args, limit)
@@ -361,6 +441,55 @@ func (s *Store) Requests(state string, limit int) ([]Request, *exit.Error) {
 		r, err := scanRequest(rows)
 		if err != nil {
 			return nil, exit.Internalf("cannot read a request row: %s", err)
+		}
+		out = append(out, r)
+	}
+	return out, nil
+}
+
+// Owed is every request this authority still owes work for and that has NO live attempt:
+// the ones a restarted service must put back on its dispatch queue. A request WITH a live
+// or recovered attempt is not owed capacity — it is owed a terminal, and the
+// recovered-attempts law is what settles that.
+func (s *Store) Owed() ([]Request, *exit.Error) {
+	rows, err := s.db.Query(`SELECT ` + requestCols + ` FROM requests r
+		WHERE r.state IN ('submitted','queued')
+		  AND NOT EXISTS (SELECT 1 FROM attempts a WHERE a.request_id=r.id
+		                  AND a.state IN ('dispatching','accepted','recovered_open'))
+		ORDER BY r.created_at, r.id`)
+	if err != nil {
+		return nil, exit.Internalf("cannot read the owed requests: %s", err)
+	}
+	defer rows.Close()
+	var out []Request
+	for rows.Next() {
+		r, err := scanRequest(rows)
+		if err != nil {
+			return nil, exit.Internalf("cannot read an owed request row: %s", err)
+		}
+		out = append(out, r)
+	}
+	return out, nil
+}
+
+// Unsettled is every request that holds an OPEN attempt: one this authority assigned and
+// has no terminal for. These are not owed capacity — they are owed a TERMINAL, and the
+// only thing that can produce one is the supervisor's own journal replayed by a worker in
+// the same slot (worker-protocol/02 §6.2).
+func (s *Store) Unsettled() ([]Request, *exit.Error) {
+	rows, err := s.db.Query(`SELECT ` + requestCols + ` FROM requests r
+		WHERE EXISTS (SELECT 1 FROM attempts a WHERE a.request_id=r.id
+		              AND a.state IN ('dispatching','accepted','recovered_open'))
+		ORDER BY r.created_at, r.id`)
+	if err != nil {
+		return nil, exit.Internalf("cannot read the unsettled requests: %s", err)
+	}
+	defer rows.Close()
+	var out []Request
+	for rows.Next() {
+		r, err := scanRequest(rows)
+		if err != nil {
+			return nil, exit.Internalf("cannot read an unsettled request row: %s", err)
 		}
 		out = append(out, r)
 	}
@@ -414,10 +543,14 @@ func (s *Store) Submit(r Request) (Request, bool, *exit.Error) {
 	}
 	r.CreatedAt = now()
 	r.State = "submitted"
+	if r.Kind == "" {
+		r.Kind = "serving"
+	}
 	if _, err := s.db.Exec(`INSERT INTO requests(id,idem_key,body_digest,endpoint,entrypoint,
-		plan_id,payload,outputs,state,ordinal,requeues,created_at) VALUES(?,?,?,?,?,?,?,?,?,0,0,?)`,
+		plan_id,payload,outputs,state,ordinal,requeues,created_at,kind,org,trees)
+		VALUES(?,?,?,?,?,?,?,?,?,0,0,?,?,?,?)`,
 		r.ID, r.IdemKey, r.BodyDigest, r.Endpoint, r.Entrypoint, r.PlanID, r.Payload,
-		r.Outputs, r.State, r.CreatedAt); err != nil {
+		r.Outputs, r.State, r.CreatedAt, r.Kind, r.Org, r.Trees); err != nil {
 		return Request{}, false, exit.Internalf("cannot record request %s: %s", r.ID, err)
 	}
 	return r, true, nil
@@ -616,6 +749,24 @@ type Terminal struct {
 	// writing `abandoned` there would make the status document say `failed` for a
 	// request that is still going.
 	RequestState string
+	// Publication is the job lane's durable publication (cl-004), written INSIDE this
+	// transaction. `nil` for a serving attempt — and for a job attempt the coordinator
+	// will requeue, because a requeued attempt has not ended the request.
+	Publication *Publication
+}
+
+// Publication is one job's DURABLE PUBLICATION: the scratch repo it landed under, the
+// root that holds its bytes, and whatever it declared into the local CAS.
+type Publication struct {
+	RequestID   string
+	Attempt     int64
+	Repo        string // <org>/_job-<request-id>
+	Root        string // the durable directory the grant named
+	Status      string // the terminal's verdict, STAMPED — never a persistence gate
+	Cause       string
+	Entries     int64
+	Bytes       int64
+	CommittedAt string
 }
 
 // AcceptTerminal is THE transaction cl-001 exists for: the terminal becomes
@@ -700,6 +851,23 @@ func (s *Store) AcceptTerminal(t Terminal) (applied bool, e *exit.Error) {
 		requestState, t.RequestID); err != nil {
 		return false, exit.Internalf("cannot settle request %s: %s", t.RequestID, err)
 	}
+	// THE PUBLICATION rides the same commit as the terminal and the outputs (cl-004).
+	// "The bundle is visible" and "the terminal was accepted" are therefore one fact:
+	// a kill before this commit leaves the bytes on disk with nothing claiming them,
+	// which is what "no partial bundle is visible" means. A LATER attempt of the same
+	// request republishes into the same root, so the row is upserted rather than
+	// duplicated — the publication belongs to the REQUEST, not to one ordinal.
+	if p := t.Publication; p != nil {
+		if _, err := tx.Exec(`INSERT INTO publications(request_id,attempt,repo,root,status,cause,
+			entries,bytes,committed_at) VALUES(?,?,?,?,?,?,?,?,?)
+			ON CONFLICT(request_id) DO UPDATE SET attempt=excluded.attempt,
+			  status=excluded.status, cause=excluded.cause, entries=excluded.entries,
+			  bytes=excluded.bytes, committed_at=excluded.committed_at`,
+			p.RequestID, p.Attempt, p.Repo, p.Root, p.Status, p.Cause, p.Entries, p.Bytes,
+			visible); err != nil {
+			return false, exit.Internalf("cannot commit the publication of %s: %s", p.Repo, err)
+		}
+	}
 	// The terminal EVENT rides the same transaction as the terminal fact and its outputs
 	// (cl-006). A stream that announced a terminal the authority had not committed — or an
 	// authority that committed one the stream never announced — is unrepresentable.
@@ -766,6 +934,15 @@ func (s *Store) AttemptByKey(key string) (*Attempt, *exit.Error) {
 
 func (s *Store) Attempts(requestID string) ([]Attempt, *exit.Error) {
 	return s.attemptsWhere(`request_id=?`, requestID)
+}
+
+// OpenAttemptsOf is every attempt one worker INSTANCE still owes a terminal for. It is
+// what a coordinator asks when that worker's process dies: those attempts are not
+// finished and not failed — they are unsettled, and the only thing that can settle one is
+// the supervisor's own journal, replayed by a worker in the SAME slot.
+func (s *Store) OpenAttemptsOf(instanceID string) ([]Attempt, *exit.Error) {
+	return s.attemptsWhere(
+		`instance_id=? AND state IN ('dispatching','accepted','recovered_open')`, instanceID)
 }
 
 func (s *Store) attemptsWhere(where string, args ...any) ([]Attempt, *exit.Error) {
@@ -861,6 +1038,122 @@ func (s *Store) Media(mediaID string) (*Output, string, int64, *exit.Error) {
 		return nil, "", 0, exit.Internalf("cannot read media %s: %s", mediaID, err)
 	}
 	return &o, requestID, attempt, nil
+}
+
+// ---------------------------------------------------------------- publications (cl-004)
+
+const publicationCols = `request_id,attempt,repo,root,status,cause,entries,bytes,committed_at`
+
+func scanPublication(row interface{ Scan(...any) error }) (Publication, error) {
+	var p Publication
+	err := row.Scan(&p.RequestID, &p.Attempt, &p.Repo, &p.Root, &p.Status, &p.Cause,
+		&p.Entries, &p.Bytes, &p.CommittedAt)
+	return p, err
+}
+
+// PublicationOf answers for one request. A nil answer means no terminal ever committed
+// one — which is exactly the question a crash arm asks.
+func (s *Store) PublicationOf(requestID string) (*Publication, *exit.Error) {
+	p, err := scanPublication(s.db.QueryRow(
+		`SELECT `+publicationCols+` FROM publications WHERE request_id=?`, requestID))
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, exit.Internalf("cannot read the publication of %s: %s", requestID, err)
+	}
+	return &p, nil
+}
+
+// Publications lists every committed publication, newest first.
+func (s *Store) Publications(limit int) ([]Publication, *exit.Error) {
+	rows, err := s.db.Query(`SELECT `+publicationCols+` FROM publications
+		ORDER BY committed_at DESC LIMIT ?`, limit)
+	if err != nil {
+		return nil, exit.Internalf("cannot list publications: %s", err)
+	}
+	defer rows.Close()
+	var out []Publication
+	for rows.Next() {
+		p, err := scanPublication(rows)
+		if err != nil {
+			return nil, exit.Internalf("cannot read a publication row: %s", err)
+		}
+		out = append(out, p)
+	}
+	return out, nil
+}
+
+// ---------------------------------------------------------------- job checkpoints
+
+// Checkpoint is one durable checkpoint identity, as the worker presented it.
+type Checkpoint struct {
+	RequestID     string
+	Attempt       int64
+	OperationKey  string
+	LogicalKey    string
+	ContentDigest string
+	ReceiptID     string
+	Outcome       string
+	RecordedAt    string
+}
+
+// RecordCheckpoint journals the coordinator's copy of one durable save and answers with
+// the row plus what happened: RECORDED (new), REPLAYED (the same identity again) or
+// CONFLICT (the same keys, different bytes). It never replaces a recorded digest — the
+// worker's own journal already made that fact durable, and a coordinator that overwrote
+// it would be a second authority over one fact.
+func (s *Store) RecordCheckpoint(c Checkpoint) (Checkpoint, string, *exit.Error) {
+	held, err := s.db.Query(`SELECT `+checkpointCols+` FROM job_checkpoints
+		WHERE request_id=? AND operation_key=? AND logical_key=?`,
+		c.RequestID, c.OperationKey, c.LogicalKey)
+	if err != nil {
+		return c, "", exit.Internalf("cannot read the checkpoint journal: %s", err)
+	}
+	defer held.Close()
+	if held.Next() {
+		var row Checkpoint
+		if err := held.Scan(&row.RequestID, &row.Attempt, &row.OperationKey, &row.LogicalKey,
+			&row.ContentDigest, &row.ReceiptID, &row.Outcome, &row.RecordedAt); err != nil {
+			return c, "", exit.Internalf("cannot read a checkpoint row: %s", err)
+		}
+		if row.ContentDigest != c.ContentDigest {
+			return row, "CONFLICT", nil
+		}
+		return row, "REPLAYED", nil
+	}
+	c.ReceiptID = NewID("crc")
+	c.Outcome, c.RecordedAt = "RECORDED", now()
+	if _, err := s.db.Exec(`INSERT INTO job_checkpoints(request_id,attempt,operation_key,
+		logical_key,content_digest,receipt_id,outcome,recorded_at) VALUES(?,?,?,?,?,?,?,?)`,
+		c.RequestID, c.Attempt, c.OperationKey, c.LogicalKey, c.ContentDigest,
+		c.ReceiptID, c.Outcome, c.RecordedAt); err != nil {
+		return c, "", exit.Internalf("cannot journal the checkpoint: %s", err)
+	}
+	return c, "RECORDED", nil
+}
+
+const checkpointCols = `request_id,attempt,operation_key,logical_key,content_digest,
+	receipt_id,outcome,recorded_at`
+
+// Checkpoints lists one request's journaled checkpoint identities, in arrival order.
+func (s *Store) Checkpoints(requestID string) ([]Checkpoint, *exit.Error) {
+	rows, err := s.db.Query(`SELECT `+checkpointCols+` FROM job_checkpoints
+		WHERE request_id=? ORDER BY recorded_at`, requestID)
+	if err != nil {
+		return nil, exit.Internalf("cannot list the checkpoints of %s: %s", requestID, err)
+	}
+	defer rows.Close()
+	var out []Checkpoint
+	for rows.Next() {
+		var c Checkpoint
+		if err := rows.Scan(&c.RequestID, &c.Attempt, &c.OperationKey, &c.LogicalKey,
+			&c.ContentDigest, &c.ReceiptID, &c.Outcome, &c.RecordedAt); err != nil {
+			return nil, exit.Internalf("cannot read a checkpoint row: %s", err)
+		}
+		out = append(out, c)
+	}
+	return out, nil
 }
 
 // Counts is what bare `cozy` renders: one line of live facts, read from the authority.

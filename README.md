@@ -181,6 +181,60 @@ Live drivers: `./cozy-live verbs` (25 refusal arms, no GPU) and `./cozy-live jou
 RELEASE they install — source, a lock over its whole closure, and the two wheels that are
 not on an index yet, with cozy-runtime built from a pinned read-only `git archive`.
 
+## Bounded jobs and the durable publication root (cl-004)
+
+`job submit` / `status` / `ls` / `follow` / `cancel` — the bounded job surface, LOCAL ONLY
+(the hub's job plane is th-008's; a manually provisioned pod is not the loopback
+coordinator). A job is an **attempt class on the one coordinator**, not a second scheduler:
+same request row, same ordinal law, same terminal transaction, same durable event stream
+(`cozy job follow` is `GET /v1/requests/{id}/events`'s client). What differs is what cr-009
+says differs — a `JobDirective`, a `JobExecutionSpec`, job capacity instead of serving
+capacity, and a grant that writes somewhere a reclaim cannot reach.
+
+- **The publication root is a real place, and a job never writes into it.**
+  `<COZY_HOME>/publications/<org>/_job-<job-id>` is the addressable publication; an attempt
+  in flight is granted `<that>/.staging/a<N>` instead, and the coordinator PROMOTES the
+  landed writes across by rename after the terminal document has been verified. So the
+  addressable path only ever holds bytes some terminal vouched for. The fence is the
+  resolution, not a scan: a destination that does not resolve INSIDE the grant's root
+  cannot be granted, so no job ever holds a capability to write outside its own stage.
+  Neither path is under `workers/` or `outputs/` — a bounded job is reclaimed at its
+  terminal, and a bundle inside what reclaim removes would be destroyed by the act that
+  ends the job that produced it.
+- **The publication commits with the terminal.** The row rides `AcceptTerminal`'s
+  transaction beside the outputs, so "a bundle is visible" and "a terminal was accepted"
+  are one fact. The verdict is STAMPED as metadata and gates nothing: a failed run's landed
+  writes still land (jobs.md), and a REQUEUEING attempt writes no publication at all.
+- **The CHECKPOINT half is a runtime-border SEAM, not a Creator protocol.** A job that
+  produces canonical bytes writes them through the one TensorFS border, and the publication
+  TRANSACTION is the runtime's (cr-005/cr-009, jobs.md). What this host owes is to validate
+  ONE typed durable publication receipt from that border, root what it names, and record
+  the catalog projection. That receipt does not exist yet, so nothing here interprets a
+  job's result to guess at one — the asset plane above is the whole of what ships.
+- **A job worker is terminal-and-reclaim, and the QUEUE is the coordinator's.**
+  `reclaim_on_terminal` is true: one immutable build, one bounded attempt, terminal,
+  reclaim. Deep queueing (owner directive, decisions #394 / cr-019) is the dispatch queue
+  plus select-or-start, not a warm worker — warm persistence is a serving concern.
+  Submission never answers "busy": no capacity is a queued STATE, `queue_position` says
+  where, and a submission with a non-empty queue JOINS it rather than overtaking it.
+- **`job_descriptor_id` is derived, never read.** It is absent from the descriptor by
+  design (a digest in a source-stable surface has no clock), so this host reproduces
+  `internal/descriptor.py::job_descriptor_id` under tfs-013's writer rules — verified
+  byte-identical against the runtime's own derivation, and checked again every run because
+  the worker resolves its local plan record BY that string.
+- **No fabricated `$0.00`.** The bill exists only where `COZY_LOCAL_RATE_MICRO_USD_PER_HOUR`
+  configured one; otherwise the field is absent and the rendering says why.
+- **The durable checkpoint exchange** is journaled here as a SECOND observation (law 9):
+  same identity replays the receipt, same keys with different bytes conflict, and nothing
+  on this side can un-write what the worker already made durable.
+
+Live drivers: `./cozy-live jobarms` (refusal arms, no store), `./cozy-live jobs` (the real
+census job end to end over the 6.9 GB bench store, the depth pass, kill/resume, the retry
+projection, benchmarks) and `./cozy-live jobcrash` (the coordinator killed at the two
+lifecycle points that decide whether a publication is a promise or a fact).
+`scripts/job-release.sh` builds the release they install — cr-009's own
+`structural_census.py`, verbatim from a pinned `git archive`.
+
 ## Catalog and first-party publish (cl-011)
 
 `internal/hub` is the ONE client onto tensorhub's HTTP API. Launch-1 tensorhub has **no

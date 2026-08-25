@@ -316,6 +316,46 @@ type Triage struct {
 	Bundle     map[string]any `json:"bundle"`
 }
 
+// ------------------------------------------------------------------ the JOB family
+
+// SubmitJob posts one bounded job under an idempotency key. It never answers "busy":
+// no capacity is a queued STATE, and the handle says which.
+func (c *Client) SubmitJob(sub api.JobSubmission, key string) (api.JobHandle, *exit.Error) {
+	var h api.JobHandle
+	e := c.call("POST", "/v1/local/jobs", sub, &h, "Idempotency-Key", key)
+	return h, e
+}
+
+// Job reads one job's state document.
+func (c *Client) Job(id string) (api.JobState, *exit.Error) {
+	var state api.JobState
+	e := c.call("GET", "/v1/local/jobs/"+id, nil, &state)
+	return state, e
+}
+
+// Jobs lists jobs newest-first with the server's own per-state counts.
+func (c *Client) Jobs(status, endpoint string, limit int) ([]api.JobState, map[string]int, *exit.Error) {
+	var out struct {
+		Jobs   []api.JobState `json:"jobs"`
+		States map[string]int `json:"states"`
+	}
+	path := fmt.Sprintf("/v1/local/jobs?limit=%d", limit)
+	if status != "" {
+		path += "&status=" + status
+	}
+	if endpoint != "" {
+		path += "&endpoint=" + endpoint
+	}
+	e := c.call("GET", path, nil, &out)
+	return out.Jobs, out.States, e
+}
+
+// CancelJob REQUESTS cancellation. A running job's own journaled terminal settles it; a
+// queued one leaves the queue and settles here.
+func (c *Client) CancelJob(id string) *exit.Error {
+	return c.call("POST", "/v1/local/jobs/"+id+"/cancel", nil, nil)
+}
+
 func (c *Client) Triage(attemptKey string) (Triage, *exit.Error) {
 	var t Triage
 	e := c.call("GET", "/v1/local/attempts/"+attemptKey+"/triage", nil, &t)

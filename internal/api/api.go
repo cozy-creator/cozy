@@ -53,6 +53,7 @@ import (
 	"github.com/cozy-creator/cozy-creator-v2/internal/coord"
 	"github.com/cozy-creator/cozy-creator-v2/internal/exit"
 	"github.com/cozy-creator/cozy-creator-v2/internal/home"
+	"github.com/cozy-creator/cozy-creator-v2/internal/launch"
 	"github.com/cozy-creator/cozy-creator-v2/internal/records"
 )
 
@@ -83,6 +84,10 @@ type Server struct {
 // driver supplies a dev tree.
 type Resolver interface {
 	Resolve(endpoint string) (coord.EndpointSpec, *exit.Error)
+	// Jobs names the `@job` functions one installed endpoint registers, with the
+	// descriptor id each resolves to. The job submit route resolves a function to its
+	// digest through this and never lets a client name one (cl-004).
+	Jobs(endpoint string) ([]launch.JobFacts, *exit.Error)
 	List() []string
 }
 
@@ -129,6 +134,10 @@ func (s *Server) Handler() (http.Handler, *exit.Error) {
 		"DELETE /v1/local/workers/{instance_id}":      s.stopWorker,
 		"GET /v1/local/doctor":                        s.doctor,
 		"GET /v1/local/attempts/{attempt_key}/triage": s.triage,
+		"POST /v1/local/jobs":                         s.submitJob,
+		"GET /v1/local/jobs":                          s.listJobs,
+		"GET /v1/local/jobs/{id}":                     s.getJob,
+		"POST /v1/local/jobs/{id}/cancel":             s.cancelJob,
 		"GET /healthz":                                s.healthz,
 		"GET /{$}":                                    s.stub,
 		"GET /app.js":                                 s.stub,

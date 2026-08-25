@@ -99,6 +99,21 @@ var Routes = []Route{
 		"the retained WorkerTriageBundle by OPAQUE attempt key, verified against its terminal",
 		"cl-010 `cozy logs <attempt>`"},
 
+	// ---- the JOB family (cl-004), LOCAL by design: the hub's job plane is th-008's,
+	// and a job's typed input trees are directories only a local caller owns.
+	{"POST", "/v1/local/jobs", Local, true, true, false, "Idempotency-Key",
+		"submit one bounded job; 202 with the job handle and its publication repo",
+		"cl-004 `cozy job submit`"},
+	{"GET", "/v1/local/jobs", Local, true, false, false, "",
+		"list jobs newest-first with per-state counts, optionally filtered",
+		"cl-004 `cozy job ls`"},
+	{"GET", "/v1/local/jobs/{id}", Local, true, false, false, "",
+		"one job: state, queue position, retry budget, publication, checkpoints, bill where a rate exists",
+		"cl-004 `cozy job status`"},
+	{"POST", "/v1/local/jobs/{id}/cancel", Local, true, true, false, "",
+		"request cancellation; a queued job leaves the queue, a running one gets its terminal",
+		"cl-004 `cozy job cancel`"},
+
 	// ---- unauthenticated: liveness and the stub page ----
 	{"GET", "/healthz", Local, false, false, false, "",
 		"liveness only — it answers `up` and nothing about any request",
@@ -128,6 +143,8 @@ var Tokens = []string{
 	"api.bind.loopback",    // loopback-only bind, IPv4 and IPv6
 	"api.local.extension",  // the LOCAL module, explicitly not the core
 	"api.local.triage",     // retained bundles by opaque attempt key
+	"api.local.jobs",       // the bounded job family: submit/list/status/cancel
+	"api.jobs.publication", // a job's landed writes are a durable publication root
 	"api.stub.embedded",    // the go:embed stub page
 }
 
