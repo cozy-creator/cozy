@@ -79,7 +79,8 @@ device ledger, and output publication authority.
 - **Liveness is an OS fact.** The service holds an exclusive `flock` on
   `$COZY_HOME/service.lock` for its life; a reader that can TAKE the lock has proof of
   absence. No pidfile, no heartbeat, no grace period. Worker adoption uses the protocol's
-  own identities plus `/proc` process-birth — a reused pid is never signalled.
+  own identities plus an OS process-birth identity: only the process this service started
+  may bind a worker slot (`SO_PEERCRED`), and a reused pid is never signalled.
 - **No credential is minted anywhere.** A local grant is a CAS root plus an output
   directory; the payload rides it as the input `payload`, and one `OutputDestination` is
   named per result FIELD PATH.
