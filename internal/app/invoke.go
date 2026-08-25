@@ -299,6 +299,28 @@ func handleRun(ctx *Context) *exit.Error {
 				WithRemedy("the local binding resolver lands with cl-005; this build refuses rather than ignoring it")
 		}
 	}
+	// TWO RUNTIME FLAGS HAVE NO WIRE FIELD, and they refuse rather than being dropped.
+	// `--seed` and `--offline` are cozy-runtime's own (a deterministic RNG at construction,
+	// a CAS-only acquisition), and the submission this host makes carries neither — the
+	// ExecutionSpec's key set is closed and adding a member is a th-024 change. A flag
+	// silently ignored is the failure mode `override_unresolved` exists to prevent, and
+	// these are the same shape.
+	if v := ctx.Inv.Value("--seed"); v != "" {
+		return exit.Named(exit.Usage, "not_implemented",
+			"--seed names the runtime's construction RNG and no wire field carries it").
+			WithRemedy("if the endpoint declares a seed field, pass it as payload: `seed=%s`", v).
+			WithNext("cozy describe <org/endpoint>/<function>")
+	}
+	if ctx.Inv.Bool("--offline") {
+		return exit.Named(exit.Usage, "not_implemented",
+			"--offline is the runtime's CAS-only acquisition mode and no wire field carries it").
+			WithRemedy("this host serves what its local artifact index already holds; a miss refuses at start").
+			WithNext("cozy-runtime run <fn> --offline (the standalone door)")
+	}
+	deadline, e := runDeadline(ctx)
+	if e != nil {
+		return e
+	}
 
 	// THE PAYLOAD IS TYPED AGAINST THE RECORDED SCHEMA — the surface the release's own
 	// runtime vouched for at install — so a typo costs a millisecond instead of a model
@@ -338,7 +360,7 @@ func handleRun(ctx *Context) *exit.Error {
 		}
 	}
 
-	terminal, canceled, e := watch(ctx, c, handle.RequestID, stream)
+	terminal, stopped, e := watch(ctx, c, handle.RequestID, stream, deadline)
 	if e != nil {
 		return e
 	}
@@ -350,35 +372,77 @@ func handleRun(ctx *Context) *exit.Error {
 	if e != nil {
 		return e
 	}
-	return renderRun(ctx, life, terminal, canceled, saved, submitted, began)
+	return renderRun(ctx, life, terminal, stopped, saved, submitted, began)
 }
 
 // watch consumes the request's own event stream to its terminal, rendering progress as
 // it goes. SIGINT does not kill this process: it CANCELS the request through the
 // coordinator and keeps watching, because the attempt's own journaled terminal is what
 // settles it and a client that walked away would leave the card held.
-func watch(ctx *Context, c *localapi.Client, requestID string, stream bool) (
-	*localapi.Event, bool, *exit.Error) {
+// watch returns the terminal event and WHY the client stopped waiting, which is not the
+// same question as what the terminal says: a canceled terminal caused by `--timeout` is
+// exit 10, because a caller that set a deadline wants to know the deadline is what
+// happened.
+func watch(ctx *Context, c *localapi.Client, requestID string, stream bool,
+	deadline time.Duration) (*localapi.Event, string, *exit.Error) {
 	interrupt := make(chan os.Signal, 1)
 	signal.Notify(interrupt, syscall.SIGINT, syscall.SIGTERM)
 	defer signal.Stop(interrupt)
 
-	canceled := false
-	go func() {
-		if _, ok := <-interrupt; !ok {
-			return
-		}
-		canceled = true
-		fmt.Fprintln(ctx.Err, "\ncancel requested — the attempt's own terminal still settles it")
+	stopped := ""
+	cancel := func(why string) {
+		fmt.Fprintf(ctx.Err, "\n%s — the attempt's own terminal still settles it\n", why)
 		if e := c.Cancel(requestID); e != nil {
 			fmt.Fprintf(ctx.Err, "cancel: %s\n", e.Message)
+		}
+	}
+	done := make(chan struct{})
+	defer close(done)
+	go func() {
+		select {
+		case _, ok := <-interrupt:
+			if !ok {
+				return
+			}
+			stopped = "canceled"
+			cancel("cancel requested")
+		case <-deadlineC(deadline):
+			// `--timeout` is a REQUEST DEADLINE the client enforces the only way a client
+			// honestly can: by asking the coordinator to cancel. It is not the
+			// supervisor's watchdog deadline (that one is on the attempt, and this host
+			// has no wire field for it) — walking away instead would leave the card held.
+			stopped = "deadline"
+			cancel(fmt.Sprintf("--timeout %s expired", deadline))
+		case <-done:
 		}
 	}()
 
 	lines := newProgress(ctx, stream)
 	terminal, e := c.Watch(requestID, 0, lines.on)
 	lines.done()
-	return terminal, canceled, e
+	return terminal, stopped, e
+}
+
+// deadlineC is a timer channel, or one that never fires when no deadline was set.
+func deadlineC(d time.Duration) <-chan time.Time {
+	if d <= 0 {
+		return nil
+	}
+	return time.After(d)
+}
+
+// runDeadline reads `--timeout <dur>`.
+func runDeadline(ctx *Context) (time.Duration, *exit.Error) {
+	v := ctx.Inv.Value("--timeout")
+	if v == "" {
+		return 0, nil
+	}
+	d, err := time.ParseDuration(v)
+	if err != nil || d <= 0 {
+		return 0, exit.Usagef("--timeout %q is not a positive duration", v).
+			WithRemedy("durations are Go-spelled: 30s, 5m, 1h30m")
+	}
+	return d, nil
 }
 
 // progress renders the live lane. Two shapes, and they are not the same surface:
@@ -544,11 +608,15 @@ const opaqueType = "application/octet-stream"
 
 // renderRun prints the run's answer and maps the terminal onto the SHARED matrix:
 // succeeded 0 · failed 11 · canceled 12 · deadline 10, from `exit.JobTerminal`.
-func renderRun(ctx *Context, life api.Lifecycle, terminal *localapi.Event, canceled bool,
+func renderRun(ctx *Context, life api.Lifecycle, terminal *localapi.Event, stopped string,
 	saved []map[string]string, submitted time.Duration, began time.Time) *exit.Error {
 	status := localapi.StreamStatus(terminal)
 	if status == "" {
 		status = life.Status
+	}
+	if stopped == "deadline" && status == "canceled" {
+		// The DEADLINE is why this ended, and the shared matrix has a code for it.
+		status = "deadline"
 	}
 	fields := []render.Field{
 		{K: "request", V: life.RequestID},
@@ -608,8 +676,7 @@ func renderRun(ctx *Context, life api.Lifecycle, terminal *localapi.Event, cance
 	if err := rec.Emit(ctx.Out, ctx.Mode()); err != nil && !ctx.Mode().JSON {
 		return exit.As(err)
 	}
-	e := exit.Named(code, statusName(status, canceled), "request %s ended %s",
-		life.RequestID, status)
+	e := exit.Named(code, status, "request %s ended %s", life.RequestID, status)
 	if life.Error != "" {
 		e.Message = fmt.Sprintf("request %s ended %s: %s — %s",
 			life.RequestID, status, life.ErrorType, life.Error)
@@ -629,13 +696,6 @@ func mapTerminal(status string) string {
 		return "canceled"
 	case "failed":
 		return "failed"
-	}
-	return status
-}
-
-func statusName(status string, canceled bool) string {
-	if canceled {
-		return "canceled"
 	}
 	return status
 }

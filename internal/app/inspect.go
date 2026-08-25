@@ -242,10 +242,15 @@ func handleFit(ctx *Context) *exit.Error {
 	}
 	host, verdicts, worst := []render.Field{}, []map[string]string{}, exit.OK
 	notes := []string{"verdicts are the runtime's own — the same arithmetic `run` prices with"}
+	hints := []string{}
 	for _, row := range rows {
 		switch {
 		case row.Key == "device" || row.Key == "allocatable":
 			host = append(host, render.Field{K: row.Key, V: row.Value})
+			continue
+		case row.Key == "next":
+			// The runtime's own next-step hint, kept as one.
+			hints = append(hints, row.Value)
 			continue
 		case !declared[row.Key]:
 			// The runtime's own trailing lines. Carried, never re-worded.
@@ -267,6 +272,7 @@ func handleFit(ctx *Context) *exit.Error {
 		Empty:      "0 fit verdicts",
 		Aggregates: append([]render.Field{{K: "endpoint", V: endpoint}}, host...),
 		Notes:      notes,
+		Next:       hints,
 	}
 	if worst == exit.OK {
 		return emit(ctx, l)

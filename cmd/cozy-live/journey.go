@@ -81,6 +81,17 @@ func sectionVerbs() {
 	code, out = cozyRun(root, "run", endpointRef+"/v1/denoise", "--model", "acme/other")
 	check("--model -> 2 override_unresolved (cl-005), never silently ignored",
 		code == 2 && strings.Contains(out, "override_unresolved"), firstLine(out))
+	// Two runtime flags this host advertises and has no WIRE FIELD for. A flag that
+	// parses and does nothing is the same bug as an ignored override.
+	code, out = cozyRun(root, "run", endpointRef+"/v1/denoise", "--seed", "7")
+	check("--seed -> 2, naming the payload field that WOULD carry it",
+		code == 2 && strings.Contains(out, "seed=7"), firstLine(out))
+	code, out = cozyRun(root, "run", endpointRef+"/v1/denoise", "--offline")
+	check("--offline -> 2, naming the standalone door that has it",
+		code == 2 && strings.Contains(out, "not_implemented"), firstLine(out))
+	code, out = cozyRun(root, "run", endpointRef+"/v1/denoise", "--timeout", "soon")
+	check("--timeout with a non-duration -> 2", code == 2 && strings.Contains(out, "duration"),
+		firstLine(out))
 
 	head("a PATH is not an attempt id")
 	for _, subject := range []string{"../../etc/passwd", "/etc/passwd", "./triage/x.json"} {
@@ -231,6 +242,17 @@ func sectionJourney() {
 	code4, out4 := cozyRun(root, "run", endpointRef+"/v1/pair", "steps=2",
 		"--idempotency-key", key)
 	check("the same key naming a different FUNCTION refuses 13 too", code4 == 13, firstLine(out4))
+
+	head("--timeout is a REQUEST DEADLINE the client enforces by cancelling")
+	t0 = time.Now()
+	code, out = cozyRun(root, "run", endpointRef+"/v1/stubborn", "steps=512", "latent=80",
+		"--timeout", "3s")
+	timeoutMS := elapsedMS(t0)
+	check("a run past its --timeout exits 10, not 12: the deadline is what happened",
+		code == 10 && strings.Contains(out, "deadline"), firstLine(out))
+	check("and it cancelled through the coordinator rather than walking away",
+		strings.Contains(out, "expired"), "")
+	fmt.Printf("  the deadline settled in %d ms\n", timeoutMS)
 
 	head("cancel mid-attempt: the request is cancelled, the attempt's own terminal settles it")
 	cancelled := cancelMidRun(root, port)
