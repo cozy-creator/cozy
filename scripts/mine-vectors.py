@@ -55,13 +55,6 @@ def raw(t):
     return t.contiguous().cpu().reshape(-1).view(torch.uint8).numpy().tobytes()
 
 
-def st_name(t):
-    return {
-        torch.float32: "f32", torch.bfloat16: "bf16", torch.float16: "f16",
-        torch.float8_e4m3fn: "f8_e4m3fn", torch.int8: "i8", torch.uint8: "u8",
-    }[t.dtype]
-
-
 # ---------------------------------------------------------------- v1, verbatim
 
 def _e2m1_bounds(device):

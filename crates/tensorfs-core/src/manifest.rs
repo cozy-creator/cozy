@@ -210,10 +210,6 @@ impl SnapshotManifest {
         }
     }
 
-    pub fn get(&self, path: &str) -> Option<&Entry> {
-        self.entries.iter().find(|(p, _)| p == path).map(|(_, e)| e)
-    }
-
     /// Is this exact object listed as a file entry, and at how many paths?
     pub fn listings(&self, r: &ObjectRef) -> Vec<&str> {
         self.entries
@@ -221,20 +217,6 @@ impl SnapshotManifest {
             .filter(|(_, e)| matches!(e, Entry::File(o) if o == r))
             .map(|(p, _)| p.as_str())
             .collect()
-    }
-
-    /// Every object this manifest's own bytes name, in entry order. The transitive root
-    /// walk (checkpoint.rs) continues from here THROUGH the header.
-    pub fn direct_objects(&self) -> Vec<ObjectRef> {
-        let mut v = Vec::new();
-        for (_, e) in &self.entries {
-            match e {
-                Entry::Dir => {}
-                Entry::File(o) => v.push(o.clone()),
-                Entry::Blob(b) => v.extend(b.segments.iter().cloned()),
-            }
-        }
-        v
     }
 
     /// The path law, run as part of every decode. Strictly ascending raw bytes gives

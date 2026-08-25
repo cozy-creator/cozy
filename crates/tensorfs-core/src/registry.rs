@@ -72,13 +72,6 @@ pub struct Seed {
     pub vectors: Option<EncodingVectors>,
 }
 
-impl Seed {
-    /// The contained documents this entry contributes to a checkpoint closure.
-    pub fn vectors_ref(&self) -> Option<ObjectRef> {
-        self.spec.vectors.clone()
-    }
-}
-
 fn spec(
     logical_dtypes: Vec<Dtype>,
     logical_rank: Option<u64>,

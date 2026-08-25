@@ -65,14 +65,6 @@ impl CapabilityRecords {
             }
         }
     }
-
-    pub fn devices_for(&self, encoding: &str) -> Vec<&str> {
-        self.records
-            .iter()
-            .filter(|r| r.encoding == encoding)
-            .map(|r| r.device.as_str())
-            .collect()
-    }
 }
 
 impl Doc for CapabilityRecords {
