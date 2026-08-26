@@ -109,6 +109,16 @@ func HashLine(v Value) string {
 	return "sha256:" + hex.EncodeToString(sum[:])
 }
 
+// HashHex is the WIRE CARRIER: the bare 64 lowercase hex of a credential's sha256, with
+// no `sha256:` prefix.
+//
+// It is a second spelling of one fact and it exists because two peers spell it two ways:
+// a token-hash FILE carries `sha256:<hex>` lines (HashLine, what cozy-media and the
+// runtime read), and a hub's `renter_token_sha256` field takes the hex alone. Naming both
+// here keeps the conversion at the carrier, where every other credential rendering in this
+// package lives, instead of a TrimPrefix at a call site that has to remember why.
+func HashHex(v Value) string { return strings.TrimPrefix(HashLine(v), "sha256:") }
+
 // MatchesHash answers whether a presented bearer hashes to one `sha256:<64 hex>` line, in
 // constant time. Neither side of the comparison is a raw credential: the verifier holds a
 // digest and the presented string is digested before it is compared.

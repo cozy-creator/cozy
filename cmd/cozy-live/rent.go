@@ -121,14 +121,14 @@ func sectionRent() {
 	// the minted token and holds nothing that could produce it.
 	hashes := hub.hashesOf(rentalA)
 	wantSum := sha256.Sum256([]byte(minted))
-	wantHash := "sha256:" + hex.EncodeToString(wantSum[:])
+	wantHash := hex.EncodeToString(wantSum[:]) // the hub's spelling: bare hex
 	check("the hub holds exactly one credential fact for this pod, and it is a HASH",
 		len(hashes) == 1 && hashes[0] == wantHash, strings.Join(hashes, " "))
 	check("and that hash is not the token: nothing the hub holds could be presented as proof",
 		hashes != nil && hashes[0] != minted, "a hash is not a preimage")
 	podSet, err := os.ReadFile(filepath.Join(root, "hub", rentalA+"-run", "pod.tokens"))
 	check("the pod was provisioned with that same hash, and the token is absent from the pod",
-		err == nil && strings.Contains(string(podSet), wantHash) &&
+		err == nil && strings.Contains(string(podSet), "sha256:"+wantHash) &&
 			!strings.Contains(string(podSet), minted),
 		strings.TrimSpace(string(podSet)))
 

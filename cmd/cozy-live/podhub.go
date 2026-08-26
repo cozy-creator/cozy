@@ -15,6 +15,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"sync"
 	"syscall"
@@ -50,9 +51,9 @@ type podRental struct {
 	CertPEM string
 	// Hashes is the pod's LIVE credential set, `sha256:<64 hex>` lines. It is everything
 	// this hub was ever told about the renter's credential.
-	Hashes  []string
-	PodID   string
-	Detail  string
+	Hashes []string
+	PodID  string
+	Detail string
 	// Media is where this pod's co-resident MEDIA SERVER answers (cl-014). A real hub
 	// names it in the rental document; this stand-in names it too, so the client's
 	// verbatim read of the field is exercised as well as its derivation fallback.
@@ -65,6 +66,9 @@ type podRental struct {
 	WorkerPID int
 	MediaPID  int
 }
+
+// bareHash is the hub field's shape: 64 lowercase hex, no prefix.
+var bareHash = regexp.MustCompile(`^[0-9a-f]{64}$`)
 
 type podHub struct {
 	mu    sync.Mutex
@@ -234,10 +238,14 @@ func (h *podHub) rent(w http.ResponseWriter, r *http.Request) {
 			"a rental names an endpoint and a card", `{"endpoint":"h3","card":"H200"}`)
 		return
 	}
+	// THE HUB'S SPELLING IS BARE HEX, which is the real surface's (provider.IsHash).
+	// The `sha256:` prefix belongs to the pod's token FILE and not to this field, and a
+	// stand-in that admitted the file spelling would be green about a body the real hub
+	// refuses — the drift this peer exists to catch.
 	for _, h := range body.TokenSHA256 {
-		if !strings.HasPrefix(h, "sha256:") || len(h) != len("sha256:")+64 {
+		if !bareHash.MatchString(h) {
 			refuse(w, http.StatusUnprocessableEntity, "rental.token_not_hashed",
-				"send sha256 hex of the token you minted",
+				"send the sha256 hex of the token you minted, 64 lowercase hex and no prefix",
 				"this hub never accepts a plaintext credential: it could use one")
 			return
 		}
@@ -287,7 +295,13 @@ func (h *podHub) provision(rec *podRental) {
 	// the pod is the set it was handed — written 0600, one `sha256:` line each, and read by
 	// BOTH pod processes. A rotation is this file being rewritten.
 	tokenFile := filepath.Join(runRoot, "pod.tokens")
-	if err := os.WriteFile(tokenFile, []byte(strings.Join(rec.Hashes, "\n")+"\n"), 0o600); err != nil {
+	// The FILE's spelling, which is not the wire's: `sha256:<hex>` lines are what both
+	// pod processes read, and the prefix is added here rather than carried on the wire.
+	var lines strings.Builder
+	for _, h := range rec.Hashes {
+		lines.WriteString("sha256:" + h + "\n")
+	}
+	if err := os.WriteFile(tokenFile, []byte(lines.String()), 0o600); err != nil {
 		h.mu.Lock()
 		rec.State, rec.Detail = "failed", "cannot provision the credential set: "+err.Error()
 		h.mu.Unlock()

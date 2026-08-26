@@ -88,7 +88,7 @@ func handleRent(ctx *Context) *exit.Error {
 
 	c := client(ctx)
 	hctx, cancel := hub.Context()
-	r, e := c.Rent(hctx, endpoint, card, secret.HashLine(token), reason)
+	r, e := c.Rent(hctx, endpoint, card, secret.HashHex(token), reason)
 	cancel()
 	if e != nil {
 		return e
@@ -106,7 +106,7 @@ func handleRent(ctx *Context) *exit.Error {
 	}
 	row.PodID, row.Address, row.State = ready.PodID, ready.Address, ready.State
 	row.MediaAddress = ready.MediaAddress
-	if !ready.HoldsHash(secret.HashLine(token)) {
+	if !ready.HoldsHash(secret.HashHex(token)) {
 		// The pod was provisioned with a credential set this host's token is not in, so
 		// dialling it would 401 and look like a network fault. The hub says which hashes
 		// are live; neither end has to say a token to find this out.

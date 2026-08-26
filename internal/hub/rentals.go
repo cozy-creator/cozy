@@ -3,6 +3,7 @@ package hub
 import (
 	"context"
 	"net/http"
+	"strings"
 
 	"github.com/cozy-creator/cozy-creator-v2/internal/exit"
 )
@@ -69,10 +70,14 @@ func (r Rental) Ready() bool {
 }
 
 // HoldsHash answers whether the hub's live set carries this hash — the renter's own
-// check that the pod it is about to dial was provisioned with the token it holds.
-func (r Rental) HoldsHash(line string) bool {
+// check that the pod it is about to dial was provisioned with the token it holds. Both
+// spellings are accepted because both exist: the wire's bare hex and the pod hash file's
+// `sha256:` line are one fact, and a comparison that knew only one would read as a
+// mismatch on the other.
+func (r Rental) HoldsHash(hash string) bool {
+	bare := strings.TrimPrefix(hash, "sha256:")
 	for _, h := range r.TokenSHA256 {
-		if h == line || "sha256:"+h == line {
+		if strings.TrimPrefix(h, "sha256:") == bare {
 			return true
 		}
 	}
@@ -107,9 +112,10 @@ func (w wireRental) rental(id string) Rental {
 // this client watches it through `Rental`, because a POST that blocked until a pod booted
 // would be a request whose failure mode is a lost id.
 //
-// `tokenSHA256` is `sha256:<64 hex>` and the token itself is not an argument here, in this
-// package, or anywhere on this wire. A hub that was sent a plaintext credential would be a
-// hub that could use it.
+// `tokenSHA256` is the BARE 64 lowercase hex — the spelling the hub's field takes; the
+// `sha256:` prefix is the token-hash FILE's spelling and belongs to the pod, not the wire.
+// The token itself is not an argument here, in this package, or anywhere on this wire: a
+// hub that was sent a plaintext credential would be a hub that could use it.
 func (c *Client) Rent(ctx context.Context, endpoint, card, tokenSHA256, reason string) (Rental, *exit.Error) {
 	body := map[string]any{
 		"endpoint": endpoint, "card": card,
