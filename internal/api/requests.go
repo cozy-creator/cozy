@@ -3,13 +3,16 @@ package api
 import (
 	"encoding/base64"
 	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
+	"sort"
 	"strconv"
 	"strings"
 
 	"github.com/cozy-creator/cozy-creator-v2/internal/canonical"
 	"github.com/cozy-creator/cozy-creator-v2/internal/exit"
+	"github.com/cozy-creator/cozy-creator-v2/internal/inputasset"
 	"github.com/cozy-creator/cozy-creator-v2/internal/orchestrator"
 	"github.com/cozy-creator/cozy-creator-v2/internal/records"
 	pb "github.com/cozy-creator/cozy-creator-v2/protocol/cozy/worker/v1"
@@ -33,6 +36,10 @@ type Submission struct {
 	Lane     string          `json:"lane,omitempty"`
 	Adapter  string          `json:"adapter,omitempty"`
 	PlanID   string          `json:"plan_id,omitempty"`
+	// LocalAssets is the local API's out-of-band input set. Each source path is ingested into
+	// the service-owned immutable input store before the request row exists; it never
+	// crosses the worker protocol. The typed payload carries only its opaque reference.
+	LocalAssets []records.AssetBinding `json:"local_assets,omitempty"`
 	// Worker pins this request to an ATTACHED remote worker by rental id (cl-015). It is
 	// a LOCAL addition and is named as one in docs/client-contract.md: the cloud host
 	// places work itself and has no rental for a client to name.
@@ -83,6 +90,19 @@ func (s *Server) submit(w http.ResponseWriter, r *http.Request) {
 			`{"endpoint":"org/name","function":"denoise","input":{…}}`)
 		return
 	}
+	if len(sub.LocalAssets) > 0 && !s.cliAuthenticated(r) {
+		s.refuse(w, r, http.StatusForbidden, "cli_credential_required",
+			"local_assets may name host filesystem paths and require the OS-protected CLI credential",
+			"use `cozy run --asset <field-path>=<file>`; this build exposes no browser asset-upload route")
+		return
+	}
+	// Staging bytes and recording their request are one ownership handoff even though the
+	// filesystem and SQLite cannot share a transaction. Terminal GC takes the same short
+	// guard, so it cannot remove a digest in the gap between those two operations.
+	if len(sub.LocalAssets) > 0 {
+		unlock := inputasset.Guard()
+		defer unlock()
+	}
 	// Overrides are ADMISSIBLE HERE and refuse typed on public serving (th-021's
 	// surface scoping). Locally the override is always available — but the machinery
 	// that resolves one is cl-005's, so this host refuses the FIELD rather than
@@ -94,12 +114,39 @@ func (s *Server) submit(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	spec, e := s.resolvePlan(sub)
+	key := strings.TrimSpace(r.Header.Get("Idempotency-Key"))
+	existing, e := s.store.RequestByIdempotencyKey(key)
 	if e != nil {
 		s.refuseTyped(w, r, e)
 		return
 	}
-	spec.IdemKey = strings.TrimSpace(r.Header.Get("Idempotency-Key"))
+	var spec orchestrator.Submission
+	if existing != nil {
+		// Resolve an existing key from the durable request identity, not from resources
+		// retained only while it can execute. The caller's asset claims are still hashed
+		// below, so a different body conflicts, but neither its source nor the reclaimed
+		// staging object is opened merely to answer an already-recorded request.
+		spec = replaySubmission(sub, *existing)
+	} else {
+		spec, e = s.resolvePlan(sub)
+		if e != nil {
+			s.refuseTyped(w, r, e)
+			return
+		}
+		spec.Assets, e = s.stageAssets(spec.Assets)
+		if e != nil {
+			s.refuseTyped(w, r, e)
+			return
+		}
+		if len(spec.Assets) > 0 {
+			defer func() {
+				if e := inputasset.DropUnowned(s.layout, s.store, spec.Assets); e != nil {
+					fmt.Fprintf(s.log, "input asset cleanup deferred: %s\n", e.Message)
+				}
+			}()
+		}
+	}
+	spec.IdemKey = key
 	// THE BODY DIGEST is over the whole submission the key names, not over the payload
 	// alone: one key that named a different FUNCTION must conflict as loudly as one
 	// that named different input. The canonical document is the digest's subject, so
@@ -133,6 +180,27 @@ func (s *Server) submit(w http.ResponseWriter, r *http.Request) {
 	s.ok(w, r, status, handle)
 }
 
+func replaySubmission(sub Submission, recorded records.Request) orchestrator.Submission {
+	planID := sub.PlanID
+	if planID == "" {
+		planID = recorded.PlanID
+	}
+	outputs := append([]string(nil), sub.Outputs...)
+	if len(outputs) == 0 && recorded.Outputs != "" {
+		outputs = strings.Split(recorded.Outputs, ",")
+	}
+	assets := append([]records.AssetBinding(nil), sub.LocalAssets...)
+	sort.Slice(assets, func(i, j int) bool { return assets[i].FieldPath < assets[j].FieldPath })
+	payload := []byte(sub.Input)
+	if len(payload) == 0 {
+		payload = []byte("{}")
+	}
+	return orchestrator.Submission{
+		Endpoint: sub.Endpoint, Entrypoint: sub.Function, Payload: payload,
+		Outputs: outputs, PlanID: planID, Worker: sub.Worker, Assets: assets,
+	}
+}
+
 // submissionDigest is the canonical identity of one submission. It uses the SAME writer
 // the protocol documents use, so the digest a client can reproduce is the digest the
 // authority recorded.
@@ -144,6 +212,19 @@ func submissionDigest(spec orchestrator.Submission) (string, *exit.Error) {
 		"plan_id":  spec.PlanID,
 		"input":    base64.StdEncoding.EncodeToString(spec.Payload),
 		"outputs":  strings.Join(spec.Outputs, ","),
+	}
+	assets := make([]canonical.Value, 0, len(spec.Assets))
+	for _, asset := range spec.Assets {
+		assets = append(assets, map[string]canonical.Value{
+			"field_path": asset.FieldPath,
+			"digest":     asset.Digest,
+			"length":     asset.Length,
+			"media_type": asset.MediaType,
+			"order":      int64(asset.Order),
+		})
+	}
+	if len(assets) > 0 {
+		doc["assets"] = assets
 	}
 	// The pinned rental is NOT in it: a worker id says WHERE the same work runs, and two
 	// submissions of one key that differ only in placement are the same request. What the
@@ -178,7 +259,7 @@ func (s *Server) handleOf(row records.Request, attempt uint64) Handle {
 // row, the contract says what a client should do next.
 func contractStatus(state string) string {
 	switch state {
-	case "submitted", "queued":
+	case "submitted", "queued", "requeue_pending":
 		// `queued` is BOTH "never dispatched" and "an attempt ended and the orchestrator
 		// is minting the next ordinal". From a client's seat those are the same fact:
 		// work is owed and nothing has settled.
@@ -202,7 +283,7 @@ func contractStatus(state string) string {
 func (s *Server) resolvePlan(sub Submission) (orchestrator.Submission, *exit.Error) {
 	out := orchestrator.Submission{
 		Endpoint: sub.Endpoint, Entrypoint: sub.Function, Payload: []byte(sub.Input),
-		Outputs: sub.Outputs, PlanID: sub.PlanID, Worker: sub.Worker,
+		Outputs: sub.Outputs, PlanID: sub.PlanID, Worker: sub.Worker, Assets: sub.LocalAssets,
 	}
 	if len(out.Payload) == 0 {
 		out.Payload = []byte("{}")
@@ -244,6 +325,43 @@ func (s *Server) resolvePlan(sub Submission) (orchestrator.Submission, *exit.Err
 			out.Outputs = spec.Placement.OutputsFor(sub.Function)
 		}
 	}
+	return out, nil
+}
+
+func (s *Server) stageAssets(assets []records.AssetBinding) ([]records.AssetBinding, *exit.Error) {
+	if len(assets) == 0 {
+		return nil, nil
+	}
+	out := make([]records.AssetBinding, 0, len(assets))
+	rollback := func() {
+		if e := inputasset.DropUnowned(s.layout, s.store, out); e != nil {
+			fmt.Fprintf(s.log, "partial input asset cleanup deferred: %s\n", e.Message)
+		}
+	}
+	seen := map[string]bool{}
+	var total int64
+	for _, asset := range assets {
+		if seen[asset.FieldPath] {
+			rollback()
+			return nil, exit.New(exit.Validation,
+				"input asset field %q was supplied more than once", asset.FieldPath)
+		}
+		seen[asset.FieldPath] = true
+		staged, e := inputasset.Stage(s.layout, asset, inputasset.MaxBytes)
+		if e != nil {
+			rollback()
+			return nil, e
+		}
+		out = append(out, staged)
+		total += staged.Length
+		if total > inputasset.MaxTotalBytes {
+			rollback()
+			return nil, exit.Named(exit.Validation, "inputs_over_total_cap",
+				"this request's input assets declare %d B and this deployment admits %d B per attempt",
+				total, inputasset.MaxTotalBytes)
+		}
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].FieldPath < out[j].FieldPath })
 	return out, nil
 }
 

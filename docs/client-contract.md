@@ -64,16 +64,42 @@ host does not hold is `404` **before** a request row exists — a pin that canno
 resolved now cannot be resolved on a later attempt either. The pin is deliberately NOT in
 the idempotency digest: it says WHERE the same work runs, not what the work is.
 
+`local_assets` is the CLI-only local extension for `--asset
+<field-path>=<file>`. Each row names the exact request-schema field path plus a source
+path, digest, length, and detected media type. The service verifies those claims and
+copies the bytes into its private content-addressed input store before recording the
+request. Only an opaque digest reference enters `input`; only the field-path identity,
+digest, length, media type, and ordered occurrence enter the invocation spec. A network
+host uses an upload/asset-id surface instead — a client filesystem path is never portable
+authority. This field requires the OS-protected CLI bearer; the browser bearer is refused
+before any path is read, and this local host does not yet expose a browser asset-upload
+route.
+
+The private staged object remains only while some unsettled request references its
+digest. The service serializes the filesystem-to-request-row ownership handoff with the
+same guard used by terminal cleanup, so deduplication cannot turn cleanup into a race.
+Per-attempt input directories are removed after the outcome is mirrored, committed, and
+acknowledged; locally mirrored output bytes remain addressable by their media ids. A
+failed pod deletion remains a durable attempt-row obligation and is retried on subsequent
+worker reports; it is never converted into a successful cleanup claim.
+
+Local worker grants currently refuse on Windows as
+`local_file_grant_unsupported` (structural). Remote pod execution remains supported.
+This is an explicit boundary until cozy-runtime and Creator share one Windows file-URL
+encoder/authorizer; Creator does not emit malformed `file://C:\\…` capabilities.
+
 A pinned request crosses a REAL byte boundary, and the crossing is the pod's own media
-server (cl-014, ruled #506b): the payload is uploaded to the pod before the attempt is
-dispatched, the worker reads it off the pod's disk, and the outputs are fetched back and
-verified against the terminal's manifest before anything is acked. A rental whose media
+server (cl-014, ruled #506b): the payload and every input asset are uploaded as separate
+objects before the attempt is dispatched, the worker reads them off the pod's disk, and
+the outputs are fetched back and verified against the terminal's manifest before anything
+is acked. A rental whose media
 plane does not answer is `media_unreachable` — this host never falls back to granting a
 path on its own disk, because the pod cannot reach one.
 
 **The idempotency key names one request forever.** The host records the key beside a
-digest of the whole submission — endpoint, function, input, outputs — so the same key
-with a different FUNCTION conflicts as loudly as one with different input. Answers:
+digest of the whole submission — endpoint, function, input, asset identities, outputs —
+so the same key with a different FUNCTION conflicts as loudly as one with different input.
+Answers:
 
 | | |
 |---|---|
@@ -130,6 +156,7 @@ after it arrives in order, across a host restart. `id:` carries the cursor on th
 |---|---|
 | `request.submitted` | `endpoint`, `function`, `body_digest`, `plan_id`, `outputs` |
 | `request.queued` | `reason` |
+| `request.dispatch_aborted` | pre-offer preparation failed; `cause`, `error`; no worker saw this ordinal |
 | `request.dispatched` | `instance_id`, `exec_spec_digest` |
 | `request.accepted` | `plan_digest`, `construction_digest`, `plan` |
 | `request.attempt_failed` | one ATTEMPT ended and the request did NOT — `status`, `cause`, `requeuing: true` |

@@ -11,7 +11,8 @@ import (
 
 // The `run` payload grammar (cozy-runtime-cli.md), the same one cr-016 implements for a
 // bare-venv run: a positional PRIMARY filling the first declared field, `key=value`
-// scalars, `key=@file` file inputs, `key:=<json>` raw JSON for nested values, and
+// scalars, `key=@file` local file contents encoded as one JSON string,
+// `key:=<json>` raw JSON for nested values, and
 // `--in <file>` supplying the whole payload with `key=value` merged on top.
 //
 // TYPING IS THE DESCRIPTOR'S, not this module's. `steps=20` is an int because the field's
@@ -64,6 +65,13 @@ func ParsePayload(ep *Entrypoint, terms []string, infile string) (json.RawMessag
 				return nil, e
 			}
 			if after, isFile := strings.CutPrefix(raw, "@"); isFile {
+				rendered, _ := ep.TypeOfField(key)
+				kind, _ := typeOf(rendered)
+				if kind == "asset" {
+					return nil, exit.New(exit.Validation,
+						"%s.%s is an input asset and key=@file has no grant identity", ep.Name, key).
+						WithRemedy("use `--asset %s=%s`; the schema field path becomes the input identity", key, after)
+				}
 				data, err := os.ReadFile(after)
 				if err != nil {
 					return nil, exit.New(exit.NotFound, "%s=@%s: %s", key, after, err)
@@ -157,12 +165,16 @@ func typed(ep *Entrypoint, key, raw string) (json.RawMessage, *exit.Error) {
 			return nil, exit.Internalf("cannot carry %s: %s", key, err)
 		}
 		return encoded, nil
+	case "asset":
+		return nil, exit.New(exit.Validation,
+			"%s.%s is an input asset and `key=value` cannot grant its bytes", ep.Name, key).
+			WithRemedy("use `--asset %s=<file>`; the schema field path becomes the input identity", key)
 	}
 	// Anything structured — an asset, a list, a nested struct — has no scalar spelling.
 	// `key:=<json>` is the form that carries it, and saying so beats guessing.
 	return nil, exit.New(exit.Validation,
 		"%s.%s is not a scalar and `key=value` cannot spell one", ep.Name, key).
-		WithRemedy("carry it as `%s:=<json>`, or `%s=@<file>` for a file input", key, key)
+		WithRemedy("carry it as `%s:=<json>`; asset fields use `--asset <field-path>=<file>`", key)
 }
 
 func wrongType(ep *Entrypoint, key, raw, want string) *exit.Error {

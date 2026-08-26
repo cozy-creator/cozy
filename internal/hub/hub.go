@@ -104,6 +104,9 @@ type call struct {
 	body   any
 	admin  bool   // carries the admin token
 	reason string // X-Tensorhub-Reason; the hub refuses a mutation without one
+	// idempotency is the caller-owned operation identity for a paid mutation. It is
+	// distinct from Tensorhub's provider operation id and survives a lost HTTP answer.
+	idempotency string
 	// byBytes drops the transport total for a call whose work is bounded by BYTES
 	// rather than by the hub's own latency (completion re-streams and re-hashes every
 	// declared object). A catalog read that is slow is broken; a completion that is
@@ -201,6 +204,9 @@ func (c *Client) do(ctx context.Context, cl call, out any) *exit.Error {
 	}
 	if cl.reason != "" {
 		req.Header.Set("X-Tensorhub-Reason", cl.reason)
+	}
+	if cl.idempotency != "" {
+		req.Header.Set("Idempotency-Key", cl.idempotency)
 	}
 	if cl.admin {
 		// The ONE raw read of the credential in this binary. It goes into a header on

@@ -2,6 +2,7 @@ package app
 
 import (
 	"crypto/rand"
+	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
@@ -363,7 +364,17 @@ func handleRun(ctx *Context) *exit.Error {
 	if e != nil {
 		return e
 	}
+	worker := strings.TrimSpace(ctx.Inv.Value("--worker"))
+	if legacy := launch.LegacyFileTerm(ctx.Inv.Args[1:]); worker != "" && legacy != "" {
+		return exit.Named(exit.Usage, "remote_file_input_ambiguous",
+			"%s embeds file bytes into a JSON string and cannot name a remote input grant", legacy).
+			WithRemedy("use `--asset <field-path>=<file>`; the field path becomes the exact worker-protocol input id")
+	}
 	input, e := launch.ParsePayload(ep, ctx.Inv.Args[1:], ctx.Inv.Value("--in"))
+	if e != nil {
+		return e
+	}
+	input, assets, e := launch.ParseAssets(ep, input, ctx.Inv.Values["--asset"])
 	if e != nil {
 		return e
 	}
@@ -379,7 +390,7 @@ func handleRun(ctx *Context) *exit.Error {
 	began := time.Now()
 	handle, e := c.Submit(api.Submission{
 		Endpoint: target.Endpoint, Function: target.Function, Input: input,
-		Worker: strings.TrimSpace(ctx.Inv.Value("--worker")),
+		Worker: worker, LocalAssets: assets,
 	}, key)
 	if e != nil {
 		return e
@@ -578,34 +589,81 @@ func saveOutputs(ctx *Context, c *localapi.Client, life api.Lifecycle) ([]map[st
 	for _, out := range life.Outputs {
 		name := strings.ReplaceAll(out.OutputID, "/", "_") + extensionOf(out.MimeType)
 		path := filepath.Join(dir, name)
+		staging, actualDigest := "", ""
 		n, digest, e := c.Media(out.MediaID, func(body io.Reader) (int64, *exit.Error) {
-			f, err := os.Create(path)
-			if err != nil {
-				return 0, exit.Internalf("cannot write %s: %s", path, err)
+			staged, copied, actual, stageErr := stageVerifiedOutput(
+				path, out.Length, out.Digest, body)
+			if stageErr == nil {
+				staging, actualDigest = staged, actual
 			}
-			defer f.Close()
-			n, err := io.Copy(f, body)
-			if err != nil {
-				return n, exit.Internalf("cannot write %s: %s", path, err)
-			}
-			return n, nil
+			return copied, stageErr
 		})
 		if e != nil {
 			return nil, e
 		}
+		cleanup := func() { _ = os.Remove(staging) }
+		// The response header must agree too, but it is not proof of the transfer: the
+		// independent hash above is. Publication waits for BOTH checks.
+		if digest != "" && digest != actualDigest {
+			cleanup()
+			return nil, exit.Named(exit.Validation, "media_digest_mismatch",
+				"output %s served header %s but its received bytes hash to %s",
+				out.OutputID, digest, actualDigest)
+		}
+		if err := os.Rename(staging, path); err != nil {
+			cleanup()
+			return nil, exit.Internalf("cannot publish verified output %s: %s", path, err)
+		}
 		row := map[string]string{
 			"output": out.OutputID, "path": path, "bytes": render.Bytes(n),
-			"media_id": out.MediaID, "mime": out.MimeType, "digest": out.Digest,
-		}
-		// The server declares a digest on the response; a mismatch would mean the bytes
-		// changed between the manifest and the wire, which is worth saying out loud.
-		if digest != "" && out.Digest != "" && digest != out.Digest {
-			return nil, exit.Named(exit.Validation, "media_digest_mismatch",
-				"output %s served %s where its manifest declared %s", out.OutputID, digest, out.Digest)
+			"media_id": out.MediaID, "mime": out.MimeType, "digest": actualDigest,
 		}
 		saved = append(saved, row)
 	}
 	return saved, nil
+}
+
+// stageVerifiedOutput receives into a sibling temporary, hashes the exact bytes written,
+// and checks both durable identity fields before the caller can rename it into --out.
+// The API's digest header is a restatement of the record; it cannot replace this read.
+func stageVerifiedOutput(path string, expectedLength int64, expectedDigest string,
+	body io.Reader) (staging string, length int64, digest string, e *exit.Error) {
+	f, err := os.CreateTemp(filepath.Dir(path), "."+filepath.Base(path)+".staging-*")
+	if err != nil {
+		return "", 0, "", exit.Internalf("cannot stage %s: %s", path, err)
+	}
+	staging = f.Name()
+	stagingPath := staging
+	keep := false
+	defer func() {
+		if !keep {
+			_ = os.Remove(stagingPath)
+		}
+	}()
+	hash := sha256.New()
+	length, err = io.Copy(io.MultiWriter(f, hash), body)
+	if err == nil {
+		err = f.Sync()
+	}
+	if closeErr := f.Close(); err == nil {
+		err = closeErr
+	}
+	if err != nil {
+		return "", length, "", exit.Internalf("cannot stage %s: %s", path, err)
+	}
+	digest = "sha256:" + hex.EncodeToString(hash.Sum(nil))
+	if length != expectedLength {
+		return "", length, digest, exit.Named(exit.Validation, "media_length_mismatch",
+			"output %s received %d B where its manifest declared %d B",
+			filepath.Base(path), length, expectedLength)
+	}
+	if digest != expectedDigest {
+		return "", length, digest, exit.Named(exit.Validation, "media_digest_mismatch",
+			"output %s received %s where its manifest declared %s",
+			filepath.Base(path), digest, expectedDigest)
+	}
+	keep = true
+	return staging, length, digest, nil
 }
 
 // extensionOf names a file from the type the OUTPUT MANIFEST declared. An unknown or

@@ -72,6 +72,11 @@ func (c Credentials) Admits(presented string) bool {
 	return browser || cli
 }
 
+// AdmitsCLI is the narrower authority check for operations that may read the caller's
+// filesystem. A browser bearer can drive ordinary request lifecycle routes, but it must
+// never name host paths; a future browser asset surface has to upload selected bytes.
+func (c Credentials) AdmitsCLI(presented string) bool { return c.CLI.Equal(presented) }
+
 // ClientCredential is the CLI side of the 0600 handoff (cl-010, the file's first reader).
 // It is deliberately here and not in the client package: this file is the credential's
 // carrier site, so the raw value is read where it becomes a carrier and nowhere else —

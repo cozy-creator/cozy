@@ -127,7 +127,7 @@ func (w wireRental) rental(id string) Rental {
 // same pod again. A placement preference is not a hardware choice and it is not policy —
 // it is the one fact about a rental that the renter, and only the renter, may have
 // evidence for.
-func (c *Client) Rent(ctx context.Context, endpoint, card, region, tokenSHA256, reason string) (Rental, *exit.Error) {
+func (c *Client) Rent(ctx context.Context, endpoint, card, region, tokenSHA256, reason, operationKey string) (Rental, *exit.Error) {
 	body := map[string]any{
 		"endpoint": endpoint, "card": card,
 		"renter_token_sha256": []string{tokenSHA256},
@@ -137,7 +137,8 @@ func (c *Client) Rent(ctx context.Context, endpoint, card, region, tokenSHA256, 
 	}
 	var out wireRental
 	e := c.do(ctx, call{
-		method: http.MethodPost, path: "/v1/private-rentals", admin: true, reason: reason, body: body,
+		method: http.MethodPost, path: "/v1/private-rentals", admin: true, reason: reason,
+		idempotency: operationKey, body: body,
 	}, &out)
 	if e != nil {
 		return Rental{}, e

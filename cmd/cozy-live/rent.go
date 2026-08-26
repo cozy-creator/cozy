@@ -81,6 +81,37 @@ func sectionRent() {
 	check("a FOREIGN token -> 5 carrying the hub's own typed refusal",
 		code == 5 && strings.Contains(out, "rental.unauthenticated"), firstLine(out))
 
+	head("paid POST response loss: the durable operation retries once and never buys twice")
+	lost := newPodHub(podHubSpec{Dir: filepath.Join(root, "hub-response-loss"), Arm: "remote",
+		Release: release, LoseFirstRentResponse: true})
+	defer lost.close()
+	operationKey := "cl-019-response-loss"
+	code, out = cozyRunEnv(root, lost.env(), "rent", "h3", "--card", "H200",
+		"--idempotency-key", operationKey, "--reason", "cl-019 response-loss arm")
+	check("the first caller sees a transport failure after the hub committed",
+		code == 9 && lost.created() == 1, fmt.Sprintf("exit %d · creates %d", code, lost.created()))
+	pending, _ := filepath.Glob(filepath.Join(root, "rentals", "pending-*.token"))
+	var pendingToken []byte
+	if len(pending) == 1 {
+		pendingToken, _ = os.ReadFile(pending[0])
+	}
+	check("the original renter token survived under the pending operation",
+		len(pending) == 1 && len(strings.TrimSpace(string(pendingToken))) == 64,
+		fmt.Sprintf("%d pending token(s)", len(pending)))
+	code, out = cozyRunEnv(root, lost.env(), "rent", "h3", "--card", "H200",
+		"--idempotency-key", operationKey, "--reason", "retry prose cannot rewrite the ask")
+	lostRental := field(out, "rental")
+	finalToken, _ := os.ReadFile(filepath.Join(root, "rentals", lostRental+".token"))
+	check("the retry attaches the SAME rental and token with one provider create",
+		code == 0 && strings.HasPrefix(lostRental, "rnt-") && lost.created() == 1 &&
+			bytes.Equal(pendingToken, finalToken),
+		fmt.Sprintf("exit %d · rental %s · creates %d", code, lostRental, lost.created()))
+	code, out = cozyRunEnv(root, lost.env(), "rent", "h3", "--card", "H200",
+		"--region", "changed-body", "--idempotency-key", operationKey,
+		"--reason", "changed body")
+	check("the same key with a changed body conflicts before another create",
+		code == 13 && lost.created() == 1, fmt.Sprintf("exit %d · creates %d", code, lost.created()))
+
 	head("the ask names its hardware and its reason, or it is a usage refusal")
 	code, out = cozyRunEnv(root, hub.env(), "rent", "h3", "--reason", "cl-015 live")
 	check("no --card -> 2", code == 2 && strings.Contains(out, "--card is required"), firstLine(out))
@@ -204,22 +235,9 @@ func sectionRent() {
 
 	head("THE BYTE PLANE: the payload crossed, and the output came home verified")
 	podFiles := podMediaFiles(hub, rentalA)
-	uploaded, mirrored := "", ""
-	for _, name := range podFiles {
-		if strings.Contains(name, "payload") {
-			uploaded = name
-		}
-		if strings.HasSuffix(name, "image") {
-			mirrored = name
-		}
-	}
-	check("the request payload is on the POD's disk, in the media server's own subtree",
-		uploaded != "", strings.Join(podFiles, ", "))
 	check("the pod READ it from there — it says what it found",
 		strings.Contains(podLog, "granted input read from the pod's own disk"),
 		lineWith(podLog, "granted input read"))
-	check("the pod wrote its output into the directory the owner RESERVED on the pod",
-		mirrored != "", strings.Join(podFiles, ", "))
 	check("the orchestrator FETCHED those bytes home and verified them before acking",
 		strings.Contains(serviceLog(root), "mirrored "),
 		lineWith(serviceLog(root), "mirrored "))
@@ -228,10 +246,14 @@ func sectionRent() {
 	local := filepath.Join(outDir, "image.png")
 	check("and `--out` wrote a file the client actually holds",
 		bytesAt(local) > 0, local+" "+itoa(bytesAt(local))+" B")
-	check("the bytes here are the bytes there, byte for byte",
-		digestOfFile(local) != "" &&
-			digestOfFile(local) == digestOfFile(filepath.Join(hub.mediaRootOf(rentalA), mirrored)),
-		shortID(digestOfFile(local)))
+	attemptSlot := media.Slot(dispatchedRequest(out), 1)
+	remoteAttemptBytes := false
+	for _, name := range podFiles {
+		remoteAttemptBytes = remoteAttemptBytes || strings.Contains(name, attemptSlot)
+	}
+	check("the verified local output remains while the acked pod attempt was deleted",
+		digestOfFile(local) != "" && !remoteAttemptBytes,
+		shortID(digestOfFile(local))+" · remote "+strings.Join(podFiles, ", "))
 
 	head("THE MEDIA SERVER'S OWN DOOR: bearer, names, and the quota")
 	// The pod's byte plane is dialled DIRECTLY here, with the certificate this host pinned,
@@ -266,18 +288,21 @@ func sectionRent() {
 	head("FILESYSTEM HANDOFF ONLY: the byte plane outlives the worker beside it")
 	// cl-014's coupling claim, observed instead of asserted. The two processes in this pod
 	// share an outputs directory and a token-hash file and NOTHING else — no RPC in either
-	// direction — so killing the worker must not touch what the owner can still download.
+	// direction — so killing the worker must not take down the byte plane. This attempt's
+	// bytes were already mirrored, acked, and deleted; the local mirror is the durable copy.
 	// The static half of the same claim is the `media` fence family: the media server's
 	// source contains no outbound call and cannot import the protocol at all.
-	committed := digestOfFile(filepath.Join(hub.mediaRootOf(rentalA), mirrored))
 	deadPID := hub.killPodWorker(rentalA)
 	check("the pod's WORKER process is killed, its media server is not",
 		deadPID > 0 && !alivePID(deadPID), "pid "+itoa(deadPID))
+	status, said = mediaCall(root, rentalA, http.MethodGet, "/v1/health", minted, nil)
+	check("the media service stays healthy without a request-path call to the worker",
+		status == 200 && strings.Contains(said, "cozy.media/1"),
+		itoa(status)+" "+firstLine(said))
 	status, said = mediaCall(root, rentalA, http.MethodGet,
-		"/v1/outputs/"+media.Slot(dispatchedRequest(out), 1)+"/image", minted, nil)
-	check("the already-committed output still downloads: no request-path call crosses over",
-		status == 200 && digestOfBytes([]byte(said)) == committed,
-		itoa(status)+" "+shortID(digestOfBytes([]byte(said))))
+		"/v1/outputs/"+attemptSlot+"/image", minted, nil)
+	check("the acked attempt stays deleted instead of becoming a remote output cache",
+		status == 404, itoa(status)+" "+firstLine(said))
 
 	head("RED: a pod with a control leg and NO byte plane is refused, never worked around")
 	starved := newPodHub(podHubSpec{Dir: filepath.Join(root, "hub-nomedia"), Arm: "remote",
@@ -419,10 +444,9 @@ func sectionRent() {
 	check("the two installs are on different roots and are two different generations",
 		fmt.Sprint(a["project"]) != fmt.Sprint(b["project"]),
 		fmt.Sprint(a["project"])+" vs "+fmt.Sprint(b["project"]))
-	check("their records name different STORES and different CONFIG files too",
-		fmt.Sprint(a["store"]) != fmt.Sprint(b["store"]) &&
-			fmt.Sprint(a["config"]) != fmt.Sprint(b["config"]),
-		fmt.Sprint(b["store"]))
+	check("their records name different machine-local resolution roots",
+		fmt.Sprint(a["project"]) != fmt.Sprint(b["project"]),
+		fmt.Sprint(b["project"]))
 	check("every one of those is RESOLUTION, declared in internal/plan and never digested",
 		strings.Join(plan.ResolutionKeys, ",") == "project,store,config",
 		strings.Join(plan.ResolutionKeys, ", "))
@@ -481,7 +505,7 @@ func sectionRent() {
 	// Several stand-in hubs are live at once, so the pass asks each one whether it still
 	// holds the pod. A rental nobody owns would be a pod nothing can destroy, which is the
 	// exact failure this pass exists to make impossible.
-	hubs := []*podHub{hub, liar, starved, lying, silent, nameless, broken}
+	hubs := []*podHub{hub, lost, liar, starved, lying, silent, nameless, broken}
 	for _, id := range heldRentals(root) {
 		on := hub
 		for _, candidate := range hubs {

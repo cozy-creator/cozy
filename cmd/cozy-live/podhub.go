@@ -4,6 +4,7 @@ import (
 	"crypto/ecdsa"
 	"crypto/elliptic"
 	"crypto/rand"
+	"crypto/sha256"
 	"crypto/x509"
 	"crypto/x509/pkix"
 	"encoding/json"
@@ -67,6 +68,11 @@ type podRental struct {
 	MediaPID  int
 }
 
+type podRentalOperation struct {
+	digest [32]byte
+	rental *podRental
+}
+
 // bareHash is the hub field's shape: 64 lowercase hex, no prefix.
 var bareHash = regexp.MustCompile(`^[0-9a-f]{64}$`)
 
@@ -81,9 +87,12 @@ type podHub struct {
 	pods string
 	// arm is what the provisioned worker plays. The pod side is a peer with its own
 	// behaviour, so the hub picks it once and every pod it provisions runs it.
-	arm     string
-	rentals map[string]*podRental
-	deleted map[string]bool
+	arm        string
+	rentals    map[string]*podRental
+	deleted    map[string]bool
+	operations map[string]podRentalOperation
+	creates    int
+	dropped    map[string]bool
 	// fail makes every pod this hub provisions end `failed`. It is the arm for a rental
 	// that never comes up, which a client must answer for rather than wait out.
 	fail bool
@@ -94,6 +103,9 @@ type podHub struct {
 	// noInstance provisions a pod whose worker declares NO instance identity — the shape
 	// this stand-in had by accident until a real pod showed it was a shape at all.
 	noInstance bool
+	// loseFirstRentResponse commits the first operation and then closes the HTTP stream
+	// without an answer. A correct caller retries the same key and sees the same rental.
+	loseFirstRentResponse bool
 	// release is what the provisioned worker DECLARES on ClaimAck. A real hub installs the
 	// release the renter asked for and the pod says which; this stand-in is told, so the
 	// owner's release pin has both a matching pod to accept and a lying one to refuse
@@ -117,7 +129,8 @@ type podHubSpec struct {
 	// NoInstance: a worker that will not say WHICH worker it is. A real pod always
 	// does — it was started with an instance identity — so this is a peer defect, and
 	// an owner that admitted it could not attribute a terminal to anything.
-	NoInstance bool
+	NoInstance            bool
+	LoseFirstRentResponse bool
 }
 
 func startPodHub(dir, arm string, fail bool) *podHub {
@@ -130,8 +143,10 @@ func newPodHub(spec podHubSpec) *podHub {
 	h := &podHub{
 		token: randomHex(16), // an opaque admin credential; its shape is the hub's
 		dir:   dir, pods: filepath.Join(dir, "pod-fs"), arm: arm,
-		rentals: map[string]*podRental{}, deleted: map[string]bool{}, fail: spec.Fail,
+		rentals: map[string]*podRental{}, deleted: map[string]bool{},
+		operations: map[string]podRentalOperation{}, dropped: map[string]bool{}, fail: spec.Fail,
 		noMedia: spec.NoMedia, noInstance: spec.NoInstance, releaseID: spec.Release,
+		loseFirstRentResponse: spec.LoseFirstRentResponse,
 	}
 	must("creating the pod-side filesystem", os.MkdirAll(h.pods, 0o755))
 	ln, err := net.Listen("tcp", "127.0.0.1:0") //cozy:allow the DRIVER hosts a stand-in hub; the product binds through internal/api
@@ -182,6 +197,12 @@ func (h *podHub) live() int {
 	return len(h.rentals)
 }
 
+func (h *podHub) created() int {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return h.creates
+}
+
 // admits is the credential check, spelled the way the real hub's is: a first-party route
 // with the wrong bearer is 401 with a TYPED envelope, and the client's exit code is the
 // matrix's, not this hub's status.
@@ -211,6 +232,13 @@ func (h *podHub) rent(w http.ResponseWriter, r *http.Request) {
 	if r.Header.Get("X-Tensorhub-Reason") == "" {
 		refuse(w, http.StatusBadRequest, "reason_required",
 			"a mutation is recorded with a reason before it happens", "pass --reason <why>")
+		return
+	}
+	operationKey := strings.TrimSpace(r.Header.Get("Idempotency-Key"))
+	if operationKey == "" || len(operationKey) > 200 {
+		refuse(w, http.StatusBadRequest, "rental.idempotency_key_required",
+			"a rental requires an Idempotency-Key of at most 200 bytes",
+			"retry one paid request with the same caller-owned key")
 		return
 	}
 	raw, err := io.ReadAll(http.MaxBytesReader(w, r.Body, 1<<16))
@@ -263,18 +291,43 @@ func (h *podHub) rent(w http.ResponseWriter, r *http.Request) {
 			"a pod provisioned with no credential is a pod nobody could ever reach")
 		return
 	}
+	digest := sha256.Sum256(raw)
+	h.mu.Lock()
+	if prior, ok := h.operations[operationKey]; ok {
+		if prior.digest != digest {
+			h.mu.Unlock()
+			refuse(w, http.StatusConflict, "rental.idempotency_conflict",
+				"this Idempotency-Key already names a different rental request",
+				"reuse a key only with the exact same request body")
+			return
+		}
+		rec := prior.rental
+		state := rec.State
+		h.mu.Unlock()
+		writeRentalAccepted(w, rec.ID, state)
+		return
+	}
 	id := "rnt-" + randomHex(8)
 	rec := &podRental{ID: id, State: "provisioning", PodID: "pod-" + randomHex(6),
 		Hashes: body.TokenSHA256,
 		Detail: "asking the provider for " + body.Card}
-	h.mu.Lock()
 	h.rentals[id] = rec
+	h.operations[operationKey] = podRentalOperation{digest: digest, rental: rec}
+	h.creates++
+	drop := h.loseFirstRentResponse && !h.dropped[operationKey]
+	h.dropped[operationKey] = true
 	h.mu.Unlock()
 	go h.provision(rec)
+	if drop {
+		panic(http.ErrAbortHandler)
+	}
+	writeRentalAccepted(w, rec.ID, "provisioning")
+}
 
+func writeRentalAccepted(w http.ResponseWriter, id, state string) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusAccepted)
-	_ = json.NewEncoder(w).Encode(map[string]any{"rental_id": id, "state": rec.State})
+	_ = json.NewEncoder(w).Encode(map[string]any{"rental_id": id, "state": state})
 }
 
 // provision mints the pod's identity and starts the worker that hosts it. The real hub
@@ -379,9 +432,10 @@ func (h *podHub) provision(rec *podRental) {
 			"--tokens", tokenFile,
 			"--out", runRoot,
 			"--tls-cert", certPath, "--tls-key", keyPath,
-			// A small quota on purpose: the arm that fills it is cheap, and a media
-			// subtree is separately bounded so an upload can never ENOSPC the journal.
-			"--quota", "4194304")
+			// The quota must admit the exact 64 MiB output reservation the product grants.
+			// The separate 4 MiB body bound keeps the oversize red arm cheap without
+			// under-provisioning every ordinary attempt before its offer exists.
+			"--quota", "134217728", "--max-body", "4194304")
 		mediaLog, err := os.Create(filepath.Join(runRoot, "pod-media.log"))
 		must("the pod media log", err)
 		media.Stdout, media.Stderr = mediaLog, mediaLog

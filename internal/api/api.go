@@ -57,8 +57,8 @@ import (
 	"github.com/cozy-creator/cozy-creator-v2/internal/records"
 )
 
-// MaxBody caps a submitted request body. The contract carries typed inputs, not assets;
-// an asset arrives as a model reference or, later, as its own upload route.
+// MaxBody caps a submitted request body. Asset bytes never ride JSON: the local extension
+// names files the service ingests, while a network host uses its own upload surface.
 const MaxBody = 8 << 20
 
 // Server is the local client API. One per LocalService.
@@ -310,6 +310,12 @@ func (s *Server) authenticated(r *http.Request) bool {
 		return false
 	}
 	return s.creds.Admits(presented)
+}
+
+func (s *Server) cliAuthenticated(r *http.Request) bool {
+	header := r.Header.Get("Authorization")
+	presented, ok := strings.CutPrefix(header, "Bearer ")
+	return ok && s.creds.AdmitsCLI(presented)
 }
 
 // ---------------------------------------------------------------- the error envelope
