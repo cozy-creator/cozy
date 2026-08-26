@@ -8,6 +8,7 @@ import (
 	"strings"
 	"time"
 
+	"google.golang.org/grpc/metadata"
 	"google.golang.org/protobuf/types/known/emptypb"
 
 	"github.com/cozy-creator/cozy-creator-v2/internal/canonical"
@@ -190,6 +191,21 @@ func (c *Coordinator) onRegister(stream pb.Worker_ControlServer, r *pb.Register,
 		return reject(pb.RegisterRejection_REGISTER_REJECTION_STALE_SESSION,
 			fmt.Sprintf("pid %d is not the process this LocalService started for %s (pid %d)",
 				pid, r.InstanceId, want))
+	}
+	// Where the transport carries no kernel identity (Windows loopback), the per-spawn
+	// bootstrap credential is the substitute: only the child this launcher handed it to
+	// can echo it. The value never appears in a log — a mismatch is reported as a fact.
+	if w.bootstrap.Present() {
+		got := ""
+		if md, ok := metadata.FromIncomingContext(stream.Context()); ok {
+			if vals := md.Get("cozy-bootstrap"); len(vals) > 0 {
+				got = vals[0]
+			}
+		}
+		if !w.bootstrap.Equal(got) {
+			return reject(pb.RegisterRejection_REGISTER_REJECTION_STALE_SESSION,
+				"the bootstrap credential for "+r.InstanceId+" was absent or wrong")
+		}
 	}
 	if bound != "" && bound != r.SessionId {
 		return reject(pb.RegisterRejection_REGISTER_REJECTION_SESSION_COLLISION,

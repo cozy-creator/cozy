@@ -23,8 +23,13 @@ func setProcessGroup(cmd *exec.Cmd) {
 }
 
 // adoptProcessGroup has nothing to do here: the group was established at fork. It exists
-// because Windows cannot attach its equivalent until the process is running.
-func adoptProcessGroup(cmd *exec.Cmd) {}
+// because Windows cannot attach its equivalent until the process is running, and it can
+// fail there — which is why it returns an error the spawn treats as fatal (#449).
+func adoptProcessGroup(cmd *exec.Cmd) error { return nil }
+
+// releaseGroup has nothing to hold here either: a Unix group is a kernel fact that dies
+// with its members, not a handle this process keeps.
+func releaseGroup(pid int) {}
 
 // killGroup signals the whole group. A NEGATIVE pid is the group, and that is the point:
 // signalling the leader alone leaves its children running.

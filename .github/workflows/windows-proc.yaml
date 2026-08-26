@@ -1,0 +1,41 @@
+# The Windows PROCESS-MODEL proof (#449, cr-020 Half 1): the coordinator's live arm
+# suites and the up/down journey on a hosted windows-latest runner. Not one step touches a
+# card — device facts are cr-020's deferred Half 2 on rented consumer GPUs.
+#
+# Dispatch-only: this is an evidence run someone reads, not a gate.
+name: windows-proc
+on: [workflow_dispatch]
+jobs:
+  proc:
+    runs-on: windows-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: stable
+      - run: go vet ./...
+      - run: gofmt -l . ; if (gofmt -l . | Where-Object { $_ -notmatch 'vendor' }) { exit 1 }
+      # The three in-process suites: spawn (CREATE_SUSPENDED -> job adoption -> resume),
+      # Register over the LOOPBACK transport with the per-spawn bootstrap credential,
+      # dispatch/terminal/ack, the two-tier stop (CTRL_BREAK -> TerminateJobObject),
+      # Windows birth identity, and reconcile — against the Go fake worker.
+      - run: go run ./cmd/cozy-live arms
+      - run: go run ./cmd/cozy-live apiarms
+      - run: go run ./cmd/cozy-live verbs
+      # The service journey: detach, probe by lock, cooperative down over the shutdown
+      # route, exit proved by the lock — the tier order #449 mandates.
+      - shell: pwsh
+        run: |
+          $env:COZY_HOME = Join-Path $env:RUNNER_TEMP "cozy-home"
+          New-Item -ItemType Directory -Force -Path $env:COZY_HOME | Out-Null
+          go build -o cozy.exe ./cmd/cozy
+          ./cozy.exe up --detach
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+          ./cozy.exe status --full
+          $down = ./cozy.exe down --full | Out-String
+          Write-Output $down
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+          if ($down -notmatch "asked over the shutdown route") {
+            Write-Error "cozy down did not take the cooperative route"; exit 1
+          }

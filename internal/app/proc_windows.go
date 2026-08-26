@@ -1,12 +1,14 @@
 //go:build windows
 
 // Detaching and signalling the LocalService, on the platform that has neither a session nor
-// a signal. Windows detaches with creation flags and ends a process by handle; `cozy down`
-// still proves the exit the same way it does everywhere — by the LOCK becoming free, never
-// by the pid disappearing.
+// a signal. Windows detaches with creation flags; `cozy down` asks cooperatively over the
+// AUTHENTICATED shutdown route (the service has no console a ctrl event could reach), and
+// only the forced tier ends the process by handle. Exit is still proved the same way it is
+// everywhere — by the LOCK becoming free, never by the pid disappearing.
 package app
 
 import (
+	"fmt"
 	"os/exec"
 	"syscall"
 
@@ -21,10 +23,14 @@ func detachProcess(cmd *exec.Cmd) {
 	}
 }
 
-// signalProcess ends ONE process. Windows has no graceful signal to send a service that is not a
-// console application, so a TERM and a KILL are the same act — the caller's timeout is what
-// distinguishes asking from insisting, and it already reads the lock rather than the pid.
+// signalProcess refuses to pretend (#449): a TERM here used to TerminateProcess, which is
+// a KILL wearing a polite name — it ended the service mid-transaction and called it
+// graceful. Now TERM reports that no cooperative signal exists (the shutdown route is the
+// cooperative path on this platform) and only an explicit KILL terminates.
 func signalProcess(pid int, sig syscall.Signal) error {
+	if sig != syscall.SIGKILL {
+		return fmt.Errorf("windows has no cooperative process signal; the shutdown route is the ask")
+	}
 	handle, err := windows.OpenProcess(windows.PROCESS_TERMINATE, false, uint32(pid))
 	if err != nil {
 		return err

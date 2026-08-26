@@ -18,6 +18,7 @@ import (
 
 	"github.com/cozy-creator/cozy-creator-v2/internal/config"
 	"github.com/cozy-creator/cozy-creator-v2/internal/exit"
+	"github.com/cozy-creator/cozy-creator-v2/internal/home"
 )
 
 // Env is the environment record: exactly what produced this generation's venv.
@@ -292,12 +293,12 @@ func firstExistingParent(p string) string {
 }
 
 func pythonVersion(venvDir string) string {
-	out := strings.TrimSpace(runOut(filepath.Join(venvDir, "bin", "python"), "-V"))
+	out := strings.TrimSpace(runOut(home.VenvPython(venvDir), "-V"))
 	return strings.TrimSpace(strings.TrimPrefix(out, "Python"))
 }
 
 func closure(venvDir string) (int, string) {
-	out := runOut("uv", "pip", "list", "--format=json", "--python", filepath.Join(venvDir, "bin", "python"))
+	out := runOut("uv", "pip", "list", "--format=json", "--python", home.VenvPython(venvDir))
 	var pkgs []struct{ Name, Version string }
 	if json.Unmarshal([]byte(out), &pkgs) != nil {
 		return 0, ""

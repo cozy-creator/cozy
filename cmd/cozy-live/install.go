@@ -10,6 +10,7 @@ import (
 	"syscall"
 
 	"github.com/cozy-creator/cozy-creator-v2/internal/config"
+	"github.com/cozy-creator/cozy-creator-v2/internal/home"
 )
 
 // installEndpoint puts the SDXL endpoint on a service root THE WAY A USER DOES: one
@@ -56,7 +57,7 @@ func installEndpoint(root string) string {
 	}
 
 	snapshot := benchSnapshot(bench)
-	python := filepath.Join(root, "generations", generation, "venv", "bin", "python")
+	python := home.VenvPython(filepath.Join(root, "generations", generation, "venv"))
 	script := `
 import sys
 from pathlib import Path

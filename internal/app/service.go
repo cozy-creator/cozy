@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/cozy-creator/cozy-creator-v2/internal/api"
+	localapi "github.com/cozy-creator/cozy-creator-v2/internal/client"
 	"github.com/cozy-creator/cozy-creator-v2/internal/coord"
 	"github.com/cozy-creator/cozy-creator-v2/internal/exit"
 	"github.com/cozy-creator/cozy-creator-v2/internal/home"
@@ -120,9 +121,14 @@ func handleUp(ctx *Context) *exit.Error {
 		return e
 	}
 
+	// The stop channel exists before the server so the shutdown route can feed it: the
+	// route is the ask a platform with no process signal still has (#449), and it takes
+	// exactly the path a SIGTERM takes.
+	stop := make(chan os.Signal, 1)
 	server := api.New(api.Options{
 		Coordinator: c, Cfg: ctx.Cfg, Creds: creds, Addr: addr,
 		Log: ctx.Out, Endpoints: resolver, Bound: bound,
+		Shutdown: func() { stop <- syscall.SIGTERM },
 	})
 	handler, e := server.Handler()
 	if e != nil {
@@ -147,7 +153,6 @@ func handleUp(ctx *Context) *exit.Error {
 		openStub(ctx, creds, addr)
 	}
 
-	stop := make(chan os.Signal, 1)
 	signal.Notify(stop, syscall.SIGINT, syscall.SIGTERM)
 	<-stop
 	fmt.Fprintln(ctx.Out, "draining endpoint processes…")
@@ -217,15 +222,12 @@ func detach(ctx *Context, port int, yield string) *exit.Error {
 		WithRemedy("its log is %s", logPath)
 }
 
+// handleDown is the three-tier stop (#449): ask cooperatively, wait under a bounded
+// deadline, and only then force. The ask has two spellings — the authenticated shutdown
+// route (exists on every platform), and the process SIGTERM as the fallback where the
+// route cannot be reached (a wedged API on a platform that has signals). Windows has no
+// cooperative signal, so there the route is the only ask and `signalProcess` says so.
 func handleDown(ctx *Context) *exit.Error {
-	timeout := 30 * time.Second
-	if v := ctx.Inv.Value("--timeout"); v != "" {
-		d, err := time.ParseDuration(v)
-		if err != nil {
-			return exit.Usagef("--timeout %q is not a duration", v)
-		}
-		timeout = d
-	}
 	st := service.Probe(ctx.Cfg)
 	if !st.Up {
 		return emit(ctx, render.Record{Kind: "service",
@@ -235,27 +237,60 @@ func handleDown(ctx *Context) *exit.Error {
 	if st.PID <= 0 {
 		return exit.Internalf("the service lock is held but names no pid")
 	}
-	if err := signalProcess(st.PID, syscall.SIGTERM); err != nil {
-		return exit.Internalf("cannot signal the LocalService (pid %d): %s", st.PID, err)
-	}
-	// The proof of exit is the LOCK becoming free, not the pid disappearing and not a
-	// timer: the kernel drops the lock when the process dies, whatever killed it.
-	deadline := time.Now().Add(timeout)
-	for time.Now().Before(deadline) {
-		if !service.Probe(ctx.Cfg).Up {
-			return emit(ctx, render.Record{Kind: "service",
-				Fields: []render.Field{{K: "service", V: "down"}, {K: "stopped_pid", V: st.PID}},
-				Notes:  []string{"the service lock is free again — the process is provably gone"}})
+	// The wait bound is the caller's --timeout when given; otherwise it is DERIVED from
+	// the service's own published cancellation budget (#434): workers drain in parallel
+	// under one StopGrace, and the service's own teardown plus lock release is bounded by
+	// the same budget again — so two StopGrace windows, not a number invented here.
+	timeout := 2 * coord.StopGrace
+	if v := ctx.Inv.Value("--timeout"); v != "" {
+		d, err := time.ParseDuration(v)
+		if err != nil {
+			return exit.Usagef("--timeout %q is not a duration", v)
 		}
-		time.Sleep(50 * time.Millisecond)
+		timeout = d
 	}
+	asked := ""
+	if cl, e := localapi.Open(ctx.Cfg, st); e == nil {
+		if e := cl.ShutdownService(); e == nil {
+			asked = "the shutdown route"
+		}
+	}
+	if asked == "" {
+		if err := signalProcess(st.PID, syscall.SIGTERM); err == nil {
+			asked = "SIGTERM"
+		}
+	}
+	if asked != "" {
+		// The proof of exit is the LOCK becoming free, not the pid disappearing and not
+		// a timer: the kernel drops the lock when the process dies, whatever killed it.
+		deadline := time.Now().Add(timeout)
+		for time.Now().Before(deadline) {
+			if !service.Probe(ctx.Cfg).Up {
+				return emit(ctx, render.Record{Kind: "service",
+					Fields: []render.Field{{K: "service", V: "down"}, {K: "stopped_pid", V: st.PID}},
+					Notes: []string{fmt.Sprintf(
+						"asked over %s; the service lock is free again — the process is provably gone", asked)}})
+			}
+			time.Sleep(50 * time.Millisecond)
+		}
+	}
+	// The forced tier. After a KILL the kernel frees the lock at process death, so a
+	// further wait observes only that; one more StopGrace bounds it, and a process that
+	// survives a KILL that long is REPORTED, not waited on forever.
 	_ = signalProcess(st.PID, syscall.SIGKILL)
-	hard := time.Now().Add(5 * time.Second)
+	hard := time.Now().Add(coord.StopGrace)
 	for time.Now().Before(hard) && service.Probe(ctx.Cfg).Up {
 		time.Sleep(50 * time.Millisecond)
 	}
+	why := fmt.Sprintf("the cooperative drain over %s exceeded %s; the process was killed", asked, timeout)
+	if asked == "" {
+		why = "no cooperative channel could be reached (route unreachable, no signal on this platform); " +
+			"the process was killed"
+	}
+	if service.Probe(ctx.Cfg).Up {
+		return exit.Internalf("the LocalService (pid %d) survived a kill; its lock is still held", st.PID)
+	}
 	return emit(ctx, render.Record{Kind: "service",
 		Fields: []render.Field{{K: "service", V: "down"}, {K: "stopped_pid", V: st.PID}},
-		Notes: []string{fmt.Sprintf("the cooperative drain exceeded %s; the process group was killed",
-			timeout)}})
+		Notes:  []string{why}})
 }

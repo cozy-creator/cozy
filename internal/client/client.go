@@ -302,6 +302,14 @@ func (c *Client) StopWorker(instance string) (StopResult, *exit.Error) {
 	return res, e
 }
 
+// ShutdownService is `cozy down`'s cooperative ask (#449): the authenticated route that
+// takes the same path a SIGTERM takes. The 202 means the ask was DELIVERED; the exit is
+// proved by the service lock, which the caller watches.
+func (c *Client) ShutdownService() *exit.Error {
+	var out map[string]any
+	return c.call("POST", "/v1/local/service/shutdown", map[string]any{}, &out)
+}
+
 // Doctor is the host/service document, verbatim. cozy-creator renders it; it derives
 // nothing the server already answered.
 func (c *Client) Doctor() (map[string]any, *exit.Error) {

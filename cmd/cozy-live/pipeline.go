@@ -11,6 +11,8 @@ import (
 	"path/filepath"
 	"strings"
 	"time"
+
+	"github.com/cozy-creator/cozy-creator-v2/internal/home"
 )
 
 // cl-003's M4 proof: an SDXL-CLASS ENDPOINT SERVES LOCALLY, through the product.
@@ -90,7 +92,7 @@ func installPipeline(root, endpoint, ref, lane string, snapshots map[string]stri
 
 	blob, err := json.Marshal(snapshots)
 	must("rendering the component snapshots", err)
-	python := filepath.Join(root, "generations", generation, "venv", "bin", "python")
+	python := home.VenvPython(filepath.Join(root, "generations", generation, "venv"))
 	cmd := exec.Command("/usr/bin/nice", "-n", "19", python, "-c", rowScript,
 		root, filepath.Join(pipeWork, "store"),
 		filepath.Join(pipeWork, "pipeline.config.json"), ref, lane, string(blob))
@@ -451,7 +453,7 @@ func comparePixels(root, mine, banked string) {
 	if err != nil || len(generations) == 0 {
 		return
 	}
-	python := filepath.Join(root, "generations", generations[0].Name(), "venv", "bin", "python")
+	python := home.VenvPython(filepath.Join(root, "generations", generations[0].Name(), "venv"))
 	cmd := exec.Command("/usr/bin/nice", "-n", "19", python, "-c", diffScript, banked, mine)
 	cmd.Env = childEnv(root)
 	out, err := cmd.CombinedOutput()

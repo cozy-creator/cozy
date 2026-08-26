@@ -21,7 +21,6 @@ import (
 	"fmt"
 	"io"
 	"net"
-	"os"
 	"sync"
 	"time"
 
@@ -83,6 +82,9 @@ type Coordinator struct {
 
 	grpc     *grpc.Server
 	listener net.Listener
+	// dialAddr is what workers are handed as `--socket`: the unix socket path, or the
+	// loopback address the Windows listener actually bound.
+	dialAddr string
 
 	// drainMu serializes the dispatch queue's drain. It is separate from `mu` because a
 	// drain dispatches — it talks to the store and to a session — and holding the state
@@ -140,16 +142,16 @@ func Open(opt Options) (*Coordinator, *exit.Error) {
 		stalls:   map[string]time.Time{},
 		frames:   newFanout(),
 	}
-	// A stale socket file is a leftover, never evidence: the service lock already proved
-	// no live owner exists on this root, so removing it is safe and required.
-	_ = os.Remove(opt.Socket)
-	ln, err := net.Listen("unix", opt.Socket)
-	if err != nil {
-		return nil, exit.New(exit.Conflict, "cannot bind the worker socket %s: %s", opt.Socket, err).
-			WithRemedy("another LocalService may own this root; `cozy status`")
+	// The transport is a platform fact (#449): a unix socket where the OS has one worth
+	// having, a loopback TCP port on Windows — `listenLocal` owns the difference and
+	// hands back the address workers dial.
+	ln, creds, dial, e := listenLocal(opt.Socket)
+	if e != nil {
+		return nil, e
 	}
 	c.listener = ln
-	c.grpc = grpc.NewServer(grpc.Creds(unixPeer{}))
+	c.dialAddr = dial
+	c.grpc = grpc.NewServer(grpc.Creds(creds))
 	pb.RegisterWorkerServer(c.grpc, &hub{c: c})
 	return c, nil
 }
@@ -164,11 +166,20 @@ func (c *Coordinator) Close(grace time.Duration) {
 	c.mu.Lock()
 	c.closing = true
 	c.mu.Unlock()
+	// Workers drain IN PARALLEL: each gets the same grace, and the whole close costs one
+	// grace window, not one per worker — a serial loop here could outlive the deadline
+	// its own caller was waiting under (#449).
+	var wg sync.WaitGroup
 	for _, w := range c.workerList() {
-		c.StopWorker(w.instanceID, grace)
+		wg.Add(1)
+		go func(id string) {
+			defer wg.Done()
+			c.StopWorker(id, grace)
+		}(w.instanceID)
 	}
+	wg.Wait()
 	c.grpc.Stop()
-	_ = os.Remove(c.opt.Socket)
+	cleanupLocal(c.opt.Socket)
 }
 
 func (c *Coordinator) workerList() []*worker {

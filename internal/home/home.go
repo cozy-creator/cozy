@@ -6,6 +6,7 @@ package home
 import (
 	"os"
 	"path/filepath"
+	"runtime"
 
 	"github.com/cozy-creator/cozy-creator-v2/internal/exit"
 )
@@ -124,4 +125,19 @@ func itoa(n uint64) string {
 		n /= 10
 	}
 	return string(buf[i:])
+}
+
+// VenvPython is the interpreter inside one venv — `bin/python` where venvs have a bin,
+// `Scripts\python.exe` on Windows. The venv's executable layout is a PLATFORM fact and
+// this is its one spelling (#449); a path built by hand with "bin" is the bug class this
+// replaces.
+func VenvPython(venvDir string) string { return VenvTool(venvDir, "python") }
+
+// VenvTool is a console script inside one venv (`cozy-runtime`, `uv`-installed
+// entrypoints), spelled for the platform the way VenvPython is.
+func VenvTool(venvDir, name string) string {
+	if runtime.GOOS == "windows" {
+		return filepath.Join(venvDir, "Scripts", name+".exe")
+	}
+	return filepath.Join(venvDir, "bin", name)
 }

@@ -144,6 +144,24 @@ func (s *Server) stopWorker(w http.ResponseWriter, r *http.Request) {
 	s.ok(w, r, http.StatusOK, map[string]any{"instance_id": instance, "stopped": true})
 }
 
+// shutdownService is `cozy down`'s COOPERATIVE tier (#449): an authenticated ask that the
+// service drain every worker and exit — the same act the Unix SIGTERM performs, spelled as
+// a route so it exists on every platform (Windows has no signal to send a detached
+// service). The reply races the exit deliberately: it is sent before the drain starts, and
+// the caller's proof of completion is the service LOCK becoming free, never this body.
+func (s *Server) shutdownService(w http.ResponseWriter, r *http.Request) {
+	if s.shutdown == nil {
+		s.refuse(w, r, http.StatusConflict, "conflict",
+			"this server was built with no shutdown hook", "")
+		return
+	}
+	s.ok(w, r, http.StatusAccepted, map[string]any{
+		"shutting_down": true,
+		"note":          "draining workers; the service lock frees when the exit is complete",
+	})
+	go s.shutdown()
+}
+
 func (s *Server) doctor(w http.ResponseWriter, r *http.Request) {
 	counts, _ := s.store.Counts()
 	head, _ := s.store.LastEventSeq()

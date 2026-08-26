@@ -8,6 +8,7 @@ import (
 	"strings"
 
 	"github.com/cozy-creator/cozy-creator-v2/internal/exit"
+	"github.com/cozy-creator/cozy-creator-v2/internal/home"
 )
 
 // The LOCAL ARTIFACT INDEX, read through the runtime's own `list` verb.
@@ -46,7 +47,7 @@ func (a Artifact) Components() []string {
 // Every question this host asks the runtime goes through here, so there is one place
 // that knows how to invoke it and one place that renders its refusals.
 type Runtime struct {
-	Bin  string   // <generation>/venv/bin/cozy-runtime
+	Bin  string   // the generation venv's cozy-runtime (home.VenvTool spells the platform)
 	Dir  string   // the endpoint project root
 	Home string   // COZY_HOME the runtime reads its artifact index out of
 	Env  []string // the allowlisted child environment (config.Tool)
@@ -56,7 +57,7 @@ type Runtime struct {
 // whose venv provides none (cl-009's `runtime_missing`), so this is the same claim,
 // re-asserted where it is used.
 func Binary(generationDir string) string {
-	return filepath.Join(generationDir, "venv", "bin", "cozy-runtime")
+	return home.VenvTool(filepath.Join(generationDir, "venv"), "cozy-runtime")
 }
 
 // json runs one verb and decodes its `--json` document.

@@ -77,6 +77,10 @@ type Server struct {
 	// endpoints resolves an endpoint ref to a spec the coordinator can start. It is the
 	// LOCAL module's resolver; the pod profile (cl-014) supplies its own.
 	endpoints Resolver
+
+	// shutdown asks the process that owns this server to drain and exit — `cozy down`'s
+	// cooperative tier (#449). The route refuses when the builder wired none.
+	shutdown func()
 }
 
 // Resolver turns `org/name` into the spec that makes its worker resident. cl-010's
@@ -100,6 +104,8 @@ type Options struct {
 	Log         io.Writer
 	Endpoints   Resolver
 	Bound       []string
+	// Shutdown is the cooperative-exit hook the shutdown route calls (#449).
+	Shutdown func()
 }
 
 // New builds the server and its route table. It binds nothing; Listeners does that.
@@ -111,6 +117,7 @@ func New(opt Options) *Server {
 		coord: opt.Coordinator, store: opt.Coordinator.Store(),
 		layout: opt.Coordinator.Layout(), cfg: opt.Cfg, creds: opt.Creds,
 		addr: opt.Addr, log: opt.Log, endpoints: opt.Endpoints, bound: opt.Bound,
+		shutdown: opt.Shutdown,
 	}
 }
 
@@ -133,6 +140,7 @@ func (s *Server) Handler() (http.Handler, *exit.Error) {
 		"POST /v1/local/workers":                      s.startWorker,
 		"DELETE /v1/local/workers/{instance_id}":      s.stopWorker,
 		"GET /v1/local/doctor":                        s.doctor,
+		"POST /v1/local/service/shutdown":             s.shutdownService,
 		"GET /v1/local/attempts/{attempt_key}/triage": s.triage,
 		"POST /v1/local/jobs":                         s.submitJob,
 		"GET /v1/local/jobs":                          s.listJobs,

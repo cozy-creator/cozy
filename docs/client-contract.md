@@ -206,6 +206,7 @@ none of these.
 | `POST /v1/local/workers` | local | yes | make one endpoint resident (idempotent); `{"endpoint":…, "warm":false}` skips the boot warm pass |
 | `DELETE /v1/local/workers/{instance_id}` | local | yes | drain and stop the process group |
 | `GET /v1/local/doctor` | local | yes | host facts, bound families, counts |
+| `POST /v1/local/service/shutdown` | local | yes | ask the service to drain every worker and exit (`cozy down`'s cooperative tier); exit is proved by the service lock, never this reply |
 | `GET /v1/local/attempts/{attempt_key}/triage` | local | yes | the retained WorkerTriageBundle |
 | `POST /v1/local/jobs` | local | yes | submit one bounded job; `Idempotency-Key`; 202 with the handle and its publication repo |
 | `GET /v1/local/jobs` | local | yes | jobs newest-first with per-state counts; `?status=`, `?endpoint=` |

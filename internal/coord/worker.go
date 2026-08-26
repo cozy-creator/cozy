@@ -15,6 +15,7 @@ import (
 	"github.com/cozy-creator/cozy-creator-v2/internal/canonical"
 	"github.com/cozy-creator/cozy-creator-v2/internal/exit"
 	"github.com/cozy-creator/cozy-creator-v2/internal/records"
+	"github.com/cozy-creator/cozy-creator-v2/internal/secret"
 	pb "github.com/cozy-creator/cozy-creator-v2/protocol/cozy/worker/v1"
 )
 
@@ -166,8 +167,11 @@ type worker struct {
 	// exitCode is the process's own disposition. RECYCLE is not a death (cr-009): a
 	// run-once job worker exits with it the moment its terminal is acknowledged, and
 	// reading that as "the worker died" turns a completed job into a failed request.
-	exitCode    int
-	pid         int // the process THIS coordinator started; the only one that may register
+	exitCode int
+	pid      int // the process THIS coordinator started; the only one that may register
+	// bootstrap is the per-spawn credential on transports with no kernel peer identity
+	// (Windows loopback); empty where SO_PEERCRED answers instead.
+	bootstrap   secret.Value
 	sessionID   string
 	incarnation uint64
 	epoch       uint64
@@ -262,7 +266,7 @@ func (c *Coordinator) StartWorker(spec EndpointSpec) (string, *exit.Error) {
 	// into the supervisor's own `--hub`/`--root`.
 	args := append([]string{}, spec.Args...)
 	args = append(args,
-		"--socket", c.opt.Socket,
+		"--socket", c.dialAddr,
 		"--out", filepath.Join(root, "run"),
 		"--instance-id", instanceID,
 		"--release-id", spec.ReleaseID,
@@ -276,16 +280,26 @@ func (c *Coordinator) StartWorker(spec EndpointSpec) (string, *exit.Error) {
 	cmd.Dir = spec.Dir
 	// The child's whole environment: the allowlist plus the values THIS launcher
 	// imposes. COZY_HOME points the worker at its own staged records and nothing else.
-	cmd.Env = c.opt.Cfg.Child(append([]string{
+	imposed := append([]string{
 		"COZY_HOME=" + workerHome,
 		"CUDA_VISIBLE_DEVICES=" + strings.Join(spec.Devices, ","),
-	}, spec.Imposed...)...)
+	}, spec.Imposed...)
+	// Where the local transport carries no kernel peer identity (Windows loopback), the
+	// launcher mints a PER-SPAWN bootstrap credential and hands it over through the
+	// environment — the one channel only this child inherits. Register must echo it.
+	var bootstrap secret.Value
+	if bootstrapRequired {
+		bootstrap = secret.Mint()
+		imposed = append(imposed, secret.EnvEntry("COZY_BOOTSTRAP_CREDENTIAL", bootstrap))
+	}
+	cmd.Env = c.opt.Cfg.Child(imposed...)
 	cmd.Stdout, cmd.Stderr = logFile, logFile
 	setProcessGroup(cmd)
 
 	w := &worker{
 		instanceID: instanceID, spec: spec, cmd: cmd, logPath: logPath,
 		home: workerHome, planIDs: planIDs, ready: map[string]bool{},
+		bootstrap: bootstrap,
 	}
 	// Registered BEFORE the process can dial: a worker that registers faster than its
 	// launcher can record it would be refused as an instance nobody spawned.
@@ -302,9 +316,18 @@ func (c *Coordinator) StartWorker(spec EndpointSpec) (string, *exit.Error) {
 		return "", exit.Internalf("cannot start the endpoint worker: %s", err)
 	}
 	// The group is established at fork on Unix and must be ATTACHED after start on Windows,
-	// where the analogue is a job object. Here, before the child has spawned anything of
-	// its own, is the one moment both platforms can agree on.
-	adoptProcessGroup(cmd)
+	// where the child is created suspended and the job adopts it before it runs. Adoption
+	// FAILS CLOSED (#449): a worker that cannot be contained is ended before it executes,
+	// and the spawn refuses exactly as if the process had never started.
+	if err := adoptProcessGroup(cmd); err != nil {
+		_ = cmd.Process.Kill()
+		go func() { _ = cmd.Wait(); logFile.Close() }()
+		c.mu.Lock()
+		delete(c.workers, instanceID)
+		c.mu.Unlock()
+		_ = c.opt.Store.CloseWorker(instanceID)
+		return "", exit.Internalf("cannot contain the endpoint worker: %s", err)
+	}
 	c.mu.Lock()
 	w.pid = cmd.Process.Pid
 	c.mu.Unlock()
@@ -319,6 +342,9 @@ func (c *Coordinator) StartWorker(spec EndpointSpec) (string, *exit.Error) {
 	go func() {
 		err := cmd.Wait()
 		logFile.Close()
+		// The process is reaped: retire its containment handle so a reused pid can
+		// never meet a stale job (Windows; a no-op where the group is a kernel fact).
+		releaseGroup(cmd.Process.Pid)
 		c.mu.Lock()
 		current, live := c.workers[instanceID]
 		mine := live && current == w
@@ -559,7 +585,13 @@ func (c *Coordinator) StopWorker(instanceID string, grace time.Duration) {
 		return
 	}
 	if w.cmd.Process != nil && !w.exited {
-		_ = killGroup(w.cmd.Process.Pid, syscall.SIGTERM)
+		// The cooperative tier: SIGTERM to the group, CTRL_BREAK to the job's console
+		// group on Windows. A failure here is loud but not an escalation by itself —
+		// the bounded wait below is what separates asking from insisting.
+		if err := killGroup(w.cmd.Process.Pid, syscall.SIGTERM); err != nil {
+			c.logf("worker %s: the cooperative stop could not be delivered (%s); "+
+				"the forced tier follows the grace window", instanceID, err)
+		}
 		deadline := time.Now().Add(grace)
 		for time.Now().Before(deadline) {
 			if !alive(w.cmd.Process.Pid) {
@@ -642,26 +674,6 @@ func (c *Coordinator) Reconcile() (killed, forgotten int, e *exit.Error) {
 		c.selectOrStart(req)
 	}
 	return killed, forgotten, nil
-}
-
-// birthOf is the OS process-birth identity: /proc/<pid>/stat field 22, the kernel's own
-// start time in clock ticks. A reused pid has a different birth, which is why a pid
-// alone is never enough to adopt a worker as warm.
-func birthOf(pid int) string {
-	data, err := os.ReadFile("/proc/" + strconv.Itoa(pid) + "/stat")
-	if err != nil {
-		return ""
-	}
-	// The comm field may contain spaces; everything after the last ')' is positional.
-	tail := string(data)
-	if i := strings.LastIndex(tail, ")"); i >= 0 {
-		tail = tail[i+1:]
-	}
-	fields := strings.Fields(tail)
-	if len(fields) < 20 {
-		return ""
-	}
-	return fields[19] // (22) starttime, offset by the two fields consumed above
 }
 
 func sortStrings(s []string) {

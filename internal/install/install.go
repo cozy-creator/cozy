@@ -218,7 +218,7 @@ func Run(l home.Layout, st *records.Store, req Request) (*Result, *exit.Error) {
 // through with the runtime's own words. No door widens either one — a descriptor that
 // disagrees with the code that built the venv refuses the install.
 func deriveDescriptor(venvDir, sourceDir string) (string, *exit.Error) {
-	bin := filepath.Join(venvDir, "bin", "cozy-runtime")
+	bin := home.VenvTool(venvDir, "cozy-runtime")
 	if _, err := os.Stat(bin); err != nil {
 		return "", exit.Named(exit.Structural, "runtime_missing",
 			"this generation's venv provides no cozy-runtime at %s", bin).

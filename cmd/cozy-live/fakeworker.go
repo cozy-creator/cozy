@@ -7,10 +7,12 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
+	"google.golang.org/grpc/metadata"
 
 	"github.com/cozy-creator/cozy-creator-v2/internal/canonical"
 	"github.com/cozy-creator/cozy-creator-v2/internal/home"
@@ -40,9 +42,14 @@ func fakeWorker() int {
 		os.Stdout.Sync()
 	}
 
+	// The coordinator hands `--socket` a unix path where the OS has one, and a loopback
+	// `host:port` on Windows (#449) — the adversary speaks both, exactly as the real
+	// supervisor must.
 	target := "unix://" + socket
 	if len(socket) > 5 && socket[:5] == "unix:" {
 		target = "unix://" + socket[5:]
+	} else if strings.Contains(socket, ":") && !strings.ContainsAny(socket, `/\`) {
+		target = socket
 	}
 	conn, err := grpc.NewClient(target, grpc.WithTransportCredentials(insecure.NewCredentials()))
 	if err != nil {
@@ -50,7 +57,15 @@ func fakeWorker() int {
 		return 1
 	}
 	defer conn.Close()
-	stream, err := pb.NewWorkerClient(conn).Control(context.Background())
+	// On the loopback transport the launcher hands a PER-SPAWN bootstrap credential
+	// through the environment; Register must echo it as metadata (#449). The adversary
+	// forwards whatever it was handed — an arm that wants the refusal simply is not
+	// handed one.
+	ctx := context.Background()
+	if tok := os.Getenv("COZY_BOOTSTRAP_CREDENTIAL"); tok != "" {
+		ctx = metadata.AppendToOutgoingContext(ctx, "cozy-bootstrap", tok)
+	}
+	stream, err := pb.NewWorkerClient(conn).Control(ctx)
 	if err != nil {
 		say("cannot open Control: %v", err)
 		return 1
