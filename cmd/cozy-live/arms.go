@@ -236,12 +236,18 @@ func sectionArms() {
 		fmt.Sprintf("%d output(s)", len(outs)))
 
 	head("teardown")
-	live, _ := lv.store.LiveWorkers()
-	for _, row := range live {
-		lv.c.StopWorker(row.InstanceID, 10*time.Second)
-	}
+	// Close, not a StopWorker loop: Close sets `closing`, which is what keeps the
+	// revive machinery from respawning a worker for the still-owed request while the
+	// sweep runs. Stopping without it is a race the Windows runner actually lost —
+	// a revived row landed between the last stop and the check (windows-proc run 2).
+	lv.c.Close(10 * time.Second)
 	rows, _ := lv.store.LiveWorkers()
-	check("every device grant is released", len(rows) == 0, fmt.Sprintf("%d live row(s)", len(rows)))
+	names := ""
+	for _, row := range rows {
+		names += " " + row.InstanceID + "(pid " + fmt.Sprint(row.PID) + ")"
+	}
+	check("every device grant is released", len(rows) == 0,
+		fmt.Sprintf("%d live row(s)%s", len(rows), names))
 }
 
 func trimLog(line string) string {
