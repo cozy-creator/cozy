@@ -84,3 +84,8 @@ func Mint() Value {
 // credential to the child it just created (#449) never touches the raw value itself —
 // same rule as the request-builder carrier in `api.Authorize`.
 func EnvEntry(name string, v Value) string { return name + "=" + v.raw }
+
+// GRPCMetadataPair is the METADATA CARRIER: the one place a credential becomes a gRPC
+// metadata key/value (the worker echoing its #449 bootstrap credential at Register). Same
+// rule as EnvEntry and api.Authorize — the raw value is read where it becomes a carrier.
+func GRPCMetadataPair(key string, v Value) (string, string) { return key, v.raw }

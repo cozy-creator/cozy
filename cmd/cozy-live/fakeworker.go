@@ -16,7 +16,9 @@ import (
 	"google.golang.org/grpc/metadata"
 
 	"github.com/cozy-creator/cozy-creator-v2/internal/canonical"
+	"github.com/cozy-creator/cozy-creator-v2/internal/config"
 	"github.com/cozy-creator/cozy-creator-v2/internal/home"
+	"github.com/cozy-creator/cozy-creator-v2/internal/secret"
 	pb "github.com/cozy-creator/cozy-creator-v2/protocol/cozy/worker/v1"
 )
 
@@ -60,11 +62,13 @@ func fakeWorker() int {
 	defer conn.Close()
 	// On the loopback transport the launcher hands a PER-SPAWN bootstrap credential
 	// through the environment; Register must echo it as metadata (#449). The adversary
-	// forwards whatever it was handed — an arm that wants the refusal simply is not
+	// reads it the way every process reads its environment — through the ONE env reader —
+	// and forwards whatever it was handed; an arm that wants the refusal simply is not
 	// handed one.
 	ctx := context.Background()
-	if tok := os.Getenv("COZY_BOOTSTRAP_CREDENTIAL"); tok != "" { //cozy:allow the adversary plays the SUPERVISOR, whose side of the #449 contract IS "read the handed credential from the child environment" — the runtime's Python does exactly this
-		ctx = metadata.AppendToOutgoingContext(ctx, "cozy-bootstrap", tok)
+	if cfg, e := config.Load(); e == nil && cfg.Bootstrap.Present() {
+		k, v := secret.GRPCMetadataPair("cozy-bootstrap", cfg.Bootstrap)
+		ctx = metadata.AppendToOutgoingContext(ctx, k, v)
 	}
 	stream, err := pb.NewWorkerClient(conn).Control(ctx)
 	if err != nil {

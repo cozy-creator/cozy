@@ -68,6 +68,11 @@ type Config struct {
 	LocalRateMicroUSDPerHour int64
 	LocalRateSource          string
 
+	// Bootstrap is the per-spawn worker bootstrap credential a LAUNCHER imposed on this
+	// process (COZY_BOOTSTRAP_CREDENTIAL, #449) — present only in a spawned worker,
+	// never inherited onward.
+	Bootstrap secret.Value
+
 	inherited []string // the allowlisted snapshot, captured at Load
 }
 
@@ -103,6 +108,13 @@ func Load() (Config, *exit.Error) {
 	}
 	if v := os.Getenv("TENSORHUB_TOKEN"); strings.TrimSpace(v) != "" {
 		c.HubToken, c.HubTokenSource = secret.New(v), "env"
+	}
+	// The PER-SPAWN worker bootstrap credential (#449): imposed by the launcher on the
+	// child it just created, read here because this file is the one env reader, consumed
+	// by the worker side of the protocol. Deliberately NOT in the inherited allowlist —
+	// it exists for exactly one process.
+	if v := os.Getenv("COZY_BOOTSTRAP_CREDENTIAL"); strings.TrimSpace(v) != "" {
+		c.Bootstrap = secret.New(v)
 	}
 
 	if v := strings.TrimSpace(os.Getenv("COZY_HOME")); v != "" {
