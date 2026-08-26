@@ -11,16 +11,26 @@ import (
 	"github.com/cozy-creator/cozy-creator-v2/internal/records"
 	"github.com/cozy-creator/cozy-creator-v2/internal/render"
 	"github.com/cozy-creator/cozy-creator-v2/internal/rental"
+	"github.com/cozy-creator/cozy-creator-v2/internal/secret"
 )
 
-// The rental verbs (cl-015). `cozy rent` asks the hub for a pod, watches it provision,
-// and PINS what came back — the address, the certificate to trust, and the owner token —
-// so that `cozy run --worker <id>` can dial a worker this host never spawned.
+// The rental verbs (cl-015). `cozy rent` MINTS the pod's access token, asks the hub for a
+// pod while presenting only that token's sha256, watches it provision, and PINS the
+// triple — the address, the certificate to trust, and the token it minted — so that
+// `cozy run --worker <id>` can dial a worker this host never spawned.
 //
-// The credential rule is the one every other credential here already keeps: the owner
-// token is written to a 0600 file and is never printed, logged, or put on argv. What
-// these verbs render is its DIGEST, which is comparable against the pod's own without
-// either end saying the value.
+// THE MINT IS THE POINT (#495e). The token is generated here, from this host's own
+// entropy, and what crosses to the hub is a hash. The hub provisions the pod with that
+// hash, the pod checks a presented credential by hashing it, and neither the hub nor the
+// provider ever holds a value that would let it authenticate as this host to this host's
+// own pod. The old contract had the hub mint the token and hand it back on a GET, which
+// made every party in the chain — and every log line along it — a holder of the
+// credential.
+//
+// The credential rule is the one every other credential here already keeps: the token is
+// written to a 0600 file and is never printed, logged, or put on argv. What these verbs
+// render is its DIGEST, which is comparable against the pod's own without either end
+// saying the value.
 
 // pollCadence is how often a provisioning rental is re-read. It is a SAMPLING
 // RESOLUTION, not a bound: the wait ends when the hub says `ready` or `failed`, when the
@@ -71,9 +81,14 @@ func handleRent(ctx *Context) *exit.Error {
 	}
 	defer st.Close()
 
+	// THE MINT, BEFORE THE ASK. The pod's credential exists on this host before any hub
+	// knows a rental is coming, and what travels is its hash. A failed rental leaves a
+	// token nobody can use, which is the correct direction to fail in.
+	token := secret.Mint()
+
 	c := client(ctx)
 	hctx, cancel := hub.Context()
-	r, e := c.Rent(hctx, endpoint, card, reason)
+	r, e := c.Rent(hctx, endpoint, card, secret.HashLine(token), reason)
 	cancel()
 	if e != nil {
 		return e
@@ -91,7 +106,16 @@ func handleRent(ctx *Context) *exit.Error {
 	}
 	row.PodID, row.Address, row.State = ready.PodID, ready.Address, ready.State
 	row.MediaAddress = ready.MediaAddress
-	if e := rental.Attach(l, st, row, ready.CertPEM, ready.Token); e != nil {
+	if !ready.HoldsHash(secret.HashLine(token)) {
+		// The pod was provisioned with a credential set this host's token is not in, so
+		// dialling it would 401 and look like a network fault. The hub says which hashes
+		// are live; neither end has to say a token to find this out.
+		return exit.New(exit.Failed,
+			"rental %s is ready and its live credential set does not carry the token this host minted", ready.ID).
+			WithRemedy("release it and rent again; a pod nobody can authenticate to still costs money").
+			WithNext("cozy rent release " + ready.ID + " --yes")
+	}
+	if e := rental.Attach(l, st, row, ready.CertPEM, token); e != nil {
 		return e
 	}
 	return emit(ctx, render.Record{Kind: "rental", Fields: []render.Field{
@@ -104,10 +128,10 @@ func handleRent(ctx *Context) *exit.Error {
 		{K: "card", V: card},
 		// The DIGEST, which is the only rendering a credential has here: it is
 		// comparable against the pod's own without either end printing the value.
-		{K: "owner_token", V: ready.Token.Digest()},
+		{K: "owner_token", V: token.Digest()},
 		{K: "pinned_cert", V: l.RentalCert(ready.ID)},
 	}, Notes: []string{
-		"the owner token is on this disk at mode 0600 and is never printed; the pod holds the same one"},
+		"this host MINTED the owner token and holds it at mode 0600; the hub and the pod hold only its sha256, so neither can dial this pod as you"},
 		Next: []string{"cozy run <org/endpoint/vN/function> --worker " + ready.ID}})
 }
 
@@ -132,6 +156,13 @@ func waitProvisioned(ctx *Context, c *hub.Client, id string, deadline time.Time)
 				"rental %s failed to provision: %s", id, detailOr(r.Detail)).
 				WithRemedy("the pod is the hub's to reclaim; `cozy rent release %s --yes` closes it out", id).
 				WithNext("cozy rent release " + id + " --yes")
+		case r.State == hub.RentalDead || r.State == hub.RentalReclaiming:
+			// A rental that is LEAVING is not one that is still coming up, and waiting on
+			// it is waiting for a state it will never reach.
+			return hub.Rental{}, exit.New(exit.Failed,
+				"rental %s is %s: %s", id, r.State, detailOr(r.Detail)).
+				WithRemedy("nothing here is owed money for it; rent again if you still need a pod").
+				WithNext("cozy rent <endpoint> --card <name> --reason <why>")
 		case r.State == hub.RentalReady:
 			// READY without a whole triple is the hub contradicting itself, and dialling
 			// on a partial one would fail later as something that looks like a network
@@ -163,16 +194,13 @@ func detailOr(detail string) string {
 	return detail
 }
 
-// missingOf names the first piece of the dial triple a `ready` rental did not carry.
+// missingOf names the first piece a `ready` rental did not carry. The credential is not
+// among them: this host minted it and the hub could not have carried it.
 func missingOf(r hub.Rental) string {
-	switch {
-	case r.Address == "":
+	if r.Address == "" {
 		return "address"
-	case r.CertPEM == "":
-		return "certificate to pin"
-	default:
-		return "owner token"
 	}
+	return "certificate to pin"
 }
 
 func handleRentLs(ctx *Context) *exit.Error {

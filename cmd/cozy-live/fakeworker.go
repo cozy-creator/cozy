@@ -18,6 +18,7 @@ import (
 	"github.com/cozy-creator/cozy-creator-v2/internal/canonical"
 	"github.com/cozy-creator/cozy-creator-v2/internal/config"
 	"github.com/cozy-creator/cozy-creator-v2/internal/home"
+	"github.com/cozy-creator/cozy-creator-v2/internal/secret"
 	pb "github.com/cozy-creator/cozy-creator-v2/protocol/cozy/worker/v1"
 )
 
@@ -80,12 +81,30 @@ func fakeWorker() int {
 	}
 	say("hosting WorkerControl at %s (boot %s)", bound, bootID)
 
-	// The per-spawn bootstrap credential the launcher handed through the environment;
-	// the owner must present it as Claim.proof (#463's flip). Verification is the secret
-	// package's constant-time Equal — Reveal never happens here. The `badcred` arm
-	// refuses EVERY proof, so the real owner's correct one is refused — which is the arm.
+	// THE CLAIM CREDENTIAL, in whichever of the two launch modes this pod was provisioned
+	// in (#560g). `--tokens` is the RENTED shape: a file of `sha256:<64 hex>` lines, which
+	// is everything the provisioner was ever given, re-read per claim so a rotation
+	// converges. COZY_BOOTSTRAP_CREDENTIAL is the SELF-SPAWNED shape, where the launcher
+	// minted the credential and legitimately holds it. Both compare in constant time and
+	// neither reads a raw value out of the Value that holds it.
+	//
+	// The `badcred` arm refuses EVERY proof, so the real owner's correct one is refused —
+	// which is the arm.
 	verify := func(string) bool { return true }
-	if cfg, e := config.Load(); e == nil && cfg.Bootstrap.Present() {
+	if tokens := flag("tokens", ""); tokens != "" {
+		verify = func(presented string) bool {
+			data, err := os.ReadFile(tokens)
+			if err != nil {
+				return false // fail closed: a set that cannot be read admits nobody
+			}
+			for _, line := range strings.Split(string(data), "\n") {
+				if secret.MatchesHash(presented, line) {
+					return true
+				}
+			}
+			return false
+		}
+	} else if cfg, e := config.Load(); e == nil && cfg.Bootstrap.Present() {
 		bootstrap := cfg.Bootstrap
 		verify = bootstrap.Equal
 	}

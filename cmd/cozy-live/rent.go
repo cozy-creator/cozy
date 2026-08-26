@@ -99,21 +99,39 @@ func sectionRent() {
 			strings.Contains(out, "pod-"), field(out, "address")+" "+field(out, "pod"))
 	fmt.Printf("  bench ask -> ready -> pinned: %d ms\n", rentMS)
 
-	head("the owner token is a SECRET, and every arm here is about it not leaking")
-	planted := hub.tokenOf(rentalA)
-	check("the driver knows the value the hub issued", len(planted) == 64, "64 hex chars")
-	check("and it appears NOWHERE in what cozy printed",
-		!strings.Contains(out, planted), "searched the whole rendering")
-	check("what IS printed is its digest, comparable against the pod's own",
-		strings.Contains(field(out, "owner_token"), "sha256:"), field(out, "owner_token"))
+	head("the owner token is MINTED HERE, and the hub is never told it (#495e)")
+	// The token exists on THIS host and nowhere else. Reading it out of the 0600 file the
+	// client wrote is the only way anything in this driver can know it — the hub cannot be
+	// asked, because the hub has no such field.
 	tokenFile := filepath.Join(root, "rentals", rentalA+".token")
 	info, err := os.Stat(tokenFile)
 	check("the token landed in a 0600 file, not a record and not argv",
 		err == nil && info != nil && info.Mode().Perm() == 0o600,
 		tokenFile+" "+modeOf(info))
 	stored, err := os.ReadFile(tokenFile)
-	check("and the bytes on disk are exactly the token the hub issued",
-		err == nil && strings.TrimSpace(string(stored)) == planted, "")
+	minted := strings.TrimSpace(string(stored))
+	check("and it is 32 bytes of this host's own entropy, hex-spelled",
+		err == nil && len(minted) == 64, fmt.Sprintf("%d hex chars", len(minted)))
+	check("it appears NOWHERE in what cozy printed",
+		minted != "" && !strings.Contains(out, minted), "searched the whole rendering")
+	check("what IS printed is its digest, comparable against the pod's own",
+		strings.Contains(field(out, "owner_token"), "sha256:"), field(out, "owner_token"))
+
+	// THE INVERSION, as an observation over the peer's own state. The hub holds a hash of
+	// the minted token and holds nothing that could produce it.
+	hashes := hub.hashesOf(rentalA)
+	wantSum := sha256.Sum256([]byte(minted))
+	wantHash := "sha256:" + hex.EncodeToString(wantSum[:])
+	check("the hub holds exactly one credential fact for this pod, and it is a HASH",
+		len(hashes) == 1 && hashes[0] == wantHash, strings.Join(hashes, " "))
+	check("and that hash is not the token: nothing the hub holds could be presented as proof",
+		hashes != nil && hashes[0] != minted, "a hash is not a preimage")
+	podSet, err := os.ReadFile(filepath.Join(root, "hub", rentalA+"-run", "pod.tokens"))
+	check("the pod was provisioned with that same hash, and the token is absent from the pod",
+		err == nil && strings.Contains(string(podSet), wantHash) &&
+			!strings.Contains(string(podSet), minted),
+		strings.TrimSpace(string(podSet)))
+
 	pemBytes, err := os.ReadFile(filepath.Join(root, "rentals", rentalA+".pem"))
 	check("the certificate to PIN is beside it, and it is a certificate",
 		err == nil && strings.HasPrefix(string(pemBytes), "-----BEGIN CERTIFICATE-----"), "")
@@ -124,7 +142,7 @@ func sectionRent() {
 	check("cozy rent ls names the rental this host holds",
 		code == 0 && strings.Contains(out, rentalA), firstLine(out))
 	check("with the owner token digested, and the raw value absent",
-		strings.Contains(out, "sha256:") && !strings.Contains(out, planted), "")
+		strings.Contains(out, "sha256:") && !strings.Contains(out, minted), "")
 
 	head("RED: a run pinned to a rental this host does not hold")
 	_, before, _ := cozyJSON(root, "status")
@@ -175,7 +193,7 @@ func sectionRent() {
 	tampered["variant"] = "not-the-variant-that-was-digested"
 	tamperedBody, _ := json.Marshal(tampered)
 	status, said := mediaCall(root, rentalA, http.MethodPut,
-		"/v1/plans/"+strings.TrimPrefix(planID, "sha256:"), planted, tamperedBody)
+		"/v1/plans/"+strings.TrimPrefix(planID, "sha256:"), minted, tamperedBody)
 	check("RED: a record whose identity was edited is refused under the id it arrived as",
 		status == 400 && strings.Contains(said, "plan_id_mismatch"),
 		itoa(status)+" "+firstLine(said))
@@ -227,16 +245,16 @@ func sectionRent() {
 	check("RED: a FOREIGN bearer -> 401 — the pod checks a hash it was provisioned with",
 		status == 401 && strings.Contains(said, "media.unauthenticated"),
 		itoa(status)+" "+firstLine(said))
-	status, said = mediaCall(root, rentalA, http.MethodGet, "/v1/health", planted, nil)
+	status, said = mediaCall(root, rentalA, http.MethodGet, "/v1/health", minted, nil)
 	check("the rental's OWN token is admitted, and the server says what it holds",
 		status == 200 && strings.Contains(said, "cozy.media/1"),
 		itoa(status)+" "+firstLine(said))
 	status, said = mediaCall(root, rentalA, http.MethodGet,
-		"/v1/outputs/"+media.Slot("req-nope", 1)+"/..%2f..%2fpod-worker.log", planted, nil)
+		"/v1/outputs/"+media.Slot("req-nope", 1)+"/..%2f..%2fpod-worker.log", minted, nil)
 	check("RED: a traversal in an output name is not a name this server can hold",
 		status == 400 && strings.Contains(said, "media.bad_name"),
 		itoa(status)+" "+firstLine(said))
-	status, said = mediaCall(root, rentalA, http.MethodPut, "/v1/inputs/oversize", planted,
+	status, said = mediaCall(root, rentalA, http.MethodPut, "/v1/inputs/oversize", minted,
 		make([]byte, 8<<20))
 	check("RED: a body past the pod's media quota refuses; the subtree is separately bounded",
 		(status == 507 || status == 413) &&
@@ -256,7 +274,7 @@ func sectionRent() {
 	check("the pod's WORKER process is killed, its media server is not",
 		deadPID > 0 && !alivePID(deadPID), "pid "+itoa(deadPID))
 	status, said = mediaCall(root, rentalA, http.MethodGet,
-		"/v1/outputs/"+media.Slot(dispatchedRequest(out), 1)+"/image", planted, nil)
+		"/v1/outputs/"+media.Slot(dispatchedRequest(out), 1)+"/image", minted, nil)
 	check("the already-committed output still downloads: no request-path call crosses over",
 		status == 200 && digestOfBytes([]byte(said)) == committed,
 		itoa(status)+" "+shortID(digestOfBytes([]byte(said))))

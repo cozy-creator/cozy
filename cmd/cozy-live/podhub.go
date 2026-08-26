@@ -8,6 +8,7 @@ import (
 	"crypto/x509/pkix"
 	"encoding/json"
 	"encoding/pem"
+	"io"
 	"math/big"
 	"net"
 	"net/http"
@@ -18,8 +19,6 @@ import (
 	"sync"
 	"syscall"
 	"time"
-
-	"github.com/cozy-creator/cozy-creator-v2/internal/secret"
 )
 
 // podHub is the SECOND independent implementation of the hub's rental contract (cl-015),
@@ -30,10 +29,16 @@ import (
 // hundred times on a laptop before a card is ever billed.
 //
 // What it provisions is a REAL worker: `cozy-live fakeworker --arm remote` behind TLS with
-// a certificate it mints, holding the owner token in `COZY_BOOTSTRAP_CREDENTIAL` — the
-// exact contract a rented pod's `cozy-runtime serve --tls-cert --tls-key` keeps. So the
-// leg this proves is the whole owner side: dial the address, trust exactly that PEM,
-// present the owner token as Claim.proof, converse, dispatch, settle.
+// a certificate it mints, provisioned with the renter's token HASH SET — the exact
+// contract a rented pod's `cozy-runtime serve --tls-cert --tls-key` keeps now that the
+// runtime accepts `COZY_ACCESS_TOKEN_SHA256`. So the leg this proves is the whole owner
+// side: dial the address, trust exactly that PEM, present the token YOU minted as
+// Claim.proof, converse, dispatch, settle.
+//
+// AND THIS HUB CANNOT DIAL ITS OWN PODS (#495e). It is handed a sha256 and nothing else;
+// there is no field on it, no variable in it and no route out of it that holds a renter's
+// token. That is not politeness — it is the property the arms in rent.go observe, and the
+// reason this stand-in had to be flipped along with the product.
 //
 // What it is NOT: a provider. It boots nothing, bills nothing, and knows no card names —
 // `card` is carried and echoed, never interpreted.
@@ -43,7 +48,9 @@ type podRental struct {
 	State   string
 	Address string
 	CertPEM string
-	Token   string
+	// Hashes is the pod's LIVE credential set, `sha256:<64 hex>` lines. It is everything
+	// this hub was ever told about the renter's credential.
+	Hashes  []string
 	PodID   string
 	Detail  string
 	// Media is where this pod's co-resident MEDIA SERVER answers (cl-014). A real hub
@@ -120,9 +127,9 @@ func newPodHub(spec podHubSpec) *podHub {
 	must("binding the fake hub", err)
 	h.ln, h.addr = ln, ln.Addr().String()
 	mux := http.NewServeMux()
-	mux.HandleFunc("POST /v1/rentals", h.rent)
-	mux.HandleFunc("GET /v1/rentals/{id}", h.read)
-	mux.HandleFunc("DELETE /v1/rentals/{id}", h.release)
+	mux.HandleFunc("POST /v1/private-rentals", h.rent)
+	mux.HandleFunc("GET /v1/private-rentals/{id}", h.read)
+	mux.HandleFunc("DELETE /v1/private-rentals/{id}", h.release)
 	go func() { _ = http.Serve(ln, mux) }()
 	return h
 }
@@ -195,18 +202,55 @@ func (h *podHub) rent(w http.ResponseWriter, r *http.Request) {
 			"a mutation is recorded with a reason before it happens", "pass --reason <why>")
 		return
 	}
-	var body struct {
-		Endpoint string `json:"endpoint"`
-		Card     string `json:"card"`
-		Hint     int    `json:"duration_hint_s"`
+	raw, err := io.ReadAll(http.MaxBytesReader(w, r.Body, 1<<16))
+	if err != nil {
+		refuse(w, http.StatusBadRequest, "rental.unreadable_body", "re-send the request", "")
+		return
 	}
-	if err := json.NewDecoder(r.Body).Decode(&body); err != nil || body.Endpoint == "" || body.Card == "" {
+	// THE TOMBSTONE, checked first and BY NAME, exactly as the real surface checks it. A
+	// caller still sending the demo contract's plaintext credential must be told the field
+	// is gone rather than have it silently ignored — silently ignoring it is how a client
+	// ends up believing a hub holds a token it does not.
+	var probe map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &probe); err != nil {
+		refuse(w, http.StatusBadRequest, "rental.unparseable",
+			"a rental names an endpoint, a card and the sha256 of the token you minted",
+			`{"endpoint":"h3","card":"H200","renter_token_sha256":["sha256:<64 hex>"]}`)
+		return
+	}
+	if _, ok := probe["owner_token"]; ok {
+		refuse(w, http.StatusUnprocessableEntity, "rental.field_deleted",
+			`"owner_token" was deleted from the rental surface`,
+			"use renter_token_sha256: the RENTER mints the token and this hub stores only its hash")
+		return
+	}
+	var body struct {
+		Endpoint    string   `json:"endpoint"`
+		Card        string   `json:"card"`
+		TokenSHA256 []string `json:"renter_token_sha256"`
+	}
+	if err := json.Unmarshal(raw, &body); err != nil || body.Endpoint == "" || body.Card == "" {
 		refuse(w, http.StatusBadRequest, "invalid_request",
 			"a rental names an endpoint and a card", `{"endpoint":"h3","card":"H200"}`)
 		return
 	}
+	for _, h := range body.TokenSHA256 {
+		if !strings.HasPrefix(h, "sha256:") || len(h) != len("sha256:")+64 {
+			refuse(w, http.StatusUnprocessableEntity, "rental.token_not_hashed",
+				"send sha256 hex of the token you minted",
+				"this hub never accepts a plaintext credential: it could use one")
+			return
+		}
+	}
+	if len(body.TokenSHA256) == 0 {
+		refuse(w, http.StatusUnprocessableEntity, "rental.no_token_hash",
+			"mint a token, keep it, and send its sha256",
+			"a pod provisioned with no credential is a pod nobody could ever reach")
+		return
+	}
 	id := "rnt-" + randomHex(8)
 	rec := &podRental{ID: id, State: "provisioning", PodID: "pod-" + randomHex(6),
+		Hashes: body.TokenSHA256,
 		Detail: "asking the provider for " + body.Card}
 	h.mu.Lock()
 	h.rentals[id] = rec
@@ -236,12 +280,19 @@ func (h *podHub) provision(rec *podRental) {
 		h.mu.Unlock()
 		return
 	}
-	// The owner token is the pod's OWN provisioned credential, minted here and imposed on
-	// the worker through the one channel only it inherits — the same handoff a spawned
-	// local worker's bootstrap credential rides (#449/#463).
-	token := randomHex(32)
 	runRoot := filepath.Join(h.dir, rec.ID+"-run")
 	must("creating the pod run root", os.MkdirAll(runRoot, 0o755))
+	// THE CREDENTIAL, AS HASHES, and there is no other kind here. The renter minted the
+	// token and this hub was never told it, so the only credential material that can reach
+	// the pod is the set it was handed — written 0600, one `sha256:` line each, and read by
+	// BOTH pod processes. A rotation is this file being rewritten.
+	tokenFile := filepath.Join(runRoot, "pod.tokens")
+	if err := os.WriteFile(tokenFile, []byte(strings.Join(rec.Hashes, "\n")+"\n"), 0o600); err != nil {
+		h.mu.Lock()
+		rec.State, rec.Detail = "failed", "cannot provision the credential set: "+err.Error()
+		h.mu.Unlock()
+		return
+	}
 
 	self, err := os.Executable()
 	if err != nil {
@@ -258,6 +309,7 @@ func (h *podHub) provision(rec *podRental) {
 	args := []string{"fakeworker", "--arm", h.arm,
 		"--socket", "127.0.0.1:0", "--out", runRoot,
 		"--tls-cert", certPath, "--tls-key", keyPath,
+		"--tokens", tokenFile,
 		"--cozy-home", podRoot}
 	if h.releaseID != "" {
 		// WHAT THIS POD SERVES, declared on ClaimAck. A hub that installed the release
@@ -265,7 +317,7 @@ func (h *podHub) provision(rec *podRental) {
 		args = append(args, "--release-id", h.releaseID)
 	}
 	cmd := niceCmd(self, args...)
-	cmd.Env = append(childEnv(podRoot), "COZY_BOOTSTRAP_CREDENTIAL="+token)
+	cmd.Env = childEnv(podRoot)
 	logPath := filepath.Join(runRoot, "pod-worker.log")
 	logFile, err := os.Create(logPath)
 	must("the pod worker log", err)
@@ -288,19 +340,11 @@ func (h *podHub) provision(rec *podRental) {
 	// It is what the owner uploads a payload and a binding record to and downloads an
 	// output from, and it is started here because provisioning a pod is the hub's job.
 	//
-	// Its credential is the rental's own owner token, delivered as a HASH: the provisioner
-	// knows the token because it minted it, and the server that checks it never does.
+	// Its credential is the SAME hash file the worker reads — one provisioned identity per
+	// pod, two listeners, and neither of them holds a token.
 	mediaAddr, mediaRoot := "", ""
 	if !h.noMedia {
 		mediaRoot = filepath.Join(podRoot, "media")
-		tokenFile := filepath.Join(runRoot, "media.tokens")
-		if err := os.WriteFile(tokenFile,
-			[]byte(secret.HashLine(secret.New(token))+"\n"), 0o600); err != nil {
-			h.mu.Lock()
-			rec.State, rec.Detail = "failed", "cannot provision the media credential: "+err.Error()
-			h.mu.Unlock()
-			return
-		}
 		media := niceCmd(mediaBinary(),
 			"--listen", "127.0.0.1:0",
 			"--root", mediaRoot,
@@ -343,7 +387,7 @@ func (h *podHub) provision(rec *podRental) {
 		if data, err := os.ReadFile(addrFile); err == nil && len(data) > 0 {
 			h.mu.Lock()
 			rec.Address = strings.TrimSpace(string(data))
-			rec.CertPEM, rec.Token, rec.State = certPEM, token, "ready"
+			rec.CertPEM, rec.State = certPEM, "ready"
 			rec.Media, rec.MediaRoot = mediaAddr, mediaRoot
 			rec.Detail = "the worker is hosting WorkerControl behind TLS"
 			h.mu.Unlock()
@@ -449,11 +493,14 @@ func (h *podHub) read(w http.ResponseWriter, r *http.Request) {
 	}
 	out := map[string]any{
 		"rental_id": rec.ID, "state": rec.State, "address": rec.Address,
-		"cert_pem": rec.CertPEM, "owner_token": rec.Token,
-		"pod_id": rec.PodID, "detail": rec.Detail,
-		// The one field this lane adds to the consumed contract (#506b). A hub that omits
-		// it gets the client's stated convention instead; naming it here exercises the
-		// verbatim path, which is the one a real hub will take once th-041 carries it.
+		"cert_pem": rec.CertPEM,
+		// The LIVE HASH SET, which is the whole of what this hub can say about the
+		// credential. There is no `owner_token` key, and the struct behind this map has no
+		// field one could be read out of.
+		"renter_token_sha256": rec.Hashes,
+		"pod_id":              rec.PodID, "detail": rec.Detail,
+		// The byte plane's address, OBSERVED. The client no longer derives one, so a hub
+		// that omits this names no byte plane at all.
 		"media_address": rec.Media,
 	}
 	h.mu.Unlock()
@@ -533,16 +580,16 @@ func writeSelfSigned(certPath, keyPath string) (string, error) {
 	return string(certPEM), nil
 }
 
-// tokenOf reads back the token this hub issued for one rental, so an arm can assert that
-// the value NEVER appeared in the client's output. Checking that a credential was not
-// printed requires knowing the credential.
-func (h *podHub) tokenOf(id string) string {
+// hashesOf reads back the credential set this hub was HANDED for one rental. It is what
+// an arm compares against the digest of the token the client kept — the same one-way
+// comparison the pod makes, and the reason neither side has to say a token.
+func (h *podHub) hashesOf(id string) []string {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	if rec := h.rentals[id]; rec != nil {
-		return rec.Token
+		return append([]string(nil), rec.Hashes...)
 	}
-	return ""
+	return nil
 }
 
 // holds answers whether this hub still has the rental — which is how the teardown pass
