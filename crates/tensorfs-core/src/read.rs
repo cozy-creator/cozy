@@ -485,21 +485,78 @@ fn tally(items: &[PlanItem]) -> (u64, u64, usize) {
 }
 
 /// The read planner. Order comes from the CALLER's code-topology traversal — never from the
-/// header. A traversal that does not name every tensor the header carries refuses: a fill
-/// that silently skips a tensor is a wrong model, not a fast one.
+/// header.
+///
+/// COMPLETENESS SCOPES TO THE REQUESTED COMPONENT SET (#570b). `requested` is the caller's
+/// explicit declaration of which components this plan is for; the traversal must name every
+/// tensor the header carries FOR THOSE COMPONENTS, and may name nothing outside them.
+///
+/// The check used to be whole-header, and tfs-007's reason for it is unchanged and still
+/// enforced: a fill that silently skips a tensor is a wrong model, not a fast one. What was
+/// wrong was the SCOPE. An N-ary artifact packages several components under one snapshot —
+/// the canonical shape for every multi-task family — and a role class constructs only its
+/// own graph, so a whole-header rule made the standard packaging unservable: H3's Fl2VA
+/// class names 917 of 3445 tensors and was refused for the 2528 belonging to a sibling
+/// transformer it must not touch. It also contradicted the per-component residency the rest
+/// of the design assumes everywhere, which stages components independently by construction.
+///
+/// So the hole this closes is stated per component rather than per snapshot. A traversal
+/// missing one tensor of a component it REQUESTED still refuses, exactly as before. A
+/// traversal naming a tensor from a component it did not request refuses too — declaring a
+/// narrow scope and then reading outside it is the smuggling case, and it is the reason the
+/// scope is DECLARED rather than inferred from the keys the caller happened to name.
 pub fn plan_for_traversal(
     header: &Header,
     traversal: &[(String, String)],
+    requested: &[String],
     window: u64,
 ) -> Result<ReadPlan> {
+    let mut scope: Vec<&str> = requested.iter().map(|c| c.as_str()).collect();
+    scope.sort();
+    scope.dedup();
+    if scope.is_empty() {
+        return refuse(
+            Code::TRAVERSAL_INCOMPLETE,
+            "the plan declares no requested component: completeness is scoped to a declared \
+             set, and an empty one names nothing to be complete about"
+                .to_string(),
+        );
+    }
+    for comp in &scope {
+        if !header.components.iter().any(|(c, _)| c == comp) {
+            let carried: Vec<&str> = header.components.iter().map(|(c, _)| c.as_str()).collect();
+            return refuse(
+                Code::TRAVERSAL_INCOMPLETE,
+                format!(
+                    "the plan requests component {comp:?}, which this header does not carry \
+                     (it carries: {carried:?})"
+                ),
+            );
+        }
+    }
+
     let mut named: Vec<(&str, &str)> = traversal
         .iter()
         .map(|(c, k)| (c.as_str(), k.as_str()))
         .collect();
     named.sort();
     named.dedup();
+
+    // NO SMUGGLING: every named tensor belongs to a requested component.
+    if let Some((c, k)) = named.iter().find(|(c, _)| !scope.contains(c)) {
+        return refuse(
+            Code::TRAVERSAL_INCOMPLETE,
+            format!(
+                "the traversal names {c}/{k}, whose component is not in the requested set \
+                 {scope:?}: a plan reads the components it declared and no others"
+            ),
+        );
+    }
+
+    // NO HOLES, per requested component.
     let mut have: Vec<(&str, &str)> = header
         .tensors()
+        .filter(|(c, _, _)| scope.contains(&c.as_str()))
         .map(|(c, k, _)| (c.as_str(), k.as_str()))
         .collect();
     have.sort();
@@ -513,8 +570,8 @@ pub fn plan_for_traversal(
         return refuse(
             Code::TRAVERSAL_INCOMPLETE,
             format!(
-                "the traversal names {} distinct tensors, the header carries {} — first \
-                 missing: {missing:?}",
+                "the traversal names {} distinct tensors, the requested components \
+                 {scope:?} carry {} — first missing: {missing:?}",
                 named.len(),
                 have.len()
             ),

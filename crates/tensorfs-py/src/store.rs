@@ -567,17 +567,24 @@ impl PyPlan {
 }
 
 /// Build a read plan from canonical header bytes and the CALLER's traversal. Order is the
-/// caller's code topology; a traversal that does not name every tensor refuses.
+/// caller's code topology.
+///
+/// `components` DECLARES the scope completeness is checked against (#570b): the traversal
+/// must name every tensor the header carries for those components and none outside them.
+/// Absent, it defaults to every component the header carries — the whole-artifact reading,
+/// which is what a caller with no code topology to narrow by means.
 #[pyfunction]
-#[pyo3(signature = (header, traversal, window=1<<24))]
+#[pyo3(signature = (header, traversal, components=None, window=1<<24))]
 pub fn plan(
     py: Python<'_>,
     header: &[u8],
     traversal: Vec<(String, String)>,
+    components: Option<Vec<String>>,
     window: u64,
 ) -> PyResult<PyPlan> {
     let h = Header::parse(header).or_refuse(py)?;
-    let p = read::plan_for_traversal(&h, &traversal, window).or_refuse(py)?;
+    let scope = components.unwrap_or_else(|| h.components.iter().map(|(c, _)| c.clone()).collect());
+    let p = read::plan_for_traversal(&h, &traversal, &scope, window).or_refuse(py)?;
     Ok(PyPlan { plan: p })
 }
 

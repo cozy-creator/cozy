@@ -48,6 +48,13 @@ fn load(root: &Path, hex: &str) -> Result<(Store, SnapshotManifest, Header), Ref
 /// gets backwards. This is a STAND-IN for the caller's real code-topology traversal — the
 /// runtime supplies the true one and TensorFS guarantees only that it uses what it is given.
 /// It is here because the difference from key order is the whole point of the contract.
+/// Every component this header carries. The `tfs` CLI's own plans are whole-artifact by
+/// construction — it has no code topology to narrow by — so it declares the full set
+/// (#570b). A caller that binds a subset declares the subset.
+fn all_components(h: &Header) -> Vec<String> {
+    h.components.iter().map(|(c, _)| c.clone()).collect()
+}
+
 fn module_order(h: &Header) -> Vec<(String, String)> {
     let mut v: Vec<(String, String)> = h
         .tensors()
@@ -126,16 +133,21 @@ fn plan_of(h: &Header, f: &Flags) -> Result<ReadPlan, Refusal> {
         Some("reverse") => {
             let mut v = module_order(h);
             v.reverse();
-            read::plan_for_traversal(h, &v, window)
+            read::plan_for_traversal(h, &v, &all_components(h), window)
         }
-        _ => read::plan_for_traversal(h, &module_order(h), window),
+        _ => read::plan_for_traversal(h, &module_order(h), &all_components(h), window),
     }
 }
 
 pub fn cmd_plan(root: &Path, hex: &str, f: &Flags) -> ExitCode {
     let (_, _, h) = ok!(load(root, hex));
     let window: u64 = flag_num(f, "window", 16 << 20);
-    let dest = ok!(read::plan_for_traversal(&h, &module_order(&h), window));
+    let dest = ok!(read::plan_for_traversal(
+        &h,
+        &module_order(&h),
+        &all_components(&h),
+        window
+    ));
     let keyed = ok!(read::plan_in_key_order(&h, window));
     println!(
         "items:      {} covering {} B ({} B disk leg)",
@@ -155,7 +167,12 @@ pub fn cmd_plan(root: &Path, hex: &str, f: &Flags) -> ExitCode {
     // planner that quietly re-sorted would pass the identity case and fail this one.
     let mut rev = module_order(&h);
     rev.reverse();
-    let rp = ok!(read::plan_for_traversal(&h, &rev, window));
+    let rp = ok!(read::plan_for_traversal(
+        &h,
+        &rev,
+        &all_components(&h),
+        window
+    ));
     let expect: Vec<String> = rev
         .iter()
         .flat_map(|(c, k)| {
@@ -861,7 +878,72 @@ pub fn cmd_arms(root: &Path, hex: &str) -> ExitCode {
     a.arm(
         "traversal missing a tensor",
         Code::TRAVERSAL_INCOMPLETE,
-        read::plan_for_traversal(&h, &short, 1 << 20),
+        read::plan_for_traversal(&h, &short, &all_components(&h), 1 << 20),
+    );
+
+    // 5a-5d. COMPONENT-SCOPED COMPLETENESS (#570b). The scope moved from the snapshot to
+    // the declared component set; the hole it forbids did not move at all.
+    let comps = all_components(&h);
+    let one = comps[0].clone();
+    let only_one = std::slice::from_ref(&one);
+    let scoped: Vec<(String, String)> = module_order(&h)
+        .into_iter()
+        .filter(|(c, _)| c == &one)
+        .collect();
+
+    // GREEN, and it is the whole point: 1-of-N components, complete for that one, admits.
+    match read::plan_for_traversal(&h, &scoped, only_one, 1 << 20) {
+        Ok(p) => println!(
+            "  GREEN  a component-complete traversal of 1 of {} components admits: \
+             {} item(s), {} B",
+            comps.len(),
+            p.items.len(),
+            p.bytes
+        ),
+        Err(e) => {
+            a.missed += 1;
+            println!("  MISSED component-scoped plan should admit, got {e}");
+        }
+    }
+
+    // A hole WITHIN a requested component still refuses — tfs-007's rule, unmoved.
+    if scoped.len() > 1 {
+        let mut holed = scoped.clone();
+        holed.pop();
+        a.arm(
+            "a tensor missing WITHIN a requested component",
+            Code::TRAVERSAL_INCOMPLETE,
+            read::plan_for_traversal(&h, &holed, only_one, 1 << 20),
+        );
+    }
+
+    // NO SMUGGLING: naming a tensor outside the declared scope refuses. Planted from a REAL
+    // sibling component when the fixture has one, and from a synthetic name when it does
+    // not — the scope check runs before the header lookup, so both reach it, and the arm
+    // must exist on a single-component fixture too.
+    let mut smuggled = scoped.clone();
+    match module_order(&h).into_iter().find(|(c, _)| c != &one) {
+        Some(foreign) => smuggled.push(foreign),
+        None => smuggled.push(("a_sibling_component".to_string(), scoped[0].1.clone())),
+    }
+    a.arm(
+        "a tensor from a component the plan did not request",
+        Code::TRAVERSAL_INCOMPLETE,
+        read::plan_for_traversal(&h, &smuggled, only_one, 1 << 20),
+    );
+
+    // A requested component the header does not carry refuses rather than reading nothing.
+    a.arm(
+        "a requested component the header does not carry",
+        Code::TRAVERSAL_INCOMPLETE,
+        read::plan_for_traversal(&h, &scoped, &["not_a_component".to_string()], 1 << 20),
+    );
+
+    // An EMPTY declared scope is not "everything": it names nothing to be complete about.
+    a.arm(
+        "an empty requested component set",
+        Code::TRAVERSAL_INCOMPLETE,
+        read::plan_for_traversal(&h, &scoped, &[], 1 << 20),
     );
 
     // 6. element-level permute over a block-quantized carrier
