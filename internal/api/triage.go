@@ -126,11 +126,16 @@ func explain(document map[string]any) []string {
 		"attempt   " + str(attempt["request_id"]) + "#" + str(attempt["attempt"]) +
 			" (" + str(document["subject_id"]) + ")",
 		"spec      " + clip(str(attempt["exec_spec_digest"]), 30),
-		"terminal  " + str(terminal["status"]) + " / " + str(terminal["cause_code"]) +
+		// `outcome`, and the ADMISSION GENERATION beside the incarnation: the same two
+		// lines cr-011's own renderer prints (cozy-runtime `triage.py::explain`).
+		// `readiness_epoch` is DELETED with rev-2, not renamed, and this projection is
+		// deliberately the SAME VIEW as the runtime's — a second reader that drifts is two
+		// answers to one question.
+		"outcome   " + str(terminal["status"]) + " / " + str(terminal["cause_code"]) +
 			" from " + str(terminal["cause_origin"]),
 		"because   " + clip(str(terminal["safe_message"]), 300),
 		"executor  incarnation " + str(attempt["executor_incarnation"]) +
-			" readiness epoch " + str(attempt["readiness_epoch"]),
+			" admission generation " + str(attempt["admission_generation"]),
 	}
 	for _, f := range list(document["faults"]) {
 		row := object(f)

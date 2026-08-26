@@ -224,7 +224,7 @@ func sectionJourney() {
 	head("cozy logs <attempt> — the retained bundle, verified, explained")
 	code, out = cozyRun(root, "logs", attempt)
 	check("cozy logs <attempt> -> 0 and renders the server's explain projection",
-		code == 0 && strings.Contains(out, "terminal"), firstLine(out))
+		code == 0 && strings.Contains(out, "outcome"), firstLine(out))
 	fmt.Println(indent(out))
 
 	head("idempotency: one key names one request forever")
