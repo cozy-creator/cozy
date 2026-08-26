@@ -12,6 +12,7 @@ pub mod compat;
 pub mod corpus;
 pub mod dtype;
 pub mod err;
+pub mod fetch;
 pub mod fill;
 pub mod gc;
 pub mod grade;

@@ -75,6 +75,69 @@ impl Writable {
     }
 }
 
+/// The caller's byte SOURCE — the mirror of `Writable`, and the reason a worker can pull a
+/// multi-gigabyte artifact out of an HTTP response without a second full copy on disk or in
+/// RAM.
+///
+/// The transport adapter (boundaries.md §9: `HTTP/R2 fetch with attempt authority` is
+/// cozy-runtime's) hands over anything with `.read(n) -> bytes`. TensorFS never learns the
+/// URL, the token or the protocol; it hashes what arrives and admits it at the digest it
+/// computed, which is the same door `tfs put` and `tfs fetch admit` cross.
+///
+/// The GIL is held ONLY for the duration of each `.read()` call: hashing and writing the
+/// chunk happen with it released, so one pulling thread does not stall the rest of the
+/// process for the length of a download.
+struct Readable {
+    obj: Py<PyAny>,
+    /// The Python exception, kept verbatim. A dropped connection surfaces as the transport's
+    /// own error rather than as a flattened `IO_FAILED` string.
+    err: Option<PyErr>,
+}
+
+impl std::io::Read for Readable {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        let want = buf.len();
+        Python::with_gil(|py| {
+            let chunk = match self.obj.bind(py).call_method1("read", (want,)) {
+                Ok(c) => c,
+                Err(e) => {
+                    let msg = e.to_string();
+                    self.err = Some(e);
+                    return Err(std::io::Error::other(msg));
+                }
+            };
+            let bytes: Vec<u8> = if let Ok(b) = chunk.downcast::<PyBytes>() {
+                b.as_bytes().to_vec()
+            } else {
+                match chunk.extract::<Vec<u8>>() {
+                    Ok(v) => v,
+                    Err(e) => {
+                        let msg =
+                            format!(
+                            "the source's read({want}) returned {}, not bytes — a reader is an \
+                             object with .read(n) -> bytes, and a str would be a re-encoding: {e}",
+                            chunk.get_type().name().map(|n| n.to_string()).unwrap_or_default()
+                        );
+                        self.err = Some(e);
+                        return Err(std::io::Error::other(msg));
+                    }
+                }
+            };
+            if bytes.len() > want {
+                // Never silently truncate: over-reading is the caller's bug and the bytes
+                // beyond the buffer would vanish from the digest without a word.
+                return Err(std::io::Error::other(format!(
+                    "the source's read({want}) returned {} bytes — more than asked for; the \
+                     surplus cannot be hashed and will not be dropped in silence",
+                    bytes.len()
+                )));
+            }
+            buf[..bytes.len()].copy_from_slice(&bytes);
+            Ok(bytes.len())
+        })
+    }
+}
+
 fn receipts_to_py<'p>(py: Python<'p>, rx: &Receipts) -> PyResult<Bound<'p, PyList>> {
     let l = PyList::empty(py);
     for r in &rx.0 {
@@ -179,6 +242,46 @@ impl PyStore {
         d.set_item("id", p.obj.id())?;
         d.set_item("length", p.obj.length)?;
         d.set_item("admitted", p.admitted)?;
+        Ok(d)
+    }
+
+    /// Stream a READER into the CAS through the one verifying door (tfs-003 row 220).
+    ///
+    /// `reader` is anything with `.read(n) -> bytes` — an `http.client.HTTPResponse`, a
+    /// socket file, a pipe. `expect` is REQUIRED here, unlike `put_file`: a local file can
+    /// be re-read and re-hashed, but a network body arrives once, so admitting it without an
+    /// expectation would mean trusting whatever the remote sent. That is exactly the
+    /// property this method exists to hold, so there is no flag to turn it off.
+    ///
+    /// A digest or length disagreement refuses typed and commits NOTHING: the partial temp
+    /// file is removed on the way out of `put_stream`.
+    fn put_reader<'p>(
+        &self,
+        py: Python<'p>,
+        reader: &Bound<'p, PyAny>,
+        expect: &str,
+        expect_length: u64,
+    ) -> PyResult<Bound<'p, PyDict>> {
+        let want = obj_ref(py, expect, expect_length)?;
+        let mut src = Readable {
+            obj: reader.clone().unbind(),
+            err: None,
+        };
+        let put = py.allow_threads(|| {
+            self.store
+                .put_stream(&mut src, Some(&want), &Fault::default())
+        });
+        let put = match put {
+            Ok(p) => p,
+            // The transport's own exception outranks the border's IO_FAILED restatement of
+            // it: a dropped connection is the transport's fault to report, with its own
+            // traceback, and nothing was committed either way.
+            Err(e) => return Err(src.err.take().unwrap_or_else(|| to_py(py, &e))),
+        };
+        let d = PyDict::new(py);
+        d.set_item("id", put.obj.id())?;
+        d.set_item("length", put.obj.length)?;
+        d.set_item("admitted", put.admitted)?;
         Ok(d)
     }
 
@@ -810,4 +913,110 @@ pub fn ingest_reap<'p>(py: Python<'p>, store: &PyStore, now: u64) -> PyResult<Bo
 #[pyfunction]
 pub fn ingest_installed(store: &PyStore) -> Vec<String> {
     tensorfs_core::ingest::transaction::installed(&store.store)
+}
+
+// ---------------------------------------------------------------- the pull plane
+
+/// The fetch plan, computed by core against a real store (tfs-003 row 220).
+///
+/// The transport adapter asks this ONE question — what must actually move? — instead of
+/// answering it itself. A puller that re-derived "is it already here" in Python would be a
+/// second opinion about residency, and the two would disagree the first time a verification
+/// record went stale.
+///
+/// `declared` is the remote catalog's claim: `[(object_id, length), ...]`. The snapshot is
+/// folded into the covered set whether or not the claim listed it — an artifact without its
+/// own manifest is bytes nobody can open.
+#[pyfunction]
+#[pyo3(signature = (store, session, snapshot, snapshot_length, declared))]
+pub fn fetch_plan<'p>(
+    py: Python<'p>,
+    store: &PyStore,
+    session: &str,
+    snapshot: &str,
+    snapshot_length: u64,
+    declared: Vec<(String, u64)>,
+) -> PyResult<Bound<'p, PyDict>> {
+    let snap = obj_ref(py, snapshot, snapshot_length)?;
+    let mut refs = Vec::with_capacity(declared.len());
+    for (id, length) in &declared {
+        refs.push(obj_ref(py, id, *length)?);
+    }
+    let (plan, why) =
+        tensorfs_core::fetch::FetchPlan::of(&store.store, session, &snap, &refs).or_refuse(py)?;
+
+    let set = |v: &[ObjectRef]| -> PyResult<Bound<'p, PyList>> {
+        let l = PyList::empty(py);
+        for o in v {
+            l.append((o.id(), o.length))?;
+        }
+        Ok(l)
+    };
+    let presence = PyDict::new(py);
+    for (o, p) in &why {
+        presence.set_item(o.id(), p.as_str())?;
+    }
+    let d = PyDict::new(py);
+    d.set_item("session", &plan.session)?;
+    d.set_item("snapshot", plan.snapshot.id())?;
+    d.set_item("held", set(&plan.held)?)?;
+    d.set_item("wanted", set(&plan.wanted)?)?;
+    d.set_item("wanted_bytes", plan.wanted_bytes())?;
+    d.set_item("held_bytes", plan.held_bytes())?;
+    d.set_item("presence", presence)?;
+    // The canonical document, so a transport can hand the same plan to `tfs fetch admit`
+    // and to this module and neither can drift from the other.
+    d.set_item("document", PyBytes::new(py, &plan.canonical_bytes()))?;
+    Ok(d)
+}
+
+/// THE DOOR, plan-bound. Admits one object's bytes from a Python reader, and only an object
+/// the plan actually wants: an already-held digest refuses `NOT_CONTAINED` rather than
+/// quietly re-downloading, which is what makes idempotency a property instead of a habit.
+#[pyfunction]
+#[pyo3(signature = (store, plan, object_id, reader))]
+pub fn fetch_admit<'p>(
+    py: Python<'p>,
+    store: &PyStore,
+    plan: &[u8],
+    object_id: &str,
+    reader: &Bound<'p, PyAny>,
+) -> PyResult<Bound<'p, PyDict>> {
+    let plan = tensorfs_core::fetch::FetchPlan::parse(plan).or_refuse(py)?;
+    let hex = object_id.trim_start_matches("sha256:");
+    let length = plan
+        .wanted
+        .iter()
+        .chain(plan.held.iter())
+        .find(|o| o.sha256 == hex)
+        .map(|o| o.length)
+        .unwrap_or(0);
+    let want = obj_ref(py, hex, length)?;
+    let grant = tensorfs_core::fetch::DeliveryGrant::mint(&plan, &want).or_refuse(py)?;
+    let mut src = Readable {
+        obj: reader.clone().unbind(),
+        err: None,
+    };
+    let admitted = py.allow_threads(|| grant.admit(&store.store, &mut src));
+    let admitted = match admitted {
+        Ok(a) => a,
+        Err(e) => return Err(src.err.take().unwrap_or_else(|| to_py(py, &e))),
+    };
+    let d = PyDict::new(py);
+    d.set_item("id", admitted.object.id())?;
+    d.set_item("length", admitted.object.length)?;
+    d.set_item("admitted", admitted.first_writer)?;
+    d.set_item("key", grant.key())?;
+    Ok(d)
+}
+
+/// The PROOF: every object the plan declared is installed and this store's own record
+/// vouches for it. Refuses `DURABILITY_UNPROVEN` naming the first that is not.
+#[pyfunction]
+#[pyo3(signature = (store, plan))]
+pub fn fetch_complete(py: Python<'_>, store: &PyStore, plan: &[u8]) -> PyResult<u64> {
+    let plan = tensorfs_core::fetch::FetchPlan::parse(plan).or_refuse(py)?;
+    py.allow_threads(|| plan.complete(&store.store))
+        .or_refuse(py)?;
+    Ok(plan.declared_bytes())
 }

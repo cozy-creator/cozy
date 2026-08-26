@@ -139,6 +139,9 @@ CODEC_OWNERS = {
     "tensorfs.publish_grant/1": {"crates/tensorfs-core/src/cloud.rs"},
     "tensorfs.verified_object/1": {"crates/tensorfs-core/src/cloud.rs"},
     "tensorfs.catalog_root/1": {"crates/tensorfs-core/src/cloud.rs"},
+    # the pull plane (tfs-003 row 220) — the same rule in the other direction
+    "tensorfs.fetch_plan/1": {"crates/tensorfs-core/src/fetch.rs"},
+    "tensorfs.delivery_grant/1": {"crates/tensorfs-core/src/fetch.rs"},
 }
 CODEC_MARKS = list(CODEC_OWNERS)
 GRAMMAR_TAGS = ["ceil_block", "elements_div", "ceil_div"]

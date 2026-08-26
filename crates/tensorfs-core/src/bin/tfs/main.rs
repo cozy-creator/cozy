@@ -114,6 +114,13 @@
 //!   tfs cloud conflict <grant> <resident-checksum>   honest duplicate, or quarantine
 //!   tfs cloud publish <closure> <facts-dir>     the atomic root, over facts only
 //!
+//! The pull plane (tfs-003 row 220) — cloud run backwards. Core links no HTTP, so the
+//! transport is the caller's and the bytes arrive on stdin. Flags: --out <path> --why
+//!
+//!   tfs fetch plan <root> <closure> <session>   split the declared set: HELD vs WANTED
+//!   tfs fetch admit <root> <plan> <object-id>   THE DOOR — stdin in, verified object out
+//!   tfs fetch complete <root> <plan>            every declared object verifiably resident
+//!
 //! Roots, holds and local GC (tfs-006). Flags: --kind <k> --expect-generation <n>
 //! --hub-published --source-url <u> --hold-secs <s> --ready <p> --limit <n> --dry-run
 //! --allow-empty --free <b> --reserve <b>
@@ -280,6 +287,9 @@ fn main() -> ExitCode {
         ["cloud", "verified", g, v, e, c] => cloud::cmd_verified(Path::new(g), v, e, c, &flags),
         ["cloud", "conflict", g, r] => cloud::cmd_conflict(Path::new(g), r),
         ["cloud", "publish", c, d] => cloud::cmd_publish(Path::new(c), Path::new(d), &flags),
+        ["fetch", "plan", r, d, s] => fetch::cmd_plan(Path::new(r), Path::new(d), s, &flags),
+        ["fetch", "admit", r, p, i] => fetch::cmd_admit(Path::new(r), Path::new(p), i, &flags),
+        ["fetch", "complete", r, p] => fetch::cmd_complete(Path::new(r), Path::new(p)),
         ["compat", "import", r] => layout::cmd_import(Path::new(r), &flags),
         ["compat", "topology", r, h] => layout::cmd_topology(Path::new(r), h, &flags),
         ["compat", "check", c, h] => layout::cmd_check(Path::new(c), Path::new(h), &flags),
@@ -357,6 +367,7 @@ macro_rules! ok {
 mod ckpt;
 mod cloud;
 mod conform;
+mod fetch;
 mod fixtures;
 mod ingest;
 mod layout;
