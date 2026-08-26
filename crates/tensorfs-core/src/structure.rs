@@ -58,7 +58,7 @@ impl StructureFixture {
         topology_value(self.tensors())
     }
 
-    /// The banked key. Two structures with the same component roles, canonical logical keys
+    /// The banked key. Two structures with the same components, canonical logical keys
     /// and logical shapes have the same digest, whatever their bytes are encoded as.
     pub fn topology_digest(&self) -> String {
         topology_digest_of(&self.topology_value())
