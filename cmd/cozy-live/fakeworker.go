@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"crypto/rand"
 	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
@@ -318,12 +319,14 @@ func stealTerminal(send func(*pb.WorkerMessage), session string, say func(string
 	send(&pb.WorkerMessage{Msg: &pb.WorkerMessage_AttemptTerminal{AttemptTerminal: t}})
 }
 
+// randomHex uses crypto/rand, which speaks for every OS — the /dev/urandom spelling
+// silently produced all-zero session ids on Windows, colliding every fake worker on one
+// session (found by the windows-proc run: the "second writer" and "worker B" arms were
+// really SESSION_COLLISION refusals).
 func randomHex(n int) string {
 	b := make([]byte, n)
-	f, err := os.Open("/dev/urandom")
-	if err == nil {
-		_, _ = f.Read(b)
-		f.Close()
+	if _, err := rand.Read(b); err != nil {
+		panic("no randomness for a fake session id: " + err.Error())
 	}
 	return hex.EncodeToString(b)
 }
