@@ -4,44 +4,25 @@ import (
 	"encoding/json"
 	"os/exec"
 	"path/filepath"
-	"sort"
 	"strings"
 
 	"github.com/cozy-creator/cozy-creator-v2/internal/exit"
 	"github.com/cozy-creator/cozy-creator-v2/internal/home"
 )
 
-// The LOCAL ARTIFACT INDEX, read through the runtime's own `list` verb.
+// THE LOCAL ARTIFACT INDEX IS NOT READ HERE ANY MORE (#567e).
 //
-// cozy-runtime-cli.md §Local authority makes "install local snapshot refs" a CLI-layer
-// power: the runtime CORE is handed exact store roots and snapshot digests and never
-// resolves a ref, and `cozy_runtime.cli.artifacts` is where a ref becomes those facts.
-// cozy-creator asks that owner rather than reading its files — the index's layout is the
-// runtime's, and a second reader of it would be a second layout to keep in step.
-
-// ModelArtifact is one locally installed checkpoint, in the runtime's own vocabulary.
-type ModelArtifact struct {
-	Ref            string            `json:"ref"`
-	Store          string            `json:"store"`
-	Config         string            `json:"config"`
-	Snapshots      map[string]string `json:"snapshots"`
-	Lane           string            `json:"lane"`
-	Bytes          int64             `json:"bytes"`
-	Tensors        int               `json:"tensors"`
-	Variant        string            `json:"variant"`
-	Custody        string            `json:"custody"`
-	VRAMFloorBytes int64             `json:"vram_floor_bytes"`
-}
-
-// Components is the artifact's component set, ordered as the index orders it.
-func (a ModelArtifact) Components() []string {
-	out := make([]string, 0, len(a.Snapshots))
-	for name := range a.Snapshots {
-		out = append(out, name)
-	}
-	sort.Strings(out)
-	return out
-}
+// This file used to carry `ModelArtifact`, `Artifacts()` and `Find()` — a whole capability
+// for turning a ref into store roots and snapshot digests by asking the runtime's `list`
+// verb. Every caller of it was the binding-record writer, and #565b's rule says that writer
+// is the wrong machine to ask: RESOLUTION IS THE RESOLVER'S OWN. A record now names the ref
+// and the SERVING machine resolves it against its own index, so the capability has no
+// honest caller left and is deleted rather than kept as an entry point nobody may use
+// (#496e: the deletion unit is the capability, not the function).
+//
+// The refusal it used to raise moved with it, and improved: an artifact this host lacks is
+// no longer exit 4 on the owner's box before a request is even sent, it is a typed
+// BINDING_UNAVAILABLE from the pod that would have served it, naming that pod's own index.
 
 // RuntimeCLI is one generation's own cozy-runtime binary, run against a named local root.
 // Every question this host asks the runtime goes through here, so there is one place
@@ -127,50 +108,6 @@ func condense(s string) string {
 		return s[:400] + "…"
 	}
 	return s
-}
-
-// Artifacts is the local artifact index, as the runtime reports it.
-func (r RuntimeCLI) Artifacts() ([]ModelArtifact, *exit.Error) {
-	var rows []ModelArtifact
-	if e := r.call(&rows, "list"); e != nil {
-		return nil, e
-	}
-	return rows, nil
-}
-
-// Find resolves one ref against the index. A miss is exit 4 naming the pull that fixes
-// it — the same refusal the runtime's own local orchestrator raises for the same cause.
-func (r RuntimeCLI) Find(ref string) (ModelArtifact, *exit.Error) {
-	rows, e := r.Artifacts()
-	if e != nil {
-		return ModelArtifact{}, e
-	}
-	for _, a := range rows {
-		if a.Ref == ref {
-			return a, nil
-		}
-	}
-	// A bare `org/repo` matches any release of it, exactly as the index's own lookup does.
-	if !strings.Contains(ref, "@") {
-		for _, a := range rows {
-			if strings.HasPrefix(a.Ref, ref+"@") {
-				return a, nil
-			}
-		}
-	}
-	have := make([]string, 0, len(rows))
-	for _, a := range rows {
-		have = append(have, a.Ref)
-	}
-	sort.Strings(have)
-	held := strings.Join(have, ", ")
-	if held == "" {
-		held = "nothing"
-	}
-	return ModelArtifact{}, exit.New(exit.NotFound,
-		"%s is not in this host's local artifact index", ref).
-		WithRemedy("the index holds: %s", held).
-		WithNext("cozy pull " + ref)
 }
 
 // Binding is one RESOLVED binding record, exactly as `cozy-runtime bindings` reports it.

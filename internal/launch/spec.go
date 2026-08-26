@@ -190,54 +190,35 @@ func (f *Facts) binding(ep *Entrypoint, table map[string]Binding) (*orchestrator
 				strings.Join(known, ", ")).
 			WithNext("cozy describe " + f.Install.Endpoint)
 	}
-	artifact, e := f.RuntimeCLI.Find(selected.Ref)
-	if e != nil {
-		return nil, e
-	}
-	// The DECLARED component set for this function narrows what the record stages; an
-	// endpoint that declares none takes the artifact whole.
-	components := artifact.Components()
-	if declared := slot.ComponentUse[ep.Name]; len(declared) > 0 {
-		narrowed := []string{}
-		for _, name := range components {
-			for _, want := range declared {
-				if name == want {
-					narrowed = append(narrowed, name)
-				}
-			}
-		}
-		if len(narrowed) > 0 {
-			components = narrowed
-		}
-	}
-	// REAL SETS in the record: the component order is a list and the per-component
-	// snapshots are a map. They were comma-packed strings, which is a second grammar both
-	// sides had to agree about by hand (cr-008b's deferred break, taken 2026-08-25).
-	snapshots := make(map[string]string, len(artifact.Snapshots))
-	for _, name := range artifact.Components() {
-		snapshots[name] = artifact.Snapshots[name]
-	}
-	floor := artifact.VRAMFloorBytes
-	if floor == 0 {
-		floor = vramFloor
-	}
+	// THE RECORD NAMES THE ARTIFACT, IT DOES NOT RESOLVE IT (#567e).
+	//
+	// This used to call `RuntimeCLI.Find(selected.Ref)` and copy the answer — store root,
+	// per-component snapshot map, config path, variant, custody, VRAM floor — into the
+	// document. Every one of those is a fact about a DISK, and the disk it was read from is
+	// this box's. A rented pod holding the artifact perfectly was dispatched a record
+	// describing a store it has never seen; worse, the owner could not mint the record at
+	// all, because a host that has not pulled 92 GiB it never intends to serve exits 4 on
+	// its own empty index before a request leaves it. That is the whole of hard stop 2.
+	//
+	// #565b's rule already covered `project` and this is its exact twin: RESOLUTION IS THE
+	// RESOLVER'S OWN. So the record states the REF — identity, the same string on both
+	// machines — and the worker resolves it against the index of the machine that is going
+	// to serve. A local run is unchanged by construction: there, both machines are this one.
+	//
+	// `components` stays, and is a different KIND of fact: it is the CLASS's declared
+	// component set, read off the descriptor of the release BOTH machines installed. The
+	// worker intersects it with what the artifact carries.
 	record["model_class"] = slot.Class
 	record["model_binding_path"] = slot.Path
 	record["model_parameter_name"] = slot.Param
-	record["components"] = components
-	record["store"] = artifact.Store
-	record["config"] = artifact.Config
-	record["snapshot"] = artifact.Snapshots[components[0]]
-	record["snapshots"] = snapshots
-	record["release"] = artifact.Ref
-	record["variant"] = artifact.Variant
+	record["artifact_ref"] = selected.Ref
+	record["components"] = append([]string{}, slot.ComponentUse[ep.Name]...)
+	record["release"] = selected.Ref
 	record["vram_bytes"] = int64(vramBudget)
 	record["host_bytes"] = int64(hostBudget)
 	record["pinned_bytes"] = int64(pinnedBudget)
-	record["vram_floor_bytes"] = floor
 	record["resident_budget_bytes"] = int64(0)
 	record["tenancy"] = "local"
-	record["custody"] = artifact.Custody
 	record["strict_keys"] = false
 	return &orchestrator.Binding{
 		Entrypoint: ep.Name, Record: record, Outputs: AssetPaths(ep.Result),
