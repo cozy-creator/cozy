@@ -201,14 +201,21 @@ check "and the server-backed verbs refuse 9 again" "$([ "$CODE" = 9 ] && echo 1 
 if [ -n "$UPGRADE" ] && [ -f "$UPGRADE" ]; then
   section "UPGRADE — the same verify-then-rename, pointed at a different asset"
   BEFORE="$("$COZY" version --fields tag | grep '^tag:')"
+  RECORDS_BEFORE="$(sha256sum "$COZY_HOME/records.db" | cut -d' ' -f1)"
   OUT="$("$INSTALL" --asset "$UPGRADE" --prefix "$PREFIX" 2>&1)"; CODE=$?
   printf '%s\n' "$OUT" | sed 's/^/    /'
   AFTER="$("$COZY" version --fields tag | grep '^tag:')"
   check "the upgrade verified its own checksum and exits 0" "$([ "$CODE" = 0 ] && echo 1 || echo 0)" "exit $CODE"
   check "the installed binary now reports the new tag" \
     "$([ "$BEFORE" != "$AFTER" ] && echo 1 || echo 0)" "${BEFORE#tag: } -> ${AFTER#tag: }"
-  check "and the install record survived the replacement" \
-    "$("$COZY" ls 2>/dev/null | grep -q 'cozy/weightless' && echo 1 || echo 0)" "$COZY_HOME"
+  RECORDS_AFTER="$(sha256sum "$COZY_HOME/records.db" | cut -d' ' -f1)"
+  check "and the local record database survived byte-for-byte" \
+    "$([ "$RECORDS_BEFORE" = "$RECORDS_AFTER" ] && "$COZY" ls >/dev/null 2>&1 && echo 1 || echo 0)" \
+    "$COZY_HOME/records.db sha256:$RECORDS_AFTER"
+  if [ -n "$ENDPOINT" ]; then
+    check "and the installed endpoint survived the replacement" \
+      "$("$COZY" ls 2>/dev/null | grep -q 'cozy/weightless' && echo 1 || echo 0)" "$COZY_HOME"
+  fi
 fi
 
 printf '\n%d passed, %d failed\n' "$PASS" "$FAIL"

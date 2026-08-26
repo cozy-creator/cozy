@@ -29,19 +29,40 @@ jobs:
   # moved and this consumer has not flipped. That red IS the flip obligation arriving.
   vendored-protocol:
     runs-on: ubuntu-latest
+    env:
+      WORKER_PROTOCOL_TOKEN: ${{ secrets.WORKER_PROTOCOL_TOKEN }}
     steps:
       - uses: actions/checkout@v4
         with:
           path: cozy-creator
-      - uses: actions/checkout@v4
+      # This arm is self-contained and always executes. It proves that the copied bytes are the
+      # exact reviewed worker-protocol@df05c8d set recorded in protocol/SHA256SUMS. Runtime's
+      # wire_schema_digest remains the safety fence if the private peer later advances.
+      - name: Verify reviewed vendored bytes
+        working-directory: cozy-creator
+        run: sha256sum --check protocol/SHA256SUMS
+      # GITHUB_TOKEN is repository-scoped and cannot read a private sibling. When an explicit
+      # read token exists, additionally compare against worker-protocol master so drift arrives
+      # at build time. Its absence is reported, never disguised as a failed code check.
+      - name: Check out current worker protocol
+        if: env.WORKER_PROTOCOL_TOKEN != ''
+        uses: actions/checkout@v4
         with:
           repository: cozy-creator/worker-protocol-v2
           path: worker-protocol
+          token: ${{ env.WORKER_PROTOCOL_TOKEN }}
       - uses: actions/setup-go@v5
+        if: env.WORKER_PROTOCOL_TOKEN != ''
         with:
           go-version: stable
       - uses: astral-sh/setup-uv@v5
-      - run: worker-protocol/scripts/vendored-diff.sh cozy-creator/protocol/cozy/worker/v1
+        if: env.WORKER_PROTOCOL_TOKEN != ''
+      - name: Compare against current peer
+        if: env.WORKER_PROTOCOL_TOKEN != ''
+        run: worker-protocol/scripts/vendored-diff.sh cozy-creator/protocol/cozy/worker/v1
+      - name: Report unarmed peer drift check
+        if: env.WORKER_PROTOCOL_TOKEN == ''
+        run: echo '::warning::WORKER_PROTOCOL_TOKEN is absent; exact reviewed bytes passed, but current private-peer drift was not queried'
 
   # cl-013's SHIPPED GUARD. A green `checks` is a fact about the source tree; this job is a
   # fact about the artifact a user would install. They are separate evidence axes and a
