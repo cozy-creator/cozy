@@ -152,11 +152,13 @@ CREATE TABLE IF NOT EXISTS outputs (
 // cannot express. `stale` is a fragment of the OLD table's own DDL, read back out of
 // `sqlite_master`, so the rebuild is skipped on every root that already carries the new
 // shape: idempotent by observation, not by a version counter nobody maintains.
-var rebuild = []struct {
+type tableRebuild struct {
 	table string
 	stale string
 	steps []string
-}{{
+}
+
+var rebuild = append([]tableRebuild{{
 	table: "job_checkpoints",
 	stale: "PRIMARY KEY (request_id, operation_key, logical_key)",
 	steps: []string{
@@ -183,7 +185,7 @@ var rebuild = []struct {
 		                 WHERE a.request_id=c.request_id AND a.attempt=c.attempt)`,
 		`DROP TABLE job_checkpoints_pre_attempt_key`,
 	},
-}}
+}}, rentalRebuild...)
 
 // widen carries the columns a table gained after some root already created it. Applied
 // after `schema`, and a duplicate-column answer means it is already there.

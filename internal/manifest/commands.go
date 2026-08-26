@@ -307,17 +307,14 @@ var Commands = []Command{
 	},
 
 	// ---- rentals (cl-015) ----
-	// A rental is a POD the hub provisioned and this host ATTACHES a worker to. None of
-	// these verbs needs the LocalService: renting is a hub act plus a records/credential
-	// write (cl-009's D3 rule), and a service already running resolves the new rental on
-	// its next dispatch because it reads the store rather than a startup snapshot.
+	// A rental is a provider-neutral pod lifetime. This slice persists exact desired
+	// request bytes; cl-019 moves their side effects under the LocalService reconciler.
 	{
 		Path: []string{"rent"}, Group: "rentals",
 		Summary: "rent a pod through the hub and pin its dial triple for `run --worker`",
-		Args:    "<hub-endpoint>", MinArgs: 1, MaxArgs: 1,
+		Args:    "<endpoint-ref>", MinArgs: 1, MaxArgs: 1,
 		Flags: []Flag{
-			{Name: "--card", Arg: "<name>", Summary: "required; the accelerator the hub provisions"},
-			{Name: "--region", Arg: "<datacenter>", Summary: "optional placement preference; absent lets the provider place it"},
+			{Name: "--accelerator", Arg: "<model>", Summary: "required; provider-neutral accelerator model"},
 			{Name: "--idempotency-key", Arg: "<key>", Summary: "resume one paid ask; the same key never buys twice"},
 			{Name: "--timeout", Arg: "<dur>", Summary: "give up waiting for ready; the pod is NOT released"},
 			{Name: "--reason", Arg: "<why>", Summary: "required; the hub records it durably before it acts"},

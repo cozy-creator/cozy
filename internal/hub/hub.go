@@ -99,11 +99,12 @@ type ConfigKey struct {
 }
 
 type call struct {
-	method string
-	path   string
-	body   any
-	admin  bool   // carries the admin token
-	reason string // X-Tensorhub-Reason; the hub refuses a mutation without one
+	method    string
+	path      string
+	body      any
+	bodyBytes []byte // exact caller-persisted JSON; never re-marshaled on replay
+	admin     bool   // carries the admin token
+	reason    string // X-Tensorhub-Reason; the hub refuses a mutation without one
 	// idempotency is the caller-owned operation identity for a paid mutation. It is
 	// distinct from Tensorhub's provider operation id and survives a lost HTTP answer.
 	idempotency string
@@ -183,7 +184,12 @@ func (c *Client) do(ctx context.Context, cl call, out any) *exit.Error {
 	}
 
 	var body io.Reader
-	if cl.body != nil {
+	if cl.body != nil && cl.bodyBytes != nil {
+		return exit.Internalf("hub call %s %s supplied both structured and exact request bytes", cl.method, cl.path)
+	}
+	if cl.bodyBytes != nil {
+		body = bytes.NewReader(cl.bodyBytes)
+	} else if cl.body != nil {
 		b, err := json.Marshal(cl.body)
 		if err != nil {
 			return exit.Internalf("encoding the request body failed: %s", err)
@@ -199,7 +205,7 @@ func (c *Client) do(ctx context.Context, cl call, out any) *exit.Error {
 	}
 	req.Header.Set("Accept", "application/json")
 	req.Header.Set("User-Agent", c.agent)
-	if cl.body != nil {
+	if cl.body != nil || cl.bodyBytes != nil {
 		req.Header.Set("Content-Type", "application/json")
 	}
 	if cl.reason != "" {

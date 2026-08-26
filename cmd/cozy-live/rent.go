@@ -50,6 +50,8 @@ import (
 // the pod directory the owner reserved, and the owner FETCHES the bytes back and verifies
 // them before it acks. Nothing in it is stubbed, and the arms say where each byte was.
 
+const rentalEndpointRef = endpointRef + "/v1/denoise"
+
 func sectionRent() {
 	root := flag("home", filepath.Join(os.TempDir(), "cozy-live", "cl015-rent"))
 	must("clearing the root", os.RemoveAll(root))
@@ -72,12 +74,12 @@ func sectionRent() {
 
 	head("the credential arms come FIRST: a rental is a first-party write")
 	code, out := cozyRunEnv(root, []string{"TENSORHUB_URL=" + hub.url()},
-		"rent", "h3", "--card", "H200", "--reason", "cl-015 live")
+		"rent", rentalEndpointRef, "--accelerator", "NVIDIA H200", "--reason", "cl-015 live")
 	check("no configured token -> 5, answered BEFORE the dial",
 		code == 5 && strings.Contains(out, "no admin token is configured"), firstLine(out))
 	code, out = cozyRunEnv(root,
 		[]string{"TENSORHUB_URL=" + hub.url(), "TENSORHUB_TOKEN=" + randomHex(16)},
-		"rent", "h3", "--card", "H200", "--reason", "cl-015 live")
+		"rent", rentalEndpointRef, "--accelerator", "NVIDIA H200", "--reason", "cl-015 live")
 	check("a FOREIGN token -> 5 carrying the hub's own typed refusal",
 		code == 5 && strings.Contains(out, "rental.unauthenticated"), firstLine(out))
 
@@ -86,7 +88,7 @@ func sectionRent() {
 		Release: release, LoseFirstRentResponse: true})
 	defer lost.close()
 	operationKey := "cl-019-response-loss"
-	code, out = cozyRunEnv(root, lost.env(), "rent", "h3", "--card", "H200",
+	code, out = cozyRunEnv(root, lost.env(), "rent", rentalEndpointRef, "--accelerator", "NVIDIA H200",
 		"--idempotency-key", operationKey, "--reason", "cl-019 response-loss arm")
 	check("the first caller sees a transport failure after the hub committed",
 		code == 9 && lost.created() == 1, fmt.Sprintf("exit %d · creates %d", code, lost.created()))
@@ -98,7 +100,7 @@ func sectionRent() {
 	check("the original renter token survived under the pending operation",
 		len(pending) == 1 && len(strings.TrimSpace(string(pendingToken))) == 64,
 		fmt.Sprintf("%d pending token(s)", len(pending)))
-	code, out = cozyRunEnv(root, lost.env(), "rent", "h3", "--card", "H200",
+	code, out = cozyRunEnv(root, lost.env(), "rent", rentalEndpointRef, "--accelerator", "NVIDIA H200",
 		"--idempotency-key", operationKey, "--reason", "retry prose cannot rewrite the ask")
 	lostRental := field(out, "rental")
 	finalToken, _ := os.ReadFile(filepath.Join(root, "rentals", lostRental+".token"))
@@ -106,16 +108,16 @@ func sectionRent() {
 		code == 0 && strings.HasPrefix(lostRental, "rnt-") && lost.created() == 1 &&
 			bytes.Equal(pendingToken, finalToken),
 		fmt.Sprintf("exit %d · rental %s · creates %d", code, lostRental, lost.created()))
-	code, out = cozyRunEnv(root, lost.env(), "rent", "h3", "--card", "H200",
-		"--region", "changed-body", "--idempotency-key", operationKey,
+	code, out = cozyRunEnv(root, lost.env(), "rent", rentalEndpointRef, "--accelerator", "NVIDIA H100",
+		"--idempotency-key", operationKey,
 		"--reason", "changed body")
 	check("the same key with a changed body conflicts before another create",
 		code == 13 && lost.created() == 1, fmt.Sprintf("exit %d · creates %d", code, lost.created()))
 
 	head("the ask names its hardware and its reason, or it is a usage refusal")
-	code, out = cozyRunEnv(root, hub.env(), "rent", "h3", "--reason", "cl-015 live")
-	check("no --card -> 2", code == 2 && strings.Contains(out, "--card is required"), firstLine(out))
-	code, out = cozyRunEnv(root, hub.env(), "rent", "h3", "--card", "H200")
+	code, out = cozyRunEnv(root, hub.env(), "rent", rentalEndpointRef, "--reason", "cl-015 live")
+	check("no --accelerator -> 2", code == 2 && strings.Contains(out, "--accelerator is required"), firstLine(out))
+	code, out = cozyRunEnv(root, hub.env(), "rent", rentalEndpointRef, "--accelerator", "NVIDIA H200")
 	check("no --reason -> 2: the hub records why before it spends",
 		code == 2 && strings.Contains(out, "--reason is required"), firstLine(out))
 
@@ -125,9 +127,9 @@ func sectionRent() {
 	rentMS := elapsedMS(t0)
 	fmt.Println(indent(out))
 	check("cozy rent -> 0 with a rental id", strings.HasPrefix(rentalA, "rnt-"), rentalA)
-	check("it reports the pod's own state, address and pod id",
+	check("it reports the rental state, direct address, and requested accelerator",
 		strings.Contains(out, "state:") && strings.Contains(out, "127.0.0.1:") &&
-			strings.Contains(out, "pod-"), field(out, "address")+" "+field(out, "pod"))
+			field(out, "accelerator") == "NVIDIA H200", field(out, "address")+" "+field(out, "accelerator"))
 	fmt.Printf("  bench ask -> ready -> pinned: %d ms\n", rentMS)
 
 	head("the owner token is MINTED HERE, and the hub is never told it (#495e)")
@@ -494,10 +496,10 @@ func sectionRent() {
 	head("RED: a hub whose pods never come up")
 	broken := startPodHub(filepath.Join(root, "hub-broken"), "remote", true)
 	defer broken.close()
-	code, out = cozyRunEnv(root, broken.env(), "rent", "h3", "--card", "H200",
+	code, out = cozyRunEnv(root, broken.env(), "rent", rentalEndpointRef, "--accelerator", "NVIDIA H200",
 		"--reason", "cl-015 failed-provision arm")
 	check("a rental that fails to provision -> 11, carrying the hub's own detail",
-		code == 11 && strings.Contains(out, "no capacity"), firstLine(out))
+		code == 11 && strings.Contains(out, "no eligible capacity"), firstLine(out))
 	check("and nothing was pinned for it: there is no triple to pin",
 		!strings.Contains(out, "owner_token"), "")
 
@@ -524,7 +526,7 @@ func sectionRent() {
 // rentOne rents a pod and returns its id with the whole rendering, so an arm can search
 // what was printed as well as act on the id.
 func rentOne(root string, h *podHub, reason string) (string, string) {
-	code, out := cozyRunEnv(root, h.env(), "rent", "h3", "--card", "H200", "--reason", reason)
+	code, out := cozyRunEnv(root, h.env(), "rent", rentalEndpointRef, "--accelerator", "NVIDIA H200", "--reason", reason)
 	if code != 0 {
 		fmt.Println(indent(out))
 		return "", out

@@ -2,10 +2,14 @@ package hub
 
 import (
 	"context"
+	"encoding/json"
 	"net/http"
+	"net/url"
+	"regexp"
 	"strings"
 
 	"github.com/cozy-creator/cozy-creator-v2/internal/exit"
+	"github.com/cozy-creator/cozy-creator-v2/internal/rentalid"
 )
 
 // The RENTAL routes (cl-015, on th-042's product surface). The hub owns the pod: it
@@ -22,9 +26,10 @@ import (
 //
 // The contract is the hub's and is consumed verbatim, exactly as the catalog's is:
 //
-//	POST   /v1/private-rentals       {endpoint, card, renter_token_sha256:[<64 hex>]}
+//	POST   /v1/private-rentals       {endpoint_ref, accelerator_model,
+//	                                 renter_token_sha256:[<64 hex>]}
 //	                                 -> 202 {rental_id, state, ...}
-//	GET    /v1/private-rentals/{id}  -> {state, address, cert_pem, media_address, pod_id,
+//	GET    /v1/private-rentals/{id}  -> {state, address, cert_pem, media_address,
 //	                                     detail, renter_token_sha256:[...]}
 //	DELETE /v1/private-rentals/{id}  -> 204
 //
@@ -51,7 +56,6 @@ type Rental struct {
 	State   string
 	Address string
 	CertPEM string
-	PodID   string
 	Detail  string
 	// MediaAddress is the pod's BYTE PLANE (cl-014, ruled #506b): the co-resident media
 	// server's own listener, which is where an owner uploads a payload and downloads an
@@ -90,10 +94,20 @@ type wireRental struct {
 	State        string   `json:"state"`
 	Address      string   `json:"address"`
 	CertPEM      string   `json:"cert_pem"`
-	PodID        string   `json:"pod_id"`
 	Detail       string   `json:"detail"`
 	MediaAddress string   `json:"media_address"`
 	TokenSHA256  []string `json:"renter_token_sha256"`
+}
+
+var bareSHA256Pattern = regexp.MustCompile(`^[0-9a-f]{64}$`)
+
+func validateRentalID(id string) *exit.Error {
+	if !rentalid.Valid(id) {
+		return exit.Named(exit.Validation, "hub.rental_id_invalid",
+			"the hub returned an invalid opaque rental_id").
+			WithRemedy("the hub must mint a portable opaque name, never path syntax or a reserved device name")
+	}
+	return nil
 }
 
 func (w wireRental) rental(id string) Rental {
@@ -102,9 +116,38 @@ func (w wireRental) rental(id string) Rental {
 	}
 	return Rental{
 		ID: id, State: w.State, Address: w.Address, CertPEM: w.CertPEM,
-		PodID: w.PodID, Detail: w.Detail, MediaAddress: w.MediaAddress,
+		Detail: w.Detail, MediaAddress: w.MediaAddress,
 		TokenSHA256: w.TokenSHA256,
 	}
+}
+
+// RentalRequest is the closed provider-neutral product intent. Provider,
+// datacenter, offer, image, cache volume, disk, and ports do not have fields
+// here: Tensorhub resolves and selects them.
+type RentalRequest struct {
+	EndpointRef       string   `json:"endpoint_ref"`
+	AcceleratorModel  string   `json:"accelerator_model"`
+	RenterTokenSHA256 []string `json:"renter_token_sha256"`
+}
+
+// RentalRequestBytes authors the exact bytes persisted before POST and replayed
+// unchanged after response loss. There is one encoder, not a digest struct plus
+// a separately marshaled transport map that can drift.
+func RentalRequestBytes(endpointRef, acceleratorModel, tokenSHA256 string) ([]byte, *exit.Error) {
+	req := RentalRequest{
+		EndpointRef: strings.TrimSpace(endpointRef), AcceleratorModel: strings.TrimSpace(acceleratorModel),
+		RenterTokenSHA256: []string{strings.TrimPrefix(strings.TrimSpace(tokenSHA256), "sha256:")},
+	}
+	if req.EndpointRef == "" || req.AcceleratorModel == "" ||
+		!bareSHA256Pattern.MatchString(req.RenterTokenSHA256[0]) {
+		return nil, exit.Named(exit.Validation, "rental.intent_incomplete",
+			"endpoint_ref, accelerator_model, and one 64-character lowercase renter_token_sha256 are required")
+	}
+	raw, err := json.Marshal(req)
+	if err != nil {
+		return nil, exit.Internalf("cannot encode the closed rental request: %s", err)
+	}
+	return raw, nil
 }
 
 // Rent asks for a pod, presenting the HASH of a token the caller has already minted. It
@@ -116,29 +159,14 @@ func (w wireRental) rental(id string) Rental {
 // `sha256:` prefix is the token-hash FILE's spelling and belongs to the pod, not the wire.
 // The token itself is not an argument here, in this package, or anywhere on this wire: a
 // hub that was sent a plaintext credential would be a hub that could use it.
-// Rent asks the hub for one pod. `region` is OPTIONAL and is the renter's only say in
-// WHERE: empty lets the hub's provider place the pod wherever it has stock, which is the
-// ordinary case.
-//
-// The field existed on the hub's side of this contract and had no client half (#569). It
-// stopped being academic the day four consecutive H200 allocations came back from one
-// machine whose uplink to PyPI was pinned at ~80 KB/s: a renter with a measured, named
-// reason to be somewhere else could not say so, and the only lever left was to buy the
-// same pod again. A placement preference is not a hardware choice and it is not policy —
-// it is the one fact about a rental that the renter, and only the renter, may have
-// evidence for.
-func (c *Client) Rent(ctx context.Context, endpoint, card, region, tokenSHA256, reason, operationKey string) (Rental, *exit.Error) {
-	body := map[string]any{
-		"endpoint": endpoint, "card": card,
-		"renter_token_sha256": []string{tokenSHA256},
-	}
-	if region != "" {
-		body["region"] = region
-	}
+// Rent retransmits the exact canonical bytes the caller persisted before the
+// paid mutation. The hub authority is bound separately by the local operation
+// digest; a retry against another hub therefore conflicts before this method.
+func (c *Client) Rent(ctx context.Context, requestBody []byte, reason, operationKey string) (Rental, *exit.Error) {
 	var out wireRental
 	e := c.do(ctx, call{
 		method: http.MethodPost, path: "/v1/private-rentals", admin: true, reason: reason,
-		idempotency: operationKey, body: body,
+		idempotency: operationKey, bodyBytes: requestBody,
 	}, &out)
 	if e != nil {
 		return Rental{}, e
@@ -148,15 +176,26 @@ func (c *Client) Rent(ctx context.Context, endpoint, card, region, tokenSHA256, 
 			"the hub accepted the rental and named no rental_id").
 			WithRemedy("this route may not exist on this hub build; `cozy hub status` names it and its version")
 	}
+	if e := validateRentalID(out.ID); e != nil {
+		return Rental{}, e
+	}
 	return out.rental(""), nil
 }
 
 // Rental reads one rental's current state. Admin, like every first-party route.
 func (c *Client) Rental(ctx context.Context, id string) (Rental, *exit.Error) {
+	if e := validateRentalID(id); e != nil {
+		return Rental{}, e
+	}
 	var out wireRental
-	e := c.do(ctx, call{method: http.MethodGet, path: "/v1/private-rentals/" + id, admin: true}, &out)
+	e := c.do(ctx, call{method: http.MethodGet, path: "/v1/private-rentals/" + url.PathEscape(id), admin: true}, &out)
 	if e != nil {
 		return Rental{}, e
+	}
+	if out.ID != "" && out.ID != id {
+		return Rental{}, exit.Named(exit.Conflict, "hub.rental_id_changed",
+			"the hub answered rental %s with identity %s", id, out.ID).
+			WithRemedy("preserve the original rental identity; never attach the response under another id")
 	}
 	return out.rental(id), nil
 }
@@ -165,7 +204,10 @@ func (c *Client) Rental(ctx context.Context, id string) (Rental, *exit.Error) {
 // 404 reaches the caller as the hub's own refusal rather than being swallowed as "already
 // gone": this client cannot tell a released rental from one that was never ours.
 func (c *Client) Release(ctx context.Context, id, reason string) *exit.Error {
+	if e := validateRentalID(id); e != nil {
+		return e
+	}
 	return c.do(ctx, call{
-		method: http.MethodDelete, path: "/v1/private-rentals/" + id, admin: true, reason: reason,
+		method: http.MethodDelete, path: "/v1/private-rentals/" + url.PathEscape(id), admin: true, reason: reason,
 	}, nil)
 }

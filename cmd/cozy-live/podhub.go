@@ -42,8 +42,8 @@ import (
 // token. That is not politeness — it is the property the arms in rent.go observe, and the
 // reason this stand-in had to be flipped along with the product.
 //
-// What it is NOT: a provider. It boots nothing, bills nothing, and knows no card names —
-// `card` is carried and echoed, never interpreted.
+// What it is NOT: a provider. It boots nothing, bills nothing, and only carries the
+// provider-neutral accelerator model the renter requested.
 
 type podRental struct {
 	ID      string
@@ -53,7 +53,6 @@ type podRental struct {
 	// Hashes is the pod's LIVE credential set, `sha256:<64 hex>` lines. It is everything
 	// this hub was ever told about the renter's credential.
 	Hashes []string
-	PodID  string
 	Detail string
 	// Media is where this pod's co-resident MEDIA SERVER answers (cl-014). A real hub
 	// names it in the rental document; this stand-in names it too, so the client's
@@ -253,8 +252,8 @@ func (h *podHub) rent(w http.ResponseWriter, r *http.Request) {
 	var probe map[string]json.RawMessage
 	if err := json.Unmarshal(raw, &probe); err != nil {
 		refuse(w, http.StatusBadRequest, "rental.unparseable",
-			"a rental names an endpoint, a card and the sha256 of the token you minted",
-			`{"endpoint":"h3","card":"H200","renter_token_sha256":["sha256:<64 hex>"]}`)
+			"a rental names an endpoint ref, accelerator model, and the sha256 of the token you minted",
+			`{"endpoint_ref":"org/h3/v1/generate","accelerator_model":"NVIDIA H200","renter_token_sha256":["<64 hex>"]}`)
 		return
 	}
 	if _, ok := probe["owner_token"]; ok {
@@ -264,13 +263,14 @@ func (h *podHub) rent(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var body struct {
-		Endpoint    string   `json:"endpoint"`
-		Card        string   `json:"card"`
-		TokenSHA256 []string `json:"renter_token_sha256"`
+		EndpointRef      string   `json:"endpoint_ref"`
+		AcceleratorModel string   `json:"accelerator_model"`
+		TokenSHA256      []string `json:"renter_token_sha256"`
 	}
-	if err := json.Unmarshal(raw, &body); err != nil || body.Endpoint == "" || body.Card == "" {
+	if err := json.Unmarshal(raw, &body); err != nil || body.EndpointRef == "" || body.AcceleratorModel == "" {
 		refuse(w, http.StatusBadRequest, "invalid_request",
-			"a rental names an endpoint and a card", `{"endpoint":"h3","card":"H200"}`)
+			"a rental names an endpoint ref and accelerator model",
+			`{"endpoint_ref":"org/h3/v1/generate","accelerator_model":"NVIDIA H200"}`)
 		return
 	}
 	// THE HUB'S SPELLING IS BARE HEX, which is the real surface's (provider.IsHash).
@@ -308,9 +308,9 @@ func (h *podHub) rent(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	id := "rnt-" + randomHex(8)
-	rec := &podRental{ID: id, State: "provisioning", PodID: "pod-" + randomHex(6),
+	rec := &podRental{ID: id, State: "provisioning",
 		Hashes: body.TokenSHA256,
-		Detail: "asking the provider for " + body.Card}
+		Detail: "selecting capacity for " + body.AcceleratorModel}
 	h.rentals[id] = rec
 	h.operations[operationKey] = podRentalOperation{digest: digest, rental: rec}
 	h.creates++
@@ -335,7 +335,7 @@ func writeRentalAccepted(w http.ResponseWriter, id, state string) {
 func (h *podHub) provision(rec *podRental) {
 	if h.fail {
 		h.mu.Lock()
-		rec.State, rec.Detail = "failed", "no capacity for this card in any region"
+		rec.State, rec.Detail = "failed", "no eligible capacity for this accelerator"
 		h.mu.Unlock()
 		return
 	}
@@ -579,7 +579,7 @@ func (h *podHub) read(w http.ResponseWriter, r *http.Request) {
 		// credential. There is no `owner_token` key, and the struct behind this map has no
 		// field one could be read out of.
 		"renter_token_sha256": rec.Hashes,
-		"pod_id":              rec.PodID, "detail": rec.Detail,
+		"detail":              rec.Detail,
 		// The byte plane's address, OBSERVED. The client no longer derives one, so a hub
 		// that omits this names no byte plane at all.
 		"media_address": rec.Media,

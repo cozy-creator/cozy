@@ -1,9 +1,9 @@
 package app
 
 import (
+	"bytes"
 	"crypto/sha256"
 	"encoding/hex"
-	"encoding/json"
 	"fmt"
 	"strings"
 	"time"
@@ -54,24 +54,19 @@ func rentalStores(ctx *Context) (home.Layout, *records.Store, *exit.Error) {
 }
 
 func handleRent(ctx *Context) *exit.Error {
-	endpoint := strings.TrimSpace(ctx.Inv.Args[0])
-	card := strings.TrimSpace(ctx.Inv.Value("--card"))
-	if card == "" {
+	endpointRef := strings.TrimSpace(ctx.Inv.Args[0])
+	acceleratorModel := strings.TrimSpace(ctx.Inv.Value("--accelerator"))
+	if acceleratorModel == "" {
 		return exit.Usagef("`cozy rent` names the accelerator to provision").
-			WithRemedy("--card is required; the hub decides nothing about hardware for you").
-			WithNext("cozy rent " + endpoint + " --card H200 --reason <why>")
+			WithRemedy("--accelerator is required; name a provider-neutral model such as NVIDIA H200").
+			WithNext("cozy rent " + endpointRef + " --accelerator 'NVIDIA H200' --reason <why>")
 	}
 	reason := strings.TrimSpace(ctx.Inv.Value("--reason"))
 	if reason == "" {
 		return exit.Usagef("`cozy rent` spends money and the hub records why before it acts").
 			WithRemedy("--reason is required, exactly as it is for every first-party write").
-			WithNext("cozy rent " + endpoint + " --card " + card + " --reason <why>")
+			WithNext("cozy rent " + endpointRef + " --accelerator '" + acceleratorModel + "' --reason <why>")
 	}
-	// WHERE, optionally. Absent is the ordinary case and lets the provider place the pod
-	// wherever it has stock. It is a preference and never a promise: the hub answers with
-	// the pod it actually got, and a region with no capacity refuses through the provider's
-	// own words rather than being silently ignored here.
-	region := strings.TrimSpace(ctx.Inv.Value("--region"))
 	// The wait's ONLY caller-supplied bound. Absent, the wait ends on what the hub says
 	// rather than on a clock: a pod that is still booting is not a pod that has failed.
 	deadline := time.Time{}
@@ -101,15 +96,9 @@ func handleRent(ctx *Context) *exit.Error {
 		return exit.Usagef("--idempotency-key is %d bytes; the hub admits at most 200", len(operationKey))
 	}
 	if operationKey == "" {
-		pending, e := st.PendingRentalOperation(c.Base(), endpoint, card, region)
-		if e != nil {
-			return e
-		}
-		if pending != nil {
-			operationKey = pending.Key
-		} else {
-			operationKey = mintKey()
-		}
+		// Identical intent is not identity: a user may deliberately rent two
+		// identical pods. Only an explicit key may coalesce two invocations.
+		operationKey = mintKey()
 	}
 
 	// THE DURABLE MINT, BEFORE THE ASK. O_EXCL makes concurrent same-key callers read one
@@ -134,28 +123,38 @@ func handleRent(ctx *Context) *exit.Error {
 		return e
 	}
 	tokenHash := secret.HashHex(token)
-	digest, err := rentDigest(endpoint, card, region, tokenHash)
-	if err != nil {
-		return exit.Internalf("cannot digest the rental request: %s", err)
+	requestBody, e := hub.RentalRequestBytes(endpointRef, acceleratorModel, tokenHash)
+	if e != nil {
+		return e
 	}
+	digest := rentalRequestDigest(c.Base(), requestBody)
 	op, replay, e := st.BeginRentalOperation(records.RentalOperation{
-		Key: operationKey, RequestDigest: digest, Endpoint: endpoint, Card: card,
-		Region: region, Hub: c.Base(), Reason: reason,
+		Key: operationKey, RequestDigest: digest, RequestBody: requestBody,
+		EndpointRef: endpointRef, AcceleratorModel: acceleratorModel,
+		Hub: c.Base(), Reason: reason,
 	})
 	if e != nil {
 		return e
 	}
-	if op.RequestDigest != digest {
+	if len(op.RequestBody) == 0 {
+		return exit.Named(exit.Conflict, "rental.legacy_operation_unreplayable",
+			"rental operation %s predates exact request-byte persistence", operationKey).
+			WithRemedy("release or settle it with the prior Creator build; never guess paid request bytes")
+	}
+	if op.RequestDigest != digest || op.Hub != c.Base() || !bytes.Equal(op.RequestBody, requestBody) {
 		return exit.Named(exit.Conflict, "rental.idempotency_conflict",
-			"rental operation %s already names a different request body", operationKey).
-			WithRemedy("reuse a key only for the exact same endpoint, card, region, and renter token")
+			"rental operation %s already names a different hub or request body", operationKey).
+			WithRemedy("reuse a key only for the exact same hub, endpoint, accelerator, and renter token")
+	}
+	if !replay {
+		fmt.Fprintf(ctx.Err, "  rental operation %s persisted; reuse this key to resume\n", operationKey)
 	}
 	// The first recorded reason is the paid operation's audit reason. A retry may be typed
 	// with different prose, but it must not rewrite why the original purchase was made.
 	reason = op.Reason
 
 	hctx, cancel := hub.Context()
-	r, e := c.Rent(hctx, endpoint, card, region, tokenHash, reason, operationKey)
+	r, e := c.Rent(hctx, op.RequestBody, reason, operationKey)
 	cancel()
 	if e != nil {
 		// A typed 4xx answer proves this POST bought nothing. Transport, deadline,
@@ -174,14 +173,14 @@ func handleRent(ctx *Context) *exit.Error {
 		return e
 	}
 	row := records.Rental{
-		ID: r.ID, Endpoint: endpoint, Card: card, PodID: r.PodID,
+		ID: r.ID, EndpointRef: endpointRef, AcceleratorModel: acceleratorModel,
 		State: r.State, Hub: c.Base(),
 	}
 	if e := st.RecordRental(row); e != nil {
 		return e
 	}
 	observe := func(seen hub.Rental) *exit.Error {
-		row.PodID, row.Address, row.State = seen.PodID, seen.Address, seen.State
+		row.Address, row.State = seen.Address, seen.State
 		row.MediaAddress = seen.MediaAddress
 		if e := st.RecordRental(row); e != nil {
 			return e
@@ -192,7 +191,7 @@ func handleRent(ctx *Context) *exit.Error {
 	if e != nil {
 		return e
 	}
-	row.PodID, row.Address, row.State = ready.PodID, ready.Address, ready.State
+	row.Address, row.State = ready.Address, ready.State
 	row.MediaAddress = ready.MediaAddress
 	if !ready.HoldsHash(secret.HashHex(token)) {
 		// The pod was provisioned with a credential set this host's token is not in, so
@@ -222,10 +221,8 @@ func handleRent(ctx *Context) *exit.Error {
 		{K: "state", V: ready.State},
 		{K: "address", V: ready.Address},
 		{K: "media", V: ready.MediaAddress},
-		{K: "pod", V: ready.PodID},
-		{K: "endpoint", V: endpoint},
-		{K: "card", V: card},
-		{K: "region", V: regionOrAny(region)},
+		{K: "endpoint", V: endpointRef},
+		{K: "accelerator", V: acceleratorModel},
 		// The DIGEST, which is the only rendering a credential has here: it is
 		// comparable against the pod's own without either end printing the value.
 		{K: "owner_token", V: token.Digest()},
@@ -234,19 +231,13 @@ func handleRent(ctx *Context) *exit.Error {
 		Next: []string{"cozy run <org/endpoint/vN/function> --worker " + ready.ID}})
 }
 
-func rentDigest(endpoint, card, region, tokenHash string) (string, error) {
-	body := struct {
-		Endpoint    string   `json:"endpoint"`
-		Card        string   `json:"card"`
-		Region      string   `json:"region,omitempty"`
-		TokenHashes []string `json:"renter_token_sha256"`
-	}{endpoint, card, region, []string{tokenHash}}
-	raw, err := json.Marshal(body)
-	if err != nil {
-		return "", err
-	}
-	sum := sha256.Sum256(raw)
-	return "sha256:" + hex.EncodeToString(sum[:]), nil
+func rentalRequestDigest(hubAuthority string, requestBody []byte) string {
+	h := sha256.New()
+	_, _ = h.Write([]byte("cozy.rental_request/1\n"))
+	_, _ = h.Write([]byte(strings.TrimRight(hubAuthority, "/")))
+	_, _ = h.Write([]byte{'\n'})
+	_, _ = h.Write(requestBody)
+	return "sha256:" + hex.EncodeToString(h.Sum(nil))
 }
 
 // waitProvisioned polls one rental to a settled state. Every wait here is bounded by something
@@ -279,7 +270,7 @@ func waitProvisioned(ctx *Context, c *hub.Client, id string, deadline time.Time,
 			return hub.Rental{}, exit.New(exit.Failed,
 				"rental %s is %s: %s", id, r.State, detailOr(r.Detail)).
 				WithRemedy("nothing here is owed money for it; rent again if you still need a pod").
-				WithNext("cozy rent <endpoint> --card <name> --reason <why>")
+				WithNext("cozy rent <endpoint> --accelerator <model> --reason <why>")
 		case r.State == hub.RentalReady:
 			// READY without a whole triple is the hub contradicting itself, and dialling
 			// on a partial one would fail later as something that looks like a network
@@ -332,10 +323,10 @@ func handleRentLs(ctx *Context) *exit.Error {
 	}
 	list := render.List{
 		Kind:      "rentals",
-		Fields:    []string{"rental", "state", "endpoint", "card", "address"},
-		AllFields: []string{"rental", "state", "endpoint", "card", "address", "media", "pod", "hub", "owner_token", "rented"},
+		Fields:    []string{"rental", "state", "endpoint", "accelerator", "address"},
+		AllFields: []string{"rental", "state", "endpoint", "accelerator", "address", "media", "hub", "owner_token", "rented"},
 		Empty:     "0 rentals on this host",
-		Next:      []string{"cozy rent <hub-endpoint> --card <name> --reason <why>"},
+		Next:      []string{"cozy rent <endpoint-ref> --accelerator <model> --reason <why>"},
 	}
 	attached := 0
 	for _, r := range rows {
@@ -348,8 +339,9 @@ func handleRentLs(ctx *Context) *exit.Error {
 			attached++
 		}
 		list.Rows = append(list.Rows, map[string]string{
-			"rental": r.ID, "state": r.State, "endpoint": r.Endpoint, "card": r.Card,
-			"address": r.Address, "media": r.MediaAddress, "pod": r.PodID, "hub": r.Hub,
+			"rental": r.ID, "state": r.State, "endpoint": r.EndpointRef,
+			"accelerator": r.AcceleratorModel, "address": r.Address,
+			"media": r.MediaAddress, "hub": r.Hub,
 			"owner_token": digest, "rented": stamp(r.RentedAt),
 		})
 	}
@@ -382,7 +374,7 @@ func handleRentRelease(ctx *Context) *exit.Error {
 	// everything resident on it are gone afterwards and there is no undo and no prompt.
 	if !ctx.Inv.Bool("--yes") {
 		return emit(ctx, render.Record{Kind: "release-plan", Fields: []render.Field{
-			{K: "rental", V: row.ID}, {K: "state", V: row.State}, {K: "pod", V: row.PodID},
+			{K: "rental", V: row.ID}, {K: "state", V: row.State},
 			{K: "address", V: row.Address}, {K: "media", V: row.MediaAddress},
 			{K: "hub", V: row.Hub},
 		}, Notes: []string{
@@ -408,17 +400,8 @@ func handleRentRelease(ctx *Context) *exit.Error {
 		return e
 	}
 	return emit(ctx, render.Record{Kind: "release", Fields: []render.Field{
-		{K: "rental", V: id}, {K: "released", V: forgotten}, {K: "pod", V: row.PodID},
+		{K: "rental", V: id}, {K: "released", V: forgotten},
 	}, Notes: []string{
 		"the hub destroyed the pod; its owner token and pinned certificate are gone from this host"},
 		Next: []string{"cozy rent ls"}})
-}
-
-// regionOrAny renders an unset placement preference as what it means, so a rental record
-// never shows an empty cell that could be read as "somewhere in particular".
-func regionOrAny(region string) string {
-	if region == "" {
-		return "any (the provider placed it)"
-	}
-	return region
 }

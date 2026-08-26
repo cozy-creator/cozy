@@ -16,33 +16,36 @@ import (
 // database would be a reader of that credential; the 0600 handoff beside it is the
 // boundary (home.Layout.RentalToken), exactly as the CLI's own credential is.
 
-var rentalSchema = []string{`
-CREATE TABLE IF NOT EXISTS rentals (
-  id          TEXT PRIMARY KEY,
-  endpoint    TEXT NOT NULL,
-  card        TEXT NOT NULL,
-  pod_id      TEXT NOT NULL,
-  address     TEXT NOT NULL,
-  cert_path   TEXT NOT NULL,
-  state       TEXT NOT NULL,
-  hub         TEXT NOT NULL,
-  rented_at   TEXT NOT NULL,
-  released_at TEXT NOT NULL DEFAULT '',
-  media_address TEXT NOT NULL DEFAULT ''
-)`, `
+const rentalOperationsDDL = `
 CREATE TABLE IF NOT EXISTS rental_operations (
-  operation_key  TEXT PRIMARY KEY,
-  request_digest TEXT NOT NULL,
-  endpoint       TEXT NOT NULL,
-  card           TEXT NOT NULL,
-  region         TEXT NOT NULL,
-  hub            TEXT NOT NULL,
-  reason         TEXT NOT NULL,
-  rental_id      TEXT NOT NULL DEFAULT '',
-  state          TEXT NOT NULL,
-  created_at     TEXT NOT NULL,
-  updated_at     TEXT NOT NULL
-)`, `
+  operation_key    TEXT PRIMARY KEY,
+  request_digest   TEXT NOT NULL,
+  request_body     BLOB NOT NULL,
+  endpoint_ref     TEXT NOT NULL,
+  accelerator_model TEXT NOT NULL,
+  hub              TEXT NOT NULL,
+  reason           TEXT NOT NULL,
+  rental_id        TEXT NOT NULL DEFAULT '',
+  state            TEXT NOT NULL,
+  created_at       TEXT NOT NULL,
+  updated_at       TEXT NOT NULL
+)`
+
+const rentalsDDL = `
+CREATE TABLE IF NOT EXISTS rentals (
+  id                TEXT PRIMARY KEY,
+  endpoint_ref      TEXT NOT NULL,
+  accelerator_model TEXT NOT NULL,
+  address           TEXT NOT NULL,
+  cert_path         TEXT NOT NULL,
+  state             TEXT NOT NULL,
+  hub               TEXT NOT NULL,
+  rented_at         TEXT NOT NULL,
+  released_at       TEXT NOT NULL DEFAULT '',
+  media_address     TEXT NOT NULL DEFAULT ''
+)`
+
+var rentalSchema = []string{rentalOperationsDDL, rentalsDDL, `
 CREATE UNIQUE INDEX IF NOT EXISTS rental_operation_remote
   ON rental_operations(rental_id) WHERE rental_id <> ''`}
 
@@ -50,24 +53,24 @@ CREATE UNIQUE INDEX IF NOT EXISTS rental_operation_remote
 // the POST: the operation key and its 0600 token survive a lost response, so retry can
 // ask for the same provider obligation instead of buying a second one.
 type RentalOperation struct {
-	Key           string
-	RequestDigest string
-	Endpoint      string
-	Card          string
-	Region        string
-	Hub           string
-	Reason        string
-	RentalID      string
-	State         string
-	CreatedAt     string
-	UpdatedAt     string
+	Key              string
+	RequestDigest    string
+	RequestBody      []byte
+	EndpointRef      string
+	AcceleratorModel string
+	Hub              string
+	Reason           string
+	RentalID         string
+	State            string
+	CreatedAt        string
+	UpdatedAt        string
 }
 
-const rentalOperationCols = `operation_key,request_digest,endpoint,card,region,hub,reason,rental_id,state,created_at,updated_at`
+const rentalOperationCols = `operation_key,request_digest,request_body,endpoint_ref,accelerator_model,hub,reason,rental_id,state,created_at,updated_at`
 
 func scanRentalOperation(row interface{ Scan(...any) error }) (RentalOperation, error) {
 	var op RentalOperation
-	err := row.Scan(&op.Key, &op.RequestDigest, &op.Endpoint, &op.Card, &op.Region,
+	err := row.Scan(&op.Key, &op.RequestDigest, &op.RequestBody, &op.EndpointRef, &op.AcceleratorModel,
 		&op.Hub, &op.Reason, &op.RentalID, &op.State, &op.CreatedAt, &op.UpdatedAt)
 	return op, err
 }
@@ -78,7 +81,7 @@ func (s *Store) BeginRentalOperation(op RentalOperation) (RentalOperation, bool,
 	stamp := now()
 	res, err := s.db.Exec(`INSERT INTO rental_operations(`+rentalOperationCols+`)
 		VALUES(?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(operation_key) DO NOTHING`,
-		op.Key, op.RequestDigest, op.Endpoint, op.Card, op.Region, op.Hub, op.Reason,
+		op.Key, op.RequestDigest, op.RequestBody, op.EndpointRef, op.AcceleratorModel, op.Hub, op.Reason,
 		op.RentalID, "pending", stamp, stamp)
 	if err != nil {
 		return RentalOperation{}, false, exit.Internalf("cannot record rental operation: %s", err)
@@ -93,23 +96,6 @@ func (s *Store) BeginRentalOperation(op RentalOperation) (RentalOperation, bool,
 		return RentalOperation{}, false, exit.Internalf("cannot read rental operation: %s", err)
 	}
 	return stored, inserted == 0, nil
-}
-
-// PendingRentalOperation finds the one unfinished ask matching an implicit retry. A fresh
-// explicit --idempotency-key never calls this; it is what makes re-running the ordinary
-// command after SIGINT or response loss resume instead of spend twice.
-func (s *Store) PendingRentalOperation(hub, endpoint, card, region string) (*RentalOperation, *exit.Error) {
-	op, err := scanRentalOperation(s.db.QueryRow(`SELECT `+rentalOperationCols+`
-		FROM rental_operations WHERE hub=? AND endpoint=? AND card=? AND region=?
-		  AND state NOT IN ('attached','failed','released')
-		ORDER BY created_at LIMIT 1`, hub, endpoint, card, region))
-	if errors.Is(err, sql.ErrNoRows) {
-		return nil, nil
-	}
-	if err != nil {
-		return nil, exit.Internalf("cannot find a pending rental operation: %s", err)
-	}
-	return &op, nil
 }
 
 func (s *Store) RentalOperation(key string) (*RentalOperation, *exit.Error) {
@@ -140,31 +126,28 @@ func (s *Store) AdvanceRentalOperation(key, rentalID, state string) *exit.Error 
 	return nil
 }
 
-// Rental is one pod this client rented and may attach a worker to. `Endpoint` and `Card`
-// are the hub's own vocabulary for what was asked for, kept verbatim so a listing says
-// what was rented rather than what this host guessed it meant.
+// Rental is one provider-neutral pod rental this client may attach a worker to.
 type Rental struct {
-	ID         string
-	Endpoint   string
-	Card       string
-	PodID      string
-	Address    string
-	CertPath   string
-	State      string
-	Hub        string
-	RentedAt   string
-	ReleasedAt string
+	ID               string
+	EndpointRef      string
+	AcceleratorModel string
+	Address          string
+	CertPath         string
+	State            string
+	Hub              string
+	RentedAt         string
+	ReleasedAt       string
 	// MediaAddress is where the pod's co-resident media server answers (cl-014). It is a
 	// FACT about the pod like the control address is, so it is a row and not a file; the
 	// credential it takes is the rental's own owner token, which stays 0600 beside it.
 	MediaAddress string
 }
 
-const rentalCols = `id,endpoint,card,pod_id,address,cert_path,state,hub,rented_at,released_at,media_address`
+const rentalCols = `id,endpoint_ref,accelerator_model,address,cert_path,state,hub,rented_at,released_at,media_address`
 
 func scanRental(row interface{ Scan(...any) error }) (Rental, error) {
 	var r Rental
-	err := row.Scan(&r.ID, &r.Endpoint, &r.Card, &r.PodID, &r.Address, &r.CertPath,
+	err := row.Scan(&r.ID, &r.EndpointRef, &r.AcceleratorModel, &r.Address, &r.CertPath,
 		&r.State, &r.Hub, &r.RentedAt, &r.ReleasedAt, &r.MediaAddress)
 	return r, err
 }
@@ -177,16 +160,49 @@ func (s *Store) RecordRental(r Rental) *exit.Error {
 		r.RentedAt = now()
 	}
 	if _, err := s.db.Exec(`INSERT INTO rentals(`+rentalCols+`)
-		VALUES(?,?,?,?,?,?,?,?,?,?,?)
-		ON CONFLICT(id) DO UPDATE SET address=excluded.address, pod_id=excluded.pod_id,
+		VALUES(?,?,?,?,?,?,?,?,?,?)
+		ON CONFLICT(id) DO UPDATE SET address=excluded.address,
 		  cert_path=excluded.cert_path, state=excluded.state, released_at=excluded.released_at,
 		  media_address=excluded.media_address`,
-		r.ID, r.Endpoint, r.Card, r.PodID, r.Address, r.CertPath, r.State, r.Hub,
+		r.ID, r.EndpointRef, r.AcceleratorModel, r.Address, r.CertPath, r.State, r.Hub,
 		r.RentedAt, r.ReleasedAt, r.MediaAddress); err != nil {
 		return exit.Internalf("cannot record rental %s: %s", r.ID, err)
 	}
 	return nil
 }
+
+// rentalRebuild hardcuts provider-placement vocabulary from pre-launch local
+// databases without discarding attached rental handles. An unfinished legacy
+// operation has no exact new request body, so it migrates with an empty body and
+// is refused before replay rather than being silently re-encoded.
+var rentalRebuild = []tableRebuild{{
+	table: "rental_operations",
+	stale: "region",
+	steps: []string{
+		`DROP INDEX IF EXISTS rental_operation_remote`,
+		`ALTER TABLE rental_operations RENAME TO rental_operations_pre_provider_neutral`,
+		rentalOperationsDDL,
+		`INSERT INTO rental_operations
+  (operation_key,request_digest,request_body,endpoint_ref,accelerator_model,hub,reason,rental_id,state,created_at,updated_at)
+  SELECT operation_key,request_digest,x'',endpoint,card,hub,reason,rental_id,state,created_at,updated_at
+    FROM rental_operations_pre_provider_neutral`,
+		`DROP TABLE rental_operations_pre_provider_neutral`,
+		`CREATE UNIQUE INDEX rental_operation_remote
+  ON rental_operations(rental_id) WHERE rental_id <> ''`,
+	},
+}, {
+	table: "rentals",
+	stale: "pod_id",
+	steps: []string{
+		`ALTER TABLE rentals RENAME TO rentals_pre_provider_neutral`,
+		rentalsDDL,
+		`INSERT INTO rentals
+  (id,endpoint_ref,accelerator_model,address,cert_path,state,hub,rented_at,released_at,media_address)
+  SELECT id,endpoint,card,address,cert_path,state,hub,rented_at,released_at,media_address
+    FROM rentals_pre_provider_neutral`,
+		`DROP TABLE rentals_pre_provider_neutral`,
+	},
+}}
 
 // RentalRow reads one rental, or nil when this host rented no such thing.
 func (s *Store) RentalRow(id string) (*Rental, *exit.Error) {

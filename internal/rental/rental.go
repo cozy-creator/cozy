@@ -20,14 +20,27 @@ import (
 	"github.com/cozy-creator/cozy-creator-v2/internal/media"
 	"github.com/cozy-creator/cozy-creator-v2/internal/orchestrator"
 	"github.com/cozy-creator/cozy-creator-v2/internal/records"
+	"github.com/cozy-creator/cozy-creator-v2/internal/rentalid"
 	"github.com/cozy-creator/cozy-creator-v2/internal/secret"
 )
+
+func validID(id string) *exit.Error {
+	if !rentalid.Valid(id) {
+		return exit.Named(exit.Validation, "rental.id_invalid",
+			"rental id %q is not a portable opaque name", id).
+			WithRemedy("use the exact rental id Tensorhub returned; never a path or provider resource id")
+	}
+	return nil
+}
 
 // Attach persists everything a later process needs to dial this rental. Secret/public
 // files land before the row can advertise a dialable target. The pre-POST operation row
 // already names the paid resource, so a crash at any point resumes rather than orphaning
 // a pod or publishing a row whose credential is absent.
 func Attach(l home.Layout, st *records.Store, row records.Rental, cert string, token secret.Value) *exit.Error {
+	if e := validID(row.ID); e != nil {
+		return e
+	}
 	if err := os.MkdirAll(l.Rentals, 0o700); err != nil {
 		return exit.Internalf("cannot create the rental credential root %s: %s", l.Rentals, err)
 	}
@@ -97,6 +110,9 @@ func ForgetPending(l home.Layout, operationKey string) {
 // Forget removes the local half. The pod is the hub's to destroy; this is what stops
 // this host from holding a credential for something that no longer exists.
 func Forget(l home.Layout, st *records.Store, id string) (bool, *exit.Error) {
+	if e := validID(id); e != nil {
+		return false, e
+	}
 	forgotten, e := st.ForgetRental(id)
 	if e != nil {
 		return false, e
@@ -111,6 +127,9 @@ func Forget(l home.Layout, st *records.Store, id string) (bool, *exit.Error) {
 // leak it created the file to prevent — cl-006's rule for the CLI credential, and the
 // same one here because it is the same class of file.
 func Token(l home.Layout, id string) (secret.Value, *exit.Error) {
+	if e := validID(id); e != nil {
+		return secret.Value{}, e
+	}
 	return tokenAt(l.RentalToken(id), "rental "+id)
 }
 
