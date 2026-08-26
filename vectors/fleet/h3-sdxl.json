@@ -1,0 +1,58 @@
+[
+ {
+  "repo": "MiniMaxAI/MiniMax-H3",
+  "component": "audio_vae",
+  "files": [
+   "FL2VA/audio_vae/model.safetensors"
+  ]
+ },
+ {
+  "repo": "MiniMaxAI/MiniMax-H3",
+  "component": "audio_vae",
+  "files": [
+   "audio_vae/diffusion_pytorch_model.safetensors"
+  ]
+ },
+ {
+  "repo": "MiniMaxAI/MiniMax-H3",
+  "component": "transformer",
+  "files": [
+   "FL2VA/transformer/model.safetensors.index.json"
+  ]
+ },
+ {
+  "repo": "MiniMaxAI/MiniMax-H3",
+  "component": "transformer",
+  "files": [
+   "transformer/diffusion_pytorch_model.safetensors.index.json"
+  ]
+ },
+ {
+  "repo": "MiniMaxAI/MiniMax-H3",
+  "component": "transformer_ref",
+  "files": [
+   "transformer_ref/diffusion_pytorch_model.safetensors.index.json"
+  ]
+ },
+ {
+  "repo": "Comfy-Org/MiniMax-H3",
+  "component": "transformer",
+  "files": [
+   "diffusion_models/minimax_h3_fl2va_bf16.safetensors"
+  ]
+ },
+ {
+  "repo": "stabilityai/stable-diffusion-xl-base-1.0",
+  "component": "unet",
+  "files": [
+   "unet/diffusion_pytorch_model.fp16.safetensors"
+  ]
+ },
+ {
+  "repo": "stabilityai/stable-diffusion-xl-base-1.0",
+  "component": "vae",
+  "files": [
+   "vae/diffusion_pytorch_model.fp16.safetensors"
+  ]
+ }
+]
