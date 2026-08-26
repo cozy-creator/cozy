@@ -14,6 +14,7 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/cozy-creator/cozy-creator-v2/internal/app"
@@ -243,6 +244,22 @@ func sectionRent() {
 		itoa(status)+" "+firstLine(said))
 	check("and the worker's journal is untouched by it: the quota is not the pod's disk",
 		podWorkerLog(hub, rentalA) != "", "the pod's worker log is still readable")
+
+	head("FILESYSTEM HANDOFF ONLY: the byte plane outlives the worker beside it")
+	// cl-014's coupling claim, observed instead of asserted. The two processes in this pod
+	// share an outputs directory and a token-hash file and NOTHING else — no RPC in either
+	// direction — so killing the worker must not touch what the owner can still download.
+	// The static half of the same claim is the `media` fence family: the media server's
+	// source contains no outbound call and cannot import the protocol at all.
+	committed := digestOfFile(filepath.Join(hub.mediaRootOf(rentalA), mirrored))
+	deadPID := hub.killPodWorker(rentalA)
+	check("the pod's WORKER process is killed, its media server is not",
+		deadPID > 0 && !alivePID(deadPID), "pid "+itoa(deadPID))
+	status, said = mediaCall(root, rentalA, http.MethodGet,
+		"/v1/outputs/"+media.Slot(dispatchedRequest(out), 1)+"/image", planted, nil)
+	check("the already-committed output still downloads: no request-path call crosses over",
+		status == 200 && digestOfBytes([]byte(said)) == committed,
+		itoa(status)+" "+shortID(digestOfBytes([]byte(said))))
 
 	head("RED: a pod with a control leg and NO byte plane is refused, never worked around")
 	starved := newPodHub(podHubSpec{Dir: filepath.Join(root, "hub-nomedia"), Arm: "remote",
@@ -786,4 +803,30 @@ func recordFor(records map[string]map[string]any, function string) map[string]an
 		}
 	}
 	return nil
+}
+
+// alivePID answers whether a pid is still a live process — the kernel's own answer, which
+// is what an arm about a killed process needs rather than this driver's memory of it.
+func alivePID(pid int) bool {
+	proc, err := os.FindProcess(pid)
+	if err != nil {
+		return false
+	}
+	return proc.Signal(syscall.Signal(0)) == nil
+}
+
+func digestOfBytes(data []byte) string {
+	sum := sha256.Sum256(data)
+	return "sha256:" + hex.EncodeToString(sum[:])
+}
+
+// dispatchedRequest reads the request id out of the stream a `--stream` run printed, so an
+// arm can name the media slot the coordinator's own grant pointed at.
+func dispatchedRequest(stream string) string {
+	if _, rest, ok := strings.Cut(stream, `"request_id":"`); ok {
+		if id, _, ok := strings.Cut(rest, `"`); ok {
+			return id
+		}
+	}
+	return ""
 }

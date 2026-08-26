@@ -53,6 +53,10 @@ type podRental struct {
 	// MediaRoot is the subtree that media server owns on the pod's filesystem — the
 	// arms read it directly to see where bytes actually landed.
 	MediaRoot string
+	// The two CO-RESIDENT processes, separately. cl-014's coupling claim is that neither
+	// is in the other's request path, and the way to observe that is to kill one.
+	WorkerPID int
+	MediaPID  int
 }
 
 type podHub struct {
@@ -275,6 +279,7 @@ func (h *podHub) provision(rec *podRental) {
 	}
 	h.mu.Lock()
 	h.procs = append(h.procs, cmd)
+	rec.WorkerPID = cmd.Process.Pid
 	rec.Detail = "the pod is up; waiting for its worker to bind"
 	h.mu.Unlock()
 
@@ -318,6 +323,7 @@ func (h *podHub) provision(rec *podRental) {
 		}
 		h.mu.Lock()
 		h.procs = append(h.procs, media)
+		rec.MediaPID = media.Process.Pid
 		h.mu.Unlock()
 		mediaAddr = awaitAddr(filepath.Join(runRoot, "media.addr"), media)
 		if mediaAddr == "" {
@@ -375,6 +381,37 @@ func mediaBinary() string {
 	abs, err := filepath.Abs(flag("media", "./cozy-media"))
 	must("resolving the cozy-media binary", err)
 	return abs
+}
+
+// killPodWorker ends ONE pod's worker process and leaves its media server running. It is
+// how cl-014's coupling claim becomes an observation: the two processes share files and
+// nothing else, so a dead worker must not take the byte plane down with it.
+func (h *podHub) killPodWorker(id string) int {
+	h.mu.Lock()
+	rec := h.rentals[id]
+	pid := 0
+	if rec != nil {
+		pid = rec.WorkerPID
+	}
+	var victim *exec.Cmd
+	for _, p := range h.procs {
+		if p.Process != nil && p.Process.Pid == pid {
+			victim = p
+		}
+	}
+	h.mu.Unlock()
+	if pid <= 0 {
+		return 0
+	}
+	_ = killGroup(pid, syscall.SIGKILL)
+	// AND IT IS REAPED. A killed child this process started stays a zombie until someone
+	// waits on it, and a zombie answers signal 0 — so an arm asking "is it gone" would be
+	// told yes-it-is-still-there about a process that is already dead. The hub started it,
+	// so the hub collects it.
+	if victim != nil {
+		_ = victim.Wait()
+	}
+	return pid
 }
 
 // mediaOf is a rental's media address, so an arm can dial the pod's byte plane directly.
