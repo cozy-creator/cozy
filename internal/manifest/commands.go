@@ -112,6 +112,18 @@ var Commands = []Command{
 
 	// ---- endpoints (cl-009) ----
 	{
+		Path: []string{"pack"}, Group: "endpoints",
+		Summary: "pack an endpoint source tree into ONE deterministic py3-none-any wheel (th-039)",
+		Args:    "<tree>", MinArgs: 1, MaxArgs: 1,
+		Flags: []Flag{
+			{Name: "--name", Arg: "<dist>", Summary: "distribution name, when the tree declares no `[project] name` (the env lane passes the release name)"},
+			{Name: "--version", Arg: "<x.y.z>", Summary: "version, when the tree declares no `[project] version`"},
+			{Name: "--out", Arg: "<dir>", Summary: "where to write the wheel (default: the working directory)"},
+		},
+		Exits:      []exit.Code{exit.OK, exit.Usage, exit.Validation, exit.NotFound, exit.Structural},
+		Capability: "cmd.pack", Status: Implemented, Handler: "pack",
+	},
+	{
 		Path: []string{"install"}, Group: "endpoints",
 		Summary: "resolve, verify, build and pin an endpoint as an immutable generation",
 		Args:    "<org/endpoint[@vN]>", MinArgs: 1, MaxArgs: 1,

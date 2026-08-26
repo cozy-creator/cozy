@@ -63,6 +63,34 @@ executes with it, reclaiming only what nothing references.
 `--from <archive>` is the pre-hub source door standing in for the hub resolve (cl-011);
 `scripts/pack.py` is the pre-hub packager an endpoint-release publish (th-003/th-004) replaces.
 
+## The deterministic wheel packer (th-039)
+
+`internal/wheel` is the ONE way an endpoint project becomes an importable unit, and it
+lives here because both seats that need it share this build seat: the tensorhub env-lane
+build stage (tensorhub-build.md §1 stage 2e) and a local `cozy install` must produce the
+SAME `project_wheel_digest` for the same tree, and they can only do that by running the
+same code. `wheel.Pack` is that seam; `cozy pack <tree>` is its local door.
+
+It is FIXED first-party code. It does not consult the repo's `[build-system]`, does not
+import the project, and fires no PEP 517 hook: it copies the canonical path-sorted tree,
+synthesizes `METADATA`/`WHEEL`/`RECORD` from declared metadata read as DATA, and emits one
+`py3-none-any` wheel. Distribution identity comes from `[project]` when the tree declares
+it and from the caller otherwise — an endpoint's identity is its RELEASE, not a line in
+its tree.
+
+**Determinism is structural, not hoped for.** The wheel bytes are a function of (canonical
+tree, distribution identity, packer version) and nothing else. Two consequences are chosen
+rather than inherited: the zip container is written by hand — the two seats do not share a
+build of Go, so a library's framing choices must not enter the digest — and entries are
+STORED, not deflated, because a compressor's output is a property of whoever compiled the
+packer. Every entry carries 1980-01-01 and mode 0644; no path inside is absolute.
+
+Refusals are typed and ordered: `build_backend_unsupported`, `compiled_extension`,
+`project_code_execution`, `metadata_malformed`/`metadata_dynamic`, `unsafe_entry`,
+`application_module_absent`. The first three each name the FUTURE sandboxed class —
+custom PEP 517 backends and compiled project wheels execute tenant code at assembly, so
+they land on the VM-class sandbox posture (tensorhub-build.md §1.1) or they do not land.
+
 ## The LocalService and LocalCoordinator (cl-001)
 
 `cozy up` starts the ONE long-lived process; `cozy down` stops it. Its scheduling role is
@@ -396,6 +424,14 @@ No automated tests. Verification is running the real thing:
 
 - `scripts/redarm.py` builds each hostile input for real, runs the real binary and
   observes the typed refusal (16 arms).
+- `scripts/wheel-live.sh` drives the real `cozy pack` against the real H3 and SDXL
+  endpoint trees: the same tree packed under four environments (umask, TZ, locale, cwd,
+  HOME, rewritten mtimes and modes, a different absolute path) and inside two containers
+  (glibc and musl, another uid, no `$HOME`) yields ONE `project_wheel_digest`; eight
+  planted trees each refuse by their own name, observed red, and pack green once the
+  planted file is removed; and each real wheel is `pip install`ed into a throwaway venv
+  where `cozy-runtime describe --check` runs THROUGH THE INSTALLED WHEEL — site-packages
+  as the project root, no source tree on `sys.path`.
 - `scripts/hub-live.py` drives the real `cozy` against a REAL tensorhub: public reads,
   admin writes, every refusal arm (wrong token, absent repo, closed port, a hub that
   accepts and never answers, a 200 that is not our document), and a cumulative secrecy

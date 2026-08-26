@@ -40,6 +40,7 @@ var handlers = map[string]Handler{
 	"commands":     handleCommands,
 	"help":         handleHelp,
 	"install":      handleInstall,
+	"pack":         handlePack,
 	"ls":           handleLs,
 	"rm":           handleRm,
 	"gc":           handleGC,
