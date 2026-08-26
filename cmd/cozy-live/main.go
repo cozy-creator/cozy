@@ -68,7 +68,7 @@ func main() {
 	args := os.Args[1:]
 	if len(args) == 0 {
 		fmt.Fprintln(os.Stderr, "usage: cozy-live "+
-			"<canonical|attempt|recovered|arms|api|apiarms|apicrash|verbs|journey|"+
+			"<canonical|attempt|recovered|arms|api|apiarms|apicrash|verbs|journey|rent|"+
 			"pipeline|m4arms|dropack|jobarms|jobs|jobcrash|fakeworker> [--flag value]")
 		os.Exit(2)
 	}
@@ -107,6 +107,8 @@ func main() {
 		sectionVerbs()
 	case "journey":
 		sectionJourney()
+	case "rent":
+		sectionRent()
 	case "pipeline":
 		sectionPipeline()
 	case "m4arms":
@@ -171,8 +173,7 @@ func hostCoordinator(name string, fresh bool) *live {
 	must("coordinator log", err)
 
 	c, e := coord.Open(coord.Options{
-		Cfg: cfg, Layout: l, Store: st, Socket: filepath.Join(root, "worker.sock"),
-		Yield: "smart", Log: logFile,
+		Cfg: cfg, Layout: l, Store: st, Yield: "smart", Log: logFile,
 		ImageDigest:  "sha256:" + strings.Repeat("11", 32),
 		ConfigDigest: "sha256:" + strings.Repeat("22", 32),
 		MaxOutputMiB: 8,

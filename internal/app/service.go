@@ -18,6 +18,7 @@ import (
 	"github.com/cozy-creator/cozy-creator-v2/internal/home"
 	"github.com/cozy-creator/cozy-creator-v2/internal/records"
 	"github.com/cozy-creator/cozy-creator-v2/internal/render"
+	"github.com/cozy-creator/cozy-creator-v2/internal/rental"
 	"github.com/cozy-creator/cozy-creator-v2/internal/service"
 )
 
@@ -97,10 +98,15 @@ func handleUp(ctx *Context) *exit.Error {
 	// select-or-start is the scheduler's act, and a request whose binding no live worker
 	// advertises makes one rather than queueing for capacity nothing would create.
 	resolver := NewResolver(st, ctx.Cfg)
+	// Two questions, deliberately not one object: the API asks whether a pinned rental
+	// EXISTS (so an unresolvable pin is refused before a request row does), and the
+	// coordinator resolves the dial triple at the moment it dials. Only the second reads
+	// the owner token, which is why only the coordinator holds it.
+	rentals := rental.Resolver(l, st)
 
 	c, e := coord.Open(coord.Options{
-		Cfg: ctx.Cfg, Layout: l, Store: st, Socket: socket, Yield: yield, Log: ctx.Out,
-		Endpoints: resolver,
+		Cfg: ctx.Cfg, Layout: l, Store: st, Yield: yield, Log: ctx.Out,
+		Endpoints: resolver, Rentals: rentals,
 	})
 	if e != nil {
 		closeListeners()
@@ -127,7 +133,7 @@ func handleUp(ctx *Context) *exit.Error {
 	stop := make(chan os.Signal, 1)
 	server := api.New(api.Options{
 		Coordinator: c, Cfg: ctx.Cfg, Creds: creds, Addr: addr,
-		Log: ctx.Out, Endpoints: resolver, Bound: bound,
+		Log: ctx.Out, Endpoints: resolver, Bound: bound, Rentals: rental.Known(st),
 		Shutdown: func() { stop <- syscall.SIGTERM },
 	})
 	handler, e := server.Handler()

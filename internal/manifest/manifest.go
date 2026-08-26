@@ -49,7 +49,7 @@ type Command struct {
 func (c *Command) Name() string { return strings.Join(c.Path, " ") }
 
 // Groups is the display order of command groups.
-var Groups = []string{"meta", "service", "endpoints", "invocation", "jobs", "catalog", "transfer", "account"}
+var Groups = []string{"meta", "service", "endpoints", "invocation", "jobs", "rentals", "catalog", "transfer", "account"}
 
 // GlobalFlags apply to every command.
 var GlobalFlags = []Flag{
@@ -84,6 +84,20 @@ func Lookup(words []string) (*Command, int) {
 		}
 	}
 	return nil, 0
+}
+
+// Extendable answers whether any row EXTENDS this word with a second one. It exists for
+// the parser: `rent` and `rent ls` are both verbs, so a one-word match must be HELD until
+// the next word says which one was meant. Binding the shorter row the moment it matched
+// made every two-word verb under a one-word verb unreachable and turned its own second
+// word into an argument the shorter row then refused (`login` / `login ls` had it too).
+func Extendable(word string) bool {
+	for i := range Commands {
+		if len(Commands[i].Path) == 2 && Commands[i].Path[0] == word {
+			return true
+		}
+	}
+	return false
 }
 
 // Suggest returns near-miss command names for an unknown word.

@@ -42,6 +42,11 @@ type Layout struct {
 	// argv (cl-011's rule), so the handoff is an OS-protected file the LocalService
 	// writes and its own CLI reads.
 	Client string
+	// Rentals holds one rented pod's SECRET MATERIAL: its provisioned owner token (0600)
+	// and the certificate this client pins when it dials (cl-015). The rental's facts —
+	// address, pod id, state — are rows in the one records authority; only what must not
+	// be readable by another user on this host lives out here as files.
+	Rentals string
 }
 
 func Open(root string) (Layout, *exit.Error) {
@@ -62,6 +67,7 @@ func Open(root string) (Layout, *exit.Error) {
 		Client:      filepath.Join(root, "client.cred"),
 	}
 	l.Publications = filepath.Join(root, "publications")
+	l.Rentals = filepath.Join(root, "rentals")
 	for _, dir := range []string{l.Generations, l.Workers, l.Outputs, l.Triage, l.Publications} {
 		if err := os.MkdirAll(dir, 0o755); err != nil {
 			return Layout{}, exit.Internalf("cannot create %s: %s", dir, err)
@@ -69,6 +75,15 @@ func Open(root string) (Layout, *exit.Error) {
 	}
 	return l, nil
 }
+
+// RentalToken is one rental's provisioned owner token, mode 0600. It is deliberately
+// NOT a row: a credential in the records database would be readable by every reader of
+// that database, and the whole point of the 0600 handoff is that it is not.
+func (l Layout) RentalToken(id string) string { return filepath.Join(l.Rentals, id+".token") }
+
+// RentalCert is the worker certificate this client PINS for one rental. A certificate is
+// public — trusting exactly this PEM and no CA is what makes the pin a pin (#445).
+func (l Layout) RentalCert(id string) string { return filepath.Join(l.Rentals, id+".pem") }
 
 // GenerationDir is where one generation's source tree and venv live.
 func (l Layout) GenerationDir(id string) string { return filepath.Join(l.Generations, id) }

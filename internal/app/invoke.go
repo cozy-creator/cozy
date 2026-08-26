@@ -364,6 +364,7 @@ func handleRun(ctx *Context) *exit.Error {
 	began := time.Now()
 	handle, e := c.Submit(api.Submission{
 		Endpoint: target.Endpoint, Function: target.Function, Input: input,
+		Worker: strings.TrimSpace(ctx.Inv.Value("--worker")),
 	}, key)
 	if e != nil {
 		return e
@@ -696,9 +697,17 @@ func renderRun(ctx *Context, life api.Lifecycle, terminal *localapi.Event, stopp
 		return exit.As(err)
 	}
 	e := exit.Named(code, status, "request %s ended %s", life.RequestID, status)
-	if life.Error != "" {
+	errType, why := life.ErrorType, life.Error
+	if why == "" && terminal != nil {
+		// A request that failed BEFORE ANY ATTEMPT has no attempt row to carry a cause —
+		// an unplaceable pin, a credential the coordinator refused to read, a worker that
+		// could not be started. Its reason exists on the terminal EVENT and nowhere else,
+		// and dropping it left the client with "ended failed" and no way to learn why.
+		errType, why = eventText(terminal, "error_type"), eventText(terminal, "error")
+	}
+	if why != "" {
 		e.Message = fmt.Sprintf("request %s ended %s: %s — %s",
-			life.RequestID, status, life.ErrorType, life.Error)
+			life.RequestID, status, errType, why)
 	}
 	if life.Triage != nil {
 		e.WithRemedy("the retained triage bundle explains it").
@@ -833,4 +842,14 @@ func generationFacts(ctx *Context, endpoint string, major int) (*launch.Facts, *
 			endpoint, chosen.Generation)
 	}
 	return launch.Read(*gen, ctx.Cfg.Home, ctx.Cfg.Tool())
+}
+
+// eventText reads one string field out of an event's payload. It is how a pre-attempt
+// failure's reason reaches the client: the event is where that reason lives.
+func eventText(e *localapi.Event, key string) string {
+	if e == nil {
+		return ""
+	}
+	s, _ := e.Payload[key].(string)
+	return s
 }

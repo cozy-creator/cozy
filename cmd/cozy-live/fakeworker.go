@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/credentials"
 
 	"github.com/cozy-creator/cozy-creator-v2/internal/canonical"
 	"github.com/cozy-creator/cozy-creator-v2/internal/config"
@@ -86,10 +87,24 @@ func fakeWorker() int {
 		verify = func(string) bool { return false }
 	}
 
-	server := grpc.NewServer()
+	// The POD's spelling of the same listener (#445): the same `WorkerControl`, behind TLS
+	// with the certificate the rental pins. `cozy-runtime serve --tls-cert/--tls-key` is
+	// the real worker's flag pair and this is the adversary's, so the owner's dial is
+	// exercised against a peer it did not co-develop with.
+	var opts []grpc.ServerOption
+	if cert, key := flag("tls-cert", ""), flag("tls-key", ""); cert != "" && key != "" {
+		creds, err := credentials.NewServerTLSFromFile(cert, key)
+		if err != nil {
+			say("cannot host TLS from %s/%s: %v", cert, key, err)
+			return 1
+		}
+		opts = append(opts, grpc.Creds(creds))
+		say("hosting behind TLS with the certificate the owner pins")
+	}
+	server := grpc.NewServer(opts...)
 	pb.RegisterWorkerControlServer(server, &fakeControl{
 		say: say, arm: arm, bootID: bootID, instance: instance, releaseID: releaseID,
-		verify: verify,
+		root: flag("cozy-home", ""), verify: verify,
 	})
 	if err := server.Serve(ln); err != nil {
 		say("serve ended: %v", err)
@@ -104,6 +119,7 @@ type fakeControl struct {
 	bootID     string
 	instance   string
 	releaseID  string
+	root       string // this worker's OWN filesystem root; nothing outside it is writable
 	verify     func(string) bool
 	generation uint64
 }
@@ -227,7 +243,10 @@ func (f *fakeControl) Control(stream pb.WorkerControl_ControlServer) error {
 				f.badTerminals(terminal, start)
 			}
 			if f.arm == "dropack" {
-				dropAck = f.droppedAckTerminal(terminal, start)
+				dropAck = f.terminalWithOutput(terminal, start)
+			}
+			if f.arm == "remote" || f.arm == "remotelie" {
+				f.remoteTerminal(terminal, start)
 			}
 		case *pb.OwnerFrame_TerminalAck:
 			f.say("TerminalAck for %s#%d digest=%s", m.TerminalAck.RequestId,
@@ -246,7 +265,17 @@ func (f *fakeControl) Control(stream pb.WorkerControl_ControlServer) error {
 				go func() { time.Sleep(3 * time.Second); os.Exit(0) }()
 			}
 		case *pb.OwnerFrame_CancelAttempt:
-			f.say("CancelAttempt %s#%d", m.CancelAttempt.RequestId, m.CancelAttempt.Attempt)
+			cancel := m.CancelAttempt
+			f.say("CancelAttempt %s#%d", cancel.RequestId, cancel.Attempt)
+			if f.arm == "remote" || f.arm == "remotelie" {
+				// A cancel is an ASK and the attempt's own journaled terminal is what
+				// settles it. A worker that never answers leaves the owner watching
+				// forever — a worker defect, not a protocol one — so the pod side answers
+				// here the way a real supervisor does.
+				t, _ := terminalFor(cancel.RequestId, cancel.Attempt, cancel.InvocationDigest,
+					pb.TerminalStatus_TERMINAL_STATUS_CANCELED, "canceled by the owner")
+				terminal(t)
+			}
 		}
 	}
 }
@@ -331,10 +360,57 @@ func (f *fakeControl) badTerminals(emit func(*pb.AttemptTerminal), start *pb.Sta
 	send(t)
 }
 
-// droppedAckTerminal writes ONE real output under the attempt's granted directory and
+// remoteTerminal is the POD's side of one attempt, and the arm that makes the byte
+// boundary REAL. A worker writes where the GRANT says and nowhere else — so a pod whose
+// grant names a directory on the OWNER's filesystem has been handed a destination it
+// cannot reach, and says so by name instead of finding somewhere else to put the bytes.
+//
+//	remote     refuses the foreign destination — what a real pod does with a file:// URL
+//	           rooted on the client's disk
+//	remotelie  does the work, writes the bytes on ITS OWN disk, and declares them anyway:
+//	           the manifest is true about what exists on the pod and false about what the
+//	           owner can show, which is exactly what an UNMIRRORED output is
+func (f *fakeControl) remoteTerminal(emit func(*pb.AttemptTerminal), start *pb.StartAttempt) {
+	granted := ""
+	for _, o := range start.Grant.GetOutputs() {
+		if o.OutputId == "image" {
+			granted = strings.TrimPrefix(o.Url, "file://")
+		}
+	}
+	if granted == "" {
+		f.say("the grant names no `image` destination; nothing to write")
+		return
+	}
+	if f.arm == "remote" && !underRoot(granted, f.root) {
+		f.say("ARM: the granted destination %s is not on this machine (my root is %s)", granted, f.root)
+		t, _ := terminalFor(start.RequestId, start.Attempt, start.InvocationDigest,
+			pb.TerminalStatus_TERMINAL_STATUS_FAILED,
+			"the granted output destination is on the owner's filesystem, not this worker's")
+		emit(t)
+		return
+	}
+	// remotelie: the bytes go where this worker CAN write, which is not where the owner
+	// granted. Nothing here lies about the digest — the manifest describes real bytes on
+	// a real disk. What is false is only that the OWNER holds them.
+	f.terminalWithOutput(emit, start)
+}
+
+// underRoot answers whether a granted path is on this worker's own filesystem root. It
+// is the whole boundary check, and it is a string test on purpose: the interesting case
+// is a path that does not exist HERE at all, which no stat can tell apart from a typo.
+func underRoot(path, root string) bool {
+	if root == "" {
+		return false
+	}
+	rel, err := filepath.Rel(root, path)
+	return err == nil && !strings.HasPrefix(rel, "..")
+}
+
+// terminalWithOutput writes ONE real output under the attempt's granted directory and
 // sends a SUCCEEDED terminal that declares it. It returns the identical envelope, which
-// the caller replays when the ack arrives — the coordinator half of a lost TerminalAck.
-func (f *fakeControl) droppedAckTerminal(emit func(*pb.AttemptTerminal),
+// the `dropack` arm replays when the ack arrives — the coordinator half of a lost
+// TerminalAck — and which the `remote` arm sends once and is done with.
+func (f *fakeControl) terminalWithOutput(emit func(*pb.AttemptTerminal),
 	start *pb.StartAttempt) *pb.AttemptTerminal {
 	layout, e := home.Open(flag("cozy-home", ""))
 	if e != nil {

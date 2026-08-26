@@ -38,9 +38,6 @@ type Options struct {
 	Cfg    config.Config
 	Layout home.Layout
 	Store  *records.Store
-	// Socket is RETAINED as the service's socket-directory hint (#436 made each WORKER
-	// bind its own socket under its root; this owner dials those). Unused for listening.
-	Socket string
 	// Yield is the GPU yield policy: smart | always | never.
 	Yield string
 	Log   io.Writer
@@ -51,6 +48,10 @@ type Options struct {
 	// same states and differ only in latency. Without it a cold request queues for
 	// capacity that nothing would ever create.
 	Endpoints Launcher
+
+	// Rentals resolves an attached-worker id (`cozy rent`'s persisted triple) to its
+	// dial spec. Wired by the entrypoint; nil = this service attaches no remote workers.
+	Rentals func(id string) (*RemoteSpec, *exit.Error)
 
 	// ImageDigest and ConfigDigest ride INSIDE every ExecutionSpec document: the exact
 	// execution environment (class b) and the evaluated-config document's identity

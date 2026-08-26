@@ -64,6 +64,9 @@ var handlers = map[string]Handler{
 	"job.ls":       handleJobLs,
 	"job.follow":   handleJobFollow,
 	"job.cancel":   handleJobCancel,
+	"rent":         handleRent,
+	"rent.ls":      handleRentLs,
+	"rent.release": handleRentRelease,
 }
 
 func handlerNames() []string {

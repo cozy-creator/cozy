@@ -113,19 +113,31 @@ func parse(args []string) (*Invocation, *exit.Error) {
 			inv.Values[spec.Name] = append(inv.Values[spec.Name], val)
 		default:
 			positional = append(positional, tok)
-			if inv.Cmd == nil {
-				if c, n := manifest.Lookup(positional); c != nil {
-					inv.Cmd = c
-					positional = positional[n:]
-				} else if len(positional) >= 2 {
-					return inv, unknownCommand(positional)
-				}
+			if inv.Cmd != nil {
+				continue
+			}
+			// LONGEST MATCH WINS. A one-word row whose word also starts a two-word row is
+			// HELD for one more token: binding it the moment it matched made `rent ls`
+			// unreachable and made `ls` an argument `rent` then refused.
+			if len(positional) == 1 && manifest.Extendable(positional[0]) {
+				continue
+			}
+			if c, n := manifest.Lookup(positional); c != nil {
+				inv.Cmd = c
+				positional = positional[n:]
+			} else if len(positional) >= 2 {
+				return inv, unknownCommand(positional)
 			}
 		}
 	}
 
+	// A held word with nothing after it is the one-word verb after all.
 	if inv.Cmd == nil && len(positional) > 0 {
-		return inv, unknownCommand(positional)
+		c, n := manifest.Lookup(positional)
+		if c == nil {
+			return inv, unknownCommand(positional)
+		}
+		inv.Cmd, positional = c, positional[n:]
 	}
 
 	inv.Args = positional

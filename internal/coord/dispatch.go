@@ -46,6 +46,10 @@ type Submission struct {
 	Org string
 	// Trees are the job's typed input TREES as `ref=dir`, one grant input each.
 	Trees []string
+
+	// Worker pins this request to an ATTACHED remote worker (a rental id resolved
+	// through Options.Rentals). Empty = any local worker.
+	Worker string
 }
 
 // Result is what one closed attempt produced.
@@ -95,6 +99,7 @@ func (c *Coordinator) SubmitDetail(s Submission) (string, uint64, bool, *exit.Er
 		Endpoint: s.Endpoint, Entrypoint: s.Entrypoint, PlanID: s.PlanID, Payload: s.Payload,
 		Outputs: strings.Join(s.Outputs, ","),
 		Kind:    s.Kind, Org: s.Org, Trees: strings.Join(s.Trees, ","),
+		Worker: s.Worker,
 	})
 	if e != nil {
 		return "", 0, false, e
@@ -216,7 +221,11 @@ func (c *Coordinator) selectOrStart(req records.Request) {
 	// "already starting" and "already resident" questions are asked about that slot and
 	// not about the endpoint. Without this, submitting a job while a serving worker of
 	// the same endpoint is up would decide a job worker already existed.
-	slot := req.Endpoint
+	// A request PINNED to a rental asks its questions about the rental's own slot: the
+	// attached worker's spec carries the pinned endpoint name, so comparing against the
+	// bare one would decide no worker was resident and attach a second control stream to
+	// the pod on every request.
+	slot := pinnedEndpoint(req.Endpoint, req.Worker)
 	if req.IsJob() {
 		slot += "/job/" + req.Entrypoint
 	}
@@ -227,7 +236,8 @@ func (c *Coordinator) selectOrStart(req records.Request) {
 	}
 	stale := ""
 	for _, w := range c.workers {
-		if w.exited || w.spec.Endpoint != req.Endpoint || w.spec.IsJob() != req.IsJob() {
+		if w.exited || w.spec.Endpoint != pinnedEndpoint(req.Endpoint, req.Worker) ||
+			w.spec.IsJob() != req.IsJob() {
 			continue
 		}
 		if !req.IsJob() || w.spec.Jobs[0].Function == req.Entrypoint {
@@ -328,12 +338,31 @@ func settledState(state string) bool {
 	return false
 }
 
-// resolveFor asks the launcher for the spec of the LANE this request runs in.
+// resolveFor asks the launcher for the spec of the LANE this request runs in. A request
+// pinned to an attached remote worker (cl-015) resolves the SAME spec — same bindings,
+// same plan ids — and gains the dial triple: the pod installed the identical release, so
+// the plan digests agree by construction or the worker refuses typed.
 func (c *Coordinator) resolveFor(req records.Request) (EndpointSpec, *exit.Error) {
+	spec, e := c.opt.Endpoints.Resolve(req.Endpoint)
 	if req.IsJob() {
-		return c.opt.Endpoints.ResolveJob(req.Endpoint, req.Entrypoint)
+		spec, e = c.opt.Endpoints.ResolveJob(req.Endpoint, req.Entrypoint)
 	}
-	return c.opt.Endpoints.Resolve(req.Endpoint)
+	if e != nil || req.Worker == "" {
+		return spec, e
+	}
+	if c.opt.Rentals == nil {
+		return spec, exit.Unavailablef("this LocalService attaches no remote workers")
+	}
+	remote, e := c.opt.Rentals(req.Worker)
+	if e != nil {
+		return spec, e
+	}
+	spec.Remote = remote
+	// The rental IS the slot: one attached worker per rental id, its own instance
+	// namespace, and no local device envelope (the pod's card is the pod's).
+	spec.Endpoint = pinnedEndpoint(spec.Endpoint, req.Worker)
+	spec.Devices = nil
+	return spec, nil
 }
 
 // failQueued settles a request that can never be placed. It is a request-level terminal:
@@ -372,7 +401,7 @@ func (c *Coordinator) failQueued(requestID string, cause *exit.Error) {
 func (c *Coordinator) dispatch(req records.Request) (uint64, *exit.Error) {
 	// PLACEMENT is the coordinator's: the caller names the binding, and dispatch picks a
 	// worker that advertises it as dispatchable NOW.
-	w, sess, e := c.pick(req.PlanID)
+	w, sess, e := c.pick(req)
 	if e != nil {
 		return 0, e
 	}
@@ -508,11 +537,23 @@ func outputBindings(ids []string, maxBytes uint64) []*pb.OutputBinding {
 
 // pick resolves a worker that advertises this binding as READY. Compatibility and
 // capacity matching stay here, in the coordinator, exactly as they do in the cloud.
-func (c *Coordinator) pick(planID string) (*worker, *session, *exit.Error) {
+//
+// THE SLOT IS PART OF THE MATCH, not only the binding. Matching on the plan id alone sent
+// a request pinned to rental B to rental A's worker — same endpoint, same plan digest, so
+// it looked like capacity — which made the pin advisory and, worse, let a request run on a
+// pod whose credential it never presented. It cuts the other way too: an UNPINNED request
+// must never land on a rented worker, because someone is being billed for that card and
+// nobody asked for it here.
+func (c *Coordinator) pick(req records.Request) (*worker, *session, *exit.Error) {
+	planID := req.PlanID
+	slot := pinnedEndpoint(req.Endpoint, req.Worker)
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	for _, w := range c.workers {
 		if w.exited || w.intake != pb.IntakeState_INTAKE_STATE_READY || !w.ready[planID] {
+			continue
+		}
+		if w.spec.Endpoint != slot {
 			continue
 		}
 		if sess := c.sessions[w.bootID]; sess != nil {
@@ -536,7 +577,8 @@ func (c *Coordinator) pick(planID string) (*worker, *session, *exit.Error) {
 			return w, sess, nil
 		}
 	}
-	return nil, nil, exit.Unavailablef("no claimed worker advertises %s as dispatchable", planID)
+	return nil, nil, exit.Unavailablef(
+		"no claimed worker in %s advertises %s as dispatchable", slot, planID)
 }
 
 // grantFor picks the lane's grant. The two differ in exactly one thing that matters —

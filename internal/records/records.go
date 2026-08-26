@@ -94,7 +94,7 @@ CREATE TABLE IF NOT EXISTS pins (
   generation   TEXT    NOT NULL REFERENCES install_generations(id),
   activated_at TEXT    NOT NULL,
   PRIMARY KEY (endpoint, major)
-)`}, append(coordSchema, eventSchema...)...)
+)`}, append(coordSchema, append(eventSchema, rentalSchema...)...)...)
 
 // pragmas ride the DSN rather than being executed after the open, because a pragma is a
 // property of a CONNECTION and database/sql may discard and redial one at any moment: a

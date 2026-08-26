@@ -57,6 +57,13 @@ Idempotency-Key: <caller's key>
 entrypoint's declared set — binding by field path is what makes a two-output result
 unswappable.
 
+`worker` is a **LOCAL ADDITION** (cl-015), not part of the shared core: it pins the
+request to a rented pod this host has attached, by rental id. The cloud host places work
+itself and has no rental for a client to name, so it does not carry the field. An id this
+host does not hold is `404` **before** a request row exists — a pin that cannot be
+resolved now cannot be resolved on a later attempt either. The pin is deliberately NOT in
+the idempotency digest: it says WHERE the same work runs, not what the work is.
+
 **The idempotency key names one request forever.** The host records the key beside a
 digest of the whole submission — endpoint, function, input, outputs — so the same key
 with a different FUNCTION conflicts as loudly as one with different input. Answers:

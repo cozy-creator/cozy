@@ -2,6 +2,7 @@ package coord
 
 import (
 	"bytes"
+	"crypto/sha256"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -261,7 +262,15 @@ func (c *Coordinator) onTerminal(s *session, t *pb.AttemptTerminal) {
 		refuse("no request row to settle")
 		return
 	}
-	outputs := c.outputsOf(*req, t.Attempt, doc)
+	// THE MIRROR RUNS BEFORE ANYTHING IS ACCEPTED OR ACKED. An output that is not here,
+	// or is not what the manifest says it is, means this terminal cannot be honoured: the
+	// worker's journaled terminal stays owed and replayable, exactly as a failed job
+	// promotion does below, rather than being acked with a row that points at nothing.
+	outputs, e := c.mirrorOutputs(*req, t.Attempt, doc)
+	if e != nil {
+		refuse("%s", e.Message)
+		return
+	}
 	// cl-006 OWNS TRIAGE PERSISTENCE (cr-011's seam): the bundle lives in the worker's
 	// own root, and a worker root does not outlive its worker. Copy it out and verify it
 	// against the terminal document's OWN TriageBundleRef before the transaction runs.
@@ -490,10 +499,19 @@ func requeueable(status, cause string) bool {
 	return false
 }
 
-// outputsOf joins the manifest's entries to the destinations THIS coordinator granted.
-// The runtime names what it wrote; the coordinator names where it was allowed to write
-// and decides that the result is visible. Neither half can do the other's job.
-func (c *Coordinator) outputsOf(req records.Request, attempt uint64, doc canonical.Doc) []records.Output {
+// mirrorOutputs joins the manifest's entries to the destinations THIS coordinator granted
+// and PROVES the bytes are there before any of them becomes visible. The runtime names
+// what it wrote; the coordinator names where it was allowed to write and decides that the
+// result is visible. Neither half can do the other's job.
+//
+// THE PROOF IS THE POINT, and it is why this is not a join any more. Composing a local
+// path out of the grant and stamping the manifest's own digest onto it made the record a
+// RESTATEMENT of the worker's claim rather than an observation: for a local worker the
+// two happen to agree, and for a REMOTE one the bytes are on the pod and the row pointed
+// at a path with nothing in it. `--out` then wrote a file the client had never received.
+// So: the destination is read, its length and its digest are recomputed here, and an
+// output that cannot be shown is never acked as one that can.
+func (c *Coordinator) mirrorOutputs(req records.Request, attempt uint64, doc canonical.Doc) ([]records.Output, *exit.Error) {
 	manifest := doc.Sub("output_manifest")
 	list, _ := manifest["outputs"].([]canonical.Value)
 	// WHERE THE COORDINATOR GRANTED. A serving attempt writes into its own disposable
@@ -513,6 +531,12 @@ func (c *Coordinator) outputsOf(req records.Request, attempt uint64, doc canonic
 		}
 		e := canonical.Doc(entry)
 		id := e.Str("output_id")
+		path := filepath.Join(dir, id)
+		if err := verifyBytes(path, e.Str("digest"), e.Int("length")); err != nil {
+			return nil, err.WithRemedy(
+				"a remote worker writes on its own machine; its outputs are MIRRORED here " +
+					"before the outcome is acked, and this attempt has nothing to show")
+		}
 		out = append(out, records.Output{
 			OutputID: id,
 			// The OPAQUE media id is minted HERE, before the terminal transaction, so
@@ -521,13 +545,40 @@ func (c *Coordinator) outputsOf(req records.Request, attempt uint64, doc canonic
 			// an empty handle — found live by the arm that reads the event's own
 			// `outputs`, which is exactly the field a UI would render from.
 			MediaID:  records.NewID("med"),
-			Path:     filepath.Join(dir, id),
+			Path:     path,
 			Digest:   e.Str("digest"),
 			Length:   e.Int("length"),
 			MimeType: e.Str("mime_type"),
 		})
 	}
-	return out
+	return out, nil
+}
+
+// verifyBytes is the mirror's proof: the declared identity, recomputed over the bytes
+// that are actually at the granted destination. It reads the file once — the grant's own
+// per-output ceiling already bounds how large one can be — because a length that agrees
+// with a digest that does not is the interesting failure, not the cheap one.
+func verifyBytes(path, digest string, length int64) *exit.Error {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return exit.New(exit.Failed,
+			"the declared output at %s cannot be read here: %s", path, err)
+	}
+	if int64(len(data)) != length {
+		return exit.New(exit.Failed,
+			"the output at %s is %d B and its manifest declares %d B", path, len(data), length)
+	}
+	sum := sha256.Sum256(data)
+	spelled, serr := canonical.Spell(sum[:])
+	if serr != nil {
+		return exit.Internalf("cannot spell the mirrored output's digest: %s", serr)
+	}
+	if spelled != digest {
+		return exit.New(exit.Failed,
+			"the output at %s hashes to %s and its manifest declares %s",
+			path, shortDigest(spelled), shortDigest(digest))
+	}
+	return nil
 }
 
 // brief keeps a worker's own words readable in one line without editing them.

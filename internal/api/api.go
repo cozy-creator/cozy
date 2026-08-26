@@ -78,6 +78,13 @@ type Server struct {
 	// LOCAL module's resolver; the pod profile (cl-014) supplies its own.
 	endpoints Resolver
 
+	// rentals answers whether this host holds a pinned rental — EXISTENCE ONLY. It
+	// deliberately does not resolve the dial triple: the credential is obtained by the
+	// coordinator at dial time, so the HTTP layer never reads one, and a check here that
+	// loaded it would be a second exposure of the same secret to answer a question that
+	// did not need it.
+	rentals func(id string) *exit.Error
+
 	// shutdown asks the process that owns this server to drain and exit — `cozy down`'s
 	// cooperative tier (#449). The route refuses when the builder wired none.
 	shutdown func()
@@ -104,6 +111,9 @@ type Options struct {
 	Log         io.Writer
 	Endpoints   Resolver
 	Bound       []string
+	// Rentals answers whether an attached-worker id names a pod this host holds; nil =
+	// this host attaches no remote workers, and a submission that names one says so.
+	Rentals func(id string) *exit.Error
 	// Shutdown is the cooperative-exit hook the shutdown route calls (#449).
 	Shutdown func()
 }
@@ -117,7 +127,7 @@ func New(opt Options) *Server {
 		coord: opt.Coordinator, store: opt.Coordinator.Store(),
 		layout: opt.Coordinator.Layout(), cfg: opt.Cfg, creds: opt.Creds,
 		addr: opt.Addr, log: opt.Log, endpoints: opt.Endpoints, bound: opt.Bound,
-		shutdown: opt.Shutdown,
+		rentals: opt.Rentals, shutdown: opt.Shutdown,
 	}
 }
 

@@ -25,15 +25,19 @@ import (
 // carried VERBATIM: the coordinator digests exactly the bytes the client sent, so a
 // re-submit under one key compares the same digest a hub would have compared.
 type Submission struct {
-	Endpoint   string          `json:"endpoint"`
-	Function   string          `json:"function"`
-	Input      json.RawMessage `json:"input"`
-	Outputs    []string        `json:"outputs,omitempty"`
-	Model      string          `json:"model,omitempty"`
-	Lane       string          `json:"lane,omitempty"`
-	Adapter    string          `json:"adapter,omitempty"`
-	PlanID     string          `json:"plan_id,omitempty"`
-	AttemptKey string          `json:"-"`
+	Endpoint string          `json:"endpoint"`
+	Function string          `json:"function"`
+	Input    json.RawMessage `json:"input"`
+	Outputs  []string        `json:"outputs,omitempty"`
+	Model    string          `json:"model,omitempty"`
+	Lane     string          `json:"lane,omitempty"`
+	Adapter  string          `json:"adapter,omitempty"`
+	PlanID   string          `json:"plan_id,omitempty"`
+	// Worker pins this request to an ATTACHED remote worker by rental id (cl-015). It is
+	// a LOCAL addition and is named as one in docs/client-contract.md: the cloud host
+	// places work itself and has no rental for a client to name.
+	Worker     string `json:"worker,omitempty"`
+	AttemptKey string `json:"-"`
 }
 
 // Handle is the 202 answer: the request's id and where to go next. Verbatim from the
@@ -141,6 +145,9 @@ func submissionDigest(spec coord.Submission) (string, *exit.Error) {
 		"input":    base64.StdEncoding.EncodeToString(spec.Payload),
 		"outputs":  strings.Join(spec.Outputs, ","),
 	}
+	// The pinned rental is NOT in it: a worker id says WHERE the same work runs, and two
+	// submissions of one key that differ only in placement are the same request. What the
+	// row records is what a requeue re-derives; the digest is about meaning.
 	data, err := canonical.Write(doc)
 	if err != nil {
 		return "", exit.Internalf("cannot canonicalize the submission: %s", err)
@@ -195,10 +202,21 @@ func contractStatus(state string) string {
 func (s *Server) resolvePlan(sub Submission) (coord.Submission, *exit.Error) {
 	out := coord.Submission{
 		Endpoint: sub.Endpoint, Entrypoint: sub.Function, Payload: []byte(sub.Input),
-		Outputs: sub.Outputs, PlanID: sub.PlanID,
+		Outputs: sub.Outputs, PlanID: sub.PlanID, Worker: sub.Worker,
 	}
 	if len(out.Payload) == 0 {
 		out.Payload = []byte("{}")
+	}
+	// THE PIN IS RESOLVED BEFORE A ROW EXISTS. A rental this host does not hold cannot be
+	// placed on any later attempt either, so recording the request would hand the client
+	// an id for work that is already known to be unplaceable.
+	if out.Worker != "" {
+		if s.rentals == nil {
+			return out, exit.Unavailablef("this LocalService attaches no remote workers")
+		}
+		if e := s.rentals(out.Worker); e != nil {
+			return out, e
+		}
 	}
 	if out.PlanID == "" {
 		if s.endpoints == nil {

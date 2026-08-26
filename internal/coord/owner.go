@@ -155,7 +155,7 @@ func (c *Coordinator) converse(w *worker, addr string) error {
 
 	proof := w.bootstrap.Reveal()
 	if w.spec.Remote != nil {
-		proof = w.spec.Remote.Token
+		proof = w.spec.Remote.Token.Reveal()
 	}
 	s.send(&pb.OwnerFrame{Msg: &pb.OwnerFrame_Claim{Claim: &pb.Claim{
 		OwnerEpoch:   ownerEpoch,

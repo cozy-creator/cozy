@@ -61,7 +61,8 @@ CREATE TABLE IF NOT EXISTS requests (
   created_at   TEXT    NOT NULL,
   kind         TEXT    NOT NULL DEFAULT 'serving',
   org          TEXT    NOT NULL DEFAULT '',
-  trees        TEXT    NOT NULL DEFAULT ''
+  trees        TEXT    NOT NULL DEFAULT '',
+  worker       TEXT    NOT NULL DEFAULT ''
 )`, `
 -- The PUBLICATION (cl-004). One row per job request, written INSIDE the terminal
 -- transaction: a publication that a terminal did not commit does not exist, which is
@@ -140,6 +141,7 @@ CREATE TABLE IF NOT EXISTS outputs (
 // after `schema`, and a duplicate-column answer means it is already there.
 var widen = []string{
 	`ALTER TABLE requests ADD COLUMN kind TEXT NOT NULL DEFAULT 'serving'`,
+	`ALTER TABLE requests ADD COLUMN worker TEXT NOT NULL DEFAULT ''`,
 	`ALTER TABLE requests ADD COLUMN org TEXT NOT NULL DEFAULT ''`,
 	`ALTER TABLE requests ADD COLUMN trees TEXT NOT NULL DEFAULT ''`,
 }
@@ -232,6 +234,30 @@ func (s *Store) SpawnWorker(w WorkerProcess) *exit.Error {
 			strings.Join(w.Devices, ","), strings.Join(held, ",")).
 			WithRemedy("one process per device: stop the holding worker first").
 			WithNext("cozy status")
+	}
+	return nil
+}
+
+// AttachWorker journals a worker this host did not spawn (a rented pod's, cl-015). It is
+// SpawnWorker minus the device arbitration, and that subtraction is the whole reason it
+// exists: the envelope fence arbitrates a scarce LOCAL resource, and a process on someone
+// else's machine holds none of it. Routing an attach through the fence refused it with
+// `a worker process needs a device envelope` — a local rule applied to a non-local fact.
+//
+// The identity fence is still here: the instance id is the primary key, so re-attaching
+// one rental lands on its own row rather than accumulating one per request.
+func (s *Store) AttachWorker(w WorkerProcess) *exit.Error {
+	if _, err := s.db.Exec(`
+		INSERT INTO worker_processes(instance_id,endpoint,generation,release_id,worker_id,
+		  devices,pid,birth,state,opened_at)
+		VALUES(?,?,?,?,?,'',0,'','spawned',?)
+		ON CONFLICT(instance_id) DO UPDATE SET
+		  generation=excluded.generation, release_id=excluded.release_id,
+		  session_id=NULL, incarnation=0, readiness_epoch=0, revision=0, intake='',
+		  state='spawned', opened_at=excluded.opened_at, closed_at=''`,
+		w.InstanceID, w.Endpoint, nullable(w.Generation), w.ReleaseID, w.WorkerID,
+		now()); err != nil {
+		return exit.Internalf("cannot journal the attached worker %s: %s", w.InstanceID, err)
 	}
 	return nil
 }
@@ -376,16 +402,20 @@ type Request struct {
 	// one grant input `tree:<ref>`; a field naming a ref the grant does not cover never
 	// reaches a filesystem.
 	Trees string
+	// Worker names an ATTACHED remote worker (a rental id) this request must run on.
+	// It lives on the request because a requeue must re-derive the same placement
+	// without a client saying so again. Empty = any local worker.
+	Worker string
 }
 
 const requestCols = `id,idem_key,body_digest,endpoint,entrypoint,plan_id,payload,outputs,
-	state,ordinal,requeues,created_at,kind,org,trees`
+	state,ordinal,requeues,created_at,kind,org,trees,worker`
 
 func scanRequest(row interface{ Scan(...any) error }) (Request, error) {
 	var r Request
 	err := row.Scan(&r.ID, &r.IdemKey, &r.BodyDigest, &r.Endpoint, &r.Entrypoint, &r.PlanID,
 		&r.Payload, &r.Outputs, &r.State, &r.Ordinal, &r.Requeues, &r.CreatedAt,
-		&r.Kind, &r.Org, &r.Trees)
+		&r.Kind, &r.Org, &r.Trees, &r.Worker)
 	return r, err
 }
 
@@ -547,10 +577,10 @@ func (s *Store) Submit(r Request) (Request, bool, *exit.Error) {
 		r.Kind = "serving"
 	}
 	if _, err := s.db.Exec(`INSERT INTO requests(id,idem_key,body_digest,endpoint,entrypoint,
-		plan_id,payload,outputs,state,ordinal,requeues,created_at,kind,org,trees)
-		VALUES(?,?,?,?,?,?,?,?,?,0,0,?,?,?,?)`,
+		plan_id,payload,outputs,state,ordinal,requeues,created_at,kind,org,trees,worker)
+		VALUES(?,?,?,?,?,?,?,?,?,0,0,?,?,?,?,?)`,
 		r.ID, r.IdemKey, r.BodyDigest, r.Endpoint, r.Entrypoint, r.PlanID, r.Payload,
-		r.Outputs, r.State, r.CreatedAt, r.Kind, r.Org, r.Trees); err != nil {
+		r.Outputs, r.State, r.CreatedAt, r.Kind, r.Org, r.Trees, r.Worker); err != nil {
 		return Request{}, false, exit.Internalf("cannot record request %s: %s", r.ID, err)
 	}
 	return r, true, nil

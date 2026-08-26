@@ -127,11 +127,25 @@ type EndpointSpec struct {
 	Remote *RemoteSpec `json:"remote,omitempty"`
 }
 
-// RemoteSpec is the dial triple for a worker this service did not spawn.
+// RemoteSpec is the dial triple for a worker this service did not spawn. Token is a
+// secret.Value rather than a string so that a spec which is logged, rendered or
+// marshalled prints the credential's DIGEST — there is no formatting verb that leaks it,
+// and its one raw read is the same Claim.proof carrier a spawned worker's bootstrap uses.
 type RemoteSpec struct {
-	Addr   string `json:"addr"`
-	Token  string `json:"token"`
-	CACert string `json:"ca_cert"` // path to the worker's pinned PEM
+	Addr   string       `json:"addr"`
+	Token  secret.Value `json:"token"`
+	CACert string       `json:"ca_cert"` // path to the worker's pinned PEM
+}
+
+// pinnedEndpoint is the endpoint name a request PINNED to a rental resolves its slot
+// under. One attached worker per rental id: a second request naming the same rental finds
+// the worker already conversing instead of attaching a second control stream to it, and a
+// request naming no rental never lands in a rented worker's slot.
+func pinnedEndpoint(endpoint, rental string) string {
+	if rental == "" {
+		return endpoint
+	}
+	return endpoint + "@" + rental
 }
 
 // WorkerID is what the Claim names as the expected worker identity; empty skips the
@@ -224,6 +238,9 @@ type worker struct {
 // supervisor. The grant is journaled BEFORE the process exists: a process that was never
 // granted an envelope cannot appear, and two concurrent starts cannot both consume one.
 func (c *Coordinator) StartWorker(spec EndpointSpec) (string, *exit.Error) {
+	if spec.Remote != nil {
+		return c.attachRemote(spec)
+	}
 	instanceID := spec.InstanceID()
 	// The slot's root is REUSED on purpose: the supervisor journal under it is what a
 	// restarted worker replays as `recovered_attempts`. Wiping it would manufacture the
@@ -411,6 +428,48 @@ func (c *Coordinator) StartWorker(spec EndpointSpec) (string, *exit.Error) {
 			go c.recoverWorker(w.spec)
 		}
 	}()
+	return instanceID, nil
+}
+
+// attachRemote registers an ALREADY-RUNNING worker (a rented pod's TLS leg, cl-015):
+// no spawn, no device grant (the pod's card is the pod's), no birth identity — the
+// conversation is the same claim the local path runs, dialed at the rental's address
+// with the pinned cert and the owner token as proof (#445).
+func (c *Coordinator) attachRemote(spec EndpointSpec) (string, *exit.Error) {
+	instanceID := spec.InstanceID()
+	var planIDs []string
+	for _, b := range spec.Bindings {
+		id, e := b.PlanID()
+		if e != nil {
+			return "", e
+		}
+		planIDs = append(planIDs, id)
+	}
+	sortStrings(planIDs)
+	// AttachWorker, not SpawnWorker: the device-envelope admission arbitrates THIS host's
+	// cards, and the pod's card is the pod's. There is no grant to journal and none to
+	// release, which is also why nothing here has a pid or a birth identity to record.
+	if e := c.opt.Store.AttachWorker(records.WorkerProcess{
+		InstanceID: instanceID,
+		Endpoint:   spec.Endpoint,
+		Generation: spec.Generation,
+		ReleaseID:  spec.ReleaseID,
+		WorkerID:   "remote",
+	}); e != nil {
+		return "", e
+	}
+	w := &worker{
+		instanceID: instanceID, spec: spec,
+		logPath: "(remote worker: its log lives on the pod)",
+		planIDs: planIDs, ready: map[string]bool{},
+		deploymentID: "dpl-" + strings.TrimPrefix(instanceID, "ins-"),
+		spawned:      time.Now(),
+	}
+	c.mu.Lock()
+	c.workers[instanceID] = w
+	c.mu.Unlock()
+	c.logf("worker %s ATTACHED remote at %s plans=%d", instanceID, spec.Remote.Addr, len(planIDs))
+	go c.attach(w)
 	return instanceID, nil
 }
 
@@ -629,7 +688,7 @@ func (c *Coordinator) StopWorker(instanceID string, grace time.Duration) {
 	if w == nil {
 		return
 	}
-	if w.cmd.Process != nil && !w.exited {
+	if w.cmd != nil && w.cmd.Process != nil && !w.exited {
 		// The cooperative tier: SIGTERM to the group, CTRL_BREAK to the job's console
 		// group on Windows. A failure here is loud but not an escalation by itself —
 		// the bounded wait below is what separates asking from insisting.

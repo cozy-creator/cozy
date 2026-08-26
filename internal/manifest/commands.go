@@ -31,6 +31,8 @@ var FoundationTokens = []string{
 	"run.payload.schema",     // payload typed against the recorded surface, before a request exists
 	"run.media.save",         // `--out` writes accepted outputs by opaque id and declared field path
 	"endpoint.generations",   // an installed generation is the ONLY source of launch facts
+	"worker.remote.attach",   // a rented pod's worker is DIALED over TLS with its cert pinned
+	"rental.pinned_triple",   // the rental's address/cert/owner token are pinned locally, 0600
 }
 
 // APITokens are the local client API's own tokens (cl-006). They live in internal/api's
@@ -200,6 +202,7 @@ var Commands = []Command{
 			{Name: "--in", Arg: "<file>", Summary: "whole payload as JSON"},
 			{Name: "--local", Summary: "run on this host (default)"},
 			{Name: "--cloud", Summary: "submit to tensorhub under the account"},
+			{Name: "--worker", Arg: "<rental-id>", Summary: "pin this run to an attached rented pod (`cozy rent ls`)"},
 			// One key names one request forever. A bare `run` mints its own, so retry
 			// safety across a process restart is the caller's explicit act.
 			{Name: "--idempotency-key", Arg: "<k>", Summary: "reuse a key: the same key returns the same request"},
@@ -288,6 +291,40 @@ var Commands = []Command{
 		Args:    "<job-id>", MinArgs: 1, MaxArgs: 1,
 		Exits:      []exit.Code{exit.OK, exit.NotFound, exit.Unavailable},
 		Capability: "cmd.job.cancel", NeedsServer: true, Status: Implemented, Handler: "job.cancel",
+	},
+
+	// ---- rentals (cl-015) ----
+	// A rental is a POD the hub provisioned and this host ATTACHES a worker to. None of
+	// these verbs needs the LocalService: renting is a hub act plus a records/credential
+	// write (cl-009's D3 rule), and a service already running resolves the new rental on
+	// its next dispatch because it reads the store rather than a startup snapshot.
+	{
+		Path: []string{"rent"}, Group: "rentals",
+		Summary: "rent a pod through the hub and pin its dial triple for `run --worker`",
+		Args:    "<hub-endpoint>", MinArgs: 1, MaxArgs: 1,
+		Flags: []Flag{
+			{Name: "--card", Arg: "<name>", Summary: "required; the accelerator the hub provisions"},
+			{Name: "--timeout", Arg: "<dur>", Summary: "give up waiting for ready; the pod is NOT released"},
+			{Name: "--reason", Arg: "<why>", Summary: "required; the hub records it durably before it acts"},
+		},
+		Exits: []exit.Code{exit.OK, exit.Usage, exit.Validation, exit.NotFound, exit.Credential,
+			exit.Unavailable, exit.Deadline, exit.Failed},
+		Capability: "cmd.rent", Status: Implemented, Handler: "rent",
+	},
+	{
+		Path: []string{"rent", "ls"}, Group: "rentals",
+		Summary:    "pods this host holds: state, address, and the owner token's DIGEST",
+		MaxArgs:    0,
+		Exits:      []exit.Code{exit.OK, exit.Usage},
+		Capability: "cmd.rent.ls", Status: Implemented, Handler: "rent.ls",
+	},
+	{
+		Path: []string{"rent", "release"}, Group: "rentals",
+		Summary: "without --yes what releasing costs (a read); with --yes the pod is destroyed",
+		Args:    "<rental-id>", MinArgs: 1, MaxArgs: 1,
+		Flags:      []Flag{yesFlag},
+		Exits:      []exit.Code{exit.OK, exit.Usage, exit.NotFound, exit.Credential, exit.Unavailable, exit.Deadline},
+		Capability: "cmd.rent.release", PlanFirst: true, Status: Implemented, Handler: "rent.release",
 	},
 
 	// ---- catalog (cl-011) ----
