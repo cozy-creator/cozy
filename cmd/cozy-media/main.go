@@ -21,8 +21,9 @@
 //	                              it was delivered under. That check exists only because
 //	                              #506a made the identity path-free — under the old shape
 //	                              the pod could not have recomputed it at all.
-//	POST /v1/outputs/{slot}       the owner reserves one attempt's output directory and is
-//	                              told the pod-local path to grant the worker.
+//	POST /v1/outputs/{slot}       the owner reserves one attempt's output directory AND its
+//	                              exact maximum byte budget, then is told the pod-local path
+//	                              to grant the worker.
 //	GET  /v1/outputs/{slot}/{id}  the owner reads back what the worker wrote. READ-ONLY:
 //	                              this route opens a file and never creates one.
 //	DELETE /v1/attempts/{slot}    after rollback, or after mirror plus outcome ack, the
@@ -35,7 +36,9 @@
 // applied, so a restored backup cannot reinstate a retired credential.
 //
 // The SUBTREE IS QUOTA-BOUNDED and it is not the worker's root: uploads can never ENOSPC
-// the journal, because they land in a directory whose total is checked before each write.
+// the journal. The worker writes outputs through the shared filesystem, so this process
+// durably reserves their full grant bounds before returning a directory. HTTP uploads and
+// direct worker writes thereby consume one media-owned budget without a cross-process lock.
 package main
 
 import (
@@ -126,6 +129,23 @@ func run(args []string) int {
 	for _, dir := range []string{filepath.Join(opt.root, "inputs"), filepath.Join(opt.root, "outputs")} {
 		if err := os.MkdirAll(dir, 0o755); err != nil {
 			return fatal("cannot create %s: %v", dir, err)
+		}
+	}
+	reservationDir := filepath.Join(opt.root, ".reservations")
+	if err := os.MkdirAll(reservationDir, 0o700); err != nil {
+		return fatal("cannot create the media reservation directory: %v", err)
+	}
+	// A crash before an atomic reservation rename can leave only its hidden temporary.
+	// No grant was returned in that state, so boot removes it before quota is admitted.
+	if entries, err := os.ReadDir(reservationDir); err != nil {
+		return fatal("cannot inspect the media reservation directory: %v", err)
+	} else {
+		for _, entry := range entries {
+			if strings.HasPrefix(entry.Name(), ".") && strings.HasSuffix(entry.Name(), ".staging") {
+				if err := os.Remove(filepath.Join(reservationDir, entry.Name())); err != nil {
+					return fatal("cannot remove interrupted media reservation %s: %v", entry.Name(), err)
+				}
+			}
 		}
 	}
 	if opt.plans != "" {
@@ -250,28 +270,75 @@ func named(w http.ResponseWriter, r *http.Request, keys ...string) ([]string, bo
 	return out, true
 }
 
-// used is EVERYTHING THIS SERVER HAS WRITTEN, including the binding records it stages into
-// the worker's own directory. That directory is deliberately outside this server's subtree —
-// it has to be, because the worker resolves plan ids against it — and it sits beside the
-// journal, which is exactly the thing cl-014's quota exists to keep an upload from filling.
-// So the bound covers what this server writes, not merely where it prefers to write it.
+// used is the ONE admission number: bytes already written outside active output slots,
+// plus every active slot's exact grant bound. Worker-written files under a reserved slot
+// are excluded because their maximum has already been charged in full. That makes this
+// number invariant while the other process writes and closes the cross-process check/write
+// race without teaching the worker a second quota authority or relying on headroom.
 //
-// It is walked per write rather than counted incrementally because the number that matters
-// is what is ON THE DISK: a counter that drifted from the filesystem would be a quota that
-// has stopped bounding anything.
+// Binding records are included even though the worker resolves them outside this subtree.
+// A malformed reservation fails closed by reporting the whole quota used.
 func (s *server) used() int64 {
+	reservations, err := s.reservations()
+	if err != nil {
+		return s.opt.quota
+	}
 	var total int64
-	count := func(_ string, info os.FileInfo, err error) error {
+	count := func(path string, info os.FileInfo, err error) error {
 		if err == nil && info != nil && !info.IsDir() {
+			rel, relErr := filepath.Rel(s.opt.root, path)
+			if relErr == nil {
+				parts := strings.Split(rel, string(filepath.Separator))
+				if len(parts) >= 3 && parts[0] == "outputs" {
+					if _, reserved := reservations[parts[1]]; reserved {
+						return nil
+					}
+				}
+			}
 			total += info.Size()
 		}
 		return nil
 	}
-	_ = filepath.Walk(s.opt.root, count)
+	reservationDir := filepath.Join(s.opt.root, ".reservations")
+	_ = filepath.Walk(s.opt.root, func(path string, info os.FileInfo, err error) error {
+		if err == nil && info != nil && info.IsDir() && path == reservationDir {
+			return filepath.SkipDir
+		}
+		return count(path, info, err)
+	})
 	if s.opt.plans != "" {
 		_ = filepath.Walk(s.opt.plans, count)
 	}
+	for _, bytes := range reservations {
+		total += bytes
+	}
 	return total
+}
+
+func (s *server) reservations() (map[string]int64, error) {
+	entries, err := os.ReadDir(filepath.Join(s.opt.root, ".reservations"))
+	if os.IsNotExist(err) {
+		return map[string]int64{}, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	out := make(map[string]int64, len(entries))
+	for _, entry := range entries {
+		if entry.IsDir() || !safeName.MatchString(entry.Name()) || strings.Contains(entry.Name(), "..") {
+			return nil, fmt.Errorf("invalid media reservation %q", entry.Name())
+		}
+		data, err := os.ReadFile(filepath.Join(s.opt.root, ".reservations", entry.Name()))
+		if err != nil {
+			return nil, err
+		}
+		bytes, err := strconv.ParseInt(strings.TrimSpace(string(data)), 10, 64)
+		if err != nil || bytes < 0 {
+			return nil, fmt.Errorf("invalid byte bound in media reservation %q", entry.Name())
+		}
+		out[entry.Name()] = bytes
+	}
+	return out, nil
 }
 
 // take reads one request body under two bounds: this server's per-body cap, and whatever
@@ -319,7 +386,8 @@ func commit(path string, data []byte) error {
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
 		return err
 	}
-	staging := path + ".staging"
+	staging := filepath.Join(filepath.Dir(path), "."+filepath.Base(path)+".staging")
+	defer os.Remove(staging)
 	if err := os.WriteFile(staging, data, 0o644); err != nil {
 		return err
 	}
@@ -404,9 +472,11 @@ func (s *server) putPlan(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-// reserveOutputs creates one attempt's output directory and answers its pod-local path.
-// The owner grants the worker exactly this directory; nothing else in the subtree is a
-// destination anybody was given.
+// reserveOutputs charges one attempt's exact maximum output bytes BEFORE returning its
+// pod-local directory. The durable reservation is the protocol between this process and
+// the filesystem-writing worker: HTTP admission counts the bound instead of racing the
+// worker's current file sizes. A retry with the same bound is idempotent; changing it is
+// a conflict because an already-issued grant cannot be widened in place.
 func (s *server) reserveOutputs(w http.ResponseWriter, r *http.Request) {
 	if !s.admits(w, r) {
 		return
@@ -417,8 +487,55 @@ func (s *server) reserveOutputs(w http.ResponseWriter, r *http.Request) {
 	}
 	s.writes.Lock()
 	defer s.writes.Unlock()
-	dir := filepath.Join(s.opt.root, "outputs", names[0])
+	bound, err := strconv.ParseInt(r.URL.Query().Get("max_bytes"), 10, 64)
+	if err != nil || bound < 0 {
+		refuse(w, http.StatusBadRequest, "media.bad_reservation",
+			"max_bytes must be the non-negative sum of this attempt's output grants",
+			"the owner derives it from the OutputBinding max_bytes values")
+		return
+	}
+	slot := names[0]
+	reservation := filepath.Join(s.opt.root, ".reservations", slot)
+	created := false
+	if data, readErr := os.ReadFile(reservation); readErr == nil {
+		prior, parseErr := strconv.ParseInt(strings.TrimSpace(string(data)), 10, 64)
+		if parseErr != nil || prior < 0 {
+			refuse(w, http.StatusInsufficientStorage, "media.reservation_corrupt",
+				"the existing output reservation is unreadable, so quota admission fails closed",
+				"drop the attempt or repair the pod's media subtree")
+			return
+		}
+		if prior != bound {
+			refuse(w, http.StatusConflict, "media.reservation_conflict",
+				fmt.Sprintf("slot %s already reserves %d B, not %d B", slot, prior, bound),
+				"an issued output grant is immutable; use a new attempt slot")
+			return
+		}
+	} else if !os.IsNotExist(readErr) {
+		refuse(w, http.StatusInsufficientStorage, "media.reservation_unreadable",
+			"the output reservation cannot be read: "+readErr.Error(),
+			"check the pod's media subtree")
+		return
+	} else {
+		used := s.used()
+		if bound > s.opt.quota-used {
+			refuse(w, http.StatusInsufficientStorage, "media.quota_exhausted",
+				fmt.Sprintf("this pod holds or reserves %d B; %d B of its %d B quota remains", used, max(0, s.opt.quota-used), s.opt.quota),
+				"drop completed attempts before reserving another output grant")
+			return
+		}
+		if err := commit(reservation, []byte(strconv.FormatInt(bound, 10))); err != nil {
+			refuse(w, http.StatusInternalServerError, "media.unwritable",
+				"the output reservation could not be recorded: "+err.Error(), "check the pod's media subtree")
+			return
+		}
+		created = true
+	}
+	dir := filepath.Join(s.opt.root, "outputs", slot)
 	if err := os.MkdirAll(dir, 0o777); err != nil {
+		if created {
+			_ = os.Remove(reservation)
+		}
 		refuse(w, http.StatusInternalServerError, "media.unwritable",
 			"the output slot could not be reserved: "+err.Error(), "check the pod's media subtree")
 		return
@@ -427,7 +544,7 @@ func (s *server) reserveOutputs(w http.ResponseWriter, r *http.Request) {
 	// writable on purpose, because the two processes share a container and not a uid in
 	// every provisioning. The subtree is quota-bounded and holds no credential.
 	_ = os.Chmod(dir, 0o777)
-	answer(w, http.StatusCreated, map[string]any{"dir": dir, "slot": names[0]})
+	answer(w, http.StatusCreated, map[string]any{"dir": dir, "slot": slot})
 }
 
 // dropAttempt removes only one opaque attempt slot. Inputs use the slot as an exact
@@ -464,6 +581,11 @@ func (s *server) dropAttempt(w http.ResponseWriter, r *http.Request) {
 			"the attempt output directory could not be removed: "+err.Error(), "check the pod's media subtree")
 		return
 	}
+	if err := os.Remove(filepath.Join(s.opt.root, ".reservations", slot)); err != nil && !os.IsNotExist(err) {
+		refuse(w, http.StatusInternalServerError, "media.unwritable",
+			"the attempt output reservation could not be removed: "+err.Error(), "check the pod's media subtree")
+		return
+	}
 	answer(w, http.StatusOK, map[string]any{"slot": slot})
 }
 
@@ -479,10 +601,9 @@ func (s *server) getOutput(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	path := filepath.Join(s.opt.root, "outputs", names[0], names[1])
-	// BOUNDED, even though the worker wrote it. This server did not mint the grant that
-	// bounded the write and does not know what the owner admitted, so it holds the read to
-	// what it admits — an output larger than this server's own body bound is refused
-	// rather than loaded, and the refusal says so.
+	// BOUNDED, even though the worker wrote it. The slot reservation is an aggregate bound,
+	// not permission to load any one object into memory, so this read is held to the
+	// server's per-body cap as well. An oversized output is refused rather than loaded.
 	if info, err := os.Stat(path); err == nil && info.Size() > s.opt.maxBody {
 		refuse(w, http.StatusRequestEntityTooLarge, "media.over_bound",
 			fmt.Sprintf("the output at %s/%s is %d B and %d B is admissible here",

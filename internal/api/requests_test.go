@@ -1,0 +1,117 @@
+package api
+
+import (
+	"bytes"
+	"encoding/json"
+	"net/http"
+	"net/http/httptest"
+	"os"
+	"testing"
+	"time"
+
+	"github.com/cozy-creator/cozy-creator-v2/internal/home"
+	"github.com/cozy-creator/cozy-creator-v2/internal/inputasset"
+	"github.com/cozy-creator/cozy-creator-v2/internal/orchestrator"
+	"github.com/cozy-creator/cozy-creator-v2/internal/records"
+	"github.com/cozy-creator/cozy-creator-v2/internal/secret"
+)
+
+func TestSettledAssetReplayUsesDurableIdentityBeforeFiles(t *testing.T) {
+	layout, e := home.Open(t.TempDir())
+	if e != nil {
+		t.Fatal(e)
+	}
+	store, e := records.Open(layout.DB)
+	if e != nil {
+		t.Fatal(e)
+	}
+	defer store.Close()
+	owner, e := orchestrator.Open(orchestrator.Options{Layout: layout, Store: store})
+	if e != nil {
+		t.Fatal(e)
+	}
+	defer owner.Close(time.Second)
+	cli := secret.New("cli-test-token")
+	s := New(Options{Orchestrator: owner, Creds: Credentials{CLI: cli}, Addr: "127.0.0.1:2699"})
+	handler, e := s.Handler()
+	if e != nil {
+		t.Fatal(e)
+	}
+
+	source := layout.Root + "/source.png"
+	if err := os.WriteFile(source, []byte("asset bytes"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	data, digest, mediaType, inspected := inputasset.Inspect(source, inputasset.MaxBytes)
+	if inspected != nil {
+		t.Fatal(inspected)
+	}
+	submission := Submission{
+		Endpoint: "org/model", Function: "generate", PlanID: "sha256:plan",
+		Input:   json.RawMessage(`{"first_frame":"` + digest + `","prompt":"same"}`),
+		Outputs: []string{"image"},
+		LocalAssets: []records.AssetBinding{{
+			FieldPath: "first_frame", LocalPath: source, Digest: digest,
+			Length: int64(len(data)), MediaType: mediaType, Order: 0,
+		}},
+	}
+	body, err := json.Marshal(submission)
+	if err != nil {
+		t.Fatal(err)
+	}
+	call := func(body []byte) *httptest.ResponseRecorder {
+		t.Helper()
+		req := httptest.NewRequest(http.MethodPost, "/v1/requests", bytes.NewReader(body))
+		req.RemoteAddr = "127.0.0.1:12345"
+		req.Host = "127.0.0.1:2699"
+		req.Header.Set("Idempotency-Key", "asset-replay")
+		Authorize(req, cli)
+		response := httptest.NewRecorder()
+		handler.ServeHTTP(response, req)
+		return response
+	}
+
+	first := call(body)
+	if first.Code != http.StatusAccepted {
+		t.Fatalf("first submit = %d, body %s", first.Code, first.Body.String())
+	}
+	var original Handle
+	if err := json.Unmarshal(first.Body.Bytes(), &original); err != nil {
+		t.Fatal(err)
+	}
+	if original.RequestID == "" || original.Replay {
+		t.Fatalf("first handle = %#v", original)
+	}
+	if e := store.SettleRequest(original.RequestID, "succeeded"); e != nil {
+		t.Fatal(e)
+	}
+	if err := os.Remove(source); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Remove(layout.InputAsset(digest)); err != nil {
+		t.Fatal(err)
+	}
+
+	replayed := call(body)
+	if replayed.Code != http.StatusOK {
+		t.Fatalf("settled replay = %d, body %s", replayed.Code, replayed.Body.String())
+	}
+	var same Handle
+	if err := json.Unmarshal(replayed.Body.Bytes(), &same); err != nil {
+		t.Fatal(err)
+	}
+	if same.RequestID != original.RequestID || !same.Replay {
+		t.Fatalf("replay handle = %#v, original = %#v", same, original)
+	}
+
+	changed := submission
+	changed.Input = json.RawMessage(`{"first_frame":"` + digest + `","prompt":"changed"}`)
+	changedBody, err := json.Marshal(changed)
+	if err != nil {
+		t.Fatal(err)
+	}
+	conflict := call(changedBody)
+	if conflict.Code != http.StatusConflict {
+		t.Fatalf("changed body after asset cleanup = %d, body %s", conflict.Code, conflict.Body.String())
+	}
+}

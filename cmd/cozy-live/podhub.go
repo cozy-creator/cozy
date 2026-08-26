@@ -432,9 +432,10 @@ func (h *podHub) provision(rec *podRental) {
 			"--tokens", tokenFile,
 			"--out", runRoot,
 			"--tls-cert", certPath, "--tls-key", keyPath,
-			// A small quota on purpose: the arm that fills it is cheap, and a media
-			// subtree is separately bounded so an upload can never ENOSPC the journal.
-			"--quota", "4194304")
+			// The quota must admit the exact 64 MiB output reservation the product grants.
+			// The separate 4 MiB body bound keeps the oversize red arm cheap without
+			// under-provisioning every ordinary attempt before its offer exists.
+			"--quota", "134217728", "--max-body", "4194304")
 		mediaLog, err := os.Create(filepath.Join(runRoot, "pod-media.log"))
 		must("the pod media log", err)
 		media.Stdout, media.Stderr = mediaLog, mediaLog

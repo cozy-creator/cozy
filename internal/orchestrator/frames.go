@@ -399,7 +399,6 @@ func (c *Orchestrator) onOutcome(s *session, t *pb.AttemptOutcome) {
 	cause := causeCode(doc.Sub("cause").Int("code"))
 	origin := causeOrigin(doc.Sub("cause").Int("origin"))
 	executionStarted, _ := doc["execution_started"].(bool)
-	c.settleDispatch(t.RequestId, ordinal, status != "REFUSED" || executionStarted)
 	req, e := c.opt.Store.RequestRow(t.RequestId)
 	if e != nil || req == nil {
 		refuse("no request row to settle")
@@ -491,6 +490,12 @@ func (c *Orchestrator) onOutcome(s *session, t *pb.AttemptOutcome) {
 		refuse("%s", e.Message)
 		return
 	}
+	// CAPACITY MOVES ONLY AFTER AUTHORITY ACCEPTS THE OUTCOME. In particular, a frame from
+	// the wrong session or carrying the wrong InvocationSpec digest must not be able to
+	// return another worker's reservation and reopen its seat before AcceptTerminal rejects
+	// it. The durable attempt row authenticates the causal answer; the frame cannot do so by
+	// naming a request id that happens to hold an offer.
+	c.settleDispatch(t.RequestId, ordinal, status != "REFUSED" || executionStarted)
 	if applied {
 		c.logf("AttemptOutcome %s#%d %s/%s(%s) started=%v applied in %.2f ms: %d output(s) "+
 			"became visible in the SAME transaction", t.RequestId, ordinal, status, cause,

@@ -14,6 +14,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/cozy-creator/cozy-creator-v2/internal/canonical"
 	"github.com/cozy-creator/cozy-creator-v2/internal/home"
 	"github.com/cozy-creator/cozy-creator-v2/internal/media"
 	"github.com/cozy-creator/cozy-creator-v2/internal/records"
@@ -171,6 +172,112 @@ func TestLocalWindowsGrantRefusesBeforeWritingPaths(t *testing.T) {
 	}
 	if e := localGrantSupport("linux"); e != nil {
 		t.Fatalf("Linux local-grant verdict = %v", e)
+	}
+}
+
+func TestUnauthorizedRefusalCannotReturnAnotherAssignmentsSeat(t *testing.T) {
+	tests := []struct {
+		name        string
+		sessionBoot string
+		outcomeSpec []byte
+	}{
+		{name: "wrong session", sessionBoot: "boot-intruder"},
+		{name: "wrong invocation digest", sessionBoot: "boot-owner", outcomeSpec: []byte("wrong-spec")},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			layout, e := home.Open(t.TempDir())
+			if e != nil {
+				t.Fatal(e)
+			}
+			store, e := records.Open(layout.DB)
+			if e != nil {
+				t.Fatal(e)
+			}
+			defer store.Close()
+
+			const instance, ownerBoot = "ins-owner", "boot-owner"
+			if e := store.AttachWorker(records.WorkerProcess{
+				InstanceID: instance, Endpoint: "org/model", ReleaseID: "release", WorkerID: instance,
+			}); e != nil {
+				t.Fatal(e)
+			}
+			req, _, e := store.Submit(records.Request{
+				ID: "req-authority", IdemKey: "idem-authority", BodyDigest: "sha256:body",
+				Endpoint: "org/model", Entrypoint: "generate", PlanID: "plan", Payload: []byte(`{}`),
+			})
+			if e != nil {
+				t.Fatal(e)
+			}
+			assigned := sha256.Sum256([]byte("assigned-spec"))
+			spelled, _ := canonical.Spell(assigned[:])
+			ordinal, e := store.Dispatch(records.Attempt{
+				RequestID: req.ID, InstanceID: instance, SessionID: ownerBoot,
+				InvocationDigest: spelled, InvocationCanonical: []byte("assigned-spec"),
+			})
+			if e != nil {
+				t.Fatal(e)
+			}
+			if e := store.OfferDispatch(req.ID, ordinal, ownerBoot); e != nil {
+				t.Fatal(e)
+			}
+
+			c, e := Open(Options{Layout: layout, Store: store})
+			if e != nil {
+				t.Fatal(e)
+			}
+			w := &worker{instanceID: instance, bootID: ownerBoot, reportedSlots: 1, reservedSlots: 1}
+			w.observeSlots(1)
+			c.workers[instance] = w
+			c.offers[key(req.ID, uint64(ordinal))] = &dispatchReservation{worker: w}
+
+			spec := assigned[:]
+			if tt.outcomeSpec != nil {
+				wrong := sha256.Sum256(tt.outcomeSpec)
+				spec = wrong[:]
+			}
+			outcome := refusedOutcome(t, req.ID, uint64(ordinal), spec)
+			c.onOutcome(&session{
+				bootID: tt.sessionBoot, instanceID: instance, generation: 1,
+				out: make(chan *pb.RecordOwnerFrame, 1),
+			}, outcome)
+
+			if _, ok := c.offers[key(req.ID, uint64(ordinal))]; !ok {
+				t.Fatal("unauthorized outcome removed the live dispatch reservation")
+			}
+			if w.reservedSlots != 1 || w.slots != 0 {
+				t.Fatalf("unauthorized outcome reopened the seat: slots=%d reserved=%d", w.slots, w.reservedSlots)
+			}
+			attempt, e := store.AttemptRow(req.ID, ordinal)
+			if e != nil || attempt == nil || attempt.State != "offered" {
+				t.Fatalf("unauthorized outcome changed durable attempt: %#v, %v", attempt, e)
+			}
+		})
+	}
+}
+
+func refusedOutcome(t *testing.T, requestID string, ordinal uint64, spec []byte) *pb.AttemptOutcome {
+	t.Helper()
+	spelled, e := canonical.Spell(spec)
+	if e != nil {
+		t.Fatal(e)
+	}
+	body := &pb.AttemptOutcomeBody{
+		RequestId: requestID, AttemptOrdinal: ordinal, InvocationSpecDigest: spelled,
+		Status: pb.OutcomeStatus_OUTCOME_STATUS_REFUSED, SafeMessage: "no capacity",
+		ExecutionStarted: false,
+		Cause: &pb.OutcomeCause{
+			Code: pb.CauseCode_CAUSE_CODE_NO_CAPACITY, Origin: pb.CauseOrigin_CAUSE_ORIGIN_SUPERVISOR,
+			Detail: "refused before execution",
+		},
+	}
+	data, digest, e := canonical.Identity(body)
+	if e != nil {
+		t.Fatal(e)
+	}
+	return &pb.AttemptOutcome{
+		RequestId: requestID, AttemptOrdinal: ordinal, InvocationSpecDigest: spec,
+		OutcomeId: "out-refused", OutcomeDigest: digest, OutcomeCanonicalBytes: data,
 	}
 }
 

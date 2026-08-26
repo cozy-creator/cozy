@@ -1,6 +1,7 @@
 package orchestrator
 
 import (
+	"math"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -805,13 +806,20 @@ func (c *Orchestrator) remoteGrant(req records.Request, attempt uint64, w *worke
 		assets[i] = data
 	}
 	slot := media.Slot(req.ID, attempt)
+	outputIDs := splitList(req.Outputs)
+	perOutput := c.maxOutputBytes()
+	if len(outputIDs) > 0 && perOutput > uint64(math.MaxInt64)/uint64(len(outputIDs)) {
+		return nil, exit.New(exit.Validation,
+			"the output grant for %s#%d exceeds the media plane's byte range", req.ID, attempt)
+	}
+	reservedOutputBytes := int64(perOutput * uint64(len(outputIDs)))
 	complete := false
 	defer func() {
 		if !complete {
 			c.cleanupRemote(req.ID, attempt, w)
 		}
 	}()
-	dir, e := w.media.ReserveOutputs(slot)
+	dir, e := w.media.ReserveOutputs(slot, reservedOutputBytes)
 	if e != nil {
 		return nil, e
 	}
@@ -835,10 +843,7 @@ func (c *Orchestrator) remoteGrant(req records.Request, attempt uint64, w *worke
 		c.logf("%s#%d: input asset %s (%d B, %s) crossed to %s at %s",
 			req.ID, attempt, asset.FieldPath, asset.Length, asset.Digest, w.media.Addr(), path)
 	}
-	for _, id := range strings.Split(req.Outputs, ",") {
-		if id == "" {
-			continue
-		}
+	for _, id := range outputIDs {
 		g.Outputs = append(g.Outputs, &pb.OutputAccess{
 			OutputId: id, Url: "file://" + dir + "/" + id,
 		})

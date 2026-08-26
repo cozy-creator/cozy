@@ -204,7 +204,7 @@ var normalize = []string{
 	`UPDATE attempts SET state='offered' WHERE state='dispatching'`,
 	`UPDATE requests SET state='requeue_pending' WHERE state='queued' AND EXISTS (
 	  SELECT 1 FROM attempts a WHERE a.request_id=requests.id
-	  AND a.attempt=requests.ordinal AND a.state='terminal')`,
+	  AND a.attempt=requests.ordinal AND a.state IN ('terminal','closed'))`,
 }
 
 func now() string { return time.Now().UTC().Format(time.RFC3339Nano) }
@@ -515,6 +515,20 @@ func (s *Store) RequestRow(id string) (*Request, *exit.Error) {
 	}
 	if err != nil {
 		return nil, exit.Internalf("cannot read request %s: %s", id, err)
+	}
+	return &r, nil
+}
+
+// RequestByIdempotencyKey resolves the durable identity before a retry touches any
+// caller-owned resources. In particular, a settled request's original and staged asset
+// files may both be gone; its recorded semantic body is still the answer for that key.
+func (s *Store) RequestByIdempotencyKey(key string) (*Request, *exit.Error) {
+	r, err := scanRequest(s.db.QueryRow(`SELECT `+requestCols+` FROM requests WHERE idem_key=?`, key))
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, exit.Internalf("cannot read request for idempotency key %s: %s", key, err)
 	}
 	return &r, nil
 }

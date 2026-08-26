@@ -114,19 +114,39 @@ func (s *Server) submit(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	spec, e := s.resolvePlan(sub)
+	key := strings.TrimSpace(r.Header.Get("Idempotency-Key"))
+	existing, e := s.store.RequestByIdempotencyKey(key)
 	if e != nil {
 		s.refuseTyped(w, r, e)
 		return
 	}
-	if len(spec.Assets) > 0 {
-		defer func() {
-			if e := inputasset.DropUnowned(s.layout, s.store, spec.Assets); e != nil {
-				fmt.Fprintf(s.log, "input asset cleanup deferred: %s\n", e.Message)
-			}
-		}()
+	var spec orchestrator.Submission
+	if existing != nil {
+		// Resolve an existing key from the durable request identity, not from resources
+		// retained only while it can execute. The caller's asset claims are still hashed
+		// below, so a different body conflicts, but neither its source nor the reclaimed
+		// staging object is opened merely to answer an already-recorded request.
+		spec = replaySubmission(sub, *existing)
+	} else {
+		spec, e = s.resolvePlan(sub)
+		if e != nil {
+			s.refuseTyped(w, r, e)
+			return
+		}
+		spec.Assets, e = s.stageAssets(spec.Assets)
+		if e != nil {
+			s.refuseTyped(w, r, e)
+			return
+		}
+		if len(spec.Assets) > 0 {
+			defer func() {
+				if e := inputasset.DropUnowned(s.layout, s.store, spec.Assets); e != nil {
+					fmt.Fprintf(s.log, "input asset cleanup deferred: %s\n", e.Message)
+				}
+			}()
+		}
 	}
-	spec.IdemKey = strings.TrimSpace(r.Header.Get("Idempotency-Key"))
+	spec.IdemKey = key
 	// THE BODY DIGEST is over the whole submission the key names, not over the payload
 	// alone: one key that named a different FUNCTION must conflict as loudly as one
 	// that named different input. The canonical document is the digest's subject, so
@@ -158,6 +178,27 @@ func (s *Server) submit(w http.ResponseWriter, r *http.Request) {
 		status = http.StatusOK
 	}
 	s.ok(w, r, status, handle)
+}
+
+func replaySubmission(sub Submission, recorded records.Request) orchestrator.Submission {
+	planID := sub.PlanID
+	if planID == "" {
+		planID = recorded.PlanID
+	}
+	outputs := append([]string(nil), sub.Outputs...)
+	if len(outputs) == 0 && recorded.Outputs != "" {
+		outputs = strings.Split(recorded.Outputs, ",")
+	}
+	assets := append([]records.AssetBinding(nil), sub.LocalAssets...)
+	sort.Slice(assets, func(i, j int) bool { return assets[i].FieldPath < assets[j].FieldPath })
+	payload := []byte(sub.Input)
+	if len(payload) == 0 {
+		payload = []byte("{}")
+	}
+	return orchestrator.Submission{
+		Endpoint: sub.Endpoint, Entrypoint: sub.Function, Payload: payload,
+		Outputs: outputs, PlanID: planID, Worker: sub.Worker, Assets: assets,
+	}
 }
 
 // submissionDigest is the canonical identity of one submission. It uses the SAME writer
@@ -284,11 +325,6 @@ func (s *Server) resolvePlan(sub Submission) (orchestrator.Submission, *exit.Err
 			out.Outputs = spec.Placement.OutputsFor(sub.Function)
 		}
 	}
-	staged, e := s.stageAssets(out.Assets)
-	if e != nil {
-		return out, e
-	}
-	out.Assets = staged
 	return out, nil
 }
 

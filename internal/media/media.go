@@ -31,6 +31,7 @@ import (
 	"io"
 	"net/http"
 	"os"
+	"strconv"
 	"strings"
 	"time"
 
@@ -216,6 +217,8 @@ func codeFor(status int) exit.Code {
 		return exit.NotFound
 	case http.StatusBadRequest, http.StatusRequestEntityTooLarge:
 		return exit.Validation
+	case http.StatusConflict:
+		return exit.Conflict
 	default:
 		return exit.Unavailable
 	}
@@ -265,10 +268,12 @@ func (c *Client) PutPlan(planID string, record []byte) (string, *exit.Error) {
 	return doc.Path, nil
 }
 
-// ReserveOutputs creates one attempt's output directory on the pod and answers its
-// pod-local path — the destination the owner grants the worker.
-func (c *Client) ReserveOutputs(slot string) (string, *exit.Error) {
-	doc, _, e := c.call(http.MethodPost, "/v1/outputs/"+slot, nil)
+// ReserveOutputs charges the exact sum of the attempt's OutputBinding max_bytes values,
+// then creates its output directory and answers the pod-local destination. Charging first
+// is what lets direct worker filesystem writes and owner HTTP uploads share one quota.
+func (c *Client) ReserveOutputs(slot string, maxBytes int64) (string, *exit.Error) {
+	doc, _, e := c.call(http.MethodPost,
+		"/v1/outputs/"+slot+"?max_bytes="+strconv.FormatInt(maxBytes, 10), nil)
 	if e != nil {
 		return "", e
 	}
