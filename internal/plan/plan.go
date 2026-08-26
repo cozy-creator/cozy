@@ -28,6 +28,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"sort"
+	"strconv"
 	"strings"
 
 	"github.com/cozy-creator/cozy-creator-v2/internal/canonical"
@@ -71,17 +72,6 @@ func Identity(record map[string]any) map[string]any {
 			continue
 		}
 		out[k] = v
-	}
-	return out
-}
-
-// Resolution is the complement: this machine's answer to where the referents are.
-func Resolution(record map[string]any) map[string]any {
-	out := map[string]any{}
-	for k, v := range record {
-		if resolution[k] {
-			out[k] = v
-		}
 	}
 	return out
 }
@@ -180,7 +170,7 @@ func spell(key string, v any) (canonical.Value, *exit.Error) {
 	case []any:
 		items := make([]canonical.Value, 0, len(t))
 		for i, item := range t {
-			value, e := spell(key+"["+itoa(i)+"]", item)
+			value, e := spell(key+"["+strconv.Itoa(i)+"]", item)
 			if e != nil {
 				return nil, e
 			}
@@ -297,16 +287,4 @@ func short(id string) string {
 		return "sha256:" + bare[:12] + "…"
 	}
 	return id
-}
-
-func itoa(n int) string {
-	if n == 0 {
-		return "0"
-	}
-	digits := ""
-	for n > 0 {
-		digits = string(rune('0'+n%10)) + digits
-		n /= 10
-	}
-	return digits
 }
