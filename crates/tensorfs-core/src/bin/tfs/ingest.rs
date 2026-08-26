@@ -898,14 +898,28 @@ pub fn cmd_worker(root: &Path, target: &str, f: &Flags) -> ExitCode {
         ("class", Value::str(p.plan.class_name.clone())),
         ("converter", Value::str(p.plan.converter.clone())),
         (
+            // Each component's ALLOWED SET, one entry per component. A component may be
+            // named more than once in a target (that is how a mixed-allocation carrier is
+            // addressed), and a map keyed on the component with a bare alias value emits
+            // the same key twice — a document the canonical reader refuses on the way back.
             "target",
-            Value::map(
-                p.target
-                    .components
-                    .iter()
-                    .map(|(c, e)| (c.clone(), Value::str(e.clone())))
-                    .collect(),
-            ),
+            Value::map({
+                let mut out: Vec<(String, Value)> = Vec::new();
+                for (c, _) in &p.target.components {
+                    if out.iter().any(|(k, _)| k == c) {
+                        continue;
+                    }
+                    let aliases = match p.target.allowed(c) {
+                        Ok(v) => v,
+                        Err(e) => return bail(e),
+                    };
+                    out.push((
+                        c.clone(),
+                        Value::arr(aliases.into_iter().map(Value::str).collect()),
+                    ));
+                }
+                out
+            }),
         ),
     ]));
     let recipe = ok!(store.put_stream(

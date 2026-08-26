@@ -241,6 +241,66 @@ impl Relation {
             Relation::Dims(dims) => dims.iter().map(|d| d.eval(logical, elements)).collect(),
         }
     }
+
+    /// Can this relation be run BACKWARDS at all? A spec property, decided on the relation
+    /// alone: every stored dim must name one logical axis and lose nothing (`axis`, `div`),
+    /// and between them they must cover the logical axes contiguously from 0. The lossy and
+    /// non-positional half of the grammar — `ceil_div`, `ceil_block`, `elements_div`, `lit` —
+    /// never inverts, and a spec whose DATA role uses one has put its logical shape somewhere
+    /// the border cannot read it back out of.
+    pub fn invertible(&self) -> bool {
+        let dims = match self {
+            Relation::Same => return true,
+            Relation::Dims(d) => d,
+        };
+        let mut seen = vec![false; dims.len()];
+        for d in dims {
+            let axis = match d {
+                Dim::Axis { axis } | Dim::Div { axis, .. } => *axis as usize,
+                _ => return false,
+            };
+            match seen.get_mut(axis) {
+                // Two stored dims naming one logical axis: the recovery is over-determined,
+                // which is a disagreement waiting to happen and never a default.
+                Some(true) | None => return false,
+                Some(s) => *s = true,
+            }
+        }
+        seen.into_iter().all(|s| s)
+    }
+
+    /// The LOGICAL shape a stored shape came from. `None` when this relation has no inverse
+    /// or when the stored shape does not have the relation's own rank — the first is a spec
+    /// fact, the second a carrier fact, and the caller separates them.
+    ///
+    /// This is what makes a PACKED data role possible: `nvfp4-w4a4/1` stores `[out, in/2]`,
+    /// so the companion relations must be evaluated against the `[out, in]` that came from,
+    /// never against the packed bytes' own shape.
+    pub fn invert(&self, stored: &[u64]) -> Result<Option<Vec<u64>>> {
+        let dims = match self {
+            Relation::Same => return Ok(Some(stored.to_vec())),
+            Relation::Dims(d) => d,
+        };
+        if !self.invertible() || dims.len() != stored.len() {
+            return Ok(None);
+        }
+        let mut logical = vec![0u64; dims.len()];
+        for (d, got) in dims.iter().zip(stored) {
+            let (axis, value) = match d {
+                Dim::Axis { axis } => (*axis, *got),
+                Dim::Div { axis, by } => (
+                    *axis,
+                    got.checked_mul(*by).ok_or_else(|| crate::err::Refusal {
+                        code: Code::ARITH_OVERFLOW,
+                        detail: format!("{got} × {by} overflows"),
+                    })?,
+                ),
+                _ => return Ok(None),
+            };
+            logical[axis as usize] = value;
+        }
+        Ok(Some(logical))
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

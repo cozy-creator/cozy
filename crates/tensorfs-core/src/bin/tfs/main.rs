@@ -58,6 +58,7 @@
 //!                                            payloads — the only tensor bytes inspect reads
 //!   tfs ingest bank <dialect> <fam> <var> <converter>   the REVIEW act: bank a fingerprint
 //!   tfs ingest plan <c=alias,...>            the plan, from headers alone: 0 tensor bytes
+//!                                            a component repeats for its ALLOWED SET
 //!   tfs ingest run <root> <c=alias,...>      spawn the isolated worker; candidate + receipt
 //!   tfs ingest-worker <root> <c=alias,...>   the hermetic child (invoked by `run`)
 //!   tfs ingest install <root> <session>      the coordinator promotes ONE root

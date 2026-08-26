@@ -116,13 +116,20 @@ pub fn converter(name: &str) -> Result<&'static Converter> {
 /// Component-granular, never one rule over the tree: the real bindable H3 tree is an
 /// fp8-blockwise text encoder BESIDE a BF16 transformer, and a single tree-wide target
 /// cannot say that.
+///
+/// A component may be named MORE THAN ONCE, and that is the vocabulary a mixed-allocation
+/// carrier needs: `transformer=mxfp8/1,transformer=fp8-rowwise/1` says this one component's
+/// tensors are drawn from those two encodings, and the carrier's own per-tensor roles pick
+/// which is which. The widening stops at the component on purpose — a set that spanned the
+/// SNAPSHOT would let the transformer's encoding admit a text-encoder tensor, which is the
+/// one-rule-over-the-tree this type exists to refuse.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Target {
     pub components: Vec<(String, String)>,
 }
 
 impl Target {
-    /// `unet=plain/1,text_encoder=plain/1`
+    /// `unet=plain/1,text_encoder=plain/1`, a component repeatable for a mixed one.
     pub fn parse(s: &str) -> Result<Target> {
         let mut components = Vec::new();
         for part in s.split(',').filter(|p| !p.is_empty()) {
@@ -141,17 +148,25 @@ impl Target {
         }
         Ok(Target { components })
     }
-    pub fn get(&self, component: &str) -> Result<&str> {
-        match self.components.iter().find(|(c, _)| c == component) {
-            Some((_, e)) => Ok(e.as_str()),
-            None => refuse(
+    /// Every alias this component is allowed to draw from, in declaration order. A set of
+    /// one is the ordinary case and behaves exactly as the single alias always did.
+    pub fn allowed(&self, component: &str) -> Result<Vec<&str>> {
+        let mut v: Vec<&str> = Vec::new();
+        for (c, e) in &self.components {
+            if c == component && !v.contains(&e.as_str()) {
+                v.push(e.as_str());
+            }
+        }
+        if v.is_empty() {
+            return refuse(
                 Code::MISSING_FIELD,
                 format!(
                     "the target names no encoding for component {component:?} — targets are \
                      component-granular and a missing component is never defaulted"
                 ),
-            ),
+            );
         }
+        Ok(v)
     }
 }
 
@@ -391,6 +406,27 @@ fn short(id: &str) -> String {
     id.chars().skip(7).take(12).collect()
 }
 
+/// One component's ALLOWED ALIAS SET, for the verdicts. A set of one prints bare, so the
+/// ordinary single-encoding refusal reads exactly as it always did.
+struct Allowed<'a>(&'a [&'a str]);
+
+impl Allowed<'_> {
+    /// Nothing but plain storage allowed — then a component with no encoded tensor is the
+    /// ordinary case rather than an unperformed conversion.
+    fn is_plain_only(&self) -> bool {
+        self.0.iter().all(|a| *a == "plain/1")
+    }
+}
+
+impl std::fmt::Display for Allowed<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self.0 {
+            [one] => write!(f, "{one}"),
+            many => write!(f, "{many:?}"),
+        }
+    }
+}
+
 /// Plan one conversion. Headers in, plan out — no path is opened and no tensor byte is read.
 ///
 /// `specs` is the CANDIDATE SET: `(alias, spec)` pairs, and one alias may appear more than
@@ -431,25 +467,30 @@ pub fn plan(
     };
     for s in sources {
         let component = s.component().to_string();
-        let alias = target.get(&component)?;
+        // The component's ALLOWED SET, not its one alias: a component whose producer
+        // allocated two encodings across its tensors is one component, and the candidate
+        // closure has to be able to say so or that carrier is unreachable by construction.
+        let allowed = target.allowed(&component)?;
         let encoded: Vec<(&str, &EncodingSpec)> = specs
             .iter()
-            .filter(|(a, _)| a == alias && a != "plain/1")
+            .filter(|(a, _)| a != "plain/1" && allowed.contains(&a.as_str()))
             .map(|(a, sp)| (a.as_str(), sp))
             .collect();
-        if encoded.is_empty() && alias != "plain/1" {
-            return refuse(
-                Code::UNKNOWN_ENCODING,
-                format!("{component}: target encoding {alias:?} is not a platform alias"),
-            );
+        for a in &allowed {
+            if *a != "plain/1" && !encoded.iter().any(|(e, _)| e == a) {
+                return refuse(
+                    Code::UNKNOWN_ENCODING,
+                    format!("{component}: target encoding {a:?} is not a platform alias"),
+                );
+            }
         }
         let cands = Candidates { encoded, plain };
         match s {
             Source::Carrier { file, header, .. } => {
-                plan_carrier(conv, &component, *file, header, alias, &cands, &mut p)?
+                plan_carrier(conv, &component, *file, header, &allowed, &cands, &mut p)?
             }
             Source::Canonical { header, .. } => {
-                plan_canonical(&component, header, alias, &cands, rekey, &mut p)?
+                plan_canonical(&component, header, &allowed, &cands, rekey, &mut p)?
             }
         }
     }
@@ -673,6 +714,11 @@ struct Chosen<'a> {
     data_role: &'static str,
     /// The dtype the tensor STANDS FOR, resolved from the chosen spec's data-role carrier.
     logical: Dtype,
+    /// The shape the tensor STANDS FOR, recovered by running the data role's own relation
+    /// backwards. Equal to the stored shape for every `Relation::Same` data role; for a
+    /// PACKED one (`nvfp4-w4a4/1`'s `[out, in/2]`) it is the `[out, in]` the packing came
+    /// from, which is the only shape the companion relations mean anything against.
+    logical_shape: Vec<u64>,
     present: Vec<(String, &'a super::carrier::SourceTensor)>,
 }
 
@@ -709,14 +755,6 @@ fn fit<'a>(
         got.sort();
         return Ok(Err(Reject::RoleSet { got, want: b }));
     }
-    if let Some(r) = spec.logical_rank {
-        if r as usize != t.shape.len() {
-            return Ok(Err(Reject::Rank {
-                want: r,
-                got: t.shape.len(),
-            }));
-        }
-    }
     // The data role's own carrier type. Keyed on the SPEC, never on the dtype spelling: fp8
     // storage with scales and fp8 storage without declare the same element type.
     let data_role = match spec.role(map.data) {
@@ -731,6 +769,48 @@ fn fit<'a>(
             )
         }
     };
+    // THE LOGICAL SHAPE, recovered before anything is evaluated. Every relation in a spec is
+    // written against the tensor's LOGICAL shape — the store's own validator evaluates them
+    // that way (`header.rs`) — and for a `Relation::Same` data role the stored shape IS the
+    // logical one, which is why every encoding registered before nvfp4 was right by accident.
+    // `nvfp4-w4a4/1` packs two fp4 elements per byte, so its data role stores `[out, in/2]`;
+    // evaluating `weight_scale`'s `in/16` against THAT asks for `in/32` scales, refuses every
+    // spec-correct carrier and admits one with half the scales it needs. The data role knows
+    // what it packed, so it is asked.
+    let stored_rank = match &data_role.shape {
+        crate::relation::Relation::Same => t.shape.len(),
+        crate::relation::Relation::Dims(d) => d.len(),
+    };
+    if stored_rank != t.shape.len() {
+        return Ok(Err(Reject::Rank {
+            want: stored_rank as u64,
+            got: t.shape.len(),
+        }));
+    }
+    let logical_shape = match data_role.shape.invert(&t.shape)? {
+        Some(s) => s,
+        None => {
+            return refuse(
+                Code::UNKNOWN_RELATION,
+                format!(
+                    "{alias}: the data role {:?} declares relation {:?}, which cannot be run \
+                     backwards — so the tensor's LOGICAL shape is not recoverable from what it \
+                     stores, and every companion relation in the spec is written against that \
+                     logical shape. A data role that packs must pack invertibly (`axis`/`div` \
+                     over the logical axes); this is a registry defect, not a carrier one.",
+                    map.data, data_role.shape
+                ),
+            )
+        }
+    };
+    if let Some(r) = spec.logical_rank {
+        if r as usize != logical_shape.len() {
+            return Ok(Err(Reject::Rank {
+                want: r,
+                got: logical_shape.len(),
+            }));
+        }
+    }
     // A spec that stores its OWN carrier type keeps the logical dtype out of the file, so it
     // is read off this artifact's unencoded float weights — or refused. Never assumed.
     let logical = match &data_role.carrier {
@@ -761,13 +841,13 @@ fn fit<'a>(
     // Companion geometry against the spec's own relation, checked here rather than after
     // 5 GB have moved. Two scale geometries under one alias are two DIGESTS: a reader that
     // assumes the other mis-strides every row and yields plausible, wrong numbers.
-    let elements = crate::dtype::checked_elements(&t.key, &t.shape)?;
+    let elements = crate::dtype::checked_elements(&t.key, &logical_shape)?;
     for (name, st) in &present {
         let role = match spec.role(name) {
             Some(r) => r,
             None => unreachable!("the role set was just compared"),
         };
-        let want_shape = role.shape.eval(&t.shape, elements)?;
+        let want_shape = role.shape.eval(&logical_shape, elements)?;
         if want_shape != st.shape {
             return Ok(Err(Reject::Shape {
                 role: name.clone(),
@@ -787,19 +867,22 @@ fn fit<'a>(
         spec,
         data_role: map.data,
         logical,
+        logical_shape,
         present,
     }))
 }
 
+#[allow(clippy::too_many_arguments)]
 fn plan_carrier(
     conv: &Converter,
     component: &str,
     file: usize,
     h: &SourceHeader,
-    alias: &str,
+    allowed: &[&str],
     cands: &Candidates<'_>,
     p: &mut Plan,
 ) -> Result<()> {
+    let alias = Allowed(allowed);
     p.header_bytes += h.header_bytes;
     let plain_map = role_map("plain/1")?;
     let cand_suffixes = cands.suffixes()?;
@@ -920,6 +1003,7 @@ fn plan_carrier(
                 spec: cands.plain,
                 data_role: plain_map.data,
                 logical: t.dtype,
+                logical_shape: t.shape.clone(),
                 present: Vec::new(),
             }
         } else {
@@ -1019,7 +1103,7 @@ fn plan_carrier(
             encoding: chosen.alias.to_string(),
             encoding_id: chosen.spec.object_id(),
             logical_dtype,
-            logical_shape: t.shape.clone(),
+            logical_shape: chosen.logical_shape.clone(),
             roles,
             effect,
         });
@@ -1027,7 +1111,7 @@ fn plan_carrier(
 
     // The component's target named an encoding and NOTHING in the component carries it.
     // Producing it is arithmetic; the verdict's remedy derives from the TARGET's contract.
-    if alias != "plain/1" && encoded_tensors == 0 {
+    if !alias.is_plain_only() && encoded_tensors == 0 {
         return refuse(
             Code::REMEDY_FROM_TARGET,
             format!(
@@ -1174,11 +1258,12 @@ impl Rekey {
 fn plan_canonical(
     component: &str,
     h: &Header,
-    alias: &str,
+    allowed: &[&str],
     cands: &Candidates<'_>,
     rekey: &Rekey,
     p: &mut Plan,
 ) -> Result<()> {
+    let alias = Allowed(allowed);
     // The candidate set, by DIGEST — an already-canonical component is mixed exactly as its
     // carrier was, so a re-ingest matches each tensor against every candidate, not one.
     let mut ids: Vec<(String, &str)> = vec![(cands.plain.object_id(), "plain/1")];

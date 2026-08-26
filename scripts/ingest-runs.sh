@@ -56,7 +56,7 @@ green() {
 rm -rf "$WORK"; mkdir -p "$WORK/carriers"
 for v in good pickle pickle-proto0 zip gguf gzip header-cap truncated geometry overlap gap \
          dtype-unknown float-dim no-tensors bnb deep \
-         mixed-fp8 mixed-fp8-spoof rowwise-keepdim \
+         mixed-fp8 mixed-fp8-spoof rowwise-keepdim nvfp4 nvfp4-halfscale two-encodings \
          native-qkv native-qkv-nonorm native-qkv-odd native-qkv-encoded native-qkv-vae \
          marker-malformed; do
   python3 "$ROOT/scripts/make-carrier.py" "$v" "$WORK/carriers/$v.safetensors"
@@ -76,6 +76,18 @@ done
 "$TFS" ingest bank safetensors.diffusers toy rowwise-keepdim diffusers.identity/1 \
   --source kd="$WORK/carriers/rowwise-keepdim.safetensors" --registry "$REG" \
   --source-name synthetic-rowwise-keepdim >/dev/null
+# The PACKED-data-role carrier and its half-scaled twin (identical key sets, so they are
+# banked under two components — classification is (key set, component)), and the carrier
+# that puts two encodings in ONE component.
+"$TFS" ingest bank safetensors.diffusers toy nvfp4 diffusers.identity/1 \
+  --source nv="$WORK/carriers/nvfp4.safetensors" --registry "$REG" \
+  --source-name synthetic-nvfp4 >/dev/null
+"$TFS" ingest bank safetensors.diffusers toy nvfp4-halfscale diffusers.identity/1 \
+  --source nvhalf="$WORK/carriers/nvfp4-halfscale.safetensors" --registry "$REG" \
+  --source-name synthetic-nvfp4-halfscale >/dev/null
+"$TFS" ingest bank safetensors.diffusers toy two-encodings diffusers.identity/1 \
+  --source mix2="$WORK/carriers/two-encodings.safetensors" --registry "$REG" \
+  --source-name synthetic-two-encodings >/dev/null
 
 if [ "$MODE" = all ] || [ "$MODE" = red ]; then
 
@@ -359,6 +371,69 @@ if "$TFS" ingest inspect --source mix="$WORK/carriers/mixed-fp8.safetensors" | g
 else
   MISS=$((MISS+1)); printf '  MISS %-42s the default read tensor bytes\n' "inspect stays header-only"
 fi
+
+banner "RED 6e — a PACKED data role: relations are evaluated against the LOGICAL shape"
+# `nvfp4-w4a4/1` is the first registered encoding whose DATA role is not `Relation::Same` —
+# its weight stores [out, in/2], two e2m1 elements per byte. Every relation in a spec is
+# written against the tensor's LOGICAL shape (the store's own validator, `header.rs`,
+# evaluates them that way), so the planner must run the data role's relation BACKWARDS
+# before asking what the scales' shape should be. It evaluated them against the PACKED
+# shape, and the polarity was the worst one available: it demanded [out, in/32], refused
+# every spec-correct carrier — ours and all five wild nvfp4 publishers' — and admitted one
+# carrying half the scales it needs.
+green "the spec-correct nvfp4 carrier plans: [4,16] u8 weight, [4,2] e4m3 scales off in=32" \
+    "$TFS" ingest plan nv=nvfp4-w4a4/1 --source nv="$WORK/carriers/nvfp4.safetensors" --registry "$REG"
+"$TFS" ingest plan nv=nvfp4-w4a4/1 --source nv="$WORK/carriers/nvfp4.safetensors" --registry "$REG" \
+  | grep -E "^encodings|^ +[0-9]+ +" | sed 's/^/  /'
+red MISSING_COMPANION_ROLE "HALF the scales — the [out, in/32] the planner used to demand" \
+    "$TFS" ingest plan nvhalf=nvfp4-w4a4/1 --source nvhalf="$WORK/carriers/nvfp4-halfscale.safetensors" --registry "$REG"
+# The planner and the STORE now agree, which is the whole claim: `header.rs` re-evaluates
+# every role relation against the tensor's logical shape at the door, so a run that lands is
+# proof the recovered [4, 32] is the shape the spec means — and a packed shape written as
+# the logical one would refuse SHAPE_MISMATCH there instead of anywhere quieter.
+NVSTORE="$WORK/nvstore"
+"$TFS" ingest run "$NVSTORE" nv=nvfp4-w4a4/1 --registry "$REG" --session nv \
+  --source nv="$WORK/carriers/nvfp4.safetensors" 2>&1 \
+  | grep -E "^encodings|^ +[0-9]+ +|^topology|parts |tensors " | sed 's/^/  /'
+green "install the packed-data-role candidate" "$TFS" ingest install "$NVSTORE" nv
+NVSNAP=$("$TFS" ingest roots "$NVSTORE" | grep installed | head -1 | awk '{print $2}' | cut -d: -f2)
+green "delivered bytes hash to the digests the header declares" \
+    "$TFS" read prove "$NVSTORE" "$NVSNAP"
+
+banner "RED 6f — one component, several encodings: the candidate SET"
+# The STORE has always admitted heterogeneous per-tensor encodings — `encoding` is a
+# per-TENSOR header field, and a two-COMPONENT snapshot citing three spec digests was
+# already green. The planner filtered the encoded candidates to `a == alias` for the ONE
+# alias `Target::get` found, so a component whose producer allocated two encodings across
+# its own tensors was unreachable by construction, in both directions.
+red SHAPE_MISMATCH "a two-encoding component under a target naming ONE of them" \
+    "$TFS" ingest plan mix2=mxfp8/1 --source mix2="$WORK/carriers/two-encodings.safetensors" --registry "$REG"
+green "the same carrier under the component's SET of two" \
+    "$TFS" ingest plan mix2=mxfp8/1,mix2=fp8-rowwise/1 --source mix2="$WORK/carriers/two-encodings.safetensors" --registry "$REG"
+"$TFS" ingest plan mix2=mxfp8/1,mix2=fp8-rowwise/1 --source mix2="$WORK/carriers/two-encodings.safetensors" \
+  --registry "$REG" | grep -E "^encodings|^ +[0-9]+ +" | sed 's/^/  /'
+# Through the REAL transaction, because the store is where a two-alias component stops being
+# a planner opinion: the recipe records the component's SET, and a set spelled as a repeated
+# scalar key is a canonical document the reader refuses on the way back in.
+M2STORE="$WORK/mix2store"
+"$TFS" ingest run "$M2STORE" mix2=mxfp8/1,mix2=fp8-rowwise/1 --registry "$REG" --session m2 \
+  --source mix2="$WORK/carriers/two-encodings.safetensors" 2>&1 \
+  | grep -E "^encodings|^ +[0-9]+ +|^topology|tensors " | sed 's/^/  /'
+green "install the two-encoding component" "$TFS" ingest install "$M2STORE" m2
+M2SNAP=$("$TFS" ingest roots "$M2STORE" | grep installed | head -1 | awk '{print $2}' | cut -d: -f2)
+green "delivered bytes hash to the digests the header declares" \
+    "$TFS" read prove "$M2STORE" "$M2SNAP"
+# The set widens the vocabulary, never the judgement: a tensor whose roles match NO alias in
+# the set still refuses typed, with every candidate tried named in the verdict.
+red DOUBLE_ENCODE "a .weight_scale_2 role no alias in the set declares" \
+    "$TFS" ingest plan nv=mxfp8/1,nv=fp8-rowwise/1 --source nv="$WORK/carriers/nvfp4.safetensors" --registry "$REG"
+# And the set is scoped to the COMPONENT, not the snapshot: `fp8-rowwise/1` declared for
+# `nv` does not reach `mix2`'s tensors. A snapshot-wide set is exactly the one-rule-over-
+# the-tree that `Target` exists to refuse.
+red SHAPE_MISMATCH "an alias declared for ANOTHER component does not widen this one" \
+    "$TFS" ingest plan mix2=mxfp8/1,nv=fp8-rowwise/1 \
+    --source mix2="$WORK/carriers/two-encodings.safetensors" --source nv="$WORK/carriers/nvfp4.safetensors" \
+    --registry "$REG"
 
 banner "RED 7 — the fourth fence: foreign parsing lives only at the border"
 cp "$ROOT/crates/tensorfs-core/src/checkpoint.rs" "$WORK/checkpoint.rs.bak"

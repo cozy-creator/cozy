@@ -15,6 +15,7 @@ VARIANTS = [
     "header-cap", "truncated", "geometry", "overlap", "gap",
     "dtype-unknown", "duplicate-key", "float-dim", "no-tensors", "bnb", "deep",
     "mixed-fp8", "mixed-fp8-spoof", "rowwise-keepdim",
+    "nvfp4", "nvfp4-halfscale", "two-encodings",
     "native-qkv", "native-qkv-nonorm", "native-qkv-odd", "native-qkv-encoded",
     "native-qkv-vae",
     "marker-malformed",
@@ -50,6 +51,43 @@ def mixed_fp8(spoof):
         # encoding whose siblings are absent. Selection reads siblings, not markers.
         t["norm.comfy_quant"] = ("U8", [len(MARKER)], len(MARKER))
     return dict(sorted(t.items()))
+
+
+def nvfp4(half):
+    """A PACKED data role, which no encoding before `nvfp4-w4a4/1` had.
+
+    Logical [4, 32] bf16: the weight stores [4, 16] u8 (two e2m1 elements per byte) and the
+    scales are [4, 2] e4m3 — one per 16-element block of the LOGICAL row. The planner has to
+    recover [4, 32] from the packed [4, 16] before it evaluates `in/16`, or it asks for
+    `in/32` and gets the polarity exactly backwards: the spec-correct carrier refused and the
+    `half` one below — half the scales the encoding needs — admitted.
+
+    The bf16 norm is not decoration: nvfp4 stores u8 carrier bytes, so the logical dtype is
+    not in the file and is read off this artifact's own unencoded float weights.
+    """
+    return dict(sorted({
+        "attn.k_norm.weight": ("BF16", [32], 64),
+        "attn.out_proj.weight": ("U8", [4, 16], 64),
+        "attn.out_proj.weight_scale": ("F8_E4M3", [4, 1] if half else [4, 2], 4 if half else 8),
+        "attn.out_proj.weight_scale_2": ("F32", [], 4),
+    }.items()))
+
+
+def two_encodings():
+    """ONE component, TWO encodings — the shape a mixed-allocation producer ships.
+
+    `attn.out_proj` carries mxfp8's [out, ceil(in/32)] u8 block scales and `mlp.fc1` carries
+    fp8-rowwise's rank-1 [out] f32 row scales, in one file under one component. The STORE has
+    always admitted this (encoding is a per-tensor field); the planner filtered its candidate
+    set to one alias per component, so this carrier was unreachable through it.
+    """
+    return dict(sorted({
+        "attn.out_proj.weight": ("F8_E4M3", [4, 64], 256),
+        "attn.out_proj.weight_scale": ("U8", [4, 2], 8),
+        "mlp.fc1.weight": ("F8_E4M3", [4, 64], 256),
+        "mlp.fc1.weight_scale": ("F32", [4], 16),
+        "norm.weight": ("BF16", [64], 128),
+    }.items()))
 
 
 def native_qkv(kind):
@@ -180,6 +218,12 @@ def main(variant, path):
     elif variant.startswith("native-qkv"):
         kind = variant[len("native-qkv"):].lstrip("-")
         h2, blob2 = body(native_qkv(kind))
+        write(path, h2, blob2)
+    elif variant in ("nvfp4", "nvfp4-halfscale"):
+        h2, blob2 = body(nvfp4(variant.endswith("halfscale")))
+        write(path, h2, blob2)
+    elif variant == "two-encodings":
+        h2, blob2 = body(two_encodings())
         write(path, h2, blob2)
     elif variant == "rowwise-keepdim":
         h2, blob2 = body(dict(sorted({

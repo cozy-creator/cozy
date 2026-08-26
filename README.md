@@ -96,7 +96,9 @@ tfs ingest install <store> <session>        # the coordinator promotes ONE root
 tfs ingest roots|reap <store> [--now]       # candidates are not checkpoints
 tfs ingest reingest <store> <header> <target> [--rekey c=from:to]   # inherit by reference
 tfs ingest converters | golden              # reviewed converters + their geometry, live
-scripts/ingest-runs.sh all                  # the border plus 56 planted arms
+# a component may be named more than once — `c=mxfp8/1,c=fp8-rowwise/1` is its ALLOWED SET,
+# and the carrier's own per-tensor roles pick which tensor is which
+scripts/ingest-runs.sh all                  # the border plus 66 planted arms
 ```
 
 A `--source` names its component; a FILENAME never authorizes anything. Classification is
