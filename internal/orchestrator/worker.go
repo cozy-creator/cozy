@@ -506,6 +506,10 @@ func (c *Orchestrator) spawnWorker(spec WorkerLaunchSpec) (string, *exit.Error) 
 	args = append(args,
 		"--socket", listen,
 		"--out", filepath.Join(root, "run"),
+		// THIS machine's copy of the release tree (#563f). It is `cmd.Dir` below, so the
+		// worker's own default would already be right — stating it is what makes the
+		// launcher, and not a binding-plan record written beside it, the resolver.
+		"--project", spec.Dir,
 		"--instance-id", instanceID,
 		"--release-id", spec.Placement.ReleaseID,
 		"--devices", strings.Join(spec.Devices, ","),
