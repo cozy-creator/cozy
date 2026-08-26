@@ -91,6 +91,9 @@ type podHub struct {
 	// be dialled and a pod that cannot be handed a byte. It is the arm for the refusal
 	// this client owes instead of falling back to granting paths on its own disk.
 	noMedia bool
+	// noInstance provisions a pod whose worker declares NO instance identity — the shape
+	// this stand-in had by accident until a real pod showed it was a shape at all.
+	noInstance bool
 	// release is what the provisioned worker DECLARES on ClaimAck. A real hub installs the
 	// release the renter asked for and the pod says which; this stand-in is told, so the
 	// owner's release pin has both a matching pod to accept and a lying one to refuse
@@ -111,6 +114,10 @@ type podHubSpec struct {
 	Release string
 	Fail    bool // every pod ends `failed`: the rental that never comes up
 	NoMedia bool // a worker with no co-resident media server: a pod that cannot be fed
+	// NoInstance: a worker that will not say WHICH worker it is. A real pod always
+	// does — it was started with an instance identity — so this is a peer defect, and
+	// an owner that admitted it could not attribute a terminal to anything.
+	NoInstance bool
 }
 
 func startPodHub(dir, arm string, fail bool) *podHub {
@@ -124,7 +131,7 @@ func newPodHub(spec podHubSpec) *podHub {
 		token: randomHex(16), // an opaque admin credential; its shape is the hub's
 		dir:   dir, pods: filepath.Join(dir, "pod-fs"), arm: arm,
 		rentals: map[string]*podRental{}, deleted: map[string]bool{}, fail: spec.Fail,
-		noMedia: spec.NoMedia, releaseID: spec.Release,
+		noMedia: spec.NoMedia, noInstance: spec.NoInstance, releaseID: spec.Release,
 	}
 	must("creating the pod-side filesystem", os.MkdirAll(h.pods, 0o755))
 	ln, err := net.Listen("tcp", "127.0.0.1:0") //cozy:allow the DRIVER hosts a stand-in hub; the product binds through internal/api
@@ -325,6 +332,12 @@ func (h *podHub) provision(rec *podRental) {
 		"--tls-cert", certPath, "--tls-key", keyPath,
 		"--tokens", tokenFile,
 		"--cozy-home", podRoot}
+	if !h.noInstance {
+		// WHAT THIS POD'S WORKER IS, declared on ClaimAck. A real hub starts the pod's
+		// worker with an instance identity of its own minting — the owner never named
+		// it and could not have — so the stand-in mints one the same way.
+		args = append(args, "--instance-id", "ins-"+rec.ID)
+	}
 	if h.releaseID != "" {
 		// WHAT THIS POD SERVES, declared on ClaimAck. A hub that installed the release
 		// knows it; a pod that will not say is refused by the owner's pin.

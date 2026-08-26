@@ -332,12 +332,10 @@ func (c *Orchestrator) onClaimAck(w *worker, s *session, ack *pb.ClaimAck) {
 	c.logf("ClaimAck boot=%s generation=%d instance=%s minor=%d schema=rev%d backend=%q device=%q",
 		ack.WorkerBootId, ack.ControlStreamGeneration, ack.WorkerInstanceId, ack.WireMinor,
 		pb.WireSchemaRev, ack.Resources.GetBackend(), ack.Resources.GetDeviceName())
-	if ack.WorkerInstanceId != "" && ack.WorkerInstanceId != w.instanceID {
-		// The thing at this address is not the worker this slot spawned. Nothing is
-		// dispatched to it; the stream ends on the next recv when we stop talking.
-		c.refuseClaim(w, exit.Named(exit.Conflict, "worker_instance_mismatch",
-			"the worker at this address answers as instance %q and this slot is %q",
-			ack.WorkerInstanceId, w.instanceID))
+	if e := instancePin(w, ack.WorkerInstanceId); e != nil {
+		// Nothing is dispatched to it; the stream ends on the next recv when we stop
+		// talking.
+		c.refuseClaim(w, e)
 		return
 	}
 	if e := releasePin(w, ack.WorkerReleaseId); e != nil {
@@ -350,12 +348,61 @@ func (c *Orchestrator) onClaimAck(w *worker, s *session, ack *pb.ClaimAck) {
 		return
 	}
 	c.mu.Lock()
+	if w.spec.Connection != nil {
+		w.remoteInstance = ack.WorkerInstanceId
+	}
 	if w.bootID != "" && w.bootID != ack.WorkerBootId {
 		delete(c.sessions, w.bootID)
 	}
 	c.sessions[ack.WorkerBootId] = s
 	w.bootID = ack.WorkerBootId
 	c.mu.Unlock()
+}
+
+// instancePin is the IDENTITY FENCE on a claim, and #505's carried-not-verified gap in its
+// second place.
+//
+// The check used to be one comparison against `w.instanceID` — the name of the SLOT — and
+// that is the right question for exactly one lane. A worker this host SPAWNED was handed
+// `--instance-id`, so a different name at that address is a stranger and refuses.
+//
+// A rented pod is not that. This host never spawned it, never named it, and could not
+// have: the hub provisioned the worker before any owner attached, so the pod names its own
+// instance exactly as it mints its own boot id. Demanding it answer to the slot's name was
+// this host asking a machine it does not own to have been called something else — and it
+// only ever passed because the stand-in pod declared NO instance at all, which took the
+// empty-string branch. Carried and verified were the same branch again.
+//
+// So the rule splits the same way the release pin's does. SPAWNED: a declared identity that
+// is not ours is a stranger. ATTACHED: silence cannot be attributed — a terminal from an
+// unnamed instance belongs to nobody — and what this host holds a pod to is STABILITY: the
+// identity recorded at the first claim is the identity every later claim must carry, so a
+// DIFFERENT worker arriving at the same address is caught, which is the thing the old check
+// was actually protecting.
+func instancePin(w *worker, declared string) *exit.Error {
+	if w.spec.Connection == nil {
+		if declared != "" && declared != w.instanceID {
+			return exit.Named(exit.Conflict, "worker_instance_mismatch",
+				"the worker at this address answers as instance %q and this slot is %q",
+				declared, w.instanceID)
+		}
+		return nil
+	}
+	if declared == "" {
+		return exit.Named(exit.Conflict, "worker_instance_undeclared",
+			"this pod's ClaimAck declares no worker instance, so nothing it settles could be "+
+				"attributed to a worker at all").
+			WithRemedy("a rented pod's worker is started with an instance identity; one that " +
+				"will not say which worker it is cannot be dispatched to")
+	}
+	if w.remoteInstance != "" && w.remoteInstance != declared {
+		return exit.Named(exit.Conflict, "worker_instance_changed",
+			"this pod answered as instance %q and now answers as %q: a DIFFERENT worker is at "+
+				"the address this rental pinned", w.remoteInstance, declared).
+			WithRemedy("release the rental; a pod whose worker identity moved under this host " +
+				"is not the machine its attempts were dispatched to")
+	}
+	return nil
 }
 
 // releasePin is the RELEASE FENCE on a claim, and #505's carried-not-verified gap closed.

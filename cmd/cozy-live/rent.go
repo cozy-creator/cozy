@@ -314,6 +314,24 @@ func sectionRent() {
 		code != 0 && strings.Contains(serviceLog(root), "release_undeclared"),
 		lineWith(serviceLog(root), "release_undeclared"))
 
+	head("#563e: the INSTANCE identity of a pod is the POD's, and it must be declared")
+	// A rented pod names its own worker: this host never spawned it and could not have
+	// chosen the name. What it is held to is saying WHICH worker it is — silence there
+	// is a terminal that belongs to nobody — and to not changing the answer later.
+	nameless := newPodHub(podHubSpec{Dir: filepath.Join(root, "hub-noinstance"), Arm: "remote",
+		Release: release, NoInstance: true})
+	defer nameless.close()
+	rentalI, _ := rentOne(root, nameless, "cl-019 instance-undeclared arm")
+	code, out = cozyRun(root, "run", endpointRef+"/v1/denoise", "steps=2",
+		"--timeout", "20s", "--worker", rentalI)
+	check("a pod that will not say WHICH worker it is is refused — carried is not verified",
+		code != 0 && strings.Contains(serviceLog(root), "worker_instance_undeclared"),
+		lineWith(serviceLog(root), "worker_instance_undeclared"))
+	check("and the pod's own instance name is ACCEPTED when it gives one: the slot does not "+
+		"demand a machine it never spawned answer to the slot's name",
+		strings.Contains(podWorkerLog(hub, rentalA), "instance=ins-"+rentalA),
+		lineWith(podWorkerLog(hub, rentalA), "ClaimAck sent"))
+
 	head("EXACT ROUTING: a second attached target advertising the SAME plan")
 	rentalB, _ := rentOne(root, hub, "cl-015 target B")
 	code, out = cozyRun(root, "run", endpointRef+"/v1/denoise", "steps=2",
@@ -463,7 +481,7 @@ func sectionRent() {
 	// Several stand-in hubs are live at once, so the pass asks each one whether it still
 	// holds the pod. A rental nobody owns would be a pod nothing can destroy, which is the
 	// exact failure this pass exists to make impossible.
-	hubs := []*podHub{hub, liar, starved, lying, silent, broken}
+	hubs := []*podHub{hub, liar, starved, lying, silent, nameless, broken}
 	for _, id := range heldRentals(root) {
 		on := hub
 		for _, candidate := range hubs {

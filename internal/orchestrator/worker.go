@@ -256,6 +256,13 @@ type worker struct {
 	// nothing to transport.
 	media *media.Client
 
+	// remoteInstance is the instance identity an ATTACHED pod's worker declared for
+	// itself. A pod is a machine this host never spawned, so it names its own worker the
+	// way it mints its own boot id; what this host may hold it to is that the name does
+	// not CHANGE under it. Empty for a locally spawned worker, whose identity is this
+	// launcher's by construction.
+	remoteInstance string
+
 	// what the worker itself reported; the orchestrator echoes, never invents
 	exited bool
 	// refusal is a claim-time verdict this owner reached about the thing at the other end —
