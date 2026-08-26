@@ -164,11 +164,7 @@ impl PublishGrant {
     /// The base64 sha256 the signature must bind. Derived from the object's own digest, so
     /// a grant cannot advertise a checksum that disagrees with the key it writes to.
     pub fn checksum_sha256(&self) -> String {
-        let mut raw = [0u8; 32];
-        for (i, b) in raw.iter_mut().enumerate() {
-            *b = u8::from_str_radix(&self.object.sha256[i * 2..i * 2 + 2], 16).unwrap_or(0);
-        }
-        b64::encode(&raw)
+        required_checksum(&self.object.sha256)
     }
 
     /// Every header the coordinator MUST sign into the presigned URL. Not a suggestion and
@@ -236,6 +232,34 @@ pub struct VerifiedObject {
     pub verified_at: u64,
 }
 
+/// The base64 sha256 an object's own digest REQUIRES. One arithmetic, two callers: the
+/// grant that signs it and the fact that is only a fact if the backend reported it.
+fn required_checksum(sha256_hex: &str) -> String {
+    let mut raw = [0u8; 32];
+    for (i, b) in raw.iter_mut().enumerate() {
+        *b = u8::from_str_radix(&sha256_hex[i * 2..i * 2 + 2], 16).unwrap_or(0);
+    }
+    b64::encode(&raw)
+}
+
+/// The one adjudication, wherever a `VerifiedObject` comes into existence: the checksum the
+/// backend reported against the checksum the object's own id requires.
+fn adjudicate_checksum(where_: &str, object: &ObjectRef, reported: &str) -> Result<()> {
+    let want = required_checksum(&object.sha256);
+    if reported != want {
+        return refuse(
+            Code::OBJECT_CORRUPT,
+            format!(
+                "{}: {where_} reports checksum {reported}, the digest requires {want} — \
+                 QUARANTINE and repair. There is no branch here that accepts a final-key \
+                 mismatch and continues.",
+                object.id()
+            ),
+        );
+    }
+    Ok(())
+}
+
 impl VerifiedObject {
     /// The fact is minted from what the backend REPORTED, checked against what we asked
     /// for. A mismatch is a quarantine/repair event, never overwrite-and-continue.
@@ -246,23 +270,7 @@ impl VerifiedObject {
         checksum_sha256: &str,
         verified_at: u64,
     ) -> Result<Self> {
-        let want = PublishGrant {
-            session: "check".to_string(),
-            object: object.clone(),
-            expires_at: u64::MAX,
-        }
-        .checksum_sha256();
-        if checksum_sha256 != want {
-            return refuse(
-                Code::OBJECT_CORRUPT,
-                format!(
-                    "{}: the backend reports checksum {checksum_sha256}, the digest requires \
-                     {want} — QUARANTINE and repair. There is no branch here that accepts a \
-                     final-key mismatch and continues.",
-                    object.id()
-                ),
-            );
-        }
+        adjudicate_checksum("the backend", object, checksum_sha256)?;
         Ok(VerifiedObject {
             object: object.clone(),
             backend_version: backend_version.to_string(),
@@ -304,6 +312,13 @@ impl Doc for VerifiedObject {
                 );
             }
         }
+        // DESERIALIZATION DOES NOT MINT VERIFICATION (#553b). v1 read `checksum_sha256`
+        // straight off the document, so a hand-written JSON file dropped into a facts
+        // directory became a fact — and `CatalogRoot::publish` authorizes a root over
+        // exactly those. The adjudication `of()` performs at mint time is arithmetic over
+        // the object's own id, so it costs nothing to perform it again here, and a fact
+        // that cannot survive it was never one.
+        adjudicate_checksum("this document", &object, &checksum_sha256)?;
         Ok(VerifiedObject {
             object,
             backend_version,

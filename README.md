@@ -260,7 +260,13 @@ tfs cloud conflict <grant> <resident-checksum>  honest duplicate, or quarantine
 tfs cloud publish <closure> <facts-dir>         the atomic root, over facts only
 scripts/r2-qualify.py --env <f>                 the gate
 scripts/r2-qualify.py --env <f> --publish <store> <snap>   the race matrix, live
+scripts/cloud-runs.sh green|red|all             the document plane, locally
 ```
+
+A `VerifiedObject` is minted from what the backend REPORTED, adjudicated against the
+checksum the object's own digest requires — and DESERIALIZATION DOES NOT MINT VERIFICATION:
+the same adjudication runs on load, so a hand-forged fact dropped into a facts directory
+refuses instead of authorizing a root (`cloud-runs.sh red`).
 
 Core links no HTTP, no cloud SDK and no credentials — the coordinator executes the
 requests. What TensorFS owns is the SHAPE, and the shape is where the invariant is held:

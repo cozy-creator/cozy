@@ -233,6 +233,53 @@ pub struct Put {
     pub admitted: bool,
 }
 
+/// Bytes proven to be `sha256` THROUGH THE DESCRIPTOR THIS HOLDS.
+///
+/// The point of the type is the fd, not the fields: a `VerifiedFile` cannot be built from a
+/// pathname and a promise, so there is no way to spell "verified over there, read over
+/// here". Reads start at offset 0 and the descriptor keeps the inode alive for the handle's
+/// whole life, so a replacement at the path — same length or not — cannot reach them.
+#[derive(Debug)]
+pub struct VerifiedFile {
+    file: File,
+    sha256: String,
+    len: u64,
+}
+
+impl VerifiedFile {
+    /// The id these bytes were proven to have.
+    pub fn sha256(&self) -> &str {
+        &self.sha256
+    }
+
+    /// The length observed on the verified descriptor (`fstat`, never a second `stat`).
+    pub fn len(&self) -> u64 {
+        self.len
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    /// The pinned descriptor. Whatever a caller does with it, it is still the file that was
+    /// verified — that is the whole guarantee, and it travels with the handle.
+    pub fn into_file(self) -> File {
+        self.file
+    }
+}
+
+impl Read for VerifiedFile {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        self.file.read(buf)
+    }
+}
+
+impl Seek for VerifiedFile {
+    fn seek(&mut self, pos: SeekFrom) -> std::io::Result<u64> {
+        self.file.seek(pos)
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Verdict {
     Verified { rehashed: bool },
@@ -537,20 +584,41 @@ impl Store {
 
     /// A verified handle: trusted from a valid record, otherwise rehashed. Bytes that
     /// disagree with their id are quarantined, never returned.
-    pub fn open_verified(&self, hex: &str) -> Result<File> {
-        match self.verify(hex)? {
-            Verdict::Quarantined { to, why } => refuse(
+    ///
+    /// THE FILE THAT WAS VERIFIED IS THE FILE THAT IS READ. v1 verified a PATHNAME and then
+    /// re-opened that pathname to read it — two resolutions of one name, with a window
+    /// between them in which a same-length replacement passes every check the record binds
+    /// (size, and an mtime the attacker controls). The handle is opened ONCE here; the
+    /// fstat, the rehash and every subsequent read go through that one descriptor, which on
+    /// Linux pins the inode. A rename over the path after this point does not reach these
+    /// bytes at all — the swap is not caught, it is INEFFECTIVE.
+    pub fn open_verified(&self, hex: &str) -> Result<VerifiedFile> {
+        let (verdict, file) = self.verify_pinned(hex, false)?;
+        match (verdict, file) {
+            (Verdict::Quarantined { to, why }, _) => refuse(
                 Code::OBJECT_CORRUPT,
                 format!("sha256:{hex} quarantined to {}: {why}", to.display()),
             ),
-            _ => self.open_nofollow(hex),
+            (_, Some(mut f)) => {
+                let len = f.metadata().map_err(|e| io("stat object", e))?.len();
+                f.seek(SeekFrom::Start(0)).map_err(|e| io("rewind", e))?;
+                Ok(VerifiedFile {
+                    file: f,
+                    sha256: hex.to_string(),
+                    len,
+                })
+            }
+            (v, None) => refuse(
+                Code::OBJECT_CORRUPT,
+                format!("sha256:{hex}: {v:?} left no verified descriptor"),
+            ),
         }
     }
 
     /// Bounded range read over verified bytes. Out-of-bounds refuses instead of clamping.
     pub fn read_range(&self, hex: &str, off: u64, len: u64) -> Result<Vec<u8>> {
-        let mut f = self.open_verified(hex)?;
-        let size = f.metadata().map_err(|e| io("stat object", e))?.len();
+        let mut vf = self.open_verified(hex)?;
+        let size = vf.len;
         let end = off.checked_add(len).ok_or(Refusal {
             code: Code::RANGE_BOUNDS,
             detail: format!("offset {off} + length {len} overflows"),
@@ -561,19 +629,24 @@ impl Store {
                 format!("range [{off}, {end}) leaves object of {size} bytes"),
             );
         }
-        f.seek(SeekFrom::Start(off)).map_err(|e| io("seek", e))?;
+        vf.file
+            .seek(SeekFrom::Start(off))
+            .map_err(|e| io("seek", e))?;
         let mut out = vec![0u8; len as usize];
-        f.read_exact(&mut out).map_err(|e| io("read range", e))?;
+        vf.file
+            .read_exact(&mut out)
+            .map_err(|e| io("read range", e))?;
         Ok(out)
     }
 
-    /// Stream a verified object out. The read path does not hash; `verify` decided already.
+    /// Stream a verified object out. The read path does not hash; the pinned verification
+    /// decided already, and it decided about THIS descriptor.
     pub fn read_into<W: Write>(&self, hex: &str, w: &mut W) -> Result<u64> {
-        let mut f = self.open_verified(hex)?;
+        let mut vf = self.open_verified(hex)?;
         let mut buf = vec![0u8; BUF];
         let mut n = 0u64;
         loop {
-            let k = f.read(&mut buf).map_err(|e| io("read object", e))?;
+            let k = vf.file.read(&mut buf).map_err(|e| io("read object", e))?;
             if k == 0 {
                 return Ok(n);
             }
@@ -594,52 +667,58 @@ impl Store {
     /// full-rehash door, and it reaches the forced path through `rehash` below rather than
     /// through a flag anyone can pass on a read.
     pub fn verify(&self, hex: &str) -> Result<Verdict> {
-        self.verify_inner(hex, false)
+        Ok(self.verify_pinned(hex, false)?.0)
     }
 
     /// The scrub's door: rehash this object whatever its record says. Not reachable from
     /// the read path, the CLI, or the wheel — only from `scrub`.
     fn rehash(&self, hex: &str) -> Result<Verdict> {
-        self.verify_inner(hex, true)
+        Ok(self.verify_pinned(hex, true)?.0)
     }
 
-    fn verify_inner(&self, hex: &str, force: bool) -> Result<Verdict> {
-        let md = stat(&self.object_path(hex))?;
+    /// Verify through ONE descriptor and hand it back with the verdict.
+    ///
+    /// Every fact this consults comes from the open fd — `fstat` for the record binding,
+    /// the fd itself for the rehash — so the pathname is resolved exactly once. The
+    /// returned `File` is the object those facts are about; `None` only on quarantine,
+    /// where there is nothing to hand out.
+    fn verify_pinned(&self, hex: &str, force: bool) -> Result<(Verdict, Option<File>)> {
+        let mut f = self.open_nofollow(hex)?;
+        let md = f.metadata().map_err(|e| io("fstat object", e))?;
         let disagreement = match self.record(hex) {
             None => Some("no verification record".to_string()),
             Some(rec) => rec.disagreement(hex, &md, self.marker.generation),
         };
         if disagreement.is_none() && !force {
-            return Ok(Verdict::Verified { rehashed: false });
+            return Ok((Verdict::Verified { rehashed: false }, Some(f)));
         }
-        let got = self.hash_object(hex)?;
+        let got = hash_fd(&mut f)?;
         if got != hex {
             let why = disagreement.unwrap_or_else(|| "scrub rehash".to_string());
+            // Take the NAME: whatever is at the path now must stop satisfying reads. The
+            // descriptor is dropped with `f` — corrupt bytes are never handed back.
             let to = self.quarantine(hex)?;
-            return Ok(Verdict::Quarantined {
-                to,
-                why: format!("{why}; rehash gave sha256:{got}"),
-            });
+            return Ok((
+                Verdict::Quarantined {
+                    to,
+                    why: format!("{why}; rehash gave sha256:{got}"),
+                },
+                None,
+            ));
         }
-        let md = stat(&self.object_path(hex))?;
+        let md = f.metadata().map_err(|e| io("fstat object", e))?;
         self.write_record(&VRecord::of(hex, &md, self.marker.generation))?;
-        Ok(match disagreement {
-            None => Verdict::Verified { rehashed: true },
-            Some(why) => Verdict::Invalidated { why },
-        })
+        Ok((
+            match disagreement {
+                None => Verdict::Verified { rehashed: true },
+                Some(why) => Verdict::Invalidated { why },
+            },
+            Some(f),
+        ))
     }
 
     pub fn hash_object(&self, hex: &str) -> Result<String> {
-        let mut f = self.open_nofollow(hex)?;
-        let mut h = Sha256::new();
-        let mut buf = vec![0u8; BUF];
-        loop {
-            let n = f.read(&mut buf).map_err(|e| io("read object", e))?;
-            if n == 0 {
-                return Ok(sha256::hex(&h.finish()));
-            }
-            h.update(&buf[..n]);
-        }
+        hash_fd(&mut self.open_nofollow(hex)?)
     }
 
     /// Take the NAME first: rename out of `objects/` so exactly one remover wins and the
@@ -743,6 +822,21 @@ fn cleanup<T>(tmp: &Path, e: Refusal) -> Result<T> {
     let _ = fs::set_permissions(tmp, fs::Permissions::from_mode(0o600));
     let _ = fs::remove_file(tmp);
     Err(e)
+}
+
+/// Hash an OPEN object from the top. Takes the descriptor, never the name — the caller has
+/// already resolved the path and everything after it is about this inode.
+fn hash_fd(f: &mut File) -> Result<String> {
+    f.seek(SeekFrom::Start(0)).map_err(|e| io("rewind", e))?;
+    let mut h = Sha256::new();
+    let mut buf = vec![0u8; BUF];
+    loop {
+        let n = f.read(&mut buf).map_err(|e| io("read object", e))?;
+        if n == 0 {
+            return Ok(sha256::hex(&h.finish()));
+        }
+        h.update(&buf[..n]);
+    }
 }
 
 fn stat(p: &Path) -> Result<fs::Metadata> {

@@ -195,6 +195,52 @@ red_section() {
   echo "quarantine now: $(ls "$S/quarantine" | tr '\n' ' ')"
   echo "--- the same store at a partial rate (one knob) ---"
   "$TFS" scrub "$S" --rate 0.25 --pass 7
+
+  # ------------------------------------------------------------------ #553b
+  # The verify-then-reopen-by-pathname window. v1 resolved the name twice — `stat` for the
+  # record, `open` for the read — so a same-length replacement landing between them was
+  # read as verified bytes. The read path now opens ONCE and verifies through that
+  # descriptor. Both halves of the old window are armed here.
+
+  hr "RED 7 — replace the pathname MID-READ: the descriptor pins the inode"
+  fresh "$S"; obj="$S/objects/sha256/${want:0:2}/${want:2:2}/$want"
+  "$TFS" put "$S" "$SRC" >/dev/null
+  head -c "$len" /dev/urandom > "$WORK/forged"
+  echo "forged twin: $(stat -c%s "$WORK/forged") bytes — exactly the length the record binds"
+  rm -f "$WORK/pipe"; mkfifo "$WORK/pipe"
+  # `--out` is the door that emits BYTES (bare `get` counts them). Pointed at a fifo, the
+  # sink's own open blocks until this shell takes the read end below.
+  "$TFS" get "$S" "$want" --out "$WORK/pipe" >"$WORK/get.log" 2>"$WORK/get.err" &
+  local gpid=$!
+  # Hold the read end open WITHOUT draining it. The writer's own open() then completes, it
+  # verifies, it starts writing, and the 64 KB pipe buffer parks it mid-read — a window
+  # that stays open until this shell decides to drain, so nothing here races a clock.
+  exec 9< "$WORK/pipe"
+  # Wait on OBSERVED progress, never a guessed interval: the object is open when it is open.
+  local opened=no
+  for _ in $(seq 4000); do
+    if ls -l /proc/$gpid/fd 2>/dev/null | grep -q "$want"; then opened=yes; break; fi
+    kill -0 $gpid 2>/dev/null || break
+    sleep 0.005
+  done
+  echo "reader holds the object open: $opened (parked on an undrained pipe, mid-read)"
+  chmod 0644 "$obj" 2>/dev/null
+  cp "$WORK/forged" "$WORK/forged.stage"; mv "$WORK/forged.stage" "$obj"; chmod 0444 "$obj"
+  echo "the PATH now holds the forgery: $(cmp -s "$WORK/forged" "$obj" && echo yes || echo NO)"
+  cat <&9 > "$WORK/got"; exec 9<&-; wait $gpid
+  echo "bytes read == the VERIFIED object:  $(cmp -s "$SRC" "$WORK/got" && echo yes || echo NO)"
+  echo "bytes read == the forged twin:      $(cmp -s "$WORK/forged" "$WORK/got" && echo yes || echo NO)"
+  echo "(the fd pins the inode: the swap is not caught, it is INERT)"
+
+  hr "RED 7b — the same replacement landing BEFORE the open: refused and quarantined"
+  fresh "$S"; obj="$S/objects/sha256/${want:0:2}/${want:2:2}/$want"
+  "$TFS" put "$S" "$SRC" >/dev/null
+  "$TFS" verify "$S" "$want"
+  chmod 0644 "$obj"; cp "$WORK/forged" "$WORK/forged.stage"; mv "$WORK/forged.stage" "$obj"
+  chmod 0444 "$obj"
+  echo "same length, different bytes, new inode — the record's only unbound field is content"
+  "$TFS" get "$S" "$want" > /dev/null; echo "get exit=$?"
+  echo "quarantine: $(ls "$S/quarantine")"
 }
 
 case "$SECTION" in
