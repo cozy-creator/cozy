@@ -1,6 +1,9 @@
 package app
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
 	"fmt"
 	"strings"
 	"time"
@@ -86,16 +89,88 @@ func handleRent(ctx *Context) *exit.Error {
 	}
 	defer st.Close()
 
-	// THE MINT, BEFORE THE ASK. The pod's credential exists on this host before any hub
-	// knows a rental is coming, and what travels is its hash. A failed rental leaves a
-	// token nobody can use, which is the correct direction to fail in.
-	token := secret.Mint()
-
 	c := client(ctx)
+	if !c.Token().Present() {
+		return exit.Named(exit.Credential, "hub.token_missing",
+			"POST /v1/private-rentals is a first-party route and no admin token is configured").
+			WithRemedy("set TENSORHUB_TOKEN to the hub's admin.token; catalog reads need no credential").
+			WithNext("cozy hub status")
+	}
+	operationKey := strings.TrimSpace(ctx.Inv.Value("--idempotency-key"))
+	if len(operationKey) > 200 {
+		return exit.Usagef("--idempotency-key is %d bytes; the hub admits at most 200", len(operationKey))
+	}
+	if operationKey == "" {
+		pending, e := st.PendingRentalOperation(c.Base(), endpoint, card, region)
+		if e != nil {
+			return e
+		}
+		if pending != nil {
+			operationKey = pending.Key
+		} else {
+			operationKey = mintKey()
+		}
+	}
+
+	// THE DURABLE MINT, BEFORE THE ASK. O_EXCL makes concurrent same-key callers read one
+	// token, and the operation row makes a lost HTTP response resumable. Only the token's
+	// hash crosses the wire.
+	existing, e := st.RentalOperation(operationKey)
+	if e != nil {
+		return e
+	}
+	if existing != nil && (existing.State == "failed" || existing.State == "released") {
+		return exit.Named(exit.Conflict, "rental.operation_settled",
+			"rental operation %s is already %s", operationKey, existing.State).
+			WithRemedy("use a fresh --idempotency-key for a new paid rental")
+	}
+	var token secret.Value
+	if existing != nil && existing.State == "attached" && existing.RentalID != "" {
+		token, e = rental.Token(l, existing.RentalID)
+	} else {
+		token, e = rental.PendingToken(l, operationKey)
+	}
+	if e != nil {
+		return e
+	}
+	tokenHash := secret.HashHex(token)
+	digest, err := rentDigest(endpoint, card, region, tokenHash)
+	if err != nil {
+		return exit.Internalf("cannot digest the rental request: %s", err)
+	}
+	op, replay, e := st.BeginRentalOperation(records.RentalOperation{
+		Key: operationKey, RequestDigest: digest, Endpoint: endpoint, Card: card,
+		Region: region, Hub: c.Base(), Reason: reason,
+	})
+	if e != nil {
+		return e
+	}
+	if op.RequestDigest != digest {
+		return exit.Named(exit.Conflict, "rental.idempotency_conflict",
+			"rental operation %s already names a different request body", operationKey).
+			WithRemedy("reuse a key only for the exact same endpoint, card, region, and renter token")
+	}
+	// The first recorded reason is the paid operation's audit reason. A retry may be typed
+	// with different prose, but it must not rewrite why the original purchase was made.
+	reason = op.Reason
+
 	hctx, cancel := hub.Context()
-	r, e := c.Rent(hctx, endpoint, card, region, secret.HashHex(token), reason)
+	r, e := c.Rent(hctx, endpoint, card, region, tokenHash, reason, operationKey)
 	cancel()
 	if e != nil {
+		// A typed 4xx answer proves this POST bought nothing. Transport, deadline,
+		// unreadable-success, and 5xx failures remain pending because the hub may have
+		// committed before the answer was lost.
+		if e.Code == exit.Credential || e.Code == exit.Validation ||
+			e.Code == exit.NotFound || e.Code == exit.Conflict {
+			if advanced := st.AdvanceRentalOperation(operationKey, "", "failed"); advanced != nil {
+				return advanced
+			}
+			rental.ForgetPending(l, operationKey)
+		}
+		return e
+	}
+	if e := st.AdvanceRentalOperation(operationKey, r.ID, r.State); e != nil {
 		return e
 	}
 	row := records.Rental{
@@ -105,7 +180,15 @@ func handleRent(ctx *Context) *exit.Error {
 	if e := st.RecordRental(row); e != nil {
 		return e
 	}
-	ready, e := waitProvisioned(ctx, c, r.ID, deadline)
+	observe := func(seen hub.Rental) *exit.Error {
+		row.PodID, row.Address, row.State = seen.PodID, seen.Address, seen.State
+		row.MediaAddress = seen.MediaAddress
+		if e := st.RecordRental(row); e != nil {
+			return e
+		}
+		return st.AdvanceRentalOperation(operationKey, seen.ID, seen.State)
+	}
+	ready, e := waitProvisioned(ctx, c, r.ID, deadline, observe)
 	if e != nil {
 		return e
 	}
@@ -123,6 +206,17 @@ func handleRent(ctx *Context) *exit.Error {
 	if e := rental.Attach(l, st, row, ready.CertPEM, token); e != nil {
 		return e
 	}
+	if e := st.AdvanceRentalOperation(operationKey, ready.ID, "attached"); e != nil {
+		return e
+	}
+	rental.ForgetPending(l, operationKey)
+	notes := []string{
+		"this host MINTED the owner token and holds it at mode 0600; the hub and the pod hold only its sha256, so neither can dial this pod as you",
+		"rental operation " + operationKey,
+	}
+	if replay {
+		notes[1] += " resumed"
+	}
 	return emit(ctx, render.Record{Kind: "rental", Fields: []render.Field{
 		{K: "rental", V: ready.ID},
 		{K: "state", V: ready.State},
@@ -136,22 +230,39 @@ func handleRent(ctx *Context) *exit.Error {
 		// comparable against the pod's own without either end printing the value.
 		{K: "owner_token", V: token.Digest()},
 		{K: "pinned_cert", V: l.RentalCert(ready.ID)},
-	}, Notes: []string{
-		"this host MINTED the owner token and holds it at mode 0600; the hub and the pod hold only its sha256, so neither can dial this pod as you"},
+	}, Notes: notes,
 		Next: []string{"cozy run <org/endpoint/vN/function> --worker " + ready.ID}})
+}
+
+func rentDigest(endpoint, card, region, tokenHash string) (string, error) {
+	body := struct {
+		Endpoint    string   `json:"endpoint"`
+		Card        string   `json:"card"`
+		Region      string   `json:"region,omitempty"`
+		TokenHashes []string `json:"renter_token_sha256"`
+	}{endpoint, card, region, []string{tokenHash}}
+	raw, err := json.Marshal(body)
+	if err != nil {
+		return "", err
+	}
+	sum := sha256.Sum256(raw)
+	return "sha256:" + hex.EncodeToString(sum[:]), nil
 }
 
 // waitProvisioned polls one rental to a settled state. Every wait here is bounded by something
 // OBSERVED: the hub's own verdict, the hub failing to answer at all (each call carries
 // hub.Timeout), or the caller's --timeout. A rental that is still provisioning is none of
 // those, however long the provider takes.
-func waitProvisioned(ctx *Context, c *hub.Client, id string, deadline time.Time) (hub.Rental, *exit.Error) {
+func waitProvisioned(ctx *Context, c *hub.Client, id string, deadline time.Time, observe func(hub.Rental) *exit.Error) (hub.Rental, *exit.Error) {
 	said := ""
 	for {
 		hctx, cancel := hub.Context()
 		r, e := c.Rental(hctx, id)
 		cancel()
 		if e != nil {
+			return hub.Rental{}, e
+		}
+		if e := observe(r); e != nil {
 			return hub.Rental{}, e
 		}
 		switch {

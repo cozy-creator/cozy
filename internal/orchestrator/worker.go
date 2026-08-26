@@ -15,6 +15,7 @@ import (
 
 	"github.com/cozy-creator/cozy-creator-v2/internal/canonical"
 	"github.com/cozy-creator/cozy-creator-v2/internal/exit"
+	"github.com/cozy-creator/cozy-creator-v2/internal/inputasset"
 	"github.com/cozy-creator/cozy-creator-v2/internal/media"
 	"github.com/cozy-creator/cozy-creator-v2/internal/plan"
 	"github.com/cozy-creator/cozy-creator-v2/internal/records"
@@ -306,10 +307,12 @@ type worker struct {
 	// WORKER property; dispatchability is a PLACEMENT property.
 	admission    pb.AdmissionState
 	admissionGen uint64 // echoed on every offer; a stale echo refuses deterministically
-	// slots is the owner's working copy of available_attempt_slots — the worker's free
-	// seats, corrected by every report and RESERVED at dispatch so one drain pass cannot
-	// hand two attempts to a one-seat worker on one reading.
-	slots int
+	// reportedSlots is the worker's last available_attempt_slots. reservedSlots is the
+	// owner's reservation from choosing a worker until its offer is accepted or refused.
+	// Keeping them separate prevents a Report racing preparation or send from reopening it.
+	reportedSlots int
+	reservedSlots int
+	slots         int // reportedSlots - reservedSlots, clamped at zero
 	// unacked is how many outcomes this owner HOLDS without having acked. The worker
 	// counts them against its own available_attempt_slots (#480d), so an owner that stops
 	// acking starves its own admission — boundedness is structural, and this is the number
@@ -324,11 +327,11 @@ type worker struct {
 	acceptedRevision  uint64
 	convergedRevision uint64
 	acceptedSetDigest []byte
-	// jobsAvail is the worker's own last `jobs_available`. It is RESERVED at dispatch
-	// and corrected by the next Report: without the reservation one drain pass would
-	// hand two queued jobs to the same one-attempt worker on one stale reading, and
-	// relying on the worker to refuse the second is not a design.
-	jobsAvail int
+	// The job lane uses the same reported-versus-pre-offer split as serving. jobsAvail is
+	// the effective number dispatch reads.
+	reportedJobs int
+	reservedJobs int
+	jobsAvail    int
 	// revision is the desired-state revision THIS owner last issued, with the placement
 	// set it issued. The set travels as bytes, so the owner keeps the bytes it authored:
 	// a worker's accepted digest is compared against these, never re-canonicalized.
@@ -367,6 +370,16 @@ func (w *worker) dispatchableFor(planID string) bool {
 // (#486c), which is why they are two fields here and not one.
 func (w *worker) admissible() bool {
 	return w.admission == pb.AdmissionState_ADMISSION_STATE_OPEN && w.slots > 0
+}
+
+func (w *worker) observeSlots(n int) {
+	w.reportedSlots = n
+	w.slots = max(0, n-w.reservedSlots)
+}
+
+func (w *worker) observeJobs(n int) {
+	w.reportedJobs = n
+	w.jobsAvail = max(0, n-w.reservedJobs)
 }
 
 // EnsureWorker makes one worker exist hosting one placement, and SAYS WHICH OF THE THREE
@@ -1086,6 +1099,12 @@ func (c *Orchestrator) ShutdownWorker(instanceID string, grace time.Duration) {
 // orphan and is killed (it holds a device grant and a socket this service no longer
 // knows); a mismatch is a REUSED PID and is never signalled — only its row is closed.
 func (c *Orchestrator) Reconcile() (killed, forgotten int, e *exit.Error) {
+	unlock := inputasset.Guard()
+	e = inputasset.Sweep(c.opt.Layout, c.opt.Store)
+	unlock()
+	if e != nil {
+		return 0, 0, e
+	}
 	rows, e := c.opt.Store.LiveWorkers()
 	if e != nil {
 		return 0, 0, e
@@ -1138,6 +1157,14 @@ func (c *Orchestrator) Reconcile() (killed, forgotten int, e *exit.Error) {
 		c.logf("%s holds an attempt with no terminal; making its slot resident so the "+
 			"supervisor journal replays", req.ID)
 		c.selectOrStart(req)
+	}
+	ready, e := c.opt.Store.ReadyRequeues()
+	if e != nil {
+		return killed, forgotten, e
+	}
+	for _, req := range ready {
+		c.logf("%s committed and acknowledged a retry before restart; resuming its requeue", req.ID)
+		c.Requeue(req.ID, "restart-after-terminal-ack")
 	}
 	return killed, forgotten, nil
 }

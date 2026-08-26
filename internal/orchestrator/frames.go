@@ -11,6 +11,7 @@ import (
 
 	"github.com/cozy-creator/cozy-creator-v2/internal/canonical"
 	"github.com/cozy-creator/cozy-creator-v2/internal/exit"
+	"github.com/cozy-creator/cozy-creator-v2/internal/inputasset"
 	"github.com/cozy-creator/cozy-creator-v2/internal/media"
 	"github.com/cozy-creator/cozy-creator-v2/internal/records"
 	pb "github.com/cozy-creator/cozy-creator-v2/protocol/cozy/worker/v1"
@@ -159,7 +160,7 @@ func (c *Orchestrator) onObserved(s *session, r *pb.ObservedWorkerState) {
 		// are a property of the machine, and `available_attempt_slots` already counts both
 		// running attempts and outcomes this owner has not acked (#480d).
 		w.admission, w.admissionGen = r.AdmissionState, r.AdmissionGeneration
-		w.slots = int(r.AvailableAttemptSlots)
+		w.observeSlots(int(r.AvailableAttemptSlots))
 		w.acceptedRevision = r.AcceptedDesiredStateRevision
 		w.convergedRevision = r.ConvergedRevision
 		w.acceptedSetDigest = r.AcceptedPlacementSetDigest
@@ -169,7 +170,7 @@ func (c *Orchestrator) onObserved(s *session, r *pb.ObservedWorkerState) {
 			// hosts no placement at all, so it has no serving axis. `jobs_available` IS
 			// the job credit, and this lane's dispatchability is that number.
 			avail := r.GetJobCapacity().GetJobsAvailable()
-			w.jobsAvail = int(avail)
+			w.observeJobs(int(avail))
 			for _, p := range w.spec.Placement.Jobs {
 				dispatchable[p.DescriptorID] = avail > 0
 			}
@@ -230,6 +231,9 @@ func (c *Orchestrator) onObserved(s *session, r *pb.ObservedWorkerState) {
 	}
 	c.mu.Unlock()
 	_ = c.opt.Store.ReportWorker(s.bootID, phase, accepted, int64(r.ConvergedRevision), generation)
+	if w != nil && w.media != nil {
+		go c.retryMediaCleanup(w)
+	}
 	for _, f := range r.Faults {
 		c.logf("worker fault %s on %s: %s (%s)", pb.FaultKind_name[int32(f.Kind)],
 			f.Subject, f.Reason, f.Detail)
@@ -310,6 +314,7 @@ func (c *Orchestrator) onAccepted(s *session, a *pb.AttemptAccepted) {
 		c.logf("AttemptAccepted for %s#%d REFUSED: %s", a.RequestId, ordinal, e.Message)
 		return
 	}
+	c.settleDispatch(a.RequestId, ordinal, true)
 	c.logf("AttemptAccepted %s#%d placement=%s generation=%d plan=%s construction=%s [%s]",
 		a.RequestId, ordinal, a.PlacementId, a.ExecutorGeneration,
 		shortDigest(planDigest), shortDigest(construction), summary)
@@ -394,10 +399,25 @@ func (c *Orchestrator) onOutcome(s *session, t *pb.AttemptOutcome) {
 	cause := causeCode(doc.Sub("cause").Int("code"))
 	origin := causeOrigin(doc.Sub("cause").Int("origin"))
 	executionStarted, _ := doc["execution_started"].(bool)
+	c.settleDispatch(t.RequestId, ordinal, status != "REFUSED" || executionStarted)
 	req, e := c.opt.Store.RequestRow(t.RequestId)
 	if e != nil || req == nil {
 		refuse("no request row to settle")
 		return
+	}
+	// An exact replay of a terminal already in the authority needs only another ack. In
+	// particular it must not fetch pod outputs again: after the first mirror and ack this
+	// owner is allowed to delete the remote attempt subtree, while the durable local output
+	// rows and bytes remain the accepted answer.
+	knownReplay := false
+	if prior, e := c.opt.Store.AttemptRow(t.RequestId, int64(ordinal)); e == nil && prior != nil &&
+		(prior.State == "terminal" || prior.State == "closed") {
+		if prior.TerminalDigest != shortNone(t.OutcomeDigest) {
+			refuse("the attempt already closed with terminal %s, not %s",
+				shortDigest(prior.TerminalDigest), shortDigest(shortNone(t.OutcomeDigest)))
+			return
+		}
+		knownReplay = true
 	}
 	// THE MIRROR RUNS BEFORE ANYTHING IS ACCEPTED OR ACKED. An output that is not here,
 	// or is not what the manifest says it is, means this outcome cannot be honoured: the
@@ -406,15 +426,21 @@ func (c *Orchestrator) onOutcome(s *session, t *pb.AttemptOutcome) {
 	c.mu.Lock()
 	holder := c.workers[s.instanceID]
 	c.mu.Unlock()
-	outputs, e := c.mirrorOutputs(*req, ordinal, doc, holder)
-	if e != nil {
-		refuse("%s", e.Message)
-		return
+	var outputs []records.Output
+	if !knownReplay {
+		outputs, e = c.mirrorOutputs(*req, ordinal, doc, holder)
+		if e != nil {
+			refuse("%s", e.Message)
+			return
+		}
 	}
 	// cl-006 OWNS TRIAGE PERSISTENCE (cr-011's seam): the bundle lives in the worker's
 	// own root, and a worker root does not outlive its worker. Copy it out and verify it
 	// against the outcome document's OWN TriageBundleRef before the transaction runs.
-	triage := c.captureTriage(s, t.RequestId, ordinal, doc.Sub("triage_bundle"))
+	triage := Triage{}
+	if !knownReplay {
+		triage = c.captureTriage(s, t.RequestId, ordinal, doc.Sub("triage_bundle"))
+	}
 	// WHETHER THIS ATTEMPT ENDS THE REQUEST is decided BEFORE the event is written, not
 	// after. An ABANDONED attempt that the requeue projection will re-dispatch has ended
 	// an ATTEMPT, not a REQUEST — and the contract's terminal-stop rule means a client
@@ -437,7 +463,7 @@ func (c *Orchestrator) onOutcome(s *session, t *pb.AttemptOutcome) {
 	// goes on to succeed. Observed live: attempt 1 of a killed job committed an empty
 	// `local/_job-…` publication seconds before attempt 2 published the real one.
 	var publication *records.Publication
-	if req.IsJob() && !requeuing {
+	if req.IsJob() && !requeuing && !knownReplay {
 		if e := c.promote(*req, ordinal, outputs); e != nil {
 			refuse("%s", e.Message)
 			return
@@ -490,24 +516,95 @@ func (c *Orchestrator) onOutcome(s *session, t *pb.AttemptOutcome) {
 	}
 	ack.RecordOwnerEpoch, ack.ControlStreamGeneration, ack.WorkerBootId =
 		recordOwnerEpoch, s.generation, s.bootID
-	s.send(&pb.RecordOwnerFrame{Msg: &pb.RecordOwnerFrame_OutcomeAck{OutcomeAck: ack}})
-	_ = c.opt.Store.Closed(t.RequestId, int64(ordinal))
-	verdict := outcomeError(status, cause, doc.Str("safe_message"))
-	c.waitFor(key(t.RequestId, ordinal)).markClosed(verdict)
-	if !applied {
-		return // a replay settles nothing twice and requeues nothing twice
-	}
-
-	// The requeue PROJECTION over (status, cause, origin, execution_started). Retryability
-	// is never a wire observation: this is the only place the neutral facts become a
-	// decision.
-	if requeuing {
-		c.Requeue(t.RequestId, status+"/"+cause)
+	if !s.send(&pb.RecordOwnerFrame{Msg: &pb.RecordOwnerFrame_OutcomeAck{OutcomeAck: ack}}) {
+		c.logf("OutcomeAck %s#%d was not queued: the closed stream owes a replay", t.RequestId, ordinal)
 		return
 	}
-	c.frames.forget(t.RequestId)
-	_ = c.opt.Store.SettleRequest(t.RequestId, strings.ToLower(status))
-	c.waitRequest(t.RequestId).markClosed(verdict)
+	if e := c.opt.Store.Closed(t.RequestId, int64(ordinal)); e != nil {
+		c.logf("OutcomeAck %s#%d was queued but closure is still owed: %s",
+			t.RequestId, ordinal, e.Message)
+		return
+	}
+	req.State = requeueState(status, requeuing)
+	c.afterAck(*req, records.Attempt{RequestID: t.RequestId, Attempt: int64(ordinal),
+		TerminalStatus: status, TerminalCause: cause, SafeMessage: doc.Str("safe_message")}, holder)
+}
+
+// afterAck is the one post-terminal continuation, shared by the live frame and snapshot
+// recovery. It is intentionally idempotent: cleanup and BeginRequeue both have durable
+// guards, so a replay cannot spend twice or delete a still-owned asset.
+func (c *Orchestrator) afterAck(req records.Request, attempt records.Attempt, holder *worker) {
+	requeue := req.State == "requeue_pending"
+	c.cleanupAttempt(req, uint64(attempt.Attempt), holder, !requeue)
+	verdict := outcomeError(attempt.TerminalStatus, attempt.TerminalCause, attempt.SafeMessage)
+	c.waitFor(key(req.ID, uint64(attempt.Attempt))).markClosed(verdict)
+	if requeue {
+		c.Requeue(req.ID, attempt.TerminalStatus+"/"+attempt.TerminalCause)
+		return
+	}
+	c.frames.forget(req.ID)
+	c.waitRequest(req.ID).markClosed(verdict)
+}
+
+// cleanupAttempt runs only after the outcome's bytes were mirrored, its terminal commit
+// succeeded, and OutcomeAck was sent. Per-attempt inputs are always disposable here;
+// request assets are dropped only after the final attempt and only when no other live
+// request owns the same content digest. Locally mirrored outputs remain addressable.
+func (c *Orchestrator) cleanupAttempt(req records.Request, attempt uint64, holder *worker, final bool) {
+	if holder != nil && holder.media != nil {
+		c.cleanupRemote(req.ID, attempt, holder)
+	} else if !req.IsJob() {
+		if err := os.RemoveAll(filepath.Join(c.opt.Layout.AttemptDir(req.ID, attempt), "in")); err != nil {
+			c.logf("%s#%d local attempt input cleanup failed: %s", req.ID, attempt, err)
+		}
+	}
+	if !final {
+		return
+	}
+	c.cleanupRequestAssets(req)
+}
+
+func (c *Orchestrator) cleanupRequestAssets(req records.Request) {
+	unlock := inputasset.Guard()
+	defer unlock()
+	if e := inputasset.DropUnowned(c.opt.Layout, c.opt.Store, req.Assets); e != nil {
+		c.logf("request %s input asset cleanup deferred: %s", req.ID, e.Message)
+	}
+}
+
+func (c *Orchestrator) cleanupRemote(requestID string, attempt uint64, holder *worker) {
+	k := key(requestID, attempt)
+	c.mu.Lock()
+	if c.mediaCleaning[k] {
+		c.mu.Unlock()
+		return
+	}
+	c.mediaCleaning[k] = true
+	c.mu.Unlock()
+
+	e := holder.media.DropAttempt(media.Slot(requestID, attempt))
+	if e == nil {
+		e = c.opt.Store.MarkMediaCleaned(requestID, int64(attempt))
+	}
+	c.mu.Lock()
+	delete(c.mediaCleaning, k)
+	c.mu.Unlock()
+	if e != nil {
+		c.logf("%s#%d pod media cleanup deferred: %s", requestID, attempt, e.Message)
+	}
+}
+
+// Every remote Report retries the durable obligations still assigned to that worker.
+// DELETE is idempotent, and media_cleaned stops successful rows from being revisited.
+func (c *Orchestrator) retryMediaCleanup(holder *worker) {
+	owed, e := c.opt.Store.MediaCleanupOwed(holder.instanceID)
+	if e != nil {
+		c.logf("cannot read media cleanup obligations of %s: %s", holder.instanceID, e.Message)
+		return
+	}
+	for _, attempt := range owed {
+		c.cleanupRemote(attempt.RequestID, uint64(attempt.Attempt), holder)
+	}
 }
 
 // Triage is what cl-006 persisted for one attempt. An empty Subject means the outcome
@@ -530,7 +627,7 @@ type outcomeEvent struct {
 // queued for its next ordinal; anything else takes the attempt's own status.
 func requeueState(status string, requeuing bool) string {
 	if requeuing {
-		return "queued"
+		return "requeue_pending"
 	}
 	return strings.ToLower(status)
 }

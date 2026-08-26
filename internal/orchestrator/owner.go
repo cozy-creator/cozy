@@ -16,6 +16,7 @@ import (
 
 	"github.com/cozy-creator/cozy-creator-v2/internal/canonical"
 	"github.com/cozy-creator/cozy-creator-v2/internal/exit"
+	"github.com/cozy-creator/cozy-creator-v2/internal/records"
 	pb "github.com/cozy-creator/cozy-creator-v2/protocol/cozy/worker/v1"
 )
 
@@ -44,9 +45,14 @@ type session struct {
 	out        chan *pb.RecordOwnerFrame
 }
 
-func (s *session) send(m *pb.RecordOwnerFrame) {
-	defer func() { _ = recover() }() // a closed stream is not an error worth a panic
+func (s *session) send(m *pb.RecordOwnerFrame) (sent bool) {
+	defer func() {
+		if recover() != nil { // a closed stream is an ordinary unavailable answer
+			sent = false
+		}
+	}()
 	s.out <- m
+	return true
 }
 
 // schemaDigest is THE FENCE (#530-A1), as the 32 raw bytes the wire carries. It is derived
@@ -500,8 +506,10 @@ func (c *Orchestrator) onSnapshot(w *worker, s *session, snap *pb.WorkerSnapshot
 	}
 
 	held := doc.List("held_attempts")
+	heldSet := make(map[string]bool, len(held))
 	for _, ha := range held {
 		requestID, ordinal := ha.Str("request_id"), uint64(ha.Int("attempt_ordinal"))
+		heldSet[key(requestID, ordinal)] = true
 		if e := c.opt.Store.Recover(requestID, int64(ordinal), s.bootID); e != nil {
 			c.logf("held attempt %s#%d REFUSED: %s", requestID, ordinal, e.Message)
 			continue
@@ -512,6 +520,7 @@ func (c *Orchestrator) onSnapshot(w *worker, s *session, snap *pb.WorkerSnapshot
 			trimEnum(pb.AttemptState_name[int32(ha.Int("state"))], "ATTEMPT_STATE_"),
 			briefOf(blocked))
 	}
+	continuations := c.reconcileSnapshotAbsence(w, heldSet)
 	// The worker's own admission facts arrive with the snapshot, so the barrier's other
 	// side is readable before the first observed state: admission reports CLOSED until the
 	// ack lands, which is exactly what "dispatch stays closed" looks like on the wire.
@@ -520,7 +529,7 @@ func (c *Orchestrator) onSnapshot(w *worker, s *session, snap *pb.WorkerSnapshot
 	w.convergedRevision = uint64(doc.Int("converged_revision"))
 	w.admissionGen = uint64(doc.Int("admission_generation"))
 	w.admission = pb.AdmissionState(doc.Int("admission_state"))
-	w.slots = int(doc.Int("available_attempt_slots"))
+	w.observeSlots(int(doc.Int("available_attempt_slots")))
 	w.phase = pb.WorkerPhase(doc.Int("worker_phase"))
 	c.mu.Unlock()
 
@@ -528,6 +537,10 @@ func (c *Orchestrator) onSnapshot(w *worker, s *session, snap *pb.WorkerSnapshot
 	ackMsg.RecordOwnerEpoch, ackMsg.ControlStreamGeneration, ackMsg.WorkerBootId =
 		recordOwnerEpoch, s.generation, s.bootID
 	s.send(&pb.RecordOwnerFrame{Msg: &pb.RecordOwnerFrame_SnapshotAck{SnapshotAck: ackMsg}})
+	for _, continuation := range continuations {
+		c.afterAck(continuation.request, continuation.attempt, w)
+	}
+	c.retryMediaCleanup(w)
 	c.logf("snapshot %s (%s, %d B) acknowledged: %d held attempt(s), accepted revision %d, "+
 		"converged %d; dispatch is open", snap.SnapshotId,
 		shortDigest(shortNone(snap.SnapshotDigest)), len(snap.SnapshotCanonicalBytes),
@@ -539,6 +552,61 @@ func (c *Orchestrator) onSnapshot(w *worker, s *session, snap *pb.WorkerSnapshot
 	if e := c.converge(s, w, []DesiredPlacement{w.spec.Placement}); e != nil {
 		c.logf("the desired placement set for %s could not be issued: %s", w.instanceID, e.Message)
 	}
+}
+
+type snapshotContinuation struct {
+	request records.Request
+	attempt records.Attempt
+}
+
+// reconcileSnapshotAbsence closes the two facts a crash can leave ambiguous. A prepared
+// or offered assignment absent from the worker's durable snapshot never crossed the
+// worker boundary and is aborted. A committed terminal absent from that snapshot has
+// already been compacted, which the protocol permits only after its ack, so local closure
+// and post-ack cleanup may resume. Nothing accepted-but-nonterminal is inferred absent.
+func (c *Orchestrator) reconcileSnapshotAbsence(w *worker, held map[string]bool) []snapshotContinuation {
+	attempts, e := c.opt.Store.OpenAttemptsOf(w.instanceID)
+	if e != nil {
+		c.logf("cannot reconcile attempts of %s: %s", w.instanceID, e.Message)
+		return nil
+	}
+	var continuations []snapshotContinuation
+	for _, attempt := range attempts {
+		if held[key(attempt.RequestID, uint64(attempt.Attempt))] {
+			continue
+		}
+		switch attempt.State {
+		case "preparing", "offered":
+			c.settleDispatch(attempt.RequestID, uint64(attempt.Attempt), false)
+			if e := c.opt.Store.AbortDispatch(attempt.RequestID, attempt.Attempt,
+				attempt.SessionID, "absent from the worker's reconciled snapshot"); e != nil {
+				c.logf("snapshot could not abort absent %s#%d: %s",
+					attempt.RequestID, attempt.Attempt, e.Message)
+				continue
+			}
+			req, e := c.opt.Store.RequestRow(attempt.RequestID)
+			if e != nil || req == nil {
+				continue
+			}
+			if w.media == nil {
+				c.rollbackGrant(*req, uint64(attempt.Attempt), w)
+			}
+			c.enqueue(req.ID)
+			c.logf("%s#%d was absent from the worker snapshot; preparation aborted and request requeued",
+				attempt.RequestID, attempt.Attempt)
+		case "terminal":
+			if e := c.opt.Store.Closed(attempt.RequestID, attempt.Attempt); e != nil {
+				c.logf("snapshot could not close compacted terminal %s#%d: %s",
+					attempt.RequestID, attempt.Attempt, e.Message)
+				continue
+			}
+			req, e := c.opt.Store.RequestRow(attempt.RequestID)
+			if e == nil && req != nil {
+				continuations = append(continuations, snapshotContinuation{*req, attempt})
+			}
+		}
+	}
+	return continuations
 }
 
 // openWatch opens the LOSSY progress lane on its own connection, bound to the claimed

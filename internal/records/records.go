@@ -140,6 +140,12 @@ func Open(path string) (*Store, *exit.Error) {
 			return nil, exit.Internalf("cannot widen the records schema in %s: %s", path, err)
 		}
 	}
+	for _, stmt := range normalize {
+		if _, err := db.Exec(stmt); err != nil {
+			db.Close()
+			return nil, exit.Internalf("cannot normalize lifecycle state in %s: %s", path, err)
+		}
+	}
 	// A table whose IDENTITY changed. `CREATE TABLE IF NOT EXISTS` above left an older
 	// root's shape in place and no `ALTER TABLE` can move a primary key, so the rows move
 	// to a new table instead — in ONE transaction, so a kill mid-rebuild leaves the old

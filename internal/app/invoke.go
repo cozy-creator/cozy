@@ -363,7 +363,17 @@ func handleRun(ctx *Context) *exit.Error {
 	if e != nil {
 		return e
 	}
+	worker := strings.TrimSpace(ctx.Inv.Value("--worker"))
+	if legacy := launch.LegacyFileTerm(ctx.Inv.Args[1:]); worker != "" && legacy != "" {
+		return exit.Named(exit.Usage, "remote_file_input_ambiguous",
+			"%s embeds file bytes into a JSON string and cannot name a remote input grant", legacy).
+			WithRemedy("use `--asset <field-path>=<file>`; the field path becomes the exact worker-protocol input id")
+	}
 	input, e := launch.ParsePayload(ep, ctx.Inv.Args[1:], ctx.Inv.Value("--in"))
+	if e != nil {
+		return e
+	}
+	input, assets, e := launch.ParseAssets(ep, input, ctx.Inv.Values["--asset"])
 	if e != nil {
 		return e
 	}
@@ -379,7 +389,7 @@ func handleRun(ctx *Context) *exit.Error {
 	began := time.Now()
 	handle, e := c.Submit(api.Submission{
 		Endpoint: target.Endpoint, Function: target.Function, Input: input,
-		Worker: strings.TrimSpace(ctx.Inv.Value("--worker")),
+		Worker: worker, LocalAssets: assets,
 	}, key)
 	if e != nil {
 		return e

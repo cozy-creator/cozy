@@ -4,6 +4,7 @@ import (
 	"crypto/rand"
 	"database/sql"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"strings"
 	"time"
@@ -62,7 +63,8 @@ CREATE TABLE IF NOT EXISTS requests (
   kind         TEXT    NOT NULL DEFAULT 'serving',
   org          TEXT    NOT NULL DEFAULT '',
   trees        TEXT    NOT NULL DEFAULT '',
-  worker       TEXT    NOT NULL DEFAULT ''
+  worker       TEXT    NOT NULL DEFAULT '',
+  assets       TEXT    NOT NULL DEFAULT '[]'
 )`, `
 -- The PUBLICATION (cl-004). One row per job request, written INSIDE the terminal
 -- transaction: a publication that a terminal did not commit does not exist, which is
@@ -129,6 +131,7 @@ CREATE TABLE IF NOT EXISTS attempts (
   dispatched_at    TEXT    NOT NULL,
   accepted_at      TEXT    NOT NULL DEFAULT '',
   closed_at        TEXT    NOT NULL DEFAULT '',
+  media_cleaned    INTEGER NOT NULL DEFAULT 0,
   PRIMARY KEY (request_id, attempt)
 )`, `
 CREATE TABLE IF NOT EXISTS outputs (
@@ -189,7 +192,19 @@ var widen = []string{
 	`ALTER TABLE requests ADD COLUMN worker TEXT NOT NULL DEFAULT ''`,
 	`ALTER TABLE requests ADD COLUMN org TEXT NOT NULL DEFAULT ''`,
 	`ALTER TABLE requests ADD COLUMN trees TEXT NOT NULL DEFAULT ''`,
+	`ALTER TABLE requests ADD COLUMN assets TEXT NOT NULL DEFAULT '[]'`,
+	`ALTER TABLE attempts ADD COLUMN media_cleaned INTEGER NOT NULL DEFAULT 0`,
 	`ALTER TABLE rentals ADD COLUMN media_address TEXT NOT NULL DEFAULT ''`,
+}
+
+// normalize hard-cuts pre-launch lifecycle spellings whose durable meaning was refined.
+// Each statement is idempotent and runs after every open, so an interrupted upgrade is
+// simply retried.
+var normalize = []string{
+	`UPDATE attempts SET state='offered' WHERE state='dispatching'`,
+	`UPDATE requests SET state='requeue_pending' WHERE state='queued' AND EXISTS (
+	  SELECT 1 FROM attempts a WHERE a.request_id=requests.id
+	  AND a.attempt=requests.ordinal AND a.state='terminal')`,
 }
 
 func now() string { return time.Now().UTC().Format(time.RFC3339Nano) }
@@ -452,16 +467,38 @@ type Request struct {
 	// It lives on the request because a requeue must re-derive the same placement
 	// without a client saying so again. Empty = any local worker.
 	Worker string
+	// Assets are the request's durable input-asset bindings. LocalPath points into the
+	// authority-owned immutable input store, not at the caller's original file: a requeue
+	// after a client exit or service restart therefore grants the same verified bytes.
+	Assets []AssetBinding
+}
+
+// AssetBinding ties one payload asset field to the exact local bytes the request owns.
+// FieldPath is also the worker-protocol input_id (`first_frame`,
+// `references.0.image`); position is identity for mixed reference lists, never a file
+// name inferred later. LocalPath is resolution only and is excluded from submission
+// identity; Digest, Length and MediaType are the claims inside InvocationSpec.
+type AssetBinding struct {
+	FieldPath string `json:"field_path"`
+	LocalPath string `json:"local_path"`
+	Digest    string `json:"digest"`
+	Length    int64  `json:"length"`
+	MediaType string `json:"media_type,omitempty"`
+	Order     uint32 `json:"order"`
 }
 
 const requestCols = `id,idem_key,body_digest,endpoint,entrypoint,plan_id,payload,outputs,
-	state,ordinal,requeues,created_at,kind,org,trees,worker`
+	state,ordinal,requeues,created_at,kind,org,trees,worker,assets`
 
 func scanRequest(row interface{ Scan(...any) error }) (Request, error) {
 	var r Request
+	var assets string
 	err := row.Scan(&r.ID, &r.IdemKey, &r.BodyDigest, &r.Endpoint, &r.Entrypoint, &r.PlanID,
 		&r.Payload, &r.Outputs, &r.State, &r.Ordinal, &r.Requeues, &r.CreatedAt,
-		&r.Kind, &r.Org, &r.Trees, &r.Worker)
+		&r.Kind, &r.Org, &r.Trees, &r.Worker, &assets)
+	if err == nil && assets != "" {
+		err = json.Unmarshal([]byte(assets), &r.Assets)
+	}
 	return r, err
 }
 
@@ -531,7 +568,7 @@ func (s *Store) Owed() ([]Request, *exit.Error) {
 	rows, err := s.db.Query(`SELECT ` + requestCols + ` FROM requests r
 		WHERE r.state IN ('submitted','queued')
 		  AND NOT EXISTS (SELECT 1 FROM attempts a WHERE a.request_id=r.id
-		                  AND a.state IN ('dispatching','accepted','recovered_open'))
+		                  AND a.state IN ('preparing','offered','accepted','recovered_open','terminal'))
 		ORDER BY r.created_at, r.id`)
 	if err != nil {
 		return nil, exit.Internalf("cannot read the owed requests: %s", err)
@@ -555,7 +592,7 @@ func (s *Store) Owed() ([]Request, *exit.Error) {
 func (s *Store) Unsettled() ([]Request, *exit.Error) {
 	rows, err := s.db.Query(`SELECT ` + requestCols + ` FROM requests r
 		WHERE EXISTS (SELECT 1 FROM attempts a WHERE a.request_id=r.id
-		              AND a.state IN ('dispatching','accepted','recovered_open'))
+		              AND a.state IN ('preparing','offered','accepted','recovered_open','terminal'))
 		ORDER BY r.created_at, r.id`)
 	if err != nil {
 		return nil, exit.Internalf("cannot read the unsettled requests: %s", err)
@@ -572,6 +609,35 @@ func (s *Store) Unsettled() ([]Request, *exit.Error) {
 	return out, nil
 }
 
+// AssetInUse answers whether an unsettled request still owns a staged content object.
+// Settled request rows retain their identity claims for audit/idempotency, but their bytes
+// are no longer execution inputs and must not pin the private input store forever.
+func (s *Store) AssetInUse(digest string) (bool, *exit.Error) {
+	rows, err := s.db.Query(`SELECT assets FROM requests
+		WHERE state IN ('submitted','queued','dispatching','requeue_pending')
+		  AND assets <> '[]'`)
+	if err != nil {
+		return false, exit.Internalf("cannot read live input asset ownership: %s", err)
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var raw string
+		if err := rows.Scan(&raw); err != nil {
+			return false, exit.Internalf("cannot read a live input asset binding: %s", err)
+		}
+		var assets []AssetBinding
+		if err := json.Unmarshal([]byte(raw), &assets); err != nil {
+			return false, exit.Internalf("cannot decode a live input asset binding: %s", err)
+		}
+		for _, asset := range assets {
+			if asset.Digest == digest {
+				return true, nil
+			}
+		}
+	}
+	return false, nil
+}
+
 // SettleRequest records the request's final state. Only a terminal the orchestrator
 // ACCEPTED can settle one.
 func (s *Store) SettleRequest(id, state string) *exit.Error {
@@ -581,22 +647,34 @@ func (s *Store) SettleRequest(id, state string) *exit.Error {
 	return nil
 }
 
-// ChargeRequeue consumes one unit of the request's durable requeue budget. Retry is
-// BOUNDED and the bound is durable: a worker that dies on every attempt exhausts it
-// instead of running forever.
-func (s *Store) ChargeRequeue(id string, max int64) (int64, *exit.Error) {
-	res, err := s.db.Exec(`UPDATE requests SET requeues=requeues+1 WHERE id=? AND requeues<?`, id, max)
+// BeginRequeue crosses the post-ack boundary and charges the durable retry budget in one
+// transition. Replays after that transition are harmless: only `requeue_pending` can be
+// charged, so a duplicate terminal ack cannot spend twice or mint two ordinals.
+func (s *Store) BeginRequeue(id string, max int64) (count int64, started bool, e *exit.Error) {
+	tx, err := s.db.Begin()
 	if err != nil {
-		return 0, exit.Internalf("cannot charge a requeue for %s: %s", id, err)
+		return 0, false, exit.Internalf("cannot begin the requeue transaction: %s", err)
 	}
-	if n, _ := res.RowsAffected(); n != 1 {
-		return max, exit.New(exit.Failed, "%s exhausted its requeue budget of %d", id, max)
+	defer tx.Rollback()
+	var state string
+	if err := tx.QueryRow(`SELECT state,requeues FROM requests WHERE id=?`, id).
+		Scan(&state, &count); err != nil {
+		return 0, false, exit.Internalf("cannot read requeue state for %s: %s", id, err)
 	}
-	r, e := s.RequestRow(id)
-	if e != nil {
-		return 0, e
+	if state != "requeue_pending" {
+		return count, false, nil
 	}
-	return r.Requeues, nil
+	if count >= max {
+		return count, false, exit.New(exit.Failed, "%s exhausted its requeue budget of %d", id, max)
+	}
+	if _, err := tx.Exec(`UPDATE requests SET state='queued',requeues=requeues+1
+		WHERE id=? AND state='requeue_pending'`, id); err != nil {
+		return 0, false, exit.Internalf("cannot charge a requeue for %s: %s", id, err)
+	}
+	if err := tx.Commit(); err != nil {
+		return 0, false, exit.Internalf("cannot commit requeue %s: %s", id, err)
+	}
+	return count + 1, true, nil
 }
 
 // Submit records one durable request under its idempotency key. The same key with the
@@ -622,11 +700,19 @@ func (s *Store) Submit(r Request) (Request, bool, *exit.Error) {
 	if r.Kind == "" {
 		r.Kind = "serving"
 	}
+	assets := []byte("[]")
+	if len(r.Assets) > 0 {
+		var err error
+		assets, err = json.Marshal(r.Assets)
+		if err != nil {
+			return Request{}, false, exit.Internalf("cannot record request %s assets: %s", r.ID, err)
+		}
+	}
 	if _, err := s.db.Exec(`INSERT INTO requests(id,idem_key,body_digest,endpoint,entrypoint,
-		plan_id,payload,outputs,state,ordinal,requeues,created_at,kind,org,trees,worker)
-		VALUES(?,?,?,?,?,?,?,?,?,0,0,?,?,?,?,?)`,
+		plan_id,payload,outputs,state,ordinal,requeues,created_at,kind,org,trees,worker,assets)
+		VALUES(?,?,?,?,?,?,?,?,?,0,0,?,?,?,?,?,?)`,
 		r.ID, r.IdemKey, r.BodyDigest, r.Endpoint, r.Entrypoint, r.PlanID, r.Payload,
-		r.Outputs, r.State, r.CreatedAt, r.Kind, r.Org, r.Trees, r.Worker); err != nil {
+		r.Outputs, r.State, r.CreatedAt, r.Kind, r.Org, r.Trees, r.Worker, string(assets)); err != nil {
 		return Request{}, false, exit.Internalf("cannot record request %s: %s", r.ID, err)
 	}
 	return r, true, nil
@@ -651,7 +737,7 @@ type Attempt struct {
 	SessionID           string
 	InvocationDigest    string
 	InvocationCanonical []byte
-	State               string // dispatching | accepted | recovered_open | terminal | closed
+	State               string // preparing | offered | dispatch_aborted | accepted | recovered_open | terminal | closed
 	PlanDigest          string
 	Construction        string
 	PlanSummary         string
@@ -686,7 +772,7 @@ func ordinalLaws(tx *sql.Tx, requestID string) (int64, *exit.Error) {
 	}
 	var live int
 	if err := tx.QueryRow(`SELECT COUNT(*) FROM attempts
-		WHERE request_id=? AND state IN ('dispatching','accepted')`, requestID).Scan(&live); err != nil {
+		WHERE request_id=? AND state IN ('preparing','offered','accepted','terminal')`, requestID).Scan(&live); err != nil {
 		return 0, exit.Internalf("cannot read the live attempts of %s: %s", requestID, err)
 	}
 	if live > 0 {
@@ -744,7 +830,7 @@ func (s *Store) Dispatch(a Attempt) (int64, *exit.Error) {
 	a.Attempt = ordinal
 	if _, err := tx.Exec(`INSERT INTO attempts(request_id,attempt,attempt_key,instance_id,
 		session_id,invocation_digest,invocation,state,dispatched_at)
-		VALUES(?,?,?,?,?,?,?,'dispatching',?)`,
+		VALUES(?,?,?,?,?,?,?,'preparing',?)`,
 		a.RequestID, a.Attempt, a.AttemptKey, a.InstanceID, a.SessionID,
 		a.InvocationDigest, a.InvocationCanonical, a.DispatchedAt); err != nil {
 		return 0, exit.New(exit.Conflict, "cannot journal attempt %s#%d: %s", a.RequestID, a.Attempt, err).
@@ -760,11 +846,90 @@ func (s *Store) Dispatch(a Attempt) (int64, *exit.Error) {
 	return ordinal, nil
 }
 
+// OfferDispatch durably crosses the offer boundary before the frame is queued. If the
+// process dies on either side, the next worker snapshot decides the only ambiguity:
+// held means recover it; absent means abort it and return the request to the queue.
+func (s *Store) OfferDispatch(requestID string, attempt int64, sessionID string) *exit.Error {
+	tx, err := s.db.Begin()
+	if err != nil {
+		return exit.Internalf("cannot begin the offer transaction: %s", err)
+	}
+	defer tx.Rollback()
+	res, err := tx.Exec(`UPDATE attempts SET state='offered'
+		WHERE request_id=? AND attempt=? AND session_id=? AND state='preparing'`,
+		requestID, attempt, sessionID)
+	if err != nil {
+		return exit.Internalf("cannot offer %s#%d: %s", requestID, attempt, err)
+	}
+	if n, _ := res.RowsAffected(); n != 1 {
+		return exit.New(exit.Conflict, "%s#%d is not a prepared assignment of session %s",
+			requestID, attempt, sessionID)
+	}
+	if err := tx.Commit(); err != nil {
+		return exit.Internalf("the offer transaction did not commit for %s#%d: %s",
+			requestID, attempt, err)
+	}
+	return nil
+}
+
+// AbortDispatch closes an assignment that never crossed the AttemptOffer boundary. It is
+// not a terminal: no worker saw the attempt and therefore no worker owes an outcome. The
+// row remains as durable history while the request becomes owed capacity again.
+func (s *Store) AbortDispatch(requestID string, attempt int64, sessionID, reason string) *exit.Error {
+	tx, err := s.db.Begin()
+	if err != nil {
+		return exit.Internalf("cannot begin the dispatch-abort transaction: %s", err)
+	}
+	defer tx.Rollback()
+	res, err := tx.Exec(`UPDATE attempts SET state='dispatch_aborted', safe_message=?, closed_at=?
+		WHERE request_id=? AND attempt=? AND session_id=? AND state IN ('preparing','offered')`,
+		reason, now(), requestID, attempt, sessionID)
+	if err != nil {
+		return exit.Internalf("cannot abort dispatch %s#%d: %s", requestID, attempt, err)
+	}
+	if n, _ := res.RowsAffected(); n != 1 {
+		return exit.New(exit.Conflict,
+			"cannot abort dispatch %s#%d: it is not an unoffered assignment of session %s",
+			requestID, attempt, sessionID)
+	}
+	request, err := tx.Exec(`UPDATE requests SET state='submitted'
+		WHERE id=? AND ordinal=? AND state='dispatching'`, requestID, attempt)
+	if err != nil {
+		return exit.Internalf("cannot return request %s to submitted: %s", requestID, err)
+	}
+	if n, _ := request.RowsAffected(); n != 1 {
+		return exit.New(exit.Conflict,
+			"cannot abort dispatch %s#%d: its request no longer names that live assignment",
+			requestID, attempt)
+	}
+	if err := tx.Commit(); err != nil {
+		return exit.Internalf("the dispatch-abort transaction did not commit for %s#%d: %s",
+			requestID, attempt, err)
+	}
+	return nil
+}
+
+// MediaCleanupOwed derives cleanup work from durable attempt state. Only an aborted
+// pre-offer assignment or an acknowledged closed outcome is disposable; a terminal that
+// has not been acked still needs its remote outputs for replay.
+func (s *Store) MediaCleanupOwed(instanceID string) ([]Attempt, *exit.Error) {
+	return s.attemptsWhere(`instance_id=? AND media_cleaned=0
+		AND state IN ('dispatch_aborted','closed')`, instanceID)
+}
+
+func (s *Store) MarkMediaCleaned(requestID string, attempt int64) *exit.Error {
+	if _, err := s.db.Exec(`UPDATE attempts SET media_cleaned=1 WHERE request_id=? AND attempt=?`,
+		requestID, attempt); err != nil {
+		return exit.Internalf("cannot record media cleanup for %s#%d: %s", requestID, attempt, err)
+	}
+	return nil
+}
+
 // Accepted records AttemptAccepted's journaled digests. They never move afterwards.
 func (s *Store) Accepted(requestID string, attempt int64, sessionID, planDigest, construction, summary string) *exit.Error {
 	res, err := s.db.Exec(`UPDATE attempts SET state='accepted', plan_digest=?, construction=?,
 		plan_summary=?, accepted_at=?
-		WHERE request_id=? AND attempt=? AND session_id=? AND state='dispatching'`,
+		WHERE request_id=? AND attempt=? AND session_id=? AND state IN ('offered','recovered_open')`,
 		planDigest, construction, summary, now(), requestID, attempt, sessionID)
 	if err != nil {
 		return exit.Internalf("cannot record acceptance of %s#%d: %s", requestID, attempt, err)
@@ -894,7 +1059,7 @@ func (s *Store) AcceptTerminal(t Terminal) (applied bool, e *exit.Error) {
 	res, err := tx.Exec(`UPDATE attempts SET state='terminal', terminal_id=?, terminal_digest=?,
 		terminal_status=?, terminal_cause=?, safe_message=?, triage_subject=?, triage_digest=?,
 		triage_length=?, triage_path=?, terminal_body=?, closed_at=?
-		WHERE request_id=? AND attempt=? AND session_id=? AND state IN ('dispatching','accepted','recovered_open')`,
+		WHERE request_id=? AND attempt=? AND session_id=? AND state IN ('offered','accepted','recovered_open')`,
 		t.TerminalID, t.TerminalDigest, t.Status, t.Cause, t.SafeMessage, t.TriageSubject,
 		t.TriageDigest, t.TriageLength, t.TriagePath,
 		t.Body, now(), t.RequestID, t.Attempt, t.SessionID)
@@ -964,10 +1129,17 @@ func (s *Store) AcceptTerminal(t Terminal) (applied bool, e *exit.Error) {
 // Closed records the ack. Only a closed entry is compactable, and closure follows the
 // commit — never precedes it.
 func (s *Store) Closed(requestID string, attempt int64) *exit.Error {
-	_, err := s.db.Exec(`UPDATE attempts SET state='closed' WHERE request_id=? AND attempt=?
+	res, err := s.db.Exec(`UPDATE attempts SET state='closed' WHERE request_id=? AND attempt=?
 		AND state='terminal'`, requestID, attempt)
 	if err != nil {
 		return exit.Internalf("cannot close %s#%d: %s", requestID, attempt, err)
+	}
+	if n, _ := res.RowsAffected(); n == 0 {
+		var state string
+		if err := s.db.QueryRow(`SELECT state FROM attempts WHERE request_id=? AND attempt=?`,
+			requestID, attempt).Scan(&state); err != nil || state != "closed" {
+			return exit.New(exit.Conflict, "cannot close %s#%d from state %q", requestID, attempt, state)
+		}
 	}
 	return nil
 }
@@ -976,8 +1148,10 @@ func (s *Store) Closed(requestID string, attempt int64) *exit.Error {
 // it is open, NextOrdinal refuses for that request id — the whole point of the
 // recovered-journal handshake.
 func (s *Store) Recover(requestID string, attempt int64, sessionID string) *exit.Error {
-	res, err := s.db.Exec(`UPDATE attempts SET state='recovered_open', session_id=?
-		WHERE request_id=? AND attempt=? AND state IN ('dispatching','accepted')`,
+	res, err := s.db.Exec(`UPDATE attempts SET
+		state=CASE WHEN terminal_digest<>'' THEN 'terminal' ELSE 'recovered_open' END,
+		session_id=? WHERE request_id=? AND attempt=?
+		AND state IN ('preparing','offered','accepted','recovered_open','terminal','closed')`,
 		sessionID, requestID, attempt)
 	if err != nil {
 		return exit.Internalf("cannot record the recovered attempt %s#%d: %s", requestID, attempt, err)
@@ -1018,7 +1192,31 @@ func (s *Store) Attempts(requestID string) ([]Attempt, *exit.Error) {
 // the supervisor's own journal, replayed by a worker in the SAME slot.
 func (s *Store) OpenAttemptsOf(instanceID string) ([]Attempt, *exit.Error) {
 	return s.attemptsWhere(
-		`instance_id=? AND state IN ('dispatching','accepted','recovered_open')`, instanceID)
+		`instance_id=? AND state IN ('preparing','offered','accepted','recovered_open','terminal')`, instanceID)
+}
+
+// ReadyRequeues are committed retry decisions whose old terminal has crossed the
+// acknowledgement boundary. BeginRequeue changes them to queued and charges the budget
+// atomically.
+func (s *Store) ReadyRequeues() ([]Request, *exit.Error) {
+	rows, err := s.db.Query(`SELECT ` + requestCols + ` FROM requests
+		WHERE state='requeue_pending' AND EXISTS (
+		  SELECT 1 FROM attempts a WHERE a.request_id=requests.id
+		  AND a.attempt=requests.ordinal AND a.state='closed')
+		ORDER BY created_at,id`)
+	if err != nil {
+		return nil, exit.Internalf("cannot read pending requeues: %s", err)
+	}
+	defer rows.Close()
+	var out []Request
+	for rows.Next() {
+		r, err := scanRequest(rows)
+		if err != nil {
+			return nil, exit.Internalf("cannot read a pending requeue: %s", err)
+		}
+		out = append(out, r)
+	}
+	return out, nil
 }
 
 func (s *Store) attemptsWhere(where string, args ...any) ([]Attempt, *exit.Error) {
@@ -1194,7 +1392,7 @@ func (s *Store) RecordCheckpoint(c Checkpoint) (Checkpoint, string, *exit.Error)
 	var open int
 	if err := s.db.QueryRow(`SELECT COUNT(*) FROM attempts
 		WHERE request_id=? AND attempt=? AND session_id=?
-		AND state IN ('dispatching','accepted','recovered_open')`,
+		AND state IN ('offered','accepted','recovered_open')`,
 		c.RequestID, c.Attempt, c.SessionID).Scan(&open); err != nil {
 		return c, "", exit.Internalf("cannot read the attempt of a checkpoint: %s", err)
 	}
@@ -1225,7 +1423,7 @@ func (s *Store) RecordCheckpoint(c Checkpoint) (Checkpoint, string, *exit.Error)
 		logical_key,content_digest,receipt_id,outcome,recorded_at)
 		SELECT ?,?,?,?,?,?,?,?
 		WHERE EXISTS (SELECT 1 FROM attempts WHERE request_id=? AND attempt=? AND session_id=?
-		              AND state IN ('dispatching','accepted','recovered_open'))`,
+		              AND state IN ('offered','accepted','recovered_open'))`,
 		c.RequestID, c.Attempt, c.OperationKey, c.LogicalKey, c.ContentDigest,
 		c.ReceiptID, c.Outcome, c.RecordedAt,
 		c.RequestID, c.Attempt, c.SessionID)
@@ -1278,7 +1476,7 @@ func (s *Store) Counts() (map[string]int, *exit.Error) {
 		"workers":   `SELECT COUNT(*) FROM worker_processes WHERE state != 'closed'`,
 		"requests":  `SELECT COUNT(*) FROM requests`,
 		"attempts":  `SELECT COUNT(*) FROM attempts`,
-		"live":      `SELECT COUNT(*) FROM attempts WHERE state IN ('dispatching','accepted')`,
+		"live":      `SELECT COUNT(*) FROM attempts WHERE state IN ('preparing','offered','accepted','terminal')`,
 		"recovered": `SELECT COUNT(*) FROM attempts WHERE state='recovered_open'`,
 		"outputs":   `SELECT COUNT(*) FROM outputs`,
 	} {

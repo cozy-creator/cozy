@@ -96,6 +96,12 @@ type Orchestrator struct {
 	sessions map[string]*session // by worker_boot_id (the live claimed stream per worker)
 	workers  map[string]*worker  // by instance_id
 	waits    map[string]*wait    // by request#attempt
+	// offers are seats reserved for emitted offers that have not yet produced the causal
+	// Accepted or pre-execution Refused frame. Reports cannot reopen these seats.
+	offers map[string]*dispatchReservation
+	// mediaCleaning prevents overlapping retries of one durable cleanup obligation. It
+	// contains only calls in flight; success is recorded on the attempt row.
+	mediaCleaning map[string]bool
 	// pending is the dispatch queue: requests that have no ready worker YET. A requeue
 	// with nowhere to go WAITS for capacity instead of evaporating — the alternative is
 	// a request that quietly stops existing because a worker was still loading.
@@ -136,14 +142,16 @@ func Open(opt Options) (*Orchestrator, *exit.Error) {
 		opt.Yield = "smart"
 	}
 	c := &Orchestrator{
-		opt:      opt,
-		done:     make(chan struct{}),
-		sessions: map[string]*session{},
-		workers:  map[string]*worker{},
-		waits:    map[string]*wait{},
-		starting: map[string]bool{},
-		stalls:   map[string]time.Time{},
-		frames:   newFanout(),
+		opt:           opt,
+		done:          make(chan struct{}),
+		sessions:      map[string]*session{},
+		workers:       map[string]*worker{},
+		waits:         map[string]*wait{},
+		offers:        map[string]*dispatchReservation{},
+		mediaCleaning: map[string]bool{},
+		starting:      map[string]bool{},
+		stalls:        map[string]time.Time{},
+		frames:        newFanout(),
 	}
 	return c, nil
 }

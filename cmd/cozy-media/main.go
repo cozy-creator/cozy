@@ -9,7 +9,7 @@
 // discipline: this binary imports no protocol client and, by fence, contains no outbound
 // network call of any kind. It joins the liability fence by HAVING NOTHING TO EGRESS WITH.
 //
-// Four routes, and the shape of each is the whole design:
+// Five routes, and the shape of each is the whole design:
 //
 //	PUT  /v1/inputs/{blob}        the owner uploads one attempt input; the answer is the
 //	                              POD-LOCAL PATH it landed at, which is what the owner then
@@ -25,6 +25,8 @@
 //	                              told the pod-local path to grant the worker.
 //	GET  /v1/outputs/{slot}/{id}  the owner reads back what the worker wrote. READ-ONLY:
 //	                              this route opens a file and never creates one.
+//	DELETE /v1/attempts/{slot}    after rollback, or after mirror plus outcome ack, the
+//	                              owner drops exactly that attempt's inputs and outputs.
 //
 // AUTH is a bearer against a TOKEN-HASH FILE, stat-per-request and fail-closed: the file is
 // re-read whenever its (size, mtime) changes, an unreadable or empty file authenticates
@@ -145,7 +147,8 @@ func run(args []string) int {
 type server struct {
 	opt options
 
-	mu sync.Mutex
+	mu     sync.Mutex
+	writes sync.Mutex // quota admission and the filesystem mutation are one critical section
 	// hashes is the loaded credential set: `sha256:<64 hex>` lines, never a raw token.
 	hashes []string
 	// size/stamp are what the loaded set was read from. Stat-per-request compares against
@@ -339,6 +342,8 @@ func (s *server) putInput(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
+	s.writes.Lock()
+	defer s.writes.Unlock()
 	data, ok := s.take(w, r)
 	if !ok {
 		return
@@ -375,6 +380,8 @@ func (s *server) putPlan(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
+	s.writes.Lock()
+	defer s.writes.Unlock()
 	data, ok := s.take(w, r)
 	if !ok {
 		return
@@ -408,6 +415,8 @@ func (s *server) reserveOutputs(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
+	s.writes.Lock()
+	defer s.writes.Unlock()
 	dir := filepath.Join(s.opt.root, "outputs", names[0])
 	if err := os.MkdirAll(dir, 0o777); err != nil {
 		refuse(w, http.StatusInternalServerError, "media.unwritable",
@@ -419,6 +428,43 @@ func (s *server) reserveOutputs(w http.ResponseWriter, r *http.Request) {
 	// every provisioning. The subtree is quota-bounded and holds no credential.
 	_ = os.Chmod(dir, 0o777)
 	answer(w, http.StatusCreated, map[string]any{"dir": dir, "slot": names[0]})
+}
+
+// dropAttempt removes only one opaque attempt slot. Inputs use the slot as an exact
+// prefix followed by a dash; outputs use it as their directory name. Plans are shared by
+// placements and deliberately outside this ownership boundary.
+func (s *server) dropAttempt(w http.ResponseWriter, r *http.Request) {
+	if !s.admits(w, r) {
+		return
+	}
+	names, ok := named(w, r, "slot")
+	if !ok {
+		return
+	}
+	s.writes.Lock()
+	defer s.writes.Unlock()
+	slot := names[0]
+	entries, err := os.ReadDir(filepath.Join(s.opt.root, "inputs"))
+	if err != nil && !os.IsNotExist(err) {
+		refuse(w, http.StatusInternalServerError, "media.unreadable",
+			"the attempt input directory cannot be read: "+err.Error(), "check the pod's media subtree")
+		return
+	}
+	for _, entry := range entries {
+		if strings.HasPrefix(entry.Name(), slot+"-") {
+			if err := os.Remove(filepath.Join(s.opt.root, "inputs", entry.Name())); err != nil && !os.IsNotExist(err) {
+				refuse(w, http.StatusInternalServerError, "media.unwritable",
+					"an attempt input could not be removed: "+err.Error(), "check the pod's media subtree")
+				return
+			}
+		}
+	}
+	if err := os.RemoveAll(filepath.Join(s.opt.root, "outputs", slot)); err != nil {
+		refuse(w, http.StatusInternalServerError, "media.unwritable",
+			"the attempt output directory could not be removed: "+err.Error(), "check the pod's media subtree")
+		return
+	}
+	answer(w, http.StatusOK, map[string]any{"slot": slot})
 }
 
 // getOutput serves one committed output. READ-ONLY, and that is what makes this route
@@ -479,6 +525,7 @@ func (s *server) routes() *http.ServeMux {
 	mux.HandleFunc("PUT /v1/plans/{id}", s.putPlan)
 	mux.HandleFunc("POST /v1/outputs/{slot}", s.reserveOutputs)
 	mux.HandleFunc("GET /v1/outputs/{slot}/{name}", s.getOutput)
+	mux.HandleFunc("DELETE /v1/attempts/{slot}", s.dropAttempt)
 	return mux
 }
 

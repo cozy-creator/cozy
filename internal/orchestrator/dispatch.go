@@ -3,12 +3,15 @@ package orchestrator
 import (
 	"os"
 	"path/filepath"
+	"runtime"
+	"strconv"
 	"strings"
 	"time"
 
 	"github.com/cozy-creator/cozy-creator-v2/internal/canonical"
 	"github.com/cozy-creator/cozy-creator-v2/internal/exit"
 	"github.com/cozy-creator/cozy-creator-v2/internal/home"
+	"github.com/cozy-creator/cozy-creator-v2/internal/inputasset"
 	"github.com/cozy-creator/cozy-creator-v2/internal/media"
 	"github.com/cozy-creator/cozy-creator-v2/internal/records"
 	pb "github.com/cozy-creator/cozy-creator-v2/protocol/cozy/worker/v1"
@@ -26,6 +29,9 @@ type Submission struct {
 	// `payload` — a grant input, never a wire field, so refreshing the grant can never
 	// substitute it.
 	Payload []byte
+	// Assets are immutable, service-staged files bound to exact payload field paths.
+	// The request row keeps them so every requeue derives the same spec and grant.
+	Assets []records.AssetBinding
 
 	// Outputs is one destination per RESULT FIELD PATH (`image`, `detail.thumb`). Binding
 	// by field path with exact set equality is what makes a two-output result
@@ -99,6 +105,7 @@ func (c *Orchestrator) SubmitDetail(s Submission) (string, uint64, bool, *exit.E
 		ID: id, IdemKey: s.IdemKey, BodyDigest: bodyDigest,
 		Endpoint: s.Endpoint, Entrypoint: s.Entrypoint, PlanID: s.PlanID, Payload: s.Payload,
 		Outputs: strings.Join(s.Outputs, ","),
+		Assets:  s.Assets,
 		Kind:    s.Kind, Org: s.Org, Trees: strings.Join(s.Trees, ","),
 		Worker: s.Worker,
 	})
@@ -141,6 +148,7 @@ func (c *Orchestrator) SubmitDetail(s Submission) (string, uint64, bool, *exit.E
 		// one projection. Every OTHER refusal (an open recovered obligation, a live
 		// attempt) is a real conflict and still refuses.
 		if e.Code != exit.Unavailable {
+			c.failQueued(req.ID, e)
 			return req.ID, 0, true, e
 		}
 		c.enqueue(req.ID)
@@ -156,7 +164,7 @@ func (c *Orchestrator) SubmitDetail(s Submission) (string, uint64, bool, *exit.E
 // or an infra-class failure earns a NEW ordinal, a fresh grant and a fresh execution —
 // never a patch to the one that died. It is charged against the request's durable budget.
 func (c *Orchestrator) Requeue(requestID, why string) {
-	n, e := c.opt.Store.ChargeRequeue(requestID, MaxRequeues)
+	n, started, e := c.opt.Store.BeginRequeue(requestID, MaxRequeues)
 	if e != nil {
 		// THE REQUEST ENDS HERE, and it has to SAY so. Settling the row without emitting a
 		// terminal event left a client watching the durable stream with `attempt_failed
@@ -173,6 +181,12 @@ func (c *Orchestrator) Requeue(requestID, why string) {
 			"outputs": []any{}, "requeuing": false,
 		})
 		c.waitRequest(requestID).markClosed(e)
+		if row, read := c.opt.Store.RequestRow(requestID); read == nil && row != nil {
+			go c.cleanupRequestAssets(*row)
+		}
+		return
+	}
+	if !started {
 		return
 	}
 	req, e := c.opt.Store.RequestRow(requestID)
@@ -367,8 +381,8 @@ func (c *Orchestrator) resolveFor(req records.Request) (WorkerLaunchSpec, *exit.
 }
 
 // failQueued settles a request that can never be placed. It is a request-level terminal:
-// no attempt was ever dispatched, so there is no attempt terminal to replay and the
-// request row is what settles.
+// no offer crossed to a worker, so there is no worker terminal to replay and the request
+// row is what settles. A closed dispatch_aborted row may remain as preparation history.
 func (c *Orchestrator) failQueued(requestID string, cause *exit.Error) {
 	c.forget(requestID)
 	// A REQUEST THAT ALREADY SETTLED IS NOT FAILED BY A LATER OBSERVATION. The launch
@@ -390,12 +404,15 @@ func (c *Orchestrator) failQueued(requestID string, cause *exit.Error) {
 	if e := c.opt.Store.SettleRequest(requestID, "failed"); e != nil {
 		c.logf("%s could not be settled: %s", requestID, e.Message)
 	}
+	if row, e := c.opt.Store.RequestRow(requestID); e == nil && row != nil {
+		go c.cleanupRequestAssets(*row)
+	}
 	c.emit(requestID, "request.failed", 0, map[string]any{
 		"status": "FAILED", "cause": cause.ErrName(),
 		"error_type": cause.ErrName(), "error": cause.Message,
 		"outputs": []any{}, "requeuing": false,
 	})
-	c.logf("%s FAILED before any attempt: %s", requestID, cause.Message)
+	c.logf("%s FAILED before any offer: %s", requestID, cause.Message)
 	c.waitRequest(requestID).markClosed(cause)
 }
 
@@ -404,10 +421,16 @@ func (c *Orchestrator) dispatch(req records.Request) (uint64, *exit.Error) {
 	// worker whose placement advertises it as DISPATCHABLE now and whose admission fence
 	// is open. `pick` also returns the admission generation it OBSERVED, which is what
 	// makes a stale offer refuse deterministically rather than race.
-	w, sess, admissionGen, e := c.pick(req)
+	w, sess, admissionGen, reservation, e := c.pick(req)
 	if e != nil {
 		return 0, e
 	}
+	reserved := true
+	defer func() {
+		if reserved {
+			c.releaseDispatch(reservation)
+		}
+	}()
 
 	// The InvocationSpec DOCUMENT (#439): everything that gives the invocation meaning —
 	// the payload digest, the ORDERED input identities, the output contracts, the
@@ -471,7 +494,7 @@ func (c *Orchestrator) dispatch(req records.Request) (uint64, *exit.Error) {
 	// anybody held.
 	grant, e := c.grantFor(req, attempt, w)
 	if e != nil {
-		return 0, e
+		return 0, c.abortDispatch(req.ID, attempt, w.bootID, e)
 	}
 	grant.InvocationSpecDigest = digest
 
@@ -492,7 +515,23 @@ func (c *Orchestrator) dispatch(req records.Request) (uint64, *exit.Error) {
 	}
 	offer.RecordOwnerEpoch, offer.ControlStreamGeneration, offer.WorkerBootId =
 		recordOwnerEpoch, sess.generation, sess.bootID
-	sess.send(&pb.RecordOwnerFrame{Msg: &pb.RecordOwnerFrame_AttemptOffer{AttemptOffer: offer}})
+	if !c.commitDispatch(reservation, req.ID, attempt) {
+		cause := exit.Unavailablef("the worker selected for %s#%d left before its offer", req.ID, attempt)
+		c.rollbackGrant(req, attempt, w)
+		return 0, c.abortDispatch(req.ID, attempt, w.bootID, cause)
+	}
+	reserved = false
+	if e := c.opt.Store.OfferDispatch(req.ID, int64(attempt), w.bootID); e != nil {
+		c.settleDispatch(req.ID, attempt, false)
+		c.rollbackGrant(req, attempt, w)
+		return 0, c.abortDispatch(req.ID, attempt, w.bootID, e)
+	}
+	if !sess.send(&pb.RecordOwnerFrame{Msg: &pb.RecordOwnerFrame_AttemptOffer{AttemptOffer: offer}}) {
+		c.settleDispatch(req.ID, attempt, false)
+		c.rollbackGrant(req, attempt, w)
+		cause := exit.Unavailablef("the control stream for %s#%d closed before its offer", req.ID, attempt)
+		return 0, c.abortDispatch(req.ID, attempt, w.bootID, cause)
+	}
 	c.logf("AttemptOffer %s#%d spec=%s (%d canonical bytes) placement=%s admission=%d outputs=%s on %s",
 		req.ID, attempt, shortDigest(spelled), len(canonicalBytes), placementID,
 		admissionGen, req.Outputs, w.instanceID)
@@ -500,6 +539,33 @@ func (c *Orchestrator) dispatch(req records.Request) (uint64, *exit.Error) {
 		"instance_id": w.instanceID, "invocation_digest": spelled,
 	})
 	return attempt, nil
+}
+
+func (c *Orchestrator) abortDispatch(requestID string, attempt uint64, sessionID string, cause *exit.Error) *exit.Error {
+	if abort := c.opt.Store.AbortDispatch(requestID, int64(attempt), sessionID, cause.Message); abort != nil {
+		c.logf("%s#%d preparation failed (%s), and its dispatch could not be aborted: %s",
+			requestID, attempt, cause.Message, abort.Message)
+		return abort
+	}
+	c.emit(requestID, "request.dispatch_aborted", attempt, map[string]any{
+		"cause": cause.ErrName(), "error": cause.Message,
+	})
+	c.logf("%s#%d dispatch ABORTED before offer: %s", requestID, attempt, cause.Message)
+	return cause
+}
+
+func (c *Orchestrator) rollbackGrant(req records.Request, attempt uint64, w *worker) {
+	if w.media != nil {
+		c.cleanupRemote(req.ID, attempt, w)
+		return
+	}
+	path := c.opt.Layout.AttemptDir(req.ID, attempt)
+	if req.IsJob() {
+		path = c.opt.Layout.PublicationStage(req.Org, req.ID, attempt)
+	}
+	if err := os.RemoveAll(path); err != nil {
+		c.logf("%s#%d local grant rollback failed: %s", req.ID, attempt, err)
+	}
 }
 
 func (c *Orchestrator) maxOutputBytes() uint64 {
@@ -528,7 +594,13 @@ func inputBindings(req records.Request) []*pb.InputBinding {
 		KindMime: "application/json",
 		Order:    0,
 	}}
-	order := uint32(1)
+	for _, asset := range req.Assets {
+		rows = append(rows, &pb.InputBinding{
+			InputId: asset.FieldPath, Digest: asset.Digest, Length: uint64(asset.Length),
+			KindMime: asset.MediaType, Order: asset.Order,
+		})
+	}
+	order := uint32(len(req.Assets) + 1)
 	for _, pair := range splitList(req.Trees) {
 		ref, _, ok := strings.Cut(pair, "=")
 		if !ok {
@@ -566,7 +638,13 @@ func outputBindings(ids []string, maxBytes uint64) []*pb.OutputBinding {
 // pod whose credential it never presented. It cuts the other way too: an UNPINNED request
 // must never land on a rented worker, because someone is being billed for that card and
 // nobody asked for it here.
-func (c *Orchestrator) pick(req records.Request) (*worker, *session, uint64, *exit.Error) {
+type dispatchReservation struct {
+	worker *worker
+	job    bool
+	planID string
+}
+
+func (c *Orchestrator) pick(req records.Request) (*worker, *session, uint64, *dispatchReservation, *exit.Error) {
 	planID := req.PlanID
 	slot := pinnedEndpoint(req.Endpoint, req.Worker)
 	c.mu.Lock()
@@ -587,11 +665,13 @@ func (c *Orchestrator) pick(req records.Request) (*worker, *session, uint64, *ex
 			// RESERVE the seat this dispatch is about to consume. The worker's own next
 			// observed state is still the authority — this only stops ONE drain pass from
 			// handing two queued jobs to a one-attempt worker on one reading.
-			w.jobsAvail--
+			w.reservedJobs++
+			w.jobsAvail = max(0, w.reportedJobs-w.reservedJobs)
 			if w.jobsAvail <= 0 {
 				w.dispatchable[planID] = false
 			}
-			return w, sess, w.admissionGen, nil
+			return w, sess, w.admissionGen,
+				&dispatchReservation{worker: w, job: true, planID: planID}, nil
 		}
 		if !w.dispatchableFor(planID) {
 			continue
@@ -603,12 +683,74 @@ func (c *Orchestrator) pick(req records.Request) (*worker, *session, uint64, *ex
 			// and never the worker's.
 			continue
 		}
-		w.slots--
-		return w, sess, w.admissionGen, nil
+		w.reservedSlots++
+		w.slots = max(0, w.reportedSlots-w.reservedSlots)
+		return w, sess, w.admissionGen, &dispatchReservation{worker: w}, nil
 	}
-	return nil, nil, 0, exit.Unavailablef(
+	return nil, nil, 0, nil, exit.Unavailablef(
 		"no claimed worker in %s has a DISPATCHABLE placement for %s with a free attempt slot",
 		slot, planID)
+}
+
+// A reservation starts while an offer is prepared and remains subtracted after emission
+// until the worker causally answers Accepted or Refused. A Report can race an upload or an
+// outbound frame, so it is never evidence that this particular offer has been observed.
+func (c *Orchestrator) commitDispatch(r *dispatchReservation, requestID string, attempt uint64) bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if r == nil || c.workers[r.worker.instanceID] != r.worker {
+		return false
+	}
+	c.offers[key(requestID, attempt)] = r
+	return true
+}
+
+func (c *Orchestrator) releaseDispatch(r *dispatchReservation) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if r == nil || c.workers[r.worker.instanceID] != r.worker {
+		return
+	}
+	if r.job {
+		r.worker.reservedJobs = max(0, r.worker.reservedJobs-1)
+		r.worker.observeJobs(r.worker.reportedJobs)
+		if r.worker.jobsAvail > 0 {
+			r.worker.dispatchable[r.planID] = true
+		}
+		return
+	}
+	r.worker.reservedSlots = max(0, r.worker.reservedSlots-1)
+	r.worker.observeSlots(r.worker.reportedSlots)
+}
+
+// settleDispatch consumes a seat on Accepted/executed outcome and returns it on a
+// pre-execution Refused outcome. It is idempotent because only the first causal answer
+// finds the offer reservation.
+func (c *Orchestrator) settleDispatch(requestID string, attempt uint64, consumed bool) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	k := key(requestID, attempt)
+	r := c.offers[k]
+	delete(c.offers, k)
+	if r == nil || c.workers[r.worker.instanceID] != r.worker {
+		return
+	}
+	if r.job {
+		r.worker.reservedJobs = max(0, r.worker.reservedJobs-1)
+		if consumed {
+			r.worker.reportedJobs = max(0, r.worker.reportedJobs-1)
+		}
+		r.worker.observeJobs(r.worker.reportedJobs)
+		if !consumed && r.worker.jobsAvail > 0 {
+			r.worker.dispatchable[r.planID] = true
+		}
+		return
+	}
+	r.worker.reservedSlots = max(0, r.worker.reservedSlots-1)
+	if consumed {
+		r.worker.reportedSlots = max(0, r.worker.reportedSlots-1)
+	}
+	r.worker.observeSlots(r.worker.reportedSlots)
 }
 
 // grantFor picks the lane's grant. The lanes differ in exactly one thing that matters —
@@ -617,6 +759,11 @@ func (c *Orchestrator) pick(req records.Request) (*worker, *session, uint64, *ex
 // attempt's destinations must be on the pod, because that is where the process writing
 // them is.
 func (c *Orchestrator) grantFor(req records.Request, attempt uint64, w *worker) (*pb.DeliveryGrant, *exit.Error) {
+	if w.media == nil {
+		if e := localGrantSupport(runtime.GOOS); e != nil {
+			return nil, e
+		}
+	}
 	if req.IsJob() {
 		g, _, e := c.jobGrant(req, attempt)
 		return g, e
@@ -625,6 +772,15 @@ func (c *Orchestrator) grantFor(req records.Request, attempt uint64, w *worker) 
 		return c.remoteGrant(req, attempt, w)
 	}
 	return c.grant(req.ID, attempt, req)
+}
+
+func localGrantSupport(goos string) *exit.Error {
+	if goos != "windows" {
+		return nil
+	}
+	return exit.Named(exit.Structural, "local_file_grant_unsupported",
+		"local worker grants are not yet supported on Windows").
+		WithRemedy("use --worker with a remote pod; local file URL authorization is currently POSIX-only")
 }
 
 // remoteGrant builds the grant for an attempt that will run on a POD (cl-014/#506b).
@@ -640,7 +796,21 @@ func (c *Orchestrator) grantFor(req records.Request, attempt uint64, w *worker) 
 // journaled and before `StartAttempt` is sent, so a pod that cannot be fed refuses the
 // dispatch rather than accepting an attempt whose inputs are unreachable.
 func (c *Orchestrator) remoteGrant(req records.Request, attempt uint64, w *worker) (*pb.DeliveryGrant, *exit.Error) {
+	assets := make([][]byte, len(req.Assets))
+	for i, asset := range req.Assets {
+		data, e := inputasset.Read(asset, inputasset.MaxBytes)
+		if e != nil {
+			return nil, e
+		}
+		assets[i] = data
+	}
 	slot := media.Slot(req.ID, attempt)
+	complete := false
+	defer func() {
+		if !complete {
+			c.cleanupRemote(req.ID, attempt, w)
+		}
+	}()
 	dir, e := w.media.ReserveOutputs(slot)
 	if e != nil {
 		return nil, e
@@ -656,6 +826,15 @@ func (c *Orchestrator) remoteGrant(req records.Request, attempt uint64, w *worke
 		ExpiresAtUnix: 0,
 		Inputs:        []*pb.InputAccess{{InputId: "payload", Url: "file://" + path}},
 	}
+	for index, asset := range req.Assets {
+		path, e := w.media.PutInput(slot+"-input-"+strconv.Itoa(index), assets[index])
+		if e != nil {
+			return nil, e
+		}
+		g.Inputs = append(g.Inputs, &pb.InputAccess{InputId: asset.FieldPath, Url: "file://" + path})
+		c.logf("%s#%d: input asset %s (%d B, %s) crossed to %s at %s",
+			req.ID, attempt, asset.FieldPath, asset.Length, asset.Digest, w.media.Addr(), path)
+	}
 	for _, id := range strings.Split(req.Outputs, ",") {
 		if id == "" {
 			continue
@@ -664,6 +843,7 @@ func (c *Orchestrator) remoteGrant(req records.Request, attempt uint64, w *worke
 			OutputId: id, Url: "file://" + dir + "/" + id,
 		})
 	}
+	complete = true
 	return g, nil
 }
 
@@ -693,6 +873,14 @@ func (c *Orchestrator) grant(requestID string, attempt uint64, req records.Reque
 		// ACCESS ONLY (#439): the identities (digest, length, media kind) live in the
 		// spec's bindings, inside the invocation digest.
 		Inputs: []*pb.InputAccess{{InputId: "payload", Url: "file://" + payloadPath}},
+	}
+	for _, asset := range req.Assets {
+		if _, e := inputasset.Read(asset, inputasset.MaxBytes); e != nil {
+			return nil, e
+		}
+		g.Inputs = append(g.Inputs, &pb.InputAccess{
+			InputId: asset.FieldPath, Url: "file://" + asset.LocalPath,
+		})
 	}
 	for _, id := range strings.Split(req.Outputs, ",") {
 		if id == "" {

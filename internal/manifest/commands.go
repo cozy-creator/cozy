@@ -212,6 +212,7 @@ var Commands = []Command{
 			{Name: "--timeout", Arg: "<dur>", Summary: "request deadline"},
 			{Name: "--stream", Summary: "typed deltas as NDJSON"},
 			{Name: "--in", Arg: "<file>", Summary: "whole payload as JSON"},
+			{Name: "--asset", Arg: "<field-path>=<file>", Summary: "bind a local asset file to a request field (repeatable)"},
 			{Name: "--local", Summary: "run on this host (default)"},
 			{Name: "--cloud", Summary: "submit to tensorhub under the account"},
 			{Name: "--worker", Arg: "<rental-id>", Summary: "pin this run to an attached rented pod (`cozy rent ls`)"},
@@ -317,6 +318,7 @@ var Commands = []Command{
 		Flags: []Flag{
 			{Name: "--card", Arg: "<name>", Summary: "required; the accelerator the hub provisions"},
 			{Name: "--region", Arg: "<datacenter>", Summary: "optional placement preference; absent lets the provider place it"},
+			{Name: "--idempotency-key", Arg: "<key>", Summary: "resume one paid ask; the same key never buys twice"},
 			{Name: "--timeout", Arg: "<dur>", Summary: "give up waiting for ready; the pod is NOT released"},
 			{Name: "--reason", Arg: "<why>", Summary: "required; the hub records it durably before it acts"},
 		},

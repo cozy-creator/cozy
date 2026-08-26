@@ -10,6 +10,7 @@
 package rental
 
 import (
+	"errors"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -22,10 +23,10 @@ import (
 	"github.com/cozy-creator/cozy-creator-v2/internal/secret"
 )
 
-// Attach persists everything a later process needs to dial this rental: the row, the
-// pinned certificate, and the owner token under 0600. It is written in that order on
-// purpose — the row is what `cozy rent ls` and `release` work from, so a crash between
-// the credential and the row would leave a pod nobody can name or tear down.
+// Attach persists everything a later process needs to dial this rental. Secret/public
+// files land before the row can advertise a dialable target. The pre-POST operation row
+// already names the paid resource, so a crash at any point resumes rather than orphaning
+// a pod or publishing a row whose credential is absent.
 func Attach(l home.Layout, st *records.Store, row records.Rental, cert string, token secret.Value) *exit.Error {
 	if err := os.MkdirAll(l.Rentals, 0o700); err != nil {
 		return exit.Internalf("cannot create the rental credential root %s: %s", l.Rentals, err)
@@ -40,12 +41,69 @@ func Attach(l home.Layout, st *records.Store, row records.Rental, cert string, t
 	return st.RecordRental(row)
 }
 
+// PendingToken establishes the plaintext credential BEFORE a paid POST. O_EXCL makes the
+// file the winner under concurrent retries of one operation key: every contender then
+// reads the same token instead of truncating it with fresh entropy.
+func PendingToken(l home.Layout, operationKey string) (secret.Value, *exit.Error) {
+	if err := os.MkdirAll(l.Rentals, 0o700); err != nil {
+		return secret.Value{}, exit.Internalf("cannot create the rental credential root %s: %s", l.Rentals, err)
+	}
+	path := l.PendingRentalToken(operationKey)
+	f, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
+	if errors.Is(err, os.ErrExist) {
+		return tokenAt(path, "pending rental operation "+operationKey)
+	}
+	if err != nil {
+		return secret.Value{}, exit.Internalf("cannot create pending rental token: %s", err)
+	}
+	token := secret.Mint()
+	ok := false
+	defer func() {
+		_ = f.Close()
+		if !ok {
+			_ = os.Remove(path)
+		}
+	}()
+	if err := f.Chmod(0o600); err != nil {
+		return secret.Value{}, exit.Internalf("cannot restrict pending rental token: %s", err)
+	}
+	if _, err := f.Write(secret.FileBody(token)); err != nil {
+		return secret.Value{}, exit.Internalf("cannot write pending rental token: %s", err)
+	}
+	if err := f.Sync(); err != nil {
+		return secret.Value{}, exit.Internalf("cannot make pending rental token durable: %s", err)
+	}
+	if runtime.GOOS != "windows" {
+		dir, err := os.Open(l.Rentals)
+		if err != nil {
+			return secret.Value{}, exit.Internalf("cannot open the rental credential root for sync: %s", err)
+		}
+		err = dir.Sync()
+		_ = dir.Close()
+		if err != nil {
+			return secret.Value{}, exit.Internalf("cannot make the pending rental token name durable: %s", err)
+		}
+	}
+	ok = true
+	return token, nil
+}
+
+// ForgetPending removes the pre-id token only after the operation is attached or proved
+// terminal. An interrupted poll deliberately leaves it for the exact-key retry.
+func ForgetPending(l home.Layout, operationKey string) {
+	_ = os.Remove(l.PendingRentalToken(operationKey))
+}
+
 // Forget removes the local half. The pod is the hub's to destroy; this is what stops
 // this host from holding a credential for something that no longer exists.
 func Forget(l home.Layout, st *records.Store, id string) (bool, *exit.Error) {
+	forgotten, e := st.ForgetRental(id)
+	if e != nil {
+		return false, e
+	}
 	_ = os.Remove(l.RentalToken(id))
 	_ = os.Remove(l.RentalCert(id))
-	return st.ForgetRental(id)
+	return forgotten, nil
 }
 
 // Token reads one rental's owner token back, refusing a file whose mode widened. Reading
@@ -53,11 +111,14 @@ func Forget(l home.Layout, st *records.Store, id string) (bool, *exit.Error) {
 // leak it created the file to prevent — cl-006's rule for the CLI credential, and the
 // same one here because it is the same class of file.
 func Token(l home.Layout, id string) (secret.Value, *exit.Error) {
-	path := l.RentalToken(id)
+	return tokenAt(l.RentalToken(id), "rental "+id)
+}
+
+func tokenAt(path, subject string) (secret.Value, *exit.Error) {
 	info, err := os.Stat(path)
 	if err != nil {
 		return secret.Value{}, exit.New(exit.NotFound,
-			"rental %s has no owner token on this host", id).
+			"%s has no owner token on this host", subject).
 			WithRemedy("`cozy rent` writes it when the pod comes ready; a rental rented elsewhere is not this host's").
 			WithNext("cozy rent ls")
 	}
@@ -67,17 +128,17 @@ func Token(l home.Layout, id string) (secret.Value, *exit.Error) {
 		return secret.Value{}, exit.New(exit.Credential,
 			"%s is mode %#o; a rental's owner token is 0600 or it is not used", path, perm).
 			WithRemedy("release this rental and rent again: every rental provisions its own token").
-			WithNext("cozy rent release " + id + " --yes")
+			WithNext("cozy rent ls")
 	}
 	data, err := os.ReadFile(path)
 	if err != nil {
 		return secret.Value{}, exit.New(exit.Credential,
-			"rental %s's owner token is unreadable: %s", id, err)
+			"%s's owner token is unreadable: %s", subject, err)
 	}
 	v := secret.New(string(data))
 	if !v.Present() {
 		return secret.Value{}, exit.New(exit.Credential,
-			"rental %s's owner token file is empty", id).WithNext("cozy rent ls")
+			"%s's owner token file is empty", subject).WithNext("cozy rent ls")
 	}
 	return v, nil
 }

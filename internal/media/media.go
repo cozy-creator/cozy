@@ -278,6 +278,13 @@ func (c *Client) ReserveOutputs(slot string) (string, *exit.Error) {
 	return doc.Dir, nil
 }
 
+// DropAttempt removes the pod-side inputs and outputs owned by one attempt. It is
+// idempotent, serving both failed-grant rollback and post-ack terminal cleanup.
+func (c *Client) DropAttempt(slot string) *exit.Error {
+	_, _, e := c.call(http.MethodDelete, "/v1/attempts/"+slot, nil)
+	return e
+}
+
 // GetOutput fetches one committed output back to this host. It is the MIRROR's transport:
 // the bytes it returns are verified against the terminal's manifest by the orchestrator
 // before anything becomes visible, and this function verifies nothing itself beyond the

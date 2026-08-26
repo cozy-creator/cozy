@@ -4,9 +4,12 @@
 package home
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"os"
 	"path/filepath"
 	"runtime"
+	"strings"
 
 	"github.com/cozy-creator/cozy-creator-v2/internal/exit"
 )
@@ -20,6 +23,10 @@ type Layout struct {
 	Service     string // the LocalService's liveness lock (cl-001; held, never read)
 	Workers     string // per-worker roots: journal, logs, staged binding plans
 	Outputs     string // the local output namespace the orchestrator grants into
+	// Inputs is the immutable, content-addressed staging area for caller-owned assets.
+	// Request rows point here so requeue never depends on the submitting CLI or its
+	// original path still existing.
+	Inputs string
 	// CAS is the shared local tensorfs store: the one place canonical bytes live on
 	// this host. cozy-creator names it and never writes into it — every byte crosses
 	// through the tfs binary (cl-012).
@@ -61,6 +68,7 @@ func Open(root string) (Layout, *exit.Error) {
 		Service:     filepath.Join(root, "service.lock"),
 		Workers:     filepath.Join(root, "workers"),
 		Outputs:     filepath.Join(root, "outputs"),
+		Inputs:      filepath.Join(root, "inputs"),
 		CAS:         filepath.Join(root, "cas"),
 		Transfer:    filepath.Join(root, "transfer"),
 		Triage:      filepath.Join(root, "triage"),
@@ -73,13 +81,31 @@ func Open(root string) (Layout, *exit.Error) {
 			return Layout{}, exit.Internalf("cannot create %s: %s", dir, err)
 		}
 	}
+	if err := os.MkdirAll(l.Inputs, 0o700); err != nil {
+		return Layout{}, exit.Internalf("cannot create %s: %s", l.Inputs, err)
+	}
 	return l, nil
+}
+
+// InputAsset resolves one verified sha256 digest into its private immutable staging
+// path. Callers validate the digest before reaching this method; keeping the spelling
+// here prevents each transport from inventing a layout.
+func (l Layout) InputAsset(digest string) string {
+	return filepath.Join(l.Inputs, strings.TrimPrefix(digest, "sha256:"))
 }
 
 // RentalToken is one rental's provisioned owner token, mode 0600. It is deliberately
 // NOT a row: a credential in the records database would be readable by every reader of
 // that database, and the whole point of the 0600 handoff is that it is not.
 func (l Layout) RentalToken(id string) string { return filepath.Join(l.Rentals, id+".token") }
+
+// PendingRentalToken is the renter-minted token before the hub has answered with a
+// rental id. The caller's operation key may contain path separators, so only its digest
+// becomes a filename. The operation row keeps the unhashed key needed on the wire.
+func (l Layout) PendingRentalToken(operationKey string) string {
+	sum := sha256.Sum256([]byte(operationKey))
+	return filepath.Join(l.Rentals, "pending-"+hex.EncodeToString(sum[:])+".token")
+}
 
 // RentalCert is the worker certificate this client PINS for one rental. A certificate is
 // public — trusting exactly this PEM and no CA is what makes the pin a pin (#445).
