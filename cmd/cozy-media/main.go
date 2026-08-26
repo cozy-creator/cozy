@@ -247,17 +247,27 @@ func named(w http.ResponseWriter, r *http.Request, keys ...string) ([]string, bo
 	return out, true
 }
 
-// used is what this server's subtree currently holds. It is walked per write rather than
-// counted incrementally because the number that matters is what is ON THE DISK: a counter
-// that drifted from the filesystem would be a quota that stops bounding anything.
+// used is EVERYTHING THIS SERVER HAS WRITTEN, including the binding records it stages into
+// the worker's own directory. That directory is deliberately outside this server's subtree —
+// it has to be, because the worker resolves plan ids against it — and it sits beside the
+// journal, which is exactly the thing cl-014's quota exists to keep an upload from filling.
+// So the bound covers what this server writes, not merely where it prefers to write it.
+//
+// It is walked per write rather than counted incrementally because the number that matters
+// is what is ON THE DISK: a counter that drifted from the filesystem would be a quota that
+// has stopped bounding anything.
 func (s *server) used() int64 {
 	var total int64
-	_ = filepath.Walk(s.opt.root, func(_ string, info os.FileInfo, err error) error {
+	count := func(_ string, info os.FileInfo, err error) error {
 		if err == nil && info != nil && !info.IsDir() {
 			total += info.Size()
 		}
 		return nil
-	})
+	}
+	_ = filepath.Walk(s.opt.root, count)
+	if s.opt.plans != "" {
+		_ = filepath.Walk(s.opt.plans, count)
+	}
 	return total
 }
 
