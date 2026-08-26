@@ -72,6 +72,16 @@ fn foreign_dtype(key: &str, name: &str) -> Result<Dtype> {
 /// Ordered so the strongest evidence wins. The safe carrier has no magic at all (it opens
 /// with a little-endian length), so it is the fallthrough — which is why every hostile shape
 /// must be named here explicitly rather than inferred from "not one of ours".
+///
+/// TWO STRENGTHS, TWO CALL SITES. The multi-byte magics (zip, GGUF, compressed) run before
+/// anything else — a ≥2-byte collision with a sub-cap little-endian header length is not
+/// arithmetically possible (the smallest such prefix reads as a length far over the cap).
+/// The SINGLE-BYTE pickle opcodes are 1-in-64 collisions with a legitimate length prefix —
+/// the real 66 GB official H3 diffusers DiT opens 0x28 = `(` because its shard-1 header is
+/// 0x…28 bytes long, and the pre-parse check refused it as a pickle. They live in
+/// `sniff_weak`, called ONLY on the failure paths (length over cap, truncated, or a header
+/// that does not parse), where they upgrade the refusal's NAME without ever refusing a
+/// carrier the arithmetic accepts.
 pub fn sniff(head: &[u8]) -> Result<()> {
     // `PK\x01\x02` is the CENTRAL DIRECTORY header. A whole `.bin` opens with the local
     // header, but a bounded probe of one — the range fetch that reads a torchao pickle's
@@ -96,8 +106,20 @@ pub fn sniff(head: &[u8]) -> Result<()> {
             "GGUF: consumer-gated, never admitted by the normal door (tensorfs.md §6)",
         );
     }
-    // PROTO opcode + a protocol number is a pickle stream; the classic protocol-0/1 streams
-    // open with a MARK, EMPTY_DICT or a memo op. Both are named, neither is fed to anything.
+    if head.starts_with(b"\x1f\x8b") || head.starts_with(b"BZh") || head.starts_with(b"\xfd7zXZ") {
+        return refuse(
+            Code::ARCHIVE_REFUSED,
+            "compressed stream: the border decompresses nothing (an unbounded expansion is \
+             a resource claim the caller never made)",
+        );
+    }
+    Ok(())
+}
+
+/// The weak single-byte pickle evidence — see `sniff`'s header comment. Called only where
+/// the length-prefix arithmetic or the header parse has ALREADY refused: it can rename a
+/// refusal, never create one.
+fn sniff_weak(head: &[u8]) -> Result<()> {
     if head.first() == Some(&0x80) && matches!(head.get(1), Some(2..=5)) {
         return refuse(
             Code::PICKLE_REFUSED,
@@ -112,13 +134,6 @@ pub fn sniff(head: &[u8]) -> Result<()> {
         return refuse(
             Code::PICKLE_REFUSED,
             "protocol-0/1 pickle opening opcode: refused on the magic, nothing interpreted",
-        );
-    }
-    if head.starts_with(b"\x1f\x8b") || head.starts_with(b"BZh") || head.starts_with(b"\xfd7zXZ") {
-        return refuse(
-            Code::ARCHIVE_REFUSED,
-            "compressed stream: the border decompresses nothing (an unbounded expansion is \
-             a resource claim the caller never made)",
         );
     }
     Ok(())
@@ -196,6 +211,7 @@ pub fn read_header(path: &Path) -> Result<SourceHeader> {
     let n = read_upto(&mut f, &mut head)?;
     sniff(&head[..n])?;
     if n < 8 {
+        sniff_weak(&head[..n])?;
         return refuse(
             Code::CARRIER_TRUNCATED,
             format!("{n} bytes: too short to carry an 8-byte header length"),
@@ -203,8 +219,12 @@ pub fn read_header(path: &Path) -> Result<SourceHeader> {
     }
     let declared = u64::from_le_bytes(head[0..8].try_into().unwrap());
 
-    // Refuse BEFORE the allocation, against both the cap and the real file.
+    // Refuse BEFORE the allocation, against both the cap and the real file. Only when the
+    // arithmetic refuses may the weak pickle bytes rename the refusal — a length the cap
+    // and the file both accept is a carrier, whatever its low byte spells (the real H3
+    // diffusers shard-1 header is 0x…28 B long, and 0x28 is pickle MARK).
     if declared > limits::CARRIER_HEADER_MAX_BYTES as u64 {
+        sniff_weak(&head[..n])?;
         return refuse(
             Code::CARRIER_HEADER_CAP,
             format!(
@@ -218,6 +238,7 @@ pub fn read_header(path: &Path) -> Result<SourceHeader> {
         None => return refuse(Code::ARITH_OVERFLOW, "header length + 8 overflows"),
     };
     if data_start > file_len {
+        sniff_weak(&head[..n])?;
         return refuse(
             Code::CARRIER_TRUNCATED,
             format!("header claims {declared} B but the file holds {file_len} B in total"),
@@ -229,7 +250,14 @@ pub fn read_header(path: &Path) -> Result<SourceHeader> {
     f.read_exact(&mut buf)
         .map_err(|e| io(format!("read {declared} header bytes"), e))?;
 
-    parse_header(&buf, data_start, Some(file_len))
+    parse_header(&buf, data_start, Some(file_len)).map_err(|e| {
+        // A sub-cap length whose "header" is not carrier JSON: if the opening byte is a
+        // pickle opcode, the honest name is pickle, not a JSON grammar refusal.
+        match sniff_weak(&head[..n]) {
+            Err(p) => p,
+            Ok(()) => e,
+        }
+    })
 }
 
 /// The header bytes alone → the decoded, geometry-checked shape. Separated from IO so a
