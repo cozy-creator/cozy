@@ -63,7 +63,7 @@ func fakeWorker() int {
 	// forwards whatever it was handed — an arm that wants the refusal simply is not
 	// handed one.
 	ctx := context.Background()
-	if tok := os.Getenv("COZY_BOOTSTRAP_CREDENTIAL"); tok != "" {
+	if tok := os.Getenv("COZY_BOOTSTRAP_CREDENTIAL"); tok != "" { //cozy:allow the adversary plays the SUPERVISOR, whose side of the #449 contract IS "read the handed credential from the child environment" — the runtime's Python does exactly this
 		ctx = metadata.AppendToOutgoingContext(ctx, "cozy-bootstrap", tok)
 	}
 	stream, err := pb.NewWorkerClient(conn).Control(ctx)
