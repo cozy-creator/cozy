@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"time"
 
@@ -175,8 +176,11 @@ func sectionAPIArms() {
 
 	head("the credential file")
 	info, err := os.Stat(filepath.Join(root, "client.cred"))
+	// Unix mode bits are a fiction on Windows (Go reports 0666 for every file); the
+	// boundary there is the user profile's ACL, so the bit assertion is Unix-only.
+	modeOK := err == nil && (runtime.GOOS == "windows" || info.Mode().Perm() == 0o600)
 	check("the CLI credential is handed over through a 0600 file, never argv",
-		err == nil && info.Mode().Perm() == 0o600, fmt.Sprintf("%v", info.Mode().Perm()))
+		modeOK, fmt.Sprintf("%v", info.Mode().Perm()))
 	logBody, _ := os.ReadFile(filepath.Join(root, "driver-service.log"))
 	check("and the service's own log never contains it",
 		!strings.Contains(string(logBody), svc.token), fmt.Sprintf("%d B of log", len(logBody)))

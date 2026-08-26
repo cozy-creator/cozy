@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"runtime"
 
 	"github.com/cozy-creator/cozy-creator-v2/internal/exit"
 	"github.com/cozy-creator/cozy-creator-v2/internal/home"
@@ -90,7 +91,10 @@ func ClientCredential(l home.Layout) (secret.Value, *exit.Error) {
 	// The mode is CHECKED, not assumed. A credential that became group- or
 	// world-readable (an inherited umask, a careless copy) is a refusal: reading it
 	// anyway would be the client agreeing to a leak the server tried to prevent.
-	if perm := info.Mode().Perm(); perm&0o077 != 0 {
+	// On Windows, Unix mode bits are a fiction (Go reports 0666 for every file) — the
+	// boundary there is the user profile's ACL, which already scopes COZY_HOME to the
+	// user, so the bits are not consulted.
+	if perm := info.Mode().Perm(); perm&0o077 != 0 && runtime.GOOS != "windows" {
 		return secret.Value{}, exit.New(exit.Credential,
 			"%s is mode %#o; the local client credential is 0600 or it is not used", l.Client, perm).
 			WithRemedy("restart the LocalService: every launch mints a fresh pair").
