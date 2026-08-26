@@ -4,8 +4,8 @@ import (
 	"encoding/json"
 	"strings"
 
-	"github.com/cozy-creator/cozy-creator-v2/internal/coord"
 	"github.com/cozy-creator/cozy-creator-v2/internal/exit"
+	"github.com/cozy-creator/cozy-creator-v2/internal/orchestrator"
 )
 
 // THE JOB HALF of an installed generation (cl-004). A job is an attempt class on the one
@@ -19,7 +19,7 @@ import (
 // component set and no construction digest on a job record — a job has no model
 // residency at all (cr-009 §2).
 
-// JobResourceCap is the coordinator's declared bound for one local job attempt. Jobs are
+// JobResourceCap is the orchestrator's declared bound for one local job attempt. Jobs are
 // CPU-class here: the census-shaped work this host runs reads canonical headers and
 // derives projections, and a job that needs a card declares `gpu_count` on its own
 // surface, which the record below carries as a FLOOR.
@@ -42,51 +42,58 @@ type JobFacts struct {
 	GPUCount  int64
 }
 
-// JobSpec builds the EndpointSpec that makes ONE job function's worker resident. It is
-// the job lane's `Facts.Spec`: same supervisor, same venv, same device envelope, a
-// JobDirective instead of a ServingDirective.
+// JobSpec builds the WorkerLaunchSpec that makes ONE job function's worker resident. It
+// is the job lane's `Facts.Spec`: same worker, same venv, same device envelope, a
+// JobDirective instead of a placement set.
 //
-// ONE WORKER PER (endpoint, generation, job function), and it is RECLAIMED at its
-// terminal like every other job worker: one immutable build, one bounded attempt,
-// terminal, reclaim (worker-protocol, cr-009). Deep queueing is the COORDINATOR's — the
-// dispatch queue holds the work and select-or-start makes the next worker resident — and
-// it does not require keeping a job worker warm after it finishes. Warm persistence is a
-// serving concern and stays one.
-func (f *Facts) JobSpec(function string, devices []string) (coord.EndpointSpec, *JobFacts, *exit.Error) {
+// A JOB WORKER HOSTS NO PLACEMENT. Its DesiredPlacement carries `Jobs` and no bindings,
+// which is what puts the DesiredWorkerState's `mode` oneof on the job branch — a worker is
+// in exactly ONE mode until the next revision.
+//
+// ONE WORKER PER (endpoint, install, job function), and it is RECLAIMED at its outcome
+// like every other job worker: one immutable build, one bounded attempt, outcome, reclaim
+// (worker-protocol, cr-009). Deep queueing is the ORCHESTRATOR's — the dispatch queue holds
+// the work and select-or-start makes the next worker resident — and it does not require
+// keeping a job worker warm after it finishes. Warm persistence is a serving concern and
+// stays one.
+func (f *Facts) JobSpec(function string, devices []string) (orchestrator.WorkerLaunchSpec, *JobFacts, *exit.Error) {
 	facts, e := f.Job(function)
 	if e != nil {
-		return coord.EndpointSpec{}, nil, e
+		return orchestrator.WorkerLaunchSpec{}, nil, e
 	}
-	spec := coord.EndpointSpec{
-		Endpoint:   f.Generation.Endpoint,
-		ReleaseID:  ReleaseID(f.Generation),
-		Generation: f.Generation.ID,
+	spec := orchestrator.WorkerLaunchSpec{
+		Placement: orchestrator.DesiredPlacement{
+			Endpoint:         f.Install.Endpoint,
+			ReleaseID:        ReleaseID(f.Install),
+			InstallID:        f.Install.ID,
+			DescriptorDigest: f.Install.Descriptor,
+			Jobs: []*orchestrator.JobPlan{{
+				Function:     facts.Name,
+				DescriptorID: facts.DescriptorID,
+				Outputs:      facts.Outputs,
+				// The record's key set is CLOSED at both ends: `plan.py::JobBinding.read`
+				// refuses an unknown key, exactly as the binding record's reader does.
+				Record: map[string]any{
+					"job_descriptor_id":           facts.DescriptorID,
+					"build_id":                    ReleaseID(f.Install),
+					"project":                     f.Source,
+					"job":                         facts.Name,
+					"gpu_count":                   facts.GPUCount,
+					"publishes":                   facts.Publishes,
+					"emits_media":                 false,
+					"gpu_rate_micro_usd_per_hour": int64(0),
+					"cap_micro_usd":               int64(0),
+					"reclaim_on_terminal":         true,
+				},
+				RSSCap: jobRSSBudget,
+			}},
+		},
 		// The same entry the serving lane uses: the runtime's own public verb (spec.go).
-		Python:   Binary(f.Generation.Dir),
+		Python:   Binary(f.Install.Dir),
 		Args:     []string{"serve"},
 		Dir:      f.Source,
 		Devices:  devices,
 		GraceSec: 3,
-		Jobs: []*coord.JobPlan{{
-			Function:     facts.Name,
-			DescriptorID: facts.DescriptorID,
-			Outputs:      facts.Outputs,
-			// The record's key set is CLOSED at both ends: `plan.py::JobBinding.read`
-			// refuses an unknown key, exactly as the binding record's reader does.
-			Record: map[string]any{
-				"job_descriptor_id":           facts.DescriptorID,
-				"build_id":                    ReleaseID(f.Generation),
-				"project":                     f.Source,
-				"job":                         facts.Name,
-				"gpu_count":                   facts.GPUCount,
-				"publishes":                   facts.Publishes,
-				"emits_media":                 false,
-				"gpu_rate_micro_usd_per_hour": int64(0),
-				"cap_micro_usd":               int64(0),
-				"reclaim_on_terminal":         true,
-			},
-			RSSCap: jobRSSBudget,
-		}},
 	}
 	return spec, facts, nil
 }
@@ -109,7 +116,7 @@ func (f *Facts) Job(function string) (*JobFacts, *exit.Error) {
 	var said struct {
 		DescriptorID string `json:"job_descriptor_id"`
 	}
-	if e := f.Runtime.call(&said, "describe", function); e != nil {
+	if e := f.RuntimeCLI.call(&said, "describe", function); e != nil {
 		return nil, e
 	}
 	if said.DescriptorID == "" {
@@ -159,7 +166,7 @@ func (f *Facts) jobEntry(function string) (json.RawMessage, *exit.Error) {
 		known = "no jobs"
 	}
 	return nil, exit.Named(exit.NotFound, "unknown_job",
-		"%s registers no job named %q", f.Generation.Endpoint, function).
+		"%s registers no job named %q", f.Install.Endpoint, function).
 		WithRemedy("it registers: %s", known).
-		WithNext("cozy describe " + f.Generation.Endpoint)
+		WithNext("cozy describe " + f.Install.Endpoint)
 }

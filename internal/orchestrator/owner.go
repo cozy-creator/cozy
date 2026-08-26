@@ -1,0 +1,510 @@
+package orchestrator
+
+import (
+	"bytes"
+	"context"
+	"crypto/x509"
+	"fmt"
+	"os"
+	"path/filepath"
+	"strings"
+	"time"
+
+	"google.golang.org/grpc"
+	"google.golang.org/grpc/credentials"
+	"google.golang.org/grpc/credentials/insecure"
+
+	"github.com/cozy-creator/cozy-creator-v2/internal/canonical"
+	"github.com/cozy-creator/cozy-creator-v2/internal/exit"
+	pb "github.com/cozy-creator/cozy-creator-v2/protocol/cozy/worker/v1"
+)
+
+// THE RECORDOWNER SIDE of th-024's orientation (#436/#446/#454, renamed by #481 — bare
+// "owner" is retired and the formal role is RecordOwner): the WORKER hosts `WorkerControl`
+// and THIS side dials it, claims it, reconciles its ONE snapshot, and only then
+// dispatches. One goroutine per worker owns the whole conversation; the `session` is that
+// stream's sender half, fenced by the control stream generation the worker minted.
+//
+// LAUNCH TIER (#437): record_owner_epoch is the constant 1 — this service is the one
+// RecordOwner of every worker it spawns or connects to; the machinery that MINTS competing
+// epochs is the hub's Wave-2 lease. The bearer credential (#445/#449/#463) rides
+// `Claim.proof`: for a spawned worker it is the per-spawn bootstrap credential this
+// launcher minted; for a connected worker it is the provisioned renter access token.
+
+const recordOwnerEpoch = 1
+
+// recordOwnerID names this owner on Claim. Stable per service run is enough at launch:
+// equal-epoch claims from the SAME RecordOwner are reconnects, anything else is refused.
+const recordOwnerID = "cozy-local-client"
+
+type session struct {
+	bootID     string
+	generation uint64
+	instanceID string
+	out        chan *pb.RecordOwnerFrame
+}
+
+func (s *session) send(m *pb.RecordOwnerFrame) {
+	defer func() { _ = recover() }() // a closed stream is not an error worth a panic
+	s.out <- m
+}
+
+// schemaDigest is THE FENCE (#530-A1), as the 32 raw bytes the wire carries. It is derived
+// from the schema this binary was generated against — `wire_identity.go`'s SchemaDigest —
+// so a stale vendored copy cannot spell it without BEING the schema it names. WIRE_MINOR
+// could not do this job: the minor is the ADDITIVE train, it does not move for a breaking
+// in-place revision, and all three stale bindings sat there declaring 0 at each other.
+func schemaDigest() []byte {
+	raw, err := canonical.Raw(pb.SchemaDigest)
+	if err != nil {
+		// Unreachable by construction: regen.sh writes the constant and this repo's CI
+		// byte-compares the whole file set against it. A panic here beats dialing with a
+		// fence nobody can check.
+		panic("the vendored wire_identity.go carries an unspellable schema digest: " + err.Error())
+	}
+	return raw
+}
+
+// attach owns one worker's control conversation for the life of its process: read the
+// published address, dial, claim, reconcile, direct, then pump frames. On a stream drop
+// with the process still alive it re-dials and RE-CLAIMS the same boot (the worker mints
+// a fresh control generation and resends its snapshot; replay covers the durables).
+func (c *Orchestrator) attach(w *worker) {
+	for {
+		c.mu.Lock()
+		current, live := c.workers[w.instanceID]
+		closing := c.closing
+		c.mu.Unlock()
+		if closing || !live || current != w || w.exited {
+			return
+		}
+		addr, e := c.workerAddr(w)
+		if e != nil {
+			c.logf("worker %s: %s", w.instanceID, e.Message)
+			return
+		}
+		err := c.converse(w, addr)
+		if err != nil {
+			c.logf("worker %s: control stream ended: %s", w.instanceID, err)
+		}
+		c.mu.Lock()
+		gone := w.exited || c.closing
+		c.mu.Unlock()
+		if gone {
+			return
+		}
+		// The process is alive and the stream is not: redial. The cadence is a sampling
+		// resolution (the worker republishes nothing; its listener persists), not a bound.
+		time.Sleep(200 * time.Millisecond)
+	}
+}
+
+// workerAddr resolves the dialable address: the remote spec's own, or the file-handoff
+// `control.addr` the spawned worker publishes after binding (#436 discovery contract).
+// The wait is bounded by the PROCESS: a worker that dies before binding is the answer.
+func (c *Orchestrator) workerAddr(w *worker) (string, *exit.Error) {
+	if w.spec.Connection != nil {
+		return w.spec.Connection.Addr, nil
+	}
+	addrFile := filepath.Join(c.opt.Layout.WorkerDir(w.instanceID), "run", "control.addr")
+	for {
+		data, err := os.ReadFile(addrFile)
+		if err == nil && len(data) > 0 {
+			return strings.TrimSpace(string(data)), nil
+		}
+		c.mu.Lock()
+		dead := w.exited
+		c.mu.Unlock()
+		if dead {
+			return "", exit.New(exit.Failed,
+				"the worker exited before publishing its control address").
+				WithRemedy("its log is %s", w.logPath)
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+}
+
+// dialWorker opens the channel: insecure over the unix socket / loopback a spawned worker
+// binds; TLS with the PINNED cert for a remote one (#445 — trusting exactly that PEM is
+// the fingerprint pin; never mTLS).
+func dialWorker(addr string, remote *WorkerConnection) (*grpc.ClientConn, error) {
+	if remote != nil && remote.CACert != "" {
+		pem, err := os.ReadFile(remote.CACert)
+		if err != nil {
+			return nil, fmt.Errorf("reading the pinned worker cert: %w", err)
+		}
+		pool := x509.NewCertPool()
+		if !pool.AppendCertsFromPEM(pem) {
+			return nil, fmt.Errorf("%s holds no usable certificate", remote.CACert)
+		}
+		creds := credentials.NewClientTLSFromCert(pool, "")
+		return grpc.NewClient(addr, grpc.WithTransportCredentials(creds))
+	}
+	target := addr
+	if strings.HasPrefix(addr, "unix:") || strings.HasPrefix(addr, "/") {
+		target = "unix:" + strings.TrimPrefix(addr, "unix:")
+	}
+	return grpc.NewClient(target, grpc.WithTransportCredentials(insecure.NewCredentials()))
+}
+
+// converse runs ONE claimed stream to its end: Claim -> ClaimAck -> WorkerSnapshot ->
+// SnapshotAck -> DesiredWorkerState -> frames. Returns when the stream closes.
+func (c *Orchestrator) converse(w *worker, addr string) error {
+	conn, err := dialWorker(addr, w.spec.Connection)
+	if err != nil {
+		return err
+	}
+	defer conn.Close()
+	client := pb.NewWorkerControlClient(conn)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	stream, err := client.Control(ctx)
+	if err != nil {
+		return err
+	}
+	s := &session{instanceID: w.instanceID, out: make(chan *pb.RecordOwnerFrame, 32)}
+	go func() {
+		for m := range s.out {
+			if err := stream.Send(m); err != nil {
+				return
+			}
+		}
+	}()
+	defer close(s.out)
+
+	proof := w.bootstrap.Reveal()
+	if w.spec.Connection != nil {
+		proof = w.spec.Connection.Token.Reveal()
+	}
+	s.send(&pb.RecordOwnerFrame{Msg: &pb.RecordOwnerFrame_Claim{Claim: &pb.Claim{
+		RecordOwnerEpoch: recordOwnerEpoch,
+		RecordOwnerId:    recordOwnerID,
+		WorkerId:         w.spec.WorkerID(),
+		WireMinor:        pb.WireMinor,
+		Proof:            []byte(proof),
+		// THE SCHEMA FENCE RIDES THE CLAIM and is checked before any other body field, in
+		// BOTH directions: a stale RecordOwner sends none, a stale worker answers with
+		// none, and either way the stream closes instead of a renumbered field being
+		// misparsed mid-conversation.
+		WireSchemaDigest: schemaDigest(),
+	}}}) //cozy:allow-reveal the one place the credential leaves this process: Claim.proof over the worker's own channel
+
+	// WatchProgress rides a PHYSICALLY separate connection (01) once the claim lands;
+	// opened after ClaimAck below.
+	var watchCancel context.CancelFunc
+	defer func() {
+		if watchCancel != nil {
+			watchCancel()
+		}
+	}()
+
+	for {
+		frame, err := stream.Recv()
+		if err != nil {
+			c.dropSession(s)
+			return nil
+		}
+		switch m := frame.Msg.(type) {
+		case *pb.WorkerFrame_ClaimAck:
+			ack := m.ClaimAck
+			// THE SCHEMA DIGEST IS READ FIRST — before `accepted`, before the rejection
+			// code, before anything. A peer that does not speak this schema cannot be
+			// trusted to have MEANT the enum value it put in `rejection`, so reading that
+			// first would be believing a number from a shape we have just established we
+			// do not share.
+			if e := c.schemaFence(w, ack.WireSchemaDigest); e != nil {
+				c.refuseClaim(w, e)
+				return fmt.Errorf("%s", e.Message)
+			}
+			if !ack.Accepted {
+				c.logf("Claim REFUSED by %s: %s", w.instanceID,
+					pb.ClaimRejection_name[int32(ack.Rejection)])
+				return fmt.Errorf("claim refused: %s", pb.ClaimRejection_name[int32(ack.Rejection)])
+			}
+			s.bootID, s.generation = ack.WorkerBootId, ack.ControlStreamGeneration
+			c.onClaimAck(w, s, ack)
+			watchCancel = c.openWatch(addr, w, s)
+		case *pb.WorkerFrame_BootFailure:
+			c.logf("BOOT FAILURE from %s: %s (%s)", m.BootFailure.WorkerInstanceId,
+				pb.BootFailureReason_name[int32(m.BootFailure.Reason)], m.BootFailure.Detail)
+			return nil
+		case *pb.WorkerFrame_Snapshot:
+			if c.fenced(s, m.Snapshot.RecordOwnerEpoch, m.Snapshot.ControlStreamGeneration,
+				m.Snapshot.WorkerBootId) {
+				continue
+			}
+			c.onSnapshot(w, s, m.Snapshot)
+		case *pb.WorkerFrame_ObservedState:
+			r := m.ObservedState
+			if c.fenced(s, r.RecordOwnerEpoch, r.ControlStreamGeneration, r.WorkerBootId) {
+				continue
+			}
+			c.onObserved(s, r)
+		case *pb.WorkerFrame_AttemptAccepted:
+			a := m.AttemptAccepted
+			if c.fenced(s, a.RecordOwnerEpoch, a.ControlStreamGeneration, a.WorkerBootId) {
+				continue
+			}
+			c.onAccepted(s, a)
+		case *pb.WorkerFrame_AttemptOutcome:
+			t := m.AttemptOutcome
+			if c.fenced(s, t.RecordOwnerEpoch, t.ControlStreamGeneration, t.WorkerBootId) {
+				continue
+			}
+			c.onOutcome(s, t)
+		case *pb.WorkerFrame_CheckpointRequest:
+			r := m.CheckpointRequest
+			if c.fenced(s, r.RecordOwnerEpoch, r.ControlStreamGeneration, r.WorkerBootId) {
+				continue
+			}
+			if !c.jobMode(s) {
+				s.send(checkpointReceipt(s, r, "",
+					pb.CheckpointOutcome_CHECKPOINT_OUTCOME_REFUSED,
+					pb.CheckpointFaultCode_CHECKPOINT_FAULT_CODE_NOT_JOB_MODE,
+					"this worker is in serving mode; the checkpoint lane is the job lane's"))
+				continue
+			}
+			c.onCheckpoint(s, r)
+		case *pb.WorkerFrame_CheckpointAck:
+			// the worker's echo of a receipt already durable here; nothing to apply
+		}
+	}
+}
+
+// schemaFence is #530-A1's owner half. Absence IS the stale signal: a pre-rev-2 binding
+// cannot populate the field at all, so an empty digest names a peer revisions behind
+// rather than a peer that chose not to answer. R8's absence-default rule is exempted here
+// deliberately and by the rev — this is a breaking in-place revision on an unreleased
+// major, where an older peer MUST NOT interoperate.
+func (c *Orchestrator) schemaFence(w *worker, declared []byte) *exit.Error {
+	ours := schemaDigest()
+	if bytes.Equal(declared, ours) {
+		return nil
+	}
+	spelled, _ := canonical.Spell(declared)
+	said := spelled
+	if said == "" {
+		said = "nothing — a binding older than the fence itself"
+	}
+	return exit.Named(exit.Conflict, "wire_schema_mismatch",
+		"the worker at this address declares wire schema %s and this build speaks %s",
+		said, pb.SchemaDigest).
+		WithRemedy("the two ends were generated from different `cozy.worker.v1` schemas, so "+
+			"no later frame is worth parsing: a renumbered field would be misparsed rather "+
+			"than refused. Both sides regenerate from one worker-protocol revision (this "+
+			"build is rev %d)", pb.WireSchemaRev)
+}
+
+// fenced evaluates the three-field envelope in its fixed order, BEFORE any body field is
+// interpreted (02 §0).
+func (c *Orchestrator) fenced(s *session, epoch, generation uint64, bootID string) bool {
+	if epoch != recordOwnerEpoch {
+		c.logf("DROPPED: epoch %d is not this owner's %d", epoch, recordOwnerEpoch)
+		return true
+	}
+	if generation != s.generation {
+		c.logf("DROPPED: superseded control generation %d (live %d)", generation, s.generation)
+		return true
+	}
+	if bootID != s.bootID {
+		c.logf("DROPPED: boot %q is not this stream's %q", bootID, s.bootID)
+		return true
+	}
+	return false
+}
+
+// onClaimAck binds the claimed boot to the worker slot: identity checks, the durable
+// binding, and the session registry (the ClaimAck is the flip's Register successor).
+func (c *Orchestrator) onClaimAck(w *worker, s *session, ack *pb.ClaimAck) {
+	c.logf("ClaimAck boot=%s generation=%d instance=%s minor=%d schema=rev%d backend=%q device=%q",
+		ack.WorkerBootId, ack.ControlStreamGeneration, ack.WorkerInstanceId, ack.WireMinor,
+		pb.WireSchemaRev, ack.Resources.GetBackend(), ack.Resources.GetDeviceName())
+	if ack.WorkerInstanceId != "" && ack.WorkerInstanceId != w.instanceID {
+		// The thing at this address is not the worker this slot spawned. Nothing is
+		// dispatched to it; the stream ends on the next recv when we stop talking.
+		c.refuseClaim(w, exit.Named(exit.Conflict, "worker_instance_mismatch",
+			"the worker at this address answers as instance %q and this slot is %q",
+			ack.WorkerInstanceId, w.instanceID))
+		return
+	}
+	if e := releasePin(w, ack.WorkerReleaseId); e != nil {
+		c.refuseClaim(w, e)
+		return
+	}
+	if e := c.opt.Store.BindSession(w.instanceID, ack.WorkerBootId,
+		int64(ack.ControlStreamGeneration)); e != nil {
+		c.logf("boot binding for %s REFUSED: %s", w.instanceID, e.Message)
+		return
+	}
+	c.mu.Lock()
+	if w.bootID != "" && w.bootID != ack.WorkerBootId {
+		delete(c.sessions, w.bootID)
+	}
+	c.sessions[ack.WorkerBootId] = s
+	w.bootID = ack.WorkerBootId
+	c.mu.Unlock()
+}
+
+// releasePin is the RELEASE FENCE on a claim, and #505's carried-not-verified gap closed.
+//
+// A rented pod is supposed to have installed the same endpoint release this host did — the
+// plan ids the orchestrator is about to name in a Directive are the digests of THAT
+// release's bindings, and #506a is what makes those digests comparable across machines at
+// all. The check existed and could not fire for a rental: a pod that declared NOTHING was
+// admitted, because "carried" and "verified" were the same branch.
+//
+// So the rule is split by lane. A SPAWNED worker may be silent — this launcher passed it
+// `--release-id`, so the identity is ours by construction. An ATTACHED remote worker may
+// NOT: silence there is a pod that will not say what it is serving, which is the one case
+// the pin exists for. In both lanes a stated release that disagrees refuses.
+func releasePin(w *worker, declared string) *exit.Error {
+	pinned := w.spec.Placement.ReleaseID
+	if pinned == "" {
+		return nil // nothing to pin against — an uninstalled dev spec names no release
+	}
+	if declared == "" {
+		if w.spec.Connection == nil {
+			return nil
+		}
+		return exit.Named(exit.Conflict, "release_undeclared",
+			"this pod's ClaimAck declares no endpoint release, and this host pinned %q", pinned).
+			WithRemedy("a rented pod installs the release this host is dispatching against; " +
+				"one that will not say which release it serves cannot be shown to have it, " +
+				"and the plan ids in the directive would be resolved against a guess").
+			WithNext("cozy rent release " + rentalOf(w.spec.Placement.Endpoint) + " --yes")
+	}
+	if declared != pinned {
+		return exit.Named(exit.Conflict, "release_mismatch",
+			"this worker serves release %q and this host pinned %q", declared, pinned).
+			WithRemedy("the pod installed a different release; its binding plan ids are "+
+				"digests of ITS release and not of %q, so nothing this host dispatches "+
+				"would resolve there", pinned)
+	}
+	return nil
+}
+
+// rentalOf recovers the rental id out of a pinned slot name (`org/name@rnt-…`), so the
+// `next` line names the pod the user would actually act on.
+func rentalOf(slot string) string {
+	if _, id, ok := strings.Cut(slot, "@"); ok {
+		return id
+	}
+	return "<rental>"
+}
+
+// refuseClaim records this owner's verdict on the thing at the other end and logs it. The
+// verdict is kept on the worker so a WAITER gets the answer: before this, a refused claim
+// simply stopped the conversation and the request waited out the silence window to be told
+// the worker was "stalled" — a network sentence for an identity fact.
+func (c *Orchestrator) refuseClaim(w *worker, e *exit.Error) {
+	c.mu.Lock()
+	w.refusal = e
+	c.mu.Unlock()
+	c.logf("REFUSING the claimed worker %s (%s): %s", w.instanceID, e.ErrName(), e.Message)
+}
+
+// onSnapshot is THE ONE DIGEST-ACKED BARRIER (§5). The three-message
+// SnapshotBegin/Entry/End form could only be bounded by a counted-entries check, which is
+// a claim; a single canonical document is bounded by its own digest, and a truncated
+// snapshot cannot match one. So the count check is GONE and a stronger thing replaces it.
+//
+// The order is not negotiable: recompute over the resident bytes, parse under
+// unknown-field refusal, reconcile every held attempt DURABLY, and only then ack the exact
+// (snapshot_id, snapshot_digest). Dispatch stays CLOSED until the worker sees that ack, so
+// a snapshot this owner could not read is one nothing is ever dispatched against.
+func (c *Orchestrator) onSnapshot(w *worker, s *session, snap *pb.WorkerSnapshot) {
+	refuse := func(format string, args ...any) {
+		c.logf("WorkerSnapshot %s from %s NOT acknowledged: "+format,
+			append([]any{snap.SnapshotId, w.instanceID}, args...)...)
+	}
+	computed := canonical.Digest(snap.SnapshotCanonicalBytes)
+	if !bytes.Equal(computed, snap.SnapshotDigest) {
+		refuse("snapshot_digest %x does not hash the %d resident bytes (%x)",
+			snap.SnapshotDigest, len(snap.SnapshotCanonicalBytes), computed)
+		return
+	}
+	doc, err := canonical.Read(snap.SnapshotCanonicalBytes, &pb.WorkerSnapshotBody{})
+	if err != nil {
+		refuse("the snapshot document is inadmissible (%s)", err)
+		return
+	}
+	// The accepted set travels beside the body as the EXACT bytes the worker journaled,
+	// never a re-serialization, and its digest lives INSIDE the body. Checking one against
+	// the other is what makes "the set it is serving" a fact rather than a claim.
+	setDigest, _ := canonical.Spell(canonical.Digest(snap.AcceptedPlacementSetCanonicalBytes))
+	if declared := doc.Str("accepted_placement_set_digest"); declared != "" && declared != setDigest {
+		refuse("the body names accepted set %s and the %d bytes beside it hash to %s",
+			shortDigest(declared), len(snap.AcceptedPlacementSetCanonicalBytes),
+			shortDigest(setDigest))
+		return
+	}
+
+	held := doc.List("held_attempts")
+	for _, ha := range held {
+		requestID, ordinal := ha.Str("request_id"), uint64(ha.Int("attempt_ordinal"))
+		if e := c.opt.Store.Recover(requestID, int64(ordinal), s.bootID); e != nil {
+			c.logf("held attempt %s#%d REFUSED: %s", requestID, ordinal, e.Message)
+			continue
+		}
+		_, blocked := c.opt.Store.NextOrdinal(requestID)
+		c.logf("held attempt %s#%d (%s) is an OPEN OBLIGATION — the ordinal gate now "+
+			"refuses: %s", requestID, ordinal,
+			trimEnum(pb.AttemptState_name[int32(ha.Int("state"))], "ATTEMPT_STATE_"),
+			briefOf(blocked))
+	}
+	// The worker's own admission facts arrive with the snapshot, so the barrier's other
+	// side is readable before the first observed state: admission reports CLOSED until the
+	// ack lands, which is exactly what "dispatch stays closed" looks like on the wire.
+	c.mu.Lock()
+	w.acceptedRevision = uint64(doc.Int("accepted_desired_state_revision"))
+	w.convergedRevision = uint64(doc.Int("converged_revision"))
+	w.admissionGen = uint64(doc.Int("admission_generation"))
+	w.admission = pb.AdmissionState(doc.Int("admission_state"))
+	w.slots = int(doc.Int("available_attempt_slots"))
+	w.phase = pb.WorkerPhase(doc.Int("worker_phase"))
+	c.mu.Unlock()
+
+	ackMsg := &pb.SnapshotAck{SnapshotId: snap.SnapshotId, SnapshotDigest: snap.SnapshotDigest}
+	ackMsg.RecordOwnerEpoch, ackMsg.ControlStreamGeneration, ackMsg.WorkerBootId =
+		recordOwnerEpoch, s.generation, s.bootID
+	s.send(&pb.RecordOwnerFrame{Msg: &pb.RecordOwnerFrame_SnapshotAck{SnapshotAck: ackMsg}})
+	c.logf("snapshot %s (%s, %d B) acknowledged: %d held attempt(s), accepted revision %d, "+
+		"converged %d; dispatch is open", snap.SnapshotId,
+		shortDigest(shortNone(snap.SnapshotDigest)), len(snap.SnapshotCanonicalBytes),
+		len(held), doc.Int("accepted_desired_state_revision"), doc.Int("converged_revision"))
+	if w.spec.IsJob() {
+		c.sendJobDirective(s, w)
+		return
+	}
+	if e := c.converge(s, w, []DesiredPlacement{w.spec.Placement}); e != nil {
+		c.logf("the desired placement set for %s could not be issued: %s", w.instanceID, e.Message)
+	}
+}
+
+// openWatch opens the LOSSY progress lane on its own connection, bound to the claimed
+// generation. Its death is invisible to control; the redial cycle reopens it.
+func (c *Orchestrator) openWatch(addr string, w *worker, s *session) context.CancelFunc {
+	ctx, cancel := context.WithCancel(context.Background())
+	go func() {
+		conn, err := dialWorker(addr, w.spec.Connection)
+		if err != nil {
+			return
+		}
+		defer conn.Close()
+		open := &pb.ProgressOpen{}
+		open.RecordOwnerEpoch, open.ControlStreamGeneration, open.WorkerBootId =
+			recordOwnerEpoch, s.generation, s.bootID
+		watch, err := pb.NewWorkerControlClient(conn).WatchProgress(ctx, open)
+		if err != nil {
+			return
+		}
+		for {
+			p, err := watch.Recv()
+			if err != nil {
+				return
+			}
+			c.frames.publish(frameOf(p))
+		}
+	}()
+	return cancel
+}

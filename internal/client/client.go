@@ -232,8 +232,8 @@ func (c *Client) Endpoints() ([]api.EndpointRow, *exit.Error) {
 	return out.Endpoints, e
 }
 
-// Worker is one live worker, as the coordinator reports it. The fields are
-// `coord.WorkerFacts` on the wire; a client reads the ones it renders.
+// Worker is one live worker, as the orchestrator reports it. The fields are
+// `orchestrator.WorkerFacts` on the wire; a client reads the ones it renders.
 type Worker struct {
 	InstanceID string   `json:"instance_id"`
 	Endpoint   string   `json:"endpoint"`
@@ -266,19 +266,21 @@ func (c *Client) Workers() ([]Worker, *exit.Error) {
 	return out.Workers, e
 }
 
-// StartResult is the prewarm answer. `Resident` true means the route was idempotent and
-// nothing new was spawned.
+// StartResult is the prewarm answer. `Change` says WHICH of the three things happened —
+// `none`, `worker_started`, or `placement_added` (#484). The old `Resident bool` could
+// only answer "was it already there", which is true both of an idempotent no-op and of a
+// live worker that just gained a placement, and those are different answers.
 type StartResult struct {
 	InstanceID string `json:"instance_id"`
 	Endpoint   string `json:"endpoint"`
-	Resident   bool   `json:"resident"`
+	Change     string `json:"change"`
 	Note       string `json:"note"`
 }
 
 // StartWorker makes an endpoint resident. `warm` false asks the worker to skip its boot
 // warm pass — the route's `warm` field is omitted entirely when it is true, so the wire
 // carries a choice only when one was made.
-func (c *Client) StartWorker(endpoint string, warm bool) (StartResult, *exit.Error) {
+func (c *Client) EnsureWorker(endpoint string, warm bool) (StartResult, *exit.Error) {
 	var res StartResult
 	body := map[string]any{"endpoint": endpoint}
 	if !warm {
@@ -296,7 +298,7 @@ type StopResult struct {
 	Note       string `json:"note"`
 }
 
-func (c *Client) StopWorker(instance string) (StopResult, *exit.Error) {
+func (c *Client) ShutdownWorker(instance string) (StopResult, *exit.Error) {
 	var res StopResult
 	e := c.call("DELETE", "/v1/local/workers/"+instance, nil, &res)
 	return res, e

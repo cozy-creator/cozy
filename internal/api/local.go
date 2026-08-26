@@ -6,8 +6,8 @@ import (
 	"net/http"
 	"runtime"
 
-	"github.com/cozy-creator/cozy-creator-v2/internal/coord"
 	"github.com/cozy-creator/cozy-creator-v2/internal/exit"
+	"github.com/cozy-creator/cozy-creator-v2/internal/orchestrator"
 )
 
 // The LOCAL EXTENSION MODULE. Everything here is mounted under /v1/local/ so the boundary
@@ -29,7 +29,7 @@ type EndpointRow struct {
 func (s *Server) localEndpoints(w http.ResponseWriter, r *http.Request) {
 	rows := []EndpointRow{}
 	resident := map[string]bool{}
-	for _, f := range s.coord.Workers() {
+	for _, f := range s.orchestrator.Workers() {
 		resident[f.Endpoint] = true
 	}
 	if s.endpoints != nil {
@@ -39,13 +39,13 @@ func (s *Server) localEndpoints(w http.ResponseWriter, r *http.Request) {
 				continue
 			}
 			row := EndpointRow{
-				Endpoint: spec.Endpoint, ReleaseID: spec.ReleaseID,
-				Source: "dev", Resident: resident[spec.Endpoint], Functions: []string{},
+				Endpoint: spec.Placement.Endpoint, ReleaseID: spec.Placement.ReleaseID,
+				Source: "dev", Resident: resident[spec.Placement.Endpoint], Functions: []string{},
 			}
-			if spec.Generation != "" {
+			if spec.Placement.InstallID != "" {
 				row.Source = "generation"
 			}
-			for _, b := range spec.Bindings {
+			for _, b := range spec.Placement.Bindings {
 				row.Functions = append(row.Functions, b.Entrypoint)
 			}
 			rows = append(rows, row)
@@ -55,7 +55,7 @@ func (s *Server) localEndpoints(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) localWorkers(w http.ResponseWriter, r *http.Request) {
-	facts := s.coord.Workers()
+	facts := s.orchestrator.Workers()
 	s.ok(w, r, http.StatusOK, map[string]any{"workers": facts, "count": len(facts)})
 }
 
@@ -91,40 +91,44 @@ func (s *Server) startWorker(w http.ResponseWriter, r *http.Request) {
 	// resident), and the warm pass is a BIT-LEVEL input to the first real image, because
 	// the device-memory history it leaves is what cuDNN's algorithm selection reads.
 	if body.Warm != nil && !*body.Warm {
-		spec.NoWarm = true
+		spec.Warmup = orchestrator.WarmupNone
 	}
-	// Already resident is an IDEMPOTENT 200 (cozy-creator.md: "already serving = 0").
-	for _, f := range s.coord.Workers() {
-		if f.Endpoint == spec.Endpoint {
-			note := "already resident: this route is idempotent"
-			if spec.NoWarm {
-				// The flag asked for a boot that has already happened. Saying so is the
-				// difference between an idempotent verb and one that quietly ignores an
-				// argument — the same defect as a flag that parses and does nothing.
-				note += "; `warm:false` changed nothing — the resident worker was booted with its own warm setting"
-			}
-			s.ok(w, r, http.StatusOK, map[string]any{
-				"instance_id": f.InstanceID, "endpoint": f.Endpoint, "resident": true,
-				"note": note,
-			})
-			return
-		}
-	}
-	instance, e := s.coord.StartWorker(spec)
+	// EnsureWorker is idempotent by construction and SAYS WHAT IT DID (#484). `resident`
+	// is deleted: it answered "was it already there", which is true both of a no-op and of
+	// a live worker that just gained a placement, and a client that has to tell those apart
+	// cannot read it off a boolean.
+	instance, change, e := s.orchestrator.EnsureWorker(spec)
 	if e != nil {
 		s.refuseTyped(w, r, e)
 		return
 	}
-	s.ok(w, r, http.StatusAccepted, map[string]any{
-		"instance_id": instance, "endpoint": spec.Endpoint, "resident": false,
-		"note": "spawned; poll GET /v1/local/workers for intake READY",
+	note := map[orchestrator.WorkerChange]string{
+		orchestrator.ChangeNone: "already hosting this placement: this route is idempotent",
+		orchestrator.ChangeWorkerStarted: "spawned; poll GET /v1/local/workers until the " +
+			"placement's serving axis is DISPATCHABLE",
+		orchestrator.ChangePlacementAdded: "the live worker was converged onto a desired set " +
+			"carrying this placement; poll GET /v1/local/workers for its serving axis",
+	}[change]
+	if change == orchestrator.ChangeNone && spec.Warmup == orchestrator.WarmupNone {
+		// The flag asked for a boot that has already happened. Saying so is the
+		// difference between an idempotent verb and one that quietly ignores an
+		// argument — the same defect as a flag that parses and does nothing.
+		note += "; `warm:false` changed nothing — the resident worker was booted with its own warm setting"
+	}
+	status := http.StatusAccepted
+	if change == orchestrator.ChangeNone {
+		status = http.StatusOK
+	}
+	s.ok(w, r, status, map[string]any{
+		"instance_id": instance, "endpoint": spec.Placement.Endpoint,
+		"change": string(change), "note": note,
 	})
 }
 
 func (s *Server) stopWorker(w http.ResponseWriter, r *http.Request) {
 	instance := r.PathValue("instance_id")
 	found := false
-	for _, f := range s.coord.Workers() {
+	for _, f := range s.orchestrator.Workers() {
 		if f.InstanceID == instance {
 			found = true
 		}
@@ -140,7 +144,7 @@ func (s *Server) stopWorker(w http.ResponseWriter, r *http.Request) {
 	}
 	// The WHOLE process group drains and stops — the only yield mechanism there is. An
 	// attempt is never killed to improve queue latency and no suspend path exists.
-	s.coord.StopWorker(instance, coord.StopGrace)
+	s.orchestrator.ShutdownWorker(instance, orchestrator.StopGrace)
 	s.ok(w, r, http.StatusOK, map[string]any{"instance_id": instance, "stopped": true})
 }
 
@@ -175,7 +179,7 @@ func (s *Server) doctor(w http.ResponseWriter, r *http.Request) {
 		},
 		"counts":     counts,
 		"event_head": head,
-		"workers":    s.coord.Workers(),
+		"workers":    s.orchestrator.Workers(),
 	})
 }
 

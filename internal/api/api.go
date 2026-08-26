@@ -1,10 +1,10 @@
 // Package api is the LOCAL CLIENT API server (cl-006): the shared client contract's CORE
 // served on loopback by the one LocalService, plus an explicitly LOCAL extension module.
 //
-// It is a client of internal/coord and nothing else. Every submission still flows
-// coordinator → worker protocol → runtime; this package adds an HTTP shape, a typed error
+// It is a client of internal/orchestrator and nothing else. Every submission still flows
+// orchestrator → worker protocol → runtime; this package adds an HTTP shape, a typed error
 // envelope, and the event/media planes a browser needs. It opens no second door into the
-// runtime, and it cannot: it holds a *coord.Coordinator, and the coordinator's exported
+// runtime, and it cannot: it holds a *orchestrator.Orchestrator, and the orchestrator's exported
 // surface has no "run this" that bypasses the request record.
 //
 // # A loopback bind is not a boundary
@@ -50,10 +50,10 @@ import (
 	"strings"
 
 	"github.com/cozy-creator/cozy-creator-v2/internal/config"
-	"github.com/cozy-creator/cozy-creator-v2/internal/coord"
 	"github.com/cozy-creator/cozy-creator-v2/internal/exit"
 	"github.com/cozy-creator/cozy-creator-v2/internal/home"
 	"github.com/cozy-creator/cozy-creator-v2/internal/launch"
+	"github.com/cozy-creator/cozy-creator-v2/internal/orchestrator"
 	"github.com/cozy-creator/cozy-creator-v2/internal/records"
 )
 
@@ -63,24 +63,24 @@ const MaxBody = 8 << 20
 
 // Server is the local client API. One per LocalService.
 type Server struct {
-	coord  *coord.Coordinator
-	store  *records.Store
-	layout home.Layout
-	cfg    config.Config
-	creds  Credentials
-	addr   string
-	log    io.Writer
+	orchestrator *orchestrator.Orchestrator
+	store        *records.Store
+	layout       home.Layout
+	cfg          config.Config
+	creds        Credentials
+	addr         string
+	log          io.Writer
 	// bound names the loopback families actually listening ("ipv4", "ipv6"). It is what
 	// `doctor` reports, so the Host allowlist and reality can be compared.
 	bound []string
 
-	// endpoints resolves an endpoint ref to a spec the coordinator can start. It is the
+	// endpoints resolves an endpoint ref to a spec the orchestrator can start. It is the
 	// LOCAL module's resolver; the pod profile (cl-014) supplies its own.
 	endpoints Resolver
 
 	// rentals answers whether this host holds a pinned rental — EXISTENCE ONLY. It
 	// deliberately does not resolve the dial triple: the credential is obtained by the
-	// coordinator at dial time, so the HTTP layer never reads one, and a check here that
+	// orchestrator at dial time, so the HTTP layer never reads one, and a check here that
 	// loaded it would be a second exposure of the same secret to answer a question that
 	// did not need it.
 	rentals func(id string) *exit.Error
@@ -94,7 +94,7 @@ type Server struct {
 // `start` and the installed-generation lookup are its real implementation; the live
 // driver supplies a dev tree.
 type Resolver interface {
-	Resolve(endpoint string) (coord.EndpointSpec, *exit.Error)
+	Resolve(endpoint string) (orchestrator.WorkerLaunchSpec, *exit.Error)
 	// Jobs names the `@job` functions one installed endpoint registers, with the
 	// descriptor id each resolves to. The job submit route resolves a function to its
 	// digest through this and never lets a client name one (cl-004).
@@ -104,13 +104,13 @@ type Resolver interface {
 
 // Options is the frozen input to one API server.
 type Options struct {
-	Coordinator *coord.Coordinator
-	Cfg         config.Config
-	Creds       Credentials
-	Addr        string
-	Log         io.Writer
-	Endpoints   Resolver
-	Bound       []string
+	Orchestrator *orchestrator.Orchestrator
+	Cfg          config.Config
+	Creds        Credentials
+	Addr         string
+	Log          io.Writer
+	Endpoints    Resolver
+	Bound        []string
 	// Rentals answers whether an attached-worker id names a pod this host holds; nil =
 	// this host attaches no remote workers, and a submission that names one says so.
 	Rentals func(id string) *exit.Error
@@ -124,8 +124,8 @@ func New(opt Options) *Server {
 		opt.Log = io.Discard
 	}
 	return &Server{
-		coord: opt.Coordinator, store: opt.Coordinator.Store(),
-		layout: opt.Coordinator.Layout(), cfg: opt.Cfg, creds: opt.Creds,
+		orchestrator: opt.Orchestrator, store: opt.Orchestrator.Store(),
+		layout: opt.Orchestrator.Layout(), cfg: opt.Cfg, creds: opt.Creds,
 		addr: opt.Addr, log: opt.Log, endpoints: opt.Endpoints, bound: opt.Bound,
 		rentals: opt.Rentals, shutdown: opt.Shutdown,
 	}
@@ -334,7 +334,7 @@ func (s *Server) refuse(w http.ResponseWriter, r *http.Request, status int, code
 	s.logf("%s %s -> %d %s", r.Method, r.URL.Path, status, code)
 }
 
-// refuseTyped renders a coordinator/records refusal without inventing a second
+// refuseTyped renders a orchestrator/records refusal without inventing a second
 // vocabulary: the typed error's own name is the envelope code, and the shared exit
 // matrix decides the HTTP status. One mapping, in one place.
 func (s *Server) refuseTyped(w http.ResponseWriter, r *http.Request, e *exit.Error) {

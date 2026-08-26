@@ -1,4 +1,4 @@
-package coord
+package orchestrator
 
 import (
 	"os"
@@ -14,7 +14,7 @@ import (
 	pb "github.com/cozy-creator/cozy-creator-v2/protocol/cozy/worker/v1"
 )
 
-// Submission is one local request. The coordinator owns everything in it that decides
+// Submission is one local request. The orchestrator owns everything in it that decides
 // WHAT runs; the runtime owns everything about HOW.
 type Submission struct {
 	IdemKey    string // the caller's idempotency key
@@ -72,8 +72,8 @@ const MaxRequeues = 3
 // Submit records the request and dispatches its FIRST attempt. It is idempotent in the
 // strong sense: the same key with the same body answers with the recorded request and
 // its current attempt, and never starts a second execution. Re-dispatch is the
-// coordinator's requeue PROJECTION over a terminal, never a client repeating itself.
-func (c *Coordinator) Submit(s Submission) (string, uint64, *exit.Error) {
+// orchestrator's requeue PROJECTION over a terminal, never a client repeating itself.
+func (c *Orchestrator) Submit(s Submission) (string, uint64, *exit.Error) {
 	id, attempt, _, e := c.SubmitDetail(s)
 	return id, attempt, e
 }
@@ -82,7 +82,7 @@ func (c *Coordinator) Submit(s Submission) (string, uint64, *exit.Error) {
 // call started the work. A client that retried a timed-out POST needs "202, I started it"
 // and "200, this key was already yours" to be different answers, and inferring it from
 // equal request ids is a race.
-func (c *Coordinator) SubmitDetail(s Submission) (string, uint64, bool, *exit.Error) {
+func (c *Orchestrator) SubmitDetail(s Submission) (string, uint64, bool, *exit.Error) {
 	bodyDigest := s.BodyDigest
 	if bodyDigest == "" {
 		spelled, err := canonical.Spell(canonical.Digest(s.Payload))
@@ -152,10 +152,10 @@ func (c *Coordinator) SubmitDetail(s Submission) (string, uint64, bool, *exit.Er
 	return req.ID, attempt, true, nil
 }
 
-// Requeue is the coordinator's PROJECTION over a neutral terminal: an ABANDONED attempt
+// Requeue is the orchestrator's PROJECTION over a neutral terminal: an ABANDONED attempt
 // or an infra-class failure earns a NEW ordinal, a fresh grant and a fresh execution —
 // never a patch to the one that died. It is charged against the request's durable budget.
-func (c *Coordinator) Requeue(requestID, why string) {
+func (c *Orchestrator) Requeue(requestID, why string) {
 	n, e := c.opt.Store.ChargeRequeue(requestID, MaxRequeues)
 	if e != nil {
 		// THE REQUEST ENDS HERE, and it has to SAY so. Settling the row without emitting a
@@ -181,7 +181,7 @@ func (c *Coordinator) Requeue(requestID, why string) {
 	}
 	// THE REQUEUE IS A FACT THE MOMENT THE BUDGET IS CHARGED, and it is announced here —
 	// before dispatch, which may or may not find capacity. Announcing it only on the
-	// successful branch lost the fact exactly when it mattered most: the coordinator-kill
+	// successful branch lost the fact exactly when it mattered most: the orchestrator-kill
 	// arm requeued into a worker that was still loading, so the stream said `queued` and
 	// never said WHY, and a client could not tell a first dispatch from a retry.
 	c.emit(requestID, "request.requeued", 0, map[string]any{
@@ -214,7 +214,7 @@ func (c *Coordinator) Requeue(requestID, why string) {
 // A worker that cannot become dispatchable is a TERMINAL condition for the request, not a
 // longer wait. A request that queues forever behind a worker that died on boot is the
 // worst of both: no output and no answer.
-func (c *Coordinator) selectOrStart(req records.Request) {
+func (c *Orchestrator) selectOrStart(req records.Request) {
 	if c.opt.Endpoints == nil {
 		return
 	}
@@ -237,11 +237,11 @@ func (c *Coordinator) selectOrStart(req records.Request) {
 	}
 	stale := ""
 	for _, w := range c.workers {
-		if w.exited || w.spec.Endpoint != pinnedEndpoint(req.Endpoint, req.Worker) ||
+		if w.exited || w.spec.Placement.Endpoint != pinnedEndpoint(req.Endpoint, req.Worker) ||
 			w.spec.IsJob() != req.IsJob() {
 			continue
 		}
-		if !req.IsJob() || w.spec.Jobs[0].Function == req.Entrypoint {
+		if !req.IsJob() || w.spec.Placement.Jobs[0].Function == req.Entrypoint {
 			// RESIDENCY IS ABOUT THE PLAN, not about the slot. A worker that STAGED this
 			// request's plan is already resident or loading, and its READY drains the
 			// queue — which is exactly how several submitted jobs queue against ONE
@@ -262,7 +262,7 @@ func (c *Coordinator) selectOrStart(req records.Request) {
 	c.mu.Unlock()
 	if stale != "" {
 		c.logf("worker %s staged no plan for %s and is STALE; replacing it", stale, req.PlanID)
-		c.StopWorker(stale, StopGrace)
+		c.ShutdownWorker(stale, StopGrace)
 	}
 
 	go func() {
@@ -283,14 +283,14 @@ func (c *Coordinator) selectOrStart(req records.Request) {
 			c.failQueued(req.ID, e)
 			return
 		}
-		instance, e := c.StartWorker(spec)
+		instance, change, e := c.EnsureWorker(spec)
 		if e != nil {
 			done()
 			c.failQueued(req.ID, e)
 			return
 		}
-		c.logf("%s: started %s for the queued request", req.Endpoint, instance)
-		if e := c.WaitReady(instance, req.PlanID); e != nil {
+		c.logf("%s: %s is %s for the queued request", req.Endpoint, instance, change)
+		if e := c.EnsurePlacementReady(instance, req.PlanID); e != nil {
 			// AND THE WORKER GOES. A process that cannot make its binding resident still
 			// holds a device grant, and `selectOrStart` returns early whenever a worker
 			// for the endpoint exists — so leaving it would hang the NEXT request behind a
@@ -304,7 +304,7 @@ func (c *Coordinator) selectOrStart(req records.Request) {
 				done()
 				return
 			}
-			c.StopWorker(instance, StopGrace)
+			c.ShutdownWorker(instance, StopGrace)
 			done()
 			c.failQueued(req.ID, e)
 			return
@@ -340,10 +340,10 @@ func settledState(state string) bool {
 }
 
 // resolveFor asks the launcher for the spec of the LANE this request runs in. A request
-// pinned to an attached remote worker (cl-015) resolves the SAME spec — same bindings,
+// pinned to a connected worker (cl-015) resolves the SAME spec — same bindings,
 // same plan ids — and gains the dial triple: the pod installed the identical release, so
 // the plan digests agree by construction or the worker refuses typed.
-func (c *Coordinator) resolveFor(req records.Request) (EndpointSpec, *exit.Error) {
+func (c *Orchestrator) resolveFor(req records.Request) (WorkerLaunchSpec, *exit.Error) {
 	spec, e := c.opt.Endpoints.Resolve(req.Endpoint)
 	if req.IsJob() {
 		spec, e = c.opt.Endpoints.ResolveJob(req.Endpoint, req.Entrypoint)
@@ -358,10 +358,10 @@ func (c *Coordinator) resolveFor(req records.Request) (EndpointSpec, *exit.Error
 	if e != nil {
 		return spec, e
 	}
-	spec.Remote = remote
-	// The rental IS the slot: one attached worker per rental id, its own instance
+	spec.Connection = remote
+	// The rental IS the slot: one connected worker per rental id, its own instance
 	// namespace, and no local device envelope (the pod's card is the pod's).
-	spec.Endpoint = pinnedEndpoint(spec.Endpoint, req.Worker)
+	spec.Placement.Endpoint = pinnedEndpoint(spec.Placement.Endpoint, req.Worker)
 	spec.Devices = nil
 	return spec, nil
 }
@@ -369,12 +369,12 @@ func (c *Coordinator) resolveFor(req records.Request) (EndpointSpec, *exit.Error
 // failQueued settles a request that can never be placed. It is a request-level terminal:
 // no attempt was ever dispatched, so there is no attempt terminal to replay and the
 // request row is what settles.
-func (c *Coordinator) failQueued(requestID string, cause *exit.Error) {
+func (c *Orchestrator) failQueued(requestID string, cause *exit.Error) {
 	c.forget(requestID)
 	// A REQUEST THAT ALREADY SETTLED IS NOT FAILED BY A LATER OBSERVATION. The launch
 	// goroutine that made this request's worker resident OUTLIVES the request: a job
 	// worker is terminal-and-reclaim, so it EXITS the moment its terminal is acknowledged,
-	// and `WaitReady` then answers "the endpoint worker exited before reporting ready" —
+	// and `EnsurePlacementReady` then answers "the endpoint worker exited before reporting ready" —
 	// about a process whose exit was the successful end of the work.
 	//
 	// Observed live in cl-004's crash arm, and it is the worst failure class this system
@@ -399,10 +399,12 @@ func (c *Coordinator) failQueued(requestID string, cause *exit.Error) {
 	c.waitRequest(requestID).markClosed(cause)
 }
 
-func (c *Coordinator) dispatch(req records.Request) (uint64, *exit.Error) {
-	// PLACEMENT is the coordinator's: the caller names the binding, and dispatch picks a
-	// worker that advertises it as dispatchable NOW.
-	w, sess, e := c.pick(req)
+func (c *Orchestrator) dispatch(req records.Request) (uint64, *exit.Error) {
+	// PLACEMENT is the orchestrator's: the caller names the binding, and dispatch picks a
+	// worker whose placement advertises it as DISPATCHABLE now and whose admission fence
+	// is open. `pick` also returns the admission generation it OBSERVED, which is what
+	// makes a stale offer refuse deterministically rather than race.
+	w, sess, admissionGen, e := c.pick(req)
 	if e != nil {
 		return 0, e
 	}
@@ -412,12 +414,15 @@ func (c *Coordinator) dispatch(req records.Request) (uint64, *exit.Error) {
 	// deadline — lives INSIDE the digest. Its key set is closed: no human model ref, no
 	// service class, no local extension has a slot.
 	spec := &pb.InvocationSpec{
-		EndpointReleaseId: w.spec.ReleaseID,
-		ImageDigest:       c.opt.ImageDigest,
-		ConfigDigest:      c.opt.ConfigDigest,
-		PayloadDigest:     spellOf(canonical.Digest(req.Payload)),
-		Inputs:            inputBindings(req),
-		Outputs:           outputBindings(splitList(req.Outputs), c.maxOutputBytes()),
+		EndpointReleaseId: w.spec.Placement.ReleaseID,
+		// `image_digest` is GONE, renamed to what it always meant (#483): "image" is wrong
+		// for a native install with no OCI image at all. The value is the same one this
+		// service was frozen with — a request cannot choose the environment it runs under.
+		EnvironmentSpecDigest: c.opt.EnvironmentSpecDigest,
+		ConfigDigest:          c.opt.ConfigDigest,
+		PayloadDigest:         spellOf(canonical.Digest(req.Payload)),
+		Inputs:                inputBindings(req),
+		Outputs:               outputBindings(splitList(req.Outputs), c.maxOutputBytes()),
 		Spec: &pb.InvocationSpec_Serving{Serving: &pb.ServingInvocationSpec{
 			EntrypointBindingPlanId: req.PlanID,
 			// With no adapters the binding IS the plan, so the two ids are equal by
@@ -430,7 +435,7 @@ func (c *Coordinator) dispatch(req records.Request) (uint64, *exit.Error) {
 		// request's scratch repo, which is why a queue-serving worker can hold one
 		// directive and still publish each attempt into its own place.
 		spec.Spec = &pb.InvocationSpec_Job{Job: &pb.JobInvocationSpec{
-			BuildId:         w.spec.ReleaseID,
+			BuildId:         w.spec.Placement.ReleaseID,
 			JobDescriptorId: req.PlanID,
 			PublicationContract: &pb.PublicationContract{
 				GrantId: home.ScratchRepo(req.Org, req.ID),
@@ -462,33 +467,42 @@ func (c *Coordinator) dispatch(req records.Request) (uint64, *exit.Error) {
 	// re-derive access and structurally cannot substitute meaning.
 	//
 	// A JOB's grant names the DURABLE PUBLICATION ROOT instead, and the destination fence
-	// runs HERE — before StartAttempt, so an escaping destination is never a capability
+	// runs HERE — before the offer, so an escaping destination is never a capability
 	// anybody held.
 	grant, e := c.grantFor(req, attempt, w)
 	if e != nil {
 		return 0, e
 	}
-	grant.InvocationDigest = digest
+	grant.InvocationSpecDigest = digest
 
-	deploymentID := w.deploymentID
+	placementID := w.placementID
 	if req.IsJob() {
-		deploymentID = "" // job mode routes by the directive, not a deployment (#446)
+		placementID = "" // job mode routes by the directive, not a placement (#446/#481)
 	}
-	start := &pb.StartAttempt{
-		RequestId: req.ID, Attempt: attempt, InvocationDigest: digest,
-		Grant: grant, InvocationCanonical: canonicalBytes, DeploymentId: deploymentID,
+	// AN OFFER, NOT A START (#481): receiving one begins VALIDATION, not execution, which
+	// is why refusing it is an ordinary journaled outcome rather than an exception. EVERY
+	// offer gets AttemptAccepted or a journaled AttemptOutcome(REFUSED) — never silence.
+	offer := &pb.AttemptOffer{
+		RequestId: req.ID, AttemptOrdinal: attempt, InvocationSpecDigest: digest,
+		Grant: grant, InvocationSpecCanonicalBytes: canonicalBytes, PlacementId: placementID,
+		// THE GENERATION THIS OWNER OBSERVED WHEN IT DISPATCHED. The worker admits only if
+		// this is still current; a stale echo refuses deterministically — same input, same
+		// verdict, no race window — instead of running under capacity meaning that moved.
+		AdmissionGeneration: admissionGen,
 	}
-	start.OwnerEpoch, start.ControlGeneration, start.WorkerBootId = ownerEpoch, sess.generation, sess.bootID
-	sess.send(&pb.OwnerFrame{Msg: &pb.OwnerFrame_StartAttempt{StartAttempt: start}})
-	c.logf("StartAttempt %s#%d spec=%s (%d canonical bytes) outputs=%s on %s",
-		req.ID, attempt, shortDigest(spelled), len(canonicalBytes), req.Outputs, w.instanceID)
+	offer.RecordOwnerEpoch, offer.ControlStreamGeneration, offer.WorkerBootId =
+		recordOwnerEpoch, sess.generation, sess.bootID
+	sess.send(&pb.RecordOwnerFrame{Msg: &pb.RecordOwnerFrame_AttemptOffer{AttemptOffer: offer}})
+	c.logf("AttemptOffer %s#%d spec=%s (%d canonical bytes) placement=%s admission=%d outputs=%s on %s",
+		req.ID, attempt, shortDigest(spelled), len(canonicalBytes), placementID,
+		admissionGen, req.Outputs, w.instanceID)
 	c.emit(req.ID, "request.dispatched", attempt, map[string]any{
 		"instance_id": w.instanceID, "invocation_digest": spelled,
 	})
 	return attempt, nil
 }
 
-func (c *Coordinator) maxOutputBytes() uint64 {
+func (c *Orchestrator) maxOutputBytes() uint64 {
 	maxBytes := c.opt.MaxOutputMiB
 	if maxBytes <= 0 {
 		maxBytes = 64
@@ -536,8 +550,15 @@ func outputBindings(ids []string, maxBytes uint64) []*pb.OutputBinding {
 	return out
 }
 
-// pick resolves a worker that advertises this binding as READY. Compatibility and
-// capacity matching stay here, in the coordinator, exactly as they do in the cloud.
+// pick resolves a worker whose PLACEMENT is DISPATCHABLE for this binding and whose
+// worker-level ADMISSION FENCE will take it. Compatibility and capacity matching stay
+// here, in the orchestrator, exactly as they do in the cloud.
+//
+// TWO GATES, TWO OWNERS (#472e/#482). Dispatchability is a PLACEMENT property — the
+// serving axis and `dispatchable_plan_ids`. Capacity is a WORKER property — the admission
+// state, its generation, and the one shared seat window. Per-placement `attempt_credits`
+// are DELETED because N counters over ONE serialized device advertise N times the real
+// capacity, and that defect is arithmetic rather than a race.
 //
 // THE SLOT IS PART OF THE MATCH, not only the binding. Matching on the plan id alone sent
 // a request pinned to rental B to rental A's worker — same endpoint, same plan digest, so
@@ -545,41 +566,49 @@ func outputBindings(ids []string, maxBytes uint64) []*pb.OutputBinding {
 // pod whose credential it never presented. It cuts the other way too: an UNPINNED request
 // must never land on a rented worker, because someone is being billed for that card and
 // nobody asked for it here.
-func (c *Coordinator) pick(req records.Request) (*worker, *session, *exit.Error) {
+func (c *Orchestrator) pick(req records.Request) (*worker, *session, uint64, *exit.Error) {
 	planID := req.PlanID
 	slot := pinnedEndpoint(req.Endpoint, req.Worker)
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	for _, w := range c.workers {
-		if w.exited || w.intake != pb.IntakeState_INTAKE_STATE_READY || !w.ready[planID] {
+		if w.exited || w.spec.Placement.Endpoint != slot {
 			continue
 		}
-		if w.spec.Endpoint != slot {
+		sess := c.sessions[w.bootID]
+		if sess == nil {
 			continue
 		}
-		if sess := c.sessions[w.bootID]; sess != nil {
-			if w.spec.IsJob() {
-				// RESERVE the slot this dispatch is about to consume. The worker's own
-				// next Report is still the authority — this only stops ONE drain pass
-				// from handing two queued jobs to a one-attempt worker on one reading.
-				w.jobsAvail--
-				if w.jobsAvail <= 0 {
-					w.ready[planID] = false
-				}
-				return w, sess, nil
-			}
-			// SERVING dispatches against ADMISSION CREDITS (#441): the worker's small
-			// accepted window, reserved here and corrected by its next Report. Spent
-			// credits park the request in THIS owner's deep queue — the queue seat.
-			if w.credits <= 0 {
+		if w.spec.IsJob() {
+			// A JOB worker hosts no placement: its dispatchability IS its job capacity.
+			if !w.dispatchable[planID] || w.jobsAvail <= 0 {
 				continue
 			}
-			w.credits--
-			return w, sess, nil
+			// RESERVE the seat this dispatch is about to consume. The worker's own next
+			// observed state is still the authority — this only stops ONE drain pass from
+			// handing two queued jobs to a one-attempt worker on one reading.
+			w.jobsAvail--
+			if w.jobsAvail <= 0 {
+				w.dispatchable[planID] = false
+			}
+			return w, sess, w.admissionGen, nil
 		}
+		if !w.dispatchableFor(planID) {
+			continue
+		}
+		if !w.admissible() {
+			// CLOSED and OPEN-with-no-seat are BOTH "not now", and they are deliberately
+			// distinguished on the worker facts rather than here: this side's answer is the
+			// same either way — the request parks in the deep queue, which is this owner's
+			// and never the worker's.
+			continue
+		}
+		w.slots--
+		return w, sess, w.admissionGen, nil
 	}
-	return nil, nil, exit.Unavailablef(
-		"no claimed worker in %s advertises %s as dispatchable", slot, planID)
+	return nil, nil, 0, exit.Unavailablef(
+		"no claimed worker in %s has a DISPATCHABLE placement for %s with a free attempt slot",
+		slot, planID)
 }
 
 // grantFor picks the lane's grant. The lanes differ in exactly one thing that matters —
@@ -587,7 +616,7 @@ func (c *Coordinator) pick(req records.Request) (*worker, *session, *exit.Error)
 // machine: a bounded job's writes must outlive the reclaim that ends it, and a REMOTE
 // attempt's destinations must be on the pod, because that is where the process writing
 // them is.
-func (c *Coordinator) grantFor(req records.Request, attempt uint64, w *worker) (*pb.DeliveryGrant, *exit.Error) {
+func (c *Orchestrator) grantFor(req records.Request, attempt uint64, w *worker) (*pb.DeliveryGrant, *exit.Error) {
 	if req.IsJob() {
 		g, _, e := c.jobGrant(req, attempt)
 		return g, e
@@ -610,7 +639,7 @@ func (c *Coordinator) grantFor(req records.Request, attempt uint64, w *worker) (
 // The BYTES MOVE BEFORE THE ATTEMPT EXISTS. `dispatch` calls this after the ordinal is
 // journaled and before `StartAttempt` is sent, so a pod that cannot be fed refuses the
 // dispatch rather than accepting an attempt whose inputs are unreachable.
-func (c *Coordinator) remoteGrant(req records.Request, attempt uint64, w *worker) (*pb.DeliveryGrant, *exit.Error) {
+func (c *Orchestrator) remoteGrant(req records.Request, attempt uint64, w *worker) (*pb.DeliveryGrant, *exit.Error) {
 	slot := media.Slot(req.ID, attempt)
 	dir, e := w.media.ReserveOutputs(slot)
 	if e != nil {
@@ -642,7 +671,7 @@ func (c *Coordinator) remoteGrant(req records.Request, attempt uint64, w *worker
 // field path, under this attempt's own directory. There is no credential — a local grant
 // is a CAS root plus an output dir, and a fabricated token would be a lie about
 // authority nobody issued.
-func (c *Coordinator) grant(requestID string, attempt uint64, req records.Request) (*pb.DeliveryGrant, *exit.Error) {
+func (c *Orchestrator) grant(requestID string, attempt uint64, req records.Request) (*pb.DeliveryGrant, *exit.Error) {
 	dir := c.opt.Layout.AttemptDir(requestID, attempt)
 	inDir := filepath.Join(dir, "in")
 	if err := os.MkdirAll(inDir, 0o755); err != nil {
@@ -678,9 +707,9 @@ func (c *Coordinator) grant(requestID string, attempt uint64, req records.Reques
 }
 
 // Await blocks until the attempt is closed — the terminal accepted, its outputs visible,
-// and the ack sent. The error it returns is the coordinator's PROJECTION of the neutral
+// and the ack sent. The error it returns is the orchestrator's PROJECTION of the neutral
 // terminal, never a worker-authored retryability claim.
-func (c *Coordinator) Await(requestID string, attempt uint64, timeout time.Duration) (*Result, *exit.Error) {
+func (c *Orchestrator) Await(requestID string, attempt uint64, timeout time.Duration) (*Result, *exit.Error) {
 	w := c.waitFor(key(requestID, attempt))
 	select {
 	case <-w.closed:
@@ -707,9 +736,9 @@ func (c *Coordinator) Await(requestID string, attempt uint64, timeout time.Durat
 }
 
 // AwaitSettled blocks until the REQUEST settles — through however many requeued
-// ordinals the coordinator's projection minted. This is what a caller waits on; an
-// individual attempt is the coordinator's business.
-func (c *Coordinator) AwaitSettled(requestID string, timeout time.Duration) (*Result, *exit.Error) {
+// ordinals the orchestrator's projection minted. This is what a caller waits on; an
+// individual attempt is the orchestrator's business.
+func (c *Orchestrator) AwaitSettled(requestID string, timeout time.Duration) (*Result, *exit.Error) {
 	w := c.waitRequest(requestID)
 	select {
 	case <-w.closed:
@@ -738,7 +767,7 @@ func (c *Coordinator) AwaitSettled(requestID string, timeout time.Duration) (*Re
 
 // AwaitAccepted blocks until AttemptAccepted is journaled — the acceptance boundary a
 // submit→accepted benchmark measures.
-func (c *Coordinator) AwaitAccepted(requestID string, attempt uint64, timeout time.Duration) *exit.Error {
+func (c *Orchestrator) AwaitAccepted(requestID string, attempt uint64, timeout time.Duration) *exit.Error {
 	w := c.waitFor(key(requestID, attempt))
 	select {
 	case <-w.accepted:
@@ -752,14 +781,14 @@ func (c *Coordinator) AwaitAccepted(requestID string, attempt uint64, timeout ti
 
 // CancelClient is the client-reason cancel, for the callers that have no business
 // naming a protocol enum.
-func (c *Coordinator) CancelClient(requestID string, attempt, graceMS uint64) *exit.Error {
+func (c *Orchestrator) CancelClient(requestID string, attempt, graceMS uint64) *exit.Error {
 	return c.Cancel(requestID, attempt, pb.CancelReason_CANCEL_REASON_CLIENT, graceMS)
 }
 
 // Cancel is the only way to supersede a live attempt: explicit, digest-fenced, and
 // followed by a journaled terminal. Silent supersession does not exist in this protocol,
 // and an attempt is never killed to improve queue latency.
-func (c *Coordinator) Cancel(requestID string, attempt uint64, reason pb.CancelReason, graceMS uint64) *exit.Error {
+func (c *Orchestrator) Cancel(requestID string, attempt uint64, reason pb.CancelReason, graceMS uint64) *exit.Error {
 	row, e := c.opt.Store.AttemptRow(requestID, int64(attempt))
 	if e != nil {
 		return e
@@ -779,11 +808,12 @@ func (c *Coordinator) Cancel(requestID string, attempt uint64, reason pb.CancelR
 		return exit.Unavailablef("the stream that holds %s#%d is gone", requestID, attempt)
 	}
 	cancel := &pb.CancelAttempt{
-		RequestId: requestID, Attempt: attempt, Reason: reason,
-		GraceMs: graceMS, InvocationDigest: raw,
+		RequestId: requestID, AttemptOrdinal: attempt, Reason: reason,
+		GraceMs: graceMS, InvocationSpecDigest: raw,
 	}
-	cancel.OwnerEpoch, cancel.ControlGeneration, cancel.WorkerBootId = ownerEpoch, sess.generation, sess.bootID
-	sess.send(&pb.OwnerFrame{Msg: &pb.OwnerFrame_CancelAttempt{CancelAttempt: cancel}})
+	cancel.RecordOwnerEpoch, cancel.ControlStreamGeneration, cancel.WorkerBootId =
+		recordOwnerEpoch, sess.generation, sess.bootID
+	sess.send(&pb.RecordOwnerFrame{Msg: &pb.RecordOwnerFrame_CancelAttempt{CancelAttempt: cancel}})
 	c.logf("CancelAttempt %s#%d reason=%s", requestID, attempt,
 		pb.CancelReason_name[int32(reason)])
 	return nil

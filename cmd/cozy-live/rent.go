@@ -148,7 +148,7 @@ func sectionRent() {
 		strings.Contains(podLog, "hosting behind TLS"), "")
 	check("and it ACCEPTED the claim — the owner presented the provisioned owner token",
 		strings.Contains(podLog, "ClaimAck sent"), "")
-	check("the coordinator ATTACHED rather than spawned: the slot is the RENTAL's",
+	check("the orchestrator ATTACHED rather than spawned: the slot is the RENTAL's",
 		strings.HasSuffix(instanceEndpoint(root, instanceA), "@"+rentalA),
 		instanceEndpoint(root, instanceA)+" "+instanceA)
 	check("the attempt was DISPATCHED to that pod's own instance",
@@ -202,7 +202,7 @@ func sectionRent() {
 		lineWith(podLog, "granted input read"))
 	check("the pod wrote its output into the directory the owner RESERVED on the pod",
 		mirrored != "", strings.Join(podFiles, ", "))
-	check("the coordinator FETCHED those bytes home and verified them before acking",
+	check("the orchestrator FETCHED those bytes home and verified them before acking",
 		strings.Contains(serviceLog(root), "mirrored "),
 		lineWith(serviceLog(root), "mirrored "))
 	check("the run succeeded end to end over a real byte boundary",
@@ -271,8 +271,8 @@ func sectionRent() {
 		code != 0 && (strings.Contains(out, "media") || strings.Contains(out, "byte plane")),
 		firstLine(out)+" [exit "+itoa(code)+"]")
 	check("and no attempt was dispatched to it: nothing crossed a boundary that is not there",
-		!strings.Contains(podWorkerLog(starved, rentalF), "StartAttempt"),
-		"the pod's worker saw no StartAttempt")
+		!strings.Contains(podWorkerLog(starved, rentalF), "AttemptOffer"),
+		"the pod's worker saw no AttemptOffer")
 
 	head("#505: the RELEASE PIN is verified, not merely carried")
 	lying := newPodHub(podHubSpec{Dir: filepath.Join(root, "hub-badrelease"), Arm: "remote",
@@ -284,7 +284,7 @@ func sectionRent() {
 	check("a pod serving a DIFFERENT release is refused, and the client is told which",
 		code != 0 && strings.Contains(out, "not-this-one"),
 		firstLine(out)+" [exit "+itoa(code)+"]")
-	check("the coordinator named the fence: this host pinned %s",
+	check("the orchestrator named the fence: this host pinned %s",
 		strings.Contains(serviceLog(root), "release_mismatch"),
 		lineWith(serviceLog(root), "release_mismatch"))
 	silent := newPodHub(podHubSpec{Dir: filepath.Join(root, "hub-norelease"), Arm: "remote"})
@@ -359,7 +359,7 @@ func sectionRent() {
 		podWroteOutput(liar, rentalD), filepath.Join(liar.pods, rentalD))
 	check("the owner did not ack it: the request never settled and the deadline answered",
 		code == 10, firstLine(out)+" [exit "+itoa(code)+"]")
-	check("the coordinator said WHY: the pod's media plane has no such output to hand over",
+	check("the orchestrator said WHY: the pod's media plane has no such output to hand over",
 		strings.Contains(serviceLog(root), "no output"),
 		lineWith(serviceLog(root), "no output"))
 	check("no output became visible and no file was written",
@@ -370,7 +370,7 @@ func sectionRent() {
 	// was blocked without it. A SECOND independent install of the byte-identical release
 	// archive, on its own root, against its own spelling of the store — the shape of a pod
 	// that installed what this host installed. Different directories everywhere, and the
-	// plan the coordinator names on the wire has to be the same plan.
+	// plan the orchestrator names on the wire has to be the same plan.
 	rootB := filepath.Join(root, "machine-b")
 	must("creating the second root", os.MkdirAll(rootB, 0o755))
 	benchB := filepath.Join(root, "bench-as-the-pod-sees-it")
@@ -472,7 +472,7 @@ func rentOne(root string, h *podHub, reason string) (string, string) {
 	return field(out, "rental"), out
 }
 
-// dispatchedInstance reads the instance the coordinator actually placed the attempt on,
+// dispatchedInstance reads the instance the orchestrator actually placed the attempt on,
 // out of the request's own `request.dispatched` frame. It is the routing observation:
 // which worker took the work, from the stream the client watched.
 func dispatchedInstance(stream string) string {
@@ -633,9 +633,9 @@ func sectionPlanIDs() {
 	defer st.Close()
 	spec, e := app.NewResolver(st, cfg).Resolve(flag("endpoint", endpointRef))
 	must("resolving the endpoint", errOf(e))
-	doc := map[string]any{"release": spec.ReleaseID}
+	doc := map[string]any{"release": spec.Placement.ReleaseID}
 	plans, recs := map[string]string{}, map[string]map[string]any{}
-	for _, b := range spec.Bindings {
+	for _, b := range spec.Placement.Bindings {
 		id, e := b.PlanID()
 		must("plan id", errOf(e))
 		plans[b.Entrypoint], recs[b.Entrypoint] = id, b.Record
@@ -821,7 +821,7 @@ func digestOfBytes(data []byte) string {
 }
 
 // dispatchedRequest reads the request id out of the stream a `--stream` run printed, so an
-// arm can name the media slot the coordinator's own grant pointed at.
+// arm can name the media slot the orchestrator's own grant pointed at.
 func dispatchedRequest(stream string) string {
 	if _, rest, ok := strings.Cut(stream, `"request_id":"`); ok {
 		if id, _, ok := strings.Cut(rest, `"`); ok {

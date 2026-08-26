@@ -9,8 +9,8 @@ import (
 	"time"
 
 	"github.com/cozy-creator/cozy-creator-v2/internal/canonical"
-	"github.com/cozy-creator/cozy-creator-v2/internal/coord"
 	"github.com/cozy-creator/cozy-creator-v2/internal/exit"
+	"github.com/cozy-creator/cozy-creator-v2/internal/orchestrator"
 	"github.com/cozy-creator/cozy-creator-v2/internal/service"
 	pb "github.com/cozy-creator/cozy-creator-v2/protocol/cozy/worker/v1"
 )
@@ -18,22 +18,24 @@ import (
 // fakeSpec is a worker slot whose process is THIS binary speaking raw protocol. It is a
 // real process dialing the real socket over the committed contract — the adversary, not
 // a plant.
-func fakeSpec(name string, device string, args ...string) coord.EndpointSpec {
+func fakeSpec(name string, device string, args ...string) orchestrator.WorkerLaunchSpec {
 	self, err := os.Executable()
 	must("locating this binary", err)
-	return coord.EndpointSpec{
-		Endpoint:   "fake/" + name,
-		ReleaseID:  release,
-		Generation: "",
-		Python:     self,
-		Args:       append([]string{"fakeworker"}, args...),
-		Devices:    []string{device},
-		Bindings: []*coord.Binding{{
-			Entrypoint: "fake",
-			Record: map[string]any{
-				"entrypoint": "fake", "release": release, "slot": name,
-			},
-		}},
+	return orchestrator.WorkerLaunchSpec{
+		Python:  self,
+		Args:    append([]string{"fakeworker"}, args...),
+		Devices: []string{device},
+		Placement: orchestrator.DesiredPlacement{
+			Endpoint:  "fake/" + name,
+			ReleaseID: release,
+			InstallID: "",
+			Bindings: []*orchestrator.Binding{{
+				Entrypoint: "fake",
+				Record: map[string]any{
+					"entrypoint": "fake", "release": release, "slot": name,
+				},
+			}},
+		},
 	}
 }
 
@@ -61,7 +63,7 @@ func countEvents(lv *live, substr string) int {
 }
 
 // sectionArms is the refusal matrix, every arm planted by a REAL peer or a REAL second
-// process and observed against the real coordinator.
+// process and observed against the real orchestrator.
 func sectionArms() {
 	var e *exit.Error
 	lv := hostCoordinator("arms", true)
@@ -80,10 +82,10 @@ func sectionArms() {
 
 	head("the device ledger: an envelope cannot be consumed twice")
 	victim := fakeSpec("victim", "0", "--arm", "idle")
-	instanceA, e := lv.c.StartWorker(victim)
+	instanceA, _, e := lv.c.EnsureWorker(victim)
 	check("worker A holds device 0", e == nil, briefly(e))
 	rival := fakeSpec("rival", "0", "--arm", "idle")
-	_, e = lv.c.StartWorker(rival)
+	_, _, e = lv.c.EnsureWorker(rival)
 	check("a second start against device 0 REFUSES", e != nil && e.Code == exit.Conflict,
 		briefly(e))
 
@@ -94,7 +96,7 @@ func sectionArms() {
 		wg.Add(1)
 		go func(i int) {
 			defer wg.Done()
-			_, results[i] = lv.c.StartWorker(fakeSpec(fmt.Sprintf("racer%d", i), "9", "--arm", "idle"))
+			_, _, results[i] = lv.c.EnsureWorker(fakeSpec(fmt.Sprintf("racer%d", i), "9", "--arm", "idle"))
 		}(i)
 	}
 	wg.Wait()
@@ -108,7 +110,7 @@ func sectionArms() {
 		fmt.Sprintf("%d won, refusals: %v", won, briefly(results[0])+" / "+briefly(results[1])))
 
 	planA := planIDOf(victim, "fake")
-	if e := lv.c.WaitReady(instanceA, planA); e != nil {
+	if e := lv.c.EnsurePlacementReady(instanceA, planA); e != nil {
 		check("worker A ready", false, e.Message)
 		return
 	}
@@ -120,7 +122,7 @@ func sectionArms() {
 	// A worker whose ClaimAck reports an instance this owner never spawned for that slot:
 	// the owner refuses to bind it and dispatches nothing.
 	ghost := fakeSpec("ghost", "7", "--arm", "idle", "--fake-instance", "ins-never-spawned")
-	_, _ = lv.c.StartWorker(ghost)
+	_, _, _ = lv.c.EnsureWorker(ghost)
 	line, ok := waitEvent(lv, "REFUSING the claimed worker", 10*time.Second)
 	check("a foreign instance identity on ClaimAck is refused", ok, trimLog(line))
 
@@ -128,7 +130,7 @@ func sectionArms() {
 	// credential as Claim.proof and the WORKER verifies it constant-time. The badcred arm
 	// is a worker that refuses every proof — the typed refusal must surface here.
 	badcred := fakeSpec("badcred", "8", "--arm", "badcred")
-	_, _ = lv.c.StartWorker(badcred)
+	_, _, _ = lv.c.EnsureWorker(badcred)
 	line, ok = waitEvent(lv, "Claim REFUSED", 10*time.Second)
 	check("the bootstrap-credential fence refuses typed at Claim", ok, trimLog(line))
 	check("worker A's claimed boot is untouched by the refusals",
@@ -137,13 +139,13 @@ func sectionArms() {
 
 	// A worker reporting a release that is not the pinned one.
 	badrel := fakeSpec("badrelease", "6", "--arm", "badrelease")
-	_, _ = lv.c.StartWorker(badrel)
+	_, _, _ = lv.c.EnsureWorker(badrel)
 	line, ok = waitEvent(lv, "release_mismatch", 10*time.Second)
 	check("a release that is not the pinned one is refused", ok, trimLog(line))
 
 	// A second live worker presenting a boot id already bound to worker A.
 	collide := fakeSpec("collide", "5", "--arm", "idle", "--session", factsA.BootID)
-	_, _ = lv.c.StartWorker(collide)
+	_, _, _ = lv.c.EnsureWorker(collide)
 	line, ok = waitEvent(lv, "boot binding for", 10*time.Second)
 	check("two live workers cannot share a worker_boot_id", ok, trimLog(line))
 
@@ -176,7 +178,7 @@ func sectionArms() {
 	// A second session writing another session's attempt row.
 	thief := fakeSpec("thief", "4", "--arm", "steal", "--request", requestA,
 		"--attempt", fmt.Sprint(attemptA), "--spec", specHex)
-	_, _ = lv.c.StartWorker(thief)
+	_, _, _ = lv.c.EnsureWorker(thief)
 	line, ok = waitEvent(lv, "does not own that attempt row", 15*time.Second)
 	check("a SECOND WRITER on the same attempt row refuses", ok, trimLog(line))
 	rowA2, _ := lv.store.AttemptRow(requestA, int64(attemptA))
@@ -185,7 +187,7 @@ func sectionArms() {
 
 	// Supersession is EXPLICIT: a cancel naming the full attempt triple, sent to the
 	// session that holds it. The idle fake ignores it — which is the point of the
-	// cooperative/forceful split on the worker side — but the coordinator's obligation
+	// cooperative/forceful split on the worker side — but the orchestrator's obligation
 	// is to send a digest-fenced cancel and nothing else.
 	must("cancel", errOf(lv.c.Cancel(requestA, attemptA, pb.CancelReason_CANCEL_REASON_SUPERSEDED, 1000)))
 	line, ok = waitEvent(lv, "CancelAttempt "+requestA, 10*time.Second)
@@ -196,11 +198,11 @@ func sectionArms() {
 
 	head("terminal-level refusals: the digest fence, the document fence, the replay")
 	badspec := fakeSpec("badterminal", "3", "--arm", "badterminal")
-	instanceB, e := lv.c.StartWorker(badspec)
+	instanceB, _, e := lv.c.EnsureWorker(badspec)
 	_ = instanceA
 	check("worker B up", e == nil, briefly(e))
 	planB := planIDOf(badspec, "fake")
-	if e := lv.c.WaitReady(instanceB, planB); e != nil {
+	if e := lv.c.EnsurePlacementReady(instanceB, planB); e != nil {
 		check("worker B ready", false, e.Message)
 		return
 	}

@@ -4,7 +4,7 @@
 Thirteen families:
   deps      forbidden dependencies (raw lines, incl. import paths and go.mod)
   impl      storage/chunk/loader/residency/tensor implementation vocabulary — cozy-creator
-            renders and coordinates, it never implements the byte plane (TensorFS owns it)
+            renders and orchestrates, it never implements the byte plane (TensorFS owns it)
   prompt    interactive prompts: no cozy command may ever ask a question (AXI)
   matrix    internal/exit/exit.go must equal docs/exit-matrix.md row for row
   manifest  a reclaiming/removing verb must DECLARE its gate: Destructive (exit 7 without
@@ -93,7 +93,7 @@ REVEAL_SITES = {
     # The flip's one addition (#436/#463): the owner PRESENTS the credential to the
     # worker as `Claim.proof` — the exact dual of the old metadata echo, and the only
     # place the value leaves this process (over the worker's own channel).
-    "internal/coord/owner.go",
+    "internal/orchestrator/owner.go",
     # The byte plane's (#506b): the rental's owner token becomes the Authorization
     # header for the POD's media server. Same rule as hub/hub.go one plane over — one
     # request builder, and the raw value is read exactly where it becomes a carrier.
@@ -140,9 +140,9 @@ DENY_MEDIA_EGRESS = [
     "http.DefaultClient", "http.Client", "net.Dial", "net.DialTimeout", "grpc.NewClient",
     "grpc.Dial", "exec.Command", "exec.CommandContext",
 ]
-# …and it may not import the protocol or the coordinator: a media server that could speak
+# …and it may not import the protocol or the orchestrator: a media server that could speak
 # `cozy.worker.v1` would be a second control plane inside the pod.
-DENY_MEDIA_IMPORT = ["protocol/cozy/worker", "internal/coord", "internal/api"]
+DENY_MEDIA_IMPORT = ["protocol/cozy/worker", "internal/orchestrator", "internal/api"]
 # An import LINE, so a doc comment naming the owner's bind site is prose and not a door.
 MEDIA_IMPORT_LINE = re.compile(
     r'^\s*(?:[A-Za-z_]\w*\s+)?"github\.com/cozy-creator/cozy-creator-v2/([^"]+)"\s*$')
@@ -169,7 +169,7 @@ TFS_FIELD = re.compile(r"\.Tfs\b")
 # (cl-010) The two files that may reach an endpoint's own cozy-runtime, and the CLOSED set
 # of verbs they may name. `install.go` runs `describe --check` at install; `artifacts.go`
 # asks for the artifact index, host facts and fit verdicts. Nothing executes a model
-# through this door — that is what the coordinator and the worker protocol are for.
+# through this door — that is what the orchestrator and the worker protocol are for.
 RUNTIME_SITES = {"internal/install/install.go", "internal/launch/artifacts.go"}
 RUNTIME_BIN = re.compile(r'"cozy-runtime"')
 RUNTIME_VERBS_OK = {"describe", "list", "doctor", "fit", "bindings"}
@@ -277,7 +277,7 @@ def check_sources():
                     ALLOW_DOOR not in src_line:
                 bad.append(f"{p}:{i}: [runtime] the cozy-runtime binary is reached outside "
                            f"{' / '.join(sorted(RUNTIME_SITES))} — one execution path: a run goes "
-                           f"coordinator -> worker protocol -> runtime, never a shell-out: {src_line.strip()}")
+                           f"orchestrator -> worker protocol -> runtime, never a shell-out: {src_line.strip()}")
             if rel in RUNTIME_SITES:
                 for verb in sorted(RUNTIME_VERBS_DENY):
                     if re.search(r'"' + verb + r'"', src_line):

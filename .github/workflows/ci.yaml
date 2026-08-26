@@ -16,6 +16,33 @@ jobs:
       - run: go vet ./...
       - run: python3 scripts/fence.py
 
+  # THE VENDORED-BINDING FENCE (#530-A1/#536d). `protocol/` is COPIED, never imported, so
+  # nothing in a Go build can notice that the copy is revisions behind the contract — and
+  # `wire_minor` could not notice either, because the minor is the ADDITIVE train and does
+  # not move for a breaking in-place revision. `wire_schema_digest` catches a stale peer at
+  # the HANDSHAKE, which is a run-time discovery by an operator on a live stream. This
+  # catches the same fact at BUILD time: worker-protocol regenerates from its own .proto
+  # with its own pinned protoc and byte-compares against what is vendored here.
+  #
+  # It tracks worker-protocol's master deliberately. A pinned ref would only ever prove
+  # that nobody edited this directory by hand; the fact worth knowing is that the contract
+  # moved and this consumer has not flipped. That red IS the flip obligation arriving.
+  vendored-protocol:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: cozy-creator
+      - uses: actions/checkout@v4
+        with:
+          repository: cozy-creator/worker-protocol-v2
+          path: worker-protocol
+      - uses: actions/setup-go@v5
+        with:
+          go-version: stable
+      - uses: astral-sh/setup-uv@v5
+      - run: worker-protocol/scripts/vendored-diff.sh cozy-creator/protocol/cozy/worker/v1
+
   # cl-013's SHIPPED GUARD. A green `checks` is a fact about the source tree; this job is a
   # fact about the artifact a user would install. They are separate evidence axes and a
   # master-only green may not stand in for this one.

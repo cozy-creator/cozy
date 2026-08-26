@@ -42,7 +42,7 @@ type Timing struct {
 }
 
 type Result struct {
-	Gen        records.Generation
+	Gen        records.EndpointInstall
 	Superseded string
 	Idempotent bool
 	Timings    []Timing
@@ -90,7 +90,7 @@ func Run(l home.Layout, st *records.Store, req Request) (*Result, *exit.Error) {
 		return nil, err
 	}
 
-	gen := records.Generation{ID: id, Dir: genDir}
+	gen := records.EndpointInstall{ID: id, Dir: genDir}
 
 	// ---- stage: bytes land under bounds; no code from the release has run ----
 	var sourceDir string
@@ -149,7 +149,7 @@ func Run(l home.Layout, st *records.Store, req Request) (*Result, *exit.Error) {
 		}
 		_ = os.RemoveAll(genDir)
 		return nil, exit.New(exit.Conflict,
-			"%s is already installed and pinned to generation %s", gen.Endpoint+majorSuffix(gen.Major), short12(prior.Generation)).
+			"%s is already installed and pinned to generation %s", gen.Endpoint+majorSuffix(gen.Major), short12(prior.InstallID)).
 			WithRemedy("install never silently upgrades; --force builds a new generation and swaps the pin").
 			WithNext("cozy install " + req.Ref.String() + " --force")
 	}
@@ -161,7 +161,7 @@ func Run(l home.Layout, st *records.Store, req Request) (*Result, *exit.Error) {
 		_ = os.RemoveAll(genDir)
 		return nil, exit.New(exit.Conflict,
 			"the replacement generation for %s failed; the working install (generation %s) is untouched and still runnable",
-			gen.Endpoint+majorSuffix(gen.Major), short12(prior.Generation)).
+			gen.Endpoint+majorSuffix(gen.Major), short12(prior.InstallID)).
 			WithRemedy("cause: %s — %s", err.ErrName(), err.Message).
 			WithNext("cozy ls")
 	}
@@ -172,7 +172,7 @@ func Run(l home.Layout, st *records.Store, req Request) (*Result, *exit.Error) {
 
 	// ---- venv: the first code-executing step, on verified source only ----
 	venvDir := filepath.Join(genDir, "venv")
-	env, err := BuildVenv(sourceDir, venvDir)
+	env, err := MaterializeEnvironment(sourceDir, venvDir)
 	if err != nil {
 		return guard(err)
 	}
@@ -275,7 +275,7 @@ func describeRefusal(code int, stderr string) *exit.Error {
 }
 
 // verifySource settles source identity before any build backend or import can run.
-func verifySource(gen *records.Generation, req Request, warn *[]string) *exit.Error {
+func verifySource(gen *records.EndpointInstall, req Request, warn *[]string) *exit.Error {
 	if gen.SourceKind == "dir" {
 		// --dir IS the development trust path: an explicit local tree the operator
 		// already controls. It carries a snapshot identity, never publisher evidence.
@@ -305,7 +305,7 @@ func verifySource(gen *records.Generation, req Request, warn *[]string) *exit.Er
 }
 
 // resolveTarget reconciles what the release says with what the caller asked for.
-func resolveTarget(gen *records.Generation, ref Ref) *exit.Error {
+func resolveTarget(gen *records.EndpointInstall, ref Ref) *exit.Error {
 	if gen.SourceKind == "dir" {
 		if !ref.HasMajor {
 			return exit.Usagef("an editable --dir install needs an explicit major").

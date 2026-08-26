@@ -41,7 +41,7 @@ func Read(data []byte, m proto.Message) (Doc, error) {
 		return nil, refuse("wrong_type", "a document is a JSON object")
 	}
 	d := m.ProtoReflect().Descriptor()
-	want := string(d.FullName()) + "/1"
+	want := Format(m)
 	if obj["format"] != want {
 		return nil, refuse("unknown_format", "%v is not %q", obj["format"], want)
 	}
@@ -54,7 +54,32 @@ func Read(data []byte, m proto.Message) (Doc, error) {
 			return nil, refuse("unknown_field", "%s: unknown field %q", want, k)
 		}
 	}
+	if err := semantics(string(d.FullName()), Doc(obj)); err != nil {
+		return nil, err
+	}
 	return Doc(obj), nil
+}
+
+// semantics carries the few document rules the KEY SET cannot state. A closed key set says
+// which keys may appear; it cannot say that one of them has exactly one legal spelling of
+// "absent", and #485b makes that a wire law rather than a convention.
+func semantics(name string, d Doc) error {
+	switch name {
+	case "cozy.worker.v1.EndpointEnvironmentSpec":
+		// PLATFORMTARGET HAS ONE CANONICAL ENCODING (#485b). The absent libc is the single
+		// value "none" — never "", never omitted. Two spellings of "no libc" would digest
+		// to two environments and split every cache and receipt built on either, so the
+		// unspelled form refuses at parse instead of quietly becoming a second identity.
+		if pt, ok := d["platform_target"]; ok {
+			target, _ := pt.(map[string]Value)
+			if libc, _ := target["libc"].(string); libc == "" {
+				return refuse("libc_unspelled",
+					"platform_target.libc has one canonical encoding and the absent case is "+
+						`"none"; an omitted or empty libc is a second spelling of the same environment`)
+			}
+		}
+	}
+	return nil
 }
 
 // Str reads one string field off a parsed document; a missing or wrong-typed field
@@ -74,6 +99,19 @@ func (d Doc) Int(key string) int64 {
 func (d Doc) Sub(key string) Doc {
 	m, _ := d[key].(map[string]Value)
 	return Doc(m)
+}
+
+// List reads one repeated field off a parsed document as documents. An entry that is not
+// an object is skipped rather than guessed at: the caller wanted rows.
+func (d Doc) List(key string) []Doc {
+	items, _ := d[key].([]Value)
+	out := make([]Doc, 0, len(items))
+	for _, item := range items {
+		if m, ok := item.(map[string]Value); ok {
+			out = append(out, Doc(m))
+		}
+	}
+	return out
 }
 
 // --------------------------------------------------------------------------- parser

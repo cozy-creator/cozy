@@ -1,6 +1,6 @@
 //go:build windows
 
-package coord
+package orchestrator
 
 // bootstrapRequired: a loopback TCP port has no SO_PEERCRED, so the kernel cannot say
 // which process dialled. The substitute (#449) is a PER-SPAWN bootstrap credential the

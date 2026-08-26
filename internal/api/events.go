@@ -7,7 +7,7 @@ import (
 	"strconv"
 	"time"
 
-	"github.com/cozy-creator/cozy-creator-v2/internal/coord"
+	"github.com/cozy-creator/cozy-creator-v2/internal/orchestrator"
 	"github.com/cozy-creator/cozy-creator-v2/internal/records"
 )
 
@@ -101,13 +101,13 @@ func (s *Server) stream(w http.ResponseWriter, r *http.Request, requestID string
 	fmt.Fprintf(w, ":ok\n\nretry: %d\n\n", retryHintMS)
 	flusher.Flush()
 
-	frames, unsubscribe := s.coord.Subscribe(requestID)
+	frames, unsubscribe := s.orchestrator.Subscribe(requestID)
 	defer unsubscribe()
 
 	// The latest tick, immediately. A subscriber attaching to a running attempt sees
 	// where it IS, not where it goes next.
 	if requestID != "" {
-		if frame, ok := s.coord.LatestFrame(requestID); ok {
+		if frame, ok := s.orchestrator.LatestFrame(requestID); ok {
 			writeEvent(w, 0, liveEnvelope(frame))
 			flusher.Flush()
 		}
@@ -188,7 +188,7 @@ func durableEnvelope(row records.Event) Envelope {
 // through rather than translated: `progress` becomes `request.progress` and everything
 // else becomes `request.<kind>`, because inventing a second name for the runtime's
 // `stage` or `metric` would be a second vocabulary for one fact.
-func liveEnvelope(frame coord.Frame) Envelope {
+func liveEnvelope(frame orchestrator.Frame) Envelope {
 	return Envelope{
 		Type: "request." + frame.Type, RequestID: frame.RequestID, Attempt: frame.Attempt,
 		EventID: 0, At: time.Now().UTC().Format(time.RFC3339Nano),

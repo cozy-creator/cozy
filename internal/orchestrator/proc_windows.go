@@ -17,7 +17,7 @@
 // handles SIGTERM elsewhere — and KILL is TerminateJobObject. The job handle lives until
 // the process is provably gone (killed or reaped), so a reused pid can never collide with
 // a stale entry.
-package coord
+package orchestrator
 
 import (
 	"fmt"

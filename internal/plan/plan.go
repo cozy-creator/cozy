@@ -243,7 +243,7 @@ func Stage(dir string, record map[string]any) (string, *exit.Error) {
 // name it was delivered under. It is what makes the media server's plan route fail-closed:
 // a record that does not hash to its own name is not the plan the owner dispatched
 // against, whoever sent it, and the pod refuses it rather than staging a plan the
-// coordinator will then name in a directive.
+// orchestrator will then name in a directive.
 //
 // This check exists only because the identity became path-free: under `/1` the pod could
 // not have recomputed the id at all, because the digest covered the owner's own paths.

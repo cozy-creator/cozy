@@ -107,7 +107,7 @@ func handleJobSubmit(ctx *Context) *exit.Error {
 
 // parseTrees reads `--input <ref>=<dir>`, the typed input TREES a job's fields hydrate
 // from. The ref is the job's own request-field value; the directory is a read capability
-// the coordinator grants. A field naming a ref that is not here never hydrates.
+// the orchestrator grants. A field naming a ref that is not here never hydrates.
 func parseTrees(values []string) ([]string, *exit.Error) {
 	out := []string{}
 	for _, v := range values {
@@ -120,7 +120,7 @@ func parseTrees(values []string) ([]string, *exit.Error) {
 		info, err := os.Stat(dir)
 		if err != nil || !info.IsDir() {
 			return nil, exit.New(exit.NotFound, "--input %s: %s is not a directory", ref, dir).
-				WithRemedy("an input tree is a MATERIALIZED directory the coordinator grants a read of")
+				WithRemedy("an input tree is a MATERIALIZED directory the orchestrator grants a read of")
 		}
 		out = append(out, v)
 	}
@@ -407,7 +407,7 @@ func followJob(ctx *Context, c *localapi.Client, jobID string, began time.Time) 
 			jobID, status, state.ErrorType, state.Error)
 	}
 	if state.Requeues > 0 {
-		err.WithRemedy("the coordinator's retry projection spent %d of a %d-attempt budget "+
+		err.WithRemedy("the orchestrator's retry projection spent %d of a %d-attempt budget "+
 			"on neutral outcomes before settling", state.Requeues, state.RetryBudget)
 	}
 	if state.Triage != nil {

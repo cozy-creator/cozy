@@ -1,6 +1,6 @@
 //go:build !windows
 
-package coord
+package orchestrator
 
 // bootstrapRequired: the unix transport carries SO_PEERCRED, so the kernel already
 // attests who dialled — no handed credential is needed.

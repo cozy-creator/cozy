@@ -11,7 +11,7 @@ import (
 	"github.com/cozy-creator/cozy-creator-v2/internal/exit"
 )
 
-// The coordinator's half of the ONE lifecycle authority (cl-001). Worker processes,
+// The orchestrator's half of the ONE lifecycle authority (cl-001). Worker processes,
 // their sessions, requests, attempts and outputs are rows in the SAME database as the
 // install generations and pins — one authority, one transaction boundary, no second
 // lifecycle store anywhere (the fence's `store` family proves the absence).
@@ -25,7 +25,7 @@ import (
 //      single INSERT...SELECT...WHERE NOT EXISTS statement — atomic by construction,
 //      so two concurrent starts cannot both win.
 
-var coordSchema = []string{`
+var orchestratorSchema = []string{`
 CREATE TABLE IF NOT EXISTS worker_processes (
   instance_id     TEXT PRIMARY KEY,
   endpoint        TEXT    NOT NULL,
@@ -80,11 +80,11 @@ CREATE TABLE IF NOT EXISTS publications (
   bytes        INTEGER NOT NULL DEFAULT 0,
   committed_at TEXT    NOT NULL
 )`, `
--- The DURABLE checkpoint exchange's coordinator half (cr-009 §Checkpoints). The worker
+-- The DURABLE checkpoint exchange's orchestrator half (cr-009 §Checkpoints). The worker
 -- has already made the save durable in its OWN journal; this is a SECOND observation,
 -- at-least-once like every other durable message (law 9). The identity is closed:
 -- repeating it replays the receipt, and the same key with different bytes CONFLICTS —
--- a coordinator conflict is a journaled fault and never un-writes the worker's fact.
+-- a orchestrator conflict is a journaled fault and never un-writes the worker's fact.
 CREATE TABLE IF NOT EXISTS job_checkpoints (
   request_id    TEXT    NOT NULL,
   attempt       INTEGER NOT NULL,
@@ -296,7 +296,7 @@ func (s *Store) DeviceHolders(devices []string) ([]string, *exit.Error) {
 }
 
 // BindSession records what Register reported. session_id is the WORKER's to mint; the
-// coordinator only binds it, and the unique index refuses two live workers sharing one.
+// orchestrator only binds it, and the unique index refuses two live workers sharing one.
 func (s *Store) BindSession(instanceID, sessionID string, incarnation int64) *exit.Error {
 	res, err := s.db.Exec(`UPDATE worker_processes
 		SET session_id=?, incarnation=?, state='registered'
@@ -527,7 +527,7 @@ func (s *Store) Unsettled() ([]Request, *exit.Error) {
 	return out, nil
 }
 
-// SettleRequest records the request's final state. Only a terminal the coordinator
+// SettleRequest records the request's final state. Only a terminal the orchestrator
 // ACCEPTED can settle one.
 func (s *Store) SettleRequest(id, state string) *exit.Error {
 	if _, err := s.db.Exec(`UPDATE requests SET state=? WHERE id=?`, state, id); err != nil {
@@ -678,7 +678,7 @@ func (s *Store) NextOrdinal(requestID string) (int64, *exit.Error) {
 // reads inside the old `NextOrdinal`: the second read (is an attempt live?) ran before the
 // first goroutine's insert committed, and the third (what is the highest ordinal?) ran
 // after it. So the law said "nothing is live" and the arithmetic said "one exists", and
-// the coordinator dispatched attempt 2 of a request whose attempt 1 was starting. The
+// the orchestrator dispatched attempt 2 of a request whose attempt 1 was starting. The
 // worker refused it — `live_attempt_supersession`, which is the runtime's own fence doing
 // its job — and the request FAILED. The ordinal is now minted by the writer that owns the
 // row, which is the only place it can be minted atomically.
@@ -738,7 +738,7 @@ func (s *Store) Accepted(requestID string, attempt int64, sessionID, planDigest,
 // `MediaID` is the client's ONLY handle on the bytes (cl-006). It is minted here, inside
 // the terminal transaction, and it is opaque: the client contract's media route takes a
 // media id and nothing else, so there is no representation of "fetch this path" for a
-// caller to shape. `Path` is the coordinator's own knowledge of where the runtime was
+// caller to shape. `Path` is the orchestrator's own knowledge of where the runtime was
 // granted to write, and it never leaves this process.
 type Output struct {
 	OutputID string
@@ -749,7 +749,7 @@ type Output struct {
 	MimeType string
 }
 
-// Terminal is what a worker journaled and the coordinator is about to make authoritative.
+// Terminal is what a worker journaled and the orchestrator is about to make authoritative.
 type Terminal struct {
 	RequestID        string
 	Attempt          int64
@@ -765,7 +765,7 @@ type Terminal struct {
 	// bundle: the bytes are copied out of the worker root and verified against the
 	// terminal's own TriageBundleRef before this transaction runs. A one-shot run
 	// deletes its worker root (cr-011 §8), so a bundle worth keeping is the client's
-	// to keep — and "the client" is this coordinator.
+	// to keep — and "the client" is this orchestrator.
 	TriageDigest string
 	TriageLength int64
 	TriagePath   string
@@ -776,12 +776,12 @@ type Terminal struct {
 	EventType    string
 	EventPayload map[string]any
 	// RequestState is what the REQUEST row becomes. It is not always the attempt's own
-	// status: an attempt the coordinator will requeue leaves the request QUEUED, and
+	// status: an attempt the orchestrator will requeue leaves the request QUEUED, and
 	// writing `abandoned` there would make the status document say `failed` for a
 	// request that is still going.
 	RequestState string
 	// Publication is the job lane's durable publication (cl-004), written INSIDE this
-	// transaction. `nil` for a serving attempt — and for a job attempt the coordinator
+	// transaction. `nil` for a serving attempt — and for a job attempt the orchestrator
 	// will requeue, because a requeued attempt has not ended the request.
 	Publication *Publication
 }
@@ -939,7 +939,7 @@ func (s *Store) Recover(requestID string, attempt int64, sessionID string) *exit
 	}
 	if n, _ := res.RowsAffected(); n != 1 {
 		return exit.New(exit.NotFound,
-			"the worker reported a recovered attempt %s#%d this coordinator never assigned",
+			"the worker reported a recovered attempt %s#%d this orchestrator never assigned",
 			requestID, attempt)
 	}
 	return nil
@@ -968,7 +968,7 @@ func (s *Store) Attempts(requestID string) ([]Attempt, *exit.Error) {
 }
 
 // OpenAttemptsOf is every attempt one worker INSTANCE still owes a terminal for. It is
-// what a coordinator asks when that worker's process dies: those attempts are not
+// what a orchestrator asks when that worker's process dies: those attempts are not
 // finished and not failed — they are unsettled, and the only thing that can settle one is
 // the supervisor's own journal, replayed by a worker in the SAME slot.
 func (s *Store) OpenAttemptsOf(instanceID string) ([]Attempt, *exit.Error) {
@@ -1002,7 +1002,7 @@ func (s *Store) attemptsWhere(where string, args ...any) ([]Attempt, *exit.Error
 	return out, nil
 }
 
-// VisibleOutputs answers ONLY for an attempt whose terminal the coordinator accepted.
+// VisibleOutputs answers ONLY for an attempt whose terminal the orchestrator accepted.
 // The join is the invariant: an output row exists only inside the terminal transaction,
 // so "visible without a terminal" has no representation.
 func (s *Store) VisibleOutputs(requestID string) ([]Output, *exit.Error) {
@@ -1129,10 +1129,10 @@ type Checkpoint struct {
 	RecordedAt    string
 }
 
-// RecordCheckpoint journals the coordinator's copy of one durable save and answers with
+// RecordCheckpoint journals the orchestrator's copy of one durable save and answers with
 // the row plus what happened: RECORDED (new), REPLAYED (the same identity again) or
 // CONFLICT (the same keys, different bytes). It never replaces a recorded digest — the
-// worker's own journal already made that fact durable, and a coordinator that overwrote
+// worker's own journal already made that fact durable, and a orchestrator that overwrote
 // it would be a second authority over one fact.
 func (s *Store) RecordCheckpoint(c Checkpoint) (Checkpoint, string, *exit.Error) {
 	held, err := s.db.Query(`SELECT `+checkpointCols+` FROM job_checkpoints

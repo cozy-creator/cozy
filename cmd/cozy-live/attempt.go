@@ -20,7 +20,7 @@ func runOut(name string, args ...string) (string, error) {
 	return out.String(), err
 }
 
-// sectionAttempt is the whole point of cl-001: the REAL product coordinator replacing
+// sectionAttempt is the whole point of cl-001: the REAL product orchestrator replacing
 // worker-live.py's scripted Hub, driving the REAL two-process runtime through one real
 // GPU attempt, and making the terminal and its output visible in ONE transaction.
 func sectionAttempt() {
@@ -33,23 +33,25 @@ func sectionAttempt() {
 
 	head("the LocalService starts the REAL cozy-runtime supervisor over its own socket")
 	bootStart := time.Now()
-	instance, e := lv.c.StartWorker(spec)
+	instance, _, e := lv.c.EnsureWorker(spec)
 	if e != nil {
 		check("StartWorker", false, e.Message)
 		return
 	}
 	check("worker spawned", true, "instance "+instance+", devices [0]")
-	if e := lv.c.WaitReady(instance, planID); e != nil {
+	if e := lv.c.EnsurePlacementReady(instance, planID); e != nil {
 		check("READY", false, e.Message+" "+e.Remedy)
 		fmt.Println(tail(lv.c.WorkerLog(instance), 25))
 		return
 	}
 	boot := time.Since(bootStart)
 	facts := lv.c.Worker(instance)
-	check("READY", true, fmt.Sprintf("%s, session %s incarnation %d epoch %d revision %d",
-		ms(boot), facts.BootID, facts.Generation, facts.Epoch, facts.Revision))
-	check("the worker advertises the plan this coordinator minted", len(facts.Ready) == 1 &&
-		facts.Ready[0] == planID, planID)
+	check("DISPATCHABLE", true, fmt.Sprintf(
+		"%s, boot %s executor %d placement %s/%s accepted %d converged %d",
+		ms(boot), facts.BootID, facts.Generation, facts.Materialization, facts.Serving,
+		facts.AcceptedRevision, facts.ConvergedRevision))
+	check("the worker advertises the plan this orchestrator minted",
+		len(facts.Dispatchable) == 1 && facts.Dispatchable[0] == planID, planID)
 
 	rows, _ := lv.store.LiveWorkers()
 	check("the device grant is an attribute of the worker row", len(rows) == 1 &&
@@ -72,7 +74,7 @@ func sectionAttempt() {
 	check("submit -> AttemptAccepted", true, ms(accepted))
 
 	// Before the terminal: the runtime may already have written bytes under the grant,
-	// and NONE of it is visible. Publication authority is the coordinator's alone.
+	// and NONE of it is visible. Publication authority is the orchestrator's alone.
 	beforeOutputs, _ := lv.store.VisibleOutputs(requestID)
 	check("no output is visible before the terminal is accepted", len(beforeOutputs) == 0,
 		fmt.Sprintf("%d visible", len(beforeOutputs)))
@@ -103,13 +105,13 @@ func sectionAttempt() {
 			o.OutputID)
 	}
 
-	head("the terminal document, read back from the ONE authority")
-	doc, rerr := canonical.Read(result.Body, &pb.TerminalBody{})
-	check("the journaled TerminalBody re-reads as canonical bytes", rerr == nil, detailOf(rerr))
+	head("the outcome document, read back from the ONE authority")
+	doc, rerr := canonical.Read(result.Body, &pb.AttemptOutcomeBody{})
+	check("the journaled AttemptOutcomeBody/2 re-reads as canonical bytes", rerr == nil, detailOf(rerr))
 	if rerr == nil {
 		env := doc.Sub("result")
 		inline, _ := env["inline_result"].(string)
-		check("the typed result rode the terminal INLINE", len(inline) > 0,
+		check("the typed result rode the outcome INLINE", len(inline) > 0,
 			fmt.Sprintf("%d base64 chars, schema %s", len(inline),
 				short(env.Str("result_schema_digest"))))
 		metrics := doc.Sub("metrics")
@@ -169,10 +171,10 @@ func sectionAttempt() {
 				strings.TrimSpace(line[strings.Index(line, "applied in")+len("applied in"):]))
 		}
 	}
-	fmt.Printf("  coordinator RSS while serving                       : %.1f MiB\n", rssMiB())
+	fmt.Printf("  orchestrator RSS while serving                       : %.1f MiB\n", rssMiB())
 
 	head("teardown")
-	lv.c.StopWorker(instance, 20*time.Second)
+	lv.c.ShutdownWorker(instance, 20*time.Second)
 	after, _ := lv.store.LiveWorkers()
 	check("stopping the worker released its device grant", len(after) == 0,
 		fmt.Sprintf("%d live worker row(s)", len(after)))

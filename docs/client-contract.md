@@ -216,8 +216,8 @@ none of these.
 | route | scope | auth | notes |
 |---|---|---|---|
 | `GET /v1/local/endpoints` | local | yes | installed endpoints and their functions |
-| `GET /v1/local/workers` | local | yes | live workers: protocol identities, devices, intake |
-| `POST /v1/local/workers` | local | yes | make one endpoint resident (idempotent); `{"endpoint":…, "warm":false}` skips the boot warm pass |
+| `GET /v1/local/workers` | local | yes | live workers: protocol identities, devices, worker phase, the placement's two axes, the admission fence |
+| `POST /v1/local/workers` | local | yes | ensure one endpoint resident (idempotent); answers `change`: `none` \| `worker_started` \| `placement_added`. `{"endpoint":…, "warm":false}` skips the boot warm pass |
 | `DELETE /v1/local/workers/{instance_id}` | local | yes | drain and stop the process group |
 | `GET /v1/local/doctor` | local | yes | host facts, bound families, counts |
 | `POST /v1/local/service/shutdown` | local | yes | ask the service to drain every worker and exit (`cozy down`'s cooperative tier); exit is proved by the service lock, never this reply |

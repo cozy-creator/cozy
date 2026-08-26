@@ -1,6 +1,6 @@
 //go:build linux
 
-package coord
+package orchestrator
 
 import (
 	"os"

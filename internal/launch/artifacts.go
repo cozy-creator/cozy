@@ -19,8 +19,8 @@ import (
 // cozy-creator asks that owner rather than reading its files — the index's layout is the
 // runtime's, and a second reader of it would be a second layout to keep in step.
 
-// Artifact is one locally installed checkpoint, in the runtime's own vocabulary.
-type Artifact struct {
+// ModelArtifact is one locally installed checkpoint, in the runtime's own vocabulary.
+type ModelArtifact struct {
 	Ref            string            `json:"ref"`
 	Store          string            `json:"store"`
 	Config         string            `json:"config"`
@@ -34,7 +34,7 @@ type Artifact struct {
 }
 
 // Components is the artifact's component set, ordered as the index orders it.
-func (a Artifact) Components() []string {
+func (a ModelArtifact) Components() []string {
 	out := make([]string, 0, len(a.Snapshots))
 	for name := range a.Snapshots {
 		out = append(out, name)
@@ -43,10 +43,10 @@ func (a Artifact) Components() []string {
 	return out
 }
 
-// Runtime is one generation's own cozy-runtime binary, run against a named local root.
+// RuntimeCLI is one generation's own cozy-runtime binary, run against a named local root.
 // Every question this host asks the runtime goes through here, so there is one place
 // that knows how to invoke it and one place that renders its refusals.
-type Runtime struct {
+type RuntimeCLI struct {
 	Bin  string   // the generation venv's cozy-runtime (home.VenvTool spells the platform)
 	Dir  string   // the endpoint project root
 	Home string   // COZY_HOME the runtime reads its artifact index out of
@@ -61,7 +61,7 @@ func Binary(generationDir string) string {
 }
 
 // json runs one verb and decodes its `--json` document.
-func (r Runtime) call(out any, verb ...string) *exit.Error {
+func (r RuntimeCLI) call(out any, verb ...string) *exit.Error {
 	args := append([]string{"--json", "--dir", r.Dir}, verb...)
 	cmd := exec.Command(r.Bin, args...)
 	cmd.Env = append(append([]string{}, r.Env...), "COZY_HOME="+r.Home)
@@ -130,8 +130,8 @@ func condense(s string) string {
 }
 
 // Artifacts is the local artifact index, as the runtime reports it.
-func (r Runtime) Artifacts() ([]Artifact, *exit.Error) {
-	var rows []Artifact
+func (r RuntimeCLI) Artifacts() ([]ModelArtifact, *exit.Error) {
+	var rows []ModelArtifact
 	if e := r.call(&rows, "list"); e != nil {
 		return nil, e
 	}
@@ -139,11 +139,11 @@ func (r Runtime) Artifacts() ([]Artifact, *exit.Error) {
 }
 
 // Find resolves one ref against the index. A miss is exit 4 naming the pull that fixes
-// it — the same refusal the runtime's own local coordinator raises for the same cause.
-func (r Runtime) Find(ref string) (Artifact, *exit.Error) {
+// it — the same refusal the runtime's own local orchestrator raises for the same cause.
+func (r RuntimeCLI) Find(ref string) (ModelArtifact, *exit.Error) {
 	rows, e := r.Artifacts()
 	if e != nil {
-		return Artifact{}, e
+		return ModelArtifact{}, e
 	}
 	for _, a := range rows {
 		if a.Ref == ref {
@@ -167,7 +167,7 @@ func (r Runtime) Find(ref string) (Artifact, *exit.Error) {
 	if held == "" {
 		held = "nothing"
 	}
-	return Artifact{}, exit.New(exit.NotFound,
+	return ModelArtifact{}, exit.New(exit.NotFound,
 		"%s is not in this host's local artifact index", ref).
 		WithRemedy("the index holds: %s", held).
 		WithNext("cozy pull " + ref)
@@ -193,7 +193,7 @@ type Binding struct {
 
 // Bindings is what this project SELECTS, resolved by the one resolver that owns the
 // grammar. It constructs nothing, touches no device and loads no weights.
-func (r Runtime) Bindings() ([]Binding, *exit.Error) {
+func (r RuntimeCLI) Bindings() ([]Binding, *exit.Error) {
 	var doc struct {
 		Bindings []Binding `json:"bindings"`
 	}
@@ -216,7 +216,7 @@ type Verdict struct {
 // row RENDERING because `fit --json` faulted on that build (a slotted dataclass read
 // through `__dict__`); cr-016 fixed it, and reading the document is what deletes the
 // parser.
-func (r Runtime) Fit(function string, payload []string) (map[string]any, []Verdict, *exit.Error) {
+func (r RuntimeCLI) Fit(function string, payload []string) (map[string]any, []Verdict, *exit.Error) {
 	var doc struct {
 		Host     map[string]any `json:"host"`
 		Verdicts []Verdict      `json:"verdicts"`
@@ -234,7 +234,7 @@ func (r Runtime) Fit(function string, payload []string) (map[string]any, []Verdi
 
 // HostFacts runs `doctor` — device/driver/CUDA tri-state, encoder capability, CAS and
 // credential presence. Host health only; it derives no fit verdict.
-func (r Runtime) HostFacts() (map[string]any, *exit.Error) {
+func (r RuntimeCLI) HostFacts() (map[string]any, *exit.Error) {
 	var doc map[string]any
 	if e := r.call(&doc, "doctor"); e != nil {
 		return nil, e

@@ -190,7 +190,7 @@ func handleRm(ctx *Context) *exit.Error {
 			removed.Rows = append(removed.Rows, map[string]string{
 				"endpoint":   p.Endpoint,
 				"major":      fmt.Sprintf("v%d", p.Major),
-				"generation": p.Generation,
+				"generation": p.InstallID,
 				"reclaimed":  render.Bytes(n),
 			})
 		}
@@ -265,7 +265,7 @@ func handleGC(ctx *Context) *exit.Error {
 	return emit(ctx, out)
 }
 
-func diskText(g records.Generation) string {
+func diskText(g records.EndpointInstall) string {
 	if g.BytesShared == 0 {
 		return render.Bytes(g.BytesExcl)
 	}

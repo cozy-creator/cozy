@@ -21,8 +21,8 @@ import (
 	"github.com/cozy-creator/cozy-creator-v2/internal/home"
 )
 
-// Env is the environment record: exactly what produced this generation's venv.
-type Env struct {
+// EnvironmentReceipt is the environment record: exactly what produced this generation's venv.
+type EnvironmentReceipt struct {
 	Python     string
 	UV         string
 	LockDigest string
@@ -34,7 +34,7 @@ type Env struct {
 	Warnings   []string
 }
 
-// BuildVenv is the ONE code-executing step, and it runs only after the source has
+// MaterializeEnvironment is the ONE code-executing step, and it runs only after the source has
 // been verified. The lock is absolute: there is no relaxed fallback and no resolve
 // that could write one — a lock that cannot satisfy this host refuses with uv's
 // exact words.
@@ -46,7 +46,7 @@ type Env struct {
 // that, never writes uv.lock, and never falls back to a resolve; a matching lock
 // needs no network at all (verified with UV_OFFLINE=1). The two flags are mutually
 // exclusive in uv, so this is the stronger reading of one rule, not a second one.
-func BuildVenv(sourceDir, venvDir string) (*Env, *exit.Error) {
+func MaterializeEnvironment(sourceDir, venvDir string) (*EnvironmentReceipt, *exit.Error) {
 	lock := filepath.Join(sourceDir, "uv.lock")
 	lockDigest, err := fileDigest(lock)
 	if err != nil {
@@ -55,7 +55,7 @@ func BuildVenv(sourceDir, venvDir string) (*Env, *exit.Error) {
 			WithRemedy("an endpoint release pins its whole closure; `uv sync --locked` has nothing to install without it")
 	}
 
-	env := &Env{
+	env := &EnvironmentReceipt{
 		LockDigest: "sha256:" + lockDigest,
 		Platform:   runtime.GOOS + "/" + runtime.GOARCH,
 		UV:         toolVersion("uv", "--version"),

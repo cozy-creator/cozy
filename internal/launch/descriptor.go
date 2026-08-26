@@ -1,6 +1,6 @@
 // Package launch turns an INSTALLED GENERATION into the facts needed to serve it: the
 // endpoint's verified surface, the artifact its binding selects, and the EndpointSpec the
-// coordinator launches. It is what replaces cl-006's `--dev-endpoint` document (cl-010).
+// orchestrator launches. It is what replaces cl-006's `--dev-endpoint` document (cl-010).
 //
 // Nothing here re-derives a fact its owner already produced:
 //
@@ -16,7 +16,7 @@
 //     default, in the runtime's own grammar and vocabulary.
 //
 // What cozy-creator DOES own is the LOCAL PINNED-BINDING RECORD it mints from those three
-// (see coord.Binding): th-004 owns the real EntrypointBindingPlan document, this is the
+// (see orchestrator.Binding): th-004 owns the real EntrypointBindingPlan document, this is the
 // named seam, and the identity rule — the plan id is the digest of the record's canonical
 // bytes — does not move when the document does.
 package launch
@@ -141,7 +141,7 @@ func (d *Descriptor) Names() []string {
 }
 
 // AssetPaths is every asset-typed field path of a result struct, dotted for nesting.
-// These ARE the output ids: the coordinator grants one destination per asset field path,
+// These ARE the output ids: the orchestrator grants one destination per asset field path,
 // so `--out` is a consequence of the endpoint's declared result rather than a convention
 // the CLI and the endpoint each have to remember. Same walk cr-016's `payload.asset_paths`
 // makes over the same document.

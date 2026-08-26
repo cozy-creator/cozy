@@ -19,7 +19,7 @@ type Layout struct {
 	Lock        string // the single-writer flock file
 	Service     string // the LocalService's liveness lock (cl-001; held, never read)
 	Workers     string // per-worker roots: journal, logs, staged binding plans
-	Outputs     string // the local output namespace the coordinator grants into
+	Outputs     string // the local output namespace the orchestrator grants into
 	// CAS is the shared local tensorfs store: the one place canonical bytes live on
 	// this host. cozy-creator names it and never writes into it — every byte crosses
 	// through the tfs binary (cl-012).
@@ -107,8 +107,8 @@ func ScratchRepo(org, requestID string) string {
 }
 
 // PublicationRoot is the one directory a job of this request may be granted to write
-// into. Every OutputDestination the coordinator mints resolves under it, and the fence
-// that proves so is `coord.publicationDest`.
+// into. Every OutputDestination the orchestrator mints resolves under it, and the fence
+// that proves so is `orchestrator.publicationDest`.
 func (l Layout) PublicationRoot(org, requestID string) string {
 	return filepath.Join(l.Publications, org, "_job-"+requestID)
 }
@@ -121,7 +121,7 @@ func (l Layout) PublicationStage(org, requestID string, attempt uint64) string {
 	return filepath.Join(l.PublicationRoot(org, requestID), ".staging", "a"+itoa(attempt))
 }
 
-// AttemptDir is the local output namespace for one attempt. The coordinator grants
+// AttemptDir is the local output namespace for one attempt. The orchestrator grants
 // exactly this directory and nothing above it; the runtime writes under the grant and
 // never learns who may read it.
 func (l Layout) AttemptDir(requestID string, attempt uint64) string {

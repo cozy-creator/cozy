@@ -7,9 +7,9 @@ import (
 
 	"github.com/cozy-creator/cozy-creator-v2/internal/api"
 	"github.com/cozy-creator/cozy-creator-v2/internal/config"
-	"github.com/cozy-creator/cozy-creator-v2/internal/coord"
 	"github.com/cozy-creator/cozy-creator-v2/internal/exit"
 	"github.com/cozy-creator/cozy-creator-v2/internal/launch"
+	"github.com/cozy-creator/cozy-creator-v2/internal/orchestrator"
 	"github.com/cozy-creator/cozy-creator-v2/internal/records"
 )
 
@@ -33,7 +33,7 @@ type Resolver struct {
 	// cache holds the specs already derived this launch. Deriving one reads a descriptor
 	// and asks the runtime for its artifact index; a generation is IMMUTABLE, so doing it
 	// twice would answer the same thing twice.
-	cache map[string]coord.EndpointSpec
+	cache map[string]orchestrator.WorkerLaunchSpec
 	// Devices is the device envelope a worker this host launches may SEE.
 	Devices []string
 }
@@ -42,13 +42,13 @@ type Resolver struct {
 func NewResolver(store *records.Store, cfg config.Config) *Resolver {
 	return &Resolver{
 		store: store, cfg: cfg,
-		cache:   map[string]coord.EndpointSpec{},
+		cache:   map[string]orchestrator.WorkerLaunchSpec{},
 		Devices: []string{"0"},
 	}
 }
 
 // Resolve answers with the spec for one endpoint ref.
-func (r *Resolver) Resolve(endpoint string) (coord.EndpointSpec, *exit.Error) {
+func (r *Resolver) Resolve(endpoint string) (orchestrator.WorkerLaunchSpec, *exit.Error) {
 	endpoint = strings.TrimSpace(endpoint)
 	r.mu.Lock()
 	spec, ok := r.cache[endpoint]
@@ -58,15 +58,15 @@ func (r *Resolver) Resolve(endpoint string) (coord.EndpointSpec, *exit.Error) {
 	}
 	gen, e := r.generation(endpoint)
 	if e != nil {
-		return coord.EndpointSpec{}, e
+		return orchestrator.WorkerLaunchSpec{}, e
 	}
 	facts, e := launch.Read(*gen, r.cfg.Home, r.cfg.Tool())
 	if e != nil {
-		return coord.EndpointSpec{}, e
+		return orchestrator.WorkerLaunchSpec{}, e
 	}
 	spec, e = facts.Spec(r.Devices)
 	if e != nil {
-		return coord.EndpointSpec{}, e
+		return orchestrator.WorkerLaunchSpec{}, e
 	}
 	r.mu.Lock()
 	r.cache[endpoint] = spec
@@ -80,14 +80,14 @@ func (r *Resolver) Resolve(endpoint string) (coord.EndpointSpec, *exit.Error) {
 //
 // It is NOT cached: a job spec is per-function, and caching by endpoint alone was exactly
 // the shape that would hand a serving spec to a job.
-func (r *Resolver) ResolveJob(endpoint, function string) (coord.EndpointSpec, *exit.Error) {
+func (r *Resolver) ResolveJob(endpoint, function string) (orchestrator.WorkerLaunchSpec, *exit.Error) {
 	gen, e := r.generation(strings.TrimSpace(endpoint))
 	if e != nil {
-		return coord.EndpointSpec{}, e
+		return orchestrator.WorkerLaunchSpec{}, e
 	}
 	facts, e := launch.Read(*gen, r.cfg.Home, r.cfg.Tool())
 	if e != nil {
-		return coord.EndpointSpec{}, e
+		return orchestrator.WorkerLaunchSpec{}, e
 	}
 	spec, _, e := facts.JobSpec(function, r.Devices)
 	return spec, e
@@ -118,7 +118,7 @@ func (r *Resolver) Jobs(endpoint string) ([]launch.JobFacts, *exit.Error) {
 // generation resolves the ACTIVE pin for an endpoint. A ref may name its major
 // (`org/name@v2`); without one, a single pinned major answers and several refuse rather
 // than picking.
-func (r *Resolver) generation(ref string) (*records.Generation, *exit.Error) {
+func (r *Resolver) generation(ref string) (*records.EndpointInstall, *exit.Error) {
 	endpoint, major, hasMajor := splitMajor(ref)
 	if r.store == nil {
 		return nil, exit.Unavailablef("this LocalService has no install records")
@@ -148,13 +148,13 @@ func (r *Resolver) generation(ref string) (*records.Generation, *exit.Error) {
 			WithRemedy("majors: %s — a major is a required path segment, never a default", majorsOf(pins)).
 			WithNext("cozy ls")
 	}
-	gen, e := r.store.Generation(chosen.Generation)
+	gen, e := r.store.Install(chosen.InstallID)
 	if e != nil {
 		return nil, e
 	}
 	if gen == nil {
 		return nil, exit.Internalf("%s is pinned to generation %s and that row is gone",
-			endpoint, chosen.Generation)
+			endpoint, chosen.InstallID)
 	}
 	return gen, nil
 }

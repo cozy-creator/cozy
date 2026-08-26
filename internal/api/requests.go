@@ -9,8 +9,8 @@ import (
 	"strings"
 
 	"github.com/cozy-creator/cozy-creator-v2/internal/canonical"
-	"github.com/cozy-creator/cozy-creator-v2/internal/coord"
 	"github.com/cozy-creator/cozy-creator-v2/internal/exit"
+	"github.com/cozy-creator/cozy-creator-v2/internal/orchestrator"
 	"github.com/cozy-creator/cozy-creator-v2/internal/records"
 	pb "github.com/cozy-creator/cozy-creator-v2/protocol/cozy/worker/v1"
 )
@@ -22,7 +22,7 @@ import (
 // this host adds a field it is ADDITIVE and named as such in docs/client-contract.md.
 
 // Submission is the request body. `input` is the endpoint's own typed payload and is
-// carried VERBATIM: the coordinator digests exactly the bytes the client sent, so a
+// carried VERBATIM: the orchestrator digests exactly the bytes the client sent, so a
 // re-submit under one key compares the same digest a hub would have compared.
 type Submission struct {
 	Endpoint string          `json:"endpoint"`
@@ -111,7 +111,7 @@ func (s *Server) submit(w http.ResponseWriter, r *http.Request) {
 	}
 	spec.BodyDigest = digest
 
-	requestID, attempt, fresh, e := s.coord.SubmitDetail(spec)
+	requestID, attempt, fresh, e := s.orchestrator.SubmitDetail(spec)
 	if e != nil {
 		s.refuseTyped(w, r, e)
 		return
@@ -136,7 +136,7 @@ func (s *Server) submit(w http.ResponseWriter, r *http.Request) {
 // submissionDigest is the canonical identity of one submission. It uses the SAME writer
 // the protocol documents use, so the digest a client can reproduce is the digest the
 // authority recorded.
-func submissionDigest(spec coord.Submission) (string, *exit.Error) {
+func submissionDigest(spec orchestrator.Submission) (string, *exit.Error) {
 	doc := map[string]canonical.Value{
 		"format":   "cozy.client.Submission/1",
 		"endpoint": spec.Endpoint,
@@ -179,7 +179,7 @@ func (s *Server) handleOf(row records.Request, attempt uint64) Handle {
 func contractStatus(state string) string {
 	switch state {
 	case "submitted", "queued":
-		// `queued` is BOTH "never dispatched" and "an attempt ended and the coordinator
+		// `queued` is BOTH "never dispatched" and "an attempt ended and the orchestrator
 		// is minting the next ordinal". From a client's seat those are the same fact:
 		// work is owed and nothing has settled.
 		return "queued"
@@ -195,12 +195,12 @@ func contractStatus(state string) string {
 	return state
 }
 
-// resolvePlan turns the client's endpoint/function into the coordinator's Submission.
+// resolvePlan turns the client's endpoint/function into the orchestrator's Submission.
 // The plan id is resolved through the LOCAL resolver — the same object `start` uses — so
 // a client never names a plan digest and a submission can never bind a binding this host
 // did not install.
-func (s *Server) resolvePlan(sub Submission) (coord.Submission, *exit.Error) {
-	out := coord.Submission{
+func (s *Server) resolvePlan(sub Submission) (orchestrator.Submission, *exit.Error) {
+	out := orchestrator.Submission{
 		Endpoint: sub.Endpoint, Entrypoint: sub.Function, Payload: []byte(sub.Input),
 		Outputs: sub.Outputs, PlanID: sub.PlanID, Worker: sub.Worker,
 	}
@@ -226,7 +226,7 @@ func (s *Server) resolvePlan(sub Submission) (coord.Submission, *exit.Error) {
 		if e != nil {
 			return out, e
 		}
-		for _, b := range spec.Bindings {
+		for _, b := range spec.Placement.Bindings {
 			if b.Entrypoint != sub.Function {
 				continue
 			}
@@ -241,7 +241,7 @@ func (s *Server) resolvePlan(sub Submission) (coord.Submission, *exit.Error) {
 				WithRemedy("GET /v1/local/endpoints lists the functions this host serves")
 		}
 		if len(out.Outputs) == 0 {
-			out.Outputs = spec.OutputsFor(sub.Function)
+			out.Outputs = spec.Placement.OutputsFor(sub.Function)
 		}
 	}
 	return out, nil
@@ -280,7 +280,7 @@ type MediaRef struct {
 	Digest   string `json:"digest"`
 }
 
-// TriageRef is the handle onto a retained bundle. `attempt_key` is the coordinator's own
+// TriageRef is the handle onto a retained bundle. `attempt_key` is the orchestrator's own
 // opaque key; `subject_id` is the runtime's. Neither is a path.
 type TriageRef struct {
 	AttemptKey string `json:"attempt_key"`
@@ -336,7 +336,7 @@ func (s *Server) lifecycleOf(row records.Request) Lifecycle {
 	if len(last.TerminalBody) == 0 {
 		return life
 	}
-	doc, err := canonical.Read(last.TerminalBody, &pb.TerminalBody{})
+	doc, err := canonical.Read(last.TerminalBody, &pb.AttemptOutcomeBody{})
 	if err != nil {
 		return life
 	}
@@ -438,7 +438,7 @@ func (s *Server) cancelRequest(w http.ResponseWriter, r *http.Request) {
 			grace = n
 		}
 	}
-	if e := s.coord.Cancel(id, uint64(last.Attempt), pb.CancelReason_CANCEL_REASON_CLIENT, grace); e != nil {
+	if e := s.orchestrator.Cancel(id, uint64(last.Attempt), pb.CancelReason_CANCEL_REASON_CLIENT, grace); e != nil {
 		s.refuseTyped(w, r, e)
 		return
 	}

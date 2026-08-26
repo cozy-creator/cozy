@@ -10,14 +10,14 @@ import (
 	"strings"
 	"time"
 
-	"github.com/cozy-creator/cozy-creator-v2/internal/coord"
 	"github.com/cozy-creator/cozy-creator-v2/internal/launch"
+	"github.com/cozy-creator/cozy-creator-v2/internal/orchestrator"
 )
 
 const (
 	mib = 1 << 20
 	gib = 1 << 30
-	// The release cr-005's real SDXL UNet is published under. The coordinator pins it and
+	// The release cr-005's real SDXL UNet is published under. The orchestrator pins it and
 	// refuses a worker that registers under any other.
 	release = "cozy/sdxl-unet@cr-005"
 )
@@ -27,7 +27,7 @@ const (
 // the REAL cozy-runtime supervisor and executor from a read-only checkout.
 //
 // The binding RECORD is cozy-creator's own: it is the local pinned-binding record this
-// coordinator owns, staged into the worker's COZY_HOME, and the plan id on the wire is
+// orchestrator owns, staged into the worker's COZY_HOME, and the plan id on the wire is
 // the digest of its canonical bytes. th-004 replaces the document later; the identity
 // rule does not move.
 // PIN THE RUNTIME. `--runtime` may name a `git archive` of a pinned cozy-runtime commit
@@ -35,9 +35,9 @@ const (
 // not in a git archive). Found by being bitten, mid-run: another agent's UNCOMMITTED
 // cr-009 edit added `job_capacity=` beside `serving_capacity=` in the supervisor's
 // Report, and `capacity` is a proto ONEOF — so every Report advertised zero ready
-// serving plans and no coordinator could ever dispatch. A verification whose peer moves
+// serving plans and no orchestrator could ever dispatch. A verification whose peer moves
 // underneath it measures nothing, and the pin is what makes a number readable.
-func sdxlSpec(entrypoints ...string) coord.EndpointSpec {
+func sdxlSpec(entrypoints ...string) orchestrator.WorkerLaunchSpec {
 	runtime := flag("runtime", "/home/fidika/cozy_v2/cozy-runtime")
 	venv := flag("venv", filepath.Join(runtime, "corpus", ".venv"))
 	bench := flag("bench", "/home/fidika/cozy_v2/tensorfs-bench")
@@ -57,9 +57,9 @@ func sdxlSpec(entrypoints ...string) coord.EndpointSpec {
 		must("the bench checkpoint", fmt.Errorf("no checkpoint digest in results/checkpoint.txt"))
 	}
 
-	var bindings []*coord.Binding
+	var bindings []*orchestrator.Binding
 	for _, entrypoint := range entrypoints {
-		bindings = append(bindings, &coord.Binding{
+		bindings = append(bindings, &orchestrator.Binding{
 			Entrypoint: entrypoint,
 			Record: map[string]any{
 				"project":              filepath.Join(runtime, "corpus", "endpoint"),
@@ -84,12 +84,15 @@ func sdxlSpec(entrypoints ...string) coord.EndpointSpec {
 		})
 	}
 
-	return coord.EndpointSpec{
-		Endpoint:   "cozy/sdxl-unet",
-		ReleaseID:  release,
-		Generation: "", // an uninstalled dev tree: cl-009 generations pin an installed one
+	return orchestrator.WorkerLaunchSpec{
+		Placement: orchestrator.DesiredPlacement{
+			Endpoint:  "cozy/sdxl-unet",
+			ReleaseID: release,
+			InstallID: "", // an uninstalled dev tree: cl-009 installs pin a real one
+			Bindings:  bindings,
+		},
 		// nice(1) is this DRIVER's resource discipline on a shared box, imposed on the
-		// launch rather than baked into the coordinator's policy.
+		// launch rather than baked into the orchestrator's policy.
 		Python: "/usr/bin/nice",
 		// `launch.Binary` names the runtime, so the ONE site that spells the binary stays the
 		// one site (the `runtime` fence). This dev spec points it at the corpus venv rather
@@ -98,14 +101,13 @@ func sdxlSpec(entrypoints ...string) coord.EndpointSpec {
 		Dir:      runtime,
 		Imposed:  []string{"PYTHONPATH=" + runtime + ":" + filepath.Join(runtime, "src")},
 		Devices:  []string{"0"},
-		Bindings: bindings,
 		GraceSec: 3,
 	}
 }
 
 // planIDOf resolves the wire id of one staged binding.
-func planIDOf(spec coord.EndpointSpec, entrypoint string) string {
-	for _, b := range spec.Bindings {
+func planIDOf(spec orchestrator.WorkerLaunchSpec, entrypoint string) string {
+	for _, b := range spec.Placement.Bindings {
 		if b.Entrypoint == entrypoint {
 			id, e := b.PlanID()
 			if e != nil {

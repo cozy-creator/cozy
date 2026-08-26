@@ -17,7 +17,7 @@ var FoundationTokens = []string{
 	"records.sqlite",         // ONE local SQLite lifecycle database, pure-Go driver
 	"service.lock",           // liveness is an OS advisory lock the owner holds
 	"worker.protocol.v1",     // the cozy.worker.v1 server over a unix socket
-	"coordinator.local",      // local dispatch: request -> attempt -> terminal -> visible output
+	"orchestrator.local",     // local dispatch: request -> attempt -> terminal -> visible output
 	"terminal.transaction",   // terminal accepted + output visible commit together
 	"catalog.public_reads",   // hub catalog reads carry no credential
 	"hub.static_token",       // first-party writes carry ONE static admin token; no login act exists
@@ -200,7 +200,7 @@ var Commands = []Command{
 	// ---- invocation (cl-010) ----
 	{
 		Path: []string{"run"}, Group: "invocation",
-		Summary: "invoke one function through the coordinator — the one invocation path",
+		Summary: "invoke one function through the orchestrator — the one invocation path",
 		Args:    "<org/endpoint/vN/function> [<primary>] [key=value …]", MinArgs: 1, MaxArgs: -1,
 		Flags: []Flag{
 			{Name: "--model", Arg: "<[binding-path=]ref|path>", Summary: "override a model binding (repeatable)"},
@@ -441,7 +441,7 @@ var Commands = []Command{
 	},
 	{
 		Path: []string{"export"}, Group: "transfer",
-		Summary: "authorized local checkpoint export through the coordinator surface",
+		Summary: "authorized local checkpoint export through the orchestrator surface",
 		Args:    "<ref>", MinArgs: 1, MaxArgs: 1,
 		Exits:      []exit.Code{exit.OK, exit.NotFound, exit.Unavailable},
 		Capability: "cmd.export", NeedsServer: true, Status: Planned, Issue: "cl-008",

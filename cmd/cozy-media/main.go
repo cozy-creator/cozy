@@ -359,7 +359,7 @@ func (s *server) putInput(w http.ResponseWriter, r *http.Request) {
 //
 // The record is not taken on trust: its IDENTITY is re-hashed here and must equal the id
 // it was delivered under. A record that does not hash to its own name is not the plan the
-// coordinator is about to name in a directive, whoever sent it — so it is refused rather
+// orchestrator is about to name in a directive, whoever sent it — so it is refused rather
 // than staged, and the worker never resolves a plan id against bytes nobody agreed to.
 func (s *server) putPlan(w http.ResponseWriter, r *http.Request) {
 	if !s.admits(w, r) {

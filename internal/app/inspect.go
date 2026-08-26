@@ -81,7 +81,7 @@ func handleDescribe(ctx *Context) *exit.Error {
 		Empty:     "this release registers 0 functions",
 		Aggregates: []render.Field{
 			{K: "endpoint", V: endpoint},
-			{K: "generation", V: short12(facts.Generation.ID)},
+			{K: "generation", V: short12(facts.Install.ID)},
 			{K: "surface_digest", V: d.Digest},
 		},
 		Next: []string{"cozy describe " + ctx.Inv.Args[0] + "/<function>"}})
@@ -167,13 +167,13 @@ func handleDoctor(ctx *Context) *exit.Error {
 	_ = endpoints
 	notes := []string{}
 	if facts, e := anyGeneration(ctx); e == nil && facts != nil {
-		host, e := facts.Runtime.HostFacts()
+		host, e := facts.RuntimeCLI.HostFacts()
 		if e != nil {
 			notes = append(notes, "device facts unreadable: "+e.Message)
 		} else {
 			fields = append(fields, render.Field{K: "device", V: hostSummary(host)})
 			notes = append(notes, "device/driver/CUDA facts derived by "+
-				facts.Generation.Endpoint+"'s own cozy-runtime")
+				facts.Install.Endpoint+"'s own cozy-runtime")
 		}
 	} else {
 		notes = append(notes, "no endpoint is installed, so no runtime is present to report device facts")
@@ -228,7 +228,7 @@ func handleFit(ctx *Context) *exit.Error {
 	if e != nil {
 		return e
 	}
-	hostFacts, verdicts, e := facts.Runtime.Fit(function, nil)
+	hostFacts, verdicts, e := facts.RuntimeCLI.Fit(function, nil)
 	if e != nil {
 		return e
 	}

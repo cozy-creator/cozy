@@ -15,7 +15,7 @@ import (
 //
 // cr-011 built the bundle and made it explainable from a directory; it deliberately did
 // NOT build two things, and both are here: PERSISTENCE (a one-shot run deletes its worker
-// root, so a bundle worth keeping is copied by the client — coord/server.go's
+// root, so a bundle worth keeping is copied by the client — orchestrator/server.go's
 // captureTriage) and RENDERING.
 //
 // The read path is a key and a digest, exactly as the runtime's own reader is:
@@ -25,7 +25,7 @@ import (
 //
 // The one deliberate DIVERGENCE from cr-011's `BundleStore.read`: it verifies against the
 // RUNTIME'S JOURNALED RECEIPT, and this verifies against the TERMINAL DOCUMENT. The
-// terminal is strictly stronger evidence here — this coordinator recomputed its digest
+// terminal is strictly stronger evidence here — this orchestrator recomputed its digest
 // over the resident bytes, parsed it under unknown-field refusal, and committed it in the
 // same transaction as the outputs. The worker's journal is a file the worker can still
 // write; the accepted terminal is not.
@@ -67,7 +67,7 @@ func (s *Server) triage(w http.ResponseWriter, r *http.Request) {
 	if row.TriagePath == "" {
 		s.refuse(w, r, http.StatusGone, "bundle_not_kept",
 			"attempt "+key+" named bundle "+row.TriageSubject+" and its bytes were not kept",
-			"the coordinator refused the bytes when the terminal was accepted; the terminal itself still stands")
+			"the orchestrator refused the bytes when the terminal was accepted; the terminal itself still stands")
 		return
 	}
 	data, err := os.ReadFile(row.TriagePath)

@@ -1,4 +1,4 @@
-package coord
+package orchestrator
 
 import (
 	"encoding/json"
@@ -13,7 +13,7 @@ import (
 	pb "github.com/cozy-creator/cozy-creator-v2/protocol/cozy/worker/v1"
 )
 
-// THE JOB BRANCH (cl-004). A job is an ATTEMPT CLASS on this one coordinator, not a
+// THE JOB BRANCH (cl-004). A job is an ATTEMPT CLASS on this one orchestrator, not a
 // second scheduler: it reuses the request row, the ordinal law, the dispatch queue, the
 // terminal transaction, the requeue projection and the event plane unchanged. What
 // differs is exactly what cr-009 says differs — a `JobDirective` instead of a
@@ -29,13 +29,13 @@ import (
 //     which nothing in the reclaim path touches. `publicationDest` is the fence: a
 //     destination that resolves outside that root is refused BEFORE the attempt is
 //     dispatched, so the escape is unrepresentable rather than defended against.
-//  2. THE DURABLE CHECKPOINT EXCHANGE's coordinator half. The worker has already made
+//  2. THE DURABLE CHECKPOINT EXCHANGE's orchestrator half. The worker has already made
 //     the save durable in its own journal; this side records the identity and answers
 //     with a receipt. It is a SECOND observation, never a second authority (law 9).
 
 // JobPlan is cozy-creator's LOCAL JOB PLAN RECORD: the resolution of one
 // `job_descriptor_id` against this machine. Same seam as `Binding`, one lane over — the
-// coordinator names the job by DIGEST and never ships a path, and the worker resolves
+// orchestrator names the job by DIGEST and never ships a path, and the worker resolves
 // that digest against a small local file under `<worker home>/job-plans/`.
 type JobPlan struct {
 	Function     string
@@ -69,21 +69,23 @@ func stageJobPlans(workerHome string, plans []*JobPlan) *exit.Error {
 	return nil
 }
 
-// sendJobDirective issues the JOB-mode full-replace Directive. A Directive is a
-// discriminated COMPLETE replacement carrying its own `mode` oneof, so a worker is in
+// sendJobDirective issues the JOB-mode full-replace desired state. A DesiredWorkerState is
+// a discriminated COMPLETE replacement carrying its own `mode` oneof, so a worker is in
 // exactly ONE mode until the next revision — the branch is stated here rather than
-// inferred from which field happens to be populated (cr-009's `fabd6fc` lesson).
-func (c *Coordinator) sendJobDirective(s *session, w *worker) {
-	plan := w.spec.Jobs[0]
+// inferred from which field happens to be populated (cr-009's `fabd6fc` lesson). Job mode
+// hosts no PLACEMENT at all: there is no set, no serving axis, and no placement_id on its
+// attempts.
+func (c *Orchestrator) sendJobDirective(s *session, w *worker) {
+	plan := w.spec.Placement.Jobs[0]
 	rev := c.nextRevision()
 	c.mu.Lock()
 	w.revision = rev
 	c.mu.Unlock()
-	d := &pb.Directive{
+	d := &pb.DesiredWorkerState{
 		Revision: rev, WireMinor: pb.WireMinor,
 		Posture: pb.Posture_POSTURE_ACCEPTING,
-		Mode: &pb.Directive_Job{Job: &pb.JobDirective{
-			BuildId:         w.spec.ReleaseID,
+		Mode: &pb.DesiredWorkerState_Job{Job: &pb.JobDirective{
+			BuildId:         w.spec.Placement.ReleaseID,
 			JobDescriptorId: plan.DescriptorID,
 			ResourceCaps: &pb.ResourceCaps{
 				DeviceRequired: gpuCountOf(plan) > 0,
@@ -97,15 +99,15 @@ func (c *Coordinator) sendJobDirective(s *session, w *worker) {
 				Outputs: outputBindings(plan.Outputs, maxOutputBytes),
 			},
 			// TERMINAL AND RECLAIM, everywhere. A job worker is one immutable build
-			// running one bounded attempt; deep queueing is the coordinator's dispatch
+			// running one bounded attempt; deep queueing is the orchestrator's dispatch
 			// queue, not a warm worker (audit-adopted, 2026-08-26).
 			ReclaimOnTerminal: true,
 			DeviceCount:       uint32(gpuCountOf(plan)),
 		}},
 	}
-	d.OwnerEpoch, d.ControlGeneration, d.WorkerBootId = ownerEpoch, s.generation, s.bootID
-	s.send(&pb.OwnerFrame{Msg: &pb.OwnerFrame_Directive{Directive: d}})
-	c.logf("Directive revision=%d posture=accepting JOB %s (%s) -> %s",
+	d.RecordOwnerEpoch, d.ControlStreamGeneration, d.WorkerBootId = recordOwnerEpoch, s.generation, s.bootID
+	s.send(&pb.RecordOwnerFrame{Msg: &pb.RecordOwnerFrame_DesiredState{DesiredState: d}})
+	c.logf("DesiredWorkerState revision=%d posture=accepting JOB %s (%s) -> %s",
 		rev, plan.Function, shortDigest(plan.DescriptorID), s.bootID)
 }
 
@@ -146,7 +148,7 @@ func publicationDest(root, outputID string) (string, *exit.Error) {
 //
 // There is no credential here either. A local grant is a CAS root plus a directory, and a
 // job's directory is the durable one.
-func (c *Coordinator) jobGrant(req records.Request, attempt uint64) (*pb.DeliveryGrant, string, *exit.Error) {
+func (c *Orchestrator) jobGrant(req records.Request, attempt uint64) (*pb.DeliveryGrant, string, *exit.Error) {
 	// THE JOB WRITES INTO A STAGE, never into the addressable publication root. The root
 	// is where a COMMITTED bundle lives; the stage is where an attempt in flight puts its
 	// bytes, and `promote` moves them across after the terminal is verified.
@@ -217,7 +219,7 @@ func splitList(joined string) []string {
 // THE CHECKPOINT HALF IS A RUNTIME-BORDER SEAM, NOT A CREATOR PROTOCOL.
 //
 // A job that produces canonical bytes writes them through the ONE TensorFS border and the
-// PUBLICATION TRANSACTION is the runtime's (cr-005/cr-009, jobs.md). What this coordinator
+// PUBLICATION TRANSACTION is the runtime's (cr-005/cr-009, jobs.md). What this orchestrator
 // owes is the half it owns: validate ONE typed durable publication receipt the runtime
 // produced, root what that receipt names, and record the catalog projection.
 //
@@ -235,7 +237,7 @@ func splitList(joined string) []string {
 // under the durable publication root, recorded in the one lifecycle authority.
 
 // publicationOf builds the row that becomes durable INSIDE the terminal transaction.
-func (c *Coordinator) publicationOf(req records.Request, attempt uint64, status, cause string,
+func (c *Orchestrator) publicationOf(req records.Request, attempt uint64, status, cause string,
 	outputs []records.Output) *records.Publication {
 	var bytes int64
 	for _, o := range outputs {
@@ -258,7 +260,7 @@ func (c *Coordinator) publicationOf(req records.Request, attempt uint64, status,
 // that makes the publication exist, so the addressable path only ever holds bytes some
 // terminal vouched for: a job never writes there itself, and a crash before the commit
 // leaves the root without them.
-func (c *Coordinator) promote(req records.Request, attempt uint64, outputs []records.Output) *exit.Error {
+func (c *Orchestrator) promote(req records.Request, attempt uint64, outputs []records.Output) *exit.Error {
 	root := c.opt.Layout.PublicationRoot(req.Org, req.ID)
 	for i, o := range outputs {
 		dest, e := publicationDest(root, o.OutputID)
@@ -299,21 +301,21 @@ func (c *Coordinator) promote(req records.Request, attempt uint64, outputs []rec
 // over the control lane — deliberately not the lossy one — and the identity it presents
 // is closed: repeating it replays the receipt, and the same operation/logical key with
 // different bytes is a CONFLICT, never a replacement.
-func (c *Coordinator) onCheckpoint(s *session, r *pb.JobCheckpointRequest) {
+func (c *Orchestrator) onCheckpoint(s *session, r *pb.JobCheckpointRequest) {
 	digest, _ := canonical.Spell(r.ContentDigest)
 	row, outcome, e := c.opt.Store.RecordCheckpoint(records.Checkpoint{
-		RequestID: r.RequestId, Attempt: int64(r.Attempt),
+		RequestID: r.RequestId, Attempt: int64(r.AttemptOrdinal),
 		OperationKey: r.OperationKey, LogicalKey: r.LogicalKey, ContentDigest: digest,
 	})
 	if e != nil {
 		c.logf("checkpoint %s/%s of %s#%d NOT journaled: %s",
-			r.OperationKey, r.LogicalKey, r.RequestId, r.Attempt, e.Message)
+			r.OperationKey, r.LogicalKey, r.RequestId, r.AttemptOrdinal, e.Message)
 		s.send(checkpointReceipt(s, r, "", pb.CheckpointOutcome_CHECKPOINT_OUTCOME_REFUSED,
 			pb.CheckpointFaultCode_CHECKPOINT_FAULT_CODE_UNKNOWN_ATTEMPT, e.Message))
 		return
 	}
 	c.logf("checkpoint %s/%s of %s#%d %s (%s)", r.OperationKey, r.LogicalKey,
-		r.RequestId, r.Attempt, outcome, shortDigest(digest))
+		r.RequestId, r.AttemptOrdinal, outcome, shortDigest(digest))
 	switch outcome {
 	case "CONFLICT":
 		s.send(checkpointReceipt(s, r, row.ReceiptID, pb.CheckpointOutcome_CHECKPOINT_OUTCOME_CONFLICT,
@@ -326,15 +328,16 @@ func (c *Coordinator) onCheckpoint(s *session, r *pb.JobCheckpointRequest) {
 }
 
 func checkpointReceipt(s *session, r *pb.JobCheckpointRequest, receiptID string,
-	outcome pb.CheckpointOutcome, code pb.CheckpointFaultCode, detail string) *pb.OwnerFrame {
+	outcome pb.CheckpointOutcome, code pb.CheckpointFaultCode, detail string) *pb.RecordOwnerFrame {
 	receipt := &pb.JobCheckpointReceipt{
-		RequestId: r.RequestId, Attempt: r.Attempt, OperationKey: r.OperationKey,
+		RequestId: r.RequestId, AttemptOrdinal: r.AttemptOrdinal, OperationKey: r.OperationKey,
 		LogicalKey: r.LogicalKey, ContentDigest: r.ContentDigest,
 		ReceiptId: receiptID, Outcome: outcome,
 	}
-	receipt.OwnerEpoch, receipt.ControlGeneration, receipt.WorkerBootId = ownerEpoch, s.generation, s.bootID
+	receipt.RecordOwnerEpoch, receipt.ControlStreamGeneration, receipt.WorkerBootId =
+		recordOwnerEpoch, s.generation, s.bootID
 	if detail != "" {
 		receipt.Fault = &pb.CheckpointFault{Code: code, Detail: detail}
 	}
-	return &pb.OwnerFrame{Msg: &pb.OwnerFrame_CheckpointReceipt{CheckpointReceipt: receipt}}
+	return &pb.RecordOwnerFrame{Msg: &pb.RecordOwnerFrame_CheckpointReceipt{CheckpointReceipt: receipt}}
 }

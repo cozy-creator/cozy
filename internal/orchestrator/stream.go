@@ -1,4 +1,4 @@
-package coord
+package orchestrator
 
 import (
 	"encoding/json"
@@ -25,7 +25,7 @@ import (
 
 // Frame is one live tick, exactly as the runtime encoded it. cozy-creator does not own
 // this shape: `Type` and `Value` are the runtime's `{"type": kind, "payload": value}`
-// (cozy-runtime session.emit_progress), and this coordinator transports them verbatim
+// (cozy-runtime session.emit_progress), and this orchestrator transports them verbatim
 // rather than inventing a second vocabulary for them.
 type Frame struct {
 	RequestID string `json:"request_id"`
@@ -57,7 +57,7 @@ func newFanout() *fanout {
 
 // Subscribe opens a live frame feed. An empty requestID takes every request's frames.
 // The returned function must be called; it is the only way a subscriber is forgotten.
-func (c *Coordinator) Subscribe(requestID string) (<-chan Frame, func()) {
+func (c *Orchestrator) Subscribe(requestID string) (<-chan Frame, func()) {
 	f := c.frames
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -78,7 +78,7 @@ func (c *Coordinator) Subscribe(requestID string) (<-chan Frame, func()) {
 // LatestFrame is the most recent tick for one request, or false when none has arrived.
 // A subscriber that attaches mid-attempt gets this immediately so its first render shows
 // where the attempt actually is.
-func (c *Coordinator) LatestFrame(requestID string) (Frame, bool) {
+func (c *Orchestrator) LatestFrame(requestID string) (Frame, bool) {
 	f := c.frames
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -116,7 +116,7 @@ func (f *fanout) forget(requestID string) {
 // JSON object it owns; an unreadable one becomes a frame with no value rather than a
 // dropped tick, because the SEQUENCE still tells a client the attempt is alive.
 func frameOf(p *pb.AttemptProgress) Frame {
-	frame := Frame{RequestID: p.RequestId, Attempt: p.Attempt, Seq: p.Seq, Type: "progress"}
+	frame := Frame{RequestID: p.RequestId, Attempt: p.AttemptOrdinal, Seq: p.Seq, Type: "progress"}
 	var body struct {
 		Type    string `json:"type"`
 		Payload any    `json:"payload"`

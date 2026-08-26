@@ -12,7 +12,7 @@ import (
 // THE COORDINATOR-KILL CRASH ARM.
 //
 // cl-001 armed the worker half of its crash-convergence matrix at two lifecycle points
-// and named the COORDINATOR half as still owed, for one reason: the coordinator ran
+// and named the COORDINATOR half as still owed, for one reason: the orchestrator ran
 // inside the verification driver, so killing it killed the observer. That reason is gone.
 // This section drives a SEPARATE `cozy up` process over real HTTP, `kill -9`s it
 // mid-attempt, and watches the whole recovery FROM THE API CONSUMER'S SEAT — which is
@@ -21,10 +21,10 @@ import (
 //
 // What must hold across the kill, and what this arm checks:
 //
-//  1. Nothing the dead coordinator had not COMMITTED is visible afterwards.
+//  1. Nothing the dead orchestrator had not COMMITTED is visible afterwards.
 //  2. The request survives. Its id is still an id; its idempotency key still names it and
 //     starting a second execution under that key is impossible.
-//  3. The RECOVERED-ATTEMPTS LAW holds through a coordinator restart, not only a worker
+//  3. The RECOVERED-ATTEMPTS LAW holds through a orchestrator restart, not only a worker
 //     one: the restarted supervisor reports its open attempt on Register, that attempt is
 //     an OPEN OBLIGATION, and no next ordinal is minted until its own journaled terminal
 //     arrives.
@@ -101,7 +101,7 @@ func sectionAPICrash() {
 	check("the request is still an id, with its endpoint and its attempt",
 		life.Status == http.StatusOK && life.json()["request_id"] == requestID,
 		fmt.Sprintf("status %v, attempt %v", life.json()["status"], life.json()["attempt"]))
-	check("and NOTHING is visible that the dead coordinator had not committed",
+	check("and NOTHING is visible that the dead orchestrator had not committed",
 		len(life.json()["outputs"].([]any)) == 0 && life.json()["status"] != "completed",
 		fmt.Sprint(life.json()["status"]))
 
@@ -123,7 +123,7 @@ func sectionAPICrash() {
 		replay.json()["request_id"] == requestID && replay.json()["idempotent_replay"] == true,
 		replay.brief())
 
-	head("the recovered-attempts law, through a coordinator restart")
+	head("the recovered-attempts law, through a orchestrator restart")
 	// The restart reconciled the orphaned worker (it was killed with its launcher's
 	// group, or reaped at boot). Starting the slot again replays the SUPERVISOR's own
 	// journal, and the recovered attempt is an OPEN OBLIGATION.
@@ -139,7 +139,7 @@ func sectionAPICrash() {
 		attemptEnd != nil && attemptEnd.Payload["requeuing"] == true,
 		fmt.Sprintf("request.attempt_failed %v/%v", payloadOf(attemptEnd, "status"),
 			payloadOf(attemptEnd, "cause")))
-	check("and the coordinator minted a NEW ordinal for it",
+	check("and the orchestrator minted a NEW ordinal for it",
 		settled.find("request.requeued") != nil,
 		fmt.Sprint(settled.find("request.requeued") != nil))
 	check("attempt 2 ran and the request completed", settled.find("request.completed") != nil,
@@ -206,7 +206,7 @@ func sameIDs(a, b []sseEvent) bool {
 
 // noOrdinalRace checks the ordering the law promises, from the STREAM: a `request.
 // dispatched` for ordinal N+1 may never appear before the terminal-shaped row that
-// closed ordinal N. The client can check this because the coordinator publishes both.
+// closed ordinal N. The client can check this because the orchestrator publishes both.
 func noOrdinalRace(st *sseStream) bool {
 	open := map[uint64]bool{}
 	for _, e := range st.events {

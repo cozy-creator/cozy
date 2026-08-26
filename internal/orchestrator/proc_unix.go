@@ -8,7 +8,7 @@
 // Unix says that with a process group: the child leads its own, and a negative pid signals
 // every member. `proc_windows.go` says the same thing with a Job Object, which is the
 // analogue that exists there.
-package coord
+package orchestrator
 
 import (
 	"os/exec"

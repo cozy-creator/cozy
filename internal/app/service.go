@@ -13,9 +13,9 @@ import (
 
 	"github.com/cozy-creator/cozy-creator-v2/internal/api"
 	localapi "github.com/cozy-creator/cozy-creator-v2/internal/client"
-	"github.com/cozy-creator/cozy-creator-v2/internal/coord"
 	"github.com/cozy-creator/cozy-creator-v2/internal/exit"
 	"github.com/cozy-creator/cozy-creator-v2/internal/home"
+	"github.com/cozy-creator/cozy-creator-v2/internal/orchestrator"
 	"github.com/cozy-creator/cozy-creator-v2/internal/records"
 	"github.com/cozy-creator/cozy-creator-v2/internal/render"
 	"github.com/cozy-creator/cozy-creator-v2/internal/rental"
@@ -94,17 +94,17 @@ func handleUp(ctx *Context) *exit.Error {
 	}
 	defer st.Close()
 
-	// The resolver is built BEFORE the coordinator, because the coordinator holds it:
+	// The resolver is built BEFORE the orchestrator, because the orchestrator holds it:
 	// select-or-start is the scheduler's act, and a request whose binding no live worker
 	// advertises makes one rather than queueing for capacity nothing would create.
 	resolver := NewResolver(st, ctx.Cfg)
 	// Two questions, deliberately not one object: the API asks whether a pinned rental
 	// EXISTS (so an unresolvable pin is refused before a request row does), and the
-	// coordinator resolves the dial triple at the moment it dials. Only the second reads
-	// the owner token, which is why only the coordinator holds it.
+	// orchestrator resolves the dial triple at the moment it dials. Only the second reads
+	// the owner token, which is why only the orchestrator holds it.
 	rentals := rental.Resolver(l, st)
 
-	c, e := coord.Open(coord.Options{
+	c, e := orchestrator.Open(orchestrator.Options{
 		Cfg: ctx.Cfg, Layout: l, Store: st, Yield: yield, Log: ctx.Out,
 		Endpoints: resolver, Rentals: rentals,
 	})
@@ -132,7 +132,7 @@ func handleUp(ctx *Context) *exit.Error {
 	// exactly the path a SIGTERM takes.
 	stop := make(chan os.Signal, 1)
 	server := api.New(api.Options{
-		Coordinator: c, Cfg: ctx.Cfg, Creds: creds, Addr: addr,
+		Orchestrator: c, Cfg: ctx.Cfg, Creds: creds, Addr: addr,
 		Log: ctx.Out, Endpoints: resolver, Bound: bound, Rentals: rental.Known(st),
 		Shutdown: func() { stop <- syscall.SIGTERM },
 	})
@@ -162,7 +162,7 @@ func handleUp(ctx *Context) *exit.Error {
 	signal.Notify(stop, syscall.SIGINT, syscall.SIGTERM)
 	<-stop
 	fmt.Fprintln(ctx.Out, "draining endpoint processes…")
-	c.Close(coord.StopGrace)
+	c.Close(orchestrator.StopGrace)
 	closeListeners()
 	return nil
 }
@@ -247,7 +247,7 @@ func handleDown(ctx *Context) *exit.Error {
 	// the service's own published cancellation budget (#434): workers drain in parallel
 	// under one StopGrace, and the service's own teardown plus lock release is bounded by
 	// the same budget again — so two StopGrace windows, not a number invented here.
-	timeout := 2 * coord.StopGrace
+	timeout := 2 * orchestrator.StopGrace
 	if v := ctx.Inv.Value("--timeout"); v != "" {
 		d, err := time.ParseDuration(v)
 		if err != nil {
@@ -284,7 +284,7 @@ func handleDown(ctx *Context) *exit.Error {
 	// further wait observes only that; one more StopGrace bounds it, and a process that
 	// survives a KILL that long is REPORTED, not waited on forever.
 	_ = signalProcess(st.PID, syscall.SIGKILL)
-	hard := time.Now().Add(coord.StopGrace)
+	hard := time.Now().Add(orchestrator.StopGrace)
 	for time.Now().Before(hard) && service.Probe(ctx.Cfg).Up {
 		time.Sleep(50 * time.Millisecond)
 	}

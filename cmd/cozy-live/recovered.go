@@ -24,12 +24,12 @@ func sectionRecovered() {
 	planID := planIDOf(spec, "denoise")
 
 	head("a real attempt, killed mid-flight")
-	instance, e := lv.c.StartWorker(spec)
+	instance, _, e := lv.c.EnsureWorker(spec)
 	if e != nil {
 		check("StartWorker", false, briefly(e))
 		return
 	}
-	if e := lv.c.WaitReady(instance, planID); e != nil {
+	if e := lv.c.EnsurePlacementReady(instance, planID); e != nil {
 		check("READY", false, briefly(e))
 		fmt.Println(tail(lv.c.WorkerLog(instance), 20))
 		return
@@ -72,7 +72,7 @@ func sectionRecovered() {
 	check("nothing became visible", len(outs) == 0, fmt.Sprintf("%d output(s)", len(outs)))
 
 	head("the law: no next ordinal until the recovered attempt is closed")
-	// A spinner asks the coordinator's OWN ordinal gate for the next ordinal, as fast as
+	// A spinner asks the orchestrator's OWN ordinal gate for the next ordinal, as fast as
 	// it can, from BEFORE the restart. Every refusal it collects is the law being
 	// enforced under contention rather than in a quiet moment chosen by the harness.
 	var (
@@ -103,7 +103,7 @@ func sectionRecovered() {
 	defer close(stop)
 
 	restartAt := time.Now()
-	if _, e := lv.c.StartWorker(spec); e != nil {
+	if _, _, e := lv.c.EnsureWorker(spec); e != nil {
 		check("restart the same worker slot", false, briefly(e))
 		close(stop)
 		return
@@ -121,7 +121,7 @@ func sectionRecovered() {
 
 	// The recovered attempt is closed by its OWN journaled terminal — replayed
 	// SUCCEEDED if the tail had already finished, ABANDONED if it had not. Either way
-	// the coordinator never invents it.
+	// the orchestrator never invents it.
 	closeLine, ok := waitEvent(lv, "applied in", 180*time.Second)
 	check("the recovered attempt was closed by a journaled terminal", ok, trimLog(closeLine))
 
@@ -137,11 +137,11 @@ func sectionRecovered() {
 	fmt.Printf("  ---- an external spinner hammered the same gate: %d refusals, the recovered "+
 		"one first seen %s\n", tries, when)
 	_ = sawLaw
-	check("the coordinator's own log orders closure BEFORE the next dispatch",
-		orderedBefore(lv, "applied in", fmt.Sprintf("StartAttempt %s#%d", requestID, attempt+1)),
+	check("the orchestrator's own log orders closure BEFORE the next dispatch",
+		orderedBefore(lv, "applied in", fmt.Sprintf("AttemptOffer %s#%d", requestID, attempt+1)),
 		"the requeue projection dispatches attempt 2 only after attempt 1's terminal committed")
 
-	head("the coordinator's own requeue projection runs attempt 2 to a visible output")
+	head("the orchestrator's own requeue projection runs attempt 2 to a visible output")
 	result, e := lv.c.AwaitSettled(requestID, 240*time.Second)
 	if e != nil {
 		check("the request settled", false, briefly(e))
@@ -169,7 +169,7 @@ func sectionRecovered() {
 	head("teardown")
 	live, _ := lv.store.LiveWorkers()
 	for _, r := range live {
-		lv.c.StopWorker(r.InstanceID, 20*time.Second)
+		lv.c.ShutdownWorker(r.InstanceID, 20*time.Second)
 	}
 	time.Sleep(2 * time.Second)
 	now := gpuUsedMiB()
@@ -179,7 +179,7 @@ func sectionRecovered() {
 
 // scenarioB kills the supervisor the instant the runtime's tail writes the output file.
 // Whichever side of the journal the kill lands on, the invariant is the same: bytes under
-// a grant are not a result. They become visible only when the coordinator accepts a
+// a grant are not a result. They become visible only when the orchestrator accepts a
 // terminal, in the same transaction, or never.
 func scenarioB(lv *live, instance, planID string) {
 	body := payload(map[string]any{"steps": 6, "latent": 64, "seed": 11})
@@ -217,13 +217,13 @@ func scenarioB(lv *live, instance, planID string) {
 		size > 0, fmt.Sprintf("%d B at %s", size, path))
 	outs, _ := lv.store.VisibleOutputsOf(requestID, int64(attempt))
 	check("those bytes are NOT a visible output", len(outs) == 0,
-		"the coordinator accepted no terminal for them")
+		"the orchestrator accepted no terminal for them")
 
 	waitFor(func() bool {
 		rows, _ := lv.store.LiveWorkers()
 		return len(rows) == 0
 	}, 20*time.Second)
-	if _, e := lv.c.StartWorker(sdxlSpec("denoise")); e != nil {
+	if _, _, e := lv.c.EnsureWorker(sdxlSpec("denoise")); e != nil {
 		check("restart", false, briefly(e))
 		return
 	}
@@ -263,7 +263,7 @@ func waitFor(cond func() bool, timeout time.Duration) bool {
 	return false
 }
 
-// orderedBefore reads the coordinator's own event order: `first` must appear before
+// orderedBefore reads the orchestrator's own event order: `first` must appear before
 // `second` ever does.
 func orderedBefore(lv *live, first, second string) bool {
 	seenFirst := false

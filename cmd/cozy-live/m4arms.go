@@ -21,7 +21,7 @@ import (
 //	1  duplicate attempt      one key, two callers, a LIVE attempt -> one attempt, one output
 //	2  dropped TerminalAck    the ack never lands -> the terminal replays -> applied ONCE
 //	3  non-cooperative cancel  a handler that ignores cancel -> grace -> kill -> CANCELED
-//	4  coordinator restart     kill -9 mid-attempt -> the recovered-attempts law -> one output
+//	4  orchestrator restart     kill -9 mid-attempt -> the recovered-attempts law -> one output
 
 func sectionM4Arms() {
 	idle := waitQuietGPU(45 * time.Minute)
@@ -105,29 +105,29 @@ func armDuplicate(svc *liveService, root string) {
 // sectionDropAck is ARM 2, and it stands alone because its instrument is the PROTOCOL
 // PEER rather than the HTTP client.
 //
-// LOCALLY a worker cannot outlive its coordinator: `Coordinator.Reconcile` kills every
+// LOCALLY a worker cannot outlive its orchestrator: `Orchestrator.Reconcile` kills every
 // orphan worker at boot, and the SO_PEERCRED slot fence refuses to adopt a process this
-// coordinator did not start. So "the same worker replays its terminal to a restarted
-// coordinator" has no local representation at all — on a pod it is the recovery path
+// orchestrator did not start. So "the same worker replays its terminal to a restarted
+// orchestrator" has no local representation at all — on a pod it is the recovery path
 // (cl-014/th-013), and locally the recovery path is the requeue projection (ARM 4).
 //
-// What a lost TerminalAck looks like to the COORDINATOR, though, is exactly one thing: a
-// peer that keeps replaying its journaled terminal until it is acknowledged. That is what
+// What a lost AttemptOutcomeAck looks like to the OWNER, though, is exactly one thing: a
+// peer that keeps replaying its journaled outcome until it is acknowledged. That is what
 // this fake worker does — real protocol bytes, a real output file under the real grant,
 // the identical canonical document twice — and the obligation under test is the
-// coordinator's: apply it once, publish once, re-ack.
+// orchestrator's: apply it once, publish once, re-ack.
 func sectionDropAck() {
 	lv := hostCoordinator("cl003-dropack", true)
 	defer lv.close()
 
-	head("ARM 2 — the TerminalAck is dropped: the terminal replays and applies ONCE")
+	head("ARM 2 — the AttemptOutcomeAck is dropped: the outcome replays and applies ONCE")
 	spec := fakeSpec("dropack", "7", "--arm", "dropack", "--cozy-home", lv.root)
-	instance, e := lv.c.StartWorker(spec)
+	instance, _, e := lv.c.EnsureWorker(spec)
 	if !check("the peer registers over the committed contract", e == nil, briefly(e)) {
 		return
 	}
 	planID := planIDOf(spec, "fake")
-	if e := lv.c.WaitReady(instance, planID); e != nil {
+	if e := lv.c.EnsurePlacementReady(instance, planID); e != nil {
 		check("the peer is ready", false, e.Message)
 		return
 	}
@@ -138,33 +138,33 @@ func sectionDropAck() {
 		return
 	}
 	_, e = lv.c.Await(requestID, attempt, 60*time.Second)
-	check("the attempt closes on its journaled terminal", e == nil, briefly(e))
+	check("the attempt closes on its journaled outcome", e == nil, briefly(e))
 
-	line, ok := waitEvent(lv, "exact replay of a closed terminal", 20*time.Second)
+	line, ok := waitEvent(lv, "exact replay of a closed outcome", 20*time.Second)
 	check("the REPLAY after the dropped ack is recognised and applied NOTHING twice", ok,
 		trimLog(line))
-	check("exactly ONE terminal was applied across two identical arrivals",
+	check("exactly ONE outcome was applied across two identical arrivals",
 		countEvents(lv, "applied in") == 1,
 		fmt.Sprintf("%d apply line(s), %d replay line(s)",
 			countEvents(lv, "applied in"), countEvents(lv, "exact replay")))
 	outs, _ := lv.store.VisibleOutputs(requestID)
-	check("and the output the terminal carried is visible exactly ONCE",
+	check("and the output the outcome carried is visible exactly ONCE",
 		len(outs) == 1, fmt.Sprintf("%d visible output(s)", len(outs)))
 	if len(outs) == 1 {
 		info, err := os.Stat(outs[0].Path)
-		check("the published bytes are on disk under the coordinator's own grant",
+		check("the published bytes are on disk under the orchestrator's own grant",
 			err == nil && info.Size() > 0,
 			fmt.Sprintf("%s (%s)", outs[0].MediaID, sizeOf(info)))
 	}
 	row, _ := lv.store.AttemptRow(requestID, int64(attempt))
-	check("the attempt row is CLOSED on one terminal id",
+	check("the attempt row is CLOSED on one outcome id",
 		row.State == "closed" && row.TerminalStatus == "SUCCEEDED",
 		fmt.Sprintf("%s/%s %s", row.TerminalStatus, row.TerminalCause, row.State))
 
 	head("teardown")
 	live, _ := lv.store.LiveWorkers()
 	for _, w := range live {
-		lv.c.StopWorker(w.InstanceID, 10*time.Second)
+		lv.c.ShutdownWorker(w.InstanceID, 10*time.Second)
 	}
 	rows, _ := lv.store.LiveWorkers()
 	check("every device grant is released", len(rows) == 0, fmt.Sprintf("%d live row(s)", len(rows)))
@@ -232,10 +232,10 @@ func armNonCooperativeCancel(svc *liveService, root string, idle int) {
 		fmt.Sprintf("%d MiB (idle was %d)", used, idle))
 }
 
-// ------------------------------------------------------------ 4: coordinator restart
+// ------------------------------------------------------------ 4: orchestrator restart
 
 func armCoordinatorRestart(svc *liveService, root string, port, idle int) {
-	head("ARM 4 — kill -9 the coordinator mid-attempt, on the four-component pipeline")
+	head("ARM 4 — kill -9 the orchestrator mid-attempt, on the four-component pipeline")
 	// A FRESH worker, for ARM 3's reason: each arm has to be answered by its own subject,
 	// and a 1024px attempt on a generation another arm already drove is answered by the
 	// residency defect instead of by the crash.
@@ -262,7 +262,7 @@ func armCoordinatorRestart(svc *liveService, root string, port, idle int) {
 	check("the SAME root comes back up", svc.alive(), "")
 
 	life := svc.call("GET", "/v1/requests/"+requestID, nil)
-	check("nothing the dead coordinator had not committed is visible",
+	check("nothing the dead orchestrator had not committed is visible",
 		len(asList(life.json()["outputs"])) == 0 && life.json()["status"] != "completed",
 		fmt.Sprint(life.json()["status"]))
 	replay := svc.call("POST", "/v1/requests", map[string]any{

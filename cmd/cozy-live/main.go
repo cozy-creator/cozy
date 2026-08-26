@@ -3,7 +3,7 @@
 // LocalCoordinator, the REAL cozy-runtime supervisor and its disposable CUDA executor,
 // and cr-005's real SDXL CAS — and prints what it observed.
 //
-// The coordinator it drives is the same `internal/coord` package `cozy up` runs. What
+// The orchestrator it drives is the same `internal/orchestrator` package `cozy up` runs. What
 // this binary adds is the ORCHESTRATION worker-live.py's harness added on the other
 // side: staging, timing, kills, and one adversarial worker (`fakeworker`) that speaks
 // raw protocol bytes so the refusal arms have someone to refuse.
@@ -22,9 +22,9 @@ import (
 	"time"
 
 	"github.com/cozy-creator/cozy-creator-v2/internal/config"
-	"github.com/cozy-creator/cozy-creator-v2/internal/coord"
 	"github.com/cozy-creator/cozy-creator-v2/internal/exit"
 	"github.com/cozy-creator/cozy-creator-v2/internal/home"
+	"github.com/cozy-creator/cozy-creator-v2/internal/orchestrator"
 	"github.com/cozy-creator/cozy-creator-v2/internal/records"
 )
 
@@ -142,7 +142,7 @@ type live struct {
 	cfg   config.Config
 	l     home.Layout
 	store *records.Store
-	c     *coord.Coordinator
+	c     *orchestrator.Orchestrator
 	log   *os.File
 }
 
@@ -171,18 +171,18 @@ func hostCoordinator(name string, fresh bool) *live {
 	if e != nil {
 		must("records", e)
 	}
-	logPath := filepath.Join(root, "coordinator.log")
+	logPath := filepath.Join(root, "orchestrator.log")
 	logFile, err := os.Create(logPath)
-	must("coordinator log", err)
+	must("orchestrator log", err)
 
-	c, e := coord.Open(coord.Options{
+	c, e := orchestrator.Open(orchestrator.Options{
 		Cfg: cfg, Layout: l, Store: st, Yield: "smart", Log: logFile,
-		ImageDigest:  "sha256:" + strings.Repeat("11", 32),
-		ConfigDigest: "sha256:" + strings.Repeat("22", 32),
-		MaxOutputMiB: 8,
+		EnvironmentSpecDigest: "sha256:" + strings.Repeat("11", 32),
+		ConfigDigest:          "sha256:" + strings.Repeat("22", 32),
+		MaxOutputMiB:          8,
 	})
 	if e != nil {
-		must("coordinator", e)
+		must("orchestrator", e)
 	}
 	if _, _, e := c.Reconcile(); e != nil {
 		must("reconcile", e)
@@ -197,8 +197,8 @@ func (lv *live) close() {
 	lv.log.Close()
 }
 
-// rssMiB is this process's resident set — the coordinator's own footprint, since the
-// coordinator runs in this process.
+// rssMiB is this process's resident set — the orchestrator's own footprint, since the
+// orchestrator runs in this process.
 func rssMiB() float64 {
 	data, err := os.ReadFile("/proc/self/status")
 	if err != nil {
@@ -216,16 +216,16 @@ func rssMiB() float64 {
 
 func ms(d time.Duration) string { return fmt.Sprintf("%.1f ms", float64(d.Microseconds())/1000) }
 
-// coordSubmission is the driver's alias for the coordinator's Submission, so the
+// orchestratorSubmission is the driver's alias for the orchestrator's Submission, so the
 // section files read as prose rather than as a struct literal repeated five times.
-type coordSubmission = coord.Submission
+type orchestratorSubmission = orchestrator.Submission
 
-func submission(planID string, body []byte) coordSubmission {
+func submission(planID string, body []byte) orchestratorSubmission {
 	return submissionKey(planID, body, "idem-"+fmt.Sprint(time.Now().UnixNano()))
 }
 
-func submissionKey(planID string, body []byte, idem string) coordSubmission {
-	return coordSubmission{
+func submissionKey(planID string, body []byte, idem string) orchestratorSubmission {
+	return orchestratorSubmission{
 		IdemKey: idem, Endpoint: "cozy/sdxl-unet", Entrypoint: "denoise",
 		PlanID: planID, Payload: body,
 		// One destination per RESULT FIELD PATH. `denoise` returns `image`.

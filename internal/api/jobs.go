@@ -11,9 +11,9 @@ import (
 	"time"
 
 	"github.com/cozy-creator/cozy-creator-v2/internal/canonical"
-	"github.com/cozy-creator/cozy-creator-v2/internal/coord"
 	"github.com/cozy-creator/cozy-creator-v2/internal/exit"
 	"github.com/cozy-creator/cozy-creator-v2/internal/home"
+	"github.com/cozy-creator/cozy-creator-v2/internal/orchestrator"
 	"github.com/cozy-creator/cozy-creator-v2/internal/records"
 	pb "github.com/cozy-creator/cozy-creator-v2/protocol/cozy/worker/v1"
 )
@@ -101,10 +101,10 @@ func (s *Server) submitJob(w http.ResponseWriter, r *http.Request) {
 	spec.BodyDigest = digest
 
 	// NO CAPACITY IS A STATE, never a refusal — this route cannot answer "busy". The
-	// coordinator records the row, queues it and makes the worker resident; several jobs
+	// orchestrator records the row, queues it and makes the worker resident; several jobs
 	// submitted at once queue against ONE worker and drain in submission order
 	// (owner directive, decisions #394 / cr-019).
-	jobID, attempt, fresh, e := s.coord.SubmitDetail(spec)
+	jobID, attempt, fresh, e := s.orchestrator.SubmitDetail(spec)
 	if e != nil {
 		s.refuseTyped(w, r, e)
 		return
@@ -131,11 +131,11 @@ func (s *Server) submitJob(w http.ResponseWriter, r *http.Request) {
 	s.ok(w, r, status, handle)
 }
 
-// resolveJob turns endpoint+function into the coordinator's Submission. The
+// resolveJob turns endpoint+function into the orchestrator's Submission. The
 // `job_descriptor_id` is resolved HERE, from the installed generation's own descriptor —
 // a client never names a digest, exactly as it never names a binding plan id.
-func (s *Server) resolveJob(sub JobSubmission) (coord.Submission, *exit.Error) {
-	out := coord.Submission{
+func (s *Server) resolveJob(sub JobSubmission) (orchestrator.Submission, *exit.Error) {
+	out := orchestrator.Submission{
 		Kind: "job", Endpoint: sub.Endpoint, Entrypoint: sub.Function,
 		Payload: []byte(sub.Input), Org: strings.TrimSpace(sub.Org),
 	}
@@ -203,7 +203,7 @@ func validOrg(org string) *exit.Error {
 	return nil
 }
 
-func jobSubmissionDigest(spec coord.Submission) (string, *exit.Error) {
+func jobSubmissionDigest(spec orchestrator.Submission) (string, *exit.Error) {
 	doc := map[string]canonical.Value{
 		"format":   "cozy.client.JobSubmission/1",
 		"endpoint": spec.Endpoint,
@@ -239,7 +239,7 @@ type JobState struct {
 	// Queued is the job's position in the dispatch queue while it waits for a worker,
 	// counted from 1. Absent once it has an attempt — a running job is not queued.
 	QueuePosition *int `json:"queue_position,omitempty"`
-	// Requeues and RetryBudget are the coordinator's RETRY PROJECTION made visible: how
+	// Requeues and RetryBudget are the orchestrator's RETRY PROJECTION made visible: how
 	// much of the durable budget the neutral outcomes have already spent, and what the
 	// bound is. A settlement that exhausted it names the budget in `error`.
 	Requeues    int64           `json:"requeues"`
@@ -372,12 +372,12 @@ func (s *Server) jobStateOf(row records.Request) JobState {
 	state := JobState{
 		JobID: row.ID, Status: contractStatus(row.State), Endpoint: row.Endpoint,
 		Function: row.Entrypoint, Attempt: uint64(row.Ordinal),
-		Requeues: row.Requeues, RetryBudget: coord.MaxRequeues,
+		Requeues: row.Requeues, RetryBudget: orchestrator.MaxRequeues,
 		Outputs: []MediaRef{}, CreatedAt: row.CreatedAt,
 		EventsURL: "/v1/requests/" + row.ID + "/events",
 	}
 	if row.Ordinal == 0 && (row.State == "submitted" || row.State == "queued") {
-		if n := s.coord.QueuePosition(row.ID); n > 0 {
+		if n := s.orchestrator.QueuePosition(row.ID); n > 0 {
 			state.QueuePosition = &n
 		}
 	}
@@ -407,7 +407,7 @@ func (s *Server) jobStateOf(row records.Request) JobState {
 	// THE ELAPSED CLOCK is the authority's own timestamps, and the LIVE progress is the
 	// lossy lane's latest tick — replayed on connect, never durable, never load-bearing.
 	state.ElapsedMS = elapsedMS(row, attempts)
-	if frame, ok := s.coord.LatestFrame(row.ID); ok {
+	if frame, ok := s.orchestrator.LatestFrame(row.ID); ok {
 		if value, ok := frame.Value.(map[string]any); ok {
 			state.Progress = value
 			if stage, ok := value["stage"].(string); ok {
@@ -438,7 +438,7 @@ func (s *Server) jobStateOf(row records.Request) JobState {
 	if len(last.TerminalBody) == 0 {
 		return state
 	}
-	doc, err := canonical.Read(last.TerminalBody, &pb.TerminalBody{})
+	doc, err := canonical.Read(last.TerminalBody, &pb.AttemptOutcomeBody{})
 	if err != nil {
 		return state
 	}
@@ -505,7 +505,7 @@ func (s *Server) cancelJob(w http.ResponseWriter, r *http.Request) {
 	if len(attempts) == 0 {
 		// A QUEUED job has nothing running, and cancelling it is still a real act: it
 		// leaves the queue and settles, so a client that asked never has to wonder.
-		s.coord.CancelQueued(row.ID)
+		s.orchestrator.CancelQueued(row.ID)
 		s.ok(w, r, http.StatusOK, s.jobStateOf(row))
 		return
 	}
@@ -520,7 +520,7 @@ func (s *Server) cancelJob(w http.ResponseWriter, r *http.Request) {
 			grace = n
 		}
 	}
-	if e := s.coord.CancelClient(row.ID, uint64(last.Attempt), grace); e != nil {
+	if e := s.orchestrator.CancelClient(row.ID, uint64(last.Attempt), grace); e != nil {
 		s.refuseTyped(w, r, e)
 		return
 	}

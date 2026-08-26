@@ -20,7 +20,7 @@ import (
 // was accepted. Consequently:
 //
 //   - There is no representation of "serve this path". Not a rejected one — none.
-//   - An output the coordinator never published has no id, so it cannot be reached even
+//   - An output the orchestrator never published has no id, so it cannot be reached even
 //     by a caller who knows exactly where the runtime wrote it.
 //   - `..`, absolute paths, symlinks and encodings of them are not special cases: they are
 //     simply not media ids, and a non-id is a 404.
@@ -90,7 +90,7 @@ func (s *Server) media(w http.ResponseWriter, r *http.Request) {
 	if out == nil {
 		s.refuse(w, r, http.StatusNotFound, "not_found",
 			"no media by that id on this host",
-			"only an output whose terminal this coordinator accepted has an id at all")
+			"only an output whose terminal this orchestrator accepted has an id at all")
 		return
 	}
 

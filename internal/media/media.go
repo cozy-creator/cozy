@@ -17,7 +17,7 @@
 // This client is a plain HTTPS client pinned to the pod's certificate. It holds the
 // rental's owner token because it is the one place that credential becomes an
 // `Authorization` header for the media plane — the same rule `internal/hub` keeps for the
-// hub's and `internal/coord/owner.go` keeps for `Claim.proof`.
+// hub's and `internal/orchestrator/owner.go` keeps for `Claim.proof`.
 package media
 
 import (
@@ -64,7 +64,7 @@ type Client struct {
 // Budget is how long ONE media call may go unanswered before this host decides the pod's
 // byte plane is not there. It is DERIVED, not chosen: the caller passes the same silence
 // budget the pod's CONTROL leg is already judged by — the count of report periods a worker
-// may miss before it is called stalled (`coord.SilentReports * coord.ReportCadence`). A pod
+// may miss before it is called stalled (`orchestrator.SilentReports * orchestrator.ReportCadence`). A pod
 // that has not answered its byte plane in the time it owes eight reports is not slow.
 //
 // It is not optional, and the reason is an observation: a client with no bound at all hung
@@ -253,7 +253,7 @@ func (c *Client) PutInput(blob string, data []byte) (string, *exit.Error) {
 // PutPlan delivers one binding-plan record. The pod RE-DERIVES the id from the record's
 // own identity before it keeps the bytes, so this call either lands a plan the two ends
 // agree about or refuses typed — there is no third outcome where the worker holds a record
-// the coordinator will name in a directive and does not recognize.
+// the orchestrator will name in a directive and does not recognize.
 func (c *Client) PutPlan(planID string, record []byte) (string, *exit.Error) {
 	doc, _, e := c.call(http.MethodPut,
 		"/v1/plans/"+strings.TrimPrefix(planID, "sha256:"), record)
@@ -279,9 +279,9 @@ func (c *Client) ReserveOutputs(slot string) (string, *exit.Error) {
 }
 
 // GetOutput fetches one committed output back to this host. It is the MIRROR's transport:
-// the bytes it returns are verified against the terminal's manifest by the coordinator
+// the bytes it returns are verified against the terminal's manifest by the orchestrator
 // before anything becomes visible, and this function verifies nothing itself beyond the
-// pod's own declared digest — deciding that an output may be shown is the coordinator's
+// pod's own declared digest — deciding that an output may be shown is the orchestrator's
 // job and never a transport's.
 func (c *Client) GetOutput(slot, name string) ([]byte, *exit.Error) {
 	doc, data, e := c.call(http.MethodGet, "/v1/outputs/"+slot+"/"+name, nil)
@@ -325,7 +325,7 @@ func or(a, b string) string {
 }
 
 // Slot is the OPAQUE per-attempt name the media plane is addressed by. It is DERIVED from
-// the attempt's own identity rather than minted and remembered: a coordinator that
+// the attempt's own identity rather than minted and remembered: a orchestrator that
 // restarted between dispatch and terminal must still be able to name the slot its own
 // grant pointed at, and a remembered id would be exactly the state a restart loses.
 func Slot(requestID string, attempt uint64) string {

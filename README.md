@@ -1,6 +1,6 @@
 # cozy-creator (v2)
 
-The local-first product: `cozy` CLI + LocalService/LocalCoordinator (Go).
+The local-first product: `cozy` CLI + LocalService/LocalOrchestrator (Go).
 Design authority: [tracker-v2](https://github.com/cozy-creator/tracker-v2) `cozy-creator.md`; issues `tracker/cozy-creator/` (`cl-*`).
 No automated tests (decisions.md #160): verification = live runs + benchmarks.
 
@@ -91,22 +91,47 @@ Refusals are typed and ordered: `build_backend_unsupported`, `compiled_extension
 custom PEP 517 backends and compiled project wheels execute tenant code at assembly, so
 they land on the VM-class sandbox posture (tensorhub-build.md §1.1) or they do not land.
 
-## The LocalService and LocalCoordinator (cl-001)
+## The LocalService and LocalOrchestrator (cl-001)
 
 `cozy up` starts the ONE long-lived process; `cozy down` stops it. Its scheduling role is
-the **LocalCoordinator** (`internal/coord`): the worker protocol's **SERVER** over a unix
-socket — the cozy-runtime supervisor dials a stable address — plus local dispatch, the
-device ledger, and output publication authority.
+the **LocalOrchestrator** (`internal/orchestrator`): the worker protocol's **RecordOwner**,
+which DIALS each worker's own socket (#436), plus local dispatch, the device ledger, and
+output publication authority. The wire is `cozy.worker.v1` at **rev-2**, the
+dynamic-serving rev.
 
 - **Identity is canonical bytes.** `internal/canonical` is the document plane: the writer
   is adapted from worker-protocol's own independent Go canonicalizer, the reader is this
   repo's and refuses everything the writer could not have produced. `protocol/` carries
-  the generated `cozy.worker.v1` bindings, COPIED (never imported as a module).
-- **One transaction.** "terminal accepted + output visible" commits together, and only
-  then is `TerminalAck` sent. A crash between them replays; it cannot half-apply.
-- **The recovered-attempts law** (worker-protocol/02 §6.2): the attempts a restarted
-  supervisor reports on `Register` are OPEN OBLIGATIONS, and no next ordinal for their
-  request ids is minted until each is closed by its own journaled terminal.
+  the generated `cozy.worker.v1` bindings, COPIED (never imported as a module) and
+  byte-checked against the schema by `ci.yaml`'s `vendored-protocol` job.
+- **The schema fences itself** (#530-A1). `wire_schema_digest` rides `Claim`/`ClaimAck`,
+  is checked BEFORE any other body field, and refuses the handshake on a mismatch or an
+  absence — absence being precisely the pre-rev-2 signal, since an older binding cannot
+  spell the field. `WIRE_MINOR` stays 0 and fences nothing: the minor is the additive
+  train and cannot honestly move for a breaking in-place revision.
+- **The desired set is BYTES.** `ConvergePlacementSet` authors a `PlacementSet` document
+  once and sends its exact canonical bytes plus their digest; the worker recomputes before
+  parsing a single field. There is no second structured copy for the set to disagree with.
+- **Two axes, one admission fence.** A placement's convergence is
+  materialization × serving; DISPATCHABLE gates dispatch. Capacity is a WORKER property —
+  `admission_state` + `admission_generation` + `available_attempt_slots` — and every offer
+  echoes the generation it observed, so a stale one refuses deterministically.
+- **Acceptance and convergence are two facts.** `accepted_desired_state_revision` moves on
+  acceptance; `converged_revision` moves only when observed state satisfies it. The old
+  `applied_revision` is retired as dishonest.
+- **One transaction.** "outcome accepted + output visible" commits together, and only
+  then is `AttemptOutcomeAck` sent. A crash between them replays; it cannot half-apply.
+  An outcome this owner holds unacked is counted against the worker's own free seats, so
+  an owner that stops acking starves its own admission.
+- **Every offer gets a journaled outcome**, including a refusal. The REFUSED projection
+  SPLITS by (cause, origin): author/runtime causes settle; SUPERVISOR pre-execution causes
+  consume the ordinal, spend zero execution budget (`execution_started` is a structural
+  bit, never a cause-code allowlist) and are immediately re-dispatchable.
+- **The recovered-attempts law** (worker-protocol/02 §6.2): the `held_attempts` a
+  restarted worker reports in its ONE digest-acked snapshot are OPEN OBLIGATIONS, and no
+  next ordinal for their request ids is minted until each is closed by its own journaled
+  outcome. The snapshot is bounded by its own digest — a truncated one cannot match — and
+  dispatch stays closed until this owner acks the exact (id, digest).
 - **Device grants** are an attribute of the worker process row, admitted by one atomic
   statement. Two concurrent starts cannot both consume an envelope.
 - **Liveness is an OS fact.** The service holds an exclusive `flock` on
@@ -126,8 +151,8 @@ device ledger, and output publication authority.
 Tensorhub (th-021) and the private-deployment pod (cl-014) serve, byte for byte. Full
 contract: [`docs/client-contract.md`](docs/client-contract.md), which
 `scripts/fence.py`'s `contract` family checks against `internal/api/routes.go` row for
-row. `internal/api` is a CLIENT of `internal/coord` and opens no second door into the
-runtime: every submission still flows coordinator → worker protocol → runtime.
+row. `internal/api` is a CLIENT of `internal/orchestrator` and opens no second door into
+the runtime: every submission still flows orchestrator → worker protocol → runtime.
 
 - **Submit / status / cancel** (`/v1/requests`). The idempotency key names one request
   forever; the body digest covers the WHOLE submission, so one key naming a different
@@ -139,7 +164,7 @@ runtime: every submission still flows coordinator → worker protocol → runtim
   transaction. Live progress is the lossy lane: never durable, never replayed, latest
   tick replayed on connect. `/v1/events` multiplexes every request onto one connection
   (a browser caps six per origin); `/v1/requests/{id}/events` terminal-stops.
-  **An attempt ending is not a request ending**: an attempt the coordinator will requeue
+  **An attempt ending is not a request ending**: an attempt the orchestrator will requeue
   emits `request.attempt_failed`, deliberately outside the terminal set.
 - **Media by OPAQUE id only.** The id is minted inside the terminal transaction, so an
   output no terminal published has no id at all — the ComfyUI `/view` traversal class is
@@ -161,7 +186,7 @@ runtime: every submission still flows coordinator → worker protocol → runtim
 
 Live drivers: `./cozy-live apiarms` (35 door/refusal checks, no GPU), `./cozy-live api`
 (51 checks, real SDXL end to end), `./cozy-live apicrash` (23 checks — `kill -9` the
-coordinator mid-attempt and watch the recovered-attempts law from the client's seat). All
+orchestrator mid-attempt and watch the recovered-attempts law from the client's seat). All
 three install the endpoint through `cozy install`; the runtime they run is the one the
 RELEASE pinned (`scripts/sdxl-release.sh` builds it from a read-only `git archive`), so a
 verification's peer cannot move underneath it.
@@ -179,7 +204,8 @@ service, so there is no temporary direct-Go path for the HTTP API to later wrap:
 
 - **ONE EXECUTION PATH, and cold and warm traverse the same states.** A request whose
   binding no live worker advertises does not queue for capacity that nothing would create:
-  the coordinator SELECTS-OR-STARTS (`coord.selectOrStart`), the worker's READY drains the
+  the orchestrator SELECTS-OR-STARTS (`orchestrator.selectOrStart`), the placement becoming
+  DISPATCHABLE drains the
   queue, and dispatch stays the one placement path. `cozy start` is the same act made
   explicit for prewarming — never a second invocation mechanism. A worker that cannot
   become dispatchable settles the request FAILED rather than leaving it queued forever.
@@ -196,7 +222,7 @@ service, so there is no temporary direct-Go path for the HTTP API to later wrap:
   replacements for exactly that), and so are the last two: the supervisor is entered
   through the PUBLIC verb `cozy-runtime serve` rather than a private
   `internal.worker.session:main` import (runtime `db4ab8a` passes its already-read config
-  into `supervise`), so the coordinator speaks the verb's own closed launch grammar
+  into `supervise`), so the orchestrator speaks the verb's own closed launch grammar
   (`--socket`/`--out`); and `job_descriptor_id` is READ from `describe <job> --json`
   (runtime `4485f27`) rather than re-derived, which deletes cl-004's Go reimplementation
   of the canonical form along with the refusals it owed for values the protocol profile
@@ -216,7 +242,7 @@ service, so there is no temporary direct-Go path for the HTTP API to later wrap:
   declares no type is written without a suffix and says so. (cl-010 landed against a
   runtime that hard-coded `application/octet-stream`; the pinned peer declares the real
   type, so the file is `image.png`.)
-- **SIGINT cancels, it does not abandon.** The client asks the coordinator to cancel and
+- **SIGINT cancels, it does not abandon.** The client asks the orchestrator to cancel and
   keeps watching, because the attempt's own journaled terminal settles the request; the
   exit code is the terminal's, through `exit.JobTerminal` (0 · 11 · 12 · 10).
 - `describe` renders the surface the install already verified (re-deriving it per
@@ -232,7 +258,7 @@ not on an index yet, with cozy-runtime built from a pinned read-only `git archiv
 
 `job submit` / `status` / `ls` / `follow` / `cancel` — the bounded job surface, LOCAL ONLY
 (the hub's job plane is th-008's; a manually provisioned pod is not the loopback
-coordinator). A job is an **attempt class on the one coordinator**, not a second scheduler:
+orchestrator). A job is an **attempt class on the one orchestrator**, not a second scheduler:
 same request row, same ordinal law, same terminal transaction, same durable event stream
 (`cozy job follow` is `GET /v1/requests/{id}/events`'s client). What differs is what cr-009
 says differs — a `JobDirective`, a `JobExecutionSpec`, job capacity instead of serving
@@ -240,7 +266,7 @@ capacity, and a grant that writes somewhere a reclaim cannot reach.
 
 - **The publication root is a real place, and a job never writes into it.**
   `<COZY_HOME>/publications/<org>/_job-<job-id>` is the addressable publication; an attempt
-  in flight is granted `<that>/.staging/a<N>` instead, and the coordinator PROMOTES the
+  in flight is granted `<that>/.staging/a<N>` instead, and the orchestrator PROMOTES the
   landed writes across by rename after the terminal document has been verified. So the
   addressable path only ever holds bytes some terminal vouched for. The fence is the
   resolution, not a scan: a destination that does not resolve INSIDE the grant's root
@@ -258,7 +284,7 @@ capacity, and a grant that writes somewhere a reclaim cannot reach.
   ONE typed durable publication receipt from that border, root what it names, and record
   the catalog projection. That receipt does not exist yet, so nothing here interprets a
   job's result to guess at one — the asset plane above is the whole of what ships.
-- **A job worker is terminal-and-reclaim, and the QUEUE is the coordinator's.**
+- **A job worker is terminal-and-reclaim, and the QUEUE is the orchestrator's.**
   `reclaim_on_terminal` is true: one immutable build, one bounded attempt, terminal,
   reclaim. Deep queueing (owner directive, decisions #394 / cr-019) is the dispatch queue
   plus select-or-start, not a warm worker — warm persistence is a serving concern.
@@ -278,7 +304,7 @@ capacity, and a grant that writes somewhere a reclaim cannot reach.
 
 Live drivers: `./cozy-live jobarms` (refusal arms, no store), `./cozy-live jobs` (the real
 census job end to end over the 6.9 GB bench store, the depth pass, kill/resume, the retry
-projection, benchmarks) and `./cozy-live jobcrash` (the coordinator killed at the two
+projection, benchmarks) and `./cozy-live jobcrash` (the orchestrator killed at the two
 lifecycle points that decide whether a publication is a promise or a fact).
 `scripts/job-release.sh` builds the release they install — cr-009's own
 `structural_census.py`, verbatim from a pinned `git archive`.
@@ -385,10 +411,10 @@ installed-binary state and release state are four distinct evidence axes, so a g
   `linux/amd64`, `linux/arm64`, `darwin/arm64` and `darwin/amd64` are four cross-compiles
   from one host. The per-OS facts that used to be C are Go build tags now —
   `internal/flock` (flock vs `LockFileEx`), `internal/install` (statfs vs
-  `GetDiskFreeSpaceEx`, `st_dev`/`st_nlink` vs the volume serial), and `internal/coord`'s
+  `GetDiskFreeSpaceEx`, `st_dev`/`st_nlink` vs the volume serial), and `internal/orchestrator`'s
   peer credential (`SO_PEERCRED`, Darwin's `LOCAL_PEERCRED`, and no answer at all
   elsewhere, which `peerPID` already reads as 0). `windows/amd64` is the one row left, and
-  it is no longer a dependency: `internal/coord/worker.go` spells the worker's process
+  it is no longer a dependency: `internal/orchestrator/worker.go` spells the worker's process
   group and its kills as `syscall.SysProcAttr{Setpgid}` and `syscall.Kill`, which Windows
   answers with Job Objects instead. The UNBUILT reason quotes the compiler naming those
   five lines, which is a port of one file rather than a wall.
@@ -436,7 +462,7 @@ No automated tests. Verification is running the real thing:
   admin writes, every refusal arm (wrong token, absent repo, closed port, a hub that
   accepts and never answers, a 200 that is not our document), and a cumulative secrecy
   check that the raw credential appears in no byte the session printed.
-- `cmd/cozy-live` drives the REAL coordinator against real peers:
+- `cmd/cozy-live` drives the REAL orchestrator against real peers:
   `canonical` (worker-protocol's frozen corpus, byte-for-byte, plus every semantic twin
   refused by its own code), `arms` (the refusal matrix against `fakeworker`, a second
   independent Go implementation of the worker side), `attempt` and `recovered` (the real

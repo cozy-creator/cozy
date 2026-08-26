@@ -1,6 +1,6 @@
 //go:build windows
 
-package coord
+package orchestrator
 
 import (
 	"strconv"

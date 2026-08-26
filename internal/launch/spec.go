@@ -5,8 +5,8 @@ import (
 	"sort"
 	"strings"
 
-	"github.com/cozy-creator/cozy-creator-v2/internal/coord"
 	"github.com/cozy-creator/cozy-creator-v2/internal/exit"
+	"github.com/cozy-creator/cozy-creator-v2/internal/orchestrator"
 	"github.com/cozy-creator/cozy-creator-v2/internal/records"
 )
 
@@ -15,10 +15,10 @@ const (
 	gib = 1 << 30
 )
 
-// The budgets this LOCAL coordinator declares for one attempt. They are a COORDINATOR
+// The budgets this LOCAL orchestrator declares for one attempt. They are a COORDINATOR
 // policy, not an endpoint fact — the runtime prices the real ladder against the card's
 // measured free bytes and confesses what it did (cr-008a/cr-008b). The same three numbers
-// the runtime's own local-coordinator adapter uses for a bare-venv run, so the two doors
+// the runtime's own local-orchestrator adapter uses for a bare-venv run, so the two doors
 // price identically.
 const (
 	vramBudget   = 7 * gib
@@ -27,34 +27,34 @@ const (
 	vramFloor    = 1 * gib
 )
 
-// Facts is everything one installed generation needs to be served, gathered once.
+// Facts is everything one endpoint install needs to be served, gathered once.
 type Facts struct {
-	Generation records.Generation
+	Install    records.EndpointInstall
 	Source     string
 	Descriptor *Descriptor
-	Runtime    Runtime
+	RuntimeCLI RuntimeCLI
 }
 
 // Read gathers a generation's facts: where its source is, the surface it proved at
 // install, and the runtime that proved it.
-func Read(gen records.Generation, cozyHome string, env []string) (*Facts, *exit.Error) {
+func Read(gen records.EndpointInstall, cozyHome string, env []string) (*Facts, *exit.Error) {
 	source := SourceDir(gen)
 	d, e := ReadDescriptor(source, gen.Descriptor)
 	if e != nil {
 		return nil, e
 	}
 	return &Facts{
-		Generation: gen,
+		Install:    gen,
 		Source:     source,
 		Descriptor: d,
-		Runtime:    Runtime{Bin: Binary(gen.Dir), Dir: source, Home: cozyHome, Env: env},
+		RuntimeCLI: RuntimeCLI{Bin: Binary(gen.Dir), Dir: source, Home: cozyHome, Env: env},
 	}, nil
 }
 
 // SourceDir is where a generation's endpoint tree lives. An archive install stages it
 // under the generation; a `--dir` install builds a venv against the live tree and records
 // its absolute path (cl-009's editable development door).
-func SourceDir(gen records.Generation) string {
+func SourceDir(gen records.EndpointInstall) string {
 	if gen.SourceKind == "dir" && gen.SourceRef != "" {
 		return gen.SourceRef
 	}
@@ -62,9 +62,9 @@ func SourceDir(gen records.Generation) string {
 }
 
 // ReleaseID is the endpoint release identity this host serves the generation under. It is
-// what the coordinator pins and what a registering worker must match: an install
+// what the orchestrator pins and what a registering worker must match: an install
 // generation of one endpoint version is one provisioned instance lifetime.
-func ReleaseID(gen records.Generation) string {
+func ReleaseID(gen records.EndpointInstall) string {
 	version := gen.Version
 	if version == "" {
 		version = gen.ID
@@ -72,29 +72,35 @@ func ReleaseID(gen records.Generation) string {
 	return gen.Endpoint + "@" + version
 }
 
-// Spec builds the EndpointSpec the coordinator launches — the object cl-006's
-// `--dev-endpoint` document used to supply by hand.
+// Spec builds the WorkerLaunchSpec the orchestrator launches, with the DesiredPlacement
+// that worker is launched to host (#484) — the object cl-006's `--dev-endpoint` document
+// used to supply by hand.
 //
 // The interpreter is the GENERATION'S OWN: the venv `uv sync --locked` built from the
 // release's own lock, so the cozy-runtime that serves an endpoint is the one the release
 // pinned and never this host's. That is the whole reason a generation is a venv.
-func (f *Facts) Spec(devices []string) (coord.EndpointSpec, *exit.Error) {
+func (f *Facts) Spec(devices []string) (orchestrator.WorkerLaunchSpec, *exit.Error) {
 	// THE RESOLVED SELECTION, from the one resolver that owns the grammar
 	// (`cozy-runtime bindings`). cl-010 read `endpoint.toml`'s `[bindings]` table here
 	// because no runtime verb emitted the resolved record; cr-016 added the verb, and this
 	// host's second reader of that closed grammar is deleted rather than kept in step.
-	resolved, e := f.Runtime.Bindings()
+	resolved, e := f.RuntimeCLI.Bindings()
 	if e != nil {
-		return coord.EndpointSpec{}, e
+		return orchestrator.WorkerLaunchSpec{}, e
 	}
 	table := map[string]Binding{}
 	for _, b := range resolved {
 		table[b.Path] = b
 	}
-	spec := coord.EndpointSpec{
-		Endpoint:   f.Generation.Endpoint,
-		ReleaseID:  ReleaseID(f.Generation),
-		Generation: f.Generation.ID,
+	spec := orchestrator.WorkerLaunchSpec{
+		Placement: orchestrator.DesiredPlacement{
+			Endpoint:  f.Install.Endpoint,
+			ReleaseID: ReleaseID(f.Install),
+			InstallID: f.Install.ID,
+			// The descriptor this install already VERIFIED in the generation's own venv
+			// (cr-003's `describe --check`). It names the placement's surface by digest.
+			DescriptorDigest: f.Install.Descriptor,
+		},
 		// THE SUPERVISOR ENTRY, and it is now the VERB. cl-004 recorded the private
 		// `internal.worker.session:main` import as owed: `serve` was dead on arrival
 		// because the CLI read the config at its entrypoint and `session.main` read it
@@ -102,7 +108,7 @@ func (f *Facts) Spec(devices []string) (coord.EndpointSpec, *exit.Error) {
 		// `db4ab8a` passes the config it already read into `session.supervise`, so the
 		// import — a second process entry into one loop, across a private module path a
 		// release is free to move — deletes.
-		Python:   Binary(f.Generation.Dir),
+		Python:   Binary(f.Install.Dir),
 		Args:     []string{"serve"},
 		Dir:      f.Source,
 		Devices:  devices,
@@ -112,17 +118,17 @@ func (f *Facts) Spec(devices []string) (coord.EndpointSpec, *exit.Error) {
 		ep := &f.Descriptor.Entrypoints[i]
 		binding, e := f.binding(ep, table)
 		if e != nil {
-			return coord.EndpointSpec{}, e
+			return orchestrator.WorkerLaunchSpec{}, e
 		}
-		spec.Bindings = append(spec.Bindings, binding)
+		spec.Placement.Bindings = append(spec.Placement.Bindings, binding)
 	}
-	if len(spec.Bindings) == 0 {
+	if len(spec.Placement.Bindings) == 0 {
 		// Every entrypoint mints a record now — weightless included — so this is the one
 		// remaining case: a release whose descriptor registers no entrypoint at all. A job
 		// function is not one; it is served through `cozy job`, on a spec of its own.
-		return coord.EndpointSpec{}, exit.Named(exit.Structural, "no_servable_function",
+		return orchestrator.WorkerLaunchSpec{}, exit.Named(exit.Structural, "no_servable_function",
 			"%s registers no entrypoint, and a worker with no plan to advertise has nothing to serve",
-			f.Generation.Endpoint).
+			f.Install.Endpoint).
 			WithRemedy("its functions: %s — an `@app.entrypoint` is what a request dispatches to",
 				strings.Join(f.Descriptor.Names(), ", "))
 	}
@@ -132,14 +138,14 @@ func (f *Facts) Spec(devices []string) (coord.EndpointSpec, *exit.Error) {
 // binding mints ONE entrypoint's local pinned-binding record. A weightless entrypoint
 // (no declared model slot) still gets a record: it names the project and the entrypoint,
 // which is all the runtime needs to construct nothing.
-func (f *Facts) binding(ep *Entrypoint, table map[string]Binding) (*coord.Binding, *exit.Error) {
+func (f *Facts) binding(ep *Entrypoint, table map[string]Binding) (*orchestrator.Binding, *exit.Error) {
 	record := map[string]any{
 		// RESOLUTION, not identity (#506a): `project` is where THIS machine staged the
 		// endpoint tree, and a pod that installed the byte-identical archive staged it
 		// somewhere else. What names the endpoint inside the identity is
 		// `endpoint_release` below — the same string on both machines by construction.
 		"project":                   f.Source,
-		"endpoint_release":          ReleaseID(f.Generation),
+		"endpoint_release":          ReleaseID(f.Install),
 		"entrypoint":                ep.Name,
 		"model_construction_digest": "",
 	}
@@ -157,14 +163,14 @@ func (f *Facts) binding(ep *Entrypoint, table map[string]Binding) (*coord.Bindin
 		// and that IS the record, not an absence of one. cozy-runtime `a3c3d72` reads a
 		// record carrying none of the seven model keys as weightless, keys its executor by
 		// release and project, and returns from `prepare` before the torch import. So the
-		// coordinator gets a plan digest to dispatch by, and a machine with no card and no
+		// orchestrator gets a plan digest to dispatch by, and a machine with no card and no
 		// bench store can serve something. That was cl-010's named seam and it is closed.
 		//
 		// `release` is the endpoint release rather than an artifact ref because there is no
 		// artifact: every weightless entrypoint of one install generation shares one
 		// executor, which is exactly what the runtime's construction key spells.
-		record["release"] = ReleaseID(f.Generation)
-		return &coord.Binding{
+		record["release"] = ReleaseID(f.Install)
+		return &orchestrator.Binding{
 			Entrypoint: ep.Name, Record: record, Outputs: AssetPaths(ep.Result),
 		}, nil
 	}
@@ -182,9 +188,9 @@ func (f *Facts) binding(ep *Entrypoint, table map[string]Binding) (*coord.Bindin
 			ep.Name, slot.Path).
 			WithRemedy("it resolves: %s — code states capability, bindings state selection",
 				strings.Join(known, ", ")).
-			WithNext("cozy describe " + f.Generation.Endpoint)
+			WithNext("cozy describe " + f.Install.Endpoint)
 	}
-	artifact, e := f.Runtime.Find(selected.Ref)
+	artifact, e := f.RuntimeCLI.Find(selected.Ref)
 	if e != nil {
 		return nil, e
 	}
@@ -233,7 +239,7 @@ func (f *Facts) binding(ep *Entrypoint, table map[string]Binding) (*coord.Bindin
 	record["tenancy"] = "local"
 	record["custody"] = artifact.Custody
 	record["strict_keys"] = false
-	return &coord.Binding{
+	return &orchestrator.Binding{
 		Entrypoint: ep.Name, Record: record, Outputs: AssetPaths(ep.Result),
 	}, nil
 }

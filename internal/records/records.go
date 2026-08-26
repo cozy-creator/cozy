@@ -25,9 +25,11 @@ import (
 	_ "modernc.org/sqlite"
 )
 
-// Generation is one immutable install: a built environment plus the evidence that
-// produced it. Rows are never updated — a rebuild is a NEW generation.
-type Generation struct {
+// EndpointInstall is one immutable install: a materialized environment plus the evidence
+// that produced it. Rows are never updated — a rebuild is a NEW install. Was `Generation`,
+// which the wire spends on executor and admission generations; the local install is not
+// one of those, and one word for three fences is how they drift (#484).
+type EndpointInstall struct {
 	ID           string
 	Endpoint     string // org/name
 	Major        int
@@ -51,12 +53,12 @@ type Generation struct {
 	CreatedAt    string
 }
 
-// Pin is the active generation for one (endpoint, major). Two majors of one
-// endpoint coexist because the key is the pair.
+// Pin is the active install for one (endpoint, major). Two majors of one endpoint coexist
+// because the key is the pair.
 type Pin struct {
 	Endpoint    string
 	Major       int
-	Generation  string
+	InstallID   string // was `Generation` (#484): it names an EndpointInstall row's id
 	ActivatedAt string
 }
 
@@ -94,7 +96,7 @@ CREATE TABLE IF NOT EXISTS pins (
   generation   TEXT    NOT NULL REFERENCES install_generations(id),
   activated_at TEXT    NOT NULL,
   PRIMARY KEY (endpoint, major)
-)`}, append(coordSchema, append(eventSchema, rentalSchema...)...)...)
+)`}, append(orchestratorSchema, append(eventSchema, rentalSchema...)...)...)
 
 // pragmas ride the DSN rather than being executed after the open, because a pragma is a
 // property of a CONNECTION and database/sql may discard and redial one at any moment: a
@@ -162,8 +164,8 @@ func placeholders() string {
 	return strings.TrimSuffix(strings.Repeat("?,", len(genFields)), ",")
 }
 
-func scanGen(rows interface{ Scan(...any) error }) (Generation, error) {
-	var g Generation
+func scanGen(rows interface{ Scan(...any) error }) (EndpointInstall, error) {
+	var g EndpointInstall
 	var verified int
 	err := rows.Scan(&g.ID, &g.Endpoint, &g.Major, &g.Version, &g.SourceKind, &g.SourceRef,
 		&g.SourceDigest, &verified, &g.Dir, &g.Python, &g.UV, &g.LockDigest, &g.Platform,
@@ -176,7 +178,7 @@ func scanGen(rows interface{ Scan(...any) error }) (Generation, error) {
 // Activate is THE install transaction: the generation row and the pin swap commit
 // together or not at all. A crash before Commit leaves the previous pin — and the
 // previous generation's venv — exactly as it was.
-func (s *Store) Activate(g Generation) (superseded string, e *exit.Error) {
+func (s *Store) Activate(g EndpointInstall) (superseded string, e *exit.Error) {
 	tx, err := s.db.Begin()
 	if err != nil {
 		return "", exit.Internalf("cannot begin the activation transaction: %s", err)
@@ -217,22 +219,22 @@ func (s *Store) Activate(g Generation) (superseded string, e *exit.Error) {
 }
 
 // ActivePin returns the pinned generation for one (endpoint, major).
-func (s *Store) ActivePin(endpoint string, major int) (*Pin, *Generation, *exit.Error) {
+func (s *Store) ActivePin(endpoint string, major int) (*Pin, *EndpointInstall, *exit.Error) {
 	var p Pin
 	err := s.db.QueryRow(`SELECT endpoint,major,generation,activated_at FROM pins
 		WHERE endpoint=? AND major=?`, endpoint, major).
-		Scan(&p.Endpoint, &p.Major, &p.Generation, &p.ActivatedAt)
+		Scan(&p.Endpoint, &p.Major, &p.InstallID, &p.ActivatedAt)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, nil, nil
 	}
 	if err != nil {
 		return nil, nil, exit.Internalf("cannot read the pin for %s@v%d: %s", endpoint, major, err)
 	}
-	g, e := s.Generation(p.Generation)
+	g, e := s.Install(p.InstallID)
 	return &p, g, e
 }
 
-func (s *Store) Generation(id string) (*Generation, *exit.Error) {
+func (s *Store) Install(id string) (*EndpointInstall, *exit.Error) {
 	g, err := scanGen(s.db.QueryRow(`SELECT `+genCols("")+` FROM install_generations WHERE id=?`, id))
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, nil
@@ -245,7 +247,7 @@ func (s *Store) Generation(id string) (*Generation, *exit.Error) {
 
 // Installed is every active pin joined to its generation, endpoint-major ordered.
 // This is what `cozy ls` reads — records only, never a walk of the filesystem.
-func (s *Store) Installed() ([]Generation, *exit.Error) {
+func (s *Store) Installed() ([]EndpointInstall, *exit.Error) {
 	rows, err := s.db.Query(`SELECT ` + genCols("g.") + `
 		FROM install_generations g JOIN pins p ON p.generation = g.id
 		ORDER BY g.endpoint, g.major`)
@@ -253,7 +255,7 @@ func (s *Store) Installed() ([]Generation, *exit.Error) {
 		return nil, exit.Internalf("cannot list installed endpoints: %s", err)
 	}
 	defer rows.Close()
-	var out []Generation
+	var out []EndpointInstall
 	for rows.Next() {
 		g, err := scanGen(rows)
 		if err != nil {
@@ -265,7 +267,7 @@ func (s *Store) Installed() ([]Generation, *exit.Error) {
 }
 
 // Unreferenced is every generation no pin points at — gc's reclaim set.
-func (s *Store) Unreferenced() ([]Generation, *exit.Error) {
+func (s *Store) Unreferenced() ([]EndpointInstall, *exit.Error) {
 	rows, err := s.db.Query(`SELECT ` + genCols("g.") + `
 		FROM install_generations g WHERE g.id NOT IN (SELECT generation FROM pins)
 		ORDER BY g.created_at`)
@@ -273,7 +275,7 @@ func (s *Store) Unreferenced() ([]Generation, *exit.Error) {
 		return nil, exit.Internalf("cannot list unreferenced generations: %s", err)
 	}
 	defer rows.Close()
-	var out []Generation
+	var out []EndpointInstall
 	for rows.Next() {
 		g, err := scanGen(rows)
 		if err != nil {
@@ -314,7 +316,7 @@ func (s *Store) Pins(endpoint string) ([]Pin, *exit.Error) {
 	var out []Pin
 	for rows.Next() {
 		var p Pin
-		if err := rows.Scan(&p.Endpoint, &p.Major, &p.Generation, &p.ActivatedAt); err != nil {
+		if err := rows.Scan(&p.Endpoint, &p.Major, &p.InstallID, &p.ActivatedAt); err != nil {
 			return nil, exit.Internalf("cannot read a pin: %s", err)
 		}
 		out = append(out, p)

@@ -10,7 +10,7 @@ import (
 
 // cl-010's two sections. Both drive the PRODUCT BINARY exactly as a user types it —
 // `cozy up`, `cozy run …`, `cozy logs …` — against a real service in its own process.
-// Nothing here calls into internal/coord or internal/api: if a verb works, it worked
+// Nothing here calls into internal/orchestrator or internal/api: if a verb works, it worked
 // through the local client API over a socket.
 //
 //	journey  the full user path on the real card: up -> install -> describe -> fit ->
@@ -252,7 +252,7 @@ func sectionJourney() {
 	timeoutMS := elapsedMS(t0)
 	check("a run past its --timeout exits 10, not 12: the deadline is what happened",
 		code == 10 && strings.Contains(out, "deadline"), firstLine(out))
-	check("and it cancelled through the coordinator rather than walking away",
+	check("and it cancelled through the orchestrator rather than walking away",
 		strings.Contains(out, "expired"), "")
 	fmt.Printf("  the deadline settled in %d ms\n", timeoutMS)
 
@@ -286,7 +286,7 @@ func sectionJourney() {
 
 // cancelMidRun starts a LONG attempt and interrupts the client the way a person does:
 // SIGINT to the `cozy run` process. The client must not die — it cancels through the
-// coordinator and keeps watching, because the attempt's own journaled terminal is what
+// orchestrator and keeps watching, because the attempt's own journaled terminal is what
 // settles the request.
 func cancelMidRun(root string, port int) bool {
 	cmd := niceCmd(cozyBinary(), "run", endpointRef+"/v1/stubborn", "steps=512", "latent=80")

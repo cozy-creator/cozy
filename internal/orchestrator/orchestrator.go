@@ -1,4 +1,4 @@
-// Package coord is the local client's EMBEDDED ORCHESTRATOR (#455; the record-plane
+// Package orchestrator is the local client's EMBEDDED ORCHESTRATOR (#455; the record-plane
 // owner of every worker this service runs): the scheduling role of the ONE long-lived
 // LocalService `cozy up` starts (cl-001). Since the 2026-08-25 re-landing (#436) the
 // WORKER hosts the protocol and this side DIALS it: each spawned worker binds its own
@@ -17,7 +17,7 @@
 // `recovered_attempts` a new session reports on Register are OPEN OBLIGATIONS, and no
 // next ordinal for those request ids may be minted until each is closed by its own
 // journaled terminal. A new session_id never manufactures absence.
-package coord
+package orchestrator
 
 import (
 	"fmt"
@@ -51,33 +51,35 @@ type Options struct {
 
 	// Rentals resolves an attached-worker id (`cozy rent`'s persisted triple) to its
 	// dial spec. Wired by the entrypoint; nil = this service attaches no remote workers.
-	Rentals func(id string) (*RemoteSpec, *exit.Error)
+	Rentals func(id string) (*WorkerConnection, *exit.Error)
 
-	// ImageDigest and ConfigDigest ride INSIDE every ExecutionSpec document: the exact
-	// execution environment (class b) and the evaluated-config document's identity
-	// (class a, cr-003's). They are frozen per service, never per request — a request
-	// cannot choose the environment it is admitted under.
-	ImageDigest  string
-	ConfigDigest string
-	MaxOutputMiB int64
+	// EnvironmentSpecDigest and ConfigDigest ride INSIDE every InvocationSpec document:
+	// the EndpointEnvironmentSpec that IS this invocation's execution environment (#483 —
+	// was `ImageDigest`, and "image" is wrong for a native install with no OCI image at
+	// all) and the evaluated-config document's identity (cr-003's). They are frozen per
+	// service, never per request — a request cannot choose the environment it is admitted
+	// under.
+	EnvironmentSpecDigest string
+	ConfigDigest          string
+	MaxOutputMiB          int64
 }
 
-// Launcher resolves an endpoint ref to the spec that starts its worker. The coordinator
+// Launcher resolves an endpoint ref to the spec that starts its worker. The orchestrator
 // holds it to SELECT-OR-START and for nothing else: it never resolves a name itself, and
 // the object that does is the LOCAL module's install-generation resolver (cl-010) or, on
 // a pod, cl-014's.
 type Launcher interface {
-	Resolve(endpoint string) (EndpointSpec, *exit.Error)
+	Resolve(endpoint string) (WorkerLaunchSpec, *exit.Error)
 	// ResolveJob is the JOB lane's half: `org/name` plus a job function to the spec that
 	// makes THAT job's worker resident. It is a separate method rather than a flag
 	// because the two produce different Directives and different worker slots — the
 	// mode is a fact about the worker, and a resolver that returned "either" would push
-	// the choice into the coordinator, which resolves nothing.
-	ResolveJob(endpoint, function string) (EndpointSpec, *exit.Error)
+	// the choice into the orchestrator, which resolves nothing.
+	ResolveJob(endpoint, function string) (WorkerLaunchSpec, *exit.Error)
 }
 
-// Coordinator is the LocalService's scheduling role.
-type Coordinator struct {
+// Orchestrator is the LocalService's scheduling role.
+type Orchestrator struct {
 	opt Options
 
 	// done closes when the service is closing; Serve blocks on it (the owner DIALS
@@ -124,16 +126,16 @@ type wait struct {
 	err      *exit.Error
 }
 
-// Open builds the coordinator. No listener binds here: the owner DIALS each worker's
+// Open builds the orchestrator. No listener binds here: the owner DIALS each worker's
 // own socket (#436); a second LocalService on one root fails on the service lock instead.
-func Open(opt Options) (*Coordinator, *exit.Error) {
+func Open(opt Options) (*Orchestrator, *exit.Error) {
 	if opt.Log == nil {
 		opt.Log = io.Discard
 	}
 	if opt.Yield == "" {
 		opt.Yield = "smart"
 	}
-	c := &Coordinator{
+	c := &Orchestrator{
 		opt:      opt,
 		done:     make(chan struct{}),
 		sessions: map[string]*session{},
@@ -148,7 +150,7 @@ func Open(opt Options) (*Coordinator, *exit.Error) {
 
 // Serve blocks until Close. The owner dials workers; there is no server to run (#436),
 // and the blocking shape is kept so entrypoints stay one-line callers.
-func (c *Coordinator) Serve() error {
+func (c *Orchestrator) Serve() error {
 	<-c.done
 	return nil
 }
@@ -156,7 +158,7 @@ func (c *Coordinator) Serve() error {
 // Close stops every worker this service owns. A worker outliving its launcher is exactly
 // the class of bug the birth identity exists to catch, so `down` stops what it started
 // rather than orphaning it.
-func (c *Coordinator) Close(grace time.Duration) {
+func (c *Orchestrator) Close(grace time.Duration) {
 	c.mu.Lock()
 	c.closing = true
 	c.mu.Unlock()
@@ -168,14 +170,14 @@ func (c *Coordinator) Close(grace time.Duration) {
 		wg.Add(1)
 		go func(id string) {
 			defer wg.Done()
-			c.StopWorker(id, grace)
+			c.ShutdownWorker(id, grace)
 		}(w.instanceID)
 	}
 	wg.Wait()
 	c.closeOnce.Do(func() { close(c.done) })
 }
 
-func (c *Coordinator) workerList() []*worker {
+func (c *Orchestrator) workerList() []*worker {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	out := make([]*worker, 0, len(c.workers))
@@ -185,8 +187,8 @@ func (c *Coordinator) workerList() []*worker {
 	return out
 }
 
-func (c *Coordinator) logf(format string, args ...any) {
-	line := fmt.Sprintf("[coord %s] ", time.Now().UTC().Format("15:04:05.000")) +
+func (c *Orchestrator) logf(format string, args ...any) {
+	line := fmt.Sprintf("[orchestrator %s] ", time.Now().UTC().Format("15:04:05.000")) +
 		fmt.Sprintf(format, args...)
 	fmt.Fprintln(c.opt.Log, line)
 	c.mu.Lock()
@@ -197,24 +199,24 @@ func (c *Coordinator) logf(format string, args ...any) {
 	c.mu.Unlock()
 }
 
-// Events is the coordinator's own recent activity, for status rendering. Runtime events
-// reach a client through here and never bypass the coordinator.
-func (c *Coordinator) Events() []string {
+// Events is the orchestrator's own recent activity, for status rendering. Runtime events
+// reach a client through here and never bypass the orchestrator.
+func (c *Orchestrator) Events() []string {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	return append([]string(nil), c.events...)
 }
 
-// Store is the lifecycle authority this coordinator writes. cl-006's API reads requests,
+// Store is the lifecycle authority this orchestrator writes. cl-006's API reads requests,
 // attempts, outputs and durable events through it — the same rows, never a second copy.
-func (c *Coordinator) Store() *records.Store { return c.opt.Store }
+func (c *Orchestrator) Store() *records.Store { return c.opt.Store }
 
-// Layout is the local root this coordinator grants into.
-func (c *Coordinator) Layout() home.Layout { return c.opt.Layout }
+// Layout is the local root this orchestrator grants into.
+func (c *Orchestrator) Layout() home.Layout { return c.opt.Layout }
 
 // emit appends ONE durable lifecycle event. A failure to append is logged and never
 // fatal: the authority's own row is the fact, and the stream is its announcement.
-func (c *Coordinator) emit(requestID, eventType string, attempt uint64, payload map[string]any) {
+func (c *Orchestrator) emit(requestID, eventType string, attempt uint64, payload map[string]any) {
 	if e := c.opt.Store.AppendEvent(requestID, eventType, int64(attempt), payload); e != nil {
 		c.logf("event %s for %s NOT appended: %s", eventType, requestID, e.Message)
 	}
@@ -222,7 +224,7 @@ func (c *Coordinator) emit(requestID, eventType string, attempt uint64, payload 
 
 // nextRevision mints the Directive revision. The hub owns it; it is monotonic, and a
 // changed body always carries a new one.
-func (c *Coordinator) nextRevision() uint64 {
+func (c *Orchestrator) nextRevision() uint64 {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	c.revision++
@@ -233,7 +235,7 @@ func key(requestID string, attempt uint64) string {
 	return fmt.Sprintf("%s#%d", requestID, attempt)
 }
 
-func (c *Coordinator) waitFor(k string) *wait {
+func (c *Orchestrator) waitFor(k string) *wait {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	w, ok := c.waits[k]
@@ -245,7 +247,7 @@ func (c *Coordinator) waitFor(k string) *wait {
 }
 
 // enqueue parks a request until some worker advertises its binding as ready.
-func (c *Coordinator) enqueue(requestID string) {
+func (c *Orchestrator) enqueue(requestID string) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	for _, id := range c.pending {
@@ -264,7 +266,7 @@ func (c *Coordinator) enqueue(requestID string) {
 // same queue snapshot: the durable ordinal law is what refuses the duplicate, but doing the
 // work twice and relying on a refusal is not a design. The lock makes the second drain read
 // a queue the first one has already emptied.
-func (c *Coordinator) drain() {
+func (c *Orchestrator) drain() {
 	c.drainMu.Lock()
 	defer c.drainMu.Unlock()
 	c.mu.Lock()
@@ -301,7 +303,7 @@ func (c *Coordinator) drain() {
 // The queue is a slice appended in submission order and drained in that order, so the
 // position is the real thing rather than an estimate (cr-019: many queued jobs against
 // one worker drain FIFO, and a client can watch it happen).
-func (c *Coordinator) QueuePosition(requestID string) int {
+func (c *Orchestrator) QueuePosition(requestID string) int {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	for i, id := range c.pending {
@@ -326,7 +328,7 @@ func (c *Coordinator) QueuePosition(requestID string) int {
 // needing different plans stop each other's worker in turn; the FIFO head is the one that
 // gets capacity next, so it is the one whose need is asked about. Nothing is dispatched
 // here — `drain` is still the one placement path.
-func (c *Coordinator) reviveQueue() {
+func (c *Orchestrator) reviveQueue() {
 	c.mu.Lock()
 	closing, head := c.closing, ""
 	if len(c.pending) > 0 {
@@ -357,7 +359,7 @@ func (c *Coordinator) reviveQueue() {
 // terminal forever: the request was not queued (it had an ordinal), so nothing looked at
 // it again. Found live by cl-004's kill arm, which only converged when a LATER submission
 // happened to restart the same slot.
-func (c *Coordinator) recoverWorker(spec EndpointSpec) {
+func (c *Orchestrator) recoverWorker(spec WorkerLaunchSpec) {
 	c.mu.Lock()
 	closing := c.closing
 	c.mu.Unlock()
@@ -374,7 +376,7 @@ func (c *Coordinator) recoverWorker(spec EndpointSpec) {
 	}
 	c.logf("worker %s died owing %d terminal(s); restarting the slot so its journal replays",
 		spec.InstanceID(), len(open))
-	if _, e := c.StartWorker(spec); e != nil {
+	if _, _, e := c.EnsureWorker(spec); e != nil {
 		// The slot cannot come back. The attempts it holds are unsettleable, and saying so
 		// beats leaving a client on a stream that will never close.
 		c.logf("the slot %s could not be restarted (%s); its %d open attempt(s) cannot settle",
@@ -385,21 +387,22 @@ func (c *Coordinator) recoverWorker(spec EndpointSpec) {
 
 // StallGrace is how long a RESIDENT worker may go on not being dispatchable for the
 // request at the head of its own queue before it is replaced. It is deliberately the same
-// clock `WaitReady` gives a worker reporting ERROR: a worker that has not become able to
-// serve its queue in a minute and a half has answered, whatever state it is reporting.
+// clock `EnsurePlacementReady` gives a placement holding a fault: a worker that has not
+// become able to serve its queue in a minute and a half has answered, whatever state it is
+// reporting.
 const StallGrace = 90 * time.Second
 
 // checkStall replaces a worker that is resident, alive, staged for the head of the queue,
-// and STILL not dispatchable. It runs on every Report, because a Report is the only thing
-// a stuck worker keeps producing.
+// and STILL not dispatchable. It runs on every observed state, because that is the only
+// thing a stuck worker keeps producing.
 //
 // The condition is real and was met live: `kill -9` of a job executor mid-attempt left the
-// supervisor rebuilding, its Report pinned at INTAKE_STATE_LOADING with jobs_available=0,
-// and the queue behind it waiting forever. `drain` could not help — it only runs on READY,
-// which is exactly what never came. Nothing here decides WHY a worker is stuck: the
-// coordinator's business is that a request has been owed capacity for too long by a
-// process it started, and the one thing it owns is whether that process keeps the slot.
-func (c *Coordinator) checkStall() {
+// worker rebuilding, its capacity pinned at zero, and the queue behind it waiting forever.
+// `drain` could not help — it only runs on DISPATCHABLE, which is exactly what never came.
+// Nothing here decides WHY a worker is stuck: the orchestrator's business is that a request
+// has been owed capacity for too long by a process it started, and the one thing it owns is
+// whether that process keeps the slot.
+func (c *Orchestrator) checkStall() {
 	c.mu.Lock()
 	head := ""
 	if len(c.pending) > 0 {
@@ -419,7 +422,7 @@ func (c *Coordinator) checkStall() {
 		if w.exited || !staged(w, req.PlanID) {
 			continue
 		}
-		if w.intake == pb.IntakeState_INTAKE_STATE_READY && w.ready[req.PlanID] {
+		if w.dispatchableFor(req.PlanID) {
 			// Dispatchable. The queue is waiting on placement, not on this worker.
 			delete(c.stalls, w.instanceID)
 			c.mu.Unlock()
@@ -437,24 +440,36 @@ func (c *Coordinator) checkStall() {
 		c.mu.Unlock()
 		return
 	}
-	stuck, intake := time.Since(first), pb.IntakeState_name[int32(victim.intake)]
-	instance := victim.instanceID
+	stuck := time.Since(first)
+	state := fmt.Sprintf("%s/%s",
+		trimEnum(pb.MaterializationState_name[int32(victim.materialization)], "MATERIALIZATION_STATE_"),
+		trimEnum(pb.ServingState_name[int32(victim.serving)], "SERVING_STATE_"))
+	instance, placement := victim.instanceID, victim.placementID
 	c.mu.Unlock()
 	if stuck < StallGrace {
 		return
 	}
-	c.logf("worker %s has been %s and undispatchable for %s while %s waits; replacing it",
-		instance, intake, stuck.Round(time.Second), head)
+	c.logf("worker %s has been %s and undispatchable for %s while %s waits; retiring its "+
+		"placement and replacing it", instance, state, stuck.Round(time.Second), head)
 	c.mu.Lock()
 	delete(c.stalls, instance)
 	c.mu.Unlock()
-	// StopWorker's own reviveQueue asks for the replacement, so the request the watchdog
+	// RETIRE, THEN SHUT DOWN. The two halves are separate acts (#484): the placement is
+	// taken out of the desired set first, so the worker drains what it holds under a
+	// DRAINING posture instead of meeting SIGTERM with the set still saying "serve this".
+	// A worker whose stream is already gone cannot be told, and that refusal is not an
+	// error — the process stop below is what settles it either way.
+	if e := c.RetirePlacement(instance, placement); e != nil {
+		c.logf("worker %s could not be told to retire %s (%s); the process stop follows",
+			instance, placement, e.Message)
+	}
+	// ShutdownWorker's own reviveQueue asks for the replacement, so the request the watchdog
 	// fired for is the one whose need gets re-asked.
-	c.StopWorker(instance, StopGrace)
+	c.ShutdownWorker(instance, StopGrace)
 }
 
 // queueDepth is how many requests are waiting for capacity right now.
-func (c *Coordinator) queueDepth() int {
+func (c *Orchestrator) queueDepth() int {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	return len(c.pending)
@@ -463,7 +478,7 @@ func (c *Coordinator) queueDepth() int {
 // CancelQueued settles a request that is WAITING and has no attempt to cancel. It leaves
 // the queue and is settled canceled — a client that asked for a cancel is owed an answer,
 // and "it will start later anyway" is not one.
-func (c *Coordinator) CancelQueued(requestID string) {
+func (c *Orchestrator) CancelQueued(requestID string) {
 	c.forget(requestID)
 	if e := c.opt.Store.SettleRequest(requestID, "canceled"); e != nil {
 		c.logf("%s could not be settled canceled: %s", requestID, e.Message)
@@ -481,7 +496,7 @@ func (c *Coordinator) CancelQueued(requestID string) {
 		exit.New(exit.Canceled, "%s was canceled before any attempt was dispatched", requestID))
 }
 
-func (c *Coordinator) forget(requestID string) {
+func (c *Orchestrator) forget(requestID string) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	out := c.pending[:0]
@@ -495,7 +510,7 @@ func (c *Coordinator) forget(requestID string) {
 
 // waitRequest is the REQUEST-level wait: it closes when the request settles, which may
 // be several attempts after the one a caller first saw.
-func (c *Coordinator) waitRequest(requestID string) *wait { return c.waitFor("request:" + requestID) }
+func (c *Orchestrator) waitRequest(requestID string) *wait { return c.waitFor("request:" + requestID) }
 
 func (w *wait) markAccepted() { w.onceA.Do(func() { close(w.accepted) }) }
 func (w *wait) markClosed(e *exit.Error) {

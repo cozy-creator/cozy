@@ -1,6 +1,6 @@
 // Package rental is the local side of a rented pod (cl-015): where its facts live, where
 // its credential lives, and the ONE function that turns a rental id into the dial triple
-// the coordinator attaches a remote worker with.
+// the orchestrator attaches a remote worker with.
 //
 // The split is deliberate and is the same one cl-006 already made for the CLI's own
 // credential: the FACTS are rows in the records authority (they are durable lifecycle
@@ -14,10 +14,10 @@ import (
 	"path/filepath"
 	"runtime"
 
-	"github.com/cozy-creator/cozy-creator-v2/internal/coord"
 	"github.com/cozy-creator/cozy-creator-v2/internal/exit"
 	"github.com/cozy-creator/cozy-creator-v2/internal/home"
 	"github.com/cozy-creator/cozy-creator-v2/internal/media"
+	"github.com/cozy-creator/cozy-creator-v2/internal/orchestrator"
 	"github.com/cozy-creator/cozy-creator-v2/internal/records"
 	"github.com/cozy-creator/cozy-creator-v2/internal/secret"
 )
@@ -114,13 +114,13 @@ func noAddress(id, state string) *exit.Error {
 		WithNext("cozy rent ls")
 }
 
-// Resolver is what the service entrypoint hands the coordinator as `Options.Rentals`. It
+// Resolver is what the service entrypoint hands the orchestrator as `Options.Rentals`. It
 // is the DIAL-TIME resolution — the one place the owner token is read, at the moment it
 // becomes Claim.proof. It reads the store on EVERY call rather than closing over a
 // snapshot: `cozy rent` is a records-plane act that runs against a service already up, so
 // a resolver that cached would refuse the rental the user just made until a restart.
-func Resolver(l home.Layout, st *records.Store) func(string) (*coord.RemoteSpec, *exit.Error) {
-	return func(id string) (*coord.RemoteSpec, *exit.Error) {
+func Resolver(l home.Layout, st *records.Store) func(string) (*orchestrator.WorkerConnection, *exit.Error) {
+	return func(id string) (*orchestrator.WorkerConnection, *exit.Error) {
 		row, e := st.RentalRow(id)
 		if e != nil {
 			return nil, e
@@ -145,7 +145,7 @@ func Resolver(l home.Layout, st *records.Store) func(string) (*coord.RemoteSpec,
 				WithRemedy("release this rental and rent again; the pin is written with the token").
 				WithNext("cozy rent release " + id + " --yes")
 		}
-		spec := &coord.RemoteSpec{Addr: row.Address, Token: token, CACert: cert}
+		spec := &orchestrator.WorkerConnection{Addr: row.Address, Token: token, CACert: cert}
 		if row.MediaAddress != "" {
 			// ONE PROVISIONED IDENTITY, TWO LISTENERS (#506b, tonight's tier). The pod's
 			// media server holds its OWN keys — cl-014's rule, and this host pins the same

@@ -25,7 +25,7 @@ import (
 //	pipeline  install (both rungs) -> describe -> fit -> up -> start -> a real 1024px
 //	          image -> warm -> multi-request -> the capacity law -> the fp8 rung
 //	m4arms    the four M4 arms on the FULL pipeline: duplicate attempt, dropped
-//	          TerminalAck, non-cooperative cancel, coordinator restart
+//	          TerminalAck, non-cooperative cancel, orchestrator restart
 
 const (
 	pipeRef    = "cozy/sdxl-pipeline"
@@ -45,7 +45,7 @@ const (
 	// cr-008b's harness time to first image for that request: `cozy-runtime run`, one
 	// shot, warm page cache, no service and no boot warm pass. THE BAR's cold ladder puts
 	// the same request at 25.14 s with the page cache dropped and 21.39 s warm. The
-	// PRODUCT TAX is what `cozy run` through a coordinator costs on top.
+	// PRODUCT TAX is what `cozy run` through a orchestrator costs on top.
 	harnessTTFIms = 19347
 	harnessWarmMs = 21390
 	// cr-008b's banked 1024px artifact itself, kept by THE BAR's ladder. Absent, the
@@ -398,7 +398,7 @@ func sectionPipeline() {
 
 	head("the capacity law: a SECOND endpoint cannot take a device the first one holds")
 	// One active attempt per GPU (law 8) starts at the device envelope: the fp8 rung is a
-	// different endpoint over the same card, and the coordinator's ledger is what refuses.
+	// different endpoint over the same card, and the orchestrator's ledger is what refuses.
 	second := svc.call("POST", "/v1/local/workers", map[string]any{"endpoint": pipeFP8Ref})
 	check("starting a second endpoint's worker while the first holds the card refuses TYPED",
 		second.Status >= 400, fmt.Sprintf("%d %s", second.Status, second.brief()))

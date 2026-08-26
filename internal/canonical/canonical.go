@@ -7,7 +7,7 @@
 //
 // The writer is ADAPTED from worker-protocol's own independent Go canonicalizer
 // (`scripts/crosslang/canon.go`) — the second implementation that proved the rules are
-// written down rather than accidental. The reader is new here, because a coordinator
+// written down rather than accidental. The reader is new here, because a orchestrator
 // reads terminals: it refuses everything the writer could not have produced
 // (non-canonical encoding, unknown key, wrong format), which is what makes a planted
 // key a REFUSAL rather than an ignored unknown field.
@@ -169,6 +169,30 @@ func body(m protoreflect.Message) (map[string]Value, error) {
 	return out, err
 }
 
+// docVersion is the DOCUMENT VERSION MAP. A digest-fenced document is NOT additively
+// versioned (01 §3): an unknown key REFUSES, so a new key is a NEW DOCUMENT VERSION and
+// the version rides the `format` tag. Every document is at /1 except
+// `AttemptOutcomeBody/2`, which carries #480c's `execution_started` bit on top of the
+// frozen wire's TerminalBody/1 lineage.
+//
+// The map is read INDEPENDENTLY per language (#510g) rather than derived from the
+// binding, because the version is a property of the document's key set and not of the
+// message that happens to transport it. Without it this writer would spell an
+// AttemptOutcomeBody under `/1` and every digest it minted would name the wrong document
+// (#536e).
+var docVersion = map[string]int{"cozy.worker.v1.AttemptOutcomeBody": 2}
+
+// Format is the canonical `format` tag for one message's document: its full name plus the
+// document version.
+func Format(m proto.Message) string {
+	name := string(m.ProtoReflect().Descriptor().FullName())
+	v, ok := docVersion[name]
+	if !ok {
+		v = 1
+	}
+	return name + "/" + strconv.Itoa(v)
+}
+
 // Document is a message's set fields plus the `format` tag that domain-separates one
 // document kind from another.
 func Document(m proto.Message) (Doc, error) {
@@ -179,7 +203,7 @@ func Document(m proto.Message) (Doc, error) {
 	if _, taken := b["format"]; taken {
 		return nil, refuse("unknown_field", "`format` is reserved for the document tag")
 	}
-	b["format"] = string(m.ProtoReflect().Descriptor().FullName()) + "/1"
+	b["format"] = Format(m)
 	return b, nil
 }
 
@@ -268,7 +292,7 @@ func Bytes(m proto.Message) ([]byte, error) {
 }
 
 // Identity is `(canonical bytes, raw 32-byte digest)` — the fenced pair a message
-// carries. The coordinator mints this once per attempt and never recomputes it from a
+// carries. The orchestrator mints this once per attempt and never recomputes it from a
 // second representation.
 func Identity(m proto.Message) ([]byte, []byte, error) {
 	data, err := Bytes(m)

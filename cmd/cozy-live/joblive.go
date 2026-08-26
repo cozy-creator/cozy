@@ -29,7 +29,7 @@ func jobStore() string { return flag("store", "/tmp/cozy-sdxl4/store") }
 
 // bankedTensors / bankedBytes are cr-009's OWN measurements over this exact store
 // (execution record: 2,641 tensors, 6,937,675,734 logical bytes). Reproducing them
-// through a different coordinator, in a different language, on a different day is what
+// through a different orchestrator, in a different language, on a different day is what
 // makes this an integration proof rather than a smoke test.
 const (
 	bankedTensors = 2641
@@ -60,7 +60,7 @@ func installJobEndpoint(root string) {
 // the four component snapshots as request data. No identifier is a literal in job code.
 func jobPayload(dir, ref string, dwellMS int) string {
 	// NAMED BY ITS DWELL. One filename for two payloads silently made the benchmark
-	// measure the kill arm's 2.5 s-per-component dwell: 11.7 s of "coordinator tax" that
+	// measure the kill arm's 2.5 s-per-component dwell: 11.7 s of "orchestrator tax" that
 	// was a harness bug, not a number.
 	snapshots := map[string]string{}
 	data, err := os.ReadFile(filepath.Join(filepath.Dir(jobStore()), "snapshots.json"))
@@ -122,7 +122,7 @@ func sectionJobArms() {
 	check("a wrong scalar type -> 3, naming the declared type",
 		code == 3 && strings.Contains(out, "declared int"), firstLine(out))
 
-	head("a granted read capability is a DIRECTORY the coordinator can authorize")
+	head("a granted read capability is a DIRECTORY the orchestrator can authorize")
 	code, out = cozyRun(root, "job", "submit", jobEndpoint+"/v1/census", "--input", "notaref")
 	check("--input without ref=dir -> 2", code == 2 && strings.Contains(out, "<ref>=<directory>"),
 		firstLine(out))
@@ -228,7 +228,7 @@ func sectionJobs() {
 		pubRoot != "" && strings.Contains(pubRoot, "publications") &&
 			!strings.Contains(pubRoot, "workers") && !strings.Contains(pubRoot, "outputs"),
 		pubRoot)
-	// The attempt wrote into its STAGE and the coordinator promoted it across; nothing the
+	// The attempt wrote into its STAGE and the orchestrator promoted it across; nothing the
 	// job itself wrote is left at the addressable path.
 	staged, _ := filepath.Glob(filepath.Join(pubRoot, ".staging", "*", "*"))
 	check("the attempt's stage is EMPTY — its writes were promoted, not copied",
@@ -251,7 +251,7 @@ func sectionJobs() {
 	check("and the publication names NO checkpoints — that half is the runtime border's",
 		pub["checkpoints"] == nil, "the typed receipt seam, deliberately empty")
 	saves, _ := doc["checkpoints"].([]any)
-	check("the DURABLE checkpoint exchange was journaled by the coordinator",
+	check("the DURABLE checkpoint exchange was journaled by the orchestrator",
 		len(saves) >= 1, fmt.Sprintf("%d journaled save(s)", len(saves)))
 	fmt.Printf("  bench submit -> complete wall: %d ms\n", wallMS)
 
@@ -276,9 +276,9 @@ func sectionJobs() {
 	begun := time.Now()
 	// SEQUENTIALLY, and that is the point rather than a convenience: FIFO can only be
 	// checked against a submission order that EXISTS, and firing six `cozy job submit`
-	// processes concurrently means the order they reach the coordinator is a race with
+	// processes concurrently means the order they reach the orchestrator is a race with
 	// process startup — which is what made an earlier version of this arm report a
-	// violation the coordinator had not committed. Each submit returns immediately (no
+	// violation the orchestrator had not committed. Each submit returns immediately (no
 	// --follow), so six of them land inside a second.
 	for i := 0; i < depth; i++ {
 		_, out := cozyRun(root, "job", "submit", jobEndpoint+"/v1/census",
@@ -439,7 +439,7 @@ func killMidJob(svc *liveService, root, ref, payloadPath string) string {
 
 	// WAIT FOR THE ATTEMPT, from the API rather than from the client's stdout: the
 	// progress lane's stage names are the job's own words and gating on them made an
-	// earlier version of this arm never fire at all. `in_progress` is the coordinator's
+	// earlier version of this arm never fire at all. `in_progress` is the orchestrator's
 	// answer to "is an attempt running", which is exactly the state the kill must land in.
 	deadline := time.Now().Add(5 * time.Minute)
 	killed := false
@@ -448,7 +448,7 @@ func killMidJob(svc *liveService, root, ref, payloadPath string) string {
 		if newestJobStatus(svc) != "in_progress" {
 			continue
 		}
-		// The worker's own process group, found through the coordinator's listing rather
+		// The worker's own process group, found through the orchestrator's listing rather
 		// than through a pid this driver remembered.
 		if pid := jobWorkerPID(svc); pid > 0 {
 			_ = killGroup(pid, syscall.SIGKILL)
@@ -492,7 +492,7 @@ func killMidJob(svc *liveService, root, ref, payloadPath string) string {
 }
 
 // exhaustRetryBudget plants a job BODY that kills its own executor the moment it runs, so
-// every dispatched attempt ends on a NEUTRAL outcome the coordinator's projection reads as
+// every dispatched attempt ends on a NEUTRAL outcome the orchestrator's projection reads as
 // infra-class. The projection then spends the durable budget one requeue at a time and,
 // when it is gone, SETTLES the request typed and names the budget it spent.
 //
@@ -534,7 +534,7 @@ func exhaustRetryBudget(svc *liveService, root, ref, payloadPath string) string 
 	attempts := int64(numberOf(doc, "attempts"))
 	check("a job that ends NEUTRAL on every attempt settles typed rather than retrying forever",
 		code == 11, firstLine(out))
-	check("the coordinator's PROJECTION spent the whole durable retry budget",
+	check("the orchestrator's PROJECTION spent the whole durable retry budget",
 		spent == budget && budget > 0,
 		fmt.Sprintf("%d/%d spent over %d attempt(s)", spent, budget, attempts))
 	check("and the settlement NAMES the budget it exhausted",
@@ -544,9 +544,9 @@ func exhaustRetryBudget(svc *liveService, root, ref, payloadPath string) string 
 	return log.String()
 }
 
-// benchJob measures the coordinator tax: the same job through `cozy job` versus cr-009's
+// benchJob measures the orchestrator tax: the same job through `cozy job` versus cr-009's
 // own banked runner numbers (264–313 ms whole job, 44–48 ms body, 216–241 ms fixed runner
-// overhead). The difference is what a coordinator, an HTTP hop, a durable authority and a
+// overhead). The difference is what a orchestrator, an HTTP hop, a durable authority and a
 // RECLAIMED worker cost on top of an in-process ephemeral supervisor — a job worker is
 // terminal-and-reclaim, so every job pays its own spawn.
 func benchJob(svc *liveService, root, ref, payloadPath string) {
@@ -606,7 +606,7 @@ func numberOf(doc map[string]any, key string) float64 {
 	return n
 }
 
-// jobWorkerPID finds the live job worker's pid through the coordinator's own listing —
+// jobWorkerPID finds the live job worker's pid through the orchestrator's own listing —
 // the protocol's identities, read from the API, never a pid this driver remembered.
 func jobWorkerPID(svc *liveService) int {
 	workers, _ := svc.call("GET", "/v1/local/workers", nil).json()["workers"].([]any)
@@ -702,7 +702,7 @@ func cozyRunEnv(root string, imposed []string, args ...string) (int, string) {
 // THE CRASH MATRIX, at the two lifecycle points that decide whether a publication is a
 // promise or a fact. The COORDINATOR is what dies here — a separate `cozy up` process,
 // `kill -9`ed — because the publication row rides its terminal transaction, so the
-// coordinator's death is the only crash that can land between "the bytes are on disk" and
+// orchestrator's death is the only crash that can land between "the bytes are on disk" and
 // "the publication exists".
 //
 //	before the bundle lands  ->  no publication is visible, and none ever was
@@ -720,7 +720,7 @@ func sectionJobCrash() {
 	// the kill would prove nothing.
 	slow := jobPayload(root, ref, 2500)
 
-	head("ARM A — kill the coordinator BEFORE the bundle lands")
+	head("ARM A — kill the orchestrator BEFORE the bundle lands")
 	jobA := submitJobAPI(svc, ref, slow)
 	rootA := filepath.Join(root, "publications", "local", "_job-"+jobA)
 	check("the attempt is running and has written nothing yet",
@@ -728,12 +728,12 @@ func sectionJobCrash() {
 			!exists(filepath.Join(rootA, "census")),
 		rootA)
 	svc.kill9()
-	check("the coordinator is gone", !svc.alive(), "")
+	check("the orchestrator is gone", !svc.alive(), "")
 	check("and no bundle was left behind at the publication root",
 		!exists(filepath.Join(rootA, "census")), rootA)
 	svc = startService(root, port, false)
 	docA := svc.jobDoc(jobA)
-	check("after the restart NOTHING the dead coordinator had not committed is visible",
+	check("after the restart NOTHING the dead orchestrator had not committed is visible",
 		docA["publication"] == nil && len(asList(docA["outputs"])) == 0,
 		fmt.Sprintf("status %v", docA["status"]))
 	// The orphaned worker was reconciled at boot; the queued attempt needs a replacement,
@@ -761,18 +761,18 @@ func sectionJobCrash() {
 		fmt.Sprintf("%d output(s) over %v attempt(s)", len(asList(settledA["outputs"])),
 			settledA["attempts"]))
 
-	head("ARM B — kill the coordinator the instant the bundle LANDS, before its terminal")
+	head("ARM B — kill the orchestrator the instant the bundle LANDS, before its terminal")
 	jobB := submitJobAPI(svc, ref, slow)
 	rootB := filepath.Join(root, "publications", "local", "_job-"+jobB)
 	landed := filepath.Join(rootB, "census")
 	// The window between the job's last write and `AcceptTerminal` is ~50 ms (the
-	// coordinator's own measurement of the transaction). Poll fast and kill on sight.
+	// orchestrator's own measurement of the transaction). Poll fast and kill on sight.
 	raced := waitFast(func() bool { return exists(landed) }, 20*time.Minute)
 	svc.kill9()
 	killedAt := "the bundle was on disk"
 	check("the bundle was observed on disk before the kill", raced, landed)
 	svc = startService(root, port, false)
-	check("THE BUNDLE SURVIVED the coordinator's death", exists(landed), landed)
+	check("THE BUNDLE SURVIVED the orchestrator's death", exists(landed), landed)
 	settledB := waitSettled(svc, jobB, 20*time.Minute)
 	pubB, _ := settledB["publication"].(map[string]any)
 	// WHICH SIDE of the transaction the kill landed on is not something a driver may
@@ -814,7 +814,7 @@ func submitJobAPI(svc *liveService, ref, payloadPath string) string {
 	return id
 }
 
-// newestJobStatus is the coordinator's own answer about the most recently recorded job.
+// newestJobStatus is the orchestrator's own answer about the most recently recorded job.
 func newestJobStatus(svc *liveService) string {
 	jobs, _ := svc.call("GET", "/v1/local/jobs?limit=1", nil).json()["jobs"].([]any)
 	if len(jobs) == 0 {

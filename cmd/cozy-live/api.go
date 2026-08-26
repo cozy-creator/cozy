@@ -16,7 +16,7 @@ import (
 
 // cl-006's live sections. Everything here drives a SEPARATE, REAL `cozy up` process over
 // real HTTP — the driver is a client and nothing more, which is what makes the
-// coordinator-kill arm possible at all.
+// orchestrator-kill arm possible at all.
 
 // --------------------------------------------------------------------------- apiarms
 //
@@ -533,7 +533,7 @@ func (s stat) String() string {
 }
 
 // benchAPI measures what cl-006 adds ON TOP of cl-001's direct numbers. The comparison is
-// the point: 35–43 ms submit->accepted through the coordinator's Go surface, versus the
+// the point: 35–43 ms submit->accepted through the orchestrator's Go surface, versus the
 // same thing through a real HTTP client on the same machine.
 func benchAPI(svc *liveService, boot, acceptedHTTP, total, fetch time.Duration, mediaBytes int, mediaID string) {
 	fmt.Printf("  worker spawn -> READY through the API                : %s\n", ms(boot))
@@ -542,7 +542,7 @@ func benchAPI(svc *liveService, boot, acceptedHTTP, total, fetch time.Duration, 
 
 	// Ten warm runs, each measured on FOUR boundaries at once. `submit -> accepted` is
 	// the one that compares directly with cl-001's 35–43 ms cold / 19.4–33.6 ms warm:
-	// there the coordinator's Go surface was called in-process, here the same boundary is
+	// there the orchestrator's Go surface was called in-process, here the same boundary is
 	// crossed by a real HTTP client watching a real SSE stream.
 	var httpS, acceptS, terminalS, progressS, ackS stat
 	for i := 0; i < 10; i++ {
@@ -623,7 +623,7 @@ func serviceRSS(svc *liveService) string {
 }
 
 // waitReady polls the LOCAL module for an intake-READY worker — the same fact a client
-// has, through the same route, with no privileged view of the coordinator.
+// has, through the same route, with no privileged view of the orchestrator.
 func waitReady(svc *liveService, timeout time.Duration) bool {
 	deadline := time.Now().Add(timeout)
 	for time.Now().Before(deadline) {

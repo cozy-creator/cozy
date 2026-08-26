@@ -17,11 +17,11 @@ import (
 //   - REPLAYABLE: a client resumes from the last id it saw. A stream close is never a
 //     terminal verdict — reconnecting from the cursor is always the right move.
 //   - AS DURABLE AS THE FACT: the terminal event is appended INSIDE the terminal
-//     transaction (records/coord.go), so "the output became visible" and "the stream says
+//     transaction (records/orchestrator.go), so "the output became visible" and "the stream says
 //     so" commit together. A crash between them is unrepresentable.
 //
 // The LOSSY half — progress ticks, logs, per-stage marks — is never written here. It is
-// live-only by construction (coord/dispatch.go's fanout), because a durable row per
+// live-only by construction (orchestrator/dispatch.go's fanout), because a durable row per
 // denoising step would make the authority a log sink.
 var eventSchema = []string{`
 CREATE TABLE IF NOT EXISTS request_events (

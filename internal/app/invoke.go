@@ -16,16 +16,16 @@ import (
 
 	"github.com/cozy-creator/cozy-creator-v2/internal/api"
 	localapi "github.com/cozy-creator/cozy-creator-v2/internal/client"
-	"github.com/cozy-creator/cozy-creator-v2/internal/coord"
 	"github.com/cozy-creator/cozy-creator-v2/internal/exit"
 	"github.com/cozy-creator/cozy-creator-v2/internal/home"
 	"github.com/cozy-creator/cozy-creator-v2/internal/launch"
+	"github.com/cozy-creator/cozy-creator-v2/internal/orchestrator"
 	"github.com/cozy-creator/cozy-creator-v2/internal/records"
 	"github.com/cozy-creator/cozy-creator-v2/internal/render"
 )
 
 // THE LIFECYCLE AND REQUEST VERBS (cl-010), every one of them a CLIENT of the local
-// client API. There is no direct-Go path from a verb to the coordinator: `dial` is the
+// client API. There is no direct-Go path from a verb to the orchestrator: `dial` is the
 // only way into any of them, and what it returns speaks HTTP to a separate process.
 //
 // ONE PRODUCT EXECUTION PATH. `cozy run` is
@@ -54,7 +54,7 @@ func handleStart(ctx *Context) *exit.Error {
 	}
 	ref := ctx.Inv.Args[0]
 	began := time.Now()
-	res, e := c.StartWorker(ref, !ctx.Inv.Bool("--no-warm"))
+	res, e := c.EnsureWorker(ref, !ctx.Inv.Bool("--no-warm"))
 	if e != nil {
 		return e
 	}
@@ -62,7 +62,8 @@ func handleStart(ctx *Context) *exit.Error {
 		{K: "endpoint", V: res.Endpoint},
 		{K: "instance", V: res.InstanceID},
 	}
-	if res.Resident {
+	fields = append(fields, render.Field{K: "change", V: res.Change})
+	if res.Change == "none" {
 		// Already serving = idempotent 0 (cozy-creator.md). It is a STATE this verb
 		// reports, not a refusal it raises.
 		return emit(ctx, render.Record{Kind: "worker",
@@ -97,11 +98,11 @@ func handleStart(ctx *Context) *exit.Error {
 // It said "never a clock" while holding one: a 10-minute ceiling, which is a statement
 // about how large a model may be rather than about anything having gone wrong. The three
 // ways this fails are all the worker's own and all now visible through the listing — it
-// EXITS, it goes SILENT, or it dwells in ERROR — which is the same set `coord.WaitReady`
+// EXITS, it goes SILENT, or it dwells in ERROR — which is the same set `orchestrator.WaitReady`
 // decides on, so the two sides of the same wait cannot disagree.
 func waitReady(c *localapi.Client, instance string) (localapi.Worker, *exit.Error) {
-	silent := (coord.SilentReports * coord.ReportCadence).Milliseconds()
-	errorGrace := coord.ErrorGrace.Milliseconds()
+	silent := (orchestrator.SilentReports * orchestrator.ReportCadence).Milliseconds()
+	errorGrace := orchestrator.ErrorGrace.Milliseconds()
 	for {
 		workers, e := c.Workers()
 		if e != nil {
@@ -126,7 +127,7 @@ func waitReady(c *localapi.Client, instance string) (localapi.Worker, *exit.Erro
 				return localapi.Worker{}, exit.Named(exit.Failed, "worker_silent",
 					"the endpoint worker has sent no Report for %d ms, which is %d missed "+
 						"periods of %s: it is stalled, not slow", w.QuietMS,
-					coord.SilentReports, coord.ReportCadence).
+					orchestrator.SilentReports, orchestrator.ReportCadence).
 					WithNext("cozy logs <org/endpoint>")
 			}
 			if w.ErrorForMS > errorGrace {
@@ -138,7 +139,7 @@ func waitReady(c *localapi.Client, instance string) (localapi.Worker, *exit.Erro
 		}
 		if !found {
 			return localapi.Worker{}, exit.New(exit.Failed,
-				"worker %s is no longer registered with the coordinator", instance)
+				"worker %s is no longer registered with the orchestrator", instance)
 		}
 		time.Sleep(100 * time.Millisecond)
 	}
@@ -167,10 +168,10 @@ func handleStop(ctx *Context) *exit.Error {
 		if !all && w.Endpoint != target {
 			continue
 		}
-		// The DRAIN happens on the coordinator's side of this call and it BLOCKS: the
+		// The DRAIN happens on the orchestrator's side of this call and it BLOCKS: the
 		// route returns after the whole process group has gone. A remembered pid is
-		// never signalled from here — the coordinator stops what the coordinator started.
-		res, e := c.StopWorker(w.InstanceID)
+		// never signalled from here — the orchestrator stops what the orchestrator started.
+		res, e := c.ShutdownWorker(w.InstanceID)
 		if e != nil {
 			return e
 		}
@@ -201,7 +202,7 @@ func handleStop(ctx *Context) *exit.Error {
 func handleLogs(ctx *Context) *exit.Error {
 	subject := ctx.Inv.Args[0]
 	// A PATH-SHAPED attempt input refuses (cozy-creator.md). Triage is addressed by the
-	// coordinator's OPAQUE attempt key; there is no path form, and the route this verb
+	// orchestrator's OPAQUE attempt key; there is no path form, and the route this verb
 	// calls takes no path parameter at all.
 	if strings.ContainsAny(subject, "/\\") && !looksLikeEndpoint(subject) {
 		return exit.Usagef("%q is a path, and an attempt is named by its opaque key", subject).
@@ -247,7 +248,7 @@ func looksLikeEndpoint(s string) bool {
 }
 
 // endpointLog tails one endpoint worker's process log. The log is a FILE in the local
-// root the coordinator owns; the worker listing is what says which instance owns it, so
+// root the orchestrator owns; the worker listing is what says which instance owns it, so
 // the path is derived from an identity the server issued and never from user input.
 func endpointLog(ctx *Context, c *localapi.Client, endpoint string) *exit.Error {
 	workers, e := c.Workers()
@@ -289,7 +290,7 @@ func endpointLog(ctx *Context, c *localapi.Client, endpoint string) *exit.Error 
 	return emit(ctx, render.Lines{Kind: "log", Key: "lines", Items: all,
 		Empty: "the worker log is empty",
 		Extra: []render.Field{{K: "endpoint", V: endpoint}, {K: "instance", V: instance}},
-		Notes: []string{"the coordinator-owned process log; an attempt's triage bundle is `cozy logs <attempt>`"}})
+		Notes: []string{"the orchestrator-owned process log; an attempt's triage bundle is `cozy logs <attempt>`"}})
 }
 
 // ----------------------------------------------------------------------------- run
@@ -397,7 +398,7 @@ func handleRun(ctx *Context) *exit.Error {
 
 // watch consumes the request's own event stream to its terminal, rendering progress as
 // it goes. SIGINT does not kill this process: it CANCELS the request through the
-// coordinator and keeps watching, because the attempt's own journaled terminal is what
+// orchestrator and keeps watching, because the attempt's own journaled terminal is what
 // settles it and a client that walked away would leave the card held.
 // watch returns the terminal event and WHY the client stopped waiting, which is not the
 // same question as what the terminal says: a canceled terminal caused by `--timeout` is
@@ -428,7 +429,7 @@ func watch(ctx *Context, c *localapi.Client, requestID string, stream bool,
 			cancel("cancel requested")
 		case <-deadlineC(deadline):
 			// `--timeout` is a REQUEST DEADLINE the client enforces the only way a client
-			// honestly can: by asking the coordinator to cancel. It is not the
+			// honestly can: by asking the orchestrator to cancel. It is not the
 			// supervisor's watchdog deadline (that one is on the attempt, and this host
 			// has no wire field for it) — walking away instead would leave the card held.
 			stopped = "deadline"
@@ -700,7 +701,7 @@ func renderRun(ctx *Context, life api.Lifecycle, terminal *localapi.Event, stopp
 	errType, why := life.ErrorType, life.Error
 	if why == "" && terminal != nil {
 		// A request that failed BEFORE ANY ATTEMPT has no attempt row to carry a cause —
-		// an unplaceable pin, a credential the coordinator refused to read, a worker that
+		// an unplaceable pin, a credential the orchestrator refused to read, a worker that
 		// could not be started. Its reason exists on the terminal EVENT and nowhere else,
 		// and dropping it left the client with "ended failed" and no way to learn why.
 		errType, why = eventText(terminal, "error_type"), eventText(terminal, "error")
@@ -833,13 +834,13 @@ func generationFacts(ctx *Context, endpoint string, major int) (*launch.Facts, *
 			WithRemedy("installed majors: %s", majorsOf(pins)).
 			WithNext("cozy ls")
 	}
-	gen, e := store.Generation(chosen.Generation)
+	gen, e := store.Install(chosen.InstallID)
 	if e != nil {
 		return nil, e
 	}
 	if gen == nil {
 		return nil, exit.Internalf("%s is pinned to generation %s and that row is gone",
-			endpoint, chosen.Generation)
+			endpoint, chosen.InstallID)
 	}
 	return launch.Read(*gen, ctx.Cfg.Home, ctx.Cfg.Tool())
 }

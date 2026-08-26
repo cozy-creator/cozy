@@ -21,7 +21,7 @@ import (
 // The cl-006 driver's own HTTP client, and a SEPARATE `cozy up` process to point it at.
 //
 // The separate process is the point, not an accident of style. cl-001 could not arm its
-// coordinator-kill crash branch because the coordinator ran inside the verification
+// orchestrator-kill crash branch because the orchestrator ran inside the verification
 // driver — killing it killed the observer. Here the driver is a CLIENT: it starts a real
 // `cozy up`, drives the real HTTP API, and can `kill -9` the service and keep watching
 // from the outside, which is exactly the seat a real client occupies.
