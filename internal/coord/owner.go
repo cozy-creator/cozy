@@ -265,13 +265,13 @@ func (c *Coordinator) onClaimAck(w *worker, s *session, ack *pb.ClaimAck) {
 	if ack.InstanceId != "" && ack.InstanceId != w.instanceID {
 		// The thing at this address is not the worker this slot spawned. Nothing is
 		// dispatched to it; the stream ends on the next recv when we stop talking.
-		c.logf("REFUSING the claimed worker: instance %q is not this slot's %q",
-			ack.InstanceId, w.instanceID)
+		c.refuseClaim(w, exit.Named(exit.Conflict, "worker_instance_mismatch",
+			"the worker at this address answers as instance %q and this slot is %q",
+			ack.InstanceId, w.instanceID))
 		return
 	}
-	if w.spec.ReleaseID != "" && ack.ReleaseId != "" && ack.ReleaseId != w.spec.ReleaseID {
-		c.logf("REFUSING the claimed worker (RELEASE_ID_MISMATCH): release %q is not the "+
-			"pinned %q", ack.ReleaseId, w.spec.ReleaseID)
+	if e := releasePin(w, ack.ReleaseId); e != nil {
+		c.refuseClaim(w, e)
 		return
 	}
 	if e := c.opt.Store.BindSession(w.instanceID, ack.WorkerBootId,
@@ -286,6 +286,64 @@ func (c *Coordinator) onClaimAck(w *worker, s *session, ack *pb.ClaimAck) {
 	c.sessions[ack.WorkerBootId] = s
 	w.bootID = ack.WorkerBootId
 	c.mu.Unlock()
+}
+
+// releasePin is the RELEASE FENCE on a claim, and #505's carried-not-verified gap closed.
+//
+// A rented pod is supposed to have installed the same endpoint release this host did — the
+// plan ids the coordinator is about to name in a Directive are the digests of THAT
+// release's bindings, and #506a is what makes those digests comparable across machines at
+// all. The check existed and could not fire for a rental: a pod that declared NOTHING was
+// admitted, because "carried" and "verified" were the same branch.
+//
+// So the rule is split by lane. A SPAWNED worker may be silent — this launcher passed it
+// `--release-id`, so the identity is ours by construction. An ATTACHED remote worker may
+// NOT: silence there is a pod that will not say what it is serving, which is the one case
+// the pin exists for. In both lanes a stated release that disagrees refuses.
+func releasePin(w *worker, declared string) *exit.Error {
+	pinned := w.spec.ReleaseID
+	if pinned == "" {
+		return nil // nothing to pin against — an uninstalled dev spec names no release
+	}
+	if declared == "" {
+		if w.spec.Remote == nil {
+			return nil
+		}
+		return exit.Named(exit.Conflict, "release_undeclared",
+			"this pod's ClaimAck declares no endpoint release, and this host pinned %q", pinned).
+			WithRemedy("a rented pod installs the release this host is dispatching against; " +
+				"one that will not say which release it serves cannot be shown to have it, " +
+				"and the plan ids in the directive would be resolved against a guess").
+			WithNext("cozy rent release " + rentalOf(w.spec.Endpoint) + " --yes")
+	}
+	if declared != pinned {
+		return exit.Named(exit.Conflict, "release_mismatch",
+			"this worker serves release %q and this host pinned %q", declared, pinned).
+			WithRemedy("the pod installed a different release; its binding plan ids are "+
+				"digests of ITS release and not of %q, so nothing this host dispatches "+
+				"would resolve there", pinned)
+	}
+	return nil
+}
+
+// rentalOf recovers the rental id out of a pinned slot name (`org/name@rnt-…`), so the
+// `next` line names the pod the user would actually act on.
+func rentalOf(slot string) string {
+	if _, id, ok := strings.Cut(slot, "@"); ok {
+		return id
+	}
+	return "<rental>"
+}
+
+// refuseClaim records this owner's verdict on the thing at the other end and logs it. The
+// verdict is kept on the worker so a WAITER gets the answer: before this, a refused claim
+// simply stopped the conversation and the request waited out the silence window to be told
+// the worker was "stalled" — a network sentence for an identity fact.
+func (c *Coordinator) refuseClaim(w *worker, e *exit.Error) {
+	c.mu.Lock()
+	w.refusal = e
+	c.mu.Unlock()
+	c.logf("REFUSING the claimed worker %s (%s): %s", w.instanceID, e.ErrName(), e.Message)
 }
 
 // onSnapshot reconciles the worker's recovered attempts DURABLY, acks the exact

@@ -11,6 +11,7 @@ import (
 
 	"github.com/cozy-creator/cozy-creator-v2/internal/canonical"
 	"github.com/cozy-creator/cozy-creator-v2/internal/exit"
+	"github.com/cozy-creator/cozy-creator-v2/internal/media"
 	"github.com/cozy-creator/cozy-creator-v2/internal/records"
 	pb "github.com/cozy-creator/cozy-creator-v2/protocol/cozy/worker/v1"
 )
@@ -266,7 +267,10 @@ func (c *Coordinator) onTerminal(s *session, t *pb.AttemptTerminal) {
 	// or is not what the manifest says it is, means this terminal cannot be honoured: the
 	// worker's journaled terminal stays owed and replayable, exactly as a failed job
 	// promotion does below, rather than being acked with a row that points at nothing.
-	outputs, e := c.mirrorOutputs(*req, t.Attempt, doc)
+	c.mu.Lock()
+	holder := c.workers[s.instanceID]
+	c.mu.Unlock()
+	outputs, e := c.mirrorOutputs(*req, t.Attempt, doc, holder)
 	if e != nil {
 		refuse("%s", e.Message)
 		return
@@ -511,7 +515,8 @@ func requeueable(status, cause string) bool {
 // at a path with nothing in it. `--out` then wrote a file the client had never received.
 // So: the destination is read, its length and its digest are recomputed here, and an
 // output that cannot be shown is never acked as one that can.
-func (c *Coordinator) mirrorOutputs(req records.Request, attempt uint64, doc canonical.Doc) ([]records.Output, *exit.Error) {
+func (c *Coordinator) mirrorOutputs(req records.Request, attempt uint64, doc canonical.Doc,
+	holder *worker) ([]records.Output, *exit.Error) {
 	manifest := doc.Sub("output_manifest")
 	list, _ := manifest["outputs"].([]canonical.Value)
 	// WHERE THE COORDINATOR GRANTED. A serving attempt writes into its own disposable
@@ -522,6 +527,16 @@ func (c *Coordinator) mirrorOutputs(req records.Request, attempt uint64, doc can
 		// Where the coordinator GRANTED: an attempt in flight writes into its stage, and
 		// `promote` rewrites these paths when the bundle crosses into the publication.
 		dir = c.opt.Layout.PublicationStage(req.Org, req.ID, attempt)
+	}
+	// AND WHERE THE BYTES ACTUALLY ARE. For a pod attempt the granted destination is a
+	// directory on the pod, so "mirror" stops being a figure of speech: each declared
+	// output is FETCHED over the pod's media plane and landed here first. Everything after
+	// that is the local law unchanged — the bytes are at the path, their length and digest
+	// are recomputed here, and an output that cannot be shown is never acked.
+	if holder != nil && holder.media != nil {
+		if e := c.fetchOutputs(req, attempt, list, dir, holder); e != nil {
+			return nil, e
+		}
 	}
 	out := make([]records.Output, 0, len(list))
 	for _, item := range list {
@@ -552,6 +567,53 @@ func (c *Coordinator) mirrorOutputs(req records.Request, attempt uint64, doc can
 		})
 	}
 	return out, nil
+}
+
+// fetchOutputs pulls one remote attempt's declared outputs across the pod's media plane
+// and lands them where this coordinator granted, so the verification below runs against
+// bytes THIS host holds.
+//
+// It is deliberately not a verification step: the media client checks only the pod's own
+// declared digest against what arrived (a transport's business), and whether an output may
+// become visible is decided one function up, against the TERMINAL's manifest. Two checks
+// of two different claims, and neither substitutes for the other.
+//
+// RE-MIRRORING CONVERGES. A coordinator killed between fetch and commit re-runs this on
+// the worker's replayed terminal: the slot name is derived from the attempt's identity
+// rather than remembered, the fetch is idempotent, and the write is atomic.
+func (c *Coordinator) fetchOutputs(req records.Request, attempt uint64,
+	list []canonical.Value, dir string, holder *worker) *exit.Error {
+	slot := media.Slot(req.ID, attempt)
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return exit.Internalf("cannot create the local mirror directory %s: %s", dir, err)
+	}
+	for _, item := range list {
+		entry, ok := item.(map[string]canonical.Value)
+		if !ok {
+			continue
+		}
+		id := canonical.Doc(entry).Str("output_id")
+		if id == "" {
+			continue
+		}
+		data, e := holder.media.GetOutput(slot, id)
+		if e != nil {
+			return e.WithRemedy("the pod declared this output in its terminal and this host "+
+				"cannot fetch it from the pod's media plane, so the terminal stays OWED and "+
+				"unacked rather than being accepted with a row that points at nothing (%s)",
+				e.Remedy)
+		}
+		staging := filepath.Join(dir, id+".mirroring")
+		if err := os.WriteFile(staging, data, 0o644); err != nil {
+			return exit.Internalf("cannot land the mirrored output %s: %s", id, err)
+		}
+		if err := os.Rename(staging, filepath.Join(dir, id)); err != nil {
+			return exit.Internalf("cannot commit the mirrored output %s: %s", id, err)
+		}
+		c.logf("mirrored %s#%d/%s: %d B from %s", req.ID, attempt, id, len(data),
+			holder.media.Addr())
+	}
+	return nil
 }
 
 // verifyBytes is the mirror's proof: the declared identity, recomputed over the bytes

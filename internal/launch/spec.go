@@ -134,7 +134,12 @@ func (f *Facts) Spec(devices []string) (coord.EndpointSpec, *exit.Error) {
 // which is all the runtime needs to construct nothing.
 func (f *Facts) binding(ep *Entrypoint, table map[string]Binding) (*coord.Binding, *exit.Error) {
 	record := map[string]any{
+		// RESOLUTION, not identity (#506a): `project` is where THIS machine staged the
+		// endpoint tree, and a pod that installed the byte-identical archive staged it
+		// somewhere else. What names the endpoint inside the identity is
+		// `endpoint_release` below — the same string on both machines by construction.
 		"project":                   f.Source,
+		"endpoint_release":          ReleaseID(f.Generation),
 		"entrypoint":                ep.Name,
 		"model_construction_digest": "",
 	}

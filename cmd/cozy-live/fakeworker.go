@@ -361,16 +361,40 @@ func (f *fakeControl) badTerminals(emit func(*pb.AttemptTerminal), start *pb.Sta
 }
 
 // remoteTerminal is the POD's side of one attempt, and the arm that makes the byte
-// boundary REAL. A worker writes where the GRANT says and nowhere else — so a pod whose
-// grant names a directory on the OWNER's filesystem has been handed a destination it
-// cannot reach, and says so by name instead of finding somewhere else to put the bytes.
+// boundary REAL. A worker writes where the GRANT says and nowhere else — and it READS
+// where the grant says too, which is the half that had no implementation until the pod
+// grew a media server to put the bytes there (#506b).
 //
-//	remote     refuses the foreign destination — what a real pod does with a file:// URL
-//	           rooted on the client's disk
-//	remotelie  does the work, writes the bytes on ITS OWN disk, and declares them anyway:
-//	           the manifest is true about what exists on the pod and false about what the
-//	           owner can show, which is exactly what an UNMIRRORED output is
+//	remote     the honest pod: it reads the granted input off ITS OWN disk (the owner
+//	           uploaded it through the media server), writes the output into the granted
+//	           directory, and declares exactly those bytes. A granted destination that is
+//	           NOT on this machine is refused by name — the client-local `file://` law,
+//	           still enforced, now as the case that should never arise.
+//	remotelie  does the work, writes the bytes somewhere else on its own disk, and declares
+//	           them anyway: the manifest is true about what exists on the pod and false
+//	           about what the owner can fetch, which is exactly what an UNMIRRORED output is
 func (f *fakeControl) remoteTerminal(emit func(*pb.AttemptTerminal), start *pb.StartAttempt) {
+	// THE INPUT CROSSED, or it did not. A pod reads its payload from the granted address;
+	// this reads it and SAYS what it found, so an arm can see the client's bytes on the
+	// pod rather than inferring it from a green terminal.
+	for _, in := range start.Grant.GetInputs() {
+		if in.InputId != "payload" {
+			continue
+		}
+		path := strings.TrimPrefix(in.Url, "file://")
+		data, err := os.ReadFile(path)
+		if err != nil {
+			f.say("ARM: the granted input %s cannot be read here: %v", path, err)
+			t, _ := terminalFor(start.RequestId, start.Attempt, start.InvocationDigest,
+				pb.TerminalStatus_TERMINAL_STATUS_FAILED,
+				"the granted input is not on this worker's filesystem")
+			emit(t)
+			return
+		}
+		sum := sha256.Sum256(data)
+		f.say("granted input read from the pod's own disk: %s is %d B hashing to sha256:%s",
+			path, len(data), hex.EncodeToString(sum[:])[:16])
+	}
 	granted := ""
 	for _, o := range start.Grant.GetOutputs() {
 		if o.OutputId == "image" {
@@ -381,7 +405,7 @@ func (f *fakeControl) remoteTerminal(emit func(*pb.AttemptTerminal), start *pb.S
 		f.say("the grant names no `image` destination; nothing to write")
 		return
 	}
-	if f.arm == "remote" && !underRoot(granted, f.root) {
+	if !underRoot(granted, f.root) {
 		f.say("ARM: the granted destination %s is not on this machine (my root is %s)", granted, f.root)
 		t, _ := terminalFor(start.RequestId, start.Attempt, start.InvocationDigest,
 			pb.TerminalStatus_TERMINAL_STATUS_FAILED,
@@ -389,10 +413,13 @@ func (f *fakeControl) remoteTerminal(emit func(*pb.AttemptTerminal), start *pb.S
 		emit(t)
 		return
 	}
-	// remotelie: the bytes go where this worker CAN write, which is not where the owner
-	// granted. Nothing here lies about the digest — the manifest describes real bytes on
-	// a real disk. What is false is only that the OWNER holds them.
-	f.terminalWithOutput(emit, start)
+	if f.arm == "remotelie" {
+		// The bytes go where this worker CAN write and where the OWNER was never told to
+		// look. Nothing here lies about the digest — the manifest describes real bytes on a
+		// real disk. What is false is only that the owner can fetch them.
+		granted = filepath.Join(f.root, "elsewhere", filepath.Base(granted))
+	}
+	f.writeGrantedOutput(emit, start, granted)
 }
 
 // underRoot answers whether a granted path is on this worker's own filesystem root. It
@@ -409,7 +436,7 @@ func underRoot(path, root string) bool {
 // terminalWithOutput writes ONE real output under the attempt's granted directory and
 // sends a SUCCEEDED terminal that declares it. It returns the identical envelope, which
 // the `dropack` arm replays when the ack arrives — the coordinator half of a lost
-// TerminalAck — and which the `remote` arm sends once and is done with.
+// TerminalAck.
 func (f *fakeControl) terminalWithOutput(emit func(*pb.AttemptTerminal),
 	start *pb.StartAttempt) *pb.AttemptTerminal {
 	layout, e := home.Open(flag("cozy-home", ""))
@@ -417,8 +444,16 @@ func (f *fakeControl) terminalWithOutput(emit func(*pb.AttemptTerminal),
 		f.say("no layout: %s", e.Message)
 		return nil
 	}
-	dir := layout.AttemptDir(start.RequestId, start.Attempt)
-	if err := os.MkdirAll(dir, 0o755); err != nil {
+	return f.writeGrantedOutput(emit, start,
+		filepath.Join(layout.AttemptDir(start.RequestId, start.Attempt), "image"))
+}
+
+// writeGrantedOutput puts one real PNG at `dest` and declares exactly those bytes. It is
+// the one place this worker writes an output, so every arm above differs in WHERE it was
+// told to write and in nothing else.
+func (f *fakeControl) writeGrantedOutput(emit func(*pb.AttemptTerminal),
+	start *pb.StartAttempt, dest string) *pb.AttemptTerminal {
+	if err := os.MkdirAll(filepath.Dir(dest), 0o755); err != nil {
 		f.say("cannot write under the grant: %v", err)
 		return nil
 	}
@@ -428,13 +463,13 @@ func (f *fakeControl) terminalWithOutput(emit func(*pb.AttemptTerminal),
 		f.say("bad fixture: %v", err)
 		return nil
 	}
-	if err := os.WriteFile(filepath.Join(dir, "image"), body, 0o644); err != nil {
+	if err := os.WriteFile(dest, body, 0o644); err != nil {
 		f.say("cannot write the output: %v", err)
 		return nil
 	}
 	sum := sha256.Sum256(body)
 	t, _ := terminalFor(start.RequestId, start.Attempt, start.InvocationDigest,
-		pb.TerminalStatus_TERMINAL_STATUS_SUCCEEDED, "one output, and an ack that will be lost")
+		pb.TerminalStatus_TERMINAL_STATUS_SUCCEEDED, "one output, written where the grant said")
 	doc, err := canonical.Read(t.TerminalCanonical, &pb.TerminalBody{})
 	if err != nil {
 		f.say("cannot read back the terminal: %v", err)
@@ -454,7 +489,7 @@ func (f *fakeControl) terminalWithOutput(emit func(*pb.AttemptTerminal),
 		return nil
 	}
 	t.TerminalCanonical, t.TerminalDigest = written, canonical.Digest(written)
-	f.say("terminal with ONE %d B output under %s", len(body), dir)
+	f.say("terminal with ONE %d B output at %s", len(body), dest)
 	emit(t)
 	return t
 }

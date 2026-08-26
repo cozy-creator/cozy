@@ -90,6 +90,7 @@ func handleRent(ctx *Context) *exit.Error {
 		return e
 	}
 	row.PodID, row.Address, row.State = ready.PodID, ready.Address, ready.State
+	row.MediaAddress = ready.MediaAddress
 	if e := rental.Attach(l, st, row, ready.CertPEM, ready.Token); e != nil {
 		return e
 	}
@@ -97,6 +98,7 @@ func handleRent(ctx *Context) *exit.Error {
 		{K: "rental", V: ready.ID},
 		{K: "state", V: ready.State},
 		{K: "address", V: ready.Address},
+		{K: "media", V: ready.MediaAddress},
 		{K: "pod", V: ready.PodID},
 		{K: "endpoint", V: endpoint},
 		{K: "card", V: card},
@@ -186,7 +188,7 @@ func handleRentLs(ctx *Context) *exit.Error {
 	list := render.List{
 		Kind:      "rentals",
 		Fields:    []string{"rental", "state", "endpoint", "card", "address"},
-		AllFields: []string{"rental", "state", "endpoint", "card", "address", "pod", "hub", "owner_token", "rented"},
+		AllFields: []string{"rental", "state", "endpoint", "card", "address", "media", "pod", "hub", "owner_token", "rented"},
 		Empty:     "0 rentals on this host",
 		Next:      []string{"cozy rent <hub-endpoint> --card <name> --reason <why>"},
 	}
@@ -202,7 +204,7 @@ func handleRentLs(ctx *Context) *exit.Error {
 		}
 		list.Rows = append(list.Rows, map[string]string{
 			"rental": r.ID, "state": r.State, "endpoint": r.Endpoint, "card": r.Card,
-			"address": r.Address, "pod": r.PodID, "hub": r.Hub,
+			"address": r.Address, "media": r.MediaAddress, "pod": r.PodID, "hub": r.Hub,
 			"owner_token": digest, "rented": stamp(r.RentedAt),
 		})
 	}
@@ -236,7 +238,8 @@ func handleRentRelease(ctx *Context) *exit.Error {
 	if !ctx.Inv.Bool("--yes") {
 		return emit(ctx, render.Record{Kind: "release-plan", Fields: []render.Field{
 			{K: "rental", V: row.ID}, {K: "state", V: row.State}, {K: "pod", V: row.PodID},
-			{K: "address", V: row.Address}, {K: "hub", V: row.Hub},
+			{K: "address", V: row.Address}, {K: "media", V: row.MediaAddress},
+			{K: "hub", V: row.Hub},
 		}, Notes: []string{
 			"the hub DESTROYS the pod: anything resident on it is lost and any run pinned to it stops being placeable",
 			"the pinned certificate and the owner token are removed from this host with the row",

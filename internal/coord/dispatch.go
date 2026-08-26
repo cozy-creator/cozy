@@ -9,6 +9,7 @@ import (
 	"github.com/cozy-creator/cozy-creator-v2/internal/canonical"
 	"github.com/cozy-creator/cozy-creator-v2/internal/exit"
 	"github.com/cozy-creator/cozy-creator-v2/internal/home"
+	"github.com/cozy-creator/cozy-creator-v2/internal/media"
 	"github.com/cozy-creator/cozy-creator-v2/internal/records"
 	pb "github.com/cozy-creator/cozy-creator-v2/protocol/cozy/worker/v1"
 )
@@ -463,7 +464,7 @@ func (c *Coordinator) dispatch(req records.Request) (uint64, *exit.Error) {
 	// A JOB's grant names the DURABLE PUBLICATION ROOT instead, and the destination fence
 	// runs HERE — before StartAttempt, so an escaping destination is never a capability
 	// anybody held.
-	grant, e := c.grantFor(req, attempt)
+	grant, e := c.grantFor(req, attempt, w)
 	if e != nil {
 		return 0, e
 	}
@@ -581,15 +582,60 @@ func (c *Coordinator) pick(req records.Request) (*worker, *session, *exit.Error)
 		"no claimed worker in %s advertises %s as dispatchable", slot, planID)
 }
 
-// grantFor picks the lane's grant. The two differ in exactly one thing that matters —
-// WHERE the destinations are — and that difference is the whole point of the job lane's:
-// a bounded job's writes must outlive the reclaim that ends it.
-func (c *Coordinator) grantFor(req records.Request, attempt uint64) (*pb.DeliveryGrant, *exit.Error) {
+// grantFor picks the lane's grant. The lanes differ in exactly one thing that matters —
+// WHERE the destinations are — and every one of those differences is a fact about a
+// machine: a bounded job's writes must outlive the reclaim that ends it, and a REMOTE
+// attempt's destinations must be on the pod, because that is where the process writing
+// them is.
+func (c *Coordinator) grantFor(req records.Request, attempt uint64, w *worker) (*pb.DeliveryGrant, *exit.Error) {
 	if req.IsJob() {
 		g, _, e := c.jobGrant(req, attempt)
 		return g, e
 	}
+	if w.media != nil {
+		return c.remoteGrant(req, attempt, w)
+	}
 	return c.grant(req.ID, attempt, req)
+}
+
+// remoteGrant builds the grant for an attempt that will run on a POD (cl-014/#506b).
+//
+// It is the same grant the local lane mints and every address in it is on the other
+// machine: the payload is UPLOADED to the pod's media server first and the grant names
+// where the pod says it landed; the output destinations are a directory the pod reserved.
+// Nothing here composes a pod path — every one of them is an answer from the pod — and
+// nothing falls back to this host's disk, because a `file://` rooted here is a destination
+// the pod cannot reach and the whole class of defect #493.3 found.
+//
+// The BYTES MOVE BEFORE THE ATTEMPT EXISTS. `dispatch` calls this after the ordinal is
+// journaled and before `StartAttempt` is sent, so a pod that cannot be fed refuses the
+// dispatch rather than accepting an attempt whose inputs are unreachable.
+func (c *Coordinator) remoteGrant(req records.Request, attempt uint64, w *worker) (*pb.DeliveryGrant, *exit.Error) {
+	slot := media.Slot(req.ID, attempt)
+	dir, e := w.media.ReserveOutputs(slot)
+	if e != nil {
+		return nil, e
+	}
+	path, e := w.media.PutInput(slot+"-payload", req.Payload)
+	if e != nil {
+		return nil, e
+	}
+	c.logf("%s#%d: %d payload bytes crossed to %s at %s; outputs reserved at %s",
+		req.ID, attempt, len(req.Payload), w.media.Addr(), path, dir)
+	g := &pb.DeliveryGrant{
+		FileBaseUrl:   "file://" + dir,
+		ExpiresAtUnix: 0,
+		Inputs:        []*pb.InputAccess{{InputId: "payload", Url: "file://" + path}},
+	}
+	for _, id := range strings.Split(req.Outputs, ",") {
+		if id == "" {
+			continue
+		}
+		g.Outputs = append(g.Outputs, &pb.OutputAccess{
+			OutputId: id, Url: "file://" + dir + "/" + id,
+		})
+	}
+	return g, nil
 }
 
 // grant builds the LOCAL delivery grant: a payload input and one destination per result

@@ -27,7 +27,8 @@ CREATE TABLE IF NOT EXISTS rentals (
   state       TEXT NOT NULL,
   hub         TEXT NOT NULL,
   rented_at   TEXT NOT NULL,
-  released_at TEXT NOT NULL DEFAULT ''
+  released_at TEXT NOT NULL DEFAULT '',
+  media_address TEXT NOT NULL DEFAULT ''
 )`}
 
 // Rental is one pod this client rented and may attach a worker to. `Endpoint` and `Card`
@@ -44,14 +45,18 @@ type Rental struct {
 	Hub        string
 	RentedAt   string
 	ReleasedAt string
+	// MediaAddress is where the pod's co-resident media server answers (cl-014). It is a
+	// FACT about the pod like the control address is, so it is a row and not a file; the
+	// credential it takes is the rental's own owner token, which stays 0600 beside it.
+	MediaAddress string
 }
 
-const rentalCols = `id,endpoint,card,pod_id,address,cert_path,state,hub,rented_at,released_at`
+const rentalCols = `id,endpoint,card,pod_id,address,cert_path,state,hub,rented_at,released_at,media_address`
 
 func scanRental(row interface{ Scan(...any) error }) (Rental, error) {
 	var r Rental
 	err := row.Scan(&r.ID, &r.Endpoint, &r.Card, &r.PodID, &r.Address, &r.CertPath,
-		&r.State, &r.Hub, &r.RentedAt, &r.ReleasedAt)
+		&r.State, &r.Hub, &r.RentedAt, &r.ReleasedAt, &r.MediaAddress)
 	return r, err
 }
 
@@ -63,11 +68,12 @@ func (s *Store) RecordRental(r Rental) *exit.Error {
 		r.RentedAt = now()
 	}
 	if _, err := s.db.Exec(`INSERT INTO rentals(`+rentalCols+`)
-		VALUES(?,?,?,?,?,?,?,?,?,?)
+		VALUES(?,?,?,?,?,?,?,?,?,?,?)
 		ON CONFLICT(id) DO UPDATE SET address=excluded.address, pod_id=excluded.pod_id,
-		  cert_path=excluded.cert_path, state=excluded.state, released_at=excluded.released_at`,
+		  cert_path=excluded.cert_path, state=excluded.state, released_at=excluded.released_at,
+		  media_address=excluded.media_address`,
 		r.ID, r.Endpoint, r.Card, r.PodID, r.Address, r.CertPath, r.State, r.Hub,
-		r.RentedAt, r.ReleasedAt); err != nil {
+		r.RentedAt, r.ReleasedAt, r.MediaAddress); err != nil {
 		return exit.Internalf("cannot record rental %s: %s", r.ID, err)
 	}
 	return nil

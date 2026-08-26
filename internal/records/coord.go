@@ -144,6 +144,7 @@ var widen = []string{
 	`ALTER TABLE requests ADD COLUMN worker TEXT NOT NULL DEFAULT ''`,
 	`ALTER TABLE requests ADD COLUMN org TEXT NOT NULL DEFAULT ''`,
 	`ALTER TABLE requests ADD COLUMN trees TEXT NOT NULL DEFAULT ''`,
+	`ALTER TABLE rentals ADD COLUMN media_address TEXT NOT NULL DEFAULT ''`,
 }
 
 func now() string { return time.Now().UTC().Format(time.RFC3339Nano) }

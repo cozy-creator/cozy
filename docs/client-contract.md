@@ -64,6 +64,13 @@ host does not hold is `404` **before** a request row exists — a pin that canno
 resolved now cannot be resolved on a later attempt either. The pin is deliberately NOT in
 the idempotency digest: it says WHERE the same work runs, not what the work is.
 
+A pinned request crosses a REAL byte boundary, and the crossing is the pod's own media
+server (cl-014, ruled #506b): the payload is uploaded to the pod before the attempt is
+dispatched, the worker reads it off the pod's disk, and the outputs are fetched back and
+verified against the terminal's manifest before anything is acked. A rental whose media
+plane does not answer is `media_unreachable` — this host never falls back to granting a
+path on its own disk, because the pod cannot reach one.
+
 **The idempotency key names one request forever.** The host records the key beside a
 digest of the whole submission — endpoint, function, input, outputs — so the same key
 with a different FUNCTION conflicts as loudly as one with different input. Answers:

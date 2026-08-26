@@ -68,7 +68,7 @@ func main() {
 	args := os.Args[1:]
 	if len(args) == 0 {
 		fmt.Fprintln(os.Stderr, "usage: cozy-live "+
-			"<canonical|attempt|recovered|arms|api|apiarms|apicrash|verbs|journey|rent|"+
+			"<canonical|attempt|recovered|arms|api|apiarms|apicrash|verbs|journey|rent|planids|"+
 			"pipeline|m4arms|dropack|jobarms|jobs|jobcrash|fakeworker> [--flag value]")
 		os.Exit(2)
 	}
@@ -107,6 +107,9 @@ func main() {
 		sectionVerbs()
 	case "journey":
 		sectionJourney()
+	case "planids":
+		sectionPlanIDs()
+		return
 	case "rent":
 		sectionRent()
 	case "pipeline":

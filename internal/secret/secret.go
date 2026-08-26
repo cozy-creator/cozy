@@ -94,3 +94,30 @@ func GRPCMetadataPair(key string, v Value) (string, string) { return key, v.raw 
 // OS-protected 0600 handoff file (a rental's provisioned owner token, cl-015). The
 // caller writes bytes it never looked at, which is the same rule EnvEntry keeps.
 func FileBody(v Value) []byte { return []byte(v.raw + "\n") }
+
+// HashLine is the VERIFIER CARRIER: one line of a token-hash file, `sha256:<64 hex>`.
+//
+// It exists so a process that only ever CHECKS a bearer — cl-014's media server — can be
+// provisioned without ever being given the token. The pod's provisioner writes these
+// lines; the server stats the file per request, hashes what was presented, and compares.
+// A credential the verifier does not hold cannot leak out of the verifier.
+func HashLine(v Value) string {
+	if v.raw == "" {
+		return ""
+	}
+	sum := sha256.Sum256([]byte(v.raw))
+	return "sha256:" + hex.EncodeToString(sum[:])
+}
+
+// MatchesHash answers whether a presented bearer hashes to one `sha256:<64 hex>` line, in
+// constant time. Neither side of the comparison is a raw credential: the verifier holds a
+// digest and the presented string is digested before it is compared.
+func MatchesHash(presented, line string) bool {
+	want := strings.TrimSpace(line)
+	if !strings.HasPrefix(want, "sha256:") || len(want) != len("sha256:")+64 {
+		return false // an unparseable line authenticates nothing — fail closed
+	}
+	sum := sha256.Sum256([]byte(strings.TrimSpace(presented)))
+	got := "sha256:" + hex.EncodeToString(sum[:])
+	return subtle.ConstantTimeCompare([]byte(got), []byte(want)) == 1
+}

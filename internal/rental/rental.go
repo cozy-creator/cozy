@@ -17,6 +17,7 @@ import (
 	"github.com/cozy-creator/cozy-creator-v2/internal/coord"
 	"github.com/cozy-creator/cozy-creator-v2/internal/exit"
 	"github.com/cozy-creator/cozy-creator-v2/internal/home"
+	"github.com/cozy-creator/cozy-creator-v2/internal/media"
 	"github.com/cozy-creator/cozy-creator-v2/internal/records"
 	"github.com/cozy-creator/cozy-creator-v2/internal/secret"
 )
@@ -144,7 +145,17 @@ func Resolver(l home.Layout, st *records.Store) func(string) (*coord.RemoteSpec,
 				WithRemedy("release this rental and rent again; the pin is written with the token").
 				WithNext("cozy rent release " + id + " --yes")
 		}
-		return &coord.RemoteSpec{Addr: row.Address, Token: token, CACert: cert}, nil
+		spec := &coord.RemoteSpec{Addr: row.Address, Token: token, CACert: cert}
+		if row.MediaAddress != "" {
+			// ONE PROVISIONED IDENTITY, TWO LISTENERS (#506b, tonight's tier). The pod's
+			// media server holds its OWN keys — cl-014's rule, and this host pins the same
+			// PEM only because the stand-in provisioner mints one certificate covering both
+			// names. What this host never does is MINT anything: the bearer the media plane
+			// checks is the rental's provisioned owner token, hashed into the pod's
+			// token-hash file by whoever provisioned the pod.
+			spec.Media = &media.Spec{Addr: row.MediaAddress, Token: token, CACert: cert}
+		}
+		return spec, nil
 	}
 }
 

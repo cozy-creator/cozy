@@ -138,7 +138,7 @@ func sectionArms() {
 	// A worker reporting a release that is not the pinned one.
 	badrel := fakeSpec("badrelease", "6", "--arm", "badrelease")
 	_, _ = lv.c.StartWorker(badrel)
-	line, ok = waitEvent(lv, "RELEASE_ID_MISMATCH", 10*time.Second)
+	line, ok = waitEvent(lv, "release_mismatch", 10*time.Second)
 	check("a release that is not the pinned one is refused", ok, trimLog(line))
 
 	// A second live worker presenting a boot id already bound to worker A.

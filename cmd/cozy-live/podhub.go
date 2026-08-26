@@ -18,6 +18,8 @@ import (
 	"sync"
 	"syscall"
 	"time"
+
+	"github.com/cozy-creator/cozy-creator-v2/internal/secret"
 )
 
 // podHub is the SECOND independent implementation of the hub's rental contract (cl-015),
@@ -44,6 +46,13 @@ type podRental struct {
 	Token   string
 	PodID   string
 	Detail  string
+	// Media is where this pod's co-resident MEDIA SERVER answers (cl-014). A real hub
+	// names it in the rental document; this stand-in names it too, so the client's
+	// verbatim read of the field is exercised as well as its derivation fallback.
+	Media string
+	// MediaRoot is the subtree that media server owns on the pod's filesystem — the
+	// arms read it directly to see where bytes actually landed.
+	MediaRoot string
 }
 
 type podHub struct {
@@ -62,18 +71,45 @@ type podHub struct {
 	deleted map[string]bool
 	// fail makes every pod this hub provisions end `failed`. It is the arm for a rental
 	// that never comes up, which a client must answer for rather than wait out.
-	fail  bool
-	procs []*exec.Cmd
-	addr  string
-	ln    net.Listener
+	fail bool
+	// noMedia provisions a pod with a worker and NO media server: a control leg that can
+	// be dialled and a pod that cannot be handed a byte. It is the arm for the refusal
+	// this client owes instead of falling back to granting paths on its own disk.
+	noMedia bool
+	// release is what the provisioned worker DECLARES on ClaimAck. A real hub installs the
+	// release the renter asked for and the pod says which; this stand-in is told, so the
+	// owner's release pin has both a matching pod to accept and a lying one to refuse
+	// (#505's carried-not-verified gap).
+	releaseID string
+	procs     []*exec.Cmd
+	addr      string
+	ln        net.Listener
+}
+
+// podHubSpec is what a stand-in hub is told to provision. Everything in it is a fact a
+// REAL hub knows and this one has to be given: which release it installed on the pod, what
+// the pod's worker plays, and whether this pod is one of the broken shapes an owner must
+// answer for.
+type podHubSpec struct {
+	Dir     string
+	Arm     string
+	Release string
+	Fail    bool // every pod ends `failed`: the rental that never comes up
+	NoMedia bool // a worker with no co-resident media server: a pod that cannot be fed
 }
 
 func startPodHub(dir, arm string, fail bool) *podHub {
+	return newPodHub(podHubSpec{Dir: dir, Arm: arm, Fail: fail})
+}
+
+func newPodHub(spec podHubSpec) *podHub {
+	dir, arm := spec.Dir, spec.Arm
 	must("creating the hub scratch", os.MkdirAll(dir, 0o755))
 	h := &podHub{
 		token: randomHex(16), // an opaque admin credential; its shape is the hub's
 		dir:   dir, pods: filepath.Join(dir, "pod-fs"), arm: arm,
-		rentals: map[string]*podRental{}, deleted: map[string]bool{}, fail: fail,
+		rentals: map[string]*podRental{}, deleted: map[string]bool{}, fail: spec.Fail,
+		noMedia: spec.NoMedia, releaseID: spec.Release,
 	}
 	must("creating the pod-side filesystem", os.MkdirAll(h.pods, 0o755))
 	ln, err := net.Listen("tcp", "127.0.0.1:0") //cozy:allow the DRIVER hosts a stand-in hub; the product binds through internal/api
@@ -215,10 +251,16 @@ func (h *podHub) provision(rec *podRental) {
 	// over the byte boundary can observe anything.
 	podRoot := filepath.Join(h.pods, rec.ID)
 	must("creating the pod filesystem", os.MkdirAll(podRoot, 0o755))
-	cmd := niceCmd(self, "fakeworker", "--arm", h.arm,
+	args := []string{"fakeworker", "--arm", h.arm,
 		"--socket", "127.0.0.1:0", "--out", runRoot,
 		"--tls-cert", certPath, "--tls-key", keyPath,
-		"--cozy-home", podRoot)
+		"--cozy-home", podRoot}
+	if h.releaseID != "" {
+		// WHAT THIS POD SERVES, declared on ClaimAck. A hub that installed the release
+		// knows it; a pod that will not say is refused by the owner's pin.
+		args = append(args, "--release-id", h.releaseID)
+	}
+	cmd := niceCmd(self, args...)
 	cmd.Env = append(childEnv(podRoot), "COZY_BOOTSTRAP_CREDENTIAL="+token)
 	logPath := filepath.Join(runRoot, "pod-worker.log")
 	logFile, err := os.Create(logPath)
@@ -236,6 +278,57 @@ func (h *podHub) provision(rec *podRental) {
 	rec.Detail = "the pod is up; waiting for its worker to bind"
 	h.mu.Unlock()
 
+	// THE SECOND PROCESS IN THE POD'S CONTAINER (cl-014): the media server, co-resident
+	// with the worker, holding its OWN keys and coupled to the worker BY THE FILESYSTEM.
+	// It is what the owner uploads a payload and a binding record to and downloads an
+	// output from, and it is started here because provisioning a pod is the hub's job.
+	//
+	// Its credential is the rental's own owner token, delivered as a HASH: the provisioner
+	// knows the token because it minted it, and the server that checks it never does.
+	mediaAddr, mediaRoot := "", ""
+	if !h.noMedia {
+		mediaRoot = filepath.Join(podRoot, "media")
+		tokenFile := filepath.Join(runRoot, "media.tokens")
+		if err := os.WriteFile(tokenFile,
+			[]byte(secret.HashLine(secret.New(token))+"\n"), 0o600); err != nil {
+			h.mu.Lock()
+			rec.State, rec.Detail = "failed", "cannot provision the media credential: "+err.Error()
+			h.mu.Unlock()
+			return
+		}
+		media := niceCmd(mediaBinary(),
+			"--listen", "127.0.0.1:0",
+			"--root", mediaRoot,
+			"--plans", filepath.Join(podRoot, "binding-plans"),
+			"--tokens", tokenFile,
+			"--out", runRoot,
+			"--tls-cert", certPath, "--tls-key", keyPath,
+			// A small quota on purpose: the arm that fills it is cheap, and a media
+			// subtree is separately bounded so an upload can never ENOSPC the journal.
+			"--quota", "4194304")
+		mediaLog, err := os.Create(filepath.Join(runRoot, "pod-media.log"))
+		must("the pod media log", err)
+		media.Stdout, media.Stderr = mediaLog, mediaLog
+		setProcessGroup(media)
+		if err := media.Start(); err != nil {
+			h.mu.Lock()
+			rec.State, rec.Detail = "failed", "the pod's media server did not start: "+err.Error()
+			h.mu.Unlock()
+			return
+		}
+		h.mu.Lock()
+		h.procs = append(h.procs, media)
+		h.mu.Unlock()
+		mediaAddr = awaitAddr(filepath.Join(runRoot, "media.addr"), media)
+		if mediaAddr == "" {
+			h.mu.Lock()
+			rec.State, rec.Detail = "failed",
+				"the pod's media server exited before binding; log "+filepath.Join(runRoot, "pod-media.log")
+			h.mu.Unlock()
+			return
+		}
+	}
+
 	// READY IS AN OBSERVATION, never a timer: the hub says ready when the worker has
 	// PUBLISHED an address, which is the same file-handoff discovery contract a locally
 	// spawned worker keeps (#436). A worker that dies instead is the answer.
@@ -245,6 +338,7 @@ func (h *podHub) provision(rec *podRental) {
 			h.mu.Lock()
 			rec.Address = strings.TrimSpace(string(data))
 			rec.CertPEM, rec.Token, rec.State = certPEM, token, "ready"
+			rec.Media, rec.MediaRoot = mediaAddr, mediaRoot
 			rec.Detail = "the worker is hosting WorkerControl behind TLS"
 			h.mu.Unlock()
 			return
@@ -257,6 +351,51 @@ func (h *podHub) provision(rec *podRental) {
 		}
 		time.Sleep(20 * time.Millisecond)
 	}
+}
+
+// awaitAddr reads a bound address out of the file the process publishes. The wait is
+// bounded by the PROCESS: one that dies instead of binding is the answer, and there is no
+// clock here about how long binding a socket ought to take.
+func awaitAddr(path string, cmd *exec.Cmd) string {
+	for {
+		if data, err := os.ReadFile(path); err == nil && len(data) > 0 {
+			return strings.TrimSpace(string(data))
+		}
+		if cmd.ProcessState != nil {
+			return ""
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+}
+
+// mediaBinary is the pod-side media server this driver provisions. It is the real built
+// binary, not a stand-in: the point of the section is that a REAL byte plane carried the
+// bytes, and a fake one would prove the owner talks to itself.
+func mediaBinary() string {
+	abs, err := filepath.Abs(flag("media", "./cozy-media"))
+	must("resolving the cozy-media binary", err)
+	return abs
+}
+
+// mediaOf is a rental's media address, so an arm can dial the pod's byte plane directly.
+func (h *podHub) mediaOf(id string) string {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if rec := h.rentals[id]; rec != nil {
+		return rec.Media
+	}
+	return ""
+}
+
+// mediaRootOf is where that server keeps what it was handed — the pod-side directory an
+// arm walks to see that bytes really crossed.
+func (h *podHub) mediaRootOf(id string) string {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if rec := h.rentals[id]; rec != nil {
+		return rec.MediaRoot
+	}
+	return ""
 }
 
 func (h *podHub) read(w http.ResponseWriter, r *http.Request) {
@@ -275,6 +414,10 @@ func (h *podHub) read(w http.ResponseWriter, r *http.Request) {
 		"rental_id": rec.ID, "state": rec.State, "address": rec.Address,
 		"cert_pem": rec.CertPEM, "owner_token": rec.Token,
 		"pod_id": rec.PodID, "detail": rec.Detail,
+		// The one field this lane adds to the consumed contract (#506b). A hub that omits
+		// it gets the client's stated convention instead; naming it here exercises the
+		// verbatim path, which is the one a real hub will take once th-041 carries it.
+		"media_address": rec.Media,
 	}
 	h.mu.Unlock()
 	w.Header().Set("Content-Type", "application/json")

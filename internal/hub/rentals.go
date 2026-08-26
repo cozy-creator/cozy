@@ -3,6 +3,8 @@ package hub
 import (
 	"context"
 	"net/http"
+	"strconv"
+	"strings"
 
 	"github.com/cozy-creator/cozy-creator-v2/internal/exit"
 	"github.com/cozy-creator/cozy-creator-v2/internal/secret"
@@ -17,8 +19,13 @@ import (
 // The contract is the hub's and is consumed verbatim, exactly as the catalog's is:
 //
 //	POST   /v1/rentals       {endpoint, card, duration_hint_s?} -> 202 {rental_id}
-//	GET    /v1/rentals/{id}  -> {state, address, cert_pem, owner_token, pod_id, detail}
+//	GET    /v1/rentals/{id}  -> {state, address, cert_pem, owner_token, pod_id, detail,
+//	                             media_address?}
 //	DELETE /v1/rentals/{id}  -> 204
+//
+// `media_address` is the ONE addition this lane makes to the consumed contract, and it is
+// read as OPTIONAL: the pinned contract does not carry it yet, so a hub that omits it gets
+// the stated convention in `MediaAddressOf` instead of a refusal.
 
 // Rental states, the hub's own words. `ready` is the only one that carries a triple.
 const (
@@ -38,6 +45,10 @@ type Rental struct {
 	Token   secret.Value
 	PodID   string
 	Detail  string
+	// MediaAddress is the pod's BYTE PLANE (cl-014, ruled #506b): the co-resident media
+	// server's own listener, which is where an owner uploads a payload and downloads an
+	// output. See `MediaAddressOf` for what happens when the hub does not name one.
+	MediaAddress string
 }
 
 // Ready answers whether this rental carries a usable dial triple.
@@ -48,23 +59,55 @@ func (r Rental) Ready() bool {
 // wireRental is the answer's own shape. It exists so `owner_token` becomes a
 // secret.Value at the boundary rather than living on as a string somebody could print.
 type wireRental struct {
-	ID         string `json:"rental_id"`
-	State      string `json:"state"`
-	Address    string `json:"address"`
-	CertPEM    string `json:"cert_pem"`
-	OwnerToken string `json:"owner_token"`
-	PodID      string `json:"pod_id"`
-	Detail     string `json:"detail"`
+	ID           string `json:"rental_id"`
+	State        string `json:"state"`
+	Address      string `json:"address"`
+	CertPEM      string `json:"cert_pem"`
+	OwnerToken   string `json:"owner_token"`
+	PodID        string `json:"pod_id"`
+	Detail       string `json:"detail"`
+	MediaAddress string `json:"media_address"`
 }
 
 func (w wireRental) rental(id string) Rental {
 	if w.ID != "" {
 		id = w.ID
 	}
-	return Rental{
+	r := Rental{
 		ID: id, State: w.State, Address: w.Address, CertPEM: w.CertPEM,
 		Token: secret.New(w.OwnerToken), PodID: w.PodID, Detail: w.Detail,
+		MediaAddress: w.MediaAddress,
 	}
+	if r.MediaAddress == "" {
+		r.MediaAddress = MediaAddressOf(r.Address)
+	}
+	return r
+}
+
+// MediaAddressOf DERIVES a pod's media address from its control address: the same host,
+// the next port.
+//
+// It is a stated convention and not a discovery, and it is here because the hub's pinned
+// rental contract has no `media_address` field yet. The alternative — refusing every
+// rental the hub cannot describe fully — would make a byte plane the hub cannot yet
+// announce impossible to reach at all, including on a pod that is running one. So: if the
+// hub NAMES a media address this client uses it verbatim; if it does not, this convention
+// applies and the pod either answers there or the first media call refuses typed, which is
+// an observation rather than a guess that fails later as something else.
+//
+// The credential and the pinned certificate are deliberately the RENTAL's own — one
+// provisioned identity per pod, two listeners. Splitting them is th-041's to do when the
+// hub contract grows the field; nothing here mints anything.
+func MediaAddressOf(control string) string {
+	host, port, ok := strings.Cut(control, ":")
+	if !ok {
+		return ""
+	}
+	n, err := strconv.Atoi(port)
+	if err != nil || n <= 0 || n >= 65535 {
+		return ""
+	}
+	return host + ":" + strconv.Itoa(n+1)
 }
 
 // Rent asks for a pod. It returns as soon as the hub has ACCEPTED the ask — provisioning

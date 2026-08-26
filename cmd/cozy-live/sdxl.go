@@ -63,6 +63,7 @@ func sdxlSpec(entrypoints ...string) coord.EndpointSpec {
 			Entrypoint: entrypoint,
 			Record: map[string]any{
 				"project":              filepath.Join(runtime, "corpus", "endpoint"),
+				"endpoint_release":     release,
 				"model_class":          "SdxlUnetModel",
 				"model_binding_path":   entrypoint + ".models.model",
 				"model_parameter_name": "model",

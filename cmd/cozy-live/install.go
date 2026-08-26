@@ -31,13 +31,18 @@ import (
 // points at cr-005's real 4.782 GiB CAS, and the runtime's own `artifacts.install` writes
 // it — the harness does not compose the index's layout.
 func installEndpoint(root string) string {
+	return installEndpointFrom(root, flag("bench", "/home/fidika/cozy_v2/tensorfs-bench"))
+}
+
+// installEndpointFrom is the same install against a NAMED store root. Two roots pointed at
+// two spellings of one store is how the cross-machine plan-id arm gets what it needs: the
+// same release bytes and the same snapshot digests, landing at different paths.
+func installEndpointFrom(root, bench string) string {
 	release := flag("release", defaultRelease())
 	if _, err := os.Stat(release); err != nil {
 		must("the SDXL release archive", fmt.Errorf(
 			"%s: %w — build it with scripts/sdxl-release.sh", release, err))
 	}
-	bench := flag("bench", "/home/fidika/cozy_v2/tensorfs-bench")
-
 	// cozyRun, not a bare exec: the install must land on THIS root, and the root reaches
 	// a child only through the product's own env allowlist.
 	code, out := cozyRun(root, "install", "cozy/sdxl-unet", "--from", release,

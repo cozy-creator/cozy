@@ -94,6 +94,10 @@ REVEAL_SITES = {
     # worker as `Claim.proof` — the exact dual of the old metadata echo, and the only
     # place the value leaves this process (over the worker's own channel).
     "internal/coord/owner.go",
+    # The byte plane's (#506b): the rental's owner token becomes the Authorization
+    # header for the POD's media server. Same rule as hub/hub.go one plane over — one
+    # request builder, and the raw value is read exactly where it becomes a carrier.
+    "internal/media/media.go",
 }
 
 # The contract document's own tables use `| \`METHOD /path\` | scope |`, which the CAS
@@ -112,8 +116,36 @@ REVEAL_SITES = {
 #     as an accident.
 DENY_COOKIE = ["http.Cookie", "SetCookie", "http.SetCookie", ".Cookies", ".Cookie("]
 CORS_HEADER = re.compile(r"Access-Control-Allow-", re.I)
-LISTEN_SITE = "internal/api/listen.go"
+#   Two programs, two bind rules, and they are NOT the same rule (#506b). The owner's
+#   `cozy` binary binds once, on loopback, for its local client API. The POD's media
+#   server (`cmd/cozy-media`) binds once, off-loopback on purpose — it is the leg an
+#   off-machine owner reaches — and its own rule is TLS-or-loopback, enforced in the same
+#   file. Naming both here keeps "one bind site" true PER PROGRAM instead of collapsing
+#   into "one bind site somewhere in the repo", which would let either rule go missing.
+LISTEN_SITES = {
+    "internal/api/listen.go": "the owner's local client API — loopback only",
+    "cmd/cozy-media/listen.go": "the POD's media server — off-loopback requires TLS",
+}
+LISTEN_SITE = " / ".join(sorted(LISTEN_SITES))
 LISTEN_CALL = re.compile(r'net\.Listen\s*\(\s*"tcp')
+
+# (cl-014 / #506b) THE MEDIA SERVER HAS NO OUTBOUND NETWORK. It joins the liability fence
+# by having nothing to egress WITH: a pod-side process that can be talked into fetching a
+# URL is a request-content-to-hub channel with an extra step, and one that can call the
+# worker is the live RPC cl-014's filesystem-handoff coupling exists to forbid. This is the
+# structural half of "prove no request-path call crosses to the worker process".
+MEDIA_DIR = "cmd/cozy-media/"
+DENY_MEDIA_EGRESS = [
+    "http.Get", "http.Post", "http.PostForm", "http.Head", "http.NewRequest",
+    "http.DefaultClient", "http.Client", "net.Dial", "net.DialTimeout", "grpc.NewClient",
+    "grpc.Dial", "exec.Command", "exec.CommandContext",
+]
+# …and it may not import the protocol or the coordinator: a media server that could speak
+# `cozy.worker.v1` would be a second control plane inside the pod.
+DENY_MEDIA_IMPORT = ["protocol/cozy/worker", "internal/coord", "internal/api"]
+# An import LINE, so a doc comment naming the owner's bind site is prose and not a door.
+MEDIA_IMPORT_LINE = re.compile(
+    r'^\s*(?:[A-Za-z_]\w*\s+)?"github\.com/cozy-creator/cozy-creator-v2/([^"]+)"\s*$')
 
 ALLOW_DOOR = "//cozy:allow"
 STDIN_DOOR = "//cozy:stdin-value"
@@ -211,6 +243,7 @@ def check_sources():
             continue
         for i, line in enumerate(strip_go(raw).splitlines(), 1):
             src_line = raw_lines[i - 1] if i <= len(raw_lines) else ""
+            s_raw_line = src_line
             idents = IDENT.findall(line)
             low = line.lower()
             if ALLOW_DOOR not in src_line:
@@ -262,10 +295,24 @@ def check_sources():
                     bad.append(f"{p}:{i}: [api] '{call}' — the local client API is BEARER ONLY. A cookie "
                                f"is ambient authority the browser attaches cross-site; cl-007's session "
                                f"ceremony is a recorded decision, not a quiet import: {line.strip()}")
-            if rel != LISTEN_SITE and LISTEN_CALL.search(line) and ALLOW_DOOR not in src_line:
-                bad.append(f"{p}:{i}: [api] net.Listen(\"tcp\", …) outside {LISTEN_SITE} — one bind site, "
-                           f"and it REFUSES a non-loopback address. The LAN door is deferred behind TLS "
-                           f"and its own threat review, never a second listener: {line.strip()}")
+            if rel not in LISTEN_SITES and LISTEN_CALL.search(line) and ALLOW_DOOR not in src_line:
+                bad.append(f"{p}:{i}: [api] net.Listen(\"tcp\", …) outside {LISTEN_SITE} — one bind site "
+                           f"per program, each with its own stated rule. The owner's LAN door is "
+                           f"deferred behind TLS and its own threat review, never a second listener: "
+                           f"{line.strip()}")
+            if rel.startswith(MEDIA_DIR):
+                for call in DENY_MEDIA_EGRESS:
+                    if call in line:
+                        bad.append(f"{p}:{i}: [media] '{call}' in the pod's media server — it has NO "
+                                   f"outbound capability of any kind (cl-014): no fetch, no worker "
+                                   f"call, no child process. It is coupled to the worker BY THE "
+                                   f"FILESYSTEM ONLY: {line.strip()}")
+                imported = MEDIA_IMPORT_LINE.match(s_raw_line)
+                for dep in DENY_MEDIA_IMPORT if imported else ():
+                    if dep in imported.group(1):
+                        bad.append(f"{p}:{i}: [media] the media server imports '{dep}' — a byte plane "
+                                   f"that could speak the worker protocol would be a second control "
+                                   f"plane inside the pod: {line.strip()}")
     return bad
 
 
@@ -415,7 +462,8 @@ print(
     f"env({len(DENY_ENV_CALLS)}) store({len(DENY_STORE)}) cloud({len(DENY_CLOUD)}) "
     f"manifest({RECLAIM_VERB.pattern}) secret({SECRET_FLAG.pattern} + Reveal@{len(REVEAL_SITES)}) "
     f"cas({len(DENY_DIGEST)} digests@{len(DIGEST_FREE)} + store-path) tensor(tfs@{len(TFS_SITES)}) "
-    f"api({len(DENY_COOKIE)} cookie + cors + listen@{LISTEN_SITE}) "
+    f"api({len(DENY_COOKIE)} cookie + cors + listen@{len(LISTEN_SITES)} programs) "
+    f"media({len(DENY_MEDIA_EGRESS)} egress + {len(DENY_MEDIA_IMPORT)} imports@{MEDIA_DIR}) "
     f"runtime({len(RUNTIME_VERBS_DENY)} denied verbs@{len(RUNTIME_SITES)}) "
     f"contract({len(parse_go_routes(pathlib.Path('internal/api/routes.go')))} routes)"
 )

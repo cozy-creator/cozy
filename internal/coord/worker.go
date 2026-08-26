@@ -3,7 +3,6 @@ package coord
 import (
 	"crypto/sha256"
 	"encoding/hex"
-	"encoding/json"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -12,8 +11,9 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/cozy-creator/cozy-creator-v2/internal/canonical"
 	"github.com/cozy-creator/cozy-creator-v2/internal/exit"
+	"github.com/cozy-creator/cozy-creator-v2/internal/media"
+	"github.com/cozy-creator/cozy-creator-v2/internal/plan"
 	"github.com/cozy-creator/cozy-creator-v2/internal/records"
 	"github.com/cozy-creator/cozy-creator-v2/internal/secret"
 	pb "github.com/cozy-creator/cozy-creator-v2/protocol/cozy/worker/v1"
@@ -27,6 +27,10 @@ import (
 // and th-004 owns the real EntrypointBindingPlan document. This is the named seam, not a
 // pretend hub: when th-004 lands, the id keeps being the digest of a canonical document
 // and only the document changes.
+//
+// `Record` is the WHOLE record; which half of it is IDENTITY and which half is this
+// machine's RESOLUTION is declared once, in internal/plan (#506a), and both the id and
+// the pod's re-derivation of it read that one declaration.
 type Binding struct {
 	Entrypoint string         `json:"entrypoint"`
 	Record     map[string]any `json:"record"`
@@ -39,66 +43,33 @@ type Binding struct {
 	Outputs []string `json:"outputs,omitempty"`
 }
 
-// PlanID is the binding's identity: sha256 over the canonical bytes of the record
-// WITHOUT its own id — a document never contains its own digest.
+// PlanID is the binding's identity: sha256 over the canonical bytes of the record's
+// IDENTITY half, without its own id (a document never contains its own digest) and
+// without the paths that say where this machine put things (#506a).
 func (b *Binding) PlanID() (string, *exit.Error) {
 	if b.planID != "" {
 		return b.planID, nil
 	}
-	doc := map[string]canonical.Value{}
-	for k, v := range b.Record {
-		if k == "entrypoint_binding_plan_id" {
-			continue
-		}
-		switch t := v.(type) {
-		case string:
-			doc[k] = t
-		case int:
-			doc[k] = int64(t)
-		case int64:
-			doc[k] = t
-		case bool:
-			doc[k] = t
-		case float64:
-			// A record that crossed JSON (the dev-spec door) arrives with float64 where
-			// the author wrote an integer. These documents are INTEGER-ONLY, exactly as
-			// the canonical writer is, so an integral float is the integer it spells and
-			// a fractional one is a refusal rather than a rounding.
-			if t != float64(int64(t)) {
-				return "", exit.Internalf(
-					"binding record field %q is %v; these documents are integer-only", k, t)
-			}
-			doc[k] = int64(t)
-		case []string:
-			// The record carries REAL SETS now — the ordered component list and the
-			// per-component snapshot map — instead of comma-packed strings that both
-			// sides had to agree how to split.
-			items := make([]canonical.Value, 0, len(t))
-			for _, item := range t {
-				items = append(items, item)
-			}
-			doc[k] = items
-		case map[string]string:
-			pairs := map[string]canonical.Value{}
-			for name, value := range t {
-				pairs[name] = value
-			}
-			doc[k] = pairs
-		default:
-			return "", exit.Internalf("binding record field %q has no canonical spelling (%T)", k, v)
-		}
+	id, e := plan.ID(b.Record)
+	if e != nil {
+		return "", e
 	}
-	doc["format"] = "cozy.local.EntrypointBindingRecord/1"
-	data, err := canonical.Write(doc)
-	if err != nil {
-		return "", exit.Internalf("cannot canonicalize the binding record: %s", err)
+	b.planID = id
+	return id, nil
+}
+
+// Staged is the record exactly as it lands on the worker's disk — identity, resolution
+// and the id — and is what the remote delivery path ships to a pod's media server.
+func (b *Binding) Staged() (string, []byte, *exit.Error) {
+	id, e := b.PlanID()
+	if e != nil {
+		return "", nil, e
 	}
-	spelled, err := canonical.Spell(canonical.Digest(data))
-	if err != nil {
-		return "", exit.Internalf("cannot spell the binding plan id: %s", err)
+	data, e := plan.Render(b.Record, id)
+	if e != nil {
+		return "", nil, e
 	}
-	b.planID = spelled
-	return spelled, nil
+	return id, data, nil
 }
 
 // EndpointSpec is everything the coordinator needs to make one endpoint worker resident.
@@ -135,6 +106,15 @@ type RemoteSpec struct {
 	Addr   string       `json:"addr"`
 	Token  secret.Value `json:"token"`
 	CACert string       `json:"ca_cert"` // path to the worker's pinned PEM
+	// Media is the pod's BYTE PLANE (cl-014, ruled #506b): the co-resident media server
+	// this owner uploads inputs and binding records to and downloads outputs from. It is
+	// the pod's own listener with its own keys, not a second use of the control leg —
+	// which is why it is a spec of its own rather than a port on this one.
+	//
+	// Nil is not "no bytes needed": a remote worker with no media plane cannot be fed, and
+	// `attachRemote` refuses typed rather than falling back to owner-local paths the pod
+	// cannot reach. That fallback is exactly the defect #493.3 caught.
+	Media *media.Spec `json:"media,omitempty"`
 }
 
 // pinnedEndpoint is the endpoint name a request PINNED to a rental resolves its slot
@@ -190,9 +170,18 @@ type worker struct {
 	logPath    string
 	home       string
 	planIDs    []string
+	// media is the pod's byte plane, dialled once at attach. Nil for a locally spawned
+	// worker: it shares this host's filesystem, so its grant IS a path and there is
+	// nothing to transport.
+	media *media.Client
 
 	// what the worker itself reported; the coordinator echoes, never invents
 	exited bool
+	// refusal is a claim-time verdict this owner reached about the thing at the other end —
+	// a pod serving a different release than the one this host pinned, say. It is kept so a
+	// waiter gets the ANSWER instead of waiting out the silence window for a worker this
+	// owner has already decided not to talk to (#505's carried-not-verified gap).
+	refusal *exit.Error
 	// exitCode is the process's own disposition. RECYCLE is not a death (cr-009): a
 	// run-once job worker exits with it the moment its terminal is acknowledged, and
 	// reading that as "the worker died" turns a completed job into a failed request.
@@ -253,23 +242,11 @@ func (c *Coordinator) StartWorker(spec EndpointSpec) (string, *exit.Error) {
 
 	var planIDs []string
 	for _, b := range spec.Bindings {
-		id, e := b.PlanID()
+		id, e := plan.Stage(filepath.Join(workerHome, "binding-plans"), b.Record)
 		if e != nil {
 			return "", e
 		}
-		record := map[string]any{}
-		for k, v := range b.Record {
-			record[k] = v
-		}
-		record["entrypoint_binding_plan_id"] = id
-		data, err := json.MarshalIndent(record, "", "  ")
-		if err != nil {
-			return "", exit.Internalf("cannot render the binding record: %s", err)
-		}
-		name := strings.TrimPrefix(id, "sha256:") + ".json"
-		if err := os.WriteFile(filepath.Join(workerHome, "binding-plans", name), data, 0o644); err != nil {
-			return "", exit.Internalf("cannot stage the binding record: %s", err)
-		}
+		b.planID = id
 		planIDs = append(planIDs, id)
 	}
 	sortStrings(planIDs) // the wire field is sorted lexicographic ascending
@@ -435,14 +412,47 @@ func (c *Coordinator) StartWorker(spec EndpointSpec) (string, *exit.Error) {
 // no spawn, no device grant (the pod's card is the pod's), no birth identity — the
 // conversation is the same claim the local path runs, dialed at the rental's address
 // with the pinned cert and the owner token as proof (#445).
+// It also DELIVERS this attempt's binding-plan records to the pod. That is the half that
+// was missing: a Directive names plan ids, and the worker resolves each one against a
+// record on ITS OWN disk (`<worker home>/binding-plans/<id>.json`). The local path stages
+// those records by writing files; the remote path had no channel at all, so a real pod
+// would have been directed to serve plans it had never been given (#506a/#506b). The
+// channel is the pod's media server, and the pod re-derives each id from the record's own
+// identity before it keeps the bytes — so delivery either agrees or refuses typed.
 func (c *Coordinator) attachRemote(spec EndpointSpec) (string, *exit.Error) {
 	instanceID := spec.InstanceID()
+	if spec.Remote.Media == nil {
+		return "", exit.Named(exit.Unavailable, "rental_no_media_plane",
+			"rental %s pins a control address and no media plane, and a pod that cannot be "+
+				"handed bytes cannot be served", spec.Endpoint).
+			WithRemedy("a rented pod runs its worker and a co-resident media server " +
+				"(cl-014); this host will not fall back to granting paths on its own disk, " +
+				"because the pod cannot reach them").
+			WithNext("cozy rent ls")
+	}
+	// THE SAME SILENCE BUDGET THE CONTROL LEG LIVES UNDER. One pod, two listeners, one
+	// standard for "has not answered": a byte plane that misses what eight report periods
+	// cost is judged exactly as a worker that misses eight reports.
+	byteplane, e := media.Dial(*spec.Remote.Media, SilentReports*ReportCadence,
+		int64(c.maxOutputBytes()))
+	if e != nil {
+		return "", e
+	}
+	if e := byteplane.Health(); e != nil {
+		return "", e
+	}
 	var planIDs []string
 	for _, b := range spec.Bindings {
-		id, e := b.PlanID()
+		id, data, e := b.Staged()
 		if e != nil {
 			return "", e
 		}
+		path, e := byteplane.PutPlan(id, data)
+		if e != nil {
+			return "", e
+		}
+		c.logf("binding plan %s delivered to %s at %s (%d B)",
+			shortDigest(id), byteplane.Addr(), path, len(data))
 		planIDs = append(planIDs, id)
 	}
 	sortStrings(planIDs)
@@ -461,14 +471,15 @@ func (c *Coordinator) attachRemote(spec EndpointSpec) (string, *exit.Error) {
 	w := &worker{
 		instanceID: instanceID, spec: spec,
 		logPath: "(remote worker: its log lives on the pod)",
-		planIDs: planIDs, ready: map[string]bool{},
+		planIDs: planIDs, ready: map[string]bool{}, media: byteplane,
 		deploymentID: "dpl-" + strings.TrimPrefix(instanceID, "ins-"),
 		spawned:      time.Now(),
 	}
 	c.mu.Lock()
 	c.workers[instanceID] = w
 	c.mu.Unlock()
-	c.logf("worker %s ATTACHED remote at %s plans=%d", instanceID, spec.Remote.Addr, len(planIDs))
+	c.logf("worker %s ATTACHED remote at %s (media %s) plans=%d",
+		instanceID, spec.Remote.Addr, byteplane.Addr(), len(planIDs))
 	go c.attach(w)
 	return instanceID, nil
 }
@@ -516,8 +527,9 @@ func (c *Coordinator) WaitReady(instanceID, planID string) *exit.Error {
 		gone := w == nil || w.exited
 		logPath, fault, stuck, code := "", "", time.Duration(0), 0
 		quiet := time.Duration(0)
+		var refused *exit.Error
 		if w != nil {
-			logPath, fault, code = w.logPath, w.fault, w.exitCode
+			logPath, fault, code, refused = w.logPath, w.fault, w.exitCode, w.refusal
 			if !w.errorSince.IsZero() {
 				stuck = time.Since(w.errorSince)
 			}
@@ -530,6 +542,13 @@ func (c *Coordinator) WaitReady(instanceID, planID string) *exit.Error {
 		c.mu.Unlock()
 		if ok {
 			return nil
+		}
+		// THIS OWNER'S OWN VERDICT COMES FIRST. A worker whose claim was refused here is
+		// not slow and not silent — this side has decided not to converse with it — and
+		// waiting out eight missed report periods to say "it is stalled" would report a
+		// network symptom for an identity fact this process already established.
+		if refused != nil {
+			return refused
 		}
 		if gone {
 			if code == RecycleExit {
