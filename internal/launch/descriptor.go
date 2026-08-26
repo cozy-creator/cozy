@@ -49,9 +49,15 @@ type Descriptor struct {
 // Entrypoint is one callable surface: its request schema, its declared model slots, and
 // its result shape.
 type Entrypoint struct {
-	Name    string   `json:"name"`
-	Kind    string   `json:"kind"`
-	GPU     bool     `json:"gpu"`
+	Name string `json:"name"`
+	Kind string `json:"kind"`
+	GPU  bool   `json:"gpu"`
+	// Hidden is the author's DECLARED-BUT-NOT-SERVED marker (#572d). The surface stays in
+	// the descriptor because it is real code; it gets no binding staged and takes no
+	// traffic. H3's `reference_to_video` is the case: its vision-conditioning seam is
+	// unbuilt, and staging its binding anyway let it fail to prepare and deny the working
+	// T2VA sibling the card.
+	Hidden bool `json:"hidden"`
 	Models  []Slot   `json:"models"`
 	Request Struct   `json:"request"`
 	Result  Struct   `json:"result"`

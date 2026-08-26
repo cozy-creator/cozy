@@ -120,13 +120,24 @@ func (f *Facts) Spec(devices []string) (orchestrator.WorkerLaunchSpec, *exit.Err
 		Devices:  devices,
 		GraceSec: 3,
 	}
+	hidden := []string{}
 	for i := range f.Descriptor.Entrypoints {
 		ep := &f.Descriptor.Entrypoints[i]
+		// THE SERVING SET EXCLUDES HIDDEN SURFACES (#572d). Not a filter on rendering — a
+		// filter on what gets a binding staged at all, which is the only place the hide can
+		// be structural rather than documentary.
+		if ep.Hidden {
+			hidden = append(hidden, ep.Name)
+			continue
+		}
 		binding, e := f.binding(ep, table)
 		if e != nil {
 			return orchestrator.WorkerLaunchSpec{}, e
 		}
 		spec.Placement.Bindings = append(spec.Placement.Bindings, binding)
+	}
+	if len(hidden) > 0 {
+		spec.Placement.Hidden = hidden
 	}
 	if len(spec.Placement.Bindings) == 0 {
 		// Every entrypoint mints a record now — weightless included — so this is the one

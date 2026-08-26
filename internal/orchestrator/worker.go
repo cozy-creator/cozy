@@ -120,6 +120,10 @@ type DesiredPlacement struct {
 	// named by the bytes it serves, and the descriptor is one of them.
 	DescriptorDigest string     `json:"descriptor_digest"`
 	Bindings         []*Binding `json:"bindings"`
+	// Hidden names the entrypoints this placement deliberately does NOT serve (#572d).
+	// Recorded so an operator reading a placement can tell "no binding was staged" from
+	// "a binding was staged and broke".
+	Hidden []string `json:"hidden,omitempty"`
 	// Jobs is the JOB-mode declaration (cl-004). A worker is in exactly ONE mode — the
 	// DesiredWorkerState's own oneof says which — so a placement carries bindings or jobs,
 	// never both, and `IsJob` is read from it rather than re-derived from what happens to
