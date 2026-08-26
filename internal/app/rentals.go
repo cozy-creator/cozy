@@ -64,6 +64,11 @@ func handleRent(ctx *Context) *exit.Error {
 			WithRemedy("--reason is required, exactly as it is for every first-party write").
 			WithNext("cozy rent " + endpoint + " --card " + card + " --reason <why>")
 	}
+	// WHERE, optionally. Absent is the ordinary case and lets the provider place the pod
+	// wherever it has stock. It is a preference and never a promise: the hub answers with
+	// the pod it actually got, and a region with no capacity refuses through the provider's
+	// own words rather than being silently ignored here.
+	region := strings.TrimSpace(ctx.Inv.Value("--region"))
 	// The wait's ONLY caller-supplied bound. Absent, the wait ends on what the hub says
 	// rather than on a clock: a pod that is still booting is not a pod that has failed.
 	deadline := time.Time{}
@@ -88,7 +93,7 @@ func handleRent(ctx *Context) *exit.Error {
 
 	c := client(ctx)
 	hctx, cancel := hub.Context()
-	r, e := c.Rent(hctx, endpoint, card, secret.HashHex(token), reason)
+	r, e := c.Rent(hctx, endpoint, card, region, secret.HashHex(token), reason)
 	cancel()
 	if e != nil {
 		return e
@@ -126,6 +131,7 @@ func handleRent(ctx *Context) *exit.Error {
 		{K: "pod", V: ready.PodID},
 		{K: "endpoint", V: endpoint},
 		{K: "card", V: card},
+		{K: "region", V: regionOrAny(region)},
 		// The DIGEST, which is the only rendering a credential has here: it is
 		// comparable against the pod's own without either end printing the value.
 		{K: "owner_token", V: token.Digest()},
@@ -295,4 +301,13 @@ func handleRentRelease(ctx *Context) *exit.Error {
 	}, Notes: []string{
 		"the hub destroyed the pod; its owner token and pinned certificate are gone from this host"},
 		Next: []string{"cozy rent ls"}})
+}
+
+// regionOrAny renders an unset placement preference as what it means, so a rental record
+// never shows an empty cell that could be read as "somewhere in particular".
+func regionOrAny(region string) string {
+	if region == "" {
+		return "any (the provider placed it)"
+	}
+	return region
 }

@@ -17,14 +17,20 @@ const (
 
 // The budgets this LOCAL orchestrator declares for one attempt. They are a COORDINATOR
 // policy, not an endpoint fact — the runtime prices the real ladder against the card's
-// measured free bytes and confesses what it did (cr-008a/cr-008b). The same three numbers
-// the runtime's own local-orchestrator adapter uses for a bare-venv run, so the two doors
+// measured free bytes and confesses what it did (cr-008a/cr-008b). The same numbers the
+// runtime's own local-orchestrator adapter uses for a bare-venv run, so the two doors
 // price identically.
+//
+// `vramBudget` IS GONE (#569b). It was 7 GiB, and it was not policy: it was a guess at how
+// much a model weighs, made by a host that may never have held the model. Bound against a
+// 92.42 GiB artifact on a card with 149 GB free, the fill refused `budget_overrun` — the
+// ninth field of the same mistake #567e corrected in the other eight. What a model weighs
+// is the artifact's own byte total, which the border counted and the index row carries, so
+// the machine that holds the bytes states it. Host and pinned staging buffers stay here,
+// because those really are this coordinator's policy and not facts about anybody's weights.
 const (
-	vramBudget   = 7 * gib
 	hostBudget   = 2 * gib
 	pinnedBudget = 256 * mib
-	vramFloor    = 1 * gib
 )
 
 // Facts is everything one endpoint install needs to be served, gathered once.
@@ -214,7 +220,6 @@ func (f *Facts) binding(ep *Entrypoint, table map[string]Binding) (*orchestrator
 	record["artifact_ref"] = selected.Ref
 	record["components"] = append([]string{}, slot.ComponentUse[ep.Name]...)
 	record["release"] = selected.Ref
-	record["vram_bytes"] = int64(vramBudget)
 	record["host_bytes"] = int64(hostBudget)
 	record["pinned_bytes"] = int64(pinnedBudget)
 	record["resident_budget_bytes"] = int64(0)

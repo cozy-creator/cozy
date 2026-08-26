@@ -116,10 +116,24 @@ func (w wireRental) rental(id string) Rental {
 // `sha256:` prefix is the token-hash FILE's spelling and belongs to the pod, not the wire.
 // The token itself is not an argument here, in this package, or anywhere on this wire: a
 // hub that was sent a plaintext credential would be a hub that could use it.
-func (c *Client) Rent(ctx context.Context, endpoint, card, tokenSHA256, reason string) (Rental, *exit.Error) {
+// Rent asks the hub for one pod. `region` is OPTIONAL and is the renter's only say in
+// WHERE: empty lets the hub's provider place the pod wherever it has stock, which is the
+// ordinary case.
+//
+// The field existed on the hub's side of this contract and had no client half (#569). It
+// stopped being academic the day four consecutive H200 allocations came back from one
+// machine whose uplink to PyPI was pinned at ~80 KB/s: a renter with a measured, named
+// reason to be somewhere else could not say so, and the only lever left was to buy the
+// same pod again. A placement preference is not a hardware choice and it is not policy —
+// it is the one fact about a rental that the renter, and only the renter, may have
+// evidence for.
+func (c *Client) Rent(ctx context.Context, endpoint, card, region, tokenSHA256, reason string) (Rental, *exit.Error) {
 	body := map[string]any{
 		"endpoint": endpoint, "card": card,
 		"renter_token_sha256": []string{tokenSHA256},
+	}
+	if region != "" {
+		body["region"] = region
 	}
 	var out wireRental
 	e := c.do(ctx, call{
