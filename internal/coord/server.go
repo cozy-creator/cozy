@@ -286,6 +286,7 @@ func (c *Coordinator) onReport(s *session, r *pb.Report) {
 		return
 	}
 	if w != nil {
+		w.lastReport = time.Now()
 		w.incarnation = r.ExecutorIncarnation
 		w.epoch = r.ReadinessEpoch
 		w.intake = r.IntakeState

@@ -377,7 +377,10 @@ func download(ctx context.Context, url, dst string, length int64) (int64, *exit.
 }
 
 func fetchOnce(ctx context.Context, url, dst string, length int64) (int64, bool, *exit.Error) {
-	rctx, cancel := context.WithTimeout(ctx, storage)
+	// Bounded by BYTES ARRIVING, not by a clock: a download that is slow is not a
+	// download that has stopped, and the two used to be the same 30-minute number.
+	m := &mover{}
+	rctx, cancel := m.context(ctx)
 	defer cancel()
 	req, err := http.NewRequestWithContext(rctx, http.MethodGet, url, nil)
 	if err != nil {
@@ -400,7 +403,7 @@ func fetchOnce(ctx context.Context, url, dst string, length int64) (int64, bool,
 	// The read is bounded by the length the checkpoint DECLARES. A source streaming
 	// more than it should is stopped here; whether the bytes hash correctly is the
 	// byte plane's question, one step later.
-	n, err := io.Copy(f, io.LimitReader(resp.Body, length))
+	n, err := io.Copy(f, m.reader(io.LimitReader(resp.Body, length)))
 	if err != nil {
 		return 0, true, exit.Unavailablef("the transfer broke after %s: %s", size(n), err)
 	}

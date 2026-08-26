@@ -108,7 +108,7 @@ func sectionArms() {
 		fmt.Sprintf("%d won, refusals: %v", won, briefly(results[0])+" / "+briefly(results[1])))
 
 	planA := planIDOf(victim, "fake")
-	if e := lv.c.WaitReady(instanceA, planA, 30*time.Second); e != nil {
+	if e := lv.c.WaitReady(instanceA, planA); e != nil {
 		check("worker A ready", false, e.Message)
 		return
 	}
@@ -202,7 +202,7 @@ func sectionArms() {
 	_ = instanceA
 	check("worker B up", e == nil, briefly(e))
 	planB := planIDOf(badspec, "fake")
-	if e := lv.c.WaitReady(instanceB, planB, 30*time.Second); e != nil {
+	if e := lv.c.WaitReady(instanceB, planB); e != nil {
 		check("worker B ready", false, e.Message)
 		return
 	}

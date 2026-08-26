@@ -184,6 +184,11 @@ type worker struct {
 	// client waiting on it needs that answer rather than a longer wait.
 	fault      string
 	errorSince time.Time
+	// lastReport is when this worker last said ANYTHING. The Report cadence is a
+	// protocol fact rather than a choice made here, which is what makes silence
+	// measurable: a worker that is loading for twenty minutes still reports every
+	// period, so "has not reported" is a stall and never merely "is slow".
+	lastReport time.Time
 }
 
 // StartWorker journals the device grant, stages the binding records, and spawns the
@@ -357,18 +362,39 @@ func graceOr(v float64) float64 {
 // waited out the full thirty-minute readiness window with nothing on its event stream.
 const ErrorGrace = 90 * time.Second
 
-func (c *Coordinator) WaitReady(instanceID, planID string, timeout time.Duration) *exit.Error {
-	deadline := time.Now().Add(timeout)
-	for time.Now().Before(deadline) {
+// ReportCadence is the worker's OWN Report period, a protocol fact rather than a number
+// chosen here: the supervisor reports durably on this cadence so a coordinator can always
+// see a directive it issued but the worker did not apply.
+const ReportCadence = 2 * time.Second
+
+// SilentReports is how many of those periods may pass with NOTHING arriving before the
+// worker is called silent. A COUNT of missed heartbeats, which is why it is not a guess
+// about how long a load takes: a worker resident-loading a 20 GB binding for half an hour
+// reports on every one of them, and only a worker that has stopped talking misses them.
+const SilentReports = 8
+
+// WaitReady waits on OBSERVATIONS and on nothing else. It used to carry a `timeout` —
+// 30 minutes from `dispatch`, 10 from `cozy warm`, two different ceilings on the same
+// cold start — and that number was a ceiling on how large a model may be, not a bound on
+// anything that had gone wrong. Every way this can actually fail is already visible: the
+// worker EXITS, it dwells in ERROR past `ErrorGrace`, or it goes SILENT. A worker that is
+// loading is none of those, however long it takes.
+func (c *Coordinator) WaitReady(instanceID, planID string) *exit.Error {
+	silent := SilentReports * ReportCadence
+	for {
 		c.mu.Lock()
 		w := c.workers[instanceID]
 		ok := w != nil && !w.exited && w.intake == pb.IntakeState_INTAKE_STATE_READY && w.ready[planID]
 		gone := w == nil || w.exited
 		logPath, fault, stuck, code := "", "", time.Duration(0), 0
+		quiet := time.Duration(0)
 		if w != nil {
 			logPath, fault, code = w.logPath, w.fault, w.exitCode
 			if !w.errorSince.IsZero() {
 				stuck = time.Since(w.errorSince)
+			}
+			if !w.lastReport.IsZero() {
+				quiet = time.Since(w.lastReport)
 			}
 		}
 		c.mu.Unlock()
@@ -394,10 +420,17 @@ func (c *Coordinator) WaitReady(instanceID, planID string, timeout time.Duration
 			// is not patience, it is a client with no answer.
 			return workerError(fault, stuck).WithRemedy("its log is %s", logPath)
 		}
+		if quiet > silent {
+			// STALLED, and said as an observation rather than as an elapsed time: this
+			// worker owes a Report every `ReportCadence` and has missed `SilentReports`
+			// of them. A slow load is not this — a loading worker keeps reporting.
+			return exit.Named(exit.Failed, "worker_silent",
+				"the endpoint worker has sent no Report for %s, which is %d missed periods "+
+					"of %s: it is stalled, not slow", quiet.Round(time.Second), SilentReports,
+				ReportCadence).WithRemedy("its log is %s", logPath)
+		}
 		time.Sleep(20 * time.Millisecond)
 	}
-	return exit.New(exit.Deadline, "the endpoint worker did not report %s ready in %s",
-		planID, timeout).WithRemedy("its log is %s", c.WorkerLog(instanceID))
 }
 
 // RecycleExit is the run-once COMPLETION disposition (cr-009, v1 rc 75). A job worker
@@ -447,6 +480,13 @@ type WorkerFacts struct {
 	Exited      bool     `json:"exited"`
 	Devices     []string `json:"devices"`
 	Ready       []string `json:"ready_plans"`
+	// The two OBSERVATIONS a waiter needs and could not see. `cozy warm` polls this
+	// listing and used to give up on a 10-minute clock, because the facts that decide
+	// — how long the worker has been silent, and how long it has been saying it cannot
+	// serve — lived only inside the coordinator. A slow load is neither of them.
+	QuietMS    int64  `json:"quiet_ms"`
+	ErrorForMS int64  `json:"error_for_ms"`
+	Fault      string `json:"fault"`
 }
 
 func (c *Coordinator) Worker(instanceID string) *WorkerFacts {
@@ -478,6 +518,13 @@ func factsOf(w *worker) WorkerFacts {
 		SessionID: w.sessionID, Incarnation: w.incarnation, Epoch: w.epoch,
 		Revision: w.revision, Intake: pb.IntakeState_name[int32(w.intake)],
 		Exited: w.exited, Devices: w.spec.Devices, Ready: []string{},
+		Fault: w.fault,
+	}
+	if !w.lastReport.IsZero() {
+		f.QuietMS = time.Since(w.lastReport).Milliseconds()
+	}
+	if !w.errorSince.IsZero() {
+		f.ErrorForMS = time.Since(w.errorSince).Milliseconds()
 	}
 	if w.cmd != nil && w.cmd.Process != nil {
 		f.PID = w.cmd.Process.Pid
@@ -491,9 +538,19 @@ func factsOf(w *worker) WorkerFacts {
 	return f
 }
 
+// StopGrace is how long a worker has between SIGTERM and SIGKILL. It is a CANCELLATION
+// BUDGET, not a wait for work to finish: the supervisor's own cooperative-cancel budget
+// plus the terminal transaction that follows it, which is what a worker still needs to do
+// after it is told to stop. It is deliberately ONE number — this operation used to be
+// spelled 20 s in the stall watchdog, 20 s for a stale worker, 20 s for one that failed to
+// become ready, and 30 s on the API route, with nothing anywhere saying why the same
+// SIGTERM deserved three budgets.
+const StopGrace = 30 * time.Second
+
 // StopWorker drains and stops the WHOLE worker process group — the only yield mechanism
 // there is. An attempt is never killed to improve queue latency, and no suspend path
-// exists anywhere in this package.
+// exists anywhere in this package. The wait for the process to go is `alive(pid)`, the
+// kernel's own answer, polled until `StopGrace` is spent.
 func (c *Coordinator) StopWorker(instanceID string, grace time.Duration) {
 	c.mu.Lock()
 	w := c.workers[instanceID]

@@ -29,9 +29,9 @@ import (
 	"github.com/cozy-creator/cozy-creator-v2/internal/tfs"
 )
 
-// storage bounds one object write or read at the storage edge. It is generous
-// because it is bounded by bytes on a link, not by anyone's latency.
-const storage = 30 * time.Minute
+// One object write or read at the storage edge is bounded by BYTES MOVING, not by a
+// clock — see `mover`. The 30-minute constant that used to live here said in its own
+// comment that it was standing in for a byte meter.
 
 // Publish is one declare-first upload, start to finish.
 type Publish struct {
@@ -345,8 +345,11 @@ func send(ctx context.Context, method, url string, open func() (io.Reader, error
 		if err != nil {
 			return 0, nil, nil, exit.Internalf("the staged object is unreadable: %s", err)
 		}
-		rctx, cancel := context.WithTimeout(ctx, storage)
-		req, err := http.NewRequestWithContext(rctx, method, url, body)
+		// The body is COUNTED and the context lives while the count moves: an upload
+		// that is slow is not an upload that has stopped.
+		m := &mover{}
+		rctx, cancel := m.context(ctx)
+		req, err := http.NewRequestWithContext(rctx, method, url, m.reader(body))
 		if err != nil {
 			cancel()
 			return 0, nil, nil, exit.Internalf("the grant's URL is not usable: %s", err)

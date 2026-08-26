@@ -127,7 +127,7 @@ func sectionDropAck() {
 		return
 	}
 	planID := planIDOf(spec, "fake")
-	if e := lv.c.WaitReady(instance, planID, 30*time.Second); e != nil {
+	if e := lv.c.WaitReady(instance, planID); e != nil {
 		check("the peer is ready", false, e.Message)
 		return
 	}

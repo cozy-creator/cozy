@@ -251,7 +251,7 @@ func (c *Coordinator) selectOrStart(req records.Request) {
 	c.mu.Unlock()
 	if stale != "" {
 		c.logf("worker %s staged no plan for %s and is STALE; replacing it", stale, req.PlanID)
-		c.StopWorker(stale, 20*time.Second)
+		c.StopWorker(stale, StopGrace)
 	}
 
 	go func() {
@@ -279,7 +279,7 @@ func (c *Coordinator) selectOrStart(req records.Request) {
 			return
 		}
 		c.logf("%s: started %s for the queued request", req.Endpoint, instance)
-		if e := c.WaitReady(instance, req.PlanID, 30*time.Minute); e != nil {
+		if e := c.WaitReady(instance, req.PlanID); e != nil {
 			// AND THE WORKER GOES. A process that cannot make its binding resident still
 			// holds a device grant, and `selectOrStart` returns early whenever a worker
 			// for the endpoint exists — so leaving it would hang the NEXT request behind a
@@ -293,7 +293,7 @@ func (c *Coordinator) selectOrStart(req records.Request) {
 				done()
 				return
 			}
-			c.StopWorker(instance, 20*time.Second)
+			c.StopWorker(instance, StopGrace)
 			done()
 			c.failQueued(req.ID, e)
 			return
@@ -499,17 +499,19 @@ func (c *Coordinator) grant(requestID string, attempt uint64, req records.Reques
 	if err := os.WriteFile(payloadPath, req.Payload, 0o644); err != nil {
 		return nil, exit.Internalf("cannot stage the request payload: %s", err)
 	}
-	ttl := c.opt.GrantTTL
-	if ttl <= 0 {
-		ttl = 10 * time.Minute
-	}
 	maxBytes := c.opt.MaxOutputMiB
 	if maxBytes <= 0 {
 		maxBytes = 64
 	}
 	g := &pb.DeliveryGrant{
-		FileBaseUrl:   "file://" + dir,
-		ExpiresAtUnix: uint64(time.Now().Add(ttl).Unix()),
+		FileBaseUrl: "file://" + dir,
+		// NO EXPIRY, because this host mints no deadline to derive one from. A grant lasts
+		// as long as the attempt it was minted for (cr-009), and the attempt's bound is the
+		// caller's deadline — which `dispatch` never sets, because there is no wire field
+		// for it here and `--timeout` is enforced client-side by CANCELLING. 10 minutes was
+		// therefore a ceiling on how long a local attempt could be, invented at the one
+		// place nobody was asked. The worker reads 0 as "does not expire" (`grants.expired`).
+		ExpiresAtUnix: 0,
 		Inputs: []*pb.InputLocation{{
 			Digest:   canonical.Digest(req.Payload),
 			Url:      "file://" + payloadPath,

@@ -151,7 +151,7 @@ func handleUp(ctx *Context) *exit.Error {
 	signal.Notify(stop, syscall.SIGINT, syscall.SIGTERM)
 	<-stop
 	fmt.Fprintln(ctx.Out, "draining endpoint processes…")
-	c.Close(30 * time.Second)
+	c.Close(coord.StopGrace)
 	closeListeners()
 	return nil
 }

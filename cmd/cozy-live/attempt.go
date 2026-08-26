@@ -39,7 +39,7 @@ func sectionAttempt() {
 		return
 	}
 	check("worker spawned", true, "instance "+instance+", devices [0]")
-	if e := lv.c.WaitReady(instance, planID, 300*time.Second); e != nil {
+	if e := lv.c.WaitReady(instance, planID); e != nil {
 		check("READY", false, e.Message+" "+e.Remedy)
 		fmt.Println(tail(lv.c.WorkerLog(instance), 25))
 		return

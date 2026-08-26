@@ -5,7 +5,6 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
-	"time"
 
 	"github.com/cozy-creator/cozy-creator-v2/internal/canonical"
 	"github.com/cozy-creator/cozy-creator-v2/internal/exit"
@@ -170,13 +169,15 @@ func (c *Coordinator) jobGrant(req records.Request, attempt uint64) (*pb.Deliver
 	if err := os.WriteFile(payloadPath, req.Payload, 0o644); err != nil {
 		return nil, "", exit.Internalf("cannot stage the job payload: %s", err)
 	}
-	ttl := c.opt.GrantTTL
-	if ttl <= 0 {
-		ttl = 6 * time.Hour // a job is bounded, not brief
-	}
 	g := &pb.DeliveryGrant{
-		FileBaseUrl:   "file://" + root,
-		ExpiresAtUnix: uint64(time.Now().Add(ttl).Unix()),
+		FileBaseUrl: "file://" + root,
+		// NO EXPIRY — the same reading as the serving grant, and a job is where the old
+		// constant did real damage: 6 hours is a ceiling on what a run-to-completion
+		// conversion may be, and job-001 is the incident where one of these killed a
+		// 99 GB artifact that had already landed. The stage's lifetime is the ATTEMPT's:
+		// `promote` moves the bytes across once the terminal is verified, and that is the
+		// event that ends this grant's usefulness. A clock never knew about it.
+		ExpiresAtUnix: 0,
 		Inputs: []*pb.InputLocation{{
 			Digest:   canonical.Digest(req.Payload),
 			Url:      "file://" + payloadPath,

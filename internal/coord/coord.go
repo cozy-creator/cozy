@@ -60,7 +60,6 @@ type Options struct {
 	// cannot choose the environment it is admitted under.
 	ImageDigest  string
 	ConfigDigest string
-	GrantTTL     time.Duration
 	MaxOutputMiB int64
 }
 
@@ -447,7 +446,7 @@ func (c *Coordinator) checkStall() {
 	c.mu.Unlock()
 	// StopWorker's own reviveQueue asks for the replacement, so the request the watchdog
 	// fired for is the one whose need gets re-asked.
-	c.StopWorker(instance, 20*time.Second)
+	c.StopWorker(instance, StopGrace)
 }
 
 // queueDepth is how many requests are waiting for capacity right now.

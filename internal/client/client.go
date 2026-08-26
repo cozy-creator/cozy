@@ -244,6 +244,12 @@ type Worker struct {
 	Exited     bool     `json:"exited"`
 	Devices    []string `json:"devices"`
 	Plans      []string `json:"ready_plans"`
+	// How long this worker has been SILENT, and how long it has been saying it CANNOT
+	// serve. They are what a waiter watches instead of a clock: a worker loading a
+	// 20 GB binding is neither silent nor in error, however long it takes.
+	QuietMS    int64  `json:"quiet_ms"`
+	ErrorForMS int64  `json:"error_for_ms"`
+	Fault      string `json:"fault"`
 }
 
 // Dispatchable answers whether this worker can take an attempt — the protocol's own fact,

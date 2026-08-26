@@ -16,6 +16,7 @@ import (
 
 	"github.com/cozy-creator/cozy-creator-v2/internal/api"
 	localapi "github.com/cozy-creator/cozy-creator-v2/internal/client"
+	"github.com/cozy-creator/cozy-creator-v2/internal/coord"
 	"github.com/cozy-creator/cozy-creator-v2/internal/exit"
 	"github.com/cozy-creator/cozy-creator-v2/internal/home"
 	"github.com/cozy-creator/cozy-creator-v2/internal/launch"
@@ -76,7 +77,7 @@ func handleStart(ctx *Context) *exit.Error {
 			Fields: append(fields, render.Field{K: "state", V: "spawned"}),
 			Notes:  []string{res.Note}, Next: []string{"cozy status"}})
 	}
-	worker, e := waitReady(c, res.InstanceID, 10*time.Minute)
+	worker, e := waitReady(c, res.InstanceID)
 	if e != nil {
 		return e
 	}
@@ -92,9 +93,16 @@ func handleStart(ctx *Context) *exit.Error {
 // waitReady polls the workers listing until the protocol says dispatchable. The fact is
 // the WORKER's own (`INTAKE_STATE_READY` plus at least one advertised plan), read through
 // the API — never a clock, and never "the process is alive".
-func waitReady(c *localapi.Client, instance string, timeout time.Duration) (localapi.Worker, *exit.Error) {
-	deadline := time.Now().Add(timeout)
-	for time.Now().Before(deadline) {
+//
+// It said "never a clock" while holding one: a 10-minute ceiling, which is a statement
+// about how large a model may be rather than about anything having gone wrong. The three
+// ways this fails are all the worker's own and all now visible through the listing — it
+// EXITS, it goes SILENT, or it dwells in ERROR — which is the same set `coord.WaitReady`
+// decides on, so the two sides of the same wait cannot disagree.
+func waitReady(c *localapi.Client, instance string) (localapi.Worker, *exit.Error) {
+	silent := (coord.SilentReports * coord.ReportCadence).Milliseconds()
+	errorGrace := coord.ErrorGrace.Milliseconds()
+	for {
 		workers, e := c.Workers()
 		if e != nil {
 			return localapi.Worker{}, e
@@ -114,6 +122,19 @@ func waitReady(c *localapi.Client, instance string, timeout time.Duration) (loca
 			if w.Dispatchable() {
 				return w, nil
 			}
+			if w.QuietMS > silent {
+				return localapi.Worker{}, exit.Named(exit.Failed, "worker_silent",
+					"the endpoint worker has sent no Report for %d ms, which is %d missed "+
+						"periods of %s: it is stalled, not slow", w.QuietMS,
+					coord.SilentReports, coord.ReportCadence).
+					WithNext("cozy logs <org/endpoint>")
+			}
+			if w.ErrorForMS > errorGrace {
+				return localapi.Worker{}, exit.New(exit.Failed,
+					"the endpoint worker has reported ERROR for %d ms and never became "+
+						"dispatchable: %s", w.ErrorForMS, w.Fault).
+					WithNext("cozy logs <org/endpoint>")
+			}
 		}
 		if !found {
 			return localapi.Worker{}, exit.New(exit.Failed,
@@ -121,8 +142,6 @@ func waitReady(c *localapi.Client, instance string, timeout time.Duration) (loca
 		}
 		time.Sleep(100 * time.Millisecond)
 	}
-	return localapi.Worker{}, exit.New(exit.Deadline,
-		"worker %s did not advertise a dispatchable plan in %s", instance, timeout)
 }
 
 func handleStop(ctx *Context) *exit.Error {

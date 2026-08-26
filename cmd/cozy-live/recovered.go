@@ -29,7 +29,7 @@ func sectionRecovered() {
 		check("StartWorker", false, briefly(e))
 		return
 	}
-	if e := lv.c.WaitReady(instance, planID, 300*time.Second); e != nil {
+	if e := lv.c.WaitReady(instance, planID); e != nil {
 		check("READY", false, briefly(e))
 		fmt.Println(tail(lv.c.WorkerLog(instance), 20))
 		return

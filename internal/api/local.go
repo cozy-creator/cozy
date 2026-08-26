@@ -5,8 +5,8 @@ import (
 	"io"
 	"net/http"
 	"runtime"
-	"time"
 
+	"github.com/cozy-creator/cozy-creator-v2/internal/coord"
 	"github.com/cozy-creator/cozy-creator-v2/internal/exit"
 )
 
@@ -140,7 +140,7 @@ func (s *Server) stopWorker(w http.ResponseWriter, r *http.Request) {
 	}
 	// The WHOLE process group drains and stops — the only yield mechanism there is. An
 	// attempt is never killed to improve queue latency and no suspend path exists.
-	s.coord.StopWorker(instance, 30*time.Second)
+	s.coord.StopWorker(instance, coord.StopGrace)
 	s.ok(w, r, http.StatusOK, map[string]any{"instance_id": instance, "stopped": true})
 }
 

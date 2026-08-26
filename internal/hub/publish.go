@@ -108,7 +108,7 @@ func (c *Client) Begin(ctx context.Context, ref Ref, req BeginRequest, reason st
 	var out BeginResponse
 	e := c.do(ctx, call{
 		method: http.MethodPost, path: publishes(ref), admin: true, reason: reason,
-		body: req, timeout: Transfer,
+		body: req, byBytes: true,
 	}, &out)
 	return out, e
 }
@@ -149,7 +149,7 @@ func (c *Client) Grants(ctx context.Context, ref Ref, publishID string, ids []st
 	}
 	e := c.do(ctx, call{
 		method: http.MethodPost, path: publishes(ref) + "/" + publishID + "/grants",
-		admin: true, reason: reason, timeout: Transfer,
+		admin: true, reason: reason, byBytes: true,
 		body: map[string]any{"object_ids": ids},
 	}, &out)
 	return out.Grants, e
@@ -164,7 +164,7 @@ func (c *Client) FinishMultipart(ctx context.Context, ref Ref, publishID, object
 	}
 	e := c.do(ctx, call{
 		method: http.MethodPost, path: publishes(ref) + "/" + publishID + "/multipart/complete",
-		admin: true, reason: reason, timeout: Transfer,
+		admin: true, reason: reason, byBytes: true,
 		body: map[string]any{"object_id": objectID, "etags": etags},
 	}, &out)
 	return out.Conflict, e
@@ -198,7 +198,7 @@ func (c *Client) VerifyObjects(ctx context.Context, ref Ref, publishID string, r
 	}
 	e := c.do(ctx, call{
 		method: http.MethodPost, path: publishes(ref) + "/" + publishID + "/objects/verify",
-		admin: true, reason: reason, timeout: Transfer,
+		admin: true, reason: reason, byBytes: true,
 		body: map[string]any{"objects": reports},
 	}, &out)
 	return out.Objects, e
@@ -245,7 +245,7 @@ func (c *Client) Complete(ctx context.Context, ref Ref, publishID, reason string
 	var out CompleteResponse
 	e := c.do(ctx, call{
 		method: http.MethodPost, path: publishes(ref) + "/" + publishID + "/complete",
-		admin: true, reason: reason, timeout: Transfer,
+		admin: true, reason: reason, byBytes: true,
 	}, &out)
 	return out, e
 }
@@ -296,7 +296,7 @@ func (c *Client) Manifest(ctx context.Context, ref Ref, snapshot string) ([]byte
 	e := c.do(ctx, call{
 		method: http.MethodGet,
 		path:   "/v1/repos/" + ref.Org + "/" + ref.Name + "/checkpoints/" + snapshot + "/manifest",
-		raw:    &raw, timeout: Transfer,
+		raw:    &raw, byBytes: true,
 	}, nil)
 	return raw, e
 }
@@ -326,7 +326,7 @@ func (c *Client) Reads(ctx context.Context, ref Ref, snapshot string, ids []stri
 		Reads []Read `json:"reads"`
 	}
 	e := c.do(ctx, call{
-		method: http.MethodPost, timeout: Transfer,
+		method: http.MethodPost, byBytes: true,
 		path: "/v1/repos/" + ref.Org + "/" + ref.Name + "/checkpoints/" + snapshot + "/reads",
 		body: map[string]any{"object_ids": ids},
 	}, &out)

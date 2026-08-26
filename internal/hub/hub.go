@@ -43,8 +43,10 @@ const maxBody = 4 << 20
 // would accept cannot be one the hub installed.
 const maxDocument = 64 << 20
 
-// Transfer bounds one call whose work is proportional to the bytes it moves.
-const Transfer = 30 * time.Minute
+// A call whose work is proportional to the bytes it moves is bounded by THOSE BYTES,
+// at the storage edge where they are (`transfer.mover`). There is no `Transfer`
+// constant any more: a 30-minute total is a ceiling on how big a checkpoint may be,
+// and it wrapped the per-object bound so tightly that the inner one could never fire.
 
 // Client is one configured hub endpoint. It holds no state between calls.
 type Client struct {
@@ -102,11 +104,13 @@ type call struct {
 	body   any
 	admin  bool   // carries the admin token
 	reason string // X-Tensorhub-Reason; the hub refuses a mutation without one
-	// timeout overrides Timeout for a call whose work is bounded by BYTES rather
-	// than by the hub's own latency (completion re-streams and re-hashes every
-	// declared object). A catalog read that is slow is broken; a completion that
-	// is slow is working.
-	timeout time.Duration
+	// byBytes drops the transport total for a call whose work is bounded by BYTES
+	// rather than by the hub's own latency (completion re-streams and re-hashes every
+	// declared object). A catalog read that is slow is broken; a completion that is
+	// slow is working, and this side cannot see how far along the hub is — so what
+	// bounds it is the CONNECTION being alive, which the kernel's keepalive answers,
+	// rather than a number picked here about someone else's work.
+	byBytes bool
 	// raw takes the answer's exact bytes instead of decoding it. The snapshot
 	// manifest route answers a canonical document verbatim, and this client must
 	// carry it the same way — nothing here re-encodes one.
@@ -205,9 +209,9 @@ func (c *Client) do(ctx context.Context, cl call, out any) *exit.Error {
 	}
 
 	client := c.http
-	if cl.timeout > 0 {
+	if cl.byBytes {
 		wider := *c.http
-		wider.Timeout = cl.timeout
+		wider.Timeout = 0
 		client = &wider
 	}
 	resp, err := client.Do(req)
@@ -375,9 +379,12 @@ func Context() (context.Context, context.CancelFunc) {
 	return context.WithTimeout(context.Background(), Timeout)
 }
 
-// LongContext bounds a whole transfer — many calls, some of them proportional to the
+// LongContext carries a whole transfer — many calls, some of them proportional to the
 // bytes moved. A catalog read that takes minutes is broken; a publish that does is
-// working, and one deadline cannot mean both.
+// working, and one deadline cannot mean both — so this one carries NO deadline. Each
+// object at the storage edge is bounded by its own byte counter, and a transfer is a
+// finite list of those; the only thing left for this context to carry is the caller's
+// cancel.
 func LongContext() (context.Context, context.CancelFunc) {
-	return context.WithTimeout(context.Background(), Transfer)
+	return context.WithCancel(context.Background())
 }
