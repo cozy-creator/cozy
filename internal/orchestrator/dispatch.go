@@ -359,25 +359,39 @@ func settledState(state string) bool {
 // same plan ids — and gains the dial triple: the pod installed the identical release, so
 // the plan digests agree by construction or the worker refuses typed.
 func (c *Orchestrator) resolveFor(req records.Request) (WorkerLaunchSpec, *exit.Error) {
-	spec, e := c.opt.Endpoints.Resolve(req.Endpoint)
-	if req.IsJob() {
-		spec, e = c.opt.Endpoints.ResolveJob(req.Endpoint, req.Entrypoint)
-	}
-	if e != nil || req.Worker == "" {
+	if req.Worker == "" {
+		spec, e := c.opt.Endpoints.Resolve(req.Endpoint)
+		if req.IsJob() {
+			spec, e = c.opt.Endpoints.ResolveJob(req.Endpoint, req.Entrypoint)
+		}
 		return spec, e
 	}
+	// Serving placements are the first cl-020 consumer: their descriptor and binding
+	// plans belong in platform-neutral control metadata. Jobs retain their existing local
+	// materialized path until the job half of that manifest contract is defined.
+	var placement DesiredPlacement
+	var e *exit.Error
+	if req.IsJob() {
+		var spec WorkerLaunchSpec
+		spec, e = c.opt.Endpoints.ResolveJob(req.Endpoint, req.Entrypoint)
+		placement = spec.Placement
+	} else {
+		placement, e = c.opt.Endpoints.ResolvePlacement(req.Endpoint)
+	}
+	if e != nil {
+		return WorkerLaunchSpec{}, e
+	}
 	if c.opt.Rentals == nil {
-		return spec, exit.Unavailablef("this LocalService attaches no remote workers")
+		return WorkerLaunchSpec{}, exit.Unavailablef("this LocalService attaches no remote workers")
 	}
 	remote, e := c.opt.Rentals(req.Worker)
 	if e != nil {
-		return spec, e
+		return WorkerLaunchSpec{}, e
 	}
-	spec.Connection = remote
+	spec := WorkerLaunchSpec{Placement: placement, Connection: remote}
 	// The rental IS the slot: one connected worker per rental id, its own instance
 	// namespace, and no local device envelope (the pod's card is the pod's).
 	spec.Placement.Endpoint = pinnedEndpoint(spec.Placement.Endpoint, req.Worker)
-	spec.Devices = nil
 	return spec, nil
 }
 

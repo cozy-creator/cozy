@@ -34,18 +34,18 @@ func (s *Server) localEndpoints(w http.ResponseWriter, r *http.Request) {
 	}
 	if s.endpoints != nil {
 		for _, name := range s.endpoints.List() {
-			spec, e := s.endpoints.Resolve(name)
+			placement, e := s.endpoints.ResolvePlacement(name)
 			if e != nil {
 				continue
 			}
 			row := EndpointRow{
-				Endpoint: spec.Placement.Endpoint, ReleaseID: spec.Placement.ReleaseID,
-				Source: "dev", Resident: resident[spec.Placement.Endpoint], Functions: []string{},
+				Endpoint: placement.Endpoint, ReleaseID: placement.ReleaseID,
+				Source: "dev", Resident: resident[placement.Endpoint], Functions: []string{},
 			}
-			if spec.Placement.InstallID != "" {
+			if placement.InstallID != "" {
 				row.Source = "generation"
 			}
-			for _, b := range spec.Placement.Bindings {
+			for _, b := range placement.Bindings {
 				row.Functions = append(row.Functions, b.Entrypoint)
 			}
 			rows = append(rows, row)

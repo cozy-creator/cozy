@@ -90,10 +90,11 @@ type Server struct {
 	shutdown func()
 }
 
-// Resolver turns `org/name` into the spec that makes its worker resident. cl-010's
-// `start` and the installed-generation lookup are its real implementation; the live
-// driver supplies a dev tree.
+// Resolver exposes control-plane placement facts separately from a local worker launch.
+// A remote request and endpoint listing use ResolvePlacement; only an explicit local
+// start may require the target environment through Resolve.
 type Resolver interface {
+	ResolvePlacement(endpoint string) (orchestrator.DesiredPlacement, *exit.Error)
 	Resolve(endpoint string) (orchestrator.WorkerLaunchSpec, *exit.Error)
 	// Jobs names the `@job` functions one installed endpoint registers, with the
 	// descriptor id each resolves to. The job submit route resolves a function to its
