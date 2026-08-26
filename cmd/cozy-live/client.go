@@ -46,11 +46,12 @@ func startService(root string, port int, fresh bool) *liveService {
 	}
 	must("creating the service root", os.MkdirAll(root, 0o755))
 
-	binary := flag("cozy", "./cozy")
+	binary := flag("cozy", defaultCozy())
 	abs, err := filepath.Abs(binary)
 	must("resolving the cozy binary", err)
 	if _, err := os.Stat(abs); err != nil {
-		must("the cozy binary", fmt.Errorf("%s: %w (build it: go build -o cozy ./cmd/cozy)", abs, err))
+		must("the cozy binary", fmt.Errorf("%s: %w (build it: go build -o %s ./cmd/cozy)",
+			abs, filepath.Base(defaultCozy()), err))
 	}
 
 	logPath := filepath.Join(root, "driver-service.log")

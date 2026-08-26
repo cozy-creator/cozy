@@ -6,6 +6,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"syscall"
 
@@ -99,9 +100,18 @@ func defaultRelease() string {
 }
 
 func cozyBinary() string {
-	abs, err := filepath.Abs(flag("cozy", "./cozy"))
+	abs, err := filepath.Abs(flag("cozy", defaultCozy()))
 	must("resolving the cozy binary", err)
 	return abs
+}
+
+// defaultCozy is the built product binary's default name — an .exe where executables
+// carry one.
+func defaultCozy() string {
+	if runtime.GOOS == "windows" {
+		return "./cozy.exe"
+	}
+	return "./cozy"
 }
 
 // digestOf reads the archive's sha256 the way `cozy install --digest` wants it. The
@@ -128,7 +138,7 @@ func benchSnapshot(bench string) string {
 
 // cozyRun runs the product binary as a user would type it, against one service root.
 func cozyRun(root string, args ...string) (int, string) {
-	cmd := exec.Command("/usr/bin/nice", append([]string{"-n", "19", cozyBinary()}, args...)...)
+	cmd := niceCmd(cozyBinary(), args...)
 	cmd.Env = childEnv(root)
 	data, _ := cmd.CombinedOutput()
 	code := 0
@@ -167,8 +177,12 @@ func reverse(in []string) []string {
 }
 
 // niceCmd builds a `nice -n 19` child — this DRIVER's resource discipline on a shared
-// box, imposed on the launch rather than baked into the product.
+// box, imposed on the launch rather than baked into the product. Windows has no nice(1);
+// the CI runner is not the shared box, so the child simply runs.
 func niceCmd(name string, args ...string) *exec.Cmd {
+	if runtime.GOOS == "windows" {
+		return exec.Command(name, args...)
+	}
 	return exec.Command("/usr/bin/nice", append([]string{"-n", "19", name}, args...)...)
 }
 
