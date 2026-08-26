@@ -218,7 +218,7 @@ func (f *Facts) binding(ep *Entrypoint, table map[string]Binding) (*orchestrator
 	record["model_binding_path"] = slot.Path
 	record["model_parameter_name"] = slot.Param
 	record["artifact_ref"] = selected.Ref
-	record["components"] = append([]string{}, slot.ComponentUse[ep.Name]...)
+	record["components"] = declaredComponents(slot)
 	record["release"] = selected.Ref
 	record["host_bytes"] = int64(hostBudget)
 	record["pinned_bytes"] = int64(pinnedBudget)
@@ -228,4 +228,33 @@ func (f *Facts) binding(ep *Entrypoint, table map[string]Binding) (*orchestrator
 	return &orchestrator.Binding{
 		Entrypoint: ep.Name, Record: record, Outputs: AssetPaths(ep.Result),
 	}, nil
+}
+
+// declaredComponents is the UNION of the component names a slot's class declares across all
+// its methods — the set that class's construction binds, and the scope its read plan is
+// checked against (#570b).
+//
+// It used to read `slot.ComponentUse[ep.Name]`, which is always EMPTY: `component_use` is
+// keyed by METHOD (`predict_data_velocity`, `condition_text`, …) and never by entrypoint.
+// The bug was invisible while an empty set fell back to the artifact's whole component
+// list — every binding simply took all of them, which is what a single-component artifact
+// wants anyway. On H3's N-ary artifact it stopped being invisible: Ref2VAModel was handed
+// all five components including the sibling `transformer` its contract forbids it to touch,
+// and construction refused `undeclared_component`.
+//
+// An empty union still means "take the artifact whole", which is the honest reading for a
+// class that declares no component use at all.
+func declaredComponents(slot Slot) []string {
+	seen := map[string]bool{}
+	out := []string{}
+	for _, names := range slot.ComponentUse {
+		for _, n := range names {
+			if !seen[n] {
+				seen[n] = true
+				out = append(out, n)
+			}
+		}
+	}
+	sort.Strings(out)
+	return out
 }
