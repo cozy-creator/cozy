@@ -69,13 +69,26 @@ func schemaDigest() []byte {
 // published address, dial, claim, reconcile, direct, then pump frames. On a stream drop
 // with the process still alive it re-dials and RE-CLAIMS the same boot (the worker mints
 // a fresh control generation and resends its snapshot; replay covers the durables).
+//
+// A RECORDED REFUSAL ENDS THE LOOP. The verdicts this owner reaches at claim time — a
+// foreign instance identity, an unpinned release, a schema this build does not speak — are
+// facts about the THING AT THE OTHER END, and redialing cannot change any of them. Left
+// running, the loop burns one of the worker's control generations every 200 ms forever;
+// observed at 1,111 generations against a pre-rev-2 worker while a waiter sat on a
+// readiness poll that was never going to end. The refusal is already the waiter's answer
+// (`EnsurePlacementReady` reads it first) — this stops the conversation from outliving it.
 func (c *Orchestrator) attach(w *worker) {
 	for {
 		c.mu.Lock()
 		current, live := c.workers[w.instanceID]
-		closing := c.closing
+		closing, refused := c.closing, w.refusal
 		c.mu.Unlock()
 		if closing || !live || current != w || w.exited {
+			return
+		}
+		if refused != nil {
+			c.logf("worker %s: not re-claiming — this owner has refused it (%s)",
+				w.instanceID, refused.ErrName())
 			return
 		}
 		addr, e := c.workerAddr(w)

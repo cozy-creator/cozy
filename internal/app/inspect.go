@@ -156,7 +156,7 @@ func handleDoctor(ctx *Context) *exit.Error {
 	live := make([]string, 0, len(workers))
 	for _, w := range workers {
 		live = append(live, fmt.Sprintf("%s %s pid=%d %s plans=%d",
-			w.Endpoint, w.InstanceID, w.PID, w.Intake, len(w.Plans)))
+			w.Endpoint, w.InstanceID, w.PID, w.Serving, len(w.Plans)))
 	}
 	fields = append(fields, render.Field{K: "workers", V: live})
 

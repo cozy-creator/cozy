@@ -142,7 +142,7 @@ func handleStatus(ctx *Context) *exit.Error {
 			if workers, e := c.Workers(); e == nil {
 				live := make([]string, 0, len(workers))
 				for _, w := range workers {
-					live = append(live, w.Endpoint+" "+w.InstanceID+" "+w.Intake)
+					live = append(live, w.Endpoint+" "+w.InstanceID+" "+w.Serving)
 				}
 				rec.Fields = append(rec.Fields, render.Field{K: "live_workers", V: live})
 			}

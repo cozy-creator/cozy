@@ -92,18 +92,23 @@ func handleStart(ctx *Context) *exit.Error {
 }
 
 // waitReady polls the workers listing until the protocol says dispatchable. The fact is
-// the WORKER's own (`INTAKE_STATE_READY` plus at least one advertised plan), read through
-// the API — never a clock, and never "the process is alive".
+// the WORKER's own — the placement's SERVING AXIS at DISPATCHABLE plus at least one
+// advertised plan — read through the API, never a clock and never "the process is alive".
 //
 // It said "never a clock" while holding one: a 10-minute ceiling, which is a statement
-// about how large a model may be rather than about anything having gone wrong. The three
-// ways this fails are all the worker's own and all now visible through the listing — it
-// EXITS, it goes SILENT, or it dwells in ERROR — which is the same set `orchestrator.WaitReady`
-// decides on, so the two sides of the same wait cannot disagree.
+// about how large a model may be rather than about anything having gone wrong. The ways
+// this fails are all the worker's own and all visible through the listing — it EXITS, it
+// goes SILENT, it holds a FAULT, or this owner REFUSED it — which is the same set
+// `orchestrator.EnsurePlacementReady` decides on, so the two sides of the same wait cannot
+// disagree.
 func waitReady(c *localapi.Client, instance string) (localapi.Worker, *exit.Error) {
 	silent := (orchestrator.SilentReports * orchestrator.ReportCadence).Milliseconds()
 	errorGrace := orchestrator.ErrorGrace.Milliseconds()
 	for {
+		// THIS OWNER'S OWN VERDICT COMES FIRST, exactly as it does inside the orchestrator:
+		// a worker whose claim was refused here is not slow and not silent, and waiting out
+		// eight missed report periods to call it stalled would report a network symptom for
+		// an identity fact this process already established.
 		workers, e := c.Workers()
 		if e != nil {
 			return localapi.Worker{}, e
@@ -123,17 +128,24 @@ func waitReady(c *localapi.Client, instance string) (localapi.Worker, *exit.Erro
 			if w.Dispatchable() {
 				return w, nil
 			}
+			if w.Fault != "" && w.ErrorForMS == 0 {
+				// A refusal this owner recorded at claim time carries no error clock: it is
+				// a settled verdict, not a state the worker might leave.
+				return localapi.Worker{}, exit.New(exit.Conflict,
+					"this host refused the worker at that address: %s", w.Fault).
+					WithNext("cozy logs <org/endpoint>")
+			}
 			if w.QuietMS > silent {
 				return localapi.Worker{}, exit.Named(exit.Failed, "worker_silent",
-					"the endpoint worker has sent no Report for %d ms, which is %d missed "+
+					"the endpoint worker has reported no observed state for %d ms, which is %d missed "+
 						"periods of %s: it is stalled, not slow", w.QuietMS,
 					orchestrator.SilentReports, orchestrator.ReportCadence).
 					WithNext("cozy logs <org/endpoint>")
 			}
 			if w.ErrorForMS > errorGrace {
 				return localapi.Worker{}, exit.New(exit.Failed,
-					"the endpoint worker has reported ERROR for %d ms and never became "+
-						"dispatchable: %s", w.ErrorForMS, w.Fault).
+					"the endpoint worker's placement has held a fault for %d ms and never "+
+						"became dispatchable: %s", w.ErrorForMS, w.Fault).
 					WithNext("cozy logs <org/endpoint>")
 			}
 		}

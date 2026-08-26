@@ -240,10 +240,16 @@ type Worker struct {
 	ReleaseID  string   `json:"release_id"`
 	SessionID  string   `json:"session_id"`
 	PID        int      `json:"pid"`
-	Intake     string   `json:"intake_state"`
 	Exited     bool     `json:"exited"`
 	Devices    []string `json:"devices"`
-	Plans      []string `json:"ready_plans"`
+	// THE TWO AXES, and the machine phase they were pulled out of (#473/#482).
+	// `intake_state` is retired with both of its uses: one enum could not say "staged on
+	// disk but offline", which is the exact state an outgoing spec holds under
+	// fallback-retention.
+	Phase           string   `json:"worker_phase"`
+	Materialization string   `json:"materialization"`
+	Serving         string   `json:"serving"`
+	Plans           []string `json:"dispatchable_plan_ids"`
 	// How long this worker has been SILENT, and how long it has been saying it CANNOT
 	// serve. They are what a waiter watches instead of a clock: a worker loading a
 	// 20 GB binding is neither silent nor in error, however long it takes.
@@ -253,9 +259,10 @@ type Worker struct {
 }
 
 // Dispatchable answers whether this worker can take an attempt — the protocol's own fact,
-// not a guess from liveness: a process that is up but has loaded nothing is not warm.
+// not a guess from liveness: a process that is up but has loaded nothing is not warm, and
+// a placement that is STAGED but OFFLINE is not capacity however much of it is on disk.
 func (w Worker) Dispatchable() bool {
-	return !w.Exited && w.Intake == "INTAKE_STATE_READY" && len(w.Plans) > 0
+	return !w.Exited && w.Serving == "DISPATCHABLE" && len(w.Plans) > 0
 }
 
 func (c *Client) Workers() ([]Worker, *exit.Error) {

@@ -624,17 +624,41 @@ func serviceRSS(svc *liveService) string {
 
 // waitReady polls the LOCAL module for an intake-READY worker — the same fact a client
 // has, through the same route, with no privileged view of the orchestrator.
+// waitReady polls until the placement's SERVING AXIS is DISPATCHABLE for a real plan
+// (rev-2 retired IntakeState with both of its uses), and RETURNS EARLY on a fault. A
+// worker this owner has already refused — a foreign instance, an unpinned release, a wire
+// schema this build does not speak — is not slow, and waiting out five minutes to call it
+// slow reports a timeout for a decision that was reached in milliseconds.
 func waitReady(svc *liveService, timeout time.Duration) bool {
 	deadline := time.Now().Add(timeout)
 	for time.Now().Before(deadline) {
 		res := svc.call("GET", "/v1/local/workers", nil)
-		if strings.Contains(string(res.Body), "INTAKE_STATE_READY") &&
-			strings.Contains(string(res.Body), "sha256:") {
+		body := string(res.Body)
+		if strings.Contains(body, `"serving":"DISPATCHABLE"`) && strings.Contains(body, "sha256:") {
 			return true
+		}
+		if !strings.Contains(body, `"fault":""`) && strings.Contains(body, `"fault":`) {
+			fmt.Println("    worker fault: " + between(body, `"fault":"`, `"`))
+			return false
 		}
 		time.Sleep(200 * time.Millisecond)
 	}
 	return false
+}
+
+// between lifts one JSON string value out of a rendered body for a diagnostic line. It is
+// a DIAGNOSTIC, deliberately not a parse: the arm's verdict never depends on it.
+func between(s, open, close string) string {
+	i := strings.Index(s, open)
+	if i < 0 {
+		return ""
+	}
+	rest := s[i+len(open):]
+	j := strings.Index(rest, close)
+	if j < 0 {
+		return rest
+	}
+	return rest[:j]
 }
 
 // waitProgress blocks until the attempt is provably RUNNING — a live progress frame, not

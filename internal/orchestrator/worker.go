@@ -944,6 +944,14 @@ func factsOf(w *worker) WorkerFacts {
 
 		Fault: w.fault,
 	}
+	// THIS OWNER'S OWN VERDICT IS A FACT ABOUT THE WORKER, so it is reported as one. A
+	// claim this side refused — a foreign instance, an unpinned release, a schema this
+	// build does not speak — is the answer a poller of `/v1/local/workers` needs; without
+	// it the only observable was a readiness wait that timed out, which reads as "slow"
+	// for something that has already been decided.
+	if w.refusal != nil {
+		f.Fault = w.refusal.ErrName() + ": " + w.refusal.Message
+	}
 	if !w.lastReport.IsZero() {
 		f.QuietMS = time.Since(w.lastReport).Milliseconds()
 	}
