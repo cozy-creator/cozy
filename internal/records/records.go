@@ -140,6 +140,34 @@ func Open(path string) (*Store, *exit.Error) {
 			return nil, exit.Internalf("cannot widen the records schema in %s: %s", path, err)
 		}
 	}
+	// A table whose IDENTITY changed. `CREATE TABLE IF NOT EXISTS` above left an older
+	// root's shape in place and no `ALTER TABLE` can move a primary key, so the rows move
+	// to a new table instead — in ONE transaction, so a kill mid-rebuild leaves the old
+	// shape whole and the next open retries it.
+	for _, r := range rebuild {
+		var ddl string
+		err := db.QueryRow(`SELECT COALESCE(sql,'') FROM sqlite_master
+			WHERE type='table' AND name=?`, r.table).Scan(&ddl)
+		if err != nil || !strings.Contains(ddl, r.stale) {
+			continue
+		}
+		tx, err := db.Begin()
+		if err != nil {
+			db.Close()
+			return nil, exit.Internalf("cannot begin the %s rebuild in %s: %s", r.table, path, err)
+		}
+		for _, stmt := range r.steps {
+			if _, err := tx.Exec(stmt); err != nil {
+				tx.Rollback()
+				db.Close()
+				return nil, exit.Internalf("cannot rebuild %s in %s: %s", r.table, path, err)
+			}
+		}
+		if err := tx.Commit(); err != nil {
+			db.Close()
+			return nil, exit.Internalf("the %s rebuild did not commit in %s: %s", r.table, path, err)
+		}
+	}
 	return &Store{db: db}, nil
 }
 

@@ -303,9 +303,14 @@ func (c *Orchestrator) promote(req records.Request, attempt uint64, outputs []re
 // different bytes is a CONFLICT, never a replacement.
 func (c *Orchestrator) onCheckpoint(s *session, r *pb.JobCheckpointRequest) {
 	digest, _ := canonical.Spell(r.ContentDigest)
+	// The attempt is part of the identity AND the authority: the row is admitted only if
+	// `RequestId#AttemptOrdinal` is an attempt still open under THIS session (#553a). A
+	// worker cannot declare a checkpoint against another worker's run, and no worker can
+	// declare one against a run that has already ended.
 	row, outcome, e := c.opt.Store.RecordCheckpoint(records.Checkpoint{
 		RequestID: r.RequestId, Attempt: int64(r.AttemptOrdinal),
 		OperationKey: r.OperationKey, LogicalKey: r.LogicalKey, ContentDigest: digest,
+		SessionID: s.bootID,
 	})
 	if e != nil {
 		c.logf("checkpoint %s/%s of %s#%d NOT journaled: %s",

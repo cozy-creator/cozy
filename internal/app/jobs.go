@@ -225,9 +225,10 @@ func jobFields(state api.JobState, full bool) []render.Field {
 	if len(state.Checkpoints) > 0 {
 		rows := make([]string, 0, len(state.Checkpoints))
 		for _, c := range state.Checkpoints {
-			rows = append(rows, c.OperationKey+"/"+c.LogicalKey+" "+c.Outcome)
+			rows = append(rows, fmt.Sprintf("#%d %s/%s %s", c.Attempt, c.OperationKey,
+				c.LogicalKey, c.Outcome))
 		}
-		fields = append(fields, render.Field{K: "durable_saves", V: rows})
+		fields = append(fields, render.Field{K: "checkpoints_declared", V: rows})
 	}
 	if len(state.Outputs) > 0 {
 		outs := make([]string, 0, len(state.Outputs))

@@ -279,8 +279,11 @@ type PublicationRef struct {
 	CommittedAt string `json:"committed_at"`
 }
 
-// JobCheckpoint is one journaled durable-save identity.
+// JobCheckpoint is one journaled checkpoint DECLARATION. Not a durable-save receipt: no
+// component stores the bytes yet (#553a), and the attempt is part of the identity because
+// two attempts of one request are two runs with two checkpoint sets.
 type JobCheckpoint struct {
+	Attempt       int64  `json:"attempt"`
 	OperationKey  string `json:"operation_key"`
 	LogicalKey    string `json:"logical_key"`
 	ContentDigest string `json:"content_digest"`
@@ -393,7 +396,7 @@ func (s *Server) jobStateOf(row records.Request) JobState {
 	if rows, e := s.store.Checkpoints(row.ID); e == nil {
 		for _, c := range rows {
 			state.Checkpoints = append(state.Checkpoints, JobCheckpoint{
-				OperationKey: c.OperationKey, LogicalKey: c.LogicalKey,
+				Attempt: c.Attempt, OperationKey: c.OperationKey, LogicalKey: c.LogicalKey,
 				ContentDigest: c.ContentDigest, ReceiptID: c.ReceiptID, Outcome: c.Outcome,
 			})
 		}

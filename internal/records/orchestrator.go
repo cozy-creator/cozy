@@ -85,6 +85,13 @@ CREATE TABLE IF NOT EXISTS publications (
 -- at-least-once like every other durable message (law 9). The identity is closed:
 -- repeating it replays the receipt, and the same key with different bytes CONFLICTS —
 -- a orchestrator conflict is a journaled fault and never un-writes the worker's fact.
+--
+-- THE ATTEMPT IS PART OF THE IDENTITY (#553a). It was stored and then left out of the key,
+-- so two attempts of one request shared one checkpoint identity: attempt 2 saving the same
+-- logical key with different bytes read as a CONFLICT with attempt 1 instead of as its own
+-- checkpoint, and identical bytes read as attempt 1's receipt REPLAYED. The foreign key is
+-- the other half — the same shape the outputs table already carries — so a checkpoint row
+-- cannot name an attempt that does not exist.
 CREATE TABLE IF NOT EXISTS job_checkpoints (
   request_id    TEXT    NOT NULL,
   attempt       INTEGER NOT NULL,
@@ -94,7 +101,8 @@ CREATE TABLE IF NOT EXISTS job_checkpoints (
   receipt_id    TEXT    NOT NULL,
   outcome       TEXT    NOT NULL,
   recorded_at   TEXT    NOT NULL,
-  PRIMARY KEY (request_id, operation_key, logical_key)
+  PRIMARY KEY (request_id, attempt, operation_key, logical_key),
+  FOREIGN KEY (request_id, attempt) REFERENCES attempts(request_id, attempt)
 )`, `
 CREATE TABLE IF NOT EXISTS attempts (
   request_id       TEXT    NOT NULL REFERENCES requests(id),
@@ -136,6 +144,43 @@ CREATE TABLE IF NOT EXISTS outputs (
   PRIMARY KEY (request_id, attempt, output_id),
   FOREIGN KEY (request_id, attempt) REFERENCES attempts(request_id, attempt)
 )`}
+
+// rebuild carries the tables whose IDENTITY changed — the one migration `ALTER TABLE`
+// cannot express. `stale` is a fragment of the OLD table's own DDL, read back out of
+// `sqlite_master`, so the rebuild is skipped on every root that already carries the new
+// shape: idempotent by observation, not by a version counter nobody maintains.
+var rebuild = []struct {
+	table string
+	stale string
+	steps []string
+}{{
+	table: "job_checkpoints",
+	stale: "PRIMARY KEY (request_id, operation_key, logical_key)",
+	steps: []string{
+		`ALTER TABLE job_checkpoints RENAME TO job_checkpoints_pre_attempt_key`,
+		// Recreated by `schema` on the next Open? No — this runs inside the same Open, so
+		// the new shape is created here, from the same text the schema declares.
+		`CREATE TABLE job_checkpoints (
+  request_id    TEXT    NOT NULL,
+  attempt       INTEGER NOT NULL,
+  operation_key TEXT    NOT NULL,
+  logical_key   TEXT    NOT NULL,
+  content_digest TEXT   NOT NULL,
+  receipt_id    TEXT    NOT NULL,
+  outcome       TEXT    NOT NULL,
+  recorded_at   TEXT    NOT NULL,
+  PRIMARY KEY (request_id, attempt, operation_key, logical_key),
+  FOREIGN KEY (request_id, attempt) REFERENCES attempts(request_id, attempt)
+)`,
+		// Rows whose attempt does not exist are dropped, and that is the correction, not a
+		// loss: under the new identity a checkpoint of an attempt that was never dispatched
+		// is exactly the row this key exists to make unrepresentable.
+		`INSERT INTO job_checkpoints SELECT c.* FROM job_checkpoints_pre_attempt_key c
+		   WHERE EXISTS (SELECT 1 FROM attempts a
+		                 WHERE a.request_id=c.request_id AND a.attempt=c.attempt)`,
+		`DROP TABLE job_checkpoints_pre_attempt_key`,
+	},
+}}
 
 // widen carries the columns a table gained after some root already created it. Applied
 // after `schema`, and a duplicate-column answer means it is already there.
@@ -1127,6 +1172,10 @@ type Checkpoint struct {
 	ReceiptID     string
 	Outcome       string
 	RecordedAt    string
+	// SessionID is the CLAIM the frame arrived under, never a stored column: the row is
+	// admitted only if the attempt it names is open under this same session. It is an
+	// input to the admission, not a fact about the checkpoint.
+	SessionID string
 }
 
 // RecordCheckpoint journals the orchestrator's copy of one durable save and answers with
@@ -1134,10 +1183,27 @@ type Checkpoint struct {
 // CONFLICT (the same keys, different bytes). It never replaces a recorded digest — the
 // worker's own journal already made that fact durable, and a orchestrator that overwrote
 // it would be a second authority over one fact.
+// A fourth answer joins the three: UNKNOWN_ATTEMPT, when the frame names an attempt that
+// is not open under the sending session. Ownership is checked INSIDE the insert — one
+// INSERT...SELECT...WHERE EXISTS, atomic by construction — so a terminal landing between a
+// separate check and the write cannot slip a checkpoint into a closed attempt.
 func (s *Store) RecordCheckpoint(c Checkpoint) (Checkpoint, string, *exit.Error) {
+	// OWNERSHIP FIRST, and it decides before anything is read back. A sender that does not
+	// own an open attempt learns nothing about what is journaled under it — not even that
+	// a key is taken, which is what answering CONFLICT would have told it.
+	var open int
+	if err := s.db.QueryRow(`SELECT COUNT(*) FROM attempts
+		WHERE request_id=? AND attempt=? AND session_id=?
+		AND state IN ('dispatching','accepted','recovered_open')`,
+		c.RequestID, c.Attempt, c.SessionID).Scan(&open); err != nil {
+		return c, "", exit.Internalf("cannot read the attempt of a checkpoint: %s", err)
+	}
+	if open != 1 {
+		return c, "UNKNOWN_ATTEMPT", unknownAttempt(c)
+	}
 	held, err := s.db.Query(`SELECT `+checkpointCols+` FROM job_checkpoints
-		WHERE request_id=? AND operation_key=? AND logical_key=?`,
-		c.RequestID, c.OperationKey, c.LogicalKey)
+		WHERE request_id=? AND attempt=? AND operation_key=? AND logical_key=?`,
+		c.RequestID, c.Attempt, c.OperationKey, c.LogicalKey)
 	if err != nil {
 		return c, "", exit.Internalf("cannot read the checkpoint journal: %s", err)
 	}
@@ -1155,13 +1221,31 @@ func (s *Store) RecordCheckpoint(c Checkpoint) (Checkpoint, string, *exit.Error)
 	}
 	c.ReceiptID = NewID("crc")
 	c.Outcome, c.RecordedAt = "RECORDED", now()
-	if _, err := s.db.Exec(`INSERT INTO job_checkpoints(request_id,attempt,operation_key,
-		logical_key,content_digest,receipt_id,outcome,recorded_at) VALUES(?,?,?,?,?,?,?,?)`,
+	res, err := s.db.Exec(`INSERT INTO job_checkpoints(request_id,attempt,operation_key,
+		logical_key,content_digest,receipt_id,outcome,recorded_at)
+		SELECT ?,?,?,?,?,?,?,?
+		WHERE EXISTS (SELECT 1 FROM attempts WHERE request_id=? AND attempt=? AND session_id=?
+		              AND state IN ('dispatching','accepted','recovered_open'))`,
 		c.RequestID, c.Attempt, c.OperationKey, c.LogicalKey, c.ContentDigest,
-		c.ReceiptID, c.Outcome, c.RecordedAt); err != nil {
+		c.ReceiptID, c.Outcome, c.RecordedAt,
+		c.RequestID, c.Attempt, c.SessionID)
+	if err != nil {
 		return c, "", exit.Internalf("cannot journal the checkpoint: %s", err)
 	}
+	// The pre-check above answers; THIS is the authority. A terminal landing between the
+	// two closes the attempt and the insert writes nothing — one statement, no window.
+	if n, _ := res.RowsAffected(); n != 1 {
+		return c, "UNKNOWN_ATTEMPT", unknownAttempt(c)
+	}
 	return c, "RECORDED", nil
+}
+
+func unknownAttempt(c Checkpoint) *exit.Error {
+	return exit.New(exit.NotFound,
+		"checkpoint %s/%s refused: %s#%d is not an OPEN attempt of session %s",
+		c.OperationKey, c.LogicalKey, c.RequestID, c.Attempt, c.SessionID).
+		WithRemedy("a checkpoint belongs to the attempt that is running it, and only its " +
+			"own session may declare one")
 }
 
 const checkpointCols = `request_id,attempt,operation_key,logical_key,content_digest,
@@ -1170,7 +1254,7 @@ const checkpointCols = `request_id,attempt,operation_key,logical_key,content_dig
 // Checkpoints lists one request's journaled checkpoint identities, in arrival order.
 func (s *Store) Checkpoints(requestID string) ([]Checkpoint, *exit.Error) {
 	rows, err := s.db.Query(`SELECT `+checkpointCols+` FROM job_checkpoints
-		WHERE request_id=? ORDER BY recorded_at`, requestID)
+		WHERE request_id=? ORDER BY attempt, recorded_at`, requestID)
 	if err != nil {
 		return nil, exit.Internalf("cannot list the checkpoints of %s: %s", requestID, err)
 	}

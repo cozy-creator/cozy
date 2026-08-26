@@ -1,6 +1,7 @@
 package main
 
 import (
+	"database/sql"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -9,6 +10,11 @@ import (
 	"strings"
 	"syscall"
 	"time"
+
+	"github.com/cozy-creator/cozy-creator-v2/internal/exit"
+	"github.com/cozy-creator/cozy-creator-v2/internal/records"
+
+	_ "modernc.org/sqlite"
 )
 
 // cl-004's live sections. Every one drives the PRODUCT BINARY as a user types it —
@@ -77,10 +83,193 @@ func jobPayload(dir, ref string, dwellMS int) string {
 
 // --------------------------------------------------------------------------- jobarms
 
+// checkpointIdentityArms drives the REAL records authority — a real SQLite root, the real
+// schema, the real `RecordCheckpoint` — over the two laws #553a added: the attempt is part
+// of the checkpoint identity, and the sender must own an OPEN attempt to declare one.
+func checkpointIdentityArms(root string) {
+	head("the checkpoint identity: attempt is part of the key, FK'd, and session-owned")
+	db := filepath.Join(root, "checkpoint-identity.sqlite3")
+	must("clearing the arm root", os.RemoveAll(db))
+	store, e := records.Open(db)
+	must("opening the records root", errOf(e))
+	defer store.Close()
+
+	// One worker instance, two sessions (two worker boots), one request, two attempts.
+	must("spawning the worker row", errOf(store.SpawnWorker(records.WorkerProcess{
+		InstanceID: "ins-arm", Endpoint: jobEndpoint, ReleaseID: "rel-arm", WorkerID: "w-arm",
+		Devices: []string{""}, PID: os.Getpid(), Birth: "arm", State: "spawned",
+	})))
+	req, _, e := store.Submit(records.Request{
+		ID: records.NewID("job"), IdemKey: "arm-idem", BodyDigest: "sha256:arm",
+		Endpoint: jobEndpoint, Entrypoint: "census", PlanID: "plan-arm",
+		Payload: []byte("{}"), Kind: "job",
+	})
+	must("submitting the arm request", errOf(e))
+	mkAttempt := func(session string) int64 {
+		n, e := store.Dispatch(records.Attempt{
+			RequestID: req.ID, InstanceID: "ins-arm", SessionID: session,
+			InvocationDigest: "sha256:arm", InvocationCanonical: []byte("{}"),
+		})
+		must("dispatching an arm attempt", errOf(e))
+		return n
+	}
+	declare := func(attempt int64, session, digest string) (string, *exit.Error) {
+		_, outcome, e := store.RecordCheckpoint(records.Checkpoint{
+			RequestID: req.ID, Attempt: attempt, OperationKey: "census/topology",
+			LogicalKey: "topology", ContentDigest: digest, SessionID: session,
+		})
+		return outcome, e
+	}
+
+	settle := func(attempt int64, session string) {
+		applied, e := store.AcceptTerminal(records.Terminal{
+			RequestID: req.ID, Attempt: attempt, SessionID: session,
+			InvocationDigest: "sha256:arm", TerminalID: records.NewID("trm"),
+			TerminalDigest: "sha256:trm", Status: "SUCCEEDED", RequestState: "queued",
+		})
+		must("settling an arm attempt", errOf(e))
+		check(fmt.Sprintf("attempt %d reached its terminal through the real transaction",
+			attempt), applied, fmt.Sprint(applied))
+	}
+
+	a1 := mkAttempt("boot-1")
+	out, e := declare(a1, "boot-1", "sha256:aaa")
+	check("attempt 1 declares its checkpoint under its own session",
+		out == "RECORDED" && e == nil, out+" "+briefly(e))
+	out, _ = declare(a1, "boot-1", "sha256:aaa")
+	check("the same identity REPLAYS and writes nothing a second time", out == "REPLAYED", out)
+	out, _ = declare(a1, "boot-1", "sha256:bbb")
+	check("the same identity with different bytes CONFLICTS, never replaces", out == "CONFLICT", out)
+
+	// ARM: a FOREIGN session cannot declare into an attempt it does not own — and it is
+	// refused BEFORE the journal is read, so it does not learn that the key is taken.
+	out, e = declare(a1, "boot-2", "sha256:ccc")
+	check("a FOREIGN session declaring into that attempt refuses UNKNOWN_ATTEMPT",
+		out == "UNKNOWN_ATTEMPT" && e != nil, out+" "+briefly(e))
+	check("and the refusal names ownership, never the recorded digest",
+		e != nil && strings.Contains(e.Message, "is not an OPEN attempt of session boot-2") &&
+			!strings.Contains(e.Message, "sha256:bbb"), briefly(e))
+
+	// ARM: two attempts of ONE request keep DISTINCT checkpoint identities. Attempt 1 must
+	// settle first — supersession is explicit, so one request holds one live attempt.
+	settle(a1, "boot-1")
+	a2 := mkAttempt("boot-1")
+	out, e = declare(a2, "boot-1", "sha256:bbb")
+	check("attempt 2 declares the SAME keys with DIFFERENT bytes and is RECORDED, not a conflict",
+		out == "RECORDED" && e == nil, fmt.Sprintf("attempt %d: %s %s", a2, out, briefly(e)))
+	rows, e := store.Checkpoints(req.ID)
+	must("listing the arm checkpoints", errOf(e))
+	distinct := len(rows) == 2 && rows[0].Attempt != rows[1].Attempt &&
+		rows[0].ContentDigest != rows[1].ContentDigest
+	check("and the request holds TWO checkpoint rows, one per attempt", distinct,
+		fmt.Sprintf("%d row(s) over attempts %v", len(rows), attemptsOf(rows)))
+
+	// ARM: an attempt that has reached its TERMINAL is no longer declarable against.
+	out, e = declare(a1, "boot-1", "sha256:ddd")
+	check("a SETTLED attempt refuses UNKNOWN_ATTEMPT — a checkpoint belongs to a live run",
+		out == "UNKNOWN_ATTEMPT" && e != nil, out+" "+briefly(e))
+
+	// ARM: an attempt ordinal that was never dispatched has no representation at all.
+	out, e = declare(99, "boot-1", "sha256:eee")
+	check("an attempt that was never dispatched refuses UNKNOWN_ATTEMPT",
+		out == "UNKNOWN_ATTEMPT" && e != nil, out+" "+briefly(e))
+}
+
+// checkpointMigrationArm plants a root carrying the PRE-#553a table — the identity without
+// `attempt`, no foreign key — and opens it with the product's own `records.Open`.
+func checkpointMigrationArm(root string) {
+	head("an OLD root migrates: the identity is rebuilt, and orphan rows do not survive it")
+	path := filepath.Join(root, "checkpoint-migration.sqlite3")
+	must("clearing the migration root", os.RemoveAll(path))
+
+	// Build a real root, then put the OLD shape back where the new one is.
+	store, e := records.Open(path)
+	must("opening the migration root", errOf(e))
+	req, _, e := store.Submit(records.Request{
+		ID: records.NewID("job"), IdemKey: "mig-idem", BodyDigest: "sha256:mig",
+		Endpoint: jobEndpoint, Entrypoint: "census", PlanID: "plan-mig",
+		Payload: []byte("{}"), Kind: "job",
+	})
+	must("submitting the migration request", errOf(e))
+	must("spawning the migration worker", errOf(store.SpawnWorker(records.WorkerProcess{
+		InstanceID: "ins-mig", Endpoint: jobEndpoint, ReleaseID: "rel-mig", WorkerID: "w-mig",
+		Devices: []string{""}, PID: os.Getpid(), Birth: "mig", State: "spawned",
+	})))
+	kept, e := store.Dispatch(records.Attempt{
+		RequestID: req.ID, InstanceID: "ins-mig", SessionID: "boot-m",
+		InvocationDigest: "sha256:mig", InvocationCanonical: []byte("{}"),
+	})
+	must("dispatching the migration attempt", errOf(e))
+	store.Close()
+
+	raw, err := sql.Open("sqlite", path)
+	must("re-opening the migration root raw", err)
+	for _, stmt := range []string{
+		`DROP TABLE job_checkpoints`,
+		`CREATE TABLE job_checkpoints (
+  request_id    TEXT    NOT NULL,
+  attempt       INTEGER NOT NULL,
+  operation_key TEXT    NOT NULL,
+  logical_key   TEXT    NOT NULL,
+  content_digest TEXT   NOT NULL,
+  receipt_id    TEXT    NOT NULL,
+  outcome       TEXT    NOT NULL,
+  recorded_at   TEXT    NOT NULL,
+  PRIMARY KEY (request_id, operation_key, logical_key)
+)`,
+		fmt.Sprintf(`INSERT INTO job_checkpoints VALUES
+			('%s',%d,'op/keep','keep','sha256:keep','crc-keep','RECORDED','t'),
+			('%s',7,'op/orphan','orphan','sha256:orphan','crc-orphan','RECORDED','t')`,
+			req.ID, kept, req.ID),
+	} {
+		_, err := raw.Exec(stmt)
+		must("planting the pre-#553a table", err)
+	}
+	must("closing the raw handle", raw.Close())
+
+	store, e = records.Open(path)
+	must("re-opening the planted root through the product", errOf(e))
+	defer store.Close()
+	rows, e := store.Checkpoints(req.ID)
+	must("listing the migrated checkpoints", errOf(e))
+	check("the row whose attempt EXISTS survives the rebuild",
+		len(rows) == 1 && rows[0].LogicalKey == "keep" && rows[0].Attempt == kept,
+		fmt.Sprintf("%d row(s): %v", len(rows), keysOf(rows)))
+	check("the row naming attempt 7, which was never dispatched, does not",
+		len(rows) == 1, fmt.Sprintf("%v", keysOf(rows)))
+
+	// The new identity is live on the migrated root: the same keys under the OPEN attempt.
+	_, outcome, e := store.RecordCheckpoint(records.Checkpoint{
+		RequestID: req.ID, Attempt: kept, OperationKey: "op/keep", LogicalKey: "keep",
+		ContentDigest: "sha256:keep", SessionID: "boot-m",
+	})
+	check("and the migrated row REPLAYS under the new key, so nothing was re-minted",
+		outcome == "REPLAYED" && e == nil, outcome+" "+briefly(e))
+}
+
+func keysOf(rows []records.Checkpoint) []string {
+	out := make([]string, 0, len(rows))
+	for _, r := range rows {
+		out = append(out, fmt.Sprintf("#%d %s", r.Attempt, r.LogicalKey))
+	}
+	return out
+}
+
+func attemptsOf(rows []records.Checkpoint) []int64 {
+	out := make([]int64, 0, len(rows))
+	for _, r := range rows {
+		out = append(out, r.Attempt)
+	}
+	return out
+}
+
 func sectionJobArms() {
 	root := flag("home", filepath.Join(os.TempDir(), "cozy-live", "cl004-arms"))
 	must("clearing the root", os.RemoveAll(root))
 	must("creating the root", os.MkdirAll(root, 0o755))
+
+	checkpointIdentityArms(root)
+	checkpointMigrationArm(root)
 
 	head("the service is DOWN: every job verb is typed exit 9 with the start remedy")
 	for _, args := range [][]string{
