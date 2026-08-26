@@ -87,11 +87,14 @@ pub const CONVERTERS: [Converter; 4] = [
               canonical per-head contiguous to_q|to_k|to_v, and the ratified rekey rows moved \
               with it. Reordering only — never arithmetic. A fused attention key this \
               converter has NO banked seam for refuses rather than carrying through.",
-        // The GEOMETRY is now read from the real native header and the split runs on real
-        // bytes at miniature scale — but the 66 GB native tensors have never met it, and
-        // nothing has compared a produced `to_q` against the diffusers packaging's own.
-        // That convergence is what flips this, and it needs both trees' weights.
-        validated_on_real_bytes: false,
+        // FLIPPED 2026-08-25 (tfs-003 convergence run, MiniMaxAI/MiniMax-H3@42ed227e): the
+        // full 66.28 GB native tree ingested through this converter (639 ops, exit 0), and
+        // the produced to_q/to_k/to_v are BIT-IDENTICAL to the diffusers packaging's own
+        // bytes on real 77 MB fused tensors from BOTH attention families
+        // (transformer_blocks.0 and token_refiner.blocks.0; groups=56, head_dim=128 read
+        // from q_norm). The 17 edge rewrites are byte-digest-proven bijections; the sole
+        // native-only key is rope.inv_freq, carried.
+        validated_on_real_bytes: true,
     },
 ];
 
@@ -1244,6 +1247,9 @@ fn rekey(conv: &Converter, key: &str) -> String {
         // Leaf first, then the block prefix — the two halves of the ratified map's own
         // `rekey` block, applied in the order it lists them.
         "h3.native/1" => {
+            if let Some((_, to)) = H3_NATIVE_EXACT.iter().find(|(from, _)| *from == key) {
+                return to.to_string();
+            }
             let leafed = H3_NATIVE_LEAVES
                 .iter()
                 .find(|(from, _)| key.ends_with(*from))
@@ -1264,14 +1270,45 @@ fn rekey(conv: &Converter, key: &str) -> String {
 /// h3-evidence's reconciliation row). Its `rekey` block is these five leaf rewrites plus the
 /// block prefix; nothing here is inferred from a name similarity.
 ///
-/// The 18 native top-level keys the ratified map does NOT cover (`rope.inv_freq`,
-/// `audio_patch_proj`, `video_patch_proj`, `condition_proj`, `final_layer.*`,
-/// `time_embedder.proj_in/out`) pass through UNRENAMED, exactly as an unlisted single-file
-/// prefix does. The Diffusers packaging has 17 top-level keys nothing reaches
-/// (`audio_proj_in/out`, `context_embedder`, `norm_out.*`, `proj_in/out`,
-/// `time_embedder.linear_1/2`) and native carries one extra buffer — which IS the
-/// reconciliation's `-4 unfused token_refiner keys +1 buffer` residual, arithmetic that
-/// closes only because the correspondence is left unclaimed rather than guessed.
+/// The 17 edge-module rewrites, each PROVEN by byte-digest equality on the real artifacts
+/// (2026-08-25, tfs-003 convergence run: MiniMaxAI/MiniMax-H3@42ed227e, native FL2VA vs
+/// diffusers packaging, same revision — every pair's sha256 over the tensor's exact data
+/// run is identical, and the pairing is a bijection). The earlier map left these unclaimed
+/// because v1 evidence could not prove them; real bytes now can, so leaving them unmapped
+/// would make the two packagings' canonical projections diverge over a correspondence that
+/// is measured fact. `rope.inv_freq` is the ONE native key that byte-matches nothing in
+/// the diffusers packaging (a [16] f32 rope table; values follow 1/10000^(2i/32) but a
+/// bit-exact derivation was not reproduced, so it is CARRIED unrenamed — never invented,
+/// never dropped).
+const H3_NATIVE_EXACT: [(&str, &str); 17] = [
+    ("audio_patch_proj.bias", "audio_proj_in.bias"),
+    ("audio_patch_proj.weight", "audio_proj_in.weight"),
+    ("condition_proj.bias", "context_embedder.bias"),
+    ("condition_proj.weight", "context_embedder.weight"),
+    ("final_layer.adaln_proj.linear.bias", "norm_out.linear.bias"),
+    (
+        "final_layer.adaln_proj.linear.weight",
+        "norm_out.linear.weight",
+    ),
+    ("final_layer.audio_out.bias", "audio_proj_out.bias"),
+    ("final_layer.audio_out.weight", "audio_proj_out.weight"),
+    ("final_layer.norm.weight", "norm_out.norm.weight"),
+    ("final_layer.video_out.bias", "proj_out.bias"),
+    ("final_layer.video_out.weight", "proj_out.weight"),
+    ("time_embedder.proj_in.bias", "time_embedder.linear_1.bias"),
+    (
+        "time_embedder.proj_in.weight",
+        "time_embedder.linear_1.weight",
+    ),
+    ("time_embedder.proj_out.bias", "time_embedder.linear_2.bias"),
+    (
+        "time_embedder.proj_out.weight",
+        "time_embedder.linear_2.weight",
+    ),
+    ("video_patch_proj.bias", "proj_in.bias"),
+    ("video_patch_proj.weight", "proj_in.weight"),
+];
+
 const H3_NATIVE_LEAVES: [(&str, &str); 5] = [
     (".attn.out_proj.weight", ".attn.to_out.0.weight"),
     (".attn.q_norm.weight", ".attn.norm_q.weight"),
