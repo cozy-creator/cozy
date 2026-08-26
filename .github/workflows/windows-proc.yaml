@@ -14,8 +14,9 @@ jobs:
       - uses: actions/setup-go@v5
         with:
           go-version: stable
+      # No gofmt here: the Windows checkout is CRLF, which gofmt -l flags wholesale.
+      # Formatting is ci.yaml's gate on Linux; this run is about process behavior.
       - run: go vet ./...
-      - run: gofmt -l . ; if (gofmt -l . | Where-Object { $_ -notmatch 'vendor' }) { exit 1 }
       # The three in-process suites: spawn (CREATE_SUSPENDED -> job adoption -> resume),
       # Register over the LOOPBACK transport with the per-spawn bootstrap credential,
       # dispatch/terminal/ack, the two-tier stop (CTRL_BREAK -> TerminateJobObject),
