@@ -59,10 +59,9 @@ func startService(root string, port int, fresh bool) *liveService {
 	must("service log", err)
 	defer logFile.Close()
 
-	args := []string{"up", "--port", fmt.Sprint(port)}
-	// nice(1) is the DRIVER's resource discipline on a shared box, imposed on the launch
-	// rather than baked into the product.
-	cmd := exec.Command("/usr/bin/nice", append([]string{"-n", "19", abs}, args...)...)
+	// niceCmd is the DRIVER's resource discipline on a shared box, imposed on the launch
+	// rather than baked into the product (and absent on Windows, which has no nice(1)).
+	cmd := niceCmd(abs, "up", "--port", fmt.Sprint(port))
 	// The child's environment comes through the PRODUCT's own allowlist, not through
 	// os.Environ(): the driver has no business inventing a second child-env mechanism,
 	// and the env fence says there is only one reader.

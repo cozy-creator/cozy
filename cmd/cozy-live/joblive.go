@@ -4,7 +4,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"sort"
 	"strings"
@@ -688,7 +687,7 @@ func shortIDs(ids []string) []string {
 // cozyRunEnv runs the product binary with extra IMPOSED environment values, through the
 // product's own child-env allowlist.
 func cozyRunEnv(root string, imposed []string, args ...string) (int, string) {
-	cmd := exec.Command("/usr/bin/nice", append([]string{"-n", "19", cozyBinary()}, args...)...)
+	cmd := niceCmd(cozyBinary(), args...)
 	cmd.Env = append(childEnv(root), imposed...)
 	data, _ := cmd.CombinedOutput()
 	code := 0
