@@ -184,7 +184,7 @@ code topology and re-checks, so CONVERTIBLE means the mapped topology satisfies,
 one key happened to match.
 
 The pairs are REAL. `scripts/h3-pairs.py` transcribes pinned upstream headers out of
-`~/cozy_v2/h3-evidence` (33 artifacts, each pinned to a repo revision and a sha256 of the
+`~/cozy_v2/tracker-v2/h3-evidence` (33 artifacts, each pinned to a repo revision and a sha256 of the
 exact bytes read) into neutral measured rows; `tfs compat import` turns those into canonical
 documents and says on every run that the logical facts are real and the part object ids are
 placeholders. No weight bytes transit this machine, and nothing below the topology layer is

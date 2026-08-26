@@ -3,7 +3,7 @@
 
 Every plant is a SAME-LENGTH byte patch of a copy: the file's layout is untouched, so what
 the planner sees is exactly the defect and nothing else. The banked probes in
-`~/cozy_v2/h3-evidence` are read-only evidence and are never edited — this reads one and
+`~/cozy_v2/tracker-v2/h3-evidence` are read-only evidence and are never edited — this reads one and
 writes a mutated copy somewhere else.
 
   scripts/gguf-plant.py <in> <out> <plant>

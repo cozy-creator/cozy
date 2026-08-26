@@ -2,7 +2,7 @@
 """Transcribe pinned MiniMax-H3 headers out of the h3-evidence bank into NEUTRAL measured
 rows, which `tfs compat import` turns into canonical documents.
 
-The bank (`~/cozy_v2/h3-evidence`, READ-ONLY here) holds the exact upstream header bytes of
+The bank (`~/cozy_v2/tracker-v2/h3-evidence`, READ-ONLY here) holds the exact upstream header bytes of
 33 real artifacts, each pinned to a repo revision and a sha256 of the bytes read. This
 script reads those bytes and emits component/key/dtype/shape/role rows. It writes NO
 canonical document and names NO format mark: there is one canonical writer in this repo and
@@ -33,7 +33,7 @@ import sys
 # `H3_BANK` points the transcriber at another copy of the bank. Its one consumer is the
 # stamp-reconciliation red arm, which mutates a COPY of a banked verdict: the real bank is
 # read-only evidence and is never edited to make an arm fire.
-BANK = pathlib.Path(os.environ.get("H3_BANK") or pathlib.Path.home() / "cozy_v2/h3-evidence")
+BANK = pathlib.Path(os.environ.get("H3_BANK") or pathlib.Path.home() / "cozy_v2/tracker-v2/h3-evidence")
 # The marker/role sibling conventions this ecosystem actually ships, measured in
 # h3-evidence's "Marker schemas, measured" table. Markers carry no value; role siblings do.
 #

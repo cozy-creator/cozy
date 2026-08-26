@@ -3,8 +3,8 @@
 # real binary over REAL banked bytes and every red arm PLANTS a defect in a COPY of them
 # and prints the refusal it produced.
 #
-# The corpus is the six GGUF metadata regions pinned in ~/cozy_v2/h3-evidence — 33 to 75 KB
-# probes of 15 to 36 GB files, fetched by range and pinned by digest. No weight byte
+# The corpus is the six GGUF metadata regions pinned in ~/cozy_v2/tracker-v2/h3-evidence —
+# 33 to 75 KB probes of 15 to 36 GB files, fetched by range and pinned by digest. No weight
 # transits this machine and none needs to: a plan is derived from the metadata region.
 #
 #   scripts/gguf-runs.sh plan     the plan over every banked carrier
@@ -15,7 +15,7 @@
 set -uo pipefail
 cd "$(dirname "$0")/.."
 TFS=${TFS:-target/release/tfs}
-BANK=${BANK:-$HOME/cozy_v2/h3-evidence}
+BANK=${BANK:-$HOME/cozy_v2/tracker-v2/h3-evidence}
 W=${W:-/tmp/tfs-011-runs}
 SECTION=${1:-all}
 PASS=0; MISS=0

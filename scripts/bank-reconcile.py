@@ -37,7 +37,7 @@ import sys
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 TFS = pathlib.Path(os.environ.get("TFS") or ROOT / "target/release/tfs")
-BANK = pathlib.Path(os.environ.get("H3_BANK") or pathlib.Path.home() / "cozy_v2/h3-evidence")
+BANK = pathlib.Path(os.environ.get("H3_BANK") or pathlib.Path.home() / "cozy_v2/tracker-v2/h3-evidence")
 W = pathlib.Path(os.environ.get("W") or "/tmp/tfs-010-reconcile")
 VERBOSE = False
 

@@ -18,7 +18,7 @@ H3="${H3:-$ROOT/../tracker-v2/examples/safetensors-headers/minimax_h3_fl2va_prun
 # h3-evidence banked them (read-only). The cache is content-addressed, so the paths ARE
 # the digests: shard 1 of 13 of `FL2VA/transformer` and `transformer/...index.json` at
 # MiniMaxAI/MiniMax-H3@42ed227e.
-BANK="${BANK:-$HOME/cozy_v2/h3-evidence}"
+BANK="${BANK:-$HOME/cozy_v2/tracker-v2/h3-evidence}"
 NATIVE_HDR="$BANK/cache/3ac8763fb32ed28e1848f2d5f115d96f6dfc84e1ab8e0421f855f3ed0abcc91a"
 DIFFUSERS_IDX="$BANK/cache/ac30a3b58963f2e735d493475fbb81853a5735ec947619648b3e045acda6783e"
 REG="$WORK/registry.json"

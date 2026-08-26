@@ -4,7 +4,7 @@
 #
 # Not a test suite. Every arm runs the real binary; every RED arm plants a real defect and
 # prints the refusal it produced. The compatibility arms run against REAL pinned MiniMax-H3
-# headers out of ~/cozy_v2/h3-evidence — 33 upstream artifacts, each pinned to a repo
+# headers out of ~/cozy_v2/tracker-v2/h3-evidence — 33 upstream artifacts, each pinned to a repo
 # revision and a sha256 of the exact bytes read. Weights never transit this machine, so the
 # logical facts are real and the part object ids are placeholders; `tfs compat import` says
 # so on every run and nothing below the topology layer is read by the decision.
@@ -19,7 +19,7 @@ set -uo pipefail
 cd "$(dirname "$0")/.."
 TFS=${TFS:-target/release/tfs}
 W=${W:-/tmp/tfs-009-runs}
-BANK=${BANK:-$HOME/cozy_v2/h3-evidence}
+BANK=${BANK:-$HOME/cozy_v2/tracker-v2/h3-evidence}
 SECTION=${1:-all}
 PASS=0; MISS=0
 
@@ -217,7 +217,7 @@ print(f'     native {len(ka)} keys, diffusers {len(kb)} keys, shared {len(ka&kb)
   hr "scale rank is a PER-PRODUCER fact (decisions #244), read off the real headers"
   python3 - <<'PY'
 import json, pathlib, os
-BANK = pathlib.Path(os.path.expanduser("~/cozy_v2/h3-evidence"))
+BANK = pathlib.Path(os.path.expanduser("~/cozy_v2/tracker-v2/h3-evidence"))
 rows = json.loads((BANK / "rows/comfy-org-h3.json").read_text())
 for f in rows["banked_files"]:
     if f.get("mode") != "st":
