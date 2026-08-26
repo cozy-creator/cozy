@@ -78,47 +78,30 @@ func ReleaseID(gen records.EndpointInstall) string {
 	return gen.Endpoint + "@" + version
 }
 
-// Spec builds the WorkerLaunchSpec the orchestrator launches, with the DesiredPlacement
-// that worker is launched to host (#484) — the object cl-006's `--dev-endpoint` document
-// used to supply by hand.
-//
-// The interpreter is the GENERATION'S OWN: the venv `uv sync --locked` built from the
-// release's own lock, so the cozy-runtime that serves an endpoint is the one the release
-// pinned and never this host's. That is the whole reason a generation is a venv.
-func (f *Facts) Spec(devices []string) (orchestrator.WorkerLaunchSpec, *exit.Error) {
+// Placement builds the platform-neutral control facts a worker is asked to host. It says
+// WHAT release and binding plans should serve, never HOW a process is launched. Today the
+// local install derives the records through its own runtime; cl-020's signed control
+// manifest will supply the same result without constructing a target environment here.
+func (f *Facts) Placement() (orchestrator.DesiredPlacement, *exit.Error) {
 	// THE RESOLVED SELECTION, from the one resolver that owns the grammar
 	// (`cozy-runtime bindings`). cl-010 read `endpoint.toml`'s `[bindings]` table here
 	// because no runtime verb emitted the resolved record; cr-016 added the verb, and this
 	// host's second reader of that closed grammar is deleted rather than kept in step.
 	resolved, e := f.RuntimeCLI.Bindings()
 	if e != nil {
-		return orchestrator.WorkerLaunchSpec{}, e
+		return orchestrator.DesiredPlacement{}, e
 	}
 	table := map[string]Binding{}
 	for _, b := range resolved {
 		table[b.Path] = b
 	}
-	spec := orchestrator.WorkerLaunchSpec{
-		Placement: orchestrator.DesiredPlacement{
-			Endpoint:  f.Install.Endpoint,
-			ReleaseID: ReleaseID(f.Install),
-			InstallID: f.Install.ID,
-			// The descriptor this install already VERIFIED in the generation's own venv
-			// (cr-003's `describe --check`). It names the placement's surface by digest.
-			DescriptorDigest: f.Install.Descriptor,
-		},
-		// THE SUPERVISOR ENTRY, and it is now the VERB. cl-004 recorded the private
-		// `internal.worker.session:main` import as owed: `serve` was dead on arrival
-		// because the CLI read the config at its entrypoint and `session.main` read it
-		// again, which the runtime's own one-authority rule refuses. cozy-runtime
-		// `db4ab8a` passes the config it already read into `session.supervise`, so the
-		// import — a second process entry into one loop, across a private module path a
-		// release is free to move — deletes.
-		Python:   Binary(f.Install.Dir),
-		Args:     []string{"serve"},
-		Dir:      f.Source,
-		Devices:  devices,
-		GraceSec: 3,
+	placement := orchestrator.DesiredPlacement{
+		Endpoint:  f.Install.Endpoint,
+		ReleaseID: ReleaseID(f.Install),
+		InstallID: f.Install.ID,
+		// The descriptor this install already VERIFIED in the generation's own venv
+		// (cr-003's `describe --check`). It names the placement's surface by digest.
+		DescriptorDigest: f.Install.Descriptor,
 	}
 	hidden := []string{}
 	for i := range f.Descriptor.Entrypoints {
@@ -132,24 +115,50 @@ func (f *Facts) Spec(devices []string) (orchestrator.WorkerLaunchSpec, *exit.Err
 		}
 		binding, e := f.binding(ep, table)
 		if e != nil {
-			return orchestrator.WorkerLaunchSpec{}, e
+			return orchestrator.DesiredPlacement{}, e
 		}
-		spec.Placement.Bindings = append(spec.Placement.Bindings, binding)
+		placement.Bindings = append(placement.Bindings, binding)
 	}
 	if len(hidden) > 0 {
-		spec.Placement.Hidden = hidden
+		placement.Hidden = hidden
 	}
-	if len(spec.Placement.Bindings) == 0 {
+	if len(placement.Bindings) == 0 {
 		// Every entrypoint mints a record now — weightless included — so this is the one
 		// remaining case: a release whose descriptor registers no entrypoint at all. A job
 		// function is not one; it is served through `cozy job`, on a spec of its own.
-		return orchestrator.WorkerLaunchSpec{}, exit.Named(exit.Structural, "no_servable_function",
+		return orchestrator.DesiredPlacement{}, exit.Named(exit.Structural, "no_servable_function",
 			"%s registers no entrypoint, and a worker with no plan to advertise has nothing to serve",
 			f.Install.Endpoint).
 			WithRemedy("its functions: %s — an `@app.entrypoint` is what a request dispatches to",
 				strings.Join(f.Descriptor.Names(), ", "))
 	}
-	return spec, nil
+	return placement, nil
+}
+
+// Spec adds this host's target-environment materialization to a placement. The
+// interpreter is the GENERATION'S OWN: the venv `uv sync --locked` built from the
+// release's own lock, so the cozy-runtime that serves an endpoint is the one the release
+// pinned and never this host's. A connected worker never calls this method.
+func (f *Facts) Spec(devices []string) (orchestrator.WorkerLaunchSpec, *exit.Error) {
+	placement, e := f.Placement()
+	if e != nil {
+		return orchestrator.WorkerLaunchSpec{}, e
+	}
+	return orchestrator.WorkerLaunchSpec{
+		Placement: placement,
+		// THE SUPERVISOR ENTRY, and it is now the VERB. cl-004 recorded the private
+		// `internal.worker.session:main` import as owed: `serve` was dead on arrival
+		// because the CLI read the config at its entrypoint and `session.main` read it
+		// again, which the runtime's own one-authority rule refuses. cozy-runtime
+		// `db4ab8a` passes the config it already read into `session.supervise`, so the
+		// import — a second process entry into one loop, across a private module path a
+		// release is free to move — deletes.
+		Python:   Binary(f.Install.Dir),
+		Args:     []string{"serve"},
+		Dir:      f.Source,
+		Devices:  devices,
+		GraceSec: 3,
+	}, nil
 }
 
 // binding mints ONE entrypoint's local pinned-binding record. A weightless entrypoint

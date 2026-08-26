@@ -303,11 +303,11 @@ func (s *Server) resolvePlan(sub Submission) (orchestrator.Submission, *exit.Err
 		if s.endpoints == nil {
 			return out, exit.Unavailablef("this LocalService resolves no endpoints")
 		}
-		spec, e := s.endpoints.Resolve(sub.Endpoint)
+		placement, e := s.endpoints.ResolvePlacement(sub.Endpoint)
 		if e != nil {
 			return out, e
 		}
-		for _, b := range spec.Placement.Bindings {
+		for _, b := range placement.Bindings {
 			if b.Entrypoint != sub.Function {
 				continue
 			}
@@ -322,7 +322,7 @@ func (s *Server) resolvePlan(sub Submission) (orchestrator.Submission, *exit.Err
 				WithRemedy("GET /v1/local/endpoints lists the functions this host serves")
 		}
 		if len(out.Outputs) == 0 {
-			out.Outputs = spec.Placement.OutputsFor(sub.Function)
+			out.Outputs = placement.OutputsFor(sub.Function)
 		}
 	}
 	return out, nil

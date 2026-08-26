@@ -64,11 +64,12 @@ type Options struct {
 	MaxOutputMiB          int64
 }
 
-// Launcher resolves an endpoint ref to the spec that starts its worker. The orchestrator
-// holds it to SELECT-OR-START and for nothing else: it never resolves a name itself, and
-// the object that does is the LOCAL module's install-generation resolver (cl-010) or, on
-// a pod, cl-014's.
+// Launcher resolves an endpoint ref along the two boundaries #484 split: the
+// platform-neutral desired placement and the local target-environment launch. A connected
+// worker asks only for ResolvePlacement; it must never force this host to materialize or
+// execute the target environment merely to author a remote plan.
 type Launcher interface {
+	ResolvePlacement(endpoint string) (DesiredPlacement, *exit.Error)
 	Resolve(endpoint string) (WorkerLaunchSpec, *exit.Error)
 	// ResolveJob is the JOB lane's half: `org/name` plus a job function to the spec that
 	// makes THAT job's worker resident. It is a separate method rather than a flag

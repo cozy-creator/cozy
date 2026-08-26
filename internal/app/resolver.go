@@ -34,6 +34,9 @@ type Resolver struct {
 	// and asks the runtime for its artifact index; a generation is IMMUTABLE, so doing it
 	// twice would answer the same thing twice.
 	cache map[string]orchestrator.WorkerLaunchSpec
+	// placements contain only control-plane facts. Keeping this cache distinct is the
+	// seam cl-020's verified control manifest will populate without a local venv.
+	placements map[string]orchestrator.DesiredPlacement
 	// Devices is the device envelope a worker this host launches may SEE.
 	Devices []string
 }
@@ -42,9 +45,39 @@ type Resolver struct {
 func NewResolver(store *records.Store, cfg config.Config) *Resolver {
 	return &Resolver{
 		store: store, cfg: cfg,
-		cache:   map[string]orchestrator.WorkerLaunchSpec{},
-		Devices: []string{"0"},
+		cache:      map[string]orchestrator.WorkerLaunchSpec{},
+		placements: map[string]orchestrator.DesiredPlacement{},
+		Devices:    []string{"0"},
 	}
+}
+
+// ResolvePlacement answers only WHAT an endpoint target should host. The current local
+// install derives that fact from its proven environment; a future control-manifest
+// install can supply it directly without changing the API or orchestrator boundary.
+func (r *Resolver) ResolvePlacement(endpoint string) (orchestrator.DesiredPlacement, *exit.Error) {
+	endpoint = strings.TrimSpace(endpoint)
+	r.mu.Lock()
+	placement, ok := r.placements[endpoint]
+	r.mu.Unlock()
+	if ok {
+		return placement, nil
+	}
+	gen, e := r.generation(endpoint)
+	if e != nil {
+		return orchestrator.DesiredPlacement{}, e
+	}
+	facts, e := launch.Read(*gen, r.cfg.Home, r.cfg.Tool())
+	if e != nil {
+		return orchestrator.DesiredPlacement{}, e
+	}
+	placement, e = facts.Placement()
+	if e != nil {
+		return orchestrator.DesiredPlacement{}, e
+	}
+	r.mu.Lock()
+	r.placements[endpoint] = placement
+	r.mu.Unlock()
+	return placement, nil
 }
 
 // Resolve answers with the spec for one endpoint ref.
