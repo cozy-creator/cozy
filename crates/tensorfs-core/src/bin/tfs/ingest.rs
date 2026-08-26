@@ -111,8 +111,19 @@ fn read_header_only(p: &Path) -> tensorfs_core::err::Result<(SourceHeader, Vec<u
     Ok((h, raw))
 }
 
-/// Read a carrier header AND keep its exact bytes, for the identity above.
+/// Read a carrier header AND keep its exact bytes, for the identity above. A
+/// `*.index.json` is a SHARDED carrier (the official H3 trees ship 13/14-shard
+/// components) and decodes through `read_sharded` — every single-file law per shard,
+/// exact weight_map cover both directions, virtual joined offsets. Any other `.json` is
+/// committed header evidence.
 fn read_carrier(p: &Path) -> tensorfs_core::err::Result<(SourceHeader, Vec<u8>)> {
+    if p.file_name()
+        .and_then(|n| n.to_str())
+        .map(|n| n.ends_with(".index.json"))
+        .unwrap_or(false)
+    {
+        return carrier::read_sharded(p);
+    }
     if p.extension().map(|e| e == "json").unwrap_or(false) {
         return read_header_only(p);
     }
@@ -257,7 +268,8 @@ fn marker_evidence(
             );
         }
         let mut buf = Vec::with_capacity(t.nbytes() as usize);
-        carrier::Region::open(path, h.data_start, t)?
+        let (rp, abs) = carrier::resolve(path, h, t)?;
+        carrier::Region::open(rp, abs, t.nbytes())?
             .read_to_end(&mut buf)
             .map_err(|e| tensorfs_core::err::Refusal {
                 code: tensorfs_core::err::Code::IO_FAILED,

@@ -356,7 +356,8 @@ pub fn execute(
                             )
                         }
                     };
-                    let mut region = carrier::Region::open(&f.path, f.header.data_start, t)?;
+                    let (rp, abs) = carrier::resolve(&f.path, &f.header, t)?;
+                    let mut region = carrier::Region::open(rp, abs, t.nbytes())?;
                     let w = ck::objectize(store, &what, r.dtype, r.shape.clone(), &mut region)?;
                     written += w.bytes;
                     hashed += w.bytes;
@@ -383,8 +384,8 @@ pub fn execute(
                     // carrier in destination order, so a permute costs the same constant
                     // memory an identity stream does. Holding the fused tensor would make
                     // peak RSS a function of the artifact (231 MB on the real H3 QKV).
-                    let mut region =
-                        carrier::RunRegion::open(&f.path, f.header.data_start, t, xform.runs())?;
+                    let (rp, abs) = carrier::resolve(&f.path, &f.header, t)?;
+                    let mut region = carrier::RunRegion::open(rp, abs, xform.runs())?;
                     let w = ck::objectize(store, &what, r.dtype, r.shape.clone(), &mut region)?;
                     written += w.bytes;
                     hashed += w.bytes;

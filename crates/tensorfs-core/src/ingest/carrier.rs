@@ -142,6 +142,18 @@ impl SourceTensor {
     }
 }
 
+/// One shard of a sharded carrier, as the joined view remembers it. `virtual_base` is where
+/// this shard's data region begins in the joined VIRTUAL data region (the shards' regions
+/// laid end to end in sorted-filename order); tensor offsets in the joined header are
+/// virtual, and `resolve` maps them back to (path, absolute file offset) at read time.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Shard {
+    pub path: std::path::PathBuf,
+    pub data_start: u64,
+    pub virtual_base: u64,
+    pub virtual_len: u64,
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct SourceHeader {
     pub tensors: Vec<SourceTensor>,
@@ -152,6 +164,9 @@ pub struct SourceHeader {
     pub file_len: u64,
     /// Declared bytes that no tensor claims. Recorded, not silently absorbed.
     pub gap_bytes: u64,
+    /// Empty for a single-file carrier. Non-empty means tensor offsets are VIRTUAL and must
+    /// go through `resolve` — never through `data_start` arithmetic on one file.
+    pub shards: Vec<Shard>,
 }
 
 impl SourceHeader {
@@ -385,6 +400,210 @@ pub fn parse_header(bytes: &[u8], data_start: u64, file_len: Option<u64>) -> Res
     Ok(out)
 }
 
+// ---------------------------------------------------------------- sharded carriers
+
+/// Decode a sharded safe carrier through its `*.index.json`: strict bounded index decode,
+/// every shard through `read_header` (so every single-file law — geometry, overlap,
+/// gaplessness, caps — holds per shard), then EXACT COVER both directions: every
+/// `weight_map` key must exist in exactly the shard the map names, and every tensor in
+/// every shard must be claimed by the map. The joined header's tensor offsets are virtual
+/// (shards' data regions laid end to end in sorted-filename order); the returned identity
+/// bytes are the exact index bytes plus each shard's exact 8-byte prefix + header bytes in
+/// that same order, so the source digest is content-bound and deterministic.
+pub fn read_sharded(index_path: &Path) -> Result<(SourceHeader, Vec<u8>)> {
+    let dir = index_path.parent().unwrap_or_else(|| Path::new("."));
+    let index_bytes =
+        std::fs::read(index_path).map_err(|e| io(format!("read {}", index_path.display()), e))?;
+    let v = canon::parse(&index_bytes, limits::CARRIER_HEADER_MAX_BYTES)?;
+    let top = match &v {
+        Value::Obj(m) => m,
+        o => {
+            return refuse(
+                Code::WRONG_TYPE,
+                format!("shard index: expected object, got {}", o.kind()),
+            )
+        }
+    };
+    let mut weight_map: Option<&Vec<(String, Value)>> = None;
+    let mut index_meta: Vec<(String, String)> = Vec::new();
+    for (k, ev) in top {
+        match k.as_str() {
+            "weight_map" => weight_map = Some(canon::as_obj("shard index", "weight_map", ev)?),
+            "metadata" => {
+                for (mk, mv) in canon::as_obj("shard index", "metadata", ev)? {
+                    let s = match mv {
+                        Value::Str(s) => s.clone(),
+                        Value::Int(n) => n.to_string(),
+                        o => {
+                            return refuse(
+                                Code::WRONG_TYPE,
+                                format!(
+                                    "shard index metadata.{mk}: expected string or uint, got {}",
+                                    o.kind()
+                                ),
+                            )
+                        }
+                    };
+                    index_meta.push((mk.clone(), s));
+                }
+            }
+            other => {
+                return refuse(
+                    Code::WRONG_TYPE,
+                    format!("shard index: unknown top-level field {other:?}"),
+                )
+            }
+        }
+    }
+    let weight_map = match weight_map {
+        Some(m) if !m.is_empty() => m,
+        _ => {
+            return refuse(
+                Code::MISSING_FIELD,
+                "shard index: empty or missing weight_map",
+            )
+        }
+    };
+
+    // key -> shard filename, with the filename grammar closed: a bare sibling file, never
+    // a path (a traversal inside a weight_map is an exfiltration primitive, not a layout).
+    let mut by_key: Vec<(&str, &str)> = Vec::with_capacity(weight_map.len());
+    let mut names: Vec<&str> = Vec::new();
+    for (k, v) in weight_map {
+        let name = as_str("shard index", "weight_map value", v)?;
+        if name.is_empty() || name.contains('/') || name.contains('\\') || name.contains("..") {
+            return refuse(
+                Code::KEY_GRAMMAR,
+                format!("shard index: shard name {name:?} is not a bare sibling filename"),
+            );
+        }
+        by_key.push((k.as_str(), name));
+        if !names.contains(&name) {
+            names.push(name);
+        }
+    }
+    names.sort_unstable();
+
+    let mut out = SourceHeader::default();
+    let mut raw = (index_bytes.len() as u64).to_le_bytes().to_vec();
+    raw.extend_from_slice(&index_bytes);
+    let mut virtual_base = 0u64;
+    for name in &names {
+        let path = dir.join(name);
+        let h = read_header(&path)?;
+        let mut f = File::open(&path).map_err(|e| io(format!("reopen {}", path.display()), e))?;
+        let mut hb = vec![0u8; h.header_bytes as usize + 8];
+        f.read_exact(&mut hb)
+            .map_err(|e| io(format!("reread header of {}", path.display()), e))?;
+        raw.extend_from_slice(&hb);
+
+        let region = h.file_len - h.data_start;
+        for t in &h.tensors {
+            let claimed = by_key.iter().find(|(k, _)| *k == t.key);
+            match claimed {
+                Some((_, n)) if n == name => {}
+                Some((_, n)) => {
+                    return refuse(
+                        Code::CARRIER_GEOMETRY,
+                        format!(
+                            "{}: carried by shard {name:?} but the weight_map names {n:?}",
+                            t.key
+                        ),
+                    )
+                }
+                None => {
+                    return refuse(
+                        Code::CARRIER_GEOMETRY,
+                        format!(
+                            "{}: carried by shard {name:?} but claimed by no weight_map key",
+                            t.key
+                        ),
+                    )
+                }
+            }
+            if out.tensors.iter().any(|o| o.key == t.key) {
+                return refuse(
+                    Code::CARRIER_GEOMETRY,
+                    format!("{}: appears in more than one shard", t.key),
+                );
+            }
+            out.tensors.push(SourceTensor {
+                key: t.key.clone(),
+                dtype: t.dtype,
+                shape: t.shape.clone(),
+                begin: virtual_base + t.begin,
+                end: virtual_base + t.end,
+            });
+        }
+        for (mk, mv) in &h.metadata {
+            match out.metadata.iter().find(|(k, _)| k == mk) {
+                Some((_, prev)) if prev == mv => {}
+                Some((_, prev)) => {
+                    return refuse(
+                        Code::CARRIER_GEOMETRY,
+                        format!(
+                            "shard metadata {mk:?} disagrees across shards ({prev:?} vs {mv:?})"
+                        ),
+                    )
+                }
+                None => out.metadata.push((mk.clone(), mv.clone())),
+            }
+        }
+        out.header_bytes += h.header_bytes;
+        out.shards.push(Shard {
+            path,
+            data_start: h.data_start,
+            virtual_base,
+            virtual_len: region,
+        });
+        virtual_base += region;
+    }
+
+    // The other half of exact cover: every weight_map key was found in some shard.
+    for (k, name) in &by_key {
+        if !out.tensors.iter().any(|t| t.key == *k) {
+            return refuse(
+                Code::CARRIER_GEOMETRY,
+                format!("{k}: named by the weight_map in shard {name:?} but carried by no shard"),
+            );
+        }
+    }
+    for (mk, mv) in index_meta {
+        if !out.metadata.iter().any(|(k, _)| *k == mk) {
+            out.metadata.push((mk, mv));
+        }
+    }
+    out.data_start = 0;
+    out.file_len = virtual_base;
+    Ok((out, raw))
+}
+
+/// Map one tensor of a header to (file path, absolute begin offset in that file). For a
+/// single-file carrier this is `data_start + begin` in the carrier itself; for a sharded
+/// one it finds the shard whose virtual window holds the run. A run crossing a shard
+/// boundary cannot exist by construction and refuses rather than being read wrong.
+pub fn resolve<'a>(
+    default_path: &'a Path,
+    h: &'a SourceHeader,
+    t: &SourceTensor,
+) -> Result<(&'a Path, u64)> {
+    if h.shards.is_empty() {
+        return Ok((default_path, h.data_start + t.begin));
+    }
+    for s in &h.shards {
+        if t.begin >= s.virtual_base && t.end <= s.virtual_base + s.virtual_len {
+            return Ok((&s.path, s.data_start + (t.begin - s.virtual_base)));
+        }
+    }
+    refuse(
+        Code::CARRIER_GEOMETRY,
+        format!(
+            "{}: virtual run [{}, {}) lies in no shard's window",
+            t.key, t.begin, t.end
+        ),
+    )
+}
+
 fn read_upto(f: &mut File, buf: &mut [u8]) -> Result<usize> {
     let mut n = 0;
     while n < buf.len() {
@@ -424,16 +643,13 @@ pub struct RunRegion {
 }
 
 impl RunRegion {
-    pub fn open(
-        path: &Path,
-        data_start: u64,
-        t: &SourceTensor,
-        d: crate::fill::Decomposition,
-    ) -> Result<RunRegion> {
+    /// `abs_base` is the tensor's ABSOLUTE begin offset in `path` — the caller resolves it
+    /// through `resolve`, so sharded and single-file carriers read through one body.
+    pub fn open(path: &Path, abs_base: u64, d: crate::fill::Decomposition) -> Result<RunRegion> {
         let f = File::open(path).map_err(|e| io(format!("open {}", path.display()), e))?;
         Ok(RunRegion {
             f,
-            base: data_start + t.begin,
+            base: abs_base,
             runs: d.runs.into_iter(),
             left: 0,
         })
@@ -459,14 +675,12 @@ impl Read for RunRegion {
 }
 
 impl Region {
-    pub fn open(path: &Path, data_start: u64, t: &SourceTensor) -> Result<Region> {
+    /// `abs_begin` is the tensor's ABSOLUTE begin offset in `path` (see `resolve`).
+    pub fn open(path: &Path, abs_begin: u64, nbytes: u64) -> Result<Region> {
         let mut f = File::open(path).map_err(|e| io(format!("open {}", path.display()), e))?;
-        f.seek(SeekFrom::Start(data_start + t.begin))
+        f.seek(SeekFrom::Start(abs_begin))
             .map_err(|e| io("seek to run", e))?;
-        Ok(Region {
-            f,
-            left: t.nbytes(),
-        })
+        Ok(Region { f, left: nbytes })
     }
 }
 
