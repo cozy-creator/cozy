@@ -34,7 +34,7 @@ func sectionRecovered() {
 		fmt.Println(tail(lv.c.WorkerLog(instance), 20))
 		return
 	}
-	firstSession := lv.c.Worker(instance).SessionID
+	firstSession := lv.c.Worker(instance).BootID
 	check("the worker is serving", firstSession != "", "session "+firstSession)
 
 	// 48 denoising steps: long enough that a kill lands INSIDE the attempt rather than
@@ -115,7 +115,7 @@ func sectionRecovered() {
 	check("Register carried the recovered attempt", ok, trimLog(line))
 	check("at the moment the obligation was taken, the ordinal gate REFUSED",
 		strings.Contains(line, "recovered attempt(s) still open"), trimLog(line))
-	secondSession := lv.c.Worker(instance).SessionID
+	secondSession := lv.c.Worker(instance).BootID
 	check("it is a NEW session over the SAME instance", secondSession != firstSession &&
 		secondSession != "", firstSession+" -> "+secondSession)
 

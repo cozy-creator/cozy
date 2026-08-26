@@ -113,41 +113,39 @@ func sectionArms() {
 		return
 	}
 	factsA := lv.c.Worker(instanceA)
-	check("worker A registered over raw protocol bytes", factsA.SessionID != "",
-		"session "+factsA.SessionID)
+	check("worker A claimed over raw protocol bytes", factsA.BootID != "",
+		"boot "+factsA.BootID)
 
-	head("register-level refusals")
-	// A worker this LocalService never spawned cannot register: the coordinator knows
-	// exactly which instances it launched.
+	head("claim-level refusals (#436: the owner dials, so identity is checked on ClaimAck)")
+	// A worker whose ClaimAck reports an instance this owner never spawned for that slot:
+	// the owner refuses to bind it and dispatches nothing.
 	ghost := fakeSpec("ghost", "7", "--arm", "idle", "--fake-instance", "ins-never-spawned")
 	_, _ = lv.c.StartWorker(ghost)
-	line, ok := waitEvent(lv, "WORKER_ID_MISMATCH", 10*time.Second)
-	check("an unspawned instance_id is refused at Register", ok, trimLog(line))
+	line, ok := waitEvent(lv, "REFUSING the claimed worker", 10*time.Second)
+	check("a foreign instance identity on ClaimAck is refused", ok, trimLog(line))
 
-	// The stale-supervisor arm, and it is not hypothetical: a supervisor from a PREVIOUS
-	// LocalService reconnecting on its backoff dials the same socket path and presents a
-	// perfectly valid instance_id — its own. Here a different process claims worker A's
-	// live slot; only the process this coordinator started may bind it, and only the
-	// kernel can say which one that is.
-	impostor := fakeSpec("impostor", "8", "--arm", "idle", "--fake-instance", instanceA)
-	_, _ = lv.c.StartWorker(impostor)
-	line, ok = waitEvent(lv, "STALE_SESSION", 10*time.Second)
-	check("a DIFFERENT process claiming a live instance is refused (SO_PEERCRED)", ok, trimLog(line))
-	check("worker A's session is untouched by the impostor",
-		lv.c.Worker(instanceA) != nil && lv.c.Worker(instanceA).SessionID == factsA.SessionID,
-		factsA.SessionID)
+	// The credential fence, flipped (#463): the OWNER presents the per-spawn bootstrap
+	// credential as Claim.proof and the WORKER verifies it constant-time. The badcred arm
+	// is a worker that refuses every proof — the typed refusal must surface here.
+	badcred := fakeSpec("badcred", "8", "--arm", "badcred")
+	_, _ = lv.c.StartWorker(badcred)
+	line, ok = waitEvent(lv, "Claim REFUSED", 10*time.Second)
+	check("the bootstrap-credential fence refuses typed at Claim", ok, trimLog(line))
+	check("worker A's claimed boot is untouched by the refusals",
+		lv.c.Worker(instanceA) != nil && lv.c.Worker(instanceA).BootID == factsA.BootID,
+		factsA.BootID)
 
-	// A worker registering under a release that is not the pinned one.
+	// A worker reporting a release that is not the pinned one.
 	badrel := fakeSpec("badrelease", "6", "--arm", "badrelease")
 	_, _ = lv.c.StartWorker(badrel)
 	line, ok = waitEvent(lv, "RELEASE_ID_MISMATCH", 10*time.Second)
 	check("a release that is not the pinned one is refused", ok, trimLog(line))
 
-	// A second live worker claiming a bound session_id.
-	collide := fakeSpec("collide", "5", "--arm", "idle", "--session", factsA.SessionID)
+	// A second live worker presenting a boot id already bound to worker A.
+	collide := fakeSpec("collide", "5", "--arm", "idle", "--session", factsA.BootID)
 	_, _ = lv.c.StartWorker(collide)
-	line, ok = waitEvent(lv, "SESSION_COLLISION", 10*time.Second)
-	check("two live workers cannot share a session_id", ok, trimLog(line))
+	line, ok = waitEvent(lv, "boot binding for", 10*time.Second)
+	check("two live workers cannot share a worker_boot_id", ok, trimLog(line))
 
 	head("attempt-level refusals: a held attempt, and a stranger's terminal")
 	bodyA := payload(map[string]any{"held": true})
@@ -161,7 +159,7 @@ func sectionArms() {
 	}
 	rowA, _ := lv.store.AttemptRow(requestA, int64(attemptA))
 	specHex := ""
-	if raw, err := canonical.Raw(rowA.ExecSpecDigest); err == nil {
+	if raw, err := canonical.Raw(rowA.InvocationDigest); err == nil {
 		specHex = hex.EncodeToString(raw)
 	}
 

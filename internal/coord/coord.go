@@ -1,9 +1,11 @@
-// Package coord is the LocalCoordinator: the scheduling role of the ONE long-lived
-// LocalService `cozy up` starts (cl-001). It is the worker protocol's SERVER — the
-// cozy-runtime supervisor dials IT, per the dial-toward-a-stable-address law — and the
-// authority for everything the runtime deliberately is not: which request runs, which
-// attempt ordinal exists, which devices a process may see, and which terminal/result
-// becomes visible.
+// Package coord is the local client's EMBEDDED ORCHESTRATOR (#455; the record-plane
+// owner of every worker this service runs): the scheduling role of the ONE long-lived
+// LocalService `cozy up` starts (cl-001). Since the 2026-08-25 re-landing (#436) the
+// WORKER hosts the protocol and this side DIALS it: each spawned worker binds its own
+// local socket, and this owner claims it (Claim -> ClaimAck -> snapshot -> SnapshotAck)
+// before any dispatch. It is the authority for everything the runtime deliberately is
+// not: which request runs, which attempt ordinal exists, which devices a process may
+// see, and which terminal/result becomes visible.
 //
 // What it does NOT do, structurally rather than by policy: it never executes a model,
 // never chooses a placement or a plan, never authorizes a reader from inside the
@@ -20,11 +22,8 @@ package coord
 import (
 	"fmt"
 	"io"
-	"net"
 	"sync"
 	"time"
-
-	"google.golang.org/grpc"
 
 	"github.com/cozy-creator/cozy-creator-v2/internal/config"
 	"github.com/cozy-creator/cozy-creator-v2/internal/exit"
@@ -39,8 +38,8 @@ type Options struct {
 	Cfg    config.Config
 	Layout home.Layout
 	Store  *records.Store
-	// Socket is the worker-protocol unix socket the supervisor dials. A stable address
-	// the worker dials TOWARD; the coordinator never dials a worker.
+	// Socket is RETAINED as the service's socket-directory hint (#436 made each WORKER
+	// bind its own socket under its root; this owner dials those). Unused for listening.
 	Socket string
 	// Yield is the GPU yield policy: smart | always | never.
 	Yield string
@@ -80,18 +79,18 @@ type Launcher interface {
 type Coordinator struct {
 	opt Options
 
-	grpc     *grpc.Server
-	listener net.Listener
-	// dialAddr is what workers are handed as `--socket`: the unix socket path, or the
-	// loopback address the Windows listener actually bound.
-	dialAddr string
+	// done closes when the service is closing; Serve blocks on it (the owner DIALS
+	// workers, so there is no server here to run, #436). closeOnce makes Close
+	// idempotent — harnesses close defensively and twice is not an event.
+	done      chan struct{}
+	closeOnce sync.Once
 
 	// drainMu serializes the dispatch queue's drain. It is separate from `mu` because a
 	// drain dispatches — it talks to the store and to a session — and holding the state
 	// lock across that would serialize every report behind one 4.8 GiB fill.
 	drainMu  sync.Mutex
 	mu       sync.Mutex
-	sessions map[string]*session // by session_id
+	sessions map[string]*session // by worker_boot_id (the live claimed stream per worker)
 	workers  map[string]*worker  // by instance_id
 	waits    map[string]*wait    // by request#attempt
 	// pending is the dispatch queue: requests that have no ready worker YET. A requeue
@@ -124,8 +123,8 @@ type wait struct {
 	err      *exit.Error
 }
 
-// Open builds the coordinator and binds its unix socket. Binding is where a second
-// LocalService on one root would fail, and it happens before any worker exists.
+// Open builds the coordinator. No listener binds here: the owner DIALS each worker's
+// own socket (#436); a second LocalService on one root fails on the service lock instead.
 func Open(opt Options) (*Coordinator, *exit.Error) {
 	if opt.Log == nil {
 		opt.Log = io.Discard
@@ -135,6 +134,7 @@ func Open(opt Options) (*Coordinator, *exit.Error) {
 	}
 	c := &Coordinator{
 		opt:      opt,
+		done:     make(chan struct{}),
 		sessions: map[string]*session{},
 		workers:  map[string]*worker{},
 		waits:    map[string]*wait{},
@@ -142,26 +142,19 @@ func Open(opt Options) (*Coordinator, *exit.Error) {
 		stalls:   map[string]time.Time{},
 		frames:   newFanout(),
 	}
-	// The transport is a platform fact (#449): a unix socket where the OS has one worth
-	// having, a loopback TCP port on Windows — `listenLocal` owns the difference and
-	// hands back the address workers dial.
-	ln, creds, dial, e := listenLocal(opt.Socket)
-	if e != nil {
-		return nil, e
-	}
-	c.listener = ln
-	c.dialAddr = dial
-	c.grpc = grpc.NewServer(grpc.Creds(creds))
-	pb.RegisterWorkerServer(c.grpc, &hub{c: c})
 	return c, nil
 }
 
-// Serve runs until Close. The coordinator is the SERVER; it never dials a worker.
-func (c *Coordinator) Serve() error { return c.grpc.Serve(c.listener) }
+// Serve blocks until Close. The owner dials workers; there is no server to run (#436),
+// and the blocking shape is kept so entrypoints stay one-line callers.
+func (c *Coordinator) Serve() error {
+	<-c.done
+	return nil
+}
 
-// Close stops every worker this service owns, then the server. A worker outliving its
-// launcher is exactly the class of bug the birth identity exists to catch, so `down`
-// stops what it started rather than orphaning it.
+// Close stops every worker this service owns. A worker outliving its launcher is exactly
+// the class of bug the birth identity exists to catch, so `down` stops what it started
+// rather than orphaning it.
 func (c *Coordinator) Close(grace time.Duration) {
 	c.mu.Lock()
 	c.closing = true
@@ -178,8 +171,7 @@ func (c *Coordinator) Close(grace time.Duration) {
 		}(w.instanceID)
 	}
 	wg.Wait()
-	c.grpc.Stop()
-	cleanupLocal(c.opt.Socket)
+	c.closeOnce.Do(func() { close(c.done) })
 }
 
 func (c *Coordinator) workerList() []*worker {

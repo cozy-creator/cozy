@@ -90,6 +90,10 @@ REVEAL_SITES = {
     "internal/secret/secret.go",
     "internal/hub/hub.go",
     "internal/api/credentials.go",
+    # The flip's one addition (#436/#463): the owner PRESENTS the credential to the
+    # worker as `Claim.proof` — the exact dual of the old metadata echo, and the only
+    # place the value leaves this process (over the worker's own channel).
+    "internal/coord/owner.go",
 }
 
 # The contract document's own tables use `| \`METHOD /path\` | scope |`, which the CAS

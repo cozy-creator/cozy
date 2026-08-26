@@ -121,7 +121,22 @@ type EndpointSpec struct {
 	// and `IsJob` is read from the spec rather than re-derived from what happens to be
 	// populated later.
 	Jobs []*JobPlan `json:"jobs,omitempty"`
+	// Remote attaches an ALREADY-RUNNING worker (a rented pod's TLS leg, cl-015/#445)
+	// instead of spawning one: the owner dials Addr with the cert at CACert pinned and
+	// presents Token as Claim.proof. Nil = the ordinary local spawn.
+	Remote *RemoteSpec `json:"remote,omitempty"`
 }
+
+// RemoteSpec is the dial triple for a worker this service did not spawn.
+type RemoteSpec struct {
+	Addr   string `json:"addr"`
+	Token  string `json:"token"`
+	CACert string `json:"ca_cert"` // path to the worker's pinned PEM
+}
+
+// WorkerID is what the Claim names as the expected worker identity; empty skips the
+// worker-side check (a spawned worker's identity is already ours by construction).
+func (s EndpointSpec) WorkerID() string { return "" }
 
 // IsJob answers the worker's mode.
 func (s EndpointSpec) IsJob() bool { return len(s.Jobs) > 0 }
@@ -169,14 +184,19 @@ type worker struct {
 	// reading that as "the worker died" turns a completed job into a failed request.
 	exitCode int
 	pid      int // the process THIS coordinator started; the only one that may register
-	// bootstrap is the per-spawn credential on transports with no kernel peer identity
-	// (Windows loopback); empty where SO_PEERCRED answers instead.
-	bootstrap   secret.Value
-	sessionID   string
-	incarnation uint64
-	epoch       uint64
-	intake      pb.IntakeState
-	ready       map[string]bool
+	// bootstrap is the per-spawn credential the worker verifies at Claim (#463's flip:
+	// the OWNER presents it as proof; the worker checks constant-time). Minted for every
+	// spawn on every platform — the flipped direction has no SO_PEERCRED to lean on.
+	bootstrap secret.Value
+	// deploymentID is the owner-minted routing key for the ONE deployment this worker
+	// hosts (#446). Routing, never identity.
+	deploymentID string
+	bootID       string
+	generation   uint64
+	credits      int
+	epoch        uint64
+	intake       pb.IntakeState
+	ready        map[string]bool
 	// jobsAvail is the worker's own last `jobs_available`. It is RESERVED at dispatch
 	// and corrected by the next Report: without the reservation one drain pass would
 	// hand two queued jobs to the same one-attempt worker on one stale reading, and
@@ -193,6 +213,11 @@ type worker struct {
 	// measurable: a worker that is loading for twenty minutes still reports every
 	// period, so "has not reported" is a stall and never merely "is slow".
 	lastReport time.Time
+	// spawned starts the silence clock BEFORE the first Report: a worker that never
+	// claims at all owes its first Report on the same cadence, and a wait with no clock
+	// until the first frame is a wait that cannot end (found by the flip: a pre-flip
+	// runtime wheel that cannot host left WaitReady spinning forever).
+	spawned time.Time
 }
 
 // StartWorker journals the device grant, stages the binding records, and spawns the
@@ -264,9 +289,23 @@ func (c *Coordinator) StartWorker(spec EndpointSpec) (string, *exit.Error) {
 	// coordinator. It is the runtime's PUBLIC launch grammar, so this is the only spelling
 	// the coordinator knows: `--socket`/`--out` are the path grants the verb translates
 	// into the supervisor's own `--hub`/`--root`.
+	// THE WORKER BINDS ITS OWN SOCKET (#436): a unix path under its run root (loopback
+	// `127.0.0.1:0` on Windows — proc shims pick it), published to run/control.addr for
+	// this owner to dial. `--socket` is the runtime serve verb's listen grant.
+	listen := filepath.Join(root, "run", "control.sock")
+	if bootstrapRequired {
+		// Windows has no unix socket worth having: the worker binds an ephemeral
+		// loopback port and publishes the real address (cr-020 item 4).
+		listen = "127.0.0.1:0"
+	}
+	if err := os.MkdirAll(filepath.Join(root, "run"), 0o755); err != nil {
+		return "", exit.Internalf("cannot create the worker run root: %s", err)
+	}
+	_ = os.Remove(filepath.Join(root, "run", "control.addr"))
+	_ = os.Remove(filepath.Join(root, "run", "control.sock"))
 	args := append([]string{}, spec.Args...)
 	args = append(args,
-		"--socket", c.dialAddr,
+		"--socket", listen,
 		"--out", filepath.Join(root, "run"),
 		"--instance-id", instanceID,
 		"--release-id", spec.ReleaseID,
@@ -284,14 +323,13 @@ func (c *Coordinator) StartWorker(spec EndpointSpec) (string, *exit.Error) {
 		"COZY_HOME=" + workerHome,
 		"CUDA_VISIBLE_DEVICES=" + strings.Join(spec.Devices, ","),
 	}, spec.Imposed...)
-	// Where the local transport carries no kernel peer identity (Windows loopback), the
-	// launcher mints a PER-SPAWN bootstrap credential and hands it over through the
-	// environment — the one channel only this child inherits. Register must echo it.
-	var bootstrap secret.Value
-	if bootstrapRequired {
-		bootstrap = secret.Mint()
-		imposed = append(imposed, secret.EnvEntry("COZY_BOOTSTRAP_CREDENTIAL", bootstrap))
-	}
+	// The launcher mints a PER-SPAWN bootstrap credential and hands it over through the
+	// environment — the one channel only this child inherits. The flip made it the
+	// controller-authority proof on EVERY platform (#463): this owner presents it as
+	// Claim.proof and the worker verifies constant-time; the unix socket's filesystem
+	// authority is belt, this is suspenders.
+	bootstrap := secret.Mint()
+	imposed = append(imposed, secret.EnvEntry("COZY_BOOTSTRAP_CREDENTIAL", bootstrap))
 	cmd.Env = c.opt.Cfg.Child(imposed...)
 	cmd.Stdout, cmd.Stderr = logFile, logFile
 	setProcessGroup(cmd)
@@ -299,7 +337,9 @@ func (c *Coordinator) StartWorker(spec EndpointSpec) (string, *exit.Error) {
 	w := &worker{
 		instanceID: instanceID, spec: spec, cmd: cmd, logPath: logPath,
 		home: workerHome, planIDs: planIDs, ready: map[string]bool{},
-		bootstrap: bootstrap,
+		bootstrap:    bootstrap,
+		deploymentID: "dpl-" + strings.TrimPrefix(instanceID, "ins-"),
+		spawned:      time.Now(),
 	}
 	// Registered BEFORE the process can dial: a worker that registers faster than its
 	// launcher can record it would be refused as an instance nobody spawned.
@@ -336,6 +376,9 @@ func (c *Coordinator) StartWorker(spec EndpointSpec) (string, *exit.Error) {
 	}
 	c.logf("worker %s spawned pid=%d devices=[%s] plans=%d",
 		instanceID, cmd.Process.Pid, strings.Join(spec.Devices, ","), len(planIDs))
+	// THE OWNER DIALS (#436): one goroutine owns this worker's claim conversation for
+	// the life of its process, re-claiming across stream drops.
+	go c.attach(w)
 
 	// A worker row outliving its process is exactly the sidecar bug this design refuses:
 	// the row holds a device grant, so it dies with the process that held it.
@@ -354,8 +397,8 @@ func (c *Coordinator) StartWorker(spec EndpointSpec) (string, *exit.Error) {
 			// learn the worker is gone and where its log is, and a row that vanishes
 			// silently is the same lie as a row that outlives its process.
 			w.exited = true
-			if w.sessionID != "" {
-				delete(c.sessions, w.sessionID)
+			if w.bootID != "" {
+				delete(c.sessions, w.bootID)
 			}
 		}
 		c.mu.Unlock()
@@ -421,6 +464,8 @@ func (c *Coordinator) WaitReady(instanceID, planID string) *exit.Error {
 			}
 			if !w.lastReport.IsZero() {
 				quiet = time.Since(w.lastReport)
+			} else if !w.spawned.IsZero() {
+				quiet = time.Since(w.spawned)
 			}
 		}
 		c.mu.Unlock()
@@ -494,18 +539,18 @@ func (c *Coordinator) WorkerLog(instanceID string) string {
 // WorkerFacts is what status renders: the protocol's own identities plus the OS
 // process-birth identity. There is no local synonym tuple.
 type WorkerFacts struct {
-	InstanceID  string   `json:"instance_id"`
-	Endpoint    string   `json:"endpoint"`
-	ReleaseID   string   `json:"release_id"`
-	SessionID   string   `json:"session_id"`
-	PID         int      `json:"pid"`
-	Incarnation uint64   `json:"executor_incarnation"`
-	Epoch       uint64   `json:"readiness_epoch"`
-	Revision    uint64   `json:"applied_revision"`
-	Intake      string   `json:"intake_state"`
-	Exited      bool     `json:"exited"`
-	Devices     []string `json:"devices"`
-	Ready       []string `json:"ready_plans"`
+	InstanceID string   `json:"instance_id"`
+	Endpoint   string   `json:"endpoint"`
+	ReleaseID  string   `json:"release_id"`
+	BootID     string   `json:"worker_boot_id"`
+	PID        int      `json:"pid"`
+	Generation uint64   `json:"executor_generation"`
+	Epoch      uint64   `json:"readiness_epoch"`
+	Revision   uint64   `json:"applied_revision"`
+	Intake     string   `json:"intake_state"`
+	Exited     bool     `json:"exited"`
+	Devices    []string `json:"devices"`
+	Ready      []string `json:"ready_plans"`
 	// The two OBSERVATIONS a waiter needs and could not see. `cozy warm` polls this
 	// listing and used to give up on a 10-minute clock, because the facts that decide
 	// — how long the worker has been silent, and how long it has been saying it cannot
@@ -541,7 +586,7 @@ func (c *Coordinator) Workers() []WorkerFacts {
 func factsOf(w *worker) WorkerFacts {
 	f := WorkerFacts{
 		InstanceID: w.instanceID, Endpoint: w.spec.Endpoint, ReleaseID: w.spec.ReleaseID,
-		SessionID: w.sessionID, Incarnation: w.incarnation, Epoch: w.epoch,
+		BootID: w.bootID, Generation: w.generation, Epoch: w.epoch,
 		Revision: w.revision, Intake: pb.IntakeState_name[int32(w.intake)],
 		Exited: w.exited, Devices: w.spec.Devices, Ready: []string{},
 		Fault: w.fault,
@@ -607,8 +652,8 @@ func (c *Coordinator) StopWorker(instanceID string, grace time.Duration) {
 	c.mu.Lock()
 	w.exited = true
 	delete(c.workers, instanceID)
-	if w.sessionID != "" {
-		delete(c.sessions, w.sessionID)
+	if w.bootID != "" {
+		delete(c.sessions, w.bootID)
 	}
 	c.mu.Unlock()
 	c.logf("worker %s stopped; its device grant is released", instanceID)

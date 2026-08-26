@@ -102,7 +102,7 @@ func sectionCanonical() {
 			check(name, false, "fixture missing: "+err.Error())
 			continue
 		}
-		_, rerr := canonical.Read(body, &pb.ExecutionSpec{})
+		_, rerr := canonical.Read(body, &pb.InvocationSpec{})
 		got := canonical.Code(rerr)
 		check(name+" refuses", got == expect[name],
 			fmt.Sprintf("%d B -> %s (wanted %s)", len(body), orNone(got), expect[name]))
@@ -111,14 +111,14 @@ func sectionCanonical() {
 	head("red arms: the document plane's own refusals, live")
 	// A document of the WRONG kind. The `format` tag is what domain-separates two
 	// documents with equal fields, and it is checked before any field is read.
-	specBytes, err := os.ReadFile(filepath.Join(fixtures, "canonical", "exec_spec_serving.json"))
-	must("reading exec_spec_serving.json", err)
+	specBytes, err := os.ReadFile(filepath.Join(fixtures, "canonical", "invocation_spec_serving.json"))
+	must("reading invocation_spec_serving.json", err)
 	_, rerr := canonical.Read(specBytes, &pb.TerminalBody{})
 	check("an ExecutionSpec read as a TerminalBody refuses", canonical.Code(rerr) == "unknown_format",
 		detailOf(rerr))
 
 	// A digest field that is not 32 bytes has no canonical spelling at all.
-	bad := &pb.TerminalBody{RequestId: "req-1", Attempt: 1, ExecSpecDigest: []byte{1, 2, 3}}
+	bad := &pb.TerminalBody{RequestId: "req-1", Attempt: 1, InvocationDigest: "sha256:short"}
 	_, _, cerr := canonical.Identity(bad)
 	check("a 3-byte *_digest refuses", canonical.Code(cerr) == "malformed_digest", detailOf(cerr))
 
@@ -129,18 +129,18 @@ func sectionCanonical() {
 	check("a non-ASCII field refuses", canonical.Code(cerr) == "non_ascii_field", detailOf(cerr))
 
 	// Truncated bytes are not a document.
-	_, rerr = canonical.Read(specBytes[:len(specBytes)-1], &pb.ExecutionSpec{})
+	_, rerr = canonical.Read(specBytes[:len(specBytes)-1], &pb.InvocationSpec{})
 	check("truncated canonical bytes refuse", rerr != nil, detailOf(rerr))
 }
 
 func messageFor(name string) proto.Message {
 	switch name {
-	case "cozy.worker.v1.ExecutionSpec":
-		return &pb.ExecutionSpec{}
+	case "cozy.worker.v1.InvocationSpec":
+		return &pb.InvocationSpec{}
 	case "cozy.worker.v1.TerminalBody":
 		return &pb.TerminalBody{}
-	case "cozy.worker.v1.PurgeBody":
-		return &pb.PurgeBody{}
+	case "cozy.worker.v1.DeploymentSet":
+		return &pb.DeploymentSet{}
 	}
 	return nil
 }

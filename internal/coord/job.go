@@ -79,33 +79,34 @@ func (c *Coordinator) sendJobDirective(s *session, w *worker) {
 	c.mu.Lock()
 	w.revision = rev
 	c.mu.Unlock()
-	s.send(&pb.CoordinatorMessage{Msg: &pb.CoordinatorMessage_Directive{
-		Directive: &pb.Directive{
-			SessionId: s.id, Revision: rev, WireMinor: pb.WireMinor,
-			Posture: pb.Posture_POSTURE_ACCEPTING,
-			Mode: &pb.Directive_Job{Job: &pb.JobDirective{
-				BuildId:         w.spec.ReleaseID,
-				JobDescriptorId: plan.DescriptorID,
-				ResourceCaps: &pb.ResourceCaps{
-					GpuRequired: gpuCountOf(plan) > 0,
-					MaxRssBytes: uint64(plan.RSSCap),
-				},
-				// The DIRECTIVE's publication contract is the worker-level authorization;
-				// the per-attempt one rides the ExecutionSpec, because a worker that
-				// drains a queue publishes into a different scratch repo per request.
-				PublicationContract: &pb.PublicationContract{
-					GrantId: home.ScratchRepo("local", "queue"),
-					Outputs: outputSpecs(plan.Outputs),
-				},
-				// TERMINAL AND RECLAIM, everywhere. A job worker is one immutable build
-				// running one bounded attempt; deep queueing is the coordinator's dispatch
-				// queue, not a warm worker (audit-adopted, 2026-08-26).
-				ReclaimOnTerminal: true,
-				GpuCount:          uint32(gpuCountOf(plan)),
-			}},
-		}}})
+	d := &pb.Directive{
+		Revision: rev, WireMinor: pb.WireMinor,
+		Posture: pb.Posture_POSTURE_ACCEPTING,
+		Mode: &pb.Directive_Job{Job: &pb.JobDirective{
+			BuildId:         w.spec.ReleaseID,
+			JobDescriptorId: plan.DescriptorID,
+			ResourceCaps: &pb.ResourceCaps{
+				DeviceRequired: gpuCountOf(plan) > 0,
+				MaxRssBytes:    uint64(plan.RSSCap),
+			},
+			// The DIRECTIVE's publication contract is the worker-level authorization;
+			// the per-attempt one rides the InvocationSpec, because a worker that
+			// drains a queue publishes into a different scratch repo per request.
+			PublicationContract: &pb.PublicationContract{
+				GrantId: home.ScratchRepo("local", "queue"),
+				Outputs: outputBindings(plan.Outputs, maxOutputBytes),
+			},
+			// TERMINAL AND RECLAIM, everywhere. A job worker is one immutable build
+			// running one bounded attempt; deep queueing is the coordinator's dispatch
+			// queue, not a warm worker (audit-adopted, 2026-08-26).
+			ReclaimOnTerminal: true,
+			DeviceCount:       uint32(gpuCountOf(plan)),
+		}},
+	}
+	d.OwnerEpoch, d.ControlGeneration, d.WorkerBootId = ownerEpoch, s.generation, s.bootID
+	s.send(&pb.OwnerFrame{Msg: &pb.OwnerFrame_Directive{Directive: d}})
 	c.logf("Directive revision=%d posture=accepting JOB %s (%s) -> %s",
-		rev, plan.Function, shortDigest(plan.DescriptorID), s.id)
+		rev, plan.Function, shortDigest(plan.DescriptorID), s.bootID)
 }
 
 func gpuCountOf(p *JobPlan) int64 {
@@ -113,14 +114,6 @@ func gpuCountOf(p *JobPlan) int64 {
 		return n
 	}
 	return 0
-}
-
-func outputSpecs(ids []string) []*pb.OutputSpec {
-	out := make([]*pb.OutputSpec, 0, len(ids))
-	for _, id := range ids {
-		out = append(out, &pb.OutputSpec{OutputId: id, MaxBytes: maxOutputBytes})
-	}
-	return out
 }
 
 const maxOutputBytes = uint64(64) << 20
@@ -178,13 +171,8 @@ func (c *Coordinator) jobGrant(req records.Request, attempt uint64) (*pb.Deliver
 		// `promote` moves the bytes across once the terminal is verified, and that is the
 		// event that ends this grant's usefulness. A clock never knew about it.
 		ExpiresAtUnix: 0,
-		Inputs: []*pb.InputLocation{{
-			Digest:   canonical.Digest(req.Payload),
-			Url:      "file://" + payloadPath,
-			Length:   uint64(len(req.Payload)),
-			InputId:  "payload",
-			KindMime: "application/json",
-		}},
+		// ACCESS ONLY (#439): identities live in the InvocationSpec's bindings.
+		Inputs: []*pb.InputAccess{{InputId: "payload", Url: "file://" + payloadPath}},
 	}
 	// THE INPUT TREES. A tree's bytes are not re-hashed at the grant: a tree is a
 	// materialized TensorFS snapshot and its verification is the store's own verified
@@ -199,9 +187,7 @@ func (c *Coordinator) jobGrant(req records.Request, attempt uint64) (*pb.Deliver
 		if err != nil {
 			return nil, "", exit.Internalf("cannot resolve the input tree %s: %s", dir, err)
 		}
-		g.Inputs = append(g.Inputs, &pb.InputLocation{
-			Url: "file://" + abs, InputId: "tree:" + ref, KindMime: "inode/directory",
-		})
+		g.Inputs = append(g.Inputs, &pb.InputAccess{Url: "file://" + abs, InputId: "tree:" + ref})
 	}
 	for _, id := range splitList(req.Outputs) {
 		dest, e := publicationDest(root, id)
@@ -211,9 +197,7 @@ func (c *Coordinator) jobGrant(req records.Request, attempt uint64) (*pb.Deliver
 		if err := os.MkdirAll(filepath.Dir(dest), 0o755); err != nil {
 			return nil, "", exit.Internalf("cannot create %s: %s", filepath.Dir(dest), err)
 		}
-		g.Outputs = append(g.Outputs, &pb.OutputDestination{
-			OutputId: id, Url: "file://" + dest, MaxBytes: maxOutputBytes,
-		})
+		g.Outputs = append(g.Outputs, &pb.OutputAccess{OutputId: id, Url: "file://" + dest})
 	}
 	return g, root, nil
 }
@@ -324,7 +308,7 @@ func (c *Coordinator) onCheckpoint(s *session, r *pb.JobCheckpointRequest) {
 	if e != nil {
 		c.logf("checkpoint %s/%s of %s#%d NOT journaled: %s",
 			r.OperationKey, r.LogicalKey, r.RequestId, r.Attempt, e.Message)
-		s.send(checkpointReceipt(r, "", pb.CheckpointOutcome_CHECKPOINT_OUTCOME_REFUSED,
+		s.send(checkpointReceipt(s, r, "", pb.CheckpointOutcome_CHECKPOINT_OUTCOME_REFUSED,
 			pb.CheckpointFaultCode_CHECKPOINT_FAULT_CODE_UNKNOWN_ATTEMPT, e.Message))
 		return
 	}
@@ -332,26 +316,25 @@ func (c *Coordinator) onCheckpoint(s *session, r *pb.JobCheckpointRequest) {
 		r.RequestId, r.Attempt, outcome, shortDigest(digest))
 	switch outcome {
 	case "CONFLICT":
-		s.send(checkpointReceipt(r, row.ReceiptID, pb.CheckpointOutcome_CHECKPOINT_OUTCOME_CONFLICT,
+		s.send(checkpointReceipt(s, r, row.ReceiptID, pb.CheckpointOutcome_CHECKPOINT_OUTCOME_CONFLICT,
 			pb.CheckpointFaultCode_CHECKPOINT_FAULT_CODE_IDENTITY_CONFLICT,
 			"this identity is already journaled at "+shortDigest(row.ContentDigest)))
 	default:
-		s.send(checkpointReceipt(r, row.ReceiptID,
+		s.send(checkpointReceipt(s, r, row.ReceiptID,
 			pb.CheckpointOutcome_CHECKPOINT_OUTCOME_RECORDED, 0, ""))
 	}
 }
 
-func checkpointReceipt(r *pb.JobCheckpointRequest, receiptID string,
-	outcome pb.CheckpointOutcome, code pb.CheckpointFaultCode, detail string) *pb.CoordinatorMessage {
+func checkpointReceipt(s *session, r *pb.JobCheckpointRequest, receiptID string,
+	outcome pb.CheckpointOutcome, code pb.CheckpointFaultCode, detail string) *pb.OwnerFrame {
 	receipt := &pb.JobCheckpointReceipt{
-		SessionId: r.SessionId, ExecutorIncarnation: r.ExecutorIncarnation,
 		RequestId: r.RequestId, Attempt: r.Attempt, OperationKey: r.OperationKey,
 		LogicalKey: r.LogicalKey, ContentDigest: r.ContentDigest,
 		ReceiptId: receiptID, Outcome: outcome,
 	}
+	receipt.OwnerEpoch, receipt.ControlGeneration, receipt.WorkerBootId = ownerEpoch, s.generation, s.bootID
 	if detail != "" {
 		receipt.Fault = &pb.CheckpointFault{Code: code, Detail: detail}
 	}
-	return &pb.CoordinatorMessage{Msg: &pb.CoordinatorMessage_CheckpointReceipt{
-		CheckpointReceipt: receipt}}
+	return &pb.OwnerFrame{Msg: &pb.OwnerFrame_CheckpointReceipt{CheckpointReceipt: receipt}}
 }

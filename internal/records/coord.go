@@ -101,8 +101,8 @@ CREATE TABLE IF NOT EXISTS attempts (
   attempt_key      TEXT    NOT NULL UNIQUE,
   instance_id      TEXT    NOT NULL REFERENCES worker_processes(instance_id),
   session_id       TEXT    NOT NULL,
-  exec_spec_digest TEXT    NOT NULL,
-  exec_spec        BLOB    NOT NULL,
+  invocation_digest TEXT    NOT NULL,
+  invocation        BLOB    NOT NULL,
   state            TEXT    NOT NULL,
   plan_digest      TEXT    NOT NULL DEFAULT '',
   construction     TEXT    NOT NULL DEFAULT '',
@@ -568,30 +568,30 @@ func short(s string) string {
 // Attempt is one execution of one spec. `AttemptKey` is the opaque id triage is served
 // by; nothing about it is a path.
 type Attempt struct {
-	RequestID      string
-	Attempt        int64
-	AttemptKey     string
-	InstanceID     string
-	SessionID      string
-	ExecSpecDigest string
-	ExecSpec       []byte
-	State          string // dispatching | accepted | recovered_open | terminal | closed
-	PlanDigest     string
-	Construction   string
-	PlanSummary    string
-	TerminalID     string
-	TerminalDigest string
-	TerminalStatus string
-	TerminalCause  string
-	SafeMessage    string
-	TriageSubject  string
-	TriageDigest   string
-	TriageLength   int64
-	TriagePath     string
-	TerminalBody   []byte
-	DispatchedAt   string
-	AcceptedAt     string
-	ClosedAt       string
+	RequestID           string
+	Attempt             int64
+	AttemptKey          string
+	InstanceID          string
+	SessionID           string
+	InvocationDigest    string
+	InvocationCanonical []byte
+	State               string // dispatching | accepted | recovered_open | terminal | closed
+	PlanDigest          string
+	Construction        string
+	PlanSummary         string
+	TerminalID          string
+	TerminalDigest      string
+	TerminalStatus      string
+	TerminalCause       string
+	SafeMessage         string
+	TriageSubject       string
+	TriageDigest        string
+	TriageLength        int64
+	TriagePath          string
+	TerminalBody        []byte
+	DispatchedAt        string
+	AcceptedAt          string
+	ClosedAt            string
 }
 
 // ordinalLaws is the ordinal-minting law, read INSIDE the caller's transaction. It refuses
@@ -667,10 +667,10 @@ func (s *Store) Dispatch(a Attempt) (int64, *exit.Error) {
 	}
 	a.Attempt = ordinal
 	if _, err := tx.Exec(`INSERT INTO attempts(request_id,attempt,attempt_key,instance_id,
-		session_id,exec_spec_digest,exec_spec,state,dispatched_at)
+		session_id,invocation_digest,invocation,state,dispatched_at)
 		VALUES(?,?,?,?,?,?,?,'dispatching',?)`,
 		a.RequestID, a.Attempt, a.AttemptKey, a.InstanceID, a.SessionID,
-		a.ExecSpecDigest, a.ExecSpec, a.DispatchedAt); err != nil {
+		a.InvocationDigest, a.InvocationCanonical, a.DispatchedAt); err != nil {
 		return 0, exit.New(exit.Conflict, "cannot journal attempt %s#%d: %s", a.RequestID, a.Attempt, err).
 			WithRemedy("an attempt ordinal is written once")
 	}
@@ -720,16 +720,16 @@ type Output struct {
 
 // Terminal is what a worker journaled and the coordinator is about to make authoritative.
 type Terminal struct {
-	RequestID      string
-	Attempt        int64
-	SessionID      string
-	ExecSpecDigest string
-	TerminalID     string
-	TerminalDigest string
-	Status         string
-	Cause          string
-	SafeMessage    string
-	TriageSubject  string
+	RequestID        string
+	Attempt          int64
+	SessionID        string
+	InvocationDigest string
+	TerminalID       string
+	TerminalDigest   string
+	Status           string
+	Cause            string
+	SafeMessage      string
+	TriageSubject    string
 	// TriageDigest/TriageLength/TriagePath are cl-006's PERSISTENCE of the worker's
 	// bundle: the bytes are copied out of the worker root and verified against the
 	// terminal's own TriageBundleRef before this transaction runs. A one-shot run
@@ -784,7 +784,7 @@ func (s *Store) AcceptTerminal(t Terminal) (applied bool, e *exit.Error) {
 	defer tx.Rollback()
 
 	var state, digest, assignedSession, assignedSpec string
-	err = tx.QueryRow(`SELECT state, terminal_digest, session_id, exec_spec_digest FROM attempts
+	err = tx.QueryRow(`SELECT state, terminal_digest, session_id, invocation_digest FROM attempts
 		WHERE request_id=? AND attempt=?`, t.RequestID, t.Attempt).
 		Scan(&state, &digest, &assignedSession, &assignedSpec)
 	if errors.Is(err, sql.ErrNoRows) {
@@ -795,10 +795,10 @@ func (s *Store) AcceptTerminal(t Terminal) (applied bool, e *exit.Error) {
 	if err != nil {
 		return false, exit.Internalf("cannot read attempt %s#%d: %s", t.RequestID, t.Attempt, err)
 	}
-	if assignedSpec != t.ExecSpecDigest {
+	if assignedSpec != t.InvocationDigest {
 		return false, exit.New(exit.Validation,
 			"terminal for %s#%d refused: it closes %s, the assignment is %s",
-			t.RequestID, t.Attempt, short(t.ExecSpecDigest), short(assignedSpec))
+			t.RequestID, t.Attempt, short(t.InvocationDigest), short(assignedSpec))
 	}
 	if assignedSession != t.SessionID {
 		return false, exit.New(exit.Conflict,
@@ -947,7 +947,7 @@ func (s *Store) OpenAttemptsOf(instanceID string) ([]Attempt, *exit.Error) {
 
 func (s *Store) attemptsWhere(where string, args ...any) ([]Attempt, *exit.Error) {
 	rows, err := s.db.Query(`SELECT request_id,attempt,attempt_key,instance_id,session_id,
-		exec_spec_digest,exec_spec,state,plan_digest,construction,plan_summary,terminal_id,
+		invocation_digest,invocation,state,plan_digest,construction,plan_summary,terminal_id,
 		terminal_digest,terminal_status,terminal_cause,safe_message,triage_subject,
 		triage_digest,triage_length,triage_path,
 		COALESCE(terminal_body,x''),dispatched_at,accepted_at,closed_at
@@ -960,7 +960,7 @@ func (s *Store) attemptsWhere(where string, args ...any) ([]Attempt, *exit.Error
 	for rows.Next() {
 		var a Attempt
 		if err := rows.Scan(&a.RequestID, &a.Attempt, &a.AttemptKey, &a.InstanceID, &a.SessionID,
-			&a.ExecSpecDigest, &a.ExecSpec, &a.State, &a.PlanDigest, &a.Construction,
+			&a.InvocationDigest, &a.InvocationCanonical, &a.State, &a.PlanDigest, &a.Construction,
 			&a.PlanSummary, &a.TerminalID, &a.TerminalDigest, &a.TerminalStatus, &a.TerminalCause,
 			&a.SafeMessage, &a.TriageSubject, &a.TriageDigest, &a.TriageLength, &a.TriagePath,
 			&a.TerminalBody, &a.DispatchedAt, &a.AcceptedAt, &a.ClosedAt); err != nil {

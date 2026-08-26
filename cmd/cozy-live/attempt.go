@@ -47,7 +47,7 @@ func sectionAttempt() {
 	boot := time.Since(bootStart)
 	facts := lv.c.Worker(instance)
 	check("READY", true, fmt.Sprintf("%s, session %s incarnation %d epoch %d revision %d",
-		ms(boot), facts.SessionID, facts.Incarnation, facts.Epoch, facts.Revision))
+		ms(boot), facts.BootID, facts.Generation, facts.Epoch, facts.Revision))
 	check("the worker advertises the plan this coordinator minted", len(facts.Ready) == 1 &&
 		facts.Ready[0] == planID, planID)
 

@@ -377,13 +377,18 @@ func (c *Coordinator) dispatch(req records.Request) (uint64, *exit.Error) {
 		return 0, e
 	}
 
-	// The ExecutionSpec DOCUMENT. Its key set is closed and is exactly this message's
-	// fields: no human model ref, no service class, no local extension has a slot.
-	spec := &pb.ExecutionSpec{
+	// The InvocationSpec DOCUMENT (#439): everything that gives the invocation meaning —
+	// the payload digest, the ORDERED input identities, the output contracts, the
+	// deadline — lives INSIDE the digest. Its key set is closed: no human model ref, no
+	// service class, no local extension has a slot.
+	spec := &pb.InvocationSpec{
 		EndpointReleaseId: w.spec.ReleaseID,
 		ImageDigest:       c.opt.ImageDigest,
 		ConfigDigest:      c.opt.ConfigDigest,
-		Spec: &pb.ExecutionSpec_Serving{Serving: &pb.ServingExecutionSpec{
+		PayloadDigest:     spellOf(canonical.Digest(req.Payload)),
+		Inputs:            inputBindings(req),
+		Outputs:           outputBindings(splitList(req.Outputs), c.maxOutputBytes()),
+		Spec: &pb.InvocationSpec_Serving{Serving: &pb.ServingInvocationSpec{
 			EntrypointBindingPlanId: req.PlanID,
 			// With no adapters the binding IS the plan, so the two ids are equal by
 			// construction rather than by copying a value around.
@@ -394,18 +399,18 @@ func (c *Coordinator) dispatch(req records.Request) (uint64, *exit.Error) {
 		// ONE mode names ONE spec. The per-attempt publication contract names THIS
 		// request's scratch repo, which is why a queue-serving worker can hold one
 		// directive and still publish each attempt into its own place.
-		spec.Spec = &pb.ExecutionSpec_Job{Job: &pb.JobExecutionSpec{
+		spec.Spec = &pb.InvocationSpec_Job{Job: &pb.JobInvocationSpec{
 			BuildId:         w.spec.ReleaseID,
 			JobDescriptorId: req.PlanID,
 			PublicationContract: &pb.PublicationContract{
 				GrantId: home.ScratchRepo(req.Org, req.ID),
-				Outputs: outputSpecs(splitList(req.Outputs)),
+				Outputs: outputBindings(splitList(req.Outputs), maxOutputBytes),
 			},
 		}}
 	}
 	canonicalBytes, digest, err := canonical.Identity(spec)
 	if err != nil {
-		return 0, exit.Internalf("cannot mint the ExecutionSpec document: %s", err)
+		return 0, exit.Internalf("cannot mint the InvocationSpec document: %s", err)
 	}
 	spelled, _ := canonical.Spell(digest)
 
@@ -415,7 +420,7 @@ func (c *Coordinator) dispatch(req records.Request) (uint64, *exit.Error) {
 	// `drain()` goroutines minted 1 and 2 for one request across the old split call).
 	ordinal, e := c.opt.Store.Dispatch(records.Attempt{
 		RequestID: req.ID, InstanceID: w.instanceID,
-		SessionID: w.sessionID, ExecSpecDigest: spelled, ExecSpec: canonicalBytes,
+		SessionID: w.bootID, InvocationDigest: spelled, InvocationCanonical: canonicalBytes,
 	})
 	if e != nil {
 		return 0, e
@@ -423,9 +428,8 @@ func (c *Coordinator) dispatch(req records.Request) (uint64, *exit.Error) {
 	attempt := uint64(ordinal)
 
 	// The grant names this attempt's own directory, so it is built after the ordinal is
-	// real. A failure here is a broken local filesystem under our own root: the journaled
-	// row stands as the record of a dispatch that could not be granted, and the request
-	// answers with the error rather than silently retrying into the same disk.
+	// real. ACCESS ONLY (#439): urls under the ids the spec declares — a refresh can
+	// re-derive access and structurally cannot substitute meaning.
 	//
 	// A JOB's grant names the DURABLE PUBLICATION ROOT instead, and the destination fence
 	// runs HERE — before StartAttempt, so an escaping destination is never a capability
@@ -434,19 +438,72 @@ func (c *Coordinator) dispatch(req records.Request) (uint64, *exit.Error) {
 	if e != nil {
 		return 0, e
 	}
+	grant.InvocationDigest = digest
 
-	sess.send(&pb.CoordinatorMessage{Msg: &pb.CoordinatorMessage_StartAttempt{
-		StartAttempt: &pb.StartAttempt{
-			SessionId: w.sessionID, ExecutorIncarnation: w.incarnation,
-			RequestId: req.ID, Attempt: attempt, ExecSpecDigest: digest,
-			Grant: grant, ExecSpecCanonical: canonicalBytes,
-		}}})
+	deploymentID := w.deploymentID
+	if req.IsJob() {
+		deploymentID = "" // job mode routes by the directive, not a deployment (#446)
+	}
+	start := &pb.StartAttempt{
+		RequestId: req.ID, Attempt: attempt, InvocationDigest: digest,
+		Grant: grant, InvocationCanonical: canonicalBytes, DeploymentId: deploymentID,
+	}
+	start.OwnerEpoch, start.ControlGeneration, start.WorkerBootId = ownerEpoch, sess.generation, sess.bootID
+	sess.send(&pb.OwnerFrame{Msg: &pb.OwnerFrame_StartAttempt{StartAttempt: start}})
 	c.logf("StartAttempt %s#%d spec=%s (%d canonical bytes) outputs=%s on %s",
 		req.ID, attempt, shortDigest(spelled), len(canonicalBytes), req.Outputs, w.instanceID)
 	c.emit(req.ID, "request.dispatched", attempt, map[string]any{
-		"instance_id": w.instanceID, "exec_spec_digest": spelled,
+		"instance_id": w.instanceID, "invocation_digest": spelled,
 	})
 	return attempt, nil
+}
+
+func (c *Coordinator) maxOutputBytes() uint64 {
+	maxBytes := c.opt.MaxOutputMiB
+	if maxBytes <= 0 {
+		maxBytes = 64
+	}
+	return uint64(maxBytes) << 20
+}
+
+func spellOf(raw []byte) string {
+	s, err := canonical.Spell(raw)
+	if err != nil {
+		return ""
+	}
+	return s
+}
+
+// inputBindings is the spec's ORDERED input identity list (#439): the payload always,
+// plus a job's materialized trees (their verification is the store's own, so no digest).
+func inputBindings(req records.Request) []*pb.InputBinding {
+	rows := []*pb.InputBinding{{
+		InputId:  "payload",
+		Digest:   spellOf(canonical.Digest(req.Payload)),
+		Length:   uint64(len(req.Payload)),
+		KindMime: "application/json",
+		Order:    0,
+	}}
+	order := uint32(1)
+	for _, pair := range splitList(req.Trees) {
+		ref, _, ok := strings.Cut(pair, "=")
+		if !ok {
+			continue
+		}
+		rows = append(rows, &pb.InputBinding{
+			InputId: "tree:" + ref, KindMime: "inode/directory", Order: order,
+		})
+		order++
+	}
+	return rows
+}
+
+func outputBindings(ids []string, maxBytes uint64) []*pb.OutputBinding {
+	out := make([]*pb.OutputBinding, 0, len(ids))
+	for _, id := range ids {
+		out = append(out, &pb.OutputBinding{OutputId: id, MaxBytes: maxBytes})
+	}
+	return out
 }
 
 // pick resolves a worker that advertises this binding as READY. Compatibility and
@@ -458,7 +515,7 @@ func (c *Coordinator) pick(planID string) (*worker, *session, *exit.Error) {
 		if w.exited || w.intake != pb.IntakeState_INTAKE_STATE_READY || !w.ready[planID] {
 			continue
 		}
-		if sess := c.sessions[w.sessionID]; sess != nil {
+		if sess := c.sessions[w.bootID]; sess != nil {
 			if w.spec.IsJob() {
 				// RESERVE the slot this dispatch is about to consume. The worker's own
 				// next Report is still the authority — this only stops ONE drain pass
@@ -467,11 +524,19 @@ func (c *Coordinator) pick(planID string) (*worker, *session, *exit.Error) {
 				if w.jobsAvail <= 0 {
 					w.ready[planID] = false
 				}
+				return w, sess, nil
 			}
+			// SERVING dispatches against ADMISSION CREDITS (#441): the worker's small
+			// accepted window, reserved here and corrected by its next Report. Spent
+			// credits park the request in THIS owner's deep queue — the queue seat.
+			if w.credits <= 0 {
+				continue
+			}
+			w.credits--
 			return w, sess, nil
 		}
 	}
-	return nil, nil, exit.Unavailablef("no registered worker advertises %s as ready", planID)
+	return nil, nil, exit.Unavailablef("no claimed worker advertises %s as dispatchable", planID)
 }
 
 // grantFor picks the lane's grant. The two differ in exactly one thing that matters —
@@ -499,10 +564,6 @@ func (c *Coordinator) grant(requestID string, attempt uint64, req records.Reques
 	if err := os.WriteFile(payloadPath, req.Payload, 0o644); err != nil {
 		return nil, exit.Internalf("cannot stage the request payload: %s", err)
 	}
-	maxBytes := c.opt.MaxOutputMiB
-	if maxBytes <= 0 {
-		maxBytes = 64
-	}
 	g := &pb.DeliveryGrant{
 		FileBaseUrl: "file://" + dir,
 		// NO EXPIRY, because this host mints no deadline to derive one from. A grant lasts
@@ -512,22 +573,17 @@ func (c *Coordinator) grant(requestID string, attempt uint64, req records.Reques
 		// therefore a ceiling on how long a local attempt could be, invented at the one
 		// place nobody was asked. The worker reads 0 as "does not expire" (`grants.expired`).
 		ExpiresAtUnix: 0,
-		Inputs: []*pb.InputLocation{{
-			Digest:   canonical.Digest(req.Payload),
-			Url:      "file://" + payloadPath,
-			Length:   uint64(len(req.Payload)),
-			InputId:  "payload",
-			KindMime: "application/json",
-		}},
+		// ACCESS ONLY (#439): the identities (digest, length, media kind) live in the
+		// spec's bindings, inside the invocation digest.
+		Inputs: []*pb.InputAccess{{InputId: "payload", Url: "file://" + payloadPath}},
 	}
 	for _, id := range strings.Split(req.Outputs, ",") {
 		if id == "" {
 			continue
 		}
-		g.Outputs = append(g.Outputs, &pb.OutputDestination{
+		g.Outputs = append(g.Outputs, &pb.OutputAccess{
 			OutputId: id,
 			Url:      "file://" + filepath.Join(dir, id),
-			MaxBytes: uint64(maxBytes) << 20,
 		})
 	}
 	return g, nil
@@ -623,7 +679,7 @@ func (c *Coordinator) Cancel(requestID string, attempt uint64, reason pb.CancelR
 	if row == nil {
 		return exit.New(exit.NotFound, "no attempt %s#%d to cancel", requestID, attempt)
 	}
-	raw, err := canonical.Raw(row.ExecSpecDigest)
+	raw, err := canonical.Raw(row.InvocationDigest)
 	if err != nil {
 		return exit.Internalf("the journaled spec digest is unreadable: %s", err)
 	}
@@ -632,14 +688,14 @@ func (c *Coordinator) Cancel(requestID string, attempt uint64, reason pb.CancelR
 	w := c.workers[row.InstanceID]
 	c.mu.Unlock()
 	if sess == nil || w == nil {
-		return exit.Unavailablef("the session that holds %s#%d is gone", requestID, attempt)
+		return exit.Unavailablef("the stream that holds %s#%d is gone", requestID, attempt)
 	}
-	sess.send(&pb.CoordinatorMessage{Msg: &pb.CoordinatorMessage_CancelAttempt{
-		CancelAttempt: &pb.CancelAttempt{
-			SessionId: row.SessionID, ExecutorIncarnation: w.incarnation,
-			RequestId: requestID, Attempt: attempt, Reason: reason,
-			GraceMs: graceMS, ExecSpecDigest: raw,
-		}}})
+	cancel := &pb.CancelAttempt{
+		RequestId: requestID, Attempt: attempt, Reason: reason,
+		GraceMs: graceMS, InvocationDigest: raw,
+	}
+	cancel.OwnerEpoch, cancel.ControlGeneration, cancel.WorkerBootId = ownerEpoch, sess.generation, sess.bootID
+	sess.send(&pb.OwnerFrame{Msg: &pb.OwnerFrame_CancelAttempt{CancelAttempt: cancel}})
 	c.logf("CancelAttempt %s#%d reason=%s", requestID, attempt,
 		pb.CancelReason_name[int32(reason)])
 	return nil

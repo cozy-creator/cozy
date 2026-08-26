@@ -8,256 +8,24 @@ import (
 	"strings"
 	"time"
 
-	"google.golang.org/grpc/metadata"
-	"google.golang.org/protobuf/types/known/emptypb"
-
 	"github.com/cozy-creator/cozy-creator-v2/internal/canonical"
 	"github.com/cozy-creator/cozy-creator-v2/internal/exit"
 	"github.com/cozy-creator/cozy-creator-v2/internal/records"
 	pb "github.com/cozy-creator/cozy-creator-v2/protocol/cozy/worker/v1"
 )
 
-// hub is the coordinator side of the `cozy.worker.v1` service. The worker is the gRPC
-// CLIENT and dials this socket; terminal authority lives only on Control.
-type hub struct {
-	pb.UnimplementedWorkerServer
-	c *Coordinator
-}
-
-type session struct {
-	id         string
-	instanceID string
-	out        chan *pb.CoordinatorMessage
-}
-
-func (s *session) send(m *pb.CoordinatorMessage) {
-	defer func() { _ = recover() }() // a closed stream is not an error worth a panic
-	s.out <- m
-}
-
-// Control is the durable bidi stream: one causal order, one fence. Durable messages are
-// never shed to backpressure.
-func (h *hub) Control(stream pb.Worker_ControlServer) error {
-	var s *session
-	defer func() {
-		if s != nil {
-			h.c.dropSession(s)
-		}
-	}()
-	for {
-		msg, err := stream.Recv()
-		if err != nil {
-			return nil
-		}
-		switch m := msg.Msg.(type) {
-		case *pb.WorkerMessage_Register:
-			if s != nil {
-				h.c.logf("REFUSED: a second Register on a bound stream (session %s)", s.id)
-				continue
-			}
-			s = h.c.onRegister(stream, m.Register, peerPID(stream.Context()))
-		case *pb.WorkerMessage_BootFailure:
-			h.c.logf("BOOT FAILURE from %s: %s (%s)", m.BootFailure.InstanceId,
-				pb.BootFailureReason_name[int32(m.BootFailure.Reason)], m.BootFailure.Detail)
-			return nil
-		case *pb.WorkerMessage_Report:
-			if h.c.fenced(s, m.Report.SessionId, m.Report.ExecutorIncarnation, true) {
-				continue
-			}
-			h.c.onReport(s, m.Report)
-		case *pb.WorkerMessage_AttemptAccepted:
-			if h.c.fenced(s, m.AttemptAccepted.SessionId, m.AttemptAccepted.ExecutorIncarnation, false) {
-				continue
-			}
-			h.c.onAccepted(s, m.AttemptAccepted)
-		case *pb.WorkerMessage_AttemptTerminal:
-			if h.c.fenced(s, m.AttemptTerminal.SessionId, m.AttemptTerminal.ExecutorIncarnation, false) {
-				continue
-			}
-			h.c.onTerminal(s, m.AttemptTerminal)
-		case *pb.WorkerMessage_CheckpointRequest:
-			r := m.CheckpointRequest
-			if h.c.fenced(s, r.SessionId, r.ExecutorIncarnation, false) {
-				continue
-			}
-			// A SERVING attempt has no checkpoint lane, and the refusal is typed rather
-			// than silence. The mode is the worker's own, read off the spec this service
-			// launched it under.
-			if !h.c.jobMode(s) {
-				s.send(checkpointReceipt(r, "", pb.CheckpointOutcome_CHECKPOINT_OUTCOME_REFUSED,
-					pb.CheckpointFaultCode_CHECKPOINT_FAULT_CODE_NOT_JOB_MODE,
-					"this worker is in serving mode; the checkpoint lane is the job lane's"))
-				continue
-			}
-			h.c.onCheckpoint(s, r)
-		}
-	}
-}
-
-// StreamProgress is the one LOSSY lane: sequence-numbered, gaps visible, and structurally
-// incapable of blocking Control or carrying terminal authority.
-func (h *hub) StreamProgress(stream pb.Worker_StreamProgressServer) error {
-	for {
-		p, err := stream.Recv()
-		if err != nil {
-			return stream.SendAndClose(&emptypb.Empty{})
-		}
-		// The lossy lane's ONE consumer: the live fanout cl-006 serves as
-		// `request.progress`. It never touches the authority and never blocks this
-		// reader — a slow SSE client sheds frames, it does not slow the protocol.
-		h.c.frames.publish(frameOf(p))
-	}
-}
-
-// fenced evaluates the fence tuple in its fixed order and refuses on the first mismatch,
-// BEFORE any body field is interpreted (02 §0).
-func (c *Coordinator) fenced(s *session, sessionID string, incarnation uint64, advanceOK bool) bool {
-	if s == nil {
-		c.logf("DROPPED: a message arrived on a stream that never registered")
-		return true
-	}
-	if sessionID != s.id {
-		c.logf("DROPPED: session %q is not this stream's bound session %q", sessionID, s.id)
-		return true
-	}
-	c.mu.Lock()
-	w := c.workers[s.instanceID]
-	current := uint64(0)
-	if w != nil {
-		current = w.incarnation
-	}
-	c.mu.Unlock()
-	if incarnation < current {
-		c.logf("DROPPED: stale executor_incarnation %d (current %d)", incarnation, current)
-		return true
-	}
-	if incarnation > current && !advanceOK {
-		c.logf("DROPPED: future executor_incarnation %d on a non-Report message", incarnation)
-		return true
-	}
-	return false
-}
+// The owner-side FRAME HANDLERS for one claimed stream (owner.go runs the conversation;
+// #436 flipped the dial direction, so the old worker-dials hub/Register machinery is
+// gone — ClaimAck/snapshot are its successors, handled in owner.go).
 
 func (c *Coordinator) dropSession(s *session) {
 	c.mu.Lock()
-	if c.sessions[s.id] == s {
-		delete(c.sessions, s.id)
+	if c.sessions[s.bootID] == s {
+		delete(c.sessions, s.bootID)
 	}
 	c.mu.Unlock()
-	close(s.out)
-	c.logf("control stream for session %s closed", s.id)
-}
-
-// --------------------------------------------------------------------------- register
-
-func (c *Coordinator) onRegister(stream pb.Worker_ControlServer, r *pb.Register, pid int32) *session {
-	s := &session{id: r.SessionId, instanceID: r.InstanceId, out: make(chan *pb.CoordinatorMessage, 32)}
-	go func() {
-		for m := range s.out {
-			if err := stream.Send(m); err != nil {
-				return
-			}
-		}
-	}()
-
-	c.mu.Lock()
-	w := c.workers[r.InstanceId]
-	c.mu.Unlock()
-	reject := func(reason pb.RegisterRejection, why string) *session {
-		c.logf("Register REFUSED (%s): %s", pb.RegisterRejection_name[int32(reason)], why)
-		s.send(&pb.CoordinatorMessage{Msg: &pb.CoordinatorMessage_RegisterAck{
-			RegisterAck: &pb.RegisterAck{
-				SessionId: r.SessionId, ExecutorIncarnation: r.ExecutorIncarnation,
-				WireMinor: pb.WireMinor, Accepted: false, Rejection: reason,
-			}}})
-		return s
-	}
-	if w == nil {
-		return reject(pb.RegisterRejection_REGISTER_REJECTION_WORKER_ID_MISMATCH,
-			"instance "+r.InstanceId+" was never spawned by this LocalService")
-	}
-	if w.spec.ReleaseID != "" && r.ReleaseId != w.spec.ReleaseID {
-		return reject(pb.RegisterRejection_REGISTER_REJECTION_RELEASE_ID_MISMATCH,
-			"release "+r.ReleaseId+" is not the pinned "+w.spec.ReleaseID)
-	}
-	// The kernel-attested pid. A supervisor from a PREVIOUS LocalService, still
-	// reconnecting on its backoff, dials the same socket path and presents a perfectly
-	// valid instance_id — its own. Only the process this coordinator started may bind
-	// this slot, and only the kernel can say which one that is.
-	c.mu.Lock()
-	want, bound := w.pid, w.sessionID
-	c.mu.Unlock()
-	if pid != 0 && want != 0 && int(pid) != want {
-		return reject(pb.RegisterRejection_REGISTER_REJECTION_STALE_SESSION,
-			fmt.Sprintf("pid %d is not the process this LocalService started for %s (pid %d)",
-				pid, r.InstanceId, want))
-	}
-	// Where the transport carries no kernel identity (Windows loopback), the per-spawn
-	// bootstrap credential is the substitute: only the child this launcher handed it to
-	// can echo it. The value never appears in a log — a mismatch is reported as a fact.
-	if w.bootstrap.Present() {
-		got := ""
-		if md, ok := metadata.FromIncomingContext(stream.Context()); ok {
-			if vals := md.Get("cozy-bootstrap"); len(vals) > 0 {
-				got = vals[0]
-			}
-		}
-		if !w.bootstrap.Equal(got) {
-			return reject(pb.RegisterRejection_REGISTER_REJECTION_STALE_SESSION,
-				"the bootstrap credential for "+r.InstanceId+" was absent or wrong")
-		}
-	}
-	if bound != "" && bound != r.SessionId {
-		return reject(pb.RegisterRejection_REGISTER_REJECTION_SESSION_COLLISION,
-			"instance "+r.InstanceId+" already has the live session "+bound)
-	}
-	if e := c.opt.Store.BindSession(r.InstanceId, r.SessionId, int64(r.ExecutorIncarnation)); e != nil {
-		return reject(pb.RegisterRejection_REGISTER_REJECTION_SESSION_COLLISION, e.Message)
-	}
-
-	c.mu.Lock()
-	c.sessions[r.SessionId] = s
-	w.sessionID = r.SessionId
-	w.incarnation = r.ExecutorIncarnation
-	c.mu.Unlock()
-
-	c.logf("Register session=%s instance=%s incarnation=%d minor=%d gpu=%q recovered=%d",
-		r.SessionId, r.InstanceId, r.ExecutorIncarnation, r.WireMinor,
-		r.Resources.GetGpuName(), len(r.RecoveredAttempts))
-
-	// THE LAW (02 §6.2). The recovered journal is reported FIRST and is an OPEN
-	// OBLIGATION from this moment: records.Recover puts each attempt in `recovered_open`,
-	// and NextOrdinal refuses for those request ids until each is closed by its own
-	// journaled terminal. Absence is never manufactured by a fresh session_id.
-	for _, ra := range r.RecoveredAttempts {
-		if e := c.opt.Store.Recover(ra.RequestId, int64(ra.Attempt), r.SessionId); e != nil {
-			c.logf("recovered attempt %s#%d REFUSED: %s", ra.RequestId, ra.Attempt, e.Message)
-			continue
-		}
-		// Assert the obligation at the moment it is taken: ask this coordinator's own
-		// ordinal gate what it now answers for that request id. The refusal is the law
-		// as an OBSERVED fact rather than an inference from the row's state, and it is
-		// recorded here because the window it holds for is milliseconds wide.
-		_, blocked := c.opt.Store.NextOrdinal(ra.RequestId)
-		c.logf("recovered attempt %s#%d (%s) is an OPEN OBLIGATION — the ordinal gate now "+
-			"refuses: %s", ra.RequestId, ra.Attempt,
-			pb.AttemptState_name[int32(ra.State)], briefOf(blocked))
-	}
-
-	s.send(&pb.CoordinatorMessage{Msg: &pb.CoordinatorMessage_RegisterAck{
-		RegisterAck: &pb.RegisterAck{
-			SessionId: r.SessionId, ExecutorIncarnation: r.ExecutorIncarnation,
-			WireMinor: pb.WireMinor, Accepted: true,
-		}}})
-	// ONE MODE, chosen from the spec this service launched. Sending the mode the worker
-	// is in — rather than setting both members of the Directive's oneof — is the same
-	// lesson cr-009's `fabd6fc` recorded on the Report side.
-	if w.spec.IsJob() {
-		c.sendJobDirective(s, w)
-	} else {
-		c.sendDirective(s, w)
-	}
-	return s
+	// The out channel is closed by `converse`'s own defer — one owner, one close.
+	c.logf("control stream for boot %s closed", s.bootID)
 }
 
 // jobMode answers whether the worker behind this session was launched in job mode.
@@ -271,64 +39,94 @@ func (c *Coordinator) jobMode(s *session) bool {
 	return w != nil && w.spec.IsJob()
 }
 
-// sendDirective issues the full-replace Directive. It carries NO credential: a local
-// grant is a CAS root and an output directory, and there is no token to mint.
+// sendDirective issues the full-replace Directive: the digest-addressed DeploymentSet
+// (#446), one Deployment at launch (the len<=1 clamp is the worker's).
 func (c *Coordinator) sendDirective(s *session, w *worker) {
 	rev := c.nextRevision()
 	c.mu.Lock()
 	w.revision = rev
+	deploymentID := w.deploymentID
 	c.mu.Unlock()
-	s.send(&pb.CoordinatorMessage{Msg: &pb.CoordinatorMessage_Directive{
-		Directive: &pb.Directive{
-			SessionId: s.id, Revision: rev, WireMinor: pb.WireMinor,
-			Posture: pb.Posture_POSTURE_ACCEPTING,
-			Mode: &pb.Directive_Serving{Serving: &pb.ServingDirective{
-				EndpointReleaseId:        w.spec.ReleaseID,
-				EntrypointBindingPlanIds: w.planIDs,
-			}},
-		}}})
-	c.logf("Directive revision=%d posture=accepting plans=%d -> %s", rev, len(w.planIDs), s.id)
+	set := &pb.DeploymentSet{Deployments: []*pb.Deployment{{
+		DeploymentId:             deploymentID,
+		EndpointReleaseId:        w.spec.ReleaseID,
+		EntrypointBindingPlanIds: w.planIDs,
+	}}}
+	// THE ONE-DIGESTER RULE (#454): this owner authors BOTH the structured set and its
+	// canonical document digest; the worker echoes the digest as the set's NAME.
+	_, setDigest, err := canonical.Identity(set)
+	if err != nil {
+		c.logf("cannot mint the DeploymentSet document for %s: %s", w.instanceID, err)
+		return
+	}
+	d := &pb.Directive{
+		Revision: rev, WireMinor: pb.WireMinor,
+		Posture: pb.Posture_POSTURE_ACCEPTING,
+		Mode: &pb.Directive_DeploymentSet{DeploymentSet: &pb.DeploymentSetDirective{
+			SetDigest: setDigest, Set: set,
+		}},
+	}
+	d.OwnerEpoch, d.ControlGeneration, d.WorkerBootId = ownerEpoch, s.generation, s.bootID
+	s.send(&pb.OwnerFrame{Msg: &pb.OwnerFrame_Directive{Directive: d}})
+	c.logf("Directive revision=%d posture=accepting deployment=%s plans=%d -> %s",
+		rev, deploymentID, len(w.planIDs), s.bootID)
 }
 
 // --------------------------------------------------------------------------- report
 
 func (c *Coordinator) onReport(s *session, r *pb.Report) {
+	// Serving truth is PER-DEPLOYMENT (#446): the one hosted deployment's status carries
+	// readiness, the executor generation and the ADMISSION CREDITS this owner dispatches
+	// against (#441 — the deep queue stays here; the worker holds a small window).
+	var status *pb.DeploymentStatus
 	c.mu.Lock()
 	w := c.workers[s.instanceID]
-	if w != nil && w.sessionID != s.id {
-		// A superseded session's Report is a fact about a worker that no longer exists.
+	if w != nil && w.bootID != s.bootID {
+		// A superseded stream's Report is a fact about a worker that no longer exists.
 		c.mu.Unlock()
-		c.logf("DROPPED: Report from superseded session %s (the live one is %s)", s.id, w.sessionID)
+		c.logf("DROPPED: Report from superseded boot %s (the live one is %s)", s.bootID, w.bootID)
 		return
 	}
 	if w != nil {
 		w.lastReport = time.Now()
-		w.incarnation = r.ExecutorIncarnation
-		w.epoch = r.ReadinessEpoch
-		w.intake = r.IntakeState
 		w.revision = r.AppliedRevision
 		ready := map[string]bool{}
 		if w.spec.IsJob() {
-			// THE JOB LANE READS JOB CAPACITY. `jobs_available` is the worker's own
-			// answer to "can I take an attempt right now" — law 8 in the job lane, so a
-			// worker with a live attempt reports zero and its queue simply waits. The
-			// coordinator dispatches by the SAME map the serving lane uses, keyed on the
-			// job descriptor id, so there is one placement path and not two.
+			// THE JOB LANE READS JOB CAPACITY. `jobs_available` IS the job credit (#441).
+			w.intake = r.IntakeState
 			avail := r.GetJobCapacity().GetJobsAvailable()
 			w.jobsAvail = int(avail)
 			for _, p := range w.spec.Jobs {
 				ready[p.DescriptorID] = avail > 0
 			}
 		} else {
-			for _, id := range r.GetServingCapacity().GetReadyEntrypointBindingPlanIds() {
-				ready[id] = true
+			for _, d := range r.Deployments {
+				if d.DeploymentId == w.deploymentID {
+					status = d
+				}
+			}
+			if status != nil {
+				w.intake = status.IntakeState
+				w.generation = status.ExecutorGeneration
+				w.epoch = status.ReadinessEpoch
+				w.credits = int(status.AttemptCredits)
+				for _, id := range status.ReadyEntrypointBindingPlanIds {
+					ready[id] = true
+				}
+				for _, f := range status.Faults {
+					w.fault = fmt.Sprintf("%s: %s", f.Reason, brief(f.Detail, 240))
+				}
+			} else {
+				// No deployment yet (the directive has not applied): machine intake is
+				// what there is, and nothing is ready.
+				w.intake = r.IntakeState
 			}
 		}
 		w.ready = ready
 		// A worker that says ERROR is timed from the FIRST time it said so, and the clock
 		// resets the moment it stops. Its reason is the worker's own — this side echoes
 		// the fault it reported and never composes one.
-		if r.IntakeState == pb.IntakeState_INTAKE_STATE_ERROR {
+		if w.intake == pb.IntakeState_INTAKE_STATE_ERROR {
 			if w.errorSince.IsZero() {
 				w.errorSince = time.Now()
 			}
@@ -339,9 +137,13 @@ func (c *Coordinator) onReport(s *session, r *pb.Report) {
 			w.fault = fmt.Sprintf("%s: %s", f.Reason, brief(f.Detail, 240))
 		}
 	}
+	generation := int64(0)
+	if w != nil {
+		generation = int64(w.generation)
+	}
 	c.mu.Unlock()
-	_ = c.opt.Store.ReportWorker(s.id, pb.IntakeState_name[int32(r.IntakeState)],
-		int64(r.AppliedRevision), int64(r.ReadinessEpoch), int64(r.ExecutorIncarnation))
+	_ = c.opt.Store.ReportWorker(s.bootID, pb.IntakeState_name[int32(r.IntakeState)],
+		int64(r.AppliedRevision), int64(0), generation)
 	for _, f := range r.Faults {
 		c.logf("worker fault %s on %s: %s (%s)", pb.FaultKind_name[int32(f.Kind)],
 			f.Subject, f.Reason, f.Detail)
@@ -349,21 +151,33 @@ func (c *Coordinator) onReport(s *session, r *pb.Report) {
 	for _, a := range r.Activity {
 		c.logf("activity seq=%d %s: %s", a.Seq, a.Kind, a.Step)
 	}
-	if r.IntakeState == pb.IntakeState_INTAKE_STATE_READY {
+	ready := r.IntakeState == pb.IntakeState_INTAKE_STATE_READY
+	if status != nil {
+		ready = status.IntakeState == pb.IntakeState_INTAKE_STATE_READY
+	}
+	if ready {
 		go c.drain()
 	}
 	// A Report is the only thing a STUCK worker keeps producing, so it is where the stall
 	// watchdog runs.
 	go c.checkStall()
 	if r.GetJobCapacity() != nil {
-		c.logf("Report intake=%s revision=%d epoch=%d jobs_available=%d jobs_in_flight=%d",
-			pb.IntakeState_name[int32(r.IntakeState)], r.AppliedRevision, r.ReadinessEpoch,
+		c.logf("Report intake=%s revision=%d jobs_available=%d jobs_in_flight=%d",
+			pb.IntakeState_name[int32(r.IntakeState)], r.AppliedRevision,
 			r.GetJobCapacity().GetJobsAvailable(), r.GetJobCapacity().GetJobsInFlight())
 		return
 	}
-	c.logf("Report intake=%s revision=%d epoch=%d ready=%d in_flight=%d",
-		pb.IntakeState_name[int32(r.IntakeState)], r.AppliedRevision, r.ReadinessEpoch,
-		len(r.GetServingCapacity().GetReadyEntrypointBindingPlanIds()), len(r.ActiveAttempts))
+	if status != nil {
+		c.logf("Report intake=%s revision=%d deployment=%s epoch=%d generation=%d credits=%d "+
+			"ready=%d in_flight=%d",
+			pb.IntakeState_name[int32(status.IntakeState)], r.AppliedRevision,
+			status.DeploymentId, status.ReadinessEpoch, status.ExecutorGeneration,
+			status.AttemptCredits, len(status.ReadyEntrypointBindingPlanIds),
+			len(r.ActiveAttempts))
+		return
+	}
+	c.logf("Report intake=%s revision=%d (no deployment applied yet)",
+		pb.IntakeState_name[int32(r.IntakeState)], r.AppliedRevision)
 }
 
 // --------------------------------------------------------------------------- accepted
@@ -374,21 +188,22 @@ func (c *Coordinator) onAccepted(s *session, a *pb.AttemptAccepted) {
 		c.logf("AttemptAccepted for %s#%d REFUSED: no such assigned attempt", a.RequestId, a.Attempt)
 		return
 	}
-	spelled, err := canonical.Spell(a.ExecSpecDigest)
-	if err != nil || spelled != row.ExecSpecDigest {
+	spelled, err := canonical.Spell(a.InvocationDigest)
+	if err != nil || spelled != row.InvocationDigest {
 		c.logf("AttemptAccepted for %s#%d REFUSED: it echoes %v, the assignment is %s",
-			a.RequestId, a.Attempt, spelled, row.ExecSpecDigest)
+			a.RequestId, a.Attempt, spelled, row.InvocationDigest)
 		return
 	}
 	planDigest, _ := canonical.Spell(a.PlanDigest)
 	construction, _ := canonical.Spell(a.ModelConstructionDigest)
 	summary := planSummary(a.Plan)
-	if e := c.opt.Store.Accepted(a.RequestId, int64(a.Attempt), s.id, planDigest, construction, summary); e != nil {
+	if e := c.opt.Store.Accepted(a.RequestId, int64(a.Attempt), s.bootID, planDigest, construction, summary); e != nil {
 		c.logf("AttemptAccepted for %s#%d REFUSED: %s", a.RequestId, a.Attempt, e.Message)
 		return
 	}
-	c.logf("AttemptAccepted %s#%d plan=%s construction=%s [%s]",
-		a.RequestId, a.Attempt, shortDigest(planDigest), shortDigest(construction), summary)
+	c.logf("AttemptAccepted %s#%d deployment=%s generation=%d plan=%s construction=%s [%s]",
+		a.RequestId, a.Attempt, a.DeploymentId, a.ExecutorGeneration,
+		shortDigest(planDigest), shortDigest(construction), summary)
 	c.emit(a.RequestId, "request.accepted", a.Attempt, map[string]any{
 		"plan_digest": planDigest, "construction_digest": construction, "plan": summary,
 	})
@@ -402,9 +217,9 @@ func planSummary(p *pb.AttemptPlanSummary) string {
 	if p == nil {
 		return ""
 	}
-	return fmt.Sprintf("%s/%s %s %s vram=%dB host=%dB",
+	return fmt.Sprintf("%s/%s %s %s device=%dB host=%dB",
 		p.Delivery, p.Materialization, p.ComputeDtype, p.Placement, //cozy:allow the protocol's own AttemptPlanSummary field, transported and rendered — never chosen here
-		p.ReservedVramBytes, p.ReservedHostBytes)
+		p.ReservedDeviceMemoryBytes, p.ReservedHostBytes)
 }
 
 // --------------------------------------------------------------------------- terminal
@@ -430,12 +245,12 @@ func (c *Coordinator) onTerminal(s *session, t *pb.AttemptTerminal) {
 		return
 	}
 	// 3. The routing copies must agree with the DOCUMENT, which is authoritative.
-	spelledSpec, _ := canonical.Spell(t.ExecSpecDigest)
+	spelledSpec, _ := canonical.Spell(t.InvocationDigest)
 	if doc.Str("request_id") != t.RequestId || uint64(doc.Int("attempt")) != t.Attempt ||
-		doc.Str("exec_spec_digest") != spelledSpec {
+		doc.Str("invocation_digest") != spelledSpec {
 		refuse("envelope/document divergence: envelope %s#%d/%s, document %s#%d/%s",
 			t.RequestId, t.Attempt, shortDigest(spelledSpec),
-			doc.Str("request_id"), doc.Int("attempt"), shortDigest(doc.Str("exec_spec_digest")))
+			doc.Str("request_id"), doc.Int("attempt"), shortDigest(doc.Str("invocation_digest")))
 		return
 	}
 
@@ -483,8 +298,8 @@ func (c *Coordinator) onTerminal(s *session, t *pb.AttemptTerminal) {
 
 	began := time.Now()
 	applied, e := c.opt.Store.AcceptTerminal(records.Terminal{
-		RequestID: t.RequestId, Attempt: int64(t.Attempt), SessionID: s.id,
-		ExecSpecDigest: spelledSpec, TerminalID: t.TerminalId,
+		RequestID: t.RequestId, Attempt: int64(t.Attempt), SessionID: s.bootID,
+		InvocationDigest: spelledSpec, TerminalID: t.TerminalId,
 		TerminalDigest: shortNone(t.TerminalDigest), Status: status, Cause: cause,
 		SafeMessage:   doc.Str("safe_message"),
 		TriageSubject: triage.Subject, TriageDigest: triage.Digest,
@@ -516,12 +331,12 @@ func (c *Coordinator) onTerminal(s *session, t *pb.AttemptTerminal) {
 
 	// The ack follows the COMMIT. A crash before this line replays; a crash after it is
 	// a closed attempt either way.
-	s.send(&pb.CoordinatorMessage{Msg: &pb.CoordinatorMessage_TerminalAck{
-		TerminalAck: &pb.TerminalAck{
-			SessionId: s.id, ExecutorIncarnation: t.ExecutorIncarnation,
-			RequestId: t.RequestId, Attempt: t.Attempt, ExecSpecDigest: t.ExecSpecDigest,
-			TerminalId: t.TerminalId, TerminalDigest: t.TerminalDigest,
-		}}})
+	ack := &pb.TerminalAck{
+		RequestId: t.RequestId, Attempt: t.Attempt, InvocationDigest: t.InvocationDigest,
+		TerminalId: t.TerminalId, TerminalDigest: t.TerminalDigest,
+	}
+	ack.OwnerEpoch, ack.ControlGeneration, ack.WorkerBootId = ownerEpoch, s.generation, s.bootID
+	s.send(&pb.OwnerFrame{Msg: &pb.OwnerFrame_TerminalAck{TerminalAck: ack}})
 	_ = c.opt.Store.Closed(t.RequestId, int64(t.Attempt))
 	outcome := terminalError(status, cause, doc.Str("safe_message"))
 	c.waitFor(key(t.RequestId, t.Attempt)).markClosed(outcome)
