@@ -1302,13 +1302,13 @@ pub fn cmd_golden() -> ExitCode {
             }
 
             // The planted wrong geometry: the SAME source read as one contiguous group.
-            if let convert::Xform::QkvSplit {
-                groups,
-                shares,
-                take,
-                unit_bytes,
-            } = &x
             {
+                let convert::Xform::QkvSplit {
+                    groups,
+                    shares,
+                    take,
+                    unit_bytes,
+                } = &x;
                 if *groups == 1 {
                     continue;
                 }

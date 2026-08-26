@@ -180,21 +180,6 @@ impl PublishGrant {
             ("x-amz-checksum-sha256".to_string(), self.checksum_sha256()),
         ]
     }
-
-    pub fn expired(&self, now: u64) -> Result<()> {
-        if self.expires_at <= now {
-            return refuse(
-                Code::ROOT_EXPIRED,
-                format!(
-                    "grant for {} expired at {} — an expired grant is a typed REPLAN against \
-                     the declared closure, never a retry and never a failure",
-                    self.object.id(),
-                    self.expires_at
-                ),
-            );
-        }
-        Ok(())
-    }
 }
 
 impl Doc for PublishGrant {

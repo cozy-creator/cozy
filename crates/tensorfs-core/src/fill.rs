@@ -107,16 +107,6 @@ pub enum Xform {
         /// Bytes in one share unit — derived from the source run, never assumed.
         unit_bytes: u64,
     },
-    /// Two fused halves in source order, emitted swapped.
-    ///
-    /// NOT BANKED, and deliberately not wired to any converter. The v1 quarry contains NO
-    /// gate/up ordering code anywhere (swept for gate_up, swiglu, gate_proj, chunk(2), w1/w3
-    /// across all four repos: zero hits) — H3's fused `mlp.fc1 [28672, 5376]` is carried by
-    /// v1 as a PURE RENAME whose half order is inherited from diffusers and never stated.
-    /// The geometry is here because it is trivial and the refusal path needs something to
-    /// name; the ORDER fact is not evidence anyone has, and inventing one would be the
-    /// canonically-encoded fabrication this repo deleted an H3 example over. tfs-010.
-    HalfSwap { unit_bytes: u64 },
 }
 
 impl Xform {
@@ -129,7 +119,6 @@ impl Xform {
                 unit_bytes,
                 ..
             } => groups * (shares[0] + shares[1] + shares[2]) * unit_bytes,
-            Xform::HalfSwap { unit_bytes } => 2 * unit_bytes,
         }
     }
 
@@ -142,7 +131,6 @@ impl Xform {
                 take,
                 unit_bytes,
             } => groups * shares[*take as usize] * unit_bytes,
-            Xform::HalfSwap { unit_bytes } => 2 * unit_bytes,
         }
     }
 
@@ -171,18 +159,6 @@ impl Xform {
                         .collect(),
                 )
             }
-            Xform::HalfSwap { unit_bytes } => Decomposition::of(vec![
-                Run {
-                    src_off: *unit_bytes,
-                    dest_off: 0,
-                    len: *unit_bytes,
-                },
-                Run {
-                    src_off: 0,
-                    dest_off: *unit_bytes,
-                    len: *unit_bytes,
-                },
-            ]),
         }
     }
 
@@ -263,13 +239,6 @@ impl Xform {
                     }
                 }
                 Ok(back == src)
-            }
-            Xform::HalfSwap { .. } => {
-                let mut once = Vec::new();
-                self.apply(src, &mut once)?;
-                let mut twice = Vec::new();
-                self.apply(&once, &mut twice)?;
-                Ok(twice == src)
             }
         }
     }

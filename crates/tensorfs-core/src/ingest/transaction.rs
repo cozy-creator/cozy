@@ -333,9 +333,6 @@ pub fn execute(
         };
         let sid = spec.object_id();
         if closure.get(&sid).is_none() {
-            if let Some(v) = &spec.vectors {
-                let _ = v;
-            }
             enc_refs.push(spec.object_ref());
             closure.insert(spec.clone());
         }
