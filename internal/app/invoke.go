@@ -128,11 +128,13 @@ func waitReady(c *localapi.Client, instance string) (localapi.Worker, *exit.Erro
 			if w.Dispatchable() {
 				return w, nil
 			}
-			if w.Fault != "" && w.ErrorForMS == 0 {
-				// A refusal this owner recorded at claim time carries no error clock: it is
-				// a settled verdict, not a state the worker might leave.
+			if w.Refusal != "" {
+				// A refusal this host recorded at claim time is a SETTLED verdict, not a
+				// state the worker might leave — so it answers now instead of after eight
+				// missed report periods. A worker FAULT is the other thing entirely and is
+				// timed below: a placement can hold one and still activate.
 				return localapi.Worker{}, exit.New(exit.Conflict,
-					"this host refused the worker at that address: %s", w.Fault).
+					"this host refused the worker at that address: %s", w.Refusal).
 					WithNext("cozy logs <org/endpoint>")
 			}
 			if w.QuietMS > silent {

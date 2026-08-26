@@ -231,11 +231,15 @@ func sectionAPI() {
 		return
 	}
 	boot := time.Since(bootStart)
-	check("the worker reports READY through the API", true, ms(boot))
+	check("the worker's placement reports DISPATCHABLE through the API", true, ms(boot))
 
+	// IDEMPOTENT, and it SAYS SO rather than leaving a client to infer it (#484): the
+	// route answers `change: none` for a worker already hosting this placement, which is a
+	// different answer from `placement_added` on a live worker that gained one — and a
+	// `resident: true` boolean was true of both.
 	again := svc.call("POST", "/v1/local/workers", map[string]any{"endpoint": "cozy/sdxl-unet"})
-	check("starting it again is IDEMPOTENT", again.Status == http.StatusOK &&
-		again.json()["resident"] == true, again.brief())
+	check("starting it again is IDEMPOTENT and names the change", again.Status == http.StatusOK &&
+		again.json()["change"] == "none", again.brief())
 
 	head("submit -> SSE -> terminal -> media, as an HTTP client")
 	body := map[string]any{"steps": 4, "latent": 64, "seed": 1005}
@@ -637,8 +641,10 @@ func waitReady(svc *liveService, timeout time.Duration) bool {
 		if strings.Contains(body, `"serving":"DISPATCHABLE"`) && strings.Contains(body, "sha256:") {
 			return true
 		}
-		if !strings.Contains(body, `"fault":""`) && strings.Contains(body, `"fault":`) {
-			fmt.Println("    worker fault: " + between(body, `"fault":"`, `"`))
+		// A REFUSAL ends the wait; a FAULT does not. This host's own claim-time verdict is
+		// settled, and a placement holding a degraded warm case still activates.
+		if strings.Contains(body, `"refusal":`) && !strings.Contains(body, `"refusal":""`) {
+			fmt.Println("    this host refused the worker: " + between(body, `"refusal":"`, `"`))
 			return false
 		}
 		time.Sleep(200 * time.Millisecond)

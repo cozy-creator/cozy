@@ -256,6 +256,9 @@ type Worker struct {
 	QuietMS    int64  `json:"quiet_ms"`
 	ErrorForMS int64  `json:"error_for_ms"`
 	Fault      string `json:"fault"`
+	// Refusal is the HOST's own verdict about this worker, distinct from the worker's own
+	// fault: a fault may clear, a refusal is settled.
+	Refusal string `json:"refusal"`
 }
 
 // Dispatchable answers whether this worker can take an attempt — the protocol's own fact,
