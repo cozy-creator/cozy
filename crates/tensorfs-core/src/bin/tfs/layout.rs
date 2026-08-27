@@ -634,7 +634,10 @@ pub fn cmd_register(name: &str, kind: &str, spec: &str, flags: &Flags) -> ExitCo
         reg.round_trip.coverage,
         t.elapsed().as_secs_f64() * 1000.0
     );
-    println!("registration {}", tensorfs_core::ids::object_id(&reg.canonical_bytes()));
+    println!(
+        "registration {}",
+        tensorfs_core::ids::object_id(&reg.canonical_bytes())
+    );
     ExitCode::SUCCESS
 }
 
@@ -660,7 +663,10 @@ fn load_registry(flags: &Flags) -> Result<Registry, ExitCode> {
 /// must never build a second reader for them.
 pub fn cmd_decision(p: &Path) -> ExitCode {
     let d = ok!(GradeDecision::parse(&rd!(p)));
-    println!("decision     {}", tensorfs_core::ids::object_id(&d.canonical_bytes()));
+    println!(
+        "decision     {}",
+        tensorfs_core::ids::object_id(&d.canonical_bytes())
+    );
     println!("report       {}", d.report);
     println!("grade        {}", d.grade.name());
     ExitCode::SUCCESS
@@ -727,7 +733,10 @@ pub fn cmd_grade(report_p: &Path, flags: &Flags) -> ExitCode {
         }
         Grade::Incompatible { reason } => println!("  reason     {reason}"),
     }
-    println!("decision     {}", tensorfs_core::ids::object_id(&decision.canonical_bytes()));
+    println!(
+        "decision     {}",
+        tensorfs_core::ids::object_id(&decision.canonical_bytes())
+    );
     println!(
         "in {us:.0} us over {} registration(s)",
         reg.registrations.len()

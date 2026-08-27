@@ -2,7 +2,7 @@
 facade that re-exports it; the extension itself is the authority on behaviour."""
 
 from collections.abc import Callable, Sequence
-from typing import Any
+from typing import Any, Literal, NotRequired, TypedDict
 
 __version__: str
 ERA: str
@@ -115,6 +115,48 @@ class ReadLease:
     def __enter__(self) -> ReadLease: ...
     def __exit__(self, *args: object) -> bool: ...
 
+class DerivedPartDeclaration(TypedDict):
+    dtype: str
+    shape: Sequence[int]
+
+class DerivedTensorDeclaration(TypedDict):
+    logical_dtype: str
+    shape: Sequence[int]
+    encoding: str
+    parts: dict[str, DerivedPartDeclaration]
+
+class DerivedTargetDeclaration(TypedDict):
+    source: NotRequired[str]
+    source_component: NotRequired[str]
+    drop: Sequence[str]
+    add: dict[str, DerivedTensorDeclaration]
+
+class DerivedCopyConfig(TypedDict):
+    source: str
+    source_config: str
+
+class DerivedAddedConfig(TypedDict):
+    media_type: str
+    length: int
+
+class DerivedWriter:
+    def sources(self) -> list[dict[str, Any]]: ...
+    def source_read_into(
+        self,
+        source: str,
+        component: str,
+        key: str,
+        role: str,
+        off: int,
+        into: Any,
+    ) -> None: ...
+    def add_part(
+        self, component: str, key: str, role: str, reader: Any
+    ) -> dict[str, Any]: ...
+    def add_config(self, name: str, reader: Any) -> dict[str, Any]: ...
+    def commit(self) -> dict[str, Any]: ...
+    def fence(self) -> bool: ...
+
 class Store:
     @staticmethod
     def open(root: str) -> Store: ...
@@ -144,6 +186,23 @@ class Store:
     def materialize(self, hex: str, path: str, dest: str) -> int: ...
     def state(self) -> dict[str, Any]: ...
     def reap_holds(self) -> list[str]: ...
+    def begin_derived(
+        self,
+        transaction_id: str,
+        writer_session_id: int,
+        sources: dict[str, tuple[str, int]],
+        targets: dict[str, DerivedTargetDeclaration],
+        configs: dict[str, DerivedCopyConfig | DerivedAddedConfig],
+        max_new_bytes: int,
+    ) -> DerivedWriter: ...
+    def derived_lookup(
+        self, transaction_id: str
+    ) -> dict[str, Any]: ...
+    def derived_fence(self, transaction_id: str, writer_session_id: int) -> bool: ...
+    def derived_abandon(self, transaction_id: str) -> dict[str, Any]: ...
+    def derived_dispose(
+        self, transaction_id: str, scratch_root: str | None = ...
+    ) -> dict[str, Any]: ...
 
 def fetch_plan(
     store: Store,

@@ -474,8 +474,17 @@ pub fn sweep_at(
     let mut t = loop {
         let t = meta.txn()?;
         let holds: Vec<String> = t.state.holds.iter().map(|h| h.id.clone()).collect();
+        let derived: Vec<String> = t
+            .state
+            .derived
+            .iter()
+            .filter(|row| {
+                row.state == crate::derived::TransactionState::Open && row.current_session.is_some()
+            })
+            .map(|row| row.id.clone())
+            .collect();
         let roots = open_ingest_roots(store);
-        if holds.is_empty() && roots.is_empty() {
+        if holds.is_empty() && roots.is_empty() && derived.is_empty() {
             break t;
         }
         if !wait {
@@ -483,10 +492,12 @@ pub fn sweep_at(
                 Code::STORE_BUSY,
                 format!(
                     "the sweep is EXCLUSIVE and the store has writers: {} open ingest \
-                     root(s) {roots:?}, {} held lease(s) {holds:?} — GC never runs beside \
+                     root(s) {roots:?}, {} held lease(s) {holds:?}, {} active derived \
+                     transaction(s) {derived:?} — GC never runs beside \
                      a writer; retry after they finish, or pass --wait",
                     roots.len(),
-                    holds.len()
+                    holds.len(),
+                    derived.len()
                 ),
             );
         }

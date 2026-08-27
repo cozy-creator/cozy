@@ -2273,9 +2273,9 @@ fn meta_cases() -> Vec<Case> {
 
     let snap = "a".repeat(64);
     let other = "b".repeat(64);
-    let full = State {
-        generation: 7,
-        snapshots: vec![
+    let full = State::from_records(
+        7,
+        vec![
             SnapshotRow {
                 snapshot: snap.clone(),
                 known_at: 100,
@@ -2294,13 +2294,13 @@ fn meta_cases() -> Vec<Case> {
                 evidence: Vec::new(),
             },
         ],
-        roots: vec![RootRow {
+        vec![RootRow {
             name: "binding-0".to_string(),
             snapshot: snap.clone(),
             kind: "binding".to_string(),
             created: 120,
         }],
-        holds: vec![HoldRow {
+        vec![HoldRow {
             id: "read-1-2".to_string(),
             kind: "read".to_string(),
             snapshot: other.clone(),
@@ -2309,11 +2309,11 @@ fn meta_cases() -> Vec<Case> {
             boot_epoch: 1700000000,
             acquired: 130,
         }],
-        quarantine: vec![QRow {
+        vec![QRow {
             object: "d".repeat(64),
             claim_generation: 6,
         }],
-    };
+    );
     let bytes = full.canonical_bytes();
     let mut out = vec![ok_case(
         "meta",

@@ -2,7 +2,7 @@
 //!
 //! ```text
 //! <root>/meta/LOCK              the exclusive advisory lock: one writer, serialized transitions
-//! <root>/meta/state.json        the authority document — snapshots / roots / holds / quarantine
+//! <root>/meta/state.json        the authority document — roots, holds, quarantine, transactions
 //! <root>/meta/holds/<id>.lock   one owner-liveness lock per hold
 //! ```
 //!
@@ -135,6 +135,9 @@ pub struct State {
     pub roots: Vec<RootRow>,
     pub holds: Vec<HoldRow>,
     pub quarantine: Vec<QRow>,
+    /// Exact derived-artifact transactions (tfs-019). Kept in the same fsync-rename
+    /// authority as roots so commit and root disposition have one linearization point.
+    pub(crate) derived: Vec<crate::derived::TransactionRow>,
 }
 
 fn sorted<T, K: Ord>(v: &[T], key: impl Fn(&T) -> K) -> bool {
@@ -253,6 +256,12 @@ impl Doc for State {
                 evidence,
             });
         }
+        let mut derived = Vec::new();
+        if let Some(rows) = f.opt("derived") {
+            for row in as_arr("State", "derived", rows)? {
+                derived.push(crate::derived::TransactionRow::from_value(row)?);
+            }
+        }
         f.done()?;
 
         // Deterministic order is part of the document, not a convention: an unsorted twin
@@ -261,6 +270,7 @@ impl Doc for State {
             || !sorted(&holds, |h| h.id.clone())
             || !sorted(&quarantine, |q| q.object.clone())
             || !sorted(&snapshots, |s| s.snapshot.clone())
+            || !sorted(&derived, |row| row.id.clone())
         {
             return refuse(
                 Code::SORT_ORDER,
@@ -273,11 +283,12 @@ impl Doc for State {
             roots,
             holds,
             quarantine,
+            derived,
         })
     }
 
     fn to_value(&self) -> Value {
-        Value::obj(vec![
+        let mut fields = vec![
             ("format", Value::str(Self::FORMAT)),
             ("generation", Value::uint(self.generation)),
             (
@@ -357,16 +368,48 @@ impl Doc for State {
                         .collect(),
                 ),
             ),
-        ])
+        ];
+        // Omit while empty so every pre-tfs-019 state remains byte-canonical under the
+        // same `tensorfs.meta/1` identity kind (decision #616's identity-kind freeze).
+        if !self.derived.is_empty() {
+            fields.push((
+                "derived",
+                Value::arr(self.derived.iter().map(|row| row.to_value()).collect()),
+            ));
+        }
+        Value::obj(fields)
     }
 }
 
 impl State {
+    /// Construct the five pre-tfs-019 record sets. The CLI's live canonical-vector
+    /// generator uses this instead of gaining access to private transaction rows.
+    pub fn from_records(
+        generation: u64,
+        snapshots: Vec<SnapshotRow>,
+        roots: Vec<RootRow>,
+        holds: Vec<HoldRow>,
+        quarantine: Vec<QRow>,
+    ) -> State {
+        State {
+            generation,
+            snapshots,
+            roots,
+            holds,
+            quarantine,
+            derived: Vec::new(),
+        }
+    }
+
     fn normalize(&mut self) {
         self.roots.sort_by(|a, b| a.name.cmp(&b.name));
         self.holds.sort_by(|a, b| a.id.cmp(&b.id));
         self.quarantine.sort_by(|a, b| a.object.cmp(&b.object));
         self.snapshots.sort_by(|a, b| a.snapshot.cmp(&b.snapshot));
+        for row in &mut self.derived {
+            row.normalize();
+        }
+        self.derived.sort_by(|a, b| a.id.cmp(&b.id));
     }
     pub fn root(&self, name: &str) -> Option<&RootRow> {
         self.roots.iter().find(|r| r.name == name)
@@ -480,6 +523,16 @@ impl Txn<'_> {
         self.state.generation += 1;
         self.state.normalize();
         let bytes = self.state.canonical_bytes();
+        if bytes.len() > State::MAX_BYTES {
+            return refuse(
+                Code::SIZE_CAP,
+                format!(
+                    "metadata state is {} bytes, over the {} byte cap; refusing before writing an unreadable authority",
+                    bytes.len(),
+                    State::MAX_BYTES
+                ),
+            );
+        }
         let p = self.meta.state_path();
         let tmp = self
             .meta

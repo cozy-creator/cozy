@@ -286,6 +286,24 @@ each); the fence refuses a `const FORMAT` the crate declares outside it. Demoted
 `delivery_grant` (one pull session's scratch), `grade_decision` + `conversion_registration`
 (verifier-internal). Kept by caution: the ingest quartet (their refs are snapshot evidence).
 
+## exact derived snapshots (tfs-019)
+
+`Store.begin_derived(...)` is the one copy/create/derive transaction used by Runtime's
+ArtifactSink. It takes exact installed source snapshots, explicit source-component to
+target-component selections, closed drop/add/config declarations, and capability-backed
+readers. The returned writer keeps pinned verified source leases and reads only semantic
+`(source, component, key, role)` selectors—never caller-supplied ObjectRefs. Independent
+`derived_lookup`, `derived_fence`, `derived_abandon`, and
+`derived_dispose` calls hold crash recovery and final root disposition without exposing a
+store path to a job. The canonical outer artifact receipt remains Runtime's (cr-030/th-049);
+TensorFS returns immutable exact receipt facts and adds no document kind (decision #616).
+
+```bash
+uv run --with ./target/wheels/tensorfs-0.0.1-*.whl \
+  scripts/derived-runs.py --tfs target/release/tfs --store /tmp/tfs-derived-proof
+# live result: drop=106 add=51 components=5, inherited payload reads=0/hashes=0
+```
+
 ## the Python facade (tfs-007)
 
 One wheel, abi3-py311, `py.typed`. The compiled half owns every byte-level fact; the Python

@@ -71,7 +71,10 @@ pub fn cmd_plan(root: &Path, declared_p: &Path, session: &str, flags: &Flags) ->
         &closure.objects
     ));
     emit_bytes(&plan.canonical_bytes(), flags);
-    println!("plan         {}", tensorfs_core::ids::object_id(&plan.canonical_bytes()));
+    println!(
+        "plan         {}",
+        tensorfs_core::ids::object_id(&plan.canonical_bytes())
+    );
     println!("session      {}", plan.session);
     println!("snapshot     {}", plan.snapshot.id());
     println!(

@@ -15,13 +15,17 @@ use pyo3::buffer::PyBuffer;
 use pyo3::prelude::*;
 use pyo3::types::{PyBytes, PyDict, PyList};
 use tensorfs_core::checkpoint;
+use tensorfs_core::derived::{
+    self, ComponentDeclaration, ConfigDeclaration, Declaration, PartDeclaration, Source,
+    TensorDeclaration,
+};
 use tensorfs_core::err::{refuse, Code, Refusal, Result as TResult};
 use tensorfs_core::header::Header;
 use tensorfs_core::ids::{Doc, ObjectRef};
 use tensorfs_core::manifest::{BlobDescriptor, Entry, SnapshotManifest};
-use tensorfs_core::meta::Meta;
+use tensorfs_core::meta::{Hold, Meta};
 use tensorfs_core::project;
-use tensorfs_core::read::{self, ObjectRange, ReadLease as CoreLease, Source};
+use tensorfs_core::read::{self, ObjectRange, ReadLease as CoreLease, Source as ReadSource};
 use tensorfs_core::receipt::Receipts;
 use tensorfs_core::store::{Fault, Store as CoreStore, Verdict};
 
@@ -153,6 +157,208 @@ fn obj_ref(py: Python<'_>, hex: &str, length: u64) -> PyResult<ObjectRef> {
     };
     tensorfs_core::ids::hex64("ObjectRef", &r.sha256).or_refuse(py)?;
     Ok(r)
+}
+
+fn missing(py: Python<'_>, what: &str, field: &str) -> PyErr {
+    to_py(
+        py,
+        &Refusal {
+            code: Code::MISSING_FIELD,
+            detail: format!("{what}: missing {field:?}"),
+        },
+    )
+}
+
+fn required<'p>(
+    py: Python<'p>,
+    dict: &Bound<'p, PyDict>,
+    what: &str,
+    field: &str,
+) -> PyResult<Bound<'p, PyAny>> {
+    dict.get_item(field)?
+        .ok_or_else(|| missing(py, what, field))
+}
+
+fn only_keys(
+    py: Python<'_>,
+    dict: &Bound<'_, PyDict>,
+    what: &str,
+    allowed: &[&str],
+) -> PyResult<()> {
+    for (key, _) in dict.iter() {
+        let key: String = key.extract()?;
+        if !allowed.contains(&key.as_str()) {
+            return Err(to_py(
+                py,
+                &Refusal {
+                    code: Code::UNKNOWN_FIELD,
+                    detail: format!("{what}: unknown field {key:?}"),
+                },
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn parse_declaration(
+    py: Python<'_>,
+    sources: &Bound<'_, PyDict>,
+    targets: &Bound<'_, PyDict>,
+    configs: &Bound<'_, PyDict>,
+    max_new_bytes: u64,
+) -> PyResult<Declaration> {
+    let mut source_rows = Vec::with_capacity(sources.len());
+    for (alias, value) in sources.iter() {
+        let alias: String = alias.extract()?;
+        let (snapshot, length): (String, u64) = value.extract()?;
+        source_rows.push(Source {
+            alias,
+            snapshot: obj_ref(py, &snapshot, length)?,
+        });
+    }
+
+    let mut components = Vec::with_capacity(targets.len());
+    for (target, value) in targets.iter() {
+        let target: String = target.extract()?;
+        let value = value.downcast::<PyDict>()?;
+        only_keys(
+            py,
+            value,
+            &format!("target {target:?}"),
+            &["source", "source_component", "drop", "add"],
+        )?;
+        let source = value
+            .get_item("source")?
+            .map(|value| value.extract::<String>())
+            .transpose()?;
+        let source_component = value
+            .get_item("source_component")?
+            .map(|value| value.extract::<String>())
+            .transpose()?;
+        let drop: Vec<String> = required(py, value, "target", "drop")?.extract()?;
+        let additions = required(py, value, "target", "add")?.downcast_into::<PyDict>()?;
+        let mut add = Vec::with_capacity(additions.len());
+        for (tensor_key, tensor_value) in additions.iter() {
+            let tensor_key: String = tensor_key.extract()?;
+            let tensor = tensor_value.downcast::<PyDict>()?;
+            only_keys(
+                py,
+                tensor,
+                &format!("addition {target}/{tensor_key}"),
+                &["logical_dtype", "shape", "encoding", "parts"],
+            )?;
+            let dtype = tensorfs_core::dtype::Dtype::parse(
+                &required(py, tensor, "addition", "logical_dtype")?.extract::<String>()?,
+            )
+            .or_refuse(py)?;
+            let shape: Vec<u64> = required(py, tensor, "addition", "shape")?.extract()?;
+            let encoding: String = required(py, tensor, "addition", "encoding")?.extract()?;
+            let part_values =
+                required(py, tensor, "addition", "parts")?.downcast_into::<PyDict>()?;
+            let mut parts = Vec::with_capacity(part_values.len());
+            for (role, part_value) in part_values.iter() {
+                let role: String = role.extract()?;
+                let part = part_value.downcast::<PyDict>()?;
+                only_keys(
+                    py,
+                    part,
+                    &format!("addition {target}/{tensor_key}#{role}"),
+                    &["dtype", "shape"],
+                )?;
+                let dtype = tensorfs_core::dtype::Dtype::parse(
+                    &required(py, part, "part", "dtype")?.extract::<String>()?,
+                )
+                .or_refuse(py)?;
+                let shape: Vec<u64> = required(py, part, "part", "shape")?.extract()?;
+                parts.push(PartDeclaration { role, dtype, shape });
+            }
+            add.push(TensorDeclaration {
+                key: tensor_key,
+                dtype,
+                shape,
+                encoding,
+                parts,
+            });
+        }
+        components.push(ComponentDeclaration {
+            target,
+            source,
+            source_component,
+            drop,
+            add,
+        });
+    }
+
+    let mut config_rows = Vec::with_capacity(configs.len());
+    for (target, value) in configs.iter() {
+        let target: String = target.extract()?;
+        let value = value.downcast::<PyDict>()?;
+        only_keys(
+            py,
+            value,
+            &format!("config {target:?}"),
+            &["source", "source_config", "media_type", "length"],
+        )?;
+        let source = value.get_item("source")?;
+        let source_config = value.get_item("source_config")?;
+        let media_type = value.get_item("media_type")?;
+        let length = value.get_item("length")?;
+        match (source, source_config, media_type, length) {
+            (Some(source), Some(source_config), None, None) => {
+                config_rows.push(ConfigDeclaration::Copy {
+                    target,
+                    source: source.extract()?,
+                    source_config: source_config.extract()?,
+                });
+            }
+            (None, None, Some(media_type), Some(length)) => {
+                config_rows.push(ConfigDeclaration::Add {
+                    target,
+                    media_type: media_type.extract()?,
+                    length: length.extract()?,
+                });
+            }
+            _ => {
+                return Err(to_py(
+                    py,
+                    &Refusal {
+                        code: Code::MISSING_FIELD,
+                        detail: format!(
+                            "config {target:?} must be exactly source+source_config or media_type+length"
+                        ),
+                    },
+                ));
+            }
+        }
+    }
+    let mut declaration = Declaration {
+        sources: source_rows,
+        components,
+        configs: config_rows,
+        max_new_bytes,
+    };
+    declaration.normalize_and_validate().or_refuse(py)?;
+    Ok(declaration)
+}
+
+fn source_facts<'p>(py: Python<'p>, views: &[derived::SourceView]) -> PyResult<Bound<'p, PyList>> {
+    let rows = PyList::empty(py);
+    for view in views {
+        let fact = &view.fact;
+        let row = PyDict::new(py);
+        row.set_item("alias", &fact.alias)?;
+        row.set_item("snapshot_id", fact.snapshot.id())?;
+        row.set_item("snapshot_length", fact.snapshot.length)?;
+        row.set_item("header_id", fact.header.id())?;
+        row.set_item("header_length", fact.header.length)?;
+        row.set_item("components", &fact.components)?;
+        rows.append(row)?;
+    }
+    Ok(rows)
+}
+
+fn receipt<'p>(py: Python<'p>, receipt: &derived::ReceiptFacts) -> PyResult<Bound<'p, PyAny>> {
+    marshal(py, &receipt.to_value())
 }
 
 // ---------------------------------------------------------------- store
@@ -464,12 +670,371 @@ impl PyStore {
         py.allow_threads(|| self.meta.reap_holds()).or_refuse(py)
     }
 
+    /// Open one exact tfs-019 transaction. Python supplies typed plain values; canonical
+    /// declaration bytes are constructed and locked only by the compiled core.
+    // PyO3 exposes these as six named boundary fields. Packing them into an opaque dict
+    // would only move the arity into hand parsing and weaken the typed facade.
+    #[allow(clippy::too_many_arguments)]
+    #[pyo3(signature = (transaction_id, writer_session_id, sources, targets, configs, max_new_bytes))]
+    fn begin_derived(
+        &self,
+        py: Python<'_>,
+        transaction_id: &str,
+        writer_session_id: u64,
+        sources: &Bound<'_, PyDict>,
+        targets: &Bound<'_, PyDict>,
+        configs: &Bound<'_, PyDict>,
+        max_new_bytes: u64,
+    ) -> PyResult<PyDerivedWriter> {
+        let declaration = parse_declaration(py, sources, targets, configs, max_new_bytes)?;
+        let begin = py
+            .allow_threads(|| {
+                derived::begin(
+                    &self.store,
+                    &self.meta,
+                    transaction_id,
+                    writer_session_id,
+                    declaration,
+                )
+            })
+            .or_refuse(py)?;
+        Ok(PyDerivedWriter {
+            store: self.store.clone(),
+            meta: self.meta.clone(),
+            transaction_id: transaction_id.to_string(),
+            writer_session_id,
+            source_views: begin.source_views,
+            guards: Mutex::new(Some(DerivedGuards {
+                writer_hold: begin.writer_hold,
+                source_leases: begin.source_leases,
+            })),
+        })
+    }
+
+    /// Durable recovery after the TensorFS-commit/Runtime-journal crash gap.
+    fn derived_lookup<'p>(
+        &self,
+        py: Python<'p>,
+        transaction_id: &str,
+    ) -> PyResult<Bound<'p, PyDict>> {
+        let result = py
+            .allow_threads(|| derived::lookup(&self.meta, transaction_id))
+            .or_refuse(py)?;
+        let out = PyDict::new(py);
+        match result {
+            derived::Lookup::Absent => out.set_item("state", "absent")?,
+            derived::Lookup::Open { writer_session } => {
+                out.set_item("state", "open")?;
+                if let Some(writer_session) = writer_session {
+                    out.set_item("writer_session_id", writer_session)?;
+                }
+            }
+            derived::Lookup::Committed(value) => {
+                out.set_item("state", "committed")?;
+                out.set_item("receipt", receipt(py, &value)?)?;
+            }
+            derived::Lookup::Abandoned => out.set_item("state", "abandoned")?,
+        }
+        Ok(out)
+    }
+
+    /// Fence one executor session. Its live process holds remain until it explicitly
+    /// closes or dies; therefore GC cannot race a stale stream already in progress.
+    fn derived_fence(
+        &self,
+        py: Python<'_>,
+        transaction_id: &str,
+        writer_session_id: u64,
+    ) -> PyResult<bool> {
+        py.allow_threads(|| derived::fence(&self.meta, transaction_id, writer_session_id))
+            .or_refuse(py)
+    }
+
+    /// Receipt-free abandonment. The same metadata lock arbitrates it against commit.
+    fn derived_abandon<'p>(
+        &self,
+        py: Python<'p>,
+        transaction_id: &str,
+    ) -> PyResult<Bound<'p, PyDict>> {
+        let result = py
+            .allow_threads(|| derived::abandon(&self.meta, transaction_id))
+            .or_refuse(py)?;
+        let out = PyDict::new(py);
+        match result {
+            None => out.set_item("state", "abandoned")?,
+            Some(value) => {
+                out.set_item("state", "committed")?;
+                out.set_item("receipt", receipt(py, &value)?)?;
+            }
+        }
+        Ok(out)
+    }
+
+    /// Atomically transfer the private committed root to a scratch root, or release it.
+    #[pyo3(signature = (transaction_id, scratch_root=None))]
+    fn derived_dispose<'p>(
+        &self,
+        py: Python<'p>,
+        transaction_id: &str,
+        scratch_root: Option<&str>,
+    ) -> PyResult<Bound<'p, PyAny>> {
+        let value = py
+            .allow_threads(|| derived::dispose(&self.meta, transaction_id, scratch_root))
+            .or_refuse(py)?;
+        marshal(py, &value.to_value())
+    }
+
     fn __repr__(&self) -> String {
         format!(
             "<tensorfs.Store {} era={} generation={}>",
             self.store.root().display(),
             tensorfs_core::store::ERA,
             self.store.generation()
+        )
+    }
+}
+
+// ---------------------------------------------------------------- exact derived snapshots
+
+#[pyclass(name = "DerivedWriter")]
+pub struct PyDerivedWriter {
+    store: Arc<CoreStore>,
+    meta: Arc<Meta>,
+    transaction_id: String,
+    writer_session_id: u64,
+    source_views: Vec<derived::SourceView>,
+    guards: Mutex<Option<DerivedGuards>>,
+}
+
+struct DerivedGuards {
+    writer_hold: Hold,
+    source_leases: Vec<(String, CoreLease)>,
+}
+
+impl PyDerivedWriter {
+    fn release_holds(&self) {
+        let Some(guards) = self
+            .guards
+            .lock()
+            .expect("writer hold mutex poisoned")
+            .take()
+        else {
+            return;
+        };
+        for (_, lease) in guards.source_leases {
+            if let Err(error) = lease.release(&self.meta) {
+                eprintln!(
+                    "DEGRADED derived-source-lease-release transaction={} — {error}",
+                    self.transaction_id
+                );
+            }
+        }
+        if let Err(error) = guards.writer_hold.release(&self.meta) {
+            eprintln!(
+                "DEGRADED derived-writer-hold-release transaction={} — {error}",
+                self.transaction_id
+            );
+        }
+    }
+}
+
+#[pymethods]
+impl PyDerivedWriter {
+    /// Effective exact sources after TensorFS has checked installed identity and closure.
+    fn sources<'p>(&self, py: Python<'p>) -> PyResult<Bound<'p, PyList>> {
+        source_facts(py, &self.source_views)
+    }
+
+    /// Read one semantic source-part range through its pinned verified descriptor set.
+    /// ObjectRefs never cross this author door: TensorFS resolves the exact locked header,
+    /// including inline parts and segmented ranges.
+    #[allow(clippy::too_many_arguments)]
+    fn source_read_into(
+        &self,
+        py: Python<'_>,
+        source: &str,
+        component: &str,
+        key: &str,
+        role: &str,
+        off: u64,
+        into: &Bound<'_, PyAny>,
+    ) -> PyResult<()> {
+        let mut buffer = Writable::new(py, into)?;
+        let destination = buffer.slice();
+        let guards = self.guards.lock().expect("writer hold mutex poisoned");
+        let guards = guards.as_ref().ok_or_else(|| released(py))?;
+        let lease = guards
+            .source_leases
+            .iter()
+            .find(|(alias, _)| alias == source)
+            .map(|(_, lease)| lease)
+            .ok_or_else(|| {
+                to_py(
+                    py,
+                    &Refusal {
+                        code: Code::ROOT_ABSENT,
+                        detail: format!("no source alias {source:?} on this derived writer"),
+                    },
+                )
+            })?;
+        let view = self
+            .source_views
+            .iter()
+            .find(|view| view.fact.alias == source)
+            .ok_or_else(|| missing(py, "derived source", source))?;
+        if !view
+            .fact
+            .components
+            .iter()
+            .any(|allowed| allowed == component)
+        {
+            return Err(to_py(
+                py,
+                &Refusal {
+                    code: Code::MISSING_COMPONENT,
+                    detail: format!(
+                        "source alias {source:?} component {component:?} is outside the locked target declaration"
+                    ),
+                },
+            ));
+        }
+        let part = view
+            .header
+            .components
+            .iter()
+            .find(|(name, _)| name == component)
+            .and_then(|(_, tensors)| tensors.iter().find(|(name, _)| name == key))
+            .and_then(|(_, tensor)| tensor.parts.iter().find(|(name, _)| name == role))
+            .map(|(_, part)| part)
+            .ok_or_else(|| {
+                to_py(
+                    py,
+                    &Refusal {
+                        code: Code::MISSING_TENSOR,
+                        detail: format!(
+                            "source alias {source:?} has no exact part {component}/{key}#{role}"
+                        ),
+                    },
+                )
+            })?;
+        let what = format!("{component}/{key}#{role}");
+        py.allow_threads(|| {
+            derived::check_writer(&self.meta, &self.transaction_id, self.writer_session_id)?;
+            read::read_part_into(
+                lease,
+                &what,
+                part,
+                off,
+                destination.len() as u64,
+                destination,
+            )?;
+            derived::check_writer(&self.meta, &self.transaction_id, self.writer_session_id)
+        })
+        .or_refuse(py)
+    }
+
+    /// Stream one declared physical role. A pathname is intentionally not an accepted
+    /// shape; Runtime hands in a capability-backed reader.
+    fn add_part<'p>(
+        &self,
+        py: Python<'p>,
+        component: &str,
+        key: &str,
+        role: &str,
+        reader: &Bound<'p, PyAny>,
+    ) -> PyResult<Bound<'p, PyDict>> {
+        let mut source = Readable {
+            obj: reader.clone().unbind(),
+            err: None,
+        };
+        let result = py.allow_threads(|| {
+            derived::add_part(
+                &self.store,
+                &self.meta,
+                &self.transaction_id,
+                self.writer_session_id,
+                (component, key, role),
+                &mut source,
+            )
+        });
+        let result = match result {
+            Ok(value) => value,
+            Err(error) => return Err(source.err.take().unwrap_or_else(|| to_py(py, &error))),
+        };
+        let out = PyDict::new(py);
+        out.set_item("bytes", result.bytes)?;
+        out.set_item("deduped_bytes", result.deduped)?;
+        out.set_item("whole_sha256", result.whole)?;
+        let objects = PyList::empty(py);
+        for object in result.part.segments() {
+            let row = PyDict::new(py);
+            row.set_item("sha256", &object.sha256)?;
+            row.set_item("length", object.length)?;
+            objects.append(row)?;
+        }
+        out.set_item("objects", objects)?;
+        Ok(out)
+    }
+
+    fn add_config<'p>(
+        &self,
+        py: Python<'p>,
+        name: &str,
+        reader: &Bound<'p, PyAny>,
+    ) -> PyResult<Bound<'p, PyDict>> {
+        let mut source = Readable {
+            obj: reader.clone().unbind(),
+            err: None,
+        };
+        let result = py.allow_threads(|| {
+            derived::add_config(
+                &self.store,
+                &self.meta,
+                &self.transaction_id,
+                self.writer_session_id,
+                name,
+                &mut source,
+            )
+        });
+        let result = match result {
+            Ok(value) => value,
+            Err(error) => return Err(source.err.take().unwrap_or_else(|| to_py(py, &error))),
+        };
+        let out = PyDict::new(py);
+        out.set_item("sha256", result.sha256)?;
+        out.set_item("length", result.length)?;
+        Ok(out)
+    }
+
+    fn commit<'p>(&self, py: Python<'p>) -> PyResult<Bound<'p, PyAny>> {
+        let value = py
+            .allow_threads(|| {
+                derived::commit(
+                    &self.store,
+                    &self.meta,
+                    &self.transaction_id,
+                    self.writer_session_id,
+                )
+            })
+            .or_refuse(py)?;
+        self.release_holds();
+        receipt(py, &value)
+    }
+
+    fn fence(&self, py: Python<'_>) -> PyResult<bool> {
+        let fenced = py
+            .allow_threads(|| {
+                derived::fence(&self.meta, &self.transaction_id, self.writer_session_id)
+            })
+            .or_refuse(py)?;
+        self.release_holds();
+        Ok(fenced)
+    }
+
+    fn __repr__(&self) -> String {
+        format!(
+            "<tensorfs.DerivedWriter transaction={} writer_session_id={}>",
+            self.transaction_id, self.writer_session_id
         )
     }
 }
@@ -543,13 +1108,13 @@ impl PyPlan {
             d.set_item("dest_off", it.dest_off)?;
             d.set_item("len", it.len)?;
             match &it.source {
-                Source::Object(r) => {
+                ReadSource::Object(r) => {
                     d.set_item("source", "object")?;
                     d.set_item("object", r.obj.id())?;
                     d.set_item("object_length", r.obj.length)?;
                     d.set_item("off", r.off)?;
                 }
-                Source::Inline(_) => {
+                ReadSource::Inline(_) => {
                     d.set_item("source", "inline")?;
                 }
             }

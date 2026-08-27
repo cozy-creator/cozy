@@ -10,6 +10,7 @@ pub mod checkpoint;
 pub mod cloud;
 pub mod compat;
 pub mod corpus;
+pub mod derived;
 pub mod dtype;
 pub mod err;
 pub mod fetch;
