@@ -3,6 +3,7 @@ package main
 import (
 	"bufio"
 	"bytes"
+	"crypto/sha256"
 	"encoding/binary"
 	"encoding/hex"
 	"fmt"
@@ -78,10 +79,12 @@ func sectionDescriptor() {
 
 func sectionDescriptorJCS() {
 	path := flag("number-vectors", "fixtures/canonical/es6-numbers.txt")
-	file, err := os.Open(path)
-	must("opening the Runtime ES6 number vectors", err)
-	defer file.Close()
-	scanner := bufio.NewScanner(file)
+	corpus, err := os.ReadFile(path)
+	must("reading the Runtime ES6 number vectors", err)
+	wantCorpus := "973abb151673539cb1713991235beb4f9892e55c3743e6bbb0d398c8e5512302"
+	gotCorpus := fmt.Sprintf("%x", sha256.Sum256(corpus))
+	check("the pinned Runtime number oracle is unchanged", gotCorpus == wantCorpus, gotCorpus)
+	scanner := bufio.NewScanner(bytes.NewReader(corpus))
 	rows, mismatches := 0, 0
 	for scanner.Scan() {
 		fields := strings.Fields(scanner.Text())
@@ -101,7 +104,7 @@ func sectionDescriptorJCS() {
 		}
 		rows++
 	}
-	must("reading the Runtime ES6 number vectors", scanner.Err())
+	must("scanning the Runtime ES6 number vectors", scanner.Err())
 	check("Creator matches Runtime over the full ES6 number corpus",
 		rows == 4561 && mismatches == 0, fmt.Sprintf("%d rows, %d mismatches", rows, mismatches))
 
