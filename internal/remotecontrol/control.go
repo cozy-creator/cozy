@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"io"
 	"sort"
+	"strconv"
 	"strings"
 
 	"github.com/cozy-creator/cozy-creator-v2/internal/canonical"
@@ -223,9 +224,10 @@ func Decode(control hub.ExactControlDocument, endpointRef string) (Facts, *exit.
 		}
 		ref, err := refOf(row.Sub("ref"))
 		stored := documents[ref.Digest]
-		if err != nil || stored.Digest == "" || stored.Kind != row.Str("kind") ||
+		if err != nil || releaseKinds[ref.Digest] != "" || stored.Digest == "" ||
+			stored.Kind != row.Str("kind") ||
 			stored.Length != ref.Length {
-			return facts, invalid("binding release document %s is absent or changed", ref.Digest)
+			return facts, invalid("binding release document %s is absent, changed, or duplicated", ref.Digest)
 		}
 		releaseKinds[ref.Digest] = stored.Kind
 	}
@@ -252,7 +254,8 @@ func Decode(control hub.ExactControlDocument, endpointRef string) (Facts, *exit.
 	planSubjects := map[string]int64{}
 	for _, subject := range placementSpec.List("binding_plans") {
 		if subject.Str("kind") != "plan" || subject.Str("subject_id") != subject.Str("digest") ||
-			subject.Str("digest") == "" || subject.Int("length") <= 0 {
+			subject.Str("digest") == "" || subject.Int("length") <= 0 ||
+			planSubjects[subject.Str("digest")] != 0 {
 			return facts, invalid("placement carries a malformed binding-plan subject")
 		}
 		planSubjects[subject.Str("digest")] = subject.Int("length")
@@ -323,6 +326,7 @@ func Decode(control hub.ExactControlDocument, endpointRef string) (Facts, *exit.
 	}
 	reachable := map[string]bool{}
 	referencedRMB := map[string]bool{}
+	boundEntrypoints := map[string]bool{}
 	bindings := []*orchestrator.Binding{}
 	for digest, document := range documents {
 		if document.Kind != "entrypoint_binding_plan" {
@@ -336,13 +340,19 @@ func Decode(control hub.ExactControlDocument, endpointRef string) (Facts, *exit.
 		planDescriptor, err := refOf(plan.Sub("descriptor"))
 		entrypoint := plan.Str("entrypoint")
 		ep := visible[entrypoint]
-		if err != nil || !sameRef(planDescriptor, s.Descriptor) || ep == nil {
+		if err != nil || !sameRef(planDescriptor, s.Descriptor) || ep == nil ||
+			boundEntrypoints[entrypoint] {
 			return facts, invalid("binding plan %s disagrees with the descriptor", digest)
 		}
+		boundEntrypoints[entrypoint] = true
+		slots := map[string]bool{}
 		for _, slot := range plan.List("bindings") {
-			if err := requireKeys(slot, "binding", "slot"); err != nil || slot.Str("slot") == "" {
+			slotName := slot.Str("slot")
+			if err := requireKeys(slot, "binding", "slot"); err != nil || slotName == "" ||
+				slots[slotName] {
 				return facts, invalid("binding plan %s has a malformed slot", digest)
 			}
+			slots[slotName] = true
 			ref, err := refOf(slot.Sub("binding"))
 			if err != nil || releaseKinds[ref.Digest] != "resolved_model_binding" ||
 				documents[ref.Digest].Length != ref.Length {
@@ -384,13 +394,19 @@ func Decode(control hub.ExactControlDocument, endpointRef string) (Facts, *exit.
 	sort.Slice(bindings, func(i, j int) bool { return bindings[i].Entrypoint < bindings[j].Entrypoint })
 
 	parts := strings.Split(strings.TrimSpace(endpointRef), "/")
-	if len(parts) != 4 || parts[0] == "" || parts[1] == "" || parts[2] == "" || parts[3] == "" ||
-		visible[parts[3]] == nil {
+	major := uint64(0)
+	var majorErr error
+	if len(parts) == 4 && strings.HasPrefix(parts[2], "v") {
+		major, majorErr = strconv.ParseUint(strings.TrimPrefix(parts[2], "v"), 10, 32)
+	}
+	repo, repoErr := hub.ParseRef(strings.Join(parts[:min(len(parts), 2)], "/"))
+	if len(parts) != 4 || repoErr != nil || majorErr != nil || major == 0 ||
+		parts[2] != fmt.Sprintf("v%d", major) || parts[3] == "" || visible[parts[3]] == nil {
 		return facts, invalid("rental endpoint_ref %q is not covered by the exact descriptor", endpointRef)
 	}
 	facts.Descriptor = &descriptor
 	facts.Placement = orchestrator.DesiredPlacement{
-		Endpoint: parts[0] + "/" + parts[1], ReleaseID: placementSpec.Str("endpoint_release_id"),
+		Endpoint: repo.String(), ReleaseID: placementSpec.Str("endpoint_release_id"),
 		InstallID: s.AcquisitionAttemptID, DescriptorDigest: s.Descriptor.Digest,
 		Bindings: bindings, EnvironmentSpecDigest: s.EnvironmentSpec.Digest,
 		InstalledEnvironmentReceiptDigest: s.InstalledEnvironmentReceipt.Digest,

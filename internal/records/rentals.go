@@ -1,6 +1,7 @@
 package records
 
 import (
+	"bytes"
 	"database/sql"
 	"errors"
 
@@ -286,16 +287,27 @@ func (s *Store) RecordRental(r Rental) *exit.Error {
 		ON CONFLICT(id) DO UPDATE SET address=excluded.address,
 		  cert_path=excluded.cert_path, state=excluded.state, released_at=excluded.released_at,
 		  media_address=excluded.media_address,
-		  control_snapshot_digest=CASE WHEN length(excluded.control_snapshot_bytes)>0
-		    THEN excluded.control_snapshot_digest ELSE rentals.control_snapshot_digest END,
-		  control_snapshot_length=CASE WHEN length(excluded.control_snapshot_bytes)>0
-		    THEN excluded.control_snapshot_length ELSE rentals.control_snapshot_length END,
-		  control_snapshot_bytes=CASE WHEN length(excluded.control_snapshot_bytes)>0
-		    THEN excluded.control_snapshot_bytes ELSE rentals.control_snapshot_bytes END`,
+		  control_snapshot_digest=CASE WHEN length(rentals.control_snapshot_bytes)>0
+		    THEN rentals.control_snapshot_digest ELSE excluded.control_snapshot_digest END,
+		  control_snapshot_length=CASE WHEN length(rentals.control_snapshot_bytes)>0
+		    THEN rentals.control_snapshot_length ELSE excluded.control_snapshot_length END,
+		  control_snapshot_bytes=CASE WHEN length(rentals.control_snapshot_bytes)>0
+		    THEN rentals.control_snapshot_bytes ELSE excluded.control_snapshot_bytes END`,
 		r.ID, r.EndpointRef, r.AcceleratorModel, r.Address, r.CertPath, r.State, r.Hub,
 		r.RentedAt, r.ReleasedAt, r.MediaAddress, r.ControlSnapshotDigest,
 		r.ControlSnapshotLength, r.ControlSnapshotBytes); err != nil {
 		return exit.Internalf("cannot record rental %s: %s", r.ID, err)
+	}
+	stored, e := s.RentalRow(r.ID)
+	if e != nil {
+		return e
+	}
+	if len(r.ControlSnapshotBytes) > 0 && (stored == nil ||
+		stored.ControlSnapshotDigest != r.ControlSnapshotDigest ||
+		stored.ControlSnapshotLength != r.ControlSnapshotLength ||
+		!bytes.Equal(stored.ControlSnapshotBytes, r.ControlSnapshotBytes)) {
+		return exit.Named(exit.Conflict, "rental.control_snapshot_conflict",
+			"rental %s already carries another exact acquisition-attempt control snapshot", r.ID)
 	}
 	return nil
 }
