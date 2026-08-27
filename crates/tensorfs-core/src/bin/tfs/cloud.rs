@@ -9,7 +9,8 @@ use std::path::Path;
 use std::process::ExitCode;
 
 use tensorfs_core::cloud::{
-    self, CatalogRoot, Conflict, PublishClosure, PublishGrant, VerifiedObject,
+    self, ArtifactUploadSet, CatalogRoot, Conflict, DeclaredObjectSet, PublishClosure,
+    PublishGrant, VerifiedObject,
 };
 use tensorfs_core::ids::{Doc, ObjectRef};
 use tensorfs_core::store::Store;
@@ -82,20 +83,54 @@ pub fn cmd_closure(root: &Path, hex: &str, session: &str, flags: &Flags) -> Exit
     ExitCode::SUCCESS
 }
 
+/// Normalize and validate a first-party build artifact declaration through TensorFS's one
+/// canonical writer. The caller supplies data; only the re-emitted bytes are authoritative.
+pub fn cmd_artifact_set(document: &Path, flags: &Flags) -> ExitCode {
+    let value = ok!(tensorfs_core::canon::parse(
+        &read!(document),
+        ArtifactUploadSet::MAX_BYTES
+    ));
+    let set = ok!(ArtifactUploadSet::from_value(&value));
+    emit(&set, flags);
+    println!("artifact_set {}", set.object_id());
+    println!("session      {}", set.session);
+    println!("objects      {}", set.objects.len());
+    ExitCode::SUCCESS
+}
+
+fn grant_from<T: DeclaredObjectSet>(
+    declared: &T,
+    id: &str,
+    flags: &Flags,
+) -> tensorfs_core::err::Result<PublishGrant> {
+    let hex = id.trim_start_matches("sha256:");
+    let object = match declared
+        .objects()
+        .iter()
+        .find(|object| object.sha256 == hex)
+    {
+        Some(object) => object.clone(),
+        None => cloud::object_ref(&format!("sha256:{hex}"), flag_num(flags, "length", 0))?,
+    };
+    PublishGrant::mint(
+        declared,
+        &object,
+        flag_num(flags, "expires-at", now() + 900),
+    )
+}
+
 /// MINT A GRANT. There is no flag that produces an unconditional or unchecksummed one:
 /// both conditions are derived from the digest, so the unsafe grant is unrepresentable.
 pub fn cmd_grant(closure_p: &Path, id: &str, flags: &Flags) -> ExitCode {
-    let closure = ok!(PublishClosure::parse(&read!(closure_p)));
-    let hex = id.trim_start_matches("sha256:");
-    let object = match closure.objects.iter().find(|o| o.sha256 == hex) {
-        Some(o) => o.clone(),
-        None => ok!(cloud::object_ref(id, flag_num(flags, "length", 0))),
+    let raw = read!(closure_p);
+    let grant = match PublishClosure::parse(&raw) {
+        Ok(closure) => ok!(grant_from(&closure, id, flags)),
+        Err(publish_error) if publish_error.code == tensorfs_core::err::Code::UNKNOWN_FORMAT => {
+            let artifacts = ok!(ArtifactUploadSet::parse(&raw));
+            ok!(grant_from(&artifacts, id, flags))
+        }
+        Err(error) => return bail(error),
     };
-    let grant = ok!(PublishGrant::mint(
-        &closure,
-        &object,
-        flag_num(flags, "expires-at", now() + 900)
-    ));
     emit(&grant, flags);
     println!("grant        {}", grant.object_id());
     println!("key          {}", grant.key());

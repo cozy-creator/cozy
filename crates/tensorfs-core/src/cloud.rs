@@ -55,13 +55,73 @@ pub struct PublishClosure {
     pub objects: Vec<ObjectRef>,
 }
 
+/// A first-party build's exact upload set. It is deliberately smaller than a
+/// `PublishClosure`: release meaning lives in Tensorhub's canonical build documents, while
+/// this document authorizes only these exact bytes to enter the shared object store.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ArtifactUploadSet {
+    pub session: String,
+    /// Sorted unique by digest, for the same declare-first reason as `PublishClosure`.
+    pub objects: Vec<ObjectRef>,
+}
+
+/// The one input shape from which a no-clobber upload grant may be minted. Model publishes
+/// and first-party build artifacts differ in their higher-level completion transaction, not
+/// in how an exact object is authorized at the storage boundary.
+pub trait DeclaredObjectSet {
+    fn session(&self) -> &str;
+    fn objects(&self) -> &[ObjectRef];
+
+    fn contains(&self, sha256: &str) -> bool {
+        self.objects().iter().any(|object| object.sha256 == sha256)
+    }
+}
+
 impl PublishClosure {
     pub fn bytes(&self) -> u64 {
         self.objects.iter().map(|o| o.length).sum()
     }
-    pub fn contains(&self, sha256: &str) -> bool {
-        self.objects.iter().any(|o| o.sha256 == sha256)
+}
+
+impl DeclaredObjectSet for PublishClosure {
+    fn session(&self) -> &str {
+        &self.session
     }
+
+    fn objects(&self) -> &[ObjectRef] {
+        &self.objects
+    }
+}
+
+impl DeclaredObjectSet for ArtifactUploadSet {
+    fn session(&self) -> &str {
+        &self.session
+    }
+
+    fn objects(&self) -> &[ObjectRef] {
+        &self.objects
+    }
+}
+
+fn validate_declared_objects(what: &str, session: &str, objects: &[ObjectRef]) -> Result<()> {
+    ascii_name(&format!("{what}.session"), session, limits::MAX_NAME_BYTES)?;
+    if objects.is_empty() {
+        return refuse(Code::MISSING_FIELD, format!("a {what} declares no object"));
+    }
+    let mut ids: Vec<&str> = objects
+        .iter()
+        .map(|object| object.sha256.as_str())
+        .collect();
+    let given = ids.clone();
+    ids.sort_unstable();
+    ids.dedup();
+    if ids != given {
+        return refuse(
+            Code::SORT_ORDER,
+            format!("{what}.objects must be sorted and unique by digest"),
+        );
+    }
+    Ok(())
 }
 
 impl Doc for PublishClosure {
@@ -82,20 +142,7 @@ impl Doc for PublishClosure {
         let session = f.req_str("session")?.to_string();
         let snapshot = ObjectRef::from_value("PublishClosure.snapshot", f.req("snapshot")?)?;
         f.done()?;
-        ascii_name("PublishClosure.session", &session, limits::MAX_NAME_BYTES)?;
-        if objects.is_empty() {
-            return refuse(Code::MISSING_FIELD, "a publish closure declares no object");
-        }
-        let mut ids: Vec<&str> = objects.iter().map(|o| o.sha256.as_str()).collect();
-        let given = ids.clone();
-        ids.sort_unstable();
-        ids.dedup();
-        if ids != given {
-            return refuse(
-                Code::SORT_ORDER,
-                "PublishClosure.objects must be sorted and unique by digest",
-            );
-        }
+        validate_declared_objects("PublishClosure", &session, &objects)?;
         Ok(PublishClosure {
             session,
             snapshot,
@@ -112,6 +159,44 @@ impl Doc for PublishClosure {
             ),
             ("session", Value::str(self.session.clone())),
             ("snapshot", self.snapshot.to_value()),
+        ])
+    }
+}
+
+impl Doc for ArtifactUploadSet {
+    const FORMAT: &'static str = "tensorfs.artifact_upload_set/1";
+    const MAX_BYTES: usize = limits::DOC_MAX_BYTES;
+
+    fn from_value(v: &Value) -> Result<Self> {
+        let mut f = Fields::new("ArtifactUploadSet", v)?;
+        check_format(
+            "ArtifactUploadSet",
+            as_str("ArtifactUploadSet", "format", f.req("format")?)?,
+            Self::FORMAT,
+        )?;
+        let mut objects = Vec::new();
+        for object in as_arr("ArtifactUploadSet", "objects", f.req("objects")?)? {
+            objects.push(ObjectRef::from_value("ArtifactUploadSet.object", object)?);
+        }
+        let session = f.req_str("session")?.to_string();
+        f.done()?;
+        validate_declared_objects("ArtifactUploadSet", &session, &objects)?;
+        Ok(ArtifactUploadSet { session, objects })
+    }
+
+    fn to_value(&self) -> Value {
+        Value::obj(vec![
+            ("format", Value::str(Self::FORMAT)),
+            (
+                "objects",
+                Value::arr(
+                    self.objects
+                        .iter()
+                        .map(|object| object.to_value())
+                        .collect(),
+                ),
+            ),
+            ("session", Value::str(self.session.clone())),
         ])
     }
 }
@@ -136,21 +221,25 @@ pub struct PublishGrant {
 impl PublishGrant {
     /// The only way to get one. It is checked against the declared closure, so a grant can
     /// never name an object the session never declared.
-    pub fn mint(closure: &PublishClosure, object: &ObjectRef, expires_at: u64) -> Result<Self> {
+    pub fn mint<T: DeclaredObjectSet + ?Sized>(
+        declared: &T,
+        object: &ObjectRef,
+        expires_at: u64,
+    ) -> Result<Self> {
         hex64("PublishGrant.object", &object.sha256)?;
-        if !closure.contains(&object.sha256) {
+        if !declared.contains(&object.sha256) {
             return refuse(
                 Code::NOT_CONTAINED,
                 format!(
-                    "{}: not in publish session {:?}'s declared closure — declare-first means \
+                    "{}: not in upload session {:?}'s declared object set — declare-first means \
                      the grant set is a subset of the declaration, never a superset",
                     object.id(),
-                    closure.session
+                    declared.session()
                 ),
             );
         }
         Ok(PublishGrant {
-            session: closure.session.clone(),
+            session: declared.session().to_string(),
             object: object.clone(),
             expires_at,
         })

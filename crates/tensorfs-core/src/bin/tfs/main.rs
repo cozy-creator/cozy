@@ -110,7 +110,8 @@
 //! Flags: --out <f> --expires-at <t> --length <n>
 //!
 //!   tfs cloud closure <root> <snap> <session>   DECLARE FIRST: the exact object set
-//!   tfs cloud grant <closure> <object-id>       both conditions, derived, not optional
+//!   tfs cloud artifact-set <document>           canonical first-party build object set
+//!   tfs cloud grant <set> <object-id>           both conditions, derived, not optional
 //!   tfs cloud verified <grant> <version> <etag> <checksum-b64>
 //!   tfs cloud conflict <grant> <resident-checksum>   honest duplicate, or quarantine
 //!   tfs cloud publish <closure> <facts-dir>     the atomic root, over facts only
@@ -284,6 +285,7 @@ fn main() -> ExitCode {
         ["gc", "pressure", r] => roots::cmd_gc(Path::new(r), "pressure", &flags),
         ["gc", "arms", r] => roots::cmd_arms(Path::new(r)),
         ["cloud", "closure", r, h, s] => cloud::cmd_closure(Path::new(r), h, s, &flags),
+        ["cloud", "artifact-set", d] => cloud::cmd_artifact_set(Path::new(d), &flags),
         ["cloud", "grant", c, i] => cloud::cmd_grant(Path::new(c), i, &flags),
         ["cloud", "verified", g, v, e, c] => cloud::cmd_verified(Path::new(g), v, e, c, &flags),
         ["cloud", "conflict", g, r] => cloud::cmd_conflict(Path::new(g), r),
