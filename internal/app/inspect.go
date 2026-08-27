@@ -47,12 +47,10 @@ func handleDescribe(ctx *Context) *exit.Error {
 			{K: "endpoint", V: endpoint},
 			{K: "function", V: ep.Name},
 			{K: "kind", V: ep.Kind},
-			{K: "gpu", V: ep.GPU},
 			{K: "request", V: fieldLines(ep.Request)},
 			{K: "result", V: fieldLines(ep.Result)},
 			{K: "outputs", V: launch.AssetPaths(ep.Result)},
 			{K: "models", V: slotLines(ep)},
-			{K: "capabilities", V: ep.Caps},
 		}, Notes: []string{"the surface this release's OWN runtime derived and the install verified"}})
 	}
 	rows := []map[string]string{}
@@ -60,9 +58,8 @@ func handleDescribe(ctx *Context) *exit.Error {
 		ep := &d.Entrypoints[i]
 		rows = append(rows, map[string]string{
 			"function": ep.Name, "kind": ep.Kind,
-			"gpu":     fmt.Sprintf("%t", ep.GPU),
-			"request": ep.Request.Name,
-			"result":  ep.Result.Name,
+			"request": fmt.Sprintf("%d fields", len(ep.Request.Fields)),
+			"result":  fmt.Sprintf("%d fields", len(ep.Result.Fields)),
 			"outputs": strings.Join(launch.AssetPaths(ep.Result), ", "),
 			"models":  strings.Join(slotLines(ep), ", "),
 		})
@@ -71,18 +68,19 @@ func handleDescribe(ctx *Context) *exit.Error {
 		job := &d.Jobs[i]
 		rows = append(rows, map[string]string{
 			"function": job.Name, "kind": "job",
-			"request": job.Request.Name, "result": job.Result.Name,
+			"request": fmt.Sprintf("%d fields", len(job.Request.Fields)),
+			"result":  fmt.Sprintf("%d fields", len(job.Result.Fields)),
 		})
 	}
 	return emit(ctx, render.List{Kind: "describe",
 		Fields:    []string{"function", "kind", "request", "result"},
-		AllFields: []string{"function", "kind", "gpu", "request", "result", "outputs", "models"},
+		AllFields: []string{"function", "kind", "request", "result", "outputs", "models"},
 		Rows:      rows,
 		Empty:     "this release registers 0 functions",
 		Aggregates: []render.Field{
 			{K: "endpoint", V: endpoint},
 			{K: "generation", V: short12(facts.Install.ID)},
-			{K: "surface_digest", V: d.Digest},
+			{K: "descriptor_digest", V: d.Digest},
 		},
 		Next: []string{"cozy describe " + ctx.Inv.Args[0] + "/<function>"}})
 }
