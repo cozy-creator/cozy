@@ -1,8 +1,9 @@
 package canonical
 
-// This file is the full RFC 8785 JSON normalization used by EndpointDescriptor/1.
-// Worker-protocol documents continue to use the deliberately narrower integer-only
-// printable-ASCII profile in canonical.go/read.go.
+// This file is RFC 8785 rendering over EndpointDescriptor/1's bounded I-JSON profile.
+// Every numeric value is limited to +/-((2^53)-1), independent of token spelling.
+// Worker-protocol documents continue to use the narrower integer-only printable-ASCII
+// profile in canonical.go/read.go.
 
 import (
 	"bytes"
@@ -203,6 +204,9 @@ func jcsNumber(raw string) (string, error) {
 	value, err := strconv.ParseFloat(raw, 64)
 	if err != nil || math.IsNaN(value) || math.IsInf(value, 0) {
 		return "", refuse("number_range", "%s has no finite IEEE-754 spelling", raw)
+	}
+	if math.Abs(value) > float64(intMax) {
+		return "", refuse("number_range", "%s is outside the interoperable numeric range", raw)
 	}
 	if value == 0 {
 		return "0", nil
