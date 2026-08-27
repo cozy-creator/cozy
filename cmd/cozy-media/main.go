@@ -9,8 +9,11 @@
 // discipline: this binary imports no protocol client and, by fence, contains no outbound
 // network call of any kind. It joins the liability fence by HAVING NOTHING TO EGRESS WITH.
 //
-// Five routes, and the shape of each is the whole design:
+// Six routes, and the shape of each is the whole design:
 //
+//	GET  /v1/bootstrap/receipt    Tensorhub reads one attempt-bound, pod-authored readiness
+//	                              receipt. It has its OWN bearer hash, which cannot authorize
+//	                              any renter route. The response is the exact file bytes.
 //	PUT  /v1/inputs/{blob}        the owner uploads one attempt input; the answer is the
 //	                              POD-LOCAL PATH it landed at, which is what the owner then
 //	                              mints into the DeliveryGrant. The owner never guesses a
@@ -68,15 +71,17 @@ func main() {
 // options is the whole launch surface. Everything is a path grant or a bound; nothing is
 // discovered, nothing is read from the environment, and there is no configuration file.
 type options struct {
-	listen  string
-	root    string // the quota-bounded subtree this server OWNS
-	plans   string // the worker's `binding-plans` directory — write-only, from here
-	tokens  string // the token-hash file, `sha256:<64 hex>` one per line
-	out     string // where `media.addr` is published (the file-handoff discovery contract)
-	cert    string
-	key     string
-	quota   int64
-	maxBody int64
+	listen             string
+	root               string // the quota-bounded subtree this server OWNS
+	plans              string // the worker's `binding-plans` directory — write-only, from here
+	tokens             string // the token-hash file, `sha256:<64 hex>` one per line
+	out                string // where `media.addr` is published (the file-handoff discovery contract)
+	cert               string
+	key                string
+	bootstrapReceipt   string // exact pod-authored JSON; may appear after the listener starts
+	bootstrapTokenHash string // separate one-attempt verifier; never authorizes renter routes
+	quota              int64
+	maxBody            int64
 }
 
 func run(args []string) int {
@@ -102,6 +107,10 @@ func run(args []string) int {
 			opt.cert = value
 		case "tls-key":
 			opt.key = value
+		case "bootstrap-receipt":
+			opt.bootstrapReceipt = value
+		case "bootstrap-token-sha256":
+			opt.bootstrapTokenHash = value
 		case "quota":
 			n, err := strconv.ParseInt(value, 10, 64)
 			if err != nil || n <= 0 {
@@ -125,6 +134,10 @@ func run(args []string) int {
 		return usage("--root <dir> is required: this server owns exactly one subtree")
 	case opt.tokens == "":
 		return usage("--tokens <file> is required: there is no unauthenticated mode")
+	case (opt.bootstrapReceipt == "") != (opt.bootstrapTokenHash == ""):
+		return usage("--bootstrap-receipt and --bootstrap-token-sha256 must be supplied together")
+	case opt.bootstrapTokenHash != "" && !validTokenHash(opt.bootstrapTokenHash):
+		return usage("--bootstrap-token-sha256 must be sha256:<64 lowercase hex>")
 	}
 	for _, dir := range []string{filepath.Join(opt.root, "inputs"), filepath.Join(opt.root, "outputs")} {
 		if err := os.MkdirAll(dir, 0o755); err != nil {
@@ -246,6 +259,50 @@ func (s *server) admits(w http.ResponseWriter, r *http.Request) bool {
 		"the presented credential is not one this pod was provisioned with",
 		"`cozy rent ls` renders the digest of the token this host holds")
 	return false
+}
+
+const maxBootstrapReceiptBytes = 64 << 10
+
+func validTokenHash(line string) bool {
+	if !strings.HasPrefix(line, "sha256:") || len(line) != len("sha256:")+64 {
+		return false
+	}
+	_, err := hex.DecodeString(strings.TrimPrefix(line, "sha256:"))
+	return err == nil && line == strings.ToLower(line)
+}
+
+// bootstrapReceipt is Tensorhub's one read-only rendezvous with a pod it bought. The
+// attempt-specific hash is separate from the renter set, so the hub can prove that the
+// expected image answered without acquiring the ability to control the worker or move
+// media. The file may appear after this listener starts; until then readiness is pending.
+// Exact bytes are returned so the hub can digest and retain the document it actually saw.
+func (s *server) bootstrapReceipt(w http.ResponseWriter, r *http.Request) {
+	presented := strings.TrimSpace(strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer "))
+	if !secret.MatchesHash(presented, s.opt.bootstrapTokenHash) {
+		refuse(w, http.StatusUnauthorized, "media.bootstrap_unauthenticated",
+			"the presented credential does not match this acquisition attempt",
+			"Tensorhub alone holds the one-attempt bootstrap credential")
+		return
+	}
+	file, err := os.Open(s.opt.bootstrapReceipt)
+	if err != nil {
+		refuse(w, http.StatusServiceUnavailable, "media.bootstrap_pending",
+			"the pod has not published its readiness receipt: "+err.Error(),
+			"wait for endpoint materialization and both pod listeners")
+		return
+	}
+	defer file.Close()
+	data, err := io.ReadAll(io.LimitReader(file, maxBootstrapReceiptBytes+1))
+	if err != nil || len(data) == 0 || len(data) > maxBootstrapReceiptBytes || !json.Valid(data) {
+		refuse(w, http.StatusServiceUnavailable, "media.bootstrap_receipt_invalid",
+			"the pod's readiness receipt is unreadable, empty, oversized, or not JSON",
+			"publish one complete receipt by atomic rename after endpoint materialization")
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("Content-Length", strconv.Itoa(len(data)))
+	w.WriteHeader(http.StatusOK)
+	_, _ = w.Write(data)
 }
 
 // safeName is the only shape a caller-supplied path segment may take. An output id is a
@@ -641,6 +698,9 @@ func (s *server) health(w http.ResponseWriter, r *http.Request) {
 
 func (s *server) routes() *http.ServeMux {
 	mux := http.NewServeMux()
+	if s.opt.bootstrapReceipt != "" {
+		mux.HandleFunc("GET /v1/bootstrap/receipt", s.bootstrapReceipt)
+	}
 	mux.HandleFunc("GET /v1/health", s.health)
 	mux.HandleFunc("PUT /v1/inputs/{blob}", s.putInput)
 	mux.HandleFunc("PUT /v1/plans/{id}", s.putPlan)
@@ -670,6 +730,7 @@ func usage(format string, args ...any) int {
 	fmt.Fprintf(os.Stderr, "cozy-media: "+format+"\n", args...)
 	fmt.Fprintln(os.Stderr, "usage: cozy-media --listen <host:port> --root <dir> "+
 		"--tokens <file> [--plans <dir>] [--out <dir>] [--tls-cert <pem> --tls-key <pem>] "+
+		"[--bootstrap-receipt <json> --bootstrap-token-sha256 <sha256:hex>] "+
 		"[--quota <bytes>] [--max-body <bytes>]")
 	return 2
 }
