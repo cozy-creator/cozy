@@ -140,19 +140,28 @@ type Part struct {
 // the hub's own streaming hash discharges the digest.
 func (g Grant) Multipart() bool { return g.Method == "MULTIPART" }
 
-// Grants asks for authorization over the named objects; an empty list means every
-// missing object. An expired grant comes back as `grant.expired_replan` — a REPLAN,
-// never a retry-as-failure.
-func (c *Client) Grants(ctx context.Context, ref Ref, publishID string, ids []string, reason string) ([]Grant, *exit.Error) {
+// Grant asks for authorization over exactly one object immediately before its bytes move.
+// Multipart plans contain one URL per part, so batching objects here can exceed the bounded
+// response reader on a real model. An expired grant comes back as `grant.expired_replan` — a
+// REPLAN, never a retry-as-failure.
+func (c *Client) Grant(ctx context.Context, ref Ref, publishID, objectID, reason string) (Grant, *exit.Error) {
 	var out struct {
 		Grants []Grant `json:"grants"`
 	}
 	e := c.do(ctx, call{
 		method: http.MethodPost, path: publishes(ref) + "/" + publishID + "/grants",
 		admin: true, reason: reason, byBytes: true,
-		body: map[string]any{"object_ids": ids},
+		body: map[string]any{"object_ids": []string{objectID}},
 	}, &out)
-	return out.Grants, e
+	if e != nil {
+		return Grant{}, e
+	}
+	if len(out.Grants) != 1 || out.Grants[0].ObjectID != objectID {
+		return Grant{}, exit.Internalf(
+			"grant for %s answered %d rows or another object", objectID, len(out.Grants),
+		)
+	}
+	return out.Grants[0], nil
 }
 
 // FinishMultipart assembles a ranged upload. The HUB owns this call because it

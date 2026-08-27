@@ -195,55 +195,50 @@ func (p *Publish) Run(ctx context.Context) (Result, *exit.Error) {
 // condition the grant signed, and then asks the hub to prove them. An expired grant
 // comes back as a REPLAN and is answered by asking again — never by failing.
 func (p *Publish) upload(ctx context.Context, missing []hub.Missing, res *Result, ms map[string]int64) *exit.Error {
-	ids := make([]string, 0, len(missing))
-	for _, m := range missing {
-		ids = append(ids, m.ID)
-	}
-
-	t0 := time.Now()
-	grants, e := p.Hub.Grants(ctx, p.Ref, res.PublishID, ids, p.Reason)
-	if e != nil {
-		return e
-	}
-	ms["grants"] = since(t0)
-	res.Grants = len(grants)
-	for _, g := range grants {
+	reports := make([]hub.VerifyReport, 0, len(missing))
+	staged := filepath.Join(p.Scratch, "object")
+	var grantMS, uploadMS int64
+	for i, object := range missing {
+		if p.FailAfter > 0 && i >= p.FailAfter {
+			return exit.Named(exit.Internal, "crash_after_upload",
+				"development kill point: stopped after %d of %d objects", i, len(missing)).
+				WithRemedy("re-run the same publish; the hub re-plans the declaration and the uploaded objects are already held")
+		}
+		t0 := time.Now()
+		g, e := p.Hub.Grant(ctx, p.Ref, res.PublishID, object.ID, p.Reason)
+		grantMS += since(t0)
+		if e != nil {
+			return e
+		}
+		res.Grants++
 		if g.Multipart() {
 			res.Multipart++
 		}
-	}
-	p.say("granted %d objects (%d ranged) at their final content keys", len(grants), res.Multipart)
-
-	t0 = time.Now()
-	reports := make([]hub.VerifyReport, 0, len(grants))
-	staged := filepath.Join(p.Scratch, "object")
-	for i, g := range grants {
-		if p.FailAfter > 0 && i >= p.FailAfter {
-			return exit.Named(exit.Internal, "crash_after_upload",
-				"development kill point: stopped after %d of %d objects", i, len(grants)).
-				WithRemedy("re-run the same publish; the hub re-plans the declaration and the uploaded objects are already held")
-		}
 		// The bytes leave the store through a VERIFIED read, so a publisher cannot
 		// upload what its own store silently corrupted.
+		t0 = time.Now()
 		if e := p.Tool.Extract(g.ObjectID, staged); e != nil {
 			return e
 		}
 		conflict, e := p.put(ctx, g, staged, res)
+		uploadMS += since(t0)
 		if e != nil {
 			// A grant whose window closed is a re-plan, not a failure. Ask again
-			// once and continue; a second expiry is a clock problem, not a race.
+			// once for this same object and continue; a second expiry is a clock
+			// problem, not a race.
 			if e.Name != "grant.expired_replan" {
 				return e
 			}
 			p.say("a grant window closed mid-upload: re-planning (already-verified objects are the journal)")
-			fresh, e2 := p.Hub.Grants(ctx, p.Ref, res.PublishID, []string{g.ObjectID}, p.Reason)
+			t0 = time.Now()
+			fresh, e2 := p.Hub.Grant(ctx, p.Ref, res.PublishID, g.ObjectID, p.Reason)
+			grantMS += since(t0)
 			if e2 != nil {
 				return e2
 			}
-			if len(fresh) != 1 {
-				return exit.Internalf("re-planning %s answered %d grants", g.ObjectID, len(fresh))
-			}
-			conflict, e = p.put(ctx, fresh[0], staged, res)
+			t0 = time.Now()
+			conflict, e = p.put(ctx, fresh, staged, res)
+			uploadMS += since(t0)
 			if e != nil {
 				return e
 			}
@@ -255,13 +250,14 @@ func (p *Publish) upload(ctx context.Context, missing []hub.Missing, res *Result
 		reports = append(reports, hub.VerifyReport{ObjectID: g.ObjectID, Conflict: conflict})
 	}
 	_ = os.Remove(staged)
-	ms["upload"] = since(t0)
-	p.say("uploaded %d objects, %s moved (%d already resident at the key)",
-		res.Uploaded, size(res.Moved), res.Conflicts)
+	ms["grants"] = grantMS
+	ms["upload"] = uploadMS
+	p.say("granted and uploaded %d objects one at a time (%d ranged), %s moved "+
+		"(%d already resident at the key)", res.Uploaded, res.Multipart, size(res.Moved), res.Conflicts)
 
 	// The hub streams every object BACK and hashes it itself. Nothing this client
 	// observed is evidence, which is why the report above carries no checksum.
-	t0 = time.Now()
+	t0 := time.Now()
 	verdicts, e := p.Hub.VerifyObjects(ctx, p.Ref, res.PublishID, reports, p.Reason)
 	if e != nil {
 		return e
