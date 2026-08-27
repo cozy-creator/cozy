@@ -89,6 +89,7 @@ type Server struct {
 	// workflows is Creator's LOCAL ordered-child controller. Its children still enter
 	// exclusively through orchestrator.
 	workflows WorkflowController
+	videos    VideoController
 }
 
 // Resolver exposes control-plane placement facts separately from a local worker launch.
@@ -120,6 +121,7 @@ type Options struct {
 	// Shutdown is the cooperative-exit hook the shutdown route calls (#449).
 	Shutdown  func()
 	Workflows WorkflowController
+	Videos    VideoController
 }
 
 // New builds the server and its route table. It binds nothing; Listeners does that.
@@ -131,7 +133,7 @@ func New(opt Options) *Server {
 		orchestrator: opt.Orchestrator, store: opt.Orchestrator.Store(),
 		layout: opt.Orchestrator.Layout(), cfg: opt.Cfg, creds: opt.Creds,
 		addr: opt.Addr, log: opt.Log, endpoints: opt.Endpoints, bound: opt.Bound,
-		rentals: opt.Rentals, shutdown: opt.Shutdown, workflows: opt.Workflows,
+		rentals: opt.Rentals, shutdown: opt.Shutdown, workflows: opt.Workflows, videos: opt.Videos,
 	}
 }
 
@@ -163,6 +165,7 @@ func (s *Server) Handler() (http.Handler, *exit.Error) {
 		"POST /v1/local/workflows":                    s.submitWorkflow,
 		"GET /v1/local/workflows/{id}":                s.getWorkflow,
 		"POST /v1/local/workflows/{id}/cancel":        s.cancelWorkflow,
+		"POST /v1/local/video-compositions":           s.composeVideo,
 		"GET /healthz":                                s.healthz,
 		"GET /{$}":                                    s.stub,
 		"GET /app.js":                                 s.stub,

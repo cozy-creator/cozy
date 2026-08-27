@@ -256,6 +256,7 @@ none of these.
 | `POST /v1/local/workflows` | local | yes | submit one canonical ordered workflow; `Idempotency-Key`; 202 fresh or 200 replay |
 | `GET /v1/local/workflows/{id}` | local | yes | one workflow with ordinary child request states and accepted outputs projected from the records authority |
 | `POST /v1/local/workflows/{id}/cancel` | local | yes | persist cancellation, cancel the active child, and prevent every later child |
+| `POST /v1/local/video-compositions` | local | CLI only | compose exact source bytes or one retained creative-plan digest into the existing workflow submission shape; local base paths are resolution-only and never returned or stored |
 | `GET /healthz` | local | no | liveness ONLY; says nothing about any request |
 | `GET /{$}` | local | no | the embedded stub page |
 | `GET /app.js` | local | no | the stub's script — a FILE, so no inline-script CSP |
@@ -317,6 +318,37 @@ accepted. `targets` maps a one-based step to an attached rental id. Targets and 
 are resolution only and do not enter workflow/child execution meaning. The frozen workflow status
 set is `running | canceling | succeeded | failed | canceled`; ordinary child rows are projected as
 `queued | in_progress | completed | failed | canceled` plus workflow-only `pending | prepared`.
+
+### The video composer is a LOCAL authoring boundary (cl-024)
+
+`POST /v1/local/video-compositions` is the only YAML-reading route. It requires the OS-protected
+CLI credential because a fresh composition reads caller-owned local paths. Its strict request names
+exactly one of bounded source bytes or a retained `creative_plan_digest`, plus explicit H3 and CPU
+assembly endpoint refs and an optional attached H3 worker. The absolute source directory resolves
+relative asset spellings but is never stored, hashed, echoed, or added to a receipt.
+
+The caller retains the editable YAML; Creator retains its exact-byte digest rather than a hidden
+second copy. The response separates that source identity, path-free/deployment-free creative identity, and
+the existing deployment-resolved `cozy.workflow.Plan/1`. Composition starts no workflow. `cozy video
+submit` passes that plan and its staged content identities to `POST /v1/local/workflows`; workflow
+status, cancellation, recovery, attempts, outputs, and events remain cl-018's one authority. There
+is no video-specific status route, retry policy, cursor, provider call, endpoint callback, or second
+lifecycle table.
+
+Composition rows are durable project records in v1 and deliberately retain their staged content
+identities after any workflow settles. There is no implicit expiry or GC guess about whether
+creative work is disposable. A future explicit forget verb may release a composition; until then,
+retention is permanent and visible. The entire local root is mode 0700, protecting prompts in the
+records database and SQLite's lazily-created WAL/SHM files from other OS users.
+
+Only `cozy video compose` and `cozy video submit` exist. A formatter would rewrite the very source
+bytes whose identity is being preserved, while an honest validator must resolve schemas and stage
+content and is therefore composition with its result discarded. The source parser lives only in
+Creator's video package; endpoints, Runtime, Tensorhub, worker protocol, and workflow records never
+parse YAML or acquire shot semantics.
+
+`cozy video submit` requires an explicit idempotency key. A client that loses the POST response can
+therefore retry the same key and recover the same cl-018 workflow rather than minting a duplicate.
 
 ## 8. Local host security posture
 

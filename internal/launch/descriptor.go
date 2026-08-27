@@ -75,19 +75,22 @@ type Slot struct {
 
 // Struct is a rendered msgspec struct.
 type Struct struct {
-	Name   string  `json:"struct"`
-	Fields []Field `json:"fields"`
+	Name     string          `json:"struct"`
+	Fields   []Field         `json:"fields"`
+	TagField string          `json:"tag_field"`
+	Tag      json.RawMessage `json:"tag"`
 }
 
 // Field is one declared field and its rendered type. `Type` is a string for a scalar
 // (`int`, `str`) and an object for an asset (`{"asset":"image"}`), a list
 // (`{"list":"float"}`) or a nested struct (`{"struct":…,"fields":[…]}`).
 type Field struct {
-	Name        string           `json:"name"`
-	Type        json.RawMessage  `json:"type"`
-	Wire        string           `json:"wire"`
-	Constraints FieldConstraints `json:"constraints"`
-	AssetBound  struct {
+	Name          string           `json:"name"`
+	Type          json.RawMessage  `json:"type"`
+	Wire          string           `json:"wire"`
+	Discriminator bool             `json:"discriminator"`
+	Constraints   FieldConstraints `json:"constraints"`
+	AssetBound    struct {
 		MaxBytes   int64    `json:"max_bytes"`
 		MediaTypes []string `json:"media_types"`
 	} `json:"asset_bound"`

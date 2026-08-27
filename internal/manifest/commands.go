@@ -287,6 +287,38 @@ var Commands = []Command{
 		Handler: "workflow.cancel",
 	},
 
+	// ---- editable Cozy Video sources (cl-024) ----
+	{
+		Path: []string{"video", "compose"}, Group: "videos",
+		Summary: "compose an editable cozy.video/1 source into an exact ordinary workflow",
+		Args:    "<source.cozy-video.yaml>", MinArgs: 1, MaxArgs: 1,
+		Flags: []Flag{
+			{Name: "--h3", Arg: "<endpoint-ref>", Summary: "installed H3 endpoint or the endpoint on --worker"},
+			{Name: "--assembler", Arg: "<endpoint-ref>", Summary: "installed CPU video-assembly endpoint"},
+			{Name: "--worker", Arg: "<rental-id>", Summary: "resolve every H3 shot against this attached rental"},
+			{Name: "--out", Arg: "<file>", Summary: "write the path-free composition document"},
+		},
+		Exits: []exit.Code{exit.OK, exit.Usage, exit.Validation, exit.NotFound,
+			exit.Structural, exit.Unavailable, exit.Conflict},
+		Capability: "cmd.video.compose", NeedsServer: true, Status: Implemented,
+		Handler: "video.compose",
+	},
+	{
+		Path: []string{"video", "submit"}, Group: "videos",
+		Summary: "submit a source or retained creative plan through the durable workflow owner",
+		Args:    "<source.cozy-video.yaml | creative-plan-digest>", MinArgs: 1, MaxArgs: 1,
+		Flags: []Flag{
+			{Name: "--h3", Arg: "<endpoint-ref>", Summary: "installed H3 endpoint or the endpoint on --worker"},
+			{Name: "--assembler", Arg: "<endpoint-ref>", Summary: "installed CPU video-assembly endpoint"},
+			{Name: "--worker", Arg: "<rental-id>", Summary: "run every H3 shot on this attached rental; assembly stays local"},
+			{Name: "--idempotency-key", Arg: "<key>", Summary: "required: name this workflow so a lost response can be retried"},
+		},
+		Exits: []exit.Code{exit.OK, exit.Usage, exit.Validation, exit.NotFound,
+			exit.Structural, exit.Unavailable, exit.Conflict},
+		Capability: "cmd.video.submit", NeedsServer: true, Status: Implemented,
+		Handler: "video.submit",
+	},
+
 	// ---- jobs (cl-004) ----
 	{
 		Path: []string{"job", "submit"}, Group: "jobs",

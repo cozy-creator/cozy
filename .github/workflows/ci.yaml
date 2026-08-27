@@ -16,7 +16,7 @@ jobs:
       # Tests are an executed gate, not an implication of build/vet. The targeted race
       # arm includes the filesystem-writing worker versus HTTP media quota regression.
       - run: go test ./...
-      - run: go test -race ./cmd/cozy-media ./integration ./internal/api ./internal/app ./internal/inputasset ./internal/orchestrator ./internal/records ./internal/workflow
+      - run: go test -race ./cmd/cozy-media ./integration ./internal/api ./internal/app ./internal/inputasset ./internal/orchestrator ./internal/records ./internal/video ./internal/workflow
       - run: go vet ./...
       - run: python3 scripts/fence.py
 

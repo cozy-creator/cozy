@@ -97,7 +97,7 @@ CREATE TABLE IF NOT EXISTS pins (
   activated_at TEXT    NOT NULL,
   PRIMARY KEY (endpoint, major)
 )`}, append(orchestratorSchema,
-	append(eventSchema, append(rentalSchema, workflowSchema...)...)...)...)
+	append(eventSchema, append(rentalSchema, append(workflowSchema, videoSchema...)...)...)...)...)
 
 // pragmas ride the DSN rather than being executed after the open, because a pragma is a
 // property of a CONNECTION and database/sql may discard and redial one at any moment: a

@@ -47,6 +47,7 @@ import pathlib, re, sys
 SCAN = ["go.mod", "cmd/**/*.go", "internal/**/*.go"]
 
 DENY_DEPS = ["tensorhub-v2", "varena"]
+YAML_IMPORT = "go.yaml.in/yaml/v3"
 
 DENY_IMPL = [
     "safetensors", "cozytensor", "tensorbytes", "tensorchunk", "chunk", "residency",
@@ -225,6 +226,8 @@ def check_sources():
             for d in DENY_DEPS:
                 if re.search(r"(?<![\w.-])" + re.escape(d) + r"(?![\w-])", s, re.I):
                     bad.append(f"{p}:{i}: [deps] forbidden dependency '{d}': {s}")
+            if p.suffix == ".go" and YAML_IMPORT in s and not str(p).startswith("internal/video/"):
+                bad.append(f"{p}:{i}: [deps] YAML parsing belongs only to internal/video: {s}")
             for d in DENY_STORE:
                 if d in s.lower():
                     bad.append(f"{p}:{i}: [store] lifecycle sidecar '{d}' — the one SQLite "

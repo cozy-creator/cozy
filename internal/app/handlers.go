@@ -68,6 +68,8 @@ var handlers = map[string]Handler{
 	"workflow.submit": handleWorkflowSubmit,
 	"workflow.status": handleWorkflowStatus,
 	"workflow.cancel": handleWorkflowCancel,
+	"video.compose":   handleVideoCompose,
+	"video.submit":    handleVideoSubmit,
 	"rent":            handleRent,
 	"rent.ls":         handleRentLs,
 	"rent.release":    handleRentRelease,

@@ -661,7 +661,11 @@ func (s *Store) AssetInUse(digest string) (bool, *exit.Error) {
 			}
 		}
 	}
-	return s.workflowAssetInUse(digest)
+	used, problem := s.workflowAssetInUse(digest)
+	if problem != nil || used {
+		return used, problem
+	}
+	return s.compositionAssetInUse(digest)
 }
 
 // SettleRequest records the request's final state. Only a terminal the orchestrator

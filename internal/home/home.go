@@ -60,6 +60,15 @@ func Open(root string) (Layout, *exit.Error) {
 	if root == "" {
 		return Layout{}, exit.Internalf("the local root is unset: internal/config.Load did not run")
 	}
+	// The records database retains request payloads and path-free creative prompts; the
+	// client credential and rental secrets already make this an OS-private user root.
+	// Protecting the directory also protects SQLite's lazily-created WAL/SHM siblings.
+	if err := os.MkdirAll(root, 0o700); err != nil {
+		return Layout{}, exit.Internalf("cannot create the private local root %s: %s", root, err)
+	}
+	if err := os.Chmod(root, 0o700); err != nil {
+		return Layout{}, exit.Internalf("cannot protect the private local root %s: %s", root, err)
+	}
 	l := Layout{
 		Root:        root,
 		DB:          filepath.Join(root, "records.db"),
