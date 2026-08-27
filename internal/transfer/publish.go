@@ -195,7 +195,7 @@ func (p *Publish) Run(ctx context.Context) (Result, *exit.Error) {
 // upload requests grants, writes each object at its final content key under every
 // condition the grant signed, and then asks the hub to prove them. An expired grant
 // comes back as a REPLAN and is answered by asking again — never by failing.
-const publishParallelism = 8
+const publishParallelism = 16
 
 type uploadOutcome struct {
 	index     int
