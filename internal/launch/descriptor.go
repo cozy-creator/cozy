@@ -15,10 +15,11 @@
 //   - THE SELECTION is `endpoint.toml`'s `[bindings]` table — the author's declared
 //     default, in the runtime's own grammar and vocabulary.
 //
-// What cozy-creator DOES own is the LOCAL PINNED-BINDING RECORD it mints from those three
-// (see orchestrator.Binding): th-004 owns the real EntrypointBindingPlan document, this is the
-// named seam, and the identity rule — the plan id is the digest of the record's canonical
-// bytes — does not move when the document does.
+// For a wholly weightless endpoint the installed runtime is the sole canonical plan writer:
+// `bindings --json` reports exact ArtifactSubjects before spawn and
+// `serve --weightless-endpoint` privately stages the same bytes. Creator consumes the
+// identities as record-owner intent and never reconstructs the documents. The older local
+// pinned-binding writer below remains only for the modeled path that still carries it.
 package launch
 
 import (
@@ -57,7 +58,7 @@ type Entrypoint struct {
 	// traffic. H3's `reference_to_video` is the case: its vision-conditioning seam is
 	// unbuilt, and staging its binding anyway let it fail to prepare and deny the working
 	// T2VA sibling the card.
-	Hidden bool `json:"hidden"`
+	Hidden  bool     `json:"hidden"`
 	Models  []Slot   `json:"models"`
 	Request Struct   `json:"request"`
 	Result  Struct   `json:"result"`

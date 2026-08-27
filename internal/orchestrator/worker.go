@@ -23,22 +23,22 @@ import (
 	pb "github.com/cozy-creator/cozy-creator-v2/protocol/cozy/worker/v1"
 )
 
-// Binding is cozy-creator's LOCAL PINNED-BINDING RECORD: the resolution of one
-// `entrypoint_binding_plan_id` against this machine. The orchestrator names a plan by
-// digest on the wire and stages the record the worker resolves that digest against.
+// Binding is the record owner's resolution of one `entrypoint_binding_plan_id`. For a
+// wholly weightless local endpoint, RuntimePlan is the installed runtime's exact subject
+// and Runtime owns the private bytes. The modeled/connected path still carries Record so
+// it can stage or deliver those bytes explicitly.
 //
-// The record's key set is CLOSED at both ends — cozy-runtime refuses an unknown key —
-// and th-004 owns the real EntrypointBindingPlan document. This is the named seam, not a
-// pretend hub: when th-004 lands, the id keeps being the digest of a canonical document
-// and only the document changes.
-//
-// `Record` is the WHOLE record; which half of it is IDENTITY and which half is this
-// machine's RESOLUTION is declared once, in internal/plan (#506a), and both the id and
-// the pod's re-derivation of it read that one declaration.
+// `Record` is the WHOLE older modeled record; which half is IDENTITY and which half is
+// this machine's RESOLUTION is declared once in internal/plan (#506a). RuntimePlan never
+// revives that format: its id, digest and length are consumed exactly as Runtime reports.
 type Binding struct {
 	Entrypoint string         `json:"entrypoint"`
 	Record     map[string]any `json:"record"`
-	planID     string
+	// RuntimePlan is the exact ArtifactSubject emitted by the installed runtime for a
+	// wholly weightless endpoint. Runtime owns and privately stages those canonical
+	// bytes; this record owner consumes only their measured identity before spawn.
+	RuntimePlan *BindingPlanSubject `json:"runtime_plan,omitempty"`
+	planID      string
 	// Outputs names this entrypoint's RESULT FIELD PATHS (`image`, `preview`,
 	// `detail.thumb`). It is not part of the binding record's canonical bytes — it is
 	// the LAUNCHER's knowledge of the entrypoint's declared result shape, which cl-006
@@ -47,10 +47,24 @@ type Binding struct {
 	Outputs []string `json:"outputs,omitempty"`
 }
 
-// PlanID is the binding's identity: sha256 over the canonical bytes of the record's
-// IDENTITY half, without its own id (a document never contains its own digest) and
-// without the paths that say where this machine put things (#506a).
+// BindingPlanSubject is the wire identity of one Runtime-owned canonical plan document.
+// It deliberately carries no path or bytes: serve --weightless-endpoint stages those.
+type BindingPlanSubject struct {
+	SubjectID string `json:"subject_id"`
+	Kind      string `json:"kind"`
+	Digest    string `json:"digest"`
+	Length    uint64 `json:"length"`
+}
+
+// PlanID is the binding's identity. Runtime-owned plans carry it exactly; an older modeled
+// record derives it from the canonical bytes of its IDENTITY half (#506a).
 func (b *Binding) PlanID() (string, *exit.Error) {
+	if b.RuntimePlan != nil {
+		if _, err := canonical.Raw(b.RuntimePlan.SubjectID); err != nil {
+			return "", exit.Internalf("runtime reported a malformed binding-plan subject id: %s", err)
+		}
+		return b.RuntimePlan.SubjectID, nil
+	}
 	if b.planID != "" {
 		return b.planID, nil
 	}
@@ -65,6 +79,11 @@ func (b *Binding) PlanID() (string, *exit.Error) {
 // Staged is the record exactly as it lands on the worker's disk — identity, resolution
 // and the id — and is what the remote delivery path ships to a pod's media server.
 func (b *Binding) Staged() (string, []byte, *exit.Error) {
+	if b.RuntimePlan != nil {
+		return "", nil, exit.Named(exit.Structural, "binding_plan_bytes_unavailable",
+			"binding plan %s is staged privately by the installed runtime", b.RuntimePlan.SubjectID).
+			WithRemedy("launch it locally with the runtime's explicit weightless-endpoint mode")
+	}
 	id, e := b.PlanID()
 	if e != nil {
 		return "", nil, e
@@ -74,6 +93,28 @@ func (b *Binding) Staged() (string, []byte, *exit.Error) {
 		return "", nil, e
 	}
 	return id, data, nil
+}
+
+// runtimeArtifactSubject returns the exact wire subject Runtime authored for a weightless
+// plan. Older modeled records obtain their subject from Staged's exact bytes instead.
+func (b *Binding) runtimeArtifactSubject() (*pb.ArtifactSubject, *exit.Error) {
+	if b.RuntimePlan.Kind != "plan" {
+		return nil, exit.Internalf("runtime reported binding-plan kind %q, want plan", b.RuntimePlan.Kind)
+	}
+	digest, err := canonical.Raw(b.RuntimePlan.Digest)
+	if err != nil {
+		return nil, exit.Internalf("runtime reported a malformed binding-plan digest: %s", err)
+	}
+	id, e := b.PlanID()
+	if e != nil {
+		return nil, e
+	}
+	if b.RuntimePlan.Length == 0 {
+		return nil, exit.Internalf("runtime reported a zero-length binding plan %s", id)
+	}
+	return &pb.ArtifactSubject{
+		Digest: digest, SubjectId: id, Kind: b.RuntimePlan.Kind, Length: b.RuntimePlan.Length,
+	}, nil
 }
 
 // THE THREE OBJECTS THAT USED TO BE ONE (#484). `EndpointSpec` conflated three
@@ -199,6 +240,21 @@ func pinnedEndpoint(endpoint, rental string) string {
 
 // IsJob answers the worker's mode.
 func (p DesiredPlacement) IsJob() bool { return len(p.Jobs) > 0 }
+
+// RuntimeStagesBindings reports the one local launch mode in which the installed runtime
+// owns every canonical binding-plan byte. A partial set is never a launch mode: modeled
+// and remote placements keep their explicit artifact and plan delivery paths.
+func (p DesiredPlacement) RuntimeStagesBindings() bool {
+	if len(p.Bindings) == 0 {
+		return false
+	}
+	for _, b := range p.Bindings {
+		if b.RuntimePlan == nil {
+			return false
+		}
+	}
+	return true
+}
 
 // IsJob answers the worker's mode, from the one placement it hosts.
 func (s WorkerLaunchSpec) IsJob() bool { return s.Placement.IsJob() }
@@ -439,12 +495,13 @@ func hostsPlans(w *worker, p DesiredPlacement) bool {
 	return true
 }
 
-// spawnWorker journals the device grant, stages the binding records, and spawns the
-// worker. The grant is journaled BEFORE the process exists: a process that was never
+// spawnWorker journals the device grant, resolves exact binding subjects, and spawns the
+// worker. It stages older modeled records; weightless canonical bytes are staged by the
+// runtime's explicit launch mode. The grant is journaled BEFORE the process exists: a process that was never
 // granted an envelope cannot appear, and two concurrent starts cannot both consume one.
 func (c *Orchestrator) spawnWorker(spec WorkerLaunchSpec) (string, *exit.Error) {
 	instanceID := spec.InstanceID()
-	// The slot's root is REUSED on purpose: the supervisor journal under it is what a
+	// The slot's root is REUSED on purpose: the worker journal under it is what a
 	// restarted worker replays as `recovered_attempts`. Wiping it would manufacture the
 	// absence this protocol refuses to manufacture.
 	root := c.opt.Layout.WorkerDir(instanceID)
@@ -456,15 +513,29 @@ func (c *Orchestrator) spawnWorker(spec WorkerLaunchSpec) (string, *exit.Error) 
 	var planIDs []string
 	var subjects []*pb.ArtifactSubject
 	for _, b := range spec.Placement.Bindings {
-		id, data, e := b.Staged()
-		if e != nil {
-			return "", e
-		}
-		if _, e := plan.Stage(filepath.Join(workerHome, "binding-plans"), b.Record); e != nil {
-			return "", e
+		var id string
+		var subject *pb.ArtifactSubject
+		if b.RuntimePlan != nil {
+			var e *exit.Error
+			subject, e = b.runtimeArtifactSubject()
+			if e != nil {
+				return "", e
+			}
+			id = subject.SubjectId
+		} else {
+			var data []byte
+			var e *exit.Error
+			id, data, e = b.Staged()
+			if e != nil {
+				return "", e
+			}
+			if _, e := plan.Stage(filepath.Join(workerHome, "binding-plans"), b.Record); e != nil {
+				return "", e
+			}
+			subject = subjectOf(id, data)
 		}
 		planIDs = append(planIDs, id)
-		subjects = append(subjects, subjectOf(id, data))
+		subjects = append(subjects, subject)
 	}
 	sortStrings(planIDs) // the wire field is sorted lexicographic ascending
 	sortSubjects(subjects)
@@ -500,7 +571,7 @@ func (c *Orchestrator) spawnWorker(spec WorkerLaunchSpec) (string, *exit.Error) 
 	// `cozy-runtime serve`'s CLOSED flag set — the launch facts nothing can discover for a
 	// orchestrator. It is the runtime's PUBLIC launch grammar, so this is the only spelling
 	// the orchestrator knows: `--socket`/`--out` are the path grants the verb translates
-	// into the supervisor's own `--hub`/`--root`.
+	// into its worker loop.
 	// THE WORKER BINDS ITS OWN SOCKET (#436): a unix path under its run root (loopback
 	// `127.0.0.1:0` on Windows — proc shims pick it), published to run/control.addr for
 	// this owner to dial. `--socket` is the runtime serve verb's listen grant.
@@ -519,10 +590,6 @@ func (c *Orchestrator) spawnWorker(spec WorkerLaunchSpec) (string, *exit.Error) 
 	args = append(args,
 		"--socket", listen,
 		"--out", filepath.Join(root, "run"),
-		// THIS machine's copy of the release tree (#563f). It is `cmd.Dir` below, so the
-		// worker's own default would already be right — stating it is what makes the
-		// launcher, and not a binding-plan record written beside it, the resolver.
-		"--project", spec.Dir,
 		"--instance-id", instanceID,
 		"--release-id", spec.Placement.ReleaseID,
 		"--devices", strings.Join(spec.Devices, ","),
@@ -645,10 +712,13 @@ func newWorker(instanceID string, spec WorkerLaunchSpec) *worker {
 // no spawn, no device grant (the pod's card is the pod's), no birth identity — the
 // conversation is the same claim the local path runs, dialed at the rental's address
 // with the pinned cert and the owner token as proof (#445).
-// It also DELIVERS this placement's binding-plan records to the pod. That is the half that
+// It also DELIVERS this placement's binding-plan records to the pod. Runtime-owned
+// weightless plans intentionally carry no bytes and therefore refuse this connected path;
+// they are valid only with a locally installed endpoint and its explicit launch mode.
+// This delivery is the half that
 // was missing: a desired set names plan ids, and the worker resolves each one against a
-// record on ITS OWN disk (`<worker home>/binding-plans/<id>.json`). The local path stages
-// those records by writing files; the connected path had no channel at all, so a real pod
+// record on ITS OWN disk (`<worker home>/binding-plans/<id>.json`). The older local modeled
+// path stages those records by writing files; the connected path had no channel at all, so a real pod
 // would have been directed to serve plans it had never been given (#506a/#506b). The
 // channel is the pod's media server, and the pod re-derives each id from the record's own
 // identity before it keeps the bytes — so delivery either agrees or refuses typed.

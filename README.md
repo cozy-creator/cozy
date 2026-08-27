@@ -227,7 +227,9 @@ service, so there is no temporary direct-Go path for the HTTP API to later wrap:
   through the PUBLIC verb `cozy-runtime serve` rather than a private
   `internal.worker.session:main` import (runtime `db4ab8a` passes its already-read config
   into `supervise`), so the orchestrator speaks the verb's own closed launch grammar
-  (`--socket`/`--out`); and `job_descriptor_id` is READ from `describe <job> --json`
+  (`--socket`/`--out`); for a wholly weightless release, `bindings --json` also supplies
+  exact canonical plan subjects before spawn and `serve --weightless-endpoint` privately
+  stages those same bytes; and `job_descriptor_id` is READ from `describe <job> --json`
   (runtime `4485f27`) rather than re-derived, which deletes cl-004's Go reimplementation
   of the canonical form along with the refusals it owed for values the protocol profile
   cannot spell.
@@ -235,8 +237,9 @@ service, so there is no temporary direct-Go path for the HTTP API to later wrap:
   `--dev-endpoint` is DELETED with its loader and its writer. A generation carries the
   venv that runs it, the descriptor its own runtime derived and the install verified, and
   the `endpoint.toml` binding table that selects its artifact; the local artifact index
-  answers where the bytes are. cozy-creator mints the local pinned-binding record from
-  those three (th-004 owns the real EntrypointBindingPlan document — the named seam).
+  answers where the bytes are. The modeled path still carries its explicit local record.
+  The weightless path consumes Runtime-authored plan subjects and never recreates its
+  canonical closure in Go.
 - **The payload is typed against the recorded schema**, client-side, before a request
   exists: `steps=2` is an int because the surface says int, an undeclared key is exit 3
   naming what the release declares, and none of it costs a subprocess or a round trip.
@@ -439,10 +442,10 @@ installed-binary state and release state are four distinct evidence axes, so a g
   is that file plus a throwaway container with an empty home to run it on.
 - **`fixtures/weightless/`** is an endpoint with no `Model` parameter, so `gpu` derives
   False and its release depends on the BASE cozy-runtime wheel alone — no torch anywhere in
-  its venv. It **serves**: cozy-runtime `a3c3d72` reads a binding record carrying none of
-  the seven model keys as WEIGHTLESS and returns from `prepare` before the torch import, so
-  `launch.binding` mints that record for a modelless entrypoint instead of refusing
-  `no_servable_function`. cl-010's named seam is closed. The fixture drives the whole
+  its venv. It **serves**: the installed runtime authors one canonical provisioned closure,
+  reports exact plan subjects through `bindings --json`, and privately stages the identical
+  bytes under `serve --weightless-endpoint`; Creator only carries those identities as the
+  record owner's desired state. There is no flat Record/2 fallback. The fixture drives the whole
   product path — install, `start`, invoke, typed result, published PNG, and the failure
   terminal on the same path — with nothing to load, which is the only claim a machine with
   no card can make for itself. `no_servable_function` survives for its one remaining case:
