@@ -23,7 +23,6 @@ import (
 	"io"
 	"net/http"
 	"strings"
-	"time"
 
 	"github.com/cozy-creator/cozy-creator-v2/internal/api"
 	"github.com/cozy-creator/cozy-creator-v2/internal/config"
@@ -55,9 +54,10 @@ func Open(cfg config.Config, st service.State) (*Client, *exit.Error) {
 	return &Client{
 		base:  "http://" + st.Addr,
 		token: token,
-		// Long, because a run's own stream is the thing being waited on and the
-		// deadline that matters is the request's, not the transport's.
-		http: &http.Client{Timeout: 6 * time.Hour},
+		// No client-wide clock decides whether a local workflow or request stalled.
+		// Explicit caller deadlines cancel their request; worker liveness and measured
+		// no-progress facts decide operational failure.
+		http: &http.Client{},
 	}, nil
 }
 

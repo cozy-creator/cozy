@@ -14,6 +14,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"sort"
 
 	"github.com/cozy-creator/cozy-creator-v2/internal/exit"
 	"github.com/cozy-creator/cozy-creator-v2/internal/home"
@@ -216,6 +217,60 @@ func Descriptor(st *records.Store, id string) (*launch.Descriptor, *exit.Error) 
 		return nil, e
 	}
 	return facts.Descriptor, nil
+}
+
+// ControlSummary is the exact, non-secret execution closure Tensorhub selected for one
+// attached rental. It is an observation surface for acceptance and diagnosis, never an
+// input to selection: callers still ask only for endpoint + provider-neutral accelerator.
+type ControlSummary struct {
+	ControlSnapshotDigest             string   `json:"control_snapshot_digest"`
+	EndpointExecutionDigest           string   `json:"endpoint_execution_digest"`
+	ArtifactObjectSetDigest           string   `json:"artifact_object_set_digest"`
+	ModelRootDigests                  []string `json:"model_root_digests"`
+	EndpointReleaseID                 string   `json:"endpoint_release_id"`
+	DescriptorDigest                  string   `json:"descriptor_digest"`
+	EnvironmentSpecDigest             string   `json:"environment_spec_digest"`
+	InstalledEnvironmentReceiptDigest string   `json:"installed_environment_receipt_digest"`
+	PlacementSetDigest                string   `json:"placement_set_digest"`
+	BindingPlanDigests                []string `json:"binding_plan_digests"`
+}
+
+// Inspect returns the persisted rental row plus the verified projection of its exact
+// acquisition-attempt control snapshot. No provider resource id, lane selector, or secret
+// is exposed or reconstructed.
+func Inspect(st *records.Store, id string) (*records.Rental, ControlSummary, *exit.Error) {
+	row, e := st.RentalRow(id)
+	if e != nil || row == nil {
+		if e == nil {
+			e = unknown(id)
+		}
+		return row, ControlSummary{}, e
+	}
+	facts, e := controlFacts(*row)
+	if e != nil {
+		return row, ControlSummary{}, e
+	}
+	plans := make([]string, 0, len(facts.Placement.Bindings))
+	for _, binding := range facts.Placement.Bindings {
+		planID, problem := binding.PlanID()
+		if problem != nil {
+			return row, ControlSummary{}, problem
+		}
+		plans = append(plans, planID)
+	}
+	sort.Strings(plans)
+	return row, ControlSummary{
+		ControlSnapshotDigest:             row.ControlSnapshotDigest,
+		EndpointExecutionDigest:           facts.EndpointExecutionDigest,
+		ArtifactObjectSetDigest:           facts.ArtifactObjectSetDigest,
+		ModelRootDigests:                  append([]string(nil), facts.ModelRootDigests...),
+		EndpointReleaseID:                 facts.Placement.ReleaseID,
+		DescriptorDigest:                  facts.Placement.DescriptorDigest,
+		EnvironmentSpecDigest:             facts.Placement.EnvironmentSpecDigest,
+		InstalledEnvironmentReceiptDigest: facts.Placement.InstalledEnvironmentReceiptDigest,
+		PlacementSetDigest:                facts.Placement.ExactPlacementSetDigest,
+		BindingPlanDigests:                plans,
+	}, nil
 }
 
 func unknown(id string) *exit.Error {

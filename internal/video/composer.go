@@ -40,7 +40,7 @@ type ComposeRequest struct {
 	CreativePlanDigest string
 	H3Endpoint         string
 	AssemblyEndpoint   string
-	Worker             string
+	RentalID           string
 }
 
 func Open(opt Options) (*Composer, *exit.Error) {
@@ -208,22 +208,22 @@ func (c *Composer) resolveProfile(request ComposeRequest) (videoProfile, *exit.E
 	}
 	var h3 orchestrator.DesiredPlacement
 	var problem *exit.Error
-	remote := strings.TrimSpace(request.Worker) != ""
+	remote := strings.TrimSpace(request.RentalID) != ""
 	if remote {
 		if c.opt.Rentals == nil || c.opt.RemoteEntrypoint == nil {
 			return videoProfile{}, exit.Unavailablef("this LocalService resolves no rented video target")
 		}
-		resolved, e := c.opt.Rentals(strings.TrimSpace(request.Worker))
+		resolved, e := c.opt.Rentals(strings.TrimSpace(request.RentalID))
 		if e != nil || resolved == nil {
 			if e == nil {
-				e = exit.New(exit.NotFound, "no attached rental %s", request.Worker)
+				e = exit.New(exit.NotFound, "no attached rental %s", request.RentalID)
 			}
 			return videoProfile{}, e
 		}
 		h3 = *resolved
 		if h3.Endpoint != request.H3Endpoint {
 			return videoProfile{}, exit.Named(exit.Conflict, "video_h3_target_mismatch",
-				"rental %s serves %s, not %s", request.Worker, h3.Endpoint, request.H3Endpoint)
+				"rental %s serves %s, not %s", request.RentalID, h3.Endpoint, request.H3Endpoint)
 		}
 	} else {
 		h3, problem = c.opt.Resolver.ResolvePlacement(request.H3Endpoint)
@@ -235,7 +235,7 @@ func (c *Composer) resolveProfile(request ComposeRequest) (videoProfile, *exit.E
 		var schema *launch.Entrypoint
 		var problem *exit.Error
 		if remote {
-			schema, problem = c.opt.RemoteEntrypoint(request.Worker, name)
+			schema, problem = c.opt.RemoteEntrypoint(request.RentalID, name)
 		} else {
 			schema, problem = c.opt.Resolver.Entrypoint(h3.InstallID, name)
 		}

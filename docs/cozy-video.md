@@ -46,11 +46,11 @@ replaces rather than mixes the generated segment soundtracks.
 ```sh
 cozy video compose film.cozy-video.yaml \
   --h3 cozy/minimax-h3 --assembler cozy/video-assembly \
-  --worker <rental-id> --out film.composition.json
+  --rental <rental-id> --out film.composition.json
 
 cozy video submit film.cozy-video.yaml \
   --h3 cozy/minimax-h3 --assembler cozy/video-assembly \
-  --worker <rental-id> --idempotency-key film-run-001
+  --rental <rental-id> --idempotency-key film-run-001
 ```
 
 `compose` stages bounded immutable assets and records the path-free creative plan, but starts no
@@ -61,5 +61,6 @@ spellings, and shot-ID edits do not change creative identity when their meaning 
 the same.
 
 V1 deliberately has no includes, templates, variables, inheritance, arbitrary graph expressions,
-transition system, retry fields, duration/step knobs, or model profile selection. FULL versus BAKED
-is resolved from the exact endpoint release, outside the source.
+transition system, retry fields, duration/step knobs, or model profile selection. FULL versus
+AdaLN-pruned structure is frozen in the exact endpoint execution selected by Tensorhub, outside
+the source.

@@ -56,8 +56,13 @@ type snapshot struct {
 // Facts is the verified remote-only projection. Descriptor is used for payload
 // typing; Placement is handed directly to the orchestrator.
 type Facts struct {
-	Descriptor *launch.Descriptor
-	Placement  orchestrator.DesiredPlacement
+	Descriptor              *launch.Descriptor
+	Placement               orchestrator.DesiredPlacement
+	EndpointExecutionDigest string
+	ArtifactObjectSetDigest string
+	ModelRootDigests        []string
+	BindingReleaseDigest    string
+	EndpointBundleDigest    string
 }
 
 type exactRef struct {
@@ -215,6 +220,16 @@ func Decode(control hub.ExactControlDocument, endpointRef string) (Facts, *exit.
 	if err != nil || requireKeys(objectSet, "kind", "roots") != nil ||
 		objectSet.Str("kind") != "tensorhub.resolved_object_set/1" {
 		return facts, invalid("artifact object set is not the closed canonical document: %v", err)
+	}
+	for _, root := range objectSet.List("roots") {
+		if err := requireKeys(root, "objects", "root"); err != nil {
+			return facts, invalid("artifact object set root is not closed: %v", err)
+		}
+		ref, err := refOf(root.Sub("root"))
+		if err != nil {
+			return facts, invalid("artifact object set root is malformed: %v", err)
+		}
+		facts.ModelRootDigests = append(facts.ModelRootDigests, ref.Digest)
 	}
 
 	releaseKinds := map[string]string{}
@@ -401,6 +416,10 @@ func Decode(control hub.ExactControlDocument, endpointRef string) (Facts, *exit.
 		return facts, invalid("rental endpoint_ref %q is not covered by the exact descriptor", endpointRef)
 	}
 	facts.Descriptor = descriptor
+	facts.EndpointExecutionDigest = s.EndpointExecutionDigest
+	facts.ArtifactObjectSetDigest = s.ArtifactObjectSet.Digest
+	facts.BindingReleaseDigest = s.BindingRelease.Digest
+	facts.EndpointBundleDigest = s.EndpointBundle.Digest
 	facts.Placement = orchestrator.DesiredPlacement{
 		Endpoint: repo.String(), ReleaseID: placementSpec.Str("endpoint_release_id"),
 		InstallID: s.AcquisitionAttemptID, DescriptorDigest: s.Descriptor.Digest,

@@ -22,6 +22,7 @@ package orchestrator
 import (
 	"fmt"
 	"io"
+	"sort"
 	"sync"
 	"time"
 
@@ -444,17 +445,16 @@ func (c *Orchestrator) retirementLoop() {
 	}
 }
 
-// checkRetirement replaces a worker that is resident, staged for the head of the queue,
-// and has ANSWERED that it cannot serve it. `StallGrace` and its timer are DELETED, not
+// checkRetirement replaces a worker that either blocks the head of the queue or owes an
+// active attempt, and has ANSWERED that it cannot progress. `StallGrace` and its timer are DELETED, not
 // resized (cl-025, decisions #613): no wall-clock number here may race a legitimate
 // workload, because any constant sized to one workload kills the next — H3's cold fill
 // runs minutes by construction and was killed at 90 s forever. A worker is retired on
 // exactly three grounds, each an observation rather than a schedule:
 //
-//  1. WORKER-DECLARED FAULT — the placement has held a latched fault past `ErrorGrace`
-//     (the same latch `EnsurePlacementReady` reads; a fault is the worker saying "I
-//     cannot", and the grace only lets a transient one clear). A claim this owner itself
-//     REFUSED is the same ground with no clock: the verdict is already settled.
+//  1. WORKER-DECLARED FAULT — a FAILED/fault axis is the worker saying "I cannot" and
+//     is acted on immediately. Transient work remains MATERIALIZING/ACTIVATING rather
+//     than publishing a terminal fault. A claim this owner REFUSED is the same class.
 //  2. LIVENESS DEATH — the worker owes an ObservedWorkerState every `ReportCadence` and
 //     has missed `SilentReports` of them. A count of missed heartbeats, never a guess
 //     about how long a load takes: a worker filling for an hour reports on every one.
@@ -472,79 +472,95 @@ func (c *Orchestrator) checkRetirement() {
 		head = c.pending[0]
 	}
 	c.mu.Unlock()
-	if head == "" || closing {
+	if closing {
 		return
 	}
-	req, e := c.opt.Store.RequestRow(head)
-	if e != nil || req == nil {
-		return
+	var req *records.Request
+	if head != "" {
+		var e *exit.Error
+		req, e = c.opt.Store.RequestRow(head)
+		if e != nil || req == nil {
+			return
+		}
+	}
+	type candidate struct {
+		instance  string
+		placement string
+		state     string
+		ground    string
+		spec      WorkerLaunchSpec
 	}
 	c.mu.Lock()
-	var victim *worker
+	candidates := []candidate{}
 	for _, w := range c.workers {
-		if w.exited || !staged(w, req.PlanID) {
+		if w.exited || req != nil && !staged(w, req.PlanID) {
 			continue
 		}
-		if w.dispatchableFor(req.PlanID) || (w.spec.IsJob() && w.dispatchable[req.PlanID]) {
+		if req != nil && (w.dispatchableFor(req.PlanID) ||
+			w.spec.IsJob() && w.dispatchable[req.PlanID]) {
 			// Dispatchable. The queue is waiting on placement, not on this worker.
 			c.mu.Unlock()
 			return
 		}
-		victim = w
+		if ground := retirementGround(w); ground != "" {
+			candidates = append(candidates, candidate{instance: w.instanceID,
+				placement: w.placementID, spec: w.spec, ground: ground,
+				state: fmt.Sprintf("%s/%s",
+					trimEnum(pb.MaterializationState_name[int32(w.materialization)], "MATERIALIZATION_STATE_"),
+					trimEnum(pb.ServingState_name[int32(w.serving)], "SERVING_STATE_"))})
+		}
 	}
-	if victim == nil {
-		c.mu.Unlock()
+	c.mu.Unlock()
+	sort.Slice(candidates, func(i, j int) bool { return candidates[i].instance < candidates[j].instance })
+	for _, victim := range candidates {
+		subject := head
+		if subject == "" {
+			open, e := c.opt.Store.OpenAttemptsOf(victim.instance)
+			if e != nil || len(open) == 0 {
+				continue
+			}
+			subject = open[0].RequestID
+		}
+		c.logf("worker %s is %s while %s depends on it; retiring it: %s",
+			victim.instance, victim.state, subject, victim.ground)
+		if e := c.RetirePlacement(victim.instance, victim.placement); e != nil {
+			c.logf("worker %s could not be told to retire %s (%s); the stop follows",
+				victim.instance, victim.placement, e.Message)
+		}
+		c.ShutdownWorker(victim.instance, StopGrace)
+		// A remote worker has no local process waiter to recover its open journal.
+		// Reconnect the same exact Tensorhub-selected target after the old control
+		// stream is closed; local workers recover from their process exit path.
+		if victim.spec.Connection != nil {
+			go c.recoverWorker(victim.spec)
+		}
 		return
+	}
+}
+
+func retirementGround(w *worker) string {
+	if w.refusal != nil {
+		return fmt.Sprintf("this owner refused its claim (%s: %s)",
+			w.refusal.ErrName(), w.refusal.Message)
+	}
+	if w.faulted {
+		return fmt.Sprintf("it reported a terminal worker/placement fault: %s", w.fault)
 	}
 	quiet := time.Duration(0)
-	if !victim.lastReport.IsZero() {
-		quiet = time.Since(victim.lastReport)
-	} else if !victim.spawned.IsZero() {
-		quiet = time.Since(victim.spawned)
+	if !w.lastReport.IsZero() {
+		quiet = time.Since(w.lastReport)
+	} else if !w.spawned.IsZero() {
+		quiet = time.Since(w.spawned)
 	}
-	stuck := time.Duration(0)
-	if !victim.errorSince.IsZero() {
-		stuck = time.Since(victim.errorSince)
+	if quiet > SilentReports*ReportCadence {
+		return fmt.Sprintf("it reported no observed state for %s — %d missed reports of %s",
+			quiet.Round(time.Second), SilentReports, ReportCadence)
 	}
-	fault, refused := victim.fault, victim.refusal
-	wedged, still := victim.wedged, victim.noProgress
-	state := fmt.Sprintf("%s/%s",
-		trimEnum(pb.MaterializationState_name[int32(victim.materialization)], "MATERIALIZATION_STATE_"),
-		trimEnum(pb.ServingState_name[int32(victim.serving)], "SERVING_STATE_"))
-	instance, placement := victim.instanceID, victim.placementID
-	c.mu.Unlock()
-
-	silent := SilentReports * ReportCadence
-	ground := ""
-	switch {
-	case refused != nil:
-		ground = fmt.Sprintf("this owner refused its claim (%s: %s)", refused.ErrName(), refused.Message)
-	case stuck > ErrorGrace:
-		ground = fmt.Sprintf("it has held a worker-declared fault for %s: %s",
-			stuck.Round(time.Second), fault)
-	case quiet > silent:
-		ground = fmt.Sprintf("it has reported no observed state for %s — %d missed reports of %s: "+
-			"it is dead or stalled, not slow", quiet.Round(time.Second), SilentReports, ReportCadence)
-	case wedged && still >= NoProgressReports:
-		ground = fmt.Sprintf("it declared itself WEDGED and %d successive reports moved no axis",
-			still)
-	default:
-		return
+	if w.wedged && w.noProgress >= NoProgressReports {
+		return fmt.Sprintf("it declared itself WEDGED and %d successive reports moved no axis",
+			w.noProgress)
 	}
-	c.logf("worker %s is %s and undispatchable while %s waits; retiring it: %s",
-		instance, state, head, ground)
-	// RETIRE, THEN SHUT DOWN. The two halves are separate acts (#484): the placement is
-	// taken out of the desired set first, so the worker drains what it holds under a
-	// DRAINING posture instead of meeting SIGTERM with the set still saying "serve this".
-	// A worker whose stream is already gone cannot be told, and that refusal is not an
-	// error — the process stop below is what settles it either way.
-	if e := c.RetirePlacement(instance, placement); e != nil {
-		c.logf("worker %s could not be told to retire %s (%s); the process stop follows",
-			instance, placement, e.Message)
-	}
-	// ShutdownWorker's own reviveQueue asks for the replacement, so the request the
-	// retirement fired for is the one whose need gets re-asked.
-	c.ShutdownWorker(instance, StopGrace)
+	return ""
 }
 
 // queueDepth is how many requests are waiting for capacity right now.

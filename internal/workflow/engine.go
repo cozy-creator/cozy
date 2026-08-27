@@ -62,11 +62,16 @@ type Snapshot struct {
 }
 
 type StepSnapshot struct {
-	Ordinal      int
-	State        string
-	Child        *records.Request
-	Outputs      []records.Output
-	Materialized bool
+	Ordinal            int
+	State              string
+	Child              *records.Request
+	Outputs            []records.Output
+	Materialized       bool
+	MaterializedDigest string
+	MaterializedAssets []MaterializedAsset
+	ResolvedBindings   []records.ResolvedBinding
+	ChildKey           string
+	RentalID           string
 }
 
 func Open(opt Options) (*Engine, *exit.Error) {
@@ -717,7 +722,8 @@ func (e *Engine) cancelActive(workflow records.WorkflowExecution,
 		case "terminal":
 			return nil // wait for the ack/requeue projection before deciding what remains
 		default:
-			return e.opt.Owner.CancelClient(request.ID, uint64(last.Attempt), 5000)
+			return e.opt.Owner.CancelClient(request.ID, uint64(last.Attempt),
+				orchestrator.ClientCancelGraceMS)
 		}
 	}
 	return e.settle(workflow, steps, "canceled", "CLIENT_CANCELED",
@@ -775,7 +781,17 @@ func (e *Engine) snapshot(id string) (*Snapshot, *exit.Error) {
 	}
 	out := &Snapshot{Execution: *row, Steps: make([]StepSnapshot, 0, len(steps))}
 	for _, step := range steps {
-		one := StepSnapshot{Ordinal: step.Ordinal, Materialized: step.MaterializedDigest != ""}
+		one := StepSnapshot{Ordinal: step.Ordinal, Materialized: step.MaterializedDigest != "",
+			MaterializedDigest: step.MaterializedDigest,
+			ResolvedBindings:   append([]records.ResolvedBinding(nil), step.ResolvedBindings...),
+			ChildKey:           step.ChildKey, RentalID: step.Worker}
+		if len(step.MaterializedSubmission) > 0 {
+			materialized, decodeProblem := DecodeMaterialized(step.MaterializedSubmission)
+			if decodeProblem != nil {
+				return nil, decodeProblem
+			}
+			one.MaterializedAssets = append([]MaterializedAsset(nil), materialized.Assets...)
+		}
 		if !one.Materialized {
 			one.State = "pending"
 		} else if step.ChildRequestID == "" {

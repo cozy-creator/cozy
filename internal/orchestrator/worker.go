@@ -338,6 +338,10 @@ type worker struct {
 	// worker: it shares this host's filesystem, so its grant IS a path and there is
 	// nothing to transport.
 	media *media.Client
+	// cancelControl closes the active owner stream for an attached worker. Local
+	// processes also exit through their process waiter; remote workers have no local
+	// process to signal, so retirement must explicitly close this connection.
+	cancelControl func()
 
 	// remoteInstance is the instance identity an ATTACHED pod's worker declared for
 	// itself. A pod is a machine this host never spawned, so it names its own worker the
@@ -420,6 +424,7 @@ type worker struct {
 	// whose placement latches a fault has not answered "not yet" — it has answered "I
 	// cannot", and a client waiting on it needs that answer rather than a longer wait.
 	fault      string
+	faulted    bool
 	errorSince time.Time
 	// lastReport is when this worker last said ANYTHING. The ObservedWorkerState cadence
 	// is a protocol fact rather than a choice made here, which is what makes silence
@@ -849,14 +854,6 @@ func graceOr(v float64) float64 {
 	return v
 }
 
-// ErrorGrace is how long a placement may hold a latched fault before the wait gives up on
-// it. A shortfall on a shared card is often transient — a neighbouring process gives the
-// device back and the next activation succeeds — so a fault is not instantly fatal. What
-// is fatal is staying there: cl-003 watched a worker whose fill was refused
-// `device_shortfall` report every two seconds for eleven minutes while a `cozy run`
-// waited out the full thirty-minute readiness window with nothing on its event stream.
-const ErrorGrace = 90 * time.Second
-
 // ReportCadence is the worker's OWN ObservedWorkerState period, a protocol fact rather
 // than a number chosen here: the worker reports durably on this cadence so an owner can
 // always see a desired state it issued that has not converged.
@@ -887,15 +884,14 @@ func (c *Orchestrator) EnsurePlacementReady(instanceID, planID string) *exit.Err
 		w := c.workers[instanceID]
 		ok := w != nil && !w.exited && w.dispatchableFor(planID)
 		gone := w == nil || w.exited
-		logPath, fault, stuck, code := "", "", time.Duration(0), 0
+		logPath, fault, code := "", "", 0
+		workerFaulted := false
 		quiet := time.Duration(0)
 		unstaged, holds := false, ""
 		var refused *exit.Error
 		if w != nil {
 			logPath, fault, code, refused = w.logPath, w.fault, w.exitCode, w.refusal
-			if !w.errorSince.IsZero() {
-				stuck = time.Since(w.errorSince)
-			}
+			workerFaulted = w.faulted
 			if !w.lastReport.IsZero() {
 				quiet = time.Since(w.lastReport)
 			} else if !w.spawned.IsZero() {
@@ -943,11 +939,10 @@ func (c *Orchestrator) EnsurePlacementReady(instanceID, planID string) *exit.Err
 			return exit.New(exit.Failed, "the endpoint worker exited before reporting ready").
 				WithRemedy("its log is %s", logPath)
 		}
-		if stuck > ErrorGrace {
-			// The worker's OWN words, under the code its reason projects to. Waiting
-			// longer on a worker that has been saying "I cannot" for a minute and a half
-			// is not patience, it is a client with no answer.
-			return workerError(fault, stuck).WithRemedy("its log is %s", logPath)
+		if workerFaulted {
+			// FAILED/fault is the worker's settled typed answer, not a timer start.
+			// Transient work remains MATERIALIZING/ACTIVATING and keeps reporting progress.
+			return workerError(fault).WithRemedy("its log is %s", logPath)
 		}
 		if quiet > silent {
 			// STALLED, and said as an observation rather than as an elapsed time: this
@@ -970,19 +965,18 @@ const RecycleExit = 75
 // workerError is the orchestrator's PROJECTION over a worker's fault reason. The reasons
 // are the runtime's neutral vocabulary; deciding what a user should do about one is this
 // side's job, exactly as it is for a terminal's (status, cause).
-func workerError(fault string, stuck time.Duration) *exit.Error {
+func workerError(fault string) *exit.Error {
 	said := fault
 	if said == "" {
 		said = "no reason reported"
 	}
 	if strings.Contains(fault, "shortfall") || strings.Contains(fault, "capacity") {
 		return exit.New(exit.Capacity,
-			"the endpoint worker cannot make its binding resident on this device (%s, for %s)",
-			said, stuck.Round(time.Second))
+			"the endpoint worker cannot make its binding resident on this device: %s", said)
 	}
 	return exit.New(exit.Failed,
-		"the endpoint worker's placement has held a fault for %s and never became "+
-			"dispatchable: %s", stuck.Round(time.Second), said)
+		"the endpoint worker's placement reported a terminal fault and cannot become "+
+			"dispatchable: %s", said)
 }
 
 func (c *Orchestrator) WorkerLog(instanceID string) string {
@@ -1181,6 +1175,9 @@ func (c *Orchestrator) ShutdownWorker(instanceID string, grace time.Duration) {
 	c.mu.Unlock()
 	if w == nil {
 		return
+	}
+	if w.cancelControl != nil {
+		w.cancelControl()
 	}
 	if w.cmd != nil && w.cmd.Process != nil && !w.exited {
 		// The cooperative tier: SIGTERM to the group, CTRL_BREAK to the job's console

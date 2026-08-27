@@ -387,6 +387,34 @@ func handleRentLs(ctx *Context) *exit.Error {
 	return emit(ctx, list)
 }
 
+func handleRentShow(ctx *Context) *exit.Error {
+	_, st, e := rentalStores(ctx)
+	if e != nil {
+		return e
+	}
+	defer st.Close()
+	row, control, e := rental.Inspect(st, strings.TrimSpace(ctx.Inv.Args[0]))
+	if e != nil {
+		return e
+	}
+	return emit(ctx, render.Record{Kind: "rental_control", Fields: []render.Field{
+		{K: "rental", V: row.ID}, {K: "state", V: row.State},
+		{K: "endpoint", V: row.EndpointRef}, {K: "accelerator", V: row.AcceleratorModel},
+		{K: "control_snapshot_digest", V: control.ControlSnapshotDigest},
+		{K: "endpoint_execution_digest", V: control.EndpointExecutionDigest},
+		{K: "endpoint_release_id", V: control.EndpointReleaseID},
+		{K: "artifact_object_set_digest", V: control.ArtifactObjectSetDigest},
+		{K: "model_root_digests", V: control.ModelRootDigests},
+		{K: "descriptor_digest", V: control.DescriptorDigest},
+		{K: "environment_spec_digest", V: control.EnvironmentSpecDigest},
+		{K: "installed_environment_receipt_digest", V: control.InstalledEnvironmentReceiptDigest},
+		{K: "placement_set_digest", V: control.PlacementSetDigest},
+		{K: "binding_plan_digests", V: control.BindingPlanDigests},
+	}, Notes: []string{
+		"observed exact control selected by Tensorhub; none of these fields is a placement input",
+	}})
+}
+
 func handleRentRelease(ctx *Context) *exit.Error {
 	id := strings.TrimSpace(ctx.Inv.Args[0])
 	l, st, e := rentalStores(ctx)

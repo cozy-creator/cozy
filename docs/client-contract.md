@@ -324,7 +324,8 @@ set is `running | canceling | succeeded | failed | canceled`; ordinary child row
 `POST /v1/local/video-compositions` is the only YAML-reading route. It requires the OS-protected
 CLI credential because a fresh composition reads caller-owned local paths. Its strict request names
 exactly one of bounded source bytes or a retained `creative_plan_digest`, plus explicit H3 and CPU
-assembly endpoint refs and an optional attached H3 worker. The absolute source directory resolves
+assembly endpoint refs and an optional attached H3 rental id. The rental is a Tensorhub-selected
+result handle, never provider or placement policy. The absolute source directory resolves
 relative asset spellings but is never stored, hashed, echoed, or added to a receipt.
 
 The caller retains the editable YAML; Creator retains its exact-byte digest rather than a hidden
@@ -332,7 +333,7 @@ second copy. The response separates that source identity, path-free/deployment-f
 the existing deployment-resolved `cozy.workflow.Plan/1`. Composition starts no workflow. `cozy video
 submit` passes that plan and its staged content identities to `POST /v1/local/workflows`; workflow
 status, cancellation, recovery, attempts, outputs, and events remain cl-018's one authority. There
-is no video-specific status route, retry policy, cursor, provider call, endpoint callback, or second
+is no video-specific status route, retry policy, cursor, provider selector, endpoint callback, or second
 lifecycle table.
 
 Composition rows are durable project records in v1 and deliberately retain their staged content

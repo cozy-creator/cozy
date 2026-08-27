@@ -68,11 +68,11 @@ func handleVideoSubmit(ctx *Context) *exit.Error {
 			FieldPath: asset.FieldPath, Digest: asset.Digest, Length: asset.Length,
 			MediaType: asset.MediaType, Order: asset.Order})
 	}
-	worker := strings.TrimSpace(ctx.Inv.Value("--worker"))
+	rentalID := strings.TrimSpace(ctx.Inv.Value("--rental"))
 	var targets []api.WorkflowTargetResolution
-	if worker != "" {
+	if rentalID != "" {
 		for step := 1; step <= composition.ShotCount; step++ {
-			targets = append(targets, api.WorkflowTargetResolution{Step: step, Worker: worker})
+			targets = append(targets, api.WorkflowTargetResolution{Step: step, Worker: rentalID})
 		}
 	}
 	client, problem := dial(ctx)
@@ -103,7 +103,7 @@ func composeVideo(ctx *Context, allowDigest bool) (video.Composition, *exit.Erro
 	}
 	input := ctx.Inv.Args[0]
 	request := api.VideoComposeRequest{H3Endpoint: h3, AssemblyEndpoint: assembler,
-		Worker: strings.TrimSpace(ctx.Inv.Value("--worker"))}
+		RentalID: strings.TrimSpace(ctx.Inv.Value("--rental"))}
 	if allowDigest && strings.HasPrefix(input, "sha256:") {
 		request.CreativePlanDigest = input
 	} else {
@@ -187,8 +187,8 @@ func writeComposition(path string, composition video.Composition) *exit.Error {
 func videoResolutionFlags(ctx *Context) string {
 	flags := " --h3 " + ctx.Inv.Value("--h3") + " --assembler " + ctx.Inv.Value("--assembler") +
 		" --idempotency-key <key>"
-	if worker := ctx.Inv.Value("--worker"); worker != "" {
-		flags += " --worker " + worker
+	if rentalID := ctx.Inv.Value("--rental"); rentalID != "" {
+		flags += " --rental " + rentalID
 	}
 	return flags
 }

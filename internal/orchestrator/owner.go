@@ -192,6 +192,18 @@ func (c *Orchestrator) converse(w *worker, addr string) error {
 	client := pb.NewWorkerControlClient(conn)
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
+	c.mu.Lock()
+	if current := c.workers[w.instanceID]; current == w {
+		w.cancelControl = cancel
+	}
+	c.mu.Unlock()
+	defer func() {
+		c.mu.Lock()
+		if current := c.workers[w.instanceID]; current == w {
+			w.cancelControl = nil
+		}
+		c.mu.Unlock()
+	}()
 	stream, err := client.Control(ctx)
 	if err != nil {
 		return err

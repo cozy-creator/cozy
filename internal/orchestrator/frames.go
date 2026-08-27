@@ -233,7 +233,8 @@ func (c *Orchestrator) onObserved(s *session, r *pb.ObservedWorkerState) {
 		// A placement holding a FAULT is timed from the first report that carried one, and
 		// the clock resets the moment it clears. The reason is the worker's own — this side
 		// echoes what it reported and never composes one.
-		if faulted(status, r) {
+		w.faulted = faulted(status, r)
+		if w.faulted {
 			if w.errorSince.IsZero() {
 				w.errorSince = time.Now()
 			}
@@ -245,6 +246,11 @@ func (c *Orchestrator) onObserved(s *session, r *pb.ObservedWorkerState) {
 		}
 		for _, f := range r.Faults {
 			w.fault = fmt.Sprintf("%s: %s", f.Reason, brief(f.Detail, 240))
+		}
+		if len(r.Faults) == 0 && status != nil {
+			for _, f := range status.Faults {
+				w.fault = fmt.Sprintf("%s: %s", f.Reason, brief(f.Detail, 240))
+			}
 		}
 		// THE NO-PROGRESS GROUND'S BOOKKEEPING (cl-025). Movement is a changed signature
 		// between two of the worker's own reports; the wedge verdict is the worker's own
@@ -346,12 +352,40 @@ func progressSignature(r *pb.ObservedWorkerState, status *pb.PlacementStatus) st
 // the worker too). The orchestrator never diagnoses a wedge itself — it acts on this
 // report, which is the whole of decisions #613's rule.
 func wedgeDeclared(r *pb.ObservedWorkerState) bool {
-	for _, a := range r.Activity {
-		if a.Kind == "liveness" && strings.Contains(a.Step, "WEDGED") {
+	type verdict struct {
+		seq    uint64
+		wedged bool
+	}
+	latest := map[string]verdict{}
+	for _, activity := range r.Activity {
+		if activity.Kind != "liveness" {
+			continue
+		}
+		subject, wedged, ok := livenessVerdict(activity.Step)
+		if !ok || latest[subject].seq > activity.Seq {
+			continue
+		}
+		latest[subject] = verdict{seq: activity.Seq, wedged: wedged}
+	}
+	for _, current := range latest {
+		if current.wedged {
 			return true
 		}
 	}
 	return false
+}
+
+// livenessVerdict reads only the two exact Runtime spellings. In particular, the
+// recovery note contains the historical word WEDGED while explicitly retracting it;
+// substring matching turned that retraction into a fresh wedge.
+func livenessVerdict(step string) (subject string, wedged bool, ok bool) {
+	if subject, _, ok = strings.Cut(step, " is WEDGED by silence"); ok && subject != "" {
+		return subject, true, true
+	}
+	if subject, _, ok = strings.Cut(step, " resumed ("); ok && subject != "" {
+		return subject, false, true
+	}
+	return "", false, false
 }
 
 // faulted answers whether this worker is holding a REFUSAL rather than merely taking its

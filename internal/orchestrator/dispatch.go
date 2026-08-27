@@ -1101,6 +1101,10 @@ func (c *Orchestrator) AwaitAccepted(requestID string, attempt uint64, timeout t
 	}
 }
 
+// ClientCancelGraceMS is the one cooperative attempt-cancellation policy. It is a
+// cancellation budget carried to Runtime, never a stall or workflow deadline.
+const ClientCancelGraceMS uint64 = 5000
+
 // CancelClient is the client-reason cancel, for the callers that have no business
 // naming a protocol enum.
 func (c *Orchestrator) CancelClient(requestID string, attempt, graceMS uint64) *exit.Error {

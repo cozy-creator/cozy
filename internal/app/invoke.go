@@ -105,7 +105,6 @@ func handleStart(ctx *Context) *exit.Error {
 // disagree.
 func waitReady(c *localapi.Client, instance string) (localapi.Worker, *exit.Error) {
 	silent := (orchestrator.SilentReports * orchestrator.ReportCadence).Milliseconds()
-	errorGrace := orchestrator.ErrorGrace.Milliseconds()
 	for {
 		// THIS OWNER'S OWN VERDICT COMES FIRST, exactly as it does inside the orchestrator:
 		// a worker whose claim was refused here is not slow and not silent, and waiting out
@@ -133,8 +132,7 @@ func waitReady(c *localapi.Client, instance string) (localapi.Worker, *exit.Erro
 			if w.Refusal != "" {
 				// A refusal this host recorded at claim time is a SETTLED verdict, not a
 				// state the worker might leave — so it answers now instead of after eight
-				// missed report periods. A worker FAULT is the other thing entirely and is
-				// timed below: a placement can hold one and still activate.
+				// missed report periods. A worker FAULT is the other settled verdict below.
 				return localapi.Worker{}, exit.New(exit.Conflict,
 					"this host refused the worker at that address: %s", w.Refusal).
 					WithNext("cozy logs <org/endpoint>")
@@ -146,10 +144,10 @@ func waitReady(c *localapi.Client, instance string) (localapi.Worker, *exit.Erro
 					orchestrator.SilentReports, orchestrator.ReportCadence).
 					WithNext("cozy logs <org/endpoint>")
 			}
-			if w.ErrorForMS > errorGrace {
+			if w.Fault != "" {
 				return localapi.Worker{}, exit.New(exit.Failed,
-					"the endpoint worker's placement has held a fault for %d ms and never "+
-						"became dispatchable: %s", w.ErrorForMS, w.Fault).
+					"the endpoint worker's placement reported a terminal fault and cannot "+
+						"become dispatchable: %s", w.Fault).
 					WithNext("cozy logs <org/endpoint>")
 			}
 		}
@@ -585,6 +583,13 @@ func compactValue(v map[string]any) string {
 // declared — the CLI composes no path a server did not name.
 func saveOutputs(ctx *Context, c *localapi.Client, life api.Lifecycle) ([]map[string]string, *exit.Error) {
 	dir := ctx.Inv.Value("--out")
+	return saveOutputsAt(c, life, dir)
+}
+
+// saveOutputsAt is the one verified local-download path for ordinary requests and
+// workflow exports. Every caller receives through the opaque media API, hashes the
+// bytes independently, checks length and digest, then atomically publishes the file.
+func saveOutputsAt(c *localapi.Client, life api.Lifecycle, dir string) ([]map[string]string, *exit.Error) {
 	if dir == "" || len(life.Outputs) == 0 {
 		return nil, nil
 	}

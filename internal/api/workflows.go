@@ -64,11 +64,16 @@ type WorkflowState struct {
 }
 
 type WorkflowStepState struct {
-	Ordinal      int        `json:"ordinal"`
-	Status       string     `json:"status"`
-	Materialized bool       `json:"materialized"`
-	ChildRequest string     `json:"child_request_id,omitempty"`
-	Outputs      []MediaRef `json:"outputs"`
+	Ordinal            int                          `json:"ordinal"`
+	Status             string                       `json:"status"`
+	Materialized       bool                         `json:"materialized"`
+	MaterializedDigest string                       `json:"materialized_submission_digest,omitempty"`
+	MaterializedAssets []workflow.MaterializedAsset `json:"materialized_assets"`
+	ResolvedBindings   []records.ResolvedBinding    `json:"resolved_bindings"`
+	ChildKey           string                       `json:"child_key,omitempty"`
+	RentalID           string                       `json:"rental_id,omitempty"`
+	ChildRequest       string                       `json:"child_request_id,omitempty"`
+	Outputs            []MediaRef                   `json:"outputs"`
 }
 
 func (s *Server) submitWorkflow(w http.ResponseWriter, r *http.Request) {
@@ -199,7 +204,10 @@ func workflowStateOf(snapshot *workflow.Snapshot) WorkflowState {
 			status = contractStatus(status)
 		}
 		one := WorkflowStepState{Ordinal: step.Ordinal, Status: status,
-			Materialized: step.Materialized, Outputs: []MediaRef{}}
+			Materialized: step.Materialized, MaterializedDigest: step.MaterializedDigest,
+			MaterializedAssets: append([]workflow.MaterializedAsset{}, step.MaterializedAssets...),
+			ResolvedBindings:   append([]records.ResolvedBinding{}, step.ResolvedBindings...),
+			ChildKey:           step.ChildKey, RentalID: step.RentalID, Outputs: []MediaRef{}}
 		if step.Child != nil {
 			one.ChildRequest = step.Child.ID
 		}
