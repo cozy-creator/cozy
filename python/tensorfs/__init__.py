@@ -61,6 +61,7 @@ from ._ext import (
     run_doc,
     seed_digests,
     topology_digest,
+    transfer_object,
 )
 
 #: The closed carrier/logical dtype enum and its element sizes. The ONE export of dtype
@@ -100,4 +101,5 @@ __all__ = [
     "run_doc",
     "seed_digests",
     "topology_digest",
+    "transfer_object",
 ]

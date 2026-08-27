@@ -89,6 +89,7 @@ fn _ext(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(store::fetch_plan, m)?)?;
     m.add_function(wrap_pyfunction!(store::fetch_admit, m)?)?;
     m.add_function(wrap_pyfunction!(store::fetch_complete, m)?)?;
+    m.add_function(wrap_pyfunction!(store::transfer_object, m)?)?;
     m.add_class::<store::PyStore>()?;
     m.add_class::<store::PyLease>()?;
     m.add_class::<store::PyPlan>()?;

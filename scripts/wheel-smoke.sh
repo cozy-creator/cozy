@@ -33,7 +33,7 @@ rm -rf "$work/venv"
 echo "installed into fresh venv: $("$work/venv/bin/python" -V)"
 
 "$work/venv/bin/python" - "$PWD" "$SNAP" "$DIGEST" <<'PY'
-import hashlib, pathlib, sys
+import hashlib, pathlib, sys, tempfile
 
 repo, snap, want = pathlib.Path(sys.argv[1]), sys.argv[2], sys.argv[3]
 import tensorfs
@@ -63,6 +63,7 @@ digest = hashlib.sha256()
 
 with store.acquire_snapshot(snap) as lease:
     print(f"lease: {len(lease.objects)} objects, {lease.bytes} B verified")
+    first_id, first_length = lease.objects[0]
 
     def on_batch(b):
         digest.update(slots[b.slot][: b.nbytes])
@@ -73,6 +74,15 @@ with store.acquire_snapshot(snap) as lease:
 got = digest.hexdigest()
 print(f"streamed {st['items']} items, {st['bytes']} B -> sha256 {got[:16]}…")
 assert got == want, f"{got} != banked {want}"
+
+with tempfile.TemporaryDirectory(prefix="tensorfs-transfer-") as transfer_root:
+    destination = tensorfs.Store.init(transfer_root)
+    admitted = tensorfs.transfer_object(store, destination, first_id, first_length)
+    skipped = tensorfs.transfer_object(store, destination, first_id, first_length)
+    assert admitted == {"id": first_id, "length": first_length, "admitted": True}
+    assert skipped == {"id": first_id, "length": first_length, "admitted": False}
+    assert destination.verify(first_id)["verdict"] == "verified"
+    print(f"transfer:   admitted then skipped {first_id[:23]}… through two Store objects")
 
 try:
     tensorfs.platform_gate("win32")

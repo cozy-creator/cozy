@@ -517,6 +517,41 @@ impl Store {
         self.put_stream(&mut f, expect, fault)
     }
 
+    /// Copy one exact object between stores through the same verified read and admission
+    /// doors used everywhere else. Store layout never escapes this module: the source is
+    /// opened once through `open_verified`, and the destination hashes, length-checks and
+    /// publishes without clobbering through `put_stream`.
+    pub fn transfer_object(&self, destination: &Store, want: &ObjectRef) -> Result<Put> {
+        let mut source = self.open_verified(&want.sha256)?;
+        if source.len() != want.length {
+            return refuse(
+                Code::LENGTH_MISMATCH,
+                format!(
+                    "{} is {} bytes in the source store, expected {}",
+                    want.id(),
+                    source.len(),
+                    want.length
+                ),
+            );
+        }
+        let put = destination.put_stream(&mut source, Some(want), &Fault::default())?;
+        if !put.admitted {
+            let installed = destination.open_verified(&want.sha256)?;
+            if installed.len() != want.length {
+                return refuse(
+                    Code::LENGTH_MISMATCH,
+                    format!(
+                        "{} is {} bytes in the destination store, expected {}",
+                        want.id(),
+                        installed.len(),
+                        want.length
+                    ),
+                );
+            }
+        }
+        Ok(put)
+    }
+
     // ------------------------------------------------------------ records
 
     fn write_record(&self, rec: &VRecord) -> Result<()> {

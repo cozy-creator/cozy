@@ -924,6 +924,28 @@ pub fn ingest_installed(store: &PyStore) -> Vec<String> {
 
 // ---------------------------------------------------------------- the pull plane
 
+/// Move one exact object between TensorFS stores without exposing either store's layout.
+/// The source is a verified pinned descriptor; the destination uses the ordinary hashing,
+/// length check, no-clobber publication and verification-record path.
+#[pyfunction]
+pub fn transfer_object<'p>(
+    py: Python<'p>,
+    source: &PyStore,
+    destination: &PyStore,
+    object_id: &str,
+    expected_length: u64,
+) -> PyResult<Bound<'p, PyDict>> {
+    let want = obj_ref(py, object_id, expected_length)?;
+    let put = py
+        .allow_threads(|| source.store.transfer_object(&destination.store, &want))
+        .or_refuse(py)?;
+    let result = PyDict::new(py);
+    result.set_item("id", put.obj.id())?;
+    result.set_item("length", put.obj.length)?;
+    result.set_item("admitted", put.admitted)?;
+    Ok(result)
+}
+
 /// The fetch plan, computed by core against a real store (tfs-003 row 220).
 ///
 /// The transport adapter asks this ONE question — what must actually move? — instead of

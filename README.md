@@ -294,6 +294,9 @@ with store.acquire_snapshot(snapshot_id) as lease:     # verified, hold register
         issue_h2d(slots[b.slot][: b.nbytes])           # asynchronous
         b.release()                                    # after the completion event
     lease.stream(plan, slots, on_batch, readers=8)
+
+# Exact cache copies never expose Store layout or add a second verifier.
+tensorfs.transfer_object(cache, store, object_id, expected_length)
 ```
 
 `stream` is a CONTINUOUS slot ring, not a batch-at-a-time call: `execute` per batch drains
@@ -313,6 +316,7 @@ scripts/wheel-smoke.sh                  # build, install into a fresh venv, read
 scripts/facade-conform.py               # the 122 shared vectors, verdict-for-verdict
 scripts/facade-runs.py arms|real|bench <store> <snap>
 scripts/facade-h2d-smoke.py <store> <snap>   # cr-005's fill loop with the facade as reader
+scripts/transfer-runs.py                      # exact admit/skip/corruption Store transfer
 ```
 
 `vectors/store/` is a committed 176 KB snapshot (`tfs checkpoint write ... --blocks 1
