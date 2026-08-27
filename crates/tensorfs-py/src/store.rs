@@ -318,13 +318,22 @@ fn parse_declaration(
                     length: length.extract()?,
                 });
             }
+            (Some(source), Some(source_config), Some(media_type), Some(length)) => {
+                config_rows.push(ConfigDeclaration::Derive {
+                    target,
+                    source: source.extract()?,
+                    source_config: source_config.extract()?,
+                    media_type: media_type.extract()?,
+                    length: length.extract()?,
+                });
+            }
             _ => {
                 return Err(to_py(
                     py,
                     &Refusal {
                         code: Code::MISSING_FIELD,
                         detail: format!(
-                            "config {target:?} must be exactly source+source_config or media_type+length"
+                            "config {target:?} must be copy (source+source_config), add (media_type+length), or derive (all four)"
                         ),
                     },
                 ));
@@ -352,6 +361,39 @@ fn source_facts<'p>(py: Python<'p>, views: &[derived::SourceView]) -> PyResult<B
         row.set_item("header_id", fact.header.id())?;
         row.set_item("header_length", fact.header.length)?;
         row.set_item("components", &fact.components)?;
+        rows.append(row)?;
+    }
+    Ok(rows)
+}
+
+fn source_component<'p>(
+    py: Python<'p>,
+    view: &derived::SourceView,
+    component: &str,
+) -> PyResult<Bound<'p, PyList>> {
+    let tensors = view
+        .header
+        .components
+        .iter()
+        .find(|(name, _)| name == component)
+        .map(|(_, tensors)| tensors)
+        .ok_or_else(|| missing(py, "source component", component))?;
+    let rows = PyList::empty(py);
+    for (key, tensor) in tensors {
+        let row = PyDict::new(py);
+        row.set_item("key", key)?;
+        row.set_item("logical_dtype", tensor.dtype.name())?;
+        row.set_item("shape", &tensor.shape)?;
+        row.set_item("encoding", &tensor.encoding)?;
+        let parts = PyList::empty(py);
+        for (role, part) in &tensor.parts {
+            let part_row = PyDict::new(py);
+            part_row.set_item("role", role)?;
+            part_row.set_item("dtype", part.dtype.name())?;
+            part_row.set_item("shape", &part.shape)?;
+            parts.append(part_row)?;
+        }
+        row.set_item("parts", parts)?;
         rows.append(row)?;
     }
     Ok(rows)
@@ -668,6 +710,48 @@ impl PyStore {
 
     fn reap_holds(&self, py: Python<'_>) -> PyResult<Vec<String>> {
         py.allow_threads(|| self.meta.reap_holds()).or_refuse(py)
+    }
+
+    /// Exact pre-transaction preview for a granted source snapshot. Selected tensor
+    /// declarations contain no ObjectRefs; selected config bytes cross one verified lease.
+    fn inspect_derived_source<'p>(
+        &self,
+        py: Python<'p>,
+        snapshot: &str,
+        snapshot_length: u64,
+        components: Vec<String>,
+        configs: Vec<String>,
+    ) -> PyResult<Bound<'p, PyDict>> {
+        let reference = obj_ref(py, snapshot, snapshot_length)?;
+        let inspection = py
+            .allow_threads(|| {
+                derived::inspect_source(&self.store, &self.meta, reference, components, configs)
+            })
+            .or_refuse(py)?;
+        let out = PyDict::new(py);
+        let identity = source_facts(py, std::slice::from_ref(&inspection.view))?;
+        out.set_item("source", identity.get_item(0)?)?;
+        let component_rows = PyList::empty(py);
+        for component in &inspection.view.fact.components {
+            let row = PyDict::new(py);
+            row.set_item("name", component)?;
+            row.set_item(
+                "tensors",
+                source_component(py, &inspection.view, component)?,
+            )?;
+            component_rows.append(row)?;
+        }
+        out.set_item("components", component_rows)?;
+        let config_rows = PyList::empty(py);
+        for config in &inspection.configs {
+            let row = PyDict::new(py);
+            row.set_item("name", &config.name)?;
+            row.set_item("media_type", &config.media_type)?;
+            row.set_item("data", PyBytes::new(py, &config.bytes))?;
+            config_rows.append(row)?;
+        }
+        out.set_item("configs", config_rows)?;
+        Ok(out)
     }
 
     /// Open one exact tfs-019 transaction. Python supplies typed plain values; canonical

@@ -139,6 +139,12 @@ class DerivedAddedConfig(TypedDict):
     media_type: str
     length: int
 
+class DerivedConfigEdit(TypedDict):
+    source: str
+    source_config: str
+    media_type: str
+    length: int
+
 class DerivedWriter:
     def sources(self) -> list[dict[str, Any]]: ...
     def source_read_into(
@@ -186,13 +192,20 @@ class Store:
     def materialize(self, hex: str, path: str, dest: str) -> int: ...
     def state(self) -> dict[str, Any]: ...
     def reap_holds(self) -> list[str]: ...
+    def inspect_derived_source(
+        self,
+        snapshot: str,
+        snapshot_length: int,
+        components: Sequence[str],
+        configs: Sequence[str],
+    ) -> dict[str, Any]: ...
     def begin_derived(
         self,
         transaction_id: str,
         writer_session_id: int,
         sources: dict[str, tuple[str, int]],
         targets: dict[str, DerivedTargetDeclaration],
-        configs: dict[str, DerivedCopyConfig | DerivedAddedConfig],
+        configs: dict[str, DerivedCopyConfig | DerivedAddedConfig | DerivedConfigEdit],
         max_new_bytes: int,
     ) -> DerivedWriter: ...
     def derived_lookup(

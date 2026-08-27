@@ -115,14 +115,21 @@ pub enum ConfigDeclaration {
         media_type: String,
         length: u64,
     },
+    Derive {
+        target: String,
+        source: String,
+        source_config: String,
+        media_type: String,
+        length: u64,
+    },
 }
 
 impl ConfigDeclaration {
     fn target(&self) -> &str {
         match self {
-            ConfigDeclaration::Copy { target, .. } | ConfigDeclaration::Add { target, .. } => {
-                target
-            }
+            ConfigDeclaration::Copy { target, .. }
+            | ConfigDeclaration::Add { target, .. }
+            | ConfigDeclaration::Derive { target, .. } => target,
         }
     }
 }
@@ -310,6 +317,27 @@ impl Declaration {
                         return refuse(Code::ZERO_ELEMENT, "added config length is zero");
                     }
                 }
+                ConfigDeclaration::Derive {
+                    source,
+                    source_config,
+                    media_type,
+                    length,
+                    ..
+                } => {
+                    if !source_names.contains(source.as_str()) {
+                        return refuse(
+                            Code::ROOT_ABSENT,
+                            format!("config selects undeclared source alias {source:?}"),
+                        );
+                    }
+                    name("source config", source_config)?;
+                    if media_type.is_empty() || media_type.len() > 128 {
+                        return refuse(Code::KEY_GRAMMAR, "config media_type out of bounds");
+                    }
+                    if *length == 0 {
+                        return refuse(Code::ZERO_ELEMENT, "derived config length is zero");
+                    }
+                }
             }
         }
         self.configs.sort_by(|a, b| a.target().cmp(b.target()));
@@ -329,7 +357,8 @@ impl Declaration {
             .iter()
             .filter_map(|component| component.source.as_deref())
             .chain(self.configs.iter().filter_map(|config| match config {
-                ConfigDeclaration::Copy { source, .. } => Some(source.as_str()),
+                ConfigDeclaration::Copy { source, .. }
+                | ConfigDeclaration::Derive { source, .. } => Some(source.as_str()),
                 ConfigDeclaration::Add { .. } => None,
             }))
             .collect();
@@ -396,7 +425,9 @@ impl Declaration {
             }
         }
         for config in &self.configs {
-            if let ConfigDeclaration::Add { length, .. } = config {
+            if let ConfigDeclaration::Add { length, .. }
+            | ConfigDeclaration::Derive { length, .. } = config
+            {
                 bytes = bytes
                     .checked_add(*length)
                     .ok_or_else(|| arithmetic("config byte total overflows"))?;
@@ -515,11 +546,21 @@ impl Declaration {
                     media_type: as_str("config", "media_type", media_type)?.to_string(),
                     length: crate::canon::as_uint("config", "length", length)?,
                 },
+                (Some(source), Some(source_config), Some(media_type), Some(length)) => {
+                    ConfigDeclaration::Derive {
+                        target: target.clone(),
+                        source: as_str("config", "source", source)?.to_string(),
+                        source_config: as_str("config", "source_config", source_config)?
+                            .to_string(),
+                        media_type: as_str("config", "media_type", media_type)?.to_string(),
+                        length: crate::canon::as_uint("config", "length", length)?,
+                    }
+                }
                 _ => {
                     return refuse(
                         Code::MISSING_FIELD,
                         format!(
-                            "config {target:?} must be exactly source+source_config or media_type+length"
+                            "config {target:?} must be copy (source+source_config), add (media_type+length), or derive (all four)"
                         ),
                     )
                 }
@@ -660,6 +701,21 @@ impl Declaration {
                                     ("media_type", Value::str(media_type.clone())),
                                 ]),
                             ),
+                            ConfigDeclaration::Derive {
+                                target,
+                                source,
+                                source_config,
+                                media_type,
+                                length,
+                            } => (
+                                target.clone(),
+                                Value::obj(vec![
+                                    ("length", Value::uint(*length)),
+                                    ("media_type", Value::str(media_type.clone())),
+                                    ("source", Value::str(source.clone())),
+                                    ("source_config", Value::str(source_config.clone())),
+                                ]),
+                            ),
                         })
                         .collect(),
                 ),
@@ -699,6 +755,29 @@ fn selected_components(declaration: &Declaration, source_alias: &str) -> Vec<Str
     components.sort();
     components.dedup();
     components
+}
+
+fn selected_configs(declaration: &Declaration, source_alias: &str) -> Vec<String> {
+    let mut configs: Vec<String> = declaration
+        .configs
+        .iter()
+        .filter_map(|config| match config {
+            ConfigDeclaration::Copy {
+                source,
+                source_config,
+                ..
+            }
+            | ConfigDeclaration::Derive {
+                source,
+                source_config,
+                ..
+            } if source == source_alias => Some(source_config.clone()),
+            _ => None,
+        })
+        .collect();
+    configs.sort();
+    configs.dedup();
+    configs
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1457,6 +1536,30 @@ fn build_header(
                 };
                 configs.push((target.clone(), value));
             }
+            ConfigDeclaration::Derive {
+                target,
+                media_type,
+                length,
+                ..
+            } => {
+                let value = if planned {
+                    ConfigRef {
+                        sha256: crate::sha256::hex_digest(target.as_bytes()),
+                        length: *length,
+                        media_type: media_type.clone(),
+                    }
+                } else {
+                    added_configs
+                        .iter()
+                        .find(|added| added.name == *target)
+                        .map(|added| added.config.clone())
+                        .ok_or_else(|| Refusal {
+                            code: Code::ARTIFACT_INCOMPLETE,
+                            detail: format!("missing derived config {target:?}"),
+                        })?
+                };
+                configs.push((target.clone(), value));
+            }
         }
     }
 
@@ -1531,6 +1634,134 @@ pub struct Begin {
 pub struct SourceView {
     pub fact: SourceFact,
     pub header: Header,
+    pub configs: Vec<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct InspectedConfig {
+    pub name: String,
+    pub media_type: String,
+    pub bytes: Vec<u8>,
+}
+
+#[derive(Debug, Clone)]
+pub struct SourceInspection {
+    pub view: SourceView,
+    pub configs: Vec<InspectedConfig>,
+}
+
+/// Bounded metadata/config preview for a source the caller already holds by exact snapshot.
+/// The lease pins and verifies every config read; tensor payload ObjectRefs never leave TensorFS.
+pub fn inspect_source(
+    store: &Store,
+    meta: &Meta,
+    snapshot: ObjectRef,
+    component_names: Vec<String>,
+    config_names: Vec<String>,
+) -> Result<SourceInspection> {
+    let alias = "source".to_string();
+    let mut declaration = Declaration {
+        sources: vec![Source {
+            alias: alias.clone(),
+            snapshot,
+        }],
+        components: component_names
+            .iter()
+            .map(|component| ComponentDeclaration {
+                target: component.clone(),
+                source: Some(alias.clone()),
+                source_component: Some(component.clone()),
+                drop: Vec::new(),
+                add: Vec::new(),
+            })
+            .collect(),
+        configs: config_names
+            .iter()
+            .map(|config| ConfigDeclaration::Copy {
+                target: config.clone(),
+                source: alias.clone(),
+                source_config: config.clone(),
+            })
+            .collect(),
+        max_new_bytes: 0,
+    };
+    declaration.normalize_and_validate()?;
+    let mut sources = resolve_sources(store, meta, &declaration)?;
+    let source = sources.pop().ok_or_else(|| Refusal {
+        code: Code::ROOT_ABSENT,
+        detail: "source inspection resolved no source".into(),
+    })?;
+    let mut config_refs = Vec::new();
+    for name in &config_names {
+        let config = source
+            .header
+            .configs
+            .iter()
+            .find(|(candidate, _)| candidate == name)
+            .map(|(_, config)| config)
+            .ok_or_else(|| Refusal {
+                code: Code::MISSING_FIELD,
+                detail: format!("source has no config {name:?}"),
+            })?;
+        config_refs.push(ObjectRef {
+            sha256: config.sha256.clone(),
+            length: config.length,
+        });
+    }
+    let (lease, _receipts) = read::acquire(store, meta, &source.fact.snapshot.sha256, config_refs)?;
+    let result = (|| {
+        let mut configs = Vec::new();
+        for name in &config_names {
+            let config = source
+                .header
+                .configs
+                .iter()
+                .find(|(candidate, _)| candidate == name)
+                .map(|(_, config)| config)
+                .ok_or_else(|| Refusal {
+                    code: Code::MISSING_FIELD,
+                    detail: format!("source has no config {name:?}"),
+                })?;
+            if config.length > limits::DOC_MAX_BYTES as u64 {
+                return refuse(
+                    Code::SIZE_CAP,
+                    format!(
+                        "source config {name:?} is {} B over the {} B document cap",
+                        config.length,
+                        limits::DOC_MAX_BYTES
+                    ),
+                );
+            }
+            let mut bytes = vec![0u8; config.length as usize];
+            read::read_into(
+                &lease,
+                &read::ObjectRange {
+                    obj: ObjectRef {
+                        sha256: config.sha256.clone(),
+                        length: config.length,
+                    },
+                    off: 0,
+                    len: config.length,
+                },
+                &mut bytes,
+            )?;
+            configs.push(InspectedConfig {
+                name: name.clone(),
+                media_type: config.media_type.clone(),
+                bytes,
+            });
+        }
+        Ok(SourceInspection {
+            view: SourceView {
+                fact: source.fact.clone(),
+                header: source.header.clone(),
+                configs: config_names,
+            },
+            configs,
+        })
+    })();
+    lease.release(meta)?;
+    result
 }
 
 fn release_guards(meta: &Meta, writer_hold: Option<Hold>, source_leases: Vec<(String, ReadLease)>) {
@@ -1609,6 +1840,7 @@ pub fn begin(
         .map(|source| SourceView {
             fact: source.fact.clone(),
             header: source.header.clone(),
+            configs: selected_configs(&declaration, &source.fact.alias),
         })
         .collect();
 
@@ -1867,6 +2099,12 @@ pub fn add_config<R: Read>(
                     target,
                     media_type,
                     length,
+                }
+                | ConfigDeclaration::Derive {
+                    target,
+                    media_type,
+                    length,
+                    ..
                 } if target == config_name => Some((media_type.clone(), *length)),
                 _ => None,
             })
