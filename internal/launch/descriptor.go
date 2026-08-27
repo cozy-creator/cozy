@@ -8,8 +8,8 @@
 //     PROVEN at install by the release's own runtime (`cozy-runtime describe --check`, cl-009).
 //     Reading it back costs microseconds; re-running `describe` per invocation would import
 //     the endpoint's whole module graph to learn a fact already vouched for. The recorded
-//     the exact-byte `descriptor_digest` is checked on every read, so an edited source tree
-//     is a refusal.
+//     semantic `descriptor_digest` is checked on every read, so a meaning change refuses
+//     while whitespace and object-key order remain irrelevant.
 //   - THE ARTIFACT FACTS (store root, per-component snapshots, immutable config, variant,
 //     physical floor) come from the runtime's own local artifact index, read through
 //     `cozy-runtime list --json`. cozy-creator never composes a store path.
@@ -43,7 +43,7 @@ const DescriptorFile = "endpoint.descriptor.json"
 const descriptorFormat = "cozy.endpoint.descriptor/1"
 
 // Descriptor is the closed EndpointDescriptor/1 this host reads. Unknown fields refuse;
-// Raw preserves the exact bytes whose digest is carried through launch documents.
+// Raw is normalized canonical JSON for control-plane transport and semantic identity.
 type Descriptor struct {
 	Format      string          `json:"format"`
 	Application string          `json:"application"`
@@ -312,8 +312,8 @@ func validateEntrypoint(ep *Entrypoint) *exit.Error {
 	return nil
 }
 
-// ReadDescriptor reads the committed descriptor out of a generation's source tree and
-// checks it against the digest the install recorded.
+// ReadDescriptor reads the committed descriptor projection out of a generation's source
+// tree and checks its canonical semantic digest against the install record.
 //
 // The check is the whole point of reading it here rather than re-deriving: cl-009 ran the
 // release's OWN runtime over this file and recorded what it vouched for. If the two
@@ -334,23 +334,28 @@ func ReadDescriptor(sourceDir, expectDigest string) (*Descriptor, *exit.Error) {
 	}
 	if expectDigest != "" && d.Digest != expectDigest {
 		return nil, exit.Named(exit.Conflict, "descriptor_stale",
-			"the committed descriptor bytes digest to %s and this install recorded %s", d.Digest, expectDigest).
+			"the committed descriptor content digests to %s and this install recorded %s", d.Digest, expectDigest).
 			WithRemedy("the source tree changed after the install; reinstall so the surface and the record are one document").
 			WithNext("cozy install <org/endpoint> --force")
 	}
 	return d, nil
 }
 
-// DecodeDescriptor reads the one closed descriptor/1 grammar and derives its exact-byte
-// identity. Collection membership supplies callable kind; the document does not repeat it.
+// DecodeDescriptor reads the one closed descriptor/1 grammar and derives its canonical
+// semantic identity. Collection membership supplies callable kind; the document does not
+// repeat it.
 func DecodeDescriptor(data []byte) (*Descriptor, *exit.Error) {
 	if len(data) > canonical.DocMax {
 		return nil, exit.New(exit.Validation, "%s exceeds the %d-byte cap", DescriptorFile, canonical.DocMax)
 	}
-	if err := validateClosedDescriptor(data); err != nil {
+	normalized, err := canonical.NormalizeJCS(data)
+	if err != nil {
 		return nil, exit.New(exit.Validation, "%s violates descriptor/1: %s", DescriptorFile, err)
 	}
-	decoder := json.NewDecoder(bytes.NewReader(data))
+	if err := validateClosedDescriptor(normalized); err != nil {
+		return nil, exit.New(exit.Validation, "%s violates descriptor/1: %s", DescriptorFile, err)
+	}
+	decoder := json.NewDecoder(bytes.NewReader(normalized))
 	decoder.DisallowUnknownFields()
 	var d Descriptor
 	if err := decoder.Decode(&d); err != nil {
@@ -374,12 +379,12 @@ func DecodeDescriptor(data []byte) (*Descriptor, *exit.Error) {
 			return nil, problem
 		}
 	}
-	digest, err := canonical.Spell(canonical.Digest(data))
+	digest, err := canonical.Spell(canonical.Digest(normalized))
 	if err != nil {
 		return nil, exit.Internalf("cannot spell descriptor digest: %s", err)
 	}
 	d.Digest = digest
-	d.Raw = append([]byte(nil), data...)
+	d.Raw = normalized
 	return &d, nil
 }
 

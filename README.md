@@ -51,7 +51,8 @@ no relaxed fallback, no lock rewrite. **descriptor** runs `cozy-runtime describe
 in the generation's own venv (cr-003): the release's own runtime derives its surface
 without loading weights and compares it against the committed `endpoint.descriptor.json`,
 so a descriptor that disagrees with the code refuses the install (exit 13, naming which
-pair diverged) and a passing check records its exact-byte `descriptor_digest`. There is no door.
+pair diverged) and a passing check records its canonical semantic `descriptor_digest`.
+Whitespace and object-key order are not surface meaning. There is no door.
 **activate** inserts the generation row and swaps
 the pin in ONE transaction, so a kill at any earlier stage leaves the prior pin runnable.
 
