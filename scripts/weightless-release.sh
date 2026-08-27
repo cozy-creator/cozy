@@ -15,12 +15,10 @@
 set -euo pipefail
 
 RUNTIME_REPO="${RUNTIME_REPO:-$HOME/cozy_v2/cozy-runtime}"
-# f1625f9: the floor, not a preference — this host enters the supervisor through
-# `cozy-runtime serve` (db4ab8a), reads `job_descriptor_id` off `describe` (4485f27), stages
-# WEIGHTLESS binding records (a3c3d72) and writes the record's NEW key set (f1625f9), so a
-# release pinning an older runtime either cannot be served at all or reads a record whose
-# every key it refuses as unknown.
-RUNTIME_SHA="${RUNTIME_SHA:-f1625f9}"
+# Runtime #7 is the exact first release whose `bindings --json` and
+# `serve --weightless-endpoint` share one canonical Plan/1 constructor. Creator consumes
+# those subjects and will not reconstruct the retired flat record.
+RUNTIME_SHA="${RUNTIME_SHA:-12013e93c19e19d6d43e022801aea2b3f19e46e9}"
 OUT="${OUT:-$HOME/.cache/cozy/cl-013}"
 VERSION="${VERSION:-1.0.0}"
 ENDPOINT="${ENDPOINT:-cozy/weightless}"
@@ -49,6 +47,12 @@ git -C "$RUNTIME_REPO" archive "$FULL" | tar -x -C "$RT"
 
 nice -n 19 uv build --wheel --project "$RT" --out-dir "$T/vendor" >/dev/null
 rm -f "$T/vendor/.gitignore"
+RUNTIME_VERSION="$(sed -n 's/^version = "\([^"]*\)"/\1/p' "$RT/pyproject.toml" | head -1)"
+RUNTIME_WHEEL="$(find "$T/vendor" -maxdepth 1 -type f -name 'cozy_runtime-*.whl' -printf '%f\n')"
+[ -n "$RUNTIME_VERSION" ] && [ -n "$RUNTIME_WHEEL" ] && [ "$(printf '%s\n' "$RUNTIME_WHEEL" | wc -l)" -eq 1 ] || {
+  echo "refusing: expected one versioned cozy-runtime wheel from $FULL" >&2
+  exit 2
+}
 
 cp "$ROOT/fixtures/weightless/weightless.py" "$T/weightless.py"
 cp "$ROOT/fixtures/weightless/endpoint.toml" "$T/endpoint.toml"
@@ -58,10 +62,10 @@ cat > "$T/pyproject.toml" <<TOML
 name = "cozy-weightless-endpoint"
 version = "$VERSION"
 requires-python = ">=3.11"
-dependencies = ["cozy-runtime==0.0.1"]
+dependencies = ["cozy-runtime==$RUNTIME_VERSION"]
 
 [tool.uv.sources]
-cozy-runtime = { path = "vendor/cozy_runtime-0.0.1-py3-none-any.whl" }
+cozy-runtime = { path = "vendor/$RUNTIME_WHEEL" }
 TOML
 
 ( cd "$T" && nice -n 19 uv lock --quiet && nice -n 19 uv sync --locked --quiet )

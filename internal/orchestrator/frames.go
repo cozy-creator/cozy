@@ -730,8 +730,8 @@ func (c *Orchestrator) captureTriage(s *session, requestID string, attempt uint6
 	return tr
 }
 
-// requeueable is the orchestrator's projection: an accepted-but-incomplete attempt, the
-// infra-class failures, and a SUPERVISOR pre-execution refusal earn a new ordinal. A
+// requeueable is the record owner's projection: an accepted-but-incomplete attempt, the
+// infra-class failures, and a WORKER pre-execution refusal earn a new ordinal. A
 // deterministic body failure and an author/runtime refusal settle — re-running them would
 // only fail again.
 //
@@ -744,18 +744,18 @@ func (c *Orchestrator) captureTriage(s *session, requestID string, attempt uint6
 //
 // `execution_started` is the structural check, not a cause-code allowlist (#480c): the
 // author having run is a bit the worker sets, and inferring it from a code list is exactly
-// the fragility the bit exists to remove. A "supervisor refusal" that claims execution
+// the fragility the bit exists to remove. A "worker refusal" that claims execution
 // started is a contradiction, and it settles rather than being re-dispatched.
 //
 // The re-dispatch still charges the request's DURABLE requeue budget. Zero BILLED budget
-// is a statement about money; the bound on how many times this owner will try is its own,
+// is a statement about money; the bound on how many times this record owner will try is its own,
 // and a worker refusing forever must still terminate.
 func requeueable(status, cause, origin string, executionStarted bool) bool {
 	if status == "ABANDONED" {
 		return true
 	}
 	if status == "REFUSED" {
-		return origin == "SUPERVISOR" && !executionStarted && preExecution(cause)
+		return origin == "WORKER" && !executionStarted && preExecution(cause)
 	}
 	if status != "FAILED" {
 		return false
@@ -767,9 +767,9 @@ func requeueable(status, cause, origin string, executionStarted bool) bool {
 	return false
 }
 
-// preExecution names the four causes rev-2 §6/§7 defines as supervisor pre-execution
+// preExecution names the four causes rev-2 §6/§7 defines as worker pre-execution
 // refusals. It is a CLOSED list because the protocol's is closed: a cause outside it that
-// arrives with origin SUPERVISOR is a peer saying something this contract does not define,
+// arrives with origin WORKER is a peer saying something this contract does not define,
 // and settling is the conservative answer.
 func preExecution(cause string) bool {
 	switch cause {
@@ -780,9 +780,9 @@ func preExecution(cause string) bool {
 	return false
 }
 
-// mirrorOutputs joins the manifest's entries to the destinations THIS orchestrator granted
+// mirrorOutputs joins the manifest's entries to the destinations THIS record owner granted
 // and PROVES the bytes are there before any of them becomes visible. The runtime names
-// what it wrote; the orchestrator names where it was allowed to write and decides that the
+// what it wrote; the record owner names where it was allowed to write and decides that the
 // result is visible. Neither half can do the other's job.
 //
 // THE PROOF IS THE POINT, and it is why this is not a join any more. Composing a local
@@ -796,7 +796,7 @@ func (c *Orchestrator) mirrorOutputs(req records.Request, attempt uint64, doc ca
 	holder *worker) ([]records.Output, *exit.Error) {
 	manifest := doc.Sub("output_manifest")
 	list, _ := manifest["outputs"].([]canonical.Value)
-	// WHERE THE COORDINATOR GRANTED. A serving attempt writes into its own disposable
+	// WHERE THE RECORD OWNER GRANTED. A serving attempt writes into its own disposable
 	// attempt directory; a job writes into the durable publication root, which is the
 	// same fact stated at the other end of the same grant.
 	dir := c.opt.Layout.AttemptDir(req.ID, attempt)
@@ -941,7 +941,7 @@ func causeOrigin(n int64) string {
 	return trimEnum(pb.CauseOrigin_name[int32(n)], "CAUSE_ORIGIN_")
 }
 
-// outcomeError is the orchestrator PROJECTION over (status, cause). Retryability is
+// outcomeError is the record owner's PROJECTION over (status, cause). Retryability is
 // never a wire observation; this is the only place the neutral facts become an outcome.
 func outcomeError(status, cause, message string) *exit.Error {
 	switch status {

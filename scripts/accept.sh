@@ -148,10 +148,10 @@ if [ -n "$ENDPOINT" ] && [ -f "$ENDPOINT" ]; then
     "$([ "$CODE" = 0 ] && printf '%s' "$OUT" | grep -q 'tile' && echo 1 || echo 0)" "$(first "$OUT")"
 
   section "the WEIGHTLESS SERVE — a real worker on a machine with no card"
-  # cl-010's named seam is CLOSED (cozy-runtime a3c3d72): a binding record declaring none
-  # of the seven model keys is weightless, its `prepare` returns before the torch import,
-  # and this host mints that record instead of refusing `no_servable_function`. What the
-  # arms below establish is the only claim a cardless machine — a Windows runner, this
+  # Runtime is the sole writer of the canonical weightless closure: bindings --json gives
+  # this record owner exact plan subjects before spawn, and serve --weightless-endpoint
+  # privately stages the identical bytes. What the arms below establish is the only claim
+  # a cardless machine — a Windows runner, this
   # container — can ever make for itself: the whole product path, end to end, with nothing
   # to load.
   check "the generation's venv contains NO TORCH — the point of a weightless endpoint" \
@@ -164,10 +164,18 @@ if [ -n "$ENDPOINT" ] && [ -f "$ENDPOINT" ]; then
   check "cozy start makes the worker READY with no weights to fill" \
     "$([ "$CODE" = 0 ] && printf '%s' "$OUT" | grep -qE 'state: +ready' && echo 1 || echo 0)" \
     "${ELAPSED} ms, $(printf '%s' "$OUT" | grep -E '^ready_plans:' | tr -s ' ')"
+  PLAN_COUNT="$(find "$COZY_HOME/workers" -path '*/home/binding-plans/*.json' -type f 2>/dev/null | wc -l)"
+  CANONICAL_PLAN_COUNT="$(find "$COZY_HOME/workers" -path '*/home/binding-plans/*.json' -type f \
+    -exec grep -l 'cozy.endpoint.EntrypointBindingPlan/1' {} + 2>/dev/null | wc -l)"
+  FLAT_PLAN_COUNT="$(find "$COZY_HOME/workers" -path '*/home/binding-plans/*.json' -type f \
+    -exec grep -l 'cozy.local.EntrypointBindingRecord/2' {} + 2>/dev/null | wc -l)"
+  check "Runtime privately staged canonical Plan/1 bytes, with no flat Record/2 fallback" \
+    "$([ "$PLAN_COUNT" -gt 0 ] && [ "$CANONICAL_PLAN_COUNT" = "$PLAN_COUNT" ] && [ "$FLAT_PLAN_COUNT" = 0 ] && echo 1 || echo 0)" \
+    "$CANONICAL_PLAN_COUNT/$PLAN_COUNT canonical plans; $FLAT_PLAN_COUNT flat records"
 
   run run cozy/weightless/v1/tile size=32 seed=7 --full --out "$COZY_HOME/out"
   printf '%s\n' "$OUT" | sed 's/^/    /'
-  check "the invoke exits 0 on a TYPED terminal — the coordinator's success transaction" \
+  check "the invoke exits 0 on a TYPED terminal — the record owner's success transaction" \
     "$([ "$CODE" = 0 ] && printf '%s' "$OUT" | grep -qE 'status: +completed' && echo 1 || echo 0)" \
     "$(printf '%s' "$OUT" | grep -E '^status:' | tr -s ' ') [exit $CODE]"
   check "the typed result is the handler's own struct, not a blob" \

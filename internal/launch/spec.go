@@ -15,7 +15,7 @@ const (
 	gib = 1 << 30
 )
 
-// The budgets this LOCAL orchestrator declares for one attempt. They are a COORDINATOR
+// The budgets this LOCAL orchestrator declares for one attempt. They are ORCHESTRATOR
 // policy, not an endpoint fact — the runtime prices the real ladder against the card's
 // measured free bytes and confesses what it did (cr-008a/cr-008b). The same numbers the
 // runtime's own local-orchestrator adapter uses for a bare-venv run, so the two doors
@@ -27,7 +27,7 @@ const (
 // ninth field of the same mistake #567e corrected in the other eight. What a model weighs
 // is the artifact's own byte total, which the border counted and the index row carries, so
 // the machine that holds the bytes states it. Host and pinned staging buffers stay here,
-// because those really are this coordinator's policy and not facts about anybody's weights.
+// because those really are this orchestrator's policy and not facts about anybody's weights.
 const (
 	hostBudget   = 2 * gib
 	pinnedBudget = 256 * mib
@@ -87,13 +87,25 @@ func (f *Facts) Placement() (orchestrator.DesiredPlacement, *exit.Error) {
 	// (`cozy-runtime bindings`). cl-010 read `endpoint.toml`'s `[bindings]` table here
 	// because no runtime verb emitted the resolved record; cr-016 added the verb, and this
 	// host's second reader of that closed grammar is deleted rather than kept in step.
-	resolved, e := f.RuntimeCLI.Bindings()
+	resolved, weightlessPlans, e := f.RuntimeCLI.Bindings()
 	if e != nil {
 		return orchestrator.DesiredPlacement{}, e
 	}
 	table := map[string]Binding{}
 	for _, b := range resolved {
 		table[b.Path] = b
+	}
+	plans := map[string]WeightlessPlan{}
+	for _, p := range weightlessPlans {
+		if _, exists := plans[p.Entrypoint]; exists {
+			return orchestrator.DesiredPlacement{}, exit.Internalf(
+				"runtime reported weightless plan %s more than once", p.Entrypoint)
+		}
+		plans[p.Entrypoint] = p
+	}
+	if len(plans) > 0 && len(table) > 0 {
+		return orchestrator.DesiredPlacement{}, exit.Internalf(
+			"runtime reported modeled bindings and weightless plans for one placement")
 	}
 	placement := orchestrator.DesiredPlacement{
 		Endpoint:  f.Install.Endpoint,
@@ -113,9 +125,28 @@ func (f *Facts) Placement() (orchestrator.DesiredPlacement, *exit.Error) {
 			hidden = append(hidden, ep.Name)
 			continue
 		}
-		binding, e := f.binding(ep, table)
-		if e != nil {
-			return orchestrator.DesiredPlacement{}, e
+		var binding *orchestrator.Binding
+		if len(plans) > 0 {
+			p, ok := plans[ep.Name]
+			if !ok {
+				return orchestrator.DesiredPlacement{}, exit.Internalf(
+					"runtime reported no canonical weightless plan for visible entrypoint %s", ep.Name)
+			}
+			binding = &orchestrator.Binding{
+				Entrypoint: ep.Name,
+				Outputs:    AssetPaths(ep.Result),
+				RuntimePlan: &orchestrator.BindingPlanSubject{
+					SubjectID: p.SubjectID,
+					Kind:      p.Kind,
+					Digest:    p.Digest,
+					Length:    p.Length,
+				},
+			}
+		} else {
+			binding, e = f.binding(ep, table)
+			if e != nil {
+				return orchestrator.DesiredPlacement{}, e
+			}
 		}
 		placement.Bindings = append(placement.Bindings, binding)
 	}
@@ -123,14 +154,18 @@ func (f *Facts) Placement() (orchestrator.DesiredPlacement, *exit.Error) {
 		placement.Hidden = hidden
 	}
 	if len(placement.Bindings) == 0 {
-		// Every entrypoint mints a record now — weightless included — so this is the one
-		// remaining case: a release whose descriptor registers no entrypoint at all. A job
+		// A release whose descriptor registers no entrypoint has no plan to advertise. A job
 		// function is not one; it is served through `cozy job`, on a spec of its own.
 		return orchestrator.DesiredPlacement{}, exit.Named(exit.Structural, "no_servable_function",
 			"%s registers no entrypoint, and a worker with no plan to advertise has nothing to serve",
 			f.Install.Endpoint).
 			WithRemedy("its functions: %s — an `@app.entrypoint` is what a request dispatches to",
 				strings.Join(f.Descriptor.Names(), ", "))
+	}
+	if len(plans) != len(placement.Bindings) && len(plans) > 0 {
+		return orchestrator.DesiredPlacement{}, exit.Internalf(
+			"runtime reported %d weightless plans for %d visible entrypoints",
+			len(plans), len(placement.Bindings))
 	}
 	return placement, nil
 }
@@ -144,27 +179,33 @@ func (f *Facts) Spec(devices []string) (orchestrator.WorkerLaunchSpec, *exit.Err
 	if e != nil {
 		return orchestrator.WorkerLaunchSpec{}, e
 	}
+	args := []string{"serve"}
+	if placement.RuntimeStagesBindings() {
+		args = append(args, "--weightless-endpoint", f.Source)
+	}
 	return orchestrator.WorkerLaunchSpec{
 		Placement: placement,
-		// THE SUPERVISOR ENTRY, and it is now the VERB. cl-004 recorded the private
-		// `internal.worker.session:main` import as owed: `serve` was dead on arrival
-		// because the CLI read the config at its entrypoint and `session.main` read it
-		// again, which the runtime's own one-authority rule refuses. cozy-runtime
-		// `db4ab8a` passes the config it already read into `session.supervise`, so the
-		// import — a second process entry into one loop, across a private module path a
-		// release is free to move — deletes.
+		// THE WORKER ENTRY is the public verb. Creator never imports Runtime internals or
+		// gives the weightless constructor a second source tree: the exact same f.Source
+		// is both the child working directory and --weightless-endpoint.
 		Python:   Binary(f.Install.Dir),
-		Args:     []string{"serve"},
+		Args:     args,
 		Dir:      f.Source,
 		Devices:  devices,
 		GraceSec: 3,
 	}, nil
 }
 
-// binding mints ONE entrypoint's local pinned-binding record. A weightless entrypoint
-// (no declared model slot) still gets a record: it names the project and the entrypoint,
-// which is all the runtime needs to construct nothing.
+// binding mints ONE modeled entrypoint's local pinned-binding record. Weightless plans
+// are the installed runtime's canonical documents and arrive through weightless_plans;
+// this writer must never approximate them or keep the retired Record/2 path as a fallback.
 func (f *Facts) binding(ep *Entrypoint, table map[string]Binding) (*orchestrator.Binding, *exit.Error) {
+	if len(ep.Models) == 0 {
+		return nil, exit.Named(exit.Structural, "weightless_plan_unavailable",
+			"the installed runtime reported no canonical weightless plan for %s", ep.Name).
+			WithRemedy("install a runtime whose bindings document carries weightless_plans; " +
+				"Creator will not recreate the retired flat binding record")
+	}
 	record := map[string]any{
 		// RESOLUTION, not identity (#506a): `project` is where THIS machine staged the
 		// endpoint tree, and a pod that installed the byte-identical archive staged it
@@ -184,23 +225,6 @@ func (f *Facts) binding(ep *Entrypoint, table map[string]Binding) (*orchestrator
 			ep.Name, len(ep.Models)).
 			WithRemedy("multi-slot local serving lands with th-004's EntrypointBindingPlan document")
 	}
-	if len(ep.Models) == 0 {
-		// A WEIGHTLESS entrypoint declares no model, so its record declares none either —
-		// and that IS the record, not an absence of one. cozy-runtime `a3c3d72` reads a
-		// record carrying none of the seven model keys as weightless, keys its executor by
-		// release and project, and returns from `prepare` before the torch import. So the
-		// orchestrator gets a plan digest to dispatch by, and a machine with no card and no
-		// bench store can serve something. That was cl-010's named seam and it is closed.
-		//
-		// `release` is the endpoint release rather than an artifact ref because there is no
-		// artifact: every weightless entrypoint of one install generation shares one
-		// executor, which is exactly what the runtime's construction key spells.
-		record["release"] = ReleaseID(f.Install)
-		return &orchestrator.Binding{
-			Entrypoint: ep.Name, Record: record, Outputs: AssetPaths(ep.Result),
-		}, nil
-	}
-
 	slot := ep.Models[0]
 	selected, ok := table[slot.Path]
 	if !ok {

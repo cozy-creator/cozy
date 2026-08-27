@@ -26,10 +26,10 @@ const (
 // 1,680 destinations and 4.782 GiB out of ~/cozy_v2/tensorfs-bench's real CAS, served by
 // the REAL cozy-runtime supervisor and executor from a read-only checkout.
 //
-// The binding RECORD is cozy-creator's own: it is the local pinned-binding record this
-// orchestrator owns, staged into the worker's COZY_HOME, and the plan id on the wire is
-// the digest of its canonical bytes. th-004 replaces the document later; the identity
-// rule does not move.
+// This MODELED harness preserves the older explicit binding record: it is staged into the
+// worker's COZY_HOME, and its canonical identity is the plan id on the wire. Weightless
+// installed releases instead consume Runtime-authored plan subjects and launch through
+// Runtime's explicit weightless-endpoint mode; this corpus is not that path.
 // PIN THE RUNTIME. `--runtime` may name a `git archive` of a pinned cozy-runtime commit
 // rather than the live checkout, and `--venv` then supplies the interpreter (a venv is
 // not in a git archive). Found by being bitten, mid-run: another agent's UNCOMMITTED

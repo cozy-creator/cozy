@@ -552,7 +552,7 @@ func (OutcomeStatus) EnumDescriptor() ([]byte, []int) {
 
 // Retryability is a RecordOwner PROJECTION over (status, cause, origin), never a wire fact. The
 // REFUSED projection SPLITS by cause (#480b): author/runtime causes settle refused and are never
-// re-dispatched; SUPERVISOR pre-execution causes consume the ordinal, leave the budget
+// re-dispatched; WORKER pre-execution causes consume the ordinal, leave the budget
 // untouched, and are immediately re-dispatchable as attempt_ordinal + 1 elsewhere.
 type CauseCode int32
 
@@ -578,7 +578,7 @@ const (
 	CauseCode_CAUSE_CODE_SUPERSEDED_CANCEL CauseCode = 15
 	// ABANDONED
 	CauseCode_CAUSE_CODE_EXECUTOR_INVALIDATED CauseCode = 16
-	// REFUSED — pre-execution, origin SUPERVISOR (rev-2 §6/§7). Zero billed execution budget;
+	// REFUSED — pre-execution, origin WORKER (rev-2 §6/§7). Zero billed execution budget;
 	// execution_started is false; the ordinal is consumed and the next one may go elsewhere now.
 	CauseCode_CAUSE_CODE_NO_CAPACITY                CauseCode = 17 // admission CLOSED, or OPEN with no free slot
 	CauseCode_CAUSE_CODE_ADMISSION_GENERATION_STALE CauseCode = 18 // the echoed generation is not current
@@ -666,14 +666,14 @@ func (CauseCode) EnumDescriptor() ([]byte, []int) {
 type CauseOrigin int32
 
 const (
-	CauseOrigin_CAUSE_ORIGIN_UNSPECIFIED CauseOrigin = 0
-	CauseOrigin_CAUSE_ORIGIN_AUTHOR      CauseOrigin = 1
-	CauseOrigin_CAUSE_ORIGIN_RUNTIME     CauseOrigin = 2
-	CauseOrigin_CAUSE_ORIGIN_EXECUTOR    CauseOrigin = 3
-	CauseOrigin_CAUSE_ORIGIN_SUPERVISOR  CauseOrigin = 4
-	CauseOrigin_CAUSE_ORIGIN_INFRA       CauseOrigin = 5
-	CauseOrigin_CAUSE_ORIGIN_CLIENT      CauseOrigin = 6
-	CauseOrigin_CAUSE_ORIGIN_COORDINATOR CauseOrigin = 7
+	CauseOrigin_CAUSE_ORIGIN_UNSPECIFIED  CauseOrigin = 0
+	CauseOrigin_CAUSE_ORIGIN_AUTHOR       CauseOrigin = 1
+	CauseOrigin_CAUSE_ORIGIN_RUNTIME      CauseOrigin = 2
+	CauseOrigin_CAUSE_ORIGIN_EXECUTOR     CauseOrigin = 3
+	CauseOrigin_CAUSE_ORIGIN_WORKER       CauseOrigin = 4
+	CauseOrigin_CAUSE_ORIGIN_INFRA        CauseOrigin = 5
+	CauseOrigin_CAUSE_ORIGIN_CLIENT       CauseOrigin = 6
+	CauseOrigin_CAUSE_ORIGIN_RECORD_OWNER CauseOrigin = 7
 )
 
 // Enum value maps for CauseOrigin.
@@ -683,20 +683,20 @@ var (
 		1: "CAUSE_ORIGIN_AUTHOR",
 		2: "CAUSE_ORIGIN_RUNTIME",
 		3: "CAUSE_ORIGIN_EXECUTOR",
-		4: "CAUSE_ORIGIN_SUPERVISOR",
+		4: "CAUSE_ORIGIN_WORKER",
 		5: "CAUSE_ORIGIN_INFRA",
 		6: "CAUSE_ORIGIN_CLIENT",
-		7: "CAUSE_ORIGIN_COORDINATOR",
+		7: "CAUSE_ORIGIN_RECORD_OWNER",
 	}
 	CauseOrigin_value = map[string]int32{
-		"CAUSE_ORIGIN_UNSPECIFIED": 0,
-		"CAUSE_ORIGIN_AUTHOR":      1,
-		"CAUSE_ORIGIN_RUNTIME":     2,
-		"CAUSE_ORIGIN_EXECUTOR":    3,
-		"CAUSE_ORIGIN_SUPERVISOR":  4,
-		"CAUSE_ORIGIN_INFRA":       5,
-		"CAUSE_ORIGIN_CLIENT":      6,
-		"CAUSE_ORIGIN_COORDINATOR": 7,
+		"CAUSE_ORIGIN_UNSPECIFIED":  0,
+		"CAUSE_ORIGIN_AUTHOR":       1,
+		"CAUSE_ORIGIN_RUNTIME":      2,
+		"CAUSE_ORIGIN_EXECUTOR":     3,
+		"CAUSE_ORIGIN_WORKER":       4,
+		"CAUSE_ORIGIN_INFRA":        5,
+		"CAUSE_ORIGIN_CLIENT":       6,
+		"CAUSE_ORIGIN_RECORD_OWNER": 7,
 	}
 )
 
@@ -7384,16 +7384,16 @@ const file_cozy_worker_v1_worker_proto_rawDesc = "" +
 	"\x16CAUSE_CODE_NO_CAPACITY\x10\x11\x12)\n" +
 	"%CAUSE_CODE_ADMISSION_GENERATION_STALE\x10\x12\x12 \n" +
 	"\x1cCAUSE_CODE_UNKNOWN_PLACEMENT\x10\x13\x12)\n" +
-	"%CAUSE_CODE_PLACEMENT_NOT_DISPATCHABLE\x10\x14*\xe5\x01\n" +
+	"%CAUSE_CODE_PLACEMENT_NOT_DISPATCHABLE\x10\x14*\xe2\x01\n" +
 	"\vCauseOrigin\x12\x1c\n" +
 	"\x18CAUSE_ORIGIN_UNSPECIFIED\x10\x00\x12\x17\n" +
 	"\x13CAUSE_ORIGIN_AUTHOR\x10\x01\x12\x18\n" +
 	"\x14CAUSE_ORIGIN_RUNTIME\x10\x02\x12\x19\n" +
-	"\x15CAUSE_ORIGIN_EXECUTOR\x10\x03\x12\x1b\n" +
-	"\x17CAUSE_ORIGIN_SUPERVISOR\x10\x04\x12\x16\n" +
+	"\x15CAUSE_ORIGIN_EXECUTOR\x10\x03\x12\x17\n" +
+	"\x13CAUSE_ORIGIN_WORKER\x10\x04\x12\x16\n" +
 	"\x12CAUSE_ORIGIN_INFRA\x10\x05\x12\x17\n" +
-	"\x13CAUSE_ORIGIN_CLIENT\x10\x06\x12\x1c\n" +
-	"\x18CAUSE_ORIGIN_COORDINATOR\x10\a*\xb4\x01\n" +
+	"\x13CAUSE_ORIGIN_CLIENT\x10\x06\x12\x1d\n" +
+	"\x19CAUSE_ORIGIN_RECORD_OWNER\x10\a*\xb4\x01\n" +
 	"\fCancelReason\x12\x1d\n" +
 	"\x19CANCEL_REASON_UNSPECIFIED\x10\x00\x12\x18\n" +
 	"\x14CANCEL_REASON_CLIENT\x10\x01\x12\x17\n" +

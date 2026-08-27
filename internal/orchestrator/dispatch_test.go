@@ -175,6 +175,18 @@ func TestLocalWindowsGrantRefusesBeforeWritingPaths(t *testing.T) {
 	}
 }
 
+func TestWorkerRefusalOriginHardcut(t *testing.T) {
+	if !requeueable("REFUSED", "NO_CAPACITY", "WORKER", false) {
+		t.Fatal("a pre-execution WORKER refusal did not earn a new ordinal")
+	}
+	if requeueable("REFUSED", "NO_CAPACITY", "SUPERVISOR", false) {
+		t.Fatal("the retired SUPERVISOR origin remained an alias")
+	}
+	if requeueable("REFUSED", "NO_CAPACITY", "WORKER", true) {
+		t.Fatal("a worker refusal that claims execution started was requeued")
+	}
+}
+
 func TestUnauthorizedRefusalCannotReturnAnotherAssignmentsSeat(t *testing.T) {
 	tests := []struct {
 		name        string
@@ -267,7 +279,7 @@ func refusedOutcome(t *testing.T, requestID string, ordinal uint64, spec []byte)
 		Status: pb.OutcomeStatus_OUTCOME_STATUS_REFUSED, SafeMessage: "no capacity",
 		ExecutionStarted: false,
 		Cause: &pb.OutcomeCause{
-			Code: pb.CauseCode_CAUSE_CODE_NO_CAPACITY, Origin: pb.CauseOrigin_CAUSE_ORIGIN_SUPERVISOR,
+			Code: pb.CauseCode_CAUSE_CODE_NO_CAPACITY, Origin: pb.CauseOrigin_CAUSE_ORIGIN_WORKER,
 			Detail: "refused before execution",
 		},
 	}

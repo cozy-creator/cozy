@@ -264,9 +264,9 @@ story.
 
 ### The job family is LOCAL, deliberately (cl-004)
 
-A job is an ATTEMPT CLASS on the same coordinator, not a second scheduler: it is a row in
-the same request table, it takes an ordinal under the same law, it settles through the same
-terminal transaction, and it streams over the same durable event route
+A job is an ATTEMPT CLASS in the same local service, not a second scheduler: the same
+orchestrator places and dispatches it, and the same record owner gives it an ordinal,
+settles its terminal transaction, and streams it over the same durable event route
 (`GET /v1/requests/{id}/events` — there is no second event authority anywhere, and
 `cozy job follow` is that route's client).
 
@@ -280,7 +280,7 @@ Two answers a job carries that a request does not:
 
 - **`publication`** — the durable publication the job's landed writes became:
   `{repo, root, status, entries, bytes, committed_at}` under the scratch repo
-  `<org>/_job-<job-id>`. An attempt writes into a per-attempt STAGE and the coordinator
+  `<org>/_job-<job-id>`. An attempt writes into a per-attempt STAGE and the record owner
   promotes it into the addressable root after the terminal is verified; the row is written
   INSIDE the terminal transaction, so a publication a terminal did not commit does not
   exist. `status` is the terminal's verdict STAMPED as metadata; a failed run's landed
@@ -290,10 +290,10 @@ Two answers a job carries that a request does not:
 - **`bill`** — ABSENT unless the host was configured with an explicit local rate. There is
   no `$0.00`: a fabricated zero is a claim about money nobody measured.
 
-`queue_position` and `requeues`/`retry_budget` are the coordinator's own scheduling facts
-made visible: several jobs submitted at once queue against one worker and drain in
-submission order, and the retry projection over the neutral outcomes spends a durable
-budget that the settlement names when it is exhausted.
+`queue_position` is the orchestrator's scheduling fact; `requeues`/`retry_budget` are the
+record owner's durable-attempt facts. Several jobs submitted at once queue against one
+worker and drain in submission order, while the retry projection over neutral outcomes
+spends a durable budget that the settlement names when it is exhausted.
 
 ## 8. Local host security posture
 

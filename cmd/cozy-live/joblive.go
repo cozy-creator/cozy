@@ -723,7 +723,7 @@ func exhaustRetryBudget(svc *liveService, root, ref, payloadPath string) string 
 	attempts := int64(numberOf(doc, "attempts"))
 	check("a job that ends NEUTRAL on every attempt settles typed rather than retrying forever",
 		code == 11, firstLine(out))
-	check("the orchestrator's PROJECTION spent the whole durable retry budget",
+	check("the record owner's PROJECTION spent the whole durable retry budget",
 		spent == budget && budget > 0,
 		fmt.Sprintf("%d/%d spent over %d attempt(s)", spent, budget, attempts))
 	check("and the settlement NAMES the budget it exhausted",
@@ -735,7 +735,7 @@ func exhaustRetryBudget(svc *liveService, root, ref, payloadPath string) string 
 
 // benchJob measures the orchestrator tax: the same job through `cozy job` versus cr-009's
 // own banked runner numbers (264–313 ms whole job, 44–48 ms body, 216–241 ms fixed runner
-// overhead). The difference is what a orchestrator, an HTTP hop, a durable authority and a
+// overhead). The difference is what an orchestrator, an HTTP hop, a record owner and a
 // RECLAIMED worker cost on top of an in-process ephemeral supervisor — a job worker is
 // terminal-and-reclaim, so every job pays its own spawn.
 func benchJob(svc *liveService, root, ref, payloadPath string) {
@@ -771,7 +771,7 @@ func benchJob(svc *liveService, root, ref, payloadPath string) {
 	fmt.Printf("  the worker's own runtime_ms for that attempt: %v (handler %v)\n",
 		metrics["runtime_ms"], metrics["handler_ms"])
 	fmt.Printf("  cr-009's banked runner: 264–313 ms whole job, 44–48 ms body, 216–241 ms fixed overhead\n")
-	fmt.Printf("  the COORDINATOR TAX is the difference: warm wall %d ms - runner %d ms\n",
+	fmt.Printf("  the ORCHESTRATOR TAX is the difference: warm wall %d ms - runner %d ms\n",
 		warm[0], 313)
 	fmt.Printf("  publication commit: %v entries, %v B, committed at %v\n",
 		pub["entries"], pub["bytes"], pub["committed_at"])
@@ -889,9 +889,9 @@ func cozyRunEnv(root string, imposed []string, args ...string) (int, string) {
 // --------------------------------------------------------------------------- jobcrash
 
 // THE CRASH MATRIX, at the two lifecycle points that decide whether a publication is a
-// promise or a fact. The COORDINATOR is what dies here — a separate `cozy up` process,
+// promise or a fact. The RECORD OWNER is what dies here — a separate `cozy up` process,
 // `kill -9`ed — because the publication row rides its terminal transaction, so the
-// orchestrator's death is the only crash that can land between "the bytes are on disk" and
+// record owner's death is the only crash that can land between "the bytes are on disk" and
 // "the publication exists".
 //
 //	before the bundle lands  ->  no publication is visible, and none ever was

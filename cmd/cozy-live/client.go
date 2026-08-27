@@ -105,7 +105,7 @@ func (s *liveService) alive() bool {
 	return res.StatusCode == http.StatusOK
 }
 
-// kill9 is the COORDINATOR-KILL arm's own instrument: SIGKILL to the whole process
+// kill9 is the RECORD-OWNER-KILL arm's own instrument: SIGKILL to the whole process
 // group, so nothing runs a shutdown path. What survives is what was durable.
 func (s *liveService) kill9() {
 	_ = killGroup(s.cmd.Process.Pid, syscall.SIGKILL)

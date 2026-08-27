@@ -1,4 +1,4 @@
-# The Windows PROCESS-MODEL proof (#449, cr-020 Half 1): the coordinator's live arm
+# The Windows PROCESS-MODEL proof (#449, cr-020 Half 1): the orchestrator's live arm
 # suites and the up/down journey on a hosted windows-latest runner. Not one step touches a
 # card — device facts are cr-020's deferred Half 2 on rented consumer GPUs.
 #

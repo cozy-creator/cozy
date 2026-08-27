@@ -7,8 +7,9 @@
 #
 # What "clean" means here, exactly: a fresh user with an empty home, no Go toolchain, no
 # Python, no `uv`, no `~/.cozy`, no build tree, and no mount of this repository other than
-# `scripts/` (the fixture itself) and the release directory, both READ-ONLY. Everything the
-# product needs it either carries or installs.
+# `scripts/` (the fixture itself) and the release directory, both READ-ONLY. The one host
+# facility it receives is a disposable child in the container's own cgroup: Runtime's
+# executor containment is a launch requirement, not something this harness may bypass.
 #
 # The container has network because a real first install does: `uv` comes off the internet
 # and the endpoint's own venv resolves its lock from an index. Nothing else is shared, and
@@ -35,11 +36,23 @@ ARGS=(--dist /dist --asset "$ASSET" --prefix /home/tester/.local --home /home/te
 [ -z "$UPGRADE" ]  || { MOUNTS+=(-v "$(dirname "$UPGRADE"):/upgrade:ro");   ARGS+=(--upgrade "/upgrade/$(basename "$UPGRADE")"); }
 [ -z "$ENDPOINT" ] || { MOUNTS+=(-v "$(dirname "$ENDPOINT"):/endpoint:ro"); ARGS+=(--endpoint "/endpoint/$(basename "$ENDPOINT")"); }
 
-exec docker run --rm --network bridge --cpus 2 "${MOUNTS[@]}" \
+exec docker run --rm --network bridge --cpus 2 --cgroupns=host \
+  -v /sys/fs/cgroup:/sys/fs/cgroup:rw "${MOUNTS[@]}" \
   -e DEBIAN_FRONTEND=noninteractive "$IMAGE" bash -c '
 set -euo pipefail
 apt-get -qq update && apt-get -qq install -y --no-install-recommends ca-certificates curl >/dev/null
 useradd -m tester
+# Docker normally presents cgroup v2 read-only. Delegate one child of this disposable
+# container to the unprivileged fixture user, then enter it before dropping privileges.
+# Runtime can create and reclaim only descendants of that child; the child itself dies
+# with --rm. No production containment check is disabled for acceptance.
+CGROUP_REL="$(cut -d: -f3 /proc/self/cgroup)"
+CGROUP_PARENT="/sys/fs/cgroup/${CGROUP_REL#/}"
+CGROUP_FIXTURE="$CGROUP_PARENT/cozy-fixture"
+mkdir "$CGROUP_FIXTURE"
+chown tester:tester "$CGROUP_FIXTURE" "$CGROUP_FIXTURE/cgroup.procs" \
+  "$CGROUP_FIXTURE/cgroup.freeze" "$CGROUP_FIXTURE/cgroup.kill"
+echo $$ > "$CGROUP_FIXTURE/cgroup.procs"
 # uv is the ONE prerequisite a first install has, and it arrives the way a user gets it.
 # It brings its own CPython, so this machine never had a Python either.
 su tester -c "curl -LsSf https://astral.sh/uv/install.sh | sh" >/dev/null 2>&1

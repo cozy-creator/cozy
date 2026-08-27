@@ -1,7 +1,7 @@
 """cl-013's acceptance endpoint: a REAL invoke with no model, no weights, no GPU.
 
 `gpu` DERIVES from the signature (cozy-runtime `_describe.py`): a handler with no `Model`
-parameter is a CPU handler, so the coordinator grants it no device and this endpoint runs
+parameter is a CPU handler, so the orchestrator grants it no device and this endpoint runs
 on any machine — including a Windows runner, which is the whole point of the launch tier's
 Windows slice. Its release depends on the BASE `cozy-runtime` wheel only (msgspec,
 protobuf, grpcio — no torch, no tensorfs), so a clean machine can install it over a
@@ -9,7 +9,7 @@ residential line in seconds.
 
 What an invoke of `tile` exercises is everything except the model: the install generation's
 own venv, `describe --check`'s derived surface, the supervisor, the executor, the worker
-protocol, the coordinator's terminal transaction, the output publication, the media id, and
+protocol, the record owner's terminal transaction, the output publication, the media id, and
 `cozy run --out`. `refuse` is the failure terminal on the same path.
 
 `video_transport` exists only so the remote live driver can exercise a text/image request

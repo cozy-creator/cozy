@@ -128,16 +128,28 @@ type Binding struct {
 	Installed  bool              `json:"installed"`
 }
 
+// WeightlessPlan is one exact ArtifactSubject for a canonical weightless binding plan.
+// The runtime is the sole writer of those documents. Creator consumes their identities
+// here before spawn and never reconstructs the private bytes.
+type WeightlessPlan struct {
+	Entrypoint string `json:"entrypoint"`
+	SubjectID  string `json:"subject_id"`
+	Kind       string `json:"kind"`
+	Digest     string `json:"digest"`
+	Length     uint64 `json:"length"`
+}
+
 // Bindings is what this project SELECTS, resolved by the one resolver that owns the
 // grammar. It constructs nothing, touches no device and loads no weights.
-func (r RuntimeCLI) Bindings() ([]Binding, *exit.Error) {
+func (r RuntimeCLI) Bindings() ([]Binding, []WeightlessPlan, *exit.Error) {
 	var doc struct {
-		Bindings []Binding `json:"bindings"`
+		Bindings        []Binding        `json:"bindings"`
+		WeightlessPlans []WeightlessPlan `json:"weightless_plans"`
 	}
 	if e := r.call(&doc, "bindings"); e != nil {
-		return nil, e
+		return nil, nil, e
 	}
-	return doc.Bindings, nil
+	return doc.Bindings, doc.WeightlessPlans, nil
 }
 
 // Verdict is one function's fit verdict, as the runtime's own document carries it.
