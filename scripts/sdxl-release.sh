@@ -26,14 +26,10 @@
 set -euo pipefail
 
 RUNTIME_REPO="${RUNTIME_REPO:-$HOME/cozy_v2/cozy-runtime}"
-# b2c7b48: the floor, not a preference — this host enters the supervisor through
-# `cozy-runtime serve` (db4ab8a), reads `job_descriptor_id` off `describe` (4485f27), stages
-# WEIGHTLESS binding records (a3c3d72), writes the record's NEW key set (f1625f9), and
-# speaks `cozy.worker.v1` at REV-2 (7df7902/b2c7b48), so a release pinning an older runtime
-# either cannot be served at all, reads a record whose every key it refuses as unknown, or
-# is refused at the handshake by `wire_schema_digest` — the pin and the wire move together
-# or the archive is a peer this host will not talk to.
-RUNTIME_SHA="${RUNTIME_SHA:-b2c7b48}"
+# e4e71ac is the floor, not a preference: it retains the current launch/materialization
+# surface and speaks worker-protocol schema rev 3. An older runtime is either missing the
+# launch facts or is refused at Claim by the schema digest; the release and wire move together.
+RUNTIME_SHA="${RUNTIME_SHA:-e4e71ace35a5a2286cf9173f5e0d7441401995c8}"
 # tfs-007's compiled facade, built from a PINNED read-only `git archive` of tensorfs
 # 846532c. The wheel is not incidental: cozytensors' ENCODING REGISTRY ships inside it, so
 # the release's pinned tensorfs is what decides which encodings this endpoint can read
@@ -82,6 +78,12 @@ git -C "$RUNTIME_REPO" archive "$FULL" | tar -x -C "$RT"
 
 nice -n 19 uv build --wheel --project "$RT" --out-dir "$T/vendor" >/dev/null
 rm -f "$T/vendor/.gitignore"
+RUNTIME_VERSION="$(sed -n 's/^version = "\([^"]*\)"/\1/p' "$RT/pyproject.toml" | head -1)"
+RUNTIME_WHEEL="$(find "$T/vendor" -maxdepth 1 -type f -name 'cozy_runtime-*.whl' -printf '%f\n')"
+[ -n "$RUNTIME_VERSION" ] && [ -n "$RUNTIME_WHEEL" ] && [ "$(printf '%s\n' "$RUNTIME_WHEEL" | wc -l)" -eq 1 ] || {
+  echo "refusing: expected one versioned cozy-runtime wheel from $FULL" >&2
+  exit 2
+}
 cp "$TENSORFS_WHEEL" "$T/vendor/"
 TFS_WHEEL_NAME="$(basename "$TENSORFS_WHEEL")"
 
@@ -125,14 +127,14 @@ name = "$PROJECT"
 version = "$VERSION"
 requires-python = ">=3.11"
 dependencies = [
-    "cozy-runtime[corpus]==0.0.1",
+    "cozy-runtime[corpus]==$RUNTIME_VERSION",
     "tensorfs==0.0.1",
 ]
 
 # uv records path sources RELATIVE to the project root, so an in-tree wheel relocates with
 # the archive and an out-of-tree one does not (cl-009's finding).
 [tool.uv.sources]
-cozy-runtime = { path = "vendor/cozy_runtime-0.0.1-py3-none-any.whl" }
+cozy-runtime = { path = "vendor/$RUNTIME_WHEEL" }
 tensorfs = { path = "vendor/$TFS_WHEEL_NAME" }
 TOML
 

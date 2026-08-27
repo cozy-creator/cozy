@@ -12,12 +12,10 @@
 set -euo pipefail
 
 RUNTIME_REPO="${RUNTIME_REPO:-$HOME/cozy_v2/cozy-runtime}"
-# f1625f9: the floor, not a preference — this host enters the supervisor through
-# `cozy-runtime serve` (db4ab8a), reads `job_descriptor_id` off `describe` (4485f27), stages
-# WEIGHTLESS binding records (a3c3d72) and writes the record's NEW key set (f1625f9), so a
-# release pinning an older runtime either cannot be served at all or reads a record whose
-# every key it refuses as unknown.
-RUNTIME_SHA="${RUNTIME_SHA:-f1625f9}"
+# e4e71ac is the floor, not a preference: it retains the current job launch surface and
+# speaks worker-protocol schema rev 3. An older runtime is either missing the launch facts
+# or is refused at Claim by the schema digest; the release and wire move together.
+RUNTIME_SHA="${RUNTIME_SHA:-e4e71ace35a5a2286cf9173f5e0d7441401995c8}"
 TENSORFS_WHEEL="${TENSORFS_WHEEL:-/tmp/cozy-wheels-cl003/tensorfs-0.0.1-cp311-abi3-linux_x86_64.whl}"
 DESCRIBE_PY="${DESCRIBE_PY:-$RUNTIME_REPO/corpus/.venv/bin/python}"
 OUT="${OUT:-$HOME/.cache/cozy/cl-004}"
@@ -46,6 +44,12 @@ git -C "$RUNTIME_REPO" archive "$FULL" | tar -x -C "$RT"
 
 nice -n 19 uv build --wheel --project "$RT" --out-dir "$T/vendor" >/dev/null
 rm -f "$T/vendor/.gitignore"
+RUNTIME_VERSION="$(sed -n 's/^version = "\([^"]*\)"/\1/p' "$RT/pyproject.toml" | head -1)"
+RUNTIME_WHEEL="$(find "$T/vendor" -maxdepth 1 -type f -name 'cozy_runtime-*.whl' -printf '%f\n')"
+[ -n "$RUNTIME_VERSION" ] && [ -n "$RUNTIME_WHEEL" ] && [ "$(printf '%s\n' "$RUNTIME_WHEEL" | wc -l)" -eq 1 ] || {
+  echo "refusing: expected one versioned cozy-runtime wheel from $FULL" >&2
+  exit 2
+}
 cp "$TENSORFS_WHEEL" "$T/vendor/"
 TFS_WHEEL_NAME="$(basename "$TENSORFS_WHEEL")"
 
@@ -63,12 +67,12 @@ name = "cozy-census-jobs"
 version = "$VERSION"
 requires-python = ">=3.11"
 dependencies = [
-    "cozy-runtime==0.0.1",
+    "cozy-runtime==$RUNTIME_VERSION",
     "tensorfs==0.0.1",
 ]
 
 [tool.uv.sources]
-cozy-runtime = { path = "vendor/cozy_runtime-0.0.1-py3-none-any.whl" }
+cozy-runtime = { path = "vendor/$RUNTIME_WHEEL" }
 tensorfs = { path = "vendor/$TFS_WHEEL_NAME" }
 TOML
 
