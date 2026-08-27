@@ -2503,7 +2503,7 @@ type PlacementSpec struct {
 	// FAULT_KIND_ENVIRONMENT_RECEIPT_MISMATCH, never a silent
 	// serve.
 	DescriptorDigest []byte             `protobuf:"bytes,4,opt,name=descriptor_digest,json=descriptorDigest,proto3" json:"descriptor_digest,omitempty"` // class (a): the cr-003 descriptor
-	BindingPlans     []*ArtifactSubject `protobuf:"bytes,5,rep,name=binding_plans,json=bindingPlans,proto3" json:"binding_plans,omitempty"`             // sorted by digest; the plans this spec serves
+	BindingPlans     []*ArtifactSubject `protobuf:"bytes,5,rep,name=binding_plans,json=bindingPlans,proto3" json:"binding_plans,omitempty"`             // sorted by digest. PLAN-ONLY PROFILE: every
 	unknownFields    protoimpl.UnknownFields
 	sizeCache        protoimpl.SizeCache
 }
@@ -2575,11 +2575,12 @@ func (x *PlacementSpec) GetBindingPlans() []*ArtifactSubject {
 
 // UN-RESERVED by this rev (th-007's placeholder): the exact bytes a grant may authorize.
 type ArtifactSubject struct {
-	state         protoimpl.MessageState `protogen:"open.v1"`
-	Digest        []byte                 `protobuf:"bytes,1,opt,name=digest,proto3" json:"digest,omitempty"`                        // class (b): the exact bytes named
-	SubjectId     string                 `protobuf:"bytes,2,opt,name=subject_id,json=subjectId,proto3" json:"subject_id,omitempty"` // stable name within the spec (e.g. plan id)
-	Kind          string                 `protobuf:"bytes,3,opt,name=kind,proto3" json:"kind,omitempty"`                            // bundle | wheel | wheelhouse | plan | descriptor
-	Length        uint64                 `protobuf:"varint,4,opt,name=length,proto3" json:"length,omitempty"`
+	state     protoimpl.MessageState `protogen:"open.v1"`
+	Digest    []byte                 `protobuf:"bytes,1,opt,name=digest,proto3" json:"digest,omitempty"`                        // class (b): the exact bytes named
+	SubjectId string                 `protobuf:"bytes,2,opt,name=subject_id,json=subjectId,proto3" json:"subject_id,omitempty"` // stable name within the spec (e.g. plan id)
+	Kind      string                 `protobuf:"bytes,3,opt,name=kind,proto3" json:"kind,omitempty"`                            // bundle | wheel | wheelhouse | plan | descriptor
+	// (PlacementSpec.binding_plans admits ONLY "plan")
+	Length        uint64 `protobuf:"varint,4,opt,name=length,proto3" json:"length,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -7290,10 +7291,10 @@ const file_cozy_worker_v1_worker_proto_rawDesc = "" +
 	"\x04kind\x18\x01 \x01(\x0e2\x19.cozy.worker.v1.FaultKindR\x04kind\x12\x18\n" +
 	"\asubject\x18\x02 \x01(\tR\asubject\x12\x16\n" +
 	"\x06reason\x18\x03 \x01(\tR\x06reason\x12\x16\n" +
-	"\x06detail\x18\x04 \x01(\tR\x06detail\"\x85\x01\n" +
+	"\x06detail\x18\x04 \x01(\tR\x06detail\"\x8b\x01\n" +
 	"\x0eOutputManifest\x12<\n" +
 	"\x1apublication_receipt_digest\x18\x01 \x01(\tR\x18publicationReceiptDigest\x125\n" +
-	"\aoutputs\x18\x03 \x03(\v2\x1b.cozy.worker.v1.OutputEntryR\aoutputs\"w\n" +
+	"\aoutputs\x18\x03 \x03(\v2\x1b.cozy.worker.v1.OutputEntryR\aoutputsJ\x04\b\x02\x10\x03\"w\n" +
 	"\vOutputEntry\x12\x1b\n" +
 	"\toutput_id\x18\x01 \x01(\tR\boutputId\x12\x16\n" +
 	"\x06digest\x18\x02 \x01(\fR\x06digest\x12\x16\n" +
@@ -7314,12 +7315,12 @@ const file_cozy_worker_v1_worker_proto_rawDesc = "" +
 	"handler_ms\x18\n" +
 	" \x01(\x04R\thandlerMs\x12'\n" +
 	"\x0ffinalization_ms\x18\v \x01(\x04R\x0efinalizationMs\x12+\n" +
-	"\x11unverified_fields\x18\f \x03(\tR\x10unverifiedFields\"z\n" +
+	"\x11unverified_fields\x18\f \x03(\tR\x10unverifiedFields\"\x80\x01\n" +
 	"\x0fTriageBundleRef\x12\x1d\n" +
 	"\n" +
 	"subject_id\x18\x01 \x01(\tR\tsubjectId\x120\n" +
 	"\x14write_receipt_digest\x18\x04 \x01(\fR\x12writeReceiptDigest\x12\x16\n" +
-	"\x06length\x18\x03 \x01(\x04R\x06length*O\n" +
+	"\x06length\x18\x03 \x01(\x04R\x06lengthJ\x04\b\x02\x10\x03*O\n" +
 	"\aPosture\x12\x17\n" +
 	"\x13POSTURE_UNSPECIFIED\x10\x00\x12\x15\n" +
 	"\x11POSTURE_ACCEPTING\x10\x01\x12\x14\n" +

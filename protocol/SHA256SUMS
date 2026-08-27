@@ -1,3 +1,3 @@
-5973443cefca5f0220a5229f24d5d5cef77c25c16c9fc5fd26e8a418f33dac65  protocol/cozy/worker/v1/wire_identity.go
-d675b8b1bc782e12a59092ee8ab2ef5913d57b832f4905189f948c8068bd76ab  protocol/cozy/worker/v1/worker.pb.go
+e003401f8a60bc7499ae362a1393db58351ad09e77a95faa73c3aec194395dc2  protocol/cozy/worker/v1/wire_identity.go
+fecd92151fe8933d4b08c0737535ce95693670e21d2d47587930c3a71b54015f  protocol/cozy/worker/v1/worker.pb.go
 13e5b043503a50a87100c4882b70ee4ae404bfdff19403e6e16c85cd0081001e  protocol/cozy/worker/v1/worker_grpc.pb.go
