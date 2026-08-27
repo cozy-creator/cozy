@@ -44,7 +44,7 @@ func (s *server) serve() int {
 			}
 		}
 	}
-	srv := &http.Server{Handler: s.routes()}
+	srv := &http.Server{Handler: baseline(s.routes())}
 	fmt.Printf("[media] serving %s root=%s quota=%d B plans=%v\n",
 		bound, s.opt.root, s.opt.quota, s.opt.plans != "")
 	os.Stdout.Sync()
@@ -57,6 +57,24 @@ func (s *server) serve() int {
 		return fatal("serving ended: %v", err)
 	}
 	return 0
+}
+
+// baseline is what EVERY response carries, refusals included — the same posture the
+// owner API's baseline() takes (internal/api/api.go), because this is the one
+// off-loopback listener and it was the one door sending none of it (cl-026).
+func baseline(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		h := w.Header()
+		h.Set("X-Content-Type-Options", "nosniff")
+		// No response is cacheable: inputs and outputs are attempt-scoped and live.
+		h.Set("Cache-Control", "no-store")
+		h.Set("Referrer-Policy", "no-referrer")
+		// Nothing this server renders may load, connect, or execute anything.
+		h.Set("Content-Security-Policy",
+			"default-src 'none'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'")
+		// NO Access-Control-Allow-* header is set anywhere in this program, deliberately.
+		next.ServeHTTP(w, r)
+	})
 }
 
 // loopback answers whether an address is one this machine alone can reach. It is the ONLY

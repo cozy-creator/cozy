@@ -87,6 +87,15 @@ func (s *Server) submitJob(w http.ResponseWriter, r *http.Request) {
 			`{"endpoint":"org/name","function":"census","input":{…}}`)
 		return
 	}
+	// A job's trees name HOST DIRECTORIES that become read/write worker grants — the same
+	// authority local_assets carry on /v1/requests (requests.go) — so they take the same
+	// gate: a browser bearer must never name host paths (credentials.go).
+	if len(sub.Trees) > 0 && !s.cliAuthenticated(r) {
+		s.refuse(w, r, http.StatusForbidden, "cli_credential_required",
+			"trees name host filesystem directories and require the OS-protected CLI credential",
+			"use `cozy job submit --tree <ref>=<dir>`; this build exposes no browser tree-upload route")
+		return
+	}
 	spec, e := s.resolveJob(sub)
 	if e != nil {
 		s.refuseTyped(w, r, e)

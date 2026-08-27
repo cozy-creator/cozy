@@ -246,7 +246,12 @@ var cudaVersion = regexp.MustCompile(`CUDA Version:\s*(\d+)\.(\d+)`)
 
 // hostCUDA is the driver's maximum CUDA version as cuXYZ digits (12.8 -> 128).
 func hostCUDA() int {
-	out, err := exec.Command("nvidia-smi").Output()
+	cmd := exec.Command("nvidia-smi")
+	// The allowlisted tool environment, like every other spawn: a probe that inherited
+	// the full parent environment (TENSORHUB_TOKEN included) was the one production
+	// spawn invisible to the env fence (cl-026).
+	cmd.Env = config.Frozen().Tool()
+	out, err := cmd.Output()
 	if err != nil {
 		return 0
 	}

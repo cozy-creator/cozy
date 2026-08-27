@@ -3,6 +3,8 @@ package main
 import (
 	"encoding/json"
 	"fmt"
+	"io"
+	"net"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -12,6 +14,7 @@ import (
 
 	"github.com/cozy-creator/cozy-creator-v2/internal/api"
 	"github.com/cozy-creator/cozy-creator-v2/internal/manifest"
+	"github.com/cozy-creator/cozy-creator-v2/internal/secret"
 )
 
 // cl-006's live sections. Everything here drives a SEPARATE, REAL `cozy up` process over
@@ -187,6 +190,66 @@ func sectionAPIArms() {
 	errBody := svc.call("GET", "/v1/requests/req-nope", nil)
 	check("nor does any rendered error", !strings.Contains(string(errBody.Body), svc.token),
 		errBody.brief())
+
+	head("the browser credential must never name host paths (cl-026: a job's trees)")
+	// The browser half of the per-launch pair is deliberately unreachable from outside a
+	// real service (it exists only in the process and the --open URL's fragment), so this
+	// arm hosts the REAL api.Server in-process with a credential pair the driver minted
+	// itself — the same Server, the same guard chain, over real loopback HTTP.
+	lv := hostCoordinator("api-arms-paths", true)
+	defer lv.close()
+	rawBrowser, rawCLI := "arm-browser-"+randomHex(24), "arm-cli-"+randomHex(24)
+	ln, lerr := net.Listen("tcp", "127.0.0.1:0") //cozy:allow the DRIVER hosts the real api.Server to arm the browser-credential path gate; the product binds through internal/api
+	must("binding the arm server", lerr)
+	defer ln.Close()
+	armServer := api.New(api.Options{
+		Orchestrator: lv.c, Cfg: lv.cfg, Addr: ln.Addr().String(), Bound: []string{"ipv4"},
+		Creds: api.Credentials{Browser: secret.New(rawBrowser), CLI: secret.New(rawCLI)},
+	})
+	armHandler, he := armServer.Handler()
+	must("the arm server's handler", errOf(he))
+	go func() { _ = http.Serve(ln, armHandler) }()
+
+	postJob := func(token, idem string, body map[string]any) (int, string) {
+		data, err := json.Marshal(body)
+		must("rendering the job body", err)
+		req, err := http.NewRequest("POST", "http://"+ln.Addr().String()+"/v1/local/jobs",
+			strings.NewReader(string(data)))
+		must("building the job request", err)
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("Authorization", "Bearer "+token)
+		req.Header.Set("Idempotency-Key", idem)
+		res, err := (&http.Client{Timeout: 10 * time.Second}).Do(req)
+		if err != nil {
+			return 0, err.Error()
+		}
+		defer res.Body.Close()
+		raw, _ := io.ReadAll(res.Body)
+		return res.StatusCode, string(raw)
+	}
+	trees := map[string]any{"endpoint": "fake/paths", "function": "census",
+		"trees": []string{"data=" + root}}
+	status, body := postJob(rawBrowser, "arm-trees-browser", trees)
+	check("a BROWSER-credential job naming trees is refused (403 cli_credential_required)",
+		status == http.StatusForbidden && strings.Contains(body, "cli_credential_required"),
+		fmt.Sprintf("%d %s", status, brieflyBody(body)))
+	status, body = postJob(rawCLI, "arm-trees-cli", trees)
+	check("the SAME submission under the CLI credential passes the path gate",
+		status != http.StatusForbidden && !strings.Contains(body, "cli_credential_required"),
+		fmt.Sprintf("%d %s", status, brieflyBody(body)))
+	status, body = postJob(rawBrowser, "arm-notrees-browser",
+		map[string]any{"endpoint": "fake/paths", "function": "census"})
+	check("a browser submission WITHOUT trees is not refused by the path gate",
+		!strings.Contains(body, "cli_credential_required"),
+		fmt.Sprintf("%d %s", status, brieflyBody(body)))
+}
+
+func brieflyBody(body string) string {
+	body = strings.TrimSpace(body)
+	if len(body) > 120 {
+		return body[:120] + "…"
+	}
+	return body
 }
 
 func trimPath(p string) string {
