@@ -65,8 +65,8 @@ jobs:
         run: |
           for v in 3.11 3.14; do
             echo "=== CPython $v"
-            SKIP_BUILD=1 WHEEL_DIR="$PWD/dist" bash scripts/wheel-smoke.sh \
-              "${RUNNER_TEMP}/smoke-$v" "python$v"
+            bash scripts/wheel-smoke.sh "${RUNNER_TEMP}/smoke-$v" "python$v" \
+              --skip-build --wheels "$PWD/dist"
           done
       - if: ${{ !matrix.native }}
         run: echo "cross-built for ${{ matrix.target }} — archived, not executed here"

@@ -7,19 +7,30 @@
 # thing that stops a matrix entry from rotting quietly. A live run, not a test — see
 # tracker README #160.
 #
-#   scripts/wheel-smoke.sh [workdir] [python]
+#   scripts/wheel-smoke.sh [workdir] [python] [--skip-build] [--wheels <dir>]
 set -euo pipefail
 cd "$(dirname "$0")/.."
-work="${1:-$(mktemp -d)}"
-py="${2:-python3}"
+work=""
+py=python3
+skip_build=""
+wheels=""
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --skip-build) skip_build=1 ;;
+        --wheels) wheels="$2"; shift ;;
+        *) if [ -z "$work" ]; then work="$1"; else py="$1"; fi ;;
+    esac
+    shift
+done
+work="${work:-$(mktemp -d)}"
 mkdir -p "$work"
 
 # The committed fixture: `tfs checkpoint write vectors/store --blocks 1 --scale 32`.
 SNAP=beb936f23bacbb5679d5cfbc207302503660f53fe543b34a3d752a7e5a38c4ee
 DIGEST=c578846256ffce1447da8787c83315b13005977721f11a00f8084afd09098185
 
-wheels="${WHEEL_DIR:-$work/wheels}"
-if [ -z "${SKIP_BUILD:-}" ]; then
+wheels="${wheels:-$work/wheels}"
+if [ -z "$skip_build" ]; then
     export CARGO_BUILD_JOBS="${CARGO_BUILD_JOBS:-2}"
     nice -n 19 maturin build --release --out "$wheels" >"$work/build.log" 2>&1 || {
         tail -20 "$work/build.log"; exit 1; }

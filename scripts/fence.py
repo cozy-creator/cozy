@@ -425,6 +425,31 @@ def fence_staging():
     return bad, f"{len(STAGING_VOCAB)} staged-protocol words, none built"
 
 
+# ------------------------------------------------- 8. env reads are flags
+
+# tfs-023's fence. Configuration enters a binary exactly once, as parsed flags at main
+# (`split_flags` over `std::env::args`). A `std::env::var` read anywhere else is a second
+# configuration door with no --help line and no receipt. The compile-time `env!` version
+# stamps are a different token and stay legal; the one legitimate RUNTIME env use in this
+# repo is the S3 credential set, which lives in scripts, not in any binary.
+ENV_HOME = {"crates/tensorfs-core/src/bin/tfs/main.rs"}
+
+
+def fence_env():
+    bad = []
+    for p in sorted((ROOT / "crates").glob("**/*.rs")):
+        r = str(rel(p))
+        if r in ENV_HOME:
+            continue
+        for i, s in code_lines(p.read_text(errors="ignore")):
+            if not s:
+                continue
+            if re.search(r"env::var", s):
+                bad.append(f"{r}:{i}: runtime env read '{s[:70]}' — configuration is "
+                           "flags parsed once at main, never an env door")
+    return bad, f"runtime env reads confined to {sorted(ENV_HOME)}; env! stamps exempt"
+
+
 # ----------------------------------------------------------------------------
 
 def rel(p):
@@ -437,7 +462,8 @@ FENCES = [("forbidden dependencies", fence_dependencies),
           ("one codec, one evaluator", fence_one_codec),
           ("serve path, pinned buffers, one transform", fence_serve_path),
           ("no grading below the hub", fence_grading),
-          ("the staged fallback stays unbuilt", fence_staging)]
+          ("the staged fallback stays unbuilt", fence_staging),
+          ("env reads are flags", fence_env)]
 
 red = 0
 for title, fn in FENCES:

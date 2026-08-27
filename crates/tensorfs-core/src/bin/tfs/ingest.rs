@@ -780,6 +780,7 @@ pub fn cmd_run(root: &Path, target: &str, f: &Flags) -> ExitCode {
         if matches!(
             k.as_str(),
             "source" | "config" | "registry" | "spec-variant" | "tenant" | "ttl"
+                | "isolation-tier"
         ) {
             argv.push(format!("--{k}"));
             argv.push(v.clone());
@@ -969,10 +970,7 @@ pub fn cmd_worker(root: &Path, target: &str, f: &Flags) -> ExitCode {
     };
     let subject_ref = ok!(ck::put_doc(&store, &subject));
 
-    let isolation_tier: u64 = std::env::var("TFS_ISOLATION_TIER")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(1);
+    let isolation_tier: u64 = flag_num(f, "isolation-tier", 1);
     let mut out = out;
     out.obs
         .push(("source_bytes".to_string(), profile.max_source_bytes as i64));

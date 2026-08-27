@@ -24,9 +24,11 @@ is the wrong instrument for answering it.
                                    the GREEN branch end to end against live R2, plus the
                                    race matrix: honest duplicate, wrong-body publisher,
                                    verifier crash mid-publish, and a GC pass during publish
+  knobs (flags, never env):  --bucket <name>  --segment-mib <n>  --work <dir>  --out <file>
 
-Credentials come from the environment or from an --env file of KEY=VALUE lines; nothing is
-read from a credential store and nothing is written to one. The token available here can
+Credentials come from the environment or from an --env file of KEY=VALUE lines — the
+TENSORHUB_S3_*/AWS_* credential set is the doctrine's one legitimate env use in this repo;
+nothing is read from a credential store and nothing is written to one. The token available here can
 write objects but cannot create buckets, so the gate works inside an existing bucket under a
 namespaced scratch prefix and deletes every object it wrote.
 """
@@ -46,8 +48,8 @@ from concurrent.futures import ThreadPoolExecutor
 # runs inside an existing one under a namespaced scratch prefix and deletes what it wrote.
 # `dataset-cas` is a digest-keyed CAS namespace: a `tfs-017-qualification/<run>/` key is
 # not digest-shaped, collides with nothing, and is addressed by nothing.
-BUCKET = os.environ.get("TFS017_BUCKET", "dataset-cas")
-SEGMENT_MIB = int(os.environ.get("TFS017_SEGMENT_MIB", "8"))
+BUCKET = "dataset-cas"
+SEGMENT_MIB = 8
 UNSIGNED = "UNSIGNED-PAYLOAD"
 EMPTY_SHA = hashlib.sha256(b"").hexdigest()
 
@@ -302,29 +304,36 @@ def race_matrix(prefix):
 
 PUBLISH = None
 KEEP = False
-WORK = os.environ.get("TFS017_WORK", "/tmp/tfs-017")
+WORK = "/tmp/tfs-017"
+OUT = None
 
 
 def main():
     args = sys.argv[1:]
     if "--env" in args:
         load_env(args[args.index("--env") + 1])
-    global KEEP, PUBLISH
+    global KEEP, PUBLISH, BUCKET, SEGMENT_MIB, WORK, OUT
     keep = KEEP = "--keep" in args
     if "--publish" in args:
         i = args.index("--publish")
         PUBLISH = (args[i + 1], args[i + 2])
+    if "--bucket" in args:
+        BUCKET = args[args.index("--bucket") + 1]
+    if "--segment-mib" in args:
+        SEGMENT_MIB = int(args[args.index("--segment-mib") + 1])
+    if "--work" in args:
+        WORK = args[args.index("--work") + 1]
+    if "--out" in args:
+        OUT = args[args.index("--out") + 1]
     pathlib.Path(WORK).mkdir(parents=True, exist_ok=True)
     import uuid
     run = uuid.uuid4().hex[:12]
     prefix = f"qualification/{run}"
 
-    if "--segment-mib" in args:
-        globals()["SEGMENT_MIB"] = int(args[args.index("--segment-mib") + 1])
     print(f"bucket   {BUCKET}\nprefix   {prefix}\nsegment  {SEGMENT_MIB} MiB\n")
     st, _, _ = signed_request("GET", query="list-type=2&max-keys=1")
     if st != 200:
-        sys.exit(f"bucket {BUCKET!r} is not listable ({st}); set TFS017_BUCKET")
+        sys.exit(f"bucket {BUCKET!r} is not listable ({st}); pass --bucket")
     if PUBLISH:
         print("=" * 72)
         print("THE GREEN BRANCH, END TO END AGAINST LIVE R2, PLUS THE RACE MATRIX")
@@ -332,7 +341,7 @@ def main():
         race_matrix(prefix)
         green = all(r["ok"] for r in RESULTS)
         print(f"\n{sum(1 for r in RESULTS if r['ok'])}/{len(RESULTS)} arms fired")
-        out = pathlib.Path(os.environ.get("TFS017_OUT", f"{WORK}/race-matrix.json"))
+        out = pathlib.Path(OUT or f"{WORK}/race-matrix.json")
         out.write_text(json.dumps({"bucket": BUCKET, "prefix": prefix,
                                    "arms": RESULTS}, indent=1))
         print(f"banked -> {out}")
@@ -420,7 +429,7 @@ def main():
     print("publication`, and NO staging namespace, staged verifier or promotion copy exists.")
     print("=" * 72)
 
-    out = pathlib.Path(os.environ.get("TFS017_OUT", "/tmp/tfs-017-qualification.json"))
+    out = pathlib.Path(OUT or "/tmp/tfs-017-qualification.json")
     out.write_text(json.dumps({"bucket": BUCKET, "prefix": prefix,
                                "endpoint_host": urllib.parse.urlparse(creds()[2]).netloc,
                                "verdict": "GREEN" if green else "RED",
