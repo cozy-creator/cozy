@@ -14,7 +14,14 @@ jobs:
       # cross-compiles cl-013's `release` job depends on.
       - run: CGO_ENABLED=0 go build ./...
       # No automated tests (tracker decisions.md #160): test files are banned.
-      - run: if [ -n "$(find . -name '*_test.go' -not -path './.git/*')" ]; then echo 'test files are banned (decisions #160)'; exit 1; fi
+      # A block scalar, deliberately: in a plain scalar YAML read ` #160)'…` as a
+      # comment, truncated the script mid-quote, and the guard failed EVERY run with
+      # a shell EOF instead of guarding anything.
+      - run: |
+          if [ -n "$(find . -name '*_test.go' -not -path './.git/*')" ]; then
+            echo "test files are banned (decisions #160)"
+            exit 1
+          fi
       - run: go vet ./...
       - run: python3 scripts/fence.py
 
