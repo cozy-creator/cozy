@@ -64,6 +64,7 @@ func controlFixture(t *testing.T) hub.ExactControlDocument {
 		}}, "struct": "Result"},
 	}}}))
 	evaluatedConfig := exact([]byte(`{}`))
+	artifactSet := exact([]byte(`{"kind":"tensorhub.resolved_object_set/1","roots":[]}`))
 	plan := exact(mustJSON(t, map[string]any{
 		"bindings": []any{}, "descriptor": refMap(descriptor), "entrypoint": "generate", "format": planFormat,
 	}))
@@ -74,7 +75,7 @@ func controlFixture(t *testing.T) hub.ExactControlDocument {
 		"environment_spec":              map[string]any{}, // filled below
 		"format":                        bindingFormat,
 		"installed_environment_receipt": map[string]any{}, // filled below
-		"object_set_digest":             digestOf([]byte("objects")),
+		"object_set_digest":             artifactSet.Digest,
 	}))
 	_ = bindingRelease
 
@@ -111,7 +112,7 @@ func controlFixture(t *testing.T) hub.ExactControlDocument {
 		"endpoint_execution_digest": digestOf([]byte("execution")),
 		"environment_spec":          refMap(environment), "format": bindingFormat,
 		"installed_environment_receipt": refMap(receipt),
-		"object_set_digest":             digestOf([]byte("objects")),
+		"object_set_digest":             artifactSet.Digest,
 	}))
 	placementBytes, _, err := canonical.Identity(&pb.PlacementSet{Placements: []*pb.Placement{
 		{
@@ -130,6 +131,7 @@ func controlFixture(t *testing.T) hub.ExactControlDocument {
 	placement := exact(placementBytes)
 	s := snapshot{
 		AcquisitionAttemptID: "ra-test",
+		ArtifactObjectSet:    artifactSet,
 		BindingDocuments: []bindingDocument{{CanonicalBytes: plan.CanonicalBytes,
 			Digest: plan.Digest, Kind: "entrypoint_binding_plan", Length: plan.Length}},
 		BindingRelease: bindingRelease, Descriptor: descriptor, EndpointBundle: endpointBundle,

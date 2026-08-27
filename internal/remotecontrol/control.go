@@ -39,6 +39,7 @@ type bindingDocument struct {
 
 type snapshot struct {
 	AcquisitionAttemptID        string                   `json:"acquisition_attempt_id"`
+	ArtifactObjectSet           hub.ExactControlDocument `json:"artifact_object_set"`
 	BindingDocuments            []bindingDocument        `json:"binding_documents"`
 	BindingRelease              hub.ExactControlDocument `json:"binding_release"`
 	Descriptor                  hub.ExactControlDocument `json:"descriptor"`
@@ -162,7 +163,8 @@ func Decode(control hub.ExactControlDocument, endpointRef string) (Facts, *exit.
 		return facts, e
 	}
 	for name, document := range map[string]hub.ExactControlDocument{
-		"binding_release": s.BindingRelease, "descriptor": s.Descriptor,
+		"artifact_object_set": s.ArtifactObjectSet,
+		"binding_release":     s.BindingRelease, "descriptor": s.Descriptor,
 		"endpoint_bundle": s.EndpointBundle, "environment_spec": s.EnvironmentSpec,
 		"evaluated_config":              s.EvaluatedConfig,
 		"installed_environment_receipt": s.InstalledEnvironmentReceipt,
@@ -204,6 +206,14 @@ func Decode(control hub.ExactControlDocument, endpointRef string) (Facts, *exit.
 	receiptRef, err := refOf(release.Sub("installed_environment_receipt"))
 	if err != nil || !sameRef(receiptRef, s.InstalledEnvironmentReceipt) {
 		return facts, invalid("binding release receipt does not match the snapshot receipt")
+	}
+	if release.Str("object_set_digest") != s.ArtifactObjectSet.Digest {
+		return facts, invalid("binding release object set does not match the snapshot object set")
+	}
+	objectSet, err := canonical.ReadObject(s.ArtifactObjectSet.CanonicalBytes)
+	if err != nil || requireKeys(objectSet, "kind", "roots") != nil ||
+		objectSet.Str("kind") != "tensorhub.resolved_object_set/1" {
+		return facts, invalid("artifact object set is not the closed canonical document: %v", err)
 	}
 
 	releaseKinds := map[string]string{}
