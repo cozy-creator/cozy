@@ -622,8 +622,39 @@ def check_contract():
     return bad
 
 
+def check_video_boundary():
+    """Creative source and video CLI never acquire placement/model policy."""
+    commands = pathlib.Path("internal/manifest/commands.go").read_text()
+    start = commands.find("// ---- editable Cozy Video sources")
+    stop = commands.find("// ---- jobs", start)
+    if start < 0 or stop < 0:
+        return ["[video] manifest has no bounded Cozy Video command section"]
+    surface = commands[start:stop]
+    bad = []
+    for forbidden in ("--worker", "--lane", "--model", "--provider", "--datacenter",
+                      "--region", "--accelerator", "--snapshot-root", ".artifacts"):
+        if forbidden in surface:
+            bad.append(f"[video] video command surface contains placement/model input {forbidden}")
+    if surface.count('Name: "--rental"') != 2:
+        bad.append("[video] compose and submit each need the Tensorhub-issued --rental handle")
+    source = pathlib.Path("internal/video/source.go").read_text()
+    forbidden_fields = re.compile(
+        r'yaml:"(?:lane|model|provider|datacenter|region|accelerator|gpu|snapshot|model_root|artifact)'
+    )
+    if match := forbidden_fields.search(source):
+        bad.append(f"[video] cozy.video/1 acquired execution field {match.group(0)}")
+    proof = pathlib.Path("proofs/h3-long-form/accept.sh")
+    if proof.exists():
+        text = proof.read_text().lower()
+        for forbidden in ("runpod", "dual-full", "fp8-baked", "mxfp8-baked", ".artifacts"):
+            if forbidden in text:
+                bad.append(f"[video] paid acceptance script hardcodes {forbidden}")
+    return bad
+
+
 violations = (check_sources() + check_matrix() + check_manifest() + check_secret_flags()
-              + check_contract() + check_embedded() + check_scripts() + check_document_kinds())
+              + check_contract() + check_video_boundary() + check_embedded() + check_scripts()
+              + check_document_kinds())
 if violations:
     print("FENCE RED (boundaries.md):", file=sys.stderr)
     for v in violations:
@@ -639,5 +670,5 @@ print(
     f"media({len(DENY_MEDIA_EGRESS)} egress + {len(DENY_MEDIA_IMPORT)} imports@{MEDIA_DIR}) "
     f"runtime({len(RUNTIME_VERBS_DENY)} denied verbs@{len(RUNTIME_SITES)} + indirection) "
     f"embed({len(DENY_EMBED)} words, scripts allow@{len(PY_ALLOW)}) "
-    f"contract({len(parse_go_routes(pathlib.Path('internal/api/routes.go')))} routes)"
+    f"contract({len(parse_go_routes(pathlib.Path('internal/api/routes.go')))} routes) video-boundary"
 )

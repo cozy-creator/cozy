@@ -139,6 +139,12 @@ func sectionRent() {
 	check("it reports the rental state, direct address, and requested accelerator",
 		strings.Contains(out, "state:") && strings.Contains(out, "127.0.0.1:") &&
 			field(out, "accelerator") == "NVIDIA H200", field(out, "address")+" "+field(out, "accelerator"))
+	code, control, controlOut := cozyJSON(root, "rent", "show", rentalA)
+	selectedRoots, _ := control["model_root_digests"].([]any)
+	selectedPlans, _ := control["binding_plan_digests"].([]any)
+	check("rent show projects exact selected execution/root/plan identities, never selection inputs",
+		code == 0 && strings.HasPrefix(fmt.Sprint(control["endpoint_execution_digest"]), "sha256:") &&
+			len(selectedRoots) == 1 && len(selectedPlans) == 1, firstLine(controlOut))
 	fmt.Printf("  bench ask -> ready -> pinned: %d ms\n", rentMS)
 
 	head("the owner token is MINTED HERE, and the hub is never told it (#495e)")

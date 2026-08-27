@@ -246,6 +246,10 @@ func handleWorkflowDownload(ctx *Context) *exit.Error {
 		controls[id] = map[string]any{
 			"endpoint": row.EndpointRef, "accelerator": row.AcceleratorModel,
 			"control": control,
+			"exact_control_snapshot": map[string]any{
+				"canonical_bytes": row.ControlSnapshotBytes,
+				"digest":          row.ControlSnapshotDigest, "length": row.ControlSnapshotLength,
+			},
 		}
 	}
 	if problem := writeWorkflowJSON(filepath.Join(absolute, "rental-control.json"), controls); problem != nil {

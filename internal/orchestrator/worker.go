@@ -1029,18 +1029,15 @@ type WorkerFacts struct {
 	AcceptedRevision  uint64 `json:"accepted_desired_state_revision"`
 	ConvergedRevision uint64 `json:"converged_revision"`
 
-	// The two OBSERVATIONS a waiter needs and could not see. `cozy warm` polls this
-	// listing and used to give up on a 10-minute clock, because the facts that decide
-	// — how long the worker has been silent, and how long it has been saying it cannot
-	// serve — lived only inside the orchestrator. A slow load is neither of them.
+	// QuietMS makes missed protocol reports visible. ErrorForMS is diagnostic history
+	// only: a typed FAILED/fault verdict is acted on immediately, never after a timer.
 	QuietMS    int64  `json:"quiet_ms"`
 	ErrorForMS int64  `json:"error_for_ms"`
 	Fault      string `json:"fault"`
 	// Refusal is THIS OWNER'S OWN VERDICT about the thing at the other end — a foreign
 	// instance identity, an unpinned release, a wire schema this build does not speak. It
-	// is deliberately NOT `Fault`: a fault is the worker's word about itself and carries an
-	// error clock, because a placement can hold one and still activate (a degraded warm
-	// case is the ordinary example). A refusal has no clock. It is settled, and a waiter
+	// is deliberately NOT `Fault`: a fault is the worker's settled word about itself.
+	// A refusal is this owner's settled verdict. Neither waits on an error clock, and a waiter
 	// that treated the two alike would either wait out a decision or give up on a load.
 	Refusal string `json:"refusal"`
 }

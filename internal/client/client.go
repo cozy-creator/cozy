@@ -228,9 +228,8 @@ type Worker struct {
 	Materialization string   `json:"materialization"`
 	Serving         string   `json:"serving"`
 	Plans           []string `json:"dispatchable_plan_ids"`
-	// How long this worker has been SILENT, and how long it has been saying it CANNOT
-	// serve. They are what a waiter watches instead of a clock: a worker loading a
-	// 20 GB binding is neither silent nor in error, however long it takes.
+	// QuietMS measures missed protocol reports. ErrorForMS is diagnostic only; typed
+	// faults/refusals settle immediately and no elapsed duration decides readiness.
 	QuietMS    int64  `json:"quiet_ms"`
 	ErrorForMS int64  `json:"error_for_ms"`
 	Fault      string `json:"fault"`

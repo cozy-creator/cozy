@@ -50,6 +50,24 @@ func workflowLive(crashOnly bool) {
 			fmt.Sprintf("%d steps · %d children", len(steps), len(children)))
 		check("every handoff reproduced one accepted image digest", len(digests) == 1,
 			strings.Join(mapKeys(digests), ","))
+		code, statusDoc, out := cozyJSON(root, "workflow", "status", workflowID)
+		structured, _ := statusDoc["steps"].([]any)
+		bindingVisible := false
+		if len(structured) > 1 {
+			second, _ := structured[1].(map[string]any)
+			bindings, _ := second["resolved_bindings"].([]any)
+			bindingVisible = second["materialized_submission_digest"] != "" && len(bindings) == 1
+		}
+		check("workflow status --json preserves structured materialization and binding evidence",
+			code == 0 && len(structured) == 9 && bindingVisible, firstLine(out))
+		download := filepath.Join(root, "workflow-download")
+		code, out = cozyRun(root, "workflow", "download", workflowID, "--out", download)
+		_, workflowErr := os.Stat(filepath.Join(download, "workflow.json"))
+		_, manifestErr := os.Stat(filepath.Join(download, "download-manifest.json"))
+		_, receiptErr := os.Stat(filepath.Join(download, "step-09-receipt.json"))
+		check("workflow download writes local workflow, child receipt, and manifest documents",
+			code == 0 && workflowErr == nil && manifestErr == nil && receiptErr == nil,
+			firstLine(out))
 
 		head("durable cancellation prevents every later child")
 		cancelPlan := liveWorkflowPlan(root, 750)

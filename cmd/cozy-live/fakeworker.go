@@ -297,6 +297,10 @@ func (f *fakeControl) Control(stream pb.WorkerControl_ControlServer) error {
 	}
 
 	var dropAck *pb.AttemptOutcome
+	var currentRevision uint64
+	var currentPlacement string
+	var currentSetDigest []byte
+	var currentPlanIDs []string
 	reporting := false
 	for {
 		frame, err := stream.Recv()
@@ -350,8 +354,11 @@ func (f *fakeControl) Control(stream pb.WorkerControl_ControlServer) error {
 			}
 			f.say("DesiredWorkerState revision=%d placement=%s plans=%d", d.Revision,
 				placementID, len(planIDs))
+			currentRevision, currentPlacement = d.Revision, placementID
+			currentSetDigest = append([]byte(nil), setDigest...)
+			currentPlanIDs = append([]string(nil), planIDs...)
 			if placementID != "" && !reporting &&
-				(f.arm == "slowfill" || f.arm == "wedged" || f.arm == "silent") {
+				(f.arm == "slowfill" || f.arm == "wedged" || f.arm == "silent" || f.arm == "retracted") {
 				// The STALL ARMS (cl-025): a worker that is not yet DISPATCHABLE and says
 				// so on the report cadence, from its own goroutine, exactly as the real
 				// worker's reporter thread does.
@@ -405,10 +412,15 @@ func (f *fakeControl) Control(stream pb.WorkerControl_ControlServer) error {
 				accepted.RecordOwnerEpoch, accepted.ControlStreamGeneration, accepted.WorkerBootId = e, g, b
 			})
 			send(&pb.WorkerFrame{Msg: &pb.WorkerFrame_AttemptAccepted{AttemptAccepted: accepted}})
+			if f.arm == "activewedged" && !reporting {
+				reporting = true
+				go f.activeWedgeReports(stream.Context(), send, env, offer, currentRevision,
+					currentPlacement, currentSetDigest, currentPlanIDs)
+			}
 			if f.arm == "badterminal" {
 				f.badOutcomes(outcome, offer)
 			}
-			if f.arm == "slowfill" {
+			if f.arm == "slowfill" || f.arm == "retracted" {
 				// The fill completed and the attempt was dispatched: settle it, which is
 				// what "observed completing warm-up and serving" means for this arm.
 				t, _ := outcomeFor(offer.RequestId, offer.AttemptOrdinal, offer.InvocationSpecDigest,
@@ -531,6 +543,19 @@ func (f *fakeControl) stallReports(ctx context.Context, send func(*pb.WorkerFram
 					"prepare:unet is WEDGED by silence (no clock involved)"))
 			}
 			report(activity)
+		case "retracted":
+			activity := []*pb.ActivityEvent{event(1, "boot", "prepare started")}
+			if n >= 3 {
+				activity = append(activity,
+					event(2, "liveness", "prepare:unet is WEDGED by silence (no clock involved)"),
+					event(3, "liveness", "prepare:unet resumed (position advanced): the earlier WEDGED verdict is retracted"))
+			}
+			if n >= 20 {
+				ready(revision, placementID, setDigest, planIDs)
+				f.say("retracted WEDGED verdict stayed healthy through %d reports", n)
+				return
+			}
+			report(activity)
 		case "silent":
 			if n > 2 {
 				f.say("going SILENT: the stream stays open and nothing more is reported")
@@ -538,6 +563,48 @@ func (f *fakeControl) stallReports(ctx context.Context, send func(*pb.WorkerFram
 			}
 			report([]*pb.ActivityEvent{event(1, "boot", "prepare started")})
 		}
+		select {
+		case <-ctx.Done():
+			return
+		case <-tick.C:
+		}
+	}
+}
+
+// activeWedgeReports proves the no-progress ground applies when no second request is
+// queued. The attempt is already accepted and held; the worker stays alive, keeps
+// reporting the exact dispatchable placement, and declares only that attempt WEDGED.
+func (f *fakeControl) activeWedgeReports(ctx context.Context, send func(*pb.WorkerFrame),
+	env func(func(uint64, uint64, string)), offer *pb.AttemptOffer, revision uint64,
+	placementID string, setDigest []byte, planIDs []string,
+) {
+	report := func() {
+		r := &pb.ObservedWorkerState{
+			AcceptedDesiredStateRevision: revision, ConvergedRevision: revision,
+			AcceptedPlacementSetDigest: setDigest, WorkerPhase: pb.WorkerPhase_WORKER_PHASE_ONLINE,
+			AppliedWireMinor: pb.WireMinor, AdmissionState: pb.AdmissionState_ADMISSION_STATE_OPEN,
+			AdmissionGeneration: 1, AvailableAttemptSlots: 1,
+			Activity: []*pb.ActivityEvent{{Seq: 1, Kind: "boot", Step: "attempt started"},
+				{Seq: 2, Kind: "liveness", Step: "attempt:" + offer.RequestId + " is WEDGED by silence (no clock involved)"}},
+			HeldAttempts: []*pb.HeldAttempt{{RequestId: offer.RequestId,
+				AttemptOrdinal: offer.AttemptOrdinal, Kind: pb.AttemptKind_ATTEMPT_KIND_SERVING,
+				State:                pb.AttemptState_ATTEMPT_STATE_RUNNING,
+				InvocationSpecDigest: offer.InvocationSpecDigest, PlacementId: placementID,
+				ExecutorGeneration: 1}},
+			Placements: []*pb.PlacementStatus{{PlacementId: placementID,
+				Materialization: pb.MaterializationState_MATERIALIZATION_STATE_STAGED,
+				Serving:         pb.ServingState_SERVING_STATE_DISPATCHABLE, ExecutorGeneration: 1,
+				DispatchablePlanIds: planIDs, PlacementSpecDigest: setDigest}},
+		}
+		env(func(e, g uint64, b string) {
+			r.RecordOwnerEpoch, r.ControlStreamGeneration, r.WorkerBootId = e, g, b
+		})
+		send(&pb.WorkerFrame{Msg: &pb.WorkerFrame_ObservedState{ObservedState: r}})
+	}
+	tick := time.NewTicker(2 * time.Second)
+	defer tick.Stop()
+	for {
+		report()
 		select {
 		case <-ctx.Done():
 			return

@@ -309,8 +309,10 @@ outputs, media and cancellation remain the existing request authority; the workf
 projects those rows and copies none of their lifecycle state.
 
 There is no workflow SSE route, list route, retry verb, cursor, resume verb, endpoint callback,
-YAML parser or timeline object. Re-submitting the same idempotency key is recovery, status is a
-polling read, and cancellation persists before it touches the active ordinary child.
+YAML parser or timeline object. Re-submitting the same idempotency key is recovery. `workflow
+follow` samples the structured status document and has no elapsed-time verdict; worker liveness and
+measured no-progress facts remain the stall authority. Cancellation persists before it touches the
+active ordinary child.
 
 `POST /v1/local/workflows` carries `{plan, assets?, targets?}`. `assets` contains staged
 digest/length/type resolutions and therefore requires the OS-protected CLI credential; no path is
@@ -318,6 +320,10 @@ accepted. `targets` maps a one-based step to an attached rental id. Targets and 
 are resolution only and do not enter workflow/child execution meaning. The frozen workflow status
 set is `running | canceling | succeeded | failed | canceled`; ordinary child rows are projected as
 `queued | in_progress | completed | failed | canceled` plus workflow-only `pending | prepared`.
+Structured status also projects the existing materialized-submission digest, child key, exact
+resolved output bindings, materialized asset identities, rental id, and media refs. `workflow
+download` writes those documents, each child lifecycle/event/triage receipt, Tensorhub's exact
+control snapshot, and digest-verified media into one fresh local directory.
 
 ### The video composer is a LOCAL authoring boundary (cl-024)
 

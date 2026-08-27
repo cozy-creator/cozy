@@ -69,8 +69,8 @@ func main() {
 	args := os.Args[1:]
 	if len(args) == 0 {
 		fmt.Fprintln(os.Stderr, "usage: cozy-live "+
-			"<canonical|attempt|recovered|arms|stall|tlspin|api|apiarms|apicrash|verbs|journey|rent|planids|"+
-		"descriptor|pipeline|m4arms|dropack|jobarms|jobs|jobcrash|workflows|workflowcrash|fixtures|fakeworker> [--flag value]")
+			"<canonical|attempt|recovered|arms|stall|stallactive|tlspin|api|apiarms|apicrash|verbs|journey|rent|planids|"+
+			"descriptor|pipeline|m4arms|dropack|jobarms|jobs|jobcrash|workflows|workflowcrash|fixtures|fakeworker> [--flag value]")
 		os.Exit(2)
 	}
 	section := args[0]
@@ -135,6 +135,8 @@ func main() {
 		sectionWorkflowCrash()
 	case "stall":
 		sectionStall()
+	case "stallactive":
+		sectionStallActive()
 	case "tlspin":
 		sectionTLSPin()
 	default:
