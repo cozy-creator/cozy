@@ -202,6 +202,9 @@ type uploadOutcome struct {
 	report    hub.VerifyReport
 	moved     int64
 	multipart bool
+	verified  bool
+	source    string
+	primary   bool
 	err       *exit.Error
 }
 
@@ -218,17 +221,22 @@ func (p *Publish) upload(ctx context.Context, missing []hub.Missing, res *Result
 	jobs := make(chan int)
 	outcomes := make(chan uploadOutcome, parallelism)
 	var workers sync.WaitGroup
+	var cancelOnce sync.Once
 	for range parallelism {
 		workers.Add(1)
 		go func() {
 			defer workers.Done()
 			for index := range jobs {
 				outcome := p.uploadOne(ctx, res.PublishID, index, missing[index])
-				outcomes <- outcome
 				if outcome.err != nil {
-					cancel()
+					cancelOnce.Do(func() {
+						outcome.primary = true
+						cancel()
+					})
+					outcomes <- outcome
 					return
 				}
+				outcomes <- outcome
 			}
 		}()
 	}
@@ -252,16 +260,25 @@ func (p *Publish) upload(ctx context.Context, missing []hub.Missing, res *Result
 		copy := outcome
 		ordered[outcome.index] = &copy
 	}
+	var primary *exit.Error
+	for _, outcome := range ordered {
+		if outcome == nil {
+			continue
+		}
+		if outcome.primary {
+			primary = outcome.err
+		}
+	}
+	if primary != nil {
+		return primary
+	}
 	for index, outcome := range ordered {
 		if outcome == nil {
 			return exit.Internalf("upload stopped before object %d/%d produced a verdict", index, len(missing))
 		}
-		if outcome.err != nil {
-			return outcome.err
-		}
 	}
 
-	reports := make([]hub.VerifyReport, 0, len(missing))
+	sources := map[string]bool{}
 	for _, outcome := range ordered {
 		res.Grants++
 		res.Uploaded++
@@ -272,35 +289,22 @@ func (p *Publish) upload(ctx context.Context, missing []hub.Missing, res *Result
 		if outcome.report.Conflict {
 			res.Conflicts++
 		}
-		reports = append(reports, outcome.report)
-	}
-	ms["grant_upload"] = since(started)
-	p.say("granted and uploaded %d objects one at a time (%d ranged), %s moved "+
-		"(%d already resident at the key)", res.Uploaded, res.Multipart, size(res.Moved), res.Conflicts)
-
-	// The hub streams every object BACK and hashes it itself. Nothing this client
-	// observed is evidence, which is why the report above carries no checksum.
-	t0 := time.Now()
-	verdicts, e := p.Hub.VerifyObjects(ctx, p.Ref, res.PublishID, reports, p.Reason)
-	if e != nil {
-		return e
-	}
-	ms["verify"] = since(t0)
-	sources := map[string]bool{}
-	for _, v := range verdicts {
-		if v.State == "verified" {
+		if outcome.verified {
 			res.Verified++
 		}
-		if v.ChecksumSource != "" {
-			sources[v.ChecksumSource] = true
+		if outcome.source != "" {
+			sources[outcome.source] = true
 		}
 	}
-	for s := range sources {
-		res.Sources = append(res.Sources, s)
+	for source := range sources {
+		res.Sources = append(res.Sources, source)
 	}
 	sortStrings(res.Sources)
-	p.say("the hub re-hashed %d/%d objects for itself (%s)",
-		res.Verified, len(verdicts), strings.Join(res.Sources, ", "))
+	ms["grant_upload_verify"] = since(started)
+	p.say("granted and uploaded %d objects one at a time (%d ranged), %s moved "+
+		"(%d already resident at the key)", res.Uploaded, res.Multipart, size(res.Moved), res.Conflicts)
+	p.say("the hub re-hashed %d/%d objects as each upload completed (%s)",
+		res.Verified, len(missing), strings.Join(res.Sources, ", "))
 	return nil
 }
 
@@ -343,6 +347,31 @@ func (p *Publish) uploadOne(ctx context.Context, publishID string, index int, ob
 	}
 	outcome.moved = local.Moved
 	outcome.report = hub.VerifyReport{ObjectID: grant.ObjectID, Conflict: conflict}
+	verdicts, verifyErr := p.Hub.VerifyObjects(
+		ctx, p.Ref, publishID, []hub.VerifyReport{outcome.report}, p.Reason,
+	)
+	if verifyErr != nil {
+		outcome.err = verifyErr
+		return outcome
+	}
+	if len(verdicts) != 1 || verdicts[0].ObjectID != grant.ObjectID {
+		outcome.err = exit.Internalf(
+			"verification for %s answered %d rows or another object",
+			grant.ObjectID,
+			len(verdicts),
+		)
+		return outcome
+	}
+	outcome.verified = verdicts[0].State == "verified"
+	outcome.source = verdicts[0].ChecksumSource
+	if !outcome.verified {
+		outcome.err = exit.Internalf(
+			"verification for %s returned state %q: %s",
+			grant.ObjectID,
+			verdicts[0].State,
+			verdicts[0].Detail,
+		)
+	}
 	return outcome
 }
 
