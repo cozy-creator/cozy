@@ -9,6 +9,18 @@
 // It is also the child-environment allowlist. cozy-creator starts endpoint processes; a
 // child inherits exactly what Child() names and nothing else (cozy-creator.md: "child env
 // allowlisted before the runtime starts"), which is why os.Environ() has no second caller.
+//
+// LAYERED SOURCES (cl-029). A local product's configuration lives in a FILE, not a shell
+// profile. Load composes, in precedence order (later wins):
+//
+//	defaults -> $COZY_HOME/config.yaml -> .env (cwd) -> process env -> CLI flags
+//
+// The file admits a CLOSED key set of flat `key: value` scalars — an unknown key refuses
+// naming the known set, exactly as an unknown document field does. The .env and process
+// layers admit only the same env names this reader has always had; the CLI layer is the
+// manifest's own flags, applied by their verbs after Load. Every value keeps its source
+// (`default | file | dotenv | env`) so an operator debugging a 401 knows which layer
+// spoke last.
 package config
 
 import (
@@ -83,8 +95,44 @@ type Config struct {
 
 var frozen Config
 
-// Load reads the environment ONCE and freezes it. Calling it twice returns the same
-// value: a second read cannot see a different world than the first.
+// FileName is the local product's configuration file, under $COZY_HOME.
+const FileName = "config.yaml"
+
+// fileKeys is the CLOSED key set config.yaml admits, each with the shape a refusal
+// renders. `local_rate_micro_usd_per_hour` lives here FIRST-CLASS (cl-029): it is a user
+// VALUE, not a credential, and a file is its primary home. The env spelling stays
+// admitted above it — an implementer's recorded call, because the harness and existing
+// dev roots already speak it — and `cozy job status` renders whichever source won.
+var fileKeys = map[string]string{
+	"tensorhub_url":                 "the catalog host the hub verbs talk to",
+	"tensorhub_token":               "the Launch-1 static admin token (writes only)",
+	"tfs":                           "the tensorfs CLI this binary delegates the byte plane to",
+	"local_rate_micro_usd_per_hour": "your machine's own rate, integer micro-USD (250000 = $0.25/hour)",
+	"port":                          "the loopback client API port",
+	"yield":                         "the GPU yield policy: smart | always | never",
+}
+
+func knownFileKeys() string {
+	keys := make([]string, 0, len(fileKeys))
+	for k := range fileKeys {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	return strings.Join(keys, ", ")
+}
+
+// dotenvNames is what the `.env` layer admits: exactly the env names this reader speaks,
+// minus the per-spawn bootstrap credential — that one is IMPOSED by a launcher on the
+// child it just created and has no business in a file another process could share.
+// Unknown keys in .env are IGNORED, not refused: the file is a directory-level
+// convention other tools share, and this reader takes only its own names from it.
+var dotenvNames = []string{
+	"COZY_HOME", "COZY_TFS", "COZY_LOCAL_RATE_MICRO_USD_PER_HOUR",
+	"TENSORHUB_URL", "TENSORHUB_TOKEN",
+}
+
+// Load composes the layered sources ONCE and freezes them. Calling it twice returns the
+// same value: a second read cannot see a different world than the first.
 func Load() (Config, *exit.Error) {
 	if frozen.Home != "" {
 		return frozen, nil
@@ -92,37 +140,26 @@ func Load() (Config, *exit.Error) {
 	c := Config{Port: DefaultPort, Yield: "smart",
 		HubURL: DefaultHubURL, HubURLSource: "default", HubTokenSource: "unset",
 		Tfs: "tfs", TfsSource: "default"}
-
-	if v := strings.TrimSpace(os.Getenv("COZY_TFS")); v != "" {
-		c.Tfs, c.TfsSource = v, "env"
-	}
-
 	c.LocalRateSource = "unset"
-	if v := strings.TrimSpace(os.Getenv("COZY_LOCAL_RATE_MICRO_USD_PER_HOUR")); v != "" {
-		n, err := strconv.ParseInt(v, 10, 64)
-		if err != nil || n < 0 {
-			return Config{}, exit.Usagef(
-				"COZY_LOCAL_RATE_MICRO_USD_PER_HOUR=%q is not a non-negative integer of micro-USD", v).
-				WithRemedy("these documents are integer-only; 250000 is $0.25/hour")
+
+	dotenv, e := readDotEnv(".env")
+	if e != nil {
+		return Config{}, e
+	}
+	// layered answers one name: process env beats .env; "" means neither layer spoke.
+	layered := func(name string) (string, string) {
+		if v := strings.TrimSpace(os.Getenv(name)); v != "" {
+			return v, "env"
 		}
-		c.LocalRateMicroUSDPerHour, c.LocalRateSource = n, "env"
+		if v := strings.TrimSpace(dotenv[name]); v != "" {
+			return v, "dotenv"
+		}
+		return "", ""
 	}
 
-	if v := strings.TrimSpace(os.Getenv("TENSORHUB_URL")); v != "" {
-		c.HubURL, c.HubURLSource = strings.TrimRight(v, "/"), "env"
-	}
-	if v := os.Getenv("TENSORHUB_TOKEN"); strings.TrimSpace(v) != "" {
-		c.HubToken, c.HubTokenSource = secret.New(v), "env"
-	}
-	// The PER-SPAWN worker bootstrap credential (#449): imposed by the launcher on the
-	// child it just created, read here because this file is the one env reader, consumed
-	// by the worker side of the protocol. Deliberately NOT in the inherited allowlist —
-	// it exists for exactly one process.
-	if v := os.Getenv("COZY_BOOTSTRAP_CREDENTIAL"); strings.TrimSpace(v) != "" {
-		c.Bootstrap = secret.New(v)
-	}
-
-	if v := strings.TrimSpace(os.Getenv("COZY_HOME")); v != "" {
+	// HOME FIRST, because the file layer lives under it. It has no config.yaml spelling
+	// for the same reason.
+	if v, _ := layered("COZY_HOME"); v != "" {
 		abs, err := filepath.Abs(v)
 		if err != nil {
 			return Config{}, exit.Internalf("COZY_HOME %q is not resolvable: %s", v, err)
@@ -136,6 +173,68 @@ func Load() (Config, *exit.Error) {
 		c.Home = filepath.Join(h, ".cozy")
 	}
 
+	// THE FILE LAYER: above defaults, below everything that can vary per invocation.
+	file, e := readConfigFile(filepath.Join(c.Home, FileName))
+	if e != nil {
+		return Config{}, e
+	}
+	if v := file["tensorhub_url"]; v != "" {
+		c.HubURL, c.HubURLSource = strings.TrimRight(v, "/"), "file"
+	}
+	if v := file["tensorhub_token"]; v != "" {
+		c.HubToken, c.HubTokenSource = secret.New(v), "file"
+	}
+	if v := file["tfs"]; v != "" {
+		c.Tfs, c.TfsSource = v, "file"
+	}
+	if v := file["local_rate_micro_usd_per_hour"]; v != "" {
+		n, e := parseRate(v, FileName+" local_rate_micro_usd_per_hour")
+		if e != nil {
+			return Config{}, e
+		}
+		c.LocalRateMicroUSDPerHour, c.LocalRateSource = n, "file"
+	}
+	if v := file["port"]; v != "" {
+		n, err := strconv.Atoi(v)
+		if err != nil || n <= 0 || n > 65535 {
+			return Config{}, exit.Usagef("%s port %q is not a TCP port", FileName, v)
+		}
+		c.Port = n
+	}
+	if v := file["yield"]; v != "" {
+		switch v {
+		case "smart", "always", "never":
+			c.Yield = v
+		default:
+			return Config{}, exit.Usagef("%s yield %q is not smart|always|never", FileName, v)
+		}
+	}
+
+	// THE ENV LAYERS, over the file: .env in this directory, then the process env.
+	if v, src := layered("COZY_TFS"); v != "" {
+		c.Tfs, c.TfsSource = v, src
+	}
+	if v, src := layered("COZY_LOCAL_RATE_MICRO_USD_PER_HOUR"); v != "" {
+		n, e := parseRate(v, "COZY_LOCAL_RATE_MICRO_USD_PER_HOUR="+v)
+		if e != nil {
+			return Config{}, e
+		}
+		c.LocalRateMicroUSDPerHour, c.LocalRateSource = n, src
+	}
+	if v, src := layered("TENSORHUB_URL"); v != "" {
+		c.HubURL, c.HubURLSource = strings.TrimRight(v, "/"), src
+	}
+	if v, src := layered("TENSORHUB_TOKEN"); v != "" {
+		c.HubToken, c.HubTokenSource = secret.New(v), src
+	}
+	// The PER-SPAWN worker bootstrap credential (#449): imposed by the launcher on the
+	// child it just created, read here because this file is the one env reader, consumed
+	// by the worker side of the protocol. Deliberately NOT in the inherited allowlist and
+	// NOT a file or .env key — it exists for exactly one process.
+	if v := os.Getenv("COZY_BOOTSTRAP_CREDENTIAL"); strings.TrimSpace(v) != "" {
+		c.Bootstrap = secret.New(v)
+	}
+
 	for _, name := range Inherited {
 		if v, ok := os.LookupEnv(name); ok {
 			c.inherited = append(c.inherited, name+"="+v)
@@ -144,6 +243,93 @@ func Load() (Config, *exit.Error) {
 	sort.Strings(c.inherited)
 	frozen = c
 	return c, nil
+}
+
+func parseRate(v, spelled string) (int64, *exit.Error) {
+	n, err := strconv.ParseInt(v, 10, 64)
+	if err != nil || n < 0 {
+		return 0, exit.Usagef("%s is not a non-negative integer of micro-USD", spelled).
+			WithRemedy("these documents are integer-only; 250000 is $0.25/hour")
+	}
+	return n, nil
+}
+
+// readConfigFile reads $COZY_HOME/config.yaml: flat `key: value` scalars, `#` comments,
+// blank lines, and NOTHING else. The key set is CLOSED — an unknown key refuses naming
+// the known set — and the parser is deliberately this product's own: a general YAML
+// loader would admit structure this vocabulary has no meaning for, and YAML parsing
+// belongs to internal/video (the fence says so).
+func readConfigFile(path string) (map[string]string, *exit.Error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil, nil
+		}
+		return nil, exit.Internalf("cannot read %s: %s", path, err)
+	}
+	out := map[string]string{}
+	for i, line := range strings.Split(string(data), "\n") {
+		s := strings.TrimSpace(line)
+		if s == "" || strings.HasPrefix(s, "#") {
+			continue
+		}
+		key, value, ok := strings.Cut(s, ":")
+		key = strings.TrimSpace(key)
+		if !ok || key == "" || strings.ContainsAny(key, " \t") {
+			return nil, exit.Usagef("%s line %d is not a flat `key: value` scalar: %q",
+				path, i+1, s).
+				WithRemedy("this file admits: %s", knownFileKeys())
+		}
+		if _, known := fileKeys[key]; !known {
+			return nil, exit.Usagef("%s names %q, which this product does not read", path, key).
+				WithRemedy("it reads: %s", knownFileKeys())
+		}
+		if _, dup := out[key]; dup {
+			return nil, exit.Usagef("%s names %q twice; a value has one spelling", path, key)
+		}
+		out[key] = trimQuotes(strings.TrimSpace(value))
+	}
+	return out, nil
+}
+
+// readDotEnv reads `.env` in the working directory: `KEY=VALUE` lines (an optional
+// `export ` survives), `#` comments and blank lines. Only this reader's own names are
+// taken; everything else in the file belongs to other tools and is ignored.
+func readDotEnv(path string) (map[string]string, *exit.Error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil, nil
+		}
+		// Unreadable is not absent: a .env that exists and cannot be read would make
+		// this layer silently vanish, which is a debugging session nobody wants.
+		return nil, exit.Internalf("cannot read %s: %s", path, err)
+	}
+	admitted := map[string]bool{}
+	for _, name := range dotenvNames {
+		admitted[name] = true
+	}
+	out := map[string]string{}
+	for _, line := range strings.Split(string(data), "\n") {
+		s := strings.TrimSpace(strings.TrimPrefix(strings.TrimSpace(line), "export "))
+		if s == "" || strings.HasPrefix(s, "#") {
+			continue
+		}
+		key, value, ok := strings.Cut(s, "=")
+		key = strings.TrimSpace(key)
+		if !ok || !admitted[key] {
+			continue
+		}
+		out[key] = trimQuotes(strings.TrimSpace(value))
+	}
+	return out, nil
+}
+
+func trimQuotes(v string) string {
+	if len(v) >= 2 && (v[0] == '"' && v[len(v)-1] == '"' || v[0] == '\'' && v[len(v)-1] == '\'') {
+		return v[1 : len(v)-1]
+	}
+	return v
 }
 
 // Child builds a child process's whole environment: the allowlisted snapshot plus the

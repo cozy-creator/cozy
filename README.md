@@ -337,8 +337,17 @@ no orgs, so the surface splits exactly two ways.
   say so, and there is nothing for a PKCE flow to authenticate against. The env carries
   a value, never a login act.
 
-Configuration is the frozen `internal/config` value: `TENSORHUB_URL` (default
-`http://127.0.0.1:8080`) and `TENSORHUB_TOKEN`. The token is a `secret.Value` — it
+Configuration is the frozen `internal/config` value, composed from LAYERED SOURCES
+(cl-029), later layers winning: defaults → `$COZY_HOME/config.yaml` → `.env` in the
+working directory → the process environment → the manifest's own CLI flags. The FILE is
+the primary home for a local product's values — `tensorhub_url`, `tensorhub_token`,
+`tfs`, `local_rate_micro_usd_per_hour`, `port`, `yield`, flat `key: value` scalars with
+a CLOSED key set (an unknown key refuses naming the known six). The env spellings stay
+admitted above it (`TENSORHUB_URL`, `TENSORHUB_TOKEN`, `COZY_TFS`,
+`COZY_LOCAL_RATE_MICRO_USD_PER_HOUR`, `COZY_HOME` — the recorded implementer's call for
+the rate: the file is its primary home and the env name survives, because dev roots
+already speak it), and every value keeps its source (`default|file|dotenv|env`) so
+`cozy hub status` says which layer spoke last. The token is a `secret.Value` — it
 renders as `sha256:<12 hex>`, the same spelling the hub uses for its own redacted keys,
 so `cozy hub status` and `cozy hub config` can be compared without either end printing
 it. `Reveal()` has exactly one caller: the line that builds the Authorization header.
