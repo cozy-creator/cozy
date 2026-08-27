@@ -7,6 +7,7 @@ import (
 	"encoding/hex"
 	"fmt"
 	"net"
+	"net/http"
 	"os"
 	"path/filepath"
 	"strings"
@@ -363,6 +364,17 @@ func (f *fakeControl) Control(stream pb.WorkerControl_ControlServer) error {
 				outcome(t)
 				continue
 			}
+			if f.arm == "remote" || f.arm == "remotelie" {
+				if why := f.validateRemoteOffer(offer); why != nil {
+					f.say("ARM: the remote offer is not an exact invocation/grant pair: %v", why)
+					t, _ := outcomeFor(offer.RequestId, offer.AttemptOrdinal, offer.InvocationSpecDigest,
+						pb.OutcomeStatus_OUTCOME_STATUS_REFUSED, why.Error(),
+						pb.CauseCode_CAUSE_CODE_PROTOCOL, pb.CauseOrigin_CAUSE_ORIGIN_SUPERVISOR, false)
+					t.PlacementId = offer.PlacementId
+					outcome(t)
+					continue
+				}
+			}
 			accepted := &pb.AttemptAccepted{
 				RequestId: offer.RequestId, AttemptOrdinal: offer.AttemptOrdinal,
 				InvocationSpecDigest:    offer.InvocationSpecDigest,
@@ -524,35 +536,17 @@ func (f *fakeControl) badOutcomes(emit func(*pb.AttemptOutcome), offer *pb.Attem
 //	           them anyway: the manifest is true about what exists on the pod and false
 //	           about what the owner can fetch, which is exactly what an UNMIRRORED output is
 func (f *fakeControl) remoteOutcome(emit func(*pb.AttemptOutcome), offer *pb.AttemptOffer) {
-	// THE INPUT CROSSED, or it did not. A pod reads its payload from the granted address;
-	// this reads it and SAYS what it found, so an arm can see the client's bytes on the
-	// pod rather than inferring it from a green terminal.
-	for _, in := range offer.Grant.GetInputs() {
-		if in.InputId != "payload" {
-			continue
-		}
-		path := strings.TrimPrefix(in.Url, "file://")
-		data, err := os.ReadFile(path)
-		if err != nil {
-			f.say("ARM: the granted input %s cannot be read here: %v", path, err)
-			t, _ := authorFailure(offer.RequestId, offer.AttemptOrdinal, offer.InvocationSpecDigest,
-				pb.OutcomeStatus_OUTCOME_STATUS_FAILED,
-				"the granted input is not on this worker's filesystem")
-			emit(t)
-			return
-		}
-		sum := sha256.Sum256(data)
-		f.say("granted input read from the pod's own disk: %s is %d B hashing to sha256:%s",
-			path, len(data), hex.EncodeToString(sum[:])[:16])
-	}
-	granted := ""
+	// validateRemoteOffer already consumed every input and compared the bytes with the
+	// InvocationSpec before this attempt was accepted. Execution chooses only among output
+	// ids that same validation proved are an exact grant/spec set.
+	granted, outputID := "", ""
 	for _, o := range offer.Grant.GetOutputs() {
-		if o.OutputId == "image" {
-			granted = strings.TrimPrefix(o.Url, "file://")
-		}
+		outputID = o.OutputId
+		granted = strings.TrimPrefix(o.Url, "file://")
+		break
 	}
 	if granted == "" {
-		f.say("the grant names no `image` destination; nothing to write")
+		f.say("the grant names no output destination; nothing to write")
 		return
 	}
 	if !underRoot(granted, f.root) {
@@ -569,7 +563,112 @@ func (f *fakeControl) remoteOutcome(emit func(*pb.AttemptOutcome), offer *pb.Att
 		// real disk. What is false is only that the owner can fetch them.
 		granted = filepath.Join(f.root, "elsewhere", filepath.Base(granted))
 	}
-	f.writeGrantedOutput(emit, offer, granted)
+	f.writeGrantedOutput(emit, offer, outputID, granted)
+}
+
+// validateRemoteOffer is the fake pod's independent grant reader. It recomputes the
+// InvocationSpec identity, proves the grant names exactly its input/output sets, consumes
+// every granted input from THIS filesystem, and compares byte length, digest, and asset
+// media type before AttemptAccepted can be sent. A URL alone is never an input identity.
+func (f *fakeControl) validateRemoteOffer(offer *pb.AttemptOffer) error {
+	if offer.Grant == nil {
+		return fmt.Errorf("the offer carries no DeliveryGrant")
+	}
+	computed := canonical.Digest(offer.InvocationSpecCanonicalBytes)
+	if !bytes.Equal(computed, offer.InvocationSpecDigest) {
+		return fmt.Errorf("the invocation digest does not hash its canonical bytes")
+	}
+	if !bytes.Equal(offer.Grant.InvocationSpecDigest, offer.InvocationSpecDigest) {
+		return fmt.Errorf("the grant names a different invocation digest")
+	}
+	doc, err := canonical.Read(offer.InvocationSpecCanonicalBytes, &pb.InvocationSpec{})
+	if err != nil {
+		return fmt.Errorf("the invocation document is inadmissible: %w", err)
+	}
+
+	access := make(map[string]*pb.InputAccess, len(offer.Grant.Inputs))
+	for _, in := range offer.Grant.Inputs {
+		if in == nil || in.InputId == "" {
+			return fmt.Errorf("the grant contains an unnamed input")
+		}
+		if access[in.InputId] != nil {
+			return fmt.Errorf("the grant names input %s twice", in.InputId)
+		}
+		access[in.InputId] = in
+	}
+	bindings := doc.List("inputs")
+	if len(access) != len(bindings) {
+		return fmt.Errorf("the grant has %d inputs for the spec's %d", len(access), len(bindings))
+	}
+	for _, binding := range bindings {
+		id := binding.Str("input_id")
+		in := access[id]
+		if in == nil {
+			return fmt.Errorf("the grant has no access for input %s", id)
+		}
+		if !strings.HasPrefix(in.Url, "file://") {
+			return fmt.Errorf("input %s is not a file grant", id)
+		}
+		path := strings.TrimPrefix(in.Url, "file://")
+		if !underRoot(path, f.root) {
+			return fmt.Errorf("input %s is outside this worker's filesystem", id)
+		}
+		data, err := os.ReadFile(path)
+		if err != nil {
+			return fmt.Errorf("input %s cannot be read here: %w", id, err)
+		}
+		if int64(len(data)) != binding.Int("length") {
+			return fmt.Errorf("input %s is %d B and its binding declares %d B",
+				id, len(data), binding.Int("length"))
+		}
+		sum := sha256.Sum256(data)
+		actual := "sha256:" + hex.EncodeToString(sum[:])
+		if actual != binding.Str("digest") {
+			return fmt.Errorf("input %s hashes to %s and its binding declares %s",
+				id, actual, binding.Str("digest"))
+		}
+		kind := binding.Str("kind_mime")
+		if id != "payload" && kind != "" && http.DetectContentType(data) != kind {
+			return fmt.Errorf("input %s sniffs as %s and its binding declares %s",
+				id, http.DetectContentType(data), kind)
+		}
+		if id == "payload" {
+			f.say("granted input read from the pod's own disk: %s is %d B hashing to %s",
+				path, len(data), shortSHA(actual))
+		} else {
+			f.say("validated granted input %s against its invocation binding: %d B, %s, %s",
+				id, len(data), kind, actual)
+		}
+	}
+
+	outputs := make(map[string]bool, len(offer.Grant.Outputs))
+	for _, out := range offer.Grant.Outputs {
+		if out == nil || out.OutputId == "" || outputs[out.OutputId] {
+			return fmt.Errorf("the grant contains an unnamed or duplicate output")
+		}
+		if !strings.HasPrefix(out.Url, "file://") ||
+			!underRoot(strings.TrimPrefix(out.Url, "file://"), f.root) {
+			return fmt.Errorf("output %s is not a file grant on this worker", out.OutputId)
+		}
+		outputs[out.OutputId] = true
+	}
+	outputBindings := doc.List("outputs")
+	if len(outputs) != len(outputBindings) {
+		return fmt.Errorf("the grant has %d outputs for the spec's %d", len(outputs), len(outputBindings))
+	}
+	for _, binding := range outputBindings {
+		if !outputs[binding.Str("output_id")] {
+			return fmt.Errorf("the grant has no destination for output %s", binding.Str("output_id"))
+		}
+	}
+	return nil
+}
+
+func shortSHA(digest string) string {
+	if len(digest) > len("sha256:")+16 {
+		return digest[:len("sha256:")+16]
+	}
+	return digest
 }
 
 // underRoot answers whether a granted path is on this worker's own filesystem root. It
@@ -595,20 +694,23 @@ func (f *fakeControl) outcomeWithOutput(emit func(*pb.AttemptOutcome),
 		return nil
 	}
 	return f.writeGrantedOutput(emit, offer,
-		filepath.Join(layout.AttemptDir(offer.RequestId, offer.AttemptOrdinal), "image"))
+		"image", filepath.Join(layout.AttemptDir(offer.RequestId, offer.AttemptOrdinal), "image"))
 }
 
-// writeGrantedOutput puts one real PNG at `dest` and declares exactly those bytes. It is
-// the one place this worker writes an output, so every arm above differs in WHERE it was
-// told to write and in nothing else.
+// writeGrantedOutput puts one transport fixture at `dest` and declares exactly those
+// bytes. Images remain real PNGs. The video fixture is intentionally only MP4-shaped: this
+// driver proves byte transport and never pretends that its adversarial worker ran H3.
 func (f *fakeControl) writeGrantedOutput(emit func(*pb.AttemptOutcome),
-	offer *pb.AttemptOffer, dest string) *pb.AttemptOutcome {
+	offer *pb.AttemptOffer, outputID, dest string) *pb.AttemptOutcome {
 	if err := os.MkdirAll(filepath.Dir(dest), 0o755); err != nil {
 		f.say("cannot write under the grant: %v", err)
 		return nil
 	}
-	// A minimal, real PNG: an output is bytes on disk, not a claim in a document.
-	body, err := hex.DecodeString(onePixelPNG)
+	bodyHex, mimeType := onePixelPNG, "image/png"
+	if outputID == "video" {
+		bodyHex, mimeType = transportMP4, "video/mp4"
+	}
+	body, err := hex.DecodeString(bodyHex)
 	if err != nil {
 		f.say("bad fixture: %v", err)
 		return nil
@@ -619,7 +721,7 @@ func (f *fakeControl) writeGrantedOutput(emit func(*pb.AttemptOutcome),
 	}
 	sum := sha256.Sum256(body)
 	t, _ := authorFailure(offer.RequestId, offer.AttemptOrdinal, offer.InvocationSpecDigest,
-		pb.OutcomeStatus_OUTCOME_STATUS_SUCCEEDED, "one output, written where the grant said")
+		pb.OutcomeStatus_OUTCOME_STATUS_SUCCEEDED, "one transport output, written where the grant said")
 	doc, err := canonical.Read(t.OutcomeCanonicalBytes, &pb.AttemptOutcomeBody{})
 	if err != nil {
 		f.say("cannot read back the outcome: %v", err)
@@ -632,8 +734,8 @@ func (f *fakeControl) writeGrantedOutput(emit func(*pb.AttemptOutcome),
 	raw["output_manifest"] = map[string]canonical.Value{
 		"publication_receipt_digest": "sha256:" + hex.EncodeToString(sum[:]),
 		"outputs": []canonical.Value{map[string]canonical.Value{
-			"output_id": "image", "digest": "sha256:" + hex.EncodeToString(sum[:]),
-			"length": int64(len(body)), "mime_type": "image/png",
+			"output_id": outputID, "digest": "sha256:" + hex.EncodeToString(sum[:]),
+			"length": int64(len(body)), "mime_type": mimeType,
 		}},
 	}
 	written, err := canonical.Write(raw)
@@ -650,6 +752,12 @@ func (f *fakeControl) writeGrantedOutput(emit func(*pb.AttemptOutcome),
 // onePixelPNG is a 1x1 PNG, hex-encoded: the smallest thing that is really an image.
 const onePixelPNG = "89504e470d0a1a0a0000000d4948445200000001000000010806000000" +
 	"1f15c4890000000d49444154789c6360000002000100ffff03000006000557bfabd40000000049454e44ae426082"
+
+// transportMP4 is an ISO-BMFF ftyp box followed by empty free and mdat boxes. It has the
+// shape and declared media type the last mile must preserve, but no encoded frame and no
+// inference claim.
+const transportMP4 = "000000186674797069736f6d0000020069736f6d69736f32" +
+	"0000000866726565000000086d646174"
 
 // stealOutcome is a worker trying to write an attempt row it was never assigned.
 func (f *fakeControl) stealOutcome(emit func(*pb.AttemptOutcome)) {

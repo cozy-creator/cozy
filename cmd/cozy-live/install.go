@@ -87,6 +87,24 @@ print("artifact row installed")
 	return "cozy/sdxl-unet"
 }
 
+// installTransportEndpoint installs the weightless descriptor used only by rent's remote
+// byte-plane proof. Its video_transport handler refuses if executed locally; the live arm
+// is explicitly a transport proof and never a stand-in for MiniMax H3 inference.
+func installTransportEndpoint(root string) string {
+	release := flag("transport-release", defaultTransportRelease())
+	if _, err := os.Stat(release); err != nil {
+		must("the transport fixture release", fmt.Errorf(
+			"%s: %w — build it with scripts/weightless-release.sh", release, err))
+	}
+	code, out := cozyRun(root, "install", transportEndpointRef, "--from", release,
+		"--digest", digestOf(release))
+	if code != 0 {
+		fmt.Println(out)
+		must("installing the transport fixture", fmt.Errorf("cozy install exited %d", code))
+	}
+	return transportEndpointRef
+}
+
 // childEnv is the PRODUCT's own allowlist, pointed at one service root. The driver has no
 // business inventing a second child-env mechanism, and the env fence says there is only
 // one reader of the environment in this repository.
@@ -102,6 +120,12 @@ func defaultRelease() string {
 	home, err := os.UserHomeDir()
 	must("the home directory", err)
 	return filepath.Join(home, ".cache", "cozy", "cl-010", "sdxl-unet-1.0.0.tar.gz")
+}
+
+func defaultTransportRelease() string {
+	home, err := os.UserHomeDir()
+	must("the home directory", err)
+	return filepath.Join(home, ".cache", "cozy", "cl-019-transport", "weightless-1.0.0.tar.gz")
 }
 
 func cozyBinary() string {
