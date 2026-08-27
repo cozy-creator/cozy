@@ -1,6 +1,7 @@
 // cozy-live is cl-001's live verification driver. It is NOT a test suite (tracker
 // README #160): every section starts the real system — this repository's real
-// LocalCoordinator, the REAL cozy-runtime supervisor and its disposable CUDA executor,
+// local orchestrator and record owner, the REAL cozy-runtime worker and its disposable
+// CUDA executor,
 // and cr-005's real SDXL CAS — and prints what it observed.
 //
 // The orchestrator it drives is the same `internal/orchestrator` package `cozy up` runs. What

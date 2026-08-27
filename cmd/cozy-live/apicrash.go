@@ -9,11 +9,11 @@ import (
 	"time"
 )
 
-// THE COORDINATOR-KILL CRASH ARM.
+// THE RECORD-OWNER-KILL CRASH ARM.
 //
 // cl-001 armed the worker half of its crash-convergence matrix at two lifecycle points
-// and named the COORDINATOR half as still owed, for one reason: the orchestrator ran
-// inside the verification driver, so killing it killed the observer. That reason is gone.
+// and historically named the other half "COORDINATOR", for one reason: the record owner
+// ran inside the verification driver, so killing it killed the observer. That reason is gone.
 // This section drives a SEPARATE `cozy up` process over real HTTP, `kill -9`s it
 // mid-attempt, and watches the whole recovery FROM THE API CONSUMER'S SEAT — which is
 // the only seat from which the claim "a crash never produces a false success" means
@@ -21,11 +21,11 @@ import (
 //
 // What must hold across the kill, and what this arm checks:
 //
-//  1. Nothing the dead orchestrator had not COMMITTED is visible afterwards.
+//  1. Nothing the dead record owner had not COMMITTED is visible afterwards.
 //  2. The request survives. Its id is still an id; its idempotency key still names it and
 //     starting a second execution under that key is impossible.
-//  3. The RECOVERED-ATTEMPTS LAW holds through a orchestrator restart, not only a worker
-//     one: the restarted supervisor reports its open attempt on Register, that attempt is
+//  3. The RECOVERED-ATTEMPTS LAW holds through a record-owner restart, not only a worker
+//     one: the restarted worker reports its held attempt in its snapshot, that attempt is
 //     an OPEN OBLIGATION, and no next ordinal is minted until its own journaled terminal
 //     arrives.
 //  4. The event stream RESUMES from the cursor the client held before the kill. A stream
@@ -53,7 +53,7 @@ func sectionAPICrash() {
 		check("the worker reported READY", false, "see the log above")
 		return
 	}
-	check("the REAL supervisor is READY", true, "instance "+instance)
+	check("the REAL worker is READY", true, "instance "+instance)
 
 	head("a long attempt, running, watched")
 	// The longest run `denoise`'s own schema admits — 64 steps at latent 96 — which is
@@ -80,7 +80,7 @@ func sectionAPICrash() {
 	check("no output is visible while it runs",
 		len(preLife.json()["outputs"].([]any)) == 0, preLife.json()["status"].(string))
 
-	head("kill -9 the COORDINATOR, mid-attempt")
+	head("kill -9 the RECORD OWNER, mid-attempt")
 	killAt := time.Now()
 	svc.kill9()
 	check("the service is gone", !svc.alive(), ms(time.Since(killAt)))
@@ -91,7 +91,7 @@ func sectionAPICrash() {
 
 	head("restart, and the law observed from the client's seat")
 	restartAt := time.Now()
-	// NOT fresh. The whole claim is that the authority and the supervisor's journal
+	// NOT fresh. The whole claim is that the record owner and the worker's journal
 	// survived; wiping the root would be arranging the answer.
 	svc = startService(root, port, false)
 	check("the SAME root comes back up", svc.alive(), ms(time.Since(restartAt)))
@@ -101,7 +101,7 @@ func sectionAPICrash() {
 	check("the request is still an id, with its endpoint and its attempt",
 		life.Status == http.StatusOK && life.json()["request_id"] == requestID,
 		fmt.Sprintf("status %v, attempt %v", life.json()["status"], life.json()["attempt"]))
-	check("and NOTHING is visible that the dead orchestrator had not committed",
+	check("and NOTHING is visible that the dead record owner had not committed",
 		len(life.json()["outputs"].([]any)) == 0 && life.json()["status"] != "completed",
 		fmt.Sprint(life.json()["status"]))
 
@@ -123,9 +123,9 @@ func sectionAPICrash() {
 		replay.json()["request_id"] == requestID && replay.json()["idempotent_replay"] == true,
 		replay.brief())
 
-	head("the recovered-attempts law, through a orchestrator restart")
+	head("the recovered-attempts law, through a record-owner restart")
 	// The restart reconciled the orphaned worker (it was killed with its launcher's
-	// group, or reaped at boot). Starting the slot again replays the SUPERVISOR's own
+	// group, or reaped at boot). Starting the slot again replays the WORKER's own
 	// journal, and the recovered attempt is an OPEN OBLIGATION.
 	svc.call("POST", "/v1/local/workers", map[string]any{"endpoint": "cozy/sdxl-unet"})
 	settled := svc.openSSE(fmt.Sprintf("/v1/requests/%s/events?cursor=%d", requestID, cursor),
@@ -139,7 +139,7 @@ func sectionAPICrash() {
 		attemptEnd != nil && attemptEnd.Payload["requeuing"] == true,
 		fmt.Sprintf("request.attempt_failed %v/%v", payloadOf(attemptEnd, "status"),
 			payloadOf(attemptEnd, "cause")))
-	check("and the orchestrator minted a NEW ordinal for it",
+	check("and the record owner minted a NEW ordinal for it",
 		settled.find("request.requeued") != nil,
 		fmt.Sprint(settled.find("request.requeued") != nil))
 	check("attempt 2 ran and the request completed", settled.find("request.completed") != nil,

@@ -359,7 +359,7 @@ func (f *fakeControl) Control(stream pb.WorkerControl_ControlServer) error {
 					pb.OutcomeStatus_OUTCOME_STATUS_REFUSED,
 					"the echoed admission generation is not current",
 					pb.CauseCode_CAUSE_CODE_ADMISSION_GENERATION_STALE,
-					pb.CauseOrigin_CAUSE_ORIGIN_SUPERVISOR, false)
+					pb.CauseOrigin_CAUSE_ORIGIN_WORKER, false)
 				t.PlacementId = offer.PlacementId
 				outcome(t)
 				continue
@@ -369,7 +369,7 @@ func (f *fakeControl) Control(stream pb.WorkerControl_ControlServer) error {
 					f.say("ARM: the remote offer is not an exact invocation/grant pair: %v", why)
 					t, _ := outcomeFor(offer.RequestId, offer.AttemptOrdinal, offer.InvocationSpecDigest,
 						pb.OutcomeStatus_OUTCOME_STATUS_REFUSED, why.Error(),
-						pb.CauseCode_CAUSE_CODE_PROTOCOL, pb.CauseOrigin_CAUSE_ORIGIN_SUPERVISOR, false)
+						pb.CauseCode_CAUSE_CODE_PROTOCOL, pb.CauseOrigin_CAUSE_ORIGIN_WORKER, false)
 					t.PlacementId = offer.PlacementId
 					outcome(t)
 					continue

@@ -167,7 +167,7 @@ if [ -n "$ENDPOINT" ] && [ -f "$ENDPOINT" ]; then
 
   run run cozy/weightless/v1/tile size=32 seed=7 --full --out "$COZY_HOME/out"
   printf '%s\n' "$OUT" | sed 's/^/    /'
-  check "the invoke exits 0 on a TYPED terminal — the coordinator's success transaction" \
+  check "the invoke exits 0 on a TYPED terminal — the record owner's success transaction" \
     "$([ "$CODE" = 0 ] && printf '%s' "$OUT" | grep -qE 'status: +completed' && echo 1 || echo 0)" \
     "$(printf '%s' "$OUT" | grep -E '^status:' | tr -s ' ') [exit $CODE]"
   check "the typed result is the handler's own struct, not a blob" \

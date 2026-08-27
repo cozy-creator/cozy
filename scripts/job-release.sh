@@ -4,7 +4,7 @@
 # The job is cr-009's own `corpus/job/structural_census.py` — the real structural-derivation
 # job it shipped, over a real 6.9 GB cozytensors store — taken verbatim from a PINNED
 # read-only `git archive` of cozy-runtime. It is not re-implemented here and not edited:
-# cl-004 is the coordinator/CLI half, and the thing it must drive is the job that exists.
+# cl-004 is the orchestrator/CLI half, and the thing it must drive is the job that exists.
 #
 #   scripts/job-release.sh [--runtime-sha <sha>] [--out <dir>] [--endpoint org/name]
 #

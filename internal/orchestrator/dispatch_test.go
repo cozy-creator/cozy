@@ -267,7 +267,7 @@ func refusedOutcome(t *testing.T, requestID string, ordinal uint64, spec []byte)
 		Status: pb.OutcomeStatus_OUTCOME_STATUS_REFUSED, SafeMessage: "no capacity",
 		ExecutionStarted: false,
 		Cause: &pb.OutcomeCause{
-			Code: pb.CauseCode_CAUSE_CODE_NO_CAPACITY, Origin: pb.CauseOrigin_CAUSE_ORIGIN_SUPERVISOR,
+			Code: pb.CauseCode_CAUSE_CODE_NO_CAPACITY, Origin: pb.CauseOrigin_CAUSE_ORIGIN_WORKER,
 			Detail: "refused before execution",
 		},
 	}

@@ -14,7 +14,7 @@ import (
 	pb "github.com/cozy-creator/cozy-creator-v2/protocol/cozy/worker/v1"
 )
 
-// The conformance corpus is worker-protocol's FROZEN fixtures at REV-2.
+// The conformance corpus is worker-protocol's FROZEN fixtures at schema rev 3.
 // `fixtures/canonical/<n>.bin` is the marshaled message and `<n>.json` is its ONE canonical
 // document — sha256 over that file IS the wire digest. So the check is exact in both
 // directions: this writer must reproduce those bytes from the message, and this reader must
@@ -56,8 +56,8 @@ func sectionCanonical() {
 	spelledSchema, _ := canonical.Spell(canonical.Digest(schemaBytes))
 	check("and the digest is over exactly those document bytes",
 		spelledSchema == schema.ID, fmt.Sprintf("%d B -> %s", len(schemaBytes), shortID(spelledSchema)))
-	check("this binding declares wire schema rev 2 on the linear-train minor 0",
-		pb.WireSchemaRev == 2 && pb.WireMinor == 0,
+	check("this binding declares wire schema rev 3 on the linear-train minor 0",
+		pb.WireSchemaRev == 3 && pb.WireMinor == 0,
 		fmt.Sprintf("rev %d, minor %d", pb.WireSchemaRev, pb.WireMinor))
 
 	head("this Go writer against worker-protocol's frozen canonical documents")

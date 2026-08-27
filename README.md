@@ -94,10 +94,11 @@ they land on the VM-class sandbox posture (tensorhub-build.md §1.1) or they do 
 ## The LocalService and LocalOrchestrator (cl-001)
 
 `cozy up` starts the ONE long-lived process; `cozy down` stops it. Its scheduling role is
-the **LocalOrchestrator** (`internal/orchestrator`): the worker protocol's **RecordOwner**,
-which DIALS each worker's own socket (#436), plus local dispatch, the device ledger, and
-output publication authority. The wire is `cozy.worker.v1` at **rev-2**, the
-dynamic-serving rev.
+the **LocalOrchestrator** (`internal/orchestrator`): local placement, dispatch, and the
+device ledger. The same service is the worker protocol's **record owner**: it DIALS each
+worker's own socket (#436), owns durable attempt ordinals and terminal acceptance, and
+publishes accepted outputs. The wire is `cozy.worker.v1` at **schema rev 3** — rev-2's
+dynamic-serving shape with the actor-vocabulary hardcut.
 
 - **Identity is canonical bytes.** `internal/canonical` is the document plane: the writer
   is adapted from worker-protocol's own independent Go canonicalizer, the reader is this
@@ -109,6 +110,9 @@ dynamic-serving rev.
   absence — absence being precisely the pre-rev-2 signal, since an older binding cannot
   spell the field. `WIRE_MINOR` stays 0 and fences nothing: the minor is the additive
   train and cannot honestly move for a breaking in-place revision.
+- **Actor names match their current responsibilities.** Cause origin 4 is `WORKER`, the
+  machine-local peer; origin 7 is `RECORD_OWNER`, the durable-attempt authority. Rev 3
+  retains their wire numbers and hardcuts the old names with no aliases.
 - **The desired set is BYTES.** `ConvergePlacementSet` authors a `PlacementSet` document
   once and sends its exact canonical bytes plus their digest; the worker recomputes before
   parsing a single field. There is no second structured copy for the set to disagree with.
@@ -121,17 +125,17 @@ dynamic-serving rev.
   `applied_revision` is retired as dishonest.
 - **One transaction.** "outcome accepted + output visible" commits together, and only
   then is `AttemptOutcomeAck` sent. A crash between them replays; it cannot half-apply.
-  An outcome this owner holds unacked is counted against the worker's own free seats, so
-  an owner that stops acking starves its own admission.
+  An outcome this record owner holds unacked is counted against the worker's own free
+  seats, so a record owner that stops acking starves its own admission.
 - **Every offer gets a journaled outcome**, including a refusal. The REFUSED projection
-  SPLITS by (cause, origin): author/runtime causes settle; SUPERVISOR pre-execution causes
+  SPLITS by (cause, origin): author/runtime causes settle; WORKER pre-execution causes
   consume the ordinal, spend zero execution budget (`execution_started` is a structural
   bit, never a cause-code allowlist) and are immediately re-dispatchable.
 - **The recovered-attempts law** (worker-protocol/02 §6.2): the `held_attempts` a
   restarted worker reports in its ONE digest-acked snapshot are OPEN OBLIGATIONS, and no
   next ordinal for their request ids is minted until each is closed by its own journaled
   outcome. The snapshot is bounded by its own digest — a truncated one cannot match — and
-  dispatch stays closed until this owner acks the exact (id, digest).
+  dispatch stays closed until this record owner acks the exact (id, digest).
 - **Device grants** are an attribute of the worker process row, admitted by one atomic
   statement. Two concurrent starts cannot both consume an envelope.
 - **Liveness is an OS fact.** The service holds an exclusive `flock` on
