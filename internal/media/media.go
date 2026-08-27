@@ -22,6 +22,7 @@ package media
 
 import (
 	"bytes"
+	"context"
 	"crypto/sha256"
 	"crypto/tls"
 	"crypto/x509"
@@ -63,11 +64,12 @@ type Client struct {
 	maxObject int64
 }
 
-// Budget is how long ONE media call may go unanswered before this host decides the pod's
-// byte plane is not there. It is DERIVED, not chosen: the caller passes the same silence
+// Budget is the connection/response allowance before declared transfer bytes are counted.
+// It is DERIVED, not chosen: the caller passes the same silence
 // budget the pod's CONTROL leg is already judged by — the count of report periods a worker
 // may miss before it is called stalled (`orchestrator.SilentReports * orchestrator.ReportCadence`). A pod
-// that has not answered its byte plane in the time it owes eight reports is not slow.
+// A call's total deadline adds its exact byte length at the explicit 1 MiB/s floor below;
+// large valid media therefore does not inherit a hidden high-bandwidth requirement.
 //
 // It is not optional, and the reason is an observation: a client with no bound at all hung
 // on `connect()` against a REAL rented pod whose provider had mapped the control port and
@@ -111,7 +113,7 @@ func Dial(spec Spec, budget time.Duration, maxObject int64) (*Client, *exit.Erro
 		return nil, exit.Internalf(
 			"the media plane was dialled with no object bound; see media.Client's maxObject")
 	}
-	c.http = &http.Client{Transport: transport, Timeout: budget}
+	c.http = &http.Client{Transport: transport}
 	c.budget, c.maxObject = budget, maxObject
 	return c, nil
 }
@@ -120,6 +122,35 @@ func Dial(spec Spec, budget time.Duration, maxObject int64) (*Client, *exit.Erro
 func (c *Client) Addr() string { return c.spec.Addr }
 
 func (c *Client) url(path string) string { return c.scheme + "://" + c.spec.Addr + path }
+
+const minimumTransferBytesPerSecond = int64(1 << 20)
+
+// transferDeadline keeps every call bounded without making total wall time a hidden
+// bandwidth requirement. The control-plane silence budget pays for connection/response
+// latency; declared bytes then receive time at a conservative 1 MiB/s minimum rate.
+func (c *Client) transferDeadline(length int64) time.Duration {
+	if length < minimumTransferBytesPerSecond {
+		length = minimumTransferBytesPerSecond
+	}
+	seconds := length / minimumTransferBytesPerSecond
+	remainder := length % minimumTransferBytesPerSecond
+	const maximum = time.Duration(1<<63 - 1)
+	if c.budget >= maximum || seconds > int64((maximum-c.budget)/time.Second) {
+		return maximum
+	}
+	transfer := time.Duration(seconds) * time.Second
+	fraction := time.Duration(remainder) * time.Second / time.Duration(minimumTransferBytesPerSecond)
+	if transfer > maximum-c.budget-fraction {
+		return maximum
+	}
+	transfer += fraction
+	return c.budget + transfer
+}
+
+func (c *Client) bounded(request *http.Request, length int64) (*http.Request, context.CancelFunc) {
+	ctx, cancel := context.WithTimeout(request.Context(), c.transferDeadline(length))
+	return request.WithContext(ctx), cancel
+}
 
 // answer is the media server's own document. Every route answers one shape or a typed
 // refusal; this side never guesses which by status code alone.
@@ -148,11 +179,14 @@ func (c *Client) call(method, path string, body []byte) (answer, []byte, *exit.E
 		request.Header.Set("Content-Type", "application/octet-stream")
 		request.ContentLength = int64(len(body))
 	}
+	request, cancel := c.bounded(request, int64(len(body)))
+	defer cancel()
 	response, err := c.http.Do(request)
 	if err != nil {
 		return answer{}, nil, exit.Named(exit.Unavailable, "media_unreachable",
-			"the pod's media server at %s did not answer inside the %s this pod's control "+
-				"leg is already judged by: %s", c.spec.Addr, c.budget, err).
+			"the pod's media server at %s did not complete inside the %s derived from its "+
+				"declared bytes and the control-leg silence budget: %s",
+			c.spec.Addr, c.transferDeadline(int64(len(body))), err).
 			WithRemedy("a rented pod's byte plane is a CO-RESIDENT process (cl-014) on its " +
 				"own port; a pod that runs a worker and no media server can be dialled and " +
 				"cannot be fed, and this host will not fall back to granting paths on its " +
@@ -160,24 +194,25 @@ func (c *Client) call(method, path string, body []byte) (answer, []byte, *exit.E
 			WithNext("cozy rent ls")
 	}
 	defer response.Body.Close()
-	if response.ContentLength > c.maxObject {
+	const maxAnswerBytes = int64(1 << 20)
+	if response.ContentLength > maxAnswerBytes {
 		return answer{}, nil, exit.Named(exit.Validation, "media_over_bound",
-			"the pod declares %d B for %s and this host admits %d B per object",
-			response.ContentLength, path, c.maxObject).
+			"the pod declares %d B for the %s answer and this host admits %d B",
+			response.ContentLength, path, maxAnswerBytes).
 			WithRemedy("the DECLARED length refuses before the bytes move; the bytes meet " +
 				"the same bound below")
 	}
 	// The bytes are held to the same figure, because a declaration is a claim: one extra
 	// byte past the bound is read so the overrun is DETECTED rather than silently accepted.
-	data, err := io.ReadAll(io.LimitReader(response.Body, c.maxObject+1))
+	data, err := io.ReadAll(io.LimitReader(response.Body, maxAnswerBytes+1))
 	if err != nil {
 		return answer{}, nil, exit.Unavailablef(
 			"the pod's media server answered %d and the body ended early: %s",
 			response.StatusCode, err)
 	}
-	if int64(len(data)) > c.maxObject {
+	if int64(len(data)) > maxAnswerBytes {
 		return answer{}, nil, exit.Named(exit.Validation, "media_over_bound",
-			"the pod's answer for %s passed %d B and was cut there", path, c.maxObject).
+			"the pod's answer for %s passed %d B and was cut there", path, maxAnswerBytes).
 			WithRemedy("a stream may not exceed what this host admits, and finding out " +
 				"afterwards is not a bound")
 	}
@@ -194,11 +229,6 @@ func (c *Client) call(method, path string, body []byte) (answer, []byte, *exit.E
 			e.WithRemedy("%s", doc.Error.Remedy)
 		}
 		return answer{}, nil, e
-	}
-	// A GET of an output is bytes, not a document. Both come back from here so there is
-	// one authorized request builder and not two.
-	if method == http.MethodGet && strings.Contains(path, "/outputs/") {
-		return answer{Digest: response.Header.Get("X-Cozy-Digest")}, data, nil
 	}
 	var doc answer
 	if err := json.Unmarshal(data, &doc); err != nil {
@@ -276,6 +306,8 @@ func (c *Client) PutInputFile(blob, path, wantDigest string, wantLength int64) (
 	request.Header.Set("Authorization", "Bearer "+c.spec.Token.Reveal()) //cozy:allow-reveal
 	request.Header.Set("Content-Type", "application/octet-stream")
 	request.ContentLength = wantLength
+	request, cancel := c.bounded(request, wantLength)
+	defer cancel()
 	response, err := c.http.Do(request)
 	if err != nil {
 		return "", exit.Named(exit.Unavailable, "media_unreachable",
@@ -360,6 +392,8 @@ func (c *Client) GetOutputTo(slot, name, destination, wantDigest string,
 		return 0, exit.Internalf("cannot build the media output request: %s", err)
 	}
 	request.Header.Set("Authorization", "Bearer "+c.spec.Token.Reveal()) //cozy:allow-reveal
+	request, cancel := c.bounded(request, wantLength)
+	defer cancel()
 	response, err := c.http.Do(request)
 	if err != nil {
 		return 0, exit.Named(exit.Unavailable, "media_unreachable",
