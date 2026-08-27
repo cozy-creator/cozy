@@ -50,16 +50,22 @@ import (
 // the pod directory the owner reserved, and the owner FETCHES the bytes back and verifies
 // them before it acks. Nothing in it is stubbed, and the arms say where each byte was.
 
-const rentalEndpointRef = endpointRef + "/v1/denoise"
+const (
+	rentalEndpointRef          = endpointRef + "/v1/denoise"
+	transportEndpointRef       = "cozy/weightless"
+	transportRentalEndpointRef = transportEndpointRef + "/v1/video_transport"
+)
 
 func sectionRent() {
 	root := flag("home", filepath.Join(os.TempDir(), "cozy-live", "cl015-rent"))
 	must("clearing the root", os.RemoveAll(root))
 	must("creating the root", os.MkdirAll(root, 0o755))
 
-	head("a real endpoint, installed the way a user installs one")
+	head("real endpoint contracts, installed the way a user installs them")
 	installEndpoint(root)
+	installTransportEndpoint(root)
 	release, plans := endpointIdentity(root)
+	transportRelease, transportPlans := endpointIdentityFor(root, transportEndpointRef)
 	port := freePort(2990)
 	svc := startService(root, port, false)
 	defer svc.stop()
@@ -71,6 +77,8 @@ func sectionRent() {
 	fmt.Printf("  the stand-in hub is at %s · pod filesystem %s\n", hub.url(), hub.pods)
 	fmt.Printf("  this host serves %s · %d entrypoint(s) · plan %s\n",
 		release, len(plans), shortID(planFor(plans, "denoise")))
+	fmt.Printf("  transport-only contract %s · plan %s (no H3 inference claim)\n",
+		transportRelease, shortID(planFor(transportPlans, "video_transport")))
 
 	head("the credential arms come FIRST: a rental is a first-party write")
 	code, out := cozyRunEnv(root, []string{"TENSORHUB_URL=" + hub.url()},
@@ -256,6 +264,79 @@ func sectionRent() {
 	check("the verified local output remains while the acked pod attempt was deleted",
 		digestOfFile(local) != "" && !remoteAttemptBytes,
 		shortID(digestOfFile(local))+" · remote "+strings.Join(podFiles, ", "))
+
+	head("IMAGE -> MP4 TRANSPORT: the real CLI flag, exact grant, mirror, ack, cleanup")
+	// This is deliberately a transport contract, not a synthetic H3 claim. The installed
+	// weightless descriptor declares the same interesting shape (text + first-frame image
+	// -> video asset); the fake pod proves those bytes and identities cross the boundary.
+	videoHub := newPodHub(podHubSpec{Dir: filepath.Join(root, "hub-video-transport"),
+		Arm: "remote", Release: transportRelease})
+	defer videoHub.close()
+	videoRental, _ := rentEndpoint(root, videoHub, transportRentalEndpointRef,
+		"cl-019 image-to-mp4 transport proof")
+	firstFrame := filepath.Join(root, "first-frame.png")
+	frameBytes, err := hex.DecodeString(onePixelPNG)
+	must("decoding the first-frame fixture", err)
+	must("writing the first-frame fixture", os.WriteFile(firstFrame, frameBytes, 0o600))
+	frameDigest := digestOfFile(firstFrame)
+	videoOut := filepath.Join(root, "out-video")
+	code, out = cozyRun(root, "run", transportRentalEndpointRef,
+		"prompt=transport boundary only",
+		"--asset", "first_frame="+firstFrame,
+		"--out", videoOut, "--stream", "--worker", videoRental)
+	videoRequest := dispatchedRequest(out)
+	videoLog := podWorkerLog(videoHub, videoRental)
+	check("the real `cozy run --asset first_frame=<image>` invocation succeeded",
+		code == 0 && videoRequest != "", firstLine(out)+" [exit "+itoa(code)+"]")
+	check("the fake pod consumed first_frame and checked length, digest, and image/png binding",
+		strings.Contains(videoLog, "validated granted input first_frame") &&
+			strings.Contains(videoLog, frameDigest) && strings.Contains(videoLog, "image/png"),
+		lineWith(videoLog, "validated granted input first_frame"))
+
+	expectedVideo, err := hex.DecodeString(transportMP4)
+	must("decoding the MP4 transport fixture", err)
+	expectedVideoDigest := digestOfBytes(expectedVideo)
+	localVideo := filepath.Join(videoOut, "video.mp4")
+	localVideoBytes, _ := os.ReadFile(localVideo)
+	life := svc.call("GET", "/v1/requests/"+videoRequest, nil).json()
+	videoRef := lifecycleOutput(life, "video")
+	check("the mirrored record preserves the worker's exact MP4 digest, length, and MIME",
+		fmt.Sprint(videoRef["digest"]) == expectedVideoDigest &&
+			int(number(videoRef["length"])) == len(expectedVideo) &&
+			fmt.Sprint(videoRef["mime_type"]) == "video/mp4",
+		fmt.Sprintf("%v · %v B · %v", videoRef["digest"], videoRef["length"], videoRef["mime_type"]))
+	check("the CLI published the exact MP4-shaped bytes at the declared .mp4 path",
+		bytes.Equal(localVideoBytes, expectedVideo) && isMP4(localVideoBytes),
+		localVideo+" "+itoa(len(localVideoBytes))+" B "+shortID(digestOfFile(localVideo)))
+	staging, _ := filepath.Glob(filepath.Join(videoOut, ".video.mp4.staging-*"))
+	check("verified bytes were atomically renamed with no client staging residue",
+		len(staging) == 0 && digestOfFile(localVideo) == expectedVideoDigest,
+		fmt.Sprintf("%d staging files · %s", len(staging), shortID(digestOfFile(localVideo))))
+	check("the orchestrator logged the exact-length remote mirror before settlement",
+		strings.Contains(serviceLog(root), "/video: "+itoa(len(expectedVideo))+" B from"),
+		lineWith(serviceLog(root), "/video: "))
+
+	videoSlot := media.Slot(videoRequest, 1)
+	acked := waitFor(func() bool {
+		return strings.Contains(podWorkerLog(videoHub, videoRental),
+			"AttemptOutcomeAck for "+videoRequest+"#1")
+	}, 5*time.Second)
+	remoteClean := waitFor(func() bool {
+		for _, name := range podMediaFiles(videoHub, videoRental) {
+			if strings.Contains(name, videoSlot) {
+				return false
+			}
+		}
+		return true
+	}, 5*time.Second)
+	check("the fake pod received the exact terminal ack", acked,
+		lineWith(podWorkerLog(videoHub, videoRental), "AttemptOutcomeAck for "+videoRequest))
+	check("only after that ack, the pod's payload, image grant, and output slot were removed",
+		remoteClean, strings.Join(podMediaFiles(videoHub, videoRental), ", "))
+	layout, layoutErr := home.Open(root)
+	check("terminal cleanup dropped the staged host copy but preserved the user's source image",
+		layoutErr == nil && !exists(layout.InputAsset(frameDigest)) && digestOfFile(firstFrame) == frameDigest,
+		firstFrame+" "+shortID(frameDigest))
 
 	head("THE MEDIA SERVER'S OWN DOOR: bearer, names, and the quota")
 	// The pod's byte plane is dialled DIRECTLY here, with the certificate this host pinned,
@@ -507,7 +588,7 @@ func sectionRent() {
 	// Several stand-in hubs are live at once, so the pass asks each one whether it still
 	// holds the pod. A rental nobody owns would be a pod nothing can destroy, which is the
 	// exact failure this pass exists to make impossible.
-	hubs := []*podHub{hub, lost, liar, starved, lying, silent, nameless, broken}
+	hubs := []*podHub{hub, videoHub, lost, liar, starved, lying, silent, nameless, broken}
 	for _, id := range heldRentals(root) {
 		on := hub
 		for _, candidate := range hubs {
@@ -529,7 +610,11 @@ func sectionRent() {
 // rentOne rents a pod and returns its id with the whole rendering, so an arm can search
 // what was printed as well as act on the id.
 func rentOne(root string, h *podHub, reason string) (string, string) {
-	code, out := cozyRunEnv(root, h.env(), "rent", rentalEndpointRef, "--accelerator", "NVIDIA H200", "--reason", reason)
+	return rentEndpoint(root, h, rentalEndpointRef, reason)
+}
+
+func rentEndpoint(root string, h *podHub, endpoint, reason string) (string, string) {
+	code, out := cozyRunEnv(root, h.env(), "rent", endpoint, "--accelerator", "NVIDIA H200", "--reason", reason)
 	if code != 0 {
 		fmt.Println(indent(out))
 		return "", out
@@ -665,17 +750,25 @@ func modeOf(info os.FileInfo) string {
 // therefore means two processes, and the cross-machine plan-id arm is comparing what two
 // independent runs of the product's own resolver said, not what one run said twice.
 func endpointIdentity(root string) (string, map[string]string) {
-	release, ids, _ := endpointFacts(root)
+	return endpointIdentityFor(root, endpointRef)
+}
+
+func endpointIdentityFor(root, endpoint string) (string, map[string]string) {
+	release, ids, _ := endpointFactsFor(root, endpoint)
 	return release, ids
 }
 
 func endpointFacts(root string) (string, map[string]string, map[string]map[string]any) {
-	cmd := niceCmd(selfBinary(), "planids", "--endpoint", endpointRef)
+	return endpointFactsFor(root, endpointRef)
+}
+
+func endpointFactsFor(root, endpoint string) (string, map[string]string, map[string]map[string]any) {
+	cmd := niceCmd(selfBinary(), "planids", "--endpoint", endpoint)
 	cmd.Env = childEnv(root)
 	data, err := cmd.CombinedOutput()
 	if err != nil {
 		fmt.Println(string(data))
-		must("resolving "+endpointRef+" on "+root, err)
+		must("resolving "+endpoint+" on "+root, err)
 	}
 	var doc struct {
 		Release string                    `json:"release"`
@@ -826,6 +919,31 @@ func digestOfFile(path string) string {
 	}
 	sum := sha256.Sum256(data)
 	return "sha256:" + hex.EncodeToString(sum[:])
+}
+
+func digestOfBytes(data []byte) string {
+	sum := sha256.Sum256(data)
+	return "sha256:" + hex.EncodeToString(sum[:])
+}
+
+func lifecycleOutput(life map[string]any, outputID string) map[string]any {
+	rows, _ := life["outputs"].([]any)
+	for _, raw := range rows {
+		row, _ := raw.(map[string]any)
+		if fmt.Sprint(row["output_id"]) == outputID {
+			return row
+		}
+	}
+	return map[string]any{}
+}
+
+func number(value any) float64 {
+	n, _ := value.(float64)
+	return n
+}
+
+func isMP4(data []byte) bool {
+	return len(data) >= 12 && bytes.Equal(data[4:8], []byte("ftyp"))
 }
 
 // lineWith is the first line of a log that mentions a phrase — the DETAIL an arm prints,

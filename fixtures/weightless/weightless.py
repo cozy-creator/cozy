@@ -11,6 +11,10 @@ What an invoke of `tile` exercises is everything except the model: the install g
 own venv, `describe --check`'s derived surface, the supervisor, the executor, the worker
 protocol, the coordinator's terminal transaction, the output publication, the media id, and
 `cozy run --out`. `refuse` is the failure terminal on the same path.
+
+`video_transport` exists only so the remote live driver can exercise a text/image request
+and MP4 result contract through an adversarial worker. It refuses local execution and is
+explicitly not a model or video-generation fixture.
 """
 
 from __future__ import annotations
@@ -28,6 +32,7 @@ from cozy_runtime.author import (
     InvalidRequest,
     Outputs,
     Telemetry,
+    VideoAsset,
 )
 
 app = App()
@@ -48,6 +53,15 @@ class TileOutput(msgspec.Struct):
 
 class RefuseInput(msgspec.Struct, forbid_unknown_fields=True):
     why: str = "cl-013 asked for it"
+
+
+class VideoTransportInput(msgspec.Struct, forbid_unknown_fields=True):
+    prompt: str
+    first_frame: ImageAsset
+
+
+class VideoTransportOutput(msgspec.Struct):
+    video: VideoAsset
 
 
 @app.entrypoint
@@ -79,3 +93,15 @@ def refuse(payload: RefuseInput) -> TileOutput:
     """The FAILED terminal on the same weightless path, so the fixture observes both
     verdicts of the terminal transaction rather than only the happy one."""
     raise InvalidRequest(payload.why)
+
+
+@app.entrypoint
+def video_transport(payload: VideoTransportInput) -> VideoTransportOutput:
+    """A descriptor-only seam for the remote byte-plane live proof.
+
+    The fake remote worker consumes this request under an exact DeliveryGrant and emits a
+    tiny MP4-shaped transport fixture. This handler deliberately refuses if somebody runs
+    it locally: it is not video generation and must never be presented as H3 inference.
+    """
+    del payload
+    raise InvalidRequest("video_transport is a transport-contract fixture, not inference")
