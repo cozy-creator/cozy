@@ -1,1 +1,0 @@
-{"build":"0.0.1","degraded":"symlink-fell-back-to-copy","detail":"a filesystem without symlinks: dedup lost, correctness kept","device":"host","format":"tensorfs.operation_receipt/1","generation":9,"op":"project_snapshot","snapshot":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}

@@ -12,11 +12,13 @@
 //!
 //! A record cannot exist without naming the exact vector set its implementation passed, so
 //! a vectorless spec is structurally unqualifiable rather than merely discouraged.
+//!
+//! The record set is a compiled-in registry constant (`registry::capability_records`), never
+//! written, stored, or digested — a plain struct, not a canonical document (proto-007).
 
-use crate::canon::{as_arr, as_str, Fields, Value};
+use crate::canon::{self, Value};
 use crate::err::{refuse, Code, Result};
-use crate::ids::{ascii_name, check_format, prefixed, Doc, ObjectRef};
-use crate::limits;
+use crate::ids::ObjectRef;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CapabilityRecord {
@@ -67,85 +69,27 @@ impl CapabilityRecords {
     }
 }
 
-impl Doc for CapabilityRecords {
-    const FORMAT: &'static str = "tensorfs.capability_records/1";
-    const MAX_BYTES: usize = limits::DOC_MAX_BYTES;
-
-    fn from_value(v: &Value) -> Result<Self> {
-        let mut f = Fields::new("CapabilityRecords", v)?;
-        check_format(
-            "CapabilityRecords",
-            as_str("CapabilityRecords", "format", f.req("format")?)?,
-            Self::FORMAT,
-        )?;
-        let mut records = Vec::new();
-        for rv in as_arr("CapabilityRecords", "records", f.req("records")?)? {
-            let mut rf = Fields::new("CapabilityRecord", rv)?;
-            let device = rf.req_str("device")?.to_string();
-            let encoding = prefixed(
-                "CapabilityRecord.encoding",
-                as_str("CapabilityRecord", "encoding", rf.req("encoding")?)?,
-            )?;
-            let implementation = rf.req_str("implementation")?.to_string();
-            let note = rf.req_str("note")?.to_string();
-            let vectors = ObjectRef::from_value("CapabilityRecord.vectors", rf.req("vectors")?)?;
-            rf.done()?;
-            ascii_name("CapabilityRecord.device", &device, limits::MAX_NAME_BYTES)?;
-            ascii_name(
-                "CapabilityRecord.implementation",
-                &implementation,
-                limits::MAX_NAME_BYTES,
-            )?;
-            if note.len() > limits::MAX_DOC_TEXT_BYTES {
-                return refuse(Code::SIZE_CAP, "CapabilityRecord.note over the byte cap");
-            }
-            records.push(CapabilityRecord {
-                encoding,
-                device,
-                implementation,
-                vectors,
-                note,
-            });
-        }
-        f.done()?;
-        // One (encoding, device) pair, one verdict: two records for one pair is a registry
-        // that can answer the same question two ways.
-        let mut keys: Vec<(&str, &str)> = records
-            .iter()
-            .map(|r| (r.encoding.as_str(), r.device.as_str()))
-            .collect();
-        let given = keys.clone();
-        keys.sort_unstable();
-        keys.dedup();
-        if keys.len() != given.len() {
-            return refuse(
-                Code::DUPLICATE_KEY,
-                "two capability records name one (encoding, device) pair",
-            );
-        }
-        Ok(CapabilityRecords { records })
-    }
-
-    fn to_value(&self) -> Value {
-        Value::obj(vec![
-            ("format", Value::str(Self::FORMAT)),
-            (
-                "records",
-                Value::arr(
-                    self.records
-                        .iter()
-                        .map(|r| {
-                            Value::obj(vec![
-                                ("device", Value::str(r.device.clone())),
-                                ("encoding", Value::str(r.encoding.clone())),
-                                ("implementation", Value::str(r.implementation.clone())),
-                                ("note", Value::str(r.note.clone())),
-                                ("vectors", r.vectors.to_value()),
-                            ])
-                        })
-                        .collect(),
-                ),
+impl CapabilityRecords {
+    pub fn to_value(&self) -> Value {
+        Value::obj(vec![(
+            "records",
+            Value::arr(
+                self.records
+                    .iter()
+                    .map(|r| {
+                        Value::obj(vec![
+                            ("device", Value::str(r.device.clone())),
+                            ("encoding", Value::str(r.encoding.clone())),
+                            ("implementation", Value::str(r.implementation.clone())),
+                            ("note", Value::str(r.note.clone())),
+                            ("vectors", r.vectors.to_value()),
+                        ])
+                    })
+                    .collect(),
             ),
-        ])
+        )])
+    }
+    pub fn canonical_bytes(&self) -> Vec<u8> {
+        canon::write(&self.to_value())
     }
 }

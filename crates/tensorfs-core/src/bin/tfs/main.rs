@@ -1214,7 +1214,7 @@ fn build_corpus() -> (Vec<Case>, Vec<EncodingSpec>) {
     ));
 
     // --- the layout plane (tfs-009): code topology, report, registration
-    let (code, report, reg) = layout_plane_docs(&ha, &closure);
+    let (code, report, _reg) = layout_plane_docs(&ha, &closure);
     cases.push(ok_case(
         "layout",
         "code-topology",
@@ -1228,13 +1228,6 @@ fn build_corpus() -> (Vec<Case>, Vec<EncodingSpec>) {
         "compat_report",
         report.canonical_bytes(),
         "Satisfied, with the component-granular encoding facts grading needs",
-    ));
-    cases.push(ok_case(
-        "layout",
-        "registration-widen",
-        "conversion_registration",
-        reg.canonical_bytes(),
-        "bf16->f32, round trip run over the COMPLETE 16-bit domain",
     ));
     cases.push(red_case(
         "layout-red",
@@ -1260,15 +1253,6 @@ fn build_corpus() -> (Vec<Case>, Vec<EncodingSpec>) {
         "MISSING_FIELD",
         "an empty accepts list admits nothing and says nothing",
     ));
-    cases.push(red_case(
-        "layout-red",
-        "unrun-registration",
-        "conversion_registration",
-        sub(&reg.canonical_bytes(), "\"cases\":1", "\"cases\":0"),
-        "MISSING_FIELD",
-        "a registration that ran no round trip proved nothing",
-    ));
-
     // --- canonical-byte semantic twins (all red)
     let g = "canonical";
     cases.push(red_case(
@@ -2139,28 +2123,6 @@ fn build_corpus() -> (Vec<Case>, Vec<EncodingSpec>) {
         "provenance is real or synthetic, never a third thing",
     ));
 
-    let g = "capability";
-    let caps = tensorfs_core::registry::capability_records();
-    let cap_bytes = caps.canonical_bytes();
-    cases.push(ok_case(
-        g,
-        "records",
-        "capability",
-        cap_bytes.clone(),
-        "one qualified (encoding, device) pair per vectored spec; every other pair refuses",
-    ));
-    let dup = tensorfs_core::capability::CapabilityRecords {
-        records: vec![caps.records[0].clone(), caps.records[0].clone()],
-    };
-    cases.push(red_case(
-        "capability-red",
-        "duplicate-pair",
-        "capability",
-        dup.canonical_bytes(),
-        "DUPLICATE_KEY",
-        "one (encoding, device) pair cannot have two verdicts",
-    ));
-
     // --- the border's own documents (tfs-003)
     let g = "ingest";
     let banked = tensorfs_core::ingest::fingerprint::Banked {
@@ -2308,7 +2270,6 @@ fn build_corpus() -> (Vec<Case>, Vec<EncodingSpec>) {
 /// frozen here with the same discipline as the header's.
 fn meta_cases() -> Vec<Case> {
     use tensorfs_core::meta::{HoldRow, QRow, RootRow, SnapshotRow, State};
-    use tensorfs_core::receipt::Receipt;
 
     let snap = "a".repeat(64);
     let other = "b".repeat(64);
@@ -2419,36 +2380,6 @@ fn meta_cases() -> Vec<Case> {
         "a wall-clock expiry smuggled onto a LOCAL hold — local liveness is owner-evidence",
     ));
 
-    out.push(ok_case(
-        "meta",
-        "degraded-receipt",
-        "operation_receipt",
-        Receipt::new(
-            "project_snapshot",
-            "symlink-fell-back-to-copy",
-            &snap,
-            9,
-            "a filesystem without symlinks: dedup lost, correctness kept".to_string(),
-        )
-        .on("host")
-        .canonical_bytes(),
-        "a fallback that changes performance or trust says so",
-    ));
-    out.push(red_case(
-        "meta-red",
-        "receipt-open-ended-kind",
-        "operation_receipt",
-        Receipt::new(
-            "read_fill",
-            "something-else-happened",
-            &snap,
-            9,
-            "an open-ended degradation is not a receipt".to_string(),
-        )
-        .canonical_bytes(),
-        "UNKNOWN_FIELD",
-        "a degradation outside the closed set — an unnamed fallback is not observable",
-    ));
     out
 }
 

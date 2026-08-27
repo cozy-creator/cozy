@@ -1,3 +1,0 @@
-doc: capability
-expect: mutant
-note: one byte flipped at offset 850 of sha256:1048303c20e4c5944b1f39d5eb3e60ba301ca0eba63b2a97c3b35e095fb60689

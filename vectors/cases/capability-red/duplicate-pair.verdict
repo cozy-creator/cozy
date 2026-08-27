@@ -1,4 +1,0 @@
-doc: capability
-expect: refuse
-code: DUPLICATE_KEY
-note: one (encoding, device) pair cannot have two verdicts

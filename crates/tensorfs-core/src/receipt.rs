@@ -4,15 +4,12 @@
 //! by exact snapshot, build, device and generation — and by nothing that enters content
 //! identity. A silent fallback is the defect; a slow path that announces itself is fine.
 //!
-//! These are OBSERVABILITY documents. They are canonical so a consumer can diff them, and
-//! they are deliberately not admitted to the CAS: nothing references them, they carry a
-//! device and a build, and a snapshot's identity must not move because a symlink fell back
-//! to a copy.
+//! These are OBSERVABILITY records, not canonical documents (proto-007): one process emits
+//! them to its caller and nothing stores, digests, or re-reads them. They are deliberately
+//! not admitted to the CAS: nothing references them, they carry a device and a build, and a
+//! snapshot's identity must not move because a symlink fell back to a copy.
 
-use crate::canon::{Fields, Value};
-use crate::err::Result;
-use crate::ids::{check_format, Doc};
-use crate::limits;
+use crate::canon::{self, Value};
 
 /// The closed set of degradations, ENFORCED by the decoder below. A new one is a code change
 /// here, which is the point: "some other fallback happened" is not a receipt.
@@ -61,49 +58,21 @@ impl Receipt {
     }
 }
 
-impl Doc for Receipt {
-    const FORMAT: &'static str = "tensorfs.operation_receipt/1";
-    const MAX_BYTES: usize = limits::SPEC_MAX_BYTES;
-
-    fn from_value(v: &Value) -> Result<Self> {
-        let mut f = Fields::new("Receipt", v)?;
-        let build = f.req_str("build")?.to_string();
-        let degraded = f.req_str("degraded")?.to_string();
-        let detail = f.req_str("detail")?.to_string();
-        let device = f.req_str("device")?.to_string();
-        check_format("Receipt", f.req_str("format")?, Self::FORMAT)?;
-        let generation = f.req_uint("generation")?;
-        let op = f.req_str("op")?.to_string();
-        let snapshot = f.req_str("snapshot")?.to_string();
-        f.done()?;
-        if !KINDS.contains(&degraded.as_str()) {
-            return crate::err::refuse(
-                crate::err::Code::UNKNOWN_FIELD,
-                format!("degraded kind {degraded:?} is outside the closed set {KINDS:?}"),
-            );
-        }
-        Ok(Receipt {
-            op,
-            degraded,
-            snapshot,
-            build,
-            device,
-            generation,
-            detail,
-        })
-    }
-
-    fn to_value(&self) -> Value {
+impl Receipt {
+    pub fn to_value(&self) -> Value {
+        debug_assert!(KINDS.contains(&self.degraded.as_str()));
         Value::obj(vec![
             ("build", Value::str(self.build.clone())),
             ("degraded", Value::str(self.degraded.clone())),
             ("detail", Value::str(self.detail.clone())),
             ("device", Value::str(self.device.clone())),
-            ("format", Value::str(Self::FORMAT)),
             ("generation", Value::uint(self.generation)),
             ("op", Value::str(self.op.clone())),
             ("snapshot", Value::str(self.snapshot.clone())),
         ])
+    }
+    pub fn canonical_bytes(&self) -> Vec<u8> {
+        canon::write(&self.to_value())
     }
 }
 

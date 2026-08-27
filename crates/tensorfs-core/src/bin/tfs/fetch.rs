@@ -43,9 +43,9 @@ macro_rules! read {
     };
 }
 
-fn emit<D: Doc>(d: &D, flags: &Flags) {
+fn emit_bytes(bytes: &[u8], flags: &Flags) {
     if let Some(p) = flag(flags, "out") {
-        if let Err(e) = fs::write(p, d.canonical_bytes()) {
+        if let Err(e) = fs::write(p, bytes) {
             eprintln!("REFUSED IO_FAILED: write {p}: {e}");
         }
     }
@@ -70,8 +70,8 @@ pub fn cmd_plan(root: &Path, declared_p: &Path, session: &str, flags: &Flags) ->
         &closure.snapshot,
         &closure.objects
     ));
-    emit(&plan, flags);
-    println!("plan         {}", plan.object_id());
+    emit_bytes(&plan.canonical_bytes(), flags);
+    println!("plan         {}", tensorfs_core::ids::object_id(&plan.canonical_bytes()));
     println!("session      {}", plan.session);
     println!("snapshot     {}", plan.snapshot.id());
     println!(

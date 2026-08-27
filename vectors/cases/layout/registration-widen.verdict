@@ -1,4 +1,0 @@
-doc: conversion_registration
-expect: ok
-id: sha256:0bfc69e2605401eb934a89b3b8bd0baa5c583589839aeb631bdcf6e7b29f4229
-note: bf16->f32, round trip run over the COMPLETE 16-bit domain

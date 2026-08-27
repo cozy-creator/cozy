@@ -125,24 +125,32 @@ CODEC_OWNERS = {
     "tensorfs.encoding_spec/1": {"crates/tensorfs-core/src/spec.rs"},
     "tensorfs.encoding_vectors/1": {"crates/tensorfs-core/src/vectors.rs"},
     "tensorfs.meta/1": {"crates/tensorfs-core/src/meta.rs"},
-    "tensorfs.operation_receipt/1": {"crates/tensorfs-core/src/receipt.rs"},
-    # the layout plane (tfs-009)
+    "tensorfs.store/1": {"crates/tensorfs-core/src/store.rs"},
+    "tensorfs.verification/1": {"crates/tensorfs-core/src/store.rs"},
+    "tensorfs.structure_fixture/1": {"crates/tensorfs-core/src/structure.rs"},
+    # the ingest border (tfs-003): every document is a CAS object or a transaction root
+    "tensorfs.ingest_profile/1": {"crates/tensorfs-core/src/ingest/mod.rs"},
+    "tensorfs.ingest_subject/1": {"crates/tensorfs-core/src/ingest/mod.rs"},
+    "tensorfs.ingest_receipt/1": {"crates/tensorfs-core/src/ingest/mod.rs"},
+    "tensorfs.ingest_root/1": {"crates/tensorfs-core/src/ingest/transaction.rs"},
+    "tensorfs.fingerprint_registry/1": {"crates/tensorfs-core/src/ingest/fingerprint.rs"},
     "tensorfs.stamp/1": {"crates/tensorfs-core/src/ingest/stamp.rs"},
+    # the layout plane (tfs-009)
     "cozytensors.code_topology/1": {"crates/tensorfs-core/src/compat.rs"},
     "tensorfs.compatibility_report/1": {"crates/tensorfs-core/src/compat.rs"},
-    "tensorfs.conversion_registration/1": {"crates/tensorfs-core/src/grade.rs"},
-    "tensorfs.grade_decision/1": {"crates/tensorfs-core/src/grade.rs"},
     "tensorfs.verify_request/1": {"crates/tensorfs-core/src/verifier.rs"},
     "tensorfs.verify_response/1": {"crates/tensorfs-core/src/verifier.rs"},
-    # the cloud publish protocol (tfs-017)
+    # the cloud publish protocol (tfs-017); the upload set's draft is authored by tensorhub
     "tensorfs.publish_closure/1": {"crates/tensorfs-core/src/cloud.rs"},
+    "tensorfs.artifact_upload_set/1": {"crates/tensorfs-core/src/cloud.rs"},
     "tensorfs.publish_grant/1": {"crates/tensorfs-core/src/cloud.rs"},
     "tensorfs.verified_object/1": {"crates/tensorfs-core/src/cloud.rs"},
     "tensorfs.catalog_root/1": {"crates/tensorfs-core/src/cloud.rs"},
-    # the pull plane (tfs-003 row 220) — the same rule in the other direction
-    "tensorfs.fetch_plan/1": {"crates/tensorfs-core/src/fetch.rs"},
-    "tensorfs.delivery_grant/1": {"crates/tensorfs-core/src/fetch.rs"},
 }
+# proto-007: a format name exists ONLY for a document that crosses a repo/process boundary
+# AND is stored or digested. The dict above IS the registry; a `const FORMAT` the crate
+# declares that is not a key here is a new kind without its decision row (#616.a).
+DOC_FORMAT_DECL = re.compile(r'const FORMAT: &\'static str = "([^"]+)"')
 CODEC_MARKS = list(CODEC_OWNERS)
 GRAMMAR_TAGS = ["ceil_block", "elements_div", "ceil_div"]
 # Foreign containers belong to tfs-003's isolated ingest border, nowhere else. Matched
@@ -250,6 +258,18 @@ def fence_one_codec():
         # else it does or does not define.
         inside = r.startswith("crates/") and p.suffix == ".rs"
         implements = "impl Doc for" in text
+        if inside:
+            for i, line in enumerate(text.splitlines(), 1):
+                m = DOC_FORMAT_DECL.search(line)
+                if not m:
+                    continue
+                if m.group(1) not in CODEC_OWNERS:
+                    bad.append(f"{r}:{i}: declares format '{m.group(1)}' that is not in the "
+                               "registry (CODEC_OWNERS) — a new document kind needs a decision "
+                               "row (#616.a) and a boundary + storage/digest party (proto-007)")
+                elif r not in CODEC_OWNERS[m.group(1)] and r != "crates/tensorfs-core/src/ids.rs":
+                    bad.append(f"{r}:{i}: declares format '{m.group(1)}' owned by "
+                               f"{sorted(CODEC_OWNERS[m.group(1)])}")
         for m, owners in CODEC_OWNERS.items():
             if m not in text or r in owners:
                 continue

@@ -22,11 +22,11 @@
 //! INCOMPATIBLE is forbidden over-constraint. `guard_over_constraint` is that law with an
 //! exit code.
 
-use crate::canon::{as_arr, as_str, Fields, Value};
+use crate::canon::{self, as_arr, as_str, Fields, Value};
 use crate::compat::{CompatibilityReport, Satisfaction};
 use crate::dtype::Dtype;
 use crate::err::{refuse, Code, Result};
-use crate::ids::{check_format, prefixed, Doc, ObjectRef};
+use crate::ids::{prefixed, ObjectRef};
 use crate::limits;
 
 // ---------------------------------------------------------------- lossless mappings
@@ -423,17 +423,16 @@ impl ConversionRegistration {
     }
 }
 
-impl Doc for ConversionRegistration {
-    const FORMAT: &'static str = "tensorfs.conversion_registration/1";
-    const MAX_BYTES: usize = limits::SPEC_MAX_BYTES;
+impl ConversionRegistration {
+    pub fn parse(bytes: &[u8]) -> Result<Self> {
+        Self::from_value(&canon::parse_canonical(bytes, limits::SPEC_MAX_BYTES)?)
+    }
+    pub fn canonical_bytes(&self) -> Vec<u8> {
+        canon::write(&self.to_value())
+    }
 
-    fn from_value(v: &Value) -> Result<Self> {
+    pub fn from_value(v: &Value) -> Result<Self> {
         let mut f = Fields::new("ConversionRegistration", v)?;
-        check_format(
-            "ConversionRegistration",
-            as_str("ConversionRegistration", "format", f.req("format")?)?,
-            Self::FORMAT,
-        )?;
         let mapping = Mapping::from_value(f.req("mapping")?)?;
         let name = f.req_str("name")?.to_string();
         let registered_by = prefixed_build(f.req_str("registered_by")?)?;
@@ -473,9 +472,8 @@ impl Doc for ConversionRegistration {
         })
     }
 
-    fn to_value(&self) -> Value {
+    pub fn to_value(&self) -> Value {
         Value::obj(vec![
-            ("format", Value::str(Self::FORMAT)),
             ("mapping", self.mapping.to_value()),
             ("name", Value::str(self.name.clone())),
             ("registered_by", Value::str(self.registered_by.clone())),
@@ -777,17 +775,16 @@ pub struct GradeDecision {
     pub grade: Grade,
 }
 
-impl Doc for GradeDecision {
-    const FORMAT: &'static str = "tensorfs.grade_decision/1";
-    const MAX_BYTES: usize = limits::SPEC_MAX_BYTES;
+impl GradeDecision {
+    pub fn parse(bytes: &[u8]) -> Result<Self> {
+        Self::from_value(&canon::parse_canonical(bytes, limits::SPEC_MAX_BYTES)?)
+    }
+    pub fn canonical_bytes(&self) -> Vec<u8> {
+        canon::write(&self.to_value())
+    }
 
-    fn from_value(v: &Value) -> Result<Self> {
+    pub fn from_value(v: &Value) -> Result<Self> {
         let mut f = Fields::new("GradeDecision", v)?;
-        check_format(
-            "GradeDecision",
-            as_str("GradeDecision", "format", f.req("format")?)?,
-            Self::FORMAT,
-        )?;
         let mut gf = Fields::new("grade", f.req("grade")?)?;
         let t = as_str("grade", "t", gf.req("t")?)?.to_string();
         let grade = match t.as_str() {
@@ -816,7 +813,7 @@ impl Doc for GradeDecision {
         Ok(GradeDecision { report, grade })
     }
 
-    fn to_value(&self) -> Value {
+    pub fn to_value(&self) -> Value {
         let g = match &self.grade {
             Grade::Compatible => Value::obj(vec![("t", Value::str("COMPATIBLE"))]),
             Grade::Convertible {
@@ -838,7 +835,6 @@ impl Doc for GradeDecision {
             ]),
         };
         Value::obj(vec![
-            ("format", Value::str(Self::FORMAT)),
             ("grade", g),
             ("report", Value::str(self.report.clone())),
         ])

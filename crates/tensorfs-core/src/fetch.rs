@@ -23,9 +23,9 @@
 //! rehash are QUARANTINED by `verify` and then land in `wanted`, which is why a corrupted
 //! local object heals on the next pull instead of being skipped as "already present".
 
-use crate::canon::{as_arr, as_str, Fields, Value};
+use crate::canon::{self, as_arr, Fields, Value};
 use crate::err::{refuse, Code, Result};
-use crate::ids::{ascii_name, check_format, hex64, Doc, ObjectRef};
+use crate::ids::{ascii_name, hex64, ObjectRef};
 use crate::limits;
 use crate::store::{Store, Verdict};
 use std::io::Read;
@@ -195,17 +195,16 @@ fn presence(store: &Store, o: &ObjectRef) -> Result<Presence> {
     }
 }
 
-impl Doc for FetchPlan {
-    const FORMAT: &'static str = "tensorfs.fetch_plan/1";
-    const MAX_BYTES: usize = limits::DOC_MAX_BYTES;
+impl FetchPlan {
+    pub fn parse(bytes: &[u8]) -> Result<Self> {
+        Self::from_value(&canon::parse_canonical(bytes, limits::DOC_MAX_BYTES)?)
+    }
+    pub fn canonical_bytes(&self) -> Vec<u8> {
+        canon::write(&self.to_value())
+    }
 
-    fn from_value(v: &Value) -> Result<Self> {
+    pub fn from_value(v: &Value) -> Result<Self> {
         let mut f = Fields::new("FetchPlan", v)?;
-        check_format(
-            "FetchPlan",
-            as_str("FetchPlan", "format", f.req("format")?)?,
-            Self::FORMAT,
-        )?;
         let mut held = Vec::new();
         for o in as_arr("FetchPlan", "held", f.req("held")?)? {
             held.push(ObjectRef::from_value("FetchPlan.held", o)?);
@@ -241,9 +240,8 @@ impl Doc for FetchPlan {
         })
     }
 
-    fn to_value(&self) -> Value {
+    pub fn to_value(&self) -> Value {
         Value::obj(vec![
-            ("format", Value::str(Self::FORMAT)),
             (
                 "held",
                 Value::arr(self.held.iter().map(|o| o.to_value()).collect()),
@@ -341,17 +339,16 @@ pub struct Admitted {
     pub first_writer: bool,
 }
 
-impl Doc for DeliveryGrant {
-    const FORMAT: &'static str = "tensorfs.delivery_grant/1";
-    const MAX_BYTES: usize = limits::SPEC_MAX_BYTES;
+impl DeliveryGrant {
+    pub fn parse(bytes: &[u8]) -> Result<Self> {
+        Self::from_value(&canon::parse_canonical(bytes, limits::SPEC_MAX_BYTES)?)
+    }
+    pub fn canonical_bytes(&self) -> Vec<u8> {
+        canon::write(&self.to_value())
+    }
 
-    fn from_value(v: &Value) -> Result<Self> {
+    pub fn from_value(v: &Value) -> Result<Self> {
         let mut f = Fields::new("DeliveryGrant", v)?;
-        check_format(
-            "DeliveryGrant",
-            as_str("DeliveryGrant", "format", f.req("format")?)?,
-            Self::FORMAT,
-        )?;
         let object = ObjectRef::from_value("DeliveryGrant.object", f.req("object")?)?;
         let session = f.req_str("session")?.to_string();
         f.done()?;
@@ -359,11 +356,10 @@ impl Doc for DeliveryGrant {
         Ok(DeliveryGrant { session, object })
     }
 
-    fn to_value(&self) -> Value {
+    pub fn to_value(&self) -> Value {
         // `key` is deliberately ABSENT for the same reason `PublishGrant` omits it: a
         // derivable fact stored beside its source is a second authority waiting to disagree.
         Value::obj(vec![
-            ("format", Value::str(Self::FORMAT)),
             ("object", self.object.to_value()),
             ("session", Value::str(self.session.clone())),
         ])

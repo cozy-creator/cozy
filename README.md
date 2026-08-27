@@ -276,6 +276,16 @@ reverses did not fail because someone forgot a flag; it failed because a flag ex
 
 Verdicts and arms are frozen under `vectors/qualification/`.
 
+## document kinds (proto-007)
+
+A format name (`tensorfs.<kind>/1`) exists only for a document that crosses a repo or process
+boundary AND is stored or digested; everything else is a plain struct with no format string and
+no version. The registry is `CODEC_OWNERS` in `scripts/fence.py` (24 marks, one owning module
+each); the fence refuses a `const FORMAT` the crate declares outside it. Demoted 2026-08-27:
+`operation_receipt` (stdout only), `capability_records` (compiled-in), `fetch_plan` +
+`delivery_grant` (one pull session's scratch), `grade_decision` + `conversion_registration`
+(verifier-internal). Kept by caution: the ingest quartet (their refs are snapshot evidence).
+
 ## the Python facade (tfs-007)
 
 One wheel, abi3-py311, `py.typed`. The compiled half owns every byte-level fact; the Python

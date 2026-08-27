@@ -5,7 +5,6 @@
 //! would be a place for the two languages to disagree about which reader a vector names.
 //! There is exactly one reader per document either way; this says which one.
 
-use crate::capability::CapabilityRecords;
 use crate::err::{refuse, Code, Refusal, Result};
 use crate::header::{Closure, Header};
 use crate::ids::Doc;
@@ -14,7 +13,6 @@ use crate::ingest::transaction::IngestRoot;
 use crate::ingest::{IngestProfile, IngestSubject, IngestVerificationReceipt};
 use crate::manifest::SnapshotManifest;
 use crate::meta::State;
-use crate::receipt::Receipt;
 use crate::registry;
 use crate::spec::EncodingSpec;
 use crate::structure::StructureFixture;
@@ -36,7 +34,6 @@ pub const DOC_KINDS: &[&str] = &[
     "spec",
     "vectors",
     "structure",
-    "capability",
     "manifest",
     "profile",
     "subject",
@@ -45,10 +42,8 @@ pub const DOC_KINDS: &[&str] = &[
     "receipt",
     "stamp",
     "meta",
-    "operation_receipt",
     "code_topology",
     "compat_report",
-    "conversion_registration",
 ];
 
 pub fn run_doc(
@@ -82,7 +77,6 @@ pub fn run_doc(
         // A structure fixture's banked key is its topology_digest, so that is what the
         // corpus freezes: a fixture whose projection drifts announces itself here.
         "structure" => StructureFixture::parse(bytes).map(|f| (Some(f.topology_digest()), None))?,
-        "capability" => CapabilityRecords::parse(bytes).map(|_| (None, None))?,
         // A decode IS the path law now: `SnapshotManifest` cannot exist unvalidated, so
         // parsing is the whole check and there is no second validate() to forget.
         "manifest" => SnapshotManifest::parse(bytes).map(|m| (None, m.checkpoint_id().ok()))?,
@@ -96,7 +90,6 @@ pub fn run_doc(
         "receipt" => IngestVerificationReceipt::parse(bytes).map(|_| (None, None))?,
         "stamp" => crate::ingest::stamp::Stamp::parse(bytes).map(|_| (None, None))?,
         "meta" => State::parse(bytes).map(|_| (None, None))?,
-        "operation_receipt" => Receipt::parse(bytes).map(|_| (None, None))?,
         // The layout plane's documents (tfs-009). A code topology projects to the SAME
         // frozen projection a header does, so its digest is reported here too.
         "code_topology" => {
@@ -104,18 +97,6 @@ pub fn run_doc(
         }
         "compat_report" => {
             crate::compat::CompatibilityReport::parse(bytes).map(|_| (None, None))?
-        }
-        #[cfg(feature = "grade")]
-        "conversion_registration" => {
-            crate::grade::ConversionRegistration::parse(bytes).map(|_| (None, None))?
-        }
-        #[cfg(not(feature = "grade"))]
-        "conversion_registration" => {
-            return refuse(
-                Code::UNKNOWN_FORMAT,
-                "conversion_registration is a hub-side grading document; this build carries \
-                 no grading vocabulary (the `grade` feature is off in the worker wheel)",
-            )
         }
         other => {
             return refuse(
