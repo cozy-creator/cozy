@@ -13,10 +13,8 @@ jobs:
       # what keeps a C dependency from arriving unnoticed and silently ending the
       # cross-compiles cl-013's `release` job depends on.
       - run: CGO_ENABLED=0 go build ./...
-      # Tests are an executed gate, not an implication of build/vet. The targeted race
-      # arm includes the filesystem-writing worker versus HTTP media quota regression.
-      - run: go test ./...
-      - run: go test -race ./cmd/cozy-media ./integration ./internal/api ./internal/app ./internal/inputasset ./internal/orchestrator ./internal/records ./internal/video ./internal/workflow
+      # No automated tests (tracker decisions.md #160): test files are banned.
+      - run: if [ -n "$(find . -name '*_test.go' -not -path './.git/*')" ]; then echo 'test files are banned (decisions #160)'; exit 1; fi
       - run: go vet ./...
       - run: python3 scripts/fence.py
 
