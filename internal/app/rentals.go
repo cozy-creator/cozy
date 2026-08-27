@@ -307,13 +307,22 @@ func detailOr(detail string) string {
 	return detail
 }
 
-// missingOf names the first piece a `ready` rental did not carry. The credential is not
-// among them: this host minted it and the hub could not have carried it.
+// missingOf names the first piece a `ready` rental did not carry. The hub never carries
+// the credential, but it must carry the pod's observed HASH set so this host can compare.
 func missingOf(r hub.Rental) string {
 	if r.Address == "" {
-		return "address"
+		return "worker address"
 	}
-	return "certificate to pin"
+	if r.MediaAddress == "" {
+		return "media address"
+	}
+	if r.CertPEM == "" {
+		return "certificate to pin"
+	}
+	if len(r.TokenSHA256) == 0 {
+		return "observed renter-token hash set"
+	}
+	return "complete ready projection"
 }
 
 func handleRentLs(ctx *Context) *exit.Error {

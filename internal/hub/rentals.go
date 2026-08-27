@@ -29,7 +29,7 @@ import (
 //	POST   /v1/private-rentals       {endpoint_ref, accelerator_model,
 //	                                 renter_token_sha256:[<64 hex>]}
 //	                                 -> 202 {rental_id, state, ...}
-//	GET    /v1/private-rentals/{id}  -> {state, address, cert_pem, media_address,
+//	GET    /v1/private-rentals/{id}  -> {state, worker_address, cert_pem, media_address,
 //	                                     detail, renter_token_sha256:[...]}
 //	DELETE /v1/private-rentals/{id}  -> 204
 //
@@ -67,10 +67,12 @@ type Rental struct {
 	TokenSHA256 []string
 }
 
-// Ready answers whether this rental carries a usable dial pair. The credential is not
-// checked here because it is not the hub's: it never left this host.
+// Ready answers whether this rental carries the whole dial triple and an observed
+// credential set. The caller still checks that set contains ITS token hash; Ready only
+// prevents a partial ready projection from being mistaken for a usable pod.
 func (r Rental) Ready() bool {
-	return r.State == RentalReady && r.Address != "" && r.CertPEM != ""
+	return r.State == RentalReady && r.Address != "" && r.MediaAddress != "" &&
+		r.CertPEM != "" && len(r.TokenSHA256) > 0
 }
 
 // HoldsHash answers whether the hub's live set carries this hash — the renter's own
@@ -90,13 +92,13 @@ func (r Rental) HoldsHash(hash string) bool {
 
 // wireRental is the answer's own shape.
 type wireRental struct {
-	ID           string   `json:"rental_id"`
-	State        string   `json:"state"`
-	Address      string   `json:"address"`
-	CertPEM      string   `json:"cert_pem"`
-	Detail       string   `json:"detail"`
-	MediaAddress string   `json:"media_address"`
-	TokenSHA256  []string `json:"renter_token_sha256"`
+	ID            string   `json:"rental_id"`
+	State         string   `json:"state"`
+	WorkerAddress string   `json:"worker_address"`
+	CertPEM       string   `json:"cert_pem"`
+	Detail        string   `json:"detail"`
+	MediaAddress  string   `json:"media_address"`
+	TokenSHA256   []string `json:"renter_token_sha256"`
 }
 
 var bareSHA256Pattern = regexp.MustCompile(`^[0-9a-f]{64}$`)
@@ -115,7 +117,7 @@ func (w wireRental) rental(id string) Rental {
 		id = w.ID
 	}
 	return Rental{
-		ID: id, State: w.State, Address: w.Address, CertPEM: w.CertPEM,
+		ID: id, State: w.State, Address: w.WorkerAddress, CertPEM: w.CertPEM,
 		Detail: w.Detail, MediaAddress: w.MediaAddress,
 		TokenSHA256: w.TokenSHA256,
 	}

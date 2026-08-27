@@ -9,8 +9,11 @@
 // discipline: this binary imports no protocol client and, by fence, contains no outbound
 // network call of any kind. It joins the liability fence by HAVING NOTHING TO EGRESS WITH.
 //
-// Five routes, and the shape of each is the whole design:
+// Six routes, and the shape of each is the whole design:
 //
+//	GET  /v1/bootstrap/receipt    Tensorhub reads one attempt-bound, pod-authored readiness
+//	                              envelope. Its HMAC is verified by Tensorhub before the TLS
+//	                              peer is trusted; the response is the exact file bytes.
 //	PUT  /v1/inputs/{blob}        the owner uploads one attempt input; the answer is the
 //	                              POD-LOCAL PATH it landed at, which is what the owner then
 //	                              mints into the DeliveryGrant. The owner never guesses a
@@ -29,11 +32,13 @@
 //	DELETE /v1/attempts/{slot}    after rollback, or after mirror plus outcome ack, the
 //	                              owner drops exactly that attempt's inputs and outputs.
 //
-// AUTH is a bearer against a TOKEN-HASH FILE, stat-per-request and fail-closed: the file is
-// re-read whenever its (size, mtime) changes, an unreadable or empty file authenticates
-// NOBODY, and this process never holds the token — only its digest. The epoch never moves
-// backward: a replacement whose mtime predates what is loaded is refused rather than
-// applied, so a restored backup cannot reinstate a retired credential.
+// Every RENTER route authenticates a bearer against a TOKEN-HASH FILE, stat-per-request
+// and fail-closed: the file is re-read whenever its (size, mtime) changes, an unreadable or
+// empty file authenticates NOBODY, and this process never holds the token — only its
+// digest. The epoch never moves backward: a replacement whose mtime predates what is
+// loaded is refused rather than applied, so a restored backup cannot reinstate a retired
+// credential. The bootstrap envelope contains no capability; Tensorhub authenticates its
+// exact bytes with the attempt HMAC before trusting the TLS peer that served them.
 //
 // The SUBTREE IS QUOTA-BOUNDED and it is not the worker's root: uploads can never ENOSPC
 // the journal. The worker writes outputs through the shared filesystem, so this process
@@ -68,15 +73,16 @@ func main() {
 // options is the whole launch surface. Everything is a path grant or a bound; nothing is
 // discovered, nothing is read from the environment, and there is no configuration file.
 type options struct {
-	listen  string
-	root    string // the quota-bounded subtree this server OWNS
-	plans   string // the worker's `binding-plans` directory — write-only, from here
-	tokens  string // the token-hash file, `sha256:<64 hex>` one per line
-	out     string // where `media.addr` is published (the file-handoff discovery contract)
-	cert    string
-	key     string
-	quota   int64
-	maxBody int64
+	listen           string
+	root             string // the quota-bounded subtree this server OWNS
+	plans            string // the worker's `binding-plans` directory — write-only, from here
+	tokens           string // the token-hash file, `sha256:<64 hex>` one per line
+	out              string // where `media.addr` is published (the file-handoff discovery contract)
+	cert             string
+	key              string
+	bootstrapReceipt string // exact pod-authored JSON; may appear after the listener starts
+	quota            int64
+	maxBody          int64
 }
 
 func run(args []string) int {
@@ -102,6 +108,8 @@ func run(args []string) int {
 			opt.cert = value
 		case "tls-key":
 			opt.key = value
+		case "bootstrap-receipt":
+			opt.bootstrapReceipt = value
 		case "quota":
 			n, err := strconv.ParseInt(value, 10, 64)
 			if err != nil || n <= 0 {
@@ -246,6 +254,34 @@ func (s *server) admits(w http.ResponseWriter, r *http.Request) bool {
 		"the presented credential is not one this pod was provisioned with",
 		"`cozy rent ls` renders the digest of the token this host holds")
 	return false
+}
+
+const maxBootstrapReceiptBytes = 64 << 10
+
+// bootstrapReceipt is Tensorhub's one read-only rendezvous with a pod it bought. The
+// envelope carries an attempt HMAC that Tensorhub verifies over exact payload bytes before
+// it trusts the TLS peer. cozy-media owns neither that schema nor its key: it serves the
+// atomically published bytes and nothing else. Until the file appears, readiness is early.
+func (s *server) bootstrapReceipt(w http.ResponseWriter, r *http.Request) {
+	file, err := os.Open(s.opt.bootstrapReceipt)
+	if err != nil {
+		refuse(w, http.StatusTooEarly, "media.bootstrap_pending",
+			"the pod has not published its readiness receipt: "+err.Error(),
+			"wait for endpoint materialization and both pod listeners")
+		return
+	}
+	defer file.Close()
+	data, err := io.ReadAll(io.LimitReader(file, maxBootstrapReceiptBytes+1))
+	if err != nil || len(data) == 0 || len(data) > maxBootstrapReceiptBytes || !json.Valid(data) {
+		refuse(w, http.StatusServiceUnavailable, "media.bootstrap_receipt_invalid",
+			"the pod's readiness receipt is unreadable, empty, oversized, or not JSON",
+			"publish one complete receipt by atomic rename after endpoint materialization")
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("Content-Length", strconv.Itoa(len(data)))
+	w.WriteHeader(http.StatusOK)
+	_, _ = w.Write(data)
 }
 
 // safeName is the only shape a caller-supplied path segment may take. An output id is a
@@ -641,6 +677,9 @@ func (s *server) health(w http.ResponseWriter, r *http.Request) {
 
 func (s *server) routes() *http.ServeMux {
 	mux := http.NewServeMux()
+	if s.opt.bootstrapReceipt != "" {
+		mux.HandleFunc("GET /v1/bootstrap/receipt", s.bootstrapReceipt)
+	}
 	mux.HandleFunc("GET /v1/health", s.health)
 	mux.HandleFunc("PUT /v1/inputs/{blob}", s.putInput)
 	mux.HandleFunc("PUT /v1/plans/{id}", s.putPlan)
@@ -670,6 +709,7 @@ func usage(format string, args ...any) int {
 	fmt.Fprintf(os.Stderr, "cozy-media: "+format+"\n", args...)
 	fmt.Fprintln(os.Stderr, "usage: cozy-media --listen <host:port> --root <dir> "+
 		"--tokens <file> [--plans <dir>] [--out <dir>] [--tls-cert <pem> --tls-key <pem>] "+
+		"[--bootstrap-receipt <json>] "+
 		"[--quota <bytes>] [--max-body <bytes>]")
 	return 2
 }
