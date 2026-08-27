@@ -764,7 +764,7 @@ func (s *server) health(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	answer(w, http.StatusOK, map[string]any{
-		"media": "cozy.media/1", "root": s.opt.root,
+		"service": "cozy-media", "root": s.opt.root,
 		"used_bytes": s.used(), "quota_bytes": s.opt.quota, "max_object_bytes": s.opt.maxBody,
 		"plans": s.opt.plans != "",
 	})

@@ -353,7 +353,7 @@ func sectionRent() {
 		itoa(status)+" "+firstLine(said))
 	status, said = mediaCall(root, rentalA, http.MethodGet, "/v1/health", minted, nil)
 	check("the rental's OWN token is admitted, and the server says what it holds",
-		status == 200 && strings.Contains(said, "cozy.media/1"),
+		status == 200 && strings.Contains(said, "cozy-media"),
 		itoa(status)+" "+firstLine(said))
 	status, said = mediaCall(root, rentalA, http.MethodGet,
 		"/v1/outputs/"+media.Slot("req-nope", 1)+"/..%2f..%2fpod-worker.log", minted, nil)
@@ -381,7 +381,7 @@ func sectionRent() {
 		deadPID > 0 && !alivePID(deadPID), "pid "+itoa(deadPID))
 	status, said = mediaCall(root, rentalA, http.MethodGet, "/v1/health", minted, nil)
 	check("the media service stays healthy without a request-path call to the worker",
-		status == 200 && strings.Contains(said, "cozy.media/1"),
+		status == 200 && strings.Contains(said, "cozy-media"),
 		itoa(status)+" "+firstLine(said))
 	status, said = mediaCall(root, rentalA, http.MethodGet,
 		"/v1/outputs/"+attemptSlot+"/image", minted, nil)

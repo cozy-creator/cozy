@@ -329,6 +329,52 @@ def files():
                 yield p
 
 
+DOCUMENT_KINDS = {
+    # proto-007 (#616.a): the document kinds this repo AUTHORS, each with the one file that
+    # declares it. A format name exists only for a document that crosses a repo/process
+    # boundary AND is stored or digested. A literal outside this table is a new kind without
+    # its decision row; a literal in a second file is a second declaration.
+    "cozy.client.JobSubmission/1": "internal/api/jobs.go",
+    "cozy.client.Submission/1": "internal/api/requests.go",
+    "cozy.jobs.StructuralCensus/1": "cmd/cozy-live/joblive.go",
+    "cozy.local.EntrypointBindingRecord/2": "internal/plan/plan.go",
+    "cozy.local.EvaluatedConfig/1": "internal/app/identity.go",
+    "cozy.local.ExecutionEnvironment/1": "internal/app/identity.go",
+    "cozy.video/1": "internal/video/source.go",
+    "cozy.video.CreativePlan/1": "internal/video/composition.go",
+    "cozy.workflow.ChildIdentity/1": "internal/workflow/materialize.go",
+    "cozy.workflow.ExecutionIdentity/1": "internal/workflow/engine.go",
+    "cozy.workflow.MaterializedSubmission/1": "internal/workflow/materialize.go",
+    "cozy.workflow.Plan/1": "internal/workflow/plan.go",
+}
+# Kinds another repo authors and this one only reads: the owner's fence polices the name.
+FOREIGN_KIND_PREFIXES = ("cozy.worker.v1.", "cozy.endpoint.", "cozy.runtime.", "tensorhub.",
+                         "tensorfs.", "cozytensors")
+KIND_READERS = {"cozy.workflow.Plan/1": {"cmd/cozy-live/workflows.go"}}
+KIND_LITERAL = re.compile(r'"((?:cozy|cozytensors|tensorhub|tensorfs)\.[A-Za-z0-9_.-]+/\d+)"')
+
+
+def check_document_kinds():
+    bad = []
+    for p in files():
+        if p.suffix != ".go":
+            continue
+        rel = p.as_posix()
+        for i, line in enumerate(p.read_text(errors="ignore").splitlines(), 1):
+            for kind in KIND_LITERAL.findall(line):
+                if kind.startswith(FOREIGN_KIND_PREFIXES):
+                    continue
+                owner = DOCUMENT_KINDS.get(kind)
+                if owner is None:
+                    bad.append(f"{rel}:{i}: [kinds] names '{kind}', a document kind outside "
+                               "DOCUMENT_KINDS — a new kind needs a decision row (#616.a) and a "
+                               "boundary + storage/digest party (proto-007)")
+                elif rel != owner and rel not in KIND_READERS.get(kind, set()):
+                    bad.append(f"{rel}:{i}: [kinds] names '{kind}', declared in {owner} — a "
+                               "second declaration of one kind")
+    return bad
+
+
 def check_sources():
     bad = []
     for p in files():
@@ -577,7 +623,7 @@ def check_contract():
 
 
 violations = (check_sources() + check_matrix() + check_manifest() + check_secret_flags()
-              + check_contract() + check_embedded() + check_scripts())
+              + check_contract() + check_embedded() + check_scripts() + check_document_kinds())
 if violations:
     print("FENCE RED (boundaries.md):", file=sys.stderr)
     for v in violations:
