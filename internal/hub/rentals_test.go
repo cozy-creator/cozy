@@ -2,7 +2,13 @@ package hub
 
 import (
 	"bytes"
+	"encoding/json"
+	"net/http"
+	"net/http/httptest"
+	"strings"
 	"testing"
+
+	"github.com/cozy-creator/cozy-creator-v2/internal/secret"
 )
 
 func TestRentalRequestBytesAreProviderNeutralAndStable(t *testing.T) {
@@ -22,6 +28,23 @@ func TestRentalRequestBytesAreProviderNeutralAndStable(t *testing.T) {
 		if bytes.Contains(got, forbidden) {
 			t.Fatalf("provider placement field %s leaked into %s", forbidden, got)
 		}
+	}
+}
+
+func TestRentalViewCarriesABoundedControlSnapshotBeyondTheCatalogCap(t *testing.T) {
+	want := bytes.Repeat([]byte{'x'}, maxBody+1)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_ = json.NewEncoder(w).Encode(wireRental{ID: "rnt-control", State: RentalReady,
+			WorkerAddress: "pod.invalid:443", MediaAddress: "pod.invalid:444", CertPEM: "cert",
+			TokenSHA256: []string{strings.Repeat("a", 64)}, ControlSnapshot: &ExactControlDocument{
+				CanonicalBytes: want, Digest: "sha256:" + strings.Repeat("b", 64), Length: int64(len(want)),
+			}})
+	}))
+	defer server.Close()
+	c := &Client{base: server.URL, token: secret.New("admin"), http: server.Client()}
+	got, e := c.Rental(t.Context(), "rnt-control")
+	if e != nil || got.ControlSnapshot == nil || !bytes.Equal(got.ControlSnapshot.CanonicalBytes, want) {
+		t.Fatalf("large rental control view = %#v, %v", got.ControlSnapshot, e)
 	}
 }
 

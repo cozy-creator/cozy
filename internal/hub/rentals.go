@@ -118,6 +118,11 @@ type wireRental struct {
 
 var bareSHA256Pattern = regexp.MustCompile(`^[0-9a-f]{64}$`)
 
+// A persisted control snapshot is bounded to 64 MiB decoded by Tensorhub. Its
+// base64 members expand in the surrounding JSON, so the rental view gets one
+// explicit 96 MiB transport cap rather than widening every hub response.
+const maxRentalResponseBytes = 96 << 20
+
 func validateRentalID(id string) *exit.Error {
 	if !rentalid.Valid(id) {
 		return exit.Named(exit.Validation, "hub.rental_id_invalid",
@@ -183,7 +188,7 @@ func (c *Client) Rent(ctx context.Context, requestBody []byte, reason, operation
 	var out wireRental
 	e := c.do(ctx, call{
 		method: http.MethodPost, path: "/v1/private-rentals", admin: true, reason: reason,
-		idempotency: operationKey, bodyBytes: requestBody,
+		idempotency: operationKey, bodyBytes: requestBody, responseBytes: maxRentalResponseBytes,
 	}, &out)
 	if e != nil {
 		return Rental{}, e
@@ -205,7 +210,8 @@ func (c *Client) Rental(ctx context.Context, id string) (Rental, *exit.Error) {
 		return Rental{}, e
 	}
 	var out wireRental
-	e := c.do(ctx, call{method: http.MethodGet, path: "/v1/private-rentals/" + url.PathEscape(id), admin: true}, &out)
+	e := c.do(ctx, call{method: http.MethodGet, path: "/v1/private-rentals/" + url.PathEscape(id),
+		admin: true, responseBytes: maxRentalResponseBytes}, &out)
 	if e != nil {
 		return Rental{}, e
 	}

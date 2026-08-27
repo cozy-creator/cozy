@@ -115,6 +115,10 @@ type call struct {
 	// bounds it is the CONNECTION being alive, which the kernel's keepalive answers,
 	// rather than a number picked here about someone else's work.
 	byBytes bool
+	// responseBytes widens the ordinary small-JSON cap for one explicitly bounded
+	// response shape. Rental control snapshots carry base64 exact documents and
+	// therefore expand beyond their decoded-byte bound on this outer transport.
+	responseBytes int64
 	// raw takes the answer's exact bytes instead of decoding it. The snapshot
 	// manifest route answers a canonical document verbatim, and this client must
 	// carry it the same way — nothing here re-encodes one.
@@ -235,6 +239,9 @@ func (c *Client) do(ctx context.Context, cl call, out any) *exit.Error {
 	cap := int64(maxBody)
 	if cl.raw != nil {
 		cap = maxDocument
+	}
+	if cl.responseBytes > cap {
+		cap = cl.responseBytes
 	}
 	raw, err := io.ReadAll(io.LimitReader(resp.Body, cap))
 	if err != nil {
