@@ -3,8 +3,70 @@ package records
 import (
 	"database/sql"
 	"path/filepath"
+	"sync"
 	"testing"
 )
+
+func TestAdvanceRentalOperationIsMonotone(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "records.db")
+	st, e := Open(path)
+	if e != nil {
+		t.Fatal(e)
+	}
+	defer st.Close()
+	_, _, e = st.BeginRentalOperation(RentalOperation{
+		Key: "op", RequestDigest: "sha256:request", RequestBody: []byte(`{}`),
+		EndpointRef: "acme/h3/v1/generate", AcceleratorModel: "NVIDIA H200",
+		Hub: "https://hub.invalid", Reason: "test",
+	})
+	if e != nil {
+		t.Fatal(e)
+	}
+
+	// These calls may race in production. Whichever writer lands first, a later stale
+	// observation cannot move the durable operation behind attached.
+	states := []string{"provisioning", "ready", "provisioning", "attached", "ready"}
+	var wg sync.WaitGroup
+	for _, state := range states {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			if e := st.AdvanceRentalOperation("op", "rnt-one", state); e != nil {
+				t.Errorf("advance to %s: %v", state, e)
+			}
+		}()
+	}
+	wg.Wait()
+	op, e := st.RentalOperation("op")
+	if e != nil || op == nil || op.State != "attached" || op.RentalID != "rnt-one" {
+		t.Fatalf("operation after concurrent observations = %#v, %v", op, e)
+	}
+	if e := st.AdvanceRentalOperation("op", "rnt-one", "failed"); e != nil {
+		t.Fatal(e)
+	}
+	op, e = st.RentalOperation("op")
+	if e != nil || op.State != "attached" {
+		t.Fatalf("attached operation regressed = %#v, %v", op, e)
+	}
+	if e := st.AdvanceRentalOperation("op", "rnt-other", "ready"); e == nil || e.ErrName() != "rental.operation_conflict" {
+		t.Fatalf("foreign rental id conflict = %v", e)
+	}
+
+	if e := st.RecordRental(Rental{ID: "rnt-one", EndpointRef: "acme/h3/v1/generate",
+		AcceleratorModel: "NVIDIA H200", State: "ready", Hub: "https://hub.invalid"}); e != nil {
+		t.Fatal(e)
+	}
+	if forgotten, e := st.ForgetRental("rnt-one"); e != nil || !forgotten {
+		t.Fatalf("forget = %v, %v", forgotten, e)
+	}
+	if e := st.AdvanceRentalOperation("op", "rnt-one", "provisioning"); e != nil {
+		t.Fatal(e)
+	}
+	op, e = st.RentalOperation("op")
+	if e != nil || op.State != "released" {
+		t.Fatalf("released operation regressed = %#v, %v", op, e)
+	}
+}
 
 func TestOpenHardcutsLegacyProviderRentalFields(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "records.db")

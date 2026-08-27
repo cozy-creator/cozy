@@ -111,19 +111,87 @@ func (s *Store) RentalOperation(key string) (*RentalOperation, *exit.Error) {
 }
 
 // AdvanceRentalOperation records facts learned from the hub. Empty rentalID preserves a
-// previously learned id, which keeps a later polling update from erasing the join.
+// previously learned id, which keeps a later polling update from erasing the join. The
+// compare-and-swap keeps a delayed poll from moving an operation behind a fact another
+// caller has already committed.
 func (s *Store) AdvanceRentalOperation(key, rentalID, state string) *exit.Error {
-	res, err := s.db.Exec(`UPDATE rental_operations SET
-		rental_id=CASE WHEN ?='' THEN rental_id ELSE ? END, state=?, updated_at=?
-		WHERE operation_key=?`, rentalID, rentalID, state, now(), key)
-	if err != nil {
-		return exit.Internalf("cannot advance rental operation: %s", err)
+	for {
+		var currentID, currentState string
+		err := s.db.QueryRow(`SELECT rental_id,state FROM rental_operations
+			WHERE operation_key=?`, key).Scan(&currentID, &currentState)
+		if errors.Is(err, sql.ErrNoRows) {
+			return exit.Internalf("rental operation %s disappeared while advancing it", key)
+		}
+		if err != nil {
+			return exit.Internalf("cannot read rental operation %s while advancing it: %s", key, err)
+		}
+		if currentID != "" && rentalID != "" && currentID != rentalID {
+			return exit.Named(exit.Conflict, "rental.operation_conflict",
+				"rental operation %s already names rental %s, not %s", key, currentID, rentalID)
+		}
+
+		nextState, e := advanceRentalOperationState(key, currentState, state)
+		if e != nil {
+			return e
+		}
+		nextID := currentID
+		if nextID == "" && rentalID != "" && !rentalOperationStable(currentState) {
+			nextID = rentalID
+		}
+		if nextID == currentID && nextState == currentState {
+			return nil
+		}
+
+		res, err := s.db.Exec(`UPDATE rental_operations SET rental_id=?,state=?,updated_at=?
+			WHERE operation_key=? AND rental_id=? AND state=?`,
+			nextID, nextState, now(), key, currentID, currentState)
+		if err != nil {
+			return exit.Internalf("cannot advance rental operation: %s", err)
+		}
+		n, err := res.RowsAffected()
+		if err != nil {
+			return exit.Internalf("cannot read rental operation advance result: %s", err)
+		}
+		if n == 1 {
+			return nil
+		}
+		// Another writer won after the read. Re-evaluate against its fact instead of
+		// overwriting it with the stale state this caller observed.
 	}
-	n, err := res.RowsAffected()
-	if err != nil || n != 1 {
-		return exit.Internalf("rental operation %s disappeared while advancing it", key)
+}
+
+func rentalOperationStable(state string) bool {
+	switch state {
+	case "attached", "failed", "dead", "released":
+		return true
 	}
-	return nil
+	return false
+}
+
+func advanceRentalOperationState(key, current, next string) (string, *exit.Error) {
+	if current == next || rentalOperationStable(current) {
+		return current, nil
+	}
+	if current == "reclaiming" {
+		if next == "dead" {
+			return next, nil
+		}
+		return current, nil
+	}
+	rank := map[string]int{"pending": 0, "provisioning": 1, "ready": 2, "attached": 3}
+	currentRank, currentKnown := rank[current]
+	nextRank, nextKnown := rank[next]
+	if currentKnown && nextKnown {
+		if nextRank > currentRank {
+			return next, nil
+		}
+		return current, nil
+	}
+	if currentKnown && (next == "failed" || next == "reclaiming" || next == "dead" || next == "released") {
+		return next, nil
+	}
+	return "", exit.Named(exit.Conflict, "rental.operation_conflict",
+		"rental operation %s cannot advance from %q to %q", key, current, next)
 }
 
 // Rental is one provider-neutral pod rental this client may attach a worker to.
