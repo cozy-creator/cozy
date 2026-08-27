@@ -246,6 +246,19 @@ func (c *Orchestrator) onObserved(s *session, r *pb.ObservedWorkerState) {
 		for _, f := range r.Faults {
 			w.fault = fmt.Sprintf("%s: %s", f.Reason, brief(f.Detail, 240))
 		}
+		// THE NO-PROGRESS GROUND'S BOOKKEEPING (cl-025). Movement is a changed signature
+		// between two of the worker's own reports; the wedge verdict is the worker's own
+		// liveness monitor speaking on the activity lane. The orchestrator only counts.
+		sig := progressSignature(r, status)
+		moved := sig != w.progressSig
+		w.progressSig = sig
+		w.wedged = wedgeDeclared(r)
+		switch {
+		case moved, !w.wedged:
+			w.noProgress = 0
+		default:
+			w.noProgress++
+		}
 	}
 	generation, accepted := int64(0), int64(0)
 	phase := trimEnum(pb.WorkerPhase_name[int32(r.WorkerPhase)], "WORKER_PHASE_")
@@ -276,9 +289,6 @@ func (c *Orchestrator) onObserved(s *session, r *pb.ObservedWorkerState) {
 	} else if w != nil && w.spec.IsJob() && r.GetJobCapacity().GetJobsAvailable() > 0 {
 		go c.drain()
 	}
-	// An observed state is the only thing a STUCK worker keeps producing, so it is where
-	// the stall watchdog runs.
-	go c.checkStall()
 	if r.GetJobCapacity() != nil {
 		c.logf("observed phase=%s accepted=%d converged=%d jobs_available=%d jobs_in_flight=%d",
 			phase, r.AcceptedDesiredStateRevision, r.ConvergedRevision,
@@ -299,6 +309,49 @@ func (c *Orchestrator) onObserved(s *session, r *pb.ObservedWorkerState) {
 	}
 	c.logf("observed phase=%s accepted=%d converged=%d (no placement applied yet)",
 		phase, r.AcceptedDesiredStateRevision, r.ConvergedRevision)
+}
+
+// progressSignature renders every axis one ObservedWorkerState reports into one
+// comparable string, so "no axis moved since the last report" is a comparison of two
+// worker reports and nothing else (cl-025). The activity lane's high-water sequence is
+// the important member: the worker's liveness notes, boot steps and admission changes all
+// bump it, so a worker doing anything at all shows movement here even while its placement
+// axes hold still.
+func progressSignature(r *pb.ObservedWorkerState, status *pb.PlacementStatus) string {
+	maxSeq := uint64(0)
+	for _, a := range r.Activity {
+		if a.Seq > maxSeq {
+			maxSeq = a.Seq
+		}
+	}
+	sig := fmt.Sprintf("phase=%d adm=%d/%d slots=%d acc=%d conv=%d held=%d faults=%d seq=%d",
+		r.WorkerPhase, r.AdmissionState, r.AdmissionGeneration, r.AvailableAttemptSlots,
+		r.AcceptedDesiredStateRevision, r.ConvergedRevision, len(r.HeldAttempts),
+		len(r.Faults), maxSeq)
+	if jc := r.GetJobCapacity(); jc != nil {
+		sig += fmt.Sprintf(" jobs=%d/%d", jc.GetJobsAvailable(), jc.GetJobsInFlight())
+	}
+	if status != nil {
+		sig += fmt.Sprintf(" mat=%d srv=%d gen=%d disp=%s matz=%s spec=%x",
+			status.Materialization, status.Serving, status.ExecutorGeneration,
+			strings.Join(status.DispatchablePlanIds, ","),
+			strings.Join(status.MaterializablePlanIds, ","), status.PlacementSpecDigest)
+	}
+	return sig
+}
+
+// wedgeDeclared reads the worker's OWN no-progress verdict off the activity lane: its
+// liveness monitor emits a `liveness` note naming the WEDGED subject when consecutive
+// observations find a monotone position unmoved (a count of observations, clock-free on
+// the worker too). The orchestrator never diagnoses a wedge itself — it acts on this
+// report, which is the whole of decisions #613's rule.
+func wedgeDeclared(r *pb.ObservedWorkerState) bool {
+	for _, a := range r.Activity {
+		if a.Kind == "liveness" && strings.Contains(a.Step, "WEDGED") {
+			return true
+		}
+	}
+	return false
 }
 
 // faulted answers whether this worker is holding a REFUSAL rather than merely taking its

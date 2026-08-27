@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"crypto/rand"
 	"crypto/sha256"
 	"encoding/hex"
@@ -11,6 +12,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 
 	"google.golang.org/grpc"
@@ -175,7 +177,12 @@ func (f *fakeControl) Control(stream pb.WorkerControl_ControlServer) error {
 	// an offer echoing anything else is a RecordOwner dispatching against capacity meaning
 	// it did not observe.
 	const admissionGeneration = 1
+	// One mutex over Send: the stall arms report on a cadence from their own goroutine
+	// while the main loop answers frames, and a grpc stream tolerates one sender at a time.
+	var sendMu sync.Mutex
 	send := func(m *pb.WorkerFrame) {
+		sendMu.Lock()
+		defer sendMu.Unlock()
 		if err := stream.Send(m); err != nil {
 			f.say("send failed: %v", err)
 		}
@@ -290,6 +297,7 @@ func (f *fakeControl) Control(stream pb.WorkerControl_ControlServer) error {
 	}
 
 	var dropAck *pb.AttemptOutcome
+	reporting := false
 	for {
 		frame, err := stream.Recv()
 		if err != nil {
@@ -342,6 +350,16 @@ func (f *fakeControl) Control(stream pb.WorkerControl_ControlServer) error {
 			}
 			f.say("DesiredWorkerState revision=%d placement=%s plans=%d", d.Revision,
 				placementID, len(planIDs))
+			if placementID != "" && !reporting &&
+				(f.arm == "slowfill" || f.arm == "wedged" || f.arm == "silent") {
+				// The STALL ARMS (cl-025): a worker that is not yet DISPATCHABLE and says
+				// so on the report cadence, from its own goroutine, exactly as the real
+				// worker's reporter thread does.
+				reporting = true
+				go f.stallReports(stream.Context(), send, env, observed, d.Revision,
+					placementID, setDigest, planIDs)
+				continue
+			}
 			observed(d.Revision, placementID, setDigest, planIDs)
 			f.say("observed DISPATCHABLE for %d plan(s)", len(planIDs))
 		case *pb.RecordOwnerFrame_AttemptOffer:
@@ -390,6 +408,16 @@ func (f *fakeControl) Control(stream pb.WorkerControl_ControlServer) error {
 			if f.arm == "badterminal" {
 				f.badOutcomes(outcome, offer)
 			}
+			if f.arm == "slowfill" {
+				// The fill completed and the attempt was dispatched: settle it, which is
+				// what "observed completing warm-up and serving" means for this arm.
+				t, _ := outcomeFor(offer.RequestId, offer.AttemptOrdinal, offer.InvocationSpecDigest,
+					pb.OutcomeStatus_OUTCOME_STATUS_SUCCEEDED,
+					"served after the deliberately throttled multi-minute fill",
+					pb.CauseCode_CAUSE_CODE_UNSPECIFIED, pb.CauseOrigin_CAUSE_ORIGIN_RUNTIME, true)
+				t.PlacementId = offer.PlacementId
+				outcome(t)
+			}
 			if f.arm == "dropack" {
 				dropAck = f.outcomeWithOutput(outcome, offer)
 			}
@@ -425,6 +453,95 @@ func (f *fakeControl) Control(stream pb.WorkerControl_ControlServer) error {
 					pb.CauseCode_CAUSE_CODE_CLIENT_CANCEL, pb.CauseOrigin_CAUSE_ORIGIN_CLIENT, true)
 				outcome(t)
 			}
+		}
+	}
+}
+
+// stallReports is the cl-025 arm family: a worker whose placement is NOT yet
+// dispatchable, reporting on the real worker's cadence from its own goroutine.
+//
+//	slowfill  a THROTTLED MULTI-MINUTE fill: every report moves the activity sequence
+//	          (as a real filling worker's progress notes do), the placement stays
+//	          MATERIALIZING/ACTIVATING for --fill-ms, and only then does it report
+//	          DISPATCHABLE. Under the deleted 90 s StallGrace this worker was killed
+//	          mid-fill forever; under cl-025 nothing may touch it.
+//	wedged    a worker that is ALIVE and heartbeating but whose own liveness monitor
+//	          declared a subject WEDGED: the same two activity events ride every report
+//	          and no axis ever moves. The orchestrator retires it on the worker's own
+//	          no-progress report after NoProgressReports successive still reports.
+//	silent    a worker that stops heartbeating entirely (the stream stays open, the
+//	          process stays alive): dead to the record plane, retired via liveness.
+func (f *fakeControl) stallReports(ctx context.Context, send func(*pb.WorkerFrame),
+	env func(func(uint64, uint64, string)), ready func(uint64, string, []byte, []string),
+	revision uint64, placementID string, setDigest []byte, planIDs []string) {
+	fillMS := 130000
+	if v := flag("fill-ms", ""); v != "" {
+		fmt.Sscanf(v, "%d", &fillMS)
+	}
+	report := func(activity []*pb.ActivityEvent) {
+		r := &pb.ObservedWorkerState{
+			AcceptedDesiredStateRevision: revision,
+			ConvergedRevision:            revision - 1,
+			AcceptedPlacementSetDigest:   setDigest,
+			WorkerPhase:                  pb.WorkerPhase_WORKER_PHASE_ONLINE,
+			AppliedWireMinor:             pb.WireMinor,
+			AdmissionState:               pb.AdmissionState_ADMISSION_STATE_OPEN,
+			AdmissionGeneration:          1,
+			AvailableAttemptSlots:        2,
+			Activity:                     activity,
+			Placements: []*pb.PlacementStatus{{
+				PlacementId:           placementID,
+				Materialization:       pb.MaterializationState_MATERIALIZATION_STATE_MATERIALIZING,
+				Serving:               pb.ServingState_SERVING_STATE_ACTIVATING,
+				ExecutorGeneration:    1,
+				MaterializablePlanIds: planIDs,
+				PlacementSpecDigest:   setDigest,
+			}},
+		}
+		env(func(e, g uint64, b string) {
+			r.RecordOwnerEpoch, r.ControlStreamGeneration, r.WorkerBootId = e, g, b
+		})
+		send(&pb.WorkerFrame{Msg: &pb.WorkerFrame_ObservedState{ObservedState: r}})
+	}
+	event := func(seq uint64, kind, step string) *pb.ActivityEvent {
+		return &pb.ActivityEvent{Seq: seq, Kind: kind, Step: step,
+			AtUnixMs: uint64(time.Now().UnixMilli())}
+	}
+	began, n := time.Now(), uint64(0)
+	tick := time.NewTicker(2 * time.Second)
+	defer tick.Stop()
+	for {
+		n++
+		switch f.arm {
+		case "slowfill":
+			if time.Since(began) >= time.Duration(fillMS)*time.Millisecond {
+				ready(revision, placementID, setDigest, planIDs)
+				f.say("fill done after %s: observed DISPATCHABLE for %d plan(s)",
+					time.Since(began).Round(time.Second), len(planIDs))
+				return
+			}
+			// Every report MOVES: a fresh activity sequence, the way a real fill's
+			// progress notes advance. Throttled, not wedged.
+			report([]*pb.ActivityEvent{event(n, "download",
+				fmt.Sprintf("filled unit %d of a deliberately throttled materialization", n))})
+		case "wedged":
+			activity := []*pb.ActivityEvent{event(1, "boot", "prepare started")}
+			if n >= 3 {
+				activity = append(activity, event(2, "liveness",
+					"prepare:unet is WEDGED by silence (no clock involved)"))
+			}
+			report(activity)
+		case "silent":
+			if n > 2 {
+				f.say("going SILENT: the stream stays open and nothing more is reported")
+				return
+			}
+			report([]*pb.ActivityEvent{event(1, "boot", "prepare started")})
+		}
+		select {
+		case <-ctx.Done():
+			return
+		case <-tick.C:
 		}
 	}
 }

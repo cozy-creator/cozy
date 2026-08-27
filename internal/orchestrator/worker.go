@@ -441,6 +441,16 @@ type worker struct {
 	// until the first frame is a wait that cannot end (found by the flip: a pre-flip
 	// runtime wheel that cannot host left the readiness wait spinning forever).
 	spawned time.Time
+
+	// THE NO-PROGRESS GROUND'S STATE (cl-025). progressSig is a signature over every
+	// axis the last report carried — states, revisions, plan sets, the activity lane's
+	// high-water sequence — so "no axis moved" is a comparison of two reports, never a
+	// clock. wedged is whether the worker's own liveness monitor currently declares a
+	// WEDGED subject (its verdict rides the activity lane), and noProgress counts the
+	// SUCCESSIVE reports that both declared it and moved nothing. Any movement resets.
+	progressSig string
+	wedged      bool
+	noProgress  int
 }
 
 // dispatchableFor is the ROUTING GATE, and it is two questions with two owners (#482).

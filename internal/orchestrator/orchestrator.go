@@ -118,9 +118,6 @@ type Orchestrator struct {
 	// launch per endpoint: three cold requests for one endpoint must not spawn three
 	// workers and three device grants for a card that serves one attempt at a time.
 	starting map[string]bool
-	// stalls is when each RESIDENT-but-undispatchable worker first failed to serve the
-	// head of the queue. It is the stall watchdog's only state (see checkStall).
-	stalls   map[string]time.Time
 	revision uint64 // hub-owned, monotonic; every Directive bumps it
 	events   []string
 
@@ -159,9 +156,13 @@ func Open(opt Options) (*Orchestrator, *exit.Error) {
 		offers:        map[string]*dispatchReservation{},
 		mediaCleaning: map[string]bool{},
 		starting:      map[string]bool{},
-		stalls:        map[string]time.Time{},
 		frames:        newFanout(),
 	}
+	// The retirement watch samples on the worker report cadence. The cadence is a
+	// SAMPLING resolution, never a verdict: every verdict it acts on is the worker's own
+	// report (a latched fault, a declared wedge) or the absence of reports the worker
+	// owes on that same cadence.
+	go c.retirementLoop()
 	return c, nil
 }
 
@@ -417,31 +418,61 @@ func (c *Orchestrator) recoverWorker(spec WorkerLaunchSpec) {
 	c.reviveQueue()
 }
 
-// StallGrace is how long a RESIDENT worker may go on not being dispatchable for the
-// request at the head of its own queue before it is replaced. It is deliberately the same
-// clock `EnsurePlacementReady` gives a placement holding a fault: a worker that has not
-// become able to serve its queue in a minute and a half has answered, whatever state it is
-// reporting.
-const StallGrace = 90 * time.Second
+// NoProgressReports is how many SUCCESSIVE worker reports must both declare a wedge and
+// show no movement on any reported axis before the worker is retired on the no-progress
+// ground. A COUNT of the worker's own reports, never a duration (decisions #613): the
+// judgment "nothing is moving" is made by the process that can see movement — the worker's
+// liveness monitor, which is itself clock-free — and this only asks that the declared
+// verdict persist rather than flicker. A legitimately slow fill never meets it, because a
+// worker making progress does not declare a wedge.
+const NoProgressReports = 15
 
-// checkStall replaces a worker that is resident, alive, staged for the head of the queue,
-// and STILL not dispatchable. It runs on every observed state, because that is the only
-// thing a stuck worker keeps producing.
+// retirementLoop samples the retirement grounds on the worker report cadence, for as long
+// as this service lives. A ticker is needed because ground 2 is the ABSENCE of reports —
+// a dead worker produces no frame for a frame handler to run on. The tick itself decides
+// nothing; every ground below is the worker's own word or its silence.
+func (c *Orchestrator) retirementLoop() {
+	tick := time.NewTicker(ReportCadence)
+	defer tick.Stop()
+	for {
+		select {
+		case <-c.done:
+			return
+		case <-tick.C:
+			c.checkRetirement()
+		}
+	}
+}
+
+// checkRetirement replaces a worker that is resident, staged for the head of the queue,
+// and has ANSWERED that it cannot serve it. `StallGrace` and its timer are DELETED, not
+// resized (cl-025, decisions #613): no wall-clock number here may race a legitimate
+// workload, because any constant sized to one workload kills the next — H3's cold fill
+// runs minutes by construction and was killed at 90 s forever. A worker is retired on
+// exactly three grounds, each an observation rather than a schedule:
 //
-// The condition is real and was met live: `kill -9` of a job executor mid-attempt left the
-// worker rebuilding, its capacity pinned at zero, and the queue behind it waiting forever.
-// `drain` could not help — it only runs on DISPATCHABLE, which is exactly what never came.
-// Nothing here decides WHY a worker is stuck: the orchestrator's business is that a request
-// has been owed capacity for too long by a process it started, and the one thing it owns is
-// whether that process keeps the slot.
-func (c *Orchestrator) checkStall() {
+//  1. WORKER-DECLARED FAULT — the placement has held a latched fault past `ErrorGrace`
+//     (the same latch `EnsurePlacementReady` reads; a fault is the worker saying "I
+//     cannot", and the grace only lets a transient one clear). A claim this owner itself
+//     REFUSED is the same ground with no clock: the verdict is already settled.
+//  2. LIVENESS DEATH — the worker owes an ObservedWorkerState every `ReportCadence` and
+//     has missed `SilentReports` of them. A count of missed heartbeats, never a guess
+//     about how long a load takes: a worker filling for an hour reports on every one.
+//  3. WORKER-DECLARED NO-PROGRESS — the worker's own liveness monitor declared a subject
+//     WEDGED (its verdict is clock-free: consecutive observations of an unmoved monotone
+//     position), and that declaration has persisted across `NoProgressReports` successive
+//     reports in which no reported axis moved either.
+//
+// A worker that is merely SLOW — materializing, activating, filling — is none of these,
+// however long it takes, and nothing here may kill it.
+func (c *Orchestrator) checkRetirement() {
 	c.mu.Lock()
-	head := ""
+	head, closing := "", c.closing
 	if len(c.pending) > 0 {
 		head = c.pending[0]
 	}
 	c.mu.Unlock()
-	if head == "" {
+	if head == "" || closing {
 		return
 	}
 	req, e := c.opt.Store.RequestRow(head)
@@ -454,9 +485,8 @@ func (c *Orchestrator) checkStall() {
 		if w.exited || !staged(w, req.PlanID) {
 			continue
 		}
-		if w.dispatchableFor(req.PlanID) {
+		if w.dispatchableFor(req.PlanID) || (w.spec.IsJob() && w.dispatchable[req.PlanID]) {
 			// Dispatchable. The queue is waiting on placement, not on this worker.
-			delete(c.stalls, w.instanceID)
 			c.mu.Unlock()
 			return
 		}
@@ -466,26 +496,43 @@ func (c *Orchestrator) checkStall() {
 		c.mu.Unlock()
 		return
 	}
-	first, seen := c.stalls[victim.instanceID]
-	if !seen {
-		c.stalls[victim.instanceID] = time.Now()
-		c.mu.Unlock()
-		return
+	quiet := time.Duration(0)
+	if !victim.lastReport.IsZero() {
+		quiet = time.Since(victim.lastReport)
+	} else if !victim.spawned.IsZero() {
+		quiet = time.Since(victim.spawned)
 	}
-	stuck := time.Since(first)
+	stuck := time.Duration(0)
+	if !victim.errorSince.IsZero() {
+		stuck = time.Since(victim.errorSince)
+	}
+	fault, refused := victim.fault, victim.refusal
+	wedged, still := victim.wedged, victim.noProgress
 	state := fmt.Sprintf("%s/%s",
 		trimEnum(pb.MaterializationState_name[int32(victim.materialization)], "MATERIALIZATION_STATE_"),
 		trimEnum(pb.ServingState_name[int32(victim.serving)], "SERVING_STATE_"))
 	instance, placement := victim.instanceID, victim.placementID
 	c.mu.Unlock()
-	if stuck < StallGrace {
+
+	silent := SilentReports * ReportCadence
+	ground := ""
+	switch {
+	case refused != nil:
+		ground = fmt.Sprintf("this owner refused its claim (%s: %s)", refused.ErrName(), refused.Message)
+	case stuck > ErrorGrace:
+		ground = fmt.Sprintf("it has held a worker-declared fault for %s: %s",
+			stuck.Round(time.Second), fault)
+	case quiet > silent:
+		ground = fmt.Sprintf("it has reported no observed state for %s — %d missed reports of %s: "+
+			"it is dead or stalled, not slow", quiet.Round(time.Second), SilentReports, ReportCadence)
+	case wedged && still >= NoProgressReports:
+		ground = fmt.Sprintf("it declared itself WEDGED and %d successive reports moved no axis",
+			still)
+	default:
 		return
 	}
-	c.logf("worker %s has been %s and undispatchable for %s while %s waits; retiring its "+
-		"placement and replacing it", instance, state, stuck.Round(time.Second), head)
-	c.mu.Lock()
-	delete(c.stalls, instance)
-	c.mu.Unlock()
+	c.logf("worker %s is %s and undispatchable while %s waits; retiring it: %s",
+		instance, state, head, ground)
 	// RETIRE, THEN SHUT DOWN. The two halves are separate acts (#484): the placement is
 	// taken out of the desired set first, so the worker drains what it holds under a
 	// DRAINING posture instead of meeting SIGTERM with the set still saying "serve this".
@@ -495,8 +542,8 @@ func (c *Orchestrator) checkStall() {
 		c.logf("worker %s could not be told to retire %s (%s); the process stop follows",
 			instance, placement, e.Message)
 	}
-	// ShutdownWorker's own reviveQueue asks for the replacement, so the request the watchdog
-	// fired for is the one whose need gets re-asked.
+	// ShutdownWorker's own reviveQueue asks for the replacement, so the request the
+	// retirement fired for is the one whose need gets re-asked.
 	c.ShutdownWorker(instance, StopGrace)
 }
 
