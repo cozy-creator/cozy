@@ -40,13 +40,13 @@ import (
 
 // Rental states, the hub's own words.
 const (
-	RentalProvisioning = "provisioning"
-	RentalReady        = "ready"
-	RentalFailed       = "failed"
-	// The pod is being torn down, or is gone. Neither is a state a wait can outlast: a
-	// rental that has left is not one that is still coming up.
-	RentalReclaiming = "reclaiming"
-	RentalDead       = "dead"
+	RentalPendingAcquisition = "pending_acquisition"
+	RentalAcquiring          = "acquiring"
+	RentalMaterializing      = "materializing"
+	RentalReady              = "ready"
+	RentalFailed             = "failed"
+	RentalReleaseRequested   = "release_requested"
+	RentalReleased           = "released"
 )
 
 // Rental is one rented pod as the hub reports it. There is no token on it, and there is

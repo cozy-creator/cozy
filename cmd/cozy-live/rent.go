@@ -521,6 +521,9 @@ func sectionRent() {
 	}
 	check("this host holds ZERO rentals — the teardown is proved, not assumed",
 		zeroRentals(root), "")
+	pending, _ = filepath.Glob(filepath.Join(root, "rentals", "pending-*.token"))
+	check("and no rejected or released operation retains a pending token", len(pending) == 0,
+		fmt.Sprintf("%d pending token(s)", len(pending)))
 }
 
 // rentOne rents a pod and returns its id with the whole rendering, so an arm can search
@@ -875,11 +878,6 @@ func alivePID(pid int) bool {
 		return false
 	}
 	return proc.Signal(syscall.Signal(0)) == nil
-}
-
-func digestOfBytes(data []byte) string {
-	sum := sha256.Sum256(data)
-	return "sha256:" + hex.EncodeToString(sum[:])
 }
 
 // dispatchedRequest reads the request id out of the stream a `--stream` run printed, so an

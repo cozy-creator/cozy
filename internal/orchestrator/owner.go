@@ -198,7 +198,6 @@ func (c *Orchestrator) converse(w *worker, addr string) error {
 	s.send(&pb.RecordOwnerFrame{Msg: &pb.RecordOwnerFrame_Claim{Claim: &pb.Claim{
 		RecordOwnerEpoch: recordOwnerEpoch,
 		RecordOwnerId:    recordOwnerID,
-		WorkerId:         w.spec.WorkerID(),
 		WireMinor:        pb.WireMinor,
 		Proof:            []byte(proof),
 		// THE SCHEMA FENCE RIDES THE CLAIM and is checked before any other body field, in
