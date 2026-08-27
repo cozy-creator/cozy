@@ -78,12 +78,9 @@ type Server struct {
 	// LOCAL module's resolver; the pod profile (cl-014) supplies its own.
 	endpoints Resolver
 
-	// rentals answers whether this host holds a pinned rental — EXISTENCE ONLY. It
-	// deliberately does not resolve the dial triple: the credential is obtained by the
-	// orchestrator at dial time, so the HTTP layer never reads one, and a check here that
-	// loaded it would be a second exposure of the same secret to answer a question that
-	// did not need it.
-	rentals func(id string) *exit.Error
+	// rentals resolves only the non-secret, attempt-bound desired placement. The
+	// credential and dial triple remain orchestrator-only and are obtained at dial time.
+	rentals func(id string) (*orchestrator.DesiredPlacement, *exit.Error)
 
 	// shutdown asks the process that owns this server to drain and exit — `cozy down`'s
 	// cooperative tier (#449). The route refuses when the builder wired none.
@@ -112,9 +109,9 @@ type Options struct {
 	Log          io.Writer
 	Endpoints    Resolver
 	Bound        []string
-	// Rentals answers whether an attached-worker id names a pod this host holds; nil =
-	// this host attaches no remote workers, and a submission that names one says so.
-	Rentals func(id string) *exit.Error
+	// Rentals resolves an attached worker's exact non-secret placement; nil means this
+	// host attaches no remote workers.
+	Rentals func(id string) (*orchestrator.DesiredPlacement, *exit.Error)
 	// Shutdown is the cooperative-exit hook the shutdown route calls (#449).
 	Shutdown func()
 }

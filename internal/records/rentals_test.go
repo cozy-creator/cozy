@@ -154,6 +154,41 @@ func TestAdvanceRentalOperationIsMonotone(t *testing.T) {
 	}
 }
 
+func TestRentalControlSnapshotPersistsVerbatimAndLatePollCannotEraseIt(t *testing.T) {
+	st, e := Open(filepath.Join(t.TempDir(), "records.db"))
+	if e != nil {
+		t.Fatal(e)
+	}
+	defer st.Close()
+	raw := []byte{0x00, 0x01, 0x02, '{', '}', 0xff}
+	row := Rental{ID: "rnt-control", EndpointRef: "acme/h3/v1/generate",
+		AcceleratorModel: "NVIDIA H200", Address: "pod.invalid:443", CertPath: "/pinned/cert",
+		State: "ready", Hub: "https://hub.invalid", ControlSnapshotDigest: "sha256:exact",
+		ControlSnapshotLength: int64(len(raw)), ControlSnapshotBytes: raw}
+	if e := st.RecordRental(row); e != nil {
+		t.Fatal(e)
+	}
+	// A later lifecycle observation may omit the ready-only snapshot. It can move
+	// state/address fields but cannot erase the exact bytes already persisted.
+	row.State, row.ControlSnapshotDigest, row.ControlSnapshotLength, row.ControlSnapshotBytes =
+		"release_requested", "", 0, nil
+	if e := st.RecordRental(row); e != nil {
+		t.Fatal(e)
+	}
+	got, e := st.RentalRow("rnt-control")
+	if e != nil || got == nil || got.ControlSnapshotDigest != "sha256:exact" ||
+		got.ControlSnapshotLength != int64(len(raw)) || !bytes.Equal(got.ControlSnapshotBytes, raw) {
+		t.Fatalf("persisted snapshot = %#v, %v", got, e)
+	}
+	conflict := *got
+	conflict.ControlSnapshotDigest = "sha256:changed"
+	conflict.ControlSnapshotBytes = append([]byte(nil), raw...)
+	conflict.ControlSnapshotBytes[0] ^= 0xff
+	if e := st.RecordRental(conflict); e == nil || e.Name != "rental.control_snapshot_conflict" {
+		t.Fatalf("changed snapshot was not refused: %v", e)
+	}
+}
+
 func TestOpenHardcutsLegacyProviderRentalFields(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "records.db")
 	legacy, err := sql.Open("sqlite", path)

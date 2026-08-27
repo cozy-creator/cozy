@@ -113,9 +113,10 @@ dynamic-serving shape with the actor-vocabulary hardcut.
 - **Actor names match their current responsibilities.** Cause origin 4 is `WORKER`, the
   machine-local peer; origin 7 is `RECORD_OWNER`, the durable-attempt authority. Rev 3
   retains their wire numbers and hardcuts the old names with no aliases.
-- **The desired set is BYTES.** `ConvergePlacementSet` authors a `PlacementSet` document
-  once and sends its exact canonical bytes plus their digest; the worker recomputes before
-  parsing a single field. There is no second structured copy for the set to disagree with.
+- **The desired set is BYTES.** A local target authors its `PlacementSet` once. A rented
+  target instead persists and validates Tensorhub's acquisition-attempt control snapshot,
+  then relays that exact `PlacementSet` and exact plan bytes; it never resolves or renders
+  them from this machine's install. The worker recomputes before parsing a single field.
 - **Two axes, one admission fence.** A placement's convergence is
   materialization × serving; DISPATCHABLE gates dispatch. Capacity is a WORKER property —
   `admission_state` + `admission_generation` + `available_attempt_slots` — and every offer

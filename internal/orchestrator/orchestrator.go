@@ -51,14 +51,15 @@ type Options struct {
 
 	// Rentals resolves an attached-worker id (`cozy rent`'s persisted triple) to its
 	// dial spec. Wired by the entrypoint; nil = this service attaches no remote workers.
-	Rentals func(id string) (*WorkerConnection, *exit.Error)
+	Rentals func(id string) (*RemoteTarget, *exit.Error)
 
-	// EnvironmentSpecDigest and ConfigDigest ride INSIDE every InvocationSpec document:
+	// EnvironmentSpecDigest and ConfigDigest are LOCAL placement defaults. They ride
+	// INSIDE every local InvocationSpec document:
 	// the EndpointEnvironmentSpec that IS this invocation's execution environment (#483 —
 	// was `ImageDigest`, and "image" is wrong for a native install with no OCI image at
 	// all) and the evaluated-config document's identity (cr-003's). They are frozen per
-	// service, never per request — a request cannot choose the environment it is admitted
-	// under.
+	// service, never per request. A remote placement overrides both from Tensorhub's
+	// persisted attempt snapshot; a request cannot choose either environment.
 	EnvironmentSpecDigest string
 	ConfigDigest          string
 	MaxOutputMiB          int64

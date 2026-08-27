@@ -69,16 +69,37 @@ func (c *Orchestrator) ConvergePlacementSet(instanceID string, placements []Desi
 }
 
 func (c *Orchestrator) converge(s *session, w *worker, placements []DesiredPlacement) *exit.Error {
-	set := &pb.PlacementSet{}
-	for _, p := range placements {
-		set.Placements = append(set.Placements, &pb.Placement{
-			PlacementId: p.PlacementID(),
-			Spec:        c.placementSpec(p, w.subjects),
-		})
-	}
-	setBytes, digest, err := canonical.Identity(set)
-	if err != nil {
-		return exit.Internalf("cannot mint the PlacementSet document for %s: %s", w.instanceID, err)
+	var setBytes, digest []byte
+	if len(placements) == 1 && len(placements[0].ExactPlacementSetBytes) > 0 {
+		// REMOTE: relay Tensorhub's exact acquisition-attempt bytes. Parsing is
+		// validation only; these bytes are never marshaled again.
+		p := placements[0]
+		declared, err := canonical.Raw(p.ExactPlacementSetDigest)
+		if err != nil || !bytes.Equal(canonical.Digest(p.ExactPlacementSetBytes), declared) {
+			return exit.Named(exit.Conflict, "placement_set_identity_mismatch",
+				"the persisted remote PlacementSet bytes do not match %s", p.ExactPlacementSetDigest)
+		}
+		doc, err := canonical.Read(p.ExactPlacementSetBytes, &pb.PlacementSet{})
+		if err != nil || len(doc.List("placements")) != 1 ||
+			doc.List("placements")[0].Str("placement_id") != p.PlacementID() {
+			return exit.Named(exit.Conflict, "placement_set_closure_mismatch",
+				"the persisted remote PlacementSet does not name placement %s: %v", p.PlacementID(), err)
+		}
+		setBytes, digest = append([]byte(nil), p.ExactPlacementSetBytes...), append([]byte(nil), declared...)
+	} else {
+		// LOCAL: retain the independent install-derived authoring path.
+		set := &pb.PlacementSet{}
+		for _, p := range placements {
+			set.Placements = append(set.Placements, &pb.Placement{
+				PlacementId: p.PlacementID(),
+				Spec:        c.placementSpec(p, w.subjects),
+			})
+		}
+		var err error
+		setBytes, digest, err = canonical.Identity(set)
+		if err != nil {
+			return exit.Internalf("cannot mint the PlacementSet document for %s: %s", w.instanceID, err)
+		}
 	}
 	rev := c.nextRevision()
 	c.mu.Lock()
@@ -112,23 +133,23 @@ func (c *Orchestrator) converge(s *session, w *worker, placements []DesiredPlace
 // PROVENANCE and every other field is an immutable digest, so two workers handed the same
 // set converge to the same bytes or fault typed.
 //
-// TWO FIELDS THIS HOST HONESTLY CANNOT FILL, and it leaves them empty rather than
-// inventing them. `environment_spec_digest` names an EndpointEnvironmentSpec whose FIELDS
-// are owned by tensorhub-build (#483) — a bundle digest, a project-wheel digest, a
-// wheelhouse manifest — and a local `uv sync` install produces none of those artifacts, so
-// spelling one here would be manufacturing a fact on the wrong side of a boundary. It
-// carries whatever the service was configured with and nothing else.
-// `installed_environment_receipt_digest` is what a completed materialization must MEASURE
-// to, and this host does not materialize: the install already happened, locally, before
-// any worker existed. The measured receipt is #485d's launch deliverable and lands with
-// it.
+// A local install leaves environment/receipt empty unless its own launcher supplied
+// those facts; it never manufactures Tensorhub documents. A remote placement normally
+// bypasses this author entirely because converge relays Tensorhub's exact PlacementSet.
 func (c *Orchestrator) placementSpec(p DesiredPlacement, subjects []*pb.ArtifactSubject) *pb.PlacementSpec {
 	spec := &pb.PlacementSpec{
 		EndpointReleaseId: p.ReleaseID,
 		BindingPlans:      subjects,
 	}
-	if raw, err := canonical.Raw(c.opt.EnvironmentSpecDigest); err == nil {
+	environmentDigest := p.EnvironmentSpecDigest
+	if environmentDigest == "" {
+		environmentDigest = c.opt.EnvironmentSpecDigest
+	}
+	if raw, err := canonical.Raw(environmentDigest); err == nil {
 		spec.EnvironmentSpecDigest = raw
+	}
+	if raw, err := canonical.Raw(p.InstalledEnvironmentReceiptDigest); err == nil {
+		spec.InstalledEnvironmentReceiptDigest = raw
 	}
 	if raw, err := canonical.Raw(p.DescriptorDigest); err == nil {
 		spec.DescriptorDigest = raw

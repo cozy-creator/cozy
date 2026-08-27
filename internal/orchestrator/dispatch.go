@@ -354,10 +354,10 @@ func settledState(state string) bool {
 	return false
 }
 
-// resolveFor asks the launcher for the spec of the LANE this request runs in. A request
-// pinned to a connected worker (cl-015) resolves the SAME spec — same bindings,
-// same plan ids — and gains the dial triple: the pod installed the identical release, so
-// the plan digests agree by construction or the worker refuses typed.
+// resolveFor keeps the two target authorities separate. Local work asks the
+// local launcher. A pinned rental uses the exact placement persisted from
+// Tensorhub's acquisition attempt and adds only its dial authority; it never
+// asks this machine's install to recreate remote meaning.
 func (c *Orchestrator) resolveFor(req records.Request) (WorkerLaunchSpec, *exit.Error) {
 	if req.Worker == "" {
 		spec, e := c.opt.Endpoints.Resolve(req.Endpoint)
@@ -366,20 +366,10 @@ func (c *Orchestrator) resolveFor(req records.Request) (WorkerLaunchSpec, *exit.
 		}
 		return spec, e
 	}
-	// Serving placements are the first cl-020 consumer: their descriptor and binding
-	// plans belong in platform-neutral control metadata. Jobs retain their existing local
-	// materialized path until the job half of that manifest contract is defined.
-	var placement DesiredPlacement
-	var e *exit.Error
 	if req.IsJob() {
-		var spec WorkerLaunchSpec
-		spec, e = c.opt.Endpoints.ResolveJob(req.Endpoint, req.Entrypoint)
-		placement = spec.Placement
-	} else {
-		placement, e = c.opt.Endpoints.ResolvePlacement(req.Endpoint)
-	}
-	if e != nil {
-		return WorkerLaunchSpec{}, e
+		return WorkerLaunchSpec{}, exit.Named(exit.Structural, "remote_job_control_unavailable",
+			"a remote job cannot be resolved from a local installation").
+			WithRemedy("publish and rent an exact job control snapshot before enabling remote jobs")
 	}
 	if c.opt.Rentals == nil {
 		return WorkerLaunchSpec{}, exit.Unavailablef("this LocalService attaches no remote workers")
@@ -388,7 +378,11 @@ func (c *Orchestrator) resolveFor(req records.Request) (WorkerLaunchSpec, *exit.
 	if e != nil {
 		return WorkerLaunchSpec{}, e
 	}
-	spec := WorkerLaunchSpec{Placement: placement, Connection: remote}
+	if remote == nil || remote.Connection == nil {
+		return WorkerLaunchSpec{}, exit.Named(exit.Internal, "rental.target_incomplete",
+			"rental %s resolved without a complete remote target", req.Worker)
+	}
+	spec := WorkerLaunchSpec{Placement: remote.Placement, Connection: remote.Connection}
 	// The rental IS the slot: one connected worker per rental id, its own instance
 	// namespace, and no local device envelope (the pod's card is the pod's).
 	spec.Placement.Endpoint = pinnedEndpoint(spec.Placement.Endpoint, req.Worker)
@@ -451,13 +445,21 @@ func (c *Orchestrator) dispatch(req records.Request) (uint64, *exit.Error) {
 	// the payload digest, the ORDERED input identities, the output contracts, the
 	// deadline — lives INSIDE the digest. Its key set is closed: no human model ref, no
 	// service class, no local extension has a slot.
+	environmentDigest := w.spec.Placement.EnvironmentSpecDigest
+	if environmentDigest == "" {
+		environmentDigest = c.opt.EnvironmentSpecDigest
+	}
+	configDigest := w.spec.Placement.ConfigDigest
+	if configDigest == "" {
+		configDigest = c.opt.ConfigDigest
+	}
 	spec := &pb.InvocationSpec{
 		EndpointReleaseId: w.spec.Placement.ReleaseID,
 		// `image_digest` is GONE, renamed to what it always meant (#483): "image" is wrong
 		// for a native install with no OCI image at all. The value is the same one this
 		// service was frozen with — a request cannot choose the environment it runs under.
-		EnvironmentSpecDigest: c.opt.EnvironmentSpecDigest,
-		ConfigDigest:          c.opt.ConfigDigest,
+		EnvironmentSpecDigest: environmentDigest,
+		ConfigDigest:          configDigest,
 		PayloadDigest:         spellOf(canonical.Digest(req.Payload)),
 		Inputs:                inputBindings(req),
 		Outputs:               outputBindings(splitList(req.Outputs), c.maxOutputBytes()),

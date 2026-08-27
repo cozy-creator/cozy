@@ -17,28 +17,9 @@ import (
 // the canonical encoding of their own content), the document's `format` tag, and finally
 // the message's closed key set.
 func Read(data []byte, m proto.Message) (Doc, error) {
-	if len(data) > DocMax {
-		return nil, refuse("size_cap", "%d B over the %d B cap", len(data), DocMax)
-	}
-	p := &parser{src: data}
-	v, err := p.value(0)
+	obj, err := ReadObject(data)
 	if err != nil {
 		return nil, err
-	}
-	p.space()
-	if p.i != len(p.src) {
-		return nil, refuse("noncanonical_encoding", "%d trailing byte(s) after the document", len(p.src)-p.i)
-	}
-	again, err := Write(v)
-	if err != nil {
-		return nil, err
-	}
-	if !bytes.Equal(again, data) {
-		return nil, refuse("noncanonical_encoding", "bytes are not the canonical encoding of their own content")
-	}
-	obj, ok := v.(map[string]Value)
-	if !ok {
-		return nil, refuse("wrong_type", "a document is a JSON object")
 	}
 	d := m.ProtoReflect().Descriptor()
 	want := Format(m)
@@ -54,8 +35,51 @@ func Read(data []byte, m proto.Message) (Doc, error) {
 			return nil, refuse("unknown_field", "%s: unknown field %q", want, k)
 		}
 	}
-	if err := semantics(string(d.FullName()), Doc(obj)); err != nil {
+	if err := semantics(string(d.FullName()), obj); err != nil {
 		return nil, err
+	}
+	return obj, nil
+}
+
+// ReadObject validates the shared canonical JSON profile without assigning a
+// document schema. It is for exact control documents whose schemas live outside
+// worker-protocol (for example EndpointBindingRelease). Callers must still
+// enforce their closed key set and semantic joins.
+func ReadObject(data []byte) (Doc, error) {
+	obj, err := ParseObject(data)
+	if err != nil {
+		return nil, err
+	}
+	again, err := Write(map[string]Value(obj))
+	if err != nil {
+		return nil, err
+	}
+	if !bytes.Equal(again, data) {
+		return nil, refuse("noncanonical_encoding", "bytes are not the canonical encoding of their own content")
+	}
+	return obj, nil
+}
+
+// ParseObject applies the bounded JSON grammar and duplicate-key refusal but
+// does not require compact canonical rendering. Descriptor bytes have their own
+// exact stored-byte identity and may be pretty-printed; their schema owner, not
+// this codec, decides that presentation.
+func ParseObject(data []byte) (Doc, error) {
+	if len(data) > DocMax {
+		return nil, refuse("size_cap", "%d B over the %d B cap", len(data), DocMax)
+	}
+	p := &parser{src: data}
+	v, err := p.value(0)
+	if err != nil {
+		return nil, err
+	}
+	p.space()
+	if p.i != len(p.src) {
+		return nil, refuse("noncanonical_encoding", "%d trailing byte(s) after the document", len(p.src)-p.i)
+	}
+	obj, ok := v.(map[string]Value)
+	if !ok {
+		return nil, refuse("wrong_type", "a document is a JSON object")
 	}
 	return Doc(obj), nil
 }

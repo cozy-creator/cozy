@@ -6,11 +6,56 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 
+	"github.com/cozy-creator/cozy-creator-v2/internal/canonical"
 	"github.com/cozy-creator/cozy-creator-v2/internal/secret"
 )
+
+func TestPlanUploadAcceptsOnlyTensorhubsExactCanonicalBytes(t *testing.T) {
+	base := t.TempDir()
+	plans := filepath.Join(base, "plans")
+	if err := os.MkdirAll(plans, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	token := secret.New("test-token")
+	tokens := filepath.Join(base, "tokens")
+	if err := os.WriteFile(tokens, []byte(secret.HashLine(token)+"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	s := &server{opt: options{root: filepath.Join(base, "media"), plans: plans,
+		tokens: tokens, quota: 1 << 20, maxBody: 1 << 20}}
+	if err := s.reloadTokens(); err != nil {
+		t.Fatal(err)
+	}
+	plan := []byte(`{"bindings":[],"descriptor":{"digest":"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","length":1},"entrypoint":"generate","format":"cozy.endpoint.EntrypointBindingPlan/1"}`)
+	id, err := canonical.Spell(canonical.Digest(plan))
+	if err != nil {
+		t.Fatal(err)
+	}
+	put := func(raw []byte, claimed string) *httptest.ResponseRecorder {
+		req := httptest.NewRequest(http.MethodPut, "/v1/plans/"+strings.TrimPrefix(claimed, "sha256:"), bytes.NewReader(raw))
+		req.Header.Set("Authorization", "Bearer test-token")
+		out := httptest.NewRecorder()
+		s.routes().ServeHTTP(out, req)
+		return out
+	}
+	if got := put(plan, id); got.Code != http.StatusCreated {
+		t.Fatalf("exact Tensorhub plan status=%d body=%s", got.Code, got.Body.String())
+	}
+	stored, err := os.ReadFile(filepath.Join(plans, strings.TrimPrefix(id, "sha256:")+".json"))
+	if err != nil || !bytes.Equal(stored, plan) {
+		t.Fatalf("stored plan = %q, %v", stored, err)
+	}
+	legacy := []byte(`{"entrypoint_binding_plan_id":"` + id + `","format":"cozy.local.EntrypointBindingRecord/2"}`)
+	legacyID, _ := canonical.Spell(canonical.Digest(legacy))
+	if got := put(legacy, legacyID); got.Code != http.StatusBadRequest ||
+		!strings.Contains(got.Body.String(), "binding_plan_invalid") {
+		t.Fatalf("legacy local record status=%d body=%s", got.Code, got.Body.String())
+	}
+}
 
 func TestBootstrapReceiptServesExactBytesOnlyAfterPublication(t *testing.T) {
 	root := t.TempDir()

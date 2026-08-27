@@ -187,6 +187,12 @@ func handleRent(ctx *Context) *exit.Error {
 	observe := func(seen hub.Rental) *exit.Error {
 		row.Address, row.State = seen.Address, seen.State
 		row.MediaAddress = seen.MediaAddress
+		captureRentalControl(&row, seen)
+		if len(row.ControlSnapshotBytes) > 0 {
+			if e := rental.ValidateControl(row); e != nil {
+				return e
+			}
+		}
 		if e := st.RecordRental(row); e != nil {
 			return e
 		}
@@ -198,6 +204,7 @@ func handleRent(ctx *Context) *exit.Error {
 	}
 	row.Address, row.State = ready.Address, ready.State
 	row.MediaAddress = ready.MediaAddress
+	captureRentalControl(&row, ready)
 	if !ready.HoldsHash(secret.HashHex(token)) {
 		// The pod was provisioned with a credential set this host's token is not in, so
 		// dialling it would 401 and look like a network fault. The hub says which hashes
@@ -322,7 +329,19 @@ func missingOf(r hub.Rental) string {
 	if len(r.TokenSHA256) == 0 {
 		return "observed renter-token hash set"
 	}
+	if r.ControlSnapshot == nil {
+		return "attempt-bound control snapshot"
+	}
 	return "complete ready projection"
+}
+
+func captureRentalControl(row *records.Rental, seen hub.Rental) {
+	if row == nil || seen.ControlSnapshot == nil {
+		return
+	}
+	row.ControlSnapshotDigest = seen.ControlSnapshot.Digest
+	row.ControlSnapshotLength = seen.ControlSnapshot.Length
+	row.ControlSnapshotBytes = append([]byte(nil), seen.ControlSnapshot.CanonicalBytes...)
 }
 
 func handleRentLs(ctx *Context) *exit.Error {

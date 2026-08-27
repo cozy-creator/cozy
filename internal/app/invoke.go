@@ -23,6 +23,7 @@ import (
 	"github.com/cozy-creator/cozy-creator-v2/internal/orchestrator"
 	"github.com/cozy-creator/cozy-creator-v2/internal/records"
 	"github.com/cozy-creator/cozy-creator-v2/internal/render"
+	"github.com/cozy-creator/cozy-creator-v2/internal/rental"
 )
 
 // THE LIFECYCLE AND REQUEST VERBS (cl-010), every one of them a CLIENT of the local
@@ -360,11 +361,16 @@ func handleRun(ctx *Context) *exit.Error {
 	// THE PAYLOAD IS TYPED AGAINST THE RECORDED SCHEMA — the surface the release's own
 	// runtime vouched for at install — so a typo costs a millisecond instead of a model
 	// load, and `steps=2` is an int because the schema says int.
-	ep, e := entrypointOf(ctx, target)
+	worker := strings.TrimSpace(ctx.Inv.Value("--worker"))
+	var ep *launch.Entrypoint
+	if worker != "" {
+		ep, e = remoteEntrypointOf(ctx, worker, target.Function)
+	} else {
+		ep, e = entrypointOf(ctx, target)
+	}
 	if e != nil {
 		return e
 	}
-	worker := strings.TrimSpace(ctx.Inv.Value("--worker"))
 	if legacy := launch.LegacyFileTerm(ctx.Inv.Args[1:]); worker != "" && legacy != "" {
 		return exit.Named(exit.Usage, "remote_file_input_ambiguous",
 			"%s embeds file bytes into a JSON string and cannot name a remote input grant", legacy).
@@ -873,6 +879,23 @@ func entrypointOf(ctx *Context, t Target) (*launch.Entrypoint, *exit.Error) {
 		return nil, e
 	}
 	return facts.Descriptor.Function(t.Function)
+}
+
+func remoteEntrypointOf(ctx *Context, worker, function string) (*launch.Entrypoint, *exit.Error) {
+	l, e := home.Open(ctx.Cfg.Home)
+	if e != nil {
+		return nil, e
+	}
+	store, e := records.Open(l.DB)
+	if e != nil {
+		return nil, e
+	}
+	defer store.Close()
+	descriptor, e := rental.Descriptor(store, worker)
+	if e != nil {
+		return nil, e
+	}
+	return descriptor.Function(function)
 }
 
 // generationFacts resolves an endpoint ref to its pinned generation's facts.
