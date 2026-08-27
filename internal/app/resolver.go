@@ -107,6 +107,39 @@ func (r *Resolver) Resolve(endpoint string) (orchestrator.WorkerLaunchSpec, *exi
 	return spec, nil
 }
 
+// ResolveInstall answers from one exact immutable install row rather than the active pin.
+// It is the workflow recovery path: resolution can be retained without becoming identity.
+func (r *Resolver) ResolveInstall(installID string) (orchestrator.WorkerLaunchSpec, *exit.Error) {
+	facts, e := r.installFacts(installID)
+	if e != nil {
+		return orchestrator.WorkerLaunchSpec{}, e
+	}
+	return facts.Spec(r.Devices)
+}
+
+// Entrypoint returns one exact install's verified request/result schema for workflow
+// validation before any child request exists.
+func (r *Resolver) Entrypoint(installID, name string) (*launch.Entrypoint, *exit.Error) {
+	facts, e := r.installFacts(installID)
+	if e != nil {
+		return nil, e
+	}
+	return facts.Descriptor.Function(name)
+}
+
+func (r *Resolver) installFacts(installID string) (*launch.Facts, *exit.Error) {
+	install, e := r.store.Install(strings.TrimSpace(installID))
+	if e != nil {
+		return nil, e
+	}
+	if install == nil {
+		return nil, exit.New(exit.NotFound,
+			"workflow install %s is no longer present", installID).
+			WithRemedy("a live workflow pins its immutable install; restore the records/directory before retrying")
+	}
+	return launch.Read(*install, r.cfg.Home, r.cfg.Tool())
+}
+
 // ResolveJob answers with the spec that makes ONE job function's worker resident. It is
 // the same generation, the same venv and the same device envelope as `Resolve` — what
 // differs is the plan record staged for it and the Directive mode it boots into.

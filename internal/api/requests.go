@@ -13,6 +13,7 @@ import (
 	"github.com/cozy-creator/cozy-creator-v2/internal/canonical"
 	"github.com/cozy-creator/cozy-creator-v2/internal/exit"
 	"github.com/cozy-creator/cozy-creator-v2/internal/inputasset"
+	"github.com/cozy-creator/cozy-creator-v2/internal/launch"
 	"github.com/cozy-creator/cozy-creator-v2/internal/orchestrator"
 	"github.com/cozy-creator/cozy-creator-v2/internal/records"
 	pb "github.com/cozy-creator/cozy-creator-v2/protocol/cozy/worker/v1"
@@ -321,7 +322,7 @@ func (s *Server) resolvePlan(sub Submission) (orchestrator.Submission, *exit.Err
 		if len(out.Outputs) == 0 {
 			out.Outputs = outputs
 		}
-	} else if out.PlanID == "" {
+	} else {
 		var placement orchestrator.DesiredPlacement
 		if s.endpoints == nil {
 			return out, exit.Unavailablef("this LocalService resolves no endpoints")
@@ -335,9 +336,35 @@ func (s *Server) resolvePlan(sub Submission) (orchestrator.Submission, *exit.Err
 		if e != nil {
 			return out, e
 		}
+		if out.PlanID != "" && out.PlanID != planID {
+			return out, exit.Named(exit.Conflict, "plan_mismatch",
+				"%s/%s resolves plan %s, not caller-supplied %s",
+				sub.Endpoint, sub.Function, planID, out.PlanID)
+		}
 		out.PlanID = planID
 		if len(out.Outputs) == 0 {
 			out.Outputs = outputs
+		}
+		entrypoint, e := s.endpoints.Entrypoint(placement.InstallID, sub.Function)
+		if e != nil {
+			return out, e
+		}
+		if e := launch.ValidatePayload(entrypoint, out.Payload); e != nil {
+			return out, e
+		}
+		for index := range out.Assets {
+			assetSpec, ok := launch.AssetSpec(entrypoint, out.Assets[index].FieldPath)
+			if !ok || assetSpec.MaxBytes <= 0 || out.Assets[index].Length > assetSpec.MaxBytes {
+				return out, exit.Named(exit.Validation, "input_asset_bound",
+					"input asset %s is %d B and its pinned field admits %d B",
+					out.Assets[index].FieldPath, out.Assets[index].Length, assetSpec.MaxBytes)
+			}
+			if !assetSpec.AcceptsMediaType(out.Assets[index].MediaType) {
+				return out, exit.Named(exit.Validation, "input_asset_media_type",
+					"input asset %s is %s and its pinned field does not admit that media type",
+					out.Assets[index].FieldPath, out.Assets[index].MediaType)
+			}
+			out.Assets[index].MaxBytes = assetSpec.MaxBytes
 		}
 	}
 	return out, nil
@@ -369,7 +396,6 @@ func (s *Server) stageAssets(assets []records.AssetBinding) ([]records.AssetBind
 		}
 	}
 	seen := map[string]bool{}
-	var total int64
 	for _, asset := range assets {
 		if seen[asset.FieldPath] {
 			rollback()
@@ -377,19 +403,16 @@ func (s *Server) stageAssets(assets []records.AssetBinding) ([]records.AssetBind
 				"input asset field %q was supplied more than once", asset.FieldPath)
 		}
 		seen[asset.FieldPath] = true
-		staged, e := inputasset.Stage(s.layout, asset, inputasset.MaxBytes)
+		maxBytes := asset.MaxBytes
+		if maxBytes <= 0 {
+			maxBytes = inputasset.MaxBytes
+		}
+		staged, e := inputasset.Stage(s.layout, asset, maxBytes)
 		if e != nil {
 			rollback()
 			return nil, e
 		}
 		out = append(out, staged)
-		total += staged.Length
-		if total > inputasset.MaxTotalBytes {
-			rollback()
-			return nil, exit.Named(exit.Validation, "inputs_over_total_cap",
-				"this request's input assets declare %d B and this deployment admits %d B per attempt",
-				total, inputasset.MaxTotalBytes)
-		}
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].FieldPath < out[j].FieldPath })
 	return out, nil
@@ -562,22 +585,48 @@ func (s *Server) cancelRequest(w http.ResponseWriter, r *http.Request) {
 		s.refuse(w, r, http.StatusNotFound, "not_found", "no request "+id+" on this host", "")
 		return
 	}
+	if status := contractStatus(row.State); status == "completed" || status == "failed" || status == "canceled" {
+		s.ok(w, r, http.StatusOK, s.lifecycleOf(*row))
+		return
+	}
 	attempts, e := s.store.Attempts(id)
 	if e != nil {
 		s.refuseTyped(w, r, e)
 		return
 	}
 	if len(attempts) == 0 {
-		s.refuse(w, r, http.StatusConflict, "not_cancelable",
-			"request "+id+" has no attempt to cancel",
-			"a queued request has nothing running; it will not start once the worker is gone")
+		if e := s.orchestrator.CancelQueued(id); e != nil {
+			s.refuseTyped(w, r, e)
+			return
+		}
+		updated, e := s.store.RequestRow(id)
+		if e != nil || updated == nil {
+			s.refuse(w, r, http.StatusInternalServerError, "internal",
+				"the queued request was canceled and cannot be read back", "")
+			return
+		}
+		s.ok(w, r, http.StatusOK, s.lifecycleOf(*updated))
 		return
 	}
 	last := attempts[len(attempts)-1]
-	if last.State == "terminal" || last.State == "closed" {
-		// Already settled. Idempotent 200 with the lifecycle — a cancel that arrives
-		// after the terminal is not an error, it is late.
-		s.ok(w, r, http.StatusOK, s.lifecycleOf(*row))
+	if last.State == "closed" || last.State == "dispatch_aborted" {
+		if e := s.orchestrator.CancelQueued(id); e != nil {
+			s.refuseTyped(w, r, e)
+			return
+		}
+		updated, e := s.store.RequestRow(id)
+		if e != nil || updated == nil {
+			s.refuse(w, r, http.StatusInternalServerError, "internal",
+				"the queued request was canceled and cannot be read back", "")
+			return
+		}
+		s.ok(w, r, http.StatusOK, s.lifecycleOf(*updated))
+		return
+	}
+	if last.State == "terminal" {
+		s.refuse(w, r, http.StatusConflict, "terminal_ack_pending",
+			"the current attempt has a terminal whose retry/settlement projection is not acknowledged yet",
+			"retry cancellation after the terminal ack; no new attempt can dispatch before that projection")
 		return
 	}
 	grace := uint64(5000)

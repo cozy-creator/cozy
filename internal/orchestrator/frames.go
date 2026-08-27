@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"crypto/sha256"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
@@ -164,6 +165,7 @@ func (c *Orchestrator) placementSpec(p DesiredPlacement, subjects []*pb.Artifact
 // "your message arrived" and "your intent is satisfied" — are now two separate readable
 // numbers (#473).
 func (c *Orchestrator) onObserved(s *session, r *pb.ObservedWorkerState) {
+	defer c.wakeWorkflows()
 	var status *pb.PlacementStatus
 	c.mu.Lock()
 	w := c.workers[s.instanceID]
@@ -560,6 +562,7 @@ func (c *Orchestrator) onOutcome(s *session, t *pb.AttemptOutcome) {
 // recovery. It is intentionally idempotent: cleanup and BeginRequeue both have durable
 // guards, so a replay cannot spend twice or delete a still-owned asset.
 func (c *Orchestrator) afterAck(req records.Request, attempt records.Attempt, holder *worker) {
+	defer c.wakeWorkflows()
 	requeue := req.State == "requeue_pending"
 	c.cleanupAttempt(req, uint64(attempt.Attempt), holder, !requeue)
 	verdict := outcomeError(attempt.TerminalStatus, attempt.TerminalCause, attempt.SafeMessage)
@@ -623,6 +626,11 @@ func (c *Orchestrator) cleanupRemote(requestID string, attempt uint64, holder *w
 // Every remote Report retries the durable obligations still assigned to that worker.
 // DELETE is idempotent, and media_cleaned stops successful rows from being revisited.
 func (c *Orchestrator) retryMediaCleanup(holder *worker) {
+	// Local workers have no pod media plane. Their attempt directories are removed by
+	// cleanupAttempt; a recovered local snapshot must never try to call a nil client.
+	if holder == nil || holder.media == nil {
+		return
+	}
 	owed, e := c.opt.Store.MediaCleanupOwed(holder.instanceID)
 	if e != nil {
 		c.logf("cannot read media cleanup obligations of %s: %s", holder.instanceID, e.Message)
@@ -894,21 +902,17 @@ func (c *Orchestrator) fetchOutputs(req records.Request, attempt uint64,
 		if id == "" {
 			continue
 		}
-		data, e := holder.media.GetOutput(slot, id)
+		destination := filepath.Join(dir, id)
+		length := canonical.Doc(entry).Int("length")
+		digest := canonical.Doc(entry).Str("digest")
+		written, e := holder.media.GetOutputTo(slot, id, destination, digest, length)
 		if e != nil {
 			return e.WithRemedy("the pod declared this output in its terminal and this host "+
 				"cannot fetch it from the pod's media plane, so the terminal stays OWED and "+
 				"unacked rather than being accepted with a row that points at nothing (%s)",
 				e.Remedy)
 		}
-		staging := filepath.Join(dir, id+".mirroring")
-		if err := os.WriteFile(staging, data, 0o644); err != nil {
-			return exit.Internalf("cannot land the mirrored output %s: %s", id, err)
-		}
-		if err := os.Rename(staging, filepath.Join(dir, id)); err != nil {
-			return exit.Internalf("cannot commit the mirrored output %s: %s", id, err)
-		}
-		c.logf("mirrored %s#%d/%s: %d B from %s", req.ID, attempt, id, len(data),
+		c.logf("mirrored %s#%d/%s: %d B from %s", req.ID, attempt, id, written,
 			holder.media.Addr())
 	}
 	return nil
@@ -919,17 +923,23 @@ func (c *Orchestrator) fetchOutputs(req records.Request, attempt uint64,
 // per-output ceiling already bounds how large one can be — because a length that agrees
 // with a digest that does not is the interesting failure, not the cheap one.
 func verifyBytes(path, digest string, length int64) *exit.Error {
-	data, err := os.ReadFile(path)
+	file, err := os.Open(path)
 	if err != nil {
 		return exit.New(exit.Failed,
 			"the declared output at %s cannot be read here: %s", path, err)
 	}
-	if int64(len(data)) != length {
+	defer file.Close()
+	hash := sha256.New()
+	read, err := io.Copy(hash, io.LimitReader(file, length+1))
+	if err != nil {
 		return exit.New(exit.Failed,
-			"the output at %s is %d B and its manifest declares %d B", path, len(data), length)
+			"the declared output at %s cannot be read here: %s", path, err)
 	}
-	sum := sha256.Sum256(data)
-	spelled, serr := canonical.Spell(sum[:])
+	if read != length {
+		return exit.New(exit.Failed,
+			"the output at %s is %d B and its manifest declares %d B", path, read, length)
+	}
+	spelled, serr := canonical.Spell(hash.Sum(nil))
 	if serr != nil {
 		return exit.Internalf("cannot spell the mirrored output's digest: %s", serr)
 	}

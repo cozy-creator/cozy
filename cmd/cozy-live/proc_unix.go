@@ -15,8 +15,9 @@ func setProcessGroup(cmd *exec.Cmd) {
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 }
 
-// killGroup signals the whole group: the kill arms are about what survives when NOTHING
-// runs a shutdown path, so the grandchildren have to go with the parent.
+// killGroup signals exactly the named process group. Workers deliberately launch in
+// their own groups, so an owner-kill arm leaves them for restart reconciliation to find
+// and fence by pid plus kernel birth identity.
 func killGroup(pid int, sig syscall.Signal) error {
 	return syscall.Kill(-pid, sig)
 }

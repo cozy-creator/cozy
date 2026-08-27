@@ -84,7 +84,7 @@ type options struct {
 }
 
 func run(args []string) int {
-	opt := options{quota: 8 << 30, maxBody: 256 << 20}
+	opt := options{quota: 8 << 30}
 	for i := 0; i < len(args); i++ {
 		name := strings.TrimPrefix(args[i], "--")
 		value := ""
@@ -131,6 +131,11 @@ func run(args []string) int {
 		return usage("--root <dir> is required: this server owns exactly one subtree")
 	case opt.tokens == "":
 		return usage("--tokens <file> is required: there is no unauthenticated mode")
+	}
+	if opt.maxBody == 0 {
+		// No private object ceiling sits below the pod's admitted media quota. A caller
+		// may still set a smaller explicit bound for a constrained deployment.
+		opt.maxBody = opt.quota
 	}
 	for _, dir := range []string{filepath.Join(opt.root, "inputs"), filepath.Join(opt.root, "outputs")} {
 		if err := os.MkdirAll(dir, 0o755); err != nil {
@@ -378,9 +383,12 @@ func (s *server) reservations() (map[string]int64, error) {
 // take reads one request body under two bounds: this server's per-body cap, and whatever
 // room the quota leaves. The DECLARED length refuses first when the caller declared one,
 // so an oversized upload is answered before its bytes move.
-func (s *server) take(w http.ResponseWriter, r *http.Request) ([]byte, bool) {
+func (s *server) bodyLimit(w http.ResponseWriter, r *http.Request, routeMax int64) (int64, bool) {
 	room := s.opt.quota - s.used()
 	limit := s.opt.maxBody
+	if routeMax > 0 && routeMax < limit {
+		limit = routeMax
+	}
 	if room < limit {
 		limit = room
 	}
@@ -389,12 +397,20 @@ func (s *server) take(w http.ResponseWriter, r *http.Request) ([]byte, bool) {
 			fmt.Sprintf("this pod's media subtree holds %d B of its %d B quota", s.used(), s.opt.quota),
 			"outputs already downloaded can be dropped; a media subtree is deliberately "+
 				"separate from the worker's journal so a full one never stops an attempt")
-		return nil, false
+		return 0, false
 	}
 	if r.ContentLength > limit {
 		refuse(w, http.StatusRequestEntityTooLarge, "media.over_bound",
 			fmt.Sprintf("the body declares %d B and %d B is admissible here", r.ContentLength, limit),
 			"the DECLARED length refuses before a byte moves; the bytes meet the same bound")
+		return 0, false
+	}
+	return limit, true
+}
+
+func (s *server) take(w http.ResponseWriter, r *http.Request, routeMax int64) ([]byte, bool) {
+	limit, ok := s.bodyLimit(w, r, routeMax)
+	if !ok {
 		return nil, false
 	}
 	data, err := io.ReadAll(io.LimitReader(r.Body, limit+1))
@@ -411,6 +427,71 @@ func (s *server) take(w http.ResponseWriter, r *http.Request) ([]byte, bool) {
 		return nil, false
 	}
 	return data, true
+}
+
+// streamInput atomically lands one bounded upload while hashing/counting it. Encoded
+// media never becomes a []byte in the media server.
+func (s *server) streamInput(w http.ResponseWriter, r *http.Request,
+	destination string) (int64, string, bool) {
+	limit, ok := s.bodyLimit(w, r, 0)
+	if !ok {
+		return 0, "", false
+	}
+	if err := os.MkdirAll(filepath.Dir(destination), 0o755); err != nil {
+		refuse(w, http.StatusInternalServerError, "media.unwritable",
+			"the input directory could not be created: "+err.Error(), "check the pod's media subtree")
+		return 0, "", false
+	}
+	staging, err := os.CreateTemp(filepath.Dir(destination), "."+filepath.Base(destination)+".staging-*")
+	if err != nil {
+		refuse(w, http.StatusInternalServerError, "media.unwritable",
+			"the input could not be staged: "+err.Error(), "check the pod's media subtree")
+		return 0, "", false
+	}
+	path := staging.Name()
+	keep := false
+	defer func() {
+		_ = staging.Close()
+		if !keep {
+			_ = os.Remove(path)
+		}
+	}()
+	hash := sha256.New()
+	length, err := io.Copy(io.MultiWriter(staging, hash), io.LimitReader(r.Body, limit+1))
+	if err != nil {
+		refuse(w, http.StatusBadRequest, "media.body_unreadable",
+			"the request body ended early: "+err.Error(), "re-send it")
+		return 0, "", false
+	}
+	if length > limit {
+		refuse(w, http.StatusRequestEntityTooLarge, "media.over_bound",
+			fmt.Sprintf("the body passed %d B and was cut there", limit),
+			"a stream may not exceed what this server admits")
+		return 0, "", false
+	}
+	if r.ContentLength >= 0 && length != r.ContentLength {
+		refuse(w, http.StatusBadRequest, "media.body_unreadable",
+			fmt.Sprintf("the body declared %d B and delivered %d B", r.ContentLength, length),
+			"re-send the exact input")
+		return 0, "", false
+	}
+	if err := staging.Sync(); err != nil {
+		refuse(w, http.StatusInternalServerError, "media.unwritable",
+			"the staged input could not be synced: "+err.Error(), "check the pod's media subtree")
+		return 0, "", false
+	}
+	if err := staging.Close(); err != nil {
+		refuse(w, http.StatusInternalServerError, "media.unwritable",
+			"the staged input could not be closed: "+err.Error(), "check the pod's media subtree")
+		return 0, "", false
+	}
+	if err := os.Rename(path, destination); err != nil {
+		refuse(w, http.StatusInternalServerError, "media.unwritable",
+			"the staged input could not be committed: "+err.Error(), "check the pod's media subtree")
+		return 0, "", false
+	}
+	keep = true
+	return length, "sha256:" + hex.EncodeToString(hash.Sum(nil)), true
 }
 
 // commit writes bytes atomically: a temporary beside the destination, then a rename. A
@@ -446,18 +527,13 @@ func (s *server) putInput(w http.ResponseWriter, r *http.Request) {
 	}
 	s.writes.Lock()
 	defer s.writes.Unlock()
-	data, ok := s.take(w, r)
+	path := filepath.Join(s.opt.root, "inputs", names[0])
+	length, digest, ok := s.streamInput(w, r, path)
 	if !ok {
 		return
 	}
-	path := filepath.Join(s.opt.root, "inputs", names[0])
-	if err := commit(path, data); err != nil {
-		refuse(w, http.StatusInternalServerError, "media.unwritable",
-			"the input could not be landed: "+err.Error(), "check the pod's media subtree")
-		return
-	}
 	answer(w, http.StatusCreated, map[string]any{
-		"path": path, "digest": digestOf(data), "length": len(data),
+		"path": path, "digest": digest, "length": length,
 	})
 }
 
@@ -484,7 +560,7 @@ func (s *server) putPlan(w http.ResponseWriter, r *http.Request) {
 	}
 	s.writes.Lock()
 	defer s.writes.Unlock()
-	data, ok := s.take(w, r)
+	data, ok := s.take(w, r, canonical.DocMax)
 	if !ok {
 		return
 	}
@@ -648,17 +724,7 @@ func (s *server) getOutput(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	path := filepath.Join(s.opt.root, "outputs", names[0], names[1])
-	// BOUNDED, even though the worker wrote it. The slot reservation is an aggregate bound,
-	// not permission to load any one object into memory, so this read is held to the
-	// server's per-body cap as well. An oversized output is refused rather than loaded.
-	if info, err := os.Stat(path); err == nil && info.Size() > s.opt.maxBody {
-		refuse(w, http.StatusRequestEntityTooLarge, "media.over_bound",
-			fmt.Sprintf("the output at %s/%s is %d B and %d B is admissible here",
-				names[0], names[1], info.Size(), s.opt.maxBody),
-			"raise --max-body on this pod's media server, or grant a smaller output")
-		return
-	}
-	data, err := os.ReadFile(path)
+	file, err := os.Open(path)
 	if err != nil {
 		refuse(w, http.StatusNotFound, "media.absent",
 			fmt.Sprintf("no output %q in slot %q on this pod", names[1], names[0]),
@@ -666,11 +732,29 @@ func (s *server) getOutput(w http.ResponseWriter, r *http.Request) {
 				"attempt that failed to write is a terminal the owner must not ack")
 		return
 	}
+	defer file.Close()
+	info, err := file.Stat()
+	if err != nil || !info.Mode().IsRegular() {
+		refuse(w, http.StatusNotFound, "media.absent",
+			fmt.Sprintf("output %q in slot %q is not one readable regular file", names[1], names[0]),
+			"the worker publishes one regular file for each declared output")
+		return
+	}
+	// BOUNDED, even though the worker wrote it. The slot reservation is an aggregate bound,
+	// not permission for an oversized object. The owner hashes the stream against the
+	// terminal manifest while landing it, so this server does not make a redundant first
+	// pass or hold bytes merely to produce a digest header.
+	if info.Size() > s.opt.maxBody {
+		refuse(w, http.StatusRequestEntityTooLarge, "media.over_bound",
+			fmt.Sprintf("the output at %s/%s is %d B and %d B is admissible here",
+				names[0], names[1], info.Size(), s.opt.maxBody),
+			"raise --max-body on this pod's media server, or grant a smaller output")
+		return
+	}
 	w.Header().Set("Content-Type", "application/octet-stream")
-	w.Header().Set("X-Cozy-Digest", digestOf(data))
-	w.Header().Set("Content-Length", strconv.Itoa(len(data)))
+	w.Header().Set("Content-Length", strconv.FormatInt(info.Size(), 10))
 	w.WriteHeader(http.StatusOK)
-	_, _ = w.Write(data)
+	_, _ = io.CopyN(w, file, info.Size())
 }
 
 // health answers that this server is up and says what it is holding. It is authenticated
@@ -681,7 +765,7 @@ func (s *server) health(w http.ResponseWriter, r *http.Request) {
 	}
 	answer(w, http.StatusOK, map[string]any{
 		"media": "cozy.media/1", "root": s.opt.root,
-		"used_bytes": s.used(), "quota_bytes": s.opt.quota,
+		"used_bytes": s.used(), "quota_bytes": s.opt.quota, "max_object_bytes": s.opt.maxBody,
 		"plans": s.opt.plans != "",
 	})
 }

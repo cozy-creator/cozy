@@ -19,12 +19,10 @@ import (
 	"github.com/cozy-creator/cozy-creator-v2/internal/records"
 )
 
-// The deployment's current eager-hydration ceilings. They are checked before a request
-// buys remote work and match the worker defaults that enforce them again.
-const (
-	MaxBytes      = int64(64 << 20)
-	MaxTotalBytes = int64(256 << 20)
-)
+// MaxBytes is the compatibility fallback for an older descriptor with no effective
+// field bound. Current descriptors carry each field's selected max_bytes; no private
+// aggregate cap exists here.
+const MaxBytes = int64(64 << 20)
 
 var ownership sync.Mutex
 
@@ -48,64 +46,76 @@ func ValidateID(fieldPath string) *exit.Error {
 	return nil
 }
 
-// Inspect reads one bounded regular file and returns the identity facts used by both the
-// request record and InvocationSpec. Unknown media type stays empty; claiming generic
-// octet-stream would contradict a more capable worker sniffer.
-func Inspect(path string, max int64) ([]byte, string, string, *exit.Error) {
+// Fingerprint streams one bounded regular file and returns the identity facts used by
+// both the request record and InvocationSpec. Encoded media never enters a whole-file
+// buffer. Unknown media type stays empty.
+func Fingerprint(path string, max int64) (int64, string, string, *exit.Error) {
 	file, err := os.Open(path)
 	if err != nil {
-		return nil, "", "", exit.New(exit.NotFound, "input asset %s: %s", path, err)
+		return 0, "", "", exit.New(exit.NotFound, "input asset %s: %s", path, err)
 	}
 	defer file.Close()
 	info, err := file.Stat()
 	if err != nil {
-		return nil, "", "", exit.New(exit.NotFound, "input asset %s: %s", path, err)
+		return 0, "", "", exit.New(exit.NotFound, "input asset %s: %s", path, err)
 	}
 	if !info.Mode().IsRegular() {
-		return nil, "", "", exit.New(exit.Validation, "input asset %s is not a regular file", path)
+		return 0, "", "", exit.New(exit.Validation, "input asset %s is not a regular file", path)
 	}
-	if info.Size() > max {
-		return nil, "", "", overCap(path, info.Size(), max)
+	if max > 0 && info.Size() > max {
+		return 0, "", "", overCap(path, info.Size(), max)
 	}
-	data, err := io.ReadAll(io.LimitReader(file, max+1))
-	if err != nil {
-		return nil, "", "", exit.New(exit.NotFound, "input asset %s: %s", path, err)
+	hash := sha256.New()
+	prefix := make([]byte, 0, 512)
+	buffer := make([]byte, 64<<10)
+	var length int64
+	for {
+		n, readErr := file.Read(buffer)
+		if n > 0 {
+			length += int64(n)
+			if max > 0 && length > max {
+				return 0, "", "", overCap(path, length, max)
+			}
+			_, _ = hash.Write(buffer[:n])
+			if len(prefix) < cap(prefix) {
+				take := min(n, cap(prefix)-len(prefix))
+				prefix = append(prefix, buffer[:take]...)
+			}
+		}
+		if readErr == io.EOF {
+			break
+		}
+		if readErr != nil {
+			return 0, "", "", exit.New(exit.NotFound, "input asset %s: %s", path, readErr)
+		}
 	}
-	if int64(len(data)) > max {
-		return nil, "", "", overCap(path, int64(len(data)), max)
+	if length != info.Size() {
+		return 0, "", "", exit.Named(exit.Conflict, "input_asset_changed",
+			"input asset %s changed length while it was fingerprinted", filepath.Base(path))
 	}
-	sum := sha256.Sum256(data)
-	digest := "sha256:" + hex.EncodeToString(sum[:])
-	mediaType := http.DetectContentType(data)
-	mediaType = strings.ToLower(strings.TrimSpace(strings.Split(mediaType, ";")[0]))
-	switch mediaType {
-	case "audio/wave", "audio/x-wav":
-		mediaType = "audio/wav"
-	}
-	if mediaType == "application/octet-stream" {
-		mediaType = ""
-	}
-	return data, digest, mediaType, nil
+	digest := "sha256:" + hex.EncodeToString(hash.Sum(nil))
+	mediaType := normalizeMediaType(http.DetectContentType(prefix))
+	return length, digest, mediaType, nil
 }
 
-// Read proves that the durable file still matches the request row before a grant is
+// Verify proves that the durable file still matches the request row before a grant is
 // minted. A mutable path can therefore never silently change an idempotent request.
-func Read(binding records.AssetBinding, max int64) ([]byte, *exit.Error) {
-	data, digest, mediaType, e := Inspect(binding.LocalPath, max)
+func Verify(binding records.AssetBinding, max int64) *exit.Error {
+	length, digest, mediaType, e := Fingerprint(binding.LocalPath, max)
 	if e != nil {
-		return nil, e
+		return e
 	}
-	if digest != binding.Digest || int64(len(data)) != binding.Length {
-		return nil, exit.Named(exit.Conflict, "input_asset_changed",
+	if digest != binding.Digest || length != binding.Length {
+		return exit.Named(exit.Conflict, "input_asset_changed",
 			"input asset %s no longer matches its request identity", binding.FieldPath).
 			WithRemedy("the service stages immutable input bytes before recording a request; restore the local input store before retrying")
 	}
 	if binding.MediaType != "" && mediaType != "" && binding.MediaType != mediaType {
-		return nil, exit.Named(exit.Conflict, "input_asset_type_changed",
+		return exit.Named(exit.Conflict, "input_asset_type_changed",
 			"input asset %s was recorded as %s and now sniffs as %s",
 			binding.FieldPath, binding.MediaType, mediaType)
 	}
-	return data, nil
+	return nil
 }
 
 // Stage verifies a caller's claims and atomically copies the bytes into the service's
@@ -119,23 +129,24 @@ func Stage(layout home.Layout, binding records.AssetBinding, max int64) (records
 	if e := ValidateID(binding.FieldPath); e != nil {
 		return binding, e
 	}
-	data, digest, mediaType, e := Inspect(binding.LocalPath, max)
-	if e != nil && validDigest(binding.Digest) {
-		staged := layout.InputAsset(binding.Digest)
-		data, digest, mediaType, e = Inspect(staged, max)
+	source := binding.LocalPath
+	if _, err := os.Stat(source); err != nil && validDigest(binding.Digest) {
+		source = layout.InputAsset(binding.Digest)
 	}
+	stagingPath, length, digest, mediaType, e := stageSource(layout, source, max)
 	if e != nil {
 		return binding, e
 	}
+	defer os.Remove(stagingPath)
 	if binding.Digest != "" && binding.Digest != digest {
 		return binding, exit.Named(exit.Validation, "input_digest_mismatch",
 			"input asset %s was declared as %s and its bytes hash to %s",
 			binding.FieldPath, binding.Digest, digest)
 	}
-	if binding.Length != 0 && binding.Length != int64(len(data)) {
+	if binding.Length != 0 && binding.Length != length {
 		return binding, exit.Named(exit.Validation, "input_length_mismatch",
 			"input asset %s was declared as %d B and holds %d B",
-			binding.FieldPath, binding.Length, len(data))
+			binding.FieldPath, binding.Length, length)
 	}
 	if binding.MediaType != "" && mediaType != "" && binding.MediaType != mediaType {
 		return binding, exit.Named(exit.Validation, "input_media_type",
@@ -143,10 +154,10 @@ func Stage(layout home.Layout, binding records.AssetBinding, max int64) (records
 			binding.FieldPath, binding.MediaType, mediaType)
 	}
 
-	binding.Digest, binding.Length, binding.MediaType = digest, int64(len(data)), mediaType
+	binding.Digest, binding.Length, binding.MediaType = digest, length, mediaType
 	destination := layout.InputAsset(digest)
 	if _, err := os.Stat(destination); err == nil {
-		_, existingDigest, _, check := Inspect(destination, max)
+		_, existingDigest, _, check := Fingerprint(destination, max)
 		if check != nil || existingDigest != digest {
 			return binding, exit.Named(exit.Conflict, "input_store_corrupt",
 				"the staged object for input asset %s does not match %s", binding.FieldPath, digest).
@@ -155,21 +166,7 @@ func Stage(layout home.Layout, binding records.AssetBinding, max int64) (records
 	} else if !os.IsNotExist(err) {
 		return binding, exit.Internalf("cannot inspect the input store for %s: %s", binding.FieldPath, err)
 	} else {
-		staging, err := os.CreateTemp(layout.Inputs, ".asset-*")
-		if err != nil {
-			return binding, exit.Internalf("cannot stage input asset %s: %s", binding.FieldPath, err)
-		}
-		stagingPath := staging.Name()
-		defer os.Remove(stagingPath)
-		if _, err = staging.Write(data); err == nil {
-			err = staging.Sync()
-		}
-		if closeErr := staging.Close(); err == nil {
-			err = closeErr
-		}
-		if err == nil {
-			err = os.Rename(stagingPath, destination)
-		}
+		err := os.Rename(stagingPath, destination)
 		if err != nil {
 			// Another concurrent submission of the same digest may have won the rename.
 			if _, statErr := os.Stat(destination); statErr != nil {
@@ -179,6 +176,84 @@ func Stage(layout home.Layout, binding records.AssetBinding, max int64) (records
 	}
 	binding.LocalPath = destination
 	return binding, nil
+}
+
+func stageSource(layout home.Layout, source string, max int64) (string, int64, string, string, *exit.Error) {
+	file, err := os.Open(source)
+	if err != nil {
+		return "", 0, "", "", exit.New(exit.NotFound, "input asset %s: %s", source, err)
+	}
+	defer file.Close()
+	info, err := file.Stat()
+	if err != nil || !info.Mode().IsRegular() {
+		return "", 0, "", "", exit.New(exit.Validation, "input asset %s is not a regular file", source)
+	}
+	if max > 0 && info.Size() > max {
+		return "", 0, "", "", overCap(source, info.Size(), max)
+	}
+	staging, err := os.CreateTemp(layout.Inputs, ".asset-*")
+	if err != nil {
+		return "", 0, "", "", exit.Internalf("cannot stage input asset: %s", err)
+	}
+	path := staging.Name()
+	keep := false
+	defer func() {
+		_ = staging.Close()
+		if !keep {
+			_ = os.Remove(path)
+		}
+	}()
+	hash := sha256.New()
+	prefix := make([]byte, 0, 512)
+	buffer := make([]byte, 64<<10)
+	var length int64
+	for {
+		n, readErr := file.Read(buffer)
+		if n > 0 {
+			length += int64(n)
+			if max > 0 && length > max {
+				return "", 0, "", "", overCap(source, length, max)
+			}
+			_, _ = hash.Write(buffer[:n])
+			if len(prefix) < cap(prefix) {
+				take := min(n, cap(prefix)-len(prefix))
+				prefix = append(prefix, buffer[:take]...)
+			}
+			if _, err := staging.Write(buffer[:n]); err != nil {
+				return "", 0, "", "", exit.Internalf("cannot stage input asset: %s", err)
+			}
+		}
+		if readErr == io.EOF {
+			break
+		}
+		if readErr != nil {
+			return "", 0, "", "", exit.New(exit.NotFound, "input asset %s: %s", source, readErr)
+		}
+	}
+	if length != info.Size() {
+		return "", 0, "", "", exit.Named(exit.Conflict, "input_asset_changed",
+			"input asset %s changed length while it was staged", filepath.Base(source))
+	}
+	if err := staging.Sync(); err != nil {
+		return "", 0, "", "", exit.Internalf("cannot sync staged input asset: %s", err)
+	}
+	if err := staging.Close(); err != nil {
+		return "", 0, "", "", exit.Internalf("cannot close staged input asset: %s", err)
+	}
+	mediaType := normalizeMediaType(http.DetectContentType(prefix))
+	keep = true
+	return path, length, "sha256:" + hex.EncodeToString(hash.Sum(nil)), mediaType, nil
+}
+
+func normalizeMediaType(mediaType string) string {
+	mediaType = strings.ToLower(strings.TrimSpace(strings.Split(mediaType, ";")[0]))
+	switch mediaType {
+	case "audio/wave", "audio/x-wav":
+		mediaType = "audio/wav"
+	case "application/octet-stream":
+		mediaType = ""
+	}
+	return mediaType
 }
 
 // Drop removes one exact content-addressed staging object after the records authority

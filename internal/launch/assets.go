@@ -30,7 +30,6 @@ func ParseAssets(ep *Entrypoint, payload json.RawMessage, specs []string) (json.
 
 	seen := map[string]bool{}
 	assets := make([]records.AssetBinding, 0, len(specs))
-	var total int64
 	for _, spec := range specs {
 		fieldPath, source, ok := strings.Cut(spec, "=")
 		fieldPath, source = strings.TrimSpace(fieldPath), strings.TrimSpace(source)
@@ -55,27 +54,31 @@ func ParseAssets(ep *Entrypoint, payload json.RawMessage, specs []string) (json.
 				"%s.%s is not an asset field in this release's request schema", ep.Name, fieldPath).
 				WithRemedy("`cozy describe <org/endpoint>/%s` prints the recorded request schema", ep.Name)
 		}
+		assetSpec, _ := AssetSpec(ep, fieldPath)
+		maxBytes := assetSpec.MaxBytes
+		if maxBytes <= 0 {
+			maxBytes = inputasset.MaxBytes
+		}
 
 		absolute, err := filepath.Abs(source)
 		if err != nil {
 			return nil, nil, exit.New(exit.NotFound, "cannot resolve input asset %s: %s", source, err)
 		}
-		data, digest, mediaType, e := inputasset.Inspect(absolute, inputasset.MaxBytes)
+		length, digest, mediaType, e := inputasset.Fingerprint(absolute, maxBytes)
 		if e != nil {
 			return nil, nil, e
 		}
-		total += int64(len(data))
-		if total > inputasset.MaxTotalBytes {
-			return nil, nil, exit.Named(exit.Validation, "inputs_over_total_cap",
-				"this request's input assets declare %d B and this deployment admits %d B per attempt",
-				total, inputasset.MaxTotalBytes)
+		if !assetSpec.AcceptsMediaType(mediaType) {
+			return nil, nil, exit.New(exit.Validation,
+				"%s.%s accepts media types [%s], not %q",
+				ep.Name, fieldPath, strings.Join(assetSpec.MediaTypes, ", "), mediaType)
 		}
 		if e := setAssetRef(document, parts, digest); e != nil {
 			return nil, nil, e
 		}
 		assets = append(assets, records.AssetBinding{
 			FieldPath: fieldPath, LocalPath: absolute, Digest: digest,
-			Length: int64(len(data)), MediaType: mediaType, Order: pathOrder(parts),
+			Length: length, MediaType: mediaType, Order: pathOrder(parts), MaxBytes: maxBytes,
 		})
 	}
 	sort.Slice(assets, func(i, j int) bool { return assets[i].FieldPath < assets[j].FieldPath })
@@ -111,55 +114,115 @@ func assetPath(path string) ([]string, *exit.Error) {
 }
 
 func assetAt(root Struct, parts []string) bool {
-	if len(parts) == 0 {
-		return false
+	_, ok := assetSpecAt(root, parts, AssetField{})
+	return ok
+}
+
+type AssetField struct {
+	Kind       string
+	MaxBytes   int64
+	MediaTypes []string
+}
+
+func (f AssetField) AcceptsMediaType(actual string) bool {
+	if len(f.MediaTypes) == 0 {
+		return true
 	}
-	for _, field := range root.Fields {
-		if field.Name == parts[0] {
-			var schema any
-			return json.Unmarshal(field.Type, &schema) == nil && assetAtValue(schema, parts[1:])
+	for _, mediaType := range f.MediaTypes {
+		if strings.EqualFold(strings.TrimSpace(mediaType), strings.TrimSpace(actual)) {
+			return true
 		}
 	}
 	return false
 }
 
-func assetAtValue(schema any, parts []string) bool {
+// AssetSpec returns the exact asset kind, compressed-byte bound, and accepted media types
+// at one request path.
+func AssetSpec(ep *Entrypoint, path string) (AssetField, bool) {
+	parts, problem := assetPath(path)
+	if problem != nil {
+		return AssetField{}, false
+	}
+	return assetSpecAt(ep.Request, parts, AssetField{})
+}
+
+func assetSpecAt(root Struct, parts []string, inherited AssetField) (AssetField, bool) {
+	if len(parts) == 0 {
+		return AssetField{}, false
+	}
+	for _, field := range root.Fields {
+		if field.Name != parts[0] {
+			continue
+		}
+		spec := inherited
+		if field.AssetBound.MaxBytes > 0 {
+			spec.MaxBytes = field.AssetBound.MaxBytes
+		}
+		if len(field.AssetBound.MediaTypes) > 0 {
+			spec.MediaTypes = append([]string(nil), field.AssetBound.MediaTypes...)
+		}
+		var schema any
+		if json.Unmarshal(field.Type, &schema) != nil {
+			return AssetField{}, false
+		}
+		return assetSpecAtValue(schema, parts[1:], spec)
+	}
+	return AssetField{}, false
+}
+
+func assetSpecAtValue(schema any, parts []string, inherited AssetField) (AssetField, bool) {
 	object, ok := schema.(map[string]any)
 	if !ok {
-		return false
+		return AssetField{}, false
 	}
-	if _, ok := object["asset"].(string); ok {
-		return len(parts) == 0
+	if kind, ok := object["asset"].(string); ok {
+		inherited.Kind = kind
+		return inherited, len(parts) == 0
 	}
 	if union, ok := object["union"].([]any); ok {
 		for _, branch := range union {
-			if assetAtValue(branch, parts) {
-				return true
+			if spec, ok := assetSpecAtValue(branch, parts, inherited); ok {
+				return spec, true
 			}
 		}
-		return false
+		return AssetField{}, false
 	}
 	if item, ok := object["list"]; ok {
 		if len(parts) == 0 {
-			return false
+			return AssetField{}, false
 		}
 		if _, err := strconv.ParseUint(parts[0], 10, 31); err != nil {
-			return false
+			return AssetField{}, false
 		}
-		return assetAtValue(item, parts[1:])
+		return assetSpecAtValue(item, parts[1:], inherited)
 	}
 	fields, ok := object["fields"].([]any)
 	if !ok || len(parts) == 0 {
-		return false
+		return AssetField{}, false
 	}
 	for _, row := range fields {
-		field, ok := row.(map[string]any)
-		if !ok || field["name"] != parts[0] {
+		encoded, err := json.Marshal(row)
+		if err != nil {
 			continue
 		}
-		return assetAtValue(field["type"], parts[1:])
+		var field Field
+		if json.Unmarshal(encoded, &field) != nil || field.Name != parts[0] {
+			continue
+		}
+		spec := inherited
+		if field.AssetBound.MaxBytes > 0 {
+			spec.MaxBytes = field.AssetBound.MaxBytes
+		}
+		if len(field.AssetBound.MediaTypes) > 0 {
+			spec.MediaTypes = append([]string(nil), field.AssetBound.MediaTypes...)
+		}
+		var nested any
+		if json.Unmarshal(field.Type, &nested) != nil {
+			return AssetField{}, false
+		}
+		return assetSpecAtValue(nested, parts[1:], spec)
 	}
-	return false
+	return AssetField{}, false
 }
 
 func setAssetRef(document map[string]any, parts []string, ref string) *exit.Error {

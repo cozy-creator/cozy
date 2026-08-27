@@ -68,15 +68,17 @@ func TestOpenNormalizesLegacyClosedRequeueThroughBudget(t *testing.T) {
 	if owed, e := store.Owed(); e != nil || len(owed) != 0 {
 		t.Fatalf("legacy request bypassed BeginRequeue before budget charge: %#v, %v", owed, e)
 	}
-	count, started, e := store.BeginRequeue("req-legacy", 3)
+	count, started, canceled, e := store.BeginRequeue("req-legacy", 3)
 	if e != nil || !started || count != 3 {
-		t.Fatalf("BeginRequeue = count %d, started %v, %v; want charged third requeue", count, started, e)
+		t.Fatalf("BeginRequeue = count %d, started %v, canceled %v, %v; want charged third requeue",
+			count, started, canceled, e)
 	}
 	if owed, e := store.Owed(); e != nil || len(owed) != 1 || owed[0].ID != "req-legacy" {
 		t.Fatalf("charged legacy request is not owed exactly once: %#v, %v", owed, e)
 	}
-	count, started, e = store.BeginRequeue("req-legacy", 3)
+	count, started, canceled, e = store.BeginRequeue("req-legacy", 3)
 	if e != nil || started || count != 3 {
-		t.Fatalf("second BeginRequeue = count %d, started %v, %v; want idempotent no-op", count, started, e)
+		t.Fatalf("second BeginRequeue = count %d, started %v, canceled %v, %v; want idempotent no-op",
+			count, started, canceled, e)
 	}
 }

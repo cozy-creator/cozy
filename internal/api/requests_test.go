@@ -33,7 +33,14 @@ func TestSettledAssetReplayUsesDurableIdentityBeforeFiles(t *testing.T) {
 	}
 	defer owner.Close(time.Second)
 	cli := secret.New("cli-test-token")
-	s := New(Options{Orchestrator: owner, Creds: Credentials{CLI: cli}, Addr: "127.0.0.1:2699"})
+	binding := &orchestrator.Binding{Entrypoint: "run", Outputs: []string{"video"},
+		RuntimePlan: &orchestrator.BindingPlanSubject{SubjectID: workflowTestDigest,
+			Digest: workflowTestDigest, Kind: "plan", Length: 1}}
+	resolver := workflowResolver{placement: orchestrator.DesiredPlacement{
+		Endpoint: "org/ep", ReleaseID: "org/ep@1.0.0", InstallID: "install-api",
+		DescriptorDigest: workflowTestDigest, Bindings: []*orchestrator.Binding{binding}}}
+	s := New(Options{Orchestrator: owner, Creds: Credentials{CLI: cli},
+		Addr: "127.0.0.1:2699", Endpoints: resolver})
 	handler, e := s.Handler()
 	if e != nil {
 		t.Fatal(e)
@@ -43,17 +50,17 @@ func TestSettledAssetReplayUsesDurableIdentityBeforeFiles(t *testing.T) {
 	if err := os.WriteFile(source, []byte("asset bytes"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	data, digest, mediaType, inspected := inputasset.Inspect(source, inputasset.MaxBytes)
+	length, digest, mediaType, inspected := inputasset.Fingerprint(source, inputasset.MaxBytes)
 	if inspected != nil {
 		t.Fatal(inspected)
 	}
 	submission := Submission{
-		Endpoint: "org/model", Function: "generate", PlanID: "sha256:plan",
+		Endpoint: "org/ep", Function: "run", PlanID: workflowTestDigest,
 		Input:   json.RawMessage(`{"first_frame":"` + digest + `","prompt":"same"}`),
-		Outputs: []string{"image"},
+		Outputs: []string{"video"},
 		LocalAssets: []records.AssetBinding{{
 			FieldPath: "first_frame", LocalPath: source, Digest: digest,
-			Length: int64(len(data)), MediaType: mediaType, Order: 0,
+			Length: length, MediaType: mediaType, Order: 0,
 		}},
 	}
 	body, err := json.Marshal(submission)

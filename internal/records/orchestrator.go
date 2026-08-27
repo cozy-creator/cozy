@@ -64,6 +64,7 @@ CREATE TABLE IF NOT EXISTS requests (
   org          TEXT    NOT NULL DEFAULT '',
   trees        TEXT    NOT NULL DEFAULT '',
   worker       TEXT    NOT NULL DEFAULT '',
+  install_id   TEXT    NOT NULL DEFAULT '',
   assets       TEXT    NOT NULL DEFAULT '[]'
 )`, `
 -- The PUBLICATION (cl-004). One row per job request, written INSIDE the terminal
@@ -195,6 +196,7 @@ var widen = []string{
 	`ALTER TABLE requests ADD COLUMN org TEXT NOT NULL DEFAULT ''`,
 	`ALTER TABLE requests ADD COLUMN trees TEXT NOT NULL DEFAULT ''`,
 	`ALTER TABLE requests ADD COLUMN assets TEXT NOT NULL DEFAULT '[]'`,
+	`ALTER TABLE requests ADD COLUMN install_id TEXT NOT NULL DEFAULT ''`,
 	`ALTER TABLE attempts ADD COLUMN media_cleaned INTEGER NOT NULL DEFAULT 0`,
 	`ALTER TABLE rentals ADD COLUMN media_address TEXT NOT NULL DEFAULT ''`,
 	`ALTER TABLE rentals ADD COLUMN control_snapshot_digest TEXT NOT NULL DEFAULT ''`,
@@ -472,6 +474,10 @@ type Request struct {
 	// It lives on the request because a requeue must re-derive the same placement
 	// without a client saying so again. Empty = any local worker.
 	Worker string
+	// InstallID pins a Creator-owned workflow child to the exact immutable local
+	// generation resolved when the workflow was accepted. Empty uses the active pin.
+	// It is resolution, not request identity.
+	InstallID string
 	// Assets are the request's durable input-asset bindings. LocalPath points into the
 	// authority-owned immutable input store, not at the caller's original file: a requeue
 	// after a client exit or service restart therefore grants the same verified bytes.
@@ -490,17 +496,18 @@ type AssetBinding struct {
 	Length    int64  `json:"length"`
 	MediaType string `json:"media_type,omitempty"`
 	Order     uint32 `json:"order"`
+	MaxBytes  int64  `json:"max_bytes,omitempty"`
 }
 
 const requestCols = `id,idem_key,body_digest,endpoint,entrypoint,plan_id,payload,outputs,
-	state,ordinal,requeues,created_at,kind,org,trees,worker,assets`
+	state,ordinal,requeues,created_at,kind,org,trees,worker,install_id,assets`
 
 func scanRequest(row interface{ Scan(...any) error }) (Request, error) {
 	var r Request
 	var assets string
 	err := row.Scan(&r.ID, &r.IdemKey, &r.BodyDigest, &r.Endpoint, &r.Entrypoint, &r.PlanID,
 		&r.Payload, &r.Outputs, &r.State, &r.Ordinal, &r.Requeues, &r.CreatedAt,
-		&r.Kind, &r.Org, &r.Trees, &r.Worker, &assets)
+		&r.Kind, &r.Org, &r.Trees, &r.Worker, &r.InstallID, &assets)
 	if err == nil && assets != "" {
 		err = json.Unmarshal([]byte(assets), &r.Assets)
 	}
@@ -654,7 +661,7 @@ func (s *Store) AssetInUse(digest string) (bool, *exit.Error) {
 			}
 		}
 	}
-	return false, nil
+	return s.workflowAssetInUse(digest)
 }
 
 // SettleRequest records the request's final state. Only a terminal the orchestrator
@@ -669,38 +676,98 @@ func (s *Store) SettleRequest(id, state string) *exit.Error {
 // BeginRequeue crosses the post-ack boundary and charges the durable retry budget in one
 // transition. Replays after that transition are harmless: only `requeue_pending` can be
 // charged, so a duplicate terminal ack cannot spend twice or mint two ordinals.
-func (s *Store) BeginRequeue(id string, max int64) (count int64, started bool, e *exit.Error) {
+func (s *Store) BeginRequeue(id string, max int64) (count int64, started, canceled bool, e *exit.Error) {
 	tx, err := s.db.Begin()
 	if err != nil {
-		return 0, false, exit.Internalf("cannot begin the requeue transaction: %s", err)
+		return 0, false, false, exit.Internalf("cannot begin the requeue transaction: %s", err)
 	}
 	defer tx.Rollback()
 	var state string
 	if err := tx.QueryRow(`SELECT state,requeues FROM requests WHERE id=?`, id).
 		Scan(&state, &count); err != nil {
-		return 0, false, exit.Internalf("cannot read requeue state for %s: %s", id, err)
+		return 0, false, false, exit.Internalf("cannot read requeue state for %s: %s", id, err)
 	}
 	if state != "requeue_pending" {
-		return count, false, nil
+		return count, false, false, nil
+	}
+	var workflowCancel int
+	if err := tx.QueryRow(`SELECT EXISTS(
+		SELECT 1 FROM workflow_steps s JOIN workflow_executions w ON w.id=s.workflow_id
+		WHERE s.child_request_id=? AND w.state='canceling')`, id).Scan(&workflowCancel); err != nil {
+		return 0, false, false, exit.Internalf("cannot read workflow cancellation for %s: %s", id, err)
+	}
+	if workflowCancel == 1 {
+		if _, err := tx.Exec(`UPDATE requests SET state='canceled' WHERE id=? AND state='requeue_pending'`, id); err != nil {
+			return 0, false, false, exit.Internalf("cannot cancel pending requeue %s: %s", id, err)
+		}
+		if err := appendEventTx(tx, id, "request.canceled", 0, map[string]any{
+			"status": "CANCELED", "cause": "CLIENT_CANCELED",
+			"error_type": "CLIENT_CANCELED",
+			"error":      "the parent workflow was canceled before this request could requeue",
+			"outputs":    []any{}, "requeuing": false,
+		}); err != nil {
+			return 0, false, false, exit.Internalf("cannot append requeue cancellation for %s: %s", id, err)
+		}
+		if err := tx.Commit(); err != nil {
+			return 0, false, false, exit.Internalf("cannot commit requeue cancellation %s: %s", id, err)
+		}
+		return count, false, true, nil
 	}
 	if count >= max {
-		return count, false, exit.New(exit.Failed, "%s exhausted its requeue budget of %d", id, max)
+		return count, false, false, exit.New(exit.Failed, "%s exhausted its requeue budget of %d", id, max)
 	}
 	if _, err := tx.Exec(`UPDATE requests SET state='queued',requeues=requeues+1
 		WHERE id=? AND state='requeue_pending'`, id); err != nil {
-		return 0, false, exit.Internalf("cannot charge a requeue for %s: %s", id, err)
+		return 0, false, false, exit.Internalf("cannot charge a requeue for %s: %s", id, err)
 	}
 	if err := tx.Commit(); err != nil {
-		return 0, false, exit.Internalf("cannot commit requeue %s: %s", id, err)
+		return 0, false, false, exit.Internalf("cannot commit requeue %s: %s", id, err)
 	}
-	return count + 1, true, nil
+	return count + 1, true, false, nil
 }
 
 // Submit records one durable request under its idempotency key. The same key with the
 // same body digest answers the SAME request; the same key with a different body is a
 // conflict, never a second execution wearing one name.
 func (s *Store) Submit(r Request) (Request, bool, *exit.Error) {
-	existing, err := scanRequest(s.db.QueryRow(
+	r, assets, problem := prepareRequest(r)
+	if problem != nil {
+		return Request{}, false, problem
+	}
+	tx, err := s.db.Begin()
+	if err != nil {
+		return Request{}, false, exit.Internalf("cannot begin request submission: %s", err)
+	}
+	defer tx.Rollback()
+	recorded, fresh, problem := submitRequestTx(tx, r, assets)
+	if problem != nil {
+		return Request{}, false, problem
+	}
+	if err := tx.Commit(); err != nil {
+		return Request{}, false, exit.Internalf("cannot commit request %s: %s", r.ID, err)
+	}
+	return recorded, fresh, nil
+}
+
+func prepareRequest(r Request) (Request, string, *exit.Error) {
+	r.CreatedAt = now()
+	r.State = "submitted"
+	if r.Kind == "" {
+		r.Kind = "serving"
+	}
+	assets := []byte("[]")
+	if len(r.Assets) > 0 {
+		var err error
+		assets, err = json.Marshal(r.Assets)
+		if err != nil {
+			return Request{}, "", exit.Internalf("cannot record request %s assets: %s", r.ID, err)
+		}
+	}
+	return r, string(assets), nil
+}
+
+func submitRequestTx(tx *sql.Tx, r Request, assets string) (Request, bool, *exit.Error) {
+	existing, err := scanRequest(tx.QueryRow(
 		`SELECT `+requestCols+` FROM requests WHERE idem_key=?`, r.IdemKey))
 	if err == nil {
 		if existing.BodyDigest != r.BodyDigest {
@@ -714,24 +781,12 @@ func (s *Store) Submit(r Request) (Request, bool, *exit.Error) {
 	if !errors.Is(err, sql.ErrNoRows) {
 		return Request{}, false, exit.Internalf("cannot read request %s: %s", r.IdemKey, err)
 	}
-	r.CreatedAt = now()
-	r.State = "submitted"
-	if r.Kind == "" {
-		r.Kind = "serving"
-	}
-	assets := []byte("[]")
-	if len(r.Assets) > 0 {
-		var err error
-		assets, err = json.Marshal(r.Assets)
-		if err != nil {
-			return Request{}, false, exit.Internalf("cannot record request %s assets: %s", r.ID, err)
-		}
-	}
-	if _, err := s.db.Exec(`INSERT INTO requests(id,idem_key,body_digest,endpoint,entrypoint,
-		plan_id,payload,outputs,state,ordinal,requeues,created_at,kind,org,trees,worker,assets)
-		VALUES(?,?,?,?,?,?,?,?,?,0,0,?,?,?,?,?,?)`,
+	if _, err := tx.Exec(`INSERT INTO requests(id,idem_key,body_digest,endpoint,entrypoint,
+		plan_id,payload,outputs,state,ordinal,requeues,created_at,kind,org,trees,worker,install_id,assets)
+		VALUES(?,?,?,?,?,?,?,?,?,0,0,?,?,?,?,?,?,?)`,
 		r.ID, r.IdemKey, r.BodyDigest, r.Endpoint, r.Entrypoint, r.PlanID, r.Payload,
-		r.Outputs, r.State, r.CreatedAt, r.Kind, r.Org, r.Trees, r.Worker, string(assets)); err != nil {
+		r.Outputs, r.State, r.CreatedAt, r.Kind, r.Org, r.Trees, r.Worker, r.InstallID,
+		assets); err != nil {
 		return Request{}, false, exit.Internalf("cannot record request %s: %s", r.ID, err)
 	}
 	return r, true, nil
@@ -779,6 +834,24 @@ type Attempt struct {
 // while the request holds an open recovered attempt (02 §6.2) or a live one: a new
 // session_id never manufactures absence, and supersession is explicit.
 func ordinalLaws(tx *sql.Tx, requestID string) (int64, *exit.Error) {
+	var requestState string
+	if err := tx.QueryRow(`SELECT state FROM requests WHERE id=?`, requestID).Scan(&requestState); err != nil {
+		return 0, exit.Internalf("cannot read request %s before dispatch: %s", requestID, err)
+	}
+	if requestState != "submitted" && requestState != "queued" {
+		return 0, exit.New(exit.Conflict,
+			"request %s is %s and may not mint another attempt", requestID, requestState)
+	}
+	var workflowCancel int
+	if err := tx.QueryRow(`SELECT EXISTS(
+		SELECT 1 FROM workflow_steps s JOIN workflow_executions w ON w.id=s.workflow_id
+		WHERE s.child_request_id=? AND w.state='canceling')`, requestID).Scan(&workflowCancel); err != nil {
+		return 0, exit.Internalf("cannot read workflow cancellation for %s: %s", requestID, err)
+	}
+	if workflowCancel == 1 {
+		return 0, exit.New(exit.Conflict,
+			"request %s belongs to a canceling workflow and may not dispatch", requestID)
+	}
 	var open int
 	if err := tx.QueryRow(`SELECT COUNT(*) FROM attempts
 		WHERE request_id=? AND state='recovered_open'`, requestID).Scan(&open); err != nil {
@@ -855,9 +928,14 @@ func (s *Store) Dispatch(a Attempt) (int64, *exit.Error) {
 		return 0, exit.New(exit.Conflict, "cannot journal attempt %s#%d: %s", a.RequestID, a.Attempt, err).
 			WithRemedy("an attempt ordinal is written once")
 	}
-	if _, err := tx.Exec(`UPDATE requests SET state='dispatching', ordinal=? WHERE id=?`,
-		a.Attempt, a.RequestID); err != nil {
+	advanced, err := tx.Exec(`UPDATE requests SET state='dispatching', ordinal=?
+		WHERE id=? AND state IN ('submitted','queued')`, a.Attempt, a.RequestID)
+	if err != nil {
 		return 0, exit.Internalf("cannot advance request %s: %s", a.RequestID, err)
+	}
+	if n, _ := advanced.RowsAffected(); n != 1 {
+		return 0, exit.New(exit.Conflict,
+			"request %s changed state before attempt %d could be assigned", a.RequestID, a.Attempt)
 	}
 	if err := tx.Commit(); err != nil {
 		return 0, exit.Internalf("the dispatch transaction did not commit: %s", err)
@@ -1492,12 +1570,14 @@ func (s *Store) Checkpoints(requestID string) ([]Checkpoint, *exit.Error) {
 func (s *Store) Counts() (map[string]int, *exit.Error) {
 	out := map[string]int{}
 	for name, query := range map[string]string{
-		"workers":   `SELECT COUNT(*) FROM worker_processes WHERE state != 'closed'`,
-		"requests":  `SELECT COUNT(*) FROM requests`,
-		"attempts":  `SELECT COUNT(*) FROM attempts`,
-		"live":      `SELECT COUNT(*) FROM attempts WHERE state IN ('preparing','offered','accepted','terminal')`,
-		"recovered": `SELECT COUNT(*) FROM attempts WHERE state='recovered_open'`,
-		"outputs":   `SELECT COUNT(*) FROM outputs`,
+		"workers":        `SELECT COUNT(*) FROM worker_processes WHERE state != 'closed'`,
+		"requests":       `SELECT COUNT(*) FROM requests`,
+		"attempts":       `SELECT COUNT(*) FROM attempts`,
+		"live":           `SELECT COUNT(*) FROM attempts WHERE state IN ('preparing','offered','accepted','terminal')`,
+		"recovered":      `SELECT COUNT(*) FROM attempts WHERE state='recovered_open'`,
+		"outputs":        `SELECT COUNT(*) FROM outputs`,
+		"workflows":      `SELECT COUNT(*) FROM workflow_executions`,
+		"live_workflows": `SELECT COUNT(*) FROM workflow_executions WHERE state IN ('running','canceling')`,
 	} {
 		var n int
 		if err := s.db.QueryRow(query).Scan(&n); err != nil {
