@@ -17,8 +17,7 @@
 //! benchmark-gated upgrades behind this unchanged API, and none of them appears in any
 //! contract — tfs-018's banked baselines are the bar they would have to miss.
 
-use std::collections::BTreeMap;
-use std::os::unix::fs::FileExt;
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::Instant;
@@ -30,7 +29,7 @@ use crate::ids::ObjectRef;
 use crate::manifest::SnapshotManifest;
 use crate::meta::{Hold, Meta};
 use crate::receipt::{Receipt, Receipts};
-use crate::store::{Store, Verdict};
+use crate::store::{Store, VerifiedFile};
 
 /// A byte range inside ONE identified object. The identity is part of the range: there is no
 /// such thing here as "an offset in a file".
@@ -64,7 +63,7 @@ impl ObjectRange {
 
 // ---------------------------------------------------------------- the lease
 
-/// `ReadLease = store.acquire(snapshot, object_set)` — verified held ranges.
+/// `ReadLease = store.acquire(snapshot, object_set)` — verified PINNED descriptors.
 ///
 /// The hold is registered BEFORE the first byte is verified or fetched, so GC racing a
 /// starting fill is fenced by construction rather than by timing. The lease lives until the
@@ -72,10 +71,20 @@ impl ObjectRange {
 /// mapping until the completion fence, and dropping it without release keeps the row for the
 /// reaper (over-keeping, the only permitted direction) with a loud degraded line — it never
 /// silently frees source bytes that may still be in DMA.
+///
+/// THE FILE VERIFIED IS THE FILE READ (tfs-021). `acquire` opens one `VerifiedFile` per
+/// distinct object and every `read_into` goes through that pinned descriptor: no pathname
+/// is resolved after verification, so a replacement at the path — same length or not —
+/// cannot reach a reader for the lease's whole life, and a 90 GiB fill pays zero
+/// per-item open/close syscalls. The descriptor-count contract is explicit: acquire proves
+/// `RLIMIT_NOFILE` headroom for the complete set and refuses `FD_HEADROOM` typed —
+/// chosen over a bounded fd cache because a cache's reopen is a second pathname
+/// resolution, which is exactly the defect this type exists to kill.
 pub struct ReadLease {
     hold: Hold,
     pub snapshot: String,
     objects: Vec<ObjectRef>,
+    files: HashMap<String, VerifiedFile>,
 }
 
 impl ReadLease {
@@ -118,7 +127,28 @@ impl ReadLease {
     }
 }
 
-/// Acquire a lease over an explicit object set, verifying every object first.
+/// The complete-descriptor-set headroom question, answered from `/proc` with std alone.
+/// `None` means the platform cannot answer (no `/proc`, an "unlimited" soft limit): the
+/// pre-check is skipped and a failing open at acquire still refuses before any read.
+fn fd_shortfall(need: usize) -> Option<(u64, u64, u64)> {
+    /// Fds the pre-check leaves free for stdio, locks and whatever the caller opens next.
+    const MARGIN: u64 = 64;
+    let soft: u64 = std::fs::read_to_string("/proc/self/limits")
+        .ok()?
+        .lines()
+        .find(|l| l.starts_with("Max open files"))?
+        .split_whitespace()
+        .nth(3)?
+        .parse()
+        .ok()?;
+    let open = std::fs::read_dir("/proc/self/fd").ok()?.count() as u64;
+    let want = need as u64 + open + MARGIN;
+    (want > soft).then_some((soft, open, want))
+}
+
+/// Acquire a lease over an explicit object set, verifying every object first and PINNING
+/// its descriptor. Verification and reading share one `open` (`open_verified`); nothing
+/// after this function resolves an object pathname.
 pub fn acquire(
     store: &Store,
     meta: &Meta,
@@ -127,51 +157,80 @@ pub fn acquire(
 ) -> Result<(ReadLease, Receipts)> {
     // The hold FIRST: registered before the first fetch (tensorfs.md §2, pin root class 2).
     let hold = meta.acquire_hold("read", snapshot, Vec::new())?;
+    // Admission proves RLIMIT_NOFILE headroom for the COMPLETE descriptor set (H3 serves
+    // 3,627 distinct objects — never an assumable count) or refuses typed.
+    let distinct: HashSet<&str> = objects.iter().map(|o| o.sha256.as_str()).collect();
+    if let Some((soft, open, want)) = fd_shortfall(distinct.len()) {
+        let _ = hold.release(meta);
+        return refuse(
+            Code::FD_HEADROOM,
+            format!(
+                "this lease pins {} verified descriptors and the process already holds \
+                 {open} fds under an RLIMIT_NOFILE soft limit of {soft} ({want} needed \
+                 with margin) — raise the soft limit; the reader will not fall back to \
+                 re-resolving pathnames",
+                distinct.len()
+            ),
+        );
+    }
     let mut rx = Receipts::default();
+    let mut files: HashMap<String, VerifiedFile> = HashMap::with_capacity(distinct.len());
     for o in &objects {
-        match store.record_valid(&o.sha256) {
-            Ok(rec) => {
-                if rec.length != o.length {
-                    let _ = hold.release(meta);
-                    return refuse(
-                        Code::LENGTH_MISMATCH,
-                        format!(
-                            "{}: the verification record carries {} bytes, the reference \
-                             claims {}",
-                            o.id(),
-                            rec.length,
-                            o.length
-                        ),
-                    );
-                }
+        if let Some(vf) = files.get(&o.sha256) {
+            if vf.len() != o.length {
+                let _ = hold.release(meta);
+                return refuse(
+                    Code::LENGTH_MISMATCH,
+                    format!(
+                        "{}: the lease already pinned these bytes at {} B, the reference \
+                         claims {}",
+                        o.id(),
+                        vf.len(),
+                        o.length
+                    ),
+                );
             }
-            Err(why) => match store.verify(&o.sha256) {
-                Ok(Verdict::Quarantined { to, why: w }) => {
-                    let _ = hold.release(meta);
-                    return refuse(
-                        Code::OBJECT_CORRUPT,
-                        format!("{} quarantined to {}: {w}", o.id(), to.display()),
-                    );
-                }
-                Ok(_) => rx.emit(Receipt::new(
-                    "acquire",
-                    "record-invalidated-rehash",
-                    snapshot,
-                    store.generation(),
-                    format!("{}: {why} — rehashed on acquire", o.id()),
-                )),
-                Err(e) => {
-                    let _ = hold.release(meta);
-                    return Err(e);
-                }
-            },
+            continue;
         }
+        // A missing or disagreeing record makes open_verified pay exactly one rehash —
+        // reported, because a read path that silently re-hashes is hiding a fault.
+        let (vf, rehashed) = match store.open_verified_reporting(&o.sha256) {
+            Ok(x) => x,
+            Err(e) => {
+                let _ = hold.release(meta);
+                return Err(e);
+            }
+        };
+        if vf.len() != o.length {
+            let _ = hold.release(meta);
+            return refuse(
+                Code::LENGTH_MISMATCH,
+                format!(
+                    "{}: the pinned verified descriptor carries {} bytes, the reference \
+                     claims {}",
+                    o.id(),
+                    vf.len(),
+                    o.length
+                ),
+            );
+        }
+        if rehashed {
+            rx.emit(Receipt::new(
+                "acquire",
+                "record-invalidated-rehash",
+                snapshot,
+                store.generation(),
+                format!("{}: rehashed on acquire", o.id()),
+            ));
+        }
+        files.insert(o.sha256.clone(), vf);
     }
     Ok((
         ReadLease {
             hold,
             snapshot: snapshot.to_string(),
             objects,
+            files,
         },
         rx,
     ))
@@ -197,10 +256,13 @@ pub fn acquire_snapshot(
 
 // ---------------------------------------------------------------- the one byte door
 
-/// Fill a CALLER-OWNED buffer from one verified range. Exact fit or refusal: a buffer that
-/// is not exactly the range's length is a caller bug, and a short read is a refusal that
-/// never claims the bytes it did move.
-pub fn read_into(store: &Store, lease: &ReadLease, r: &ObjectRange, buf: &mut [u8]) -> Result<()> {
+/// Fill a CALLER-OWNED buffer from one verified range, THROUGH THE LEASE'S PINNED
+/// DESCRIPTOR. Exact fit or refusal: a buffer that is not exactly the range's length is a
+/// caller bug, and a short read is a refusal that never claims the bytes it did move.
+///
+/// No pathname is resolved here — the fd pinned at acquire is the only door, so a
+/// replacement installed at the object's path after acquire never reaches this read.
+pub fn read_into(lease: &ReadLease, r: &ObjectRange, buf: &mut [u8]) -> Result<()> {
     lease.covers(r)?;
     r.check()?;
     if buf.len() as u64 != r.len {
@@ -214,16 +276,24 @@ pub fn read_into(store: &Store, lease: &ReadLease, r: &ObjectRange, buf: &mut [u
             ),
         );
     }
-    let f = store.open_nofollow(&r.obj.sha256)?;
-    // File identity against the DECLARED length, before any byte moves: a truncated object
-    // is caught by arithmetic rather than by a read that half-succeeds.
-    let size = f
-        .metadata()
-        .map_err(|e| Refusal {
-            code: Code::IO_FAILED,
-            detail: format!("stat {}: {e}", r.obj.id()),
-        })?
-        .len();
+    let vf = match lease.files.get(&r.obj.sha256) {
+        Some(vf) => vf,
+        // Unreachable past `covers`, but stated: a lease without the descriptor must
+        // refuse rather than fall back to a pathname.
+        None => {
+            return refuse(
+                Code::LEASE_NOT_COVERED,
+                format!("{}: no pinned descriptor on this lease", r.obj.id()),
+            )
+        }
+    };
+    // `fstat` on the PINNED fd against the declared length, before any byte moves: an
+    // in-place truncation of this inode is caught by arithmetic rather than by a read
+    // that half-succeeds. (A swap at the pathname is not caught — it is INEFFECTIVE.)
+    let size = vf.current_len().map_err(|e| Refusal {
+        code: Code::IO_FAILED,
+        detail: format!("fstat {}: {e}", r.obj.id()),
+    })?;
     if size != r.obj.length {
         return refuse(
             Code::SHORT_READ,
@@ -235,7 +305,7 @@ pub fn read_into(store: &Store, lease: &ReadLease, r: &ObjectRange, buf: &mut [u
             ),
         );
     }
-    match f.read_exact_at(buf, r.off) {
+    match vf.read_exact_at(buf, r.off) {
         Ok(()) => Ok(()),
         Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => refuse(
             Code::SHORT_READ,
@@ -256,7 +326,6 @@ pub fn read_into(store: &Store, lease: &ReadLease, r: &ObjectRange, buf: &mut [u
 /// A sequential helper over one storage-part run: the part's declared geometry locates the
 /// segments, the lease covers them, and the caller's buffer receives the exact span.
 pub fn read_part_into(
-    store: &Store,
     lease: &ReadLease,
     what: &str,
     part: &Part,
@@ -284,7 +353,6 @@ pub fn read_part_into(
             for s in spans {
                 let n = s.len as usize;
                 read_into(
-                    store,
                     lease,
                     &ObjectRange {
                         obj: s.obj.clone(),
@@ -610,7 +678,6 @@ pub struct Stats {
 /// Issue order is plan order: workers pull from one cursor in sequence, so the DESTINATION
 /// order is what reaches the disk even though completions are concurrent.
 pub fn execute(
-    store: &Store,
     lease: &ReadLease,
     plan: &ReadPlan,
     dest: &mut [u8],
@@ -663,7 +730,7 @@ pub fn execute(
                 };
                 let it = &plan.items[i];
                 let r = match &it.source {
-                    Source::Object(r) => read_into(store, lease, r, buf),
+                    Source::Object(r) => read_into(lease, r, buf),
                     // Inline bytes come out of the header the caller already holds: decoded
                     // into their exact destination span, in order, with no device touched.
                     Source::Inline(b) => crate::b64::decode(b).and_then(|v| {
@@ -870,7 +937,6 @@ pub struct Filled<'a> {
 /// `on_batch` is called on THIS thread, in batch order, once per filled slot. The readers
 /// keep going while it runs.
 pub fn pump<F>(
-    store: &Store,
     lease: &ReadLease,
     plan: &ReadPlan,
     slots: Vec<&mut [u8]>,
@@ -922,7 +988,6 @@ where
                         let mut g = park[slot].lock().unwrap();
                         let buf = g.as_mut().expect("slot buffer parked");
                         execute(
-                            store,
                             lease,
                             &batches[b],
                             &mut buf[..batches[b].bytes as usize],

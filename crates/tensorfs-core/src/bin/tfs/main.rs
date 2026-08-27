@@ -259,6 +259,7 @@ fn main() -> ExitCode {
         ),
         ["read", "arms", r, h] => rd::cmd_arms(Path::new(r), h),
         ["read", "tear", r, h] => rd::cmd_tear(Path::new(r), h),
+        ["read", "swap", r, h] => rd::cmd_swap(Path::new(r), h),
         ["read", "prove", r, h] => rd::cmd_prove(Path::new(r), h, &flags),
         ["read", "transform"] => rd::cmd_transform(),
         ["project", r, h, d] => rd::cmd_project(Path::new(r), h, Path::new(d), &flags),

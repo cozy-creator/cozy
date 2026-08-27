@@ -382,7 +382,6 @@ impl PyStore {
             .or_refuse(py)?;
         Ok(PyLease {
             lease: Mutex::new(Some(lease)),
-            store: self.store.clone(),
             meta: self.meta.clone(),
             receipts: rx,
         })
@@ -396,7 +395,6 @@ impl PyStore {
             .or_refuse(py)?;
         Ok(PyLease {
             lease: Mutex::new(Some(lease)),
-            store: self.store.clone(),
             meta: self.meta.clone(),
             receipts: rx,
         })
@@ -603,7 +601,6 @@ pub fn plan_in_key_order(py: Python<'_>, header: &[u8], window: u64) -> PyResult
 #[pyclass(name = "ReadLease")]
 pub struct PyLease {
     lease: Mutex<Option<CoreLease>>,
-    store: Arc<CoreStore>,
     meta: Arc<Meta>,
     receipts: Receipts,
 }
@@ -715,7 +712,7 @@ impl PyLease {
             off,
             len: length,
         };
-        py.allow_threads(|| read::read_into(&self.store, lease, &r, dest))
+        py.allow_threads(|| read::read_into(lease, &r, dest))
             .or_refuse(py)
     }
 
@@ -749,7 +746,6 @@ impl PyLease {
         let started = std::time::Instant::now();
         let out = py.allow_threads(|| {
             read::pump(
-                &self.store,
                 lease,
                 &plan.plan,
                 views,

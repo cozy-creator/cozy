@@ -266,6 +266,19 @@ impl VerifiedFile {
     pub fn into_file(self) -> File {
         self.file
     }
+
+    /// Positional read through the pinned descriptor — the fd, never the name. Shared-ref
+    /// on purpose: `pread` moves no cursor, so concurrent readers need no lock.
+    pub fn read_exact_at(&self, buf: &mut [u8], off: u64) -> std::io::Result<()> {
+        use std::os::unix::fs::FileExt;
+        self.file.read_exact_at(buf, off)
+    }
+
+    /// `fstat` on the pinned descriptor. A truncation of THIS inode is visible here; a
+    /// replacement at the pathname is not — by design, that swap cannot reach this handle.
+    pub fn current_len(&self) -> std::io::Result<u64> {
+        self.file.metadata().map(|m| m.len())
+    }
 }
 
 impl Read for VerifiedFile {
@@ -649,7 +662,14 @@ impl Store {
     /// Linux pins the inode. A rename over the path after this point does not reach these
     /// bytes at all — the swap is not caught, it is INEFFECTIVE.
     pub fn open_verified(&self, hex: &str) -> Result<VerifiedFile> {
+        Ok(self.open_verified_reporting(hex)?.0)
+    }
+
+    /// `open_verified` plus the fact a caller may need to report: whether trusting these
+    /// bytes cost a rehash (missing or disagreeing record) rather than a record lookup.
+    pub fn open_verified_reporting(&self, hex: &str) -> Result<(VerifiedFile, bool)> {
         let (verdict, file) = self.verify_pinned(hex, false)?;
+        let rehashed = !matches!(verdict, Verdict::Verified { rehashed: false });
         match (verdict, file) {
             (Verdict::Quarantined { to, why }, _) => refuse(
                 Code::OBJECT_CORRUPT,
@@ -658,11 +678,14 @@ impl Store {
             (_, Some(mut f)) => {
                 let len = f.metadata().map_err(|e| io("stat object", e))?.len();
                 f.seek(SeekFrom::Start(0)).map_err(|e| io("rewind", e))?;
-                Ok(VerifiedFile {
-                    file: f,
-                    sha256: hex.to_string(),
-                    len,
-                })
+                Ok((
+                    VerifiedFile {
+                        file: f,
+                        sha256: hex.to_string(),
+                        len,
+                    },
+                    rehashed,
+                ))
             }
             (v, None) => refuse(
                 Code::OBJECT_CORRUPT,

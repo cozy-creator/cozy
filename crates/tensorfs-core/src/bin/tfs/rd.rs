@@ -263,7 +263,7 @@ pub fn cmd_fill(root: &Path, hex: &str, f: &Flags) -> ExitCode {
         // The CLOCK covers the reads and nothing else. Hashing 4.8 GiB with our own sha256
         // costs ~28 s at 190 MiB/s and would have reported the hash as the read.
         let t0 = Instant::now();
-        let st = match read::execute(&s, &lease, b, dest, workers) {
+        let st = match read::execute(&lease, b, dest, workers) {
             Ok(st) => st,
             Err(e) => {
                 let _ = lease.release(&meta);
@@ -324,7 +324,7 @@ pub fn cmd_stream(root: &Path, hex: &str, f: &Flags) -> ExitCode {
     let mut batches = 0usize;
     let mut hash_ms = 0u128;
     let t0 = Instant::now();
-    let r = read::pump(&s, &lease, &plan, slots, workers, |fl, slot| {
+    let r = read::pump(&lease, &plan, slots, workers, |fl, slot| {
         batches += 1;
         if digest_it {
             // The consumer reads its slot BEFORE releasing it: an explicit release is what
@@ -438,7 +438,7 @@ pub fn cmd_span(root: &Path, hex: &str, ck: [&str; 3], off: u64, len: u64) -> Ex
     let (lease, _) = ok!(read::acquire_snapshot(&s, &meta, &m));
     let mut buf = vec![0u8; len as usize];
     let what = format!("{}/{}#{}", ck[0], ck[1], ck[2]);
-    let r = read::read_part_into(&s, &lease, &what, part, off, len, &mut buf);
+    let r = read::read_part_into(&lease, &what, part, off, len, &mut buf);
     ok!(lease.release(&meta));
     ok!(r);
     println!("{what} [{off}, {}) -> {len} B", off + len);
@@ -615,7 +615,6 @@ pub fn cmd_prove(root: &Path, hex: &str, f: &Flags) -> ExitCode {
         for o in part.segments() {
             let mut buf = vec![0u8; o.length as usize];
             if let Err(e) = read::read_into(
-                &s,
                 &lease,
                 &ObjectRange {
                     obj: o.clone(),
@@ -669,6 +668,105 @@ pub fn cmd_prove(root: &Path, hex: &str, f: &Flags) -> ExitCode {
 /// Refuses outright on a store whose objects carry more than one link: this command mutates
 /// object bytes, and a hardlinked working copy shares inodes with whatever it was copied
 /// from. A destructive arm that can reach the quarry is not an arm, it is an accident.
+/// `tfs read swap` — tfs-021's red arm: a SAME-LENGTH replacement installed at an object's
+/// pathname AFTER acquire must never reach the reader. The lease pinned the verified
+/// descriptor, so the swap is not caught — it is INEFFECTIVE, and the verified bytes are
+/// what the read returns. (The pre-fix tree, which re-resolved the pathname per read with
+/// only a size check, was observed serving the replaced bytes.)
+pub fn cmd_swap(root: &Path, hex: &str) -> ExitCode {
+    use std::os::unix::fs::MetadataExt;
+    let (s, m, h) = ok!(load(root, hex));
+    let meta = ok!(Meta::open(&s));
+    let seg = match h
+        .tensors()
+        .flat_map(|(_, _, t)| t.parts.iter())
+        .flat_map(|(_, p)| p.segments())
+        .min_by_key(|o| o.length)
+        .cloned()
+    {
+        Some(o) => o,
+        None => {
+            eprintln!("REFUSED MISSING_TENSOR: no segmented part to swap");
+            return ExitCode::FAILURE;
+        }
+    };
+    let path = s.object_path(&seg.sha256);
+    let md = match std::fs::metadata(&path) {
+        Ok(md) => md,
+        Err(e) => {
+            eprintln!("REFUSED IO_FAILED: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    if md.nlink() > 1 {
+        eprintln!(
+            "REFUSED NOT_REGULAR_FILE: {} has {} links — this arm mutates bytes and will not \
+             run against a store that shares inodes with another tree",
+            seg.id(),
+            md.nlink()
+        );
+        return ExitCode::FAILURE;
+    }
+
+    let (lease, _) = ok!(read::acquire_snapshot(&s, &meta, &m));
+    let keep = std::fs::read(&path).unwrap_or_default();
+
+    // The swap, as an attacker would install it: same length, different bytes, atomic
+    // rename over the pathname. Every fact a pathname-bound record checks (size, an mtime
+    // the writer controls) can be made to agree.
+    let mut fake = keep.clone();
+    for b in fake.iter_mut() {
+        *b ^= 0xff;
+    }
+    let tmp = path.with_extension("swap");
+    let _ = std::fs::write(&tmp, &fake);
+    let _ = std::fs::rename(&tmp, &path);
+
+    let mut buf = vec![0u8; seg.length as usize];
+    let r = read::read_into(
+        &lease,
+        &ObjectRange {
+            obj: seg.clone(),
+            off: 0,
+            len: seg.length,
+        },
+        &mut buf,
+    );
+
+    // Put the verified bytes back before reporting, so a failed arm cannot leave a broken
+    // store, then judge what the reader saw.
+    let mut perms = std::fs::metadata(&path).unwrap().permissions();
+    std::os::unix::fs::PermissionsExt::set_mode(&mut perms, 0o644);
+    let _ = std::fs::set_permissions(&path, perms);
+    let _ = std::fs::write(&path, &keep);
+    let mut perms = std::fs::metadata(&path).unwrap().permissions();
+    std::os::unix::fs::PermissionsExt::set_mode(&mut perms, 0o444);
+    let _ = std::fs::set_permissions(&path, perms);
+    ok!(lease.release(&meta));
+
+    println!(
+        "swapped object: {} ({} B, same-length replacement renamed over the path after \
+         acquire)",
+        seg.id(),
+        seg.length
+    );
+    match r {
+        Ok(()) if buf == keep => {
+            println!("  FIRED  the reader returned the VERIFIED bytes — the swap never reached it");
+            println!("         (the pinned descriptor is the only door; the pathname was not re-resolved)");
+            ExitCode::SUCCESS
+        }
+        Ok(()) => {
+            println!("  MISSED the reader served the REPLACED bytes — the v1 defect, live");
+            ExitCode::FAILURE
+        }
+        Err(e) => {
+            println!("  WRONG  the read refused ({e}) — the swap must be ineffective, not fatal");
+            ExitCode::FAILURE
+        }
+    }
+}
+
 pub fn cmd_tear(root: &Path, hex: &str) -> ExitCode {
     use std::os::unix::fs::MetadataExt;
     let (s, m, h) = ok!(load(root, hex));
@@ -713,8 +811,7 @@ pub fn cmd_tear(root: &Path, hex: &str) -> ExitCode {
 
     let mut buf = vec![0u8; seg.length as usize];
     let torn = read::read_into(
-        &s,
-        &lease,
+                &lease,
         &ObjectRange {
             obj: seg.clone(),
             off: 0,
@@ -806,8 +903,7 @@ pub fn cmd_arms(root: &Path, hex: &str) -> ExitCode {
         "buffer smaller than the range",
         Code::BUFFER_SIZE,
         read::read_into(
-            &s,
-            &lease,
+                &lease,
             &ObjectRange {
                 obj: first.clone(),
                 off: 0,
@@ -823,8 +919,7 @@ pub fn cmd_arms(root: &Path, hex: &str) -> ExitCode {
         "range past the object's declared end",
         Code::RANGE_BOUNDS,
         read::read_into(
-            &s,
-            &lease,
+                &lease,
             &ObjectRange {
                 obj: first.clone(),
                 off: first.length,
@@ -839,8 +934,7 @@ pub fn cmd_arms(root: &Path, hex: &str) -> ExitCode {
         "object outside the lease",
         Code::LEASE_NOT_COVERED,
         read::read_into(
-            &s,
-            &lease,
+                &lease,
             &ObjectRange {
                 obj: ObjectRef {
                     sha256: "0".repeat(64),
@@ -858,8 +952,7 @@ pub fn cmd_arms(root: &Path, hex: &str) -> ExitCode {
         "lease digest with a different declared length",
         Code::LEASE_NOT_COVERED,
         read::read_into(
-            &s,
-            &lease,
+                &lease,
             &ObjectRange {
                 obj: ObjectRef {
                     sha256: first.sha256.clone(),
