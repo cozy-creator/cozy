@@ -1,19 +1,22 @@
 package app
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strconv"
 	"strings"
 	"time"
 
 	"github.com/cozy-creator/cozy-creator-v2/internal/api"
+	"github.com/cozy-creator/cozy-creator-v2/internal/canonical"
 	localapi "github.com/cozy-creator/cozy-creator-v2/internal/client"
 	"github.com/cozy-creator/cozy-creator-v2/internal/exit"
 	"github.com/cozy-creator/cozy-creator-v2/internal/render"
-	"github.com/cozy-creator/cozy-creator-v2/internal/rental"
 )
 
 const workflowPollCadence = 2 * time.Second
@@ -157,13 +160,15 @@ func handleWorkflowDownload(ctx *Context) *exit.Error {
 	if err := os.MkdirAll(filepath.Dir(absolute), 0o755); err != nil {
 		return exit.Internalf("cannot create workflow output parent: %s", err)
 	}
-	if err := os.Mkdir(absolute, 0o755); err != nil {
-		return exit.Internalf("cannot create workflow output directory: %s", err)
+	parent, base := filepath.Dir(absolute), filepath.Base(absolute)
+	staging, err := os.MkdirTemp(parent, "."+base+".staging-*")
+	if err != nil {
+		return exit.Internalf("cannot stage workflow output directory: %s", err)
 	}
-	keep := false
+	published := false
 	defer func() {
-		if !keep {
-			_ = os.RemoveAll(absolute)
+		if !published {
+			_ = os.RemoveAll(staging)
 		}
 	}()
 
@@ -171,17 +176,32 @@ func handleWorkflowDownload(ctx *Context) *exit.Error {
 	if problem != nil {
 		return problem
 	}
-	state, problem := client.Workflow(ctx.Inv.Args[0])
+	receiptSet, problem := client.WorkflowReceipt(ctx.Inv.Args[0])
 	if problem != nil {
 		return problem
 	}
+	state := receiptSet.Workflow
 	if state.Status == "running" || state.Status == "canceling" {
 		return exit.New(exit.Conflict,
 			"workflow %s is %s; download only a terminal receipt set", state.WorkflowID, state.Status).
 			WithNext("cozy workflow follow " + state.WorkflowID)
 	}
-	if problem := writeWorkflowJSON(filepath.Join(absolute, "workflow.json"), state); problem != nil {
+	if problem := writeWorkflowJSON(filepath.Join(staging, "workflow.json"), state); problem != nil {
 		return problem
+	}
+	planDigest, problem := writeExactEvidence(filepath.Join(staging, "workflow-plan.json"),
+		receiptSet.CanonicalPlan, "")
+	if problem != nil {
+		return problem
+	}
+	creativePath, creativeDigest := "", ""
+	if len(receiptSet.CanonicalCreative) > 0 {
+		creativePath = "creative-plan.json"
+		creativeDigest, problem = writeExactEvidence(filepath.Join(staging, creativePath),
+			receiptSet.CanonicalCreative, state.CreativePlanDigest)
+		if problem != nil {
+			return problem
+		}
 	}
 
 	type requestReceipt struct {
@@ -191,13 +211,32 @@ func handleWorkflowDownload(ctx *Context) *exit.Error {
 		Triage    any                 `json:"triage,omitempty"`
 		Saved     []map[string]string `json:"saved_outputs"`
 	}
-	receipts := make([]requestReceipt, 0, len(state.Steps))
-	rentalIDs := map[string]bool{}
+	type stepIndex struct {
+		Ordinal            int    `json:"ordinal"`
+		ReceiptPath        string `json:"receipt_path"`
+		ReceiptDigest      string `json:"receipt_digest"`
+		MaterializedPath   string `json:"materialized_path"`
+		MaterializedDigest string `json:"materialized_digest"`
+	}
+	materialized := map[int][]byte{}
+	for _, step := range receiptSet.Steps {
+		materialized[step.Ordinal] = step.MaterializedSubmission
+	}
+	steps := make([]stepIndex, 0, len(state.Steps))
+	requestCount := 0
 	for _, step := range state.Steps {
-		if step.RentalID != "" {
-			rentalIDs[step.RentalID] = true
+		index := stepIndex{Ordinal: step.Ordinal}
+		if len(materialized[step.Ordinal]) > 0 {
+			name := fmt.Sprintf("step-%02d-materialized.json", step.Ordinal)
+			digest, writeProblem := writeExactEvidence(filepath.Join(staging, name),
+				materialized[step.Ordinal], step.MaterializedDigest)
+			if writeProblem != nil {
+				return writeProblem
+			}
+			index.MaterializedPath, index.MaterializedDigest = name, digest
 		}
 		if step.ChildRequest == "" {
+			steps = append(steps, index)
 			continue
 		}
 		life, problem := client.Request(step.ChildRequest)
@@ -218,55 +257,198 @@ func handleWorkflowDownload(ctx *Context) *exit.Error {
 				return problem
 			}
 		}
-		stepDir := filepath.Join(absolute, fmt.Sprintf("step-%02d", step.Ordinal))
+		stepDir := filepath.Join(staging, fmt.Sprintf("step-%02d", step.Ordinal))
 		saved, problem := saveOutputsAt(client, life, stepDir)
 		if problem != nil {
 			return problem
 		}
+		for _, output := range saved {
+			relative, err := filepath.Rel(staging, output["path"])
+			if err != nil || relative == ".." || strings.HasPrefix(relative, ".."+string(filepath.Separator)) {
+				return exit.Internalf("downloaded output escaped the workflow staging root")
+			}
+			output["path"] = filepath.ToSlash(relative)
+		}
 		receipt := requestReceipt{Ordinal: step.Ordinal, Lifecycle: life,
 			Events: events, Triage: triage, Saved: saved}
-		receipts = append(receipts, receipt)
-		if problem := writeWorkflowJSON(filepath.Join(absolute,
-			fmt.Sprintf("step-%02d-receipt.json", step.Ordinal)), receipt); problem != nil {
+		name := fmt.Sprintf("step-%02d-receipt.json", step.Ordinal)
+		path := filepath.Join(staging, name)
+		if problem := writeWorkflowJSON(path, receipt); problem != nil {
 			return problem
 		}
+		receiptDigest, digestProblem := digestEvidenceFile(path)
+		if digestProblem != nil {
+			return digestProblem
+		}
+		index.ReceiptPath, index.ReceiptDigest = name, receiptDigest
+		steps, requestCount = append(steps, index), requestCount+1
 	}
 
-	_, store, problem := rentalStores(ctx)
+	controlDir := filepath.Join(staging, "rental-controls")
+	if len(receiptSet.Rentals) > 0 {
+		if err := os.Mkdir(controlDir, 0o755); err != nil {
+			return exit.Internalf("cannot create rental-control evidence directory: %s", err)
+		}
+	}
+	controls := map[string]map[string]any{}
+	for _, control := range receiptSet.Rentals {
+		name := strings.TrimPrefix(control.ControlSnapshotDigest, "sha256:") + ".json"
+		path := filepath.Join(controlDir, name)
+		if _, problem := writeExactEvidence(path, control.ExactControlSnapshotBytes,
+			control.ControlSnapshotDigest); problem != nil {
+			return problem
+		}
+		controls[control.RentalID] = map[string]any{
+			"endpoint":                             control.Endpoint,
+			"accelerator":                          control.Accelerator,
+			"observed_accelerator":                 control.ObservedAccelerator,
+			"observed_accelerator_count":           control.ObservedAcceleratorCount,
+			"observed_backend":                     control.ObservedBackend,
+			"observed_worker_instance":             control.ObservedWorkerInstance,
+			"observed_worker_boot_id":              control.ObservedWorkerBootID,
+			"observed_at":                          control.ObservedAt,
+			"snapshot_path":                        filepath.ToSlash(filepath.Join("rental-controls", name)),
+			"control_snapshot_digest":              control.ControlSnapshotDigest,
+			"control_snapshot_length":              control.ControlSnapshotLength,
+			"endpoint_execution_digest":            control.EndpointExecutionDigest,
+			"artifact_object_set_digest":           control.ArtifactObjectSetDigest,
+			"model_root_digests":                   control.ModelRootDigests,
+			"endpoint_release_id":                  control.EndpointReleaseID,
+			"descriptor_digest":                    control.DescriptorDigest,
+			"environment_spec_digest":              control.EnvironmentSpecDigest,
+			"installed_environment_receipt_digest": control.InstalledReceiptDigest,
+			"placement_set_digest":                 control.PlacementSetDigest,
+			"binding_plan_digests":                 control.BindingPlanDigests,
+		}
+	}
+	controlSummary := filepath.Join(staging, "rental-control.json")
+	if problem := writeWorkflowJSON(controlSummary, controls); problem != nil {
+		return problem
+	}
+	workflowDigest, problem := digestEvidenceFile(filepath.Join(staging, "workflow.json"))
 	if problem != nil {
 		return problem
 	}
-	defer store.Close()
-	controls := map[string]any{}
-	for id := range rentalIDs {
-		row, control, inspectProblem := rental.Inspect(store, id)
-		if inspectProblem != nil {
-			return inspectProblem
-		}
-		controls[id] = map[string]any{
-			"endpoint": row.EndpointRef, "accelerator": row.AcceleratorModel,
-			"control": control,
-			"exact_control_snapshot": map[string]any{
-				"canonical_bytes": row.ControlSnapshotBytes,
-				"digest":          row.ControlSnapshotDigest, "length": row.ControlSnapshotLength,
-			},
-		}
-	}
-	if problem := writeWorkflowJSON(filepath.Join(absolute, "rental-control.json"), controls); problem != nil {
+	controlDigest, problem := digestEvidenceFile(controlSummary)
+	if problem != nil {
 		return problem
 	}
 	manifest := map[string]any{
-		"workflow": state, "requests": receipts, "rental_control": controls,
+		"version":        1,
+		"workflow":       map[string]any{"path": "workflow.json", "digest": workflowDigest},
+		"workflow_plan":  map[string]any{"path": "workflow-plan.json", "digest": planDigest},
+		"creative_plan":  map[string]any{"path": creativePath, "digest": creativeDigest},
+		"steps":          steps,
+		"rental_control": map[string]any{"path": "rental-control.json", "digest": controlDigest},
 	}
-	if problem := writeWorkflowJSON(filepath.Join(absolute, "download-manifest.json"), manifest); problem != nil {
+	if problem := writeWorkflowJSON(filepath.Join(staging, "download-manifest.json"), manifest); problem != nil {
 		return problem
 	}
-	keep = true
+	if problem := syncWorkflowTree(staging); problem != nil {
+		return problem
+	}
+	if _, err := os.Lstat(absolute); err == nil || !os.IsNotExist(err) {
+		return exit.New(exit.Conflict, "workflow output directory %s appeared during publication", absolute)
+	}
+	if err := os.Rename(staging, absolute); err != nil {
+		return exit.Internalf("cannot publish complete workflow output %s: %s", absolute, err)
+	}
+	published = true
+	if problem := syncWorkflowDirectory(parent); problem != nil {
+		return problem
+	}
 	return emit(ctx, render.Record{Kind: "workflow_download", Fields: []render.Field{
 		{K: "workflow", V: state.WorkflowID}, {K: "status", V: state.Status},
-		{K: "directory", V: absolute}, {K: "request_receipts", V: len(receipts)},
+		{K: "directory", V: absolute}, {K: "request_receipts", V: requestCount},
 		{K: "rental_controls", V: len(controls)},
-	}, Notes: []string{"every media object was length- and digest-verified before local publication"}})
+	}, Notes: []string{"the complete bundle appeared in one rename after every exact byte and media object was verified"}})
+}
+
+func writeExactEvidence(path string, data []byte, expected string) (string, *exit.Error) {
+	if len(data) == 0 {
+		return "", exit.Internalf("cannot publish empty exact evidence %s", filepath.Base(path))
+	}
+	digest, err := canonical.Spell(canonical.Digest(data))
+	if err != nil {
+		return "", exit.Internalf("cannot digest exact evidence %s: %s", filepath.Base(path), err)
+	}
+	if expected != "" && digest != expected {
+		return "", exit.Named(exit.Conflict, "workflow.receipt_digest_mismatch",
+			"exact evidence %s hashes to %s, expected %s", filepath.Base(path), digest, expected)
+	}
+	file, err := os.CreateTemp(filepath.Dir(path), "."+filepath.Base(path)+".staging-*")
+	if err != nil {
+		return "", exit.Internalf("cannot stage %s: %s", filepath.Base(path), err)
+	}
+	staged := file.Name()
+	keep := false
+	defer func() {
+		_ = file.Close()
+		if !keep {
+			_ = os.Remove(staged)
+		}
+	}()
+	if _, err = file.Write(data); err == nil {
+		err = file.Sync()
+	}
+	if closeErr := file.Close(); err == nil {
+		err = closeErr
+	}
+	if err == nil {
+		err = os.Rename(staged, path)
+	}
+	if err != nil {
+		return "", exit.Internalf("cannot publish %s: %s", filepath.Base(path), err)
+	}
+	keep = true
+	return digest, nil
+}
+
+func digestEvidenceFile(path string) (string, *exit.Error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return "", exit.Internalf("cannot digest workflow evidence %s: %s", filepath.Base(path), err)
+	}
+	sum := sha256.Sum256(data)
+	return "sha256:" + hex.EncodeToString(sum[:]), nil
+}
+
+func syncWorkflowTree(root string) *exit.Error {
+	var dirs []string
+	err := filepath.WalkDir(root, func(path string, entry os.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		if entry.IsDir() {
+			dirs = append(dirs, path)
+		}
+		return nil
+	})
+	if err != nil {
+		return exit.Internalf("cannot inspect staged workflow bundle: %s", err)
+	}
+	for index := len(dirs) - 1; index >= 0; index-- {
+		if problem := syncWorkflowDirectory(dirs[index]); problem != nil {
+			return problem
+		}
+	}
+	return nil
+}
+
+func syncWorkflowDirectory(path string) *exit.Error {
+	if runtime.GOOS == "windows" {
+		return nil
+	}
+	dir, err := os.Open(path)
+	if err != nil {
+		return exit.Internalf("cannot open workflow directory for sync: %s", err)
+	}
+	err = dir.Sync()
+	_ = dir.Close()
+	if err != nil {
+		return exit.Internalf("cannot make workflow directory durable: %s", err)
+	}
+	return nil
 }
 
 func writeWorkflowJSON(path string, value any) *exit.Error {

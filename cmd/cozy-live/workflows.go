@@ -65,9 +65,31 @@ func workflowLive(crashOnly bool) {
 		_, workflowErr := os.Stat(filepath.Join(download, "workflow.json"))
 		_, manifestErr := os.Stat(filepath.Join(download, "download-manifest.json"))
 		_, receiptErr := os.Stat(filepath.Join(download, "step-09-receipt.json"))
+		_, planErr := os.Stat(filepath.Join(download, "workflow-plan.json"))
+		_, materializedErr := os.Stat(filepath.Join(download, "step-09-materialized.json"))
 		check("workflow download writes local workflow, child receipt, and manifest documents",
-			code == 0 && workflowErr == nil && manifestErr == nil && receiptErr == nil,
+			code == 0 && workflowErr == nil && manifestErr == nil && receiptErr == nil &&
+				planErr == nil && materializedErr == nil,
 			firstLine(out))
+		manifestBytes, err := os.ReadFile(filepath.Join(download, "download-manifest.json"))
+		must("reading the workflow download manifest", err)
+		var manifest map[string]any
+		must("decoding the workflow download manifest", json.Unmarshal(manifestBytes, &manifest))
+		indexed, _ := manifest["steps"].([]any)
+		receiptBytes, err := os.ReadFile(filepath.Join(download, "step-09-receipt.json"))
+		must("reading the workflow child receipt", err)
+		var childReceipt map[string]any
+		must("decoding the workflow child receipt", json.Unmarshal(receiptBytes, &childReceipt))
+		saved, _ := childReceipt["saved_outputs"].([]any)
+		portable := false
+		if len(saved) == 1 {
+			row, _ := saved[0].(map[string]any)
+			path := fmt.Sprint(row["path"])
+			portable = path != "" && !filepath.IsAbs(path) && !strings.HasPrefix(path, "..")
+		}
+		check("workflow download is a compact portable exact-byte index",
+			manifest["version"] == float64(1) && len(indexed) == 9 && portable,
+			fmt.Sprintf("steps=%d portable=%t", len(indexed), portable))
 
 		head("durable cancellation prevents every later child")
 		cancelPlan := liveWorkflowPlan(root, 750)

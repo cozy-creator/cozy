@@ -112,7 +112,7 @@ func handleUp(ctx *Context) *exit.Error {
 	environmentSpec, configDigest := localInvocationIdentity(ctx.Cfg)
 	c, e := orchestrator.Open(orchestrator.Options{
 		Cfg: ctx.Cfg, Layout: l, Store: st, Yield: yield, Log: ctx.Out,
-		Endpoints: resolver, Rentals: rentals,
+		Endpoints: resolver, Rentals: rentals, ObserveRental: rental.ObserveWorker(st),
 		EnvironmentSpecDigest: environmentSpec, ConfigDigest: configDigest,
 	})
 	if e != nil {

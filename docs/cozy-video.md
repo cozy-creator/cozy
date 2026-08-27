@@ -46,14 +46,13 @@ replaces rather than mixes the generated segment soundtracks.
 ```sh
 cozy rent cozy/minimax-h3/v1/reference_media_to_video \
   --accelerator '<provider-neutral GPU SKU>' --reason '<authorized purpose>'
+cozy rent probe <rental-id> --json
 cozy rent show <rental-id> --json
 
 cozy video compose film.cozy-video.yaml \
-  --h3 cozy/minimax-h3 --assembler cozy/video-assembly \
   --rental <rental-id> --out film.composition.json
 
 cozy video submit film.cozy-video.yaml \
-  --h3 cozy/minimax-h3 --assembler cozy/video-assembly \
   --rental <rental-id> --idempotency-key film-run-001
 ```
 
@@ -71,6 +70,5 @@ spellings, and shot-ID edits do not change creative identity when their meaning 
 the same.
 
 V1 deliberately has no includes, templates, variables, inheritance, arbitrary graph expressions,
-transition system, retry fields, duration/step knobs, or model profile selection. FULL versus
-AdaLN-pruned structure is frozen in the exact endpoint execution selected by Tensorhub, outside
-the source.
+transition system, retry fields, duration/step knobs, or model profile selection. Model construction
+and quantization are frozen in the exact endpoint execution selected by Tensorhub, outside the source.

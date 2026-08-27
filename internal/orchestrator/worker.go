@@ -205,9 +205,10 @@ type DesiredPlacement struct {
 // formatting verb that leaks it, and its one raw read is the same Claim.proof carrier a
 // spawned worker's bootstrap uses.
 type WorkerConnection struct {
-	Addr   string       `json:"addr"`
-	Token  secret.Value `json:"token"`
-	CACert string       `json:"ca_cert"` // path to the worker's pinned PEM
+	RentalID string       `json:"rental_id"`
+	Addr     string       `json:"addr"`
+	Token    secret.Value `json:"token"`
+	CACert   string       `json:"ca_cert"` // path to the worker's pinned PEM
 	// Media is the pod's BYTE PLANE (cl-014, ruled #506b): the co-resident media server
 	// this owner uploads inputs and binding records to and downloads outputs from. It is
 	// the pod's own listener with its own keys, not a second use of the control leg —
@@ -342,6 +343,13 @@ type worker struct {
 	// processes also exit through their process waiter; remote workers have no local
 	// process to signal, so retirement must explicitly close this connection.
 	cancelControl func()
+	// stopping makes one teardown the sole owner of this worker's process, control stream,
+	// durable row, and recovery decision. Other callers wait for stopped instead of racing
+	// a replacement under the same deterministic instance id.
+	stopping    bool
+	stopped     chan struct{}
+	attachDone  chan struct{}
+	processDone chan struct{}
 
 	// remoteInstance is the instance identity an ATTACHED pod's worker declared for
 	// itself. A pod is a machine this host never spawned, so it names its own worker the
@@ -420,9 +428,8 @@ type worker struct {
 	revision  uint64
 	setDigest []byte
 	setBytes  []byte
-	// The worker's own last reason for not serving, and when it first said so. A worker
-	// whose placement latches a fault has not answered "not yet" — it has answered "I
-	// cannot", and a client waiting on it needs that answer rather than a longer wait.
+	// The worker's last diagnostic fault and the first report that carried it. The FAILED
+	// axes, not this text, decide terminality: BINDING_DEGRADED may coexist with service.
 	fault      string
 	faulted    bool
 	errorSince time.Time
@@ -443,9 +450,10 @@ type worker struct {
 	// clock. wedged is whether the worker's own liveness monitor currently declares a
 	// WEDGED subject (its verdict rides the activity lane), and noProgress counts the
 	// SUCCESSIVE reports that both declared it and moved nothing. Any movement resets.
-	progressSig string
-	wedged      bool
-	noProgress  int
+	progressSig    string
+	wedged         bool
+	wedgedSubjects map[string]bool
+	noProgress     int
 }
 
 // dispatchableFor is the ROUTING GATE, and it is two questions with two owners (#482).
@@ -485,12 +493,32 @@ func (w *worker) observeJobs(n int) {
 // tell them "it was there", which is true of both.
 func (c *Orchestrator) EnsureWorker(spec WorkerLaunchSpec) (string, WorkerChange, *exit.Error) {
 	instanceID := spec.InstanceID()
-	c.mu.Lock()
-	live := c.workers[instanceID]
-	if live != nil && live.exited {
-		live = nil
+	var live *worker
+	var mine chan struct{}
+	for {
+		c.mu.Lock()
+		if inFlight := c.ensuring[instanceID]; inFlight != nil {
+			c.mu.Unlock()
+			<-inFlight
+			continue
+		}
+		live = c.workers[instanceID]
+		if live != nil && live.stopping {
+			stopped := live.stopped
+			c.mu.Unlock()
+			<-stopped
+			continue
+		}
+		if live != nil && live.exited {
+			live = nil
+		}
+		if live == nil {
+			mine = make(chan struct{})
+			c.ensuring[instanceID] = mine
+		}
+		c.mu.Unlock()
+		break
 	}
-	c.mu.Unlock()
 	if live != nil {
 		// The worker is here. Does it already host what is wanted? The placement's
 		// identity for this purpose is its plan set, which is what the desired set names.
@@ -502,12 +530,40 @@ func (c *Orchestrator) EnsureWorker(spec WorkerLaunchSpec) (string, WorkerChange
 		}
 		return instanceID, ChangePlacementAdded, nil
 	}
+	defer func() {
+		c.mu.Lock()
+		if c.ensuring[instanceID] == mine {
+			delete(c.ensuring, instanceID)
+			close(mine)
+		}
+		c.mu.Unlock()
+	}()
 	if spec.Connection != nil {
 		id, e := c.connectWorker(spec)
 		return id, ChangeWorkerStarted, e
 	}
 	id, e := c.spawnWorker(spec)
 	return id, ChangeWorkerStarted, e
+}
+
+// EnsureRental makes an already-provisioned rental's worker resident without invoking
+// an endpoint. This is the explicit paid-run preflight: the control claim must persist
+// actual hardware readback before a request can be submitted to the pod.
+func (c *Orchestrator) EnsureRental(id string) (string, string, WorkerChange, *exit.Error) {
+	if c.opt.Rentals == nil {
+		return "", "", ChangeNone, exit.Unavailablef("this LocalService attaches no rented workers")
+	}
+	target, problem := c.opt.Rentals(id)
+	if problem != nil {
+		return "", "", ChangeNone, problem
+	}
+	if target == nil || target.Connection == nil {
+		return "", "", ChangeNone, exit.Internalf("rental %s resolved no connected worker", id)
+	}
+	instance, change, problem := c.EnsureWorker(WorkerLaunchSpec{
+		Placement: target.Placement, Connection: target.Connection,
+	})
+	return instance, target.Placement.Endpoint, change, problem
 }
 
 // hostsPlans answers whether a live worker was launched holding exactly the plans this
@@ -661,6 +717,7 @@ func (c *Orchestrator) spawnWorker(spec WorkerLaunchSpec) (string, *exit.Error) 
 	w := newWorker(instanceID, spec)
 	w.cmd, w.logPath, w.home = cmd, logPath, workerHome
 	w.planIDs, w.subjects, w.bootstrap = planIDs, subjects, bootstrap
+	w.processDone = make(chan struct{})
 	// Registered BEFORE the process can dial: a worker that registers faster than its
 	// launcher can record it would be refused as an instance nobody spawned.
 	c.mu.Lock()
@@ -692,6 +749,18 @@ func (c *Orchestrator) spawnWorker(spec WorkerLaunchSpec) (string, *exit.Error) 
 	w.pid = cmd.Process.Pid
 	c.mu.Unlock()
 	if e := c.opt.Store.WorkerStarted(instanceID, cmd.Process.Pid, birthOf(cmd.Process.Pid)); e != nil {
+		_ = killGroup(cmd.Process.Pid, syscall.SIGKILL)
+		_ = cmd.Wait()
+		logFile.Close()
+		releaseGroup(cmd.Process.Pid)
+		close(w.processDone)
+		close(w.attachDone)
+		c.mu.Lock()
+		if c.workers[instanceID] == w {
+			delete(c.workers, instanceID)
+		}
+		c.mu.Unlock()
+		_ = c.opt.Store.CloseWorker(instanceID)
 		return "", e
 	}
 	c.logf("worker %s spawned pid=%d devices=[%s] plans=%d",
@@ -703,6 +772,7 @@ func (c *Orchestrator) spawnWorker(spec WorkerLaunchSpec) (string, *exit.Error) 
 	// A worker row outliving its process is exactly the sidecar bug this design refuses:
 	// the row holds a device grant, so it dies with the process that held it.
 	go func() {
+		defer close(w.processDone)
 		err := cmd.Wait()
 		logFile.Close()
 		// The process is reaped: retire its containment handle so a reused pid can
@@ -711,24 +781,50 @@ func (c *Orchestrator) spawnWorker(spec WorkerLaunchSpec) (string, *exit.Error) 
 		c.mu.Lock()
 		current, live := c.workers[instanceID]
 		mine := live && current == w
+		controlledStop := mine && w.stopping
 		if mine {
 			w.exitCode = cmd.ProcessState.ExitCode()
 			// The entry STAYS, marked exited: a caller waiting on readiness needs to
 			// learn the worker is gone and where its log is, and a row that vanishes
 			// silently is the same lie as a row that outlives its process.
 			w.exited = true
+			if !controlledStop {
+				w.stopping = true // spontaneous exit owns cleanup until its row is closed
+			}
 			if w.bootID != "" {
 				delete(c.sessions, w.bootID)
 			}
 		}
+		cancelControl := w.cancelControl
 		c.mu.Unlock()
+		if cancelControl != nil {
+			cancelControl()
+		}
 		if mine {
-			_ = c.opt.Store.CloseWorker(instanceID)
+			if controlledStop {
+				return // the teardown that set stopping owns the row and recovery decision
+			}
+			<-w.attachDone
+			closeProblem := c.opt.Store.CloseWorker(instanceID)
+			c.mu.Lock()
+			if c.workers[instanceID] == w {
+				delete(c.workers, instanceID)
+			}
+			close(w.stopped)
+			closing := c.closing
+			c.mu.Unlock()
+			if closeProblem != nil {
+				c.logf("worker %s exited (%v) but its durable row could not close: %s",
+					instanceID, err, closeProblem.Message)
+				return
+			}
 			c.logf("worker %s exited (%v); its device grant is released — log %s",
 				instanceID, err, logPath)
 			// The queue's answer to "does capacity exist" just changed, and so has the
 			// fate of anything this worker was RUNNING.
-			go c.recoverWorker(w.spec)
+			if !closing {
+				go c.recoverWorker(w.spec)
+			}
 		}
 	}()
 	return instanceID, nil
@@ -746,6 +842,8 @@ func newWorker(instanceID string, spec WorkerLaunchSpec) *worker {
 		dispatchable:   map[string]bool{},
 		materializable: map[string]bool{},
 		spawned:        time.Now(),
+		stopped:        make(chan struct{}),
+		attachDone:     make(chan struct{}),
 	}
 }
 
@@ -875,7 +973,7 @@ const SilentReports = 8
 // from `dispatch`, 10 from `cozy warm`, two different ceilings on the same cold start —
 // and that number was a ceiling on how large a model may be, not a bound on anything that
 // had gone wrong. Every way this can actually fail is already visible: the worker EXITS,
-// its placement holds a fault past `ErrorGrace`, or it goes SILENT. A worker that is
+// reports a FAILED axis, or goes SILENT. A worker that is
 // materializing is none of those, however long it takes.
 func (c *Orchestrator) EnsurePlacementReady(instanceID, planID string) *exit.Error {
 	silent := SilentReports * ReportCadence
@@ -1030,15 +1128,14 @@ type WorkerFacts struct {
 	ConvergedRevision uint64 `json:"converged_revision"`
 
 	// QuietMS makes missed protocol reports visible. ErrorForMS is diagnostic history
-	// only: a typed FAILED/fault verdict is acted on immediately, never after a timer.
+	// only: a typed FAILED axis is acted on immediately, never after a timer.
 	QuietMS    int64  `json:"quiet_ms"`
 	ErrorForMS int64  `json:"error_for_ms"`
 	Fault      string `json:"fault"`
 	// Refusal is THIS OWNER'S OWN VERDICT about the thing at the other end — a foreign
 	// instance identity, an unpinned release, a wire schema this build does not speak. It
-	// is deliberately NOT `Fault`: a fault is the worker's settled word about itself.
-	// A refusal is this owner's settled verdict. Neither waits on an error clock, and a waiter
-	// that treated the two alike would either wait out a decision or give up on a load.
+	// is deliberately NOT `Fault`: fault rows explain worker state, while FAILED axes decide
+	// terminality. A refusal is this owner's settled verdict and waits on no error clock.
 	Refusal string `json:"refusal"`
 }
 
@@ -1157,9 +1254,26 @@ func (c *Orchestrator) RetirePlacement(instanceID, placementID string) *exit.Err
 		return exit.New(exit.NotFound, "worker %s hosts placement %s, not %s",
 			instanceID, w.placementID, placementID)
 	}
+	return c.retireWorker(w)
+}
+
+// retireWorker is the generation-fenced retirement used by the stall path. A recovered
+// worker intentionally reuses instance and placement ids; only the exact object whose
+// observations established the retirement ground may receive the empty desired set.
+func (c *Orchestrator) retireWorker(w *worker) *exit.Error {
+	c.mu.Lock()
+	if c.workers[w.instanceID] != w || w.exited || w.stopping {
+		c.mu.Unlock()
+		return exit.New(exit.NotFound, "worker %s is no longer the observed generation", w.instanceID)
+	}
+	s := c.sessions[w.bootID]
+	c.mu.Unlock()
+	if s == nil {
+		return exit.Unavailablef("worker %s holds no claimed control stream to retire", w.instanceID)
+	}
 	c.logf("retiring placement %s from %s: the desired set becomes empty and it drains",
-		placementID, instanceID)
-	return c.ConvergePlacementSet(instanceID, nil)
+		w.placementID, w.instanceID)
+	return c.converge(s, w, nil)
 }
 
 // ShutdownWorker drains and stops the WHOLE worker process group — the only yield
@@ -1170,41 +1284,84 @@ func (c *Orchestrator) ShutdownWorker(instanceID string, grace time.Duration) {
 	c.mu.Lock()
 	w := c.workers[instanceID]
 	c.mu.Unlock()
+	c.shutdownWorker(w, grace)
+}
+
+// shutdownWorker stops exactly the worker object the caller observed. Instance ids are
+// deterministic and reused for journal recovery, so an id-only teardown can otherwise close
+// the replacement's row after the old process exits. The caller that wins stopping owns all
+// four acts: close control, reap process, close the row, remove the in-memory worker.
+func (c *Orchestrator) shutdownWorker(w *worker, grace time.Duration) bool {
 	if w == nil {
-		return
+		return false
 	}
-	if w.cancelControl != nil {
-		w.cancelControl()
+	c.mu.Lock()
+	if c.workers[w.instanceID] != w {
+		c.mu.Unlock()
+		return false
 	}
-	if w.cmd != nil && w.cmd.Process != nil && !w.exited {
+	if w.stopping {
+		stopped := w.stopped
+		c.mu.Unlock()
+		<-stopped
+		return false
+	}
+	w.stopping = true
+	cancelControl := w.cancelControl
+	attachDone, processDone := w.attachDone, w.processDone
+	pid, exited := 0, w.exited
+	if w.cmd != nil && w.cmd.Process != nil {
+		pid = w.cmd.Process.Pid
+	}
+	c.mu.Unlock()
+	if cancelControl != nil {
+		cancelControl()
+	}
+	if pid != 0 && !exited {
 		// The cooperative tier: SIGTERM to the group, CTRL_BREAK to the job's console
 		// group on Windows. A failure here is loud but not an escalation by itself —
 		// the bounded wait below is what separates asking from insisting.
-		if err := killGroup(w.cmd.Process.Pid, syscall.SIGTERM); err != nil {
+		if err := killGroup(pid, syscall.SIGTERM); err != nil {
 			c.logf("worker %s: the cooperative stop could not be delivered (%s); "+
-				"the forced tier follows the grace window", instanceID, err)
+				"the forced tier follows the grace window", w.instanceID, err)
 		}
-		deadline := time.Now().Add(grace)
-		for time.Now().Before(deadline) {
-			if !alive(w.cmd.Process.Pid) {
-				break
+		timer := time.NewTimer(grace)
+		select {
+		case <-processDone:
+			if !timer.Stop() {
+				select {
+				case <-timer.C:
+				default:
+				}
 			}
-			time.Sleep(20 * time.Millisecond)
+		case <-timer.C:
+			_ = killGroup(pid, syscall.SIGKILL)
+			<-processDone // process reaping is an observed fact, not another timeout
 		}
-		if alive(w.cmd.Process.Pid) {
-			_ = killGroup(w.cmd.Process.Pid, syscall.SIGKILL)
-		}
+	} else if processDone != nil {
+		<-processDone
 	}
-	_ = c.opt.Store.CloseWorker(instanceID)
+	if attachDone != nil {
+		<-attachDone
+	}
+	closeProblem := c.opt.Store.CloseWorker(w.instanceID)
 	c.mu.Lock()
-	w.exited = true
-	delete(c.workers, instanceID)
-	if w.bootID != "" {
-		delete(c.sessions, w.bootID)
+	if c.workers[w.instanceID] == w {
+		w.exited = true
+		delete(c.workers, w.instanceID)
+		if w.bootID != "" {
+			delete(c.sessions, w.bootID)
+		}
 	}
+	close(w.stopped)
 	c.mu.Unlock()
-	c.logf("worker %s stopped; its device grant is released", instanceID)
-	go c.reviveQueue()
+	if closeProblem != nil {
+		c.logf("worker %s stopped but its durable row could not close: %s",
+			w.instanceID, closeProblem.Message)
+	} else {
+		c.logf("worker %s stopped; its device grant is released", w.instanceID)
+	}
+	return true
 }
 
 // Reconcile runs at boot, before anything is served. Rows describing processes from a

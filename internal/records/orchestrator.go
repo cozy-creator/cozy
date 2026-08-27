@@ -202,6 +202,12 @@ var widen = []string{
 	`ALTER TABLE rentals ADD COLUMN control_snapshot_digest TEXT NOT NULL DEFAULT ''`,
 	`ALTER TABLE rentals ADD COLUMN control_snapshot_length INTEGER NOT NULL DEFAULT 0`,
 	`ALTER TABLE rentals ADD COLUMN control_snapshot_bytes BLOB NOT NULL DEFAULT x''`,
+	`ALTER TABLE rentals ADD COLUMN observed_accelerator TEXT NOT NULL DEFAULT ''`,
+	`ALTER TABLE rentals ADD COLUMN observed_accelerator_count INTEGER NOT NULL DEFAULT 0`,
+	`ALTER TABLE rentals ADD COLUMN observed_backend TEXT NOT NULL DEFAULT ''`,
+	`ALTER TABLE rentals ADD COLUMN observed_worker_instance TEXT NOT NULL DEFAULT ''`,
+	`ALTER TABLE rentals ADD COLUMN observed_worker_boot_id TEXT NOT NULL DEFAULT ''`,
+	`ALTER TABLE rentals ADD COLUMN observed_at TEXT NOT NULL DEFAULT ''`,
 }
 
 // normalize hard-cuts pre-launch lifecycle spellings whose durable meaning was refined.

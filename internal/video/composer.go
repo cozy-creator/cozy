@@ -34,12 +34,13 @@ type Options struct {
 
 type Composer struct{ opt Options }
 
+const assemblyEndpoint = "cozy/video-assembly"
+
 type ComposeRequest struct {
 	Source             []byte
 	BaseDir            string
 	CreativePlanDigest string
 	H3Endpoint         string
-	AssemblyEndpoint   string
 	RentalID           string
 }
 
@@ -202,18 +203,19 @@ func (p videoProfile) entrypointForStep(step int, creative creativePlan) *launch
 }
 
 func (c *Composer) resolveProfile(request ComposeRequest) (videoProfile, *exit.Error) {
-	if strings.TrimSpace(request.H3Endpoint) == "" || strings.TrimSpace(request.AssemblyEndpoint) == "" {
+	localEndpoint, rentalID := strings.TrimSpace(request.H3Endpoint), strings.TrimSpace(request.RentalID)
+	if (localEndpoint == "") == (rentalID == "") {
 		return videoProfile{}, exit.New(exit.Validation,
-			"video composition requires explicit h3_endpoint and assembly_endpoint refs")
+			"video composition requires exactly one local h3_endpoint or remote rental_id")
 	}
 	var h3 orchestrator.DesiredPlacement
 	var problem *exit.Error
-	remote := strings.TrimSpace(request.RentalID) != ""
+	remote := rentalID != ""
 	if remote {
 		if c.opt.Rentals == nil || c.opt.RemoteEntrypoint == nil {
 			return videoProfile{}, exit.Unavailablef("this LocalService resolves no rented video target")
 		}
-		resolved, e := c.opt.Rentals(strings.TrimSpace(request.RentalID))
+		resolved, e := c.opt.Rentals(rentalID)
 		if e != nil || resolved == nil {
 			if e == nil {
 				e = exit.New(exit.NotFound, "no attached rental %s", request.RentalID)
@@ -221,12 +223,8 @@ func (c *Composer) resolveProfile(request ComposeRequest) (videoProfile, *exit.E
 			return videoProfile{}, e
 		}
 		h3 = *resolved
-		if h3.Endpoint != request.H3Endpoint {
-			return videoProfile{}, exit.Named(exit.Conflict, "video_h3_target_mismatch",
-				"rental %s serves %s, not %s", request.RentalID, h3.Endpoint, request.H3Endpoint)
-		}
 	} else {
-		h3, problem = c.opt.Resolver.ResolvePlacement(request.H3Endpoint)
+		h3, problem = c.opt.Resolver.ResolvePlacement(localEndpoint)
 		if problem != nil {
 			return videoProfile{}, problem
 		}
@@ -252,7 +250,7 @@ func (c *Composer) resolveProfile(request ComposeRequest) (videoProfile, *exit.E
 	if problem != nil {
 		return videoProfile{}, problem
 	}
-	assemblyPlacement, problem := c.opt.Resolver.ResolvePlacement(request.AssemblyEndpoint)
+	assemblyPlacement, problem := c.opt.Resolver.ResolvePlacement(assemblyEndpoint)
 	if problem != nil {
 		return videoProfile{}, problem
 	}

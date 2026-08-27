@@ -44,7 +44,13 @@ CREATE TABLE IF NOT EXISTS rentals (
   media_address     TEXT NOT NULL DEFAULT '',
   control_snapshot_digest TEXT NOT NULL DEFAULT '',
   control_snapshot_length INTEGER NOT NULL DEFAULT 0,
-  control_snapshot_bytes  BLOB NOT NULL DEFAULT x''
+  control_snapshot_bytes  BLOB NOT NULL DEFAULT x'',
+  observed_accelerator       TEXT NOT NULL DEFAULT '',
+  observed_accelerator_count INTEGER NOT NULL DEFAULT 0,
+  observed_backend           TEXT NOT NULL DEFAULT '',
+  observed_worker_instance   TEXT NOT NULL DEFAULT '',
+  observed_worker_boot_id    TEXT NOT NULL DEFAULT '',
+  observed_at                TEXT NOT NULL DEFAULT ''
 )`
 
 const migrateRentalOperationState = `CASE state
@@ -260,15 +266,26 @@ type Rental struct {
 	ControlSnapshotDigest string
 	ControlSnapshotLength int64
 	ControlSnapshotBytes  []byte
+	// Observed* is the remote worker's ClaimAck readback. AcceleratorModel above is
+	// only the caller's requested SKU; these fields are absent until Creator has
+	// actually claimed the rented worker without invoking a model.
+	ObservedAccelerator      string
+	ObservedAcceleratorCount int
+	ObservedBackend          string
+	ObservedWorkerInstance   string
+	ObservedWorkerBootID     string
+	ObservedAt               string
 }
 
-const rentalCols = `id,endpoint_ref,accelerator_model,address,cert_path,state,hub,rented_at,released_at,media_address,control_snapshot_digest,control_snapshot_length,control_snapshot_bytes`
+const rentalCols = `id,endpoint_ref,accelerator_model,address,cert_path,state,hub,rented_at,released_at,media_address,control_snapshot_digest,control_snapshot_length,control_snapshot_bytes,observed_accelerator,observed_accelerator_count,observed_backend,observed_worker_instance,observed_worker_boot_id,observed_at`
 
 func scanRental(row interface{ Scan(...any) error }) (Rental, error) {
 	var r Rental
 	err := row.Scan(&r.ID, &r.EndpointRef, &r.AcceleratorModel, &r.Address, &r.CertPath,
 		&r.State, &r.Hub, &r.RentedAt, &r.ReleasedAt, &r.MediaAddress,
-		&r.ControlSnapshotDigest, &r.ControlSnapshotLength, &r.ControlSnapshotBytes)
+		&r.ControlSnapshotDigest, &r.ControlSnapshotLength, &r.ControlSnapshotBytes,
+		&r.ObservedAccelerator, &r.ObservedAcceleratorCount, &r.ObservedBackend,
+		&r.ObservedWorkerInstance, &r.ObservedWorkerBootID, &r.ObservedAt)
 	return r, err
 }
 
@@ -283,7 +300,7 @@ func (s *Store) RecordRental(r Rental) *exit.Error {
 		r.ControlSnapshotBytes = []byte{}
 	}
 	if _, err := s.db.Exec(`INSERT INTO rentals(`+rentalCols+`)
-		VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)
+		VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
 		ON CONFLICT(id) DO UPDATE SET address=excluded.address,
 		  cert_path=excluded.cert_path, state=excluded.state, released_at=excluded.released_at,
 		  media_address=excluded.media_address,
@@ -292,10 +309,24 @@ func (s *Store) RecordRental(r Rental) *exit.Error {
 		  control_snapshot_length=CASE WHEN length(rentals.control_snapshot_bytes)>0
 		    THEN rentals.control_snapshot_length ELSE excluded.control_snapshot_length END,
 		  control_snapshot_bytes=CASE WHEN length(rentals.control_snapshot_bytes)>0
-		    THEN rentals.control_snapshot_bytes ELSE excluded.control_snapshot_bytes END`,
+		    THEN rentals.control_snapshot_bytes ELSE excluded.control_snapshot_bytes END,
+		  observed_accelerator=CASE WHEN rentals.observed_accelerator<>''
+		    THEN rentals.observed_accelerator ELSE excluded.observed_accelerator END,
+		  observed_accelerator_count=CASE WHEN rentals.observed_accelerator_count>0
+		    THEN rentals.observed_accelerator_count ELSE excluded.observed_accelerator_count END,
+		  observed_backend=CASE WHEN rentals.observed_backend<>''
+		    THEN rentals.observed_backend ELSE excluded.observed_backend END,
+		  observed_worker_instance=CASE WHEN rentals.observed_worker_instance<>''
+		    THEN rentals.observed_worker_instance ELSE excluded.observed_worker_instance END,
+		  observed_worker_boot_id=CASE WHEN rentals.observed_worker_boot_id<>''
+		    THEN rentals.observed_worker_boot_id ELSE excluded.observed_worker_boot_id END,
+		  observed_at=CASE WHEN rentals.observed_at<>''
+		    THEN rentals.observed_at ELSE excluded.observed_at END`,
 		r.ID, r.EndpointRef, r.AcceleratorModel, r.Address, r.CertPath, r.State, r.Hub,
 		r.RentedAt, r.ReleasedAt, r.MediaAddress, r.ControlSnapshotDigest,
-		r.ControlSnapshotLength, r.ControlSnapshotBytes); err != nil {
+		r.ControlSnapshotLength, r.ControlSnapshotBytes, r.ObservedAccelerator,
+		r.ObservedAcceleratorCount, r.ObservedBackend, r.ObservedWorkerInstance,
+		r.ObservedWorkerBootID, r.ObservedAt); err != nil {
 		return exit.Internalf("cannot record rental %s: %s", r.ID, err)
 	}
 	stored, e := s.RentalRow(r.ID)
@@ -308,6 +339,58 @@ func (s *Store) RecordRental(r Rental) *exit.Error {
 		!bytes.Equal(stored.ControlSnapshotBytes, r.ControlSnapshotBytes)) {
 		return exit.Named(exit.Conflict, "rental.control_snapshot_conflict",
 			"rental %s already carries another exact acquisition-attempt control snapshot", r.ID)
+	}
+	return nil
+}
+
+// ObserveRentalWorker records the actual remote worker ClaimAck before any model
+// invocation. The requested accelerator is not evidence; the worker's readback must
+// exactly agree with the SKU Tensorhub already qualified in its readiness receipt.
+// The observation is immutable for one rental so a changed machine identity refuses
+// instead of silently rewriting the evidence a workflow is about to freeze.
+func (s *Store) ObserveRentalWorker(id, accelerator, backend, instance, bootID string,
+	count int) *exit.Error {
+	tx, err := s.db.Begin()
+	if err != nil {
+		return exit.Internalf("cannot begin rental %s worker observation: %s", id, err)
+	}
+	defer tx.Rollback()
+	row, err := scanRental(tx.QueryRow(`SELECT `+rentalCols+` FROM rentals WHERE id=?`, id))
+	if errors.Is(err, sql.ErrNoRows) {
+		return exit.New(exit.NotFound, "no rental %s on this host", id)
+	}
+	if err != nil {
+		return exit.Internalf("cannot read rental %s for worker observation: %s", id, err)
+	}
+	if row.State != "ready" || accelerator == "" || backend == "" || instance == "" ||
+		bootID == "" || count != 1 {
+		return exit.Named(exit.Conflict, "rental.worker_readback_incomplete",
+			"rental %s ClaimAck is state=%q backend=%q accelerator=%q count=%d instance=%q boot=%q",
+			id, row.State, backend, accelerator, count, instance, bootID)
+	}
+	if accelerator != row.AcceleratorModel {
+		return exit.Named(exit.Conflict, "rental.accelerator_readback_mismatch",
+			"rental %s worker reports %q but the paid request selected %q",
+			id, accelerator, row.AcceleratorModel).
+			WithRemedy("release it; never invoke a model on hardware that disagrees with the paid selection")
+	}
+	if row.ObservedAccelerator != "" && (row.ObservedAccelerator != accelerator ||
+		row.ObservedAcceleratorCount != count || row.ObservedBackend != backend ||
+		row.ObservedWorkerInstance != instance || row.ObservedWorkerBootID != bootID) {
+		return exit.Named(exit.Conflict, "rental.worker_readback_changed",
+			"rental %s now claims a different accelerator or worker identity", id).
+			WithRemedy("release it; a rental's accepted execution evidence is immutable")
+	}
+	if row.ObservedAccelerator == "" {
+		if _, err := tx.Exec(`UPDATE rentals SET observed_accelerator=?,
+			observed_accelerator_count=?,observed_backend=?,observed_worker_instance=?,
+			observed_worker_boot_id=?,observed_at=? WHERE id=? AND observed_accelerator=''`,
+			accelerator, count, backend, instance, bootID, now(), id); err != nil {
+			return exit.Internalf("cannot record rental %s worker observation: %s", id, err)
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return exit.Internalf("cannot commit rental %s worker observation: %s", id, err)
 	}
 	return nil
 }

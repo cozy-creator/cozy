@@ -164,6 +164,7 @@ func (s *Server) Handler() (http.Handler, *exit.Error) {
 		"POST /v1/local/jobs/{id}/cancel":             s.cancelJob,
 		"POST /v1/local/workflows":                    s.submitWorkflow,
 		"GET /v1/local/workflows/{id}":                s.getWorkflow,
+		"GET /v1/local/workflows/{id}/receipt":        s.getWorkflowReceipt,
 		"POST /v1/local/workflows/{id}/cancel":        s.cancelWorkflow,
 		"POST /v1/local/video-compositions":           s.composeVideo,
 		"GET /healthz":                                s.healthz,

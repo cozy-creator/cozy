@@ -277,6 +277,14 @@ func (c *Client) EnsureWorker(endpoint string, warm bool) (StartResult, *exit.Er
 	return res, e
 }
 
+// EnsureRental claims one attached rented worker without invoking a model. Its
+// ClaimAck actual-hardware readback becomes durable before this returns ready.
+func (c *Client) EnsureRental(rentalID string) (StartResult, *exit.Error) {
+	var res StartResult
+	e := c.call("POST", "/v1/local/workers", map[string]any{"rental": rentalID}, &res)
+	return res, e
+}
+
 // StopResult is the drain answer. `Stopped` false means there was nothing to stop, which
 // is a successful no-op and not a refusal.
 type StopResult struct {

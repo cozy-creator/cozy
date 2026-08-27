@@ -246,20 +246,28 @@ func Inspect(st *records.Store, id string) (*records.Rental, ControlSummary, *ex
 		}
 		return row, ControlSummary{}, e
 	}
-	facts, e := controlFacts(*row)
+	summary, e := Summarize(*row)
+	return row, summary, e
+}
+
+// Summarize verifies and projects one retained exact control snapshot without
+// consulting the live rentals table. Workflow receipts use it after dial authority
+// has been released.
+func Summarize(row records.Rental) (ControlSummary, *exit.Error) {
+	facts, e := controlFacts(row)
 	if e != nil {
-		return row, ControlSummary{}, e
+		return ControlSummary{}, e
 	}
 	plans := make([]string, 0, len(facts.Placement.Bindings))
 	for _, binding := range facts.Placement.Bindings {
 		planID, problem := binding.PlanID()
 		if problem != nil {
-			return row, ControlSummary{}, problem
+			return ControlSummary{}, problem
 		}
 		plans = append(plans, planID)
 	}
 	sort.Strings(plans)
-	return row, ControlSummary{
+	return ControlSummary{
 		ControlSnapshotDigest:             row.ControlSnapshotDigest,
 		EndpointExecutionDigest:           facts.EndpointExecutionDigest,
 		ArtifactObjectSetDigest:           facts.ArtifactObjectSetDigest,
@@ -324,7 +332,9 @@ func Resolver(l home.Layout, st *records.Store) func(string) (*orchestrator.Remo
 				WithRemedy("release this rental and rent again; the pin is written with the token").
 				WithNext("cozy rent release " + id + " --yes")
 		}
-		spec := &orchestrator.WorkerConnection{Addr: row.Address, Token: token, CACert: cert}
+		spec := &orchestrator.WorkerConnection{
+			RentalID: row.ID, Addr: row.Address, Token: token, CACert: cert,
+		}
 		if row.MediaAddress != "" {
 			// ONE PROVISIONED IDENTITY, TWO LISTENERS (#506b, tonight's tier). The pod's
 			// media server holds its OWN keys — cl-014's rule, and this host pins the same
@@ -335,6 +345,17 @@ func Resolver(l home.Layout, st *records.Store) func(string) (*orchestrator.Remo
 			spec.Media = &media.Spec{Addr: row.MediaAddress, Token: token, CACert: cert}
 		}
 		return &orchestrator.RemoteTarget{Connection: spec, Placement: facts.Placement}, nil
+	}
+}
+
+// ObserveWorker turns a remote ClaimAck into the rental's durable actual-hardware
+// readback. It is wired into the orchestrator so no remote session can become
+// dispatchable without crossing this records boundary.
+func ObserveWorker(st *records.Store) func(orchestrator.RentalObservation) *exit.Error {
+	return func(observed orchestrator.RentalObservation) *exit.Error {
+		return st.ObserveRentalWorker(observed.RentalID, observed.Accelerator,
+			observed.Backend, observed.WorkerInstance, observed.WorkerBootID,
+			observed.DeviceCount)
 	}
 }
 

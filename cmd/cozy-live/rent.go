@@ -145,6 +145,19 @@ func sectionRent() {
 	check("rent show projects exact selected execution/root/plan identities, never selection inputs",
 		code == 0 && strings.HasPrefix(fmt.Sprint(control["endpoint_execution_digest"]), "sha256:") &&
 			len(selectedRoots) == 1 && len(selectedPlans) == 1, firstLine(controlOut))
+	code, probe, probeOut := cozyJSON(root, "rent", "probe", rentalA)
+	check("rent probe claims the worker without invoking a model and persists actual GPU identity",
+		code == 0 && probe["state"] == "ready" && probe["accelerator"] == "NVIDIA H200" &&
+			probe["observed_accelerator"] == "NVIDIA H200" &&
+			probe["observed_accelerator_count"] == float64(1) &&
+			probe["observed_backend"] == "cuda" && fmt.Sprint(probe["observed_worker_instance"]) != "" &&
+			fmt.Sprint(probe["observed_worker_boot_id"]) != "", firstLine(probeOut))
+	code, observedControl, controlOut := cozyJSON(root, "rent", "show", rentalA)
+	check("rent show retains the exact worker readback after the probe",
+		code == 0 && observedControl["observed_accelerator"] == probe["observed_accelerator"] &&
+			observedControl["observed_worker_instance"] == probe["observed_worker_instance"] &&
+			observedControl["endpoint_execution_digest"] == control["endpoint_execution_digest"],
+		firstLine(controlOut))
 	fmt.Printf("  bench ask -> ready -> pinned: %d ms\n", rentMS)
 
 	head("the owner token is MINTED HERE, and the hub is never told it (#495e)")

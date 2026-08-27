@@ -100,7 +100,7 @@ func handleStart(ctx *Context) *exit.Error {
 // It said "never a clock" while holding one: a 10-minute ceiling, which is a statement
 // about how large a model may be rather than about anything having gone wrong. The ways
 // this fails are all the worker's own and all visible through the listing — it EXITS, it
-// goes SILENT, it holds a FAULT, or this owner REFUSED it — which is the same set
+// goes SILENT, reports a FAILED axis, or this owner REFUSED it — which is the same set
 // `orchestrator.EnsurePlacementReady` decides on, so the two sides of the same wait cannot
 // disagree.
 func waitReady(c *localapi.Client, instance string) (localapi.Worker, *exit.Error) {
@@ -132,7 +132,7 @@ func waitReady(c *localapi.Client, instance string) (localapi.Worker, *exit.Erro
 			if w.Refusal != "" {
 				// A refusal this host recorded at claim time is a SETTLED verdict, not a
 				// state the worker might leave — so it answers now instead of after eight
-				// missed report periods. A worker FAULT is the other settled verdict below.
+				// missed report periods. A FAILED axis is the worker's settled verdict below.
 				return localapi.Worker{}, exit.New(exit.Conflict,
 					"this host refused the worker at that address: %s", w.Refusal).
 					WithNext("cozy logs <org/endpoint>")
@@ -144,7 +144,7 @@ func waitReady(c *localapi.Client, instance string) (localapi.Worker, *exit.Erro
 					orchestrator.SilentReports, orchestrator.ReportCadence).
 					WithNext("cozy logs <org/endpoint>")
 			}
-			if w.Fault != "" {
+			if w.Phase == "FAILED" || w.Materialization == "FAILED" {
 				return localapi.Worker{}, exit.New(exit.Failed,
 					"the endpoint worker's placement reported a terminal fault and cannot "+
 						"become dispatchable: %s", w.Fault).
@@ -596,10 +596,24 @@ func saveOutputsAt(c *localapi.Client, life api.Lifecycle, dir string) ([]map[st
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return nil, exit.Internalf("cannot create %s: %s", dir, err)
 	}
+	names := make([]string, len(life.Outputs))
+	seenIDs, seenNames := map[string]bool{}, map[string]bool{}
+	for index, out := range life.Outputs {
+		if out.OutputID == "" || seenIDs[out.OutputID] {
+			return nil, exit.Named(exit.Validation, "output_name_collision",
+				"the output manifest repeats or omits output id %q", out.OutputID)
+		}
+		seenIDs[out.OutputID] = true
+		names[index] = fmt.Sprintf("output-%02d%s", index+1, extensionOf(out.MimeType))
+		if seenNames[names[index]] {
+			return nil, exit.Named(exit.Validation, "output_name_collision",
+				"two output manifest rows resolve to %s", names[index])
+		}
+		seenNames[names[index]] = true
+	}
 	saved := []map[string]string{}
-	for _, out := range life.Outputs {
-		name := strings.ReplaceAll(out.OutputID, "/", "_") + extensionOf(out.MimeType)
-		path := filepath.Join(dir, name)
+	for index, out := range life.Outputs {
+		path := filepath.Join(dir, names[index])
 		staging, actualDigest := "", ""
 		n, digest, e := c.Media(out.MediaID, func(body io.Reader) (int64, *exit.Error) {
 			staged, copied, actual, stageErr := stageVerifiedOutput(

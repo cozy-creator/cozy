@@ -230,9 +230,9 @@ func (c *Orchestrator) onObserved(s *session, r *pb.ObservedWorkerState) {
 			}
 		}
 		w.dispatchable, w.materializable = dispatchable, materializable
-		// A placement holding a FAULT is timed from the first report that carried one, and
-		// the clock resets the moment it clears. The reason is the worker's own — this side
-		// echoes what it reported and never composes one.
+		// Fault rows explain state; FAILED axes decide terminality. In particular,
+		// BINDING_DEGRADED explicitly means "the worker still serves" and must never become
+		// kill authority merely because it shares the diagnostic list with fatal faults.
 		w.faulted = faulted(status, r)
 		if w.faulted {
 			if w.errorSince.IsZero() {
@@ -258,7 +258,8 @@ func (c *Orchestrator) onObserved(s *session, r *pb.ObservedWorkerState) {
 		sig := progressSignature(r, status)
 		moved := sig != w.progressSig
 		w.progressSig = sig
-		w.wedged = wedgeDeclared(r)
+		w.wedgedSubjects = wedgeDeclared(r)
+		w.wedged = len(w.wedgedSubjects) > 0
 		switch {
 		case moved, !w.wedged:
 			w.noProgress = 0
@@ -351,7 +352,7 @@ func progressSignature(r *pb.ObservedWorkerState, status *pb.PlacementStatus) st
 // observations find a monotone position unmoved (a count of observations, clock-free on
 // the worker too). The orchestrator never diagnoses a wedge itself — it acts on this
 // report, which is the whole of decisions #613's rule.
-func wedgeDeclared(r *pb.ObservedWorkerState) bool {
+func wedgeDeclared(r *pb.ObservedWorkerState) map[string]bool {
 	type verdict struct {
 		seq    uint64
 		wedged bool
@@ -367,12 +368,13 @@ func wedgeDeclared(r *pb.ObservedWorkerState) bool {
 		}
 		latest[subject] = verdict{seq: activity.Seq, wedged: wedged}
 	}
-	for _, current := range latest {
+	out := map[string]bool{}
+	for subject, current := range latest {
 		if current.wedged {
-			return true
+			out[subject] = true
 		}
 	}
-	return false
+	return out
 }
 
 // livenessVerdict reads only the two exact Runtime spellings. In particular, the
@@ -388,18 +390,17 @@ func livenessVerdict(step string) (subject string, wedged bool, ok bool) {
 	return "", false, false
 }
 
-// faulted answers whether this worker is holding a REFUSAL rather than merely taking its
-// time. A latched placement fault, a machine fault, or a FAILED axis all mean "I cannot";
-// MATERIALIZING and ACTIVATING mean "not yet", however long they take.
+// faulted reads only the protocol's terminal axes. Fault rows are explanations and may
+// coexist with a serving placement (BINDING_DEGRADED and a rejected replacement both do);
+// treating their mere presence as terminal killed healthy active attempts.
 func faulted(status *pb.PlacementStatus, r *pb.ObservedWorkerState) bool {
-	if len(r.Faults) > 0 || r.WorkerPhase == pb.WorkerPhase_WORKER_PHASE_FAILED {
+	if r.WorkerPhase == pb.WorkerPhase_WORKER_PHASE_FAILED {
 		return true
 	}
 	if status == nil {
 		return false
 	}
-	return len(status.Faults) > 0 ||
-		status.Materialization == pb.MaterializationState_MATERIALIZATION_STATE_FAILED
+	return status.Materialization == pb.MaterializationState_MATERIALIZATION_STATE_FAILED
 }
 
 // --------------------------------------------------------------------------- accepted

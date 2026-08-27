@@ -53,6 +53,10 @@ type Options struct {
 	// Rentals resolves an attached-worker id (`cozy rent`'s persisted triple) to its
 	// dial spec. Wired by the entrypoint; nil = this service attaches no remote workers.
 	Rentals func(id string) (*RemoteTarget, *exit.Error)
+	// ObserveRental persists the remote worker's ClaimAck readback. Selection intent is
+	// not hardware evidence: a rented worker is not dispatchable until this callback has
+	// durably joined its actual accelerator and worker identity to the rental.
+	ObserveRental func(RentalObservation) *exit.Error
 
 	// EnvironmentSpecDigest and ConfigDigest are LOCAL placement defaults. They ride
 	// INSIDE every local InvocationSpec document:
@@ -64,6 +68,15 @@ type Options struct {
 	EnvironmentSpecDigest string
 	ConfigDigest          string
 	MaxOutputMiB          int64
+}
+
+type RentalObservation struct {
+	RentalID       string
+	Accelerator    string
+	DeviceCount    int
+	Backend        string
+	WorkerInstance string
+	WorkerBootID   string
 }
 
 // Launcher resolves an endpoint ref along the two boundaries #484 split: the
@@ -119,6 +132,10 @@ type Orchestrator struct {
 	// launch per endpoint: three cold requests for one endpoint must not spawn three
 	// workers and three device grants for a card that serves one attempt at a time.
 	starting map[string]bool
+	// ensuring is the per-instance creation fence beneath every caller, including journal
+	// recovery. `starting` serializes queue policy; this prevents two callers that already
+	// chose the same deterministic slot from spawning two processes into it.
+	ensuring map[string]chan struct{}
 	revision uint64 // hub-owned, monotonic; every Directive bumps it
 	events   []string
 
@@ -157,6 +174,7 @@ func Open(opt Options) (*Orchestrator, *exit.Error) {
 		offers:        map[string]*dispatchReservation{},
 		mediaCleaning: map[string]bool{},
 		starting:      map[string]bool{},
+		ensuring:      map[string]chan struct{}{},
 		frames:        newFanout(),
 	}
 	// The retirement watch samples on the worker report cadence. The cadence is a
@@ -187,10 +205,10 @@ func (c *Orchestrator) Close(grace time.Duration) {
 	var wg sync.WaitGroup
 	for _, w := range c.workerList() {
 		wg.Add(1)
-		go func(id string) {
+		go func(worker *worker) {
 			defer wg.Done()
-			c.ShutdownWorker(id, grace)
-		}(w.instanceID)
+			c.shutdownWorker(worker, grace)
+		}(w)
 	}
 	wg.Wait()
 	c.closeOnce.Do(func() { close(c.done) })
@@ -452,9 +470,9 @@ func (c *Orchestrator) retirementLoop() {
 // runs minutes by construction and was killed at 90 s forever. A worker is retired on
 // exactly three grounds, each an observation rather than a schedule:
 //
-//  1. WORKER-DECLARED FAULT — a FAILED/fault axis is the worker saying "I cannot" and
-//     is acted on immediately. Transient work remains MATERIALIZING/ACTIVATING rather
-//     than publishing a terminal fault. A claim this owner REFUSED is the same class.
+//  1. WORKER-DECLARED FAILURE — a FAILED axis is the worker saying "I cannot" and is
+//     acted on immediately. Fault rows only explain an axis: BINDING_DEGRADED explicitly
+//     coexists with service. A claim this owner REFUSED is the same terminal class.
 //  2. LIVENESS DEATH — the worker owes an ObservedWorkerState every `ReportCadence` and
 //     has missed `SilentReports` of them. A count of missed heartbeats, never a guess
 //     about how long a load takes: a worker filling for an hour reports on every one.
@@ -475,76 +493,103 @@ func (c *Orchestrator) checkRetirement() {
 	if closing {
 		return
 	}
-	var req *records.Request
-	if head != "" {
-		var e *exit.Error
-		req, e = c.opt.Store.RequestRow(head)
-		if e != nil || req == nil {
+	type candidate struct {
+		worker *worker
+		state  string
+	}
+	snapshot := func(eligible func(*worker) bool) []candidate {
+		c.mu.Lock()
+		defer c.mu.Unlock()
+		out := []candidate{}
+		for _, w := range c.workers {
+			if w.exited || w.stopping || !eligible(w) {
+				continue
+			}
+			if retirementGround(w, nil) != "" {
+				out = append(out, candidate{worker: w,
+					state: fmt.Sprintf("%s/%s",
+						trimEnum(pb.MaterializationState_name[int32(w.materialization)], "MATERIALIZATION_STATE_"),
+						trimEnum(pb.ServingState_name[int32(w.serving)], "SERVING_STATE_"))})
+			}
+		}
+		sort.Slice(out, func(i, j int) bool {
+			return out[i].worker.instanceID < out[j].worker.instanceID
+		})
+		return out
+	}
+	retire := func(victim candidate, subject string, attempts []records.Attempt) bool {
+		w := victim.worker
+		c.mu.Lock()
+		current := c.workers[w.instanceID] == w && !w.exited && !w.stopping
+		ground := retirementGround(w, attempts)
+		c.mu.Unlock()
+		if !current || ground == "" {
+			return false
+		}
+		c.logf("worker %s is %s while %s depends on it; retiring it: %s",
+			w.instanceID, victim.state, subject, ground)
+		if e := c.retireWorker(w); e != nil {
+			c.logf("worker %s could not be told to retire %s (%s); the stop follows",
+				w.instanceID, w.placementID, e.Message)
+		}
+		if !c.shutdownWorker(w, StopGrace) {
+			return false
+		}
+		go c.recoverWorker(w.spec)
+		return true
+	}
+
+	// An accepted attempt is its own obligation. A completely unrelated queue head must
+	// neither mask its wedge nor become the subject printed in its retirement evidence.
+	active := snapshot(func(*worker) bool { return true })
+	for _, victim := range active {
+		open, e := c.opt.Store.OpenAttemptsOf(victim.worker.instanceID)
+		if e != nil || len(open) == 0 {
+			continue
+		}
+		if retire(victim, open[0].RequestID, open) {
 			return
 		}
 	}
-	type candidate struct {
-		instance  string
-		placement string
-		state     string
-		ground    string
-		spec      WorkerLaunchSpec
+
+	if head == "" {
+		return
+	}
+	req, e := c.opt.Store.RequestRow(head)
+	if e != nil || req == nil {
+		return
 	}
 	c.mu.Lock()
-	candidates := []candidate{}
 	for _, w := range c.workers {
-		if w.exited || req != nil && !staged(w, req.PlanID) {
+		if w.exited || w.stopping || !staged(w, req.PlanID) {
 			continue
 		}
-		if req != nil && (w.dispatchableFor(req.PlanID) ||
-			w.spec.IsJob() && w.dispatchable[req.PlanID]) {
+		if w.dispatchableFor(req.PlanID) ||
+			w.spec.IsJob() && w.dispatchable[req.PlanID] {
 			// Dispatchable. The queue is waiting on placement, not on this worker.
 			c.mu.Unlock()
 			return
 		}
-		if ground := retirementGround(w); ground != "" {
-			candidates = append(candidates, candidate{instance: w.instanceID,
-				placement: w.placementID, spec: w.spec, ground: ground,
-				state: fmt.Sprintf("%s/%s",
-					trimEnum(pb.MaterializationState_name[int32(w.materialization)], "MATERIALIZATION_STATE_"),
-					trimEnum(pb.ServingState_name[int32(w.serving)], "SERVING_STATE_"))})
-		}
 	}
 	c.mu.Unlock()
-	sort.Slice(candidates, func(i, j int) bool { return candidates[i].instance < candidates[j].instance })
-	for _, victim := range candidates {
-		subject := head
-		if subject == "" {
-			open, e := c.opt.Store.OpenAttemptsOf(victim.instance)
-			if e != nil || len(open) == 0 {
-				continue
-			}
-			subject = open[0].RequestID
+	queued := snapshot(func(w *worker) bool {
+		return staged(w, req.PlanID) && !w.dispatchableFor(req.PlanID) &&
+			!(w.spec.IsJob() && w.dispatchable[req.PlanID])
+	})
+	for _, victim := range queued {
+		if retire(victim, head, nil) {
+			return
 		}
-		c.logf("worker %s is %s while %s depends on it; retiring it: %s",
-			victim.instance, victim.state, subject, victim.ground)
-		if e := c.RetirePlacement(victim.instance, victim.placement); e != nil {
-			c.logf("worker %s could not be told to retire %s (%s); the stop follows",
-				victim.instance, victim.placement, e.Message)
-		}
-		c.ShutdownWorker(victim.instance, StopGrace)
-		// A remote worker has no local process waiter to recover its open journal.
-		// Reconnect the same exact Tensorhub-selected target after the old control
-		// stream is closed; local workers recover from their process exit path.
-		if victim.spec.Connection != nil {
-			go c.recoverWorker(victim.spec)
-		}
-		return
 	}
 }
 
-func retirementGround(w *worker) string {
+func retirementGround(w *worker, attempts []records.Attempt) string {
 	if w.refusal != nil {
 		return fmt.Sprintf("this owner refused its claim (%s: %s)",
 			w.refusal.ErrName(), w.refusal.Message)
 	}
 	if w.faulted {
-		return fmt.Sprintf("it reported a terminal worker/placement fault: %s", w.fault)
+		return fmt.Sprintf("it reported a FAILED worker/placement axis: %s", w.fault)
 	}
 	quiet := time.Duration(0)
 	if !w.lastReport.IsZero() {
@@ -556,7 +601,17 @@ func retirementGround(w *worker) string {
 		return fmt.Sprintf("it reported no observed state for %s — %d missed reports of %s",
 			quiet.Round(time.Second), SilentReports, ReportCadence)
 	}
-	if w.wedged && w.noProgress >= NoProgressReports {
+	wedgeApplies := w.wedged
+	if attempts != nil {
+		wedgeApplies = false
+		for _, attempt := range attempts {
+			if w.wedgedSubjects[fmt.Sprintf("%s#%d", attempt.RequestID, attempt.Attempt)] {
+				wedgeApplies = true
+				break
+			}
+		}
+	}
+	if wedgeApplies && w.noProgress >= NoProgressReports {
 		return fmt.Sprintf("it declared itself WEDGED and %d successive reports moved no axis",
 			w.noProgress)
 	}

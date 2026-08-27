@@ -75,6 +75,7 @@ var handlers = map[string]Handler{
 	"rent":              handleRent,
 	"rent.ls":           handleRentLs,
 	"rent.show":         handleRentShow,
+	"rent.probe":        handleRentProbe,
 	"rent.release":      handleRentRelease,
 }
 

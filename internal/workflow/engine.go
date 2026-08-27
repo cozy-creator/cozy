@@ -74,6 +74,19 @@ type StepSnapshot struct {
 	RentalID           string
 }
 
+type Receipt struct {
+	Snapshot     Snapshot
+	Plan         []byte
+	CreativePlan []byte
+	Steps        []ReceiptStep
+	Rentals      []records.WorkflowRentalControl
+}
+
+type ReceiptStep struct {
+	Ordinal                int
+	MaterializedSubmission []byte
+}
+
 func Open(opt Options) (*Engine, *exit.Error) {
 	if opt.Store == nil || opt.Owner == nil || opt.Resolver == nil {
 		return nil, exit.Internalf("workflow engine needs the records, request owner, and resolver")
@@ -145,9 +158,19 @@ func (e *Engine) Submit(sub Submission) (records.WorkflowExecution, bool, *exit.
 				"idempotency key %s already names a workflow with a different body",
 				sub.IdempotencyKey)
 		}
+		got, readProblem := e.opt.Store.WorkflowTargets(existing.ID)
+		if readProblem != nil {
+			return records.WorkflowExecution{}, false, readProblem
+		}
+		want := normalizedTargets(sub.Workers, len(plan.Steps))
+		if want == nil || !sameTargets(got, want) {
+			return records.WorkflowExecution{}, false, exit.New(exit.Conflict,
+				"idempotency key %s already names different rental targets", sub.IdempotencyKey)
+		}
 		return *existing, false, nil
 	}
 	installs, workers := map[int]string{}, map[int]string{}
+	controls := map[string]records.WorkflowRentalControl{}
 	for index, step := range plan.Steps {
 		ordinal := index + 1
 		worker := strings.TrimSpace(sub.Workers[ordinal])
@@ -164,6 +187,33 @@ func (e *Engine) Submit(sub Submission) (records.WorkflowExecution, bool, *exit.
 			if remote == nil {
 				return records.WorkflowExecution{}, false,
 					exit.New(exit.NotFound, "no attached rental %s", worker)
+			}
+			if controls[worker].RentalID == "" {
+				row, readProblem := e.opt.Store.RentalRow(worker)
+				if readProblem != nil {
+					return records.WorkflowExecution{}, false, readProblem
+				}
+				if row == nil || row.State != "ready" || row.ObservedAccelerator == "" ||
+					row.ObservedAccelerator != row.AcceleratorModel ||
+					row.ObservedAcceleratorCount != 1 || row.ObservedBackend == "" ||
+					row.ObservedWorkerInstance == "" || row.ObservedWorkerBootID == "" {
+					return records.WorkflowExecution{}, false, exit.Named(exit.Conflict,
+						"workflow.rental_unprobed",
+						"rental %s has no complete actual-hardware ClaimAck readback", worker).
+						WithRemedy("run `cozy rent probe %s` before submitting the workflow", worker)
+				}
+				controls[worker] = records.WorkflowRentalControl{
+					RentalID: worker, EndpointRef: row.EndpointRef,
+					AcceleratorModel:         row.AcceleratorModel,
+					ObservedAccelerator:      row.ObservedAccelerator,
+					ObservedAcceleratorCount: row.ObservedAcceleratorCount,
+					ObservedBackend:          row.ObservedBackend,
+					ObservedWorkerInstance:   row.ObservedWorkerInstance,
+					ObservedWorkerBootID:     row.ObservedWorkerBootID, ObservedAt: row.ObservedAt,
+					ControlSnapshotDigest: row.ControlSnapshotDigest,
+					ControlSnapshotLength: row.ControlSnapshotLength,
+					ControlSnapshotBytes:  append([]byte(nil), row.ControlSnapshotBytes...),
+				}
 			}
 			placement, workers[ordinal] = *remote, worker
 		} else {
@@ -267,7 +317,7 @@ func (e *Engine) Submit(sub Submission) (records.WorkflowExecution, bool, *exit.
 		ID: id, IdemKey: sub.IdempotencyKey,
 		BodyDigest: digest, ExecutionDigest: executionDigest,
 		CreativePlanDigest: plan.CreativePlanDigest, Plan: canonicalPlan,
-	}, sub.Assets, installs, workers, len(plan.Steps))
+	}, sub.Assets, installs, workers, controls, len(plan.Steps))
 	if problem != nil {
 		return records.WorkflowExecution{}, false, problem
 	}
@@ -275,6 +325,30 @@ func (e *Engine) Submit(sub Submission) (records.WorkflowExecution, bool, *exit.
 		e.Wake()
 	}
 	return row, fresh, nil
+}
+
+func normalizedTargets(workers map[int]string, steps int) map[int]string {
+	out := map[int]string{}
+	for ordinal, worker := range workers {
+		worker = strings.TrimSpace(worker)
+		if ordinal < 1 || ordinal > steps || worker == "" {
+			return nil
+		}
+		out[ordinal] = worker
+	}
+	return out
+}
+
+func sameTargets(left, right map[int]string) bool {
+	if len(left) != len(right) {
+		return false
+	}
+	for ordinal, worker := range left {
+		if right[ordinal] != worker {
+			return false
+		}
+	}
+	return true
 }
 
 func validationPayload(step Step) ([]byte, *exit.Error) {
@@ -768,6 +842,43 @@ func (e *Engine) State(id string) (*Snapshot, *exit.Error) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	return e.snapshot(id)
+}
+
+// Receipt returns only durable workflow-owned evidence. In particular it never
+// resolves the current rental table: paid dial authority may already have been
+// released while the exact execution snapshot remains part of this workflow.
+func (e *Engine) Receipt(id string) (*Receipt, *exit.Error) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	snapshot, problem := e.snapshot(id)
+	if problem != nil || snapshot == nil {
+		return nil, problem
+	}
+	steps, problem := e.opt.Store.WorkflowSteps(id)
+	if problem != nil {
+		return nil, problem
+	}
+	controls, problem := e.opt.Store.WorkflowRentalControls(id)
+	if problem != nil {
+		return nil, problem
+	}
+	out := &Receipt{Snapshot: *snapshot, Plan: append([]byte(nil), snapshot.Execution.Plan...),
+		Rentals: controls, Steps: make([]ReceiptStep, 0, len(steps))}
+	for _, step := range steps {
+		out.Steps = append(out.Steps, ReceiptStep{Ordinal: step.Ordinal,
+			MaterializedSubmission: append([]byte(nil), step.MaterializedSubmission...)})
+	}
+	if snapshot.Execution.CreativePlanDigest != "" {
+		composition, readProblem := e.opt.Store.VideoCompositionByCreativePlan(
+			snapshot.Execution.CreativePlanDigest)
+		if readProblem != nil {
+			return nil, readProblem
+		}
+		if composition != nil {
+			out.CreativePlan = append([]byte(nil), composition.CreativePlan...)
+		}
+	}
+	return out, nil
 }
 
 func (e *Engine) snapshot(id string) (*Snapshot, *exit.Error) {

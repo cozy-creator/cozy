@@ -400,6 +400,12 @@ func handleRentShow(ctx *Context) *exit.Error {
 	return emit(ctx, render.Record{Kind: "rental_control", Fields: []render.Field{
 		{K: "rental", V: row.ID}, {K: "state", V: row.State},
 		{K: "endpoint", V: row.EndpointRef}, {K: "accelerator", V: row.AcceleratorModel},
+		{K: "observed_accelerator", V: row.ObservedAccelerator},
+		{K: "observed_accelerator_count", V: row.ObservedAcceleratorCount},
+		{K: "observed_backend", V: row.ObservedBackend},
+		{K: "observed_worker_instance", V: row.ObservedWorkerInstance},
+		{K: "observed_worker_boot_id", V: row.ObservedWorkerBootID},
+		{K: "observed_at", V: row.ObservedAt},
 		{K: "control_snapshot_digest", V: control.ControlSnapshotDigest},
 		{K: "endpoint_execution_digest", V: control.EndpointExecutionDigest},
 		{K: "endpoint_release_id", V: control.EndpointReleaseID},
@@ -413,6 +419,40 @@ func handleRentShow(ctx *Context) *exit.Error {
 	}, Notes: []string{
 		"observed exact control selected by Tensorhub; none of these fields is a placement input",
 	}})
+}
+
+func handleRentProbe(ctx *Context) *exit.Error {
+	id := strings.TrimSpace(ctx.Inv.Args[0])
+	client, e := dial(ctx)
+	if e != nil {
+		return e
+	}
+	started, e := client.EnsureRental(id)
+	if e != nil {
+		return e
+	}
+	if _, e := waitReady(client, started.InstanceID); e != nil {
+		return e
+	}
+	_, st, e := rentalStores(ctx)
+	if e != nil {
+		return e
+	}
+	defer st.Close()
+	row, control, e := rental.Inspect(st, id)
+	if e != nil {
+		return e
+	}
+	return emit(ctx, render.Record{Kind: "rental_probe", Fields: []render.Field{
+		{K: "rental", V: id}, {K: "state", V: row.State},
+		{K: "endpoint", V: row.EndpointRef}, {K: "accelerator", V: row.AcceleratorModel},
+		{K: "observed_accelerator", V: row.ObservedAccelerator},
+		{K: "observed_accelerator_count", V: row.ObservedAcceleratorCount},
+		{K: "observed_backend", V: row.ObservedBackend},
+		{K: "observed_worker_instance", V: row.ObservedWorkerInstance},
+		{K: "observed_worker_boot_id", V: row.ObservedWorkerBootID},
+		{K: "endpoint_execution_digest", V: control.EndpointExecutionDigest},
+	}, Notes: []string{"no model was invoked; this is the worker ClaimAck readback"}})
 }
 
 func handleRentRelease(ctx *Context) *exit.Error {

@@ -6,6 +6,7 @@ import (
 	"crypto/rand"
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"fmt"
 	"net"
 	"net/http"
@@ -130,9 +131,14 @@ func fakeWorker() int {
 		say("hosting behind TLS with the certificate the owner pins")
 	}
 	server := grpc.NewServer(opts...)
+	journalPath := ""
+	if out != "" {
+		journalPath = filepath.Join(out, "activewedged-journal.json")
+	}
 	pb.RegisterWorkerControlServer(server, &fakeControl{
 		say: say, arm: arm, bootID: bootID, instance: instance, releaseID: releaseID,
 		root: flag("cozy-home", ""), verify: verify,
+		journal: journalPath,
 	})
 	if err := server.Serve(ln); err != nil {
 		say("serve ended: %v", err)
@@ -149,7 +155,60 @@ type fakeControl struct {
 	releaseID  string
 	root       string // this worker's OWN filesystem root; nothing outside it is writable
 	verify     func(string) bool
+	journal    string
 	generation uint64
+}
+
+type fakeActiveJournal struct {
+	Revision      uint64   `json:"revision"`
+	SetBytes      []byte   `json:"placement_set_canonical_bytes"`
+	PlacementID   string   `json:"placement_id"`
+	PlanIDs       []string `json:"plan_ids"`
+	RequestID     string   `json:"request_id,omitempty"`
+	Attempt       uint64   `json:"attempt,omitempty"`
+	SpecDigest    []byte   `json:"invocation_spec_digest,omitempty"`
+	OutcomeID     string   `json:"outcome_id,omitempty"`
+	OutcomeDigest []byte   `json:"outcome_digest,omitempty"`
+	OutcomeBytes  []byte   `json:"outcome_canonical_bytes,omitempty"`
+}
+
+func (f *fakeControl) readActiveJournal() *fakeActiveJournal {
+	if f.arm != "activewedged" || f.journal == "" {
+		return nil
+	}
+	data, err := os.ReadFile(f.journal)
+	if err != nil {
+		return nil
+	}
+	var journal fakeActiveJournal
+	if json.Unmarshal(data, &journal) != nil {
+		return nil
+	}
+	return &journal
+}
+
+func (f *fakeControl) writeActiveJournal(journal *fakeActiveJournal) {
+	if f.arm != "activewedged" || f.journal == "" || journal == nil {
+		return
+	}
+	data, err := json.Marshal(journal)
+	if err != nil {
+		f.say("cannot encode active-attempt journal: %v", err)
+		return
+	}
+	staging := f.journal + ".staging"
+	if err := os.WriteFile(staging, data, 0o600); err == nil {
+		err = os.Rename(staging, f.journal)
+	}
+	if err != nil {
+		f.say("cannot persist active-attempt journal: %v", err)
+	}
+}
+
+func (f *fakeControl) clearActiveJournal() {
+	if f.journal != "" {
+		_ = os.Remove(f.journal)
+	}
 }
 
 func (f *fakeControl) WatchProgress(open *pb.ProgressOpen, stream pb.WorkerControl_WatchProgressServer) error {
@@ -209,11 +268,17 @@ func (f *fakeControl) Control(stream pb.WorkerControl_ControlServer) error {
 			"the presented proof is not the provisioned credential")
 		return nil
 	}
+	resources := &pb.WorkerResources{Platform: "fake"}
+	if f.arm == "remote" || f.arm == "remotelie" {
+		resources.Backend = "cuda"
+		resources.DeviceCount = 1
+		resources.DeviceName = "NVIDIA H200"
+	}
 	ack := &pb.ClaimAck{
 		Accepted: true, WireMinor: pb.WireMinor, WorkerId: "local",
 		WorkerInstanceId: f.instance, WorkerReleaseId: f.releaseID,
 		WireSchemaDigest: mySchemaDigest(),
-		Resources:        &pb.WorkerResources{Platform: "fake", Backend: ""},
+		Resources:        resources,
 	}
 	env(func(e, g uint64, b string) {
 		ack.RecordOwnerEpoch, ack.ControlStreamGeneration, ack.WorkerBootId = e, g, b
@@ -231,8 +296,10 @@ func (f *fakeControl) Control(stream pb.WorkerControl_ControlServer) error {
 		f.say("cannot mint the empty placement set: %v", err)
 		return nil
 	}
-	spelledSet, _ := canonical.Spell(emptySetDigest)
-	bodyBytes, bodyDigest, err := canonical.Identity(&pb.WorkerSnapshotBody{
+	acceptedSet, acceptedSetDigest := emptySet, emptySetDigest
+	journal := f.readActiveJournal()
+	var replay *pb.AttemptOutcome
+	body := &pb.WorkerSnapshotBody{
 		WorkerPhase: pb.WorkerPhase_WORKER_PHASE_ONLINE,
 		// ADMISSION IS CLOSED UNTIL THE ACK. That is not politeness: it is the barrier
 		// stated on the wire, and an owner reading OPEN before it acked would be reading a
@@ -240,17 +307,55 @@ func (f *fakeControl) Control(stream pb.WorkerControl_ControlServer) error {
 		AdmissionState:             pb.AdmissionState_ADMISSION_STATE_CLOSED,
 		AdmissionGeneration:        1,
 		AvailableAttemptSlots:      0,
-		AcceptedPlacementSetDigest: emptySetDigest,
-	})
+		AcceptedPlacementSetDigest: acceptedSetDigest,
+	}
+	if journal != nil && len(journal.SetBytes) > 0 {
+		acceptedSet = append([]byte(nil), journal.SetBytes...)
+		acceptedSetDigest = canonical.Digest(acceptedSet)
+		body.AcceptedDesiredStateRevision = journal.Revision
+		body.AcceptedPlacementSetDigest = acceptedSetDigest
+		body.ConvergedRevision = journal.Revision
+		body.Placements = []*pb.PlacementStatus{{
+			PlacementId: journal.PlacementID, ExecutorGeneration: 1,
+			Materialization:     pb.MaterializationState_MATERIALIZATION_STATE_STAGED,
+			Serving:             pb.ServingState_SERVING_STATE_DISPATCHABLE,
+			DispatchablePlanIds: append([]string(nil), journal.PlanIDs...),
+			PlacementSpecDigest: acceptedSetDigest,
+		}}
+		if journal.RequestID != "" {
+			if journal.OutcomeID == "" {
+				replay, journal.OutcomeBytes = outcomeFor(journal.RequestID, journal.Attempt,
+					journal.SpecDigest, pb.OutcomeStatus_OUTCOME_STATUS_ABANDONED,
+					"the prior executor was retired after its measured no-progress verdict",
+					pb.CauseCode_CAUSE_CODE_EXECUTOR_INVALIDATED,
+					pb.CauseOrigin_CAUSE_ORIGIN_WORKER, true)
+				journal.OutcomeID = replay.OutcomeId
+				journal.OutcomeDigest = append([]byte(nil), replay.OutcomeDigest...)
+				f.writeActiveJournal(journal)
+			} else {
+				replay = &pb.AttemptOutcome{RequestId: journal.RequestID,
+					AttemptOrdinal: journal.Attempt, InvocationSpecDigest: journal.SpecDigest,
+					OutcomeId: journal.OutcomeID, OutcomeDigest: journal.OutcomeDigest,
+					OutcomeCanonicalBytes: journal.OutcomeBytes, PlacementId: journal.PlacementID}
+			}
+			replay.PlacementId = journal.PlacementID
+			body.HeldAttempts = []*pb.HeldAttempt{{RequestId: journal.RequestID,
+				AttemptOrdinal: journal.Attempt, Kind: pb.AttemptKind_ATTEMPT_KIND_SERVING,
+				State:                pb.AttemptState_ATTEMPT_STATE_OUTCOME_PENDING_ACK,
+				InvocationSpecDigest: journal.SpecDigest, PlacementId: journal.PlacementID,
+				ExecutorGeneration: 1, OutcomeId: journal.OutcomeID,
+				OutcomeDigest: journal.OutcomeDigest}}
+		}
+	}
+	bodyBytes, bodyDigest, err := canonical.Identity(body)
 	if err != nil {
 		f.say("cannot mint the snapshot body: %v", err)
 		return nil
 	}
-	_ = spelledSet
 	snap := &pb.WorkerSnapshot{
 		SnapshotId: snapshotID, SnapshotDigest: bodyDigest,
 		SnapshotCanonicalBytes:             bodyBytes,
-		AcceptedPlacementSetCanonicalBytes: emptySet,
+		AcceptedPlacementSetCanonicalBytes: acceptedSet,
 	}
 	env(func(e, g uint64, b string) {
 		snap.RecordOwnerEpoch, snap.ControlStreamGeneration, snap.WorkerBootId = e, g, b
@@ -302,6 +407,7 @@ func (f *fakeControl) Control(stream pb.WorkerControl_ControlServer) error {
 	var currentSetDigest []byte
 	var currentPlanIDs []string
 	reporting := false
+	recovered := false
 	for {
 		frame, err := stream.Recv()
 		if err != nil {
@@ -319,6 +425,15 @@ func (f *fakeControl) Control(stream pb.WorkerControl_ControlServer) error {
 				continue
 			}
 			f.say("SnapshotAck for %s matches the digest; dispatch open", a.SnapshotId)
+			if replay != nil {
+				env(func(e, g uint64, b string) {
+					replay.RecordOwnerEpoch, replay.ControlStreamGeneration, replay.WorkerBootId = e, g, b
+				})
+				outcome(replay)
+				f.say("replayed journaled ABANDONED outcome for %s#%d",
+					replay.RequestId, replay.AttemptOrdinal)
+				replay = nil
+			}
 			if f.arm == "steal" {
 				f.stealOutcome(outcome)
 				time.Sleep(2 * time.Second)
@@ -357,6 +472,16 @@ func (f *fakeControl) Control(stream pb.WorkerControl_ControlServer) error {
 			currentRevision, currentPlacement = d.Revision, placementID
 			currentSetDigest = append([]byte(nil), setDigest...)
 			currentPlanIDs = append([]string(nil), planIDs...)
+			if f.arm == "activewedged" && placementID != "" {
+				if journal == nil {
+					journal = &fakeActiveJournal{}
+				}
+				journal.Revision = d.Revision
+				journal.SetBytes = append([]byte(nil), d.GetPlacementSet().PlacementSetCanonicalBytes...)
+				journal.PlacementID = placementID
+				journal.PlanIDs = append([]string(nil), planIDs...)
+				f.writeActiveJournal(journal)
+			}
 			if placementID != "" && !reporting &&
 				(f.arm == "slowfill" || f.arm == "wedged" || f.arm == "silent" || f.arm == "retracted") {
 				// The STALL ARMS (cl-025): a worker that is not yet DISPATCHABLE and says
@@ -411,8 +536,24 @@ func (f *fakeControl) Control(stream pb.WorkerControl_ControlServer) error {
 			env(func(e, g uint64, b string) {
 				accepted.RecordOwnerEpoch, accepted.ControlStreamGeneration, accepted.WorkerBootId = e, g, b
 			})
+			if f.arm == "activewedged" && !recovered {
+				if journal == nil {
+					journal = &fakeActiveJournal{}
+				}
+				journal.RequestID, journal.Attempt = offer.RequestId, offer.AttemptOrdinal
+				journal.SpecDigest = append([]byte(nil), offer.InvocationSpecDigest...)
+				journal.PlacementID = offer.PlacementId
+				f.writeActiveJournal(journal) // durable before AttemptAccepted leaves the worker
+			}
 			send(&pb.WorkerFrame{Msg: &pb.WorkerFrame_AttemptAccepted{AttemptAccepted: accepted}})
-			if f.arm == "activewedged" && !reporting {
+			if f.arm == "activewedged" && recovered {
+				t, _ := outcomeFor(offer.RequestId, offer.AttemptOrdinal, offer.InvocationSpecDigest,
+					pb.OutcomeStatus_OUTCOME_STATUS_SUCCEEDED,
+					"served after the prior journaled attempt was recovered and requeued",
+					pb.CauseCode_CAUSE_CODE_UNSPECIFIED, pb.CauseOrigin_CAUSE_ORIGIN_RUNTIME, true)
+				t.PlacementId = offer.PlacementId
+				outcome(t)
+			} else if f.arm == "activewedged" && !reporting {
 				reporting = true
 				go f.activeWedgeReports(stream.Context(), send, env, offer, currentRevision,
 					currentPlacement, currentSetDigest, currentPlanIDs)
@@ -437,8 +578,16 @@ func (f *fakeControl) Control(stream pb.WorkerControl_ControlServer) error {
 				f.remoteOutcome(outcome, offer)
 			}
 		case *pb.RecordOwnerFrame_OutcomeAck:
-			f.say("AttemptOutcomeAck for %s#%d digest=%s", m.OutcomeAck.RequestId,
-				m.OutcomeAck.AttemptOrdinal, hex.EncodeToString(m.OutcomeAck.OutcomeDigest)[:16])
+			ack := m.OutcomeAck
+			f.say("AttemptOutcomeAck for %s#%d digest=%s", ack.RequestId,
+				ack.AttemptOrdinal, hex.EncodeToString(ack.OutcomeDigest)[:16])
+			if f.arm == "activewedged" && journal != nil && ack.RequestId == journal.RequestID &&
+				ack.AttemptOrdinal == journal.Attempt && ack.OutcomeId == journal.OutcomeID &&
+				bytes.Equal(ack.OutcomeDigest, journal.OutcomeDigest) {
+				f.clearActiveJournal()
+				journal, recovered = nil, true
+				f.say("recovered outcome acked; the replacement may accept the requeued ordinal")
+			}
 			if f.arm == "badterminal" {
 				time.Sleep(500 * time.Millisecond)
 				return nil
@@ -491,6 +640,19 @@ func (f *fakeControl) stallReports(ctx context.Context, send func(*pb.WorkerFram
 		fmt.Sscanf(v, "%d", &fillMS)
 	}
 	report := func(activity []*pb.ActivityEvent) {
+		status := &pb.PlacementStatus{
+			PlacementId:           placementID,
+			Materialization:       pb.MaterializationState_MATERIALIZATION_STATE_MATERIALIZING,
+			Serving:               pb.ServingState_SERVING_STATE_ACTIVATING,
+			ExecutorGeneration:    1,
+			MaterializablePlanIds: planIDs,
+			PlacementSpecDigest:   setDigest,
+		}
+		if f.arm == "retracted" {
+			status.Faults = []*pb.Fault{{Kind: pb.FaultKind_FAULT_KIND_BINDING_DEGRADED,
+				Subject: planIDs[0], Reason: "serve_degrade",
+				Detail: "the warm probe degraded; the worker still serves"}}
+		}
 		r := &pb.ObservedWorkerState{
 			AcceptedDesiredStateRevision: revision,
 			ConvergedRevision:            revision - 1,
@@ -501,14 +663,7 @@ func (f *fakeControl) stallReports(ctx context.Context, send func(*pb.WorkerFram
 			AdmissionGeneration:          1,
 			AvailableAttemptSlots:        2,
 			Activity:                     activity,
-			Placements: []*pb.PlacementStatus{{
-				PlacementId:           placementID,
-				Materialization:       pb.MaterializationState_MATERIALIZATION_STATE_MATERIALIZING,
-				Serving:               pb.ServingState_SERVING_STATE_ACTIVATING,
-				ExecutorGeneration:    1,
-				MaterializablePlanIds: planIDs,
-				PlacementSpecDigest:   setDigest,
-			}},
+			Placements:                   []*pb.PlacementStatus{status},
 		}
 		env(func(e, g uint64, b string) {
 			r.RecordOwnerEpoch, r.ControlStreamGeneration, r.WorkerBootId = e, g, b
@@ -585,7 +740,8 @@ func (f *fakeControl) activeWedgeReports(ctx context.Context, send func(*pb.Work
 			AppliedWireMinor: pb.WireMinor, AdmissionState: pb.AdmissionState_ADMISSION_STATE_OPEN,
 			AdmissionGeneration: 1, AvailableAttemptSlots: 1,
 			Activity: []*pb.ActivityEvent{{Seq: 1, Kind: "boot", Step: "attempt started"},
-				{Seq: 2, Kind: "liveness", Step: "attempt:" + offer.RequestId + " is WEDGED by silence (no clock involved)"}},
+				{Seq: 2, Kind: "liveness", Step: fmt.Sprintf("%s#%d is WEDGED by silence (no clock involved)",
+					offer.RequestId, offer.AttemptOrdinal)}},
 			HeldAttempts: []*pb.HeldAttempt{{RequestId: offer.RequestId,
 				AttemptOrdinal: offer.AttemptOrdinal, Kind: pb.AttemptKind_ATTEMPT_KIND_SERVING,
 				State:                pb.AttemptState_ATTEMPT_STATE_RUNNING,

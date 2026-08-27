@@ -311,9 +311,8 @@ var Commands = []Command{
 		Summary: "compose an editable cozy.video/1 source into an exact ordinary workflow",
 		Args:    "<source.cozy-video.yaml>", MinArgs: 1, MaxArgs: 1,
 		Flags: []Flag{
-			{Name: "--h3", Arg: "<endpoint-ref>", Summary: "installed H3 endpoint or the endpoint on --rental"},
-			{Name: "--assembler", Arg: "<endpoint-ref>", Summary: "installed CPU video-assembly endpoint"},
-			{Name: "--rental", Arg: "<rental-id>", Summary: "Tensorhub-selected exact H3 rental (`cozy rent`)"},
+			{Name: "--h3", Arg: "<endpoint-ref>", Summary: "local-only H3 endpoint; mutually exclusive with --rental"},
+			{Name: "--rental", Arg: "<rental-id>", Summary: "remote H3 target; its endpoint is already exact"},
 			{Name: "--out", Arg: "<file>", Summary: "write the path-free composition document"},
 		},
 		Exits: []exit.Code{exit.OK, exit.Usage, exit.Validation, exit.NotFound,
@@ -326,8 +325,7 @@ var Commands = []Command{
 		Summary: "submit a source or retained creative plan through the durable workflow owner",
 		Args:    "<source.cozy-video.yaml | creative-plan-digest>", MinArgs: 1, MaxArgs: 1,
 		Flags: []Flag{
-			{Name: "--h3", Arg: "<endpoint-ref>", Summary: "installed H3 endpoint or the endpoint on --rental"},
-			{Name: "--assembler", Arg: "<endpoint-ref>", Summary: "installed CPU video-assembly endpoint"},
+			{Name: "--h3", Arg: "<endpoint-ref>", Summary: "local-only H3 endpoint; mutually exclusive with --rental"},
 			{Name: "--rental", Arg: "<rental-id>", Summary: "run every H3 shot on this Tensorhub-selected rental; assembly stays local"},
 			{Name: "--idempotency-key", Arg: "<key>", Summary: "required: name this workflow so a lost response can be retried"},
 		},
@@ -418,6 +416,14 @@ var Commands = []Command{
 		Args:    "<rental-id>", MinArgs: 1, MaxArgs: 1,
 		Exits:      []exit.Code{exit.OK, exit.Usage, exit.NotFound, exit.Conflict},
 		Capability: "cmd.rent.show", Status: Implemented, Handler: "rent.show",
+	},
+	{
+		Path: []string{"rent", "probe"}, Group: "rentals",
+		Summary: "claim one ready rental and persist actual GPU readback without invoking a model",
+		Args:    "<rental-id>", MinArgs: 1, MaxArgs: 1,
+		Exits: []exit.Code{exit.OK, exit.Usage, exit.NotFound, exit.Unavailable,
+			exit.Failed, exit.Conflict},
+		Capability: "cmd.rent.probe", NeedsServer: true, Status: Implemented, Handler: "rent.probe",
 	},
 	{
 		Path: []string{"rent", "release"}, Group: "rentals",
