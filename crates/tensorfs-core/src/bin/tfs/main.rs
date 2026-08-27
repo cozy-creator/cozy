@@ -123,16 +123,17 @@
 //!   tfs fetch admit <root> <plan> <object-id>   THE DOOR — stdin in, verified object out
 //!   tfs fetch complete <root> <plan>            every declared object verifiably resident
 //!
-//! Roots, holds and local GC (tfs-006). Flags: --kind <k> --expect-generation <n>
-//! --hub-published --source-url <u> --hold-secs <s> --ready <p> --limit <n> --dry-run
-//! --allow-empty --free <b> --reserve <b>
+//! Roots, holds and local GC (tfs-006, exclusive-and-explicit per tfs-020). Flags:
+//! --kind <k> --expect-generation <n> --source-url <u> --hold-secs <s> --ready <p>
+//! --limit <n> --dry-run --allow-empty --wait
 //!
 //!   tfs root list|register|release|open <root> [name] [snap]
-//!   tfs root note <root> <snap> --hub-published    durability WITHOUT pinning
+//!   tfs root note <root> <snap> --source-url <u>  provenance WITHOUT pinning
 //!   tfs root reconcile <root> <name>=<snap>...   the supervisor's binding set
 //!   tfs hold take|reap|steal <root> [snap|id]    owner-liveness holds
+//!   tfs rm <root> <snap>                         THE explicit tombstone — the only act
+//!                                                that makes bytes collectable
 //!   tfs gc mark|usage|sweep|reap|refs <root>     the census, the numbers, the cycle
-//!   tfs gc pressure <root> --free <b> --reserve <b>
 //!   tfs gc arms <root>                           the roots/GC red arms, planted live
 
 use std::fs;
@@ -283,8 +284,8 @@ fn main() -> ExitCode {
         ["gc", "sweep", r] => roots::cmd_gc(Path::new(r), "sweep", &flags),
         ["gc", "reap", r] => roots::cmd_gc(Path::new(r), "reap", &flags),
         ["gc", "refs", r] => roots::cmd_gc(Path::new(r), "refs", &flags),
-        ["gc", "pressure", r] => roots::cmd_gc(Path::new(r), "pressure", &flags),
         ["gc", "arms", r] => roots::cmd_arms(Path::new(r)),
+        ["rm", r, h] => roots::cmd_rm(Path::new(r), h),
         ["cloud", "closure", r, h, s] => cloud::cmd_closure(Path::new(r), h, s, &flags),
         ["cloud", "artifact-set", d] => cloud::cmd_artifact_set(Path::new(d), &flags),
         ["cloud", "grant", c, i] => cloud::cmd_grant(Path::new(c), i, &flags),
@@ -2317,16 +2318,19 @@ fn meta_cases() -> Vec<Case> {
             SnapshotRow {
                 snapshot: snap.clone(),
                 known_at: 100,
-                hub_published: true,
+                tombstoned: false,
                 source_url: String::new(),
                 last_used: 140,
+                // The ingest receipt this snapshot keeps beside its transitive graph.
+                evidence: vec!["e".repeat(64)],
             },
             SnapshotRow {
                 snapshot: other.clone(),
                 known_at: 101,
-                hub_published: false,
+                tombstoned: true,
                 source_url: "https://example.invalid/m".to_string(),
                 last_used: 141,
+                evidence: Vec::new(),
             },
         ],
         roots: vec![RootRow {
@@ -2334,8 +2338,6 @@ fn meta_cases() -> Vec<Case> {
             snapshot: snap.clone(),
             kind: "binding".to_string(),
             created: 120,
-            // The ingest receipt this root pins beside the snapshot's transitive graph.
-            evidence: vec!["e".repeat(64)],
         }],
         holds: vec![HoldRow {
             id: "read-1-2".to_string(),

@@ -1,8 +1,13 @@
 #!/usr/bin/env bash
-# tfs-006 — roots, holds and local GC, proved on real bytes by real processes.
+# tfs-006 + tfs-020 — roots, holds and local GC, EXCLUSIVE AND EXPLICIT, proved on real
+# bytes by real processes.
 #
 #   scripts/gc-runs.sh              the full cycle on two overlapping REAL SDXL snapshots
 #   scripts/gc-runs.sh arms         the red arms only (fast, synthetic subject)
+#
+# The rule under proof (decisions #613): GC never INFERS liveness — a snapshot's bytes are
+# collectable only via the explicit tombstone (`tfs rm`) — and GC never runs beside a
+# writer: an open ingest root or a held lease refuses the sweep at start.
 #
 # No automated tests (owner rule #160). Every claim below is a live run: real ingests, real
 # concurrent processes, real `kill -9`, and byte counts read off the filesystem.
@@ -32,6 +37,8 @@ ingest_one() { # session component family
   "$T" ingest install "$S" "$sess" | head -1
 }
 
+snap_of() { "$T" root list "$S" | grep "root  ingest.$1" | grep -oE '[0-9a-f]{64}'; }
+
 # ---------------------------------------------------------------- red arms
 
 if [ "$MODE" = arms ]; then
@@ -57,20 +64,31 @@ say "two OVERLAPPING snapshots from real SDXL components (both carry the same VA
 ingest_one a text_encoder sdxl-a
 ingest_one b text_encoder_2 sdxl-b
 "$T" root list "$S"
+A=$(snap_of a); B=$(snap_of b)
 
 say "1. mark — every object is reached, and reached for a NAMED reason"
 "$T" gc mark "$S"
 
 say "2. usage — exclusive is the freed-if-deleted number"
 "$T" gc usage "$S"
-EXCL=$("$T" gc usage "$S" | grep -A3 "sha256:4a27e0ac" | grep exclusive | awk '{print $2}')
+EXCL=$("$T" gc usage "$S" | grep -A3 "sha256:${A:0:8}" | grep exclusive | awk '{print $2}')
 
 say "3. nothing is collectable while both roots stand"
 "$T" gc sweep "$S" --dry-run
 
-N0=$(objects); D0=$(disk)
-say "4. release ONE root and sweep — the numeric proof"
+say "4. TOMBSTONE-ONLY collection: warm is not garbage, rm is"
 "$T" root release "$S" ingest.a
+N0=$(objects); D0=$(disk)
+echo "  --- released but NOT tombstoned: the sweep collects NOTHING (warm survives) ---"
+"$T" gc sweep "$S" | sed -n 1p
+N_WARM=$(objects)
+if [ "$N_WARM" = "$N0" ]; then
+  echo "  PROOF: a plain sweep over a warm unpinned snapshot is a NO-OP ($N_WARM objects)"
+else
+  echo "  DEFECT: the sweep collected $((N0 - N_WARM)) objects nothing tombstoned"
+fi
+echo "  --- the explicit act, then the numeric proof ---"
+"$T" rm "$S" "$A"
 "$T" gc sweep "$S"
 N1=$(objects); D1=$(disk)
 FREED=$((D0 - D1))
@@ -82,7 +100,6 @@ else
 fi
 
 say "5. the SHARED set survived: snapshot B still walks and its bytes still verify"
-B=$("$T" root list "$S" | grep 'root  ingest.b' | grep -oE '[0-9a-f]{64}')
 "$T" snapshot walk "$S" "$B" | sed -n '2,4p'
 "$T" read prove "$S" "$B" --sample 40 | tail -2
 
@@ -95,7 +112,7 @@ echo "  forged a ref for a snapshot that does not exist, and deleted the real on
 echo "  the census is unchanged: GC never read refs/"
 rm -rf "$S/refs"
 
-say "7. a live LEASE blocks collection of the objects it covers"
+say "7. the sweep is EXCLUSIVE: a live lease REFUSES it at start"
 "$T" root release "$S" ingest.b | head -1
 rm -f "$G/ready"
 "$T" read lease "$S" "$B" --hold-secs 30 --ready "$G/ready" > "$G/lease.log" 2>&1 &
@@ -104,22 +121,25 @@ for _ in $(seq 60); do [ -f "$G/ready" ] && break; sleep 0.25; done
 echo "  holder pid $LP, hold $(cat "$G/ready")"
 "$T" gc sweep "$S" > "$G/sweep-held.log" 2>&1
 sed -n 1p "$G/sweep-held.log"
-echo "  0 roots, and the bytes are still here: $(objects) objects"
+echo "  the bytes are untouched: $(objects) objects — GC never runs beside a writer"
 
-say "8. kill -9 the holder — a SIGKILLed lease must not strand a permanent root"
+say "8. kill -9 the holder — a SIGKILLed lease must not strand the store forever"
 kill -9 $LP 2>/dev/null; wait $LP 2>/dev/null
 "$T" gc sweep "$S" > "$G/sweep-stranded.log" 2>&1
 sed -n 1p "$G/sweep-stranded.log"
-echo "  still protected: the hold row outlives the process until liveness is PROVED"
+echo "  still refused: the hold row outlives the process until liveness is PROVED"
 "$T" hold reap "$S"
+"$T" rm "$S" "$B"
 "$T" gc sweep "$S" > "$G/sweep-reaped.log" 2>&1
 sed -n 1p "$G/sweep-reaped.log"
-echo "  objects now $(objects), disk $(disk) B"
+echo "  after reap + explicit rm: objects now $(objects), disk $(disk) B"
 
 say "9. kill -9 MID-SWEEP: claimed, not yet deleted"
 ingest_one c text_encoder sdxl-c > /dev/null 2>&1 || ingest_one c text_encoder sdxl-a
+C=$(snap_of c)
 N_PRE=$(objects); D_PRE=$(disk)
 "$T" root release "$S" ingest.c > /dev/null
+"$T" rm "$S" "$C" > /dev/null
 nice -n 19 "$T" gc sweep "$S" --fault claimed > "$G/fault.log" 2>&1 &
 FP=$!
 for _ in $(seq 80); do grep -q FAULT-READY "$G/fault.log" 2>/dev/null && break; sleep 0.25; done
@@ -134,7 +154,9 @@ echo "  objects now $(objects)"
 
 say "10. two sweeps at once serialize — the authority lock is the whole race"
 ingest_one d text_encoder sdxl-a > /dev/null 2>&1
+D=$(snap_of d)
 "$T" root release "$S" ingest.d > /dev/null
+"$T" rm "$S" "$D" > /dev/null
 ( "$T" gc sweep "$S" > "$G/race1.log" 2>&1 ) &
 ( "$T" gc sweep "$S" > "$G/race2.log" 2>&1 ) &
 wait
@@ -145,28 +167,50 @@ echo "  claims left: $("$T" root list "$S" | grep -c '^  claim')   objects: $(ob
 
 say "11. binding churn moves ROOTS, never bytes"
 ingest_one e text_encoder sdxl-a > /dev/null 2>&1
-E=$("$T" root list "$S" | grep 'root  ingest.e' | grep -oE '[0-9a-f]{64}')
+E=$(snap_of e)
 "$T" root reconcile "$S" "binding-0=$E" "binding-1=$E"
 "$T" root reconcile "$S" "binding-1=$E"
 
-say "12. pressure: the durability invariant, on an UNROOTED snapshot"
-# Every `vae + text_encoder` ingest produces the SAME snapshot id (boundary determinism), so
-# several roots point at it by now. Pressure is about UNPINNED bytes, so drop them all first.
-for r in $("$T" root list "$S" | awk '/^  root /{print $2}'); do
-  "$T" root release "$S" "$r" > /dev/null
-done
-echo "  --- hub-published: the bytes can be got back, so they may be evicted ---"
-"$T" root note "$S" "$E" --hub-published
-"$T" gc pressure "$S" --free 0 --reserve 1000000000000 | grep -E 'EVICT|KEEP|evictable|admission'
-echo "  --- the SAME snapshot with only a source URL: provenance is not durability ---"
-"$T" root note "$S" "$E" --source-url https://example.invalid/m
-"$T" gc pressure "$S" --free 0 --reserve 1000000000000 | grep -E 'EVICT|KEEP|evictable|admission'
-echo "  (snapshot B has never been published or fetched — it is the local-only arm above)"
+say "12. sweep-mid-BORDER: a sweep during a LIVE ingest run refuses at start"
+"$T" ingest bank safetensors.diffusers sdxl-bd vae-border diffusers.identity/1 --registry "$REG" \
+  --source vae="$SDXL/vae/diffusion_pytorch_model.fp16.safetensors" --source-name local/border > /dev/null
+nice -n 19 "$T" ingest run "$S" "vae=plain/1" --registry "$REG" --session border \
+  --source vae="$SDXL/vae/diffusion_pytorch_model.fp16.safetensors" \
+  --config vae="$SDXL/vae/config.json" > "$G/border.log" 2>&1 &
+BP=$!
+for _ in $(seq 200); do [ -f "$S/ingest/border/root.json" ] && break; sleep 0.05; done
+"$T" gc sweep "$S" > "$G/border-sweep.log" 2>&1
+sed -n 1p "$G/border-sweep.log"
+echo "  the border keeps running; the sweep refused rather than racing it"
+wait $BP
+"$T" ingest install "$S" border | head -1
+echo "  the border completed and installed AFTER the refused sweep — no byte was contested"
+
+say "12a. border-mid-SWEEP: opening an ingest root BLOCKS until the sweep is done"
+nice -n 19 "$T" gc sweep "$S" --fault claimed > "$G/sweeplock.log" 2>&1 &
+SPID=$!
+for _ in $(seq 80); do grep -q FAULT-READY "$G/sweeplock.log" 2>/dev/null && break; sleep 0.25; done
+nice -n 19 "$T" ingest run "$S" "vae=plain/1" --registry "$REG" --session blocked \
+  --source vae="$SDXL/vae/diffusion_pytorch_model.fp16.safetensors" \
+  --config vae="$SDXL/vae/config.json" > "$G/blocked.log" 2>&1 &
+BP2=$!
+sleep 3
+if [ -f "$S/ingest/blocked/root.json" ]; then
+  echo "  DEFECT: the border opened its root beside a live sweep"
+else
+  echo "  PROOF: 3s in, the border is BLOCKED at open_root while the sweep holds the store"
+fi
+kill -9 $SPID 2>/dev/null; wait $SPID 2>/dev/null
+wait $BP2
+"$T" ingest install "$S" blocked | head -1
+echo "  the sweep died, the lock released, and the border proceeded — blocked, never raced"
 
 say "12b. kill -9 mid-DELETION: partial removal must recover, never lose a live object"
 ingest_one f text_encoder sdxl-a > /dev/null 2>&1
-F=$("$T" root list "$S" | grep 'root  ingest.f' | grep -oE '[0-9a-f]{64}')
+F=$(snap_of f)
 "$T" root release "$S" ingest.f > /dev/null
+for r in $("$T" root list "$S" | awk '/^  root /{print $2}'); do "$T" root release "$S" "$r" > /dev/null; done
+"$T" rm "$S" "$F" > /dev/null
 rm -f "$G/fault2.log"
 nice -n 19 "$T" gc sweep "$S" --fault deleting > "$G/fault2.log" 2>&1 &
 FP2=$!
@@ -185,9 +229,9 @@ echo "  objects now $(objects)"
 
 say "12c. GC racing a fill: the hold registers BEFORE the first fetch"
 ingest_one g text_encoder sdxl-a > /dev/null 2>&1
-GS=$("$T" root list "$S" | grep 'root  ingest.g' | grep -oE '[0-9a-f]{64}')
+GS=$(snap_of g)
 "$T" root release "$S" ingest.g > /dev/null
-echo "  --- (a) the fill HAS registered: the sweep must collect nothing it covers ---"
+echo "  --- (a) the fill HAS registered: the sweep refuses — it never runs beside a reader ---"
 rm -f "$G/ready2"
 "$T" read lease "$S" "$GS" --hold-secs 8 --ready "$G/ready2" > "$G/racefill.log" 2>&1 &
 RP=$!
@@ -198,11 +242,12 @@ echo "  objects still present: $(objects)"
 wait $RP 2>/dev/null
 "$T" read prove "$S" "$GS" --sample 20 > "$G/proveg.log" 2>&1 && sed -n '$p' "$G/proveg.log"
 
-echo "  --- (b) the fill has NOT registered: the sweep may win, and the fill REFUSES ---"
+echo "  --- (b) tombstoned, and the fill has NOT registered: the sweep may win, the fill REFUSES ---"
 "$T" hold reap "$S" > /dev/null
+"$T" rm "$S" "$GS" > /dev/null
 "$T" read lease "$S" "$GS" > "$G/racefill2.log" 2>&1 &
 RP2=$!
-"$T" gc sweep "$S" > "$G/racesweep2.log" 2>&1
+"$T" gc sweep "$S" --wait > "$G/racesweep2.log" 2>&1
 sed -n 1p "$G/racesweep2.log"
 wait $RP2 2>/dev/null
 echo "  fill result: $(grep -E 'verified:|REFUSED' "$G/racefill2.log" | head -1)"
@@ -210,7 +255,7 @@ echo "  a lost race is a typed refusal, never a partial or wrong read"
 
 say "12d. fuzzed concurrency: sweeps, root swaps and leases at once over LIVE data"
 ingest_one h text_encoder sdxl-a > /dev/null 2>&1
-HS=$("$T" root list "$S" | grep 'root  ingest.h' | grep -oE '[0-9a-f]{64}')
+HS=$(snap_of h)
 for i in $(seq 6); do
   ( "$T" gc sweep "$S" > "$G/fz-sweep-$i.log" 2>&1 ) &
   ( "$T" root register "$S" "churn-$i" "$HS" --kind workspace > /dev/null 2>&1
@@ -218,9 +263,9 @@ for i in $(seq 6); do
   ( "$T" read lease "$S" "$HS" > "$G/fz-lease-$i.log" 2>&1 ) &
 done
 wait
-echo "  sweeps that refused: $(grep -l REFUSED "$G"/fz-sweep-*.log 2>/dev/null | wc -l) of 6"
+echo "  sweeps that refused (STORE_BUSY beside writers): $(grep -l REFUSED "$G"/fz-sweep-*.log 2>/dev/null | wc -l) of 6"
 echo "  leases that refused: $(grep -l REFUSED "$G"/fz-lease-*.log 2>/dev/null | wc -l) of 6"
-echo "  objects collected across all sweeps: $(awk '/^scanned/{s+=$6} END{print s+0}' "$G"/fz-sweep-*.log)"
+echo "  objects collected across all sweeps (nothing tombstoned -> 0): $(awk '/^scanned/{s+=$6} END{print s+0}' "$G"/fz-sweep-*.log)"
 echo "  --- the live root's data must be intact ---"
 "$T" snapshot walk "$S" "$HS" > "$G/fzwalk.log" 2>&1; sed -n '4p' "$G/fzwalk.log"
 "$T" read prove "$S" "$HS" --sample 30 > "$G/fzprove.log" 2>&1; sed -n '$p' "$G/fzprove.log"

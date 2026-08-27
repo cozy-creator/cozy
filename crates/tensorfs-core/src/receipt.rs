@@ -22,7 +22,6 @@ pub const KINDS: &[&str] = &[
     "fill-used-gather",
     "record-invalidated-rehash",
     "lease-dropped-unreleased",
-    "pressure-skipped-protected",
 ];
 
 #[derive(Debug, Clone, PartialEq, Eq)]

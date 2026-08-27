@@ -40,31 +40,22 @@ pub fn cmd_root(root: &Path, verb: &str, args: &[&str], f: &Flags) -> ExitCode {
                 args[1],
                 flag(f, "kind").unwrap_or("workspace"),
                 expected,
-                &[]
             ));
-            if flag_on(f, "hub-published") {
-                ok!(t.note_snapshot(args[1], true, flag(f, "source-url").unwrap_or("")));
-            } else if let Some(u) = flag(f, "source-url") {
-                ok!(t.note_snapshot(args[1], false, u));
+            if let Some(u) = flag(f, "source-url") {
+                ok!(t.note_snapshot(args[1], u));
             }
             let g = ok!(t.commit());
             println!("root {:?} -> sha256:{} at generation {g}", args[0], args[1]);
         }
-        // Durability is a per-snapshot FACT, recorded without pinning anything: rooting a
-        // snapshot in order to mark it published would protect the very bytes the record is
-        // supposed to make evictable.
+        // Provenance is a per-snapshot FACT, recorded without pinning anything. It grants
+        // nothing: no URL ever qualifies bytes for deletion (tfs-020).
         "note" => {
             let mut t = ok!(meta.txn());
-            ok!(t.note_snapshot(
-                args[0],
-                flag_on(f, "hub-published"),
-                flag(f, "source-url").unwrap_or("")
-            ));
+            ok!(t.note_snapshot(args[0], flag(f, "source-url").unwrap_or("")));
             ok!(t.commit());
             println!(
-                "snapshot sha256:{} hub_published={} source_url={:?}",
+                "snapshot sha256:{} source_url={:?}",
                 args[0],
-                flag_on(f, "hub-published"),
                 flag(f, "source-url").unwrap_or("")
             );
         }
@@ -141,8 +132,10 @@ pub fn cmd_root(root: &Path, verb: &str, args: &[&str], f: &Flags) -> ExitCode {
             }
             for sn in &st.snapshots {
                 println!(
-                    "  snap  sha256:{} hub_published={} source_url={:?}",
-                    sn.snapshot, sn.hub_published, sn.source_url
+                    "  snap  sha256:{}{} source_url={:?}",
+                    sn.snapshot,
+                    if sn.tombstoned { " TOMBSTONED" } else { "" },
+                    sn.source_url
                 );
             }
         }
@@ -256,6 +249,7 @@ pub fn cmd_gc(root: &Path, verb: &str, f: &Flags) -> ExitCode {
                 flag_num(f, "limit", 0),
                 flag_on(f, "dry-run"),
                 flag_on(f, "allow-empty"),
+                flag_on(f, "wait"),
                 flag(f, "fault")
             ));
             println!(
@@ -292,34 +286,20 @@ pub fn cmd_gc(root: &Path, verb: &str, f: &Flags) -> ExitCode {
                 d.display()
             );
         }
-        "pressure" => {
-            let st = ok!(meta.read());
-            let c = ok!(gc::mark(&s, &st));
-            let u = gc::usage(&s, &c);
-            let free: u64 = flag_num(f, "free", 0);
-            let floor: u64 = flag_num(f, "reserve", 0);
-            let p = gc::pressure_plan(&st, &u, free, floor);
-            println!(
-                "free {free} B, reserve floor {floor} B -> need {} B",
-                p.need
-            );
-            for e in &p.plan {
-                println!(
-                    "  EVICT sha256:{} {} B (last used {})",
-                    e.snapshot, e.bytes, e.last_used
-                );
-            }
-            for (snap, why) in &p.protected {
-                println!("  KEEP  sha256:{} — {why}", snap);
-            }
-            println!("evictable total {} B", p.freed);
-            match gc::admission_under_pressure(&p) {
-                Ok(()) => println!("new admission: allowed"),
-                Err(e) => println!("new admission: REFUSED {}", e),
-            }
-        }
         _ => return ExitCode::from(2),
     }
+    ExitCode::SUCCESS
+}
+
+/// `tfs rm` — THE explicit tombstone (tfs-020). The one act that makes a snapshot's bytes
+/// collectable; nothing is deleted here, and nothing else ever infers deletability.
+pub fn cmd_rm(root: &Path, hex: &str) -> ExitCode {
+    let (_, meta) = ok!(open(root));
+    let mut t = ok!(meta.txn());
+    ok!(t.tombstone_snapshot(hex));
+    let g = ok!(t.commit());
+    println!("snapshot sha256:{hex} TOMBSTONED at generation {g}");
+    println!("bytes are collected by the next `tfs gc sweep`; nothing was deleted here");
     ExitCode::SUCCESS
 }
 
@@ -353,7 +333,7 @@ pub fn cmd_arms(root: &Path) -> ExitCode {
         Code::ROOT_GENERATION,
         (|| {
             let mut t = meta.txn()?;
-            t.register_root("stale-swap", &"e".repeat(64), "workspace", Some(stale), &[])?;
+            t.register_root("stale-swap", &"e".repeat(64), "workspace", Some(stale))?;
             t.commit()?;
             Ok(())
         })(),
@@ -394,7 +374,7 @@ pub fn cmd_arms(root: &Path) -> ExitCode {
 
     // 5. a rooted snapshot the store cannot walk — the census is incomplete, so nothing goes
     let mut t = ok!(meta.txn());
-    ok!(t.register_root("dangling", &"a".repeat(64), "workspace", None, &[]));
+    ok!(t.register_root("dangling", &"a".repeat(64), "workspace", None));
     ok!(t.commit());
     arm(
         "sweeping with a rooted snapshot that cannot be read",
@@ -403,18 +383,54 @@ pub fn cmd_arms(root: &Path) -> ExitCode {
     );
     let mut t = ok!(meta.txn());
     ok!(t.release_root("dangling"));
+    // Registration made the snapshot KNOWN, and known non-tombstoned is live by default —
+    // the explicit `tfs rm` is what lets later sweeps proceed past the unreadable row.
+    ok!(t.tombstone_snapshot(&"a".repeat(64)));
     ok!(t.commit());
 
-    // 6. capacity: only protected bytes left under pressure
-    let st = ok!(meta.read());
-    let c = ok!(gc::mark(&s, &st));
-    let u = gc::usage(&s, &c);
-    let p = gc::pressure_plan(&st, &u, 0, 1 << 40);
+    // 6. the sweep is EXCLUSIVE: a held lease refuses it at start (tfs-020)
+    let hold = ok!(meta.acquire_hold("read", "", Vec::new()));
     arm(
-        "new admission when only protected bytes remain",
-        Code::CAPACITY_EXHAUSTED,
-        gc::admission_under_pressure(&p),
+        "sweep attempted while a lease is held",
+        Code::STORE_BUSY,
+        gc::sweep(&s, &meta, 0, true, false).map(|_| ()),
     );
+    ok!(hold.release(&meta));
+
+    // 7. the sweep is EXCLUSIVE: an open ingest transaction root refuses it at start
+    let session = "arms-open-root";
+    ok!(tensorfs_core::ingest::transaction::open_root(
+        &s, session, "dev", 3600
+    ));
+    arm(
+        "sweep attempted while an ingest root is open",
+        Code::STORE_BUSY,
+        gc::sweep(&s, &meta, 0, true, false).map(|_| ()),
+    );
+    let _ = std::fs::remove_dir_all(tensorfs_core::ingest::transaction::quarantine_dir(
+        s.root(),
+        session,
+    ));
+
+    // 8. deletion is EXPLICIT: tombstoning a snapshot a root still pins refuses
+    let pinned = "1".repeat(64);
+    let mut t = ok!(meta.txn());
+    ok!(t.register_root("arms-pin", &pinned, "workspace", None));
+    ok!(t.commit());
+    arm(
+        "tombstoning a snapshot a root still pins",
+        Code::SNAPSHOT_PINNED,
+        (|| {
+            let mut t = meta.txn()?;
+            t.tombstone_snapshot(&pinned)?;
+            t.commit()?;
+            Ok(())
+        })(),
+    );
+    let mut t = ok!(meta.txn());
+    ok!(t.release_root("arms-pin"));
+    ok!(t.tombstone_snapshot(&pinned));
+    ok!(t.commit());
 
     println!("\n{fired} fired, {missed} missed");
     if missed > 0 {

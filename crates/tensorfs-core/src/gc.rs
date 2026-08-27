@@ -1,9 +1,23 @@
-//! Roots, leases and local GC (tfs-006) over the metadata authority.
+//! Roots, leases and local GC (tfs-006), made EXCLUSIVE AND EXPLICIT (tfs-020, decisions
+//! #613) over the metadata authority.
 //!
-//! One rule shapes everything here: **over-keeping the index is the only permitted failure
-//! direction.** A sweep that cannot read its liveness census refuses to delete; a row dies
-//! WITH its object and after it; recovery may keep bytes it did not need, never invent a
-//! root and never delete from an incomplete census.
+//! Two processes never hold conflicting authority over one byte, so:
+//!
+//! * **GC never INFERS what is alive.** Every known non-tombstoned snapshot is live by
+//!   default — pinned, warm, unpublished, in-flight alike. A snapshot's bytes become
+//!   collectable ONLY via the explicit tombstone (`tfs rm` / the worker-protocol purge
+//!   path); liveness is never computed from pin structure.
+//! * **GC never runs beside a writer.** The sweep takes store-wide exclusivity at start:
+//!   any open ingest transaction root or any held lease refuses it (`STORE_BUSY`, or wait
+//!   under `--wait`), and because opening a root and registering a hold both pass through
+//!   the metadata lock the sweep holds for its whole cycle, a border run arriving
+//!   mid-sweep blocks the border, never the bytes. No incremental refresh and no
+//!   census-vs-writer race is representable.
+//!
+//! One rule shapes the failure direction: **over-keeping the index is the only permitted
+//! failure direction.** A sweep that cannot read its liveness census refuses to delete; a
+//! row dies WITH its object and after it; recovery may keep bytes it did not need, never
+//! invent a root and never delete from an incomplete census.
 //!
 //! The whole cycle — census, mark, claim, delete — runs inside ONE metadata write
 //! transaction, so the scrub cannot race a seal or a release: a live root can never be
@@ -142,8 +156,8 @@ pub fn reap_removed(store: &Store) -> Result<(usize, u64)> {
 
 // ---------------------------------------------------------------- the census
 
-/// Why one object is live. The reason is the point: usage accounting, the pressure rules and
-/// every refusal message need to name what is holding the bytes, not merely that something is.
+/// Why one object is live. The reason is the point: usage accounting and every refusal
+/// message need to name what is holding the bytes, not merely that something is.
 #[derive(Debug, Clone)]
 pub struct Live {
     pub object: String,
@@ -158,13 +172,12 @@ pub struct Census {
     pub roots: usize,
     pub holds: usize,
     pub ingest_roots: usize,
-    /// snapshot -> its distinct object set, for usage accounting. This covers every KNOWN
-    /// snapshot, pinned or not: pressure eviction targets UNPINNED snapshots, so "how many
-    /// bytes does evicting this free" has to be answerable for a snapshot nothing pins.
-    /// Knowledge is not liveness — a row here says nothing about `live`.
+    /// snapshot -> its distinct object set, for usage accounting. Covers every readable
+    /// snapshot, tombstoned or not: "how many bytes does removing this reclaim" has to be
+    /// answerable before the explicit `tfs rm`.
     pub per_snapshot: Vec<(String, Vec<ObjectRef>)>,
-    /// Known snapshots this store cannot currently read. Not an error: knowledge is not
-    /// liveness, so an unreadable ROW is skipped while an unreadable PIN refuses the census.
+    /// TOMBSTONED snapshots this store can no longer read — collection already underway.
+    /// A LIVE snapshot that does not read refuses the census instead.
     pub unreadable: Vec<String>,
 }
 
@@ -195,12 +208,15 @@ impl Census {
     }
 }
 
-/// The MARK phase. Every root and every hold names a snapshot; each snapshot is walked with
-/// `checkpoint::walk`, which returns objects classified by WHY they are live. The snapshot
-/// manifest object itself is live too — it is what the root points AT.
+/// The MARK phase. EVERY KNOWN NON-TOMBSTONED SNAPSHOT IS LIVE (tfs-020): pinned or not,
+/// published or not, its whole transitive walk is marked. Tombstoned snapshots are walked
+/// only for accounting; their unshared objects are what the sweep collects.
 ///
-/// A rooted snapshot that cannot be loaded or walked fails the WHOLE census: a partial mark
-/// is exactly the state from which deleting is wrong, so it refuses instead.
+/// A live snapshot that cannot be loaded or walked fails the WHOLE census — pinned or
+/// merely known: a partial mark is exactly the state from which deleting is wrong, so it
+/// refuses instead. Only a TOMBSTONED snapshot that no longer reads is skipped (recorded
+/// in `unreadable`): its bytes are collectable, so an unreadable manifest there is the
+/// collection already underway, not a hole in the census.
 pub fn mark(store: &Store, state: &State) -> Result<Census> {
     let mut c = Census {
         roots: state.roots.len(),
@@ -215,7 +231,14 @@ pub fn mark(store: &Store, state: &State) -> Result<Census> {
         .collect();
     for row in &state.snapshots {
         if !subjects.iter().any(|(s, _)| *s == row.snapshot) {
-            subjects.push((row.snapshot.clone(), None));
+            subjects.push((
+                row.snapshot.clone(),
+                if row.tombstoned {
+                    None
+                } else {
+                    Some("known snapshot (live by default, not tombstoned)".to_string())
+                },
+            ));
         }
     }
 
@@ -233,19 +256,20 @@ pub fn mark(store: &Store, state: &State) -> Result<Census> {
         });
         let w = match (walked, &via) {
             (Ok(w), _) => w,
-            // A PIN this store cannot read fails the whole census: a partial mark is exactly
-            // the state from which deleting is wrong.
+            // A LIVE snapshot this store cannot read — a pin, or any known non-tombstoned
+            // row — fails the whole census: a partial mark is exactly the state from which
+            // deleting is wrong.
             (Err(e), Some(via)) => {
                 return refuse(
                     Code::CENSUS_INCOMPLETE,
                     format!(
-                        "{via} pins sha256:{snap_hex}, which this store cannot read as a \
-                         snapshot ({e}) — refusing to delete from an incomplete census"
+                        "{via} keeps sha256:{snap_hex} live, and this store cannot read it \
+                         as a snapshot ({e}) — refusing to delete from an incomplete \
+                         census; `tfs rm` the snapshot if it is truly unwanted"
                     ),
                 )
             }
-            // A merely-KNOWN row that no longer reads is knowledge going stale, not liveness
-            // going wrong. It is recorded and skipped.
+            // A TOMBSTONED row that no longer reads: collection already underway.
             (Err(_), None) => {
                 c.unreadable.push(snap_hex.clone());
                 continue;
@@ -274,26 +298,28 @@ pub fn mark(store: &Store, state: &State) -> Result<Census> {
         }
     }
 
-    // A root's EVIDENCE: the ingest receipt/subject/profile chain that attests how the
-    // checkpoint came to exist. Nothing in the snapshot references them — they bind TO it —
-    // so without this they would be unrooted the moment the quarantine root is reaped.
+    // A snapshot's EVIDENCE: the ingest receipt/subject/profile chain that attests how it
+    // came to exist. Nothing in the snapshot references them — they bind TO it — so they
+    // are marked from the SNAPSHOT row (tfs-020): provenance lives while the snapshot
+    // lives and is collected with it, never merely because a root was released.
     //
-    // Evidence joins the snapshot's accounting set as well as the live set. It is part of
-    // what the root keeps alive, so it is part of what releasing the root reclaims: leaving
-    // it out made `exclusive` understate the reclaim by exactly the evidence bytes, which is
-    // the numeric proof obligation catching a real error rather than a rounding one.
-    for r in &state.roots {
-        for e in &r.evidence {
+    // Evidence joins the snapshot's accounting set as well as the live set: it is part of
+    // what removing the snapshot reclaims, so leaving it out would make `exclusive`
+    // understate the reclaim by exactly the evidence bytes.
+    for row in &state.snapshots {
+        for e in &row.evidence {
             let length = fs::metadata(store.object_path(e))
                 .map(|m| m.len())
                 .unwrap_or(0);
-            c.live.push(Live {
-                object: e.clone(),
-                length,
-                kind: "evidence",
-                via: format!("root {}", r.name),
-            });
-            if let Some((_, objs)) = c.per_snapshot.iter_mut().find(|(s, _)| *s == r.snapshot) {
+            if !row.tombstoned {
+                c.live.push(Live {
+                    object: e.clone(),
+                    length,
+                    kind: "evidence",
+                    via: format!("snapshot sha256:{}", row.snapshot),
+                });
+            }
+            if let Some((_, objs)) = c.per_snapshot.iter_mut().find(|(s, _)| *s == row.snapshot) {
                 if !objs.iter().any(|o| o.sha256 == *e) {
                     objs.push(ObjectRef {
                         sha256: e.clone(),
@@ -389,7 +415,26 @@ pub fn sweep(
     dry_run: bool,
     allow_empty: bool,
 ) -> Result<(Sweep, Census)> {
-    sweep_at(store, meta, limit, dry_run, allow_empty, None)
+    sweep_at(store, meta, limit, dry_run, allow_empty, false, None)
+}
+
+/// Ingest transaction roots that are OPEN — unexpired. An expired root is reapable debris,
+/// pins nothing, and does not block the sweep.
+fn open_ingest_roots(store: &Store) -> Vec<String> {
+    let now = now_secs();
+    let mut out = Vec::new();
+    if let Ok(rd) = fs::read_dir(store.root().join("ingest")) {
+        for e in rd.flatten() {
+            let name = e.file_name().to_string_lossy().to_string();
+            if let Ok(r) = ingest_txn::read_root(store.root(), &name) {
+                if r.expires_at > now {
+                    out.push(name);
+                }
+            }
+        }
+    }
+    out.sort();
+    out
 }
 
 pub fn sweep_at(
@@ -398,6 +443,7 @@ pub fn sweep_at(
     limit: usize,
     dry_run: bool,
     allow_empty: bool,
+    wait: bool,
     at: Option<&str>,
 ) -> Result<(Sweep, Census)> {
     // The sweep set fence, in the direction that can actually be violated: an algorithm
@@ -420,7 +466,33 @@ pub fn sweep_at(
         }
     }
 
-    let mut t = meta.txn()?;
+    // STORE-WIDE EXCLUSIVITY, checked at sweep start under the one lock scope (tfs-020):
+    // an open ingest root or a held lease refuses the sweep (or waits, by flag). Opening a
+    // root and registering a hold both pass through this same lock, and the sweep keeps it
+    // for the whole cycle — so a border run arriving mid-sweep BLOCKS THE BORDER, not the
+    // bytes, and no writer can appear between this check and the deletions.
+    let mut t = loop {
+        let t = meta.txn()?;
+        let holds: Vec<String> = t.state.holds.iter().map(|h| h.id.clone()).collect();
+        let roots = open_ingest_roots(store);
+        if holds.is_empty() && roots.is_empty() {
+            break t;
+        }
+        if !wait {
+            return refuse(
+                Code::STORE_BUSY,
+                format!(
+                    "the sweep is EXCLUSIVE and the store has writers: {} open ingest \
+                     root(s) {roots:?}, {} held lease(s) {holds:?} — GC never runs beside \
+                     a writer; retry after they finish, or pass --wait",
+                    roots.len(),
+                    holds.len()
+                ),
+            );
+        }
+        drop(t);
+        std::thread::sleep(std::time::Duration::from_millis(250));
+    };
     let all = store.objects()?;
 
     if meta.is_empty() && !all.is_empty() && !allow_empty {
@@ -512,6 +584,12 @@ pub fn sweep_at(
     t.state
         .quarantine
         .retain(|q| !done.contains(&q.object) && store.contains(&q.object));
+    // THE TOMBSTONED STATE IS COLLECTED TOO: a tombstoned row whose manifest object is
+    // gone has nothing left to account for and dies here — after its objects, never
+    // before. A deferred removal keeps the row for the next sweep (over-keeping).
+    t.state
+        .snapshots
+        .retain(|row| !row.tombstoned || store.contains(&row.snapshot));
     t.commit()?;
     Ok((s, census))
 }
@@ -578,123 +656,6 @@ pub fn usage(store: &Store, census: &Census) -> Vec<Usage> {
     out
 }
 
-// ---------------------------------------------------------------- pressure
-
-#[derive(Debug, Clone)]
-pub struct Eviction {
-    pub snapshot: String,
-    pub bytes: u64,
-    pub last_used: u64,
-}
-
-#[derive(Debug, Clone, Default)]
-pub struct Pressure {
-    pub need: u64,
-    pub plan: Vec<Eviction>,
-    pub protected: Vec<(String, String)>,
-    pub freed: u64,
-}
-
-/// Pressure-triggered eviction: LRU over UNPINNED snapshots, gated by the durability
-/// invariant.
-///
-/// Free space is an INPUT, not something this reads. TensorFS owns the decision and the
-/// invariant; the filesystem statistic belongs to the caller that owns pager policy
-/// (boundaries.md), and core has neither a syscall crate nor `unsafe` to go get it.
-///
-/// The invariant, at launch: only a snapshot whose row carries the HUB-PUBLISHED boolean may
-/// be evicted. Provenance is not durability — URLs vanish, gates change, mutable refs move —
-/// so a bare source URL never qualifies, and a local-only artifact is PROTECTED: never
-/// pressure-evicted, only explicitly removed.
-pub fn pressure_plan(
-    state: &State,
-    usage: &[Usage],
-    free_bytes: u64,
-    reserve_floor: u64,
-) -> Pressure {
-    let mut p = Pressure::default();
-    if free_bytes >= reserve_floor {
-        return p;
-    }
-    p.need = reserve_floor - free_bytes;
-
-    let rooted: Vec<&str> = state.roots.iter().map(|r| r.snapshot.as_str()).collect();
-    let held: Vec<&str> = state
-        .holds
-        .iter()
-        .filter(|h| !h.snapshot.is_empty())
-        .map(|h| h.snapshot.as_str())
-        .collect();
-
-    let mut candidates: Vec<&crate::meta::SnapshotRow> = Vec::new();
-    for row in &state.snapshots {
-        let s = row.snapshot.as_str();
-        if rooted.contains(&s) {
-            p.protected
-                .push((row.snapshot.clone(), "pinned by a root".into()));
-            continue;
-        }
-        if held.contains(&s) {
-            p.protected
-                .push((row.snapshot.clone(), "under a live hold".into()));
-            continue;
-        }
-        if !row.hub_published {
-            p.protected.push((
-                row.snapshot.clone(),
-                if row.source_url.is_empty() {
-                    "local-only: unpublished work is never pressure-evicted".into()
-                } else {
-                    format!(
-                        "source URL {:?} is PROVENANCE, not durability — a bare URL never \
-                         qualifies a snapshot for eviction",
-                        row.source_url
-                    )
-                },
-            ));
-            continue;
-        }
-        candidates.push(row);
-    }
-    candidates.sort_by_key(|r| r.last_used);
-    for row in candidates {
-        if p.freed >= p.need {
-            break;
-        }
-        let bytes = usage
-            .iter()
-            .find(|u| u.snapshot == row.snapshot)
-            .map(|u| u.exclusive)
-            .unwrap_or(0);
-        p.freed += bytes;
-        p.plan.push(Eviction {
-            snapshot: row.snapshot.clone(),
-            bytes,
-            last_used: row.last_used,
-        });
-    }
-    p
-}
-
-/// When only protected bytes remain under pressure, NEW ADMISSION fails with a typed
-/// capacity error rather than silently evicting something that cannot be re-obtained.
-pub fn admission_under_pressure(p: &Pressure) -> Result<()> {
-    if p.need == 0 || p.freed >= p.need {
-        return Ok(());
-    }
-    refuse(
-        Code::CAPACITY_EXHAUSTED,
-        format!(
-            "{} B short of the reserve floor and only {} B are evictable — {} snapshots are \
-             protected (unpublished, source-URL-only, rooted or held). New admission fails \
-             rather than evicting bytes nobody can get back",
-            p.need,
-            p.freed,
-            p.protected.len()
-        ),
-    )
-}
-
 // ---------------------------------------------------------------- reconciliation
 
 /// The supervisor holds one `roots` row per live binding. Binding churn moves ROOTS, never
@@ -723,7 +684,7 @@ pub fn reconcile_bindings(
     for (name, snapshot) in bindings {
         let current = t.state.root(name).map(|r| r.snapshot.clone());
         if current.as_deref() != Some(snapshot.as_str()) {
-            t.register_root(name, snapshot, kind, None, &[])?;
+            t.register_root(name, snapshot, kind, None)?;
             added.push(name.clone());
         }
     }

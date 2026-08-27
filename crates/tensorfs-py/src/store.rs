@@ -881,13 +881,8 @@ pub fn ingest_open_root<'p>(
     tenant: &str,
     ttl_secs: u64,
 ) -> PyResult<Bound<'p, PyAny>> {
-    let r = tensorfs_core::ingest::transaction::open_root(
-        store.store.root(),
-        session,
-        tenant,
-        ttl_secs,
-    )
-    .or_refuse(py)?;
+    let r = tensorfs_core::ingest::transaction::open_root(&store.store, session, tenant, ttl_secs)
+        .or_refuse(py)?;
     tensorfs_core::ingest::transaction::write_root(store.store.root(), &r).or_refuse(py)?;
     marshal(py, &r.to_value())
 }

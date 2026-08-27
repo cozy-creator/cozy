@@ -779,8 +779,7 @@ pub fn cmd_run(root: &Path, target: &str, f: &Flags) -> ExitCode {
     for (k, v) in f.iter() {
         if matches!(
             k.as_str(),
-            "source" | "config" | "registry" | "spec-variant" | "tenant" | "ttl"
-                | "isolation-tier"
+            "source" | "config" | "registry" | "spec-variant" | "tenant" | "ttl" | "isolation-tier"
         ) {
             argv.push(format!("--{k}"));
             argv.push(v.clone());
@@ -827,7 +826,7 @@ pub fn cmd_worker(root: &Path, target: &str, f: &Flags) -> ExitCode {
     let store = ok!(Store::init(root));
 
     // The root goes down FIRST. From this line on the session is reapable whatever happens.
-    let mut ingest_root = ok!(tx::open_root(store.root(), &session, &tenant, ttl));
+    let mut ingest_root = ok!(tx::open_root(&store, &session, &tenant, ttl));
 
     // Configs are sidecar bytes the header commits BY REFERENCE.
     let mut configs: Vec<(String, ConfigRef)> = Vec::new();
@@ -1173,7 +1172,7 @@ pub fn cmd_reingest(root: &Path, header_hex: &str, target: &str, f: &Flags) -> E
     let session = flag(f, "session").unwrap_or("reingest").to_string();
     let tenant = flag(f, "tenant").unwrap_or("dev").to_string();
     let mut ingest_root = ok!(tx::open_root(
-        store.root(),
+        &store,
         &session,
         &tenant,
         flag_num(f, "ttl", limits::INGEST_ROOT_TTL_SECS)

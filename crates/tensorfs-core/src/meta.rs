@@ -76,33 +76,35 @@ pub fn boot_epoch() -> u64 {
 
 // ---------------------------------------------------------------- the four record kinds
 
-/// A KNOWN immutable manifest — knowledge, not liveness. `hub_published` is the durability
-/// fact pressure eviction reads: provenance is not durability, so a bare `source_url` never
-/// qualifies a snapshot for eviction.
+/// A KNOWN immutable manifest. Under the tfs-020 rule a known row IS liveness unless it is
+/// tombstoned: GC never infers what is alive, so a snapshot's bytes become collectable ONLY
+/// through the explicit tombstone (`tfs rm` / the worker-protocol purge path). `source_url`
+/// is PROVENANCE and nothing more — it authorizes nothing and evicts nothing.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SnapshotRow {
     pub snapshot: String,
     pub known_at: u64,
-    pub hub_published: bool,
+    /// The explicit act. True means the sweep may collect this snapshot's unshared objects
+    /// and then drop the row; false means LIVE, whatever pins do or do not exist.
+    pub tombstoned: bool,
     pub source_url: String,
     pub last_used: u64,
+    /// The objects this snapshot keeps alive BESIDES its transitive graph: the ingest
+    /// receipt/stamp/subject/profile/recipe chain attesting how it came to exist. A
+    /// per-SNAPSHOT fact (tfs-020): it lives while the snapshot lives and is collected
+    /// with it — releasing a root must not collect the provenance of a warm artifact.
+    pub evidence: Vec<String>,
 }
 
-/// A durable named pin: one per live binding, per workspace/pull.
-///
-/// `evidence` is the set of objects this root pins BESIDES its snapshot's transitive graph:
-/// the ingest receipt, subject, profile and converter declaration that attest how the
-/// checkpoint came to exist. They are found live by running the sweep on real ingested
-/// snapshots — every one of them was unrooted, so the first complete mark would have
-/// collected the provenance of the artifact it was protecting. A receipt nothing pins is
-/// garbage by construction.
+/// A durable named pin: one per live binding, per workspace/pull. Provenance evidence
+/// lives on the SNAPSHOT row, not here — a root is a pin, and releasing a pin must not
+/// collect the provenance of an artifact that stays warm (tfs-020).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RootRow {
     pub name: String,
     pub snapshot: String,
     pub kind: String,
     pub created: u64,
-    pub evidence: Vec<String>,
 }
 
 /// Process/request/fill/ingest liveness, including the lease-until-CUDA-event read hold.
@@ -203,52 +205,52 @@ impl Doc for State {
         for r in as_arr("State", "roots", f.req("roots")?)? {
             let mut rf = Fields::new("State.root", r)?;
             let created = rf.req_uint("created")?;
-            let mut evidence = Vec::new();
-            for e in as_arr("State.root", "evidence", rf.req("evidence")?)? {
-                evidence.push(hex64(
-                    "State.root.evidence",
-                    crate::canon::as_str("State.root", "evidence", e)?,
-                )?);
-            }
             let kind = rf.req_str("kind")?.to_string();
             let name = rf.req_str("name")?.to_string();
             let snapshot = hex64("State.root.snapshot", rf.req_str("snapshot")?)?;
             rf.done()?;
             ascii_name("State.root.name", &name, limits::MAX_NAME_BYTES)?;
             ascii_name("State.root.kind", &kind, limits::MAX_NAME_BYTES)?;
-            if evidence.len() > MAX_HOLD_OBJECTS {
-                return refuse(
-                    Code::COUNT_CAP,
-                    format!("root {name:?} pins too much evidence"),
-                );
-            }
             roots.push(RootRow {
                 name,
                 snapshot,
                 kind,
                 created,
-                evidence,
             });
         }
 
         let mut snapshots = Vec::new();
         for s in as_arr("State", "snapshots", f.req("snapshots")?)? {
             let mut sf = Fields::new("State.snapshot", s)?;
-            let hub_published = matches!(sf.req("hub_published")?, Value::Bool(true));
+            let mut evidence = Vec::new();
+            for e in as_arr("State.snapshot", "evidence", sf.req("evidence")?)? {
+                evidence.push(hex64(
+                    "State.snapshot.evidence",
+                    crate::canon::as_str("State.snapshot", "evidence", e)?,
+                )?);
+            }
             let known_at = sf.req_uint("known_at")?;
             let last_used = sf.req_uint("last_used")?;
             let snapshot = hex64("State.snapshot.snapshot", sf.req_str("snapshot")?)?;
             let source_url = sf.req_str("source_url")?.to_string();
+            let tombstoned = matches!(sf.req("tombstoned")?, Value::Bool(true));
             sf.done()?;
             if source_url.len() > limits::MAX_KEY_BYTES {
                 return refuse(Code::SIZE_CAP, "State.snapshot.source_url over cap");
             }
+            if evidence.len() > MAX_HOLD_OBJECTS {
+                return refuse(
+                    Code::COUNT_CAP,
+                    format!("snapshot {snapshot} carries too much evidence"),
+                );
+            }
             snapshots.push(SnapshotRow {
                 snapshot,
                 known_at,
-                hub_published,
+                tombstoned,
                 source_url,
                 last_used,
+                evidence,
             });
         }
         f.done()?;
@@ -324,12 +326,6 @@ impl Doc for State {
                         .map(|r| {
                             Value::obj(vec![
                                 ("created", Value::uint(r.created)),
-                                (
-                                    "evidence",
-                                    Value::arr(
-                                        r.evidence.iter().map(|e| Value::str(e.clone())).collect(),
-                                    ),
-                                ),
                                 ("kind", Value::str(r.kind.clone())),
                                 ("name", Value::str(r.name.clone())),
                                 ("snapshot", Value::str(r.snapshot.clone())),
@@ -345,11 +341,17 @@ impl Doc for State {
                         .iter()
                         .map(|s| {
                             Value::obj(vec![
-                                ("hub_published", Value::Bool(s.hub_published)),
+                                (
+                                    "evidence",
+                                    Value::arr(
+                                        s.evidence.iter().map(|e| Value::str(e.clone())).collect(),
+                                    ),
+                                ),
                                 ("known_at", Value::uint(s.known_at)),
                                 ("last_used", Value::uint(s.last_used)),
                                 ("snapshot", Value::str(s.snapshot.clone())),
                                 ("source_url", Value::str(s.source_url.clone())),
+                                ("tombstoned", Value::Bool(s.tombstoned)),
                             ])
                         })
                         .collect(),
@@ -502,7 +504,6 @@ impl Txn<'_> {
         snapshot: &str,
         kind: &str,
         expected: Option<u64>,
-        evidence: &[String],
     ) -> Result<()> {
         ascii_name("root name", name, limits::MAX_NAME_BYTES)?;
         ascii_name("root kind", kind, limits::MAX_NAME_BYTES)?;
@@ -518,38 +519,109 @@ impl Txn<'_> {
                 );
             }
         }
-        let mut evidence: Vec<String> = evidence.to_vec();
-        for e in &evidence {
-            hex64("root evidence", e)?;
-        }
-        evidence.sort();
-        evidence.dedup();
         let now = now_secs();
         match self.state.roots.iter_mut().find(|r| r.name == name) {
             Some(r) => {
                 r.snapshot = snapshot.to_string();
                 r.kind = kind.to_string();
                 r.created = now;
-                r.evidence = evidence;
             }
             None => self.state.roots.push(RootRow {
                 name: name.to_string(),
                 snapshot: snapshot.to_string(),
                 kind: kind.to_string(),
                 created: now,
-                evidence,
             }),
         }
-        if self.state.snapshot(snapshot).is_none() {
-            self.state.snapshots.push(SnapshotRow {
+        match self
+            .state
+            .snapshots
+            .iter_mut()
+            .find(|s| s.snapshot == snapshot)
+        {
+            // Registering a root over a tombstoned row is the explicit act that
+            // un-tombstones it — an operator re-pinning wins over a pending collection.
+            Some(s) => s.tombstoned = false,
+            None => self.state.snapshots.push(SnapshotRow {
                 snapshot: snapshot.to_string(),
                 known_at: now,
-                hub_published: false,
+                tombstoned: false,
                 source_url: String::new(),
                 last_used: now,
-            });
+                evidence: Vec::new(),
+            }),
         }
         Ok(())
+    }
+
+    /// Attach provenance evidence to a KNOWN snapshot — the ingest receipt chain. Sorted,
+    /// deduped, and additive: two installs of one snapshot union their evidence.
+    pub fn set_evidence(&mut self, snapshot: &str, evidence: &[String]) -> Result<()> {
+        hex64("snapshot", snapshot)?;
+        for e in evidence {
+            hex64("snapshot evidence", e)?;
+        }
+        match self
+            .state
+            .snapshots
+            .iter_mut()
+            .find(|s| s.snapshot == snapshot)
+        {
+            Some(s) => {
+                s.evidence.extend(evidence.iter().cloned());
+                s.evidence.sort();
+                s.evidence.dedup();
+                if s.evidence.len() > MAX_HOLD_OBJECTS {
+                    return refuse(
+                        Code::COUNT_CAP,
+                        format!("snapshot {snapshot} carries too much evidence"),
+                    );
+                }
+                Ok(())
+            }
+            None => refuse(
+                Code::ROOT_ABSENT,
+                format!("sha256:{snapshot} is not a known snapshot — note it first"),
+            ),
+        }
+    }
+
+    /// THE EXPLICIT TOMBSTONE (tfs-020) — the ONLY act that makes a snapshot's bytes
+    /// collectable. Refuses while any root or hold names the snapshot: a pinned artifact
+    /// is released first, so deletion is always two explicit acts away from a live one.
+    pub fn tombstone_snapshot(&mut self, snapshot: &str) -> Result<()> {
+        hex64("snapshot", snapshot)?;
+        if let Some(r) = self.state.roots.iter().find(|r| r.snapshot == snapshot) {
+            return refuse(
+                Code::SNAPSHOT_PINNED,
+                format!(
+                    "sha256:{snapshot} is pinned by root {:?} — release the root before \
+                     tombstoning",
+                    r.name
+                ),
+            );
+        }
+        if let Some(h) = self.state.holds.iter().find(|h| h.snapshot == snapshot) {
+            return refuse(
+                Code::SNAPSHOT_PINNED,
+                format!("sha256:{snapshot} is under live hold {:?}", h.id),
+            );
+        }
+        match self
+            .state
+            .snapshots
+            .iter_mut()
+            .find(|s| s.snapshot == snapshot)
+        {
+            Some(s) => {
+                s.tombstoned = true;
+                Ok(())
+            }
+            None => refuse(
+                Code::ROOT_ABSENT,
+                format!("sha256:{snapshot} is not a known snapshot — nothing to tombstone"),
+            ),
+        }
     }
 
     pub fn release_root(&mut self, name: &str) -> Result<String> {
@@ -562,12 +634,7 @@ impl Txn<'_> {
         }
     }
 
-    pub fn note_snapshot(
-        &mut self,
-        snapshot: &str,
-        hub_published: bool,
-        source_url: &str,
-    ) -> Result<()> {
+    pub fn note_snapshot(&mut self, snapshot: &str, source_url: &str) -> Result<()> {
         hex64("snapshot", snapshot)?;
         let now = now_secs();
         match self
@@ -577,7 +644,6 @@ impl Txn<'_> {
             .find(|s| s.snapshot == snapshot)
         {
             Some(s) => {
-                s.hub_published = hub_published;
                 if !source_url.is_empty() {
                     s.source_url = source_url.to_string();
                 }
@@ -586,9 +652,10 @@ impl Txn<'_> {
             None => self.state.snapshots.push(SnapshotRow {
                 snapshot: snapshot.to_string(),
                 known_at: now,
-                hub_published,
+                tombstoned: false,
                 source_url: source_url.to_string(),
                 last_used: now,
+                evidence: Vec::new(),
             }),
         }
         Ok(())

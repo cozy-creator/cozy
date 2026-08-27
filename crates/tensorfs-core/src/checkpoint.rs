@@ -400,6 +400,27 @@ impl Walk {
         v.dedup_by(|a, b| a.sha256 == b.sha256);
         v
     }
+
+    /// Every reached object PRESENT in the store, or the first absent one as a refusal.
+    /// The walk itself proves containment (the manifest lists what the header reaches);
+    /// this proves residency — `install`'s gate (tfs-020), so a root can never commit
+    /// over missing objects. A partially fetched snapshot legitimately fails this; it is
+    /// an install precondition, not a walk invariant.
+    pub fn require_resident(&self, store: &Store) -> Result<()> {
+        for r in self.distinct() {
+            if !store.contains(&r.sha256) {
+                return refuse(
+                    Code::OBJECT_ABSENT,
+                    format!(
+                        "{} is committed by this snapshot but absent from the store — \
+                         refusing to install a root over missing objects",
+                        r.id()
+                    ),
+                );
+            }
+        }
+        Ok(())
+    }
 }
 
 /// SnapshotManifest → CozyTensorsHeader → contained tensor rules → storage-part object runs.

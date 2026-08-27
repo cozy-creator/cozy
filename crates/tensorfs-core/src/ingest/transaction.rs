@@ -106,7 +106,15 @@ pub fn installed_dir(store_root: &Path) -> PathBuf {
 }
 
 /// Write the root FIRST: from this instant the session is reapable, whatever happens next.
-pub fn open_root(store_root: &Path, session: &str, tenant: &str, ttl: u64) -> Result<IngestRoot> {
+///
+/// Passes through the METADATA LOCK before writing (tfs-020): a sweep holds that lock for
+/// its whole cycle, so a border run opening a root while a sweep holds the store BLOCKS
+/// THE BORDER, not the bytes — and a root that exists when the sweep checks refuses the
+/// sweep instead. One lock scope, no census-vs-writer race representable.
+pub fn open_root(store: &Store, session: &str, tenant: &str, ttl: u64) -> Result<IngestRoot> {
+    let meta = crate::meta::Meta::open(store)?;
+    let _lock = meta.txn()?;
+    let store_root = store.root();
     let dir = quarantine_dir(store_root, session);
     fs::create_dir_all(&dir).map_err(|e| io("mkdir quarantine root", e))?;
     let now = now_secs();
@@ -196,6 +204,8 @@ pub fn install(
 ) -> Result<String> {
     receipt.binds(subject, snap, header, stamp)?;
     let walk = ck::walk(store, snap)?;
+    // Containment is not residency: a root never commits over missing objects (tfs-020).
+    walk.require_resident(store)?;
     let id = snap.checkpoint_id()?;
     let hex_id = id.strip_prefix("sha256:").unwrap_or(&id).to_string();
 
@@ -220,12 +230,13 @@ pub fn install(
         );
     }
     // No source URL yet: the per-source FETCH legs are deferred (tfs-003 divergence 4), so
-    // nothing here has one to record. The column exists because pressure eviction reads it,
-    // and an empty one is the honest state — never a claim of local origin.
-    t.note_snapshot(&hex_id, false, "")?;
-    // The root pins its EVIDENCE too. Everything below binds TO the checkpoint rather than
-    // being referenced BY it, so nothing else can keep it alive: without this the first
-    // complete mark collects the receipt that proves this artifact was verified.
+    // nothing here has one to record. The column is PROVENANCE only, and an empty one is
+    // the honest state — never a claim of local origin.
+    t.note_snapshot(&hex_id, "")?;
+    // The SNAPSHOT carries its EVIDENCE (tfs-020). Everything below binds TO the
+    // checkpoint rather than being referenced BY it, so nothing else can keep it alive:
+    // without this the sweep would collect the receipt that proves this artifact was
+    // verified — and it must survive exactly as long as the snapshot does, root or not.
     let mut evidence = vec![
         receipt.object_ref().sha256.clone(),
         stamp.object_ref().sha256.clone(),
@@ -239,13 +250,8 @@ pub fn install(
     )?) {
         evidence.push(p.converter_recipe.sha256.clone());
     }
-    t.register_root(
-        &format!("ingest.{session}"),
-        &hex_id,
-        "ingest",
-        None,
-        &evidence,
-    )?;
+    t.set_evidence(&hex_id, &evidence)?;
+    t.register_root(&format!("ingest.{session}"), &hex_id, "ingest", None)?;
     t.commit()?;
 
     let dir = installed_dir(store.root());
@@ -421,10 +427,7 @@ pub fn execute(
                             Err(_) => {
                                 let v = store.verify(&s.sha256).map_err(|e| Refusal {
                                     code: e.code,
-                                    detail: format!(
-                                        "{what}: inherit-by-reference: {}",
-                                        e.detail
-                                    ),
+                                    detail: format!("{what}: inherit-by-reference: {}", e.detail),
                                 })?;
                                 if let Verdict::Quarantined { to, why } = v {
                                     return refuse(

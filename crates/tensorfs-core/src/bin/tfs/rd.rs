@@ -811,7 +811,7 @@ pub fn cmd_tear(root: &Path, hex: &str) -> ExitCode {
 
     let mut buf = vec![0u8; seg.length as usize];
     let torn = read::read_into(
-                &lease,
+        &lease,
         &ObjectRange {
             obj: seg.clone(),
             off: 0,
@@ -903,7 +903,7 @@ pub fn cmd_arms(root: &Path, hex: &str) -> ExitCode {
         "buffer smaller than the range",
         Code::BUFFER_SIZE,
         read::read_into(
-                &lease,
+            &lease,
             &ObjectRange {
                 obj: first.clone(),
                 off: 0,
@@ -919,7 +919,7 @@ pub fn cmd_arms(root: &Path, hex: &str) -> ExitCode {
         "range past the object's declared end",
         Code::RANGE_BOUNDS,
         read::read_into(
-                &lease,
+            &lease,
             &ObjectRange {
                 obj: first.clone(),
                 off: first.length,
@@ -934,7 +934,7 @@ pub fn cmd_arms(root: &Path, hex: &str) -> ExitCode {
         "object outside the lease",
         Code::LEASE_NOT_COVERED,
         read::read_into(
-                &lease,
+            &lease,
             &ObjectRange {
                 obj: ObjectRef {
                     sha256: "0".repeat(64),
@@ -952,7 +952,7 @@ pub fn cmd_arms(root: &Path, hex: &str) -> ExitCode {
         "lease digest with a different declared length",
         Code::LEASE_NOT_COVERED,
         read::read_into(
-                &lease,
+            &lease,
             &ObjectRange {
                 obj: ObjectRef {
                     sha256: first.sha256.clone(),

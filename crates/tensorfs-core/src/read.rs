@@ -987,12 +987,7 @@ where
                     let r = {
                         let mut g = park[slot].lock().unwrap();
                         let buf = g.as_mut().expect("slot buffer parked");
-                        execute(
-                            lease,
-                            &batches[b],
-                            &mut buf[..batches[b].bytes as usize],
-                            1,
-                        )
+                        execute(lease, &batches[b], &mut buf[..batches[b].bytes as usize], 1)
                     };
                     ring.finish(b, slot, r.err(), t.elapsed().as_millis());
                 }
