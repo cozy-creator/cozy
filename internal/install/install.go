@@ -213,7 +213,7 @@ func Run(l home.Layout, st *records.Store, req Request) (*Result, *exit.Error) {
 // over the generation's OWN source (cr-003). The runtime imports the app, derives the
 // surface without loading weights, and compares it against the committed
 // endpoint.descriptor.json: `--check` IS the comparison, so nothing is re-derived or
-// re-compared here. Exit 0 hands back the exact-byte `descriptor_digest` the release's runtime
+// re-compared here. Exit 0 hands back the semantic `descriptor_digest` the release's runtime
 // vouched for, and the install records it; 13 and 3 are its typed refusals, passed
 // through with the runtime's own words. No door widens either one — a descriptor that
 // disagrees with the code that built the venv refuses the install.
