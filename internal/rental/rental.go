@@ -17,9 +17,12 @@ import (
 
 	"github.com/cozy-creator/cozy-creator-v2/internal/exit"
 	"github.com/cozy-creator/cozy-creator-v2/internal/home"
+	"github.com/cozy-creator/cozy-creator-v2/internal/hub"
+	"github.com/cozy-creator/cozy-creator-v2/internal/launch"
 	"github.com/cozy-creator/cozy-creator-v2/internal/media"
 	"github.com/cozy-creator/cozy-creator-v2/internal/orchestrator"
 	"github.com/cozy-creator/cozy-creator-v2/internal/records"
+	"github.com/cozy-creator/cozy-creator-v2/internal/remotecontrol"
 	"github.com/cozy-creator/cozy-creator-v2/internal/rentalid"
 	"github.com/cozy-creator/cozy-creator-v2/internal/secret"
 )
@@ -39,6 +42,11 @@ func validID(id string) *exit.Error {
 // a pod or publishing a row whose credential is absent.
 func Attach(l home.Layout, st *records.Store, row records.Rental, cert string, token secret.Value) *exit.Error {
 	if e := validID(row.ID); e != nil {
+		return e
+	}
+	// Validate and project the complete exact snapshot BEFORE files or a dialable
+	// rental row become visible. A bad snapshot never publishes a WorkerTarget.
+	if _, e := controlFacts(row); e != nil {
 		return e
 	}
 	if err := os.MkdirAll(l.Rentals, 0o700); err != nil {
@@ -162,24 +170,52 @@ func tokenAt(path, subject string) (secret.Value, *exit.Error) {
 	return v, nil
 }
 
-// Known is the EXISTENCE question, and only that. The HTTP layer asks it so a submission
-// naming a pod this host does not hold is refused before a request row exists; it must
-// not resolve the credential, because a check that loaded the owner token would expose it
-// a second time to answer a question the row already answers.
-func Known(st *records.Store) func(string) *exit.Error {
-	return func(id string) *exit.Error {
+// Known is the non-secret target question. The HTTP layer asks it so a submission
+// naming an absent or not-yet-published pod is refused before a request row exists, and
+// so its plan resolves from the exact persisted snapshot. It never reads the owner token.
+func Known(st *records.Store) func(string) (*orchestrator.DesiredPlacement, *exit.Error) {
+	return func(id string) (*orchestrator.DesiredPlacement, *exit.Error) {
 		row, e := st.RentalRow(id)
 		if e != nil {
-			return e
+			return nil, e
 		}
 		if row == nil {
-			return unknown(id)
+			return nil, unknown(id)
 		}
 		if row.Address == "" {
-			return noAddress(id, row.State)
+			return nil, noAddress(id, row.State)
 		}
-		return nil
+		if row.CertPath == "" {
+			return nil, exit.Unavailablef("rental %s has exact control but its WorkerTarget is not attached yet", id).
+				WithRemedy("wait for `cozy rent` to validate and atomically publish the target")
+		}
+		facts, e := controlFacts(*row)
+		if e != nil {
+			return nil, e
+		}
+		placement := facts.Placement
+		return &placement, nil
 	}
+}
+
+// Descriptor returns the exact remote descriptor already frozen into one
+// rental. It is the CLI payload surface for --worker; no local install is read.
+func Descriptor(st *records.Store, id string) (*launch.Descriptor, *exit.Error) {
+	row, e := st.RentalRow(id)
+	if e != nil {
+		return nil, e
+	}
+	if row == nil {
+		return nil, unknown(id)
+	}
+	if row.CertPath == "" {
+		return nil, exit.Unavailablef("rental %s has not published its WorkerTarget", id)
+	}
+	facts, e := controlFacts(*row)
+	if e != nil {
+		return nil, e
+	}
+	return facts.Descriptor, nil
 }
 
 func unknown(id string) *exit.Error {
@@ -199,8 +235,8 @@ func noAddress(id, state string) *exit.Error {
 // becomes Claim.proof. It reads the store on EVERY call rather than closing over a
 // snapshot: `cozy rent` is a records-plane act that runs against a service already up, so
 // a resolver that cached would refuse the rental the user just made until a restart.
-func Resolver(l home.Layout, st *records.Store) func(string) (*orchestrator.WorkerConnection, *exit.Error) {
-	return func(id string) (*orchestrator.WorkerConnection, *exit.Error) {
+func Resolver(l home.Layout, st *records.Store) func(string) (*orchestrator.RemoteTarget, *exit.Error) {
+	return func(id string) (*orchestrator.RemoteTarget, *exit.Error) {
 		row, e := st.RentalRow(id)
 		if e != nil {
 			return nil, e
@@ -210,6 +246,14 @@ func Resolver(l home.Layout, st *records.Store) func(string) (*orchestrator.Work
 		}
 		if row.Address == "" {
 			return nil, noAddress(id, row.State)
+		}
+		if row.CertPath == "" {
+			return nil, exit.Unavailablef("rental %s is not attached on this host", id).
+				WithRemedy("resume the original rental operation so control, certificate, and token publish together")
+		}
+		facts, e := controlFacts(*row)
+		if e != nil {
+			return nil, e
 		}
 		token, e := Token(l, id)
 		if e != nil {
@@ -235,8 +279,20 @@ func Resolver(l home.Layout, st *records.Store) func(string) (*orchestrator.Work
 			// token-hash file by whoever provisioned the pod.
 			spec.Media = &media.Spec{Addr: row.MediaAddress, Token: token, CACert: cert}
 		}
-		return spec, nil
+		return &orchestrator.RemoteTarget{Connection: spec, Placement: facts.Placement}, nil
 	}
+}
+
+func controlFacts(row records.Rental) (remotecontrol.Facts, *exit.Error) {
+	if row.ControlSnapshotDigest == "" || row.ControlSnapshotLength <= 0 || len(row.ControlSnapshotBytes) == 0 {
+		return remotecontrol.Facts{}, exit.Named(exit.Conflict, "rental.control_snapshot_missing",
+			"rental %s has no persisted acquisition-attempt control snapshot", row.ID).
+			WithRemedy("release it and rent again; Creator will not resolve a remote pod from the local install")
+	}
+	return remotecontrol.Decode(hub.ExactControlDocument{
+		CanonicalBytes: row.ControlSnapshotBytes, Digest: row.ControlSnapshotDigest,
+		Length: row.ControlSnapshotLength,
+	}, row.EndpointRef)
 }
 
 func write0600(path string, body []byte) *exit.Error {

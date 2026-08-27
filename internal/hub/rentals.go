@@ -30,7 +30,8 @@ import (
 //	                                 renter_token_sha256:[<64 hex>]}
 //	                                 -> 202 {rental_id, state, ...}
 //	GET    /v1/private-rentals/{id}  -> {state, worker_address, cert_pem, media_address,
-//	                                     detail, renter_token_sha256:[...]}
+//	                                     detail, renter_token_sha256:[...],
+//	                                     control_snapshot:{digest,length,canonical_bytes}}
 //	DELETE /v1/private-rentals/{id}  -> 204
 //
 // `media_address` is now ALWAYS the hub's own word. The client used to derive it from the
@@ -65,6 +66,19 @@ type Rental struct {
 	// see that the hash of the token it minted is one the pod was provisioned with —
 	// a comparison neither end can make by saying the token.
 	TokenSHA256 []string
+	// ControlSnapshot is Tensorhub's exact acquisition-attempt control truth. Its
+	// canonical bytes were persisted before provider Create; Creator verifies and
+	// stores those same bytes before publishing a remote target.
+	ControlSnapshot *ExactControlDocument
+}
+
+// ExactControlDocument is one bounded exact-byte document transported by the
+// existing ready rental view. CanonicalBytes is base64 on JSON; Digest and
+// Length fence the decoded bytes.
+type ExactControlDocument struct {
+	CanonicalBytes []byte `json:"canonical_bytes"`
+	Digest         string `json:"digest"`
+	Length         int64  `json:"length"`
 }
 
 // Ready answers whether this rental carries the whole dial triple and an observed
@@ -72,7 +86,7 @@ type Rental struct {
 // prevents a partial ready projection from being mistaken for a usable pod.
 func (r Rental) Ready() bool {
 	return r.State == RentalReady && r.Address != "" && r.MediaAddress != "" &&
-		r.CertPEM != "" && len(r.TokenSHA256) > 0
+		r.CertPEM != "" && len(r.TokenSHA256) > 0 && r.ControlSnapshot != nil
 }
 
 // HoldsHash answers whether the hub's live set carries this hash — the renter's own
@@ -92,13 +106,14 @@ func (r Rental) HoldsHash(hash string) bool {
 
 // wireRental is the answer's own shape.
 type wireRental struct {
-	ID            string   `json:"rental_id"`
-	State         string   `json:"state"`
-	WorkerAddress string   `json:"worker_address"`
-	CertPEM       string   `json:"cert_pem"`
-	Detail        string   `json:"detail"`
-	MediaAddress  string   `json:"media_address"`
-	TokenSHA256   []string `json:"renter_token_sha256"`
+	ID              string                `json:"rental_id"`
+	State           string                `json:"state"`
+	WorkerAddress   string                `json:"worker_address"`
+	CertPEM         string                `json:"cert_pem"`
+	Detail          string                `json:"detail"`
+	MediaAddress    string                `json:"media_address"`
+	TokenSHA256     []string              `json:"renter_token_sha256"`
+	ControlSnapshot *ExactControlDocument `json:"control_snapshot"`
 }
 
 var bareSHA256Pattern = regexp.MustCompile(`^[0-9a-f]{64}$`)
@@ -119,7 +134,7 @@ func (w wireRental) rental(id string) Rental {
 	return Rental{
 		ID: id, State: w.State, Address: w.WorkerAddress, CertPEM: w.CertPEM,
 		Detail: w.Detail, MediaAddress: w.MediaAddress,
-		TokenSHA256: w.TokenSHA256,
+		TokenSHA256: w.TokenSHA256, ControlSnapshot: w.ControlSnapshot,
 	}
 }
 

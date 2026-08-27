@@ -9,6 +9,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/cozy-creator/cozy-creator-v2/internal/exit"
 	"github.com/cozy-creator/cozy-creator-v2/internal/home"
 	"github.com/cozy-creator/cozy-creator-v2/internal/inputasset"
 	"github.com/cozy-creator/cozy-creator-v2/internal/orchestrator"
@@ -113,5 +114,34 @@ func TestSettledAssetReplayUsesDurableIdentityBeforeFiles(t *testing.T) {
 	conflict := call(changedBody)
 	if conflict.Code != http.StatusConflict {
 		t.Fatalf("changed body after asset cleanup = %d, body %s", conflict.Code, conflict.Body.String())
+	}
+}
+
+func TestRemoteSubmissionResolvesOnlyTheRentalsExactPlan(t *testing.T) {
+	const planID = "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+	s := &Server{rentals: func(id string) (*orchestrator.DesiredPlacement, *exit.Error) {
+		if id != "rnt-exact" {
+			t.Fatalf("rental lookup = %q", id)
+		}
+		return &orchestrator.DesiredPlacement{Endpoint: "org/model", Bindings: []*orchestrator.Binding{{
+			Entrypoint: "generate", Outputs: []string{"image"},
+			RuntimePlan: &orchestrator.BindingPlanSubject{SubjectID: planID, Digest: planID,
+				Kind: "plan", Length: 1, CanonicalBytes: []byte("x")},
+		}}}, nil
+	}}
+	resolved, e := s.resolvePlan(Submission{
+		Endpoint: "org/model", Function: "generate", Worker: "rnt-exact", Input: json.RawMessage(`{}`),
+	})
+	if e != nil {
+		t.Fatal(e)
+	}
+	if resolved.PlanID != planID || len(resolved.Outputs) != 1 || resolved.Outputs[0] != "image" {
+		t.Fatalf("remote resolution = %#v", resolved)
+	}
+	_, e = s.resolvePlan(Submission{Endpoint: "org/model", Function: "generate",
+		Worker: "rnt-exact", PlanID: "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+		Input: json.RawMessage(`{}`)})
+	if e == nil || e.ErrName() != "rental.plan_mismatch" {
+		t.Fatalf("caller-supplied remote plan = %v, want rental.plan_mismatch", e)
 	}
 }

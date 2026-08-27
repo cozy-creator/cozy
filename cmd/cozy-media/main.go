@@ -18,12 +18,10 @@
 //	                              POD-LOCAL PATH it landed at, which is what the owner then
 //	                              mints into the DeliveryGrant. The owner never guesses a
 //	                              pod path and this server never learns an owner path.
-//	PUT  /v1/plans/{plan-id}      the owner delivers one binding-plan record into the
+//	PUT  /v1/plans/{plan-id}      the owner relays one exact canonical binding plan into the
 //	                              worker's own `binding-plans` directory. FAIL-CLOSED: the
-//	                              record's identity is re-hashed HERE and must equal the id
-//	                              it was delivered under. That check exists only because
-//	                              #506a made the identity path-free — under the old shape
-//	                              the pod could not have recomputed it at all.
+//	                              whole byte string is re-hashed HERE and must equal the id
+//	                              it was delivered under. Local binding records refuse.
 //	POST /v1/outputs/{slot}       the owner reserves one attempt's output directory AND its
 //	                              exact maximum byte budget, then is told the pod-local path
 //	                              to grant the worker.
@@ -62,7 +60,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/cozy-creator/cozy-creator-v2/internal/plan"
+	"github.com/cozy-creator/cozy-creator-v2/internal/canonical"
 	"github.com/cozy-creator/cozy-creator-v2/internal/secret"
 )
 
@@ -491,13 +489,26 @@ func (s *server) putPlan(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	// The wire spelling is the file spelling: bare hex, which is what the runtime resolves
-	// a wire plan id against on its own disk.
+	// a wire plan id against on its own disk. Remote plans are Tensorhub's canonical
+	// EntrypointBindingPlan bytes: their subject id is their whole-byte digest. The
+	// retired local EntrypointBindingRecord identity is deliberately not accepted here.
 	claimed := "sha256:" + strings.TrimSuffix(names[0], ".json")
-	if _, e := plan.Verify(data, claimed); e != nil {
-		refuse(w, http.StatusBadRequest, "media."+e.ErrName(), e.Message, e.Remedy)
+	doc, err := canonical.ReadObject(data)
+	if err != nil || doc.Str("format") != "cozy.endpoint.EntrypointBindingPlan/1" ||
+		len(doc) != 4 || doc["bindings"] == nil || doc["descriptor"] == nil || doc["entrypoint"] == nil {
+		refuse(w, http.StatusBadRequest, "media.binding_plan_invalid",
+			"the delivered bytes are not one exact canonical EntrypointBindingPlan",
+			"relay Tensorhub's acquisition-attempt plan bytes; never render a local binding record")
 		return
 	}
-	path := filepath.Join(s.opt.plans, plan.FileName(claimed))
+	computed, _ := canonical.Spell(canonical.Digest(data))
+	if computed != claimed {
+		refuse(w, http.StatusBadRequest, "media.binding_plan_identity_mismatch",
+			"the delivered plan hashes to "+computed+", not "+claimed,
+			"use the digest and exact canonical bytes from Tensorhub's persisted control snapshot")
+		return
+	}
+	path := filepath.Join(s.opt.plans, strings.TrimPrefix(claimed, "sha256:")+".json")
 	if err := commit(path, data); err != nil {
 		refuse(w, http.StatusInternalServerError, "media.unwritable",
 			"the binding record could not be staged: "+err.Error(), "check the pod's worker home")

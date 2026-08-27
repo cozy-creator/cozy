@@ -197,6 +197,9 @@ var widen = []string{
 	`ALTER TABLE requests ADD COLUMN assets TEXT NOT NULL DEFAULT '[]'`,
 	`ALTER TABLE attempts ADD COLUMN media_cleaned INTEGER NOT NULL DEFAULT 0`,
 	`ALTER TABLE rentals ADD COLUMN media_address TEXT NOT NULL DEFAULT ''`,
+	`ALTER TABLE rentals ADD COLUMN control_snapshot_digest TEXT NOT NULL DEFAULT ''`,
+	`ALTER TABLE rentals ADD COLUMN control_snapshot_length INTEGER NOT NULL DEFAULT 0`,
+	`ALTER TABLE rentals ADD COLUMN control_snapshot_bytes BLOB NOT NULL DEFAULT x''`,
 }
 
 // normalize hard-cuts pre-launch lifecycle spellings whose durable meaning was refined.

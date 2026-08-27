@@ -253,10 +253,9 @@ func (c *Client) PutInput(blob string, data []byte) (string, *exit.Error) {
 	return doc.Path, nil
 }
 
-// PutPlan delivers one binding-plan record. The pod RE-DERIVES the id from the record's
-// own identity before it keeps the bytes, so this call either lands a plan the two ends
-// agree about or refuses typed — there is no third outcome where the worker holds a record
-// the orchestrator will name in a directive and does not recognize.
+// PutPlan relays one exact canonical EntrypointBindingPlan. The pod hashes the
+// whole byte string and checks the claimed subject id before keeping it; neither
+// side renders a local binding record.
 func (c *Client) PutPlan(planID string, record []byte) (string, *exit.Error) {
 	doc, _, e := c.call(http.MethodPut,
 		"/v1/plans/"+strings.TrimPrefix(planID, "sha256:"), record)

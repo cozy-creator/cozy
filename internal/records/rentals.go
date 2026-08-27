@@ -40,7 +40,10 @@ CREATE TABLE IF NOT EXISTS rentals (
   hub               TEXT NOT NULL,
   rented_at         TEXT NOT NULL,
   released_at       TEXT NOT NULL DEFAULT '',
-  media_address     TEXT NOT NULL DEFAULT ''
+  media_address     TEXT NOT NULL DEFAULT '',
+  control_snapshot_digest TEXT NOT NULL DEFAULT '',
+  control_snapshot_length INTEGER NOT NULL DEFAULT 0,
+  control_snapshot_bytes  BLOB NOT NULL DEFAULT x''
 )`
 
 const migrateRentalOperationState = `CASE state
@@ -250,14 +253,21 @@ type Rental struct {
 	// FACT about the pod like the control address is, so it is a row and not a file; the
 	// credential it takes is the rental's own owner token, which stays 0600 beside it.
 	MediaAddress string
+	// ControlSnapshotBytes is the exact Tensorhub-authored, attempt-bound
+	// snapshot received on the ready view. It remains raw bytes in SQLite so a
+	// restart cannot re-render remote execution meaning from a local install.
+	ControlSnapshotDigest string
+	ControlSnapshotLength int64
+	ControlSnapshotBytes  []byte
 }
 
-const rentalCols = `id,endpoint_ref,accelerator_model,address,cert_path,state,hub,rented_at,released_at,media_address`
+const rentalCols = `id,endpoint_ref,accelerator_model,address,cert_path,state,hub,rented_at,released_at,media_address,control_snapshot_digest,control_snapshot_length,control_snapshot_bytes`
 
 func scanRental(row interface{ Scan(...any) error }) (Rental, error) {
 	var r Rental
 	err := row.Scan(&r.ID, &r.EndpointRef, &r.AcceleratorModel, &r.Address, &r.CertPath,
-		&r.State, &r.Hub, &r.RentedAt, &r.ReleasedAt, &r.MediaAddress)
+		&r.State, &r.Hub, &r.RentedAt, &r.ReleasedAt, &r.MediaAddress,
+		&r.ControlSnapshotDigest, &r.ControlSnapshotLength, &r.ControlSnapshotBytes)
 	return r, err
 }
 
@@ -268,13 +278,23 @@ func (s *Store) RecordRental(r Rental) *exit.Error {
 	if r.RentedAt == "" {
 		r.RentedAt = now()
 	}
+	if r.ControlSnapshotBytes == nil {
+		r.ControlSnapshotBytes = []byte{}
+	}
 	if _, err := s.db.Exec(`INSERT INTO rentals(`+rentalCols+`)
-		VALUES(?,?,?,?,?,?,?,?,?,?)
+		VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)
 		ON CONFLICT(id) DO UPDATE SET address=excluded.address,
 		  cert_path=excluded.cert_path, state=excluded.state, released_at=excluded.released_at,
-		  media_address=excluded.media_address`,
+		  media_address=excluded.media_address,
+		  control_snapshot_digest=CASE WHEN length(excluded.control_snapshot_bytes)>0
+		    THEN excluded.control_snapshot_digest ELSE rentals.control_snapshot_digest END,
+		  control_snapshot_length=CASE WHEN length(excluded.control_snapshot_bytes)>0
+		    THEN excluded.control_snapshot_length ELSE rentals.control_snapshot_length END,
+		  control_snapshot_bytes=CASE WHEN length(excluded.control_snapshot_bytes)>0
+		    THEN excluded.control_snapshot_bytes ELSE rentals.control_snapshot_bytes END`,
 		r.ID, r.EndpointRef, r.AcceleratorModel, r.Address, r.CertPath, r.State, r.Hub,
-		r.RentedAt, r.ReleasedAt, r.MediaAddress); err != nil {
+		r.RentedAt, r.ReleasedAt, r.MediaAddress, r.ControlSnapshotDigest,
+		r.ControlSnapshotLength, r.ControlSnapshotBytes); err != nil {
 		return exit.Internalf("cannot record rental %s: %s", r.ID, err)
 	}
 	return nil

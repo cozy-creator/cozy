@@ -98,10 +98,9 @@ func handleUp(ctx *Context) *exit.Error {
 	// select-or-start is the scheduler's act, and a request whose binding no live worker
 	// advertises makes one rather than queueing for capacity nothing would create.
 	resolver := NewResolver(st, ctx.Cfg)
-	// Two questions, deliberately not one object: the API asks whether a pinned rental
-	// EXISTS (so an unresolvable pin is refused before a request row does), and the
-	// orchestrator resolves the dial triple at the moment it dials. Only the second reads
-	// the owner token, which is why only the orchestrator holds it.
+	// Two questions, deliberately not one object: the API resolves the persisted,
+	// non-secret attempt control (so a bad pin refuses before a request row), and the
+	// orchestrator resolves the dial triple at dial time. Only the second reads the token.
 	rentals := rental.Resolver(l, st)
 
 	c, e := orchestrator.Open(orchestrator.Options{

@@ -47,13 +47,16 @@ type Binding struct {
 	Outputs []string `json:"outputs,omitempty"`
 }
 
-// BindingPlanSubject is the wire identity of one Runtime-owned canonical plan document.
-// It deliberately carries no path or bytes: serve --weightless-endpoint stages those.
+// BindingPlanSubject is the wire identity of one canonical plan document. A
+// local Runtime-owned plan carries no bytes because serve --weightless-endpoint
+// stages them privately. A remote plan carries Tensorhub's exact canonical bytes
+// so Creator can relay rather than reconstruct them.
 type BindingPlanSubject struct {
-	SubjectID string `json:"subject_id"`
-	Kind      string `json:"kind"`
-	Digest    string `json:"digest"`
-	Length    uint64 `json:"length"`
+	SubjectID      string `json:"subject_id"`
+	Kind           string `json:"kind"`
+	Digest         string `json:"digest"`
+	Length         uint64 `json:"length"`
+	CanonicalBytes []byte `json:"canonical_bytes,omitempty"`
 }
 
 // PlanID is the binding's identity. Runtime-owned plans carry it exactly; an older modeled
@@ -80,6 +83,19 @@ func (b *Binding) PlanID() (string, *exit.Error) {
 // and the id — and is what the remote delivery path ships to a pod's media server.
 func (b *Binding) Staged() (string, []byte, *exit.Error) {
 	if b.RuntimePlan != nil {
+		if len(b.RuntimePlan.CanonicalBytes) > 0 {
+			id, e := b.PlanID()
+			if e != nil {
+				return "", nil, e
+			}
+			digest, err := canonical.Raw(b.RuntimePlan.Digest)
+			if err != nil || uint64(len(b.RuntimePlan.CanonicalBytes)) != b.RuntimePlan.Length ||
+				!bytes.Equal(canonical.Digest(b.RuntimePlan.CanonicalBytes), digest) {
+				return "", nil, exit.Named(exit.Conflict, "binding_plan_identity_mismatch",
+					"Tensorhub control bytes for plan %s do not match their digest and length", id)
+			}
+			return id, append([]byte(nil), b.RuntimePlan.CanonicalBytes...), nil
+		}
 		return "", nil, exit.Named(exit.Structural, "binding_plan_bytes_unavailable",
 			"binding plan %s is staged privately by the installed runtime", b.RuntimePlan.SubjectID).
 			WithRemedy("launch it locally with the runtime's explicit weightless-endpoint mode")
@@ -162,6 +178,15 @@ type DesiredPlacement struct {
 	// named by the bytes it serves, and the descriptor is one of them.
 	DescriptorDigest string     `json:"descriptor_digest"`
 	Bindings         []*Binding `json:"bindings"`
+	// Remote control truth comes only from Tensorhub's persisted acquisition
+	// snapshot. Local placements retain their independent install-derived path
+	// and leave these fields empty.
+	EnvironmentSpecDigest             string `json:"environment_spec_digest,omitempty"`
+	InstalledEnvironmentReceiptDigest string `json:"installed_environment_receipt_digest,omitempty"`
+	ConfigDigest                      string `json:"config_digest,omitempty"`
+	ExactPlacementSetDigest           string `json:"exact_placement_set_digest,omitempty"`
+	ExactPlacementSetBytes            []byte `json:"exact_placement_set_bytes,omitempty"`
+	PlacementIDValue                  string `json:"placement_id,omitempty"`
 	// Hidden names the entrypoints this placement deliberately does NOT serve (#572d).
 	// Recorded so an operator reading a placement can tell "no binding was staged" from
 	// "a binding was staged and broke".
@@ -192,6 +217,14 @@ type WorkerConnection struct {
 	// and `connectWorker` refuses typed rather than falling back to owner-local paths the
 	// pod cannot reach. That fallback is exactly the defect #493.3 caught.
 	Media *media.Spec `json:"media,omitempty"`
+}
+
+// RemoteTarget joins one dial triple to the exact attempt-bound placement the
+// provisioned worker already staged. Connection is authority; Placement is
+// immutable execution meaning.
+type RemoteTarget struct {
+	Connection *WorkerConnection
+	Placement  DesiredPlacement
 }
 
 // WorkerLaunchSpec is everything this owner needs to make one worker exist and host one
@@ -294,6 +327,9 @@ func (s WorkerLaunchSpec) InstanceID() string { return s.Placement.InstanceID() 
 // semantic tuple and the collision was real). Routing, NEVER identity: an InvocationSpec
 // digest excludes it, so the same invocation is the same work wherever it routes.
 func (p DesiredPlacement) PlacementID() string {
+	if p.PlacementIDValue != "" {
+		return p.PlacementIDValue
+	}
 	return "plc-" + strings.TrimPrefix(p.InstanceID(), "ins-")
 }
 
@@ -712,10 +748,9 @@ func newWorker(instanceID string, spec WorkerLaunchSpec) *worker {
 // no spawn, no device grant (the pod's card is the pod's), no birth identity — the
 // conversation is the same claim the local path runs, dialed at the rental's address
 // with the pinned cert and the owner token as proof (#445).
-// It also DELIVERS this placement's binding-plan records to the pod. Runtime-owned
-// weightless plans intentionally carry no bytes and therefore refuse this connected path;
-// they are valid only with a locally installed endpoint and its explicit launch mode.
-// This delivery is the half that
+// It also DELIVERS Tensorhub's exact binding-plan bytes to the pod. Local
+// Runtime-owned weightless subjects intentionally carry no bytes and therefore
+// refuse this connected path; no local plan is rendered as a substitute. This delivery is the half that
 // was missing: a desired set names plan ids, and the worker resolves each one against a
 // record on ITS OWN disk (`<worker home>/binding-plans/<id>.json`). The older local modeled
 // path stages those records by writing files; the connected path had no channel at all, so a real pod

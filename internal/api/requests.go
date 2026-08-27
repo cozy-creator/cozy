@@ -291,41 +291,71 @@ func (s *Server) resolvePlan(sub Submission) (orchestrator.Submission, *exit.Err
 	// THE PIN IS RESOLVED BEFORE A ROW EXISTS. A rental this host does not hold cannot be
 	// placed on any later attempt either, so recording the request would hand the client
 	// an id for work that is already known to be unplaceable.
+	var remotePlacement *orchestrator.DesiredPlacement
 	if out.Worker != "" {
 		if s.rentals == nil {
 			return out, exit.Unavailablef("this LocalService attaches no remote workers")
 		}
-		if e := s.rentals(out.Worker); e != nil {
-			return out, e
-		}
-	}
-	if out.PlanID == "" {
-		if s.endpoints == nil {
-			return out, exit.Unavailablef("this LocalService resolves no endpoints")
-		}
-		placement, e := s.endpoints.ResolvePlacement(sub.Endpoint)
+		var e *exit.Error
+		remotePlacement, e = s.rentals(out.Worker)
 		if e != nil {
 			return out, e
 		}
-		for _, b := range placement.Bindings {
-			if b.Entrypoint != sub.Function {
-				continue
-			}
-			id, e := b.PlanID()
-			if e != nil {
-				return out, e
-			}
-			out.PlanID = id
+		if remotePlacement.Endpoint != sub.Endpoint {
+			return out, exit.Named(exit.Conflict, "rental.endpoint_mismatch",
+				"rental %s carries exact control for %s, not %s", out.Worker,
+				remotePlacement.Endpoint, sub.Endpoint)
 		}
-		if out.PlanID == "" {
-			return out, exit.New(exit.NotFound, "%s has no function %q", sub.Endpoint, sub.Function).
-				WithRemedy("GET /v1/local/endpoints lists the functions this host serves")
+	}
+	if remotePlacement != nil {
+		expected, outputs, e := placementPlan(*remotePlacement, sub.Function)
+		if e != nil {
+			return out, e
 		}
+		if out.PlanID != "" && out.PlanID != expected {
+			return out, exit.Named(exit.Conflict, "rental.plan_mismatch",
+				"rental %s binds function %s to %s, not caller-supplied %s",
+				out.Worker, sub.Function, expected, out.PlanID)
+		}
+		out.PlanID = expected
 		if len(out.Outputs) == 0 {
-			out.Outputs = placement.OutputsFor(sub.Function)
+			out.Outputs = outputs
+		}
+	} else if out.PlanID == "" {
+		var placement orchestrator.DesiredPlacement
+		if s.endpoints == nil {
+			return out, exit.Unavailablef("this LocalService resolves no endpoints")
+		}
+		var e *exit.Error
+		placement, e = s.endpoints.ResolvePlacement(sub.Endpoint)
+		if e != nil {
+			return out, e
+		}
+		planID, outputs, e := placementPlan(placement, sub.Function)
+		if e != nil {
+			return out, e
+		}
+		out.PlanID = planID
+		if len(out.Outputs) == 0 {
+			out.Outputs = outputs
 		}
 	}
 	return out, nil
+}
+
+func placementPlan(placement orchestrator.DesiredPlacement, function string) (string, []string, *exit.Error) {
+	for _, binding := range placement.Bindings {
+		if binding.Entrypoint != function {
+			continue
+		}
+		id, e := binding.PlanID()
+		if e != nil {
+			return "", nil, e
+		}
+		return id, append([]string(nil), binding.Outputs...), nil
+	}
+	return "", nil, exit.New(exit.NotFound, "%s has no function %q", placement.Endpoint, function).
+		WithRemedy("GET /v1/local/endpoints lists the functions this target serves")
 }
 
 func (s *Server) stageAssets(assets []records.AssetBinding) ([]records.AssetBinding, *exit.Error) {
