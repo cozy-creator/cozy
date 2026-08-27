@@ -266,7 +266,13 @@ func (f *Facts) binding(ep *Entrypoint, table map[string]Binding) (*orchestrator
 	record["release"] = selected.Ref
 	record["host_bytes"] = int64(hostBudget)
 	record["pinned_bytes"] = int64(pinnedBudget)
-	record["resident_budget_bytes"] = int64(0)
+	// `resident_budget_bytes` is DELIBERATELY ABSENT (cl-027, se-002 defect 4's ruling
+	// finished). Runtime defines zero as "every component stays resident", so the
+	// unconditional `0` this record used to carry was an unsafe all-resident declaration
+	// authored by a host that never saw the card — the same ninth-field mistake as the
+	// deleted vramBudget (#569b). The residence ceiling derives from card + artifact on
+	// the machine that holds both; zero is the EXPLICIT operator override meaning
+	// all-resident, never a default this side spells for it.
 	record["tenancy"] = "local"
 	record["strict_keys"] = false
 	return &orchestrator.Binding{
