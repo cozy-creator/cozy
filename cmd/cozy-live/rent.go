@@ -521,6 +521,9 @@ func sectionRent() {
 	}
 	check("this host holds ZERO rentals — the teardown is proved, not assumed",
 		zeroRentals(root), "")
+	pending, _ = filepath.Glob(filepath.Join(root, "rentals", "pending-*.token"))
+	check("and no rejected or released operation retains a pending token", len(pending) == 0,
+		fmt.Sprintf("%d pending token(s)", len(pending)))
 }
 
 // rentOne rents a pod and returns its id with the whole rendering, so an arm can search

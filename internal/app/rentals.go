@@ -108,10 +108,16 @@ func handleRent(ctx *Context) *exit.Error {
 	if e != nil {
 		return e
 	}
-	if existing != nil && (existing.State == "failed" || existing.State == "released") {
+	if existing != nil && (existing.State == "rejected" || existing.State == "released") {
 		return exit.Named(exit.Conflict, "rental.operation_settled",
 			"rental operation %s is already %s", operationKey, existing.State).
 			WithRemedy("use a fresh --idempotency-key for a new paid rental")
+	}
+	if existing != nil && (existing.State == "failed" || existing.State == "release_requested") {
+		return exit.Named(exit.Conflict, "rental.release_required",
+			"rental operation %s is %s and still names rental %s", operationKey, existing.State, existing.RentalID).
+			WithRemedy("release the existing rental before starting another operation").
+			WithNext("cozy rent release " + existing.RentalID + " --yes")
 	}
 	var token secret.Value
 	if existing != nil && existing.State == "attached" && existing.RentalID != "" {
@@ -161,7 +167,7 @@ func handleRent(ctx *Context) *exit.Error {
 		// committed before the answer was lost.
 		if e.Code == exit.Credential || e.Code == exit.Validation ||
 			e.Code == exit.NotFound || e.Code == exit.Conflict {
-			if advanced := st.AdvanceRentalOperation(operationKey, "", "failed"); advanced != nil {
+			if advanced := st.AdvanceRentalOperation(operationKey, "", "rejected"); advanced != nil {
 				return advanced
 			}
 			rental.ForgetPending(l, operationKey)
@@ -241,8 +247,8 @@ func rentalRequestDigest(hubAuthority string, requestBody []byte) string {
 
 // waitProvisioned polls one rental to a settled state. Every wait here is bounded by something
 // OBSERVED: the hub's own verdict, the hub failing to answer at all (each call carries
-// hub.Timeout), or the caller's --timeout. A rental that is still provisioning is none of
-// those, however long the provider takes.
+// hub.Timeout), or the caller's --timeout. A rental that is still acquiring or
+// materializing is none of those, however long the provider takes.
 func waitProvisioned(ctx *Context, c *hub.Client, id string, deadline time.Time, observe func(hub.Rental) *exit.Error) (hub.Rental, *exit.Error) {
 	said := ""
 	for {
@@ -263,12 +269,12 @@ func waitProvisioned(ctx *Context, c *hub.Client, id string, deadline time.Time,
 				"rental %s failed to provision: %s", id, detailOr(r.Detail)).
 				WithRemedy("the pod is the hub's to reclaim; `cozy rent release %s --yes` closes it out", id).
 				WithNext("cozy rent release " + id + " --yes")
-		case r.State == hub.RentalDead || r.State == hub.RentalReclaiming:
+		case r.State == hub.RentalReleaseRequested || r.State == hub.RentalReleased:
 			// A rental that is LEAVING is not one that is still coming up, and waiting on
 			// it is waiting for a state it will never reach.
 			return hub.Rental{}, exit.New(exit.Failed,
 				"rental %s is %s: %s", id, r.State, detailOr(r.Detail)).
-				WithRemedy("nothing here is owed money for it; rent again if you still need a pod").
+				WithRemedy("the rental is leaving or gone; rent again if you still need a pod").
 				WithNext("cozy rent <endpoint> --accelerator <model> --reason <why>")
 		case r.State == hub.RentalReady:
 			// READY without a whole triple is the hub contradicting itself, and dialling
@@ -384,6 +390,10 @@ func handleRentRelease(ctx *Context) *exit.Error {
 	}
 
 	c := client(ctx)
+	operationKey, e := st.RequestRentalRelease(id)
+	if e != nil {
+		return e
+	}
 	hctx, cancel := hub.Context()
 	e = c.Release(hctx, id, "cozy rent release")
 	cancel()
@@ -398,6 +408,7 @@ func handleRentRelease(ctx *Context) *exit.Error {
 	if e != nil {
 		return e
 	}
+	rental.ForgetPending(l, operationKey)
 	return emit(ctx, render.Record{Kind: "release", Fields: []render.Field{
 		{K: "rental", V: id}, {K: "released", V: forgotten},
 	}, Notes: []string{

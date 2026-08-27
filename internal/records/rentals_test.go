@@ -71,7 +71,7 @@ func TestAdvanceRentalOperationIsMonotone(t *testing.T) {
 
 	// These calls may race in production. Whichever writer lands first, a later stale
 	// observation cannot move the durable operation behind attached.
-	states := []string{"provisioning", "ready", "provisioning", "attached", "ready"}
+	states := []string{"acquiring", "materializing", "ready", "attached", "pending_acquisition"}
 	var wg sync.WaitGroup
 	for _, state := range states {
 		wg.Add(1)
@@ -87,42 +87,65 @@ func TestAdvanceRentalOperationIsMonotone(t *testing.T) {
 	if e != nil || op == nil || op.State != "attached" || op.RentalID != "rnt-one" {
 		t.Fatalf("operation after concurrent observations = %#v, %v", op, e)
 	}
-	if e := st.AdvanceRentalOperation("op", "rnt-one", "failed"); e != nil {
+	if e := st.AdvanceRentalOperation("op", "rnt-one", "materializing"); e != nil {
 		t.Fatal(e)
 	}
 	op, e = st.RentalOperation("op")
 	if e != nil || op.State != "attached" {
 		t.Fatalf("attached operation regressed = %#v, %v", op, e)
 	}
+	if e := st.AdvanceRentalOperation("op", "rnt-one", "failed"); e != nil {
+		t.Fatal(e)
+	}
+	if e := st.AdvanceRentalOperation("op", "rnt-one", "ready"); e != nil {
+		t.Fatal(e)
+	}
+	op, e = st.RentalOperation("op")
+	if e != nil || op.State != "failed" {
+		t.Fatalf("failed operation regressed = %#v, %v", op, e)
+	}
 	if e := st.AdvanceRentalOperation("op", "rnt-other", "ready"); e == nil || e.ErrName() != "rental.operation_conflict" {
 		t.Fatalf("foreign rental id conflict = %v", e)
 	}
+	if e := st.AdvanceRentalOperation("op", "", "rejected"); e == nil || e.ErrName() != "rental.operation_conflict" {
+		t.Fatalf("paid operation rejection conflict = %v", e)
+	}
 	_, _, e = st.BeginRentalOperation(RentalOperation{
-		Key: "op-failed", RequestDigest: "sha256:failed", RequestBody: []byte(`{}`),
+		Key: "op-rejected", RequestDigest: "sha256:rejected", RequestBody: []byte(`{}`),
 		Hub: "https://hub.invalid", Reason: "test",
 	})
 	if e != nil {
 		t.Fatal(e)
 	}
-	if e := st.AdvanceRentalOperation("op-failed", "", "failed"); e != nil {
+	if e := st.AdvanceRentalOperation("op-rejected", "", "rejected"); e != nil {
 		t.Fatal(e)
 	}
-	if e := st.AdvanceRentalOperation("op-failed", "rnt-late", "ready"); e != nil {
+	if e := st.AdvanceRentalOperation("op-rejected", "rnt-late", "ready"); e != nil {
 		t.Fatal(e)
 	}
-	failed, e := st.RentalOperation("op-failed")
-	if e != nil || failed == nil || failed.State != "failed" || failed.RentalID != "" {
-		t.Fatalf("failed operation regressed = %#v, %v", failed, e)
+	rejected, e := st.RentalOperation("op-rejected")
+	if e != nil || rejected == nil || rejected.State != "rejected" || rejected.RentalID != "" {
+		t.Fatalf("rejected operation regressed = %#v, %v", rejected, e)
 	}
 
 	if e := st.RecordRental(Rental{ID: "rnt-one", EndpointRef: "acme/h3/v1/generate",
 		AcceleratorModel: "NVIDIA H200", State: "ready", Hub: "https://hub.invalid"}); e != nil {
 		t.Fatal(e)
 	}
+	if key, e := st.RequestRentalRelease("rnt-one"); e != nil || key != "op" {
+		t.Fatalf("request release = %q, %v", key, e)
+	}
+	if e := st.AdvanceRentalOperation("op", "rnt-one", "materializing"); e != nil {
+		t.Fatal(e)
+	}
+	op, e = st.RentalOperation("op")
+	if e != nil || op.State != "release_requested" {
+		t.Fatalf("release request regressed = %#v, %v", op, e)
+	}
 	if forgotten, e := st.ForgetRental("rnt-one"); e != nil || !forgotten {
 		t.Fatalf("forget = %v, %v", forgotten, e)
 	}
-	if e := st.AdvanceRentalOperation("op", "rnt-one", "provisioning"); e != nil {
+	if e := st.AdvanceRentalOperation("op", "rnt-one", "acquiring"); e != nil {
 		t.Fatal(e)
 	}
 	op, e = st.RentalOperation("op")

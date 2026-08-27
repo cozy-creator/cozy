@@ -308,9 +308,9 @@ func (h *podHub) rent(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	id := "rnt-" + randomHex(8)
-	rec := &podRental{ID: id, State: "provisioning",
+	rec := &podRental{ID: id, State: "pending_acquisition",
 		Hashes: body.TokenSHA256,
-		Detail: "selecting capacity for " + body.AcceleratorModel}
+		Detail: "the rental is durably accepted"}
 	h.rentals[id] = rec
 	h.operations[operationKey] = podRentalOperation{digest: digest, rental: rec}
 	h.creates++
@@ -321,7 +321,7 @@ func (h *podHub) rent(w http.ResponseWriter, r *http.Request) {
 	if drop {
 		panic(http.ErrAbortHandler)
 	}
-	writeRentalAccepted(w, rec.ID, "provisioning")
+	writeRentalAccepted(w, rec.ID, "pending_acquisition")
 }
 
 func writeRentalAccepted(w http.ResponseWriter, id, state string) {
@@ -333,6 +333,9 @@ func writeRentalAccepted(w http.ResponseWriter, id, state string) {
 // provision mints the pod's identity and starts the worker that hosts it. The real hub
 // does this on a machine it rented; the shape of what it hands back is identical.
 func (h *podHub) provision(rec *podRental) {
+	h.mu.Lock()
+	rec.State, rec.Detail = "acquiring", "selecting capacity for the requested accelerator"
+	h.mu.Unlock()
 	if h.fail {
 		h.mu.Lock()
 		rec.State, rec.Detail = "failed", "no eligible capacity for this accelerator"
@@ -412,7 +415,7 @@ func (h *podHub) provision(rec *podRental) {
 	h.mu.Lock()
 	h.procs = append(h.procs, cmd)
 	rec.WorkerPID = cmd.Process.Pid
-	rec.Detail = "the pod is up; waiting for its worker to bind"
+	rec.State, rec.Detail = "materializing", "the pod is up; waiting for its worker to bind"
 	h.mu.Unlock()
 
 	// THE SECOND PROCESS IN THE POD'S CONTAINER (cl-014): the media server, co-resident
