@@ -21,6 +21,8 @@ import (
 	"sync"
 	"syscall"
 	"time"
+
+	"github.com/cozy-creator/cozy-creator-v2/internal/workertls"
 )
 
 // podHub is the SECOND independent implementation of the hub's rental contract (cl-015),
@@ -640,10 +642,7 @@ func writeSelfSigned(certPath, keyPath string) (string, error) {
 		ExtKeyUsage:           []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
 		BasicConstraintsValid: true,
 		IsCA:                  true,
-		// The owner dials an ADDRESS, so the name the certificate must carry is that
-		// address's host. A pod with a hostname carries it here instead.
-		IPAddresses: []net.IP{net.ParseIP("127.0.0.1"), net.ParseIP("::1")},
-		DNSNames:    []string{"localhost"},
+		DNSNames:              []string{workertls.ServerName},
 	}
 	der, err := x509.CreateCertificate(rand.Reader, &template, &template, &key.PublicKey, key)
 	if err != nil {

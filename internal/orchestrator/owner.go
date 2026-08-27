@@ -17,6 +17,7 @@ import (
 	"github.com/cozy-creator/cozy-creator-v2/internal/canonical"
 	"github.com/cozy-creator/cozy-creator-v2/internal/exit"
 	"github.com/cozy-creator/cozy-creator-v2/internal/records"
+	"github.com/cozy-creator/cozy-creator-v2/internal/workertls"
 	pb "github.com/cozy-creator/cozy-creator-v2/protocol/cozy/worker/v1"
 )
 
@@ -170,7 +171,7 @@ func dialWorker(addr string, remote *WorkerConnection) (*grpc.ClientConn, error)
 		if !pool.AppendCertsFromPEM(pem) {
 			return nil, fmt.Errorf("%s holds no usable certificate", remote.CACert)
 		}
-		creds := credentials.NewClientTLSFromCert(pool, "")
+		creds := credentials.NewClientTLSFromCert(pool, workertls.ServerName)
 		return grpc.NewClient(addr, grpc.WithTransportCredentials(creds))
 	}
 	target := addr

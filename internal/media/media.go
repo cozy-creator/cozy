@@ -39,6 +39,7 @@ import (
 
 	"github.com/cozy-creator/cozy-creator-v2/internal/exit"
 	"github.com/cozy-creator/cozy-creator-v2/internal/secret"
+	"github.com/cozy-creator/cozy-creator-v2/internal/workertls"
 )
 
 // Spec is the pod's media plane as a rental pins it: where it answers, the certificate to
@@ -102,7 +103,9 @@ func Dial(spec Spec, budget time.Duration, maxObject int64) (*Client, *exit.Erro
 			return nil, exit.New(exit.Validation,
 				"%s holds no usable certificate to pin", spec.CACert)
 		}
-		transport.TLSClientConfig = &tls.Config{RootCAs: pool, MinVersion: tls.VersionTLS12}
+		transport.TLSClientConfig = &tls.Config{
+			RootCAs: pool, MinVersion: tls.VersionTLS12, ServerName: workertls.ServerName,
+		}
 		c.scheme = "https"
 	}
 	if budget <= 0 {
