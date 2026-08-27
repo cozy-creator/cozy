@@ -43,6 +43,14 @@ CREATE TABLE IF NOT EXISTS rentals (
   media_address     TEXT NOT NULL DEFAULT ''
 )`
 
+const migrateRentalOperationState = `CASE state
+           WHEN 'pending' THEN 'pending_acquisition'
+           WHEN 'provisioning' THEN 'acquiring'
+           WHEN 'reclaiming' THEN 'release_requested'
+           WHEN 'dead' THEN 'released'
+           ELSE state
+         END`
+
 var rentalSchema = []string{rentalOperationsDDL, rentalsDDL, `
 CREATE UNIQUE INDEX IF NOT EXISTS rental_operation_remote
   ON rental_operations(rental_id) WHERE rental_id <> ''`}
@@ -285,7 +293,8 @@ var rentalRebuild = []tableRebuild{{
 		rentalOperationsDDL,
 		`INSERT INTO rental_operations
   (operation_key,request_digest,request_body,hub,reason,rental_id,state,created_at,updated_at)
-  SELECT operation_key,request_digest,x'',hub,reason,rental_id,state,created_at,updated_at
+  SELECT operation_key,request_digest,x'',hub,reason,rental_id,` + migrateRentalOperationState + `,
+         created_at,updated_at
     FROM rental_operations_pre_provider_neutral`,
 		`DROP TABLE rental_operations_pre_provider_neutral`,
 		`CREATE UNIQUE INDEX rental_operation_remote
@@ -300,7 +309,8 @@ var rentalRebuild = []tableRebuild{{
 		rentalOperationsDDL,
 		`INSERT INTO rental_operations
   (operation_key,request_digest,request_body,hub,reason,rental_id,state,created_at,updated_at)
-  SELECT operation_key,request_digest,request_body,hub,reason,rental_id,state,created_at,updated_at
+  SELECT operation_key,request_digest,request_body,hub,reason,rental_id,` + migrateRentalOperationState + `,
+         created_at,updated_at
     FROM rental_operations_pre_operation_field_drop`,
 		`DROP TABLE rental_operations_pre_operation_field_drop`,
 		`CREATE UNIQUE INDEX rental_operation_remote

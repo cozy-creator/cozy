@@ -24,7 +24,7 @@ func TestOpenDropsWriteOnlyRentalOperationFields(t *testing.T) {
 		t.Fatal(err)
 	}
 	if _, err := legacy.Exec(`INSERT INTO rental_operations VALUES
-  ('op-current','sha256:request',?,?,?,?,'reason','rnt-current','ready','then','then')`,
+  ('op-current','sha256:request',?,?,?,?,'reason','rnt-current','provisioning','then','then')`,
 		requestBody, "acme/h3/v1/generate", "NVIDIA H200", "https://hub.invalid"); err != nil {
 		legacy.Close()
 		t.Fatal(err)
@@ -39,7 +39,7 @@ func TestOpenDropsWriteOnlyRentalOperationFields(t *testing.T) {
 	}
 	defer st.Close()
 	op, e := st.RentalOperation("op-current")
-	if e != nil || op == nil || !bytes.Equal(op.RequestBody, requestBody) {
+	if e != nil || op == nil || !bytes.Equal(op.RequestBody, requestBody) || op.State != "acquiring" {
 		t.Fatalf("migrated operation = %#v, %v", op, e)
 	}
 	for _, column := range []string{"endpoint_ref", "accelerator_model"} {
