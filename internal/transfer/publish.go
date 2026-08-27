@@ -428,7 +428,7 @@ const attempts = 3
 
 // send is the one storage-edge write in this binary. It talks to object storage,
 // never to the hub: the URL is presigned and carries no credential of ours.
-func send(ctx context.Context, method, url string, open func() (io.Reader, error), length int64, headers map[string]string) (int, http.Header, []byte, *exit.Error) {
+func send(ctx context.Context, method, url string, open func() (io.ReadCloser, error), length int64, headers map[string]string) (int, http.Header, []byte, *exit.Error) {
 	var last error
 	for try := 0; try < attempts; try++ {
 		body, err := open()
@@ -439,8 +439,10 @@ func send(ctx context.Context, method, url string, open func() (io.Reader, error
 		// that is slow is not an upload that has stopped.
 		m := &mover{}
 		rctx, cancel := m.context(ctx)
-		req, err := http.NewRequestWithContext(rctx, method, url, m.reader(body))
+		counted := m.readCloser(body)
+		req, err := http.NewRequestWithContext(rctx, method, url, counted)
 		if err != nil {
+			counted.Close()
 			cancel()
 			return 0, nil, nil, exit.Internalf("the grant's URL is not usable: %s", err)
 		}
@@ -450,6 +452,7 @@ func send(ctx context.Context, method, url string, open func() (io.Reader, error
 		}
 		resp, err := http.DefaultClient.Do(req)
 		if err != nil {
+			counted.Close()
 			cancel()
 			last = err
 			time.Sleep(time.Duration(try+1) * time.Second)
@@ -457,7 +460,12 @@ func send(ctx context.Context, method, url string, open func() (io.Reader, error
 		}
 		raw, _ := io.ReadAll(io.LimitReader(resp.Body, 8<<10))
 		resp.Body.Close()
+		counted.Close()
 		cancel()
+		if retryableStorageStatus(resp.StatusCode) && try+1 < attempts {
+			time.Sleep(time.Duration(try+1) * time.Second)
+			continue
+		}
 		return resp.StatusCode, resp.Header, raw, nil
 	}
 	return 0, nil, nil, exit.Unavailablef("object storage is unreachable after %d attempts: %s", attempts, last).
@@ -483,8 +491,13 @@ func storageRefusal(status int, subject string, body []byte) *exit.Error {
 // opener hands `send` a FRESH reader per attempt. A retried upload that re-used a
 // consumed reader would put an empty body under a signed digest — the exact failure
 // retries exist to avoid, dressed up as a corrupt object.
-func opener(path string, offset, length int64) func() (io.Reader, error) {
-	return func() (io.Reader, error) {
+type limitedReadCloser struct {
+	io.Reader
+	io.Closer
+}
+
+func opener(path string, offset, length int64) func() (io.ReadCloser, error) {
+	return func() (io.ReadCloser, error) {
 		f, err := os.Open(path)
 		if err != nil {
 			return nil, err
@@ -495,7 +508,18 @@ func opener(path string, offset, length int64) func() (io.Reader, error) {
 				return nil, err
 			}
 		}
-		return io.LimitReader(f, length), nil
+		return &limitedReadCloser{Reader: io.LimitReader(f, length), Closer: f}, nil
+	}
+}
+
+func retryableStorageStatus(status int) bool {
+	switch status {
+	case http.StatusRequestTimeout, http.StatusTooEarly, http.StatusTooManyRequests,
+		http.StatusInternalServerError, http.StatusBadGateway, http.StatusServiceUnavailable,
+		http.StatusGatewayTimeout:
+		return true
+	default:
+		return false
 	}
 }
 
