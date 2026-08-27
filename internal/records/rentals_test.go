@@ -180,6 +180,13 @@ func TestRentalControlSnapshotPersistsVerbatimAndLatePollCannotEraseIt(t *testin
 		got.ControlSnapshotLength != int64(len(raw)) || !bytes.Equal(got.ControlSnapshotBytes, raw) {
 		t.Fatalf("persisted snapshot = %#v, %v", got, e)
 	}
+	conflict := *got
+	conflict.ControlSnapshotDigest = "sha256:changed"
+	conflict.ControlSnapshotBytes = append([]byte(nil), raw...)
+	conflict.ControlSnapshotBytes[0] ^= 0xff
+	if e := st.RecordRental(conflict); e == nil || e.Name != "rental.control_snapshot_conflict" {
+		t.Fatalf("changed snapshot was not refused: %v", e)
+	}
 }
 
 func TestOpenHardcutsLegacyProviderRentalFields(t *testing.T) {
