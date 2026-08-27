@@ -37,11 +37,7 @@ func installEndpoint(root string) string {
 // two spellings of one store is how the cross-machine plan-id arm gets what it needs: the
 // same release bytes and the same snapshot digests, landing at different paths.
 func installEndpointFrom(root, bench string) string {
-	release := flag("release", defaultRelease())
-	if _, err := os.Stat(release); err != nil {
-		must("the SDXL release archive", fmt.Errorf(
-			"%s: %w — build it with scripts/sdxl-release.sh", release, err))
-	}
+	release := deriveFixture(sdxlUnetFixture)
 	// cozyRun, not a bare exec: the install must land on THIS root, and the root reaches
 	// a child only through the product's own env allowlist.
 	code, out := cozyRun(root, "install", "cozy/sdxl-unet", "--from", release,
@@ -75,11 +71,7 @@ func installEndpointFrom(root, bench string) string {
 // byte-plane proof. Its video_transport handler refuses if executed locally; the live arm
 // is explicitly a transport proof and never a stand-in for MiniMax H3 inference.
 func installTransportEndpoint(root string) string {
-	release := flag("transport-release", defaultTransportRelease())
-	if _, err := os.Stat(release); err != nil {
-		must("the transport fixture release", fmt.Errorf(
-			"%s: %w — build it with scripts/weightless-release.sh", release, err))
-	}
+	release := deriveFixture(transportFixture)
 	code, out := cozyRun(root, "install", transportEndpointRef, "--from", release,
 		"--digest", digestOf(release))
 	if code != 0 {
@@ -97,19 +89,6 @@ func childEnv(root string) []string {
 	cfg, e := config.Load()
 	must("config", errOf(e))
 	return cfg.Child("COZY_HOME=" + root)
-}
-
-// defaultRelease is where scripts/sdxl-release.sh puts the archive.
-func defaultRelease() string {
-	home, err := os.UserHomeDir()
-	must("the home directory", err)
-	return filepath.Join(home, ".cache", "cozy", "cl-010", "sdxl-unet-1.0.0.tar.gz")
-}
-
-func defaultTransportRelease() string {
-	home, err := os.UserHomeDir()
-	must("the home directory", err)
-	return filepath.Join(home, ".cache", "cozy", "cl-019-transport", "weightless-1.0.0.tar.gz")
 }
 
 func cozyBinary() string {

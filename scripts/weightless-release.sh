@@ -16,10 +16,10 @@
 set -euo pipefail
 
 RUNTIME_REPO="${RUNTIME_REPO:-$HOME/cozy_v2/cozy-runtime}"
-# Runtime #7 is the exact first release whose `bindings --json` and
-# `serve --weightless-endpoint` share one canonical Plan/1 constructor. Creator consumes
-# those subjects and will not reconstruct the retired flat record.
-RUNTIME_SHA="${RUNTIME_SHA:-5617b4286ad26a75294a273b9a682fbe6d469f56}"
+# No pinned floor: a pinned SHA is a stored artifact in recipe form, and the rev-4 wire
+# bump proved it stales (cl-030). cozy-live derives the SHA and verifies its declared
+# wire schema against the tree before invoking this script; standalone use packages HEAD.
+RUNTIME_SHA="${RUNTIME_SHA:-HEAD}"
 OUT="${OUT:-$HOME/.cache/cozy/cl-013}"
 VERSION="${VERSION:-1.0.0}"
 ENDPOINT="${ENDPOINT:-cozy/weightless}"

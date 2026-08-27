@@ -42,19 +42,9 @@ const (
 	bankedBytes   = 6937675734
 )
 
-func jobRelease() string {
-	home, err := os.UserHomeDir()
-	must("the home directory", err)
-	return flag("job-release", filepath.Join(home, ".cache", "cozy", "cl-004", "census-1.0.0.tar.gz"))
-}
-
 // installJobEndpoint installs the census release exactly as a user would.
 func installJobEndpoint(root string) {
-	release := jobRelease()
-	if _, err := os.Stat(release); err != nil {
-		must("the census release archive", fmt.Errorf(
-			"%s: %w — build it with scripts/job-release.sh", release, err))
-	}
+	release := deriveFixture(censusFixture)
 	code, out := cozyRun(root, "install", jobEndpoint, "--from", release, "--digest", digestOf(release))
 	if code != 0 {
 		fmt.Println(out)

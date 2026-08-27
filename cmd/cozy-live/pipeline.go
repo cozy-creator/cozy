@@ -53,13 +53,6 @@ const (
 	bankedImage = "/tmp/cozy-bar/bw-warm/outputs/pipe-bw-warm-image.bin"
 )
 
-// pipelineRelease is where scripts/sdxl-release.sh --kind pipeline puts its archive.
-func pipelineRelease(slug string) string {
-	home, err := os.UserHomeDir()
-	must("the home directory", err)
-	return filepath.Join(home, ".cache", "cozy", "cl-010", slug+"-1.0.0.tar.gz")
-}
-
 // installPipeline installs one RUNG of the four-component pipeline: the endpoint as a
 // release archive, then the local artifact index row its `[bindings]` table selects.
 //
@@ -69,11 +62,7 @@ func pipelineRelease(slug string) string {
 // HEADERS rather than transcribed — the index holds no tensor facts of its own.
 func installPipeline(root, endpoint, ref, lane string, snapshots map[string]string) string {
 	slug := endpoint[strings.Index(endpoint, "/")+1:]
-	archive := pipelineRelease(slug)
-	if _, err := os.Stat(archive); err != nil {
-		must("the pipeline release archive", fmt.Errorf(
-			"%s: %w — build it with scripts/sdxl-release.sh --kind pipeline", archive, err))
-	}
+	archive := deriveFixture(pipelineFixtureFor(slug))
 	code, out := cozyRun(root, "install", endpoint, "--from", archive, "--digest", digestOf(archive))
 	if code != 0 {
 		fmt.Println(out)
