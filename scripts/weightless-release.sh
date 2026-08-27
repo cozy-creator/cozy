@@ -15,10 +15,10 @@
 set -euo pipefail
 
 RUNTIME_REPO="${RUNTIME_REPO:-$HOME/cozy_v2/cozy-runtime}"
-# ef21fb4 is the floor, not a preference: it retains the current launch/materialization
-# surface and speaks worker-protocol schema rev 3. An older runtime is either missing the
-# launch facts or is refused at Claim by the schema digest; the release and wire move together.
-RUNTIME_SHA="${RUNTIME_SHA:-ef21fb4440a09ea335177f8762269170830ee7e5}"
+# Runtime #7 is the exact first release whose `bindings --json` and
+# `serve --weightless-endpoint` share one canonical Plan/1 constructor. Creator consumes
+# those subjects and will not reconstruct the retired flat record.
+RUNTIME_SHA="${RUNTIME_SHA:-12013e93c19e19d6d43e022801aea2b3f19e46e9}"
 OUT="${OUT:-$HOME/.cache/cozy/cl-013}"
 VERSION="${VERSION:-1.0.0}"
 ENDPOINT="${ENDPOINT:-cozy/weightless}"
