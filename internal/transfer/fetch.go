@@ -360,19 +360,22 @@ func (f *Fetch) install(name, plan string, out *Fetched) *exit.Error {
 // asking again is asking the same question — and the file is truncated on each
 // attempt so a half-received body never becomes the input to the next one.
 func download(ctx context.Context, url, dst string, length int64) (int64, *exit.Error) {
-	var last error
-	for try := 0; try < attempts; try++ {
-		n, retryable, e := fetchOnce(ctx, url, dst, length)
-		if e != nil && !retryable {
-			return 0, e
+	var n int64
+	exhausted, err := retryStorage(func(int) (bool, error) {
+		got, retryable, e := fetchOnce(ctx, url, dst, length)
+		if e != nil {
+			return retryable, e
 		}
-		if e == nil {
-			return n, nil
-		}
-		last = e
-		time.Sleep(time.Duration(try+1) * time.Second)
+		n = got
+		return false, nil
+	})
+	if err == nil {
+		return n, nil
 	}
-	return 0, exit.Unavailablef("object storage is unreachable after %d attempts: %s", attempts, last).
+	if !exhausted {
+		return 0, err.(*exit.Error)
+	}
+	return 0, exit.Unavailablef("object storage is unreachable after %d attempts: %s", attempts, err).
 		WithRemedy("re-run to resume: objects already verified in the store are skipped")
 }
 
@@ -448,5 +451,3 @@ func Timing(ms map[string]int64) string {
 	}
 	return strings.Join(parts, " · ")
 }
-
-func sortStrings(s []string) { sort.Strings(s) }

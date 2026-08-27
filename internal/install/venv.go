@@ -13,6 +13,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"runtime"
+	"sort"
 	"strconv"
 	"strings"
 
@@ -139,7 +140,7 @@ func SnapshotDigest(dir string) (string, int, int64, *exit.Error) {
 		return "", 0, 0, exit.New(exit.NotFound, "cannot read the source tree %s: %s", dir, err).
 			WithRemedy("--dir names a readable endpoint project directory")
 	}
-	sortStrings(paths)
+	sort.Strings(paths)
 	for _, rel := range paths {
 		d, err := fileDigest(filepath.Join(dir, rel))
 		if err != nil {
@@ -161,14 +162,6 @@ func skipDir(name string) bool {
 		return true
 	}
 	return false
-}
-
-func sortStrings(s []string) {
-	for i := 1; i < len(s); i++ {
-		for j := i; j > 0 && s[j] < s[j-1]; j-- {
-			s[j], s[j-1] = s[j-1], s[j]
-		}
-	}
 }
 
 func fileDigest(p string) (string, error) {
@@ -312,7 +305,7 @@ func closure(venvDir string) (int, string) {
 	for _, p := range pkgs {
 		lines = append(lines, p.Name+"=="+p.Version)
 	}
-	sortStrings(lines)
+	sort.Strings(lines)
 	return len(lines), strings.Join(lines, "\n")
 }
 

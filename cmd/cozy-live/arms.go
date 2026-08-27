@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/cozy-creator/cozy-creator-v2/internal/canonical"
+	"github.com/cozy-creator/cozy-creator-v2/internal/config"
 	"github.com/cozy-creator/cozy-creator-v2/internal/exit"
 	"github.com/cozy-creator/cozy-creator-v2/internal/orchestrator"
 	"github.com/cozy-creator/cozy-creator-v2/internal/service"
@@ -70,13 +71,13 @@ func sectionArms() {
 	defer lv.close()
 
 	head("the service claim: one LocalService per local root")
-	first, e1 := service.Hold(lv.l, "127.0.0.1:2699", "sock")
+	first, e1 := service.Hold(lv.l, fmt.Sprintf("127.0.0.1:%d", config.DefaultPort), "sock")
 	check("the first claim on this root succeeds", e1 == nil, briefly(e1))
-	_, e2 := service.Hold(lv.l, "127.0.0.1:2699", "sock")
+	_, e2 := service.Hold(lv.l, fmt.Sprintf("127.0.0.1:%d", config.DefaultPort), "sock")
 	check("a SECOND LocalService on the same root refuses", e2 != nil &&
 		e2.Code == exit.Conflict, briefly(e2))
 	first.Release()
-	third, e3 := service.Hold(lv.l, "127.0.0.1:2699", "sock")
+	third, e3 := service.Hold(lv.l, fmt.Sprintf("127.0.0.1:%d", config.DefaultPort), "sock")
 	check("releasing the claim frees the root again", e3 == nil, briefly(e3))
 	third.Release()
 

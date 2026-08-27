@@ -25,9 +25,6 @@ import (
 	"github.com/cozy-creator/cozy-creator-v2/internal/home"
 )
 
-// DefaultPort is the loopback bind cozy up uses (cozy-creator.md: 2699, loopback only).
-const DefaultPort = 2699
-
 type State struct {
 	Addr    string // the local client API address the live owner published
 	Socket  string // the worker-protocol unix socket the live owner published

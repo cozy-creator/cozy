@@ -292,16 +292,6 @@ func (p DesiredPlacement) RuntimeStagesBindings() bool {
 // IsJob answers the worker's mode, from the one placement it hosts.
 func (s WorkerLaunchSpec) IsJob() bool { return s.Placement.IsJob() }
 
-// OutputsFor names one entrypoint's declared result field paths.
-func (p DesiredPlacement) OutputsFor(entrypoint string) []string {
-	for _, b := range p.Bindings {
-		if b.Entrypoint == entrypoint {
-			return b.Outputs
-		}
-	}
-	return nil
-}
-
 // InstanceID is the endpoint's local worker SLOT identity, and it is deliberately STABLE
 // across supervisor restarts: `worker_instance_id` names one provisioned instance
 // lifetime, and outcome replay across a restart is authorized by that identity (02 §2). A
@@ -583,7 +573,7 @@ func (c *Orchestrator) spawnWorker(spec WorkerLaunchSpec) (string, *exit.Error) 
 		planIDs = append(planIDs, id)
 		subjects = append(subjects, subject)
 	}
-	sortStrings(planIDs) // the wire field is sorted lexicographic ascending
+	sort.Strings(planIDs) // the wire field is sorted lexicographic ascending
 	sortSubjects(subjects)
 	if spec.IsJob() {
 		if e := stageJobPlans(workerHome, spec.Placement.Jobs); e != nil {
@@ -805,7 +795,7 @@ func (c *Orchestrator) connectWorker(spec WorkerLaunchSpec) (string, *exit.Error
 		planIDs = append(planIDs, id)
 		subjects = append(subjects, subjectOf(id, data))
 	}
-	sortStrings(planIDs)
+	sort.Strings(planIDs)
 	sortSubjects(subjects)
 	// AttachWorker, not SpawnWorker: the device-envelope admission arbitrates THIS host's
 	// cards, and the pod's card is the pod's. There is no grant to journal and none to
@@ -1126,7 +1116,7 @@ func keysOf(m map[string]bool) []string {
 			out = append(out, k)
 		}
 	}
-	sortStrings(out)
+	sort.Strings(out)
 	return out
 }
 
@@ -1278,12 +1268,4 @@ func (c *Orchestrator) Reconcile() (killed, forgotten int, e *exit.Error) {
 		c.Requeue(req.ID, "restart-after-terminal-ack")
 	}
 	return killed, forgotten, nil
-}
-
-func sortStrings(s []string) {
-	for i := 1; i < len(s); i++ {
-		for j := i; j > 0 && s[j] < s[j-1]; j-- {
-			s[j], s[j-1] = s[j-1], s[j]
-		}
-	}
 }

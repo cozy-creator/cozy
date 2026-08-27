@@ -33,6 +33,11 @@ var Inherited = []string{"PATH", "HOME", "LANG", "LC_ALL", "TMPDIR", "SSL_CERT_F
 // status` always prints the URL AND where it came from, so the default is never silent.
 const DefaultHubURL = "http://127.0.0.1:8080"
 
+// DefaultPort is the loopback bind `cozy up` uses (cozy-creator.md: 2699, loopback
+// only). It lives here — with the config authority that applies it — after cl-028
+// found its previous spelling was a constant nobody read beside three literal 2699s.
+const DefaultPort = 2699
+
 // Config is the frozen typed value. Every field is decided once, at Load.
 type Config struct {
 	Home string // the local root: $COZY_HOME, or ~/.cozy
@@ -84,7 +89,7 @@ func Load() (Config, *exit.Error) {
 	if frozen.Home != "" {
 		return frozen, nil
 	}
-	c := Config{Port: 2699, Yield: "smart",
+	c := Config{Port: DefaultPort, Yield: "smart",
 		HubURL: DefaultHubURL, HubURLSource: "default", HubTokenSource: "unset",
 		Tfs: "tfs", TfsSource: "default"}
 

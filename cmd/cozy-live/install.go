@@ -11,7 +11,6 @@ import (
 	"syscall"
 
 	"github.com/cozy-creator/cozy-creator-v2/internal/config"
-	"github.com/cozy-creator/cozy-creator-v2/internal/home"
 )
 
 // installEndpoint puts the SDXL endpoint on a service root THE WAY A USER DOES: one
@@ -62,28 +61,13 @@ func installEndpointFrom(root, bench string) string {
 		must("the install", fmt.Errorf("printed no generation"))
 	}
 
-	snapshot := benchSnapshot(bench)
-	python := home.VenvPython(filepath.Join(root, "generations", generation, "venv"))
-	script := `
-import sys
-from pathlib import Path
-from cozy_runtime.cli import artifacts
-home, store, config, snap = sys.argv[1:5]
-artifacts.install(Path(home), artifacts.Artifact(
-    ref="cozy/sdxl-unet@cr-005", store=store, config=config,
-    snapshots={"unet": snap}, lane="plain-fp16",
-    bytes=5_134_927_368, tensors=1680, variant="sm89"))
-print("artifact row installed")
-`
-	cmd := exec.Command("/usr/bin/nice", "-n", "19", python, "-c", script, root,
-		filepath.Join(bench, "store"),
-		filepath.Join(bench, "hf", "sdxl", "unet", "config.json"), snapshot)
-	cmd.Env = childEnv(root)
-	data, err := cmd.CombinedOutput()
-	if err != nil {
-		fmt.Println(string(data))
-		must("installing the artifact index row", err)
-	}
+	// The row's byte totals are DERIVED by the runtime's own header reader (cl-028): the
+	// hardcoded `bytes=5_134_927_368, tensors=1680` were a second spelling of facts the
+	// machine holding the bytes already states.
+	installArtifactRow(root, generation, filepath.Join(bench, "store"),
+		filepath.Join(bench, "hf", "sdxl", "unet", "config.json"),
+		"cozy/sdxl-unet@cr-005", "plain-fp16",
+		map[string]string{"unet": benchSnapshot(bench)})
 	return "cozy/sdxl-unet"
 }
 

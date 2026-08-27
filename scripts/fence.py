@@ -128,7 +128,10 @@ LISTEN_SITES = {
     "cmd/cozy-media/listen.go": "the POD's media server — off-loopback requires TLS",
 }
 LISTEN_SITE = " / ".join(sorted(LISTEN_SITES))
-LISTEN_CALL = re.compile(r'net\.Listen\s*\(\s*"tcp')
+# (cl-028 tightening) ANY net.Listen* call, not only the literal-"tcp" spelling: a bind
+# whose network rides a variable was invisible to the old regex, and a copycat unix or
+# ListenTCP bind is the same second door.
+LISTEN_CALL = re.compile(r"net\.Listen\w*\s*\(")
 
 # (cl-014 / #506b) THE MEDIA SERVER HAS NO OUTBOUND NETWORK. It joins the liability fence
 # by having nothing to egress WITH: a pod-side process that can be talked into fetching a
@@ -173,8 +176,45 @@ TFS_FIELD = re.compile(r"\.Tfs\b")
 # through this door — that is what the orchestrator and the worker protocol are for.
 RUNTIME_SITES = {"internal/install/install.go", "internal/launch/artifacts.go"}
 RUNTIME_BIN = re.compile(r'"cozy-runtime"')
+# (cl-028) The INDIRECTIONS to the same binary, which the literal above cannot see:
+# `launch.Binary()` resolves the generation venv's cozy-runtime and `launch.RuntimeCLI{}`
+# is its invoker. Product code outside internal/launch reaching either is the same second
+# execution door the literal rule refuses; only the verification driver may (with a door).
+RUNTIME_INDIRECT = re.compile(r"launch\.Binary\s*\(|launch\.RuntimeCLI\s*\{")
+RUNTIME_INDIRECT_HOME = "internal/launch/"
 RUNTIME_VERBS_OK = {"describe", "list", "doctor", "fit", "bindings"}
 RUNTIME_VERBS_DENY = {"run", "job", "serve", "rm", "pull", "ingest", "new"}
+
+# (cl-028) EMBEDDED SCRIPTS ARE SOURCE TOO. The impl family scans Go with string literals
+# blanked, so a Python script inside a raw string could author byte-plane knowledge the
+# fence never saw — `tensorfs.parse_header` and a hand-summed tensor table already did.
+# Every multi-line Go string literal that looks like a script (it imports something) is
+# scanned for the byte-plane vocabulary below; the door is //cozy:allow on the line the
+# literal starts on. scripts/*.py are scanned with the same vocabulary.
+DENY_EMBED = [
+    "parse_header", "safetensors", "cozytensor", "tensorbytes", "tensorchunk",
+    "loadtensor", "weightbytes", "pagein", "quantiz", "gguf", "dtype", "mmap",
+    "torch", "cuda",
+]
+PY_SCAN = "scripts/*.py"
+# fence.py names the vocabulary in order to deny it; sdxl_proof.py is FIXTURE SOURCE for
+# the non-cooperative-cancel arm (cl-003/M4) — copied into the proof release by
+# sdxl-release.sh and executed only inside that released endpoint's own venv, never by
+# Creator. The allow is explicit so a second file of UNet math cannot ride in unseen.
+PY_ALLOW = {
+    "scripts/fence.py": "the fence itself: it spells the vocabulary to deny it",
+    "scripts/sdxl_proof.py": "fixture source for the M4 non-cooperative-cancel arm; "
+                             "runs only inside the released endpoint's own venv",
+    "scripts/xfer-live.py": "cl-012's live transfer driver: its corruption arm flips one "
+                            "byte in a store filename — an adversary plant, no tensor is "
+                            "parsed or composed",
+}
+
+# (cl-028) The verification driver is the ONE place an //cozy:allow door may exempt a
+# listen or a runtime indirection: it hosts adversaries and stand-ins by design. Product
+# code gets no door for either — a doored non-loopback bind in the product would be the
+# LAN door arriving as a comment.
+DRIVER_DIR = "cmd/cozy-live/"
 
 IDENT = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
 
@@ -205,6 +245,80 @@ def strip_go(src: str) -> str:
         else:
             out.append(c); i += 1
     return "".join(out)
+
+
+def go_raw_literals(src: str):
+    """Yield (start_line, text) for every backtick raw-string literal in Go source."""
+    i, n, line = 0, len(src), 1
+    while i < n:
+        c = src[i]
+        two = src[i:i + 2]
+        if two == "//":
+            j = src.find("\n", i)
+            i = n if j < 0 else j
+        elif two == "/*":
+            j = src.find("*/", i + 2)
+            j = n if j < 0 else j + 2
+            line += src.count("\n", i, j); i = j
+        elif c in ('"', "'"):
+            j = i + 1
+            while j < n:
+                if src[j] == "\\":
+                    j += 2; continue
+                if src[j] == c:
+                    j += 1; break
+                j += 1
+            line += src.count("\n", i, j); i = j
+        elif c == "`":
+            j = src.find("`", i + 1)
+            j = n if j < 0 else j
+            yield line, src[i + 1:j]
+            line += src.count("\n", i, j); i = j + 1
+        else:
+            if c == "\n":
+                line += 1
+            i += 1
+
+
+def check_embedded():
+    """(cl-028) Multi-line script literals in Go source scan like source, not like prose."""
+    bad = []
+    for p in files():
+        if p.suffix != ".go":
+            continue
+        raw = p.read_text(errors="ignore")
+        raw_lines = raw.splitlines()
+        for start, text in go_raw_literals(raw):
+            if "\n" not in text or "import " not in text:
+                continue  # not a script — a format string or a fixture blob
+            opener = raw_lines[start - 1] if start <= len(raw_lines) else ""
+            if ALLOW_DOOR in opener:
+                continue
+            for offset, line in enumerate(text.splitlines()):
+                body = line.split("#", 1)[0].lower()
+                for d in DENY_EMBED:
+                    if d in body:
+                        bad.append(
+                            f"{p}:{start + offset}: [embed] byte-plane vocabulary '{d}' inside an "
+                            f"embedded script — TensorFS/Runtime own it; delegate to a runtime "
+                            f"verb instead of authoring tensor knowledge here: {line.strip()}")
+    return bad
+
+
+def check_scripts():
+    """(cl-028) scripts/*.py are in the SCAN set, with the explicit fixture allows."""
+    bad = []
+    for p in sorted(pathlib.Path(".").glob(PY_SCAN)):
+        rel = str(p).replace("\\", "/")
+        if rel in PY_ALLOW:
+            continue
+        for i, line in enumerate(p.read_text(errors="ignore").splitlines(), 1):
+            body = line.split("#", 1)[0].lower()
+            for d in DENY_EMBED:
+                if d in body:
+                    bad.append(f"{p}:{i}: [embed] byte-plane vocabulary '{d}' in a repo script — "
+                               f"only the named fixture allows carry it: {line.strip()}")
+    return bad
 
 
 def files():
@@ -298,11 +412,20 @@ def check_sources():
                     bad.append(f"{p}:{i}: [api] '{call}' — the local client API is BEARER ONLY. A cookie "
                                f"is ambient authority the browser attaches cross-site; cl-007's session "
                                f"ceremony is a recorded decision, not a quiet import: {line.strip()}")
-            if rel not in LISTEN_SITES and LISTEN_CALL.search(line) and ALLOW_DOOR not in src_line:
-                bad.append(f"{p}:{i}: [api] net.Listen(\"tcp\", …) outside {LISTEN_SITE} — one bind site "
+            # The door is honored ONLY in the verification driver (cl-028): a doored bind
+            # in product code would be the LAN door arriving as a comment.
+            listen_doored = ALLOW_DOOR in src_line and rel.startswith(DRIVER_DIR)
+            if rel not in LISTEN_SITES and LISTEN_CALL.search(line) and not listen_doored:
+                bad.append(f"{p}:{i}: [api] net.Listen outside {LISTEN_SITE} — one bind site "
                            f"per program, each with its own stated rule. The owner's LAN door is "
-                           f"deferred behind TLS and its own threat review, never a second listener: "
-                           f"{line.strip()}")
+                           f"deferred behind TLS and its own threat review, never a second listener "
+                           f"(only {DRIVER_DIR} may door one): {line.strip()}")
+            if not rel.startswith(RUNTIME_INDIRECT_HOME) and RUNTIME_INDIRECT.search(line) and \
+                    not (ALLOW_DOOR in src_line and rel.startswith(DRIVER_DIR)):
+                bad.append(f"{p}:{i}: [runtime] launch.Binary()/launch.RuntimeCLI outside "
+                           f"{RUNTIME_INDIRECT_HOME} — the same second execution door as the "
+                           f"\"cozy-runtime\" literal, reached by indirection; only "
+                           f"{DRIVER_DIR} may door it: {line.strip()}")
             if rel.startswith(MEDIA_DIR):
                 for call in DENY_MEDIA_EGRESS:
                     if call in line:
@@ -453,7 +576,7 @@ def check_contract():
 
 
 violations = (check_sources() + check_matrix() + check_manifest() + check_secret_flags()
-              + check_contract())
+              + check_contract() + check_embedded() + check_scripts())
 if violations:
     print("FENCE RED (boundaries.md):", file=sys.stderr)
     for v in violations:
@@ -467,6 +590,7 @@ print(
     f"cas({len(DENY_DIGEST)} digests@{len(DIGEST_FREE)} + store-path) tensor(tfs@{len(TFS_SITES)}) "
     f"api({len(DENY_COOKIE)} cookie + cors + listen@{len(LISTEN_SITES)} programs) "
     f"media({len(DENY_MEDIA_EGRESS)} egress + {len(DENY_MEDIA_IMPORT)} imports@{MEDIA_DIR}) "
-    f"runtime({len(RUNTIME_VERBS_DENY)} denied verbs@{len(RUNTIME_SITES)}) "
+    f"runtime({len(RUNTIME_VERBS_DENY)} denied verbs@{len(RUNTIME_SITES)} + indirection) "
+    f"embed({len(DENY_EMBED)} words, scripts allow@{len(PY_ALLOW)}) "
     f"contract({len(parse_go_routes(pathlib.Path('internal/api/routes.go')))} routes)"
 )

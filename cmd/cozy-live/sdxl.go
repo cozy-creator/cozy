@@ -97,7 +97,7 @@ func sdxlSpec(entrypoints ...string) orchestrator.WorkerLaunchSpec {
 		// `launch.Binary` names the runtime, so the ONE site that spells the binary stays the
 		// one site (the `runtime` fence). This dev spec points it at the corpus venv rather
 		// than a generation, which is the only difference from what `cozy start` launches.
-		Args:     []string{"-n", "19", launch.Binary(filepath.Dir(venv)), "serve"},
+		Args:     []string{"-n", "19", launch.Binary(filepath.Dir(venv)), "serve"}, //cozy:allow the DRIVER resolves the real runtime for the orchestrator's own spawn — the one execution path, driven live
 		Dir:      runtime,
 		Imposed:  []string{"PYTHONPATH=" + runtime + ":" + filepath.Join(runtime, "src")},
 		Devices:  []string{"0"},

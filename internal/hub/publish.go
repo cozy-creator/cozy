@@ -259,15 +259,6 @@ func (c *Client) Complete(ctx context.Context, ref Ref, publishID, reason string
 	return out, e
 }
 
-// Abort drops a session: it aborts the session's ranged uploads (an unaborted one is
-// billed storage no object listing can show) and drops its scratch.
-func (c *Client) Abort(ctx context.Context, ref Ref, publishID, reason string) *exit.Error {
-	return c.do(ctx, call{
-		method: http.MethodDelete, path: publishes(ref) + "/" + publishID,
-		admin: true, reason: reason,
-	}, nil)
-}
-
 // ---------------------------------------------------------------- checkpoint reads
 
 // Checkpoint is one installed checkpoint row. Public: reads carry no credential.
@@ -353,13 +344,7 @@ func publishes(ref Ref) string {
 	return "/v1/repos/" + ref.Org + "/" + ref.Name + "/publishes"
 }
 
-// PublishState is the resume read: the session and every declared object's state.
-// Public — a publisher can see where it got to without a credential.
-func (c *Client) PublishState(ctx context.Context, ref Ref, publishID string) (Session, []Verdict, *exit.Error) {
-	var out struct {
-		Publish Session   `json:"publish"`
-		Objects []Verdict `json:"objects"`
-	}
-	e := c.do(ctx, call{method: http.MethodGet, path: publishes(ref) + "/" + publishID}, &out)
-	return out.Publish, out.Objects, e
-}
+// PublishState is DELETED, loudly (cl-028): it was a client-side resume read the design
+// doc says does not exist — publish.go's transactional walk re-declares and the hub
+// answers what is already held, so nothing ever read it. A resume verb returns only with
+// a recorded design decision, never as a leftover.

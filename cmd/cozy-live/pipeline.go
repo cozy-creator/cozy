@@ -90,50 +90,10 @@ func installPipeline(root, endpoint, ref, lane string, snapshots map[string]stri
 		must("the install", fmt.Errorf("printed no generation"))
 	}
 
-	blob, err := json.Marshal(snapshots)
-	must("rendering the component snapshots", err)
-	python := home.VenvPython(filepath.Join(root, "generations", generation, "venv"))
-	cmd := exec.Command("/usr/bin/nice", "-n", "19", python, "-c", rowScript,
-		root, filepath.Join(pipeWork, "store"),
-		filepath.Join(pipeWork, "pipeline.config.json"), ref, lane, string(blob))
-	cmd.Env = childEnv(root)
-	data, err := cmd.CombinedOutput()
-	if err != nil {
-		fmt.Println(string(data))
-		must("installing the artifact index row", err)
-	}
-	fmt.Printf("  %s", string(data))
+	installArtifactRow(root, generation, filepath.Join(pipeWork, "store"),
+		filepath.Join(pipeWork, "pipeline.config.json"), ref, lane, snapshots)
 	return generation
 }
-
-// rowScript writes ONE artifact index row through the runtime's own writer, with `bytes`
-// and `tensors` summed from the components' own cozytensors headers.
-const rowScript = `
-import json, sys
-from pathlib import Path
-import tensorfs
-from cozy_runtime.cli import artifacts
-
-home, store_root, config, ref, lane, snaps_json = sys.argv[1:7]
-snaps = json.loads(snaps_json)
-store = tensorfs.Store.open(store_root)
-
-def stored(part):
-    if "segments" in part:
-        return sum(s["length"] for s in part["segments"])
-    return len(part.get("inline", b""))
-
-total = tensors = 0
-for name, sid in sorted(snaps.items()):
-    table = tensorfs.parse_header(store.snapshot(sid)["header"])["components"][name]
-    tensors += len(table)
-    total += sum(stored(p) for e in table.values() for p in e["parts"].values())
-
-artifacts.install(Path(home), artifacts.Artifact(
-    ref=ref, store=store_root, config=config, snapshots=snaps, lane=lane,
-    bytes=total, tensors=tensors, variant="sm89"))
-print(f"{ref}: {len(snaps)} components, {tensors} tensors, {total} B stored ({lane})")
-`
 
 // pipeSnapshots reads cr-008b's four component snapshots off disk.
 func pipeSnapshots() map[string]string {

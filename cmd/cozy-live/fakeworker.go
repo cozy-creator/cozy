@@ -66,7 +66,7 @@ func fakeWorker() int {
 		_ = os.MkdirAll(filepath.Dir(address), 0o755)
 	}
 	_ = os.Remove(address)
-	ln, err := net.Listen(network, address)
+	ln, err := net.Listen(network, address) //cozy:allow the ADVERSARY binds exactly as the real worker does (#436: the worker hosts, the owner dials); the product binds through internal/api
 	if err != nil {
 		say("cannot bind %s: %v", listen, err)
 		return 1

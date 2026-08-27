@@ -21,6 +21,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -299,7 +300,7 @@ func (p *Publish) upload(ctx context.Context, missing []hub.Missing, res *Result
 	for source := range sources {
 		res.Sources = append(res.Sources, source)
 	}
-	sortStrings(res.Sources)
+	sort.Strings(res.Sources)
 	ms["grant_upload_verify"] = since(started)
 	p.say("granted and uploaded %d objects one at a time (%d ranged), %s moved "+
 		"(%d already resident at the key)", res.Uploaded, res.Multipart, size(res.Moved), res.Conflicts)
@@ -429,11 +430,14 @@ const attempts = 3
 // send is the one storage-edge write in this binary. It talks to object storage,
 // never to the hub: the URL is presigned and carries no credential of ours.
 func send(ctx context.Context, method, url string, open func() (io.ReadCloser, error), length int64, headers map[string]string) (int, http.Header, []byte, *exit.Error) {
-	var last error
-	for try := 0; try < attempts; try++ {
+	var status int
+	var header http.Header
+	var raw []byte
+	exhausted, err := retryStorage(func(int) (bool, error) {
+		status, header, raw = 0, nil, nil
 		body, err := open()
 		if err != nil {
-			return 0, nil, nil, exit.Internalf("the staged object is unreadable: %s", err)
+			return false, exit.Internalf("the staged object is unreadable: %s", err)
 		}
 		// The body is COUNTED and the context lives while the count moves: an upload
 		// that is slow is not an upload that has stopped.
@@ -444,7 +448,7 @@ func send(ctx context.Context, method, url string, open func() (io.ReadCloser, e
 		if err != nil {
 			counted.Close()
 			cancel()
-			return 0, nil, nil, exit.Internalf("the grant's URL is not usable: %s", err)
+			return false, exit.Internalf("the grant's URL is not usable: %s", err)
 		}
 		req.ContentLength = length
 		for k, v := range headers {
@@ -454,21 +458,27 @@ func send(ctx context.Context, method, url string, open func() (io.ReadCloser, e
 		if err != nil {
 			counted.Close()
 			cancel()
-			last = err
-			time.Sleep(time.Duration(try+1) * time.Second)
-			continue
+			return true, err
 		}
-		raw, _ := io.ReadAll(io.LimitReader(resp.Body, 8<<10))
+		raw, _ = io.ReadAll(io.LimitReader(resp.Body, 8<<10))
 		resp.Body.Close()
 		counted.Close()
 		cancel()
-		if retryableStorageStatus(resp.StatusCode) && try+1 < attempts {
-			time.Sleep(time.Duration(try+1) * time.Second)
-			continue
+		status, header = resp.StatusCode, resp.Header
+		if retryableStorageStatus(resp.StatusCode) {
+			// The recorded answer stands if this was the last try: the caller renders
+			// the storage layer's own refusal rather than a generic "unreachable".
+			return true, fmt.Errorf("object storage answered %d", resp.StatusCode)
 		}
-		return resp.StatusCode, resp.Header, raw, nil
+		return false, nil
+	})
+	if err == nil || (exhausted && status != 0) {
+		return status, header, raw, nil
 	}
-	return 0, nil, nil, exit.Unavailablef("object storage is unreachable after %d attempts: %s", attempts, last).
+	if !exhausted {
+		return 0, nil, nil, err.(*exit.Error)
+	}
+	return 0, nil, nil, exit.Unavailablef("object storage is unreachable after %d attempts: %s", attempts, err).
 		WithRemedy("re-run to resume: the objects that did land are already held, and the hub re-plans the rest")
 }
 

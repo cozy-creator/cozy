@@ -39,15 +39,15 @@ import (
 // no field for it; the product surface names it, so a guess about where somebody else's
 // byte plane listens has no reason to exist and is gone.
 
-// Rental states, the hub's own words.
+// Rental states, the hub's own words — only the ones a reader here branches on. The
+// hub's in-flight states (pending_acquisition, acquiring, materializing) reach this
+// client as opaque strings it renders verbatim; naming them as constants nobody read
+// was law-13 dead code (cl-028).
 const (
-	RentalPendingAcquisition = "pending_acquisition"
-	RentalAcquiring          = "acquiring"
-	RentalMaterializing      = "materializing"
-	RentalReady              = "ready"
-	RentalFailed             = "failed"
-	RentalReleaseRequested   = "release_requested"
-	RentalReleased           = "released"
+	RentalReady            = "ready"
+	RentalFailed           = "failed"
+	RentalReleaseRequested = "release_requested"
+	RentalReleased         = "released"
 )
 
 // Rental is one rented pod as the hub reports it. There is no token on it, and there is

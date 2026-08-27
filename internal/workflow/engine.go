@@ -504,6 +504,12 @@ func (e *Engine) advance(id string) *exit.Error {
 		if !requestDone(child.State) {
 			return nil
 		}
+		if child.State == "canceled" {
+			// An honest projection (cl-028): a canceled child ends the workflow as
+			// CANCELED, not as a failure the child never had.
+			return e.settle(*row, steps, "canceled", "CHILD_CANCELED",
+				fmt.Sprintf("workflow step %d child %s was canceled", index+1, child.ID))
+		}
 		if child.State != "succeeded" {
 			return e.fail(*row, steps, exit.Named(exit.Failed, "workflow_child_failed",
 				"workflow step %d child %s settled %s", index+1, child.ID, child.State))

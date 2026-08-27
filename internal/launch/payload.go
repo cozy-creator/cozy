@@ -289,10 +289,6 @@ func validateFieldInto(field Field, value any, path string, assets *[]string) *e
 	return nil
 }
 
-func validateRendered(raw json.RawMessage, value any, path string) *exit.Error {
-	return validateRenderedInto(raw, value, path, nil)
-}
-
 func validateRenderedInto(raw json.RawMessage, value any, path string, assets *[]string) *exit.Error {
 	var scalar string
 	if json.Unmarshal(raw, &scalar) == nil {

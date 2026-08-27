@@ -7,7 +7,9 @@ import (
 	"net/url"
 	"os"
 	"runtime"
+	"strconv"
 
+	"github.com/cozy-creator/cozy-creator-v2/internal/config"
 	"github.com/cozy-creator/cozy-creator-v2/internal/exit"
 	"github.com/cozy-creator/cozy-creator-v2/internal/home"
 	"github.com/cozy-creator/cozy-creator-v2/internal/secret"
@@ -131,7 +133,7 @@ func Authorize(r *http.Request, v secret.Value) {
 func (c Credentials) OpenURL(addr string) string {
 	_, port, err := net.SplitHostPort(addr)
 	if err != nil {
-		port = "2699"
+		port = strconv.Itoa(config.DefaultPort)
 	}
 	return "http://127.0.0.1:" + port + "/#t=" + url.QueryEscape(c.Browser.Reveal())
 }

@@ -247,12 +247,16 @@ func (s *Source) validate() *exit.Error {
 	return nil
 }
 
+// validateReferences checks STRUCTURAL YAML shape only (cl-028). The reference COUNT
+// bounds are the resolved descriptor's own facts, enforced against it when each child
+// payload is built (launch.ValidatePayloadAssets reads the entrypoint's declared
+// min/max_length), and the media-mix policy (se-012's 9/3/3, audio-only invalid) is the
+// endpoint's own `reference_policy` refusal. Restating either here was a law-2 duplicate
+// that would go stale the day the endpoint's descriptor moved.
 func validateReferences(shot string, refs []ReferenceSource) *exit.Error {
-	if len(refs) < 1 || len(refs) > 12 {
-		return invalid("shot %s has %d references; reference_media_to_video accepts 1-12",
-			shot, len(refs))
+	if len(refs) == 0 {
+		return invalid("shot %s declares reference_media_to_video with no references", shot)
 	}
-	images, videos, audios := 0, 0, 0
 	for index, ref := range refs {
 		values := []string{string(ref.Image), string(ref.Video), string(ref.Audio)}
 		present := 0
@@ -267,13 +271,6 @@ func validateReferences(shot string, refs []ReferenceSource) *exit.Error {
 		if present != 1 {
 			return invalid("shot %s reference %d needs exactly one image, video, or audio", shot, index)
 		}
-		images += map[bool]int{true: 1}[ref.Image != ""]
-		videos += map[bool]int{true: 1}[ref.Video != ""]
-		audios += map[bool]int{true: 1}[ref.Audio != ""]
-	}
-	if images > 9 || videos > 3 || audios > 3 || images+videos == 0 {
-		return invalid("shot %s references resolve to %d images, %d videos, %d audio; "+
-			"limits are 9/3/3 and audio-only is invalid", shot, images, videos, audios)
 	}
 	return nil
 }
