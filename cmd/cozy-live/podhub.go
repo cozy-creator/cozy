@@ -576,7 +576,7 @@ func (h *podHub) read(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	out := map[string]any{
-		"rental_id": rec.ID, "state": rec.State, "address": rec.Address,
+		"rental_id": rec.ID, "state": rec.State, "worker_address": rec.Address,
 		"cert_pem": rec.CertPEM,
 		// The LIVE HASH SET, which is the whole of what this hub can say about the
 		// credential. There is no `owner_token` key, and the struct behind this map has no

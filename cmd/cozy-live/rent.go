@@ -391,13 +391,20 @@ func sectionRent() {
 	starved := newPodHub(podHubSpec{Dir: filepath.Join(root, "hub-nomedia"), Arm: "remote",
 		Release: release, NoMedia: true})
 	defer starved.close()
-	rentalF, _ := rentOne(root, starved, "cl-019 no-media-plane arm")
-	code, out = cozyRun(root, "run", endpointRef+"/v1/denoise", "steps=2", "--worker", rentalF)
-	check("the run refuses rather than granting a path on the OWNER's disk",
+	code, out = cozyRunEnv(root, starved.env(), "rent", rentalEndpointRef,
+		"--accelerator", "NVIDIA H200", "--reason", "cl-019 no-media-plane arm")
+	check("the rental refuses rather than pinning an unusable pod",
 		code != 0 && (strings.Contains(out, "media") || strings.Contains(out, "byte plane")),
 		firstLine(out)+" [exit "+itoa(code)+"]")
+	rentalF := ""
+	for _, id := range heldRentals(root) {
+		if starved.holds(id) {
+			rentalF = id
+			break
+		}
+	}
 	check("and no attempt was dispatched to it: nothing crossed a boundary that is not there",
-		!strings.Contains(podWorkerLog(starved, rentalF), "AttemptOffer"),
+		rentalF != "" && !strings.Contains(podWorkerLog(starved, rentalF), "AttemptOffer"),
 		"the pod's worker saw no AttemptOffer")
 
 	head("#505: the RELEASE PIN is verified, not merely carried")
