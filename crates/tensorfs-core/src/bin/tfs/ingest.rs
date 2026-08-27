@@ -1260,7 +1260,7 @@ pub fn cmd_reap(root: &Path, f: &Flags) -> ExitCode {
     } else {
         tx::now_secs()
     };
-    let (gone, kept) = ok!(tx::reap(store.root(), now));
+    let (gone, kept) = ok!(tx::reap(&store, now));
     for g in &gone {
         println!("reaped       {g}");
     }
@@ -1279,7 +1279,7 @@ pub fn cmd_roots(root: &Path) -> ExitCode {
     for i in &installed {
         println!("installed    sha256:{i}");
     }
-    let (_, live) = ok!(tx::reap(store.root(), 0));
+    let (_, live) = ok!(tx::reap(&store, 0));
     for s in &live {
         println!("candidate    {s} (quarantined — not a checkpoint)");
     }

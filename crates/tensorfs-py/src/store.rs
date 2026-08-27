@@ -910,7 +910,7 @@ pub fn ingest_read_root<'p>(
 #[pyfunction]
 pub fn ingest_reap<'p>(py: Python<'p>, store: &PyStore, now: u64) -> PyResult<Bound<'p, PyDict>> {
     let (expired, kept) =
-        tensorfs_core::ingest::transaction::reap(store.store.root(), now).or_refuse(py)?;
+        tensorfs_core::ingest::transaction::reap(&store.store, now).or_refuse(py)?;
     let d = PyDict::new(py);
     d.set_item("expired", expired)?;
     d.set_item("kept", kept)?;

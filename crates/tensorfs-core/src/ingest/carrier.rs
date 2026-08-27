@@ -191,6 +191,11 @@ impl SourceHeader {
     pub fn get(&self, key: &str) -> Option<&SourceTensor> {
         self.tensors.iter().find(|t| t.key == key)
     }
+    /// One O(n) index for callers that look keys up in a loop — a plan executor asking
+    /// `get` per op is O(n²) at MAX_TENSORS and this is the constant-time door instead.
+    pub fn index(&self) -> std::collections::HashMap<&str, &SourceTensor> {
+        self.tensors.iter().map(|t| (t.key.as_str(), t)).collect()
+    }
     pub fn meta(&self, key: &str) -> Option<&str> {
         self.metadata
             .iter()
@@ -495,7 +500,10 @@ pub fn read_sharded(index_path: &Path) -> Result<(SourceHeader, Vec<u8>)> {
 
     // key -> shard filename, with the filename grammar closed: a bare sibling file, never
     // a path (a traversal inside a weight_map is an exfiltration primitive, not a layout).
-    let mut by_key: Vec<(&str, &str)> = Vec::with_capacity(weight_map.len());
+    // A MAP, not a scan-per-tensor: find/dedup/cover below are each per-tensor over
+    // MAX_TENSORS=100,000, and a linear probe there is O(n²) at design cardinality.
+    let mut by_key: std::collections::HashMap<&str, &str> =
+        std::collections::HashMap::with_capacity(weight_map.len());
     let mut names: Vec<&str> = Vec::new();
     for (k, v) in weight_map {
         let name = as_str("shard index", "weight_map value", v)?;
@@ -505,7 +513,7 @@ pub fn read_sharded(index_path: &Path) -> Result<(SourceHeader, Vec<u8>)> {
                 format!("shard index: shard name {name:?} is not a bare sibling filename"),
             );
         }
-        by_key.push((k.as_str(), name));
+        by_key.insert(k.as_str(), name);
         if !names.contains(&name) {
             names.push(name);
         }
@@ -513,6 +521,7 @@ pub fn read_sharded(index_path: &Path) -> Result<(SourceHeader, Vec<u8>)> {
     names.sort_unstable();
 
     let mut out = SourceHeader::default();
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
     let mut raw = (index_bytes.len() as u64).to_le_bytes().to_vec();
     raw.extend_from_slice(&index_bytes);
     let mut virtual_base = 0u64;
@@ -527,10 +536,10 @@ pub fn read_sharded(index_path: &Path) -> Result<(SourceHeader, Vec<u8>)> {
 
         let region = h.file_len - h.data_start;
         for t in &h.tensors {
-            let claimed = by_key.iter().find(|(k, _)| *k == t.key);
+            let claimed = by_key.get(t.key.as_str());
             match claimed {
-                Some((_, n)) if n == name => {}
-                Some((_, n)) => {
+                Some(n) if n == name => {}
+                Some(n) => {
                     return refuse(
                         Code::CARRIER_GEOMETRY,
                         format!(
@@ -549,7 +558,7 @@ pub fn read_sharded(index_path: &Path) -> Result<(SourceHeader, Vec<u8>)> {
                     )
                 }
             }
-            if out.tensors.iter().any(|o| o.key == t.key) {
+            if !seen.insert(t.key.clone()) {
                 return refuse(
                     Code::CARRIER_GEOMETRY,
                     format!("{}: appears in more than one shard", t.key),
@@ -588,13 +597,17 @@ pub fn read_sharded(index_path: &Path) -> Result<(SourceHeader, Vec<u8>)> {
     }
 
     // The other half of exact cover: every weight_map key was found in some shard.
-    for (k, name) in &by_key {
-        if !out.tensors.iter().any(|t| t.key == *k) {
-            return refuse(
-                Code::CARRIER_GEOMETRY,
-                format!("{k}: named by the weight_map in shard {name:?} but carried by no shard"),
-            );
-        }
+    let mut missing: Vec<(&str, &str)> = by_key
+        .iter()
+        .filter(|(k, _)| !seen.contains(**k))
+        .map(|(k, n)| (*k, *n))
+        .collect();
+    missing.sort_unstable();
+    if let Some((k, name)) = missing.first() {
+        return refuse(
+            Code::CARRIER_GEOMETRY,
+            format!("{k}: named by the weight_map in shard {name:?} but carried by no shard"),
+        );
     }
     for (mk, mv) in index_meta {
         if !out.metadata.iter().any(|(k, _)| *k == mk) {

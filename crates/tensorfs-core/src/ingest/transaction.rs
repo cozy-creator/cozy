@@ -20,7 +20,7 @@ use crate::ids::{ascii_name, check_format, Doc, ObjectRef};
 use crate::limits;
 use crate::manifest::SnapshotManifest;
 use crate::spec::EncodingSpec;
-use crate::store::Store;
+use crate::store::{Store, Verdict};
 
 use super::carrier::{self, SourceHeader};
 use super::convert::{check_permute_size, Bytes, Plan};
@@ -141,7 +141,15 @@ pub fn read_root(store_root: &Path, session: &str) -> Result<IngestRoot> {
 /// Age-bounded reap. An expired root is removed; its candidate objects stay in the CAS as
 /// unreferenced content-addressed bytes (object GC is deliberately out of this issue's
 /// scope) — what is removed is the only thing that could ever have NAMED them.
-pub fn reap(store_root: &Path, now: u64) -> Result<(Vec<String>, Vec<String>)> {
+///
+/// Runs UNDER THE METADATA LOCK — the same lock `install` re-checks the root under — so
+/// "a candidate never installs after its root does" is a serialization fact, not a race
+/// window: a root this reap removes was expired when checked under the lock, and an
+/// install that committed first has already deleted the quarantine dir it would scan.
+pub fn reap(store: &Store, now: u64) -> Result<(Vec<String>, Vec<String>)> {
+    let meta = crate::meta::Meta::open(store)?;
+    let _lock = meta.txn()?;
+    let store_root = store.root();
     let base = store_root.join("ingest");
     let (mut gone, mut kept) = (Vec::new(), Vec::new());
     let rd = match fs::read_dir(&base) {
@@ -186,6 +194,20 @@ pub fn install(
     header: &Header,
     stamp: &super::stamp::Stamp,
 ) -> Result<String> {
+    receipt.binds(subject, snap, header, stamp)?;
+    let walk = ck::walk(store, snap)?;
+    let id = snap.checkpoint_id()?;
+    let hex_id = id.strip_prefix("sha256:").unwrap_or(&id).to_string();
+
+    // The pin, in one transaction against the sole authority. `source_url` is recorded as
+    // PROVENANCE and never as durability: a snapshot arriving from a URL is not evictable
+    // until a hub publication says its bytes can be got back.
+    let meta = crate::meta::Meta::open(store)?;
+    let mut t = meta.txn()?;
+    // The root is read and checked UNDER THE LOCK `reap` also takes, and the commit below
+    // happens before the lock is released — so between this check and the pin no reaper
+    // can take the root, and "a candidate never installs after its root does" is closed
+    // by serialization rather than stated as a hope.
     let root = read_root(store.root(), session)?;
     if root.expires_at <= now_secs() {
         return refuse(
@@ -197,16 +219,6 @@ pub fn install(
             ),
         );
     }
-    receipt.binds(subject, snap, header, stamp)?;
-    let walk = ck::walk(store, snap)?;
-    let id = snap.checkpoint_id()?;
-    let hex_id = id.strip_prefix("sha256:").unwrap_or(&id).to_string();
-
-    // The pin, in one transaction against the sole authority. `source_url` is recorded as
-    // PROVENANCE and never as durability: a snapshot arriving from a URL is not evictable
-    // until a hub publication says its bytes can be got back.
-    let meta = crate::meta::Meta::open(store)?;
-    let mut t = meta.txn()?;
     // No source URL yet: the per-source FETCH legs are deferred (tfs-003 divergence 4), so
     // nothing here has one to record. The column exists because pressure eviction reads it,
     // and an empty one is the honest state — never a claim of local origin.
@@ -317,6 +329,10 @@ pub fn execute(
     // plan already selected exactly one PER TENSOR. Computed once, not per op.
     let by_id: Vec<(String, &EncodingSpec)> =
         specs.iter().map(|(_, s)| (s.object_id(), s)).collect();
+    // One key index per source file, computed once: `SourceHeader::get` is linear, and a
+    // per-op linear probe is O(n²) at MAX_TENSORS.
+    let indexes: Vec<std::collections::HashMap<&str, &super::carrier::SourceTensor>> =
+        files.iter().map(|f| f.header.index()).collect();
 
     for op in &plan.ops {
         let spec = match by_id.iter().find(|(id, _)| *id == op.encoding_id) {
@@ -344,7 +360,7 @@ pub fn execute(
             let part = match &r.bytes {
                 Bytes::Stream { file, key } => {
                     let f = &files[*file];
-                    let t = match f.header.get(key) {
+                    let t = match indexes[*file].get(key.as_str()).copied() {
                         Some(t) => t,
                         None => {
                             return refuse(
@@ -367,7 +383,7 @@ pub fn execute(
                 }
                 Bytes::Permute { file, key, xform } => {
                     let f = &files[*file];
-                    let t = match f.header.get(key) {
+                    let t = match indexes[*file].get(key.as_str()).copied() {
                         Some(t) => t,
                         None => {
                             return refuse(
@@ -394,16 +410,53 @@ pub fn execute(
                     w.part
                 }
                 Bytes::Inherit { part } => {
-                    // CAS-ASSERTED INHERIT: the objects must already be admitted. Nothing is
-                    // read, nothing is hashed, nothing is uploaded — the refs simply carry.
+                    // VERIFIED INHERIT: the refs carry without re-streaming, but `contains`
+                    // is A PRESENCE HINT AND NOTHING MORE (store.rs). Admission into a
+                    // committed checkpoint takes a valid verification record or exactly one
+                    // rehash — a truncated or swapped object refuses HERE, at execute,
+                    // never at first read.
                     for s in part.segments() {
-                        if !store.contains(&s.sha256) {
+                        let rec = match store.record_valid(&s.sha256) {
+                            Ok(rec) => rec,
+                            Err(_) => {
+                                let v = store.verify(&s.sha256).map_err(|e| Refusal {
+                                    code: e.code,
+                                    detail: format!(
+                                        "{what}: inherit-by-reference: {}",
+                                        e.detail
+                                    ),
+                                })?;
+                                if let Verdict::Quarantined { to, why } = v {
+                                    return refuse(
+                                        Code::OBJECT_CORRUPT,
+                                        format!(
+                                            "{what}: inherit-by-reference names {} whose \
+                                             bytes disagree with their id (quarantined to \
+                                             {}): {why}",
+                                            s.id(),
+                                            to.display()
+                                        ),
+                                    );
+                                }
+                                store.record_valid(&s.sha256).map_err(|why| Refusal {
+                                    code: Code::OBJECT_CORRUPT,
+                                    detail: format!(
+                                        "{what}: {} rehashed clean but its record does not \
+                                         stand: {why}",
+                                        s.id()
+                                    ),
+                                })?
+                            }
+                        };
+                        if rec.length != s.length {
                             return refuse(
-                                Code::OBJECT_ABSENT,
+                                Code::LENGTH_MISMATCH,
                                 format!(
-                                    "{what}: inherit-by-reference names {} which this store \
-                                     has never admitted",
-                                    s.id()
+                                    "{what}: inherit-by-reference declares {} at {} B; the \
+                                     verified store object is {} B",
+                                    s.id(),
+                                    s.length,
+                                    rec.length
                                 ),
                             );
                         }

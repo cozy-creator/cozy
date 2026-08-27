@@ -105,8 +105,17 @@ pub fn run_doc(
         "compat_report" => {
             crate::compat::CompatibilityReport::parse(bytes).map(|_| (None, None))?
         }
+        #[cfg(feature = "grade")]
         "conversion_registration" => {
             crate::grade::ConversionRegistration::parse(bytes).map(|_| (None, None))?
+        }
+        #[cfg(not(feature = "grade"))]
+        "conversion_registration" => {
+            return refuse(
+                Code::UNKNOWN_FORMAT,
+                "conversion_registration is a hub-side grading document; this build carries \
+                 no grading vocabulary (the `grade` feature is off in the worker wheel)",
+            )
         }
         other => {
             return refuse(

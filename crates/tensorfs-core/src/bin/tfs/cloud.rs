@@ -134,7 +134,7 @@ pub fn cmd_grant(closure_p: &Path, id: &str, flags: &Flags) -> ExitCode {
     emit(&grant, flags);
     println!("grant        {}", grant.object_id());
     println!("key          {}", grant.key());
-    for (k, v) in grant.signed_headers() {
+    for (k, v) in ok!(grant.signed_headers()) {
         println!("sign         {k}: {v}");
     }
     println!("expires_at   {}", grant.expires_at);
@@ -167,7 +167,7 @@ pub fn cmd_verified(
 /// The 412 answer: an honest duplicate, or a quarantine. Never an overwrite.
 pub fn cmd_conflict(grant_p: &Path, resident: &str) -> ExitCode {
     let grant = ok!(PublishGrant::parse(&read!(grant_p)));
-    match cloud::resolve_conflict(&grant, resident) {
+    match ok!(cloud::resolve_conflict(&grant, resident)) {
         Conflict::HonestDuplicate => {
             println!("conflict     HONEST DUPLICATE — the resident bytes are ours");
             println!("             zero bytes re-uploaded; the fact stands");

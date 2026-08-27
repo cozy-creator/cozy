@@ -522,6 +522,27 @@ impl Store {
     /// opened once through `open_verified`, and the destination hashes, length-checks and
     /// publishes without clobbering through `put_stream`.
     pub fn transfer_object(&self, destination: &Store, want: &ObjectRef) -> Result<Put> {
+        // A retried transfer streams NOTHING: the destination's own predicate
+        // (`record_valid` — may these bytes be trusted without hashing them again?, the
+        // same question `FetchPlan::of` asks) answers before any byte moves, so a retried
+        // 99 GB store-to-store materialization is a stat, not a re-copy.
+        if let Ok(rec) = destination.record_valid(&want.sha256) {
+            if rec.length == want.length {
+                return Ok(Put {
+                    obj: want.clone(),
+                    admitted: false,
+                });
+            }
+            return refuse(
+                Code::LENGTH_MISMATCH,
+                format!(
+                    "{} is {} bytes in the destination store, expected {}",
+                    want.id(),
+                    rec.length,
+                    want.length
+                ),
+            );
+        }
         let mut source = self.open_verified(&want.sha256)?;
         if source.len() != want.length {
             return refuse(
@@ -767,7 +788,19 @@ impl Store {
             to = dir.join(format!("{hex}.{n}"));
             n += 1;
         }
-        fs::rename(self.object_path(hex), &to).map_err(|e| io("quarantine rename", e))?;
+        match fs::rename(self.object_path(hex), &to) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                // RACING QUARANTINERS: the rename loser finds the name already taken.
+                // What quarantine promises — nothing at this id satisfies another read —
+                // is already true, so losing the race is the promise kept, not IO_FAILED;
+                // `open_verified` then reports the honest OBJECT_CORRUPT.
+                self.drop_record(hex);
+                let winner = dir.join(hex);
+                return Ok(if winner.exists() { winner } else { to });
+            }
+            Err(e) => return Err(io("quarantine rename", e)),
+        }
         self.drop_record(hex);
         Ok(to)
     }

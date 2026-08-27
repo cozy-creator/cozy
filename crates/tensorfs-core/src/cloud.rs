@@ -252,18 +252,18 @@ impl PublishGrant {
 
     /// The base64 sha256 the signature must bind. Derived from the object's own digest, so
     /// a grant cannot advertise a checksum that disagrees with the key it writes to.
-    pub fn checksum_sha256(&self) -> String {
+    pub fn checksum_sha256(&self) -> Result<String> {
         required_checksum(&self.object.sha256)
     }
 
     /// Every header the coordinator MUST sign into the presigned URL. Not a suggestion and
     /// not a default: this is the complete set, and the qualification gate proved that a
     /// client which strips any of them gets `SignatureDoesNotMatch`.
-    pub fn signed_headers(&self) -> Vec<(String, String)> {
-        vec![
+    pub fn signed_headers(&self) -> Result<Vec<(String, String)>> {
+        Ok(vec![
             ("if-none-match".to_string(), "*".to_string()),
-            ("x-amz-checksum-sha256".to_string(), self.checksum_sha256()),
-        ]
+            ("x-amz-checksum-sha256".to_string(), self.checksum_sha256()?),
+        ])
     }
 }
 
@@ -323,18 +323,23 @@ pub struct VerifiedObject {
 
 /// The base64 sha256 an object's own digest REQUIRES. One arithmetic, two callers: the
 /// grant that signs it and the fact that is only a fact if the backend reported it.
-fn required_checksum(sha256_hex: &str) -> String {
+///
+/// REFUSES, never panics, on anything but 64 lowercase hex: `ObjectRef` has pub fields, so
+/// a hand-built ref with short hex reaches this — and slicing it aborted the process where
+/// `MALFORMED_DIGEST` is the answer (the same class `Store::shard` already fixed).
+fn required_checksum(sha256_hex: &str) -> Result<String> {
+    crate::ids::hex64("ObjectRef.sha256", sha256_hex)?;
     let mut raw = [0u8; 32];
     for (i, b) in raw.iter_mut().enumerate() {
         *b = u8::from_str_radix(&sha256_hex[i * 2..i * 2 + 2], 16).unwrap_or(0);
     }
-    b64::encode(&raw)
+    Ok(b64::encode(&raw))
 }
 
 /// The one adjudication, wherever a `VerifiedObject` comes into existence: the checksum the
 /// backend reported against the checksum the object's own id requires.
 fn adjudicate_checksum(where_: &str, object: &ObjectRef, reported: &str) -> Result<()> {
-    let want = required_checksum(&object.sha256);
+    let want = required_checksum(&object.sha256)?;
     if reported != want {
         return refuse(
             Code::OBJECT_CORRUPT,
@@ -446,16 +451,16 @@ pub enum Conflict {
 /// The verify-resident-on-conflict step, which is why losing a race costs one HEAD rather
 /// than a re-upload. The gate proved the backend answers it: a HEAD with checksum mode
 /// enabled returns the resident object's sha256.
-pub fn resolve_conflict(grant: &PublishGrant, resident_checksum: &str) -> Conflict {
-    let wanted = grant.checksum_sha256();
-    if resident_checksum == wanted {
+pub fn resolve_conflict(grant: &PublishGrant, resident_checksum: &str) -> Result<Conflict> {
+    let wanted = grant.checksum_sha256()?;
+    Ok(if resident_checksum == wanted {
         Conflict::HonestDuplicate
     } else {
         Conflict::Quarantine {
             resident: resident_checksum.to_string(),
             wanted,
         }
-    }
+    })
 }
 
 // ---------------------------------------------------------------- the catalog root

@@ -506,7 +506,13 @@ pub fn walk(store: &Store, snap: &SnapshotManifest) -> Result<Walk> {
     //    reference reaches is an orphan, not an asset: it is a canonical document the
     //    checkpoint does not commit to, sitting at a path that asserts it does. Silently
     //    absorbing it as a "sibling" is how a stale or planted spec rides along.
-    let accounted: Vec<ObjectRef> = w.objects.iter().map(|r| r.obj.clone()).collect();
+    // A SET over the whole length-bearing ObjectRef, not a per-entry linear scan — the
+    // scan made walk O(n²) over the manifest at design cardinality.
+    let accounted: std::collections::HashSet<(String, u64)> = w
+        .objects
+        .iter()
+        .map(|r| (r.obj.sha256.clone(), r.obj.length))
+        .collect();
     for (path, e) in snap.entries() {
         let contained_ns = path
             .strip_prefix(crate::manifest::CLOSURE_DIR)
@@ -515,7 +521,7 @@ pub fn walk(store: &Store, snap: &SnapshotManifest) -> Result<Walk> {
         match e {
             crate::manifest::Entry::Dir => {}
             crate::manifest::Entry::File(o) => {
-                if !accounted.contains(o) {
+                if !accounted.contains(&(o.sha256.clone(), o.length)) {
                     if contained_ns {
                         return refuse(
                             Code::NOT_CONTAINED,

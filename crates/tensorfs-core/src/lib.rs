@@ -15,6 +15,7 @@ pub mod err;
 pub mod fetch;
 pub mod fill;
 pub mod gc;
+#[cfg(feature = "grade")]
 pub mod grade;
 pub mod header;
 pub mod ids;
@@ -32,4 +33,5 @@ pub mod spec;
 pub mod store;
 pub mod structure;
 pub mod vectors;
+#[cfg(feature = "grade")]
 pub mod verifier;

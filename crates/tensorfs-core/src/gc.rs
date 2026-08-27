@@ -172,6 +172,11 @@ impl Census {
     pub fn is_live(&self, hex: &str) -> bool {
         self.live.iter().any(|l| l.object == hex)
     }
+    /// The whole live set as one lookup structure — the sweep asks per swept object, and a
+    /// linear `is_live` there is O(n²) at store cardinality.
+    pub fn live_set(&self) -> std::collections::HashSet<&str> {
+        self.live.iter().map(|l| l.object.as_str()).collect()
+    }
     pub fn distinct(&self) -> usize {
         let mut v: Vec<&str> = self.live.iter().map(|l| l.object.as_str()).collect();
         v.sort();
@@ -443,10 +448,11 @@ pub fn sweep_at(
         ..Default::default()
     };
 
+    let live = census.live_set();
     let mut claimed: Vec<String> = Vec::new();
     for hex in &all {
         s.scanned += 1;
-        if census.is_live(hex) {
+        if live.contains(hex.as_str()) {
             s.live += 1;
             continue;
         }
@@ -526,6 +532,25 @@ pub struct Usage {
 /// reclaim exactly these bytes. A live workspace head makes nothing exclusive — `exclusive`
 /// is the freed-if-deleted number or it is nothing.
 pub fn usage(store: &Store, census: &Census) -> Vec<Usage> {
+    use std::collections::{HashMap, HashSet};
+    // Precomputed once: how many snapshots reach each object, and which objects a hold
+    // names. The per-object inner scans made this O(S²·N²) at design cardinality.
+    let mut owners: HashMap<&str, usize> = HashMap::new();
+    for (_, objs) in &census.per_snapshot {
+        let mut seen: HashSet<&str> = HashSet::with_capacity(objs.len());
+        for o in objs {
+            if seen.insert(o.sha256.as_str()) {
+                *owners.entry(o.sha256.as_str()).or_insert(0) += 1;
+            }
+        }
+    }
+    let held: HashSet<&str> = census
+        .live
+        .iter()
+        .filter(|l| l.kind == "hold-object")
+        .map(|l| l.object.as_str())
+        .collect();
+
     let mut out = Vec::new();
     for (snap, objs) in &census.per_snapshot {
         let mut u = Usage {
@@ -536,21 +561,15 @@ pub fn usage(store: &Store, census: &Census) -> Vec<Usage> {
         };
         for o in objs {
             u.logical += o.length;
-            if store.contains(&o.sha256) {
+            let resident = store.contains(&o.sha256);
+            if resident {
                 u.resident += o.length;
             }
             // Exclusive = reached by THIS snapshot and by no other pinned snapshot. Holds
             // that name a snapshot are already among `per_snapshot`, so a leased object is
             // correctly not exclusive to anybody.
-            let shared = census
-                .per_snapshot
-                .iter()
-                .any(|(other, set)| other != snap && set.iter().any(|x| x.sha256 == o.sha256));
-            let held = census
-                .live
-                .iter()
-                .any(|l| l.object == o.sha256 && l.kind == "hold-object");
-            if !shared && !held && store.contains(&o.sha256) {
+            let shared = owners.get(o.sha256.as_str()).copied().unwrap_or(0) > 1;
+            if !shared && !held.contains(o.sha256.as_str()) && resident {
                 u.exclusive += o.length;
             }
         }
