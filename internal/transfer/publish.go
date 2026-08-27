@@ -327,7 +327,7 @@ func (p *Publish) uploadOne(ctx context.Context, publishID string, index int, ob
 
 	// The bytes leave the store through a VERIFIED read, so a publisher cannot
 	// upload what its own store silently corrupted.
-	local := Result{}
+	local := Result{PublishID: publishID}
 	if e := p.Tool.Extract(grant.ObjectID, staged); e != nil {
 		outcome.err = e
 		return outcome
