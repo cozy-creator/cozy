@@ -85,6 +85,10 @@ type Server struct {
 	// shutdown asks the process that owns this server to drain and exit — `cozy down`'s
 	// cooperative tier (#449). The route refuses when the builder wired none.
 	shutdown func()
+
+	// workflows is Creator's LOCAL ordered-child controller. Its children still enter
+	// exclusively through orchestrator.
+	workflows WorkflowController
 }
 
 // Resolver exposes control-plane placement facts separately from a local worker launch.
@@ -93,6 +97,7 @@ type Server struct {
 type Resolver interface {
 	ResolvePlacement(endpoint string) (orchestrator.DesiredPlacement, *exit.Error)
 	Resolve(endpoint string) (orchestrator.WorkerLaunchSpec, *exit.Error)
+	Entrypoint(installID, name string) (*launch.Entrypoint, *exit.Error)
 	// Jobs names the `@job` functions one installed endpoint registers, with the
 	// descriptor id each resolves to. The job submit route resolves a function to its
 	// digest through this and never lets a client name one (cl-004).
@@ -113,7 +118,8 @@ type Options struct {
 	// host attaches no remote workers.
 	Rentals func(id string) (*orchestrator.DesiredPlacement, *exit.Error)
 	// Shutdown is the cooperative-exit hook the shutdown route calls (#449).
-	Shutdown func()
+	Shutdown  func()
+	Workflows WorkflowController
 }
 
 // New builds the server and its route table. It binds nothing; Listeners does that.
@@ -125,7 +131,7 @@ func New(opt Options) *Server {
 		orchestrator: opt.Orchestrator, store: opt.Orchestrator.Store(),
 		layout: opt.Orchestrator.Layout(), cfg: opt.Cfg, creds: opt.Creds,
 		addr: opt.Addr, log: opt.Log, endpoints: opt.Endpoints, bound: opt.Bound,
-		rentals: opt.Rentals, shutdown: opt.Shutdown,
+		rentals: opt.Rentals, shutdown: opt.Shutdown, workflows: opt.Workflows,
 	}
 }
 
@@ -154,6 +160,9 @@ func (s *Server) Handler() (http.Handler, *exit.Error) {
 		"GET /v1/local/jobs":                          s.listJobs,
 		"GET /v1/local/jobs/{id}":                     s.getJob,
 		"POST /v1/local/jobs/{id}/cancel":             s.cancelJob,
+		"POST /v1/local/workflows":                    s.submitWorkflow,
+		"GET /v1/local/workflows/{id}":                s.getWorkflow,
+		"POST /v1/local/workflows/{id}/cancel":        s.cancelWorkflow,
 		"GET /healthz":                                s.healthz,
 		"GET /{$}":                                    s.stub,
 		"GET /app.js":                                 s.stub,

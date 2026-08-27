@@ -2,10 +2,12 @@ package main
 
 import (
 	"bytes"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"sync"
 	"testing"
@@ -13,6 +15,22 @@ import (
 	"github.com/cozy-creator/cozy-creator-v2/internal/canonical"
 	"github.com/cozy-creator/cozy-creator-v2/internal/secret"
 )
+
+type zeroReader int64
+
+func (r *zeroReader) Read(p []byte) (int, error) {
+	remaining := int64(*r)
+	if remaining == 0 {
+		return 0, io.EOF
+	}
+	n := len(p)
+	if int64(n) > remaining {
+		n = int(remaining)
+	}
+	clear(p[:n])
+	*r -= zeroReader(n)
+	return n, nil
+}
 
 func TestPlanUploadAcceptsOnlyTensorhubsExactCanonicalBytes(t *testing.T) {
 	base := t.TempDir()
@@ -228,5 +246,41 @@ func TestConcurrentUploadsShareOneQuotaDecision(t *testing.T) {
 	}
 	if _, err := os.Stat(filepath.Join(root, "inputs", ".blob.staging")); !os.IsNotExist(err) {
 		t.Fatalf("shared staging name remains: %v", err)
+	}
+}
+
+func TestLargeInputUploadIsStreamingBounded(t *testing.T) {
+	base := t.TempDir()
+	root := filepath.Join(base, "media")
+	if err := os.MkdirAll(filepath.Join(root, "inputs"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	tokens := filepath.Join(base, "tokens")
+	if err := os.WriteFile(tokens, []byte(secret.HashLine(secret.New("test-token"))+"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	s := &server{opt: options{root: root, tokens: tokens, quota: 128 << 20, maxBody: 128 << 20}}
+	if err := s.reloadTokens(); err != nil {
+		t.Fatal(err)
+	}
+	const size = int64(64 << 20)
+	reader := zeroReader(size)
+	request := httptest.NewRequest(http.MethodPut, "/v1/inputs/large", &reader)
+	request.ContentLength = size
+	request.Header.Set("Authorization", "Bearer test-token")
+	runtime.GC()
+	var before, after runtime.MemStats
+	runtime.ReadMemStats(&before)
+	response := httptest.NewRecorder()
+	s.routes().ServeHTTP(response, request)
+	runtime.ReadMemStats(&after)
+	if response.Code != http.StatusCreated {
+		t.Fatalf("large upload = %d %s", response.Code, response.Body.String())
+	}
+	if allocated := after.TotalAlloc - before.TotalAlloc; allocated > 8<<20 {
+		t.Fatalf("64 MiB streaming upload allocated %d B", allocated)
+	}
+	if info, err := os.Stat(filepath.Join(root, "inputs", "large")); err != nil || info.Size() != size {
+		t.Fatalf("large stored input = %#v %v", info, err)
 	}
 }

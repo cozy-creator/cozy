@@ -117,6 +117,17 @@ var Routes = []Route{
 		"request cancellation; a queued job leaves the queue, a running one gets its terminal",
 		"cl-004 `cozy job cancel`"},
 
+	// ---- Creator-owned ordered workflows. Children are ordinary /v1/requests rows. ----
+	{"POST", "/v1/local/workflows", Local, true, true, false, "Idempotency-Key",
+		"submit one canonical ordered workflow; 202 fresh or 200 replay",
+		"cl-018 `cozy workflow submit`, cl-024"},
+	{"GET", "/v1/local/workflows/{id}", Local, true, false, false, "",
+		"one workflow with child request states and accepted outputs projected from authority",
+		"cl-018 `cozy workflow status`, cl-024"},
+	{"POST", "/v1/local/workflows/{id}/cancel", Local, true, true, false, "",
+		"persist workflow cancellation, cancel the active child, and mint nothing later",
+		"cl-018 `cozy workflow cancel`"},
+
 	// ---- unauthenticated: liveness and the stub page ----
 	{"GET", "/healthz", Local, false, false, false, "",
 		"liveness only — it answers `up` and nothing about any request",
@@ -148,6 +159,7 @@ var Tokens = []string{
 	"api.local.triage",     // retained bundles by opaque attempt key
 	"api.local.jobs",       // the bounded job family: submit/list/status/cancel
 	"api.jobs.publication", // a job's landed writes are a durable publication root
+	"api.local.workflows",  // ordered ordinary children, Creator-owned recovery/cancellation
 	"api.stub.embedded",    // the go:embed stub page
 }
 

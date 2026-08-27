@@ -11,14 +11,15 @@
 #
 # The descriptor is written by the runtime the release ITSELF pins, inside the release's
 # own venv — never a host venv — so the archive is reproducible from this repo plus one
-# cozy-runtime commit.
+# cozy-runtime commit. The media extra is the exact first-party relay fixture's PNG decode path;
+# no Torch, CUDA, TensorFS, or model dependency enters.
 set -euo pipefail
 
 RUNTIME_REPO="${RUNTIME_REPO:-$HOME/cozy_v2/cozy-runtime}"
 # Runtime #7 is the exact first release whose `bindings --json` and
 # `serve --weightless-endpoint` share one canonical Plan/1 constructor. Creator consumes
 # those subjects and will not reconstruct the retired flat record.
-RUNTIME_SHA="${RUNTIME_SHA:-12013e93c19e19d6d43e022801aea2b3f19e46e9}"
+RUNTIME_SHA="${RUNTIME_SHA:-5617b4286ad26a75294a273b9a682fbe6d469f56}"
 OUT="${OUT:-$HOME/.cache/cozy/cl-013}"
 VERSION="${VERSION:-1.0.0}"
 ENDPOINT="${ENDPOINT:-cozy/weightless}"
@@ -62,7 +63,7 @@ cat > "$T/pyproject.toml" <<TOML
 name = "cozy-weightless-endpoint"
 version = "$VERSION"
 requires-python = ">=3.11"
-dependencies = ["cozy-runtime==$RUNTIME_VERSION"]
+dependencies = ["cozy-runtime[media]==$RUNTIME_VERSION"]
 
 [tool.uv.sources]
 cozy-runtime = { path = "vendor/$RUNTIME_WHEEL" }

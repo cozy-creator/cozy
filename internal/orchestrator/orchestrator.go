@@ -72,6 +72,9 @@ type Options struct {
 type Launcher interface {
 	ResolvePlacement(endpoint string) (DesiredPlacement, *exit.Error)
 	Resolve(endpoint string) (WorkerLaunchSpec, *exit.Error)
+	// ResolveInstall relaunches one exact immutable local install. Workflow recovery
+	// uses it so a changed active pin cannot change an already-accepted child.
+	ResolveInstall(installID string) (WorkerLaunchSpec, *exit.Error)
 	// ResolveJob is the JOB lane's half: `org/name` plus a job function to the spec that
 	// makes THAT job's worker resident. It is a separate method rather than a flag
 	// because the two produce different Directives and different worker slots — the
@@ -124,6 +127,10 @@ type Orchestrator struct {
 	// frames is the LOSSY live lane's fanout (stream.go). The durable lane is rows in
 	// the records authority; these two are the whole event surface cl-006 serves.
 	frames *fanout
+
+	// workflowWake is an observation-only nudge installed by Creator's local workflow
+	// engine. Durable rows remain authority; a missed wake is covered by reconciliation.
+	workflowWake func()
 }
 
 type wait struct {
@@ -220,6 +227,21 @@ func (c *Orchestrator) Events() []string {
 // Store is the lifecycle authority this orchestrator writes. cl-006's API reads requests,
 // attempts, outputs and durable events through it — the same rows, never a second copy.
 func (c *Orchestrator) Store() *records.Store { return c.opt.Store }
+
+func (c *Orchestrator) SetWorkflowWake(wake func()) {
+	c.mu.Lock()
+	c.workflowWake = wake
+	c.mu.Unlock()
+}
+
+func (c *Orchestrator) wakeWorkflows() {
+	c.mu.Lock()
+	wake := c.workflowWake
+	c.mu.Unlock()
+	if wake != nil {
+		wake()
+	}
+}
 
 // Layout is the local root this orchestrator grants into.
 func (c *Orchestrator) Layout() home.Layout { return c.opt.Layout }
@@ -488,22 +510,27 @@ func (c *Orchestrator) queueDepth() int {
 // CancelQueued settles a request that is WAITING and has no attempt to cancel. It leaves
 // the queue and is settled canceled — a client that asked for a cancel is owed an answer,
 // and "it will start later anyway" is not one.
-func (c *Orchestrator) CancelQueued(requestID string) {
-	c.forget(requestID)
-	if e := c.opt.Store.SettleRequest(requestID, "canceled"); e != nil {
-		c.logf("%s could not be settled canceled: %s", requestID, e.Message)
-		return
-	}
-	c.frames.forget(requestID)
-	c.emit(requestID, "request.canceled", 0, map[string]any{
+func (c *Orchestrator) CancelQueued(requestID string) *exit.Error {
+	payload := map[string]any{
 		"status": "CANCELED", "cause": "CLIENT_CANCELED",
 		"error_type": "CLIENT_CANCELED",
 		"error":      "canceled from the dispatch queue before any attempt was dispatched",
 		"outputs":    []any{}, "requeuing": false,
-	})
+	}
+	applied, e := c.opt.Store.CancelQueuedRequest(requestID, payload)
+	if e != nil {
+		return e
+	}
+	if !applied {
+		return nil
+	}
+	c.forget(requestID)
+	c.frames.forget(requestID)
 	c.logf("%s left the dispatch queue: canceled before any attempt", requestID)
 	c.waitRequest(requestID).markClosed(
 		exit.New(exit.Canceled, "%s was canceled before any attempt was dispatched", requestID))
+	c.wakeWorkflows()
+	return nil
 }
 
 func (c *Orchestrator) forget(requestID string) {

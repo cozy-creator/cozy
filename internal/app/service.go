@@ -15,11 +15,13 @@ import (
 	localapi "github.com/cozy-creator/cozy-creator-v2/internal/client"
 	"github.com/cozy-creator/cozy-creator-v2/internal/exit"
 	"github.com/cozy-creator/cozy-creator-v2/internal/home"
+	"github.com/cozy-creator/cozy-creator-v2/internal/launch"
 	"github.com/cozy-creator/cozy-creator-v2/internal/orchestrator"
 	"github.com/cozy-creator/cozy-creator-v2/internal/records"
 	"github.com/cozy-creator/cozy-creator-v2/internal/render"
 	"github.com/cozy-creator/cozy-creator-v2/internal/rental"
 	"github.com/cozy-creator/cozy-creator-v2/internal/service"
+	"github.com/cozy-creator/cozy-creator-v2/internal/workflow"
 )
 
 // `cozy up` / `cozy down`: the LocalService's own lifecycle (cl-001). The endpoint-process
@@ -102,6 +104,7 @@ func handleUp(ctx *Context) *exit.Error {
 	// non-secret attempt control (so a bad pin refuses before a request row), and the
 	// orchestrator resolves the dial triple at dial time. Only the second reads the token.
 	rentals := rental.Resolver(l, st)
+	knownRentals := rental.Known(st)
 
 	c, e := orchestrator.Open(orchestrator.Options{
 		Cfg: ctx.Cfg, Layout: l, Store: st, Yield: yield, Log: ctx.Out,
@@ -111,11 +114,36 @@ func handleUp(ctx *Context) *exit.Error {
 		closeListeners()
 		return e
 	}
+	flows, e := workflow.Open(workflow.Options{
+		Store: st, Owner: c, Resolver: resolver, Rentals: knownRentals, Layout: l, Log: ctx.Out,
+		RemoteEntrypoint: func(worker, name string) (*launch.Entrypoint, *exit.Error) {
+			descriptor, problem := rental.Descriptor(st, worker)
+			if problem != nil {
+				return nil, problem
+			}
+			return descriptor.Function(name)
+		},
+	})
+	if e != nil {
+		closeListeners()
+		return e
+	}
+	c.SetWorkflowWake(flows.Wake)
+	if e := flows.ReconcileCancellations(); e != nil {
+		closeListeners()
+		return e
+	}
 	killed, forgotten, e := c.Reconcile()
 	if e != nil {
 		closeListeners()
 		return e
 	}
+	if e := flows.Reconcile(); e != nil {
+		closeListeners()
+		return e
+	}
+	flows.Start()
+	defer flows.Close()
 
 	// Two per-launch credentials: one for the browser (handed over in the `--open` URL's
 	// FRAGMENT) and one for CLI clients (handed over through a 0600 file). Neither is
@@ -132,8 +160,9 @@ func handleUp(ctx *Context) *exit.Error {
 	stop := make(chan os.Signal, 1)
 	server := api.New(api.Options{
 		Orchestrator: c, Cfg: ctx.Cfg, Creds: creds, Addr: addr,
-		Log: ctx.Out, Endpoints: resolver, Bound: bound, Rentals: rental.Known(st),
-		Shutdown: func() { stop <- syscall.SIGTERM },
+		Log: ctx.Out, Endpoints: resolver, Bound: bound, Rentals: knownRentals,
+		Shutdown:  func() { stop <- syscall.SIGTERM },
+		Workflows: flows,
 	})
 	handler, e := server.Handler()
 	if e != nil {
@@ -161,8 +190,9 @@ func handleUp(ctx *Context) *exit.Error {
 	signal.Notify(stop, syscall.SIGINT, syscall.SIGTERM)
 	<-stop
 	fmt.Fprintln(ctx.Out, "draining endpoint processes…")
-	c.Close(orchestrator.StopGrace)
 	closeListeners()
+	flows.Close()
+	c.Close(orchestrator.StopGrace)
 	return nil
 }
 

@@ -58,6 +58,9 @@ type Submission struct {
 	// Worker pins this request to an ATTACHED remote worker (a rental id resolved
 	// through Options.Rentals). Empty = any local worker.
 	Worker string
+	// InstallID pins a workflow child to one immutable local install resolution.
+	// Empty retains the ordinary active-pin behavior; remote requests never set it.
+	InstallID string
 }
 
 // Result is what one closed attempt produced.
@@ -90,11 +93,26 @@ func (c *Orchestrator) Submit(s Submission) (string, uint64, *exit.Error) {
 // and "200, this key was already yours" to be different answers, and inferring it from
 // equal request ids is a race.
 func (c *Orchestrator) SubmitDetail(s Submission) (string, uint64, bool, *exit.Error) {
+	req, fresh, e := c.RecordSubmission(s)
+	if e != nil {
+		return "", 0, false, e
+	}
+	if !fresh {
+		return req.ID, uint64(req.Ordinal), false, nil
+	}
+	attempt, e := c.activateRecorded(req)
+	return req.ID, attempt, true, e
+}
+
+// RecordSubmission crosses only the durable request boundary. Workflow execution uses
+// it to link its child before scheduling can start a large transfer; ordinary callers use
+// SubmitDetail, which activates immediately afterward.
+func (c *Orchestrator) RecordSubmission(s Submission) (records.Request, bool, *exit.Error) {
 	bodyDigest := s.BodyDigest
 	if bodyDigest == "" {
 		spelled, err := canonical.Spell(canonical.Digest(s.Payload))
 		if err != nil {
-			return "", 0, false, exit.Internalf("cannot digest the request body: %s", err)
+			return records.Request{}, false, exit.Internalf("cannot digest the request body: %s", err)
 		}
 		bodyDigest = spelled
 	}
@@ -108,22 +126,44 @@ func (c *Orchestrator) SubmitDetail(s Submission) (string, uint64, bool, *exit.E
 		Outputs: strings.Join(s.Outputs, ","),
 		Assets:  s.Assets,
 		Kind:    s.Kind, Org: s.Org, Trees: strings.Join(s.Trees, ","),
-		Worker: s.Worker,
+		Worker: s.Worker, InstallID: s.InstallID,
 	})
 	if e != nil {
-		return "", 0, false, e
+		return records.Request{}, false, e
 	}
 	if !fresh {
 		// The recorded answer. A settled request is settled; a live one is already
 		// running the attempt this call would otherwise duplicate.
 		c.logf("request %s is the recorded answer for idempotency key %s (state %s, attempt %d)",
 			req.ID, s.IdemKey, req.State, req.Ordinal)
-		return req.ID, uint64(req.Ordinal), false, nil
+		return req, false, nil
 	}
 	c.emit(req.ID, "request.submitted", 0, map[string]any{
 		"endpoint": s.Endpoint, "function": s.Entrypoint,
 		"body_digest": bodyDigest, "plan_id": s.PlanID, "outputs": s.Outputs,
 	})
+	return req, true, nil
+}
+
+// ActivateRecorded schedules one already-durable request. It is idempotent: a settled or
+// already-dispatched row needs no second activation, and Dispatch's transaction is the
+// final race fence.
+func (c *Orchestrator) ActivateRecorded(requestID string) *exit.Error {
+	req, e := c.opt.Store.RequestRow(requestID)
+	if e != nil || req == nil {
+		if e != nil {
+			return e
+		}
+		return exit.New(exit.NotFound, "no recorded request %s to activate", requestID)
+	}
+	if req.State != "submitted" && req.State != "queued" {
+		return nil
+	}
+	_, e = c.activateRecorded(*req)
+	return e
+}
+
+func (c *Orchestrator) activateRecorded(req records.Request) (uint64, *exit.Error) {
 	// A SUBMISSION NEVER OVERTAKES WORK ALREADY WAITING. Dispatching straight from submit
 	// is what keeps a warm request fast, and it is exactly what breaks FIFO when a queue
 	// exists: a request arriving while six are parked would take the free slot the head of
@@ -139,7 +179,7 @@ func (c *Orchestrator) SubmitDetail(s Submission) (string, uint64, bool, *exit.E
 		c.logf("%s QUEUED behind %d waiting request(s)", req.ID, c.QueuePosition(req.ID)-1)
 		c.selectOrStart(req)
 		go c.drain()
-		return req.ID, 0, true, nil
+		return 0, nil
 	}
 	attempt, e := c.dispatch(req)
 	if e != nil {
@@ -150,22 +190,22 @@ func (c *Orchestrator) SubmitDetail(s Submission) (string, uint64, bool, *exit.E
 		// attempt) is a real conflict and still refuses.
 		if e.Code != exit.Unavailable {
 			c.failQueued(req.ID, e)
-			return req.ID, 0, true, e
+			return 0, e
 		}
 		c.enqueue(req.ID)
 		c.emit(req.ID, "request.queued", 0, map[string]any{"reason": e.Message})
 		c.logf("%s QUEUED for capacity: %s", req.ID, e.Message)
 		c.selectOrStart(req)
-		return req.ID, 0, true, nil
+		return 0, nil
 	}
-	return req.ID, attempt, true, nil
+	return attempt, nil
 }
 
 // Requeue is the orchestrator's PROJECTION over a neutral terminal: an ABANDONED attempt
 // or an infra-class failure earns a NEW ordinal, a fresh grant and a fresh execution —
 // never a patch to the one that died. It is charged against the request's durable budget.
 func (c *Orchestrator) Requeue(requestID, why string) {
-	n, started, e := c.opt.Store.BeginRequeue(requestID, MaxRequeues)
+	n, started, canceled, e := c.opt.Store.BeginRequeue(requestID, MaxRequeues)
 	if e != nil {
 		// THE REQUEST ENDS HERE, and it has to SAY so. Settling the row without emitting a
 		// terminal event left a client watching the durable stream with `attempt_failed
@@ -185,6 +225,17 @@ func (c *Orchestrator) Requeue(requestID, why string) {
 		if row, read := c.opt.Store.RequestRow(requestID); read == nil && row != nil {
 			go c.cleanupRequestAssets(*row)
 		}
+		return
+	}
+	if canceled {
+		c.forget(requestID)
+		c.frames.forget(requestID)
+		c.waitRequest(requestID).markClosed(
+			exit.New(exit.Canceled, "%s was canceled before its requeue", requestID))
+		if row, read := c.opt.Store.RequestRow(requestID); read == nil && row != nil {
+			go c.cleanupRequestAssets(*row)
+		}
+		c.wakeWorkflows()
 		return
 	}
 	if !started {
@@ -242,6 +293,9 @@ func (c *Orchestrator) selectOrStart(req records.Request) {
 	// bare one would decide no worker was resident and attach a second control stream to
 	// the pod on every request.
 	slot := pinnedEndpoint(req.Endpoint, req.Worker)
+	if req.InstallID != "" {
+		slot += "/install/" + req.InstallID
+	}
 	if req.IsJob() {
 		slot += "/job/" + req.Entrypoint
 	}
@@ -254,6 +308,9 @@ func (c *Orchestrator) selectOrStart(req records.Request) {
 	for _, w := range c.workers {
 		if w.exited || w.spec.Placement.Endpoint != pinnedEndpoint(req.Endpoint, req.Worker) ||
 			w.spec.IsJob() != req.IsJob() {
+			continue
+		}
+		if req.InstallID != "" && w.spec.Placement.InstallID != req.InstallID {
 			continue
 		}
 		if !req.IsJob() || w.spec.Placement.Jobs[0].Function == req.Entrypoint {
@@ -360,6 +417,24 @@ func settledState(state string) bool {
 // asks this machine's install to recreate remote meaning.
 func (c *Orchestrator) resolveFor(req records.Request) (WorkerLaunchSpec, *exit.Error) {
 	if req.Worker == "" {
+		if req.InstallID != "" {
+			if req.IsJob() {
+				return WorkerLaunchSpec{}, exit.Named(exit.Structural,
+					"workflow_job_install_unsupported",
+					"an exact workflow install may dispatch serving children only")
+			}
+			spec, e := c.opt.Endpoints.ResolveInstall(req.InstallID)
+			if e != nil {
+				return WorkerLaunchSpec{}, e
+			}
+			if spec.Placement.Endpoint != req.Endpoint {
+				return WorkerLaunchSpec{}, exit.Named(exit.Conflict,
+					"workflow_install_endpoint_mismatch",
+					"install %s serves %s, not request endpoint %s",
+					req.InstallID, spec.Placement.Endpoint, req.Endpoint)
+			}
+			return spec, nil
+		}
 		spec, e := c.opt.Endpoints.Resolve(req.Endpoint)
 		if req.IsJob() {
 			spec, e = c.opt.Endpoints.ResolveJob(req.Endpoint, req.Entrypoint)
@@ -393,6 +468,7 @@ func (c *Orchestrator) resolveFor(req records.Request) (WorkerLaunchSpec, *exit.
 // no offer crossed to a worker, so there is no worker terminal to replay and the request
 // row is what settles. A closed dispatch_aborted row may remain as preparation history.
 func (c *Orchestrator) failQueued(requestID string, cause *exit.Error) {
+	defer c.wakeWorkflows()
 	c.forget(requestID)
 	// A REQUEST THAT ALREADY SETTLED IS NOT FAILED BY A LATER OBSERVATION. The launch
 	// goroutine that made this request's worker resident OUTLIVES the request: a job
@@ -588,7 +664,11 @@ func (c *Orchestrator) rollbackGrant(req records.Request, attempt uint64, w *wor
 func (c *Orchestrator) maxOutputBytes() uint64 {
 	maxBytes := c.opt.MaxOutputMiB
 	if maxBytes <= 0 {
-		maxBytes = 64
+		// The fixed H3 launch cell and its eight-shot assembler are legitimate large
+		// video producers. 64 MiB was a private Creator ceiling, not a release fact.
+		// 512 MiB matches the current Runtime/endpoint media object envelope while the
+		// attempt and pod quotas still bound the aggregate.
+		maxBytes = 512
 	}
 	return uint64(maxBytes) << 20
 }
@@ -668,6 +748,9 @@ func (c *Orchestrator) pick(req records.Request) (*worker, *session, uint64, *di
 	defer c.mu.Unlock()
 	for _, w := range c.workers {
 		if w.exited || w.spec.Placement.Endpoint != slot {
+			continue
+		}
+		if req.InstallID != "" && w.spec.Placement.InstallID != req.InstallID {
 			continue
 		}
 		sess := c.sessions[w.bootID]
@@ -813,14 +896,6 @@ func localGrantSupport(goos string) *exit.Error {
 // journaled and before `StartAttempt` is sent, so a pod that cannot be fed refuses the
 // dispatch rather than accepting an attempt whose inputs are unreachable.
 func (c *Orchestrator) remoteGrant(req records.Request, attempt uint64, w *worker) (*pb.DeliveryGrant, *exit.Error) {
-	assets := make([][]byte, len(req.Assets))
-	for i, asset := range req.Assets {
-		data, e := inputasset.Read(asset, inputasset.MaxBytes)
-		if e != nil {
-			return nil, e
-		}
-		assets[i] = data
-	}
 	slot := media.Slot(req.ID, attempt)
 	outputIDs := splitList(req.Outputs)
 	perOutput := c.maxOutputBytes()
@@ -851,7 +926,8 @@ func (c *Orchestrator) remoteGrant(req records.Request, attempt uint64, w *worke
 		Inputs:        []*pb.InputAccess{{InputId: "payload", Url: "file://" + path}},
 	}
 	for index, asset := range req.Assets {
-		path, e := w.media.PutInput(slot+"-input-"+strconv.Itoa(index), assets[index])
+		path, e := w.media.PutInputFile(slot+"-input-"+strconv.Itoa(index),
+			asset.LocalPath, asset.Digest, asset.Length)
 		if e != nil {
 			return nil, e
 		}
@@ -896,7 +972,11 @@ func (c *Orchestrator) grant(requestID string, attempt uint64, req records.Reque
 		Inputs: []*pb.InputAccess{{InputId: "payload", Url: "file://" + payloadPath}},
 	}
 	for _, asset := range req.Assets {
-		if _, e := inputasset.Read(asset, inputasset.MaxBytes); e != nil {
+		limit := asset.MaxBytes
+		if limit <= 0 {
+			limit = asset.Length
+		}
+		if e := inputasset.Verify(asset, limit); e != nil {
 			return nil, e
 		}
 		g.Inputs = append(g.Inputs, &pb.InputAccess{
@@ -1022,7 +1102,10 @@ func (c *Orchestrator) Cancel(requestID string, attempt uint64, reason pb.Cancel
 	}
 	cancel.RecordOwnerEpoch, cancel.ControlStreamGeneration, cancel.WorkerBootId =
 		recordOwnerEpoch, sess.generation, sess.bootID
-	sess.send(&pb.RecordOwnerFrame{Msg: &pb.RecordOwnerFrame_CancelAttempt{CancelAttempt: cancel}})
+	if !sess.trySend(&pb.RecordOwnerFrame{Msg: &pb.RecordOwnerFrame_CancelAttempt{CancelAttempt: cancel}}) {
+		return exit.Unavailablef("the control stream for %s#%d cannot accept cancellation now",
+			requestID, attempt)
+	}
 	c.logf("CancelAttempt %s#%d reason=%s", requestID, attempt,
 		pb.CancelReason_name[int32(reason)])
 	return nil

@@ -3,9 +3,9 @@
 `gpu` DERIVES from the signature (cozy-runtime `_describe.py`): a handler with no `Model`
 parameter is a CPU handler, so the orchestrator grants it no device and this endpoint runs
 on any machine — including a Windows runner, which is the whole point of the launch tier's
-Windows slice. Its release depends on the BASE `cozy-runtime` wheel only (msgspec,
-protobuf, grpcio — no torch, no tensorfs), so a clean machine can install it over a
-residential line in seconds.
+Windows slice. Its release depends on `cozy-runtime[media]` only (msgspec, protobuf,
+grpcio and the exact PyAV wheel — no torch, CUDA or tensorfs), so a clean machine can
+install it over a residential line in seconds. PyAV exists solely for the `relay` fixture.
 
 What an invoke of `tile` exercises is everything except the model: the install generation's
 own venv, `describe --check`'s derived surface, the supervisor, the executor, the worker
@@ -20,16 +20,19 @@ explicitly not a model or video-generation fixture.
 from __future__ import annotations
 
 import hashlib
+import time
 from typing import Annotated
 
 import msgspec
 
 from cozy_runtime.author import (
     App,
+    AssetBound,
     Context,
     ImageAsset,
     ImageFrame,
     InvalidRequest,
+    MediaDecoder,
     Outputs,
     Telemetry,
     VideoAsset,
@@ -64,6 +67,15 @@ class VideoTransportOutput(msgspec.Struct):
     video: VideoAsset
 
 
+class RelayInput(msgspec.Struct, forbid_unknown_fields=True):
+    image: Annotated[ImageAsset, AssetBound(max_bytes=8 << 20, max_decoded_bytes=16 << 20)]
+    delay_ms: Annotated[int, msgspec.Meta(ge=0, le=5_000)] = 0
+
+
+class RelayOutput(msgspec.Struct):
+    image: ImageAsset
+
+
 @app.entrypoint
 def tile(ctx: Context, payload: TileInput, out: Outputs, tel: Telemetry) -> TileOutput:
     """A deterministic RGB tile from a linear congruential sequence — real computation
@@ -93,6 +105,21 @@ def refuse(payload: RefuseInput) -> TileOutput:
     """The FAILED terminal on the same weightless path, so the fixture observes both
     verdicts of the terminal transaction rather than only the happy one."""
     raise InvalidRequest(payload.why)
+
+
+@app.entrypoint
+def relay(
+    payload: RelayInput, ctx: Context, decoder: MediaDecoder, out: Outputs
+) -> RelayOutput:
+    """CPU-only exact workflow handoff: decode the prior accepted PNG and save it again."""
+    remaining = payload.delay_ms
+    while remaining > 0:
+        ctx.raise_if_cancelled()
+        step = min(remaining, 25)
+        time.sleep(step / 1_000)
+        remaining -= step
+    image = decoder.decode_image(payload.image)
+    return RelayOutput(image=out.save_image(ImageFrame(image.width, image.height, image.rgb)))
 
 
 @app.entrypoint

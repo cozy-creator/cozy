@@ -105,8 +105,9 @@ func (s *liveService) alive() bool {
 	return res.StatusCode == http.StatusOK
 }
 
-// kill9 is the RECORD-OWNER-KILL arm's own instrument: SIGKILL to the whole process
-// group, so nothing runs a shutdown path. What survives is what was durable.
+// kill9 is the RECORD-OWNER-KILL arm's own instrument: SIGKILL to the owner's process
+// group, so no owner shutdown path runs. Endpoint workers have separate process groups;
+// restart must recognize and kill those exact orphans before replaying their journals.
 func (s *liveService) kill9() {
 	_ = killGroup(s.cmd.Process.Pid, syscall.SIGKILL)
 	deadline := time.Now().Add(10 * time.Second)

@@ -96,7 +96,8 @@ CREATE TABLE IF NOT EXISTS pins (
   generation   TEXT    NOT NULL REFERENCES install_generations(id),
   activated_at TEXT    NOT NULL,
   PRIMARY KEY (endpoint, major)
-)`}, append(orchestratorSchema, append(eventSchema, rentalSchema...)...)...)
+)`}, append(orchestratorSchema,
+	append(eventSchema, append(rentalSchema, workflowSchema...)...)...)...)
 
 // pragmas ride the DSN rather than being executed after the open, because a pragma is a
 // property of a CONNECTION and database/sql may discard and redial one at any moment: a
@@ -304,6 +305,7 @@ func (s *Store) Installed() ([]EndpointInstall, *exit.Error) {
 func (s *Store) Unreferenced() ([]EndpointInstall, *exit.Error) {
 	rows, err := s.db.Query(`SELECT ` + genCols("g.") + `
 		FROM install_generations g WHERE g.id NOT IN (SELECT generation FROM pins)
+		AND g.id NOT IN (SELECT install_id FROM workflow_steps WHERE install_id IS NOT NULL)
 		ORDER BY g.created_at`)
 	if err != nil {
 		return nil, exit.Internalf("cannot list unreferenced generations: %s", err)
@@ -367,12 +369,16 @@ func (s *Store) Unpin(endpoint string, major int) *exit.Error {
 	return nil
 }
 
-// Forget drops an unreferenced generation row. The foreign key refuses while a pin
-// still points at it, so a live install can never be forgotten by accident.
-func (s *Store) Forget(id string) *exit.Error {
-	if _, err := s.db.Exec(`DELETE FROM install_generations WHERE id=?`, id); err != nil {
-		return exit.New(exit.Conflict, "cannot forget generation %s: %s", id, err).
-			WithRemedy("a pin still references it — `cozy rm` the install first")
+// ForgetIfUnreferenced atomically claims one generation for GC. The row goes before
+// filesystem deletion; a newly pinned workflow therefore wins through its foreign key,
+// and a filesystem failure leaves an ordinary orphan the next GC can retry.
+func (s *Store) ForgetIfUnreferenced(id string) (bool, *exit.Error) {
+	result, err := s.db.Exec(`DELETE FROM install_generations WHERE id=?
+		AND NOT EXISTS (SELECT 1 FROM pins WHERE generation=?)
+		AND NOT EXISTS (SELECT 1 FROM workflow_steps WHERE install_id=?)`, id, id, id)
+	if err != nil {
+		return false, exit.New(exit.Conflict, "cannot claim generation %s for gc: %s", id, err)
 	}
-	return nil
+	n, _ := result.RowsAffected()
+	return n == 1, nil
 }

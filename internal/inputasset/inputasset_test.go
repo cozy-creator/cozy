@@ -2,6 +2,7 @@ package inputasset
 
 import (
 	"os"
+	"runtime"
 	"strings"
 	"testing"
 
@@ -43,5 +44,39 @@ func TestSweepKeepsOwnedObjectsAndDropsCrashOrphans(t *testing.T) {
 		if _, err := os.Stat(path); !os.IsNotExist(err) {
 			t.Fatalf("orphan %s remains: %v", path, err)
 		}
+	}
+}
+
+func TestLargeStageUsesBoundedMemory(t *testing.T) {
+	layout, problem := home.Open(t.TempDir())
+	if problem != nil {
+		t.Fatal(problem)
+	}
+	source := layout.Root + "/large.mp4"
+	file, err := os.Create(source)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := file.Truncate(64 << 20); err != nil {
+		t.Fatal(err)
+	}
+	_ = file.Close()
+	runtime.GC()
+	var before, after runtime.MemStats
+	runtime.ReadMemStats(&before)
+	staged, problem := Stage(layout, records.AssetBinding{FieldPath: "video", LocalPath: source},
+		128<<20)
+	runtime.ReadMemStats(&after)
+	if problem != nil {
+		t.Fatal(problem)
+	}
+	if staged.Length != 64<<20 || staged.LocalPath != layout.InputAsset(staged.Digest) {
+		t.Fatalf("staged=%#v", staged)
+	}
+	if allocated := after.TotalAlloc - before.TotalAlloc; allocated > 8<<20 {
+		t.Fatalf("64 MiB stage allocated %d B", allocated)
+	}
+	if problem := Verify(staged, 128<<20); problem != nil {
+		t.Fatal(problem)
 	}
 }

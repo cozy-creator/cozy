@@ -79,18 +79,23 @@ func Plan(l home.Layout, st *records.Store) ([]Reclaimable, *exit.Error) {
 	return out, nil
 }
 
-// Collect executes the plan: directories go, then the rows. A pinned generation's
-// foreign key refuses the row delete, so an active install can never be collected.
+// Collect executes the plan. A recorded generation is atomically claimed in SQLite
+// before its directory goes; a pin/workflow created after Plan therefore wins without
+// losing bytes. A filesystem failure leaves an orphan directory the next GC can retry.
 func Collect(l home.Layout, st *records.Store, plan []Reclaimable) (int64, *exit.Error) {
 	var freed int64
 	for _, r := range plan {
-		if err := os.RemoveAll(filepath.Join(l.Generations, r.ID)); err != nil {
-			return freed, exit.Internalf("cannot remove generation directory %s: %s", r.ID, err)
-		}
 		if r.Kind == "generation" {
-			if e := st.Forget(r.ID); e != nil {
+			claimed, e := st.ForgetIfUnreferenced(r.ID)
+			if e != nil {
 				return freed, e
 			}
+			if !claimed {
+				continue // the read-only plan went stale; a new pin/workflow owns it
+			}
+		}
+		if err := os.RemoveAll(filepath.Join(l.Generations, r.ID)); err != nil {
+			return freed, exit.Internalf("cannot remove generation directory %s: %s", r.ID, err)
 		}
 		freed += r.Bytes
 	}

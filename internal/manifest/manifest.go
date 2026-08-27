@@ -49,7 +49,7 @@ type Command struct {
 func (c *Command) Name() string { return strings.Join(c.Path, " ") }
 
 // Groups is the display order of command groups.
-var Groups = []string{"meta", "service", "endpoints", "invocation", "jobs", "rentals", "catalog", "transfer", "account"}
+var Groups = []string{"meta", "service", "endpoints", "invocation", "workflows", "jobs", "rentals", "catalog", "transfer", "account"}
 
 // GlobalFlags apply to every command.
 var GlobalFlags = []Flag{

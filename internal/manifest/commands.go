@@ -255,6 +255,38 @@ var Commands = []Command{
 		Capability: "cmd.fit", Status: Implemented, Handler: "fit",
 	},
 
+	// ---- durable workflows (cl-018) ----
+	{
+		Path: []string{"workflow", "submit"}, Group: "workflows",
+		Summary: "submit one canonical ordered workflow of ordinary endpoint requests",
+		MaxArgs: 0,
+		Flags: []Flag{
+			{Name: "--in", Arg: "<file>", Summary: "canonical cozy.workflow.Plan/1 JSON"},
+			{Name: "--worker", Arg: "<step>=<rental-id>", Summary: "run one step on an attached exact rental (repeatable)"},
+			{Name: "--idempotency-key", Arg: "<key>", Summary: "name this workflow forever; a repeat answers the same one"},
+		},
+		Exits: []exit.Code{exit.OK, exit.Usage, exit.Validation, exit.NotFound,
+			exit.Unavailable, exit.Conflict},
+		Capability: "cmd.workflow.submit", NeedsServer: true, Status: Implemented,
+		Handler: "workflow.submit",
+	},
+	{
+		Path: []string{"workflow", "status"}, Group: "workflows",
+		Summary: "workflow state projected from its ordinary child requests and outputs",
+		Args:    "<workflow-id>", MinArgs: 1, MaxArgs: 1,
+		Exits:      []exit.Code{exit.OK, exit.NotFound, exit.Unavailable},
+		Capability: "cmd.workflow.status", NeedsServer: true, Status: Implemented,
+		Handler: "workflow.status",
+	},
+	{
+		Path: []string{"workflow", "cancel"}, Group: "workflows",
+		Summary: "persist cancellation, cancel the active child, and prevent later children",
+		Args:    "<workflow-id>", MinArgs: 1, MaxArgs: 1,
+		Exits:      []exit.Code{exit.OK, exit.NotFound, exit.Unavailable},
+		Capability: "cmd.workflow.cancel", NeedsServer: true, Status: Implemented,
+		Handler: "workflow.cancel",
+	},
+
 	// ---- jobs (cl-004) ----
 	{
 		Path: []string{"job", "submit"}, Group: "jobs",

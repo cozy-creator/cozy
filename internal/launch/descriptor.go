@@ -83,9 +83,18 @@ type Struct struct {
 // (`int`, `str`) and an object for an asset (`{"asset":"image"}`), a list
 // (`{"list":"float"}`) or a nested struct (`{"struct":…,"fields":[…]}`).
 type Field struct {
-	Name string          `json:"name"`
-	Type json.RawMessage `json:"type"`
-	Wire string          `json:"wire"`
+	Name        string          `json:"name"`
+	Type        json.RawMessage `json:"type"`
+	Wire        string          `json:"wire"`
+	Constraints struct {
+		MinLength *int64   `json:"min_length"`
+		MaxLength *int64   `json:"max_length"`
+		GE        *float64 `json:"ge"`
+		LE        *float64 `json:"le"`
+	} `json:"constraints"`
+	AssetBound struct {
+		MaxBytes int64 `json:"max_bytes"`
+	} `json:"asset_bound"`
 }
 
 // ReadDescriptor reads the committed descriptor out of a generation's source tree and

@@ -70,7 +70,7 @@ func main() {
 	if len(args) == 0 {
 		fmt.Fprintln(os.Stderr, "usage: cozy-live "+
 			"<canonical|attempt|recovered|arms|api|apiarms|apicrash|verbs|journey|rent|planids|"+
-			"pipeline|m4arms|dropack|jobarms|jobs|jobcrash|fakeworker> [--flag value]")
+			"pipeline|m4arms|dropack|jobarms|jobs|jobcrash|workflows|workflowcrash|fakeworker> [--flag value]")
 		os.Exit(2)
 	}
 	section := args[0]
@@ -125,6 +125,10 @@ func main() {
 		sectionJobs()
 	case "jobcrash":
 		sectionJobCrash()
+	case "workflows":
+		sectionWorkflows()
+	case "workflowcrash":
+		sectionWorkflowCrash()
 	default:
 		fmt.Fprintf(os.Stderr, "cozy-live: unknown section %q\n", section)
 		os.Exit(2)

@@ -55,6 +55,20 @@ func (s *session) send(m *pb.RecordOwnerFrame) (sent bool) {
 	return true
 }
 
+func (s *session) trySend(m *pb.RecordOwnerFrame) (sent bool) {
+	defer func() {
+		if recover() != nil {
+			sent = false
+		}
+	}()
+	select {
+	case s.out <- m:
+		return true
+	default:
+		return false
+	}
+}
+
 // schemaDigest is THE FENCE (#530-A1), as the 32 raw bytes the wire carries. It is derived
 // from the schema this binary was generated against — `wire_identity.go`'s SchemaDigest —
 // so a stale vendored copy cannot spell it without BEING the schema it names. WIRE_MINOR
@@ -362,6 +376,7 @@ func (c *Orchestrator) onClaimAck(w *worker, s *session, ack *pb.ClaimAck) {
 	c.sessions[ack.WorkerBootId] = s
 	w.bootID = ack.WorkerBootId
 	c.mu.Unlock()
+	c.wakeWorkflows()
 }
 
 // instancePin is the IDENTITY FENCE on a claim, and #505's carried-not-verified gap in its

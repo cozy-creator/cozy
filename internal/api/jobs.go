@@ -500,6 +500,10 @@ func (s *Server) cancelJob(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
+	if status := contractStatus(row.State); status == "completed" || status == "failed" || status == "canceled" {
+		s.ok(w, r, http.StatusOK, s.jobStateOf(row))
+		return
+	}
 	attempts, e := s.store.Attempts(row.ID)
 	if e != nil {
 		s.refuseTyped(w, r, e)
@@ -508,13 +512,32 @@ func (s *Server) cancelJob(w http.ResponseWriter, r *http.Request) {
 	if len(attempts) == 0 {
 		// A QUEUED job has nothing running, and cancelling it is still a real act: it
 		// leaves the queue and settles, so a client that asked never has to wonder.
-		s.orchestrator.CancelQueued(row.ID)
+		if e := s.orchestrator.CancelQueued(row.ID); e != nil {
+			s.refuseTyped(w, r, e)
+			return
+		}
 		s.ok(w, r, http.StatusOK, s.jobStateOf(row))
 		return
 	}
 	last := attempts[len(attempts)-1]
-	if last.State == "terminal" || last.State == "closed" {
-		s.ok(w, r, http.StatusOK, s.jobStateOf(row))
+	if last.State == "closed" || last.State == "dispatch_aborted" {
+		if e := s.orchestrator.CancelQueued(row.ID); e != nil {
+			s.refuseTyped(w, r, e)
+			return
+		}
+		updated, e := s.store.RequestRow(row.ID)
+		if e != nil || updated == nil {
+			s.refuse(w, r, http.StatusInternalServerError, "internal",
+				"the queued job was canceled and cannot be read back", "")
+			return
+		}
+		s.ok(w, r, http.StatusOK, s.jobStateOf(*updated))
+		return
+	}
+	if last.State == "terminal" {
+		s.refuse(w, r, http.StatusConflict, "terminal_ack_pending",
+			"the current job attempt has a terminal whose retry/settlement projection is not acknowledged yet",
+			"retry cancellation after the terminal ack")
 		return
 	}
 	grace := uint64(5000)

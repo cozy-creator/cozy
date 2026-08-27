@@ -253,6 +253,9 @@ none of these.
 | `GET /v1/local/jobs` | local | yes | jobs newest-first with per-state counts; `?status=`, `?endpoint=` |
 | `GET /v1/local/jobs/{id}` | local | yes | one job: state, queue position, retry budget, publication, checkpoints, bill where a rate exists |
 | `POST /v1/local/jobs/{id}/cancel` | local | yes | request cancellation; a queued job leaves the queue, a running one gets its terminal |
+| `POST /v1/local/workflows` | local | yes | submit one canonical ordered workflow; `Idempotency-Key`; 202 fresh or 200 replay |
+| `GET /v1/local/workflows/{id}` | local | yes | one workflow with ordinary child request states and accepted outputs projected from the records authority |
+| `POST /v1/local/workflows/{id}/cancel` | local | yes | persist cancellation, cancel the active child, and prevent every later child |
 | `GET /healthz` | local | no | liveness ONLY; says nothing about any request |
 | `GET /{$}` | local | no | the embedded stub page |
 | `GET /app.js` | local | no | the stub's script — a FILE, so no inline-script CSP |
@@ -294,6 +297,26 @@ Two answers a job carries that a request does not:
 record owner's durable-attempt facts. Several jobs submitted at once queue against one
 worker and drain in submission order, while the retry projection over neutral outcomes
 spends a durable budget that the settlement names when it is exhausted.
+
+### The workflow family is LOCAL and ordered (cl-018)
+
+A workflow is one immutable maximum-16 ordered plan over ordinary serving requests. Only backward
+output bindings exist, so a cycle is unrepresentable. Creator persists exact materialization before
+submitting each child, derives its ordinary idempotency key from workflow/ordinal/release/action/
+materialized identity, and mints at most one current child. Request attempts, retries, terminals,
+outputs, media and cancellation remain the existing request authority; the workflow status document
+projects those rows and copies none of their lifecycle state.
+
+There is no workflow SSE route, list route, retry verb, cursor, resume verb, endpoint callback,
+YAML parser or timeline object. Re-submitting the same idempotency key is recovery, status is a
+polling read, and cancellation persists before it touches the active ordinary child.
+
+`POST /v1/local/workflows` carries `{plan, assets?, targets?}`. `assets` contains staged
+digest/length/type resolutions and therefore requires the OS-protected CLI credential; no path is
+accepted. `targets` maps a one-based step to an attached rental id. Targets and local install ids
+are resolution only and do not enter workflow/child execution meaning. The frozen workflow status
+set is `running | canceling | succeeded | failed | canceled`; ordinary child rows are projected as
+`queued | in_progress | completed | failed | canceled` plus workflow-only `pending | prepared`.
 
 ## 8. Local host security posture
 

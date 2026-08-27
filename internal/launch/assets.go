@@ -30,7 +30,6 @@ func ParseAssets(ep *Entrypoint, payload json.RawMessage, specs []string) (json.
 
 	seen := map[string]bool{}
 	assets := make([]records.AssetBinding, 0, len(specs))
-	var total int64
 	for _, spec := range specs {
 		fieldPath, source, ok := strings.Cut(spec, "=")
 		fieldPath, source = strings.TrimSpace(fieldPath), strings.TrimSpace(source)
@@ -55,27 +54,25 @@ func ParseAssets(ep *Entrypoint, payload json.RawMessage, specs []string) (json.
 				"%s.%s is not an asset field in this release's request schema", ep.Name, fieldPath).
 				WithRemedy("`cozy describe <org/endpoint>/%s` prints the recorded request schema", ep.Name)
 		}
+		_, maxBytes, _ := AssetKind(ep, fieldPath)
+		if maxBytes <= 0 {
+			maxBytes = inputasset.MaxBytes
+		}
 
 		absolute, err := filepath.Abs(source)
 		if err != nil {
 			return nil, nil, exit.New(exit.NotFound, "cannot resolve input asset %s: %s", source, err)
 		}
-		data, digest, mediaType, e := inputasset.Inspect(absolute, inputasset.MaxBytes)
+		length, digest, mediaType, e := inputasset.Fingerprint(absolute, maxBytes)
 		if e != nil {
 			return nil, nil, e
-		}
-		total += int64(len(data))
-		if total > inputasset.MaxTotalBytes {
-			return nil, nil, exit.Named(exit.Validation, "inputs_over_total_cap",
-				"this request's input assets declare %d B and this deployment admits %d B per attempt",
-				total, inputasset.MaxTotalBytes)
 		}
 		if e := setAssetRef(document, parts, digest); e != nil {
 			return nil, nil, e
 		}
 		assets = append(assets, records.AssetBinding{
 			FieldPath: fieldPath, LocalPath: absolute, Digest: digest,
-			Length: int64(len(data)), MediaType: mediaType, Order: pathOrder(parts),
+			Length: length, MediaType: mediaType, Order: pathOrder(parts), MaxBytes: maxBytes,
 		})
 	}
 	sort.Slice(assets, func(i, j int) bool { return assets[i].FieldPath < assets[j].FieldPath })
@@ -111,55 +108,89 @@ func assetPath(path string) ([]string, *exit.Error) {
 }
 
 func assetAt(root Struct, parts []string) bool {
-	if len(parts) == 0 {
-		return false
-	}
-	for _, field := range root.Fields {
-		if field.Name == parts[0] {
-			var schema any
-			return json.Unmarshal(field.Type, &schema) == nil && assetAtValue(schema, parts[1:])
-		}
-	}
-	return false
+	_, _, ok := assetKindAt(root, parts, 0)
+	return ok
 }
 
-func assetAtValue(schema any, parts []string) bool {
+// AssetKind returns the exact asset kind and compressed-byte bound at one request path.
+func AssetKind(ep *Entrypoint, path string) (string, int64, bool) {
+	parts, problem := assetPath(path)
+	if problem != nil {
+		return "", 0, false
+	}
+	return assetKindAt(ep.Request, parts, 0)
+}
+
+func assetKindAt(root Struct, parts []string, inherited int64) (string, int64, bool) {
+	if len(parts) == 0 {
+		return "", 0, false
+	}
+	for _, field := range root.Fields {
+		if field.Name != parts[0] {
+			continue
+		}
+		bound := inherited
+		if field.AssetBound.MaxBytes > 0 {
+			bound = field.AssetBound.MaxBytes
+		}
+		var schema any
+		if json.Unmarshal(field.Type, &schema) != nil {
+			return "", 0, false
+		}
+		return assetKindAtValue(schema, parts[1:], bound)
+	}
+	return "", 0, false
+}
+
+func assetKindAtValue(schema any, parts []string, bound int64) (string, int64, bool) {
 	object, ok := schema.(map[string]any)
 	if !ok {
-		return false
+		return "", 0, false
 	}
-	if _, ok := object["asset"].(string); ok {
-		return len(parts) == 0
+	if kind, ok := object["asset"].(string); ok {
+		return kind, bound, len(parts) == 0
 	}
 	if union, ok := object["union"].([]any); ok {
 		for _, branch := range union {
-			if assetAtValue(branch, parts) {
-				return true
+			if kind, limit, ok := assetKindAtValue(branch, parts, bound); ok {
+				return kind, limit, true
 			}
 		}
-		return false
+		return "", 0, false
 	}
 	if item, ok := object["list"]; ok {
 		if len(parts) == 0 {
-			return false
+			return "", 0, false
 		}
 		if _, err := strconv.ParseUint(parts[0], 10, 31); err != nil {
-			return false
+			return "", 0, false
 		}
-		return assetAtValue(item, parts[1:])
+		return assetKindAtValue(item, parts[1:], bound)
 	}
 	fields, ok := object["fields"].([]any)
 	if !ok || len(parts) == 0 {
-		return false
+		return "", 0, false
 	}
 	for _, row := range fields {
-		field, ok := row.(map[string]any)
-		if !ok || field["name"] != parts[0] {
+		encoded, err := json.Marshal(row)
+		if err != nil {
 			continue
 		}
-		return assetAtValue(field["type"], parts[1:])
+		var field Field
+		if json.Unmarshal(encoded, &field) != nil || field.Name != parts[0] {
+			continue
+		}
+		nextBound := bound
+		if field.AssetBound.MaxBytes > 0 {
+			nextBound = field.AssetBound.MaxBytes
+		}
+		var nested any
+		if json.Unmarshal(field.Type, &nested) != nil {
+			return "", 0, false
+		}
+		return assetKindAtValue(nested, parts[1:], nextBound)
 	}
-	return false
+	return "", 0, false
 }
 
 func setAssetRef(document map[string]any, parts []string, ref string) *exit.Error {

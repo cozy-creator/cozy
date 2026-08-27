@@ -519,3 +519,37 @@ func cleanupPeer(t *testing.T) (*httptest.Server, *atomic.Int64) {
 	t.Cleanup(peer.Close)
 	return peer, &drops
 }
+
+func TestPickHonorsExactInstallWithEqualPlanID(t *testing.T) {
+	const planID = "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+	c := &Orchestrator{workers: map[string]*worker{}, sessions: map[string]*session{}}
+	makeWorker := func(id, install, boot string) *worker {
+		w := newWorker(id, WorkerLaunchSpec{Placement: DesiredPlacement{
+			Endpoint: "org/ep", InstallID: install,
+		}})
+		w.bootID = boot
+		w.serving = pb.ServingState_SERVING_STATE_DISPATCHABLE
+		w.dispatchable[planID] = true
+		w.admission = pb.AdmissionState_ADMISSION_STATE_OPEN
+		w.observeSlots(1)
+		c.workers[id] = w
+		c.sessions[boot] = &session{bootID: boot, instanceID: id,
+			out: make(chan *pb.RecordOwnerFrame, 1)}
+		return w
+	}
+	old := makeWorker("old", "install-old", "boot-old")
+	want := makeWorker("wanted", "install-wanted", "boot-wanted")
+	got, _, _, reservation, problem := c.pick(records.Request{
+		Endpoint: "org/ep", PlanID: planID, InstallID: "install-wanted",
+	})
+	if problem != nil || got != want || got == old {
+		t.Fatalf("picked=%v want=%v problem=%v", got, want, problem)
+	}
+	c.releaseDispatch(reservation)
+}
+
+func TestLocalSnapshotHasNoRemoteMediaCleanup(t *testing.T) {
+	// A local worker deliberately has no media client. Snapshot recovery shares the
+	// cleanup path with remote workers, so this call is the nil-client regression arm.
+	(&Orchestrator{}).retryMediaCleanup(&worker{instanceID: "local"})
+}

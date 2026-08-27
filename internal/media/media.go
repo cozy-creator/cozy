@@ -31,6 +31,7 @@ import (
 	"io"
 	"net/http"
 	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"time"
@@ -253,6 +254,67 @@ func (c *Client) PutInput(blob string, data []byte) (string, *exit.Error) {
 	return doc.Path, nil
 }
 
+// PutInputFile streams one exact verified file to the pod. The digest and length are the
+// request record's facts; neither side needs a whole-file byte slice.
+func (c *Client) PutInputFile(blob, path, wantDigest string, wantLength int64) (string, *exit.Error) {
+	file, err := os.Open(path)
+	if err != nil {
+		return "", exit.New(exit.NotFound, "input asset %s: %s", filepath.Base(path), err)
+	}
+	defer file.Close()
+	info, err := file.Stat()
+	if err != nil || !info.Mode().IsRegular() || info.Size() != wantLength {
+		return "", exit.Named(exit.Conflict, "input_asset_changed",
+			"input asset %s no longer has its recorded %d-byte length", filepath.Base(path), wantLength)
+	}
+	hash := sha256.New()
+	request, err := http.NewRequest(http.MethodPut, c.url("/v1/inputs/"+blob),
+		io.TeeReader(file, hash))
+	if err != nil {
+		return "", exit.Internalf("cannot build the media upload: %s", err)
+	}
+	request.Header.Set("Authorization", "Bearer "+c.spec.Token.Reveal()) //cozy:allow-reveal
+	request.Header.Set("Content-Type", "application/octet-stream")
+	request.ContentLength = wantLength
+	response, err := c.http.Do(request)
+	if err != nil {
+		return "", exit.Named(exit.Unavailable, "media_unreachable",
+			"the pod's media server at %s did not accept %s: %s", c.spec.Addr, filepath.Base(path), err)
+	}
+	defer response.Body.Close()
+	data, err := io.ReadAll(io.LimitReader(response.Body, 1<<20+1))
+	if err != nil || len(data) > 1<<20 {
+		return "", exit.Unavailablef("the pod's media upload answer is unreadable or oversized")
+	}
+	if response.StatusCode >= 400 {
+		return "", mediaRefusal(response.StatusCode, data)
+	}
+	var doc answer
+	if err := json.Unmarshal(data, &doc); err != nil || doc.Path == "" {
+		return "", exit.Internalf("the pod accepted an input and returned no readable path")
+	}
+	gotDigest := "sha256:" + hex.EncodeToString(hash.Sum(nil))
+	if gotDigest != wantDigest || doc.Length != wantLength ||
+		(doc.Digest != "" && doc.Digest != wantDigest) {
+		return "", exit.Named(exit.Conflict, "input_asset_changed",
+			"input asset %s did not retain its recorded digest/length during upload", filepath.Base(path))
+	}
+	return doc.Path, nil
+}
+
+func mediaRefusal(status int, data []byte) *exit.Error {
+	var doc answer
+	_ = json.Unmarshal(data, &doc)
+	if doc.Error.Code == "" {
+		return exit.Unavailablef("the pod's media server answered %d with no typed refusal", status)
+	}
+	problem := exit.Named(codeFor(status), doc.Error.Code, "%s", doc.Error.Message)
+	if doc.Error.Remedy != "" {
+		problem.WithRemedy("%s", doc.Error.Remedy)
+	}
+	return problem
+}
+
 // PutPlan relays one exact canonical EntrypointBindingPlan. The pod hashes the
 // whole byte string and checks the claimed subject id before keeping it; neither
 // side renders a local binding record.
@@ -289,22 +351,71 @@ func (c *Client) DropAttempt(slot string) *exit.Error {
 	return e
 }
 
-// GetOutput fetches one committed output back to this host. It is the MIRROR's transport:
-// the bytes it returns are verified against the terminal's manifest by the orchestrator
-// before anything becomes visible, and this function verifies nothing itself beyond the
-// pod's own declared digest — deciding that an output may be shown is the orchestrator's
-// job and never a transport's.
-func (c *Client) GetOutput(slot, name string) ([]byte, *exit.Error) {
-	doc, data, e := c.call(http.MethodGet, "/v1/outputs/"+slot+"/"+name, nil)
-	if e != nil {
-		return nil, e
+// GetOutputTo mirrors one exact output directly into an atomic local file while hashing
+// and counting the received stream.
+func (c *Client) GetOutputTo(slot, name, destination, wantDigest string,
+	wantLength int64) (int64, *exit.Error) {
+	request, err := http.NewRequest(http.MethodGet, c.url("/v1/outputs/"+slot+"/"+name), nil)
+	if err != nil {
+		return 0, exit.Internalf("cannot build the media output request: %s", err)
 	}
-	if want := digestOf(data); doc.Digest != "" && doc.Digest != want {
-		return nil, exit.New(exit.Failed,
-			"the pod declares this output as %s and the %d B that arrived hash to %s",
-			shortDigest(doc.Digest), len(data), shortDigest(want))
+	request.Header.Set("Authorization", "Bearer "+c.spec.Token.Reveal()) //cozy:allow-reveal
+	response, err := c.http.Do(request)
+	if err != nil {
+		return 0, exit.Named(exit.Unavailable, "media_unreachable",
+			"the pod's media server at %s could not stream output %s: %s", c.spec.Addr, name, err)
 	}
-	return data, nil
+	defer response.Body.Close()
+	if response.StatusCode >= 400 {
+		data, _ := io.ReadAll(io.LimitReader(response.Body, 1<<20+1))
+		return 0, mediaRefusal(response.StatusCode, data)
+	}
+	if response.ContentLength >= 0 && response.ContentLength != wantLength {
+		return 0, exit.Named(exit.Failed, "media_length_mismatch",
+			"the pod declares output %s as %d B; its terminal declares %d B",
+			name, response.ContentLength, wantLength)
+	}
+	if err := os.MkdirAll(filepath.Dir(destination), 0o755); err != nil {
+		return 0, exit.Internalf("cannot create output mirror directory: %s", err)
+	}
+	staging, err := os.CreateTemp(filepath.Dir(destination), "."+filepath.Base(destination)+".mirroring-*")
+	if err != nil {
+		return 0, exit.Internalf("cannot stage mirrored output %s: %s", name, err)
+	}
+	stagingPath := staging.Name()
+	keep := false
+	defer func() {
+		_ = staging.Close()
+		if !keep {
+			_ = os.Remove(stagingPath)
+		}
+	}()
+	hash := sha256.New()
+	written, err := io.Copy(io.MultiWriter(staging, hash), io.LimitReader(response.Body, wantLength+1))
+	if err != nil {
+		return written, exit.Unavailablef("output %s ended while it was mirrored: %s", name, err)
+	}
+	if written != wantLength {
+		return written, exit.Named(exit.Failed, "media_length_mismatch",
+			"output %s delivered %d B; its terminal declares %d B", name, written, wantLength)
+	}
+	gotDigest := "sha256:" + hex.EncodeToString(hash.Sum(nil))
+	headerDigest := response.Header.Get("X-Cozy-Digest")
+	if gotDigest != wantDigest || (headerDigest != "" && headerDigest != wantDigest) {
+		return written, exit.Named(exit.Failed, "media_digest_mismatch",
+			"output %s delivered %s; its terminal declares %s", name, gotDigest, wantDigest)
+	}
+	if err := staging.Sync(); err != nil {
+		return written, exit.Internalf("cannot sync mirrored output %s: %s", name, err)
+	}
+	if err := staging.Close(); err != nil {
+		return written, exit.Internalf("cannot close mirrored output %s: %s", name, err)
+	}
+	if err := os.Rename(stagingPath, destination); err != nil {
+		return written, exit.Internalf("cannot commit mirrored output %s: %s", name, err)
+	}
+	keep = true
+	return written, nil
 }
 
 func digestOf(data []byte) string {
