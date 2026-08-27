@@ -14,12 +14,13 @@ use crate::checkpoint::{self, build_snapshot};
 use crate::dtype::{checked_bytes, Dtype};
 use crate::err::{refuse, Code, Refusal, Result};
 use crate::header::{Body, Closure, Header, Part, Tensor};
-use crate::ids::{ascii_name, prefixed, ConfigRef, ObjectRef};
+use crate::ids::{ascii_name, prefixed, ConfigRef, Doc, ObjectRef};
 use crate::limits;
 use crate::manifest::SnapshotManifest;
 use crate::meta::{Hold, Meta, RootRow, SnapshotRow};
 use crate::read::{self, ReadLease};
 use crate::store::{Fault, Store};
+use crate::{registry, spec::EncodingSpec, vectors::EncodingVectors};
 
 fn arithmetic(what: impl Into<String>) -> Refusal {
     Refusal {
@@ -1389,13 +1390,78 @@ fn planned_part(declaration: &PartDeclaration) -> Result<Part> {
     })
 }
 
+#[derive(Debug)]
+struct RegistryAdoption {
+    spec: EncodingSpec,
+    vectors: EncodingVectors,
+}
+
+/// Resolve by artifact identity alone. Registry aliases deliberately never cross this
+/// boundary: they are discovery/display names, while the declaration is locked to a digest.
+fn registry_adoption(encoding: &str) -> Result<RegistryAdoption> {
+    let mut matches: Vec<_> = registry::seeds()
+        .into_iter()
+        .filter(|seed| seed.spec.object_id() == encoding)
+        .collect();
+    if matches.len() > 1 {
+        return refuse(
+            Code::TRANSACTION_CONFLICT,
+            format!(
+                "target encoding {encoding} resolves to {} compiled registry entries",
+                matches.len()
+            ),
+        );
+    }
+    let seed = matches.pop().ok_or_else(|| Refusal {
+        code: Code::UNKNOWN_ENCODING,
+        detail: format!(
+            "target cites {encoding}, absent from every exact source closure and the compiled platform registry"
+        ),
+    })?;
+    let spec = EncodingSpec::parse(&seed.spec.canonical_bytes())?;
+    let vectors = seed.vectors.ok_or_else(|| Refusal {
+        code: Code::VECTORS_REQUIRED,
+        detail: format!(
+            "compiled registry spec {encoding} has no conformance-vector document and cannot be introduced into a derived snapshot"
+        ),
+    })?;
+    let vectors = EncodingVectors::parse(&vectors.canonical_bytes())?;
+    let expected = spec.vectors.as_ref().ok_or_else(|| Refusal {
+        code: Code::VECTOR_MISMATCH,
+        detail: format!("compiled registry spec {encoding} does not reference its vectors"),
+    })?;
+    let actual = vectors.object_ref();
+    if &actual != expected {
+        return refuse(
+            Code::VECTOR_MISMATCH,
+            format!(
+                "compiled registry spec {encoding} references {}, canonical vectors are {}",
+                expected.id(),
+                actual.id()
+            ),
+        );
+    }
+    vectors.check(&spec)?;
+    Ok(RegistryAdoption { spec, vectors })
+}
+
+fn admit_registry(store: &Store, adoptions: &[RegistryAdoption]) -> Result<()> {
+    for adoption in adoptions {
+        // Referenced bytes land first, through the same content-addressed Store path as
+        // every other document. The snapshot root is published only after both exist.
+        checkpoint::put_doc(store, &adoption.vectors)?;
+        checkpoint::put_doc(store, &adoption.spec)?;
+    }
+    Ok(())
+}
+
 fn build_header(
     declaration: &Declaration,
     sources: &[SourceData],
     added_parts: &[AddedPart],
     added_configs: &[AddedConfig],
     planned: bool,
-) -> Result<(Header, Closure)> {
+) -> Result<(Header, Closure, Vec<RegistryAdoption>)> {
     let mut components = Vec::new();
     for component in &declaration.components {
         let mut tensors = match (&component.source, &component.source_component) {
@@ -1569,6 +1635,7 @@ fn build_header(
         .collect();
     let mut encodings = Vec::new();
     let mut closure = Closure::default();
+    let mut registry_adoptions = Vec::new();
     for encoding in cited {
         let mut found: Option<(ObjectRef, crate::spec::EncodingSpec)> = None;
         for source in sources {
@@ -1593,10 +1660,15 @@ fn build_header(
                 }
             }
         }
-        let (reference, spec) = found.ok_or_else(|| Refusal {
-            code: Code::UNKNOWN_ENCODING,
-            detail: format!("target cites {encoding}, absent from every exact source closure"),
-        })?;
+        let (reference, spec) = match found {
+            Some(found) => found,
+            None => {
+                let adoption = registry_adoption(&encoding)?;
+                let found = (adoption.spec.object_ref(), adoption.spec.clone());
+                registry_adoptions.push(adoption);
+                found
+            }
+        };
         encodings.push(reference);
         closure.insert(spec);
     }
@@ -1621,7 +1693,7 @@ fn build_header(
         components,
     };
     header.validate(&closure)?;
-    Ok((header, closure))
+    Ok((header, closure, registry_adoptions))
 }
 
 pub struct Begin {
@@ -2310,13 +2382,14 @@ pub fn commit(
     };
     let declaration = declaration(&row_before)?;
     let sources = resolve_sources(store, meta, &declaration)?;
-    let (header, closure) = build_header(
+    let (header, closure, registry_adoptions) = build_header(
         &declaration,
         &sources,
         &row_before.added_parts,
         &row_before.added_configs,
         false,
     )?;
+    admit_registry(store, &registry_adoptions)?;
     let header_ref = checkpoint::put_doc(store, &header)?;
     let manifest = build_snapshot(&header, &header_ref, &closure)?;
     let snapshot_ref = checkpoint::put_doc(store, &manifest)?;
