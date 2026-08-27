@@ -65,6 +65,7 @@ DENY_PROMPT_CALLS = [
 ]
 
 # The ONE environment reader. Every other package takes the frozen typed value.
+# Its Inherited allowlist is class A of tracker-v2/spawn-allowlists.md (#616.d).
 ENV_READER = "internal/config/config.go"
 DENY_ENV_CALLS = ["os.Getenv", "os.LookupEnv", "os.Environ", "syscall.Getenv", "syscall.Environ"]
 

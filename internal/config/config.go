@@ -37,6 +37,8 @@ import (
 // Inherited is the CLOSED set of variables a child process may see from this process's
 // own environment. Everything else a child needs is IMPOSED by its launcher as an
 // explicit value (COZY_HOME, the device grant, the socket) — never inherited.
+// Class-A base inherit list — tracker-v2/spawn-allowlists.md (#616.d) is the authority;
+// keep equal to that row (Tool() adds NO_COLOR=1 per the same row).
 var Inherited = []string{"PATH", "HOME", "LANG", "LC_ALL", "TMPDIR", "SSL_CERT_FILE", "SSL_CERT_DIR"}
 
 // DefaultHubURL is where the catalog verbs look when nothing says otherwise. There is
