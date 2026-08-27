@@ -295,6 +295,13 @@ func controlFacts(row records.Rental) (remotecontrol.Facts, *exit.Error) {
 	}, row.EndpointRef)
 }
 
+// ValidateControl refuses a hub observation before its bytes become the rental's durable,
+// write-once control snapshot. Attach repeats the same check at the publication boundary.
+func ValidateControl(row records.Rental) *exit.Error {
+	_, e := controlFacts(row)
+	return e
+}
+
 func write0600(path string, body []byte) *exit.Error {
 	f, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o600)
 	if err != nil {

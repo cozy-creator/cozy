@@ -188,6 +188,11 @@ func handleRent(ctx *Context) *exit.Error {
 		row.Address, row.State = seen.Address, seen.State
 		row.MediaAddress = seen.MediaAddress
 		captureRentalControl(&row, seen)
+		if len(row.ControlSnapshotBytes) > 0 {
+			if e := rental.ValidateControl(row); e != nil {
+				return e
+			}
+		}
 		if e := st.RecordRental(row); e != nil {
 			return e
 		}
