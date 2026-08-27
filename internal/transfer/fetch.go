@@ -393,7 +393,8 @@ func fetchOnce(ctx context.Context, url, dst string, length int64) (int64, bool,
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
 		raw, _ := io.ReadAll(io.LimitReader(resp.Body, 4<<10))
-		return 0, false, storageRefusal(resp.StatusCode, short1(filepath.Base(dst)), raw)
+		return 0, retryableStorageStatus(resp.StatusCode),
+			storageRefusal(resp.StatusCode, short1(filepath.Base(dst)), raw)
 	}
 	f, err := os.Create(dst)
 	if err != nil {

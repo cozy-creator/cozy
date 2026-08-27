@@ -64,6 +64,10 @@ func (m *mover) context(parent context.Context) (context.Context, context.Cancel
 // part has landed, so a single multi-gigabyte part would read as no progress at all.
 func (m *mover) reader(r io.Reader) io.Reader { return &counted{r: r, m: m} }
 
+func (m *mover) readCloser(r io.ReadCloser) io.ReadCloser {
+	return &countedReadCloser{counted: counted{r: r, m: m}, closer: r}
+}
+
 type counted struct {
 	r io.Reader
 	m *mover
@@ -76,3 +80,11 @@ func (c *counted) Read(p []byte) (int, error) {
 	}
 	return n, err
 }
+
+type countedReadCloser struct {
+	counted counted
+	closer  io.Closer
+}
+
+func (c *countedReadCloser) Read(p []byte) (int, error) { return c.counted.Read(p) }
+func (c *countedReadCloser) Close() error               { return c.closer.Close() }

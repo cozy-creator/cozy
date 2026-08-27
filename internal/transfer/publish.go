@@ -22,6 +22,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/cozy-creator/cozy-creator-v2/internal/exit"
@@ -194,95 +195,184 @@ func (p *Publish) Run(ctx context.Context) (Result, *exit.Error) {
 // upload requests grants, writes each object at its final content key under every
 // condition the grant signed, and then asks the hub to prove them. An expired grant
 // comes back as a REPLAN and is answered by asking again — never by failing.
+const publishParallelism = 16
+
+type uploadOutcome struct {
+	index     int
+	report    hub.VerifyReport
+	moved     int64
+	multipart bool
+	verified  bool
+	source    string
+	primary   bool
+	err       *exit.Error
+}
+
 func (p *Publish) upload(ctx context.Context, missing []hub.Missing, res *Result, ms map[string]int64) *exit.Error {
-	ids := make([]string, 0, len(missing))
-	for _, m := range missing {
-		ids = append(ids, m.ID)
+	parallelism := publishParallelism
+	if p.FailAfter > 0 {
+		// The development kill point promises an exact completed-object count. Keep
+		// that proof serial without slowing the production path.
+		parallelism = 1
+	}
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	started := time.Now()
+	jobs := make(chan int)
+	outcomes := make(chan uploadOutcome, parallelism)
+	var workers sync.WaitGroup
+	var cancelOnce sync.Once
+	for range parallelism {
+		workers.Add(1)
+		go func() {
+			defer workers.Done()
+			for index := range jobs {
+				outcome := p.uploadOne(ctx, res.PublishID, index, missing[index])
+				if outcome.err != nil {
+					cancelOnce.Do(func() {
+						outcome.primary = true
+						cancel()
+					})
+					outcomes <- outcome
+					return
+				}
+				outcomes <- outcome
+			}
+		}()
+	}
+	go func() {
+		defer close(outcomes)
+		for index := range missing {
+			select {
+			case jobs <- index:
+			case <-ctx.Done():
+				close(jobs)
+				workers.Wait()
+				return
+			}
+		}
+		close(jobs)
+		workers.Wait()
+	}()
+
+	ordered := make([]*uploadOutcome, len(missing))
+	for outcome := range outcomes {
+		copy := outcome
+		ordered[outcome.index] = &copy
+	}
+	var primary *exit.Error
+	for _, outcome := range ordered {
+		if outcome == nil {
+			continue
+		}
+		if outcome.primary {
+			primary = outcome.err
+		}
+	}
+	if primary != nil {
+		return primary
+	}
+	for index, outcome := range ordered {
+		if outcome == nil {
+			return exit.Internalf("upload stopped before object %d/%d produced a verdict", index, len(missing))
+		}
 	}
 
-	t0 := time.Now()
-	grants, e := p.Hub.Grants(ctx, p.Ref, res.PublishID, ids, p.Reason)
-	if e != nil {
-		return e
-	}
-	ms["grants"] = since(t0)
-	res.Grants = len(grants)
-	for _, g := range grants {
-		if g.Multipart() {
+	sources := map[string]bool{}
+	for _, outcome := range ordered {
+		res.Grants++
+		res.Uploaded++
+		res.Moved += outcome.moved
+		if outcome.multipart {
 			res.Multipart++
 		}
-	}
-	p.say("granted %d objects (%d ranged) at their final content keys", len(grants), res.Multipart)
-
-	t0 = time.Now()
-	reports := make([]hub.VerifyReport, 0, len(grants))
-	staged := filepath.Join(p.Scratch, "object")
-	for i, g := range grants {
-		if p.FailAfter > 0 && i >= p.FailAfter {
-			return exit.Named(exit.Internal, "crash_after_upload",
-				"development kill point: stopped after %d of %d objects", i, len(grants)).
-				WithRemedy("re-run the same publish; the hub re-plans the declaration and the uploaded objects are already held")
-		}
-		// The bytes leave the store through a VERIFIED read, so a publisher cannot
-		// upload what its own store silently corrupted.
-		if e := p.Tool.Extract(g.ObjectID, staged); e != nil {
-			return e
-		}
-		conflict, e := p.put(ctx, g, staged, res)
-		if e != nil {
-			// A grant whose window closed is a re-plan, not a failure. Ask again
-			// once and continue; a second expiry is a clock problem, not a race.
-			if e.Name != "grant.expired_replan" {
-				return e
-			}
-			p.say("a grant window closed mid-upload: re-planning (already-verified objects are the journal)")
-			fresh, e2 := p.Hub.Grants(ctx, p.Ref, res.PublishID, []string{g.ObjectID}, p.Reason)
-			if e2 != nil {
-				return e2
-			}
-			if len(fresh) != 1 {
-				return exit.Internalf("re-planning %s answered %d grants", g.ObjectID, len(fresh))
-			}
-			conflict, e = p.put(ctx, fresh[0], staged, res)
-			if e != nil {
-				return e
-			}
-		}
-		res.Uploaded++
-		if conflict {
+		if outcome.report.Conflict {
 			res.Conflicts++
 		}
-		reports = append(reports, hub.VerifyReport{ObjectID: g.ObjectID, Conflict: conflict})
-	}
-	_ = os.Remove(staged)
-	ms["upload"] = since(t0)
-	p.say("uploaded %d objects, %s moved (%d already resident at the key)",
-		res.Uploaded, size(res.Moved), res.Conflicts)
-
-	// The hub streams every object BACK and hashes it itself. Nothing this client
-	// observed is evidence, which is why the report above carries no checksum.
-	t0 = time.Now()
-	verdicts, e := p.Hub.VerifyObjects(ctx, p.Ref, res.PublishID, reports, p.Reason)
-	if e != nil {
-		return e
-	}
-	ms["verify"] = since(t0)
-	sources := map[string]bool{}
-	for _, v := range verdicts {
-		if v.State == "verified" {
+		if outcome.verified {
 			res.Verified++
 		}
-		if v.ChecksumSource != "" {
-			sources[v.ChecksumSource] = true
+		if outcome.source != "" {
+			sources[outcome.source] = true
 		}
 	}
-	for s := range sources {
-		res.Sources = append(res.Sources, s)
+	for source := range sources {
+		res.Sources = append(res.Sources, source)
 	}
 	sortStrings(res.Sources)
-	p.say("the hub re-hashed %d/%d objects for itself (%s)",
-		res.Verified, len(verdicts), strings.Join(res.Sources, ", "))
+	ms["grant_upload_verify"] = since(started)
+	p.say("granted and uploaded %d objects one at a time (%d ranged), %s moved "+
+		"(%d already resident at the key)", res.Uploaded, res.Multipart, size(res.Moved), res.Conflicts)
+	p.say("the hub re-hashed %d/%d objects as each upload completed (%s)",
+		res.Verified, len(missing), strings.Join(res.Sources, ", "))
 	return nil
+}
+
+func (p *Publish) uploadOne(ctx context.Context, publishID string, index int, object hub.Missing) uploadOutcome {
+	outcome := uploadOutcome{index: index}
+	if p.FailAfter > 0 && index >= p.FailAfter {
+		outcome.err = exit.Named(exit.Internal, "crash_after_upload",
+			"development kill point: stopped after %d objects", index).
+			WithRemedy("re-run the same publish; the hub re-plans the declaration and the uploaded objects are already held")
+		return outcome
+	}
+	grant, e := p.Hub.Grant(ctx, p.Ref, publishID, object.ID, p.Reason)
+	if e != nil {
+		outcome.err = e
+		return outcome
+	}
+	outcome.multipart = grant.Multipart()
+	staged := filepath.Join(p.Scratch, fmt.Sprintf("object-%06d", index))
+	defer os.Remove(staged)
+
+	// The bytes leave the store through a VERIFIED read, so a publisher cannot
+	// upload what its own store silently corrupted.
+	local := Result{PublishID: publishID}
+	if e := p.Tool.Extract(grant.ObjectID, staged); e != nil {
+		outcome.err = e
+		return outcome
+	}
+	conflict, e := p.put(ctx, grant, staged, &local)
+	if e != nil && e.Name == "grant.expired_replan" {
+		fresh, e2 := p.Hub.Grant(ctx, p.Ref, publishID, grant.ObjectID, p.Reason)
+		if e2 != nil {
+			outcome.err = e2
+			return outcome
+		}
+		conflict, e = p.put(ctx, fresh, staged, &local)
+	}
+	if e != nil {
+		outcome.err = e
+		return outcome
+	}
+	outcome.moved = local.Moved
+	outcome.report = hub.VerifyReport{ObjectID: grant.ObjectID, Conflict: conflict}
+	verdicts, verifyErr := p.Hub.VerifyObjects(
+		ctx, p.Ref, publishID, []hub.VerifyReport{outcome.report}, p.Reason,
+	)
+	if verifyErr != nil {
+		outcome.err = verifyErr
+		return outcome
+	}
+	if len(verdicts) != 1 || verdicts[0].ObjectID != grant.ObjectID {
+		outcome.err = exit.Internalf(
+			"verification for %s answered %d rows or another object",
+			grant.ObjectID,
+			len(verdicts),
+		)
+		return outcome
+	}
+	outcome.verified = verdicts[0].State == "verified"
+	outcome.source = verdicts[0].ChecksumSource
+	if !outcome.verified {
+		outcome.err = exit.Internalf(
+			"verification for %s returned state %q: %s",
+			grant.ObjectID,
+			verdicts[0].State,
+			verdicts[0].Detail,
+		)
+	}
+	return outcome
 }
 
 // put writes one object at its final content key. Every required header is sent
@@ -338,7 +428,7 @@ const attempts = 3
 
 // send is the one storage-edge write in this binary. It talks to object storage,
 // never to the hub: the URL is presigned and carries no credential of ours.
-func send(ctx context.Context, method, url string, open func() (io.Reader, error), length int64, headers map[string]string) (int, http.Header, []byte, *exit.Error) {
+func send(ctx context.Context, method, url string, open func() (io.ReadCloser, error), length int64, headers map[string]string) (int, http.Header, []byte, *exit.Error) {
 	var last error
 	for try := 0; try < attempts; try++ {
 		body, err := open()
@@ -349,8 +439,10 @@ func send(ctx context.Context, method, url string, open func() (io.Reader, error
 		// that is slow is not an upload that has stopped.
 		m := &mover{}
 		rctx, cancel := m.context(ctx)
-		req, err := http.NewRequestWithContext(rctx, method, url, m.reader(body))
+		counted := m.readCloser(body)
+		req, err := http.NewRequestWithContext(rctx, method, url, counted)
 		if err != nil {
+			counted.Close()
 			cancel()
 			return 0, nil, nil, exit.Internalf("the grant's URL is not usable: %s", err)
 		}
@@ -360,6 +452,7 @@ func send(ctx context.Context, method, url string, open func() (io.Reader, error
 		}
 		resp, err := http.DefaultClient.Do(req)
 		if err != nil {
+			counted.Close()
 			cancel()
 			last = err
 			time.Sleep(time.Duration(try+1) * time.Second)
@@ -367,7 +460,12 @@ func send(ctx context.Context, method, url string, open func() (io.Reader, error
 		}
 		raw, _ := io.ReadAll(io.LimitReader(resp.Body, 8<<10))
 		resp.Body.Close()
+		counted.Close()
 		cancel()
+		if retryableStorageStatus(resp.StatusCode) && try+1 < attempts {
+			time.Sleep(time.Duration(try+1) * time.Second)
+			continue
+		}
 		return resp.StatusCode, resp.Header, raw, nil
 	}
 	return 0, nil, nil, exit.Unavailablef("object storage is unreachable after %d attempts: %s", attempts, last).
@@ -393,8 +491,13 @@ func storageRefusal(status int, subject string, body []byte) *exit.Error {
 // opener hands `send` a FRESH reader per attempt. A retried upload that re-used a
 // consumed reader would put an empty body under a signed digest — the exact failure
 // retries exist to avoid, dressed up as a corrupt object.
-func opener(path string, offset, length int64) func() (io.Reader, error) {
-	return func() (io.Reader, error) {
+type limitedReadCloser struct {
+	io.Reader
+	io.Closer
+}
+
+func opener(path string, offset, length int64) func() (io.ReadCloser, error) {
+	return func() (io.ReadCloser, error) {
 		f, err := os.Open(path)
 		if err != nil {
 			return nil, err
@@ -405,7 +508,18 @@ func opener(path string, offset, length int64) func() (io.Reader, error) {
 				return nil, err
 			}
 		}
-		return io.LimitReader(f, length), nil
+		return &limitedReadCloser{Reader: io.LimitReader(f, length), Closer: f}, nil
+	}
+}
+
+func retryableStorageStatus(status int) bool {
+	switch status {
+	case http.StatusRequestTimeout, http.StatusTooEarly, http.StatusTooManyRequests,
+		http.StatusInternalServerError, http.StatusBadGateway, http.StatusServiceUnavailable,
+		http.StatusGatewayTimeout:
+		return true
+	default:
+		return false
 	}
 }
 
