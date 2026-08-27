@@ -267,7 +267,7 @@ func validateFieldInto(field Field, value any, path string, assets *[]string) *e
 				"request field %s has length %d; its maximum is %d", path, length, *maximum)
 		}
 	}
-	if field.Constraints.GE != nil || field.Constraints.LE != nil {
+	if field.Constraints.GT != nil || field.Constraints.GE != nil || field.Constraints.LE != nil {
 		number, ok := value.(json.Number)
 		if !ok {
 			return exit.Named(exit.Structural, "descriptor_constraint_unknown",
@@ -280,6 +280,10 @@ func validateFieldInto(field Field, value any, path string, assets *[]string) *e
 		if minimum := field.Constraints.GE; minimum != nil && parsed < *minimum {
 			return exit.New(exit.Validation,
 				"request field %s is %s; its minimum is %v", path, number.String(), *minimum)
+		}
+		if minimum := field.Constraints.GT; minimum != nil && parsed <= *minimum {
+			return exit.New(exit.Validation,
+				"request field %s is %s; it must be greater than %v", path, number.String(), *minimum)
 		}
 		if maximum := field.Constraints.LE; maximum != nil && parsed > *maximum {
 			return exit.New(exit.Validation,
@@ -359,23 +363,6 @@ func validateRenderedInto(raw json.RawMessage, value any, path string, assets *[
 			}
 		}
 		return exit.New(exit.Validation, "request field %s is not one of its declared literals", path)
-	}
-	if values, ok := schema["values"]; ok && schema["enum"] != nil {
-		var members []json.RawMessage
-		if json.Unmarshal(values, &members) != nil || len(members) == 0 {
-			return exit.Named(exit.Structural, "descriptor_type_unknown",
-				"request field %s has an unreadable enum", path)
-		}
-		actual, err := json.Marshal(value)
-		if err == nil {
-			for _, member := range members {
-				var compact bytes.Buffer
-				if json.Compact(&compact, member) == nil && bytes.Equal(actual, compact.Bytes()) {
-					return nil
-				}
-			}
-		}
-		return exit.New(exit.Validation, "request field %s is not one of its declared enum values", path)
 	}
 	if union, ok := schema["union"]; ok {
 		var branches []json.RawMessage

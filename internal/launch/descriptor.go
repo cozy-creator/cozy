@@ -8,7 +8,8 @@
 //     PROVEN at install by the release's own runtime (`cozy-runtime describe --check`, cl-009).
 //     Reading it back costs microseconds; re-running `describe` per invocation would import
 //     the endpoint's whole module graph to learn a fact already vouched for. The recorded
-//     `surface_digest` is checked on every read, so an edited source tree is a refusal.
+//     the exact-byte `descriptor_digest` is checked on every read, so an edited source tree
+//     is a refusal.
 //   - THE ARTIFACT FACTS (store root, per-component snapshots, immutable config, variant,
 //     physical floor) come from the runtime's own local artifact index, read through
 //     `cozy-runtime list --json`. cozy-creator never composes a store path.
@@ -23,27 +24,32 @@
 package launch
 
 import (
+	"bytes"
 	"encoding/json"
+	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"sort"
 	"strings"
 
+	"github.com/cozy-creator/cozy-creator-v2/internal/canonical"
 	"github.com/cozy-creator/cozy-creator-v2/internal/exit"
 )
 
 // DescriptorFile is the name cr-003 froze. It is committed in the endpoint's source and
 // `describe --check` is what proves it current.
 const DescriptorFile = "endpoint.descriptor.json"
+const descriptorFormat = "cozy.endpoint.descriptor/1"
 
-// Descriptor is the part of the EndpointDescriptor this host reads. Unknown keys are
-// carried in `Raw` and rendered untouched — a client that adds a field does not need this
-// reader to change, and this reader never claims to understand one it does not.
+// Descriptor is the closed EndpointDescriptor/1 this host reads. Unknown fields refuse;
+// Raw preserves the exact bytes whose digest is carried through launch documents.
 type Descriptor struct {
+	Format      string          `json:"format"`
 	Application string          `json:"application"`
-	Digest      string          `json:"surface_digest"`
 	Entrypoints []Entrypoint    `json:"entrypoints"`
 	Jobs        []Entrypoint    `json:"jobs"`
+	Digest      string          `json:"-"`
 	Raw         json.RawMessage `json:"-"`
 }
 
@@ -51,18 +57,20 @@ type Descriptor struct {
 // its result shape.
 type Entrypoint struct {
 	Name string `json:"name"`
-	Kind string `json:"kind"`
-	GPU  bool   `json:"gpu"`
+	Kind string `json:"-"`
 	// Hidden is the author's DECLARED-BUT-NOT-SERVED marker (#572d). The surface stays in
 	// the descriptor because it is real code; it gets no binding staged and takes no
 	// traffic. H3's `reference_to_video` is the case: its vision-conditioning seam is
 	// unbuilt, and staging its binding anyway let it fail to prepare and deny the working
 	// T2VA sibling the card.
-	Hidden  bool     `json:"hidden"`
-	Models  []Slot   `json:"models"`
-	Request Struct   `json:"request"`
-	Result  Struct   `json:"result"`
-	Caps    []string `json:"capabilities"`
+	Hidden    bool   `json:"hidden"`
+	Models    []Slot `json:"models"`
+	Request   Struct `json:"request"`
+	Result    Struct `json:"result"`
+	Publishes bool   `json:"publishes"`
+	Resources struct {
+		GPUCount int64 `json:"gpu_count"`
+	} `json:"resources"`
 }
 
 // Slot is one declared model binding path — capability, never selection.
@@ -70,12 +78,12 @@ type Slot struct {
 	Class        string              `json:"class"`
 	Path         string              `json:"path"`
 	Param        string              `json:"param"`
+	Stamps       map[string]string   `json:"stamps"`
 	ComponentUse map[string][]string `json:"component_use"`
 }
 
 // Struct is a rendered msgspec struct.
 type Struct struct {
-	Name     string          `json:"struct"`
 	Fields   []Field         `json:"fields"`
 	TagField string          `json:"tag_field"`
 	Tag      json.RawMessage `json:"tag"`
@@ -85,12 +93,11 @@ type Struct struct {
 // (`int`, `str`) and an object for an asset (`{"asset":"image"}`), a list
 // (`{"list":"float"}`) or a nested struct (`{"struct":…,"fields":[…]}`).
 type Field struct {
-	Name          string           `json:"name"`
-	Type          json.RawMessage  `json:"type"`
-	Wire          string           `json:"wire"`
-	Discriminator bool             `json:"discriminator"`
-	Constraints   FieldConstraints `json:"constraints"`
-	AssetBound    struct {
+	Name        string           `json:"name"`
+	Type        json.RawMessage  `json:"type"`
+	Wire        string           `json:"wire"`
+	Constraints FieldConstraints `json:"constraints"`
+	AssetBound  struct {
 		MaxBytes   int64    `json:"max_bytes"`
 		MediaTypes []string `json:"media_types"`
 	} `json:"asset_bound"`
@@ -99,6 +106,7 @@ type Field struct {
 type FieldConstraints struct {
 	MinLength *int64   `json:"min_length"`
 	MaxLength *int64   `json:"max_length"`
+	GT        *float64 `json:"gt"`
 	GE        *float64 `json:"ge"`
 	LE        *float64 `json:"le"`
 	Unknown   []string `json:"-"`
@@ -111,7 +119,7 @@ func (c *FieldConstraints) UnmarshalJSON(data []byte) error {
 	}
 	for key := range raw {
 		switch key {
-		case "min_length", "max_length", "ge", "le":
+		case "min_length", "max_length", "gt", "ge", "le":
 		default:
 			c.Unknown = append(c.Unknown, key)
 		}
@@ -125,6 +133,182 @@ func (c *FieldConstraints) UnmarshalJSON(data []byte) error {
 	unknown := c.Unknown
 	*c = FieldConstraints(decoded)
 	c.Unknown = unknown
+	return nil
+}
+
+func exactKeys(raw json.RawMessage, required, optional []string) (map[string]json.RawMessage, error) {
+	var object map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &object); err != nil {
+		return nil, err
+	}
+	allowed := map[string]bool{}
+	for _, key := range required {
+		allowed[key] = true
+		if _, ok := object[key]; !ok {
+			return nil, fmt.Errorf("missing field %q", key)
+		}
+	}
+	for _, key := range optional {
+		allowed[key] = true
+	}
+	for key := range object {
+		if !allowed[key] {
+			return nil, fmt.Errorf("unknown field %q", key)
+		}
+	}
+	return object, nil
+}
+
+func validateClosedDescriptor(data []byte) error {
+	root, err := exactKeys(data, []string{"application", "entrypoints", "format", "jobs"}, nil)
+	if err != nil {
+		return err
+	}
+	for collection, kind := range map[string]string{"entrypoints": "entrypoint", "jobs": "job"} {
+		var rows []json.RawMessage
+		if err := json.Unmarshal(root[collection], &rows); err != nil {
+			return err
+		}
+		for _, row := range rows {
+			required := []string{"name", "request", "result"}
+			optional := []string{"models"}
+			if kind == "entrypoint" {
+				required = append(required, "hidden")
+			} else {
+				required = append(required, "publishes")
+				optional = append(optional, "resources")
+			}
+			callable, err := exactKeys(row, required, optional)
+			if err != nil {
+				return err
+			}
+			for _, name := range []string{"request", "result"} {
+				if err := validateStructRaw(callable[name]); err != nil {
+					return err
+				}
+			}
+			if models := callable["models"]; models != nil {
+				var slots []json.RawMessage
+				if err := json.Unmarshal(models, &slots); err != nil {
+					return err
+				}
+				for _, slot := range slots {
+					if _, err := exactKeys(slot,
+						[]string{"class", "component_use", "param", "path", "stamps"}, nil); err != nil {
+						return err
+					}
+				}
+			}
+			if resources := callable["resources"]; resources != nil {
+				if _, err := exactKeys(resources, []string{"gpu_count"}, nil); err != nil {
+					return err
+				}
+			}
+		}
+	}
+	return nil
+}
+
+func validateStructRaw(raw json.RawMessage) error {
+	object, err := exactKeys(raw, []string{"fields"}, []string{"tag", "tag_field"})
+	if err != nil {
+		return err
+	}
+	var fields []json.RawMessage
+	if err := json.Unmarshal(object["fields"], &fields); err != nil {
+		return err
+	}
+	for _, rawField := range fields {
+		field, err := exactKeys(rawField, []string{"name", "type", "wire"},
+			[]string{"asset_bound", "constraints"})
+		if err != nil {
+			return err
+		}
+		if err := validateTypeRaw(field["type"]); err != nil {
+			return err
+		}
+		if bound := field["asset_bound"]; bound != nil {
+			if _, err := exactKeys(bound, nil, []string{"max_bytes", "media_types"}); err != nil {
+				return err
+			}
+		}
+		if constraints := field["constraints"]; constraints != nil {
+			if _, err := exactKeys(constraints, nil,
+				[]string{"ge", "gt", "le", "max_length", "min_length"}); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
+func validateTypeRaw(raw json.RawMessage) error {
+	var scalar string
+	if json.Unmarshal(raw, &scalar) == nil {
+		switch scalar {
+		case "bool", "float", "int", "null", "str":
+			return nil
+		}
+		return fmt.Errorf("unsupported descriptor scalar %q", scalar)
+	}
+	var object map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &object); err != nil {
+		return err
+	}
+	switch {
+	case object["asset"] != nil:
+		_, err := exactKeys(raw, []string{"asset"}, nil)
+		return err
+	case object["input"] != nil:
+		_, err := exactKeys(raw, []string{"input"}, nil)
+		return err
+	case object["literal"] != nil:
+		_, err := exactKeys(raw, []string{"literal"}, nil)
+		return err
+	case object["list"] != nil:
+		if _, err := exactKeys(raw, []string{"list"}, nil); err != nil {
+			return err
+		}
+		return validateTypeRaw(object["list"])
+	case object["union"] != nil:
+		if _, err := exactKeys(raw, []string{"union"}, []string{"tag_field"}); err != nil {
+			return err
+		}
+		var branches []json.RawMessage
+		if err := json.Unmarshal(object["union"], &branches); err != nil || len(branches) == 0 {
+			return fmt.Errorf("empty descriptor union")
+		}
+		for _, branch := range branches {
+			if err := validateTypeRaw(branch); err != nil {
+				return err
+			}
+		}
+		return nil
+	case object["fields"] != nil:
+		return validateStructRaw(raw)
+	}
+	return fmt.Errorf("unsupported descriptor type")
+}
+
+func validateEntrypoint(ep *Entrypoint) *exit.Error {
+	if ep.Name == "" {
+		return exit.New(exit.Validation, "descriptor carries an unnamed %s", ep.Kind)
+	}
+	for _, pair := range []struct {
+		name string
+		body Struct
+	}{{"request", ep.Request}, {"result", ep.Result}} {
+		for _, field := range pair.body.Fields {
+			if field.Name == "" || (field.Wire != "required" && field.Wire != "optional" &&
+				field.Wire != "omissible") {
+				return exit.New(exit.Validation, "%s.%s has an invalid field", ep.Name, pair.name)
+			}
+			if len(field.Constraints.Unknown) > 0 {
+				return exit.New(exit.Validation, "%s.%s uses unsupported constraints: %s",
+					ep.Name, field.Name, strings.Join(field.Constraints.Unknown, ", "))
+			}
+		}
+	}
 	return nil
 }
 
@@ -144,17 +328,58 @@ func ReadDescriptor(sourceDir, expectDigest string) (*Descriptor, *exit.Error) {
 			WithRemedy("an installed release commits its descriptor; `cozy-runtime describe --write-descriptor` is what writes one").
 			WithNext("cozy install <org/endpoint> --force")
 	}
-	var d Descriptor
-	if err := json.Unmarshal(data, &d); err != nil {
-		return nil, exit.New(exit.Validation, "%s is not a descriptor document: %s", path, err)
+	d, problem := DecodeDescriptor(data)
+	if problem != nil {
+		return nil, problem
 	}
-	d.Raw = data
 	if expectDigest != "" && d.Digest != expectDigest {
 		return nil, exit.Named(exit.Conflict, "descriptor_stale",
-			"the committed descriptor is %s and this install recorded %s", d.Digest, expectDigest).
+			"the committed descriptor bytes digest to %s and this install recorded %s", d.Digest, expectDigest).
 			WithRemedy("the source tree changed after the install; reinstall so the surface and the record are one document").
 			WithNext("cozy install <org/endpoint> --force")
 	}
+	return d, nil
+}
+
+// DecodeDescriptor reads the one closed descriptor/1 grammar and derives its exact-byte
+// identity. Collection membership supplies callable kind; the document does not repeat it.
+func DecodeDescriptor(data []byte) (*Descriptor, *exit.Error) {
+	if len(data) > canonical.DocMax {
+		return nil, exit.New(exit.Validation, "%s exceeds the %d-byte cap", DescriptorFile, canonical.DocMax)
+	}
+	if err := validateClosedDescriptor(data); err != nil {
+		return nil, exit.New(exit.Validation, "%s violates descriptor/1: %s", DescriptorFile, err)
+	}
+	decoder := json.NewDecoder(bytes.NewReader(data))
+	decoder.DisallowUnknownFields()
+	var d Descriptor
+	if err := decoder.Decode(&d); err != nil {
+		return nil, exit.New(exit.Validation, "%s is not a descriptor document: %s", DescriptorFile, err)
+	}
+	if err := decoder.Decode(&struct{}{}); err != io.EOF {
+		return nil, exit.New(exit.Validation, "%s carries trailing JSON", DescriptorFile)
+	}
+	if d.Format != descriptorFormat || d.Application == "" {
+		return nil, exit.New(exit.Validation, "%s format/application is invalid", DescriptorFile)
+	}
+	for i := range d.Entrypoints {
+		d.Entrypoints[i].Kind = "entrypoint"
+		if problem := validateEntrypoint(&d.Entrypoints[i]); problem != nil {
+			return nil, problem
+		}
+	}
+	for i := range d.Jobs {
+		d.Jobs[i].Kind = "job"
+		if problem := validateEntrypoint(&d.Jobs[i]); problem != nil {
+			return nil, problem
+		}
+	}
+	digest, err := canonical.Spell(canonical.Digest(data))
+	if err != nil {
+		return nil, exit.Internalf("cannot spell descriptor digest: %s", err)
+	}
+	d.Digest = digest
+	d.Raw = append([]byte(nil), data...)
 	return &d, nil
 }
 

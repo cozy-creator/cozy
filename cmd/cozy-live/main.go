@@ -70,7 +70,7 @@ func main() {
 	if len(args) == 0 {
 		fmt.Fprintln(os.Stderr, "usage: cozy-live "+
 			"<canonical|attempt|recovered|arms|stall|tlspin|api|apiarms|apicrash|verbs|journey|rent|planids|"+
-			"pipeline|m4arms|dropack|jobarms|jobs|jobcrash|workflows|workflowcrash|fakeworker> [--flag value]")
+			"descriptor|pipeline|m4arms|dropack|jobarms|jobs|jobcrash|workflows|workflowcrash|fakeworker> [--flag value]")
 		os.Exit(2)
 	}
 	section := args[0]
@@ -92,6 +92,8 @@ func main() {
 		os.Exit(fakeWorker())
 	case "canonical":
 		sectionCanonical()
+	case "descriptor":
+		sectionDescriptor()
 	case "attempt":
 		sectionAttempt()
 	case "recovered":

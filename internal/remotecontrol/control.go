@@ -306,18 +306,14 @@ func Decode(control hub.ExactControlDocument, endpointRef string) (Facts, *exit.
 		return facts, invalid("installed-environment receipt does not close the selected environment: %v", err)
 	}
 
-	var descriptor launch.Descriptor
-	if _, err := canonical.ParseObject(s.Descriptor.CanonicalBytes); err != nil {
-		return facts, invalid("endpoint descriptor violates the bounded JSON grammar: %v", err)
+	descriptor, problem := launch.DecodeDescriptor(s.Descriptor.CanonicalBytes)
+	if problem != nil || descriptor.Digest != s.Descriptor.Digest {
+		return facts, invalid("endpoint descriptor is unreadable or has the wrong digest: %v", problem)
 	}
-	if err := json.Unmarshal(s.Descriptor.CanonicalBytes, &descriptor); err != nil {
-		return facts, invalid("endpoint descriptor is unreadable: %v", err)
-	}
-	descriptor.Raw = append([]byte(nil), s.Descriptor.CanonicalBytes...)
 	visible := map[string]*launch.Entrypoint{}
 	for i := range descriptor.Entrypoints {
 		ep := &descriptor.Entrypoints[i]
-		if ep.Kind == "entrypoint" && !ep.Hidden {
+		if !ep.Hidden {
 			if visible[ep.Name] != nil {
 				return facts, invalid("descriptor repeats visible entrypoint %q", ep.Name)
 			}
@@ -404,7 +400,7 @@ func Decode(control hub.ExactControlDocument, endpointRef string) (Facts, *exit.
 		parts[2] != fmt.Sprintf("v%d", major) || parts[3] == "" || visible[parts[3]] == nil {
 		return facts, invalid("rental endpoint_ref %q is not covered by the exact descriptor", endpointRef)
 	}
-	facts.Descriptor = &descriptor
+	facts.Descriptor = descriptor
 	facts.Placement = orchestrator.DesiredPlacement{
 		Endpoint: repo.String(), ReleaseID: placementSpec.Str("endpoint_release_id"),
 		InstallID: s.AcquisitionAttemptID, DescriptorDigest: s.Descriptor.Digest,

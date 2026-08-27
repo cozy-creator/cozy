@@ -1,7 +1,6 @@
 package launch
 
 import (
-	"encoding/json"
 	"strings"
 
 	"github.com/cozy-creator/cozy-creator-v2/internal/exit"
@@ -105,13 +104,18 @@ func (f *Facts) JobSpec(function string, devices []string) (orchestrator.WorkerL
 // refusals it owed for values the protocol profile cannot spell (a float bound, a null
 // default) — deletes with it.
 func (f *Facts) Job(function string) (*JobFacts, *exit.Error) {
-	entry, e := f.jobEntry(function)
-	if e != nil {
-		return nil, e
+	var declared *Entrypoint
+	for i := range f.Descriptor.Jobs {
+		if f.Descriptor.Jobs[i].Name == function {
+			declared = &f.Descriptor.Jobs[i]
+			break
+		}
 	}
-	var declared Entrypoint
-	if err := json.Unmarshal(entry, &declared); err != nil {
-		return nil, exit.Internalf("the descriptor's job entry for %q is unreadable: %s", function, err)
+	if declared == nil {
+		return nil, exit.Named(exit.NotFound, "unknown_job",
+			"%s registers no job named %q", f.Install.Endpoint, function).
+			WithRemedy("it registers: %s", strings.Join(f.Descriptor.Names(), ", ")).
+			WithNext("cozy describe " + f.Install.Endpoint)
 	}
 	var said struct {
 		DescriptorID string `json:"job_descriptor_id"`
@@ -126,47 +130,7 @@ func (f *Facts) Job(function string) (*JobFacts, *exit.Error) {
 	}
 	facts := &JobFacts{
 		Name: function, DescriptorID: said.DescriptorID, Outputs: AssetPaths(declared.Result),
+		Publishes: declared.Publishes, GPUCount: declared.Resources.GPUCount,
 	}
-	var shape struct {
-		Publishes bool `json:"publishes"`
-		Resources struct {
-			GPUCount int64 `json:"gpu_count"`
-		} `json:"resources"`
-	}
-	_ = json.Unmarshal(entry, &shape)
-	facts.Publishes, facts.GPUCount = shape.Publishes, shape.Resources.GPUCount
 	return facts, nil
-}
-
-// jobEntry finds one job's EXACT descriptor entry, as bytes. The typed `Descriptor.Jobs`
-// view is a projection of this document and would not reproduce it — the digest is over
-// what the release committed, so it is taken over the release's own bytes.
-func (f *Facts) jobEntry(function string) (json.RawMessage, *exit.Error) {
-	var doc struct {
-		Jobs []json.RawMessage `json:"jobs"`
-	}
-	if err := json.Unmarshal(f.Descriptor.Raw, &doc); err != nil {
-		return nil, exit.Internalf("this generation's descriptor is unreadable: %s", err)
-	}
-	names := []string{}
-	for _, raw := range doc.Jobs {
-		var named struct {
-			Name string `json:"name"`
-		}
-		if json.Unmarshal(raw, &named) != nil {
-			continue
-		}
-		names = append(names, named.Name)
-		if named.Name == function {
-			return raw, nil
-		}
-	}
-	known := strings.Join(names, ", ")
-	if known == "" {
-		known = "no jobs"
-	}
-	return nil, exit.Named(exit.NotFound, "unknown_job",
-		"%s registers no job named %q", f.Install.Endpoint, function).
-		WithRemedy("it registers: %s", known).
-		WithNext("cozy describe " + f.Install.Endpoint)
 }
