@@ -12,10 +12,10 @@
 set -euo pipefail
 
 RUNTIME_REPO="${RUNTIME_REPO:-$HOME/cozy_v2/cozy-runtime}"
-# e4e71ac is the floor, not a preference: it retains the current job launch surface and
+# ef21fb4 is the floor, not a preference: it retains the current job launch surface and
 # speaks worker-protocol schema rev 3. An older runtime is either missing the launch facts
 # or is refused at Claim by the schema digest; the release and wire move together.
-RUNTIME_SHA="${RUNTIME_SHA:-e4e71ace35a5a2286cf9173f5e0d7441401995c8}"
+RUNTIME_SHA="${RUNTIME_SHA:-ef21fb4440a09ea335177f8762269170830ee7e5}"
 TENSORFS_WHEEL="${TENSORFS_WHEEL:-/tmp/cozy-wheels-cl003/tensorfs-0.0.1-cp311-abi3-linux_x86_64.whl}"
 DESCRIBE_PY="${DESCRIBE_PY:-$RUNTIME_REPO/corpus/.venv/bin/python}"
 OUT="${OUT:-$HOME/.cache/cozy/cl-004}"

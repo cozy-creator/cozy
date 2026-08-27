@@ -26,10 +26,10 @@
 set -euo pipefail
 
 RUNTIME_REPO="${RUNTIME_REPO:-$HOME/cozy_v2/cozy-runtime}"
-# e4e71ac is the floor, not a preference: it retains the current launch/materialization
+# ef21fb4 is the floor, not a preference: it retains the current launch/materialization
 # surface and speaks worker-protocol schema rev 3. An older runtime is either missing the
 # launch facts or is refused at Claim by the schema digest; the release and wire move together.
-RUNTIME_SHA="${RUNTIME_SHA:-e4e71ace35a5a2286cf9173f5e0d7441401995c8}"
+RUNTIME_SHA="${RUNTIME_SHA:-ef21fb4440a09ea335177f8762269170830ee7e5}"
 # tfs-007's compiled facade, built from a PINNED read-only `git archive` of tensorfs
 # 846532c. The wheel is not incidental: cozytensors' ENCODING REGISTRY ships inside it, so
 # the release's pinned tensorfs is what decides which encodings this endpoint can read
