@@ -24,6 +24,7 @@ import (
 	"github.com/cozy-creator/cozy-creator-v2/internal/media"
 	"github.com/cozy-creator/cozy-creator-v2/internal/plan"
 	"github.com/cozy-creator/cozy-creator-v2/internal/records"
+	"github.com/cozy-creator/cozy-creator-v2/internal/workertls"
 )
 
 // cl-015's section: RENT A POD, ATTACH ITS WORKER, ROUTE TO IT, AND SEE WHERE THE BYTES
@@ -883,7 +884,9 @@ func mediaCall(root, rentalID, method, path, bearer string, body []byte) (int, s
 	}
 	request.Header.Set("Authorization", "Bearer "+bearer)
 	client := &http.Client{Transport: &http.Transport{
-		TLSClientConfig: &tls.Config{RootCAs: pool, MinVersion: tls.VersionTLS12},
+		TLSClientConfig: &tls.Config{
+			RootCAs: pool, MinVersion: tls.VersionTLS12, ServerName: workertls.ServerName,
+		},
 	}}
 	response, err := client.Do(request)
 	if err != nil {
