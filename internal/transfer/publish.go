@@ -22,6 +22,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/cozy-creator/cozy-creator-v2/internal/exit"
@@ -194,64 +195,86 @@ func (p *Publish) Run(ctx context.Context) (Result, *exit.Error) {
 // upload requests grants, writes each object at its final content key under every
 // condition the grant signed, and then asks the hub to prove them. An expired grant
 // comes back as a REPLAN and is answered by asking again — never by failing.
+const publishParallelism = 8
+
+type uploadOutcome struct {
+	index     int
+	report    hub.VerifyReport
+	moved     int64
+	multipart bool
+	err       *exit.Error
+}
+
 func (p *Publish) upload(ctx context.Context, missing []hub.Missing, res *Result, ms map[string]int64) *exit.Error {
+	parallelism := publishParallelism
+	if p.FailAfter > 0 {
+		// The development kill point promises an exact completed-object count. Keep
+		// that proof serial without slowing the production path.
+		parallelism = 1
+	}
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	started := time.Now()
+	jobs := make(chan int)
+	outcomes := make(chan uploadOutcome, parallelism)
+	var workers sync.WaitGroup
+	for range parallelism {
+		workers.Add(1)
+		go func() {
+			defer workers.Done()
+			for index := range jobs {
+				outcome := p.uploadOne(ctx, res.PublishID, index, missing[index])
+				outcomes <- outcome
+				if outcome.err != nil {
+					cancel()
+					return
+				}
+			}
+		}()
+	}
+	go func() {
+		defer close(outcomes)
+		for index := range missing {
+			select {
+			case jobs <- index:
+			case <-ctx.Done():
+				close(jobs)
+				workers.Wait()
+				return
+			}
+		}
+		close(jobs)
+		workers.Wait()
+	}()
+
+	ordered := make([]*uploadOutcome, len(missing))
+	for outcome := range outcomes {
+		copy := outcome
+		ordered[outcome.index] = &copy
+	}
+	for index, outcome := range ordered {
+		if outcome == nil {
+			return exit.Internalf("upload stopped before object %d/%d produced a verdict", index, len(missing))
+		}
+		if outcome.err != nil {
+			return outcome.err
+		}
+	}
+
 	reports := make([]hub.VerifyReport, 0, len(missing))
-	staged := filepath.Join(p.Scratch, "object")
-	var grantMS, uploadMS int64
-	for i, object := range missing {
-		if p.FailAfter > 0 && i >= p.FailAfter {
-			return exit.Named(exit.Internal, "crash_after_upload",
-				"development kill point: stopped after %d of %d objects", i, len(missing)).
-				WithRemedy("re-run the same publish; the hub re-plans the declaration and the uploaded objects are already held")
-		}
-		t0 := time.Now()
-		g, e := p.Hub.Grant(ctx, p.Ref, res.PublishID, object.ID, p.Reason)
-		grantMS += since(t0)
-		if e != nil {
-			return e
-		}
+	for _, outcome := range ordered {
 		res.Grants++
-		if g.Multipart() {
+		res.Uploaded++
+		res.Moved += outcome.moved
+		if outcome.multipart {
 			res.Multipart++
 		}
-		// The bytes leave the store through a VERIFIED read, so a publisher cannot
-		// upload what its own store silently corrupted.
-		t0 = time.Now()
-		if e := p.Tool.Extract(g.ObjectID, staged); e != nil {
-			return e
-		}
-		conflict, e := p.put(ctx, g, staged, res)
-		uploadMS += since(t0)
-		if e != nil {
-			// A grant whose window closed is a re-plan, not a failure. Ask again
-			// once for this same object and continue; a second expiry is a clock
-			// problem, not a race.
-			if e.Name != "grant.expired_replan" {
-				return e
-			}
-			p.say("a grant window closed mid-upload: re-planning (already-verified objects are the journal)")
-			t0 = time.Now()
-			fresh, e2 := p.Hub.Grant(ctx, p.Ref, res.PublishID, g.ObjectID, p.Reason)
-			grantMS += since(t0)
-			if e2 != nil {
-				return e2
-			}
-			t0 = time.Now()
-			conflict, e = p.put(ctx, fresh, staged, res)
-			uploadMS += since(t0)
-			if e != nil {
-				return e
-			}
-		}
-		res.Uploaded++
-		if conflict {
+		if outcome.report.Conflict {
 			res.Conflicts++
 		}
-		reports = append(reports, hub.VerifyReport{ObjectID: g.ObjectID, Conflict: conflict})
+		reports = append(reports, outcome.report)
 	}
-	_ = os.Remove(staged)
-	ms["grants"] = grantMS
-	ms["upload"] = uploadMS
+	ms["grant_upload"] = since(started)
 	p.say("granted and uploaded %d objects one at a time (%d ranged), %s moved "+
 		"(%d already resident at the key)", res.Uploaded, res.Multipart, size(res.Moved), res.Conflicts)
 
@@ -279,6 +302,48 @@ func (p *Publish) upload(ctx context.Context, missing []hub.Missing, res *Result
 	p.say("the hub re-hashed %d/%d objects for itself (%s)",
 		res.Verified, len(verdicts), strings.Join(res.Sources, ", "))
 	return nil
+}
+
+func (p *Publish) uploadOne(ctx context.Context, publishID string, index int, object hub.Missing) uploadOutcome {
+	outcome := uploadOutcome{index: index}
+	if p.FailAfter > 0 && index >= p.FailAfter {
+		outcome.err = exit.Named(exit.Internal, "crash_after_upload",
+			"development kill point: stopped after %d objects", index).
+			WithRemedy("re-run the same publish; the hub re-plans the declaration and the uploaded objects are already held")
+		return outcome
+	}
+	grant, e := p.Hub.Grant(ctx, p.Ref, publishID, object.ID, p.Reason)
+	if e != nil {
+		outcome.err = e
+		return outcome
+	}
+	outcome.multipart = grant.Multipart()
+	staged := filepath.Join(p.Scratch, fmt.Sprintf("object-%06d", index))
+	defer os.Remove(staged)
+
+	// The bytes leave the store through a VERIFIED read, so a publisher cannot
+	// upload what its own store silently corrupted.
+	local := Result{}
+	if e := p.Tool.Extract(grant.ObjectID, staged); e != nil {
+		outcome.err = e
+		return outcome
+	}
+	conflict, e := p.put(ctx, grant, staged, &local)
+	if e != nil && e.Name == "grant.expired_replan" {
+		fresh, e2 := p.Hub.Grant(ctx, p.Ref, publishID, grant.ObjectID, p.Reason)
+		if e2 != nil {
+			outcome.err = e2
+			return outcome
+		}
+		conflict, e = p.put(ctx, fresh, staged, &local)
+	}
+	if e != nil {
+		outcome.err = e
+		return outcome
+	}
+	outcome.moved = local.Moved
+	outcome.report = hub.VerifyReport{ObjectID: grant.ObjectID, Conflict: conflict}
+	return outcome
 }
 
 // put writes one object at its final content key. Every required header is sent
