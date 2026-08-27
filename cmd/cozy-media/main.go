@@ -12,8 +12,8 @@
 // Six routes, and the shape of each is the whole design:
 //
 //	GET  /v1/bootstrap/receipt    Tensorhub reads one attempt-bound, pod-authored readiness
-//	                              receipt. It has its OWN bearer hash, which cannot authorize
-//	                              any renter route. The response is the exact file bytes.
+//	                              envelope. Its HMAC is verified by Tensorhub before the TLS
+//	                              peer is trusted; the response is the exact file bytes.
 //	PUT  /v1/inputs/{blob}        the owner uploads one attempt input; the answer is the
 //	                              POD-LOCAL PATH it landed at, which is what the owner then
 //	                              mints into the DeliveryGrant. The owner never guesses a
@@ -32,11 +32,13 @@
 //	DELETE /v1/attempts/{slot}    after rollback, or after mirror plus outcome ack, the
 //	                              owner drops exactly that attempt's inputs and outputs.
 //
-// AUTH is a bearer against a TOKEN-HASH FILE, stat-per-request and fail-closed: the file is
-// re-read whenever its (size, mtime) changes, an unreadable or empty file authenticates
-// NOBODY, and this process never holds the token — only its digest. The epoch never moves
-// backward: a replacement whose mtime predates what is loaded is refused rather than
-// applied, so a restored backup cannot reinstate a retired credential.
+// Every RENTER route authenticates a bearer against a TOKEN-HASH FILE, stat-per-request
+// and fail-closed: the file is re-read whenever its (size, mtime) changes, an unreadable or
+// empty file authenticates NOBODY, and this process never holds the token — only its
+// digest. The epoch never moves backward: a replacement whose mtime predates what is
+// loaded is refused rather than applied, so a restored backup cannot reinstate a retired
+// credential. The bootstrap envelope contains no capability; Tensorhub authenticates its
+// exact bytes with the attempt HMAC before trusting the TLS peer that served them.
 //
 // The SUBTREE IS QUOTA-BOUNDED and it is not the worker's root: uploads can never ENOSPC
 // the journal. The worker writes outputs through the shared filesystem, so this process
@@ -71,17 +73,16 @@ func main() {
 // options is the whole launch surface. Everything is a path grant or a bound; nothing is
 // discovered, nothing is read from the environment, and there is no configuration file.
 type options struct {
-	listen             string
-	root               string // the quota-bounded subtree this server OWNS
-	plans              string // the worker's `binding-plans` directory — write-only, from here
-	tokens             string // the token-hash file, `sha256:<64 hex>` one per line
-	out                string // where `media.addr` is published (the file-handoff discovery contract)
-	cert               string
-	key                string
-	bootstrapReceipt   string // exact pod-authored JSON; may appear after the listener starts
-	bootstrapTokenHash string // separate one-attempt verifier; never authorizes renter routes
-	quota              int64
-	maxBody            int64
+	listen           string
+	root             string // the quota-bounded subtree this server OWNS
+	plans            string // the worker's `binding-plans` directory — write-only, from here
+	tokens           string // the token-hash file, `sha256:<64 hex>` one per line
+	out              string // where `media.addr` is published (the file-handoff discovery contract)
+	cert             string
+	key              string
+	bootstrapReceipt string // exact pod-authored JSON; may appear after the listener starts
+	quota            int64
+	maxBody          int64
 }
 
 func run(args []string) int {
@@ -109,8 +110,6 @@ func run(args []string) int {
 			opt.key = value
 		case "bootstrap-receipt":
 			opt.bootstrapReceipt = value
-		case "bootstrap-token-sha256":
-			opt.bootstrapTokenHash = value
 		case "quota":
 			n, err := strconv.ParseInt(value, 10, 64)
 			if err != nil || n <= 0 {
@@ -134,10 +133,6 @@ func run(args []string) int {
 		return usage("--root <dir> is required: this server owns exactly one subtree")
 	case opt.tokens == "":
 		return usage("--tokens <file> is required: there is no unauthenticated mode")
-	case (opt.bootstrapReceipt == "") != (opt.bootstrapTokenHash == ""):
-		return usage("--bootstrap-receipt and --bootstrap-token-sha256 must be supplied together")
-	case opt.bootstrapTokenHash != "" && !validTokenHash(opt.bootstrapTokenHash):
-		return usage("--bootstrap-token-sha256 must be sha256:<64 lowercase hex>")
 	}
 	for _, dir := range []string{filepath.Join(opt.root, "inputs"), filepath.Join(opt.root, "outputs")} {
 		if err := os.MkdirAll(dir, 0o755); err != nil {
@@ -263,30 +258,14 @@ func (s *server) admits(w http.ResponseWriter, r *http.Request) bool {
 
 const maxBootstrapReceiptBytes = 64 << 10
 
-func validTokenHash(line string) bool {
-	if !strings.HasPrefix(line, "sha256:") || len(line) != len("sha256:")+64 {
-		return false
-	}
-	_, err := hex.DecodeString(strings.TrimPrefix(line, "sha256:"))
-	return err == nil && line == strings.ToLower(line)
-}
-
 // bootstrapReceipt is Tensorhub's one read-only rendezvous with a pod it bought. The
-// attempt-specific hash is separate from the renter set, so the hub can prove that the
-// expected image answered without acquiring the ability to control the worker or move
-// media. The file may appear after this listener starts; until then readiness is pending.
-// Exact bytes are returned so the hub can digest and retain the document it actually saw.
+// envelope carries an attempt HMAC that Tensorhub verifies over exact payload bytes before
+// it trusts the TLS peer. cozy-media owns neither that schema nor its key: it serves the
+// atomically published bytes and nothing else. Until the file appears, readiness is early.
 func (s *server) bootstrapReceipt(w http.ResponseWriter, r *http.Request) {
-	presented := strings.TrimSpace(strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer "))
-	if !secret.MatchesHash(presented, s.opt.bootstrapTokenHash) {
-		refuse(w, http.StatusUnauthorized, "media.bootstrap_unauthenticated",
-			"the presented credential does not match this acquisition attempt",
-			"Tensorhub alone holds the one-attempt bootstrap credential")
-		return
-	}
 	file, err := os.Open(s.opt.bootstrapReceipt)
 	if err != nil {
-		refuse(w, http.StatusServiceUnavailable, "media.bootstrap_pending",
+		refuse(w, http.StatusTooEarly, "media.bootstrap_pending",
 			"the pod has not published its readiness receipt: "+err.Error(),
 			"wait for endpoint materialization and both pod listeners")
 		return
@@ -730,7 +709,7 @@ func usage(format string, args ...any) int {
 	fmt.Fprintf(os.Stderr, "cozy-media: "+format+"\n", args...)
 	fmt.Fprintln(os.Stderr, "usage: cozy-media --listen <host:port> --root <dir> "+
 		"--tokens <file> [--plans <dir>] [--out <dir>] [--tls-cert <pem> --tls-key <pem>] "+
-		"[--bootstrap-receipt <json> --bootstrap-token-sha256 <sha256:hex>] "+
+		"[--bootstrap-receipt <json>] "+
 		"[--quota <bytes>] [--max-body <bytes>]")
 	return 2
 }

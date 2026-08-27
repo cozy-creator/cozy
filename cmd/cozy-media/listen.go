@@ -20,8 +20,9 @@ import (
 //
 // What replaces "loopback only" here is the pair below it: a non-loopback listener REQUIRES
 // TLS, exactly as the worker's own does (`serve --tls-cert/--tls-key`), and there is no
-// unauthenticated route. A plaintext media server reachable off-loopback would be an owner
-// token travelling in the clear on the first request.
+// unauthenticated RENTER route. The bootstrap receipt contains no capability and is
+// authenticated by its attempt HMAC before Tensorhub trusts the serving certificate. A
+// plaintext media server reachable off-loopback would still put owner tokens in the clear.
 func (s *server) serve() int {
 	if !loopback(s.opt.listen) && (s.opt.cert == "" || s.opt.key == "") {
 		return fatal("refusing to bind %s without TLS: this server is reached from off the "+

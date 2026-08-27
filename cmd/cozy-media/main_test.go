@@ -12,32 +12,24 @@ import (
 	"github.com/cozy-creator/cozy-creator-v2/internal/secret"
 )
 
-func TestBootstrapReceiptHasSeparateAttemptCredential(t *testing.T) {
+func TestBootstrapReceiptServesExactBytesOnlyAfterPublication(t *testing.T) {
 	root := t.TempDir()
 	receipt := filepath.Join(root, "bootstrap.json")
-	s := &server{opt: options{
-		bootstrapReceipt:   receipt,
-		bootstrapTokenHash: secret.HashLine(secret.New("attempt-bootstrap-token")),
-	}}
-	call := func(token string) *httptest.ResponseRecorder {
-		t.Helper()
+	s := &server{opt: options{bootstrapReceipt: receipt}}
+	call := func() *httptest.ResponseRecorder {
 		req := httptest.NewRequest(http.MethodGet, "/v1/bootstrap/receipt", nil)
-		req.Header.Set("Authorization", "Bearer "+token)
 		out := httptest.NewRecorder()
 		s.routes().ServeHTTP(out, req)
 		return out
 	}
-	if got := call("renter-token"); got.Code != http.StatusUnauthorized {
-		t.Fatalf("renter credential status = %d, want 401", got.Code)
-	}
-	if got := call("attempt-bootstrap-token"); got.Code != http.StatusServiceUnavailable {
-		t.Fatalf("pending receipt status = %d, want 503", got.Code)
+	if got := call(); got.Code != http.StatusTooEarly {
+		t.Fatalf("pending receipt status = %d, want 425", got.Code)
 	}
 	want := []byte(`{"kind":"cozy.pod_bootstrap_receipt/1","attempt_id":"ra-1"}`)
 	if err := os.WriteFile(receipt, want, 0o600); err != nil {
 		t.Fatal(err)
 	}
-	got := call("attempt-bootstrap-token")
+	got := call()
 	if got.Code != http.StatusOK || !bytes.Equal(got.Body.Bytes(), want) {
 		t.Fatalf("receipt = status %d body %q, want 200 %q", got.Code, got.Body.Bytes(), want)
 	}
