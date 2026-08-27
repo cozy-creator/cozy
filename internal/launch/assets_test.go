@@ -83,6 +83,39 @@ func TestPopulatedAssetPathsUsesTheValidationWalk(t *testing.T) {
 	}
 }
 
+func TestTaggedUnionAssetCarriesAndValidatesExactDiscriminator(t *testing.T) {
+	var ep Entrypoint
+	if err := json.Unmarshal([]byte(`{"name":"run","request":{"fields":[
+      {"name":"references","type":{"list":{"tag_field":"type","union":[
+        {"tag":"image","tag_field":"type","fields":[
+          {"name":"type","type":{"literal":["image"]},"wire":"required","discriminator":true},
+          {"name":"image","type":{"asset":"image"},"wire":"required","asset_bound":{"max_bytes":100}}]},
+        {"tag":"video","tag_field":"type","fields":[
+          {"name":"type","type":{"literal":["video"]},"wire":"required","discriminator":true},
+          {"name":"video","type":{"asset":"video"},"wire":"required","asset_bound":{"max_bytes":200}}]}
+      ]}},"wire":"required"}
+    ]}}`), &ep); err != nil {
+		t.Fatal(err)
+	}
+	spec, ok := AssetSpec(&ep, "references.0.image")
+	if !ok || spec.Kind != "image" || spec.TagField != "type" || spec.TagValue != "image" {
+		t.Fatalf("spec=%#v ok=%v", spec, ok)
+	}
+	good := []byte(`{"references":[{"type":"image","image":""}]}`)
+	if problem := ValidatePayloadAssets(&ep, good, []string{"references.0.image"}); problem != nil {
+		t.Fatal(problem)
+	}
+	for _, bad := range [][]byte{
+		[]byte(`{"references":[{"image":""}]}`),
+		[]byte(`{"references":[{"type":"video","image":""}]}`),
+		[]byte(`{"references":[{"type":"audio","image":""}]}`),
+	} {
+		if problem := ValidatePayloadAssets(&ep, bad, []string{"references.0.image"}); problem == nil {
+			t.Fatalf("tagged payload accepted: %s", bad)
+		}
+	}
+}
+
 func TestValidatePayloadEnforcesRecordedConstraints(t *testing.T) {
 	var ep Entrypoint
 	if err := json.Unmarshal([]byte(`{

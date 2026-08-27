@@ -21,6 +21,7 @@ import (
 	"github.com/cozy-creator/cozy-creator-v2/internal/render"
 	"github.com/cozy-creator/cozy-creator-v2/internal/rental"
 	"github.com/cozy-creator/cozy-creator-v2/internal/service"
+	"github.com/cozy-creator/cozy-creator-v2/internal/video"
 	"github.com/cozy-creator/cozy-creator-v2/internal/workflow"
 )
 
@@ -144,6 +145,20 @@ func handleUp(ctx *Context) *exit.Error {
 	}
 	flows.Start()
 	defer flows.Close()
+	composer, e := video.Open(video.Options{
+		Store: st, Layout: l, Resolver: resolver, Rentals: knownRentals,
+		RemoteEntrypoint: func(worker, name string) (*launch.Entrypoint, *exit.Error) {
+			descriptor, problem := rental.Descriptor(st, worker)
+			if problem != nil {
+				return nil, problem
+			}
+			return descriptor.Function(name)
+		},
+	})
+	if e != nil {
+		closeListeners()
+		return e
+	}
 
 	// Two per-launch credentials: one for the browser (handed over in the `--open` URL's
 	// FRAGMENT) and one for CLI clients (handed over through a 0600 file). Neither is
@@ -163,6 +178,7 @@ func handleUp(ctx *Context) *exit.Error {
 		Log: ctx.Out, Endpoints: resolver, Bound: bound, Rentals: knownRentals,
 		Shutdown:  func() { stop <- syscall.SIGTERM },
 		Workflows: flows,
+		Videos:    composer,
 	})
 	handler, e := server.Handler()
 	if e != nil {

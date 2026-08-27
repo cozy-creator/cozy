@@ -184,6 +184,56 @@ func PopulatedAssetPaths(ep *Entrypoint, payload json.RawMessage) ([]string, *ex
 	return out, nil
 }
 
+// ValidatePayloadAssets validates one authored payload after substituting exact-shaped
+// opaque references at the declared out-of-band grant paths. It is the pre-record gate
+// shared by higher-level composers that know asset identity before the digest exists in
+// a backward workflow binding.
+func ValidatePayloadAssets(ep *Entrypoint, payload json.RawMessage, assetPaths []string) *exit.Error {
+	decoder := json.NewDecoder(bytes.NewReader(payload))
+	decoder.UseNumber()
+	var document map[string]any
+	if err := decoder.Decode(&document); err != nil || document == nil {
+		return exit.New(exit.Validation, "%s payload is not one JSON object", ep.Name)
+	}
+	expected := append([]string(nil), assetPaths...)
+	sort.Strings(expected)
+	for index, path := range expected {
+		if index > 0 && expected[index-1] == path {
+			return exit.New(exit.Validation, "request asset path %s appears more than once", path)
+		}
+		parts, problem := assetPath(path)
+		if problem != nil {
+			return problem
+		}
+		if problem := setAssetRef(document, parts,
+			"sha256:0000000000000000000000000000000000000000000000000000000000000000"); problem != nil {
+			return problem
+		}
+	}
+	rendered, err := json.Marshal(document)
+	if err != nil {
+		return exit.Internalf("cannot render %s validation payload: %s", ep.Name, err)
+	}
+	if problem := ValidatePayload(ep, rendered); problem != nil {
+		return problem
+	}
+	populated, problem := PopulatedAssetPaths(ep, rendered)
+	if problem != nil {
+		return problem
+	}
+	if len(populated) != len(expected) {
+		return exit.Named(exit.Validation, "request_asset_resolution",
+			"%s payload asset references do not exactly match its declared grants", ep.Name)
+	}
+	for index := range populated {
+		if populated[index] != expected[index] {
+			return exit.Named(exit.Validation, "request_asset_resolution",
+				"%s payload asset references do not exactly match its declared grants", ep.Name)
+		}
+	}
+	return nil
+}
+
 func validateField(field Field, value any, path string) *exit.Error {
 	return validateFieldInto(field, value, path, nil)
 }
@@ -296,6 +346,40 @@ func validateRenderedInto(raw json.RawMessage, value any, path string, assets *[
 			return nil
 		}
 		return exit.New(exit.Validation, "request tree field %s is not a reference", path)
+	}
+	if literal, ok := schema["literal"]; ok {
+		var members []json.RawMessage
+		if json.Unmarshal(literal, &members) != nil || len(members) == 0 {
+			return exit.Named(exit.Structural, "descriptor_type_unknown",
+				"request field %s has an unreadable literal", path)
+		}
+		actual, err := json.Marshal(value)
+		if err == nil {
+			for _, member := range members {
+				var compact bytes.Buffer
+				if json.Compact(&compact, member) == nil && bytes.Equal(actual, compact.Bytes()) {
+					return nil
+				}
+			}
+		}
+		return exit.New(exit.Validation, "request field %s is not one of its declared literals", path)
+	}
+	if values, ok := schema["values"]; ok && schema["enum"] != nil {
+		var members []json.RawMessage
+		if json.Unmarshal(values, &members) != nil || len(members) == 0 {
+			return exit.Named(exit.Structural, "descriptor_type_unknown",
+				"request field %s has an unreadable enum", path)
+		}
+		actual, err := json.Marshal(value)
+		if err == nil {
+			for _, member := range members {
+				var compact bytes.Buffer
+				if json.Compact(&compact, member) == nil && bytes.Equal(actual, compact.Bytes()) {
+					return nil
+				}
+			}
+		}
+		return exit.New(exit.Validation, "request field %s is not one of its declared enum values", path)
 	}
 	if union, ok := schema["union"]; ok {
 		var branches []json.RawMessage

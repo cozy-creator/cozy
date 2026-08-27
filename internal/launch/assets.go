@@ -122,6 +122,8 @@ type AssetField struct {
 	Kind       string
 	MaxBytes   int64
 	MediaTypes []string
+	TagField   string
+	TagValue   any
 }
 
 func (f AssetField) AcceptsMediaType(actual string) bool {
@@ -178,6 +180,9 @@ func assetSpecAtValue(schema any, parts []string, inherited AssetField) (AssetFi
 	if kind, ok := object["asset"].(string); ok {
 		inherited.Kind = kind
 		return inherited, len(parts) == 0
+	}
+	if field, ok := object["tag_field"].(string); ok && field != "" {
+		inherited.TagField, inherited.TagValue = field, object["tag"]
 	}
 	if union, ok := object["union"].([]any); ok {
 		for _, branch := range union {

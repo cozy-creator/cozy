@@ -127,6 +127,9 @@ var Routes = []Route{
 	{"POST", "/v1/local/workflows/{id}/cancel", Local, true, true, false, "",
 		"persist workflow cancellation, cancel the active child, and mint nothing later",
 		"cl-018 `cozy workflow cancel`"},
+	{"POST", "/v1/local/video-compositions", Local, true, true, false, "",
+		"compose an exact Cozy Video source or retained creative plan into an ordinary workflow",
+		"cl-024 `cozy video compose`, `cozy video submit`"},
 
 	// ---- unauthenticated: liveness and the stub page ----
 	{"GET", "/healthz", Local, false, false, false, "",
@@ -160,6 +163,7 @@ var Tokens = []string{
 	"api.local.jobs",       // the bounded job family: submit/list/status/cancel
 	"api.jobs.publication", // a job's landed writes are a durable publication root
 	"api.local.workflows",  // ordered ordinary children, Creator-owned recovery/cancellation
+	"api.local.video",      // strict source composition into the workflow form
 	"api.stub.embedded",    // the go:embed stub page
 }
 
