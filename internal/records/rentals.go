@@ -21,8 +21,6 @@ CREATE TABLE IF NOT EXISTS rental_operations (
   operation_key    TEXT PRIMARY KEY,
   request_digest   TEXT NOT NULL,
   request_body     BLOB NOT NULL,
-  endpoint_ref     TEXT NOT NULL,
-  accelerator_model TEXT NOT NULL,
   hub              TEXT NOT NULL,
   reason           TEXT NOT NULL,
   rental_id        TEXT NOT NULL DEFAULT '',
@@ -53,25 +51,23 @@ CREATE UNIQUE INDEX IF NOT EXISTS rental_operation_remote
 // the POST: the operation key and its 0600 token survive a lost response, so retry can
 // ask for the same provider obligation instead of buying a second one.
 type RentalOperation struct {
-	Key              string
-	RequestDigest    string
-	RequestBody      []byte
-	EndpointRef      string
-	AcceleratorModel string
-	Hub              string
-	Reason           string
-	RentalID         string
-	State            string
-	CreatedAt        string
-	UpdatedAt        string
+	Key           string
+	RequestDigest string
+	RequestBody   []byte
+	Hub           string
+	Reason        string
+	RentalID      string
+	State         string
+	CreatedAt     string
+	UpdatedAt     string
 }
 
-const rentalOperationCols = `operation_key,request_digest,request_body,endpoint_ref,accelerator_model,hub,reason,rental_id,state,created_at,updated_at`
+const rentalOperationCols = `operation_key,request_digest,request_body,hub,reason,rental_id,state,created_at,updated_at`
 
 func scanRentalOperation(row interface{ Scan(...any) error }) (RentalOperation, error) {
 	var op RentalOperation
-	err := row.Scan(&op.Key, &op.RequestDigest, &op.RequestBody, &op.EndpointRef, &op.AcceleratorModel,
-		&op.Hub, &op.Reason, &op.RentalID, &op.State, &op.CreatedAt, &op.UpdatedAt)
+	err := row.Scan(&op.Key, &op.RequestDigest, &op.RequestBody, &op.Hub, &op.Reason,
+		&op.RentalID, &op.State, &op.CreatedAt, &op.UpdatedAt)
 	return op, err
 }
 
@@ -80,8 +76,8 @@ func scanRentalOperation(row interface{ Scan(...any) error }) (RentalOperation, 
 func (s *Store) BeginRentalOperation(op RentalOperation) (RentalOperation, bool, *exit.Error) {
 	stamp := now()
 	res, err := s.db.Exec(`INSERT INTO rental_operations(`+rentalOperationCols+`)
-		VALUES(?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(operation_key) DO NOTHING`,
-		op.Key, op.RequestDigest, op.RequestBody, op.EndpointRef, op.AcceleratorModel, op.Hub, op.Reason,
+		VALUES(?,?,?,?,?,?,?,?,?) ON CONFLICT(operation_key) DO NOTHING`,
+		op.Key, op.RequestDigest, op.RequestBody, op.Hub, op.Reason,
 		op.RentalID, "pending", stamp, stamp)
 	if err != nil {
 		return RentalOperation{}, false, exit.Internalf("cannot record rental operation: %s", err)
@@ -251,10 +247,25 @@ var rentalRebuild = []tableRebuild{{
 		`ALTER TABLE rental_operations RENAME TO rental_operations_pre_provider_neutral`,
 		rentalOperationsDDL,
 		`INSERT INTO rental_operations
-  (operation_key,request_digest,request_body,endpoint_ref,accelerator_model,hub,reason,rental_id,state,created_at,updated_at)
-  SELECT operation_key,request_digest,x'',endpoint,card,hub,reason,rental_id,state,created_at,updated_at
+  (operation_key,request_digest,request_body,hub,reason,rental_id,state,created_at,updated_at)
+  SELECT operation_key,request_digest,x'',hub,reason,rental_id,state,created_at,updated_at
     FROM rental_operations_pre_provider_neutral`,
 		`DROP TABLE rental_operations_pre_provider_neutral`,
+		`CREATE UNIQUE INDEX rental_operation_remote
+  ON rental_operations(rental_id) WHERE rental_id <> ''`,
+	},
+}, {
+	table: "rental_operations",
+	stale: "endpoint_ref",
+	steps: []string{
+		`DROP INDEX IF EXISTS rental_operation_remote`,
+		`ALTER TABLE rental_operations RENAME TO rental_operations_pre_operation_field_drop`,
+		rentalOperationsDDL,
+		`INSERT INTO rental_operations
+  (operation_key,request_digest,request_body,hub,reason,rental_id,state,created_at,updated_at)
+  SELECT operation_key,request_digest,request_body,hub,reason,rental_id,state,created_at,updated_at
+    FROM rental_operations_pre_operation_field_drop`,
+		`DROP TABLE rental_operations_pre_operation_field_drop`,
 		`CREATE UNIQUE INDEX rental_operation_remote
   ON rental_operations(rental_id) WHERE rental_id <> ''`,
 	},

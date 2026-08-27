@@ -197,10 +197,6 @@ func pinnedEndpoint(endpoint, rental string) string {
 	return endpoint + "@" + rental
 }
 
-// WorkerID is what the Claim names as the expected worker identity; empty skips the
-// worker-side check (a spawned worker's identity is already ours by construction).
-func (s WorkerLaunchSpec) WorkerID() string { return "" }
-
 // IsJob answers the worker's mode.
 func (p DesiredPlacement) IsJob() bool { return len(p.Jobs) > 0 }
 

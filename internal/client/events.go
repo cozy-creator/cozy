@@ -36,9 +36,6 @@ func Terminal(t string) bool {
 	return false
 }
 
-// Live answers whether an event came off the lossy lane rather than the durable one.
-func Live(e Event) bool { return e.EventID == 0 }
-
 // Watch consumes ONE request's stream to its terminal, calling `on` for every event. It
 // reconnects from its own cursor when the connection drops without a terminal, because a
 // close is not a verdict; `on` returning false stops the watch deliberately (SIGINT, a

@@ -130,7 +130,6 @@ func handleRent(ctx *Context) *exit.Error {
 	digest := rentalRequestDigest(c.Base(), requestBody)
 	op, replay, e := st.BeginRentalOperation(records.RentalOperation{
 		Key: operationKey, RequestDigest: digest, RequestBody: requestBody,
-		EndpointRef: endpointRef, AcceleratorModel: acceleratorModel,
 		Hub: c.Base(), Reason: reason,
 	})
 	if e != nil {

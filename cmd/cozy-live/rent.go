@@ -877,11 +877,6 @@ func alivePID(pid int) bool {
 	return proc.Signal(syscall.Signal(0)) == nil
 }
 
-func digestOfBytes(data []byte) string {
-	sum := sha256.Sum256(data)
-	return "sha256:" + hex.EncodeToString(sum[:])
-}
-
 // dispatchedRequest reads the request id out of the stream a `--stream` run printed, so an
 // arm can name the media slot the orchestrator's own grant pointed at.
 func dispatchedRequest(stream string) string {

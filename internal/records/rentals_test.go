@@ -1,11 +1,58 @@
 package records
 
 import (
+	"bytes"
 	"database/sql"
 	"path/filepath"
 	"sync"
 	"testing"
 )
+
+func TestOpenDropsWriteOnlyRentalOperationFields(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "records.db")
+	legacy, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	requestBody := []byte(`{"endpoint_ref":"acme/h3/v1/generate","accelerator_model":"NVIDIA H200"}`)
+	if _, err := legacy.Exec(`CREATE TABLE rental_operations (
+  operation_key TEXT PRIMARY KEY, request_digest TEXT NOT NULL, request_body BLOB NOT NULL,
+  endpoint_ref TEXT NOT NULL, accelerator_model TEXT NOT NULL, hub TEXT NOT NULL,
+  reason TEXT NOT NULL, rental_id TEXT NOT NULL DEFAULT '', state TEXT NOT NULL,
+  created_at TEXT NOT NULL, updated_at TEXT NOT NULL)`); err != nil {
+		legacy.Close()
+		t.Fatal(err)
+	}
+	if _, err := legacy.Exec(`INSERT INTO rental_operations VALUES
+  ('op-current','sha256:request',?,?,?,?,'reason','rnt-current','ready','then','then')`,
+		requestBody, "acme/h3/v1/generate", "NVIDIA H200", "https://hub.invalid"); err != nil {
+		legacy.Close()
+		t.Fatal(err)
+	}
+	if err := legacy.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	st, e := Open(path)
+	if e != nil {
+		t.Fatal(e)
+	}
+	defer st.Close()
+	op, e := st.RentalOperation("op-current")
+	if e != nil || op == nil || !bytes.Equal(op.RequestBody, requestBody) {
+		t.Fatalf("migrated operation = %#v, %v", op, e)
+	}
+	for _, column := range []string{"endpoint_ref", "accelerator_model"} {
+		var count int
+		if err := st.db.QueryRow(`SELECT COUNT(*) FROM pragma_table_info('rental_operations')
+      WHERE name=?`, column).Scan(&count); err != nil {
+			t.Fatal(err)
+		}
+		if count != 0 {
+			t.Fatalf("write-only column rental_operations.%s survived", column)
+		}
+	}
+}
 
 func TestAdvanceRentalOperationIsMonotone(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "records.db")
@@ -16,7 +63,6 @@ func TestAdvanceRentalOperationIsMonotone(t *testing.T) {
 	defer st.Close()
 	_, _, e = st.BeginRentalOperation(RentalOperation{
 		Key: "op", RequestDigest: "sha256:request", RequestBody: []byte(`{}`),
-		EndpointRef: "acme/h3/v1/generate", AcceleratorModel: "NVIDIA H200",
 		Hub: "https://hub.invalid", Reason: "test",
 	})
 	if e != nil {
@@ -50,6 +96,23 @@ func TestAdvanceRentalOperationIsMonotone(t *testing.T) {
 	}
 	if e := st.AdvanceRentalOperation("op", "rnt-other", "ready"); e == nil || e.ErrName() != "rental.operation_conflict" {
 		t.Fatalf("foreign rental id conflict = %v", e)
+	}
+	_, _, e = st.BeginRentalOperation(RentalOperation{
+		Key: "op-failed", RequestDigest: "sha256:failed", RequestBody: []byte(`{}`),
+		Hub: "https://hub.invalid", Reason: "test",
+	})
+	if e != nil {
+		t.Fatal(e)
+	}
+	if e := st.AdvanceRentalOperation("op-failed", "", "failed"); e != nil {
+		t.Fatal(e)
+	}
+	if e := st.AdvanceRentalOperation("op-failed", "rnt-late", "ready"); e != nil {
+		t.Fatal(e)
+	}
+	failed, e := st.RentalOperation("op-failed")
+	if e != nil || failed == nil || failed.State != "failed" || failed.RentalID != "" {
+		t.Fatalf("failed operation regressed = %#v, %v", failed, e)
 	}
 
 	if e := st.RecordRental(Rental{ID: "rnt-one", EndpointRef: "acme/h3/v1/generate",
@@ -112,19 +175,19 @@ func TestOpenHardcutsLegacyProviderRentalFields(t *testing.T) {
 	if e != nil || op == nil {
 		t.Fatalf("migrated operation = %#v, %v", op, e)
 	}
-	if op.EndpointRef != "acme/h3/v1/generate" || op.AcceleratorModel != "NVIDIA H200" || len(op.RequestBody) != 0 {
+	if len(op.RequestBody) != 0 {
 		t.Fatalf("migrated operation = %#v", op)
 	}
 	r, e := st.RentalRow("rnt-old")
 	if e != nil || r == nil {
 		t.Fatalf("migrated rental = %#v, %v", r, e)
 	}
-	if r.EndpointRef != op.EndpointRef || r.AcceleratorModel != op.AcceleratorModel || r.Address == "" {
+	if r.EndpointRef != "acme/h3/v1/generate" || r.AcceleratorModel != "NVIDIA H200" || r.Address == "" {
 		t.Fatalf("migrated rental = %#v", r)
 	}
 
 	for table, forbidden := range map[string][]string{
-		"rental_operations": {"endpoint", "card", "region"},
+		"rental_operations": {"endpoint", "card", "region", "endpoint_ref", "accelerator_model"},
 		"rentals":           {"endpoint", "card", "pod_id"},
 	} {
 		rows, err := st.db.Query(`PRAGMA table_info(` + table + `)`)

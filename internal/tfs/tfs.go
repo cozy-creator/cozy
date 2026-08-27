@@ -20,14 +20,12 @@ package tfs
 import (
 	"bytes"
 	"encoding/json"
-	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"regexp"
 	"strconv"
 	"strings"
-	"time"
 
 	"github.com/cozy-creator/cozy-creator-v2/internal/config"
 	"github.com/cozy-creator/cozy-creator-v2/internal/exit"
@@ -61,17 +59,6 @@ func Open(cfg config.Config, layout home.Layout) (*Tool, *exit.Error) {
 		return nil, e
 	}
 	return t, nil
-}
-
-// Version identifies the binary for a receipt line. It is the path plus its size and
-// modification time: tfs prints no version of its own, and inventing one would be a
-// claim nobody produced.
-func (t *Tool) Version() string {
-	st, err := os.Stat(t.Bin)
-	if err != nil {
-		return t.Bin
-	}
-	return fmt.Sprintf("%s (%d B, %s)", t.Bin, st.Size(), st.ModTime().UTC().Format(time.RFC3339))
 }
 
 func (t *Tool) run(args ...string) (string, *exit.Error) {

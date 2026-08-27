@@ -173,19 +173,6 @@ func (c *Client) Request(id string) (api.Lifecycle, *exit.Error) {
 	return life, e
 }
 
-// Requests lists requests newest-first.
-func (c *Client) Requests(status string, limit int) ([]api.Lifecycle, *exit.Error) {
-	var out struct {
-		Requests []api.Lifecycle `json:"requests"`
-	}
-	path := fmt.Sprintf("/v1/requests?limit=%d", limit)
-	if status != "" {
-		path += "&status=" + status
-	}
-	e := c.call("GET", path, nil, &out)
-	return out.Requests, e
-}
-
 // Cancel REQUESTS cancellation. The attempt's own journaled terminal settles it, so this
 // returns as soon as the request is recorded and the caller keeps watching the stream.
 func (c *Client) Cancel(id string) *exit.Error {
@@ -210,15 +197,6 @@ func (c *Client) Media(mediaID string, write func(io.Reader) (int64, *exit.Error
 	}
 	n, e := write(res.Body)
 	return n, res.Header.Get("X-Cozy-Digest"), e
-}
-
-// Capabilities is the server's own token list.
-func (c *Client) Capabilities() ([]string, *exit.Error) {
-	var out struct {
-		Tokens []string `json:"tokens"`
-	}
-	e := c.call("GET", "/v1/capabilities", nil, &out)
-	return out.Tokens, e
 }
 
 // ------------------------------------------------------------ the LOCAL extension
