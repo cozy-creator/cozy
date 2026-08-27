@@ -107,9 +107,13 @@ func handleUp(ctx *Context) *exit.Error {
 	rentals := rental.Resolver(l, st)
 	knownRentals := rental.Known(st)
 
+	// The two per-service identity digests every local InvocationSpec rides (cl-022's
+	// guard): left unset, dispatch froze empty strings into every persisted invocation.
+	environmentSpec, configDigest := localInvocationIdentity(ctx.Cfg)
 	c, e := orchestrator.Open(orchestrator.Options{
 		Cfg: ctx.Cfg, Layout: l, Store: st, Yield: yield, Log: ctx.Out,
 		Endpoints: resolver, Rentals: rentals,
+		EnvironmentSpecDigest: environmentSpec, ConfigDigest: configDigest,
 	})
 	if e != nil {
 		closeListeners()

@@ -889,6 +889,7 @@ func (c *Orchestrator) EnsurePlacementReady(instanceID, planID string) *exit.Err
 		gone := w == nil || w.exited
 		logPath, fault, stuck, code := "", "", time.Duration(0), 0
 		quiet := time.Duration(0)
+		unstaged, holds := false, ""
 		var refused *exit.Error
 		if w != nil {
 			logPath, fault, code, refused = w.logPath, w.fault, w.exitCode, w.refusal
@@ -899,6 +900,9 @@ func (c *Orchestrator) EnsurePlacementReady(instanceID, planID string) *exit.Err
 				quiet = time.Since(w.lastReport)
 			} else if !w.spawned.IsZero() {
 				quiet = time.Since(w.spawned)
+			}
+			if !w.exited && !staged(w, planID) {
+				unstaged, holds = true, strings.Join(w.planIDs, ", ")
 			}
 		}
 		c.mu.Unlock()
@@ -911,6 +915,20 @@ func (c *Orchestrator) EnsurePlacementReady(instanceID, planID string) *exit.Err
 		// network symptom for an identity fact this process already established.
 		if refused != nil {
 			return refused
+		}
+		// A PLAN THE LAUNCHER NEVER STAGED CAN NEVER BECOME DISPATCHABLE (cl-022's
+		// corollary guard). The live case: submit, then an install --force moves the
+		// active pin before the launch goroutine runs — selectOrStart replaces the stale
+		// worker with one launched for the NEW pin, and this wait would watch it for the
+		// OLD plan forever, holding `starting[slot]` and wedging the endpoint slot until
+		// restart. A structural mismatch is an answer, not a longer wait.
+		if unstaged {
+			return exit.Named(exit.Conflict, "plan_not_staged",
+				"worker %s was launched holding [%s] and will never advertise %s: the "+
+					"binding this request froze is not one its worker was staged with",
+				instanceID, holds, planID).
+				WithRemedy("the active pin moved after this request was accepted; " +
+					"re-submit against the current install")
 		}
 		if gone {
 			if code == RecycleExit {

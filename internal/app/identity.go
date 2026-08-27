@@ -1,0 +1,68 @@
+package app
+
+import (
+	"runtime"
+	"runtime/debug"
+
+	"github.com/cozy-creator/cozy-creator-v2/internal/canonical"
+	"github.com/cozy-creator/cozy-creator-v2/internal/config"
+)
+
+// localInvocationIdentity mints the two per-service identity digests every LOCAL
+// InvocationSpec rides (cl-022's guard): the execution environment's and the evaluated
+// configuration's. They used to be the orchestrator Options' empty strings, so every
+// local InvocationSpec froze `environment_spec_digest: ""` — an UNDER-SPECIFIED identity
+// persisted forever under the request's digest.
+//
+// Both documents are deliberately `cozy.local.*` formats: a local service manufactures
+// no Tensorhub document. They are frozen per service run, never per request — a request
+// cannot choose the environment it runs under — and the config's one secret enters as
+// its DIGEST, never raw.
+func localInvocationIdentity(cfg config.Config) (environmentSpec, configDigest string) {
+	build := "unknown"
+	if info, ok := debug.ReadBuildInfo(); ok {
+		if info.Main.Version != "" && info.Main.Version != "(devel)" {
+			build = info.Main.Version
+		}
+		for _, s := range info.Settings {
+			if s.Key == "vcs.revision" && s.Value != "" {
+				build = s.Value
+			}
+		}
+	}
+	environmentSpec = spellOf(map[string]canonical.Value{
+		"format":        "cozy.local.ExecutionEnvironment/1",
+		"os":            runtime.GOOS,
+		"arch":          runtime.GOARCH,
+		"service_build": build,
+	})
+	configDigest = spellOf(map[string]canonical.Value{
+		"format":           "cozy.local.EvaluatedConfig/1",
+		"home":             cfg.Home,
+		"port":             int64(cfg.Port),
+		"yield":            cfg.Yield,
+		"hub_url":          cfg.HubURL,
+		"hub_url_source":   cfg.HubURLSource,
+		"hub_token":        cfg.HubToken.Digest(),
+		"hub_token_source": cfg.HubTokenSource,
+		// The tfs VALUE stays out: reading `.Tfs` is the byte-plane door's own fence
+		// (one caller, internal/tfs), and a tool path is resolution rather than
+		// identity — its provenance is the config fact worth freezing.
+		"tfs_source":                    cfg.TfsSource,
+		"local_rate_micro_usd_per_hour": cfg.LocalRateMicroUSDPerHour,
+	})
+	return environmentSpec, configDigest
+}
+
+func spellOf(doc map[string]canonical.Value) string {
+	data, err := canonical.Write(doc)
+	if err != nil {
+		// Unreachable by construction: every value above is a string or an int64.
+		panic("the local identity document cannot be canonicalized: " + err.Error())
+	}
+	spelled, err := canonical.Spell(canonical.Digest(data))
+	if err != nil {
+		panic("the local identity digest cannot be spelled: " + err.Error())
+	}
+	return spelled
+}
