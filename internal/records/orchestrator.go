@@ -730,7 +730,44 @@ func (s *Store) BeginRequeue(id string, max int64) (count int64, started, cancel
 // same body digest answers the SAME request; the same key with a different body is a
 // conflict, never a second execution wearing one name.
 func (s *Store) Submit(r Request) (Request, bool, *exit.Error) {
-	existing, err := scanRequest(s.db.QueryRow(
+	r, assets, problem := prepareRequest(r)
+	if problem != nil {
+		return Request{}, false, problem
+	}
+	tx, err := s.db.Begin()
+	if err != nil {
+		return Request{}, false, exit.Internalf("cannot begin request submission: %s", err)
+	}
+	defer tx.Rollback()
+	recorded, fresh, problem := submitRequestTx(tx, r, assets)
+	if problem != nil {
+		return Request{}, false, problem
+	}
+	if err := tx.Commit(); err != nil {
+		return Request{}, false, exit.Internalf("cannot commit request %s: %s", r.ID, err)
+	}
+	return recorded, fresh, nil
+}
+
+func prepareRequest(r Request) (Request, string, *exit.Error) {
+	r.CreatedAt = now()
+	r.State = "submitted"
+	if r.Kind == "" {
+		r.Kind = "serving"
+	}
+	assets := []byte("[]")
+	if len(r.Assets) > 0 {
+		var err error
+		assets, err = json.Marshal(r.Assets)
+		if err != nil {
+			return Request{}, "", exit.Internalf("cannot record request %s assets: %s", r.ID, err)
+		}
+	}
+	return r, string(assets), nil
+}
+
+func submitRequestTx(tx *sql.Tx, r Request, assets string) (Request, bool, *exit.Error) {
+	existing, err := scanRequest(tx.QueryRow(
 		`SELECT `+requestCols+` FROM requests WHERE idem_key=?`, r.IdemKey))
 	if err == nil {
 		if existing.BodyDigest != r.BodyDigest {
@@ -744,25 +781,12 @@ func (s *Store) Submit(r Request) (Request, bool, *exit.Error) {
 	if !errors.Is(err, sql.ErrNoRows) {
 		return Request{}, false, exit.Internalf("cannot read request %s: %s", r.IdemKey, err)
 	}
-	r.CreatedAt = now()
-	r.State = "submitted"
-	if r.Kind == "" {
-		r.Kind = "serving"
-	}
-	assets := []byte("[]")
-	if len(r.Assets) > 0 {
-		var err error
-		assets, err = json.Marshal(r.Assets)
-		if err != nil {
-			return Request{}, false, exit.Internalf("cannot record request %s assets: %s", r.ID, err)
-		}
-	}
-	if _, err := s.db.Exec(`INSERT INTO requests(id,idem_key,body_digest,endpoint,entrypoint,
+	if _, err := tx.Exec(`INSERT INTO requests(id,idem_key,body_digest,endpoint,entrypoint,
 		plan_id,payload,outputs,state,ordinal,requeues,created_at,kind,org,trees,worker,install_id,assets)
 		VALUES(?,?,?,?,?,?,?,?,?,0,0,?,?,?,?,?,?,?)`,
 		r.ID, r.IdemKey, r.BodyDigest, r.Endpoint, r.Entrypoint, r.PlanID, r.Payload,
 		r.Outputs, r.State, r.CreatedAt, r.Kind, r.Org, r.Trees, r.Worker, r.InstallID,
-		string(assets)); err != nil {
+		assets); err != nil {
 		return Request{}, false, exit.Internalf("cannot record request %s: %s", r.ID, err)
 	}
 	return r, true, nil

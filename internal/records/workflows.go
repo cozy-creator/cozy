@@ -260,18 +260,79 @@ func (s *Store) PrepareWorkflowStep(workflowID string, ordinal int, installID st
 	return nil
 }
 
-func (s *Store) LinkWorkflowChild(workflowID string, ordinal int, childKey, requestID string) *exit.Error {
-	res, err := s.db.Exec(`UPDATE workflow_steps SET child_request_id=?
-		WHERE workflow_id=? AND ordinal=? AND child_key=?
-		AND (child_request_id IS NULL OR child_request_id=?)`,
-		requestID, workflowID, ordinal, childKey, requestID)
+// SubmitWorkflowChild atomically creates (or adopts) one ordinary request and links it
+// to its prepared workflow step. Therefore Owed can never observe a workflow child whose
+// parent cannot yet cancel or recover it.
+func (s *Store) SubmitWorkflowChild(workflowID string, ordinal int, childKey string,
+	request Request, submittedEvent map[string]any) (Request, bool, *exit.Error) {
+	if request.IdemKey != childKey {
+		return Request{}, false, exit.Internalf(
+			"workflow %s step %d child request does not carry its prepared key", workflowID, ordinal)
+	}
+	request, assets, problem := prepareRequest(request)
+	if problem != nil {
+		return Request{}, false, problem
+	}
+	tx, err := s.db.Begin()
 	if err != nil {
-		return exit.Internalf("cannot link workflow %s step %d child: %s", workflowID, ordinal, err)
+		return Request{}, false, exit.Internalf("cannot begin workflow child submission: %s", err)
 	}
-	if n, _ := res.RowsAffected(); n != 1 {
-		return exit.New(exit.Conflict, "workflow %s step %d child link disagrees", workflowID, ordinal)
+	defer tx.Rollback()
+	var workflowState, cancelAt, preparedKey, linkedID string
+	if err := tx.QueryRow(`SELECT w.state,w.cancel_requested_at,COALESCE(s.child_key,''),
+		COALESCE(s.child_request_id,'')
+		FROM workflow_executions w JOIN workflow_steps s ON s.workflow_id=w.id
+		WHERE w.id=? AND s.ordinal=?`, workflowID, ordinal).
+		Scan(&workflowState, &cancelAt, &preparedKey, &linkedID); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return Request{}, false, exit.New(exit.NotFound,
+				"workflow %s has no step %d", workflowID, ordinal)
+		}
+		return Request{}, false, exit.Internalf(
+			"cannot read workflow %s step %d before child submission: %s", workflowID, ordinal, err)
 	}
-	return nil
+	if workflowState != "running" || cancelAt != "" {
+		return Request{}, false, exit.Named(exit.Canceled, "workflow_canceled",
+			"workflow %s no longer admits step %d", workflowID, ordinal)
+	}
+	if preparedKey == "" || preparedKey != childKey {
+		return Request{}, false, exit.New(exit.Conflict,
+			"workflow %s step %d is not prepared under child key %s", workflowID, ordinal, childKey)
+	}
+	if linkedID != "" {
+		existing, err := scanRequest(tx.QueryRow(`SELECT `+requestCols+` FROM requests WHERE id=?`, linkedID))
+		if err != nil || existing.IdemKey != childKey || existing.BodyDigest != request.BodyDigest {
+			return Request{}, false, exit.New(exit.Conflict,
+				"workflow %s step %d already links a different child", workflowID, ordinal)
+		}
+		return existing, false, nil
+	}
+	recorded, fresh, problem := submitRequestTx(tx, request, assets)
+	if problem != nil {
+		return Request{}, false, problem
+	}
+	result, err := tx.Exec(`UPDATE workflow_steps SET child_request_id=?
+		WHERE workflow_id=? AND ordinal=? AND child_key=? AND child_request_id IS NULL`,
+		recorded.ID, workflowID, ordinal, childKey)
+	if err != nil {
+		return Request{}, false, exit.Internalf(
+			"cannot link workflow %s step %d child: %s", workflowID, ordinal, err)
+	}
+	if changed, _ := result.RowsAffected(); changed != 1 {
+		return Request{}, false, exit.New(exit.Conflict,
+			"workflow %s step %d changed while its child was recorded", workflowID, ordinal)
+	}
+	if fresh {
+		if err := appendEventTx(tx, recorded.ID, "request.submitted", 0, submittedEvent); err != nil {
+			return Request{}, false, exit.Internalf(
+				"cannot append workflow child submission for %s: %s", recorded.ID, err)
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return Request{}, false, exit.Internalf(
+			"cannot commit workflow %s step %d child: %s", workflowID, ordinal, err)
+	}
+	return recorded, fresh, nil
 }
 
 func (s *Store) RequestWorkflowCancel(id string) (*WorkflowExecution, bool, *exit.Error) {

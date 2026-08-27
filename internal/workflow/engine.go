@@ -198,23 +198,39 @@ func (e *Engine) Submit(sub Submission) (records.WorkflowExecution, bool, *exit.
 		if problem := launch.ValidatePayload(entrypoint, payload); problem != nil {
 			return records.WorkflowExecution{}, false, problem
 		}
+		populatedAssets, problem := launch.PopulatedAssetPaths(entrypoint, payload)
+		if problem != nil {
+			return records.WorkflowExecution{}, false, problem
+		}
+		if expected := stepAssetFields(step); !sameStrings(populatedAssets, expected) {
+			return records.WorkflowExecution{}, false, exit.Named(exit.Validation,
+				"workflow_asset_resolution",
+				"workflow step %d payload asset references do not exactly match its declared grants",
+				ordinal)
+		}
 		for _, asset := range step.Assets {
-			kind, limit, ok := launch.AssetKind(entrypoint, asset.FieldPath)
-			if !ok || kind != asset.Kind {
+			assetSpec, ok := launch.AssetSpec(entrypoint, asset.FieldPath)
+			if !ok || assetSpec.Kind != asset.Kind {
 				return records.WorkflowExecution{}, false, exit.Named(exit.Validation,
 					"workflow_asset_field", "workflow step %d target %s is not a %s asset field in %s",
 					ordinal, asset.FieldPath, asset.Kind, step.Entrypoint)
 			}
-			if limit <= 0 || asset.Length > limit {
+			if assetSpec.MaxBytes <= 0 || asset.Length > assetSpec.MaxBytes {
 				return records.WorkflowExecution{}, false, exit.Named(exit.Validation,
 					"workflow_asset_over_bound",
 					"workflow step %d asset %s is %d B; its pinned field admits %d B",
-					ordinal, asset.FieldPath, asset.Length, limit)
+					ordinal, asset.FieldPath, asset.Length, assetSpec.MaxBytes)
+			}
+			if !assetSpec.AcceptsMediaType(asset.MediaType) {
+				return records.WorkflowExecution{}, false, exit.Named(exit.Validation,
+					"workflow_asset_media_type",
+					"workflow step %d asset %s is %s, which its pinned field does not admit",
+					ordinal, asset.FieldPath, asset.MediaType)
 			}
 		}
 		for _, binding := range step.Bindings {
-			kind, _, ok := launch.AssetKind(entrypoint, binding.FieldPath)
-			if !ok || kind != binding.ExpectedMediaKind {
+			assetSpec, ok := launch.AssetSpec(entrypoint, binding.FieldPath)
+			if !ok || assetSpec.Kind != binding.ExpectedMediaKind {
 				return records.WorkflowExecution{}, false, exit.Named(exit.Validation,
 					"workflow_asset_field", "workflow step %d target %s is not a %s asset field in %s",
 					ordinal, binding.FieldPath, binding.ExpectedMediaKind, step.Entrypoint)
@@ -583,45 +599,34 @@ func (e *Engine) submitChild(workflow records.WorkflowExecution, step records.Wo
 	}
 	limits := map[string]int64{}
 	for _, asset := range materialized.Assets {
-		_, limit, ok := launch.AssetKind(entrypoint, asset.FieldPath)
-		if !ok || limit <= 0 {
+		assetSpec, ok := launch.AssetSpec(entrypoint, asset.FieldPath)
+		if !ok || assetSpec.MaxBytes <= 0 {
 			return e.fail(workflow, []records.WorkflowStep{step}, exit.Named(exit.Structural,
 				"workflow_asset_bound_missing",
 				"workflow step %d field %s has no effective compressed-byte bound",
 				step.Ordinal, asset.FieldPath))
 		}
-		limits[asset.FieldPath] = limit
+		if !assetSpec.AcceptsMediaType(asset.MediaType) {
+			return e.fail(workflow, []records.WorkflowStep{step}, exit.Named(exit.Validation,
+				"workflow_asset_media_type",
+				"workflow step %d asset %s is %s, which its pinned field does not admit",
+				step.Ordinal, asset.FieldPath, asset.MediaType))
+		}
+		limits[asset.FieldPath] = assetSpec.MaxBytes
 	}
 	submission, problem := materialized.Submission(step.ChildKey,
 		step.MaterializedDigest, step.InstallID, step.Worker, paths, limits)
 	if problem != nil {
 		return e.fail(workflow, []records.WorkflowStep{step}, problem)
 	}
-	child, problem := e.opt.Store.RequestByIdempotencyKey(step.ChildKey)
+	child, _, problem := e.opt.Owner.RecordWorkflowChild(
+		workflow.ID, step.Ordinal, step.ChildKey, submission)
 	if problem != nil {
 		return problem
 	}
-	childID := ""
-	if child != nil {
-		if child.BodyDigest != step.MaterializedDigest {
-			return exit.New(exit.Conflict, "workflow child key %s names different bytes", step.ChildKey)
-		}
-		childID = child.ID
-	} else {
-		recorded, _, recordProblem := e.opt.Owner.RecordSubmission(submission)
-		problem = recordProblem
-		if problem != nil {
-			return problem
-		}
-		childID = recorded.ID
-	}
-	if problem := e.opt.Store.LinkWorkflowChild(workflow.ID, step.Ordinal,
-		step.ChildKey, childID); problem != nil {
-		return problem
-	}
 	go func() {
-		if problem := e.opt.Owner.ActivateRecorded(childID); problem != nil {
-			fmt.Fprintf(e.opt.Log, "[workflow] child %s activation: %s\n", childID, problem.Message)
+		if problem := e.opt.Owner.ActivateRecorded(child.ID); problem != nil {
+			fmt.Fprintf(e.opt.Log, "[workflow] child %s activation: %s\n", child.ID, problem.Message)
 		}
 	}()
 	return nil

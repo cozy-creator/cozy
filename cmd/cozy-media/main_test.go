@@ -32,6 +32,16 @@ func (r *zeroReader) Read(p []byte) (int, error) {
 	return n, nil
 }
 
+type discardResponse struct {
+	*httptest.ResponseRecorder
+	bytes int64
+}
+
+func (w *discardResponse) Write(p []byte) (int, error) {
+	w.bytes += int64(len(p))
+	return len(p), nil
+}
+
 func TestPlanUploadAcceptsOnlyTensorhubsExactCanonicalBytes(t *testing.T) {
 	base := t.TempDir()
 	plans := filepath.Join(base, "plans")
@@ -44,7 +54,7 @@ func TestPlanUploadAcceptsOnlyTensorhubsExactCanonicalBytes(t *testing.T) {
 		t.Fatal(err)
 	}
 	s := &server{opt: options{root: filepath.Join(base, "media"), plans: plans,
-		tokens: tokens, quota: 1 << 20, maxBody: 1 << 20}}
+		tokens: tokens, quota: 16 << 20, maxBody: 16 << 20}}
 	if err := s.reloadTokens(); err != nil {
 		t.Fatal(err)
 	}
@@ -72,6 +82,16 @@ func TestPlanUploadAcceptsOnlyTensorhubsExactCanonicalBytes(t *testing.T) {
 	if got := put(legacy, legacyID); got.Code != http.StatusBadRequest ||
 		!strings.Contains(got.Body.String(), "binding_plan_invalid") {
 		t.Fatalf("legacy local record status=%d body=%s", got.Code, got.Body.String())
+	}
+	oversized := httptest.NewRequest(http.MethodPut,
+		"/v1/plans/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+		strings.NewReader(""))
+	oversized.ContentLength = canonical.DocMax + 1
+	oversized.Header.Set("Authorization", "Bearer test-token")
+	refusal := httptest.NewRecorder()
+	s.routes().ServeHTTP(refusal, oversized)
+	if refusal.Code != http.StatusRequestEntityTooLarge {
+		t.Fatalf("oversized plan status=%d body=%s", refusal.Code, refusal.Body.String())
 	}
 }
 
@@ -282,5 +302,51 @@ func TestLargeInputUploadIsStreamingBounded(t *testing.T) {
 	}
 	if info, err := os.Stat(filepath.Join(root, "inputs", "large")); err != nil || info.Size() != size {
 		t.Fatalf("large stored input = %#v %v", info, err)
+	}
+}
+
+func TestLargeOutputDownloadIsStreamingBounded(t *testing.T) {
+	base := t.TempDir()
+	root := filepath.Join(base, "media")
+	outputDir := filepath.Join(root, "outputs", "attempt")
+	if err := os.MkdirAll(outputDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	const size = int64(64 << 20)
+	output := filepath.Join(outputDir, "video")
+	file, err := os.Create(output)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := file.Truncate(size); err != nil {
+		file.Close()
+		t.Fatal(err)
+	}
+	if err := file.Close(); err != nil {
+		t.Fatal(err)
+	}
+	tokens := filepath.Join(base, "tokens")
+	if err := os.WriteFile(tokens, []byte(secret.HashLine(secret.New("test-token"))+"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	s := &server{opt: options{root: root, tokens: tokens, quota: 128 << 20, maxBody: 128 << 20}}
+	if err := s.reloadTokens(); err != nil {
+		t.Fatal(err)
+	}
+	request := httptest.NewRequest(http.MethodGet, "/v1/outputs/attempt/video", nil)
+	request.Header.Set("Authorization", "Bearer test-token")
+	runtime.GC()
+	var before, after runtime.MemStats
+	runtime.ReadMemStats(&before)
+	response := &discardResponse{ResponseRecorder: httptest.NewRecorder()}
+	s.routes().ServeHTTP(response, request)
+	runtime.ReadMemStats(&after)
+	if response.Code != http.StatusOK || response.bytes != size ||
+		response.Header().Get("Content-Length") != "67108864" {
+		t.Fatalf("large output = status %d bytes %d headers %v",
+			response.Code, response.bytes, response.Header())
+	}
+	if allocated := after.TotalAlloc - before.TotalAlloc; allocated > 8<<20 {
+		t.Fatalf("64 MiB streaming download allocated %d B", allocated)
 	}
 }

@@ -353,13 +353,18 @@ func (s *Server) resolvePlan(sub Submission) (orchestrator.Submission, *exit.Err
 			return out, e
 		}
 		for index := range out.Assets {
-			_, maxBytes, ok := launch.AssetKind(entrypoint, out.Assets[index].FieldPath)
-			if !ok || maxBytes <= 0 || out.Assets[index].Length > maxBytes {
+			assetSpec, ok := launch.AssetSpec(entrypoint, out.Assets[index].FieldPath)
+			if !ok || assetSpec.MaxBytes <= 0 || out.Assets[index].Length > assetSpec.MaxBytes {
 				return out, exit.Named(exit.Validation, "input_asset_bound",
 					"input asset %s is %d B and its pinned field admits %d B",
-					out.Assets[index].FieldPath, out.Assets[index].Length, maxBytes)
+					out.Assets[index].FieldPath, out.Assets[index].Length, assetSpec.MaxBytes)
 			}
-			out.Assets[index].MaxBytes = maxBytes
+			if !assetSpec.AcceptsMediaType(out.Assets[index].MediaType) {
+				return out, exit.Named(exit.Validation, "input_asset_media_type",
+					"input asset %s is %s and its pinned field does not admit that media type",
+					out.Assets[index].FieldPath, out.Assets[index].MediaType)
+			}
+			out.Assets[index].MaxBytes = assetSpec.MaxBytes
 		}
 	}
 	return out, nil

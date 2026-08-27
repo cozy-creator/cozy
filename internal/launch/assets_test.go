@@ -10,7 +10,7 @@ func TestAssetKindAndBoundFollowExactNestedField(t *testing.T) {
 	if err := json.Unmarshal([]byte(`{
       "name":"run",
       "request":{"struct":"Request","fields":[
-        {"name":"image","type":{"asset":"image"},"asset_bound":{"max_bytes":100},"wire":"required"},
+        {"name":"image","type":{"asset":"image"},"asset_bound":{"max_bytes":100,"media_types":["image/png"]},"wire":"required"},
         {"name":"references","type":{"list":{"struct":"Reference","fields":[
           {"name":"video","type":{"asset":"video"},"asset_bound":{"max_bytes":200},"wire":"required"}
         ]}},"wire":"required"}
@@ -18,13 +18,14 @@ func TestAssetKindAndBoundFollowExactNestedField(t *testing.T) {
     }`), &ep); err != nil {
 		t.Fatal(err)
 	}
-	if kind, limit, ok := AssetKind(&ep, "image"); !ok || kind != "image" || limit != 100 {
-		t.Fatalf("image = %s %d %v", kind, limit, ok)
+	if spec, ok := AssetSpec(&ep, "image"); !ok || spec.Kind != "image" || spec.MaxBytes != 100 ||
+		!spec.AcceptsMediaType("image/png") || spec.AcceptsMediaType("image/jpeg") {
+		t.Fatalf("image = %#v %v", spec, ok)
 	}
-	if kind, limit, ok := AssetKind(&ep, "references.3.video"); !ok || kind != "video" || limit != 200 {
-		t.Fatalf("video = %s %d %v", kind, limit, ok)
+	if spec, ok := AssetSpec(&ep, "references.3.video"); !ok || spec.Kind != "video" || spec.MaxBytes != 200 {
+		t.Fatalf("video = %#v %v", spec, ok)
 	}
-	if _, _, ok := AssetKind(&ep, "references.x.video"); ok {
+	if _, ok := AssetSpec(&ep, "references.x.video"); ok {
 		t.Fatal("nonnumeric list path accepted")
 	}
 }
@@ -43,6 +44,42 @@ func TestValidatePayloadRejectsUnknownAndWrongTypes(t *testing.T) {
 	}
 	if problem := ValidatePayload(ep, []byte(`{"prompt":"ok","seed":4}`)); problem != nil {
 		t.Fatal(problem)
+	}
+}
+
+func TestValidatePayloadFailsClosedOnlyWhenUnknownConstraintIsUsed(t *testing.T) {
+	var ep Entrypoint
+	if err := json.Unmarshal([]byte(`{"name":"run","request":{"fields":[
+      {"name":"future","type":"str","constraints":{"pattern":"x+"},"wire":"optional"}
+    ]}}`), &ep); err != nil {
+		t.Fatal(err)
+	}
+	if problem := ValidatePayload(&ep, []byte(`{}`)); problem != nil {
+		t.Fatalf("unused future field rejected descriptor: %v", problem)
+	}
+	if problem := ValidatePayload(&ep, []byte(`{"future":"x"}`)); problem == nil || problem.ErrName() != "descriptor_constraint_unknown" {
+		t.Fatalf("unknown constraint = %#v", problem)
+	}
+}
+
+func TestPopulatedAssetPathsUsesTheValidationWalk(t *testing.T) {
+	var ep Entrypoint
+	if err := json.Unmarshal([]byte(`{"name":"run","request":{"fields":[
+      {"name":"first","type":{"union":["null",{"asset":"image"}]},"wire":"optional"},
+      {"name":"references","type":{"list":{"fields":[
+        {"name":"video","type":{"asset":"video"},"wire":"required"}
+      ]}},"wire":"required"}
+    ]}}`), &ep); err != nil {
+		t.Fatal(err)
+	}
+	payload := []byte(`{"first":null,"references":[{"video":"sha256:a"},{"video":"sha256:b"}]}`)
+	if problem := ValidatePayload(&ep, payload); problem != nil {
+		t.Fatal(problem)
+	}
+	paths, problem := PopulatedAssetPaths(&ep, payload)
+	if problem != nil || len(paths) != 2 || paths[0] != "references.0.video" ||
+		paths[1] != "references.1.video" {
+		t.Fatalf("paths=%#v problem=%v", paths, problem)
 	}
 }
 
@@ -70,5 +107,13 @@ func TestValidatePayloadEnforcesRecordedConstraints(t *testing.T) {
 		if problem := ValidatePayload(&ep, payload); problem == nil {
 			t.Fatalf("constrained payload accepted: %s", payload)
 		}
+	}
+	if problem := ValidatePayload(&ep,
+		[]byte(`{"prompt":"🙂🙂🙂🙂","videos":["a","b"],"steps":1}`)); problem != nil {
+		t.Fatalf("four Unicode code points: %v", problem)
+	}
+	if problem := ValidatePayload(&ep,
+		[]byte(`{"prompt":"🙂🙂🙂🙂🙂","videos":["a","b"],"steps":1}`)); problem == nil {
+		t.Fatal("five Unicode code points passed max_length=4")
 	}
 }

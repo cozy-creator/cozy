@@ -83,18 +83,46 @@ type Struct struct {
 // (`int`, `str`) and an object for an asset (`{"asset":"image"}`), a list
 // (`{"list":"float"}`) or a nested struct (`{"struct":…,"fields":[…]}`).
 type Field struct {
-	Name        string          `json:"name"`
-	Type        json.RawMessage `json:"type"`
-	Wire        string          `json:"wire"`
-	Constraints struct {
-		MinLength *int64   `json:"min_length"`
-		MaxLength *int64   `json:"max_length"`
-		GE        *float64 `json:"ge"`
-		LE        *float64 `json:"le"`
-	} `json:"constraints"`
-	AssetBound struct {
-		MaxBytes int64 `json:"max_bytes"`
+	Name        string           `json:"name"`
+	Type        json.RawMessage  `json:"type"`
+	Wire        string           `json:"wire"`
+	Constraints FieldConstraints `json:"constraints"`
+	AssetBound  struct {
+		MaxBytes   int64    `json:"max_bytes"`
+		MediaTypes []string `json:"media_types"`
 	} `json:"asset_bound"`
+}
+
+type FieldConstraints struct {
+	MinLength *int64   `json:"min_length"`
+	MaxLength *int64   `json:"max_length"`
+	GE        *float64 `json:"ge"`
+	LE        *float64 `json:"le"`
+	Unknown   []string `json:"-"`
+}
+
+func (c *FieldConstraints) UnmarshalJSON(data []byte) error {
+	var raw map[string]json.RawMessage
+	if err := json.Unmarshal(data, &raw); err != nil {
+		return err
+	}
+	for key := range raw {
+		switch key {
+		case "min_length", "max_length", "ge", "le":
+		default:
+			c.Unknown = append(c.Unknown, key)
+		}
+	}
+	sort.Strings(c.Unknown)
+	type plain FieldConstraints
+	var decoded plain
+	if err := json.Unmarshal(data, &decoded); err != nil {
+		return err
+	}
+	unknown := c.Unknown
+	*c = FieldConstraints(decoded)
+	c.Unknown = unknown
+	return nil
 }
 
 // ReadDescriptor reads the committed descriptor out of a generation's source tree and

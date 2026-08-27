@@ -5,8 +5,10 @@ import (
 	"encoding/json"
 	"io"
 	"os"
+	"sort"
 	"strconv"
 	"strings"
+	"unicode/utf8"
 
 	"github.com/cozy-creator/cozy-creator-v2/internal/exit"
 )
@@ -158,15 +160,48 @@ func ValidatePayload(ep *Entrypoint, payload json.RawMessage) *exit.Error {
 	return nil
 }
 
+// PopulatedAssetPaths returns every request-schema asset field carrying a non-empty
+// reference in one already-validated payload. It lets a workflow prove that each opaque
+// reference has an out-of-band grant instead of accepting a string the worker cannot open.
+func PopulatedAssetPaths(ep *Entrypoint, payload json.RawMessage) ([]string, *exit.Error) {
+	decoder := json.NewDecoder(bytes.NewReader(payload))
+	decoder.UseNumber()
+	var document map[string]any
+	if err := decoder.Decode(&document); err != nil || document == nil {
+		return nil, exit.New(exit.Validation, "%s payload is not one JSON object", ep.Name)
+	}
+	var out []string
+	for _, field := range ep.Request.Fields {
+		value, present := document[field.Name]
+		if !present {
+			continue
+		}
+		if problem := validateRenderedInto(field.Type, value, field.Name, &out); problem != nil {
+			return nil, problem
+		}
+	}
+	sort.Strings(out)
+	return out, nil
+}
+
 func validateField(field Field, value any, path string) *exit.Error {
-	if problem := validateRendered(field.Type, value, path); problem != nil {
+	return validateFieldInto(field, value, path, nil)
+}
+
+func validateFieldInto(field Field, value any, path string, assets *[]string) *exit.Error {
+	if len(field.Constraints.Unknown) > 0 {
+		return exit.Named(exit.Structural, "descriptor_constraint_unknown",
+			"request field %s uses unsupported constraints: %s",
+			path, strings.Join(field.Constraints.Unknown, ", "))
+	}
+	if problem := validateRenderedInto(field.Type, value, path, assets); problem != nil {
 		return problem
 	}
 	if field.Constraints.MinLength != nil || field.Constraints.MaxLength != nil {
 		var length int64
 		switch typed := value.(type) {
 		case string:
-			length = int64(len(typed))
+			length = int64(utf8.RuneCountInString(typed))
 		case []any:
 			length = int64(len(typed))
 		default:
@@ -205,6 +240,10 @@ func validateField(field Field, value any, path string) *exit.Error {
 }
 
 func validateRendered(raw json.RawMessage, value any, path string) *exit.Error {
+	return validateRenderedInto(raw, value, path, nil)
+}
+
+func validateRenderedInto(raw json.RawMessage, value any, path string, assets *[]string) *exit.Error {
 	var scalar string
 	if json.Unmarshal(raw, &scalar) == nil {
 		switch scalar {
@@ -245,6 +284,9 @@ func validateRendered(raw json.RawMessage, value any, path string) *exit.Error {
 	}
 	if _, ok := schema["asset"]; ok {
 		if ref, ok := value.(string); ok && ref != "" {
+			if assets != nil {
+				*assets = append(*assets, path)
+			}
 			return nil
 		}
 		return exit.New(exit.Validation, "request asset field %s is not a non-empty reference", path)
@@ -262,7 +304,11 @@ func validateRendered(raw json.RawMessage, value any, path string) *exit.Error {
 				"request field %s has an unreadable union", path)
 		}
 		for _, branch := range branches {
-			if validateRendered(branch, value, path) == nil {
+			var found []string
+			if validateRenderedInto(branch, value, path, &found) == nil {
+				if assets != nil {
+					*assets = append(*assets, found...)
+				}
 				return nil
 			}
 		}
@@ -274,8 +320,8 @@ func validateRendered(raw json.RawMessage, value any, path string) *exit.Error {
 			return exit.New(exit.Validation, "request field %s is not a list", path)
 		}
 		for index, element := range values {
-			if problem := validateRendered(item, element,
-				path+"."+strconv.Itoa(index)); problem != nil {
+			if problem := validateRenderedInto(item, element,
+				path+"."+strconv.Itoa(index), assets); problem != nil {
 				return problem
 			}
 		}
@@ -305,7 +351,7 @@ func validateRendered(raw json.RawMessage, value any, path string) *exit.Error {
 			if !ok {
 				return exit.New(exit.Validation, "request field %s declares no nested field %q", path, name)
 			}
-			if problem := validateField(field, element, path+"."+name); problem != nil {
+			if problem := validateFieldInto(field, element, path+"."+name, assets); problem != nil {
 				return problem
 			}
 		}

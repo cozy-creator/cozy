@@ -63,17 +63,23 @@ func TestWorkflowRecordsTransitionsAndOwnership(t *testing.T) {
 		[]byte(`{"materialized":true}`), workflowDigest, resolved, workflowDigest); problem != nil {
 		t.Fatalf("prepare replay: %v", problem)
 	}
-	child, _, problem := store.Submit(Request{ID: "req-child", IdemKey: workflowDigest,
-		BodyDigest: workflowDigest, Endpoint: "org/ep", Entrypoint: "run",
-		PlanID: workflowDigest, Payload: []byte(`{}`)})
-	if problem != nil {
-		t.Fatal(problem)
+	child, fresh, problem := store.SubmitWorkflowChild(created.ID, 1, workflowDigest,
+		Request{ID: "req-child", IdemKey: workflowDigest,
+			BodyDigest: workflowDigest, Endpoint: "org/ep", Entrypoint: "run",
+			PlanID: workflowDigest, Payload: []byte(`{}`)}, map[string]any{"endpoint": "org/ep"})
+	if problem != nil || !fresh {
+		t.Fatalf("child=%#v fresh=%v problem=%v", child, fresh, problem)
 	}
-	if problem := store.LinkWorkflowChild(created.ID, 1, workflowDigest, child.ID); problem != nil {
-		t.Fatal(problem)
+	replayedChild, fresh, problem := store.SubmitWorkflowChild(created.ID, 1, workflowDigest,
+		Request{ID: "req-other", IdemKey: workflowDigest,
+			BodyDigest: workflowDigest, Endpoint: "org/ep", Entrypoint: "run",
+			PlanID: workflowDigest, Payload: []byte(`{}`)}, map[string]any{})
+	if problem != nil || fresh || replayedChild.ID != child.ID {
+		t.Fatalf("child replay=%#v fresh=%v problem=%v", replayedChild, fresh, problem)
 	}
-	if problem := store.LinkWorkflowChild(created.ID, 1, workflowDigest, child.ID); problem != nil {
-		t.Fatalf("link replay: %v", problem)
+	events, problem := store.EventsAfter(child.ID, 0, 10)
+	if problem != nil || len(events) != 1 || events[0].Type != "request.submitted" {
+		t.Fatalf("child events=%#v problem=%v", events, problem)
 	}
 	if problem := store.SettleWorkflow(created.ID, "succeeded", "", ""); problem != nil {
 		t.Fatal(problem)
@@ -112,12 +118,6 @@ func TestQueuedCancellationCommitsTerminalEvent(t *testing.T) {
 
 func TestWorkflowCancellationFencesDispatchAndRequeueTransactions(t *testing.T) {
 	store := testStore(t)
-	request, _, problem := store.Submit(Request{ID: "req-fenced", IdemKey: "fenced",
-		BodyDigest: workflowDigest, Endpoint: "org/ep", Entrypoint: "run",
-		PlanID: workflowDigest, Payload: []byte(`{}`)})
-	if problem != nil {
-		t.Fatal(problem)
-	}
 	workflow, _, problem := store.CreateWorkflow(WorkflowExecution{ID: "wfl-fenced",
 		IdemKey: "wfl-fenced", BodyDigest: workflowDigest, ExecutionDigest: workflowDigest,
 		CreativePlanDigest: workflowDigest, Plan: []byte(`{}`)}, nil, nil, nil, 1)
@@ -128,7 +128,11 @@ func TestWorkflowCancellationFencesDispatchAndRequeueTransactions(t *testing.T) 
 		[]byte(`{}`), workflowDigest, nil, workflowDigest); problem != nil {
 		t.Fatal(problem)
 	}
-	if problem := store.LinkWorkflowChild(workflow.ID, 1, workflowDigest, request.ID); problem != nil {
+	request, _, problem := store.SubmitWorkflowChild(workflow.ID, 1, workflowDigest,
+		Request{ID: "req-fenced", IdemKey: workflowDigest,
+			BodyDigest: workflowDigest, Endpoint: "org/ep", Entrypoint: "run",
+			PlanID: workflowDigest, Payload: []byte(`{}`)}, map[string]any{})
+	if problem != nil {
 		t.Fatal(problem)
 	}
 	if _, _, problem := store.RequestWorkflowCancel(workflow.ID); problem != nil {
@@ -147,12 +151,6 @@ func TestWorkflowCancellationFencesDispatchAndRequeueTransactions(t *testing.T) 
 		t.Fatalf("attempt minted after workflow cancel: %#v", attempts)
 	}
 
-	second, _, problem := store.Submit(Request{ID: "req-requeue", IdemKey: "requeue",
-		BodyDigest: workflowDigest, Endpoint: "org/ep", Entrypoint: "run",
-		PlanID: workflowDigest, Payload: []byte(`{}`)})
-	if problem != nil {
-		t.Fatal(problem)
-	}
 	secondWorkflow, _, problem := store.CreateWorkflow(WorkflowExecution{ID: "wfl-requeue",
 		IdemKey: "wfl-requeue", BodyDigest: workflowDigest, ExecutionDigest: workflowDigest,
 		CreativePlanDigest: workflowDigest, Plan: []byte(`{}`)}, nil, nil, nil, 1)
@@ -163,8 +161,12 @@ func TestWorkflowCancellationFencesDispatchAndRequeueTransactions(t *testing.T) 
 		[]byte(`{}`), workflowDigest, nil, "sha256:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"); problem != nil {
 		t.Fatal(problem)
 	}
-	if problem := store.LinkWorkflowChild(secondWorkflow.ID, 1,
-		"sha256:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee", second.ID); problem != nil {
+	secondKey := "sha256:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"
+	second, _, problem := store.SubmitWorkflowChild(secondWorkflow.ID, 1, secondKey,
+		Request{ID: "req-requeue", IdemKey: secondKey,
+			BodyDigest: workflowDigest, Endpoint: "org/ep", Entrypoint: "run",
+			PlanID: workflowDigest, Payload: []byte(`{}`)}, map[string]any{})
+	if problem != nil {
 		t.Fatal(problem)
 	}
 	if _, err := store.db.Exec(`INSERT INTO attempts(request_id,attempt,attempt_key,instance_id,

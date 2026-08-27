@@ -66,6 +66,7 @@ func (r fixedResolver) Entrypoint(installID, name string) (*launch.Entrypoint, *
 	}
 	asset := launch.Field{Name: "first_frame", Type: []byte(`{"asset":"video"}`), Wire: "optional"}
 	asset.AssetBound.MaxBytes = 128 << 20
+	asset.AssetBound.MediaTypes = []string{"video/mp4"}
 	return &launch.Entrypoint{Name: "run", Request: launch.Struct{Fields: []launch.Field{
 		{Name: "prompt", Type: []byte(`"str"`), Wire: "optional"}, asset,
 	}}}, nil
@@ -204,7 +205,7 @@ func TestReconcileAdoptsPreparedStepAfterRestart(t *testing.T) {
 	}
 }
 
-func TestReconcileAdoptsRecordedUnlinkedChildAfterRestart(t *testing.T) {
+func TestWorkflowChildRecordAndLinkCommitTogether(t *testing.T) {
 	engine, store := testEngine(t)
 	plan := testPlan(1)
 	row, _, problem := engine.Submit(Submission{
@@ -223,25 +224,48 @@ func TestReconcileAdoptsRecordedUnlinkedChildAfterRestart(t *testing.T) {
 	if problem != nil {
 		t.Fatal(problem)
 	}
-	child, fresh, problem := engine.opt.Owner.RecordSubmission(submission)
+	child, fresh, problem := engine.opt.Owner.RecordWorkflowChild(
+		row.ID, 1, prepared.ChildKey, submission)
 	if problem != nil || !fresh {
 		t.Fatalf("record child: fresh=%v problem=%v", fresh, problem)
 	}
 	steps, _ := store.WorkflowSteps(row.ID)
-	if steps[0].ChildRequestID != "" {
-		t.Fatal("child was linked before the simulated crash window")
+	requests, _ := store.Requests("", 100)
+	if steps[0].ChildRequestID != child.ID || len(requests) != 1 || requests[0].State != "submitted" {
+		t.Fatalf("atomic step=%#v child=%s requests=%#v", steps[0], child.ID, requests)
 	}
-	restarted, problem := Open(engine.opt)
+}
+
+func TestWorkflowCancellationPreventsAtomicChildRecord(t *testing.T) {
+	engine, store := testEngine(t)
+	plan := testPlan(1)
+	row, _, problem := engine.Submit(Submission{
+		IdempotencyKey: "record-canceled", Plan: encodePlan(t, plan),
+	})
 	if problem != nil {
 		t.Fatal(problem)
 	}
-	if problem := restarted.Reconcile(); problem != nil {
+	prepared := prepareFirstStep(t, store, row, plan)
+	materialized, problem := DecodeMaterialized(prepared.MaterializedSubmission)
+	if problem != nil {
 		t.Fatal(problem)
 	}
-	steps, _ = store.WorkflowSteps(row.ID)
+	submission, problem := materialized.Submission(prepared.ChildKey,
+		prepared.MaterializedDigest, prepared.InstallID, "", map[string]string{}, map[string]int64{})
+	if problem != nil {
+		t.Fatal(problem)
+	}
+	if _, _, problem := store.RequestWorkflowCancel(row.ID); problem != nil {
+		t.Fatal(problem)
+	}
+	if _, _, problem := engine.opt.Owner.RecordWorkflowChild(
+		row.ID, 1, prepared.ChildKey, submission); problem == nil || problem.Code != exit.Canceled {
+		t.Fatalf("child after cancellation: %#v", problem)
+	}
+	steps, _ := store.WorkflowSteps(row.ID)
 	requests, _ := store.Requests("", 100)
-	if steps[0].ChildRequestID != child.ID || len(requests) != 1 {
-		t.Fatalf("adopted step=%#v child=%s requests=%d", steps[0], child.ID, len(requests))
+	if steps[0].ChildRequestID != "" || len(requests) != 0 {
+		t.Fatalf("canceled step=%#v requests=%#v", steps[0], requests)
 	}
 }
 
@@ -427,6 +451,36 @@ func TestWorkflowAssetKindMustMatchPinnedRequestField(t *testing.T) {
 		t.Fatalf("kind mismatch: %#v", problem)
 	}
 	if row, problem := store.WorkflowByIdempotencyKey("wrong-kind"); problem != nil || row != nil {
+		t.Fatalf("invalid workflow recorded: %#v %v", row, problem)
+	}
+}
+
+func TestWorkflowPayloadAssetReferenceNeedsDeclaredGrant(t *testing.T) {
+	engine, store := testEngine(t)
+	plan := testPlan(1)
+	plan.Steps[0].PayloadBase64 = "eyJmaXJzdF9mcmFtZSI6InNoYTI1NjphYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhIn0="
+	if _, _, problem := engine.Submit(Submission{IdempotencyKey: "ungranted-ref",
+		Plan: encodePlan(t, plan)}); problem == nil || problem.ErrName() != "workflow_asset_resolution" {
+		t.Fatalf("ungranted asset reference: %#v", problem)
+	}
+	if row, problem := store.WorkflowByIdempotencyKey("ungranted-ref"); problem != nil || row != nil {
+		t.Fatalf("invalid workflow recorded: %#v %v", row, problem)
+	}
+}
+
+func TestWorkflowAuthoredAssetMediaTypeMustMatchPinnedField(t *testing.T) {
+	engine, store := testEngine(t)
+	plan := testPlan(1)
+	plan.Steps[0].PayloadBase64 = "eyJmaXJzdF9mcmFtZSI6IiJ9"
+	plan.Steps[0].Assets = []AssetClaim{{FieldPath: "first_frame", Digest: testDigest,
+		Length: 1, MediaType: "video/webm", Kind: "video"}}
+	if _, _, problem := engine.Submit(Submission{IdempotencyKey: "wrong-media-type",
+		Plan: encodePlan(t, plan), Assets: map[int][]records.AssetBinding{1: {{
+			FieldPath: "first_frame", Digest: testDigest, Length: 1, MediaType: "video/webm",
+		}}}}); problem == nil || problem.ErrName() != "workflow_asset_media_type" {
+		t.Fatalf("media type mismatch: %#v", problem)
+	}
+	if row, problem := store.WorkflowByIdempotencyKey("wrong-media-type"); problem != nil || row != nil {
 		t.Fatalf("invalid workflow recorded: %#v %v", row, problem)
 	}
 }

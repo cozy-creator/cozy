@@ -104,15 +104,51 @@ func (c *Orchestrator) SubmitDetail(s Submission) (string, uint64, bool, *exit.E
 	return req.ID, attempt, true, e
 }
 
-// RecordSubmission crosses only the durable request boundary. Workflow execution uses
-// it to link its child before scheduling can start a large transfer; ordinary callers use
-// SubmitDetail, which activates immediately afterward.
+// RecordSubmission crosses only the durable ordinary-request boundary. Workflow children
+// use RecordWorkflowChild instead, because their request row and parent link are one fact.
 func (c *Orchestrator) RecordSubmission(s Submission) (records.Request, bool, *exit.Error) {
+	req, event, e := requestRecord(s)
+	if e != nil {
+		return records.Request{}, false, e
+	}
+	req, fresh, e := c.opt.Store.Submit(req)
+	if e != nil {
+		return records.Request{}, false, e
+	}
+	if !fresh {
+		c.logRecordedReplay(req, s.IdemKey)
+		return req, false, nil
+	}
+	c.emit(req.ID, "request.submitted", 0, event)
+	return req, true, nil
+}
+
+// RecordWorkflowChild commits the ordinary request and its workflow-step link in the same
+// SQLite transaction. Scheduling starts only after this returns, so cancellation and boot
+// recovery can always discover the child before Owed can activate it.
+func (c *Orchestrator) RecordWorkflowChild(workflowID string, ordinal int, childKey string,
+	s Submission) (records.Request, bool, *exit.Error) {
+	req, event, e := requestRecord(s)
+	if e != nil {
+		return records.Request{}, false, e
+	}
+	req, fresh, e := c.opt.Store.SubmitWorkflowChild(
+		workflowID, ordinal, childKey, req, event)
+	if e != nil {
+		return records.Request{}, false, e
+	}
+	if !fresh {
+		c.logRecordedReplay(req, s.IdemKey)
+	}
+	return req, fresh, nil
+}
+
+func requestRecord(s Submission) (records.Request, map[string]any, *exit.Error) {
 	bodyDigest := s.BodyDigest
 	if bodyDigest == "" {
 		spelled, err := canonical.Spell(canonical.Digest(s.Payload))
 		if err != nil {
-			return records.Request{}, false, exit.Internalf("cannot digest the request body: %s", err)
+			return records.Request{}, nil, exit.Internalf("cannot digest the request body: %s", err)
 		}
 		bodyDigest = spelled
 	}
@@ -120,29 +156,26 @@ func (c *Orchestrator) RecordSubmission(s Submission) (records.Request, bool, *e
 	if s.Kind == "job" {
 		id = records.NewID("job")
 	}
-	req, fresh, e := c.opt.Store.Submit(records.Request{
+	req := records.Request{
 		ID: id, IdemKey: s.IdemKey, BodyDigest: bodyDigest,
 		Endpoint: s.Endpoint, Entrypoint: s.Entrypoint, PlanID: s.PlanID, Payload: s.Payload,
 		Outputs: strings.Join(s.Outputs, ","),
 		Assets:  s.Assets,
 		Kind:    s.Kind, Org: s.Org, Trees: strings.Join(s.Trees, ","),
 		Worker: s.Worker, InstallID: s.InstallID,
-	})
-	if e != nil {
-		return records.Request{}, false, e
 	}
-	if !fresh {
-		// The recorded answer. A settled request is settled; a live one is already
-		// running the attempt this call would otherwise duplicate.
-		c.logf("request %s is the recorded answer for idempotency key %s (state %s, attempt %d)",
-			req.ID, s.IdemKey, req.State, req.Ordinal)
-		return req, false, nil
-	}
-	c.emit(req.ID, "request.submitted", 0, map[string]any{
+	event := map[string]any{
 		"endpoint": s.Endpoint, "function": s.Entrypoint,
 		"body_digest": bodyDigest, "plan_id": s.PlanID, "outputs": s.Outputs,
-	})
-	return req, true, nil
+	}
+	return req, event, nil
+}
+
+func (c *Orchestrator) logRecordedReplay(req records.Request, idempotencyKey string) {
+	// The recorded answer. A settled request is settled; a live one is already
+	// running the attempt this call would otherwise duplicate.
+	c.logf("request %s is the recorded answer for idempotency key %s (state %s, attempt %d)",
+		req.ID, idempotencyKey, req.State, req.Ordinal)
 }
 
 // ActivateRecorded schedules one already-durable request. It is idempotent: a settled or
