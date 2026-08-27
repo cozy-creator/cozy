@@ -85,7 +85,8 @@ func sectionDescriptorJCS() {
 	gotCorpus := fmt.Sprintf("%x", sha256.Sum256(corpus))
 	check("the pinned Runtime number oracle is unchanged", gotCorpus == wantCorpus, gotCorpus)
 	scanner := bufio.NewScanner(bytes.NewReader(corpus))
-	rows, mismatches := 0, 0
+	rows, admitted, refused, mismatches := 0, 0, 0, 0
+	safe := float64((int64(1) << 53) - 1)
 	for scanner.Scan() {
 		fields := strings.Fields(scanner.Text())
 		if len(fields) != 2 {
@@ -99,14 +100,63 @@ func sectionDescriptorJCS() {
 		value := math.Float64frombits(binary.LittleEndian.Uint64(bits))
 		input := strconv.FormatFloat(value, 'g', -1, 64)
 		got, err := canonical.NormalizeJCS([]byte(input))
-		if err != nil || string(got) != fields[1] {
+		if math.Abs(value) > safe {
+			if err == nil {
+				mismatches++
+			} else {
+				refused++
+			}
+		} else if err != nil || string(got) != fields[1] {
 			mismatches++
+		} else {
+			admitted++
 		}
 		rows++
 	}
 	must("scanning the Runtime ES6 number vectors", scanner.Err())
 	check("Creator matches Runtime over the full ES6 number corpus",
-		rows == 4561 && mismatches == 0, fmt.Sprintf("%d rows, %d mismatches", rows, mismatches))
+		rows == 4561 && admitted > 0 && refused > 0 && mismatches == 0,
+		fmt.Sprintf("%d rows, %d admitted, %d profile refusals, %d mismatches",
+			rows, admitted, refused, mismatches))
+
+	for sign, twins := range map[string][][]byte{
+		"positive safe boundary": {
+			[]byte(`{"v":9007199254740991}`), []byte(`{"v":9007199254740991.0}`),
+			[]byte(`{"v":9.007199254740991e15}`),
+		},
+		"negative safe boundary": {
+			[]byte(`{"v":-9007199254740991}`), []byte(`{"v":-9007199254740991.0}`),
+			[]byte(`{"v":-9.007199254740991e15}`),
+		},
+	} {
+		identities := map[string]bool{}
+		closed := true
+		for _, twin := range twins {
+			normalized, err := canonical.NormalizeJCS(twin)
+			if err != nil {
+				closed = false
+				continue
+			}
+			again, err := canonical.NormalizeJCS(normalized)
+			closed = closed && err == nil && bytes.Equal(again, normalized)
+			identities[string(normalized)] = true
+		}
+		check(sign+" spellings share one closed identity", closed && len(identities) == 1, "")
+	}
+
+	profileRefusals := 0
+	for _, source := range [][]byte{
+		[]byte(`{"v":9007199254740992}`), []byte(`{"v":9007199254740992.0}`),
+		[]byte(`{"v":9.007199254740992e15}`), []byte(`{"v":-9007199254740992}`),
+		[]byte(`{"v":-9007199254740992.0}`), []byte(`{"v":-9.007199254740992e15}`),
+		[]byte(`{"v":1000000000000000000000}`), []byte(`{"v":1e21}`),
+	} {
+		if _, err := canonical.NormalizeJCS(source); canonical.Code(err) == "number_range" {
+			profileRefusals++
+		}
+	}
+	check("all out-of-range numeric spellings refuse", profileRefusals == 8,
+		fmt.Sprintf("%d/8", profileRefusals))
 
 	input := []byte("{\"\ue000\":\"bmp\",\"s\":\"\\b\\t\\n\\f\\r\\u0000\\\"\\\\\u2028\u2029\",\"\U00010000\":\"astral\"}")
 	want := []byte("{\"s\":\"\\b\\t\\n\\f\\r\\u0000\\\"\\\\\u2028\u2029\",\"\U00010000\":\"astral\",\"\ue000\":\"bmp\"}")
@@ -114,15 +164,16 @@ func sectionDescriptorJCS() {
 	check("Creator matches Runtime string escaping and UTF-16 key order",
 		err == nil && bytes.Equal(got, want), fmt.Sprintf("%q", got))
 
-	refused := 0
+	surrogateRefusals := 0
 	for _, raw := range []string{
 		`{"s":"\uD800"}`,
 		`{"s":"\uDC00"}`,
 		`{"s":"\uD800x"}`,
 	} {
 		if _, err := canonical.NormalizeJCS([]byte(raw)); canonical.Code(err) == "unicode_scalar" {
-			refused++
+			surrogateRefusals++
 		}
 	}
-	check("unpaired surrogate escapes refuse", refused == 3, fmt.Sprintf("%d/3", refused))
+	check("unpaired surrogate escapes refuse", surrogateRefusals == 3,
+		fmt.Sprintf("%d/3", surrogateRefusals))
 }
