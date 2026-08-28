@@ -1,5 +1,5 @@
-// Package api is the LOCAL CLIENT API server (cl-006): the shared client contract's CORE
-// served on loopback by the one LocalService, plus an explicitly LOCAL extension module.
+// Package api is Creator's local client API server: the request-level CORE served on
+// loopback by the one LocalService, plus an explicitly Creator-only extension module.
 //
 // It is a client of internal/orchestrator and nothing else. Every submission still flows
 // orchestrator → worker protocol → runtime; this package adds an HTTP shape, a typed error
@@ -332,9 +332,9 @@ func (s *Server) cliAuthenticated(r *http.Request) bool {
 
 // ---------------------------------------------------------------- the error envelope
 
-// envelope is the contract's ONE error shape, taken from the surface cozy.art already
-// parses against Tensorhub: {"error": {code, message, ...}}. Every refusal in this
-// package renders through it, including the guards' own and the unknown-route catch-all.
+// envelope is the contract's one error shape: {"error": {code, message, ...}}. Every
+// refusal in this package renders through it, including the guards' own and the
+// unknown-route catch-all.
 type envelope struct {
 	Code      string `json:"code"`
 	Message   string `json:"message"`

@@ -43,9 +43,8 @@ Thirteen families:
             (#628): a CORS header on a loopback bind is what makes it readable by any
             page the browser loads. And there is exactly ONE net.Listen(…) site per
             program, each with its own stated rule.
-  contract  (cl-006) internal/api/routes.go and docs/client-contract.md are ONE surface,
-            row for row, scope for scope. The document is what th-021's other two hosts
-            implement against, so drift is a shared-contract defect, not a doc lag.
+  contract  internal/api/routes.go and docs/client-contract.md have the same route
+            method, path, scope, and order. Payload and behavior are tested separately.
   tensor    (cl-012) the tensorfs CLI has ONE caller: internal/tfs. The configured binary
             is read there and in the config authority, nowhere else — a second package
             shelling out to `tfs` is a second byte-plane door with its own vocabulary.
@@ -697,13 +696,10 @@ def parse_go_routes(path: pathlib.Path):
 
 
 def check_contract():
-    """(cl-006) The route table and the contract document are ONE surface.
+    """The route table and Creator's contract document expose the same route inventory.
 
-    docs/client-contract.md is what th-021's other two hosts implement against, so a route
-    that exists in code and not in the document — or the reverse — is drift in a SHARED
-    contract, not a local doc lag. The scope column is checked too: moving a route between
-    the shared CORE and the LOCAL extension is the single most consequential edit anyone
-    can make here, and it must be visible in both places at once.
+    This fence checks method, path, scope, and order. Payload and behavior conformance are
+    separate tests; passing this check makes no claim about unimplemented external hosts.
     """
     doc = pathlib.Path("docs/client-contract.md")
     go = pathlib.Path("internal/api/routes.go")

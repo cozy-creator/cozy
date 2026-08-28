@@ -20,15 +20,13 @@ import (
 	pb "github.com/cozy-creator/cozy-creator/protocol/cozy/worker/v1"
 )
 
-// The CONTRACT CORE, taken from the surface cozy.art already speaks against Tensorhub:
-// a 202 handle out of submit, a lifecycle document out of status, an explicit cancel.
-// The shapes below are that surface's, field for field — `status_url` / `response_url` /
-// `cancel_url` are not this host's inventions and are not renamed for local taste. Where
-// this host adds a field it is ADDITIVE and named as such in docs/client-contract.md.
+// The request-level contract: a 202 handle out of submit, a lifecycle document out of
+// status, and explicit cancellation. Creator implements this surface today; other hosts
+// require their own implementation and conformance proof.
 
 // Submission is the request body. `input` is the endpoint's own typed payload and is
 // carried VERBATIM: the orchestrator digests exactly the bytes the client sent, so a
-// re-submit under one key compares the same digest a hub would have compared.
+// re-submit under one key compares the same request identity.
 type Submission struct {
 	Endpoint string          `json:"endpoint"`
 	Function string          `json:"function"`
@@ -42,9 +40,7 @@ type Submission struct {
 	// the service-owned immutable input store before the request row exists; it never
 	// crosses the worker protocol. The typed payload carries only its opaque reference.
 	LocalAssets []records.AssetBinding `json:"local_assets,omitempty"`
-	// Worker pins this request to an ATTACHED remote worker by rental id (cl-015). It is
-	// a LOCAL addition and is named as one in docs/client-contract.md: the cloud host
-	// places work itself and has no rental for a client to name.
+	// Worker is Creator's local addition: it pins this request to an attached rental id.
 	Worker     string `json:"worker,omitempty"`
 	AttemptKey string `json:"-"`
 }

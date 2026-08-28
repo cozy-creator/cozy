@@ -170,12 +170,14 @@ dynamic-serving shape with honest control-Runtime provenance.
 
 ## The local client API (cl-006)
 
-`cozy up` serves the **shared client contract's CORE** on loopback — the same surface
-Tensorhub (th-021) and the private-deployment pod (cl-014) serve, byte for byte. Full
-contract: [`docs/client-contract.md`](docs/client-contract.md), which
-`scripts/fence.py`'s `contract` family checks against `internal/api/routes.go` row for
-row. `internal/api` is a CLIENT of `internal/orchestrator` and opens no second door into
-the runtime: every submission still flows orchestrator → worker protocol → runtime.
+`cozy up` serves Creator's local client API on loopback. Its CORE routes are the proposed
+common request-level API for future Tensorhub and private-rental servers; no cross-host
+parity is claimed until those servers pass shared conformance tests. The current contract
+is [`docs/client-contract.md`](docs/client-contract.md). `scripts/fence.py` checks its
+route method, path, scope, and order against `internal/api/routes.go`; payload and behavior
+remain implementation-and-test contracts. `internal/api` is a CLIENT of
+`internal/orchestrator` and opens no second door into the runtime: every submission still
+flows orchestrator → worker protocol → runtime.
 
 - **Submit / status / cancel** (`/v1/requests`). The idempotency key names one request
   forever; the body digest covers the WHOLE submission, so one key naming a different
@@ -279,6 +281,14 @@ Verified by `go test ./internal/live -run TestProductPath`: install -> up -> inv
 typed result -> the file on disk, both terminal verdicts, the client-side payload grammar,
 and a `kill -9` of the record owner mid-attempt. It runs on `fixtures/weightless/` — a real
 endpoint with no model and no card — so it is the whole product path minus the GPU.
+
+## Cozy Video
+
+`cozy video compose` turns an editable `cozy.video/1` YAML source into an ordinary
+ordered workflow without starting it. `cozy video submit` submits either that source or a
+retained creative-plan digest through the same workflow owner. The source grammar,
+examples, asset rules, and deliberate omissions are documented in
+[`docs/cozy-video.md`](docs/cozy-video.md).
 
 ## Bounded jobs and the durable publication root (cl-004)
 

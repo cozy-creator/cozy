@@ -33,8 +33,9 @@ assembly:
 A source has 2–8 ordered shots, unique editor IDs, non-empty prompts of at most 4,096 Unicode
 characters, and explicit decimal int64 seeds. Each shot selects exactly one action:
 
-- `reference_media_to_video` takes 1–12 ordered references: at most 9 images, 3 videos, and 3
-  standalone audio files, with at least one image or video.
+- `reference_media_to_video` takes one or more ordered references, each naming exactly one image,
+  video, or audio asset. The selected endpoint descriptor and its `reference_policy` define the
+  accepted count and media mix; the source format does not duplicate those endpoint-owned limits.
 - `first_last_frame_to_video` takes optional `first_frame` and `last_frame`. A non-first shot may
   use `first_frame: previous`; Creator binds the prior ordinary child's exact
   `continuation_frame`. An empty `{}` is valid T2VA. Because the scalar `previous` is reserved,

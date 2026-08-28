@@ -18,19 +18,11 @@ import (
 	pb "github.com/cozy-creator/cozy-creator/protocol/cozy/worker/v1"
 )
 
-// THE JOB FAMILY (cl-004), mounted under /v1/local/ and deliberately NOT in the shared
-// contract core. Two reasons, and both are about honesty rather than taste:
+// The job family is mounted under /v1/local/ because its typed input trees are local
+// directories the caller already owns. Keeping filesystem paths out of the proposed
+// common core preserves that boundary.
 //
-//   - cl-004 is LOCAL ONLY. The hub's job plane arrives with th-008, and a core route
-//     that only one of the three hosts served would make `docs/client-contract.md` a
-//     document about this host rather than about the contract.
-//   - A job's typed input TREES are local directories the caller already owns. That is
-//     the design (cr-009: a tree's path rides the field VALUE), and it is exactly the
-//     kind of parameter the CORE must never take — a cloud host materializes trees from
-//     digests instead. Keeping it local keeps the core's "no client-supplied path"
-//     property intact.
-//
-// The EVENT plane is shared, and that is not an exception: a job IS a request row in the
+// The event plane is reused, and that is not an exception: a job is a request row in the
 // one lifecycle authority, so `GET /v1/requests/{id}/events` streams a job's lifecycle
 // with no second event authority anywhere. `cozy job follow` is that route's client.
 

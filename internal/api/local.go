@@ -11,12 +11,9 @@ import (
 	"github.com/cozy-creator/cozy-creator/internal/orchestrator"
 )
 
-// The LOCAL EXTENSION MODULE. Everything here is mounted under /v1/local/ so the boundary
-// is visible in the URL rather than only in a document: a client that sees `/v1/local/`
-// knows it has left the shared contract and is talking to this host's own surface. The
-// cloud host serves none of these and never will; it serves catalog/billing/org routes
-// this host serves none of. The CORE between them is byte-identical, and neither set of
-// extensions pretends to be part of it.
+// The Creator-only extension module. Everything here is mounted under /v1/local/ so the
+// boundary is visible in the URL rather than only in a document. A client that sees
+// `/v1/local/` knows it has left the proposed common core and is using Creator's surface.
 
 // EndpointRow is one endpoint this host can serve.
 type EndpointRow struct {

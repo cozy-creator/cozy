@@ -1,19 +1,13 @@
-# The shared client contract — core v1
+# Cozy Creator local client API — v1
 
-**One contract, three hosts.** `cozy-creator` local (this host, the reference
-implementation), Tensorhub cloud (th-021), and the private-deployment pod profile
-(cl-014, `private-deployments.md` §1). The CORE below is byte-identical on all three.
-Extension modules are not: this host adds a LOCAL module, Tensorhub adds catalog,
-billing and org routes, the pod adds owner-token and output-store routes — and none of
-them ever pretends to be the core.
+This document describes the HTTP API implemented by Cozy Creator's local background
+service. The routes in the CORE module are the proposed common request-level API for
+future Tensorhub and private-rental servers, but no cross-host parity is claimed until
+those servers exist and pass shared conformance tests. The LOCAL module is Creator-only.
 
-Not invented here. This is the `/v1/requests` submit / status / cancel + SSE surface
-cozy.art already speaks against Tensorhub, taken verbatim. Every divergence from it is a
-recorded decision, and the ones this host made are in §7.
-
-`internal/api/routes.go` is the machine-readable form of the tables below and
-`scripts/fence.py`'s `contract` family checks them against each other, row for row.
-A route in one and not the other is CI-red.
+`internal/api/routes.go` is the route registry. `scripts/fence.py` checks this document's
+route method, path, scope, and order against that registry. Authentication, idempotency,
+payloads, and behavior are documented below but are outside that row-level fence.
 
 ## 1. Transport and identity
 
@@ -21,13 +15,12 @@ A route in one and not the other is CI-red.
 |---|---|
 | version | `cozy.client.v1` (`GET /v1/capabilities` → `core`) |
 | encoding | JSON, UTF-8. SSE for streams. |
-| auth | `Authorization: Bearer <token>`. **Never a cookie**, on any host. |
+| auth | `Authorization: Bearer <token>`. Creator never accepts a cookie. |
 | idempotency | `Idempotency-Key` header on submit; required. |
 | errors | one envelope, §6 |
 
-Bearer-only is a contract property, not a local choice: it is what makes CORS simple on
-the pod host (a browser talks to the pod directly) and what keeps a cross-site request
-from carrying ambient authority on the local host.
+Bearer-only prevents a cross-site request from carrying ambient authority into the local
+service.
 
 ## 2. Core routes
 
@@ -49,7 +42,7 @@ POST /v1/requests
 Idempotency-Key: <caller's key>
 
 {"endpoint": "org/name", "function": "denoise", "input": {…},
- "outputs": ["image"], "model": "org/repo@release", "lane": "auto"}
+ "outputs": ["image"]}
 ```
 
 `input` is the endpoint's own typed payload and is carried verbatim to the runtime.
@@ -57,34 +50,25 @@ Idempotency-Key: <caller's key>
 entrypoint's declared set — binding by field path is what makes a two-output result
 unswappable.
 
-`worker` is a **LOCAL ADDITION** (cl-015), not part of the shared core: it pins the
-request to a rented pod this host has attached, by rental id. The cloud host places work
-itself and has no rental for a client to name, so it does not carry the field. An id this
-host does not hold is `404` **before** a request row exists — a pin that cannot be
-resolved now cannot be resolved on a later attempt either. The pin is deliberately NOT in
-the idempotency digest: it says WHERE the same work runs, not what the work is.
+The `model`, `lane`, and `adapter` fields are reserved but not resolved by Creator yet.
+Any non-empty value refuses as `501 override_unresolved`; it is never silently ignored.
 
-A new private rental becomes `converging` with its complete receipt-pinned attach
-projection before it becomes `ready`. Creator's LocalService is the sole live
-`WorkerControl` RecordOwner: it presents the renter token, validates `ClaimAck` and the
-snapshot barrier, sends the Tensorhub placement revision as the exact desired revision,
-and relays deterministic ClaimAck/snapshot/observed-state frames through Tensorhub's
-rental-scoped HTTP route. Tensorhub validates the selected OCI and
-`control_runtime_digest`, then gates `ready` on accepted = converged = desired with a
-STAGED, DISPATCHABLE placement. Tensorhub never receives the plaintext token during
-creation and never dials or fences the private worker. A pinned request is refused as
-`rental.convergence_pending` until that ready verdict is durable locally.
+`worker` is a **LOCAL ADDITION**: it pins the request to an attached rental by id. An id
+this Creator service does not hold is `404` before a request row exists. The pin is not in
+the idempotency digest because it selects where the same work runs, not what the work is.
+A new rental cannot be pinned until its exact desired placement has been accepted,
+converged, and reported dispatchable; otherwise submission refuses as
+`rental.convergence_pending`.
 
 `local_assets` is the CLI-only local extension for `--asset
 <field-path>=<file>`. Each row names the exact request-schema field path plus a source
 path, digest, length, and detected media type. The service verifies those claims and
 copies the bytes into its private content-addressed input store before recording the
 request. Only an opaque digest reference enters `input`; only the field-path identity,
-digest, length, media type, and ordered occurrence enter the invocation spec. A network
-host uses an upload/asset-id surface instead — a client filesystem path is never portable
-authority. This field requires the OS-protected CLI bearer; the browser bearer is refused
-before any path is read, and this local host does not yet expose a browser asset-upload
-route.
+digest, length, media type, and ordered occurrence enter the invocation spec. A client
+filesystem path is never portable authority. This field requires the OS-protected CLI
+bearer; the browser bearer is refused before any path is read, and this local host does
+not yet expose a browser asset-upload route.
 
 The private staged object remains only while some unsettled request references its
 digest. The service serializes the filesystem-to-request-row ownership handoff with the
@@ -100,7 +84,7 @@ This is an explicit boundary until cozy-runtime and Creator share one Windows fi
 encoder/authorizer; Creator does not emit malformed `file://C:\\…` capabilities.
 
 A pinned request crosses a REAL byte boundary, and the crossing is the pod's own media
-server (cl-014, ruled #506b): the payload and every input asset are uploaded as separate
+server: the payload and every input asset are uploaded as separate
 objects before the attempt is dispatched, the worker reads them off the pod's disk, and
 the outputs are fetched back and verified against the terminal's manifest before anything
 is acked. A rental whose media
@@ -168,7 +152,7 @@ after it arrives in order, across a host restart. `id:` carries the cursor on th
 | `request.submitted` | `endpoint`, `function`, `body_digest`, `plan_id`, `outputs` |
 | `request.queued` | `reason` |
 | `request.dispatch_aborted` | pre-offer preparation failed; `cause`, `error`; no worker saw this ordinal |
-| `request.dispatched` | `instance_id`, `exec_spec_digest` |
+| `request.dispatched` | `instance_id`, `invocation_digest` |
 | `request.accepted` | `plan_digest`, `construction_digest`, `plan` |
 | `request.attempt_failed` | one ATTEMPT ended and the request did NOT — `status`, `cause`, `requeuing: true` |
 | `request.requeued` | `cause`, `requeues`, `budget` |
@@ -229,7 +213,7 @@ Feature presence is a TOKEN. A client never infers a feature from a version stri
            "request_id": "req-…"}}
 ```
 
-`code` is the name from the shared exit matrix (`docs/exit-matrix.md`), which is also
+`code` is the name from the exit matrix (`docs/exit-matrix.md`), which is also
 what the CLI exits with — one vocabulary from HTTP status to shell exit code. Every
 refusal renders through it, including an unknown route: a client that parses one envelope
 parses every answer.
@@ -248,8 +232,7 @@ parses every answer.
 
 ## 7. Local extension module
 
-Mounted under `/v1/local/` so the boundary is visible in the URL. The cloud host serves
-none of these.
+Mounted under `/v1/local/` so the Creator-only boundary is visible in the URL.
 
 | route | scope | auth | notes |
 |---|---|---|---|
@@ -279,7 +262,7 @@ Triage is served by the OPAQUE attempt key and verified on read against the dige
 terminal declared. A bundle whose bytes moved is `409 bundle_corrupt`, never a plausible
 story.
 
-### The job family is LOCAL, deliberately (cl-004)
+### The job family is local
 
 A job is an ATTEMPT CLASS in the same local service, not a second scheduler: the same
 orchestrator places and dispatches it, and the same record owner gives it an ordinal,
@@ -287,11 +270,9 @@ settles its terminal transaction, and streams it over the same durable event rou
 (`GET /v1/requests/{id}/events` — there is no second event authority anywhere, and
 `cozy job follow` is that route's client).
 
-The FAMILY is nonetheless local rather than core, for two reasons that are about honesty:
-the hub's job plane is th-008's, so a core route only one of the three hosts served would
-make this document a description of this host; and a job's typed input TREES are
-directories the caller already owns (`{"trees":["<ref>=<dir>"]}`), which is exactly the
-parameter shape the core must never take. A cloud host materializes trees from digests.
+The family is local because a job's typed input trees are directories the caller already
+owns (`{"trees":["<ref>=<dir>"]}`). Client filesystem paths are not part of the proposed
+common core.
 
 Two answers a job carries that a request does not:
 
@@ -312,7 +293,7 @@ record owner's durable-attempt facts. Several jobs submitted at once queue again
 worker and drain in submission order, while the retry projection over neutral outcomes
 spends a durable budget that the settlement names when it is exhausted.
 
-### The workflow family is LOCAL and ordered (cl-018)
+### The workflow family is local and ordered
 
 A workflow is one immutable maximum-16 ordered plan over ordinary serving requests. Only backward
 output bindings exist, so a cycle is unrepresentable. Creator persists exact materialization before
@@ -342,7 +323,7 @@ submission, child lifecycle/event/triage receipts, one content-addressed copy of
 control snapshot, actual ClaimAck GPU identity, and digest-verified media into a sibling staging
 tree. Every path in a receipt is bundle-relative; the destination appears only by one final rename.
 
-### The video composer is a LOCAL authoring boundary (cl-024)
+### The video composer is a local authoring boundary
 
 `POST /v1/local/video-compositions` is the only YAML-reading route. It requires the OS-protected
 CLI credential because a fresh composition reads caller-owned local paths. Its strict request names
@@ -357,7 +338,7 @@ The caller retains the editable YAML; Creator retains its exact-byte digest rath
 second copy. The response separates that source identity, path-free/deployment-free creative identity, and
 the existing deployment-resolved `cozy.workflow.Plan/1`. Composition starts no workflow. `cozy video
 submit` passes that plan and its staged content identities to `POST /v1/local/workflows`; workflow
-status, cancellation, recovery, attempts, outputs, and events remain cl-018's one authority. There
+status, cancellation, recovery, attempts, outputs, and events remain the workflow owner's authority. There
 is no video-specific status route, retry policy, cursor, provider selector, endpoint callback, or second
 lifecycle table.
 
@@ -374,7 +355,7 @@ Creator's video package; endpoints, Runtime, Tensorhub, worker protocol, and wor
 parse YAML or acquire shot semantics.
 
 `cozy video submit` requires an explicit idempotency key. A client that loses the POST response can
-therefore retry the same key and recover the same cl-018 workflow rather than minting a duplicate.
+therefore retry the same key and recover the same workflow rather than minting a duplicate.
 
 ## 8. Local host security posture
 
@@ -394,35 +375,11 @@ Two per-launch credentials, both dying with the process: the BROWSER token rides
 nor an access log nor a `Referer`), and the CLI credential is handed over through a 0600
 file. Neither ever appears in argv, a log line, or a rendered error.
 
-## 9. Divergences from the cozy.art/Tensorhub surface
+## 9. The status-to-exit projection
 
-Recorded, not accidental.
-
-1. **`GET /v1/events`, the multiplexed stream, is NEW.** cozy.art opens one EventSource
-   per request; a browser caps concurrent connections per origin at six, so a gallery
-   watching ten requests silently stops receiving four of them. Same envelope, same
-   cursor, one connection. The per-request route is unchanged and still terminal-stops.
-2. **`events_url` is added to the submit handle.** cozy.art derives it by string
-   concatenation; naming it is what lets a host move the stream later.
-3. **`idempotent_replay` is added, and 200-vs-202 is load-bearing.** A client that
-   retried a timed-out POST must be able to tell "I started it" from "this key was
-   already mine" without comparing ids.
-4. **The body digest covers the whole submission**, not the payload alone.
-5. **Media is served by opaque id rather than a presigned URL.** The cloud host presigns
-   because its bytes are in object storage; the local host's are on this disk. The
-   CLIENT-VISIBLE shape is the same — an opaque handle in a document, a fetch to get
-   bytes — which is what the contract actually requires.
-6. **No estimate surface.** th-021's price-and-wait quote has no local meaning: nothing
-   bills and the queue depth is one card.
-7. **Model/lane/adapter overrides are ADMISSIBLE here and refuse `501
-   override_unresolved`.** The local binding resolver is cl-005's. An override that is
-   silently ignored is the worse bug, so the field refuses rather than being dropped.
-
-## 10. The status→exit projection (cl-010)
-
-Every host's refusal envelope carries the refusal's own NAME; the shared exit-matrix code
-comes from the HTTP status. `api.CodeOf` is the inverse of `statusOf` and lives beside it
-so the two cannot drift, and a client on any of the three hosts reads it the same way:
+Every refusal envelope carries the refusal's own name; the exit-matrix code comes from
+the HTTP status. `api.CodeOf` is the inverse of `statusOf` and lives beside it so the two
+cannot drift:
 
 | status | matrix code |
 |---|---|

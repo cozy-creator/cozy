@@ -2,26 +2,18 @@ package api
 
 import "github.com/cozy-creator/cozy-creator/internal/manifest"
 
-// The route table is DATA, and it is the same kind of object cl-002 made the CLI surface:
-// one declarative registry that drives dispatch, the capability tokens, and the contract
-// document. `docs/client-contract.md` is generated from these rows and fence-checked
-// against them, so a route that exists in code and not in the document — or a document
-// that describes a route nobody serves — is CI-red rather than a discovery six months
-// later (th-021's "the table is a MANIFEST" item, built here first because this host is
-// the reference).
+// The route table is DATA: one declarative registry drives dispatch and capability
+// tokens. `scripts/fence.py` checks its method, path, scope, and order against
+// `docs/client-contract.md`, so a route present on only one side is CI-red.
 //
 // The split this file exists to make VISIBLE:
 //
-//	Core   — the shared client contract (th-021). Byte-identical across the three hosts:
-//	         cozy-creator local, Tensorhub cloud, and the private-deployment pod. A change
-//	         here is a change to all three and is a recorded decision, never a local
-//	         convenience.
-//	Local  — the LOCAL extension module. Installed endpoints, workers, host doctor,
-//	         triage. These do not exist on the cloud host and never pretend to: they are
-//	         mounted under /v1/local/ so a client can see the boundary in the URL.
-//
-// Cloud-only families (catalog, billing, orgs) are Tensorhub extensions and have no row
-// here at all.
+//	Core  — Creator's implemented request-level API and the proposed common core for
+//	        future servers. Cross-host parity requires conformance proof; it is not
+//	        asserted by this registry.
+//	Local — the Creator-only extension module: installed endpoints, workers, host doctor,
+//	        triage, jobs, workflows, and video composition. Its /v1/local/ mount makes
+//	        that boundary visible in the URL.
 
 // Scope is which module a route belongs to.
 type Scope string
@@ -53,10 +45,10 @@ type Route struct {
 
 // Routes is THE surface. Order is the document's order.
 var Routes = []Route{
-	// ---- the shared client contract CORE (th-021) ----
+	// ---- Creator's implemented request-level CORE ----
 	{"POST", "/v1/requests", Core, true, true, false, "Idempotency-Key",
 		"submit one request; 202 with the request handle",
-		"cl-010 `cozy run`, cl-007's UI, cozy.art"},
+		"`cozy run` and Creator's local UI"},
 	{"GET", "/v1/requests", Core, true, false, false, "",
 		"list requests newest-first, optionally filtered by status",
 		"cl-010 `cozy status`"},
@@ -174,8 +166,7 @@ var Tokens = []string{
 	"api.stub.embedded",          // the go:embed stub page
 }
 
-// ContractVersion is the shared client contract's core version this host serves. It
-// replaces cl-002's `pending-cl-006` placeholder in `cozy version`.
+// ContractVersion is the request-level core version Creator serves.
 const ContractVersion = "cozy.client.v1"
 
 // ONE registry. `cozy capabilities` and `GET /v1/capabilities` read the same slice, so
