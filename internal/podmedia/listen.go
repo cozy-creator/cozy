@@ -63,8 +63,8 @@ func (p *Plane) Close() error { return p.ln.Close() }
 // Serve runs until the listener fails or is closed.
 func (p *Plane) Serve() error {
 	srv := &http.Server{Handler: baseline(p.srv.routes())}
-	fmt.Printf("[media] serving %s root=%s quota=%d B plans=%v\n",
-		p.Addr(), p.srv.opt.Root, p.srv.opt.Quota, p.srv.opt.Plans != "")
+	fmt.Printf("[media] serving %s root=%s quota=%d B\n",
+		p.Addr(), p.srv.opt.Root, p.srv.opt.Quota)
 	_ = os.Stdout.Sync()
 	var err error
 	if p.srv.opt.Cert != "" {

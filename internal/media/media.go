@@ -1,11 +1,9 @@
 // Package media is the OWNER's side of a rented pod's media server (cl-014, ruled #506b):
 // the only byte channel there is between this host and a pod, in either direction.
 //
-// Before this existed there was none. `attachRemote` dialled a pod's control leg, named
-// plan ids the pod had never been given, and minted DeliveryGrant access out of paths on
-// the OWNER's disk — three separate ways of pretending a boundary was not there. The wire
-// always had the shape for it (`InputAccess.Url` to read from, `OutputAccess.Url` to write
-// to, `DeliveryGrant.Credential` to present); nothing implemented either end.
+// This plane carries per-invocation inputs and outputs only. Endpoint source, plans,
+// wheels, and model-object sets are ordinary standing ArtifactGrant subjects fetched by
+// the worker; there is no endpoint-distribution route on this client or the pod server.
 //
 // WHY THE POD HOSTS IT and not this host: an owner-side byte plane would have to bind
 // off-loopback, which is exactly what `internal/api`'s one-bind-site fence refuses, and it
@@ -413,20 +411,6 @@ func mediaRefusal(status int, data []byte) *exit.Error {
 		problem.WithRemedy("%s", doc.Error.Remedy)
 	}
 	return problem
-}
-
-// PutPlan relays one exact canonical EntrypointBindingPlan. The pod hashes the
-// whole byte string and checks the claimed subject id before keeping it; neither
-// side renders a local binding record.
-func (c *Client) PutPlan(planID string, record []byte) (string, *exit.Error) {
-	doc, _, e := c.call(http.MethodPut,
-		"/v1/plans/"+strings.TrimPrefix(planID, "sha256:"), record)
-	if e != nil {
-		return "", e.WithRemedy("%s", or(e.Remedy,
-			"a binding plan is named by the digest of its identity; the pod recomputes it "+
-				"rather than trusting the name it arrived under"))
-	}
-	return doc.Path, nil
 }
 
 // ReserveOutputs charges the exact sum of the attempt's OutputBinding max_bytes values,

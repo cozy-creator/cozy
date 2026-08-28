@@ -39,10 +39,12 @@ const recordOwnerEpoch = 1
 const recordOwnerID = "cozy-local-client"
 
 type session struct {
-	bootID     string
-	generation uint64
-	instanceID string
-	out        chan *pb.RecordOwnerFrame
+	ctx                context.Context
+	bootID             string
+	generation         uint64
+	instanceID         string
+	out                chan *pb.RecordOwnerFrame
+	remoteGrantStarted bool
 }
 
 func (s *session) send(m *pb.RecordOwnerFrame) (sent bool) {
@@ -51,8 +53,12 @@ func (s *session) send(m *pb.RecordOwnerFrame) (sent bool) {
 			sent = false
 		}
 	}()
-	s.out <- m
-	return true
+	select {
+	case s.out <- m:
+		return true
+	case <-s.ctx.Done():
+		return false
+	}
 }
 
 func (s *session) trySend(m *pb.RecordOwnerFrame) (sent bool) {
@@ -216,7 +222,7 @@ func (c *Orchestrator) converse(w *worker, addr string) error {
 		w.spawned = time.Now() // the claim is out; silence from here is the pod's
 	}
 	c.mu.Unlock()
-	s := &session{instanceID: w.instanceID, out: make(chan *pb.RecordOwnerFrame, 32)}
+	s := &session{ctx: ctx, instanceID: w.instanceID, out: make(chan *pb.RecordOwnerFrame, 32)}
 	go func() {
 		for m := range s.out {
 			if err := stream.Send(m); err != nil {
@@ -619,8 +625,146 @@ func (c *Orchestrator) onSnapshot(w *worker, s *session, snap *pb.WorkerSnapshot
 		c.sendJobDirective(s, w)
 		return
 	}
+	if w.spec.Connection != nil {
+		if s.remoteGrantStarted {
+			return
+		}
+		s.remoteGrantStarted = true
+		go c.runRemoteGrantLoop(s, w)
+		return
+	}
 	if e := c.converge(s, w, []DesiredPlacement{w.spec.Placement}); e != nil {
 		c.logf("the desired placement set for %s could not be issued: %s", w.instanceID, e.Message)
+	}
+}
+
+// runRemoteGrantLoop owns the standing access lane for one claimed stream. The first
+// successful update is queued before DesiredPlacementSet; later updates touch only
+// grant_revision, so expiring URLs cannot manufacture a new desired revision.
+func (c *Orchestrator) runRemoteGrantLoop(s *session, w *worker) {
+	if c.opt.ArtifactGrants == nil {
+		c.logf("rental %s has no artifact-grant source; desired placement was not issued",
+			w.spec.Connection.RentalID)
+		return
+	}
+	initial := true
+	for {
+		revision, grant, problem := c.opt.ArtifactGrants(s.ctx, w.spec.Connection)
+		if problem != nil {
+			c.logf("rental %s artifact grant was not refreshed: %s",
+				w.spec.Connection.RentalID, problem.Message)
+			if !waitContext(s.ctx, ReportCadence) {
+				return
+			}
+			continue
+		}
+		if problem := grantCovers(w.spec.Placement, grant); problem != nil {
+			c.logf("rental %s artifact grant REFUSED: %s",
+				w.spec.Connection.RentalID, problem.Message)
+			if !waitContext(s.ctx, ReportCadence) {
+				return
+			}
+			continue
+		}
+		update := &pb.ArtifactGrantUpdate{GrantRevision: revision, Grant: grant}
+		update.RecordOwnerEpoch, update.ControlStreamGeneration, update.WorkerBootId =
+			recordOwnerEpoch, s.generation, s.bootID
+		if !s.send(&pb.RecordOwnerFrame{Msg: &pb.RecordOwnerFrame_ArtifactGrantUpdate{
+			ArtifactGrantUpdate: update,
+		}}) {
+			return
+		}
+		c.mu.Lock()
+		w.grantRevision, w.grantID = revision, grant.GrantId
+		c.mu.Unlock()
+		c.logf("ArtifactGrantUpdate revision=%d grant=%s subjects=%d expires=%d -> %s",
+			revision, grant.GrantId, len(grant.Subjects), grant.ExpiresAtUnix, s.bootID)
+		if initial {
+			if problem := c.converge(s, w, []DesiredPlacement{w.spec.Placement}); problem != nil {
+				c.logf("the desired placement set for %s could not be issued: %s",
+					w.instanceID, problem.Message)
+				return
+			}
+			initial = false
+		}
+		if !waitContext(s.ctx, grantRefreshDelay(grant.ExpiresAtUnix)) {
+			return
+		}
+	}
+}
+
+func grantCovers(placement DesiredPlacement, grant *pb.ArtifactGrant) *exit.Error {
+	if grant == nil || grant.GrantId == "" || grant.ExpiresAtUnix <= uint64(time.Now().Unix()) {
+		return exit.Named(exit.Conflict, "rental.artifact_grant_invalid",
+			"the rental artifact grant is absent, unnamed, or expired")
+	}
+	type requiredSubject struct {
+		kind, id string
+		length   uint64
+	}
+	want := map[string]requiredSubject{}
+	for _, binding := range placement.Bindings {
+		if binding.RuntimePlan == nil {
+			return exit.Named(exit.Conflict, "rental.artifact_grant_closure_mismatch",
+				"remote binding %s has no exact plan subject", binding.Entrypoint)
+		}
+		want[binding.RuntimePlan.Digest] = requiredSubject{
+			kind: "plan", id: binding.RuntimePlan.SubjectID, length: binding.RuntimePlan.Length,
+		}
+	}
+	if placement.ModelObjectSetDigest == "" || placement.ModelObjectSetLength == 0 {
+		return exit.Named(exit.Conflict, "rental.model_object_set_missing",
+			"the remote placement carries no exact model-object-set subject")
+	}
+	want[placement.ModelObjectSetDigest] = requiredSubject{
+		kind: "model_object_set", id: placement.ModelObjectSetDigest,
+		length: placement.ModelObjectSetLength,
+	}
+	for _, subject := range grant.Subjects {
+		spelled, err := canonical.Spell(subject.Digest)
+		if err != nil {
+			continue
+		}
+		if required, exists := want[spelled]; exists {
+			if required.length != subject.Length || required.kind != subject.Kind ||
+				required.id != subject.SubjectId {
+				return exit.Named(exit.Conflict, "rental.artifact_grant_closure_mismatch",
+					"grant subject %s does not equal desired kind=%s id=%s length=%d",
+					spelled, required.kind, required.id, required.length)
+			}
+			delete(want, spelled)
+		}
+	}
+	if len(want) != 0 {
+		return exit.Named(exit.Conflict, "rental.artifact_grant_closure_mismatch",
+			"the complete rental grant omits %d subject(s) required by desired state", len(want))
+	}
+	return nil
+}
+
+func grantRefreshDelay(expiresAt uint64) time.Duration {
+	remaining := time.Until(time.Unix(int64(expiresAt), 0))
+	if remaining <= 0 {
+		return 0
+	}
+	lead := remaining / 3
+	if lead > 5*time.Minute {
+		lead = 5 * time.Minute
+	}
+	if delay := remaining - lead; delay > 0 {
+		return delay
+	}
+	return 0
+}
+
+func waitContext(ctx context.Context, delay time.Duration) bool {
+	timer := time.NewTimer(delay)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return false
+	case <-timer.C:
+		return true
 	}
 }
 

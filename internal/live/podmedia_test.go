@@ -52,7 +52,6 @@ func TestPodMediaGrant(t *testing.T) {
 	plane, err := podmedia.Bind(podmedia.Options{
 		Listen:           "127.0.0.1:0",
 		Root:             filepath.Join(root, "media"),
-		Plans:            filepath.Join(root, "plans"),
 		TokenHashes:      []string{"sha256:" + digest},
 		Cert:             cert,
 		Key:              key,

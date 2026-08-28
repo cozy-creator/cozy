@@ -94,7 +94,6 @@ func startMedia(cfg config) (*leg, error) {
 	plane, err := podmedia.Bind(podmedia.Options{
 		Listen:           net.JoinHostPort("0.0.0.0", strconv.Itoa(int(cfg.mediaPort))),
 		Root:             mediaRoot,
-		Plans:            plansDir,
 		TokenHashes:      mediaGrant(cfg.tokenHashes),
 		Cert:             certificatePath,
 		Key:              privateKeyPath,

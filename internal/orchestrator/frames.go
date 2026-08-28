@@ -147,6 +147,7 @@ func (c *Orchestrator) placementSpec(w *worker, p DesiredPlacement) *pb.Placemen
 	spec := &pb.PlacementSpec{
 		EndpointReleaseId: p.ReleaseID,
 		BindingPlans:      w.subjects,
+		ModelObjectSet:    modelObjectSetSubject(p),
 	}
 	environmentDigest := p.EnvironmentSpecDigest
 	if environmentDigest == "" && w.spec.Connection == nil {
@@ -162,6 +163,27 @@ func (c *Orchestrator) placementSpec(w *worker, p DesiredPlacement) *pb.Placemen
 		spec.DescriptorDigest = raw
 	}
 	return spec
+}
+
+const (
+	emptyModelObjectSetDigest = "sha256:d60755ff474871fce1e9705850245780895c1d2b798750f7692962c2d64d8856"
+	emptyModelObjectSetLength = 53
+)
+
+// modelObjectSetSubject makes the required PlacementSpec/2 closure explicit even for a
+// weightless local endpoint. The empty object-set document is a real canonical subject,
+// not absence; remote placements carry Tensorhub's exact non-empty subject and normally
+// bypass local authoring by relaying the complete PlacementSet bytes.
+func modelObjectSetSubject(p DesiredPlacement) *pb.ArtifactSubject {
+	digest, length := p.ModelObjectSetDigest, p.ModelObjectSetLength
+	if digest == "" {
+		digest, length = emptyModelObjectSetDigest, emptyModelObjectSetLength
+	}
+	raw, err := canonical.Raw(digest)
+	if err != nil || length == 0 {
+		return nil
+	}
+	return &pb.ArtifactSubject{Digest: raw, SubjectId: digest, Kind: "model_object_set", Length: length}
 }
 
 // ------------------------------------------------------------------- observed state
@@ -193,6 +215,7 @@ func (c *Orchestrator) onObserved(s *session, r *pb.ObservedWorkerState) {
 		w.acceptedRevision = r.AcceptedDesiredStateRevision
 		w.convergedRevision = r.ConvergedRevision
 		w.acceptedSetDigest = r.AcceptedPlacementSetDigest
+		w.appliedGrantRevision, w.appliedGrantID = r.AppliedGrantRevision, r.AppliedArtifactGrantId
 		dispatchable, materializable := map[string]bool{}, map[string]bool{}
 		if w.spec.IsJob() {
 			// THE JOB LANE READS JOB CAPACITY: a job worker is in JobDirective mode and

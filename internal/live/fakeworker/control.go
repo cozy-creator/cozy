@@ -119,6 +119,8 @@ func (f *fakeControl) Control(stream pb.WorkerControl_ControlServer) error {
 	send(&pb.WorkerFrame{Msg: &pb.WorkerFrame_Snapshot{Snapshot: snap}})
 	f.say("WorkerSnapshot %s sent (%d B); admission is CLOSED until the ack", snapshotID, len(bodyBytes))
 
+	var grantRevision uint64
+	var grantID string
 	observed := func(revision uint64, placementID string, setDigest []byte, planIDs []string) {
 		r := &pb.ObservedWorkerState{
 			AcceptedDesiredStateRevision: revision, ConvergedRevision: revision,
@@ -127,6 +129,7 @@ func (f *fakeControl) Control(stream pb.WorkerControl_ControlServer) error {
 			AppliedWireMinor:           pb.WireMinor,
 			AdmissionState:             pb.AdmissionState_ADMISSION_STATE_OPEN,
 			AdmissionGeneration:        admissionGeneration, AvailableAttemptSlots: 2,
+			AppliedGrantRevision: grantRevision, AppliedArtifactGrantId: grantID,
 		}
 		if placementID != "" {
 			r.Placements = []*pb.PlacementStatus{{
@@ -172,6 +175,14 @@ func (f *fakeControl) Control(stream pb.WorkerControl_ControlServer) error {
 				time.Sleep(2 * time.Second)
 				return nil
 			}
+		case *pb.RecordOwnerFrame_ArtifactGrantUpdate:
+			update := m.ArtifactGrantUpdate
+			if update.Grant == nil || update.GrantRevision < grantRevision {
+				continue
+			}
+			grantRevision, grantID = update.GrantRevision, update.Grant.GrantId
+			f.say("ArtifactGrantUpdate revision=%d grant=%s subjects=%d",
+				grantRevision, grantID, len(update.Grant.Subjects))
 		case *pb.RecordOwnerFrame_DesiredState:
 			d := m.DesiredState
 			placementID, planIDs, setDigest := "", []string(nil), []byte(nil)

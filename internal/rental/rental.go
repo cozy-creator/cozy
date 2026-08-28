@@ -10,12 +10,14 @@
 package rental
 
 import (
+	"context"
 	"errors"
 	"os"
 	"path/filepath"
 	"runtime"
 	"sort"
 
+	"github.com/cozy-creator/cozy-creator/internal/canonical"
 	"github.com/cozy-creator/cozy-creator/internal/exit"
 	"github.com/cozy-creator/cozy-creator/internal/home"
 	"github.com/cozy-creator/cozy-creator/internal/hub"
@@ -26,6 +28,7 @@ import (
 	"github.com/cozy-creator/cozy-creator/internal/remotecontrol"
 	"github.com/cozy-creator/cozy-creator/internal/rentalid"
 	"github.com/cozy-creator/cozy-creator/internal/secret"
+	pb "github.com/cozy-creator/cozy-creator/protocol/cozy/worker/v1"
 )
 
 func validID(id string) *exit.Error {
@@ -345,6 +348,52 @@ func Resolver(l home.Layout, st *records.Store) func(string) (*orchestrator.Remo
 			spec.Media = &media.Spec{Addr: row.MediaAddress, Token: token, CACert: cert}
 		}
 		return &orchestrator.RemoteTarget{Connection: spec, Placement: facts.Placement}, nil
+	}
+}
+
+// ArtifactGrants wires the owner-token authenticated Tensorhub route into the RecordOwner.
+// Revision allocation is durable and precedes the request; if the response is lost, the
+// next retry moves forward rather than emitting an update the worker has already applied.
+func ArtifactGrants(st *records.Store, client *hub.Client) orchestrator.ArtifactGrantSource {
+	return func(ctx context.Context, connection *orchestrator.WorkerConnection) (
+		uint64, *pb.ArtifactGrant, *exit.Error) {
+		if connection == nil || connection.RentalID == "" || !connection.Token.Present() {
+			return 0, nil, exit.Named(exit.Credential, "rental.artifact_grant_authority_missing",
+				"the connected worker has no rental identity or owner token")
+		}
+		revision, problem := st.ReserveArtifactGrantRevision(connection.RentalID)
+		if problem != nil {
+			return 0, nil, problem
+		}
+		answer, problem := client.WithToken(connection.Token, "rental owner token").ArtifactGrant(
+			ctx, connection.RentalID, revision, 3600, "cozy RecordOwner artifact grant")
+		if problem != nil {
+			return 0, nil, problem
+		}
+		grant := &pb.ArtifactGrant{
+			GrantId: answer.Grant.GrantID, ExpiresAtUnix: answer.Grant.ExpiresAtUnix,
+		}
+		for _, subject := range answer.Grant.Subjects {
+			digest, err := canonical.Raw(subject.Digest)
+			if err != nil {
+				return 0, nil, exit.Named(exit.Conflict, "rental.artifact_grant_invalid",
+					"Tensorhub returned malformed artifact digest %q", subject.Digest)
+			}
+			grant.Subjects = append(grant.Subjects, &pb.ArtifactSubject{
+				Digest: digest, SubjectId: subject.SubjectID, Kind: subject.Kind, Length: subject.Length,
+			})
+		}
+		for _, location := range answer.Grant.Locations {
+			digest, err := canonical.Raw(location.Digest)
+			if err != nil {
+				return 0, nil, exit.Named(exit.Conflict, "rental.artifact_grant_invalid",
+					"Tensorhub returned malformed artifact-location digest %q", location.Digest)
+			}
+			grant.Locations = append(grant.Locations, &pb.ArtifactLocation{
+				Digest: digest, Url: location.URL,
+			})
+		}
+		return revision, grant, nil
 	}
 }
 

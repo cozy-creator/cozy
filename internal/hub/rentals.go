@@ -2,11 +2,13 @@ package hub
 
 import (
 	"context"
+	"encoding/hex"
 	"encoding/json"
 	"net/http"
 	"net/url"
 	"regexp"
 	"strings"
+	"time"
 
 	"github.com/cozy-creator/cozy-creator/internal/exit"
 	"github.com/cozy-creator/cozy-creator/internal/rentalid"
@@ -225,6 +227,116 @@ func (c *Client) Rental(ctx context.Context, id string) (Rental, *exit.Error) {
 			WithRemedy("preserve the original rental identity; never attach the response under another id")
 	}
 	return out.rental(), nil
+}
+
+// ArtifactGrant is one complete, expiring authorization for the immutable subjects
+// Tensorhub selected for a rental. Identity remains in PlacementSet/2; this answer carries
+// only access locations and can therefore be refreshed without changing desired state.
+type ArtifactGrant struct {
+	GrantID       string                  `json:"grant_id"`
+	Subjects      []ArtifactGrantSubject  `json:"subjects"`
+	Locations     []ArtifactGrantLocation `json:"locations"`
+	ExpiresAtUnix uint64                  `json:"expires_at_unix"`
+}
+
+type ArtifactGrantSubject struct {
+	Digest    string `json:"digest"`
+	Kind      string `json:"kind"`
+	Length    uint64 `json:"length"`
+	SubjectID string `json:"subject_id"`
+}
+
+type ArtifactGrantLocation struct {
+	Digest string `json:"digest"`
+	URL    string `json:"url"`
+}
+
+type RentalArtifactGrant struct {
+	GrantRevision uint64        `json:"grant_revision"`
+	Grant         ArtifactGrant `json:"grant"`
+}
+
+const maxArtifactGrantResponseBytes = 64 << 20
+
+// ArtifactGrant asks Tensorhub for fresh, rental-scoped locations using the renter token
+// that already authenticates Claim. The request is deliberately only revision plus TTL:
+// callers cannot choose, omit, or substitute a subject selected by Tensorhub.
+func (c *Client) ArtifactGrant(ctx context.Context, id string, revision, ttlSeconds uint64,
+	reason string) (RentalArtifactGrant, *exit.Error) {
+	var out RentalArtifactGrant
+	if e := validateRentalID(id); e != nil {
+		return out, e
+	}
+	if revision == 0 || ttlSeconds == 0 {
+		return out, exit.Internalf("rental artifact grant requires non-zero revision and TTL")
+	}
+	e := c.do(ctx, call{
+		method:        http.MethodPost,
+		path:          "/v1/private-rentals/" + url.PathEscape(id) + "/artifact-grants",
+		admin:         true,
+		reason:        reason,
+		responseBytes: maxArtifactGrantResponseBytes,
+		body: struct {
+			GrantRevision uint64 `json:"grant_revision"`
+			TTLSeconds    uint64 `json:"ttl_seconds"`
+		}{GrantRevision: revision, TTLSeconds: ttlSeconds},
+	}, &out)
+	if e != nil {
+		return out, e
+	}
+	if out.GrantRevision != revision {
+		return out, artifactGrantInvalid("answered revision %d for requested revision %d",
+			out.GrantRevision, revision)
+	}
+	if e := validateArtifactGrant(out.Grant); e != nil {
+		return out, e
+	}
+	return out, nil
+}
+
+func artifactGrantInvalid(format string, args ...any) *exit.Error {
+	return exit.Named(exit.Conflict, "rental.artifact_grant_invalid", format, args...).
+		WithRemedy("release this rental; Creator will not repair or widen Tensorhub's artifact authority")
+}
+
+func validateArtifactGrant(grant ArtifactGrant) *exit.Error {
+	if grant.GrantID == "" || len(grant.Subjects) == 0 ||
+		grant.ExpiresAtUnix <= uint64(time.Now().Unix()) {
+		return artifactGrantInvalid("the grant header is incomplete or already expired")
+	}
+	locations := make(map[string]string, len(grant.Locations))
+	prior := ""
+	for i, location := range grant.Locations {
+		if !validDigest(location.Digest) || location.URL == "" ||
+			(i > 0 && location.Digest <= prior) {
+			return artifactGrantInvalid("artifact location %d is malformed, duplicated, or unsorted", i)
+		}
+		locations[location.Digest] = location.URL
+		prior = location.Digest
+	}
+	prior = ""
+	for i, subject := range grant.Subjects {
+		if !validDigest(subject.Digest) || subject.SubjectID == "" || subject.Kind == "" ||
+			subject.Length == 0 || (i > 0 && subject.Digest <= prior) {
+			return artifactGrantInvalid("artifact subject %d is malformed, duplicated, or unsorted", i)
+		}
+		if locations[subject.Digest] == "" {
+			return artifactGrantInvalid("artifact subject %s has no acquisition location", subject.Digest)
+		}
+		prior = subject.Digest
+	}
+	if len(locations) != len(grant.Subjects) {
+		return artifactGrantInvalid("the grant has %d subjects and %d locations",
+			len(grant.Subjects), len(locations))
+	}
+	return nil
+}
+
+func validDigest(spelled string) bool {
+	raw := strings.TrimPrefix(spelled, "sha256:")
+	decoded, err := hex.DecodeString(raw)
+	return strings.HasPrefix(spelled, "sha256:") && err == nil && len(decoded) == 32 &&
+		raw == strings.ToLower(raw)
 }
 
 // Release asks the hub to tear the pod down. The hub answers 204 and nothing is decoded;

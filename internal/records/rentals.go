@@ -50,7 +50,8 @@ CREATE TABLE IF NOT EXISTS rentals (
   observed_backend           TEXT NOT NULL DEFAULT '',
   observed_worker_instance   TEXT NOT NULL DEFAULT '',
   observed_worker_boot_id    TEXT NOT NULL DEFAULT '',
-  observed_at                TEXT NOT NULL DEFAULT ''
+  observed_at                TEXT NOT NULL DEFAULT '',
+  artifact_grant_revision    INTEGER NOT NULL DEFAULT 0
 )`
 
 var rentalSchema = []string{rentalOperationsDDL, rentalsDDL, `
@@ -276,9 +277,13 @@ type Rental struct {
 	ObservedWorkerInstance   string
 	ObservedWorkerBootID     string
 	ObservedAt               string
+	// ArtifactGrantRevision is the highest renter-owned access revision reserved for
+	// this pod. It advances before the HTTP ask so a lost answer can never make a service
+	// restart replay an older revision the worker will ignore.
+	ArtifactGrantRevision uint64
 }
 
-const rentalCols = `id,endpoint_ref,accelerator_model,address,cert_path,state,hub,rented_at,media_address,control_snapshot_digest,control_snapshot_bytes,observed_accelerator,observed_accelerator_count,observed_backend,observed_worker_instance,observed_worker_boot_id,observed_at`
+const rentalCols = `id,endpoint_ref,accelerator_model,address,cert_path,state,hub,rented_at,media_address,control_snapshot_digest,control_snapshot_bytes,observed_accelerator,observed_accelerator_count,observed_backend,observed_worker_instance,observed_worker_boot_id,observed_at,artifact_grant_revision`
 
 func scanRental(row interface{ Scan(...any) error }) (Rental, error) {
 	var r Rental
@@ -286,7 +291,8 @@ func scanRental(row interface{ Scan(...any) error }) (Rental, error) {
 		&r.State, &r.Hub, &r.RentedAt, &r.MediaAddress,
 		&r.ControlSnapshotDigest, &r.ControlSnapshotBytes,
 		&r.ObservedAccelerator, &r.ObservedAcceleratorCount, &r.ObservedBackend,
-		&r.ObservedWorkerInstance, &r.ObservedWorkerBootID, &r.ObservedAt)
+		&r.ObservedWorkerInstance, &r.ObservedWorkerBootID, &r.ObservedAt,
+		&r.ArtifactGrantRevision)
 	return r, err
 }
 
@@ -315,7 +321,7 @@ func (s *Store) RecordRental(r Rental) *exit.Error {
 		r.State = rentalStateForward(current, r.State)
 	}
 	if _, err := tx.Exec(`INSERT INTO rentals(`+rentalCols+`)
-		VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+		VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
 		ON CONFLICT(id) DO UPDATE SET address=excluded.address,
 		  cert_path=excluded.cert_path, state=excluded.state,
 		  media_address=excluded.media_address,
@@ -339,7 +345,7 @@ func (s *Store) RecordRental(r Rental) *exit.Error {
 		r.RentedAt, r.MediaAddress, r.ControlSnapshotDigest,
 		r.ControlSnapshotBytes, r.ObservedAccelerator,
 		r.ObservedAcceleratorCount, r.ObservedBackend, r.ObservedWorkerInstance,
-		r.ObservedWorkerBootID, r.ObservedAt); err != nil {
+		r.ObservedWorkerBootID, r.ObservedAt, r.ArtifactGrantRevision); err != nil {
 		return exit.Internalf("cannot record rental %s: %s", r.ID, err)
 	}
 	if err := tx.Commit(); err != nil {
@@ -356,6 +362,41 @@ func (s *Store) RecordRental(r Rental) *exit.Error {
 			"rental %s already carries another exact acquisition-attempt control snapshot", r.ID)
 	}
 	return nil
+}
+
+// ReserveArtifactGrantRevision durably allocates the next monotonic access revision.
+// Gaps are harmless; reuse is not. The reservation commits before a network call so a
+// response lost after Tensorhub committed cannot move the next service process backward.
+func (s *Store) ReserveArtifactGrantRevision(id string) (uint64, *exit.Error) {
+	tx, err := s.db.Begin()
+	if err != nil {
+		return 0, exit.Internalf("cannot begin artifact-grant revision for rental %s: %s", id, err)
+	}
+	defer tx.Rollback()
+	var current uint64
+	if err := tx.QueryRow(`SELECT artifact_grant_revision FROM rentals WHERE id=?`, id).Scan(&current); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return 0, exit.New(exit.NotFound, "no rental %s on this host", id)
+		}
+		return 0, exit.Internalf("cannot read artifact-grant revision for rental %s: %s", id, err)
+	}
+	if current == ^uint64(0) {
+		return 0, exit.Internalf("artifact-grant revision for rental %s is exhausted", id)
+	}
+	next := current + 1
+	result, err := tx.Exec(`UPDATE rentals SET artifact_grant_revision=?
+		WHERE id=? AND artifact_grant_revision=?`, next, id, current)
+	if err != nil {
+		return 0, exit.Internalf("cannot reserve artifact-grant revision for rental %s: %s", id, err)
+	}
+	changed, err := result.RowsAffected()
+	if err != nil || changed != 1 {
+		return 0, exit.Internalf("artifact-grant revision for rental %s changed concurrently", id)
+	}
+	if err := tx.Commit(); err != nil {
+		return 0, exit.Internalf("cannot commit artifact-grant revision for rental %s: %s", id, err)
+	}
+	return next, nil
 }
 
 // ObserveRentalWorker records the actual remote worker ClaimAck before any model

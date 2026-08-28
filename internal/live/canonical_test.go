@@ -53,8 +53,8 @@ func TestCanonicalDocuments(t *testing.T) {
 	if got, _ := canonical.Spell(canonical.Digest(schemaBytes)); got != schema.ID {
 		t.Errorf("the schema digest is not over those document bytes: %s", got)
 	}
-	if pb.WireSchemaRev != 5 || pb.WireMinor != 1 {
-		t.Errorf("this binding declares rev %d minor %d, wanted rev 5 minor 1",
+	if pb.WireSchemaRev != 6 || pb.WireMinor != 1 {
+		t.Errorf("this binding declares rev %d minor %d, wanted rev 6 minor 1",
 			pb.WireSchemaRev, pb.WireMinor)
 	}
 
@@ -107,11 +107,14 @@ func TestCanonicalDocuments(t *testing.T) {
 		code string
 		msg  proto.Message
 	}{
-		"twin_duplicate_key":  {"duplicate_key", &pb.InvocationSpec{}},
-		"twin_float":          {"non_integer_number", &pb.InvocationSpec{}},
-		"twin_unknown_key":    {"unknown_field", &pb.InvocationSpec{}},
-		"twin_whitespace":     {"noncanonical_encoding", &pb.InvocationSpec{}},
-		"twin_libc_unspelled": {"libc_unspelled", &pb.EndpointEnvironmentSpec{}},
+		"twin_duplicate_key":                {"duplicate_key", &pb.InvocationSpec{}},
+		"twin_float":                        {"non_integer_number", &pb.InvocationSpec{}},
+		"twin_unknown_key":                  {"unknown_field", &pb.InvocationSpec{}},
+		"twin_whitespace":                   {"noncanonical_encoding", &pb.InvocationSpec{}},
+		"twin_libc_unspelled":               {"libc_unspelled", &pb.EndpointEnvironmentSpec{}},
+		"twin_model_object_set_missing":     {"model_object_set_missing", &pb.PlacementSpec{}},
+		"twin_model_object_set_wrong_kind":  {"model_object_set_shape", &pb.PlacementSpec{}},
+		"twin_model_object_set_zero_length": {"model_object_set_shape", &pb.PlacementSpec{}},
 	} {
 		body, err := os.ReadFile(filepath.Join(fixtureDir, "red", name+".json"))
 		must(t, err)
