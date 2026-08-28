@@ -338,8 +338,14 @@ func (c *Client) ObserveWorkerSession(ctx context.Context, id string,
 		return out, exit.Named(exit.Conflict, "rental.worker_observation_invalid",
 			"Tensorhub accepted private worker evidence but answered state %q", out.State)
 	}
+	if boot && out.State != RentalConverging {
+		return out, exit.Named(exit.Conflict, "rental.worker_observation_invalid",
+			"Tensorhub answered %s to a typed worker boot failure", out.State)
+	}
 	if !boot && (out.DesiredRevision != observation.DesiredRevision ||
-		out.AcceptedRevision > out.DesiredRevision || out.ConvergedRevision > out.AcceptedRevision) {
+		out.AcceptedRevision > out.DesiredRevision || out.ConvergedRevision > out.AcceptedRevision ||
+		out.State == RentalReady && (out.AcceptedRevision != out.DesiredRevision ||
+			out.ConvergedRevision != out.DesiredRevision)) {
 		return out, exit.Named(exit.Conflict, "rental.worker_observation_invalid",
 			"Tensorhub answered impossible convergence revisions desired=%d accepted=%d converged=%d",
 			out.DesiredRevision, out.AcceptedRevision, out.ConvergedRevision)
