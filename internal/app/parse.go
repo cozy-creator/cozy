@@ -198,14 +198,13 @@ func parse(args []string) (*Invocation, *exit.Error) {
 	}
 	if inv.Cmd == nil {
 		inv.Bare = !inv.Help
-		return inv, nil
-	}
-	if err := checkArgs(inv); err != nil {
-		return inv, err
 	}
 	return inv, nil
 }
 
+// checkArgs is a GATE, not a parse step: it runs from app.gate, after -h has been
+// answered and after a planned row has said which issue it lands with. Refusing here
+// would put arity ahead of both.
 func checkArgs(inv *Invocation) *exit.Error {
 	c := inv.Cmd
 	if len(inv.Args) < c.MinArgs {

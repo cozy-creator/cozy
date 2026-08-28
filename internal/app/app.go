@@ -79,8 +79,8 @@ func Run(args []string, stdout, stderr io.Writer) int {
 		inv.Cmd, _ = manifest.Lookup([]string{"status"})
 	}
 
-	// Gates, most-durable refusal first: a refusal that would still stand in a
-	// fully implemented binary is reported before one that is only true of this build.
+	// Gates, in precedence order — see gate(). Arity is one of them, deliberately:
+	// checked here rather than in parse so that -h and the planned-row answer come first.
 	if e := gate(ctx); e != nil {
 		render.EmitError(stdout, e, inv.Mode)
 		return int(exit.Of(e))
@@ -94,10 +94,18 @@ func Run(args []string, stdout, stderr io.Writer) int {
 	return int(exit.OK)
 }
 
+// gate is the whole refusal precedence, in one place and in one order. -h/--help never
+// reaches here — Run answers it first, because help outranks every refusal (AXI 10) and a
+// gate that fired earlier would make `cozy job submit -h` a usage error, which it was.
+// Below help: authorization, then what this build carries, then the shape of the line,
+// then the world. The last one dials another process, so it is asked last.
 func gate(ctx *Context) *exit.Error {
 	c := ctx.Inv.Cmd
 
-	// 7 — destructive without --yes. No prompt exists anywhere.
+	// 7 — destructive without --yes. No prompt exists anywhere. First even for a line that
+	// is also malformed: this refusal's next: already spells the corrected line, arguments
+	// included, so following it fixes both facts at once — where an arity error would send
+	// the caller back for a second refusal it never mentioned.
 	if c.Destructive && !ctx.Inv.Bool("--yes") {
 		e := exit.Confirmf("`cozy %s` is destructive and refuses without --yes", c.Name()).
 			WithRemedy("re-run with --yes; there is no prompt")
@@ -107,20 +115,29 @@ func gate(ctx *Context) *exit.Error {
 		return e.WithNext("cozy " + c.Name() + " " + strings.TrimSpace(c.Args) + " --yes")
 	}
 
-	// 9 — the LocalService is the only door to server-backed verbs.
-	if c.NeedsServer {
-		ctx.Service = service.Probe(ctx.Cfg)
-		if !ctx.Service.Up {
-			return ctx.Service.Unavailable()
-		}
-	}
-
-	// 2 — advertised in the manifest, not carried by this build.
+	// 2 — advertised in the manifest, not carried by this build. Ahead of arity: a planned
+	// row has no handler, so its MinArgs/MaxArgs describe a contract nothing here enforces,
+	// and "you are missing an argument" is a worse answer than the issue it lands with.
 	if c.Status != manifest.Implemented {
 		return exit.Named(exit.Usage, "not_implemented",
 			"`cozy %s` is not implemented in this build", c.Name()).
 			WithRemedy("it lands with issue %s", c.Issue).
 			WithNext("cozy commands", "cozy help "+c.Name())
+	}
+
+	// 2 — arity: a fact about the line itself, settled without reading disk or dialing.
+	if e := checkArgs(ctx.Inv); e != nil {
+		return e
+	}
+
+	// 9 — the LocalService is the only door to server-backed verbs. Last: it is the only
+	// gate that touches another process, and "not running on this host right now" is the
+	// least durable of the four — a malformed or unbuilt verb is refused without it.
+	if c.NeedsServer {
+		ctx.Service = service.Probe(ctx.Cfg)
+		if !ctx.Service.Up {
+			return ctx.Service.Unavailable()
+		}
 	}
 	return nil
 }

@@ -21,7 +21,9 @@ and observes it — no mocks, no unit-test layer. #634 amends #160 for this repo
   never mutates or dials, and no prompt exists anywhere — destructive verbs refuse
   without `--yes` (exit 7).
 
-Gates run most-durable-refusal-first: confirm (7) → service (9) → not-implemented (2).
+Gates run help-first, then most-durable-refusal-first: `-h` (0) → confirm (7) →
+not-implemented (2) → arity (2) → service (9). Arity is a gate, not a parse step, so
+`-h` and a planned row's owning issue are never masked by an argument count.
 
 ## Install, pins and maintenance (cl-009)
 

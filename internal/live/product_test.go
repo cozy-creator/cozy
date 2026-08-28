@@ -30,6 +30,24 @@ func TestProductPath(t *testing.T) {
 	must(t, os.RemoveAll(root))
 	must(t, os.MkdirAll(root, 0o755))
 
+	// REFUSAL PRECEDENCE, before anything is built: -h outranks every gate even on a line
+	// that carries no arguments, a planned row names its issue rather than the arguments it
+	// would never read, and an implemented row still refuses a short line.
+	for _, arm := range []struct {
+		args []string
+		code int
+		want string
+	}{
+		{[]string{"job", "submit", "-h"}, 0, "usage: cozy job submit"},
+		{[]string{"datasets", "push"}, 2, "it lands with issue th-035"},
+		{[]string{"describe"}, 2, "`cozy describe` needs"},
+	} {
+		if code, out := runCozy(t, root, arm.args...); code != arm.code || !strings.Contains(out, arm.want) {
+			t.Errorf("cozy %s: exit %d wanted %d, and %q\n%s",
+				strings.Join(arm.args, " "), code, arm.code, arm.want, out)
+		}
+	}
+
 	// THE SERVICE IS DOWN: every server-backed verb is typed exit 9 with the start remedy.
 	// This needs no endpoint and no runtime peer, so it is checked before anything is built.
 	for _, args := range [][]string{
