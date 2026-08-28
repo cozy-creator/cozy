@@ -64,6 +64,17 @@ host does not hold is `404` **before** a request row exists — a pin that canno
 resolved now cannot be resolved on a later attempt either. The pin is deliberately NOT in
 the idempotency digest: it says WHERE the same work runs, not what the work is.
 
+A new private rental becomes `converging` with its complete receipt-pinned attach
+projection before it becomes `ready`. Creator's LocalService is the sole live
+`WorkerControl` RecordOwner: it presents the renter token, validates `ClaimAck` and the
+snapshot barrier, sends the Tensorhub placement revision as the exact desired revision,
+and relays deterministic ClaimAck/snapshot/observed-state frames through Tensorhub's
+rental-scoped HTTP route. Tensorhub validates the selected OCI and
+`control_runtime_digest`, then gates `ready` on accepted = converged = desired with a
+STAGED, DISPATCHABLE placement. Tensorhub never receives the plaintext token during
+creation and never dials or fences the private worker. A pinned request is refused as
+`rental.convergence_pending` until that ready verdict is durable locally.
+
 `local_assets` is the CLI-only local extension for `--asset
 <field-path>=<file>`. Each row names the exact request-schema field path plus a source
 path, digest, length, and detected media type. The service verifies those claims and

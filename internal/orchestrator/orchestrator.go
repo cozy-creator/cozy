@@ -65,6 +65,11 @@ type Options struct {
 	// PlacementRevisions asks Tensorhub to author and durably publish one new desired
 	// placement for this same live rental. It returns exact validated placement bytes.
 	PlacementRevisions PlacementRevisionSource
+	// RelayRentalSession returns authenticated private-worker evidence to Tensorhub.
+	// This RecordOwner remains the only process that dials WorkerControl: the callback
+	// carries deterministic frame bytes over the rental-scoped HTTP authority and never
+	// grants Tensorhub a worker credential or a competing control stream.
+	RelayRentalSession RentalSessionRelay
 
 	// EnvironmentSpecDigest and ConfigDigest are LOCAL placement defaults. They ride
 	// INSIDE every local InvocationSpec document:
@@ -81,6 +86,16 @@ type Options struct {
 type ArtifactGrantSource func(context.Context, *WorkerConnection) (uint64, *pb.ArtifactGrant, *exit.Error)
 type PlacementRevisionSource func(context.Context, *WorkerConnection, string, string, string) (
 	DesiredPlacement, uint64, *exit.Error)
+
+type RentalSessionEvidence struct {
+	ClaimAck        []byte
+	Snapshot        []byte
+	ObservedState   []byte
+	BootFailure     []byte
+	DesiredRevision uint64
+}
+
+type RentalSessionRelay func(context.Context, *WorkerConnection, RentalSessionEvidence) *exit.Error
 
 type RentalObservation struct {
 	RentalID               string

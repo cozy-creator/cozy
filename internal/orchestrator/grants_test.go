@@ -37,7 +37,8 @@ func TestRemoteGrantPrecedesPlacementAndRefreshDoesNotReviseDesiredState(t *test
 	}
 	setSpelling, _ := canonical.Spell(setDigest)
 	placement := DesiredPlacement{
-		Endpoint: "cozy/endpoint", ReleaseID: "release-1", PlacementIDValue: "acq-1",
+		PlacementRevision: 1,
+		Endpoint:          "cozy/endpoint", ReleaseID: "release-1", PlacementIDValue: "acq-1",
 		ExactPlacementSetBytes: setBytes, ExactPlacementSetDigest: setSpelling,
 		ModelObjectSetDigest: modelDigest, ModelObjectSetLength: uint64(len(modelBytes)),
 		Bindings: []*Binding{{Entrypoint: "generate", RuntimePlan: &BindingPlanSubject{

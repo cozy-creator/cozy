@@ -175,11 +175,19 @@ func handleRent(ctx *Context) *exit.Error {
 	if e := st.AdvanceRentalOperation(operationKey, r.ID, r.State); e != nil {
 		return e
 	}
-	row := records.Rental{
-		ID: r.ID, EndpointRef: endpointRef, AcceleratorModel: acceleratorModel,
-		State: r.State, Hub: c.Base(),
-	}
-	if e := st.RecordRental(row); e != nil {
+	row := records.Rental{ID: r.ID, EndpointRef: endpointRef,
+		AcceleratorModel: acceleratorModel, State: r.State, Hub: c.Base()}
+	if existing != nil && existing.State == "attached" {
+		stored, problem := st.RentalRow(r.ID)
+		if problem != nil {
+			return problem
+		}
+		if stored == nil {
+			return exit.Named(exit.Conflict, "rental.attached_record_missing",
+				"rental operation %s is attached but rental %s has no local row", operationKey, r.ID)
+		}
+		row = *stored
+	} else if e := st.RecordRental(row); e != nil {
 		return e
 	}
 	observe := func(seen hub.Rental) *exit.Error {
@@ -196,29 +204,66 @@ func handleRent(ctx *Context) *exit.Error {
 		}
 		return st.AdvanceRentalOperation(operationKey, seen.ID, seen.State)
 	}
-	ready, e := waitProvisioned(ctx, c, r.ID, deadline, observe)
+	attachable, e := waitRental(ctx, c, r.ID, deadline, observe,
+		func(r hub.Rental) bool { return r.Attachable() })
 	if e != nil {
 		return e
 	}
-	row.Address, row.State = ready.Address, ready.State
-	row.MediaAddress = ready.MediaAddress
-	captureRentalControl(&row, ready)
-	if !ready.HoldsHash(secret.HashHex(token)) {
+	if attachable.State == hub.RentalReady {
+		current, problem := st.RentalOperation(operationKey)
+		if problem != nil {
+			return problem
+		}
+		if current == nil || current.State != "attached" {
+			return exit.Named(exit.Conflict, "rental.convergence_evidence_missing",
+				"rental %s became ready before this host attached its private RecordOwner", attachable.ID).
+				WithRemedy("upgrade Tensorhub to the convergence-gated private-rental contract; the Hub cannot declare a fresh private worker ready without the renter's relayed frames")
+		}
+	}
+	row.Address, row.State = attachable.Address, attachable.State
+	row.MediaAddress = attachable.MediaAddress
+	captureRentalControl(&row, attachable)
+	if !attachable.HoldsHash(secret.HashHex(token)) {
 		// The pod was provisioned with a credential set this host's token is not in, so
 		// dialling it would 401 and look like a network fault. The hub says which hashes
 		// are live; neither end has to say a token to find this out.
 		return exit.New(exit.Failed,
-			"rental %s is ready and its live credential set does not carry the token this host minted", ready.ID).
+			"rental %s is attachable and its live credential set does not carry the token this host minted", attachable.ID).
 			WithRemedy("release it and rent again; a pod nobody can authenticate to still costs money").
-			WithNext("cozy rent release " + ready.ID + " --yes")
+			WithNext("cozy rent release " + attachable.ID + " --yes")
 	}
-	if e := rental.Attach(l, st, row, ready.CertPEM, token); e != nil {
+	if e := rental.Attach(l, st, row, attachable.CertPEM, token); e != nil {
 		return e
 	}
-	if e := st.AdvanceRentalOperation(operationKey, ready.ID, "attached"); e != nil {
+	row.CertPath = l.RentalCert(attachable.ID)
+	if e := st.AdvanceRentalOperation(operationKey, attachable.ID, "attached"); e != nil {
 		return e
 	}
 	rental.ForgetPending(l, operationKey)
+
+	// CONVERGING is the handoff to this host's sole RecordOwner. Tensorhub holds only
+	// the token hash and cannot authenticate to WorkerControl; the LocalService claims,
+	// acknowledges the snapshot barrier, drives desired state, and relays the resulting
+	// authenticated worker frames over the rental-scoped HTTP route.
+	local, e := dial(ctx)
+	if e != nil {
+		return e.WithRemedy("the paid rental remains converging and attached on this host; start `cozy up` and resume with the same --idempotency-key")
+	}
+	if _, e := local.EnsureRental(attachable.ID); e != nil {
+		return e.WithRemedy("the paid rental remains converging and attached on this host; keep `cozy up` running and resume with the same --idempotency-key")
+	}
+	observeConvergence := func(seen hub.Rental) *exit.Error {
+		if e := sameAttachProjection(attachable, seen, secret.HashHex(token)); e != nil {
+			return e
+		}
+		row.State = seen.State
+		return st.RecordRental(row)
+	}
+	ready, e := waitRental(ctx, c.WithToken(token, "rental owner token"), attachable.ID,
+		deadline, observeConvergence, func(r hub.Rental) bool { return r.Ready() })
+	if e != nil {
+		return e
+	}
 	notes := []string{
 		"this host MINTED the owner token and holds it at mode 0600; the hub and the pod hold only its sha256, so neither can dial this pod as you",
 		"rental operation " + operationKey,
@@ -256,11 +301,12 @@ func transient(e *exit.Error) bool {
 	return e.Code == exit.Unavailable || e.Code == exit.Deadline
 }
 
-// waitProvisioned polls one rental to a settled state. Every wait here is bounded by something
+// waitRental polls one rental to the caller's observed goal. Every wait here is bounded by something
 // OBSERVED: the hub's own verdict, a typed refusal, or the caller's --timeout. A rental
 // that is still acquiring or materializing is none of those, however long the provider
 // takes, and a hub that is momentarily unreachable is asked again at the same cadence.
-func waitProvisioned(ctx *Context, c *hub.Client, id string, deadline time.Time, observe func(hub.Rental) *exit.Error) (hub.Rental, *exit.Error) {
+func waitRental(ctx *Context, c *hub.Client, id string, deadline time.Time,
+	observe func(hub.Rental) *exit.Error, done func(hub.Rental) bool) (hub.Rental, *exit.Error) {
 	said := ""
 	for {
 		hctx, cancel := hub.LongContext()
@@ -284,7 +330,7 @@ func waitProvisioned(ctx *Context, c *hub.Client, id string, deadline time.Time,
 			return hub.Rental{}, e
 		}
 		switch {
-		case r.Ready():
+		case done(r):
 			return r, nil
 		case r.State == hub.RentalFailed:
 			return hub.Rental{}, exit.New(exit.Failed,
@@ -305,6 +351,10 @@ func waitProvisioned(ctx *Context, c *hub.Client, id string, deadline time.Time,
 			return hub.Rental{}, exit.New(exit.Failed,
 				"rental %s is ready and carries no %s", id, missingOf(r)).
 				WithRemedy("this hub build may not provision the worker's TLS leg; `cozy hub status` names it")
+		case r.State == hub.RentalConverging && !r.Attachable():
+			return hub.Rental{}, exit.New(exit.Failed,
+				"rental %s is converging and carries no %s", id, missingOf(r)).
+				WithRemedy("Tensorhub must publish the complete receipt-pinned attach projection before asking this RecordOwner to claim it")
 		}
 		// The hub's own words about what is happening, printed when they CHANGE. A line
 		// per poll would be a progress bar for someone else's work.
@@ -317,6 +367,39 @@ func waitProvisioned(ctx *Context, c *hub.Client, id string, deadline time.Time,
 		}
 		time.Sleep(pollCadence)
 	}
+}
+
+func sameAttachProjection(attached, seen hub.Rental, tokenHash string) *exit.Error {
+	if !seen.Attachable() || attached.ID != seen.ID || attached.Address != seen.Address ||
+		attached.MediaAddress != seen.MediaAddress || attached.CertPEM != seen.CertPEM ||
+		attached.EndpointRef != seen.EndpointRef || attached.PlacementRevision != seen.PlacementRevision ||
+		!seen.HoldsHash(tokenHash) || !sameHashSet(attached.TokenSHA256, seen.TokenSHA256) ||
+		attached.ControlSnapshot == nil || seen.ControlSnapshot == nil ||
+		attached.ControlSnapshot.Digest != seen.ControlSnapshot.Digest ||
+		attached.ControlSnapshot.Length != seen.ControlSnapshot.Length ||
+		!bytes.Equal(attached.ControlSnapshot.CanonicalBytes, seen.ControlSnapshot.CanonicalBytes) {
+		return exit.Named(exit.Conflict, "rental.attach_projection_changed",
+			"rental %s changed its receipt-pinned control projection while this host was converging it",
+			attached.ID).
+			WithRemedy("release it; a different address, certificate, credential set, or control snapshot is not the worker this RecordOwner claimed")
+	}
+	return nil
+}
+
+func sameHashSet(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	set := make(map[string]bool, len(a))
+	for _, value := range a {
+		set[strings.TrimPrefix(value, "sha256:")] = true
+	}
+	for _, value := range b {
+		if !set[strings.TrimPrefix(value, "sha256:")] {
+			return false
+		}
+	}
+	return len(set) == len(a)
 }
 
 func pastDeadline(id, state string, deadline time.Time) *exit.Error {

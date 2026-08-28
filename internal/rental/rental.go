@@ -54,6 +54,24 @@ func Attach(l home.Layout, st *records.Store, row records.Rental, cert string, t
 	if _, e := controlFacts(row); e != nil {
 		return e
 	}
+	stored, e := st.RentalRow(row.ID)
+	if e != nil {
+		return e
+	}
+	if stored != nil {
+		if stored.Address != "" && stored.Address != row.Address ||
+			stored.MediaAddress != "" && stored.MediaAddress != row.MediaAddress {
+			return exit.Named(exit.Conflict, "rental.attach_projection_conflict",
+				"rental %s changed its control or media address before attachment", row.ID)
+		}
+		if stored.CertPath != "" {
+			pinned, err := os.ReadFile(stored.CertPath)
+			if err != nil || !bytes.Equal(pinned, []byte(cert)) {
+				return exit.Named(exit.Conflict, "rental.attach_projection_conflict",
+					"rental %s changed its pinned certificate before attachment", row.ID)
+			}
+		}
+	}
 	if err := os.MkdirAll(l.Rentals, 0o700); err != nil {
 		return exit.Internalf("cannot create the rental credential root %s: %s", l.Rentals, err)
 	}
@@ -186,6 +204,12 @@ func Known(st *records.Store) func(string) (*orchestrator.DesiredPlacement, *exi
 		}
 		if row == nil {
 			return nil, unknown(id)
+		}
+		if row.State != hub.RentalReady {
+			return nil, exit.Named(exit.Unavailable, "rental.convergence_pending",
+				"rental %s is %s; Tensorhub has not accepted its relayed worker convergence evidence",
+				id, row.State).
+				WithRemedy("keep `cozy up` running so this host's RecordOwner can claim and converge the private worker")
 		}
 		if row.Address == "" {
 			return nil, noAddress(id, row.State)
@@ -324,6 +348,7 @@ func Resolver(l home.Layout, st *records.Store) func(string) (*orchestrator.Remo
 		if e != nil {
 			return nil, e
 		}
+		facts.Placement.PlacementRevision = row.PlacementRevision
 		token, e := Token(l, id)
 		if e != nil {
 			return nil, e
@@ -434,11 +459,49 @@ func PlacementRevisions(st *records.Store, client *hub.Client) orchestrator.Plac
 				"revision %d control snapshot and placement_set response disagree",
 				answer.PlacementRevision)
 		}
+		facts.Placement.PlacementRevision = answer.PlacementRevision
 		if problem := st.ReviseRentalControl(row.ID, answer.EndpointRef, answer.PlacementRevision,
 			answer.ControlSnapshot.Digest, answer.ControlSnapshot.CanonicalBytes); problem != nil {
 			return orchestrator.DesiredPlacement{}, 0, problem
 		}
 		return facts.Placement, answer.PlacementRevision, nil
+	}
+}
+
+// RelayWorkerSession is the private-rental observation seam. The plaintext renter token
+// already used as Claim.proof authenticates this HTTP call, but it is never persisted in
+// Tensorhub and Tensorhub never dials WorkerControl. A ready answer advances the local
+// rental row so request creation and dispatch remain closed until both authorities agree.
+func RelayWorkerSession(st *records.Store, client *hub.Client) orchestrator.RentalSessionRelay {
+	return func(ctx context.Context, connection *orchestrator.WorkerConnection,
+		evidence orchestrator.RentalSessionEvidence) *exit.Error {
+		if connection == nil || connection.RentalID == "" || !connection.Token.Present() {
+			return exit.Named(exit.Credential, "rental.worker_observation_authority_missing",
+				"the connected worker has no rental identity or owner token")
+		}
+		row, problem := st.RentalRow(connection.RentalID)
+		if problem != nil {
+			return problem
+		}
+		if row == nil {
+			return unknown(connection.RentalID)
+		}
+		if row.Hub != client.Base() {
+			return exit.Named(exit.Conflict, "rental.hub_mismatch",
+				"rental %s belongs to %s, configured hub is %s",
+				row.ID, row.Hub, client.Base())
+		}
+		answer, problem := client.WithToken(connection.Token, "rental owner token").ObserveWorkerSession(
+			ctx, connection.RentalID, hub.WorkerSessionObservation{
+				ClaimAck: evidence.ClaimAck, Snapshot: evidence.Snapshot,
+				ObservedState: evidence.ObservedState, BootFailure: evidence.BootFailure,
+				DesiredRevision: evidence.DesiredRevision,
+			})
+		if problem != nil {
+			return problem
+		}
+		row.State = answer.State
+		return st.RecordRental(*row)
 	}
 }
 

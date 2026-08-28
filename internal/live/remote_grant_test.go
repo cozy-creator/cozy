@@ -13,6 +13,7 @@ import (
 
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials"
+	"google.golang.org/protobuf/proto"
 
 	"github.com/cozy-creator/cozy-creator/internal/canonical"
 	"github.com/cozy-creator/cozy-creator/internal/exit"
@@ -36,7 +37,7 @@ func TestRemotePlacementReceivesGrantBeforeDesired(t *testing.T) {
 	token := secret.New(tokenText)
 	mediaAddr := serveMediaPeer(t, certPath, keyPath, tokenText, mediawire.ContractRev)
 
-	peer := &grantPeer{frames: make(chan string, 8)}
+	peer := &grantPeer{frames: make(chan string, 8), allowReady: make(chan struct{})}
 	controlAddr, stopControl := serveWorkerPeer(t, certPath, keyPath, peer)
 	defer stopControl()
 
@@ -56,7 +57,8 @@ func TestRemotePlacementReceivesGrantBeforeDesired(t *testing.T) {
 	must(t, err)
 	setSpelling, _ := canonical.Spell(setDigest)
 	placement := orchestrator.DesiredPlacement{
-		Endpoint: "cozy/endpoint@rental-1", ReleaseID: "release-1",
+		PlacementRevision: 1,
+		Endpoint:          "cozy/endpoint@rental-1", ReleaseID: "release-1",
 		PlacementIDValue: "acquisition-1", ExactPlacementSetDigest: setSpelling,
 		ExactPlacementSetBytes: setBytes, ModelObjectSetDigest: modelDigest,
 		ModelObjectSetLength: uint64(len(modelData)),
@@ -73,6 +75,7 @@ func TestRemotePlacementReceivesGrantBeforeDesired(t *testing.T) {
 	defer store.Close()
 	subjects := []*pb.ArtifactSubject{planSubject, modelSubject}
 	sort.Slice(subjects, func(i, j int) bool { return bytes.Compare(subjects[i].Digest, subjects[j].Digest) < 0 })
+	relayed := make(chan orchestrator.RentalSessionEvidence, 2)
 	owner, problem := orchestrator.Open(orchestrator.Options{
 		Layout: layout, Store: store, Log: io.Discard, MaxOutputMiB: 1,
 		ObserveRental: func(orchestrator.RentalObservation) *exit.Error { return nil },
@@ -82,6 +85,14 @@ func TestRemotePlacementReceivesGrantBeforeDesired(t *testing.T) {
 				GrantId: "acquisition-1-grant-1", Subjects: subjects,
 				ExpiresAtUnix: uint64(time.Now().Add(time.Hour).Unix()),
 			}, nil
+		},
+		RelayRentalSession: func(_ context.Context, connection *orchestrator.WorkerConnection,
+			evidence orchestrator.RentalSessionEvidence) *exit.Error {
+			if connection.RentalID != "rental-1" {
+				return exit.Internalf("relayed rental %s", connection.RentalID)
+			}
+			relayed <- evidence
+			return nil
 		},
 	})
 	fatal(t, problem)
@@ -107,11 +118,62 @@ func TestRemotePlacementReceivesGrantBeforeDesired(t *testing.T) {
 			t.Fatalf("no %s frame", want)
 		}
 	}
+	fault := receiveRelayedEvidence(t, relayed, placement.PlacementRevision)
+	if observed := fault.GetObservedState(); observed.GetAdmissionState() !=
+		pb.AdmissionState_ADMISSION_STATE_CLOSED || len(observed.GetPlacements()) != 1 ||
+		len(observed.GetPlacements()[0].GetFaults()) != 1 || observed.GetConvergedRevision() != 0 {
+		t.Fatalf("typed convergence fault was not relayed exactly: %v", observed)
+	}
+	close(peer.allowReady)
+	ready := receiveRelayedEvidence(t, relayed, placement.PlacementRevision)
+	if observed := ready.GetObservedState(); observed.GetAdmissionState() !=
+		pb.AdmissionState_ADMISSION_STATE_OPEN || observed.GetConvergedRevision() != placement.PlacementRevision {
+		t.Fatalf("ready convergence was not relayed exactly: %v", observed)
+	}
+}
+
+func receiveRelayedEvidence(t *testing.T, relayed <-chan orchestrator.RentalSessionEvidence,
+	revision uint64) *pb.WorkerFrame {
+	t.Helper()
+	select {
+	case evidence := <-relayed:
+		if evidence.DesiredRevision != revision || len(evidence.BootFailure) != 0 {
+			t.Fatalf("relay revision/alternative = %#v", evidence)
+		}
+		var observed *pb.WorkerFrame
+		for name, raw := range map[string][]byte{
+			"claim": evidence.ClaimAck, "snapshot": evidence.Snapshot, "observed": evidence.ObservedState,
+		} {
+			var frame pb.WorkerFrame
+			if err := proto.Unmarshal(raw, &frame); err != nil {
+				t.Fatalf("%s relay frame: %v", name, err)
+			}
+			reencoded, err := (proto.MarshalOptions{Deterministic: true}).Marshal(&frame)
+			if err != nil || !bytes.Equal(raw, reencoded) {
+				t.Fatalf("%s relay frame is not deterministic: %v", name, err)
+			}
+			if name == "claim" && frame.GetClaimAck().GetControlRuntimeDigest() == "" {
+				t.Fatal("relayed ClaimAck omitted control_runtime_digest")
+			}
+			if name == "observed" {
+				if frame.GetObservedState().GetAppliedWireMinor() != pb.WireMinor {
+					t.Fatalf("relayed ObservedWorkerState applied minor = %d, want %d",
+						frame.GetObservedState().GetAppliedWireMinor(), pb.WireMinor)
+				}
+				observed = &frame
+			}
+		}
+		return observed
+	case <-time.After(5 * time.Second):
+		t.Fatal("no private-rental convergence relay")
+		return nil
+	}
 }
 
 type grantPeer struct {
 	pb.UnimplementedWorkerControlServer
-	frames chan string
+	frames     chan string
+	allowReady chan struct{}
 }
 
 func (p *grantPeer) WatchProgress(_ *pb.ProgressOpen, stream pb.WorkerControl_WatchProgressServer) error {
@@ -132,7 +194,8 @@ func (p *grantPeer) Control(stream pb.WorkerControl_ControlServer) error {
 		WorkerBootId: bootID, Accepted: true, WireMinor: pb.WireMinor,
 		WorkerId: "worker-remote", WorkerInstanceId: "worker-instance-remote",
 		WorkerReleaseId: "release-1", WireSchemaDigest: schemaDigest,
-		Resources: &pb.WorkerResources{Backend: "cuda", DeviceName: "NVIDIA H100", DeviceCount: 1},
+		ControlRuntimeDigest: "sha256:1111111111111111111111111111111111111111111111111111111111111111",
+		Resources:            &pb.WorkerResources{Backend: "cuda", DeviceName: "NVIDIA H100", DeviceCount: 1},
 	}}}); err != nil {
 		return err
 	}
@@ -171,7 +234,8 @@ func (p *grantPeer) Control(stream pb.WorkerControl_ControlServer) error {
 			}
 			p.frames <- "artifact_grant"
 		case frame.GetDesiredState() != nil:
-			desired := frame.GetDesiredState().GetPlacementSet()
+			desiredFrame := frame.GetDesiredState()
+			desired := desiredFrame.GetPlacementSet()
 			if desired == nil {
 				p.frames <- "invalid_desired_state"
 				continue
@@ -188,6 +252,48 @@ func (p *grantPeer) Control(stream pb.WorkerControl_ControlServer) error {
 				continue
 			}
 			p.frames <- "desired_state"
+			placement := doc.List("placements")[0]
+			planID := placement.Sub("spec").List("binding_plans")[0].Str("subject_id")
+			if err := stream.Send(&pb.WorkerFrame{Msg: &pb.WorkerFrame_ObservedState{
+				ObservedState: &pb.ObservedWorkerState{
+					RecordOwnerEpoch: claim.RecordOwnerEpoch, ControlStreamGeneration: generation,
+					WorkerBootId: bootID, WorkerPhase: pb.WorkerPhase_WORKER_PHASE_ONLINE,
+					AppliedWireMinor: pb.WireMinor,
+					AdmissionState:   pb.AdmissionState_ADMISSION_STATE_CLOSED, AdmissionGeneration: 2,
+					AcceptedDesiredStateRevision: desiredFrame.Revision,
+					AcceptedPlacementSetDigest:   desired.PlacementSetDigest,
+					Placements: []*pb.PlacementStatus{{PlacementId: placement.Str("placement_id"),
+						Materialization: pb.MaterializationState_MATERIALIZATION_STATE_FAILED,
+						Serving:         pb.ServingState_SERVING_STATE_OFFLINE,
+						Faults: []*pb.Fault{{Kind: pb.FaultKind_FAULT_KIND_ARTIFACT_FETCH_FAILED,
+							Subject: placement.Str("placement_id"), Reason: "artifact_fetch_failed",
+							Detail: "typed test fault"}}}},
+				},
+			}}); err != nil {
+				return err
+			}
+			select {
+			case <-p.allowReady:
+			case <-stream.Context().Done():
+				return nil
+			}
+			if err := stream.Send(&pb.WorkerFrame{Msg: &pb.WorkerFrame_ObservedState{
+				ObservedState: &pb.ObservedWorkerState{
+					RecordOwnerEpoch: claim.RecordOwnerEpoch, ControlStreamGeneration: generation,
+					WorkerBootId: bootID, WorkerPhase: pb.WorkerPhase_WORKER_PHASE_ONLINE,
+					AppliedWireMinor: pb.WireMinor,
+					AdmissionState:   pb.AdmissionState_ADMISSION_STATE_OPEN, AdmissionGeneration: 2,
+					AvailableAttemptSlots: 1, AcceptedDesiredStateRevision: desiredFrame.Revision,
+					AcceptedPlacementSetDigest: desired.PlacementSetDigest,
+					ConvergedRevision:          desiredFrame.Revision,
+					Placements: []*pb.PlacementStatus{{PlacementId: placement.Str("placement_id"),
+						Materialization:     pb.MaterializationState_MATERIALIZATION_STATE_STAGED,
+						Serving:             pb.ServingState_SERVING_STATE_DISPATCHABLE,
+						DispatchablePlanIds: []string{planID}}},
+				},
+			}}); err != nil {
+				return err
+			}
 		}
 	}
 }

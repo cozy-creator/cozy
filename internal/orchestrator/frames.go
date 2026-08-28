@@ -108,7 +108,24 @@ func (c *Orchestrator) converge(s *session, w *worker, placements []DesiredPlace
 			return exit.Internalf("cannot mint the PlacementSet document for %s: %s", w.instanceID, err)
 		}
 	}
-	rev := c.nextRevision()
+	rev := uint64(0)
+	if w.spec.Connection != nil {
+		if len(placements) != 1 || placements[0].PlacementRevision == 0 {
+			return exit.Named(exit.Structural, "remote_placement_revision_missing",
+				"attached worker %s has no Tensorhub placement revision", w.instanceID)
+		}
+		rev = placements[0].PlacementRevision
+		c.mu.Lock()
+		prior := w.revision
+		c.mu.Unlock()
+		if prior > rev {
+			return exit.Named(exit.Conflict, "remote_placement_revision_regressed",
+				"attached worker %s already holds desired revision %d, not older Tensorhub revision %d",
+				w.instanceID, prior, rev)
+		}
+	} else {
+		rev = c.nextRevision()
+	}
 	c.mu.Lock()
 	w.revision, w.setDigest, w.setBytes = rev, digest, setBytes
 	c.mu.Unlock()
@@ -197,10 +214,11 @@ func modelObjectSetSubject(p DesiredPlacement) *pb.ArtifactSubject {
 // worker's own last word, and the two facts the frozen wire could not tell apart —
 // "your message arrived" and "your intent is satisfied" — are now two separate readable
 // numbers (#473).
-func (c *Orchestrator) onObserved(s *session, r *pb.ObservedWorkerState) {
+func (c *Orchestrator) onObserved(s *session, r *pb.ObservedWorkerState, frameBytes []byte) {
 	defer c.wakeWorkflows()
 	var status *pb.PlacementStatus
 	var acquisition *records.PlacementAcquisition
+	var desiredRevision uint64
 	c.mu.Lock()
 	w := c.workers[s.instanceID]
 	if w != nil && w.bootID != s.bootID {
@@ -211,6 +229,7 @@ func (c *Orchestrator) onObserved(s *session, r *pb.ObservedWorkerState) {
 		return
 	}
 	if w != nil {
+		desiredRevision = w.revision
 		w.lastReport = time.Now()
 		w.phase = r.WorkerPhase
 		// THE ONE ADMISSION FENCE, worker-level. Per-placement credits are gone: the seats
@@ -318,6 +337,9 @@ func (c *Orchestrator) onObserved(s *session, r *pb.ObservedWorkerState) {
 		if problem := c.opt.Store.ObservePlacementAcquisition(*acquisition); problem != nil {
 			c.logf("placement acquisition observation REFUSED: %s", problem.Message)
 		}
+	}
+	if w != nil && w.spec.Connection != nil {
+		c.queueRentalSessionEvidence(s, desiredRevision, frameBytes)
 	}
 	if w != nil && w.media != nil {
 		go c.retryMediaCleanup(w)
