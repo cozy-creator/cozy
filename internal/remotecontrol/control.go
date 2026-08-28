@@ -23,11 +23,12 @@ import (
 )
 
 const (
-	format          = "tensorhub.rental_control_snapshot/1"
+	format          = "tensorhub.rental_control_snapshot/2"
 	bindingFormat   = "tensorhub.endpoint_binding_release/1"
 	planFormat      = "cozy.endpoint.EntrypointBindingPlan/1"
 	rmbFormat       = "cozy.endpoint.ResolvedModelBinding/1"
 	bundleFormat    = "tensorhub.endpoint_bundle/2"
+	receiptFormat   = "cozy.runtime.EndpointOverlayReceipt/1"
 	maxSnapshotSize = 64 << 20
 )
 
@@ -51,6 +52,7 @@ type snapshot struct {
 	Format                      string                   `json:"format"`
 	InstalledEnvironmentReceipt hub.ExactControlDocument `json:"installed_environment_receipt"`
 	PlacementSet                hub.ExactControlDocument `json:"placement_set"`
+	ResolvedWheelSet            hub.ExactControlDocument `json:"resolved_wheel_set"`
 }
 
 // Facts is the verified remote-only projection. Descriptor is used for payload
@@ -151,6 +153,123 @@ func sameRef(ref exactRef, document hub.ExactControlDocument) bool {
 	return ref.Digest == document.Digest && ref.Length == document.Length
 }
 
+type overlayWheel struct {
+	Digest       string
+	Distribution string
+	Owner        string
+	Version      string
+}
+
+func wheelFact(doc canonical.Doc, owner string) (overlayWheel, error) {
+	if err := requireKeys(doc, "digest", "distribution", "filename", "length", "tags", "version"); err != nil {
+		return overlayWheel{}, err
+	}
+	wheel := overlayWheel{Digest: doc.Str("digest"), Distribution: doc.Str("distribution"), Owner: owner,
+		Version: doc.Str("version")}
+	tags, tagsOK := doc["tags"].([]canonical.Value)
+	if _, err := canonical.Raw(wheel.Digest); err != nil || wheel.Distribution == "" || wheel.Version == "" ||
+		!strings.HasSuffix(doc.Str("filename"), ".whl") || doc.Int("length") <= 0 || !tagsOK || len(tags) == 0 {
+		return overlayWheel{}, fmt.Errorf("wheel fact is incomplete")
+	}
+	prior := ""
+	for _, value := range tags {
+		tag, ok := value.(string)
+		if !ok || tag == "" || tag <= prior {
+			return overlayWheel{}, fmt.Errorf("wheel tags are malformed or unsorted")
+		}
+		prior = tag
+	}
+	return wheel, nil
+}
+
+func validateOverlayReceipt(raw []byte, environmentRef hub.ExactControlDocument, environment canonical.Doc,
+	projectWheel canonical.Doc, resolvedRaw []byte,
+) error {
+	project, err := wheelFact(projectWheel, "project")
+	if err != nil || project.Digest != environment.Str("project_wheel_digest") {
+		return fmt.Errorf("project wheel disagrees with the selected environment: %v", err)
+	}
+	resolved, err := canonical.ReadObject(resolvedRaw)
+	if err != nil {
+		return fmt.Errorf("resolved wheel set is not canonical: %w", err)
+	}
+	if err := requireKeys(resolved, "format", "lock_digest", "platform_target",
+		"wheelhouse_manifest_digest", "wheels"); err != nil {
+		return fmt.Errorf("resolved wheel set is not closed: %w", err)
+	}
+	if resolved.Str("format") != "ResolvedWheelSet/1" ||
+		resolved.Str("wheelhouse_manifest_digest") != environment.Str("wheelhouse_manifest_digest") {
+		return fmt.Errorf("resolved wheel set disagrees with the selected environment")
+	}
+	if _, err := canonical.Raw(resolved.Str("lock_digest")); err != nil {
+		return fmt.Errorf("resolved wheel set lock digest is malformed")
+	}
+	resolvedTarget, environmentTarget := resolved.Sub("platform_target"), environment.Sub("platform_target")
+	if err := requireKeys(resolvedTarget, "accelerator_abi", "accelerator_backend", "libc", "os_arch", "python_abi"); err != nil {
+		return fmt.Errorf("resolved wheel set platform target: %w", err)
+	}
+	for _, key := range []string{"accelerator_abi", "accelerator_backend", "libc", "os_arch", "python_abi"} {
+		if resolvedTarget.Str(key) == "" || resolvedTarget.Str(key) != environmentTarget.Str(key) {
+			return fmt.Errorf("resolved wheel set platform target disagrees on %s", key)
+		}
+	}
+	rawCustom, ok := resolved["wheels"].([]canonical.Value)
+	custom := resolved.List("wheels")
+	if !ok || len(custom) != len(rawCustom) || len(custom) > 127 {
+		return fmt.Errorf("resolved wheel set wheels is not a bounded object list")
+	}
+	expected := map[string]overlayWheel{project.Distribution: project}
+	seenDigests := map[string]bool{project.Digest: true}
+	priorCustom := ""
+	for i, row := range custom {
+		wheel, err := wheelFact(row, "custom")
+		if err != nil || wheel.Distribution <= priorCustom || expected[wheel.Distribution].Distribution != "" ||
+			seenDigests[wheel.Digest] {
+			return fmt.Errorf("resolved custom wheel %d is malformed or duplicated: %v", i, err)
+		}
+		expected[wheel.Distribution] = wheel
+		seenDigests[wheel.Digest] = true
+		priorCustom = wheel.Distribution
+	}
+
+	receipt, err := canonical.ReadObject(raw)
+	if err != nil {
+		return err
+	}
+	if err := requireKeys(receipt, "base_family_digest", "environment_spec_digest", "format",
+		"overlay_wheels", "project_wheel_digest"); err != nil {
+		return err
+	}
+	if receipt.Str("format") != receiptFormat ||
+		receipt.Str("environment_spec_digest") != environmentRef.Digest ||
+		receipt.Str("project_wheel_digest") != environment.Str("project_wheel_digest") ||
+		receipt.Str("base_family_digest") != environment.Str("wheelhouse_manifest_digest") {
+		return fmt.Errorf("receipt identity disagrees with the selected environment")
+	}
+	rawWheels, ok := receipt["overlay_wheels"].([]canonical.Value)
+	wheels := receipt.List("overlay_wheels")
+	if !ok || len(wheels) != len(expected) || len(wheels) != len(rawWheels) || len(wheels) > 128 {
+		return fmt.Errorf("overlay_wheels is not a non-empty bounded object list")
+	}
+	priorDistribution := ""
+	for i, wheel := range wheels {
+		if err := requireKeys(wheel, "digest", "distribution", "owner", "version"); err != nil {
+			return fmt.Errorf("overlay wheel %d: %w", i, err)
+		}
+		got := overlayWheel{Digest: wheel.Str("digest"), Distribution: wheel.Str("distribution"),
+			Owner: wheel.Str("owner"), Version: wheel.Str("version")}
+		if got.Distribution <= priorDistribution || got != expected[got.Distribution] {
+			return fmt.Errorf("overlay wheel %d is malformed, duplicated, or unsorted", i)
+		}
+		priorDistribution = got.Distribution
+		delete(expected, got.Distribution)
+	}
+	if len(expected) != 0 {
+		return fmt.Errorf("overlay receipt omits selected wheels")
+	}
+	return nil
+}
+
 func exactOf(document bindingDocument) hub.ExactControlDocument {
 	return hub.ExactControlDocument{
 		CanonicalBytes: document.CanonicalBytes, Digest: document.Digest, Length: document.Length,
@@ -172,7 +291,7 @@ func Decode(control hub.ExactControlDocument, endpointRef string) (Facts, *exit.
 		"endpoint_bundle": s.EndpointBundle, "environment_spec": s.EnvironmentSpec,
 		"evaluated_config":              s.EvaluatedConfig,
 		"installed_environment_receipt": s.InstalledEnvironmentReceipt,
-		"placement_set":                 s.PlacementSet,
+		"placement_set":                 s.PlacementSet, "resolved_wheel_set": s.ResolvedWheelSet,
 	} {
 		if e := validateExact(name, document); e != nil {
 			return facts, e
@@ -312,23 +431,21 @@ func Decode(control hub.ExactControlDocument, endpointRef string) (Facts, *exit.
 	}
 	sourceArchive, archiveErr := refOf(bundle.Sub("source_archive"))
 	sourceLock, lockErr := refOf(bundle.Sub("source_lock"))
-	if archiveErr != nil || lockErr != nil || sourceArchive.Digest == sourceLock.Digest {
-		return facts, invalid("endpoint bundle source archive and lock are absent, malformed, or identical")
+	resolvedWheels, resolvedErr := refOf(bundle.Sub("resolved_wheel_set"))
+	if archiveErr != nil || lockErr != nil || resolvedErr != nil ||
+		sourceArchive.Digest == sourceLock.Digest {
+		return facts, invalid("endpoint bundle source archive, lock, or resolved wheel set is absent or malformed")
+	}
+	if !sameRef(resolvedWheels, s.ResolvedWheelSet) {
+		return facts, invalid("endpoint bundle resolved wheel set does not match the snapshot document")
 	}
 
 	environment, err := canonical.Read(s.EnvironmentSpec.CanonicalBytes, &pb.EndpointEnvironmentSpec{})
 	if err != nil || environment.Str("endpoint_bundle_digest") != s.EndpointBundle.Digest {
 		return facts, invalid("environment spec does not close the endpoint bundle: %v", err)
 	}
-	receipt, err := canonical.ReadObject(s.InstalledEnvironmentReceipt.CanonicalBytes)
-	if err != nil || requireKeys(receipt, "distributions", "endpoint_bundle_digest",
-		"environment_spec_digest", "format", "platform_target", "project_wheel_digest",
-		"wheelhouse_manifest_digest") != nil ||
-		receipt.Str("format") != "cozy.worker.v1.InstalledEnvironmentReceipt/1" ||
-		receipt.Str("endpoint_bundle_digest") != s.EndpointBundle.Digest ||
-		receipt.Str("environment_spec_digest") != s.EnvironmentSpec.Digest ||
-		receipt.Str("project_wheel_digest") != environment.Str("project_wheel_digest") ||
-		receipt.Str("wheelhouse_manifest_digest") != environment.Str("wheelhouse_manifest_digest") {
+	if err := validateOverlayReceipt(s.InstalledEnvironmentReceipt.CanonicalBytes, s.EnvironmentSpec, environment,
+		bundle.Sub("project_wheel"), s.ResolvedWheelSet.CanonicalBytes); err != nil {
 		return facts, invalid("installed-environment receipt does not close the selected environment: %v", err)
 	}
 
