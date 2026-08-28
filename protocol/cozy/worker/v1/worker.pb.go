@@ -1742,7 +1742,7 @@ type ClaimAck struct {
 	// authorization keys on this, never worker_id
 	WorkerReleaseId      string `protobuf:"bytes,10,opt,name=worker_release_id,json=workerReleaseId,proto3" json:"worker_release_id,omitempty"`
 	WorkerArtifactDigest string `protobuf:"bytes,11,opt,name=worker_artifact_digest,json=workerArtifactDigest,proto3" json:"worker_artifact_digest,omitempty"` // class (b), `sha256:<hex>` (provenance). A native worker
-	// has no OCI image (#481). SUBSTRATE IDENTITY RIDES HERE
+	// has no OCI image (#481). BASE WORKER IMAGE IDENTITY RIDES HERE
 	// AND NOWHERE ELSE (#487/#489): it is evidence about a
 	// MACHINE, never identity of an ENVIRONMENT, and a process
 	// cannot prove its own image — the PROVISIONER verifies the
@@ -2799,7 +2799,7 @@ func (x *ArtifactSubject) GetLength() uint64 {
 // PlacementSpec names it by digest, and because PlatformTarget's canonical encoding rule is a
 // wire law.
 //
-// THERE IS NO SUBSTRATE KEY (#487/#489, and the exclusion is not optional). #478's cloud-only
+// THERE IS NO BASE-WORKER-IMAGE KEY (#487/#489, and the exclusion is not optional). #478's cloud-only
 // OCI identity would, if it contributed to environment_spec_digest, re-key every cache, receipt
 // and placement whenever a compatible base image was patched — over a change nothing inside the
 // environment can observe, destroying the exact property #478 exists to create. The field is
@@ -2807,7 +2807,7 @@ func (x *ArtifactSubject) GetLength() uint64 {
 // document with a non-digested key would force a VERIFIER to own a canonicalizer that knows
 // which keys to strip, and 01 §3 law 3 holds that a verifier needs no canonicalizer, only an
 // author does. So this document's canonical bytes are digested WHOLE, like every other document
-// here. Substrate identity rides ClaimAck.worker_artifact_digest instead.
+// here. Base worker image identity rides ClaimAck.worker_artifact_digest instead.
 type EndpointEnvironmentSpec struct {
 	state                protoimpl.MessageState `protogen:"open.v1"`
 	PlatformTarget       *PlatformTarget        `protobuf:"bytes,1,opt,name=platform_target,json=platformTarget,proto3" json:"platform_target,omitempty"`
@@ -3612,7 +3612,7 @@ func (x *PlacementStatus) GetAcquisition() *PlacementAcquisitionObservation {
 // while in progress or >= start when terminal. The two terminal intervals prove overlap exactly.
 //
 // Scope is deliberately disjoint. `endpoint` counts the desired endpoint overlay bytes needed
-// above the baked substrate (including its project/custom wheels), excluding model bytes.
+// above the base worker image (including its project/custom wheels), excluding model bytes.
 // `model` counts the object bytes in PlacementSpec.model_object_set's closure, excluding the
 // object-set document itself. At terminal, downloaded_bytes + reused_bytes is the exact reached
 // content length for that leg. Downloaded bytes were newly fetched into verified local holdings;
