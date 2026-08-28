@@ -273,6 +273,11 @@ def fence_one_codec():
         for m, owners in CODEC_OWNERS.items():
             if m not in text or r in owners:
                 continue
+            # tfs-027's manual interoperability seats are deliberately independent
+            # implementations of ONLY the frozen CozyTensors-header CDDL. They have no
+            # production import path; every other format mark/path remains fenced.
+            if m == "cozytensors/1" and r.startswith("conformance/cbor/"):
+                continue
             if inside and not implements:
                 continue    # a consumer naming or planting the mark, not a second codec
             if inside:

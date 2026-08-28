@@ -42,7 +42,9 @@ def main() -> int:
     for p in sorted((VEC / "closure").iterdir()):
         closure.insert(p.read_bytes())
 
-    cases = sorted((VEC / "cases").glob("*/*.json"))
+    cases = sorted(
+        [*(VEC / "cases").glob("*/*.json"), *(VEC / "cases").glob("*/*.cbor")]
+    )
     outcomes: dict[str, dict[str, str | None]] = {}
     refusals: dict[str, str] = {}
     npass = nfail = 0
@@ -139,6 +141,15 @@ def main() -> int:
     )
     cross.append(
         (
+            "tensor reorder flips header id, not topology_digest",
+            idof("header/plain-fp8") != idof("header/plain-fp8-reordered")
+            and topof("header/plain-fp8")
+            == topof("header/plain-fp8-reordered"),
+            topof("header/plain-fp8-reordered"),
+        )
+    )
+    cross.append(
+        (
             "one more sibling file flips checkpoint_id only",
             cpof("manifest/checkpoint") != cpof("manifest/checkpoint-extra-file"),
             cpof("manifest/checkpoint-extra-file"),
@@ -148,9 +159,10 @@ def main() -> int:
     rcpt = (VEC / "cases/ingest/receipt.json").read_bytes()
     subj = (VEC / "cases/ingest/subject.json").read_bytes()
     snap = (VEC / "cases/manifest/checkpoint.json").read_bytes()
-    hdr = (VEC / "cases/header/plain-fp8.json").read_bytes()
+    hdr = (VEC / "cases/header/plain-fp8.cbor").read_bytes()
+    stamp = (VEC / "cases/ingest/stamp.json").read_bytes()
     try:
-        tensorfs.receipt_binds(rcpt, subj, snap, hdr)
+        tensorfs.receipt_binds(rcpt, subj, snap, hdr, stamp)
         cross.append(("receipt binds its exact subject/snapshot/header", True, ""))
     except errors.Refusal as e:
         cross.append(("receipt binds its exact subject/snapshot/header", False, e.detail))
@@ -162,7 +174,7 @@ def main() -> int:
     assert other != subj, "the tenant plant did not apply"
     tensorfs.run_doc("subject", other, closure)
     try:
-        tensorfs.receipt_binds(rcpt, other, snap, hdr)
+        tensorfs.receipt_binds(rcpt, other, snap, hdr, stamp)
         cross.append(("cross-subject replay refuses", False, "it bound"))
     except errors.Refusal as e:
         cross.append(("cross-subject replay refuses", e.code == "CROSS_SUBJECT_REPLAY", e.detail))

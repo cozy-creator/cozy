@@ -260,7 +260,7 @@ pub fn install(
         dir.join(format!("{hex_id}.json")),
         crate::canon::write(&Value::obj(vec![
             ("checkpoint", Value::str(id.clone())),
-            ("header", header.object_ref().to_value()),
+            ("header", header.object_ref()?.to_value()),
             ("installed_at", Value::uint(now_secs())),
             ("objects", Value::uint(walk.distinct().len() as u64)),
             ("receipt", receipt.object_ref().to_value()),
@@ -323,6 +323,7 @@ pub fn execute(
     specs: &[(String, EncodingSpec)],
     configs: &[(String, crate::ids::ConfigRef)],
 ) -> Result<Outcome> {
+    plan.require_order()?;
     let t0 = Instant::now();
     let mut comps: Vec<(String, Vec<(String, Tensor)>)> = Vec::new();
     let mut closure = Closure::default();
@@ -488,6 +489,7 @@ pub fn execute(
     enc_refs.dedup_by(|a, b| a.sha256 == b.sha256);
     let header = Header {
         configs: configs.to_vec(),
+        assets: Vec::new(),
         encodings: enc_refs,
         components: comps,
     };

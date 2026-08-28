@@ -51,7 +51,7 @@ def main() -> int:
     a = p.parse_args()
 
     store, header, header_bytes = _fr.load(a.store, a.snapshot)
-    plan = tensorfs.plan(header_bytes, _fr.module_order(header), window=a.window)
+    plan = tensorfs.plan(header_bytes, _fr.construction_order(header), window=a.window)
     dev = torch.device("cuda:0")
     print(f"device:     {torch.cuda.get_device_name(0)}  torch {torch.__version__}")
     print(f"plan:       {len(plan)} items, {plan.bytes} B, order = {plan.order}")

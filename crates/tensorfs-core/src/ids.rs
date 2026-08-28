@@ -131,6 +131,36 @@ pub trait Doc: Sized {
     }
 }
 
+/// Exact stored-byte documents. Most TensorFS documents use [`Doc`]'s bounded canonical
+/// JSON implementation; the CozyTensors header implements this trait directly because its
+/// one stored representation is restricted deterministic CBOR.
+pub trait StoredDoc: Sized {
+    const FORMAT: &'static str;
+    const MAX_BYTES: usize;
+
+    fn canonical_bytes(&self) -> Result<Vec<u8>>;
+    fn parse(bytes: &[u8]) -> Result<Self>;
+
+    fn object_id(&self) -> Result<String> {
+        Ok(object_id(&self.canonical_bytes()?))
+    }
+    fn object_ref(&self) -> Result<ObjectRef> {
+        Ok(ObjectRef::of(&self.canonical_bytes()?))
+    }
+}
+
+impl<T: Doc> StoredDoc for T {
+    const FORMAT: &'static str = T::FORMAT;
+    const MAX_BYTES: usize = T::MAX_BYTES;
+
+    fn canonical_bytes(&self) -> Result<Vec<u8>> {
+        Ok(<T as Doc>::canonical_bytes(self))
+    }
+    fn parse(bytes: &[u8]) -> Result<Self> {
+        <T as Doc>::parse(bytes)
+    }
+}
+
 pub fn check_format(what: &'static str, got: &str, want: &str) -> Result<()> {
     if got != want {
         return refuse(

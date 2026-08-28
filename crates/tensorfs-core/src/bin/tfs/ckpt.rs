@@ -13,7 +13,7 @@ use std::time::Instant;
 
 use tensorfs_core::checkpoint::{self as ck, build_snapshot};
 use tensorfs_core::dtype::Dtype;
-use tensorfs_core::header::{Body, Closure, Header, Located, Part, Tensor};
+use tensorfs_core::header::{Asset, Body, Closure, Header, Located, Part, Tensor};
 use tensorfs_core::ids::{ConfigRef, Doc, ObjectRef};
 use tensorfs_core::limits;
 use tensorfs_core::registry;
@@ -272,6 +272,23 @@ pub fn cmd_write(root: &Path, f: &Flags) -> ExitCode {
             },
         ));
     }
+    cfg_refs.sort_by(|a, b| a.0.cmp(&b.0));
+    let asset_bytes = b"<pad>0</pad>\n<pad>1</pad>\n";
+    let asset_object = ok!(store.put_stream(
+        &mut &asset_bytes[..],
+        Some(&ObjectRef::of(asset_bytes)),
+        &Default::default()
+    ))
+    .obj;
+    let assets = vec![(
+        "tokenizer/vocab.txt".to_string(),
+        Asset {
+            logical_sha256: sha256::hex_digest(asset_bytes),
+            logical_length: asset_bytes.len() as u64,
+            media_type: "text/plain".to_string(),
+            segments: vec![asset_object],
+        },
+    )];
 
     let t0 = Instant::now();
     let (mut bytes, mut deduped, mut segments, mut inlines) = (0u64, 0u64, 0usize, 0usize);
@@ -315,11 +332,12 @@ pub fn cmd_write(root: &Path, f: &Flags) -> ExitCode {
 
     let header = Header {
         configs: cfg_refs,
+        assets,
         encodings: enc_refs,
         components: comps,
     };
     let t = Instant::now();
-    let hbytes = header.canonical_bytes();
+    let hbytes = ok!(header.canonical_bytes());
     let encode_ms = t.elapsed().as_secs_f64() * 1000.0;
     ok!(header.validate(&closure));
     let href = ok!(ck::put_doc(&store, &header));
@@ -345,9 +363,10 @@ pub fn cmd_write(root: &Path, f: &Flags) -> ExitCode {
         inlines
     );
     println!(
-        "  encodings {}  configs {}  header {} B canonical (encode {encode_ms:.1} ms)",
+        "  encodings {}  configs {}  assets {}  header {} B canonical (encode {encode_ms:.1} ms)",
         header.encodings.len(),
         header.configs.len(),
+        header.assets.len(),
         hbytes.len()
     );
     println!(
@@ -454,6 +473,19 @@ pub fn cmd_read(root: &Path, hex: &str, f: &Flags) -> ExitCode {
             }
         }
     }
+    let mut checked_assets = 0usize;
+    for (name, asset) in &header.assets {
+        let mut sink = Sink(0);
+        ok!(ck::read_asset(&store, name, asset, &mut sink));
+        bytes = match bytes.checked_add(sink.0) {
+            Some(bytes) => bytes,
+            None => {
+                eprintln!("REFUSED ARITH_OVERFLOW: checkpoint read byte total overflows");
+                return ExitCode::FAILURE;
+            }
+        };
+        checked_assets += 1;
+    }
     let read_s = t.elapsed().as_secs_f64();
     let mb = bytes as f64 / (1024.0 * 1024.0);
 
@@ -463,7 +495,7 @@ pub fn cmd_read(root: &Path, hex: &str, f: &Flags) -> ExitCode {
         href.length
     );
     println!(
-        "  {} tensors, {} parts, {bytes} B ({mb:.1} MiB) reconstructed in {read_s:.2}s = {:.1} MiB/s",
+        "  {} tensors, {} parts, {checked_assets} assets, {bytes} B ({mb:.1} MiB) reconstructed in {read_s:.2}s = {:.1} MiB/s",
         header.tensors().count(),
         expect.len(),
         mb / read_s
@@ -648,6 +680,7 @@ pub fn cmd_caps() -> ExitCode {
     }
     let refs_doc = Header {
         configs: vec![],
+        assets: vec![],
         encodings: vec![plain.object_ref()],
         components: vec![("transformer".to_string(), tensors)],
     };
@@ -669,6 +702,7 @@ pub fn cmd_caps() -> ExitCode {
     let big = 1u64 << 48;
     let bytes_doc = Header {
         configs: vec![],
+        assets: vec![],
         encodings: vec![plain.object_ref()],
         components: vec![(
             "transformer".to_string(),
@@ -748,7 +782,7 @@ pub fn cmd_size(n: usize) -> ExitCode {
             let dt = carrier_dtype(&r.carrier, Dtype::Bf16);
             let nb = ok!(tensorfs_core::dtype::checked_bytes(role, &sshape, dt));
             let body = if Part::is_inline(nb) {
-                Body::Inline(tensorfs_core::b64::encode(&vec![0u8; nb as usize]))
+                Body::Inline(vec![0u8; nb as usize])
             } else {
                 Body::Segments(
                     (0..nb.div_ceil(limits::GRID_BYTES))
@@ -783,21 +817,18 @@ pub fn cmd_size(n: usize) -> ExitCode {
             None => comps.push((comp.to_string(), vec![(key, t)])),
         }
     }
-    for (_, ts) in comps.iter_mut() {
-        ts.sort_by(|a, b| a.0.cmp(&b.0));
-        ts.dedup_by(|a, b| a.0 == b.0);
-    }
     let mut enc: Vec<ObjectRef> = specs.iter().map(|s| s.object_ref()).collect();
     enc.sort_by(|a, b| a.sha256.cmp(&b.sha256));
     let h = Header {
         configs: vec![],
+        assets: vec![],
         encodings: enc,
         components: comps,
     };
     let count = h.tensors().count();
     let parts: usize = h.tensors().map(|(_, _, t)| t.parts.len()).sum();
     let t = Instant::now();
-    let bytes = h.canonical_bytes();
+    let bytes = ok!(h.canonical_bytes());
     let encode_ms = t.elapsed().as_secs_f64() * 1000.0;
     let t = Instant::now();
     let parsed = ok!(Header::parse(&bytes));

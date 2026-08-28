@@ -1,0 +1,4 @@
+doc: header
+expect: refuse
+code: SORT_ORDER
+note: EncodingSpec references sort by raw digest

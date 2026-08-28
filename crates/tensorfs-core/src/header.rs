@@ -1,18 +1,17 @@
 //! The `cozytensors/1` header: one uniform per-tensor form (logical + spec-digest encoding
 //! + exact parts), configs by reference, and the frozen topology projection.
 
-use crate::b64;
-use crate::canon::{as_arr, as_obj, as_str, Fields, Value};
+use crate::canon::Value;
 use crate::dtype::{checked_bytes, checked_elements, Dtype};
-use crate::err::{refuse, Code, Result};
-use crate::ids::{ascii_name, check_format, prefixed, ConfigRef, Doc, ObjectRef};
+use crate::err::{refuse, Code, Refusal, Result};
+use crate::ids::{ascii_name, ConfigRef, Doc, ObjectRef};
 use crate::limits;
 use crate::spec::EncodingSpec;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Body {
     Segments(Vec<ObjectRef>),
-    Inline(String),
+    Inline(Vec<u8>),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -94,9 +93,18 @@ pub struct Tensor {
     pub parts: Vec<(String, Part)>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Asset {
+    pub logical_sha256: String,
+    pub logical_length: u64,
+    pub media_type: String,
+    pub segments: Vec<ObjectRef>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct Header {
     pub configs: Vec<(String, ConfigRef)>,
+    pub assets: Vec<(String, Asset)>,
     pub encodings: Vec<ObjectRef>,
     pub components: Vec<(String, Vec<(String, Tensor)>)>,
 }
@@ -105,25 +113,25 @@ pub struct Header {
 #[derive(Debug, Default)]
 pub struct Closure {
     pub specs: Vec<(String, EncodingSpec)>,
+    index: std::collections::HashMap<String, usize>,
 }
 
 impl Closure {
     pub fn get(&self, id: &str) -> Option<&EncodingSpec> {
-        self.specs.iter().find(|(k, _)| k == id).map(|(_, s)| s)
+        self.index
+            .get(id)
+            .and_then(|index| self.specs.get(*index))
+            .map(|(_, spec)| spec)
     }
     pub fn insert(&mut self, spec: EncodingSpec) {
-        self.specs.push((spec.object_id(), spec));
+        let id = spec.object_id();
+        if let Some(index) = self.index.get(&id).copied() {
+            self.specs[index] = (id, spec);
+        } else {
+            self.index.insert(id.clone(), self.specs.len());
+            self.specs.push((id, spec));
+        }
     }
-}
-
-fn shape_from(what: &str, v: &Value) -> Result<Vec<u64>> {
-    let a = as_arr(what, "shape", v)?;
-    if a.len() > limits::MAX_RANK {
-        return refuse(Code::RANK_CAP, format!("{what}: rank {} over cap", a.len()));
-    }
-    a.iter()
-        .map(|x| crate::canon::as_uint(what, "shape", x))
-        .collect()
 }
 
 fn shape_value(s: &[u64]) -> Value {
@@ -142,7 +150,7 @@ impl Part {
     /// exists. Same law, same grid; it just cannot admit the bytes anywhere.
     pub fn plan(dtype: Dtype, shape: Vec<u64>, bytes: &[u8]) -> Part {
         let body = if Part::is_inline(bytes.len() as u64) {
-            Body::Inline(b64::encode(bytes))
+            Body::Inline(bytes.to_vec())
         } else {
             Body::Segments(
                 bytes
@@ -152,64 +160,6 @@ impl Part {
             )
         };
         Part { dtype, shape, body }
-    }
-
-    fn from_value(v: &Value) -> Result<Part> {
-        let mut f = Fields::new("part", v)?;
-        let dtype = Dtype::parse(as_str("part", "dtype", f.req("dtype")?)?)?;
-        let shape = shape_from("part", f.req("shape")?)?;
-        let seg = f.opt("segments");
-        let inl = f.opt("inline");
-        f.done()?;
-        let body = match (seg, inl) {
-            (Some(_), Some(_)) => {
-                return refuse(
-                    Code::INLINE_EXCLUSIVE,
-                    "a part carries `segments` or `inline`, never both",
-                )
-            }
-            (None, None) => {
-                return refuse(
-                    Code::MISSING_FIELD,
-                    "part carries neither `segments` nor `inline`",
-                )
-            }
-            (Some(s), None) => {
-                let a = as_arr("part", "segments", s)?;
-                if a.is_empty() || a.len() > limits::MAX_SEGMENTS {
-                    return refuse(
-                        Code::COUNT_CAP,
-                        format!("part.segments count {} out of bounds", a.len()),
-                    );
-                }
-                let mut refs = Vec::new();
-                for x in a {
-                    let r = ObjectRef::from_value("part.segment", x)?;
-                    if r.length == 0 {
-                        return refuse(Code::ZERO_ELEMENT, "zero-length segment");
-                    }
-                    refs.push(r);
-                }
-                Body::Segments(refs)
-            }
-            (None, Some(i)) => Body::Inline(as_str("part", "inline", i)?.to_string()),
-        };
-        Ok(Part { dtype, shape, body })
-    }
-
-    fn to_value(&self) -> Value {
-        let mut fields = vec![
-            ("dtype", Value::str(self.dtype.name())),
-            ("shape", shape_value(&self.shape)),
-        ];
-        match &self.body {
-            Body::Segments(s) => fields.push((
-                "segments",
-                Value::arr(s.iter().map(|r| r.to_value()).collect()),
-            )),
-            Body::Inline(b) => fields.push(("inline", Value::str(b.clone()))),
-        }
-        Value::obj(fields)
     }
 
     /// The anchor equation's left side: `checked_prod(shape) × sizeof(dtype)`.
@@ -275,7 +225,13 @@ impl Part {
         let want = checked_bytes(what, &self.shape, self.dtype)?;
         match &self.body {
             Body::Inline(b) => {
-                let got = b64::decode(b)?.len() as u64;
+                let got = b.len() as u64;
+                if self.dtype == Dtype::Bool && b.iter().any(|byte| *byte > 1) {
+                    return refuse(
+                        Code::DTYPE_MISMATCH,
+                        format!("{what}: bool inline body contains a byte outside {{0,1}}"),
+                    );
+                }
                 if got != want {
                     return refuse(
                         Code::BYTE_LENGTH_MISMATCH,
@@ -297,6 +253,10 @@ impl Part {
             Body::Segments(s) => {
                 let mut got: u64 = 0;
                 for r in s {
+                    crate::ids::hex64("part segment", &r.sha256)?;
+                    if r.length == 0 {
+                        return refuse(Code::ZERO_ELEMENT, format!("{what}: zero-length segment"));
+                    }
                     got = got
                         .checked_add(r.length)
                         .ok_or_else(|| crate::err::Refusal {
@@ -319,61 +279,6 @@ impl Part {
             }
         }
         Ok(())
-    }
-}
-
-impl Tensor {
-    fn from_value(v: &Value) -> Result<Tensor> {
-        let mut f = Fields::new("tensor", v)?;
-        let mut lf = Fields::new("tensor.logical", f.req("logical")?)?;
-        let dtype = Dtype::parse(as_str("tensor.logical", "dtype", lf.req("dtype")?)?)?;
-        let shape = shape_from("tensor.logical", lf.req("shape")?)?;
-        lf.done()?;
-        let encoding = prefixed(
-            "tensor.encoding",
-            as_str("tensor", "encoding", f.req("encoding")?)?,
-        )?;
-        let ps = as_obj("tensor", "parts", f.req("parts")?)?;
-        f.done()?;
-        if ps.is_empty() || ps.len() > limits::MAX_PARTS {
-            return refuse(
-                Code::COUNT_CAP,
-                format!("tensor.parts count {} out of bounds", ps.len()),
-            );
-        }
-        let mut parts = Vec::new();
-        for (name, pv) in ps {
-            ascii_name("tensor.part", name, limits::MAX_NAME_BYTES)?;
-            parts.push((name.clone(), Part::from_value(pv)?));
-        }
-        Ok(Tensor {
-            dtype,
-            shape,
-            encoding,
-            parts,
-        })
-    }
-
-    fn to_value(&self) -> Value {
-        Value::obj(vec![
-            ("encoding", Value::str(self.encoding.clone())),
-            (
-                "logical",
-                Value::obj(vec![
-                    ("dtype", Value::str(self.dtype.name())),
-                    ("shape", shape_value(&self.shape)),
-                ]),
-            ),
-            (
-                "parts",
-                Value::map(
-                    self.parts
-                        .iter()
-                        .map(|(n, p)| (n.clone(), p.to_value()))
-                        .collect(),
-                ),
-            ),
-        ])
     }
 }
 
@@ -430,15 +335,117 @@ impl Header {
         topology_digest_of(&self.topology_value())
     }
 
-    /// Structural validation against the checkpoint's spec closure.
-    pub fn validate(&self, closure: &Closure) -> Result<()> {
+    /// Closure-independent schema, geometry, ordering and aggregate-limit validation.
+    pub fn validate_structure(&self) -> Result<()> {
         if self.components.is_empty() || self.components.len() > limits::MAX_COMPONENTS {
             return refuse(
                 Code::EMPTY_COMPONENTS,
                 format!("components count {} out of bounds", self.components.len()),
             );
         }
-        let listed: Vec<String> = self.encodings.iter().map(|r| r.id()).collect();
+        let sorted_names = |what: &str, names: Vec<&str>| -> Result<()> {
+            let mut sorted = names.clone();
+            sorted.sort();
+            sorted.dedup();
+            if sorted != names {
+                return refuse(
+                    Code::SORT_ORDER,
+                    format!("{what} must be sorted and unique"),
+                );
+            }
+            Ok(())
+        };
+        sorted_names(
+            "configs",
+            self.configs.iter().map(|(name, _)| name.as_str()).collect(),
+        )?;
+        sorted_names(
+            "assets",
+            self.assets.iter().map(|(name, _)| name.as_str()).collect(),
+        )?;
+        for (name, config) in &self.configs {
+            ascii_name("config", name, limits::MAX_NAME_BYTES)?;
+            crate::ids::hex64("config digest", &config.sha256)?;
+            if config.length == 0 {
+                return refuse(Code::ZERO_ELEMENT, format!("config {name:?} is empty"));
+            }
+            if config.media_type.is_empty()
+                || config.media_type.len() > 128
+                || !config
+                    .media_type
+                    .bytes()
+                    .all(|byte| (0x20..=0x7e).contains(&byte))
+            {
+                return refuse(
+                    Code::KEY_GRAMMAR,
+                    format!("config {name:?}: bad media type"),
+                );
+            }
+        }
+        let mut asset_refs = 0usize;
+        let mut asset_bytes = 0u64;
+        let mut folded_assets = std::collections::HashSet::new();
+        for (name, asset) in &self.assets {
+            crate::manifest::check_path(name)?;
+            if !folded_assets.insert(name.to_ascii_lowercase()) {
+                return refuse(
+                    Code::PATH_CASE_COLLISION,
+                    format!("asset logical path {name:?} case-collides"),
+                );
+            }
+            crate::ids::hex64("asset logical digest", &asset.logical_sha256)?;
+            if asset.logical_length == 0 || asset.segments.is_empty() {
+                return refuse(Code::ZERO_ELEMENT, format!("asset {name:?} is empty"));
+            }
+            if asset.media_type.is_empty()
+                || asset.media_type.len() > 128
+                || !asset
+                    .media_type
+                    .bytes()
+                    .all(|byte| (0x20..=0x7e).contains(&byte))
+            {
+                return refuse(Code::KEY_GRAMMAR, format!("asset {name:?}: bad media type"));
+            }
+            let mut total = 0u64;
+            for segment in &asset.segments {
+                crate::ids::hex64("asset segment", &segment.sha256)?;
+                if segment.length == 0 {
+                    return refuse(Code::ZERO_ELEMENT, format!("asset {name:?}: empty segment"));
+                }
+                total = total.checked_add(segment.length).ok_or_else(|| Refusal {
+                    code: Code::ARITH_OVERFLOW,
+                    detail: format!("asset {name:?}: segment length sum overflows"),
+                })?;
+            }
+            if total != asset.logical_length {
+                return refuse(
+                    Code::BYTE_LENGTH_MISMATCH,
+                    format!(
+                        "asset {name:?}: segments total {total} B, logical length {} B",
+                        asset.logical_length
+                    ),
+                );
+            }
+            asset_refs = asset_refs
+                .checked_add(asset.segments.len())
+                .ok_or_else(|| Refusal {
+                    code: Code::ARITH_OVERFLOW,
+                    detail: "asset reference total overflows".into(),
+                })?;
+            asset_bytes = asset_bytes.checked_add(total).ok_or_else(|| Refusal {
+                code: Code::ARITH_OVERFLOW,
+                detail: "asset byte total overflows".into(),
+            })?;
+        }
+        if self.encodings.is_empty() {
+            return refuse(Code::COUNT_CAP, "encodings is empty");
+        }
+        for encoding in &self.encodings {
+            crate::ids::hex64("encoding digest", &encoding.sha256)?;
+            if encoding.length == 0 {
+                return refuse(Code::ZERO_ELEMENT, "zero-length EncodingSpec reference");
+            }
+        }
         let mut sorted = self
             .encodings
             .iter()
@@ -450,114 +457,110 @@ impl Header {
         if sorted != given {
             return refuse(Code::SORT_ORDER, "encodings must be a sorted unique list");
         }
-        let mut cited: Vec<String> = Vec::new();
+        let listed: std::collections::HashMap<String, usize> = self
+            .encodings
+            .iter()
+            .enumerate()
+            .map(|(index, encoding)| (encoding.id(), index))
+            .collect();
+        let mut cited = vec![false; self.encodings.len()];
         let mut count = 0usize;
         // Whole-DOCUMENT totals, not only per-part counts.
-        let mut refs = self.configs.len() + self.encodings.len();
-        let mut total_bytes: u64 = self
+        let mut refs = self
+            .configs
+            .len()
+            .checked_add(self.encodings.len())
+            .and_then(|count| count.checked_add(asset_refs))
+            .ok_or_else(|| Refusal {
+                code: Code::ARITH_OVERFLOW,
+                detail: "header reference total overflows".into(),
+            })?;
+        let mut total_bytes = asset_bytes;
+        for length in self
             .configs
             .iter()
-            .map(|(_, c)| c.length)
-            .chain(self.encodings.iter().map(|r| r.length))
-            .sum();
+            .map(|(_, config)| config.length)
+            .chain(self.encodings.iter().map(|encoding| encoding.length))
+        {
+            total_bytes = total_bytes.checked_add(length).ok_or_else(|| Refusal {
+                code: Code::ARITH_OVERFLOW,
+                detail: "header referenced-byte total overflows".into(),
+            })?;
+        }
+        if refs > limits::MAX_TOTAL_REFS {
+            return refuse(Code::TOTAL_REFS_CAP, "header reference total over cap");
+        }
+        if total_bytes > limits::MAX_TOTAL_BYTES {
+            return refuse(Code::TOTAL_BYTES_CAP, "header referenced bytes over cap");
+        }
+
+        let mut component_names = std::collections::HashSet::new();
 
         for (comp, tensors) in &self.components {
             ascii_name("component", comp, limits::MAX_NAME_BYTES)?;
+            if !component_names.insert(comp.as_str()) {
+                return refuse(
+                    Code::DUPLICATE_KEY,
+                    format!("component {comp:?} appears twice"),
+                );
+            }
             if tensors.is_empty() {
                 return refuse(
                     Code::EMPTY_COMPONENTS,
                     format!("component {comp:?} has no tensors"),
                 );
             }
+            let mut tensor_names = std::collections::HashSet::new();
             for (key, t) in tensors {
-                count += 1;
+                count = count.checked_add(1).ok_or_else(|| Refusal {
+                    code: Code::ARITH_OVERFLOW,
+                    detail: "tensor count overflows".into(),
+                })?;
                 if count > limits::MAX_TENSORS {
                     return refuse(Code::COUNT_CAP, "tensor count over cap");
                 }
                 let what = format!("{comp}/{key}");
-                if key.is_empty() || key.len() > limits::MAX_KEY_BYTES {
-                    return refuse(
-                        Code::KEY_GRAMMAR,
-                        format!("{what}: key length out of bounds"),
-                    );
+                ascii_name("tensor key", key, limits::MAX_KEY_BYTES)?;
+                if !tensor_names.insert(key.as_str()) {
+                    return refuse(Code::DUPLICATE_KEY, format!("{what}: key appears twice"));
                 }
-                let elements = checked_elements(&what, &t.shape)?;
-                if !listed.contains(&t.encoding) {
-                    return refuse(
-                        Code::ENCODING_MISMATCH,
-                        format!(
-                            "{what}: cites {} which is not in the header's `encodings` list",
-                            t.encoding
-                        ),
-                    );
-                }
-                if !cited.contains(&t.encoding) {
-                    cited.push(t.encoding.clone());
-                }
-                let spec = match closure.get(&t.encoding) {
-                    Some(s) => s,
+                checked_elements(&what, &t.shape)?;
+                let encoding_index = match listed.get(&t.encoding).copied() {
+                    Some(index) => index,
                     None => {
                         return refuse(
-                            Code::UNKNOWN_ENCODING,
+                            Code::ENCODING_MISMATCH,
                             format!(
-                                "{what}: spec object {} is absent from the closure",
+                                "{what}: cites {} which is not in the header's `encodings` list",
                                 t.encoding
                             ),
                         )
                     }
                 };
-                if !spec.admits_logical(t.dtype) {
+                cited[encoding_index] = true;
+                if t.parts.is_empty() || t.parts.len() > limits::MAX_PARTS {
                     return refuse(
-                        Code::DTYPE_MISMATCH,
-                        format!(
-                            "{what}: logical dtype {} is outside the spec's logical_dtypes",
-                            t.dtype.name()
-                        ),
+                        Code::COUNT_CAP,
+                        format!("{what}: part count {} out of bounds", t.parts.len()),
                     );
                 }
-                if let Some(r) = spec.logical_rank {
-                    if r as usize != t.shape.len() {
-                        return refuse(
-                            Code::SHAPE_MISMATCH,
-                            format!(
-                                "{what}: logical rank {} != spec logical_rank {r}",
-                                t.shape.len()
-                            ),
-                        );
-                    }
-                }
-                let want: Vec<&str> = spec.roles.iter().map(|(n, _)| n.as_str()).collect();
-                let got: Vec<&str> = t.parts.iter().map(|(n, _)| n.as_str()).collect();
-                if want != got {
-                    return refuse(
-                        Code::ROLE_SET_MISMATCH,
-                        format!("{what}: parts {got:?} != the spec's exact role set {want:?}"),
-                    );
-                }
+                let mut roles = std::collections::HashSet::new();
                 for (name, part) in &t.parts {
-                    let role = spec.role(name).unwrap();
+                    ascii_name("part role", name, limits::MAX_NAME_BYTES)?;
+                    if !roles.insert(name.as_str()) {
+                        return refuse(
+                            Code::DUPLICATE_KEY,
+                            format!("{what}: part role {name:?} appears twice"),
+                        );
+                    }
                     let pw = format!("{what}#{name}");
-                    if !role.carrier.admits(t.dtype, part.dtype) {
-                        return refuse(
-                            Code::DTYPE_MISMATCH,
-                            format!(
-                                "{pw}: carrier {} is outside the role's carrier set",
-                                part.dtype.name()
-                            ),
-                        );
-                    }
-                    let want_shape = role.shape.eval(&t.shape, elements)?;
-                    if want_shape != part.shape {
-                        return refuse(
-                            Code::SHAPE_MISMATCH,
-                            format!(
-                                "{pw}: stored shape {:?} != relation result {want_shape:?}",
-                                part.shape
-                            ),
-                        );
-                    }
                     part.check_bytes(&pw)?;
-                    refs += part.segments().len();
+                    refs = refs
+                        .checked_add(part.segments().len())
+                        .ok_or_else(|| Refusal {
+                            code: Code::ARITH_OVERFLOW,
+                            detail: format!("{pw}: reference total overflows"),
+                        })?;
                     if refs > limits::MAX_TOTAL_REFS {
                         return refuse(
                             Code::TOTAL_REFS_CAP,
@@ -585,9 +588,8 @@ impl Header {
                 }
             }
         }
-        let _ = refs;
-        for r in &self.encodings {
-            if !cited.contains(&r.id()) {
+        for (index, r) in self.encodings.iter().enumerate() {
+            if !cited[index] {
                 return refuse(
                     Code::UNCITED_ENCODING,
                     format!(
@@ -595,6 +597,74 @@ impl Header {
                         r.id()
                     ),
                 );
+            }
+        }
+        Ok(())
+    }
+
+    /// Structural validation against the checkpoint's exact EncodingSpec closure.
+    pub fn validate(&self, closure: &Closure) -> Result<()> {
+        self.validate_structure()?;
+        for (comp, key, tensor) in self.tensors() {
+            let what = format!("{comp}/{key}");
+            let elements = checked_elements(&what, &tensor.shape)?;
+            let spec = closure.get(&tensor.encoding).ok_or_else(|| Refusal {
+                code: Code::UNKNOWN_ENCODING,
+                detail: format!(
+                    "{what}: spec object {} is absent from the closure",
+                    tensor.encoding
+                ),
+            })?;
+            if !spec.admits_logical(tensor.dtype) {
+                return refuse(
+                    Code::DTYPE_MISMATCH,
+                    format!(
+                        "{what}: logical dtype {} is outside the spec's logical_dtypes",
+                        tensor.dtype.name()
+                    ),
+                );
+            }
+            if let Some(rank) = spec.logical_rank {
+                if rank as usize != tensor.shape.len() {
+                    return refuse(
+                        Code::SHAPE_MISMATCH,
+                        format!(
+                            "{what}: logical rank {} != spec logical_rank {rank}",
+                            tensor.shape.len()
+                        ),
+                    );
+                }
+            }
+            let want: Vec<&str> = spec.roles.iter().map(|(name, _)| name.as_str()).collect();
+            let got: Vec<&str> = tensor.parts.iter().map(|(name, _)| name.as_str()).collect();
+            if want != got {
+                return refuse(
+                    Code::ROLE_SET_MISMATCH,
+                    format!("{what}: parts {got:?} != the spec's exact role order {want:?}"),
+                );
+            }
+            for (name, part) in &tensor.parts {
+                let role = spec.role(name).unwrap();
+                let part_what = format!("{what}#{name}");
+                if !role.carrier.admits(tensor.dtype, part.dtype) {
+                    return refuse(
+                        Code::DTYPE_MISMATCH,
+                        format!(
+                            "{part_what}: carrier {} is outside the role's carrier set",
+                            part.dtype.name()
+                        ),
+                    );
+                }
+                let want_shape = role.shape.eval(&tensor.shape, elements)?;
+                if want_shape != part.shape {
+                    return refuse(
+                        Code::SHAPE_MISMATCH,
+                        format!(
+                            "{part_what}: stored shape {:?} != relation result {want_shape:?}",
+                            part.shape
+                        ),
+                    );
+                }
             }
         }
         Ok(())
@@ -625,79 +695,331 @@ impl Header {
     }
 }
 
-impl Doc for Header {
-    const FORMAT: &'static str = "cozytensors/1";
-    const MAX_BYTES: usize = limits::DOC_MAX_BYTES;
+impl Header {
+    pub const FORMAT: &'static str = "cozytensors/1";
+    pub const MAX_BYTES: usize = limits::DOC_MAX_BYTES;
 
-    fn from_value(v: &Value) -> Result<Self> {
-        let mut f = Fields::new("Header", v)?;
-        check_format(
-            "Header",
-            as_str("Header", "format", f.req("format")?)?,
-            Self::FORMAT,
-        )?;
+    pub fn parse(bytes: &[u8]) -> Result<Self> {
+        <Self as crate::ids::StoredDoc>::parse(bytes)
+    }
+    pub fn canonical_bytes(&self) -> Result<Vec<u8>> {
+        <Self as crate::ids::StoredDoc>::canonical_bytes(self)
+    }
+    pub fn object_id(&self) -> Result<String> {
+        <Self as crate::ids::StoredDoc>::object_id(self)
+    }
+    pub fn object_ref(&self) -> Result<ObjectRef> {
+        <Self as crate::ids::StoredDoc>::object_ref(self)
+    }
+
+    /// Binary red-vector authoring only. This never computes identity or admits storage;
+    /// production callers use the validating fallible methods above.
+    #[doc(hidden)]
+    pub fn conformance_bytes(&self) -> Result<Vec<u8>> {
+        crate::cbor::encode_header_unvalidated(self)
+    }
+
+    /// Parse the ordered diagnostic JSON schema used only by conformance tooling. The
+    /// resulting Header is encoded by the production CBOR writer; these JSON bytes have no
+    /// identity and no stored-reader path.
+    pub fn from_diagnostic_value(value: &Value) -> Result<Self> {
+        use crate::canon::{as_arr, as_str, Fields};
+
+        fn row<'a>(what: &str, value: &'a Value, n: usize) -> Result<&'a [Value]> {
+            let values = crate::canon::as_arr(what, "row", value)?;
+            if values.len() != n {
+                return refuse(
+                    Code::WRONG_TYPE,
+                    format!("{what}: row arity {}, expected {n}", values.len()),
+                );
+            }
+            Ok(values)
+        }
+        fn uint(what: &str, value: &Value) -> Result<u64> {
+            crate::canon::as_uint(what, "value", value)
+        }
+        fn digest(what: &str, value: &Value) -> Result<String> {
+            let value = as_str(what, "digest", value)?;
+            Ok(crate::ids::prefixed(what, value)?[7..].to_string())
+        }
+        fn object_ref(what: &str, value: &Value) -> Result<ObjectRef> {
+            let values = row(what, value, 2)?;
+            Ok(ObjectRef {
+                sha256: digest(what, &values[0])?,
+                length: uint(what, &values[1])?,
+            })
+        }
+        fn shape(what: &str, value: &Value) -> Result<Vec<u64>> {
+            let values = as_arr(what, "shape", value)?;
+            if values.len() > limits::MAX_RANK {
+                return refuse(Code::RANK_CAP, format!("{what}: rank over cap"));
+            }
+            values.iter().map(|value| uint(what, value)).collect()
+        }
+        fn hex_bytes(what: &str, value: &Value) -> Result<Vec<u8>> {
+            let text = as_str(what, "inline_hex", value)?;
+            if text.len() % 2 != 0 || !text.bytes().all(|b| b.is_ascii_hexdigit()) {
+                return refuse(
+                    Code::MALFORMED_DIGEST,
+                    format!("{what}: malformed hex bytes"),
+                );
+            }
+            text.as_bytes()
+                .chunks_exact(2)
+                .map(|pair| {
+                    std::str::from_utf8(pair)
+                        .ok()
+                        .and_then(|p| u8::from_str_radix(p, 16).ok())
+                        .ok_or_else(|| Refusal {
+                            code: Code::MALFORMED_DIGEST,
+                            detail: format!("{what}: malformed hex bytes"),
+                        })
+                })
+                .collect()
+        }
+
+        let mut fields = Fields::new("Header diagnostic", value)?;
+        let format = fields.req_str("format")?;
+        if format != Self::FORMAT {
+            return refuse(
+                Code::UNKNOWN_FORMAT,
+                format!("diagnostic format {format:?} != {:?}", Self::FORMAT),
+            );
+        }
         let mut configs = Vec::new();
-        if let Some(c) = f.opt("configs") {
-            for (name, cv) in as_obj("Header", "configs", c)? {
-                ascii_name("Header.configs", name, limits::MAX_NAME_BYTES)?;
-                configs.push((name.clone(), ConfigRef::from_value(cv)?));
-            }
+        for (i, value) in as_arr("Header diagnostic", "configs", fields.req("configs")?)?
+            .iter()
+            .enumerate()
+        {
+            let what = format!("configs[{i}]");
+            let values = row(&what, value, 4)?;
+            configs.push((
+                as_str(&what, "name", &values[0])?.to_string(),
+                ConfigRef {
+                    sha256: digest(&what, &values[1])?,
+                    length: uint(&what, &values[2])?,
+                    media_type: as_str(&what, "media_type", &values[3])?.to_string(),
+                },
+            ));
         }
-        let mut encodings = Vec::new();
-        for e in as_arr("Header", "encodings", f.req("encodings")?)? {
-            encodings.push(ObjectRef::from_value("Header.encodings", e)?);
+        let mut assets = Vec::new();
+        for (i, value) in as_arr("Header diagnostic", "assets", fields.req("assets")?)?
+            .iter()
+            .enumerate()
+        {
+            let what = format!("assets[{i}]");
+            let values = row(&what, value, 5)?;
+            let segments = as_arr(&what, "segments", &values[4])?
+                .iter()
+                .enumerate()
+                .map(|(j, value)| object_ref(&format!("{what}.segments[{j}]"), value))
+                .collect::<Result<Vec<_>>>()?;
+            assets.push((
+                as_str(&what, "name", &values[0])?.to_string(),
+                Asset {
+                    logical_sha256: digest(&what, &values[1])?,
+                    logical_length: uint(&what, &values[2])?,
+                    media_type: as_str(&what, "media_type", &values[3])?.to_string(),
+                    segments,
+                },
+            ));
         }
+        let encodings = as_arr("Header diagnostic", "encodings", fields.req("encodings")?)?
+            .iter()
+            .enumerate()
+            .map(|(i, value)| object_ref(&format!("encodings[{i}]"), value))
+            .collect::<Result<Vec<_>>>()?;
         let mut components = Vec::new();
-        for (name, cv) in as_obj("Header", "components", f.req("components")?)? {
+        for (i, value) in as_arr("Header diagnostic", "components", fields.req("components")?)?
+            .iter()
+            .enumerate()
+        {
+            let what = format!("components[{i}]");
+            let values = row(&what, value, 2)?;
+            let name = as_str(&what, "name", &values[0])?.to_string();
             let mut tensors = Vec::new();
-            for (key, tv) in as_obj("Header.components", name, cv)? {
-                tensors.push((key.clone(), Tensor::from_value(tv)?));
+            for (j, value) in as_arr(&what, "tensors", &values[1])?.iter().enumerate() {
+                let tensor_what = format!("{what}.tensors[{j}]");
+                let values = row(&tensor_what, value, 5)?;
+                let encoding_index =
+                    usize::try_from(uint(&tensor_what, &values[3])?).map_err(|_| Refusal {
+                        code: Code::NUMBER_RANGE,
+                        detail: format!(
+                            "{tensor_what}: encoding index is outside this platform's usize range"
+                        ),
+                    })?;
+                let encoding = encodings.get(encoding_index).ok_or_else(|| Refusal {
+                    code: Code::ENCODING_MISMATCH,
+                    detail: format!("{tensor_what}: encoding index {encoding_index} out of range"),
+                })?;
+                let mut parts = Vec::new();
+                for (k, value) in as_arr(&tensor_what, "parts", &values[4])?
+                    .iter()
+                    .enumerate()
+                {
+                    let part_what = format!("{tensor_what}.parts[{k}]");
+                    let values = row(&part_what, value, 4)?;
+                    let mut body_fields = Fields::new("diagnostic body", &values[3])?;
+                    let inline = body_fields.opt("inline_hex");
+                    let segments = body_fields.opt("segments");
+                    body_fields.done()?;
+                    let body = match (inline, segments) {
+                        (Some(value), None) => Body::Inline(hex_bytes(&part_what, value)?),
+                        (None, Some(value)) => Body::Segments(
+                            as_arr(&part_what, "segments", value)?
+                                .iter()
+                                .enumerate()
+                                .map(|(n, value)| {
+                                    object_ref(&format!("{part_what}.segments[{n}]"), value)
+                                })
+                                .collect::<Result<Vec<_>>>()?,
+                        ),
+                        _ => {
+                            return refuse(
+                                Code::INLINE_EXCLUSIVE,
+                                format!("{part_what}: body has exactly one representation"),
+                            )
+                        }
+                    };
+                    parts.push((
+                        as_str(&part_what, "role", &values[0])?.to_string(),
+                        Part {
+                            dtype: Dtype::parse(as_str(&part_what, "dtype", &values[1])?)?,
+                            shape: shape(&part_what, &values[2])?,
+                            body,
+                        },
+                    ));
+                }
+                tensors.push((
+                    as_str(&tensor_what, "key", &values[0])?.to_string(),
+                    Tensor {
+                        dtype: Dtype::parse(as_str(&tensor_what, "dtype", &values[1])?)?,
+                        shape: shape(&tensor_what, &values[2])?,
+                        encoding: encoding.id(),
+                        parts,
+                    },
+                ));
             }
-            components.push((name.clone(), tensors));
+            components.push((name, tensors));
         }
-        f.done()?;
+        fields.done()?;
         Ok(Header {
             configs,
+            assets,
             encodings,
             components,
         })
     }
 
-    fn to_value(&self) -> Value {
-        let mut fields = vec![
+    /// Readable JSON-shaped projection. It is never accepted as a header or hashed.
+    pub fn diagnostic_value(&self) -> Result<Value> {
+        self.validate_structure()?;
+        let object_ref =
+            |r: &ObjectRef| Value::arr(vec![Value::str(r.id()), Value::uint(r.length)]);
+        let encoding_index: std::collections::HashMap<String, usize> = self
+            .encodings
+            .iter()
+            .enumerate()
+            .map(|(index, encoding)| (encoding.id(), index))
+            .collect();
+        let mut component_values = Vec::with_capacity(self.components.len());
+        for (component, rows) in &self.components {
+            let mut tensor_values = Vec::with_capacity(rows.len());
+            for (key, tensor) in rows {
+                let encoding = encoding_index
+                    .get(&tensor.encoding)
+                    .copied()
+                    .ok_or_else(|| Refusal {
+                        code: Code::ENCODING_MISMATCH,
+                        detail: format!("{component}/{key}: encoding is not listed"),
+                    })?;
+                let parts = tensor
+                    .parts
+                    .iter()
+                    .map(|(role, part)| {
+                        let body = match &part.body {
+                            Body::Inline(bytes) => Value::obj(vec![(
+                                "inline_hex",
+                                Value::str(crate::sha256::hex(bytes)),
+                            )]),
+                            Body::Segments(segments) => Value::obj(vec![(
+                                "segments",
+                                Value::arr(segments.iter().map(&object_ref).collect()),
+                            )]),
+                        };
+                        Value::arr(vec![
+                            Value::str(role),
+                            Value::str(part.dtype.name()),
+                            shape_value(&part.shape),
+                            body,
+                        ])
+                    })
+                    .collect();
+                tensor_values.push(Value::arr(vec![
+                    Value::str(key),
+                    Value::str(tensor.dtype.name()),
+                    shape_value(&tensor.shape),
+                    Value::uint(encoding as u64),
+                    Value::arr(parts),
+                ]));
+            }
+            component_values.push(Value::arr(vec![
+                Value::str(component),
+                Value::arr(tensor_values),
+            ]));
+        }
+        Ok(Value::obj(vec![
             ("format", Value::str(Self::FORMAT)),
             (
-                "encodings",
-                Value::arr(self.encodings.iter().map(|r| r.to_value()).collect()),
-            ),
-            (
-                "components",
-                Value::map(
-                    self.components
+                "configs",
+                Value::arr(
+                    self.configs
                         .iter()
-                        .map(|(c, ts)| {
-                            (
-                                c.clone(),
-                                Value::map(
-                                    ts.iter().map(|(k, t)| (k.clone(), t.to_value())).collect(),
-                                ),
-                            )
+                        .map(|(name, config)| {
+                            Value::arr(vec![
+                                Value::str(name),
+                                Value::str(format!("sha256:{}", config.sha256)),
+                                Value::uint(config.length),
+                                Value::str(&config.media_type),
+                            ])
                         })
                         .collect(),
                 ),
             ),
-        ];
-        if !self.configs.is_empty() {
-            fields.push((
-                "configs",
-                Value::map(
-                    self.configs
+            (
+                "assets",
+                Value::arr(
+                    self.assets
                         .iter()
-                        .map(|(n, c)| (n.clone(), c.to_value()))
+                        .map(|(name, asset)| {
+                            Value::arr(vec![
+                                Value::str(name),
+                                Value::str(format!("sha256:{}", asset.logical_sha256)),
+                                Value::uint(asset.logical_length),
+                                Value::str(&asset.media_type),
+                                Value::arr(asset.segments.iter().map(&object_ref).collect()),
+                            ])
+                        })
                         .collect(),
                 ),
-            ));
-        }
-        Value::obj(fields)
+            ),
+            (
+                "encodings",
+                Value::arr(self.encodings.iter().map(&object_ref).collect()),
+            ),
+            ("components", Value::arr(component_values)),
+        ]))
+    }
+}
+
+impl crate::ids::StoredDoc for Header {
+    const FORMAT: &'static str = Header::FORMAT;
+    const MAX_BYTES: usize = Header::MAX_BYTES;
+
+    fn canonical_bytes(&self) -> Result<Vec<u8>> {
+        crate::cbor::encode_header(self)
+    }
+    fn parse(bytes: &[u8]) -> Result<Self> {
+        crate::cbor::decode_header(bytes)
     }
 }

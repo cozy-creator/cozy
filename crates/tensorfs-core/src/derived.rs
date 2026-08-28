@@ -140,10 +140,32 @@ pub struct Declaration {
     pub sources: Vec<Source>,
     pub components: Vec<ComponentDeclaration>,
     pub configs: Vec<ConfigDeclaration>,
+    pub order: Vec<(String, String)>,
     pub max_new_bytes: u64,
 }
 
 impl Declaration {
+    fn require_order(&self) -> Result<()> {
+        if self.order.is_empty() {
+            return refuse(
+                Code::CONSTRUCTION_ORDER_REQUIRED,
+                "derived artifact declaration has no construction traversal",
+            );
+        }
+        let mut seen = HashSet::new();
+        for (component, tensor_key) in &self.order {
+            name("construction-order component", component)?;
+            key("construction-order tensor", tensor_key)?;
+            if !seen.insert((component.as_str(), tensor_key.as_str())) {
+                return refuse(
+                    Code::DUPLICATE_KEY,
+                    format!("construction order repeats {component}/{tensor_key}"),
+                );
+            }
+        }
+        Ok(())
+    }
+
     pub fn normalize_and_validate(&mut self) -> Result<()> {
         if self.components.is_empty() || self.components.len() > limits::MAX_COMPONENTS {
             return refuse(
@@ -269,26 +291,29 @@ impl Declaration {
                     );
                 }
             }
-            component.add.sort_by(|a, b| a.key.cmp(&b.key));
-            if let Some(pair) = component.add.windows(2).find(|w| w[0].key == w[1].key) {
+            let mut add_keys: Vec<&str> = component
+                .add
+                .iter()
+                .map(|tensor| tensor.key.as_str())
+                .collect();
+            add_keys.sort();
+            if let Some(pair) = add_keys.windows(2).find(|w| w[0] == w[1]) {
                 return refuse(
                     Code::DUPLICATE_KEY,
-                    format!(
-                        "target {:?} adds key {:?} twice",
-                        component.target, pair[0].key
-                    ),
+                    format!("target {:?} adds key {:?} twice", component.target, pair[0]),
                 );
             }
         }
-        self.components.sort_by(|a, b| a.target.cmp(&b.target));
-        if let Some(pair) = self
+        let mut component_names: Vec<&str> = self
             .components
-            .windows(2)
-            .find(|w| w[0].target == w[1].target)
-        {
+            .iter()
+            .map(|component| component.target.as_str())
+            .collect();
+        component_names.sort();
+        if let Some(pair) = component_names.windows(2).find(|w| w[0] == w[1]) {
             return refuse(
                 Code::DUPLICATE_KEY,
-                format!("target component {:?} appears twice", pair[0].target),
+                format!("target component {:?} appears twice", pair[0]),
             );
         }
 
@@ -569,11 +594,32 @@ impl Declaration {
             cf.done()?;
             configs.push(config);
         }
+        let mut order = Vec::new();
+        for (index, value) in as_arr("DerivedDeclaration", "order", f.req("order")?)?
+            .iter()
+            .enumerate()
+        {
+            let row = as_arr("DerivedDeclaration.order", "row", value)?;
+            if row.len() != 2 {
+                return refuse(
+                    Code::WRONG_TYPE,
+                    format!(
+                        "DerivedDeclaration.order[{index}] arity {}, expected 2",
+                        row.len()
+                    ),
+                );
+            }
+            order.push((
+                as_str("DerivedDeclaration.order", "component", &row[0])?.to_string(),
+                as_str("DerivedDeclaration.order", "key", &row[1])?.to_string(),
+            ));
+        }
         f.done()?;
         Ok(Declaration {
             sources,
             components,
             configs,
+            order,
             max_new_bytes,
         })
     }
@@ -723,6 +769,17 @@ impl Declaration {
             ),
             ("max_new_bytes", Value::uint(self.max_new_bytes)),
             (
+                "order",
+                Value::arr(
+                    self.order
+                        .iter()
+                        .map(|(component, key)| {
+                            Value::arr(vec![Value::str(component.clone()), Value::str(key.clone())])
+                        })
+                        .collect(),
+                ),
+            ),
+            (
                 "sources",
                 Value::map(
                     self.sources
@@ -841,7 +898,9 @@ fn part_value(part: &Part) -> Value {
         ("shape".to_string(), shape_value(&part.shape)),
     ];
     match &part.body {
-        Body::Inline(value) => fields.push(("inline".to_string(), Value::str(value.clone()))),
+        Body::Inline(value) => {
+            fields.push(("inline".to_string(), Value::str(crate::b64::encode(value))))
+        }
         Body::Segments(segments) => fields.push((
             "segments".to_string(),
             Value::arr(segments.iter().map(ObjectRef::to_value).collect()),
@@ -858,7 +917,9 @@ fn part_from_value(value: &Value) -> Result<Part> {
     let segments = f.opt("segments");
     f.done()?;
     let body = match (inline, segments) {
-        (Some(value), None) => Body::Inline(as_str("DerivedPart", "inline", value)?.to_string()),
+        (Some(value), None) => {
+            Body::Inline(crate::b64::decode(as_str("DerivedPart", "inline", value)?)?)
+        }
         (None, Some(values)) => Body::Segments(
             as_arr("DerivedPart", "segments", values)?
                 .iter()
@@ -1369,7 +1430,7 @@ fn planned_part(declaration: &PartDeclaration) -> Result<Part> {
         declaration.dtype,
     )?;
     let body = if Part::is_inline(bytes) {
-        Body::Inline(crate::b64::encode(&vec![0; bytes as usize]))
+        Body::Inline(vec![0; bytes as usize])
     } else {
         let mut left = bytes;
         let mut segments = Vec::new();
@@ -1547,7 +1608,6 @@ fn build_header(
                 },
             ));
         }
-        tensors.sort_by(|a, b| a.0.cmp(&b.0));
         if tensors.is_empty() {
             return refuse(
                 Code::EMPTY_COMPONENTS,
@@ -1556,6 +1616,61 @@ fn build_header(
         }
         components.push((component.target.clone(), tensors));
     }
+
+    let mut rows = std::collections::HashMap::new();
+    for (component, tensors) in components.drain(..) {
+        for (key, tensor) in tensors {
+            if rows
+                .insert((component.clone(), key.clone()), tensor)
+                .is_some()
+            {
+                return refuse(
+                    Code::DUPLICATE_KEY,
+                    format!("derived target repeats {component}/{key}"),
+                );
+            }
+        }
+    }
+    let mut ordered: Vec<(String, Vec<(String, Tensor)>)> = Vec::new();
+    let mut closed_components = HashSet::new();
+    for (component, key) in &declaration.order {
+        let tensor = rows
+            .remove(&(component.clone(), key.clone()))
+            .ok_or_else(|| Refusal {
+                code: Code::TRAVERSAL_INCOMPLETE,
+                detail: format!("construction order repeats or invents {component}/{key}"),
+            })?;
+        match ordered.last_mut() {
+            Some((current, tensors)) if current == component => {
+                tensors.push((key.clone(), tensor));
+            }
+            _ => {
+                if !closed_components.insert(component.clone()) {
+                    return refuse(
+                        Code::TRAVERSAL_ORDER_MISMATCH,
+                        format!("construction order interleaves component {component:?}"),
+                    );
+                }
+                ordered.push((component.clone(), vec![(key.clone(), tensor)]));
+            }
+        }
+    }
+    if !rows.is_empty() {
+        let mut missing: Vec<String> = rows
+            .keys()
+            .map(|(component, key)| format!("{component}/{key}"))
+            .collect();
+        missing.sort();
+        return refuse(
+            Code::TRAVERSAL_INCOMPLETE,
+            format!(
+                "construction order omits {} derived tensor(s), first {:?}",
+                missing.len(),
+                &missing[..missing.len().min(3)]
+            ),
+        );
+    }
+    components = ordered;
 
     let mut configs = Vec::new();
     for config in &declaration.configs {
@@ -1686,9 +1801,9 @@ fn build_header(
             );
         }
     }
-    components.sort_by(|a, b| a.0.cmp(&b.0));
     let header = Header {
         configs,
+        assets: Vec::new(),
         encodings,
         components,
     };
@@ -1755,6 +1870,7 @@ pub fn inspect_source(
                 source_config: config.clone(),
             })
             .collect(),
+        order: Vec::new(),
         max_new_bytes: 0,
     };
     declaration.normalize_and_validate()?;
@@ -1860,6 +1976,7 @@ pub fn begin(
         );
     }
     declaration.normalize_and_validate()?;
+    declaration.require_order()?;
     let declaration_text = declaration.canonical_text();
     if declaration_text.len() > limits::DOC_MAX_BYTES / 2 {
         return refuse(

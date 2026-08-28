@@ -75,7 +75,7 @@ pub fn cmd_topology(root: &Path, hex: &str, flags: &Flags) -> ExitCode {
         }
     ));
     if let Some(p) = flag(flags, "emit-header") {
-        let _ = fs::write(p, header.canonical_bytes());
+        let _ = fs::write(p, ok!(header.canonical_bytes()));
     }
     let code = project(&header, flag(flags, "contract").unwrap_or("local"));
     emit(&code, flags);
@@ -289,12 +289,11 @@ pub fn cmd_import(rows_p: &Path, flags: &Flags) -> ExitCode {
         );
         return ExitCode::SUCCESS;
     }
-    out.sort_by(|a, b| a.0.cmp(&b.0));
-    reqs.sort_by(|a, b| a.0.cmp(&b.0));
     let mut encodings: Vec<ObjectRef> = closure.specs.iter().map(|(_, s)| s.object_ref()).collect();
     encodings.sort_by(|a, b| a.sha256.cmp(&b.sha256));
     let header = tensorfs_core::header::Header {
         configs: vec![],
+        assets: vec![],
         encodings,
         components: vec![(component.clone(), out)],
     };
@@ -304,7 +303,7 @@ pub fn cmd_import(rows_p: &Path, flags: &Flags) -> ExitCode {
         components: vec![(component, reqs)],
     };
     if let Some(p) = flag(flags, "out-header") {
-        let _ = fs::write(p, header.canonical_bytes());
+        let _ = fs::write(p, ok!(header.canonical_bytes()));
     }
     if let Some(p) = flag(flags, "out-code") {
         let _ = fs::write(p, code.canonical_bytes());
@@ -324,7 +323,7 @@ pub fn cmd_import(rows_p: &Path, flags: &Flags) -> ExitCode {
     );
     println!("  logical    REAL — keys/dtypes/shapes/roles off pinned upstream header bytes");
     println!("  parts      PLACEHOLDER object ids: no weight bytes transit this machine");
-    println!("header       {}", header.object_id());
+    println!("header       {}", ok!(header.object_id()));
     println!("topology     {}", header.topology_digest());
     println!("code         {}", code.object_id());
     for (id, s) in &closure.specs {
@@ -396,7 +395,7 @@ fn placeholder_part(
         return Part {
             dtype,
             shape,
-            body: Body::Inline(tensorfs_core::b64::encode(&vec![0u8; nbytes as usize])),
+            body: Body::Inline(vec![0u8; nbytes as usize]),
         };
     }
     let grid = limits::GRID_BYTES;
@@ -462,7 +461,7 @@ pub fn cmd_check(code_p: &Path, header_p: &Path, flags: &Flags) -> ExitCode {
         &markers()
     ));
     let us = t.elapsed().as_secs_f64() * 1e6;
-    let report = CompatibilityReport::of(&code, &header, lane, &out);
+    let report = ok!(CompatibilityReport::of(&code, &header, lane, &out));
     emit(&report, flags);
 
     println!("lane         {}", lane.name());

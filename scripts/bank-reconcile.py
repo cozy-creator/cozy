@@ -130,7 +130,7 @@ def build(name, artifact, twin=None):
     if p.returncode != 0:
         return f"TRANSCRIBE_FAILED {p.stdout.strip() or p.stderr.strip()}"[:90], None
     code, out = run(TFS, "compat", "import", rows,
-                    "--out-header", W / f"{name}.header.json",
+                    "--out-header", W / f"{name}.header.cbor",
                     "--out-code", W / f"{name}.code.json",
                     "--out-closure", W / f"{name}.closure")
     if code != 0:
@@ -158,7 +158,7 @@ def check(case, contract, checkpoint):
     report = W / f"report.{case}.json"
     pins = pin_of(checkpoint) + ("," + pin_of(contract) if contract != checkpoint else "")
     _, out = run(TFS, "compat", "check", W / f"{contract}.code.json",
-                 W / f"{checkpoint}.header.json",
+                 W / f"{checkpoint}.header.cbor",
                  "--closure", ",".join(str(p) for p in cl), "--pin", pins,
                  "--lane", CASES_LANE.get(case, "canonical"), "--out", report)
     verdict = next((l.split(None, 1)[1].strip() for l in out.splitlines()
@@ -170,7 +170,7 @@ def grade(report, registry=None, contract=None, checkpoint=None):
     args = [TFS, "grade", report]
     if registry:
         args += ["--registry", registry, "--code", W / f"{contract}.code.json",
-                 "--header", W / f"{checkpoint}.header.json",
+                 "--header", W / f"{checkpoint}.header.cbor",
                  "--closure", ",".join(str(p) for p in closure_of(checkpoint)),
                  "--pin", pin_of(checkpoint)]
     _, out = run(*args)

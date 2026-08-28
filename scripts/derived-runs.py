@@ -19,6 +19,21 @@ from typing import Any
 import tensorfs
 
 
+def construction_order(
+    targets: dict[str, Any], components: dict[str, dict[str, Any]]
+) -> list[tuple[str, str]]:
+    order: list[tuple[str, str]] = []
+    for target, declaration in targets.items():
+        source = declaration.get("source_component")
+        dropped = set(declaration["drop"])
+        if source is not None:
+            order.extend(
+                (target, key) for key in components[source] if key not in dropped
+            )
+        order.extend((target, key) for key in declaration["add"])
+    return order
+
+
 def run(*argv: str) -> str:
     completed = subprocess.run(argv, check=False, text=True, capture_output=True)
     print(completed.stdout, end="")
@@ -35,6 +50,7 @@ def lifecycle_arms(
     source_id: str,
     source_length: int,
     plain: str,
+    components: dict[str, dict[str, Any]],
 ) -> None:
     sources = {"full": (source_id, source_length)}
     target: dict[str, Any] = {
@@ -63,16 +79,20 @@ def lifecycle_arms(
 
     # A fenced id cannot reopen or write; one greater id restarts the locked declaration.
     transaction_id = "sha256:" + "a" * 64
-    old = store.begin_derived(transaction_id, 1, sources, target, {}, 1024)
+    target_order = construction_order(target, components)
+    copy_order = construction_order(copy, components)
+    old = store.begin_derived(transaction_id, 1, sources, target, {}, target_order, 1024)
     if not old.fence():
         raise RuntimeError("the active writer did not fence")
     try:
-        store.begin_derived(transaction_id, 1, sources, target, {}, 1024)
+        store.begin_derived(transaction_id, 1, sources, target, {}, target_order, 1024)
     except tensorfs.errors.WriterFenced:
         pass
     else:
         raise RuntimeError("a fenced WriterSessionId reopened")
-    successor = store.begin_derived(transaction_id, 2, sources, target, {}, 1024)
+    successor = store.begin_derived(
+        transaction_id, 2, sources, target, {}, target_order, 1024
+    )
     try:
         old.add_part("fl2va_dit", "table", "value", io.BytesIO(b"x" * 1024))
     except tensorfs.errors.WriterFenced:
@@ -98,7 +118,7 @@ def lifecycle_arms(
 
     # The first declaration is a durable lock, including explicit source-component rename.
     transaction_id = "sha256:" + "b" * 64
-    writer = store.begin_derived(transaction_id, 1, sources, copy, {}, 0)
+    writer = store.begin_derived(transaction_id, 1, sources, copy, {}, copy_order, 0)
     changed: dict[str, Any] = {
         "fl2va_dit": {
             "source": "full",
@@ -108,7 +128,15 @@ def lifecycle_arms(
         }
     }
     try:
-        store.begin_derived(transaction_id, 2, sources, changed, {}, 0)
+        store.begin_derived(
+            transaction_id,
+            2,
+            sources,
+            changed,
+            {},
+            construction_order(changed, components),
+            0,
+        )
     except tensorfs.errors.TransactionConflict:
         pass
     else:
@@ -121,14 +149,14 @@ def lifecycle_arms(
     transaction_id = "sha256:" + "c" * 64
     store.derived_abandon(transaction_id)
     try:
-        store.begin_derived(transaction_id, 1, sources, copy, {}, 0)
+        store.begin_derived(transaction_id, 1, sources, copy, {}, copy_order, 0)
     except tensorfs.errors.TransactionClosed:
         pass
     else:
         raise RuntimeError("an abandoned transaction reopened")
 
     transaction_id = "sha256:" + "d" * 64
-    writer = store.begin_derived(transaction_id, 1, sources, copy, {}, 0)
+    writer = store.begin_derived(transaction_id, 1, sources, copy, {}, copy_order, 0)
     receipt = writer.commit()
     released = store.derived_dispose(transaction_id)
     if released != {"disposition": {"kind": "released"}, "receipt": receipt}:
@@ -235,6 +263,7 @@ def main() -> None:
         {"full": (source_id, len(source_document))},
         targets,
         configs,
+        construction_order(targets, components),
         51 * 1024,
     )
     consumed_selector: tuple[str, str, int] | None = None
@@ -310,7 +339,7 @@ def main() -> None:
     if sum(key.startswith("adaln.table.") for key in fl2va) != 51:
         raise RuntimeError("the 51 declared table tensors were not all added")
 
-    lifecycle_arms(store, source_id, len(source_document), plain)
+    lifecycle_arms(store, source_id, len(source_document), plain, components)
 
     print(
         "DERIVED PASS "

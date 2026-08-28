@@ -701,7 +701,7 @@ pub fn resolve(
     reg: &Registry,
 ) -> Result<(CompatibilityReport, Grade)> {
     let out = crate::compat::check_compatibility(code, header, closure, pin, lane, known_markers)?;
-    let report = CompatibilityReport::of(code, header, lane, &out);
+    let report = CompatibilityReport::of(code, header, lane, &out)?;
     if out.satisfaction.is_satisfied() {
         return Ok((report, Grade::Compatible));
     }

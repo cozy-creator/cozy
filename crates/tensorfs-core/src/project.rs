@@ -209,6 +209,9 @@ pub fn materialize_blob(store: &Store, what: &str, b: &BlobDescriptor, dest: &Pa
 /// first, so it can only render a document the store would admit, and what it returns is
 /// deliberately not admissible anywhere.
 pub fn render(bytes: &[u8], max: usize) -> Result<String> {
+    if let Ok(header) = crate::header::Header::parse(bytes) {
+        return Ok(canon::pretty(&header.diagnostic_value()?, 0));
+    }
     let v = canon::parse_canonical(bytes, max)?;
     Ok(canon::pretty(&v, 0))
 }

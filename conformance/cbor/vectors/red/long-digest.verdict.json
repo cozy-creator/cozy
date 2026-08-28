@@ -1,0 +1,4 @@
+{
+  "expect": "refuse",
+  "why": "digests are exactly 32 bytes"
+}

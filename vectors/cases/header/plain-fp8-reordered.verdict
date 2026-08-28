@@ -1,0 +1,5 @@
+doc: header
+expect: ok
+id: sha256:4bd7911f524c48f49f5ee2b996d3d5327bf74b7f457e4775d0651363573ff4d2
+topology: sha256:14fc85f36f84019391ce2691f0b206faebd505b37727f34fcc4deb6177ed918f
+note: same topology and objects, opposite identity-bearing tensor order

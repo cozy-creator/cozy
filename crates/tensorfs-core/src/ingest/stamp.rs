@@ -244,8 +244,8 @@ pub fn stamp(store: &Store, p: Presented) -> Result<Stamped> {
     if header != p.outcome.header {
         return Err(disagree(
             "header",
-            &header.object_ref().id(),
-            &p.outcome.header.object_ref().id(),
+            &header.object_ref()?.id(),
+            &p.outcome.header.object_ref()?.id(),
         ));
     }
     let closure = ck::load_closure(store, &header)?;

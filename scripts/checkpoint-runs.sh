@@ -93,20 +93,23 @@ red_section() {
   echo "small checkpoint $h written for planting"
 
   hr "RED 1 — a segment length lie, refused BEFORE any body is fetched"
-  cp "$(objpath "$RED" "$h")" "$WORK/lie.json"
-  chmod u+w "$WORK/lie.json"
-  sed -i '0,/"length":4194304/s//"length":4194300/' "$WORK/lie.json"
-  local lie; lie=$("$TFS" put "$RED" "$WORK/lie.json" | hex)
+  "$TFS" cbor plant "$(objpath "$RED" "$h")" anchor-length --out "$WORK/lie.cbor"
+  local lie; lie=$("$TFS" put "$RED" "$WORK/lie.cbor" | hex)
   echo "doctored header admitted at $lie"
   strace -f -e trace=openat -o "$WORK/lie.strace" "$TFS" checkpoint read "$RED" "$lie" --blocks 1
   echo "object opens during the refusal: $(grep -c 'objects/sha256' "$WORK/lie.strace") \
 (header + $(($(grep -c 'objects/sha256' "$WORK/lie.strace") - 1)) spec/config objects; zero tensor segments)"
 
   hr "RED 2 — the same content, one trailing byte: never readable AS a header"
-  cp "$(objpath "$RED" "$h")" "$WORK/twin.json"; chmod u+w "$WORK/twin.json"
-  printf '\n' >> "$WORK/twin.json"
-  local twin; twin=$("$TFS" put "$RED" "$WORK/twin.json" | hex)
+  cp "$(objpath "$RED" "$h")" "$WORK/twin.cbor"; chmod u+w "$WORK/twin.cbor"
+  printf '\200' >> "$WORK/twin.cbor"
+  local twin; twin=$("$TFS" put "$RED" "$WORK/twin.cbor" | hex)
   "$TFS" checkpoint read "$RED" "$twin" --blocks 1
+
+  hr "RED 2b — a model asset logical-digest lie is caught on consumption"
+  "$TFS" cbor plant "$(objpath "$RED" "$h")" asset-logical-digest --out "$WORK/asset-lie.cbor"
+  local asset_lie; asset_lie=$("$TFS" put "$RED" "$WORK/asset-lie.cbor" | hex)
+  "$TFS" checkpoint read "$RED" "$asset_lie" --blocks 1
 
   hr "RED 3 — a spec object missing from the closure: cannot install as self-describing"
   local spec; spec=$("$TFS" checkpoint info "$RED" "$h" | grep '^encoding' | head -1 | hex)

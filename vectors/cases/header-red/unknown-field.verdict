@@ -1,4 +1,4 @@
 doc: header
 expect: refuse
-code: UNKNOWN_FIELD
-note: unknown root field
+code: WRONG_TYPE
+note: the fixed root has no sixth field

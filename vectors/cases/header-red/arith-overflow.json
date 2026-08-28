@@ -1,1 +1,0 @@
-{"components":{"transformer":{"probe.weight":{"encoding":"sha256:bc82d7f544f0f1eb53bc04d1b3c389a0310e746e1de7d93a5a4e6167458452b6","logical":{"dtype":"bf16","shape":[4096,8]},"parts":{"value":{"dtype":"u8","inline":"AA==","shape":[1]}}}}},"encodings":[{"length":328,"sha256":"bc82d7f544f0f1eb53bc04d1b3c389a0310e746e1de7d93a5a4e6167458452b6"}],"format":"cozytensors/1"}

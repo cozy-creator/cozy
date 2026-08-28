@@ -26,8 +26,8 @@ work="${work:-$(mktemp -d)}"
 mkdir -p "$work"
 
 # The committed fixture: `tfs checkpoint write vectors/store --blocks 1 --scale 32`.
-SNAP=beb936f23bacbb5679d5cfbc207302503660f53fe543b34a3d752a7e5a38c4ee
-DIGEST=c578846256ffce1447da8787c83315b13005977721f11a00f8084afd09098185
+SNAP=3efa56a9969b1c4a06d1588da74340b972df9b98ae3b8ecc03cb5796e836f479
+DIGEST=a5421bd647401296a540be4f122f2fd03e04e7d1a312023b759e36c44b17ef73
 
 wheels="${wheels:-$work/wheels}"
 if [ -z "$skip_build" ]; then
@@ -63,11 +63,11 @@ assert tensorfs.object_id(info["manifest"]) == "sha256:" + snap
 # buffer is the caller's, and the bytes are checked against the part digest the header
 # declares.
 names = [(c, k) for c in header["components"] for k in header["components"][c]]
-comp, key = sorted(names)[0]
+comp, key = names[0]
 tensor = header["components"][comp][key]
 print(f"named tensor: {comp}/{key} {tensor['logical']['dtype']} {tensor['logical']['shape']}")
 
-order = sorted(names)
+order = names
 plan = tensorfs.plan(info["header"], order, window=1 << 16)
 slots = [memoryview(bytearray(1 << 18)) for _ in range(3)]
 digest = hashlib.sha256()
@@ -102,7 +102,7 @@ except tensorfs.errors.PlatformUnsupported as e:
 
 try:
     tensorfs.parse_header(info["manifest"])
-except tensorfs.errors.UnknownFormat as e:
+except tensorfs.errors.MalformedCbor as e:
     print("typed refusal :", e.code, "|", e.detail[:60])
 
 print("SMOKE GREEN")

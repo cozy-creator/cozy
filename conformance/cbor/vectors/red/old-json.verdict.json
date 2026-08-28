@@ -1,0 +1,4 @@
+{
+  "expect": "refuse",
+  "why": "old JSON is not a CBOR header"
+}

@@ -40,21 +40,11 @@ def rss_mib() -> float:
     return 0.0
 
 
-def seg_key(k: str) -> list[tuple[int, int, str]]:
-    """`down_blocks.2` before `down_blocks.10`, which byte order gets backwards. This is a
-    STAND-IN for the runtime's code-topology traversal — TensorFS uses what it is given."""
-    out = []
-    for s in k.split("."):
-        out.append((0, int(s), "") if s.isdigit() else (1, 0, s))
-    return out
-
-
-def module_order(header: dict[str, Any]) -> list[tuple[str, str]]:
+def construction_order(header: dict[str, Any]) -> list[tuple[str, str]]:
     comps = list(header["components"])
-    keys: list[tuple[str, str]] = [
+    return [
         (c, k) for c in comps for k in header["components"][c]
     ]
-    return sorted(keys, key=lambda ck: (comps.index(ck[0]), seg_key(ck[1])))
 
 
 def evict(store: str) -> tuple[int, int]:
@@ -184,7 +174,7 @@ def open_interim(store_path: str) -> Any:
 def cmd_real(a: argparse.Namespace) -> int:
     store, header, header_bytes = load(a.store, a.snapshot)
     print(f"store:      {store.root} era={store.era} generation={store.generation}")
-    order = module_order(header)
+    order = construction_order(header)
     print(f"traversal:  {len(order)} tensors in module order, first {order[0][1]}")
 
     t0 = time.perf_counter()
@@ -238,7 +228,7 @@ def cmd_real(a: argparse.Namespace) -> int:
 
 def cmd_bench(a: argparse.Namespace) -> int:
     store, header, header_bytes = load(a.store, a.snapshot)
-    order = module_order(header)
+    order = construction_order(header)
     plan = tensorfs.plan(header_bytes, order, window=a.window)
     print(f"# {plan.io_bytes} B disk leg, window {a.window} B, slot {a.slot_bytes} B, {a.slots} slots")
     print(f"{'arm':<10} {'depth':<6} {'cold GB/s':<10} {'warm GB/s':<10} {'peak RSS':<10}")
@@ -317,7 +307,7 @@ def cmd_arms(a: argparse.Namespace) -> int:
     work = pathlib.Path(a.work)
     arms = Arms()
     store, header, header_bytes = load(a.store, a.snapshot)
-    order = module_order(header)
+    order = construction_order(header)
     plan = tensorfs.plan(header_bytes, order, window=a.window)
     lease = store.acquire_snapshot(a.snapshot)
     first = lease.objects[0]

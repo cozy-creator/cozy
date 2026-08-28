@@ -1,0 +1,4 @@
+doc: header
+expect: refuse
+code: COUNT_CAP
+note: segmented body is a non-empty ObjectRef array

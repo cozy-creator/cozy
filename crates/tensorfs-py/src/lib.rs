@@ -81,7 +81,6 @@ fn _ext(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<docs::PyClosure>()?;
 
     m.add_function(wrap_pyfunction!(store::plan, m)?)?;
-    m.add_function(wrap_pyfunction!(store::plan_in_key_order, m)?)?;
     m.add_function(wrap_pyfunction!(store::ingest_open_root, m)?)?;
     m.add_function(wrap_pyfunction!(store::ingest_read_root, m)?)?;
     m.add_function(wrap_pyfunction!(store::ingest_reap, m)?)?;

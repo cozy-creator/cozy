@@ -16,3 +16,4 @@ path = "src/bin/tfs/main.rs"
 required-features = ["grade"]
 
 [dependencies]
+minicbor = { version = "2.3.0", default-features = false, features = ["alloc"] }

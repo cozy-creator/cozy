@@ -86,6 +86,10 @@ def main() -> None:
     encoding = variants[0]
     changed = encoding[:-1] + ("0" if encoding[-1] != "0" else "1")
     sources = {"bf16": (source_id, source_length)}
+    order = [
+        ("text_encoder", key)
+        for key in source_header["components"]["text_encoder"]
+    ]
 
     try:
         store.begin_derived(
@@ -94,6 +98,7 @@ def main() -> None:
             sources,
             target(changed),
             {},
+            order,
             12,
         )
     except tensorfs.errors.UnknownEncoding:
@@ -110,6 +115,7 @@ def main() -> None:
         sources,
         target(encoding),
         {},
+        order,
         len(encoded.payload) + len(scale.raw),
     )
     writer.add_part("text_encoder", "embeddings.weight", "data", io.BytesIO(encoded.payload))

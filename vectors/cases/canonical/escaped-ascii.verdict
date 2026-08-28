@@ -1,4 +1,0 @@
-doc: header
-expect: refuse
-code: NONCANONICAL_ENCODING
-note: \u escape of a plain letter

@@ -10,7 +10,7 @@ use std::process::ExitCode;
 use std::time::Instant;
 
 use tensorfs_core::checkpoint as ck;
-use tensorfs_core::err::Result as TfsResult;
+use tensorfs_core::err::{Code, Result as TfsResult};
 use tensorfs_core::ids::{Doc, ObjectRef};
 use tensorfs_core::manifest::{BlobDescriptor, Draft, Entry, SnapshotManifest};
 use tensorfs_core::sha256;
@@ -120,10 +120,11 @@ pub fn cmd_walk(root: &Path, hex: &str) -> ExitCode {
 
     println!("transitive root of {}", sref.id());
     println!(
-        "  manifest → header → {} spec + {} vectors + {} config → {} tensors / {} parts → {} part runs",
+        "  manifest → header → {} spec + {} vectors + {} config + {} asset segments → {} tensors / {} parts → {} part runs",
         w.count("spec"),
         w.count("vectors"),
         w.count("config"),
+        w.count("model_asset"),
         w.tensors,
         w.parts,
         w.count("part")
@@ -188,7 +189,7 @@ pub fn cmd_verify(root: &Path, hex: &str) -> ExitCode {
     let header = ok!(ck::load_header(&store, snap.header().unwrap()));
 
     let t = Instant::now();
-    let (mut bytes, mut parts, mut blobs) = (0u64, 0usize, 0usize);
+    let (mut bytes, mut parts, mut blobs, mut assets) = (0u64, 0usize, 0usize, 0usize);
     for (comp, key, tensor) in header.tensors() {
         for (role, part) in &tensor.parts {
             let what = format!("{comp}/{key}#{role}");
@@ -197,6 +198,12 @@ pub fn cmd_verify(root: &Path, hex: &str) -> ExitCode {
             bytes += sink.0;
             parts += 1;
         }
+    }
+    for (name, asset) in &header.assets {
+        let mut sink = Sink(0);
+        ok!(ck::read_asset(&store, name, asset, &mut sink));
+        bytes += sink.0;
+        assets += 1;
     }
     for (path, e) in snap.entries() {
         match e {
@@ -207,6 +214,9 @@ pub fn cmd_verify(root: &Path, hex: &str) -> ExitCode {
                 blobs += 1;
             }
             Entry::File(o) => {
+                if path.starts_with(&format!("{}/", tensorfs_core::manifest::ASSET_DIR)) {
+                    continue;
+                }
                 let mut sink = Sink(0);
                 let n = ok!(store.read_into(&o.sha256, &mut sink));
                 bytes += n;
@@ -218,7 +228,7 @@ pub fn cmd_verify(root: &Path, hex: &str) -> ExitCode {
     let mb = bytes as f64 / (1024.0 * 1024.0);
     println!("full-checkpoint verify walk over {}", sref.id());
     println!(
-        "  {} tensors, {parts} parts, {blobs} blobs, {} distinct objects",
+        "  {} tensors, {parts} parts, {assets} assets, {blobs} blobs, {} distinct objects",
         w.tensors,
         w.distinct().len()
     );
@@ -552,7 +562,7 @@ pub fn cmd_flip(root: &Path, hex: &str, f: &Flags) -> ExitCode {
     if let Some((_, c)) = h2.configs.first_mut() {
         c.sha256 = sha256::hex_digest(b"a different config object");
     }
-    let h2ref = h2.object_ref();
+    let h2ref = ok!(h2.object_ref());
     let m2 = ok!(reheader(&snap, &h2ref));
     row(
         "config object changed",
@@ -566,7 +576,7 @@ pub fn cmd_flip(root: &Path, hex: &str, f: &Flags) -> ExitCode {
     if let Some(e) = h3.encodings.first_mut() {
         e.sha256 = sha256::hex_digest(b"a different EncodingSpec object");
     }
-    let h3ref = h3.object_ref();
+    let h3ref = ok!(h3.object_ref());
     let m3 = ok!(reheader(&snap, &h3ref));
     row(
         "EncodingSpec object changed",
@@ -582,7 +592,7 @@ pub fn cmd_flip(root: &Path, hex: &str, f: &Flags) -> ExitCode {
             t.dtype = tensorfs_core::dtype::Dtype::F16;
         }
     }
-    let h4ref = h4.object_ref();
+    let h4ref = ok!(h4.object_ref());
     let m4 = ok!(reheader(&snap, &h4ref));
     row(
         "logical dtype changed",
@@ -657,7 +667,21 @@ pub fn cmd_arms(root: &Path, hex: &str) -> ExitCode {
 
     // (1) illegal trees cannot become an identity-bearing manifest at all.
     let mut d = Draft::of(&snap);
-    d.entries.swap(0, 1);
+    let model = d
+        .entries
+        .iter()
+        .position(|(path, _)| path == "model.cozytensors");
+    let sibling = d
+        .entries
+        .iter()
+        .position(|(path, _)| path == "text_encoder");
+    match (model, sibling) {
+        (Some(model), Some(sibling)) => d.entries.swap(model, sibling),
+        _ => {
+            eprintln!("REFUSED MISSING_FIELD: audit checkpoint lacks expected root files");
+            return ExitCode::FAILURE;
+        }
+    }
     arm("draft: entries out of ascending order", d, false);
 
     let mut d = Draft::of(&snap);
@@ -702,8 +726,48 @@ pub fn cmd_arms(root: &Path, hex: &str) -> ExitCode {
     }
     arm("walk: right digest, wrong length", d, true);
 
-    println!("  {red}/6 arms fired");
-    if red == 6 {
+    let orphan_asset = ObjectRef::of(b"uncommitted model asset");
+    let mut d = Draft::of(&snap);
+    d.entries.push((
+        tensorfs_core::manifest::asset_path(&orphan_asset.sha256),
+        Entry::File(orphan_asset),
+    ));
+    d.entries.sort_by(|a, b| a.0.cmp(&b.0));
+    arm("walk: orphan assets/<digest>.bin", d, true);
+
+    let mut conflicting = header.clone();
+    if let Some((_, original)) = conflicting.assets.first().cloned() {
+        let mut changed = original;
+        changed.logical_length += 1;
+        changed.segments[0].length += 1;
+        conflicting
+            .assets
+            .push(("tokenizer/vocab2.txt".to_string(), changed));
+        conflicting.assets.sort_by(|a, b| a.0.cmp(&b.0));
+        let closure = ok!(ck::load_closure(&store, &header));
+        match ck::build_snapshot(&conflicting, snap.header().unwrap(), &closure) {
+            Err(error) if error.code == Code::LENGTH_MISMATCH => {
+                red += 1;
+                println!(
+                    "  RED  {:<44} build refused {}",
+                    "asset: same digest, conflicting length",
+                    error.code.as_str()
+                );
+            }
+            Err(error) => println!(
+                "  ??   {:<44} wrong refusal {}",
+                "asset: same digest, conflicting length",
+                error.code.as_str()
+            ),
+            Ok(_) => println!(
+                "  ??   {:<44} build succeeded — arm did not fire",
+                "asset: same digest, conflicting length"
+            ),
+        }
+    }
+
+    println!("  {red}/8 arms fired");
+    if red == 8 {
         ExitCode::SUCCESS
     } else {
         ExitCode::FAILURE

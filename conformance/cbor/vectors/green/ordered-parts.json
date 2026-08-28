@@ -1,0 +1,23 @@
+{
+  "assets": [],
+  "components": [
+    [
+      "transformer",
+      [
+        [
+          "packed.weight",
+          "bf16",
+          [2],
+          0,
+          [
+            ["scale", "f32", [], {"inline_hex": "0000803f"}],
+            ["data", "f8_e4m3fn", [2], {"inline_hex": "0038"}]
+          ]
+        ]
+      ]
+    ]
+  ],
+  "configs": [],
+  "encodings": [["sha256:1111111111111111111111111111111111111111111111111111111111111111", 470]],
+  "format": "cozytensors/1"
+}

@@ -1,4 +1,4 @@
 doc: header
 expect: refuse
-code: KEY_GRAMMAR
+code: NON_ASCII_FIELD
 note: the empty key

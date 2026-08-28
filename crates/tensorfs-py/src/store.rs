@@ -205,6 +205,7 @@ fn parse_declaration(
     sources: &Bound<'_, PyDict>,
     targets: &Bound<'_, PyDict>,
     configs: &Bound<'_, PyDict>,
+    order: Vec<(String, String)>,
     max_new_bytes: u64,
 ) -> PyResult<Declaration> {
     let mut source_rows = Vec::with_capacity(sources.len());
@@ -344,6 +345,7 @@ fn parse_declaration(
         sources: source_rows,
         components,
         configs: config_rows,
+        order,
         max_new_bytes,
     };
     declaration.normalize_and_validate().or_refuse(py)?;
@@ -759,7 +761,7 @@ impl PyStore {
     // PyO3 exposes these as six named boundary fields. Packing them into an opaque dict
     // would only move the arity into hand parsing and weaken the typed facade.
     #[allow(clippy::too_many_arguments)]
-    #[pyo3(signature = (transaction_id, writer_session_id, sources, targets, configs, max_new_bytes))]
+    #[pyo3(signature = (transaction_id, writer_session_id, sources, targets, configs, order, max_new_bytes))]
     fn begin_derived(
         &self,
         py: Python<'_>,
@@ -768,9 +770,10 @@ impl PyStore {
         sources: &Bound<'_, PyDict>,
         targets: &Bound<'_, PyDict>,
         configs: &Bound<'_, PyDict>,
+        order: Vec<(String, String)>,
         max_new_bytes: u64,
     ) -> PyResult<PyDerivedWriter> {
-        let declaration = parse_declaration(py, sources, targets, configs, max_new_bytes)?;
+        let declaration = parse_declaration(py, sources, targets, configs, order, max_new_bytes)?;
         let begin = py
             .allow_threads(|| {
                 derived::begin(
@@ -1147,7 +1150,11 @@ impl PyStore {
             }
         };
         let h = checkpoint::load_header(&self.store, &hr).or_refuse(py)?;
-        Ok((m.clone(), m.canonical_bytes(), h.canonical_bytes()))
+        Ok((
+            m.clone(),
+            m.canonical_bytes(),
+            h.canonical_bytes().or_refuse(py)?,
+        ))
     }
 }
 
@@ -1232,16 +1239,6 @@ pub fn plan(
     let h = Header::parse(header).or_refuse(py)?;
     let scope = components.unwrap_or_else(|| h.components.iter().map(|(c, _)| c.clone()).collect());
     let p = read::plan_for_traversal(&h, &traversal, &scope, window).or_refuse(py)?;
-    Ok(PyPlan { plan: p })
-}
-
-/// The header's own key order. BENCHMARK-ONLY, and it says so: it exists so the
-/// destination-order contract can be measured rather than quoted.
-#[pyfunction]
-#[pyo3(signature = (header, window=1<<24))]
-pub fn plan_in_key_order(py: Python<'_>, header: &[u8], window: u64) -> PyResult<PyPlan> {
-    let h = Header::parse(header).or_refuse(py)?;
-    let p = read::plan_in_key_order(&h, window).or_refuse(py)?;
     Ok(PyPlan { plan: p })
 }
 

@@ -342,7 +342,7 @@ pub fn read_part_into(
     match part.locate(what, off, len)? {
         Located::Inline { off, len } => {
             let b = match &part.body {
-                Body::Inline(s) => crate::b64::decode(s)?,
+                Body::Inline(s) => s.clone(),
                 Body::Segments(_) => unreachable!("locate returned Inline for a segmented part"),
             };
             buf.copy_from_slice(&b[off as usize..(off + len) as usize]);
@@ -377,7 +377,7 @@ pub fn read_part_into(
 #[derive(Debug, Clone)]
 pub enum Source {
     Object(ObjectRange),
-    Inline(String),
+    Inline(Vec<u8>),
 }
 
 #[derive(Debug, Clone)]
@@ -394,24 +394,15 @@ impl PlanItem {
     }
 }
 
-/// Where the ORDER came from. It is a field because it is a contract: fill iterates in
-/// DESTINATION order, and reading in the header's key order is the v1 ~10x cold-load defect
-/// (disk-order = memory-order took a ~50 GB load from hundreds of seconds to ~10).
+/// The header's construction order, after exact equality with Runtime's traversal.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Order {
-    /// The caller's code-topology / module traversal. The only order fill may use.
     Destination,
-    /// The header's key order. BENCHMARK-ONLY — it exists so the lesson can be measured
-    /// rather than quoted, and `execute` names it in its output every time.
-    HeaderKey,
 }
 
 impl Order {
     pub fn as_str(self) -> &'static str {
-        match self {
-            Order::Destination => "destination (code-topology traversal)",
-            Order::HeaderKey => "header key order (BENCHMARK-ONLY)",
-        }
+        "construction"
     }
 }
 
@@ -471,65 +462,48 @@ impl ReadPlan {
     }
 }
 
-fn build(
-    header: &Header,
-    keys: &[(String, String)],
-    order: Order,
-    window: u64,
-) -> Result<ReadPlan> {
+fn build(header: &Header, scope: &[&str], window: u64) -> Result<ReadPlan> {
     let mut items = Vec::new();
     let mut dest: u64 = 0;
-    for (comp, key) in keys {
-        let t = header
-            .components
-            .iter()
-            .find(|(c, _)| c == comp)
-            .and_then(|(_, ts)| ts.iter().find(|(k, _)| k == key))
-            .map(|(_, t)| t);
-        let t = match t {
-            Some(t) => t,
-            None => {
-                return refuse(
-                    Code::TRAVERSAL_INCOMPLETE,
-                    format!(
-                        "{comp}/{key}: the traversal names a tensor this header does not carry"
-                    ),
-                )
-            }
-        };
-        for (role, part) in &t.parts {
-            let what = format!("{comp}/{key}#{role}");
-            if let Body::Inline(b) = &part.body {
-                let n = part.nbytes(&what)?;
-                items.push(PlanItem {
-                    what: what.clone(),
-                    dest_off: dest,
-                    len: n,
-                    source: Source::Inline(b.clone()),
-                });
-                dest += n;
-                continue;
-            }
-            for s in part.segments() {
-                let mut off = 0u64;
-                while off < s.length {
-                    let n = if window == 0 {
-                        s.length - off
-                    } else {
-                        window.min(s.length - off)
-                    };
+    for (comp, tensors) in &header.components {
+        if !scope.contains(&comp.as_str()) {
+            continue;
+        }
+        for (key, tensor) in tensors {
+            for (role, part) in &tensor.parts {
+                let what = format!("{comp}/{key}#{role}");
+                if let Body::Inline(b) = &part.body {
+                    let n = part.nbytes(&what)?;
                     items.push(PlanItem {
                         what: what.clone(),
                         dest_off: dest,
                         len: n,
-                        source: Source::Object(ObjectRange {
-                            obj: s.clone(),
-                            off,
-                            len: n,
-                        }),
+                        source: Source::Inline(b.clone()),
                     });
                     dest += n;
-                    off += n;
+                    continue;
+                }
+                for segment in part.segments() {
+                    let mut off = 0u64;
+                    while off < segment.length {
+                        let n = if window == 0 {
+                            segment.length - off
+                        } else {
+                            window.min(segment.length - off)
+                        };
+                        items.push(PlanItem {
+                            what: what.clone(),
+                            dest_off: dest,
+                            len: n,
+                            source: Source::Object(ObjectRange {
+                                obj: segment.clone(),
+                                off,
+                                len: n,
+                            }),
+                        });
+                        dest += n;
+                        off += n;
+                    }
                 }
             }
         }
@@ -541,7 +515,7 @@ fn build(
         bytes,
         io_bytes,
         inline_parts,
-        order,
+        order: Order::Destination,
     })
 }
 
@@ -552,8 +526,8 @@ fn tally(items: &[PlanItem]) -> (u64, u64, usize) {
     (bytes, io_bytes, inline)
 }
 
-/// The read planner. Order comes from the CALLER's code-topology traversal — never from the
-/// header.
+/// The read planner. Runtime's traversal must exactly equal the stored construction order;
+/// after that equality gate, planning walks the header once and never performs key lookup.
 ///
 /// COMPLETENESS SCOPES TO THE REQUESTED COMPONENT SET (#570b). `requested` is the caller's
 /// explicit declaration of which components this plan is for; the traversal must name every
@@ -580,14 +554,21 @@ pub fn plan_for_traversal(
     window: u64,
 ) -> Result<ReadPlan> {
     let mut scope: Vec<&str> = requested.iter().map(|c| c.as_str()).collect();
-    scope.sort();
-    scope.dedup();
     if scope.is_empty() {
         return refuse(
             Code::TRAVERSAL_INCOMPLETE,
             "the plan declares no requested component: completeness is scoped to a declared \
              set, and an empty one names nothing to be complete about"
                 .to_string(),
+        );
+    }
+    let before = scope.len();
+    scope.sort();
+    scope.dedup();
+    if scope.len() != before {
+        return refuse(
+            Code::TRAVERSAL_INCOMPLETE,
+            "requested components repeat; scope is an exact set",
         );
     }
     for comp in &scope {
@@ -603,59 +584,34 @@ pub fn plan_for_traversal(
         }
     }
 
-    let mut named: Vec<(&str, &str)> = traversal
+    let named: Vec<(&str, &str)> = traversal
         .iter()
         .map(|(c, k)| (c.as_str(), k.as_str()))
         .collect();
-    named.sort();
-    named.dedup();
-
-    // NO SMUGGLING: every named tensor belongs to a requested component.
-    if let Some((c, k)) = named.iter().find(|(c, _)| !scope.contains(c)) {
-        return refuse(
-            Code::TRAVERSAL_INCOMPLETE,
-            format!(
-                "the traversal names {c}/{k}, whose component is not in the requested set \
-                 {scope:?}: a plan reads the components it declared and no others"
-            ),
-        );
-    }
-
-    // NO HOLES, per requested component.
-    let mut have: Vec<(&str, &str)> = header
+    let have: Vec<(&str, &str)> = header
         .tensors()
         .filter(|(c, _, _)| scope.contains(&c.as_str()))
         .map(|(c, k, _)| (c.as_str(), k.as_str()))
         .collect();
-    have.sort();
     if named != have {
-        let missing: Vec<String> = have
+        let at = named
             .iter()
-            .filter(|x| !named.contains(x))
-            .take(3)
-            .map(|(c, k)| format!("{c}/{k}"))
-            .collect();
+            .zip(have.iter())
+            .position(|(got, want)| got != want)
+            .unwrap_or(named.len().min(have.len()));
+        let got = named.get(at).map(|(c, k)| format!("{c}/{k}"));
+        let want = have.get(at).map(|(c, k)| format!("{c}/{k}"));
         return refuse(
-            Code::TRAVERSAL_INCOMPLETE,
+            Code::TRAVERSAL_ORDER_MISMATCH,
             format!(
-                "the traversal names {} distinct tensors, the requested components \
-                 {scope:?} carry {} — first missing: {missing:?}",
+                "construction order differs at row {at}: caller {got:?}, header {want:?}; \
+                 caller has {} rows and requested components {scope:?} carry {}",
                 named.len(),
                 have.len()
             ),
         );
     }
-    build(header, traversal, Order::Destination, window)
-}
-
-/// The header's own key order. BENCHMARK-ONLY: it is what the destination-order contract
-/// exists to beat, and it is here so the margin can be measured on real bytes.
-pub fn plan_in_key_order(header: &Header, window: u64) -> Result<ReadPlan> {
-    let keys: Vec<(String, String)> = header
-        .tensors()
-        .map(|(c, k, _)| (c.clone(), k.clone()))
-        .collect();
-    build(header, &keys, Order::HeaderKey, window)
+    build(header, &scope, window)
 }
 
 // ---------------------------------------------------------------- the reader pool
@@ -731,22 +687,18 @@ pub fn execute(
                 let it = &plan.items[i];
                 let r = match &it.source {
                     Source::Object(r) => read_into(lease, r, buf),
-                    // Inline bytes come out of the header the caller already holds: decoded
-                    // into their exact destination span, in order, with no device touched.
-                    Source::Inline(b) => crate::b64::decode(b).and_then(|v| {
+                    // Inline bytes ride the header and land directly in their destination.
+                    Source::Inline(v) => {
                         if v.len() != buf.len() {
-                            return refuse(
+                            refuse(
                                 Code::BYTE_LENGTH_MISMATCH,
-                                format!(
-                                    "inline decodes to {} B for a {} B span",
-                                    v.len(),
-                                    buf.len()
-                                ),
-                            );
+                                format!("inline carries {} B for a {} B span", v.len(), buf.len()),
+                            )
+                        } else {
+                            buf.copy_from_slice(v);
+                            Ok(())
                         }
-                        buf.copy_from_slice(&v);
-                        Ok(())
-                    }),
+                    }
                 };
                 if let Err(e) = r {
                     errs.lock().unwrap().push(Refusal {

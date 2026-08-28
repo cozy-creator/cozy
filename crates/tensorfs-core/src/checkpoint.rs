@@ -8,7 +8,6 @@
 
 use std::io::{Read, Write};
 
-use crate::b64;
 use crate::dtype::{checked_bytes, Dtype};
 use crate::err::{refuse, Code, Refusal, Result};
 use crate::header::{Body, Closure, Header, Located, Part};
@@ -90,7 +89,7 @@ pub fn objectize<R: Read>(
             part: Part {
                 dtype,
                 shape,
-                body: Body::Inline(b64::encode(&buf)),
+                body: Body::Inline(buf),
             },
             whole: sha256::hex(&h.finish()),
             bytes: want,
@@ -145,9 +144,8 @@ pub fn materialize<W: Write>(store: &Store, what: &str, part: &Part, w: &mut W) 
     let mut h = Sha256::new();
     match &part.body {
         Body::Inline(s) => {
-            let b = b64::decode(s)?;
-            h.update(&b);
-            w.write_all(&b).map_err(|e| io("write inline", e))?;
+            h.update(s);
+            w.write_all(s).map_err(|e| io("write inline", e))?;
         }
         Body::Segments(segs) => {
             for (i, s) in segs.iter().enumerate() {
@@ -173,7 +171,7 @@ pub fn read_span(store: &Store, what: &str, part: &Part, off: u64, len: u64) -> 
     match part.locate(what, off, len)? {
         Located::Inline { off, len } => {
             let b = match &part.body {
-                Body::Inline(s) => b64::decode(s)?,
+                Body::Inline(s) => s.clone(),
                 Body::Segments(_) => unreachable!(),
             };
             Ok(b[off as usize..(off + len) as usize].to_vec())
@@ -220,22 +218,22 @@ pub fn read_object(store: &Store, r: &ObjectRef, max: usize) -> Result<Vec<u8>> 
 
 /// Documents admit as their EXACT canonical bytes: `put_expected` proves the id the writer
 /// advertises is the id the store installed.
-pub fn put_doc<D: Doc>(store: &Store, d: &D) -> Result<ObjectRef> {
-    let bytes = d.canonical_bytes();
+pub fn put_doc<D: crate::ids::StoredDoc>(store: &Store, d: &D) -> Result<ObjectRef> {
+    let bytes = <D as crate::ids::StoredDoc>::canonical_bytes(d)?;
     // A document that cannot be read back must not be written. `Doc::parse` enforces
     // `MAX_BYTES` and this side did not, so an over-cap document stored happily and then
     // refused SIZE_CAP on the way back in — a write/read asymmetry that turns a bounds
     // decision into a corrupt-looking store. Observed live: the ingest subject's candidate
     // set at 2,601 objects.
-    if bytes.len() > D::MAX_BYTES {
+    if bytes.len() > <D as crate::ids::StoredDoc>::MAX_BYTES {
         return refuse(
             Code::SIZE_CAP,
             format!(
                 "{}: {} canonical bytes over the {} B document cap — refused at WRITE, \
                  because this store would never be able to read it back",
-                D::FORMAT,
+                <D as crate::ids::StoredDoc>::FORMAT,
                 bytes.len(),
-                D::MAX_BYTES
+                <D as crate::ids::StoredDoc>::MAX_BYTES
             ),
         );
     }
@@ -286,7 +284,10 @@ pub fn read_blob<W: Write>(store: &Store, what: &str, b: &BlobDescriptor, w: &mu
                 ),
             );
         }
-        total += n;
+        total = total.checked_add(n).ok_or_else(|| Refusal {
+            code: Code::ARITH_OVERFLOW,
+            detail: format!("{what}: blob length overflows"),
+        })?;
     }
     let got = sha256::hex(&h.finish());
     if total != b.logical_size {
@@ -301,6 +302,45 @@ pub fn read_blob<W: Write>(store: &Store, what: &str, b: &BlobDescriptor, w: &mu
             format!(
                 "{what}: segments reassemble to sha256:{got}, the descriptor claims sha256:{}",
                 b.whole_sha256
+            ),
+        );
+    }
+    Ok(())
+}
+
+/// Stream one model-runtime asset in declared segment order and verify its logical whole.
+pub fn read_asset<W: Write>(
+    store: &Store,
+    name: &str,
+    asset: &crate::header::Asset,
+    w: &mut W,
+) -> Result<()> {
+    let mut hash = Sha256::new();
+    let mut total = 0u64;
+    for (index, segment) in asset.segments.iter().enumerate() {
+        let mut tee = TeeW { w, h: &mut hash };
+        let read = store.read_into(&segment.sha256, &mut tee)?;
+        if read != segment.length {
+            return refuse(
+                Code::LENGTH_MISMATCH,
+                format!(
+                    "asset {name:?} segment {index} delivered {read} B, promised {} B",
+                    segment.length
+                ),
+            );
+        }
+        total = total.checked_add(read).ok_or_else(|| Refusal {
+            code: Code::ARITH_OVERFLOW,
+            detail: format!("asset {name:?}: logical length overflows"),
+        })?;
+    }
+    let got = sha256::hex(&hash.finish());
+    if total != asset.logical_length || got != asset.logical_sha256 {
+        return refuse(
+            Code::WHOLE_DIGEST_MISMATCH,
+            format!(
+                "asset {name:?}: reassembled {total} B sha256:{got}, header claims {} B sha256:{}",
+                asset.logical_length, asset.logical_sha256
             ),
         );
     }
@@ -344,6 +384,44 @@ pub fn build_snapshot(
             crate::manifest::Entry::Dir,
         ));
         entries.extend(contained);
+    }
+    let mut assets = Vec::new();
+    for (_, asset) in &header.assets {
+        for segment in &asset.segments {
+            assets.push((
+                crate::manifest::asset_path(&segment.sha256),
+                crate::manifest::Entry::File(segment.clone()),
+            ));
+        }
+    }
+    assets.sort_by(|a, b| a.0.cmp(&b.0));
+    if let Some(pair) = assets
+        .windows(2)
+        .find(|pair| pair[0].0 == pair[1].0 && pair[0].1 != pair[1].1)
+    {
+        let (left, right) = match (&pair[0].1, &pair[1].1) {
+            (crate::manifest::Entry::File(left), crate::manifest::Entry::File(right)) => {
+                (left, right)
+            }
+            _ => unreachable!("asset closure contains only files"),
+        };
+        return refuse(
+            Code::LENGTH_MISMATCH,
+            format!(
+                "asset object {} is declared at conflicting lengths {} and {}",
+                left.id(),
+                left.length,
+                right.length
+            ),
+        );
+    }
+    assets.dedup_by(|a, b| a == b);
+    if !assets.is_empty() {
+        entries.push((
+            crate::manifest::ASSET_DIR.to_string(),
+            crate::manifest::Entry::Dir,
+        ));
+        entries.extend(assets);
     }
     for (name, c) in &header.configs {
         entries.push((name.clone(), crate::manifest::Entry::Dir));
@@ -502,6 +580,26 @@ pub fn walk(store: &Store, snap: &SnapshotManifest) -> Result<Walk> {
         closure.insert(spec);
     }
 
+    for (_, asset) in &header.assets {
+        for segment in &asset.segments {
+            let want = crate::manifest::asset_path(&segment.sha256);
+            let paths = snap.listings(segment);
+            if paths != [want.as_str()] {
+                return refuse(
+                    Code::NOT_CONTAINED,
+                    format!(
+                        "model asset segment {} resolves to {paths:?}, not exactly one {want:?}",
+                        segment.id()
+                    ),
+                );
+            }
+            w.objects.push(Reached {
+                kind: "model_asset",
+                obj: segment.clone(),
+            });
+        }
+    }
+
     header.validate(&closure)?;
     for (comp, key, t) in header.tensors() {
         w.tensors += 1;
@@ -535,10 +633,13 @@ pub fn walk(store: &Store, snap: &SnapshotManifest) -> Result<Walk> {
         .map(|r| (r.obj.sha256.clone(), r.obj.length))
         .collect();
     for (path, e) in snap.entries() {
-        let contained_ns = path
-            .strip_prefix(crate::manifest::CLOSURE_DIR)
-            .and_then(|r| r.strip_prefix('/'))
-            .is_some();
+        let contained_ns = [crate::manifest::CLOSURE_DIR, crate::manifest::ASSET_DIR]
+            .iter()
+            .any(|dir| {
+                path.strip_prefix(dir)
+                    .and_then(|r| r.strip_prefix('/'))
+                    .is_some()
+            });
         match e {
             crate::manifest::Entry::Dir => {}
             crate::manifest::Entry::File(o) => {

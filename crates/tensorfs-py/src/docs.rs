@@ -41,6 +41,90 @@ pub fn marshal<'p>(py: Python<'p>, v: &Value) -> PyResult<Bound<'p, PyAny>> {
     })
 }
 
+/// Header -> ergonomic lookup dictionaries. Stored order survives insertion order, while
+/// CBOR bytes and integer dtype/index codes stay private to TensorFS.
+fn marshal_header<'p>(py: Python<'p>, header: &Header) -> PyResult<Bound<'p, PyAny>> {
+    let root = PyDict::new(py);
+    root.set_item("format", Header::FORMAT)?;
+
+    let configs = PyDict::new(py);
+    for (name, config) in &header.configs {
+        let row = PyDict::new(py);
+        row.set_item("sha256", &config.sha256)?;
+        row.set_item("length", config.length)?;
+        row.set_item("media_type", &config.media_type)?;
+        configs.set_item(name, row)?;
+    }
+    root.set_item("configs", configs)?;
+
+    let assets = PyDict::new(py);
+    for (name, asset) in &header.assets {
+        let row = PyDict::new(py);
+        row.set_item("logical_sha256", &asset.logical_sha256)?;
+        row.set_item("logical_length", asset.logical_length)?;
+        row.set_item("media_type", &asset.media_type)?;
+        let segments = PyList::empty(py);
+        for segment in &asset.segments {
+            let item = PyDict::new(py);
+            item.set_item("sha256", &segment.sha256)?;
+            item.set_item("length", segment.length)?;
+            segments.append(item)?;
+        }
+        row.set_item("segments", segments)?;
+        assets.set_item(name, row)?;
+    }
+    root.set_item("assets", assets)?;
+
+    let encodings = PyList::empty(py);
+    for encoding in &header.encodings {
+        let row = PyDict::new(py);
+        row.set_item("sha256", &encoding.sha256)?;
+        row.set_item("length", encoding.length)?;
+        encodings.append(row)?;
+    }
+    root.set_item("encodings", encodings)?;
+
+    let components = PyDict::new(py);
+    for (component, tensors) in &header.components {
+        let table = PyDict::new(py);
+        for (key, tensor) in tensors {
+            let row = PyDict::new(py);
+            let logical = PyDict::new(py);
+            logical.set_item("dtype", tensor.dtype.name())?;
+            logical.set_item("shape", &tensor.shape)?;
+            row.set_item("logical", logical)?;
+            row.set_item("encoding", &tensor.encoding)?;
+            let parts = PyDict::new(py);
+            for (role, part) in &tensor.parts {
+                let item = PyDict::new(py);
+                item.set_item("dtype", part.dtype.name())?;
+                item.set_item("shape", &part.shape)?;
+                match &part.body {
+                    tensorfs_core::header::Body::Inline(bytes) => {
+                        item.set_item("inline", PyBytes::new(py, bytes))?;
+                    }
+                    tensorfs_core::header::Body::Segments(values) => {
+                        let segments = PyList::empty(py);
+                        for segment in values {
+                            let value = PyDict::new(py);
+                            value.set_item("sha256", &segment.sha256)?;
+                            value.set_item("length", segment.length)?;
+                            segments.append(value)?;
+                        }
+                        item.set_item("segments", segments)?;
+                    }
+                }
+                parts.set_item(role, item)?;
+            }
+            row.set_item("parts", parts)?;
+            table.set_item(key, row)?;
+        }
+        components.set_item(component, table)?;
+    }
+    root.set_item("components", components)?;
+    Ok(root.into_any())
+}
+
 /// The encoding closure a header validates against: spec objects by digest.
 #[pyclass(name = "Closure")]
 pub struct PyClosure {
@@ -92,7 +176,7 @@ pub fn parse_header<'p>(
     if let Some(c) = closure {
         h.validate(&c.inner).or_refuse(py)?;
     }
-    marshal(py, &h.to_value())
+    marshal_header(py, &h)
 }
 
 /// The frozen topology projection of a header — logical dtype included, encodings not.
@@ -200,7 +284,10 @@ pub fn render(py: Python<'_>, data: &[u8], max_bytes: usize) -> PyResult<String>
 #[pyfunction]
 pub fn recanonicalize<'p>(py: Python<'p>, doc: &str, data: &[u8]) -> PyResult<Bound<'p, PyBytes>> {
     let out = match doc {
-        "header" => Header::parse(data).or_refuse(py)?.canonical_bytes(),
+        "header" => Header::parse(data)
+            .or_refuse(py)?
+            .canonical_bytes()
+            .or_refuse(py)?,
         "manifest" => SnapshotManifest::parse(data)
             .or_refuse(py)?
             .canonical_bytes(),

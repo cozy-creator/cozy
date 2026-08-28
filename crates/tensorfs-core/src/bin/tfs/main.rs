@@ -6,6 +6,7 @@
 //!   tfs bench [tensors] [reps]   canonical-writer throughput + peak RSS
 //!   tfs flip                     identity-flip matrix over live documents
 //!   tfs id <file>                object id (+ derived ids) of a stored document
+//!   tfs cbor encode|decode|check <file>  header conformance seam; JSON is diagnostic only
 //!
 //! The object store (tfs-002). Flags: --expect <hex> --expect-length <n> --out <path>
 //! --range <off>:<len> --rate <f> --pass <n> --max-age <s> --slow-ms <n>
@@ -51,7 +52,8 @@
 //! The ingest border (tfs-003) — the ONE normal tensor-ingest door. A `--source` names its
 //! component; a filename never authorizes anything. Flags: --source <c>=<path> (repeated)
 //! --config <c>=<path> --registry <path> --spec-variant <n> --session <s> --tenant <t>
-//! --ttl <s> --rekey <c>=<from>:<to> --rlimit-as-mb/-cpu-s/-fsize-mb --no-netns --now
+//! --ttl <s> --rekey <c>=<from>:<to> --order <construction.json>
+//! --rlimit-as-mb/-cpu-s/-fsize-mb --no-netns --now
 //!
 //!   tfs ingest inspect [--markers]           hermetic bounded decode + classification
 //!                                            --markers also decodes the `.comfy_quant`
@@ -74,10 +76,10 @@
 //!   tfs gguf admit <file>                    the same, then the admission verdict (refuses)
 //!
 //! Reads and projection (tfs-005). Flags: --workers <n> --window <b> --ring <b>
-//! --order module|key --hold-secs <s> --drop-unreleased --no-symlink
+//! --hold-secs <s> --drop-unreleased --no-symlink
 //!
 //!   tfs read lease <root> <snap>             acquire/verify/release one ReadLease
-//!   tfs read plan <root> <snap>              destination order vs header key order
+//!   tfs read plan <root> <snap>              stored construction order + drift refusal
 //!   tfs read fill <root> <snap>              the pooled fill into a caller-owned ring
 //!   tfs read verify-fill <root> <snap>       the same bytes through the sequential path
 //!   tfs read span <root> <snap> <c> <k> <role> <off> <len>
@@ -96,12 +98,12 @@
 //!
 //!   tfs compat import <rows.json>            measured rows -> canonical header + contract
 //!   tfs compat topology <root> <hex>         a header's own topology as a code contract
-//!   tfs compat check <code.json> <header.json>   Satisfied | Mismatch(details) + the facts
+//!   tfs compat check <code.json> <header.cbor>   Satisfied | Mismatch(details) + the facts
 //!   tfs compat release-cut <report.json>     unclassified extras never cut a release
 //!   tfs grade <report.json>                  COMPATIBLE|CONVERTIBLE|PRODUCIBLE|INCOMPATIBLE
 //!   tfs grade register <name> <kind> <spec>  the registration ACT: runs A->B->A
 //!   tfs grade decision <file>                read one grade decision, or refuse
-//!   tfs verify-request <code.json> <header.json>   build the bounded request document
+//!   tfs verify-request <code.json> <header.cbor>   build the bounded request document
 //!   tfs verify-compat <request> <response>   the hermetic verifier: one file in, one out
 //!   tfs verify-consume <request> <response>  the hub's side; partial output mints nothing
 //!
@@ -141,12 +143,12 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::time::Instant;
 
-use tensorfs_core::canon::{self, Value};
+use tensorfs_core::canon;
 use tensorfs_core::compat::{self, Accepts, CodeTopology, CompatibilityReport, Lane, Requirement};
 use tensorfs_core::dtype::Dtype;
-use tensorfs_core::err::Refusal;
+use tensorfs_core::err::{refuse, Code, Refusal};
 use tensorfs_core::grade::{self, ConversionRegistration, Mapping};
-use tensorfs_core::header::{Body, Closure, Header, Part, Tensor};
+use tensorfs_core::header::{Asset, Body, Closure, Header, Part, Tensor};
 use tensorfs_core::ids::{ConfigRef, Doc, ObjectRef};
 use tensorfs_core::ingest::stamp::Stamp;
 use tensorfs_core::ingest::{Evidence, IngestProfile, IngestSubject, IngestVerificationReceipt};
@@ -154,6 +156,8 @@ use tensorfs_core::manifest::{BlobDescriptor, Draft, Entry, SnapshotManifest};
 use tensorfs_core::registry;
 use tensorfs_core::spec::EncodingSpec;
 use tensorfs_core::store::{Fault, Store, Verdict, FAULT_STAGES};
+
+type TfsResult<T> = tensorfs_core::err::Result<T>;
 
 /// ONE spelling in both directions, on the POSITIONAL surface. Every id this tool prints is
 /// `sha256:<hex>`, and a positional digest used to be bare hex only, so an id copied out of
@@ -314,6 +318,10 @@ fn main() -> ExitCode {
         ["bench", n] => cmd_bench(n.parse().unwrap_or(2000), 20),
         ["bench", n, r] => cmd_bench(n.parse().unwrap_or(2000), r.parse().unwrap_or(20)),
         ["flip"] => cmd_flip(),
+        ["cbor", "encode", f] => cmd_cbor("encode", Path::new(f), &flags),
+        ["cbor", "decode", f] => cmd_cbor("decode", Path::new(f), &flags),
+        ["cbor", "check", f] => cmd_cbor("check", Path::new(f), &flags),
+        ["cbor", "plant", f, kind] => cmd_cbor_plant(Path::new(f), kind, &flags),
         ["id", f] => cmd_id(Path::new(f)),
         _ => {
             eprintln!("usage: see the header of {}", file!());
@@ -787,6 +795,15 @@ fn header_a(config: Option<ConfigRef>) -> (Header, Closure) {
         configs: config
             .map(|c| vec![("transformer".to_string(), c)])
             .unwrap_or_default(),
+        assets: vec![(
+            "tokenizer/vocab.txt".to_string(),
+            Asset {
+                logical_sha256: tensorfs_core::sha256::hex_digest(b"one\ntwo\n"),
+                logical_length: 8,
+                media_type: "text/plain".to_string(),
+                segments: vec![ObjectRef::of(b"one\ntwo\n")],
+            },
+        )],
         encodings: encodings_of(&[&plain, &fp8]),
         components: vec![(
             "transformer".to_string(),
@@ -825,6 +842,7 @@ fn header_nvfp4() -> (Header, EncodingSpec) {
     let spec = seed_spec("nvfp4-w4a4/1", 0);
     let h = Header {
         configs: vec![],
+        assets: vec![],
         encodings: encodings_of(&[&spec]),
         components: vec![(
             "transformer".to_string(),
@@ -849,19 +867,24 @@ fn header_nvfp4() -> (Header, EncodingSpec) {
     (h, spec)
 }
 
-fn manifest_checkpoint(header: &Header, extra_file: bool) -> SnapshotManifest {
+fn manifest_checkpoint(header: &Header, extra_file: bool) -> TfsResult<SnapshotManifest> {
     let blob = BlobDescriptor::of(&pattern(4096));
     let mut entries = vec![
         // The attachment is TYPED; this is the one path the same object is projected to.
         (
             "model.cozytensors".to_string(),
-            Entry::File(header.object_ref()),
+            Entry::File(header.object_ref()?),
         ),
         ("tokenizer.model".to_string(), Entry::Blob(blob)),
         ("transformer".to_string(), Entry::Dir),
         (
             "transformer/config.json".to_string(),
             Entry::File(ObjectRef::of(br#"{"hidden_size":1536}"#)),
+        ),
+        (tensorfs_core::manifest::ASSET_DIR.to_string(), Entry::Dir),
+        (
+            tensorfs_core::manifest::asset_path(&tensorfs_core::sha256::hex_digest(b"one\ntwo\n")),
+            Entry::File(ObjectRef::of(b"one\ntwo\n")),
         ),
     ];
     if extra_file {
@@ -870,12 +893,12 @@ fn manifest_checkpoint(header: &Header, extra_file: bool) -> SnapshotManifest {
             Entry::File(ObjectRef::of(br#"{"steps":30}"#)),
         ));
     }
+    entries.sort_by(|a, b| a.0.cmp(&b.0));
     Draft {
-        header: Some(header.object_ref()),
+        header: Some(header.object_ref()?),
         entries,
     }
     .seal()
-    .expect("the corpus's positive manifest is a legal tree by construction")
 }
 
 fn profile_normal(allowed: Vec<ObjectRef>, dialect: &str) -> IngestProfile {
@@ -891,14 +914,14 @@ fn profile_normal(allowed: Vec<ObjectRef>, dialect: &str) -> IngestProfile {
     }
 }
 
-fn subject(profile: &IngestProfile, header: &Header, tenant: &str) -> IngestSubject {
-    IngestSubject {
+fn subject(profile: &IngestProfile, header: &Header, tenant: &str) -> TfsResult<IngestSubject> {
+    Ok(IngestSubject {
         profile: profile.object_ref(),
         tenant: tenant.to_string(),
         sources: vec![(tensorfs_core::ids::object_id(b"hf://acme/model@rev1"), 1)],
-        proposed_header: header.object_ref(),
+        proposed_header: header.object_ref()?,
         candidates: vec![ObjectRef::of(b"candidate")],
-    }
+    })
 }
 
 /// The corpus twin of what `ingest::stamp::stamp` mints. The vector exists so the LEDGER's
@@ -908,11 +931,11 @@ fn stamp_doc(
     sub: &IngestSubject,
     snap: &SnapshotManifest,
     header: &Header,
-) -> Stamp {
-    Stamp {
+) -> TfsResult<Stamp> {
+    Ok(Stamp {
         subject: sub.object_ref(),
         profile: prof.object_ref(),
-        header: header.object_ref(),
+        header: header.object_ref()?,
         snapshot: snap.object_ref(),
         topology_digest: header.topology_digest(),
         converter_build: prof.converter_build.clone(),
@@ -927,7 +950,7 @@ fn stamp_doc(
             ("bytes_written".to_string(), 1 << 20),
             ("tensors".to_string(), 2),
         ],
-    }
+    })
 }
 
 /// The layout plane's three frozen documents, all derived from the corpus header so the
@@ -937,7 +960,7 @@ fn stamp_doc(
 fn layout_plane_docs(
     h: &Header,
     closure: &Closure,
-) -> (CodeTopology, CompatibilityReport, ConversionRegistration) {
+) -> TfsResult<(CodeTopology, CompatibilityReport, ConversionRegistration)> {
     let code = CodeTopology {
         contract: tensorfs_core::ids::object_id(b"ModelConstructionContract:corpus"),
         components: h
@@ -963,9 +986,8 @@ fn layout_plane_docs(
             .collect(),
     };
     let pin: Vec<String> = h.encodings.iter().map(|e| e.id()).collect();
-    let out = compat::check_compatibility(&code, h, closure, &pin, Lane::Canonical, &[])
-        .expect("the corpus header is a legal checkpoint by construction");
-    let report = CompatibilityReport::of(&code, h, Lane::Canonical, &out);
+    let out = compat::check_compatibility(&code, h, closure, &pin, Lane::Canonical, &[])?;
+    let report = CompatibilityReport::of(&code, h, Lane::Canonical, &out)?;
     let reg = ConversionRegistration::register(
         "bf16-to-f32",
         Mapping::Widen {
@@ -973,9 +995,8 @@ fn layout_plane_docs(
             to: Dtype::F32,
         },
         &grade::complete_domain_16(),
-    )
-    .expect("bf16 -> f32 -> bf16 is the identity on every bit pattern");
-    (code, report, reg)
+    )?;
+    Ok((code, report, reg))
 }
 
 fn receipt(
@@ -984,11 +1005,11 @@ fn receipt(
     header: &Header,
     stamp: &Stamp,
     signer: &str,
-) -> IngestVerificationReceipt {
-    IngestVerificationReceipt {
+) -> TfsResult<IngestVerificationReceipt> {
+    Ok(IngestVerificationReceipt {
         subject: sub.object_ref(),
         snapshot: snap.object_ref(),
-        header: header.object_ref(),
+        header: header.object_ref()?,
         stamp: stamp.object_ref(),
         evidence: Evidence::ApprovedProducer {
             implementation: tensorfs_core::ids::object_id(b"converter-impl"),
@@ -1000,7 +1021,7 @@ fn receipt(
             ("source_bytes".to_string(), 1 << 20),
             ("tensors".to_string(), 2),
         ],
-    }
+    })
 }
 
 // ------------------------------------------------------------------ vector files
@@ -1052,44 +1073,22 @@ fn sub(bytes: &[u8], from: &str, to: &str) -> Vec<u8> {
     hay.replacen(from, to, 1).into_bytes()
 }
 
-/// A deliberately non-canonical twin: same content, reversed object key order.
-fn reversed(v: &Value) -> Vec<u8> {
-    fn emit(v: &Value, out: &mut Vec<u8>) {
-        match v {
-            Value::Obj(m) => {
-                out.push(b'{');
-                for (i, (k, x)) in m.iter().rev().enumerate() {
-                    if i > 0 {
-                        out.push(b',');
-                    }
-                    out.extend_from_slice(&canon::write(&Value::Str(k.clone())));
-                    out.push(b':');
-                    emit(x, out);
-                }
-                out.push(b'}');
-            }
-            Value::Arr(a) => {
-                out.push(b'[');
-                for (i, x) in a.iter().enumerate() {
-                    if i > 0 {
-                        out.push(b',');
-                    }
-                    emit(x, out);
-                }
-                out.push(b']');
-            }
-            other => out.extend_from_slice(&canon::write(other)),
-        }
-    }
-    let mut out = Vec::new();
-    emit(v, &mut out);
+fn binary_sub(bytes: &[u8], from: &[u8], to: &[u8]) -> Vec<u8> {
+    let at = bytes
+        .windows(from.len())
+        .position(|window| window == from)
+        .unwrap_or_else(|| panic!("binary surgery anchor {from:?} absent"));
+    let mut out = Vec::with_capacity(bytes.len() + to.len() - from.len());
+    out.extend_from_slice(&bytes[..at]);
+    out.extend_from_slice(to);
+    out.extend_from_slice(&bytes[at + from.len()..]);
     out
 }
 
-fn build_corpus() -> (Vec<Case>, Vec<EncodingSpec>) {
+fn build_corpus() -> TfsResult<(Vec<Case>, Vec<EncodingSpec>)> {
     let mut cases: Vec<Case> = Vec::new();
     let (ha, closure) = header_a(Some(config_ref()));
-    let ha_bytes = ha.canonical_bytes();
+    let ha_bytes = ha.conformance_bytes()?;
     let (hn, _) = header_nvfp4();
     let plain = seed_spec("plain/1", 0);
     let fp8 = seed_spec("fp8-rowwise/1", 0);
@@ -1120,7 +1119,7 @@ fn build_corpus() -> (Vec<Case>, Vec<EncodingSpec>) {
         "header",
         "nvfp4-base",
         "header",
-        hn.canonical_bytes(),
+        hn.conformance_bytes()?,
         "nvfp4 W4A4 base variant, rank-0 scalar role",
     ));
     let (ha2, _) = header_a(None);
@@ -1128,8 +1127,17 @@ fn build_corpus() -> (Vec<Case>, Vec<EncodingSpec>) {
         "header",
         "plain-fp8-noconfig",
         "header",
-        ha2.canonical_bytes(),
+        ha2.conformance_bytes()?,
         "same tensors, no configs: same topology, different header id",
+    ));
+    let mut reordered = ha.clone();
+    reordered.components[0].1.reverse();
+    cases.push(ok_case(
+        "header",
+        "plain-fp8-reordered",
+        "header",
+        reordered.conformance_bytes()?,
+        "same topology and objects, opposite identity-bearing tensor order",
     ));
     cases.push(ok_case(
         "spec",
@@ -1160,8 +1168,8 @@ fn build_corpus() -> (Vec<Case>, Vec<EncodingSpec>) {
         "raw bit patterns: signed zero, NaN payload, infinity, rank-0",
     ));
 
-    let snap = manifest_checkpoint(&ha, false);
-    let snap2 = manifest_checkpoint(&ha, true);
+    let snap = manifest_checkpoint(&ha, false)?;
+    let snap2 = manifest_checkpoint(&ha, true)?;
     cases.push(ok_case(
         "manifest",
         "checkpoint",
@@ -1181,9 +1189,9 @@ fn build_corpus() -> (Vec<Case>, Vec<EncodingSpec>) {
         vec![plain.object_ref(), fp8.object_ref()],
         "safetensors.diffusers",
     );
-    let sub_doc = subject(&prof, &ha, "acme");
-    let stmp = stamp_doc(&prof, &sub_doc, &snap, &ha);
-    let rcpt = receipt(&sub_doc, &snap, &ha, &stmp, "platform-key-1");
+    let sub_doc = subject(&prof, &ha, "acme")?;
+    let stmp = stamp_doc(&prof, &sub_doc, &snap, &ha)?;
+    let rcpt = receipt(&sub_doc, &snap, &ha, &stmp, "platform-key-1")?;
     cases.push(ok_case(
         "ingest",
         "profile-normal",
@@ -1214,7 +1222,7 @@ fn build_corpus() -> (Vec<Case>, Vec<EncodingSpec>) {
     ));
 
     // --- the layout plane (tfs-009): code topology, report, registration
-    let (code, report, _reg) = layout_plane_docs(&ha, &closure);
+    let (code, report, _reg) = layout_plane_docs(&ha, &closure)?;
     cases.push(ok_case(
         "layout",
         "code-topology",
@@ -1253,113 +1261,77 @@ fn build_corpus() -> (Vec<Case>, Vec<EncodingSpec>) {
         "MISSING_FIELD",
         "an empty accepts list admits nothing and says nothing",
     ));
-    // --- canonical-byte semantic twins (all red)
+    // --- restricted deterministic CBOR representations (all red)
     let g = "canonical";
     cases.push(red_case(
         g,
-        "whitespace",
+        "old-json-header",
         "header",
-        sub(&ha_bytes, "{\"components\"", "{ \"components\""),
+        canon::write(&ha.diagnostic_value()?),
+        "MALFORMED_CBOR",
+        "the pre-hardcut JSON header has no reader",
+    ));
+    cases.push(red_case(
+        g,
+        "nonpreferred-root-length",
+        "header",
+        binary_sub(&ha_bytes, &[0x85], &[0x98, 0x05]),
         "NONCANONICAL_ENCODING",
-        "one inserted space",
+        "root arity five encoded with an unnecessary width byte",
     ));
     cases.push(red_case(
         g,
-        "key-order",
+        "indefinite-root",
         "header",
-        reversed(&ha.to_value()),
+        binary_sub(&ha_bytes, &[0x85], &[0x9f]),
         "NONCANONICAL_ENCODING",
-        "reversed object key order",
+        "indefinite containers are outside the profile",
     ));
     cases.push(red_case(
         g,
-        "duplicate-key",
+        "forbidden-map",
         "header",
-        sub(
-            &ha_bytes,
-            "\"format\":\"cozytensors/1\"",
-            "\"format\":\"cozytensors/1\",\"format\":\"cozytensors/1\"",
-        ),
-        "DUPLICATE_KEY",
-        "same key twice",
+        binary_sub(&ha_bytes, &[0x85], &[0xa5]),
+        "MALFORMED_CBOR",
+        "maps are outside the all-array profile",
     ));
     cases.push(red_case(
         g,
-        "number-float",
+        "forbidden-tag",
         "header",
-        sub(&ha_bytes, "\"length\":8192", "\"length\":8192.0"),
-        "NON_INTEGER_NUMBER",
-        "float spelling of an integer",
+        [vec![0xc0], ha_bytes.clone()].concat(),
+        "MALFORMED_CBOR",
+        "tags are outside the profile",
     ));
     cases.push(red_case(
         g,
-        "number-exponent",
+        "forbidden-float",
         "header",
-        sub(&ha_bytes, "\"length\":8192", "\"length\":8.192e3"),
-        "NON_INTEGER_NUMBER",
-        "exponent spelling",
+        [vec![0xfb], 1f64.to_be_bytes().to_vec()].concat(),
+        "MALFORMED_CBOR",
+        "floats are outside the profile",
     ));
     cases.push(red_case(
         g,
-        "number-leading-zero",
+        "forbidden-null",
         "header",
-        sub(&ha_bytes, "\"length\":8192", "\"length\":08192"),
-        "NON_INTEGER_NUMBER",
-        "non-canonical integer spelling",
-    ));
-    cases.push(red_case(
-        g,
-        "null-value",
-        "header",
-        sub(&ha_bytes, "\"length\":8192", "\"length\":null"),
-        "WRONG_TYPE",
+        vec![0xf6],
+        "MALFORMED_CBOR",
         "null is not admitted",
     ));
     cases.push(red_case(
         g,
-        "escaped-ascii",
+        "truncated",
         "header",
-        sub(&ha_bytes, "\"format\"", "\"form\\u0061t\""),
-        "NONCANONICAL_ENCODING",
-        "\\u escape of a plain letter",
-    ));
-    cases.push(red_case(
-        g,
-        "unicode-nfc",
-        "header",
-        sub(&ha_bytes, "transformer", "transf\u{00f6}rmer"),
-        "NON_ASCII_FIELD",
-        "NFC o-diaeresis in a component name",
-    ));
-    cases.push(red_case(
-        g,
-        "unicode-nfd",
-        "header",
-        sub(&ha_bytes, "transformer", "transfo\u{0308}rmer"),
-        "NON_ASCII_FIELD",
-        "NFD twin of the same name",
-    ));
-    cases.push(red_case(
-        g,
-        "digest-uppercase",
-        "header",
-        uppercase_digest(&ha_bytes),
-        "MALFORMED_DIGEST",
-        "uppercase hex in a digest",
-    ));
-    cases.push(red_case(
-        g,
-        "trailing-whitespace",
-        "header",
-        [ha_bytes.clone(), b"\n".to_vec()].concat(),
-        "NONCANONICAL_ENCODING",
-        "trailing newline: parses, then fails the re-emit law",
+        ha_bytes[..ha_bytes.len() - 1].to_vec(),
+        "MALFORMED_CBOR",
+        "the final byte is absent",
     ));
     cases.push(red_case(
         g,
         "trailing-bytes",
         "header",
-        [ha_bytes.clone(), b"{}".to_vec()].concat(),
+        [ha_bytes.clone(), vec![0x80]].concat(),
         "TRAILING_BYTES",
         "a second value after the document",
     ));
@@ -1370,35 +1342,42 @@ fn build_corpus() -> (Vec<Case>, Vec<EncodingSpec>) {
         g,
         "unknown-field",
         "header",
-        sub(&ha_bytes, ",\"format\"", ",\"extra\":1,\"format\""),
-        "UNKNOWN_FIELD",
-        "unknown root field",
+        binary_sub(&ha_bytes, &[0x85], &[0x86]),
+        "WRONG_TYPE",
+        "the fixed root has no sixth field",
     ));
     cases.push(red_case(
         g,
         "unknown-major",
         "header",
-        sub(&ha_bytes, "cozytensors/1", "cozytensors/2"),
+        binary_sub(&ha_bytes, b"cozytensors/1", b"cozytensors/2"),
         "UNKNOWN_FORMAT",
         "unknown format major",
     ));
+    let mut h = ha.clone();
+    if let Body::Segments(segments) = &mut h.components[0].1[0].1.parts[0].1.body {
+        segments[0].length -= 1;
+    }
     cases.push(red_case(
         g,
         "anchor-equation",
         "header",
-        sub(&ha_bytes, "\"length\":8192", "\"length\":8191"),
+        h.conformance_bytes()?,
         "BYTE_LENGTH_MISMATCH",
         "segment total off by one byte",
     ));
+    let mut unknown_dtype = ha_bytes.clone();
+    let dtype_at = unknown_dtype
+        .windows(b"blocks.0.attn.to_q.weight".len())
+        .position(|window| window == b"blocks.0.attn.to_q.weight")
+        .unwrap()
+        + b"blocks.0.attn.to_q.weight".len();
+    unknown_dtype[dtype_at] = 12;
     cases.push(red_case(
         g,
         "dtype-outside-enum",
         "header",
-        sub(
-            &ha_bytes,
-            "\"dtype\":\"f8_e4m3fn\"",
-            "\"dtype\":\"f4_e2m1\"",
-        ),
+        unknown_dtype,
         "DTYPE_UNKNOWN",
         "carrier dtype outside the closed enum",
     ));
@@ -1409,7 +1388,7 @@ fn build_corpus() -> (Vec<Case>, Vec<EncodingSpec>) {
         g,
         "role-missing",
         "header",
-        h.canonical_bytes(),
+        h.conformance_bytes()?,
         "ROLE_SET_MISMATCH",
         "spec role set is EXACT",
     ));
@@ -1422,17 +1401,18 @@ fn build_corpus() -> (Vec<Case>, Vec<EncodingSpec>) {
         g,
         "role-extra",
         "header",
-        h.canonical_bytes(),
+        h.conformance_bytes()?,
         "ROLE_SET_MISMATCH",
         "an extra role is a different spec digest",
     ));
     let mut h = ha.clone();
     h.components[0].1[0].1.parts[1].1.shape = vec![32];
+    h.components[0].1[0].1.parts[1].1.body = Body::Inline(pattern(128));
     cases.push(red_case(
         g,
         "relation-shape",
         "header",
-        h.canonical_bytes(),
+        h.conformance_bytes()?,
         "SHAPE_MISMATCH",
         "scale shape != relation result",
     ));
@@ -1442,7 +1422,7 @@ fn build_corpus() -> (Vec<Case>, Vec<EncodingSpec>) {
         g,
         "zero-element",
         "header",
-        h.canonical_bytes(),
+        h.conformance_bytes()?,
         "ZERO_ELEMENT",
         "zero-element tensor",
     ));
@@ -1456,7 +1436,7 @@ fn build_corpus() -> (Vec<Case>, Vec<EncodingSpec>) {
         g,
         "inline-threshold-under",
         "header",
-        h.canonical_bytes(),
+        h.conformance_bytes()?,
         "INLINE_THRESHOLD",
         "256 B stored as a segment",
     ));
@@ -1465,34 +1445,25 @@ fn build_corpus() -> (Vec<Case>, Vec<EncodingSpec>) {
     h.components[0].1[1].1.parts[0].1 = Part {
         dtype: Dtype::Bf16,
         shape: vec![130],
-        body: Body::Inline(tensorfs_core::b64::encode(&pattern(260))),
+        body: Body::Inline(pattern(260)),
     };
     cases.push(red_case(
         g,
         "inline-threshold-over",
         "header",
-        h.canonical_bytes(),
+        h.conformance_bytes()?,
         "INLINE_THRESHOLD",
         "260 B stored inline",
     ));
-    let inline_anchor = format!(
-        "\"inline\":\"{}\"",
-        tensorfs_core::b64::encode(&pattern(256))
-    );
+    let mut h = ha.clone();
+    h.components[0].1[1].1.parts[0].1.body = Body::Segments(vec![]);
     cases.push(red_case(
         g,
-        "inline-and-segments",
+        "empty-segments",
         "header",
-        sub(
-            &ha_bytes,
-            &inline_anchor,
-            &format!(
-                "{inline_anchor},\"segments\":[{{\"length\":256,\"sha256\":\"{}\"}}]",
-                "0".repeat(64)
-            ),
-        ),
-        "INLINE_EXCLUSIVE",
-        "both bodies present",
+        h.conformance_bytes()?,
+        "COUNT_CAP",
+        "segmented body is a non-empty ObjectRef array",
     ));
     let mut h = ha.clone();
     h.encodings.push(ObjectRef::of(b"an uncited spec object"));
@@ -1501,29 +1472,37 @@ fn build_corpus() -> (Vec<Case>, Vec<EncodingSpec>) {
         g,
         "uncited-encoding",
         "header",
-        h.canonical_bytes(),
+        h.conformance_bytes()?,
         "UNCITED_ENCODING",
         "derivable-fact law",
     ));
     let mut h = ha.clone();
     h.components[0].1[1].1.encoding = tensorfs_core::ids::object_id(b"a spec nobody shipped");
+    let old = seed_spec("plain/1", 0).object_id();
+    h.encodings.retain(|encoding| encoding.id() != old);
     h.encodings.push(ObjectRef::of(b"a spec nobody shipped"));
     h.encodings.sort_by(|a, b| a.sha256.cmp(&b.sha256));
     cases.push(red_case(
         g,
         "dangling-spec",
         "header",
-        h.canonical_bytes(),
+        h.conformance_bytes()?,
         "UNKNOWN_ENCODING",
         "cited digest absent from the closure",
     ));
-    let mut h = ha.clone();
-    h.components[0].1[1].1.encoding = tensorfs_core::ids::object_id(b"not listed either");
+    let mut h = ha_bytes.clone();
+    let key = b"blocks.0.norm.weight";
+    let at = h
+        .windows(key.len())
+        .position(|window| window == key)
+        .unwrap()
+        + key.len();
+    h[at + 4] = 2;
     cases.push(red_case(
         g,
         "encoding-not-listed",
         "header",
-        h.canonical_bytes(),
+        h,
         "ENCODING_MISMATCH",
         "cited digest missing from `encodings`",
     ));
@@ -1533,73 +1512,52 @@ fn build_corpus() -> (Vec<Case>, Vec<EncodingSpec>) {
         g,
         "empty-components",
         "header",
-        h.canonical_bytes(),
+        h.conformance_bytes()?,
         "EMPTY_COMPONENTS",
         "no components",
     ));
 
-    // ---- tfs-015: hostile bodies, hostile keys, whole-document totals, capability ----
-
-    // The inline body's grammar is exact: one canonical spelling per byte run.
-    let inline_b64 = tensorfs_core::b64::encode(&pattern(256));
-    for (name, twin, note) in [
-        (
-            "base64-unpadded",
-            inline_b64.trim_end_matches('=').to_string(),
-            "padding stripped",
-        ),
-        (
-            "base64-whitespace",
-            format!("{} {}", &inline_b64[..8], &inline_b64[8..]),
-            "a space inside the body",
-        ),
-        (
-            "base64-urlsafe",
-            inline_b64.replace('+', "-").replace('/', "_"),
-            "url-safe alphabet",
-        ),
-    ] {
-        cases.push(red_case(
-            g,
-            name,
-            "header",
-            sub(&ha_bytes, &inline_b64, &twin),
-            "BAD_BASE64",
-            note,
-        ));
-    }
-    // A last quantum whose unused low bits are set decodes to the same bytes and re-encodes
-    // differently — the classic base64 malleability channel.
-    let tail = tensorfs_core::b64::encode(&pattern(2));
-    let alphabet = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-    let mut evil = tail.clone().into_bytes();
-    // Two data bytes leave the final sextet's low TWO bits unused; canonical encoding
-    // clears them, so setting one decodes identically and re-encodes differently.
-    let i = alphabet.iter().position(|c| *c == evil[2]).unwrap();
-    evil[2] = alphabet[i | 1];
-    let mut h = ha.clone();
-    h.components[0].1[1].1.shape = vec![1];
-    h.components[0].1[1].1.parts[0].1 = Part {
-        dtype: Dtype::Bf16,
-        shape: vec![1],
-        body: Body::Inline(tail.clone()),
-    };
+    // ---- tfs-015: hostile native bytes, keys, totals, capability ----
     cases.push(red_case(
         g,
-        "base64-noncanonical-tail",
+        "digest-31-bytes",
         "header",
-        sub(
-            &h.canonical_bytes(),
-            &tail,
-            &String::from_utf8(evil).unwrap(),
-        ),
-        "BAD_BASE64",
-        "unused low bits set in the final quantum",
+        binary_sub(&ha_bytes, &[0x58, 0x20], &[0x58, 0x1f]),
+        "MALFORMED_DIGEST",
+        "a digest is exactly 32 native bytes",
+    ));
+    cases.push(red_case(
+        g,
+        "digest-33-bytes",
+        "header",
+        binary_sub(&ha_bytes, &[0x58, 0x20], &[0x58, 0x21]),
+        "MALFORMED_DIGEST",
+        "a digest is exactly 32 native bytes",
+    ));
+    let mut h = ha.clone();
+    h.configs.push(("aaa".to_string(), config_ref()));
+    cases.push(red_case(
+        g,
+        "configs-unsorted",
+        "header",
+        h.conformance_bytes()?,
+        "SORT_ORDER",
+        "configs are a sorted set, not construction order",
+    ));
+    let mut h = ha.clone();
+    h.encodings.reverse();
+    cases.push(red_case(
+        g,
+        "encodings-unsorted",
+        "header",
+        h.conformance_bytes()?,
+        "SORT_ORDER",
+        "EncodingSpec references sort by raw digest",
     ));
 
     // Tensor keys are data-shaped and therefore the hostile-input surface.
     for (name, key, code, note) in [
-        ("key-empty", "", "KEY_GRAMMAR", "the empty key"),
+        ("key-empty", "", "NON_ASCII_FIELD", "the empty key"),
         (
             "key-non-ascii",
             "blocks.0.attn.tö_q.weight",
@@ -1607,36 +1565,28 @@ fn build_corpus() -> (Vec<Case>, Vec<EncodingSpec>) {
             "a non-ASCII tensor key",
         ),
     ] {
+        let mut header = ha.clone();
+        header.components[0].1[0].0 = key.to_string();
         cases.push(red_case(
             g,
             name,
             "header",
-            sub(&ha_bytes, "blocks.0.attn.to_q.weight", key),
+            header.conformance_bytes()?,
             code,
             note,
         ));
     }
 
-    // Endianness is a format GLOBAL: there is no field to disagree with.
-    cases.push(red_case(
-        g,
-        "endian-field",
-        "header",
-        sub(
-            &ha_bytes,
-            "\"dtype\":\"f8_e4m3fn\"",
-            "\"dtype\":\"f8_e4m3fn\",\"endian\":\"little\"",
-        ),
-        "UNKNOWN_FIELD",
-        "a part claiming its own byte order",
-    ));
-
     // A zero-length segment is a fetch that can never satisfy the anchor equation.
+    let mut h = ha.clone();
+    if let Body::Segments(segments) = &mut h.components[0].1[0].1.parts[0].1.body {
+        segments[0].length = 0;
+    }
     cases.push(red_case(
         g,
         "segment-zero-length",
         "header",
-        sub(&ha_bytes, "\"length\":8192", "\"length\":0"),
+        h.conformance_bytes()?,
         "ZERO_ELEMENT",
         "an empty segment record",
     ));
@@ -1644,6 +1594,7 @@ fn build_corpus() -> (Vec<Case>, Vec<EncodingSpec>) {
     // Whole-DOCUMENT byte total, not just this part's.
     let huge = Header {
         configs: vec![],
+        assets: vec![],
         encodings: encodings_of(&[&plain]),
         components: vec![(
             "transformer".to_string(),
@@ -1672,7 +1623,7 @@ fn build_corpus() -> (Vec<Case>, Vec<EncodingSpec>) {
         g,
         "total-bytes-cap",
         "header",
-        huge.canonical_bytes(),
+        huge.conformance_bytes()?,
         "TOTAL_BYTES_CAP",
         "one legal tensor over the whole-document byte total",
     ));
@@ -1686,6 +1637,7 @@ fn build_corpus() -> (Vec<Case>, Vec<EncodingSpec>) {
     };
     let hf = Header {
         configs: vec![],
+        assets: vec![],
         encodings: encodings_of(&[&foreign]),
         components: vec![(
             "transformer".to_string(),
@@ -1704,14 +1656,14 @@ fn build_corpus() -> (Vec<Case>, Vec<EncodingSpec>) {
         g,
         "unaliased-spec-stores",
         "header",
-        hf.canonical_bytes(),
+        hf.conformance_bytes()?,
         "a pin-absent spec object validates as data",
     ));
     cases.push(red_case(
         g,
         "unaliased-spec-serving",
         "header-serving",
-        hf.canonical_bytes(),
+        hf.conformance_bytes()?,
         "UNKNOWN_TO_LOCAL_CAPABILITY",
         "the same bytes refused for SERVING against the local pin",
     ));
@@ -1722,7 +1674,7 @@ fn build_corpus() -> (Vec<Case>, Vec<EncodingSpec>) {
         g,
         "division-remainder",
         "header",
-        h.canonical_bytes(),
+        h.conformance_bytes()?,
         "DIVISION_REMAINDER",
         "in/2 with an odd in",
     ));
@@ -1732,7 +1684,7 @@ fn build_corpus() -> (Vec<Case>, Vec<EncodingSpec>) {
         g,
         "element-count-cap",
         "header",
-        h.canonical_bytes(),
+        h.conformance_bytes()?,
         "COUNT_CAP",
         "aggregate element limit",
     ));
@@ -1741,6 +1693,7 @@ fn build_corpus() -> (Vec<Case>, Vec<EncodingSpec>) {
     let probe = probe_spec();
     let h = Header {
         configs: vec![],
+        assets: vec![],
         encodings: encodings_of(&[&probe]),
         components: vec![(
             "transformer".to_string(),
@@ -1755,7 +1708,7 @@ fn build_corpus() -> (Vec<Case>, Vec<EncodingSpec>) {
                         Part {
                             dtype: Dtype::U8,
                             shape: vec![1],
-                            body: Body::Inline(tensorfs_core::b64::encode(&[0u8])),
+                            body: Body::Inline(vec![0u8]),
                         },
                     )],
                 },
@@ -1766,7 +1719,7 @@ fn build_corpus() -> (Vec<Case>, Vec<EncodingSpec>) {
         g,
         "arith-overflow",
         "header",
-        h.canonical_bytes(),
+        h.conformance_bytes()?,
         "ARITH_OVERFLOW",
         "checked 64-bit geometry arithmetic in the relation evaluator",
     ));
@@ -1776,7 +1729,7 @@ fn build_corpus() -> (Vec<Case>, Vec<EncodingSpec>) {
         g,
         "logical-dtype-carrier",
         "header",
-        h.canonical_bytes(),
+        h.conformance_bytes()?,
         "DTYPE_MISMATCH",
         "carrier no longer equals the logical dtype",
     ));
@@ -1828,9 +1781,25 @@ fn build_corpus() -> (Vec<Case>, Vec<EncodingSpec>) {
 
     // --- manifest reds
     let g = "manifest-red";
-    let header_ref = ha.object_ref();
+    let header_ref = ha.object_ref()?;
     let mut m = Draft::of(&snap);
-    m.entries.swap(0, 1);
+    let first = m
+        .entries
+        .iter()
+        .position(|(path, _)| path == "model.cozytensors")
+        .ok_or_else(|| Refusal {
+            code: Code::MISSING_FIELD,
+            detail: "corpus manifest lacks model.cozytensors".into(),
+        })?;
+    let second = m
+        .entries
+        .iter()
+        .position(|(path, _)| path == "tokenizer.model")
+        .ok_or_else(|| Refusal {
+            code: Code::MISSING_FIELD,
+            detail: "corpus manifest lacks tokenizer.model".into(),
+        })?;
+    m.entries.swap(first, second);
     cases.push(red_case(
         g,
         "path-order",
@@ -1886,7 +1855,11 @@ fn build_corpus() -> (Vec<Case>, Vec<EncodingSpec>) {
         "reserved stem",
     ));
     let mut m = Draft::of(&snap);
-    if let Entry::Blob(b) = &mut m.entries[1].1 {
+    if let Some((_, Entry::Blob(b))) = m
+        .entries
+        .iter_mut()
+        .find(|(path, _)| path == "tokenizer.model")
+    {
         b.logical_size += 1;
     }
     cases.push(red_case(
@@ -2029,7 +2002,11 @@ fn build_corpus() -> (Vec<Case>, Vec<EncodingSpec>) {
         "a content-addressed path that names something else",
     ));
     let mut m = Draft::of(&snap);
-    if let Entry::Blob(b) = &mut m.entries[1].1 {
+    if let Some((_, Entry::Blob(b))) = m
+        .entries
+        .iter_mut()
+        .find(|(path, _)| path == "tokenizer.model")
+    {
         // a HOLE: a non-final segment short of the profile grid
         b.segments.push(b.segments[0].clone());
         b.logical_size *= 2;
@@ -2043,7 +2020,11 @@ fn build_corpus() -> (Vec<Case>, Vec<EncodingSpec>) {
         "sparse holes are unrepresentable: the profile fixes every boundary",
     ));
     let mut m = Draft::of(&snap);
-    if let Entry::Blob(b) = &mut m.entries[1].1 {
+    if let Some((_, Entry::Blob(b))) = m
+        .entries
+        .iter_mut()
+        .find(|(path, _)| path == "tokenizer.model")
+    {
         b.logical_size -= 1;
     }
     cases.push(red_case(
@@ -2262,7 +2243,7 @@ fn build_corpus() -> (Vec<Case>, Vec<EncodingSpec>) {
     }
 
     cases.extend(meta_cases());
-    (cases, specs)
+    Ok((cases, specs))
 }
 
 /// The metadata authority document (tfs-006) and the degraded-behaviour receipt (tfs-005).
@@ -2383,20 +2364,13 @@ fn meta_cases() -> Vec<Case> {
     out
 }
 
-fn uppercase_digest(bytes: &[u8]) -> Vec<u8> {
-    let s = String::from_utf8(bytes.to_vec()).unwrap();
-    let i = s.find("\"sha256\":\"").unwrap() + 10;
-    let mut out = s.into_bytes();
-    for b in out[i..i + 8].iter_mut() {
-        b.make_ascii_uppercase();
-    }
-    out
-}
-
 // ------------------------------------------------------------------ gen
 
 fn cmd_gen(dir: &Path) -> ExitCode {
-    let (cases, specs) = build_corpus();
+    let (cases, specs) = match build_corpus() {
+        Ok(corpus) => corpus,
+        Err(error) => return bail(error),
+    };
     // Regenerate only what the corpus OWNS. `mined/` (producer-mined vectors) and
     // `structure/` (banked fixtures) are evidence with their own provenance and their own
     // banking commands; a corpus rebuild must never be able to delete them.
@@ -2415,7 +2389,12 @@ fn cmd_gen(dir: &Path) -> ExitCode {
     for c in &cases {
         let d = dir.join("cases").join(c.group);
         fs::create_dir_all(&d).unwrap();
-        fs::write(d.join(format!("{}.json", c.name)), &c.bytes).unwrap();
+        let extension = if matches!(c.doc, "header" | "header-serving") {
+            "cbor"
+        } else {
+            "json"
+        };
+        fs::write(d.join(format!("{}.{}", c.name, extension)), &c.bytes).unwrap();
         let mut v = format!("doc: {}\nexpect: {}\n", c.doc, c.expect);
         if let Some(code) = &c.code {
             v += &format!("code: {code}\n");
@@ -2512,7 +2491,11 @@ fn cmd_verify(dir: &Path) -> ExitCode {
         let mut files: Vec<PathBuf> = fs::read_dir(&g)
             .unwrap()
             .map(|e| e.unwrap().path())
-            .filter(|p| p.extension().map(|x| x == "json").unwrap_or(false))
+            .filter(|p| {
+                p.extension()
+                    .map(|x| x == "json" || x == "cbor")
+                    .unwrap_or(false)
+            })
             .collect();
         files.sort();
         for f in files {
@@ -2621,6 +2604,7 @@ fn cmd_verify(dir: &Path) -> ExitCode {
             _ => String::new(),
         }
     };
+    let short = |value: String| value.chars().take(19).collect::<String>();
     let mut cross: Vec<(String, bool, String)> = Vec::new();
     cross.push((
         "checkpoint_id == snapshot_id (unconditional)".into(),
@@ -2633,8 +2617,8 @@ fn cmd_verify(dir: &Path) -> ExitCode {
         idof("header/plain-fp8") != cpof("manifest/checkpoint"),
         format!(
             "{} vs {}",
-            &idof("header/plain-fp8")[..19],
-            &cpof("manifest/checkpoint")[..19]
+            short(idof("header/plain-fp8")),
+            short(cpof("manifest/checkpoint"))
         ),
     ));
     cross.push((
@@ -2644,25 +2628,31 @@ fn cmd_verify(dir: &Path) -> ExitCode {
         topof("header/plain-fp8"),
     ));
     cross.push((
+        "tensor reorder flips header id, not topology_digest".into(),
+        idof("header/plain-fp8") != idof("header/plain-fp8-reordered")
+            && topof("header/plain-fp8") == topof("header/plain-fp8-reordered"),
+        topof("header/plain-fp8-reordered"),
+    ));
+    cross.push((
         "one more sibling file flips checkpoint_id only".into(),
         cpof("manifest/checkpoint") != cpof("manifest/checkpoint-extra-file"),
         cpof("manifest/checkpoint-extra-file"),
     ));
     let (cha, _) = header_a(Some(config_ref()));
-    let csnap = manifest_checkpoint(&cha, false);
+    let csnap = ok!(manifest_checkpoint(&cha, false));
     let cprof = profile_normal(
         vec![seed_spec("plain/1", 0).object_ref()],
         "safetensors.diffusers",
     );
-    let csub = subject(&cprof, &cha, "acme");
-    let cstamp = stamp_doc(&cprof, &csub, &csnap, &cha);
-    let crcpt = receipt(&csub, &csnap, &cha, &cstamp, "platform-key-1");
+    let csub = ok!(subject(&cprof, &cha, "acme"));
+    let cstamp = ok!(stamp_doc(&cprof, &csub, &csnap, &cha));
+    let crcpt = ok!(receipt(&csub, &csnap, &cha, &cstamp, "platform-key-1"));
     cross.push((
         "receipt binds its exact subject/snapshot/header/stamp".into(),
         crcpt.binds(&csub, &csnap, &cha, &cstamp).is_ok(),
         String::new(),
     ));
-    let other = subject(&cprof, &cha, "other-tenant");
+    let other = ok!(subject(&cprof, &cha, "other-tenant"));
     let replay = crcpt.binds(&other, &csnap, &cha, &cstamp);
     cross.push((
         "cross-subject replay refuses".into(),
@@ -2764,9 +2754,9 @@ fn cmd_bench(tensors: usize, reps: usize) -> ExitCode {
             },
         ));
     }
-    ts.sort_by(|a, b| a.0.cmp(&b.0));
     let h = Header {
         configs: vec![("transformer".to_string(), config_ref())],
+        assets: vec![],
         encodings: encodings_of(&[&fp8]),
         components: vec![("transformer".to_string(), ts)],
     };
@@ -2775,7 +2765,7 @@ fn cmd_bench(tensors: usize, reps: usize) -> ExitCode {
     let t = Instant::now();
     let mut bytes = Vec::new();
     for _ in 0..reps {
-        bytes = h.canonical_bytes();
+        bytes = ok!(h.canonical_bytes());
     }
     let write_s = t.elapsed().as_secs_f64();
 
@@ -2788,14 +2778,14 @@ fn cmd_bench(tensors: usize, reps: usize) -> ExitCode {
 
     let t = Instant::now();
     for _ in 0..reps {
-        Header::parse(&bytes).expect("reparse");
+        ok!(Header::parse(&bytes));
     }
     let parse_s = t.elapsed().as_secs_f64();
 
-    let parsed = Header::parse(&bytes).unwrap();
+    let parsed = ok!(Header::parse(&bytes));
     let t = Instant::now();
     for _ in 0..reps {
-        parsed.validate(&closure).expect("validate");
+        ok!(parsed.validate(&closure));
     }
     let val_s = t.elapsed().as_secs_f64();
 
@@ -2838,20 +2828,27 @@ fn cmd_bench(tensors: usize, reps: usize) -> ExitCode {
 // ------------------------------------------------------------------ flip matrix
 
 fn cmd_flip() -> ExitCode {
+    match flip_matrix() {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(error) => bail(error),
+    }
+}
+
+fn flip_matrix() -> TfsResult<()> {
     let (ha, _) = header_a(Some(config_ref()));
-    let snap = manifest_checkpoint(&ha, false);
+    let snap = manifest_checkpoint(&ha, false)?;
     let prof = profile_normal(
         vec![seed_spec("plain/1", 0).object_ref()],
         "safetensors.diffusers",
     );
-    let sub0 = subject(&prof, &ha, "acme");
-    let st0 = stamp_doc(&prof, &sub0, &snap, &ha);
-    let r0 = receipt(&sub0, &snap, &ha, &st0, "platform-key-1");
+    let sub0 = subject(&prof, &ha, "acme")?;
+    let st0 = stamp_doc(&prof, &sub0, &snap, &ha)?;
+    let r0 = receipt(&sub0, &snap, &ha, &st0, "platform-key-1")?;
 
     let base = (
-        ha.object_id(),
+        ha.object_id()?,
         ha.topology_digest(),
-        snap.checkpoint_id().unwrap(),
+        snap.checkpoint_id()?,
         sub0.object_id(),
         r0.object_id(),
     );
@@ -2868,13 +2865,13 @@ fn cmd_flip() -> ExitCode {
     if let Body::Segments(s) = &mut h.components[0].1[0].1.parts[0].1.body {
         s[0].sha256 = tensorfs_core::sha256::hex_digest(b"different weight bytes");
     }
-    let s = manifest_checkpoint(&h, false);
+    let s = manifest_checkpoint(&h, false)?;
     rows.push((
         "artifact bytes change",
         (
-            h.object_id(),
+            h.object_id()?,
             h.topology_digest(),
-            s.checkpoint_id().unwrap(),
+            s.checkpoint_id()?,
             sub0.object_id(),
             r0.object_id(),
         ),
@@ -2884,13 +2881,13 @@ fn cmd_flip() -> ExitCode {
     let mut h = ha.clone();
     h.components[0].1[1].1.dtype = Dtype::F16;
     h.components[0].1[1].1.parts[0].1.dtype = Dtype::F16;
-    let s = manifest_checkpoint(&h, false);
+    let s = manifest_checkpoint(&h, false)?;
     rows.push((
         "logical dtype change",
         (
-            h.object_id(),
+            h.object_id()?,
             h.topology_digest(),
-            s.checkpoint_id().unwrap(),
+            s.checkpoint_id()?,
             sub0.object_id(),
             r0.object_id(),
         ),
@@ -2898,52 +2895,52 @@ fn cmd_flip() -> ExitCode {
     ));
 
     let (h, _) = header_a(None);
-    let s = manifest_checkpoint(&h, false);
+    let s = manifest_checkpoint(&h, false)?;
     rows.push((
         "config change",
         (
-            h.object_id(),
+            h.object_id()?,
             h.topology_digest(),
-            s.checkpoint_id().unwrap(),
+            s.checkpoint_id()?,
             sub0.object_id(),
             r0.object_id(),
         ),
         [true, false, true, false, false],
     ));
 
-    let s = manifest_checkpoint(&ha, true);
+    let s = manifest_checkpoint(&ha, true)?;
     rows.push((
         "snapshot gains a file",
         (
-            ha.object_id(),
+            ha.object_id()?,
             ha.topology_digest(),
-            s.checkpoint_id().unwrap(),
+            s.checkpoint_id()?,
             sub0.object_id(),
             r0.object_id(),
         ),
         [false, false, true, false, false],
     ));
 
-    let sub1 = subject(&prof, &ha, "other-tenant");
+    let sub1 = subject(&prof, &ha, "other-tenant")?;
     rows.push((
         "tenant change",
         (
-            ha.object_id(),
+            ha.object_id()?,
             ha.topology_digest(),
-            snap.checkpoint_id().unwrap(),
+            snap.checkpoint_id()?,
             sub1.object_id(),
             r0.object_id(),
         ),
         [false, false, false, true, false],
     ));
 
-    let r1 = receipt(&sub0, &snap, &ha, &st0, "platform-key-2-rotated");
+    let r1 = receipt(&sub0, &snap, &ha, &st0, "platform-key-2-rotated")?;
     rows.push((
         "signer rotation",
         (
-            ha.object_id(),
+            ha.object_id()?,
             ha.topology_digest(),
-            snap.checkpoint_id().unwrap(),
+            snap.checkpoint_id()?,
             sub0.object_id(),
             r1.object_id(),
         ),
@@ -2988,9 +2985,9 @@ fn cmd_flip() -> ExitCode {
     ok &= alias_stable;
     if ok {
         println!("\nall flips as designed");
-        ExitCode::SUCCESS
+        Ok(())
     } else {
-        ExitCode::FAILURE
+        refuse(Code::OBJECT_ID_MISMATCH, "identity flip matrix disagrees")
     }
 }
 
@@ -3010,7 +3007,10 @@ fn cmd_id(p: &Path) -> ExitCode {
         println!("kind:      cozytensors/1 header");
         println!("topology:  {}", h.topology_digest());
         println!("tensors:   {}", h.tensors().count());
-        println!("pretty:\n{}", canon::pretty(&h.to_value(), 0));
+        match h.diagnostic_value() {
+            Ok(value) => println!("pretty:\n{}", canon::pretty(&value, 0)),
+            Err(error) => return bail(error),
+        }
     } else if let Ok(m) = SnapshotManifest::parse(&bytes) {
         println!("kind:      snapshot manifest");
         match m.checkpoint_id() {
@@ -3026,4 +3026,141 @@ fn cmd_id(p: &Path) -> ExitCode {
         );
     }
     ExitCode::SUCCESS
+}
+
+fn write_cli(bytes: &[u8], flags: &Flags) -> ExitCode {
+    if let Some(path) = flag(flags, "out") {
+        match fs::write(path, bytes) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(error) => {
+                eprintln!("{path}: {error}");
+                ExitCode::FAILURE
+            }
+        }
+    } else {
+        use std::io::Write;
+        match std::io::stdout().write_all(bytes) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(error) => {
+                eprintln!("stdout: {error}");
+                ExitCode::FAILURE
+            }
+        }
+    }
+}
+
+fn cmd_cbor(action: &str, path: &Path, flags: &Flags) -> ExitCode {
+    let bytes = match fs::read(path) {
+        Ok(bytes) => bytes,
+        Err(error) => {
+            eprintln!("{}: {error}", path.display());
+            return ExitCode::FAILURE;
+        }
+    };
+    match action {
+        "encode" => {
+            let value =
+                match canon::parse_with_depth(&bytes, tensorfs_core::limits::DOC_MAX_BYTES, 16) {
+                    Ok(value) => value,
+                    Err(error) => return bail(error),
+                };
+            let header = match Header::from_diagnostic_value(&value) {
+                Ok(header) => header,
+                Err(error) => return bail(error),
+            };
+            if let Err(error) = header.validate_structure() {
+                return bail(error);
+            }
+            let encoded = match header.canonical_bytes() {
+                Ok(bytes) => bytes,
+                Err(error) => return bail(error),
+            };
+            if let Err(error) = Header::parse(&encoded) {
+                return bail(error);
+            }
+            write_cli(&encoded, flags)
+        }
+        "decode" => {
+            let header = match Header::parse(&bytes) {
+                Ok(header) => header,
+                Err(error) => return bail(error),
+            };
+            let value = match header.diagnostic_value() {
+                Ok(value) => value,
+                Err(error) => return bail(error),
+            };
+            let mut rendered = canon::pretty(&value, 0).into_bytes();
+            rendered.push(b'\n');
+            write_cli(&rendered, flags)
+        }
+        "check" => {
+            let header = match Header::parse(&bytes) {
+                Ok(header) => header,
+                Err(error) => return bail(error),
+            };
+            println!("header_digest {}", tensorfs_core::ids::object_id(&bytes));
+            println!("bytes {}", bytes.len());
+            println!("components {}", header.components.len());
+            println!("tensors {}", header.tensors().count());
+            for (component, tensors) in &header.components {
+                println!("component {component} {}", tensors.len());
+                for (index, (key, _)) in tensors.iter().enumerate() {
+                    println!("order {component} {index} {key}");
+                }
+            }
+            ExitCode::SUCCESS
+        }
+        _ => unreachable!(),
+    }
+}
+
+fn cmd_cbor_plant(path: &Path, kind: &str, flags: &Flags) -> ExitCode {
+    let bytes = match fs::read(path) {
+        Ok(bytes) => bytes,
+        Err(error) => {
+            eprintln!("{}: {error}", path.display());
+            return ExitCode::FAILURE;
+        }
+    };
+    let mut header = match Header::parse(&bytes) {
+        Ok(header) => header,
+        Err(error) => return bail(error),
+    };
+    match kind {
+        "anchor-length" => {
+            let segment = header
+                .components
+                .iter_mut()
+                .flat_map(|(_, tensors)| tensors.iter_mut())
+                .flat_map(|(_, tensor)| tensor.parts.iter_mut())
+                .find_map(|(_, part)| match &mut part.body {
+                    Body::Segments(segments) => segments.first_mut(),
+                    Body::Inline(_) => None,
+                });
+            match segment {
+                Some(segment) if segment.length > 1 => segment.length -= 1,
+                _ => {
+                    eprintln!("REFUSED MISSING_TENSOR: header has no plantable segment");
+                    return ExitCode::FAILURE;
+                }
+            }
+        }
+        "asset-logical-digest" => match header.assets.first_mut() {
+            Some((_, asset)) => {
+                asset.logical_sha256 = tensorfs_core::sha256::hex_digest(b"wrong asset bytes")
+            }
+            None => {
+                eprintln!("REFUSED MISSING_FIELD: header has no model asset");
+                return ExitCode::FAILURE;
+            }
+        },
+        other => {
+            eprintln!("REFUSED UNKNOWN_FIELD: unknown CBOR plant {other:?}");
+            return ExitCode::FAILURE;
+        }
+    }
+    match header.conformance_bytes() {
+        Ok(bytes) => write_cli(&bytes, flags),
+        Err(error) => bail(error),
+    }
 }

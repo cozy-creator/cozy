@@ -1,0 +1,480 @@
+//! The one stored CozyTensors-header codec: a closed all-array RFC 8949 Core
+//! Deterministic CBOR profile. Generic CBOR values never enter the model.
+
+use minicbor::data::Type;
+use minicbor::{Decoder, Encoder};
+
+use crate::dtype::Dtype;
+use crate::err::{refuse, Code, Refusal, Result};
+use crate::header::{Asset, Body, Header, Part, Tensor};
+use crate::ids::{ConfigRef, ObjectRef};
+use crate::limits;
+
+fn malformed(what: &str, error: impl std::fmt::Display) -> Refusal {
+    Refusal {
+        code: Code::MALFORMED_CBOR,
+        detail: format!("{what}: {error}"),
+    }
+}
+
+struct Bounded {
+    bytes: Vec<u8>,
+}
+
+#[derive(Debug)]
+struct CapError;
+
+impl std::fmt::Display for CapError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("header byte cap exceeded")
+    }
+}
+
+impl minicbor::encode::Write for Bounded {
+    type Error = CapError;
+
+    fn write_all(&mut self, bytes: &[u8]) -> std::result::Result<(), Self::Error> {
+        let length = self.bytes.len().checked_add(bytes.len()).ok_or(CapError)?;
+        if length > Header::MAX_BYTES {
+            return Err(CapError);
+        }
+        self.bytes.extend_from_slice(bytes);
+        Ok(())
+    }
+}
+
+fn emit<T>(
+    what: &str,
+    result: std::result::Result<T, minicbor::encode::Error<CapError>>,
+) -> Result<T> {
+    result.map_err(|error| {
+        if error.is_write() {
+            Refusal {
+                code: Code::SIZE_CAP,
+                detail: format!("{what}: encoded header exceeds {} bytes", Header::MAX_BYTES),
+            }
+        } else {
+            malformed(what, error)
+        }
+    })
+}
+
+fn exact_array(d: &mut Decoder<'_>, what: &str, want: u64) -> Result<()> {
+    match d.array().map_err(|e| malformed(what, e))? {
+        Some(got) if got == want => Ok(()),
+        Some(got) => refuse(
+            Code::WRONG_TYPE,
+            format!("{what}: array arity {got}, expected {want}"),
+        ),
+        None => refuse(
+            Code::NONCANONICAL_ENCODING,
+            format!("{what}: indefinite arrays are forbidden"),
+        ),
+    }
+}
+
+fn list_len(d: &mut Decoder<'_>, what: &str, cap: usize, nonempty: bool) -> Result<usize> {
+    let n = match d.array().map_err(|e| malformed(what, e))? {
+        Some(n) => usize::try_from(n).map_err(|_| malformed(what, "array length over usize"))?,
+        None => {
+            return refuse(
+                Code::NONCANONICAL_ENCODING,
+                format!("{what}: indefinite arrays are forbidden"),
+            )
+        }
+    };
+    if n > cap || (nonempty && n == 0) {
+        return refuse(
+            Code::COUNT_CAP,
+            format!(
+                "{what}: count {n} outside {}..={cap}",
+                usize::from(nonempty)
+            ),
+        );
+    }
+    Ok(n)
+}
+
+fn text(d: &mut Decoder<'_>, what: &str, max: usize) -> Result<String> {
+    let value = d.str().map_err(|e| malformed(what, e))?;
+    if value.is_empty() || value.len() > max || !value.bytes().all(|b| (0x20..=0x7e).contains(&b)) {
+        return refuse(
+            Code::NON_ASCII_FIELD,
+            format!("{what}: expected 1..={max} printable-ASCII bytes"),
+        );
+    }
+    Ok(value.to_string())
+}
+
+fn uint(d: &mut Decoder<'_>, what: &str) -> Result<u64> {
+    d.u64().map_err(|e| malformed(what, e))
+}
+
+fn digest_bytes(what: &str, hex: &str) -> Result<[u8; 32]> {
+    crate::ids::hex64(what, hex)?;
+    let mut out = [0u8; 32];
+    for (i, pair) in hex.as_bytes().chunks_exact(2).enumerate() {
+        let nibble = |b: u8| match b {
+            b'0'..=b'9' => b - b'0',
+            b'a'..=b'f' => b - b'a' + 10,
+            _ => 0,
+        };
+        out[i] = (nibble(pair[0]) << 4) | nibble(pair[1]);
+    }
+    Ok(out)
+}
+
+fn digest_hex(d: &mut Decoder<'_>, what: &str) -> Result<String> {
+    let bytes = d.bytes().map_err(|e| malformed(what, e))?;
+    if bytes.len() != 32 {
+        return refuse(
+            Code::MALFORMED_DIGEST,
+            format!("{what}: digest is {} bytes, expected 32", bytes.len()),
+        );
+    }
+    Ok(crate::sha256::hex(bytes))
+}
+
+fn encode_ref(e: &mut Encoder<Bounded>, r: &ObjectRef) -> Result<()> {
+    emit("ObjectRef", e.array(2))?;
+    emit(
+        "ObjectRef.digest",
+        e.bytes(&digest_bytes("ObjectRef", &r.sha256)?),
+    )?;
+    emit("ObjectRef.length", e.u64(r.length))?;
+    Ok(())
+}
+
+fn decode_ref(d: &mut Decoder<'_>, what: &str) -> Result<ObjectRef> {
+    exact_array(d, what, 2)?;
+    Ok(ObjectRef {
+        sha256: digest_hex(d, what)?,
+        length: uint(d, what)?,
+    })
+}
+
+fn encode_shape(e: &mut Encoder<Bounded>, shape: &[u64]) -> Result<()> {
+    emit("shape", e.array(shape.len() as u64))?;
+    for extent in shape {
+        emit("shape.extent", e.u64(*extent))?;
+    }
+    Ok(())
+}
+
+fn decode_shape(d: &mut Decoder<'_>, what: &str) -> Result<Vec<u64>> {
+    let n = list_len(d, what, limits::MAX_RANK, false)?;
+    (0..n).map(|_| uint(d, what)).collect()
+}
+
+fn encode_part(e: &mut Encoder<Bounded>, role: &str, part: &Part) -> Result<()> {
+    emit("part", e.array(4))?;
+    emit("part.role", e.str(role))?;
+    emit("part.dtype", e.u8(part.dtype.code()))?;
+    encode_shape(e, &part.shape)?;
+    match &part.body {
+        Body::Inline(bytes) => {
+            emit("part.inline", e.bytes(bytes))?;
+        }
+        Body::Segments(segments) => {
+            emit("part.segments", e.array(segments.len() as u64))?;
+            for segment in segments {
+                encode_ref(e, segment)?;
+            }
+        }
+    }
+    Ok(())
+}
+
+fn decode_part(d: &mut Decoder<'_>, what: &str) -> Result<(String, Part)> {
+    exact_array(d, what, 4)?;
+    let role = text(d, &format!("{what}.role"), limits::MAX_NAME_BYTES)?;
+    let dtype = Dtype::from_code(uint(d, &format!("{what}.dtype"))?)?;
+    let shape = decode_shape(d, &format!("{what}.shape"))?;
+    let body = match d.datatype().map_err(|e| malformed(what, e))? {
+        Type::Bytes => {
+            let bytes = d.bytes().map_err(|e| malformed(what, e))?;
+            if bytes.len() as u64 > limits::INLINE_MAX_BYTES {
+                return refuse(
+                    Code::INLINE_THRESHOLD,
+                    format!(
+                        "{what}.body: {} inline bytes exceeds {}",
+                        bytes.len(),
+                        limits::INLINE_MAX_BYTES
+                    ),
+                );
+            }
+            Body::Inline(bytes.to_vec())
+        }
+        Type::Array => {
+            let n = list_len(d, &format!("{what}.segments"), limits::MAX_SEGMENTS, true)?;
+            let mut segments = Vec::with_capacity(n);
+            for i in 0..n {
+                segments.push(decode_ref(d, &format!("{what}.segments[{i}]"))?);
+            }
+            Body::Segments(segments)
+        }
+        got => {
+            return refuse(
+                Code::WRONG_TYPE,
+                format!("{what}.body: expected bytes or array, got {got}"),
+            )
+        }
+    };
+    Ok((role, Part { dtype, shape, body }))
+}
+
+fn encode_tensor(
+    e: &mut Encoder<Bounded>,
+    key: &str,
+    tensor: &Tensor,
+    encodings: &std::collections::HashMap<String, usize>,
+) -> Result<()> {
+    emit("tensor", e.array(5))?;
+    emit("tensor.key", e.str(key))?;
+    emit("tensor.dtype", e.u8(tensor.dtype.code()))?;
+    encode_shape(e, &tensor.shape)?;
+    let index = encodings
+        .get(&tensor.encoding)
+        .copied()
+        .ok_or_else(|| Refusal {
+            code: Code::ENCODING_MISMATCH,
+            detail: format!("{key}: encoding {} is not listed", tensor.encoding),
+        })?;
+    emit("tensor.encoding", e.u64(index as u64))?;
+    emit("tensor.parts", e.array(tensor.parts.len() as u64))?;
+    for (role, part) in &tensor.parts {
+        encode_part(e, role, part)?;
+    }
+    Ok(())
+}
+
+fn decode_tensor(
+    d: &mut Decoder<'_>,
+    what: &str,
+    encodings: &[ObjectRef],
+) -> Result<(String, Tensor)> {
+    exact_array(d, what, 5)?;
+    let key = text(d, &format!("{what}.key"), limits::MAX_KEY_BYTES)?;
+    let dtype = Dtype::from_code(uint(d, &format!("{what}.dtype"))?)?;
+    let shape = decode_shape(d, &format!("{what}.shape"))?;
+    let encoding_index =
+        usize::try_from(uint(d, &format!("{what}.encoding"))?).map_err(|_| Refusal {
+            code: Code::NUMBER_RANGE,
+            detail: format!("{what}: encoding index is outside this platform's usize range"),
+        })?;
+    let encoding = encodings
+        .get(encoding_index)
+        .ok_or_else(|| Refusal {
+            code: Code::ENCODING_MISMATCH,
+            detail: format!(
+                "{what}: encoding index {encoding_index} outside {} entries",
+                encodings.len()
+            ),
+        })?
+        .id();
+    let n = list_len(d, &format!("{what}.parts"), limits::MAX_PARTS, true)?;
+    let mut parts = Vec::with_capacity(n);
+    for i in 0..n {
+        parts.push(decode_part(d, &format!("{what}.parts[{i}]"))?);
+    }
+    Ok((
+        key,
+        Tensor {
+            dtype,
+            shape,
+            encoding,
+            parts,
+        },
+    ))
+}
+
+pub fn encode_header(header: &Header) -> Result<Vec<u8>> {
+    header.validate_structure()?;
+    encode_header_unvalidated(header)
+}
+
+pub fn encode_header_unvalidated(header: &Header) -> Result<Vec<u8>> {
+    let mut e = Encoder::new(Bounded { bytes: Vec::new() });
+    let encoding_index: std::collections::HashMap<String, usize> = header
+        .encodings
+        .iter()
+        .enumerate()
+        .map(|(index, encoding)| (encoding.id(), index))
+        .collect();
+    emit("header", e.array(5))?;
+    emit("header.format", e.str(Header::FORMAT))?;
+
+    emit("header.configs", e.array(header.configs.len() as u64))?;
+    for (name, config) in &header.configs {
+        emit("config", e.array(4))?;
+        emit("config.name", e.str(name))?;
+        emit(
+            "config.digest",
+            e.bytes(&digest_bytes("config digest", &config.sha256)?),
+        )?;
+        emit("config.length", e.u64(config.length))?;
+        emit("config.media_type", e.str(&config.media_type))?;
+    }
+
+    emit("header.assets", e.array(header.assets.len() as u64))?;
+    for (name, asset) in &header.assets {
+        emit("asset", e.array(5))?;
+        emit("asset.name", e.str(name))?;
+        emit(
+            "asset.logical_digest",
+            e.bytes(&digest_bytes(
+                "asset logical digest",
+                &asset.logical_sha256,
+            )?),
+        )?;
+        emit("asset.logical_length", e.u64(asset.logical_length))?;
+        emit("asset.media_type", e.str(&asset.media_type))?;
+        emit("asset.segments", e.array(asset.segments.len() as u64))?;
+        for segment in &asset.segments {
+            encode_ref(&mut e, segment)?;
+        }
+    }
+
+    emit("header.encodings", e.array(header.encodings.len() as u64))?;
+    for encoding in &header.encodings {
+        encode_ref(&mut e, encoding)?;
+    }
+
+    emit("header.components", e.array(header.components.len() as u64))?;
+    for (name, tensors) in &header.components {
+        emit("component", e.array(2))?;
+        emit("component.name", e.str(name))?;
+        emit("component.tensors", e.array(tensors.len() as u64))?;
+        for (key, tensor) in tensors {
+            encode_tensor(&mut e, key, tensor, &encoding_index)?;
+        }
+    }
+    Ok(e.into_writer().bytes)
+}
+
+fn decode(bytes: &[u8]) -> Result<Header> {
+    if bytes.len() > Header::MAX_BYTES {
+        return refuse(
+            Code::SIZE_CAP,
+            format!(
+                "header is {} bytes, cap is {}",
+                bytes.len(),
+                Header::MAX_BYTES
+            ),
+        );
+    }
+    let mut d = Decoder::new(bytes);
+    exact_array(&mut d, "header", 5)?;
+    let format = text(&mut d, "header.format", 64)?;
+    if format != Header::FORMAT {
+        return refuse(
+            Code::UNKNOWN_FORMAT,
+            format!("Header: format {format:?} != {:?}", Header::FORMAT),
+        );
+    }
+
+    let config_count = list_len(&mut d, "header.configs", limits::MAX_COMPONENTS, false)?;
+    let mut configs = Vec::with_capacity(config_count);
+    for i in 0..config_count {
+        let what = format!("header.configs[{i}]");
+        exact_array(&mut d, &what, 4)?;
+        configs.push((
+            text(&mut d, &format!("{what}.name"), limits::MAX_NAME_BYTES)?,
+            ConfigRef {
+                sha256: digest_hex(&mut d, &format!("{what}.digest"))?,
+                length: uint(&mut d, &format!("{what}.length"))?,
+                media_type: text(&mut d, &format!("{what}.media_type"), 128)?,
+            },
+        ));
+    }
+
+    let asset_count = list_len(&mut d, "header.assets", limits::MAX_ENTRIES, false)?;
+    let mut assets = Vec::with_capacity(asset_count);
+    for i in 0..asset_count {
+        let what = format!("header.assets[{i}]");
+        exact_array(&mut d, &what, 5)?;
+        let name = text(&mut d, &format!("{what}.name"), limits::MAX_KEY_BYTES)?;
+        let logical_sha256 = digest_hex(&mut d, &format!("{what}.logical_digest"))?;
+        let logical_length = uint(&mut d, &format!("{what}.logical_length"))?;
+        let media_type = text(&mut d, &format!("{what}.media_type"), 128)?;
+        let count = list_len(
+            &mut d,
+            &format!("{what}.segments"),
+            limits::MAX_SEGMENTS,
+            true,
+        )?;
+        let mut segments = Vec::with_capacity(count);
+        for j in 0..count {
+            segments.push(decode_ref(&mut d, &format!("{what}.segments[{j}]"))?);
+        }
+        assets.push((
+            name,
+            Asset {
+                logical_sha256,
+                logical_length,
+                media_type,
+                segments,
+            },
+        ));
+    }
+
+    let encoding_count = list_len(&mut d, "header.encodings", limits::MAX_TOTAL_REFS, true)?;
+    let mut encodings = Vec::with_capacity(encoding_count);
+    for i in 0..encoding_count {
+        encodings.push(decode_ref(&mut d, &format!("header.encodings[{i}]"))?);
+    }
+
+    let component_count = list_len(&mut d, "header.components", limits::MAX_COMPONENTS, false)?;
+    let mut components = Vec::with_capacity(component_count);
+    let mut tensor_count = 0usize;
+    for i in 0..component_count {
+        let what = format!("header.components[{i}]");
+        exact_array(&mut d, &what, 2)?;
+        let name = text(&mut d, &format!("{what}.name"), limits::MAX_NAME_BYTES)?;
+        let count = list_len(
+            &mut d,
+            &format!("{what}.tensors"),
+            limits::MAX_TENSORS,
+            true,
+        )?;
+        tensor_count = tensor_count
+            .checked_add(count)
+            .ok_or_else(|| malformed(&what, "tensor count overflow"))?;
+        if tensor_count > limits::MAX_TENSORS {
+            return refuse(Code::COUNT_CAP, "whole-header tensor count over cap");
+        }
+        let mut tensors = Vec::with_capacity(count);
+        for j in 0..count {
+            tensors.push(decode_tensor(
+                &mut d,
+                &format!("{what}.tensors[{j}]"),
+                &encodings,
+            )?);
+        }
+        components.push((name, tensors));
+    }
+    if d.position() != bytes.len() {
+        return refuse(
+            Code::TRAILING_BYTES,
+            format!("header: trailing bytes at offset {}", d.position()),
+        );
+    }
+    Ok(Header {
+        configs,
+        assets,
+        encodings,
+        components,
+    })
+}
+
+pub fn decode_header(bytes: &[u8]) -> Result<Header> {
+    let header = decode(bytes)?;
+    if encode_header(&header)? != bytes {
+        return refuse(
+            Code::NONCANONICAL_ENCODING,
+            "stored header bytes are not the restricted deterministic CBOR encoding of their content",
+        );
+    }
+    header.validate_structure()?;
+    Ok(header)
+}

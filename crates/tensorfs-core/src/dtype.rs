@@ -35,6 +35,22 @@ const TABLE: [(&str, Dtype, u64); 12] = [
 ];
 
 impl Dtype {
+    pub fn code(self) -> u8 {
+        TABLE.iter().position(|(_, d, _)| *d == self).unwrap() as u8
+    }
+    pub fn from_code(code: u64) -> Result<Dtype> {
+        let index = usize::try_from(code).map_err(|_| crate::err::Refusal {
+            code: Code::NUMBER_RANGE,
+            detail: format!("dtype code {code} is outside this platform's usize range"),
+        })?;
+        TABLE
+            .get(index)
+            .map(|(_, d, _)| *d)
+            .ok_or_else(|| crate::err::Refusal {
+                code: Code::DTYPE_UNKNOWN,
+                detail: format!("dtype code {code} is outside 0..{}", TABLE.len()),
+            })
+    }
     pub fn parse(s: &str) -> Result<Dtype> {
         match TABLE.iter().find(|(n, _, _)| *n == s) {
             Some((_, d, _)) => Ok(*d),

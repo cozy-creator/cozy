@@ -63,7 +63,7 @@ if [ "$MODE" = "arms" ]; then
   say "2. a lease DROPPED instead of released — the row is kept for the reaper"
   "$TFS" read lease "$WORK/syn" "$SYN" --drop-unreleased
 
-  say "3. the plan: destination order is the caller's, never the header's"
+  say "3. the plan: caller construction order must exactly equal the ordered header"
   "$TFS" read plan "$WORK/syn" "$SYN" --window 1048576
 
   say "4. the pooled fill into a caller-owned ring"

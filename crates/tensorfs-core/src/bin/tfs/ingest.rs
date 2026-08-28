@@ -508,6 +508,59 @@ struct Prepared {
     target: Target,
 }
 
+fn construction_order(f: &Flags) -> Result<Vec<(String, String)>, ExitCode> {
+    let path = match flag(f, "order") {
+        Some(path) => path,
+        None => {
+            eprintln!(
+                "REFUSED CONSTRUCTION_ORDER_REQUIRED: artifact production requires \
+                 --order <json>; TensorFS never infers execution order from names or carriers"
+            );
+            return Err(ExitCode::FAILURE);
+        }
+    };
+    let bytes = match fs::read(path) {
+        Ok(bytes) => bytes,
+        Err(error) => {
+            eprintln!("REFUSED IO_FAILED: read construction order {path}: {error}");
+            return Err(ExitCode::FAILURE);
+        }
+    };
+    let value = match canon::parse(&bytes, limits::DOC_MAX_BYTES) {
+        Ok(value) => value,
+        Err(error) => return Err(bail(error)),
+    };
+    let rows = match tensorfs_core::canon::as_arr("construction order", "rows", &value) {
+        Ok(rows) => rows,
+        Err(error) => return Err(bail(error)),
+    };
+    let mut order = Vec::with_capacity(rows.len());
+    for (index, row) in rows.iter().enumerate() {
+        let row = match tensorfs_core::canon::as_arr("construction order", "row", row) {
+            Ok(row) if row.len() == 2 => row,
+            Ok(row) => {
+                eprintln!(
+                    "REFUSED WRONG_TYPE: construction order row {index} has arity {}, expected 2",
+                    row.len()
+                );
+                return Err(ExitCode::FAILURE);
+            }
+            Err(error) => return Err(bail(error)),
+        };
+        let component =
+            match tensorfs_core::canon::as_str("construction order", "component", &row[0]) {
+                Ok(value) => value.to_string(),
+                Err(error) => return Err(bail(error)),
+            };
+        let key = match tensorfs_core::canon::as_str("construction order", "key", &row[1]) {
+            Ok(value) => value.to_string(),
+            Err(error) => return Err(bail(error)),
+        };
+        order.push((component, key));
+    }
+    Ok(order)
+}
+
 /// Headers in, plan out. The one function `plan`, `run` and the worker all go through, so
 /// a preview and a run cannot disagree about what was going to happen.
 fn prepare(f: &Flags, target: &str) -> Result<Prepared, ExitCode> {
@@ -643,10 +696,21 @@ fn print_plan(p: &Prepared) {
 
 pub fn cmd_plan(target: &str, f: &Flags) -> ExitCode {
     let t0 = Instant::now();
-    let p = match prepare(f, target) {
+    let mut p = match prepare(f, target) {
         Ok(p) => p,
         Err(c) => return c,
     };
+    if flag(f, "order").is_some() {
+        let order = match construction_order(f) {
+            Ok(order) => order,
+            Err(code) => return code,
+        };
+        if let Err(error) = p.plan.apply_order(&order) {
+            return bail(error);
+        }
+    } else {
+        println!("order        UNBOUND preview only; run requires --order <json>");
+    }
     for (i, b) in p.verdicts.iter().enumerate() {
         println!(
             "verdict      {} -> {}/{} via {} ({} keys)",
@@ -747,6 +811,21 @@ fn session_of(f: &Flags, p: &Prepared) -> String {
             "topology",
             Value::str(topology_digest_of(&plan_topology(&p.plan))),
         ),
+        (
+            "order",
+            Value::arr(
+                p.plan
+                    .ops
+                    .iter()
+                    .map(|op| {
+                        Value::arr(vec![
+                            Value::str(op.component.clone()),
+                            Value::str(op.out_key.clone()),
+                        ])
+                    })
+                    .collect(),
+            ),
+        ),
     ]);
     tensorfs_core::ids::object_id(&canon::write(&v))
         .trim_start_matches("sha256:")
@@ -758,10 +837,17 @@ fn session_of(f: &Flags, p: &Prepared) -> String {
 /// The coordinator side of a run: it prepares and previews, then hands the whole job to an
 /// isolated child. This process never opens the carrier's data region.
 pub fn cmd_run(root: &Path, target: &str, f: &Flags) -> ExitCode {
-    let p = match prepare(f, target) {
+    let mut p = match prepare(f, target) {
         Ok(p) => p,
         Err(c) => return c,
     };
+    let order = match construction_order(f) {
+        Ok(order) => order,
+        Err(code) => return code,
+    };
+    if let Err(error) = p.plan.apply_order(&order) {
+        return bail(error);
+    }
     if let Err(e) = p.plan.check_converts_something() {
         eprintln!("REFUSED {}: {}", e.code.as_str(), e.detail);
         return ExitCode::FAILURE;
@@ -779,7 +865,14 @@ pub fn cmd_run(root: &Path, target: &str, f: &Flags) -> ExitCode {
     for (k, v) in f.iter() {
         if matches!(
             k.as_str(),
-            "source" | "config" | "registry" | "spec-variant" | "tenant" | "ttl" | "isolation-tier"
+            "source"
+                | "config"
+                | "registry"
+                | "spec-variant"
+                | "order"
+                | "tenant"
+                | "ttl"
+                | "isolation-tier"
         ) {
             argv.push(format!("--{k}"));
             argv.push(v.clone());
@@ -812,10 +905,17 @@ pub fn cmd_run(root: &Path, target: &str, f: &Flags) -> ExitCode {
 
 pub fn cmd_worker(root: &Path, target: &str, f: &Flags) -> ExitCode {
     let t0 = Instant::now();
-    let p = match prepare(f, target) {
+    let mut p = match prepare(f, target) {
         Ok(p) => p,
         Err(c) => return c,
     };
+    let order = match construction_order(f) {
+        Ok(order) => order,
+        Err(code) => return code,
+    };
+    if let Err(error) = p.plan.apply_order(&order) {
+        return bail(error);
+    }
     if let Err(e) = p.plan.check_converts_something() {
         eprintln!("REFUSED {}: {}", e.code.as_str(), e.detail);
         return ExitCode::FAILURE;
@@ -1143,7 +1243,7 @@ pub fn cmd_reingest(root: &Path, header_hex: &str, target: &str, f: &Flags) -> E
         })
         .collect();
     let conv = ok!(convert::converter("cozytensors.inherit/1"));
-    let plan = ok!(convert::plan(
+    let mut plan = ok!(convert::plan(
         conv,
         &views,
         &target,
@@ -1151,6 +1251,11 @@ pub fn cmd_reingest(root: &Path, header_hex: &str, target: &str, f: &Flags) -> E
         &rekey
     ));
     drop(views);
+    let order = match construction_order(f) {
+        Ok(order) => order,
+        Err(code) => return code,
+    };
+    ok!(plan.apply_order(&order));
 
     println!("converter    {} ({})", plan.converter, plan.class_name);
     println!(

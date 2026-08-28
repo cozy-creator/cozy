@@ -9,7 +9,7 @@ use tensorfs_core::checkpoint;
 use tensorfs_core::err::{Code, Refusal};
 use tensorfs_core::fill::{guard_block_granular, Class, Xform};
 use tensorfs_core::header::Header;
-use tensorfs_core::ids::{Doc, ObjectRef};
+use tensorfs_core::ids::ObjectRef;
 use tensorfs_core::manifest::{Draft, Entry, SnapshotManifest};
 use tensorfs_core::meta::Meta;
 use tensorfs_core::project;
@@ -44,10 +44,6 @@ fn load(root: &Path, hex: &str) -> Result<(Store, SnapshotManifest, Header), Ref
     Ok((s, m, h))
 }
 
-/// Numeric-aware segment order: `down_blocks.2` before `down_blocks.10`, which byte order
-/// gets backwards. This is a STAND-IN for the caller's real code-topology traversal — the
-/// runtime supplies the true one and TensorFS guarantees only that it uses what it is given.
-/// It is here because the difference from key order is the whole point of the contract.
 /// Every component this header carries. The `tfs` CLI's own plans are whole-artifact by
 /// construction — it has no code topology to narrow by — so it declares the full set
 /// (#570b). A caller that binds a subset declares the subset.
@@ -55,27 +51,9 @@ fn all_components(h: &Header) -> Vec<String> {
     h.components.iter().map(|(c, _)| c.clone()).collect()
 }
 
-fn module_order(h: &Header) -> Vec<(String, String)> {
-    let mut v: Vec<(String, String)> = h
-        .tensors()
+fn construction_order(h: &Header) -> Vec<(String, String)> {
+    h.tensors()
         .map(|(c, k, _)| (c.clone(), k.clone()))
-        .collect();
-    let comp_index = |c: &String| h.components.iter().position(|(n, _)| n == c).unwrap_or(0);
-    v.sort_by(|a, b| {
-        comp_index(&a.0)
-            .cmp(&comp_index(&b.0))
-            .then_with(|| seg_key(&a.1).cmp(&seg_key(&b.1)))
-    });
-    v
-}
-
-/// One path's segments as (is_number, number, text) so numeric segments compare numerically.
-fn seg_key(k: &str) -> Vec<(u8, u64, String)> {
-    k.split('.')
-        .map(|s| match s.parse::<u64>() {
-            Ok(n) => (0u8, n, String::new()),
-            Err(_) => (1u8, 0, s.to_string()),
-        })
         .collect()
 }
 
@@ -122,21 +100,9 @@ pub fn cmd_lease(root: &Path, hex: &str, f: &Flags) -> ExitCode {
 
 // ---------------------------------------------------------------- plan
 
-/// `--order module` (default) is the caller's traversal. `key` and `reverse` are
-/// BENCHMARK-ONLY arms: `key` is the header's own order and `reverse` is the maximal
-/// scatter, and they exist so the destination-order contract can be MEASURED on real bytes
-/// rather than quoted from v1.
 fn plan_of(h: &Header, f: &Flags) -> Result<ReadPlan, Refusal> {
     let window: u64 = flag_num(f, "window", 16 << 20);
-    match flag(f, "order") {
-        Some("key") => read::plan_in_key_order(h, window),
-        Some("reverse") => {
-            let mut v = module_order(h);
-            v.reverse();
-            read::plan_for_traversal(h, &v, &all_components(h), window)
-        }
-        _ => read::plan_for_traversal(h, &module_order(h), &all_components(h), window),
-    }
+    read::plan_for_traversal(h, &construction_order(h), &all_components(h), window)
 }
 
 pub fn cmd_plan(root: &Path, hex: &str, f: &Flags) -> ExitCode {
@@ -144,11 +110,10 @@ pub fn cmd_plan(root: &Path, hex: &str, f: &Flags) -> ExitCode {
     let window: u64 = flag_num(f, "window", 16 << 20);
     let dest = ok!(read::plan_for_traversal(
         &h,
-        &module_order(&h),
+        &construction_order(&h),
         &all_components(&h),
         window
     ));
-    let keyed = ok!(read::plan_in_key_order(&h, window));
     println!(
         "items:      {} covering {} B ({} B disk leg)",
         dest.items.len(),
@@ -165,65 +130,17 @@ pub fn cmd_plan(root: &Path, hex: &str, f: &Flags) -> ExitCode {
     // The contract, asserted rather than assumed: the emitted plan follows the traversal it
     // was given, in that exact order. Proved against the REVERSED traversal too, because a
     // planner that quietly re-sorted would pass the identity case and fail this one.
-    let mut rev = module_order(&h);
+    let mut rev = construction_order(&h);
     rev.reverse();
-    let rp = ok!(read::plan_for_traversal(
-        &h,
-        &rev,
-        &all_components(&h),
-        window
-    ));
-    let expect: Vec<String> = rev
-        .iter()
-        .flat_map(|(c, k)| {
-            h.components
-                .iter()
-                .find(|(x, _)| x == c)
-                .and_then(|(_, ts)| ts.iter().find(|(y, _)| y == k))
-                .map(|(_, t)| {
-                    t.parts
-                        .iter()
-                        .map(|(r, _)| format!("{c}/{k}#{r}"))
-                        .collect::<Vec<_>>()
-                })
-                .unwrap_or_default()
-        })
-        .collect();
-    let got: Vec<String> = {
-        let mut v: Vec<String> = Vec::new();
-        for it in &rp.items {
-            if v.last().map(|x| x != &it.what).unwrap_or(true) {
-                v.push(it.what.clone());
-            }
-        }
-        v
-    };
     println!(
-        "contract:   plan follows the caller's traversal exactly: {} ({} spans)",
-        if got == expect {
-            "YES"
-        } else {
-            "NO — DEFECT"
-        },
-        got.len()
+        "contract:   reversed caller traversal refuses: {}",
+        match read::plan_for_traversal(&h, &rev, &all_components(&h), window) {
+            Err(e) if e.code == Code::TRAVERSAL_ORDER_MISMATCH => "YES",
+            _ => "NO — DEFECT",
+        }
     );
-    let differs = dest
-        .items
-        .iter()
-        .zip(keyed.items.iter())
-        .position(|(a, b)| a.what != b.what);
-    match differs {
-        Some(i) => println!(
-            "diverges:   at item {i} — destination {:?} vs header key {:?}",
-            dest.items[i].what, keyed.items[i].what
-        ),
-        None => println!("diverges:   NO — this header's key order already is module order"),
-    }
     for (n, it) in dest.items.iter().take(6).enumerate() {
         println!("  dest[{n}] {} +{} {} B", it.what, it.dest_off, it.len);
-    }
-    for (n, it) in keyed.items.iter().take(6).enumerate() {
-        println!("  key [{n}] {}", it.what);
     }
     ExitCode::SUCCESS
 }
@@ -377,11 +294,11 @@ pub fn cmd_verify_fill(root: &Path, hex: &str, f: &Flags) -> ExitCode {
     let (s, _, h) = ok!(load(root, hex));
     let order = match flag(f, "order") {
         Some("reverse") => {
-            let mut v = module_order(&h);
+            let mut v = construction_order(&h);
             v.reverse();
             v
         }
-        _ => module_order(&h),
+        _ => construction_order(&h),
     };
     let mut hasher = Sha256::new();
     let t0 = Instant::now();
@@ -966,7 +883,7 @@ pub fn cmd_arms(root: &Path, hex: &str) -> ExitCode {
     );
 
     // 5. a traversal that does not name every tensor
-    let mut short = module_order(&h);
+    let mut short = construction_order(&h);
     short.pop();
     a.arm(
         "traversal missing a tensor",
@@ -979,7 +896,7 @@ pub fn cmd_arms(root: &Path, hex: &str) -> ExitCode {
     let comps = all_components(&h);
     let one = comps[0].clone();
     let only_one = std::slice::from_ref(&one);
-    let scoped: Vec<(String, String)> = module_order(&h)
+    let scoped: Vec<(String, String)> = construction_order(&h)
         .into_iter()
         .filter(|(c, _)| c == &one)
         .collect();
@@ -1015,7 +932,7 @@ pub fn cmd_arms(root: &Path, hex: &str) -> ExitCode {
     // not — the scope check runs before the header lookup, so both reach it, and the arm
     // must exist on a single-component fixture too.
     let mut smuggled = scoped.clone();
-    match module_order(&h).into_iter().find(|(c, _)| c != &one) {
+    match construction_order(&h).into_iter().find(|(c, _)| c != &one) {
         Some(foreign) => smuggled.push(foreign),
         None => smuggled.push(("a_sibling_component".to_string(), scoped[0].1.clone())),
     }
@@ -1076,7 +993,7 @@ pub fn cmd_arms(root: &Path, hex: &str) -> ExitCode {
     let pretty = ok!(project::render(&hb, 1 << 26));
     a.arm(
         "pretty header decoded as a document",
-        Code::NONCANONICAL_ENCODING,
+        Code::MALFORMED_CBOR,
         Header::parse(pretty.as_bytes()),
     );
     println!(

@@ -1,0 +1,4 @@
+doc: header
+expect: refuse
+code: MALFORMED_CBOR
+note: floats are outside the profile

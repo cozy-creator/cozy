@@ -134,9 +134,16 @@ struct P<'a> {
     b: &'a [u8],
     i: usize,
     depth: usize,
+    depth_max: usize,
 }
 
 pub fn parse(bytes: &[u8], max_bytes: usize) -> Result<Value> {
+    parse_with_depth(bytes, max_bytes, limits::DEPTH_MAX)
+}
+
+/// Projection-tool reader with an explicit depth. Stored documents always call [`parse`]
+/// and retain the frozen schema depth.
+pub fn parse_with_depth(bytes: &[u8], max_bytes: usize, depth_max: usize) -> Result<Value> {
     if bytes.len() > max_bytes {
         return refuse(
             Code::SIZE_CAP,
@@ -147,6 +154,7 @@ pub fn parse(bytes: &[u8], max_bytes: usize) -> Result<Value> {
         b: bytes,
         i: 0,
         depth: 0,
+        depth_max,
     };
     let v = p.value()?;
     p.ws();
@@ -178,7 +186,7 @@ impl<'a> P<'a> {
         refuse(code, format!("{what} at offset {}", self.i))
     }
     fn value(&mut self) -> Result<Value> {
-        if self.depth > limits::DEPTH_MAX {
+        if self.depth > self.depth_max {
             return self.err(
                 Code::DEPTH_CAP,
                 "nesting deeper than the fixed schema depth",

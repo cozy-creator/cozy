@@ -21,10 +21,15 @@ pub const SEGMENT_PROFILE: &str = "fixed-64m/1";
 /// sets) live under ONE directory whose leaf names ARE their digests. The path terminal is
 /// therefore checkable against the object it names, with no second naming authority.
 pub const CLOSURE_DIR: &str = "closure";
+pub const ASSET_DIR: &str = "assets";
 
 /// The canonical path of one contained document.
 pub fn closure_path(sha256: &str) -> String {
     format!("{CLOSURE_DIR}/{sha256}.json")
+}
+
+pub fn asset_path(sha256: &str) -> String {
+    format!("{ASSET_DIR}/{sha256}.bin")
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -169,7 +174,7 @@ const RESERVED: [&str; 22] = [
     "com9", "lpt1", "lpt2", "lpt3", "lpt4", "lpt5", "lpt6", "lpt7", "lpt8", "lpt9",
 ];
 
-fn check_path(p: &str) -> Result<()> {
+pub(crate) fn check_path(p: &str) -> Result<()> {
     if p.is_empty() || p.len() > limits::MAX_KEY_BYTES {
         return refuse(
             Code::PATH_ILLEGAL,
@@ -204,12 +209,18 @@ fn check_path(p: &str) -> Result<()> {
 
 /// One contained-document path whose terminal must equal the digest it names.
 fn check_content_addressed(path: &str, entry: &Entry) -> Result<()> {
-    let leaf = match path.strip_prefix(CLOSURE_DIR) {
-        Some(rest) => match rest.strip_prefix('/') {
-            Some(l) => l,
-            None => return Ok(()), // a sibling like "closure-notes.txt" is an ordinary path
-        },
-        None => return Ok(()),
+    let (leaf, suffix) = if let Some(rest) = path.strip_prefix(CLOSURE_DIR) {
+        match rest.strip_prefix('/') {
+            Some(leaf) => (leaf, ".json"),
+            None => return Ok(()),
+        }
+    } else if let Some(rest) = path.strip_prefix(ASSET_DIR) {
+        match rest.strip_prefix('/') {
+            Some(leaf) => (leaf, ".bin"),
+            None => return Ok(()),
+        }
+    } else {
+        return Ok(());
     };
     let obj = match entry {
         Entry::File(o) => o,
@@ -220,7 +231,7 @@ fn check_content_addressed(path: &str, entry: &Entry) -> Result<()> {
             )
         }
     };
-    match leaf.strip_suffix(".json") {
+    match leaf.strip_suffix(suffix) {
         Some(stem) if stem == obj.sha256 => Ok(()),
         _ => refuse(
             Code::PATH_DIGEST_MISMATCH,

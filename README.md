@@ -15,6 +15,7 @@ cargo run --release -p tensorfs-core --bin tfs -- vectors gen     # rewrite it (
 cargo run --release -p tensorfs-core --bin tfs -- bench 3699 50   # writer throughput + peak RSS
 cargo run --release -p tensorfs-core --bin tfs -- flip            # identity-flip matrix
 cargo run --release -p tensorfs-core --bin tfs -- id <file>       # object id + derived ids
+tfs cbor encode|decode|check <file>                               # deterministic header seam
 ```
 
 ## checkpoints (tfs-015)
@@ -57,7 +58,7 @@ predicate. Reader depth is load-bearing: 0.32 GB/s cold at queue depth 1 against
 
 ```bash
 tfs read lease <root> <snap>            # acquire, verify, release ONE ReadLease
-tfs read plan|fill <root> <snap>        # destination order; the pooled fill into a ring
+tfs read plan|fill <root> <snap>        # stored construction order; the pooled fill ring
 tfs read verify-fill|prove <root> <snap>  # the sequential path; delivered bytes vs the header
 tfs read span <root> <snap> <c> <k> <role> <off> <len>
 tfs read arms|tear <root> <snap>        # red arms; tear a verified object UNDER a live lease

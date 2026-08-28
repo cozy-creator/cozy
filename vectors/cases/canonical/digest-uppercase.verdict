@@ -1,4 +1,0 @@
-doc: header
-expect: refuse
-code: MALFORMED_DIGEST
-note: uppercase hex in a digest

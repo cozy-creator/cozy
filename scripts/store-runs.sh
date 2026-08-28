@@ -147,10 +147,10 @@ red_section() {
 
   hr "RED 5 — pretty-printed document twin refuses at put"
   fresh "$S"
-  local DOC=vectors/cases/header/plain-fp8.json
+  local DOC=vectors/cases/header/plain-fp8.cbor
   local did dlen
   did=$(sha256sum "$DOC" | cut -d' ' -f1); dlen=$(stat -c%s "$DOC")
-  python3 -c "import json,sys; d=json.load(open('$DOC')); open('$WORK/pretty.json','w').write(json.dumps(d, indent=2, sort_keys=True))"
+  "$TFS" cbor decode "$DOC" --out "$WORK/pretty.json"
   echo "canonical: $dlen bytes  pretty twin: $(stat -c%s "$WORK/pretty.json") bytes"
   "$TFS" put "$S" "$DOC" --expect "$did" --expect-length "$dlen"
   "$TFS" put "$S" "$WORK/pretty.json" --expect "$did" --expect-length "$dlen"; echo "exit=$?"

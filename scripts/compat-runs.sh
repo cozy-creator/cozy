@@ -81,14 +81,14 @@ build_pairs() {
   mkdir -p "$W"
   for row in $PAIRS; do
     name="${row%%:*}"; rest="${row#*:}"; art="${rest%%:*}"; twin="${rest#*:}"
-    [ -f "$W/$name.header.json" ] && continue
+    [ -f "$W/$name.header.cbor" ] && continue
     if [ -n "$twin" ]; then
       nice -n 19 python3 scripts/h3-pairs.py fold "$art" "$W/$name.rows.json" "$twin" >/dev/null || exit 1
     else
       nice -n 19 python3 scripts/h3-pairs.py rows "$art" "$W/$name.rows.json" >/dev/null || exit 1
     fi
     nice -n 19 "$TFS" compat import "$W/$name.rows.json" \
-      --out-header "$W/$name.header.json" --out-code "$W/$name.code.json" \
+      --out-header "$W/$name.header.cbor" --out-code "$W/$name.code.json" \
       --out-closure "$W/$name.closure" >"$W/$name.import" || exit 1
   done
 }
@@ -104,7 +104,7 @@ print(','.join('sha256:'+hashlib.sha256(p.read_bytes()).hexdigest()
 # chk <report-name> <code-of> <header-of> <lane> [extra flags...] — one run, one report.
 chk() {
   local name="$1" c="$2" h="$3" lane="$4"; shift 4
-  nice -n 19 "$TFS" compat check "$W/$c.code.json" "$W/$h.header.json" \
+  nice -n 19 "$TFS" compat check "$W/$c.code.json" "$W/$h.header.cbor" \
     --closure "$(cl "$h")$([ "$c" != "$h" ] && printf ,%s "$(cl "$c")")" \
     --pin "$(pin_of "$h"),$(pin_of "$c")" --lane "$lane" --out "$W/compat.$name.json" "$@" 2>&1
 }
@@ -164,7 +164,7 @@ pairs_section() {
     vae vae-f32 vae-f16 local_unbordered
   grade_is CONVERTIBLE "graded, naming the registered conversion" \
     "$TFS" grade "$W/compat.vae.json" --registry "$W/reg.f16f32.json" \
-      --code "$W/vae-f32.code.json" --header "$W/vae-f16.header.json" \
+      --code "$W/vae-f32.code.json" --header "$W/vae-f16.header.cbor" \
       --closure "$(cl vae-f16)" --pin "$(pin_of vae-f16)"
   echo "  and with NO registration the same pair is INCOMPATIBLE — not over-constraint:"
   echo "  with no registered lossless mapping there is no conversion to name, and inventing"
@@ -268,14 +268,14 @@ arms_section() {
     "$TFS" grade register empty widen f16:f32 --corpus "$W/empty.corpus"
 
   hr "the code topology's closed vocabulary"
-  red MISSING_FIELD "an empty accepts list" "$TFS" compat check "$W/bad-accepts.code.json" "$W/vae-f16.header.json"
+  red MISSING_FIELD "an empty accepts list" "$TFS" compat check "$W/bad-accepts.code.json" "$W/vae-f16.header.cbor"
   red UNKNOWN_FIELD "a third satisfaction verdict in a report" "$TFS" grade "$W/bad-verdict.report.json"
   red UNKNOWN_FIELD "a lane outside the closed set" "$TFS" grade "$W/bad-lane.report.json"
   red UNKNOWN_FIELD "a fifth grade in a decision" "$TFS" grade decision "$W/bad-grade.decision.json"
 
   hr "the pinned registry: an unaliased spec is DATA, not EXECUTION"
   verdict_cmd "Mismatch UNKNOWN_TO_LOCAL_CAPABILITY" "fp8 checkpoint against a plain-only pin" \
-    "$TFS" compat check "$W/curve-fp8.code.json" "$W/curve-fp8.header.json" \
+    "$TFS" compat check "$W/curve-fp8.code.json" "$W/curve-fp8.header.cbor" \
       --closure "$(cl curve-fp8)" --lane canonical \
       --pin sha256:88c2f114d68d7e30f0a003a0880a28ded359476ac3cddb7891b6ab7f056d9907
 
@@ -289,10 +289,10 @@ arms_section() {
 verifier_section() {
   build_pairs
   hr "the bounded document interface: one file in, one file out"
-  green "build the request" "$TFS" verify-request "$W/vae-f32.code.json" "$W/vae-f16.header.json" \
+  green "build the request" "$TFS" verify-request "$W/vae-f32.code.json" "$W/vae-f16.header.cbor" \
     --closure "$(cl vae-f16)" --registry "$W/reg.f16f32.json" --lane local_unbordered \
     --pin "$(pin_of vae-f16)" --out "$W/req.json"
-  nice -n 19 "$TFS" verify-request "$W/vae-f32.code.json" "$W/vae-f16.header.json" \
+  nice -n 19 "$TFS" verify-request "$W/vae-f32.code.json" "$W/vae-f16.header.cbor" \
     --closure "$(cl vae-f16)" --registry "$W/reg.f16f32.json" --lane local_unbordered \
     --pin "$(pin_of vae-f16)" --out "$W/req.json" | sed 's/^/  /'
   green "run the verifier" "$TFS" verify-compat "$W/req.json" "$W/resp.json"
@@ -308,7 +308,7 @@ verifier_section() {
   rm -f "$W/resp-absent.json"
   red VERIFIER_OUTPUT_INCOMPLETE "a crashed verifier leaves no response at all" \
     "$TFS" verify-consume "$W/req.json" "$W/resp-absent.json"
-  green "build a DIFFERENT request" "$TFS" verify-request "$W/full-bf16.code.json" "$W/curve-bf16.header.json" \
+  green "build a DIFFERENT request" "$TFS" verify-request "$W/full-bf16.code.json" "$W/curve-bf16.header.cbor" \
     --closure "$(cl curve-bf16)" --pin "$(pin_of curve-bf16)" --out "$W/req2.json"
   red VERIFIER_OUTPUT_INCOMPLETE "the answer to another question" \
     "$TFS" verify-consume "$W/req2.json" "$W/resp.json"
@@ -449,7 +449,7 @@ d['tensors']=[t for t in d['tensors'] if t['key'] not in ('latents_mean','latent
 d['provenance']=d['provenance']+' minus the two ComfyUI-only keys'
 pathlib.Path('$W/vae-shared.rows.json').write_text(json.dumps(d,sort_keys=True,separators=(',',':')))"
     nice -n 19 "$TFS" compat import "$W/vae-shared.rows.json" \
-      --out-header "$W/vae-shared.header.json" --out-code "$W/vae-shared.code.json" \
+      --out-header "$W/vae-shared.header.cbor" --out-code "$W/vae-shared.code.json" \
       --out-closure "$W/vae-shared.closure" >"$W/vae-shared.import"
   fi
   # The four keys the AdaLN-curve topology does not carry at all.
@@ -461,7 +461,7 @@ d['tensors']=[t for t in d['tensors'] if t['key'].startswith('time_embedder.')]
 d['provenance']=d['provenance']+' time_embedder only'
 pathlib.Path('$W/full-timeembed.rows.json').write_text(json.dumps(d,sort_keys=True,separators=(',',':')))"
     nice -n 19 "$TFS" compat import "$W/full-timeembed.rows.json" \
-      --out-header "$W/full-timeembed.header.json" --out-code "$W/full-timeembed.code.json" \
+      --out-header "$W/full-timeembed.header.cbor" --out-code "$W/full-timeembed.code.json" \
       --out-closure "$W/full-timeembed.closure" >"$W/full-timeembed.import"
   fi
   # A code topology whose accepts list is empty: admits nothing, says nothing.

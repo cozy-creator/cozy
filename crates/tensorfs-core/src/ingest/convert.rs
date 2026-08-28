@@ -238,9 +238,71 @@ pub struct Plan {
     pub folded_roles: Vec<String>,
     /// Header bytes the planner read. Tensor bytes read: zero, structurally.
     pub header_bytes: u64,
+    construction_order_bound: bool,
 }
 
 impl Plan {
+    /// Apply the artifact recipe's exact construction traversal. The converter produces a
+    /// set of typed operations; it has no authority to invent their execution order.
+    pub fn apply_order(&mut self, order: &[(String, String)]) -> Result<()> {
+        if order.is_empty() {
+            return refuse(
+                Code::CONSTRUCTION_ORDER_REQUIRED,
+                "artifact production requires a non-empty construction traversal",
+            );
+        }
+        let mut by_key = std::collections::HashMap::with_capacity(self.ops.len());
+        for op in std::mem::take(&mut self.ops) {
+            let key = (op.component.clone(), op.out_key.clone());
+            if by_key.insert(key.clone(), op).is_some() {
+                return refuse(
+                    Code::DUPLICATE_KEY,
+                    format!("converter produced {}/{} twice", key.0, key.1),
+                );
+            }
+        }
+        let mut ordered = Vec::with_capacity(order.len());
+        for (component, key) in order {
+            match by_key.remove(&(component.clone(), key.clone())) {
+                Some(op) => ordered.push(op),
+                None => {
+                    return refuse(
+                        Code::TRAVERSAL_INCOMPLETE,
+                        format!("construction traversal repeats or invents {component}/{key}"),
+                    )
+                }
+            }
+        }
+        if !by_key.is_empty() {
+            let mut missing: Vec<String> = by_key
+                .keys()
+                .map(|(component, key)| format!("{component}/{key}"))
+                .collect();
+            missing.sort();
+            return refuse(
+                Code::TRAVERSAL_INCOMPLETE,
+                format!(
+                    "construction traversal omits {} tensor(s), first {:?}",
+                    missing.len(),
+                    &missing[..missing.len().min(3)]
+                ),
+            );
+        }
+        self.ops = ordered;
+        self.construction_order_bound = true;
+        Ok(())
+    }
+
+    pub(crate) fn require_order(&self) -> Result<()> {
+        if self.construction_order_bound {
+            Ok(())
+        } else {
+            refuse(
+                Code::CONSTRUCTION_ORDER_REQUIRED,
+                "artifact execution received a plan with no bound construction traversal",
+            )
+        }
+    }
     pub fn tensor_bytes_read(&self) -> u64 {
         0
     }
@@ -497,8 +559,6 @@ pub fn plan(
     if p.ops.is_empty() {
         return refuse(Code::MISSING_TENSOR, "the plan produces no tensor");
     }
-    p.ops
-        .sort_by(|a, b| (&a.component, &a.out_key).cmp(&(&b.component, &b.out_key)));
     Ok(p)
 }
 

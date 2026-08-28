@@ -294,7 +294,7 @@ impl IngestVerificationReceipt {
         for (what, got, want) in [
             ("subject", self.subject.clone(), subject.object_ref()),
             ("snapshot", self.snapshot.clone(), snapshot.object_ref()),
-            ("header", self.header.clone(), header.object_ref()),
+            ("header", self.header.clone(), header.object_ref()?),
             ("stamp", self.stamp.clone(), stamp.object_ref()),
         ] {
             if got != want {

@@ -710,17 +710,17 @@ impl CompatibilityReport {
         header: &Header,
         lane: Lane,
         o: &Outcome,
-    ) -> CompatibilityReport {
-        CompatibilityReport {
+    ) -> Result<CompatibilityReport> {
+        Ok(CompatibilityReport {
             contract: code.contract.clone(),
-            header: header.object_id(),
+            header: header.object_id()?,
             topology_required: code.topology_digest(),
             topology_present: header.topology_digest(),
             lane,
             satisfaction: o.satisfaction.clone(),
             facts: o.facts.clone(),
             unconsumed: o.unconsumed.clone(),
-        }
+        })
     }
 
     /// A release cut takes only a snapshot whose extras were all classified. An
