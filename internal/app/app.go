@@ -97,8 +97,8 @@ func Run(args []string, stdout, stderr io.Writer) int {
 // gate is the whole refusal precedence, in one place and in one order. -h/--help never
 // reaches here — Run answers it first, because help outranks every refusal (AXI 10) and a
 // gate that fired earlier would make `cozy job submit -h` a usage error, which it was.
-// Below help: authorization, then what this build carries, then the shape of the line,
-// then the world. The last one dials another process, so it is asked last.
+// Below help: authorization, then the required LocalService, then what this build carries,
+// then the shape of the line. This is cl-002's fixed 7 -> 9 -> 2 precedence.
 func gate(ctx *Context) *exit.Error {
 	c := ctx.Inv.Cmd
 
@@ -115,6 +115,16 @@ func gate(ctx *Context) *exit.Error {
 		return e.WithNext("cozy " + c.Name() + " " + strings.TrimSpace(c.Args) + " --yes")
 	}
 
+	// 9 — the LocalService is the only door to server-backed verbs. This deliberately
+	// outranks a planned row's exit 2: a server-backed command first states whether the
+	// stack it addresses exists, then whether this client build carries the operation.
+	if c.NeedsServer {
+		ctx.Service = service.Probe(ctx.Cfg)
+		if !ctx.Service.Up {
+			return ctx.Service.Unavailable()
+		}
+	}
+
 	// 2 — advertised in the manifest, not carried by this build. Ahead of arity: a planned
 	// row has no handler, so its MinArgs/MaxArgs describe a contract nothing here enforces,
 	// and "you are missing an argument" is a worse answer than the issue it lands with.
@@ -125,19 +135,9 @@ func gate(ctx *Context) *exit.Error {
 			WithNext("cozy commands", "cozy help "+c.Name())
 	}
 
-	// 2 — arity: a fact about the line itself, settled without reading disk or dialing.
+	// 2 — arity: a fact about the line itself, settled without handler dispatch.
 	if e := checkArgs(ctx.Inv); e != nil {
 		return e
-	}
-
-	// 9 — the LocalService is the only door to server-backed verbs. Last: it is the only
-	// gate that touches another process, and "not running on this host right now" is the
-	// least durable of the four — a malformed or unbuilt verb is refused without it.
-	if c.NeedsServer {
-		ctx.Service = service.Probe(ctx.Cfg)
-		if !ctx.Service.Up {
-			return ctx.Service.Unavailable()
-		}
 	}
 	return nil
 }

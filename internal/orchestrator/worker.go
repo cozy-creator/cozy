@@ -1442,6 +1442,15 @@ func (c *Orchestrator) Reconcile() (killed, forgotten int, e *exit.Error) {
 		return 0, 0, e
 	}
 	for _, row := range rows {
+		if row.WorkerID == "local" && row.State == "spawned_without_birth" {
+			return 0, 0, exit.Named(exit.Conflict, "worker_birth_identity_unresolved",
+				"local worker %s may have started before its OS birth identity was journaled",
+				row.InstanceID).
+				WithRemedy("do not start another worker on devices [%s]; locate and stop the orphan, then explicitly close its retained worker row",
+					strings.Join(row.Devices, ","))
+		}
+	}
+	for _, row := range rows {
 		if row.PID > 0 && birthOf(row.PID) == row.Birth && row.Birth != "" {
 			_ = killGroup(row.PID, syscall.SIGKILL)
 			killed++

@@ -1,14 +1,22 @@
 package launch
 
 import (
+	"context"
 	"encoding/json"
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"time"
 
 	"github.com/cozy-creator/cozy-creator/internal/exit"
 	"github.com/cozy-creator/cozy-creator/internal/home"
 )
+
+// DefaultRuntimeQueryTimeout bounds metadata-only runtime questions used while selecting
+// or starting a worker. These verbs read declarations; they do not construct an endpoint,
+// inspect a device, or load weights. A runtime that cannot answer them promptly is stalled,
+// and must not hold an orchestrator slot's in-memory starting fence forever.
+const DefaultRuntimeQueryTimeout = 5 * time.Second
 
 // THE LOCAL ARTIFACT INDEX IS NOT READ HERE ANY MORE (#567e).
 //
@@ -28,10 +36,11 @@ import (
 // Every question this host asks the runtime goes through here, so there is one place
 // that knows how to invoke it and one place that renders its refusals.
 type RuntimeCLI struct {
-	Bin  string   // the generation venv's cozy-runtime (home.VenvTool spells the platform)
-	Dir  string   // the endpoint project root
-	Home string   // COZY_HOME the runtime reads its artifact index out of
-	Env  []string // the allowlisted child environment (config.Tool)
+	Bin          string        // the generation venv's cozy-runtime (home.VenvTool spells the platform)
+	Dir          string        // the endpoint project root
+	Home         string        // COZY_HOME the runtime reads its artifact index out of
+	Env          []string      // the allowlisted child environment (config.Tool)
+	QueryTimeout time.Duration // metadata-query bound; zero selects DefaultRuntimeQueryTimeout
 }
 
 // Binary is the runtime a generation carries. An install already refused a generation
@@ -43,12 +52,40 @@ func Binary(generationDir string) string {
 
 // json runs one verb and decodes its `--json` document.
 func (r RuntimeCLI) call(out any, verb ...string) *exit.Error {
+	return r.callContext(context.Background(), out, verb...)
+}
+
+// query runs a metadata-only verb under the selection/start liveness bound. Fit and
+// doctor deliberately continue through call: they inspect a real host and may perform
+// work whose duration cannot honestly be represented by this metadata deadline.
+func (r RuntimeCLI) query(out any, verb ...string) *exit.Error {
+	timeout := r.QueryTimeout
+	if timeout <= 0 {
+		timeout = DefaultRuntimeQueryTimeout
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+	return r.callContext(ctx, out, verb...)
+}
+
+func (r RuntimeCLI) callContext(ctx context.Context, out any, verb ...string) *exit.Error {
 	args := append([]string{"--json", "--dir", r.Dir}, verb...)
-	cmd := exec.Command(r.Bin, args...)
+	cmd := exec.CommandContext(ctx, r.Bin, args...)
+	if _, bounded := ctx.Deadline(); bounded {
+		// CommandContext kills the direct child at the deadline. WaitDelay also closes a
+		// pipe retained by a misbehaving descendant, so the query itself remains bounded.
+		cmd.WaitDelay = 250 * time.Millisecond
+	}
 	cmd.Env = append(append([]string{}, r.Env...), "COZY_HOME="+r.Home)
 	var stdout, stderr strings.Builder
 	cmd.Stdout, cmd.Stderr = &stdout, &stderr
 	err := cmd.Run()
+	if ctx.Err() == context.DeadlineExceeded {
+		return exit.Named(exit.Deadline, "runtime_query_stalled",
+			"`cozy-runtime %s` did not answer its metadata query within %s",
+			strings.Join(verb, " "), r.queryTimeout()).
+			WithRemedy("the release's runtime must answer bindings and job-describe metadata without importing or constructing the endpoint")
+	}
 	if cmd.ProcessState == nil {
 		return exit.Named(exit.Structural, "runtime_missing",
 			"cannot run %s: %s", r.Bin, err).
@@ -65,6 +102,13 @@ func (r RuntimeCLI) call(out any, verb ...string) *exit.Error {
 			strings.Join(verb, " "), err)
 	}
 	return nil
+}
+
+func (r RuntimeCLI) queryTimeout() time.Duration {
+	if r.QueryTimeout > 0 {
+		return r.QueryTimeout
+	}
+	return DefaultRuntimeQueryTimeout
 }
 
 // runtimeRefusal renders the runtime's own words under its own exit code. The matrix is
@@ -146,7 +190,7 @@ func (r RuntimeCLI) Bindings() ([]Binding, []WeightlessPlan, *exit.Error) {
 		Bindings        []Binding        `json:"bindings"`
 		WeightlessPlans []WeightlessPlan `json:"weightless_plans"`
 	}
-	if e := r.call(&doc, "bindings"); e != nil {
+	if e := r.query(&doc, "bindings"); e != nil {
 		return nil, nil, e
 	}
 	return doc.Bindings, doc.WeightlessPlans, nil

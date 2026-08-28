@@ -302,7 +302,7 @@ type WorkerProcess struct {
 	SessionID                             string
 	Incarnation, ReadinessEpoch, Revision int64
 	Intake                                string
-	State                                 string // spawned | registered | closed
+	State                                 string // spawned_without_birth | spawned | registered | closed
 	OpenedAt                              string
 }
 
@@ -452,7 +452,7 @@ func (s *Store) SpawnWorker(w WorkerProcess) *exit.Error {
 	clauses := make([]string, 0, len(w.Devices))
 	args := []any{
 		w.InstanceID, w.Endpoint, nullable(w.Generation), w.ReleaseID, w.WorkerID,
-		deviceList(w.Devices), w.PID, w.Birth, "spawned", now(),
+		deviceList(w.Devices), w.PID, w.Birth, "spawned_without_birth", now(),
 	}
 	for _, d := range w.Devices {
 		clauses = append(clauses, "w.devices LIKE ?")
@@ -476,7 +476,7 @@ func (s *Store) SpawnWorker(w WorkerProcess) *exit.Error {
 		  pid=excluded.pid, birth=excluded.birth, devices=excluded.devices,
 		  generation=excluded.generation, release_id=excluded.release_id,
 		  session_id=NULL, incarnation=0, readiness_epoch=0, revision=0, intake='',
-		  state='spawned', opened_at=excluded.opened_at, closed_at=''`, args...)
+		  state='spawned_without_birth', opened_at=excluded.opened_at, closed_at=''`, args...)
 	if err != nil {
 		return exit.Internalf("cannot journal the worker process %s: %s", w.InstanceID, err)
 	}
@@ -594,10 +594,21 @@ func (s *Store) ReportWorker(sessionID, intake string, revision, epoch, incarnat
 // already journaled. The grant comes FIRST and the process second: a process that was
 // never admitted cannot exist, and the identity that proves it is the kernel's.
 func (s *Store) WorkerStarted(instanceID string, pid int, birth string) *exit.Error {
-	_, err := s.db.Exec(`UPDATE worker_processes SET pid=?, birth=? WHERE instance_id=?`,
+	if pid <= 0 || birth == "" {
+		return exit.Named(exit.Conflict, "worker_birth_identity_missing",
+			"worker %s started without a complete OS process-birth identity", instanceID).
+			WithRemedy("stop the child before releasing its device grant")
+	}
+	result, err := s.db.Exec(`UPDATE worker_processes SET pid=?, birth=?, state='spawned'
+		WHERE instance_id=? AND worker_id='local' AND state='spawned_without_birth'`,
 		pid, birth, instanceID)
 	if err != nil {
 		return exit.Internalf("cannot record the birth identity of %s: %s", instanceID, err)
+	}
+	if changed, _ := result.RowsAffected(); changed != 1 {
+		return exit.Named(exit.Conflict, "worker_birth_identity_not_pending",
+			"worker %s has no pending local birth identity", instanceID).
+			WithRemedy("only the launcher that reserved this worker may attach its OS identity")
 	}
 	return nil
 }
@@ -1973,6 +1984,17 @@ func (s *Store) Publications(limit int) ([]Publication, *exit.Error) {
 		out = append(out, p)
 	}
 	return out, nil
+}
+
+// PublicationStats is the part of local disk ownership `cozy gc` must disclose even
+// though it may not reclaim it. A job publication is the durable result, not a cache or
+// mirrored output governed by the media horizon.
+func (s *Store) PublicationStats() (items int, bytes int64, e *exit.Error) {
+	if err := s.db.QueryRow(`SELECT count(*),COALESCE(sum(bytes),0) FROM publications`).Scan(
+		&items, &bytes); err != nil {
+		return 0, 0, exit.Internalf("cannot summarize retained job publications: %s", err)
+	}
+	return items, bytes, nil
 }
 
 // ---------------------------------------------------------------- job checkpoints

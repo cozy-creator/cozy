@@ -156,7 +156,7 @@ func handleRent(ctx *Context) *exit.Error {
 	// with different prose, but it must not rewrite why the original purchase was made.
 	reason = op.Reason
 
-	hctx, cancel := hub.LongContext()
+	hctx, cancel := rentalCallContext(deadline)
 	r, e := c.Rent(hctx, op.RequestBody, reason, operationKey)
 	cancel()
 	if e != nil {
@@ -257,7 +257,20 @@ func handleRent(ctx *Context) *exit.Error {
 			return e
 		}
 		row.State = seen.State
-		return st.RecordRental(row)
+		if e := st.RecordRental(row); e != nil {
+			return e
+		}
+		if seen.State == hub.RentalReady {
+			return st.ClearRentalRelayRefusal(seen.ID)
+		}
+		refusal, e := st.RentalRelayRefusal(seen.ID)
+		if e != nil {
+			return e
+		}
+		if refusal != nil {
+			return refusal.Error()
+		}
+		return nil
 	}
 	ready, e := waitRental(ctx, c.WithToken(token, "rental owner token"), attachable.ID,
 		deadline, observeConvergence, func(r hub.Rental) bool { return r.Ready() })
@@ -301,6 +314,26 @@ func transient(e *exit.Error) bool {
 	return e.Code == exit.Unavailable || e.Code == exit.Deadline
 }
 
+func stamp(ts string) string {
+	if i := strings.IndexByte(ts, '.'); i >= 0 {
+		if z := strings.IndexAny(ts[i:], "Z+-"); z >= 0 {
+			return ts[:i] + ts[i+z:]
+		}
+	}
+	return ts
+}
+
+// rentalCallContext carries the caller's one explicit wall-clock bound into every Hub
+// request in the paid flow. Without it, a response body that kept moving one byte at a
+// time could remain live past --timeout because the polling loop checked the deadline
+// only after the body finished.
+func rentalCallContext(deadline time.Time) (context.Context, context.CancelFunc) {
+	if deadline.IsZero() {
+		return hub.LongContext()
+	}
+	return context.WithDeadline(context.Background(), deadline)
+}
+
 // waitRental polls one rental to the caller's observed goal. Every wait here is bounded by something
 // OBSERVED: the hub's own verdict, a typed refusal, or the caller's --timeout. A rental
 // that is still acquiring or materializing is none of those, however long the provider
@@ -309,7 +342,7 @@ func waitRental(ctx *Context, c *hub.Client, id string, deadline time.Time,
 	observe func(hub.Rental) *exit.Error, done func(hub.Rental) bool) (hub.Rental, *exit.Error) {
 	said := ""
 	for {
-		hctx, cancel := hub.LongContext()
+		hctx, cancel := rentalCallContext(deadline)
 		r, e := c.Rental(hctx, id)
 		cancel()
 		if e != nil && !transient(e) {

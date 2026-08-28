@@ -22,10 +22,6 @@ import (
 	"github.com/cozy-creator/cozy-creator/internal/records"
 )
 
-// Stages, in order. `--crash-after <stage>` kills the process after the named one;
-// that is how the crash matrix is observed on the real binary.
-var Stages = []string{"stage", "verify", "venv", "descriptor", "activate"}
-
 type Request struct {
 	Ref           Ref
 	Archive       string // --from: the local release archive (pre-hub door; cl-011 resolves it instead)
@@ -33,7 +29,6 @@ type Request struct {
 	Dir           string // --dir: an editable local tree, the development trust path
 	AllowUnsigned bool
 	Force         bool
-	CrashAfter    string
 }
 
 type Timing struct {
@@ -60,11 +55,6 @@ func Run(l home.Layout, st *records.Store, req Request) (*Result, *exit.Error) {
 			WithRemedy("--from installs a published release archive; --dir installs an editable local tree").
 			WithNext("cozy help install")
 	}
-	if req.CrashAfter != "" && !containsStage(req.CrashAfter) {
-		return nil, exit.Usagef("--crash-after %q is not an install stage", req.CrashAfter).
-			WithRemedy("stages: %s", strings.Join(Stages, ", "))
-	}
-
 	id, e := newGenerationID()
 	if e != nil {
 		return nil, e
@@ -72,18 +62,9 @@ func Run(l home.Layout, st *records.Store, req Request) (*Result, *exit.Error) {
 	genDir := l.GenerationDir(id)
 	res := &Result{}
 	clock := time.Now()
-	mark := func(stage string) *exit.Error {
+	mark := func(stage string) {
 		res.Timings = append(res.Timings, Timing{stage, time.Since(clock)})
 		clock = time.Now()
-		if req.CrashAfter == stage {
-			// A real KILL, not an orderly exit: the crash matrix is only evidence
-			// if the process actually dies where a crash would. os.Process.Kill is
-			// SIGKILL on unix and TerminateProcess on Windows — unblockable on both.
-			if self, err := os.FindProcess(os.Getpid()); err == nil {
-				_ = self.Kill()
-			}
-		}
-		return nil
 	}
 	fail := func(err *exit.Error) (*Result, *exit.Error) {
 		_ = os.RemoveAll(genDir)
@@ -120,9 +101,7 @@ func Run(l home.Layout, st *records.Store, req Request) (*Result, *exit.Error) {
 		gen.Version = "dev+" + strings.TrimPrefix(digest, "sha256:")[:12]
 		res.Files, res.Bytes = files, bytes
 	}
-	if err := mark("stage"); err != nil {
-		return fail(err)
-	}
+	mark("stage")
 
 	// ---- verify: source identity settles BEFORE anything can execute ----
 	if e := verifySource(&gen, req, &res.Warnings); e != nil {
@@ -131,9 +110,7 @@ func Run(l home.Layout, st *records.Store, req Request) (*Result, *exit.Error) {
 	if e := resolveTarget(&gen, req.Ref); e != nil {
 		return fail(e)
 	}
-	if err := mark("verify"); err != nil {
-		return fail(err)
-	}
+	mark("verify")
 
 	// The pin decision is made before the expensive step, never after it.
 	prior, priorGen, e := st.ActivePin(gen.Endpoint, gen.Major)
@@ -180,9 +157,7 @@ func Run(l home.Layout, st *records.Store, req Request) (*Result, *exit.Error) {
 	gen.Platform, gen.Extra, gen.LinkMode = env.Platform, env.Extra, env.LinkMode
 	gen.Packages, gen.Closure = env.Packages, env.Closure
 	res.Warnings = append(res.Warnings, env.Warnings...)
-	if err := mark("venv"); err != nil {
-		return guard(err)
-	}
+	mark("venv")
 
 	// ---- descriptor: the release's OWN runtime checks its OWN committed surface ----
 	digest, e := deriveDescriptor(venvDir, sourceDir)
@@ -190,9 +165,7 @@ func Run(l home.Layout, st *records.Store, req Request) (*Result, *exit.Error) {
 		return guard(e)
 	}
 	gen.Descriptor = digest
-	if err := mark("descriptor"); err != nil {
-		return guard(err)
-	}
+	mark("descriptor")
 
 	// Disk is measured once, here, and read back from the record forever after.
 	gen.BytesExcl, gen.BytesShared = Disk(genDir)
@@ -203,9 +176,7 @@ func Run(l home.Layout, st *records.Store, req Request) (*Result, *exit.Error) {
 		return guard(e)
 	}
 	res.Gen, res.Superseded = gen, superseded
-	if err := mark("activate"); err != nil {
-		return nil, err
-	}
+	mark("activate")
 	return res, nil
 }
 
@@ -389,13 +360,4 @@ func short12(s string) string {
 		return s[:12]
 	}
 	return s
-}
-
-func containsStage(s string) bool {
-	for _, st := range Stages {
-		if st == s {
-			return true
-		}
-	}
-	return false
 }

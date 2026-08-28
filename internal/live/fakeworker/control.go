@@ -258,6 +258,12 @@ func (f *fakeControl) Control(stream pb.WorkerControl_ControlServer) error {
 				dropAck = f.outcomeWithOutput(outcome, offer)
 			case "output":
 				f.outcomeWithOutput(outcome, offer)
+			case "missing-output":
+				t, _ := authorOutcome(offer.RequestId, offer.AttemptOrdinal,
+					offer.InvocationSpecDigest, pb.OutcomeStatus_OUTCOME_STATUS_SUCCEEDED,
+					"success that omits its granted output")
+				f.say("ARM: SUCCEEDED outcome omits the granted output")
+				outcome(t)
 			}
 		case *pb.RecordOwnerFrame_OutcomeAck:
 			a := m.OutcomeAck
@@ -417,7 +423,7 @@ func (f *fakeControl) outcomeWithOutput(emit func(*pb.AttemptOutcome),
 func (f *fakeControl) stealOutcome(emit func(*pb.AttemptOutcome)) {
 	spec, _ := hex.DecodeString(*stealSpec)
 	t, _ := authorOutcome(*stealRequest, *stealAttempt, spec,
-		pb.OutcomeStatus_OUTCOME_STATUS_SUCCEEDED, "an outcome from a worker that does not own it")
+		pb.OutcomeStatus_OUTCOME_STATUS_FAILED, "an outcome from a worker that does not own it")
 	f.say("ARM: boot %s claims %s#%d, which it was never assigned", f.bootID, *stealRequest, *stealAttempt)
 	emit(t)
 }

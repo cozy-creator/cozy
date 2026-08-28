@@ -1,11 +1,15 @@
 package live
 
 import (
+	"database/sql"
 	"net/http"
 	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/cozy-creator/cozy-creator/internal/records"
 )
 
 // TestOutputRetention is the discipline on the only verb in this product that removes a
@@ -39,6 +43,29 @@ func TestOutputRetention(t *testing.T) {
 		paths = append(paths, outs[0].Path)
 	}
 	o.c.ShutdownWorker(instance, 10*time.Second)
+
+	// A job publication is a durable result plane, not media. Seed one exact committed
+	// row and real file, then prove both planning and performing GC disclose but retain it.
+	job := records.Request{
+		ID: "job-retained-publication", IdemKey: "job-retained-publication",
+		BodyDigest: "sha256:retained-publication", Kind: "job", Payload: []byte("{}"),
+	}
+	if _, fresh, problem := o.store.Submit(job); problem != nil || !fresh {
+		t.Fatalf("seed publication request: fresh=%t problem=%v", fresh, problem)
+	}
+	publicationRoot := filepath.Join(o.l.Publications, "local", "_job-"+job.ID)
+	must(t, os.MkdirAll(publicationRoot, 0o700))
+	publicationPath := filepath.Join(publicationRoot, "result.bin")
+	publicationBody := []byte("durable bytes")
+	must(t, os.WriteFile(publicationPath, publicationBody, 0o600))
+	db, err := sql.Open("sqlite", o.l.DB)
+	must(t, err)
+	_, err = db.Exec(`INSERT INTO publications(
+		request_id,attempt,repo,root,status,cause,entries,bytes,committed_at)
+		VALUES(?,?,?,?,?,?,?,?,?)`, job.ID, 1, "local/_job-"+job.ID, publicationRoot,
+		"SUCCEEDED", "", 1, len(publicationBody), time.Now().UTC().Format(time.RFC3339Nano))
+	must(t, err)
+	must(t, db.Close())
 	o.close() // the root belongs to the `cozy up` process from here on
 
 	svc := startService(t, root)
@@ -50,7 +77,8 @@ func TestOutputRetention(t *testing.T) {
 	// THE HORIZON PROTECTS: a bare `cozy gc` plans zero media and says what it kept.
 	code, out := runCozy(t, root, "gc")
 	if code != 0 || !strings.Contains(out, "media: 0 output(s)") ||
-		!strings.Contains(out, "retained: 2 output(s)") {
+		!strings.Contains(out, "retained: 2 output(s)") ||
+		!strings.Contains(out, "publications: 1 publication(s), 13B retained indefinitely") {
 		t.Errorf("the default horizon did not protect both outputs [exit %d]\n%s", code, out)
 	}
 	// THE PLAN/PERFORM SPLIT: a bare invocation removes nothing, however wide the horizon.
@@ -64,6 +92,9 @@ func TestOutputRetention(t *testing.T) {
 			t.Errorf("a planned-only reclamation removed %s", p)
 		}
 	}
+	if _, err := os.Stat(publicationPath); err != nil {
+		t.Errorf("planned-only gc removed the durable job publication: %v", err)
+	}
 	// `--yes` performs: the bytes go, the ROWS stay.
 	code, out = runCozy(t, root, "gc", "--keep-media", "0", "--yes")
 	if code != 0 || !strings.Contains(out, "media: 2 output(s)") {
@@ -73,6 +104,9 @@ func TestOutputRetention(t *testing.T) {
 		if _, err := os.Stat(p); err == nil {
 			t.Errorf("%s survived the reclamation", p)
 		}
+	}
+	if _, err := os.Stat(publicationPath); err != nil {
+		t.Errorf("gc removed the durable job publication: %v", err)
 	}
 	// A reclaimed id is a TOMBSTONE — 410, never 404. "we removed this" and "this never
 	// existed" are different facts and a client must be able to tell them apart.

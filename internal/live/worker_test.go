@@ -10,7 +10,38 @@ import (
 
 	"github.com/cozy-creator/cozy-creator/internal/canonical"
 	"github.com/cozy-creator/cozy-creator/internal/exit"
+	"github.com/cozy-creator/cozy-creator/internal/records"
 )
+
+func TestReconcilePreservesWorkerWithUnresolvedBirthIdentity(t *testing.T) {
+	o := hostOwner(t, "unresolved-birth")
+	defer o.close()
+
+	pending := records.WorkerProcess{
+		InstanceID: "ins-pending-birth", Endpoint: "fake/pending", ReleaseID: fakeRelease,
+		WorkerID: "local", Devices: []string{"7"},
+	}
+	fatal(t, o.store.SpawnWorker(pending))
+	killed, forgotten, problem := o.c.Reconcile()
+	if problem == nil || problem.ErrName() != "worker_birth_identity_unresolved" ||
+		killed != 0 || forgotten != 0 {
+		t.Fatalf("reconcile unresolved birth = killed %d forgotten %d problem %v",
+			killed, forgotten, problem)
+	}
+	rows, readProblem := o.store.LiveWorkers()
+	fatal(t, readProblem)
+	if len(rows) != 1 || rows[0].InstanceID != pending.InstanceID ||
+		rows[0].State != "spawned_without_birth" {
+		t.Fatalf("unresolved worker row was not retained: %#v", rows)
+	}
+	if problem := o.store.SpawnWorker(records.WorkerProcess{
+		InstanceID: "ins-rival", Endpoint: "fake/rival", ReleaseID: fakeRelease,
+		WorkerID: "local", Devices: []string{"7"},
+	}); problem == nil || problem.Code != exit.Conflict {
+		t.Fatalf("retained unresolved grant did not block a second worker: %v", problem)
+	}
+	fatal(t, o.store.CloseWorker(pending.InstanceID))
+}
 
 // TestWorkerRefusals is the interop proof. `internal/live/fakeworker` is a SECOND, independent
 // implementation of the worker protocol that the orchestrator was not co-developed
@@ -186,5 +217,35 @@ func TestDroppedOutcomeAck(t *testing.T) {
 	row, _ := o.store.AttemptRow(requestID, int64(attempt))
 	if row.State != "closed" || row.TerminalStatus != "SUCCEEDED" {
 		t.Errorf("the attempt row is %s/%s", row.TerminalStatus, row.State)
+	}
+}
+
+// TestLocalSucceededRequiresEveryGrantedOutput is the local half of the output-set fence.
+// A local worker has no media peer, but it owes the exact same manifest completeness as a
+// remote worker: SUCCEEDED may not silently publish and ack a subset of the granted set.
+func TestLocalSucceededRequiresEveryGrantedOutput(t *testing.T) {
+	o := hostOwner(t, "missing-granted-output")
+	spec := fakeSpec("missing-output", "5", "--arm", "missing-output")
+	instance, _, e := o.c.EnsureWorker(spec)
+	fatal(t, e)
+	planID := planIDOf(t, spec)
+	fatal(t, o.c.EnsurePlacementReady(instance, planID))
+	requestID, attempt, e := o.c.Submit(submission(planID, "fake/missing-output",
+		"missing-output-1", map[string]any{"missing": true}))
+	fatal(t, e)
+	fatal(t, o.c.AwaitAccepted(requestID, attempt, 15*time.Second))
+
+	if line, ok := waitEvent(o, "terminal omits granted output \"image\"", 15*time.Second); !ok {
+		t.Fatal("a local SUCCEEDED outcome missing its granted output was not refused")
+	} else {
+		t.Logf("%s", trimLog(line))
+	}
+	row, e := o.store.AttemptRow(requestID, int64(attempt))
+	fatal(t, e)
+	if row == nil || row.State != "accepted" || row.TerminalID != "" {
+		t.Fatalf("the refused terminal changed its attempt row: %#v", row)
+	}
+	if outputs, e := o.store.VisibleOutputs(requestID); e != nil || len(outputs) != 0 {
+		t.Fatalf("the refused terminal exposed outputs: %d (%s)", len(outputs), briefly(e))
 	}
 }

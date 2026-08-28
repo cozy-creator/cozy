@@ -51,15 +51,16 @@ func TestProductPath(t *testing.T) {
 		t.Fatalf("cozy status running-only field while down [exit %d]\n%s", code, out)
 	}
 
-	// REFUSAL PRECEDENCE, before anything is built: -h outranks every gate even on a line
-	// that carries no arguments, a planned row names its issue rather than the arguments it
-	// would never read, and an implemented row still refuses a short line.
+	// REFUSAL PRECEDENCE, before anything is built: -h outranks every gate, confirmation
+	// outranks arity, and service availability outranks a planned row's exit 2.
 	for _, arm := range []struct {
 		args []string
 		code int
 		want string
 	}{
 		{[]string{"job", "submit", "-h"}, 0, "usage: cozy job submit"},
+		{[]string{"rm"}, 7, "error(confirm)"},
+		{[]string{"export", "anything"}, 9, "error(unavailable)"},
 		{[]string{"datasets", "push"}, 2, "it lands with issue th-035"},
 		{[]string{"endpoint", "publish", "cozy/example", "--release", "v1"}, 2, "it lands with issue cl-039"},
 		{[]string{"repo", "show", "cozy/example"}, 2, `unknown command "repo show"`},
@@ -75,6 +76,37 @@ func TestProductPath(t *testing.T) {
 			t.Errorf("cozy %s: exit %d wanted %d, and %q\n%s",
 				strings.Join(arm.args, " "), code, arm.code, arm.want, out)
 		}
+	}
+
+	// Removed flags refuse by name during parsing. A shipped binary never accepts a flag
+	// that no handler reads, and the install crash switch is verification code, not product.
+	for _, args := range [][]string{
+		{"install", weightlessRef, "--prefetch"},
+		{"install", weightlessRef, "--all-variants"},
+		{"install", weightlessRef, "--crash-after", "stage"},
+		{"stop", weightlessRef, "--timeout", "1s"},
+		{"logs", weightlessRef, "--follow"},
+	} {
+		if code, out := runCozy(t, root, args...); code != 2 ||
+			!strings.Contains(out, "error(usage)") || !strings.Contains(out, "unknown flag") {
+			t.Errorf("cozy %s accepted a removed flag [exit %d]\n%s", strings.Join(args, " "), code, out)
+		}
+	}
+
+	// Tensorhub's generic catalog and /publishes routes are gone. Their old command
+	// spellings are hard-cut, while the typed replacements name the Creator issue that
+	// will wire the current endpoint/model APIs.
+	for _, args := range [][]string{
+		{"search"}, {"repo", "show", "cozy/model"}, {"push", "cozy/model", "sha256:dead"},
+		{"pull", "cozy/model"}, {"deploy"}, {"promote", "cozy/endpoint", "release-1"},
+	} {
+		if code, out := runCozy(t, root, args...); code != 2 || !strings.Contains(out, "unknown command") {
+			t.Errorf("retired command cozy %s survived the typed hard cut [exit %d]\n%s",
+				strings.Join(args, " "), code, out)
+		}
+	}
+	if code, out := runCozy(t, root, "model", "publish", "cozy/model", "local-ref"); code != 2 || !strings.Contains(out, "not_implemented") || !strings.Contains(out, "cl-040") {
+		t.Errorf("typed model publication did not name cl-040 [exit %d]\n%s", code, out)
 	}
 
 	// THE SERVICE IS DOWN: every server-backed verb is typed exit 9 with the start remedy.
@@ -107,6 +139,10 @@ func TestProductPath(t *testing.T) {
 	}
 
 	svc := startService(t, root)
+	if code, out := runCozy(t, root, "export", "anything"); code != 2 ||
+		!strings.Contains(out, "error(not_implemented)") {
+		t.Errorf("cozy export with service up did not reach the final planned-row gate [exit %d]\n%s", code, out)
+	}
 
 	// Running status reads its workload summary through the service API. Serving
 	// requests and jobs are separate counts even though they share one records table.

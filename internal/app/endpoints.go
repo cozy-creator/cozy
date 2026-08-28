@@ -56,7 +56,6 @@ func handleInstall(ctx *Context) *exit.Error {
 		Dir:           ctx.Inv.Value("--dir"),
 		AllowUnsigned: ctx.Inv.Bool("--allow-unsigned"),
 		Force:         ctx.Inv.Bool("--force"),
-		CrashAfter:    ctx.Inv.Value("--crash-after"),
 	})
 	if e != nil {
 		return e
@@ -238,6 +237,10 @@ func handleGC(ctx *Context) *exit.Error {
 	if e != nil {
 		return e
 	}
+	publicationItems, publicationBytes, e := st.PublicationStats()
+	if e != nil {
+		return e
+	}
 	out := render.List{
 		Kind:      "gc",
 		Fields:    []string{"kind", "id", "endpoint", "bytes"},
@@ -265,6 +268,11 @@ func handleGC(ctx *Context) *exit.Error {
 			"%d output row(s) record a path outside the local output namespace and were NOT planned",
 			media.Foreign))
 	}
+	if publicationItems > 0 {
+		out.Notes = append(out.Notes, fmt.Sprintf(
+			"%d job publication(s), %s are retained indefinitely; gc reports but never reclaims the durable result plane",
+			publicationItems, render.Bytes(publicationBytes)))
+	}
 	if !write {
 		out.Aggregates = []render.Field{
 			{K: "reclaimable", V: render.Bytes(total)},
@@ -273,6 +281,8 @@ func handleGC(ctx *Context) *exit.Error {
 				len(media.Items), render.Bytes(media.Bytes), retention.Short(horizon))},
 			{K: "retained", V: fmt.Sprintf("%d output(s), %s kept",
 				media.RetainedItems, render.Bytes(media.RetainedBytes))},
+			{K: "publications", V: fmt.Sprintf("%d publication(s), %s retained indefinitely",
+				publicationItems, render.Bytes(publicationBytes))},
 			{K: "cas", V: "0 objects (the shared weights CAS lands with cl-012)"},
 		}
 		if items == 0 {
@@ -299,6 +309,8 @@ func handleGC(ctx *Context) *exit.Error {
 		{K: "media", V: fmt.Sprintf("%d output(s), %s", len(media.Items), render.Bytes(reclaimed))},
 		{K: "retained", V: fmt.Sprintf("%d output(s), %s kept",
 			media.RetainedItems, render.Bytes(media.RetainedBytes))},
+		{K: "publications", V: fmt.Sprintf("%d publication(s), %s retained indefinitely",
+			publicationItems, render.Bytes(publicationBytes))},
 	}
 	if items > 0 {
 		out.Notes = append(out.Notes,

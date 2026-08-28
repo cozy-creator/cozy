@@ -1100,7 +1100,7 @@ func (c *Orchestrator) mirrorOutputs(req records.Request, attempt uint64, doc ca
 		granted := map[string]bool{}
 		for _, id := range splitList(req.Outputs) {
 			granted[id] = true
-			if !declared[id] && holder.media != nil && outcomeStatus(doc.Int("status")) == "SUCCEEDED" {
+			if !declared[id] && outcomeStatus(doc.Int("status")) == "SUCCEEDED" {
 				return nil, exit.Named(exit.Validation, "output_set_mismatch",
 					"the terminal omits granted output %q", id)
 			}

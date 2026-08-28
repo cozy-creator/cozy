@@ -3,6 +3,7 @@ package records
 import (
 	"bytes"
 	"database/sql"
+	"encoding/json"
 	"errors"
 	"strings"
 	"unicode"
@@ -60,7 +61,16 @@ CREATE TABLE IF NOT EXISTS rentals (
 
 var rentalSchema = []string{rentalOperationsDDL, rentalsDDL, `
 CREATE UNIQUE INDEX IF NOT EXISTS rental_operation_remote
-  ON rental_operations(rental_id) WHERE rental_id <> ''`}
+  ON rental_operations(rental_id) WHERE rental_id <> ''`, `
+CREATE TABLE IF NOT EXISTS rental_relay_refusals (
+  rental_id   TEXT PRIMARY KEY REFERENCES rentals(id) ON DELETE CASCADE,
+  exit_code   INTEGER NOT NULL,
+  name        TEXT NOT NULL,
+  message     TEXT NOT NULL,
+  remedy      TEXT NOT NULL,
+  next_json   TEXT NOT NULL,
+  observed_at TEXT NOT NULL
+)`}
 
 // CheckRentalSchema refuses a root whose rental tables were created by another shape of
 // this binary. Rentals are paid obligations, so a mismatched table is never rebuilt or
@@ -584,6 +594,79 @@ func (s *Store) Rentals() ([]Rental, *exit.Error) {
 		out = append(out, r)
 	}
 	return out, nil
+}
+
+// RentalRelayRefusal is the last durable non-transient verdict Tensorhub returned for
+// this rental's worker-session evidence. Without it the relay could stop retrying one
+// rejected frame while every client continued seeing only `converging`.
+type RentalRelayRefusal struct {
+	RentalID   string
+	Code       exit.Code
+	Name       string
+	Message    string
+	Remedy     string
+	Next       []string
+	ObservedAt string
+}
+
+func (r RentalRelayRefusal) Error() *exit.Error {
+	e := exit.Named(r.Code, r.Name, "%s", r.Message)
+	if r.Remedy != "" {
+		e.WithRemedy("%s", r.Remedy)
+	}
+	if len(r.Next) > 0 {
+		e.WithNext(r.Next...)
+	}
+	return e
+}
+
+func (s *Store) RecordRentalRelayRefusal(id string, problem *exit.Error) *exit.Error {
+	if id == "" || problem == nil {
+		return exit.Internalf("cannot record an empty rental relay refusal")
+	}
+	next, err := json.Marshal(problem.Next)
+	if err != nil {
+		return exit.Internalf("cannot encode rental %s relay refusal: %s", id, err)
+	}
+	if _, err := s.db.Exec(`INSERT INTO rental_relay_refusals(
+		rental_id,exit_code,name,message,remedy,next_json,observed_at)
+		VALUES(?,?,?,?,?,?,?) ON CONFLICT(rental_id) DO UPDATE SET
+		exit_code=excluded.exit_code,name=excluded.name,message=excluded.message,
+		remedy=excluded.remedy,next_json=excluded.next_json,observed_at=excluded.observed_at`,
+		id, int(problem.Code), problem.ErrName(), problem.Message, problem.Remedy, string(next), now()); err != nil {
+		return exit.Internalf("cannot record rental %s relay refusal: %s", id, err)
+	}
+	return nil
+}
+
+func (s *Store) RentalRelayRefusal(id string) (*RentalRelayRefusal, *exit.Error) {
+	var row RentalRelayRefusal
+	var code int
+	var next string
+	err := s.db.QueryRow(`SELECT rental_id,exit_code,name,message,remedy,next_json,observed_at
+		FROM rental_relay_refusals WHERE rental_id=?`, id).Scan(
+		&row.RentalID, &code, &row.Name, &row.Message, &row.Remedy, &next, &row.ObservedAt)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, exit.Internalf("cannot read rental %s relay refusal: %s", id, err)
+	}
+	row.Code = exit.Code(code)
+	if !row.Code.Valid() {
+		return nil, exit.Internalf("rental %s relay refusal carries invalid exit code %d", id, code)
+	}
+	if err := json.Unmarshal([]byte(next), &row.Next); err != nil {
+		return nil, exit.Internalf("cannot decode rental %s relay refusal: %s", id, err)
+	}
+	return &row, nil
+}
+
+func (s *Store) ClearRentalRelayRefusal(id string) *exit.Error {
+	if _, err := s.db.Exec(`DELETE FROM rental_relay_refusals WHERE rental_id=?`, id); err != nil {
+		return exit.Internalf("cannot clear rental %s relay refusal: %s", id, err)
+	}
+	return nil
 }
 
 // ForgetRental removes the row once the hub reports the pod gone and closes whatever

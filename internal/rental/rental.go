@@ -206,6 +206,13 @@ func Known(st *records.Store) func(string) (*orchestrator.DesiredPlacement, *exi
 			return nil, unknown(id)
 		}
 		if row.State != hub.RentalReady {
+			refusal, problem := st.RentalRelayRefusal(id)
+			if problem != nil {
+				return nil, problem
+			}
+			if refusal != nil {
+				return nil, refusal.Error()
+			}
 			return nil, exit.Named(exit.Unavailable, "rental.convergence_pending",
 				"rental %s is %s; Tensorhub has not accepted its relayed worker convergence evidence",
 				id, row.State).
@@ -498,10 +505,18 @@ func RelayWorkerSession(st *records.Store, client *hub.Client) orchestrator.Rent
 				DesiredRevision: evidence.DesiredRevision,
 			})
 		if problem != nil {
+			if problem.Code != exit.Unavailable && problem.Code != exit.Deadline {
+				if recordProblem := st.RecordRentalRelayRefusal(row.ID, problem); recordProblem != nil {
+					return recordProblem
+				}
+			}
 			return problem
 		}
 		row.State = answer.State
-		return st.RecordRental(*row)
+		if problem := st.RecordRental(*row); problem != nil {
+			return problem
+		}
+		return st.ClearRentalRelayRefusal(row.ID)
 	}
 }
 
