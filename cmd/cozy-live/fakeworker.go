@@ -157,6 +157,12 @@ type fakeControl struct {
 	verify     func(string) bool
 	journal    string
 	generation uint64
+	// The artifact half (cl-023): the record owner that claimed this worker, and the
+	// exact receipts this worker minted, keyed by request and slot.
+	ownerScope  string
+	artMu       sync.Mutex
+	artMinted   map[string]*pb.ArtifactReceiptRef
+	artAnswered int
 }
 
 type fakeActiveJournal struct {
@@ -284,6 +290,9 @@ func (f *fakeControl) Control(stream pb.WorkerControl_ControlServer) error {
 		ack.RecordOwnerEpoch, ack.ControlStreamGeneration, ack.WorkerBootId = e, g, b
 	})
 	send(&pb.WorkerFrame{Msg: &pb.WorkerFrame_ClaimAck{ClaimAck: ack}})
+	// The OWNER NAMES ITSELF on Claim, and an ArtifactReceipt names that authority. A
+	// worker inventing an owner scope would be authoring the record owner's identity.
+	f.ownerScope = claim.RecordOwnerId
 	f.say("ClaimAck sent: boot=%s instance=%s release=%s schema=rev%d",
 		f.bootID, f.instance, f.releaseID, pb.WireSchemaRev)
 
@@ -574,6 +583,9 @@ func (f *fakeControl) Control(stream pb.WorkerControl_ControlServer) error {
 			if f.arm == "dropack" {
 				dropAck = f.outcomeWithOutput(outcome, offer)
 			}
+			if strings.HasPrefix(f.arm, "artifact") {
+				f.artifactAttempt(outcome, offer)
+			}
 			if f.arm == "remote" || f.arm == "remotelie" {
 				f.remoteOutcome(outcome, offer)
 			}
@@ -601,6 +613,15 @@ func (f *fakeControl) Control(stream pb.WorkerControl_ControlServer) error {
 				dropAck = nil
 				go func() { time.Sleep(3 * time.Second); os.Exit(0) }()
 			}
+		case *pb.RecordOwnerFrame_ArtifactFinalizeRequest:
+			if f.arm == "artifacthold" {
+				// The crash arm: the request is received and NEVER answered, which is what
+				// a runtime still inside TensorFS's atomic disposition looks like.
+				f.say("ARM: the ArtifactFinalizeRequest for %s/%s is HELD, never answered",
+					m.ArtifactFinalizeRequest.RequestId, m.ArtifactFinalizeRequest.OutputSlot)
+				continue
+			}
+			f.onFinalizeRequest(send, env, m.ArtifactFinalizeRequest)
 		case *pb.RecordOwnerFrame_CancelAttempt:
 			cancel := m.CancelAttempt
 			f.say("CancelAttempt %s#%d", cancel.RequestId, cancel.AttemptOrdinal)

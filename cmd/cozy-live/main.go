@@ -103,7 +103,7 @@ func main() {
 	if len(args) == 0 {
 		fmt.Fprintln(os.Stderr, "usage: cozy-live "+
 			"<canonical|attempt|recovered|arms|stall|stallactive|tlspin|api|apiarms|apicrash|verbs|journey|rent|planids|"+
-			"descriptor|pipeline|m4arms|dropack|jobarms|jobs|jobcrash|workflows|workflowcrash|fixtures|fakeworker> [--flag value]")
+			"descriptor|pipeline|m4arms|dropack|jobarms|jobs|jobcrash|artifacts|artifactcrash|workflows|workflowcrash|fixtures|fakeworker> [--flag value]")
 		os.Exit(2)
 	}
 	section := args[0]
@@ -170,6 +170,10 @@ func main() {
 		sectionM4Arms()
 	case "dropack":
 		sectionDropAck()
+	case "artifacts":
+		sectionArtifacts()
+	case "artifactcrash":
+		sectionArtifactCrash()
 	case "jobarms":
 		sectionJobArms()
 	case "jobs":

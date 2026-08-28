@@ -318,6 +318,38 @@ lifecycle points that decide whether a publication is a promise or a fact).
 `scripts/job-release.sh` builds the release they install — cr-009's own
 `structural_census.py`, verbatim from a pinned `git archive`.
 
+## The durable artifact transaction (cl-023)
+
+A job may declare **artifact outputs** — TensorFS snapshot slots, stated explicitly beside
+the InvocationSpec because rev-5's `OutputBinding` carries no kind. The declaration decides
+what an artifact slot is; an arriving receipt never does, and this lane is artifact-only so
+a missing receipt can be classified without guessing about asset slots.
+
+For each declared slot the record owner records exactly **one** durable final intent inside
+the terminal transaction — `ADOPT` the returned `ArtifactReceipt/1` into this job's own
+scratch root, `ABANDON` a committed receipt, or `ABANDON_UNCOMMITTED` an open slot — then
+asks the runtime to execute it over th-049's one `ArtifactFinalizeRequest`/`Result`
+exchange and journals the exact result BEFORE `AttemptOutcomeAck`. First intent wins; the
+opposite decision conflicts forever; a lost result replays the identical request.
+
+- **Creator authors no storage identity.** It never mints a receipt, never derives a
+  snapshot id, and refuses a bare snapshot id, a job-authored authority, a cross-job or
+  cross-spec receipt, an undeclared slot, and any local path — the closed `ArtifactReceipt`
+  document has no slot for one.
+- **The scratch root is Creator's own derivation** inside its job namespace: an opaque
+  semantic id, never a path and never the public `<org>/_job-*` repository name.
+- **Nothing becomes public.** An adopted artifact job writes no output row and no
+  publication; promotion out of the scratch root is a later, explicit act.
+- `GET /v1/requests/<id>` grows an `artifacts` array — slot, disposition, outcome, receipt
+  digest, scratch root id. No path, no TensorFS internals.
+
+Live drivers: `./cozy-live artifacts` (74 checks — the happy path, both abandon paths, and
+two refusal matrices driven by an adversarial `fakeworker` that authors real receipts and
+hosts the finalize exchange) and `./cozy-live artifactcrash` (50 checks — `kill -9` the
+record owner before the intent, after it, mid-disposition and after one exact result, then
+reopen the root with a second owner). Neither needs a store, a GPU, or a runtime peer; the
+runtime half of the exchange is cr-030's.
+
 ## Catalog and first-party publish (cl-011)
 
 `internal/hub` is the ONE client onto tensorhub's HTTP API. Launch-1 tensorhub has **no
@@ -485,7 +517,8 @@ No automated tests. Verification is running the real thing:
   refused by its own code), `arms` (the refusal matrix against `fakeworker`, a second
   independent Go implementation of the worker side), `attempt` and `recovered` (the real
   cozy-runtime supervisor + executor on a real GPU), `api`/`apiarms`/`apicrash` (the local
-  client API from a client's seat), and `verbs`/`journey` (the CLI as a user types it,
+  client API from a client's seat), `artifacts`/`artifactcrash` (the durable artifact
+  transaction and its crash matrix), and `verbs`/`journey` (the CLI as a user types it,
   against an INSTALLED endpoint — no hand-written spec document anywhere).
 - `scripts/verify-cl012.sh` + `scripts/xfer-live.py` drive the real `cozy` against a
   real tensorhub (built from a PINNED commit through a read-only `git archive`, because

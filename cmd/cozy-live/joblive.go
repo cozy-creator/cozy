@@ -101,6 +101,10 @@ func checkpointIdentityArms(root string) {
 			InvocationDigest: "sha256:arm", InvocationCanonical: []byte("{}"),
 		})
 		must("dispatching an arm attempt", errOf(e))
+		// The OFFER boundary is durable and separate from the assignment: an attempt in
+		// `preparing` is nobody's open obligation yet, so neither a checkpoint nor a
+		// terminal may be declared against it.
+		must("offering an arm attempt", errOf(store.OfferDispatch(req.ID, n, session)))
 		return n
 	}
 	declare := func(attempt int64, session, digest string) (string, *exit.Error) {
@@ -118,6 +122,9 @@ func checkpointIdentityArms(root string) {
 			TerminalDigest: "sha256:trm", Status: "SUCCEEDED", RequestState: "queued",
 		})
 		must("settling an arm attempt", errOf(e))
+		// A terminal attempt is still LIVE until it is closed: the ack is what releases the
+		// ordinal, so the next one cannot be minted before it.
+		must("closing an arm attempt", errOf(store.Closed(req.ID, attempt)))
 		check(fmt.Sprintf("attempt %d reached its terminal through the real transaction",
 			attempt), applied, fmt.Sprint(applied))
 	}
@@ -190,6 +197,7 @@ func checkpointMigrationArm(root string) {
 		InvocationDigest: "sha256:mig", InvocationCanonical: []byte("{}"),
 	})
 	must("dispatching the migration attempt", errOf(e))
+	must("offering the migration attempt", errOf(store.OfferDispatch(req.ID, kept, "boot-m")))
 	store.Close()
 
 	raw, err := sql.Open("sqlite", path)

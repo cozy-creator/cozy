@@ -1559,8 +1559,8 @@ func (s *Store) RecordArtifactFinalizeResult(result ArtifactFinalization) (appli
 	updated, err := tx.Exec(`UPDATE artifact_finalizations SET result_outcome=?,result_digest=?,
 		result_bytes=?,result_receipt_digest=?,result_receipt_bytes=?,completed_at=?
 		WHERE request_id=? AND invocation_digest=? AND output_slot=? AND result_digest=''`,
-		result.ResultOutcome, result.ResultDigest, result.ResultBytes,
-		result.ResultReceiptDigest, result.ResultReceiptBytes, completed,
+		result.ResultOutcome, result.ResultDigest, blob(result.ResultBytes),
+		result.ResultReceiptDigest, blob(result.ResultReceiptBytes), completed,
 		result.RequestID, result.InvocationDigest, result.OutputSlot)
 	if err != nil {
 		return false, exit.Internalf("cannot record artifact finalize result %s/%s: %s",
@@ -1575,6 +1575,15 @@ func (s *Store) RecordArtifactFinalizeResult(result ArtifactFinalization) (appli
 			result.RequestID, result.OutputSlot, err)
 	}
 	return true, nil
+}
+
+// blob keeps a NOT NULL BLOB column NOT NULL. An ABANDON_UNCOMMITTED completion carries
+// no receipt at all, and a nil slice is a NULL rather than the empty evidence it means.
+func blob(b []byte) []byte {
+	if b == nil {
+		return []byte{}
+	}
+	return b
 }
 
 // ArtifactReceiptsOf exposes the exact bytes the terminal transaction made durable.
