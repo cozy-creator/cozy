@@ -35,8 +35,6 @@ const (
 	stateDir            = "/run/cozy/bootstrap"
 	mediaRoot           = "/var/lib/cozy/media"
 	plansDir            = "/run/cozy/binding-plans"
-	provisionSpecPath   = stateDir + "/provision-spec"
-	provisionBundlePath = stateDir + "/provision-bundle"
 	podBootIDPath       = stateDir + "/pod-boot-id"
 	certificatePath     = stateDir + "/tls.crt"
 	privateKeyPath      = stateDir + "/tls.key"
@@ -55,9 +53,9 @@ type child struct {
 	err  error
 }
 
-// run performs the generic pod bootstrap. It treats provision documents and
-// readiness payload bytes as opaque exact artifacts; their schemas remain with
-// th-046, cr-027, and th-048.
+// run performs the generic pod bootstrap. It dials nothing: the whole launch surface is
+// the injected environment, and the readiness payload the adapter drops is opaque bytes
+// this process only authenticates (cr-048/th-067 retired the two provision documents).
 func run(parent context.Context) error {
 	cfg, err := parseConfig()
 	if err != nil {
@@ -74,12 +72,6 @@ func run(parent context.Context) error {
 	}
 	children := []*child{media}
 	defer stopChildren(children)
-	if err := fetchExact(readinessCtx, cfg.spec, provisionSpecPath); err != nil {
-		return fmt.Errorf("provision spec acquisition failed: %w", classifyContext(parent, readinessCtx, err))
-	}
-	if err := fetchExact(readinessCtx, cfg.bundle, provisionBundlePath); err != nil {
-		return fmt.Errorf("provision bundle acquisition failed: %w", classifyContext(parent, readinessCtx, err))
-	}
 	adapter, err := startAdapter(cfg)
 	if err != nil {
 		return err
@@ -190,10 +182,9 @@ func startAdapter(cfg config) (*child, error) {
 	env := childEnvironment()
 	hashes, _ := json.Marshal(cfg.tokenHashes)
 	env = append(env,
-		"COZY_ADAPTER_PROVISION_SPEC_PATH="+provisionSpecPath,
-		"COZY_ADAPTER_PROVISION_SPEC_DIGEST="+cfg.spec.digest,
-		"COZY_ADAPTER_PROVISION_BUNDLE_PATH="+provisionBundlePath,
-		"COZY_ADAPTER_PROVISION_BUNDLE_DIGEST="+cfg.bundle.digest,
+		"COZY_ADAPTER_ACQUISITION_ATTEMPT_ID="+cfg.attemptID,
+		"COZY_ADAPTER_ACQUISITION_ATTEMPT_ORDINAL="+strconv.FormatInt(cfg.attemptOrdinal, 10),
+		"COZY_ADAPTER_RENTAL_ID="+cfg.rentalID,
 		"COZY_ADAPTER_POD_BOOT_ID_PATH="+podBootIDPath,
 		"COZY_ADAPTER_TLS_CERT_PATH="+certificatePath,
 		"COZY_ADAPTER_TLS_KEY_PATH="+privateKeyPath,

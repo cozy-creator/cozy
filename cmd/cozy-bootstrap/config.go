@@ -6,7 +6,6 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
-	"net/url"
 	"os"
 	"strconv"
 	"strings"
@@ -14,44 +13,40 @@ import (
 )
 
 const (
-	envProvisionSpecDigest   = "COZY_PROVISION_SPEC_DIGEST"
-	envProvisionSpecURL      = "COZY_PROVISION_SPEC_URL"
-	envProvisionSpecLength   = "COZY_PROVISION_SPEC_LENGTH"
-	envProvisionBundleDigest = "COZY_PROVISION_BUNDLE_DIGEST"
-	envProvisionBundleURL    = "COZY_PROVISION_BUNDLE_URL"
-	envProvisionBundleLength = "COZY_PROVISION_BUNDLE_LENGTH"
-	envReceiptKey            = "COZY_BOOTSTRAP_RECEIPT_HMAC_KEY_B64URL"
-	envReceiptDeadline       = "COZY_BOOTSTRAP_RECEIPT_DEADLINE_UNIX"
-	envWorkerPort            = "COZY_WORKER_INTERNAL_PORT"
-	envMediaPort             = "COZY_MEDIA_INTERNAL_PORT"
-	envTokenHashes           = "COZY_RENTER_TOKEN_SHA256_JSON"
-	maxTokenHashes           = 16
-	maxProvisionDocumentSize = int64(8 << 20)
+	envAttemptID       = "COZY_ACQUISITION_ATTEMPT_ID"
+	envAttemptOrdinal  = "COZY_ACQUISITION_ATTEMPT_ORDINAL"
+	envRentalID        = "COZY_RENTAL_ID"
+	envReceiptKey      = "COZY_BOOTSTRAP_RECEIPT_HMAC_KEY_B64URL"
+	envReceiptDeadline = "COZY_BOOTSTRAP_RECEIPT_DEADLINE_UNIX"
+	envWorkerPort      = "COZY_WORKER_INTERNAL_PORT"
+	envMediaPort       = "COZY_MEDIA_INTERNAL_PORT"
+	envTokenHashes     = "COZY_RENTER_TOKEN_SHA256_JSON"
+	maxTokenHashes     = 16
+	maxIdentityBytes   = 256
+	maxAttemptOrdinal  = int64(1) << 31
 )
 
+// allowedCozyEnv is the CLOSED pod environment contract, consumer half. Tensorhub's
+// internal/podenv renders exactly these eight names and its build/substrate recipe refuses
+// to compile an image whose pinned bootstrap admits a different set, so an addition here
+// is a contract change on both sides or it is a build failure. cl-036 retired the six
+// COZY_PROVISION_{SPEC,BUNDLE}_{DIGEST,URL,LENGTH} grants with the documents they fetched
+// and added the three identity facts those documents were smuggling.
 var allowedCozyEnv = map[string]bool{
-	envProvisionSpecDigest: true, envProvisionSpecURL: true, envProvisionSpecLength: true,
-	envProvisionBundleDigest: true, envProvisionBundleURL: true, envProvisionBundleLength: true,
+	envAttemptID: true, envAttemptOrdinal: true, envRentalID: true,
 	envReceiptKey: true, envReceiptDeadline: true, envWorkerPort: true, envMediaPort: true,
 	envTokenHashes: true,
 }
 
-type artifactGrant struct {
-	kind   string
-	digest string
-	want   [sha256.Size]byte
-	url    *url.URL
-	length int64
-}
-
 type config struct {
-	spec        artifactGrant
-	bundle      artifactGrant
-	hmacKey     []byte
-	deadline    time.Time
-	workerPort  uint16
-	mediaPort   uint16
-	tokenHashes []string
+	attemptID      string
+	attemptOrdinal int64
+	rentalID       string
+	hmacKey        []byte
+	deadline       time.Time
+	workerPort     uint16
+	mediaPort      uint16
+	tokenHashes    []string
 }
 
 func parseConfig() (config, error) {
@@ -63,14 +58,14 @@ func parseConfig() (config, error) {
 		}
 	}
 	var err error
-	if out.spec, err = parseGrant("provision spec", envProvisionSpecDigest, envProvisionSpecURL, envProvisionSpecLength); err != nil {
+	if out.attemptID, err = parseIdentity(envAttemptID); err != nil {
 		return out, err
 	}
-	if out.bundle, err = parseGrant("provision bundle", envProvisionBundleDigest, envProvisionBundleURL, envProvisionBundleLength); err != nil {
+	if out.attemptOrdinal, err = parseOrdinal(envAttemptOrdinal); err != nil {
 		return out, err
 	}
-	if out.spec.digest == out.bundle.digest {
-		return out, fmt.Errorf("provision spec and provision bundle digests must remain distinct")
+	if out.rentalID, err = parseIdentity(envRentalID); err != nil {
+		return out, err
 	}
 	keyText, err := requiredEnv(envReceiptKey)
 	if err != nil {
@@ -111,40 +106,35 @@ func parseConfig() (config, error) {
 	return out, nil
 }
 
-func parseGrant(kind, digestEnv, urlEnv, lengthEnv string) (artifactGrant, error) {
-	grant := artifactGrant{kind: kind}
-	var err error
-	grant.digest, err = requiredEnv(digestEnv)
+// parseIdentity reads one bounded opaque id. Bootstrap never interprets an attempt or
+// rental id; it hands it to the adapter, which echoes it in the readiness receipt so
+// tensorhub's binder can join the receipt to the attempt row it froze. The bound is the
+// adapter's own (cozy_runtime.internal.config.bounded) so a value that boots here cannot
+// be refused one exec later.
+func parseIdentity(name string) (string, error) {
+	value, err := requiredEnv(name)
 	if err != nil {
-		return grant, err
+		return "", err
 	}
-	if len(grant.digest) != len("sha256:")+sha256.Size*2 || !strings.HasPrefix(grant.digest, "sha256:") ||
-		grant.digest != strings.ToLower(grant.digest) {
-		return grant, fmt.Errorf("%s must be sha256:<64 lowercase hex>", digestEnv)
+	if len(value) > maxIdentityBytes || strings.TrimSpace(value) != value {
+		return "", fmt.Errorf("%s must be one untrimmed identifier of at most %d bytes",
+			name, maxIdentityBytes)
 	}
-	digestBytes, err := hex.DecodeString(strings.TrimPrefix(grant.digest, "sha256:"))
+	return value, nil
+}
+
+func parseOrdinal(name string) (int64, error) {
+	text, err := requiredEnv(name)
 	if err != nil {
-		return grant, fmt.Errorf("%s must be sha256:<64 lowercase hex>", digestEnv)
+		return 0, err
 	}
-	copy(grant.want[:], digestBytes)
-	urlText, err := requiredEnv(urlEnv)
-	if err != nil {
-		return grant, err
+	ordinal, err := strconv.ParseInt(text, 10, 64)
+	if err != nil || ordinal <= 0 || ordinal > maxAttemptOrdinal ||
+		strconv.FormatInt(ordinal, 10) != text {
+		return 0, fmt.Errorf("%s must be one positive canonical decimal no greater than %d",
+			name, maxAttemptOrdinal)
 	}
-	grant.url, err = url.Parse(urlText)
-	if err != nil || grant.url.Scheme != "https" || grant.url.Host == "" || grant.url.User != nil || grant.url.Fragment != "" {
-		return grant, fmt.Errorf("%s must be one credential-free HTTPS URL without a fragment", urlEnv)
-	}
-	lengthText, err := requiredEnv(lengthEnv)
-	if err != nil {
-		return grant, err
-	}
-	grant.length, err = strconv.ParseInt(lengthText, 10, 64)
-	if err != nil || grant.length <= 0 || grant.length > maxProvisionDocumentSize ||
-		strconv.FormatInt(grant.length, 10) != lengthText {
-		return grant, fmt.Errorf("%s must be one positive canonical decimal byte length no greater than 8 MiB", lengthEnv)
-	}
-	return grant, nil
+	return ordinal, nil
 }
 
 func parsePort(name string) (uint16, error) {
@@ -189,10 +179,9 @@ func requiredEnv(name string) (string, error) {
 //
 // Provider/image environments routinely contain AWS, Hugging Face, and RunPod
 // credentials. Children need only process locale/timezone and the standard TLS trust
-// overrides used by exact-grant HTTPS clients. Class-D base inherit list —
-// tracker-v2/spawn-allowlists.md (#616.d) is the authority; keep equal to that row. PATH
-// is deliberately absent: cozy-media and the adapter are exec'd by absolute path and
-// spawn nothing PATH-resolved.
+// overrides. Class-D base inherit list — tracker-v2/spawn-allowlists.md (#616.d) is the
+// authority; keep equal to that row. PATH is deliberately absent: cozy-media and the
+// adapter are exec'd by absolute path and spawn nothing PATH-resolved.
 func childEnvironment() []string {
 	allowed := map[string]bool{
 		"LANG": true, "LC_ALL": true, "TZ": true,

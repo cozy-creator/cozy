@@ -520,16 +520,23 @@ A rented pod runs one container with two Go processes from this repo, plus the P
 worker. They are built here because they are peers of `internal/media` and share one wire
 contract; the image RECIPE that assembles them is Tensorhub's.
 
-`cmd/cozy-bootstrap` is the entrypoint and supervisor. It takes no arguments and reads no
-configuration file: its whole launch surface is an ALLOWLISTED set of `COZY_*` environment
-grants, and an unrecognized one is a boot failure rather than an ignored default. It mints
-the pod's TLS leaf and the token-hash file (so no credential ships in the image), fetches
-the two provision documents as exact grants — credential-free HTTPS, declared length,
-declared sha256, no proxy and no redirect, verified before publication — execs
-`cozy-media` and the control runtime's launch adapter with a five-name environment by
-absolute path, and HMACs the adapter's opaque readiness payload into the envelope the
-media server serves. It treats both provision documents and the readiness payload as
-opaque bytes.
+`cmd/cozy-bootstrap` is the entrypoint and supervisor, and **it dials nothing**. It takes
+no arguments and reads no configuration file: its whole launch surface is eight
+ALLOWLISTED `COZY_*` environment variables, and an unrecognized one is a boot failure
+rather than an ignored default. It mints the pod's TLS leaf and the token-hash file (so no
+credential ships in the image), execs `cozy-media` and the control runtime's launch
+adapter by absolute path each with a closed environment, and HMACs the adapter's opaque
+readiness payload into the envelope the media server serves.
+
+Its two exact-grant fetches went out with the provision documents they carried (cl-036,
+paired with cozy-runtime's cr-048 and Tensorhub's th-067): **a pod boots ready-but-empty**,
+and one endpoint's closure arrives on the hub-authored placement lane after the RecordOwner
+connects, not as a boot-time document. Three facts those documents were smuggling —
+`COZY_ACQUISITION_ATTEMPT_ID`, `COZY_ACQUISITION_ATTEMPT_ORDINAL`, `COZY_RENTAL_ID` — are
+now ordinary environment values the adapter echoes in the readiness receipt. With no
+outbound door left, the fence holds this binary to the same ABSOLUTE no-egress rule as
+`cmd/cozy-media`; the emitter half of the same contract is Tensorhub's `internal/podenv`,
+and its image recipe refuses to build a bootstrap that admits a different set of names.
 
 `cmd/cozy-media` is the byte plane (above). The one number they must agree on — the
 readiness envelope ceiling — is `internal/mediawire.MaxReceiptBytes`, imported by both;

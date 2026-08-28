@@ -50,12 +50,12 @@ Fifteen families:
             cannot import the worker protocol, and its wire contract — the service name, the
             revision both ends compare before a byte moves, and the bounds it publishes — is
             declared in internal/mediawire and restated nowhere.
-  bootstrap (xs-004) the POD SUPERVISOR is the one pod-side process that legitimately
-            egresses and legitimately execs, so its licence is BOUNDED rather than absent:
-            outbound network lives in exactly one file (the two exact-grant fetches), it
-            attaches no credential to either, and it may not import the worker protocol —
-            a supervisor that could talk to the worker is the second control plane cl-014
-            forbids one directory over.
+  bootstrap (xs-004/cl-036) the POD SUPERVISOR has NO outbound capability of any kind —
+            the same absolute rule as the media plane beside it, since cl-036 deleted the
+            two provision-document fetches that were its whole licence to egress. It still
+            legitimately EXECS its two children, and it still may not import the worker
+            protocol — a supervisor that could talk to the worker is the second control
+            plane cl-014 forbids one directory over.
   tensor    (cl-012) the tensorfs CLI has ONE caller: internal/tfs. The configured binary
             is read there and in the config authority, nowhere else — a second package
             shelling out to `tfs` is a second byte-plane door with its own vocabulary.
@@ -212,25 +212,30 @@ MEDIA_CONTRACT_FIELDS = ["contract_rev", "max_receipt_bytes"]
 # 64 KiB is an ordinary buffer size everywhere else in this tree.
 MEDIA_CEILING_LITERAL = re.compile(r"64\s*<<\s*10")
 
-# (xs-004) THE POD SUPERVISOR'S BOUNDED LICENCE. `cmd/cozy-bootstrap` is PID 1 of a rented
-# pod. Unlike the media server beside it, it MUST egress (two provision documents) and MUST
-# exec (its two children), so it cannot join the liability fence by having nothing to do it
-# with. It joins by having exactly ONE of each, in a named place, with a stated rule.
+# (xs-004, tightened by cl-036) THE POD SUPERVISOR DIALS NOTHING. `cmd/cozy-bootstrap` is
+# PID 1 of a rented pod. It used to hold a BOUNDED egress licence — one file, two
+# exact-grant provision-document fetches — because the pod could not boot without them.
+# cr-048/th-067 retired those documents (a pod boots ready-but-empty and its closure
+# arrives on the rev-2 placement lane after the RecordOwner connects), so the licence has
+# no subject left and the rule is now ABSOLUTE, exactly like DENY_MEDIA_EGRESS one
+# directory over. A supervisor's whole launch surface is the injected environment; the
+# first `http.Get` back — a health poll, a telemetry ping, a "just fetch the config"
+# convenience — is an exfiltration channel with an extra step and no exact-grant checks
+# around it. `exec.Command` is deliberately NOT here and IS in the media list: execing the
+# two children is the one capability this process exists to have, and it is the only reason
+# these stay two families rather than one. With this rule absolute, cl-036's merge into one
+# `cozy-pod` binary can be fenced WHOLE — its precondition, "no carve-out for a file that
+# still egresses", is now met.
 BOOTSTRAP_DIR = "cmd/cozy-bootstrap/"
-# One outbound door. A second `http.Get` anywhere in this binary — a health poll, a
-# telemetry ping, a "just fetch the config" convenience — is an egress channel that no
-# longer passes the exact-grant checks (declared length, declared digest, no redirect, no
-# proxy) that make the two real ones safe.
-BOOTSTRAP_EGRESS_SITE = "cmd/cozy-bootstrap/fetch.go"
 DENY_BOOTSTRAP_EGRESS = [
     "http.Get", "http.Post", "http.PostForm", "http.Head", "http.NewRequest",
     "http.DefaultClient", "http.Client", "http.Transport", "net.Dial", "net.DialTimeout",
     "grpc.NewClient", "grpc.Dial",
 ]
-# The two fetches are CREDENTIAL-FREE by construction: parseGrant refuses a URL carrying
-# userinfo, and nothing here ever sets an Authorization header. Fence the header, because
-# the day this process presents a credential to fetch something is the day a pod supervisor
-# becomes a capability an attacker can aim.
+# It holds the receipt HMAC key and the renter token hashes and now has nowhere to send
+# them. Keep fencing the header anyway: the day this process presents a credential is the
+# day a pod supervisor becomes a capability an attacker can aim, and this rule is what
+# makes that arrive as a red fence rather than as a diff nobody read.
 BOOTSTRAP_CREDENTIAL_HEADER = re.compile(r"Authorization", re.I)
 # It holds token HASHES and mints a self-signed leaf; it never speaks a control plane. An
 # import of the worker protocol, the orchestrator, the owner's API or its media/hub clients
@@ -587,23 +592,22 @@ def check_sources():
                            f"\"cozy-runtime\" literal, reached by indirection; only "
                            f"{DRIVER_DIR} may door it: {line.strip()}")
             if rel.startswith(BOOTSTRAP_DIR):
-                if rel != BOOTSTRAP_EGRESS_SITE:
-                    for call in DENY_BOOTSTRAP_EGRESS:
-                        if call in line:
-                            bad.append(f"{p}:{i}: [bootstrap] '{call}' outside "
-                                       f"{BOOTSTRAP_EGRESS_SITE} — the pod supervisor egresses "
-                                       f"EXACTLY TWICE per boot, both exact grants (declared "
-                                       f"length, declared digest, no proxy, no redirect) from "
-                                       f"one file. A second door does not pass those checks: "
-                                       f"{line.strip()}")
+                for call in DENY_BOOTSTRAP_EGRESS:
+                    if call in line:
+                        bad.append(f"{p}:{i}: [bootstrap] '{call}' in the pod supervisor — it "
+                                   f"has NO outbound capability of any kind. Its launch "
+                                   f"surface is the injected environment and nothing else; "
+                                   f"the two exact-grant fetches that once licensed one file "
+                                   f"went out with the provision documents (cl-036), so there "
+                                   f"is no door to reopen: {line.strip()}")
                 # RAW, because a header name is a string literal the identifier scan blanks;
                 # a whole-line comment is prose (same convention as check_media_contract).
                 if not s_raw_line.strip().startswith("//") and \
                         BOOTSTRAP_CREDENTIAL_HEADER.search(s_raw_line):
                     bad.append(f"{p}:{i}: [bootstrap] the pod supervisor sets an Authorization "
-                               f"header — its two fetches are credential-free by construction "
-                               f"(parseGrant refuses userinfo); a supervisor that presents a "
-                               f"credential is a capability an attacker can aim: "
+                               f"header — it holds the receipt key and the renter token "
+                               f"hashes and has nowhere to send them; a supervisor that "
+                               f"presents a credential is a capability an attacker can aim: "
                                f"{s_raw_line.strip()}")
                 imported = MEDIA_IMPORT_LINE.match(s_raw_line)
                 for dep in DENY_BOOTSTRAP_IMPORT if imported else ():
@@ -891,7 +895,7 @@ print(
     f"api({len(DENY_COOKIE)} cookie + cors(absolute@{CORS_ABSOLUTE}) + listen@{len(LISTEN_SITES)} programs) "
     f"media({len(DENY_MEDIA_EGRESS)} egress + {len(DENY_MEDIA_IMPORT)} imports@{MEDIA_DIR} "
     f"+ {len(MEDIA_CONTRACT_FIELDS)} contract fields + ceiling literal@{MEDIA_CONTRACT_HOME}) "
-    f"bootstrap({len(DENY_BOOTSTRAP_EGRESS)} egress@{BOOTSTRAP_EGRESS_SITE} + no-credential "
+    f"bootstrap({len(DENY_BOOTSTRAP_EGRESS)} egress(absolute@{BOOTSTRAP_DIR}) + no-credential "
     f"+ {len(DENY_BOOTSTRAP_IMPORT)} imports@{BOOTSTRAP_DIR}) "
     f"runtime({len(RUNTIME_VERBS_DENY)} denied verbs@{len(RUNTIME_SITES)} + indirection) "
     f"embed({len(DENY_EMBED)} words, scripts allow@{len(PY_ALLOW)}) "

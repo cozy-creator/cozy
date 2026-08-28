@@ -4,7 +4,8 @@
 #
 # Verifies:
 #   1. Ambient RunPod provider identity (RUNPOD_*) never enters bootstrap config.
-#   2. Unknown COZY_* variables (provider-identity aliases) are refused by name.
+#   2. Unknown COZY_* variables (provider-identity aliases, and the six retired
+#      COZY_PROVISION_* grants) are refused by name.
 #   3. The child-process environment allowlist is exactly the reviewed set, so
 #      AWS/HF/RunPod/Cozy credentials never cross the child boundary.
 #   4. The receipt ceiling is IMPORTED from internal/mediawire, not restated — the two
@@ -23,12 +24,9 @@ bad() { printf '  FAIL %s\n' "$*"; fail=$((fail + 1)); }
 
 base_env=(
   "PATH=/usr/bin:/bin" "HOME=$work"
-  "COZY_PROVISION_SPEC_DIGEST=sha256:$(printf '1%.0s' $(seq 64))"
-  "COZY_PROVISION_SPEC_URL=https://example.invalid/spec"
-  "COZY_PROVISION_SPEC_LENGTH=2"
-  "COZY_PROVISION_BUNDLE_DIGEST=sha256:$(printf '2%.0s' $(seq 64))"
-  "COZY_PROVISION_BUNDLE_URL=https://example.invalid/bundle"
-  "COZY_PROVISION_BUNDLE_LENGTH=3"
+  "COZY_ACQUISITION_ATTEMPT_ID=ra-hardening-proof"
+  "COZY_ACQUISITION_ATTEMPT_ORDINAL=1"
+  "COZY_RENTAL_ID=rental-hardening-proof"
   "COZY_BOOTSTRAP_RECEIPT_HMAC_KEY_B64URL=$(printf 'A%.0s' $(seq 43))"
   "COZY_BOOTSTRAP_RECEIPT_DEADLINE_UNIX=4102444800"
   "COZY_WORKER_INTERNAL_PORT=43100"
@@ -53,6 +51,19 @@ if grep -q 'unknown Cozy environment variable COZY_PROVIDER_POD_ID' <<<"$out"; t
 else
   bad "provider identity alias was admitted: $out"
 fi
+
+# cl-036: the retired boot-closure grants are refused BY NAME, not ignored. A hub still
+# emitting them is a boot failure the operator can read, never a pod that silently fetches
+# nothing and reports ready.
+for retired in COZY_PROVISION_SPEC_DIGEST COZY_PROVISION_SPEC_URL COZY_PROVISION_SPEC_LENGTH \
+  COZY_PROVISION_BUNDLE_DIGEST COZY_PROVISION_BUNDLE_URL COZY_PROVISION_BUNDLE_LENGTH; do
+  out=$(run "${base_env[@]}" "$retired=whatever")
+  if grep -q "unknown Cozy environment variable $retired" <<<"$out"; then
+    ok "retired boot-closure grant $retired is refused"
+  else
+    bad "retired boot-closure grant $retired was admitted: $out"
+  fi
+done
 
 got=$(awk '/^func childEnvironment/,/^}$/' "$root/cmd/cozy-bootstrap/config.go" |
   grep -oE '"[A-Z_]+"' | tr -d '"' | sort | paste -sd, -)
