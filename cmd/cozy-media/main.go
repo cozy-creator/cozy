@@ -33,13 +33,14 @@
 //	DELETE /v1/attempts/{slot}    after rollback, or after mirror plus outcome ack, the
 //	                              owner drops exactly that attempt's inputs and outputs.
 //
-// Every RENTER route authenticates a bearer against a TOKEN-HASH FILE, stat-per-request
-// and fail-closed: the file is re-read whenever its (size, mtime) changes, an unreadable or
-// empty file authenticates NOBODY, and this process never holds the token — only its
-// digest. The epoch never moves backward: a replacement whose mtime predates what is
-// loaded is refused rather than applied, so a restored backup cannot reinstate a retired
-// credential. The bootstrap envelope contains no capability; Tensorhub authenticates its
-// exact bytes with the attempt HMAC before trusting the TLS peer that served them.
+// Every RENTER route authenticates a bearer against a FROZEN SET OF DIGESTS handed to
+// this process at launch (`--token-sha256`) and never re-read: the renter minted the
+// token, Tensorhub kept only its SHA-256, and this process holds that digest and compares
+// digests. It never holds a raw token, so there is nothing here to leak. The set is
+// validated once, at boot, and a set that is absent, empty, or malformed refuses to start
+// rather than serve — an unauthenticated media plane is not a degraded mode. The bootstrap
+// envelope contains no capability; Tensorhub authenticates its exact bytes with the
+// attempt HMAC before trusting the TLS peer that served them.
 //
 // The SUBTREE IS QUOTA-BOUNDED and it is not the worker's root: uploads can never ENOSPC
 // the journal. The worker writes outputs through the shared filesystem, so this process
@@ -51,7 +52,6 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -61,7 +61,6 @@ import (
 	"strconv"
 	"strings"
 	"sync"
-	"time"
 
 	"github.com/cozy-creator/cozy-creator/internal/canonical"
 	"github.com/cozy-creator/cozy-creator/internal/mediawire"
@@ -76,10 +75,10 @@ func main() {
 // discovered, nothing is read from the environment, and there is no configuration file.
 type options struct {
 	listen           string
-	root             string // the quota-bounded subtree this server OWNS
-	plans            string // the worker's `binding-plans` directory — write-only, from here
-	tokens           string // the token-hash file, `sha256:<64 hex>` one per line
-	out              string // where `media.addr` is published (the file-handoff discovery contract)
+	root             string   // the quota-bounded subtree this server OWNS
+	plans            string   // the worker's `binding-plans` directory — write-only, from here
+	tokenHashes      []string // the frozen credential set, `sha256:<64 hex>` each
+	out              string   // where `media.addr` is published (the file-handoff discovery contract)
 	cert             string
 	key              string
 	bootstrapReceipt string // exact pod-authored JSON; may appear after the listener starts
@@ -102,8 +101,12 @@ func run(args []string) int {
 			opt.root = value
 		case "plans":
 			opt.plans = value
-		case "tokens":
-			opt.tokens = value
+		case "token-sha256":
+			hashes, err := parseTokenHashes(value)
+			if err != nil {
+				return usage("--token-sha256 %v", err)
+			}
+			opt.tokenHashes = hashes
 		case "out":
 			opt.out = value
 		case "tls-cert":
@@ -133,8 +136,8 @@ func run(args []string) int {
 		return usage("--listen <host:port> is required")
 	case opt.root == "":
 		return usage("--root <dir> is required: this server owns exactly one subtree")
-	case opt.tokens == "":
-		return usage("--tokens <file> is required: there is no unauthenticated mode")
+	case len(opt.tokenHashes) == 0:
+		return usage("--token-sha256 <sha256:hex,...> is required: there is no unauthenticated mode")
 	}
 	if opt.maxBody == 0 {
 		// No private object ceiling sits below the pod's admitted media quota. A caller
@@ -168,80 +171,52 @@ func run(args []string) int {
 			return fatal("cannot create the binding-plan directory %s: %v", opt.plans, err)
 		}
 	}
-	s := &server{opt: opt}
-	// FAIL CLOSED AT BOOT, not at the first request: a media server whose token file is
-	// absent or empty admits nobody, and saying so now beats answering 401 to the owner who
-	// just rented the pod and has no way to see why.
-	if err := s.reloadTokens(); err != nil {
-		return fatal("the token-hash file %s is unusable: %v — a media server with no "+
-			"credential to check authenticates nobody", opt.tokens, err)
-	}
-	return s.serve()
+	return (&server{opt: opt}).serve()
 }
 
 type server struct {
 	opt options
 
-	mu     sync.Mutex
 	writes sync.Mutex // quota admission and the filesystem mutation are one critical section
-	// hashes is the loaded credential set: `sha256:<64 hex>` lines, never a raw token.
-	hashes []string
-	// size/stamp are what the loaded set was read from. Stat-per-request compares against
-	// them, so a rotation is picked up on the next call without a restart and without a
-	// re-read on every call.
-	size  int64
-	stamp time.Time
 }
 
-// reloadTokens re-reads the hash file if and only if its (size, mtime) moved, and refuses
-// a move BACKWARD. Everything about it is fail-closed: an unreadable file, a file with no
-// usable line, or a stamp older than the loaded one leaves the previous set in place and
-// returns an error the caller turns into a refusal.
-func (s *server) reloadTokens() error {
-	info, err := os.Stat(s.opt.tokens)
-	if err != nil {
-		return err
+// tokenHashPattern is the ONE shape a credential digest may take here: the `sha256:<64
+// lowercase hex>` spelling secret.HashLine renders and secret.MatchesHash compares.
+var tokenHashPattern = regexp.MustCompile(`^sha256:[0-9a-f]{64}$`)
+
+// maxTokenHashes bounds the set. It is the rental's own ceiling (tensorhub mints at most
+// this many live hashes per rental), restated as a refusal rather than trusted.
+const maxTokenHashes = 16
+
+// parseTokenHashes validates the launch credential set and is the whole of this program's
+// admission policy. FAIL CLOSED: an empty value, a duplicate, an out-of-order entry, an
+// over-long set, or anything that is not `sha256:<64 lowercase hex>` yields an error and
+// no set at all, so a malformed grant authenticates NOBODY rather than everybody. Sorted
+// and unique is required, not normalized: the sender already owes a canonical set, and
+// silently repairing one hides a sender that has drifted.
+func parseTokenHashes(value string) ([]string, error) {
+	if strings.TrimSpace(value) == "" {
+		return nil, fmt.Errorf("takes at least one `sha256:<64 hex>` digest")
 	}
-	s.mu.Lock()
-	same := info.Size() == s.size && info.ModTime().Equal(s.stamp)
-	older := !s.stamp.IsZero() && info.ModTime().Before(s.stamp)
-	s.mu.Unlock()
-	if same {
-		return nil
+	hashes := strings.Split(value, ",")
+	if len(hashes) > maxTokenHashes {
+		return nil, fmt.Errorf("takes at most %d digests, not %d", maxTokenHashes, len(hashes))
 	}
-	if older {
-		return fmt.Errorf("its mtime %s predates the loaded %s: the credential epoch is "+
-			"monotone and never moves backward", info.ModTime().UTC().Format(time.RFC3339),
-			s.stamp.UTC().Format(time.RFC3339))
-	}
-	data, err := os.ReadFile(s.opt.tokens)
-	if err != nil {
-		return err
-	}
-	var lines []string
-	for _, line := range strings.Split(string(data), "\n") {
-		if line = strings.TrimSpace(line); strings.HasPrefix(line, "sha256:") {
-			lines = append(lines, line)
+	for i, hash := range hashes {
+		if !tokenHashPattern.MatchString(hash) {
+			return nil, fmt.Errorf("entry %d %q is not `sha256:<64 lowercase hex>`", i+1, hash)
+		}
+		if i > 0 && hashes[i-1] >= hash {
+			return nil, fmt.Errorf("entries must be sorted and unique; %q does not follow %q",
+				hash, hashes[i-1])
 		}
 	}
-	if len(lines) == 0 {
-		return errors.New("it holds no `sha256:<64 hex>` line")
-	}
-	s.mu.Lock()
-	s.hashes, s.size, s.stamp = lines, info.Size(), info.ModTime()
-	s.mu.Unlock()
-	return nil
+	return hashes, nil
 }
 
-// admits authenticates one request. STAT PER REQUEST: a rotated file takes effect on the
-// next call, and a file that has become unreadable stops admitting anyone.
+// admits authenticates one request against the frozen set. Neither side of the comparison
+// is a raw credential: this process holds digests and hashes what was presented.
 func (s *server) admits(w http.ResponseWriter, r *http.Request) bool {
-	if err := s.reloadTokens(); err != nil {
-		refuse(w, http.StatusServiceUnavailable, "media.credential_unreadable",
-			"this server cannot read its own token-hash file, so it admits nobody: "+err.Error(),
-			"the pod's provisioner owns that file; a media server never mints a credential")
-		return false
-	}
 	presented := strings.TrimSpace(strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer "))
 	if presented == "" {
 		refuse(w, http.StatusUnauthorized, "media.unauthenticated",
@@ -249,10 +224,7 @@ func (s *server) admits(w http.ResponseWriter, r *http.Request) bool {
 			"the rental's provisioned owner token is the bearer")
 		return false
 	}
-	s.mu.Lock()
-	hashes := append([]string(nil), s.hashes...)
-	s.mu.Unlock()
-	for _, line := range hashes {
+	for _, line := range s.opt.tokenHashes {
 		if secret.MatchesHash(presented, line) {
 			return true
 		}
@@ -809,7 +781,8 @@ func refuse(w http.ResponseWriter, status int, code, message, remedy string) {
 func usage(format string, args ...any) int {
 	fmt.Fprintf(os.Stderr, "cozy-media: "+format+"\n", args...)
 	fmt.Fprintln(os.Stderr, "usage: cozy-media --listen <host:port> --root <dir> "+
-		"--tokens <file> [--plans <dir>] [--out <dir>] [--tls-cert <pem> --tls-key <pem>] "+
+		"--token-sha256 <sha256:hex,...> [--plans <dir>] [--out <dir>] "+
+		"[--tls-cert <pem> --tls-key <pem>] "+
 		"[--bootstrap-receipt <json>] "+
 		"[--quota <bytes>] [--max-body <bytes>]")
 	return 2

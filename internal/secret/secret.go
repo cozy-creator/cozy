@@ -90,12 +90,12 @@ func EnvEntry(name string, v Value) string { return name + "=" + v.raw }
 // caller writes bytes it never looked at, which is the same rule EnvEntry keeps.
 func FileBody(v Value) []byte { return []byte(v.raw + "\n") }
 
-// HashLine is the VERIFIER CARRIER: one line of a token-hash file, `sha256:<64 hex>`.
+// HashLine is the VERIFIER CARRIER: one credential digest, `sha256:<64 hex>`.
 //
 // It exists so a process that only ever CHECKS a bearer — cl-014's media server — can be
-// provisioned without ever being given the token. The pod's provisioner writes these
-// lines; the server stats the file per request, hashes what was presented, and compares.
-// A credential the verifier does not hold cannot leak out of the verifier.
+// provisioned without ever being given the token. The pod's supervisor hands the digests
+// over at launch; the server hashes what was presented and compares digests. A credential
+// the verifier does not hold cannot leak out of the verifier.
 func HashLine(v Value) string {
 	if v.raw == "" {
 		return ""
@@ -108,8 +108,8 @@ func HashLine(v Value) string {
 // no `sha256:` prefix.
 //
 // It is a second spelling of one fact and it exists because two peers spell it two ways:
-// a token-hash FILE carries `sha256:<hex>` lines (HashLine, what cozy-media and the
-// runtime read), and a hub's `renter_token_sha256` field takes the hex alone. Naming both
+// the pod's verifiers take `sha256:<hex>` (HashLine, what cozy-media and the runtime
+// hold), and a hub's `renter_token_sha256` field takes the hex alone. Naming both
 // here keeps the conversion at the carrier, where every other credential rendering in this
 // package lives, instead of a TrimPrefix at a call site that has to remember why.
 func HashHex(v Value) string { return strings.TrimPrefix(HashLine(v), "sha256:") }

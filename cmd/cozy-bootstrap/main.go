@@ -4,10 +4,10 @@
 // It does three things and nothing else, and IT DIALS NOTHING — cl-036 deleted its one
 // outbound door with the two provision documents it fetched, so the fence now holds the
 // pod supervisor to the same absolute no-egress rule as `cozy-media` beside it. It mints
-// the pod's TLS key pair and the token-hash file that `cozy-media` authenticates renters
-// against — so no long-lived credential ships inside the image. It execs the two children
-// — `cozy-media` (this repo's byte plane) and the control runtime's materialize/launch
-// adapter — by absolute path, with no PATH, each with a closed environment. And it
+// the pod's TLS key pair — so no long-lived credential ships inside the image. It execs
+// the two children — `cozy-media` (this repo's byte plane) and the control runtime's
+// materialize/launch adapter — by absolute path, with no PATH, each with a closed
+// environment, handing each the validated renter token DIGESTS it needs. And it
 // publishes the readiness receipt: the adapter drops an opaque payload on the filesystem,
 // this process HMACs it under the attempt key and writes the envelope `cozy-media` serves
 // at `GET /v1/bootstrap/receipt`.

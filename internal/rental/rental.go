@@ -340,8 +340,8 @@ func Resolver(l home.Layout, st *records.Store) func(string) (*orchestrator.Remo
 			// media server holds its OWN keys — cl-014's rule, and this host pins the same
 			// PEM only because the stand-in provisioner mints one certificate covering both
 			// names. What this host never does is MINT anything: the bearer the media plane
-			// checks is the rental's provisioned owner token, hashed into the pod's
-			// token-hash file by whoever provisioned the pod.
+			// checks is the rental's provisioned owner token, whose digest reached the pod
+			// as a launch grant from whoever provisioned it.
 			spec.Media = &media.Spec{Addr: row.MediaAddress, Token: token, CACert: cert}
 		}
 		return &orchestrator.RemoteTarget{Connection: spec, Placement: facts.Placement}, nil

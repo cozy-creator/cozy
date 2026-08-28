@@ -523,10 +523,11 @@ contract; the image RECIPE that assembles them is Tensorhub's.
 `cmd/cozy-bootstrap` is the entrypoint and supervisor, and **it dials nothing**. It takes
 no arguments and reads no configuration file: its whole launch surface is eight
 ALLOWLISTED `COZY_*` environment variables, and an unrecognized one is a boot failure
-rather than an ignored default. It mints the pod's TLS leaf and the token-hash file (so no
-credential ships in the image), execs `cozy-media` and the control runtime's launch
-adapter by absolute path each with a closed environment, and HMACs the adapter's opaque
-readiness payload into the envelope the media server serves.
+rather than an ignored default. It mints the pod's TLS leaf (so no credential ships in the
+image), execs `cozy-media` and the control runtime's launch adapter by absolute path each
+with a closed environment, hands each the validated renter token DIGESTS it authenticates
+against, and HMACs the adapter's opaque readiness payload into the envelope the media
+server serves.
 
 Its two exact-grant fetches went out with the provision documents they carried (cl-036,
 paired with cozy-runtime's cr-048 and Tensorhub's th-067): **a pod boots ready-but-empty**,

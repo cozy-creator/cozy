@@ -38,7 +38,6 @@ const (
 	podBootIDPath       = stateDir + "/pod-boot-id"
 	certificatePath     = stateDir + "/tls.crt"
 	privateKeyPath      = stateDir + "/tls.key"
-	tokenHashesPath     = stateDir + "/renter-token-hashes"
 	receiptPayloadPath  = stateDir + "/readiness-payload"
 	receiptEnvelopePath = stateDir + "/readiness-envelope.json"
 	tlsServerName       = "cozy-worker"
@@ -101,16 +100,7 @@ func prepareState(cfg config) error {
 	if err := mintPodBootID(); err != nil {
 		return err
 	}
-	if err := mintCertificate(cfg.deadline); err != nil {
-		return err
-	}
-	var hashes strings.Builder
-	for _, hash := range cfg.tokenHashes {
-		hashes.WriteString("sha256:")
-		hashes.WriteString(hash)
-		hashes.WriteByte('\n')
-	}
-	return atomicWrite(tokenHashesPath, []byte(hashes.String()), 0o400)
+	return mintCertificate(cfg.deadline)
 }
 
 func mintPodBootID() error {
@@ -167,7 +157,7 @@ func startMedia(cfg config) (*child, error) {
 		"--listen", listen,
 		"--root", mediaRoot,
 		"--plans", plansDir,
-		"--tokens", tokenHashesPath,
+		"--token-sha256", mediaTokenGrant(cfg.tokenHashes),
 		"--tls-cert", certificatePath,
 		"--tls-key", privateKeyPath,
 		"--bootstrap-receipt", receiptEnvelopePath,
@@ -175,6 +165,17 @@ func startMedia(cfg config) (*child, error) {
 	cmd.Env = childEnvironment()
 	cmd.Stdout, cmd.Stderr = os.Stdout, os.Stderr
 	return startChild("cozy-media", cmd)
+}
+
+// mediaTokenGrant spells the validated hash set the way cozy-media takes it. These are
+// DIGESTS, not credentials — the raw token exists only on the renter's host — so the
+// process list carries nothing an observer could present.
+func mediaTokenGrant(hashes []string) string {
+	lines := make([]string, len(hashes))
+	for i, hash := range hashes {
+		lines[i] = "sha256:" + hash
+	}
+	return strings.Join(lines, ",")
 }
 
 func startAdapter(cfg config) (*child, error) {
