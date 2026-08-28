@@ -28,6 +28,7 @@ const (
 	planFormat      = "cozy.endpoint.EntrypointBindingPlan/1"
 	rmbFormat       = "cozy.endpoint.ResolvedModelBinding/1"
 	bundleFormat    = "tensorhub.endpoint_bundle/2"
+	receiptFormat   = "cozy.runtime.EndpointOverlayReceipt/1"
 	maxSnapshotSize = 64 << 20
 )
 
@@ -149,6 +150,53 @@ func refOf(doc canonical.Doc) (exactRef, error) {
 
 func sameRef(ref exactRef, document hub.ExactControlDocument) bool {
 	return ref.Digest == document.Digest && ref.Length == document.Length
+}
+
+func validateOverlayReceipt(raw []byte, environmentRef hub.ExactControlDocument, environment canonical.Doc) error {
+	receipt, err := canonical.ReadObject(raw)
+	if err != nil {
+		return err
+	}
+	if err := requireKeys(receipt, "base_family_digest", "environment_spec_digest", "format",
+		"overlay_wheels", "project_wheel_digest"); err != nil {
+		return err
+	}
+	if receipt.Str("format") != receiptFormat ||
+		receipt.Str("environment_spec_digest") != environmentRef.Digest ||
+		receipt.Str("project_wheel_digest") != environment.Str("project_wheel_digest") ||
+		receipt.Str("base_family_digest") != environment.Str("wheelhouse_manifest_digest") {
+		return fmt.Errorf("receipt identity disagrees with the selected environment")
+	}
+	rawWheels, ok := receipt["overlay_wheels"].([]canonical.Value)
+	wheels := receipt.List("overlay_wheels")
+	if !ok || len(wheels) == 0 || len(wheels) != len(rawWheels) || len(wheels) > 128 {
+		return fmt.Errorf("overlay_wheels is not a non-empty bounded object list")
+	}
+	projectDigest := receipt.Str("project_wheel_digest")
+	projects, priorDistribution := 0, ""
+	digests := map[string]bool{}
+	for i, wheel := range wheels {
+		if err := requireKeys(wheel, "digest", "distribution", "owner", "version"); err != nil {
+			return fmt.Errorf("overlay wheel %d: %w", i, err)
+		}
+		digest, distribution, owner := wheel.Str("digest"), wheel.Str("distribution"), wheel.Str("owner")
+		if _, err := canonical.Raw(digest); err != nil || distribution == "" || wheel.Str("version") == "" ||
+			(owner != "project" && owner != "custom") || distribution <= priorDistribution || digests[digest] {
+			return fmt.Errorf("overlay wheel %d is malformed, duplicated, or unsorted", i)
+		}
+		digests[digest] = true
+		priorDistribution = distribution
+		if owner == "project" {
+			projects++
+			if digest != projectDigest {
+				return fmt.Errorf("project overlay wheel disagrees with project_wheel_digest")
+			}
+		}
+	}
+	if projects != 1 {
+		return fmt.Errorf("overlay_wheels has %d project owners", projects)
+	}
+	return nil
 }
 
 func exactOf(document bindingDocument) hub.ExactControlDocument {
@@ -320,15 +368,7 @@ func Decode(control hub.ExactControlDocument, endpointRef string) (Facts, *exit.
 	if err != nil || environment.Str("endpoint_bundle_digest") != s.EndpointBundle.Digest {
 		return facts, invalid("environment spec does not close the endpoint bundle: %v", err)
 	}
-	receipt, err := canonical.ReadObject(s.InstalledEnvironmentReceipt.CanonicalBytes)
-	if err != nil || requireKeys(receipt, "distributions", "endpoint_bundle_digest",
-		"environment_spec_digest", "format", "platform_target", "project_wheel_digest",
-		"wheelhouse_manifest_digest") != nil ||
-		receipt.Str("format") != "cozy.worker.v1.InstalledEnvironmentReceipt/1" ||
-		receipt.Str("endpoint_bundle_digest") != s.EndpointBundle.Digest ||
-		receipt.Str("environment_spec_digest") != s.EnvironmentSpec.Digest ||
-		receipt.Str("project_wheel_digest") != environment.Str("project_wheel_digest") ||
-		receipt.Str("wheelhouse_manifest_digest") != environment.Str("wheelhouse_manifest_digest") {
+	if err := validateOverlayReceipt(s.InstalledEnvironmentReceipt.CanonicalBytes, s.EnvironmentSpec, environment); err != nil {
 		return facts, invalid("installed-environment receipt does not close the selected environment: %v", err)
 	}
 

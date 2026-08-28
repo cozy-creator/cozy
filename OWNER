@@ -1,0 +1,4 @@
+owner: /root/full_remote_e2e/creator_overlay_receipt_fix
+purpose: th-067 hardcut Creator remote snapshot validation to EndpointOverlayReceipt/1
+branch: th-067-overlay-receipt
+base: e3b911c0656ad46f079cbdbdbf6453ffd95395d9
