@@ -111,6 +111,16 @@ func (s *Server) media(w http.ResponseWriter, r *http.Request) {
 		s.refuse(w, r, http.StatusInternalServerError, "internal", "cannot size the media", "")
 		return
 	}
+	// The row is the authority on length. A file that disagrees is not the published
+	// object, and serving it would put the record's digest on the wrong bytes.
+	if info.Size() != out.Length {
+		s.refuse(w, r, http.StatusInternalServerError, "media_length_mismatch",
+			fmt.Sprintf("%s holds %d B on disk where its record declares %d B",
+				id, info.Size(), out.Length),
+			"the published bytes were altered after the terminal was accepted")
+		return
+	}
+	size := out.Length
 
 	contentType := out.MimeType
 	disposition := "inline"
@@ -131,24 +141,23 @@ func (s *Server) media(w http.ResponseWriter, r *http.Request) {
 	// The digest the manifest declared, so a client can verify the bytes it received
 	// against what the terminal published rather than trusting the transfer.
 	h.Set("X-Cozy-Digest", out.Digest)
-	h.Set("X-Cozy-Output-Id", out.OutputID)
 
 	if r.Method == http.MethodHead {
-		h.Set("Content-Length", strconv.FormatInt(info.Size(), 10))
+		h.Set("Content-Length", strconv.FormatInt(size, 10))
 		w.WriteHeader(http.StatusOK)
 		return
 	}
 
-	start, end, ranged, bad := parseRange(r.Header.Get("Range"), info.Size())
+	start, end, ranged, bad := parseRange(r.Header.Get("Range"), size)
 	if bad {
-		h.Set("Content-Range", "bytes */"+strconv.FormatInt(info.Size(), 10))
+		h.Set("Content-Range", "bytes */"+strconv.FormatInt(size, 10))
 		s.refuse(w, r, http.StatusRequestedRangeNotSatisfiable, "range_not_satisfiable",
 			"the requested range lies outside the media",
 			"one range per request; multipart ranges are not served")
 		return
 	}
 	if !ranged {
-		h.Set("Content-Length", strconv.FormatInt(info.Size(), 10))
+		h.Set("Content-Length", strconv.FormatInt(size, 10))
 		w.WriteHeader(http.StatusOK)
 		_, _ = io.Copy(w, f)
 		return
@@ -157,7 +166,7 @@ func (s *Server) media(w http.ResponseWriter, r *http.Request) {
 		s.refuse(w, r, http.StatusInternalServerError, "internal", "cannot seek the media", "")
 		return
 	}
-	h.Set("Content-Range", fmt.Sprintf("bytes %d-%d/%d", start, end, info.Size()))
+	h.Set("Content-Range", fmt.Sprintf("bytes %d-%d/%d", start, end, size))
 	h.Set("Content-Length", strconv.FormatInt(end-start+1, 10))
 	w.WriteHeader(http.StatusPartialContent)
 	_, _ = io.CopyN(w, f, end-start+1)

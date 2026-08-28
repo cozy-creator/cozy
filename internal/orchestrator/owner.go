@@ -3,7 +3,6 @@ package orchestrator
 import (
 	"bytes"
 	"context"
-	"crypto/x509"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -123,6 +122,11 @@ func (c *Orchestrator) attach(w *worker) {
 			c.logf("worker %s: control stream ended: %s", w.instanceID, err)
 		}
 		c.mu.Lock()
+		if w.spawned.IsZero() && w.lastReport.IsZero() {
+			// An attached worker whose dial FAILED before any claim: that failure is
+			// measured non-progress, and the silence budget counts from its first one.
+			w.spawned = time.Now()
+		}
 		gone := w.exited || w.stopping || c.closing
 		c.mu.Unlock()
 		if gone {
@@ -160,19 +164,15 @@ func (c *Orchestrator) workerAddr(w *worker) (string, *exit.Error) {
 }
 
 // dialWorker opens the channel: insecure over the unix socket / loopback a spawned worker
-// binds; TLS with the PINNED cert for a remote one (#445 — trusting exactly that PEM is
-// the fingerprint pin; never mTLS).
+// binds; TLS with the PINNED cert for a remote one (#445 — the presented leaf must equal
+// that PEM byte for byte; never mTLS).
 func dialWorker(addr string, remote *WorkerConnection) (*grpc.ClientConn, error) {
 	if remote != nil && remote.CACert != "" {
-		pem, err := os.ReadFile(remote.CACert)
+		pin, err := workertls.LoadPin(remote.CACert)
 		if err != nil {
-			return nil, fmt.Errorf("reading the pinned worker cert: %w", err)
+			return nil, err
 		}
-		pool := x509.NewCertPool()
-		if !pool.AppendCertsFromPEM(pem) {
-			return nil, fmt.Errorf("%s holds no usable certificate", remote.CACert)
-		}
-		creds := credentials.NewClientTLSFromCert(pool, workertls.ServerName)
+		creds := credentials.NewTLS(pin.TLSConfig())
 		return grpc.NewClient(addr, grpc.WithTransportCredentials(creds))
 	}
 	target := addr
@@ -211,6 +211,11 @@ func (c *Orchestrator) converse(w *worker, addr string) error {
 	if err != nil {
 		return err
 	}
+	c.mu.Lock()
+	if w.spawned.IsZero() && w.lastReport.IsZero() {
+		w.spawned = time.Now() // the claim is out; silence from here is the pod's
+	}
+	c.mu.Unlock()
 	s := &session{instanceID: w.instanceID, out: make(chan *pb.RecordOwnerFrame, 32)}
 	go func() {
 		for m := range s.out {
@@ -412,6 +417,8 @@ func (c *Orchestrator) onClaimAck(w *worker, s *session, ack *pb.ClaimAck) *exit
 	if w.spec.Connection != nil {
 		w.remoteInstance = ack.WorkerInstanceId
 	}
+	// The ClaimAck is the first thing this worker said; the silence clock runs from here.
+	w.lastReport = time.Now()
 	if w.bootID != "" && w.bootID != ack.WorkerBootId {
 		delete(c.sessions, w.bootID)
 	}

@@ -60,7 +60,7 @@ class RefuseInput(msgspec.Struct, forbid_unknown_fields=True):
 
 class VideoTransportInput(msgspec.Struct, forbid_unknown_fields=True):
     prompt: str
-    first_frame: ImageAsset
+    first_frame: Annotated[ImageAsset, AssetBound(max_bytes=8 << 20, max_decoded_bytes=16 << 20)]
 
 
 class VideoTransportOutput(msgspec.Struct):

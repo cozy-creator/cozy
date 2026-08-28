@@ -211,7 +211,7 @@ func (e *Engine) Submit(sub Submission) (records.WorkflowExecution, bool, *exit.
 					ObservedWorkerInstance:   row.ObservedWorkerInstance,
 					ObservedWorkerBootID:     row.ObservedWorkerBootID, ObservedAt: row.ObservedAt,
 					ControlSnapshotDigest: row.ControlSnapshotDigest,
-					ControlSnapshotLength: row.ControlSnapshotLength,
+					ControlSnapshotLength: int64(len(row.ControlSnapshotBytes)),
 					ControlSnapshotBytes:  append([]byte(nil), row.ControlSnapshotBytes...),
 				}
 			}

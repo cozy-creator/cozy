@@ -7,7 +7,6 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
-	"runtime"
 	"strconv"
 	"strings"
 	"time"
@@ -344,7 +343,7 @@ func handleWorkflowDownload(ctx *Context) *exit.Error {
 	if problem := writeWorkflowJSON(filepath.Join(staging, "download-manifest.json"), manifest); problem != nil {
 		return problem
 	}
-	if problem := syncWorkflowTree(staging); problem != nil {
+	if problem := syncTree(staging); problem != nil {
 		return problem
 	}
 	if _, err := os.Lstat(absolute); err == nil || !os.IsNotExist(err) {
@@ -354,7 +353,7 @@ func handleWorkflowDownload(ctx *Context) *exit.Error {
 		return exit.Internalf("cannot publish complete workflow output %s: %s", absolute, err)
 	}
 	published = true
-	if problem := syncWorkflowDirectory(parent); problem != nil {
+	if problem := syncDirectory(parent); problem != nil {
 		return problem
 	}
 	return emit(ctx, render.Record{Kind: "workflow_download", Fields: []render.Field{
@@ -411,44 +410,6 @@ func digestEvidenceFile(path string) (string, *exit.Error) {
 	}
 	sum := sha256.Sum256(data)
 	return "sha256:" + hex.EncodeToString(sum[:]), nil
-}
-
-func syncWorkflowTree(root string) *exit.Error {
-	var dirs []string
-	err := filepath.WalkDir(root, func(path string, entry os.DirEntry, err error) error {
-		if err != nil {
-			return err
-		}
-		if entry.IsDir() {
-			dirs = append(dirs, path)
-		}
-		return nil
-	})
-	if err != nil {
-		return exit.Internalf("cannot inspect staged workflow bundle: %s", err)
-	}
-	for index := len(dirs) - 1; index >= 0; index-- {
-		if problem := syncWorkflowDirectory(dirs[index]); problem != nil {
-			return problem
-		}
-	}
-	return nil
-}
-
-func syncWorkflowDirectory(path string) *exit.Error {
-	if runtime.GOOS == "windows" {
-		return nil
-	}
-	dir, err := os.Open(path)
-	if err != nil {
-		return exit.Internalf("cannot open workflow directory for sync: %s", err)
-	}
-	err = dir.Sync()
-	_ = dir.Close()
-	if err != nil {
-		return exit.Internalf("cannot make workflow directory durable: %s", err)
-	}
-	return nil
 }
 
 func writeWorkflowJSON(path string, value any) *exit.Error {

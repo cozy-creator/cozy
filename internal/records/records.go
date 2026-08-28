@@ -141,6 +141,10 @@ func Open(path string) (*Store, *exit.Error) {
 			return nil, exit.Internalf("cannot widen the records schema in %s: %s", path, err)
 		}
 	}
+	if e := CheckRentalSchema(db, path); e != nil {
+		db.Close()
+		return nil, e
+	}
 	for _, stmt := range normalize {
 		if _, err := db.Exec(stmt); err != nil {
 			db.Close()

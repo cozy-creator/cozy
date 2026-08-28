@@ -24,8 +24,6 @@ import (
 	"bytes"
 	"context"
 	"crypto/sha256"
-	"crypto/tls"
-	"crypto/x509"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
@@ -35,6 +33,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/cozy-creator/cozy-creator-v2/internal/exit"
@@ -65,12 +64,12 @@ type Client struct {
 	maxObject int64
 }
 
-// Budget is the connection/response allowance before declared transfer bytes are counted.
-// It is DERIVED, not chosen: the caller passes the same silence
-// budget the pod's CONTROL leg is already judged by — the count of report periods a worker
-// may miss before it is called stalled (`orchestrator.SilentReports * orchestrator.ReportCadence`). A pod
-// A call's total deadline adds its exact byte length at the explicit 1 MiB/s floor below;
-// large valid media therefore does not inherit a hidden high-bandwidth requirement.
+// Budget is the STALL allowance: how long a call may go with no byte moving in either
+// direction before it is called dead. It is DERIVED, not chosen: the caller passes the
+// same silence budget the pod's CONTROL leg is already judged by — the count of report
+// periods a worker may miss before it is called stalled
+// (`orchestrator.SilentReports * orchestrator.ReportCadence`). A transfer that keeps moving
+// bytes, however slowly, is never failed by it: total wall time is not a bandwidth claim.
 //
 // It is not optional, and the reason is an observation: a client with no bound at all hung
 // on `connect()` against a REAL rented pod whose provider had mapped the control port and
@@ -78,8 +77,8 @@ type Client struct {
 // to end on something, and the honest something is the budget the same pod is already held
 // to on its other listener.
 
-// Dial builds the client. The certificate is PINNED — trusting exactly that PEM and no CA
-// is what makes a pin a pin, the same choice the control leg makes (#445). A spec with no
+// Dial builds the client. The certificate is PINNED — the leaf the pod presents must be
+// byte-for-byte the pinned PEM, the same rule the control leg keeps (#445). A spec with no
 // certificate is a loopback harness pod and speaks plain http; a spec with one speaks TLS
 // and will not fall back.
 func Dial(spec Spec, budget time.Duration, maxObject int64) (*Client, *exit.Error) {
@@ -93,19 +92,11 @@ func Dial(spec Spec, budget time.Duration, maxObject int64) (*Client, *exit.Erro
 	c := &Client{spec: spec, scheme: "http"}
 	transport := &http.Transport{}
 	if spec.CACert != "" {
-		pem, err := os.ReadFile(spec.CACert)
+		pin, err := workertls.LoadPin(spec.CACert)
 		if err != nil {
-			return nil, exit.New(exit.NotFound,
-				"the pinned media certificate %s cannot be read: %s", spec.CACert, err)
+			return nil, exit.New(exit.Validation, "pinned media certificate: %s", err)
 		}
-		pool := x509.NewCertPool()
-		if !pool.AppendCertsFromPEM(pem) {
-			return nil, exit.New(exit.Validation,
-				"%s holds no usable certificate to pin", spec.CACert)
-		}
-		transport.TLSClientConfig = &tls.Config{
-			RootCAs: pool, MinVersion: tls.VersionTLS12, ServerName: workertls.ServerName,
-		}
+		transport.TLSClientConfig = pin.TLSConfig()
 		c.scheme = "https"
 	}
 	if budget <= 0 {
@@ -126,33 +117,60 @@ func (c *Client) Addr() string { return c.spec.Addr }
 
 func (c *Client) url(path string) string { return c.scheme + "://" + c.spec.Addr + path }
 
-const minimumTransferBytesPerSecond = int64(1 << 20)
-
-// transferDeadline keeps every call bounded without making total wall time a hidden
-// bandwidth requirement. The control-plane silence budget pays for connection/response
-// latency; declared bytes then receive time at a conservative 1 MiB/s minimum rate.
-func (c *Client) transferDeadline(length int64) time.Duration {
-	if length < minimumTransferBytesPerSecond {
-		length = minimumTransferBytesPerSecond
-	}
-	seconds := length / minimumTransferBytesPerSecond
-	remainder := length % minimumTransferBytesPerSecond
-	const maximum = time.Duration(1<<63 - 1)
-	if c.budget >= maximum || seconds > int64((maximum-c.budget)/time.Second) {
-		return maximum
-	}
-	transfer := time.Duration(seconds) * time.Second
-	fraction := time.Duration(remainder) * time.Second / time.Duration(minimumTransferBytesPerSecond)
-	if transfer > maximum-c.budget-fraction {
-		return maximum
-	}
-	transfer += fraction
-	return c.budget + transfer
+// stall bounds one call by PROGRESS, not by a clock over the whole transfer: its context
+// ends only after `budget` passes with no byte moved in either direction. Connect and
+// headers are under the same budget, because nothing moves during them.
+type stall struct {
+	ctx    context.Context
+	cancel context.CancelFunc
+	timer  *time.Timer
+	budget time.Duration
+	done   atomic.Bool
 }
 
-func (c *Client) bounded(request *http.Request, length int64) (*http.Request, context.CancelFunc) {
-	ctx, cancel := context.WithTimeout(request.Context(), c.transferDeadline(length))
-	return request.WithContext(ctx), cancel
+var errStalled = fmt.Errorf("stalled")
+
+func (c *Client) stall(request *http.Request) (*http.Request, *stall) {
+	ctx, cancel := context.WithCancelCause(request.Context())
+	g := &stall{ctx: ctx, budget: c.budget}
+	g.timer = time.AfterFunc(c.budget, func() { cancel(errStalled) })
+	g.cancel = func() { g.done.Store(true); g.timer.Stop(); cancel(nil) }
+	if request.Body != nil && request.Body != http.NoBody {
+		request.Body = g.reader(request.Body)
+	}
+	return request.WithContext(ctx), g
+}
+
+func (g *stall) touch() {
+	if !g.done.Load() {
+		g.timer.Reset(g.budget)
+	}
+}
+
+// reader reports every chunk that moves through it as progress.
+func (g *stall) reader(r io.ReadCloser) io.ReadCloser {
+	return &progress{ReadCloser: r, touch: g.touch}
+}
+
+// why names the stall as such when that is what ended the call.
+func (g *stall) why(err error) error {
+	if context.Cause(g.ctx) == errStalled {
+		return fmt.Errorf("no byte moved for %s (the control-leg silence budget)", g.budget)
+	}
+	return err
+}
+
+type progress struct {
+	io.ReadCloser
+	touch func()
+}
+
+func (p *progress) Read(b []byte) (int, error) {
+	n, err := p.ReadCloser.Read(b)
+	if n > 0 {
+		p.touch()
+	}
+	return n, err
 }
 
 // answer is the media server's own document. Every route answers one shape or a typed
@@ -173,7 +191,11 @@ type answer struct {
 // call is the ONE request builder, and therefore the one place the owner token becomes an
 // Authorization header for this plane.
 func (c *Client) call(method, path string, body []byte) (answer, []byte, *exit.Error) {
-	request, err := http.NewRequest(method, c.url(path), bytes.NewReader(body))
+	var reader io.Reader
+	if body != nil {
+		reader = bytes.NewReader(body)
+	}
+	request, err := http.NewRequest(method, c.url(path), reader)
 	if err != nil {
 		return answer{}, nil, exit.Internalf("cannot build the media request: %s", err)
 	}
@@ -182,14 +204,13 @@ func (c *Client) call(method, path string, body []byte) (answer, []byte, *exit.E
 		request.Header.Set("Content-Type", "application/octet-stream")
 		request.ContentLength = int64(len(body))
 	}
-	request, cancel := c.bounded(request, int64(len(body)))
-	defer cancel()
+	request, guard := c.stall(request)
+	defer guard.cancel()
 	response, err := c.http.Do(request)
 	if err != nil {
 		return answer{}, nil, exit.Named(exit.Unavailable, "media_unreachable",
-			"the pod's media server at %s did not complete inside the %s derived from its "+
-				"declared bytes and the control-leg silence budget: %s",
-			c.spec.Addr, c.transferDeadline(int64(len(body))), err).
+			"the pod's media server at %s did not answer %s %s: %s",
+			c.spec.Addr, method, path, guard.why(err)).
 			WithRemedy("a rented pod's byte plane is a CO-RESIDENT process (cl-014) on its " +
 				"own port; a pod that runs a worker and no media server can be dialled and " +
 				"cannot be fed, and this host will not fall back to granting paths on its " +
@@ -207,11 +228,11 @@ func (c *Client) call(method, path string, body []byte) (answer, []byte, *exit.E
 	}
 	// The bytes are held to the same figure, because a declaration is a claim: one extra
 	// byte past the bound is read so the overrun is DETECTED rather than silently accepted.
-	data, err := io.ReadAll(io.LimitReader(response.Body, maxAnswerBytes+1))
+	data, err := io.ReadAll(io.LimitReader(guard.reader(response.Body), maxAnswerBytes+1))
 	if err != nil {
 		return answer{}, nil, exit.Unavailablef(
 			"the pod's media server answered %d and the body ended early: %s",
-			response.StatusCode, err)
+			response.StatusCode, guard.why(err))
 	}
 	if int64(len(data)) > maxAnswerBytes {
 		return answer{}, nil, exit.Named(exit.Validation, "media_over_bound",
@@ -309,15 +330,16 @@ func (c *Client) PutInputFile(blob, path, wantDigest string, wantLength int64) (
 	request.Header.Set("Authorization", "Bearer "+c.spec.Token.Reveal()) //cozy:allow-reveal
 	request.Header.Set("Content-Type", "application/octet-stream")
 	request.ContentLength = wantLength
-	request, cancel := c.bounded(request, wantLength)
-	defer cancel()
+	request, guard := c.stall(request)
+	defer guard.cancel()
 	response, err := c.http.Do(request)
 	if err != nil {
 		return "", exit.Named(exit.Unavailable, "media_unreachable",
-			"the pod's media server at %s did not accept %s: %s", c.spec.Addr, filepath.Base(path), err)
+			"the pod's media server at %s did not accept %s: %s",
+			c.spec.Addr, filepath.Base(path), guard.why(err))
 	}
 	defer response.Body.Close()
-	data, err := io.ReadAll(io.LimitReader(response.Body, 1<<20+1))
+	data, err := io.ReadAll(io.LimitReader(guard.reader(response.Body), 1<<20+1))
 	if err != nil || len(data) > 1<<20 {
 		return "", exit.Unavailablef("the pod's media upload answer is unreadable or oversized")
 	}
@@ -395,16 +417,18 @@ func (c *Client) GetOutputTo(slot, name, destination, wantDigest string,
 		return 0, exit.Internalf("cannot build the media output request: %s", err)
 	}
 	request.Header.Set("Authorization", "Bearer "+c.spec.Token.Reveal()) //cozy:allow-reveal
-	request, cancel := c.bounded(request, wantLength)
-	defer cancel()
+	request, guard := c.stall(request)
+	defer guard.cancel()
 	response, err := c.http.Do(request)
 	if err != nil {
 		return 0, exit.Named(exit.Unavailable, "media_unreachable",
-			"the pod's media server at %s could not stream output %s: %s", c.spec.Addr, name, err)
+			"the pod's media server at %s could not stream output %s: %s",
+			c.spec.Addr, name, guard.why(err))
 	}
 	defer response.Body.Close()
+	body := guard.reader(response.Body)
 	if response.StatusCode >= 400 {
-		data, _ := io.ReadAll(io.LimitReader(response.Body, 1<<20+1))
+		data, _ := io.ReadAll(io.LimitReader(body, 1<<20+1))
 		return 0, mediaRefusal(response.StatusCode, data)
 	}
 	if response.ContentLength >= 0 && response.ContentLength != wantLength {
@@ -428,17 +452,17 @@ func (c *Client) GetOutputTo(slot, name, destination, wantDigest string,
 		}
 	}()
 	hash := sha256.New()
-	written, err := io.Copy(io.MultiWriter(staging, hash), io.LimitReader(response.Body, wantLength+1))
+	written, err := io.Copy(io.MultiWriter(staging, hash), io.LimitReader(body, wantLength+1))
 	if err != nil {
-		return written, exit.Unavailablef("output %s ended while it was mirrored: %s", name, err)
+		return written, exit.Unavailablef("output %s ended while it was mirrored: %s",
+			name, guard.why(err))
 	}
 	if written != wantLength {
 		return written, exit.Named(exit.Failed, "media_length_mismatch",
 			"output %s delivered %d B; its terminal declares %d B", name, written, wantLength)
 	}
 	gotDigest := "sha256:" + hex.EncodeToString(hash.Sum(nil))
-	headerDigest := response.Header.Get("X-Cozy-Digest")
-	if gotDigest != wantDigest || (headerDigest != "" && headerDigest != wantDigest) {
+	if gotDigest != wantDigest {
 		return written, exit.Named(exit.Failed, "media_digest_mismatch",
 			"output %s delivered %s; its terminal declares %s", name, gotDigest, wantDigest)
 	}

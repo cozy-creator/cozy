@@ -142,6 +142,18 @@ func publicationDest(root, outputID string) (string, *exit.Error) {
 	return clean, nil
 }
 
+// fenceOutputID admits a serving output id only as ONE path element: no separators, no
+// "..", never empty. It is the serving counterpart of publicationDest — the grant and the
+// mirror both resolve `dir/id`, so the id itself must be unable to leave dir.
+func fenceOutputID(id string) *exit.Error {
+	if id == "" || id == "." || id == ".." || strings.ContainsAny(id, `/\`) {
+		return exit.Named(exit.Validation, "output_id_escape",
+			"output id %q is not a single path element", id).
+			WithRemedy("an output is granted one file under its attempt directory and nowhere else")
+	}
+	return nil
+}
+
 // jobGrant builds the LOCAL delivery grant for one job attempt: the payload as the input
 // `payload`, one input per MATERIALIZED input tree (`tree:<ref>`), and one destination per
 // granted result field path — every one of them under the publication root.

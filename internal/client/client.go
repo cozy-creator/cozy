@@ -179,24 +179,32 @@ func (c *Client) Cancel(id string) *exit.Error {
 	return c.call("POST", "/v1/requests/"+id+"/cancel", nil, nil)
 }
 
-// Media hands one output's bytes to `write` and returns what it wrote plus the digest the
-// server declared. The id is OPAQUE: this client composes no path and cannot ask for one.
-func (c *Client) Media(mediaID string, write func(io.Reader) (int64, *exit.Error)) (int64, string, *exit.Error) {
+// MediaResponse is one media GET as the server declared it. Body is bounded by nothing
+// here: the receiver knows the manifest length and must bound its own read.
+type MediaResponse struct {
+	Body          io.Reader
+	ContentLength int64  // -1 when the server declared none
+	Digest        string // X-Cozy-Digest, a restatement of the record, not proof of transfer
+}
+
+// Media hands one output's response to `receive`. The id is OPAQUE: this client composes
+// no path and cannot ask for one.
+func (c *Client) Media(mediaID string, receive func(MediaResponse) *exit.Error) *exit.Error {
 	req, e := c.request("GET", "/v1/media/"+mediaID, nil)
 	if e != nil {
-		return 0, "", e
+		return e
 	}
 	res, err := c.http.Do(req)
 	if err != nil {
-		return 0, "", c.unreachable(err)
+		return c.unreachable(err)
 	}
 	defer res.Body.Close()
 	if res.StatusCode >= 300 {
 		data, _ := io.ReadAll(io.LimitReader(res.Body, 1<<20))
-		return 0, "", Refusal(res.StatusCode, data)
+		return Refusal(res.StatusCode, data)
 	}
-	n, e := write(res.Body)
-	return n, res.Header.Get("X-Cozy-Digest"), e
+	return receive(MediaResponse{Body: res.Body, ContentLength: res.ContentLength,
+		Digest: res.Header.Get("X-Cozy-Digest")})
 }
 
 // ------------------------------------------------------------ the LOCAL extension

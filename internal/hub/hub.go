@@ -20,6 +20,7 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
+	"net"
 	"net/http"
 	"strings"
 	"time"
@@ -54,7 +55,11 @@ type Client struct {
 	token  secret.Value
 	source string // where the token came from, for the remedy text
 	http   *http.Client
-	agent  string
+	// slow answers a call whose BODY may be large (a rental view carrying a control
+	// snapshot): headers must still arrive within Timeout, but the body read is bounded
+	// by responseBytes and the caller's context rather than the per-call total.
+	slow  *http.Client
+	agent string
 }
 
 // New builds the client from the frozen config value. It reads no environment.
@@ -64,8 +69,15 @@ func New(cfg config.Config, agent string) *Client {
 		token:  cfg.HubToken,
 		source: cfg.HubTokenSource,
 		http:   &http.Client{Timeout: Timeout},
+		slow:   &http.Client{Transport: slowTransport()},
 		agent:  agent,
 	}
+}
+
+func slowTransport() *http.Transport {
+	t := http.DefaultTransport.(*http.Transport).Clone()
+	t.ResponseHeaderTimeout = Timeout
+	return t
 }
 
 func (c *Client) Base() string        { return c.base }
@@ -116,8 +128,8 @@ type call struct {
 	// rather than a number picked here about someone else's work.
 	byBytes bool
 	// responseBytes widens the ordinary small-JSON cap for one explicitly bounded
-	// response shape. Rental control snapshots carry base64 exact documents and
-	// therefore expand beyond their decoded-byte bound on this outer transport.
+	// response shape and moves the call onto the slow client: a large snapshot body
+	// is bounded by these bytes, not by Timeout.
 	responseBytes int64
 	// raw takes the answer's exact bytes instead of decoding it. The snapshot
 	// manifest route answers a canonical document verbatim, and this client must
@@ -225,10 +237,13 @@ func (c *Client) do(ctx context.Context, cl call, out any) *exit.Error {
 	}
 
 	client := c.http
-	if cl.byBytes {
+	switch {
+	case cl.byBytes:
 		wider := *c.http
 		wider.Timeout = 0
 		client = &wider
+	case cl.responseBytes > 0:
+		client = c.slow
 	}
 	resp, err := client.Do(req)
 	if err != nil {
@@ -269,7 +284,9 @@ func (c *Client) do(ctx context.Context, cl call, out any) *exit.Error {
 // transport maps a failure that never became an HTTP answer. Unreachable is 9;
 // a deadline is 10 — a hub that is up but stuck is a different problem.
 func (c *Client) transport(err error) *exit.Error {
-	if errors.Is(err, context.DeadlineExceeded) || strings.Contains(err.Error(), "Client.Timeout") {
+	var netErr net.Error
+	if errors.Is(err, context.DeadlineExceeded) || strings.Contains(err.Error(), "Client.Timeout") ||
+		(errors.As(err, &netErr) && netErr.Timeout()) {
 		return exit.New(exit.Deadline, "the hub at %s did not answer within %s", c.base, Timeout).
 			WithRemedy("retry; if it persists the hub is up but not serving").
 			WithNext("cozy hub status")

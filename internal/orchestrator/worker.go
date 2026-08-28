@@ -442,6 +442,8 @@ type worker struct {
 	// claims at all owes its first one on the same cadence, and a wait with no clock
 	// until the first frame is a wait that cannot end (found by the flip: a pre-flip
 	// runtime wheel that cannot host left the readiness wait spinning forever).
+	// For an ATTACHED worker it is zero until its first ClaimAck: the dial / plan delivery
+	// phase is bounded by its own measured progress, not by the report cadence.
 	spawned time.Time
 
 	// THE NO-PROGRESS GROUND'S STATE (cl-025). progressSig is a signature over every
@@ -560,10 +562,12 @@ func (c *Orchestrator) EnsureRental(id string) (string, string, WorkerChange, *e
 	if target == nil || target.Connection == nil {
 		return "", "", ChangeNone, exit.Internalf("rental %s resolved no connected worker", id)
 	}
-	instance, change, problem := c.EnsureWorker(WorkerLaunchSpec{
-		Placement: target.Placement, Connection: target.Connection,
-	})
-	return instance, target.Placement.Endpoint, change, problem
+	// The rental IS the slot, exactly as dispatch pins it: the same `org/name@<rental>`
+	// name, so a probe and a later pinned run share ONE connected worker.
+	spec := WorkerLaunchSpec{Placement: target.Placement, Connection: target.Connection}
+	spec.Placement.Endpoint = pinnedEndpoint(spec.Placement.Endpoint, id)
+	instance, change, problem := c.EnsureWorker(spec)
+	return instance, spec.Placement.Endpoint, change, problem
 }
 
 // hostsPlans answers whether a live worker was launched holding exactly the plans this
@@ -835,16 +839,19 @@ func (c *Orchestrator) spawnWorker(spec WorkerLaunchSpec) (string, *exit.Error) 
 // not heard from is not dispatchable, and the gates read that off these values rather than
 // off a separate "have we heard from it" flag that could disagree with them.
 func newWorker(instanceID string, spec WorkerLaunchSpec) *worker {
-	return &worker{
+	w := &worker{
 		instanceID:     instanceID,
 		spec:           spec,
 		placementID:    spec.Placement.PlacementID(),
 		dispatchable:   map[string]bool{},
 		materializable: map[string]bool{},
-		spawned:        time.Now(),
 		stopped:        make(chan struct{}),
 		attachDone:     make(chan struct{}),
 	}
+	if spec.Connection == nil {
+		w.spawned = time.Now()
+	}
+	return w
 }
 
 // connectWorker registers an ALREADY-RUNNING worker (a rented pod's TLS leg, cl-015):

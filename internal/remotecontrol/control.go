@@ -61,8 +61,6 @@ type Facts struct {
 	EndpointExecutionDigest string
 	ArtifactObjectSetDigest string
 	ModelRootDigests        []string
-	BindingReleaseDigest    string
-	EndpointBundleDigest    string
 }
 
 type exactRef struct {
@@ -418,12 +416,12 @@ func Decode(control hub.ExactControlDocument, endpointRef string) (Facts, *exit.
 	facts.Descriptor = descriptor
 	facts.EndpointExecutionDigest = s.EndpointExecutionDigest
 	facts.ArtifactObjectSetDigest = s.ArtifactObjectSet.Digest
-	facts.BindingReleaseDigest = s.BindingRelease.Digest
-	facts.EndpointBundleDigest = s.EndpointBundle.Digest
 	facts.Placement = orchestrator.DesiredPlacement{
 		Endpoint: repo.String(), ReleaseID: placementSpec.Str("endpoint_release_id"),
-		InstallID: s.AcquisitionAttemptID, DescriptorDigest: s.Descriptor.Digest,
-		Bindings: bindings, EnvironmentSpecDigest: s.EnvironmentSpec.Digest,
+		// No InstallID: a remote placement resolves from Tensorhub's attempt, never a
+		// local install row; the attempt id rides PlacementIDValue.
+		DescriptorDigest: s.Descriptor.Digest,
+		Bindings:         bindings, EnvironmentSpecDigest: s.EnvironmentSpec.Digest,
 		InstalledEnvironmentReceiptDigest: s.InstalledEnvironmentReceipt.Digest,
 		ConfigDigest:                      s.EvaluatedConfig.Digest, ExactPlacementSetDigest: s.PlacementSet.Digest,
 		ExactPlacementSetBytes: append([]byte(nil), s.PlacementSet.CanonicalBytes...),

@@ -541,7 +541,11 @@ func (c *Orchestrator) checkRetirement() {
 
 	// An accepted attempt is its own obligation. A completely unrelated queue head must
 	// neither mask its wedge nor become the subject printed in its retirement evidence.
-	active := snapshot(func(*worker) bool { return true })
+	// Only a worker that DECLARED a wedged subject needs its open attempts read to decide
+	// whether the wedge is on accepted work; the other grounds never depend on them.
+	active := snapshot(func(w *worker) bool {
+		return len(w.wedgedSubjects) > 0 || retirementGround(w, []records.Attempt{}) != ""
+	})
 	for _, victim := range active {
 		open, e := c.opt.Store.OpenAttemptsOf(victim.worker.instanceID)
 		if e != nil || len(open) == 0 {

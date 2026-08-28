@@ -88,12 +88,18 @@ func (c *Orchestrator) converge(s *session, w *worker, placements []DesiredPlace
 		}
 		setBytes, digest = append([]byte(nil), p.ExactPlacementSetBytes...), append([]byte(nil), declared...)
 	} else {
-		// LOCAL: retain the independent install-derived authoring path.
+		// LOCAL: retain the independent install-derived authoring path. An attached
+		// worker never gets this host's identity digests substituted for its own.
 		set := &pb.PlacementSet{}
 		for _, p := range placements {
+			if w.spec.Connection != nil && p.EnvironmentSpecDigest == "" {
+				return exit.Named(exit.Structural, "remote_placement_identity_missing",
+					"attached worker %s placement %s carries no frozen environment digest",
+					w.instanceID, p.PlacementID())
+			}
 			set.Placements = append(set.Placements, &pb.Placement{
 				PlacementId: p.PlacementID(),
-				Spec:        c.placementSpec(p, w.subjects),
+				Spec:        c.placementSpec(w, p),
 			})
 		}
 		var err error
@@ -137,13 +143,13 @@ func (c *Orchestrator) converge(s *session, w *worker, placements []DesiredPlace
 // A local install leaves environment/receipt empty unless its own launcher supplied
 // those facts; it never manufactures Tensorhub documents. A remote placement normally
 // bypasses this author entirely because converge relays Tensorhub's exact PlacementSet.
-func (c *Orchestrator) placementSpec(p DesiredPlacement, subjects []*pb.ArtifactSubject) *pb.PlacementSpec {
+func (c *Orchestrator) placementSpec(w *worker, p DesiredPlacement) *pb.PlacementSpec {
 	spec := &pb.PlacementSpec{
 		EndpointReleaseId: p.ReleaseID,
-		BindingPlans:      subjects,
+		BindingPlans:      w.subjects,
 	}
 	environmentDigest := p.EnvironmentSpecDigest
-	if environmentDigest == "" {
+	if environmentDigest == "" && w.spec.Connection == nil {
 		environmentDigest = c.opt.EnvironmentSpecDigest
 	}
 	if raw, err := canonical.Raw(environmentDigest); err == nil {
@@ -933,6 +939,7 @@ func (c *Orchestrator) mirrorOutputs(req records.Request, attempt uint64, doc ca
 		}
 	}
 	out := make([]records.Output, 0, len(list))
+	declared := map[string]bool{}
 	for _, item := range list {
 		entry, ok := item.(map[string]canonical.Value)
 		if !ok {
@@ -940,7 +947,11 @@ func (c *Orchestrator) mirrorOutputs(req records.Request, attempt uint64, doc ca
 		}
 		e := canonical.Doc(entry)
 		id := e.Str("output_id")
-		path := filepath.Join(dir, id)
+		path, problem := outputDest(req, dir, id)
+		if problem != nil {
+			return nil, problem
+		}
+		declared[id] = true
 		if err := verifyBytes(path, e.Str("digest"), e.Int("length")); err != nil {
 			return nil, err.WithRemedy(
 				"a remote worker writes on its own machine; its outputs are MIRRORED here " +
@@ -960,7 +971,36 @@ func (c *Orchestrator) mirrorOutputs(req records.Request, attempt uint64, doc ca
 			MimeType: e.Str("mime_type"),
 		})
 	}
+	if !req.IsJob() {
+		// A serving manifest may name only granted ids, and a SUCCEEDED one names all of them.
+		granted := map[string]bool{}
+		for _, id := range splitList(req.Outputs) {
+			granted[id] = true
+			if !declared[id] && holder.media != nil && outcomeStatus(doc.Int("status")) == "SUCCEEDED" {
+				return nil, exit.Named(exit.Validation, "output_set_mismatch",
+					"the terminal omits granted output %q", id)
+			}
+		}
+		for id := range declared {
+			if !granted[id] {
+				return nil, exit.Named(exit.Validation, "output_set_mismatch",
+					"the terminal names output %q, which was never granted", id)
+			}
+		}
+	}
 	return out, nil
+}
+
+// outputDest resolves where one declared output may land: a job's publication fence, or
+// a serving attempt's single-element id under its attempt directory.
+func outputDest(req records.Request, dir, id string) (string, *exit.Error) {
+	if req.IsJob() {
+		return publicationDest(dir, id)
+	}
+	if e := fenceOutputID(id); e != nil {
+		return "", e
+	}
+	return filepath.Join(dir, id), nil
 }
 
 // fetchOutputs pulls one remote attempt's declared outputs across the pod's media plane
@@ -987,10 +1027,10 @@ func (c *Orchestrator) fetchOutputs(req records.Request, attempt uint64,
 			continue
 		}
 		id := canonical.Doc(entry).Str("output_id")
-		if id == "" {
-			continue
+		destination, e := outputDest(req, dir, id)
+		if e != nil {
+			return e
 		}
-		destination := filepath.Join(dir, id)
 		length := canonical.Doc(entry).Int("length")
 		digest := canonical.Doc(entry).Str("digest")
 		written, e := holder.media.GetOutputTo(slot, id, destination, digest, length)

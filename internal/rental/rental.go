@@ -360,14 +360,14 @@ func ObserveWorker(st *records.Store) func(orchestrator.RentalObservation) *exit
 }
 
 func controlFacts(row records.Rental) (remotecontrol.Facts, *exit.Error) {
-	if row.ControlSnapshotDigest == "" || row.ControlSnapshotLength <= 0 || len(row.ControlSnapshotBytes) == 0 {
+	if row.ControlSnapshotDigest == "" || len(row.ControlSnapshotBytes) == 0 {
 		return remotecontrol.Facts{}, exit.Named(exit.Conflict, "rental.control_snapshot_missing",
 			"rental %s has no persisted acquisition-attempt control snapshot", row.ID).
 			WithRemedy("release it and rent again; Creator will not resolve a remote pod from the local install")
 	}
 	return remotecontrol.Decode(hub.ExactControlDocument{
 		CanonicalBytes: row.ControlSnapshotBytes, Digest: row.ControlSnapshotDigest,
-		Length: row.ControlSnapshotLength,
+		Length: int64(len(row.ControlSnapshotBytes)),
 	}, row.EndpointRef)
 }
 

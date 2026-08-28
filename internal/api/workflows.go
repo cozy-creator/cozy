@@ -236,7 +236,6 @@ func (s *Server) getWorkflowReceipt(w http.ResponseWriter, r *http.Request) {
 		summary, summaryProblem := rental.Summarize(records.Rental{
 			ID: control.RentalID, EndpointRef: control.EndpointRef,
 			ControlSnapshotDigest: control.ControlSnapshotDigest,
-			ControlSnapshotLength: control.ControlSnapshotLength,
 			ControlSnapshotBytes:  control.ControlSnapshotBytes,
 		})
 		if summaryProblem != nil {
