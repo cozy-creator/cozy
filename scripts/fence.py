@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Boundary fence (boundaries.md). Architecture enforcement, not a test.
 
-Thirteen families:
+Fourteen families:
   deps      forbidden dependencies (raw lines, incl. import paths and go.mod)
   impl      storage/chunk/loader/residency/tensor implementation vocabulary — cozy-creator
             renders and orchestrates, it never implements the byte plane (TensorFS owns it)
@@ -9,7 +9,12 @@ Thirteen families:
   matrix    internal/exit/exit.go must equal docs/exit-matrix.md row for row
   manifest  a reclaiming/removing verb must DECLARE its gate: Destructive (exit 7 without
             --yes) or PlanFirst (a read without --yes) — exactly one, and it must
-            advertise --yes. Nothing removes bytes on a bare invocation.
+            advertise --yes. Nothing removes bytes on a bare invocation. And GlobalFlags
+            never names --version/-v/-V: AXI 10's version probe is a pre-parse fast path
+            in app.Run, and a global row would shadow `cozy pack --version <x.y.z>`.
+  render    (AXI 6) internal/render writes ONE stream. An error is structured output the
+            agent must read, so it leaves on stdout with the data; stderr is progress and
+            diagnostics, which this layer does not emit.
   env       (cl-001) the environment is read in internal/config/config.go and NOWHERE else:
             one entrypoint reader, a frozen typed value thereafter.
   store     (cl-001) no second lifecycle store: the ONE local SQLite database is the
@@ -509,13 +514,44 @@ def check_secret_flags():
 # A verb whose name reclaims or removes must declare how it is gated.
 RECLAIM_VERB = re.compile(r"\b(rm|gc|purge|delete|destroy|prune|reset|clean)\b")
 
+# AXI 10's three version spellings. They are answered before the manifest is even read;
+# as GlobalFlags rows they would instead be resolved by parse.findFlag, which checks
+# globals FIRST and would hand `cozy pack --version 1.2.3` to the wrong flag.
+VERSION_SPELLINGS = ("--version", "-v", "-V")
+FLAG_SPELLING = re.compile(r'(?:Name|Short):\s*"(-[-A-Za-z0-9]*)"')
+
+
+def check_global_flags():
+    src_path = pathlib.Path("internal/manifest/manifest.go")
+    if not src_path.exists():
+        return ["[manifest] missing internal/manifest/manifest.go"]
+    bad, seen = [], False
+    inside = False
+    for i, line in enumerate(src_path.read_text().splitlines(), 1):
+        if line.startswith("var GlobalFlags"):
+            inside, seen = True, True
+            continue
+        if not inside:
+            continue
+        if line.startswith("}"):
+            break
+        for m in FLAG_SPELLING.finditer(line):
+            if m.group(1) in VERSION_SPELLINGS:
+                bad.append(f"internal/manifest/manifest.go:{i}: [manifest] GlobalFlags declares "
+                           f"'{m.group(1)}' — the version probe is a pre-parse fast path in "
+                           "app.Run, and a global row shadows `cozy pack --version <x.y.z>` "
+                           "because parse.findFlag resolves globals before command flags")
+    if not seen:
+        bad.append("[manifest] internal/manifest/manifest.go declares no GlobalFlags block")
+    return bad
+
 
 def check_manifest():
     src_path = pathlib.Path("internal/manifest/commands.go")
     if not src_path.exists():
         return ["[manifest] missing internal/manifest/commands.go"]
     blocks = src_path.read_text().split("\n\t{\n")[1:]
-    bad, rows = [], 0
+    bad, rows = check_global_flags(), 0
     for block in blocks:
         body = block.split("\n\t},")[0]
         m = re.search(r"Path:\s*\[\]string\{([^}]*)\}", body)
@@ -535,7 +571,27 @@ def check_manifest():
         if (destructive or plan_first) and not has_yes:
             bad.append(f"[manifest] '{name}' is gated on --yes but advertises no --yes flag")
     if not rows:
-        return ["[manifest] no command rows parsed out of commands.go"]
+        bad.append("[manifest] no command rows parsed out of commands.go")
+    return bad
+
+
+RENDER_SRC = "internal/render/render.go"
+RENDER_STDERR = re.compile(r"Fprint(?:f|ln)?\(\s*(?:[A-Za-z_.]*\.)?[Ss]tderr\b")
+
+
+def check_render_streams():
+    """(AXI 6) The one output layer writes one stream. Errors are structured output the
+    agent consumes, so they leave on stdout beside the data; a stderr writer here is the
+    regression where `cozy ls nonexistent` gave a stdout-capturing agent an empty buffer."""
+    src_path = pathlib.Path(RENDER_SRC)
+    if not src_path.exists():
+        return [f"[render] missing {RENDER_SRC}"]
+    bad = []
+    for i, line in enumerate(src_path.read_text().splitlines(), 1):
+        if RENDER_STDERR.search(line):
+            bad.append(f"{RENDER_SRC}:{i}: [render] the render layer writes to stderr — an error "
+                       "is structured output and belongs on stdout with the data (AXI 6); stderr "
+                       f"carries progress, which this layer does not emit: {line.strip()}")
     return bad
 
 
@@ -654,7 +710,7 @@ def check_video_boundary():
 
 violations = (check_sources() + check_matrix() + check_manifest() + check_secret_flags()
               + check_contract() + check_video_boundary() + check_embedded() + check_scripts()
-              + check_document_kinds())
+              + check_document_kinds() + check_render_streams())
 if violations:
     print("FENCE RED (boundaries.md):", file=sys.stderr)
     for v in violations:
@@ -664,7 +720,8 @@ print(
     f"fence green — deps({len(DENY_DEPS)}) impl({len(DENY_IMPL)}) "
     f"prompt({len(DENY_PROMPT) + len(DENY_PROMPT_CALLS) + 1}) matrix(15 rows) "
     f"env({len(DENY_ENV_CALLS)}) store({len(DENY_STORE)}) cloud({len(DENY_CLOUD)}) "
-    f"manifest({RECLAIM_VERB.pattern}) secret({SECRET_FLAG.pattern} + Reveal@{len(REVEAL_SITES)}) "
+    f"manifest({RECLAIM_VERB.pattern} + globals!{'/'.join(VERSION_SPELLINGS)}) "
+    f"render(one stream@{RENDER_SRC}) secret({SECRET_FLAG.pattern} + Reveal@{len(REVEAL_SITES)}) "
     f"cas({len(DENY_DIGEST)} digests@{len(DIGEST_FREE)} + store-path) tensor(tfs@{len(TFS_SITES)}) "
     f"api({len(DENY_COOKIE)} cookie + cors + listen@{len(LISTEN_SITES)} programs) "
     f"media({len(DENY_MEDIA_EGRESS)} egress + {len(DENY_MEDIA_IMPORT)} imports@{MEDIA_DIR}) "

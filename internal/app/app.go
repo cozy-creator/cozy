@@ -4,6 +4,7 @@
 package app
 
 import (
+	"fmt"
 	"io"
 	"strings"
 
@@ -32,22 +33,34 @@ type Handler func(*Context) *exit.Error
 
 // Run is the whole CLI. It returns a shared-matrix exit code and never panics out.
 func Run(args []string, stdout, stderr io.Writer) int {
+	// AXI 10 — the version probe is the first statement of the process: agents run it at
+	// every session start, so it pays for no self-check, no manifest parse and no
+	// config.Load (which reads $COZY_HOME/config.yaml and .env off disk). It fires ONLY as
+	// the sole argument, which is what keeps `cozy pack --version <x.y.z>` — a real
+	// value-taking command flag — untouched. This is deliberately NOT a manifest.GlobalFlags
+	// row: parse.findFlag checks globals before command flags, so a global --version would
+	// silently swallow pack's. The manifest fence forbids anyone from adding one.
+	if len(args) == 1 && (args[0] == "-v" || args[0] == "-V" || args[0] == "--version") {
+		fmt.Fprintln(stdout, tag)
+		return int(exit.OK)
+	}
+
 	// Startup self-check: the manifest and the handler registry must agree.
 	if e := manifest.SelfCheck(handlerNames()); e != nil {
-		render.EmitError(stdout, stderr, e, render.Mode{JSON: prescanJSON(args)})
+		render.EmitError(stdout, e, render.Mode{JSON: prescanJSON(args)})
 		return int(exit.Internal)
 	}
 
 	inv, e := parse(args)
 	if e != nil {
-		render.EmitError(stdout, stderr, e, inv.Mode)
+		render.EmitError(stdout, e, inv.Mode)
 		return int(exit.Of(e))
 	}
 
 	// The ONE environment read of this process, before any handler runs.
 	cfg, e := config.Load()
 	if e != nil {
-		render.EmitError(stdout, stderr, e, inv.Mode)
+		render.EmitError(stdout, e, inv.Mode)
 		return int(exit.Of(e))
 	}
 
@@ -56,7 +69,7 @@ func Run(args []string, stdout, stderr io.Writer) int {
 	// -h/--help short-circuits before every gate: help never mutates, never dials.
 	if inv.Help {
 		if e := renderHelp(ctx, inv.Cmd); e != nil {
-			render.EmitError(stdout, stderr, e, inv.Mode)
+			render.EmitError(stdout, e, inv.Mode)
 			return int(exit.Of(e))
 		}
 		return int(exit.OK)
@@ -69,13 +82,13 @@ func Run(args []string, stdout, stderr io.Writer) int {
 	// Gates, most-durable refusal first: a refusal that would still stand in a
 	// fully implemented binary is reported before one that is only true of this build.
 	if e := gate(ctx); e != nil {
-		render.EmitError(stdout, stderr, e, inv.Mode)
+		render.EmitError(stdout, e, inv.Mode)
 		return int(exit.Of(e))
 	}
 
 	h := handlers[inv.Cmd.Handler]
 	if e := h(ctx); e != nil {
-		render.EmitError(stdout, stderr, e, inv.Mode)
+		render.EmitError(stdout, e, inv.Mode)
 		return int(exit.Of(e))
 	}
 	return int(exit.OK)

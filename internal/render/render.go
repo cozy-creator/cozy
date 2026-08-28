@@ -8,14 +8,19 @@ import (
 	"fmt"
 	"io"
 	"strings"
+	"unicode/utf8"
 
 	"github.com/cozy-creator/cozy-creator/internal/exit"
 )
 
 const (
-	rowCap    = 20 // lists cap at 20 rows without --full
-	valueCap  = 72 // long values elide with a size hint
-	maxNext   = 2  // at most two next: lines
+	rowCap = 20 // lists cap at 20 rows without --full
+	// Two caps, because the constraints differ (AXI 3). A list CELL is bounded by the
+	// column it sits in; a record/lines VALUE is bounded only by what an agent can read,
+	// and 72 guillotines a job error or a result blob. 900 sits in AXI's 500–1500 band.
+	cellCap   = 72
+	fieldCap  = 900
+	maxNext   = 2 // at most two next: lines
 	sepAggreg = " · "
 )
 
@@ -104,18 +109,18 @@ func Bytes(n int64) string {
 	return fmt.Sprintf("%.1f%ciB", float64(n)/float64(div), "KMGTPE"[exp])
 }
 
-// Elide shortens a long value with a size hint unless --full.
-func Elide(s string, full bool) string {
-	if full || len(s) <= valueCap {
+// Elide shortens a value to `limit` RUNES and reports its TOTAL length, so the agent knows
+// the size of what it is missing (AXI 3) rather than a remainder it cannot act on. Counting
+// is rune-based throughout: the old mix of len() bytes with rune indexing both over-reported
+// and over-cut a multibyte value. The hint fires only when something was actually cut.
+func Elide(s string, limit int, full bool) string {
+	total := utf8.RuneCountInString(s)
+	if full || total <= limit {
 		return s
 	}
-	r := []rune(s)
-	if len(r) <= valueCap {
-		return s
-	}
-	kept := string(r[:valueCap-1])
-	out := fmt.Sprintf("%s… (+%s, --full)", kept, Bytes(int64(len(s)-len(kept))))
-	if len(out) >= len(s) {
+	kept := string([]rune(s)[:limit-1])
+	out := fmt.Sprintf("%s… (truncated, %d chars total, --full)", kept, total)
+	if utf8.RuneCountInString(out) >= total {
 		return s // eliding would print more, not less
 	}
 	return out
@@ -220,7 +225,7 @@ func (r Record) Emit(w io.Writer, m Mode) error {
 		}
 	}
 	for _, f := range fields {
-		fmt.Fprintf(w, "%-*s %s\n", width+1, f.K+":", Elide(text(f.V), m.Full))
+		fmt.Fprintf(w, "%-*s %s\n", width+1, f.K+":", Elide(text(f.V), fieldCap, m.Full))
 	}
 	writeTail(w, r.Notes, r.Next)
 	return nil
@@ -246,7 +251,7 @@ func (l Lines) Emit(w io.Writer, m Mode) error {
 		fmt.Fprintf(w, "+%d more — --full\n", len(l.Items)-len(shown))
 	}
 	for _, e := range l.Extra {
-		fmt.Fprintf(w, "%s: %s\n", e.K, text(e.V))
+		fmt.Fprintf(w, "%s: %s\n", e.K, Elide(text(e.V), fieldCap, m.Full))
 	}
 	writeTail(w, l.Notes, l.Next)
 	return nil
@@ -320,7 +325,7 @@ func (l List) Emit(w io.Writer, m Mode) error {
 	for _, r := range shown {
 		row := make([]string, len(cols))
 		for i, c := range cols {
-			row[i] = Elide(r[c], m.Full)
+			row[i] = Elide(r[c], cellCap, m.Full)
 			if len(row[i]) > width[i] {
 				width[i] = len(row[i])
 			}
@@ -361,11 +366,13 @@ func printRow(w io.Writer, cells []string, width []int) {
 	fmt.Fprintln(w, strings.TrimRight(strings.Join(out, "  "), " "))
 }
 
-// EmitError renders a typed error. Compact text goes to stderr; under --json the
-// envelope goes to stdout so stdout always carries exactly one JSON document.
-func EmitError(stdout, stderr io.Writer, e *exit.Error, m Mode) {
+// EmitError renders a typed error onto the SAME stream the data would have used —
+// stdout — in both modes (AXI 6). A refusal is structured output the agent must read and
+// act on; on stderr it left an agent capturing stdout with an empty buffer and a bare
+// exit code. stderr carries progress and diagnostics, and this layer never writes there.
+func EmitError(w io.Writer, e *exit.Error, m Mode) {
 	if m.JSON {
-		_ = writeJSON(stdout, []Field{
+		_ = writeJSON(w, []Field{
 			{"error", map[string]any{
 				"code":    int(e.Code),
 				"name":    e.ErrName(),
@@ -376,11 +383,11 @@ func EmitError(stdout, stderr io.Writer, e *exit.Error, m Mode) {
 		})
 		return
 	}
-	fmt.Fprintf(stderr, "error(%s): %s\n", e.ErrName(), e.Message)
+	fmt.Fprintf(w, "error(%s): %s\n", e.ErrName(), e.Message)
 	if e.Remedy != "" {
-		fmt.Fprintf(stderr, "remedy: %s\n", e.Remedy)
+		fmt.Fprintf(w, "remedy: %s\n", e.Remedy)
 	}
 	for _, n := range trimNext(e.Next) {
-		fmt.Fprintf(stderr, "next: %s\n", n)
+		fmt.Fprintf(w, "next: %s\n", n)
 	}
 }

@@ -96,7 +96,10 @@ func renderRootHelp(ctx *Context) *exit.Error {
 		fmt.Fprintln(w, "\n  * planned — `cozy commands` names the owning issue")
 	}
 	fmt.Fprintln(w, "\nglobal flags:")
-	width := 0
+	// The version probe is a pre-parse fast path in Run, not a GlobalFlags row (a global
+	// --version would shadow `cozy pack --version`), so root help is where it is advertised.
+	const versionFlags = "-v/-V/--version"
+	width := len(versionFlags)
 	for _, f := range manifest.GlobalFlags {
 		if n := len(flagSpelling(f)); n > width {
 			width = n
@@ -105,6 +108,8 @@ func renderRootHelp(ctx *Context) *exit.Error {
 	for _, f := range manifest.GlobalFlags {
 		fmt.Fprintf(w, "  %-*s  %s\n", width, flagSpelling(f), f.Summary)
 	}
+	fmt.Fprintf(w, "  %-*s  %s\n", width, versionFlags,
+		"print the bare version and exit 0; only as the sole argument (`cozy version` is the full record)")
 	fmt.Fprintln(w, "next: cozy commands --full")
 	fmt.Fprintln(w, "next: cozy help <command>")
 	return nil
