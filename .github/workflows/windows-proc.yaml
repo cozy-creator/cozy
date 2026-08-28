@@ -18,15 +18,15 @@ jobs:
       # Formatting is ci.yaml's gate on Linux; this run is about process behavior.
       - run: go vet ./...
       # apiarms/verbs drive the BUILT product binary; build it first, where they look.
-      - run: go build -o cozy.exe ./cmd/cozy
+      - run: go build -o cozy.exe .
       # The three in-process suites: spawn (CREATE_SUSPENDED -> job adoption -> resume),
       # Register over the LOOPBACK transport with the per-spawn bootstrap credential,
       # dispatch/terminal/ack, the two-tier stop (CTRL_BREAK -> TerminateJobObject),
       # Windows birth identity, and reconcile — against the Go fake worker.
       # verbs is deliberately absent: it installs the real 4.8 GiB SDXL release archive,
       # which is endpoint evidence (cr-020 Half 2), not process-model evidence.
-      - run: go run ./cmd/cozy-live arms
-      - run: go run ./cmd/cozy-live apiarms
+      - run: go run .-live arms
+      - run: go run .-live apiarms
       # The service journey: detach, probe by lock, cooperative down over the shutdown
       # route, exit proved by the lock — the tier order #449 mandates.
       - shell: pwsh

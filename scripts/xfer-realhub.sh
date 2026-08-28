@@ -75,7 +75,7 @@ ok "sources pinned"
 
 step "build"
 ( cd "$WORK/hub" && nice -n 19 go build -o "$WORK/tensorhub" ./cmd/tensorhub ) || { bad "hub build"; exit 1; }
-nice -n 19 env CGO_ENABLED=0 go build -o "$WORK/cozy" ./cmd/cozy || { bad "cozy build"; exit 1; }
+nice -n 19 env CGO_ENABLED=0 go build -o "$WORK/cozy" . || { bad "cozy build"; exit 1; }
 [ -x "$TFS_BIN" ] || { bad "no tfs binary at $TFS_BIN"; exit 1; }
 ok "tensorhub, cozy and tfs in hand"
 

@@ -61,7 +61,7 @@ word inside help text or a doc comment is never a violation. Doors, both greppab
 """
 import pathlib, re, sys
 
-SCAN = ["go.mod", "cmd/**/*.go", "internal/**/*.go"]
+SCAN = ["go.mod", "main.go", "cmd/**/*.go", "internal/**/*.go"]
 
 DENY_DEPS = ["tensorhub-v2", "varena"]
 YAML_IMPORT = "go.yaml.in/yaml/v3"

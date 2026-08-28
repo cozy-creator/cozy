@@ -3,7 +3,7 @@
 # automated tests; verification is running the real thing) — every line below is the real
 # `cozy pack` binary against real endpoint trees, and it PRINTS what it observed.
 #
-#   CGO_ENABLED=0 go build -o cozy ./cmd/cozy       # the binary the product ships
+#   CGO_ENABLED=0 go build -o cozy .       # the binary the product ships
 #   scripts/wheel-live.sh [--cozy <bin>] [--endpoints <dir>] [--runtime <dir>] [<section> …]
 #
 # Sections: determinism | seat | arms | install   (default: all four)
@@ -37,7 +37,7 @@ while [ $# -gt 0 ]; do
   esac
 done
 [ ${#SECTIONS[@]} -eq 0 ] && SECTIONS=(determinism seat arms install)
-[ -x "$COZY" ] || { echo "refusing: no cozy binary at $COZY (go build -o cozy ./cmd/cozy)" >&2; exit 2; }
+[ -x "$COZY" ] || { echo "refusing: no cozy binary at $COZY (go build -o cozy .)" >&2; exit 2; }
 
 WORK="$(mktemp -d)"
 trap 'rm -rf "$WORK"' EXIT

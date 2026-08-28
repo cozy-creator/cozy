@@ -80,7 +80,7 @@ for target in $TARGETS; do
   for pass in a b; do
     mkdir -p "$D/.build-$pass"
     why="$(nice -n 19 env GOOS="$goos" GOARCH="$goarch" CGO_ENABLED=0 \
-      go build -trimpath -ldflags "$LDFLAGS" -o "$D/.build-$pass/$exe" ./cmd/cozy 2>&1)" || { ok=0; break; }
+      go build -trimpath -ldflags "$LDFLAGS" -o "$D/.build-$pass/$exe" . 2>&1)" || { ok=0; break; }
   done
   # The compiler's OWN first line, quoted into the reason. "the build failed" names
   # nothing; `undefined: syscall.Kill` names the file that still owes this platform a port.

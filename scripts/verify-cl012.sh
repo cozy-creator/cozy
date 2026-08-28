@@ -97,7 +97,7 @@ note "tensorhub $HUB_SHA · tensorfs $TFS_SHA · bucket $BUCKET · prefix $PREFI
 rm -rf "$WORK/hubsrc"; mkdir -p "$WORK/hubsrc"
 git -C "$HUB_REPO" archive "$HUB_SHA" | tar -x -C "$WORK/hubsrc" || exit 1
 ( cd "$WORK/hubsrc" && nice -n 19 go build -o "$HUB_BIN" ./cmd/tensorhub ) || exit 1
-nice -n 19 go build -o "$COZY_BIN" ./cmd/cozy || exit 1
+nice -n 19 go build -o "$COZY_BIN" . || exit 1
 note "tensorhub $(stat -c%s "$HUB_BIN") B · cozy $(stat -c%s "$COZY_BIN") B"
 
 step "postgres (dedicated container, torn down on exit)"

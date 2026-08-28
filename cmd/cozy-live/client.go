@@ -51,7 +51,7 @@ func startService(root string, port int, fresh bool) *liveService {
 	abs, err := filepath.Abs(binary)
 	must("resolving the cozy binary", err)
 	if _, err := os.Stat(abs); err != nil {
-		must("the cozy binary", fmt.Errorf("%s: %w (build it: go build -o %s ./cmd/cozy)",
+		must("the cozy binary", fmt.Errorf("%s: %w (build it: go build -o %s .)",
 			abs, err, filepath.Base(defaultCozy())))
 	}
 
