@@ -11,6 +11,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"encoding/pem"
+	"io"
 	"math/big"
 	"net"
 	"net/http"
@@ -106,6 +107,30 @@ func TestPodMediaGrant(t *testing.T) {
 			}
 		})
 	}
+
+	// The health answer is the CONTRACT AND NOTHING ELSE (rev 2). It is checked against the
+	// ONE declaration rather than against a second spelling of the field names here — the
+	// fence forbids that spelling for the same reason this plane has a revision at all. So:
+	// the served bytes must equal the declared document exactly, and it must carry exactly
+	// the two fields that have a reader. A field added to the answer reddens this arm, which
+	// is the point — an unread field is how a wire shape both ends must agree on grows.
+	t.Run("the health answer publishes only the contract", func(t *testing.T) {
+		resp := get(t, "/v1/health", token)
+		defer resp.Body.Close()
+		body, err := io.ReadAll(resp.Body)
+		must(t, err)
+		declared, err := json.Marshal(mediawire.Ours())
+		must(t, err)
+		if strings.TrimSpace(string(body)) != string(declared) {
+			t.Fatalf("the health answer is not the declared document:\n got %s\nwant %s",
+				strings.TrimSpace(string(body)), declared)
+		}
+		var said map[string]any
+		must(t, json.Unmarshal(body, &said))
+		if len(said) != 2 {
+			t.Fatalf("the health answer carries %d fields, want exactly 2 (%s)", len(said), body)
+		}
+	})
 
 	// The readiness envelope is served as EXACT BYTES and carries no capability: it is
 	// the one route Tensorhub reads before it trusts the TLS peer, and it authenticates

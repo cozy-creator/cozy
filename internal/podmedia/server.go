@@ -21,8 +21,9 @@
 // Seven routes, and the shape of each is the whole design:
 //
 //	GET  /v1/health               the owner's ONE pre-flight: this server names itself and
-//	                              its contract revision, and the owner refuses the rental
-//	                              rather than upload a byte to a plane at another revision.
+//	                              its contract revision — and answers nothing else — and the
+//	                              owner refuses the rental rather than upload a byte to a
+//	                              plane at another revision.
 //	GET  /v1/bootstrap/receipt    Tensorhub reads one attempt-bound, pod-authored readiness
 //	                              envelope. Its HMAC is verified by Tensorhub before the TLS
 //	                              peer is trusted; the response is the exact file bytes.
@@ -706,21 +707,22 @@ func (s *server) getOutput(w http.ResponseWriter, r *http.Request) {
 	_, _ = io.CopyN(w, file, info.Size())
 }
 
-// health answers that this server is up, WHICH CONTRACT IT SPEAKS, and what it is holding.
+// health answers that this server is up and WHICH CONTRACT IT SPEAKS, and nothing else.
 // The revision is the whole reason the owner asks before it uploads: this binary is pinned
 // into the pod image by commit and the owner floats, so `service` + `contract_rev` is the
 // only thing standing between the two ends and a silently misparsed answer. It is
 // authenticated like everything else: an unauthenticated liveness route would be a second,
 // weaker door.
+//
+// It no longer publishes this pod's root, fill level, quota, object ceiling, or whether
+// plans are configured (rev 2). Nothing read them. Those bounds are enforced where they
+// are checked — `room` and `reserveOutputs` refuse with the exact numbers — so publishing
+// them ahead of time only handed pod state to every authenticated caller.
 func (s *server) health(w http.ResponseWriter, r *http.Request) {
 	if !s.admits(w, r) {
 		return
 	}
-	answer(w, http.StatusOK, mediawire.Health{
-		Contract: mediawire.Ours(), Root: s.opt.Root,
-		UsedBytes: s.used(), QuotaBytes: s.opt.Quota, MaxObjectBytes: s.opt.MaxBody,
-		Plans: s.opt.Plans != "",
-	})
+	answer(w, http.StatusOK, mediawire.Ours())
 }
 
 func (s *server) routes() *http.ServeMux {

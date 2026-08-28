@@ -270,7 +270,10 @@ POD_KEY_WIPES = {
 # exactly one home. A second spelling of a contract field is how the two ends drift back
 # apart in silence, which is the whole defect cl-031 closed.
 MEDIA_CONTRACT_HOME = "internal/mediawire/wire.go"
-MEDIA_CONTRACT_FIELDS = ["contract_rev", "max_receipt_bytes"]
+MEDIA_CONTRACT_FIELDS = ["contract_rev"]
+# `max_receipt_bytes` left this list when it left the wire (rev 2): the health answer
+# published a ceiling nothing read, because the reader that needed it was in another repo
+# until cl-036 made the two ends one binary. The NUMBER is still fenced below.
 # …and the ceiling itself, as a NUMBER. The field-name rule above catches a second JSON
 # spelling; it did not catch what actually happened, which is that the pod supervisor
 # declared `maxReceiptEnvelopeSize = 64 << 10` of its own while it lived in another repo —

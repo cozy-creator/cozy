@@ -564,7 +564,9 @@ separately exec'd process either way.
 
 The one number the two halves must agree on — the readiness envelope ceiling — is
 `internal/mediawire.MaxReceiptBytes`, imported by both; the fence refuses a second spelling
-of it, as a JSON field name or as a literal.
+of it as a literal. It is no longer published on `/v1/health`: it crossed the wire only so
+a `cozy-bootstrap` in another repo could learn it without a credential, and the merge made
+that a compile-time read.
 
 ## Verification
 
