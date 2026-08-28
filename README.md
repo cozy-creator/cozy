@@ -520,6 +520,27 @@ installed-binary state and release state are four distinct evidence axes, so a g
   no card can make for itself. `no_servable_function` survives for its one remaining case:
   a release whose descriptor registers no entrypoint at all.
 
+## The pod's two processes (cl-014, xs-004)
+
+A rented pod runs one container with two Go processes from this repo, plus the Python
+worker. They are built here because they are peers of `internal/media` and share one wire
+contract; the image RECIPE that assembles them is Tensorhub's.
+
+`cmd/cozy-bootstrap` is the entrypoint and supervisor. It takes no arguments and reads no
+configuration file: its whole launch surface is an ALLOWLISTED set of `COZY_*` environment
+grants, and an unrecognized one is a boot failure rather than an ignored default. It mints
+the pod's TLS leaf and the token-hash file (so no credential ships in the image), fetches
+the two provision documents as exact grants — credential-free HTTPS, declared length,
+declared sha256, no proxy and no redirect, verified before publication — execs
+`cozy-media` and the control runtime's launch adapter with a five-name environment by
+absolute path, and HMACs the adapter's opaque readiness payload into the envelope the
+media server serves. It treats both provision documents and the readiness payload as
+opaque bytes.
+
+`cmd/cozy-media` is the byte plane (above). The one number they must agree on — the
+readiness envelope ceiling — is `internal/mediawire.MaxReceiptBytes`, imported by both;
+the fence refuses a second spelling of it, as a JSON field name or as a literal.
+
 ## Verification
 
 No automated tests. Verification is running the real thing:
@@ -554,6 +575,11 @@ No automated tests. Verification is running the real thing:
   plan/perform split, the bytes actually freed, and the 410-not-404 tombstone), and
   `verbs`/`journey` (the CLI as a user types it, against an INSTALLED endpoint — no
   hand-written spec document anywhere).
+- `scripts/verify-hardening.sh` runs the real `cozy-bootstrap` binary against the pod
+  supervisor's four hardening claims: ambient `RUNPOD_*` provider identity never reaches
+  guest truth, an unknown `COZY_*` name is refused BY NAME rather than ignored, the child
+  environment allowlist is exactly the reviewed five-name set, and the readiness ceiling is
+  imported from `internal/mediawire` rather than restated.
 - `scripts/verify-cl012.sh` + `scripts/xfer-live.py` drive the real `cozy` against a
   real tensorhub (built from a PINNED commit through a read-only `git archive`, because
   that repo has a concurrent writer), its own Postgres container, real R2 under
@@ -569,17 +595,21 @@ No automated tests. Verification is running the real thing:
   a READY worker with no weights to fill, a typed `completed` terminal, a published PNG,
   zero reserved VRAM and an empty construction digest, plus the typed failure terminal —
   `cozy down`'s proof of absence, and the verified upgrade.
-- `scripts/fence.py` enforces fourteen families: forbidden deps, the canonical tensor
+- `scripts/fence.py` enforces fifteen families: forbidden deps, the canonical tensor
   carriers TensorFS parses, interactive prompts, exit-matrix parity, a manifest lint (gate
   declaration, no `--version` global, and a `Next:`/`Examples:` disclosure on every
   implemented row), the `render` fence (one stream — an error is data and leaves on
-  stdout), the env-read fence (one reader), no lifecycle sidecar, the secret fence (no
+  stdout), the env-read fence (one reader PER PROGRAM — the CLI's and the pod
+  supervisor's), no lifecycle sidecar, the secret fence (no
   credential-shaped flag takes an argv value; `Reveal()` only where the value becomes a
   header), the `cas` fence (nobody composes a store path), the `api` fence (no cookie, one
   bind per program, and a CORS header that is doored elsewhere but ABSOLUTELY refused
   inside `internal/api` per #628), client-contract parity, the `media` fence (the pod's
   byte plane has no outbound capability and cannot import the worker protocol, and its
-  wire contract is declared in `internal/mediawire` and restated nowhere) and the `tensor`
-  fence (the tensorfs CLI has one caller). Doors are greppable: `//cozy:allow`,
-  `//cozy:stdin-value`. The `cloud` family and the transfer-plane digest ban were deleted
+  wire contract — including the receipt ceiling as a NUMBER — is declared in
+  `internal/mediawire` and restated nowhere), the `bootstrap` fence (the pod supervisor
+  must egress and must exec, so its licence is bounded instead of absent: outbound network
+  in exactly one file, no credential on either request, and no worker-protocol import) and
+  the `tensor` fence (the tensorfs CLI has one caller). Doors are greppable:
+  `//cozy:allow`, `//cozy:stdin-value`. The `cloud` family and the transfer-plane digest ban were deleted
   2026-08-28 as vocabulary rules with no failure behind them.

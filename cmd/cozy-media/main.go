@@ -85,10 +85,6 @@ type options struct {
 	bootstrapReceipt string // exact pod-authored JSON; may appear after the listener starts
 	quota            int64
 	maxBody          int64
-	// bounds prints this build's media contract and exits. It is how the POD IMAGE's build
-	// and cozy-bootstrap learn the revision and the receipt ceiling from the binary itself
-	// instead of restating numbers this repo owns.
-	bounds bool
 }
 
 func run(args []string) int {
@@ -116,11 +112,6 @@ func run(args []string) int {
 			opt.key = value
 		case "bootstrap-receipt":
 			opt.bootstrapReceipt = value
-		case "bounds":
-			opt.bounds = true
-			if value != "" {
-				return usage("--bounds takes no value")
-			}
 		case "quota":
 			n, err := strconv.ParseInt(value, 10, 64)
 			if err != nil || n <= 0 {
@@ -136,14 +127,6 @@ func run(args []string) int {
 		default:
 			return usage("unknown flag %q", args[i])
 		}
-	}
-	if opt.bounds {
-		out, err := json.Marshal(mediawire.Ours())
-		if err != nil {
-			return fatal("cannot render this build's media contract: %v", err)
-		}
-		fmt.Println(string(out))
-		return 0
 	}
 	switch {
 	case opt.listen == "":
@@ -828,8 +811,7 @@ func usage(format string, args ...any) int {
 	fmt.Fprintln(os.Stderr, "usage: cozy-media --listen <host:port> --root <dir> "+
 		"--tokens <file> [--plans <dir>] [--out <dir>] [--tls-cert <pem> --tls-key <pem>] "+
 		"[--bootstrap-receipt <json>] "+
-		"[--quota <bytes>] [--max-body <bytes>]\n"+
-		"       cozy-media --bounds   print this build's media contract as JSON and exit")
+		"[--quota <bytes>] [--max-body <bytes>]")
 	return 2
 }
 

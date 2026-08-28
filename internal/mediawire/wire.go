@@ -3,9 +3,9 @@
 // and the bounds the plane PUBLISHES instead of each end restating.
 //
 // It exists because the two ends ship separately and always have. `cmd/cozy-media` is
-// compiled into the pod image from a commit pin (`execution-substrates/versions.env`,
-// CREATOR_COMMIT) while the owner's client in `internal/media` floats with master, and
-// until now the only version signal between them was the literal `/v1/` in a URL path. A
+// compiled into the pod image from a commit pin (the image recipe's CREATOR_COMMIT) while
+// the owner's client in `internal/media` floats with master, and until now the only version
+// signal between them was the literal `/v1/` in a URL path. A
 // renumbered answer field or a moved route would have been MISPARSED rather than refused.
 // The control leg one plane over already forecloses exactly this on `pb.WireSchemaRev`
 // (`internal/orchestrator/owner.go`); this is that check for the byte plane.
@@ -28,9 +28,9 @@ const ContractRev = 1
 
 // MaxReceiptBytes is the ceiling on the pod readiness envelope that
 // `GET /v1/bootstrap/receipt` serves. It is THIS repo's number because cozy-media is the
-// process that refuses an oversized one; cozy-bootstrap writes that file and must not
-// exceed it, and reads the bound from `cozy-media --bounds` rather than declaring a
-// second, silently divergent copy of it.
+// process that refuses an oversized one; `cmd/cozy-bootstrap` writes that file and must
+// not exceed it, and IMPORTS this constant rather than declaring a second, silently
+// divergent copy of it — which is exactly what it did while it lived in another repo.
 const MaxReceiptBytes = 64 << 10
 
 // Rev answers the revision as a document carries it. It is a pointer so that "answered a
@@ -38,7 +38,7 @@ const MaxReceiptBytes = 64 << 10
 func Rev() *int { v := ContractRev; return &v }
 
 // Contract is what both ends compare: who is answering, at which revision, under which
-// published bound. `cozy-media --bounds` prints exactly this document.
+// published bound. It is the head of the `GET /v1/health` answer.
 type Contract struct {
 	Service         string `json:"service"`
 	ContractRev     *int   `json:"contract_rev,omitempty"`

@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Boundary fence (boundaries.md). Architecture enforcement, not a test.
 
-Fourteen families:
+Fifteen families:
   deps      forbidden dependencies (raw lines, incl. import paths and go.mod)
   impl      the CANONICAL FORMATS TensorFS parses. A second reader of safetensors/gguf/
             cozytensors here would drift from the one that produced the published bytes.
@@ -50,6 +50,12 @@ Fourteen families:
             cannot import the worker protocol, and its wire contract — the service name, the
             revision both ends compare before a byte moves, and the bounds it publishes — is
             declared in internal/mediawire and restated nowhere.
+  bootstrap (xs-004) the POD SUPERVISOR is the one pod-side process that legitimately
+            egresses and legitimately execs, so its licence is BOUNDED rather than absent:
+            outbound network lives in exactly one file (the two exact-grant fetches), it
+            attaches no credential to either, and it may not import the worker protocol —
+            a supervisor that could talk to the worker is the second control plane cl-014
+            forbids one directory over.
   tensor    (cl-012) the tensorfs CLI has ONE caller: internal/tfs. The configured binary
             is read there and in the config authority, nowhere else — a second package
             shelling out to `tfs` is a second byte-plane door with its own vocabulary.
@@ -86,9 +92,22 @@ DENY_PROMPT_CALLS = [
     "fmt.Scan", "fmt.Scanln", "fmt.Scanf", "fmt.Fscan", "fmt.Fscanln", "fmt.Fscanf",
 ]
 
-# The ONE environment reader. Every other package takes the frozen typed value.
-# Its Inherited allowlist is class A of tracker-v2/spawn-allowlists.md (#616.d).
-ENV_READER = "internal/config/config.go"
+# ONE environment reader PER PROGRAM — the same shape as LISTEN_SITES below, and for the
+# same reason: this repo builds three binaries, and collapsing the rule to "one reader
+# somewhere" would let either program's reader go missing. Every other package in each
+# program takes the frozen typed value.
+#   config/config.go   the `cozy` CLI. Its Inherited allowlist is class A of
+#                      tracker-v2/spawn-allowlists.md (#616.d).
+#   cozy-bootstrap     the POD SUPERVISOR, whose entire launch surface IS the injected
+#                      environment: it takes no arguments and reads no configuration file,
+#                      so its one reader is also its one ALLOWLIST — an unrecognized COZY_*
+#                      name is refused rather than ignored, which is what makes a renamed
+#                      grant a boot failure instead of a silent default.
+ENV_READERS = {
+    "internal/config/config.go": "the cozy CLI's entrypoint reader",
+    "cmd/cozy-bootstrap/config.go": "the pod supervisor's entrypoint reader and allowlist",
+}
+ENV_READER = " / ".join(sorted(ENV_READERS))
 DENY_ENV_CALLS = ["os.Getenv", "os.LookupEnv", "os.Environ", "syscall.Getenv", "syscall.Environ"]
 
 # Lifecycle-sidecar names, matched on RAW code lines — raw because a sidecar name is a
@@ -186,6 +205,41 @@ MEDIA_IMPORT_LINE = re.compile(
 # back apart in silence, which is the whole defect cl-031 closed.
 MEDIA_CONTRACT_HOME = "internal/mediawire/wire.go"
 MEDIA_CONTRACT_FIELDS = ["contract_rev", "max_receipt_bytes"]
+# …and the ceiling itself, as a NUMBER. The field-name rule above catches a second JSON
+# spelling; it did not catch what actually happened, which is that the pod supervisor
+# declared `maxReceiptEnvelopeSize = 64 << 10` of its own while it lived in another repo —
+# a second copy of one bound, agreeing by luck. Scoped to the two POD binaries, because
+# 64 KiB is an ordinary buffer size everywhere else in this tree.
+MEDIA_CEILING_LITERAL = re.compile(r"64\s*<<\s*10")
+
+# (xs-004) THE POD SUPERVISOR'S BOUNDED LICENCE. `cmd/cozy-bootstrap` is PID 1 of a rented
+# pod. Unlike the media server beside it, it MUST egress (two provision documents) and MUST
+# exec (its two children), so it cannot join the liability fence by having nothing to do it
+# with. It joins by having exactly ONE of each, in a named place, with a stated rule.
+BOOTSTRAP_DIR = "cmd/cozy-bootstrap/"
+# One outbound door. A second `http.Get` anywhere in this binary — a health poll, a
+# telemetry ping, a "just fetch the config" convenience — is an egress channel that no
+# longer passes the exact-grant checks (declared length, declared digest, no redirect, no
+# proxy) that make the two real ones safe.
+BOOTSTRAP_EGRESS_SITE = "cmd/cozy-bootstrap/fetch.go"
+DENY_BOOTSTRAP_EGRESS = [
+    "http.Get", "http.Post", "http.PostForm", "http.Head", "http.NewRequest",
+    "http.DefaultClient", "http.Client", "http.Transport", "net.Dial", "net.DialTimeout",
+    "grpc.NewClient", "grpc.Dial",
+]
+# The two fetches are CREDENTIAL-FREE by construction: parseGrant refuses a URL carrying
+# userinfo, and nothing here ever sets an Authorization header. Fence the header, because
+# the day this process presents a credential to fetch something is the day a pod supervisor
+# becomes a capability an attacker can aim.
+BOOTSTRAP_CREDENTIAL_HEADER = re.compile(r"Authorization", re.I)
+# It holds token HASHES and mints a self-signed leaf; it never speaks a control plane. An
+# import of the worker protocol, the orchestrator, the owner's API or its media/hub clients
+# would each be a second control plane inside the pod (cl-014's rule, one directory over).
+# `internal/mediawire` is deliberately NOT here: importing the contract is the point.
+DENY_BOOTSTRAP_IMPORT = [
+    "protocol/cozy/worker", "internal/orchestrator", "internal/api", "internal/hub",
+    "internal/media",
+]
 
 ALLOW_DOOR = "//cozy:allow"
 STDIN_DOOR = "//cozy:stdin-value"
@@ -356,16 +410,24 @@ def files():
 
 
 DOCUMENT_KINDS = {
-    # proto-007 (#616.a): the document kinds this repo AUTHORS, each with the one file that
-    # declares it. A format name exists only for a document that crosses a repo/process
-    # boundary AND is stored or digested. A literal outside this table is a new kind without
-    # its decision row; a literal in a second file is a second declaration.
+    # proto-007 (#616.a): the `cozy.<name>/<N>` names this repo AUTHORS, each with the one
+    # file that declares it. A format name exists only for a document that crosses a
+    # repo/process boundary AND is stored or digested. A literal outside this table is a new
+    # name without its decision row; a literal in a second file is a second declaration.
+    #
+    # Two rows are HMAC DOMAIN-SEPARATION TAGS rather than stored documents
+    # (`cozy.pod-readiness/1`, `cozy.rental_request/1`). They are registered for the same
+    # reason and are if anything stricter: a peer repo reproduces those exact bytes to
+    # verify a MAC, so a silent edit does not misparse — it fails authentication at a
+    # rental boundary, which is the worst place to discover a renamed constant.
     "cozy.client.JobSubmission/1": "internal/api/jobs.go",
     "cozy.client.Submission/1": "internal/api/requests.go",
     "cozy.jobs.StructuralCensus/1": "cmd/cozy-live/joblive.go",
     "cozy.local.EntrypointBindingRecord/2": "internal/plan/plan.go",
     "cozy.local.EvaluatedConfig/1": "internal/app/identity.go",
     "cozy.local.ExecutionEnvironment/1": "internal/app/identity.go",
+    "cozy.pod-readiness/1": "cmd/cozy-bootstrap/run.go",
+    "cozy.rental_request/1": "internal/app/rentals.go",
     "cozy.video/1": "internal/video/source.go",
     "cozy.video.CreativePlan/1": "internal/video/composition.go",
     "cozy.workflow.ChildIdentity/1": "internal/workflow/materialize.go",
@@ -377,7 +439,10 @@ DOCUMENT_KINDS = {
 FOREIGN_KIND_PREFIXES = ("cozy.worker.v1.", "cozy.endpoint.", "cozy.runtime.", "tensorhub.",
                          "tensorfs.", "cozytensors")
 KIND_READERS = {"cozy.workflow.Plan/1": {"cmd/cozy-live/workflows.go"}}
-KIND_LITERAL = re.compile(r'"((?:cozy|cozytensors|tensorhub|tensorfs)\.[A-Za-z0-9_.-]+/\d+)"')
+# No trailing quote: a domain-separation tag is a PREFIX inside a longer literal — it ends
+# in `\x00` or `\n`, and requiring the close quote made both of this repo's tags invisible
+# to the registry that exists to hold exactly this class of cross-repo agreed name.
+KIND_LITERAL = re.compile(r'"((?:cozy|cozytensors|tensorhub|tensorfs)\.[A-Za-z0-9_.-]+/\d+)')
 
 
 def check_document_kinds():
@@ -474,7 +539,7 @@ def check_sources():
             for call in DENY_PROMPT_CALLS:
                 if re.search(r"(?<![\w.])" + re.escape(call) + r"\s*\(", line):
                     bad.append(f"{p}:{i}: [prompt] '{call}' reads input — no cozy command may prompt: {line.strip()}")
-            if str(p).replace("\\", "/") != ENV_READER:
+            if str(p).replace("\\", "/") not in ENV_READERS:
                 for call in DENY_ENV_CALLS:
                     if re.search(r"(?<![\w.])" + re.escape(call) + r"\s*\(", line):
                         bad.append(f"{p}:{i}: [env] '{call}' outside {ENV_READER} — the "
@@ -521,6 +586,39 @@ def check_sources():
                            f"{RUNTIME_INDIRECT_HOME} — the same second execution door as the "
                            f"\"cozy-runtime\" literal, reached by indirection; only "
                            f"{DRIVER_DIR} may door it: {line.strip()}")
+            if rel.startswith(BOOTSTRAP_DIR):
+                if rel != BOOTSTRAP_EGRESS_SITE:
+                    for call in DENY_BOOTSTRAP_EGRESS:
+                        if call in line:
+                            bad.append(f"{p}:{i}: [bootstrap] '{call}' outside "
+                                       f"{BOOTSTRAP_EGRESS_SITE} — the pod supervisor egresses "
+                                       f"EXACTLY TWICE per boot, both exact grants (declared "
+                                       f"length, declared digest, no proxy, no redirect) from "
+                                       f"one file. A second door does not pass those checks: "
+                                       f"{line.strip()}")
+                # RAW, because a header name is a string literal the identifier scan blanks;
+                # a whole-line comment is prose (same convention as check_media_contract).
+                if not s_raw_line.strip().startswith("//") and \
+                        BOOTSTRAP_CREDENTIAL_HEADER.search(s_raw_line):
+                    bad.append(f"{p}:{i}: [bootstrap] the pod supervisor sets an Authorization "
+                               f"header — its two fetches are credential-free by construction "
+                               f"(parseGrant refuses userinfo); a supervisor that presents a "
+                               f"credential is a capability an attacker can aim: "
+                               f"{s_raw_line.strip()}")
+                imported = MEDIA_IMPORT_LINE.match(s_raw_line)
+                for dep in DENY_BOOTSTRAP_IMPORT if imported else ():
+                    path = imported.group(1)
+                    if path == dep or path.startswith(dep + "/"):
+                        bad.append(f"{p}:{i}: [bootstrap] the pod supervisor imports '{dep}' — it "
+                                   f"mints credentials and execs two children; a control-plane "
+                                   f"client here is the second control plane inside the pod that "
+                                   f"cl-014 forbids one directory over: {line.strip()}")
+            if rel.startswith(BOOTSTRAP_DIR) or rel.startswith(MEDIA_DIR):
+                if MEDIA_CEILING_LITERAL.search(line):
+                    bad.append(f"{p}:{i}: [media] the receipt ceiling is spelled as a literal in a "
+                               f"pod binary — one end writes that envelope and the other refuses "
+                               f"it, so the number lives in {MEDIA_CONTRACT_HOME} and is imported "
+                               f"(cl-031's defect was two copies agreeing by luck): {line.strip()}")
             if rel.startswith(MEDIA_DIR):
                 for call in DENY_MEDIA_EGRESS:
                     if call in line:
@@ -785,14 +883,16 @@ if violations:
 print(
     f"fence green — deps({len(DENY_DEPS)}) impl({len(DENY_IMPL)}) "
     f"prompt({len(DENY_PROMPT) + len(DENY_PROMPT_CALLS) + 1}) matrix(15 rows) "
-    f"env({len(DENY_ENV_CALLS)}) store({len(DENY_STORE)}) "
+    f"env({len(DENY_ENV_CALLS)} calls@{len(ENV_READERS)} programs) store({len(DENY_STORE)}) "
     f"manifest({RECLAIM_VERB.pattern} + globals!{'/'.join(VERSION_SPELLINGS)} "
     f"+ next/examples per implemented row) "
     f"render(one stream@{RENDER_SRC}) secret({SECRET_FLAG.pattern} + Reveal@{len(REVEAL_SITES)}) "
     f"cas(store-path) tensor(tfs@{len(TFS_SITES)}) "
     f"api({len(DENY_COOKIE)} cookie + cors(absolute@{CORS_ABSOLUTE}) + listen@{len(LISTEN_SITES)} programs) "
     f"media({len(DENY_MEDIA_EGRESS)} egress + {len(DENY_MEDIA_IMPORT)} imports@{MEDIA_DIR} "
-    f"+ {len(MEDIA_CONTRACT_FIELDS)} contract fields@{MEDIA_CONTRACT_HOME}) "
+    f"+ {len(MEDIA_CONTRACT_FIELDS)} contract fields + ceiling literal@{MEDIA_CONTRACT_HOME}) "
+    f"bootstrap({len(DENY_BOOTSTRAP_EGRESS)} egress@{BOOTSTRAP_EGRESS_SITE} + no-credential "
+    f"+ {len(DENY_BOOTSTRAP_IMPORT)} imports@{BOOTSTRAP_DIR}) "
     f"runtime({len(RUNTIME_VERBS_DENY)} denied verbs@{len(RUNTIME_SITES)} + indirection) "
     f"embed({len(DENY_EMBED)} words, scripts allow@{len(PY_ALLOW)}) "
     f"contract({len(parse_go_routes(pathlib.Path('internal/api/routes.go')))} routes) video-boundary"
