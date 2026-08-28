@@ -22,6 +22,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/cozy-creator/cozy-creator-v2/internal/hub"
 	"github.com/cozy-creator/cozy-creator-v2/internal/workertls"
 )
 
@@ -67,6 +68,9 @@ type podRental struct {
 	// is in the other's request path, and the way to observe that is to kill one.
 	WorkerPID int
 	MediaPID  int
+	// Control is Tensorhub's exact acquisition-attempt control snapshot, authored before
+	// the pod is provisioned and carried verbatim on the ready view.
+	Control *hub.ExactControlDocument
 }
 
 type podRentalOperation struct {
@@ -111,10 +115,13 @@ type podHub struct {
 	// release the renter asked for and the pod says which; this stand-in is told, so the
 	// owner's release pin has both a matching pod to accept and a lying one to refuse
 	// (#505's carried-not-verified gap).
-	releaseID string
-	procs     []*exec.Cmd
-	addr      string
-	ln        net.Listener
+	releaseID   string
+	accelerator string
+	// control authors the acquisition-attempt control snapshot every pod carries.
+	control *podControl
+	procs   []*exec.Cmd
+	addr    string
+	ln      net.Listener
 }
 
 // podHubSpec is what a stand-in hub is told to provision. Everything in it is a fact a
@@ -132,6 +139,12 @@ type podHubSpec struct {
 	// an owner that admitted it could not attribute a terminal to anything.
 	NoInstance            bool
 	LoseFirstRentResponse bool
+	// Accelerator is what the provisioned worker REPORTS on ClaimAck; the owner's probe
+	// compares it to what was requested.
+	Accelerator string
+	// Control is the release closure this hub installs on its pods; nil takes the
+	// section's defaultPodControl.
+	Control *podControl
 }
 
 func startPodHub(dir, arm string, fail bool) *podHub {
@@ -147,7 +160,14 @@ func newPodHub(spec podHubSpec) *podHub {
 		rentals: map[string]*podRental{}, deleted: map[string]bool{},
 		operations: map[string]podRentalOperation{}, dropped: map[string]bool{}, fail: spec.Fail,
 		noMedia: spec.NoMedia, noInstance: spec.NoInstance, releaseID: spec.Release,
-		loseFirstRentResponse: spec.LoseFirstRentResponse,
+		loseFirstRentResponse: spec.LoseFirstRentResponse, accelerator: spec.Accelerator,
+		control: spec.Control,
+	}
+	if h.control == nil {
+		h.control = defaultPodControl
+	}
+	if h.accelerator == "" {
+		h.accelerator = accelerator
 	}
 	must("creating the pod-side filesystem", os.MkdirAll(h.pods, 0o755))
 	ln, err := net.Listen("tcp", "127.0.0.1:0") //cozy:allow the DRIVER hosts a stand-in hub; the product binds through internal/api
@@ -158,6 +178,7 @@ func newPodHub(spec podHubSpec) *podHub {
 	mux.HandleFunc("GET /v1/private-rentals/{id}", h.read)
 	mux.HandleFunc("DELETE /v1/private-rentals/{id}", h.release)
 	go func() { _ = http.Serve(ln, mux) }()
+	onExit(h.close)
 	return h
 }
 
@@ -337,6 +358,11 @@ func writeRentalAccepted(w http.ResponseWriter, id, state string) {
 func (h *podHub) provision(rec *podRental) {
 	h.mu.Lock()
 	rec.State, rec.Detail = "acquiring", "selecting capacity for the requested accelerator"
+	// THE CONTROL SNAPSHOT IS AUTHORED BEFORE PROVIDER CREATE, keyed by this acquisition
+	// attempt. The pod is then installed from it; the owner verifies the same bytes.
+	if h.control != nil {
+		rec.Control = h.control.snapshot("att-" + rec.ID)
+	}
 	h.mu.Unlock()
 	if h.fail {
 		h.mu.Lock()
@@ -401,6 +427,9 @@ func (h *podHub) provision(rec *podRental) {
 		// knows it; a pod that will not say is refused by the owner's pin.
 		args = append(args, "--release-id", h.releaseID)
 	}
+	if h.accelerator != "" {
+		args = append(args, "--accelerator", h.accelerator)
+	}
 	cmd := niceCmd(self, args...)
 	cmd.Env = childEnv(podRoot)
 	logPath := filepath.Join(runRoot, "pod-worker.log")
@@ -437,10 +466,11 @@ func (h *podHub) provision(rec *podRental) {
 			"--tokens", tokenFile,
 			"--out", runRoot,
 			"--tls-cert", certPath, "--tls-key", keyPath,
-			// The quota must admit the exact 64 MiB output reservation the product grants.
-			// The separate 4 MiB body bound keeps the oversize red arm cheap without
-			// under-provisioning every ordinary attempt before its offer exists.
-			"--quota", "134217728", "--max-body", "4194304")
+			// The quota must admit the product's per-output reservation (512 MiB by
+			// default, orchestrator.DefaultMaxOutputMiB) for every output an attempt
+			// declares. The separate 4 MiB body bound keeps the oversize red arm cheap
+			// without under-provisioning every ordinary attempt before its offer exists.
+			"--quota", "4294967296", "--max-body", "4194304")
 		mediaLog, err := os.Create(filepath.Join(runRoot, "pod-media.log"))
 		must("the pod media log", err)
 		media.Stdout, media.Stderr = mediaLog, mediaLog
@@ -588,6 +618,9 @@ func (h *podHub) read(w http.ResponseWriter, r *http.Request) {
 		// The byte plane's address, OBSERVED. The client no longer derives one, so a hub
 		// that omits this names no byte plane at all.
 		"media_address": rec.Media,
+		// The acquisition-attempt control snapshot, exact bytes. Present from the moment
+		// the attempt was durably accepted; the owner reads it only on the ready view.
+		"control_snapshot": rec.Control,
 	}
 	h.mu.Unlock()
 	w.Header().Set("Content-Type", "application/json")
@@ -609,16 +642,38 @@ func (h *podHub) release(w http.ResponseWriter, r *http.Request) {
 	}
 	delete(h.rentals, id)
 	h.deleted[id] = true
-	procs := h.procs
-	h.mu.Unlock()
-	// The pod is DESTROYED, which for this stand-in means the worker process it hosted
-	// stops answering. An arm that dialled it afterwards must find nothing.
-	for _, p := range procs {
-		if p.Process != nil {
-			_ = killGroup(p.Process.Pid, syscall.SIGKILL)
+	var procs []*exec.Cmd
+	for _, p := range h.procs {
+		if p.Process != nil && (p.Process.Pid == rec.WorkerPID || p.Process.Pid == rec.MediaPID) {
+			procs = append(procs, p)
 		}
 	}
+	h.mu.Unlock()
+	// The pod is DESTROYED, which for this stand-in means THIS pod's two processes stop
+	// answering; a GET afterwards is 404, which is what the owner's post-DELETE poll
+	// terminates on. An arm that dialled the pod afterwards must find nothing.
+	for _, p := range procs {
+		_ = killGroup(p.Process.Pid, syscall.SIGKILL)
+		go func(p *exec.Cmd) { _ = p.Wait() }(p)
+	}
 	w.WriteHeader(http.StatusNoContent)
+}
+
+// status is the hub's own answer to GET for one rental, with the admin credential — how
+// an arm observes that a released pod is ABSENT rather than merely forgotten locally.
+func (h *podHub) status(id string) int {
+	req, err := http.NewRequest(http.MethodGet, h.url()+"/v1/private-rentals/"+id, nil)
+	if err != nil {
+		return 0
+	}
+	req.Header.Set("Authorization", "Bearer "+h.token)
+	res, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return 0
+	}
+	defer res.Body.Close()
+	_, _ = io.Copy(io.Discard, res.Body)
+	return res.StatusCode
 }
 
 // writeSelfSigned mints the certificate the rental hands over to be PINNED. It is signed

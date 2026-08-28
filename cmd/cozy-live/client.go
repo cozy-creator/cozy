@@ -28,13 +28,14 @@ import (
 
 // service is one detached `cozy up` this driver owns.
 type liveService struct {
-	root  string
-	port  int
-	addr  string
-	token string
-	cmd   *exec.Cmd
-	log   string
-	http  *http.Client
+	root    string
+	port    int
+	addr    string
+	token   string
+	cmd     *exec.Cmd
+	log     string
+	http    *http.Client
+	stopped bool
 }
 
 // startService launches a REAL `cozy up` in its own process group and waits for the API
@@ -77,6 +78,7 @@ func startService(root string, port int, fresh bool) *liveService {
 		root: root, port: port, addr: fmt.Sprintf("127.0.0.1:%d", port), cmd: cmd,
 		log: logPath, http: &http.Client{Timeout: 5 * time.Minute},
 	}
+	onExit(s.stop)
 	deadline := time.Now().Add(30 * time.Second)
 	for time.Now().Before(deadline) {
 		if s.alive() {
@@ -118,9 +120,10 @@ func (s *liveService) kill9() {
 }
 
 func (s *liveService) stop() {
-	if s.cmd == nil || s.cmd.Process == nil {
+	if s.stopped || s.cmd == nil || s.cmd.Process == nil {
 		return
 	}
+	s.stopped = true
 	_ = killGroup(s.cmd.Process.Pid, syscall.SIGTERM)
 	deadline := time.Now().Add(45 * time.Second)
 	for time.Now().Before(deadline) && s.alive() {

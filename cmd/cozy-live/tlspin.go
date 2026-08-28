@@ -60,7 +60,7 @@ func sectionTLSPin() {
 	worker.Stdout, worker.Stderr = workerLog, workerLog
 	setProcessGroup(worker)
 	must("starting the pod worker", worker.Start())
-	defer func() { _ = killGroup(worker.Process.Pid, syscall.SIGKILL); _ = worker.Wait() }()
+	onExit(func() { _ = killGroup(worker.Process.Pid, syscall.SIGKILL); _ = worker.Wait() })
 	controlAddr := awaitAddr(filepath.Join(runRoot, "control.addr"), worker)
 	check("the pod worker hosts WorkerControl behind TLS", controlAddr != "", controlAddr)
 
@@ -75,7 +75,7 @@ func sectionTLSPin() {
 	mediaCmd.Stdout, mediaCmd.Stderr = mediaLog, mediaLog
 	setProcessGroup(mediaCmd)
 	must("starting the pod media server", mediaCmd.Start())
-	defer func() { _ = killGroup(mediaCmd.Process.Pid, syscall.SIGKILL); _ = mediaCmd.Wait() }()
+	onExit(func() { _ = killGroup(mediaCmd.Process.Pid, syscall.SIGKILL); _ = mediaCmd.Wait() })
 	mediaAddr := awaitAddr(filepath.Join(runRoot, "media.addr"), mediaCmd)
 	check("the pod media server is behind the same certificate", mediaAddr != "", mediaAddr)
 

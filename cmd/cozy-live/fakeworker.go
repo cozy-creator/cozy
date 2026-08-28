@@ -272,7 +272,7 @@ func (f *fakeControl) Control(stream pb.WorkerControl_ControlServer) error {
 	if f.arm == "remote" || f.arm == "remotelie" {
 		resources.Backend = "cuda"
 		resources.DeviceCount = 1
-		resources.DeviceName = "NVIDIA H200"
+		resources.DeviceName = flag("accelerator", "NVIDIA H200")
 	}
 	ack := &pb.ClaimAck{
 		Accepted: true, WireMinor: pb.WireMinor, WorkerId: "local",
