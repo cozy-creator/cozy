@@ -2,7 +2,7 @@ package app
 
 import (
 	"fmt"
-	"io"
+	"os"
 	"runtime"
 	"runtime/debug"
 	"sort"
@@ -88,9 +88,13 @@ func handlerNames() []string {
 	return out
 }
 
-func emit(ctx *Context, d interface {
-	Emit(w io.Writer, m render.Mode) error
-}) *exit.Error {
+// emit is the ONE place a handler's success document reaches the stream, so it is where
+// AXI 9's disclosure is attached: the resolved row's manifest `Next` fills a document the
+// handler left empty, and a handler that computed a state-dependent one keeps it.
+func emit(ctx *Context, d render.Document) *exit.Error {
+	if c := ctx.Inv.Cmd; c != nil && len(c.Next) > 0 {
+		d = d.WithDefaultNext(c.Next)
+	}
 	if err := d.Emit(ctx.Out, ctx.Mode()); err != nil {
 		return exit.As(err)
 	}
@@ -139,6 +143,7 @@ func handleStatus(ctx *Context) *exit.Error {
 		// credential that cannot be read is reported, never fatal — bare `cozy` is
 		// content-first and answers with what it could learn.
 		ctx.Service = st
+		installed, resident := -1, 0
 		if c, e := dial(ctx); e == nil {
 			if rows, e := c.Endpoints(); e == nil {
 				names := make([]string, 0, len(rows))
@@ -146,9 +151,11 @@ func handleStatus(ctx *Context) *exit.Error {
 					state := "cold"
 					if row.Resident {
 						state = "running"
+						resident++
 					}
 					names = append(names, row.Endpoint+" ("+state+")")
 				}
+				installed = len(rows)
 				rec.Fields = append(rec.Fields, render.Field{K: "endpoints", V: names})
 			}
 			if workers, e := c.Workers(); e == nil {
@@ -162,13 +169,40 @@ func handleStatus(ctx *Context) *exit.Error {
 			rec.Notes = append(rec.Notes, "the local client credential is unreadable: "+e.Message)
 		}
 		rec.Notes = append(rec.Notes, st.Details)
-		rec.Next = []string{"cozy commands"}
+		// The suggestion follows the STATE, not the verb: nothing installed and "run
+		// something" is unactionable. Everything warm falls through to the row's own
+		// manifest default. A listing that could not be read leaves it there too.
+		switch {
+		case installed == 0:
+			rec.Next = []string{"cozy install <org/endpoint>", "cozy search"}
+		case installed > 0 && resident == 0:
+			rec.Next = []string{"cozy start <org/endpoint>"}
+		}
 	} else {
 		rec.Notes = []string{st.Details,
 			"installed endpoints, workers and jobs are readable only while the service runs"}
 		rec.Next = []string{"cozy up"}
 	}
+	// AXI 10 — the HOME view names the tool before its live data. `cozy status` typed
+	// explicitly is a poll of that data and stays exactly as it is.
+	if ctx.Inv.Bare {
+		rec.Fields = append(identity(), rec.Fields...)
+	}
 	return emit(ctx, rec)
+}
+
+// identity is AXI 10's identification block. The path is the RUNNING binary's own, not
+// an env reading — several cozy builds coexist and the agent needs the one it just ran.
+func identity() []render.Field {
+	bin, err := os.Executable()
+	if err != nil {
+		bin = "cozy"
+	}
+	return []render.Field{
+		{K: "bin", V: bin},
+		{K: "description", V: manifest.Description},
+		{K: "version", V: tag},
+	}
 }
 
 func buildStamp() (string, bool) {
@@ -207,7 +241,6 @@ func handleVersion(ctx *Context) *exit.Error {
 			{K: "go", V: runtime.Version()},
 			{K: "platform", V: runtime.GOOS + "/" + runtime.GOARCH},
 		},
-		Next: []string{"cozy capabilities"},
 	})
 }
 
@@ -296,7 +329,6 @@ func handleCommands(ctx *Context) *exit.Error {
 		{K: "planned", V: planned},
 		{K: "groups", V: len(groups)},
 	}
-	l.Next = []string{"cozy help <command>"}
 	return emit(ctx, l)
 }
 

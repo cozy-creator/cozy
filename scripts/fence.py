@@ -9,9 +9,12 @@ Fourteen families:
   matrix    internal/exit/exit.go must equal docs/exit-matrix.md row for row
   manifest  a reclaiming/removing verb must DECLARE its gate: Destructive (exit 7 without
             --yes) or PlanFirst (a read without --yes) — exactly one, and it must
-            advertise --yes. Nothing removes bytes on a bare invocation. And GlobalFlags
+            advertise --yes. Nothing removes bytes on a bare invocation. GlobalFlags
             never names --version/-v/-V: AXI 10's version probe is a pre-parse fast path
-            in app.Run, and a global row would shadow `cozy pack --version <x.y.z>`.
+            in app.Run, and a global row would shadow `cozy pack --version <x.y.z>`. And
+            every IMPLEMENTED row carries AXI 9's disclosure and AXI 10's examples: a
+            `Next:` default (or `SelfContained: true`, the detail-view exemption, whose
+            handler computes a state-dependent one) and at least one `Examples:` line.
   render    (AXI 6) internal/render writes ONE stream. An error is structured output the
             agent must read, so it leaves on stdout with the data; stderr is progress and
             diagnostics, which this layer does not emit.
@@ -546,6 +549,15 @@ def check_global_flags():
     return bad
 
 
+# AXI 9/10, per IMPLEMENTED row. `Next` is the default disclosure the ONE emit seam
+# attaches; `SelfContained: true` is AXI 9's "omit when self-contained" exemption, taken
+# only by a detail view of one thing the caller already named. `Examples` is AXI 10's
+# 2-3 worked invocations, which is what `cozy help <cmd>` renders.
+ROW_NEXT = re.compile(r'\bNext:\s*\[\]string\{\s*"')
+ROW_EXAMPLES = re.compile(r'\bExamples:\s*\[\]string\{\s*"')
+ROW_SELF_CONTAINED = "SelfContained: true"
+
+
 def check_manifest():
     src_path = pathlib.Path("internal/manifest/commands.go")
     if not src_path.exists():
@@ -570,6 +582,19 @@ def check_manifest():
             bad.append(f"[manifest] '{name}' takes --yes but is {joined} — exactly one")
         if (destructive or plan_first) and not has_yes:
             bad.append(f"[manifest] '{name}' is gated on --yes but advertises no --yes flag")
+        if "Status: Implemented" not in body:
+            continue
+        if not ROW_NEXT.search(body) and ROW_SELF_CONTAINED not in body:
+            bad.append(f"[manifest] '{name}' is implemented but declares no 'Next:' — AXI 9 wants "
+                       "a next step after normal output, and the emit seam can only attach what "
+                       "the row declares. A detail view whose handler computes its own says so "
+                       "with 'SelfContained: true'")
+        if ROW_NEXT.search(body) and ROW_SELF_CONTAINED in body:
+            bad.append(f"[manifest] '{name}' declares both 'Next:' and 'SelfContained: true' — "
+                       "the exemption means there is no default to declare")
+        if not ROW_EXAMPLES.search(body):
+            bad.append(f"[manifest] '{name}' is implemented but declares no 'Examples:' — AXI 10 "
+                       "wants 2-3 worked, parameterized invocations in `cozy help " + name + "`")
     if not rows:
         bad.append("[manifest] no command rows parsed out of commands.go")
     return bad
@@ -720,7 +745,8 @@ print(
     f"fence green — deps({len(DENY_DEPS)}) impl({len(DENY_IMPL)}) "
     f"prompt({len(DENY_PROMPT) + len(DENY_PROMPT_CALLS) + 1}) matrix(15 rows) "
     f"env({len(DENY_ENV_CALLS)}) store({len(DENY_STORE)}) cloud({len(DENY_CLOUD)}) "
-    f"manifest({RECLAIM_VERB.pattern} + globals!{'/'.join(VERSION_SPELLINGS)}) "
+    f"manifest({RECLAIM_VERB.pattern} + globals!{'/'.join(VERSION_SPELLINGS)} "
+    f"+ next/examples per implemented row) "
     f"render(one stream@{RENDER_SRC}) secret({SECRET_FLAG.pattern} + Reveal@{len(REVEAL_SITES)}) "
     f"cas({len(DENY_DIGEST)} digests@{len(DIGEST_FREE)} + store-path) tensor(tfs@{len(TFS_SITES)}) "
     f"api({len(DENY_COOKIE)} cookie + cors + listen@{len(LISTEN_SITES)} programs) "

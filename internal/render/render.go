@@ -24,6 +24,14 @@ const (
 	sepAggreg = " · "
 )
 
+// Document is one emittable surface. WithDefaultNext lets the ONE emit seam hand a
+// document its verb's manifest-declared next steps (AXI 9) without a handler that
+// computed its own state-dependent ones losing them.
+type Document interface {
+	Emit(w io.Writer, m Mode) error
+	WithDefaultNext(next []string) Document
+}
+
 // Mode carries the global presentation flags.
 type Mode struct {
 	JSON   bool
@@ -65,6 +73,27 @@ type List struct {
 	Empty      string
 	Notes      []string
 	Next       []string
+}
+
+func (r Record) WithDefaultNext(n []string) Document {
+	if len(r.Next) == 0 {
+		r.Next = n
+	}
+	return r
+}
+
+func (l Lines) WithDefaultNext(n []string) Document {
+	if len(l.Next) == 0 {
+		l.Next = n
+	}
+	return l
+}
+
+func (l List) WithDefaultNext(n []string) Document {
+	if len(l.Next) == 0 {
+		l.Next = n
+	}
+	return l
 }
 
 func trimNext(n []string) []string {

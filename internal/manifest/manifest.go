@@ -23,6 +23,7 @@ type Flag struct {
 	Short   string // optional, e.g. "-d"
 	Arg     string // "" = boolean, else the value placeholder
 	Summary string
+	Default string // AXI 10: the value that applies when the flag is absent; "" = none
 }
 
 func (f Flag) TakesValue() bool { return f.Arg != "" }
@@ -41,12 +42,26 @@ type Command struct {
 	PlanFirst   bool // carries --yes but is NOT destructive: bare it prints the plan, exit 0
 	NeedsServer bool // refuses with unavailable (exit 9) while the LocalService is down
 	Terminals   bool // help renders the job terminal mapping
-	Status      Status
-	Issue       string // owning issue for a planned row
-	Handler     string // handler key; empty iff Status == Planned
+	// Next is AXI 9's default disclosure: the next steps this verb's SUCCESS output
+	// carries when the handler computes none of its own. Values are PARAMETERIZED —
+	// `<job-id>`, never an id from the output, which would read as the only valid one.
+	Next []string
+	// Examples are AXI 10's 2-3 realistic invocations rendered by `cozy help <cmd>`.
+	Examples []string
+	// SelfContained exempts a row from Next (AXI 9: "omit when self-contained"). It is
+	// true only for a DETAIL VIEW of one thing the caller already named, where a static
+	// suggestion is noise and any real next step is state-dependent and handler-computed.
+	SelfContained bool
+	Status        Status
+	Issue         string // owning issue for a planned row
+	Handler       string // handler key; empty iff Status == Planned
 }
 
 func (c *Command) Name() string { return strings.Join(c.Path, " ") }
+
+// Description is the one sentence that says what this tool is. Root help and the
+// home view (AXI 10's identification block) both print it, from here, so they cannot drift.
+const Description = "local-first generative media: install endpoints, run them, publish releases"
 
 // Groups is the display order of command groups.
 var Groups = []string{"meta", "service", "endpoints", "invocation", "videos", "workflows", "jobs", "rentals", "catalog", "transfer", "account"}
@@ -56,7 +71,7 @@ var GlobalFlags = []Flag{
 	{Name: "--json", Summary: "emit the full typed result as one JSON document"},
 	{Name: "--full", Summary: "widen columns and lift truncation"},
 	{Name: "--fields", Arg: "<a,b,c>", Summary: "pick listing columns"},
-	{Name: "--dir", Arg: "<path>", Summary: "project root (default cwd)"},
+	{Name: "--dir", Arg: "<path>", Summary: "project root", Default: "the working directory"},
 	{Name: "--help", Short: "-h", Summary: "concise help for this command; never mutates"},
 }
 

@@ -176,8 +176,7 @@ func handleDoctor(ctx *Context) *exit.Error {
 	} else {
 		notes = append(notes, "no endpoint is installed, so no runtime is present to report device facts")
 	}
-	return emit(ctx, render.Record{Kind: "doctor", Fields: fields, Notes: notes,
-		Next: []string{"cozy fit <org/endpoint>"}})
+	return emit(ctx, render.Record{Kind: "doctor", Fields: fields, Notes: notes})
 }
 
 // hostSummary keeps the runtime's own words. A tri-state fact (present/absent/UNREADABLE)

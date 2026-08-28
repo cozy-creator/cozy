@@ -91,7 +91,7 @@ func handleSearch(ctx *Context) *exit.Error {
 		l.Empty = "0 results for " + describeQuery(query, kind)
 		l.Next = []string{"cozy search"}
 	default:
-		l.Next = []string{"cozy repo show " + l.Rows[0]["ref"]}
+		l.Next = []string{"cozy repo show <org/name>", "cozy install <org/endpoint>"}
 	}
 	return emit(ctx, l)
 }

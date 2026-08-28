@@ -57,6 +57,8 @@ var Commands = []Command{
 		Args:    "", MaxArgs: 0,
 		Exits:      []exit.Code{exit.OK},
 		Capability: "cmd.status", Status: Implemented, Handler: "status",
+		Next:     []string{"cozy run <org/endpoint/vN/function>", "cozy job ls"},
+		Examples: []string{"cozy", "cozy status --json", "cozy status --fields service,endpoints"},
 	},
 	{
 		Path: []string{"version"}, Group: "meta",
@@ -64,6 +66,8 @@ var Commands = []Command{
 		MaxArgs:    0,
 		Exits:      []exit.Code{exit.OK},
 		Capability: "cmd.version", Status: Implemented, Handler: "version",
+		Next:     []string{"cozy capabilities"},
+		Examples: []string{"cozy --version", "cozy version --json"},
 	},
 	{
 		Path: []string{"capabilities"}, Group: "meta",
@@ -71,6 +75,8 @@ var Commands = []Command{
 		MaxArgs:    0,
 		Exits:      []exit.Code{exit.OK},
 		Capability: "cmd.capabilities", Status: Implemented, Handler: "capabilities",
+		Next:     []string{"cozy commands"},
+		Examples: []string{"cozy capabilities", "cozy capabilities --json"},
 	},
 	{
 		Path: []string{"commands"}, Group: "meta",
@@ -78,6 +84,8 @@ var Commands = []Command{
 		Args:    "[<prefix>]", MaxArgs: 1,
 		Exits:      []exit.Code{exit.OK, exit.Usage},
 		Capability: "cmd.commands", Status: Implemented, Handler: "commands",
+		Next:     []string{"cozy help <command>"},
+		Examples: []string{"cozy commands", "cozy commands job", "cozy commands --full"},
 	},
 	{
 		Path: []string{"help"}, Group: "meta",
@@ -85,6 +93,8 @@ var Commands = []Command{
 		Args:    "[<command>]", MaxArgs: 2,
 		Exits:      []exit.Code{exit.OK, exit.NotFound},
 		Capability: "cmd.help", Status: Implemented, Handler: "help",
+		Next:     []string{"cozy commands"},
+		Examples: []string{"cozy help run", "cozy help job submit"},
 	},
 
 	// ---- service (cl-001: the LocalService's own lifecycle) ----
@@ -93,21 +103,25 @@ var Commands = []Command{
 		Summary: "start the one LocalService (foreground; -d detaches)",
 		Flags: []Flag{
 			{Name: "--detach", Short: "-d", Summary: "run in the background"},
-			{Name: "--port", Arg: "<n>", Summary: "local client API port (default 2699, loopback only)"},
+			{Name: "--port", Arg: "<n>", Summary: "local client API port, loopback only", Default: "2699"},
 			{Name: "--open", Summary: "open the stub UI page with the per-launch token"},
-			{Name: "--yield", Arg: "<smart|always|never>", Summary: "GPU yield policy (default smart)"},
+			{Name: "--yield", Arg: "<smart|always|never>", Summary: "GPU yield policy", Default: "smart"},
 		},
 		MaxArgs:    0,
 		Exits:      []exit.Code{exit.OK, exit.Conflict},
 		Capability: "cmd.up", Status: Implemented, Handler: "up",
+		Next:     []string{"cozy status", "cozy ls"},
+		Examples: []string{"cozy up", "cozy up -d", "cozy up -d --port 2699 --yield never"},
 	},
 	{
 		Path: []string{"down"}, Group: "service",
 		Summary:    "stop the LocalService, draining endpoint processes",
-		Flags:      []Flag{{Name: "--timeout", Arg: "<dur>", Summary: "drain bound (default 30s)"}},
+		Flags:      []Flag{{Name: "--timeout", Arg: "<dur>", Summary: "drain bound", Default: "30s"}},
 		MaxArgs:    0,
 		Exits:      []exit.Code{exit.OK},
 		Capability: "cmd.down", Status: Implemented, Handler: "down",
+		Next:     []string{"cozy up"},
+		Examples: []string{"cozy down", "cozy down --timeout 60s"},
 	},
 
 	// ---- endpoints (cl-009) ----
@@ -118,10 +132,12 @@ var Commands = []Command{
 		Flags: []Flag{
 			{Name: "--name", Arg: "<dist>", Summary: "distribution name, when the tree declares no `[project] name` (the env lane passes the release name)"},
 			{Name: "--version", Arg: "<x.y.z>", Summary: "version, when the tree declares no `[project] version`"},
-			{Name: "--out", Arg: "<dir>", Summary: "where to write the wheel (default: the working directory)"},
+			{Name: "--out", Arg: "<dir>", Summary: "where to write the wheel", Default: "the working directory"},
 		},
 		Exits:      []exit.Code{exit.OK, exit.Usage, exit.Validation, exit.NotFound, exit.Structural},
 		Capability: "cmd.pack", Status: Implemented, Handler: "pack",
+		Next:     []string{"cozy install <org/endpoint> --from <archive.tar.gz>"},
+		Examples: []string{"cozy pack ./my-endpoint", "cozy pack ./my-endpoint --out ./dist", "cozy pack ./my-endpoint --name my-endpoint --version 1.2.3"},
 	},
 	{
 		Path: []string{"install"}, Group: "endpoints",
@@ -138,6 +154,8 @@ var Commands = []Command{
 		},
 		Exits:      []exit.Code{exit.OK, exit.Usage, exit.Validation, exit.NotFound, exit.Credential, exit.Structural, exit.Conflict, exit.Capacity},
 		Capability: "cmd.install", Status: Implemented, Handler: "install",
+		Next:     []string{"cozy run <org/endpoint/vN/function>", "cozy describe <org/endpoint>"},
+		Examples: []string{"cozy install org/endpoint --from ./release.tar.gz --digest sha256:<hex>", "cozy install org/endpoint@v2 --prefetch", "cozy install org/endpoint --from ./release.tar.gz --force"},
 	},
 	{
 		Path: []string{"ls"}, Group: "endpoints",
@@ -145,6 +163,8 @@ var Commands = []Command{
 		MaxArgs:    0,
 		Exits:      []exit.Code{exit.OK, exit.Usage},
 		Capability: "cmd.ls", Status: Implemented, Handler: "ls",
+		Next:     []string{"cozy describe <org/endpoint>", "cozy run <org/endpoint/vN/function>"},
+		Examples: []string{"cozy ls", "cozy ls --fields endpoint,version,disk", "cozy ls --full --json"},
 	},
 	{
 		Path: []string{"rm"}, Group: "endpoints",
@@ -153,6 +173,8 @@ var Commands = []Command{
 		Flags:      []Flag{yesFlag},
 		Exits:      []exit.Code{exit.OK, exit.Usage, exit.Confirm, exit.Conflict},
 		Capability: "cmd.rm", Destructive: true, Status: Implemented, Handler: "rm",
+		Next:     []string{"cozy ls", "cozy gc"},
+		Examples: []string{"cozy rm org/endpoint --yes", "cozy rm org/endpoint@v2 org/other --yes"},
 	},
 	{
 		Path: []string{"gc"}, Group: "endpoints",
@@ -161,6 +183,8 @@ var Commands = []Command{
 		MaxArgs:    0,
 		Exits:      []exit.Code{exit.OK, exit.Conflict},
 		Capability: "cmd.gc", PlanFirst: true, Status: Implemented, Handler: "gc",
+		Next:     []string{"cozy ls"},
+		Examples: []string{"cozy gc", "cozy gc --yes"},
 	},
 	{
 		Path: []string{"start"}, Group: "endpoints",
@@ -173,6 +197,8 @@ var Commands = []Command{
 		Exits: []exit.Code{exit.OK, exit.Usage, exit.Validation, exit.NotFound, exit.Structural,
 			exit.Unavailable, exit.Deadline, exit.Failed, exit.Conflict},
 		Capability: "cmd.start", NeedsServer: true, Status: Implemented, Handler: "start",
+		Next:     []string{"cozy run <org/endpoint/vN/function>", "cozy stop <org/endpoint>"},
+		Examples: []string{"cozy start org/endpoint", "cozy start org/endpoint@v2 -d", "cozy start org/endpoint --no-warm"},
 	},
 	{
 		Path: []string{"stop"}, Group: "endpoints",
@@ -184,6 +210,8 @@ var Commands = []Command{
 		},
 		Exits:      []exit.Code{exit.OK, exit.Usage, exit.Unavailable},
 		Capability: "cmd.stop", NeedsServer: true, Status: Implemented, Handler: "stop",
+		Next:     []string{"cozy status", "cozy start <org/endpoint>"},
+		Examples: []string{"cozy stop org/endpoint", "cozy stop --all", "cozy stop org/endpoint --timeout 30s"},
 	},
 	{
 		Path: []string{"logs"}, Group: "endpoints",
@@ -191,10 +219,12 @@ var Commands = []Command{
 		Args:    "<org/endpoint | attempt-id>", MinArgs: 1, MaxArgs: 1,
 		Flags: []Flag{
 			{Name: "--follow", Short: "-f", Summary: "follow"},
-			{Name: "--lines", Short: "-n", Arg: "<count>", Summary: "tail count (default 100)"},
+			{Name: "--lines", Short: "-n", Arg: "<count>", Summary: "tail count", Default: "100"},
 		},
 		Exits:      []exit.Code{exit.OK, exit.Usage, exit.NotFound, exit.Unavailable, exit.Conflict},
 		Capability: "cmd.logs", NeedsServer: true, Status: Implemented, Handler: "logs",
+		Next:     []string{"cozy logs <org/endpoint> --follow", "cozy status"},
+		Examples: []string{"cozy logs org/endpoint", "cozy logs org/endpoint -f -n 200", "cozy logs <attempt-id> --json"},
 	},
 
 	// ---- invocation (cl-010) ----
@@ -213,7 +243,7 @@ var Commands = []Command{
 			{Name: "--stream", Summary: "typed deltas as NDJSON"},
 			{Name: "--in", Arg: "<file>", Summary: "whole payload as JSON"},
 			{Name: "--asset", Arg: "<field-path>=<file>", Summary: "bind a local asset file to a request field (repeatable)"},
-			{Name: "--local", Summary: "run on this host (default)"},
+			{Name: "--local", Summary: "run on this host", Default: "on"},
 			{Name: "--cloud", Summary: "submit to tensorhub under the account"},
 			{Name: "--worker", Arg: "<rental-id>", Summary: "pin this run to an attached rented pod (`cozy rent ls`)"},
 			// One key names one request forever. A bare `run` mints its own, so retry
@@ -224,6 +254,8 @@ var Commands = []Command{
 			exit.Structural, exit.OfflineMiss, exit.Unavailable, exit.Deadline, exit.Failed,
 			exit.Canceled, exit.Conflict, exit.Capacity},
 		Capability: "cmd.run", NeedsServer: true, Terminals: true, Status: Implemented, Handler: "run",
+		Next:     []string{"cozy job submit <org/endpoint/vN/function>", "cozy logs <org/endpoint>"},
+		Examples: []string{"cozy run org/endpoint/v1/generate \"a red bicycle\"", "cozy run org/endpoint/v1/generate --in ./payload.json --out ./outputs", "cozy run org/endpoint/v1/generate prompt=\"a red bicycle\" --seed 7 --stream"},
 	},
 	{
 		Path: []string{"describe"}, Group: "invocation",
@@ -233,6 +265,8 @@ var Commands = []Command{
 		// A records-plane read (cl-009's D3 rule): the descriptor is a verified document
 		// in the generation, so the LocalService is not on the path to reading it.
 		Capability: "cmd.describe", Status: Implemented, Handler: "describe",
+		SelfContained: true,
+		Examples:      []string{"cozy describe org/endpoint", "cozy describe org/endpoint@v2/generate"},
 	},
 	{
 		Path: []string{"doctor"}, Group: "invocation",
@@ -240,6 +274,8 @@ var Commands = []Command{
 		MaxArgs:    0,
 		Exits:      []exit.Code{exit.OK, exit.Unavailable},
 		Capability: "cmd.doctor", NeedsServer: true, Status: Implemented, Handler: "doctor",
+		Next:     []string{"cozy fit <org/endpoint>"},
+		Examples: []string{"cozy doctor", "cozy doctor --json"},
 	},
 	{
 		Path: []string{"fit"}, Group: "invocation",
@@ -253,6 +289,8 @@ var Commands = []Command{
 		// 14 below it with the runtime's quantified shortfall; 6 structural.
 		Exits:      []exit.Code{exit.OK, exit.Usage, exit.NotFound, exit.Structural, exit.Capacity},
 		Capability: "cmd.fit", Status: Implemented, Handler: "fit",
+		SelfContained: true,
+		Examples:      []string{"cozy fit org/endpoint", "cozy fit org/endpoint@v2/generate --lane auto"},
 	},
 
 	// ---- durable workflows (cl-018) ----
@@ -268,7 +306,9 @@ var Commands = []Command{
 		Exits: []exit.Code{exit.OK, exit.Usage, exit.Validation, exit.NotFound,
 			exit.Unavailable, exit.Conflict},
 		Capability: "cmd.workflow.submit", NeedsServer: true, Status: Implemented,
-		Handler: "workflow.submit",
+		Handler:  "workflow.submit",
+		Next:     []string{"cozy workflow status <workflow-id>", "cozy workflow follow <workflow-id>"},
+		Examples: []string{"cozy workflow submit --in ./plan.json --idempotency-key <key>", "cozy workflow submit --in ./plan.json --worker shot-1=<rental-id> --idempotency-key <key>"},
 	},
 	{
 		Path: []string{"workflow", "status"}, Group: "workflows",
@@ -276,7 +316,9 @@ var Commands = []Command{
 		Args:    "<workflow-id>", MinArgs: 1, MaxArgs: 1,
 		Exits:      []exit.Code{exit.OK, exit.NotFound, exit.Unavailable},
 		Capability: "cmd.workflow.status", NeedsServer: true, Status: Implemented,
-		Handler: "workflow.status",
+		Handler:       "workflow.status",
+		SelfContained: true,
+		Examples:      []string{"cozy workflow status <workflow-id>", "cozy workflow status <workflow-id> --json"},
 	},
 	{
 		Path: []string{"workflow", "follow"}, Group: "workflows",
@@ -285,6 +327,8 @@ var Commands = []Command{
 		Exits:      []exit.Code{exit.OK, exit.NotFound, exit.Unavailable, exit.Failed, exit.Canceled},
 		Capability: "cmd.workflow.follow", NeedsServer: true, Terminals: true,
 		Status: Implemented, Handler: "workflow.follow",
+		Next:     []string{"cozy workflow download <workflow-id> --out <new-dir>"},
+		Examples: []string{"cozy workflow follow <workflow-id>"},
 	},
 	{
 		Path: []string{"workflow", "download"}, Group: "workflows",
@@ -294,7 +338,9 @@ var Commands = []Command{
 		Exits: []exit.Code{exit.OK, exit.Usage, exit.NotFound, exit.Unavailable,
 			exit.Validation, exit.Conflict},
 		Capability: "cmd.workflow.download", NeedsServer: true, Status: Implemented,
-		Handler: "workflow.download",
+		Handler:  "workflow.download",
+		Next:     []string{"cozy workflow status <workflow-id>"},
+		Examples: []string{"cozy workflow download <workflow-id> --out ./accepted"},
 	},
 	{
 		Path: []string{"workflow", "cancel"}, Group: "workflows",
@@ -302,7 +348,9 @@ var Commands = []Command{
 		Args:    "<workflow-id>", MinArgs: 1, MaxArgs: 1,
 		Exits:      []exit.Code{exit.OK, exit.NotFound, exit.Unavailable},
 		Capability: "cmd.workflow.cancel", NeedsServer: true, Status: Implemented,
-		Handler: "workflow.cancel",
+		Handler:  "workflow.cancel",
+		Next:     []string{"cozy workflow status <workflow-id>", "cozy workflow ls"},
+		Examples: []string{"cozy workflow cancel <workflow-id>"},
 	},
 
 	// ---- editable Cozy Video sources (cl-024) ----
@@ -318,7 +366,9 @@ var Commands = []Command{
 		Exits: []exit.Code{exit.OK, exit.Usage, exit.Validation, exit.NotFound,
 			exit.Structural, exit.Unavailable, exit.Conflict},
 		Capability: "cmd.video.compose", NeedsServer: true, Status: Implemented,
-		Handler: "video.compose",
+		Handler:  "video.compose",
+		Next:     []string{"cozy video submit <creative-plan-digest> --idempotency-key <key>"},
+		Examples: []string{"cozy video compose ./film.cozy-video.yaml --h3 org/endpoint", "cozy video compose ./film.cozy-video.yaml --out ./film.composition.json"},
 	},
 	{
 		Path: []string{"video", "submit"}, Group: "videos",
@@ -332,7 +382,9 @@ var Commands = []Command{
 		Exits: []exit.Code{exit.OK, exit.Usage, exit.Validation, exit.NotFound,
 			exit.Structural, exit.Unavailable, exit.Conflict},
 		Capability: "cmd.video.submit", NeedsServer: true, Status: Implemented,
-		Handler: "video.submit",
+		Handler:  "video.submit",
+		Next:     []string{"cozy workflow status <workflow-id>", "cozy workflow follow <workflow-id>"},
+		Examples: []string{"cozy video submit ./film.cozy-video.yaml --h3 org/endpoint --idempotency-key <key>", "cozy video submit <creative-plan-digest> --h3 org/endpoint --idempotency-key <key>"},
 	},
 
 	// ---- jobs (cl-004) ----
@@ -345,13 +397,15 @@ var Commands = []Command{
 			{Name: "--cloud", Summary: "submit to tensorhub"},
 			{Name: "--model", Arg: "<ref>", Summary: "override a model binding (repeatable)"},
 			{Name: "--input", Arg: "<ref>=<dir>", Summary: "a typed input TREE, granted as a read capability (repeatable)"},
-			{Name: "--org", Arg: "<name>", Summary: "the org whose scratch repo this job publishes into (default local)"},
+			{Name: "--org", Arg: "<name>", Summary: "the org whose scratch repo this job publishes into", Default: "local"},
 			{Name: "--in", Arg: "<file>", Summary: "whole payload as JSON"},
 			{Name: "--idempotency-key", Arg: "<key>", Summary: "name this job forever; a repeat answers the same one"},
 			{Name: "--follow", Summary: "attach immediately and exit with the terminal mapping"},
 		},
 		Exits:      []exit.Code{exit.OK, exit.Validation, exit.NotFound, exit.Unavailable, exit.Deadline, exit.Failed, exit.Canceled},
 		Capability: "cmd.job.submit", NeedsServer: true, Terminals: true, Status: Implemented, Handler: "job.submit",
+		Next:     []string{"cozy job follow <job-id>", "cozy job ls"},
+		Examples: []string{"cozy job submit org/endpoint/v1/train epochs=3", "cozy job submit org/endpoint/v1/train --in ./payload.json --follow", "cozy job submit org/endpoint/v1/train --input dataset=./data --idempotency-key <key>"},
 	},
 	{
 		Path: []string{"job", "status"}, Group: "jobs",
@@ -359,6 +413,8 @@ var Commands = []Command{
 		Args:    "<job-id>", MinArgs: 1, MaxArgs: 1,
 		Exits:      []exit.Code{exit.OK, exit.NotFound, exit.Unavailable},
 		Capability: "cmd.job.status", NeedsServer: true, Status: Implemented, Handler: "job.status",
+		SelfContained: true,
+		Examples:      []string{"cozy job status <job-id>", "cozy job status <job-id> --json"},
 	},
 	{
 		Path: []string{"job", "ls"}, Group: "jobs",
@@ -370,6 +426,8 @@ var Commands = []Command{
 		MaxArgs:    0,
 		Exits:      []exit.Code{exit.OK, exit.Unavailable},
 		Capability: "cmd.job.ls", NeedsServer: true, Status: Implemented, Handler: "job.ls",
+		Next:     []string{"cozy job status <job-id>", "cozy job follow <job-id>"},
+		Examples: []string{"cozy job ls", "cozy job ls --state running", "cozy job ls --endpoint org/endpoint --full"},
 	},
 	{
 		Path: []string{"job", "follow"}, Group: "jobs",
@@ -377,6 +435,8 @@ var Commands = []Command{
 		Args:    "<job-id>", MinArgs: 1, MaxArgs: 1,
 		Exits:      []exit.Code{exit.OK, exit.NotFound, exit.Unavailable, exit.Deadline, exit.Failed, exit.Canceled},
 		Capability: "cmd.job.follow", NeedsServer: true, Terminals: true, Status: Implemented, Handler: "job.follow",
+		Next:     []string{"cozy job ls", "cozy logs <attempt-id>"},
+		Examples: []string{"cozy job follow <job-id>"},
 	},
 	{
 		Path: []string{"job", "cancel"}, Group: "jobs",
@@ -384,6 +444,8 @@ var Commands = []Command{
 		Args:    "<job-id>", MinArgs: 1, MaxArgs: 1,
 		Exits:      []exit.Code{exit.OK, exit.NotFound, exit.Unavailable},
 		Capability: "cmd.job.cancel", NeedsServer: true, Status: Implemented, Handler: "job.cancel",
+		Next:     []string{"cozy job ls", "cozy job status <job-id>"},
+		Examples: []string{"cozy job cancel <job-id>"},
 	},
 
 	// ---- rentals (cl-015) ----
@@ -402,6 +464,8 @@ var Commands = []Command{
 		Exits: []exit.Code{exit.OK, exit.Usage, exit.Validation, exit.NotFound, exit.Credential,
 			exit.Unavailable, exit.Deadline, exit.Failed},
 		Capability: "cmd.rent", Status: Implemented, Handler: "rent",
+		Next:     []string{"cozy rent ls", "cozy rent probe <rental-id>"},
+		Examples: []string{"cozy rent org/endpoint --accelerator <model> --reason <why>", "cozy rent org/endpoint --accelerator <model> --reason <why> --idempotency-key <key>"},
 	},
 	{
 		Path: []string{"rent", "ls"}, Group: "rentals",
@@ -409,6 +473,8 @@ var Commands = []Command{
 		MaxArgs:    0,
 		Exits:      []exit.Code{exit.OK, exit.Usage},
 		Capability: "cmd.rent.ls", Status: Implemented, Handler: "rent.ls",
+		Next:     []string{"cozy rent show <rental-id>", "cozy rent release <rental-id>"},
+		Examples: []string{"cozy rent ls", "cozy rent ls --json"},
 	},
 	{
 		Path: []string{"rent", "show"}, Group: "rentals",
@@ -416,6 +482,8 @@ var Commands = []Command{
 		Args:    "<rental-id>", MinArgs: 1, MaxArgs: 1,
 		Exits:      []exit.Code{exit.OK, exit.Usage, exit.NotFound, exit.Conflict},
 		Capability: "cmd.rent.show", Status: Implemented, Handler: "rent.show",
+		Next:     []string{"cozy rent probe <rental-id>", "cozy run <org/endpoint/vN/function> --worker <rental-id>"},
+		Examples: []string{"cozy rent show <rental-id>"},
 	},
 	{
 		Path: []string{"rent", "probe"}, Group: "rentals",
@@ -424,6 +492,8 @@ var Commands = []Command{
 		Exits: []exit.Code{exit.OK, exit.Usage, exit.NotFound, exit.Unavailable,
 			exit.Failed, exit.Conflict},
 		Capability: "cmd.rent.probe", NeedsServer: true, Status: Implemented, Handler: "rent.probe",
+		Next:     []string{"cozy run <org/endpoint/vN/function> --worker <rental-id>", "cozy rent show <rental-id>"},
+		Examples: []string{"cozy rent probe <rental-id>"},
 	},
 	{
 		Path: []string{"rent", "release"}, Group: "rentals",
@@ -432,6 +502,8 @@ var Commands = []Command{
 		Flags:      []Flag{yesFlag},
 		Exits:      []exit.Code{exit.OK, exit.Usage, exit.NotFound, exit.Credential, exit.Unavailable, exit.Deadline},
 		Capability: "cmd.rent.release", PlanFirst: true, Status: Implemented, Handler: "rent.release",
+		Next:     []string{"cozy rent ls"},
+		Examples: []string{"cozy rent release <rental-id>", "cozy rent release <rental-id> --yes"},
 	},
 
 	// ---- catalog (cl-011) ----
@@ -445,6 +517,8 @@ var Commands = []Command{
 		Flags:      []Flag{{Name: "--kind", Arg: "<endpoint|model>", Summary: "restrict the kind"}},
 		Exits:      []exit.Code{exit.OK, exit.Usage, exit.Unavailable, exit.Deadline},
 		Capability: "cmd.search", Status: Implemented, Handler: "search",
+		Next:     []string{"cozy repo show <org/name>", "cozy install <org/endpoint>"},
+		Examples: []string{"cozy search", "cozy search flux --kind model", "cozy search --kind endpoint --json"},
 	},
 	{
 		Path: []string{"repo", "show"}, Group: "catalog",
@@ -452,6 +526,8 @@ var Commands = []Command{
 		Args:    "<org/name>", MinArgs: 1, MaxArgs: 1,
 		Exits:      []exit.Code{exit.OK, exit.Usage, exit.NotFound, exit.Unavailable, exit.Deadline},
 		Capability: "cmd.repo.show", Status: Implemented, Handler: "repo.show",
+		Next:     []string{"cozy search <query>"},
+		Examples: []string{"cozy repo show org/name"},
 	},
 	{
 		Path: []string{"repo", "create"}, Group: "catalog",
@@ -463,6 +539,8 @@ var Commands = []Command{
 		},
 		Exits:      []exit.Code{exit.OK, exit.Usage, exit.Validation, exit.Credential, exit.Unavailable, exit.Deadline, exit.Conflict},
 		Capability: "cmd.repo.create", Status: Implemented, Handler: "repo.create",
+		Next:     []string{"cozy repo show <org/name>", "cozy push <org/repo> <sha256:snapshot> --reason <why>"},
+		Examples: []string{"cozy repo create org/name --kind model --reason <why>"},
 	},
 	{
 		Path: []string{"hub", "status"}, Group: "catalog",
@@ -472,6 +550,8 @@ var Commands = []Command{
 		// reports, not a refusal it raises.
 		Exits:      []exit.Code{exit.OK},
 		Capability: "cmd.hub.status", Status: Implemented, Handler: "hub.status",
+		Next:     []string{"cozy search", "cozy hub config"},
+		Examples: []string{"cozy hub status", "cozy hub status --json"},
 	},
 	{
 		Path: []string{"hub", "config"}, Group: "catalog",
@@ -479,6 +559,8 @@ var Commands = []Command{
 		MaxArgs:    0,
 		Exits:      []exit.Code{exit.OK, exit.Usage, exit.Credential, exit.Unavailable, exit.Deadline},
 		Capability: "cmd.hub.config", Status: Implemented, Handler: "hub.config",
+		Next:     []string{"cozy hub status"},
+		Examples: []string{"cozy hub config", "cozy hub config --fields key,value,source"},
 	},
 
 	// ---- transfer (cl-012, cl-008) ----
@@ -500,6 +582,8 @@ var Commands = []Command{
 		Exits: []exit.Code{exit.OK, exit.Usage, exit.Validation, exit.NotFound, exit.Credential,
 			exit.Structural, exit.Unavailable, exit.Deadline},
 		Capability: "cmd.pull", Status: Implemented, Handler: "pull",
+		Next:     []string{"cozy install <org/endpoint>", "cozy search <query>"},
+		Examples: []string{"cozy pull org/repo", "cozy pull org/repo@sha256:<hex>", "cozy pull org/repo --dry-run"},
 	},
 	{
 		Path: []string{"push"}, Group: "transfer",
@@ -510,7 +594,7 @@ var Commands = []Command{
 			// topology digest and refuses an unknown field, so a declared family is
 			// both unnecessary and fatal (cl-006's real-hub side-check, closed here).
 			{Name: "--reason", Arg: "<why>", Summary: "required; the hub records it durably before it acts"},
-			{Name: "--session", Arg: "<name>", Summary: "publish session name (default derived from the snapshot)"},
+			{Name: "--session", Arg: "<name>", Summary: "publish session name", Default: "derived from the snapshot"},
 			{Name: "--dry-run", Summary: "declare and stop: the hub's own transfer plan"},
 			{Name: "--token-stdin", Summary: "read this invocation's hub credential from stdin (never argv)"},
 			{Name: "--crash-after", Arg: "<n>", Summary: "development: stop after n objects (resume verification)"},
@@ -518,6 +602,8 @@ var Commands = []Command{
 		Exits: []exit.Code{exit.OK, exit.Usage, exit.Validation, exit.NotFound, exit.Credential,
 			exit.Structural, exit.Unavailable, exit.Deadline, exit.Failed, exit.Conflict},
 		Capability: "cmd.push", Status: Implemented, Handler: "push",
+		Next:     []string{"cozy repo show <org/name>", "cozy pull <org/repo>"},
+		Examples: []string{"cozy push org/repo sha256:<snapshot> --reason <why>", "cozy push org/repo sha256:<snapshot> --reason <why> --dry-run"},
 	},
 	{
 		Path: []string{"datasets", "push"}, Group: "transfer",

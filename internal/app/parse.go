@@ -1,6 +1,7 @@
 package app
 
 import (
+	"fmt"
 	"strings"
 
 	"github.com/cozy-creator/cozy-creator/internal/exit"
@@ -60,17 +61,61 @@ func findFlag(name string, cmd *manifest.Command) (manifest.Flag, bool) {
 	return manifest.Flag{}, false
 }
 
+// acceptedFlags names the RESOLVED command's own flags first and the globals second
+// (AXI 6): "valid flags for `ls`" is the answer; a flat union of everything is a list the
+// agent has to re-derive the scope of.
 func acceptedFlags(cmd *manifest.Command) string {
-	var names []string
+	var global []string
 	for _, f := range manifest.GlobalFlags {
-		names = append(names, f.Name)
+		global = append(global, f.Name)
 	}
-	if cmd != nil {
-		for _, f := range cmd.Flags {
-			names = append(names, f.Name)
+	if cmd == nil {
+		return strings.Join(global, " ") + " (global; the line names no command)"
+	}
+	var own []string
+	for _, f := range cmd.Flags {
+		own = append(own, f.Name)
+	}
+	if len(own) == 0 {
+		return fmt.Sprintf("`cozy %s` takes no flags of its own · global: %s",
+			cmd.Name(), strings.Join(global, " "))
+	}
+	return fmt.Sprintf("`cozy %s`: %s · global: %s",
+		cmd.Name(), strings.Join(own, " "), strings.Join(global, " "))
+}
+
+// scope answers WHICH command a refusal is about. `cozy --stat ls` fails on token 1,
+// before `ls` was ever read, so inv.Cmd is still nil and the refusal would name the
+// global flags only — the wrong surface for the command the caller actually typed.
+// This re-reads the whole line for the command word. It is BEST EFFORT and never feeds
+// dispatch: an unknown flag's arity is unknowable, so it is assumed boolean, and a
+// KNOWN global flag's value is skipped so `cozy --fields ls run` still resolves `run`.
+func scope(inv *Invocation, args []string) *manifest.Command {
+	if inv.Cmd != nil {
+		return inv.Cmd
+	}
+	var words []string
+	for i := 0; i < len(args); i++ {
+		tok := args[i]
+		if tok == "--" {
+			break
+		}
+		if strings.HasPrefix(tok, "-") && tok != "-" {
+			name, _, inline := strings.Cut(tok, "=")
+			if f, ok := findFlag(name, nil); ok && f.TakesValue() && !inline {
+				i++
+			}
+			continue
+		}
+		words = append(words, tok)
+	}
+	// Lookup already prefers the two-word row, so the held-verb rule needs no repeat here.
+	for start := range words {
+		if c, _ := manifest.Lookup(words[start:]); c != nil {
+			return c
 		}
 	}
-	return strings.Join(names, " ")
+	return nil
 }
 
 func parse(args []string) (*Invocation, *exit.Error) {
@@ -89,14 +134,15 @@ func parse(args []string) (*Invocation, *exit.Error) {
 			name, inline, hasInline := strings.Cut(tok, "=")
 			spec, ok := findFlag(name, inv.Cmd)
 			if !ok {
-				return inv, exit.Usagef("unknown flag %q", name).
-					WithRemedy("accepted flags: %s", acceptedFlags(inv.Cmd)).
-					WithNext(helpNext(inv.Cmd))
+				at := scope(inv, args)
+				return inv, exit.Usagef("unknown flag %q for `cozy %s`", name, cmdName(at)).
+					WithRemedy("accepted flags: %s", acceptedFlags(at)).
+					WithNext(helpNext(at))
 			}
 			if !spec.TakesValue() {
 				if hasInline {
 					return inv, exit.Usagef("flag %s takes no value", spec.Name).
-						WithNext(helpNext(inv.Cmd))
+						WithNext(helpNext(scope(inv, args)))
 				}
 				inv.Bools[spec.Name] = true
 				continue
@@ -105,7 +151,7 @@ func parse(args []string) (*Invocation, *exit.Error) {
 			if !hasInline {
 				if i+1 >= len(args) {
 					return inv, exit.Usagef("flag %s needs a value %s", spec.Name, spec.Arg).
-						WithNext(helpNext(inv.Cmd))
+						WithNext(helpNext(scope(inv, args)))
 				}
 				i++
 				val = args[i]
@@ -190,4 +236,11 @@ func helpNext(c *manifest.Command) string {
 		return "cozy -h"
 	}
 	return "cozy help " + c.Name()
+}
+
+func cmdName(c *manifest.Command) string {
+	if c == nil {
+		return "<command>"
+	}
+	return c.Name()
 }

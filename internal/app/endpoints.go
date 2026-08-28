@@ -142,7 +142,7 @@ func handleLs(ctx *Context) *exit.Error {
 		})
 	}
 	if len(l.Rows) == 0 {
-		l.Next = []string{"cozy install org/endpoint"}
+		l.Next = []string{"cozy install <org/endpoint>", "cozy search --kind endpoint"}
 		return emit(ctx, l)
 	}
 	l.Aggregates = []render.Field{

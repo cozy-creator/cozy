@@ -329,13 +329,18 @@ func handleJobLs(ctx *Context) *exit.Error {
 	for _, state := range states {
 		aggregates = append(aggregates, render.Field{K: state, V: counts[state]})
 	}
-	return emit(ctx, render.List{Kind: "job",
+	l := render.List{Kind: "job",
 		Fields:     []string{"job", "target", "state", "age"},
 		AllFields:  []string{"job", "target", "state", "age", "publication", "bill"},
 		Rows:       rows,
 		Empty:      "0 jobs",
 		Aggregates: aggregates,
-	})
+	}
+	if len(rows) == 0 {
+		// AXI 9: after an EMPTY list the useful step is creating one, not viewing one.
+		l.Next = []string{"cozy job submit <org/endpoint/vN/function>"}
+	}
+	return emit(ctx, l)
 }
 
 // ---------------------------------------------------------------------- job follow

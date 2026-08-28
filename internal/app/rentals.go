@@ -403,7 +403,7 @@ func handleRentLs(ctx *Context) *exit.Error {
 		list.Aggregates = []render.Field{
 			{K: "rentals", V: len(list.Rows)}, {K: "dialable", V: attached},
 		}
-		list.Next = []string{"cozy rent release " + list.Rows[0]["rental"] + " --yes"}
+		list.Next = []string{"cozy rent show <rental-id>", "cozy rent release <rental-id>"}
 	}
 	return emit(ctx, list)
 }

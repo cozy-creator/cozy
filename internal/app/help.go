@@ -17,6 +17,9 @@ func renderHelp(ctx *Context, c *manifest.Command) *exit.Error {
 	w := ctx.Out
 	fmt.Fprintf(w, "cozy %s — %s\n", c.Name(), c.Summary)
 	fmt.Fprintf(w, "usage: %s\n", strings.TrimSpace("cozy "+c.Name()+" "+c.Args))
+	if c.MinArgs > 0 {
+		fmt.Fprintf(w, "required: %s (%d argument(s))\n", strings.TrimSpace(c.Args), c.MinArgs)
+	}
 	fmt.Fprintf(w, "group: %s\n", c.Group)
 	if c.Status == manifest.Implemented {
 		fmt.Fprintln(w, "status: implemented")
@@ -32,7 +35,7 @@ func renderHelp(ctx *Context, c *manifest.Command) *exit.Error {
 			}
 		}
 		for _, f := range c.Flags {
-			fmt.Fprintf(w, "  %-*s  %s\n", width, flagSpelling(f), f.Summary)
+			fmt.Fprintf(w, "  %-*s  %s\n", width, flagSpelling(f), flagSummary(f))
 		}
 	}
 	if len(c.Exits) > 0 {
@@ -53,8 +56,24 @@ func renderHelp(ctx *Context, c *manifest.Command) *exit.Error {
 	if c.Capability != "" {
 		fmt.Fprintf(w, "capability: %s\n", c.Capability)
 	}
+	// AXI 10 — worked invocations, parameterized. An agent reading `--in <file>` still
+	// has to guess the shape of a call; an example is the shape.
+	if len(c.Examples) > 0 {
+		fmt.Fprintln(w, "examples:")
+		for _, e := range c.Examples {
+			fmt.Fprintf(w, "  %s\n", e)
+		}
+	}
 	fmt.Fprintln(w, "next: cozy commands")
 	return nil
+}
+
+// flagSummary appends the value that applies when the flag is absent (AXI 10).
+func flagSummary(f manifest.Flag) string {
+	if f.Default == "" {
+		return f.Summary
+	}
+	return fmt.Sprintf("%s (default %s)", f.Summary, f.Default)
 }
 
 func flagSpelling(f manifest.Flag) string {
@@ -70,7 +89,7 @@ func flagSpelling(f manifest.Flag) string {
 
 func renderRootHelp(ctx *Context) *exit.Error {
 	w := ctx.Out
-	fmt.Fprintln(w, "cozy — local-first generative media: install endpoints, run them, publish releases")
+	fmt.Fprintln(w, "cozy — "+manifest.Description)
 	fmt.Fprintln(w, "usage: cozy [global flags] <command> [args…]   ·   bare `cozy` prints live status")
 	fmt.Fprintln(w)
 	planned := false
@@ -106,7 +125,7 @@ func renderRootHelp(ctx *Context) *exit.Error {
 		}
 	}
 	for _, f := range manifest.GlobalFlags {
-		fmt.Fprintf(w, "  %-*s  %s\n", width, flagSpelling(f), f.Summary)
+		fmt.Fprintf(w, "  %-*s  %s\n", width, flagSpelling(f), flagSummary(f))
 	}
 	fmt.Fprintf(w, "  %-*s  %s\n", width, versionFlags,
 		"print the bare version and exit 0; only as the sole argument (`cozy version` is the full record)")
