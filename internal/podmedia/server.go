@@ -75,7 +75,7 @@ import (
 
 // Options is the whole launch surface of the media plane. Everything is a path grant or a
 // bound; nothing is discovered, nothing is read from the environment, and there is no
-// configuration file. `cmd/pod-supervisor` fills it from the eight allowlisted pod variables and
+// configuration file. `cmd/pod-supervisor` fills it from the six allowlisted pod variables and
 // its own fixed image layout — this package never learns either.
 type Options struct {
 	Listen           string
@@ -145,9 +145,9 @@ type server struct {
 // lowercase hex>` spelling secret.HashLine renders and secret.MatchesHash compares.
 var tokenHashPattern = regexp.MustCompile(`^sha256:[0-9a-f]{64}$`)
 
-// maxTokenHashes bounds the set. It is the rental's own ceiling (tensorhub mints at most
+// MaxTokenHashes bounds the set. It is the rental's own ceiling (tensorhub mints at most
 // this many live hashes per rental), restated as a refusal rather than trusted.
-const maxTokenHashes = 16
+const MaxTokenHashes = 16
 
 // validateTokenHashes checks the launch credential set and is the whole of this plane's
 // admission policy. FAIL CLOSED: an empty set, a duplicate, an out-of-order entry, an
@@ -164,8 +164,8 @@ func validateTokenHashes(hashes []string) error {
 	if len(hashes) == 0 {
 		return fmt.Errorf("the media grant takes at least one `sha256:<64 hex>` digest")
 	}
-	if len(hashes) > maxTokenHashes {
-		return fmt.Errorf("the media grant takes at most %d digests, not %d", maxTokenHashes, len(hashes))
+	if len(hashes) > MaxTokenHashes {
+		return fmt.Errorf("the media grant takes at most %d digests, not %d", MaxTokenHashes, len(hashes))
 	}
 	for i, hash := range hashes {
 		if !tokenHashPattern.MatchString(hash) {

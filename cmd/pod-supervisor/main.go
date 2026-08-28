@@ -11,7 +11,7 @@
 //
 // It does four things and nothing else:
 //
-//   - It PARSES ITS GRANT. The whole launch surface is eight ALLOWLISTED `COZY_*`
+//   - It PARSES ITS GRANT. The whole launch surface is six ALLOWLISTED `COZY_*`
 //     environment variables; it takes no arguments and reads no configuration file, and an
 //     unrecognized `COZY_*` name is a boot failure rather than an ignored default.
 //   - It MINTS the pod's TLS leaf and boot id, so no long-lived credential ships in the

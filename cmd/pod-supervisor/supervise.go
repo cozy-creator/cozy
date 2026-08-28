@@ -43,6 +43,12 @@ type leg struct {
 	kill      func()
 }
 
+type legRuntime struct {
+	startAdapter   func() (*leg, error)
+	publishReceipt func(context.Context, []*leg) error
+	supervise      func(context.Context, []*leg) error
+}
+
 func (l *leg) exited() bool {
 	select {
 	case <-l.done:
@@ -73,18 +79,30 @@ func run(parent context.Context) error {
 	if err != nil {
 		return err
 	}
-	legs := []*leg{media}
-	defer stopLegs(legs)
-	adapter, err := startAdapter(cfg)
+	return runLegs(parent, readinessCtx, cancelReadiness, media, legRuntime{
+		startAdapter: func() (*leg, error) { return startAdapter(cfg) },
+		publishReceipt: func(ctx context.Context, legs []*leg) error {
+			return publishReceipt(ctx, cfg.receipt, legs)
+		},
+		supervise: supervise,
+	})
+}
+
+func runLegs(parent, readinessCtx context.Context, cancelReadiness context.CancelFunc,
+	media *leg, runtime legRuntime,
+) error {
+	var adapter *leg
+	defer func() { stopLegs([]*leg{media, adapter}) }()
+	adapter, err := runtime.startAdapter()
 	if err != nil {
 		return err
 	}
-	legs = append(legs, adapter)
-	if err := publishReceipt(readinessCtx, cfg.receipt, legs); err != nil {
+	legs := []*leg{media, adapter}
+	if err := runtime.publishReceipt(readinessCtx, legs); err != nil {
 		return classifyContext(parent, readinessCtx, err)
 	}
 	cancelReadiness()
-	return supervise(parent, legs)
+	return runtime.supervise(parent, legs)
 }
 
 // startMedia binds the pod's byte plane and serves it in this process. Its grant is the
@@ -122,7 +140,11 @@ func mediaGrant(hashes []string) []string {
 }
 
 func startAdapter(cfg config) (*leg, error) {
-	cmd := exec.Command(adapterPath)
+	return startAdapterAt(adapterPath, cfg)
+}
+
+func startAdapterAt(path string, cfg config) (*leg, error) {
+	cmd := exec.Command(path)
 	env := childEnvironment()
 	hashes, _ := json.Marshal(cfg.tokenHashes)
 	env = append(env,

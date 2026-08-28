@@ -10,6 +10,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/cozy-creator/cozy-creator/internal/podmedia"
 )
 
 const (
@@ -19,7 +21,6 @@ const (
 	envWorkerPort    = "COZY_WORKER_INTERNAL_PORT"
 	envMediaPort     = "COZY_MEDIA_INTERNAL_PORT"
 	envTokenHashes   = "COZY_RENTER_TOKEN_SHA256_JSON"
-	maxTokenHashes   = 16
 	maxIdentityBytes = 256
 )
 
@@ -153,8 +154,8 @@ func parsePort(name string) (uint16, error) {
 }
 
 func validateTokenHashes(hashes []string) error {
-	if len(hashes) == 0 || len(hashes) > maxTokenHashes {
-		return fmt.Errorf("%s must contain between 1 and %d hashes", envTokenHashes, maxTokenHashes)
+	if len(hashes) == 0 || len(hashes) > podmedia.MaxTokenHashes {
+		return fmt.Errorf("%s must contain between 1 and %d hashes", envTokenHashes, podmedia.MaxTokenHashes)
 	}
 	for i, hash := range hashes {
 		if len(hash) != sha256.Size*2 || hash != strings.ToLower(hash) {
