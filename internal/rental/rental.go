@@ -10,6 +10,7 @@
 package rental
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"os"
@@ -226,6 +227,7 @@ func Descriptor(st *records.Store, id string) (*launch.Descriptor, *exit.Error) 
 // attached rental. It is an observation surface for acceptance and diagnosis, never an
 // input to selection: callers still ask only for endpoint + provider-neutral accelerator.
 type ControlSummary struct {
+	PlacementRevision                 uint64   `json:"placement_revision"`
 	ControlSnapshotDigest             string   `json:"control_snapshot_digest"`
 	EndpointExecutionDigest           string   `json:"endpoint_execution_digest"`
 	ArtifactObjectSetDigest           string   `json:"artifact_object_set_digest"`
@@ -271,6 +273,7 @@ func Summarize(row records.Rental) (ControlSummary, *exit.Error) {
 	}
 	sort.Strings(plans)
 	return ControlSummary{
+		PlacementRevision:                 row.PlacementRevision,
 		ControlSnapshotDigest:             row.ControlSnapshotDigest,
 		EndpointExecutionDigest:           facts.EndpointExecutionDigest,
 		ArtifactObjectSetDigest:           facts.ArtifactObjectSetDigest,
@@ -397,14 +400,57 @@ func ArtifactGrants(st *records.Store, client *hub.Client) orchestrator.Artifact
 	}
 }
 
+func PlacementRevisions(st *records.Store, client *hub.Client) orchestrator.PlacementRevisionSource {
+	return func(ctx context.Context, connection *orchestrator.WorkerConnection,
+		endpointRef, idempotencyKey, reason string) (orchestrator.DesiredPlacement, uint64, *exit.Error) {
+		if connection == nil || connection.RentalID == "" {
+			return orchestrator.DesiredPlacement{}, 0,
+				exit.Named(exit.Validation, "rental.placement_revision_invalid", "rental identity is absent")
+		}
+		row, problem := st.RentalRow(connection.RentalID)
+		if problem != nil {
+			return orchestrator.DesiredPlacement{}, 0, problem
+		}
+		if row == nil {
+			return orchestrator.DesiredPlacement{}, 0, unknown(connection.RentalID)
+		}
+		if row.Hub != client.Base() {
+			return orchestrator.DesiredPlacement{}, 0, exit.Named(exit.Conflict, "rental.hub_mismatch",
+				"rental %s belongs to %s, configured hub is %s", row.ID, row.Hub, client.Base())
+		}
+		answer, problem := client.ReviseRentalPlacement(ctx, row.ID, endpointRef, idempotencyKey, reason)
+		if problem != nil {
+			return orchestrator.DesiredPlacement{}, 0, problem
+		}
+		facts, problem := remotecontrol.Decode(answer.ControlSnapshot, answer.EndpointRef)
+		if problem != nil {
+			return orchestrator.DesiredPlacement{}, 0, problem
+		}
+		if facts.Placement.ExactPlacementSetDigest != answer.PlacementSet.Digest ||
+			!bytes.Equal(facts.Placement.ExactPlacementSetBytes, answer.PlacementSet.CanonicalBytes) ||
+			int64(len(facts.Placement.ExactPlacementSetBytes)) != answer.PlacementSet.Length {
+			return orchestrator.DesiredPlacement{}, 0, exit.Named(exit.Conflict,
+				"rental.placement_revision_invalid",
+				"revision %d control snapshot and placement_set response disagree",
+				answer.PlacementRevision)
+		}
+		if problem := st.ReviseRentalControl(row.ID, answer.EndpointRef, answer.PlacementRevision,
+			answer.ControlSnapshot.Digest, answer.ControlSnapshot.CanonicalBytes); problem != nil {
+			return orchestrator.DesiredPlacement{}, 0, problem
+		}
+		return facts.Placement, answer.PlacementRevision, nil
+	}
+}
+
 // ObserveWorker turns a remote ClaimAck into the rental's durable actual-hardware
 // readback. It is wired into the orchestrator so no remote session can become
 // dispatchable without crossing this records boundary.
 func ObserveWorker(st *records.Store) func(orchestrator.RentalObservation) *exit.Error {
 	return func(observed orchestrator.RentalObservation) *exit.Error {
 		return st.ObserveRentalWorker(observed.RentalID, observed.Accelerator,
-			observed.Backend, observed.WorkerInstance, observed.WorkerBootID,
-			observed.DeviceCount)
+			observed.Backend, observed.DriverVersion, observed.BackendVersion,
+			observed.DeviceMemoryTotalBytes, observed.WorkerInstance,
+			observed.WorkerBootID, observed.DeviceCount)
 	}
 }
 

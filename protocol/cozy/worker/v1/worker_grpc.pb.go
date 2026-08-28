@@ -37,8 +37,11 @@
 // DOCUMENT VERSIONS. A digest-fenced document is NOT additively versioned: an unknown key
 // REFUSES, and a new key is a new document version. The canonical `format` tag is the message's
 // full name plus its document version. Every document here is at /1 except
-// `cozy.worker.v1.AttemptOutcomeBody/3`: /2 added `execution_started` under #480c; /3 adds exact
-// committed job artifact receipts under th-049 on top of the frozen TerminalBody/1 lineage (#481).
+// `cozy.worker.v1.AttemptOutcomeBody/3`, `PlacementSet/2`, `PlacementSpec/2`, and
+// `WorkerSnapshotBody/2`. AttemptOutcomeBody /2 added `execution_started` under #480c; /3 adds
+// exact committed job artifact receipts under th-049 on the frozen TerminalBody/1 lineage
+// (#481). The Placement pair /2 adds exact desired model closure; WorkerSnapshotBody /2 carries
+// observation-only placement acquisition telemetry.
 //
 // THE ENVELOPE (every message, fields 1-3): the ownership + boot fence, checked BEFORE any body
 // field is read, in this order:

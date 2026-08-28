@@ -24,7 +24,7 @@ var (
 	commit = ""
 	// The published worker protocol (worker-protocol-v2, th-024). Asserted here as a
 	// constant; the binding link to a running worker arrives with cl-001.
-	protocolVersion = "cozy.worker.v1 (wire_minor 0)"
+	protocolVersion = "cozy.worker.v1 (wire_minor 2)"
 	// The local client API contract this binary serves (cl-006). It is the SHARED
 	// contract's core version, not a local build number: the same string is what
 	// Tensorhub's host and the pod profile answer with when they serve the same core.
@@ -77,6 +77,7 @@ var handlers = map[string]Handler{
 	"rent.ls":           handleRentLs,
 	"rent.show":         handleRentShow,
 	"rent.probe":        handleRentProbe,
+	"rent.revise":       handleRentRevise,
 	"rent.release":      handleRentRelease,
 }
 

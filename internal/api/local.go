@@ -167,6 +167,40 @@ func (s *Server) stopWorker(w http.ResponseWriter, r *http.Request) {
 	s.ok(w, r, http.StatusOK, map[string]any{"instance_id": instance, "stopped": true})
 }
 
+func (s *Server) reviseRental(w http.ResponseWriter, r *http.Request) {
+	var body struct {
+		EndpointRef    string `json:"endpoint_ref"`
+		IdempotencyKey string `json:"idempotency_key"`
+		Reason         string `json:"reason"`
+	}
+	data, _ := io.ReadAll(io.LimitReader(r.Body, 1<<16))
+	decoder := json.NewDecoder(bytes.NewReader(data))
+	decoder.DisallowUnknownFields()
+	err := decoder.Decode(&body)
+	var trailing any
+	if err == nil {
+		err = decoder.Decode(&trailing)
+	}
+	if err != io.EOF || body.EndpointRef == "" || body.IdempotencyKey == "" || body.Reason == "" ||
+		r.Header.Get("Idempotency-Key") != body.IdempotencyKey {
+		s.refuse(w, r, http.StatusBadRequest, "invalid_request",
+			"endpoint_ref, idempotency_key, and reason are required", "send one closed revision request")
+		return
+	}
+	facts, revision, problem := s.orchestrator.ReviseRental(r.Context(), r.PathValue("rental_id"),
+		body.EndpointRef, body.IdempotencyKey, body.Reason)
+	if problem != nil {
+		s.refuseTyped(w, r, problem)
+		return
+	}
+	s.ok(w, r, http.StatusAccepted, map[string]any{
+		"rental_id": r.PathValue("rental_id"), "placement_revision": revision,
+		"instance_id": facts.InstanceID, "worker_boot_id": facts.BootID,
+		"endpoint": facts.Endpoint, "desired_state_revision": facts.DesiredRevision,
+		"artifact_grant_revision": facts.GrantRevision,
+	})
+}
+
 // shutdownService is `cozy down`'s COOPERATIVE tier (#449): an authenticated ask that the
 // service drain every worker and exit — the same act the Unix SIGTERM performs, spelled as
 // a route so it exists on every platform (Windows has no signal to send a detached

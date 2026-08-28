@@ -48,6 +48,22 @@ CREATE TABLE IF NOT EXISTS worker_processes (
 )`, `
 CREATE UNIQUE INDEX IF NOT EXISTS worker_session ON worker_processes(session_id)
   WHERE session_id IS NOT NULL`, `
+CREATE TABLE IF NOT EXISTS placement_acquisition_observations (
+  instance_id                 TEXT NOT NULL,
+  worker_boot_id              TEXT NOT NULL,
+  placement_id                TEXT NOT NULL,
+  placement_spec_digest       TEXT NOT NULL,
+  endpoint_started_ns         INTEGER NOT NULL,
+  endpoint_ended_ns           INTEGER NOT NULL,
+  endpoint_downloaded_bytes   INTEGER NOT NULL,
+  endpoint_reused_bytes       INTEGER NOT NULL,
+  model_started_ns            INTEGER NOT NULL,
+  model_ended_ns              INTEGER NOT NULL,
+  model_downloaded_bytes      INTEGER NOT NULL,
+  model_reused_bytes          INTEGER NOT NULL,
+  observed_at                 TEXT NOT NULL,
+  PRIMARY KEY (instance_id, worker_boot_id, placement_id, placement_spec_digest)
+)`, `
 CREATE TABLE IF NOT EXISTS requests (
   id           TEXT PRIMARY KEY,
   idem_key     TEXT    NOT NULL UNIQUE,
@@ -290,6 +306,130 @@ type WorkerProcess struct {
 	OpenedAt                              string
 }
 
+type AcquisitionLeg struct {
+	StartedNS, EndedNS           uint64
+	DownloadedBytes, ReusedBytes uint64
+}
+
+type PlacementAcquisition struct {
+	InstanceID, WorkerBootID, PlacementID, PlacementSpecDigest string
+	Endpoint, Model                                            AcquisitionLeg
+	ObservedAt                                                 string
+}
+
+const acquisitionColumns = `instance_id,worker_boot_id,placement_id,placement_spec_digest,
+	endpoint_started_ns,endpoint_ended_ns,endpoint_downloaded_bytes,endpoint_reused_bytes,
+	model_started_ns,model_ended_ns,model_downloaded_bytes,model_reused_bytes,observed_at`
+
+func scanPlacementAcquisition(row interface{ Scan(...any) error }) (PlacementAcquisition, error) {
+	var out PlacementAcquisition
+	err := row.Scan(&out.InstanceID, &out.WorkerBootID, &out.PlacementID, &out.PlacementSpecDigest,
+		&out.Endpoint.StartedNS, &out.Endpoint.EndedNS,
+		&out.Endpoint.DownloadedBytes, &out.Endpoint.ReusedBytes,
+		&out.Model.StartedNS, &out.Model.EndedNS,
+		&out.Model.DownloadedBytes, &out.Model.ReusedBytes, &out.ObservedAt)
+	return out, err
+}
+
+// ObservePlacementAcquisition persists the latest worker-authored observation for one
+// exact placement spec. Counters and clock points may advance; they never move backward.
+func (s *Store) ObservePlacementAcquisition(in PlacementAcquisition) *exit.Error {
+	if in.InstanceID == "" || in.WorkerBootID == "" || in.PlacementID == "" ||
+		in.PlacementSpecDigest == "" {
+		return exit.Named(exit.Conflict, "placement.acquisition_identity_missing",
+			"an acquisition observation is missing worker, boot, placement, or spec identity")
+	}
+	if err := validAcquisitionLeg("endpoint", in.Endpoint); err != nil {
+		return err
+	}
+	if err := validAcquisitionLeg("model", in.Model); err != nil {
+		return err
+	}
+	if in.ObservedAt == "" {
+		in.ObservedAt = now()
+	}
+	result, err := s.db.Exec(`INSERT INTO placement_acquisition_observations(`+acquisitionColumns+`)
+		VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)
+		ON CONFLICT(instance_id,worker_boot_id,placement_id,placement_spec_digest)
+		DO UPDATE SET endpoint_started_ns=excluded.endpoint_started_ns,
+		 endpoint_ended_ns=excluded.endpoint_ended_ns,
+		 endpoint_downloaded_bytes=excluded.endpoint_downloaded_bytes,
+		 endpoint_reused_bytes=excluded.endpoint_reused_bytes,
+		 model_started_ns=excluded.model_started_ns,model_ended_ns=excluded.model_ended_ns,
+		 model_downloaded_bytes=excluded.model_downloaded_bytes,
+		 model_reused_bytes=excluded.model_reused_bytes,observed_at=excluded.observed_at
+		WHERE (placement_acquisition_observations.endpoint_started_ns=0 OR
+		       (excluded.endpoint_started_ns=placement_acquisition_observations.endpoint_started_ns AND
+		        excluded.endpoint_ended_ns>=placement_acquisition_observations.endpoint_ended_ns AND
+		        (placement_acquisition_observations.endpoint_ended_ns=0 OR
+		         excluded.endpoint_ended_ns=placement_acquisition_observations.endpoint_ended_ns) AND
+		        excluded.endpoint_downloaded_bytes>=placement_acquisition_observations.endpoint_downloaded_bytes AND
+		        excluded.endpoint_reused_bytes>=placement_acquisition_observations.endpoint_reused_bytes) OR
+		       (placement_acquisition_observations.endpoint_ended_ns>0 AND
+		        excluded.endpoint_started_ns>placement_acquisition_observations.endpoint_ended_ns))
+		  AND (placement_acquisition_observations.model_started_ns=0 OR
+		       (excluded.model_started_ns=placement_acquisition_observations.model_started_ns AND
+		        excluded.model_ended_ns>=placement_acquisition_observations.model_ended_ns AND
+		        (placement_acquisition_observations.model_ended_ns=0 OR
+		         excluded.model_ended_ns=placement_acquisition_observations.model_ended_ns) AND
+		        excluded.model_downloaded_bytes>=placement_acquisition_observations.model_downloaded_bytes AND
+		        excluded.model_reused_bytes>=placement_acquisition_observations.model_reused_bytes) OR
+		       (placement_acquisition_observations.model_ended_ns>0 AND
+		        excluded.model_started_ns>placement_acquisition_observations.model_ended_ns))`,
+		in.InstanceID, in.WorkerBootID, in.PlacementID, in.PlacementSpecDigest,
+		in.Endpoint.StartedNS, in.Endpoint.EndedNS, in.Endpoint.DownloadedBytes, in.Endpoint.ReusedBytes,
+		in.Model.StartedNS, in.Model.EndedNS, in.Model.DownloadedBytes, in.Model.ReusedBytes,
+		in.ObservedAt)
+	if err != nil {
+		return exit.Internalf("cannot persist placement acquisition observation: %s", err)
+	}
+	changed, err := result.RowsAffected()
+	if err != nil {
+		return exit.Internalf("cannot read placement acquisition result: %s", err)
+	}
+	if changed != 1 {
+		return exit.Named(exit.Conflict, "placement.acquisition_regressed",
+			"worker %s acquisition counters or clock points moved backward", in.WorkerBootID)
+	}
+	return nil
+}
+
+func validAcquisitionLeg(name string, leg AcquisitionLeg) *exit.Error {
+	if leg.StartedNS == 0 {
+		if leg.EndedNS != 0 || leg.DownloadedBytes != 0 || leg.ReusedBytes != 0 {
+			return exit.Named(exit.Conflict, "placement.acquisition_invalid",
+				"%s acquisition has counters or an end without a start", name)
+		}
+		return nil
+	}
+	if leg.EndedNS != 0 && leg.EndedNS < leg.StartedNS {
+		return exit.Named(exit.Conflict, "placement.acquisition_invalid",
+			"%s acquisition ended before it started", name)
+	}
+	const maxSQLiteInteger = uint64(1<<63 - 1)
+	if leg.StartedNS > maxSQLiteInteger || leg.EndedNS > maxSQLiteInteger ||
+		leg.DownloadedBytes > maxSQLiteInteger || leg.ReusedBytes > maxSQLiteInteger {
+		return exit.Named(exit.Conflict, "placement.acquisition_invalid",
+			"%s acquisition exceeds the durable integer range", name)
+	}
+	return nil
+}
+
+func (s *Store) PlacementAcquisition(instanceID, bootID, placementID,
+	specDigest string) (*PlacementAcquisition, *exit.Error) {
+	out, err := scanPlacementAcquisition(s.db.QueryRow(`SELECT `+acquisitionColumns+`
+		FROM placement_acquisition_observations
+		WHERE instance_id=? AND worker_boot_id=? AND placement_id=? AND placement_spec_digest=?`,
+		instanceID, bootID, placementID, specDigest))
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, exit.Internalf("cannot read placement acquisition observation: %s", err)
+	}
+	return &out, nil
+}
+
 func deviceMark(d string) string { return "|" + d + "|" }
 
 func deviceList(devices []string) string {
@@ -371,6 +511,21 @@ func (s *Store) AttachWorker(w WorkerProcess) *exit.Error {
 		w.InstanceID, w.Endpoint, nullable(w.Generation), w.ReleaseID, w.WorkerID,
 		now()); err != nil {
 		return exit.Internalf("cannot journal the attached worker %s: %s", w.InstanceID, err)
+	}
+	return nil
+}
+
+func (s *Store) ReviseAttachedWorker(instanceID, endpoint, releaseID string) *exit.Error {
+	result, err := s.db.Exec(`UPDATE worker_processes SET endpoint=?,release_id=?
+		WHERE instance_id=? AND worker_id='remote' AND state!='closed'`,
+		endpoint, releaseID, instanceID)
+	if err != nil {
+		return exit.Internalf("cannot revise attached worker %s: %s", instanceID, err)
+	}
+	changed, err := result.RowsAffected()
+	if err != nil || changed != 1 {
+		return exit.Named(exit.Conflict, "rental.worker_not_live",
+			"attached worker %s is no longer one live remote worker", instanceID)
 	}
 	return nil
 }

@@ -246,6 +246,7 @@ none of these.
 | `GET /v1/local/workers` | local | yes | live workers: protocol identities, devices, worker phase, the placement's two axes, the admission fence |
 | `POST /v1/local/workers` | local | yes | ensure one local endpoint resident or claim one exact rental without invoking a model; exactly one of `endpoint` or `rental` |
 | `DELETE /v1/local/workers/{instance_id}` | local | yes | drain and stop the process group |
+| `POST /v1/local/rentals/{rental_id}/placement-revisions` | local | yes | `Idempotency-Key`; author one Tensorhub revision and relay grant-before-set on the same claimed worker |
 | `GET /v1/local/doctor` | local | yes | host facts, bound families, counts |
 | `POST /v1/local/service/shutdown` | local | yes | ask the service to drain every worker and exit (`cozy down`'s cooperative tier); exit is proved by the service lock, never this reply |
 | `GET /v1/local/attempts/{attempt_key}/triage` | local | yes | the retained WorkerTriageBundle |

@@ -102,7 +102,7 @@ they land on the VM-class sandbox posture (tensorhub-build.md §1.1) or they do 
 the **LocalOrchestrator** (`internal/orchestrator`): local placement, dispatch, and the
 device ledger. The same service is the worker protocol's **record owner**: it DIALS each
 worker's own socket (#436), owns durable attempt ordinals and terminal acceptance, and
-publishes accepted outputs. The wire is `cozy.worker.v1` at **schema rev 6** — rev-2's
+publishes accepted outputs. The wire is `cozy.worker.v1` at **schema rev 7** — rev-2's
 dynamic-serving shape with the actor-vocabulary hardcut.
 
 - **Identity is canonical bytes.** `internal/canonical` is the document plane: the writer
@@ -113,7 +113,7 @@ dynamic-serving shape with the actor-vocabulary hardcut.
 - **The schema fences itself** (#530-A1). `wire_schema_digest` rides `Claim`/`ClaimAck`,
   is checked BEFORE any other body field, and refuses the handshake on a mismatch or an
   absence — absence being precisely the pre-rev-2 signal, since an older binding cannot
-  spell the field. `WIRE_MINOR` is 1 and fences nothing: the minor is the additive
+  spell the field. `WIRE_MINOR` is 2 and fences nothing: the minor is the additive
   train and cannot honestly move for a breaking in-place revision.
 - **Actor names match their current responsibilities.** Cause origin 4 is `WORKER`, the
   machine-local peer; origin 7 is `RECORD_OWNER`, the durable-attempt authority. Rev 3
@@ -126,6 +126,15 @@ dynamic-serving shape with the actor-vocabulary hardcut.
   ordinary grant subjects fetched by the worker; refreshing their expiring locations never
   changes the desired revision. The invocation media plane carries no endpoint distribution
   route. The worker recomputes every subject digest before using its bytes.
+- **A rental is a reusable pod, not an endpoint-shaped image.** `cozy rent revise` asks
+  Tensorhub to author one immutable active placement revision, then the existing
+  RecordOwner sends that revision's grant before its set on the already-claimed stream.
+  The worker instance and boot identity do not change; a different substrate family
+  refuses at Tensorhub before Creator can relay it.
+- **Acquisition is observable, not authoritative.** Schema rev 7 carries endpoint/model
+  monotonic intervals plus downloaded/reused byte counters. Creator persists those facts
+  by worker boot + placement spec and exposes them on the worker listing, but no timing or
+  counter participates in identity, convergence, readiness, or admission.
 - **Two axes, one admission fence.** A placement's convergence is
   materialization × serving; DISPATCHABLE gates dispatch. Capacity is a WORKER property —
   `admission_state` + `admission_generation` + `available_attempt_slots` — and every offer

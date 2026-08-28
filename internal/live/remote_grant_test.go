@@ -44,7 +44,7 @@ func TestRemotePlacementReceivesGrantBeforeDesired(t *testing.T) {
 	t.Cleanup(func() { _ = plane.Close() })
 
 	peer := &grantPeer{frames: make(chan string, 8)}
-	controlAddr, stopControl := serveGrantPeer(t, certPath, keyPath, peer)
+	controlAddr, stopControl := serveWorkerPeer(t, certPath, keyPath, peer)
 	defer stopControl()
 
 	planData, modelData := []byte("exact-plan"), []byte("exact-model-object-set")
@@ -199,7 +199,8 @@ func (p *grantPeer) Control(stream pb.WorkerControl_ControlServer) error {
 	}
 }
 
-func serveGrantPeer(t *testing.T, certPath, keyPath string, peer *grantPeer) (string, func()) {
+func serveWorkerPeer(t *testing.T, certPath, keyPath string,
+	peer pb.WorkerControlServer) (string, func()) {
 	t.Helper()
 	certificate, err := tls.LoadX509KeyPair(certPath, keyPath)
 	must(t, err)

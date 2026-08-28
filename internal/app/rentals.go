@@ -354,6 +354,9 @@ func missingOf(r hub.Rental) string {
 	if r.ControlSnapshot == nil {
 		return "attempt-bound control snapshot"
 	}
+	if r.PlacementRevision == 0 {
+		return "active placement revision"
+	}
 	return "complete ready projection"
 }
 
@@ -363,6 +366,10 @@ func captureRentalControl(row *records.Rental, seen hub.Rental) {
 	}
 	row.ControlSnapshotDigest = seen.ControlSnapshot.Digest
 	row.ControlSnapshotBytes = append([]byte(nil), seen.ControlSnapshot.CanonicalBytes...)
+	row.PlacementRevision = seen.PlacementRevision
+	if seen.EndpointRef != "" {
+		row.EndpointRef = seen.EndpointRef
+	}
 }
 
 func handleRentLs(ctx *Context) *exit.Error {
@@ -421,9 +428,13 @@ func handleRentShow(ctx *Context) *exit.Error {
 	return emit(ctx, render.Record{Kind: "rental_control", Fields: []render.Field{
 		{K: "rental", V: row.ID}, {K: "state", V: row.State},
 		{K: "endpoint", V: row.EndpointRef}, {K: "accelerator", V: row.AcceleratorModel},
+		{K: "placement_revision", V: control.PlacementRevision},
 		{K: "observed_accelerator", V: row.ObservedAccelerator},
 		{K: "observed_accelerator_count", V: row.ObservedAcceleratorCount},
 		{K: "observed_backend", V: row.ObservedBackend},
+		{K: "observed_driver_version", V: row.ObservedDriverVersion},
+		{K: "observed_backend_version", V: row.ObservedBackendVersion},
+		{K: "observed_device_memory_total_bytes", V: row.ObservedDeviceMemoryTotalBytes},
 		{K: "observed_worker_instance", V: row.ObservedWorkerInstance},
 		{K: "observed_worker_boot_id", V: row.ObservedWorkerBootID},
 		{K: "observed_at", V: row.ObservedAt},
@@ -467,13 +478,43 @@ func handleRentProbe(ctx *Context) *exit.Error {
 	return emit(ctx, render.Record{Kind: "rental_probe", Fields: []render.Field{
 		{K: "rental", V: id}, {K: "state", V: row.State},
 		{K: "endpoint", V: row.EndpointRef}, {K: "accelerator", V: row.AcceleratorModel},
+		{K: "placement_revision", V: control.PlacementRevision},
 		{K: "observed_accelerator", V: row.ObservedAccelerator},
 		{K: "observed_accelerator_count", V: row.ObservedAcceleratorCount},
 		{K: "observed_backend", V: row.ObservedBackend},
+		{K: "observed_driver_version", V: row.ObservedDriverVersion},
+		{K: "observed_backend_version", V: row.ObservedBackendVersion},
+		{K: "observed_device_memory_total_bytes", V: row.ObservedDeviceMemoryTotalBytes},
 		{K: "observed_worker_instance", V: row.ObservedWorkerInstance},
 		{K: "observed_worker_boot_id", V: row.ObservedWorkerBootID},
 		{K: "endpoint_execution_digest", V: control.EndpointExecutionDigest},
 	}, Notes: []string{"no model was invoked; this is the worker ClaimAck readback"}})
+}
+
+func handleRentRevise(ctx *Context) *exit.Error {
+	id := strings.TrimSpace(ctx.Inv.Args[0])
+	endpointRef := strings.TrimSpace(ctx.Inv.Value("--endpoint-ref"))
+	key := strings.TrimSpace(ctx.Inv.Value("--idempotency-key"))
+	reason := strings.TrimSpace(ctx.Inv.Value("--reason"))
+	if endpointRef == "" || key == "" || reason == "" {
+		return exit.Usagef("`cozy rent revise` requires --endpoint-ref, --idempotency-key, and --reason").
+			WithNext("cozy rent revise " + id + " --endpoint-ref <org/endpoint/vN/function> --idempotency-key <key> --reason <why>")
+	}
+	client, problem := dial(ctx)
+	if problem != nil {
+		return problem
+	}
+	revision, problem := client.ReviseRental(id, endpointRef, key, reason)
+	if problem != nil {
+		return problem
+	}
+	return emit(ctx, render.Record{Kind: "rental_revision", Fields: []render.Field{
+		{K: "rental", V: revision.RentalID}, {K: "placement_revision", V: revision.PlacementRevision},
+		{K: "instance", V: revision.InstanceID}, {K: "worker_boot_id", V: revision.WorkerBootID},
+		{K: "endpoint", V: revision.Endpoint},
+		{K: "desired_state_revision", V: revision.DesiredStateRevision},
+		{K: "artifact_grant_revision", V: revision.ArtifactGrantRevision},
+	}, Notes: []string{"same claimed worker; ArtifactGrantUpdate was queued before DesiredPlacementSet"}})
 }
 
 // handleRentRelease is idempotent and ends only on provider ABSENCE: the hub reporting the

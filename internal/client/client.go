@@ -22,6 +22,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"strings"
 
 	"github.com/cozy-creator/cozy-creator/internal/api"
@@ -221,25 +222,34 @@ func (c *Client) Endpoints() ([]api.EndpointRow, *exit.Error) {
 // Worker is one live worker, as the orchestrator reports it. The fields are
 // `orchestrator.WorkerFacts` on the wire; a client reads the ones it renders.
 type Worker struct {
-	InstanceID string   `json:"instance_id"`
-	Endpoint   string   `json:"endpoint"`
-	ReleaseID  string   `json:"release_id"`
-	SessionID  string   `json:"session_id"`
-	PID        int      `json:"pid"`
-	Exited     bool     `json:"exited"`
-	Devices    []string `json:"devices"`
+	InstanceID                 string   `json:"instance_id"`
+	RentalID                   string   `json:"rental_id"`
+	Endpoint                   string   `json:"endpoint"`
+	ReleaseID                  string   `json:"release_id"`
+	PlacementSpecDigest        string   `json:"placement_spec_digest"`
+	RetainedFallbackSpecDigest string   `json:"retained_fallback_spec_digest"`
+	BootID                     string   `json:"worker_boot_id"`
+	PID                        int      `json:"pid"`
+	Exited                     bool     `json:"exited"`
+	Devices                    []string `json:"devices"`
 	// THE TWO AXES, and the machine phase they were pulled out of (#473/#482).
 	// `intake_state` is retired with both of its uses: one enum could not say "staged on
 	// disk but offline", which is the exact state an outgoing spec holds under
 	// fallback-retention.
-	Phase                string   `json:"worker_phase"`
-	Materialization      string   `json:"materialization"`
-	Serving              string   `json:"serving"`
-	Plans                []string `json:"dispatchable_plan_ids"`
-	GrantID              string   `json:"artifact_grant_id"`
-	GrantRevision        uint64   `json:"artifact_grant_revision"`
-	AppliedGrantID       string   `json:"applied_artifact_grant_id"`
-	AppliedGrantRevision uint64   `json:"applied_grant_revision"`
+	Phase                      string                    `json:"worker_phase"`
+	Materialization            string                    `json:"materialization"`
+	Serving                    string                    `json:"serving"`
+	Plans                      []string                  `json:"dispatchable_plan_ids"`
+	GrantID                    string                    `json:"artifact_grant_id"`
+	GrantRevision              uint64                    `json:"artifact_grant_revision"`
+	AppliedGrantID             string                    `json:"applied_artifact_grant_id"`
+	AppliedGrantRevision       uint64                    `json:"applied_grant_revision"`
+	DesiredRevision            uint64                    `json:"desired_state_revision"`
+	AcceptedRevision           uint64                    `json:"accepted_desired_state_revision"`
+	ConvergedRevision          uint64                    `json:"converged_revision"`
+	AcceptedPlacementSetDigest string                    `json:"accepted_placement_set_digest"`
+	GrantSubjects              []ArtifactSubjectFacts    `json:"artifact_grant_subjects"`
+	Acquisition                PlacementAcquisitionFacts `json:"acquisition"`
 	// QuietMS measures missed protocol reports. ErrorForMS is diagnostic only; typed
 	// faults/refusals settle immediately and no elapsed duration decides readiness.
 	QuietMS    int64  `json:"quiet_ms"`
@@ -248,6 +258,25 @@ type Worker struct {
 	// Refusal is the HOST's own verdict about this worker, distinct from the worker's own
 	// fault: a fault may clear, a refusal is settled.
 	Refusal string `json:"refusal"`
+}
+
+type AcquisitionLegFacts struct {
+	StartedNS       uint64 `json:"started_monotonic_ns"`
+	EndedNS         uint64 `json:"ended_monotonic_ns"`
+	DownloadedBytes uint64 `json:"downloaded_bytes"`
+	ReusedBytes     uint64 `json:"reused_bytes"`
+}
+
+type PlacementAcquisitionFacts struct {
+	Endpoint AcquisitionLegFacts `json:"endpoint"`
+	Model    AcquisitionLegFacts `json:"model"`
+}
+
+type ArtifactSubjectFacts struct {
+	Digest    string `json:"digest"`
+	SubjectID string `json:"subject_id"`
+	Kind      string `json:"kind"`
+	Length    uint64 `json:"length"`
 }
 
 // Dispatchable answers whether this worker can take an attempt — the protocol's own fact,
@@ -263,6 +292,26 @@ func (c *Client) Workers() ([]Worker, *exit.Error) {
 	}
 	e := c.call("GET", "/v1/local/workers", nil, &out)
 	return out.Workers, e
+}
+
+type RentalRevision struct {
+	RentalID              string `json:"rental_id"`
+	PlacementRevision     uint64 `json:"placement_revision"`
+	InstanceID            string `json:"instance_id"`
+	WorkerBootID          string `json:"worker_boot_id"`
+	Endpoint              string `json:"endpoint"`
+	DesiredStateRevision  uint64 `json:"desired_state_revision"`
+	ArtifactGrantRevision uint64 `json:"artifact_grant_revision"`
+}
+
+func (c *Client) ReviseRental(id, endpointRef, idempotencyKey,
+	reason string) (RentalRevision, *exit.Error) {
+	var out RentalRevision
+	e := c.call(http.MethodPost,
+		"/v1/local/rentals/"+url.PathEscape(id)+"/placement-revisions",
+		map[string]string{"endpoint_ref": endpointRef, "idempotency_key": idempotencyKey, "reason": reason},
+		&out, "Idempotency-Key", idempotencyKey)
+	return out, e
 }
 
 // StartResult is the prewarm answer. `Change` says WHICH of the three things happened —

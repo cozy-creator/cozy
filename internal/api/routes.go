@@ -92,6 +92,9 @@ var Routes = []Route{
 	{"DELETE", "/v1/local/workers/{instance_id}", Local, true, true, false, "",
 		"drain and stop one worker's whole process group",
 		"cl-010 `cozy stop`"},
+	{"POST", "/v1/local/rentals/{rental_id}/placement-revisions", Local, true, true, false, "Idempotency-Key",
+		"author one Tensorhub placement revision and relay grant-before-set on the claimed worker",
+		"`cozy rent revise`"},
 	{"GET", "/v1/local/doctor", Local, true, false, false, "",
 		"host facts and the service's own state",
 		"cl-010 `cozy doctor`"},
@@ -152,22 +155,23 @@ var Routes = []Route{
 // Tokens are the capability tokens this API advertises. Presence is a token; a client
 // never infers a feature from a version string (cl-002's discipline, same registry).
 var Tokens = []string{
-	"api.contract.core.v1", // the shared client-contract core, this host
-	"api.requests.submit",  // idempotency key + body digest
-	"api.requests.cancel",  // explicit, digest-fenced cancellation
-	"api.events.sse",       // durable lifecycle + cursor resume + terminal-stop
-	"api.events.multiplex", // one connection for every request
-	"api.media.opaque",     // media by opaque id; no path shape exists
-	"api.errors.envelope",  // one typed {error:{code,message,remedy,request_id}}
-	"api.auth.bearer",      // bearer only; no cookie is read anywhere
-	"api.bind.loopback",    // loopback-only bind, IPv4 and IPv6
-	"api.local.extension",  // the LOCAL module, explicitly not the core
-	"api.local.triage",     // retained bundles by opaque attempt key
-	"api.local.jobs",       // the bounded job family: submit/list/status/cancel
-	"api.jobs.publication", // a job's landed writes are a durable publication root
-	"api.local.workflows",  // ordered ordinary children, Creator-owned recovery/cancellation
-	"api.local.video",      // strict source composition into the workflow form
-	"api.stub.embedded",    // the go:embed stub page
+	"api.contract.core.v1",       // the shared client-contract core, this host
+	"api.requests.submit",        // idempotency key + body digest
+	"api.requests.cancel",        // explicit, digest-fenced cancellation
+	"api.events.sse",             // durable lifecycle + cursor resume + terminal-stop
+	"api.events.multiplex",       // one connection for every request
+	"api.media.opaque",           // media by opaque id; no path shape exists
+	"api.errors.envelope",        // one typed {error:{code,message,remedy,request_id}}
+	"api.auth.bearer",            // bearer only; no cookie is read anywhere
+	"api.bind.loopback",          // loopback-only bind, IPv4 and IPv6
+	"api.local.extension",        // the LOCAL module, explicitly not the core
+	"api.local.triage",           // retained bundles by opaque attempt key
+	"api.local.jobs",             // the bounded job family: submit/list/status/cancel
+	"api.jobs.publication",       // a job's landed writes are a durable publication root
+	"api.local.workflows",        // ordered ordinary children, Creator-owned recovery/cancellation
+	"api.local.video",            // strict source composition into the workflow form
+	"api.local.rental-revisions", // same-pod dynamic endpoint convergence
+	"api.stub.embedded",          // the go:embed stub page
 }
 
 // ContractVersion is the shared client contract's core version this host serves. It

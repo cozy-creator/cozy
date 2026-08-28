@@ -156,7 +156,11 @@ func handleDoctor(ctx *Context) *exit.Error {
 		live = append(live, fmt.Sprintf("%s %s pid=%d %s plans=%d",
 			w.Endpoint, w.InstanceID, w.PID, w.Serving, len(w.Plans)))
 	}
-	fields = append(fields, render.Field{K: "workers", V: live})
+	if ctx.Mode().JSON {
+		fields = append(fields, render.Field{K: "workers", V: workers})
+	} else {
+		fields = append(fields, render.Field{K: "workers", V: live})
+	}
 
 	// The DEVICE facts are the runtime's, read from a pinned generation's own venv. An
 	// empty host is not an error: with nothing installed there is no runtime to ask, and

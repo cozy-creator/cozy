@@ -114,6 +114,7 @@ func handleUp(ctx *Context) *exit.Error {
 		Cfg: ctx.Cfg, Layout: l, Store: st, Yield: yield, Log: ctx.Out,
 		Endpoints: resolver, Rentals: rentals, ObserveRental: rental.ObserveWorker(st),
 		ArtifactGrants:        rental.ArtifactGrants(st, client(ctx)),
+		PlacementRevisions:    rental.PlacementRevisions(st, client(ctx)),
 		EnvironmentSpecDigest: environmentSpec, ConfigDigest: configDigest,
 	})
 	if e != nil {

@@ -1,16 +1,16 @@
 # protocol — copied `cozy.worker.v1` bindings
 
 COPIED, never imported as a module (boundaries.md): these four files are byte-identical
-to `worker-protocol@315fdde7` `gen/go/cozy/worker/v1/` — schema rev 6. Rev 6 hard-cuts
-`PlacementSet/1` to `/2`: every placement now names the exact model-object-set subject whose
-bytes its standing artifact grant may reach. cozy-creator DIALS this contract as the record
+to `worker-protocol@2e412411` `gen/go/cozy/worker/v1/` — schema rev 7. Rev 7 adds
+observation-only endpoint/model acquisition intervals and byte counters to PlacementStatus,
+and hard-cuts WorkerSnapshotBody to `/2`. cozy-creator DIALS this contract as the record
 owner; the schema is th-024/th-049's and is never edited here.
 
 Refresh = re-copy from the worker-protocol repo. Editing a file in this directory is the
 one thing that turns a shared contract into two — and `ci.yaml`'s `vendored-protocol` job
 is what makes that unstateable in silence: worker-protocol regenerates from its own
 `.proto` with its own pinned protoc and byte-compares against exactly these files.
-`SHA256SUMS` always proves the checked-in set is the reviewed `315fdde7` set; the live
+`SHA256SUMS` always proves the checked-in set is the reviewed `2e412411` set; the live
 master comparison additionally arms when CI has a repository-scoped
 `WORKER_PROTOCOL_TOKEN`. GitHub's ordinary per-repo token cannot read a private sibling,
 so absence of that explicit token is a named unarmed drift check, not a fake code failure.
@@ -23,7 +23,8 @@ schema it names. It rides `Claim.wire_schema_digest` and is checked before any o
 field. The retired `wire_minor.go` is deleted: a constant still claiming currency beside a
 fresh binding is the whole of #530-A1.
 
-Schema rev 6 makes the model-object-set subject part of immutable desired state while its
+Schema rev 7 makes acquisition overlap and reuse observable without moving identity,
+readiness, convergence, or admission. Schema rev 6 makes the model-object-set subject part of immutable desired state while its
 expiring locations remain on the independently refreshable grant lane. Schema rev 5 moves wire
 minor to 1 for the paired finalize frame slots and changes the canonical
 outcome document to `AttemptOutcomeBody/3`; the schema digest remains the live-session shape

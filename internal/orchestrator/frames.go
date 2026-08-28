@@ -200,6 +200,7 @@ func modelObjectSetSubject(p DesiredPlacement) *pb.ArtifactSubject {
 func (c *Orchestrator) onObserved(s *session, r *pb.ObservedWorkerState) {
 	defer c.wakeWorkflows()
 	var status *pb.PlacementStatus
+	var acquisition *records.PlacementAcquisition
 	c.mu.Lock()
 	w := c.workers[s.instanceID]
 	if w != nil && w.bootID != s.bootID {
@@ -246,6 +247,11 @@ func (c *Orchestrator) onObserved(s *session, r *pb.ObservedWorkerState) {
 				w.materialization, w.serving = status.Materialization, status.Serving
 				w.generation = status.ExecutorGeneration
 				w.specDigest, w.fallbackPin = status.PlacementSpecDigest, status.RetainedFallbackSpecDigest
+				observed, facts := placementAcquisitionOf(w.instanceID, s.bootID, status)
+				w.acquisition = facts
+				if observed != nil {
+					acquisition = observed
+				}
 				for _, id := range status.DispatchablePlanIds {
 					dispatchable[id] = true
 				}
@@ -308,6 +314,11 @@ func (c *Orchestrator) onObserved(s *session, r *pb.ObservedWorkerState) {
 	}
 	c.mu.Unlock()
 	_ = c.opt.Store.ReportWorker(s.bootID, phase, accepted, int64(r.ConvergedRevision), generation)
+	if acquisition != nil {
+		if problem := c.opt.Store.ObservePlacementAcquisition(*acquisition); problem != nil {
+			c.logf("placement acquisition observation REFUSED: %s", problem.Message)
+		}
+	}
 	if w != nil && w.media != nil {
 		go c.retryMediaCleanup(w)
 	}
@@ -352,6 +363,38 @@ func (c *Orchestrator) onObserved(s *session, r *pb.ObservedWorkerState) {
 		phase, r.AcceptedDesiredStateRevision, r.ConvergedRevision)
 }
 
+func placementAcquisitionOf(instanceID, bootID string,
+	status *pb.PlacementStatus) (*records.PlacementAcquisition, PlacementAcquisitionFacts) {
+	var facts PlacementAcquisitionFacts
+	if status == nil || status.Acquisition == nil {
+		return nil, facts
+	}
+	specDigest, err := canonical.Spell(status.PlacementSpecDigest)
+	if err != nil {
+		return nil, facts
+	}
+	leg := func(in *pb.AcquisitionLegObservation) (records.AcquisitionLeg, AcquisitionLegFacts) {
+		if in == nil {
+			return records.AcquisitionLeg{}, AcquisitionLegFacts{}
+		}
+		stored := records.AcquisitionLeg{
+			StartedNS: in.StartedMonotonicNs, EndedNS: in.EndedMonotonicNs,
+			DownloadedBytes: in.DownloadedBytes, ReusedBytes: in.ReusedBytes,
+		}
+		return stored, AcquisitionLegFacts{
+			StartedNS: stored.StartedNS, EndedNS: stored.EndedNS,
+			DownloadedBytes: stored.DownloadedBytes, ReusedBytes: stored.ReusedBytes,
+		}
+	}
+	endpoint, endpointFacts := leg(status.Acquisition.Endpoint)
+	model, modelFacts := leg(status.Acquisition.Model)
+	facts.Endpoint, facts.Model = endpointFacts, modelFacts
+	return &records.PlacementAcquisition{
+		InstanceID: instanceID, WorkerBootID: bootID, PlacementID: status.PlacementId,
+		PlacementSpecDigest: specDigest, Endpoint: endpoint, Model: model,
+	}, facts
+}
+
 // progressSignature renders every axis one ObservedWorkerState reports into one
 // comparable string, so "no axis moved since the last report" is a comparison of two
 // worker reports and nothing else (cl-025). The activity lane's high-water sequence is
@@ -377,6 +420,18 @@ func progressSignature(r *pb.ObservedWorkerState, status *pb.PlacementStatus) st
 			status.Materialization, status.Serving, status.ExecutorGeneration,
 			strings.Join(status.DispatchablePlanIds, ","),
 			strings.Join(status.MaterializablePlanIds, ","), status.PlacementSpecDigest)
+		if acquisition := status.GetAcquisition(); acquisition != nil {
+			for _, observed := range []struct {
+				name string
+				leg  *pb.AcquisitionLegObservation
+			}{{"endpoint", acquisition.Endpoint}, {"model", acquisition.Model}} {
+				name, leg := observed.name, observed.leg
+				if leg != nil {
+					sig += fmt.Sprintf(" %s=%d/%d/%d/%d", name, leg.StartedMonotonicNs,
+						leg.EndedMonotonicNs, leg.DownloadedBytes, leg.ReusedBytes)
+				}
+			}
+		}
 	}
 	return sig
 }

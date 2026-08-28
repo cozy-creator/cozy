@@ -510,6 +510,21 @@ var Commands = []Command{
 		Examples: []string{"cozy rent probe <rental-id>"},
 	},
 	{
+		Path: []string{"rent", "revise"}, Group: "rentals",
+		Summary: "converge one new endpoint revision on the same claimed rental",
+		Args:    "<rental-id>", MinArgs: 1, MaxArgs: 1,
+		Flags: []Flag{
+			{Name: "--endpoint-ref", Arg: "<org/endpoint/vN/function>", Summary: "required new exact endpoint ref"},
+			{Name: "--idempotency-key", Arg: "<key>", Summary: "required durable revision identity"},
+			{Name: "--reason", Arg: "<why>", Summary: "required operator audit reason"},
+		},
+		Exits: []exit.Code{exit.OK, exit.Usage, exit.Validation, exit.NotFound, exit.Credential,
+			exit.Unavailable, exit.Deadline, exit.Conflict},
+		Capability: "cmd.rent.revise", NeedsServer: true, Status: Implemented, Handler: "rent.revise",
+		Next:     []string{"cozy rent show <rental-id>", "cozy status"},
+		Examples: []string{"cozy rent revise <rental-id> --endpoint-ref org/endpoint/v2/generate --idempotency-key <key> --reason <why>"},
+	},
+	{
 		Path: []string{"rent", "release"}, Group: "rentals",
 		Summary: "without --yes what releasing costs (a read); with --yes the pod is destroyed",
 		Args:    "<rental-id>", MinArgs: 1, MaxArgs: 1,
