@@ -281,6 +281,11 @@ MEDIA_CONTRACT_FIELDS = ["contract_rev"]
 # ordinary buffer size everywhere else in this tree.
 MEDIA_CEILING_LITERAL = re.compile(r"64\s*<<\s*10")
 
+# Endpoint distribution is the standing ArtifactGrant lane. The invocation media plane
+# may never grow back the retired owner-push special case for binding plans.
+MEDIA_DISTRIBUTION_DIRS = ("internal/media/", "internal/podmedia/")
+DENY_MEDIA_DISTRIBUTION = ("PutPlan", "/v1/plans/")
+
 # The supervisor holds the receipt key and the renter token hashes and has nowhere to send
 # them. Keep fencing the header anyway: the day it presents a credential is the day a pod
 # supervisor becomes a capability an attacker can aim, and this rule is what makes that
@@ -573,6 +578,13 @@ def check_sources():
                 bad.append(f"{p}:{i}: [api] an Access-Control-Allow-* header in {where} — a CORS "
                            f"header on a loopback, bearer-authenticated bind is what lets any page "
                            f"the browser loads read 127.0.0.1 (#628): {s}")
+            rel = p.as_posix()
+            if rel.startswith(MEDIA_DISTRIBUTION_DIRS):
+                for retired in DENY_MEDIA_DISTRIBUTION:
+                    if retired in s:
+                        bad.append(f"{p}:{i}: [media] retired endpoint-distribution surface "
+                                   f"'{retired}' — plans are ordinary ArtifactGrant subjects, "
+                                   f"and this plane carries invocation inputs/outputs only: {s}")
         if p.suffix != ".go":
             continue
         for i, line in enumerate(strip_go(raw).splitlines(), 1):

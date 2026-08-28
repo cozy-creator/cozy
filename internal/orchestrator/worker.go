@@ -47,16 +47,16 @@ type Binding struct {
 	Outputs []string `json:"outputs,omitempty"`
 }
 
-// BindingPlanSubject is the wire identity of one canonical plan document. A
-// local Runtime-owned plan carries no bytes because serve --weightless-endpoint
-// stages them privately. A remote plan carries Tensorhub's exact canonical bytes
-// so Creator can relay rather than reconstruct them.
+// BindingPlanSubject is the wire identity of one canonical plan document.
+// Runtime-owned and remote plans both carry identity only. Local Runtime stages its
+// private plan; a rented worker obtains the exact bytes as an ordinary ArtifactGrant
+// subject. Creator validates remote plan bytes in the control snapshot but never relays
+// them through an alternate byte path.
 type BindingPlanSubject struct {
-	SubjectID      string `json:"subject_id"`
-	Kind           string `json:"kind"`
-	Digest         string `json:"digest"`
-	Length         uint64 `json:"length"`
-	CanonicalBytes []byte `json:"canonical_bytes,omitempty"`
+	SubjectID string `json:"subject_id"`
+	Kind      string `json:"kind"`
+	Digest    string `json:"digest"`
+	Length    uint64 `json:"length"`
 }
 
 // PlanID is the binding's identity. Runtime-owned plans carry it exactly; an older modeled
@@ -64,7 +64,7 @@ type BindingPlanSubject struct {
 func (b *Binding) PlanID() (string, *exit.Error) {
 	if b.RuntimePlan != nil {
 		if _, err := canonical.Raw(b.RuntimePlan.SubjectID); err != nil {
-			return "", exit.Internalf("runtime reported a malformed binding-plan subject id: %s", err)
+			return "", exit.Internalf("binding-plan subject id is malformed: %s", err)
 		}
 		return b.RuntimePlan.SubjectID, nil
 	}
@@ -79,26 +79,12 @@ func (b *Binding) PlanID() (string, *exit.Error) {
 	return id, nil
 }
 
-// Staged is the record exactly as it lands on the worker's disk — identity, resolution
-// and the id — and is what the remote delivery path ships to a pod's media server.
+// Staged renders an older local modeled record exactly as it lands on a spawned worker's
+// disk. Runtime-owned and remote grant subjects deliberately have no bytes on this path.
 func (b *Binding) Staged() (string, []byte, *exit.Error) {
 	if b.RuntimePlan != nil {
-		if len(b.RuntimePlan.CanonicalBytes) > 0 {
-			id, e := b.PlanID()
-			if e != nil {
-				return "", nil, e
-			}
-			digest, err := canonical.Raw(b.RuntimePlan.Digest)
-			if err != nil || uint64(len(b.RuntimePlan.CanonicalBytes)) != b.RuntimePlan.Length ||
-				!bytes.Equal(canonical.Digest(b.RuntimePlan.CanonicalBytes), digest) {
-				return "", nil, exit.Named(exit.Conflict, "binding_plan_identity_mismatch",
-					"Tensorhub control bytes for plan %s do not match their digest and length", id)
-			}
-			return id, append([]byte(nil), b.RuntimePlan.CanonicalBytes...), nil
-		}
 		return "", nil, exit.Named(exit.Structural, "binding_plan_bytes_unavailable",
-			"binding plan %s is staged privately by the installed runtime", b.RuntimePlan.SubjectID).
-			WithRemedy("launch it locally with the runtime's explicit weightless-endpoint mode")
+			"binding plan %s is materialized by its runtime or standing artifact grant", b.RuntimePlan.SubjectID)
 	}
 	id, e := b.PlanID()
 	if e != nil {
@@ -111,22 +97,22 @@ func (b *Binding) Staged() (string, []byte, *exit.Error) {
 	return id, data, nil
 }
 
-// runtimeArtifactSubject returns the exact wire subject Runtime authored for a weightless
-// plan. Older modeled records obtain their subject from Staged's exact bytes instead.
-func (b *Binding) runtimeArtifactSubject() (*pb.ArtifactSubject, *exit.Error) {
+// artifactSubject returns the exact wire subject carried by Runtime or Tensorhub.
+// Older modeled local records obtain their subject from Staged's exact bytes instead.
+func (b *Binding) artifactSubject() (*pb.ArtifactSubject, *exit.Error) {
 	if b.RuntimePlan.Kind != "plan" {
-		return nil, exit.Internalf("runtime reported binding-plan kind %q, want plan", b.RuntimePlan.Kind)
+		return nil, exit.Internalf("binding-plan subject kind is %q, want plan", b.RuntimePlan.Kind)
 	}
 	digest, err := canonical.Raw(b.RuntimePlan.Digest)
 	if err != nil {
-		return nil, exit.Internalf("runtime reported a malformed binding-plan digest: %s", err)
+		return nil, exit.Internalf("binding-plan subject has a malformed digest: %s", err)
 	}
 	id, e := b.PlanID()
 	if e != nil {
 		return nil, e
 	}
 	if b.RuntimePlan.Length == 0 {
-		return nil, exit.Internalf("runtime reported a zero-length binding plan %s", id)
+		return nil, exit.Internalf("binding-plan subject %s has zero length", id)
 	}
 	return &pb.ArtifactSubject{
 		Digest: digest, SubjectId: id, Kind: b.RuntimePlan.Kind, Length: b.RuntimePlan.Length,
@@ -187,6 +173,8 @@ type DesiredPlacement struct {
 	ExactPlacementSetDigest           string `json:"exact_placement_set_digest,omitempty"`
 	ExactPlacementSetBytes            []byte `json:"exact_placement_set_bytes,omitempty"`
 	PlacementIDValue                  string `json:"placement_id,omitempty"`
+	ModelObjectSetDigest              string `json:"model_object_set_digest,omitempty"`
+	ModelObjectSetLength              uint64 `json:"model_object_set_length,omitempty"`
 	// Hidden names the entrypoints this placement deliberately does NOT serve (#572d).
 	// Recorded so an operator reading a placement can tell "no binding was staged" from
 	// "a binding was staged and broke".
@@ -276,8 +264,8 @@ func pinnedEndpoint(endpoint, rental string) string {
 func (p DesiredPlacement) IsJob() bool { return len(p.Jobs) > 0 }
 
 // RuntimeStagesBindings reports the one local launch mode in which the installed runtime
-// owns every canonical binding-plan byte. A partial set is never a launch mode: modeled
-// and remote placements keep their explicit artifact and plan delivery paths.
+// owns every canonical binding-plan byte. A partial set is never a launch mode: older
+// modeled local placements retain their explicit staging path.
 func (p DesiredPlacement) RuntimeStagesBindings() bool {
 	if len(p.Bindings) == 0 {
 		return false
@@ -425,9 +413,13 @@ type worker struct {
 	// revision is the desired-state revision THIS owner last issued, with the placement
 	// set it issued. The set travels as bytes, so the owner keeps the bytes it authored:
 	// a worker's accepted digest is compared against these, never re-canonicalized.
-	revision  uint64
-	setDigest []byte
-	setBytes  []byte
+	revision             uint64
+	grantRevision        uint64
+	grantID              string
+	appliedGrantRevision uint64
+	appliedGrantID       string
+	setDigest            []byte
+	setBytes             []byte
 	// The worker's last diagnostic fault and the first report that carried it. The FAILED
 	// axes, not this text, decide terminality: BINDING_DEGRADED may coexist with service.
 	fault      string
@@ -618,7 +610,7 @@ func (c *Orchestrator) spawnWorker(spec WorkerLaunchSpec) (string, *exit.Error) 
 		var subject *pb.ArtifactSubject
 		if b.RuntimePlan != nil {
 			var e *exit.Error
-			subject, e = b.runtimeArtifactSubject()
+			subject, e = b.artifactSubject()
 			if e != nil {
 				return "", e
 			}
@@ -858,15 +850,9 @@ func newWorker(instanceID string, spec WorkerLaunchSpec) *worker {
 // no spawn, no device grant (the pod's card is the pod's), no birth identity — the
 // conversation is the same claim the local path runs, dialed at the rental's address
 // with the pinned cert and the owner token as proof (#445).
-// It also DELIVERS Tensorhub's exact binding-plan bytes to the pod. Local
-// Runtime-owned weightless subjects intentionally carry no bytes and therefore
-// refuse this connected path; no local plan is rendered as a substitute. This delivery is the half that
-// was missing: a desired set names plan ids, and the worker resolves each one against a
-// record on ITS OWN disk (`<worker home>/binding-plans/<id>.json`). The older local modeled
-// path stages those records by writing files; the connected path had no channel at all, so a real pod
-// would have been directed to serve plans it had never been given (#506a/#506b). The
-// channel is the pod's media server, and the pod re-derives each id from the record's own
-// identity before it keeps the bytes — so delivery either agrees or refuses typed.
+// The media plane remains the invocation byte path, but it is NOT an endpoint distribution
+// path. Binding plans are ordinary artifact-grant subjects now: Tensorhub supplies their
+// locations and the worker verifies their digests while materializing PlacementSet/2.
 func (c *Orchestrator) connectWorker(spec WorkerLaunchSpec) (string, *exit.Error) {
 	instanceID := spec.InstanceID()
 	if spec.Connection.Media == nil {
@@ -892,18 +878,16 @@ func (c *Orchestrator) connectWorker(spec WorkerLaunchSpec) (string, *exit.Error
 	var planIDs []string
 	var subjects []*pb.ArtifactSubject
 	for _, b := range spec.Placement.Bindings {
-		id, data, e := b.Staged()
+		if b.RuntimePlan == nil {
+			return "", exit.Named(exit.Structural, "remote_binding_plan_subject_missing",
+				"remote binding %s carries no exact artifact subject", b.Entrypoint)
+		}
+		subject, e := b.artifactSubject()
 		if e != nil {
 			return "", e
 		}
-		path, e := byteplane.PutPlan(id, data)
-		if e != nil {
-			return "", e
-		}
-		c.logf("binding plan %s delivered to %s at %s (%d B)",
-			shortDigest(id), byteplane.Addr(), path, len(data))
-		planIDs = append(planIDs, id)
-		subjects = append(subjects, subjectOf(id, data))
+		planIDs = append(planIDs, subject.SubjectId)
+		subjects = append(subjects, subject)
 	}
 	sort.Strings(planIDs)
 	sortSubjects(subjects)
@@ -1130,9 +1114,13 @@ type WorkerFacts struct {
 
 	// ACCEPTANCE AND CONVERGENCE ARE TWO FACTS. converged < accepted is the normal,
 	// readable state of a convergence in progress or a latched failure, never an error.
-	DesiredRevision   uint64 `json:"desired_state_revision"`
-	AcceptedRevision  uint64 `json:"accepted_desired_state_revision"`
-	ConvergedRevision uint64 `json:"converged_revision"`
+	DesiredRevision      uint64 `json:"desired_state_revision"`
+	AcceptedRevision     uint64 `json:"accepted_desired_state_revision"`
+	ConvergedRevision    uint64 `json:"converged_revision"`
+	GrantID              string `json:"artifact_grant_id"`
+	GrantRevision        uint64 `json:"artifact_grant_revision"`
+	AppliedGrantID       string `json:"applied_artifact_grant_id"`
+	AppliedGrantRevision uint64 `json:"applied_grant_revision"`
 
 	// QuietMS makes missed protocol reports visible. ErrorForMS is diagnostic history
 	// only: a typed FAILED axis is acted on immediately, never after a timer.
@@ -1187,9 +1175,13 @@ func factsOf(w *worker) WorkerFacts {
 		AvailableSlots:      w.slots,
 		UnackedOutcomes:     w.unacked,
 
-		DesiredRevision:   w.revision,
-		AcceptedRevision:  w.acceptedRevision,
-		ConvergedRevision: w.convergedRevision,
+		DesiredRevision:      w.revision,
+		AcceptedRevision:     w.acceptedRevision,
+		ConvergedRevision:    w.convergedRevision,
+		GrantID:              w.grantID,
+		GrantRevision:        w.grantRevision,
+		AppliedGrantID:       w.appliedGrantID,
+		AppliedGrantRevision: w.appliedGrantRevision,
 
 		Fault: w.fault,
 	}

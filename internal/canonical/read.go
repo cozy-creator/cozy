@@ -113,6 +113,28 @@ func semantics(name string, d Doc) error {
 		return artifactFinalizeDecision(d)
 	case "cozy.worker.v1.ArtifactFinalizeResult":
 		return artifactFinalizeResult(d)
+	case "cozy.worker.v1.PlacementSpec":
+		return placementModelObjectSet(d)
+	}
+	return nil
+}
+
+func placementModelObjectSet(d Doc) error {
+	raw, ok := d["model_object_set"]
+	if !ok {
+		return refuse("model_object_set_missing", "PlacementSpec/2 requires model_object_set")
+	}
+	subject, ok := raw.(map[string]Value)
+	if !ok {
+		return refuse("model_object_set_shape", "model_object_set is not an ArtifactSubject")
+	}
+	digest, _ := subject["digest"].(string)
+	id, _ := subject["subject_id"].(string)
+	kind, _ := subject["kind"].(string)
+	length, _ := subject["length"].(int64)
+	if _, err := Raw(digest); err != nil || id != digest || kind != "model_object_set" || length <= 0 {
+		return refuse("model_object_set_shape",
+			"model_object_set requires kind=model_object_set, subject_id=digest, and non-zero length")
 	}
 	return nil
 }

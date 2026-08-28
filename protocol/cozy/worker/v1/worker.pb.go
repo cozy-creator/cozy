@@ -2516,7 +2516,7 @@ func (x *DesiredPlacementSet) GetPlacementSetCanonicalBytes() []byte {
 	return nil
 }
 
-// DOCUMENT SHAPE (not a wire message): canonical form `cozy.worker.v1.PlacementSet/1`.
+// DOCUMENT SHAPE (not a wire message): canonical form `cozy.worker.v1.PlacementSet/2`.
 // Placements sorted by placement_id. LAUNCH ENFORCES len(placements) <= 1 (header note); #475
 // adds that when the clamp lifts, multi-placement serving launches CO-FITTING ONLY.
 type PlacementSet struct {
@@ -2617,7 +2617,7 @@ func (x *Placement) GetSpec() *PlacementSpec {
 }
 
 // DOCUMENT SHAPE (also carried nested inside PlacementSet): canonical form
-// `cozy.worker.v1.PlacementSpec/1`. `placement_spec_digest = sha256(canonical bytes)` is the
+// `cozy.worker.v1.PlacementSpec/2`. `placement_spec_digest = sha256(canonical bytes)` is the
 // placement's IDENTITY.
 //
 // THE DESIRED SET NAMES BYTES, NEVER A POINTER (§1). The worker never resolves a mutable release
@@ -2637,8 +2637,14 @@ type PlacementSpec struct {
 	// serve.
 	DescriptorDigest []byte             `protobuf:"bytes,4,opt,name=descriptor_digest,json=descriptorDigest,proto3" json:"descriptor_digest,omitempty"` // class (a): the cr-003 descriptor
 	BindingPlans     []*ArtifactSubject `protobuf:"bytes,5,rep,name=binding_plans,json=bindingPlans,proto3" json:"binding_plans,omitempty"`             // sorted by digest. PLAN-ONLY PROFILE: every
-	unknownFields    protoimpl.UnknownFields
-	sizeCache        protoimpl.SizeCache
+	// subject carries kind == "plan" and subject_id equal to
+	// its own digest spelling — both production ends (the
+	// tensorhub author and the runtime launch consumer)
+	// enforce exactly this; bundle/wheel subjects ride the
+	// GRANT lane, never the desired set
+	ModelObjectSet *ArtifactSubject `protobuf:"bytes,6,opt,name=model_object_set,json=modelObjectSet,proto3" json:"model_object_set,omitempty"` // REQUIRED MODEL CLOSURE AUTHORITY. The subject carries
+	unknownFields  protoimpl.UnknownFields
+	sizeCache      protoimpl.SizeCache
 }
 
 func (x *PlacementSpec) Reset() {
@@ -2706,12 +2712,20 @@ func (x *PlacementSpec) GetBindingPlans() []*ArtifactSubject {
 	return nil
 }
 
+func (x *PlacementSpec) GetModelObjectSet() *ArtifactSubject {
+	if x != nil {
+		return x.ModelObjectSet
+	}
+	return nil
+}
+
 // UN-RESERVED by this rev (th-007's placeholder): the exact bytes a grant may authorize.
 type ArtifactSubject struct {
 	state     protoimpl.MessageState `protogen:"open.v1"`
 	Digest    []byte                 `protobuf:"bytes,1,opt,name=digest,proto3" json:"digest,omitempty"`                        // class (b): the exact bytes named
 	SubjectId string                 `protobuf:"bytes,2,opt,name=subject_id,json=subjectId,proto3" json:"subject_id,omitempty"` // stable name within the spec (e.g. plan id)
-	Kind      string                 `protobuf:"bytes,3,opt,name=kind,proto3" json:"kind,omitempty"`                            // bundle | wheel | wheelhouse | plan | descriptor
+	Kind      string                 `protobuf:"bytes,3,opt,name=kind,proto3" json:"kind,omitempty"`                            // bundle | wheel | wheelhouse | plan | descriptor |
+	// model_object_set
 	// (PlacementSpec.binding_plans admits ONLY "plan")
 	Length        uint64 `protobuf:"varint,4,opt,name=length,proto3" json:"length,omitempty"`
 	unknownFields protoimpl.UnknownFields
@@ -7598,13 +7612,14 @@ const file_cozy_worker_v1_worker_proto_rawDesc = "" +
 	"placements\"a\n" +
 	"\tPlacement\x12!\n" +
 	"\fplacement_id\x18\x01 \x01(\tR\vplacementId\x121\n" +
-	"\x04spec\x18\x02 \x01(\v2\x1d.cozy.worker.v1.PlacementSpecR\x04spec\"\xbb\x02\n" +
+	"\x04spec\x18\x02 \x01(\v2\x1d.cozy.worker.v1.PlacementSpecR\x04spec\"\x86\x03\n" +
 	"\rPlacementSpec\x12.\n" +
 	"\x13endpoint_release_id\x18\x01 \x01(\tR\x11endpointReleaseId\x126\n" +
 	"\x17environment_spec_digest\x18\x02 \x01(\fR\x15environmentSpecDigest\x12O\n" +
 	"$installed_environment_receipt_digest\x18\x03 \x01(\fR!installedEnvironmentReceiptDigest\x12+\n" +
 	"\x11descriptor_digest\x18\x04 \x01(\fR\x10descriptorDigest\x12D\n" +
-	"\rbinding_plans\x18\x05 \x03(\v2\x1f.cozy.worker.v1.ArtifactSubjectR\fbindingPlans\"t\n" +
+	"\rbinding_plans\x18\x05 \x03(\v2\x1f.cozy.worker.v1.ArtifactSubjectR\fbindingPlans\x12I\n" +
+	"\x10model_object_set\x18\x06 \x01(\v2\x1f.cozy.worker.v1.ArtifactSubjectR\x0emodelObjectSet\"t\n" +
 	"\x0fArtifactSubject\x12\x16\n" +
 	"\x06digest\x18\x01 \x01(\fR\x06digest\x12\x1d\n" +
 	"\n" +
@@ -8332,68 +8347,69 @@ var file_cozy_worker_v1_worker_proto_depIdxs = []int32{
 	29, // 29: cozy.worker.v1.PlacementSet.placements:type_name -> cozy.worker.v1.Placement
 	30, // 30: cozy.worker.v1.Placement.spec:type_name -> cozy.worker.v1.PlacementSpec
 	31, // 31: cozy.worker.v1.PlacementSpec.binding_plans:type_name -> cozy.worker.v1.ArtifactSubject
-	33, // 32: cozy.worker.v1.EndpointEnvironmentSpec.platform_target:type_name -> cozy.worker.v1.PlatformTarget
-	35, // 33: cozy.worker.v1.ArtifactGrantUpdate.grant:type_name -> cozy.worker.v1.ArtifactGrant
-	31, // 34: cozy.worker.v1.ArtifactGrant.subjects:type_name -> cozy.worker.v1.ArtifactSubject
-	73, // 35: cozy.worker.v1.ArtifactGrant.credential:type_name -> cozy.worker.v1.DeliveryAccessCredential
-	36, // 36: cozy.worker.v1.ArtifactGrant.locations:type_name -> cozy.worker.v1.ArtifactLocation
-	74, // 37: cozy.worker.v1.JobDirective.resource_caps:type_name -> cozy.worker.v1.ResourceCaps
-	75, // 38: cozy.worker.v1.JobDirective.publication_contract:type_name -> cozy.worker.v1.PublicationContract
-	78, // 39: cozy.worker.v1.ObservedWorkerState.held_attempts:type_name -> cozy.worker.v1.HeldAttempt
-	79, // 40: cozy.worker.v1.ObservedWorkerState.faults:type_name -> cozy.worker.v1.Fault
-	41, // 41: cozy.worker.v1.ObservedWorkerState.activity:type_name -> cozy.worker.v1.ActivityEvent
-	77, // 42: cozy.worker.v1.ObservedWorkerState.job_capacity:type_name -> cozy.worker.v1.JobCapacity
-	39, // 43: cozy.worker.v1.ObservedWorkerState.placements:type_name -> cozy.worker.v1.PlacementStatus
-	4,  // 44: cozy.worker.v1.ObservedWorkerState.admission_state:type_name -> cozy.worker.v1.AdmissionState
-	1,  // 45: cozy.worker.v1.ObservedWorkerState.worker_phase:type_name -> cozy.worker.v1.WorkerPhase
-	79, // 46: cozy.worker.v1.PlacementStatus.faults:type_name -> cozy.worker.v1.Fault
-	40, // 47: cozy.worker.v1.PlacementStatus.accelerator:type_name -> cozy.worker.v1.AcceleratorQualification
-	2,  // 48: cozy.worker.v1.PlacementStatus.materialization:type_name -> cozy.worker.v1.MaterializationState
-	3,  // 49: cozy.worker.v1.PlacementStatus.serving:type_name -> cozy.worker.v1.ServingState
-	70, // 50: cozy.worker.v1.AttemptOffer.grant:type_name -> cozy.worker.v1.DeliveryGrant
-	44, // 51: cozy.worker.v1.AttemptAccepted.plan:type_name -> cozy.worker.v1.AttemptPlanSummary
-	10, // 52: cozy.worker.v1.CancelAttempt.reason:type_name -> cozy.worker.v1.CancelReason
-	7,  // 53: cozy.worker.v1.AttemptOutcomeBody.status:type_name -> cozy.worker.v1.OutcomeStatus
-	80, // 54: cozy.worker.v1.AttemptOutcomeBody.output_manifest:type_name -> cozy.worker.v1.OutputManifest
-	82, // 55: cozy.worker.v1.AttemptOutcomeBody.metrics:type_name -> cozy.worker.v1.AttemptMetrics
-	83, // 56: cozy.worker.v1.AttemptOutcomeBody.triage_bundle:type_name -> cozy.worker.v1.TriageBundleRef
-	56, // 57: cozy.worker.v1.AttemptOutcomeBody.cause:type_name -> cozy.worker.v1.OutcomeCause
-	54, // 58: cozy.worker.v1.AttemptOutcomeBody.result:type_name -> cozy.worker.v1.ResultEnvelope
-	48, // 59: cozy.worker.v1.AttemptOutcomeBody.artifact_receipts:type_name -> cozy.worker.v1.ArtifactReceiptRef
-	16, // 60: cozy.worker.v1.ArtifactFinalizeDecision.disposition:type_name -> cozy.worker.v1.ArtifactFinalizeDisposition
-	17, // 61: cozy.worker.v1.ArtifactFinalizeResult.outcome:type_name -> cozy.worker.v1.ArtifactFinalizeOutcome
-	48, // 62: cozy.worker.v1.ArtifactFinalizeResult.artifact_receipt:type_name -> cozy.worker.v1.ArtifactReceiptRef
-	81, // 63: cozy.worker.v1.ResultEnvelope.result_blob:type_name -> cozy.worker.v1.OutputEntry
-	55, // 64: cozy.worker.v1.ResultEnvelope.adjustments:type_name -> cozy.worker.v1.AdjustmentRow
-	8,  // 65: cozy.worker.v1.OutcomeCause.code:type_name -> cozy.worker.v1.CauseCode
-	9,  // 66: cozy.worker.v1.OutcomeCause.origin:type_name -> cozy.worker.v1.CauseOrigin
-	57, // 67: cozy.worker.v1.OutcomeCause.shortfall:type_name -> cozy.worker.v1.ResourceShortfall
-	81, // 68: cozy.worker.v1.JobCheckpointRequest.artifact:type_name -> cozy.worker.v1.OutputEntry
-	14, // 69: cozy.worker.v1.JobCheckpointReceipt.outcome:type_name -> cozy.worker.v1.CheckpointOutcome
-	61, // 70: cozy.worker.v1.JobCheckpointReceipt.fault:type_name -> cozy.worker.v1.CheckpointFault
-	15, // 71: cozy.worker.v1.CheckpointFault.code:type_name -> cozy.worker.v1.CheckpointFaultCode
-	66, // 72: cozy.worker.v1.InvocationSpec.inputs:type_name -> cozy.worker.v1.InputBinding
-	67, // 73: cozy.worker.v1.InvocationSpec.outputs:type_name -> cozy.worker.v1.OutputBinding
-	68, // 74: cozy.worker.v1.InvocationSpec.serving:type_name -> cozy.worker.v1.ServingInvocationSpec
-	69, // 75: cozy.worker.v1.InvocationSpec.job:type_name -> cozy.worker.v1.JobInvocationSpec
-	75, // 76: cozy.worker.v1.JobInvocationSpec.publication_contract:type_name -> cozy.worker.v1.PublicationContract
-	73, // 77: cozy.worker.v1.DeliveryGrant.credential:type_name -> cozy.worker.v1.DeliveryAccessCredential
-	71, // 78: cozy.worker.v1.DeliveryGrant.inputs:type_name -> cozy.worker.v1.InputAccess
-	72, // 79: cozy.worker.v1.DeliveryGrant.outputs:type_name -> cozy.worker.v1.OutputAccess
-	67, // 80: cozy.worker.v1.PublicationContract.outputs:type_name -> cozy.worker.v1.OutputBinding
-	5,  // 81: cozy.worker.v1.HeldAttempt.kind:type_name -> cozy.worker.v1.AttemptKind
-	6,  // 82: cozy.worker.v1.HeldAttempt.state:type_name -> cozy.worker.v1.AttemptState
-	12, // 83: cozy.worker.v1.Fault.kind:type_name -> cozy.worker.v1.FaultKind
-	81, // 84: cozy.worker.v1.OutputManifest.outputs:type_name -> cozy.worker.v1.OutputEntry
-	18, // 85: cozy.worker.v1.WorkerControl.Control:input_type -> cozy.worker.v1.RecordOwnerFrame
-	63, // 86: cozy.worker.v1.WorkerControl.WatchProgress:input_type -> cozy.worker.v1.ProgressOpen
-	19, // 87: cozy.worker.v1.WorkerControl.Control:output_type -> cozy.worker.v1.WorkerFrame
-	64, // 88: cozy.worker.v1.WorkerControl.WatchProgress:output_type -> cozy.worker.v1.AttemptProgress
-	87, // [87:89] is the sub-list for method output_type
-	85, // [85:87] is the sub-list for method input_type
-	85, // [85:85] is the sub-list for extension type_name
-	85, // [85:85] is the sub-list for extension extendee
-	0,  // [0:85] is the sub-list for field type_name
+	31, // 32: cozy.worker.v1.PlacementSpec.model_object_set:type_name -> cozy.worker.v1.ArtifactSubject
+	33, // 33: cozy.worker.v1.EndpointEnvironmentSpec.platform_target:type_name -> cozy.worker.v1.PlatformTarget
+	35, // 34: cozy.worker.v1.ArtifactGrantUpdate.grant:type_name -> cozy.worker.v1.ArtifactGrant
+	31, // 35: cozy.worker.v1.ArtifactGrant.subjects:type_name -> cozy.worker.v1.ArtifactSubject
+	73, // 36: cozy.worker.v1.ArtifactGrant.credential:type_name -> cozy.worker.v1.DeliveryAccessCredential
+	36, // 37: cozy.worker.v1.ArtifactGrant.locations:type_name -> cozy.worker.v1.ArtifactLocation
+	74, // 38: cozy.worker.v1.JobDirective.resource_caps:type_name -> cozy.worker.v1.ResourceCaps
+	75, // 39: cozy.worker.v1.JobDirective.publication_contract:type_name -> cozy.worker.v1.PublicationContract
+	78, // 40: cozy.worker.v1.ObservedWorkerState.held_attempts:type_name -> cozy.worker.v1.HeldAttempt
+	79, // 41: cozy.worker.v1.ObservedWorkerState.faults:type_name -> cozy.worker.v1.Fault
+	41, // 42: cozy.worker.v1.ObservedWorkerState.activity:type_name -> cozy.worker.v1.ActivityEvent
+	77, // 43: cozy.worker.v1.ObservedWorkerState.job_capacity:type_name -> cozy.worker.v1.JobCapacity
+	39, // 44: cozy.worker.v1.ObservedWorkerState.placements:type_name -> cozy.worker.v1.PlacementStatus
+	4,  // 45: cozy.worker.v1.ObservedWorkerState.admission_state:type_name -> cozy.worker.v1.AdmissionState
+	1,  // 46: cozy.worker.v1.ObservedWorkerState.worker_phase:type_name -> cozy.worker.v1.WorkerPhase
+	79, // 47: cozy.worker.v1.PlacementStatus.faults:type_name -> cozy.worker.v1.Fault
+	40, // 48: cozy.worker.v1.PlacementStatus.accelerator:type_name -> cozy.worker.v1.AcceleratorQualification
+	2,  // 49: cozy.worker.v1.PlacementStatus.materialization:type_name -> cozy.worker.v1.MaterializationState
+	3,  // 50: cozy.worker.v1.PlacementStatus.serving:type_name -> cozy.worker.v1.ServingState
+	70, // 51: cozy.worker.v1.AttemptOffer.grant:type_name -> cozy.worker.v1.DeliveryGrant
+	44, // 52: cozy.worker.v1.AttemptAccepted.plan:type_name -> cozy.worker.v1.AttemptPlanSummary
+	10, // 53: cozy.worker.v1.CancelAttempt.reason:type_name -> cozy.worker.v1.CancelReason
+	7,  // 54: cozy.worker.v1.AttemptOutcomeBody.status:type_name -> cozy.worker.v1.OutcomeStatus
+	80, // 55: cozy.worker.v1.AttemptOutcomeBody.output_manifest:type_name -> cozy.worker.v1.OutputManifest
+	82, // 56: cozy.worker.v1.AttemptOutcomeBody.metrics:type_name -> cozy.worker.v1.AttemptMetrics
+	83, // 57: cozy.worker.v1.AttemptOutcomeBody.triage_bundle:type_name -> cozy.worker.v1.TriageBundleRef
+	56, // 58: cozy.worker.v1.AttemptOutcomeBody.cause:type_name -> cozy.worker.v1.OutcomeCause
+	54, // 59: cozy.worker.v1.AttemptOutcomeBody.result:type_name -> cozy.worker.v1.ResultEnvelope
+	48, // 60: cozy.worker.v1.AttemptOutcomeBody.artifact_receipts:type_name -> cozy.worker.v1.ArtifactReceiptRef
+	16, // 61: cozy.worker.v1.ArtifactFinalizeDecision.disposition:type_name -> cozy.worker.v1.ArtifactFinalizeDisposition
+	17, // 62: cozy.worker.v1.ArtifactFinalizeResult.outcome:type_name -> cozy.worker.v1.ArtifactFinalizeOutcome
+	48, // 63: cozy.worker.v1.ArtifactFinalizeResult.artifact_receipt:type_name -> cozy.worker.v1.ArtifactReceiptRef
+	81, // 64: cozy.worker.v1.ResultEnvelope.result_blob:type_name -> cozy.worker.v1.OutputEntry
+	55, // 65: cozy.worker.v1.ResultEnvelope.adjustments:type_name -> cozy.worker.v1.AdjustmentRow
+	8,  // 66: cozy.worker.v1.OutcomeCause.code:type_name -> cozy.worker.v1.CauseCode
+	9,  // 67: cozy.worker.v1.OutcomeCause.origin:type_name -> cozy.worker.v1.CauseOrigin
+	57, // 68: cozy.worker.v1.OutcomeCause.shortfall:type_name -> cozy.worker.v1.ResourceShortfall
+	81, // 69: cozy.worker.v1.JobCheckpointRequest.artifact:type_name -> cozy.worker.v1.OutputEntry
+	14, // 70: cozy.worker.v1.JobCheckpointReceipt.outcome:type_name -> cozy.worker.v1.CheckpointOutcome
+	61, // 71: cozy.worker.v1.JobCheckpointReceipt.fault:type_name -> cozy.worker.v1.CheckpointFault
+	15, // 72: cozy.worker.v1.CheckpointFault.code:type_name -> cozy.worker.v1.CheckpointFaultCode
+	66, // 73: cozy.worker.v1.InvocationSpec.inputs:type_name -> cozy.worker.v1.InputBinding
+	67, // 74: cozy.worker.v1.InvocationSpec.outputs:type_name -> cozy.worker.v1.OutputBinding
+	68, // 75: cozy.worker.v1.InvocationSpec.serving:type_name -> cozy.worker.v1.ServingInvocationSpec
+	69, // 76: cozy.worker.v1.InvocationSpec.job:type_name -> cozy.worker.v1.JobInvocationSpec
+	75, // 77: cozy.worker.v1.JobInvocationSpec.publication_contract:type_name -> cozy.worker.v1.PublicationContract
+	73, // 78: cozy.worker.v1.DeliveryGrant.credential:type_name -> cozy.worker.v1.DeliveryAccessCredential
+	71, // 79: cozy.worker.v1.DeliveryGrant.inputs:type_name -> cozy.worker.v1.InputAccess
+	72, // 80: cozy.worker.v1.DeliveryGrant.outputs:type_name -> cozy.worker.v1.OutputAccess
+	67, // 81: cozy.worker.v1.PublicationContract.outputs:type_name -> cozy.worker.v1.OutputBinding
+	5,  // 82: cozy.worker.v1.HeldAttempt.kind:type_name -> cozy.worker.v1.AttemptKind
+	6,  // 83: cozy.worker.v1.HeldAttempt.state:type_name -> cozy.worker.v1.AttemptState
+	12, // 84: cozy.worker.v1.Fault.kind:type_name -> cozy.worker.v1.FaultKind
+	81, // 85: cozy.worker.v1.OutputManifest.outputs:type_name -> cozy.worker.v1.OutputEntry
+	18, // 86: cozy.worker.v1.WorkerControl.Control:input_type -> cozy.worker.v1.RecordOwnerFrame
+	63, // 87: cozy.worker.v1.WorkerControl.WatchProgress:input_type -> cozy.worker.v1.ProgressOpen
+	19, // 88: cozy.worker.v1.WorkerControl.Control:output_type -> cozy.worker.v1.WorkerFrame
+	64, // 89: cozy.worker.v1.WorkerControl.WatchProgress:output_type -> cozy.worker.v1.AttemptProgress
+	88, // [88:90] is the sub-list for method output_type
+	86, // [86:88] is the sub-list for method input_type
+	86, // [86:86] is the sub-list for extension type_name
+	86, // [86:86] is the sub-list for extension extendee
+	0,  // [0:86] is the sub-list for field type_name
 }
 
 func init() { file_cozy_worker_v1_worker_proto_init() }

@@ -27,7 +27,7 @@ const (
 	bindingFormat   = "tensorhub.endpoint_binding_release/1"
 	planFormat      = "cozy.endpoint.EntrypointBindingPlan/1"
 	rmbFormat       = "cozy.endpoint.ResolvedModelBinding/1"
-	bundleFormat    = "tensorhub.endpoint_bundle/1"
+	bundleFormat    = "tensorhub.endpoint_bundle/2"
 	maxSnapshotSize = 64 << 20
 )
 
@@ -141,7 +141,7 @@ func refOf(doc canonical.Doc) (exactRef, error) {
 		return exactRef{}, err
 	}
 	ref := exactRef{Digest: doc.Str("digest"), Length: doc.Int("length")}
-	if ref.Digest == "" || ref.Length <= 0 {
+	if _, err := canonical.Raw(ref.Digest); err != nil || ref.Length <= 0 {
 		return exactRef{}, fmt.Errorf("incomplete ref")
 	}
 	return ref, nil
@@ -263,6 +263,14 @@ func Decode(control hub.ExactControlDocument, endpointRef string) (Facts, *exit.
 		placementSpec.Str("installed_environment_receipt_digest") != s.InstalledEnvironmentReceipt.Digest {
 		return facts, invalid("placement fixed digests disagree with the exact snapshot documents")
 	}
+	modelObjectSet := placementSpec.Sub("model_object_set")
+	if err := requireKeys(modelObjectSet, "digest", "kind", "length", "subject_id"); err != nil ||
+		modelObjectSet.Str("kind") != "model_object_set" ||
+		modelObjectSet.Str("subject_id") != modelObjectSet.Str("digest") ||
+		modelObjectSet.Str("digest") != s.ArtifactObjectSet.Digest ||
+		modelObjectSet.Int("length") != s.ArtifactObjectSet.Length {
+		return facts, invalid("placement model-object-set subject does not name the exact artifact object set")
+	}
 
 	planSubjects := map[string]int64{}
 	for _, subject := range placementSpec.List("binding_plans") {
@@ -290,7 +298,7 @@ func Decode(control hub.ExactControlDocument, endpointRef string) (Facts, *exit.
 
 	bundle, err := canonical.ReadObject(s.EndpointBundle.CanonicalBytes)
 	if err != nil || requireKeys(bundle, "descriptor", "endpoint_release_id", "evaluated_config", "format",
-		"project_wheel", "resolved_wheel_set", "wheelhouse_manifest") != nil ||
+		"project_wheel", "resolved_wheel_set", "source_archive", "source_lock", "wheelhouse_manifest") != nil ||
 		bundle.Str("format") != bundleFormat || bundle.Str("endpoint_release_id") != placementSpec.Str("endpoint_release_id") {
 		return facts, invalid("endpoint bundle disagrees with the placement: %v", err)
 	}
@@ -301,6 +309,11 @@ func Decode(control hub.ExactControlDocument, endpointRef string) (Facts, *exit.
 	configRef, err := refOf(bundle.Sub("evaluated_config"))
 	if err != nil || !sameRef(configRef, s.EvaluatedConfig) {
 		return facts, invalid("endpoint bundle evaluated config differs from the exact config")
+	}
+	sourceArchive, archiveErr := refOf(bundle.Sub("source_archive"))
+	sourceLock, lockErr := refOf(bundle.Sub("source_lock"))
+	if archiveErr != nil || lockErr != nil || sourceArchive.Digest == sourceLock.Digest {
+		return facts, invalid("endpoint bundle source archive and lock are absent, malformed, or identical")
 	}
 
 	environment, err := canonical.Read(s.EnvironmentSpec.CanonicalBytes, &pb.EndpointEnvironmentSpec{})
@@ -374,7 +387,6 @@ func Decode(control hub.ExactControlDocument, endpointRef string) (Facts, *exit.
 			Entrypoint: entrypoint, Outputs: launch.AssetPaths(ep.Result),
 			RuntimePlan: &orchestrator.BindingPlanSubject{
 				SubjectID: digest, Kind: "plan", Digest: digest, Length: uint64(document.Length),
-				CanonicalBytes: append([]byte(nil), document.CanonicalBytes...),
 			},
 		})
 	}
@@ -426,6 +438,8 @@ func Decode(control hub.ExactControlDocument, endpointRef string) (Facts, *exit.
 		ConfigDigest:                      s.EvaluatedConfig.Digest, ExactPlacementSetDigest: s.PlacementSet.Digest,
 		ExactPlacementSetBytes: append([]byte(nil), s.PlacementSet.CanonicalBytes...),
 		PlacementIDValue:       s.AcquisitionAttemptID,
+		ModelObjectSetDigest:   s.ArtifactObjectSet.Digest,
+		ModelObjectSetLength:   uint64(s.ArtifactObjectSet.Length),
 	}
 	return facts, nil
 }

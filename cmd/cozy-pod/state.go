@@ -25,7 +25,6 @@ import (
 const (
 	stateDir            = "/run/cozy/bootstrap"
 	mediaRoot           = "/var/lib/cozy/media"
-	plansDir            = "/run/cozy/binding-plans"
 	podBootIDPath       = stateDir + "/pod-boot-id"
 	certificatePath     = stateDir + "/tls.crt"
 	privateKeyPath      = stateDir + "/tls.key"
@@ -35,7 +34,7 @@ const (
 )
 
 func prepareState(cfg config) error {
-	for _, dir := range []string{stateDir, mediaRoot, plansDir} {
+	for _, dir := range []string{stateDir, mediaRoot} {
 		if err := os.MkdirAll(dir, 0o700); err != nil {
 			return fmt.Errorf("create private runtime directory: %w", err)
 		}

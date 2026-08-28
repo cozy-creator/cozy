@@ -20,6 +20,7 @@
 package orchestrator
 
 import (
+	"context"
 	"fmt"
 	"io"
 	"sort"
@@ -57,6 +58,10 @@ type Options struct {
 	// not hardware evidence: a rented worker is not dispatchable until this callback has
 	// durably joined its actual accelerator and worker identity to the rental.
 	ObserveRental func(RentalObservation) *exit.Error
+	// ArtifactGrants obtains the next durable, rental-scoped access revision. It is
+	// called only after the worker snapshot barrier is acknowledged. The source owns
+	// revision persistence and authentication; the orchestrator only relays the grant.
+	ArtifactGrants ArtifactGrantSource
 
 	// EnvironmentSpecDigest and ConfigDigest are LOCAL placement defaults. They ride
 	// INSIDE every local InvocationSpec document:
@@ -69,6 +74,8 @@ type Options struct {
 	ConfigDigest          string
 	MaxOutputMiB          int64
 }
+
+type ArtifactGrantSource func(context.Context, *WorkerConnection) (uint64, *pb.ArtifactGrant, *exit.Error)
 
 type RentalObservation struct {
 	RentalID       string

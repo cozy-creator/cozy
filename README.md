@@ -102,7 +102,7 @@ they land on the VM-class sandbox posture (tensorhub-build.md §1.1) or they do 
 the **LocalOrchestrator** (`internal/orchestrator`): local placement, dispatch, and the
 device ledger. The same service is the worker protocol's **record owner**: it DIALS each
 worker's own socket (#436), owns durable attempt ordinals and terminal acceptance, and
-publishes accepted outputs. The wire is `cozy.worker.v1` at **schema rev 5** — rev-2's
+publishes accepted outputs. The wire is `cozy.worker.v1` at **schema rev 6** — rev-2's
 dynamic-serving shape with the actor-vocabulary hardcut.
 
 - **Identity is canonical bytes.** `internal/canonical` is the document plane: the writer
@@ -113,15 +113,19 @@ dynamic-serving shape with the actor-vocabulary hardcut.
 - **The schema fences itself** (#530-A1). `wire_schema_digest` rides `Claim`/`ClaimAck`,
   is checked BEFORE any other body field, and refuses the handshake on a mismatch or an
   absence — absence being precisely the pre-rev-2 signal, since an older binding cannot
-  spell the field. `WIRE_MINOR` stays 0 and fences nothing: the minor is the additive
+  spell the field. `WIRE_MINOR` is 1 and fences nothing: the minor is the additive
   train and cannot honestly move for a breaking in-place revision.
 - **Actor names match their current responsibilities.** Cause origin 4 is `WORKER`, the
   machine-local peer; origin 7 is `RECORD_OWNER`, the durable-attempt authority. Rev 3
   retains their wire numbers and hardcuts the old names with no aliases.
 - **The desired set is BYTES.** A local target authors its `PlacementSet` once. A rented
   target instead persists and validates Tensorhub's acquisition-attempt control snapshot,
-  then relays that exact `PlacementSet` and exact plan bytes; it never resolves or renders
-  them from this machine's install. The worker recomputes before parsing a single field.
+  then relays that exact `PlacementSet/2`; it never resolves or renders it from this
+  machine's install. After the snapshot ack, the RecordOwner obtains one scoped artifact
+  grant and sends it before desired state. Plans and the required model-object set are
+  ordinary grant subjects fetched by the worker; refreshing their expiring locations never
+  changes the desired revision. The invocation media plane carries no endpoint distribution
+  route. The worker recomputes every subject digest before using its bytes.
 - **Two axes, one admission fence.** A placement's convergence is
   materialization × serving; DISPATCHABLE gates dispatch. Capacity is a WORKER property —
   `admission_state` + `admission_generation` + `available_attempt_slots` — and every offer

@@ -147,6 +147,7 @@ func (c *Orchestrator) placementSpec(w *worker, p DesiredPlacement) *pb.Placemen
 	spec := &pb.PlacementSpec{
 		EndpointReleaseId: p.ReleaseID,
 		BindingPlans:      w.subjects,
+		ModelObjectSet:    modelObjectSetSubject(p),
 	}
 	environmentDigest := p.EnvironmentSpecDigest
 	if environmentDigest == "" && w.spec.Connection == nil {
@@ -162,6 +163,32 @@ func (c *Orchestrator) placementSpec(w *worker, p DesiredPlacement) *pb.Placemen
 		spec.DescriptorDigest = raw
 	}
 	return spec
+}
+
+const emptyModelObjectSet = `{"kind":"tensorhub.resolved_object_set/1","roots":[]}`
+
+// modelObjectSetSubject makes the required PlacementSpec/2 closure explicit even for a
+// weightless local endpoint. The empty object-set document is a real canonical subject,
+// not absence; remote placements carry Tensorhub's exact non-empty subject and normally
+// bypass local authoring by relaying the complete PlacementSet bytes.
+func modelObjectSetSubject(p DesiredPlacement) *pb.ArtifactSubject {
+	digest, length := p.ModelObjectSetDigest, p.ModelObjectSetLength
+	var raw []byte
+	if digest == "" {
+		raw = canonical.Digest([]byte(emptyModelObjectSet))
+		digest, _ = canonical.Spell(raw)
+		length = uint64(len(emptyModelObjectSet))
+	} else {
+		var err error
+		raw, err = canonical.Raw(digest)
+		if err != nil {
+			return nil
+		}
+	}
+	if length == 0 {
+		return nil
+	}
+	return &pb.ArtifactSubject{Digest: raw, SubjectId: digest, Kind: "model_object_set", Length: length}
 }
 
 // ------------------------------------------------------------------- observed state
@@ -193,6 +220,7 @@ func (c *Orchestrator) onObserved(s *session, r *pb.ObservedWorkerState) {
 		w.acceptedRevision = r.AcceptedDesiredStateRevision
 		w.convergedRevision = r.ConvergedRevision
 		w.acceptedSetDigest = r.AcceptedPlacementSetDigest
+		w.appliedGrantRevision, w.appliedGrantID = r.AppliedGrantRevision, r.AppliedArtifactGrantId
 		dispatchable, materializable := map[string]bool{}, map[string]bool{}
 		if w.spec.IsJob() {
 			// THE JOB LANE READS JOB CAPACITY: a job worker is in JobDirective mode and

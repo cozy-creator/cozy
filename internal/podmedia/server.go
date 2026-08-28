@@ -18,7 +18,7 @@
 // outbound network call of any kind. It joins the liability fence by HAVING NOTHING TO
 // EGRESS WITH.
 //
-// Seven routes, and the shape of each is the whole design:
+// Six routes, and the shape of each is the whole design:
 //
 //	GET  /v1/health               the owner's ONE pre-flight: this server names itself and
 //	                              its contract revision — and answers nothing else — and the
@@ -31,10 +31,6 @@
 //	                              POD-LOCAL PATH it landed at, which is what the owner then
 //	                              mints into the DeliveryGrant. The owner never guesses a
 //	                              pod path and this server never learns an owner path.
-//	PUT  /v1/plans/{plan-id}      the owner relays one exact canonical binding plan into the
-//	                              worker's own `binding-plans` directory. FAIL-CLOSED: the
-//	                              whole byte string is re-hashed HERE and must equal the id
-//	                              it was delivered under. Local binding records refuse.
 //	POST /v1/outputs/{slot}       the owner reserves one attempt's output directory AND its
 //	                              exact maximum byte budget, then is told the pod-local path
 //	                              to grant the worker.
@@ -73,7 +69,6 @@ import (
 	"strings"
 	"sync"
 
-	"github.com/cozy-creator/cozy-creator/internal/canonical"
 	"github.com/cozy-creator/cozy-creator/internal/mediawire"
 	"github.com/cozy-creator/cozy-creator/internal/secret"
 )
@@ -85,7 +80,6 @@ import (
 type Options struct {
 	Listen           string
 	Root             string   // the quota-bounded subtree this plane OWNS
-	Plans            string   // the worker's `binding-plans` directory — write-only, from here
 	TokenHashes      []string // the frozen credential set, `sha256:<64 hex>` each
 	Cert             string
 	Key              string
@@ -136,11 +130,6 @@ func (opt *Options) prepare() error {
 			if err := os.Remove(filepath.Join(reservationDir, entry.Name())); err != nil {
 				return fmt.Errorf("cannot remove interrupted media reservation %s: %w", entry.Name(), err)
 			}
-		}
-	}
-	if opt.Plans != "" {
-		if err := os.MkdirAll(opt.Plans, 0o755); err != nil {
-			return fmt.Errorf("cannot create the binding-plan directory %s: %w", opt.Plans, err)
 		}
 	}
 	return nil
@@ -295,9 +284,6 @@ func (s *server) used() int64 {
 		}
 		return count(path, info, err)
 	})
-	if s.opt.Plans != "" {
-		_ = filepath.Walk(s.opt.Plans, count)
-	}
 	for _, bytes := range reservations {
 		total += bytes
 	}
@@ -487,64 +473,6 @@ func (s *server) putInput(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-// putPlan delivers one binding-plan record into the worker's own directory, and is the
-// fail-closed half of remote plan delivery (#506a/#506b).
-//
-// The record is not taken on trust: its IDENTITY is re-hashed here and must equal the id
-// it was delivered under. A record that does not hash to its own name is not the plan the
-// orchestrator is about to name in a directive, whoever sent it — so it is refused rather
-// than staged, and the worker never resolves a plan id against bytes nobody agreed to.
-func (s *server) putPlan(w http.ResponseWriter, r *http.Request) {
-	if !s.admits(w, r) {
-		return
-	}
-	if s.opt.Plans == "" {
-		refuse(w, http.StatusNotFound, "media.no_plan_plane",
-			"this media server was provisioned with no binding-plan directory",
-			"the pod's provisioner passes --plans <worker home>/binding-plans")
-		return
-	}
-	names, ok := named(w, r, "id")
-	if !ok {
-		return
-	}
-	s.writes.Lock()
-	defer s.writes.Unlock()
-	data, ok := s.take(w, r, canonical.DocMax)
-	if !ok {
-		return
-	}
-	// The wire spelling is the file spelling: bare hex, which is what the runtime resolves
-	// a wire plan id against on its own disk. Remote plans are Tensorhub's canonical
-	// EntrypointBindingPlan bytes: their subject id is their whole-byte digest. The
-	// retired local EntrypointBindingRecord identity is deliberately not accepted here.
-	claimed := "sha256:" + strings.TrimSuffix(names[0], ".json")
-	doc, err := canonical.ReadObject(data)
-	if err != nil || doc.Str("format") != "cozy.endpoint.EntrypointBindingPlan/1" ||
-		len(doc) != 4 || doc["bindings"] == nil || doc["descriptor"] == nil || doc["entrypoint"] == nil {
-		refuse(w, http.StatusBadRequest, "media.binding_plan_invalid",
-			"the delivered bytes are not one exact canonical EntrypointBindingPlan",
-			"relay Tensorhub's acquisition-attempt plan bytes; never render a local binding record")
-		return
-	}
-	computed, _ := canonical.Spell(canonical.Digest(data))
-	if computed != claimed {
-		refuse(w, http.StatusBadRequest, "media.binding_plan_identity_mismatch",
-			"the delivered plan hashes to "+computed+", not "+claimed,
-			"use the digest and exact canonical bytes from Tensorhub's persisted control snapshot")
-		return
-	}
-	path := filepath.Join(s.opt.Plans, strings.TrimPrefix(claimed, "sha256:")+".json")
-	if err := commit(path, data); err != nil {
-		refuse(w, http.StatusInternalServerError, "media.unwritable",
-			"the binding record could not be staged: "+err.Error(), "check the pod's worker home")
-		return
-	}
-	answer(w, http.StatusCreated, map[string]any{
-		"path": path, "plan_id": claimed, "length": len(data),
-	})
-}
-
 // reserveOutputs charges one attempt's exact maximum output bytes BEFORE returning its
 // pod-local directory. The durable reservation is the protocol between this process and
 // the filesystem-writing worker: HTTP admission counts the bound instead of racing the
@@ -621,8 +549,7 @@ func (s *server) reserveOutputs(w http.ResponseWriter, r *http.Request) {
 }
 
 // dropAttempt removes only one opaque attempt slot. Inputs use the slot as an exact
-// prefix followed by a dash; outputs use it as their directory name. Plans are shared by
-// placements and deliberately outside this ownership boundary.
+// prefix followed by a dash; outputs use it as their directory name.
 func (s *server) dropAttempt(w http.ResponseWriter, r *http.Request) {
 	if !s.admits(w, r) {
 		return
@@ -715,7 +642,7 @@ func (s *server) getOutput(w http.ResponseWriter, r *http.Request) {
 // weaker door.
 //
 // It no longer publishes this pod's root, fill level, quota, object ceiling, or whether
-// plans are configured (rev 2). Nothing read them. Those bounds are enforced where they
+// any internal paths (rev 2). Nothing read them. Those bounds are enforced where they
 // are checked — `room` and `reserveOutputs` refuse with the exact numbers — so publishing
 // them ahead of time only handed pod state to every authenticated caller.
 func (s *server) health(w http.ResponseWriter, r *http.Request) {
@@ -732,7 +659,6 @@ func (s *server) routes() *http.ServeMux {
 	}
 	mux.HandleFunc("GET /v1/health", s.health)
 	mux.HandleFunc("PUT /v1/inputs/{blob}", s.putInput)
-	mux.HandleFunc("PUT /v1/plans/{id}", s.putPlan)
 	mux.HandleFunc("POST /v1/outputs/{slot}", s.reserveOutputs)
 	mux.HandleFunc("GET /v1/outputs/{slot}/{name}", s.getOutput)
 	mux.HandleFunc("DELETE /v1/attempts/{slot}", s.dropAttempt)

@@ -232,10 +232,14 @@ type Worker struct {
 	// `intake_state` is retired with both of its uses: one enum could not say "staged on
 	// disk but offline", which is the exact state an outgoing spec holds under
 	// fallback-retention.
-	Phase           string   `json:"worker_phase"`
-	Materialization string   `json:"materialization"`
-	Serving         string   `json:"serving"`
-	Plans           []string `json:"dispatchable_plan_ids"`
+	Phase                string   `json:"worker_phase"`
+	Materialization      string   `json:"materialization"`
+	Serving              string   `json:"serving"`
+	Plans                []string `json:"dispatchable_plan_ids"`
+	GrantID              string   `json:"artifact_grant_id"`
+	GrantRevision        uint64   `json:"artifact_grant_revision"`
+	AppliedGrantID       string   `json:"applied_artifact_grant_id"`
+	AppliedGrantRevision uint64   `json:"applied_grant_revision"`
 	// QuietMS measures missed protocol reports. ErrorForMS is diagnostic only; typed
 	// faults/refusals settle immediately and no elapsed duration decides readiness.
 	QuietMS    int64  `json:"quiet_ms"`
