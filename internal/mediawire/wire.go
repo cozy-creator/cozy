@@ -2,9 +2,10 @@
 // service answers to, the integer revision both ends must agree on before a byte moves,
 // and the bounds the plane PUBLISHES instead of each end restating.
 //
-// It exists because the two ends ship separately and always have. `cmd/cozy-media` is
-// compiled into the pod image from a commit pin (the image recipe's CREATOR_COMMIT) while
-// the owner's client in `internal/media` floats with master, and until now the only version
+// It exists because the two ends ship separately and always have. The plane
+// (`internal/podmedia`, served inside `cmd/cozy-pod`) is compiled into the pod image from a
+// commit pin (the image recipe's CREATOR_COMMIT) while the owner's client in
+// `internal/media` floats with master, and until now the only version
 // signal between them was the literal `/v1/` in a URL path. A
 // renumbered answer field or a moved route would have been MISPARSED rather than refused.
 // The control leg one plane over already forecloses exactly this on `pb.WireSchemaRev`
@@ -17,7 +18,10 @@
 // answer may carry a plain service identity and a revision, and that is all this is.
 package mediawire
 
-// Service is what the pod's media server calls itself in every answer that identifies it.
+// Service is what the pod's media plane calls itself in every answer that identifies it.
+// It is the PLANE's name and not a binary's: cl-036 merged the plane into `cozy-pod` and
+// deliberately did not touch this string, because the owner compares it before a byte
+// moves and a rename would refuse every pod that had not been rebuilt.
 const Service = "cozy-media"
 
 // ContractRev is the media plane's wire revision. BUMP IT whenever a route, an answer
@@ -27,10 +31,11 @@ const Service = "cozy-media"
 const ContractRev = 1
 
 // MaxReceiptBytes is the ceiling on the pod readiness envelope that
-// `GET /v1/bootstrap/receipt` serves. It is THIS repo's number because cozy-media is the
-// process that refuses an oversized one; `cmd/cozy-bootstrap` writes that file and must
-// not exceed it, and IMPORTS this constant rather than declaring a second, silently
-// divergent copy of it — which is exactly what it did while it lived in another repo.
+// `GET /v1/bootstrap/receipt` serves. It is THIS repo's number because the plane is what
+// refuses an oversized one; `cmd/cozy-pod` writes that file and must not exceed it, and
+// IMPORTS this constant rather than declaring a second, silently divergent copy of it —
+// which is exactly what it did while it lived in another repo. The two are one process
+// since cl-036 and the rule did not relax: one declaration, imported at both ends.
 const MaxReceiptBytes = 64 << 10
 
 // Rev answers the revision as a document carries it. It is a pointer so that "answered a

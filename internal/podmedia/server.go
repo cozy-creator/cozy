@@ -1,13 +1,22 @@
-// cozy-media is THE POD'S MEDIA SERVER (cl-014, ruled #506b): the byte plane of a rented
-// pod, and the only way bytes cross between an owner and the worker it rented.
+// Package podmedia is THE POD'S MEDIA PLANE (cl-014, ruled #506b): the byte plane of a
+// rented pod, and the only way bytes cross between an owner and the worker it rented.
 //
-// It is a SECOND PROCESS in the pod's single container, co-resident with the Python worker
-// and coupled to it BY THE FILESYSTEM ALONE. There is no RPC between the two in either
-// direction — the worker never calls this server and this server never calls the worker —
-// so this process dying loses no attempt state and a killed worker does not stop an owner
-// from downloading what it already produced. That is a structural property here, not a
-// discipline: this binary imports no protocol client and, by fence, contains no outbound
-// network call of any kind. It joins the liability fence by HAVING NOTHING TO EGRESS WITH.
+// It is a PACKAGE and not a program (cl-036). It used to be `cmd/cozy-media`, a second
+// binary the supervisor exec'd; the pod now ships ONE binary, `cmd/cozy-pod`, and this
+// plane runs inside it. The split that remains is the one that carries weight: THIS
+// package parses attacker-influenced request bytes and it is fenced against every
+// privilege the supervisor holds — it may not exec, signal, or reap, and `cmd/cozy-pod`
+// is package main, so nothing here can even NAME the supervision loop. The concentration
+// the merge creates (PID 1 co-resident with an HTTP parser) is bought down by that
+// boundary rather than by a comment.
+//
+// It stays coupled to the Python worker BY THE FILESYSTEM ALONE. There is no RPC between
+// the two in either direction — the worker never calls this plane and this plane never
+// calls the worker — so a crash here loses no attempt state and a killed worker does not
+// stop an owner from downloading what it already produced. That is a structural property,
+// not a discipline: this package imports no protocol client and, by fence, contains no
+// outbound network call of any kind. It joins the liability fence by HAVING NOTHING TO
+// EGRESS WITH.
 //
 // Seven routes, and the shape of each is the whole design:
 //
@@ -34,19 +43,20 @@
 //	                              owner drops exactly that attempt's inputs and outputs.
 //
 // Every RENTER route authenticates a bearer against a FROZEN SET OF DIGESTS handed to
-// this process at launch (`--token-sha256`) and never re-read: the renter minted the
-// token, Tensorhub kept only its SHA-256, and this process holds that digest and compares
-// digests. It never holds a raw token, so there is nothing here to leak. The set is
-// validated once, at boot, and a set that is absent, empty, or malformed refuses to start
-// rather than serve — an unauthenticated media plane is not a degraded mode. The bootstrap
-// envelope contains no capability; Tensorhub authenticates its exact bytes with the
-// attempt HMAC before trusting the TLS peer that served them.
+// this plane at Bind and never re-read: the renter minted the token, Tensorhub kept only
+// its SHA-256, and this process holds that digest and compares digests. It never holds a
+// raw token, so there is nothing here to leak. The set is validated once, at Bind, and a
+// set that is absent, empty, or malformed refuses to bind rather than serve — an
+// unauthenticated media plane is not a degraded mode, and since the supervisor cannot
+// reach `supervise` without a bound plane, a bad grant is a POD that does not boot. The
+// bootstrap envelope contains no capability; Tensorhub authenticates its exact bytes with
+// the attempt HMAC before trusting the TLS peer that served them.
 //
 // The SUBTREE IS QUOTA-BOUNDED and it is not the worker's root: uploads can never ENOSPC
-// the journal. The worker writes outputs through the shared filesystem, so this process
+// the journal. The worker writes outputs through the shared filesystem, so this plane
 // durably reserves their full grant bounds before returning a directory. HTTP uploads and
 // direct worker writes thereby consume one media-owned budget without a cross-process lock.
-package main
+package podmedia
 
 import (
 	"crypto/sha256"
@@ -67,115 +77,76 @@ import (
 	"github.com/cozy-creator/cozy-creator/internal/secret"
 )
 
-func main() {
-	os.Exit(run(os.Args[1:]))
+// Options is the whole launch surface of the media plane. Everything is a path grant or a
+// bound; nothing is discovered, nothing is read from the environment, and there is no
+// configuration file. `cmd/cozy-pod` fills it from the eight allowlisted pod variables and
+// its own fixed image layout — this package never learns either.
+type Options struct {
+	Listen           string
+	Root             string   // the quota-bounded subtree this plane OWNS
+	Plans            string   // the worker's `binding-plans` directory — write-only, from here
+	TokenHashes      []string // the frozen credential set, `sha256:<64 hex>` each
+	Cert             string
+	Key              string
+	BootstrapReceipt string // exact pod-authored JSON; may appear after the listener starts
+	Quota            int64
+	MaxBody          int64
 }
 
-// options is the whole launch surface. Everything is a path grant or a bound; nothing is
-// discovered, nothing is read from the environment, and there is no configuration file.
-type options struct {
-	listen           string
-	root             string   // the quota-bounded subtree this server OWNS
-	plans            string   // the worker's `binding-plans` directory — write-only, from here
-	tokenHashes      []string // the frozen credential set, `sha256:<64 hex>` each
-	out              string   // where `media.addr` is published (the file-handoff discovery contract)
-	cert             string
-	key              string
-	bootstrapReceipt string // exact pod-authored JSON; may appear after the listener starts
-	quota            int64
-	maxBody          int64
-}
+// DefaultQuota is the media subtree's admitted ceiling when the caller states none.
+const DefaultQuota = 8 << 30
 
-func run(args []string) int {
-	opt := options{quota: 8 << 30}
-	for i := 0; i < len(args); i++ {
-		name := strings.TrimPrefix(args[i], "--")
-		value := ""
-		if i+1 < len(args) && !strings.HasPrefix(args[i+1], "--") {
-			value, i = args[i+1], i+1
-		}
-		switch name {
-		case "listen":
-			opt.listen = value
-		case "root":
-			opt.root = value
-		case "plans":
-			opt.plans = value
-		case "token-sha256":
-			hashes, err := parseTokenHashes(value)
-			if err != nil {
-				return usage("--token-sha256 %v", err)
-			}
-			opt.tokenHashes = hashes
-		case "out":
-			opt.out = value
-		case "tls-cert":
-			opt.cert = value
-		case "tls-key":
-			opt.key = value
-		case "bootstrap-receipt":
-			opt.bootstrapReceipt = value
-		case "quota":
-			n, err := strconv.ParseInt(value, 10, 64)
-			if err != nil || n <= 0 {
-				return usage("--quota %q is not a positive byte count", value)
-			}
-			opt.quota = n
-		case "max-body":
-			n, err := strconv.ParseInt(value, 10, 64)
-			if err != nil || n <= 0 {
-				return usage("--max-body %q is not a positive byte count", value)
-			}
-			opt.maxBody = n
-		default:
-			return usage("unknown flag %q", args[i])
-		}
-	}
+// prepare validates the grant and lays out the subtree. FAIL CLOSED: it returns an error
+// and no plane, so a malformed grant authenticates NOBODY rather than everybody.
+func (opt *Options) prepare() error {
 	switch {
-	case opt.listen == "":
-		return usage("--listen <host:port> is required")
-	case opt.root == "":
-		return usage("--root <dir> is required: this server owns exactly one subtree")
-	case len(opt.tokenHashes) == 0:
-		return usage("--token-sha256 <sha256:hex,...> is required: there is no unauthenticated mode")
+	case opt.Listen == "":
+		return fmt.Errorf("a listen address is required")
+	case opt.Root == "":
+		return fmt.Errorf("a root is required: this plane owns exactly one subtree")
 	}
-	if opt.maxBody == 0 {
-		// No private object ceiling sits below the pod's admitted media quota. A caller
-		// may still set a smaller explicit bound for a constrained deployment.
-		opt.maxBody = opt.quota
+	if err := validateTokenHashes(opt.TokenHashes); err != nil {
+		return err
 	}
-	for _, dir := range []string{filepath.Join(opt.root, "inputs"), filepath.Join(opt.root, "outputs")} {
+	if opt.Quota <= 0 {
+		opt.Quota = DefaultQuota
+	}
+	if opt.MaxBody <= 0 {
+		// No private object ceiling sits below the pod's admitted media quota.
+		opt.MaxBody = opt.Quota
+	}
+	for _, dir := range []string{filepath.Join(opt.Root, "inputs"), filepath.Join(opt.Root, "outputs")} {
 		if err := os.MkdirAll(dir, 0o755); err != nil {
-			return fatal("cannot create %s: %v", dir, err)
+			return fmt.Errorf("cannot create %s: %w", dir, err)
 		}
 	}
-	reservationDir := filepath.Join(opt.root, ".reservations")
+	reservationDir := filepath.Join(opt.Root, ".reservations")
 	if err := os.MkdirAll(reservationDir, 0o700); err != nil {
-		return fatal("cannot create the media reservation directory: %v", err)
+		return fmt.Errorf("cannot create the media reservation directory: %w", err)
 	}
 	// A crash before an atomic reservation rename can leave only its hidden temporary.
 	// No grant was returned in that state, so boot removes it before quota is admitted.
-	if entries, err := os.ReadDir(reservationDir); err != nil {
-		return fatal("cannot inspect the media reservation directory: %v", err)
-	} else {
-		for _, entry := range entries {
-			if strings.HasPrefix(entry.Name(), ".") && strings.HasSuffix(entry.Name(), ".staging") {
-				if err := os.Remove(filepath.Join(reservationDir, entry.Name())); err != nil {
-					return fatal("cannot remove interrupted media reservation %s: %v", entry.Name(), err)
-				}
+	entries, err := os.ReadDir(reservationDir)
+	if err != nil {
+		return fmt.Errorf("cannot inspect the media reservation directory: %w", err)
+	}
+	for _, entry := range entries {
+		if strings.HasPrefix(entry.Name(), ".") && strings.HasSuffix(entry.Name(), ".staging") {
+			if err := os.Remove(filepath.Join(reservationDir, entry.Name())); err != nil {
+				return fmt.Errorf("cannot remove interrupted media reservation %s: %w", entry.Name(), err)
 			}
 		}
 	}
-	if opt.plans != "" {
-		if err := os.MkdirAll(opt.plans, 0o755); err != nil {
-			return fatal("cannot create the binding-plan directory %s: %v", opt.plans, err)
+	if opt.Plans != "" {
+		if err := os.MkdirAll(opt.Plans, 0o755); err != nil {
+			return fmt.Errorf("cannot create the binding-plan directory %s: %w", opt.Plans, err)
 		}
 	}
-	return (&server{opt: opt}).serve()
+	return nil
 }
 
 type server struct {
-	opt options
+	opt Options
 
 	writes sync.Mutex // quota admission and the filesystem mutation are one critical section
 }
@@ -188,30 +159,34 @@ var tokenHashPattern = regexp.MustCompile(`^sha256:[0-9a-f]{64}$`)
 // this many live hashes per rental), restated as a refusal rather than trusted.
 const maxTokenHashes = 16
 
-// parseTokenHashes validates the launch credential set and is the whole of this program's
-// admission policy. FAIL CLOSED: an empty value, a duplicate, an out-of-order entry, an
+// validateTokenHashes checks the launch credential set and is the whole of this plane's
+// admission policy. FAIL CLOSED: an empty set, a duplicate, an out-of-order entry, an
 // over-long set, or anything that is not `sha256:<64 lowercase hex>` yields an error and
-// no set at all, so a malformed grant authenticates NOBODY rather than everybody. Sorted
-// and unique is required, not normalized: the sender already owes a canonical set, and
-// silently repairing one hides a sender that has drifted.
-func parseTokenHashes(value string) ([]string, error) {
-	if strings.TrimSpace(value) == "" {
-		return nil, fmt.Errorf("takes at least one `sha256:<64 hex>` digest")
+// no plane at all, so a malformed grant authenticates NOBODY rather than everybody.
+// Sorted and unique is required, not normalized: the caller already owes a canonical set,
+// and silently repairing one hides a caller that has drifted.
+//
+// `cmd/cozy-pod` validates the same digests one more time, in the shape the pod
+// environment spells them. That is not redundancy to delete: the plane refuses to bind on
+// a set it cannot authenticate, and the merge means a plane that will not bind is a pod
+// that does not boot.
+func validateTokenHashes(hashes []string) error {
+	if len(hashes) == 0 {
+		return fmt.Errorf("the media grant takes at least one `sha256:<64 hex>` digest")
 	}
-	hashes := strings.Split(value, ",")
 	if len(hashes) > maxTokenHashes {
-		return nil, fmt.Errorf("takes at most %d digests, not %d", maxTokenHashes, len(hashes))
+		return fmt.Errorf("the media grant takes at most %d digests, not %d", maxTokenHashes, len(hashes))
 	}
 	for i, hash := range hashes {
 		if !tokenHashPattern.MatchString(hash) {
-			return nil, fmt.Errorf("entry %d %q is not `sha256:<64 lowercase hex>`", i+1, hash)
+			return fmt.Errorf("media grant entry %d %q is not `sha256:<64 lowercase hex>`", i+1, hash)
 		}
 		if i > 0 && hashes[i-1] >= hash {
-			return nil, fmt.Errorf("entries must be sorted and unique; %q does not follow %q",
+			return fmt.Errorf("media grant entries must be sorted and unique; %q does not follow %q",
 				hash, hashes[i-1])
 		}
 	}
-	return hashes, nil
+	return nil
 }
 
 // admits authenticates one request against the frozen set. Neither side of the comparison
@@ -224,7 +199,7 @@ func (s *server) admits(w http.ResponseWriter, r *http.Request) bool {
 			"the rental's provisioned owner token is the bearer")
 		return false
 	}
-	for _, line := range s.opt.tokenHashes {
+	for _, line := range s.opt.TokenHashes {
 		if secret.MatchesHash(presented, line) {
 			return true
 		}
@@ -237,10 +212,10 @@ func (s *server) admits(w http.ResponseWriter, r *http.Request) bool {
 
 // bootstrapReceipt is Tensorhub's one read-only rendezvous with a pod it bought. The
 // envelope carries an attempt HMAC that Tensorhub verifies over exact payload bytes before
-// it trusts the TLS peer. cozy-media owns neither that schema nor its key: it serves the
+// it trusts the TLS peer. This package owns neither that schema nor its key: it serves the
 // atomically published bytes and nothing else. Until the file appears, readiness is early.
 func (s *server) bootstrapReceipt(w http.ResponseWriter, r *http.Request) {
-	file, err := os.Open(s.opt.bootstrapReceipt)
+	file, err := os.Open(s.opt.BootstrapReceipt)
 	if err != nil {
 		refuse(w, http.StatusTooEarly, "media.bootstrap_pending",
 			"the pod has not published its readiness receipt: "+err.Error(),
@@ -294,12 +269,12 @@ func named(w http.ResponseWriter, r *http.Request, keys ...string) ([]string, bo
 func (s *server) used() int64 {
 	reservations, err := s.reservations()
 	if err != nil {
-		return s.opt.quota
+		return s.opt.Quota
 	}
 	var total int64
 	count := func(path string, info os.FileInfo, err error) error {
 		if err == nil && info != nil && !info.IsDir() {
-			rel, relErr := filepath.Rel(s.opt.root, path)
+			rel, relErr := filepath.Rel(s.opt.Root, path)
 			if relErr == nil {
 				parts := strings.Split(rel, string(filepath.Separator))
 				if len(parts) >= 3 && parts[0] == "outputs" {
@@ -312,15 +287,15 @@ func (s *server) used() int64 {
 		}
 		return nil
 	}
-	reservationDir := filepath.Join(s.opt.root, ".reservations")
-	_ = filepath.Walk(s.opt.root, func(path string, info os.FileInfo, err error) error {
+	reservationDir := filepath.Join(s.opt.Root, ".reservations")
+	_ = filepath.Walk(s.opt.Root, func(path string, info os.FileInfo, err error) error {
 		if err == nil && info != nil && info.IsDir() && path == reservationDir {
 			return filepath.SkipDir
 		}
 		return count(path, info, err)
 	})
-	if s.opt.plans != "" {
-		_ = filepath.Walk(s.opt.plans, count)
+	if s.opt.Plans != "" {
+		_ = filepath.Walk(s.opt.Plans, count)
 	}
 	for _, bytes := range reservations {
 		total += bytes
@@ -329,7 +304,7 @@ func (s *server) used() int64 {
 }
 
 func (s *server) reservations() (map[string]int64, error) {
-	entries, err := os.ReadDir(filepath.Join(s.opt.root, ".reservations"))
+	entries, err := os.ReadDir(filepath.Join(s.opt.Root, ".reservations"))
 	if os.IsNotExist(err) {
 		return map[string]int64{}, nil
 	}
@@ -341,7 +316,7 @@ func (s *server) reservations() (map[string]int64, error) {
 		if entry.IsDir() || !safeName.MatchString(entry.Name()) || strings.Contains(entry.Name(), "..") {
 			return nil, fmt.Errorf("invalid media reservation %q", entry.Name())
 		}
-		data, err := os.ReadFile(filepath.Join(s.opt.root, ".reservations", entry.Name()))
+		data, err := os.ReadFile(filepath.Join(s.opt.Root, ".reservations", entry.Name()))
 		if err != nil {
 			return nil, err
 		}
@@ -358,8 +333,8 @@ func (s *server) reservations() (map[string]int64, error) {
 // room the quota leaves. The DECLARED length refuses first when the caller declared one,
 // so an oversized upload is answered before its bytes move.
 func (s *server) bodyLimit(w http.ResponseWriter, r *http.Request, routeMax int64) (int64, bool) {
-	room := s.opt.quota - s.used()
-	limit := s.opt.maxBody
+	room := s.opt.Quota - s.used()
+	limit := s.opt.MaxBody
 	if routeMax > 0 && routeMax < limit {
 		limit = routeMax
 	}
@@ -368,7 +343,7 @@ func (s *server) bodyLimit(w http.ResponseWriter, r *http.Request, routeMax int6
 	}
 	if limit <= 0 {
 		refuse(w, http.StatusInsufficientStorage, "media.quota_exhausted",
-			fmt.Sprintf("this pod's media subtree holds %d B of its %d B quota", s.used(), s.opt.quota),
+			fmt.Sprintf("this pod's media subtree holds %d B of its %d B quota", s.used(), s.opt.Quota),
 			"outputs already downloaded can be dropped; a media subtree is deliberately "+
 				"separate from the worker's journal so a full one never stops an attempt")
 		return 0, false
@@ -501,7 +476,7 @@ func (s *server) putInput(w http.ResponseWriter, r *http.Request) {
 	}
 	s.writes.Lock()
 	defer s.writes.Unlock()
-	path := filepath.Join(s.opt.root, "inputs", names[0])
+	path := filepath.Join(s.opt.Root, "inputs", names[0])
 	length, digest, ok := s.streamInput(w, r, path)
 	if !ok {
 		return
@@ -522,7 +497,7 @@ func (s *server) putPlan(w http.ResponseWriter, r *http.Request) {
 	if !s.admits(w, r) {
 		return
 	}
-	if s.opt.plans == "" {
+	if s.opt.Plans == "" {
 		refuse(w, http.StatusNotFound, "media.no_plan_plane",
 			"this media server was provisioned with no binding-plan directory",
 			"the pod's provisioner passes --plans <worker home>/binding-plans")
@@ -558,7 +533,7 @@ func (s *server) putPlan(w http.ResponseWriter, r *http.Request) {
 			"use the digest and exact canonical bytes from Tensorhub's persisted control snapshot")
 		return
 	}
-	path := filepath.Join(s.opt.plans, strings.TrimPrefix(claimed, "sha256:")+".json")
+	path := filepath.Join(s.opt.Plans, strings.TrimPrefix(claimed, "sha256:")+".json")
 	if err := commit(path, data); err != nil {
 		refuse(w, http.StatusInternalServerError, "media.unwritable",
 			"the binding record could not be staged: "+err.Error(), "check the pod's worker home")
@@ -592,7 +567,7 @@ func (s *server) reserveOutputs(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	slot := names[0]
-	reservation := filepath.Join(s.opt.root, ".reservations", slot)
+	reservation := filepath.Join(s.opt.Root, ".reservations", slot)
 	created := false
 	if data, readErr := os.ReadFile(reservation); readErr == nil {
 		prior, parseErr := strconv.ParseInt(strings.TrimSpace(string(data)), 10, 64)
@@ -615,9 +590,9 @@ func (s *server) reserveOutputs(w http.ResponseWriter, r *http.Request) {
 		return
 	} else {
 		used := s.used()
-		if bound > s.opt.quota-used {
+		if bound > s.opt.Quota-used {
 			refuse(w, http.StatusInsufficientStorage, "media.quota_exhausted",
-				fmt.Sprintf("this pod holds or reserves %d B; %d B of its %d B quota remains", used, max(0, s.opt.quota-used), s.opt.quota),
+				fmt.Sprintf("this pod holds or reserves %d B; %d B of its %d B quota remains", used, max(0, s.opt.Quota-used), s.opt.Quota),
 				"drop completed attempts before reserving another output grant")
 			return
 		}
@@ -628,7 +603,7 @@ func (s *server) reserveOutputs(w http.ResponseWriter, r *http.Request) {
 		}
 		created = true
 	}
-	dir := filepath.Join(s.opt.root, "outputs", slot)
+	dir := filepath.Join(s.opt.Root, "outputs", slot)
 	if err := os.MkdirAll(dir, 0o777); err != nil {
 		if created {
 			_ = os.Remove(reservation)
@@ -658,7 +633,7 @@ func (s *server) dropAttempt(w http.ResponseWriter, r *http.Request) {
 	s.writes.Lock()
 	defer s.writes.Unlock()
 	slot := names[0]
-	entries, err := os.ReadDir(filepath.Join(s.opt.root, "inputs"))
+	entries, err := os.ReadDir(filepath.Join(s.opt.Root, "inputs"))
 	if err != nil && !os.IsNotExist(err) {
 		refuse(w, http.StatusInternalServerError, "media.unreadable",
 			"the attempt input directory cannot be read: "+err.Error(), "check the pod's media subtree")
@@ -666,19 +641,19 @@ func (s *server) dropAttempt(w http.ResponseWriter, r *http.Request) {
 	}
 	for _, entry := range entries {
 		if strings.HasPrefix(entry.Name(), slot+"-") {
-			if err := os.Remove(filepath.Join(s.opt.root, "inputs", entry.Name())); err != nil && !os.IsNotExist(err) {
+			if err := os.Remove(filepath.Join(s.opt.Root, "inputs", entry.Name())); err != nil && !os.IsNotExist(err) {
 				refuse(w, http.StatusInternalServerError, "media.unwritable",
 					"an attempt input could not be removed: "+err.Error(), "check the pod's media subtree")
 				return
 			}
 		}
 	}
-	if err := os.RemoveAll(filepath.Join(s.opt.root, "outputs", slot)); err != nil {
+	if err := os.RemoveAll(filepath.Join(s.opt.Root, "outputs", slot)); err != nil {
 		refuse(w, http.StatusInternalServerError, "media.unwritable",
 			"the attempt output directory could not be removed: "+err.Error(), "check the pod's media subtree")
 		return
 	}
-	if err := os.Remove(filepath.Join(s.opt.root, ".reservations", slot)); err != nil && !os.IsNotExist(err) {
+	if err := os.Remove(filepath.Join(s.opt.Root, ".reservations", slot)); err != nil && !os.IsNotExist(err) {
 		refuse(w, http.StatusInternalServerError, "media.unwritable",
 			"the attempt output reservation could not be removed: "+err.Error(), "check the pod's media subtree")
 		return
@@ -697,7 +672,7 @@ func (s *server) getOutput(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	path := filepath.Join(s.opt.root, "outputs", names[0], names[1])
+	path := filepath.Join(s.opt.Root, "outputs", names[0], names[1])
 	file, err := os.Open(path)
 	if err != nil {
 		refuse(w, http.StatusNotFound, "media.absent",
@@ -718,10 +693,10 @@ func (s *server) getOutput(w http.ResponseWriter, r *http.Request) {
 	// not permission for an oversized object. The owner hashes the stream against the
 	// terminal manifest while landing it, so this server does not make a redundant first
 	// pass or hold bytes merely to produce a digest header.
-	if info.Size() > s.opt.maxBody {
+	if info.Size() > s.opt.MaxBody {
 		refuse(w, http.StatusRequestEntityTooLarge, "media.over_bound",
 			fmt.Sprintf("the output at %s/%s is %d B and %d B is admissible here",
-				names[0], names[1], info.Size(), s.opt.maxBody),
+				names[0], names[1], info.Size(), s.opt.MaxBody),
 			"raise --max-body on this pod's media server, or grant a smaller output")
 		return
 	}
@@ -742,15 +717,15 @@ func (s *server) health(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	answer(w, http.StatusOK, mediawire.Health{
-		Contract: mediawire.Ours(), Root: s.opt.root,
-		UsedBytes: s.used(), QuotaBytes: s.opt.quota, MaxObjectBytes: s.opt.maxBody,
-		Plans: s.opt.plans != "",
+		Contract: mediawire.Ours(), Root: s.opt.Root,
+		UsedBytes: s.used(), QuotaBytes: s.opt.Quota, MaxObjectBytes: s.opt.MaxBody,
+		Plans: s.opt.Plans != "",
 	})
 }
 
 func (s *server) routes() *http.ServeMux {
 	mux := http.NewServeMux()
-	if s.opt.bootstrapReceipt != "" {
+	if s.opt.BootstrapReceipt != "" {
 		mux.HandleFunc("GET /v1/bootstrap/receipt", s.bootstrapReceipt)
 	}
 	mux.HandleFunc("GET /v1/health", s.health)
@@ -776,19 +751,4 @@ func refuse(w http.ResponseWriter, status int, code, message, remedy string) {
 	_ = json.NewEncoder(w).Encode(map[string]any{"error": map[string]string{
 		"code": code, "message": message, "remedy": remedy,
 	}})
-}
-
-func usage(format string, args ...any) int {
-	fmt.Fprintf(os.Stderr, "cozy-media: "+format+"\n", args...)
-	fmt.Fprintln(os.Stderr, "usage: cozy-media --listen <host:port> --root <dir> "+
-		"--token-sha256 <sha256:hex,...> [--plans <dir>] [--out <dir>] "+
-		"[--tls-cert <pem> --tls-key <pem>] "+
-		"[--bootstrap-receipt <json>] "+
-		"[--quota <bytes>] [--max-body <bytes>]")
-	return 2
-}
-
-func fatal(format string, args ...any) int {
-	fmt.Fprintf(os.Stderr, "cozy-media: "+format+"\n", args...)
-	return 1
 }

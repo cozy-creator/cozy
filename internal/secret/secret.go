@@ -108,7 +108,7 @@ func HashLine(v Value) string {
 // no `sha256:` prefix.
 //
 // It is a second spelling of one fact and it exists because two peers spell it two ways:
-// the pod's verifiers take `sha256:<hex>` (HashLine, what cozy-media and the runtime
+// the pod's verifiers take `sha256:<hex>` (HashLine, what the pod media plane and the runtime
 // hold), and a hub's `renter_token_sha256` field takes the hex alone. Naming both
 // here keeps the conversion at the carrier, where every other credential rendering in this
 // package lives, instead of a TrimPrefix at a call site that has to remember why.

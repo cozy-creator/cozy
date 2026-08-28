@@ -31,7 +31,9 @@ const (
 // to compile an image whose pinned bootstrap admits a different set, so an addition here
 // is a contract change on both sides or it is a build failure. cl-036 retired the six
 // COZY_PROVISION_{SPEC,BUNDLE}_{DIGEST,URL,LENGTH} grants with the documents they fetched
-// and added the three identity facts those documents were smuggling.
+// and added the three identity facts those documents were smuggling. The merge into one
+// binary did not touch this set: the media plane never read the environment and still does
+// not — it is handed its grant in memory.
 var allowedCozyEnv = map[string]bool{
 	envAttemptID: true, envAttemptOrdinal: true, envRentalID: true,
 	envReceiptKey: true, envReceiptDeadline: true, envWorkerPort: true, envMediaPort: true,
@@ -42,7 +44,7 @@ type config struct {
 	attemptID      string
 	attemptOrdinal int64
 	rentalID       string
-	hmacKey        []byte
+	receipt        *attemptKey
 	deadline       time.Time
 	workerPort     uint16
 	mediaPort      uint16
@@ -71,9 +73,24 @@ func parseConfig() (config, error) {
 	if err != nil {
 		return out, err
 	}
-	out.hmacKey, err = base64.RawURLEncoding.Strict().DecodeString(keyText)
-	if err != nil || len(out.hmacKey) != 32 || base64.RawURLEncoding.EncodeToString(out.hmacKey) != keyText {
+	hmacKey, err := base64.RawURLEncoding.Strict().DecodeString(keyText)
+	if err != nil || len(hmacKey) != 32 || base64.RawURLEncoding.EncodeToString(hmacKey) != keyText {
 		return out, fmt.Errorf("%s must be unpadded base64url encoding exactly 32 bytes", envReceiptKey)
+	}
+	// The raw key never becomes a field. What the rest of the program receives is the
+	// ONE-SHOT attemptKey (receipt.go): it signs the readiness envelope once, zeroes
+	// itself in the same call, and errors on a second caller. Nothing outside this file
+	// and receipt.go can name the key at all — the fence holds that.
+	out.receipt = newAttemptKey(hmacKey)
+	// THE FIRST HALF OF THE KEY WIPE (cl-036). This process is PID 1 AND an HTTP parser
+	// now, so the readiness key spends the shortest life this program can give it: its
+	// environment slot goes the instant the bytes are decoded, which is before any
+	// listener is bound, any child is exec'd, or any request byte is read. The second
+	// half — zeroing the bytes themselves — is the one-shot attemptKey in receipt.go.
+	// Children never saw this name anyway (childEnvironment is a five-name allowlist);
+	// what this closes is /proc/1/environ and every later reader inside this process.
+	if err := os.Unsetenv(envReceiptKey); err != nil {
+		return out, fmt.Errorf("cannot unset %s after decoding it: %w", envReceiptKey, err)
 	}
 	deadlineText, err := requiredEnv(envReceiptDeadline)
 	if err != nil {
@@ -180,8 +197,9 @@ func requiredEnv(name string) (string, error) {
 // Provider/image environments routinely contain AWS, Hugging Face, and RunPod
 // credentials. Children need only process locale/timezone and the standard TLS trust
 // overrides. Class-D base inherit list — tracker-v2/spawn-allowlists.md (#616.d) is the
-// authority; keep equal to that row. PATH is deliberately absent: cozy-media and the
-// adapter are exec'd by absolute path and spawn nothing PATH-resolved.
+// authority; keep equal to that row. PATH is deliberately absent: the adapter is exec'd by
+// absolute path and spawns nothing PATH-resolved. There is exactly one child since cl-036
+// merged the media plane into this process; the allowlist is unchanged by that.
 func childEnvironment() []string {
 	allowed := map[string]bool{
 		"LANG": true, "LC_ALL": true, "TZ": true,
