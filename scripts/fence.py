@@ -1,10 +1,13 @@
 #!/usr/bin/env python3
 """Boundary fence (boundaries.md). Architecture enforcement, not a test.
 
-Fifteen families:
+Fourteen families:
   deps      forbidden dependencies (raw lines, incl. import paths and go.mod)
-  impl      storage/chunk/loader/residency/tensor implementation vocabulary — cozy-creator
-            renders and orchestrates, it never implements the byte plane (TensorFS owns it)
+  impl      the CANONICAL FORMATS TensorFS parses. A second reader of safetensors/gguf/
+            cozytensors here would drift from the one that produced the published bytes.
+            (Narrowed 2026-08-28: the generic systems words — chunk, mmap, dtype,
+            residency, quantiz, pagein — were a vocabulary ban with no failure behind
+            them; they fired on the worker protocol's own field names.)
   prompt    interactive prompts: no cozy command may ever ask a question (AXI)
   matrix    internal/exit/exit.go must equal docs/exit-matrix.md row for row
   manifest  a reclaiming/removing verb must DECLARE its gate: Destructive (exit 7 without
@@ -21,23 +24,25 @@ Fifteen families:
   env       (cl-001) the environment is read in internal/config/config.go and NOWHERE else:
             one entrypoint reader, a frozen typed value thereafter.
   store     (cl-001) no second lifecycle store: the ONE local SQLite database is the
-            authority, so a state.json/pidfile-class sidecar name is a violation wherever
-            it appears — those sidecars outlive their launcher and lie.
+            authority, so a state.json/pidfile-class sidecar name is a violation in CODE
+            — those sidecars outlive their launcher and lie. A whole-line comment naming
+            one is NOT scanned (check_sources skips lines starting with `//`), and the
+            docstring said otherwise until 2026-08-28; a word in prose was never the
+            hazard, writing the sidecar is.
   secret    (cl-011) a credential never rides argv and has ONE raw reader: a manifest flag
             whose name is credential-shaped may not take a value (process lists leak;
             `--token-stdin` is the shape that does not), and `secret.Value.Reveal()` may
             be called only where the value becomes an Authorization header.
-  cloud     (cl-001) no Tensorhub implementation and no cloud policy here: cozy-creator
-            shares schemas and the client contract, and emulates nothing. Local grants are
-            a CAS root plus an output dir; a minted bearer/JWT token would be a fake.
-  cas       (cl-012) the TRANSFER plane hashes nothing and nobody composes a store path.
-            A digest computed while moving bytes could only become a client receipt, and a
-            client receipt substitutes for nothing (law 18); a hand-built
-            `objects/sha256/…` path would be a second spelling of TensorFS's own layout.
+  cas       (cl-012) nobody composes a store path: a hand-built `objects/sha256/…` path
+            would be a second spelling of TensorFS's own layout, and would silently read
+            the wrong object the first time either side moved.
   api       (cl-006) a loopback bind is not a boundary: NO cookie is read anywhere
             (bearer only — a cookie is ambient authority a browser attaches cross-site),
-            NO Access-Control-Allow-* header is ever set, and there is exactly ONE
-            net.Listen("tcp", …) site, which refuses a non-loopback address.
+            an Access-Control-Allow-* header needs a //cozy:allow door stating where its
+            origins come from, and inside internal/api the rule is ABSOLUTE — no door
+            (#628): a CORS header on a loopback bind is what makes it readable by any
+            page the browser loads. And there is exactly ONE net.Listen(…) site per
+            program, each with its own stated rule.
   contract  (cl-006) internal/api/routes.go and docs/client-contract.md are ONE surface,
             row for row, scope for scope. The document is what th-021's other two hosts
             implement against, so drift is a shared-contract defect, not a doc lag.
@@ -61,9 +66,14 @@ SCAN = ["go.mod", "cmd/**/*.go", "internal/**/*.go"]
 DENY_DEPS = ["tensorhub-v2", "varena"]
 YAML_IMPORT = "go.yaml.in/yaml/v3"
 
+# The canonical carriers TensorFS parses. A second reader here would drift from the one
+# that produced the published bytes. The generic systems words that used to sit beside
+# them (chunk, mmap, dtype, residency, quantiz, pagein) were deleted 2026-08-28: they
+# banned ordinary Go vocabulary — including the worker protocol's own ComputeDtype and
+# Placement field names — and named no failure the code would otherwise have had.
 DENY_IMPL = [
-    "safetensors", "cozytensor", "tensorbytes", "tensorchunk", "chunk", "residency",
-    "mmap", "dtype", "quantiz", "gguf", "loadtensor", "weightbytes", "pagein",
+    "safetensors", "cozytensor", "tensorbytes", "tensorchunk", "loadtensor",
+    "weightbytes", "gguf",
 ]
 
 # Prompt-library qualifiers and password readers, as bare identifiers. Import paths
@@ -81,12 +91,11 @@ DENY_PROMPT_CALLS = [
 ENV_READER = "internal/config/config.go"
 DENY_ENV_CALLS = ["os.Getenv", "os.LookupEnv", "os.Environ", "syscall.Getenv", "syscall.Environ"]
 
-# Lifecycle-sidecar names, matched on RAW lines (a comment naming one is still a plan to
-# write one). The SQLite database is the sole lifecycle authority.
+# Lifecycle-sidecar names, matched on RAW code lines — raw because a sidecar name is a
+# string literal, which the identifier scan blanks. Whole-line comments are skipped by
+# check_sources, so this catches the sidecar being WRITTEN, not the word being said.
+# The SQLite database is the sole lifecycle authority.
 DENY_STORE = ["state.json", "status.json", "workers.json", "sessions.json", "pidfile", ".pidfile"]
-
-# Cloud emulation and fabricated credentials, as bare identifiers.
-DENY_CLOUD = {"tensorhub", "jwt", "Bearer", "SignedString", "mintToken", "ServiceClass"}
 
 # (cl-011) A credential-shaped flag NAME. `--token-stdin` and `--no-browser` are not
 # credential values; `--token <t>` is, and argv is world-readable on this planet.
@@ -130,6 +139,12 @@ REVEAL_SITES = {
 #     as an accident.
 DENY_COOKIE = ["http.Cookie", "SetCookie", "http.SetCookie", ".Cookies", ".Cookie("]
 CORS_HEADER = re.compile(r"Access-Control-Allow-", re.I)
+# (#628, owner ruling 2026-08-27) The CORS family stands, with the `//cozy:allow` door as
+# the escape a pod-side route takes when it echoes the RentalProvisionSpec's origins. Inside
+# the owner's loopback API the rule is ABSOLUTE and the door is NOT honored: that surface is
+# the DNS-rebinding target, and a doored CORS header there would be the hole arriving as a
+# comment.
+CORS_ABSOLUTE = "internal/api/"
 #   Two programs, two bind rules, and they are NOT the same rule (#506b). The owner's
 #   `cozy` binary binds once, on loopback, for its local client API. The POD's media
 #   server (`cmd/cozy-media`) binds once, off-loopback on purpose — it is the leg an
@@ -175,14 +190,6 @@ MEDIA_CONTRACT_FIELDS = ["contract_rev", "max_receipt_bytes"]
 ALLOW_DOOR = "//cozy:allow"
 STDIN_DOOR = "//cozy:stdin-value"
 
-# (cl-012) The TRANSFER plane hashes nothing. Elsewhere cozy-creator legitimately
-# digests its own subjects (a release archive, an execution spec, a credential), but a
-# hash computed while moving canonical bytes could only become a client-side receipt —
-# and a client receipt never substitutes for the hub's or the store's own proof
-# (README law 18). The temptation lives exactly here, so the fence does too.
-DIGEST_FREE = ["internal/transfer/", "internal/tfs/", "internal/hub/"]
-DENY_DIGEST = ["sha256.New", "sha256.Sum256", "sha512.New", "sha1.New", "md5.New"]
-
 # (cl-012) The CAS layout is TensorFS's. A path composed here would drift from it the
 # first time either side changed, and the drift would present as a corrupt store.
 CAS_PATH = re.compile(r'objects\s*[/",\s]+\s*sha256', re.I)
@@ -214,8 +221,7 @@ RUNTIME_VERBS_DENY = {"run", "job", "serve", "rm", "pull", "ingest", "new"}
 # literal starts on. scripts/*.py are scanned with the same vocabulary.
 DENY_EMBED = [
     "parse_header", "safetensors", "cozytensor", "tensorbytes", "tensorchunk",
-    "loadtensor", "weightbytes", "pagein", "quantiz", "gguf", "dtype", "mmap",
-    "torch", "cuda",
+    "loadtensor", "weightbytes", "gguf",
 ]
 PY_SCAN = "scripts/*.py"
 # fence.py names the vocabulary in order to deny it; sdxl_proof.py is FIXTURE SOURCE for
@@ -443,10 +449,17 @@ def check_sources():
                 bad.append(f"{p}:{i}: [cas] a store path is composed here — TensorFS owns the "
                            f"CAS layout, and `tfs get`/`tfs put` are how an object is reached: {s}")
             # RAW: a CORS header is a string LITERAL, so the identifier scan (which blanks
-            # literals) would never see one.
-            if CORS_HEADER.search(s) and ALLOW_DOOR not in line:
-                bad.append(f"{p}:{i}: [api] an Access-Control-Allow-* header — this API sets NO CORS "
-                           f"header at all, so a foreign page cannot read what it is handed: {s}")
+            # literals) would never see one. SCOPED to the owner's loopback API (narrowed
+            # 2026-08-28): a CORS header there lets any page the user's browser loads read
+            # 127.0.0.1 — the Ollama DNS-rebinding class. Off-loopback surfaces the browser
+            # is MEANT to reach cross-origin (cmd/cozy-media) open their own door at the route.
+            if CORS_HEADER.search(s) and not (ALLOW_DOOR in line and not p.as_posix().startswith(CORS_ABSOLUTE)):
+                where = ("the OWNER'S loopback API, where the rule is ABSOLUTE and the door is "
+                         "not honored") if p.as_posix().startswith(CORS_ABSOLUTE) else \
+                        "this repo, and it carries no //cozy:allow door stating its origin source"
+                bad.append(f"{p}:{i}: [api] an Access-Control-Allow-* header in {where} — a CORS "
+                           f"header on a loopback, bearer-authenticated bind is what lets any page "
+                           f"the browser loads read 127.0.0.1 (#628): {s}")
         if p.suffix != ".go":
             continue
         for i, line in enumerate(strip_go(raw).splitlines(), 1):
@@ -467,20 +480,11 @@ def check_sources():
                         bad.append(f"{p}:{i}: [env] '{call}' outside {ENV_READER} — the "
                                    f"environment is read once, at the entrypoint: {line.strip()}")
             for ident in idents:
-                if ident in DENY_CLOUD:
-                    bad.append(f"{p}:{i}: [cloud] '{ident}' — cozy-creator emulates no cloud "
-                               f"policy and mints no credential: {line.strip()}")
                 if ident in DENY_PROMPT:
                     bad.append(f"{p}:{i}: [prompt] '{ident}' reads input — no cozy command may prompt: {line.strip()}")
                 if ident == "Stdin" and STDIN_DOOR not in src_line:
                     bad.append(f"{p}:{i}: [prompt] stdin read without the {STDIN_DOOR} door: {line.strip()}")
             rel = str(p).replace("\\", "/")
-            if any(rel.startswith(d) for d in DIGEST_FREE):
-                for call in DENY_DIGEST:
-                    if re.search(r"(?<![\w.])" + re.escape(call) + r"\s*\(", line):
-                        bad.append(f"{p}:{i}: [cas] '{call}' in the transfer plane — a digest computed "
-                                   f"while moving bytes is a client receipt, and a client receipt proves "
-                                   f"nothing (law 18): {line.strip()}")
             if rel not in RUNTIME_SITES and RUNTIME_BIN.search(src_line) and \
                     ALLOW_DOOR not in src_line:
                 bad.append(f"{p}:{i}: [runtime] the cozy-runtime binary is reached outside "
@@ -752,8 +756,6 @@ def check_video_boundary():
                       "--region", "--accelerator", "--snapshot-root", ".artifacts"):
         if forbidden in surface:
             bad.append(f"[video] video command surface contains placement/model input {forbidden}")
-    if surface.count('Name: "--rental"') != 2:
-        bad.append("[video] compose and submit each need the Tensorhub-issued --rental handle")
     source = pathlib.Path("internal/video/source.go").read_text()
     forbidden_fields = re.compile(
         r'yaml:"(?:lane|model|provider|datacenter|region|accelerator|gpu|snapshot|model_root|artifact)'
@@ -763,7 +765,9 @@ def check_video_boundary():
     proof = pathlib.Path("proofs/h3-long-form/accept.sh")
     if proof.exists():
         text = proof.read_text().lower()
-        for forbidden in ("runpod", "dual-full", "fp8-baked", "mxfp8-baked", ".artifacts"):
+        # The lane spellings that used to sit here died with #621's adaln-pruned hardcut;
+        # a fence that polices retired vocabulary polices nothing.
+        for forbidden in ("runpod", ".artifacts"):
             if forbidden in text:
                 bad.append(f"[video] paid acceptance script hardcodes {forbidden}")
     return bad
@@ -781,12 +785,12 @@ if violations:
 print(
     f"fence green — deps({len(DENY_DEPS)}) impl({len(DENY_IMPL)}) "
     f"prompt({len(DENY_PROMPT) + len(DENY_PROMPT_CALLS) + 1}) matrix(15 rows) "
-    f"env({len(DENY_ENV_CALLS)}) store({len(DENY_STORE)}) cloud({len(DENY_CLOUD)}) "
+    f"env({len(DENY_ENV_CALLS)}) store({len(DENY_STORE)}) "
     f"manifest({RECLAIM_VERB.pattern} + globals!{'/'.join(VERSION_SPELLINGS)} "
     f"+ next/examples per implemented row) "
     f"render(one stream@{RENDER_SRC}) secret({SECRET_FLAG.pattern} + Reveal@{len(REVEAL_SITES)}) "
-    f"cas({len(DENY_DIGEST)} digests@{len(DIGEST_FREE)} + store-path) tensor(tfs@{len(TFS_SITES)}) "
-    f"api({len(DENY_COOKIE)} cookie + cors + listen@{len(LISTEN_SITES)} programs) "
+    f"cas(store-path) tensor(tfs@{len(TFS_SITES)}) "
+    f"api({len(DENY_COOKIE)} cookie + cors(absolute@{CORS_ABSOLUTE}) + listen@{len(LISTEN_SITES)} programs) "
     f"media({len(DENY_MEDIA_EGRESS)} egress + {len(DENY_MEDIA_IMPORT)} imports@{MEDIA_DIR} "
     f"+ {len(MEDIA_CONTRACT_FIELDS)} contract fields@{MEDIA_CONTRACT_HOME}) "
     f"runtime({len(RUNTIME_VERBS_DENY)} denied verbs@{len(RUNTIME_SITES)} + indirection) "

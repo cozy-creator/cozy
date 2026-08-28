@@ -452,7 +452,7 @@ func planSummary(p *pb.AttemptPlanSummary) string {
 	// protocol's own field name, transported and rendered, never chosen here. #510i renames
 	// it to `residency` on the protocol's next touch; until then the comment is the fence.
 	return fmt.Sprintf("%s/%s %s %s device=%dB host=%dB",
-		p.Delivery, p.Materialization, p.ComputeDtype, p.Placement, //cozy:allow the protocol's own AttemptPlanSummary field, transported and rendered — never chosen here
+		p.Delivery, p.Materialization, p.ComputeDtype, p.Placement,
 		p.ReservedDeviceMemoryBytes, p.ReservedHostBytes)
 }
 

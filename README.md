@@ -183,8 +183,10 @@ the runtime: every submission still flows orchestrator → worker protocol → r
   re-verified on every read — an edited bundle is `bundle_corrupt`, never a story.
 - **A loopback bind is not a boundary.** Loopback-only, IPv4 and IPv6, with no flag that
   widens it; a `Host` allowlist (the DNS-rebinding kill switch); `Origin` checks on every
-  mutation and stream open; **bearer only, no cookie read anywhere**; no CORS header at
-  all; a strict CSP. Two per-launch credentials die with the process — the browser's rides
+  mutation and stream open; **bearer only, no cookie read anywhere**; **no CORS header
+  here, absolutely and without a door** (#628) — a CORS header on a loopback bind is what
+  makes it readable by any page the browser loads; a strict CSP. Elsewhere a CORS header
+  needs a `//cozy:allow` door naming where its origins come from. Two per-launch credentials die with the process — the browser's rides
   `--open`'s URL FRAGMENT (never the query string, so it reaches neither the server nor a
   log nor a `Referer`), the CLI's a 0600 file. Neither ever enters argv, a log, or an
   error. The `api` fence family proves the cookie, CORS and single-bind-site invariants.
@@ -451,9 +453,8 @@ becomes a named local root only after `tfs snapshot verify` proves every declare
   done is always the wrong one.
 - **Accounting separates MOVED from DEDUPED** on every line, and an object is counted
   once per run even though the fetch rounds overlap by construction.
-- **The transfer plane hashes nothing** (fence family `cas`). A digest computed while
-  moving bytes could only become a client receipt, and a client receipt substitutes for
-  nothing — the hub re-verifies every object it already held, and says how many.
+- **The hub re-verifies every object it already held**, and says how many; a client-side
+  digest is a convenience, never the proof (law 18).
 - `--token-stdin` takes this invocation's credential as a VALUE on stdin. It is not a
   prompt and never argv.
 
@@ -568,13 +569,17 @@ No automated tests. Verification is running the real thing:
   a READY worker with no weights to fill, a typed `completed` terminal, a published PNG,
   zero reserved VRAM and an empty construction digest, plus the typed failure terminal —
   `cozy down`'s proof of absence, and the verified upgrade.
-- `scripts/fence.py` enforces fourteen families: forbidden deps, byte-plane vocabulary
-  (TensorFS owns storage/residency), interactive prompts, exit-matrix parity, a manifest
-  lint, the env-read fence (one reader), no lifecycle sidecar, no cloud emulation or
-  minted credential, the secret fence (no credential-shaped flag takes an argv value;
-  `Reveal()` only where the value becomes a header), the `cas` fence (the transfer plane
-  hashes nothing; nobody composes a store path), the `tensor` fence (the tensorfs CLI
-  has one caller) and the `media` fence (the pod's byte plane has no outbound capability
-  and cannot import the worker protocol, and its wire contract is declared in
-  `internal/mediawire` and restated nowhere). Doors are greppable: `//cozy:allow`,
-  `//cozy:stdin-value`.
+- `scripts/fence.py` enforces fourteen families: forbidden deps, the canonical tensor
+  carriers TensorFS parses, interactive prompts, exit-matrix parity, a manifest lint (gate
+  declaration, no `--version` global, and a `Next:`/`Examples:` disclosure on every
+  implemented row), the `render` fence (one stream — an error is data and leaves on
+  stdout), the env-read fence (one reader), no lifecycle sidecar, the secret fence (no
+  credential-shaped flag takes an argv value; `Reveal()` only where the value becomes a
+  header), the `cas` fence (nobody composes a store path), the `api` fence (no cookie, one
+  bind per program, and a CORS header that is doored elsewhere but ABSOLUTELY refused
+  inside `internal/api` per #628), client-contract parity, the `media` fence (the pod's
+  byte plane has no outbound capability and cannot import the worker protocol, and its
+  wire contract is declared in `internal/mediawire` and restated nowhere) and the `tensor`
+  fence (the tensorfs CLI has one caller). Doors are greppable: `//cozy:allow`,
+  `//cozy:stdin-value`. The `cloud` family and the transfer-plane digest ban were deleted
+  2026-08-28 as vocabulary rules with no failure behind them.
