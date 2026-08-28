@@ -21,7 +21,7 @@ import (
 	pb "github.com/cozy-creator/cozy-creator/protocol/cozy/worker/v1"
 )
 
-// worker-protocol's FROZEN corpus at schema rev 5, checked out beside this repo.
+// worker-protocol's FROZEN corpus at schema rev 6, checked out beside this repo.
 const fixtureDir = "/home/fidika/cozy_v2/worker-protocol/fixtures"
 
 // TestCanonicalDocuments is the identity fence. Every document that crosses a repo or
