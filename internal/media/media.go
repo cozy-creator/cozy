@@ -282,7 +282,7 @@ func codeFor(status int) exit.Code {
 // answers" and "the pod admits this host" are one answer instead of two — and it is the
 // media plane's ONE version handshake, which is why it runs before any byte moves.
 //
-// The two ends of this plane are released separately: the pod's `cozy-pod` is compiled
+// The two ends of this plane are released separately: the pod's `pod-supervisor` is compiled
 // into its image from a commit pin and this client floats with master, so a route or a
 // field can move on one side alone. The revision closes that: a plane at another revision,
 // or one too old to declare a revision at all, is refused here rather than fed bytes whose

@@ -527,13 +527,13 @@ installed-binary state and release state are four distinct evidence axes, so a g
   no card can make for itself. `no_servable_function` survives for its one remaining case:
   a release whose descriptor registers no entrypoint at all.
 
-## The pod, as one binary (cl-014, xs-004, cl-036)
+## The pod supervisor, as one binary (cl-014, xs-004, cl-036, cl-037)
 
 A rented pod runs one container with ONE Go process from this repo, plus the Python worker.
 It is built here because it is the peer of `internal/media` and shares one wire contract;
 the image RECIPE that assembles it is Tensorhub's.
 
-`cmd/cozy-pod` is the entrypoint, the supervisor, and the byte plane. It was two binaries —
+`cmd/pod-supervisor` is the pod's PID 1, process supervisor, and byte plane. It was two binaries —
 `cozy-bootstrap` and `cozy-media` — until cl-036 merged them into one artifact and one
 commit pin. **It dials nothing.** It takes no arguments and reads no configuration file:
 its whole launch surface is six ALLOWLISTED `COZY_*` environment variables, and an
@@ -563,7 +563,7 @@ buy that down and both are fenced with red arms:
 
 - **Supervision is not reachable from a request path.** The handlers live in
   `internal/podmedia`, which the fence forbids `os/exec`, signals, and process handles
-  outright; everything that spawns, signals or reaps is in `cmd/cozy-pod/supervise.go`,
+  outright; everything that spawns, signals or reaps is in `cmd/pod-supervisor/supervise.go`,
   which is package main and cannot be imported at all.
 - **The readiness HMAC key is wiped.** Its environment slot is unset the instant it is
   decoded — before any listener binds or any child exists — and the bytes are zeroed by the
@@ -614,7 +614,7 @@ No automated tests. Verification is running the real thing:
   crash on the weightless fixture; and `TestPodMediaGrant`/`TestPodMediaFailsClosed` run the
   pod's byte plane for real over a real TLS leaf — the admission matrix, the receipt served
   byte-identically, and ten adversary digest sets that each yield NO PLANE. A test whose peer is absent SKIPS by name.
-- `scripts/verify-hardening.sh` runs the real `cozy-pod` binary against the pod's hardening
+- `scripts/verify-hardening.sh` runs the real `pod-supervisor` binary against the pod's hardening
   claims — 30 arms: ambient `RUNPOD_*` provider identity never reaches guest truth, an
   unknown or retired `COZY_*` name is refused BY NAME rather than ignored, the child
   environment allowlist is exactly the reviewed five-name set, the readiness ceiling is

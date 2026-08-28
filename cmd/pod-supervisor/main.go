@@ -1,9 +1,9 @@
-// cozy-pod is THE RENTED POD, as one process: PID 1 of the pod's single container, and
+// pod-supervisor is the rented pod's process supervisor: PID 1 of its single container and
 // the whole of this repo's guest side. It was two binaries until cl-036 — `cozy-bootstrap`
 // supervised and `cozy-media` served — and they are now one image artifact, one pinned
 // commit, and one process.
 //
-// IT DIALS NOTHING. The fence holds this binary WHOLE — `cmd/cozy-pod` and
+// IT DIALS NOTHING. The fence holds this binary WHOLE — `cmd/pod-supervisor` and
 // `internal/podmedia` alike — to an absolute no-egress rule with no exception of any kind.
 // That was the merge's precondition and it is why the merge is admissible: cl-036's diet
 // deleted the supervisor's one outbound door along with the two provision documents it
@@ -51,13 +51,13 @@ import (
 
 func main() {
 	if len(os.Args) != 1 {
-		fmt.Fprintln(os.Stderr, "cozy-pod: this entrypoint takes no arguments")
+		fmt.Fprintln(os.Stderr, "pod-supervisor: this entrypoint takes no arguments")
 		os.Exit(2)
 	}
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 	if err := run(ctx); err != nil && !errors.Is(err, context.Canceled) {
-		fmt.Fprintln(os.Stderr, "cozy-pod:", err)
+		fmt.Fprintln(os.Stderr, "pod-supervisor:", err)
 		os.Exit(1)
 	}
 }

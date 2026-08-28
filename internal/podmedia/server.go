@@ -2,10 +2,10 @@
 // rented pod, and the only way bytes cross between an owner and the worker it rented.
 //
 // It is a PACKAGE and not a program (cl-036). It used to be `cmd/cozy-media`, a second
-// binary the supervisor exec'd; the pod now ships ONE binary, `cmd/cozy-pod`, and this
+// binary the supervisor exec'd; the pod now ships ONE binary, `cmd/pod-supervisor`, and this
 // plane runs inside it. The split that remains is the one that carries weight: THIS
 // package parses attacker-influenced request bytes and it is fenced against every
-// privilege the supervisor holds — it may not exec, signal, or reap, and `cmd/cozy-pod`
+// privilege the supervisor holds — it may not exec, signal, or reap, and `cmd/pod-supervisor`
 // is package main, so nothing here can even NAME the supervision loop. The concentration
 // the merge creates (PID 1 co-resident with an HTTP parser) is bought down by that
 // boundary rather than by a comment.
@@ -75,7 +75,7 @@ import (
 
 // Options is the whole launch surface of the media plane. Everything is a path grant or a
 // bound; nothing is discovered, nothing is read from the environment, and there is no
-// configuration file. `cmd/cozy-pod` fills it from the eight allowlisted pod variables and
+// configuration file. `cmd/pod-supervisor` fills it from the eight allowlisted pod variables and
 // its own fixed image layout — this package never learns either.
 type Options struct {
 	Listen           string
@@ -156,7 +156,7 @@ const maxTokenHashes = 16
 // Sorted and unique is required, not normalized: the caller already owes a canonical set,
 // and silently repairing one hides a caller that has drifted.
 //
-// `cmd/cozy-pod` validates the same digests one more time, in the shape the pod
+// `cmd/pod-supervisor` validates the same digests one more time, in the shape the pod
 // environment spells them. That is not redundancy to delete: the plane refuses to bind on
 // a set it cannot authenticate, and the merge means a plane that will not bind is a pod
 // that does not boot.

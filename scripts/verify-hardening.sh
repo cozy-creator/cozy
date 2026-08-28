@@ -2,7 +2,7 @@
 # The pod's hardening proof, against the REAL binary (no test suite: decisions.md #160).
 # Verification here is running the real thing.
 #
-# cl-036 merged `cozy-bootstrap` and `cozy-media` into ONE binary, `cozy-pod`, so every arm
+# cl-036 merged `cozy-bootstrap` and `cozy-media` into ONE binary, `pod-supervisor`, so every arm
 # below now drives one process. Two consequences shaped this file:
 #
 #   * The media plane has no argv left. Its grant used to be `--token-sha256` on a second
@@ -37,7 +37,7 @@ set -euo pipefail
 root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 work=$(mktemp -d)
 trap 'rm -rf -- "$work"' EXIT
-nice -n 19 go build -o "$work/cozy-pod" "$root/cmd/cozy-pod"
+nice -n 19 go build -o "$work/pod-supervisor" "$root/cmd/pod-supervisor"
 
 pass=0
 fail=0
@@ -55,7 +55,7 @@ base_env=(
   "COZY_RENTER_TOKEN_SHA256_JSON=$good_hashes"
 )
 
-run() { env -i "$@" timeout 15 "$work/cozy-pod" 2>&1 || true; }
+run() { env -i "$@" timeout 15 "$work/pod-supervisor" 2>&1 || true; }
 
 out=$(run "${base_env[@]}" \
   "RUNPOD_POD_ID=provider-native-id-must-not-enter-guest-truth" \
@@ -106,7 +106,7 @@ out=$(env -i "PATH=/usr/bin:/bin" "HOME=$work" \
   "COZY_ACQUISITION_ATTEMPT_ID=ra-hardening-proof" \
   "COZY_BOOTSTRAP_RECEIPT_HMAC_KEY_B64URL=$(printf 'A%.0s' $(seq 43))" \
   "COZY_WORKER_INTERNAL_PORT=43100" "COZY_MEDIA_INTERNAL_PORT=43101" \
-  "COZY_RENTER_TOKEN_SHA256_JSON=$good_hashes" timeout 15 "$work/cozy-pod" 2>&1 || true)
+  "COZY_RENTER_TOKEN_SHA256_JSON=$good_hashes" timeout 15 "$work/pod-supervisor" 2>&1 || true)
 if grep -q 'required environment variable COZY_RENTAL_LEASE_EXPIRY_UNIX is absent' <<<"$out"; then
   ok "the lease expiry is required under its own name ($(head -1 <<<"$out"))"
 else
@@ -115,14 +115,14 @@ fi
 
 # The certificate is minted against the LEASE and nothing else. A boot-shaped timeout here
 # would expire the pod's serving cert mid-rental, so the value has exactly one reader.
-if grep -q 'mintCertificate(cfg.leaseExpiry)' "$root/cmd/cozy-pod/state.go" &&
-    grep -q 'NotAfter:     leaseExpiry.Add(time.Hour)' "$root/cmd/cozy-pod/state.go"; then
+if grep -q 'mintCertificate(cfg.leaseExpiry)' "$root/cmd/pod-supervisor/state.go" &&
+    grep -q 'NotAfter:     leaseExpiry.Add(time.Hour)' "$root/cmd/pod-supervisor/state.go"; then
   ok "the pod's serving certificate expires with the rental lease, not with a boot timeout"
 else
   bad "the TLS leaf is no longer minted against the rental lease expiry"
 fi
 
-got=$(awk '/^func childEnvironment/,/^}$/' "$root/cmd/cozy-pod/config.go" |
+got=$(awk '/^func childEnvironment/,/^}$/' "$root/cmd/pod-supervisor/config.go" |
   grep -oE '"[A-Z_]+"' | tr -d '"' | sort | paste -sd, -)
 # Class-D base inherit list — tracker-v2/spawn-allowlists.md (#616.d).
 want="LANG,LC_ALL,SSL_CERT_DIR,SSL_CERT_FILE,TZ"
@@ -134,10 +134,10 @@ fi
 
 # Whole-line comments are prose (the same convention scripts/fence.py uses); the hazard
 # is the number being DECLARED here, not the story of it having been.
-if grep -rhvE '^[[:space:]]*//' "$root"/cmd/cozy-pod/*.go "$root"/internal/podmedia/*.go |
+if grep -rhvE '^[[:space:]]*//' "$root"/cmd/pod-supervisor/*.go "$root"/internal/podmedia/*.go |
     grep -qE '(64[[:space:]]*<<[[:space:]]*10|maxReceiptEnvelopeSize)'; then
   bad "the receipt ceiling is restated in the pod binary instead of imported from internal/mediawire"
-elif grep -q 'mediawire.MaxReceiptBytes' "$root/cmd/cozy-pod/receipt.go"; then
+elif grep -q 'mediawire.MaxReceiptBytes' "$root/cmd/pod-supervisor/receipt.go"; then
   ok "the receipt ceiling is the media plane's own published constant, imported"
 else
   bad "the pod bounds the readiness envelope by neither the published constant nor a literal"
@@ -147,11 +147,11 @@ fi
 # credential-shaped file for the media plane to poll (that file had one writer and no
 # updater, so its reload/epoch machinery could never fire), and since the merge there is no
 # command line to put them on either — which is one fewer place a process list can leak.
-if grep -qE 'atomicWrite\((token|hash)[A-Za-z]*Path' "$root"/cmd/cozy-pod/*.go; then
+if grep -qE 'atomicWrite\((token|hash)[A-Za-z]*Path' "$root"/cmd/pod-supervisor/*.go; then
   bad "the pod writes a token-hash file again — the digests are a launch grant"
-elif grep -qE '"--token-sha256"' "$root"/cmd/cozy-pod/*.go; then
+elif grep -qE '"--token-sha256"' "$root"/cmd/pod-supervisor/*.go; then
   bad "the pod puts the renter digests on a command line — the merge removed that surface"
-elif grep -q 'TokenHashes:      mediaGrant(cfg.tokenHashes)' "$root/cmd/cozy-pod/supervise.go"; then
+elif grep -q 'TokenHashes:      mediaGrant(cfg.tokenHashes)' "$root/cmd/pod-supervisor/supervise.go"; then
   ok "renter token digests reach the media plane in memory — no file, no argv"
 else
   bad "the pod hands the media plane no token digests at all"
@@ -159,19 +159,19 @@ fi
 
 # THE MERGE'S FIRST PRICE: the readiness HMAC key is wiped. Its environment slot goes where
 # it is decoded — before any listener binds or any child exists — and its bytes go in the
-# one call that seals the envelope. `cmd/cozy-pod` is the whole search space; the fence
+# one call that seals the envelope. `cmd/pod-supervisor` is the whole search space; the fence
 # additionally refuses to let the key be NAMED anywhere but these two files.
-if grep -q 'os.Unsetenv(envReceiptKey)' "$root/cmd/cozy-pod/config.go"; then
+if grep -q 'os.Unsetenv(envReceiptKey)' "$root/cmd/pod-supervisor/config.go"; then
   ok "the readiness HMAC key's environment slot is unset where the key is decoded"
 else
   bad "the readiness HMAC key stays in the environment after it is decoded"
 fi
-if grep -Pzoq 'k\.raw\[i\] = 0[\s\S]{0,80}k\.raw = nil' "$root/cmd/cozy-pod/receipt.go"; then
+if grep -Pzoq 'k\.raw\[i\] = 0[\s\S]{0,80}k\.raw = nil' "$root/cmd/pod-supervisor/receipt.go"; then
   ok "the readiness HMAC key's bytes are zeroed and dropped where the envelope is sealed"
 else
   bad "the readiness HMAC key survives the envelope it signed"
 fi
-if grep -q 'the readiness key was wiped' "$root/cmd/cozy-pod/receipt.go"; then
+if grep -q 'the readiness key was wiped' "$root/cmd/pod-supervisor/receipt.go"; then
   ok "a second signature is an error, not a second use of a wiped key"
 else
   bad "the attempt key is not one-shot: nothing refuses a second signing"
@@ -186,7 +186,7 @@ if grep -rlE '(exec\.Command|signal\.Notify|syscall\.SIG|\.Process\b|os/exec)' \
 else
   ok "the request path (internal/podmedia) holds none of PID 1's privileges"
 fi
-spawners=$(grep -rlE '(exec\.Command|\.Process\.(Signal|Kill)|cmd\.Wait)' "$root"/cmd/cozy-pod/*.go |
+spawners=$(grep -rlE '(exec\.Command|\.Process\.(Signal|Kill)|cmd\.Wait)' "$root"/cmd/pod-supervisor/*.go |
   xargs -n1 basename | sort | paste -sd, -)
 if [ "$spawners" = "supervise.go" ]; then
   ok "everything that execs, signals or reaps is in one file (supervise.go)"
@@ -194,13 +194,13 @@ else
   bad "supervision is spread across [$spawners] instead of supervise.go alone"
 fi
 if [ -d "$root/cmd/cozy-media" ] || [ -d "$root/cmd/cozy-bootstrap" ]; then
-  bad "the pod is still two binaries — cl-036 merged them into cmd/cozy-pod"
+  bad "the pod is still two binaries — cl-036 merged them into cmd/pod-supervisor"
 else
-  ok "the pod is ONE binary: cmd/cozy-pod, with no second main package beside it"
+  ok "the pod is ONE binary: cmd/pod-supervisor, with no second main package beside it"
 fi
 
 # The entrypoint is PID 1 of a container. It takes no arguments and says so.
-out=$(env -i "${base_env[@]}" timeout 15 "$work/cozy-pod" --anything 2>&1 || true)
+out=$(env -i "${base_env[@]}" timeout 15 "$work/pod-supervisor" --anything 2>&1 || true)
 if grep -q 'this entrypoint takes no arguments' <<<"$out"; then
   ok "the entrypoint refuses arguments ($(head -1 <<<"$out"))"
 else
@@ -216,7 +216,7 @@ closed() { # closed <label> <COZY_RENTER_TOKEN_SHA256_JSON value>
   local label=$1 value=$2
   local out
   out=$(env -i "${base_env[@]}" "COZY_RENTER_TOKEN_SHA256_JSON=$value" \
-    timeout 15 "$work/cozy-pod" 2>&1 || true)
+    timeout 15 "$work/pod-supervisor" 2>&1 || true)
   if grep -q 'COZY_RENTER_TOKEN_SHA256_JSON' <<<"$out"; then
     ok "$label: the pod refuses to boot ($(head -1 <<<"$out"))"
   else
@@ -240,7 +240,7 @@ closed "a 17-digest set" \
 # An ABSENT required grant is refused by name too: a pod that defaults a credential set is
 # a pod that authenticates somebody nobody provisioned.
 out=$(env -i "PATH=/usr/bin:/bin" "HOME=$work" \
-  "COZY_ACQUISITION_ATTEMPT_ID=ra-hardening-proof" timeout 15 "$work/cozy-pod" 2>&1 || true)
+  "COZY_ACQUISITION_ATTEMPT_ID=ra-hardening-proof" timeout 15 "$work/pod-supervisor" 2>&1 || true)
 if grep -q 'required environment variable COZY_BOOTSTRAP_RECEIPT_HMAC_KEY_B64URL is absent' <<<"$out"; then
   ok "an incomplete environment is refused by the missing name ($(head -1 <<<"$out"))"
 else

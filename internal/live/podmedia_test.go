@@ -27,7 +27,7 @@ import (
 
 // TestPodMediaGrant is the pod's byte plane, run for real. It moved here with cl-036: the
 // plane used to be a second binary (`cozy-media`) that `scripts/verify-hardening.sh`
-// launched with an argv grant, and the merged `cozy-pod` has no argv to launch it with —
+// launched with an argv grant, and the merged `pod-supervisor` has no argv to launch it with —
 // it binds the plane in-process from the validated environment grant. The arms did not
 // change shape, only their door: the same adversary digest sets, and the same admission
 // matrix, now driven through the real `podmedia.Bind`/`Serve` on a real socket. The
@@ -199,7 +199,7 @@ func podTLS(t *testing.T, dir string) (string, string) {
 	must(t, err)
 	template := &x509.Certificate{
 		SerialNumber: big.NewInt(1),
-		Subject:      pkix.Name{CommonName: "cozy-pod"},
+		Subject:      pkix.Name{CommonName: "pod-supervisor"},
 		NotBefore:    time.Now().Add(-5 * time.Minute),
 		NotAfter:     time.Now().Add(time.Hour),
 		KeyUsage:     x509.KeyUsageDigitalSignature,

@@ -46,14 +46,14 @@ Fourteen families:
   contract  (cl-006) internal/api/routes.go and docs/client-contract.md are ONE surface,
             row for row, scope for scope. The document is what th-021's other two hosts
             implement against, so drift is a shared-contract defect, not a doc lag.
-  pod       (cl-014/cl-031/xs-004/cl-036) THE POD BINARY, fenced WHOLE and with no
-            exception of any kind. `cmd/cozy-pod` (PID 1 and the supervisor) and
+  pod       (cl-014/cl-031/xs-004/cl-036/cl-037) THE POD SUPERVISOR, fenced WHOLE and with no
+            exception of any kind. `cmd/pod-supervisor` (PID 1 and the supervisor) and
             internal/podmedia (the request path) were two programs until cl-036 merged
             them; the rules that survive the merge are:
               * NO OUTBOUND CAPABILITY, absolutely, across BOTH halves. The supervisor's
                 one door went out with the two provision documents it fetched, which is
                 what made merging admissible: there is no file left to carve out.
-              * EXEC IS THE SUPERVISOR'S ALONE, and only in cmd/cozy-pod/supervise.go.
+              * EXEC IS THE SUPERVISOR'S ALONE, and only in cmd/pod-supervisor/supervise.go.
                 internal/podmedia parses attacker-influenced request bytes and may not
                 exec, signal, reap, or hold a process handle — that boundary is what buys
                 down PID 1 sharing an address space with an HTTP parser.
@@ -108,7 +108,7 @@ DENY_PROMPT_CALLS = [
 # program takes the frozen typed value.
 #   config/config.go   the `cozy` CLI. Its Inherited allowlist is class A of
 #                      tracker-v2/spawn-allowlists.md (#616.d).
-#   cozy-pod           THE POD, whose entire launch surface IS the injected environment:
+#   pod-supervisor     the pod's PID 1, whose entire launch surface IS the injected environment:
 #                      it takes no arguments and reads no configuration file, so its one
 #                      reader is also its one ALLOWLIST — an unrecognized COZY_* name is
 #                      refused rather than ignored, which is what makes a renamed grant a
@@ -116,7 +116,7 @@ DENY_PROMPT_CALLS = [
 #                      in-process reads no environment at all: it is handed its grant.
 ENV_READERS = {
     "internal/config/config.go": "the cozy CLI's entrypoint reader",
-    "cmd/cozy-pod/config.go": "the pod's entrypoint reader and allowlist",
+    "cmd/pod-supervisor/config.go": "the pod's entrypoint reader and allowlist",
 }
 ENV_READER = " / ".join(sorted(ENV_READERS))
 DENY_ENV_CALLS = ["os.Getenv", "os.LookupEnv", "os.Environ", "syscall.Getenv", "syscall.Environ"]
@@ -177,7 +177,7 @@ CORS_HEADER = re.compile(r"Access-Control-Allow-", re.I)
 CORS_ABSOLUTE = "internal/api/"
 #   Two programs, two bind rules, and they are NOT the same rule (#506b). The owner's
 #   `cozy` binary binds once, on loopback, for its local client API. The POD's media plane
-#   (`internal/podmedia`, served inside `cozy-pod` since cl-036) binds once, off-loopback
+#   (`internal/podmedia`, served inside `pod-supervisor` since cl-036) binds once, off-loopback
 #   on purpose — it is the leg an off-machine owner reaches — and its own rule is
 #   TLS-or-loopback, enforced in the same file. Naming both here keeps "one bind site" true
 #   PER PROGRAM instead of collapsing into "one bind site somewhere in the repo", which
@@ -194,8 +194,8 @@ LISTEN_CALL = re.compile(r"net\.Listen\w*\s*\(")
 
 # (cl-014 / xs-004 / cl-036, #506b) THE POD BINARY HAS NO OUTBOUND NETWORK, WHOLE.
 #
-# `cozy-pod` is PID 1 of a rented pod and it is ONE process: the supervisor half
-# (cmd/cozy-pod) and the byte-plane half (internal/podmedia) were `cozy-bootstrap` and
+# `pod-supervisor` is PID 1 of a rented pod and it is ONE process: the supervisor half
+# (cmd/pod-supervisor) and the byte-plane half (internal/podmedia) were `cozy-bootstrap` and
 # `cozy-media` until cl-036. The supervisor once held a BOUNDED egress licence — one file,
 # two exact-grant provision-document fetches — because the pod could not boot without them.
 # cr-048/th-067 retired those documents (a pod boots ready-but-empty and its closure
@@ -210,7 +210,7 @@ LISTEN_CALL = re.compile(r"net\.Listen\w*\s*\(")
 # poll, a telemetry ping, a "just fetch the config" convenience — is an exfiltration
 # channel with no exact-grant checks around it. This is the structural half of "prove no
 # request-path call crosses to the worker process".
-POD_DIRS = ("cmd/cozy-pod/", "internal/podmedia/")
+POD_DIRS = ("cmd/pod-supervisor/", "internal/podmedia/")
 POD_DIR = " / ".join(POD_DIRS)
 DENY_POD_EGRESS = [
     "http.Get", "http.Post", "http.PostForm", "http.Head", "http.NewRequest",
@@ -220,7 +220,7 @@ DENY_POD_EGRESS = [
 # …and NEITHER half may import the protocol, the orchestrator, the owner's API or its
 # hub/media clients: a pod that could speak `cozy.worker.v1` would be a second control
 # plane inside the pod. `internal/mediawire` is deliberately NOT here — importing the
-# contract is the point — and neither is `internal/podmedia`, which cmd/cozy-pod IS.
+# contract is the point — and neither is `internal/podmedia`, which cmd/pod-supervisor IS.
 DENY_POD_IMPORT = [
     "protocol/cozy/worker", "internal/orchestrator", "internal/api", "internal/hub",
     "internal/media",
@@ -232,10 +232,10 @@ POD_IMPORT_LINE = re.compile(
 # (cl-036) THE PRICE OF THE MERGE, HALF ONE: SUPERVISION IS NOT REACHABLE FROM A REQUEST
 # PATH. One process is now PID 1 and the parser of attacker-influenced bytes, so every
 # privilege that belongs to PID 1 — exec, signal, reap, a process handle — is spelled in
-# ONE FILE, cmd/cozy-pod/supervise.go, and is FORBIDDEN outright in internal/podmedia.
-# `cmd/cozy-pod` is package main and cannot be imported, so the handlers cannot reach the
+# ONE FILE, cmd/pod-supervisor/supervise.go, and is FORBIDDEN outright in internal/podmedia.
+# `cmd/pod-supervisor` is package main and cannot be imported, so the handlers cannot reach the
 # supervision loop even by name; this rule keeps a copy of it from growing beside them.
-POD_EXEC_SITE = "cmd/cozy-pod/supervise.go"
+POD_EXEC_SITE = "cmd/pod-supervisor/supervise.go"
 DENY_POD_EXEC = ["exec.Command", "exec.CommandContext"]
 # The import LINE, so a doc comment naming `os/exec` is prose and not a spawn door.
 EXEC_IMPORT_LINE = re.compile(r'^\s*(?:[A-Za-z_]\w*\s+)?"os/exec"\s*$')
@@ -253,13 +253,13 @@ DENY_HANDLER_PRIVILEGE = [
 # config.go unsets the environment slot where it decodes it, receipt.go zeroes the bytes in
 # the one call that signs with them. Deleting either half, or reading the key anywhere
 # else, is red.
-POD_KEY_HOME = {"cmd/cozy-pod/config.go", "cmd/cozy-pod/receipt.go"}
+POD_KEY_HOME = {"cmd/pod-supervisor/config.go", "cmd/pod-supervisor/receipt.go"}
 POD_KEY_IDENTS = ("hmacKey", "envReceiptKey", "attemptKey", "sealAndWipe", "newAttemptKey")
 POD_KEY_WIPES = {
-    "cmd/cozy-pod/config.go": (
+    "cmd/pod-supervisor/config.go": (
         re.compile(r"os\.Unsetenv\(envReceiptKey\)"),
         "the environment slot must be unset where the key is decoded"),
-    "cmd/cozy-pod/receipt.go": (
+    "cmd/pod-supervisor/receipt.go": (
         re.compile(r"k\.raw\[i\] = 0[\s\S]{0,80}k\.raw = nil"),
         "the key bytes must be zeroed and dropped in the call that seals the envelope"),
 }
@@ -289,9 +289,9 @@ DENY_MEDIA_DISTRIBUTION = ("PutPlan", "/v1/plans/")
 # The supervisor holds the receipt key and the renter token hashes and has nowhere to send
 # them. Keep fencing the header anyway: the day it presents a credential is the day a pod
 # supervisor becomes a capability an attacker can aim, and this rule is what makes that
-# arrive as a red fence rather than as a diff nobody read. Scoped to cmd/cozy-pod —
+# arrive as a red fence rather than as a diff nobody read. Scoped to cmd/pod-supervisor —
 # internal/podmedia READS an Authorization header, which is its whole admission policy.
-POD_SUPERVISOR_DIR = "cmd/cozy-pod/"
+POD_SUPERVISOR_DIR = "cmd/pod-supervisor/"
 POD_CREDENTIAL_HEADER = re.compile(r"Authorization", re.I)
 
 ALLOW_DOOR = "//cozy:allow"
@@ -479,7 +479,7 @@ DOCUMENT_KINDS = {
     "cozy.local.EntrypointBindingRecord/2": "internal/plan/plan.go",
     "cozy.local.EvaluatedConfig/1": "internal/app/identity.go",
     "cozy.local.ExecutionEnvironment/1": "internal/app/identity.go",
-    "cozy.pod-readiness/1": "cmd/cozy-pod/receipt.go",
+    "cozy.pod-readiness/1": "cmd/pod-supervisor/receipt.go",
     "cozy.rental_request/1": "internal/app/rentals.go",
     "cozy.video/1": "internal/video/source.go",
     "cozy.video.CreativePlan/1": "internal/video/composition.go",
