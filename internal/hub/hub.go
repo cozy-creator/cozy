@@ -24,6 +24,7 @@ import (
 	"net/http"
 	"net/url"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/cozy-creator/cozy-creator/internal/config"
@@ -56,9 +57,9 @@ type Client struct {
 	token  secret.Value
 	source string // where the token came from, for the remedy text
 	http   *http.Client
-	// slow answers a call whose BODY may be large (a rental view carrying a control
-	// snapshot): headers must still arrive within Timeout, but the body read is bounded
-	// by responseBytes and the caller's context rather than the per-call total.
+	// slow answers calls whose work or response is bounded by bytes rather than total
+	// wall time. Connection setup and headers are still bounded, and response bodies are
+	// guarded below by observed byte progress.
 	slow  *http.Client
 	agent string
 }
@@ -77,8 +78,62 @@ func New(cfg config.Config, agent string) *Client {
 
 func slowTransport() *http.Transport {
 	t := http.DefaultTransport.(*http.Transport).Clone()
+	t.DialContext = (&net.Dialer{Timeout: Timeout, KeepAlive: 30 * time.Second}).DialContext
 	t.ResponseHeaderTimeout = Timeout
 	return t
+}
+
+var errResponseStalled = errors.New("hub response body stalled")
+
+type responseProgress struct {
+	ctx    context.Context
+	cancel context.CancelCauseFunc
+	timer  *time.Timer
+	done   atomic.Bool
+}
+
+func guardResponse(req *http.Request) (*http.Request, *responseProgress) {
+	ctx, cancel := context.WithCancelCause(req.Context())
+	return req.WithContext(ctx), &responseProgress{ctx: ctx, cancel: cancel}
+}
+
+func (g *responseProgress) start() {
+	g.timer = time.AfterFunc(Timeout, func() { g.cancel(errResponseStalled) })
+}
+
+func (g *responseProgress) stop() {
+	g.done.Store(true)
+	if g.timer != nil {
+		g.timer.Stop()
+	}
+	g.cancel(nil)
+}
+
+func (g *responseProgress) touch() {
+	if !g.done.Load() && g.timer != nil {
+		g.timer.Reset(Timeout)
+	}
+}
+
+func (g *responseProgress) reader(r io.Reader) io.Reader {
+	return &progressReader{reader: r, touch: g.touch}
+}
+
+func (g *responseProgress) stalled() bool {
+	return errors.Is(context.Cause(g.ctx), errResponseStalled)
+}
+
+type progressReader struct {
+	reader io.Reader
+	touch  func()
+}
+
+func (r *progressReader) Read(p []byte) (int, error) {
+	n, err := r.reader.Read(p)
+	if n > 0 {
+		r.touch()
+	}
+	return n, err
 }
 
 func (c *Client) Base() string        { return c.base }
@@ -121,12 +176,8 @@ type call struct {
 	// idempotency is the caller-owned operation identity for a paid mutation. It is
 	// distinct from Tensorhub's provider operation id and survives a lost HTTP answer.
 	idempotency string
-	// byBytes drops the transport total for a call whose work is bounded by BYTES
-	// rather than by the hub's own latency (completion re-streams and re-hashes every
-	// declared object). A catalog read that is slow is broken; a completion that is
-	// slow is working, and this side cannot see how far along the hub is — so what
-	// bounds it is the CONNECTION being alive, which the kernel's keepalive answers,
-	// rather than a number picked here about someone else's work.
+	// byBytes drops the total wall clock for work bounded by bytes. Connection setup and
+	// headers remain bounded, and an answer body must keep making byte progress.
 	byBytes bool
 	// responseBytes widens the ordinary small-JSON cap for one explicitly bounded
 	// response shape and moves the call onto the slow client: a large snapshot body
@@ -297,19 +348,23 @@ func (c *Client) do(ctx context.Context, cl call, out any) *exit.Error {
 	}
 
 	client := c.http
-	switch {
-	case cl.byBytes:
-		wider := *c.http
-		wider.Timeout = 0
-		client = &wider
-	case cl.responseBytes > 0:
+	var progress *responseProgress
+	if cl.byBytes || cl.responseBytes > 0 {
 		client = c.slow
+		req, progress = guardResponse(req)
 	}
 	resp, err := client.Do(req)
 	if err != nil {
+		if progress != nil {
+			progress.stop()
+		}
 		return c.transport(err)
 	}
 	defer resp.Body.Close()
+	if progress != nil {
+		progress.start()
+		defer progress.stop()
+	}
 
 	cap := int64(maxBody)
 	if cl.raw != nil {
@@ -318,8 +373,18 @@ func (c *Client) do(ctx context.Context, cl call, out any) *exit.Error {
 	if cl.responseBytes > cap {
 		cap = cl.responseBytes
 	}
-	raw, err := io.ReadAll(io.LimitReader(resp.Body, cap))
+	responseBody := io.Reader(resp.Body)
+	if progress != nil {
+		responseBody = progress.reader(responseBody)
+	}
+	raw, err := io.ReadAll(io.LimitReader(responseBody, cap))
 	if err != nil {
+		if progress != nil && progress.stalled() {
+			return exit.Named(exit.Deadline, "hub.response_stalled",
+				"the hub at %s stopped sending its response body for %s", c.base, Timeout).
+				WithRemedy("retry; if it persists the hub is up but its response stream is stalled").
+				WithNext("cozy hub status")
+		}
 		return c.transport(err)
 	}
 	if resp.StatusCode >= 400 {
@@ -432,9 +497,8 @@ func statusCode(status int) exit.Code {
 	return exit.Internal
 }
 
-// Ref is `org/name` — one model or endpoint. Release addressing
-// (`@release` / `@sha256:…`) is th-003's grammar and is refused by name until it
-// exists, rather than being parsed into something this build cannot resolve.
+// Ref is one typed `org/name` endpoint or model resource. Commands that accept a release
+// pin split it before calling this resource parser.
 type Ref struct {
 	Org  string
 	Name string
@@ -444,8 +508,8 @@ func (r Ref) String() string { return r.Org + "/" + r.Name }
 
 func ParseRef(s string) (Ref, *exit.Error) {
 	if strings.Contains(s, "@") {
-		return Ref{}, exit.Usagef("%q pins a release, which this build cannot resolve", s).
-			WithRemedy("release addressing (@release, @sha256:…) lands with th-003; name the resource alone").
+		return Ref{}, exit.Usagef("%q is not a resource name", s).
+			WithRemedy("name exactly org/name here; model download parses @release and @sha256 pins separately").
 			WithNext("cozy endpoint search", "cozy model search")
 	}
 	org, name, ok := strings.Cut(s, "/")

@@ -60,7 +60,7 @@ func TestProductPath(t *testing.T) {
 	}{
 		{[]string{"job", "submit", "-h"}, 0, "usage: cozy job submit"},
 		{[]string{"rm"}, 7, "error(confirm)"},
-		{[]string{"export", "anything"}, 9, "error(unavailable)"},
+		{[]string{"model", "export", "anything"}, 9, "error(unavailable)"},
 		{[]string{"datasets", "push"}, 2, "it lands with issue th-035"},
 		{[]string{"endpoint", "publish", "cozy/example", "--release", "v1"}, 2, "it lands with issue cl-039"},
 		{[]string{"repo", "show", "cozy/example"}, 2, `unknown command "repo show"`},
@@ -93,22 +93,6 @@ func TestProductPath(t *testing.T) {
 		}
 	}
 
-	// Tensorhub's generic catalog and /publishes routes are gone. Their old command
-	// spellings are hard-cut, while the typed replacements name the Creator issue that
-	// will wire the current endpoint/model APIs.
-	for _, args := range [][]string{
-		{"search"}, {"repo", "show", "cozy/model"}, {"push", "cozy/model", "sha256:dead"},
-		{"pull", "cozy/model"}, {"deploy"}, {"promote", "cozy/endpoint", "release-1"},
-	} {
-		if code, out := runCozy(t, root, args...); code != 2 || !strings.Contains(out, "unknown command") {
-			t.Errorf("retired command cozy %s survived the typed hard cut [exit %d]\n%s",
-				strings.Join(args, " "), code, out)
-		}
-	}
-	if code, out := runCozy(t, root, "model", "publish", "cozy/model", "local-ref"); code != 2 || !strings.Contains(out, "not_implemented") || !strings.Contains(out, "cl-040") {
-		t.Errorf("typed model publication did not name cl-040 [exit %d]\n%s", code, out)
-	}
-
 	// THE SERVICE IS DOWN: every server-backed verb is typed exit 9 with the start remedy.
 	// This needs no endpoint and no runtime peer, so it is checked before anything is built.
 	for _, args := range [][]string{
@@ -139,9 +123,9 @@ func TestProductPath(t *testing.T) {
 	}
 
 	svc := startService(t, root)
-	if code, out := runCozy(t, root, "export", "anything"); code != 2 ||
+	if code, out := runCozy(t, root, "model", "export", "anything"); code != 2 ||
 		!strings.Contains(out, "error(not_implemented)") {
-		t.Errorf("cozy export with service up did not reach the final planned-row gate [exit %d]\n%s", code, out)
+		t.Errorf("cozy model export with service up did not reach the final planned-row gate [exit %d]\n%s", code, out)
 	}
 
 	// Running status reads its workload summary through the service API. Serving

@@ -22,8 +22,8 @@ and observes it — no mocks, no unit-test layer. #634 amends #160 for this repo
   without `--yes` (exit 7).
 
 Gates run help-first, then most-durable-refusal-first: `-h` (0) → confirm (7) →
-not-implemented (2) → arity (2) → service (9). Arity is a gate, not a parse step, so
-`-h` and a planned row's owning issue are never masked by an argument count.
+service unavailable (9) → not-implemented (2) → arity (2). Arity is a gate, not a parse
+step, so `-h` and a planned row's owning issue are never masked by an argument count.
 
 ## Install, pins and maintenance (cl-009)
 
@@ -314,6 +314,10 @@ capacity, and a grant that writes somewhere a reclaim cannot reach.
   transaction beside the outputs, so "a bundle is visible" and "a terminal was accepted"
   are one fact. The verdict is STAMPED as metadata and gates nothing: a failed run's landed
   writes still land (jobs.md), and a REQUEUEING attempt writes no publication at all.
+- **Publications are retained indefinitely.** They are the job's durable result, not a
+  cache and not mirrored media. `cozy gc` reports their count and recorded bytes but never
+  reclaims them. Any future deletion policy needs an explicit promotion/deletion owner
+  and tombstone semantics; it cannot silently reuse the media age horizon.
 - **The CHECKPOINT half is a runtime-border SEAM, not a Creator protocol.** A job that
   produces canonical bytes writes them through the one TensorFS border, and the publication
   TRANSACTION is the runtime's (cr-005/cr-009, jobs.md). What this host owes is to validate
@@ -480,10 +484,9 @@ becomes a named local root only after `tfs snapshot verify` proves every declare
 `scripts/xfer-realhub.sh` proves model publish → model download end to end against a hub
 built from the current contract, with no shim or retired route anywhere.
 
-`cozy endpoint publish` and `cozy endpoint promote` stay advertised-not-built: releases
-arrive with th-003 (the hub's own promotion route answers `promote.not_armed` today) and
-the leased proof that turns endpoint source into a release with th-004. `datasets
-push|pull` waits on th-035.
+`cozy endpoint publish` and `cozy endpoint promote` stay advertised-not-built: cl-039
+owns the Creator client over th-046 release assembly, and cl-041 consumes th-004's serving
+pointer. `datasets push|pull` waits on th-035.
 
 ## Release and distribution (cl-013)
 

@@ -314,15 +314,6 @@ func transient(e *exit.Error) bool {
 	return e.Code == exit.Unavailable || e.Code == exit.Deadline
 }
 
-func stamp(ts string) string {
-	if i := strings.IndexByte(ts, '.'); i >= 0 {
-		if z := strings.IndexAny(ts[i:], "Z+-"); z >= 0 {
-			return ts[:i] + ts[i+z:]
-		}
-	}
-	return ts
-}
-
 // rentalCallContext carries the caller's one explicit wall-clock bound into every Hub
 // request in the paid flow. Without it, a response body that kept moving one byte at a
 // time could remain live past --timeout because the polling loop checked the deadline

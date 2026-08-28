@@ -329,6 +329,17 @@ def files():
                 yield p
 
 
+def check_test_boundary():
+    """(#634) Go verification has one home: the real-system suite in internal/live."""
+    bad = []
+    for p in sorted(pathlib.Path(".").rglob("*_test.go")):
+        rel = p.as_posix()
+        if not rel.startswith("internal/live/"):
+            bad.append(f"{rel}: [test] *_test.go outside internal/live — #634 keeps one "
+                       "real-system verification home and no package-local mocked/unit layer")
+    return bad
+
+
 DOCUMENT_KINDS = {
     # proto-007 (#616.a): the `cozy.<name>/<N>` names this repo AUTHORS, each with the one
     # file that declares it. A format name exists only for a document that crosses a
@@ -810,7 +821,7 @@ def check_typed_resources():
 violations = (check_sources() + check_matrix() + check_manifest() + check_secret_flags()
               + check_contract() + check_video_boundary() + check_embedded() + check_scripts()
               + check_document_kinds() + check_render_streams()
-              + check_media_contract() + check_typed_resources())
+              + check_media_contract() + check_typed_resources() + check_test_boundary())
 if violations:
     print("FENCE RED (boundaries.md):", file=sys.stderr)
     for v in violations:
@@ -829,5 +840,5 @@ print(
     f"runtime({len(RUNTIME_VERBS_DENY)} denied verbs@{len(RUNTIME_SITES)} + indirection) "
     f"embed({len(DENY_EMBED)} words, scripts allow@{len(PY_ALLOW)}) "
     f"contract({len(parse_go_routes(pathlib.Path('internal/api/routes.go')))} routes) "
-    f"video-boundary resources(typed endpoint/model, no aliases)"
+    f"video-boundary resources(typed endpoint/model, no aliases) test(internal/live only)"
 )

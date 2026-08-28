@@ -116,7 +116,7 @@ var Commands = []Command{
 	{
 		Path: []string{"down"}, Group: "service",
 		Summary:    "stop the LocalService, draining endpoint processes",
-		Flags:      []Flag{{Name: "--timeout", Arg: "<dur>", Summary: "drain bound", Default: "30s"}},
+		Flags:      []Flag{{Name: "--timeout", Arg: "<dur>", Summary: "drain bound; default follows the service cancellation budget"}},
 		MaxArgs:    0,
 		Exits:      []exit.Code{exit.OK},
 		Capability: "cmd.down", Status: Implemented, Handler: "down",
@@ -144,18 +144,15 @@ var Commands = []Command{
 		Summary: "resolve, verify, build and pin an endpoint as an immutable generation",
 		Args:    "<org/endpoint[@vN]>", MinArgs: 1, MaxArgs: 1,
 		Flags: []Flag{
-			{Name: "--from", Arg: "<archive.tar.gz>", Summary: "a local release archive (the pre-hub source door; hub release resolve lands with th-003)"},
+			{Name: "--from", Arg: "<archive.tar.gz>", Summary: "install one local release archive"},
 			{Name: "--digest", Arg: "<sha256:…>", Summary: "the source digest the release declares — verified before anything executes"},
-			{Name: "--prefetch", Summary: "eagerly pull weights"},
-			{Name: "--all-variants", Summary: "with --prefetch, pull every admissible lane"},
 			{Name: "--force", Summary: "build a new generation and swap the pin"},
 			{Name: "--allow-unsigned", Summary: "development-only door past source verification"},
-			{Name: "--crash-after", Arg: "<stage>", Summary: "development: SIGKILL after stage|verify|venv|descriptor|activate (crash-matrix verification)"},
 		},
 		Exits:      []exit.Code{exit.OK, exit.Usage, exit.Validation, exit.NotFound, exit.Credential, exit.Structural, exit.Conflict, exit.Capacity},
 		Capability: "cmd.install", Status: Implemented, Handler: "install",
 		Next:     []string{"cozy run <org/endpoint/vN/function>", "cozy describe <org/endpoint>"},
-		Examples: []string{"cozy install org/endpoint --from ./release.tar.gz --digest sha256:<hex>", "cozy install org/endpoint@v2 --prefetch", "cozy install org/endpoint --from ./release.tar.gz --force"},
+		Examples: []string{"cozy install org/endpoint --from ./release.tar.gz --digest sha256:<hex>", "cozy install org/endpoint --from ./release.tar.gz --force"},
 	},
 	{
 		Path: []string{"ls"}, Group: "endpoints",
@@ -220,25 +217,23 @@ var Commands = []Command{
 		Args:    "<org/endpoint> | --all", MaxArgs: 1,
 		Flags: []Flag{
 			{Name: "--all", Summary: "every endpoint process"},
-			{Name: "--timeout", Arg: "<dur>", Summary: "cooperative phase bound"},
 		},
 		Exits:      []exit.Code{exit.OK, exit.Usage, exit.Unavailable},
 		Capability: "cmd.stop", NeedsServer: true, Status: Implemented, Handler: "stop",
 		Next:     []string{"cozy status", "cozy start <org/endpoint>"},
-		Examples: []string{"cozy stop org/endpoint", "cozy stop --all", "cozy stop org/endpoint --timeout 30s"},
+		Examples: []string{"cozy stop org/endpoint", "cozy stop --all"},
 	},
 	{
 		Path: []string{"logs"}, Group: "endpoints",
 		Summary: "endpoint process log, or the retained triage bundle for an attempt id",
 		Args:    "<org/endpoint | attempt-id>", MinArgs: 1, MaxArgs: 1,
 		Flags: []Flag{
-			{Name: "--follow", Short: "-f", Summary: "follow"},
 			{Name: "--lines", Short: "-n", Arg: "<count>", Summary: "tail count", Default: "100"},
 		},
 		Exits:      []exit.Code{exit.OK, exit.Usage, exit.NotFound, exit.Unavailable, exit.Conflict},
 		Capability: "cmd.logs", NeedsServer: true, Status: Implemented, Handler: "logs",
-		Next:     []string{"cozy logs <org/endpoint> --follow", "cozy status"},
-		Examples: []string{"cozy logs org/endpoint", "cozy logs org/endpoint -f -n 200", "cozy logs <attempt-id> --json"},
+		Next:     []string{"cozy status"},
+		Examples: []string{"cozy logs org/endpoint", "cozy logs org/endpoint -n 200", "cozy logs <attempt-id> --json"},
 	},
 
 	// ---- invocation (cl-010) ----
@@ -680,15 +675,12 @@ var Commands = []Command{
 		Exits:      []exit.Code{exit.OK, exit.NotFound, exit.Unavailable},
 		Capability: "cmd.model.export", NeedsServer: true, Status: Planned, Issue: "cl-008",
 	},
-	// `endpoint publish` and `endpoint promote` publish and point at an ENDPOINT RELEASE. Neither
-	// referent exists yet: releases arrive with th-003 (the hub's own promote route
-	// refuses `promote.not_armed` by name today) and the leased build that turns a
-	// source snapshot into a release arrives with th-004. Advertised, not built —
-	// a clean-commit snapshot uploaded into a plane with no release to cut would be
-	// machinery with no consumer (law 13).
+	// `endpoint publish` is cl-039's Creator client over th-046 release assembly.
+	// `endpoint promote` is cl-041's explicit consumer of th-004's serving pointer.
+	// Both are advertised-but-unbuilt here; th-003 is already complete.
 	{
 		Path: []string{"endpoint", "publish"}, Group: "transfer",
-		Summary: "publish an endpoint release — deferred: there is no release plane to cut into",
+		Summary: "publish an endpoint release — deferred to cl-039's th-046 client",
 		Args:    "<org/endpoint>", MinArgs: 1, MaxArgs: 1,
 		Flags: []Flag{
 			{Name: "--release", Arg: "<id>", Summary: "immutable endpoint release id"},
@@ -702,7 +694,7 @@ var Commands = []Command{
 	},
 	{
 		Path: []string{"endpoint", "promote"}, Group: "transfer",
-		Summary: "move the serving pointer — deferred: the hub refuses promote.not_armed until releases exist",
+		Summary: "move the serving pointer — deferred to cl-041 over th-004",
 		Args:    "<org/endpoint> <release-id>", MinArgs: 2, MaxArgs: 2,
 		Flags:      []Flag{{Name: "--serve", Arg: "<major>", Summary: "required; no default"}},
 		Exits:      []exit.Code{exit.OK, exit.Usage, exit.NotFound, exit.Credential},
