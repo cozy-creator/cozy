@@ -43,6 +43,9 @@ type JobPlan struct {
 	// Outputs are the job's declared asset result field paths — the output ids the
 	// publication grant names, one destination each. Grants mint off the DECLARATION.
 	Outputs []string
+	// ArtifactOutputs is the explicit ArtifactSink subset. Empty keeps an ordinary asset
+	// job on the existing publication path; non-empty is the M0 artifact-only contract.
+	ArtifactOutputs []ArtifactOutput
 	// Record is the closed key set `plan.py::JobBinding.read` accepts. An unknown key is
 	// a refusal at the worker, which is what makes "closed at both ends" a fact.
 	Record map[string]any
@@ -96,7 +99,7 @@ func (c *Orchestrator) sendJobDirective(s *session, w *worker) {
 			// drains a queue publishes into a different scratch repo per request.
 			PublicationContract: &pb.PublicationContract{
 				GrantId: home.ScratchRepo("local", "queue"),
-				Outputs: outputBindings(plan.Outputs, maxOutputBytes),
+				Outputs: invocationOutputBindings(plan.Outputs, plan.ArtifactOutputs, maxOutputBytes),
 			},
 			// TERMINAL AND RECLAIM, everywhere. A job worker is one immutable build
 			// running one bounded attempt; deep queueing is the orchestrator's dispatch

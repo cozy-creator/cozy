@@ -172,6 +172,7 @@ func (s *Server) resolveJob(sub JobSubmission) (orchestrator.Submission, *exit.E
 		}
 		out.PlanID = job.DescriptorID
 		out.Outputs = job.Outputs
+		out.ArtifactOutputs = job.ArtifactOutputs
 	}
 	if out.PlanID == "" {
 		return out, exit.Named(exit.NotFound, "unknown_job",
@@ -213,15 +214,23 @@ func validOrg(org string) *exit.Error {
 }
 
 func jobSubmissionDigest(spec orchestrator.Submission) (string, *exit.Error) {
+	artifactOutputs := make([]canonical.Value, 0, len(spec.ArtifactOutputs))
+	for _, output := range spec.ArtifactOutputs {
+		artifactOutputs = append(artifactOutputs, map[string]canonical.Value{
+			"max_bytes": int64(output.MaxBytes), "mime_type": output.MimeType,
+			"output_id": output.OutputID,
+		})
+	}
 	doc := map[string]canonical.Value{
-		"format":   "cozy.client.JobSubmission/1",
-		"endpoint": spec.Endpoint,
-		"function": spec.Entrypoint,
-		"plan_id":  spec.PlanID,
-		"org":      spec.Org,
-		"input":    base64.StdEncoding.EncodeToString(spec.Payload),
-		"outputs":  strings.Join(spec.Outputs, ","),
-		"trees":    strings.Join(spec.Trees, ","),
+		"format":           "cozy.client.JobSubmission/1",
+		"endpoint":         spec.Endpoint,
+		"function":         spec.Entrypoint,
+		"plan_id":          spec.PlanID,
+		"org":              spec.Org,
+		"input":            base64.StdEncoding.EncodeToString(spec.Payload),
+		"outputs":          strings.Join(spec.Outputs, ","),
+		"artifact_outputs": artifactOutputs,
+		"trees":            strings.Join(spec.Trees, ","),
 	}
 	data, err := canonical.Write(doc)
 	if err != nil {
@@ -261,6 +270,7 @@ type JobState struct {
 	Error       string          `json:"error,omitempty"`
 	Result      any             `json:"result,omitempty"`
 	Outputs     []MediaRef      `json:"outputs"`
+	Artifacts   []ArtifactRef   `json:"artifacts,omitempty"`
 	Checkpoints []JobCheckpoint `json:"checkpoints,omitempty"`
 	Publication *PublicationRef `json:"publication,omitempty"`
 	// Bill is ABSENT unless this host was configured with an explicit local rate. There
@@ -269,6 +279,18 @@ type JobState struct {
 	Triage    *TriageRef `json:"triage,omitempty"`
 	CreatedAt string     `json:"created_at"`
 	EventsURL string     `json:"events_url"`
+}
+
+// ArtifactRef is Creator's durable scratch adoption projection. It exposes no path or
+// TensorFS internals: the exact Runtime receipt digest and Creator-derived private root id
+// are the handles a later explicit promotion will consume.
+type ArtifactRef struct {
+	Attempt       int64  `json:"attempt"`
+	OutputSlot    string `json:"output_slot"`
+	Disposition   string `json:"disposition"`
+	Outcome       string `json:"outcome,omitempty"`
+	ReceiptDigest string `json:"artifact_receipt_digest,omitempty"`
+	ScratchRootID string `json:"scratch_root_id,omitempty"`
 }
 
 // PublicationRef is the durable publication, as a client sees it. `root` is this host's
@@ -414,6 +436,19 @@ func (s *Server) jobStateOf(row records.Request) JobState {
 		state.Publication = &PublicationRef{
 			Repo: p.Repo, Root: p.Root, Status: p.Status, Cause: p.Cause,
 			Entries: p.Entries, Bytes: p.Bytes, CommittedAt: p.CommittedAt,
+		}
+	}
+	if artifacts, e := s.store.ArtifactFinalizationsOf(row.ID); e == nil {
+		for _, artifact := range artifacts {
+			receiptDigest := artifact.ReceiptDigest
+			if receiptDigest == "" {
+				receiptDigest = artifact.ResultReceiptDigest
+			}
+			state.Artifacts = append(state.Artifacts, ArtifactRef{
+				Attempt: artifact.Attempt, OutputSlot: artifact.OutputSlot,
+				Disposition: artifact.Disposition, Outcome: artifact.ResultOutcome,
+				ReceiptDigest: receiptDigest, ScratchRootID: artifact.ScratchRootID,
+			})
 		}
 	}
 	// THE ELAPSED CLOCK is the authority's own timestamps, and the LIVE progress is the

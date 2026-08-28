@@ -172,15 +172,15 @@ func body(m protoreflect.Message) (map[string]Value, error) {
 // docVersion is the DOCUMENT VERSION MAP. A digest-fenced document is NOT additively
 // versioned (01 §3): an unknown key REFUSES, so a new key is a NEW DOCUMENT VERSION and
 // the version rides the `format` tag. Every document is at /1 except
-// `AttemptOutcomeBody/2`, which carries #480c's `execution_started` bit on top of the
-// frozen wire's TerminalBody/1 lineage.
+// `AttemptOutcomeBody/3`, which carries th-049's exact artifact receipts on top of /2's
+// `execution_started` bit and the frozen wire's TerminalBody/1 lineage.
 //
 // The map is read INDEPENDENTLY per language (#510g) rather than derived from the
 // binding, because the version is a property of the document's key set and not of the
 // message that happens to transport it. Without it this writer would spell an
 // AttemptOutcomeBody under `/1` and every digest it minted would name the wrong document
 // (#536e).
-var docVersion = map[string]int{"cozy.worker.v1.AttemptOutcomeBody": 2}
+var docVersion = map[string]int{"cozy.worker.v1.AttemptOutcomeBody": 3}
 
 // Format is the canonical `format` tag for one message's document: its full name plus the
 // document version.

@@ -35,7 +35,7 @@ import (
 //
 // REV-2 makes it host the new frames and, crucially, AUTHOR THE NEW DOCUMENTS: it mints a
 // WorkerSnapshotBody and digests it, recomputes the owner's DesiredPlacementSet digest over
-// the resident bytes before parsing them, and spells its outcomes as AttemptOutcomeBody/2.
+// the resident bytes before parsing them, and spells its outcomes as AttemptOutcomeBody/3.
 // worker-protocol's frozen canonical corpus is the reference for every one of those bytes.
 func fakeWorker() int {
 	// The serve grammar the orchestrator speaks: `--socket` is the LISTEN grant, `--out`
@@ -546,7 +546,7 @@ func (f *fakeControl) stallReports(ctx context.Context, send func(*pb.WorkerFram
 	}
 }
 
-// outcomeFor builds one journaled AttemptOutcomeBody/2 and its envelope, the way a worker
+// outcomeFor builds one journaled AttemptOutcomeBody/3 and its envelope, the way a worker
 // does: the document is canonicalized once, the digest is over exactly those bytes, and the
 // envelope's routing copies are copies of the document's own fields.
 //

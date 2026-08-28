@@ -1,6 +1,7 @@
 package records
 
 import (
+	"bytes"
 	"crypto/rand"
 	"database/sql"
 	"encoding/hex"
@@ -65,7 +66,8 @@ CREATE TABLE IF NOT EXISTS requests (
   trees        TEXT    NOT NULL DEFAULT '',
   worker       TEXT    NOT NULL DEFAULT '',
   install_id   TEXT    NOT NULL DEFAULT '',
-  assets       TEXT    NOT NULL DEFAULT '[]'
+  assets       TEXT    NOT NULL DEFAULT '[]',
+  artifact_outputs TEXT NOT NULL DEFAULT '[]'
 )`, `
 -- The PUBLICATION (cl-004). One row per job request, written INSIDE the terminal
 -- transaction: a publication that a terminal did not commit does not exist, which is
@@ -115,6 +117,7 @@ CREATE TABLE IF NOT EXISTS attempts (
   session_id       TEXT    NOT NULL,
   invocation_digest TEXT    NOT NULL,
   invocation        BLOB    NOT NULL,
+  artifact_outputs  TEXT    NOT NULL DEFAULT '[]',
   state            TEXT    NOT NULL,
   plan_digest      TEXT    NOT NULL DEFAULT '',
   construction     TEXT    NOT NULL DEFAULT '',
@@ -146,6 +149,45 @@ CREATE TABLE IF NOT EXISTS outputs (
   mime_type  TEXT    NOT NULL,
   visible_at TEXT    NOT NULL,
   PRIMARY KEY (request_id, attempt, output_id),
+  FOREIGN KEY (request_id, attempt) REFERENCES attempts(request_id, attempt)
+)`, `
+-- Exact Runtime-authored ArtifactReceipt/1 documents carried by AttemptOutcomeBody/3.
+-- They commit in the same transaction as the outcome and therefore exist before Ack.
+CREATE TABLE IF NOT EXISTS artifact_receipts (
+  request_id         TEXT    NOT NULL,
+  attempt            INTEGER NOT NULL,
+  output_slot        TEXT    NOT NULL,
+  owner_scope        TEXT    NOT NULL,
+  invocation_digest  TEXT    NOT NULL,
+  transaction_id     TEXT    NOT NULL,
+  receipt_digest     TEXT    NOT NULL,
+  receipt_bytes      BLOB    NOT NULL,
+  recorded_at        TEXT    NOT NULL,
+  PRIMARY KEY (request_id, attempt, output_slot),
+  FOREIGN KEY (request_id, attempt) REFERENCES attempts(request_id, attempt)
+)`, `
+-- Creator's first-wins artifact disposition. The exact decision is journaled before send;
+-- the exact Runtime result is journaled before the outcome is acknowledged.
+CREATE TABLE IF NOT EXISTS artifact_finalizations (
+  request_id         TEXT    NOT NULL,
+  attempt            INTEGER NOT NULL,
+  instance_id        TEXT    NOT NULL,
+  owner_scope        TEXT    NOT NULL,
+  invocation_digest  TEXT    NOT NULL,
+  output_slot        TEXT    NOT NULL,
+  disposition        TEXT    NOT NULL,
+  receipt_digest     TEXT    NOT NULL DEFAULT '',
+  scratch_root_id    TEXT    NOT NULL DEFAULT '',
+  decision_digest    TEXT    NOT NULL,
+  decision_bytes     BLOB    NOT NULL,
+  result_outcome     TEXT    NOT NULL DEFAULT '',
+  result_digest      TEXT    NOT NULL DEFAULT '',
+  result_bytes       BLOB    NOT NULL DEFAULT x'',
+  result_receipt_digest TEXT NOT NULL DEFAULT '',
+  result_receipt_bytes  BLOB NOT NULL DEFAULT x'',
+  recorded_at        TEXT    NOT NULL,
+  completed_at       TEXT    NOT NULL DEFAULT '',
+  PRIMARY KEY (request_id, invocation_digest, output_slot),
   FOREIGN KEY (request_id, attempt) REFERENCES attempts(request_id, attempt)
 )`}
 
@@ -197,7 +239,9 @@ var widen = []string{
 	`ALTER TABLE requests ADD COLUMN trees TEXT NOT NULL DEFAULT ''`,
 	`ALTER TABLE requests ADD COLUMN assets TEXT NOT NULL DEFAULT '[]'`,
 	`ALTER TABLE requests ADD COLUMN install_id TEXT NOT NULL DEFAULT ''`,
+	`ALTER TABLE requests ADD COLUMN artifact_outputs TEXT NOT NULL DEFAULT '[]'`,
 	`ALTER TABLE attempts ADD COLUMN media_cleaned INTEGER NOT NULL DEFAULT 0`,
+	`ALTER TABLE attempts ADD COLUMN artifact_outputs TEXT NOT NULL DEFAULT '[]'`,
 	`ALTER TABLE rentals ADD COLUMN media_address TEXT NOT NULL DEFAULT ''`,
 	`ALTER TABLE rentals ADD COLUMN control_snapshot_digest TEXT NOT NULL DEFAULT ''`,
 	`ALTER TABLE rentals ADD COLUMN control_snapshot_length INTEGER NOT NULL DEFAULT 0`,
@@ -482,6 +526,10 @@ type Request struct {
 	// authority-owned immutable input store, not at the caller's original file: a requeue
 	// after a client exit or service restart therefore grants the same verified bytes.
 	Assets []AssetBinding
+	// ArtifactOutputs is the immutable ArtifactSink output subset projected beside the
+	// InvocationSpec. Rev5 OutputBinding has no kind, so this may never be inferred from
+	// ordinary asset outputs or from whichever receipts happen to arrive.
+	ArtifactOutputs string
 }
 
 // AssetBinding ties one payload asset field to the exact local bytes the request owns.
@@ -500,14 +548,14 @@ type AssetBinding struct {
 }
 
 const requestCols = `id,idem_key,body_digest,endpoint,entrypoint,plan_id,payload,outputs,
-	state,ordinal,requeues,created_at,kind,org,trees,worker,install_id,assets`
+	state,ordinal,requeues,created_at,kind,org,trees,worker,install_id,assets,artifact_outputs`
 
 func scanRequest(row interface{ Scan(...any) error }) (Request, error) {
 	var r Request
 	var assets string
 	err := row.Scan(&r.ID, &r.IdemKey, &r.BodyDigest, &r.Endpoint, &r.Entrypoint, &r.PlanID,
 		&r.Payload, &r.Outputs, &r.State, &r.Ordinal, &r.Requeues, &r.CreatedAt,
-		&r.Kind, &r.Org, &r.Trees, &r.Worker, &r.InstallID, &assets)
+		&r.Kind, &r.Org, &r.Trees, &r.Worker, &r.InstallID, &assets, &r.ArtifactOutputs)
 	if err == nil && assets != "" {
 		err = json.Unmarshal([]byte(assets), &r.Assets)
 	}
@@ -786,11 +834,12 @@ func submitRequestTx(tx *sql.Tx, r Request, assets string) (Request, bool, *exit
 		return Request{}, false, exit.Internalf("cannot read request %s: %s", r.IdemKey, err)
 	}
 	if _, err := tx.Exec(`INSERT INTO requests(id,idem_key,body_digest,endpoint,entrypoint,
-		plan_id,payload,outputs,state,ordinal,requeues,created_at,kind,org,trees,worker,install_id,assets)
-		VALUES(?,?,?,?,?,?,?,?,?,0,0,?,?,?,?,?,?,?)`,
+		plan_id,payload,outputs,state,ordinal,requeues,created_at,kind,org,trees,worker,install_id,assets,
+		artifact_outputs)
+		VALUES(?,?,?,?,?,?,?,?,?,0,0,?,?,?,?,?,?,?,?)`,
 		r.ID, r.IdemKey, r.BodyDigest, r.Endpoint, r.Entrypoint, r.PlanID, r.Payload,
 		r.Outputs, r.State, r.CreatedAt, r.Kind, r.Org, r.Trees, r.Worker, r.InstallID,
-		assets); err != nil {
+		assets, r.ArtifactOutputs); err != nil {
 		return Request{}, false, exit.Internalf("cannot record request %s: %s", r.ID, err)
 	}
 	return r, true, nil
@@ -815,6 +864,7 @@ type Attempt struct {
 	SessionID           string
 	InvocationDigest    string
 	InvocationCanonical []byte
+	ArtifactOutputs     string
 	State               string // preparing | offered | dispatch_aborted | accepted | recovered_open | terminal | closed
 	PlanDigest          string
 	Construction        string
@@ -925,10 +975,10 @@ func (s *Store) Dispatch(a Attempt) (int64, *exit.Error) {
 	}
 	a.Attempt = ordinal
 	if _, err := tx.Exec(`INSERT INTO attempts(request_id,attempt,attempt_key,instance_id,
-		session_id,invocation_digest,invocation,state,dispatched_at)
-		VALUES(?,?,?,?,?,?,?,'preparing',?)`,
+		session_id,invocation_digest,invocation,artifact_outputs,state,dispatched_at)
+		VALUES(?,?,?,?,?,?,?,?,'preparing',?)`,
 		a.RequestID, a.Attempt, a.AttemptKey, a.InstanceID, a.SessionID,
-		a.InvocationDigest, a.InvocationCanonical, a.DispatchedAt); err != nil {
+		a.InvocationDigest, a.InvocationCanonical, a.ArtifactOutputs, a.DispatchedAt); err != nil {
 		return 0, exit.New(exit.Conflict, "cannot journal attempt %s#%d: %s", a.RequestID, a.Attempt, err).
 			WithRemedy("an attempt ordinal is written once")
 	}
@@ -1060,6 +1110,32 @@ type Output struct {
 	MimeType string
 }
 
+// ArtifactReceipt is the exact Runtime-authored ArtifactReceipt/1 identity carried by
+// AttemptOutcomeBody/3. ReceiptBytes are never parsed and reserialized for persistence.
+type ArtifactReceipt struct {
+	RequestID, OwnerScope, InvocationDigest, OutputSlot, TransactionID string
+	Attempt                                                            int64
+	ReceiptDigest                                                      string
+	ReceiptBytes                                                       []byte
+	RecordedAt                                                         string
+}
+
+// ArtifactFinalization is Creator's durable first-wins disposition and Runtime's exact
+// replayable completion. DecisionDigest/Bytes are persisted before send; ResultDigest/Bytes
+// are persisted before AttemptOutcomeAck.
+type ArtifactFinalization struct {
+	RequestID, InstanceID, OwnerScope, InvocationDigest, OutputSlot string
+	Attempt                                                         int64
+	Disposition, ReceiptDigest, ScratchRootID                       string
+	DecisionDigest                                                  string
+	DecisionBytes                                                   []byte
+	ResultOutcome, ResultDigest                                     string
+	ResultBytes                                                     []byte
+	ResultReceiptDigest                                             string
+	ResultReceiptBytes                                              []byte
+	RecordedAt, CompletedAt                                         string
+}
+
 // Terminal is what a worker journaled and the orchestrator is about to make authoritative.
 type Terminal struct {
 	RequestID        string
@@ -1077,11 +1153,13 @@ type Terminal struct {
 	// terminal's own TriageBundleRef before this transaction runs. A one-shot run
 	// deletes its worker root (cr-011 §8), so a bundle worth keeping is the client's
 	// to keep — and "the client" is this orchestrator.
-	TriageDigest string
-	TriageLength int64
-	TriagePath   string
-	Body         []byte
-	Outputs      []Output
+	TriageDigest          string
+	TriageLength          int64
+	TriagePath            string
+	Body                  []byte
+	Outputs               []Output
+	ArtifactReceipts      []ArtifactReceipt
+	ArtifactFinalizations []ArtifactFinalization
 	// Event is the attempt-end lifecycle event, appended INSIDE this transaction so the
 	// stream cannot disagree with the authority about whether the request ended.
 	EventType    string
@@ -1183,6 +1261,44 @@ func (s *Store) AcceptTerminal(t Terminal) (applied bool, e *exit.Error) {
 			o.MimeType, visible); err != nil {
 			return false, exit.Internalf("cannot publish output %s of %s#%d: %s",
 				o.OutputID, t.RequestID, t.Attempt, err)
+		}
+	}
+	for _, receipt := range t.ArtifactReceipts {
+		if _, err := tx.Exec(`INSERT INTO artifact_receipts(request_id,attempt,output_slot,
+			owner_scope,invocation_digest,transaction_id,receipt_digest,receipt_bytes,recorded_at)
+			VALUES(?,?,?,?,?,?,?,?,?)`, receipt.RequestID, receipt.Attempt, receipt.OutputSlot,
+			receipt.OwnerScope, receipt.InvocationDigest, receipt.TransactionID,
+			receipt.ReceiptDigest, receipt.ReceiptBytes, visible); err != nil {
+			return false, exit.Internalf("cannot record artifact receipt %s of %s#%d: %s",
+				receipt.OutputSlot, t.RequestID, t.Attempt, err)
+		}
+	}
+	for _, finalization := range t.ArtifactFinalizations {
+		var held string
+		err := tx.QueryRow(`SELECT decision_digest FROM artifact_finalizations
+			WHERE request_id=? AND invocation_digest=? AND output_slot=?`, finalization.RequestID,
+			finalization.InvocationDigest, finalization.OutputSlot).Scan(&held)
+		if err == nil {
+			if held != finalization.DecisionDigest {
+				return false, exit.New(exit.Conflict,
+					"artifact output %s already has final intent %s, not %s",
+					finalization.OutputSlot, short(held), short(finalization.DecisionDigest))
+			}
+			continue
+		}
+		if !errors.Is(err, sql.ErrNoRows) {
+			return false, exit.Internalf("cannot read artifact final intent %s of %s: %s",
+				finalization.OutputSlot, t.RequestID, err)
+		}
+		if _, err := tx.Exec(`INSERT INTO artifact_finalizations(request_id,attempt,instance_id,
+			owner_scope,invocation_digest,output_slot,disposition,receipt_digest,scratch_root_id,
+			decision_digest,decision_bytes,recorded_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)`,
+			finalization.RequestID, finalization.Attempt, finalization.InstanceID,
+			finalization.OwnerScope, finalization.InvocationDigest, finalization.OutputSlot,
+			finalization.Disposition, finalization.ReceiptDigest, finalization.ScratchRootID,
+			finalization.DecisionDigest, finalization.DecisionBytes, visible); err != nil {
+			return false, exit.Internalf("cannot record artifact final intent %s of %s#%d: %s",
+				finalization.OutputSlot, t.RequestID, t.Attempt, err)
 		}
 	}
 	requestState := t.RequestState
@@ -1322,7 +1438,7 @@ func (s *Store) ReadyRequeues() ([]Request, *exit.Error) {
 
 func (s *Store) attemptsWhere(where string, args ...any) ([]Attempt, *exit.Error) {
 	rows, err := s.db.Query(`SELECT request_id,attempt,attempt_key,instance_id,session_id,
-		invocation_digest,invocation,state,plan_digest,construction,plan_summary,terminal_id,
+		invocation_digest,invocation,artifact_outputs,state,plan_digest,construction,plan_summary,terminal_id,
 		terminal_digest,terminal_status,terminal_cause,safe_message,triage_subject,
 		triage_digest,triage_length,triage_path,
 		COALESCE(terminal_body,x''),dispatched_at,accepted_at,closed_at
@@ -1335,13 +1451,158 @@ func (s *Store) attemptsWhere(where string, args ...any) ([]Attempt, *exit.Error
 	for rows.Next() {
 		var a Attempt
 		if err := rows.Scan(&a.RequestID, &a.Attempt, &a.AttemptKey, &a.InstanceID, &a.SessionID,
-			&a.InvocationDigest, &a.InvocationCanonical, &a.State, &a.PlanDigest, &a.Construction,
+			&a.InvocationDigest, &a.InvocationCanonical, &a.ArtifactOutputs, &a.State, &a.PlanDigest, &a.Construction,
 			&a.PlanSummary, &a.TerminalID, &a.TerminalDigest, &a.TerminalStatus, &a.TerminalCause,
 			&a.SafeMessage, &a.TriageSubject, &a.TriageDigest, &a.TriageLength, &a.TriagePath,
 			&a.TerminalBody, &a.DispatchedAt, &a.AcceptedAt, &a.ClosedAt); err != nil {
 			return nil, exit.Internalf("cannot read an attempt row: %s", err)
 		}
 		out = append(out, a)
+	}
+	return out, nil
+}
+
+const artifactFinalizationCols = `request_id,attempt,instance_id,owner_scope,invocation_digest,
+	output_slot,disposition,receipt_digest,scratch_root_id,decision_digest,decision_bytes,
+	result_outcome,result_digest,result_bytes,result_receipt_digest,result_receipt_bytes,
+	recorded_at,completed_at`
+
+func scanArtifactFinalization(row interface{ Scan(...any) error }) (ArtifactFinalization, error) {
+	var f ArtifactFinalization
+	err := row.Scan(&f.RequestID, &f.Attempt, &f.InstanceID, &f.OwnerScope,
+		&f.InvocationDigest, &f.OutputSlot, &f.Disposition, &f.ReceiptDigest,
+		&f.ScratchRootID, &f.DecisionDigest, &f.DecisionBytes, &f.ResultOutcome,
+		&f.ResultDigest, &f.ResultBytes, &f.ResultReceiptDigest, &f.ResultReceiptBytes,
+		&f.RecordedAt, &f.CompletedAt)
+	return f, err
+}
+
+// ArtifactFinalization reads the exact first-wins intent for one semantic output.
+func (s *Store) ArtifactFinalization(requestID, invocationDigest, outputSlot string) (*ArtifactFinalization, *exit.Error) {
+	f, err := scanArtifactFinalization(s.db.QueryRow(`SELECT `+artifactFinalizationCols+`
+		FROM artifact_finalizations WHERE request_id=? AND invocation_digest=? AND output_slot=?`,
+		requestID, invocationDigest, outputSlot))
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, exit.Internalf("cannot read artifact finalization %s/%s: %s",
+			requestID, outputSlot, err)
+	}
+	return &f, nil
+}
+
+// PendingArtifactFinalizations is the exact decision set that must be (re)sent before
+// this attempt's outcome may be acknowledged. Ordering by slot makes replay deterministic.
+func (s *Store) PendingArtifactFinalizations(requestID string, attempt int64) ([]ArtifactFinalization, *exit.Error) {
+	rows, err := s.db.Query(`SELECT `+artifactFinalizationCols+` FROM artifact_finalizations
+		WHERE request_id=? AND attempt=? AND result_digest='' ORDER BY output_slot`, requestID, attempt)
+	if err != nil {
+		return nil, exit.Internalf("cannot read pending artifact finalizations of %s#%d: %s",
+			requestID, attempt, err)
+	}
+	defer rows.Close()
+	out := []ArtifactFinalization{}
+	for rows.Next() {
+		f, err := scanArtifactFinalization(rows)
+		if err != nil {
+			return nil, exit.Internalf("cannot read an artifact finalization row: %s", err)
+		}
+		out = append(out, f)
+	}
+	return out, nil
+}
+
+func (s *Store) ArtifactFinalizationsOf(requestID string) ([]ArtifactFinalization, *exit.Error) {
+	rows, err := s.db.Query(`SELECT `+artifactFinalizationCols+` FROM artifact_finalizations
+		WHERE request_id=? ORDER BY attempt,output_slot`, requestID)
+	if err != nil {
+		return nil, exit.Internalf("cannot read artifact finalizations of %s: %s", requestID, err)
+	}
+	defer rows.Close()
+	out := []ArtifactFinalization{}
+	for rows.Next() {
+		f, err := scanArtifactFinalization(rows)
+		if err != nil {
+			return nil, exit.Internalf("cannot read an artifact finalization row: %s", err)
+		}
+		out = append(out, f)
+	}
+	return out, nil
+}
+
+// RecordArtifactFinalizeResult journals Runtime's exact replayable result. The same result
+// is idempotent; any changed bytes for the first-wins decision conflict forever.
+func (s *Store) RecordArtifactFinalizeResult(result ArtifactFinalization) (applied bool, e *exit.Error) {
+	tx, err := s.db.Begin()
+	if err != nil {
+		return false, exit.Internalf("cannot begin the artifact finalize result transaction: %s", err)
+	}
+	defer tx.Rollback()
+	held, err := scanArtifactFinalization(tx.QueryRow(`SELECT `+artifactFinalizationCols+`
+		FROM artifact_finalizations WHERE request_id=? AND invocation_digest=? AND output_slot=?`,
+		result.RequestID, result.InvocationDigest, result.OutputSlot))
+	if errors.Is(err, sql.ErrNoRows) {
+		return false, exit.New(exit.NotFound, "no artifact final intent for %s/%s",
+			result.RequestID, result.OutputSlot)
+	}
+	if err != nil {
+		return false, exit.Internalf("cannot read artifact final intent %s/%s: %s",
+			result.RequestID, result.OutputSlot, err)
+	}
+	if held.InstanceID != result.InstanceID {
+		return false, exit.New(exit.Conflict,
+			"artifact finalize result for %s/%s came from worker %s; %s owns the transaction",
+			result.RequestID, result.OutputSlot, result.InstanceID, held.InstanceID)
+	}
+	if held.ResultDigest != "" {
+		if held.ResultDigest != result.ResultDigest || !bytes.Equal(held.ResultBytes, result.ResultBytes) {
+			return false, exit.New(exit.Conflict,
+				"artifact finalization %s/%s already completed with %s, not %s",
+				result.RequestID, result.OutputSlot, short(held.ResultDigest), short(result.ResultDigest))
+		}
+		return false, nil
+	}
+	completed := now()
+	updated, err := tx.Exec(`UPDATE artifact_finalizations SET result_outcome=?,result_digest=?,
+		result_bytes=?,result_receipt_digest=?,result_receipt_bytes=?,completed_at=?
+		WHERE request_id=? AND invocation_digest=? AND output_slot=? AND result_digest=''`,
+		result.ResultOutcome, result.ResultDigest, result.ResultBytes,
+		result.ResultReceiptDigest, result.ResultReceiptBytes, completed,
+		result.RequestID, result.InvocationDigest, result.OutputSlot)
+	if err != nil {
+		return false, exit.Internalf("cannot record artifact finalize result %s/%s: %s",
+			result.RequestID, result.OutputSlot, err)
+	}
+	if n, _ := updated.RowsAffected(); n != 1 {
+		return false, exit.New(exit.Conflict, "artifact finalization %s/%s moved while completing",
+			result.RequestID, result.OutputSlot)
+	}
+	if err := tx.Commit(); err != nil {
+		return false, exit.Internalf("cannot commit artifact finalize result %s/%s: %s",
+			result.RequestID, result.OutputSlot, err)
+	}
+	return true, nil
+}
+
+// ArtifactReceiptsOf exposes the exact bytes the terminal transaction made durable.
+func (s *Store) ArtifactReceiptsOf(requestID string, attempt int64) ([]ArtifactReceipt, *exit.Error) {
+	rows, err := s.db.Query(`SELECT request_id,attempt,owner_scope,invocation_digest,output_slot,
+		transaction_id,receipt_digest,receipt_bytes,recorded_at FROM artifact_receipts
+		WHERE request_id=? AND attempt=? ORDER BY output_slot`, requestID, attempt)
+	if err != nil {
+		return nil, exit.Internalf("cannot read artifact receipts of %s#%d: %s", requestID, attempt, err)
+	}
+	defer rows.Close()
+	out := []ArtifactReceipt{}
+	for rows.Next() {
+		var receipt ArtifactReceipt
+		if err := rows.Scan(&receipt.RequestID, &receipt.Attempt, &receipt.OwnerScope,
+			&receipt.InvocationDigest, &receipt.OutputSlot, &receipt.TransactionID,
+			&receipt.ReceiptDigest, &receipt.ReceiptBytes, &receipt.RecordedAt); err != nil {
+			return nil, exit.Internalf("cannot read an artifact receipt row: %s", err)
+		}
+		out = append(out, receipt)
 	}
 	return out, nil
 }

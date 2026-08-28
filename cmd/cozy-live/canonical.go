@@ -14,7 +14,7 @@ import (
 	pb "github.com/cozy-creator/cozy-creator-v2/protocol/cozy/worker/v1"
 )
 
-// The conformance corpus is worker-protocol's FROZEN fixtures at schema rev 3.
+// The conformance corpus is worker-protocol's FROZEN fixtures at schema rev 5.
 // `fixtures/canonical/<n>.bin` is the marshaled message and `<n>.json` is its ONE canonical
 // document — sha256 over that file IS the wire digest. So the check is exact in both
 // directions: this writer must reproduce those bytes from the message, and this reader must
@@ -56,8 +56,8 @@ func sectionCanonical() {
 	spelledSchema, _ := canonical.Spell(canonical.Digest(schemaBytes))
 	check("and the digest is over exactly those document bytes",
 		spelledSchema == schema.ID, fmt.Sprintf("%d B -> %s", len(schemaBytes), shortID(spelledSchema)))
-	check("this binding declares wire schema rev 3 on the linear-train minor 0",
-		pb.WireSchemaRev == 3 && pb.WireMinor == 0,
+	check("this binding declares wire schema rev 5 on the linear-train minor 1",
+		pb.WireSchemaRev == 5 && pb.WireMinor == 1,
 		fmt.Sprintf("rev %d, minor %d", pb.WireSchemaRev, pb.WireMinor))
 
 	head("this Go writer against worker-protocol's frozen canonical documents")
@@ -156,7 +156,7 @@ func sectionCanonical() {
 	check("an InvocationSpec read as an AttemptOutcomeBody refuses",
 		canonical.Code(rerr) == "unknown_format", detailOf(rerr))
 
-	// The VERSION half of the same fence: an AttemptOutcomeBody/2 read against a reader
+	// The VERSION half of the same fence: an AttemptOutcomeBody/3 read against a reader
 	// that expected /1 would refuse on the tag, which is why the version is IN the tag.
 	outcomeBytes, err := os.ReadFile(filepath.Join(fixtures, "canonical", "attempt_outcome_body_succeeded.json"))
 	must("reading attempt_outcome_body_succeeded.json", err)
@@ -192,6 +192,12 @@ func messageFor(name string) proto.Message {
 		return &pb.InvocationSpec{}
 	case "cozy.worker.v1.AttemptOutcomeBody":
 		return &pb.AttemptOutcomeBody{}
+	case "cozy.worker.v1.ArtifactReceipt":
+		return &pb.ArtifactReceipt{}
+	case "cozy.worker.v1.ArtifactFinalizeDecision":
+		return &pb.ArtifactFinalizeDecision{}
+	case "cozy.worker.v1.ArtifactFinalizeResult":
+		return &pb.ArtifactFinalizeResult{}
 	case "cozy.worker.v1.PlacementSet":
 		return &pb.PlacementSet{}
 	case "cozy.worker.v1.PlacementSpec":
