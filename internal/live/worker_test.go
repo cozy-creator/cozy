@@ -12,7 +12,7 @@ import (
 	"github.com/cozy-creator/cozy-creator/internal/exit"
 )
 
-// TestWorkerRefusals is the interop proof. `cmd/cozy-fakeworker` is a SECOND, independent
+// TestWorkerRefusals is the interop proof. `internal/live/fakeworker` is a SECOND, independent
 // implementation of the worker protocol that the orchestrator was not co-developed
 // against: it hosts WorkerControl, authors real canonical documents, and lies in exactly
 // the ways a hostile or broken peer would. Every refusal below is the real orchestrator

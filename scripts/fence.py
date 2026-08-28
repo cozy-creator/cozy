@@ -291,12 +291,11 @@ PY_ALLOW = {
                             "parsed or composed",
 }
 
-# (cl-028) The VERIFICATION HOMES are the only places an //cozy:allow door may exempt a
-# listen or a runtime indirection: `internal/live` is the go-test suite and
-# `cmd/cozy-fakeworker` is the adversary peer it spawns, and both bind sockets by design.
-# Product code gets no door for either — a doored non-loopback bind in the product would be
-# the LAN door arriving as a comment.
-DRIVER_DIRS = ("internal/live/", "cmd/cozy-fakeworker/")
+# (cl-028) The VERIFICATION HOME is the only place an //cozy:allow door may exempt a listen
+# or a runtime indirection: `internal/live` is the go-test suite and it contains the adversary
+# peer (`fakeworker`) it spawns; both bind sockets by design. Product code gets no door for
+# either — a doored non-loopback bind in the product would be the LAN door arriving as a comment.
+DRIVER_DIRS = ("internal/live/",)
 DRIVER_DIR = " / ".join(DRIVER_DIRS)
 
 IDENT = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")

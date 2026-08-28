@@ -559,7 +559,7 @@ No automated tests. Verification is running the real thing:
   code; `TestNumberProfile` walks Runtime's 4,561-row ES6 float oracle, which is the
   cross-language hazard behind every canonical digest; `TestEndpointDescriptor` fences the
   grammar Creator consumes at install; `TestWorkerRefusals` and `TestDroppedOutcomeAck` are
-  the interop proof against `cmd/cozy-fakeworker`, a second independent Go implementation of
+  the interop proof against `internal/live/fakeworker`, a second independent Go implementation of
   the worker side that the orchestrator was not co-developed against; `TestLocalAPIDoor` is
   the loopback door matrix; `TestOutputRetention` is the plan/perform discipline on the one
   verb that removes a user's bytes; `TestProductPath` is install -> up -> invoke -> result ->

@@ -16,7 +16,7 @@ jobs:
       - run: go vet ./...
       # THE SUITE (decisions.md #634, amending #160 for this repo). `internal/live` starts
       # the real system — the real orchestrator, a real `cozy up` process, and
-      # `cmd/cozy-fakeworker`, a second independent implementation of the worker protocol —
+      # `internal/live/fakeworker`, a second independent implementation of the worker protocol —
       # and observes what it does. Nothing in it is a mock. The tests that need a peer this
       # runner does not have (worker-protocol's frozen corpus, a cozy-runtime whose wire
       # schema matches this tree) SKIP by name rather than passing vacuously.

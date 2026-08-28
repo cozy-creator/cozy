@@ -32,7 +32,7 @@ func TestMain(m *testing.M) {
 	}
 	cozyBin = filepath.Join(dir, "cozy")
 	fakeWorkerBin = filepath.Join(dir, "cozy-fakeworker")
-	for _, b := range [][2]string{{cozyBin, "."}, {fakeWorkerBin, "./cmd/cozy-fakeworker"}} {
+	for _, b := range [][2]string{{cozyBin, "."}, {fakeWorkerBin, "./internal/live/fakeworker"}} {
 		build := exec.Command("go", "build", "-o", b[0], b[1])
 		build.Dir = "../.."
 		if out, err := build.CombinedOutput(); err != nil {
@@ -97,7 +97,7 @@ func hostOwner(t *testing.T, name string) *owner {
 // close releases the root so a later `cozy up` on the same root is the only owner of it.
 func (o *owner) close() { o.once.Do(o.closer) }
 
-// fakeSpec is a worker slot whose process is cmd/cozy-fakeworker speaking raw protocol
+// fakeSpec is a worker slot whose process is internal/live/fakeworker speaking raw protocol
 // bytes: a real process dialing the real socket over the committed contract.
 func fakeSpec(name, device string, args ...string) orchestrator.WorkerLaunchSpec {
 	return orchestrator.WorkerLaunchSpec{
