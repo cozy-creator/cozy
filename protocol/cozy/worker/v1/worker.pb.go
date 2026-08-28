@@ -1741,13 +1741,12 @@ type ClaimAck struct {
 	WorkerInstanceId string `protobuf:"bytes,9,opt,name=worker_instance_id,json=workerInstanceId,proto3" json:"worker_instance_id,omitempty"` // ONE provisioned instance lifetime; outcome-replay
 	// authorization keys on this, never worker_id
 	WorkerReleaseId      string `protobuf:"bytes,10,opt,name=worker_release_id,json=workerReleaseId,proto3" json:"worker_release_id,omitempty"`
-	WorkerArtifactDigest string `protobuf:"bytes,11,opt,name=worker_artifact_digest,json=workerArtifactDigest,proto3" json:"worker_artifact_digest,omitempty"` // class (b), `sha256:<hex>` (provenance). A native worker
-	// has no OCI image (#481). BASE WORKER IMAGE IDENTITY RIDES HERE
-	// AND NOWHERE ELSE (#487/#489): it is evidence about a
-	// MACHINE, never identity of an ENVIRONMENT, and a process
-	// cannot prove its own image — the PROVISIONER verifies the
-	// OCI digest, and on renter-provisioned pods that
-	// verification is the renter's UNTRUSTED act (#485a).
+	ControlRuntimeDigest string `protobuf:"bytes,11,opt,name=control_runtime_digest,json=controlRuntimeDigest,proto3" json:"control_runtime_digest,omitempty"` // class (b), `sha256:<hex>`: exact image-owned control
+	// Runtime wheel bytes measured from the installed wheelhouse.
+	// It is NOT the OCI image identity: an image cannot bake its
+	// own manifest digest without a self-reference. The provisioner
+	// independently verifies the selected immutable OCI identity;
+	// a RecordOwner needs BOTH facts to admit the machine.
 	GitCommit string           `protobuf:"bytes,12,opt,name=git_commit,json=gitCommit,proto3" json:"git_commit,omitempty"`
 	Resources *WorkerResources `protobuf:"bytes,13,opt,name=resources,proto3" json:"resources,omitempty"` // torch-free worker statics; never re-sent mid-stream.
 	// THE SCHEMA FENCE (#530-A1), class (a): sha256 of the canonical
@@ -1872,9 +1871,9 @@ func (x *ClaimAck) GetWorkerReleaseId() string {
 	return ""
 }
 
-func (x *ClaimAck) GetWorkerArtifactDigest() string {
+func (x *ClaimAck) GetControlRuntimeDigest() string {
 	if x != nil {
-		return x.WorkerArtifactDigest
+		return x.ControlRuntimeDigest
 	}
 	return ""
 }
@@ -1909,9 +1908,9 @@ type BootFailure struct {
 	WorkerId                string                 `protobuf:"bytes,5,opt,name=worker_id,json=workerId,proto3" json:"worker_id,omitempty"`
 	WorkerInstanceId        string                 `protobuf:"bytes,6,opt,name=worker_instance_id,json=workerInstanceId,proto3" json:"worker_instance_id,omitempty"`
 	Reason                  BootFailureReason      `protobuf:"varint,7,opt,name=reason,proto3,enum=cozy.worker.v1.BootFailureReason" json:"reason,omitempty"`
-	Detail                  string                 `protobuf:"bytes,8,opt,name=detail,proto3" json:"detail,omitempty"`       // bounded <= 1024 bytes, sanitized
-	Resources               *WorkerResources       `protobuf:"bytes,9,opt,name=resources,proto3" json:"resources,omitempty"` // whatever was measurable
-	WorkerArtifactDigest    string                 `protobuf:"bytes,10,opt,name=worker_artifact_digest,json=workerArtifactDigest,proto3" json:"worker_artifact_digest,omitempty"`
+	Detail                  string                 `protobuf:"bytes,8,opt,name=detail,proto3" json:"detail,omitempty"`                                                            // bounded <= 1024 bytes, sanitized
+	Resources               *WorkerResources       `protobuf:"bytes,9,opt,name=resources,proto3" json:"resources,omitempty"`                                                      // whatever was measurable
+	ControlRuntimeDigest    string                 `protobuf:"bytes,10,opt,name=control_runtime_digest,json=controlRuntimeDigest,proto3" json:"control_runtime_digest,omitempty"` // same measured control Runtime provenance as ClaimAck 11
 	WorkerReleaseId         string                 `protobuf:"bytes,11,opt,name=worker_release_id,json=workerReleaseId,proto3" json:"worker_release_id,omitempty"`
 	unknownFields           protoimpl.UnknownFields
 	sizeCache               protoimpl.SizeCache
@@ -2003,9 +2002,9 @@ func (x *BootFailure) GetResources() *WorkerResources {
 	return nil
 }
 
-func (x *BootFailure) GetWorkerArtifactDigest() string {
+func (x *BootFailure) GetControlRuntimeDigest() string {
 	if x != nil {
-		return x.WorkerArtifactDigest
+		return x.ControlRuntimeDigest
 	}
 	return ""
 }
@@ -2807,7 +2806,8 @@ func (x *ArtifactSubject) GetLength() uint64 {
 // document with a non-digested key would force a VERIFIER to own a canonicalizer that knows
 // which keys to strip, and 01 §3 law 3 holds that a verifier needs no canonicalizer, only an
 // author does. So this document's canonical bytes are digested WHOLE, like every other document
-// here. Base worker image identity rides ClaimAck.worker_artifact_digest instead.
+// here. Machine evidence is split honestly: provider readback owns immutable OCI identity, while
+// ClaimAck.control_runtime_digest proves the exact image-owned control Runtime wheel bytes.
 type EndpointEnvironmentSpec struct {
 	state                protoimpl.MessageState `protogen:"open.v1"`
 	PlatformTarget       *PlatformTarget        `protobuf:"bytes,1,opt,name=platform_target,json=platformTarget,proto3" json:"platform_target,omitempty"`
@@ -7687,7 +7687,7 @@ const file_cozy_worker_v1_worker_proto_rawDesc = "" +
 	"\x12worker_instance_id\x18\t \x01(\tR\x10workerInstanceId\x12*\n" +
 	"\x11worker_release_id\x18\n" +
 	" \x01(\tR\x0fworkerReleaseId\x124\n" +
-	"\x16worker_artifact_digest\x18\v \x01(\tR\x14workerArtifactDigest\x12\x1d\n" +
+	"\x16control_runtime_digest\x18\v \x01(\tR\x14controlRuntimeDigest\x12\x1d\n" +
 	"\n" +
 	"git_commit\x18\f \x01(\tR\tgitCommit\x12=\n" +
 	"\tresources\x18\r \x01(\v2\x1f.cozy.worker.v1.WorkerResourcesR\tresources\x12,\n" +
@@ -7701,8 +7701,8 @@ const file_cozy_worker_v1_worker_proto_rawDesc = "" +
 	"\x06reason\x18\a \x01(\x0e2!.cozy.worker.v1.BootFailureReasonR\x06reason\x12\x16\n" +
 	"\x06detail\x18\b \x01(\tR\x06detail\x12=\n" +
 	"\tresources\x18\t \x01(\v2\x1f.cozy.worker.v1.WorkerResourcesR\tresources\x124\n" +
-	"\x16worker_artifact_digest\x18\n" +
-	" \x01(\tR\x14workerArtifactDigest\x12*\n" +
+	"\x16control_runtime_digest\x18\n" +
+	" \x01(\tR\x14controlRuntimeDigest\x12*\n" +
 	"\x11worker_release_id\x18\v \x01(\tR\x0fworkerReleaseIdJ\x04\b\x04\x10\x05\"\xfe\x02\n" +
 	"\x0eWorkerSnapshot\x12,\n" +
 	"\x12record_owner_epoch\x18\x01 \x01(\x04R\x10recordOwnerEpoch\x12:\n" +

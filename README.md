@@ -102,8 +102,8 @@ they land on the VM-class sandbox posture (tensorhub-build.md §1.1) or they do 
 the **LocalOrchestrator** (`internal/orchestrator`): local placement, dispatch, and the
 device ledger. The same service is the worker protocol's **record owner**: it DIALS each
 worker's own socket (#436), owns durable attempt ordinals and terminal acceptance, and
-publishes accepted outputs. The wire is `cozy.worker.v1` at **schema rev 7** — rev-2's
-dynamic-serving shape with the actor-vocabulary hardcut.
+publishes accepted outputs. The wire is `cozy.worker.v1` at **schema rev 8** — rev-2's
+dynamic-serving shape with honest control-Runtime provenance.
 
 - **Identity is canonical bytes.** `internal/canonical` is the document plane: the writer
   is adapted from worker-protocol's own independent Go canonicalizer, the reader is this
