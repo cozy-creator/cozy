@@ -61,6 +61,14 @@ func TestProductPath(t *testing.T) {
 	}{
 		{[]string{"job", "submit", "-h"}, 0, "usage: cozy job submit"},
 		{[]string{"datasets", "push"}, 2, "it lands with issue th-035"},
+		{[]string{"endpoint", "publish", "cozy/example", "--release", "v1"}, 2, "it lands with issue cl-039"},
+		{[]string{"repo", "show", "cozy/example"}, 2, `unknown command "repo show"`},
+		{[]string{"search"}, 2, `unknown command "search"`},
+		{[]string{"endpoints", "show", "cozy/example"}, 2, `unknown command "endpoints show"`},
+		{[]string{"push", "cozy/example", "sha256:nope"}, 2, `unknown command "push cozy/example"`},
+		{[]string{"pull", "cozy/example"}, 2, `unknown command "pull cozy/example"`},
+		{[]string{"deploy"}, 2, `unknown command "deploy"`},
+		{[]string{"promote", "cozy/example", "v1"}, 2, `unknown command "promote cozy/example"`},
 		{[]string{"describe"}, 2, "`cozy describe` needs"},
 	} {
 		if code, out := runCozy(t, root, arm.args...); code != arm.code || !strings.Contains(out, arm.want) {

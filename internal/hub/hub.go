@@ -22,6 +22,7 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"net/url"
 	"strings"
 	"time"
 
@@ -83,16 +84,16 @@ func slowTransport() *http.Transport {
 func (c *Client) Base() string        { return c.base }
 func (c *Client) Token() secret.Value { return c.token }
 
-// Repo is one catalog row as the public listing renders it. The grammar is the hub's
-// (th-003 freezes it); this consumes it verbatim and defines none of its own.
-type Repo struct {
+// Resource is the shared shape of an endpoint or model returned by its typed public
+// route. The route supplies the type; the document therefore carries no `kind`
+// discriminator and Creator never guesses one from its contents.
+type Resource struct {
 	Org       string `json:"org"`
 	Name      string `json:"name"`
-	Kind      string `json:"kind"`
 	CreatedAt string `json:"created_at"`
 }
 
-func (r Repo) Ref() string { return r.Org + "/" + r.Name }
+func (r Resource) Ref() string { return r.Org + "/" + r.Name }
 
 // Health is GET /healthz.
 type Health struct {
@@ -153,29 +154,88 @@ func (c *Client) Health(ctx context.Context) (Health, *exit.Error) {
 	return out, e
 }
 
-// Repos lists the catalog. Public — no credential, and a tokenless caller sees
-// exactly what a credentialed one sees.
-func (c *Client) Repos(ctx context.Context) ([]Repo, *exit.Error) {
-	var out struct {
-		Repos []Repo `json:"repos"`
-	}
-	if e := c.do(ctx, call{method: http.MethodGet, path: "/v1/repos"}, &out); e != nil {
-		return nil, e
-	}
-	return out.Repos, nil
+type ResourceSearch struct {
+	Total  int    `json:"total"`
+	Limit  int    `json:"limit"`
+	Capped bool   `json:"capped"`
+	Query  string `json:"q"`
 }
 
-// CreateRepo is the first-party publish door: create a model or endpoint repo under
-// the admin token, with a reason the hub records durably before it acts.
-func (c *Client) CreateRepo(ctx context.Context, org, name, kind, reason string) (Repo, *exit.Error) {
+// Endpoints searches endpoint resources server-side. Public — no credential.
+func (c *Client) Endpoints(ctx context.Context, query string) ([]Resource, ResourceSearch, *exit.Error) {
 	var out struct {
-		Repo Repo `json:"repo"`
+		Endpoints []Resource     `json:"endpoints"`
+		Search    ResourceSearch `json:"search"`
+	}
+	if e := c.do(ctx, call{method: http.MethodGet, path: resourceSearchPath("endpoints", query)}, &out); e != nil {
+		return nil, ResourceSearch{}, e
+	}
+	return out.Endpoints, out.Search, nil
+}
+
+// Models searches model resources server-side. Public.
+func (c *Client) Models(ctx context.Context, query string) ([]Resource, ResourceSearch, *exit.Error) {
+	var out struct {
+		Models []Resource     `json:"models"`
+		Search ResourceSearch `json:"search"`
+	}
+	if e := c.do(ctx, call{method: http.MethodGet, path: resourceSearchPath("models", query)}, &out); e != nil {
+		return nil, ResourceSearch{}, e
+	}
+	return out.Models, out.Search, nil
+}
+
+func resourceSearchPath(collection, query string) string {
+	if query == "" {
+		return "/v1/" + collection
+	}
+	return "/v1/" + collection + "?" + url.Values{"q": []string{query}}.Encode()
+}
+
+// Endpoint resolves one endpoint through its typed public route.
+func (c *Client) Endpoint(ctx context.Context, ref Ref) (Resource, *exit.Error) {
+	var out struct {
+		Endpoint Resource `json:"endpoint"`
+	}
+	e := c.do(ctx, call{method: http.MethodGet, path: resourcePath("endpoints", ref)}, &out)
+	return out.Endpoint, e
+}
+
+// Model resolves one model through its typed public route.
+func (c *Client) Model(ctx context.Context, ref Ref) (Resource, *exit.Error) {
+	var out struct {
+		Model Resource `json:"model"`
+	}
+	e := c.do(ctx, call{method: http.MethodGet, path: resourcePath("models", ref)}, &out)
+	return out.Model, e
+}
+
+// CreateEndpoint is the first-party endpoint creation door.
+func (c *Client) CreateEndpoint(ctx context.Context, org, name, reason string) (Resource, *exit.Error) {
+	var out struct {
+		Endpoint Resource `json:"endpoint"`
 	}
 	e := c.do(ctx, call{
-		method: http.MethodPost, path: "/v1/repos", admin: true, reason: reason,
-		body: map[string]string{"org": org, "name": name, "kind": kind},
+		method: http.MethodPost, path: "/v1/endpoints", admin: true, reason: reason,
+		body: map[string]string{"org": org, "name": name},
 	}, &out)
-	return out.Repo, e
+	return out.Endpoint, e
+}
+
+// CreateModel is the first-party model creation door.
+func (c *Client) CreateModel(ctx context.Context, org, name, reason string) (Resource, *exit.Error) {
+	var out struct {
+		Model Resource `json:"model"`
+	}
+	e := c.do(ctx, call{
+		method: http.MethodPost, path: "/v1/models", admin: true, reason: reason,
+		body: map[string]string{"org": org, "name": name},
+	}, &out)
+	return out.Model, e
+}
+
+func resourcePath(collection string, ref Ref) string {
+	return "/v1/" + collection + "/" + ref.Org + "/" + ref.Name
 }
 
 // EffectiveConfig reads the hub's running configuration with per-key provenance.
@@ -196,7 +256,7 @@ func (c *Client) do(ctx context.Context, cl call, out any) *exit.Error {
 		return exit.Named(exit.Credential, "hub.token_missing",
 			"%s %s is a first-party route and no admin token is configured", cl.method, cl.path).
 			WithRemedy("set TENSORHUB_TOKEN to the hub's admin.token; catalog reads need no credential").
-			WithNext("cozy hub status", "cozy search")
+			WithNext("cozy hub status", "cozy endpoint search", "cozy model search")
 	}
 
 	var body io.Reader
@@ -372,7 +432,7 @@ func statusCode(status int) exit.Code {
 	return exit.Internal
 }
 
-// Ref is `org/name` — one model or endpoint repo. Release addressing
+// Ref is `org/name` — one model or endpoint. Release addressing
 // (`@release` / `@sha256:…`) is th-003's grammar and is refused by name until it
 // exists, rather than being parsed into something this build cannot resolve.
 type Ref struct {
@@ -385,29 +445,16 @@ func (r Ref) String() string { return r.Org + "/" + r.Name }
 func ParseRef(s string) (Ref, *exit.Error) {
 	if strings.Contains(s, "@") {
 		return Ref{}, exit.Usagef("%q pins a release, which this build cannot resolve", s).
-			WithRemedy("release addressing (@release, @sha256:…) lands with th-003; name the repo alone").
-			WithNext("cozy search")
+			WithRemedy("release addressing (@release, @sha256:…) lands with th-003; name the resource alone").
+			WithNext("cozy endpoint search", "cozy model search")
 	}
 	org, name, ok := strings.Cut(s, "/")
 	if !ok || org == "" || name == "" || strings.Contains(name, "/") {
-		return Ref{}, exit.Usagef("%q is not a repo ref: expected exactly one org/name separator", s).
+		return Ref{}, exit.Usagef("%q is not a model or endpoint ref: expected exactly one org/name separator", s).
 			WithRemedy("the grammar is org/name, e.g. cozy/sdxl").
-			WithNext("cozy search")
+			WithNext("cozy endpoint search", "cozy model search")
 	}
 	return Ref{Org: org, Name: name}, nil
-}
-
-// Kinds is the repo-kind vocabulary, the hub's own (its CHECK constraint).
-var Kinds = []string{"model", "endpoint"}
-
-func CheckKind(kind string) *exit.Error {
-	for _, k := range Kinds {
-		if kind == k {
-			return nil
-		}
-	}
-	return exit.Usagef("%q is not a repo kind", kind).
-		WithRemedy("kind is one of: %s", strings.Join(Kinds, ", "))
 }
 
 // Context bounds one hub call. Handlers never build their own.

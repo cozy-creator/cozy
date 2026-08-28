@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Boundary fence (boundaries.md). Architecture enforcement, not a test.
 
-Thirteen families:
+Fourteen families:
   deps      forbidden dependencies (raw lines, incl. import paths and go.mod)
   impl      the CANONICAL FORMATS TensorFS parses. A second reader of safetensors/gguf/
             cozytensors here would drift from the one that produced the published bytes.
@@ -48,6 +48,8 @@ Thirteen families:
   tensor    (cl-012) the tensorfs CLI has ONE caller: internal/tfs. The configured binary
             is read there and in the config authority, nowhere else — a second package
             shelling out to `tfs` is a second byte-plane door with its own vocabulary.
+  resources endpoint and model are the product nouns. Generic repo/create/show routes and
+            untyped model-transfer verbs are refused, not retained as aliases.
 
 Identifier families scan Go source with comments and string literals removed, so a
 word inside help text or a doc comment is never a violation. Doors, both greppable:
@@ -206,9 +208,6 @@ PY_ALLOW = {
     "scripts/fence.py": "the fence itself: it spells the vocabulary to deny it",
     "scripts/sdxl_proof.py": "fixture source for the M4 non-cooperative-cancel arm; "
                              "runs only inside the released endpoint's own venv",
-    "scripts/xfer-live.py": "cl-012's live transfer driver: its corruption arm flips one "
-                            "byte in a store filename — an adversary plant, no tensor is "
-                            "parsed or composed",
 }
 
 # (cl-028) The VERIFICATION HOME is the only place an //cozy:allow door may exempt a listen
@@ -747,10 +746,71 @@ def check_video_boundary():
     return bad
 
 
+def check_typed_resources():
+    """The product surface names endpoint and model directly; no generic compatibility door."""
+    bad = []
+    product_files = [
+        pathlib.Path("internal/manifest/commands.go"),
+        pathlib.Path("internal/app/catalog.go"),
+        pathlib.Path("internal/app/transfer.go"),
+        pathlib.Path("internal/hub/hub.go"),
+        pathlib.Path("internal/hub/publish.go"),
+    ]
+    forbidden = (
+        "/v1/repos",
+        "/v1/resolve",
+        "/v1/checkpoints",
+        "/publishes",
+        "cozy repo ",
+        "cozy search",
+        "cozy push ",
+        "cozy pull ",
+        "cozy promote ",
+        "cozy endpoints",
+        "cmd.repo.",
+        "cmd.push",
+        "cmd.pull",
+        'Handler: "repo.',
+        'Handler: "push"',
+        'Handler: "pull"',
+    )
+    for path in product_files:
+        text = path.read_text()
+        for old in forbidden:
+            if old in text:
+                bad.append(f"{path}: [resources] retired product surface remains: {old!r}")
+
+    manifest = pathlib.Path("internal/manifest/commands.go").read_text()
+    required_commands = (
+        'Path: []string{"endpoint", "create"}',
+        'Path: []string{"endpoint", "show"}',
+        'Path: []string{"endpoint", "search"}',
+        'Path: []string{"endpoint", "publish"}',
+        'Path: []string{"endpoint", "promote"}',
+        'Path: []string{"model", "create"}',
+        'Path: []string{"model", "show"}',
+        'Path: []string{"model", "search"}',
+        'Path: []string{"model", "publish"}',
+        'Path: []string{"model", "download"}',
+    )
+    for command in required_commands:
+        if command not in manifest:
+            bad.append(f"internal/manifest/commands.go: [resources] missing typed command {command}")
+    if "--kind" in manifest:
+        bad.append("internal/manifest/commands.go: [resources] retired --kind discriminator remains")
+
+    hub_sources = (pathlib.Path("internal/hub/hub.go").read_text() +
+                   pathlib.Path("internal/hub/publish.go").read_text())
+    for route in ('"/v1/endpoints"', '"/v1/models"', '"/v1/models/"', '"/publications"'):
+        if route not in hub_sources:
+            bad.append(f"internal/hub: [resources] missing typed route prefix {route}")
+    return bad
+
+
 violations = (check_sources() + check_matrix() + check_manifest() + check_secret_flags()
               + check_contract() + check_video_boundary() + check_embedded() + check_scripts()
               + check_document_kinds() + check_render_streams()
-              + check_media_contract())
+              + check_media_contract() + check_typed_resources())
 if violations:
     print("FENCE RED (boundaries.md):", file=sys.stderr)
     for v in violations:
@@ -768,5 +828,6 @@ print(
     f"media-client({len(MEDIA_CONTRACT_FIELDS)} contract fields@{MEDIA_CONTRACT_HOME}) "
     f"runtime({len(RUNTIME_VERBS_DENY)} denied verbs@{len(RUNTIME_SITES)} + indirection) "
     f"embed({len(DENY_EMBED)} words, scripts allow@{len(PY_ALLOW)}) "
-    f"contract({len(parse_go_routes(pathlib.Path('internal/api/routes.go')))} routes) video-boundary"
+    f"contract({len(parse_go_routes(pathlib.Path('internal/api/routes.go')))} routes) "
+    f"video-boundary resources(typed endpoint/model, no aliases)"
 )

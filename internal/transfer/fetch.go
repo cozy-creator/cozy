@@ -40,6 +40,8 @@ import (
 type Fetch struct {
 	Tool     *tfs.Tool
 	Hub      *hub.Client
+	Spec     string
+	Lane     string
 	Ref      hub.Ref
 	Snapshot string
 	DryRun   bool
@@ -81,45 +83,23 @@ func (f *Fetch) say(format string, args ...any) {
 	}
 }
 
-// Resolve turns a ref into exactly one installed checkpoint. With a snapshot named,
-// it confirms the hub holds it; without one, it resolves only when the answer is
-// unambiguous — several candidates refuse and list them, because guessing which
-// checkpoint someone meant is the one thing a resolver must never do.
+// Resolve asks Tensorhub's typed model resolver for exactly one checkpoint. Creator
+// never lists candidates or invents a default release locally.
 func (f *Fetch) Resolve(ctx context.Context) (hub.Checkpoint, *exit.Error) {
-	rows, e := f.Hub.Checkpoints(ctx, f.Ref)
+	resolved, e := f.Hub.ResolveModel(ctx, f.Spec, f.Lane)
 	if e != nil {
 		return hub.Checkpoint{}, e
 	}
-	if f.Snapshot != "" {
-		for _, r := range rows {
-			if r.SnapshotID == f.Snapshot {
-				return r, nil
-			}
-		}
-		return hub.Checkpoint{}, exit.New(exit.NotFound,
-			"%s holds no checkpoint %s", f.Ref, f.Snapshot).
-			WithRemedy("`cozy pull %s` lists what it does hold", f.Ref).
-			WithNext("cozy pull " + f.Ref.String() + " --dry-run")
+	ref, parseErr := hub.ParseRef(resolved.Model)
+	if parseErr != nil || resolved.Checkpoint == "" || resolved.HeaderID == "" {
+		return hub.Checkpoint{}, exit.Internalf(
+			"model resolution for %q returned an invalid model, checkpoint, or header", f.Spec)
 	}
-	switch len(rows) {
-	case 0:
-		return hub.Checkpoint{}, exit.New(exit.NotFound, "%s holds no checkpoint", f.Ref).
-			WithRemedy("nothing has been published into this repo yet").
-			WithNext("cozy push " + f.Ref.String() + " <sha256:…> --family <f> --reason <why>")
-	case 1:
-		return rows[0], nil
-	default:
-		names := make([]string, 0, len(rows))
-		for _, r := range rows {
-			names = append(names, r.SnapshotID)
-		}
-		sort.Strings(names)
-		return hub.Checkpoint{}, exit.Named(exit.Validation, "ref.ambiguous",
-			"%s holds %d checkpoints and this ref names none of them", f.Ref, len(rows)).
-			WithRemedy("name one: %s (release addressing — org/repo@release — lands with th-003)",
-				strings.Join(short(names), ", ")).
-			WithNext("cozy pull " + f.Ref.String() + "@" + names[0])
-	}
+	f.Ref, f.Snapshot = ref, resolved.Checkpoint
+	return hub.Checkpoint{
+		Org: ref.Org, Name: ref.Name, SnapshotID: resolved.Checkpoint,
+		HeaderID: resolved.HeaderID, Objects: resolved.Objects, Bytes: resolved.Bytes,
+	}, nil
 }
 
 // Run installs the checkpoint transactionally: verified writes, and a local root
@@ -315,7 +295,7 @@ func (f *Fetch) round(ctx context.Context, row hub.Checkpoint, name string, obje
 			}
 			return exit.Named(exit.Internal, "crash_after_fetch",
 				"development kill point: stopped after %d of %d objects", i, len(want)).
-				WithRemedy("re-run the same pull; the store's verification records are the journal")
+				WithRemedy("re-run the same model download; the store's verification records are the journal")
 		}
 		r, ok := at[o.ID]
 		if !ok {

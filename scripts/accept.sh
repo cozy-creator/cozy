@@ -122,6 +122,13 @@ check "the ONE local record database exists (SQLite, pure-Go driver)" \
   "$COZY_HOME/records.db ($(stat -c%s "$COZY_HOME/records.db" 2>/dev/null || echo 0) B)"
 check "the service lock is a real file this process holds" \
   "$([ -f "$COZY_HOME/service.lock" ] && echo 1 || echo 0)" "$COZY_HOME/service.lock"
+CRED_READY=0
+for _ in $(seq 1 20); do
+  if [ -f "$COZY_HOME/client.cred" ]; then CRED_READY=1; break; fi
+  sleep 0.1
+done
+check "client-auth readiness follows lock-held service liveness within 2s" \
+  "$CRED_READY" "$COZY_HOME/client.cred $( [ "$CRED_READY" = 1 ] && echo ready || echo absent )"
 check "the CLI credential is 0600 — reading a widened one would be agreeing to a leak" \
   "$([ "$(stat -c%a "$COZY_HOME/client.cred" 2>/dev/null)" = 600 ] && echo 1 || echo 0)" \
   "$COZY_HOME/client.cred mode $(stat -c%a "$COZY_HOME/client.cred" 2>/dev/null || echo absent)"

@@ -1,49 +1,21 @@
 package hub
 
-// th-002's publish protocol and th-002/th-003's checkpoint reads, as methods on the
-// ONE client (cl-012). `do` still owns the request build, the credential, the reason
-// header and the whole error mapping — these add shapes, never a second client.
-//
-// The protocol, in the hub's own words (tensorhub README, "The publish protocol"):
-// declare the whole canonical object set before a byte moves; upload only what the
-// hub says it lacks, straight to the FINAL content keys, under every condition the
-// grant signed; the hub streams every object back and hashes it ITSELF; completion
-// runs the hermetic verifier and installs exactly one root. A client receipt never
-// substitutes for the hub's own proof (law 18), which is why nothing here reports
-// what a byte hashed to.
+// Tensorhub's incremental model-publication protocol and checkpoint reads, as methods
+// on the ONE client. `do` still owns request construction, credentials, reasons, and
+// error mapping. A publication opens under a stable operation id, claims known object
+// transfers, settles each transfer through grant -> received -> verify, then seals the
+// exact TensorFS documents. The retired declare-whole route has no compatibility path.
 
 import (
 	"context"
 	"encoding/base64"
 	"net/http"
+	"net/url"
 
 	"github.com/cozy-creator/cozy-creator/internal/exit"
 )
 
-// BeginRequest is the declaration. `closure` and `code_topology` are the exact bytes
-// tfs produced; `manifest` is the exact snapshot manifest object, which is NOT in the
-// closure (tensorfs's PublishClosure covers what a publish MOVES and names the
-// snapshot separately) and therefore rides the declaration.
-//
-// THE MODEL FAMILY IS NOT DECLARED (th-003, tensorhub 1353e53). th-002 took it as a
-// declaration because no classifier existed; th-003 derives it at completion by
-// comparing the installed checkpoint's topology_digest against the structure fixtures
-// tfs banks — family is detectable from artifacts, never self-declared. The hub
-// decodes with DisallowUnknownFields, so a client that still sends the field cannot
-// publish at all; cl-006's real-hub side-check found exactly that and cl-010 removed
-// it, along with `cozy push --family`.
-type BeginRequest struct {
-	Session      string   `json:"session"`
-	Closure      string   `json:"closure"`
-	CodeTopology string   `json:"code_topology"`
-	SnapshotID   string   `json:"snapshot_id"`
-	Manifest     string   `json:"manifest"`
-	HeaderID     string   `json:"header_id"`
-	Objects      []Object `json:"objects"`
-	RawCarrier   bool     `json:"raw_carrier"`
-}
-
-// Object is one declared object identity and its length.
+// Object is one known ObjectRef transfer identity and its length.
 type Object struct {
 	ID     string `json:"object_id"`
 	Length int64  `json:"length"`
@@ -52,10 +24,12 @@ type Object struct {
 // B64 wraps exact document bytes for the declaration.
 func B64(raw []byte) string { return base64.StdEncoding.EncodeToString(raw) }
 
-// Session is the hub's view of one publish.
+// Session is the hub's durable view of one publication.
 type Session struct {
 	ID              string `json:"publish_id"`
 	Session         string `json:"session"`
+	StorageDomain   string `json:"storage_domain"`
+	CustodyScope    string `json:"custody_scope"`
 	State           string `json:"state"`
 	ClosureID       string `json:"closure_id"`
 	SnapshotID      string `json:"snapshot_id"`
@@ -65,8 +39,7 @@ type Session struct {
 	ExpiresAt       string `json:"expires_at"`
 }
 
-// Totals is what the declaration adds up to, as the HUB counted it. The names are
-// the hub's own; nothing here re-derives a count it was told.
+// Totals is Creator's accounting over the exact transfer rows Tensorhub returned.
 type Totals struct {
 	DeclaredObjects int   `json:"declared_objects"`
 	DeclaredBytes   int64 `json:"declared_bytes"`
@@ -82,39 +55,47 @@ type Totals struct {
 // declaration minus what has to move. Subtraction, not a second census.
 func (t Totals) HeldBytes() int64 { return t.DeclaredBytes - t.MissingBytes }
 
-// Missing is one object the hub does not hold, with the state it is in. A resumed
-// publish reads these states rather than any local record.
-type Missing struct {
-	ID     string `json:"object_id"`
-	Length int64  `json:"length"`
-	State  string `json:"state"`
+type OpenPublicationResponse struct {
+	Publication Session `json:"publication"`
+	Created     bool    `json:"created"`
 }
 
-// BeginResponse is the missing-object answer. `held` is a list of IDENTITIES: the
-// hub says which objects it already has, not how big they were — it knows that from
-// the declaration it just read.
-type BeginResponse struct {
-	Publish Session   `json:"publish"`
-	Missing []Missing `json:"missing"`
-	Held    []string  `json:"held"`
-	Totals  Totals    `json:"totals"`
-	Created bool      `json:"created"`
-}
-
-// Begin declares the whole set. It is idempotent on the closure digest: re-declaring
-// the same set in the same repo returns the SAME session, RE-PLANNED — which is what
-// makes an interrupted publish resumable with no client-side state at all.
-func (c *Client) Begin(ctx context.Context, ref Ref, req BeginRequest, reason string) (BeginResponse, *exit.Error) {
-	var out BeginResponse
+func (c *Client) OpenPublication(ctx context.Context, ref Ref, operationID, reason string) (OpenPublicationResponse, *exit.Error) {
+	var out OpenPublicationResponse
 	e := c.do(ctx, call{
-		method: http.MethodPost, path: publishes(ref), admin: true, reason: reason,
-		body: req, byBytes: true,
+		method: http.MethodPost, path: publications(ref), admin: true, reason: reason,
+		body: map[string]string{"operation_id": operationID},
 	}, &out)
 	return out, e
 }
 
-// Grant is one authorization to write one object at its final content key. Either a
-// single signed PUT, or a ranged plan whose parts never enter identity.
+// Transfer is one durable known-object transfer row. Its state is the restart journal.
+type Transfer struct {
+	TransferID    string `json:"transfer_id"`
+	IntakeMode    string `json:"intake_mode"`
+	ObjectID      string `json:"object_id"`
+	Length        int64  `json:"length"`
+	State         string `json:"state"`
+	ReceivedBytes int64  `json:"received_bytes"`
+	VerifiedBytes int64  `json:"verified_bytes"`
+}
+
+func (c *Client) ClaimKnownTransfers(ctx context.Context, ref Ref, publicationID string,
+	objects []Object, reason string,
+) ([]Transfer, *exit.Error) {
+	var out struct {
+		Transfers []Transfer `json:"transfers"`
+	}
+	e := c.do(ctx, call{
+		method: http.MethodPost,
+		path:   publications(ref) + "/" + publicationID + "/known-transfers",
+		admin:  true, reason: reason, byBytes: true,
+		body: map[string]any{"objects": objects},
+	}, &out)
+	return out.Transfers, e
+}
+
+// Grant is one authorization to write one known object at its final content key.
 type Grant struct {
 	ObjectID string            `json:"object_id"`
 	Length   int64             `json:"length"`
@@ -140,54 +121,57 @@ type Part struct {
 // the hub's own streaming hash discharges the digest.
 func (g Grant) Multipart() bool { return g.Method == "MULTIPART" }
 
-// Grant asks for authorization over exactly one object immediately before its bytes move.
-// Multipart plans contain one URL per part, so batching objects here can exceed the bounded
-// response reader on a real model. An expired grant comes back as `grant.expired_replan` — a
-// REPLAN, never a retry-as-failure.
-func (c *Client) Grant(ctx context.Context, ref Ref, publishID, objectID, reason string) (Grant, *exit.Error) {
-	var out struct {
-		Grants []Grant `json:"grants"`
-	}
+type GrantResponse struct {
+	Grants []Grant    `json:"grants"`
+	Held   []Transfer `json:"held"`
+}
+
+// GrantKnownTransfer asks for one transfer immediately before its bytes move. One at
+// a time keeps a large multipart response bounded.
+func (c *Client) GrantKnownTransfer(ctx context.Context, ref Ref, publicationID,
+	transferID, reason string,
+) (GrantResponse, *exit.Error) {
+	var out GrantResponse
 	e := c.do(ctx, call{
-		method: http.MethodPost, path: publishes(ref) + "/" + publishID + "/grants",
-		admin: true, reason: reason, byBytes: true,
-		body: map[string]any{"object_ids": []string{objectID}},
+		method: http.MethodPost,
+		path:   publications(ref) + "/" + publicationID + "/known-transfers/grants",
+		admin:  true, reason: reason, byBytes: true,
+		body: map[string]any{"transfer_ids": []string{transferID}},
 	}, &out)
 	if e != nil {
-		return Grant{}, e
+		return GrantResponse{}, e
 	}
-	if len(out.Grants) != 1 || out.Grants[0].ObjectID != objectID {
-		return Grant{}, exit.Internalf(
-			"grant for %s answered %d rows or another object", objectID, len(out.Grants),
+	if len(out.Grants)+len(out.Held) != 1 {
+		return GrantResponse{}, exit.Internalf(
+			"grant for transfer %s answered %d grants and %d held rows",
+			transferID, len(out.Grants), len(out.Held),
 		)
 	}
-	return out.Grants[0], nil
+	return out, nil
 }
 
-// FinishMultipart assembles a ranged upload. The HUB owns this call because it
-// carries the no-clobber precondition; a client that assembled its own could replace
-// verified bytes.
-func (c *Client) FinishMultipart(ctx context.Context, ref Ref, publishID, objectID string, etags []string, reason string) (bool, *exit.Error) {
+type ReceivedTransfer struct {
+	TransferID    string `json:"transfer_id"`
+	ReceivedBytes int64  `json:"received_bytes"`
+	Precondition  string `json:"precondition"`
+}
+
+func (c *Client) MarkTransfersReceived(ctx context.Context, ref Ref, publicationID string,
+	transfers []ReceivedTransfer, reason string,
+) ([]Transfer, *exit.Error) {
 	var out struct {
-		Conflict bool `json:"conflict"`
+		Transfers []Transfer `json:"transfers"`
 	}
 	e := c.do(ctx, call{
-		method: http.MethodPost, path: publishes(ref) + "/" + publishID + "/multipart/complete",
-		admin: true, reason: reason, byBytes: true,
-		body: map[string]any{"object_id": objectID, "etags": etags},
+		method: http.MethodPost,
+		path:   publications(ref) + "/" + publicationID + "/known-transfers/received",
+		admin:  true, reason: reason, byBytes: true,
+		body: map[string]any{"transfers": transfers},
 	}, &out)
-	return out.Conflict, e
+	return out.Transfers, e
 }
 
-// VerifyReport is what the publisher observed at the storage edge, and it is
-// deliberately thin: whether the write hit an existing key. It carries no checksum,
-// because the hub does not accept one.
-type VerifyReport struct {
-	ObjectID string `json:"object_id"`
-	Conflict bool   `json:"conflict"`
-}
-
-// Verdict is the hub's own reading of an object it streamed back and hashed.
+// Verdict is Tensorhub's own full-byte reading of one transfer.
 type Verdict struct {
 	ObjectID       string `json:"object_id"`
 	State          string `json:"state"`
@@ -198,19 +182,44 @@ type Verdict struct {
 	Detail         string `json:"detail"`
 }
 
-// VerifyObjects asks the hub to prove every uploaded object for itself: it HEADs the
-// key, streams the object back through its own sha256, and mints the receipt from
-// what it observed. PUT success and an ETag are not proof.
-func (c *Client) VerifyObjects(ctx context.Context, ref Ref, publishID string, reports []VerifyReport, reason string) ([]Verdict, *exit.Error) {
+func (c *Client) VerifyKnownTransfers(ctx context.Context, ref Ref, publicationID string,
+	transferIDs []string, reason string,
+) ([]Verdict, *exit.Error) {
 	var out struct {
-		Objects []Verdict `json:"objects"`
+		Transfers []Verdict `json:"transfers"`
 	}
 	e := c.do(ctx, call{
-		method: http.MethodPost, path: publishes(ref) + "/" + publishID + "/objects/verify",
-		admin: true, reason: reason, byBytes: true,
-		body: map[string]any{"objects": reports},
+		method: http.MethodPost,
+		path:   publications(ref) + "/" + publicationID + "/known-transfers/verify",
+		admin:  true, reason: reason, byBytes: true,
+		body: map[string]any{"transfer_ids": transferIDs},
 	}, &out)
-	return out.Objects, e
+	return out.Transfers, e
+}
+
+// FinishMultipart assembles a ranged upload. Tensorhub owns the final no-clobber
+// conditional.
+func (c *Client) FinishMultipart(ctx context.Context, ref Ref, publicationID, objectID string, etags []string, reason string) (bool, *exit.Error) {
+	var out struct {
+		Conflict bool `json:"conflict"`
+	}
+	e := c.do(ctx, call{
+		method: http.MethodPost,
+		path:   publications(ref) + "/" + publicationID + "/multipart/complete",
+		admin:  true, reason: reason, byBytes: true,
+		body: map[string]any{"object_id": objectID, "etags": etags},
+	}, &out)
+	return out.Conflict, e
+}
+
+type SealPublicationRequest struct {
+	Closure      string           `json:"closure"`
+	CodeTopology string           `json:"code_topology"`
+	SnapshotID   string           `json:"snapshot_id"`
+	Manifest     string           `json:"manifest"`
+	HeaderID     string           `json:"header_id"`
+	Stamps       []map[string]any `json:"stamps"`
+	Receipt      any              `json:"receipt"`
 }
 
 // Root is the installed checkpoint: exactly one snapshot, committed idempotently.
@@ -226,17 +235,12 @@ type Root struct {
 	Grade          string `json:"grade"`
 }
 
-// CompleteResponse is the committed result. A duplicate completion returns the
-// ORIGINAL result out of the ledger with duplicate=true — the same root, the same
-// catalog root id, byte for byte.
+// CompleteResponse is the committed seal result. Exact replay returns the original
+// result with duplicate=true.
 type CompleteResponse struct {
 	PublishID string `json:"publish_id"`
 	Root      Root   `json:"root"`
-	// Verifier is the hermetic verdict, consumed as the hub rendered it. The field
-	// spellings are the verifier's own (capitalised), and they are copied, not
-	// re-modelled: an alternate semantic model of somebody else's verdict is how a
-	// consumer starts disagreeing with the thing that decided.
-	Verifier struct {
+	Verifier  struct {
 		Report       string `json:"Report"`
 		Lane         string `json:"Lane"`
 		Satisfaction string `json:"Satisfaction"`
@@ -247,17 +251,25 @@ type CompleteResponse struct {
 	Duplicate             bool             `json:"duplicate"`
 }
 
-// Complete constructs the exact subject, runs the hermetic verifier, installs one
-// root and commits the catalog. It re-verifies every object it already held (law 18:
-// the hub re-proves the bytes regardless of what the publisher declared).
-func (c *Client) Complete(ctx context.Context, ref Ref, publishID, reason string) (CompleteResponse, *exit.Error) {
+func (c *Client) SealPublication(ctx context.Context, ref Ref, publicationID string,
+	request SealPublicationRequest, reason string,
+) (CompleteResponse, *exit.Error) {
 	var out CompleteResponse
 	e := c.do(ctx, call{
-		method: http.MethodPost, path: publishes(ref) + "/" + publishID + "/complete",
-		admin: true, reason: reason, byBytes: true,
+		method: http.MethodPost,
+		path:   publications(ref) + "/" + publicationID + "/seal",
+		admin:  true, reason: reason, byBytes: true,
+		body: request,
 	}, &out)
 	return out, e
 }
+
+func publications(ref Ref) string {
+	return "/v1/models/" + ref.Org + "/" + ref.Name + "/publications"
+}
+
+// The old whole-closure Begin/Grant/VerifyObjects/Complete API is absent.
+// Publication progress is durable only as transfer rows in Tensorhub.
 
 // ---------------------------------------------------------------- checkpoint reads
 
@@ -275,17 +287,34 @@ type Checkpoint struct {
 	InstalledAt    string `json:"installed_at"`
 }
 
-// Checkpoints lists what a repo holds. With an empty ref it lists the whole catalog.
-func (c *Client) Checkpoints(ctx context.Context, ref Ref) ([]Checkpoint, *exit.Error) {
-	path := "/v1/checkpoints"
-	if ref.Org != "" {
-		path = "/v1/repos/" + ref.Org + "/" + ref.Name + "/checkpoints"
+// ModelResolution is Tensorhub's exact answer to a human model ref. Download never
+// lists checkpoints and guesses: digest or release selection happens at this route.
+type ModelResolution struct {
+	Ref        string   `json:"ref"`
+	Model      string   `json:"model"`
+	Release    string   `json:"release"`
+	Alias      string   `json:"alias"`
+	Lane       string   `json:"lane"`
+	LaneID     string   `json:"lane_id"`
+	Checkpoint string   `json:"checkpoint_id"`
+	HeaderID   string   `json:"header_digest"`
+	Structure  string   `json:"structure"`
+	Encodings  []string `json:"encodings"`
+	Objects    int      `json:"objects"`
+	Bytes      int64    `json:"bytes"`
+	Pinned     string   `json:"pinned"`
+	Note       string   `json:"note"`
+}
+
+func (c *Client) ResolveModel(ctx context.Context, spec, lane string) (ModelResolution, *exit.Error) {
+	query := url.Values{"ref": []string{spec}}
+	if lane != "" {
+		query.Set("lane", lane)
 	}
-	var out struct {
-		Checkpoints []Checkpoint `json:"checkpoints"`
-	}
-	e := c.do(ctx, call{method: http.MethodGet, path: path}, &out)
-	return out.Checkpoints, e
+	var out ModelResolution
+	e := c.do(ctx, call{method: http.MethodGet,
+		path: "/v1/models/resolve?" + query.Encode()}, &out)
+	return out, e
 }
 
 // Manifest reads the exact SnapshotManifest bytes back, verbatim. They are handed
@@ -295,7 +324,7 @@ func (c *Client) Manifest(ctx context.Context, ref Ref, snapshot string) ([]byte
 	var raw []byte
 	e := c.do(ctx, call{
 		method: http.MethodGet,
-		path:   "/v1/repos/" + ref.Org + "/" + ref.Name + "/checkpoints/" + snapshot + "/manifest",
+		path:   "/v1/models/" + ref.Org + "/" + ref.Name + "/checkpoints/" + snapshot + "/manifest",
 		raw:    &raw, byBytes: true,
 	}, nil)
 	return raw, e
@@ -311,23 +340,16 @@ type Read struct {
 	Expires  string `json:"expires_at"`
 }
 
-// Reads asks for download authorization over the named objects of one installed
-// checkpoint.
-//
-// AWAITING A HUB ROUTE. th-002 landed the whole write side and no read side: the hub
-// signs PUTs at final keys and streams objects back for its OWN verification, but
-// exposes no route that hands a client a presigned GET (`objstore.PresignGet` exists
-// and has no caller behind a route). Until one lands, a Launch-1 hub is
-// publish-only, and this refuses by NAME — a fetch that silently invented a bucket
-// URL, or that reached object storage with a credential of its own, would be a
-// second custody authority, which is exactly what law 2 forbids.
+// Reads asks Tensorhub's live typed model route for download authorization over the
+// named objects of one installed checkpoint. Creator never constructs a bucket URL or
+// reaches storage with credentials of its own.
 func (c *Client) Reads(ctx context.Context, ref Ref, snapshot string, ids []string) ([]Read, *exit.Error) {
 	var out struct {
 		Reads []Read `json:"reads"`
 	}
 	e := c.do(ctx, call{
 		method: http.MethodPost, byBytes: true,
-		path: "/v1/repos/" + ref.Org + "/" + ref.Name + "/checkpoints/" + snapshot + "/reads",
+		path: "/v1/models/" + ref.Org + "/" + ref.Name + "/checkpoints/" + snapshot + "/reads",
 		body: map[string]any{"object_ids": ids},
 	}, &out)
 	if e != nil && (e.Name == "hub.untyped_refusal" || e.Name == "route.not_found") {
@@ -335,16 +357,7 @@ func (c *Client) Reads(ctx context.Context, ref Ref, snapshot string, ids []stri
 			"the hub at %s serves no object-read route: POST %s answered %q", c.base,
 			"…/checkpoints/{snapshot}/reads", e.Name).
 			WithRemedy("this hub can take custody of bytes and cannot hand them back yet; the read grant is the missing half of th-002's transfer protocol").
-			WithNext("cozy push <org/repo> <sha256:…>", "cozy pull --dry-run "+ref.String())
+			WithNext("cozy model publish <org/model> <sha256:…>", "cozy model download --dry-run "+ref.String())
 	}
 	return out.Reads, e
 }
-
-func publishes(ref Ref) string {
-	return "/v1/repos/" + ref.Org + "/" + ref.Name + "/publishes"
-}
-
-// PublishState is DELETED, loudly (cl-028): it was a client-side resume read the design
-// doc says does not exist — publish.go's transactional walk re-declares and the hub
-// answers what is already held, so nothing ever read it. A resume verb returns only with
-// a recorded design decision, never as a leftover.

@@ -44,13 +44,16 @@ var handlers = map[string]Handler{
 	"media.ls":          handleMediaLs,
 	"up":                handleUp,
 	"down":              handleDown,
-	"search":            handleSearch,
-	"repo.show":         handleRepoShow,
-	"repo.create":       handleRepoCreate,
+	"endpoint.search":   handleEndpointSearch,
+	"model.search":      handleModelSearch,
+	"endpoint.show":     handleEndpointShow,
+	"endpoint.create":   handleEndpointCreate,
+	"model.show":        handleModelShow,
+	"model.create":      handleModelCreate,
 	"hub.status":        handleHubStatus,
 	"hub.config":        handleHubConfig,
-	"push":              handlePush,
-	"pull":              handlePull,
+	"model.publish":     handleModelPublish,
+	"model.download":    handleModelDownload,
 	"start":             handleStart,
 	"stop":              handleStop,
 	"logs":              handleLogs,
@@ -148,7 +151,7 @@ func handleStatus(ctx *Context) *exit.Error {
 	)
 	switch {
 	case counts["endpoints"] == 0:
-		rec.Next = []string{"cozy install <org/endpoint>", "cozy search"}
+		rec.Next = []string{"cozy install <org/endpoint>", "cozy endpoint search", "cozy model search"}
 	case counts["resident_endpoints"] == 0:
 		rec.Next = []string{"cozy start <org/endpoint>"}
 	}
