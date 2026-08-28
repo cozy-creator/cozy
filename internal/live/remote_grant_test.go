@@ -171,8 +171,29 @@ func (p *grantPeer) Control(stream pb.WorkerControl_ControlServer) error {
 		case frame.GetSnapshotAck() != nil:
 			p.frames <- "snapshot_ack"
 		case frame.GetArtifactGrantUpdate() != nil:
+			update := frame.GetArtifactGrantUpdate()
+			if update.Grant == nil || len(update.Grant.Subjects) < 2 {
+				p.frames <- "invalid_artifact_grant"
+				continue
+			}
 			p.frames <- "artifact_grant"
 		case frame.GetDesiredState() != nil:
+			desired := frame.GetDesiredState().GetPlacementSet()
+			if desired == nil {
+				p.frames <- "invalid_desired_state"
+				continue
+			}
+			doc, err := canonical.Read(desired.PlacementSetCanonicalBytes, &pb.PlacementSet{})
+			if err != nil || len(doc.List("placements")) != 1 {
+				p.frames <- "invalid_desired_state"
+				continue
+			}
+			model := doc.List("placements")[0].Sub("spec").Sub("model_object_set")
+			if model.Str("kind") != "model_object_set" || model.Str("subject_id") != model.Str("digest") ||
+				model.Int("length") <= 0 {
+				p.frames <- "invalid_desired_state"
+				continue
+			}
 			p.frames <- "desired_state"
 		}
 	}
