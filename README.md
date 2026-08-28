@@ -126,6 +126,15 @@ dynamic-serving shape with the actor-vocabulary hardcut.
   ordinary grant subjects fetched by the worker; refreshing their expiring locations never
   changes the desired revision. The invocation media plane carries no endpoint distribution
   route. The worker recomputes every subject digest before using its bytes.
+- **A rental is a reusable pod, not an endpoint-shaped image.** `cozy rent revise` asks
+  Tensorhub to author one immutable active placement revision, then the existing
+  RecordOwner sends that revision's grant before its set on the already-claimed stream.
+  The worker instance and boot identity do not change; a different substrate family
+  refuses at Tensorhub before Creator can relay it.
+- **Acquisition is observable, not authoritative.** Schema rev 7 carries endpoint/model
+  monotonic intervals plus downloaded/reused byte counters. Creator persists those facts
+  by worker boot + placement spec and exposes them on the worker listing, but no timing or
+  counter participates in identity, convergence, readiness, or admission.
 - **Two axes, one admission fence.** A placement's convergence is
   materialization × serving; DISPATCHABLE gates dispatch. Capacity is a WORKER property —
   `admission_state` + `admission_generation` + `available_attempt_slots` — and every offer

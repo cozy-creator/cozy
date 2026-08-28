@@ -10,6 +10,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -299,7 +300,13 @@ func (p DesiredPlacement) InstanceID() string {
 	return "ins-" + hex.EncodeToString(sum[:12])
 }
 
-func (s WorkerLaunchSpec) InstanceID() string { return s.Placement.InstanceID() }
+func (s WorkerLaunchSpec) InstanceID() string {
+	if s.Connection != nil && s.Connection.RentalID != "" {
+		sum := sha256.Sum256([]byte("rental/" + s.Connection.RentalID))
+		return "ins-" + hex.EncodeToString(sum[:12])
+	}
+	return s.Placement.InstanceID()
+}
 
 // PlacementID is the RecordOwner-minted routing + journal key for the one placement this
 // slot hosts (#481; renamed from deployment_id — tensorhub's "deployment" is an id-less
@@ -313,6 +320,7 @@ func (p DesiredPlacement) PlacementID() string {
 }
 
 type worker struct {
+	grantMu    sync.Mutex
 	instanceID string
 	spec       WorkerLaunchSpec
 	cmd        *exec.Cmd
@@ -416,8 +424,10 @@ type worker struct {
 	revision             uint64
 	grantRevision        uint64
 	grantID              string
+	grantSubjects        []ArtifactSubjectFacts
 	appliedGrantRevision uint64
 	appliedGrantID       string
+	acquisition          PlacementAcquisitionFacts
 	setDigest            []byte
 	setBytes             []byte
 	// The worker's last diagnostic fault and the first report that carried it. The FAILED
@@ -518,6 +528,14 @@ func (c *Orchestrator) EnsureWorker(spec WorkerLaunchSpec) (string, WorkerChange
 		// identity for this purpose is its plan set, which is what the desired set names.
 		if hostsPlans(live, spec.Placement) {
 			return instanceID, ChangeNone, nil
+		}
+		if live.spec.Connection != nil {
+			return instanceID, ChangeNone, exit.Named(exit.Conflict,
+				"rental.placement_revision_required",
+				"rental %s is claimed with another desired placement",
+				live.spec.Connection.RentalID).
+				WithRemedy("use `cozy rent revise %s --endpoint-ref ...`; remote desired state always follows its active grant",
+					live.spec.Connection.RentalID)
 		}
 		if e := c.ConvergePlacementSet(instanceID, []DesiredPlacement{spec.Placement}); e != nil {
 			return instanceID, ChangeNone, e
@@ -875,22 +893,10 @@ func (c *Orchestrator) connectWorker(spec WorkerLaunchSpec) (string, *exit.Error
 	if e := byteplane.Health(); e != nil {
 		return "", e
 	}
-	var planIDs []string
-	var subjects []*pb.ArtifactSubject
-	for _, b := range spec.Placement.Bindings {
-		if b.RuntimePlan == nil {
-			return "", exit.Named(exit.Structural, "remote_binding_plan_subject_missing",
-				"remote binding %s carries no exact artifact subject", b.Entrypoint)
-		}
-		subject, e := b.artifactSubject()
-		if e != nil {
-			return "", e
-		}
-		planIDs = append(planIDs, subject.SubjectId)
-		subjects = append(subjects, subject)
+	planIDs, subjects, e := remoteBindingSubjects(spec.Placement)
+	if e != nil {
+		return "", e
 	}
-	sort.Strings(planIDs)
-	sortSubjects(subjects)
 	// AttachWorker, not SpawnWorker: the device-envelope admission arbitrates THIS host's
 	// cards, and the pod's card is the pod's. There is no grant to journal and none to
 	// release, which is also why nothing here has a pid or a birth identity to record.
@@ -913,6 +919,26 @@ func (c *Orchestrator) connectWorker(spec WorkerLaunchSpec) (string, *exit.Error
 		instanceID, spec.Connection.Addr, byteplane.Addr(), len(planIDs))
 	go c.attach(w)
 	return instanceID, nil
+}
+
+func remoteBindingSubjects(placement DesiredPlacement) ([]string, []*pb.ArtifactSubject, *exit.Error) {
+	var planIDs []string
+	var subjects []*pb.ArtifactSubject
+	for _, b := range placement.Bindings {
+		if b.RuntimePlan == nil {
+			return nil, nil, exit.Named(exit.Structural, "remote_binding_plan_subject_missing",
+				"remote binding %s carries no exact artifact subject", b.Entrypoint)
+		}
+		subject, e := b.artifactSubject()
+		if e != nil {
+			return nil, nil, e
+		}
+		planIDs = append(planIDs, subject.SubjectId)
+		subjects = append(subjects, subject)
+	}
+	sort.Strings(planIDs)
+	sortSubjects(subjects)
+	return planIDs, subjects, nil
 }
 
 // subjectOf names the exact bytes of one staged binding-plan record, as the
@@ -1086,15 +1112,18 @@ func (c *Orchestrator) WorkerLog(instanceID string) string {
 // worker-level admission fence — and `applied_revision` splits into the two facts it was
 // pretending to be (#473).
 type WorkerFacts struct {
-	InstanceID  string   `json:"instance_id"`
-	Endpoint    string   `json:"endpoint"`
-	ReleaseID   string   `json:"release_id"`
-	BootID      string   `json:"worker_boot_id"`
-	PlacementID string   `json:"placement_id"`
-	PID         int      `json:"pid"`
-	Generation  uint64   `json:"executor_generation"`
-	Exited      bool     `json:"exited"`
-	Devices     []string `json:"devices"`
+	InstanceID                 string   `json:"instance_id"`
+	RentalID                   string   `json:"rental_id,omitempty"`
+	Endpoint                   string   `json:"endpoint"`
+	ReleaseID                  string   `json:"release_id"`
+	BootID                     string   `json:"worker_boot_id"`
+	PlacementID                string   `json:"placement_id"`
+	PlacementSpecDigest        string   `json:"placement_spec_digest"`
+	RetainedFallbackSpecDigest string   `json:"retained_fallback_spec_digest"`
+	PID                        int      `json:"pid"`
+	Generation                 uint64   `json:"executor_generation"`
+	Exited                     bool     `json:"exited"`
+	Devices                    []string `json:"devices"`
 
 	Phase           string `json:"worker_phase"`
 	Materialization string `json:"materialization"`
@@ -1114,13 +1143,16 @@ type WorkerFacts struct {
 
 	// ACCEPTANCE AND CONVERGENCE ARE TWO FACTS. converged < accepted is the normal,
 	// readable state of a convergence in progress or a latched failure, never an error.
-	DesiredRevision      uint64 `json:"desired_state_revision"`
-	AcceptedRevision     uint64 `json:"accepted_desired_state_revision"`
-	ConvergedRevision    uint64 `json:"converged_revision"`
-	GrantID              string `json:"artifact_grant_id"`
-	GrantRevision        uint64 `json:"artifact_grant_revision"`
-	AppliedGrantID       string `json:"applied_artifact_grant_id"`
-	AppliedGrantRevision uint64 `json:"applied_grant_revision"`
+	DesiredRevision            uint64                    `json:"desired_state_revision"`
+	AcceptedRevision           uint64                    `json:"accepted_desired_state_revision"`
+	ConvergedRevision          uint64                    `json:"converged_revision"`
+	AcceptedPlacementSetDigest string                    `json:"accepted_placement_set_digest"`
+	GrantID                    string                    `json:"artifact_grant_id"`
+	GrantRevision              uint64                    `json:"artifact_grant_revision"`
+	GrantSubjects              []ArtifactSubjectFacts    `json:"artifact_grant_subjects"`
+	AppliedGrantID             string                    `json:"applied_artifact_grant_id"`
+	AppliedGrantRevision       uint64                    `json:"applied_grant_revision"`
+	Acquisition                PlacementAcquisitionFacts `json:"acquisition"`
 
 	// QuietMS makes missed protocol reports visible. ErrorForMS is diagnostic history
 	// only: a typed FAILED axis is acted on immediately, never after a timer.
@@ -1182,9 +1214,17 @@ func factsOf(w *worker) WorkerFacts {
 		GrantRevision:        w.grantRevision,
 		AppliedGrantID:       w.appliedGrantID,
 		AppliedGrantRevision: w.appliedGrantRevision,
+		Acquisition:          w.acquisition,
 
 		Fault: w.fault,
 	}
+	if w.spec.Connection != nil {
+		f.RentalID = w.spec.Connection.RentalID
+	}
+	f.PlacementSpecDigest, _ = canonical.Spell(w.specDigest)
+	f.RetainedFallbackSpecDigest, _ = canonical.Spell(w.fallbackPin)
+	f.AcceptedPlacementSetDigest, _ = canonical.Spell(w.acceptedSetDigest)
+	f.GrantSubjects = append([]ArtifactSubjectFacts(nil), w.grantSubjects...)
 	// THIS OWNER'S OWN VERDICT IS A FACT ABOUT THE WORKER, so it is reported as one — in
 	// its own field. A claim this side refused is the answer a poller of
 	// `/v1/local/workers` needs; without it the only observable was a readiness wait that
@@ -1202,6 +1242,25 @@ func factsOf(w *worker) WorkerFacts {
 		f.PID = w.cmd.Process.Pid
 	}
 	return f
+}
+
+type AcquisitionLegFacts struct {
+	StartedNS       uint64 `json:"started_monotonic_ns"`
+	EndedNS         uint64 `json:"ended_monotonic_ns"`
+	DownloadedBytes uint64 `json:"downloaded_bytes"`
+	ReusedBytes     uint64 `json:"reused_bytes"`
+}
+
+type PlacementAcquisitionFacts struct {
+	Endpoint AcquisitionLegFacts `json:"endpoint"`
+	Model    AcquisitionLegFacts `json:"model"`
+}
+
+type ArtifactSubjectFacts struct {
+	Digest    string `json:"digest"`
+	SubjectID string `json:"subject_id"`
+	Kind      string `json:"kind"`
+	Length    uint64 `json:"length"`
 }
 
 // trimEnum renders a protocol enum by its own name, minus the type prefix proto3's

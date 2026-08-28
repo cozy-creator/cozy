@@ -2,6 +2,7 @@ package hub
 
 import (
 	"context"
+	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
 	"net/http"
@@ -55,11 +56,12 @@ const (
 // Rental is one rented pod as the hub reports it. There is no token on it, and there is
 // no route that adds one: this host has the token because this host minted it.
 type Rental struct {
-	ID      string
-	State   string
-	Address string
-	CertPEM string
-	Detail  string
+	ID          string
+	State       string
+	EndpointRef string
+	Address     string
+	CertPEM     string
+	Detail      string
 	// MediaAddress is the pod's BYTE PLANE (cl-014, ruled #506b): the co-resident media
 	// server's own listener, which is where an owner uploads a payload and downloads an
 	// output. The hub observed it and names it.
@@ -71,7 +73,8 @@ type Rental struct {
 	// ControlSnapshot is Tensorhub's exact acquisition-attempt control truth. Its
 	// canonical bytes were persisted before provider Create; Creator verifies and
 	// stores those same bytes before publishing a remote target.
-	ControlSnapshot *ExactControlDocument
+	ControlSnapshot   *ExactControlDocument
+	PlacementRevision uint64
 }
 
 // ExactControlDocument is one bounded exact-byte document transported by the
@@ -88,7 +91,8 @@ type ExactControlDocument struct {
 // prevents a partial ready projection from being mistaken for a usable pod.
 func (r Rental) Ready() bool {
 	return r.State == RentalReady && r.Address != "" && r.MediaAddress != "" &&
-		r.CertPEM != "" && len(r.TokenSHA256) > 0 && r.ControlSnapshot != nil
+		r.CertPEM != "" && len(r.TokenSHA256) > 0 && r.ControlSnapshot != nil &&
+		r.PlacementRevision > 0
 }
 
 // HoldsHash answers whether the hub's live set carries this hash — the renter's own
@@ -108,14 +112,16 @@ func (r Rental) HoldsHash(hash string) bool {
 
 // wireRental is the answer's own shape.
 type wireRental struct {
-	ID              string                `json:"rental_id"`
-	State           string                `json:"state"`
-	WorkerAddress   string                `json:"worker_address"`
-	CertPEM         string                `json:"cert_pem"`
-	Detail          string                `json:"detail"`
-	MediaAddress    string                `json:"media_address"`
-	TokenSHA256     []string              `json:"renter_token_sha256"`
-	ControlSnapshot *ExactControlDocument `json:"control_snapshot"`
+	ID                string                `json:"rental_id"`
+	State             string                `json:"state"`
+	EndpointRef       string                `json:"endpoint_ref"`
+	WorkerAddress     string                `json:"worker_address"`
+	CertPEM           string                `json:"cert_pem"`
+	Detail            string                `json:"detail"`
+	MediaAddress      string                `json:"media_address"`
+	TokenSHA256       []string              `json:"renter_token_sha256"`
+	ControlSnapshot   *ExactControlDocument `json:"control_snapshot"`
+	PlacementRevision uint64                `json:"placement_revision"`
 }
 
 var bareSHA256Pattern = regexp.MustCompile(`^[0-9a-f]{64}$`)
@@ -136,9 +142,11 @@ func validateRentalID(id string) *exit.Error {
 
 func (w wireRental) rental() Rental {
 	return Rental{
-		ID: w.ID, State: w.State, Address: w.WorkerAddress, CertPEM: w.CertPEM,
+		ID: w.ID, State: w.State, EndpointRef: w.EndpointRef,
+		Address: w.WorkerAddress, CertPEM: w.CertPEM,
 		Detail: w.Detail, MediaAddress: w.MediaAddress,
 		TokenSHA256: w.TokenSHA256, ControlSnapshot: w.ControlSnapshot,
+		PlacementRevision: w.PlacementRevision,
 	}
 }
 
@@ -256,7 +264,65 @@ type RentalArtifactGrant struct {
 	Grant         ArtifactGrant `json:"grant"`
 }
 
+type RentalPlacementRevision struct {
+	RentalID          string               `json:"rental_id"`
+	EndpointRef       string               `json:"endpoint_ref"`
+	PlacementRevision uint64               `json:"placement_revision"`
+	ControlSnapshot   ExactControlDocument `json:"control_snapshot"`
+	PlacementSet      ExactControlDocument `json:"placement_set"`
+}
+
 const maxArtifactGrantResponseBytes = 64 << 20
+
+// ReviseRentalPlacement asks Tensorhub's operator authority to author one immutable
+// desired placement for the already-live pod. The request chooses only endpoint_ref;
+// execution, model closure, documents, image and subjects remain server-derived.
+func (c *Client) ReviseRentalPlacement(ctx context.Context, id, endpointRef,
+	idempotencyKey, reason string) (RentalPlacementRevision, *exit.Error) {
+	var out RentalPlacementRevision
+	if e := validateRentalID(id); e != nil {
+		return out, e
+	}
+	if strings.TrimSpace(endpointRef) != endpointRef || endpointRef == "" ||
+		strings.TrimSpace(idempotencyKey) == "" || len(idempotencyKey) > 200 {
+		return out, exit.Named(exit.Validation, "rental.placement_revision_invalid",
+			"endpoint_ref and an Idempotency-Key of at most 200 characters are required")
+	}
+	e := c.do(ctx, call{
+		method: http.MethodPost,
+		path:   "/v1/admin/private-rentals/" + url.PathEscape(id) + "/placement-revisions",
+		admin:  true, reason: reason, idempotency: idempotencyKey,
+		body: struct {
+			EndpointRef string `json:"endpoint_ref"`
+		}{EndpointRef: endpointRef},
+		responseBytes: maxRentalResponseBytes,
+	}, &out)
+	if e != nil {
+		return out, e
+	}
+	if out.RentalID != id || out.EndpointRef != endpointRef || out.PlacementRevision < 2 {
+		return out, placementRevisionInvalid("answer changed rental, endpoint, or revision")
+	}
+	for name, exact := range map[string]ExactControlDocument{
+		"control_snapshot": out.ControlSnapshot, "placement_set": out.PlacementSet,
+	} {
+		if exact.Length <= 0 || int64(len(exact.CanonicalBytes)) != exact.Length ||
+			!validDigest(exact.Digest) || exact.Digest != digestOf(exact.CanonicalBytes) {
+			return out, placementRevisionInvalid("%s has invalid stored-byte identity", name)
+		}
+	}
+	return out, nil
+}
+
+func placementRevisionInvalid(format string, args ...any) *exit.Error {
+	return exit.Named(exit.Conflict, "rental.placement_revision_invalid", format, args...).
+		WithRemedy("preserve the prior desired revision; Creator will not repair Tensorhub-authored identity")
+}
+
+func digestOf(raw []byte) string {
+	sum := sha256.Sum256(raw)
+	return "sha256:" + hex.EncodeToString(sum[:])
+}
 
 // ArtifactGrant asks Tensorhub for fresh, rental-scoped locations using the renter token
 // that already authenticates Claim. The request is deliberately only revision plus TTL:

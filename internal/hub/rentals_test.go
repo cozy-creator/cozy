@@ -56,3 +56,37 @@ func TestRentalArtifactGrantUsesScopedBearerAndClosedRequest(t *testing.T) {
 		t.Fatalf("grant = %#v", grant)
 	}
 }
+
+func TestReviseRentalPlacementUsesAdminMutationContract(t *testing.T) {
+	control := []byte(`{"format":"tensorhub.rental_control_snapshot/1"}`)
+	placement := []byte(`{"format":"cozy.worker.v1.PlacementSet/2"}`)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost || r.URL.Path != "/v1/admin/private-rentals/rental-1/placement-revisions" {
+			t.Fatalf("request = %s %s", r.Method, r.URL.Path)
+		}
+		if r.Header.Get("Authorization") != "Bearer admin" ||
+			r.Header.Get("Idempotency-Key") != "revise-1" ||
+			r.Header.Get("X-Tensorhub-Reason") != "switch endpoint" {
+			t.Fatalf("mutation headers = %#v", r.Header)
+		}
+		var body map[string]any
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil || len(body) != 1 ||
+			body["endpoint_ref"] != "cozy/endpoint/v2/generate" {
+			t.Fatalf("body = %#v, %v", body, err)
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"rental_id": "rental-1", "endpoint_ref": "cozy/endpoint/v2/generate",
+			"placement_revision": 2,
+			"control_snapshot":   map[string]any{"canonical_bytes": control, "digest": digestOf(control), "length": len(control)},
+			"placement_set":      map[string]any{"canonical_bytes": placement, "digest": digestOf(placement), "length": len(placement)},
+		})
+	}))
+	defer server.Close()
+	client := New(config.Config{HubURL: server.URL, HubToken: secret.New("admin")}, "test")
+	revision, problem := client.ReviseRentalPlacement(context.Background(), "rental-1",
+		"cozy/endpoint/v2/generate", "revise-1", "switch endpoint")
+	if problem != nil || revision.PlacementRevision != 2 ||
+		string(revision.PlacementSet.CanonicalBytes) != string(placement) {
+		t.Fatalf("revision = %#v, %v", revision, problem)
+	}
+}

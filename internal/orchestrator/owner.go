@@ -649,7 +649,12 @@ func (c *Orchestrator) runRemoteGrantLoop(s *session, w *worker) {
 	}
 	initial := true
 	for {
-		revision, grant, problem := c.opt.ArtifactGrants(s.ctx, w.spec.Connection)
+		w.grantMu.Lock()
+		c.mu.Lock()
+		placement := w.spec.Placement
+		c.mu.Unlock()
+		grant, problem := c.issueRemoteGrant(s.ctx, s, w, placement, initial)
+		w.grantMu.Unlock()
 		if problem != nil {
 			c.logf("rental %s artifact grant was not refreshed: %s",
 				w.spec.Connection.RentalID, problem.Message)
@@ -658,39 +663,129 @@ func (c *Orchestrator) runRemoteGrantLoop(s *session, w *worker) {
 			}
 			continue
 		}
-		if problem := grantCovers(w.spec.Placement, grant); problem != nil {
-			c.logf("rental %s artifact grant REFUSED: %s",
-				w.spec.Connection.RentalID, problem.Message)
-			if !waitContext(s.ctx, ReportCadence) {
-				return
-			}
-			continue
-		}
-		update := &pb.ArtifactGrantUpdate{GrantRevision: revision, Grant: grant}
-		update.RecordOwnerEpoch, update.ControlStreamGeneration, update.WorkerBootId =
-			recordOwnerEpoch, s.generation, s.bootID
-		if !s.send(&pb.RecordOwnerFrame{Msg: &pb.RecordOwnerFrame_ArtifactGrantUpdate{
-			ArtifactGrantUpdate: update,
-		}}) {
-			return
-		}
-		c.mu.Lock()
-		w.grantRevision, w.grantID = revision, grant.GrantId
-		c.mu.Unlock()
-		c.logf("ArtifactGrantUpdate revision=%d grant=%s subjects=%d expires=%d -> %s",
-			revision, grant.GrantId, len(grant.Subjects), grant.ExpiresAtUnix, s.bootID)
-		if initial {
-			if problem := c.converge(s, w, []DesiredPlacement{w.spec.Placement}); problem != nil {
-				c.logf("the desired placement set for %s could not be issued: %s",
-					w.instanceID, problem.Message)
-				return
-			}
-			initial = false
-		}
+		initial = false
 		if !waitContext(s.ctx, grantRefreshDelay(grant.ExpiresAtUnix)) {
 			return
 		}
 	}
+}
+
+func (c *Orchestrator) issueRemoteGrant(ctx context.Context, s *session, w *worker,
+	placement DesiredPlacement, issueDesired bool) (*pb.ArtifactGrant, *exit.Error) {
+	revision, grant, problem := c.opt.ArtifactGrants(ctx, w.spec.Connection)
+	if problem != nil {
+		return nil, problem
+	}
+	if problem := grantCovers(placement, grant); problem != nil {
+		return nil, problem
+	}
+	update := &pb.ArtifactGrantUpdate{GrantRevision: revision, Grant: grant}
+	update.RecordOwnerEpoch, update.ControlStreamGeneration, update.WorkerBootId =
+		recordOwnerEpoch, s.generation, s.bootID
+	if !s.send(&pb.RecordOwnerFrame{Msg: &pb.RecordOwnerFrame_ArtifactGrantUpdate{
+		ArtifactGrantUpdate: update,
+	}}) {
+		return nil, exit.Unavailablef("worker %s control stream closed before its artifact grant", w.instanceID)
+	}
+	c.mu.Lock()
+	w.grantRevision, w.grantID = revision, grant.GrantId
+	w.grantSubjects = grantSubjectFacts(grant.Subjects)
+	c.mu.Unlock()
+	c.logf("ArtifactGrantUpdate revision=%d grant=%s subjects=%d expires=%d -> %s",
+		revision, grant.GrantId, len(grant.Subjects), grant.ExpiresAtUnix, s.bootID)
+	if issueDesired {
+		if problem := c.converge(s, w, []DesiredPlacement{placement}); problem != nil {
+			return nil, problem
+		}
+	}
+	return grant, nil
+}
+
+func grantSubjectFacts(subjects []*pb.ArtifactSubject) []ArtifactSubjectFacts {
+	out := make([]ArtifactSubjectFacts, 0, len(subjects))
+	for _, subject := range subjects {
+		digest, err := canonical.Spell(subject.Digest)
+		if err != nil {
+			continue
+		}
+		out = append(out, ArtifactSubjectFacts{Digest: digest, SubjectID: subject.SubjectId,
+			Kind: subject.Kind, Length: subject.Length})
+	}
+	return out
+}
+
+// ReviseRental changes the desired endpoint on one already-claimed pod. Tensorhub first
+// durably authors the exact revision; this owner then sends the matching active grant and
+// only after it the set, on the same stream and worker identity.
+func (c *Orchestrator) ReviseRental(ctx context.Context, rentalID, endpointRef,
+	idempotencyKey, reason string) (WorkerFacts, uint64, *exit.Error) {
+	if c.opt.PlacementRevisions == nil || c.opt.ArtifactGrants == nil {
+		return WorkerFacts{}, 0, exit.Unavailablef("this LocalService consumes no live rental revisions")
+	}
+	c.mu.Lock()
+	var w *worker
+	for _, candidate := range c.workers {
+		if candidate.spec.Connection != nil && candidate.spec.Connection.RentalID == rentalID &&
+			!candidate.exited && !candidate.stopping {
+			w = candidate
+			break
+		}
+	}
+	c.mu.Unlock()
+	if w == nil {
+		return WorkerFacts{}, 0, exit.New(exit.NotFound,
+			"rental %s has no claimed worker in this service", rentalID).
+			WithRemedy("claim it first with `cozy rent probe %s`", rentalID)
+	}
+	placement, placementRevision, problem := c.opt.PlacementRevisions(ctx,
+		w.spec.Connection, endpointRef, idempotencyKey, reason)
+	if problem != nil {
+		return WorkerFacts{}, 0, problem
+	}
+	placement.Endpoint = pinnedEndpoint(placement.Endpoint, rentalID)
+	if placement.PlacementID() != w.placementID {
+		return WorkerFacts{}, 0, exit.Named(exit.Conflict, "rental.placement_revision_attempt_changed",
+			"revision %d names placement %s, live worker owns %s",
+			placementRevision, placement.PlacementID(), w.placementID)
+	}
+	c.mu.Lock()
+	if w.spec.Placement.ExactPlacementSetDigest == placement.ExactPlacementSetDigest {
+		facts := factsOf(w)
+		c.mu.Unlock()
+		return facts, placementRevision, nil
+	}
+	c.mu.Unlock()
+	planIDs, subjects, problem := remoteBindingSubjects(placement)
+	if problem != nil {
+		return WorkerFacts{}, 0, problem
+	}
+	if problem := c.opt.Store.ReviseAttachedWorker(w.instanceID, placement.Endpoint, placement.ReleaseID); problem != nil {
+		return WorkerFacts{}, 0, problem
+	}
+	c.mu.Lock()
+	if c.workers[w.instanceID] != w || w.exited || w.stopping {
+		c.mu.Unlock()
+		return WorkerFacts{}, 0, exit.Unavailablef("worker %s changed while revision %d was authored",
+			w.instanceID, placementRevision)
+	}
+	w.spec.Placement, w.planIDs, w.subjects = placement, planIDs, subjects
+	w.acquisition = PlacementAcquisitionFacts{}
+	s := c.sessions[w.bootID]
+	c.mu.Unlock()
+	if s == nil {
+		return WorkerFacts{}, 0, exit.Unavailablef("worker %s has no claimed stream for revision %d",
+			w.instanceID, placementRevision)
+	}
+	w.grantMu.Lock()
+	_, problem = c.issueRemoteGrant(s.ctx, s, w, placement, true)
+	w.grantMu.Unlock()
+	if problem != nil {
+		return WorkerFacts{}, 0, problem
+	}
+	c.mu.Lock()
+	facts := factsOf(w)
+	c.mu.Unlock()
+	return facts, placementRevision, nil
 }
 
 func grantCovers(placement DesiredPlacement, grant *pb.ArtifactGrant) *exit.Error {

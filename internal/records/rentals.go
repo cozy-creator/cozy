@@ -45,6 +45,7 @@ CREATE TABLE IF NOT EXISTS rentals (
   media_address     TEXT NOT NULL DEFAULT '',
   control_snapshot_digest TEXT NOT NULL DEFAULT '',
   control_snapshot_bytes  BLOB NOT NULL DEFAULT x'',
+  placement_revision      INTEGER NOT NULL DEFAULT 0,
   observed_accelerator       TEXT NOT NULL DEFAULT '',
   observed_accelerator_count INTEGER NOT NULL DEFAULT 0,
   observed_backend           TEXT NOT NULL DEFAULT '',
@@ -268,6 +269,7 @@ type Rental struct {
 	// restart cannot re-render remote execution meaning from a local install.
 	ControlSnapshotDigest string
 	ControlSnapshotBytes  []byte
+	PlacementRevision     uint64
 	// Observed* is the remote worker's ClaimAck readback. AcceleratorModel above is
 	// only the caller's requested SKU; these fields are absent until Creator has
 	// actually claimed the rented worker without invoking a model.
@@ -283,13 +285,14 @@ type Rental struct {
 	ArtifactGrantRevision uint64
 }
 
-const rentalCols = `id,endpoint_ref,accelerator_model,address,cert_path,state,hub,rented_at,media_address,control_snapshot_digest,control_snapshot_bytes,observed_accelerator,observed_accelerator_count,observed_backend,observed_worker_instance,observed_worker_boot_id,observed_at,artifact_grant_revision`
+const rentalCols = `id,endpoint_ref,accelerator_model,address,cert_path,state,hub,rented_at,media_address,control_snapshot_digest,control_snapshot_bytes,placement_revision,observed_accelerator,observed_accelerator_count,observed_backend,observed_worker_instance,observed_worker_boot_id,observed_at,artifact_grant_revision`
 
 func scanRental(row interface{ Scan(...any) error }) (Rental, error) {
 	var r Rental
 	err := row.Scan(&r.ID, &r.EndpointRef, &r.AcceleratorModel, &r.Address, &r.CertPath,
 		&r.State, &r.Hub, &r.RentedAt, &r.MediaAddress,
 		&r.ControlSnapshotDigest, &r.ControlSnapshotBytes,
+		&r.PlacementRevision,
 		&r.ObservedAccelerator, &r.ObservedAcceleratorCount, &r.ObservedBackend,
 		&r.ObservedWorkerInstance, &r.ObservedWorkerBootID, &r.ObservedAt,
 		&r.ArtifactGrantRevision)
@@ -321,7 +324,7 @@ func (s *Store) RecordRental(r Rental) *exit.Error {
 		r.State = rentalStateForward(current, r.State)
 	}
 	if _, err := tx.Exec(`INSERT INTO rentals(`+rentalCols+`)
-		VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+		VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
 		ON CONFLICT(id) DO UPDATE SET address=excluded.address,
 		  cert_path=excluded.cert_path, state=excluded.state,
 		  media_address=excluded.media_address,
@@ -329,6 +332,8 @@ func (s *Store) RecordRental(r Rental) *exit.Error {
 		    THEN rentals.control_snapshot_digest ELSE excluded.control_snapshot_digest END,
 		  control_snapshot_bytes=CASE WHEN length(rentals.control_snapshot_bytes)>0
 		    THEN rentals.control_snapshot_bytes ELSE excluded.control_snapshot_bytes END,
+		  placement_revision=CASE WHEN rentals.placement_revision>0
+		    THEN rentals.placement_revision ELSE excluded.placement_revision END,
 		  observed_accelerator=CASE WHEN rentals.observed_accelerator<>''
 		    THEN rentals.observed_accelerator ELSE excluded.observed_accelerator END,
 		  observed_accelerator_count=CASE WHEN rentals.observed_accelerator_count>0
@@ -343,7 +348,7 @@ func (s *Store) RecordRental(r Rental) *exit.Error {
 		    THEN rentals.observed_at ELSE excluded.observed_at END`,
 		r.ID, r.EndpointRef, r.AcceleratorModel, r.Address, r.CertPath, r.State, r.Hub,
 		r.RentedAt, r.MediaAddress, r.ControlSnapshotDigest,
-		r.ControlSnapshotBytes, r.ObservedAccelerator,
+		r.ControlSnapshotBytes, r.PlacementRevision, r.ObservedAccelerator,
 		r.ObservedAcceleratorCount, r.ObservedBackend, r.ObservedWorkerInstance,
 		r.ObservedWorkerBootID, r.ObservedAt, r.ArtifactGrantRevision); err != nil {
 		return exit.Internalf("cannot record rental %s: %s", r.ID, err)
@@ -360,6 +365,56 @@ func (s *Store) RecordRental(r Rental) *exit.Error {
 		!bytes.Equal(stored.ControlSnapshotBytes, r.ControlSnapshotBytes)) {
 		return exit.Named(exit.Conflict, "rental.control_snapshot_conflict",
 			"rental %s already carries another exact acquisition-attempt control snapshot", r.ID)
+	}
+	return nil
+}
+
+// ReviseRentalControl atomically advances the locally durable active desired placement.
+// Equal revision is an exact replay; an older or byte-different answer refuses.
+func (s *Store) ReviseRentalControl(id, endpointRef string, revision uint64,
+	digest string, body []byte) *exit.Error {
+	if id == "" || endpointRef == "" || revision == 0 || digest == "" || len(body) == 0 {
+		return exit.Named(exit.Validation, "rental.placement_revision_invalid",
+			"rental, endpoint, revision, control digest, and exact control bytes are required")
+	}
+	tx, err := s.db.Begin()
+	if err != nil {
+		return exit.Internalf("cannot begin rental %s placement revision: %s", id, err)
+	}
+	defer tx.Rollback()
+	var current uint64
+	var currentEndpoint, currentDigest string
+	var currentBody []byte
+	err = tx.QueryRow(`SELECT placement_revision,endpoint_ref,control_snapshot_digest,
+		control_snapshot_bytes FROM rentals WHERE id=?`, id).Scan(
+		&current, &currentEndpoint, &currentDigest, &currentBody)
+	if errors.Is(err, sql.ErrNoRows) {
+		return exit.New(exit.NotFound, "no rental %s on this host", id)
+	}
+	if err != nil {
+		return exit.Internalf("cannot read rental %s placement revision: %s", id, err)
+	}
+	if revision < current || revision == current &&
+		(endpointRef != currentEndpoint || digest != currentDigest || !bytes.Equal(body, currentBody)) {
+		return exit.Named(exit.Conflict, "rental.placement_revision_regressed",
+			"rental %s active revision is %d and the answer names incompatible revision %d",
+			id, current, revision)
+	}
+	if revision == current {
+		return nil
+	}
+	result, err := tx.Exec(`UPDATE rentals SET endpoint_ref=?,placement_revision=?,
+		control_snapshot_digest=?,control_snapshot_bytes=?
+		WHERE id=? AND placement_revision=?`, endpointRef, revision, digest, body, id, current)
+	if err != nil {
+		return exit.Internalf("cannot advance rental %s placement revision: %s", id, err)
+	}
+	changed, err := result.RowsAffected()
+	if err != nil || changed != 1 {
+		return exit.Internalf("rental %s placement revision changed concurrently", id)
+	}
+	if err := tx.Commit(); err != nil {
+		return exit.Internalf("cannot commit rental %s placement revision: %s", id, err)
 	}
 	return nil
 }

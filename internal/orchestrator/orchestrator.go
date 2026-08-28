@@ -62,6 +62,9 @@ type Options struct {
 	// called only after the worker snapshot barrier is acknowledged. The source owns
 	// revision persistence and authentication; the orchestrator only relays the grant.
 	ArtifactGrants ArtifactGrantSource
+	// PlacementRevisions asks Tensorhub to author and durably publish one new desired
+	// placement for this same live rental. It returns exact validated placement bytes.
+	PlacementRevisions PlacementRevisionSource
 
 	// EnvironmentSpecDigest and ConfigDigest are LOCAL placement defaults. They ride
 	// INSIDE every local InvocationSpec document:
@@ -76,6 +79,8 @@ type Options struct {
 }
 
 type ArtifactGrantSource func(context.Context, *WorkerConnection) (uint64, *pb.ArtifactGrant, *exit.Error)
+type PlacementRevisionSource func(context.Context, *WorkerConnection, string, string, string) (
+	DesiredPlacement, uint64, *exit.Error)
 
 type RentalObservation struct {
 	RentalID       string
