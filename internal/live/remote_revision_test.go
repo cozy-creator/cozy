@@ -109,8 +109,7 @@ func TestRemotePlacementRevisionReusesClaimAndPersistsAcquisition(t *testing.T) 
 		len(first.GrantSubjects) != 2 {
 		t.Fatalf("initial worker identity = boot %q pid %d", first.BootID, first.PID)
 	}
-	cold, problem := store.PlacementAcquisition(instanceID, first.BootID, "acquisition-1", a.specSpelling)
-	fatal(t, problem)
+	cold := waitPlacementAcquisition(t, store, instanceID, first.BootID, a.specSpelling)
 	if cold == nil || max64(cold.Endpoint.StartedNS, cold.Model.StartedNS) >=
 		min64(cold.Endpoint.EndedNS, cold.Model.EndedNS) {
 		t.Fatalf("cold endpoint/model intervals did not overlap: %#v", cold)
@@ -124,9 +123,7 @@ func TestRemotePlacementRevisionReusesClaimAndPersistsAcquisition(t *testing.T) 
 	}
 	wantFrames(t, peer.frames, "grant", "desired")
 	warmFacts := waitWorkerRevision(t, owner, instanceID, 2)
-	warm, problem := store.PlacementAcquisition(instanceID, warmFacts.BootID,
-		"acquisition-1", b.specSpelling)
-	fatal(t, problem)
+	warm := waitPlacementAcquisition(t, store, instanceID, warmFacts.BootID, b.specSpelling)
 	if warm == nil || warm.Endpoint.DownloadedBytes != 0 || warm.Model.DownloadedBytes != 0 ||
 		warm.Endpoint.ReusedBytes == 0 || warm.Model.ReusedBytes == 0 {
 		t.Fatalf("warm revision did not prove zero-download reuse: %#v", warm)
@@ -324,6 +321,23 @@ func waitWorkerRevision(t *testing.T, owner *orchestrator.Orchestrator,
 	}
 	t.Fatalf("worker %s did not accept revision %d", instanceID, revision)
 	return orchestrator.WorkerFacts{}
+}
+
+func waitPlacementAcquisition(t *testing.T, store *records.Store, instanceID,
+	bootID, specDigest string) *records.PlacementAcquisition {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		observed, problem := store.PlacementAcquisition(instanceID, bootID,
+			"acquisition-1", specDigest)
+		fatal(t, problem)
+		if observed != nil {
+			return observed
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatalf("placement acquisition %s was not persisted", specDigest)
+	return nil
 }
 
 func min64(a, b uint64) uint64 {
