@@ -11,12 +11,14 @@ import (
 	"github.com/cozy-creator/cozy-creator-v2/internal/canonical"
 	"github.com/cozy-creator/cozy-creator-v2/internal/exit"
 	"github.com/cozy-creator/cozy-creator-v2/internal/records"
+	"github.com/cozy-creator/cozy-creator-v2/internal/rental"
 	"github.com/cozy-creator/cozy-creator-v2/internal/workflow"
 )
 
 type WorkflowController interface {
 	Submit(workflow.Submission) (records.WorkflowExecution, bool, *exit.Error)
 	State(id string) (*workflow.Snapshot, *exit.Error)
+	Receipt(id string) (*workflow.Receipt, *exit.Error)
 	Cancel(id string) (*workflow.Snapshot, bool, *exit.Error)
 }
 
@@ -64,11 +66,53 @@ type WorkflowState struct {
 }
 
 type WorkflowStepState struct {
-	Ordinal      int        `json:"ordinal"`
-	Status       string     `json:"status"`
-	Materialized bool       `json:"materialized"`
-	ChildRequest string     `json:"child_request_id,omitempty"`
-	Outputs      []MediaRef `json:"outputs"`
+	Ordinal            int                          `json:"ordinal"`
+	Status             string                       `json:"status"`
+	Materialized       bool                         `json:"materialized"`
+	MaterializedDigest string                       `json:"materialized_submission_digest,omitempty"`
+	MaterializedAssets []workflow.MaterializedAsset `json:"materialized_assets"`
+	ResolvedBindings   []records.ResolvedBinding    `json:"resolved_bindings"`
+	ChildKey           string                       `json:"child_key,omitempty"`
+	RentalID           string                       `json:"rental_id,omitempty"`
+	ChildRequest       string                       `json:"child_request_id,omitempty"`
+	Outputs            []MediaRef                   `json:"outputs"`
+}
+
+type WorkflowReceipt struct {
+	Workflow          WorkflowState           `json:"workflow"`
+	CanonicalPlan     []byte                  `json:"canonical_plan_bytes"`
+	CanonicalCreative []byte                  `json:"canonical_creative_plan_bytes,omitempty"`
+	Steps             []WorkflowReceiptStep   `json:"steps"`
+	Rentals           []WorkflowReceiptRental `json:"rentals"`
+}
+
+type WorkflowReceiptStep struct {
+	Ordinal                int    `json:"ordinal"`
+	MaterializedSubmission []byte `json:"materialized_submission_bytes,omitempty"`
+}
+
+type WorkflowReceiptRental struct {
+	RentalID                  string   `json:"rental_id"`
+	Endpoint                  string   `json:"endpoint"`
+	Accelerator               string   `json:"accelerator"`
+	ObservedAccelerator       string   `json:"observed_accelerator"`
+	ObservedAcceleratorCount  int      `json:"observed_accelerator_count"`
+	ObservedBackend           string   `json:"observed_backend"`
+	ObservedWorkerInstance    string   `json:"observed_worker_instance"`
+	ObservedWorkerBootID      string   `json:"observed_worker_boot_id"`
+	ObservedAt                string   `json:"observed_at"`
+	ControlSnapshotDigest     string   `json:"control_snapshot_digest"`
+	ControlSnapshotLength     int64    `json:"control_snapshot_length"`
+	ExactControlSnapshotBytes []byte   `json:"exact_control_snapshot_bytes"`
+	EndpointExecutionDigest   string   `json:"endpoint_execution_digest"`
+	ArtifactObjectSetDigest   string   `json:"artifact_object_set_digest"`
+	ModelRootDigests          []string `json:"model_root_digests"`
+	EndpointReleaseID         string   `json:"endpoint_release_id"`
+	DescriptorDigest          string   `json:"descriptor_digest"`
+	EnvironmentSpecDigest     string   `json:"environment_spec_digest"`
+	InstalledReceiptDigest    string   `json:"installed_environment_receipt_digest"`
+	PlacementSetDigest        string   `json:"placement_set_digest"`
+	BindingPlanDigests        []string `json:"binding_plan_digests"`
 }
 
 func (s *Server) submitWorkflow(w http.ResponseWriter, r *http.Request) {
@@ -164,6 +208,66 @@ func (s *Server) getWorkflow(w http.ResponseWriter, r *http.Request) {
 	s.ok(w, r, http.StatusOK, workflowStateOf(snapshot))
 }
 
+func (s *Server) getWorkflowReceipt(w http.ResponseWriter, r *http.Request) {
+	if s.workflows == nil {
+		s.refuseTyped(w, r, exit.Unavailablef("this LocalService has no workflow controller"))
+		return
+	}
+	receipt, problem := s.workflows.Receipt(r.PathValue("id"))
+	if problem != nil {
+		s.refuseTyped(w, r, problem)
+		return
+	}
+	if receipt == nil {
+		s.refuse(w, r, http.StatusNotFound, "not_found",
+			"no workflow "+r.PathValue("id")+" on this host", "")
+		return
+	}
+	out := WorkflowReceipt{Workflow: workflowStateOf(&receipt.Snapshot),
+		CanonicalPlan:     append([]byte(nil), receipt.Plan...),
+		CanonicalCreative: append([]byte(nil), receipt.CreativePlan...),
+		Steps:             make([]WorkflowReceiptStep, 0, len(receipt.Steps)),
+		Rentals:           make([]WorkflowReceiptRental, 0, len(receipt.Rentals))}
+	for _, step := range receipt.Steps {
+		out.Steps = append(out.Steps, WorkflowReceiptStep{Ordinal: step.Ordinal,
+			MaterializedSubmission: append([]byte(nil), step.MaterializedSubmission...)})
+	}
+	for _, control := range receipt.Rentals {
+		summary, summaryProblem := rental.Summarize(records.Rental{
+			ID: control.RentalID, EndpointRef: control.EndpointRef,
+			ControlSnapshotDigest: control.ControlSnapshotDigest,
+			ControlSnapshotBytes:  control.ControlSnapshotBytes,
+		})
+		if summaryProblem != nil {
+			s.refuseTyped(w, r, summaryProblem)
+			return
+		}
+		out.Rentals = append(out.Rentals, WorkflowReceiptRental{
+			RentalID: control.RentalID, Endpoint: control.EndpointRef,
+			Accelerator:               control.AcceleratorModel,
+			ObservedAccelerator:       control.ObservedAccelerator,
+			ObservedAcceleratorCount:  control.ObservedAcceleratorCount,
+			ObservedBackend:           control.ObservedBackend,
+			ObservedWorkerInstance:    control.ObservedWorkerInstance,
+			ObservedWorkerBootID:      control.ObservedWorkerBootID,
+			ObservedAt:                control.ObservedAt,
+			ControlSnapshotDigest:     control.ControlSnapshotDigest,
+			ControlSnapshotLength:     control.ControlSnapshotLength,
+			ExactControlSnapshotBytes: append([]byte(nil), control.ControlSnapshotBytes...),
+			EndpointExecutionDigest:   summary.EndpointExecutionDigest,
+			ArtifactObjectSetDigest:   summary.ArtifactObjectSetDigest,
+			ModelRootDigests:          append([]string(nil), summary.ModelRootDigests...),
+			EndpointReleaseID:         summary.EndpointReleaseID,
+			DescriptorDigest:          summary.DescriptorDigest,
+			EnvironmentSpecDigest:     summary.EnvironmentSpecDigest,
+			InstalledReceiptDigest:    summary.InstalledEnvironmentReceiptDigest,
+			PlacementSetDigest:        summary.PlacementSetDigest,
+			BindingPlanDigests:        append([]string(nil), summary.BindingPlanDigests...),
+		})
+	}
+	s.ok(w, r, http.StatusOK, out)
+}
+
 func (s *Server) cancelWorkflow(w http.ResponseWriter, r *http.Request) {
 	if s.workflows == nil {
 		s.refuseTyped(w, r, exit.Unavailablef("this LocalService has no workflow controller"))
@@ -199,7 +303,10 @@ func workflowStateOf(snapshot *workflow.Snapshot) WorkflowState {
 			status = contractStatus(status)
 		}
 		one := WorkflowStepState{Ordinal: step.Ordinal, Status: status,
-			Materialized: step.Materialized, Outputs: []MediaRef{}}
+			Materialized: step.Materialized, MaterializedDigest: step.MaterializedDigest,
+			MaterializedAssets: append([]workflow.MaterializedAsset{}, step.MaterializedAssets...),
+			ResolvedBindings:   append([]records.ResolvedBinding{}, step.ResolvedBindings...),
+			ChildKey:           step.ChildKey, RentalID: step.RentalID, Outputs: []MediaRef{}}
 		if step.Child != nil {
 			one.ChildRequest = step.Child.ID
 		}

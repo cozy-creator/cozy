@@ -18,6 +18,12 @@ func (c *Client) Workflow(id string) (api.WorkflowState, *exit.Error) {
 	return state, problem
 }
 
+func (c *Client) WorkflowReceipt(id string) (api.WorkflowReceipt, *exit.Error) {
+	var receipt api.WorkflowReceipt
+	problem := c.call("GET", "/v1/local/workflows/"+id+"/receipt", nil, &receipt)
+	return receipt, problem
+}
+
 func (c *Client) CancelWorkflow(id string) (api.WorkflowState, *exit.Error) {
 	var state api.WorkflowState
 	problem := c.call("POST", "/v1/local/workflows/"+id+"/cancel", nil, &state)

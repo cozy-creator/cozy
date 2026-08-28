@@ -132,12 +132,9 @@ func validateRentalID(id string) *exit.Error {
 	return nil
 }
 
-func (w wireRental) rental(id string) Rental {
-	if w.ID != "" {
-		id = w.ID
-	}
+func (w wireRental) rental() Rental {
 	return Rental{
-		ID: id, State: w.State, Address: w.WorkerAddress, CertPEM: w.CertPEM,
+		ID: w.ID, State: w.State, Address: w.WorkerAddress, CertPEM: w.CertPEM,
 		Detail: w.Detail, MediaAddress: w.MediaAddress,
 		TokenSHA256: w.TokenSHA256, ControlSnapshot: w.ControlSnapshot,
 	}
@@ -193,15 +190,19 @@ func (c *Client) Rent(ctx context.Context, requestBody []byte, reason, operation
 	if e != nil {
 		return Rental{}, e
 	}
-	if out.ID == "" {
-		return Rental{}, exit.Named(exit.Internal, "hub.rental_unnamed",
-			"the hub accepted the rental and named no rental_id").
-			WithRemedy("this route may not exist on this hub build; `cozy hub status` names it and its version")
-	}
-	if e := validateRentalID(out.ID); e != nil {
+	if e := out.named("accepted the rental"); e != nil {
 		return Rental{}, e
 	}
-	return out.rental(""), nil
+	return out.rental(), nil
+}
+
+func (w wireRental) named(what string) *exit.Error {
+	if w.ID == "" {
+		return exit.Named(exit.Internal, "hub.rental_unnamed",
+			"the hub %s and named no rental_id", what).
+			WithRemedy("this route may not exist on this hub build; `cozy hub status` names it and its version")
+	}
+	return validateRentalID(w.ID)
 }
 
 // Rental reads one rental's current state. Admin, like every first-party route.
@@ -215,17 +216,19 @@ func (c *Client) Rental(ctx context.Context, id string) (Rental, *exit.Error) {
 	if e != nil {
 		return Rental{}, e
 	}
-	if out.ID != "" && out.ID != id {
+	if e := out.named("answered rental " + id); e != nil {
+		return Rental{}, e
+	}
+	if out.ID != id {
 		return Rental{}, exit.Named(exit.Conflict, "hub.rental_id_changed",
 			"the hub answered rental %s with identity %s", id, out.ID).
 			WithRemedy("preserve the original rental identity; never attach the response under another id")
 	}
-	return out.rental(id), nil
+	return out.rental(), nil
 }
 
-// Release tears the pod down. The hub answers 204, so there is nothing to decode — and a
-// 404 reaches the caller as the hub's own refusal rather than being swallowed as "already
-// gone": this client cannot tell a released rental from one that was never ours.
+// Release asks the hub to tear the pod down. The hub answers 204 and nothing is decoded;
+// a 404 reaches the caller as NotFound, and the caller decides what absence means.
 func (c *Client) Release(ctx context.Context, id, reason string) *exit.Error {
 	if e := validateRentalID(id); e != nil {
 		return e

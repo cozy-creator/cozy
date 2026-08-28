@@ -1,0 +1,48 @@
+format: cozy.video/1
+shots:
+  - id: shot01
+    prompt: |
+      Establish the subject and environment with deliberate camera motion and synchronized natural sound.
+    seed: 4201
+    reference_media_to_video:
+      references:
+        - image: references/character.png
+        - video: references/motion.mp4
+        - audio: references/voice.wav
+  - id: shot02
+    prompt: |
+      Continue from the exact prior frame into the next planned action while preserving identity and geography.
+    seed: 4202
+    first_last_frame_to_video: {first_frame: previous}
+  - id: shot03
+    prompt: |
+      Continue the action from the exact prior frame with coherent motion, lighting, and synchronized ambience.
+    seed: 4203
+    first_last_frame_to_video: {first_frame: previous}
+  - id: shot04
+    prompt: |
+      Continue from the exact prior frame; advance the story beat without changing the subject or environment.
+    seed: 4204
+    first_last_frame_to_video: {first_frame: previous}
+  - id: shot05
+    prompt: |
+      Continue from the exact prior frame with stable anatomy, textures, camera direction, and natural sound.
+    seed: 4205
+    first_last_frame_to_video: {first_frame: previous}
+  - id: shot06
+    prompt: |
+      Continue from the exact prior frame into the next movement while maintaining visual and spatial continuity.
+    seed: 4206
+    first_last_frame_to_video: {first_frame: previous}
+  - id: shot07
+    prompt: |
+      Continue from the exact prior frame and prepare the final story beat with coherent motion and audio.
+    seed: 4207
+    first_last_frame_to_video: {first_frame: previous}
+  - id: shot08
+    prompt: |
+      Continue from the exact prior frame and complete the sequence while preserving every established detail.
+    seed: 4208
+    first_last_frame_to_video: {first_frame: previous}
+assembly:
+  audio: segments

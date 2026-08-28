@@ -3,7 +3,6 @@ package orchestrator
 import (
 	"bytes"
 	"context"
-	"crypto/x509"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -99,12 +98,13 @@ func schemaDigest() []byte {
 // readiness poll that was never going to end. The refusal is already the waiter's answer
 // (`EnsurePlacementReady` reads it first) — this stops the conversation from outliving it.
 func (c *Orchestrator) attach(w *worker) {
+	defer close(w.attachDone)
 	for {
 		c.mu.Lock()
 		current, live := c.workers[w.instanceID]
-		closing, refused := c.closing, w.refusal
+		closing, refused, exited, stopping := c.closing, w.refusal, w.exited, w.stopping
 		c.mu.Unlock()
-		if closing || !live || current != w || w.exited {
+		if closing || !live || current != w || exited || stopping {
 			return
 		}
 		if refused != nil {
@@ -122,7 +122,12 @@ func (c *Orchestrator) attach(w *worker) {
 			c.logf("worker %s: control stream ended: %s", w.instanceID, err)
 		}
 		c.mu.Lock()
-		gone := w.exited || c.closing
+		if w.spawned.IsZero() && w.lastReport.IsZero() {
+			// An attached worker whose dial FAILED before any claim: that failure is
+			// measured non-progress, and the silence budget counts from its first one.
+			w.spawned = time.Now()
+		}
+		gone := w.exited || w.stopping || c.closing
 		c.mu.Unlock()
 		if gone {
 			return
@@ -147,7 +152,7 @@ func (c *Orchestrator) workerAddr(w *worker) (string, *exit.Error) {
 			return strings.TrimSpace(string(data)), nil
 		}
 		c.mu.Lock()
-		dead := w.exited
+		dead := w.exited || w.stopping
 		c.mu.Unlock()
 		if dead {
 			return "", exit.New(exit.Failed,
@@ -159,19 +164,15 @@ func (c *Orchestrator) workerAddr(w *worker) (string, *exit.Error) {
 }
 
 // dialWorker opens the channel: insecure over the unix socket / loopback a spawned worker
-// binds; TLS with the PINNED cert for a remote one (#445 — trusting exactly that PEM is
-// the fingerprint pin; never mTLS).
+// binds; TLS with the PINNED cert for a remote one (#445 — the presented leaf must equal
+// that PEM byte for byte; never mTLS).
 func dialWorker(addr string, remote *WorkerConnection) (*grpc.ClientConn, error) {
 	if remote != nil && remote.CACert != "" {
-		pem, err := os.ReadFile(remote.CACert)
+		pin, err := workertls.LoadPin(remote.CACert)
 		if err != nil {
-			return nil, fmt.Errorf("reading the pinned worker cert: %w", err)
+			return nil, err
 		}
-		pool := x509.NewCertPool()
-		if !pool.AppendCertsFromPEM(pem) {
-			return nil, fmt.Errorf("%s holds no usable certificate", remote.CACert)
-		}
-		creds := credentials.NewClientTLSFromCert(pool, workertls.ServerName)
+		creds := credentials.NewTLS(pin.TLSConfig())
 		return grpc.NewClient(addr, grpc.WithTransportCredentials(creds))
 	}
 	target := addr
@@ -192,10 +193,29 @@ func (c *Orchestrator) converse(w *worker, addr string) error {
 	client := pb.NewWorkerControlClient(conn)
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
+	c.mu.Lock()
+	if current := c.workers[w.instanceID]; current != w || w.exited || w.stopping || c.closing {
+		c.mu.Unlock()
+		return fmt.Errorf("worker %s is stopping", w.instanceID)
+	}
+	w.cancelControl = cancel
+	c.mu.Unlock()
+	defer func() {
+		c.mu.Lock()
+		if current := c.workers[w.instanceID]; current == w {
+			w.cancelControl = nil
+		}
+		c.mu.Unlock()
+	}()
 	stream, err := client.Control(ctx)
 	if err != nil {
 		return err
 	}
+	c.mu.Lock()
+	if w.spawned.IsZero() && w.lastReport.IsZero() {
+		w.spawned = time.Now() // the claim is out; silence from here is the pod's
+	}
+	c.mu.Unlock()
 	s := &session{instanceID: w.instanceID, out: make(chan *pb.RecordOwnerFrame, 32)}
 	go func() {
 		for m := range s.out {
@@ -255,7 +275,9 @@ func (c *Orchestrator) converse(w *worker, addr string) error {
 				return fmt.Errorf("claim refused: %s", pb.ClaimRejection_name[int32(ack.Rejection)])
 			}
 			s.bootID, s.generation = ack.WorkerBootId, ack.ControlStreamGeneration
-			c.onClaimAck(w, s, ack)
+			if e := c.onClaimAck(w, s, ack); e != nil {
+				return fmt.Errorf("%s", e.Message)
+			}
 			watchCancel = c.openWatch(addr, w, s)
 		case *pb.WorkerFrame_BootFailure:
 			c.logf("BOOT FAILURE from %s: %s (%s)", m.BootFailure.WorkerInstanceId,
@@ -348,7 +370,7 @@ func (c *Orchestrator) fenced(s *session, epoch, generation uint64, bootID strin
 
 // onClaimAck binds the claimed boot to the worker slot: identity checks, the durable
 // binding, and the session registry (the ClaimAck is the flip's Register successor).
-func (c *Orchestrator) onClaimAck(w *worker, s *session, ack *pb.ClaimAck) {
+func (c *Orchestrator) onClaimAck(w *worker, s *session, ack *pb.ClaimAck) *exit.Error {
 	c.logf("ClaimAck boot=%s generation=%d instance=%s minor=%d schema=rev%d backend=%q device=%q",
 		ack.WorkerBootId, ack.ControlStreamGeneration, ack.WorkerInstanceId, ack.WireMinor,
 		pb.WireSchemaRev, ack.Resources.GetBackend(), ack.Resources.GetDeviceName())
@@ -356,21 +378,47 @@ func (c *Orchestrator) onClaimAck(w *worker, s *session, ack *pb.ClaimAck) {
 		// Nothing is dispatched to it; the stream ends on the next recv when we stop
 		// talking.
 		c.refuseClaim(w, e)
-		return
+		return e
 	}
 	if e := releasePin(w, ack.WorkerReleaseId); e != nil {
 		c.refuseClaim(w, e)
-		return
+		return e
+	}
+	if w.spec.Connection != nil {
+		if c.opt.ObserveRental == nil || w.spec.Connection.RentalID == "" {
+			e := exit.Named(exit.Structural, "rental.worker_readback_unowned",
+				"the attached worker has no durable rental observation owner")
+			c.refuseClaim(w, e)
+			return e
+		}
+		resources := ack.GetResources()
+		if resources == nil {
+			e := exit.Named(exit.Conflict, "rental.worker_readback_missing",
+				"rental %s ClaimAck carries no worker resources", w.spec.Connection.RentalID)
+			c.refuseClaim(w, e)
+			return e
+		}
+		if e := c.opt.ObserveRental(RentalObservation{
+			RentalID: w.spec.Connection.RentalID, Accelerator: resources.GetDeviceName(),
+			DeviceCount: int(resources.GetDeviceCount()), Backend: resources.GetBackend(),
+			WorkerInstance: ack.WorkerInstanceId, WorkerBootID: ack.WorkerBootId,
+		}); e != nil {
+			c.refuseClaim(w, e)
+			return e
+		}
 	}
 	if e := c.opt.Store.BindSession(w.instanceID, ack.WorkerBootId,
 		int64(ack.ControlStreamGeneration)); e != nil {
 		c.logf("boot binding for %s REFUSED: %s", w.instanceID, e.Message)
-		return
+		c.refuseClaim(w, e)
+		return e
 	}
 	c.mu.Lock()
 	if w.spec.Connection != nil {
 		w.remoteInstance = ack.WorkerInstanceId
 	}
+	// The ClaimAck is the first thing this worker said; the silence clock runs from here.
+	w.lastReport = time.Now()
 	if w.bootID != "" && w.bootID != ack.WorkerBootId {
 		delete(c.sessions, w.bootID)
 	}
@@ -378,6 +426,7 @@ func (c *Orchestrator) onClaimAck(w *worker, s *session, ack *pb.ClaimAck) {
 	w.bootID = ack.WorkerBootId
 	c.mu.Unlock()
 	c.wakeWorkflows()
+	return nil
 }
 
 // instancePin is the IDENTITY FENCE on a claim, and #505's carried-not-verified gap in its

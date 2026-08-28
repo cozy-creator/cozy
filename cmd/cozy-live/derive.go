@@ -122,6 +122,10 @@ func staleness(archive, sidecar string, wanted derivation) string {
 		return fmt.Sprintf("recorded runtime %s declares wire schema %s, not this tree's %s",
 			shortCommit(got.RuntimeSHA), shortDigest(declared), shortDigest(wanted.WireSchemaDigest))
 	}
+	if got.RuntimeSHA != wanted.RuntimeSHA {
+		return fmt.Sprintf("built against runtime %s; current compatible runtime is %s",
+			shortCommit(got.RuntimeSHA), shortCommit(wanted.RuntimeSHA))
+	}
 	for script, want := range wanted.ScriptSHA256 {
 		if got.ScriptSHA256[script] != want {
 			return "the build recipe " + script + " changed"
@@ -288,6 +292,7 @@ func sectionFixtures() {
 func wantedDerivation(fx fixtureSpec) derivation {
 	wanted := derivation{
 		WireSchemaDigest: pb.SchemaDigest,
+		RuntimeSHA:       resolveRuntimeSHA(),
 		ScriptSHA256:     map[string]string{fx.script: hashTreeFile(fx.script)},
 		SourceSHA256:     map[string]string{},
 	}

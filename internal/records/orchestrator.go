@@ -159,7 +159,7 @@ type tableRebuild struct {
 	steps []string
 }
 
-var rebuild = append([]tableRebuild{{
+var rebuild = []tableRebuild{{
 	table: "job_checkpoints",
 	stale: "PRIMARY KEY (request_id, operation_key, logical_key)",
 	steps: []string{
@@ -186,7 +186,7 @@ var rebuild = append([]tableRebuild{{
 		                 WHERE a.request_id=c.request_id AND a.attempt=c.attempt)`,
 		`DROP TABLE job_checkpoints_pre_attempt_key`,
 	},
-}}, rentalRebuild...)
+}}
 
 // widen carries the columns a table gained after some root already created it. Applied
 // after `schema`, and a duplicate-column answer means it is already there.
@@ -198,10 +198,6 @@ var widen = []string{
 	`ALTER TABLE requests ADD COLUMN assets TEXT NOT NULL DEFAULT '[]'`,
 	`ALTER TABLE requests ADD COLUMN install_id TEXT NOT NULL DEFAULT ''`,
 	`ALTER TABLE attempts ADD COLUMN media_cleaned INTEGER NOT NULL DEFAULT 0`,
-	`ALTER TABLE rentals ADD COLUMN media_address TEXT NOT NULL DEFAULT ''`,
-	`ALTER TABLE rentals ADD COLUMN control_snapshot_digest TEXT NOT NULL DEFAULT ''`,
-	`ALTER TABLE rentals ADD COLUMN control_snapshot_length INTEGER NOT NULL DEFAULT 0`,
-	`ALTER TABLE rentals ADD COLUMN control_snapshot_bytes BLOB NOT NULL DEFAULT x''`,
 }
 
 // normalize hard-cuts pre-launch lifecycle spellings whose durable meaning was refined.
@@ -1172,11 +1168,7 @@ func (s *Store) AcceptTerminal(t Terminal) (applied bool, e *exit.Error) {
 			"terminal for %s#%d refused: the attempt row is in state %q", t.RequestID, t.Attempt, state)
 	}
 	visible := now()
-	for i, o := range t.Outputs {
-		if o.MediaID == "" {
-			o.MediaID = NewID("med")
-			t.Outputs[i].MediaID = o.MediaID
-		}
+	for _, o := range t.Outputs {
 		if _, err := tx.Exec(`INSERT INTO outputs(request_id,attempt,output_id,media_id,path,digest,
 			length,mime_type,visible_at) VALUES(?,?,?,?,?,?,?,?,?)`,
 			t.RequestID, t.Attempt, o.OutputID, o.MediaID, o.Path, o.Digest, o.Length,

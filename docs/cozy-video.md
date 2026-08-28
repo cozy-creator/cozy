@@ -44,14 +44,23 @@ Assembly uses either `audio: segments`, or `audio: master` plus `master_audio: <
 replaces rather than mixes the generated segment soundtracks.
 
 ```sh
+cozy rent cozy/minimax-h3/v1/reference_media_to_video \
+  --accelerator '<provider-neutral GPU SKU>' --reason '<authorized purpose>'
+cozy rent probe <rental-id> --json
+cozy rent show <rental-id> --json
+
 cozy video compose film.cozy-video.yaml \
-  --h3 cozy/minimax-h3 --assembler cozy/video-assembly \
-  --worker <rental-id> --out film.composition.json
+  --rental <rental-id> --out film.composition.json
 
 cozy video submit film.cozy-video.yaml \
-  --h3 cozy/minimax-h3 --assembler cozy/video-assembly \
-  --worker <rental-id> --idempotency-key film-run-001
+  --rental <rental-id> --idempotency-key film-run-001
 ```
+
+The rent request contains only endpoint + GPU SKU (and a renter-token hash). Tensorhub selects the
+exact compatible execution, provider, datacenter, offer, and optional cache. The returned rental id
+is an observed handle passed to video composition, not user-authored placement policy. Use
+`cozy workflow follow <id>` and `cozy workflow download <id> --out <fresh-dir>` to retain every
+verified child/final media object and receipt locally.
 
 `compose` stages bounded immutable assets and records the path-free creative plan, but starts no
 workflow. It prints a creative-plan digest; submitting that digest later reuses staged bytes without
@@ -61,5 +70,5 @@ spellings, and shot-ID edits do not change creative identity when their meaning 
 the same.
 
 V1 deliberately has no includes, templates, variables, inheritance, arbitrary graph expressions,
-transition system, retry fields, duration/step knobs, or model profile selection. FULL versus BAKED
-is resolved from the exact endpoint release, outside the source.
+transition system, retry fields, duration/step knobs, or model profile selection. Model construction
+and quantization are frozen in the exact endpoint execution selected by Tensorhub, outside the source.

@@ -4,6 +4,8 @@ import (
 	"bytes"
 	"database/sql"
 	"errors"
+	"strings"
+	"unicode"
 
 	"github.com/cozy-creator/cozy-creator-v2/internal/exit"
 )
@@ -40,24 +42,59 @@ CREATE TABLE IF NOT EXISTS rentals (
   state             TEXT NOT NULL,
   hub               TEXT NOT NULL,
   rented_at         TEXT NOT NULL,
-  released_at       TEXT NOT NULL DEFAULT '',
   media_address     TEXT NOT NULL DEFAULT '',
   control_snapshot_digest TEXT NOT NULL DEFAULT '',
-  control_snapshot_length INTEGER NOT NULL DEFAULT 0,
-  control_snapshot_bytes  BLOB NOT NULL DEFAULT x''
+  control_snapshot_bytes  BLOB NOT NULL DEFAULT x'',
+  observed_accelerator       TEXT NOT NULL DEFAULT '',
+  observed_accelerator_count INTEGER NOT NULL DEFAULT 0,
+  observed_backend           TEXT NOT NULL DEFAULT '',
+  observed_worker_instance   TEXT NOT NULL DEFAULT '',
+  observed_worker_boot_id    TEXT NOT NULL DEFAULT '',
+  observed_at                TEXT NOT NULL DEFAULT ''
 )`
-
-const migrateRentalOperationState = `CASE state
-           WHEN 'pending' THEN 'pending_acquisition'
-           WHEN 'provisioning' THEN 'acquiring'
-           WHEN 'reclaiming' THEN 'release_requested'
-           WHEN 'dead' THEN 'released'
-           ELSE state
-         END`
 
 var rentalSchema = []string{rentalOperationsDDL, rentalsDDL, `
 CREATE UNIQUE INDEX IF NOT EXISTS rental_operation_remote
   ON rental_operations(rental_id) WHERE rental_id <> ''`}
+
+// CheckRentalSchema refuses a root whose rental tables were created by another shape of
+// this binary. Rentals are paid obligations, so a mismatched table is never rebuilt or
+// dropped here; the operator settles it with the binary that wrote it.
+func CheckRentalSchema(db *sql.DB, path string) *exit.Error {
+	for table, expected := range map[string]string{"rentals": rentalsDDL, "rental_operations": rentalOperationsDDL} {
+		var stored string
+		err := db.QueryRow(`SELECT COALESCE(sql,'') FROM sqlite_master WHERE type='table' AND name=?`, table).Scan(&stored)
+		if err != nil || stored == "" {
+			continue
+		}
+		if normalizeDDL(stored) != normalizeDDL(expected) {
+			return exit.Named(exit.Conflict, "records.rental_schema_mismatch",
+				"table %s in %s was written by a different Creator build", table, path).
+				WithRemedy("release its rentals with the binary that wrote it (`cozy rent ls`, `cozy rent release <id> --yes`), or delete %s if nothing there is still rented", path)
+		}
+	}
+	return nil
+}
+
+func normalizeDDL(ddl string) string {
+	return strings.Join(strings.Fields(strings.Replace(ddl, "IF NOT EXISTS ", "", 1)), " ")
+}
+
+// rentalStateRank orders the hub's lifecycle words so a delayed observation never moves a
+// row backward. Unknown words are opaque: they neither advance nor regress anything.
+var rentalStateRank = map[string]int{
+	"pending_acquisition": 0, "acquiring": 1, "materializing": 2, "ready": 3,
+	"attached": 4, "failed": 5, "release_requested": 6, "released": 7, "rejected": 7,
+}
+
+func rentalStateForward(current, next string) string {
+	cr, ck := rentalStateRank[current]
+	nr, nk := rentalStateRank[next]
+	if nk && (!ck || nr > cr) {
+		return next
+	}
+	return current
+}
 
 // RentalOperation is the renter-owned half of one paid acquisition. It exists before
 // the POST: the operation key and its 0600 token survive a lost response, so retry can
@@ -184,51 +221,23 @@ func advanceRentalOperationState(key, current, next string) (string, *exit.Error
 	if current == next || rentalOperationFinal(current) {
 		return current, nil
 	}
-	if current == "release_requested" {
-		if next == "released" {
+	if next == "rejected" {
+		if current == "pending_acquisition" {
 			return next, nil
 		}
 		return current, nil
 	}
-	if current == "failed" {
-		if next == "release_requested" || next == "released" {
-			return next, nil
-		}
-		return current, nil
-	}
-	if current == "attached" {
-		if next == "failed" || next == "release_requested" || next == "released" {
-			return next, nil
-		}
-		return current, nil
-	}
-	rank := map[string]int{"pending_acquisition": 0, "acquiring": 1, "materializing": 2, "ready": 3}
-	currentRank, currentKnown := rank[current]
-	nextRank, nextKnown := rank[next]
-	if currentKnown && nextKnown {
-		if nextRank > currentRank {
-			return next, nil
-		}
-		return current, nil
-	}
-	if current == "pending_acquisition" && next == "rejected" {
-		return next, nil
-	}
-	if currentKnown && (next == "attached" || next == "failed" || next == "release_requested" ||
-		next == "released") {
-		return next, nil
-	}
-	return "", exit.Named(exit.Conflict, "rental.operation_conflict",
-		"rental operation %s cannot advance from %q to %q", key, current, next)
+	return rentalStateForward(current, next), nil
 }
 
 // RequestRentalRelease records intent before the remote DELETE. It returns the operation
-// key so the caller can remove a never-attached operation token after release succeeds.
+// key so the caller can remove a never-attached operation token after release succeeds;
+// an orphan rental row with no operation releases with nothing to mark.
 func (s *Store) RequestRentalRelease(id string) (string, *exit.Error) {
 	var key string
 	err := s.db.QueryRow(`SELECT operation_key FROM rental_operations WHERE rental_id=?`, id).Scan(&key)
 	if errors.Is(err, sql.ErrNoRows) {
-		return "", exit.Internalf("rental %s has no operation to release", id)
+		return "", nil
 	}
 	if err != nil {
 		return "", exit.Internalf("cannot read rental operation for %s: %s", id, err)
@@ -249,7 +258,6 @@ type Rental struct {
 	State            string
 	Hub              string
 	RentedAt         string
-	ReleasedAt       string
 	// MediaAddress is where the pod's co-resident media server answers (cl-014). It is a
 	// FACT about the pod like the control address is, so it is a row and not a file; the
 	// credential it takes is the rental's own owner token, which stays 0600 beside it.
@@ -258,23 +266,34 @@ type Rental struct {
 	// snapshot received on the ready view. It remains raw bytes in SQLite so a
 	// restart cannot re-render remote execution meaning from a local install.
 	ControlSnapshotDigest string
-	ControlSnapshotLength int64
 	ControlSnapshotBytes  []byte
+	// Observed* is the remote worker's ClaimAck readback. AcceleratorModel above is
+	// only the caller's requested SKU; these fields are absent until Creator has
+	// actually claimed the rented worker without invoking a model.
+	ObservedAccelerator      string
+	ObservedAcceleratorCount int
+	ObservedBackend          string
+	ObservedWorkerInstance   string
+	ObservedWorkerBootID     string
+	ObservedAt               string
 }
 
-const rentalCols = `id,endpoint_ref,accelerator_model,address,cert_path,state,hub,rented_at,released_at,media_address,control_snapshot_digest,control_snapshot_length,control_snapshot_bytes`
+const rentalCols = `id,endpoint_ref,accelerator_model,address,cert_path,state,hub,rented_at,media_address,control_snapshot_digest,control_snapshot_bytes,observed_accelerator,observed_accelerator_count,observed_backend,observed_worker_instance,observed_worker_boot_id,observed_at`
 
 func scanRental(row interface{ Scan(...any) error }) (Rental, error) {
 	var r Rental
 	err := row.Scan(&r.ID, &r.EndpointRef, &r.AcceleratorModel, &r.Address, &r.CertPath,
-		&r.State, &r.Hub, &r.RentedAt, &r.ReleasedAt, &r.MediaAddress,
-		&r.ControlSnapshotDigest, &r.ControlSnapshotLength, &r.ControlSnapshotBytes)
+		&r.State, &r.Hub, &r.RentedAt, &r.MediaAddress,
+		&r.ControlSnapshotDigest, &r.ControlSnapshotBytes,
+		&r.ObservedAccelerator, &r.ObservedAcceleratorCount, &r.ObservedBackend,
+		&r.ObservedWorkerInstance, &r.ObservedWorkerBootID, &r.ObservedAt)
 	return r, err
 }
 
 // RecordRental writes what the hub provisioned. It REPLACES on the rental id because the
 // id is the hub's, not this host's: re-reading a rental that moved from acquisition to
-// ready must land on the same row rather than accumulate one per poll.
+// ready must land on the same row rather than accumulate one per poll. State only moves
+// forward: a delayed poll answering `acquiring` after `ready` was recorded is stale.
 func (s *Store) RecordRental(r Rental) *exit.Error {
 	if r.RentedAt == "" {
 		r.RentedAt = now()
@@ -282,21 +301,49 @@ func (s *Store) RecordRental(r Rental) *exit.Error {
 	if r.ControlSnapshotBytes == nil {
 		r.ControlSnapshotBytes = []byte{}
 	}
-	if _, err := s.db.Exec(`INSERT INTO rentals(`+rentalCols+`)
-		VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)
+	tx, err := s.db.Begin()
+	if err != nil {
+		return exit.Internalf("cannot begin recording rental %s: %s", r.ID, err)
+	}
+	defer tx.Rollback()
+	var current string
+	switch err := tx.QueryRow(`SELECT state FROM rentals WHERE id=?`, r.ID).Scan(&current); {
+	case errors.Is(err, sql.ErrNoRows):
+	case err != nil:
+		return exit.Internalf("cannot read rental %s state: %s", r.ID, err)
+	default:
+		r.State = rentalStateForward(current, r.State)
+	}
+	if _, err := tx.Exec(`INSERT INTO rentals(`+rentalCols+`)
+		VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
 		ON CONFLICT(id) DO UPDATE SET address=excluded.address,
-		  cert_path=excluded.cert_path, state=excluded.state, released_at=excluded.released_at,
+		  cert_path=excluded.cert_path, state=excluded.state,
 		  media_address=excluded.media_address,
 		  control_snapshot_digest=CASE WHEN length(rentals.control_snapshot_bytes)>0
 		    THEN rentals.control_snapshot_digest ELSE excluded.control_snapshot_digest END,
-		  control_snapshot_length=CASE WHEN length(rentals.control_snapshot_bytes)>0
-		    THEN rentals.control_snapshot_length ELSE excluded.control_snapshot_length END,
 		  control_snapshot_bytes=CASE WHEN length(rentals.control_snapshot_bytes)>0
-		    THEN rentals.control_snapshot_bytes ELSE excluded.control_snapshot_bytes END`,
+		    THEN rentals.control_snapshot_bytes ELSE excluded.control_snapshot_bytes END,
+		  observed_accelerator=CASE WHEN rentals.observed_accelerator<>''
+		    THEN rentals.observed_accelerator ELSE excluded.observed_accelerator END,
+		  observed_accelerator_count=CASE WHEN rentals.observed_accelerator_count>0
+		    THEN rentals.observed_accelerator_count ELSE excluded.observed_accelerator_count END,
+		  observed_backend=CASE WHEN rentals.observed_backend<>''
+		    THEN rentals.observed_backend ELSE excluded.observed_backend END,
+		  observed_worker_instance=CASE WHEN rentals.observed_worker_instance<>''
+		    THEN rentals.observed_worker_instance ELSE excluded.observed_worker_instance END,
+		  observed_worker_boot_id=CASE WHEN rentals.observed_worker_boot_id<>''
+		    THEN rentals.observed_worker_boot_id ELSE excluded.observed_worker_boot_id END,
+		  observed_at=CASE WHEN rentals.observed_at<>''
+		    THEN rentals.observed_at ELSE excluded.observed_at END`,
 		r.ID, r.EndpointRef, r.AcceleratorModel, r.Address, r.CertPath, r.State, r.Hub,
-		r.RentedAt, r.ReleasedAt, r.MediaAddress, r.ControlSnapshotDigest,
-		r.ControlSnapshotLength, r.ControlSnapshotBytes); err != nil {
+		r.RentedAt, r.MediaAddress, r.ControlSnapshotDigest,
+		r.ControlSnapshotBytes, r.ObservedAccelerator,
+		r.ObservedAcceleratorCount, r.ObservedBackend, r.ObservedWorkerInstance,
+		r.ObservedWorkerBootID, r.ObservedAt); err != nil {
 		return exit.Internalf("cannot record rental %s: %s", r.ID, err)
+	}
+	if err := tx.Commit(); err != nil {
+		return exit.Internalf("cannot commit rental %s: %s", r.ID, err)
 	}
 	stored, e := s.RentalRow(r.ID)
 	if e != nil {
@@ -304,7 +351,6 @@ func (s *Store) RecordRental(r Rental) *exit.Error {
 	}
 	if len(r.ControlSnapshotBytes) > 0 && (stored == nil ||
 		stored.ControlSnapshotDigest != r.ControlSnapshotDigest ||
-		stored.ControlSnapshotLength != r.ControlSnapshotLength ||
 		!bytes.Equal(stored.ControlSnapshotBytes, r.ControlSnapshotBytes)) {
 		return exit.Named(exit.Conflict, "rental.control_snapshot_conflict",
 			"rental %s already carries another exact acquisition-attempt control snapshot", r.ID)
@@ -312,55 +358,79 @@ func (s *Store) RecordRental(r Rental) *exit.Error {
 	return nil
 }
 
-// rentalRebuild hardcuts provider-placement vocabulary from pre-launch local
-// databases without discarding attached rental handles. An unfinished legacy
-// operation has no exact new request body, so it migrates with an empty body and
-// is refused before replay rather than being silently re-encoded.
-var rentalRebuild = []tableRebuild{{
-	table: "rental_operations",
-	stale: "region",
-	steps: []string{
-		`DROP INDEX IF EXISTS rental_operation_remote`,
-		`ALTER TABLE rental_operations RENAME TO rental_operations_pre_provider_neutral`,
-		rentalOperationsDDL,
-		`INSERT INTO rental_operations
-  (operation_key,request_digest,request_body,hub,reason,rental_id,state,created_at,updated_at)
-  SELECT operation_key,request_digest,x'',hub,reason,rental_id,` + migrateRentalOperationState + `,
-         created_at,updated_at
-    FROM rental_operations_pre_provider_neutral`,
-		`DROP TABLE rental_operations_pre_provider_neutral`,
-		`CREATE UNIQUE INDEX rental_operation_remote
-  ON rental_operations(rental_id) WHERE rental_id <> ''`,
-	},
-}, {
-	table: "rental_operations",
-	stale: "endpoint_ref",
-	steps: []string{
-		`DROP INDEX IF EXISTS rental_operation_remote`,
-		`ALTER TABLE rental_operations RENAME TO rental_operations_pre_operation_field_drop`,
-		rentalOperationsDDL,
-		`INSERT INTO rental_operations
-  (operation_key,request_digest,request_body,hub,reason,rental_id,state,created_at,updated_at)
-  SELECT operation_key,request_digest,request_body,hub,reason,rental_id,` + migrateRentalOperationState + `,
-         created_at,updated_at
-    FROM rental_operations_pre_operation_field_drop`,
-		`DROP TABLE rental_operations_pre_operation_field_drop`,
-		`CREATE UNIQUE INDEX rental_operation_remote
-  ON rental_operations(rental_id) WHERE rental_id <> ''`,
-	},
-}, {
-	table: "rentals",
-	stale: "pod_id",
-	steps: []string{
-		`ALTER TABLE rentals RENAME TO rentals_pre_provider_neutral`,
-		rentalsDDL,
-		`INSERT INTO rentals
-  (id,endpoint_ref,accelerator_model,address,cert_path,state,hub,rented_at,released_at,media_address)
-  SELECT id,endpoint,card,address,cert_path,state,hub,rented_at,released_at,media_address
-    FROM rentals_pre_provider_neutral`,
-		`DROP TABLE rentals_pre_provider_neutral`,
-	},
-}}
+// ObserveRentalWorker records the actual remote worker ClaimAck before any model
+// invocation. The requested accelerator is not evidence; the worker's readback must
+// exactly agree with the SKU Tensorhub already qualified in its readiness receipt.
+// The observation is immutable for one rental so a changed machine identity refuses
+// instead of silently rewriting the evidence a workflow is about to freeze.
+func (s *Store) ObserveRentalWorker(id, accelerator, backend, instance, bootID string,
+	count int) *exit.Error {
+	tx, err := s.db.Begin()
+	if err != nil {
+		return exit.Internalf("cannot begin rental %s worker observation: %s", id, err)
+	}
+	defer tx.Rollback()
+	row, err := scanRental(tx.QueryRow(`SELECT `+rentalCols+` FROM rentals WHERE id=?`, id))
+	if errors.Is(err, sql.ErrNoRows) {
+		return exit.New(exit.NotFound, "no rental %s on this host", id)
+	}
+	if err != nil {
+		return exit.Internalf("cannot read rental %s for worker observation: %s", id, err)
+	}
+	if row.State != "ready" || accelerator == "" || backend == "" || instance == "" ||
+		bootID == "" || count != 1 {
+		return exit.Named(exit.Conflict, "rental.worker_readback_incomplete",
+			"rental %s ClaimAck is state=%q backend=%q accelerator=%q count=%d instance=%q boot=%q",
+			id, row.State, backend, accelerator, count, instance, bootID)
+	}
+	if !acceleratorMatches(row.AcceleratorModel, accelerator) {
+		return exit.Named(exit.Conflict, "rental.accelerator_readback_mismatch",
+			"rental %s worker reports %q but the paid request selected %q",
+			id, accelerator, row.AcceleratorModel).
+			WithRemedy("release it; never invoke a model on hardware that disagrees with the paid selection")
+	}
+	if row.ObservedAccelerator != "" && (row.ObservedAccelerator != accelerator ||
+		row.ObservedAcceleratorCount != count || row.ObservedBackend != backend ||
+		row.ObservedWorkerInstance != instance) {
+		return exit.Named(exit.Conflict, "rental.worker_readback_changed",
+			"rental %s now claims a different accelerator or worker identity", id).
+			WithRemedy("release it; a rental's accepted execution evidence is immutable")
+	}
+	// The worker process on the pod may restart; its boot id is the latest seen, while
+	// the hardware and instance identity above stay write-once.
+	if _, err := tx.Exec(`UPDATE rentals SET observed_accelerator=?,
+		observed_accelerator_count=?,observed_backend=?,observed_worker_instance=?,
+		observed_worker_boot_id=?,observed_at=? WHERE id=?`,
+		accelerator, count, backend, instance, bootID, now(), id); err != nil {
+		return exit.Internalf("cannot record rental %s worker observation: %s", id, err)
+	}
+	if err := tx.Commit(); err != nil {
+		return exit.Internalf("cannot commit rental %s worker observation: %s", id, err)
+	}
+	return nil
+}
+
+// acceleratorMatches accepts an observed device name that carries the requested SKU as an
+// in-order token subsequence, case-insensitively: "H200" and "NVIDIA H200" both name an
+// observed "NVIDIA H200"; "H100" does not.
+func acceleratorMatches(requested, observed string) bool {
+	split := func(s string) []string {
+		return strings.FieldsFunc(strings.ToLower(s), func(r rune) bool {
+			return !unicode.IsLetter(r) && !unicode.IsDigit(r)
+		})
+	}
+	want, have := split(requested), split(observed)
+	if len(want) == 0 || len(have) == 0 {
+		return false
+	}
+	i := 0
+	for _, tok := range have {
+		if i < len(want) && tok == want[i] {
+			i++
+		}
+	}
+	return i == len(want)
+}
 
 // RentalRow reads one rental, or nil when this host rented no such thing.
 func (s *Store) RentalRow(id string) (*Rental, *exit.Error) {
@@ -393,36 +463,17 @@ func (s *Store) Rentals() ([]Rental, *exit.Error) {
 	return out, nil
 }
 
-// ForgetRental removes the row after the hub has torn the pod down. It answers whether a
-// row was there, so a release that names nothing this host holds refuses instead of
-// reporting a success it did not have.
+// ForgetRental removes the row once the hub reports the pod gone and closes whatever
+// operation named it. It answers whether a row was there.
 func (s *Store) ForgetRental(id string) (bool, *exit.Error) {
 	tx, err := s.db.Begin()
 	if err != nil {
 		return false, exit.Internalf("cannot begin forgetting rental %s: %s", id, err)
 	}
 	defer tx.Rollback()
-	advanced, err := tx.Exec(`UPDATE rental_operations SET state='released', updated_at=?
-		WHERE rental_id=? AND state='release_requested'`, now(), id)
-	if err != nil {
+	if _, err := tx.Exec(`UPDATE rental_operations SET state='released', updated_at=?
+		WHERE rental_id=? AND state<>'released'`, now(), id); err != nil {
 		return false, exit.Internalf("cannot close rental operation for %s: %s", id, err)
-	}
-	advancedN, err := advanced.RowsAffected()
-	if err != nil {
-		return false, exit.Internalf("cannot read rental operation close result for %s: %s", id, err)
-	}
-	if advancedN == 0 {
-		var state string
-		if err := tx.QueryRow(`SELECT state FROM rental_operations WHERE rental_id=?`, id).Scan(&state); err != nil {
-			return false, exit.Internalf("cannot read rental operation while closing %s: %s", id, err)
-		}
-		if state == "released" {
-			advancedN = 1
-		}
-	}
-	if advancedN != 1 {
-		return false, exit.Named(exit.Conflict, "rental.release_transition_conflict",
-			"rental %s was not release_requested while closing it", id)
 	}
 	res, err := tx.Exec(`DELETE FROM rentals WHERE id=?`, id)
 	if err != nil {

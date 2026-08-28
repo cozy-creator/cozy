@@ -10,6 +10,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"runtime"
 	"sort"
 	"strings"
 	"syscall"
@@ -100,12 +101,11 @@ func handleStart(ctx *Context) *exit.Error {
 // It said "never a clock" while holding one: a 10-minute ceiling, which is a statement
 // about how large a model may be rather than about anything having gone wrong. The ways
 // this fails are all the worker's own and all visible through the listing — it EXITS, it
-// goes SILENT, it holds a FAULT, or this owner REFUSED it — which is the same set
+// goes SILENT, reports a FAILED axis, or this owner REFUSED it — which is the same set
 // `orchestrator.EnsurePlacementReady` decides on, so the two sides of the same wait cannot
 // disagree.
 func waitReady(c *localapi.Client, instance string) (localapi.Worker, *exit.Error) {
 	silent := (orchestrator.SilentReports * orchestrator.ReportCadence).Milliseconds()
-	errorGrace := orchestrator.ErrorGrace.Milliseconds()
 	for {
 		// THIS OWNER'S OWN VERDICT COMES FIRST, exactly as it does inside the orchestrator:
 		// a worker whose claim was refused here is not slow and not silent, and waiting out
@@ -133,8 +133,7 @@ func waitReady(c *localapi.Client, instance string) (localapi.Worker, *exit.Erro
 			if w.Refusal != "" {
 				// A refusal this host recorded at claim time is a SETTLED verdict, not a
 				// state the worker might leave — so it answers now instead of after eight
-				// missed report periods. A worker FAULT is the other thing entirely and is
-				// timed below: a placement can hold one and still activate.
+				// missed report periods. A FAILED axis is the worker's settled verdict below.
 				return localapi.Worker{}, exit.New(exit.Conflict,
 					"this host refused the worker at that address: %s", w.Refusal).
 					WithNext("cozy logs <org/endpoint>")
@@ -146,10 +145,10 @@ func waitReady(c *localapi.Client, instance string) (localapi.Worker, *exit.Erro
 					orchestrator.SilentReports, orchestrator.ReportCadence).
 					WithNext("cozy logs <org/endpoint>")
 			}
-			if w.ErrorForMS > errorGrace {
+			if w.Phase == "FAILED" || w.Materialization == "FAILED" {
 				return localapi.Worker{}, exit.New(exit.Failed,
-					"the endpoint worker's placement has held a fault for %d ms and never "+
-						"became dispatchable: %s", w.ErrorForMS, w.Fault).
+					"the endpoint worker's placement reported a terminal fault and cannot "+
+						"become dispatchable: %s", w.Fault).
 					WithNext("cozy logs <org/endpoint>")
 			}
 		}
@@ -585,69 +584,131 @@ func compactValue(v map[string]any) string {
 // declared — the CLI composes no path a server did not name.
 func saveOutputs(ctx *Context, c *localapi.Client, life api.Lifecycle) ([]map[string]string, *exit.Error) {
 	dir := ctx.Inv.Value("--out")
+	return saveOutputsAt(c, life, dir)
+}
+
+// saveOutputsAt is the one verified local-download path for ordinary requests and
+// workflow exports: every output is received through the opaque media API, hashed
+// independently, checked against the request manifest, and published as one set.
+func saveOutputsAt(c *localapi.Client, life api.Lifecycle, dir string) ([]map[string]string, *exit.Error) {
 	if dir == "" || len(life.Outputs) == 0 {
 		return nil, nil
 	}
-	if err := os.MkdirAll(dir, 0o755); err != nil {
-		return nil, exit.Internalf("cannot create %s: %s", dir, err)
+	names, e := outputNames(life.Outputs)
+	if e != nil {
+		return nil, e
 	}
-	saved := []map[string]string{}
-	for _, out := range life.Outputs {
-		name := strings.ReplaceAll(out.OutputID, "/", "_") + extensionOf(out.MimeType)
-		path := filepath.Join(dir, name)
-		staging, actualDigest := "", ""
-		n, digest, e := c.Media(out.MediaID, func(body io.Reader) (int64, *exit.Error) {
-			staged, copied, actual, stageErr := stageVerifiedOutput(
-				path, out.Length, out.Digest, body)
-			if stageErr == nil {
-				staging, actualDigest = staged, actual
+	return publishOutputSet(dir, life.Outputs, names, c.Media)
+}
+
+func outputNames(outputs []api.MediaRef) ([]string, *exit.Error) {
+	names := make([]string, len(outputs))
+	seenIDs, seenNames := map[string]bool{}, map[string]bool{}
+	for index, out := range outputs {
+		if out.OutputID == "" || seenIDs[out.OutputID] {
+			return nil, exit.Named(exit.Validation, "output_name_collision",
+				"the output manifest repeats or omits output id %q", out.OutputID)
+		}
+		seenIDs[out.OutputID] = true
+		names[index] = fmt.Sprintf("output-%02d%s", index+1, extensionOf(out.MimeType))
+		if seenNames[names[index]] {
+			return nil, exit.Named(exit.Validation, "output_name_collision",
+				"two output manifest rows resolve to %s", names[index])
+		}
+		seenNames[names[index]] = true
+	}
+	return names, nil
+}
+
+type mediaFetch func(mediaID string, receive func(localapi.MediaResponse) *exit.Error) *exit.Error
+
+// publishOutputSet stages every output into a temporary sibling of dir, verifies each
+// against the MANIFEST (length and digest; the response headers must agree but prove
+// nothing), makes the set durable, then publishes it. A dir that does not yet exist
+// appears in one rename; an existing dir receives the already-verified files. Any
+// failure removes the staging dir and publishes nothing.
+func publishOutputSet(dir string, outputs []api.MediaRef, names []string, fetch mediaFetch) ([]map[string]string, *exit.Error) {
+	absolute, err := filepath.Abs(dir)
+	if err != nil {
+		return nil, exit.Internalf("cannot resolve %s: %s", dir, err)
+	}
+	parent := filepath.Dir(absolute)
+	if info, err := os.Lstat(absolute); err == nil && info.IsDir() {
+		parent = absolute
+	} else if err := os.MkdirAll(parent, 0o755); err != nil {
+		return nil, exit.Internalf("cannot create %s: %s", parent, err)
+	}
+	staging, err := os.MkdirTemp(parent, "."+filepath.Base(absolute)+".staging-*")
+	if err != nil {
+		return nil, exit.Internalf("cannot stage outputs for %s: %s", dir, err)
+	}
+	published := false
+	defer func() {
+		if !published {
+			_ = os.RemoveAll(staging)
+		}
+	}()
+	saved := make([]map[string]string, 0, len(outputs))
+	for index, out := range outputs {
+		staged := filepath.Join(staging, names[index])
+		var n int64
+		var digest string
+		e := fetch(out.MediaID, func(res localapi.MediaResponse) *exit.Error {
+			if res.ContentLength >= 0 && res.ContentLength != out.Length {
+				return exit.Named(exit.Validation, "media_length_mismatch",
+					"output %s declared Content-Length %d where its manifest declared %d B",
+					out.OutputID, res.ContentLength, out.Length)
 			}
-			return copied, stageErr
+			if res.Digest != "" && res.Digest != out.Digest {
+				return exit.Named(exit.Validation, "media_digest_mismatch",
+					"output %s served header %s where its manifest declared %s",
+					out.OutputID, res.Digest, out.Digest)
+			}
+			var e *exit.Error
+			n, digest, e = receiveVerified(staged, out.Length, out.Digest, res.Body)
+			return e
 		})
 		if e != nil {
 			return nil, e
 		}
-		cleanup := func() { _ = os.Remove(staging) }
-		// The response header must agree too, but it is not proof of the transfer: the
-		// independent hash above is. Publication waits for BOTH checks.
-		if digest != "" && digest != actualDigest {
-			cleanup()
-			return nil, exit.Named(exit.Validation, "media_digest_mismatch",
-				"output %s served header %s but its received bytes hash to %s",
-				out.OutputID, digest, actualDigest)
-		}
-		if err := os.Rename(staging, path); err != nil {
-			cleanup()
-			return nil, exit.Internalf("cannot publish verified output %s: %s", path, err)
-		}
-		row := map[string]string{
-			"output": out.OutputID, "path": path, "bytes": render.Bytes(n),
-			"media_id": out.MediaID, "mime": out.MimeType, "digest": actualDigest,
-		}
-		saved = append(saved, row)
+		saved = append(saved, map[string]string{
+			"output": out.OutputID, "path": filepath.Join(dir, names[index]), "bytes": render.Bytes(n),
+			"media_id": out.MediaID, "mime": out.MimeType, "digest": digest,
+		})
 	}
+	if e := syncDirectory(staging); e != nil {
+		return nil, e
+	}
+	if _, err := os.Lstat(absolute); os.IsNotExist(err) {
+		if err := os.Rename(staging, absolute); err != nil {
+			return nil, exit.Internalf("cannot publish verified outputs to %s: %s", dir, err)
+		}
+		published = true
+		return saved, syncDirectory(parent)
+	}
+	for _, name := range names {
+		if err := os.Rename(filepath.Join(staging, name), filepath.Join(absolute, name)); err != nil {
+			return nil, exit.Internalf("cannot publish verified output %s: %s", name, err)
+		}
+	}
+	if e := syncDirectory(absolute); e != nil {
+		return nil, e
+	}
+	published = true
+	_ = os.Remove(staging)
 	return saved, nil
 }
 
-// stageVerifiedOutput receives into a sibling temporary, hashes the exact bytes written,
-// and checks both durable identity fields before the caller can rename it into --out.
-// The API's digest header is a restatement of the record; it cannot replace this read.
-func stageVerifiedOutput(path string, expectedLength int64, expectedDigest string,
-	body io.Reader) (staging string, length int64, digest string, e *exit.Error) {
-	f, err := os.CreateTemp(filepath.Dir(path), "."+filepath.Base(path)+".staging-*")
+// receiveVerified writes at most expectedLength+1 bytes to path, fsyncs, and checks the
+// exact length and independent sha256 against the manifest.
+func receiveVerified(path string, expectedLength int64, expectedDigest string,
+	body io.Reader) (int64, string, *exit.Error) {
+	f, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o644)
 	if err != nil {
-		return "", 0, "", exit.Internalf("cannot stage %s: %s", path, err)
+		return 0, "", exit.Internalf("cannot stage %s: %s", filepath.Base(path), err)
 	}
-	staging = f.Name()
-	stagingPath := staging
-	keep := false
-	defer func() {
-		if !keep {
-			_ = os.Remove(stagingPath)
-		}
-	}()
 	hash := sha256.New()
-	length, err = io.Copy(io.MultiWriter(f, hash), body)
+	length, err := io.Copy(io.MultiWriter(f, hash), io.LimitReader(body, expectedLength+1))
 	if err == nil {
 		err = f.Sync()
 	}
@@ -655,21 +716,56 @@ func stageVerifiedOutput(path string, expectedLength int64, expectedDigest strin
 		err = closeErr
 	}
 	if err != nil {
-		return "", length, "", exit.Internalf("cannot stage %s: %s", path, err)
+		return length, "", exit.Internalf("cannot stage %s: %s", filepath.Base(path), err)
 	}
-	digest = "sha256:" + hex.EncodeToString(hash.Sum(nil))
+	digest := "sha256:" + hex.EncodeToString(hash.Sum(nil))
 	if length != expectedLength {
-		return "", length, digest, exit.Named(exit.Validation, "media_length_mismatch",
+		return length, digest, exit.Named(exit.Validation, "media_length_mismatch",
 			"output %s received %d B where its manifest declared %d B",
 			filepath.Base(path), length, expectedLength)
 	}
 	if digest != expectedDigest {
-		return "", length, digest, exit.Named(exit.Validation, "media_digest_mismatch",
+		return length, digest, exit.Named(exit.Validation, "media_digest_mismatch",
 			"output %s received %s where its manifest declared %s",
 			filepath.Base(path), digest, expectedDigest)
 	}
-	keep = true
-	return staging, length, digest, nil
+	return length, digest, nil
+}
+
+// syncTree fsyncs every directory under root, children before parents.
+func syncTree(root string) *exit.Error {
+	var dirs []string
+	err := filepath.WalkDir(root, func(path string, entry os.DirEntry, err error) error {
+		if err == nil && entry.IsDir() {
+			dirs = append(dirs, path)
+		}
+		return err
+	})
+	if err != nil {
+		return exit.Internalf("cannot inspect staged directory %s: %s", root, err)
+	}
+	for index := len(dirs) - 1; index >= 0; index-- {
+		if e := syncDirectory(dirs[index]); e != nil {
+			return e
+		}
+	}
+	return nil
+}
+
+func syncDirectory(path string) *exit.Error {
+	if runtime.GOOS == "windows" {
+		return nil
+	}
+	dir, err := os.Open(path)
+	if err != nil {
+		return exit.Internalf("cannot open directory for sync: %s", err)
+	}
+	err = dir.Sync()
+	_ = dir.Close()
+	if err != nil {
+		return exit.Internalf("cannot make directory %s durable: %s", path, err)
+	}
+	return nil
 }
 
 // extensionOf names a file from the type the OUTPUT MANIFEST declared. An unknown or

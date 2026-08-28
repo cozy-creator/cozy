@@ -18,9 +18,8 @@ type VideoComposeRequest struct {
 	Source             []byte `json:"source,omitempty"`
 	BaseDir            string `json:"base_dir,omitempty"`
 	CreativePlanDigest string `json:"creative_plan_digest,omitempty"`
-	H3Endpoint         string `json:"h3_endpoint"`
-	AssemblyEndpoint   string `json:"assembly_endpoint"`
-	Worker             string `json:"worker,omitempty"`
+	H3Endpoint         string `json:"h3_endpoint,omitempty"`
+	RentalID           string `json:"rental_id,omitempty"`
 }
 
 func (s *Server) composeVideo(w http.ResponseWriter, r *http.Request) {
@@ -56,8 +55,7 @@ func (s *Server) composeVideo(w http.ResponseWriter, r *http.Request) {
 	composition, problem := s.videos.Compose(video.ComposeRequest{
 		Source: request.Source, BaseDir: request.BaseDir,
 		CreativePlanDigest: request.CreativePlanDigest,
-		H3Endpoint:         request.H3Endpoint, AssemblyEndpoint: request.AssemblyEndpoint,
-		Worker: request.Worker,
+		H3Endpoint:         request.H3Endpoint, RentalID: request.RentalID,
 	})
 	if problem != nil {
 		s.refuseTyped(w, r, problem)

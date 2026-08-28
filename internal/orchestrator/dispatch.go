@@ -314,9 +314,6 @@ func (c *Orchestrator) Requeue(requestID, why string) {
 // longer wait. A request that queues forever behind a worker that died on boot is the
 // worst of both: no output and no answer.
 func (c *Orchestrator) selectOrStart(req records.Request) {
-	if c.opt.Endpoints == nil {
-		return
-	}
 	// A JOB names its own slot — one worker per (endpoint, job function) — so the
 	// "already starting" and "already resident" questions are asked about that slot and
 	// not about the endpoint. Without this, submitting a job while a serving worker of
@@ -450,6 +447,9 @@ func settledState(state string) bool {
 // asks this machine's install to recreate remote meaning.
 func (c *Orchestrator) resolveFor(req records.Request) (WorkerLaunchSpec, *exit.Error) {
 	if req.Worker == "" {
+		if c.opt.Endpoints == nil {
+			return WorkerLaunchSpec{}, exit.Unavailablef("this host resolves no local endpoints")
+		}
 		if req.InstallID != "" {
 			if req.IsJob() {
 				return WorkerLaunchSpec{}, exit.Named(exit.Structural,
@@ -554,13 +554,9 @@ func (c *Orchestrator) dispatch(req records.Request) (uint64, *exit.Error) {
 	// the payload digest, the ORDERED input identities, the output contracts, the
 	// deadline — lives INSIDE the digest. Its key set is closed: no human model ref, no
 	// service class, no local extension has a slot.
-	environmentDigest := w.spec.Placement.EnvironmentSpecDigest
-	if environmentDigest == "" {
-		environmentDigest = c.opt.EnvironmentSpecDigest
-	}
-	configDigest := w.spec.Placement.ConfigDigest
-	if configDigest == "" {
-		configDigest = c.opt.ConfigDigest
+	environmentDigest, configDigest, e := c.invocationIdentity(w)
+	if e != nil {
+		return 0, e
 	}
 	spec := &pb.InvocationSpec{
 		EndpointReleaseId: w.spec.Placement.ReleaseID,
@@ -694,16 +690,39 @@ func (c *Orchestrator) rollbackGrant(req records.Request, attempt uint64, w *wor
 	}
 }
 
+// DefaultMaxOutputMiB is the per-output bound when Options.MaxOutputMiB is unset. It
+// matches the Runtime/endpoint media object envelope; attempt and pod quotas still bound
+// the aggregate.
+const DefaultMaxOutputMiB int64 = 512
+
 func (c *Orchestrator) maxOutputBytes() uint64 {
 	maxBytes := c.opt.MaxOutputMiB
 	if maxBytes <= 0 {
-		// The fixed H3 launch cell and its eight-shot assembler are legitimate large
-		// video producers. 64 MiB was a private Creator ceiling, not a release fact.
-		// 512 MiB matches the current Runtime/endpoint media object envelope while the
-		// attempt and pod quotas still bound the aggregate.
-		maxBytes = 512
+		maxBytes = DefaultMaxOutputMiB
 	}
 	return uint64(maxBytes) << 20
+}
+
+// invocationIdentity names the environment and config digests an invocation on w rides.
+// A worker this service spawned inherits the service's own; an ATTACHED worker's come only
+// from its frozen placement, and an empty one is a refusal rather than a local guess.
+func (c *Orchestrator) invocationIdentity(w *worker) (environment, config string, e *exit.Error) {
+	environment, config = w.spec.Placement.EnvironmentSpecDigest, w.spec.Placement.ConfigDigest
+	if w.spec.Connection != nil {
+		if environment == "" || config == "" {
+			return "", "", exit.Named(exit.Structural, "remote_placement_identity_missing",
+				"attached worker %s carries no frozen environment/config digest; this host "+
+					"will not substitute its own", w.instanceID)
+		}
+		return environment, config, nil
+	}
+	if environment == "" {
+		environment = c.opt.EnvironmentSpecDigest
+	}
+	if config == "" {
+		config = c.opt.ConfigDigest
+	}
+	return environment, config, nil
 }
 
 func spellOf(raw []byte) string {
@@ -969,6 +988,9 @@ func (c *Orchestrator) remoteGrant(req records.Request, attempt uint64, w *worke
 			req.ID, attempt, asset.FieldPath, asset.Length, asset.Digest, w.media.Addr(), path)
 	}
 	for _, id := range outputIDs {
+		if e := fenceOutputID(id); e != nil {
+			return nil, e
+		}
 		g.Outputs = append(g.Outputs, &pb.OutputAccess{
 			OutputId: id, Url: "file://" + dir + "/" + id,
 		})
@@ -1016,9 +1038,9 @@ func (c *Orchestrator) grant(requestID string, attempt uint64, req records.Reque
 			InputId: asset.FieldPath, Url: "file://" + asset.LocalPath,
 		})
 	}
-	for _, id := range strings.Split(req.Outputs, ",") {
-		if id == "" {
-			continue
+	for _, id := range splitList(req.Outputs) {
+		if e := fenceOutputID(id); e != nil {
+			return nil, e
 		}
 		g.Outputs = append(g.Outputs, &pb.OutputAccess{
 			OutputId: id,
@@ -1100,6 +1122,10 @@ func (c *Orchestrator) AwaitAccepted(requestID string, attempt uint64, timeout t
 		return exit.New(exit.Deadline, "%s#%d was not accepted in %s", requestID, attempt, timeout)
 	}
 }
+
+// ClientCancelGraceMS is the one cooperative attempt-cancellation policy. It is a
+// cancellation budget carried to Runtime, never a stall or workflow deadline.
+const ClientCancelGraceMS uint64 = 5000
 
 // CancelClient is the client-reason cancel, for the callers that have no business
 // naming a protocol enum.

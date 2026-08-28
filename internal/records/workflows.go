@@ -1,9 +1,11 @@
 package records
 
 import (
+	"bytes"
 	"database/sql"
 	"encoding/json"
 	"errors"
+	"sort"
 
 	"github.com/cozy-creator/cozy-creator-v2/internal/exit"
 )
@@ -35,6 +37,25 @@ CREATE TABLE IF NOT EXISTS workflow_steps (
   child_key               TEXT UNIQUE,
   child_request_id        TEXT UNIQUE REFERENCES requests(id),
   PRIMARY KEY (workflow_id, ordinal)
+)`, `
+CREATE TABLE IF NOT EXISTS rental_control_snapshots (
+  digest TEXT PRIMARY KEY,
+  length INTEGER NOT NULL,
+  bytes  BLOB NOT NULL
+)`, `
+CREATE TABLE IF NOT EXISTS workflow_rental_controls (
+  workflow_id                TEXT NOT NULL REFERENCES workflow_executions(id),
+  rental_id                  TEXT NOT NULL,
+  endpoint_ref               TEXT NOT NULL,
+  accelerator_model          TEXT NOT NULL,
+  observed_accelerator       TEXT NOT NULL,
+  observed_accelerator_count INTEGER NOT NULL,
+  observed_backend           TEXT NOT NULL,
+  observed_worker_instance   TEXT NOT NULL,
+  observed_worker_boot_id    TEXT NOT NULL,
+  observed_at                TEXT NOT NULL,
+  control_snapshot_digest    TEXT NOT NULL REFERENCES rental_control_snapshots(digest),
+  PRIMARY KEY (workflow_id, rental_id)
 )`}
 
 type WorkflowExecution struct {
@@ -78,6 +99,25 @@ type ResolvedBinding struct {
 	ExpectedMediaKind string `json:"expected_media_kind"`
 }
 
+// WorkflowRentalControl is the exact remote execution evidence frozen with a
+// workflow. It deliberately has no foreign key to rentals: releasing the paid pod
+// deletes dial authority, not the historical proof of what ran.
+type WorkflowRentalControl struct {
+	WorkflowID               string
+	RentalID                 string
+	EndpointRef              string
+	AcceleratorModel         string
+	ObservedAccelerator      string
+	ObservedAcceleratorCount int
+	ObservedBackend          string
+	ObservedWorkerInstance   string
+	ObservedWorkerBootID     string
+	ObservedAt               string
+	ControlSnapshotDigest    string
+	ControlSnapshotLength    int64
+	ControlSnapshotBytes     []byte
+}
+
 const workflowCols = `w.id,w.idem_key,w.body_digest,w.execution_digest,w.creative_plan_digest,
 	w.plan,w.state,w.cancel_requested_at,w.terminal_code,w.terminal_message,w.created_at,w.settled_at,
 	(SELECT COUNT(*) FROM workflow_steps s WHERE s.workflow_id=w.id)`
@@ -91,7 +131,8 @@ func scanWorkflow(row interface{ Scan(...any) error }) (WorkflowExecution, error
 }
 
 func (s *Store) CreateWorkflow(w WorkflowExecution, assets map[int][]AssetBinding,
-	installs, workers map[int]string, stepCount int) (WorkflowExecution, bool, *exit.Error) {
+	installs, workers map[int]string, controls map[string]WorkflowRentalControl,
+	stepCount int) (WorkflowExecution, bool, *exit.Error) {
 	existing, err := scanWorkflow(s.db.QueryRow(`SELECT `+workflowCols+`
 		FROM workflow_executions w WHERE w.idem_key=?`, w.IdemKey))
 	if err == nil {
@@ -132,11 +173,82 @@ func (s *Store) CreateWorkflow(w WorkflowExecution, assets map[int][]AssetBindin
 				"cannot record workflow %s step %d: %s", w.ID, ordinal, err)
 		}
 	}
+	ids := make([]string, 0, len(controls))
+	for id := range controls {
+		ids = append(ids, id)
+	}
+	sort.Strings(ids)
+	for _, id := range ids {
+		control := controls[id]
+		if control.RentalID != id || control.EndpointRef == "" ||
+			control.ObservedAccelerator == "" || control.ObservedAcceleratorCount != 1 ||
+			control.ControlSnapshotDigest == "" || control.ControlSnapshotLength <= 0 ||
+			int64(len(control.ControlSnapshotBytes)) != control.ControlSnapshotLength {
+			return WorkflowExecution{}, false, exit.Internalf(
+				"workflow %s rental %s control evidence is incomplete", w.ID, id)
+		}
+		if _, err := tx.Exec(`INSERT INTO rental_control_snapshots(digest,length,bytes)
+			VALUES(?,?,?) ON CONFLICT(digest) DO NOTHING`, control.ControlSnapshotDigest,
+			control.ControlSnapshotLength, control.ControlSnapshotBytes); err != nil {
+			return WorkflowExecution{}, false, exit.Internalf(
+				"cannot retain workflow %s rental control %s: %s", w.ID, id, err)
+		}
+		var retainedLength int64
+		var retainedBytes []byte
+		if err := tx.QueryRow(`SELECT length,bytes FROM rental_control_snapshots WHERE digest=?`,
+			control.ControlSnapshotDigest).Scan(&retainedLength, &retainedBytes); err != nil ||
+			retainedLength != control.ControlSnapshotLength ||
+			!bytes.Equal(retainedBytes, control.ControlSnapshotBytes) {
+			return WorkflowExecution{}, false, exit.Named(exit.Conflict,
+				"workflow.control_snapshot_conflict",
+				"retained control snapshot %s has different exact bytes", control.ControlSnapshotDigest)
+		}
+		if _, err := tx.Exec(`INSERT INTO workflow_rental_controls(
+			workflow_id,rental_id,endpoint_ref,accelerator_model,observed_accelerator,
+			observed_accelerator_count,observed_backend,observed_worker_instance,
+			observed_worker_boot_id,observed_at,control_snapshot_digest)
+			VALUES(?,?,?,?,?,?,?,?,?,?,?)`, w.ID, id, control.EndpointRef,
+			control.AcceleratorModel, control.ObservedAccelerator,
+			control.ObservedAcceleratorCount, control.ObservedBackend,
+			control.ObservedWorkerInstance, control.ObservedWorkerBootID,
+			control.ObservedAt, control.ControlSnapshotDigest); err != nil {
+			return WorkflowExecution{}, false, exit.Internalf(
+				"cannot freeze workflow %s rental %s control: %s", w.ID, id, err)
+		}
+	}
 	if err := tx.Commit(); err != nil {
 		return WorkflowExecution{}, false, exit.Internalf("cannot commit workflow %s: %s", w.ID, err)
 	}
 	w.StepCount = stepCount
 	return w, true, nil
+}
+
+func (s *Store) WorkflowRentalControls(id string) ([]WorkflowRentalControl, *exit.Error) {
+	rows, err := s.db.Query(`SELECT c.workflow_id,c.rental_id,c.endpoint_ref,c.accelerator_model,
+		observed_accelerator,observed_accelerator_count,observed_backend,
+		observed_worker_instance,observed_worker_boot_id,observed_at,
+		c.control_snapshot_digest,s.length,s.bytes
+		FROM workflow_rental_controls c JOIN rental_control_snapshots s
+		  ON s.digest=c.control_snapshot_digest
+		WHERE c.workflow_id=? ORDER BY c.rental_id`, id)
+	if err != nil {
+		return nil, exit.Internalf("cannot read workflow %s rental controls: %s", id, err)
+	}
+	defer rows.Close()
+	var out []WorkflowRentalControl
+	for rows.Next() {
+		var row WorkflowRentalControl
+		if err := rows.Scan(&row.WorkflowID, &row.RentalID, &row.EndpointRef,
+			&row.AcceleratorModel, &row.ObservedAccelerator,
+			&row.ObservedAcceleratorCount, &row.ObservedBackend,
+			&row.ObservedWorkerInstance, &row.ObservedWorkerBootID, &row.ObservedAt,
+			&row.ControlSnapshotDigest, &row.ControlSnapshotLength,
+			&row.ControlSnapshotBytes); err != nil {
+			return nil, exit.Internalf("cannot decode workflow %s rental control: %s", id, err)
+		}
+		out = append(out, row)
+	}
+	return out, nil
 }
 
 func (s *Store) Workflow(id string) (*WorkflowExecution, *exit.Error) {
@@ -197,6 +309,25 @@ func (s *Store) WorkflowSteps(id string) ([]WorkflowStep, *exit.Error) {
 			return nil, exit.Internalf("cannot decode a workflow %s step: %s", id, err)
 		}
 		out = append(out, step)
+	}
+	return out, nil
+}
+
+func (s *Store) WorkflowTargets(id string) (map[int]string, *exit.Error) {
+	rows, err := s.db.Query(`SELECT ordinal,worker FROM workflow_steps
+		WHERE workflow_id=? AND worker<>'' ORDER BY ordinal`, id)
+	if err != nil {
+		return nil, exit.Internalf("cannot read workflow %s targets: %s", id, err)
+	}
+	defer rows.Close()
+	out := map[int]string{}
+	for rows.Next() {
+		var ordinal int
+		var worker string
+		if err := rows.Scan(&ordinal, &worker); err != nil {
+			return nil, exit.Internalf("cannot decode workflow %s target: %s", id, err)
+		}
+		out[ordinal] = worker
 	}
 	return out, nil
 }

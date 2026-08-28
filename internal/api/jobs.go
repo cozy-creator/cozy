@@ -549,7 +549,7 @@ func (s *Server) cancelJob(w http.ResponseWriter, r *http.Request) {
 			"retry cancellation after the terminal ack")
 		return
 	}
-	grace := uint64(5000)
+	grace := orchestrator.ClientCancelGraceMS
 	if v := r.URL.Query().Get("grace_ms"); v != "" {
 		if n, err := strconv.ParseUint(v, 10, 64); err == nil && n <= 120000 {
 			grace = n

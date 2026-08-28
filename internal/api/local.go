@@ -1,6 +1,7 @@
 package api
 
 import (
+	"bytes"
 	"encoding/json"
 	"io"
 	"net/http"
@@ -64,21 +65,47 @@ func (s *Server) startWorker(w http.ResponseWriter, r *http.Request) {
 	// serving default, and only an explicit `false` turns the boot warm pass off.
 	var body struct {
 		Endpoint string `json:"endpoint"`
+		Rental   string `json:"rental"`
 		Warm     *bool  `json:"warm"`
 	}
 	data, _ := io.ReadAll(io.LimitReader(r.Body, 1<<16))
-	if err := json.Unmarshal(data, &body); err != nil || body.Endpoint == "" {
+	decoder := json.NewDecoder(bytes.NewReader(data))
+	decoder.DisallowUnknownFields()
+	err := decoder.Decode(&body)
+	var trailing any
+	if err == nil {
+		err = decoder.Decode(&trailing)
+	}
+	if err != io.EOF || (body.Endpoint == "") == (body.Rental == "") ||
+		body.Rental != "" && body.Warm != nil {
 		s.refuse(w, r, http.StatusBadRequest, "invalid_request",
-			`this route takes {"endpoint":"org/name"} and optionally {"warm":false}`,
-			"a client names an ENDPOINT; resolving it to an interpreter and a binding is this host's job")
+			`this route takes exactly one of {"endpoint":"org/name","warm":false} or {"rental":"id"}`,
+			"a rental probe claims an already-provisioned worker and never selects local warmup policy")
 		return
 	}
-	if s.endpoints == nil {
-		s.refuse(w, r, http.StatusServiceUnavailable, "no_resolver",
-			"this LocalService resolves no endpoints", "")
-		return
+	var spec orchestrator.WorkerLaunchSpec
+	var instance, endpoint string
+	var change orchestrator.WorkerChange
+	var e *exit.Error
+	if body.Rental != "" {
+		instance, endpoint, change, e = s.orchestrator.EnsureRental(body.Rental)
+	} else {
+		if s.endpoints == nil {
+			s.refuse(w, r, http.StatusServiceUnavailable, "no_resolver",
+				"this LocalService resolves no endpoints", "")
+			return
+		}
+		spec, e = s.endpoints.Resolve(body.Endpoint)
+		if e == nil {
+			endpoint = spec.Placement.Endpoint
+			// THE BOOT WARM PASS, off by request. A rental was already provisioned
+			// under its exact execution and has no local warmup choice on this route.
+			if body.Warm != nil && !*body.Warm {
+				spec.Warmup = orchestrator.WarmupNone
+			}
+			instance, change, e = s.orchestrator.EnsureWorker(spec)
+		}
 	}
-	spec, e := s.endpoints.Resolve(body.Endpoint)
 	if e != nil {
 		s.refuseTyped(w, r, e)
 		return
@@ -90,18 +117,10 @@ func (s *Server) startWorker(w http.ResponseWriter, r *http.Request) {
 	// nothing (observed: `condition` OOMs the 1024px decode with every component
 	// resident), and the warm pass is a BIT-LEVEL input to the first real image, because
 	// the device-memory history it leaves is what cuDNN's algorithm selection reads.
-	if body.Warm != nil && !*body.Warm {
-		spec.Warmup = orchestrator.WarmupNone
-	}
 	// EnsureWorker is idempotent by construction and SAYS WHAT IT DID (#484). `resident`
 	// is deleted: it answered "was it already there", which is true both of a no-op and of
 	// a live worker that just gained a placement, and a client that has to tell those apart
 	// cannot read it off a boolean.
-	instance, change, e := s.orchestrator.EnsureWorker(spec)
-	if e != nil {
-		s.refuseTyped(w, r, e)
-		return
-	}
 	note := map[orchestrator.WorkerChange]string{
 		orchestrator.ChangeNone: "already hosting this placement: this route is idempotent",
 		orchestrator.ChangeWorkerStarted: "spawned; poll GET /v1/local/workers until the " +
@@ -109,7 +128,7 @@ func (s *Server) startWorker(w http.ResponseWriter, r *http.Request) {
 		orchestrator.ChangePlacementAdded: "the live worker was converged onto a desired set " +
 			"carrying this placement; poll GET /v1/local/workers for its serving axis",
 	}[change]
-	if change == orchestrator.ChangeNone && spec.Warmup == orchestrator.WarmupNone {
+	if body.Endpoint != "" && change == orchestrator.ChangeNone && spec.Warmup == orchestrator.WarmupNone {
 		// The flag asked for a boot that has already happened. Saying so is the
 		// difference between an idempotent verb and one that quietly ignores an
 		// argument — the same defect as a flag that parses and does nothing.
@@ -120,7 +139,7 @@ func (s *Server) startWorker(w http.ResponseWriter, r *http.Request) {
 		status = http.StatusOK
 	}
 	s.ok(w, r, status, map[string]any{
-		"instance_id": instance, "endpoint": spec.Placement.Endpoint,
+		"instance_id": instance, "endpoint": endpoint,
 		"change": string(change), "note": note,
 	})
 }

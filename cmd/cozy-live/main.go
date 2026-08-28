@@ -18,8 +18,11 @@ package main
 import (
 	"fmt"
 	"os"
+	"os/signal"
 	"path/filepath"
 	"strings"
+	"sync"
+	"syscall"
 	"time"
 
 	"github.com/cozy-creator/cozy-creator-v2/internal/config"
@@ -61,16 +64,46 @@ func flag(name, fallback string) string {
 func must(what string, err error) {
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "cozy-live: %s: %v\n", what, err)
-		os.Exit(1)
+		exitAfterCleanup(1)
 	}
+}
+
+// Every child this driver spawns (`cozy up`, pod workers, cozy-media, in-process
+// orchestrators) registers its teardown here, because `must` exits the process and a
+// deferred stop never runs on that path. Cleanups run once, newest first, on: normal
+// return, a failing check count, `must`, a panic, or SIGINT/SIGTERM.
+var (
+	cleanupMu sync.Mutex
+	cleanups  []func()
+)
+
+func onExit(fn func()) {
+	cleanupMu.Lock()
+	defer cleanupMu.Unlock()
+	cleanups = append(cleanups, fn)
+}
+
+func runCleanups() {
+	cleanupMu.Lock()
+	list := cleanups
+	cleanups = nil
+	cleanupMu.Unlock()
+	for i := len(list) - 1; i >= 0; i-- {
+		list[i]()
+	}
+}
+
+func exitAfterCleanup(code int) {
+	runCleanups()
+	os.Exit(code)
 }
 
 func main() {
 	args := os.Args[1:]
 	if len(args) == 0 {
 		fmt.Fprintln(os.Stderr, "usage: cozy-live "+
-			"<canonical|attempt|recovered|arms|stall|tlspin|api|apiarms|apicrash|verbs|journey|rent|planids|"+
-		"descriptor|pipeline|m4arms|dropack|jobarms|jobs|jobcrash|workflows|workflowcrash|fixtures|fakeworker> [--flag value]")
+			"<canonical|attempt|recovered|arms|stall|stallactive|tlspin|api|apiarms|apicrash|verbs|journey|rent|planids|"+
+			"descriptor|pipeline|m4arms|dropack|jobarms|jobs|jobcrash|workflows|workflowcrash|fixtures|fakeworker> [--flag value]")
 		os.Exit(2)
 	}
 	section := args[0]
@@ -87,9 +120,25 @@ func main() {
 		}
 	}
 
-	switch section {
-	case "fakeworker":
+	if section == "fakeworker" {
 		os.Exit(fakeWorker())
+	}
+	signals := make(chan os.Signal, 1)
+	signal.Notify(signals, syscall.SIGINT, syscall.SIGTERM)
+	go func() {
+		sig := <-signals
+		fmt.Fprintf(os.Stderr, "cozy-live: %v: tearing down\n", sig)
+		exitAfterCleanup(130)
+	}()
+	defer func() {
+		if r := recover(); r != nil {
+			runCleanups()
+			panic(r)
+		}
+		runCleanups()
+	}()
+
+	switch section {
 	case "canonical":
 		sectionCanonical()
 	case "descriptor":
@@ -135,6 +184,8 @@ func main() {
 		sectionWorkflowCrash()
 	case "stall":
 		sectionStall()
+	case "stallactive":
+		sectionStallActive()
 	case "tlspin":
 		sectionTLSPin()
 	default:
@@ -144,19 +195,20 @@ func main() {
 
 	fmt.Printf("\n%d checks, %d failed\n", pass+fail, fail)
 	if fail > 0 {
-		os.Exit(1)
+		exitAfterCleanup(1)
 	}
 }
 
 // --------------------------------------------------------------------------- hosting
 
 type live struct {
-	root  string
-	cfg   config.Config
-	l     home.Layout
-	store *records.Store
-	c     *orchestrator.Orchestrator
-	log   *os.File
+	root   string
+	cfg    config.Config
+	l      home.Layout
+	store  *records.Store
+	c      *orchestrator.Orchestrator
+	log    *os.File
+	closed bool
 }
 
 // hostCoordinator brings up the REAL LocalCoordinator on a fresh root. Everything a
@@ -201,10 +253,16 @@ func hostCoordinator(name string, fresh bool) *live {
 		must("reconcile", e)
 	}
 	go func() { _ = c.Serve() }()
-	return &live{root: root, cfg: cfg, l: l, store: st, c: c, log: logFile}
+	lv := &live{root: root, cfg: cfg, l: l, store: st, c: c, log: logFile}
+	onExit(lv.close)
+	return lv
 }
 
 func (lv *live) close() {
+	if lv.closed {
+		return
+	}
+	lv.closed = true
 	lv.c.Close(20 * time.Second)
 	lv.store.Close()
 	lv.log.Close()

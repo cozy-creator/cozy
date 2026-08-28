@@ -23,7 +23,6 @@ import (
 	"io"
 	"net/http"
 	"strings"
-	"time"
 
 	"github.com/cozy-creator/cozy-creator-v2/internal/api"
 	"github.com/cozy-creator/cozy-creator-v2/internal/config"
@@ -55,9 +54,10 @@ func Open(cfg config.Config, st service.State) (*Client, *exit.Error) {
 	return &Client{
 		base:  "http://" + st.Addr,
 		token: token,
-		// Long, because a run's own stream is the thing being waited on and the
-		// deadline that matters is the request's, not the transport's.
-		http: &http.Client{Timeout: 6 * time.Hour},
+		// No client-wide clock decides whether a local workflow or request stalled.
+		// Explicit caller deadlines cancel their request; worker liveness and measured
+		// no-progress facts decide operational failure.
+		http: &http.Client{},
 	}, nil
 }
 
@@ -179,24 +179,32 @@ func (c *Client) Cancel(id string) *exit.Error {
 	return c.call("POST", "/v1/requests/"+id+"/cancel", nil, nil)
 }
 
-// Media hands one output's bytes to `write` and returns what it wrote plus the digest the
-// server declared. The id is OPAQUE: this client composes no path and cannot ask for one.
-func (c *Client) Media(mediaID string, write func(io.Reader) (int64, *exit.Error)) (int64, string, *exit.Error) {
+// MediaResponse is one media GET as the server declared it. Body is bounded by nothing
+// here: the receiver knows the manifest length and must bound its own read.
+type MediaResponse struct {
+	Body          io.Reader
+	ContentLength int64  // -1 when the server declared none
+	Digest        string // X-Cozy-Digest, a restatement of the record, not proof of transfer
+}
+
+// Media hands one output's response to `receive`. The id is OPAQUE: this client composes
+// no path and cannot ask for one.
+func (c *Client) Media(mediaID string, receive func(MediaResponse) *exit.Error) *exit.Error {
 	req, e := c.request("GET", "/v1/media/"+mediaID, nil)
 	if e != nil {
-		return 0, "", e
+		return e
 	}
 	res, err := c.http.Do(req)
 	if err != nil {
-		return 0, "", c.unreachable(err)
+		return c.unreachable(err)
 	}
 	defer res.Body.Close()
 	if res.StatusCode >= 300 {
 		data, _ := io.ReadAll(io.LimitReader(res.Body, 1<<20))
-		return 0, "", Refusal(res.StatusCode, data)
+		return Refusal(res.StatusCode, data)
 	}
-	n, e := write(res.Body)
-	return n, res.Header.Get("X-Cozy-Digest"), e
+	return receive(MediaResponse{Body: res.Body, ContentLength: res.ContentLength,
+		Digest: res.Header.Get("X-Cozy-Digest")})
 }
 
 // ------------------------------------------------------------ the LOCAL extension
@@ -228,9 +236,8 @@ type Worker struct {
 	Materialization string   `json:"materialization"`
 	Serving         string   `json:"serving"`
 	Plans           []string `json:"dispatchable_plan_ids"`
-	// How long this worker has been SILENT, and how long it has been saying it CANNOT
-	// serve. They are what a waiter watches instead of a clock: a worker loading a
-	// 20 GB binding is neither silent nor in error, however long it takes.
+	// QuietMS measures missed protocol reports. ErrorForMS is diagnostic only; typed
+	// faults/refusals settle immediately and no elapsed duration decides readiness.
 	QuietMS    int64  `json:"quiet_ms"`
 	ErrorForMS int64  `json:"error_for_ms"`
 	Fault      string `json:"fault"`
@@ -275,6 +282,14 @@ func (c *Client) EnsureWorker(endpoint string, warm bool) (StartResult, *exit.Er
 		body["warm"] = false
 	}
 	e := c.call("POST", "/v1/local/workers", body, &res)
+	return res, e
+}
+
+// EnsureRental claims one attached rented worker without invoking a model. Its
+// ClaimAck actual-hardware readback becomes durable before this returns ready.
+func (c *Client) EnsureRental(rentalID string) (StartResult, *exit.Error) {
+	var res StartResult
+	e := c.call("POST", "/v1/local/workers", map[string]any{"rental": rentalID}, &res)
 	return res, e
 }
 

@@ -19,10 +19,8 @@ import (
 
 	"github.com/cozy-creator/cozy-creator-v2/internal/app"
 	"github.com/cozy-creator/cozy-creator-v2/internal/config"
-	"github.com/cozy-creator/cozy-creator-v2/internal/exit"
 	"github.com/cozy-creator/cozy-creator-v2/internal/home"
 	"github.com/cozy-creator/cozy-creator-v2/internal/media"
-	"github.com/cozy-creator/cozy-creator-v2/internal/plan"
 	"github.com/cozy-creator/cozy-creator-v2/internal/records"
 	"github.com/cozy-creator/cozy-creator-v2/internal/workertls"
 )
@@ -51,22 +49,48 @@ import (
 // the pod directory the owner reserved, and the owner FETCHES the bytes back and verifies
 // them before it acks. Nothing in it is stubbed, and the arms say where each byte was.
 
+// The whole section runs on the WEIGHTLESS fixture: `tile` (a scalar-input, image-output
+// entrypoint) is what every pinned run and the local unpinned run invoke, and
+// `video_transport` carries the image->MP4 asset leg. No model, no weights, no GPU — the
+// rental proof is about the OWNER side, and the shared box runs no inference.
 const (
-	rentalEndpointRef          = endpointRef + "/v1/denoise"
 	transportEndpointRef       = "cozy/weightless"
+	rentalEndpointRef          = transportEndpointRef + "/v1/tile"
 	transportRentalEndpointRef = transportEndpointRef + "/v1/video_transport"
+	localTileRef               = rentalEndpointRef
+	rentalEntrypoint           = "tile"
+	tilePayload                = "size=8"
 )
+
+// accelerator is the provider-neutral model every rental in this section asks for and
+// every stand-in pod reports (`--accelerator`, default NVIDIA H200).
+var accelerator = "NVIDIA H200"
+
+// otherAccelerator is any accelerator that is not the one under test, for the arm that
+// changes a body under a reused idempotency key.
+func otherAccelerator() string {
+	if accelerator == "NVIDIA H100" {
+		return "NVIDIA H200"
+	}
+	return "NVIDIA H100"
+}
 
 func sectionRent() {
 	root := flag("home", filepath.Join(os.TempDir(), "cozy-live", "cl015-rent"))
+	accelerator = flag("accelerator", accelerator)
 	must("clearing the root", os.RemoveAll(root))
 	must("creating the root", os.MkdirAll(root, 0o755))
 
-	head("real endpoint contracts, installed the way a user installs them")
-	installEndpoint(root)
+	head("the weightless endpoint contract, installed the way a user installs it")
 	installTransportEndpoint(root)
-	release, plans := endpointIdentity(root)
-	transportRelease, transportPlans := endpointIdentityFor(root, transportEndpointRef)
+	release, plans := endpointIdentityFor(root, transportEndpointRef)
+	transportRelease, transportPlans := release, plans
+	// THE HUB'S CONTROL TRUTH: every stand-in hub below authors Tensorhub's exact
+	// acquisition-attempt snapshot from the release this host installed.
+	defaultPodControl = localPodControl(root, rentalEndpointRef)
+	check("the stand-in hub's control closure names the release this host serves",
+		defaultPodControl.release == release && len(defaultPodControl.plans) == len(plans),
+		defaultPodControl.release)
 	port := freePort(2990)
 	svc := startService(root, port, false)
 	defer svc.stop()
@@ -77,18 +101,18 @@ func sectionRent() {
 	defer hub.close()
 	fmt.Printf("  the stand-in hub is at %s · pod filesystem %s\n", hub.url(), hub.pods)
 	fmt.Printf("  this host serves %s · %d entrypoint(s) · plan %s\n",
-		release, len(plans), shortID(planFor(plans, "denoise")))
+		release, len(plans), shortID(planFor(plans, rentalEntrypoint)))
 	fmt.Printf("  transport-only contract %s · plan %s (no H3 inference claim)\n",
 		transportRelease, shortID(planFor(transportPlans, "video_transport")))
 
 	head("the credential arms come FIRST: a rental is a first-party write")
 	code, out := cozyRunEnv(root, []string{"TENSORHUB_URL=" + hub.url()},
-		"rent", rentalEndpointRef, "--accelerator", "NVIDIA H200", "--reason", "cl-015 live")
+		"rent", rentalEndpointRef, "--accelerator", accelerator, "--reason", "cl-015 live")
 	check("no configured token -> 5, answered BEFORE the dial",
 		code == 5 && strings.Contains(out, "no admin token is configured"), firstLine(out))
 	code, out = cozyRunEnv(root,
 		[]string{"TENSORHUB_URL=" + hub.url(), "TENSORHUB_TOKEN=" + randomHex(16)},
-		"rent", rentalEndpointRef, "--accelerator", "NVIDIA H200", "--reason", "cl-015 live")
+		"rent", rentalEndpointRef, "--accelerator", accelerator, "--reason", "cl-015 live")
 	check("a FOREIGN token -> 5 carrying the hub's own typed refusal",
 		code == 5 && strings.Contains(out, "rental.unauthenticated"), firstLine(out))
 
@@ -97,7 +121,7 @@ func sectionRent() {
 		Release: release, LoseFirstRentResponse: true})
 	defer lost.close()
 	operationKey := "cl-019-response-loss"
-	code, out = cozyRunEnv(root, lost.env(), "rent", rentalEndpointRef, "--accelerator", "NVIDIA H200",
+	code, out = cozyRunEnv(root, lost.env(), "rent", rentalEndpointRef, "--accelerator", accelerator,
 		"--idempotency-key", operationKey, "--reason", "cl-019 response-loss arm")
 	check("the first caller sees a transport failure after the hub committed",
 		code == 9 && lost.created() == 1, fmt.Sprintf("exit %d · creates %d", code, lost.created()))
@@ -109,7 +133,7 @@ func sectionRent() {
 	check("the original renter token survived under the pending operation",
 		len(pending) == 1 && len(strings.TrimSpace(string(pendingToken))) == 64,
 		fmt.Sprintf("%d pending token(s)", len(pending)))
-	code, out = cozyRunEnv(root, lost.env(), "rent", rentalEndpointRef, "--accelerator", "NVIDIA H200",
+	code, out = cozyRunEnv(root, lost.env(), "rent", rentalEndpointRef, "--accelerator", accelerator,
 		"--idempotency-key", operationKey, "--reason", "retry prose cannot rewrite the ask")
 	lostRental := field(out, "rental")
 	finalToken, _ := os.ReadFile(filepath.Join(root, "rentals", lostRental+".token"))
@@ -117,7 +141,7 @@ func sectionRent() {
 		code == 0 && strings.HasPrefix(lostRental, "rnt-") && lost.created() == 1 &&
 			bytes.Equal(pendingToken, finalToken),
 		fmt.Sprintf("exit %d · rental %s · creates %d", code, lostRental, lost.created()))
-	code, out = cozyRunEnv(root, lost.env(), "rent", rentalEndpointRef, "--accelerator", "NVIDIA H100",
+	code, out = cozyRunEnv(root, lost.env(), "rent", rentalEndpointRef, "--accelerator", otherAccelerator(),
 		"--idempotency-key", operationKey,
 		"--reason", "changed body")
 	check("the same key with a changed body conflicts before another create",
@@ -126,7 +150,7 @@ func sectionRent() {
 	head("the ask names its hardware and its reason, or it is a usage refusal")
 	code, out = cozyRunEnv(root, hub.env(), "rent", rentalEndpointRef, "--reason", "cl-015 live")
 	check("no --accelerator -> 2", code == 2 && strings.Contains(out, "--accelerator is required"), firstLine(out))
-	code, out = cozyRunEnv(root, hub.env(), "rent", rentalEndpointRef, "--accelerator", "NVIDIA H200")
+	code, out = cozyRunEnv(root, hub.env(), "rent", rentalEndpointRef, "--accelerator", accelerator)
 	check("no --reason -> 2: the hub records why before it spends",
 		code == 2 && strings.Contains(out, "--reason is required"), firstLine(out))
 
@@ -138,7 +162,28 @@ func sectionRent() {
 	check("cozy rent -> 0 with a rental id", strings.HasPrefix(rentalA, "rnt-"), rentalA)
 	check("it reports the rental state, direct address, and requested accelerator",
 		strings.Contains(out, "state:") && strings.Contains(out, "127.0.0.1:") &&
-			field(out, "accelerator") == "NVIDIA H200", field(out, "address")+" "+field(out, "accelerator"))
+			field(out, "accelerator") == accelerator, field(out, "address")+" "+field(out, "accelerator"))
+	code, control, controlOut := cozyJSON(root, "rent", "show", rentalA)
+	selectedRoots, _ := control["model_root_digests"].([]any)
+	selectedPlans, _ := control["binding_plan_digests"].([]any)
+	// A weightless release selects NO model root and one plan per visible entrypoint.
+	check("rent show projects exact selected execution/root/plan identities, never selection inputs",
+		code == 0 && strings.HasPrefix(fmt.Sprint(control["endpoint_execution_digest"]), "sha256:") &&
+			len(selectedRoots) == 0 && len(selectedPlans) == len(plans),
+		fmt.Sprintf("%d root(s) · %d plan(s) · %s", len(selectedRoots), len(selectedPlans), firstLine(controlOut)))
+	code, probe, probeOut := cozyJSON(root, "rent", "probe", rentalA)
+	check("rent probe claims the worker without invoking a model and persists actual GPU identity",
+		code == 0 && probe["state"] == "ready" && probe["accelerator"] == accelerator &&
+			probe["observed_accelerator"] == accelerator &&
+			probe["observed_accelerator_count"] == float64(1) &&
+			probe["observed_backend"] == "cuda" && fmt.Sprint(probe["observed_worker_instance"]) != "" &&
+			fmt.Sprint(probe["observed_worker_boot_id"]) != "", firstLine(probeOut))
+	code, observedControl, controlOut := cozyJSON(root, "rent", "show", rentalA)
+	check("rent show retains the exact worker readback after the probe",
+		code == 0 && observedControl["observed_accelerator"] == probe["observed_accelerator"] &&
+			observedControl["observed_worker_instance"] == probe["observed_worker_instance"] &&
+			observedControl["endpoint_execution_digest"] == control["endpoint_execution_digest"],
+		firstLine(controlOut))
 	fmt.Printf("  bench ask -> ready -> pinned: %d ms\n", rentMS)
 
 	head("the owner token is MINTED HERE, and the hub is never told it (#495e)")
@@ -188,7 +233,7 @@ func sectionRent() {
 
 	head("RED: a run pinned to a rental this host does not hold")
 	_, before, _ := cozyJSON(root, "status")
-	code, out = cozyRun(root, "run", endpointRef+"/v1/denoise", "steps=2", "--worker", "rnt-nope")
+	code, out = cozyRun(root, "run", rentalEndpointRef, tilePayload, "--worker", "rnt-nope")
 	check("cozy run --worker <unknown> -> 4, the server's own envelope",
 		code == 4 && strings.Contains(out, "no rental rnt-nope"), firstLine(out))
 	_, after, _ := cozyJSON(root, "status")
@@ -199,7 +244,7 @@ func sectionRent() {
 	head("THE LEG: attach over TLS, claim with the provisioned token, dispatch to the pod")
 	outDir := filepath.Join(root, "out")
 	t0 = time.Now()
-	code, out = cozyRun(root, "run", endpointRef+"/v1/denoise", "steps=2",
+	code, out = cozyRun(root, "run", rentalEndpointRef, tilePayload,
 		"--out", outDir, "--stream", "--worker", rentalA)
 	legMS := elapsedMS(t0)
 	instanceA := instanceFor(root, rentalA)
@@ -214,35 +259,37 @@ func sectionRent() {
 	check("the attempt was DISPATCHED to that pod's own instance",
 		instanceA != "" && dispatchedInstance(out) == instanceA,
 		dispatchedInstance(out)+" == "+instanceA)
+	slots := rentalWorkers(svc, rentalA)
+	check("probe then run left exactly ONE worker slot for the rental (#probe/run double-slot)",
+		len(slots) == 1 && slots[0] == instanceA, strings.Join(slots, ", "))
 	fmt.Printf("  bench attach + claim + dispatch over TLS: %d ms\n", legMS)
 
 	head("#506a: the BINDING RECORD reached the pod, and the pod re-derived its own id")
-	planID := planFor(plans, "denoise")
+	planID := planFor(plans, rentalEntrypoint)
 	delivered := podPlanRecord(hub, rentalA, planID)
-	check("the record is on the POD's filesystem, under the id the directive names",
+	check("the plan is on the POD's filesystem, under the id the directive names",
 		delivered != nil, filepath.Join(hub.pods, rentalA, "binding-plans",
 			strings.TrimPrefix(planID, "sha256:")+".json"))
 	check("the media server ACCEPTED it only because it hashes to that id — it recomputes",
-		delivered != nil && fmt.Sprint(delivered["entrypoint_binding_plan_id"]) == planID,
+		delivered != nil && fmt.Sprint(delivered["entrypoint"]) == rentalEntrypoint &&
+			digestOfFile(filepath.Join(hub.pods, rentalA, "binding-plans",
+				strings.TrimPrefix(planID, "sha256:")+".json")) == planID,
 		shortID(planID))
-	check("and the record still carries this machine's RESOLUTION paths, outside the identity",
-		delivered != nil && strings.HasPrefix(fmt.Sprint(delivered["project"]), root),
-		fmt.Sprint(delivered["project"]))
 	tampered := map[string]any{}
 	for k, v := range delivered {
 		tampered[k] = v
 	}
-	tampered["variant"] = "not-the-variant-that-was-digested"
+	tampered["entrypoint"] = "not-the-entrypoint-that-was-digested"
 	tamperedBody, _ := json.Marshal(tampered)
 	status, said := mediaCall(root, rentalA, http.MethodPut,
 		"/v1/plans/"+strings.TrimPrefix(planID, "sha256:"), minted, tamperedBody)
-	check("RED: a record whose identity was edited is refused under the id it arrived as",
-		status == 400 && strings.Contains(said, "plan_id_mismatch"),
+	check("RED: a plan whose identity was edited is refused under the id it arrived as",
+		status == 400 && strings.Contains(said, "media.binding_plan_"),
 		itoa(status)+" "+firstLine(said))
 	still := podPlanRecord(hub, rentalA, planID)
-	check("and the pod still holds the ORIGINAL record: a refusal wrote nothing",
-		still != nil && fmt.Sprint(still["variant"]) == fmt.Sprint(delivered["variant"]),
-		fmt.Sprint(still["variant"]))
+	check("and the pod still holds the ORIGINAL plan: a refusal wrote nothing",
+		still != nil && fmt.Sprint(still["entrypoint"]) == rentalEntrypoint,
+		fmt.Sprint(still["entrypoint"]))
 
 	head("THE BYTE PLANE: the payload crossed, and the output came home verified")
 	podFiles := podMediaFiles(hub, rentalA)
@@ -254,7 +301,9 @@ func sectionRent() {
 		lineWith(serviceLog(root), "mirrored "))
 	check("the run succeeded end to end over a real byte boundary",
 		code == 0, firstLine(out)+" [exit "+itoa(code)+"]")
-	local := filepath.Join(outDir, "image.png")
+	// `--out` names outputs by manifest ORDER and MIME (`output-01.png`), never by the
+	// endpoint's field name.
+	local := filepath.Join(outDir, "output-01.png")
 	check("and `--out` wrote a file the client actually holds",
 		bytesAt(local) > 0, local+" "+itoa(bytesAt(local))+" B")
 	attemptSlot := media.Slot(dispatchedRequest(out), 1)
@@ -297,7 +346,7 @@ func sectionRent() {
 	expectedVideo, err := hex.DecodeString(transportMP4)
 	must("decoding the MP4 transport fixture", err)
 	expectedVideoDigest := digestOfBytes(expectedVideo)
-	localVideo := filepath.Join(videoOut, "video.mp4")
+	localVideo := filepath.Join(videoOut, "output-01.mp4")
 	localVideoBytes, _ := os.ReadFile(localVideo)
 	life := svc.call("GET", "/v1/requests/"+videoRequest, nil).json()
 	videoRef := lifecycleOutput(life, "video")
@@ -309,7 +358,7 @@ func sectionRent() {
 	check("the CLI published the exact MP4-shaped bytes at the declared .mp4 path",
 		bytes.Equal(localVideoBytes, expectedVideo) && isMP4(localVideoBytes),
 		localVideo+" "+itoa(len(localVideoBytes))+" B "+shortID(digestOfFile(localVideo)))
-	staging, _ := filepath.Glob(filepath.Join(videoOut, ".video.mp4.staging-*"))
+	staging, _ := filepath.Glob(filepath.Join(root, ".out-video.staging-*"))
 	check("verified bytes were atomically renamed with no client staging residue",
 		len(staging) == 0 && digestOfFile(localVideo) == expectedVideoDigest,
 		fmt.Sprintf("%d staging files · %s", len(staging), shortID(digestOfFile(localVideo))))
@@ -318,18 +367,24 @@ func sectionRent() {
 		lineWith(serviceLog(root), "/video: "))
 
 	videoSlot := media.Slot(videoRequest, 1)
-	acked := waitFor(func() bool {
+	// The run already exited 0, so the ack and the cleanup are in flight between two live
+	// processes: wait while either side is still making progress, not for a clock.
+	podProgress := func() string {
+		return itoa(len(podWorkerLog(videoHub, videoRental))) + "/" +
+			strings.Join(podMediaFiles(videoHub, videoRental), ",") + "/" + itoa(len(serviceLog(root)))
+	}
+	acked := waitProgressing(func() bool {
 		return strings.Contains(podWorkerLog(videoHub, videoRental),
 			"AttemptOutcomeAck for "+videoRequest+"#1")
-	}, 5*time.Second)
-	remoteClean := waitFor(func() bool {
+	}, podProgress)
+	remoteClean := waitProgressing(func() bool {
 		for _, name := range podMediaFiles(videoHub, videoRental) {
 			if strings.Contains(name, videoSlot) {
 				return false
 			}
 		}
 		return true
-	}, 5*time.Second)
+	}, podProgress)
 	check("the fake pod received the exact terminal ack", acked,
 		lineWith(podWorkerLog(videoHub, videoRental), "AttemptOutcomeAck for "+videoRequest))
 	check("only after that ack, the pod's payload, image grant, and output slot were removed",
@@ -393,7 +448,7 @@ func sectionRent() {
 		Release: release, NoMedia: true})
 	defer starved.close()
 	code, out = cozyRunEnv(root, starved.env(), "rent", rentalEndpointRef,
-		"--accelerator", "NVIDIA H200", "--reason", "cl-019 no-media-plane arm")
+		"--accelerator", accelerator, "--reason", "cl-019 no-media-plane arm")
 	check("the rental refuses rather than pinning an unusable pod",
 		code != 0 && (strings.Contains(out, "media") || strings.Contains(out, "byte plane")),
 		firstLine(out)+" [exit "+itoa(code)+"]")
@@ -410,10 +465,10 @@ func sectionRent() {
 
 	head("#505: the RELEASE PIN is verified, not merely carried")
 	lying := newPodHub(podHubSpec{Dir: filepath.Join(root, "hub-badrelease"), Arm: "remote",
-		Release: "cozy/sdxl-unet@not-this-one"})
+		Release: transportEndpointRef + "@not-this-one"})
 	defer lying.close()
 	rentalG, _ := rentOne(root, lying, "cl-019 release-mismatch arm")
-	code, out = cozyRun(root, "run", endpointRef+"/v1/denoise", "steps=2",
+	code, out = cozyRun(root, "run", rentalEndpointRef, tilePayload,
 		"--timeout", "20s", "--worker", rentalG)
 	check("a pod serving a DIFFERENT release is refused, and the client is told which",
 		code != 0 && strings.Contains(out, "not-this-one"),
@@ -424,7 +479,7 @@ func sectionRent() {
 	silent := newPodHub(podHubSpec{Dir: filepath.Join(root, "hub-norelease"), Arm: "remote"})
 	defer silent.close()
 	rentalH, _ := rentOne(root, silent, "cl-019 release-undeclared arm")
-	code, out = cozyRun(root, "run", endpointRef+"/v1/denoise", "steps=2",
+	code, out = cozyRun(root, "run", rentalEndpointRef, tilePayload,
 		"--timeout", "20s", "--worker", rentalH)
 	check("a pod that will not SAY what it serves is refused too — carried is not verified",
 		code != 0 && strings.Contains(serviceLog(root), "release_undeclared"),
@@ -438,7 +493,7 @@ func sectionRent() {
 		Release: release, NoInstance: true})
 	defer nameless.close()
 	rentalI, _ := rentOne(root, nameless, "cl-019 instance-undeclared arm")
-	code, out = cozyRun(root, "run", endpointRef+"/v1/denoise", "steps=2",
+	code, out = cozyRun(root, "run", rentalEndpointRef, tilePayload,
 		"--timeout", "20s", "--worker", rentalI)
 	check("a pod that will not say WHICH worker it is is refused — carried is not verified",
 		code != 0 && strings.Contains(serviceLog(root), "worker_instance_undeclared"),
@@ -450,7 +505,7 @@ func sectionRent() {
 
 	head("EXACT ROUTING: a second attached target advertising the SAME plan")
 	rentalB, _ := rentOne(root, hub, "cl-015 target B")
-	code, out = cozyRun(root, "run", endpointRef+"/v1/denoise", "steps=2",
+	code, out = cozyRun(root, "run", rentalEndpointRef, tilePayload,
 		"--stream", "--worker", rentalB)
 	instanceB := instanceFor(root, rentalB)
 	check("B is its own instance, not A's", instanceB != "" && instanceB != instanceA,
@@ -461,13 +516,17 @@ func sectionRent() {
 	_ = code
 
 	head("an UNPINNED request never consumes rented capacity")
-	code, out = cozyRun(root, "run", endpointRef+"/v1/denoise", "steps=2",
-		"--stream", "--timeout", "6s")
+	// The unpinned request is a weightless CPU tile: the service spawns a REAL local
+	// worker for it with no model and no GPU (the shared box runs no inference), and the
+	// run settles on its own rather than on a client deadline.
+	code, out = cozyRun(root, "run", localTileRef, tilePayload, "--stream")
 	landed := dispatchedInstance(out)
 	check("it was NOT dispatched to either rented pod",
 		landed != instanceA && landed != instanceB,
 		"landed on "+nothingOr(landed)+" (A "+instanceA+", B "+instanceB+")")
-	check("it looked for LOCAL capacity instead", code != 0 || landed != "", firstLine(out))
+	check("it landed on a LOCALLY spawned worker, and settled",
+		code == 0 && landed != "" && !strings.Contains(instanceEndpoint(root, landed), "@rnt-"),
+		instanceEndpoint(root, landed)+" [exit "+itoa(code)+"]")
 	code, out = cozyRun(root, "stop", "--all")
 	check("cozy stop --all clears whatever that started", code == 0, firstLine(out))
 
@@ -475,7 +534,7 @@ func sectionRent() {
 	rentalC, _ := rentOne(root, hub, "cl-015 foreign-token arm")
 	must("planting a foreign owner token", os.WriteFile(
 		filepath.Join(root, "rentals", rentalC+".token"), []byte(randomHex(32)+"\n"), 0o600))
-	code, out = cozyRun(root, "run", endpointRef+"/v1/denoise", "steps=2", "--worker", rentalC)
+	code, out = cozyRun(root, "run", rentalEndpointRef, tilePayload, "--worker", rentalC)
 	check("the run does NOT succeed: the pod refused a claim it did not provision",
 		code != 0, firstLine(out)+" [exit "+itoa(code)+"]")
 	check("the POD's media server refused it first — the byte plane is dialled before the claim",
@@ -491,7 +550,7 @@ func sectionRent() {
 	// re-resolved. That is the point of the split — the token has exactly one reader.
 	rentalE, _ := rentOne(root, hub, "cl-015 widened-token arm")
 	must("widening the token mode", os.Chmod(filepath.Join(root, "rentals", rentalE+".token"), 0o644))
-	code, out = cozyRun(root, "run", endpointRef+"/v1/denoise", "steps=2", "--worker", rentalE)
+	code, out = cozyRun(root, "run", rentalEndpointRef, tilePayload, "--worker", rentalE)
 	check("mode 0644 refuses by name, and nothing was dialled",
 		code != 0 && strings.Contains(out, "0600"), firstLine(out)+" [exit "+itoa(code)+"]")
 	check("the pod was never claimed: no worker for it exists",
@@ -505,7 +564,7 @@ func sectionRent() {
 	defer liar.close()
 	rentalD, _ := rentOne(root, liar, "cl-015 unmirrored-output arm")
 	mirrorDir := filepath.Join(root, "out-mirror")
-	code, out = cozyRun(root, "run", endpointRef+"/v1/denoise", "steps=2",
+	code, out = cozyRun(root, "run", rentalEndpointRef, tilePayload,
 		"--out", mirrorDir, "--timeout", "12s", "--worker", rentalD)
 	check("the pod DID write bytes — on its own filesystem",
 		podWroteOutput(liar, rentalD), filepath.Join(liar.pods, rentalD))
@@ -515,54 +574,29 @@ func sectionRent() {
 		strings.Contains(serviceLog(root), "no output"),
 		lineWith(serviceLog(root), "no output"))
 	check("no output became visible and no file was written",
-		!exists(filepath.Join(mirrorDir, "image.png")), mirrorDir)
+		!exists(filepath.Join(mirrorDir, "output-01.png")) && !exists(mirrorDir), mirrorDir)
 
 	head("#506a: TWO MACHINES, ONE RELEASE, ONE PLAN ID")
-	// The consequence the path-free identity had to have, and the reason every remote lane
-	// was blocked without it. A SECOND independent install of the byte-identical release
-	// archive, on its own root, against its own spelling of the store — the shape of a pod
-	// that installed what this host installed. Different directories everywhere, and the
-	// plan the orchestrator names on the wire has to be the same plan.
+	// A SECOND independent install of the byte-identical release archive on its own root:
+	// the shape of a pod that installed what this host installed. The plan the
+	// orchestrator names on the wire has to be the same plan.
 	rootB := filepath.Join(root, "machine-b")
 	must("creating the second root", os.MkdirAll(rootB, 0o755))
-	benchB := filepath.Join(root, "bench-as-the-pod-sees-it")
-	must("giving the second machine its own path to the same store",
-		os.Symlink(flag("bench", "/home/fidika/cozy_v2/tensorfs-bench"), benchB))
-	installEndpointFrom(rootB, benchB)
-	releaseB, plansB, recordsB := endpointFacts(rootB)
-	_, plansA, recordsA := endpointFacts(root)
-	a, b := recordFor(recordsA, "denoise"), recordFor(recordsB, "denoise")
-	check("the two installs are on different roots and are two different generations",
-		fmt.Sprint(a["project"]) != fmt.Sprint(b["project"]),
-		fmt.Sprint(a["project"])+" vs "+fmt.Sprint(b["project"]))
-	check("their records name different machine-local resolution roots",
-		fmt.Sprint(a["project"]) != fmt.Sprint(b["project"]),
-		fmt.Sprint(b["project"]))
-	check("every one of those is RESOLUTION, declared in internal/plan and never digested",
-		strings.Join(plan.ResolutionKeys, ",") == "project,store,config",
-		strings.Join(plan.ResolutionKeys, ", "))
+	installTransportEndpoint(rootB)
+	releaseB, plansB := endpointIdentityFor(rootB, transportEndpointRef)
 	check("they serve the SAME endpoint release", releaseB == release, releaseB)
 	check("and they compute the SAME entrypoint_binding_plan_id — #506a's whole point",
-		planFor(plansA, "denoise") != "" && planFor(plansA, "denoise") == planFor(plansB, "denoise"),
-		shortID(planFor(plansA, "denoise"))+" == "+shortID(planFor(plansB, "denoise")))
+		planFor(plans, rentalEntrypoint) != "" &&
+			planFor(plans, rentalEntrypoint) == planFor(plansB, rentalEntrypoint),
+		shortID(planFor(plans, rentalEntrypoint))+" == "+shortID(planFor(plansB, rentalEntrypoint)))
 	same := 0
-	for name, id := range plansA {
+	for name, id := range plans {
 		if plansB[name] == id {
 			same++
 		}
 	}
 	check("for EVERY entrypoint the release declares, not just the one under test",
-		same == len(plansA) && same > 0, itoa(same)+"/"+itoa(len(plansA))+" plan ids equal")
-	// The law, not the convention: a path smuggled back into the identity refuses at the
-	// moment the id is minted, on the machine that minted it.
-	smuggled := map[string]any{}
-	for k, v := range a {
-		smuggled[k] = v
-	}
-	smuggled["variant"] = filepath.Join(root, "somewhere")
-	_, planErr := plan.ID(smuggled)
-	check("RED: a rooted path anywhere in the identity refuses when the id is minted",
-		planErr != nil && planErr.ErrName() == "plan_identity_path", messageOf(planErr))
+		same == len(plans) && same > 0, itoa(same)+"/"+itoa(len(plans))+" plan ids equal")
 
 	head("cozy rent release — plan first, then the pod is gone")
 	code, out = cozyRunEnv(root, hub.env(), "rent", "release", rentalC)
@@ -572,20 +606,25 @@ func sectionRent() {
 	code, out = cozyRunEnv(root, hub.env(), "rent", "release", rentalC, "--yes")
 	check("with --yes it exits 0 and the hub SAW the delete",
 		code == 0 && hub.released(rentalC), firstLine(out))
+	check("and the hub reports the rental ABSENT afterwards: the post-DELETE poll terminates",
+		hub.status(rentalC) == 404, itoa(hub.status(rentalC)))
 	_, err = os.Stat(filepath.Join(root, "rentals", rentalC+".token"))
 	check("the owner token is gone from this host", os.IsNotExist(err), "")
-	code, out = cozyRun(root, "run", endpointRef+"/v1/denoise", "steps=2", "--worker", rentalC)
+	code, out = cozyRunEnv(root, hub.env(), "rent", "release", rentalC, "--yes")
+	check("release is IDEMPOTENT: a second --yes for the same id exits 0",
+		code == 0, firstLine(out)+" [exit "+itoa(code)+"]")
+	code, out = cozyRun(root, "run", rentalEndpointRef, tilePayload, "--worker", rentalC)
 	check("a run pinned to the released rental is 4 again", code == 4, firstLine(out))
 
 	head("RED: releasing something this host does not hold")
 	code, out = cozyRunEnv(root, hub.env(), "rent", "release", "rnt-nope", "--yes")
-	check("cozy rent release <unknown> -> 4, before any dial",
-		code == 4 && strings.Contains(out, "no rental rnt-nope"), firstLine(out))
+	check("cozy rent release <unknown> is idempotent: the hub reports it absent -> 0",
+		code == 0 && strings.Contains(out, "already released"), firstLine(out))
 
 	head("RED: a hub whose pods never come up")
 	broken := startPodHub(filepath.Join(root, "hub-broken"), "remote", true)
 	defer broken.close()
-	code, out = cozyRunEnv(root, broken.env(), "rent", rentalEndpointRef, "--accelerator", "NVIDIA H200",
+	code, out = cozyRunEnv(root, broken.env(), "rent", rentalEndpointRef, "--accelerator", accelerator,
 		"--reason", "cl-015 failed-provision arm")
 	check("a rental that fails to provision -> 11, carrying the hub's own detail",
 		code == 11 && strings.Contains(out, "no eligible capacity"), firstLine(out))
@@ -615,6 +654,43 @@ func sectionRent() {
 		fmt.Sprintf("%d pending token(s)", len(pending)))
 }
 
+// rentalWorkers is every live worker slot the service holds for one rental, from
+// `GET /v1/local/workers`. Probe followed by run must leave exactly one.
+func rentalWorkers(svc *liveService, rentalID string) []string {
+	doc := svc.call("GET", "/v1/local/workers", nil).json()
+	rows, _ := doc["workers"].([]any)
+	out := []string{}
+	for _, raw := range rows {
+		row, _ := raw.(map[string]any)
+		if exited, _ := row["exited"].(bool); exited {
+			continue
+		}
+		if strings.HasSuffix(fmt.Sprint(row["endpoint"]), "@"+rentalID) {
+			out = append(out, fmt.Sprint(row["instance_id"]))
+		}
+	}
+	sort.Strings(out)
+	return out
+}
+
+// waitProgressing waits for cond while `progress` keeps changing: it gives up only when
+// the peers have stopped moving for a settle window, never on a flat deadline.
+func waitProgressing(cond func() bool, progress func() string) bool {
+	const settle = 2 * time.Second
+	last, since := progress(), time.Now()
+	for {
+		if cond() {
+			return true
+		}
+		if now := progress(); now != last {
+			last, since = now, time.Now()
+		} else if time.Since(since) > settle {
+			return false
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+}
+
 // rentOne rents a pod and returns its id with the whole rendering, so an arm can search
 // what was printed as well as act on the id.
 func rentOne(root string, h *podHub, reason string) (string, string) {
@@ -622,7 +698,7 @@ func rentOne(root string, h *podHub, reason string) (string, string) {
 }
 
 func rentEndpoint(root string, h *podHub, endpoint, reason string) (string, string) {
-	code, out := cozyRunEnv(root, h.env(), "rent", endpoint, "--accelerator", "NVIDIA H200", "--reason", reason)
+	code, out := cozyRunEnv(root, h.env(), "rent", endpoint, "--accelerator", accelerator, "--reason", reason)
 	if code != 0 {
 		fmt.Println(indent(out))
 		return "", out
@@ -757,17 +833,9 @@ func modeOf(info os.FileInfo) string {
 // process has exactly one COZY_HOME — which is also true of a real machine. Two roots
 // therefore means two processes, and the cross-machine plan-id arm is comparing what two
 // independent runs of the product's own resolver said, not what one run said twice.
-func endpointIdentity(root string) (string, map[string]string) {
-	return endpointIdentityFor(root, endpointRef)
-}
-
 func endpointIdentityFor(root, endpoint string) (string, map[string]string) {
 	release, ids, _ := endpointFactsFor(root, endpoint)
 	return release, ids
-}
-
-func endpointFacts(root string) (string, map[string]string, map[string]map[string]any) {
-	return endpointFactsFor(root, endpointRef)
 }
 
 func endpointFactsFor(root, endpoint string) (string, map[string]string, map[string]map[string]any) {
@@ -797,7 +865,7 @@ func sectionPlanIDs() {
 	st, e := records.Open(l.DB)
 	must("records", errOf(e))
 	defer st.Close()
-	spec, e := app.NewResolver(st, cfg).Resolve(flag("endpoint", endpointRef))
+	spec, e := app.NewResolver(st, cfg).Resolve(flag("endpoint", transportEndpointRef))
 	must("resolving the endpoint", errOf(e))
 	doc := map[string]any{"release": spec.Placement.ReleaseID}
 	plans, recs := map[string]string{}, map[string]map[string]any{}
@@ -967,16 +1035,7 @@ func lineWith(log, phrase string) string {
 	return "(no line said " + phrase + ")"
 }
 
-// messageOf renders a refusal for an arm's detail line, and says so loudly when there was
-// none: an arm that prints nothing for a gate that did not fire reads as a pass.
-func messageOf(e *exit.Error) string {
-	if e == nil {
-		return "NOT REFUSED — the gate is open, which would be the law failing"
-	}
-	return e.ErrName() + ": " + firstLine(e.Message)
-}
-
-// planFor and recordFor look one entrypoint up by the FUNCTION name a user types. The
+// planFor looks one entrypoint up by the FUNCTION name a user types. The
 // binding's own key is the descriptor's entrypoint name, and the release under test
 // registers several — matching on the suffix keeps the arms readable without the driver
 // re-deriving the descriptor's naming rule.
@@ -987,15 +1046,6 @@ func planFor(plans map[string]string, function string) string {
 		}
 	}
 	return ""
-}
-
-func recordFor(records map[string]map[string]any, function string) map[string]any {
-	for name, record := range records {
-		if name == function || strings.HasSuffix(name, "/"+function) {
-			return record
-		}
-	}
-	return nil
 }
 
 // alivePID answers whether a pid is still a live process — the kernel's own answer, which

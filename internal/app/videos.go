@@ -68,11 +68,11 @@ func handleVideoSubmit(ctx *Context) *exit.Error {
 			FieldPath: asset.FieldPath, Digest: asset.Digest, Length: asset.Length,
 			MediaType: asset.MediaType, Order: asset.Order})
 	}
-	worker := strings.TrimSpace(ctx.Inv.Value("--worker"))
+	rentalID := strings.TrimSpace(ctx.Inv.Value("--rental"))
 	var targets []api.WorkflowTargetResolution
-	if worker != "" {
+	if rentalID != "" {
 		for step := 1; step <= composition.ShotCount; step++ {
-			targets = append(targets, api.WorkflowTargetResolution{Step: step, Worker: worker})
+			targets = append(targets, api.WorkflowTargetResolution{Step: step, Worker: rentalID})
 		}
 	}
 	client, problem := dial(ctx)
@@ -97,13 +97,13 @@ func handleVideoSubmit(ctx *Context) *exit.Error {
 }
 
 func composeVideo(ctx *Context, allowDigest bool) (video.Composition, *exit.Error) {
-	h3, assembler := strings.TrimSpace(ctx.Inv.Value("--h3")), strings.TrimSpace(ctx.Inv.Value("--assembler"))
-	if h3 == "" || assembler == "" {
-		return video.Composition{}, exit.Usagef("video composition requires --h3 and --assembler endpoint refs")
+	h3, rentalID := strings.TrimSpace(ctx.Inv.Value("--h3")), strings.TrimSpace(ctx.Inv.Value("--rental"))
+	if (h3 == "") == (rentalID == "") {
+		return video.Composition{}, exit.Usagef(
+			"video composition requires exactly one --rental for remote H3 or --h3 for local H3")
 	}
 	input := ctx.Inv.Args[0]
-	request := api.VideoComposeRequest{H3Endpoint: h3, AssemblyEndpoint: assembler,
-		Worker: strings.TrimSpace(ctx.Inv.Value("--worker"))}
+	request := api.VideoComposeRequest{H3Endpoint: h3, RentalID: rentalID}
 	if allowDigest && strings.HasPrefix(input, "sha256:") {
 		request.CreativePlanDigest = input
 	} else {
@@ -185,10 +185,11 @@ func writeComposition(path string, composition video.Composition) *exit.Error {
 }
 
 func videoResolutionFlags(ctx *Context) string {
-	flags := " --h3 " + ctx.Inv.Value("--h3") + " --assembler " + ctx.Inv.Value("--assembler") +
-		" --idempotency-key <key>"
-	if worker := ctx.Inv.Value("--worker"); worker != "" {
-		flags += " --worker " + worker
+	flags := " --idempotency-key <key>"
+	if rentalID := ctx.Inv.Value("--rental"); rentalID != "" {
+		flags += " --rental " + rentalID
+	} else {
+		flags += " --h3 " + ctx.Inv.Value("--h3")
 	}
 	return flags
 }

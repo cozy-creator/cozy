@@ -83,3 +83,62 @@ func sectionStall() {
 	rows, _ := lv.store.LiveWorkers()
 	check("every device grant is released", len(rows) == 0, fmt.Sprintf("%d live row(s)", len(rows)))
 }
+
+// sectionStallActive is the long-form correction: serial workflows ordinarily have no
+// queued successor while one child runs, and a recovery activity note contains the word
+// WEDGED while retracting it. Both cases drive the real orchestrator over raw protocol.
+func sectionStallActive() {
+	lv := hostCoordinator("stall-active", true)
+	defer lv.close()
+	stallSub := func(name, planID string) orchestratorSubmission {
+		return orchestratorSubmission{IdemKey: "idem-stall-active-" + name,
+			Endpoint: "fake/" + name, Entrypoint: "fake", PlanID: planID,
+			Payload: payload(map[string]any{"arm": name})}
+	}
+
+	head("a nonterminal degraded fault and retracted WEDGED verdict do not retire a worker")
+	retracted := fakeSpec("retracted", "0", "--arm", "retracted")
+	planRetracted := planIDOf(retracted, "fake")
+	reqRetracted, _, e := lv.c.Submit(stallSub("retracted", planRetracted))
+	check("the request queues for the recovering worker", e == nil, briefly(e))
+	instanceRetracted, _, e := lv.c.EnsureWorker(retracted)
+	check("the recovery worker is up", e == nil, briefly(e))
+	result, e := lv.c.AwaitSettled(reqRetracted, 2*time.Minute)
+	check("the degraded worker serves after retracting its wedge", e == nil && result != nil &&
+		result.Status == "SUCCEEDED", briefly(e))
+	check("the retraction text did not retire the worker",
+		countEvents(lv, "worker "+instanceRetracted+" is") == 0, instanceRetracted)
+
+	head("an active wedged child retires independently of an unrelated queue head")
+	active := fakeSpec("activewedged", "1", "--arm", "activewedged")
+	planActive := planIDOf(active, "fake")
+	instanceActive, _, e := lv.c.EnsureWorker(active)
+	check("the active-wedge worker is dispatchable before submission", e == nil, briefly(e))
+	reqActive, _, e := lv.c.Submit(stallSub("activewedged", planActive))
+	check("the only request was submitted", e == nil, briefly(e))
+	_, accepted := waitEvent(lv, "AttemptAccepted "+reqActive+"#", 30*time.Second)
+	check("the only request became active with no queued successor",
+		accepted && lv.c.QueuePosition(reqActive) == 0, reqActive)
+	unrelated := fakeSpec("unrelated", "2", "--arm", "idle")
+	planUnrelated := planIDOf(unrelated, "fake")
+	reqUnrelated, _, e := lv.c.Submit(stallSub("unrelated", planUnrelated))
+	check("an unrelated plan is now the queue head",
+		e == nil && lv.c.QueuePosition(reqUnrelated) == 1, briefly(e))
+	line, ok := waitEvent(lv, "while "+reqActive+" depends on it; retiring it", 2*time.Minute)
+	check("the unrelated queue head cannot mask the active attempt's measured no-progress", ok &&
+		strings.Contains(line, instanceActive), trimLog(line))
+	line, ok = waitEvent(lv, "worker "+instanceActive+" stopped", time.Minute)
+	check("the active wedged worker is stopped for journal recovery", ok, trimLog(line))
+	line, ok = waitEvent(lv, "died owing 1 terminal(s); restarting the slot", time.Minute)
+	check("the open attempt starts exact-slot journal recovery", ok, trimLog(line))
+	result, e = lv.c.AwaitSettled(reqActive, 2*time.Minute)
+	check("the recovered journal replays, requeues, and the replacement settles the request",
+		e == nil && result != nil && result.Status == "SUCCEEDED", briefly(e))
+	check("recovery produced a new ordinal rather than re-executing the abandoned one",
+		countEvents(lv, "AttemptAccepted "+reqActive+"#") == 2,
+		fmt.Sprintf("%d accepted ordinal(s)", countEvents(lv, "AttemptAccepted "+reqActive+"#")))
+	must("canceling the unrelated queued request", errOf(lv.c.CancelQueued(reqUnrelated)))
+
+	head("teardown")
+	lv.c.Close(10 * time.Second)
+}

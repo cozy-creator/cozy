@@ -2,10 +2,13 @@ package app
 
 import (
 	"bytes"
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
+	"os/signal"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/cozy-creator/cozy-creator-v2/internal/exit"
@@ -141,11 +144,6 @@ func handleRent(ctx *Context) *exit.Error {
 	if e != nil {
 		return e
 	}
-	if len(op.RequestBody) == 0 {
-		return exit.Named(exit.Conflict, "rental.legacy_operation_unreplayable",
-			"rental operation %s predates exact request-byte persistence", operationKey).
-			WithRemedy("release or settle it with the prior Creator build; never guess paid request bytes")
-	}
 	if op.RequestDigest != digest || op.Hub != c.Base() || !bytes.Equal(op.RequestBody, requestBody) {
 		return exit.Named(exit.Conflict, "rental.idempotency_conflict",
 			"rental operation %s already names a different hub or request body", operationKey).
@@ -158,7 +156,7 @@ func handleRent(ctx *Context) *exit.Error {
 	// with different prose, but it must not rewrite why the original purchase was made.
 	reason = op.Reason
 
-	hctx, cancel := hub.Context()
+	hctx, cancel := hub.LongContext()
 	r, e := c.Rent(hctx, op.RequestBody, reason, operationKey)
 	cancel()
 	if e != nil {
@@ -252,18 +250,35 @@ func rentalRequestDigest(hubAuthority string, requestBody []byte) string {
 	return "sha256:" + hex.EncodeToString(h.Sum(nil))
 }
 
+// transient answers whether a hub failure says nothing about the rental: the hub was
+// unreachable, stalled, or answered 5xx. A typed 4xx is the hub's verdict and is not.
+func transient(e *exit.Error) bool {
+	return e.Code == exit.Unavailable || e.Code == exit.Deadline
+}
+
 // waitProvisioned polls one rental to a settled state. Every wait here is bounded by something
-// OBSERVED: the hub's own verdict, the hub failing to answer at all (each call carries
-// hub.Timeout), or the caller's --timeout. A rental that is still acquiring or
-// materializing is none of those, however long the provider takes.
+// OBSERVED: the hub's own verdict, a typed refusal, or the caller's --timeout. A rental
+// that is still acquiring or materializing is none of those, however long the provider
+// takes, and a hub that is momentarily unreachable is asked again at the same cadence.
 func waitProvisioned(ctx *Context, c *hub.Client, id string, deadline time.Time, observe func(hub.Rental) *exit.Error) (hub.Rental, *exit.Error) {
 	said := ""
 	for {
-		hctx, cancel := hub.Context()
+		hctx, cancel := hub.LongContext()
 		r, e := c.Rental(hctx, id)
 		cancel()
-		if e != nil {
+		if e != nil && !transient(e) {
 			return hub.Rental{}, e
+		}
+		if e != nil {
+			if e.Message != said {
+				said = e.Message
+				fmt.Fprintf(ctx.Err, "  hub: %s; retrying\n", e.Message)
+			}
+			if timedOut := pastDeadline(id, "unreachable", deadline); timedOut != nil {
+				return hub.Rental{}, timedOut
+			}
+			time.Sleep(pollCadence)
+			continue
 		}
 		if e := observe(r); e != nil {
 			return hub.Rental{}, e
@@ -297,14 +312,21 @@ func waitProvisioned(ctx *Context, c *hub.Client, id string, deadline time.Time,
 			said = r.Detail
 			fmt.Fprintf(ctx.Err, "  %s: %s\n", r.State, r.Detail)
 		}
-		if !deadline.IsZero() && time.Now().After(deadline) {
-			return hub.Rental{}, exit.New(exit.Deadline,
-				"rental %s was still %s at the --timeout you set", id, r.State).
-				WithRemedy("the pod is NOT released; `cozy rent ls` still names it and release destroys it").
-				WithNext("cozy rent ls", "cozy rent release "+id+" --yes")
+		if timedOut := pastDeadline(id, r.State, deadline); timedOut != nil {
+			return hub.Rental{}, timedOut
 		}
 		time.Sleep(pollCadence)
 	}
+}
+
+func pastDeadline(id, state string, deadline time.Time) *exit.Error {
+	if deadline.IsZero() || !time.Now().After(deadline) {
+		return nil
+	}
+	return exit.New(exit.Deadline,
+		"rental %s was still %s at the --timeout you set", id, state).
+		WithRemedy("the pod is NOT released; `cozy rent ls` still names it and release destroys it").
+		WithNext("cozy rent ls", "cozy rent release "+id+" --yes")
 }
 
 func detailOr(detail string) string {
@@ -340,7 +362,6 @@ func captureRentalControl(row *records.Rental, seen hub.Rental) {
 		return
 	}
 	row.ControlSnapshotDigest = seen.ControlSnapshot.Digest
-	row.ControlSnapshotLength = seen.ControlSnapshot.Length
 	row.ControlSnapshotBytes = append([]byte(nil), seen.ControlSnapshot.CanonicalBytes...)
 }
 
@@ -387,6 +408,77 @@ func handleRentLs(ctx *Context) *exit.Error {
 	return emit(ctx, list)
 }
 
+func handleRentShow(ctx *Context) *exit.Error {
+	_, st, e := rentalStores(ctx)
+	if e != nil {
+		return e
+	}
+	defer st.Close()
+	row, control, e := rental.Inspect(st, strings.TrimSpace(ctx.Inv.Args[0]))
+	if e != nil {
+		return e
+	}
+	return emit(ctx, render.Record{Kind: "rental_control", Fields: []render.Field{
+		{K: "rental", V: row.ID}, {K: "state", V: row.State},
+		{K: "endpoint", V: row.EndpointRef}, {K: "accelerator", V: row.AcceleratorModel},
+		{K: "observed_accelerator", V: row.ObservedAccelerator},
+		{K: "observed_accelerator_count", V: row.ObservedAcceleratorCount},
+		{K: "observed_backend", V: row.ObservedBackend},
+		{K: "observed_worker_instance", V: row.ObservedWorkerInstance},
+		{K: "observed_worker_boot_id", V: row.ObservedWorkerBootID},
+		{K: "observed_at", V: row.ObservedAt},
+		{K: "control_snapshot_digest", V: control.ControlSnapshotDigest},
+		{K: "endpoint_execution_digest", V: control.EndpointExecutionDigest},
+		{K: "endpoint_release_id", V: control.EndpointReleaseID},
+		{K: "artifact_object_set_digest", V: control.ArtifactObjectSetDigest},
+		{K: "model_root_digests", V: control.ModelRootDigests},
+		{K: "descriptor_digest", V: control.DescriptorDigest},
+		{K: "environment_spec_digest", V: control.EnvironmentSpecDigest},
+		{K: "installed_environment_receipt_digest", V: control.InstalledEnvironmentReceiptDigest},
+		{K: "placement_set_digest", V: control.PlacementSetDigest},
+		{K: "binding_plan_digests", V: control.BindingPlanDigests},
+	}, Notes: []string{
+		"observed exact control selected by Tensorhub; none of these fields is a placement input",
+	}})
+}
+
+func handleRentProbe(ctx *Context) *exit.Error {
+	id := strings.TrimSpace(ctx.Inv.Args[0])
+	client, e := dial(ctx)
+	if e != nil {
+		return e
+	}
+	started, e := client.EnsureRental(id)
+	if e != nil {
+		return e
+	}
+	if _, e := waitReady(client, started.InstanceID); e != nil {
+		return e
+	}
+	_, st, e := rentalStores(ctx)
+	if e != nil {
+		return e
+	}
+	defer st.Close()
+	row, control, e := rental.Inspect(st, id)
+	if e != nil {
+		return e
+	}
+	return emit(ctx, render.Record{Kind: "rental_probe", Fields: []render.Field{
+		{K: "rental", V: id}, {K: "state", V: row.State},
+		{K: "endpoint", V: row.EndpointRef}, {K: "accelerator", V: row.AcceleratorModel},
+		{K: "observed_accelerator", V: row.ObservedAccelerator},
+		{K: "observed_accelerator_count", V: row.ObservedAcceleratorCount},
+		{K: "observed_backend", V: row.ObservedBackend},
+		{K: "observed_worker_instance", V: row.ObservedWorkerInstance},
+		{K: "observed_worker_boot_id", V: row.ObservedWorkerBootID},
+		{K: "endpoint_execution_digest", V: control.EndpointExecutionDigest},
+	}, Notes: []string{"no model was invoked; this is the worker ClaimAck readback"}})
+}
+
+// handleRentRelease is idempotent and ends only on provider ABSENCE: the hub reporting the
+// rental gone (404) or `released`. Nothing local is forgotten before that, because the row
+// is the only name this host has for a pod that may still be billing.
 func handleRentRelease(ctx *Context) *exit.Error {
 	id := strings.TrimSpace(ctx.Inv.Args[0])
 	l, st, e := rentalStores(ctx)
@@ -398,48 +490,165 @@ func handleRentRelease(ctx *Context) *exit.Error {
 	if e != nil {
 		return e
 	}
-	if row == nil {
-		return exit.New(exit.NotFound, "no rental %s on this host", id).
-			WithRemedy("`cozy rent ls` names the pods this host holds").
-			WithNext("cozy rent ls")
+	c := client(ctx)
+	if row != nil && row.Hub != c.Base() {
+		return exit.Named(exit.Conflict, "rental.hub_mismatch",
+			"rental %s was rented from %s, not the configured hub %s", id, row.Hub, c.Base()).
+			WithRemedy("point TENSORHUB_URL at the hub that holds the pod; a 404 from another hub says nothing about it")
 	}
-	// PLAN FIRST: what release costs is stated before it happens, because the pod and
-	// everything resident on it are gone afterwards and there is no undo and no prompt.
-	if !ctx.Inv.Bool("--yes") {
-		return emit(ctx, render.Record{Kind: "release-plan", Fields: []render.Field{
-			{K: "rental", V: row.ID}, {K: "state", V: row.State},
-			{K: "address", V: row.Address}, {K: "media", V: row.MediaAddress},
-			{K: "hub", V: row.Hub},
+	rctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer stop()
+	confirmed := ctx.Inv.Bool("--yes")
+	w := releaseWatch{ctx: ctx, c: c, id: id, rctx: rctx, once: !confirmed}
+
+	seen, gone, e := w.observe()
+	if e != nil {
+		return e
+	}
+	if gone && confirmed {
+		return w.finish(l, st, "", row != nil, "the hub already reported this rental gone")
+	}
+	if !confirmed {
+		state := seen.State
+		if gone {
+			state = "absent on the hub"
+		}
+		plan := render.Record{Kind: "release-plan", Fields: []render.Field{
+			{K: "rental", V: id}, {K: "state", V: state}, {K: "hub", V: c.Base()},
 		}, Notes: []string{
 			"the hub DESTROYS the pod: anything resident on it is lost and any run pinned to it stops being placeable",
 			"the pinned certificate and the owner token are removed from this host with the row",
 			"this printed the plan and changed nothing — re-run with --yes",
-		}, Next: []string{"cozy rent release " + id + " --yes"}})
+		}, Next: []string{"cozy rent release " + id + " --yes"}}
+		if row != nil {
+			plan.Fields = append(plan.Fields, render.Field{K: "address", V: row.Address},
+				render.Field{K: "media", V: row.MediaAddress})
+		}
+		return emit(ctx, plan)
 	}
 
-	c := client(ctx)
 	operationKey, e := st.RequestRentalRelease(id)
 	if e != nil {
 		return e
 	}
-	hctx, cancel := hub.Context()
-	e = c.Release(hctx, id, "cozy rent release")
-	cancel()
-	if e != nil {
-		// THE LOCAL HALF STAYS. A pod this host could not reach is a pod that may still be
-		// running and still billing; forgetting the row here would leave it with no name
-		// anybody could release it by.
-		return e.WithRemedy("the local record is KEPT: the pod may still be running, and this row is its name here").
-			WithNext("cozy rent ls", "cozy rent release "+id+" --yes")
+	// A rental the hub already shows leaving needs no second DELETE; the poll settles it.
+	if seen.State != hub.RentalReleaseRequested {
+		if e := w.request(); e != nil {
+			return e
+		}
 	}
-	forgotten, e := rental.Forget(l, st, id)
-	if e != nil {
-		return e
+	for {
+		_, gone, e := w.observe()
+		if e != nil {
+			return e
+		}
+		if gone {
+			return w.finish(l, st, operationKey, row != nil, "the hub destroyed the pod")
+		}
+		select {
+		case <-rctx.Done():
+			return w.interrupted()
+		case <-time.After(pollCadence):
+		}
 	}
-	rental.ForgetPending(l, operationKey)
-	return emit(ctx, render.Record{Kind: "release", Fields: []render.Field{
-		{K: "rental", V: id}, {K: "released", V: forgotten},
-	}, Notes: []string{
-		"the hub destroyed the pod; its owner token and pinned certificate are gone from this host"},
-		Next: []string{"cozy rent ls"}})
+}
+
+type releaseWatch struct {
+	ctx  *Context
+	c    *hub.Client
+	id   string
+	rctx context.Context
+	said string
+	once bool // a plan print asks the hub once, bounded; it never waits out a fault
+}
+
+// observe reads the rental until the hub gives a verdict. Transport faults are retried at
+// cadence: they say nothing about the pod, and a release that gave up on them would leave
+// the local half of a billing pod deleted or orphaned on a guess.
+func (w *releaseWatch) observe() (hub.Rental, bool, *exit.Error) {
+	for {
+		rctx := w.rctx
+		if w.once {
+			var cancel context.CancelFunc
+			rctx, cancel = hub.Context()
+			defer cancel()
+		}
+		r, e := w.c.Rental(rctx, w.id)
+		switch {
+		case e == nil && r.State == hub.RentalReleased:
+			return r, true, nil
+		case e == nil:
+			w.say(r.State, r.Detail)
+			return r, false, nil
+		case e.Code == exit.NotFound:
+			return hub.Rental{}, true, nil
+		case !transient(e), w.once:
+			return hub.Rental{}, false, w.kept(e)
+		}
+		w.say("hub", e.Message+"; retrying")
+		select {
+		case <-w.rctx.Done():
+			return hub.Rental{}, false, w.interrupted()
+		case <-time.After(pollCadence):
+		}
+	}
+}
+
+// request sends the DELETE. A 404 is absence; any other typed refusal ends the release.
+func (w *releaseWatch) request() *exit.Error {
+	for {
+		e := w.c.Release(w.rctx, w.id, "cozy rent release")
+		switch {
+		case e == nil, e.Code == exit.NotFound:
+			return nil
+		case !transient(e):
+			return w.kept(e)
+		}
+		w.say("hub", e.Message+"; retrying")
+		select {
+		case <-w.rctx.Done():
+			return w.interrupted()
+		case <-time.After(pollCadence):
+		}
+	}
+}
+
+func (w *releaseWatch) say(state, detail string) {
+	line := state + ": " + detail
+	if detail == "" || line == w.said {
+		return
+	}
+	w.said = line
+	fmt.Fprintf(w.ctx.Err, "  %s\n", line)
+}
+
+func (w *releaseWatch) kept(e *exit.Error) *exit.Error {
+	return e.WithRemedy("the local record is KEPT: the pod may still be running, and this row is its name here").
+		WithNext("cozy rent ls", "cozy rent release "+w.id+" --yes")
+}
+
+func (w *releaseWatch) interrupted() *exit.Error {
+	return exit.New(exit.Canceled, "release of rental %s was interrupted before the hub reported it gone", w.id).
+		WithRemedy("the local record is KEPT and the hub may still be tearing the pod down; re-run release to resume watching").
+		WithNext("cozy rent release " + w.id + " --yes")
+}
+
+func (w *releaseWatch) finish(l home.Layout, st *records.Store, operationKey string, had bool, note string) *exit.Error {
+	forgotten := false
+	if had {
+		var e *exit.Error
+		if forgotten, e = rental.Forget(l, st, w.id); e != nil {
+			return e
+		}
+	}
+	if operationKey != "" {
+		rental.ForgetPending(l, operationKey)
+	}
+	notes := []string{note + "; its owner token and pinned certificate are gone from this host"}
+	if !had {
+		notes = []string{note + "; this host held no record of it — already released"}
+	}
+	return emit(w.ctx, render.Record{Kind: "release", Fields: []render.Field{
+		{K: "rental", V: w.id}, {K: "released", V: forgotten},
+	}, Notes: notes, Next: []string{"cozy rent ls"}})
 }

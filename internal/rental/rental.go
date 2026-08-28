@@ -14,6 +14,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"sort"
 
 	"github.com/cozy-creator/cozy-creator-v2/internal/exit"
 	"github.com/cozy-creator/cozy-creator-v2/internal/home"
@@ -218,6 +219,68 @@ func Descriptor(st *records.Store, id string) (*launch.Descriptor, *exit.Error) 
 	return facts.Descriptor, nil
 }
 
+// ControlSummary is the exact, non-secret execution closure Tensorhub selected for one
+// attached rental. It is an observation surface for acceptance and diagnosis, never an
+// input to selection: callers still ask only for endpoint + provider-neutral accelerator.
+type ControlSummary struct {
+	ControlSnapshotDigest             string   `json:"control_snapshot_digest"`
+	EndpointExecutionDigest           string   `json:"endpoint_execution_digest"`
+	ArtifactObjectSetDigest           string   `json:"artifact_object_set_digest"`
+	ModelRootDigests                  []string `json:"model_root_digests"`
+	EndpointReleaseID                 string   `json:"endpoint_release_id"`
+	DescriptorDigest                  string   `json:"descriptor_digest"`
+	EnvironmentSpecDigest             string   `json:"environment_spec_digest"`
+	InstalledEnvironmentReceiptDigest string   `json:"installed_environment_receipt_digest"`
+	PlacementSetDigest                string   `json:"placement_set_digest"`
+	BindingPlanDigests                []string `json:"binding_plan_digests"`
+}
+
+// Inspect returns the persisted rental row plus the verified projection of its exact
+// acquisition-attempt control snapshot. No provider resource id, lane selector, or secret
+// is exposed or reconstructed.
+func Inspect(st *records.Store, id string) (*records.Rental, ControlSummary, *exit.Error) {
+	row, e := st.RentalRow(id)
+	if e != nil || row == nil {
+		if e == nil {
+			e = unknown(id)
+		}
+		return row, ControlSummary{}, e
+	}
+	summary, e := Summarize(*row)
+	return row, summary, e
+}
+
+// Summarize verifies and projects one retained exact control snapshot without
+// consulting the live rentals table. Workflow receipts use it after dial authority
+// has been released.
+func Summarize(row records.Rental) (ControlSummary, *exit.Error) {
+	facts, e := controlFacts(row)
+	if e != nil {
+		return ControlSummary{}, e
+	}
+	plans := make([]string, 0, len(facts.Placement.Bindings))
+	for _, binding := range facts.Placement.Bindings {
+		planID, problem := binding.PlanID()
+		if problem != nil {
+			return ControlSummary{}, problem
+		}
+		plans = append(plans, planID)
+	}
+	sort.Strings(plans)
+	return ControlSummary{
+		ControlSnapshotDigest:             row.ControlSnapshotDigest,
+		EndpointExecutionDigest:           facts.EndpointExecutionDigest,
+		ArtifactObjectSetDigest:           facts.ArtifactObjectSetDigest,
+		ModelRootDigests:                  append([]string(nil), facts.ModelRootDigests...),
+		EndpointReleaseID:                 facts.Placement.ReleaseID,
+		DescriptorDigest:                  facts.Placement.DescriptorDigest,
+		EnvironmentSpecDigest:             facts.Placement.EnvironmentSpecDigest,
+		InstalledEnvironmentReceiptDigest: facts.Placement.InstalledEnvironmentReceiptDigest,
+		PlacementSetDigest:                facts.Placement.ExactPlacementSetDigest,
+		BindingPlanDigests:                plans,
+	}, nil
+}
+
 func unknown(id string) *exit.Error {
 	return exit.New(exit.NotFound, "no rental %s on this host", id).
 		WithRemedy("`cozy rent ls` names the pods this host holds").
@@ -269,7 +332,9 @@ func Resolver(l home.Layout, st *records.Store) func(string) (*orchestrator.Remo
 				WithRemedy("release this rental and rent again; the pin is written with the token").
 				WithNext("cozy rent release " + id + " --yes")
 		}
-		spec := &orchestrator.WorkerConnection{Addr: row.Address, Token: token, CACert: cert}
+		spec := &orchestrator.WorkerConnection{
+			RentalID: row.ID, Addr: row.Address, Token: token, CACert: cert,
+		}
 		if row.MediaAddress != "" {
 			// ONE PROVISIONED IDENTITY, TWO LISTENERS (#506b, tonight's tier). The pod's
 			// media server holds its OWN keys — cl-014's rule, and this host pins the same
@@ -283,15 +348,26 @@ func Resolver(l home.Layout, st *records.Store) func(string) (*orchestrator.Remo
 	}
 }
 
+// ObserveWorker turns a remote ClaimAck into the rental's durable actual-hardware
+// readback. It is wired into the orchestrator so no remote session can become
+// dispatchable without crossing this records boundary.
+func ObserveWorker(st *records.Store) func(orchestrator.RentalObservation) *exit.Error {
+	return func(observed orchestrator.RentalObservation) *exit.Error {
+		return st.ObserveRentalWorker(observed.RentalID, observed.Accelerator,
+			observed.Backend, observed.WorkerInstance, observed.WorkerBootID,
+			observed.DeviceCount)
+	}
+}
+
 func controlFacts(row records.Rental) (remotecontrol.Facts, *exit.Error) {
-	if row.ControlSnapshotDigest == "" || row.ControlSnapshotLength <= 0 || len(row.ControlSnapshotBytes) == 0 {
+	if row.ControlSnapshotDigest == "" || len(row.ControlSnapshotBytes) == 0 {
 		return remotecontrol.Facts{}, exit.Named(exit.Conflict, "rental.control_snapshot_missing",
 			"rental %s has no persisted acquisition-attempt control snapshot", row.ID).
 			WithRemedy("release it and rent again; Creator will not resolve a remote pod from the local install")
 	}
 	return remotecontrol.Decode(hub.ExactControlDocument{
 		CanonicalBytes: row.ControlSnapshotBytes, Digest: row.ControlSnapshotDigest,
-		Length: row.ControlSnapshotLength,
+		Length: int64(len(row.ControlSnapshotBytes)),
 	}, row.EndpointRef)
 }
 

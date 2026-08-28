@@ -16,6 +16,7 @@ import (
 	"github.com/cozy-creator/cozy-creator-v2/internal/launch"
 	"github.com/cozy-creator/cozy-creator-v2/internal/orchestrator"
 	"github.com/cozy-creator/cozy-creator-v2/internal/records"
+	"github.com/cozy-creator/cozy-creator-v2/internal/rental"
 	pb "github.com/cozy-creator/cozy-creator-v2/protocol/cozy/worker/v1"
 )
 
@@ -322,6 +323,18 @@ func (s *Server) resolvePlan(sub Submission) (orchestrator.Submission, *exit.Err
 		if len(out.Outputs) == 0 {
 			out.Outputs = outputs
 		}
+		// The rental's FROZEN descriptor is the schema; no local install is consulted.
+		descriptor, e := rental.Descriptor(s.store, out.Worker)
+		if e != nil {
+			return out, e
+		}
+		entrypoint, e := descriptor.Function(sub.Function)
+		if e != nil {
+			return out, e
+		}
+		if e := validateInputs(entrypoint, &out); e != nil {
+			return out, e
+		}
 	} else {
 		var placement orchestrator.DesiredPlacement
 		if s.endpoints == nil {
@@ -349,25 +362,35 @@ func (s *Server) resolvePlan(sub Submission) (orchestrator.Submission, *exit.Err
 		if e != nil {
 			return out, e
 		}
-		if e := launch.ValidatePayload(entrypoint, out.Payload); e != nil {
+		if e := validateInputs(entrypoint, &out); e != nil {
 			return out, e
-		}
-		for index := range out.Assets {
-			assetSpec, ok := launch.AssetSpec(entrypoint, out.Assets[index].FieldPath)
-			if !ok || assetSpec.MaxBytes <= 0 || out.Assets[index].Length > assetSpec.MaxBytes {
-				return out, exit.Named(exit.Validation, "input_asset_bound",
-					"input asset %s is %d B and its pinned field admits %d B",
-					out.Assets[index].FieldPath, out.Assets[index].Length, assetSpec.MaxBytes)
-			}
-			if !assetSpec.AcceptsMediaType(out.Assets[index].MediaType) {
-				return out, exit.Named(exit.Validation, "input_asset_media_type",
-					"input asset %s is %s and its pinned field does not admit that media type",
-					out.Assets[index].FieldPath, out.Assets[index].MediaType)
-			}
-			out.Assets[index].MaxBytes = assetSpec.MaxBytes
 		}
 	}
 	return out, nil
+}
+
+// validateInputs checks the payload and every local asset against the entrypoint that
+// will run it — the same law for a local install and a rental's frozen descriptor.
+func validateInputs(entrypoint *launch.Entrypoint, out *orchestrator.Submission) *exit.Error {
+	if e := launch.ValidatePayload(entrypoint, out.Payload); e != nil {
+		return e
+	}
+	for index := range out.Assets {
+		asset := &out.Assets[index]
+		assetSpec, ok := launch.AssetSpec(entrypoint, asset.FieldPath)
+		if !ok || assetSpec.MaxBytes <= 0 || asset.Length > assetSpec.MaxBytes {
+			return exit.Named(exit.Validation, "input_asset_bound",
+				"input asset %s is %d B and its pinned field admits %d B",
+				asset.FieldPath, asset.Length, assetSpec.MaxBytes)
+		}
+		if !assetSpec.AcceptsMediaType(asset.MediaType) {
+			return exit.Named(exit.Validation, "input_asset_media_type",
+				"input asset %s is %s and its pinned field does not admit that media type",
+				asset.FieldPath, asset.MediaType)
+		}
+		asset.MaxBytes = assetSpec.MaxBytes
+	}
+	return nil
 }
 
 func placementPlan(placement orchestrator.DesiredPlacement, function string) (string, []string, *exit.Error) {
@@ -629,7 +652,7 @@ func (s *Server) cancelRequest(w http.ResponseWriter, r *http.Request) {
 			"retry cancellation after the terminal ack; no new attempt can dispatch before that projection")
 		return
 	}
-	grace := uint64(5000)
+	grace := orchestrator.ClientCancelGraceMS
 	if v := r.URL.Query().Get("grace_ms"); v != "" {
 		if n, err := strconv.ParseUint(v, 10, 64); err == nil && n <= 120000 {
 			grace = n

@@ -244,7 +244,7 @@ none of these.
 |---|---|---|---|
 | `GET /v1/local/endpoints` | local | yes | installed endpoints and their functions |
 | `GET /v1/local/workers` | local | yes | live workers: protocol identities, devices, worker phase, the placement's two axes, the admission fence |
-| `POST /v1/local/workers` | local | yes | ensure one endpoint resident (idempotent); answers `change`: `none` \| `worker_started` \| `placement_added`. `{"endpoint":…, "warm":false}` skips the boot warm pass |
+| `POST /v1/local/workers` | local | yes | ensure one local endpoint resident or claim one exact rental without invoking a model; exactly one of `endpoint` or `rental` |
 | `DELETE /v1/local/workers/{instance_id}` | local | yes | drain and stop the process group |
 | `GET /v1/local/doctor` | local | yes | host facts, bound families, counts |
 | `POST /v1/local/service/shutdown` | local | yes | ask the service to drain every worker and exit (`cozy down`'s cooperative tier); exit is proved by the service lock, never this reply |
@@ -255,6 +255,7 @@ none of these.
 | `POST /v1/local/jobs/{id}/cancel` | local | yes | request cancellation; a queued job leaves the queue, a running one gets its terminal |
 | `POST /v1/local/workflows` | local | yes | submit one canonical ordered workflow; `Idempotency-Key`; 202 fresh or 200 replay |
 | `GET /v1/local/workflows/{id}` | local | yes | one workflow with ordinary child request states and accepted outputs projected from the records authority |
+| `GET /v1/local/workflows/{id}/receipt` | local | yes | canonical plan, materialized submissions, and workflow-owned exact rental controls, independent of live dial authority |
 | `POST /v1/local/workflows/{id}/cancel` | local | yes | persist cancellation, cancel the active child, and prevent every later child |
 | `POST /v1/local/video-compositions` | local | CLI only | compose exact source bytes or one retained creative-plan digest into the existing workflow submission shape; local base paths are resolution-only and never returned or stored |
 | `GET /healthz` | local | no | liveness ONLY; says nothing about any request |
@@ -309,22 +310,35 @@ outputs, media and cancellation remain the existing request authority; the workf
 projects those rows and copies none of their lifecycle state.
 
 There is no workflow SSE route, list route, retry verb, cursor, resume verb, endpoint callback,
-YAML parser or timeline object. Re-submitting the same idempotency key is recovery, status is a
-polling read, and cancellation persists before it touches the active ordinary child.
+YAML parser or timeline object. Re-submitting the same idempotency key is recovery. `workflow
+follow` samples the structured status document and has no elapsed-time verdict; worker liveness and
+measured no-progress facts remain the stall authority. Cancellation persists before it touches the
+active ordinary child.
 
 `POST /v1/local/workflows` carries `{plan, assets?, targets?}`. `assets` contains staged
 digest/length/type resolutions and therefore requires the OS-protected CLI credential; no path is
 accepted. `targets` maps a one-based step to an attached rental id. Targets and local install ids
-are resolution only and do not enter workflow/child execution meaning. The frozen workflow status
+do not enter creative or model-execution meaning, but rental targets do enter the submission
+identity so one idempotency key cannot silently move a workflow to another paid machine. The frozen workflow status
 set is `running | canceling | succeeded | failed | canceled`; ordinary child rows are projected as
 `queued | in_progress | completed | failed | canceled` plus workflow-only `pending | prepared`.
+Structured status also projects the existing materialized-submission digest, child key, exact
+resolved output bindings, materialized asset identities, rental id, and media refs. `workflow
+download` obtains a workflow-owned receipt through the local API, independent of the current
+rental table. It writes the canonical workflow and creative plans, each exact materialized
+submission, child lifecycle/event/triage receipts, one content-addressed copy of Tensorhub's exact
+control snapshot, actual ClaimAck GPU identity, and digest-verified media into a sibling staging
+tree. Every path in a receipt is bundle-relative; the destination appears only by one final rename.
 
 ### The video composer is a LOCAL authoring boundary (cl-024)
 
 `POST /v1/local/video-compositions` is the only YAML-reading route. It requires the OS-protected
 CLI credential because a fresh composition reads caller-owned local paths. Its strict request names
-exactly one of bounded source bytes or a retained `creative_plan_digest`, plus explicit H3 and CPU
-assembly endpoint refs and an optional attached H3 worker. The absolute source directory resolves
+exactly one of bounded source bytes or a retained `creative_plan_digest`, plus exactly one local H3
+endpoint ref or attached H3 rental id. A rental already fixes its endpoint, so the API refuses a
+second endpoint truth beside it. The fixed CPU assembler is a Creator-owned
+product dependency, not a source or CLI selection. The rental is a Tensorhub-selected
+result handle, never provider or placement policy. The absolute source directory resolves
 relative asset spellings but is never stored, hashed, echoed, or added to a receipt.
 
 The caller retains the editable YAML; Creator retains its exact-byte digest rather than a hidden
@@ -332,7 +346,7 @@ second copy. The response separates that source identity, path-free/deployment-f
 the existing deployment-resolved `cozy.workflow.Plan/1`. Composition starts no workflow. `cozy video
 submit` passes that plan and its staged content identities to `POST /v1/local/workflows`; workflow
 status, cancellation, recovery, attempts, outputs, and events remain cl-018's one authority. There
-is no video-specific status route, retry policy, cursor, provider call, endpoint callback, or second
+is no video-specific status route, retry policy, cursor, provider selector, endpoint callback, or second
 lifecycle table.
 
 Composition rows are durable project records in v1 and deliberately retain their staged content

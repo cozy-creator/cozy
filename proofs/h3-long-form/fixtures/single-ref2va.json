@@ -1,0 +1,10 @@
+{
+  "prompt": "A cinematic subject moves through a coherent environment with natural synchronized sound.",
+  "references": [
+    {"type": "image", "image": ""},
+    {"type": "video", "video": ""},
+    {"type": "audio", "audio": ""}
+  ],
+  "mute": false,
+  "seed": 4100
+}

@@ -88,12 +88,18 @@ func (c *Orchestrator) converge(s *session, w *worker, placements []DesiredPlace
 		}
 		setBytes, digest = append([]byte(nil), p.ExactPlacementSetBytes...), append([]byte(nil), declared...)
 	} else {
-		// LOCAL: retain the independent install-derived authoring path.
+		// LOCAL: retain the independent install-derived authoring path. An attached
+		// worker never gets this host's identity digests substituted for its own.
 		set := &pb.PlacementSet{}
 		for _, p := range placements {
+			if w.spec.Connection != nil && p.EnvironmentSpecDigest == "" {
+				return exit.Named(exit.Structural, "remote_placement_identity_missing",
+					"attached worker %s placement %s carries no frozen environment digest",
+					w.instanceID, p.PlacementID())
+			}
 			set.Placements = append(set.Placements, &pb.Placement{
 				PlacementId: p.PlacementID(),
-				Spec:        c.placementSpec(p, w.subjects),
+				Spec:        c.placementSpec(w, p),
 			})
 		}
 		var err error
@@ -137,13 +143,13 @@ func (c *Orchestrator) converge(s *session, w *worker, placements []DesiredPlace
 // A local install leaves environment/receipt empty unless its own launcher supplied
 // those facts; it never manufactures Tensorhub documents. A remote placement normally
 // bypasses this author entirely because converge relays Tensorhub's exact PlacementSet.
-func (c *Orchestrator) placementSpec(p DesiredPlacement, subjects []*pb.ArtifactSubject) *pb.PlacementSpec {
+func (c *Orchestrator) placementSpec(w *worker, p DesiredPlacement) *pb.PlacementSpec {
 	spec := &pb.PlacementSpec{
 		EndpointReleaseId: p.ReleaseID,
-		BindingPlans:      subjects,
+		BindingPlans:      w.subjects,
 	}
 	environmentDigest := p.EnvironmentSpecDigest
-	if environmentDigest == "" {
+	if environmentDigest == "" && w.spec.Connection == nil {
 		environmentDigest = c.opt.EnvironmentSpecDigest
 	}
 	if raw, err := canonical.Raw(environmentDigest); err == nil {
@@ -230,10 +236,11 @@ func (c *Orchestrator) onObserved(s *session, r *pb.ObservedWorkerState) {
 			}
 		}
 		w.dispatchable, w.materializable = dispatchable, materializable
-		// A placement holding a FAULT is timed from the first report that carried one, and
-		// the clock resets the moment it clears. The reason is the worker's own — this side
-		// echoes what it reported and never composes one.
-		if faulted(status, r) {
+		// Fault rows explain state; FAILED axes decide terminality. In particular,
+		// BINDING_DEGRADED explicitly means "the worker still serves" and must never become
+		// kill authority merely because it shares the diagnostic list with fatal faults.
+		w.faulted = faulted(status, r)
+		if w.faulted {
 			if w.errorSince.IsZero() {
 				w.errorSince = time.Now()
 			}
@@ -246,13 +253,19 @@ func (c *Orchestrator) onObserved(s *session, r *pb.ObservedWorkerState) {
 		for _, f := range r.Faults {
 			w.fault = fmt.Sprintf("%s: %s", f.Reason, brief(f.Detail, 240))
 		}
+		if len(r.Faults) == 0 && status != nil {
+			for _, f := range status.Faults {
+				w.fault = fmt.Sprintf("%s: %s", f.Reason, brief(f.Detail, 240))
+			}
+		}
 		// THE NO-PROGRESS GROUND'S BOOKKEEPING (cl-025). Movement is a changed signature
 		// between two of the worker's own reports; the wedge verdict is the worker's own
 		// liveness monitor speaking on the activity lane. The orchestrator only counts.
 		sig := progressSignature(r, status)
 		moved := sig != w.progressSig
 		w.progressSig = sig
-		w.wedged = wedgeDeclared(r)
+		w.wedgedSubjects = wedgeDeclared(r)
+		w.wedged = len(w.wedgedSubjects) > 0
 		switch {
 		case moved, !w.wedged:
 			w.noProgress = 0
@@ -345,27 +358,55 @@ func progressSignature(r *pb.ObservedWorkerState, status *pb.PlacementStatus) st
 // observations find a monotone position unmoved (a count of observations, clock-free on
 // the worker too). The orchestrator never diagnoses a wedge itself — it acts on this
 // report, which is the whole of decisions #613's rule.
-func wedgeDeclared(r *pb.ObservedWorkerState) bool {
-	for _, a := range r.Activity {
-		if a.Kind == "liveness" && strings.Contains(a.Step, "WEDGED") {
-			return true
+func wedgeDeclared(r *pb.ObservedWorkerState) map[string]bool {
+	type verdict struct {
+		seq    uint64
+		wedged bool
+	}
+	latest := map[string]verdict{}
+	for _, activity := range r.Activity {
+		if activity.Kind != "liveness" {
+			continue
+		}
+		subject, wedged, ok := livenessVerdict(activity.Step)
+		if !ok || latest[subject].seq > activity.Seq {
+			continue
+		}
+		latest[subject] = verdict{seq: activity.Seq, wedged: wedged}
+	}
+	out := map[string]bool{}
+	for subject, current := range latest {
+		if current.wedged {
+			out[subject] = true
 		}
 	}
-	return false
+	return out
 }
 
-// faulted answers whether this worker is holding a REFUSAL rather than merely taking its
-// time. A latched placement fault, a machine fault, or a FAILED axis all mean "I cannot";
-// MATERIALIZING and ACTIVATING mean "not yet", however long they take.
+// livenessVerdict reads only the two exact Runtime spellings. In particular, the
+// recovery note contains the historical word WEDGED while explicitly retracting it;
+// substring matching turned that retraction into a fresh wedge.
+func livenessVerdict(step string) (subject string, wedged bool, ok bool) {
+	if subject, _, ok = strings.Cut(step, " is WEDGED by silence"); ok && subject != "" {
+		return subject, true, true
+	}
+	if subject, _, ok = strings.Cut(step, " resumed ("); ok && subject != "" {
+		return subject, false, true
+	}
+	return "", false, false
+}
+
+// faulted reads only the protocol's terminal axes. Fault rows are explanations and may
+// coexist with a serving placement (BINDING_DEGRADED and a rejected replacement both do);
+// treating their mere presence as terminal killed healthy active attempts.
 func faulted(status *pb.PlacementStatus, r *pb.ObservedWorkerState) bool {
-	if len(r.Faults) > 0 || r.WorkerPhase == pb.WorkerPhase_WORKER_PHASE_FAILED {
+	if r.WorkerPhase == pb.WorkerPhase_WORKER_PHASE_FAILED {
 		return true
 	}
 	if status == nil {
 		return false
 	}
-	return len(status.Faults) > 0 ||
-		status.Materialization == pb.MaterializationState_MATERIALIZATION_STATE_FAILED
+	return status.Materialization == pb.MaterializationState_MATERIALIZATION_STATE_FAILED
 }
 
 // --------------------------------------------------------------------------- accepted
@@ -898,6 +939,7 @@ func (c *Orchestrator) mirrorOutputs(req records.Request, attempt uint64, doc ca
 		}
 	}
 	out := make([]records.Output, 0, len(list))
+	declared := map[string]bool{}
 	for _, item := range list {
 		entry, ok := item.(map[string]canonical.Value)
 		if !ok {
@@ -905,7 +947,11 @@ func (c *Orchestrator) mirrorOutputs(req records.Request, attempt uint64, doc ca
 		}
 		e := canonical.Doc(entry)
 		id := e.Str("output_id")
-		path := filepath.Join(dir, id)
+		path, problem := outputDest(req, dir, id)
+		if problem != nil {
+			return nil, problem
+		}
+		declared[id] = true
 		if err := verifyBytes(path, e.Str("digest"), e.Int("length")); err != nil {
 			return nil, err.WithRemedy(
 				"a remote worker writes on its own machine; its outputs are MIRRORED here " +
@@ -925,7 +971,36 @@ func (c *Orchestrator) mirrorOutputs(req records.Request, attempt uint64, doc ca
 			MimeType: e.Str("mime_type"),
 		})
 	}
+	if !req.IsJob() {
+		// A serving manifest may name only granted ids, and a SUCCEEDED one names all of them.
+		granted := map[string]bool{}
+		for _, id := range splitList(req.Outputs) {
+			granted[id] = true
+			if !declared[id] && holder.media != nil && outcomeStatus(doc.Int("status")) == "SUCCEEDED" {
+				return nil, exit.Named(exit.Validation, "output_set_mismatch",
+					"the terminal omits granted output %q", id)
+			}
+		}
+		for id := range declared {
+			if !granted[id] {
+				return nil, exit.Named(exit.Validation, "output_set_mismatch",
+					"the terminal names output %q, which was never granted", id)
+			}
+		}
+	}
 	return out, nil
+}
+
+// outputDest resolves where one declared output may land: a job's publication fence, or
+// a serving attempt's single-element id under its attempt directory.
+func outputDest(req records.Request, dir, id string) (string, *exit.Error) {
+	if req.IsJob() {
+		return publicationDest(dir, id)
+	}
+	if e := fenceOutputID(id); e != nil {
+		return "", e
+	}
+	return filepath.Join(dir, id), nil
 }
 
 // fetchOutputs pulls one remote attempt's declared outputs across the pod's media plane
@@ -952,10 +1027,10 @@ func (c *Orchestrator) fetchOutputs(req records.Request, attempt uint64,
 			continue
 		}
 		id := canonical.Doc(entry).Str("output_id")
-		if id == "" {
-			continue
+		destination, e := outputDest(req, dir, id)
+		if e != nil {
+			return e
 		}
-		destination := filepath.Join(dir, id)
 		length := canonical.Doc(entry).Int("length")
 		digest := canonical.Doc(entry).Str("digest")
 		written, e := holder.media.GetOutputTo(slot, id, destination, digest, length)
