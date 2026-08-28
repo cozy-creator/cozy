@@ -46,6 +46,8 @@
 //!   tfs checkpoint info <root> <hex>         component/scope query, zero tensor-byte reads
 //!   tfs checkpoint locate <root> <hex> <component> <key> <role> <off> <len>
 //!   tfs checkpoint admit <root> <hex>        serving admission against the local pin
+//!   tfs checkpoint reproduce <root> <header.json> <entries.json>
+//!                                            verified refs -> canonical header + snapshot
 //!   tfs checkpoint caps                      whole-document total caps, armed live
 //!   tfs checkpoint size [n]                  uniform-form header cost at H3 cardinality
 //!
@@ -205,6 +207,9 @@ fn main() -> ExitCode {
             len.parse().unwrap_or(0),
             &flags,
         ),
+        ["checkpoint", "reproduce", r, h, e] => {
+            snap::cmd_reproduce(Path::new(r), Path::new(h), Path::new(e), &flags)
+        }
         ["checkpoint", "admit", r, h] => ckpt::cmd_admit(Path::new(r), h, &flags),
         ["conform"] => conform::cmd_conform(None, &flags),
         ["conform", w] => conform::cmd_conform(Some(w), &flags),

@@ -508,7 +508,7 @@ struct Prepared {
     target: Target,
 }
 
-fn construction_order(f: &Flags) -> Result<Vec<(String, String)>, ExitCode> {
+pub(crate) fn construction_order(f: &Flags) -> Result<Vec<(String, String)>, ExitCode> {
     let path = match flag(f, "order") {
         Some(path) => path,
         None => {

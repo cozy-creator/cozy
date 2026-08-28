@@ -4,17 +4,20 @@
 //! contained documents → tensor rules → storage-part object runs. "Every and only" is proved
 //! by set-differencing the walk against the store's own object census, not asserted.
 
-use std::io::Write;
+use std::collections::BTreeMap;
+use std::io::{Cursor, Write};
 use std::path::Path;
 use std::process::ExitCode;
 use std::time::Instant;
 
+use tensorfs_core::canon::{self, as_arr, as_str};
 use tensorfs_core::checkpoint as ck;
-use tensorfs_core::err::{Code, Result as TfsResult};
+use tensorfs_core::err::{refuse, Code, Refusal, Result as TfsResult};
+use tensorfs_core::header::{Body, Header};
 use tensorfs_core::ids::{Doc, ObjectRef};
 use tensorfs_core::manifest::{BlobDescriptor, Draft, Entry, SnapshotManifest};
 use tensorfs_core::sha256;
-use tensorfs_core::store::Store;
+use tensorfs_core::store::{Fault, Store};
 
 use crate::{bail, flag_num, rss_kb, Flags};
 
@@ -55,6 +58,282 @@ macro_rules! ok {
             Err(e) => return bail(e),
         }
     };
+}
+
+// ------------------------------------------------------------------ metadata-only reproduction
+
+fn read_input(path: &Path, what: &str) -> TfsResult<Vec<u8>> {
+    std::fs::read(path).map_err(|error| Refusal {
+        code: Code::IO_FAILED,
+        detail: format!("read {what} {}: {error}", path.display()),
+    })
+}
+
+fn parse_entries(value: &canon::Value, header: &ObjectRef) -> TfsResult<Draft> {
+    let rows = as_arr("checkpoint reproduction", "entries", value)?;
+    let mut draft = Draft {
+        header: Some(header.clone()),
+        entries: Vec::with_capacity(rows.len()),
+    };
+    let mut found_header = false;
+    for (index, row) in rows.iter().enumerate() {
+        let values = as_arr("checkpoint reproduction", "entry", row)?;
+        if values.len() < 2 {
+            return refuse(
+                Code::WRONG_TYPE,
+                format!("checkpoint reproduction entry {index} has fewer than 2 fields"),
+            );
+        }
+        let path = as_str("checkpoint reproduction", "path", &values[0])?.to_string();
+        let kind = as_str("checkpoint reproduction", "kind", &values[1])?;
+        let entry = match (kind, values.len()) {
+            ("dir", 2) => Entry::Dir,
+            ("header", 2) => {
+                if found_header {
+                    return refuse(
+                        Code::ATTACHMENT_CARDINALITY,
+                        "checkpoint reproduction lists more than one header entry",
+                    );
+                }
+                found_header = true;
+                Entry::File(header.clone())
+            }
+            ("file", 3) => Entry::File(ObjectRef::from_value(
+                "checkpoint reproduction file",
+                &values[2],
+            )?),
+            _ => {
+                return refuse(
+                    Code::WRONG_TYPE,
+                    format!(
+                        "checkpoint reproduction entry {index} kind {kind:?} has arity {}; expected dir/header=2 or file=3",
+                        values.len()
+                    ),
+                )
+            }
+        };
+        draft.entries.push((path, entry));
+    }
+    if !found_header {
+        return refuse(
+            Code::ATTACHMENT_CARDINALITY,
+            "checkpoint reproduction lists no header entry",
+        );
+    }
+    Ok(draft)
+}
+
+fn add_ref(refs: &mut BTreeMap<String, u64>, object: &ObjectRef, what: &str) -> TfsResult<()> {
+    if let Some(length) = refs.insert(object.sha256.clone(), object.length) {
+        if length != object.length {
+            return refuse(
+                Code::LENGTH_MISMATCH,
+                format!(
+                    "{what}: sha256:{} appears at both {length} and {} bytes",
+                    object.sha256, object.length
+                ),
+            );
+        }
+    }
+    Ok(())
+}
+
+fn referenced_objects(header: &Header, draft: &Draft) -> TfsResult<BTreeMap<String, u64>> {
+    let mut refs = BTreeMap::new();
+    for (_, config) in &header.configs {
+        add_ref(
+            &mut refs,
+            &ObjectRef {
+                sha256: config.sha256.clone(),
+                length: config.length,
+            },
+            "config",
+        )?;
+    }
+    for (_, asset) in &header.assets {
+        for segment in &asset.segments {
+            add_ref(&mut refs, segment, "asset segment")?;
+        }
+    }
+    for encoding in &header.encodings {
+        add_ref(&mut refs, encoding, "encoding")?;
+    }
+    for (_, tensors) in &header.components {
+        for (_, tensor) in tensors {
+            for (_, part) in &tensor.parts {
+                if let Body::Segments(segments) = &part.body {
+                    for segment in segments {
+                        add_ref(&mut refs, segment, "tensor segment")?;
+                    }
+                }
+            }
+        }
+    }
+    for (_, entry) in &draft.entries {
+        if let Entry::File(object) = entry {
+            if object != draft.header.as_ref().expect("header was set") {
+                add_ref(&mut refs, object, "manifest file")?;
+            }
+        }
+    }
+    Ok(refs)
+}
+
+fn require_records(store: &Store, refs: &BTreeMap<String, u64>) -> TfsResult<()> {
+    for (sha256, length) in refs {
+        match store.record_valid(sha256) {
+            Ok(record) if record.length == *length => {}
+            Ok(record) => {
+                return refuse(
+                    Code::LENGTH_MISMATCH,
+                    format!(
+                        "sha256:{sha256} has a current {}-byte verification record, reproduction declares {length}",
+                        record.length
+                    ),
+                )
+            }
+            Err(why) => {
+                return refuse(
+                    Code::OBJECT_CORRUPT,
+                    format!(
+                        "sha256:{sha256} has no current exact verification record ({why}); metadata reproduction never rehashes inherited payload",
+                    ),
+                )
+            }
+        }
+    }
+    Ok(())
+}
+
+fn put_document(store: &Store, bytes: &[u8]) -> TfsResult<ObjectRef> {
+    let want = ObjectRef::of(bytes);
+    let mut input = Cursor::new(bytes);
+    let put = store.put_stream(&mut input, Some(&want), &Fault::default())?;
+    if !put.admitted && store.record_valid(&want.sha256).is_err() {
+        store.verify(&want.sha256)?;
+    }
+    match store.record_valid(&want.sha256) {
+        Ok(record) if record.length == want.length => Ok(want),
+        Ok(record) => refuse(
+            Code::LENGTH_MISMATCH,
+            format!(
+                "new document {} has a {}-byte record, expected {}",
+                want.id(),
+                record.length,
+                want.length
+            ),
+        ),
+        Err(why) => refuse(
+            Code::OBJECT_CORRUPT,
+            format!(
+                "new document {} has no current verification record ({why})",
+                want.id()
+            ),
+        ),
+    }
+}
+
+/// Reproduce canonical metadata over exact already-verified payload references. The diagnostic
+/// inputs are never stored; only Header/SnapshotManifest canonical bytes can leave this operation.
+pub fn cmd_reproduce(
+    root: &Path,
+    header_path: &Path,
+    entries_path: &Path,
+    flags: &Flags,
+) -> ExitCode {
+    let store = ok!(Store::open(root));
+    let header_value = ok!(canon::parse_with_depth(
+        &ok!(read_input(header_path, "header diagnostic")),
+        tensorfs_core::limits::DOC_MAX_BYTES,
+        16,
+    ));
+    let header = ok!(Header::from_diagnostic_value(&header_value));
+    ok!(header.validate_structure());
+
+    let expected_order = match crate::ingest::construction_order(flags) {
+        Ok(order) => order,
+        Err(code) => return code,
+    };
+    let actual_order: Vec<(String, String)> = header
+        .components
+        .iter()
+        .flat_map(|(component, tensors)| {
+            tensors
+                .iter()
+                .map(move |(key, _)| (component.clone(), key.clone()))
+        })
+        .collect();
+    if actual_order != expected_order {
+        let mismatch = actual_order
+            .iter()
+            .zip(&expected_order)
+            .position(|(actual, expected)| actual != expected)
+            .unwrap_or_else(|| actual_order.len().min(expected_order.len()));
+        return bail(Refusal {
+            code: Code::TRAVERSAL_ORDER_MISMATCH,
+            detail: format!(
+                "header traversal and construction order first disagree at {mismatch}; header has {} rows, order has {}",
+                actual_order.len(),
+                expected_order.len()
+            ),
+        });
+    }
+
+    let header_bytes = ok!(header.canonical_bytes());
+    let header_ref = ObjectRef::of(&header_bytes);
+    let entries_value = ok!(canon::parse(
+        &ok!(read_input(entries_path, "manifest entries")),
+        tensorfs_core::limits::DOC_MAX_BYTES,
+    ));
+    let draft = ok!(parse_entries(&entries_value, &header_ref));
+    let refs = ok!(referenced_objects(&header, &draft));
+    ok!(require_records(&store, &refs));
+    // Semantic closure reads happen only after every inherited object proves a current record;
+    // this operation may read bounded specs/configs, but never repairs trust by rehashing them.
+    let closure = ok!(ck::load_closure(&store, &header));
+    ok!(header.validate(&closure));
+    let manifest = ok!(draft.seal());
+
+    let stored_header = ok!(put_document(&store, &header_bytes));
+    if stored_header != header_ref {
+        return bail(Refusal {
+            code: Code::OBJECT_ID_MISMATCH,
+            detail: "stored header identity changed after canonical encoding".into(),
+        });
+    }
+    let manifest_bytes = manifest.canonical_bytes();
+    let snapshot = ok!(put_document(&store, &manifest_bytes));
+    let strict = ok!(ck::load_manifest(&store, &snapshot));
+    let walk = ok!(ck::walk(&store, &strict));
+    ok!(walk.require_resident(&store));
+    let all: BTreeMap<String, u64> = walk
+        .distinct()
+        .into_iter()
+        .map(|object| (object.sha256.clone(), object.length))
+        .collect();
+    ok!(require_records(&store, &all));
+
+    let inherited_bytes = refs.values().try_fold(0u64, |total, length| {
+        total.checked_add(*length).ok_or_else(|| Refusal {
+            code: Code::ARITH_OVERFLOW,
+            detail: "inherited byte count overflow".into(),
+        })
+    });
+    println!(
+        "header       {} length={}",
+        header_ref.id(),
+        header_ref.length
+    );
+    println!("snapshot     {} length={}", snapshot.id(), snapshot.length);
+    println!("tensors      {}", walk.tensors);
+    println!(
+        "inherited    {} objects {} bytes",
+        refs.len(),
+        ok!(inherited_bytes)
+    );
+    println!("tensor_payload_read 0");
+    println!("tensor_payload_hash 0");
+    ExitCode::SUCCESS
 }
 
 // ------------------------------------------------------------------ show
