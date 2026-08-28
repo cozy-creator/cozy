@@ -18,8 +18,8 @@ import (
 	"github.com/cozy-creator/cozy-creator/internal/exit"
 	"github.com/cozy-creator/cozy-creator/internal/home"
 	"github.com/cozy-creator/cozy-creator/internal/media"
+	"github.com/cozy-creator/cozy-creator/internal/mediawire"
 	"github.com/cozy-creator/cozy-creator/internal/orchestrator"
-	"github.com/cozy-creator/cozy-creator/internal/podmedia"
 	"github.com/cozy-creator/cozy-creator/internal/records"
 	"github.com/cozy-creator/cozy-creator/internal/secret"
 	pb "github.com/cozy-creator/cozy-creator/protocol/cozy/worker/v1"
@@ -32,16 +32,9 @@ import (
 func TestRemotePlacementReceivesGrantBeforeDesired(t *testing.T) {
 	root := t.TempDir()
 	certPath, keyPath := podTLS(t, root)
-	token := secret.New("remote-owner-token")
-	tokenDigest := secret.HashLine(token)
-
-	plane, err := podmedia.Bind(podmedia.Options{
-		Listen: "127.0.0.1:0", Root: filepath.Join(root, "media"),
-		TokenHashes: []string{tokenDigest}, Cert: certPath, Key: keyPath,
-	})
-	must(t, err)
-	go func() { _ = plane.Serve() }()
-	t.Cleanup(func() { _ = plane.Close() })
+	tokenText := "remote-owner-token"
+	token := secret.New(tokenText)
+	mediaAddr := serveMediaPeer(t, certPath, keyPath, tokenText, mediawire.ContractRev)
 
 	peer := &grantPeer{frames: make(chan string, 8)}
 	controlAddr, stopControl := serveWorkerPeer(t, certPath, keyPath, peer)
@@ -97,7 +90,7 @@ func TestRemotePlacementReceivesGrantBeforeDesired(t *testing.T) {
 		Placement: placement,
 		Connection: &orchestrator.WorkerConnection{
 			RentalID: "rental-1", Addr: controlAddr, Token: token, CACert: certPath,
-			Media: &media.Spec{Addr: plane.Addr(), Token: token, CACert: certPath},
+			Media: &media.Spec{Addr: mediaAddr, Token: token, CACert: certPath},
 		},
 	})
 	fatal(t, problem)

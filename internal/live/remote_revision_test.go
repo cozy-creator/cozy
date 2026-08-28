@@ -14,8 +14,8 @@ import (
 	"github.com/cozy-creator/cozy-creator/internal/exit"
 	"github.com/cozy-creator/cozy-creator/internal/home"
 	"github.com/cozy-creator/cozy-creator/internal/media"
+	"github.com/cozy-creator/cozy-creator/internal/mediawire"
 	"github.com/cozy-creator/cozy-creator/internal/orchestrator"
-	"github.com/cozy-creator/cozy-creator/internal/podmedia"
 	"github.com/cozy-creator/cozy-creator/internal/records"
 	"github.com/cozy-creator/cozy-creator/internal/secret"
 	pb "github.com/cozy-creator/cozy-creator/protocol/cozy/worker/v1"
@@ -24,14 +24,9 @@ import (
 func TestRemotePlacementRevisionReusesClaimAndPersistsAcquisition(t *testing.T) {
 	root := t.TempDir()
 	certPath, keyPath := podTLS(t, root)
-	token := secret.New("revision-owner-token")
-	plane, err := podmedia.Bind(podmedia.Options{
-		Listen: "127.0.0.1:0", Root: filepath.Join(root, "media"),
-		TokenHashes: []string{secret.HashLine(token)}, Cert: certPath, Key: keyPath,
-	})
-	must(t, err)
-	go func() { _ = plane.Serve() }()
-	defer plane.Close()
+	tokenText := "revision-owner-token"
+	token := secret.New(tokenText)
+	mediaAddr := serveMediaPeer(t, certPath, keyPath, tokenText, mediawire.ContractRev)
 
 	a := makeRevisionPlacement(t, "a")
 	b := makeRevisionPlacement(t, "b")
@@ -94,7 +89,7 @@ func TestRemotePlacementRevisionReusesClaimAndPersistsAcquisition(t *testing.T) 
 
 	connection := &orchestrator.WorkerConnection{
 		RentalID: "rental-1", Addr: controlAddr, Token: token, CACert: certPath,
-		Media: &media.Spec{Addr: plane.Addr(), Token: token, CACert: certPath},
+		Media: &media.Spec{Addr: mediaAddr, Token: token, CACert: certPath},
 	}
 	initial := a.placement
 	initial.Endpoint += "@rental-1"

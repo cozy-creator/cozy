@@ -90,39 +90,15 @@ func EnvEntry(name string, v Value) string { return name + "=" + v.raw }
 // caller writes bytes it never looked at, which is the same rule EnvEntry keeps.
 func FileBody(v Value) []byte { return []byte(v.raw + "\n") }
 
-// HashLine is the VERIFIER CARRIER: one credential digest, `sha256:<64 hex>`.
+// HashHex is the WIRE CARRIER: the bare 64 lowercase hex of a credential's sha256, with
+// no `sha256:` prefix.
 //
-// It exists so a process that only ever CHECKS a bearer — cl-014's media server — can be
-// provisioned without ever being given the token. The pod's supervisor hands the digests
-// over at launch; the server hashes what was presented and compares digests. A credential
-// the verifier does not hold cannot leak out of the verifier.
-func HashLine(v Value) string {
+// Tensorhub receives this value and gives it to the pod-side verifier. Creator
+// never needs the verifier's prefixed spelling or comparison implementation.
+func HashHex(v Value) string {
 	if v.raw == "" {
 		return ""
 	}
 	sum := sha256.Sum256([]byte(v.raw))
-	return "sha256:" + hex.EncodeToString(sum[:])
-}
-
-// HashHex is the WIRE CARRIER: the bare 64 lowercase hex of a credential's sha256, with
-// no `sha256:` prefix.
-//
-// It is a second spelling of one fact and it exists because two peers spell it two ways:
-// the pod's verifiers take `sha256:<hex>` (HashLine, what the pod media plane and the runtime
-// hold), and a hub's `renter_token_sha256` field takes the hex alone. Naming both
-// here keeps the conversion at the carrier, where every other credential rendering in this
-// package lives, instead of a TrimPrefix at a call site that has to remember why.
-func HashHex(v Value) string { return strings.TrimPrefix(HashLine(v), "sha256:") }
-
-// MatchesHash answers whether a presented bearer hashes to one `sha256:<64 hex>` line, in
-// constant time. Neither side of the comparison is a raw credential: the verifier holds a
-// digest and the presented string is digested before it is compared.
-func MatchesHash(presented, line string) bool {
-	want := strings.TrimSpace(line)
-	if !strings.HasPrefix(want, "sha256:") || len(want) != len("sha256:")+64 {
-		return false // an unparseable line authenticates nothing — fail closed
-	}
-	sum := sha256.Sum256([]byte(strings.TrimSpace(presented)))
-	got := "sha256:" + hex.EncodeToString(sum[:])
-	return subtle.ConstantTimeCompare([]byte(got), []byte(want)) == 1
+	return hex.EncodeToString(sum[:])
 }

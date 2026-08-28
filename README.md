@@ -527,65 +527,22 @@ installed-binary state and release state are four distinct evidence axes, so a g
   no card can make for itself. `no_servable_function` survives for its one remaining case:
   a release whose descriptor registers no entrypoint at all.
 
-## The pod supervisor, as one binary (cl-014, xs-004, cl-036, cl-037)
+## Remote pod media client
 
-A rented pod runs one container with ONE Go process from this repo, plus the Python worker.
-It is built here because it is the peer of `internal/media` and shares one wire contract;
-the image RECIPE that assembles it is Tensorhub's.
+Creator owns only the renter-side HTTPS client in `internal/media`. Tensorhub owns
+`pod-supervisor`, the pod-side media server, its readiness handoff, hardening fences, and
+the base worker image recipe that compiles it. No pod executable or server implementation
+is built from this repository.
 
-`cmd/pod-supervisor` is the pod's PID 1, process supervisor, and byte plane. It was two binaries —
-`cozy-bootstrap` and `cozy-media` — until cl-036 merged them into one artifact and one
-commit pin. **It dials nothing.** It takes no arguments and reads no configuration file:
-its whole launch surface is six ALLOWLISTED `COZY_*` environment variables, and an
-unrecognized one is a boot failure rather than an ignored default. It mints the pod's TLS
-leaf (so no credential ships in the image), binds and serves the media plane in-process,
-execs the control runtime's launch adapter by absolute path with a closed environment,
-hands each half the validated renter token DIGESTS it authenticates against, and HMACs the
-adapter's opaque readiness payload into the envelope the media plane serves.
-
-Its two exact-grant fetches went out with the provision documents they carried (cl-036,
-paired with cozy-runtime's cr-048 and Tensorhub's th-067): **a pod boots ready-but-empty**,
-and one endpoint's closure arrives on the hub-authored placement lane after the RecordOwner
-connects, not as a boot-time document. Of the three identity facts those documents were
-smuggling, one survives: `COZY_ACQUISITION_ATTEMPT_ID`, which the adapter spends as the
-worker's `--worker-id`. `COZY_ACQUISITION_ATTEMPT_ORDINAL` and `COZY_RENTAL_ID` were pure
-transit for a receipt echo the per-attempt receipt HMAC key had already proven, and went
-with it. **That diet is
-what made the merge admissible**: with no outbound door left, the fence holds the merged
-binary WHOLE to an absolute no-egress rule with no exception of any kind — a fence with a
-carve-out for a file that still egressed is the failure proto-008 documents. The emitter
-half of the same environment contract is Tensorhub's `internal/podenv`, and its image
-recipe refuses to build a pod that admits a different set of names.
-
-**What the merge costs, and what pays it.** One process is now PID 1, the parser of
-attacker-influenced request bytes, and the holder of the readiness HMAC key. Two boundaries
-buy that down and both are fenced with red arms:
-
-- **Supervision is not reachable from a request path.** The handlers live in
-  `internal/podmedia`, which the fence forbids `os/exec`, signals, and process handles
-  outright; everything that spawns, signals or reaps is in `cmd/pod-supervisor/supervise.go`,
-  which is package main and cannot be imported at all.
-- **The readiness HMAC key is wiped.** Its environment slot is unset the instant it is
-  decoded — before any listener binds or any child exists — and the bytes are zeroed by the
-  one-shot `attemptKey` that seals the envelope. A second signature is an error, not a
-  second use. Nothing outside `config.go` and `receipt.go` may even name it.
-
-Two objections did NOT survive the diet and are not why this stayed split. Key custody: the
-plane already held the pod's TLS private key, the very credential the receipt exists to
-bind, so an attacker who owns the media process gains nothing from the HMAC key. Independent
-failure domains: `supervise` already treated any child exit as fatal to the pod, so there
-were no restart semantics to lose. Media↔worker decoupling is untouched — the worker is a
-separately exec'd process either way.
-
-The one number the two halves must agree on — the readiness envelope ceiling — is
-`internal/mediawire.MaxReceiptBytes`, imported by both; the fence refuses a second spelling
-of it as a literal. It is no longer published on `/v1/health`: it crossed the wire only so
-a `cozy-bootstrap` in another repo could learn it without a credential, and the merge made
-that a compile-time read.
+The two repositories ship independently, so `internal/mediawire` declares the service name,
+revision, and health shape this client expects. `Client.Health` authenticates the request and
+refuses a missing or different revision before any input or output byte moves. Creator live
+tests use an independent minimal protocol peer; they do not retain Tensorhub server code as a
+test helper.
 
 ## Verification
 
-No automated tests. Verification is running the real thing:
+Creator is v2's test-suite exception; its suite and scripts drive real processes and protocol peers:
 
 - `scripts/redarm.py` builds each hostile input for real, runs the real binary and
   observes the typed refusal (16 arms).
@@ -601,7 +558,7 @@ No automated tests. Verification is running the real thing:
   admin writes, every refusal arm (wrong token, absent repo, closed port, a hub that
   accepts and never answers, a 200 that is not our document), and a cumulative secrecy
   check that the raw credential appears in no byte the session printed.
-- `go test ./internal/live` is the whole automated suite — nine tests that start the REAL
+- `go test ./...` is the permitted Creator suite; `internal/live` starts the real
   system and observe it, with no mocks anywhere. `TestCanonicalDocuments` writes and reads
   worker-protocol's frozen corpus byte-for-byte and refuses every semantic twin by its own
   code; `TestNumberProfile` walks Runtime's 4,561-row ES6 float oracle, which is the
@@ -611,18 +568,9 @@ No automated tests. Verification is running the real thing:
   the worker side that the orchestrator was not co-developed against; `TestLocalAPIDoor` is
   the loopback door matrix; `TestOutputRetention` is the plan/perform discipline on the one
   verb that removes a user's bytes; `TestProductPath` is install -> up -> invoke -> result ->
-  crash on the weightless fixture; and `TestPodMediaGrant`/`TestPodMediaFailsClosed` run the
-  pod's byte plane for real over a real TLS leaf — the admission matrix, the receipt served
-  byte-identically, and ten adversary digest sets that each yield NO PLANE. A test whose peer is absent SKIPS by name.
-- `scripts/verify-hardening.sh` runs the real `pod-supervisor` binary against the pod's hardening
-  claims — 30 arms: ambient `RUNPOD_*` provider identity never reaches guest truth, an
-  unknown or retired `COZY_*` name is refused BY NAME rather than ignored, the child
-  environment allowlist is exactly the reviewed five-name set, the readiness ceiling is
-  imported from `internal/mediawire` rather than restated, the renter digests reach the
-  media plane in memory (no file, no argv), the HMAC key is wiped at both ends of its life,
-  supervision sits in one file and none of it in the request path, the entrypoint refuses
-  arguments, and ten malformed credential grants each make the pod REFUSE TO BOOT rather
-  than serve unauthenticated.
+  crash on the weightless fixture. The remote-placement tests drive the real owner client
+  against an independent media-protocol peer rather than importing Tensorhub's server.
+  A test whose external peer is absent skips by name.
 - `scripts/verify-cl012.sh` + `scripts/xfer-live.py` drive the real `cozy` against a
   real tensorhub (built from a PINNED commit through a read-only `git archive`, because
   that repo has a concurrent writer), its own Postgres container, real R2 under
@@ -638,21 +586,16 @@ No automated tests. Verification is running the real thing:
   a READY worker with no weights to fill, a typed `completed` terminal, a published PNG,
   zero reserved VRAM and an empty construction digest, plus the typed failure terminal —
   `cozy down`'s proof of absence, and the verified upgrade.
-- `scripts/fence.py` enforces fourteen families: forbidden deps, the canonical tensor
+- `scripts/fence.py` enforces thirteen families: forbidden deps, the canonical tensor
   carriers TensorFS parses, interactive prompts, exit-matrix parity, a manifest lint (gate
   declaration, no `--version` global, and a `Next:`/`Examples:` disclosure on every
   implemented row), the `render` fence (one stream — an error is data and leaves on
-  stdout), the env-read fence (one reader PER PROGRAM — the CLI's and the pod's),
+  stdout), the env-read fence (the CLI's one reader),
   no lifecycle sidecar, the secret fence (no
   credential-shaped flag takes an argv value; `Reveal()` only where the value becomes a
   header), the `cas` fence (nobody composes a store path), the `api` fence (no cookie, one
-  bind per program, and a CORS header that is doored elsewhere but ABSOLUTELY refused
-  inside `internal/api` per #628), client-contract parity, the `pod` fence (the merged pod
-  binary, fenced WHOLE and with no exception: no outbound capability of any kind in either
-  half, exec in exactly one file and none of PID 1's privileges in the request path, the
-  readiness HMAC key wiped and nameable in two files only, no control-plane import, and the
-  wire contract — including the receipt ceiling as a NUMBER — declared in
-  `internal/mediawire` and restated nowhere) and
+  loopback bind, and no CORS inside `internal/api` per #628), client-contract parity, the
+  media-client contract expectation declared once in `internal/mediawire`, and
   the `tensor` fence (the tensorfs CLI has one caller). Doors are greppable:
   `//cozy:allow`, `//cozy:stdin-value`. The `cloud` family and the transfer-plane digest ban were deleted
   2026-08-28 as vocabulary rules with no failure behind them.

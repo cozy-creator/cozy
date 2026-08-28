@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Boundary fence (boundaries.md). Architecture enforcement, not a test.
 
-Fourteen families:
+Thirteen families:
   deps      forbidden dependencies (raw lines, incl. import paths and go.mod)
   impl      the CANONICAL FORMATS TensorFS parses. A second reader of safetensors/gguf/
             cozytensors here would drift from the one that produced the published bytes.
@@ -46,26 +46,6 @@ Fourteen families:
   contract  (cl-006) internal/api/routes.go and docs/client-contract.md are ONE surface,
             row for row, scope for scope. The document is what th-021's other two hosts
             implement against, so drift is a shared-contract defect, not a doc lag.
-  pod       (cl-014/cl-031/xs-004/cl-036/cl-037) THE POD SUPERVISOR, fenced WHOLE and with no
-            exception of any kind. `cmd/pod-supervisor` (PID 1 and the supervisor) and
-            internal/podmedia (the request path) were two programs until cl-036 merged
-            them; the rules that survive the merge are:
-              * NO OUTBOUND CAPABILITY, absolutely, across BOTH halves. The supervisor's
-                one door went out with the two provision documents it fetched, which is
-                what made merging admissible: there is no file left to carve out.
-              * EXEC IS THE SUPERVISOR'S ALONE, and only in cmd/pod-supervisor/supervise.go.
-                internal/podmedia parses attacker-influenced request bytes and may not
-                exec, signal, reap, or hold a process handle — that boundary is what buys
-                down PID 1 sharing an address space with an HTTP parser.
-              * THE READINESS HMAC KEY IS WIPED. Its environment name is unset where it is
-                decoded and its bytes are zeroed by the one-shot attemptKey that seals the
-                envelope; nothing outside config.go/receipt.go may name it.
-              * NEITHER HALF may import the worker protocol, the orchestrator, the owner's
-                API, or its hub/media clients — a pod that could speak a control plane is
-                the second control plane cl-014 forbids.
-              * ONE DECLARATION of the wire contract: the service name, the revision both
-                ends compare before a byte moves, and the bounds the plane publishes live
-                in internal/mediawire and are restated nowhere.
   tensor    (cl-012) the tensorfs CLI has ONE caller: internal/tfs. The configured binary
             is read there and in the config authority, nowhere else — a second package
             shelling out to `tfs` is a second byte-plane door with its own vocabulary.
@@ -102,21 +82,11 @@ DENY_PROMPT_CALLS = [
     "fmt.Scan", "fmt.Scanln", "fmt.Scanf", "fmt.Fscan", "fmt.Fscanln", "fmt.Fscanf",
 ]
 
-# ONE environment reader PER PROGRAM — the same shape as LISTEN_SITES below, and for the
-# same reason: this repo builds two binaries, and collapsing the rule to "one reader
-# somewhere" would let either program's reader go missing. Every other package in each
-# program takes the frozen typed value.
-#   config/config.go   the `cozy` CLI. Its Inherited allowlist is class A of
-#                      tracker-v2/spawn-allowlists.md (#616.d).
-#   pod-supervisor     the pod's PID 1, whose entire launch surface IS the injected environment:
-#                      it takes no arguments and reads no configuration file, so its one
-#                      reader is also its one ALLOWLIST — an unrecognized COZY_* name is
-#                      refused rather than ignored, which is what makes a renamed grant a
-#                      boot failure instead of a silent default. The media plane it serves
-#                      in-process reads no environment at all: it is handed its grant.
+# The `cozy` process has one environment reader. Its inherited allowlist is
+# class A of tracker-v2/spawn-allowlists.md (#616.d); every other package takes
+# the frozen typed value.
 ENV_READERS = {
     "internal/config/config.go": "the cozy CLI's entrypoint reader",
-    "cmd/pod-supervisor/config.go": "the pod's entrypoint reader and allowlist",
 }
 ENV_READER = " / ".join(sorted(ENV_READERS))
 DENY_ENV_CALLS = ["os.Getenv", "os.LookupEnv", "os.Environ", "syscall.Getenv", "syscall.Environ"]
@@ -169,22 +139,12 @@ REVEAL_SITES = {
 #     as an accident.
 DENY_COOKIE = ["http.Cookie", "SetCookie", "http.SetCookie", ".Cookies", ".Cookie("]
 CORS_HEADER = re.compile(r"Access-Control-Allow-", re.I)
-# (#628, owner ruling 2026-08-27) The CORS family stands, with the `//cozy:allow` door as
-# the escape a pod-side route takes when it echoes the RentalProvisionSpec's origins. Inside
-# the owner's loopback API the rule is ABSOLUTE and the door is NOT honored: that surface is
-# the DNS-rebinding target, and a doored CORS header there would be the hole arriving as a
-# comment.
+# (#628, owner ruling 2026-08-27) Inside the owner's loopback API the no-CORS
+# rule is absolute: that surface is the DNS-rebinding target.
 CORS_ABSOLUTE = "internal/api/"
-#   Two programs, two bind rules, and they are NOT the same rule (#506b). The owner's
-#   `cozy` binary binds once, on loopback, for its local client API. The POD's media plane
-#   (`internal/podmedia`, served inside `pod-supervisor` since cl-036) binds once, off-loopback
-#   on purpose — it is the leg an off-machine owner reaches — and its own rule is
-#   TLS-or-loopback, enforced in the same file. Naming both here keeps "one bind site" true
-#   PER PROGRAM instead of collapsing into "one bind site somewhere in the repo", which
-#   would let either rule go missing.
+# The Creator binary binds once, on loopback, for its local client API.
 LISTEN_SITES = {
     "internal/api/listen.go": "the owner's local client API — loopback only",
-    "internal/podmedia/listen.go": "the POD's media plane — off-loopback requires TLS",
 }
 LISTEN_SITE = " / ".join(sorted(LISTEN_SITES))
 # (cl-028 tightening) ANY net.Listen* call, not only the literal-"tcp" spelling: a bind
@@ -192,107 +152,15 @@ LISTEN_SITE = " / ".join(sorted(LISTEN_SITES))
 # ListenTCP bind is the same second door.
 LISTEN_CALL = re.compile(r"net\.Listen\w*\s*\(")
 
-# (cl-014 / xs-004 / cl-036, #506b) THE POD BINARY HAS NO OUTBOUND NETWORK, WHOLE.
-#
-# `pod-supervisor` is PID 1 of a rented pod and it is ONE process: the supervisor half
-# (cmd/pod-supervisor) and the byte-plane half (internal/podmedia) were `cozy-bootstrap` and
-# `cozy-media` until cl-036. The supervisor once held a BOUNDED egress licence — one file,
-# two exact-grant provision-document fetches — because the pod could not boot without them.
-# cr-048/th-067 retired those documents (a pod boots ready-but-empty and its closure
-# arrives on the rev-2 placement lane after the RecordOwner connects), the licence lost its
-# subject, and that is exactly what made the merge admissible: the merged binary is fenced
-# with NO EXCEPTION rather than with a carve-out for a file that still egresses, which is
-# the failure proto-008 documents.
-#
-# A pod-side process that can be talked into fetching a URL is a request-content-to-hub
-# channel with an extra step; one that can call the worker is the live RPC cl-014's
-# filesystem-handoff coupling exists to forbid; and the first `http.Get` back — a health
-# poll, a telemetry ping, a "just fetch the config" convenience — is an exfiltration
-# channel with no exact-grant checks around it. This is the structural half of "prove no
-# request-path call crosses to the worker process".
-POD_DIRS = ("cmd/pod-supervisor/", "internal/podmedia/")
-POD_DIR = " / ".join(POD_DIRS)
-DENY_POD_EGRESS = [
-    "http.Get", "http.Post", "http.PostForm", "http.Head", "http.NewRequest",
-    "http.DefaultClient", "http.Client", "http.Transport", "net.Dial", "net.DialTimeout",
-    "grpc.NewClient", "grpc.Dial",
-]
-# …and NEITHER half may import the protocol, the orchestrator, the owner's API or its
-# hub/media clients: a pod that could speak `cozy.worker.v1` would be a second control
-# plane inside the pod. `internal/mediawire` is deliberately NOT here — importing the
-# contract is the point — and neither is `internal/podmedia`, which cmd/pod-supervisor IS.
-DENY_POD_IMPORT = [
-    "protocol/cozy/worker", "internal/orchestrator", "internal/api", "internal/hub",
-    "internal/media",
-]
-# An import LINE, so a doc comment naming the owner's bind site is prose and not a door.
-POD_IMPORT_LINE = re.compile(
-    r'^\s*(?:[A-Za-z_]\w*\s+)?"github\.com/cozy-creator/cozy-creator/([^"]+)"\s*$')
-
-# (cl-036) THE PRICE OF THE MERGE, HALF ONE: SUPERVISION IS NOT REACHABLE FROM A REQUEST
-# PATH. One process is now PID 1 and the parser of attacker-influenced bytes, so every
-# privilege that belongs to PID 1 — exec, signal, reap, a process handle — is spelled in
-# ONE FILE, cmd/pod-supervisor/supervise.go, and is FORBIDDEN outright in internal/podmedia.
-# `cmd/pod-supervisor` is package main and cannot be imported, so the handlers cannot reach the
-# supervision loop even by name; this rule keeps a copy of it from growing beside them.
-POD_EXEC_SITE = "cmd/pod-supervisor/supervise.go"
-DENY_POD_EXEC = ["exec.Command", "exec.CommandContext"]
-# The import LINE, so a doc comment naming `os/exec` is prose and not a spawn door.
-EXEC_IMPORT_LINE = re.compile(r'^\s*(?:[A-Za-z_]\w*\s+)?"os/exec"\s*$')
-# Signals and process handles, denied in the request path only — the supervisor needs them.
-POD_HANDLER_DIR = "internal/podmedia/"
-DENY_HANDLER_PRIVILEGE = [
-    "exec.Command", "exec.CommandContext", "syscall.Kill", "signal.Notify",
-    "os.Process", "cmd.Wait", "syscall.SIGTERM", "syscall.SIGKILL",
-]
-
-# (cl-036) THE PRICE OF THE MERGE, HALF TWO: THE READINESS HMAC KEY IS WIPED AFTER USE.
-# Once the envelope is published the key has no purpose, and this process holds it in the
-# same address space as an HTTP parser. Two facts are fenced rather than reviewed: the key
-# is named in exactly two files, and each of those files carries its half of the wipe —
-# config.go unsets the environment slot where it decodes it, receipt.go zeroes the bytes in
-# the one call that signs with them. Deleting either half, or reading the key anywhere
-# else, is red.
-POD_KEY_HOME = {"cmd/pod-supervisor/config.go", "cmd/pod-supervisor/receipt.go"}
-POD_KEY_IDENTS = ("hmacKey", "envReceiptKey", "attemptKey", "sealAndWipe", "newAttemptKey")
-POD_KEY_WIPES = {
-    "cmd/pod-supervisor/config.go": (
-        re.compile(r"os\.Unsetenv\(envReceiptKey\)"),
-        "the environment slot must be unset where the key is decoded"),
-    "cmd/pod-supervisor/receipt.go": (
-        re.compile(r"k\.raw\[i\] = 0[\s\S]{0,80}k\.raw = nil"),
-        "the key bytes must be zeroed and dropped in the call that seals the envelope"),
-}
-
-# (cl-031) ONE DECLARATION OF THE MEDIA PLANE'S CONTRACT. The pod ships inside an image
-# pinned by commit and the owner's client floats with master, so the pair both ends
-# compare — the service name, the revision, and the bounds the plane publishes — has
-# exactly one home. A second spelling of a contract field is how the two ends drift back
-# apart in silence, which is the whole defect cl-031 closed.
+# (cl-031) Creator has one declaration of the media contract it expects.
+# Tensorhub's independently shipped server declares its own revision; the live
+# health handshake refuses skew before this client moves bytes.
 MEDIA_CONTRACT_HOME = "internal/mediawire/wire.go"
 MEDIA_CONTRACT_FIELDS = ["contract_rev"]
-# `max_receipt_bytes` left this list when it left the wire (rev 2): the health answer
-# published a ceiling nothing read, because the reader that needed it was in another repo
-# until cl-036 made the two ends one binary. The NUMBER is still fenced below.
-# …and the ceiling itself, as a NUMBER. The field-name rule above catches a second JSON
-# spelling; it did not catch what actually happened, which is that the pod supervisor
-# declared `maxReceiptEnvelopeSize = 64 << 10` of its own while it lived in another repo —
-# a second copy of one bound, agreeing by luck. Scoped to the POD, because 64 KiB is an
-# ordinary buffer size everywhere else in this tree.
-MEDIA_CEILING_LITERAL = re.compile(r"64\s*<<\s*10")
-
 # Endpoint distribution is the standing ArtifactGrant lane. The invocation media plane
 # may never grow back the retired owner-push special case for binding plans.
-MEDIA_DISTRIBUTION_DIRS = ("internal/media/", "internal/podmedia/")
+MEDIA_DISTRIBUTION_DIRS = ("internal/media/",)
 DENY_MEDIA_DISTRIBUTION = ("PutPlan", "/v1/plans/")
-
-# The supervisor holds the receipt key and the renter token hashes and has nowhere to send
-# them. Keep fencing the header anyway: the day it presents a credential is the day a pod
-# supervisor becomes a capability an attacker can aim, and this rule is what makes that
-# arrive as a red fence rather than as a diff nobody read. Scoped to cmd/pod-supervisor —
-# internal/podmedia READS an Authorization header, which is its whole admission policy.
-POD_SUPERVISOR_DIR = "cmd/pod-supervisor/"
-POD_CREDENTIAL_HEADER = re.compile(r"Authorization", re.I)
 
 ALLOW_DOOR = "//cozy:allow"
 STDIN_DOOR = "//cozy:stdin-value"
@@ -470,7 +338,7 @@ DOCUMENT_KINDS = {
     # name without its decision row; a literal in a second file is a second declaration.
     #
     # Two rows are HMAC DOMAIN-SEPARATION TAGS rather than stored documents
-    # (`cozy.pod-readiness/1`, `cozy.rental_request/1`). They are registered for the same
+    # (`cozy.rental_request/1`). They are registered for the same
     # reason and are if anything stricter: a peer repo reproduces those exact bytes to
     # verify a MAC, so a silent edit does not misparse — it fails authentication at a
     # rental boundary, which is the worst place to discover a renamed constant.
@@ -479,7 +347,6 @@ DOCUMENT_KINDS = {
     "cozy.local.EntrypointBindingRecord/2": "internal/plan/plan.go",
     "cozy.local.EvaluatedConfig/1": "internal/app/identity.go",
     "cozy.local.ExecutionEnvironment/1": "internal/app/identity.go",
-    "cozy.pod-readiness/1": "cmd/pod-supervisor/receipt.go",
     "cozy.rental_request/1": "internal/app/rentals.go",
     "cozy.video/1": "internal/video/source.go",
     "cozy.video.CreativePlan/1": "internal/video/composition.go",
@@ -569,8 +436,7 @@ def check_sources():
             # RAW: a CORS header is a string LITERAL, so the identifier scan (which blanks
             # literals) would never see one. SCOPED to the owner's loopback API (narrowed
             # 2026-08-28): a CORS header there lets any page the user's browser loads read
-            # 127.0.0.1 — the Ollama DNS-rebinding class. Off-loopback surfaces the browser
-            # is MEANT to reach cross-origin (internal/podmedia) open their own door at the route.
+            # 127.0.0.1 — the Ollama DNS-rebinding class.
             if CORS_HEADER.search(s) and not (ALLOW_DOOR in line and not p.as_posix().startswith(CORS_ABSOLUTE)):
                 where = ("the OWNER'S loopback API, where the rule is ABSOLUTE and the door is "
                          "not honored") if p.as_posix().startswith(CORS_ABSOLUTE) else \
@@ -646,79 +512,6 @@ def check_sources():
                            f"{RUNTIME_INDIRECT_HOME} — the same second execution door as the "
                            f"\"cozy-runtime\" literal, reached by indirection; only "
                            f"{DRIVER_DIR} may door it: {line.strip()}")
-            if rel.startswith(POD_DIRS):
-                for call in DENY_POD_EGRESS:
-                    if call in line:
-                        bad.append(f"{p}:{i}: [pod] '{call}' in the pod binary — it has NO "
-                                   f"outbound capability of any kind, in EITHER half. Its "
-                                   f"launch surface is the injected environment and nothing "
-                                   f"else; the two exact-grant fetches that once licensed one "
-                                   f"file went out with the provision documents (cl-036), and "
-                                   f"the merge is fenced whole precisely because there is no "
-                                   f"door left to reopen: {line.strip()}")
-                imported = POD_IMPORT_LINE.match(s_raw_line)
-                for dep in DENY_POD_IMPORT if imported else ():
-                    path = imported.group(1)
-                    if path == dep or path.startswith(dep + "/"):
-                        bad.append(f"{p}:{i}: [pod] the pod binary imports '{dep}' — it mints "
-                                   f"credentials, serves bytes and execs the adapter; a "
-                                   f"control-plane client here is the second control plane "
-                                   f"inside the pod that cl-014 forbids: {line.strip()}")
-                if MEDIA_CEILING_LITERAL.search(line):
-                    bad.append(f"{p}:{i}: [pod] the receipt ceiling is spelled as a literal in "
-                               f"the pod binary — one end writes that envelope and the other "
-                               f"refuses it, so the number lives in {MEDIA_CONTRACT_HOME} and is "
-                               f"imported (cl-031's defect was two copies agreeing by luck): "
-                               f"{line.strip()}")
-                if rel not in POD_KEY_HOME:
-                    for ident in POD_KEY_IDENTS:
-                        if ident in idents:
-                            bad.append(f"{p}:{i}: [pod] the readiness HMAC key is named in "
-                                       f"'{rel}' — it lives in "
-                                       f"{' / '.join(sorted(POD_KEY_HOME))} and nowhere else. "
-                                       f"It is unset from the environment where it is decoded "
-                                       f"and zeroed where the envelope is sealed; a third "
-                                       f"reader is a copy that outlives the wipe (cl-036): "
-                                       f"{line.strip()}")
-                            break
-            # EXEC IS THE SUPERVISOR'S ALONE, and it lives in one file. Outside it, in
-            # either half of the pod, an exec is a second spawn door beside the one the
-            # merge concentrated; inside internal/podmedia it is also a privilege reachable
-            # from a request path, which is the cost the merge had to buy down.
-            if rel.startswith(POD_DIRS) and rel != POD_EXEC_SITE:
-                for call in DENY_POD_EXEC + (["os/exec"] if EXEC_IMPORT_LINE.match(s_raw_line) else []):
-                    if call in line or call == "os/exec":
-                        bad.append(f"{p}:{i}: [pod] '{call}' outside {POD_EXEC_SITE} — the pod "
-                                   f"execs exactly one child and does it in the supervision "
-                                   f"file. Everything that spawns, signals or reaps is spelled "
-                                   f"there so that no part of it sits beside the request "
-                                   f"handlers (cl-036): {line.strip()}")
-            if rel.startswith(POD_HANDLER_DIR):
-                for call in DENY_HANDLER_PRIVILEGE + (["os/exec"] if EXEC_IMPORT_LINE.match(s_raw_line) else []):
-                    if call in line or call == "os/exec":
-                        bad.append(f"{p}:{i}: [pod] '{call}' in the pod's REQUEST PATH — this "
-                                   f"package parses attacker-influenced bytes and holds none "
-                                   f"of PID 1's privileges: it may not exec, signal, reap or "
-                                   f"hold a process handle. That boundary is what makes one "
-                                   f"process acceptable (cl-036): {line.strip()}")
-            if rel.startswith(POD_SUPERVISOR_DIR):
-                # RAW, because a header name is a string literal the identifier scan blanks;
-                # a whole-line comment is prose (same convention as check_media_contract).
-                if not s_raw_line.strip().startswith("//") and \
-                        POD_CREDENTIAL_HEADER.search(s_raw_line):
-                    bad.append(f"{p}:{i}: [pod] the pod supervisor sets an Authorization "
-                               f"header — it holds the receipt key and the renter token "
-                               f"hashes and has nowhere to send them; a supervisor that "
-                               f"presents a credential is a capability an attacker can aim: "
-                               f"{s_raw_line.strip()}")
-    for home, (pattern, why) in POD_KEY_WIPES.items():
-        path = pathlib.Path(home)
-        if not path.exists():
-            bad.append(f"{home}: [pod] the pod's key-wipe file is missing — {why}")
-        elif not pattern.search(path.read_text()):
-            bad.append(f"{home}: [pod] the readiness HMAC key's wipe is gone — {why}. "
-                       f"Once the envelope is published the key has no purpose and this "
-                       f"process is also an HTTP parser (cl-036)")
     return bad
 
 
@@ -976,10 +769,7 @@ print(
     f"render(one stream@{RENDER_SRC}) secret({SECRET_FLAG.pattern} + Reveal@{len(REVEAL_SITES)}) "
     f"cas(store-path) tensor(tfs@{len(TFS_SITES)}) "
     f"api({len(DENY_COOKIE)} cookie + cors(absolute@{CORS_ABSOLUTE}) + listen@{len(LISTEN_SITES)} programs) "
-    f"pod({len(DENY_POD_EGRESS)} egress(absolute@{POD_DIR}) + exec@{POD_EXEC_SITE} "
-    f"+ {len(DENY_HANDLER_PRIVILEGE)} privileges!{POD_HANDLER_DIR} + key-wipe@{len(POD_KEY_WIPES)} "
-    f"+ no-credential@{POD_SUPERVISOR_DIR} + {len(DENY_POD_IMPORT)} imports "
-    f"+ {len(MEDIA_CONTRACT_FIELDS)} contract fields + ceiling literal@{MEDIA_CONTRACT_HOME}) "
+    f"media-client({len(MEDIA_CONTRACT_FIELDS)} contract fields@{MEDIA_CONTRACT_HOME}) "
     f"runtime({len(RUNTIME_VERBS_DENY)} denied verbs@{len(RUNTIME_SITES)} + indirection) "
     f"embed({len(DENY_EMBED)} words, scripts allow@{len(PY_ALLOW)}) "
     f"contract({len(parse_go_routes(pathlib.Path('internal/api/routes.go')))} routes) video-boundary"

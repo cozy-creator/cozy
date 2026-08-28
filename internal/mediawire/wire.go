@@ -1,21 +1,6 @@
-// Package mediawire is the ONE declaration of the pod media plane's contract: the name the
-// service answers to, the integer revision both ends must agree on before a byte moves,
-// and the bounds the plane PUBLISHES instead of each end restating.
-//
-// It exists because the two ends ship separately and always have. The plane
-// (`internal/podmedia`, served inside `cmd/pod-supervisor`) is compiled into the pod image from a
-// commit pin (the image recipe's CREATOR_COMMIT) while the owner's client in
-// `internal/media` floats with master, and until now the only version
-// signal between them was the literal `/v1/` in a URL path. A
-// renumbered answer field or a moved route would have been MISPARSED rather than refused.
-// The control leg one plane over already forecloses exactly this on `pb.WireSchemaRev`
-// (`internal/orchestrator/owner.go`); this is that check for the byte plane.
-//
-// A REVISION IS NOT A DOCUMENT KIND. This plane authors no canonical document and gets no
-// `cozy.<name>/<N>` format name: proto-007 (#616.a) demoted the one it briefly had —
-// an ephemeral HTTP body wearing a format name that a sibling binary substring-matched —
-// and the fence reddens on any such literal outside the document registry. A liveness
-// answer may carry a plain service identity and a revision, and that is all this is.
+// Package mediawire is Creator's expectation of Tensorhub's pod media HTTP
+// contract. The server ships independently in the base worker image, so the
+// client compares both service identity and revision before moving a byte.
 package mediawire
 
 // Service is what the pod's media plane calls itself in every answer that identifies it.
@@ -39,18 +24,6 @@ const Service = "cozy-media"
 // pod state handed out on every pre-flight, and a shape both ends must keep agreeing on.
 const ContractRev = 2
 
-// MaxReceiptBytes is the ceiling on the pod readiness envelope that
-// `GET /v1/bootstrap/receipt` serves. It is THIS repo's number because the plane is what
-// refuses an oversized one; `cmd/pod-supervisor` writes that file and must not exceed it, and
-// IMPORTS this constant rather than declaring a second, silently divergent copy of it —
-// which is exactly what it did while it lived in another repo. The two are one process
-// since cl-036 and the rule did not relax: one declaration, imported at both ends.
-const MaxReceiptBytes = 64 << 10
-
-// Rev answers the revision as a document carries it. It is a pointer so that "answered a
-// revision" and "answered none" are different facts on the wire rather than one zero.
-func Rev() *int { v := ContractRev; return &v }
-
 // Health is the exact document `GET /v1/health` answers, and it is ONLY the contract: who
 // is answering and at which revision. That is the whole question the route exists to
 // settle — the owner's client asks it once, before it uploads, and refuses the rental on
@@ -63,6 +36,3 @@ type Health struct {
 	Service     string `json:"service"`
 	ContractRev *int   `json:"contract_rev,omitempty"`
 }
-
-// Ours is this build's answer.
-func Ours() Health { return Health{Service: Service, ContractRev: Rev()} }

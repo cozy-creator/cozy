@@ -282,8 +282,8 @@ func codeFor(status int) exit.Code {
 // answers" and "the pod admits this host" are one answer instead of two — and it is the
 // media plane's ONE version handshake, which is why it runs before any byte moves.
 //
-// The two ends of this plane are released separately: the pod's `pod-supervisor` is compiled
-// into its image from a commit pin and this client floats with master, so a route or a
+// The two ends of this plane are released separately: Tensorhub compiles `pod-supervisor`
+// into its base worker image while this client floats with Creator master, so a route or a
 // field can move on one side alone. The revision closes that: a plane at another revision,
 // or one too old to declare a revision at all, is refused here rather than fed bytes whose
 // answer shape this host would misread. It is the byte plane's `pb.WireSchemaRev` check
@@ -317,9 +317,9 @@ func (c *Client) Health() *exit.Error {
 func (c *Client) skew(format string, args ...any) *exit.Error {
 	return exit.Named(exit.Conflict, "media_contract_mismatch",
 		"the pod's media plane at %s "+format, append([]any{c.spec.Addr}, args...)...).
-		WithRemedy("the pod's media server is built into its image from a PINNED "+
-			"cozy-creator commit (base worker image's `versions.env: CREATOR_COMMIT`) and "+
-			"this host floats with master, so the two ends drift by construction. Rebuild "+
+		WithRemedy("the pod's media server is built into its image from a pinned "+
+			"Tensorhub recipe commit while this host floats with Creator master, so the "+
+			"two ends can differ. Rebuild "+
 			"the pod image from a commit that speaks rev %d, or run an owner that speaks "+
 			"what the pod does. Nothing is uploaded to a plane whose answers this host "+
 			"cannot read: a misparsed field is worse than a refused rental.",
