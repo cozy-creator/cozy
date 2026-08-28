@@ -58,6 +58,10 @@ func TestRemotePlacementRevisionReusesClaimAndPersistsAcquisition(t *testing.T) 
 	owner, problem := orchestrator.Open(orchestrator.Options{
 		Layout: layout, Store: store, Log: io.Discard, MaxOutputMiB: 1,
 		ObserveRental: func(orchestrator.RentalObservation) *exit.Error { return nil },
+		RelayRentalSession: func(context.Context, *orchestrator.WorkerConnection,
+			orchestrator.RentalSessionEvidence) *exit.Error {
+			return nil
+		},
 		ArtifactGrants: func(context.Context, *orchestrator.WorkerConnection) (
 			uint64, *pb.ArtifactGrant, *exit.Error) {
 			stateMu.Lock()

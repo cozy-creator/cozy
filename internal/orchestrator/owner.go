@@ -527,9 +527,10 @@ func (c *Orchestrator) onClaimAck(w *worker, s *session, ack *pb.ClaimAck) *exit
 		return e
 	}
 	if w.spec.Connection != nil {
-		if c.opt.ObserveRental == nil || w.spec.Connection.RentalID == "" {
+		if c.opt.ObserveRental == nil || c.opt.RelayRentalSession == nil ||
+			w.spec.Connection.RentalID == "" {
 			e := exit.Named(exit.Structural, "rental.worker_readback_unowned",
-				"the attached worker has no durable rental observation owner")
+				"the attached worker has no durable rental observation and convergence-relay owner")
 			c.refuseClaim(w, e)
 			return e
 		}
