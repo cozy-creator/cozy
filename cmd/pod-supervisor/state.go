@@ -103,7 +103,7 @@ func mintCertificate(leaseExpiry time.Time) error {
 func certificateTemplate(serial *big.Int, now, leaseExpiry time.Time) *x509.Certificate {
 	return &x509.Certificate{
 		SerialNumber: serial,
-		Subject:      pkix.Name{CommonName: "cozy-pod"},
+		Subject:      pkix.Name{CommonName: "pod-supervisor"},
 		NotBefore:    now.Add(-5 * time.Minute),
 		NotAfter:     leaseExpiry.Add(time.Hour),
 		KeyUsage:     x509.KeyUsageDigitalSignature,

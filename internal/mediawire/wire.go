@@ -3,7 +3,7 @@
 // and the bounds the plane PUBLISHES instead of each end restating.
 //
 // It exists because the two ends ship separately and always have. The plane
-// (`internal/podmedia`, served inside `cmd/cozy-pod`) is compiled into the pod image from a
+// (`internal/podmedia`, served inside `cmd/pod-supervisor`) is compiled into the pod image from a
 // commit pin (the image recipe's CREATOR_COMMIT) while the owner's client in
 // `internal/media` floats with master, and until now the only version
 // signal between them was the literal `/v1/` in a URL path. A
@@ -19,7 +19,7 @@
 package mediawire
 
 // Service is what the pod's media plane calls itself in every answer that identifies it.
-// It is the PLANE's name and not a binary's: cl-036 merged the plane into `cozy-pod` and
+// It is the PLANE's name and not a binary's: cl-036 merged the plane into `pod-supervisor` and
 // deliberately did not touch this string, because the owner compares it before a byte
 // moves and a rename would refuse every pod that had not been rebuilt.
 const Service = "cozy-media"
@@ -41,7 +41,7 @@ const ContractRev = 2
 
 // MaxReceiptBytes is the ceiling on the pod readiness envelope that
 // `GET /v1/bootstrap/receipt` serves. It is THIS repo's number because the plane is what
-// refuses an oversized one; `cmd/cozy-pod` writes that file and must not exceed it, and
+// refuses an oversized one; `cmd/pod-supervisor` writes that file and must not exceed it, and
 // IMPORTS this constant rather than declaring a second, silently divergent copy of it —
 // which is exactly what it did while it lived in another repo. The two are one process
 // since cl-036 and the rule did not relax: one declaration, imported at both ends.
