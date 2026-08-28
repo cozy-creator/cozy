@@ -23,8 +23,8 @@ schema it names. It rides `Claim.wire_schema_digest` and is checked before any o
 field. The retired `wire_minor.go` is deleted: a constant still claiming currency beside a
 fresh binding is the whole of #530-A1.
 
-Schema rev 5 keeps wire minor 0 but adds the paired finalize frame slots and changes the
-canonical outcome document to `AttemptOutcomeBody/3`; the schema digest is the live-session
+Schema rev 5 moves wire minor to 1 for the paired finalize frame slots and changes the canonical
+outcome document to `AttemptOutcomeBody/3`; the schema digest remains the live-session shape
 fence. Rev 4 changed no live wire number or document version: it only tombstoned the two retired
 field numbers (`OutputManifest` 2, `TriageBundleRef` 2), moving the descriptor and schema digest.
 Rev 3 before it also changed no wire number or document version; it hardcut numeric origin 4 from

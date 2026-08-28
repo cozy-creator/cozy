@@ -237,6 +237,19 @@ func jobFields(state api.JobState, full bool) []render.Field {
 		}
 		fields = append(fields, render.Field{K: "outputs", V: outs})
 	}
+	if len(state.Artifacts) > 0 {
+		artifacts := make([]string, 0, len(state.Artifacts))
+		for _, artifact := range state.Artifacts {
+			state := strings.ToLower(artifact.Disposition)
+			if artifact.Outcome != "" {
+				state = strings.ToLower(artifact.Outcome)
+			}
+			artifacts = append(artifacts, fmt.Sprintf("#%d %s %s receipt=%s root=%s",
+				artifact.Attempt, artifact.OutputSlot, state,
+				artifact.ReceiptDigest, artifact.ScratchRootID))
+		}
+		fields = append(fields, render.Field{K: "artifacts", V: artifacts})
+	}
 	if state.Result != nil {
 		fields = append(fields, render.Field{K: "result", V: state.Result})
 	}

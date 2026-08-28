@@ -34,7 +34,8 @@ type JobFacts struct {
 	DescriptorID string
 	// Outputs are the job's declared asset result field paths. They ARE the output ids
 	// the publication grant names, one destination each.
-	Outputs []string
+	Outputs         []string
+	ArtifactOutputs []orchestrator.ArtifactOutput
 	// Publishes is the job's own `publishes=` declaration. A grant mints off the
 	// DECLARATION, never off the kind (cr-009).
 	Publishes bool
@@ -67,9 +68,10 @@ func (f *Facts) JobSpec(function string, devices []string) (orchestrator.WorkerL
 			InstallID:        f.Install.ID,
 			DescriptorDigest: f.Install.Descriptor,
 			Jobs: []*orchestrator.JobPlan{{
-				Function:     facts.Name,
-				DescriptorID: facts.DescriptorID,
-				Outputs:      facts.Outputs,
+				Function:        facts.Name,
+				DescriptorID:    facts.DescriptorID,
+				Outputs:         facts.Outputs,
+				ArtifactOutputs: facts.ArtifactOutputs,
 				// The record's key set is CLOSED at both ends: `plan.py::JobBinding.read`
 				// refuses an unknown key, exactly as the binding record's reader does.
 				Record: map[string]any{
@@ -128,9 +130,24 @@ func (f *Facts) Job(function string) (*JobFacts, *exit.Error) {
 			"`cozy-runtime describe %s` named no job_descriptor_id", function).
 			WithRemedy("the id is the runtime's own derivation (cr-016); a release pinning an older runtime cannot be dispatched by it")
 	}
+	assets := AssetPaths(declared.Result)
+	if len(assets) > 0 && len(declared.ArtifactOutputs) > 0 {
+		return nil, exit.Named(exit.Structural, "mixed_job_output_kinds",
+			"job %s mixes %d result asset output(s) with %d artifact output(s); rev5 OutputBinding cannot distinguish them",
+			function, len(assets), len(declared.ArtifactOutputs))
+	}
+	artifactOutputs := make([]orchestrator.ArtifactOutput, 0, len(declared.ArtifactOutputs))
+	outputs := append([]string(nil), assets...)
+	for _, output := range declared.ArtifactOutputs {
+		artifactOutputs = append(artifactOutputs, orchestrator.ArtifactOutput{
+			OutputID: output.OutputID, MimeType: output.MimeType, MaxBytes: output.MaxBytes,
+		})
+		outputs = append(outputs, output.OutputID)
+	}
 	facts := &JobFacts{
-		Name: function, DescriptorID: said.DescriptorID, Outputs: AssetPaths(declared.Result),
-		Publishes: declared.Publishes, GPUCount: declared.Resources.GPUCount,
+		Name: function, DescriptorID: said.DescriptorID, Outputs: outputs,
+		ArtifactOutputs: artifactOutputs,
+		Publishes:       declared.Publishes, GPUCount: declared.Resources.GPUCount,
 	}
 	return facts, nil
 }

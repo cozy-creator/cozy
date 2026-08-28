@@ -477,8 +477,8 @@ func (c *Orchestrator) onOutcome(s *session, t *pb.AttemptOutcome) {
 		return
 	}
 	// 2. The document is parsed under UNKNOWN-FIELD REFUSAL and the re-emit law. It is an
-	//    AttemptOutcomeBody/2 — a NEW document version, because `execution_started` is a
-	//    new key and a digest-fenced document is not additively versioned (#480c/#481).
+	//    AttemptOutcomeBody/3 — a NEW document version, because artifact receipts are a
+	//    new key and a digest-fenced document is not additively versioned (th-049).
 	doc, err := canonical.Read(t.OutcomeCanonicalBytes, &pb.AttemptOutcomeBody{})
 	if err != nil {
 		refuse("the outcome document is inadmissible (%s)", err)
@@ -521,16 +521,34 @@ func (c *Orchestrator) onOutcome(s *session, t *pb.AttemptOutcome) {
 		refuse("no request row to settle")
 		return
 	}
+	attemptRow, e := c.opt.Store.AttemptRow(t.RequestId, int64(ordinal))
+	if e != nil || attemptRow == nil {
+		refuse("no assigned attempt row to settle")
+		return
+	}
+	declaredArtifactOutputs, e := decodeArtifactOutputs(attemptRow.ArtifactOutputs)
+	if e != nil {
+		refuse("%s", e.Message)
+		return
+	}
+	if len(declaredArtifactOutputs) > 0 && len(doc.Sub("output_manifest").List("outputs")) > 0 {
+		refuse("artifact-only job also returned ordinary output-manifest entries")
+		return
+	}
+	artifactReceipts, receiptsBySlot, e := artifactReceiptsFromOutcome(*req, *attemptRow, doc)
+	if e != nil {
+		refuse("%s", e.Message)
+		return
+	}
 	// An exact replay of a terminal already in the authority needs only another ack. In
 	// particular it must not fetch pod outputs again: after the first mirror and ack this
 	// owner is allowed to delete the remote attempt subtree, while the durable local output
 	// rows and bytes remain the accepted answer.
 	knownReplay := false
-	if prior, e := c.opt.Store.AttemptRow(t.RequestId, int64(ordinal)); e == nil && prior != nil &&
-		(prior.State == "terminal" || prior.State == "closed") {
-		if prior.TerminalDigest != shortNone(t.OutcomeDigest) {
+	if attemptRow.State == "terminal" || attemptRow.State == "closed" {
+		if attemptRow.TerminalDigest != shortNone(t.OutcomeDigest) {
 			refuse("the attempt already closed with terminal %s, not %s",
-				shortDigest(prior.TerminalDigest), shortDigest(shortNone(t.OutcomeDigest)))
+				shortDigest(attemptRow.TerminalDigest), shortDigest(shortNone(t.OutcomeDigest)))
 			return
 		}
 		knownReplay = true
@@ -566,6 +584,12 @@ func (c *Orchestrator) onOutcome(s *session, t *pb.AttemptOutcome) {
 	// being minted.
 	requeuing := requeueable(status, cause, origin, executionStarted)
 	kept := triage.keep(status, cause, doc.Str("safe_message"), outputs, requeuing)
+	artifactFinalizations, e := artifactFinalizationIntents(
+		*req, *attemptRow, status, requeuing, receiptsBySlot)
+	if e != nil {
+		refuse("%s", e.Message)
+		return
+	}
 
 	// THE PUBLICATION, for a job. The attempt's staged writes are PROMOTED into the
 	// addressable publication root first, and the row that makes the publication exist
@@ -579,7 +603,7 @@ func (c *Orchestrator) onOutcome(s *session, t *pb.AttemptOutcome) {
 	// goes on to succeed. Observed live: attempt 1 of a killed job committed an empty
 	// `local/_job-…` publication seconds before attempt 2 published the real one.
 	var publication *records.Publication
-	if req.IsJob() && !requeuing && !knownReplay {
+	if req.IsJob() && len(declaredArtifactOutputs) == 0 && !requeuing && !knownReplay {
 		if e := c.promote(*req, ordinal, outputs); e != nil {
 			refuse("%s", e.Message)
 			return
@@ -596,6 +620,7 @@ func (c *Orchestrator) onOutcome(s *session, t *pb.AttemptOutcome) {
 		TriageSubject: triage.Subject, TriageDigest: triage.Digest,
 		TriageLength: triage.Length, TriagePath: triage.Path,
 		Body: t.OutcomeCanonicalBytes, Outputs: outputs,
+		ArtifactReceipts: artifactReceipts, ArtifactFinalizations: artifactFinalizations,
 		EventType: kept.Type, EventPayload: kept.Payload,
 		// A requeueing request is QUEUED for its next ordinal, not failed. Writing the
 		// attempt's own status onto the request row would make the status document say
@@ -618,6 +643,10 @@ func (c *Orchestrator) onOutcome(s *session, t *pb.AttemptOutcome) {
 			"became visible in the SAME transaction", t.RequestId, ordinal, status, cause,
 			origin, executionStarted, float64(time.Since(began).Microseconds())/1000,
 			len(outputs))
+		if len(artifactReceipts) > 0 {
+			c.logf("AttemptOutcome %s#%d durably recorded %s before acknowledgement",
+				t.RequestId, ordinal, artifactReceiptSummary(artifactReceipts))
+		}
 		if publication != nil {
 			c.logf("publication %s committed: %d entr(y|ies), %d B, root %s",
 				publication.Repo, publication.Entries, publication.Bytes, publication.Root)
@@ -627,29 +656,19 @@ func (c *Orchestrator) onOutcome(s *session, t *pb.AttemptOutcome) {
 			"nothing applied twice", t.RequestId, ordinal)
 	}
 
-	// The ack follows the COMMIT. A crash before this line replays; a crash after it is
-	// a closed attempt either way. The echoed (outcome_id, outcome_digest) are COMPARED by
-	// the worker and never recomputed: an ack naming a different pair is not an ack, and
-	// replay continues.
-	ack := &pb.AttemptOutcomeAck{
-		RequestId: t.RequestId, AttemptOrdinal: ordinal,
-		InvocationSpecDigest: t.InvocationSpecDigest,
-		OutcomeId:            t.OutcomeId, OutcomeDigest: t.OutcomeDigest,
-	}
-	ack.RecordOwnerEpoch, ack.ControlStreamGeneration, ack.WorkerBootId =
-		recordOwnerEpoch, s.generation, s.bootID
-	if !s.send(&pb.RecordOwnerFrame{Msg: &pb.RecordOwnerFrame_OutcomeAck{OutcomeAck: ack}}) {
-		c.logf("OutcomeAck %s#%d was not queued: the closed stream owes a replay", t.RequestId, ordinal)
+	// Artifact decisions are independent frames, but the worker may reclaim after Ack. Send
+	// every persisted first-wins intent now and withhold Ack until their exact results land.
+	pending, e := c.sendPendingArtifactFinalizations(s, t.RequestId, int64(ordinal))
+	if e != nil {
+		refuse("artifact finalization remains pending: %s", e.Message)
 		return
 	}
-	if e := c.opt.Store.Closed(t.RequestId, int64(ordinal)); e != nil {
-		c.logf("OutcomeAck %s#%d was queued but closure is still owed: %s",
-			t.RequestId, ordinal, e.Message)
+	if pending > 0 {
+		c.logf("AttemptOutcome %s#%d remains unacked behind %d artifact finalization(s)",
+			t.RequestId, ordinal, pending)
 		return
 	}
-	req.State = requeueState(status, requeuing)
-	c.afterAck(*req, records.Attempt{RequestID: t.RequestId, Attempt: int64(ordinal),
-		TerminalStatus: status, TerminalCause: cause, SafeMessage: doc.Str("safe_message")}, holder)
+	c.ackSettledOutcome(s, t.RequestId, ordinal)
 }
 
 // afterAck is the one post-terminal continuation, shared by the live frame and snapshot

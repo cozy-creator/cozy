@@ -322,6 +322,12 @@ func (c *Orchestrator) converse(w *worker, addr string) error {
 			c.onCheckpoint(s, r)
 		case *pb.WorkerFrame_CheckpointAck:
 			// the worker's echo of a receipt already durable here; nothing to apply
+		case *pb.WorkerFrame_ArtifactFinalizeResult:
+			r := m.ArtifactFinalizeResult
+			if c.fenced(s, r.RecordOwnerEpoch, r.ControlStreamGeneration, r.WorkerBootId) {
+				continue
+			}
+			c.onArtifactFinalizeResult(s, r)
 		}
 	}
 }

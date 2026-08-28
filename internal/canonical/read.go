@@ -2,10 +2,13 @@ package canonical
 
 import (
 	"bytes"
+	"encoding/base64"
 	"strconv"
 	"strings"
 
 	"google.golang.org/protobuf/proto"
+
+	pb "github.com/cozy-creator/cozy-creator/protocol/cozy/worker/v1"
 )
 
 // Read turns exact canonical bytes into a typed document. It refuses everything the
@@ -102,8 +105,161 @@ func semantics(name string, d Doc) error {
 						`"none"; an omitted or empty libc is a second spelling of the same environment`)
 			}
 		}
+	case "cozy.worker.v1.AttemptOutcomeBody":
+		return artifactReceiptList(d)
+	case "cozy.worker.v1.ArtifactReceipt":
+		return artifactReceipt(d)
+	case "cozy.worker.v1.ArtifactFinalizeDecision":
+		return artifactFinalizeDecision(d)
+	case "cozy.worker.v1.ArtifactFinalizeResult":
+		return artifactFinalizeResult(d)
 	}
 	return nil
+}
+
+func artifactReceiptList(d Doc) error {
+	raw, present := d["artifact_receipts"]
+	if !present {
+		return nil
+	}
+	items, ok := raw.([]Value)
+	if !ok || len(items) == 0 {
+		return refuse("artifact_receipt_shape", "artifact_receipts is a non-empty list when present")
+	}
+	if len(items) > pb.MaxArtifactReceipts {
+		return refuse("artifact_receipt_count_cap", "%d receipts exceeds the %d-item cap",
+			len(items), pb.MaxArtifactReceipts)
+	}
+	aggregate, prior := 0, ""
+	for _, item := range items {
+		fields, ok := item.(map[string]Value)
+		if !ok {
+			return refuse("artifact_receipt_shape", "an artifact_receipts item is not an object")
+		}
+		receipt, size, err := readArtifactReceiptRef(Doc(fields))
+		if err != nil {
+			return err
+		}
+		aggregate += size
+		slot := receipt.Str("output_slot")
+		if slot <= prior {
+			return refuse("artifact_receipt_order", "output slot %q is not strictly after %q", slot, prior)
+		}
+		prior = slot
+	}
+	if aggregate > pb.MaxArtifactReceiptAggregateBytes {
+		return refuse("artifact_receipt_aggregate_cap", "%d receipt bytes exceeds the %d-byte cap",
+			aggregate, pb.MaxArtifactReceiptAggregateBytes)
+	}
+	return nil
+}
+
+func artifactReceipt(d Doc) error {
+	for _, field := range []string{"owner_authority_scope", "request_id", "invocation_spec_digest",
+		"output_slot", "artifact_transaction_id", "tensorfs_receipt_digest",
+		"tensorfs_receipt_canonical_bytes"} {
+		if d.Str(field) == "" {
+			return refuse("artifact_receipt_incomplete", "%s is empty or absent", field)
+		}
+	}
+	nested, err := decodeCanonicalBytes(d.Str("tensorfs_receipt_canonical_bytes"))
+	if err != nil {
+		return refuse("artifact_receipt_nested_malformed", "%s", err)
+	}
+	if !sameDigest(nested, d.Str("tensorfs_receipt_digest")) {
+		return refuse("artifact_receipt_nested_digest_mismatch",
+			"tensorfs_receipt_digest does not hash the exact carried bytes")
+	}
+	if _, err := Raw(d.Str("invocation_spec_digest")); err != nil {
+		return refuse("artifact_receipt_identity_malformed", "invocation_spec_digest: %s", err)
+	}
+	return nil
+}
+
+func artifactFinalizeDecision(d Doc) error {
+	for _, field := range []string{"owner_authority_scope", "request_id", "invocation_spec_digest", "output_slot"} {
+		if d.Str(field) == "" {
+			return refuse("artifact_finalize_decision_incomplete", "%s is empty or absent", field)
+		}
+	}
+	disposition := d.Int("disposition")
+	receipt, root := d.Str("artifact_receipt_digest"), d.Str("scratch_root_id")
+	if receipt != "" {
+		if _, err := Raw(receipt); err != nil {
+			return refuse("artifact_finalize_decision_shape", "artifact_receipt_digest: %s", err)
+		}
+	}
+	switch pb.ArtifactFinalizeDisposition(disposition) {
+	case pb.ArtifactFinalizeDisposition_ARTIFACT_FINALIZE_DISPOSITION_ADOPT:
+		if receipt != "" && root != "" {
+			return nil
+		}
+	case pb.ArtifactFinalizeDisposition_ARTIFACT_FINALIZE_DISPOSITION_ABANDON:
+		if receipt != "" && root == "" {
+			return nil
+		}
+	case pb.ArtifactFinalizeDisposition_ARTIFACT_FINALIZE_DISPOSITION_ABANDON_UNCOMMITTED:
+		if receipt == "" && root == "" {
+			return nil
+		}
+	}
+	return refuse("artifact_finalize_decision_shape", "disposition %d has an invalid receipt/root shape", disposition)
+}
+
+func artifactFinalizeResult(d Doc) error {
+	for _, field := range []string{"owner_authority_scope", "request_id", "invocation_spec_digest", "output_slot"} {
+		if d.Str(field) == "" {
+			return refuse("artifact_finalize_result_incomplete", "%s is empty or absent", field)
+		}
+	}
+	outcome := pb.ArtifactFinalizeOutcome(d.Int("outcome"))
+	rawReceipt, hasReceipt := d["artifact_receipt"]
+	if outcome != pb.ArtifactFinalizeOutcome_ARTIFACT_FINALIZE_OUTCOME_ADOPTED &&
+		outcome != pb.ArtifactFinalizeOutcome_ARTIFACT_FINALIZE_OUTCOME_ABANDONED {
+		return refuse("artifact_finalize_result_shape", "outcome %d is not final", outcome)
+	}
+	if outcome == pb.ArtifactFinalizeOutcome_ARTIFACT_FINALIZE_OUTCOME_ADOPTED && !hasReceipt {
+		return refuse("artifact_finalize_result_shape", "ADOPTED requires its exact receipt")
+	}
+	if !hasReceipt {
+		return nil
+	}
+	fields, ok := rawReceipt.(map[string]Value)
+	if !ok {
+		return refuse("artifact_finalize_result_shape", "artifact_receipt is not an object")
+	}
+	_, _, err := readArtifactReceiptRef(Doc(fields))
+	return err
+}
+
+func readArtifactReceiptRef(ref Doc) (Doc, int, error) {
+	if len(ref) != 2 || ref.Str("artifact_receipt_digest") == "" ||
+		ref.Str("artifact_receipt_canonical_bytes") == "" {
+		return nil, 0, refuse("artifact_receipt_ref_shape", "the reference has exactly digest and bytes")
+	}
+	data, err := decodeCanonicalBytes(ref.Str("artifact_receipt_canonical_bytes"))
+	if err != nil {
+		return nil, 0, refuse("artifact_receipt_malformed", "%s", err)
+	}
+	if len(data) == 0 || len(data) > pb.MaxArtifactReceiptBytes {
+		return nil, 0, refuse("artifact_receipt_item_cap", "%d B is outside the 1..%d B range",
+			len(data), pb.MaxArtifactReceiptBytes)
+	}
+	if !sameDigest(data, ref.Str("artifact_receipt_digest")) {
+		return nil, 0, refuse("artifact_receipt_digest_mismatch",
+			"artifact_receipt_digest does not hash the exact carried bytes")
+	}
+	receipt, err := Read(data, &pb.ArtifactReceipt{})
+	return receipt, len(data), err
+}
+
+func decodeCanonicalBytes(value string) ([]byte, error) {
+	return base64.StdEncoding.Strict().DecodeString(value)
+}
+
+func sameDigest(data []byte, spelled string) bool {
+	raw, err := Raw(spelled)
+	return err == nil && bytes.Equal(Digest(data), raw)
 }
 
 // Str reads one string field off a parsed document; a missing or wrong-typed field

@@ -107,7 +107,7 @@ func sectionAttempt() {
 
 	head("the outcome document, read back from the ONE authority")
 	doc, rerr := canonical.Read(result.Body, &pb.AttemptOutcomeBody{})
-	check("the journaled AttemptOutcomeBody/2 re-reads as canonical bytes", rerr == nil, detailOf(rerr))
+	check("the journaled AttemptOutcomeBody/3 re-reads as canonical bytes", rerr == nil, detailOf(rerr))
 	if rerr == nil {
 		env := doc.Sub("result")
 		inline, _ := env["inline_result"].(string)

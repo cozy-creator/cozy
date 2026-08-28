@@ -35,6 +35,7 @@ import (
 
 	"github.com/cozy-creator/cozy-creator/internal/canonical"
 	"github.com/cozy-creator/cozy-creator/internal/exit"
+	"github.com/cozy-creator/cozy-creator/internal/orchestrator"
 )
 
 // DescriptorFile is the name cr-003 froze. It is committed in the endpoint's source and
@@ -68,9 +69,18 @@ type Entrypoint struct {
 	Request   Struct `json:"request"`
 	Result    Struct `json:"result"`
 	Publishes bool   `json:"publishes"`
-	Resources struct {
+	// ArtifactOutputs is the job's explicit ArtifactSink slot set. It is separate from
+	// result asset fields because worker-protocol rev5 OutputBinding has no kind.
+	ArtifactOutputs []ArtifactOutput `json:"artifact_outputs"`
+	Resources       struct {
 		GPUCount int64 `json:"gpu_count"`
 	} `json:"resources"`
+}
+
+type ArtifactOutput struct {
+	OutputID string `json:"output_id"`
+	MimeType string `json:"mime_type"`
+	MaxBytes uint64 `json:"max_bytes"`
 }
 
 // Slot is one declared model binding path — capability, never selection.
@@ -176,7 +186,7 @@ func validateClosedDescriptor(data []byte) error {
 				required = append(required, "hidden")
 			} else {
 				required = append(required, "publishes")
-				optional = append(optional, "resources")
+				optional = append(optional, "resources", "artifact_outputs")
 			}
 			callable, err := exactKeys(row, required, optional)
 			if err != nil {
@@ -202,6 +212,18 @@ func validateClosedDescriptor(data []byte) error {
 			if resources := callable["resources"]; resources != nil {
 				if _, err := exactKeys(resources, []string{"gpu_count"}, nil); err != nil {
 					return err
+				}
+				if outputs := callable["artifact_outputs"]; outputs != nil {
+					var rows []json.RawMessage
+					if err := json.Unmarshal(outputs, &rows); err != nil {
+						return err
+					}
+					for _, output := range rows {
+						if _, err := exactKeys(output,
+							[]string{"max_bytes", "mime_type", "output_id"}, nil); err != nil {
+							return err
+						}
+					}
 				}
 			}
 		}
@@ -308,6 +330,19 @@ func validateEntrypoint(ep *Entrypoint) *exit.Error {
 					ep.Name, field.Name, strings.Join(field.Constraints.Unknown, ", "))
 			}
 		}
+	}
+	if ep.Kind != "job" && len(ep.ArtifactOutputs) > 0 {
+		return exit.New(exit.Validation, "%s declares artifact outputs outside the job surface", ep.Name)
+	}
+	seenArtifacts := map[string]bool{}
+	for _, output := range ep.ArtifactOutputs {
+		if output.OutputID == "" || seenArtifacts[output.OutputID] || output.MaxBytes == 0 ||
+			output.MaxBytes > (uint64(1)<<53)-1 || output.MimeType != orchestrator.ArtifactSnapshotMime {
+			return exit.New(exit.Validation,
+				"%s has an invalid artifact output %q: slots are unique snapshot MIME rows with a 1..2^53-1 byte cap",
+				ep.Name, output.OutputID)
+		}
+		seenArtifacts[output.OutputID] = true
 	}
 	return nil
 }

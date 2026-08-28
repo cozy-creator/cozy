@@ -1,10 +1,12 @@
 package orchestrator
 
 import (
+	"encoding/json"
 	"math"
 	"os"
 	"path/filepath"
 	"runtime"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -38,6 +40,11 @@ type Submission struct {
 	// by field path with exact set equality is what makes a two-output result
 	// unswappable; a positional grant would silently cross them (decisions #248).
 	Outputs []string
+	// ArtifactOutputs is the explicit Runtime-authored ArtifactSink subset. Rev5's generic
+	// OutputBinding carries no kind, so this is persisted beside the InvocationSpec and is
+	// never inferred from an arriving receipt. The M0 lane is artifact-only: when non-empty,
+	// this set is the complete output set for the job.
+	ArtifactOutputs []ArtifactOutput
 
 	// BodyDigest is the caller's own digest of the WHOLE submission it is making
 	// idempotent, not merely of the payload. cl-006 supplies the digest of
@@ -61,6 +68,16 @@ type Submission struct {
 	// InstallID pins a workflow child to one immutable local install resolution.
 	// Empty retains the ordinary active-pin behavior; remote requests never set it.
 	InstallID string
+}
+
+const ArtifactSnapshotMime = "application/vnd.cozy.tensorfs.snapshot"
+
+// ArtifactOutput is one bounded ArtifactSink slot projected from the installed job
+// descriptor. MaxBytes bounds only newly written table/config bytes, not inherited closure.
+type ArtifactOutput struct {
+	OutputID string `json:"output_id"`
+	MimeType string `json:"mime_type"`
+	MaxBytes uint64 `json:"max_bytes"`
 }
 
 // Result is what one closed attempt produced.
@@ -144,6 +161,11 @@ func (c *Orchestrator) RecordWorkflowChild(workflowID string, ordinal int, child
 }
 
 func requestRecord(s Submission) (records.Request, map[string]any, *exit.Error) {
+	artifactOutputs, artifactBytes, e := normalizeArtifactOutputs(s)
+	if e != nil {
+		return records.Request{}, nil, e
+	}
+	s.ArtifactOutputs = artifactOutputs
 	bodyDigest := s.BodyDigest
 	if bodyDigest == "" {
 		spelled, err := canonical.Spell(canonical.Digest(s.Payload))
@@ -160,15 +182,75 @@ func requestRecord(s Submission) (records.Request, map[string]any, *exit.Error) 
 		ID: id, IdemKey: s.IdemKey, BodyDigest: bodyDigest,
 		Endpoint: s.Endpoint, Entrypoint: s.Entrypoint, PlanID: s.PlanID, Payload: s.Payload,
 		Outputs: strings.Join(s.Outputs, ","),
-		Assets:  s.Assets,
-		Kind:    s.Kind, Org: s.Org, Trees: strings.Join(s.Trees, ","),
+		Assets:  s.Assets, ArtifactOutputs: string(artifactBytes),
+		Kind: s.Kind, Org: s.Org, Trees: strings.Join(s.Trees, ","),
 		Worker: s.Worker, InstallID: s.InstallID,
 	}
 	event := map[string]any{
 		"endpoint": s.Endpoint, "function": s.Entrypoint,
 		"body_digest": bodyDigest, "plan_id": s.PlanID, "outputs": s.Outputs,
+		"artifact_outputs": artifactOutputs,
 	}
 	return req, event, nil
+}
+
+func normalizeArtifactOutputs(s Submission) ([]ArtifactOutput, []byte, *exit.Error) {
+	if len(s.ArtifactOutputs) == 0 {
+		return nil, []byte("[]"), nil
+	}
+	if s.Kind != "job" {
+		return nil, nil, exit.Named(exit.Validation, "artifact_output_not_job",
+			"artifact outputs are valid only on a job submission")
+	}
+	if len(s.ArtifactOutputs) > pb.MaxArtifactReceipts {
+		return nil, nil, exit.Named(exit.Validation, "artifact_output_count_cap",
+			"%d artifact outputs exceeds the protocol cap of %d",
+			len(s.ArtifactOutputs), pb.MaxArtifactReceipts)
+	}
+	rows := append([]ArtifactOutput(nil), s.ArtifactOutputs...)
+	sort.Slice(rows, func(i, j int) bool { return rows[i].OutputID < rows[j].OutputID })
+	ids := make(map[string]bool, len(rows))
+	for _, row := range rows {
+		if row.OutputID == "" || ids[row.OutputID] {
+			return nil, nil, exit.Named(exit.Validation, "artifact_output_identity",
+				"artifact output slots are non-empty and unique; %q is repeated or empty", row.OutputID)
+		}
+		if row.MimeType != ArtifactSnapshotMime || row.MaxBytes == 0 || row.MaxBytes > (uint64(1)<<53)-1 {
+			return nil, nil, exit.Named(exit.Validation, "artifact_output_contract",
+				"artifact output %s must declare MIME %s and a new-byte cap in 1..2^53-1",
+				row.OutputID, ArtifactSnapshotMime)
+		}
+		ids[row.OutputID] = true
+	}
+	// OutputBinding/1 has no kind. Until that schema gap is closed, an ArtifactSink job is
+	// artifact-only so a missing receipt can be classified without guessing about asset slots.
+	if len(ids) != len(s.Outputs) {
+		return nil, nil, exit.Named(exit.Structural, "mixed_job_output_kinds",
+			"this rev5 lane requires artifact-only jobs; %d artifact slots do not close %d outputs",
+			len(ids), len(s.Outputs))
+	}
+	for _, id := range s.Outputs {
+		if !ids[id] {
+			return nil, nil, exit.Named(exit.Structural, "mixed_job_output_kinds",
+				"job output %q is not in the explicit artifact-output set", id)
+		}
+	}
+	data, err := json.Marshal(rows)
+	if err != nil {
+		return nil, nil, exit.Internalf("cannot persist artifact output declarations: %s", err)
+	}
+	return rows, data, nil
+}
+
+func decodeArtifactOutputs(data string) ([]ArtifactOutput, *exit.Error) {
+	if data == "" {
+		return nil, nil
+	}
+	var rows []ArtifactOutput
+	if err := json.Unmarshal([]byte(data), &rows); err != nil {
+		return nil, exit.Internalf("cannot decode persisted artifact output declarations: %s", err)
+	}
+	return rows, nil
 }
 
 func (c *Orchestrator) logRecordedReplay(req records.Request, idempotencyKey string) {
@@ -558,6 +640,10 @@ func (c *Orchestrator) dispatch(req records.Request) (uint64, *exit.Error) {
 	if e != nil {
 		return 0, e
 	}
+	artifactOutputs, e := decodeArtifactOutputs(req.ArtifactOutputs)
+	if e != nil {
+		return 0, e
+	}
 	spec := &pb.InvocationSpec{
 		EndpointReleaseId: w.spec.Placement.ReleaseID,
 		// `image_digest` is GONE, renamed to what it always meant (#483): "image" is wrong
@@ -567,7 +653,7 @@ func (c *Orchestrator) dispatch(req records.Request) (uint64, *exit.Error) {
 		ConfigDigest:          configDigest,
 		PayloadDigest:         spellOf(canonical.Digest(req.Payload)),
 		Inputs:                inputBindings(req),
-		Outputs:               outputBindings(splitList(req.Outputs), c.maxOutputBytes()),
+		Outputs:               invocationOutputBindings(splitList(req.Outputs), artifactOutputs, c.maxOutputBytes()),
 		Spec: &pb.InvocationSpec_Serving{Serving: &pb.ServingInvocationSpec{
 			EntrypointBindingPlanId: req.PlanID,
 			// With no adapters the binding IS the plan, so the two ids are equal by
@@ -584,7 +670,7 @@ func (c *Orchestrator) dispatch(req records.Request) (uint64, *exit.Error) {
 			JobDescriptorId: req.PlanID,
 			PublicationContract: &pb.PublicationContract{
 				GrantId: home.ScratchRepo(req.Org, req.ID),
-				Outputs: outputBindings(splitList(req.Outputs), maxOutputBytes),
+				Outputs: invocationOutputBindings(splitList(req.Outputs), artifactOutputs, maxOutputBytes),
 			},
 		}}
 	}
@@ -601,6 +687,7 @@ func (c *Orchestrator) dispatch(req records.Request) (uint64, *exit.Error) {
 	ordinal, e := c.opt.Store.Dispatch(records.Attempt{
 		RequestID: req.ID, InstanceID: w.instanceID,
 		SessionID: w.bootID, InvocationDigest: spelled, InvocationCanonical: canonicalBytes,
+		ArtifactOutputs: req.ArtifactOutputs,
 	})
 	if e != nil {
 		return 0, e
@@ -767,6 +854,23 @@ func outputBindings(ids []string, maxBytes uint64) []*pb.OutputBinding {
 	out := make([]*pb.OutputBinding, 0, len(ids))
 	for _, id := range ids {
 		out = append(out, &pb.OutputBinding{OutputId: id, MaxBytes: maxBytes})
+	}
+	return out
+}
+
+func invocationOutputBindings(ids []string, artifacts []ArtifactOutput, defaultMax uint64) []*pb.OutputBinding {
+	byID := map[string]ArtifactOutput{}
+	for _, output := range artifacts {
+		byID[output.OutputID] = output
+	}
+	out := make([]*pb.OutputBinding, 0, len(ids))
+	for _, id := range ids {
+		binding := &pb.OutputBinding{OutputId: id, MaxBytes: defaultMax}
+		if artifact, ok := byID[id]; ok {
+			binding.MimeType = artifact.MimeType
+			binding.MaxBytes = artifact.MaxBytes
+		}
+		out = append(out, binding)
 	}
 	return out
 }
