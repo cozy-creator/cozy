@@ -9,8 +9,11 @@
 // discipline: this binary imports no protocol client and, by fence, contains no outbound
 // network call of any kind. It joins the liability fence by HAVING NOTHING TO EGRESS WITH.
 //
-// Six routes, and the shape of each is the whole design:
+// Seven routes, and the shape of each is the whole design:
 //
+//	GET  /v1/health               the owner's ONE pre-flight: this server names itself and
+//	                              its contract revision, and the owner refuses the rental
+//	                              rather than upload a byte to a plane at another revision.
 //	GET  /v1/bootstrap/receipt    Tensorhub reads one attempt-bound, pod-authored readiness
 //	                              envelope. Its HMAC is verified by Tensorhub before the TLS
 //	                              peer is trusted; the response is the exact file bytes.
@@ -61,6 +64,7 @@ import (
 	"time"
 
 	"github.com/cozy-creator/cozy-creator/internal/canonical"
+	"github.com/cozy-creator/cozy-creator/internal/mediawire"
 	"github.com/cozy-creator/cozy-creator/internal/secret"
 )
 
@@ -81,6 +85,10 @@ type options struct {
 	bootstrapReceipt string // exact pod-authored JSON; may appear after the listener starts
 	quota            int64
 	maxBody          int64
+	// bounds prints this build's media contract and exits. It is how the POD IMAGE's build
+	// and cozy-bootstrap learn the revision and the receipt ceiling from the binary itself
+	// instead of restating numbers this repo owns.
+	bounds bool
 }
 
 func run(args []string) int {
@@ -108,6 +116,11 @@ func run(args []string) int {
 			opt.key = value
 		case "bootstrap-receipt":
 			opt.bootstrapReceipt = value
+		case "bounds":
+			opt.bounds = true
+			if value != "" {
+				return usage("--bounds takes no value")
+			}
 		case "quota":
 			n, err := strconv.ParseInt(value, 10, 64)
 			if err != nil || n <= 0 {
@@ -123,6 +136,14 @@ func run(args []string) int {
 		default:
 			return usage("unknown flag %q", args[i])
 		}
+	}
+	if opt.bounds {
+		out, err := json.Marshal(mediawire.Ours())
+		if err != nil {
+			return fatal("cannot render this build's media contract: %v", err)
+		}
+		fmt.Println(string(out))
+		return 0
 	}
 	switch {
 	case opt.listen == "":
@@ -259,8 +280,6 @@ func (s *server) admits(w http.ResponseWriter, r *http.Request) bool {
 	return false
 }
 
-const maxBootstrapReceiptBytes = 64 << 10
-
 // bootstrapReceipt is Tensorhub's one read-only rendezvous with a pod it bought. The
 // envelope carries an attempt HMAC that Tensorhub verifies over exact payload bytes before
 // it trusts the TLS peer. cozy-media owns neither that schema nor its key: it serves the
@@ -274,8 +293,8 @@ func (s *server) bootstrapReceipt(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	defer file.Close()
-	data, err := io.ReadAll(io.LimitReader(file, maxBootstrapReceiptBytes+1))
-	if err != nil || len(data) == 0 || len(data) > maxBootstrapReceiptBytes || !json.Valid(data) {
+	data, err := io.ReadAll(io.LimitReader(file, mediawire.MaxReceiptBytes+1))
+	if err != nil || len(data) == 0 || len(data) > mediawire.MaxReceiptBytes || !json.Valid(data) {
 		refuse(w, http.StatusServiceUnavailable, "media.bootstrap_receipt_invalid",
 			"the pod's readiness receipt is unreadable, empty, oversized, or not JSON",
 			"publish one complete receipt by atomic rename after endpoint materialization")
@@ -757,16 +776,20 @@ func (s *server) getOutput(w http.ResponseWriter, r *http.Request) {
 	_, _ = io.CopyN(w, file, info.Size())
 }
 
-// health answers that this server is up and says what it is holding. It is authenticated
-// like everything else: an unauthenticated liveness route would be a second, weaker door.
+// health answers that this server is up, WHICH CONTRACT IT SPEAKS, and what it is holding.
+// The revision is the whole reason the owner asks before it uploads: this binary is pinned
+// into the pod image by commit and the owner floats, so `service` + `contract_rev` is the
+// only thing standing between the two ends and a silently misparsed answer. It is
+// authenticated like everything else: an unauthenticated liveness route would be a second,
+// weaker door.
 func (s *server) health(w http.ResponseWriter, r *http.Request) {
 	if !s.admits(w, r) {
 		return
 	}
-	answer(w, http.StatusOK, map[string]any{
-		"service": "cozy-media", "root": s.opt.root,
-		"used_bytes": s.used(), "quota_bytes": s.opt.quota, "max_object_bytes": s.opt.maxBody,
-		"plans": s.opt.plans != "",
+	answer(w, http.StatusOK, mediawire.Health{
+		Contract: mediawire.Ours(), Root: s.opt.root,
+		UsedBytes: s.used(), QuotaBytes: s.opt.quota, MaxObjectBytes: s.opt.maxBody,
+		Plans: s.opt.plans != "",
 	})
 }
 
@@ -784,7 +807,7 @@ func (s *server) routes() *http.ServeMux {
 	return mux
 }
 
-func answer(w http.ResponseWriter, status int, body map[string]any) {
+func answer(w http.ResponseWriter, status int, body any) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
 	_ = json.NewEncoder(w).Encode(body)
@@ -805,7 +828,8 @@ func usage(format string, args ...any) int {
 	fmt.Fprintln(os.Stderr, "usage: cozy-media --listen <host:port> --root <dir> "+
 		"--tokens <file> [--plans <dir>] [--out <dir>] [--tls-cert <pem> --tls-key <pem>] "+
 		"[--bootstrap-receipt <json>] "+
-		"[--quota <bytes>] [--max-body <bytes>]")
+		"[--quota <bytes>] [--max-body <bytes>]\n"+
+		"       cozy-media --bounds   print this build's media contract as JSON and exit")
 	return 2
 }
 

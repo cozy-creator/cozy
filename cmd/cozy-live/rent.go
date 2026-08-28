@@ -21,6 +21,7 @@ import (
 	"github.com/cozy-creator/cozy-creator/internal/config"
 	"github.com/cozy-creator/cozy-creator/internal/home"
 	"github.com/cozy-creator/cozy-creator/internal/media"
+	"github.com/cozy-creator/cozy-creator/internal/mediawire"
 	"github.com/cozy-creator/cozy-creator/internal/records"
 	"github.com/cozy-creator/cozy-creator/internal/workertls"
 )
@@ -407,8 +408,11 @@ func sectionRent() {
 		status == 401 && strings.Contains(said, "media.unauthenticated"),
 		itoa(status)+" "+firstLine(said))
 	status, said = mediaCall(root, rentalA, http.MethodGet, "/v1/health", minted, nil)
-	check("the rental's OWN token is admitted, and the server says what it holds",
-		status == 200 && strings.Contains(said, "cozy-media"),
+	var served mediawire.Health
+	_ = json.Unmarshal([]byte(said), &served)
+	check("the rental's OWN token is admitted, and the plane names itself AND its revision",
+		status == 200 && served.Service == mediawire.Service &&
+			served.ContractRev != nil && *served.ContractRev == mediawire.ContractRev,
 		itoa(status)+" "+firstLine(said))
 	status, said = mediaCall(root, rentalA, http.MethodGet,
 		"/v1/outputs/"+media.Slot("req-nope", 1)+"/..%2f..%2fpod-worker.log", minted, nil)
@@ -462,6 +466,48 @@ func sectionRent() {
 	check("and no attempt was dispatched to it: nothing crossed a boundary that is not there",
 		rentalF != "" && !strings.Contains(podWorkerLog(starved, rentalF), "AttemptOffer"),
 		"the pod's worker saw no AttemptOffer")
+
+	head("cl-031 RED: a byte plane at ANOTHER CONTRACT REVISION is refused before a byte moves")
+	// The defect this closes: `cozy-media` is compiled into the pod image from a pinned
+	// cozy-creator commit while this client floats with master, and until now the only
+	// version signal between the two was the literal `/v1/` in a URL. The pods below run a
+	// STAND-IN media plane because a pod at another revision is an older build of this
+	// tree, which this worktree cannot produce; everything else about them is real.
+	otherRev := mediawire.ContractRev + 1
+	skewed := newPodHub(podHubSpec{Dir: filepath.Join(root, "hub-mediarev"), Arm: "remote",
+		Release: release, MediaSkew: &mediawire.Contract{Service: mediawire.Service,
+			ContractRev: &otherRev, MaxReceiptBytes: mediawire.MaxReceiptBytes}})
+	defer skewed.close()
+	rentalSkew, _ := rentOne(root, skewed, "cl-031 media revision skew arm")
+	code, out = cozyRun(root, "run", rentalEndpointRef, tilePayload,
+		"--timeout", "20s", "--worker", rentalSkew)
+	check("a plane at rev N+1 is refused by name, and the refusal names BOTH revisions",
+		code != 0 && strings.Contains(out, "media_contract_mismatch") &&
+			strings.Contains(out, "rev "+itoa(otherRev)) &&
+			strings.Contains(out, "rev "+itoa(mediawire.ContractRev)),
+		lineWith(out, "media_contract_mismatch")+" [exit "+itoa(code)+"]")
+	check("and NOT ONE byte was offered to it: the plane was asked its revision, nothing else",
+		len(skewed.mediaTouched()) == 0,
+		"stand-in served: "+strings.Join(append([]string{"GET /v1/health"}, skewed.mediaTouched()...), ", "))
+
+	head("cl-031 RED: a plane that declares NO revision is refused — absence IS the skew case")
+	// Fail-closed, and this is the arm that says why: a pod too old to declare a revision
+	// is precisely the pod the check exists for. Indulging it would leave the whole window
+	// open and call it compatibility.
+	mute := newPodHub(podHubSpec{Dir: filepath.Join(root, "hub-mediamute"), Arm: "remote",
+		Release: release, MediaSkew: &mediawire.Contract{Service: mediawire.Service,
+			MaxReceiptBytes: mediawire.MaxReceiptBytes}})
+	defer mute.close()
+	rentalMute, _ := rentOne(root, mute, "cl-031 media revision absent arm")
+	code, out = cozyRun(root, "run", rentalEndpointRef, tilePayload,
+		"--timeout", "20s", "--worker", rentalMute)
+	check("a plane declaring no revision is refused, not indulged as an older peer",
+		code != 0 && strings.Contains(out, "media_contract_mismatch") &&
+			strings.Contains(out, "declares NO media contract revision"),
+		lineWith(out, "media_contract_mismatch")+" [exit "+itoa(code)+"]")
+	check("and it too was never handed a byte",
+		len(mute.mediaTouched()) == 0,
+		"stand-in served: "+strings.Join(append([]string{"GET /v1/health"}, mute.mediaTouched()...), ", "))
 
 	head("#505: the RELEASE PIN is verified, not merely carried")
 	lying := newPodHub(podHubSpec{Dir: filepath.Join(root, "hub-badrelease"), Arm: "remote",
@@ -635,7 +681,8 @@ func sectionRent() {
 	// Several stand-in hubs are live at once, so the pass asks each one whether it still
 	// holds the pod. A rental nobody owns would be a pod nothing can destroy, which is the
 	// exact failure this pass exists to make impossible.
-	hubs := []*podHub{hub, videoHub, lost, liar, starved, lying, silent, nameless, broken}
+	hubs := []*podHub{hub, videoHub, lost, liar, starved, skewed, mute, lying, silent,
+		nameless, broken}
 	for _, id := range heldRentals(root) {
 		on := hub
 		for _, candidate := range hubs {

@@ -37,6 +37,7 @@ import (
 	"time"
 
 	"github.com/cozy-creator/cozy-creator/internal/exit"
+	"github.com/cozy-creator/cozy-creator/internal/mediawire"
 	"github.com/cozy-creator/cozy-creator/internal/secret"
 	"github.com/cozy-creator/cozy-creator/internal/workertls"
 )
@@ -280,10 +281,52 @@ func codeFor(status int) exit.Code {
 }
 
 // Health is the pod-side liveness question, asked with the credential so that "the pod
-// answers" and "the pod admits this host" are one answer instead of two.
+// answers" and "the pod admits this host" are one answer instead of two — and it is the
+// media plane's ONE version handshake, which is why it runs before any byte moves.
+//
+// The two ends of this plane are released separately: the pod's `cozy-media` is compiled
+// into its image from a commit pin and this client floats with master, so a route or a
+// field can move on one side alone. The revision closes that: a plane at another revision,
+// or one too old to declare a revision at all, is refused here rather than fed bytes whose
+// answer shape this host would misread. It is the byte plane's `pb.WireSchemaRev` check
+// (`internal/orchestrator/owner.go`), and it FAILS CLOSED for the same reason — a peer
+// that says nothing is the skew case, not an exemption from it.
 func (c *Client) Health() *exit.Error {
-	_, _, e := c.call(http.MethodGet, "/v1/health", nil)
-	return e
+	_, data, e := c.call(http.MethodGet, "/v1/health", nil)
+	if e != nil {
+		return e
+	}
+	var said mediawire.Health
+	if err := json.Unmarshal(data, &said); err != nil {
+		return c.skew("answered a health document this host cannot read: %s", err)
+	}
+	if said.Service != mediawire.Service {
+		return c.skew("calls itself %q and this host dials %q",
+			brief(said.Service), mediawire.Service)
+	}
+	if said.ContractRev == nil {
+		return c.skew("declares NO media contract revision and this host speaks rev %d",
+			mediawire.ContractRev)
+	}
+	if *said.ContractRev != mediawire.ContractRev {
+		return c.skew("speaks media contract rev %d and this host speaks rev %d",
+			*said.ContractRev, mediawire.ContractRev)
+	}
+	return nil
+}
+
+// skew is the one refusal shape for a byte plane this host cannot trust the answers of.
+func (c *Client) skew(format string, args ...any) *exit.Error {
+	return exit.Named(exit.Conflict, "media_contract_mismatch",
+		"the pod's media plane at %s "+format, append([]any{c.spec.Addr}, args...)...).
+		WithRemedy("the pod's media server is built into its image from a PINNED "+
+			"cozy-creator commit (execution-substrates `versions.env: CREATOR_COMMIT`) and "+
+			"this host floats with master, so the two ends drift by construction. Rebuild "+
+			"the pod image from a commit that speaks rev %d, or run an owner that speaks "+
+			"what the pod does. Nothing is uploaded to a plane whose answers this host "+
+			"cannot read: a misparsed field is worse than a refused rental.",
+			mediawire.ContractRev).
+		WithNext("cozy rent ls")
 }
 
 // PutInput uploads one attempt input and answers the POD-LOCAL PATH it landed at. That

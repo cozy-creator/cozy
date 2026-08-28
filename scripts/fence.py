@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Boundary fence (boundaries.md). Architecture enforcement, not a test.
 
-Fourteen families:
+Fifteen families:
   deps      forbidden dependencies (raw lines, incl. import paths and go.mod)
   impl      storage/chunk/loader/residency/tensor implementation vocabulary — cozy-creator
             renders and orchestrates, it never implements the byte plane (TensorFS owns it)
@@ -41,6 +41,10 @@ Fourteen families:
   contract  (cl-006) internal/api/routes.go and docs/client-contract.md are ONE surface,
             row for row, scope for scope. The document is what th-021's other two hosts
             implement against, so drift is a shared-contract defect, not a doc lag.
+  media     (cl-014/cl-031) the pod's byte plane has NO outbound capability of any kind and
+            cannot import the worker protocol, and its wire contract — the service name, the
+            revision both ends compare before a byte moves, and the bounds it publishes — is
+            declared in internal/mediawire and restated nowhere.
   tensor    (cl-012) the tensorfs CLI has ONE caller: internal/tfs. The configured binary
             is read there and in the config authority, nowhere else — a second package
             shelling out to `tfs` is a second byte-plane door with its own vocabulary.
@@ -159,6 +163,14 @@ DENY_MEDIA_IMPORT = ["protocol/cozy/worker", "internal/orchestrator", "internal/
 # An import LINE, so a doc comment naming the owner's bind site is prose and not a door.
 MEDIA_IMPORT_LINE = re.compile(
     r'^\s*(?:[A-Za-z_]\w*\s+)?"github\.com/cozy-creator/cozy-creator/([^"]+)"\s*$')
+
+# (cl-031) ONE DECLARATION OF THE MEDIA PLANE'S CONTRACT. The pod's media server ships
+# inside an image pinned by commit and the owner's client floats with master, so the pair
+# both ends compare — the service name, the revision, and the bounds the plane publishes —
+# has exactly one home. A second spelling of a contract field is how the two ends drift
+# back apart in silence, which is the whole defect cl-031 closed.
+MEDIA_CONTRACT_HOME = "internal/mediawire/wire.go"
+MEDIA_CONTRACT_FIELDS = ["contract_rev", "max_receipt_bytes"]
 
 ALLOW_DOOR = "//cozy:allow"
 STDIN_DOOR = "//cozy:stdin-value"
@@ -380,6 +392,30 @@ def check_document_kinds():
                 elif rel != owner and rel not in KIND_READERS.get(kind, set()):
                     bad.append(f"{rel}:{i}: [kinds] names '{kind}', declared in {owner} — a "
                                "second declaration of one kind")
+    return bad
+
+
+def check_media_contract():
+    """(cl-031) The media plane's contract fields are DECLARED once, not spelled twice."""
+    home = pathlib.Path(MEDIA_CONTRACT_HOME)
+    if not home.exists():
+        return [f"[media] {MEDIA_CONTRACT_HOME} is missing — the media plane's contract has "
+                f"no single home, so the pod's pinned binary and the floating owner client "
+                f"have nothing to agree on"]
+    bad = []
+    for p in files():
+        rel = p.as_posix()
+        if p.suffix != ".go" or rel == MEDIA_CONTRACT_HOME:
+            continue
+        for i, line in enumerate(p.read_text(errors="ignore").splitlines(), 1):
+            if line.strip().startswith("//"):
+                continue
+            for field in MEDIA_CONTRACT_FIELDS:
+                if field in line:
+                    bad.append(f"{p}:{i}: [media] spells the media contract field "
+                               f"'{field}' outside {MEDIA_CONTRACT_HOME} — both ends of this "
+                               f"plane ship separately, so its wire shape is declared once "
+                               f"and imported, never restated: {line.strip()}")
     return bad
 
 
@@ -735,7 +771,8 @@ def check_video_boundary():
 
 violations = (check_sources() + check_matrix() + check_manifest() + check_secret_flags()
               + check_contract() + check_video_boundary() + check_embedded() + check_scripts()
-              + check_document_kinds() + check_render_streams())
+              + check_document_kinds() + check_render_streams()
+              + check_media_contract())
 if violations:
     print("FENCE RED (boundaries.md):", file=sys.stderr)
     for v in violations:
@@ -750,7 +787,8 @@ print(
     f"render(one stream@{RENDER_SRC}) secret({SECRET_FLAG.pattern} + Reveal@{len(REVEAL_SITES)}) "
     f"cas({len(DENY_DIGEST)} digests@{len(DIGEST_FREE)} + store-path) tensor(tfs@{len(TFS_SITES)}) "
     f"api({len(DENY_COOKIE)} cookie + cors + listen@{len(LISTEN_SITES)} programs) "
-    f"media({len(DENY_MEDIA_EGRESS)} egress + {len(DENY_MEDIA_IMPORT)} imports@{MEDIA_DIR}) "
+    f"media({len(DENY_MEDIA_EGRESS)} egress + {len(DENY_MEDIA_IMPORT)} imports@{MEDIA_DIR} "
+    f"+ {len(MEDIA_CONTRACT_FIELDS)} contract fields@{MEDIA_CONTRACT_HOME}) "
     f"runtime({len(RUNTIME_VERBS_DENY)} denied verbs@{len(RUNTIME_SITES)} + indirection) "
     f"embed({len(DENY_EMBED)} words, scripts allow@{len(PY_ALLOW)}) "
     f"contract({len(parse_go_routes(pathlib.Path('internal/api/routes.go')))} routes) video-boundary"

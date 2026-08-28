@@ -518,8 +518,13 @@ No automated tests. Verification is running the real thing:
   independent Go implementation of the worker side), `attempt` and `recovered` (the real
   cozy-runtime supervisor + executor on a real GPU), `api`/`apiarms`/`apicrash` (the local
   client API from a client's seat), `artifacts`/`artifactcrash` (the durable artifact
-  transaction and its crash matrix), and `verbs`/`journey` (the CLI as a user types it,
-  against an INSTALLED endpoint — no hand-written spec document anywhere).
+  transaction and its crash matrix), `rent` (the WHOLE rental path against a stand-in hub
+  that provisions real pods — the real `cozy-media` binary beside a real worker: the
+  binding records delivered and re-hashed on the pod, the payload uploaded to it, the
+  output fetched back and verified before the ack, the media server's own door matrix, and
+  the refusals for a pod with no byte plane, a pod whose plane is at another contract
+  revision, and a pod whose plane declares none), and `verbs`/`journey` (the CLI as a user
+  types it, against an INSTALLED endpoint — no hand-written spec document anywhere).
 - `scripts/verify-cl012.sh` + `scripts/xfer-live.py` drive the real `cozy` against a
   real tensorhub (built from a PINNED commit through a read-only `git archive`, because
   that repo has a concurrent writer), its own Postgres container, real R2 under
@@ -535,10 +540,13 @@ No automated tests. Verification is running the real thing:
   a READY worker with no weights to fill, a typed `completed` terminal, a published PNG,
   zero reserved VRAM and an empty construction digest, plus the typed failure terminal —
   `cozy down`'s proof of absence, and the verified upgrade.
-- `scripts/fence.py` enforces thirteen families: forbidden deps, byte-plane vocabulary
+- `scripts/fence.py` enforces fourteen families: forbidden deps, byte-plane vocabulary
   (TensorFS owns storage/residency), interactive prompts, exit-matrix parity, a manifest
   lint, the env-read fence (one reader), no lifecycle sidecar, no cloud emulation or
   minted credential, the secret fence (no credential-shaped flag takes an argv value;
   `Reveal()` only where the value becomes a header), the `cas` fence (the transfer plane
-  hashes nothing; nobody composes a store path) and the `tensor` fence (the tensorfs CLI
-  has one caller). Doors are greppable: `//cozy:allow`, `//cozy:stdin-value`.
+  hashes nothing; nobody composes a store path), the `tensor` fence (the tensorfs CLI
+  has one caller) and the `media` fence (the pod's byte plane has no outbound capability
+  and cannot import the worker protocol, and its wire contract is declared in
+  `internal/mediawire` and restated nowhere). Doors are greppable: `//cozy:allow`,
+  `//cozy:stdin-value`.

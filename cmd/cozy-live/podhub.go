@@ -22,7 +22,10 @@ import (
 	"syscall"
 	"time"
 
+	"crypto/tls"
+
 	"github.com/cozy-creator/cozy-creator/internal/hub"
+	"github.com/cozy-creator/cozy-creator/internal/mediawire"
 	"github.com/cozy-creator/cozy-creator/internal/workertls"
 )
 
@@ -64,6 +67,11 @@ type podRental struct {
 	// MediaRoot is the subtree that media server owns on the pod's filesystem — the
 	// arms read it directly to see where bytes actually landed.
 	MediaRoot string
+	// MediaTouched is every route a STAND-IN media plane was asked for other than the
+	// health route. It is how "refused before a byte moved" is observed rather than
+	// asserted: an owner that uploaded to a plane it should have refused leaves the path
+	// it uploaded to here.
+	MediaTouched []string
 	// The two CO-RESIDENT processes, separately. cl-014's coupling claim is that neither
 	// is in the other's request path, and the way to observe that is to kill one.
 	WorkerPID int
@@ -108,6 +116,11 @@ type podHub struct {
 	// noInstance provisions a pod whose worker declares NO instance identity — the shape
 	// this stand-in had by accident until a real pod showed it was a shape at all.
 	noInstance bool
+	// mediaSkew provisions a pod whose media plane answers THIS contract instead of the
+	// one this tree speaks. A pod at another revision is an older cozy-creator build,
+	// which this worktree cannot produce, so the stand-in is the honest peer — the same
+	// reason `fakeworker` exists one plane over.
+	mediaSkew *mediawire.Contract
 	// loseFirstRentResponse commits the first operation and then closes the HTTP stream
 	// without an answer. A correct caller retries the same key and sees the same rental.
 	loseFirstRentResponse bool
@@ -139,6 +152,9 @@ type podHubSpec struct {
 	// an owner that admitted it could not attribute a terminal to anything.
 	NoInstance            bool
 	LoseFirstRentResponse bool
+	// MediaSkew replaces this pod's real `cozy-media` with a stand-in answering the given
+	// contract: cl-031's two red arms, a revision that is not this host's and none at all.
+	MediaSkew *mediawire.Contract
 	// Accelerator is what the provisioned worker REPORTS on ClaimAck; the owner's probe
 	// compares it to what was requested.
 	Accelerator string
@@ -161,7 +177,8 @@ func newPodHub(spec podHubSpec) *podHub {
 		operations: map[string]podRentalOperation{}, dropped: map[string]bool{}, fail: spec.Fail,
 		noMedia: spec.NoMedia, noInstance: spec.NoInstance, releaseID: spec.Release,
 		loseFirstRentResponse: spec.LoseFirstRentResponse, accelerator: spec.Accelerator,
-		control: spec.Control,
+		mediaSkew: spec.MediaSkew,
+		control:   spec.Control,
 	}
 	if h.control == nil {
 		h.control = defaultPodControl
@@ -457,7 +474,14 @@ func (h *podHub) provision(rec *podRental) {
 	// Its credential is the SAME hash file the worker reads — one provisioned identity per
 	// pod, two listeners, and neither of them holds a token.
 	mediaAddr, mediaRoot := "", ""
-	if !h.noMedia {
+	if h.mediaSkew != nil {
+		if mediaAddr = h.startSkewedMedia(rec, certPath, keyPath); mediaAddr == "" {
+			h.mu.Lock()
+			rec.State, rec.Detail = "failed", "the stand-in media plane did not bind"
+			h.mu.Unlock()
+			return
+		}
+	} else if !h.noMedia {
 		mediaRoot = filepath.Join(podRoot, "media")
 		media := niceCmd(mediaBinary(),
 			"--listen", "127.0.0.1:0",
@@ -517,6 +541,54 @@ func (h *podHub) provision(rec *podRental) {
 		}
 		time.Sleep(20 * time.Millisecond)
 	}
+}
+
+// startSkewedMedia stands up a media plane that answers a DIFFERENT contract than this
+// build's, which no real binary in this tree can be told to do — a pod at another revision
+// is an older cozy-creator commit, and the image pins one by construction. It serves
+// exactly one route, `GET /v1/health`, with the contract it was given, and RECORDS every
+// other path it is asked for: the claim under test is that the owner refuses at connect,
+// so any recorded path is a byte that moved when none should have.
+func (h *podHub) startSkewedMedia(rec *podRental, certPath, keyPath string) string {
+	pair, err := tls.LoadX509KeyPair(certPath, keyPath)
+	if err != nil {
+		return ""
+	}
+	ln, err := net.Listen("tcp", "127.0.0.1:0") //cozy:allow the DRIVER stands in for a pod whose media plane is at another revision; the product binds through internal/api
+	if err != nil {
+		return ""
+	}
+	said := *h.mediaSkew
+	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodGet && r.URL.Path == "/v1/health" {
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(mediawire.Health{Contract: said,
+				Root: "/stand-in", QuotaBytes: 1 << 30, MaxObjectBytes: 1 << 20})
+			return
+		}
+		h.mu.Lock()
+		rec.MediaTouched = append(rec.MediaTouched, r.Method+" "+r.URL.Path)
+		h.mu.Unlock()
+		refuse(w, http.StatusInternalServerError, "media.stand_in",
+			"this stand-in answers the health route and nothing else",
+			"an owner that reached this route did not check the plane's revision first")
+	})
+	server := &http.Server{Handler: handler,
+		TLSConfig: &tls.Config{Certificates: []tls.Certificate{pair}, MinVersion: tls.VersionTLS12}}
+	go func() { _ = server.ServeTLS(ln, "", "") }()
+	onExit(func() { _ = server.Close() })
+	return ln.Addr().String()
+}
+
+// mediaTouched is every non-health route any stand-in plane on this hub was asked for.
+func (h *podHub) mediaTouched() []string {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	var all []string
+	for _, rec := range h.rentals {
+		all = append(all, rec.MediaTouched...)
+	}
+	return all
 }
 
 // awaitAddr reads a bound address out of the file the process publishes. The wait is
