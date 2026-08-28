@@ -514,15 +514,6 @@ func releasePin(w *worker, declared string) *exit.Error {
 	return nil
 }
 
-// rentalOf recovers the rental id out of a pinned slot name (`org/name@rnt-…`), so the
-// `next` line names the pod the user would actually act on.
-func rentalOf(slot string) string {
-	if _, id, ok := strings.Cut(slot, "@"); ok {
-		return id
-	}
-	return "<rental>"
-}
-
 // refuseClaim records this owner's verdict on the thing at the other end and logs it. The
 // verdict is kept on the worker so a WAITER gets the answer: before this, a refused claim
 // simply stopped the conversation and the request waited out the silence window to be told
