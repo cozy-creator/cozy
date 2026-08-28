@@ -13,6 +13,8 @@
 //! --size <bytes> --small <n>, plus the dev-only kill points --fault <stage> --ready <path>.
 //!
 //!   tfs store init|info|bump <root>
+//!   tfs store record-arms       verification-record numeric/string boundary proof
+//!   tfs store migrate-records <root>  explicit no-payload NFS record hardcut
 //!   tfs put <root> <file>        stream one object in (any shape)
 //!   tfs get <root> <hex>         verified read, whole or ranged
 //!   tfs contains <root> <hex>    the presence HINT, and what it is worth
@@ -188,6 +190,8 @@ fn main() -> ExitCode {
         ["store", "init", r] => cmd_store(Path::new(r), "init"),
         ["store", "info", r] => cmd_store(Path::new(r), "info"),
         ["store", "bump", r] => cmd_store(Path::new(r), "bump"),
+        ["store", "record-arms"] => record::cmd_arms(),
+        ["store", "migrate-records", r] => record::cmd_migrate(Path::new(r)),
         ["put", r, f] => cmd_put(Path::new(r), Path::new(f), &flags),
         ["get", r, h] => cmd_get(Path::new(r), h, &flags),
         ["contains", r, h] => cmd_contains(Path::new(r), h),
@@ -390,6 +394,7 @@ mod fixtures;
 mod ingest;
 mod layout;
 mod rd;
+mod record;
 mod roots;
 mod snap;
 

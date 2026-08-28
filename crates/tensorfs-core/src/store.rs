@@ -106,10 +106,10 @@ impl Doc for VRecord {
 
     fn from_value(v: &Value) -> Result<Self> {
         let mut f = Fields::new("VRecord", v)?;
-        let dev = f.req_uint("dev")?;
+        let dev = file_identity(&mut f, "dev")?;
         check_format("VRecord", f.req_str("format")?, Self::FORMAT)?;
         let generation = f.req_uint("generation")?;
-        let ino = f.req_uint("ino")?;
+        let ino = file_identity(&mut f, "ino")?;
         let length = f.req_uint("length")?;
         let mtime_ns = f.req_uint("mtime_ns")?;
         let mtime_s = f.req_uint("mtime_s")?;
@@ -128,15 +128,63 @@ impl Doc for VRecord {
 
     fn to_value(&self) -> Value {
         Value::obj(vec![
-            ("dev", Value::uint(self.dev)),
+            ("dev", file_identity_value(self.dev)),
             ("format", Value::str(Self::FORMAT)),
             ("generation", Value::uint(self.generation)),
-            ("ino", Value::uint(self.ino)),
+            ("ino", file_identity_value(self.ino)),
             ("length", Value::uint(self.length)),
             ("mtime_ns", Value::uint(self.mtime_ns)),
             ("mtime_s", Value::uint(self.mtime_s)),
             ("sha256", Value::str(self.sha256.clone())),
         ])
+    }
+}
+
+/// OS device/inode identifiers are u64, while the shared canonical-JSON profile admits integers
+/// only through 2^53-1. Small values retain their existing numeric bytes; values the numeric form
+/// cannot represent use one canonical unsigned-decimal string. No previously valid record moves.
+fn file_identity_value(value: u64) -> Value {
+    if value <= crate::limits::INT_MAX as u64 {
+        Value::uint(value)
+    } else {
+        Value::str(value.to_string())
+    }
+}
+
+fn file_identity(fields: &mut Fields<'_>, key: &str) -> Result<u64> {
+    match fields.req(key)? {
+        Value::Int(value) if *value >= 0 => Ok(*value as u64),
+        Value::Str(value) => {
+            if value.is_empty()
+                || (value.len() > 1 && value.starts_with('0'))
+                || !value.bytes().all(|byte| byte.is_ascii_digit())
+            {
+                return refuse(
+                    Code::NONCANONICAL_ENCODING,
+                    format!("VRecord.{key}: file identity is not canonical unsigned decimal"),
+                );
+            }
+            let parsed = value.parse::<u64>().map_err(|_| Refusal {
+                code: Code::NUMBER_RANGE,
+                detail: format!("VRecord.{key}: file identity is outside u64"),
+            })?;
+            if parsed <= crate::limits::INT_MAX as u64 {
+                return refuse(
+                    Code::NONCANONICAL_ENCODING,
+                    format!(
+                        "VRecord.{key}: {parsed} fits the canonical JSON integer form and may not be a string"
+                    ),
+                );
+            }
+            Ok(parsed)
+        }
+        other => refuse(
+            Code::WRONG_TYPE,
+            format!(
+                "VRecord.{key}: expected non-negative integer or large unsigned-decimal string, got {}",
+                other.kind()
+            ),
+        ),
     }
 }
 
@@ -154,6 +202,20 @@ impl VRecord {
     }
     /// The first disagreeing bound fact, or None when the record still stands.
     fn disagreement(&self, hex: &str, md: &fs::Metadata, generation: u64) -> Option<String> {
+        if self.dev != md.dev() {
+            return Some(format!("file device {} != {}", self.dev, md.dev()));
+        }
+        self.portable_disagreement(hex, md, generation)
+    }
+
+    /// Everything stable across a remount of the same NFS object. Used only by the explicit
+    /// record migration; normal reads continue to require exact mount-local device identity.
+    fn portable_disagreement(
+        &self,
+        hex: &str,
+        md: &fs::Metadata,
+        generation: u64,
+    ) -> Option<String> {
         let now = VRecord::of(hex, md, generation);
         if self.sha256 != now.sha256 {
             return Some(format!("object id {} != {}", self.sha256, now.sha256));
@@ -164,11 +226,8 @@ impl VRecord {
                 self.generation, now.generation
             ));
         }
-        if self.dev != now.dev || self.ino != now.ino {
-            return Some(format!(
-                "file identity {}:{} != {}:{}",
-                self.dev, self.ino, now.dev, now.ino
-            ));
+        if self.ino != now.ino {
+            return Some(format!("file inode {} != {}", self.ino, now.ino));
         }
         if self.length != now.length {
             return Some(format!("size {} != {}", self.length, now.length));
@@ -181,6 +240,113 @@ impl VRecord {
         }
         None
     }
+}
+
+fn legacy_file_identity_record(bytes: &[u8]) -> Result<VRecord> {
+    fn take<'a>(input: &mut &'a str, delimiter: &str, field: &str) -> Result<&'a str> {
+        let (value, rest) = input.split_once(delimiter).ok_or_else(|| Refusal {
+            code: Code::MALFORMED_JSON,
+            detail: format!("legacy VRecord.{field}: missing delimiter"),
+        })?;
+        *input = rest;
+        Ok(value)
+    }
+    fn unsigned(input: &mut &str, delimiter: &str, field: &str) -> Result<u64> {
+        let value = take(input, delimiter, field)?;
+        if value.is_empty() || (value.len() > 1 && value.starts_with('0')) || !value.is_ascii() {
+            return refuse(
+                Code::NONCANONICAL_ENCODING,
+                format!("legacy VRecord.{field}: not canonical unsigned decimal"),
+            );
+        }
+        if !value.bytes().all(|byte| byte.is_ascii_digit()) {
+            return refuse(
+                Code::NONCANONICAL_ENCODING,
+                format!("legacy VRecord.{field}: not canonical unsigned decimal"),
+            );
+        }
+        value.parse::<u64>().map_err(|_| Refusal {
+            code: Code::NUMBER_RANGE,
+            detail: format!("legacy VRecord.{field}: outside u64"),
+        })
+    }
+    fn identity(input: &mut &str, delimiter: &str, field: &str) -> Result<u64> {
+        let value = take(input, delimiter, field)?;
+        if let Some(magnitude) = value.strip_prefix('-') {
+            if value == "-0"
+                || magnitude.is_empty()
+                || (magnitude.len() > 1 && magnitude.starts_with('0'))
+                || !magnitude.bytes().all(|byte| byte.is_ascii_digit())
+            {
+                return refuse(
+                    Code::NONCANONICAL_ENCODING,
+                    format!("legacy VRecord.{field}: not canonical signed decimal"),
+                );
+            }
+            return value
+                .parse::<i64>()
+                .map(|signed| signed as u64)
+                .map_err(|_| Refusal {
+                    code: Code::NUMBER_RANGE,
+                    detail: format!("legacy VRecord.{field}: outside old i64 writer range"),
+                });
+        }
+        if value.is_empty()
+            || (value.len() > 1 && value.starts_with('0'))
+            || !value.bytes().all(|byte| byte.is_ascii_digit())
+        {
+            return refuse(
+                Code::NONCANONICAL_ENCODING,
+                format!("legacy VRecord.{field}: not canonical unsigned decimal"),
+            );
+        }
+        value.parse::<u64>().map_err(|_| Refusal {
+            code: Code::NUMBER_RANGE,
+            detail: format!("legacy VRecord.{field}: outside u64"),
+        })
+    }
+
+    let mut input = std::str::from_utf8(bytes)
+        .map_err(|_| Refusal {
+            code: Code::MALFORMED_JSON,
+            detail: "legacy VRecord is not UTF-8".into(),
+        })?
+        .strip_prefix("{\"dev\":")
+        .ok_or_else(|| Refusal {
+            code: Code::MALFORMED_JSON,
+            detail: "legacy VRecord has no exact dev prefix".into(),
+        })?;
+    let dev = identity(
+        &mut input,
+        ",\"format\":\"tensorfs.verification/1\",\"generation\":",
+        "dev",
+    )?;
+    let generation = unsigned(&mut input, ",\"ino\":", "generation")?;
+    let ino = identity(&mut input, ",\"length\":", "ino")?;
+    let length = unsigned(&mut input, ",\"mtime_ns\":", "length")?;
+    let mtime_ns = unsigned(&mut input, ",\"mtime_s\":", "mtime_ns")?;
+    let mtime_s = unsigned(&mut input, ",\"sha256\":\"", "mtime_s")?;
+    let sha256 = input.strip_suffix("\"}").ok_or_else(|| Refusal {
+        code: Code::MALFORMED_JSON,
+        detail: "legacy VRecord has no exact sha256 suffix".into(),
+    })?;
+    let sha256 = crate::ids::hex64("legacy VRecord.sha256", sha256)?;
+    Ok(VRecord {
+        sha256,
+        length,
+        dev,
+        ino,
+        mtime_s,
+        mtime_ns,
+        generation,
+    })
+}
+
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct RecordMigration {
+    pub scanned: usize,
+    pub current: usize,
+    pub migrated: usize,
 }
 
 // ---------------------------------------------------------------- fault injection
@@ -619,6 +785,68 @@ impl Store {
             Some(why) => Err(why),
             None => Ok(rec),
         }
+    }
+
+    /// Explicit hardcut migration for records with a large old-writer identity or a mount-local
+    /// device id from another NFS client. It trusts no pathname absence and hashes no payload: the
+    /// exact record grammar plus stable inode/length/mtime/generation must agree, then the new writer
+    /// rebinds only the operational record to this mount. Ordinary reads never call this.
+    pub fn migrate_file_identity_records(&self) -> Result<RecordMigration> {
+        let mut result = RecordMigration::default();
+        for hex in self.objects()? {
+            result.scanned += 1;
+            if self.record_valid(&hex).is_ok() {
+                result.current += 1;
+                continue;
+            }
+            let path = self.record_path(&hex);
+            let bytes =
+                fs::read(&path).map_err(|error| io(format!("read {}", path.display()), error))?;
+            let mut record = match VRecord::parse(&bytes) {
+                Ok(record) => record,
+                Err(error)
+                    if error.code == Code::NUMBER_RANGE || error.code == Code::WRONG_TYPE =>
+                {
+                    legacy_file_identity_record(&bytes)?
+                }
+                Err(error) => {
+                    return refuse(
+                        Code::OBJECT_CORRUPT,
+                        format!(
+                            "sha256:{hex}: record is not a large/remounted identity row ({error})"
+                        ),
+                    )
+                }
+            };
+            let metadata = stat(&self.object_path(&hex))?;
+            if let Some(why) = record.portable_disagreement(&hex, &metadata, self.marker.generation)
+            {
+                return refuse(
+                    Code::OBJECT_CORRUPT,
+                    format!("sha256:{hex}: legacy record no longer describes the object ({why})"),
+                );
+            }
+            if record.dev == metadata.dev()
+                && record.dev <= crate::limits::INT_MAX as u64
+                && record.ino <= crate::limits::INT_MAX as u64
+            {
+                return refuse(
+                    Code::OBJECT_CORRUPT,
+                    format!(
+                        "sha256:{hex}: record failed despite having no large or remounted identity"
+                    ),
+                );
+            }
+            record.dev = metadata.dev();
+            record.ino = metadata.ino();
+            self.write_record(&record)?;
+            self.record_valid(&hex).map_err(|why| Refusal {
+                code: Code::OBJECT_CORRUPT,
+                detail: format!("sha256:{hex}: migrated record is not current ({why})"),
+            })?;
+            result.migrated += 1;
+        }
+        Ok(result)
     }
 
     // ------------------------------------------------------------ reads
