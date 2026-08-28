@@ -209,6 +209,17 @@ func handleRent(ctx *Context) *exit.Error {
 	if e != nil {
 		return e
 	}
+	if attachable.State == hub.RentalReady {
+		current, problem := st.RentalOperation(operationKey)
+		if problem != nil {
+			return problem
+		}
+		if current == nil || current.State != "attached" {
+			return exit.Named(exit.Conflict, "rental.convergence_evidence_missing",
+				"rental %s became ready before this host attached its private RecordOwner", attachable.ID).
+				WithRemedy("upgrade Tensorhub to the convergence-gated private-rental contract; the Hub cannot declare a fresh private worker ready without the renter's relayed frames")
+		}
+	}
 	row.Address, row.State = attachable.Address, attachable.State
 	row.MediaAddress = attachable.MediaAddress
 	captureRentalControl(&row, attachable)
