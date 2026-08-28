@@ -91,6 +91,24 @@ struct Item {
     seed: Option<String>,
 }
 
+/// The synthetic corpus has one normal, mixed-encoding form. `Plain` is a closed fixture
+/// variant for hardware that has only qualified `plain/1`: it changes the encoding choice,
+/// never the logical component/key/dtype/shape plan.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PlanEncoding {
+    Mixed,
+    Plain,
+}
+
+impl PlanEncoding {
+    fn alias(self, mixed: &'static str) -> &'static str {
+        match self {
+            PlanEncoding::Mixed => mixed,
+            PlanEncoding::Plain => "plain/1",
+        }
+    }
+}
+
 fn item(
     comp: &'static str,
     key: String,
@@ -108,13 +126,13 @@ fn item(
     }
 }
 
-/// SDXL-shaped: three components, four encodings, parts on both sides of the inline
+/// SDXL-shaped: three components, mixed encodings, parts on both sides of the inline
 /// threshold, one part over the 64 MiB grid, one rank-0 scalar, one byte-identical pair.
 /// `scale` divides every dimension (floor 2), so the same SHAPE of corpus can be written
 /// at a size a repository can carry: the committed wheel-smoke store is this plan at
-/// scale 32, ~40 KB, and it exercises the same encodings, the same inline/segment split
-/// and the same path law as the full one.
-fn plan(blocks: u64, scale: u64) -> Vec<Item> {
+/// scale 32, ~40 KB, and it exercises the same mixed encoding choices and path law as the
+/// full one. `PlanEncoding::Plain` retains every logical fact and only replaces aliases.
+fn plan(blocks: u64, scale: u64, encoding: PlanEncoding) -> Vec<Item> {
     let d = |dims: Vec<u64>| -> Vec<u64> { dims.iter().map(|x| (x / scale).max(2)).collect() };
     let mut v = Vec::new();
     for i in 0..blocks {
@@ -122,35 +140,35 @@ fn plan(blocks: u64, scale: u64) -> Vec<Item> {
         v.push(item(
             "unet",
             k("attn1.to_q.weight"),
-            "fp8-rowwise/1",
+            encoding.alias("fp8-rowwise/1"),
             Dtype::Bf16,
             d(vec![2048, 2048]),
         ));
         v.push(item(
             "unet",
             k("attn1.to_out.0.weight"),
-            "plain/1",
+            encoding.alias("plain/1"),
             Dtype::Bf16,
             d(vec![2048, 2048]),
         ));
         v.push(item(
             "unet",
             k("ff.net.0.proj.weight"),
-            "nvfp4-w4a4/1",
+            encoding.alias("nvfp4-w4a4/1"),
             Dtype::Bf16,
             d(vec![2048, 8192]),
         ));
         v.push(item(
             "unet",
             k("norm1.weight"),
-            "plain/1",
+            encoding.alias("plain/1"),
             Dtype::Bf16,
             d(vec![2048]),
         ));
         v.push(item(
             "unet",
             k("attn1.norm_q.weight"),
-            "plain/1",
+            encoding.alias("plain/1"),
             Dtype::Bf16,
             d(vec![64]),
         ));
@@ -158,28 +176,28 @@ fn plan(blocks: u64, scale: u64) -> Vec<Item> {
     v.push(item(
         "text_encoder",
         "embeddings.weight".into(),
-        "plain/1",
+        encoding.alias("plain/1"),
         Dtype::Bf16,
         d(vec![8192, 8192]),
     ));
     v.push(item(
         "text_encoder",
         "final_norm.weight".into(),
-        "plain/1",
+        encoding.alias("plain/1"),
         Dtype::F32,
         d(vec![1024]),
     ));
     v.push(item(
         "vae",
         "decoder.conv_in.weight".into(),
-        "plain/1",
+        encoding.alias("plain/1"),
         Dtype::F32,
         d(vec![512, 512]),
     ));
     let mut twin = item(
         "vae",
         "decoder.conv_out.weight".into(),
-        "plain/1",
+        encoding.alias("plain/1"),
         Dtype::F32,
         d(vec![512, 512]),
     );
@@ -229,7 +247,12 @@ pub fn cmd_write(root: &Path, f: &Flags) -> ExitCode {
     let blocks: u64 = flag_num(f, "blocks", 12);
     let scale: u64 = flag_num::<u64>(f, "scale", 1).max(1);
     let store = ok!(Store::init(root));
-    let items = plan(blocks, scale);
+    let encoding = if flag_on(f, "plain") {
+        PlanEncoding::Plain
+    } else {
+        PlanEncoding::Mixed
+    };
+    let items = plan(blocks, scale, encoding);
 
     // The closure first: spec objects and config objects are ordinary CAS objects, and the
     // header commits them BY REFERENCE.
@@ -436,7 +459,12 @@ pub fn cmd_read(root: &Path, hex: &str, f: &Flags) -> ExitCode {
     let validate_ms = t.elapsed().as_secs_f64() * 1000.0;
 
     // Expected whole-part digests, regenerated from the plan — never read from the store.
-    let items = plan(blocks, scale);
+    let encoding = if flag_on(f, "plain") {
+        PlanEncoding::Plain
+    } else {
+        PlanEncoding::Mixed
+    };
+    let items = plan(blocks, scale, encoding);
     let mut expect: Vec<(String, String)> = Vec::new();
     for it in &items {
         let spec = spec_of(it.alias);
@@ -852,4 +880,166 @@ pub fn cmd_size(n: usize) -> ExitCode {
     println!("  topology_digest {}", parsed.topology_digest());
     println!("  peak RSS {:.1} MiB", rss_kb("VmHWM") as f64 / 1024.0);
     ExitCode::SUCCESS
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::BTreeSet;
+    use std::fs;
+    use std::path::PathBuf;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    use super::*;
+
+    static NEXT_ROOT: AtomicU64 = AtomicU64::new(0);
+    const SCALED_TOPOLOGY: &str =
+        "sha256:b0bcb1d36deae42e880632817730172f6f6a14f2177bae0ea953cba2a64b0ccf";
+
+    struct TestRoot(PathBuf);
+
+    impl TestRoot {
+        fn new(name: &str) -> Self {
+            let unique = NEXT_ROOT.fetch_add(1, Ordering::Relaxed);
+            let nanos = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("clock after epoch")
+                .as_nanos();
+            let root = std::env::temp_dir().join(format!(
+                "tensorfs-{name}-{}-{nanos}-{unique}",
+                std::process::id()
+            ));
+            assert!(!root.exists(), "fresh test root already exists");
+            TestRoot(root)
+        }
+    }
+
+    impl Drop for TestRoot {
+        fn drop(&mut self) {
+            if self.0.exists() {
+                fs::remove_dir_all(&self.0).expect("remove owned TensorFS test root");
+            }
+        }
+    }
+
+    fn write_and_load(name: &str, plain: bool) -> (TestRoot, ObjectRef, Header, Closure, Flags) {
+        let root = TestRoot::new(name);
+        let mut flags = vec![
+            ("blocks".to_string(), "1".to_string()),
+            ("scale".to_string(), "32".to_string()),
+        ];
+        if plain {
+            flags.push(("plain".to_string(), "1".to_string()));
+        }
+        assert_eq!(cmd_write(&root.0, &flags), ExitCode::SUCCESS);
+
+        let store = Store::open(&root.0).expect("open written test store");
+        let mut headers = Vec::new();
+        for hex in store.objects().expect("list written objects") {
+            let path = store.object_path(&hex);
+            let length = fs::metadata(&path).expect("stat written object").len();
+            if length > Header::MAX_BYTES as u64 {
+                continue;
+            }
+            let bytes = fs::read(&path).expect("read bounded written object");
+            if let Ok(header) = Header::parse(&bytes) {
+                headers.push((
+                    ObjectRef {
+                        sha256: hex,
+                        length,
+                    },
+                    header,
+                ));
+            }
+        }
+        assert_eq!(headers.len(), 1, "store must contain exactly one header");
+        let (href, header) = headers.pop().expect("one header");
+        let closure = ck::load_closure(&store, &header).expect("load emitted header closure");
+        (root, href, header, closure, flags)
+    }
+
+    fn encoding_ids(header: &Header) -> BTreeSet<String> {
+        header
+            .tensors()
+            .map(|(_, _, tensor)| tensor.encoding.clone())
+            .collect()
+    }
+
+    #[test]
+    fn full_plain_plan_preserves_every_logical_fact_and_volume() {
+        let logical = |encoding| {
+            plan(12, 1, encoding)
+                .into_iter()
+                .map(|item| {
+                    let bytes = tensorfs_core::dtype::checked_bytes(
+                        &format!("{}/{}", item.comp, item.key),
+                        &item.shape,
+                        item.dtype,
+                    )
+                    .expect("valid synthetic logical tensor");
+                    (item.comp, item.key, item.dtype.name(), item.shape, bytes)
+                })
+                .collect::<Vec<_>>()
+        };
+        let mixed = logical(PlanEncoding::Mixed);
+        let plain = logical(PlanEncoding::Plain);
+        assert_eq!(plain, mixed, "--plain may change only the encoding alias");
+        assert_eq!(mixed.len(), 64);
+        assert_eq!(
+            mixed.iter().map(|item| item.4).sum::<u64>(),
+            740_349_440,
+            "the full synthetic corpus logical byte volume is fixed"
+        );
+        assert_eq!(
+            mixed.iter().map(|item| item.0).collect::<BTreeSet<_>>(),
+            BTreeSet::from(["text_encoder", "unet", "vae"])
+        );
+        assert!(plan(12, 1, PlanEncoding::Plain)
+            .iter()
+            .all(|item| item.alias == "plain/1"));
+    }
+
+    #[test]
+    fn default_writer_emits_a_mixed_header_and_closure() {
+        let (_root, _href, header, closure, _flags) = write_and_load("mixed", false);
+        let ids = encoding_ids(&header);
+        let header_ids: BTreeSet<String> = header.encodings.iter().map(ObjectRef::id).collect();
+        let closure_ids: BTreeSet<String> =
+            closure.specs.iter().map(|(id, _)| id.clone()).collect();
+        assert!(
+            ids.len() > 1,
+            "default checkpoint unexpectedly stopped being mixed"
+        );
+        assert_eq!(ids, header_ids);
+        assert_eq!(ids, closure_ids);
+        assert!(ids.contains(&registry_seed("plain/1").spec.object_id()));
+        assert_eq!(header.topology_digest(), SCALED_TOPOLOGY);
+    }
+
+    #[test]
+    fn plain_writer_emits_only_plain_in_header_closure_and_tensors() {
+        let (root, href, header, closure, flags) = write_and_load("plain", true);
+        let plain_id = registry_seed("plain/1").spec.object_id();
+        assert_eq!(
+            encoding_ids(&header),
+            BTreeSet::from([plain_id.clone()]),
+            "every emitted tensor must cite plain/1"
+        );
+        assert_eq!(
+            header
+                .encodings
+                .iter()
+                .map(ObjectRef::id)
+                .collect::<Vec<_>>(),
+            vec![plain_id.clone()],
+            "the header closure must cite only plain/1"
+        );
+        assert_eq!(closure.specs.len(), 1);
+        assert_eq!(closure.specs[0].0, plain_id);
+        assert!(header
+            .tensors()
+            .all(|(_, _, tensor)| tensor.parts.len() == 1 && tensor.parts[0].0 == "value"));
+        assert_eq!(header.topology_digest(), SCALED_TOPOLOGY);
+        assert_eq!(cmd_read(&root.0, &href.sha256, &flags), ExitCode::SUCCESS);
+    }
 }

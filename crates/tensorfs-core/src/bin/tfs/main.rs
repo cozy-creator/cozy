@@ -42,8 +42,9 @@
 //!   tfs snapshot blob put|read|repair <root> <file> [i]
 //!
 //! The checkpoint plane (tfs-015). Flags: --blocks <n> --pin <alias|empty> --seed <s>
+//! `write`/`read` also accept `--plain`, the closed all-`plain/1` synthetic fixture variant.
 //!
-//!   tfs checkpoint write <root>              objectize a synthetic tree, emit the header
+//!   tfs checkpoint write <root> [--plain]    objectize a synthetic tree, emit the header
 //!   tfs checkpoint read <root> <hex>         reconstruct every part, byte-identity checked
 //!   tfs checkpoint info <root> <hex>         component/scope query, zero tensor-byte reads
 //!   tfs checkpoint locate <root> <hex> <component> <key> <role> <off> <len>
