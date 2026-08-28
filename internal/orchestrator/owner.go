@@ -491,31 +491,18 @@ func instancePin(w *worker, declared string) *exit.Error {
 
 // releasePin is the RELEASE FENCE on a claim, and #505's carried-not-verified gap closed.
 //
-// A rented pod is supposed to have installed the same endpoint release this host did — the
-// plan ids the orchestrator is about to name in a Directive are the digests of THAT
-// release's bindings, and #506a is what makes those digests comparable across machines at
-// all. The check existed and could not fire for a rental: a pod that declared NOTHING was
-// admitted, because "carried" and "verified" were the same branch.
-//
-// So the rule is split by lane. A SPAWNED worker may be silent — this launcher passed it
-// `--release-id`, so the identity is ours by construction. An ATTACHED remote worker may
-// NOT: silence there is a pod that will not say what it is serving, which is the one case
-// the pin exists for. In both lanes a stated release that disagrees refuses.
+// A dynamic substrate has no endpoint release at ClaimAck time: exact endpoint identity
+// arrives later in the digest-fenced PlacementSet. Silence is therefore the only truthful
+// answer from a freshly attached pod and is accepted in both launch lanes. A worker that
+// does claim a release is still held to the host's pin; a stale preloaded endpoint must not
+// be mistaken for the dynamic placement this owner is about to converge.
 func releasePin(w *worker, declared string) *exit.Error {
 	pinned := w.spec.Placement.ReleaseID
 	if pinned == "" {
 		return nil // nothing to pin against — an uninstalled dev spec names no release
 	}
 	if declared == "" {
-		if w.spec.Connection == nil {
-			return nil
-		}
-		return exit.Named(exit.Conflict, "release_undeclared",
-			"this pod's ClaimAck declares no endpoint release, and this host pinned %q", pinned).
-			WithRemedy("a rented pod installs the release this host is dispatching against; " +
-				"one that will not say which release it serves cannot be shown to have it, " +
-				"and the plan ids in the directive would be resolved against a guess").
-			WithNext("cozy rent release " + rentalOf(w.spec.Placement.Endpoint) + " --yes")
+		return nil
 	}
 	if declared != pinned {
 		return exit.Named(exit.Conflict, "release_mismatch",
