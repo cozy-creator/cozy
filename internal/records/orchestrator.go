@@ -148,6 +148,10 @@ CREATE TABLE IF NOT EXISTS outputs (
   length     INTEGER NOT NULL,
   mime_type  TEXT    NOT NULL,
   visible_at TEXT    NOT NULL,
+  -- cl-033: the retention lifecycle fact. Empty while the bytes are on disk; stamped
+  -- when cozy gc reclaims them. The ROW is the tombstone, so a reclaimed media id
+  -- answers the honest 410 rather than a 404 that would claim it never existed.
+  reclaimed_at TEXT   NOT NULL DEFAULT '',
   PRIMARY KEY (request_id, attempt, output_id),
   FOREIGN KEY (request_id, attempt) REFERENCES attempts(request_id, attempt)
 )`, `
@@ -242,6 +246,7 @@ var widen = []string{
 	`ALTER TABLE requests ADD COLUMN artifact_outputs TEXT NOT NULL DEFAULT '[]'`,
 	`ALTER TABLE attempts ADD COLUMN media_cleaned INTEGER NOT NULL DEFAULT 0`,
 	`ALTER TABLE attempts ADD COLUMN artifact_outputs TEXT NOT NULL DEFAULT '[]'`,
+	`ALTER TABLE outputs ADD COLUMN reclaimed_at TEXT NOT NULL DEFAULT ''`,
 }
 
 // normalize hard-cuts pre-launch lifecycle spellings whose durable meaning was refined.
@@ -1675,6 +1680,100 @@ func (s *Store) Media(mediaID string) (*Output, string, int64, *exit.Error) {
 		return nil, "", 0, exit.Internalf("cannot read media %s: %s", mediaID, err)
 	}
 	return &o, requestID, attempt, nil
+}
+
+// ------------------------------------------------------------------ retention (cl-033)
+//
+// Locally mirrored outputs are the ONE thing on this host that grows forever: the bytes
+// are fetched before the terminal is acked and are deliberately never dropped with the
+// pod (that is the whole point — a rental costs $2/hr and its results must outlive it).
+// Retention is therefore a POLICY, and it lives here as two reads and one stamp:
+//
+//	RetainedOutputs     what is on this disk, so a user can ask before anything decides
+//	ReclaimableOutputs  the plan's one query: settled, older than the horizon, not a job
+//	MarkOutputReclaimed the row survives its bytes, so a reclaimed id is a 410, not a 404
+//
+// The row is NEVER deleted. `api/media.go` already answers `media_reclaimed` when the
+// bytes are gone, and "was reclaimed" is a different fact from "never existed".
+
+// RetainedOutput is one published output plus the facts retention decides on: which
+// request produced it, what kind of request that was, when it became visible, and
+// whether its bytes are still here.
+type RetainedOutput struct {
+	Output
+	RequestID   string
+	Attempt     int64
+	Endpoint    string
+	Kind        string
+	VisibleAt   string
+	ReclaimedAt string
+}
+
+const retainedCols = `o.output_id,o.media_id,o.path,o.digest,o.length,o.mime_type,
+	o.request_id,o.attempt,r.endpoint,r.kind,o.visible_at,o.reclaimed_at`
+
+func scanRetained(rows *sql.Rows) (RetainedOutput, error) {
+	var x RetainedOutput
+	err := rows.Scan(&x.OutputID, &x.MediaID, &x.Path, &x.Digest, &x.Length, &x.MimeType,
+		&x.RequestID, &x.Attempt, &x.Endpoint, &x.Kind, &x.VisibleAt, &x.ReclaimedAt)
+	return x, err
+}
+
+func (s *Store) retained(where string, args ...any) ([]RetainedOutput, *exit.Error) {
+	rows, err := s.db.Query(`SELECT `+retainedCols+` FROM outputs o
+		JOIN attempts a ON a.request_id=o.request_id AND a.attempt=o.attempt
+		JOIN requests r ON r.id=o.request_id
+		WHERE a.state IN ('terminal','closed') `+where, args...)
+	if err != nil {
+		return nil, exit.Internalf("cannot read the retained outputs: %s", err)
+	}
+	defer rows.Close()
+	out := []RetainedOutput{}
+	for rows.Next() {
+		x, err := scanRetained(rows)
+		if err != nil {
+			return nil, exit.Internalf("cannot read a retained output row: %s", err)
+		}
+		out = append(out, x)
+	}
+	return out, nil
+}
+
+// RetainedOutputs is everything this host published, newest first — reclaimed rows
+// included and marked as such, because "I had 40 of these and gc took 12" is the answer
+// a user asking about their disk actually wants.
+func (s *Store) RetainedOutputs() ([]RetainedOutput, *exit.Error) {
+	return s.retained(`ORDER BY o.visible_at DESC, o.output_id`)
+}
+
+// ReclaimableOutputs is the retention plan's ONE query, and every clause in it is a
+// refusal to delete something someone still needs:
+//
+//	reclaimed_at=''   its bytes have not already been reclaimed
+//	visible_at < cut  it is older than the horizon — nothing recent is ever a candidate,
+//	                  which is what makes "shut the pod down, then look at the files" safe
+//	r.kind <> 'job'   a job's bytes are its durable PUBLICATION (cl-004), not a mirror
+//	no live attempt   the request is settled; an in-flight attempt owns its directory
+//
+// This is deliberately NOT an unreferenced sweep. Every retained output belongs to a
+// settled request by construction, so "nothing references it" is true of ALL of them and
+// would reclaim exactly the files this plane exists to keep.
+func (s *Store) ReclaimableOutputs(cutoff string) ([]RetainedOutput, *exit.Error) {
+	return s.retained(`AND o.reclaimed_at='' AND o.visible_at < ? AND r.kind <> 'job'
+		AND NOT EXISTS (SELECT 1 FROM attempts la WHERE la.request_id=o.request_id
+		  AND la.state IN ('preparing','offered','accepted','recovered_open'))
+		ORDER BY o.visible_at, o.output_id`, cutoff)
+}
+
+// MarkOutputReclaimed stamps one row after its bytes are gone. Idempotent: the stamp is
+// written only over an empty one, so a crash between the unlink and the stamp converges
+// on the next `cozy gc` instead of needing a journal of its own.
+func (s *Store) MarkOutputReclaimed(mediaID string) *exit.Error {
+	if _, err := s.db.Exec(`UPDATE outputs SET reclaimed_at=? WHERE media_id=? AND reclaimed_at=''`,
+		now(), mediaID); err != nil {
+		return exit.Internalf("cannot mark %s reclaimed: %s", mediaID, err)
+	}
+	return nil
 }
 
 // ---------------------------------------------------------------- publications (cl-004)

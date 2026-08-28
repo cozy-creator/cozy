@@ -44,6 +44,7 @@ var handlers = map[string]Handler{
 	"ls":                handleLs,
 	"rm":                handleRm,
 	"gc":                handleGC,
+	"media.ls":          handleMediaLs,
 	"up":                handleUp,
 	"down":              handleDown,
 	"search":            handleSearch,

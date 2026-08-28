@@ -3,6 +3,7 @@ package app
 import (
 	"fmt"
 	"strings"
+	"time"
 
 	"github.com/cozy-creator/cozy-creator/internal/config"
 	"github.com/cozy-creator/cozy-creator/internal/exit"
@@ -10,6 +11,7 @@ import (
 	"github.com/cozy-creator/cozy-creator/internal/install"
 	"github.com/cozy-creator/cozy-creator/internal/records"
 	"github.com/cozy-creator/cozy-creator/internal/render"
+	"github.com/cozy-creator/cozy-creator/internal/retention"
 )
 
 // open resolves the local layout and the ONE lifecycle database. Mutating verbs
@@ -211,6 +213,10 @@ func handleRm(ctx *Context) *exit.Error {
 
 func handleGC(ctx *Context) *exit.Error {
 	write := ctx.Inv.Bool("--yes")
+	horizon, e := retention.ParseHorizon(ctx.Inv.Value("--keep-media"))
+	if e != nil {
+		return e
+	}
 	l, st, w, e := open(ctx.Cfg, write)
 	if e != nil {
 		return e
@@ -223,10 +229,19 @@ func handleGC(ctx *Context) *exit.Error {
 	if e != nil {
 		return e
 	}
+	// THE SECOND PLANE (cl-033). Unreferenced generations are garbage; retained outputs
+	// are the user's work, kept on purpose after the pod that made them was destroyed.
+	// They share `gc` because they share the question — what is this root storing, and
+	// what may go — but not the rule: one is reclaimed because nothing points at it, the
+	// other only because it is older than the declared horizon.
+	media, e := retention.Build(l, st, horizon, time.Now())
+	if e != nil {
+		return e
+	}
 	out := render.List{
 		Kind:      "gc",
 		Fields:    []string{"kind", "id", "endpoint", "bytes"},
-		AllFields: []string{"kind", "id", "endpoint", "version", "bytes", "reason"},
+		AllFields: []string{"kind", "id", "endpoint", "version", "age", "bytes", "reason"},
 		Empty:     "0 bytes reclaimable",
 	}
 	var total int64
@@ -234,19 +249,38 @@ func handleGC(ctx *Context) *exit.Error {
 		total += r.Bytes
 		out.Rows = append(out.Rows, map[string]string{
 			"kind": r.Kind, "id": r.ID, "endpoint": r.Endpoint, "version": r.Version,
-			"bytes": render.Bytes(r.Bytes), "reason": r.Reason,
+			"age": "-", "bytes": render.Bytes(r.Bytes), "reason": r.Reason,
 		})
+	}
+	for _, m := range media.Items {
+		total += m.Bytes
+		out.Rows = append(out.Rows, map[string]string{
+			"kind": "media", "id": m.MediaID, "endpoint": m.Endpoint, "version": "-",
+			"age": retention.Age(m.Age), "bytes": render.Bytes(m.Bytes), "reason": m.Reason,
+		})
+	}
+	items := len(plan) + len(media.Items)
+	if media.Foreign > 0 {
+		out.Notes = append(out.Notes, fmt.Sprintf(
+			"%d output row(s) record a path outside the local output namespace and were NOT planned",
+			media.Foreign))
 	}
 	if !write {
 		out.Aggregates = []render.Field{
 			{K: "reclaimable", V: render.Bytes(total)},
-			{K: "items", V: len(plan)},
+			{K: "items", V: items},
+			{K: "media", V: fmt.Sprintf("%d output(s), %s beyond the %s horizon",
+				len(media.Items), render.Bytes(media.Bytes), retention.Short(horizon))},
+			{K: "retained", V: fmt.Sprintf("%d output(s), %s kept",
+				media.RetainedItems, render.Bytes(media.RetainedBytes))},
 			{K: "cas", V: "0 objects (the shared weights CAS lands with cl-012)"},
 		}
-		if len(plan) == 0 {
-			out.Notes = []string{"nothing is unreferenced — this is the answer, not an empty listing"}
+		if items == 0 {
+			out.Notes = append(out.Notes, "nothing is unreferenced and no output is past the "+
+				retention.Short(horizon)+" horizon — this is the answer, not an empty listing")
+			out.Next = []string{"cozy media ls"}
 		} else {
-			out.Notes = []string{"this is the plan; nothing was removed"}
+			out.Notes = append(out.Notes, "this is the plan; nothing was removed")
 			out.Next = []string{"cozy gc --yes"}
 		}
 		return emit(ctx, out)
@@ -255,12 +289,22 @@ func handleGC(ctx *Context) *exit.Error {
 	if e != nil {
 		return e
 	}
-	out.Aggregates = []render.Field{
-		{K: "freed", V: render.Bytes(freed)},
-		{K: "items", V: len(plan)},
+	reclaimed, e := retention.Collect(l, st, media)
+	if e != nil {
+		return e
 	}
-	if len(plan) > 0 {
-		out.Notes = []string{"only generations nothing references were reclaimed; every pin still resolves"}
+	out.Aggregates = []render.Field{
+		{K: "freed", V: render.Bytes(freed + reclaimed)},
+		{K: "items", V: items},
+		{K: "media", V: fmt.Sprintf("%d output(s), %s", len(media.Items), render.Bytes(reclaimed))},
+		{K: "retained", V: fmt.Sprintf("%d output(s), %s kept",
+			media.RetainedItems, render.Bytes(media.RetainedBytes))},
+	}
+	if items > 0 {
+		out.Notes = append(out.Notes,
+			"only generations nothing references and outputs past the "+retention.Short(horizon)+
+				" horizon were reclaimed; a reclaimed media id answers 410, never 404")
+		out.Next = []string{"cozy media ls"}
 	}
 	return emit(ctx, out)
 }

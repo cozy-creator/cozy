@@ -583,6 +583,11 @@ func (f *fakeControl) Control(stream pb.WorkerControl_ControlServer) error {
 			if f.arm == "dropack" {
 				dropAck = f.outcomeWithOutput(outcome, offer)
 			}
+			// cl-033's producer: one succeeded attempt with one real mirrored output and
+			// no adversary at all. Retention is about what a NORMAL result leaves behind.
+			if f.arm == "output" {
+				f.outcomeWithOutput(outcome, offer)
+			}
 			if strings.HasPrefix(f.arm, "artifact") {
 				f.artifactAttempt(outcome, offer)
 			}

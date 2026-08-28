@@ -64,7 +64,7 @@ func (c *Command) Name() string { return strings.Join(c.Path, " ") }
 const Description = "local-first generative media: install endpoints, run them, publish releases"
 
 // Groups is the display order of command groups.
-var Groups = []string{"meta", "service", "endpoints", "invocation", "videos", "workflows", "jobs", "rentals", "catalog", "transfer", "account"}
+var Groups = []string{"meta", "service", "endpoints", "invocation", "media", "videos", "workflows", "jobs", "rentals", "catalog", "transfer", "account"}
 
 // GlobalFlags apply to every command.
 var GlobalFlags = []Flag{

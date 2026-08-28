@@ -178,13 +178,27 @@ var Commands = []Command{
 	},
 	{
 		Path: []string{"gc"}, Group: "endpoints",
-		Summary:    "without --yes the reclaim plan (a read); with --yes it executes",
-		Flags:      []Flag{yesFlag},
+		Summary: "without --yes the reclaim plan (a read); with --yes it executes",
+		Flags: []Flag{yesFlag,
+			{Name: "--keep-media", Arg: "<dur>", Summary: "local output retention horizon; 0 keeps nothing", Default: "30d"}},
 		MaxArgs:    0,
-		Exits:      []exit.Code{exit.OK, exit.Conflict},
+		Exits:      []exit.Code{exit.OK, exit.Usage, exit.Conflict},
 		Capability: "cmd.gc", PlanFirst: true, Status: Implemented, Handler: "gc",
 		Next:     []string{"cozy ls"},
 		Examples: []string{"cozy gc", "cozy gc --yes"},
+	},
+
+	// ---- retained local outputs (cl-033) ----
+	{
+		Path: []string{"media", "ls"}, Group: "media",
+		Summary: "retained local outputs: what this host stores, and what gc would reclaim",
+		Flags: []Flag{
+			{Name: "--keep-media", Arg: "<dur>", Summary: "horizon to mark rows against", Default: "30d"}},
+		MaxArgs:    0,
+		Exits:      []exit.Code{exit.OK, exit.Usage},
+		Capability: "cmd.media.ls", Status: Implemented, Handler: "media.ls",
+		Next:     []string{"cozy gc", "cozy gc --yes --keep-media <dur>"},
+		Examples: []string{"cozy media ls", "cozy media ls --keep-media 7d", "cozy media ls --json"},
 	},
 	{
 		Path: []string{"start"}, Group: "endpoints",

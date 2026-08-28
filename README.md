@@ -59,7 +59,8 @@ the pin in ONE transaction, so a kill at any earlier stage leaves the prior pin 
 Hardlink dedup is uv's link mode, not a second pool; it degrades to copies with a loud
 warning across mounts. Disk is measured once at install — `ls` reads the record and never
 walks the tree. `rm --yes` drops the pin and venv; `gc` is the plan without `--yes` and
-executes with it, reclaiming only what nothing references.
+executes with it, reclaiming what nothing references plus retained outputs past the
+retention horizon (cl-033).
 
 `--from <archive>` is the pre-hub source door standing in for the hub resolve (cl-011);
 `scripts/pack.py` is the pre-hub packager an endpoint-release publish (th-003/th-004) replaces.
@@ -318,6 +319,30 @@ lifecycle points that decide whether a publication is a promise or a fact).
 `scripts/job-release.sh` builds the release they install — cr-009's own
 `structural_census.py`, verbatim from a pinned `git archive`.
 
+## Local output retention (cl-033)
+
+An attempt's outputs are mirrored onto this host BEFORE its terminal is acknowledged and
+are kept when the pod that produced them is destroyed — a rented GPU costs dollars an hour
+and `cozy rent release` must not take its results with it. That makes
+`<COZY_HOME>/outputs/` the one plane here that grows forever, so it has a policy, and the
+policy is ONE rule: an output becomes reclaimable when it is older than the horizon
+(`--keep-media`, default 30d). Nothing else. In particular it is not an unreferenced
+sweep — every retained output belongs to a settled request by construction, so "nothing
+references it" is true of all of them and would delete exactly what this plane exists to
+keep.
+
+`cozy media ls` is what the host is storing, read straight out of the one local database
+so it answers with the service down. `cozy gc` without `--yes` prints what would go and
+removes nothing; with `--yes` it unlinks the bytes and stamps the row. The ROW survives
+its bytes on purpose: `GET /v1/media/{id}` then answers 410 `media_reclaimed`, which is a
+different fact from the 404 an id that never existed gets. A job's bytes are excluded —
+they are its durable publication, not a mirror — and the deleter refuses any recorded path
+that does not resolve under the local output namespace.
+
+KNOWN LIMITATION, recorded rather than fixed: the output fetch is SYNCHRONOUS at terminal
+time, so a pod that dies before its terminal takes those outputs with it. There is no late
+fetch.
+
 ## The durable artifact transaction (cl-023)
 
 A job may declare **artifact outputs** — TensorFS snapshot slots, stated explicitly beside
@@ -523,8 +548,11 @@ No automated tests. Verification is running the real thing:
   binding records delivered and re-hashed on the pod, the payload uploaded to it, the
   output fetched back and verified before the ack, the media server's own door matrix, and
   the refusals for a pod with no byte plane, a pod whose plane is at another contract
-  revision, and a pod whose plane declares none), and `verbs`/`journey` (the CLI as a user
-  types it, against an INSTALLED endpoint — no hand-written spec document anywhere).
+  revision, and a pod whose plane declares none), `mediagc` (cl-033's retention plane: two
+  real mirrored outputs from `fakeworker --arm output`, the horizon protecting them, the
+  plan/perform split, the bytes actually freed, and the 410-not-404 tombstone), and
+  `verbs`/`journey` (the CLI as a user types it, against an INSTALLED endpoint — no
+  hand-written spec document anywhere).
 - `scripts/verify-cl012.sh` + `scripts/xfer-live.py` drive the real `cozy` against a
   real tensorhub (built from a PINNED commit through a read-only `git archive`, because
   that repo has a concurrent writer), its own Postgres container, real R2 under
