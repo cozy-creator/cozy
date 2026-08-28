@@ -60,3 +60,37 @@ func TestRentalControlRevisionAdvancesAtomically(t *testing.T) {
 		t.Fatalf("stale revision was not refused: %v", problem)
 	}
 }
+
+func TestConvergingRentalProjectionIsWriteOnceUntilReady(t *testing.T) {
+	store, problem := Open(filepath.Join(t.TempDir(), "records.db"))
+	if problem != nil {
+		t.Fatal(problem)
+	}
+	defer store.Close()
+	first := Rental{ID: "rental-1", EndpointRef: "cozy/a/v1/generate",
+		AcceleratorModel: "H100", State: "converging", Hub: "https://hub.invalid",
+		Address: "worker:443", MediaAddress: "media:443", CertPath: "/pins/worker.pem"}
+	if problem := store.RecordRental(first); problem != nil {
+		t.Fatal(problem)
+	}
+	ready := first
+	ready.State = "ready"
+	if problem := store.RecordRental(ready); problem != nil {
+		t.Fatal(problem)
+	}
+	row, problem := store.RentalRow(first.ID)
+	if problem != nil || row == nil || row.State != "ready" {
+		t.Fatalf("ready row = %#v, %v", row, problem)
+	}
+	changed := ready
+	changed.Address = "stranger:443"
+	if problem := store.RecordRental(changed); problem == nil ||
+		problem.ErrName() != "rental.attach_projection_conflict" {
+		t.Fatalf("changed attach projection was not refused: %v", problem)
+	}
+	row, problem = store.RentalRow(first.ID)
+	if problem != nil || row.Address != first.Address || row.MediaAddress != first.MediaAddress ||
+		row.CertPath != first.CertPath {
+		t.Fatalf("stored projection changed = %#v, %v", row, problem)
+	}
+}

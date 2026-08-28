@@ -28,9 +28,9 @@ func TestRemotePlacementRevisionReusesClaimAndPersistsAcquisition(t *testing.T) 
 	token := secret.New(tokenText)
 	mediaAddr := serveMediaPeer(t, certPath, keyPath, tokenText, mediawire.ContractRev)
 
-	a := makeRevisionPlacement(t, "a")
-	b := makeRevisionPlacement(t, "b")
-	c := makeRevisionPlacement(t, "c")
+	a := makeRevisionPlacement(t, "a", 1)
+	b := makeRevisionPlacement(t, "b", 2)
+	c := makeRevisionPlacement(t, "c", 3)
 	peer := &revisionPeer{frames: make(chan string, 16), scenarios: make(chan revisionScenario, 3)}
 	peer.scenarios <- revisionScenario{actualSpec: a.specDigest, planID: a.planID, converged: 1,
 		acquisition: &pb.PlacementAcquisitionObservation{
@@ -146,7 +146,7 @@ type revisionPlacement struct {
 	specDigest           []byte
 }
 
-func makeRevisionPlacement(t *testing.T, name string) revisionPlacement {
+func makeRevisionPlacement(t *testing.T, name string, revision uint64) revisionPlacement {
 	t.Helper()
 	planData, modelData := []byte("plan-"+name), []byte("model-"+name)
 	planID, _ := canonical.Spell(canonical.Digest(planData))
@@ -169,7 +169,8 @@ func makeRevisionPlacement(t *testing.T, name string) revisionPlacement {
 	sort.Slice(subjects, func(i, j int) bool { return bytes.Compare(subjects[i].Digest, subjects[j].Digest) < 0 })
 	return revisionPlacement{
 		placement: orchestrator.DesiredPlacement{
-			Endpoint: "cozy/endpoint-" + name, ReleaseID: "release-" + name,
+			PlacementRevision: revision,
+			Endpoint:          "cozy/endpoint-" + name, ReleaseID: "release-" + name,
 			PlacementIDValue: "acquisition-1", ExactPlacementSetDigest: setSpelling,
 			ExactPlacementSetBytes: setBytes, ModelObjectSetDigest: modelID,
 			ModelObjectSetLength: uint64(len(modelData)),

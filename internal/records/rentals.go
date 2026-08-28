@@ -88,8 +88,9 @@ func normalizeDDL(ddl string) string {
 // rentalStateRank orders the hub's lifecycle words so a delayed observation never moves a
 // row backward. Unknown words are opaque: they neither advance nor regress anything.
 var rentalStateRank = map[string]int{
-	"pending_acquisition": 0, "acquiring": 1, "materializing": 2, "ready": 3,
-	"attached": 4, "failed": 5, "release_requested": 6, "released": 7, "rejected": 7,
+	"pending_acquisition": 0, "acquiring": 1, "materializing": 2, "converging": 3,
+	"ready": 4, "attached": 5, "failed": 6, "release_requested": 7,
+	"released": 8, "rejected": 8,
 }
 
 func rentalStateForward(current, next string) string {
@@ -332,9 +333,11 @@ func (s *Store) RecordRental(r Rental) *exit.Error {
 	}
 	if _, err := tx.Exec(`INSERT INTO rentals(`+rentalCols+`)
 		VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
-		ON CONFLICT(id) DO UPDATE SET address=excluded.address,
-		  cert_path=excluded.cert_path, state=excluded.state,
-		  media_address=excluded.media_address,
+		ON CONFLICT(id) DO UPDATE SET
+		  address=CASE WHEN rentals.address<>'' THEN rentals.address ELSE excluded.address END,
+		  cert_path=CASE WHEN rentals.cert_path<>'' THEN rentals.cert_path ELSE excluded.cert_path END,
+		  state=excluded.state,
+		  media_address=CASE WHEN rentals.media_address<>'' THEN rentals.media_address ELSE excluded.media_address END,
 		  control_snapshot_digest=CASE WHEN length(rentals.control_snapshot_bytes)>0
 		    THEN rentals.control_snapshot_digest ELSE excluded.control_snapshot_digest END,
 		  control_snapshot_bytes=CASE WHEN length(rentals.control_snapshot_bytes)>0
@@ -379,6 +382,12 @@ func (s *Store) RecordRental(r Rental) *exit.Error {
 		!bytes.Equal(stored.ControlSnapshotBytes, r.ControlSnapshotBytes)) {
 		return exit.Named(exit.Conflict, "rental.control_snapshot_conflict",
 			"rental %s already carries another exact acquisition-attempt control snapshot", r.ID)
+	}
+	if stored == nil || r.Address != "" && stored.Address != r.Address ||
+		r.MediaAddress != "" && stored.MediaAddress != r.MediaAddress ||
+		r.CertPath != "" && stored.CertPath != r.CertPath {
+		return exit.Named(exit.Conflict, "rental.attach_projection_conflict",
+			"rental %s already carries another address, media address, or certificate pin", r.ID)
 	}
 	return nil
 }

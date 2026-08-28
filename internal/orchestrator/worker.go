@@ -173,9 +173,13 @@ type DesiredPlacement struct {
 	ConfigDigest                      string `json:"config_digest,omitempty"`
 	ExactPlacementSetDigest           string `json:"exact_placement_set_digest,omitempty"`
 	ExactPlacementSetBytes            []byte `json:"exact_placement_set_bytes,omitempty"`
-	PlacementIDValue                  string `json:"placement_id,omitempty"`
-	ModelObjectSetDigest              string `json:"model_object_set_digest,omitempty"`
-	ModelObjectSetLength              uint64 `json:"model_object_set_length,omitempty"`
+	// PlacementRevision is Tensorhub's monotonic revision for a private rental. It is
+	// the exact DesiredWorkerState.revision Creator relays for remote placements, so Hub
+	// can compare desired, accepted, and converged without guessing a LocalService counter.
+	PlacementRevision    uint64 `json:"placement_revision,omitempty"`
+	PlacementIDValue     string `json:"placement_id,omitempty"`
+	ModelObjectSetDigest string `json:"model_object_set_digest,omitempty"`
+	ModelObjectSetLength uint64 `json:"model_object_set_length,omitempty"`
 	// Hidden names the entrypoints this placement deliberately does NOT serve (#572d).
 	// Recorded so an operator reading a placement can tell "no binding was staged" from
 	// "a binding was staged and broke".

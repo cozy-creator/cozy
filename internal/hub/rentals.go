@@ -35,6 +35,8 @@ import (
 //	GET    /v1/private-rentals/{id}  -> {state, worker_address, cert_pem, media_address,
 //	                                     detail, renter_token_sha256:[...],
 //	                                     control_snapshot:{digest,length,canonical_bytes}}
+//	POST   /v1/private-rentals/{id}/worker-session-observations
+//	                                     -> renter-authenticated deterministic WorkerFrames
 //	DELETE /v1/private-rentals/{id}  -> 204
 //
 // `media_address` is now ALWAYS the hub's own word. The client used to derive it from the
@@ -47,6 +49,7 @@ import (
 // client as opaque strings it renders verbatim; naming them as constants nobody read
 // was law-13 dead code (cl-028).
 const (
+	RentalConverging       = "converging"
 	RentalReady            = "ready"
 	RentalFailed           = "failed"
 	RentalReleaseRequested = "release_requested"
@@ -93,6 +96,17 @@ func (r Rental) Ready() bool {
 	return r.State == RentalReady && r.Address != "" && r.MediaAddress != "" &&
 		r.CertPEM != "" && len(r.TokenSHA256) > 0 && r.ControlSnapshot != nil &&
 		r.PlacementRevision > 0
+}
+
+// Attachable answers whether Tensorhub has published the complete, receipt-pinned
+// private control projection. Converging is deliberately not ready: it exists so the
+// renter's RecordOwner can claim the private WorkerControl service and return observed
+// convergence evidence without giving Tensorhub the renter credential or a second live
+// control owner.
+func (r Rental) Attachable() bool {
+	return (r.State == RentalConverging || r.State == RentalReady) &&
+		r.Address != "" && r.MediaAddress != "" && r.CertPEM != "" &&
+		len(r.TokenSHA256) > 0 && r.ControlSnapshot != nil && r.PlacementRevision > 0
 }
 
 // HoldsHash answers whether the hub's live set carries this hash — the renter's own
@@ -270,6 +284,67 @@ type RentalPlacementRevision struct {
 	PlacementRevision uint64               `json:"placement_revision"`
 	ControlSnapshot   ExactControlDocument `json:"control_snapshot"`
 	PlacementSet      ExactControlDocument `json:"placement_set"`
+}
+
+// WorkerSessionObservation is the renter RecordOwner's exact evidence relay. The three
+// normal frames are deterministic protobuf encodings of WorkerFrame and must be supplied
+// together with the DesiredWorkerState revision that owner issued. BootFailure is the
+// closed alternative: it is authenticated worker evidence before desired state exists.
+// []byte is intentionally used here because encoding/json transports it as base64 without
+// inventing a parallel textual protobuf representation.
+type WorkerSessionObservation struct {
+	ClaimAck        []byte `json:"claim_ack_base64,omitempty"`
+	Snapshot        []byte `json:"snapshot_base64,omitempty"`
+	ObservedState   []byte `json:"observed_state_base64,omitempty"`
+	BootFailure     []byte `json:"boot_failure_base64,omitempty"`
+	DesiredRevision uint64 `json:"desired_revision,omitempty"`
+}
+
+type WorkerSessionObservationResult struct {
+	State             string `json:"state"`
+	DesiredRevision   uint64 `json:"desired_revision"`
+	AcceptedRevision  uint64 `json:"accepted_revision"`
+	ConvergedRevision uint64 `json:"converged_revision"`
+	Detail            string `json:"detail,omitempty"`
+}
+
+// ObserveWorkerSession relays evidence obtained by the renter's already-authenticated
+// WorkerControl stream. WithToken supplies that same rental owner credential to this
+// route; Tensorhub never receives the plaintext through rental creation or readback and
+// never dials the private worker itself.
+func (c *Client) ObserveWorkerSession(ctx context.Context, id string,
+	observation WorkerSessionObservation) (WorkerSessionObservationResult, *exit.Error) {
+	var out WorkerSessionObservationResult
+	if e := validateRentalID(id); e != nil {
+		return out, e
+	}
+	boot := len(observation.BootFailure) > 0
+	normal := len(observation.ClaimAck) > 0 && len(observation.Snapshot) > 0 &&
+		len(observation.ObservedState) > 0 && observation.DesiredRevision > 0
+	if boot == normal || boot && (len(observation.ClaimAck) > 0 || len(observation.Snapshot) > 0 ||
+		len(observation.ObservedState) > 0 || observation.DesiredRevision > 0) {
+		return out, exit.Internalf("private worker observation requires exactly boot failure or the complete claim/snapshot/observed/revision set")
+	}
+	e := c.do(ctx, call{
+		method: http.MethodPost,
+		path:   "/v1/private-rentals/" + url.PathEscape(id) + "/worker-session-observations",
+		admin:  true, reason: "cozy RecordOwner worker session observation",
+		body: observation,
+	}, &out)
+	if e != nil {
+		return out, e
+	}
+	if out.State != RentalConverging && out.State != RentalReady {
+		return out, exit.Named(exit.Conflict, "rental.worker_observation_invalid",
+			"Tensorhub accepted private worker evidence but answered state %q", out.State)
+	}
+	if !boot && (out.DesiredRevision != observation.DesiredRevision ||
+		out.AcceptedRevision > out.DesiredRevision || out.ConvergedRevision > out.AcceptedRevision) {
+		return out, exit.Named(exit.Conflict, "rental.worker_observation_invalid",
+			"Tensorhub answered impossible convergence revisions desired=%d accepted=%d converged=%d",
+			out.DesiredRevision, out.AcceptedRevision, out.ConvergedRevision)
+	}
+	return out, nil
 }
 
 const maxArtifactGrantResponseBytes = 64 << 20

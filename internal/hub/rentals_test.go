@@ -2,6 +2,7 @@ package hub
 
 import (
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
@@ -11,6 +12,70 @@ import (
 	"github.com/cozy-creator/cozy-creator/internal/config"
 	"github.com/cozy-creator/cozy-creator/internal/secret"
 )
+
+func TestObserveWorkerSessionUsesRenterBearerAndClosedDeterministicFrameBody(t *testing.T) {
+	claim, snapshot, observed := []byte("claim"), []byte("snapshot"), []byte("observed")
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost || r.URL.Path != "/v1/private-rentals/rental-1/worker-session-observations" {
+			t.Fatalf("request = %s %s", r.Method, r.URL.Path)
+		}
+		if r.Header.Get("Authorization") != "Bearer renter-secret" ||
+			r.Header.Get("X-Tensorhub-Reason") != "cozy RecordOwner worker session observation" {
+			t.Fatalf("relay headers = %#v", r.Header)
+		}
+		var body map[string]any
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil || len(body) != 4 {
+			t.Fatalf("body = %#v, %v", body, err)
+		}
+		for name, want := range map[string][]byte{
+			"claim_ack_base64": claim, "snapshot_base64": snapshot, "observed_state_base64": observed,
+		} {
+			got, err := base64.StdEncoding.DecodeString(body[name].(string))
+			if err != nil || string(got) != string(want) {
+				t.Fatalf("%s = %q, %v", name, got, err)
+			}
+		}
+		if body["desired_revision"] != float64(7) {
+			t.Fatalf("desired_revision = %#v", body["desired_revision"])
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"state": "ready", "desired_revision": 7,
+			"accepted_revision": 7, "converged_revision": 7,
+		})
+	}))
+	defer server.Close()
+
+	client := New(config.Config{HubURL: server.URL}, "test").
+		WithToken(secret.New("renter-secret"), "test renter token")
+	answer, problem := client.ObserveWorkerSession(context.Background(), "rental-1",
+		WorkerSessionObservation{ClaimAck: claim, Snapshot: snapshot,
+			ObservedState: observed, DesiredRevision: 7})
+	if problem != nil || answer.State != RentalReady || answer.ConvergedRevision != 7 {
+		t.Fatalf("answer = %#v, %v", answer, problem)
+	}
+}
+
+func TestObserveWorkerSessionBootFailureIsClosedAlternative(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var body map[string]any
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil || len(body) != 1 ||
+			body["boot_failure_base64"] != base64.StdEncoding.EncodeToString([]byte("boot-failure")) {
+			t.Fatalf("boot body = %#v, %v", body, err)
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{"state": "converging"})
+	}))
+	defer server.Close()
+	client := New(config.Config{HubURL: server.URL}, "test").
+		WithToken(secret.New("renter-secret"), "test renter token")
+	if _, problem := client.ObserveWorkerSession(context.Background(), "rental-1",
+		WorkerSessionObservation{BootFailure: []byte("boot-failure")}); problem != nil {
+		t.Fatal(problem)
+	}
+	if _, problem := client.ObserveWorkerSession(context.Background(), "rental-1",
+		WorkerSessionObservation{BootFailure: []byte("boot-failure"), DesiredRevision: 1}); problem == nil {
+		t.Fatal("mixed boot failure and desired revision was admitted")
+	}
+}
 
 func TestRentalArtifactGrantUsesScopedBearerAndClosedRequest(t *testing.T) {
 	digest := "sha256:0000000000000000000000000000000000000000000000000000000000000001"
