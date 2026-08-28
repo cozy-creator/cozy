@@ -24,7 +24,7 @@ const (
 )
 
 // allowedCozyEnv is the CLOSED pod environment contract, consumer half. Tensorhub's
-// internal/podenv renders exactly these six names and its build/substrate recipe refuses
+// internal/podenv renders exactly these six names and its base-worker-image recipe refuses
 // to compile an image whose pinned bootstrap admits a different set, so an addition here
 // is a contract change on both sides or it is a build failure.
 //

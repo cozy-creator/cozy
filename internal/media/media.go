@@ -318,7 +318,7 @@ func (c *Client) skew(format string, args ...any) *exit.Error {
 	return exit.Named(exit.Conflict, "media_contract_mismatch",
 		"the pod's media plane at %s "+format, append([]any{c.spec.Addr}, args...)...).
 		WithRemedy("the pod's media server is built into its image from a PINNED "+
-			"cozy-creator commit (execution-substrates `versions.env: CREATOR_COMMIT`) and "+
+			"cozy-creator commit (base worker image's `versions.env: CREATOR_COMMIT`) and "+
 			"this host floats with master, so the two ends drift by construction. Rebuild "+
 			"the pod image from a commit that speaks rev %d, or run an owner that speaks "+
 			"what the pod does. Nothing is uploaded to a plane whose answers this host "+

@@ -491,7 +491,7 @@ func instancePin(w *worker, declared string) *exit.Error {
 
 // releasePin is the RELEASE FENCE on a claim, and #505's carried-not-verified gap closed.
 //
-// A dynamic substrate has no endpoint release at ClaimAck time: exact endpoint identity
+// A base worker image has no endpoint release at ClaimAck time: exact endpoint identity
 // arrives later in the digest-fenced PlacementSet. Silence is therefore the only truthful
 // answer from a freshly attached pod and is accepted in both launch lanes. A worker that
 // does claim a release is still held to the host's pin; a stale preloaded endpoint must not

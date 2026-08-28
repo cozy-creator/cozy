@@ -129,7 +129,7 @@ dynamic-serving shape with the actor-vocabulary hardcut.
 - **A rental is a reusable pod, not an endpoint-shaped image.** `cozy rent revise` asks
   Tensorhub to author one immutable active placement revision, then the existing
   RecordOwner sends that revision's grant before its set on the already-claimed stream.
-  The worker instance and boot identity do not change; a different substrate family
+  The worker instance and boot identity do not change; a different base-worker-image family
   refuses at Tensorhub before Creator can relay it.
 - **Acquisition is observable, not authoritative.** Schema rev 7 carries endpoint/model
   monotonic intervals plus downloaded/reused byte counters. Creator persists those facts
