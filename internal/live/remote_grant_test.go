@@ -137,6 +137,10 @@ func TestRemotePlacementReceivesGrantBeforeDesired(t *testing.T) {
 			if name == "claim" && frame.GetClaimAck().GetControlRuntimeDigest() == "" {
 				t.Fatal("relayed ClaimAck omitted control_runtime_digest")
 			}
+			if name == "observed" && frame.GetObservedState().GetAppliedWireMinor() != pb.WireMinor {
+				t.Fatalf("relayed ObservedWorkerState applied minor = %d, want %d",
+					frame.GetObservedState().GetAppliedWireMinor(), pb.WireMinor)
+			}
 		}
 	case <-time.After(5 * time.Second):
 		t.Fatal("no private-rental convergence relay")
@@ -230,7 +234,8 @@ func (p *grantPeer) Control(stream pb.WorkerControl_ControlServer) error {
 				ObservedState: &pb.ObservedWorkerState{
 					RecordOwnerEpoch: claim.RecordOwnerEpoch, ControlStreamGeneration: generation,
 					WorkerBootId: bootID, WorkerPhase: pb.WorkerPhase_WORKER_PHASE_ONLINE,
-					AdmissionState: pb.AdmissionState_ADMISSION_STATE_OPEN, AdmissionGeneration: 2,
+					AppliedWireMinor: pb.WireMinor,
+					AdmissionState:   pb.AdmissionState_ADMISSION_STATE_OPEN, AdmissionGeneration: 2,
 					AvailableAttemptSlots: 1, AcceptedDesiredStateRevision: desiredFrame.Revision,
 					AcceptedPlacementSetDigest: desired.PlacementSetDigest,
 					ConvergedRevision:          desiredFrame.Revision,

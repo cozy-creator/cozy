@@ -93,4 +93,15 @@ func TestConvergingRentalProjectionIsWriteOnceUntilReady(t *testing.T) {
 		row.CertPath != first.CertPath {
 		t.Fatalf("stored projection changed = %#v, %v", row, problem)
 	}
+	// A resumed POST may answer only identity + state before the first GET. It must not
+	// erase the already-attached projection while the same operation resumes convergence.
+	if problem := store.RecordRental(Rental{ID: first.ID, EndpointRef: first.EndpointRef,
+		AcceleratorModel: first.AcceleratorModel, State: "converging", Hub: first.Hub}); problem != nil {
+		t.Fatal(problem)
+	}
+	row, problem = store.RentalRow(first.ID)
+	if problem != nil || row.State != "ready" || row.Address != first.Address ||
+		row.MediaAddress != first.MediaAddress || row.CertPath != first.CertPath {
+		t.Fatalf("sparse resume erased attached projection = %#v, %v", row, problem)
+	}
 }

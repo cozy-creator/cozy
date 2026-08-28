@@ -1,4 +1,4 @@
-owner: Codex creator_convergence_relay
-purpose: th-068 private-rental convergence evidence relay
-branch: codex/private-convergence-relay
-base: 4c0b4e44969ac93375b83b4f4b75b9e791ef01e8
+owner: /root/full_remote_e2e/creator_overlay_receipt_fix
+purpose: th-067 hardcut Creator remote snapshot validation to EndpointOverlayReceipt/1
+branch: th-067-overlay-receipt
+base: e3b911c0656ad46f079cbdbdbf6453ffd95395d9
