@@ -33,16 +33,6 @@ import (
 // `explain` is a PROJECTION, never authority — the first lines a person reads, ported
 // from cr-011's own `explain()` over the CLOSED section set that schema froze.
 
-// sections is the bundle's closed top-level key set (cr-011, FROZEN there). A document
-// carrying a key outside it is not a bundle this host renders: an unknown section means
-// the schema moved and the renderer is stale, which is a refusal rather than a partial
-// story.
-var sections = map[string]bool{
-	"format": true, "subject_id": true, "attempt": true, "plan": true, "posture": true,
-	"terminal": true, "faults": true, "measurements": true, "confessions": true,
-	"liveness": true, "events": true, "caps": true,
-}
-
 const bundleFormat = "cozy.runtime.WorkerTriageBundle/1"
 
 func (s *Server) triage(w http.ResponseWriter, r *http.Request) {
@@ -96,14 +86,6 @@ func (s *Server) triage(w http.ResponseWriter, r *http.Request) {
 		s.refuse(w, r, http.StatusConflict, "bundle_malformed",
 			"the retained bundle is not a "+bundleFormat, "")
 		return
-	}
-	for section := range document {
-		if !sections[section] {
-			s.refuse(w, r, http.StatusConflict, "bundle_section_unknown",
-				"the bundle carries the section "+section+", which this renderer's closed set does not name",
-				"the WorkerTriageBundle schema moved; this host renders the set cr-011 froze")
-			return
-		}
 	}
 	s.ok(w, r, http.StatusOK, map[string]any{
 		"attempt_key": key,
