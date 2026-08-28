@@ -43,7 +43,7 @@ jobs:
         with:
           path: cozy-creator
       # This arm is self-contained and always executes. It proves that the copied bytes are the
-      # exact reviewed worker-protocol@2e412411 set recorded in protocol/SHA256SUMS. Runtime's
+      # exact reviewed worker-protocol@d57d5031 set recorded in protocol/SHA256SUMS. Runtime's
       # wire_schema_digest remains the safety fence if the private peer later advances.
       - name: Verify reviewed vendored bytes
         working-directory: cozy-creator
