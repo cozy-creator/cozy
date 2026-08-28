@@ -3,7 +3,7 @@
 
 Not a test suite (decisions.md #160) — an orchestration script that runs the shipped
 binary against a running hub and prints what it observed. Every refusal arm is a real
-condition (a wrong token, an absent repo, a closed port, a hub that never answers),
+condition (a wrong token, an absent model, a closed port, a hub that never answers),
 never a mock.
 
     scripts/hub-live.py --cozy ./cozy --hub http://127.0.0.1:18099 --token <admin token>
@@ -67,46 +67,60 @@ def reads(a, home):
     expect("reads", "hub status (reachable)",
            run(a.cozy, ["hub", "status"], {"TENSORHUB_URL": a.hub}, home),
            0, has=["reachable: true", "status:", "url:", "no accounts at Launch 1"])
-    expect("reads", "search (whole catalog, tokenless)",
-           run(a.cozy, ["search"], {"TENSORHUB_URL": a.hub}, home),
-           0, has=["ref", "kind", "results:"])
-    expect("reads", "search --kind endpoint",
-           run(a.cozy, ["search", "--kind", "endpoint"], {"TENSORHUB_URL": a.hub}, home),
+    expect("reads", "model search (tokenless)",
+           run(a.cozy, ["model", "search"], {"TENSORHUB_URL": a.hub}, home),
+           0, has=["ref", "models:", "results:"])
+    expect("reads", "endpoint search (tokenless)",
+           run(a.cozy, ["endpoint", "search"], {"TENSORHUB_URL": a.hub}, home),
            0, has=["results:"])
-    p = expect("reads", "search --json is one document",
-               run(a.cozy, ["search", "--json"], {"TENSORHUB_URL": a.hub}, home), 0)
+    p = expect("reads", "model search --json is one document",
+               run(a.cozy, ["model", "search", "--json"], {"TENSORHUB_URL": a.hub}, home), 0)
     try:
         doc = json.loads(p.stdout)
-        check("reads", "search --json parses, kind=search",
-              doc.get("kind") == "search" and "rows" in doc, str(doc)[:200])
+        check("reads", "model search --json parses",
+              doc.get("kind") == "model search" and "rows" in doc, str(doc)[:200])
     except Exception as exc:  # noqa: BLE001
         check("reads", "search --json parses", False, str(exc))
     expect("reads", "search miss is exit 0 with an empty state",
-           run(a.cozy, ["search", "zzzz-no-such-repo"], {"TENSORHUB_URL": a.hub}, home),
+           run(a.cozy, ["model", "search", "zzzz-no-such-model"], {"TENSORHUB_URL": a.hub}, home),
            0, has=["0 results for"])
-    expect("reads", "repo show resolves",
-           run(a.cozy, ["repo", "show", a.repo], {"TENSORHUB_URL": a.hub}, home),
-           0, has=["ref:", "repo_kind:"])
-    expect("reads", "search --kind bogus refuses usage",
-           run(a.cozy, ["search", "--kind", "dataset"], {"TENSORHUB_URL": a.hub}, home),
-           2, has=["is not a repo kind", "model, endpoint"])
+    expect("reads", "model show resolves through the typed route",
+           run(a.cozy, ["model", "show", a.model], {"TENSORHUB_URL": a.hub}, home),
+           0, has=["model", "ref:"])
+    expect("reads", "the generic search command is absent",
+           run(a.cozy, ["search"], {"TENSORHUB_URL": a.hub}, home),
+           2, has=["unknown command"])
 
 
 def writes(a, home):
     """First-party writes under the ONE static admin token."""
     name = f"cozy/cl011-live-{int(time.time())}"
     env = {"TENSORHUB_URL": a.hub, "TENSORHUB_TOKEN": a.token}
-    expect("writes", "repo create (model)",
-           run(a.cozy, ["repo", "create", name, "--kind", "model",
+    expect("writes", "model create",
+           run(a.cozy, ["model", "create", name,
                         "--reason", "cl-011 live verification"], env, home),
            0, has=["ref:", name, "admin audit"], lacks=[a.token])
-    expect("writes", "the created repo reads back publicly",
-           run(a.cozy, ["repo", "show", name], {"TENSORHUB_URL": a.hub}, home),
+    expect("writes", "the created model reads back publicly",
+           run(a.cozy, ["model", "show", name], {"TENSORHUB_URL": a.hub}, home),
            0, has=[name])
-    expect("writes", "duplicate create is the hub's typed conflict",
-           run(a.cozy, ["repo", "create", name, "--kind", "model",
+    expect("writes", "duplicate model create is the hub's typed conflict",
+           run(a.cozy, ["model", "create", name,
                         "--reason", "cl-011 conflict arm"], env, home),
-           13, has=["repo.already_exists", "already exists"])
+           13, has=["already exists"])
+    endpoint = name + "-endpoint"
+    expect("writes", "endpoint create",
+           run(a.cozy, ["endpoint", "create", endpoint,
+                        "--reason", "cl-011 live verification"], env, home),
+           0, has=["ref:", endpoint, "admin audit"], lacks=[a.token])
+    expect("writes", "the created endpoint reads back publicly",
+           run(a.cozy, ["endpoint", "show", endpoint], {"TENSORHUB_URL": a.hub}, home),
+           0, has=[endpoint])
+    expect("writes", "model show refuses an endpoint name",
+           run(a.cozy, ["model", "show", endpoint], {"TENSORHUB_URL": a.hub}, home),
+           4, has=["not_found"])
+    expect("writes", "endpoint show refuses a model name",
+           run(a.cozy, ["endpoint", "show", name], {"TENSORHUB_URL": a.hub}, home),
+           4, has=["not_found"])
     expect("writes", "hub config renders provenance, secrets digested",
            run(a.cozy, ["hub", "config"], env, home),
            0, has=["admin.token", "sha256:", "source"], lacks=[a.token])
@@ -127,31 +141,34 @@ def writes(a, home):
 def refusals(a, home):
     """Every arm a real condition; the hub's own envelope reaches the user verbatim."""
     expect("refusals", "tokenless write refuses BEFORE the dial (exit 5)",
-           run(a.cozy, ["repo", "create", "cozy/never", "--kind", "model", "--reason", "x"],
+           run(a.cozy, ["model", "create", "cozy/never", "--reason", "x"],
                {"TENSORHUB_URL": a.hub}, home),
            5, has=["hub.token_missing", "TENSORHUB_TOKEN"])
     expect("refusals", "tokenless admin READ refuses (exit 5)",
            run(a.cozy, ["hub", "config"], {"TENSORHUB_URL": a.hub}, home),
            5, has=["hub.token_missing"])
     expect("refusals", "wrong token: the hub's 401 rendered verbatim (exit 5)",
-           run(a.cozy, ["repo", "create", "cozy/never", "--kind", "model", "--reason", "x"],
+           run(a.cozy, ["model", "create", "cozy/never", "--reason", "x"],
                {"TENSORHUB_URL": a.hub, "TENSORHUB_TOKEN": "not-the-configured-token"}, home),
            5, has=["auth.token_invalid", "the presented admin token is not the configured one"],
            lacks=[a.token])
-    expect("refusals", "unknown repo is typed not-found (exit 4)",
-           run(a.cozy, ["repo", "show", "cozy/no-such-repo"], {"TENSORHUB_URL": a.hub}, home),
-           4, has=["not_found", "no repo"])
+    expect("refusals", "unknown model is typed not-found (exit 4)",
+           run(a.cozy, ["model", "show", "cozy/no-such-model"], {"TENSORHUB_URL": a.hub}, home),
+           4, has=["not_found", "no model"])
     expect("refusals", "a release pin refuses by name until th-003",
-           run(a.cozy, ["repo", "show", "cozy/sdxl@v1"], {"TENSORHUB_URL": a.hub}, home),
+           run(a.cozy, ["model", "show", "cozy/sdxl@v1"], {"TENSORHUB_URL": a.hub}, home),
            2, has=["th-003"])
-    expect("refusals", "repo create without --reason refuses (exit 2)",
-           run(a.cozy, ["repo", "create", "cozy/never", "--kind", "model"],
+    expect("refusals", "model create without --reason refuses (exit 2)",
+           run(a.cozy, ["model", "create", "cozy/never"],
                {"TENSORHUB_URL": a.hub, "TENSORHUB_TOKEN": a.token}, home),
            2, has=["--reason"])
-    expect("refusals", "repo create without --kind refuses (exit 2)",
-           run(a.cozy, ["repo", "create", "cozy/never", "--reason", "x"],
+    expect("refusals", "typed create rejects the retired --kind discriminator",
+           run(a.cozy, ["model", "create", "cozy/never", "--kind", "model", "--reason", "x"],
                {"TENSORHUB_URL": a.hub, "TENSORHUB_TOKEN": a.token}, home),
-           2, has=["--kind"])
+           2, has=["unknown flag", "--kind"])
+    expect("refusals", "the generic repo command is absent",
+           run(a.cozy, ["repo", "show", "cozy/never"], {"TENSORHUB_URL": a.hub}, home),
+           2, has=["unknown command"])
     expect("refusals", "login is deferred, and says why",
            run(a.cozy, ["login"], {"TENSORHUB_URL": a.hub}, home),
            2, has=["not_implemented", "th-031"])
@@ -191,17 +208,17 @@ def transport(a, home):
     """Failures that never become an HTTP answer, plus answers that are not ours."""
     dead = free_port()
     expect("transport", "hub down: a read is typed unavailable (exit 9)",
-           run(a.cozy, ["search"], {"TENSORHUB_URL": f"http://127.0.0.1:{dead}"}, home),
+           run(a.cozy, ["model", "search"], {"TENSORHUB_URL": f"http://127.0.0.1:{dead}"}, home),
            9, has=["unavailable", "unreachable", "connection refused"])
     expect("transport", "hub down: a write is typed unavailable (exit 9)",
-           run(a.cozy, ["repo", "create", "a/b", "--kind", "model", "--reason", "x"],
+           run(a.cozy, ["model", "create", "a/b", "--reason", "x"],
                {"TENSORHUB_URL": f"http://127.0.0.1:{dead}", "TENSORHUB_TOKEN": a.token}, home),
            9, has=["unreachable"])
     expect("transport", "hub down: `hub status` REPORTS it, exit 0",
            run(a.cozy, ["hub", "status"], {"TENSORHUB_URL": f"http://127.0.0.1:{dead}"}, home),
            0, has=["reachable: false", "unreachable"])
     expect("transport", "unresolvable host is typed unavailable (exit 9)",
-           run(a.cozy, ["search"], {"TENSORHUB_URL": "http://cl011.invalid:1"}, home),
+           run(a.cozy, ["model", "search"], {"TENSORHUB_URL": "http://cl011.invalid:1"}, home),
            9, has=["no such host"])
 
     # A hub that is up but not serving: accepted, then silence.
@@ -209,7 +226,7 @@ def transport(a, home):
     deaf.start()
     t0 = time.time()
     expect("transport", "a hub that never answers is a DEADLINE (exit 10), not unavailable",
-           run(a.cozy, ["search"], {"TENSORHUB_URL": f"http://127.0.0.1:{deaf.sock.getsockname()[1]}"}, home),
+           run(a.cozy, ["model", "search"], {"TENSORHUB_URL": f"http://127.0.0.1:{deaf.sock.getsockname()[1]}"}, home),
            10, has=["did not answer within"])
     check("transport", "the deadline arm actually waited", time.time() - t0 > 5,
           f"{time.time() - t0:.1f}s")
@@ -218,7 +235,7 @@ def transport(a, home):
     # Something that answers HTTP but is not a tensorhub.
     root = pathlib.Path(tempfile.mkdtemp(prefix="cl011-notahub-"))
     (root / "v1").mkdir()
-    (root / "v1" / "repos").write_text("<html>please log in</html>")
+    (root / "v1" / "models").write_text("<html>please log in</html>")
     port = free_port()
 
     class Quiet(http.server.SimpleHTTPRequestHandler):
@@ -231,10 +248,10 @@ def transport(a, home):
     srv = http.server.ThreadingHTTPServer(("127.0.0.1", port), Quiet)
     threading.Thread(target=srv.serve_forever, daemon=True).start()
     expect("transport", "a 200 that is not our document is refused, not parsed",
-           run(a.cozy, ["search"], {"TENSORHUB_URL": f"http://127.0.0.1:{port}"}, home),
+           run(a.cozy, ["model", "search"], {"TENSORHUB_URL": f"http://127.0.0.1:{port}"}, home),
            1, has=["hub.unreadable_answer"])
     expect("transport", "an untyped 404 is reported as untyped, not invented",
-           run(a.cozy, ["repo", "show", "a/b"], {"TENSORHUB_URL": f"http://127.0.0.1:{port}/nope"}, home),
+           run(a.cozy, ["model", "show", "a/b"], {"TENSORHUB_URL": f"http://127.0.0.1:{port}/nope"}, home),
            4, has=["hub.untyped_refusal"])
     srv.shutdown()
 
@@ -248,7 +265,7 @@ def secrecy(a, home):
     check("secrecy", "`hub status` renders the credential as a digest",
           "sha256:" in p.stdout and a.token not in p.stdout, p.stdout[:200])
     # A token can only enter through the environment: there is no flag that takes one.
-    p = run(a.cozy, ["repo", "create", "a/b", "--token", a.token], {"TENSORHUB_URL": a.hub}, home)
+    p = run(a.cozy, ["model", "create", "a/b", "--token", a.token], {"TENSORHUB_URL": a.hub}, home)
     check("secrecy", "no verb accepts a credential on argv",
           p.returncode == 2 and "unknown flag" in (p.stdout + p.stderr), p.stderr[:200])
 
@@ -263,8 +280,8 @@ def bench(a, home):
     print(f"  {(time.time() - t0) * 1000 / n:7.2f} ms/run  /bin/true (harness floor)  (n={n})")
     for name, args in (("cozy version (no hub call)", ["version"]),
                        ("cozy hub status", ["hub", "status"]),
-                       ("cozy search", ["search"]),
-                       ("cozy repo show", ["repo", "show", a.repo])):
+                       ("cozy model search", ["model", "search"]),
+                       ("cozy model show", ["model", "show", a.model])):
         n, t0 = 30, time.time()
         for _ in range(n):
             run(a.cozy, args, env, home)
@@ -281,7 +298,7 @@ def main():
     ap.add_argument("--cozy", default="./cozy")
     ap.add_argument("--hub", required=True)
     ap.add_argument("--token", required=True)
-    ap.add_argument("--repo", default="cozy/sdxl", help="a repo the hub already holds")
+    ap.add_argument("--model", default="cozy/sdxl", help="a model the hub already holds")
     ap.add_argument("--only", action="append", choices=sorted(SECTIONS))
     a = ap.parse_args()
     a.cozy = str(pathlib.Path(a.cozy).resolve())

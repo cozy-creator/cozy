@@ -17,8 +17,8 @@ import (
 	"github.com/cozy-creator/cozy-creator/internal/transfer"
 )
 
-// The transfer verbs (cl-012). `push` is th-002's declare-first protocol driven from
-// this side; `pull` is its inverse into the local canonical store. Neither owns a
+// The model transfer verbs (cl-012). `model publish` is th-002's declare-first protocol
+// driven from this side; `model download` is its inverse into the local canonical store. Neither owns a
 // byte or a protocol: the byte plane is TensorFS's (internal/tfs) and the protocol is
 // the hub's (internal/hub). What these own is the argument surface, the progress
 // accounting, and the exit code.
@@ -79,7 +79,7 @@ func progress(ctx *Context) func(string) {
 	return func(line string) { fmt.Fprintln(ctx.Out, line) }
 }
 
-func handlePush(ctx *Context) *exit.Error {
+func handleModelPublish(ctx *Context) *exit.Error {
 	ref, e := hub.ParseRef(ctx.Inv.Args[0])
 	if e != nil {
 		return e
@@ -90,8 +90,8 @@ func handlePush(ctx *Context) *exit.Error {
 		// model): the border runs where the bytes are, and only a canonical snapshot
 		// is publishable. Refusing by name beats growing a second border here.
 		return exit.Usagef("%q is a path, and a path is not publishable", subject).
-			WithRemedy("ingest it first — `tfs ingest run <store> <component=alias> --source …` then `tfs ingest install` — and push the snapshot id it prints").
-			WithNext("cozy help push")
+			WithRemedy("ingest it first — `tfs ingest run <store> <component=alias> --source …` then `tfs ingest install` — and publish the snapshot id it prints").
+			WithNext("cozy help model publish")
 	}
 	snapshot, e := tfs.Snapshot(subject)
 	if e != nil {
@@ -99,17 +99,14 @@ func handlePush(ctx *Context) *exit.Error {
 	}
 	reason := strings.TrimSpace(ctx.Inv.Value("--reason"))
 	if reason == "" {
-		return exit.Usagef("`cozy push` needs --reason <why>").
+		return exit.Usagef("`cozy model publish` needs --reason <why>").
 			WithRemedy("the hub records why every first-party write happened, before it acts").
-			WithNext("cozy help push")
+			WithNext("cozy help model publish")
 	}
-	session := strings.TrimSpace(ctx.Inv.Value("--session"))
-	if session == "" {
-		// The session name is bound into the closure document the hub reproduces at
-		// completion, so it must be DERIVED from the subject, never from a clock: a
-		// re-run has to build the same declaration to resume the same publish.
-		session = "s-" + strings.TrimPrefix(snapshot, "sha256:")[:12]
-	}
+	// The operation is bound to the complete immutable snapshot identity. A user-
+	// supplied operation id could be replayed with different bytes and is therefore
+	// not part of the product surface.
+	session := "snapshot-" + strings.TrimPrefix(snapshot, "sha256:")
 	failAfter, e := devKill(ctx)
 	if e != nil {
 		return e
@@ -132,7 +129,7 @@ func handlePush(ctx *Context) *exit.Error {
 	}
 
 	fields := []render.Field{
-		{K: "repo", V: ref.String()},
+		{K: "model", V: ref.String()},
 		{K: "publish_id", V: res.PublishID},
 		{K: "session", V: res.Session},
 		{K: "objects", V: res.Totals.DeclaredObjects},
@@ -142,12 +139,12 @@ func handlePush(ctx *Context) *exit.Error {
 	}
 	if p.DryRun {
 		return emit(ctx, render.Record{
-			Kind: "push plan", Fields: append(fields,
+			Kind: "model publish plan", Fields: append(fields,
 				render.Field{K: "missing", V: res.Totals.MissingObjects},
 				render.Field{K: "held", V: res.Totals.HeldObjects},
 				render.Field{K: "hub", V: c.Base()}),
 			Notes: []string{"--dry-run declared and stopped: the plan is the HUB's answer, not a local guess"},
-			Next:  []string{"cozy push " + ref.String() + " " + snapshot + " --reason <why>"},
+			Next:  []string{"cozy model publish " + ref.String() + " " + snapshot + " --reason <why>"},
 		})
 	}
 	fields = append(fields,
@@ -172,29 +169,13 @@ func handlePush(ctx *Context) *exit.Error {
 		notes = append(notes, fmt.Sprintf("%d objects went as ranged uploads; R2 signs no digest on those, so the hub's own streaming hash discharged it", res.Multipart))
 	}
 	return emit(ctx, render.Record{
-		Kind: "push", Fields: fields, Notes: notes,
-		Next: []string{"cozy pull " + ref.String() + "@" + res.Root.SnapshotID},
+		Kind: "model publish", Fields: fields, Notes: notes,
+		Next: []string{"cozy model download " + ref.String() + "@" + res.Root.SnapshotID},
 	})
 }
 
-func handlePull(ctx *Context) *exit.Error {
+func handleModelDownload(ctx *Context) *exit.Error {
 	spec := ctx.Inv.Args[0]
-	name, pin, _ := strings.Cut(spec, "@")
-	ref, e := hub.ParseRef(name)
-	if e != nil {
-		return e
-	}
-	snapshot := ""
-	if pin != "" {
-		if !strings.HasPrefix(pin, "sha256:") && len(pin) != 64 {
-			return exit.Usagef("%q pins a release by name, which this build cannot resolve", spec).
-				WithRemedy("pin a digest — org/repo@sha256:<64 hex>; release addressing lands with th-003").
-				WithNext("cozy pull " + ref.String() + " --dry-run")
-		}
-		if snapshot, e = tfs.Snapshot(pin); e != nil {
-			return e
-		}
-	}
 	failAfter, e := devKill(ctx)
 	if e != nil {
 		return e
@@ -205,7 +186,7 @@ func handlePull(ctx *Context) *exit.Error {
 		return e
 	}
 	f := &transfer.Fetch{
-		Tool: tool, Hub: c, Ref: ref, Snapshot: snapshot,
+		Tool: tool, Hub: c, Spec: spec, Lane: strings.TrimSpace(ctx.Inv.Value("--lane")),
 		DryRun: ctx.Inv.Bool("--dry-run"), Progress: progress(ctx), FailAfter: failAfter,
 	}
 	hctx, cancel := hub.LongContext()
@@ -214,6 +195,7 @@ func handlePull(ctx *Context) *exit.Error {
 	if e != nil {
 		return e
 	}
+	ref := f.Ref
 	f.Scratch = scratch(layout, row.SnapshotID)
 	res, e := f.Run(hctx, row)
 	if e != nil {
@@ -221,7 +203,7 @@ func handlePull(ctx *Context) *exit.Error {
 	}
 
 	fields := []render.Field{
-		{K: "repo", V: ref.String()},
+		{K: "model", V: ref.String()},
 		{K: "snapshot", V: res.Snapshot},
 		{K: "objects", V: res.Objects},
 		{K: "bytes", V: render.Bytes(res.Bytes)},
@@ -230,9 +212,9 @@ func handlePull(ctx *Context) *exit.Error {
 	}
 	if f.DryRun {
 		return emit(ctx, render.Record{
-			Kind: "pull plan", Fields: append(fields, render.Field{K: "hub", V: c.Base()}),
+			Kind: "model download plan", Fields: append(fields, render.Field{K: "hub", V: c.Base()}),
 			Notes: []string{"--dry-run moved nothing; the tensor set is computed from the checkpoint's own documents once they land"},
-			Next:  []string{"cozy pull " + ref.String() + "@" + res.Snapshot},
+			Next:  []string{"cozy model download " + ref.String() + "@" + res.Snapshot},
 		})
 	}
 	fields = append(fields,
@@ -246,13 +228,13 @@ func handlePull(ctx *Context) *exit.Error {
 		render.Field{K: "hub", V: c.Base()},
 	)
 	return emit(ctx, render.Record{
-		Kind: "pull", Fields: fields,
+		Kind: "model download", Fields: fields,
 		Notes: []string{
 			fmt.Sprintf("admitted counts the snapshot manifest too: the closure names what a transfer MOVES (%d objects) and the manifest separately", res.Objects),
 			"every declared byte was verified before this snapshot became a named local root",
 			"the local root is noted hub_published: durability without a pin — `tfs gc` may still reclaim it",
 		},
-		Next: []string{"cozy pull " + ref.String() + "@" + res.Snapshot},
+		Next: []string{"cozy model download " + ref.String() + "@" + res.Snapshot},
 	})
 }
 

@@ -540,36 +540,60 @@ var Commands = []Command{
 	// (decisions #229): reads are public and carry no credential, first-party writes
 	// carry the ONE static admin token from TENSORHUB_TOKEN.
 	{
-		Path: []string{"search"}, Group: "catalog",
-		Summary: "hub catalog discovery — public, no credential",
+		Path: []string{"endpoint", "search"}, Group: "catalog",
+		Summary: "search endpoints — public, no credential",
 		Args:    "[<query>]", MaxArgs: -1,
-		Flags:      []Flag{{Name: "--kind", Arg: "<endpoint|model>", Summary: "restrict the kind"}},
 		Exits:      []exit.Code{exit.OK, exit.Usage, exit.Unavailable, exit.Deadline},
-		Capability: "cmd.search", Status: Implemented, Handler: "search",
-		Next:     []string{"cozy repo show <org/name>", "cozy install <org/endpoint>"},
-		Examples: []string{"cozy search", "cozy search flux --kind model", "cozy search --kind endpoint --json"},
+		Capability: "cmd.endpoint.search", Status: Implemented, Handler: "endpoint.search",
+		Next:     []string{"cozy endpoint show <org/name>"},
+		Examples: []string{"cozy endpoint search", "cozy endpoint search flux", "cozy endpoint search --json"},
 	},
 	{
-		Path: []string{"repo", "show"}, Group: "catalog",
-		Summary: "resolve one repo ref against the catalog — public, no credential",
+		Path: []string{"model", "search"}, Group: "catalog",
+		Summary: "search models — public, no credential",
+		Args:    "[<query>]", MaxArgs: -1,
+		Exits:      []exit.Code{exit.OK, exit.Usage, exit.Unavailable, exit.Deadline},
+		Capability: "cmd.model.search", Status: Implemented, Handler: "model.search",
+		Next:     []string{"cozy model show <org/name>"},
+		Examples: []string{"cozy model search", "cozy model search flux", "cozy model search --json"},
+	},
+	{
+		Path: []string{"endpoint", "show"}, Group: "catalog",
+		Summary: "show one endpoint — public, no credential",
 		Args:    "<org/name>", MinArgs: 1, MaxArgs: 1,
 		Exits:      []exit.Code{exit.OK, exit.Usage, exit.NotFound, exit.Unavailable, exit.Deadline},
-		Capability: "cmd.repo.show", Status: Implemented, Handler: "repo.show",
-		Next:     []string{"cozy search <query>"},
-		Examples: []string{"cozy repo show org/name"},
+		Capability: "cmd.endpoint.show", Status: Implemented, Handler: "endpoint.show",
+		Next:     []string{"cozy endpoint search <query>"},
+		Examples: []string{"cozy endpoint show org/name"},
 	},
 	{
-		Path: []string{"repo", "create"}, Group: "catalog",
-		Summary: "create a model or endpoint repo — first-party, admin token",
+		Path: []string{"endpoint", "create"}, Group: "catalog",
+		Summary: "create an endpoint — first-party, admin token",
 		Args:    "<org/name>", MinArgs: 1, MaxArgs: 1,
-		Flags: []Flag{
-			{Name: "--kind", Arg: "<model|endpoint>", Summary: "required; the hub locks a repo's kind at creation"},
-			{Name: "--reason", Arg: "<why>", Summary: "required; the hub records it durably before it acts"},
-		},
+		Flags:      []Flag{{Name: "--reason", Arg: "<why>", Summary: "required; the hub records it durably before it acts"}},
 		Exits:      []exit.Code{exit.OK, exit.Usage, exit.Validation, exit.Credential, exit.Unavailable, exit.Deadline, exit.Conflict},
-		Capability: "cmd.repo.create", Status: Implemented, Handler: "repo.create",
-		Next:     []string{"cozy repo show <org/name>", "cozy push <org/repo> <sha256:snapshot> --reason <why>"},
-		Examples: []string{"cozy repo create org/name --kind model --reason <why>"},
+		Capability: "cmd.endpoint.create", Status: Implemented, Handler: "endpoint.create",
+		Next:     []string{"cozy endpoint show <org/name>", "cozy endpoint publish <org/name> --release <id> --dir <tree>"},
+		Examples: []string{"cozy endpoint create org/name --reason <why>"},
+	},
+	{
+		Path: []string{"model", "show"}, Group: "catalog",
+		Summary: "show one model — public, no credential",
+		Args:    "<org/name>", MinArgs: 1, MaxArgs: 1,
+		Exits:      []exit.Code{exit.OK, exit.Usage, exit.NotFound, exit.Unavailable, exit.Deadline},
+		Capability: "cmd.model.show", Status: Implemented, Handler: "model.show",
+		Next:     []string{"cozy model search <query>"},
+		Examples: []string{"cozy model show org/name"},
+	},
+	{
+		Path: []string{"model", "create"}, Group: "catalog",
+		Summary: "create a model — first-party, admin token",
+		Args:    "<org/name>", MinArgs: 1, MaxArgs: 1,
+		Flags:      []Flag{{Name: "--reason", Arg: "<why>", Summary: "required; the hub records it durably before it acts"}},
+		Exits:      []exit.Code{exit.OK, exit.Usage, exit.Validation, exit.Credential, exit.Unavailable, exit.Deadline, exit.Conflict},
+		Capability: "cmd.model.create", Status: Implemented, Handler: "model.create",
+		Next:     []string{"cozy model show <org/name>", "cozy model publish <org/model> <sha256:snapshot> --reason <why>"},
+		Examples: []string{"cozy model create org/name --reason <why>"},
 	},
 	{
 		Path: []string{"hub", "status"}, Group: "catalog",
@@ -579,7 +603,7 @@ var Commands = []Command{
 		// reports, not a refusal it raises.
 		Exits:      []exit.Code{exit.OK},
 		Capability: "cmd.hub.status", Status: Implemented, Handler: "hub.status",
-		Next:     []string{"cozy search", "cozy hub config"},
+		Next:     []string{"cozy endpoint search", "cozy model search", "cozy hub config"},
 		Examples: []string{"cozy hub status", "cozy hub status --json"},
 	},
 	{
@@ -597,10 +621,11 @@ var Commands = []Command{
 	// they move bytes between the local canonical store and the hub and never touch
 	// an endpoint process, so neither needs the LocalService (cl-009's D3 rule).
 	{
-		Path: []string{"pull"}, Group: "transfer",
+		Path: []string{"model", "download"}, Group: "transfer",
 		Summary: "fetch a hub checkpoint into the shared local store — verified, resumable",
-		Args:    "<org/repo[@sha256:…]>", MinArgs: 1, MaxArgs: 1,
+		Args:    "<org/model[@release|@sha256:…]>", MinArgs: 1, MaxArgs: 1,
 		Flags: []Flag{
+			{Name: "--lane", Arg: "<selector>", Summary: "resolve one release lane; no default is invented"},
 			{Name: "--dry-run", Summary: "print the plan without moving bytes"},
 			// cl-011's law, enforced by the `secret` fence family: a credential never
 			// rides argv. cozy-creator.md still spells this `--token <t>`; the doc is
@@ -610,76 +635,78 @@ var Commands = []Command{
 		},
 		Exits: []exit.Code{exit.OK, exit.Usage, exit.Validation, exit.NotFound, exit.Credential,
 			exit.Structural, exit.Unavailable, exit.Deadline},
-		Capability: "cmd.pull", Status: Implemented, Handler: "pull",
-		Next:     []string{"cozy install <org/endpoint>", "cozy search <query>"},
-		Examples: []string{"cozy pull org/repo", "cozy pull org/repo@sha256:<hex>", "cozy pull org/repo --dry-run"},
+		Capability: "cmd.model.download", Status: Implemented, Handler: "model.download",
+		Next:     []string{"cozy install <org/endpoint>", "cozy model search <query>"},
+		Examples: []string{"cozy model download org/model@release --lane task=text-to-video", "cozy model download org/model@sha256:<hex>", "cozy model download org/model@release --dry-run"},
 	},
 	{
-		Path: []string{"push"}, Group: "transfer",
-		Summary: "declare-first upload of a local canonical snapshot; only missing bytes move",
-		Args:    "<org/repo> <sha256:snapshot>", MinArgs: 2, MaxArgs: 2,
+		Path: []string{"model", "publish"}, Group: "transfer",
+		Summary: "incrementally publish a canonical snapshot; only unsettled transfers move",
+		Args:    "<org/model> <sha256:snapshot>", MinArgs: 2, MaxArgs: 2,
 		Flags: []Flag{
 			// No `--family`: th-003's hub CLASSIFIES the family from the artifact's
 			// topology digest and refuses an unknown field, so a declared family is
 			// both unnecessary and fatal (cl-006's real-hub side-check, closed here).
 			{Name: "--reason", Arg: "<why>", Summary: "required; the hub records it durably before it acts"},
-			{Name: "--session", Arg: "<name>", Summary: "publish session name", Default: "derived from the snapshot"},
-			{Name: "--dry-run", Summary: "declare and stop: the hub's own transfer plan"},
+			{Name: "--dry-run", Summary: "open and claim transfers, then stop before grants or bytes"},
 			{Name: "--token-stdin", Summary: "read this invocation's hub credential from stdin (never argv)"},
 			{Name: "--crash-after", Arg: "<n>", Summary: "development: stop after n objects (resume verification)"},
 		},
 		Exits: []exit.Code{exit.OK, exit.Usage, exit.Validation, exit.NotFound, exit.Credential,
 			exit.Structural, exit.Unavailable, exit.Deadline, exit.Failed, exit.Conflict},
-		Capability: "cmd.push", Status: Implemented, Handler: "push",
-		Next:     []string{"cozy repo show <org/name>", "cozy pull <org/repo>"},
-		Examples: []string{"cozy push org/repo sha256:<snapshot> --reason <why>", "cozy push org/repo sha256:<snapshot> --reason <why> --dry-run"},
+		Capability: "cmd.model.publish", Status: Implemented, Handler: "model.publish",
+		Next:     []string{"cozy model show <org/name>", "cozy model download <org/model>"},
+		Examples: []string{"cozy model publish org/model sha256:<snapshot> --reason <why>", "cozy model publish org/model sha256:<snapshot> --reason <why> --dry-run"},
 	},
 	{
 		Path: []string{"datasets", "push"}, Group: "transfer",
 		Summary: "the dataset dialect of push — deferred: there is no datasets plane to push into",
-		Args:    "<path> <org/repo>", MinArgs: 2, MaxArgs: 2,
+		Args:    "<path> <org/dataset>", MinArgs: 2, MaxArgs: 2,
 		Exits:      []exit.Code{exit.OK, exit.NotFound, exit.Credential},
 		Capability: "cmd.datasets.push", Status: Planned, Issue: "th-035",
 	},
 	{
 		Path: []string{"datasets", "pull"}, Group: "transfer",
 		Summary: "the dataset dialect of pull — deferred with the datasets plane",
-		Args:    "<org/repo[@release|@digest]>", MinArgs: 1, MaxArgs: 1,
+		Args:    "<org/dataset[@release|@digest]>", MinArgs: 1, MaxArgs: 1,
 		Flags:      []Flag{{Name: "--out", Arg: "<dir>", Summary: "materialize here"}},
 		Exits:      []exit.Code{exit.OK, exit.NotFound, exit.Credential},
 		Capability: "cmd.datasets.pull", Status: Planned, Issue: "th-035",
 	},
 	{
-		Path: []string{"export"}, Group: "transfer",
+		Path: []string{"model", "export"}, Group: "transfer",
 		Summary: "authorized local checkpoint export through the orchestrator surface",
 		Args:    "<ref>", MinArgs: 1, MaxArgs: 1,
 		Exits:      []exit.Code{exit.OK, exit.NotFound, exit.Unavailable},
-		Capability: "cmd.export", NeedsServer: true, Status: Planned, Issue: "cl-008",
+		Capability: "cmd.model.export", NeedsServer: true, Status: Planned, Issue: "cl-008",
 	},
-	// `deploy` and `promote` publish and point at an ENDPOINT RELEASE. Neither
+	// `endpoint publish` and `endpoint promote` publish and point at an ENDPOINT RELEASE. Neither
 	// referent exists yet: releases arrive with th-003 (the hub's own promote route
 	// refuses `promote.not_armed` by name today) and the leased build that turns a
 	// source snapshot into a release arrives with th-004. Advertised, not built —
 	// a clean-commit snapshot uploaded into a plane with no release to cut would be
 	// machinery with no consumer (law 13).
 	{
-		Path: []string{"deploy"}, Group: "transfer",
+		Path: []string{"endpoint", "publish"}, Group: "transfer",
 		Summary: "publish an endpoint release — deferred: there is no release plane to cut into",
-		MaxArgs: 0,
+		Args:    "<org/endpoint>", MinArgs: 1, MaxArgs: 1,
 		Flags: []Flag{
+			{Name: "--release", Arg: "<id>", Summary: "immutable endpoint release id"},
+			{Name: "--dir", Arg: "<tree>", Summary: "endpoint source tree", Default: "the working directory"},
 			{Name: "--create", Summary: "required for the first publish of a new name"},
 			{Name: "--detach", Summary: "return after upload"},
 		},
 		Exits:      []exit.Code{exit.OK, exit.NotFound, exit.Credential, exit.Failed},
-		Capability: "cmd.deploy", Status: Planned, Issue: "th-003",
+		Capability: "cmd.endpoint.publish", Status: Planned, Issue: "cl-039",
+		Examples: []string{"cozy endpoint publish org/endpoint --release 1.0.0 --dir ."},
 	},
 	{
-		Path: []string{"promote"}, Group: "transfer",
+		Path: []string{"endpoint", "promote"}, Group: "transfer",
 		Summary: "move the serving pointer — deferred: the hub refuses promote.not_armed until releases exist",
 		Args:    "<org/endpoint> <release-id>", MinArgs: 2, MaxArgs: 2,
 		Flags:      []Flag{{Name: "--serve", Arg: "<major>", Summary: "required; no default"}},
 		Exits:      []exit.Code{exit.OK, exit.Usage, exit.NotFound, exit.Credential},
-		Capability: "cmd.promote", Status: Planned, Issue: "th-003",
+		Capability: "cmd.endpoint.promote", Status: Planned, Issue: "cl-041",
 	},
 
 	// ---- account (th-031, Wave 2) ----

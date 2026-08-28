@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Pack an endpoint tree into a release archive — the pre-hub stand-in for `cozy deploy`.
+"""Pack an endpoint tree into a release archive — the pre-hub stand-in for `cozy endpoint publish`.
 
 cl-012 replaces this with the real publish path (manifest from `git ls-files`,
 declare-digests-first, presigned PUTs). Until then this writes the same shape the

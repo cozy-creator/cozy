@@ -400,11 +400,12 @@ standing verification: its adversary matrix was deleted with `cmd/cozy-live` (de
 identity plane** (owner ruling, decisions #229): there are no accounts, no sessions and
 no orgs, so the surface splits exactly two ways.
 
-- **Reads are public.** `cozy search [<query>] [--kind]` and `cozy repo show <org/name>`
-  carry no credential at all. A miss is exit 0 with an empty state; an unknown ref is
-  exit 4.
-- **First-party writes carry ONE static admin token.** `cozy repo create <org/name>
-  --kind <model|endpoint> --reason <why>` and `cozy hub config` send
+- **Reads are public.** `cozy endpoint search|show` and `cozy model search|show`
+  carry no credential at all. A search miss is exit 0 with an empty state; an unknown
+  typed ref is exit 4. There is no generic `repo` or root `search` command.
+- **First-party writes carry ONE static admin token.** `cozy endpoint create
+  <org/name> --reason <why>`, `cozy model create <org/name> --reason <why>`, and
+  `cozy hub config` send
   `Authorization: Bearer $TENSORHUB_TOKEN`. `--reason` is required because the hub
   records why every admin mutation happened *before* it performs it.
 - **`cozy hub status`** names the configured URL and the credential's digest with the
@@ -434,56 +435,55 @@ under a code from the shared exit matrix: 401/403 → 5, 404 → 4, 409 → 13, 
 5xx/unreachable → 9, no answer at all → 10. An answer that is not a typed envelope
 (an unknown route, a proxy, a login page) says so rather than being invented into one.
 
-Not built here, and named: release/lane resolution and the `--lane` grammar (th-003),
-per-source credential rows for `hf`/`civitai`/`comfy` (they need a source that is not
-the hub, which arrives with cr-016's fetcher).
+Not built here, and named: per-source credential rows for `hf`/`civitai`/`comfy`
+(they need a source that is not the hub, which arrives with cr-016's fetcher).
 
-## Transfer: push and pull (cl-012)
+## Model publication and download (cl-012)
 
 Two verbs move a canonical checkpoint between the local store and the hub. Neither owns
 a byte or a protocol — `internal/tfs` is the ONE door to a byte-plane fact and
 `internal/hub` the ONE door to the hub — so `internal/transfer` owns only the SEQUENCE.
 
-**`cozy push <org/repo> <sha256:snapshot> --reason <why>`** drives th-002's
-declare-first protocol: declare the exact object set before a byte moves → the hub
-answers what it lacks → write only those, straight to their FINAL content keys under
-every condition the grant signed → the hub streams each object back and hashes it
-ITSELF → complete runs the hermetic verifier and installs one root. **The model family is
+**`cozy model publish <org/model> <sha256:snapshot> --reason <why>`** drives the
+incremental publication protocol: open under a stable operation id → claim sorted known
+ObjectRefs → obtain grants only for unsettled transfer ids → report exact received bytes
+→ have Tensorhub stream and hash each transfer → seal the exact closure, topology, and
+manifest documents. The seal runs the hermetic verifier and installs one root. **The model family is
 not declared** — th-003's hub CLASSIFIES it from the artifact's topology digest and refuses
 an unknown field, so `--family` is gone (cl-010 closed cl-006's finding). A path refuses by
 name: only a canonical snapshot is publishable, and the border runs where the bytes are
-(`tfs ingest`). `--dry-run` declares and stops — the plan is the hub's answer, not a
-local guess.
+(`tfs ingest`). `--dry-run` opens and claims the transfer rows, then stops before grants
+or bytes — the plan is the hub's durable state, not a local guess.
 
-**`cozy pull <org/repo>[@sha256:…]`** is the inverse, and it needs no route that lists a
-checkpoint's objects, because the artifact declares itself: the manifest arrives first
+**`cozy model download <org/model>[@release|@sha256:…] [--lane <selector>]`** first
+resolves through `GET /v1/models/resolve`; there is no client-side default release or
+checkpoint guess. It then needs no route that lists a checkpoint's objects, because the artifact declares itself: the manifest arrives first
 and is admitted only if it hashes to the id asked for; then everything the manifest
 names directly; then the transitive closure the byte plane computes from those
 documents. `tfs fill` admits every object under its declared identity, and the snapshot
 becomes a named local root only after `tfs snapshot verify` proves every declared byte
 — cl-009's transactional install with a different source.
 
-- **Resumability is not a feature, it is the absence of one.** There is no client-side
-  journal. A publish resumes because the hub re-plans a re-declared closure server-side
-  (`Begin` is idempotent on the closure digest); a fetch resumes because the store's own
+- **There is no client-side journal.** A publication resumes from Tensorhub's durable
+  transfer rows under the same operation id; a download resumes because the store's own
   verification records already say which objects are good. A third opinion about what is
   done is always the wrong one.
 - **Accounting separates MOVED from DEDUPED** on every line, and an object is counted
   once per run even though the fetch rounds overlap by construction.
-- **The hub re-verifies every object it already held**, and says how many; a client-side
-  digest is a convenience, never the proof (law 18).
+- **Tensorhub accepts only scoped custody.** An already-accepted immutable transfer can
+  reuse that exact fact without another HEAD/hash; sealing still hydrates and verifies the
+  complete checkpoint before catalog commit. A client digest is never custody proof.
 - `--token-stdin` takes this invocation's credential as a VALUE on stdin. It is not a
   prompt and never argv.
 
-**The read plane is real.** th-003 landed `POST …/checkpoints/{snapshot}/reads` and
-`scripts/xfer-realhub.sh` proves push → pull end to end against a hub built from that
-commit, with no shim anywhere. Against an OLDER hub `pull` still refuses
-`hub.no_read_plane` by name rather than inventing a bucket URL or reaching storage with a
-credential of its own — a second custody authority is exactly what law 2 forbids.
+**The read plane is real.** `POST …/checkpoints/{snapshot}/reads` and
+`scripts/xfer-realhub.sh` proves model publish → model download end to end against a hub
+built from the current contract, with no shim or retired route anywhere.
 
-`deploy` and `promote` stay advertised-not-built: releases arrive with th-003 (the hub's
-own promote route answers `promote.not_armed` today) and the leased build that turns a
-source snapshot into a release with th-004. `datasets push|pull` waits on th-035.
+`cozy endpoint publish` and `cozy endpoint promote` stay advertised-not-built: releases
+arrive with th-003 (the hub's own promotion route answers `promote.not_armed` today) and
+the leased proof that turns endpoint source into a release with th-004. `datasets
+push|pull` waits on th-035.
 
 ## Release and distribution (cl-013)
 
@@ -565,7 +565,7 @@ Creator is v2's test-suite exception; its suite and scripts drive real processes
   where `cozy-runtime describe --check` runs THROUGH THE INSTALLED WHEEL — site-packages
   as the project root, no source tree on `sys.path`.
 - `scripts/hub-live.py` drives the real `cozy` against a REAL tensorhub: public reads,
-  admin writes, every refusal arm (wrong token, absent repo, closed port, a hub that
+  admin writes, every refusal arm (wrong token, absent model, closed port, a hub that
   accepts and never answers, a 200 that is not our document), and a cumulative secrecy
   check that the raw credential appears in no byte the session printed.
 - `go test ./...` is the permitted Creator suite; `internal/live` starts the real
@@ -581,13 +581,12 @@ Creator is v2's test-suite exception; its suite and scripts drive real processes
   crash on the weightless fixture. The remote-placement tests drive the real owner client
   against an independent media-protocol peer rather than importing Tensorhub's server.
   A test whose external peer is absent skips by name.
-- `scripts/verify-cl012.sh` + `scripts/xfer-live.py` drive the real `cozy` against a
-  real tensorhub (built from a PINNED commit through a read-only `git archive`, because
-  that repo has a concurrent writer), its own Postgres container, real R2 under
-  `v2/cl-012/<run>/`, and real artifacts written by `tfs`: the publish round trip, the
-  0-byte dedup publish, an interrupted publish and an interrupted fetch each converging
-  on a re-run, the whole refusal matrix, and the benchmarks. Everything it writes to R2
-  is swept and the sweep is re-listed to prove it.
+- `scripts/xfer-realhub.sh` drives the real `cozy` against a pinned current Tensorhub,
+  its own Postgres container, four freshly bootstrapped storage prefixes, real R2, and
+  a real TensorFS checkpoint. It proves typed endpoint/model create/show/search,
+  incremental model publication, zero-byte committed replay, typed resolution and
+  download, whole-checkpoint verification, warm zero-byte download, retired-command
+  refusals, teardown, and exact R2-prefix cleanup—with no read shim or retired route.
 - `scripts/clean-machine.sh` runs `scripts/accept.sh` inside a throwaway container with a
   fresh user, an empty home, no toolchain and no mount of this repository but `scripts/`:
   the corrupted-asset red arm, the checksum-verified install, the tag and commit the
@@ -596,7 +595,7 @@ Creator is v2's test-suite exception; its suite and scripts drive real processes
   a READY worker with no weights to fill, a typed `completed` terminal, a published PNG,
   zero reserved VRAM and an empty construction digest, plus the typed failure terminal —
   `cozy down`'s proof of absence, and the verified upgrade.
-- `scripts/fence.py` enforces thirteen families: forbidden deps, the canonical tensor
+- `scripts/fence.py` enforces fourteen families: forbidden deps, the canonical tensor
   carriers TensorFS parses, interactive prompts, exit-matrix parity, a manifest lint (gate
   declaration, no `--version` global, and a `Next:`/`Examples:` disclosure on every
   implemented row), the `render` fence (one stream — an error is data and leaves on

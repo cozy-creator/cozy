@@ -255,7 +255,7 @@ func (t *Tool) Fill(plan []byte, planPath string) (FillResult, *exit.Error) {
 	return FillResult{Put: put, Skipped: skipped, Refused: refused}, nil
 }
 
-var verified = regexp.MustCompile(`(\d+) tensors, (\d+) parts, (\d+) blobs, (\d+) distinct objects`)
+var verified = regexp.MustCompile(`(\d+) tensors, (\d+) parts,(?: (\d+) assets,)? (\d+) blobs, (\d+) distinct objects`)
 
 // Verify is the whole-checkpoint proof: every byte the snapshot declares, hashed.
 // A fetch is not finished until this passes — and the root below is registered only
@@ -271,7 +271,7 @@ func (t *Tool) Verify(snapshot string) (tensors, parts, objects int, e *exit.Err
 	}
 	tensors, _ = strconv.Atoi(m[1])
 	parts, _ = strconv.Atoi(m[2])
-	objects, _ = strconv.Atoi(m[4])
+	objects, _ = strconv.Atoi(m[5])
 	return tensors, parts, objects, nil
 }
 
@@ -302,7 +302,7 @@ func Snapshot(ref string) (string, *exit.Error) {
 	h := hex(strings.TrimSpace(ref))
 	if len(h) != 64 {
 		return "", exit.Usagef("%q is not a snapshot id", ref).
-			WithRemedy("a snapshot id is sha256:<64 hex> — `tfs ingest install` prints one, and so does `cozy pull`")
+			WithRemedy("a snapshot id is sha256:<64 hex> — `tfs ingest install` prints one, and so does `cozy model download`")
 	}
 	for _, c := range h {
 		if !strings.ContainsRune("0123456789abcdef", c) {
