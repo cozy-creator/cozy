@@ -165,10 +165,7 @@ func (c *Orchestrator) placementSpec(w *worker, p DesiredPlacement) *pb.Placemen
 	return spec
 }
 
-const (
-	emptyModelObjectSetDigest = "sha256:d60755ff474871fce1e9705850245780895c1d2b798750f7692962c2d64d8856"
-	emptyModelObjectSetLength = 53
-)
+const emptyModelObjectSet = `{"kind":"tensorhub.resolved_object_set/1","roots":[]}`
 
 // modelObjectSetSubject makes the required PlacementSpec/2 closure explicit even for a
 // weightless local endpoint. The empty object-set document is a real canonical subject,
@@ -176,11 +173,19 @@ const (
 // bypass local authoring by relaying the complete PlacementSet bytes.
 func modelObjectSetSubject(p DesiredPlacement) *pb.ArtifactSubject {
 	digest, length := p.ModelObjectSetDigest, p.ModelObjectSetLength
+	var raw []byte
 	if digest == "" {
-		digest, length = emptyModelObjectSetDigest, emptyModelObjectSetLength
+		raw = canonical.Digest([]byte(emptyModelObjectSet))
+		digest, _ = canonical.Spell(raw)
+		length = uint64(len(emptyModelObjectSet))
+	} else {
+		var err error
+		raw, err = canonical.Raw(digest)
+		if err != nil {
+			return nil
+		}
 	}
-	raw, err := canonical.Raw(digest)
-	if err != nil || length == 0 {
+	if length == 0 {
 		return nil
 	}
 	return &pb.ArtifactSubject{Digest: raw, SubjectId: digest, Kind: "model_object_set", Length: length}
