@@ -523,7 +523,7 @@ the image RECIPE that assembles it is Tensorhub's.
 `cmd/cozy-pod` is the entrypoint, the supervisor, and the byte plane. It was two binaries —
 `cozy-bootstrap` and `cozy-media` — until cl-036 merged them into one artifact and one
 commit pin. **It dials nothing.** It takes no arguments and reads no configuration file:
-its whole launch surface is eight ALLOWLISTED `COZY_*` environment variables, and an
+its whole launch surface is six ALLOWLISTED `COZY_*` environment variables, and an
 unrecognized one is a boot failure rather than an ignored default. It mints the pod's TLS
 leaf (so no credential ships in the image), binds and serves the media plane in-process,
 execs the control runtime's launch adapter by absolute path with a closed environment,
@@ -533,9 +533,11 @@ adapter's opaque readiness payload into the envelope the media plane serves.
 Its two exact-grant fetches went out with the provision documents they carried (cl-036,
 paired with cozy-runtime's cr-048 and Tensorhub's th-067): **a pod boots ready-but-empty**,
 and one endpoint's closure arrives on the hub-authored placement lane after the RecordOwner
-connects, not as a boot-time document. Three facts those documents were smuggling —
-`COZY_ACQUISITION_ATTEMPT_ID`, `COZY_ACQUISITION_ATTEMPT_ORDINAL`, `COZY_RENTAL_ID` — are
-now ordinary environment values the adapter echoes in the readiness receipt. **That diet is
+connects, not as a boot-time document. Of the three identity facts those documents were
+smuggling, one survives: `COZY_ACQUISITION_ATTEMPT_ID`, which the adapter spends as the
+worker's `--worker-id`. `COZY_ACQUISITION_ATTEMPT_ORDINAL` and `COZY_RENTAL_ID` were pure
+transit for a receipt echo the per-attempt receipt HMAC key had already proven, and went
+with it. **That diet is
 what made the merge admissible**: with no outbound door left, the fence holds the merged
 binary WHOLE to an absolute no-egress rule with no exception of any kind — a fence with a
 carve-out for a file that still egressed is the failure proto-008 documents. The emitter

@@ -13,42 +13,48 @@ import (
 )
 
 const (
-	envAttemptID       = "COZY_ACQUISITION_ATTEMPT_ID"
-	envAttemptOrdinal  = "COZY_ACQUISITION_ATTEMPT_ORDINAL"
-	envRentalID        = "COZY_RENTAL_ID"
-	envReceiptKey      = "COZY_BOOTSTRAP_RECEIPT_HMAC_KEY_B64URL"
-	envReceiptDeadline = "COZY_BOOTSTRAP_RECEIPT_DEADLINE_UNIX"
-	envWorkerPort      = "COZY_WORKER_INTERNAL_PORT"
-	envMediaPort       = "COZY_MEDIA_INTERNAL_PORT"
-	envTokenHashes     = "COZY_RENTER_TOKEN_SHA256_JSON"
-	maxTokenHashes     = 16
-	maxIdentityBytes   = 256
-	maxAttemptOrdinal  = int64(1) << 31
+	envAttemptID     = "COZY_ACQUISITION_ATTEMPT_ID"
+	envReceiptKey    = "COZY_BOOTSTRAP_RECEIPT_HMAC_KEY_B64URL"
+	envLeaseExpiry   = "COZY_RENTAL_LEASE_EXPIRY_UNIX"
+	envWorkerPort    = "COZY_WORKER_INTERNAL_PORT"
+	envMediaPort     = "COZY_MEDIA_INTERNAL_PORT"
+	envTokenHashes   = "COZY_RENTER_TOKEN_SHA256_JSON"
+	maxTokenHashes   = 16
+	maxIdentityBytes = 256
 )
 
 // allowedCozyEnv is the CLOSED pod environment contract, consumer half. Tensorhub's
-// internal/podenv renders exactly these eight names and its build/substrate recipe refuses
+// internal/podenv renders exactly these six names and its build/substrate recipe refuses
 // to compile an image whose pinned bootstrap admits a different set, so an addition here
-// is a contract change on both sides or it is a build failure. cl-036 retired the six
-// COZY_PROVISION_{SPEC,BUNDLE}_{DIGEST,URL,LENGTH} grants with the documents they fetched
-// and added the three identity facts those documents were smuggling. The merge into one
-// binary did not touch this set: the media plane never read the environment and still does
-// not — it is handed its grant in memory.
+// is a contract change on both sides or it is a build failure.
+//
+// cl-036 retired the six COZY_PROVISION_{SPEC,BUNDLE}_{DIGEST,URL,LENGTH} grants with the
+// documents they fetched, and admitted three identity facts those documents had been
+// smuggling. Two of them are gone again: COZY_ACQUISITION_ATTEMPT_ORDINAL and
+// COZY_RENTAL_ID were pure transit — validated here, forwarded to the adapter, echoed into
+// the readiness receipt, and compared by the hub's binder against the same attempt row the
+// receipt HMAC key came from. The key is minted per attempt, so a receipt that verifies has
+// ALREADY proven which attempt it belongs to; the echo proved nothing after it.
+// COZY_ACQUISITION_ATTEMPT_ID stays because it is not transit: the adapter spends it as the
+// worker's `--worker-id`, which is the identity a Claim is addressed to and a Fault is
+// attributed to on the rev-2 wire.
+//
+// COZY_RENTAL_LEASE_EXPIRY_UNIX is the old COZY_BOOTSTRAP_RECEIPT_DEADLINE_UNIX. The name
+// lied: the value is `rental start + duration cap`, and state.go mints the pod's serving
+// certificate against it. A "receipt deadline" invites being shortened to a plausible boot
+// timeout, which would expire the cert mid-rental.
 var allowedCozyEnv = map[string]bool{
-	envAttemptID: true, envAttemptOrdinal: true, envRentalID: true,
-	envReceiptKey: true, envReceiptDeadline: true, envWorkerPort: true, envMediaPort: true,
-	envTokenHashes: true,
+	envAttemptID: true, envReceiptKey: true, envLeaseExpiry: true,
+	envWorkerPort: true, envMediaPort: true, envTokenHashes: true,
 }
 
 type config struct {
-	attemptID      string
-	attemptOrdinal int64
-	rentalID       string
-	receipt        *attemptKey
-	deadline       time.Time
-	workerPort     uint16
-	mediaPort      uint16
-	tokenHashes    []string
+	attemptID   string
+	receipt     *attemptKey
+	leaseExpiry time.Time
+	workerPort  uint16
+	mediaPort   uint16
+	tokenHashes []string
 }
 
 func parseConfig() (config, error) {
@@ -61,12 +67,6 @@ func parseConfig() (config, error) {
 	}
 	var err error
 	if out.attemptID, err = parseIdentity(envAttemptID); err != nil {
-		return out, err
-	}
-	if out.attemptOrdinal, err = parseOrdinal(envAttemptOrdinal); err != nil {
-		return out, err
-	}
-	if out.rentalID, err = parseIdentity(envRentalID); err != nil {
 		return out, err
 	}
 	keyText, err := requiredEnv(envReceiptKey)
@@ -92,15 +92,15 @@ func parseConfig() (config, error) {
 	if err := os.Unsetenv(envReceiptKey); err != nil {
 		return out, fmt.Errorf("cannot unset %s after decoding it: %w", envReceiptKey, err)
 	}
-	deadlineText, err := requiredEnv(envReceiptDeadline)
+	expiryText, err := requiredEnv(envLeaseExpiry)
 	if err != nil {
 		return out, err
 	}
-	deadlineUnix, err := strconv.ParseInt(deadlineText, 10, 64)
-	if err != nil || strconv.FormatInt(deadlineUnix, 10) != deadlineText {
-		return out, fmt.Errorf("%s must be one canonical decimal Unix second", envReceiptDeadline)
+	expiryUnix, err := strconv.ParseInt(expiryText, 10, 64)
+	if err != nil || strconv.FormatInt(expiryUnix, 10) != expiryText {
+		return out, fmt.Errorf("%s must be one canonical decimal Unix second", envLeaseExpiry)
 	}
-	out.deadline = time.Unix(deadlineUnix, 0)
+	out.leaseExpiry = time.Unix(expiryUnix, 0)
 	if out.workerPort, err = parsePort(envWorkerPort); err != nil {
 		return out, err
 	}
@@ -123,11 +123,11 @@ func parseConfig() (config, error) {
 	return out, nil
 }
 
-// parseIdentity reads one bounded opaque id. Bootstrap never interprets an attempt or
-// rental id; it hands it to the adapter, which echoes it in the readiness receipt so
-// tensorhub's binder can join the receipt to the attempt row it froze. The bound is the
-// adapter's own (cozy_runtime.internal.config.bounded) so a value that boots here cannot
-// be refused one exec later.
+// parseIdentity reads one bounded opaque id. Bootstrap never interprets the attempt id; it
+// hands it to the adapter, which spends it as the worker's `--worker-id` — the identity a
+// RecordOwner's Claim is addressed to. The bound is the adapter's own
+// (cozy_runtime.internal.config.bounded) so a value that boots here cannot be refused one
+// exec later.
 func parseIdentity(name string) (string, error) {
 	value, err := requiredEnv(name)
 	if err != nil {
@@ -138,20 +138,6 @@ func parseIdentity(name string) (string, error) {
 			name, maxIdentityBytes)
 	}
 	return value, nil
-}
-
-func parseOrdinal(name string) (int64, error) {
-	text, err := requiredEnv(name)
-	if err != nil {
-		return 0, err
-	}
-	ordinal, err := strconv.ParseInt(text, 10, 64)
-	if err != nil || ordinal <= 0 || ordinal > maxAttemptOrdinal ||
-		strconv.FormatInt(ordinal, 10) != text {
-		return 0, fmt.Errorf("%s must be one positive canonical decimal no greater than %d",
-			name, maxAttemptOrdinal)
-	}
-	return ordinal, nil
 }
 
 func parsePort(name string) (uint16, error) {

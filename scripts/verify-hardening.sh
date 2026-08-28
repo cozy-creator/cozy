@@ -18,8 +18,9 @@
 #
 # Verifies:
 #   1. Ambient RunPod provider identity (RUNPOD_*) never enters pod config.
-#   2. Unknown COZY_* variables (provider-identity aliases, and the six retired
-#      COZY_PROVISION_* grants) are refused by name.
+#   2. Unknown COZY_* variables are refused by name: provider-identity aliases, the six
+#      retired COZY_PROVISION_* grants, the two identity facts the env diet cut, and the old
+#      spelling of the lease expiry.
 #   3. The child-process environment allowlist is exactly the reviewed set, so
 #      AWS/HF/RunPod/Cozy credentials never cross the child boundary.
 #   4. The receipt ceiling is IMPORTED from internal/mediawire, not restated — the two
@@ -47,10 +48,8 @@ good_hashes="[\"$(printf 'a%.0s' $(seq 64))\"]"
 base_env=(
   "PATH=/usr/bin:/bin" "HOME=$work"
   "COZY_ACQUISITION_ATTEMPT_ID=ra-hardening-proof"
-  "COZY_ACQUISITION_ATTEMPT_ORDINAL=1"
-  "COZY_RENTAL_ID=rental-hardening-proof"
   "COZY_BOOTSTRAP_RECEIPT_HMAC_KEY_B64URL=$(printf 'A%.0s' $(seq 43))"
-  "COZY_BOOTSTRAP_RECEIPT_DEADLINE_UNIX=4102444800"
+  "COZY_RENTAL_LEASE_EXPIRY_UNIX=4102444800"
   "COZY_WORKER_INTERNAL_PORT=43100"
   "COZY_MEDIA_INTERNAL_PORT=43101"
   "COZY_RENTER_TOKEN_SHA256_JSON=$good_hashes"
@@ -86,6 +85,42 @@ for retired in COZY_PROVISION_SPEC_DIGEST COZY_PROVISION_SPEC_URL COZY_PROVISION
     bad "retired boot-closure grant $retired was admitted: $out"
   fi
 done
+
+# The same rule for the two identity facts that were pure transit, and for the name
+# the lease expiry used to answer to. COZY_BOOTSTRAP_RECEIPT_DEADLINE_UNIX is the dangerous
+# one — it was never a receipt deadline, it is the life of the certificate this pod serves
+# under — so a hub still emitting it is told by name, never silently handed a pod that then
+# refuses for a missing lease it thinks it supplied.
+for cut in COZY_ACQUISITION_ATTEMPT_ORDINAL COZY_RENTAL_ID COZY_BOOTSTRAP_RECEIPT_DEADLINE_UNIX; do
+  out=$(run "${base_env[@]}" "$cut=whatever")
+  if grep -q "unknown Cozy environment variable $cut" <<<"$out"; then
+    ok "retired name $cut is refused"
+  else
+    bad "retired name $cut was admitted: $out"
+  fi
+done
+
+# The rename is not a second spelling: the pod names the lease expiry ONCE, and its absence
+# is a boot failure that says so.
+out=$(env -i "PATH=/usr/bin:/bin" "HOME=$work" \
+  "COZY_ACQUISITION_ATTEMPT_ID=ra-hardening-proof" \
+  "COZY_BOOTSTRAP_RECEIPT_HMAC_KEY_B64URL=$(printf 'A%.0s' $(seq 43))" \
+  "COZY_WORKER_INTERNAL_PORT=43100" "COZY_MEDIA_INTERNAL_PORT=43101" \
+  "COZY_RENTER_TOKEN_SHA256_JSON=$good_hashes" timeout 15 "$work/cozy-pod" 2>&1 || true)
+if grep -q 'required environment variable COZY_RENTAL_LEASE_EXPIRY_UNIX is absent' <<<"$out"; then
+  ok "the lease expiry is required under its own name ($(head -1 <<<"$out"))"
+else
+  bad "an absent lease expiry was not refused by name: $out"
+fi
+
+# The certificate is minted against the LEASE and nothing else. A boot-shaped timeout here
+# would expire the pod's serving cert mid-rental, so the value has exactly one reader.
+if grep -q 'mintCertificate(cfg.leaseExpiry)' "$root/cmd/cozy-pod/state.go" &&
+    grep -q 'NotAfter:     leaseExpiry.Add(time.Hour)' "$root/cmd/cozy-pod/state.go"; then
+  ok "the pod's serving certificate expires with the rental lease, not with a boot timeout"
+else
+  bad "the TLS leaf is no longer minted against the rental lease expiry"
+fi
 
 got=$(awk '/^func childEnvironment/,/^}$/' "$root/cmd/cozy-pod/config.go" |
   grep -oE '"[A-Z_]+"' | tr -d '"' | sort | paste -sd, -)
@@ -206,7 +241,7 @@ closed "a 17-digest set" \
 # a pod that authenticates somebody nobody provisioned.
 out=$(env -i "PATH=/usr/bin:/bin" "HOME=$work" \
   "COZY_ACQUISITION_ATTEMPT_ID=ra-hardening-proof" timeout 15 "$work/cozy-pod" 2>&1 || true)
-if grep -q 'required environment variable COZY_ACQUISITION_ATTEMPT_ORDINAL is absent' <<<"$out"; then
+if grep -q 'required environment variable COZY_BOOTSTRAP_RECEIPT_HMAC_KEY_B64URL is absent' <<<"$out"; then
   ok "an incomplete environment is refused by the missing name ($(head -1 <<<"$out"))"
 else
   bad "an incomplete environment was not refused by name: $out"

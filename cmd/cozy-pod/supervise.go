@@ -60,7 +60,7 @@ func run(parent context.Context) error {
 	if err != nil {
 		return err
 	}
-	readinessCtx, cancelReadiness := context.WithDeadline(parent, cfg.deadline)
+	readinessCtx, cancelReadiness := context.WithDeadline(parent, cfg.leaseExpiry)
 	defer cancelReadiness()
 	if err := prepareState(cfg); err != nil {
 		return err
@@ -128,8 +128,6 @@ func startAdapter(cfg config) (*leg, error) {
 	hashes, _ := json.Marshal(cfg.tokenHashes)
 	env = append(env,
 		"COZY_ADAPTER_ACQUISITION_ATTEMPT_ID="+cfg.attemptID,
-		"COZY_ADAPTER_ACQUISITION_ATTEMPT_ORDINAL="+strconv.FormatInt(cfg.attemptOrdinal, 10),
-		"COZY_ADAPTER_RENTAL_ID="+cfg.rentalID,
 		"COZY_ADAPTER_POD_BOOT_ID_PATH="+podBootIDPath,
 		"COZY_ADAPTER_TLS_CERT_PATH="+certificatePath,
 		"COZY_ADAPTER_TLS_KEY_PATH="+privateKeyPath,
@@ -137,7 +135,10 @@ func startAdapter(cfg config) (*leg, error) {
 		"COZY_ADAPTER_WORKER_INTERNAL_PORT="+strconv.Itoa(int(cfg.workerPort)),
 		"COZY_ADAPTER_MEDIA_INTERNAL_PORT="+strconv.Itoa(int(cfg.mediaPort)),
 		"COZY_ADAPTER_RENTER_TOKEN_SHA256_JSON="+string(hashes),
-		"COZY_ADAPTER_READINESS_DEADLINE_UNIX="+strconv.FormatInt(cfg.deadline.Unix(), 10),
+		// The lease expiry, spent as the adapter's boot deadline: readiness has to be
+		// proven inside the rental it is being proven for. Shortening THIS costs a boot;
+		// shortening the lease expiry itself expires the serving certificate (state.go).
+		"COZY_ADAPTER_READINESS_DEADLINE_UNIX="+strconv.FormatInt(cfg.leaseExpiry.Unix(), 10),
 	)
 	cmd.Env = env
 	cmd.Stdout, cmd.Stderr = os.Stdout, os.Stderr
