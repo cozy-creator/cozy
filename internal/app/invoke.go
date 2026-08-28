@@ -601,6 +601,12 @@ func saveOutputsAt(c *localapi.Client, life api.Lifecycle, dir string) ([]map[st
 	return publishOutputSet(dir, life.Outputs, names, c.Media)
 }
 
+// outputNames names each saved file by the output's own FIELD-PATH id plus the extension
+// its declared MIME type earns — `image` -> `image.png` — so a two-output result is
+// addressable by name and a caller never has to know the manifest's order (decisions #248
+// and #375). The id is the same single path element the grant was fenced to; it is fenced
+// again here, because a client writing into the caller's own directory verifies rather
+// than trusts. An untyped output keeps its bare field path and no extension.
 func outputNames(outputs []api.MediaRef) ([]string, *exit.Error) {
 	names := make([]string, len(outputs))
 	seenIDs, seenNames := map[string]bool{}, map[string]bool{}
@@ -610,7 +616,10 @@ func outputNames(outputs []api.MediaRef) ([]string, *exit.Error) {
 				"the output manifest repeats or omits output id %q", out.OutputID)
 		}
 		seenIDs[out.OutputID] = true
-		names[index] = fmt.Sprintf("output-%02d%s", index+1, extensionOf(out.MimeType))
+		if e := orchestrator.FenceOutputID(out.OutputID); e != nil {
+			return nil, e
+		}
+		names[index] = out.OutputID + extensionOf(out.MimeType)
 		if seenNames[names[index]] {
 			return nil, exit.Named(exit.Validation, "output_name_collision",
 				"two output manifest rows resolve to %s", names[index])

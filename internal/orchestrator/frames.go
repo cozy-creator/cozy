@@ -1016,7 +1016,7 @@ func outputDest(req records.Request, dir, id string) (string, *exit.Error) {
 	if req.IsJob() {
 		return publicationDest(dir, id)
 	}
-	if e := fenceOutputID(id); e != nil {
+	if e := FenceOutputID(id); e != nil {
 		return "", e
 	}
 	return filepath.Join(dir, id), nil

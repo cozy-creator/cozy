@@ -1092,7 +1092,7 @@ func (c *Orchestrator) remoteGrant(req records.Request, attempt uint64, w *worke
 			req.ID, attempt, asset.FieldPath, asset.Length, asset.Digest, w.media.Addr(), path)
 	}
 	for _, id := range outputIDs {
-		if e := fenceOutputID(id); e != nil {
+		if e := FenceOutputID(id); e != nil {
 			return nil, e
 		}
 		g.Outputs = append(g.Outputs, &pb.OutputAccess{
@@ -1143,7 +1143,7 @@ func (c *Orchestrator) grant(requestID string, attempt uint64, req records.Reque
 		})
 	}
 	for _, id := range splitList(req.Outputs) {
-		if e := fenceOutputID(id); e != nil {
+		if e := FenceOutputID(id); e != nil {
 			return nil, e
 		}
 		g.Outputs = append(g.Outputs, &pb.OutputAccess{

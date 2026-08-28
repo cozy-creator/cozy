@@ -145,10 +145,10 @@ func publicationDest(root, outputID string) (string, *exit.Error) {
 	return clean, nil
 }
 
-// fenceOutputID admits a serving output id only as ONE path element: no separators, no
-// "..", never empty. It is the serving counterpart of publicationDest — the grant and the
-// mirror both resolve `dir/id`, so the id itself must be unable to leave dir.
-func fenceOutputID(id string) *exit.Error {
+// FenceOutputID admits a serving output id only as ONE path element: no separators, no
+// "..", never empty. It is the serving counterpart of publicationDest — the grant, the
+// mirror and `--out` all resolve `dir/id`, so the id itself must be unable to leave dir.
+func FenceOutputID(id string) *exit.Error {
 	if id == "" || id == "." || id == ".." || strings.ContainsAny(id, `/\`) {
 		return exit.Named(exit.Validation, "output_id_escape",
 			"output id %q is not a single path element", id).

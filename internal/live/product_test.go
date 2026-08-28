@@ -135,6 +135,7 @@ func TestProductPath(t *testing.T) {
 		"--idempotency-key", "crash-key", "--stream")
 	slow.Env = childEnv(t, root)
 	slow.Stdout, slow.Stderr = stream, stream
+	setProcessGroup(slow)
 	must(t, slow.Start())
 	defer func() { _ = slow.Wait() }()
 
@@ -168,12 +169,14 @@ func TestProductPath(t *testing.T) {
 	if outs, _ := life["outputs"].([]any); len(outs) != 0 || life["status"] == "completed" {
 		t.Errorf("something the dead owner had not committed is visible: %v", life)
 	}
-	replay := restarted.call(t, "POST", "/v1/requests", map[string]any{
-		"endpoint": weightlessRef, "function": "relay",
-		"input": map[string]any{"delay_ms": 4000},
-	}, "Idempotency-Key", "crash-key")
-	if replay.json(t)["request_id"] != requestID {
-		t.Errorf("the idempotency key stopped naming the request across the crash: %s", replay.brief())
+	// ONE KEY, ONE REQUEST, ACROSS THE CRASH. The replay is the SAME command line, because
+	// the host digests the WHOLE submission — asset identities included — so a hand-rolled
+	// body that dropped the image would (correctly) conflict instead of replaying.
+	code, out = runCozy(t, root, "run", weightlessRef+"/v1/relay", "delay_ms=4000",
+		"--asset", "image="+frame, "--idempotency-key", "crash-key", "--stream")
+	if !strings.Contains(out, requestID) {
+		t.Errorf("the idempotency key stopped naming the request across the crash [exit %d]\n%s",
+			code, out)
 	}
 }
 
