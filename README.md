@@ -25,7 +25,7 @@ declared by one canonical `model.cozytensors`, and reconstructed from the header
 
 ```
 tfs checkpoint write <root>            # ~382 MiB, 3 components, mixed encodings -> header_digest
-tfs checkpoint write <root> --plain    # same logical corpus, every tensor encoded as plain/1
+tfs checkpoint write <root> --plain    # plain/1 corpus in PyTorch named_parameters() order
 tfs checkpoint read <root> <hex>       # every anchor equation, every segment, byte-identical
 tfs checkpoint info <root> <hex>       # component/scope query — opens ONE object, the header
 tfs checkpoint locate <root> <hex> <component> <key> <role> <off> <len>

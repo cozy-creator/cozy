@@ -42,7 +42,8 @@
 //!   tfs snapshot blob put|read|repair <root> <file> [i]
 //!
 //! The checkpoint plane (tfs-015). Flags: --blocks <n> --pin <alias|empty> --seed <s>
-//! `write`/`read` also accept `--plain`, the closed all-`plain/1` synthetic fixture variant.
+//! `write`/`read` also accept `--plain`, the closed all-`plain/1` fixture in PyTorch
+//! `named_parameters()` traversal order.
 //!
 //!   tfs checkpoint write <root> [--plain]    objectize a synthetic tree, emit the header
 //!   tfs checkpoint read <root> <hex>         reconstruct every part, byte-identity checked

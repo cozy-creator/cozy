@@ -92,8 +92,9 @@ struct Item {
 }
 
 /// The synthetic corpus has one normal, mixed-encoding form. `Plain` is a closed fixture
-/// variant for hardware that has only qualified `plain/1`: it changes the encoding choice,
-/// never the logical component/key/dtype/shape plan.
+/// variant for hardware that has only qualified `plain/1`: it changes the encoding choice
+/// and presents the same logical set in PyTorch traversal order; it never changes a logical
+/// component/key/dtype/shape fact.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum PlanEncoding {
     Mixed,
@@ -151,27 +152,34 @@ fn plan(blocks: u64, scale: u64, encoding: PlanEncoding) -> Vec<Item> {
             Dtype::Bf16,
             d(vec![2048, 2048]),
         ));
-        v.push(item(
+        let ff = item(
             "unet",
             k("ff.net.0.proj.weight"),
             encoding.alias("nvfp4-w4a4/1"),
             Dtype::Bf16,
             d(vec![2048, 8192]),
-        ));
-        v.push(item(
+        );
+        let norm1 = item(
             "unet",
             k("norm1.weight"),
             encoding.alias("plain/1"),
             Dtype::Bf16,
             d(vec![2048]),
-        ));
-        v.push(item(
+        );
+        let norm_q = item(
             "unet",
             k("attn1.norm_q.weight"),
             encoding.alias("plain/1"),
             Dtype::Bf16,
             d(vec![64]),
-        ));
+        );
+        match encoding {
+            // Existing fixture identity is production evidence: its default order is frozen.
+            PlanEncoding::Mixed => v.extend([ff, norm1, norm_q]),
+            // `torch.nn.Module.named_parameters()` is depth-first: finish attn1 before
+            // visiting sibling modules ff and norm1. This is the executable fixture order.
+            PlanEncoding::Plain => v.extend([norm_q, ff, norm1]),
+        }
     }
     v.push(item(
         "text_encoder",
@@ -895,6 +903,22 @@ mod tests {
     static NEXT_ROOT: AtomicU64 = AtomicU64::new(0);
     const SCALED_TOPOLOGY: &str =
         "sha256:b0bcb1d36deae42e880632817730172f6f6a14f2177bae0ea953cba2a64b0ccf";
+    const FULL_TOPOLOGY: &str =
+        "sha256:20568368a293a7d7fa7ab76d7dfece5c04616d3ff85f9e36656949eda35579d4";
+    const MIXED_BLOCK_ORDER: [&str; 5] = [
+        "blocks.0.attn1.to_q.weight",
+        "blocks.0.attn1.to_out.0.weight",
+        "blocks.0.ff.net.0.proj.weight",
+        "blocks.0.norm1.weight",
+        "blocks.0.attn1.norm_q.weight",
+    ];
+    const PLAIN_BLOCK_ORDER: [&str; 5] = [
+        "blocks.0.attn1.to_q.weight",
+        "blocks.0.attn1.to_out.0.weight",
+        "blocks.0.attn1.norm_q.weight",
+        "blocks.0.ff.net.0.proj.weight",
+        "blocks.0.norm1.weight",
+    ];
 
     struct TestRoot(PathBuf);
 
@@ -965,6 +989,18 @@ mod tests {
             .collect()
     }
 
+    fn component_keys<'a>(header: &'a Header, component: &str) -> Vec<&'a str> {
+        header
+            .components
+            .iter()
+            .find(|(name, _)| name == component)
+            .expect("component exists")
+            .1
+            .iter()
+            .map(|(key, _)| key.as_str())
+            .collect()
+    }
+
     #[test]
     fn full_plain_plan_preserves_every_logical_fact_and_volume() {
         let logical = |encoding| {
@@ -981,9 +1017,14 @@ mod tests {
                 })
                 .collect::<Vec<_>>()
         };
-        let mixed = logical(PlanEncoding::Mixed);
-        let plain = logical(PlanEncoding::Plain);
-        assert_eq!(plain, mixed, "--plain may change only the encoding alias");
+        let mut mixed = logical(PlanEncoding::Mixed);
+        let mut plain = logical(PlanEncoding::Plain);
+        mixed.sort_by(|left, right| left.0.cmp(right.0).then(left.1.cmp(&right.1)));
+        plain.sort_by(|left, right| left.0.cmp(right.0).then(left.1.cmp(&right.1)));
+        assert_eq!(
+            plain, mixed,
+            "--plain may change only encoding aliases and traversal order"
+        );
         assert_eq!(mixed.len(), 64);
         assert_eq!(
             mixed.iter().map(|item| item.4).sum::<u64>(),
@@ -997,6 +1038,32 @@ mod tests {
         assert!(plan(12, 1, PlanEncoding::Plain)
             .iter()
             .all(|item| item.alias == "plain/1"));
+        let full_plain = plan(12, 1, PlanEncoding::Plain);
+        let topology = tensorfs_core::header::topology_value(full_plain.iter().map(|item| {
+            (
+                item.comp,
+                item.key.as_str(),
+                item.dtype,
+                item.shape.as_slice(),
+            )
+        }));
+        assert_eq!(
+            tensorfs_core::header::topology_digest_of(&topology),
+            FULL_TOPOLOGY
+        );
+    }
+
+    #[test]
+    fn fixture_plans_lock_default_and_pytorch_traversal_orders() {
+        let keys = |encoding| {
+            plan(1, 32, encoding)
+                .into_iter()
+                .filter(|item| item.comp == "unet")
+                .map(|item| item.key)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(keys(PlanEncoding::Mixed), MIXED_BLOCK_ORDER);
+        assert_eq!(keys(PlanEncoding::Plain), PLAIN_BLOCK_ORDER);
     }
 
     #[test]
@@ -1013,6 +1080,7 @@ mod tests {
         assert_eq!(ids, header_ids);
         assert_eq!(ids, closure_ids);
         assert!(ids.contains(&registry_seed("plain/1").spec.object_id()));
+        assert_eq!(component_keys(&header, "unet"), MIXED_BLOCK_ORDER);
         assert_eq!(header.topology_digest(), SCALED_TOPOLOGY);
     }
 
@@ -1039,6 +1107,7 @@ mod tests {
         assert!(header
             .tensors()
             .all(|(_, _, tensor)| tensor.parts.len() == 1 && tensor.parts[0].0 == "value"));
+        assert_eq!(component_keys(&header, "unet"), PLAIN_BLOCK_ORDER);
         assert_eq!(header.topology_digest(), SCALED_TOPOLOGY);
         assert_eq!(cmd_read(&root.0, &href.sha256, &flags), ExitCode::SUCCESS);
     }
