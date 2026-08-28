@@ -10,9 +10,9 @@ import (
 	"strings"
 	"time"
 
-	"github.com/cozy-creator/cozy-creator-v2/internal/app"
-	"github.com/cozy-creator/cozy-creator-v2/internal/config"
-	"github.com/cozy-creator/cozy-creator-v2/internal/records"
+	"github.com/cozy-creator/cozy-creator/internal/app"
+	"github.com/cozy-creator/cozy-creator/internal/config"
+	"github.com/cozy-creator/cozy-creator/internal/records"
 )
 
 const workflowCreativeDigest = "sha256:7777777777777777777777777777777777777777777777777777777777777777"

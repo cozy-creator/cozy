@@ -7,10 +7,10 @@ import (
 	"path/filepath"
 	"strings"
 
-	"github.com/cozy-creator/cozy-creator-v2/internal/api"
-	"github.com/cozy-creator/cozy-creator-v2/internal/exit"
-	"github.com/cozy-creator/cozy-creator-v2/internal/render"
-	"github.com/cozy-creator/cozy-creator-v2/internal/video"
+	"github.com/cozy-creator/cozy-creator/internal/api"
+	"github.com/cozy-creator/cozy-creator/internal/exit"
+	"github.com/cozy-creator/cozy-creator/internal/render"
+	"github.com/cozy-creator/cozy-creator/internal/video"
 )
 
 func handleVideoCompose(ctx *Context) *exit.Error {

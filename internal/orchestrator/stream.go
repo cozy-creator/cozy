@@ -4,7 +4,7 @@ import (
 	"encoding/json"
 	"sync"
 
-	pb "github.com/cozy-creator/cozy-creator-v2/protocol/cozy/worker/v1"
+	pb "github.com/cozy-creator/cozy-creator/protocol/cozy/worker/v1"
 )
 
 // The LOSSY half of the client contract's event stream (cl-006), beside records/events.go's

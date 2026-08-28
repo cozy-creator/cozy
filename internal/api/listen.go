@@ -4,7 +4,7 @@ import (
 	"net"
 	"strconv"
 
-	"github.com/cozy-creator/cozy-creator-v2/internal/exit"
+	"github.com/cozy-creator/cozy-creator/internal/exit"
 )
 
 // LOOPBACK-ONLY, and it is a REFUSAL rather than a default.

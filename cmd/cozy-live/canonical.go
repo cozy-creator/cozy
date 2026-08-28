@@ -10,8 +10,8 @@ import (
 
 	"google.golang.org/protobuf/proto"
 
-	"github.com/cozy-creator/cozy-creator-v2/internal/canonical"
-	pb "github.com/cozy-creator/cozy-creator-v2/protocol/cozy/worker/v1"
+	"github.com/cozy-creator/cozy-creator/internal/canonical"
+	pb "github.com/cozy-creator/cozy-creator/protocol/cozy/worker/v1"
 )
 
 // The conformance corpus is worker-protocol's FROZEN fixtures at schema rev 3.

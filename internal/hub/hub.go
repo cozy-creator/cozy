@@ -25,9 +25,9 @@ import (
 	"strings"
 	"time"
 
-	"github.com/cozy-creator/cozy-creator-v2/internal/config"
-	"github.com/cozy-creator/cozy-creator-v2/internal/exit"
-	"github.com/cozy-creator/cozy-creator-v2/internal/secret"
+	"github.com/cozy-creator/cozy-creator/internal/config"
+	"github.com/cozy-creator/cozy-creator/internal/exit"
+	"github.com/cozy-creator/cozy-creator/internal/secret"
 )
 
 // Timeout bounds one hub call end to end. A hub that accepts a connection and then

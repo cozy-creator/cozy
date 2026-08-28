@@ -8,10 +8,10 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/cozy-creator/cozy-creator-v2/internal/canonical"
-	"github.com/cozy-creator/cozy-creator-v2/internal/media"
-	"github.com/cozy-creator/cozy-creator-v2/internal/orchestrator"
-	"github.com/cozy-creator/cozy-creator-v2/internal/secret"
+	"github.com/cozy-creator/cozy-creator/internal/canonical"
+	"github.com/cozy-creator/cozy-creator/internal/media"
+	"github.com/cozy-creator/cozy-creator/internal/orchestrator"
+	"github.com/cozy-creator/cozy-creator/internal/secret"
 )
 
 // sectionTLSPin is cl-026's certificate-substitution arm, guarding cl-019's design: the

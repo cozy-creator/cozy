@@ -6,7 +6,7 @@ import (
 	"os/exec"
 	"path/filepath"
 
-	"github.com/cozy-creator/cozy-creator-v2/internal/home"
+	"github.com/cozy-creator/cozy-creator/internal/home"
 )
 
 // rowScript writes ONE artifact index row through the runtime's own writer, with `bytes`

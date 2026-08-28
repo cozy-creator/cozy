@@ -33,8 +33,8 @@ import (
 	"sort"
 	"strings"
 
-	"github.com/cozy-creator/cozy-creator-v2/internal/canonical"
-	"github.com/cozy-creator/cozy-creator-v2/internal/exit"
+	"github.com/cozy-creator/cozy-creator/internal/canonical"
+	"github.com/cozy-creator/cozy-creator/internal/exit"
 )
 
 // DescriptorFile is the name cr-003 froze. It is committed in the endpoint's source and

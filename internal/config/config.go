@@ -30,8 +30,8 @@ import (
 	"strconv"
 	"strings"
 
-	"github.com/cozy-creator/cozy-creator-v2/internal/exit"
-	"github.com/cozy-creator/cozy-creator-v2/internal/secret"
+	"github.com/cozy-creator/cozy-creator/internal/exit"
+	"github.com/cozy-creator/cozy-creator/internal/secret"
 )
 
 // Inherited is the CLOSED set of variables a child process may see from this process's

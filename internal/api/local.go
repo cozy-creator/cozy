@@ -7,8 +7,8 @@ import (
 	"net/http"
 	"runtime"
 
-	"github.com/cozy-creator/cozy-creator-v2/internal/exit"
-	"github.com/cozy-creator/cozy-creator-v2/internal/orchestrator"
+	"github.com/cozy-creator/cozy-creator/internal/exit"
+	"github.com/cozy-creator/cozy-creator/internal/orchestrator"
 )
 
 // The LOCAL EXTENSION MODULE. Everything here is mounted under /v1/local/ so the boundary

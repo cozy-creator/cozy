@@ -5,7 +5,7 @@ import (
 	"strconv"
 	"strings"
 
-	"github.com/cozy-creator/cozy-creator-v2/internal/exit"
+	"github.com/cozy-creator/cozy-creator/internal/exit"
 )
 
 // Ref is `org/endpoint[@vN]` — the hub's grammar, consumed verbatim. "unset" has no

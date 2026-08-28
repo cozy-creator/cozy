@@ -60,8 +60,8 @@ import (
 	"sync"
 	"time"
 
-	"github.com/cozy-creator/cozy-creator-v2/internal/canonical"
-	"github.com/cozy-creator/cozy-creator-v2/internal/secret"
+	"github.com/cozy-creator/cozy-creator/internal/canonical"
+	"github.com/cozy-creator/cozy-creator/internal/secret"
 )
 
 func main() {

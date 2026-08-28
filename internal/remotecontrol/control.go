@@ -14,12 +14,12 @@ import (
 	"strconv"
 	"strings"
 
-	"github.com/cozy-creator/cozy-creator-v2/internal/canonical"
-	"github.com/cozy-creator/cozy-creator-v2/internal/exit"
-	"github.com/cozy-creator/cozy-creator-v2/internal/hub"
-	"github.com/cozy-creator/cozy-creator-v2/internal/launch"
-	"github.com/cozy-creator/cozy-creator-v2/internal/orchestrator"
-	pb "github.com/cozy-creator/cozy-creator-v2/protocol/cozy/worker/v1"
+	"github.com/cozy-creator/cozy-creator/internal/canonical"
+	"github.com/cozy-creator/cozy-creator/internal/exit"
+	"github.com/cozy-creator/cozy-creator/internal/hub"
+	"github.com/cozy-creator/cozy-creator/internal/launch"
+	"github.com/cozy-creator/cozy-creator/internal/orchestrator"
+	pb "github.com/cozy-creator/cozy-creator/protocol/cozy/worker/v1"
 )
 
 const (

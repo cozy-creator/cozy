@@ -36,9 +36,9 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/cozy-creator/cozy-creator-v2/internal/exit"
-	"github.com/cozy-creator/cozy-creator-v2/internal/secret"
-	"github.com/cozy-creator/cozy-creator-v2/internal/workertls"
+	"github.com/cozy-creator/cozy-creator/internal/exit"
+	"github.com/cozy-creator/cozy-creator/internal/secret"
+	"github.com/cozy-creator/cozy-creator/internal/workertls"
 )
 
 // Spec is the pod's media plane as a rental pins it: where it answers, the certificate to

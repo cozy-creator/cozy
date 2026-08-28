@@ -7,9 +7,9 @@ import (
 	"strconv"
 	"strings"
 
-	"github.com/cozy-creator/cozy-creator-v2/internal/exit"
-	"github.com/cozy-creator/cozy-creator-v2/internal/inputasset"
-	"github.com/cozy-creator/cozy-creator-v2/internal/records"
+	"github.com/cozy-creator/cozy-creator/internal/exit"
+	"github.com/cozy-creator/cozy-creator/internal/inputasset"
+	"github.com/cozy-creator/cozy-creator/internal/records"
 )
 
 // ParseAssets turns repeated `--asset <field-path>=<file>` flags into one payload plus

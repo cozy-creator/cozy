@@ -59,7 +59,7 @@ fi
 D="$OUT/$TAG"
 rm -rf "$D"
 mkdir -p "$D"
-STAMP="github.com/cozy-creator/cozy-creator-v2/internal/app"
+STAMP="github.com/cozy-creator/cozy-creator/internal/app"
 LDFLAGS="-s -w -X $STAMP.tag=$TAG -X $STAMP.commit=$COMMIT"
 
 # One row per target. CGO is OFF for all of them: `internal/records` drives its SQLite

@@ -4,7 +4,7 @@ package main
 import (
 	"os"
 
-	"github.com/cozy-creator/cozy-creator-v2/internal/app"
+	"github.com/cozy-creator/cozy-creator/internal/app"
 )
 
 func main() {

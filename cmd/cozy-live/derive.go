@@ -11,7 +11,7 @@ import (
 	"strings"
 	"time"
 
-	pb "github.com/cozy-creator/cozy-creator-v2/protocol/cozy/worker/v1"
+	pb "github.com/cozy-creator/cozy-creator/protocol/cozy/worker/v1"
 )
 
 // Release fixtures are DERIVED from the current tree (#616.c, cl-030). An archive on disk

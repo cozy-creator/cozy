@@ -10,8 +10,8 @@ import (
 	"strings"
 	"time"
 
-	"github.com/cozy-creator/cozy-creator-v2/internal/launch"
-	"github.com/cozy-creator/cozy-creator-v2/internal/orchestrator"
+	"github.com/cozy-creator/cozy-creator/internal/launch"
+	"github.com/cozy-creator/cozy-creator/internal/orchestrator"
 )
 
 const (

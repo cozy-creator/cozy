@@ -17,7 +17,7 @@ import (
 	"encoding/base64"
 	"net/http"
 
-	"github.com/cozy-creator/cozy-creator-v2/internal/exit"
+	"github.com/cozy-creator/cozy-creator/internal/exit"
 )
 
 // BeginRequest is the declaration. `closure` and `code_topology` are the exact bytes

@@ -17,12 +17,12 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/cozy-creator/cozy-creator-v2/internal/app"
-	"github.com/cozy-creator/cozy-creator-v2/internal/config"
-	"github.com/cozy-creator/cozy-creator-v2/internal/home"
-	"github.com/cozy-creator/cozy-creator-v2/internal/media"
-	"github.com/cozy-creator/cozy-creator-v2/internal/records"
-	"github.com/cozy-creator/cozy-creator-v2/internal/workertls"
+	"github.com/cozy-creator/cozy-creator/internal/app"
+	"github.com/cozy-creator/cozy-creator/internal/config"
+	"github.com/cozy-creator/cozy-creator/internal/home"
+	"github.com/cozy-creator/cozy-creator/internal/media"
+	"github.com/cozy-creator/cozy-creator/internal/records"
+	"github.com/cozy-creator/cozy-creator/internal/workertls"
 )
 
 // cl-015's section: RENT A POD, ATTACH ITS WORKER, ROUTE TO IT, AND SEE WHERE THE BYTES

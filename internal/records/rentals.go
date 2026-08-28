@@ -7,7 +7,7 @@ import (
 	"strings"
 	"unicode"
 
-	"github.com/cozy-creator/cozy-creator-v2/internal/exit"
+	"github.com/cozy-creator/cozy-creator/internal/exit"
 )
 
 // The RENTAL half of the one lifecycle authority (cl-015). A rented pod outlives the

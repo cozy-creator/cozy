@@ -1,6 +1,6 @@
 package manifest
 
-import "github.com/cozy-creator/cozy-creator-v2/internal/exit"
+import "github.com/cozy-creator/cozy-creator/internal/exit"
 
 // FoundationTokens are the capability tokens this binary's CLI foundation carries,
 // independent of any one command. Scripts gate on tokens, never version strings.

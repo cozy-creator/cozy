@@ -8,7 +8,7 @@ import (
 	"strconv"
 	"strings"
 
-	"github.com/cozy-creator/cozy-creator-v2/internal/canonical"
+	"github.com/cozy-creator/cozy-creator/internal/canonical"
 )
 
 // THE TRIAGE READ SURFACE (cr-011's seam, cl-006's half of it).

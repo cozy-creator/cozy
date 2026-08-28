@@ -26,11 +26,11 @@ import (
 	"sync"
 	"time"
 
-	"github.com/cozy-creator/cozy-creator-v2/internal/config"
-	"github.com/cozy-creator/cozy-creator-v2/internal/exit"
-	"github.com/cozy-creator/cozy-creator-v2/internal/home"
-	"github.com/cozy-creator/cozy-creator-v2/internal/records"
-	pb "github.com/cozy-creator/cozy-creator-v2/protocol/cozy/worker/v1"
+	"github.com/cozy-creator/cozy-creator/internal/config"
+	"github.com/cozy-creator/cozy-creator/internal/exit"
+	"github.com/cozy-creator/cozy-creator/internal/home"
+	"github.com/cozy-creator/cozy-creator/internal/records"
+	pb "github.com/cozy-creator/cozy-creator/protocol/cozy/worker/v1"
 )
 
 // Options is the frozen input to one LocalService. Every field is decided by the

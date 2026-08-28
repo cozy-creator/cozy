@@ -15,7 +15,7 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/cozy-creator/cozy-creator-v2/internal/config"
+	"github.com/cozy-creator/cozy-creator/internal/config"
 )
 
 // The cl-006 driver's own HTTP client, and a SEPARATE `cozy up` process to point it at.

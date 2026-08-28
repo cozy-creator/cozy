@@ -150,7 +150,7 @@ DENY_MEDIA_EGRESS = [
 DENY_MEDIA_IMPORT = ["protocol/cozy/worker", "internal/orchestrator", "internal/api"]
 # An import LINE, so a doc comment naming the owner's bind site is prose and not a door.
 MEDIA_IMPORT_LINE = re.compile(
-    r'^\s*(?:[A-Za-z_]\w*\s+)?"github\.com/cozy-creator/cozy-creator-v2/([^"]+)"\s*$')
+    r'^\s*(?:[A-Za-z_]\w*\s+)?"github\.com/cozy-creator/cozy-creator/([^"]+)"\s*$')
 
 ALLOW_DOOR = "//cozy:allow"
 STDIN_DOOR = "//cozy:stdin-value"

@@ -3,9 +3,9 @@ package app
 import (
 	"strings"
 
-	"github.com/cozy-creator/cozy-creator-v2/internal/exit"
-	"github.com/cozy-creator/cozy-creator-v2/internal/hub"
-	"github.com/cozy-creator/cozy-creator-v2/internal/render"
+	"github.com/cozy-creator/cozy-creator/internal/exit"
+	"github.com/cozy-creator/cozy-creator/internal/hub"
+	"github.com/cozy-creator/cozy-creator/internal/render"
 )
 
 // The catalog verbs (cl-011). Launch-1 tensorhub has no identity plane (decisions

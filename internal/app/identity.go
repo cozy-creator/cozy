@@ -4,8 +4,8 @@ import (
 	"runtime"
 	"runtime/debug"
 
-	"github.com/cozy-creator/cozy-creator-v2/internal/canonical"
-	"github.com/cozy-creator/cozy-creator-v2/internal/config"
+	"github.com/cozy-creator/cozy-creator/internal/canonical"
+	"github.com/cozy-creator/cozy-creator/internal/config"
 )
 
 // localInvocationIdentity mints the two per-service identity digests every LOCAL

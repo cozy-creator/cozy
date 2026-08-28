@@ -8,13 +8,13 @@ import (
 	"sort"
 	"strings"
 
-	"github.com/cozy-creator/cozy-creator-v2/internal/api"
-	"github.com/cozy-creator/cozy-creator-v2/internal/exit"
-	"github.com/cozy-creator/cozy-creator-v2/internal/home"
-	"github.com/cozy-creator/cozy-creator-v2/internal/manifest"
-	"github.com/cozy-creator/cozy-creator-v2/internal/records"
-	"github.com/cozy-creator/cozy-creator-v2/internal/render"
-	"github.com/cozy-creator/cozy-creator-v2/internal/service"
+	"github.com/cozy-creator/cozy-creator/internal/api"
+	"github.com/cozy-creator/cozy-creator/internal/exit"
+	"github.com/cozy-creator/cozy-creator/internal/home"
+	"github.com/cozy-creator/cozy-creator/internal/manifest"
+	"github.com/cozy-creator/cozy-creator/internal/records"
+	"github.com/cozy-creator/cozy-creator/internal/render"
+	"github.com/cozy-creator/cozy-creator/internal/service"
 )
 
 // Build identity. tag/commit may be stamped with -ldflags -X; otherwise the Go

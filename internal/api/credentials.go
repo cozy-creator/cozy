@@ -9,10 +9,10 @@ import (
 	"runtime"
 	"strconv"
 
-	"github.com/cozy-creator/cozy-creator-v2/internal/config"
-	"github.com/cozy-creator/cozy-creator-v2/internal/exit"
-	"github.com/cozy-creator/cozy-creator-v2/internal/home"
-	"github.com/cozy-creator/cozy-creator-v2/internal/secret"
+	"github.com/cozy-creator/cozy-creator/internal/config"
+	"github.com/cozy-creator/cozy-creator/internal/exit"
+	"github.com/cozy-creator/cozy-creator/internal/home"
+	"github.com/cozy-creator/cozy-creator/internal/secret"
 )
 
 // Two credentials, minted per launch, and they are DIFFERENT on purpose (cozy-creator.md:
