@@ -59,8 +59,7 @@ type Command struct {
 
 func (c *Command) Name() string { return strings.Join(c.Path, " ") }
 
-// Description is the one sentence that says what this tool is. Root help and the
-// home view (AXI 10's identification block) both print it, from here, so they cannot drift.
+// Description is the one sentence root help uses to say what this tool is.
 const Description = "local-first generative media: install endpoints, run them, publish releases"
 
 // Groups is the display order of command groups.

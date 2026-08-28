@@ -368,10 +368,19 @@ func (c *Client) ShutdownService() *exit.Error {
 	return c.call("POST", "/v1/local/service/shutdown", map[string]any{}, &out)
 }
 
-// Doctor is the host/service document, verbatim. cozy-creator renders it; it derives
-// nothing the server already answered.
-func (c *Client) Doctor() (map[string]any, *exit.Error) {
-	var out map[string]any
+// DoctorDocument is the local service's operational readback. Counts stay typed across
+// the HTTP boundary so status never reinterprets JSON numbers or opens the records store.
+type DoctorDocument struct {
+	Service   map[string]any `json:"service"`
+	Host      map[string]any `json:"host"`
+	Counts    map[string]int `json:"counts"`
+	EventHead int64          `json:"event_head"`
+	Workers   []Worker       `json:"workers"`
+}
+
+// Doctor returns the host/service document verbatim.
+func (c *Client) Doctor() (DoctorDocument, *exit.Error) {
+	var out DoctorDocument
 	e := c.call("GET", "/v1/local/doctor", nil, &out)
 	return out, e
 }

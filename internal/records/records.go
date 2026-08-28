@@ -104,11 +104,10 @@ CREATE TABLE IF NOT EXISTS pins (
 // re-dialled connection with foreign_keys OFF would silently accept the delete Forget
 // exists to refuse. The driver replays them on every connection it opens.
 //
-//	busy_timeout  a reader in another process (a bare `cozy` reading counts while the
-//	              service writes) waits instead of failing
+//	busy_timeout  transient lock contention waits instead of failing immediately
 //	foreign_keys  the pin -> generation reference is enforced, not decorative
-//	journal_mode  WAL, so those cross-process readers do not block on the writer at all;
-//	              it is persistent, so an older root converts on its first open here
+//	journal_mode  WAL keeps reads independent of the single writer; it is persistent, so
+//	              an older root converts on its first open here
 const pragmas = "?_pragma=busy_timeout(5000)&_pragma=foreign_keys(1)&_pragma=journal_mode(WAL)"
 
 func Open(path string) (*Store, *exit.Error) {

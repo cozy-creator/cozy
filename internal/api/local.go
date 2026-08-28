@@ -25,9 +25,14 @@ type EndpointRow struct {
 }
 
 func (s *Server) localEndpoints(w http.ResponseWriter, r *http.Request) {
+	rows := s.endpointRows(s.orchestrator.Workers())
+	s.ok(w, r, http.StatusOK, map[string]any{"endpoints": rows, "count": len(rows)})
+}
+
+func (s *Server) endpointRows(workers []orchestrator.WorkerFacts) []EndpointRow {
 	rows := []EndpointRow{}
 	resident := map[string]bool{}
-	for _, f := range s.orchestrator.Workers() {
+	for _, f := range workers {
 		resident[f.Endpoint] = true
 	}
 	if s.endpoints != nil {
@@ -49,7 +54,7 @@ func (s *Server) localEndpoints(w http.ResponseWriter, r *http.Request) {
 			rows = append(rows, row)
 		}
 	}
-	s.ok(w, r, http.StatusOK, map[string]any{"endpoints": rows, "count": len(rows)})
+	return rows
 }
 
 func (s *Server) localWorkers(w http.ResponseWriter, r *http.Request) {
@@ -217,8 +222,27 @@ func (s *Server) shutdownService(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) doctor(w http.ResponseWriter, r *http.Request) {
-	counts, _ := s.store.Counts()
-	head, _ := s.store.LastEventSeq()
+	counts, problem := s.store.Counts()
+	if problem != nil {
+		s.refuseTyped(w, r, problem)
+		return
+	}
+	head, problem := s.store.LastEventSeq()
+	if problem != nil {
+		s.refuseTyped(w, r, problem)
+		return
+	}
+	workers := s.orchestrator.Workers()
+	endpoints := s.endpointRows(workers)
+	resident := 0
+	for _, endpoint := range endpoints {
+		if endpoint.Resident {
+			resident++
+		}
+	}
+	counts["endpoints"] = len(endpoints)
+	counts["resident_endpoints"] = resident
+	counts["workers"] = len(workers)
 	s.ok(w, r, http.StatusOK, map[string]any{
 		"service": map[string]any{
 			"address": s.addr, "bind": "loopback-only", "root": s.layout.Root,
@@ -229,7 +253,7 @@ func (s *Server) doctor(w http.ResponseWriter, r *http.Request) {
 		},
 		"counts":     counts,
 		"event_head": head,
-		"workers":    s.orchestrator.Workers(),
+		"workers":    workers,
 	})
 }
 

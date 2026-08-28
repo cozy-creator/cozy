@@ -2086,18 +2086,24 @@ func (s *Store) Checkpoints(requestID string) ([]Checkpoint, *exit.Error) {
 	return out, nil
 }
 
-// Counts is what bare `cozy` renders: one line of live facts, read from the authority.
+// Counts is the durable workload summary exposed by the local API beside its live
+// endpoint and worker counts. Serving requests and jobs are separate products in the
+// dashboard even though they share one lifecycle table and attempt authority.
 func (s *Store) Counts() (map[string]int, *exit.Error) {
 	out := map[string]int{}
 	for name, query := range map[string]string{
-		"workers":        `SELECT COUNT(*) FROM worker_processes WHERE state != 'closed'`,
-		"requests":       `SELECT COUNT(*) FROM requests`,
-		"attempts":       `SELECT COUNT(*) FROM attempts`,
-		"live":           `SELECT COUNT(*) FROM attempts WHERE state IN ('preparing','offered','accepted','terminal')`,
-		"recovered":      `SELECT COUNT(*) FROM attempts WHERE state='recovered_open'`,
-		"outputs":        `SELECT COUNT(*) FROM outputs`,
-		"workflows":      `SELECT COUNT(*) FROM workflow_executions`,
-		"live_workflows": `SELECT COUNT(*) FROM workflow_executions WHERE state IN ('running','canceling')`,
+		"requests": `SELECT COUNT(*) FROM requests WHERE kind='serving'`,
+		"active_requests": `SELECT COUNT(*) FROM requests WHERE kind='serving'
+			AND state IN ('submitted','queued','dispatching','requeue_pending')`,
+		"jobs": `SELECT COUNT(*) FROM requests WHERE kind='job'`,
+		"active_jobs": `SELECT COUNT(*) FROM requests WHERE kind='job'
+			AND state IN ('submitted','queued','dispatching','requeue_pending')`,
+		"attempts":           `SELECT COUNT(*) FROM attempts`,
+		"active_attempts":    `SELECT COUNT(*) FROM attempts WHERE state IN ('preparing','offered','accepted','terminal')`,
+		"recovered_attempts": `SELECT COUNT(*) FROM attempts WHERE state='recovered_open'`,
+		"outputs":            `SELECT COUNT(*) FROM outputs`,
+		"workflows":          `SELECT COUNT(*) FROM workflow_executions`,
+		"active_workflows":   `SELECT COUNT(*) FROM workflow_executions WHERE state IN ('running','canceling')`,
 	} {
 		var n int
 		if err := s.db.QueryRow(query).Scan(&n); err != nil {

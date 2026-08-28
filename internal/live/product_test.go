@@ -3,6 +3,7 @@ package live
 import (
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -29,6 +30,26 @@ func TestProductPath(t *testing.T) {
 	root := filepath.Join(os.TempDir(), "cozy-live", "product")
 	must(t, os.RemoveAll(root))
 	must(t, os.MkdirAll(root, 0o755))
+
+	// Bare `cozy` and explicit `cozy status` are the same operational dashboard. A down
+	// service has no invented workload values and no binary identity banner; it identifies
+	// the selected local root and gives the background-start command.
+	for _, args := range [][]string{nil, {"status"}} {
+		code, out := runCozy(t, root, args...)
+		if code != 0 || !strings.Contains(out, "home:") || !strings.Contains(out, root) ||
+			!strings.Contains(out, "service: down") || !strings.Contains(out, "next: cozy up -d") {
+			t.Fatalf("cozy %s down dashboard [exit %d]\n%s", strings.Join(args, " "), code, out)
+		}
+		for _, noise := range []string{"bin:", "description:", "version:", "unknown"} {
+			if strings.Contains(out, noise) {
+				t.Fatalf("cozy %s down dashboard contains %q\n%s", strings.Join(args, " "), noise, out)
+			}
+		}
+	}
+	if code, out := runCozy(t, root, "status", "--fields", "service,endpoints"); code != 0 ||
+		!strings.Contains(out, "service:") || !strings.Contains(out, "endpoints: unknown") {
+		t.Fatalf("cozy status running-only field while down [exit %d]\n%s", code, out)
+	}
 
 	// REFUSAL PRECEDENCE, before anything is built: -h outranks every gate even on a line
 	// that carries no arguments, a planned row names its issue rather than the arguments it
@@ -78,6 +99,33 @@ func TestProductPath(t *testing.T) {
 	}
 
 	svc := startService(t, root)
+
+	// Running status reads its workload summary through the service API. Serving
+	// requests and jobs are separate counts even though they share one records table.
+	code, out = runCozy(t, root, "status", "--json")
+	if code != 0 {
+		t.Fatalf("cozy status --json [exit %d]\n%s", code, out)
+	}
+	var status map[string]any
+	if err := json.Unmarshal([]byte(out), &status); err != nil {
+		t.Fatalf("cozy status returned invalid JSON: %v\n%s", err, out)
+	}
+	for key, want := range map[string]any{
+		"kind": "status", "home": root, "service": "up",
+		"endpoints": float64(1), "workers": float64(0),
+		"requests": float64(0), "active_requests": float64(0),
+		"jobs": float64(0), "active_jobs": float64(0),
+		"workflows": float64(0), "active_workflows": float64(0),
+	} {
+		if status[key] != want {
+			t.Errorf("cozy status %s = %#v, want %#v\n%s", key, status[key], want, out)
+		}
+	}
+	pid, hasPID := status["pid"].(float64)
+	since, hasSince := status["since"].(string)
+	if !hasPID || pid <= 0 || !hasSince || since == "" {
+		t.Errorf("cozy status omitted the running process identity\n%s", out)
+	}
 
 	// THE INVOKE: one real request, all the way through, with the file on disk.
 	outDir := filepath.Join(root, "out")

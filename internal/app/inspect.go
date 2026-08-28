@@ -141,23 +141,19 @@ func handleDoctor(ctx *Context) *exit.Error {
 	if e != nil {
 		return e
 	}
-	fields := []render.Field{}
-	for _, key := range []string{"service", "host", "counts", "event_head"} {
-		if v, ok := doc[key]; ok {
-			fields = append(fields, render.Field{K: key, V: v})
-		}
+	fields := []render.Field{
+		{K: "service", V: doc.Service},
+		{K: "host", V: doc.Host},
+		{K: "counts", V: doc.Counts},
+		{K: "event_head", V: doc.EventHead},
 	}
-	workers, e := c.Workers()
-	if e != nil {
-		return e
-	}
-	live := make([]string, 0, len(workers))
-	for _, w := range workers {
+	live := make([]string, 0, len(doc.Workers))
+	for _, w := range doc.Workers {
 		live = append(live, fmt.Sprintf("%s %s pid=%d %s plans=%d",
 			w.Endpoint, w.InstanceID, w.PID, w.Serving, len(w.Plans)))
 	}
 	if ctx.Mode().JSON {
-		fields = append(fields, render.Field{K: "workers", V: workers})
+		fields = append(fields, render.Field{K: "workers", V: doc.Workers})
 	} else {
 		fields = append(fields, render.Field{K: "workers", V: live})
 	}

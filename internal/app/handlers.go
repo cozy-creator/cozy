@@ -2,7 +2,6 @@ package app
 
 import (
 	"fmt"
-	"os"
 	"runtime"
 	"runtime/debug"
 	"sort"
@@ -10,9 +9,7 @@ import (
 
 	"github.com/cozy-creator/cozy-creator/internal/api"
 	"github.com/cozy-creator/cozy-creator/internal/exit"
-	"github.com/cozy-creator/cozy-creator/internal/home"
 	"github.com/cozy-creator/cozy-creator/internal/manifest"
-	"github.com/cozy-creator/cozy-creator/internal/records"
 	"github.com/cozy-creator/cozy-creator/internal/render"
 	"github.com/cozy-creator/cozy-creator/internal/service"
 )
@@ -108,103 +105,76 @@ func handleStatus(ctx *Context) *exit.Error {
 	rec := render.Record{
 		Kind: "status",
 		Fields: []render.Field{
+			{K: "home", V: ctx.Cfg.Home},
 			{K: "service", V: map[bool]string{true: "up", false: "down"}[st.Up]},
 			{K: "address", V: st.Addr},
-			{K: "endpoints", V: nil},
-			{K: "workers", V: nil},
-			{K: "jobs", V: nil},
-			{K: "workflows", V: nil},
 		},
 	}
-	if st.Up {
-		// The live facts come from the ONE authority, read directly. A second reader of
-		// the same rows is a read, never a second store.
-		if l, e := home.Open(ctx.Cfg.Home); e == nil {
-			if store, e := records.Open(l.DB); e == nil {
-				defer store.Close()
-				if counts, e := store.Counts(); e == nil {
-					rec.Fields = []render.Field{
-						{K: "service", V: "up"},
-						{K: "address", V: st.Addr},
-						{K: "socket", V: st.Socket},
-						{K: "pid", V: st.PID},
-						{K: "workers", V: counts["workers"]},
-						{K: "requests", V: counts["requests"]},
-						{K: "attempts", V: counts["attempts"]},
-						{K: "live_attempts", V: counts["live"]},
-						{K: "recovered_open", V: counts["recovered"]},
-						{K: "outputs", V: counts["outputs"]},
-						{K: "workflows", V: counts["workflows"]},
-						{K: "live_workflows", V: counts["live_workflows"]},
-					}
-				}
-			}
-		}
-		// The ENDPOINT and WORKER listings are the API's, because they are facts only the
-		// running service holds (cl-010: `cozy status` is a client of /v1/local/*). A
-		// credential that cannot be read is reported, never fatal — bare `cozy` is
-		// content-first and answers with what it could learn.
-		ctx.Service = st
-		installed, resident := -1, 0
-		if c, e := dial(ctx); e == nil {
-			if rows, e := c.Endpoints(); e == nil {
-				names := make([]string, 0, len(rows))
-				for _, row := range rows {
-					state := "cold"
-					if row.Resident {
-						state = "running"
-						resident++
-					}
-					names = append(names, row.Endpoint+" ("+state+")")
-				}
-				installed = len(rows)
-				rec.Fields = append(rec.Fields, render.Field{K: "endpoints", V: names})
-			}
-			if workers, e := c.Workers(); e == nil {
-				live := make([]string, 0, len(workers))
-				for _, w := range workers {
-					live = append(live, w.Endpoint+" "+w.InstanceID+" "+w.Serving)
-				}
-				rec.Fields = append(rec.Fields, render.Field{K: "live_workers", V: live})
-			}
-		} else {
-			rec.Notes = append(rec.Notes, "the local client credential is unreadable: "+e.Message)
-		}
-		rec.Notes = append(rec.Notes, st.Details)
-		// The suggestion follows the STATE, not the verb: nothing installed and "run
-		// something" is unactionable. Everything warm falls through to the row's own
-		// manifest default. A listing that could not be read leaves it there too.
-		switch {
-		case installed == 0:
-			rec.Next = []string{"cozy install <org/endpoint>", "cozy search"}
-		case installed > 0 && resident == 0:
-			rec.Next = []string{"cozy start <org/endpoint>"}
-		}
-	} else {
-		rec.Notes = []string{st.Details,
-			"installed endpoints, workers and jobs are readable only while the service runs"}
-		rec.Next = []string{"cozy up"}
+	if !st.Up {
+		rec.Next = []string{"cozy up -d"}
+		rec.Fields = requestedStatusFields(rec.Fields, ctx.Mode().Fields)
+		return emit(ctx, rec)
 	}
-	// AXI 10 — the HOME view names the tool before its live data. `cozy status` typed
-	// explicitly is a poll of that data and stays exactly as it is.
-	if ctx.Inv.Bare {
-		rec.Fields = append(identity(), rec.Fields...)
+
+	rec.Fields = append(rec.Fields,
+		render.Field{K: "pid", V: st.PID},
+		render.Field{K: "since", V: st.Since},
+	)
+	ctx.Service = st
+	c, problem := dial(ctx)
+	if problem != nil {
+		rec.Notes = []string{"running-state details are unavailable: " + problem.Message}
+		rec.Next = []string{"cozy down", "cozy up -d"}
+		rec.Fields = requestedStatusFields(rec.Fields, ctx.Mode().Fields)
+		return emit(ctx, rec)
+	}
+	doc, problem := c.Doctor()
+	if problem != nil {
+		rec.Notes = []string{"running-state details are unavailable: " + problem.Message}
+		rec.Next = []string{"cozy doctor"}
+		rec.Fields = requestedStatusFields(rec.Fields, ctx.Mode().Fields)
+		return emit(ctx, rec)
+	}
+	counts := doc.Counts
+	rec.Fields = append(rec.Fields,
+		render.Field{K: "endpoints", V: counts["endpoints"]},
+		render.Field{K: "workers", V: counts["workers"]},
+		render.Field{K: "requests", V: counts["requests"]},
+		render.Field{K: "active_requests", V: counts["active_requests"]},
+		render.Field{K: "jobs", V: counts["jobs"]},
+		render.Field{K: "active_jobs", V: counts["active_jobs"]},
+		render.Field{K: "workflows", V: counts["workflows"]},
+		render.Field{K: "active_workflows", V: counts["active_workflows"]},
+	)
+	switch {
+	case counts["endpoints"] == 0:
+		rec.Next = []string{"cozy install <org/endpoint>", "cozy search"}
+	case counts["resident_endpoints"] == 0:
+		rec.Next = []string{"cozy start <org/endpoint>"}
 	}
 	return emit(ctx, rec)
 }
 
-// identity is AXI 10's identification block. The path is the RUNNING binary's own, not
-// an env reading — several cozy builds coexist and the agent needs the one it just ran.
-func identity() []render.Field {
-	bin, err := os.Executable()
-	if err != nil {
-		bin = "cozy"
+// requestedStatusFields keeps --fields stable across service states without printing a
+// wall of `unknown` values by default. An explicitly requested running-only fact is null
+// while the service is down; a misspelling still reaches render's ordinary usage refusal.
+func requestedStatusFields(fields []render.Field, requested []string) []render.Field {
+	valid := map[string]bool{
+		"home": true, "service": true, "address": true, "pid": true, "since": true,
+		"endpoints": true, "workers": true, "requests": true, "active_requests": true,
+		"jobs": true, "active_jobs": true, "workflows": true, "active_workflows": true,
 	}
-	return []render.Field{
-		{K: "bin", V: bin},
-		{K: "description", V: manifest.Description},
-		{K: "version", V: tag},
+	have := map[string]bool{}
+	for _, field := range fields {
+		have[field.K] = true
 	}
+	for _, name := range requested {
+		if valid[name] && !have[name] {
+			fields = append(fields, render.Field{K: name, V: nil})
+			have[name] = true
+		}
+	}
+	return fields
 }
 
 func buildStamp() (string, bool) {
