@@ -161,14 +161,16 @@ type overlayWheel struct {
 }
 
 func wheelFact(doc canonical.Doc, owner string) (overlayWheel, error) {
-	if err := requireKeys(doc, "digest", "distribution", "filename", "length", "tags", "version"); err != nil {
+	if err := requireKeys(doc, "digest", "distribution", "filename", "import_roots", "length", "tags", "version"); err != nil {
 		return overlayWheel{}, err
 	}
 	wheel := overlayWheel{Digest: doc.Str("digest"), Distribution: doc.Str("distribution"), Owner: owner,
 		Version: doc.Str("version")}
 	tags, tagsOK := doc["tags"].([]canonical.Value)
+	roots, rootsOK := doc["import_roots"].([]canonical.Value)
 	if _, err := canonical.Raw(wheel.Digest); err != nil || wheel.Distribution == "" || wheel.Version == "" ||
-		!strings.HasSuffix(doc.Str("filename"), ".whl") || doc.Int("length") <= 0 || !tagsOK || len(tags) == 0 {
+		!strings.HasSuffix(doc.Str("filename"), ".whl") || doc.Int("length") <= 0 || !tagsOK || len(tags) == 0 ||
+		!rootsOK || len(roots) == 0 {
 		return overlayWheel{}, fmt.Errorf("wheel fact is incomplete")
 	}
 	prior := ""
@@ -179,7 +181,31 @@ func wheelFact(doc canonical.Doc, owner string) (overlayWheel, error) {
 		}
 		prior = tag
 	}
+	prior = ""
+	for _, value := range roots {
+		root, ok := value.(string)
+		if !ok || !pythonImportRoot(root) || root <= prior {
+			return overlayWheel{}, fmt.Errorf("wheel import roots are malformed or unsorted")
+		}
+		prior = root
+	}
 	return wheel, nil
+}
+
+func pythonImportRoot(root string) bool {
+	for index, char := range root {
+		if index == 0 {
+			if char != '_' && (char < 'A' || char > 'Z') && (char < 'a' || char > 'z') {
+				return false
+			}
+			continue
+		}
+		if char != '_' && (char < 'A' || char > 'Z') && (char < 'a' || char > 'z') &&
+			(char < '0' || char > '9') {
+			return false
+		}
+	}
+	return root != ""
 }
 
 func validateOverlayReceipt(raw []byte, environmentRef hub.ExactControlDocument, environment canonical.Doc,
@@ -197,7 +223,7 @@ func validateOverlayReceipt(raw []byte, environmentRef hub.ExactControlDocument,
 		"wheelhouse_manifest_digest", "wheels"); err != nil {
 		return fmt.Errorf("resolved wheel set is not closed: %w", err)
 	}
-	if resolved.Str("format") != "ResolvedWheelSet/1" ||
+	if resolved.Str("format") != "ResolvedWheelSet/2" ||
 		resolved.Str("wheelhouse_manifest_digest") != environment.Str("wheelhouse_manifest_digest") {
 		return fmt.Errorf("resolved wheel set disagrees with the selected environment")
 	}

@@ -25,9 +25,10 @@ func TestValidateOverlayReceiptHardcut(t *testing.T) {
 	}
 	project := canonical.Doc{
 		"digest": projectDigest, "distribution": "probe", "filename": "probe-1.0.0-py3-none-any.whl",
-		"length": int64(123), "tags": []canonical.Value{"py3-none-any"}, "version": "1.0.0",
+		"import_roots": []canonical.Value{"probe"}, "length": int64(123),
+		"tags": []canonical.Value{"py3-none-any"}, "version": "1.0.0",
 	}
-	resolved := fmt.Sprintf(`{"format":"ResolvedWheelSet/1","lock_digest":%q,"platform_target":{"accelerator_abi":"cu126","accelerator_backend":"cuda","libc":"glibc2.39","os_arch":"linux/amd64","python_abi":"cp312"},"wheelhouse_manifest_digest":%q,"wheels":[{"digest":%q,"distribution":"addon","filename":"addon-2.0.0-py3-none-any.whl","length":456,"tags":["py3-none-any"],"version":"2.0.0"}]}`,
+	resolved := fmt.Sprintf(`{"format":"ResolvedWheelSet/2","lock_digest":%q,"platform_target":{"accelerator_abi":"cu126","accelerator_backend":"cuda","libc":"glibc2.39","os_arch":"linux/amd64","python_abi":"cp312"},"wheelhouse_manifest_digest":%q,"wheels":[{"digest":%q,"distribution":"addon","filename":"addon-2.0.0-py3-none-any.whl","import_roots":["addon"],"length":456,"tags":["py3-none-any"],"version":"2.0.0"}]}`,
 		lockDigest, baseDigest, customDigest)
 	customRow := fmt.Sprintf(`{"digest":%q,"distribution":"addon","owner":"custom","version":"2.0.0"}`, customDigest)
 	projectRow := fmt.Sprintf(`{"digest":%q,"distribution":"probe","owner":"project","version":"1.0.0"}`, projectDigest)
