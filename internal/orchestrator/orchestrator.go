@@ -83,12 +83,15 @@ type PlacementRevisionSource func(context.Context, *WorkerConnection, string, st
 	DesiredPlacement, uint64, *exit.Error)
 
 type RentalObservation struct {
-	RentalID       string
-	Accelerator    string
-	DeviceCount    int
-	Backend        string
-	WorkerInstance string
-	WorkerBootID   string
+	RentalID               string
+	Accelerator            string
+	DeviceCount            int
+	Backend                string
+	DriverVersion          string
+	BackendVersion         string
+	DeviceMemoryTotalBytes uint64
+	WorkerInstance         string
+	WorkerBootID           string
 }
 
 // Launcher resolves an endpoint ref along the two boundaries #484 split: the

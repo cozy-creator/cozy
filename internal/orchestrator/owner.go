@@ -413,7 +413,9 @@ func (c *Orchestrator) onClaimAck(w *worker, s *session, ack *pb.ClaimAck) *exit
 		if e := c.opt.ObserveRental(RentalObservation{
 			RentalID: w.spec.Connection.RentalID, Accelerator: resources.GetDeviceName(),
 			DeviceCount: int(resources.GetDeviceCount()), Backend: resources.GetBackend(),
-			WorkerInstance: ack.WorkerInstanceId, WorkerBootID: ack.WorkerBootId,
+			DriverVersion: resources.GetDriverVersion(), BackendVersion: resources.GetBackendVersion(),
+			DeviceMemoryTotalBytes: resources.GetDeviceMemoryTotalBytes(),
+			WorkerInstance:         ack.WorkerInstanceId, WorkerBootID: ack.WorkerBootId,
 		}); e != nil {
 			c.refuseClaim(w, e)
 			return e

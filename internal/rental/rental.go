@@ -448,8 +448,9 @@ func PlacementRevisions(st *records.Store, client *hub.Client) orchestrator.Plac
 func ObserveWorker(st *records.Store) func(orchestrator.RentalObservation) *exit.Error {
 	return func(observed orchestrator.RentalObservation) *exit.Error {
 		return st.ObserveRentalWorker(observed.RentalID, observed.Accelerator,
-			observed.Backend, observed.WorkerInstance, observed.WorkerBootID,
-			observed.DeviceCount)
+			observed.Backend, observed.DriverVersion, observed.BackendVersion,
+			observed.DeviceMemoryTotalBytes, observed.WorkerInstance,
+			observed.WorkerBootID, observed.DeviceCount)
 	}
 }
 
