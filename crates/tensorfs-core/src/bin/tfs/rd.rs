@@ -13,7 +13,7 @@ use tensorfs_core::ids::ObjectRef;
 use tensorfs_core::manifest::{Draft, Entry, SnapshotManifest};
 use tensorfs_core::meta::Meta;
 use tensorfs_core::project;
-use tensorfs_core::read::{self, ObjectRange, ReadPlan};
+use tensorfs_core::read::{self, ObjectRange, Order, PlanItem, ReadPlan, Source as ReadSource};
 use tensorfs_core::receipt::Receipts;
 use tensorfs_core::sha256::{self, Sha256};
 use tensorfs_core::store::Store;
@@ -800,6 +800,48 @@ impl Arms {
             }
         }
     }
+
+    fn malformed_plan(&mut self, name: &str, lease: &read::ReadLease, plan: ReadPlan) {
+        let mut destination = vec![0xa5; plan.bytes as usize];
+        let before = destination.clone();
+        match read::execute(lease, &plan, &mut destination, 4) {
+            Err(e) if e.code == Code::RANGE_BOUNDS && destination == before => {
+                self.fired += 1;
+                println!("  FIRED  {name}: RANGE_BOUNDS, destination untouched");
+            }
+            Err(e) if e.code == Code::RANGE_BOUNDS => {
+                self.missed += 1;
+                println!("  WRONG  {name}: RANGE_BOUNDS after mutating the destination");
+            }
+            Err(e) => {
+                self.missed += 1;
+                println!("  WRONG  {name}: wanted RANGE_BOUNDS, got {e}");
+            }
+            Ok(_) => {
+                self.missed += 1;
+                println!("  MISSED {name}: malformed plan SUCCEEDED");
+            }
+        }
+    }
+}
+
+fn inline_plan(items: &[(u64, &[u8])], bytes: u64) -> ReadPlan {
+    ReadPlan {
+        items: items
+            .iter()
+            .enumerate()
+            .map(|(index, (dest_off, value))| PlanItem {
+                what: format!("planted#{index}"),
+                dest_off: *dest_off,
+                len: value.len() as u64,
+                source: ReadSource::Inline(value.to_vec()),
+            })
+            .collect(),
+        bytes,
+        io_bytes: 0,
+        inline_parts: items.len(),
+        order: Order::Destination,
+    }
 }
 
 pub fn cmd_arms(root: &Path, hex: &str) -> ExitCode {
@@ -882,12 +924,71 @@ pub fn cmd_arms(root: &Path, hex: &str) -> ExitCode {
         ),
     );
 
-    // 5. a traversal that does not name every tensor
+    // 5. A public ReadPlan is validated as one exact destination partition before any
+    // reader starts. Gap, overlap, trailing bytes and a span beyond the destination all
+    // refuse typed and leave the caller's sentinel bytes untouched.
+    a.malformed_plan(
+        "construction-order destination gap",
+        &lease,
+        inline_plan(&[(0, b"ab"), (3, b"d")], 4),
+    );
+    a.malformed_plan(
+        "construction-order destination overlap",
+        &lease,
+        inline_plan(&[(0, b"ab"), (1, b"cd")], 4),
+    );
+    a.malformed_plan(
+        "construction-order trailing destination byte",
+        &lease,
+        inline_plan(&[(0, b"abc")], 4),
+    );
+    a.malformed_plan(
+        "construction-order item past destination",
+        &lease,
+        inline_plan(&[(0, b"abcde")], 4),
+    );
+    a.malformed_plan(
+        "construction-order item with unaddressable length",
+        &lease,
+        ReadPlan {
+            items: vec![PlanItem {
+                what: "planted-overflow".to_string(),
+                dest_off: 0,
+                len: u64::MAX,
+                source: ReadSource::Inline(Vec::new()),
+            }],
+            bytes: 0,
+            io_bytes: 0,
+            inline_parts: 1,
+            order: Order::Destination,
+        },
+    );
+
+    let valid = inline_plan(&[(0, b"ab"), (2, b"cd")], 4);
+    let mut valid_destination = vec![0u8; 4];
+    match read::execute(&lease, &valid, &mut valid_destination, 4) {
+        Ok(stats) if valid_destination == b"abcd" && stats.items == 2 => {
+            println!("  GREEN  one issue cursor with concurrent disjoint completions covers abcd")
+        }
+        Ok(stats) => {
+            a.missed += 1;
+            println!(
+                "  MISSED valid disjoint plan: destination {valid_destination:?}, items {}",
+                stats.items
+            );
+        }
+        Err(e) => {
+            a.missed += 1;
+            println!("  MISSED valid disjoint plan refused: {e}");
+        }
+    }
+
+    // 6. a traversal that does not name every tensor
     let mut short = construction_order(&h);
     short.pop();
     a.arm(
         "traversal missing a tensor",
-        Code::TRAVERSAL_INCOMPLETE,
+        Code::TRAVERSAL_ORDER_MISMATCH,
         read::plan_for_traversal(&h, &short, &all_components(&h), 1 << 20),
     );
 
@@ -922,7 +1023,7 @@ pub fn cmd_arms(root: &Path, hex: &str) -> ExitCode {
         holed.pop();
         a.arm(
             "a tensor missing WITHIN a requested component",
-            Code::TRAVERSAL_INCOMPLETE,
+            Code::TRAVERSAL_ORDER_MISMATCH,
             read::plan_for_traversal(&h, &holed, only_one, 1 << 20),
         );
     }
@@ -938,7 +1039,7 @@ pub fn cmd_arms(root: &Path, hex: &str) -> ExitCode {
     }
     a.arm(
         "a tensor from a component the plan did not request",
-        Code::TRAVERSAL_INCOMPLETE,
+        Code::TRAVERSAL_ORDER_MISMATCH,
         read::plan_for_traversal(&h, &smuggled, only_one, 1 << 20),
     );
 

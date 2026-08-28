@@ -649,29 +649,68 @@ pub fn execute(
             ),
         );
     }
+    let destination_len = dest.len() as u64;
     let workers = workers.max(1);
     let t0 = Instant::now();
 
-    // Split the caller's buffer into the plan's disjoint destination spans, in order. Any
-    // overlap or gap is a planner bug and refuses here rather than corrupting a fill.
+    // Split the caller's buffer into the plan's disjoint destination spans, in order. The
+    // public ReadPlan is untrusted input at this boundary: validate every offset and all
+    // arithmetic BEFORE slicing, so a gap, overlap, overflow or trailing byte refuses
+    // typed instead of panicking or leaving caller bytes untouched.
     let mut slices: Vec<(usize, &mut [u8])> = Vec::with_capacity(plan.items.len());
     let mut rest: &mut [u8] = dest;
     let mut cur: u64 = 0;
     for (i, it) in plan.items.iter().enumerate() {
-        if it.dest_off < cur {
+        if it.dest_off != cur {
+            let relation = if it.dest_off < cur {
+                "overlaps"
+            } else {
+                "leaves a gap after"
+            };
             return refuse(
                 Code::RANGE_BOUNDS,
                 format!(
-                    "plan item {i} ({}) starts at {} inside the span ending at {cur}",
-                    it.what, it.dest_off
+                    "plan item {i} ({}) starts at {} and {relation} the current destination end {cur}",
+                    it.what, it.dest_off,
                 ),
             );
         }
-        let (_, r) = rest.split_at_mut((it.dest_off - cur) as usize);
-        let (mine, r2) = r.split_at_mut(it.len as usize);
+        let end = it.dest_off.checked_add(it.len).ok_or(Refusal {
+            code: Code::RANGE_BOUNDS,
+            detail: format!(
+                "plan item {i} ({}) destination {} + length {} overflows",
+                it.what, it.dest_off, it.len
+            ),
+        })?;
+        if end > plan.bytes || end > destination_len {
+            return refuse(
+                Code::RANGE_BOUNDS,
+                format!(
+                    "plan item {i} ({}) ends at {end}, beyond plan {} B / destination {} B",
+                    it.what, plan.bytes, destination_len
+                ),
+            );
+        }
+        let len = usize::try_from(it.len).map_err(|_| Refusal {
+            code: Code::RANGE_BOUNDS,
+            detail: format!(
+                "plan item {i} ({}) length {} does not fit this address space",
+                it.what, it.len
+            ),
+        })?;
+        let (mine, r2) = rest.split_at_mut(len);
         slices.push((i, mine));
         rest = r2;
-        cur = it.dest_off + it.len;
+        cur = end;
+    }
+    if cur != plan.bytes || cur != destination_len {
+        return refuse(
+            Code::RANGE_BOUNDS,
+            format!(
+                "plan destination coverage ends at {cur}, expected plan {} B and destination {} B",
+                plan.bytes, destination_len
+            ),
+        );
     }
 
     let queue = Mutex::new(slices.into_iter());
