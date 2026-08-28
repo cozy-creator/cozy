@@ -11,13 +11,13 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/cozy-creator/cozy-creator-v2/internal/exit"
-	"github.com/cozy-creator/cozy-creator-v2/internal/home"
-	"github.com/cozy-creator/cozy-creator-v2/internal/hub"
-	"github.com/cozy-creator/cozy-creator-v2/internal/records"
-	"github.com/cozy-creator/cozy-creator-v2/internal/render"
-	"github.com/cozy-creator/cozy-creator-v2/internal/rental"
-	"github.com/cozy-creator/cozy-creator-v2/internal/secret"
+	"github.com/cozy-creator/cozy-creator/internal/exit"
+	"github.com/cozy-creator/cozy-creator/internal/home"
+	"github.com/cozy-creator/cozy-creator/internal/hub"
+	"github.com/cozy-creator/cozy-creator/internal/records"
+	"github.com/cozy-creator/cozy-creator/internal/render"
+	"github.com/cozy-creator/cozy-creator/internal/rental"
+	"github.com/cozy-creator/cozy-creator/internal/secret"
 )
 
 // The rental verbs (cl-015). `cozy rent` MINTS the pod's access token, asks the hub for a

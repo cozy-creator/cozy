@@ -7,11 +7,11 @@ import (
 	"io"
 	"strings"
 
-	"github.com/cozy-creator/cozy-creator-v2/internal/config"
-	"github.com/cozy-creator/cozy-creator-v2/internal/exit"
-	"github.com/cozy-creator/cozy-creator-v2/internal/manifest"
-	"github.com/cozy-creator/cozy-creator-v2/internal/render"
-	"github.com/cozy-creator/cozy-creator-v2/internal/service"
+	"github.com/cozy-creator/cozy-creator/internal/config"
+	"github.com/cozy-creator/cozy-creator/internal/exit"
+	"github.com/cozy-creator/cozy-creator/internal/manifest"
+	"github.com/cozy-creator/cozy-creator/internal/render"
+	"github.com/cozy-creator/cozy-creator/internal/service"
 )
 
 // Context is what a handler gets. Handlers never parse argv and never probe the

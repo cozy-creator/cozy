@@ -6,8 +6,8 @@ import (
 	"io"
 	"net/http"
 
-	"github.com/cozy-creator/cozy-creator-v2/internal/exit"
-	"github.com/cozy-creator/cozy-creator-v2/internal/video"
+	"github.com/cozy-creator/cozy-creator/internal/exit"
+	"github.com/cozy-creator/cozy-creator/internal/video"
 )
 
 type VideoController interface {

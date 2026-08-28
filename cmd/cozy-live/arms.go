@@ -8,12 +8,12 @@ import (
 	"sync"
 	"time"
 
-	"github.com/cozy-creator/cozy-creator-v2/internal/canonical"
-	"github.com/cozy-creator/cozy-creator-v2/internal/config"
-	"github.com/cozy-creator/cozy-creator-v2/internal/exit"
-	"github.com/cozy-creator/cozy-creator-v2/internal/orchestrator"
-	"github.com/cozy-creator/cozy-creator-v2/internal/service"
-	pb "github.com/cozy-creator/cozy-creator-v2/protocol/cozy/worker/v1"
+	"github.com/cozy-creator/cozy-creator/internal/canonical"
+	"github.com/cozy-creator/cozy-creator/internal/config"
+	"github.com/cozy-creator/cozy-creator/internal/exit"
+	"github.com/cozy-creator/cozy-creator/internal/orchestrator"
+	"github.com/cozy-creator/cozy-creator/internal/service"
+	pb "github.com/cozy-creator/cozy-creator/protocol/cozy/worker/v1"
 )
 
 // fakeSpec is a worker slot whose process is THIS binary speaking raw protocol. It is a

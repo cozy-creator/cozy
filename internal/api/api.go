@@ -49,12 +49,12 @@ import (
 	"net/http"
 	"strings"
 
-	"github.com/cozy-creator/cozy-creator-v2/internal/config"
-	"github.com/cozy-creator/cozy-creator-v2/internal/exit"
-	"github.com/cozy-creator/cozy-creator-v2/internal/home"
-	"github.com/cozy-creator/cozy-creator-v2/internal/launch"
-	"github.com/cozy-creator/cozy-creator-v2/internal/orchestrator"
-	"github.com/cozy-creator/cozy-creator-v2/internal/records"
+	"github.com/cozy-creator/cozy-creator/internal/config"
+	"github.com/cozy-creator/cozy-creator/internal/exit"
+	"github.com/cozy-creator/cozy-creator/internal/home"
+	"github.com/cozy-creator/cozy-creator/internal/launch"
+	"github.com/cozy-creator/cozy-creator/internal/orchestrator"
+	"github.com/cozy-creator/cozy-creator/internal/records"
 )
 
 // MaxBody caps a submitted request body. Asset bytes never ride JSON: the local extension

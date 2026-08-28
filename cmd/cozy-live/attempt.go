@@ -8,8 +8,8 @@ import (
 	"strings"
 	"time"
 
-	"github.com/cozy-creator/cozy-creator-v2/internal/canonical"
-	pb "github.com/cozy-creator/cozy-creator-v2/protocol/cozy/worker/v1"
+	"github.com/cozy-creator/cozy-creator/internal/canonical"
+	pb "github.com/cozy-creator/cozy-creator/protocol/cozy/worker/v1"
 )
 
 func runOut(name string, args ...string) (string, error) {

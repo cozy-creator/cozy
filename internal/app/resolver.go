@@ -5,12 +5,12 @@ import (
 	"strings"
 	"sync"
 
-	"github.com/cozy-creator/cozy-creator-v2/internal/api"
-	"github.com/cozy-creator/cozy-creator-v2/internal/config"
-	"github.com/cozy-creator/cozy-creator-v2/internal/exit"
-	"github.com/cozy-creator/cozy-creator-v2/internal/launch"
-	"github.com/cozy-creator/cozy-creator-v2/internal/orchestrator"
-	"github.com/cozy-creator/cozy-creator-v2/internal/records"
+	"github.com/cozy-creator/cozy-creator/internal/api"
+	"github.com/cozy-creator/cozy-creator/internal/config"
+	"github.com/cozy-creator/cozy-creator/internal/exit"
+	"github.com/cozy-creator/cozy-creator/internal/launch"
+	"github.com/cozy-creator/cozy-creator/internal/orchestrator"
+	"github.com/cozy-creator/cozy-creator/internal/records"
 )
 
 // The LOCAL module's endpoint resolver: `org/name` -> the spec that makes its worker

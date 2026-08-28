@@ -24,12 +24,12 @@ import (
 	"net/http"
 	"strings"
 
-	"github.com/cozy-creator/cozy-creator-v2/internal/api"
-	"github.com/cozy-creator/cozy-creator-v2/internal/config"
-	"github.com/cozy-creator/cozy-creator-v2/internal/exit"
-	"github.com/cozy-creator/cozy-creator-v2/internal/home"
-	"github.com/cozy-creator/cozy-creator-v2/internal/secret"
-	"github.com/cozy-creator/cozy-creator-v2/internal/service"
+	"github.com/cozy-creator/cozy-creator/internal/api"
+	"github.com/cozy-creator/cozy-creator/internal/config"
+	"github.com/cozy-creator/cozy-creator/internal/exit"
+	"github.com/cozy-creator/cozy-creator/internal/home"
+	"github.com/cozy-creator/cozy-creator/internal/secret"
+	"github.com/cozy-creator/cozy-creator/internal/service"
 )
 
 // Client is one CLI process's connection to the running LocalService.

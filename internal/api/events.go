@@ -7,8 +7,8 @@ import (
 	"strconv"
 	"time"
 
-	"github.com/cozy-creator/cozy-creator-v2/internal/orchestrator"
-	"github.com/cozy-creator/cozy-creator-v2/internal/records"
+	"github.com/cozy-creator/cozy-creator/internal/orchestrator"
+	"github.com/cozy-creator/cozy-creator/internal/records"
 )
 
 // The SSE plane. Two routes over ONE event model:

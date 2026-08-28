@@ -12,7 +12,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/cozy-creator/cozy-creator-v2/internal/home"
+	"github.com/cozy-creator/cozy-creator/internal/home"
 )
 
 // cl-003's M4 proof: an SDXL-CLASS ENDPOINT SERVES LOCALLY, through the product.

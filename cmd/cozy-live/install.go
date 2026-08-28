@@ -10,7 +10,7 @@ import (
 	"strings"
 	"syscall"
 
-	"github.com/cozy-creator/cozy-creator-v2/internal/config"
+	"github.com/cozy-creator/cozy-creator/internal/config"
 )
 
 // installEndpoint puts the SDXL endpoint on a service root THE WAY A USER DOES: one

@@ -9,7 +9,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/cozy-creator/cozy-creator-v2/internal/exit"
+	"github.com/cozy-creator/cozy-creator/internal/exit"
 )
 
 // The orchestrator's half of the ONE lifecycle authority (cl-001). Worker processes,

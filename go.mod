@@ -1,4 +1,4 @@
-module github.com/cozy-creator/cozy-creator-v2
+module github.com/cozy-creator/cozy-creator
 
 go 1.26
 

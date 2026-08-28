@@ -16,16 +16,16 @@ import (
 	"runtime"
 	"sort"
 
-	"github.com/cozy-creator/cozy-creator-v2/internal/exit"
-	"github.com/cozy-creator/cozy-creator-v2/internal/home"
-	"github.com/cozy-creator/cozy-creator-v2/internal/hub"
-	"github.com/cozy-creator/cozy-creator-v2/internal/launch"
-	"github.com/cozy-creator/cozy-creator-v2/internal/media"
-	"github.com/cozy-creator/cozy-creator-v2/internal/orchestrator"
-	"github.com/cozy-creator/cozy-creator-v2/internal/records"
-	"github.com/cozy-creator/cozy-creator-v2/internal/remotecontrol"
-	"github.com/cozy-creator/cozy-creator-v2/internal/rentalid"
-	"github.com/cozy-creator/cozy-creator-v2/internal/secret"
+	"github.com/cozy-creator/cozy-creator/internal/exit"
+	"github.com/cozy-creator/cozy-creator/internal/home"
+	"github.com/cozy-creator/cozy-creator/internal/hub"
+	"github.com/cozy-creator/cozy-creator/internal/launch"
+	"github.com/cozy-creator/cozy-creator/internal/media"
+	"github.com/cozy-creator/cozy-creator/internal/orchestrator"
+	"github.com/cozy-creator/cozy-creator/internal/records"
+	"github.com/cozy-creator/cozy-creator/internal/remotecontrol"
+	"github.com/cozy-creator/cozy-creator/internal/rentalid"
+	"github.com/cozy-creator/cozy-creator/internal/secret"
 )
 
 func validID(id string) *exit.Error {

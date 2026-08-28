@@ -1,6 +1,6 @@
 package api
 
-import "github.com/cozy-creator/cozy-creator-v2/internal/manifest"
+import "github.com/cozy-creator/cozy-creator/internal/manifest"
 
 // The route table is DATA, and it is the same kind of object cl-002 made the CLI surface:
 // one declarative registry that drives dispatch, the capability tokens, and the contract

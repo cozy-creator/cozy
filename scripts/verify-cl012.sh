@@ -13,7 +13,7 @@ set -uo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT"
 
-PG_NAME=cozy-creator-v2-cl012
+PG_NAME=cozy-creator-cl012
 PG_PORT=55471
 PG_PASS=verify
 DB_URL="postgres://postgres:${PG_PASS}@127.0.0.1:${PG_PORT}/postgres?sslmode=disable"

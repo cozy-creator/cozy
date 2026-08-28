@@ -22,8 +22,8 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/cozy-creator/cozy-creator-v2/internal/hub"
-	"github.com/cozy-creator/cozy-creator-v2/internal/workertls"
+	"github.com/cozy-creator/cozy-creator/internal/hub"
+	"github.com/cozy-creator/cozy-creator/internal/workertls"
 )
 
 // podHub is the SECOND independent implementation of the hub's rental contract (cl-015),

@@ -3,7 +3,7 @@ package wheel
 import (
 	"strings"
 
-	"github.com/cozy-creator/cozy-creator-v2/internal/exit"
+	"github.com/cozy-creator/cozy-creator/internal/exit"
 )
 
 // A deliberately SMALL TOML reader: strings and string arrays, in the three tables the

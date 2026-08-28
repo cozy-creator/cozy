@@ -11,7 +11,7 @@ import (
 	"runtime"
 	"strings"
 
-	"github.com/cozy-creator/cozy-creator-v2/internal/exit"
+	"github.com/cozy-creator/cozy-creator/internal/exit"
 )
 
 // Layout is the resolved set of paths every cl-009 verb works against.

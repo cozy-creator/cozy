@@ -11,7 +11,7 @@ import (
 	"sort"
 	"strings"
 
-	"github.com/cozy-creator/cozy-creator-v2/internal/exit"
+	"github.com/cozy-creator/cozy-creator/internal/exit"
 )
 
 // MaxTreeBytes caps what one endpoint project may become. An endpoint's wheel is CODE and

@@ -8,13 +8,13 @@ import (
 	"strconv"
 	"strings"
 
-	"github.com/cozy-creator/cozy-creator-v2/internal/exit"
-	"github.com/cozy-creator/cozy-creator-v2/internal/home"
-	"github.com/cozy-creator/cozy-creator-v2/internal/hub"
-	"github.com/cozy-creator/cozy-creator-v2/internal/render"
-	"github.com/cozy-creator/cozy-creator-v2/internal/secret"
-	"github.com/cozy-creator/cozy-creator-v2/internal/tfs"
-	"github.com/cozy-creator/cozy-creator-v2/internal/transfer"
+	"github.com/cozy-creator/cozy-creator/internal/exit"
+	"github.com/cozy-creator/cozy-creator/internal/home"
+	"github.com/cozy-creator/cozy-creator/internal/hub"
+	"github.com/cozy-creator/cozy-creator/internal/render"
+	"github.com/cozy-creator/cozy-creator/internal/secret"
+	"github.com/cozy-creator/cozy-creator/internal/tfs"
+	"github.com/cozy-creator/cozy-creator/internal/transfer"
 )
 
 // The transfer verbs (cl-012). `push` is th-002's declare-first protocol driven from
