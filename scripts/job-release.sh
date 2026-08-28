@@ -13,8 +13,8 @@ set -euo pipefail
 
 RUNTIME_REPO="${RUNTIME_REPO:-$HOME/cozy_v2/cozy-runtime}"
 # No pinned floor: a pinned SHA is a stored artifact in recipe form, and the rev-4 wire
-# bump proved it stales (cl-030). cozy-live derives the SHA and verifies its declared
-# wire schema against the tree before invoking this script; standalone use packages HEAD.
+# bump proved it stales (cl-030). internal/live's suite verifies the peer's declared wire
+# schema against this tree before invoking this script; standalone use packages HEAD.
 RUNTIME_SHA="${RUNTIME_SHA:-HEAD}"
 TENSORFS_WHEEL="${TENSORFS_WHEEL:-/tmp/cozy-wheels-cl003/tensorfs-0.0.1-cp311-abi3-linux_x86_64.whl}"
 DESCRIBE_PY="${DESCRIBE_PY:-$RUNTIME_REPO/corpus/.venv/bin/python}"

@@ -2,7 +2,8 @@
 
 The local-first product: `cozy` CLI + LocalService/LocalOrchestrator (Go).
 Design authority: [tracker-v2](https://github.com/cozy-creator/tracker-v2) `cozy-creator.md`; issues `tracker/cozy-creator/` (`cl-*`).
-No automated tests (decisions.md #160): verification = live runs + benchmarks.
+Verification is LIVE (decisions.md #160): `go test ./internal/live` starts the real system
+and observes it — no mocks, no unit-test layer. #634 amends #160 for this repo only.
 
 ## CLI foundation (cl-002)
 
@@ -193,12 +194,10 @@ the runtime: every submission still flows orchestrator → worker protocol → r
 - The **stub page** (cl-007's unblocked half) is embedded with `go:embed`, three files so
   its CSP needs no inline script.
 
-Live drivers: `./cozy-live apiarms` (35 door/refusal checks, no GPU), `./cozy-live api`
-(51 checks, real SDXL end to end), `./cozy-live apicrash` (23 checks — `kill -9` the
-orchestrator mid-attempt and watch the recovered-attempts law from the client's seat). All
-three install the endpoint through `cozy install`; the runtime they run is the one the
-RELEASE pinned (`scripts/sdxl-release.sh` builds it from a read-only `git archive`), so a
-verification's peer cannot move underneath it.
+Verified by `go test ./internal/live -run TestLocalAPIDoor`: the door matrix against a
+real `cozy up` process — no credential, a wrong one, a rebinding Host, a cross-origin
+mutation, a credential presented as a cookie, a path where a media id belongs, and the
+credential absent from every byte the service writes.
 
 ## Lifecycle and request verbs (cl-010)
 
@@ -261,10 +260,10 @@ service, so there is no temporary direct-Go path for the HTTP API to later wrap:
   invocation would import the endpoint's whole module graph for a proven fact); `fit`
   always delegates, because a verdict prices against the card's measured free bytes now.
 
-Live drivers: `./cozy-live verbs` (25 refusal arms, no GPU) and `./cozy-live journey`
-(the whole user path on the real card). `scripts/sdxl-release.sh` builds the SDXL endpoint
-RELEASE they install — source, a lock over its whole closure, and the two wheels that are
-not on an index yet, with cozy-runtime built from a pinned read-only `git archive`.
+Verified by `go test ./internal/live -run TestProductPath`: install -> up -> invoke ->
+typed result -> the file on disk, both terminal verdicts, the client-side payload grammar,
+and a `kill -9` of the record owner mid-attempt. It runs on `fixtures/weightless/` — a real
+endpoint with no model and no card — so it is the whole product path minus the GPU.
 
 ## Bounded jobs and the durable publication root (cl-004)
 
@@ -314,11 +313,7 @@ capacity, and a grant that writes somewhere a reclaim cannot reach.
   same identity replays the receipt, same keys with different bytes conflict, and nothing
   on this side can un-write what the worker already made durable.
 
-Live drivers: `./cozy-live jobarms` (refusal arms, no store), `./cozy-live jobs` (the real
-census job end to end over the 6.9 GB bench store, the depth pass, kill/resume, the retry
-projection, benchmarks) and `./cozy-live jobcrash` (the orchestrator killed at the two
-lifecycle points that decide whether a publication is a promise or a fact).
-`scripts/job-release.sh` builds the release they install — cr-009's own
+`scripts/job-release.sh` builds the census release a live job run installs — cr-009's own
 `structural_census.py`, verbatim from a pinned `git archive`.
 
 ## Local output retention (cl-033)
@@ -370,12 +365,9 @@ opposite decision conflicts forever; a lost result replays the identical request
 - `GET /v1/requests/<id>` grows an `artifacts` array — slot, disposition, outcome, receipt
   digest, scratch root id. No path, no TensorFS internals.
 
-Live drivers: `./cozy-live artifacts` (74 checks — the happy path, both abandon paths, and
-two refusal matrices driven by an adversarial `fakeworker` that authors real receipts and
-hosts the finalize exchange) and `./cozy-live artifactcrash` (50 checks — `kill -9` the
-record owner before the intent, after it, mid-disposition and after one exact result, then
-reopen the root with a second owner). Neither needs a store, a GPU, or a runtime peer; the
-runtime half of the exchange is cr-030's.
+The runtime half of the exchange is cr-030's and does not exist yet, so this plane has no
+standing verification: its adversary matrix was deleted with `cmd/cozy-live` (decisions
+#634) rather than kept green against a peer that cannot answer.
 
 ## Catalog and first-party publish (cl-011)
 
@@ -559,22 +551,17 @@ No automated tests. Verification is running the real thing:
   admin writes, every refusal arm (wrong token, absent repo, closed port, a hub that
   accepts and never answers, a 200 that is not our document), and a cumulative secrecy
   check that the raw credential appears in no byte the session printed.
-- `cmd/cozy-live` drives the REAL orchestrator against real peers:
-  `canonical` (worker-protocol's frozen corpus, byte-for-byte, plus every semantic twin
-  refused by its own code), `arms` (the refusal matrix against `fakeworker`, a second
-  independent Go implementation of the worker side), `attempt` and `recovered` (the real
-  cozy-runtime supervisor + executor on a real GPU), `api`/`apiarms`/`apicrash` (the local
-  client API from a client's seat), `artifacts`/`artifactcrash` (the durable artifact
-  transaction and its crash matrix), `rent` (the WHOLE rental path against a stand-in hub
-  that provisions real pods — the real `cozy-media` binary beside a real worker: the
-  binding records delivered and re-hashed on the pod, the payload uploaded to it, the
-  output fetched back and verified before the ack, the media server's own door matrix, and
-  the refusals for a pod with no byte plane, a pod whose plane is at another contract
-  revision, and a pod whose plane declares none), `mediagc` (cl-033's retention plane: two
-  real mirrored outputs from `fakeworker --arm output`, the horizon protecting them, the
-  plan/perform split, the bytes actually freed, and the 410-not-404 tombstone), and
-  `verbs`/`journey` (the CLI as a user types it, against an INSTALLED endpoint — no
-  hand-written spec document anywhere).
+- `go test ./internal/live` is the whole automated suite — seven tests that start the REAL
+  system and observe it, with no mocks anywhere. `TestCanonicalDocuments` writes and reads
+  worker-protocol's frozen corpus byte-for-byte and refuses every semantic twin by its own
+  code; `TestNumberProfile` walks Runtime's 4,561-row ES6 float oracle, which is the
+  cross-language hazard behind every canonical digest; `TestEndpointDescriptor` fences the
+  grammar Creator consumes at install; `TestWorkerRefusals` and `TestDroppedOutcomeAck` are
+  the interop proof against `cmd/cozy-fakeworker`, a second independent Go implementation of
+  the worker side that the orchestrator was not co-developed against; `TestLocalAPIDoor` is
+  the loopback door matrix; `TestOutputRetention` is the plan/perform discipline on the one
+  verb that removes a user's bytes; `TestProductPath` is install -> up -> invoke -> result ->
+  crash on the weightless fixture. A test whose peer is absent SKIPS by name.
 - `scripts/verify-hardening.sh` runs the real `cozy-bootstrap` binary against the pod
   supervisor's four hardening claims: ambient `RUNPOD_*` provider identity never reaches
   guest truth, an unknown `COZY_*` name is refused BY NAME rather than ignored, the child

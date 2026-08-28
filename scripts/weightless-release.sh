@@ -17,8 +17,8 @@ set -euo pipefail
 
 RUNTIME_REPO="${RUNTIME_REPO:-$HOME/cozy_v2/cozy-runtime}"
 # No pinned floor: a pinned SHA is a stored artifact in recipe form, and the rev-4 wire
-# bump proved it stales (cl-030). cozy-live derives the SHA and verifies its declared
-# wire schema against the tree before invoking this script; standalone use packages HEAD.
+# bump proved it stales (cl-030). internal/live's suite verifies the peer's declared wire
+# schema against this tree before invoking this script; standalone use packages HEAD.
 RUNTIME_SHA="${RUNTIME_SHA:-HEAD}"
 OUT="${OUT:-$HOME/.cache/cozy/cl-013}"
 VERSION="${VERSION:-1.0.0}"

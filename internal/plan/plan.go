@@ -19,7 +19,7 @@
 //     the identity because it is a fact about a machine, not about a plan.
 //
 // The consequence that had to become true: two machines installing the same release
-// compute the same id. `cozy-live rent` proves it against two independent roots.
+// compute the same id.
 package plan
 
 import (

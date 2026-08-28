@@ -291,11 +291,13 @@ PY_ALLOW = {
                             "parsed or composed",
 }
 
-# (cl-028) The verification driver is the ONE place an //cozy:allow door may exempt a
-# listen or a runtime indirection: it hosts adversaries and stand-ins by design. Product
-# code gets no door for either — a doored non-loopback bind in the product would be the
-# LAN door arriving as a comment.
-DRIVER_DIR = "cmd/cozy-live/"
+# (cl-028) The VERIFICATION HOMES are the only places an //cozy:allow door may exempt a
+# listen or a runtime indirection: `internal/live` is the go-test suite and
+# `cmd/cozy-fakeworker` is the adversary peer it spawns, and both bind sockets by design.
+# Product code gets no door for either — a doored non-loopback bind in the product would be
+# the LAN door arriving as a comment.
+DRIVER_DIRS = ("internal/live/", "cmd/cozy-fakeworker/")
+DRIVER_DIR = " / ".join(DRIVER_DIRS)
 
 IDENT = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
 
@@ -422,7 +424,6 @@ DOCUMENT_KINDS = {
     # rental boundary, which is the worst place to discover a renamed constant.
     "cozy.client.JobSubmission/1": "internal/api/jobs.go",
     "cozy.client.Submission/1": "internal/api/requests.go",
-    "cozy.jobs.StructuralCensus/1": "cmd/cozy-live/joblive.go",
     "cozy.local.EntrypointBindingRecord/2": "internal/plan/plan.go",
     "cozy.local.EvaluatedConfig/1": "internal/app/identity.go",
     "cozy.local.ExecutionEnvironment/1": "internal/app/identity.go",
@@ -438,7 +439,7 @@ DOCUMENT_KINDS = {
 # Kinds another repo authors and this one only reads: the owner's fence polices the name.
 FOREIGN_KIND_PREFIXES = ("cozy.worker.v1.", "cozy.endpoint.", "cozy.runtime.", "tensorhub.",
                          "tensorfs.", "cozytensors")
-KIND_READERS = {"cozy.workflow.Plan/1": {"cmd/cozy-live/workflows.go"}}
+KIND_READERS: dict[str, set[str]] = {}
 # No trailing quote: a domain-separation tag is a PREFIX inside a longer literal — it ends
 # in `\x00` or `\n`, and requiring the close quote made both of this repo's tags invisible
 # to the registry that exists to hold exactly this class of cross-repo agreed name.
@@ -574,14 +575,14 @@ def check_sources():
                                f"ceremony is a recorded decision, not a quiet import: {line.strip()}")
             # The door is honored ONLY in the verification driver (cl-028): a doored bind
             # in product code would be the LAN door arriving as a comment.
-            listen_doored = ALLOW_DOOR in src_line and rel.startswith(DRIVER_DIR)
+            listen_doored = ALLOW_DOOR in src_line and rel.startswith(DRIVER_DIRS)
             if rel not in LISTEN_SITES and LISTEN_CALL.search(line) and not listen_doored:
                 bad.append(f"{p}:{i}: [api] net.Listen outside {LISTEN_SITE} — one bind site "
                            f"per program, each with its own stated rule. The owner's LAN door is "
                            f"deferred behind TLS and its own threat review, never a second listener "
                            f"(only {DRIVER_DIR} may door one): {line.strip()}")
             if not rel.startswith(RUNTIME_INDIRECT_HOME) and RUNTIME_INDIRECT.search(line) and \
-                    not (ALLOW_DOOR in src_line and rel.startswith(DRIVER_DIR)):
+                    not (ALLOW_DOOR in src_line and rel.startswith(DRIVER_DIRS)):
                 bad.append(f"{p}:{i}: [runtime] launch.Binary()/launch.RuntimeCLI outside "
                            f"{RUNTIME_INDIRECT_HOME} — the same second execution door as the "
                            f"\"cozy-runtime\" literal, reached by indirection; only "

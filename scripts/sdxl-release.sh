@@ -27,8 +27,8 @@ set -euo pipefail
 
 RUNTIME_REPO="${RUNTIME_REPO:-$HOME/cozy_v2/cozy-runtime}"
 # No pinned floor: a pinned SHA is a stored artifact in recipe form, and the rev-4 wire
-# bump proved it stales (cl-030). cozy-live derives the SHA and verifies its declared
-# wire schema against the tree before invoking this script; standalone use packages HEAD.
+# bump proved it stales (cl-030). internal/live's suite verifies the peer's declared wire
+# schema against this tree before invoking this script; standalone use packages HEAD.
 RUNTIME_SHA="${RUNTIME_SHA:-HEAD}"
 # tfs-007's compiled facade, built from a PINNED read-only `git archive` of tensorfs
 # 846532c. The wheel is not incidental: cozytensors' ENCODING REGISTRY ships inside it, so
