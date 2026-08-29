@@ -135,7 +135,7 @@ CORS_HEADER = re.compile(r"Access-Control-Allow-", re.I)
 # (#628, owner ruling 2026-08-27) Inside the owner's loopback API the no-CORS
 # rule is absolute: that surface is the DNS-rebinding target.
 CORS_ABSOLUTE = "internal/api/"
-# The Creator binary binds once, on loopback, for its local client API.
+# The Cozy binary binds once, on loopback, for its local client API.
 LISTEN_SITES = {
     "internal/api/listen.go": "the owner's local client API — loopback only",
 }
@@ -145,7 +145,7 @@ LISTEN_SITE = " / ".join(sorted(LISTEN_SITES))
 # ListenTCP bind is the same second door.
 LISTEN_CALL = re.compile(r"net\.Listen\w*\s*\(")
 
-# (cl-031) Creator has one declaration of the media contract it expects.
+# (cl-031) Cozy has one declaration of the media contract it expects.
 # Tensorhub's independently shipped server declares its own revision; the live
 # health handshake refuses skew before this client moves bytes.
 MEDIA_CONTRACT_HOME = "internal/mediawire/wire.go"
@@ -707,7 +707,7 @@ def parse_go_routes(path: pathlib.Path):
 
 
 def check_contract():
-    """The route table and Creator's contract document expose the same route inventory.
+    """The route table and Cozy's contract document expose the same route inventory.
 
     This fence checks method, path, scope, and order. Payload and behavior conformance are
     separate tests; passing this check makes no claim about unimplemented external hosts.

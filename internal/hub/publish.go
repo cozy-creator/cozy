@@ -12,7 +12,7 @@ import (
 	"net/http"
 	"net/url"
 
-	"github.com/cozy-creator/cozy-creator/internal/exit"
+	"github.com/cozy-creator/cozy/internal/exit"
 )
 
 // Object is one known ObjectRef transfer identity and its length.
@@ -39,7 +39,7 @@ type Session struct {
 	ExpiresAt       string `json:"expires_at"`
 }
 
-// Totals is Creator's accounting over the exact transfer rows Tensorhub returned.
+// Totals is Cozy's accounting over the exact transfer rows Tensorhub returned.
 type Totals struct {
 	DeclaredObjects int   `json:"declared_objects"`
 	DeclaredBytes   int64 `json:"declared_bytes"`
@@ -337,7 +337,7 @@ type Read struct {
 }
 
 // Reads asks Tensorhub's live typed model route for download authorization over the
-// named objects of one installed checkpoint. Creator never constructs a bucket URL or
+// named objects of one installed checkpoint. Cozy never constructs a bucket URL or
 // reaches storage with credentials of its own.
 func (c *Client) Reads(ctx context.Context, ref Ref, snapshot string, ids []string) ([]Read, *exit.Error) {
 	var out struct {

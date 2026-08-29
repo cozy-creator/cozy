@@ -8,7 +8,7 @@ import (
 
 	"google.golang.org/protobuf/proto"
 
-	pb "github.com/cozy-creator/cozy-creator/protocol/cozy/worker/v1"
+	pb "github.com/cozy-creator/cozy/protocol/cozy/worker/v1"
 )
 
 // Read turns exact canonical bytes into a typed document. It refuses everything the

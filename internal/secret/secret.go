@@ -93,7 +93,7 @@ func FileBody(v Value) []byte { return []byte(v.raw + "\n") }
 // HashHex is the WIRE CARRIER: the bare 64 lowercase hex of a credential's sha256, with
 // no `sha256:` prefix.
 //
-// Tensorhub receives this value and gives it to the pod-side verifier. Creator
+// Tensorhub receives this value and gives it to the pod-side verifier. Cozy
 // never needs the verifier's prefixed spelling or comparison implementation.
 func HashHex(v Value) string {
 	if v.raw == "" {

@@ -8,8 +8,8 @@ import (
 	"sort"
 	"strings"
 
-	"github.com/cozy-creator/cozy-creator/internal/exit"
-	"github.com/cozy-creator/cozy-creator/internal/wheel"
+	"github.com/cozy-creator/cozy/internal/exit"
+	"github.com/cozy-creator/cozy/internal/wheel"
 )
 
 const MaxSourceBytes int64 = 512 << 20

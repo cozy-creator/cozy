@@ -6,11 +6,11 @@ import (
 	"path/filepath"
 	"strings"
 
-	"github.com/cozy-creator/cozy-creator/internal/canonical"
-	"github.com/cozy-creator/cozy-creator/internal/exit"
-	"github.com/cozy-creator/cozy-creator/internal/home"
-	"github.com/cozy-creator/cozy-creator/internal/records"
-	pb "github.com/cozy-creator/cozy-creator/protocol/cozy/worker/v1"
+	"github.com/cozy-creator/cozy/internal/canonical"
+	"github.com/cozy-creator/cozy/internal/exit"
+	"github.com/cozy-creator/cozy/internal/home"
+	"github.com/cozy-creator/cozy/internal/records"
+	pb "github.com/cozy-creator/cozy/protocol/cozy/worker/v1"
 )
 
 // THE JOB BRANCH (cl-004). A job is an ATTEMPT CLASS on this one orchestrator, not a

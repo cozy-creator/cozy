@@ -10,8 +10,8 @@ import (
 	"path/filepath"
 	"strings"
 
-	"github.com/cozy-creator/cozy-creator/internal/exit"
-	"github.com/cozy-creator/cozy-creator/internal/home"
+	"github.com/cozy-creator/cozy/internal/exit"
+	"github.com/cozy-creator/cozy/internal/home"
 )
 
 const MaxBytes int64 = 64 << 20

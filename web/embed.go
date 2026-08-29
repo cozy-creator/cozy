@@ -1,4 +1,4 @@
-// Package web embeds the localhost frontend shipped with Cozy Creator.
+// Package web embeds the localhost frontend shipped with Cozy.
 package web
 
 import (

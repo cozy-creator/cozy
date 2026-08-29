@@ -6,10 +6,10 @@ package api
 //
 // The split this file exists to make VISIBLE:
 //
-//	Core  — Creator's implemented request-level API and the proposed common core for
+//	Core  — Cozy's implemented request-level API and the proposed common core for
 //	        future servers. Cross-host parity requires conformance proof; it is not
 //	        asserted by this registry.
-//	Local — the Creator-only extension module: jobs, rentals, lifecycle, uploads, and
+//	Local — the Cozy-only extension module: jobs, rentals, lifecycle, uploads, and
 //	        localhost web assets. Its URL mount makes
 //	        that boundary visible in the URL.
 
@@ -42,7 +42,7 @@ type Route struct {
 
 // Routes is THE surface. Order is the document's order.
 var Routes = []Route{
-	// ---- Creator's implemented request-level CORE ----
+	// ---- Cozy's implemented request-level CORE ----
 	{"POST", "/v1/requests", Core, true, true, false, "Idempotency-Key",
 		"submit one request; 202 with the request handle",
 		"`cozy invoke run`"},

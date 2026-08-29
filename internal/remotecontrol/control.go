@@ -1,5 +1,5 @@
 // Package remotecontrol validates Tensorhub's persisted acquisition-attempt
-// control snapshot and projects only the facts Creator needs to own the remote
+// control snapshot and projects only the facts Cozy needs to own the remote
 // worker. It never reads a local install, invokes Runtime, or re-renders a plan.
 package remotecontrol
 
@@ -14,12 +14,12 @@ import (
 	"strconv"
 	"strings"
 
-	"github.com/cozy-creator/cozy-creator/internal/canonical"
-	"github.com/cozy-creator/cozy-creator/internal/exit"
-	"github.com/cozy-creator/cozy-creator/internal/hub"
-	"github.com/cozy-creator/cozy-creator/internal/launch"
-	"github.com/cozy-creator/cozy-creator/internal/orchestrator"
-	pb "github.com/cozy-creator/cozy-creator/protocol/cozy/worker/v1"
+	"github.com/cozy-creator/cozy/internal/canonical"
+	"github.com/cozy-creator/cozy/internal/exit"
+	"github.com/cozy-creator/cozy/internal/hub"
+	"github.com/cozy-creator/cozy/internal/launch"
+	"github.com/cozy-creator/cozy/internal/orchestrator"
+	pb "github.com/cozy-creator/cozy/protocol/cozy/worker/v1"
 )
 
 const (
@@ -83,7 +83,7 @@ func validateExact(name string, document hub.ExactControlDocument) *exit.Error {
 
 func invalid(format string, args ...any) *exit.Error {
 	return exit.Named(exit.Conflict, "rental.control_snapshot_invalid", format, args...).
-		WithRemedy("release this rental; Creator will not rebuild remote control truth from a local install")
+		WithRemedy("release this rental; Cozy will not rebuild remote control truth from a local install")
 }
 
 func decodeSnapshot(exact hub.ExactControlDocument) (snapshot, *exit.Error) {

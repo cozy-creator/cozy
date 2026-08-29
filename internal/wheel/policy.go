@@ -5,7 +5,7 @@ import (
 	"regexp"
 	"strings"
 
-	"github.com/cozy-creator/cozy-creator/internal/exit"
+	"github.com/cozy-creator/cozy/internal/exit"
 )
 
 var (

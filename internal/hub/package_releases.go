@@ -8,7 +8,7 @@ import (
 	"net/http"
 	"net/url"
 
-	"github.com/cozy-creator/cozy-creator/internal/exit"
+	"github.com/cozy-creator/cozy/internal/exit"
 )
 
 type ObjectRef struct {

@@ -5,7 +5,7 @@
 // revision). Issue: tracker/tensorhub/th-024.
 //
 // ORIENTATION: the WORKER (cozy-runtime's torch-free machine control process) HOSTS this
-// service; the RECORDOWNER (cozy-creator's embedded orchestrator, a pod's PodRecordOwner, or a
+// service; the RECORDOWNER (the Cozy daemon, a pod's PodRecordOwner, or a
 // tensorhub orchestrator-shard via th-007) DIALS it. The orientation is IDENTICAL local and
 // remote; only channel establishment differs: a Unix socket (Windows: loopback) co-resident,
 // TLS over a private network or authenticated overlay remotely. A worker control port is NEVER
@@ -788,14 +788,14 @@ type ClaimRejection int32
 
 const (
 	ClaimRejection_CLAIM_REJECTION_UNSPECIFIED              ClaimRejection = 0
-	ClaimRejection_CLAIM_REJECTION_UNAUTHENTICATED          ClaimRejection = 1
+	ClaimRejection_CLAIM_REJECTION_UNAUTHENTICATED          ClaimRejection = 1 // proof failure; checked before readiness/state
 	ClaimRejection_CLAIM_REJECTION_STALE_RECORD_OWNER_EPOCH ClaimRejection = 2 // epoch older than the accepted claim
 	ClaimRejection_CLAIM_REJECTION_EPOCH_HELD               ClaimRejection = 3 // equal epoch, different record_owner_id
 	ClaimRejection_CLAIM_REJECTION_WORKER_ID_MISMATCH       ClaimRejection = 4
 	ClaimRejection_CLAIM_REJECTION_RELEASE_ID_MISMATCH      ClaimRejection = 5
-	// #507d: the worker cannot establish a durable journal, so it cannot honour journal-before-send
-	// and must not accept the stream. The frozen wire could only route this to
-	// BootFailure(DISK_SHAPE) — representable and true, but less direct.
+	// The worker cannot yet promise durable ownership: either its journal is unavailable or its
+	// post-bind readiness barrier is still closed. In both cases no ownership state changes and an
+	// authenticated caller may retry. BootFailure(DISK_SHAPE) remains the boot-fatal form.
 	ClaimRejection_CLAIM_REJECTION_UNDURABLE ClaimRejection = 7
 )
 
@@ -1703,7 +1703,10 @@ func (x *Claim) GetProof() []byte {
 	return nil
 }
 
-// Claim acceptance: the worker fences the previous stream (if any), increments
+// Claim proof is evaluated before readiness or ownership mutation. A bad proof answers
+// UNAUTHENTICATED even before ready. A valid proof while the worker's post-bind readiness barrier
+// is closed answers UNDURABLE without minting a control_stream_generation. On acceptance the
+// worker fences the previous stream (if any), increments
 // control_stream_generation, and answers with its identity + one WorkerSnapshot. DISPATCH STAYS
 // CLOSED until the RecordOwner's SnapshotAck (02 §6) — admission_state reports CLOSED until then.
 type ClaimAck struct {
@@ -3628,7 +3631,7 @@ func (x *PlacementStatus) GetAcquisition() *PlacementAcquisitionObservation {
 	return nil
 }
 
-// Creator-visible proof of concurrent package/model acquisition and cache reuse. Both legs use
+// Cozy-visible proof of concurrent package/model acquisition and cache reuse. Both legs use
 // one process-relative monotonic clock and therefore one origin; they reset with the worker
 // process and MUST NOT be compared across worker_boot_id. A leg is absent before it starts. Once
 // present its start is non-zero, counters are cumulative and never decrease, and end is zero

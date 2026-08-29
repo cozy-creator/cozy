@@ -14,14 +14,14 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/cozy-creator/cozy-creator/internal/canonical"
-	"github.com/cozy-creator/cozy-creator/internal/exit"
-	"github.com/cozy-creator/cozy-creator/internal/inputasset"
-	"github.com/cozy-creator/cozy-creator/internal/media"
-	"github.com/cozy-creator/cozy-creator/internal/plan"
-	"github.com/cozy-creator/cozy-creator/internal/records"
-	"github.com/cozy-creator/cozy-creator/internal/secret"
-	pb "github.com/cozy-creator/cozy-creator/protocol/cozy/worker/v1"
+	"github.com/cozy-creator/cozy/internal/canonical"
+	"github.com/cozy-creator/cozy/internal/exit"
+	"github.com/cozy-creator/cozy/internal/inputasset"
+	"github.com/cozy-creator/cozy/internal/media"
+	"github.com/cozy-creator/cozy/internal/plan"
+	"github.com/cozy-creator/cozy/internal/records"
+	"github.com/cozy-creator/cozy/internal/secret"
+	pb "github.com/cozy-creator/cozy/protocol/cozy/worker/v1"
 )
 
 // Binding is the record owner's resolution of one `entrypoint_binding_plan_id`. For a
@@ -51,7 +51,7 @@ type Binding struct {
 // BindingPlanSubject is the wire identity of one canonical plan document.
 // Runtime-owned and remote plans both carry identity only. Local Runtime stages its
 // private plan; a rented worker obtains the exact bytes as an ordinary ArtifactGrant
-// subject. Creator validates remote plan bytes in the control snapshot but never relays
+// subject. Cozy validates remote plan bytes in the control snapshot but never relays
 // them through an alternate byte path.
 type BindingPlanSubject struct {
 	SubjectID string `json:"subject_id"`
@@ -173,7 +173,7 @@ type DesiredPlacement struct {
 	ExactPlacementSetDigest           string `json:"exact_placement_set_digest,omitempty"`
 	ExactPlacementSetBytes            []byte `json:"exact_placement_set_bytes,omitempty"`
 	// PlacementRevision is Tensorhub's monotonic revision for a private rental. It is
-	// the exact DesiredWorkerState.revision Creator relays for remote placements, so Hub
+	// the exact DesiredWorkerState.revision Cozy relays for remote placements, so Hub
 	// can compare desired, accepted, and converged without guessing a local daemon counter.
 	PlacementRevision    uint64 `json:"placement_revision,omitempty"`
 	PlacementIDValue     string `json:"placement_id,omitempty"`

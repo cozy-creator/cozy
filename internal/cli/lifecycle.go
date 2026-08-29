@@ -7,15 +7,15 @@ import (
 	"strings"
 	"time"
 
-	localapi "github.com/cozy-creator/cozy-creator/internal/client"
-	"github.com/cozy-creator/cozy-creator/internal/daemon"
-	"github.com/cozy-creator/cozy-creator/internal/exit"
-	"github.com/cozy-creator/cozy-creator/internal/home"
-	"github.com/cozy-creator/cozy-creator/internal/hub"
-	"github.com/cozy-creator/cozy-creator/internal/orchestrator"
-	"github.com/cozy-creator/cozy-creator/internal/output"
-	"github.com/cozy-creator/cozy-creator/internal/records"
-	"github.com/cozy-creator/cozy-creator/internal/rental"
+	localapi "github.com/cozy-creator/cozy/internal/client"
+	"github.com/cozy-creator/cozy/internal/daemon"
+	"github.com/cozy-creator/cozy/internal/exit"
+	"github.com/cozy-creator/cozy/internal/home"
+	"github.com/cozy-creator/cozy/internal/hub"
+	"github.com/cozy-creator/cozy/internal/orchestrator"
+	"github.com/cozy-creator/cozy/internal/output"
+	"github.com/cozy-creator/cozy/internal/records"
+	"github.com/cozy-creator/cozy/internal/rental"
 )
 
 func handleUnload(ctx *Context) *exit.Error {

@@ -7,8 +7,8 @@ import (
 	"strconv"
 	"strings"
 
-	"github.com/cozy-creator/cozy-creator/internal/api"
-	"github.com/cozy-creator/cozy-creator/internal/exit"
+	"github.com/cozy-creator/cozy/internal/api"
+	"github.com/cozy-creator/cozy/internal/exit"
 )
 
 // The SSE consumer, written against `docs/client-contract.md` §5 and modelled on the

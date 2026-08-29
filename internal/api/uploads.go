@@ -5,7 +5,7 @@ import (
 	"net/http"
 	"time"
 
-	"github.com/cozy-creator/cozy-creator/internal/upload"
+	"github.com/cozy-creator/cozy/internal/upload"
 )
 
 func (s *Server) putUpload(w http.ResponseWriter, r *http.Request) {

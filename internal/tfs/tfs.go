@@ -27,9 +27,9 @@ import (
 	"strconv"
 	"strings"
 
-	"github.com/cozy-creator/cozy-creator/internal/config"
-	"github.com/cozy-creator/cozy-creator/internal/exit"
-	"github.com/cozy-creator/cozy-creator/internal/home"
+	"github.com/cozy-creator/cozy/internal/config"
+	"github.com/cozy-creator/cozy/internal/exit"
+	"github.com/cozy-creator/cozy/internal/home"
 )
 
 // Tool is one resolved tensorfs CLI plus the store it operates on.
@@ -40,7 +40,7 @@ type Tool struct {
 	env    []string
 }
 
-// Root is one name in TensorFS's root authority. Creator renders the fact but
+// Root is one name in TensorFS's root authority. Cozy renders the fact but
 // never reads or composes the store's metadata files directly.
 type Root struct {
 	Name     string

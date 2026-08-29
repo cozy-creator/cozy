@@ -1,9 +1,9 @@
-# Cozy Creator local client API — v1
+# Cozy local client API — v1
 
 This document describes the HTTP API implemented by the Cozy daemon. The routes in the
 CORE module are the proposed common request-level API for
 future Tensorhub and private-rental servers, but no cross-host parity is claimed until
-those servers exist and pass shared conformance tests. The LOCAL module is Creator-only.
+those servers exist and pass shared conformance tests. The LOCAL module is Cozy-only.
 
 `internal/api/routes.go` is the route registry. `scripts/fence.py` checks this document's
 route method, path, scope, and order against that registry. Authentication, idempotency,
@@ -15,7 +15,7 @@ payloads, and behavior are documented below but are outside that row-level fence
 |---|---|
 | version | `cozy.client.v1` (`GET /v1/capabilities` → `core`) |
 | encoding | JSON, UTF-8. SSE for streams. |
-| auth | `Authorization: Bearer <token>`. Creator never accepts a cookie. |
+| auth | `Authorization: Bearer <token>`. Cozy never accepts a cookie. |
 | idempotency | `Idempotency-Key` header on submit; required. |
 | errors | one envelope, §6 |
 
@@ -50,7 +50,7 @@ Idempotency-Key: <caller's key>
 entrypoint's declared set — binding by field path is what makes a two-output result
 unswappable.
 
-The `model`, `lane`, and `adapter` fields are reserved but not resolved by Creator yet.
+The `model`, `lane`, and `adapter` fields are reserved but not resolved by Cozy yet.
 Any non-empty value refuses as `501 override_unresolved`; it is never silently ignored.
 
 `worker` is a **LOCAL ADDITION**: it pins the request to an attached rental by id. An id
@@ -79,8 +79,8 @@ worker reports; it is never converted into a successful cleanup claim.
 
 Local worker grants currently refuse on Windows as
 `local_file_grant_unsupported` (structural). Remote pod execution remains supported.
-This is an explicit boundary until cozy-runtime and Creator share one Windows file-URL
-encoder/authorizer; Creator does not emit malformed `file://C:\\…` capabilities.
+This is an explicit boundary until cozy-runtime and Cozy share one Windows file-URL
+encoder/authorizer; Cozy does not emit malformed `file://C:\\…` capabilities.
 
 A pinned request crosses a REAL byte boundary, and the crossing is the pod's own media
 server: the payload and every input asset are uploaded as separate
@@ -200,7 +200,7 @@ the size. `Range` honours exactly ONE range; a multi-range request is `416`.
 ## 5. Capabilities
 
 ```json
-{"core": "cozy.client.v1", "host": "cozy-creator.local", "tokens": ["api.…", …]}
+{"core": "cozy.client.v1", "host": "cozy.local", "tokens": ["api.…", …]}
 ```
 
 Feature presence is a TOKEN. A client never infers a feature from a version string.
@@ -230,7 +230,7 @@ through one envelope, including an unknown route.
 
 ## 7. Local extension module
 
-Creator-only control routes use `/v1/local/`. Uploads and embedded web assets use their product
+Cozy-only control routes use `/v1/local/`. Uploads and embedded web assets use their product
 URLs but remain local-scope rows in the same guarded route table.
 
 | route | scope | auth | notes |

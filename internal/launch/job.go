@@ -3,8 +3,8 @@ package launch
 import (
 	"strings"
 
-	"github.com/cozy-creator/cozy-creator/internal/exit"
-	"github.com/cozy-creator/cozy-creator/internal/orchestrator"
+	"github.com/cozy-creator/cozy/internal/exit"
+	"github.com/cozy-creator/cozy/internal/orchestrator"
 )
 
 // THE JOB HALF of an installed generation (cl-004). A job is an attempt class on the one

@@ -30,8 +30,8 @@ import (
 	"strconv"
 	"strings"
 
-	"github.com/cozy-creator/cozy-creator/internal/canonical"
-	"github.com/cozy-creator/cozy-creator/internal/exit"
+	"github.com/cozy-creator/cozy/internal/canonical"
+	"github.com/cozy-creator/cozy/internal/exit"
 )
 
 // Format is the identity document's format tag. It moved from `/1` to `/2` with the

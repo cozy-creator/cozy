@@ -8,7 +8,7 @@ import (
 	"strings"
 	"unicode"
 
-	"github.com/cozy-creator/cozy-creator/internal/exit"
+	"github.com/cozy-creator/cozy/internal/exit"
 )
 
 // The RENTAL half of the one lifecycle authority (cl-015). A rented pod outlives the
@@ -320,7 +320,7 @@ type Rental struct {
 	ControlSnapshotBytes  []byte
 	PlacementRevision     uint64
 	// Observed* is the remote worker's ClaimAck readback. AcceleratorModel above is
-	// only the caller's requested SKU; these fields are absent until Creator has
+	// only the caller's requested SKU; these fields are absent until Cozy has
 	// actually claimed the rented worker without invoking a model.
 	ObservedAccelerator            string
 	ObservedAcceleratorCount       int

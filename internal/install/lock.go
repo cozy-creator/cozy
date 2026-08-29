@@ -3,9 +3,9 @@ package install
 import (
 	"os"
 
-	"github.com/cozy-creator/cozy-creator/internal/exit"
-	"github.com/cozy-creator/cozy-creator/internal/flock"
-	"github.com/cozy-creator/cozy-creator/internal/home"
+	"github.com/cozy-creator/cozy/internal/exit"
+	"github.com/cozy-creator/cozy/internal/flock"
+	"github.com/cozy-creator/cozy/internal/home"
 )
 
 // Writer is the single-writer claim held by local install mutations.

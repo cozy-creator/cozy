@@ -15,7 +15,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/cozy-creator/cozy-creator/internal/records"
+	"github.com/cozy-creator/cozy/internal/records"
 )
 
 const weightlessRef = "cozy/weightless"

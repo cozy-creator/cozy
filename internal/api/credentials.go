@@ -6,9 +6,9 @@ import (
 	"os"
 	"runtime"
 
-	"github.com/cozy-creator/cozy-creator/internal/exit"
-	"github.com/cozy-creator/cozy-creator/internal/home"
-	"github.com/cozy-creator/cozy-creator/internal/secret"
+	"github.com/cozy-creator/cozy/internal/exit"
+	"github.com/cozy-creator/cozy/internal/home"
+	"github.com/cozy-creator/cozy/internal/secret"
 )
 
 // Credentials is the per-launch CLI credential. It is handed over through a

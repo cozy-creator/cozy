@@ -26,9 +26,9 @@ import (
 	"sync"
 	"time"
 
-	"github.com/cozy-creator/cozy-creator/internal/exit"
-	"github.com/cozy-creator/cozy-creator/internal/hub"
-	"github.com/cozy-creator/cozy-creator/internal/tfs"
+	"github.com/cozy-creator/cozy/internal/exit"
+	"github.com/cozy-creator/cozy/internal/hub"
+	"github.com/cozy-creator/cozy/internal/tfs"
 )
 
 // One object write or read at the storage edge is bounded by BYTES MOVING, not by a

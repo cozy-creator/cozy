@@ -13,10 +13,10 @@ import (
 	"strings"
 	"sync"
 
-	"github.com/cozy-creator/cozy-creator/internal/canonical"
-	"github.com/cozy-creator/cozy-creator/internal/exit"
-	"github.com/cozy-creator/cozy-creator/internal/home"
-	"github.com/cozy-creator/cozy-creator/internal/records"
+	"github.com/cozy-creator/cozy/internal/canonical"
+	"github.com/cozy-creator/cozy/internal/exit"
+	"github.com/cozy-creator/cozy/internal/home"
+	"github.com/cozy-creator/cozy/internal/records"
 )
 
 // MaxBytes is the compatibility fallback for an older descriptor with no effective

@@ -8,8 +8,8 @@ import (
 	"path/filepath"
 	"strings"
 
-	"github.com/cozy-creator/cozy-creator/internal/config"
-	"github.com/cozy-creator/cozy-creator/internal/exit"
+	"github.com/cozy-creator/cozy/internal/config"
+	"github.com/cozy-creator/cozy/internal/exit"
 )
 
 const Tag = "py3-none-any"
@@ -53,7 +53,7 @@ func Build(req Request) (*Result, *exit.Error) {
 	if cmd.ProcessState == nil {
 		return nil, exit.Named(exit.Structural, "project_wheel_builder_missing",
 			"cannot run uv build: %v", runErr).
-			WithRemedy("install uv; Creator delegates standard PEP 517 wheel construction to `uv build --wheel`")
+			WithRemedy("install uv; Cozy delegates standard PEP 517 wheel construction to `uv build --wheel`")
 	}
 	if cmd.ProcessState.ExitCode() != 0 {
 		detail := strings.Join(strings.Fields(string(body)), " ")

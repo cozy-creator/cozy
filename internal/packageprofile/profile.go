@@ -1,4 +1,4 @@
-// Package packageprofile owns Creator's syntax-only handling of Tensorhub's
+// Package packageprofile owns Cozy's syntax-only handling of Tensorhub's
 // four-axis package compatibility profile. Approval remains Tensorhub policy; the
 // client accepts only the currently frozen public spellings and never invents a
 // default profile.
@@ -9,7 +9,7 @@ import (
 	"sort"
 	"strings"
 
-	"github.com/cozy-creator/cozy-creator/internal/exit"
+	"github.com/cozy-creator/cozy/internal/exit"
 )
 
 const (
@@ -37,7 +37,7 @@ func NormalizeSet(raw []string) ([]string, *exit.Error) {
 		if !approved[profile] {
 			return nil, exit.Named(exit.Validation, "package_profile_unapproved",
 				"%s is well-formed but is not in this release's approved profile vocabulary", profile).
-				WithRemedy("approved profiles are %s, %s, and %s; a policy addition requires a new Creator/Tensorhub contract", CPU, CU126, CU130)
+				WithRemedy("approved profiles are %s, %s, and %s; a policy addition requires a new Cozy/Tensorhub contract", CPU, CU126, CU130)
 		}
 		seen[profile] = true
 	}

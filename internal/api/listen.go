@@ -6,7 +6,7 @@ import (
 	"strconv"
 	"syscall"
 
-	"github.com/cozy-creator/cozy-creator/internal/exit"
+	"github.com/cozy-creator/cozy/internal/exit"
 )
 
 // LOOPBACK-ONLY, and it is a REFUSAL rather than a default.

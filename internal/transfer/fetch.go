@@ -32,10 +32,10 @@ import (
 	"strings"
 	"time"
 
-	"github.com/cozy-creator/cozy-creator/internal/exit"
-	"github.com/cozy-creator/cozy-creator/internal/hub"
-	"github.com/cozy-creator/cozy-creator/internal/tfs"
-	"github.com/cozy-creator/cozy-creator/internal/units"
+	"github.com/cozy-creator/cozy/internal/exit"
+	"github.com/cozy-creator/cozy/internal/hub"
+	"github.com/cozy-creator/cozy/internal/tfs"
+	"github.com/cozy-creator/cozy/internal/units"
 )
 
 // Fetch is one checkpoint pulled into the local store.
@@ -82,7 +82,7 @@ func (f *Fetch) say(format string, args ...any) {
 	}
 }
 
-// Resolve asks Tensorhub's typed model resolver for exactly one checkpoint. Creator
+// Resolve asks Tensorhub's typed model resolver for exactly one checkpoint. Cozy
 // never lists candidates or invents a default release locally.
 func (f *Fetch) Resolve(ctx context.Context) (hub.Checkpoint, *exit.Error) {
 	resolved, e := f.Hub.ResolveModel(ctx, f.Spec, f.Lane)

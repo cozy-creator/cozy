@@ -14,11 +14,11 @@ import (
 	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/protobuf/proto"
 
-	"github.com/cozy-creator/cozy-creator/internal/canonical"
-	"github.com/cozy-creator/cozy-creator/internal/exit"
-	"github.com/cozy-creator/cozy-creator/internal/records"
-	"github.com/cozy-creator/cozy-creator/internal/workertls"
-	pb "github.com/cozy-creator/cozy-creator/protocol/cozy/worker/v1"
+	"github.com/cozy-creator/cozy/internal/canonical"
+	"github.com/cozy-creator/cozy/internal/exit"
+	"github.com/cozy-creator/cozy/internal/records"
+	"github.com/cozy-creator/cozy/internal/workertls"
+	pb "github.com/cozy-creator/cozy/protocol/cozy/worker/v1"
 )
 
 // THE RECORDOWNER SIDE of th-024's orientation (#436/#446/#454, renamed by #481 — bare
@@ -351,7 +351,7 @@ func deterministicWorkerFrame(frame *pb.WorkerFrame) ([]byte, *exit.Error) {
 // relayBootFailure preserves the protocol's closed boot-fatal alternative. It is
 // accepted only from this claim's epoch and a named stream/boot, then sent through the
 // renter-authenticated relay. Tensorhub verifies provider OCI and Runtime provenance;
-// Creator neither turns this into a synthetic ObservedWorkerState nor gives Hub a way to
+// Cozy neither turns this into a synthetic ObservedWorkerState nor gives Hub a way to
 // dial the worker itself.
 func (c *Orchestrator) relayBootFailure(s *session, w *worker, frame *pb.WorkerFrame,
 	failure *pb.BootFailure) {

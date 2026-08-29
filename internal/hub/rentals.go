@@ -10,8 +10,8 @@ import (
 	"strings"
 	"time"
 
-	"github.com/cozy-creator/cozy-creator/internal/exit"
-	"github.com/cozy-creator/cozy-creator/internal/rentalid"
+	"github.com/cozy-creator/cozy/internal/exit"
+	"github.com/cozy-creator/cozy/internal/rentalid"
 )
 
 // The RENTAL routes (cl-015, on th-042's product surface). The hub owns the pod: it
@@ -74,7 +74,7 @@ type Rental struct {
 	// a comparison neither end can make by saying the token.
 	TokenSHA256 []string
 	// ControlSnapshot is Tensorhub's exact acquisition-attempt control truth. Its
-	// canonical bytes were persisted before provider Create; Creator verifies and
+	// canonical bytes were persisted before provider Create; Cozy verifies and
 	// stores those same bytes before publishing a remote target.
 	ControlSnapshot   *ExactControlDocument
 	PlacementRevision uint64
@@ -385,7 +385,7 @@ func (c *Client) ArtifactGrant(ctx context.Context, id string, revision, ttlSeco
 
 func artifactGrantInvalid(format string, args ...any) *exit.Error {
 	return exit.Named(exit.Conflict, "rental.artifact_grant_invalid", format, args...).
-		WithRemedy("release this rental; Creator will not repair or widen Tensorhub's artifact authority")
+		WithRemedy("release this rental; Cozy will not repair or widen Tensorhub's artifact authority")
 }
 
 func validateArtifactGrant(grant ArtifactGrant) *exit.Error {

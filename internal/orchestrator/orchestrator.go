@@ -27,11 +27,11 @@ import (
 	"sync"
 	"time"
 
-	"github.com/cozy-creator/cozy-creator/internal/config"
-	"github.com/cozy-creator/cozy-creator/internal/exit"
-	"github.com/cozy-creator/cozy-creator/internal/home"
-	"github.com/cozy-creator/cozy-creator/internal/records"
-	pb "github.com/cozy-creator/cozy-creator/protocol/cozy/worker/v1"
+	"github.com/cozy-creator/cozy/internal/config"
+	"github.com/cozy-creator/cozy/internal/exit"
+	"github.com/cozy-creator/cozy/internal/home"
+	"github.com/cozy-creator/cozy/internal/records"
+	pb "github.com/cozy-creator/cozy/protocol/cozy/worker/v1"
 )
 
 // Options is the frozen input to one Cozy daemon. Every field is decided by the

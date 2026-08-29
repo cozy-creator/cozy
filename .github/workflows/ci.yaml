@@ -40,7 +40,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          path: cozy-creator
+          path: cozy
       # GITHUB_TOKEN is repository-scoped and cannot read a private sibling. When an explicit
       # read token exists, additionally compare against worker-protocol master so drift arrives
       # at build time. Its absence is reported, never disguised as a failed code check.
@@ -59,7 +59,7 @@ jobs:
         if: env.WORKER_PROTOCOL_TOKEN != ''
       - name: Compare against current peer
         if: env.WORKER_PROTOCOL_TOKEN != ''
-        run: worker-protocol/scripts/vendored-diff.sh cozy-creator/protocol/cozy/worker/v1
+        run: worker-protocol/scripts/vendored-diff.sh cozy/protocol/cozy/worker/v1
       - name: Report unarmed peer drift check
         if: env.WORKER_PROTOCOL_TOKEN == ''
         run: echo '::warning::WORKER_PROTOCOL_TOKEN is absent; Git tracks local vendored-byte changes, but private-upstream provenance and drift were not queried'

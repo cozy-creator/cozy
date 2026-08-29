@@ -6,11 +6,11 @@ import (
 	"strings"
 	"sync"
 
-	"github.com/cozy-creator/cozy-creator/internal/exit"
-	"github.com/cozy-creator/cozy-creator/internal/hub"
-	"github.com/cozy-creator/cozy-creator/internal/output"
-	"github.com/cozy-creator/cozy-creator/internal/packagepublish"
-	"github.com/cozy-creator/cozy-creator/internal/transfer"
+	"github.com/cozy-creator/cozy/internal/exit"
+	"github.com/cozy-creator/cozy/internal/hub"
+	"github.com/cozy-creator/cozy/internal/output"
+	"github.com/cozy-creator/cozy/internal/packagepublish"
+	"github.com/cozy-creator/cozy/internal/transfer"
 )
 
 func handlePackagePublish(ctx *Context) *exit.Error {

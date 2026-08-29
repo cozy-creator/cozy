@@ -6,14 +6,14 @@ import (
 	"path/filepath"
 	"strings"
 
-	"github.com/cozy-creator/cozy-creator/internal/exit"
-	"github.com/cozy-creator/cozy-creator/internal/home"
-	"github.com/cozy-creator/cozy-creator/internal/hub"
-	"github.com/cozy-creator/cozy-creator/internal/output"
-	"github.com/cozy-creator/cozy-creator/internal/records"
-	"github.com/cozy-creator/cozy-creator/internal/secret"
-	"github.com/cozy-creator/cozy-creator/internal/tfs"
-	"github.com/cozy-creator/cozy-creator/internal/transfer"
+	"github.com/cozy-creator/cozy/internal/exit"
+	"github.com/cozy-creator/cozy/internal/home"
+	"github.com/cozy-creator/cozy/internal/hub"
+	"github.com/cozy-creator/cozy/internal/output"
+	"github.com/cozy-creator/cozy/internal/records"
+	"github.com/cozy-creator/cozy/internal/secret"
+	"github.com/cozy-creator/cozy/internal/tfs"
+	"github.com/cozy-creator/cozy/internal/transfer"
 )
 
 // The model transfer verbs (cl-012). `model publish` is th-002's declare-first protocol

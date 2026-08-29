@@ -10,7 +10,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/cozy-creator/cozy-creator/internal/exit"
+	"github.com/cozy-creator/cozy/internal/exit"
 )
 
 // The orchestrator's half of the ONE lifecycle authority (cl-001). Worker processes,
@@ -178,7 +178,7 @@ CREATE TABLE IF NOT EXISTS artifact_receipts (
   PRIMARY KEY (request_id, attempt, output_slot),
   FOREIGN KEY (request_id, attempt) REFERENCES attempts(request_id, attempt)
 )`, `
--- Creator's first-wins artifact disposition. The exact decision is journaled before send;
+-- Cozy's first-wins artifact disposition. The exact decision is journaled before send;
 -- the exact Runtime result is journaled before the outcome is acknowledged.
 CREATE TABLE IF NOT EXISTS artifact_finalizations (
   request_id         TEXT    NOT NULL,
@@ -1250,7 +1250,7 @@ type ArtifactReceipt struct {
 	RecordedAt                                                         string
 }
 
-// ArtifactFinalization is Creator's durable first-wins disposition and Runtime's exact
+// ArtifactFinalization is Cozy's durable first-wins disposition and Runtime's exact
 // replayable completion. DecisionDigest/Bytes are persisted before send; ResultDigest/Bytes
 // are persisted before AttemptOutcomeAck.
 type ArtifactFinalization struct {

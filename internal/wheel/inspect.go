@@ -18,7 +18,7 @@ import (
 	"strconv"
 	"strings"
 
-	"github.com/cozy-creator/cozy-creator/internal/exit"
+	"github.com/cozy-creator/cozy/internal/exit"
 )
 
 const (
@@ -123,7 +123,7 @@ func Inspect(file string) (Fact, *exit.Error) {
 		}
 		if buildInputName(name) {
 			return out, exit.Named(exit.Validation, "project_wheel_build_input",
-				"%s contains a build input; Creator never builds or repairs package wheels", name)
+				"%s contains a build input; Cozy never builds or repairs package wheels", name)
 		}
 		if ext == ".pth" {
 			return out, exit.Named(exit.Validation, "wheel_path_injection",

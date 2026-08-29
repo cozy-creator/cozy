@@ -1,6 +1,6 @@
-# Cozy Creator
+# Cozy
 
-Cozy Creator is a local-first command-line application for generative media. It installs
+Cozy is a local-first command-line application for generative media. It installs
 package code, downloads models, runs package callables on your machine or a private rented
 worker, and keeps your local execution records and outputs under your control.
 
@@ -13,8 +13,8 @@ newer. Package installation also uses `uv`; model download and publication use t
 executable from TensorFS.
 
 ```sh
-git clone https://github.com/cozy-creator/cozy-creator.git
-cd cozy-creator
+git clone https://github.com/cozy-creator/cozy.git
+cd cozy
 go build -o cozy .
 install -m 0755 ./cozy ~/.local/bin/cozy
 cozy -v

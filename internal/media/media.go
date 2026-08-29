@@ -34,10 +34,10 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/cozy-creator/cozy-creator/internal/exit"
-	"github.com/cozy-creator/cozy-creator/internal/mediawire"
-	"github.com/cozy-creator/cozy-creator/internal/secret"
-	"github.com/cozy-creator/cozy-creator/internal/workertls"
+	"github.com/cozy-creator/cozy/internal/exit"
+	"github.com/cozy-creator/cozy/internal/mediawire"
+	"github.com/cozy-creator/cozy/internal/secret"
+	"github.com/cozy-creator/cozy/internal/workertls"
 )
 
 // Spec is the pod's media plane as a rental pins it: where it answers, the certificate to
@@ -283,7 +283,7 @@ func codeFor(status int) exit.Code {
 // media plane's ONE version handshake, which is why it runs before any byte moves.
 //
 // The two ends of this plane are released separately: Tensorhub compiles `pod-supervisor`
-// into its base worker image while this client floats with Creator master, so a route or a
+// into its base worker image while this client floats with Cozy master, so a route or a
 // field can move on one side alone. The revision closes that: a plane at another revision,
 // or one too old to declare a revision at all, is refused here rather than fed bytes whose
 // answer shape this host would misread. This media contract has its own explicit revision;
@@ -317,7 +317,7 @@ func (c *Client) skew(format string, args ...any) *exit.Error {
 	return exit.Named(exit.Conflict, "media_contract_mismatch",
 		"the pod's media plane at %s "+format, append([]any{c.spec.Addr}, args...)...).
 		WithRemedy("the pod's media server is built into its image from a pinned "+
-			"Tensorhub recipe commit while this host floats with Creator master, so the "+
+			"Tensorhub recipe commit while this host floats with Cozy master, so the "+
 			"two ends can differ. Rebuild "+
 			"the pod image from a commit that speaks rev %d, or run an owner that speaks "+
 			"what the pod does. Nothing is uploaded to a plane whose answers this host "+

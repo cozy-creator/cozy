@@ -9,9 +9,9 @@ import (
 	"sort"
 	"strings"
 
-	"github.com/cozy-creator/cozy-creator/internal/exit"
-	"github.com/cozy-creator/cozy-creator/internal/orchestrator"
-	"github.com/cozy-creator/cozy-creator/internal/records"
+	"github.com/cozy-creator/cozy/internal/exit"
+	"github.com/cozy-creator/cozy/internal/orchestrator"
+	"github.com/cozy-creator/cozy/internal/records"
 )
 
 // LifecycleIdentity is one durable obligation that prevents a safe daemon down.

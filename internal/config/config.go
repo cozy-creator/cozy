@@ -1,4 +1,4 @@
-// Package config owns Cozy Creator's one process-configuration read.
+// Package config owns Cozy's one process-configuration read.
 //
 // Load resolves one private Kong grammar with no argv. Sources are, in order:
 // defaults, $COZY_HOME/config.yaml, and process environment. The result is frozen for the process lifetime.
@@ -16,8 +16,8 @@ import (
 	"sync"
 
 	"github.com/alecthomas/kong"
-	"github.com/cozy-creator/cozy-creator/internal/exit"
-	"github.com/cozy-creator/cozy-creator/internal/secret"
+	"github.com/cozy-creator/cozy/internal/exit"
+	"github.com/cozy-creator/cozy/internal/secret"
 	"go.yaml.in/yaml/v3"
 )
 

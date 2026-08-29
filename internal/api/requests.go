@@ -11,18 +11,18 @@ import (
 	"strconv"
 	"strings"
 
-	"github.com/cozy-creator/cozy-creator/internal/canonical"
-	"github.com/cozy-creator/cozy-creator/internal/exit"
-	"github.com/cozy-creator/cozy-creator/internal/inputasset"
-	"github.com/cozy-creator/cozy-creator/internal/launch"
-	"github.com/cozy-creator/cozy-creator/internal/orchestrator"
-	"github.com/cozy-creator/cozy-creator/internal/records"
-	"github.com/cozy-creator/cozy-creator/internal/rental"
-	pb "github.com/cozy-creator/cozy-creator/protocol/cozy/worker/v1"
+	"github.com/cozy-creator/cozy/internal/canonical"
+	"github.com/cozy-creator/cozy/internal/exit"
+	"github.com/cozy-creator/cozy/internal/inputasset"
+	"github.com/cozy-creator/cozy/internal/launch"
+	"github.com/cozy-creator/cozy/internal/orchestrator"
+	"github.com/cozy-creator/cozy/internal/records"
+	"github.com/cozy-creator/cozy/internal/rental"
+	pb "github.com/cozy-creator/cozy/protocol/cozy/worker/v1"
 )
 
 // The request-level contract: a 202 handle out of submit, a lifecycle document out of
-// status, and explicit cancellation. Creator implements this surface today; other hosts
+// status, and explicit cancellation. Cozy implements this surface today; other hosts
 // require their own implementation and conformance proof.
 
 // Submission is the request body. `input` is the package's own typed payload and is
@@ -38,7 +38,7 @@ type Submission struct {
 	// the daemon-owned immutable input store before the request row exists; it never
 	// crosses the worker protocol. The typed payload carries only its opaque reference.
 	LocalAssets []records.AssetBinding `json:"local_assets,omitempty"`
-	// Worker is Creator's local addition: it pins this request to an attached rental id.
+	// Worker is Cozy's local addition: it pins this request to an attached rental id.
 	Worker     string `json:"worker,omitempty"`
 	AttemptKey string `json:"-"`
 }

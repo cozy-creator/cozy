@@ -11,7 +11,7 @@ import (
 	"runtime"
 	"strings"
 
-	"github.com/cozy-creator/cozy-creator/internal/exit"
+	"github.com/cozy-creator/cozy/internal/exit"
 )
 
 // Layout is the resolved set of paths every cl-009 verb works against.
@@ -58,7 +58,7 @@ type Layout struct {
 	// be readable by another user on this host lives out here as files.
 	Rentals string
 	// ManagedBases is the operator-populated immutable local equivalent of a base
-	// worker image. Creator selects only by exact realization digest; it never resolves
+	// worker image. Cozy selects only by exact realization digest; it never resolves
 	// or builds packages into this registry during package install.
 	ManagedBases string
 }

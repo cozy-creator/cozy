@@ -11,12 +11,12 @@ import (
 	"strings"
 	"time"
 
-	"github.com/cozy-creator/cozy-creator/internal/canonical"
-	"github.com/cozy-creator/cozy-creator/internal/exit"
-	"github.com/cozy-creator/cozy-creator/internal/home"
-	"github.com/cozy-creator/cozy-creator/internal/orchestrator"
-	"github.com/cozy-creator/cozy-creator/internal/records"
-	pb "github.com/cozy-creator/cozy-creator/protocol/cozy/worker/v1"
+	"github.com/cozy-creator/cozy/internal/canonical"
+	"github.com/cozy-creator/cozy/internal/exit"
+	"github.com/cozy-creator/cozy/internal/home"
+	"github.com/cozy-creator/cozy/internal/orchestrator"
+	"github.com/cozy-creator/cozy/internal/records"
+	pb "github.com/cozy-creator/cozy/protocol/cozy/worker/v1"
 )
 
 // The job family is mounted under /v1/local/ because its typed input trees are local
@@ -285,8 +285,8 @@ type JobState struct {
 	EventsURL string     `json:"events_url"`
 }
 
-// ArtifactRef is Creator's durable scratch adoption projection. It exposes no path or
-// TensorFS internals: the exact Runtime receipt digest and Creator-derived private root id
+// ArtifactRef is Cozy's durable scratch adoption projection. It exposes no path or
+// TensorFS internals: the exact Runtime receipt digest and Cozy-derived private root id
 // are the handles a later explicit promotion will consume.
 type ArtifactRef struct {
 	Attempt       int64  `json:"attempt"`

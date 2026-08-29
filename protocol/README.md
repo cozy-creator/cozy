@@ -1,8 +1,8 @@
 # Vendored worker protocol
 
-This directory contains the Go files Cozy Creator needs from
+This directory contains the Go files Cozy needs from
 `cozy-creator/worker-protocol-v2` commit
-`34f2993e91c65076850a828e37c3d9bd0215eefc`.
+`6fdaa950e2cf1d003460f84b8a110bf5f389a065`.
 
 The four files under `cozy/worker/v1/` are byte-identical to that commit's
 `gen/go/cozy/worker/v1/` output. They were generated with official protoc 35.1,
@@ -18,4 +18,4 @@ Git records the exact vendored bytes and every local change to them. A checksum 
 beside the files would merely hash one part of the same commit and would add no provenance.
 When CI has permission to read the private worker-protocol repository, its independent
 `vendored-diff.sh` comparison checks this complete generated set against upstream. Without that
-credential, Creator makes no independent upstream-provenance or drift claim.
+credential, Cozy makes no independent upstream-provenance or drift claim.

@@ -16,9 +16,9 @@ import (
 
 	"google.golang.org/protobuf/proto"
 
-	"github.com/cozy-creator/cozy-creator/internal/canonical"
-	"github.com/cozy-creator/cozy-creator/internal/launch"
-	pb "github.com/cozy-creator/cozy-creator/protocol/cozy/worker/v1"
+	"github.com/cozy-creator/cozy/internal/canonical"
+	"github.com/cozy-creator/cozy/internal/launch"
+	pb "github.com/cozy-creator/cozy/protocol/cozy/worker/v1"
 )
 
 // worker-protocol's frozen corpus, checked out beside this repo.
@@ -186,7 +186,7 @@ func TestNumberProfile(t *testing.T) {
 			}
 			refused++
 		case err != nil || string(got) != fields[1]:
-			t.Errorf("%v: Creator spelled %q, Runtime spelled %q (%v)", value, got, fields[1], err)
+			t.Errorf("%v: Cozy spelled %q, Runtime spelled %q (%v)", value, got, fields[1], err)
 		default:
 			admitted++
 		}
@@ -240,7 +240,7 @@ func TestNumberProfile(t *testing.T) {
 }
 
 // TestPackageDescriptor is the OTHER side of the identity plane: the grammar Runtime
-// authors and Creator consumes at install. Identity is the canonical content and nothing
+// authors and Cozy consumes at install. Identity is the canonical content and nothing
 // else, and a descriptor that cannot be read exactly is refused rather than guessed at.
 func TestPackageDescriptor(t *testing.T) {
 	raw := []byte(`{"application":"probe:app","entrypoints":[{"name":"run","request":{"fields":[{"constraints":{"gt":0},"name":"strength","type":"float"},{"name":"mode","type":{"literal":["fast","quality"]}}]},"result":{"fields":[]}}],"format":"cozy.package.descriptor/1","jobs":[]}`)
@@ -254,7 +254,7 @@ func TestPackageDescriptor(t *testing.T) {
 	if len(doc.Entrypoints) != 1 || doc.Entrypoints[0].Kind != "entrypoint" {
 		t.Fatalf("entrypoint kind is not inferred from collection membership: %+v", doc.Entrypoints)
 	}
-	// The declared constraints are real Creator validators, not documentation.
+	// The declared constraints are real Cozy validators, not documentation.
 	ep := &doc.Entrypoints[0]
 	if ep.Request.Fields[0].Wire != "required" || ep.Request.Fields[1].Wire != "required" {
 		t.Fatalf("absent wire did not derive required: %+v", ep.Request.Fields)

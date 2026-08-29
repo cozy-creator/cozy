@@ -7,7 +7,7 @@ import (
 	"strings"
 	"unicode/utf8"
 
-	"github.com/cozy-creator/cozy-creator/internal/units"
+	"github.com/cozy-creator/cozy/internal/units"
 )
 
 const (

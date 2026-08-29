@@ -17,18 +17,18 @@ import (
 	"path/filepath"
 	"runtime"
 
-	"github.com/cozy-creator/cozy-creator/internal/canonical"
-	"github.com/cozy-creator/cozy-creator/internal/exit"
-	"github.com/cozy-creator/cozy-creator/internal/home"
-	"github.com/cozy-creator/cozy-creator/internal/hub"
-	"github.com/cozy-creator/cozy-creator/internal/launch"
-	"github.com/cozy-creator/cozy-creator/internal/media"
-	"github.com/cozy-creator/cozy-creator/internal/orchestrator"
-	"github.com/cozy-creator/cozy-creator/internal/records"
-	"github.com/cozy-creator/cozy-creator/internal/remotecontrol"
-	"github.com/cozy-creator/cozy-creator/internal/rentalid"
-	"github.com/cozy-creator/cozy-creator/internal/secret"
-	pb "github.com/cozy-creator/cozy-creator/protocol/cozy/worker/v1"
+	"github.com/cozy-creator/cozy/internal/canonical"
+	"github.com/cozy-creator/cozy/internal/exit"
+	"github.com/cozy-creator/cozy/internal/home"
+	"github.com/cozy-creator/cozy/internal/hub"
+	"github.com/cozy-creator/cozy/internal/launch"
+	"github.com/cozy-creator/cozy/internal/media"
+	"github.com/cozy-creator/cozy/internal/orchestrator"
+	"github.com/cozy-creator/cozy/internal/records"
+	"github.com/cozy-creator/cozy/internal/remotecontrol"
+	"github.com/cozy-creator/cozy/internal/rentalid"
+	"github.com/cozy-creator/cozy/internal/secret"
+	pb "github.com/cozy-creator/cozy/protocol/cozy/worker/v1"
 )
 
 func validID(id string) *exit.Error {
@@ -436,7 +436,7 @@ func controlFacts(row records.Rental) (remotecontrol.Facts, *exit.Error) {
 	if row.ControlSnapshotDigest == "" || len(row.ControlSnapshotBytes) == 0 {
 		return remotecontrol.Facts{}, exit.Named(exit.Conflict, "rental.control_snapshot_missing",
 			"rental %s has no persisted acquisition-attempt control snapshot", row.ID).
-			WithRemedy("release it and rent again; Creator will not resolve a remote pod from the local install")
+			WithRemedy("release it and rent again; Cozy will not resolve a remote pod from the local install")
 	}
 	return remotecontrol.Decode(hub.ExactControlDocument{
 		CanonicalBytes: row.ControlSnapshotBytes, Digest: row.ControlSnapshotDigest,

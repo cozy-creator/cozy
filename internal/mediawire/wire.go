@@ -1,4 +1,4 @@
-// Package mediawire is Creator's expectation of Tensorhub's pod media HTTP
+// Package mediawire is Cozy's expectation of Tensorhub's pod media HTTP
 // contract. The server ships independently in the base worker image, so the
 // client compares both service identity and revision before moving a byte.
 package mediawire

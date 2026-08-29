@@ -5,7 +5,7 @@
 // revision). Issue: tracker/tensorhub/th-024.
 //
 // ORIENTATION: the WORKER (cozy-runtime's torch-free machine control process) HOSTS this
-// service; the RECORDOWNER (cozy-creator's embedded orchestrator, a pod's PodRecordOwner, or a
+// service; the RECORDOWNER (the Cozy daemon, a pod's PodRecordOwner, or a
 // tensorhub orchestrator-shard via th-007) DIALS it. The orientation is IDENTICAL local and
 // remote; only channel establishment differs: a Unix socket (Windows: loopback) co-resident,
 // TLS over a private network or authenticated overlay remotely. A worker control port is NEVER

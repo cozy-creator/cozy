@@ -8,9 +8,9 @@ import (
 	"testing"
 	"time"
 
-	"github.com/cozy-creator/cozy-creator/internal/canonical"
-	"github.com/cozy-creator/cozy-creator/internal/exit"
-	"github.com/cozy-creator/cozy-creator/internal/records"
+	"github.com/cozy-creator/cozy/internal/canonical"
+	"github.com/cozy-creator/cozy/internal/exit"
+	"github.com/cozy-creator/cozy/internal/records"
 )
 
 func TestReconcilePreservesWorkerWithUnresolvedBirthIdentity(t *testing.T) {

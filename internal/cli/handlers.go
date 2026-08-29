@@ -5,8 +5,8 @@ import (
 	"fmt"
 	"runtime/debug"
 
-	"github.com/cozy-creator/cozy-creator/internal/exit"
-	"github.com/cozy-creator/cozy-creator/internal/output"
+	"github.com/cozy-creator/cozy/internal/exit"
+	"github.com/cozy-creator/cozy/internal/output"
 )
 
 // Build identity may be stamped with -ldflags -X. The Go VCS stamp supplies

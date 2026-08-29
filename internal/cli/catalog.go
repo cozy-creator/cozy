@@ -4,9 +4,9 @@ import (
 	"fmt"
 	"strings"
 
-	"github.com/cozy-creator/cozy-creator/internal/exit"
-	"github.com/cozy-creator/cozy-creator/internal/hub"
-	"github.com/cozy-creator/cozy-creator/internal/output"
+	"github.com/cozy-creator/cozy/internal/exit"
+	"github.com/cozy-creator/cozy/internal/hub"
+	"github.com/cozy-creator/cozy/internal/output"
 )
 
 // The catalog verbs (cl-011). Launch-1 tensorhub has no identity plane (decisions

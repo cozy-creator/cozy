@@ -8,11 +8,11 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/cozy-creator/cozy-creator/internal/api"
-	localapi "github.com/cozy-creator/cozy-creator/internal/client"
-	"github.com/cozy-creator/cozy-creator/internal/exit"
-	"github.com/cozy-creator/cozy-creator/internal/launch"
-	"github.com/cozy-creator/cozy-creator/internal/output"
+	"github.com/cozy-creator/cozy/internal/api"
+	localapi "github.com/cozy-creator/cozy/internal/client"
+	"github.com/cozy-creator/cozy/internal/exit"
+	"github.com/cozy-creator/cozy/internal/launch"
+	"github.com/cozy-creator/cozy/internal/output"
 )
 
 // THE JOB VERBS (cl-004): `submit` · `status` · `ls` · `follow` · `cancel`. They are

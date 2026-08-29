@@ -10,9 +10,9 @@ import (
 	"sync"
 	"time"
 
-	"github.com/cozy-creator/cozy-creator/internal/canonical"
-	"github.com/cozy-creator/cozy-creator/internal/home"
-	pb "github.com/cozy-creator/cozy-creator/protocol/cozy/worker/v1"
+	"github.com/cozy-creator/cozy/internal/canonical"
+	"github.com/cozy-creator/cozy/internal/home"
+	pb "github.com/cozy-creator/cozy/protocol/cozy/worker/v1"
 )
 
 type fakeControl struct {

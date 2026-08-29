@@ -1,5 +1,5 @@
-// Package api is Creator's local client API server: the request-level CORE served on
-// loopback by the one Cozy daemon, plus an explicitly Creator-only extension module.
+// Package api is Cozy's local client API server: the request-level CORE served on
+// loopback by the one Cozy daemon, plus an explicitly Cozy-only extension module.
 //
 // It is a client of internal/orchestrator and nothing else. Every submission still flows
 // orchestrator → worker protocol → runtime; this package adds an HTTP shape, a typed error
@@ -50,12 +50,12 @@ import (
 	"strings"
 	"sync"
 
-	"github.com/cozy-creator/cozy-creator/internal/config"
-	"github.com/cozy-creator/cozy-creator/internal/exit"
-	"github.com/cozy-creator/cozy-creator/internal/home"
-	"github.com/cozy-creator/cozy-creator/internal/launch"
-	"github.com/cozy-creator/cozy-creator/internal/orchestrator"
-	"github.com/cozy-creator/cozy-creator/internal/records"
+	"github.com/cozy-creator/cozy/internal/config"
+	"github.com/cozy-creator/cozy/internal/exit"
+	"github.com/cozy-creator/cozy/internal/home"
+	"github.com/cozy-creator/cozy/internal/launch"
+	"github.com/cozy-creator/cozy/internal/orchestrator"
+	"github.com/cozy-creator/cozy/internal/records"
 )
 
 // MaxBody caps a submitted request body. Asset bytes never ride JSON: the local extension

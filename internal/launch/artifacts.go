@@ -8,9 +8,9 @@ import (
 	"strings"
 	"time"
 
-	"github.com/cozy-creator/cozy-creator/internal/exit"
-	"github.com/cozy-creator/cozy-creator/internal/home"
-	"github.com/cozy-creator/cozy-creator/internal/records"
+	"github.com/cozy-creator/cozy/internal/exit"
+	"github.com/cozy-creator/cozy/internal/home"
+	"github.com/cozy-creator/cozy/internal/records"
 )
 
 // DefaultRuntimeQueryTimeout bounds metadata-only runtime questions used while selecting
@@ -177,7 +177,7 @@ type Binding struct {
 }
 
 // WeightlessPlan is one exact ArtifactSubject for a canonical weightless binding plan.
-// The runtime is the sole writer of those documents. Creator consumes their identities
+// The runtime is the sole writer of those documents. Cozy consumes their identities
 // here before spawn and never reconstructs the private bytes.
 type WeightlessPlan struct {
 	Entrypoint string `json:"entrypoint"`

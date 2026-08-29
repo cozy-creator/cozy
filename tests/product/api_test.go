@@ -8,7 +8,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/cozy-creator/cozy-creator/internal/records"
+	"github.com/cozy-creator/cozy/internal/records"
 )
 
 // TestLocalAPIDoor is the only thing standing between a loopback bind and every page the

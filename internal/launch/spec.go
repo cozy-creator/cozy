@@ -5,9 +5,9 @@ import (
 	"sort"
 	"strings"
 
-	"github.com/cozy-creator/cozy-creator/internal/exit"
-	"github.com/cozy-creator/cozy-creator/internal/orchestrator"
-	"github.com/cozy-creator/cozy-creator/internal/records"
+	"github.com/cozy-creator/cozy/internal/exit"
+	"github.com/cozy-creator/cozy/internal/orchestrator"
+	"github.com/cozy-creator/cozy/internal/records"
 )
 
 const (
@@ -177,7 +177,7 @@ func (f *Facts) Spec(devices []string) (orchestrator.WorkerLaunchSpec, *exit.Err
 	}
 	return orchestrator.WorkerLaunchSpec{
 		Placement: placement,
-		// THE WORKER ENTRY is the public verb. Creator never imports Runtime internals or
+		// THE WORKER ENTRY is the public verb. Cozy never imports Runtime internals or
 		// gives the weightless constructor a second source tree: the exact same f.Source
 		// is both the child working directory and --weightless-package.
 		Python:   Binary(f.Install),
@@ -196,7 +196,7 @@ func (f *Facts) binding(ep *Entrypoint, table map[string]Binding) (*orchestrator
 		return nil, exit.Named(exit.Structural, "weightless_plan_unavailable",
 			"the installed runtime reported no canonical weightless plan for %s", ep.Name).
 			WithRemedy("install a runtime whose bindings document carries weightless_plans; " +
-				"Creator will not recreate the retired flat binding record")
+				"Cozy will not recreate the retired flat binding record")
 	}
 	record := map[string]any{
 		// RESOLUTION, not identity (#506a): `project` is where THIS machine staged the

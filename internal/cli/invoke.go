@@ -17,15 +17,15 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/cozy-creator/cozy-creator/internal/api"
-	localapi "github.com/cozy-creator/cozy-creator/internal/client"
-	"github.com/cozy-creator/cozy-creator/internal/exit"
-	"github.com/cozy-creator/cozy-creator/internal/home"
-	"github.com/cozy-creator/cozy-creator/internal/launch"
-	"github.com/cozy-creator/cozy-creator/internal/orchestrator"
-	"github.com/cozy-creator/cozy-creator/internal/output"
-	"github.com/cozy-creator/cozy-creator/internal/records"
-	"github.com/cozy-creator/cozy-creator/internal/rental"
+	"github.com/cozy-creator/cozy/internal/api"
+	localapi "github.com/cozy-creator/cozy/internal/client"
+	"github.com/cozy-creator/cozy/internal/exit"
+	"github.com/cozy-creator/cozy/internal/home"
+	"github.com/cozy-creator/cozy/internal/launch"
+	"github.com/cozy-creator/cozy/internal/orchestrator"
+	"github.com/cozy-creator/cozy/internal/output"
+	"github.com/cozy-creator/cozy/internal/records"
+	"github.com/cozy-creator/cozy/internal/rental"
 )
 
 // THE LIFECYCLE AND REQUEST VERBS (cl-010), every one of them a CLIENT of the local

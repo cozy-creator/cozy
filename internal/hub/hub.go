@@ -27,9 +27,9 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/cozy-creator/cozy-creator/internal/config"
-	"github.com/cozy-creator/cozy-creator/internal/exit"
-	"github.com/cozy-creator/cozy-creator/internal/secret"
+	"github.com/cozy-creator/cozy/internal/config"
+	"github.com/cozy-creator/cozy/internal/exit"
+	"github.com/cozy-creator/cozy/internal/secret"
 )
 
 // Timeout bounds one hub call end to end. A hub that accepts a connection and then
@@ -149,7 +149,7 @@ func (c *Client) Token() secret.Value { return c.token }
 
 // Resource is the shared shape of a package or model returned by its typed public
 // route. The route supplies the type; the document therefore carries no `kind`
-// discriminator and Creator never guesses one from its contents.
+// discriminator and Cozy never guesses one from its contents.
 type Resource struct {
 	Org       string `json:"org"`
 	Name      string `json:"name"`

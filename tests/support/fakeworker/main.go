@@ -19,8 +19,8 @@ import (
 
 	"google.golang.org/grpc"
 
-	"github.com/cozy-creator/cozy-creator/internal/config"
-	pb "github.com/cozy-creator/cozy-creator/protocol/cozy/worker/v1"
+	"github.com/cozy-creator/cozy/internal/config"
+	pb "github.com/cozy-creator/cozy/protocol/cozy/worker/v1"
 )
 
 var (

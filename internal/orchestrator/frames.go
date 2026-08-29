@@ -10,12 +10,12 @@ import (
 	"strings"
 	"time"
 
-	"github.com/cozy-creator/cozy-creator/internal/canonical"
-	"github.com/cozy-creator/cozy-creator/internal/exit"
-	"github.com/cozy-creator/cozy-creator/internal/inputasset"
-	"github.com/cozy-creator/cozy-creator/internal/media"
-	"github.com/cozy-creator/cozy-creator/internal/records"
-	pb "github.com/cozy-creator/cozy-creator/protocol/cozy/worker/v1"
+	"github.com/cozy-creator/cozy/internal/canonical"
+	"github.com/cozy-creator/cozy/internal/exit"
+	"github.com/cozy-creator/cozy/internal/inputasset"
+	"github.com/cozy-creator/cozy/internal/media"
+	"github.com/cozy-creator/cozy/internal/records"
+	pb "github.com/cozy-creator/cozy/protocol/cozy/worker/v1"
 )
 
 // The owner-side FRAME HANDLERS for one claimed stream (owner.go runs the conversation;

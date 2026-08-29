@@ -16,7 +16,7 @@
 //
 // For a wholly weightless package the installed runtime is the sole canonical plan writer:
 // `bindings --json` reports exact ArtifactSubjects before spawn and
-// `serve --weightless-package` privately stages the same bytes. Creator consumes the
+// `serve --weightless-package` privately stages the same bytes. Cozy consumes the
 // identities as record-owner intent and never reconstructs the documents. The older local
 // pinned-binding writer below remains only for the modeled path that still carries it.
 package launch
@@ -31,9 +31,9 @@ import (
 	"sort"
 	"strings"
 
-	"github.com/cozy-creator/cozy-creator/internal/canonical"
-	"github.com/cozy-creator/cozy-creator/internal/exit"
-	"github.com/cozy-creator/cozy-creator/internal/orchestrator"
+	"github.com/cozy-creator/cozy/internal/canonical"
+	"github.com/cozy-creator/cozy/internal/exit"
+	"github.com/cozy-creator/cozy/internal/orchestrator"
 )
 
 // DescriptorFile is Runtime's derived document inside an immutable generation. It is

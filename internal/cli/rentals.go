@@ -11,14 +11,14 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/cozy-creator/cozy-creator/internal/daemon"
-	"github.com/cozy-creator/cozy-creator/internal/exit"
-	"github.com/cozy-creator/cozy-creator/internal/home"
-	"github.com/cozy-creator/cozy-creator/internal/hub"
-	"github.com/cozy-creator/cozy-creator/internal/output"
-	"github.com/cozy-creator/cozy-creator/internal/records"
-	"github.com/cozy-creator/cozy-creator/internal/rental"
-	"github.com/cozy-creator/cozy-creator/internal/secret"
+	"github.com/cozy-creator/cozy/internal/daemon"
+	"github.com/cozy-creator/cozy/internal/exit"
+	"github.com/cozy-creator/cozy/internal/home"
+	"github.com/cozy-creator/cozy/internal/hub"
+	"github.com/cozy-creator/cozy/internal/output"
+	"github.com/cozy-creator/cozy/internal/records"
+	"github.com/cozy-creator/cozy/internal/rental"
+	"github.com/cozy-creator/cozy/internal/secret"
 )
 
 // The rental verbs (cl-015). `cozy rental new` MINTS the pod's access token, asks the hub for a
@@ -494,7 +494,7 @@ func captureRentalControl(row *records.Rental, seen hub.Rental) *exit.Error {
 		len(row.ControlSnapshotBytes) != len(seen.ControlSnapshot.CanonicalBytes) ||
 		!bytes.Equal(row.ControlSnapshotBytes, seen.ControlSnapshot.CanonicalBytes) {
 		return exit.Named(exit.Conflict, "rental.control_snapshot_changed",
-			"rental %s changed its acquisition control snapshot after Creator validated it", row.ID).
+			"rental %s changed its acquisition control snapshot after Cozy validated it", row.ID).
 			WithRemedy("release it; a different snapshot is a different execution authority")
 	}
 	if row.PlacementRevision > 0 && seen.PlacementRevision < row.PlacementRevision {

@@ -31,7 +31,7 @@ check() {
 }
 run() { OUT="$("$COZY" "$@" 2>&1)"; CODE=$?; return 0; }
 
-echo "Cozy Creator release acceptance"
+echo "Cozy release acceptance"
 echo "  asset: $DIST/$ASSET"
 echo "  home:  $COZY_HOME"
 

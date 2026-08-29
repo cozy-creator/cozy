@@ -4,8 +4,8 @@ import (
 	"runtime"
 	"runtime/debug"
 
-	"github.com/cozy-creator/cozy-creator/internal/canonical"
-	"github.com/cozy-creator/cozy-creator/internal/config"
+	"github.com/cozy-creator/cozy/internal/canonical"
+	"github.com/cozy-creator/cozy/internal/config"
 )
 
 // localInvocationIdentity mints the two per-daemon identity digests every LOCAL

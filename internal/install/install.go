@@ -16,11 +16,11 @@ import (
 	"strings"
 	"time"
 
-	"github.com/cozy-creator/cozy-creator/internal/config"
-	"github.com/cozy-creator/cozy-creator/internal/exit"
-	"github.com/cozy-creator/cozy-creator/internal/home"
-	"github.com/cozy-creator/cozy-creator/internal/launch"
-	"github.com/cozy-creator/cozy-creator/internal/records"
+	"github.com/cozy-creator/cozy/internal/config"
+	"github.com/cozy-creator/cozy/internal/exit"
+	"github.com/cozy-creator/cozy/internal/home"
+	"github.com/cozy-creator/cozy/internal/launch"
+	"github.com/cozy-creator/cozy/internal/records"
 )
 
 type Request struct {
@@ -189,7 +189,7 @@ func Run(l home.Layout, st *records.Store, req Request) (*Result, *exit.Error) {
 }
 
 // deriveDescriptor runs the generation's own Runtime over its source. Runtime emits the
-// complete descriptor without writing the source tree; Creator validates the closed grammar
+// complete descriptor without writing the source tree; Cozy validates the closed grammar
 // and stores the canonical bytes under the immutable generation root.
 func deriveDescriptor(venvDir, sourceDir string) (*launch.PackageDescriptor, *exit.Error) {
 	bin := home.VenvTool(venvDir, "cozy-runtime")
