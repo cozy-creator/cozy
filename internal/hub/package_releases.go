@@ -43,10 +43,15 @@ type PackageSourceUploads struct {
 }
 
 type PackageReleaseFinalize struct {
-	Created           bool                  `json:"created"`
-	Release           string                `json:"release"`
-	Profiles          []PackageProfileState `json:"profiles"`
-	PackageExecutions []json.RawMessage     `json:"package_executions"`
+	CompatibleProfiles []string              `json:"compatible_profiles"`
+	Created            bool                  `json:"created"`
+	PackageExecutions  []json.RawMessage     `json:"package_executions"`
+	Profiles           []PackageProfileState `json:"profiles"`
+	QualificationError string                `json:"qualification_error,omitempty"`
+	QualificationState string                `json:"qualification_state"`
+	Release            string                `json:"release"`
+	Requirements       []string              `json:"requirements"`
+	RequiresPython     string                `json:"requires_python"`
 }
 
 func packageReleasePath(ref Ref, release string) string {

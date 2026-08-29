@@ -81,8 +81,10 @@ cozy package remove org/name
 
 Publishing builds the current working tree with `uv build --wheel`; Tensorhub accepts only one
 bounded pure project wheel. Git, commits, and a clean tree are not publication inputs. Tensorhub derives
-compatible base worker profiles from wheel metadata, `uv.lock`, and its image inventory. The
-package name and release come from `[project]`; `[tool.cozy]` supplies the Tensorhub organization:
+compatible base worker profiles from wheel metadata and its exact image inventory. The uploaded
+`uv.lock` remains local-install input; Tensorhub does not use local source overrides as execution
+dependencies. The package name and release come from `[project]`; `[tool.cozy]` supplies the
+Tensorhub organization:
 
 ```toml
 [project]
@@ -102,6 +104,10 @@ cozy package publish
 This publishes `paul/marco-polo-package@1.0.0`; Cozy never invents a `v` prefix. The destination
 comes from `tensorhub_url` configuration and the credential from `tensorhub_token` or
 `TENSORHUB_TOKEN`, not from publish flags.
+
+Publication succeeds even when no compatible base worker image is currently active. The package
+appears in the catalog immediately, and Tensorhub qualifies the same immutable release when a
+compatible base becomes available. Until then, invocation remains unavailable.
 
 Tensorhub owns serving promotion; publication does not move traffic implicitly.
 See [package publication](docs/package-publication.md) for the release contract.

@@ -74,6 +74,11 @@ func handlePackagePublish(ctx *Context) *exit.Error {
 	if done.Release != release {
 		return exit.Internalf("package finalize returned another release %q", done.Release)
 	}
+	switch done.QualificationState {
+	case "pending", "qualified", "refused", "unsupported":
+	default:
+		return exit.Internalf("package finalize returned invalid qualification state %q", done.QualificationState)
+	}
 
 	profileRows := make([]string, 0, len(done.Profiles))
 	var candidateRows, refusalRows []string
@@ -95,8 +100,11 @@ func handlePackagePublish(ctx *Context) *exit.Error {
 	fields := []output.Field{
 		{K: "package", V: ref.String()}, {K: "release", V: done.Release},
 		{K: "status", V: "published"}, {K: "changed", V: begun.State != "committed"},
-		{K: "created", V: done.Created}, {K: "profiles", V: profileRows},
+		{K: "created", V: done.Created}, {K: "qualification", V: done.QualificationState},
+		{K: "qualification_error", V: done.QualificationError},
+		{K: "compatible_profiles", V: done.CompatibleProfiles}, {K: "profiles", V: profileRows},
 		{K: "package_executions", V: len(done.PackageExecutions)},
+		{K: "requires_python", V: done.RequiresPython}, {K: "requirements", V: done.Requirements},
 		{K: "uploaded", V: output.Bytes(moved)}, {K: "hub", V: c.Base()},
 	}
 	if len(candidateRows) > 0 {
@@ -105,8 +113,27 @@ func handlePackagePublish(ctx *Context) *exit.Error {
 	if len(refusalRows) > 0 {
 		fields = append(fields, output.Field{K: "profile_refusals", V: refusalRows})
 	}
-	return emit(ctx, compactRecord(fields,
-		"package", "release", "status", "profiles", "uploaded", "changed"))
+	defaults := []string{"package", "release", "status", "qualification"}
+	if done.QualificationState != "qualified" {
+		defaults = append(defaults, "requires_python", "requirements", "compatible_profiles")
+	}
+	if done.QualificationState == "refused" && len(refusalRows) > 0 {
+		defaults = append(defaults, "profile_refusals")
+	}
+	if done.QualificationError != "" {
+		defaults = append(defaults, "qualification_error")
+	}
+	defaults = append(defaults, "package_executions", "uploaded", "changed")
+	record := compactRecord(fields, defaults...)
+	switch done.QualificationState {
+	case "pending":
+		record.Notes = append(record.Notes,
+			"published successfully; Tensorhub will qualify it when a compatible base worker image becomes active")
+	case "refused", "unsupported":
+		record.Notes = append(record.Notes,
+			"published successfully, but no execution is currently eligible for placement")
+	}
+	return emit(ctx, record)
 }
 
 func shorten(value string, limit int) string {
