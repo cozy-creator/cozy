@@ -728,8 +728,7 @@ def check_typed_resources():
     for route in ('"/v1/endpoints"', '"/v1/models"', '"/v1/models/"', '"/publications"'):
         if route not in hub_sources:
             bad.append(f"internal/hub: [resources] missing typed route prefix {route}")
-    profile_routes = (pathlib.Path("internal/hub/endpoint_releases.go").read_text() +
-                      pathlib.Path("scripts/endpoint-profile-live.sh").read_text())
+    profile_routes = pathlib.Path("internal/hub/endpoint_releases.go").read_text()
     if "/local-execution" in profile_routes:
         bad.append("internal/hub/endpoint_releases.go: [resources] retired local-execution route remains")
     if "/local-qualification-materials" not in profile_routes:
