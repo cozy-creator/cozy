@@ -5,6 +5,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"os"
+	"strings"
 	"testing"
 
 	"github.com/cozy-creator/cozy-creator/internal/hub"
@@ -54,7 +55,7 @@ func TestDecodeCurrentTensorhubRentalSnapshot(t *testing.T) {
 	}
 }
 
-func TestDecodeRefusesRetiredEvaluatedConfigFields(t *testing.T) {
+func TestDecodeRefusesRetiredSnapshotAndBundleShapes(t *testing.T) {
 	fixture := currentRental(t)
 	var snapshot map[string]any
 	if err := json.Unmarshal(fixture.ControlSnapshot.CanonicalBytes, &snapshot); err != nil {
@@ -101,5 +102,42 @@ func TestDecodeRefusesRetiredEvaluatedConfigFields(t *testing.T) {
 	if _, problem := remotecontrol.Decode(exact(raw), fixture.PackageRef); problem == nil ||
 		problem.ErrName() != "rental.control_snapshot_invalid" {
 		t.Fatalf("retired bundle evaluated_config was not refused: %v", problem)
+	}
+
+	if err := json.Unmarshal(fixture.ControlSnapshot.CanonicalBytes, &snapshot); err != nil {
+		t.Fatal(err)
+	}
+	bundleRaw, err = json.Marshal(snapshot["package_bundle"])
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := json.Unmarshal(bundleRaw, &bundleDocument); err != nil {
+		t.Fatal(err)
+	}
+	if err := json.Unmarshal(bundleDocument.CanonicalBytes, &bundle); err != nil {
+		t.Fatal(err)
+	}
+	sourceTree := bundle["source_tree"]
+	delete(bundle, "source_tree")
+	bundle["format"] = "tensorhub.package_bundle/2"
+	bundle["source_archive"] = sourceTree
+	bundle["source_lock"] = map[string]any{"digest": "sha256:" + strings.Repeat("0", 64), "length": 1}
+	changedBundle, err = json.Marshal(bundle)
+	if err != nil {
+		t.Fatal(err)
+	}
+	changedExact = exact(changedBundle)
+	snapshot["package_bundle"] = map[string]any{
+		"canonical_bytes": changedExact.CanonicalBytes,
+		"digest":          changedExact.Digest,
+		"length":          changedExact.Length,
+	}
+	raw, err = json.Marshal(snapshot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, problem := remotecontrol.Decode(exact(raw), fixture.PackageRef); problem == nil ||
+		problem.ErrName() != "rental.control_snapshot_invalid" {
+		t.Fatalf("retired PackageBundle/2 was not refused: %v", problem)
 	}
 }

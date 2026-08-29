@@ -27,7 +27,7 @@ const (
 	bindingFormat   = "tensorhub.package_binding_release/1"
 	planFormat      = "cozy.package.EntrypointBindingPlan/1"
 	rmbFormat       = "cozy.package.ResolvedModelBinding/1"
-	bundleFormat    = "tensorhub.package_bundle/2"
+	bundleFormat    = "tensorhub.package_bundle/3"
 	receiptFormat   = "cozy.runtime.PackageOverlayReceipt/1"
 	maxSnapshotSize = 64 << 20
 )
@@ -456,7 +456,7 @@ func Decode(control hub.ExactControlDocument, packageRef string) (Facts, *exit.E
 
 	bundle, err := canonical.ReadObject(s.PackageBundle.CanonicalBytes)
 	if err != nil || requireKeys(bundle, "package_descriptor", "package_release_id", "format",
-		"project_wheel", "resolved_wheel_set", "source_archive", "source_lock", "wheelhouse_manifest") != nil ||
+		"project_wheel", "resolved_wheel_set", "source_tree", "wheelhouse_manifest") != nil ||
 		bundle.Str("format") != bundleFormat || bundle.Str("package_release_id") != placementSpec.Str("package_release_id") {
 		return facts, invalid("package bundle disagrees with the placement: %v", err)
 	}
@@ -464,12 +464,10 @@ func Decode(control hub.ExactControlDocument, packageRef string) (Facts, *exit.E
 	if err != nil || !sameRef(bundleDescriptor, s.PackageDescriptor) {
 		return facts, invalid("package bundle descriptor differs from the exact descriptor")
 	}
-	sourceArchive, archiveErr := refOf(bundle.Sub("source_archive"))
-	sourceLock, lockErr := refOf(bundle.Sub("source_lock"))
+	_, sourceErr := refOf(bundle.Sub("source_tree"))
 	resolvedWheels, resolvedErr := refOf(bundle.Sub("resolved_wheel_set"))
-	if archiveErr != nil || lockErr != nil || resolvedErr != nil ||
-		sourceArchive.Digest == sourceLock.Digest {
-		return facts, invalid("package bundle source archive, lock, or resolved wheel set is absent or malformed")
+	if sourceErr != nil || resolvedErr != nil {
+		return facts, invalid("package bundle source tree or resolved wheel set is absent or malformed")
 	}
 	if !sameRef(resolvedWheels, s.ResolvedWheelSet) {
 		return facts, invalid("package bundle resolved wheel set does not match the snapshot document")
