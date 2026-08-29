@@ -91,12 +91,7 @@ func handleModelPublish(ctx *Context) *exit.Error {
 	if e != nil {
 		return e
 	}
-	reason := strings.TrimSpace(ctx.Inv.Value("--reason"))
-	if reason == "" {
-		return exit.Usagef("`cozy model publish` needs --reason <why>").
-			WithRemedy("the hub records why every first-party write happened, before it acts").
-			WithNext("cozy help model publish")
-	}
+	reason := "cozy model publish " + ref.String() + " " + snapshot
 	// The operation is bound to the complete immutable snapshot identity. A user-
 	// supplied operation id could be replayed with different bytes and is therefore
 	// not part of the product surface.
@@ -146,7 +141,7 @@ func handleModelPublish(ctx *Context) *exit.Error {
 			output.Field{K: "missing", V: res.Totals.MissingObjects},
 			output.Field{K: "held", V: res.Totals.HeldObjects})
 		rec := compactRecord(fields, "model", "snapshot", "status", "missing", "changed")
-		rec.Next = []string{"cozy model publish " + ref.String() + " " + snapshot + " --reason <why>"}
+		rec.Next = []string{"cozy model publish " + ref.String() + " " + snapshot}
 		return emit(ctx, rec)
 	}
 	fields = append(fields,
