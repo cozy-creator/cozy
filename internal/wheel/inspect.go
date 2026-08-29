@@ -188,6 +188,11 @@ func Inspect(file string, class InspectClass) (Fact, *exit.Error) {
 		return out, exit.Named(exit.Validation, "project_wheel_not_pure",
 			"project wheel must declare Root-Is-Purelib: true and exactly Tag: %s", Tag)
 	}
+	if class == CustomWheel && out.Native && (pure || equalStrings(wheelTags, []string{Tag})) {
+		return out, exit.Named(exit.Validation, "custom_wheel_native_mislabeled",
+			"native custom wheel declares purelib or %s", Tag).
+			WithRemedy("publish the original correctly tagged prebuilt wheel; Creator never retags or repairs it")
+	}
 	if e := verifyRecord(recordDoc, members, distInfo+"/RECORD"); e != nil {
 		return out, e
 	}

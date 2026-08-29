@@ -78,6 +78,19 @@ object = "marco_polo:app"
 		problem.ErrName() != "project_wheel_not_pure" {
 		t.Fatalf("non-pure project tag was not refused: %v", problem)
 	}
+	mislabeled := filepath.Join(t.TempDir(), "custom_op-1.2.3-py3-none-any.whl")
+	writeTestWheel(t, mislabeled, "custom_op", "1.2.3", true,
+		[]string{"py3-none-any"}, map[string][]byte{"custom_op/_native.so": []byte("native")})
+	if _, problem := wheel.Inspect(mislabeled, wheel.CustomWheel); problem == nil ||
+		problem.ErrName() != "custom_wheel_native_mislabeled" {
+		t.Fatalf("native custom wheel mislabeled pure was not refused: %v", problem)
+	}
+	oddPure := filepath.Join(t.TempDir(), "helper-1.0.0-cp312-none-linux_x86_64.whl")
+	writeTestWheel(t, oddPure, "helper", "1.0.0", true,
+		[]string{"cp312-none-linux_x86_64"}, map[string][]byte{"helper.py": []byte("value=1\n")})
+	if fact, problem := wheel.Inspect(oddPure, wheel.CustomWheel); problem != nil || fact.Native {
+		t.Fatalf("platform-tagged but measured-pure custom wheel was misclassified: %+v %v", fact, problem)
+	}
 
 	profiles, problem := endpointprofile.NormalizeSet([]string{endpointprofile.CU130, endpointprofile.CU126, endpointprofile.CU130})
 	if problem != nil || strings.Join(profiles, ",") != endpointprofile.CU126+","+endpointprofile.CU130 {

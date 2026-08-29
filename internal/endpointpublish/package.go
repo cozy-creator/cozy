@@ -192,7 +192,7 @@ func Prepare(req Request) (*Package, *exit.Error) {
 	}
 	native := false
 	for _, item := range custom {
-		native = native || len(item.Wheel.Tags) != 1 || item.Wheel.Tags[0] != wheel.Tag
+		native = native || item.Wheel.Native
 	}
 	if native {
 		if config.NativeWheelProof == nil || !digest(config.NativeWheelProof.ExpectedResultDigest) ||
