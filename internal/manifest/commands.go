@@ -470,7 +470,7 @@ var Commands = []Command{
 		Summary: "rent a pod through the hub and pin its dial triple for `run --worker`",
 		Args:    "<endpoint-ref>", MinArgs: 1, MaxArgs: 1,
 		Flags: []Flag{
-			{Name: "--accelerator", Arg: "<model>", Summary: "required; provider-neutral accelerator model"},
+			{Name: "--accelerator", Arg: "<model>", Summary: "required; CPU or provider-neutral accelerator model"},
 			{Name: "--idempotency-key", Arg: "<key>", Summary: "resume one paid ask; the same key never buys twice"},
 			{Name: "--timeout", Arg: "<dur>", Summary: "give up waiting for ready; the pod is NOT released"},
 			{Name: "--reason", Arg: "<why>", Summary: "required; the hub records it durably before it acts"},
