@@ -44,9 +44,10 @@ object = "marco_polo:app"
 	if problem != nil {
 		t.Fatalf("current working tree build refused: %s", problem)
 	}
-	if strings.Join(packed.Fact.Tags, ",") != wheel.Tag ||
-		strings.Join(packed.Fact.ImportRoots, ",") != "marco_polo" {
-		t.Fatalf("project WheelFact disagrees with built bytes: %+v", packed.Fact)
+	fact, problem := wheel.Inspect(packed.Path, wheel.ProjectWheel)
+	if problem != nil || strings.Join(fact.Tags, ",") != wheel.Tag ||
+		strings.Join(fact.ImportRoots, ",") != "marco_polo" {
+		t.Fatalf("project WheelFact disagrees with built bytes: %+v %v", fact, problem)
 	}
 	entries := wheelEntries(t, packed.Path)
 	for _, required := range []string{"marco_polo/__init__.py", "marco_polo/untracked.py"} {
@@ -56,12 +57,20 @@ object = "marco_polo:app"
 	}
 
 	mustWrite(t, filepath.Join(root, "marco_polo", "native.so"), "native")
-	if _, problem := wheel.Build(wheel.Request{Tree: root, OutDir: filepath.Join(root, "native-out")}); problem == nil || problem.ErrName() != "project_wheel_native_file" {
+	native, problem := wheel.Build(wheel.Request{Tree: root, OutDir: filepath.Join(root, "native-out")})
+	if problem != nil {
+		t.Fatalf("standard native wheel build failed before Tensorhub inspection: %s", problem.Message)
+	}
+	if _, problem := wheel.Inspect(native.Path, wheel.ProjectWheel); problem == nil || problem.ErrName() != "project_wheel_native_file" {
 		t.Fatalf("native project file was not refused by name: %v", problem)
 	}
 	must(t, os.Remove(filepath.Join(root, "marco_polo", "native.so")))
 	mustWrite(t, filepath.Join(root, "marco_polo", ".env.local"), "TOKEN=secret\n")
-	if _, problem := wheel.Build(wheel.Request{Tree: root, OutDir: filepath.Join(root, "secret-out")}); problem == nil || problem.ErrName() != "project_wheel_credential" {
+	secret, problem := wheel.Build(wheel.Request{Tree: root, OutDir: filepath.Join(root, "secret-out")})
+	if problem != nil {
+		t.Fatalf("standard credential wheel build failed before Tensorhub inspection: %s", problem.Message)
+	}
+	if _, problem := wheel.Inspect(secret.Path, wheel.ProjectWheel); problem == nil || problem.ErrName() != "project_wheel_credential" {
 		t.Fatalf("project wheel credential was not refused: %v", problem)
 	}
 
@@ -71,7 +80,7 @@ object = "marco_polo:app"
 			"custom_op/__init__.py": []byte("from ._native import run\n"),
 			"custom_op/_native.so":  []byte("prebuilt-native-fixture"),
 		})
-	fact, problem := wheel.Inspect(custom, wheel.CustomWheel)
+	fact, problem = wheel.Inspect(custom, wheel.CustomWheel)
 	if problem != nil {
 		t.Fatalf("prebuilt custom wheel refused: %s", problem)
 	}

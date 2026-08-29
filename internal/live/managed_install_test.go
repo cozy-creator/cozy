@@ -35,6 +35,8 @@ func TestQualifiedManagedLocalInstall(t *testing.T) {
 	mustWrite(t, filepath.Join(projectTree, "marco", "__init__.py"), "app=object()\n")
 	packed, problem := wheel.Build(wheel.Request{Tree: projectTree, OutDir: t.TempDir()})
 	fatal(t, problem)
+	projectFact, problem := wheel.Inspect(packed.Path, wheel.ProjectWheel)
+	fatal(t, problem)
 	wheelBytes := mustRead(t, packed.Path)
 	customPath := filepath.Join(t.TempDir(), "custom_op-1.2.3-cp312-cp312-manylinux_2_28_x86_64.whl")
 	writeTestWheel(t, customPath, "custom_op", "1.2.3", false,
@@ -46,7 +48,7 @@ func TestQualifiedManagedLocalInstall(t *testing.T) {
 	fatal(t, problem)
 	customBytes := mustRead(t, customPath)
 
-	bundle := jcs(t, map[string]any{"format": "tensorhub.package_bundle/2", "project_wheel": packed.Fact})
+	bundle := jcs(t, map[string]any{"format": "tensorhub.package_bundle/2", "project_wheel": projectFact})
 	resolved := jcs(t, map[string]any{"format": "ResolvedWheelSet/3", "wheels": []any{customFact}})
 	lock := jcs(t, map[string]any{"format": "tensorhub.resolution_lock/1"})
 	baseDistributions := []map[string]string{{"distribution": "torch", "version": "2.13.0+cu130"}}
@@ -78,11 +80,11 @@ func TestQualifiedManagedLocalInstall(t *testing.T) {
 		"format": "cozy.runtime.PackageOverlayReceipt/1",
 		"overlay_wheels": []map[string]string{
 			{"digest": customFact.Digest, "distribution": customFact.Distribution, "owner": "custom", "version": customFact.Version},
-			{"digest": packed.Fact.Digest, "distribution": packed.Fact.Distribution, "owner": "project", "version": packed.Fact.Version},
+			{"digest": projectFact.Digest, "distribution": projectFact.Distribution, "owner": "project", "version": projectFact.Version},
 		},
-		"project_wheel_digest": packed.Fact.Digest,
+		"project_wheel_digest": projectFact.Digest,
 	})
-	wheelDigests := []string{customFact.Digest, packed.Fact.Digest}
+	wheelDigests := []string{customFact.Digest, projectFact.Digest}
 	sort.Strings(wheelDigests)
 	overlayContentDigest := digestText(jcs(t, map[string]any{
 		"base_family_digest": digestText(wheelhouse), "format": "cozy.runtime.PackageOverlayContent/1",
@@ -200,7 +202,7 @@ print(json.dumps({"digest":"sha256:"+hashlib.sha256(evidence).hexdigest(),"lengt
 				"native_wheel_proof": map[string]any{
 					"expected_result_digest": "sha256:" + strings.Repeat("3", 64), "fixture": "custom_op:run"},
 				"downloads": []map[string]any{
-					{"role": "project_wheel", "ref": map[string]any{"digest": packed.Fact.Digest, "length": len(wheelBytes)}, "url": server.URL + "/wheel", "expires_at": expiresAt},
+					{"role": "project_wheel", "ref": map[string]any{"digest": projectFact.Digest, "length": len(wheelBytes)}, "url": server.URL + "/wheel", "expires_at": expiresAt},
 					{"role": "custom_wheel:custom-op:" + strings.TrimPrefix(customFact.Digest, "sha256:"), "ref": map[string]any{"digest": customFact.Digest, "length": len(customBytes)}, "url": server.URL + "/custom", "expires_at": expiresAt},
 				},
 			})
@@ -276,7 +278,7 @@ print(json.dumps({"digest":"sha256:"+hashlib.sha256(evidence).hexdigest(),"lengt
 		t.Fatalf("failed native-evidence replacement disturbed active install: %+v", active)
 	}
 	writeExecutable(t, filepath.Join(base, "bin", "cozy-native-wheel-proof"), nativeProof(nativeEvidence))
-	badReceipt := bytes.Replace(runtimeReceipt, []byte(packed.Fact.Digest), []byte(wrongDigest), 1)
+	badReceipt := bytes.Replace(runtimeReceipt, []byte(projectFact.Digest), []byte(wrongDigest), 1)
 	writeExecutable(t, filepath.Join(base, "bin", "cozy-environment-proof"), environmentProof(badReceipt))
 	if code, output := run("package", "install", "cozy/marco@1.0.0", "--profile", packageprofile.CU130,
 		"--major", "v1", "--force", "--reason", "receipt mismatch fixture"); code != 1 ||

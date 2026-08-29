@@ -54,11 +54,14 @@ func Prepare(req Request) (*Package, *exit.Error) {
 
 var ignoredDir = map[string]bool{
 	".git": true, ".hg": true, ".svn": true, ".jj": true,
-	".venv": true, "venv": true, "node_modules": true,
 	"__pycache__": true, ".mypy_cache": true, ".ruff_cache": true,
-	".pytest_cache": true, ".tox": true, ".idea": true, ".vscode": true,
+	".pytest_cache": true, ".tox": true,
 	".aws": true, ".ssh": true, "credentials": true, "secrets": true,
-	"build": true, "dist": true,
+}
+
+var ignoredRootDir = map[string]bool{
+	".venv": true, "venv": true, "node_modules": true,
+	".idea": true, ".vscode": true, "build": true, "dist": true,
 }
 
 var ignoredFile = map[string]bool{
@@ -87,7 +90,13 @@ func sourceTree(tree string) (string, map[string]string, *exit.Error) {
 		}
 		name := strings.ToLower(entry.Name())
 		if entry.IsDir() {
-			if ignoredDir[name] || strings.HasSuffix(name, ".egg-info") {
+			rel, err := filepath.Rel(root, file)
+			if err != nil {
+				return err
+			}
+			atRoot := !strings.Contains(filepath.ToSlash(rel), "/")
+			if ignoredDir[name] || strings.HasSuffix(name, ".egg-info") ||
+				(atRoot && ignoredRootDir[name]) {
 				return fs.SkipDir
 			}
 			return nil

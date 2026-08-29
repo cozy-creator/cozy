@@ -80,8 +80,8 @@ Remove local package generations with:
 cozy package remove org/name
 ```
 
-Publishing builds the current working tree with `uv build --wheel`, then accepts only one bounded
-pure project wheel. Git, commits, and a clean tree are not publication inputs. Tensorhub derives
+Publishing builds the current working tree with `uv build --wheel`; Tensorhub accepts only one
+bounded pure project wheel. Git, commits, and a clean tree are not publication inputs. Tensorhub derives
 compatible base worker profiles from wheel metadata, `uv.lock`, and its image inventory. The
 package name is created automatically when absent:
 

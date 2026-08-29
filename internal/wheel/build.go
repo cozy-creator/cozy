@@ -20,7 +20,6 @@ type Request struct {
 
 type Result struct {
 	Path string
-	Fact Fact
 }
 
 // Build asks uv to build the current working tree, then validates the exact
@@ -67,9 +66,10 @@ func Build(req Request) (*Result, *exit.Error) {
 		return nil, exit.Named(exit.Validation, "project_wheel_build_result_invalid",
 			"uv build emitted %d wheels; package publication requires exactly one", len(wheels))
 	}
-	fact, problem := Inspect(wheels[0], ProjectWheel)
-	if problem != nil {
-		return nil, problem
+	info, err = os.Stat(wheels[0])
+	if err != nil || !info.Mode().IsRegular() || info.Size() <= 0 || info.Size() > MaxWheelBytes {
+		return nil, exit.Named(exit.Validation, "project_wheel_build_result_invalid",
+			"uv build output is not one regular wheel at or below %d B", MaxWheelBytes)
 	}
-	return &Result{Path: wheels[0], Fact: fact}, nil
+	return &Result{Path: wheels[0]}, nil
 }

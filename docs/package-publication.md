@@ -17,9 +17,9 @@ are published normally.
 
 Creator runs `uv build --wheel` against that current tree. `uv` invokes the
 project's declared PEP 517 backend; Creator does not maintain another Python
-package builder. The emitted wheel must be one bounded `py3-none-any` wheel and
-must not contain native code, nested wheels, credentials, unsafe paths, or
-executable `.pth` behavior.
+package builder. Creator uploads the one resulting wheel, and Tensorhub verifies
+that it is bounded `py3-none-any` content without native code, nested wheels,
+credentials, unsafe paths, or executable `.pth` behavior.
 
 Publication is one small release transaction:
 
