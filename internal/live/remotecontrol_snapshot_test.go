@@ -46,7 +46,7 @@ func TestDecodeCurrentTensorhubRentalSnapshot(t *testing.T) {
 	}
 	if facts.PackageExecutionDigest == "" || facts.PackageDescriptor == nil ||
 		facts.Placement.Package != "proof/package" ||
-		facts.Placement.ReleaseID != "proof/package@v1" ||
+		facts.Placement.PackageReleaseID != "proof/package@v1" ||
 		facts.Placement.PackageDescriptorDigest != facts.PackageDescriptor.Digest ||
 		facts.Placement.EnvironmentSpecDigest == "" || len(facts.Placement.Bindings) != 1 ||
 		facts.Placement.Bindings[0].Entrypoint != "marco" {

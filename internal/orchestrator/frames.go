@@ -162,7 +162,7 @@ func (c *Orchestrator) converge(s *session, w *worker, placements []DesiredPlace
 // bypasses this author entirely because converge relays Tensorhub's exact PlacementSet.
 func (c *Orchestrator) placementSpec(w *worker, p DesiredPlacement) *pb.PlacementSpec {
 	spec := &pb.PlacementSpec{
-		PackageReleaseId: p.ReleaseID,
+		PackageReleaseId: p.PackageReleaseID,
 		BindingPlans:     w.subjects,
 		ModelObjectSet:   modelObjectSetSubject(p),
 	}

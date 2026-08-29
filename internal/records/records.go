@@ -89,7 +89,7 @@ CREATE TABLE IF NOT EXISTS install_generations (
   link_mode     TEXT    NOT NULL,
   packages      INTEGER NOT NULL,
   closure       TEXT    NOT NULL,
-  descriptor    TEXT    NOT NULL,
+  package_descriptor TEXT    NOT NULL,
   bytes_excl    INTEGER NOT NULL,
   bytes_shared  INTEGER NOT NULL,
   created_at    TEXT    NOT NULL
@@ -103,7 +103,7 @@ CREATE TABLE IF NOT EXISTS pins (
 )`, `
 CREATE TABLE IF NOT EXISTS managed_profile_installs (
   install_id                    TEXT PRIMARY KEY REFERENCES install_generations(id) ON DELETE CASCADE,
-  release_id                   TEXT NOT NULL,
+  package_release_id                   TEXT NOT NULL,
   profile                      TEXT NOT NULL,
   candidate_id                 TEXT NOT NULL,
   base_realization_digest      TEXT NOT NULL,
@@ -244,7 +244,7 @@ func (s *Store) Activate(g PackageInstall) (superseded string, e *exit.Error) {
 
 type ManagedProfileInstall struct {
 	InstallID                string
-	ReleaseID                string
+	PackageReleaseID         string
 	Profile                  string
 	CandidateID              string
 	BaseRealizationDigest    string
@@ -267,7 +267,7 @@ type ManagedProfileInstall struct {
 func (s *Store) ActivateManaged(g PackageInstall, facts ManagedProfileInstall) (string, *exit.Error) {
 	facts.InstallID = g.ID
 	for name, value := range map[string]string{
-		"release": facts.ReleaseID, "profile": facts.Profile, "candidate": facts.CandidateID,
+		"release": facts.PackageReleaseID, "profile": facts.Profile, "candidate": facts.CandidateID,
 		"base realization": facts.BaseRealizationDigest, "wheelhouse": facts.WheelhouseManifestDigest,
 		"environment": facts.EnvironmentSpecDigest, "bundle": facts.PackageBundleDigest,
 		"resolved wheels": facts.ResolvedWheelSetDigest, "resolution lock": facts.ResolutionLockDigest,
@@ -313,12 +313,12 @@ func (s *Store) activate(g PackageInstall, managed *ManagedProfileInstall) (supe
 	if managed != nil {
 		managed.RecordedAt = g.CreatedAt
 		if _, err := tx.Exec(`INSERT INTO managed_profile_installs(
-			install_id,release_id,profile,candidate_id,base_realization_digest,
+			install_id,package_release_id,profile,candidate_id,base_realization_digest,
 			wheelhouse_manifest_digest,environment_spec_digest,
 			package_bundle_digest,resolved_wheel_set_digest,resolution_lock_digest,
 			installed_receipt_digest,installed_receipt_length,host_evidence_digest,
 			native_evidence_digest,lease_id,lease_expires_at,recorded_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
-			managed.InstallID, managed.ReleaseID, managed.Profile, managed.CandidateID,
+			managed.InstallID, managed.PackageReleaseID, managed.Profile, managed.CandidateID,
 			managed.BaseRealizationDigest,
 			managed.WheelhouseManifestDigest, managed.EnvironmentSpecDigest,
 			managed.PackageBundleDigest, managed.ResolvedWheelSetDigest,
@@ -345,13 +345,13 @@ func (s *Store) activate(g PackageInstall, managed *ManagedProfileInstall) (supe
 
 func (s *Store) ManagedInstall(installID string) (*ManagedProfileInstall, *exit.Error) {
 	var out ManagedProfileInstall
-	err := s.db.QueryRow(`SELECT install_id,release_id,profile,candidate_id,
+	err := s.db.QueryRow(`SELECT install_id,package_release_id,profile,candidate_id,
 		base_realization_digest,wheelhouse_manifest_digest,
 		environment_spec_digest,package_bundle_digest,resolved_wheel_set_digest,
 		resolution_lock_digest,installed_receipt_digest,installed_receipt_length,
 		host_evidence_digest,native_evidence_digest,lease_id,lease_expires_at,recorded_at
 		FROM managed_profile_installs WHERE install_id=?`, installID).Scan(
-		&out.InstallID, &out.ReleaseID, &out.Profile, &out.CandidateID,
+		&out.InstallID, &out.PackageReleaseID, &out.Profile, &out.CandidateID,
 		&out.BaseRealizationDigest, &out.WheelhouseManifestDigest,
 		&out.EnvironmentSpecDigest, &out.PackageBundleDigest, &out.ResolvedWheelSetDigest,
 		&out.ResolutionLockDigest, &out.InstalledReceiptDigest, &out.InstalledReceiptLength,

@@ -5,7 +5,7 @@
 // Nothing here is a mock, and nothing in the orchestrator knows it exists.
 //
 // It is spawned by `internal/live`'s suite as an ordinary worker: the orchestrator
-// appends its own launch grammar (--socket/--out/--instance-id/--release-id/--devices/
+// appends its own launch grammar (--socket/--out/--instance-id/--package-release-id/--devices/
 // --grace), and `--arm` picks which of the adversary behaviours this process plays.
 package main
 
@@ -30,7 +30,7 @@ var (
 	// report an instance identity this owner never spawned.
 	fakeInstance = flag.String("fake-instance", "", "report an instance identity nobody spawned")
 	instanceID   = flag.String("instance-id", "", "")
-	releaseID    = flag.String("release-id", "", "")
+	releaseID    = flag.String("package-release-id", "", "")
 	arm          = flag.String("arm", "idle", "idle|badcred|badrelease|steal|badterminal|dropack|output|missing-output")
 	session      = flag.String("session", "", "a fixed worker_boot_id (the collision arm)")
 	cozyHome     = flag.String("cozy-home", "", "this worker's own root")

@@ -70,10 +70,10 @@ func SourceDir(gen records.PackageInstall) string {
 	return filepath.Join(gen.Dir, "source")
 }
 
-// ReleaseID is the package release identity this host serves the generation under. It is
+// PackageReleaseID is the package release identity this host serves the generation under. It is
 // what the orchestrator pins and what a registering worker must match: an install
 // generation of one package version is one provisioned instance lifetime.
-func ReleaseID(gen records.PackageInstall) string {
+func PackageReleaseID(gen records.PackageInstall) string {
 	version := gen.Version
 	if version == "" {
 		version = gen.ID
@@ -111,9 +111,9 @@ func (f *Facts) Placement() (orchestrator.DesiredPlacement, *exit.Error) {
 			"runtime reported modeled bindings and weightless plans for one placement")
 	}
 	placement := orchestrator.DesiredPlacement{
-		Package:   f.Install.Package,
-		ReleaseID: ReleaseID(f.Install),
-		InstallID: f.Install.ID,
+		Package:          f.Install.Package,
+		PackageReleaseID: PackageReleaseID(f.Install),
+		InstallID:        f.Install.ID,
 		// The descriptor this install derived in the generation's own Runtime. It names
 		// the placement's surface by digest.
 		PackageDescriptorDigest: f.Install.PackageDescriptor,
@@ -204,7 +204,7 @@ func (f *Facts) binding(ep *Entrypoint, table map[string]Binding) (*orchestrator
 		// somewhere else. What names the package inside the identity is
 		// `package_release` below — the same string on both machines by construction.
 		"project":                   f.Source,
-		"package_release":           ReleaseID(f.Install),
+		"package_release":           PackageReleaseID(f.Install),
 		"entrypoint":                ep.Name,
 		"model_construction_digest": "",
 	}

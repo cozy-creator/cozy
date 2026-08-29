@@ -64,7 +64,7 @@ func (f *Facts) JobSpec(function string, devices []string) (orchestrator.WorkerL
 	spec := orchestrator.WorkerLaunchSpec{
 		Placement: orchestrator.DesiredPlacement{
 			Package:                 f.Install.Package,
-			ReleaseID:               ReleaseID(f.Install),
+			PackageReleaseID:        PackageReleaseID(f.Install),
 			InstallID:               f.Install.ID,
 			PackageDescriptorDigest: f.Install.PackageDescriptor,
 			Jobs: []*orchestrator.JobPlan{{
@@ -76,7 +76,7 @@ func (f *Facts) JobSpec(function string, devices []string) (orchestrator.WorkerL
 				// refuses an unknown key, exactly as the binding record's reader does.
 				Record: map[string]any{
 					"job_descriptor_id":           facts.DescriptorID,
-					"build_id":                    ReleaseID(f.Install),
+					"build_id":                    PackageReleaseID(f.Install),
 					"project":                     f.Source,
 					"job":                         facts.Name,
 					"gpu_count":                   facts.GPUCount,

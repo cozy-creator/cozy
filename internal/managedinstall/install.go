@@ -299,7 +299,7 @@ func Run(ctx context.Context, layout home.Layout, store *records.Store, request 
 	}
 	gen.BytesExcl, gen.BytesShared = install.Disk(genDir)
 	facts := records.ManagedProfileInstall{
-		ReleaseID: request.Release, Profile: profile, CandidateID: grant.CandidateID,
+		PackageReleaseID: request.Release, Profile: profile, CandidateID: grant.CandidateID,
 		BaseRealizationDigest:    grant.BaseRealization.Digest,
 		WheelhouseManifestDigest: grant.WheelhouseManifest.Digest,
 		EnvironmentSpecDigest:    grant.PackageEnvironmentSpec.Digest,

@@ -18,7 +18,7 @@ func TestReconcilePreservesWorkerWithUnresolvedBirthIdentity(t *testing.T) {
 	defer o.close()
 
 	pending := records.WorkerProcess{
-		InstanceID: "ins-pending-birth", Package: "fake/pending", ReleaseID: fakeRelease,
+		InstanceID: "ins-pending-birth", Package: "fake/pending", PackageReleaseID: fakeRelease,
 		WorkerID: "local", Devices: []string{"7"},
 	}
 	fatal(t, o.store.SpawnWorker(pending))
@@ -35,7 +35,7 @@ func TestReconcilePreservesWorkerWithUnresolvedBirthIdentity(t *testing.T) {
 		t.Fatalf("unresolved worker row was not retained: %#v", rows)
 	}
 	if problem := o.store.SpawnWorker(records.WorkerProcess{
-		InstanceID: "ins-rival", Package: "fake/rival", ReleaseID: fakeRelease,
+		InstanceID: "ins-rival", Package: "fake/rival", PackageReleaseID: fakeRelease,
 		WorkerID: "local", Devices: []string{"7"},
 	}); problem == nil || problem.Code != exit.Conflict {
 		t.Fatalf("retained unresolved grant did not block a second worker: %v", problem)

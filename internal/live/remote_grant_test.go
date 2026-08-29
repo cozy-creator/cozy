@@ -58,7 +58,7 @@ func TestRemotePlacementReceivesGrantBeforeDesired(t *testing.T) {
 	setSpelling, _ := canonical.Spell(setDigest)
 	placement := orchestrator.DesiredPlacement{
 		PlacementRevision: 1,
-		Package:           "cozy/package@rental-1", ReleaseID: "release-1",
+		Package:           "cozy/package@rental-1", PackageReleaseID: "release-1",
 		PlacementIDValue: "acquisition-1", ExactPlacementSetDigest: setSpelling,
 		ExactPlacementSetBytes: setBytes, ModelObjectSetDigest: modelDigest,
 		ModelObjectSetLength: uint64(len(modelData)),

@@ -105,8 +105,8 @@ func fakeSpec(name, device string, args ...string) orchestrator.WorkerLaunchSpec
 		Args:    args,
 		Devices: []string{device},
 		Placement: orchestrator.DesiredPlacement{
-			Package:   "fake/" + name,
-			ReleaseID: fakeRelease,
+			Package:          "fake/" + name,
+			PackageReleaseID: fakeRelease,
 			Bindings: []*orchestrator.Binding{{
 				Entrypoint: "fake",
 				Record:     map[string]any{"entrypoint": "fake", "slot": name},

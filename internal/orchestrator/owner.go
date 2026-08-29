@@ -573,7 +573,7 @@ func instancePin(w *worker, declared string) *exit.Error {
 // does claim a release is still held to the host's pin; a stale preloaded package must not
 // be mistaken for the dynamic placement this owner is about to converge.
 func releasePin(w *worker, declared string) *exit.Error {
-	pinned := w.spec.Placement.ReleaseID
+	pinned := w.spec.Placement.PackageReleaseID
 	if pinned == "" {
 		return nil // nothing to pin against — an uninstalled dev spec names no release
 	}

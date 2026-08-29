@@ -155,8 +155,8 @@ func (p WarmupPolicy) Or() WarmupPolicy {
 // rev-2's `Placement` (placement_id -> PlacementSpec, #481). It carries the identity
 // facts, and nothing about how a process is started.
 type DesiredPlacement struct {
-	Package   string `json:"package"`    // org/name — the slot this placement serves under
-	ReleaseID string `json:"release_id"` // PROVENANCE: what the spec was resolved FROM
+	Package          string `json:"package"`            // org/name — the slot this placement serves under
+	PackageReleaseID string `json:"package_release_id"` // PROVENANCE: what the spec was resolved FROM
 	// InstallID is the install this placement was resolved from ("" = an uninstalled dev
 	// tree). Was `Generation`, which named a protocol word this side does not own (#484).
 	InstallID string `json:"install_id"`
@@ -770,12 +770,12 @@ func (c *Orchestrator) spawnWorker(spec WorkerLaunchSpec) (string, *exit.Error) 
 	// The GRANT IS JOURNALED FIRST, before any process exists. An admission that
 	// refuses here means nothing was started, which is why the refusal has no cleanup.
 	if e := c.opt.Store.SpawnWorker(records.WorkerProcess{
-		InstanceID: instanceID,
-		Package:    spec.Placement.Package,
-		Generation: spec.Placement.InstallID,
-		ReleaseID:  spec.Placement.ReleaseID,
-		WorkerID:   "local",
-		Devices:    spec.Devices,
+		InstanceID:       instanceID,
+		Package:          spec.Placement.Package,
+		Generation:       spec.Placement.InstallID,
+		PackageReleaseID: spec.Placement.PackageReleaseID,
+		WorkerID:         "local",
+		Devices:          spec.Devices,
 	}); e != nil {
 		logFile.Close()
 		return "", e
@@ -804,7 +804,7 @@ func (c *Orchestrator) spawnWorker(spec WorkerLaunchSpec) (string, *exit.Error) 
 		"--socket", listen,
 		"--out", filepath.Join(root, "run"),
 		"--instance-id", instanceID,
-		"--release-id", spec.Placement.ReleaseID,
+		"--package-release-id", spec.Placement.PackageReleaseID,
 		"--devices", strings.Join(spec.Devices, ","),
 		"--grace", strconv.FormatFloat(graceOr(spec.GraceSec), 'f', -1, 64),
 	)
@@ -1005,11 +1005,11 @@ func (c *Orchestrator) connectWorker(spec WorkerLaunchSpec) (string, *exit.Error
 	// cards, and the pod's card is the pod's. There is no grant to journal and none to
 	// release, which is also why nothing here has a pid or a birth identity to record.
 	if e := c.opt.Store.AttachWorker(records.WorkerProcess{
-		InstanceID: instanceID,
-		Package:    spec.Placement.Package,
-		Generation: spec.Placement.InstallID,
-		ReleaseID:  spec.Placement.ReleaseID,
-		WorkerID:   "remote",
+		InstanceID:       instanceID,
+		Package:          spec.Placement.Package,
+		Generation:       spec.Placement.InstallID,
+		PackageReleaseID: spec.Placement.PackageReleaseID,
+		WorkerID:         "remote",
 	}); e != nil {
 		return "", e
 	}
@@ -1219,7 +1219,7 @@ type WorkerFacts struct {
 	InstanceID                 string   `json:"instance_id"`
 	RentalID                   string   `json:"rental_id,omitempty"`
 	Package                    string   `json:"package"`
-	ReleaseID                  string   `json:"release_id"`
+	PackageReleaseID           string   `json:"package_release_id"`
 	BootID                     string   `json:"worker_boot_id"`
 	PlacementID                string   `json:"placement_id"`
 	PlacementSpecDigest        string   `json:"placement_spec_digest"`
@@ -1296,7 +1296,7 @@ func (c *Orchestrator) Workers() []WorkerFacts {
 func factsOf(w *worker) WorkerFacts {
 	f := WorkerFacts{
 		InstanceID: w.instanceID, Package: w.spec.Placement.Package,
-		ReleaseID: w.spec.Placement.ReleaseID, BootID: w.bootID,
+		PackageReleaseID: w.spec.Placement.PackageReleaseID, BootID: w.bootID,
 		PlacementID: w.placementID, Generation: w.generation,
 		Exited: w.exited, Devices: w.spec.Devices,
 

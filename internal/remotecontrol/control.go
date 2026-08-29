@@ -579,7 +579,7 @@ func Decode(control hub.ExactControlDocument, packageRef string) (Facts, *exit.E
 	facts.PackageExecutionDigest = s.PackageExecutionDigest
 	facts.ArtifactObjectSetDigest = s.ArtifactObjectSet.Digest
 	facts.Placement = orchestrator.DesiredPlacement{
-		Package: repo.String(), ReleaseID: placementSpec.Str("package_release_id"),
+		Package: repo.String(), PackageReleaseID: placementSpec.Str("package_release_id"),
 		// No InstallID: a remote placement resolves from Tensorhub's attempt, never a
 		// local install row; the attempt id rides PlacementIDValue.
 		PackageDescriptorDigest: s.PackageDescriptor.Digest,
