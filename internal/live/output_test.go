@@ -75,6 +75,16 @@ func TestCatalogOutputIsTheDomainAnswer(t *testing.T) {
 		t.Fatalf("--full did not expose the catalog diagnostics: %#v", first)
 	}
 
+	code, selected := run("endpoint", "search", "--fields=ref,created", "--json")
+	var selectedDocument map[string]any
+	if err := json.Unmarshal([]byte(selected), &selectedDocument); code != 0 || err != nil {
+		t.Fatalf("selected catalog output [exit %d]: %v\n%s", code, err, selected)
+	}
+	selectedRow := selectedDocument["endpoints"].([]any)[0].(map[string]any)
+	if len(selectedRow) != 2 || selectedRow["ref"] == "" || selectedRow["created"] == "" {
+		t.Fatalf("--fields did not select the exact requested facts: %#v", selectedRow)
+	}
+
 	code, limited := run("endpoint", "search", "--limit=2", "--json")
 	var limitedDocument map[string]any
 	if err := json.Unmarshal([]byte(limited), &limitedDocument); code != 0 || err != nil ||
@@ -87,6 +97,12 @@ func TestCatalogOutputIsTheDomainAnswer(t *testing.T) {
 	if err := json.Unmarshal([]byte(empty), &emptyDocument); code != 0 || err != nil ||
 		len(emptyDocument["endpoints"].([]any)) != 0 || len(emptyDocument) != 2 {
 		t.Fatalf("empty search is not definitive and actionable [exit %d]: %v\n%s", code, err, empty)
+	}
+
+	result := runCozyEnv(env, "endpoint", "search", "--fields=missing")
+	if result.code != 2 || !strings.Contains(result.output, "output.field_unknown") ||
+		!strings.Contains(result.output, "available fields: ref, created, org, name") {
+		t.Fatalf("unknown output field did not refuse with its valid set [exit %d]\n%s", result.code, result.output)
 	}
 }
 
@@ -103,5 +119,9 @@ func TestNounGroupsAreFocusedHelp(t *testing.T) {
 		strings.Contains(out, "kind: error") || strings.Contains(out, "ok: false") ||
 		!strings.Contains(out, "cozy help endpoint") {
 		t.Fatalf("typed usage error carries renderer scaffolding [exit %d]\n%s", code, out)
+	}
+	code, stdout, stderr := runCozyStreams(t, t.TempDir(), "endpoint", "nope")
+	if code != 2 || stdout == "" || stderr != "" {
+		t.Fatalf("structured error crossed streams [exit %d] stdout=%q stderr=%q", code, stdout, stderr)
 	}
 }

@@ -1,6 +1,7 @@
 package live
 
 import (
+	"bytes"
 	"crypto/sha256"
 	"encoding/json"
 	"fmt"
@@ -291,6 +292,20 @@ func runCozy(t *testing.T, root string, args ...string) (int, string) {
 		code = cmd.ProcessState.ExitCode()
 	}
 	return code, string(data)
+}
+
+func runCozyStreams(t *testing.T, root string, args ...string) (int, string, string) {
+	t.Helper()
+	cmd := exec.Command("/usr/bin/nice", append([]string{"-n", "19", cozyBin}, args...)...)
+	cmd.Env = childEnv(t, root)
+	var stdout, stderr bytes.Buffer
+	cmd.Stdout, cmd.Stderr = &stdout, &stderr
+	_ = cmd.Run()
+	code := 0
+	if cmd.ProcessState != nil {
+		code = cmd.ProcessState.ExitCode()
+	}
+	return code, stdout.String(), stderr.String()
 }
 
 func childEnv(t *testing.T, root string, imposed ...string) []string {

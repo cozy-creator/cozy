@@ -49,6 +49,9 @@ func (r Record) Emit(w io.Writer, mode Mode) error {
 	if err != nil {
 		return err
 	}
+	if data == nil {
+		data = map[string]any{}
+	}
 	if len(r.Notes) > 0 {
 		data["notes"] = copyStrings(r.Notes)
 	}
