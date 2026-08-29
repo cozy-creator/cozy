@@ -4,7 +4,7 @@
 // real peer to refuse: real protocol bytes, real canonical documents, a real process.
 // Nothing here is a mock, and nothing in the orchestrator knows it exists.
 //
-// It is spawned by `internal/live`'s suite as an ordinary worker: the orchestrator
+// It is spawned by `tests/product` as an ordinary worker: the orchestrator
 // appends its own launch grammar (--socket/--out/--instance-id/--release-id/--devices/
 // --grace), and `--arm` picks which of the adversary behaviours this process plays.
 package main

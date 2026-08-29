@@ -1,4 +1,4 @@
-package live
+package producttest
 
 import (
 	"crypto/sha256"
@@ -21,7 +21,7 @@ import (
 const weightlessRef = "cozy/weightless"
 
 func TestDaemonWebLifecycle(t *testing.T) {
-	root := filepath.Join(os.TempDir(), "cozy-live", "daemon-web")
+	root := filepath.Join(os.TempDir(), "cozy-product-test", "daemon-web")
 	must(t, os.RemoveAll(root))
 	must(t, os.MkdirAll(root, 0o755))
 	t.Cleanup(func() { _, _ = runCozy(t, root, "down", "--all") })
@@ -132,12 +132,12 @@ func TestDaemonWebLifecycle(t *testing.T) {
 }
 
 func TestDaemonStartupDiagnostic(t *testing.T) {
-	root := filepath.Join(os.TempDir(), "cozy-live", "daemon-startup-diagnostic")
+	root := filepath.Join(os.TempDir(), "cozy-product-test", "daemon-startup-diagnostic")
 	must(t, os.RemoveAll(root))
 	must(t, os.MkdirAll(root, 0o755))
 	t.Cleanup(func() { _, _ = runCozy(t, root, "down", "--all") })
 
-	held, err := net.Listen("tcp4", "127.0.0.1:0") //cozy:allow live proof occupies one loopback port to exercise the real startup refusal
+	held, err := net.Listen("tcp4", "127.0.0.1:0") //cozy:allow product proof occupies one loopback port to exercise the real startup refusal
 	must(t, err)
 	port := held.Addr().(*net.TCPAddr).Port
 	must(t, os.WriteFile(filepath.Join(root, "config.yaml"),
@@ -185,7 +185,7 @@ const maxDaemonDiagnosticOutput = 18 << 10
 // release, auto-start the daemon on invoke, cross Runtime and the worker wire,
 // accept an output, release idle residency, then stop cleanly.
 func TestProductPath(t *testing.T) {
-	root := filepath.Join(os.TempDir(), "cozy-live", "product")
+	root := filepath.Join(os.TempDir(), "cozy-product-test", "product")
 	must(t, os.RemoveAll(root))
 	must(t, os.MkdirAll(root, 0o755))
 	t.Cleanup(func() { _, _ = runCozy(t, root, "down", "--all") })
@@ -287,7 +287,7 @@ func weightlessRelease(t *testing.T) string {
 	}
 	dir := t.TempDir()
 	build := exec.Command("/usr/bin/nice", "-n", "19", "python3",
-		"internal/live/testdata/build-weightless.py", "--out", dir)
+		"tests/product/testdata/build-weightless.py", "--out", dir)
 	build.Dir = "../.."
 	build.Env = childEnv(t, repo, "RUNTIME_REPO="+repo)
 	if out, err := build.CombinedOutput(); err != nil {

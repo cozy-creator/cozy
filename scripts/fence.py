@@ -50,7 +50,7 @@ word inside help text or a doc comment is never a violation. Doors, both greppab
 """
 import pathlib, re, sys
 
-SCAN = ["go.mod", "main.go", "cmd/**/*.go", "internal/**/*.go"]
+SCAN = ["go.mod", "main.go", "cmd/**/*.go", "internal/**/*.go", "tests/**/*.go"]
 
 DENY_DEPS = ["tensorhub-v2", "varena"]
 YAML_IMPORT = "go.yaml.in/yaml/v3"
@@ -199,11 +199,11 @@ PY_ALLOW = {
     "scripts/fence.py": "the fence itself: it spells the vocabulary to deny it",
 }
 
-# (cl-028) The VERIFICATION HOME is the only place an //cozy:allow door may exempt a listen
-# or a runtime indirection: `internal/live` is the go-test suite and it contains the adversary
-# peer (`fakeworker`) it spawns; both bind sockets by design. Product code gets no door for
-# either — a doored non-loopback bind in the product would be the LAN door arriving as a comment.
-DRIVER_DIRS = ("internal/live/",)
+# (cl-028) The PRODUCT-TEST HOME is the only place an //cozy:allow door may exempt a listen
+# or a runtime indirection. `tests/product` drives the product and `tests/support/fakeworker`
+# is the independent protocol peer it spawns; both bind sockets by design. Product code gets no
+# door for either — a doored non-loopback bind in the product would be the LAN door arriving as a comment.
+DRIVER_DIRS = ("tests/product/", "tests/support/fakeworker/")
 DRIVER_DIR = " / ".join(DRIVER_DIRS)
 
 IDENT = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
@@ -319,12 +319,12 @@ def files():
 
 
 def check_test_boundary():
-    """(#634) Go verification has one home: the real-system suite in internal/live."""
+    """(#661) Go verification has one home: the product suite in tests/product."""
     bad = []
     for p in sorted(pathlib.Path(".").rglob("*_test.go")):
         rel = p.as_posix()
-        if not rel.startswith("internal/live/"):
-            bad.append(f"{rel}: [test] *_test.go outside internal/live — #634 keeps one "
+        if not rel.startswith("tests/product/"):
+            bad.append(f"{rel}: [test] *_test.go outside tests/product — #661 keeps one "
                        "real-system verification home and no package-local mocked/unit layer")
     return bad
 
@@ -352,7 +352,6 @@ DOCUMENT_KINDS = {
 FOREIGN_KIND_PREFIXES = ("cozy.worker.v1.", "cozy.package.", "cozy.runtime.", "tensorhub.",
                          "tensorfs.", "cozytensors")
 KIND_READERS: dict[str, set[str]] = {}
-KIND_READERS["cozy.local.ManagedBaseReceipt/1"] = {"internal/live/managed_install_test.go"}
 # No trailing quote: a domain-separation tag is a PREFIX inside a longer literal — it ends
 # in `\x00` or `\n`, and requiring the close quote made both of this repo's tags invisible
 # to the registry that exists to hold exactly this class of cross-repo agreed name.
@@ -551,6 +550,12 @@ def check_manifest():
     for retired in ("StackCmd", "ExitCmd", "WorkflowCmd", "VideoCmd", "JobCmd", "CommandsCmd", "StatusCmd"):
         if retired in source:
             bad.append(f"[grammar] retired command family remains: {retired}")
+    publish = source.split("type PackagePublishCmd struct", 1)[-1].split("type ModelCmd", 1)[0]
+    if "Reason" in publish or '"--reason"' in publish:
+        bad.append("[grammar] package publish retained caller-authored audit prose; decision #662 derives it")
+    handler = pathlib.Path("internal/cli/package_releases.go").read_text()
+    if '"cozy package publish " + ref.String() + "@" + release' not in handler:
+        bad.append("[grammar] package publish no longer derives its internal audit reason from the exact release")
     app = pathlib.Path("internal/cli/app.go").read_text()
     for spelling in VERSION_SPELLINGS:
         if spelling not in app:
@@ -825,5 +830,5 @@ print(
     f"embed({len(DENY_EMBED)} words, scripts allow@{len(PY_ALLOW)}) "
     f"contract({len(parse_go_routes(pathlib.Path('internal/api/routes.go')))} routes) "
     f"web(stub+bounded-upload+no-log) retired-planes(absent) "
-    f"resources(typed package/model, no aliases) test(internal/live only)"
+    f"resources(typed package/model, no aliases) test(tests/product only)"
 )

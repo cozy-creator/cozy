@@ -1,4 +1,4 @@
-package live
+package producttest
 
 import (
 	"bytes"
@@ -47,13 +47,13 @@ func terminateTestDaemon(t *testing.T, root string) {
 }
 
 func TestMain(m *testing.M) {
-	dir, err := os.MkdirTemp("", "cozy-live-bin")
+	dir, err := os.MkdirTemp("", "cozy-product-test-bin")
 	if err != nil {
 		panic(err)
 	}
 	cozyBin = filepath.Join(dir, "cozy")
 	fakeWorkerBin = filepath.Join(dir, "cozy-fakeworker")
-	for _, b := range [][2]string{{cozyBin, "."}, {fakeWorkerBin, "./internal/live/fakeworker"}} {
+	for _, b := range [][2]string{{cozyBin, "."}, {fakeWorkerBin, "./tests/support/fakeworker"}} {
 		build := exec.Command("go", "build", "-o", b[0], b[1])
 		build.Dir = "../.."
 		if out, err := build.CombinedOutput(); err != nil {
@@ -83,7 +83,7 @@ type owner struct {
 
 func hostOwner(t *testing.T, name string) *owner {
 	t.Helper()
-	root := filepath.Join(os.TempDir(), "cozy-live", name)
+	root := filepath.Join(os.TempDir(), "cozy-product-test", name)
 	must(t, os.RemoveAll(root))
 	must(t, os.MkdirAll(root, 0o755))
 	must(t, os.Setenv("COZY_HOME", root))
@@ -118,7 +118,7 @@ func hostOwner(t *testing.T, name string) *owner {
 // close releases the root so a later `cozy invoke list` on the same root is the only owner of it.
 func (o *owner) close() { o.once.Do(o.closer) }
 
-// fakeSpec is a worker slot whose process is internal/live/fakeworker speaking raw protocol
+// fakeSpec is a worker slot whose process is tests/support/fakeworker speaking raw protocol
 // bytes: a real process dialing the real socket over the committed contract.
 func fakeSpec(name, device string, args ...string) orchestrator.WorkerLaunchSpec {
 	return orchestrator.WorkerLaunchSpec{

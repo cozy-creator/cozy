@@ -1,4 +1,4 @@
-package live
+package producttest
 
 import (
 	"encoding/json"
@@ -17,7 +17,7 @@ import (
 // authority plus a CORS header would hand the whole surface over. Every arm is about the
 // door, not the work, so it needs no model, no card, and no runtime peer.
 func TestLocalAPIDoor(t *testing.T) {
-	root := filepath.Join(os.TempDir(), "cozy-live", "api-door")
+	root := filepath.Join(os.TempDir(), "cozy-product-test", "api-door")
 	must(t, os.RemoveAll(root))
 	svc := startDaemonProcess(t, root)
 

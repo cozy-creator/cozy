@@ -12,7 +12,7 @@
 // (non-canonical encoding, unknown key, wrong format), which is what makes a planted
 // key a REFUSAL rather than an ignored unknown field.
 //
-// Conformance is `go test ./internal/live -run TestCanonicalDocuments`, which renders
+// Conformance is `go test ./tests/product -run TestCanonicalDocuments`, which renders
 // worker-protocol's FROZEN fixture corpus through this codec and compares bytes and ids.
 package canonical
 

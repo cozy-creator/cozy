@@ -15,9 +15,9 @@ jobs:
       # cross-compiles cl-013's `release` job depends on.
       - run: CGO_ENABLED=0 go build ./...
       - run: go vet ./...
-      # THE SUITE (decisions.md #634, amending #160 for this repo). `internal/live` starts
+      # THE SUITE (decisions.md #661, reapplying #634 for this repo). `tests/product` starts
       # the real system — the real orchestrator, an auto-started Cozy daemon process, and
-      # `internal/live/fakeworker`, a second independent implementation of the worker protocol —
+      # `tests/support/fakeworker`, a second independent implementation of the worker protocol —
       # and observes what it does. Nothing in it is a mock. The tests that need a peer this
       # runner does not have (worker-protocol's frozen corpus or a cozy-runtime checkout)
       # SKIP by name rather than passing vacuously.
@@ -68,7 +68,7 @@ jobs:
   # fact about the artifact a user would install. They are separate evidence axes and a
   # master-only green may not stand in for this one.
   #
-  # Package execution is covered by internal/live/TestProductPath when a cozy-runtime peer
+  # Package execution is covered by tests/product/TestProductPath when a cozy-runtime peer
   # exists. This job stays about the shipped CLI asset: build, verify, install, run, upgrade.
   release:
     runs-on: ubuntu-latest

@@ -1,4 +1,4 @@
-package live
+package producttest
 
 import (
 	"encoding/hex"
@@ -43,117 +43,7 @@ func TestReconcilePreservesWorkerWithUnresolvedBirthIdentity(t *testing.T) {
 	fatal(t, o.store.CloseWorker(pending.InstanceID))
 }
 
-func TestUnloadStopsOnlyIdleLocalServingWorkers(t *testing.T) {
-	o := hostOwner(t, "unload-idle-only")
-	defer o.close()
-
-	idleSpec := fakeSpec("unload-idle", "6", "--arm", "idle")
-	idleID, _, problem := o.c.EnsureWorker(idleSpec)
-	fatal(t, problem)
-	fatal(t, o.c.EnsurePlacementReady(idleID, planIDOf(t, idleSpec)))
-	stopped, problem := o.c.UnloadIdleLocalWorkers()
-	fatal(t, problem)
-	if len(stopped) != 1 || stopped[0].InstanceID != idleID || o.c.Worker(idleID) != nil {
-		t.Fatalf("unload idle = %#v; worker after = %#v", stopped, o.c.Worker(idleID))
-	}
-
-	activeSpec := fakeSpec("unload-active", "6", "--arm", "idle")
-	activeID, _, problem := o.c.EnsureWorker(activeSpec)
-	fatal(t, problem)
-	planID := planIDOf(t, activeSpec)
-	fatal(t, o.c.EnsurePlacementReady(activeID, planID))
-	requestID, attempt, problem := o.c.Submit(submission(
-		planID, "fake/unload-active", "unload-active", map[string]any{"hold": true}))
-	fatal(t, problem)
-	fatal(t, o.c.AwaitAccepted(requestID, attempt, 15*time.Second))
-
-	stopped, problem = o.c.UnloadIdleLocalWorkers()
-	fatal(t, problem)
-	if len(stopped) != 0 || o.c.Worker(activeID) == nil {
-		t.Fatalf("unload touched active worker: stopped=%#v worker=%#v", stopped, o.c.Worker(activeID))
-	}
-}
-
-func TestDevicePressureEvictsLRUIdleServingWorker(t *testing.T) {
-	o := hostOwner(t, "device-pressure-lru")
-	defer o.close()
-
-	// A arrived first, then was actually used. B arrived later but was never used, so
-	// dispatch-based LRU must evict B before A rather than merely following spawn order.
-	recentSpec := fakeSpec("lru-recent", "0", "--arm", "output", "--cozy-home", o.root)
-	recentID, _, problem := o.c.EnsureWorker(recentSpec)
-	fatal(t, problem)
-	recentPlan := planIDOf(t, recentSpec)
-	fatal(t, o.c.EnsurePlacementReady(recentID, recentPlan))
-
-	olderSpec := fakeSpec("lru-older", "1", "--arm", "idle")
-	olderID, _, problem := o.c.EnsureWorker(olderSpec)
-	fatal(t, problem)
-	fatal(t, o.c.EnsurePlacementReady(olderID, planIDOf(t, olderSpec)))
-
-	requestID, attempt, problem := o.c.Submit(submission(
-		recentPlan, "fake/lru-recent", "lru-recent-use", map[string]any{"use": true}))
-	fatal(t, problem)
-	if _, problem = o.c.Await(requestID, attempt, 15*time.Second); problem != nil {
-		t.Fatalf("recent worker use did not settle: %s", briefly(problem))
-	}
-
-	// The two-device target observes and releases one holder per bounded pass. B is LRU,
-	// then A is the only remaining holder; the exact unchanged launch succeeds.
-	pressure := fakeSpec("lru-pressure", "0", "--arm", "idle")
-	pressure.Devices = []string{"0", "1"}
-	pressureID, _, problem := o.c.EnsureWorker(pressure)
-	fatal(t, problem)
-	fatal(t, o.c.EnsurePlacementReady(pressureID, planIDOf(t, pressure)))
-	if o.c.Worker(olderID) != nil || o.c.Worker(recentID) != nil || o.c.Worker(pressureID) == nil {
-		t.Fatalf("pressure replacement wrong: older=%#v recent=%#v replacement=%#v",
-			o.c.Worker(olderID), o.c.Worker(recentID), o.c.Worker(pressureID))
-	}
-	olderEvent, recentEvent := -1, -1
-	for index, line := range o.c.Events() {
-		if strings.Contains(line, "device pressure: evicting LRU idle local worker "+olderID) {
-			olderEvent = index
-		}
-		if strings.Contains(line, "device pressure: evicting LRU idle local worker "+recentID) {
-			recentEvent = index
-		}
-	}
-	if olderEvent < 0 || recentEvent < 0 || olderEvent >= recentEvent {
-		t.Fatalf("LRU eviction order: older event %d, recent event %d; events=%v",
-			olderEvent, recentEvent, o.c.Events())
-	}
-	o.c.ShutdownWorker(pressureID, 5*time.Second)
-
-	// A held attempt on device 0 makes the whole conflicting envelope ineligible. The
-	// idle worker on device 1 must not be opportunistically evicted when doing so
-	// cannot satisfy the exact launch.
-	activeSpec := fakeSpec("lru-active", "0", "--arm", "idle")
-	activeID, _, problem := o.c.EnsureWorker(activeSpec)
-	fatal(t, problem)
-	activePlan := planIDOf(t, activeSpec)
-	fatal(t, o.c.EnsurePlacementReady(activeID, activePlan))
-	activeRequest, activeAttempt, problem := o.c.Submit(submission(
-		activePlan, "fake/lru-active", "lru-active-hold", map[string]any{"hold": true}))
-	fatal(t, problem)
-	fatal(t, o.c.AwaitAccepted(activeRequest, activeAttempt, 15*time.Second))
-	idleSpec := fakeSpec("lru-idle", "1", "--arm", "idle")
-	idleID, _, problem := o.c.EnsureWorker(idleSpec)
-	fatal(t, problem)
-	fatal(t, o.c.EnsurePlacementReady(idleID, planIDOf(t, idleSpec)))
-
-	blocked := fakeSpec("lru-blocked", "0", "--arm", "idle")
-	blocked.Devices = []string{"0", "1"}
-	if _, _, problem = o.c.EnsureWorker(blocked); problem == nil ||
-		problem.ErrName() != "device_envelope_held" {
-		t.Fatalf("active pressure = %v, want device conflict", problem)
-	}
-	if o.c.Worker(activeID) == nil || o.c.Worker(idleID) == nil {
-		t.Fatalf("pressure evicted through active work: active=%#v idle=%#v",
-			o.c.Worker(activeID), o.c.Worker(idleID))
-	}
-}
-
-// TestWorkerRefusals is the interop proof. `internal/live/fakeworker` is a SECOND, independent
+// TestWorkerRefusals is the interop proof. `tests/support/fakeworker` is a second, independent
 // implementation of the worker protocol that the orchestrator was not co-developed
 // against: it hosts WorkerControl, authors real canonical documents, and lies in exactly
 // the ways a hostile or broken peer would. Every refusal below is the real orchestrator
