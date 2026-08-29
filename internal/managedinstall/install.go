@@ -66,7 +66,7 @@ type proofOutput struct {
 	Reused     bool   `json:"reused"`
 }
 
-func Run(layout home.Layout, store *records.Store, request Request) (*Result, *exit.Error) {
+func Run(ctx context.Context, layout home.Layout, store *records.Store, request Request) (*Result, *exit.Error) {
 	grant := request.Grant
 	if request.Endpoint == "" || request.Release == "" || request.Major <= 0 ||
 		grant.CandidateID == "" || grant.Profile != request.Profile ||
@@ -172,7 +172,7 @@ func Run(layout home.Layout, store *records.Store, request Request) (*Result, *e
 		}
 		seenRoles[download.Role] = true
 		target := filepath.Join(wheelDir, fact.Filename)
-		if problem := transfer.DownloadExact(context.Background(), download.Role, download.URL,
+		if problem := transfer.DownloadExact(ctx, download.Role, download.URL,
 			target, download.Ref.Digest, download.Ref.Length); problem != nil {
 			return fail(problem)
 		}

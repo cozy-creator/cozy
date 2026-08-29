@@ -85,6 +85,7 @@ func Inspect(file string, class InspectClass) (Fact, *exit.Error) {
 
 	seen := map[string]bool{}
 	members := map[string][]byte{}
+	var expanded uint64
 	var wheelDoc, metadataDoc, recordDoc []byte
 	var distInfo string
 	rootCandidates := map[string]bool{}
@@ -100,6 +101,11 @@ func Inspect(file string, class InspectClass) (Fact, *exit.Error) {
 		seen[folded] = true
 		if member.FileInfo().IsDir() {
 			continue
+		}
+		expanded += member.UncompressedSize64
+		if expanded > uint64(MaxWheelBytes) {
+			return out, exit.Named(exit.Validation, "wheel_expansion_too_large",
+				"%s expands past the %d-byte wheel limit", filename, MaxWheelBytes)
 		}
 		if member.Mode()&os.ModeSymlink != 0 || !member.Mode().IsRegular() {
 			return out, exit.Named(exit.Validation, "wheel_entry_invalid", "%s is not a regular file", name)

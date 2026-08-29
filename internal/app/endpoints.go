@@ -156,7 +156,7 @@ func handleManagedInstall(ctx *Context, profile string) *exit.Error {
 	if e != nil {
 		return e
 	}
-	installed, e := managedinstall.Run(l, st, managedinstall.Request{
+	installed, e := managedinstall.Run(hctx, l, st, managedinstall.Request{
 		Endpoint: ref.String(), Release: release, Major: major, Profile: profiles[0],
 		Force: ctx.Inv.Bool("--force"), Grant: grant, Config: ctx.Cfg,
 	})
