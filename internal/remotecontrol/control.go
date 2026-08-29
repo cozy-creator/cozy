@@ -44,12 +44,12 @@ type snapshot struct {
 	ArtifactObjectSet           hub.ExactControlDocument `json:"artifact_object_set"`
 	BindingDocuments            []bindingDocument        `json:"binding_documents"`
 	BindingRelease              hub.ExactControlDocument `json:"binding_release"`
-	PackageDescriptor           hub.ExactControlDocument `json:"package_descriptor"`
-	PackageBundle               hub.ExactControlDocument `json:"package_bundle"`
-	PackageExecutionDigest      string                   `json:"package_execution_digest"`
 	EnvironmentSpec             hub.ExactControlDocument `json:"environment_spec"`
 	Format                      string                   `json:"format"`
 	InstalledEnvironmentReceipt hub.ExactControlDocument `json:"installed_environment_receipt"`
+	PackageBundle               hub.ExactControlDocument `json:"package_bundle"`
+	PackageDescriptor           hub.ExactControlDocument `json:"package_descriptor"`
+	PackageExecutionDigest      string                   `json:"package_execution_digest"`
 	PlacementSet                hub.ExactControlDocument `json:"placement_set"`
 	ResolvedWheelSet            hub.ExactControlDocument `json:"resolved_wheel_set"`
 }

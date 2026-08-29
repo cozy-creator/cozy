@@ -44,9 +44,10 @@ func TestDecodeCurrentTensorhubRentalSnapshot(t *testing.T) {
 	if problem != nil {
 		t.Fatal(problem)
 	}
-	if facts.PackageExecutionDigest != "sha256:a7b7a2395f5f6759a256631b2692c95479d7bd1012e9d16ba470af012bfc9c8f" ||
-		facts.Placement.Package != "cozy/marco-polo-derived" ||
-		facts.Placement.ReleaseID != "cozy/marco-polo-derived@derived-portable-1" ||
+	if facts.PackageExecutionDigest == "" || facts.PackageDescriptor == nil ||
+		facts.Placement.Package != "proof/package" ||
+		facts.Placement.ReleaseID != "proof/package@v1" ||
+		facts.Placement.PackageDescriptorDigest != facts.PackageDescriptor.Digest ||
 		facts.Placement.EnvironmentSpecDigest == "" || len(facts.Placement.Bindings) != 1 ||
 		facts.Placement.Bindings[0].Entrypoint != "marco" {
 		t.Fatalf("decoded current Tensorhub snapshot incompletely: %+v", facts)
