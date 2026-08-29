@@ -202,6 +202,8 @@ Without a configured `port`, Cozy prefers `127.0.0.1:8818` and falls back to an 
 loopback port when another process owns 8818. A configured nonzero port is strict; `port: 0`
 explicitly asks the OS to select any available port.
 
+Without `tensorhub_url`, Cozy uses the standing local Tensorhub at `http://127.0.0.1:8819`.
+
 The YAML schema is strict: unknown keys, duplicate keys, nested structures, and multiple documents
 are refused. Cozy does not load a working-directory `.env` file.
 
