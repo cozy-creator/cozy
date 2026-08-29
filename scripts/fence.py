@@ -539,7 +539,7 @@ def check_manifest():
     source = src_path.read_text()
     required = (
         "Endpoint EndpointCmd", "Model    ModelCmd", "Invoke   InvokeCmd", "Rental   RentalCmd",
-        "Unload   UnloadCmd", "Exit     ExitCmd",
+        "Up       UpCmd", "Down     DownCmd", "Unload   UnloadCmd",
         "Search  EndpointSearchCmd", "Install EndpointInstallCmd", "Remove  EndpointRemoveCmd",
         "List    EndpointListCmd", "Publish EndpointPublishCmd",
         "Search   ModelSearchCmd", "Download ModelDownloadCmd", "Remove   ModelRemoveCmd",
@@ -548,7 +548,7 @@ def check_manifest():
         "New  RentalNewCmd", "End  RentalEndCmd", "List RentalListCmd",
     )
     bad = [f"[grammar] missing Kong command field {item!r}" for item in required if item not in source]
-    for retired in ("StackCmd", "WorkflowCmd", "VideoCmd", "JobCmd", "CommandsCmd", "StatusCmd"):
+    for retired in ("StackCmd", "ExitCmd", "WorkflowCmd", "VideoCmd", "JobCmd", "CommandsCmd", "StatusCmd"):
         if retired in source:
             bad.append(f"[grammar] retired command family remains: {retired}")
     app = pathlib.Path("internal/cli/app.go").read_text()
@@ -557,6 +557,25 @@ def check_manifest():
             bad.append(f"[grammar] version fast path omits {spelling}")
     if pathlib.Path("internal/manifest").exists():
         bad.append("[grammar] parallel internal/manifest still exists")
+    return bad
+
+
+def check_web_boundary():
+    """cl-045: one embedded stub, bounded pathless uploads, and no log product."""
+    bad = []
+    for required in ("web/index.html", "web/app.css", "web/app.js", "web/embed.go",
+                     "internal/api/uploads.go", "internal/upload/upload.go"):
+        if not pathlib.Path(required).is_file():
+            bad.append(f"[web] missing {required}")
+    controller = pathlib.Path("internal/cli/controller.go").read_text()
+    if "os.DevNull" not in controller:
+        bad.append("[web] background controller does not use the null diagnostics sink")
+    if 'os.OpenFile(filepath.Join(layout.Root, "controller.log")' in controller:
+        bad.append("[web] persistent controller.log writer remains")
+    upload = pathlib.Path("internal/upload/upload.go").read_text()
+    for required in ("MaxBytes int64 = 64 << 20", "io.LimitReader", "sha256.New()", "os.Rename"):
+        if required not in upload:
+            bad.append(f"[web] upload boundary missing {required!r}")
     return bad
 
 
@@ -747,7 +766,8 @@ def check_typed_resources():
 violations = (check_sources() + check_matrix() + check_manifest() + check_secret_flags()
               + check_contract() + check_video_boundary() + check_embedded() + check_scripts()
               + check_document_kinds() + check_render_streams()
-              + check_media_contract() + check_typed_resources() + check_test_boundary())
+              + check_media_contract() + check_typed_resources() + check_web_boundary()
+              + check_test_boundary())
 if violations:
     print("FENCE RED (boundaries.md):", file=sys.stderr)
     for v in violations:
@@ -765,5 +785,6 @@ print(
     f"runtime({len(RUNTIME_VERBS_DENY)} denied verbs@{len(RUNTIME_SITES)} + indirection) "
     f"embed({len(DENY_EMBED)} words, scripts allow@{len(PY_ALLOW)}) "
     f"contract({len(parse_go_routes(pathlib.Path('internal/api/routes.go')))} routes) "
-    f"retired-planes(absent) resources(typed endpoint/model, no aliases) test(internal/live only)"
+    f"web(stub+bounded-upload+no-log) retired-planes(absent) "
+    f"resources(typed endpoint/model, no aliases) test(internal/live only)"
 )

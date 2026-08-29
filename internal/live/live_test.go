@@ -232,16 +232,29 @@ func (r reply) brief() string {
 // the refusal matrix presents a foreign Host or a foreign Origin.
 func (s *service) call(t *testing.T, method, path string, body any, headers ...string) reply {
 	t.Helper()
+	var data []byte
+	var contentType string
+	if body != nil {
+		var err error
+		data, err = json.Marshal(body)
+		must(t, err)
+		contentType = "application/json"
+	}
+	return s.callBytes(t, method, path, data, contentType, headers...)
+}
+
+// callBytes drives byte-oriented routes without smuggling a host path or JSON encoding
+// into the request. Authentication and hostile-header overrides remain identical to call.
+func (s *service) callBytes(t *testing.T, method, path string, body []byte, contentType string, headers ...string) reply {
+	t.Helper()
 	var reader io.Reader
 	if body != nil {
-		data, err := json.Marshal(body)
-		must(t, err)
-		reader = strings.NewReader(string(data))
+		reader = strings.NewReader(string(body))
 	}
 	req, err := http.NewRequest(method, "http://"+s.addr+path, reader)
 	must(t, err)
-	if body != nil {
-		req.Header.Set("Content-Type", "application/json")
+	if contentType != "" {
+		req.Header.Set("Content-Type", contentType)
 	}
 	req.Header.Set("Authorization", "Bearer "+s.token)
 	for i := 0; i+1 < len(headers); i += 2 {

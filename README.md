@@ -38,9 +38,17 @@ cozy help invoke run
 cozy -v
 ```
 
-There is no public stack, `up`, or `down` command. Commands that need durable coordination
-automatically start one lightweight per-user controller. Installed endpoints and downloaded
-models remain files on disk until an invocation needs them.
+There is no container “stack.” Start the persistent local product explicitly when you want its
+localhost UI available:
+
+```sh
+cozy up
+# open the returned http://127.0.0.1:<port>/ URL
+```
+
+`up` backgrounds one lightweight per-user controller: web UI, local API, durable records, local
+worker manager, and private-rental sessions. It does not attach a log stream or load an endpoint or
+model. Commands that require the controller may ensure the same process is running automatically.
 
 ## Endpoints
 
@@ -140,20 +148,24 @@ cozy rental end <rental-id>
 ```
 
 Rentals can continue billing until Tensorhub confirms their termination. `rental end` and
-`exit --all` keep the local controller alive when remote absence cannot be confirmed.
+`down --all` keep the local controller alive when remote absence cannot be confirmed.
 
-## Release GPU memory or exit
+## Release GPU memory or stop Cozy
 
 These commands have deliberately different scopes:
 
 ```sh
 cozy unload       # stop idle local Runtime workers and release their GPU models
-cozy exit         # stop locally; refuses while invocations or rentals are active
-cozy exit --all   # cancel all work, end all rentals, then stop the controller
+cozy down         # stop locally; refuses while invocations or rentals are active
+cozy down --all   # cancel all work, end all rentals, then stop the controller
 ```
 
-None of them deletes installed endpoint or model bytes. A failed partial `exit --all` leaves the
+None of them deletes installed endpoint or model bytes. A failed partial `down --all` leaves the
 controller running so cancellation and paid-resource reconciliation can continue.
+
+The launch web UI is currently a stub rooted in [`web/`](web/). The controller already serves
+opaque output media and a bounded authenticated content-addressed upload API; full browser
+authentication, upload-to-invocation binding, and media-history UX come with the real frontend.
 
 ## Configuration
 
@@ -195,5 +207,5 @@ cozy model search flux --full
 Shell exits are intentionally small: `0` success or idempotent no-op, `2` invocation/configuration
 error, and `1` operational failure. The structured error document retains the detailed stable code.
 
-Authentication, billing management, datasets, and a web UI are planned later; Cozy does not
-advertise placeholder commands for features that do not exist yet.
+Authentication, billing management, datasets, and the full web UI are planned later; Cozy does
+not advertise placeholder commands for features that do not exist yet.

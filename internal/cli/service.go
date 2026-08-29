@@ -22,7 +22,6 @@ import (
 
 // serveController is the private process entrypoint shared by explicit `up` and
 // commands that ensure the controller is running.
-
 func serveController(ctx *Context) *exit.Error {
 	l, e := home.Open(ctx.Cfg.Home)
 	if e != nil {
@@ -120,9 +119,9 @@ func serveController(ctx *Context) *exit.Error {
 		return e
 	}
 
-	// Two per-launch credentials: one for the browser (handed over in the `--open` URL's
-	// FRAGMENT) and one for CLI clients (handed over through a 0600 file). Neither is
-	// ever printed, logged, or placed on argv, and both die with this process.
+	// One per-launch CLI credential is handed over through a 0600 file. It is never
+	// printed, logged, or placed on argv, and dies with this process. The public web stub
+	// exposes no state; full browser authorization is a later, separately reviewed door.
 	creds, e := api.Mint(l)
 	if e != nil {
 		closeListeners()
@@ -150,7 +149,7 @@ func serveController(ctx *Context) *exit.Error {
 	fmt.Fprintf(ctx.Out, "  records %s · yield %s · reconcile killed %d orphan(s), forgot %d stale row(s)\n",
 		l.DB, yield, killed, forgotten)
 	fmt.Fprintf(ctx.Out, "  client credential %s (%s, mode 0600)\n", creds.CLI.Digest(), l.Client)
-	fmt.Fprintf(ctx.Out, "  next: cozy invoke list · stop with cozy exit\n")
+	fmt.Fprintf(ctx.Out, "  next: cozy invoke list · stop with cozy down\n")
 
 	go func() { _ = http.Serve(v4, handler) }()
 	if v6 != nil {

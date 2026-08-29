@@ -73,7 +73,7 @@ func ClientCredential(l home.Layout) (secret.Value, *exit.Error) {
 	if perm := info.Mode().Perm(); perm&0o077 != 0 && runtime.GOOS != "windows" {
 		return secret.Value{}, exit.New(exit.Credential,
 			"%s is mode %#o; the local client credential is 0600 or it is not used", l.Client, perm).
-			WithRemedy("run `cozy exit`, then retry; every controller launch mints a fresh credential")
+			WithRemedy("run `cozy down`, fix the file mode, then retry; every controller launch mints a fresh credential")
 	}
 	data, err := os.ReadFile(l.Client)
 	if err != nil {
@@ -84,7 +84,7 @@ func ClientCredential(l home.Layout) (secret.Value, *exit.Error) {
 	if !v.Present() {
 		return secret.Value{}, exit.New(exit.Credential,
 			"the local client credential at %s is empty", l.Client).
-			WithNext("cozy exit")
+			WithNext("cozy down")
 	}
 	return v, nil
 }

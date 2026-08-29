@@ -4,11 +4,14 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"io"
+	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/cozy-creator/cozy-creator/internal/records"
 )
@@ -16,29 +19,60 @@ import (
 const weightlessRef = "cozy/weightless"
 
 // TestProductPath drives only the public Kong surface: install a real weightless
-// release, auto-start the controller on invoke, cross Runtime and the worker wire,
-// accept an output, release idle residency, then exit cleanly.
+// release, explicitly start the controller and UI, cross Runtime and the worker wire,
+// accept an output, release idle residency, then stop cleanly.
 func TestProductPath(t *testing.T) {
 	root := filepath.Join(os.TempDir(), "cozy-live", "product")
 	must(t, os.RemoveAll(root))
 	must(t, os.MkdirAll(root, 0o755))
+	t.Cleanup(func() { _, _ = runCozy(t, root, "down", "--all") })
 
 	code, help := runCozy(t, root)
 	for _, want := range []string{
 		"Usage: cozy", "endpoint install", "model download", "invoke run",
-		"rental new", "unload", "exit",
+		"rental new", "up", "down", "unload",
 	} {
 		if code != 0 || !strings.Contains(help, want) {
 			t.Fatalf("bare cozy omitted %q [exit %d]\n%s", want, code, help)
 		}
 	}
-	for _, retired := range []string{" up ", " down ", "workflow", "video", "job submit"} {
+	for _, retired := range []string{" exit ", "workflow", "video", "job submit"} {
 		if strings.Contains(help, retired) {
 			t.Fatalf("bare cozy retained %q\n%s", retired, help)
 		}
 	}
-	if code, out := runCozy(t, root, "up"); code != 2 || !strings.Contains(out, "cli.usage") {
-		t.Fatalf("retired up command did not refuse [exit %d]\n%s", code, out)
+	if code, out := runCozy(t, root, "exit"); code != 2 || !strings.Contains(out, "cli.usage") {
+		t.Fatalf("retired exit command did not refuse [exit %d]\n%s", code, out)
+	}
+
+	code, up := runCozy(t, root, "up", "--json")
+	var upDocument struct {
+		OK   bool           `json:"ok"`
+		Kind string         `json:"kind"`
+		Data map[string]any `json:"data"`
+	}
+	if err := json.Unmarshal([]byte(up), &upDocument); code != 0 || err != nil ||
+		!upDocument.OK || upDocument.Kind != "up" {
+		t.Fatalf("up did not start one controller [exit %d]: %v\n%s", code, err, up)
+	}
+	url, _ := upDocument.Data["url"].(string)
+	client := &http.Client{Timeout: 5 * time.Second}
+	response, err := client.Get(url)
+	if err != nil {
+		t.Fatalf("up returned an unreachable web UI %q: %v", url, err)
+	}
+	page, readErr := io.ReadAll(response.Body)
+	response.Body.Close()
+	if readErr != nil || response.StatusCode != http.StatusOK ||
+		!strings.Contains(string(page), "local generative workspace is running") {
+		t.Fatalf("web stub is not ready at up return: status=%d err=%v\n%s",
+			response.StatusCode, readErr, page)
+	}
+	if _, err := os.Stat(filepath.Join(root, "controller.log")); !os.IsNotExist(err) {
+		t.Fatalf("up created a persistent controller log: %v", err)
+	}
+	if code, out := runCozy(t, root, "up"); code != 0 || !strings.Contains(out, "already running") {
+		t.Fatalf("up is not idempotent [exit %d]\n%s", code, out)
 	}
 
 	archive := weightlessRelease(t)
@@ -103,8 +137,8 @@ func TestProductPath(t *testing.T) {
 	if code, out := runCozy(t, root, "unload"); code != 0 || !strings.Contains(out, "stopped") {
 		t.Fatalf("unload [exit %d]\n%s", code, out)
 	}
-	if code, out := runCozy(t, root, "exit"); code != 0 || !strings.Contains(out, "controller: stopped") {
-		t.Fatalf("exit [exit %d]\n%s", code, out)
+	if code, out := runCozy(t, root, "down"); code != 0 || !strings.Contains(out, "controller: stopped") {
+		t.Fatalf("down [exit %d]\n%s", code, out)
 	}
 }
 

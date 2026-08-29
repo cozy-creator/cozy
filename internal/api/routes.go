@@ -9,8 +9,8 @@ package api
 //	Core  — Creator's implemented request-level API and the proposed common core for
 //	        future servers. Cross-host parity requires conformance proof; it is not
 //	        asserted by this registry.
-//	Local — the Creator-only extension module: installed endpoints, workers, host doctor,
-//	        triage, and jobs. Its /v1/local/ mount makes
+//	Local — the Creator-only extension module: jobs, rentals, lifecycle, uploads, and
+//	        localhost web assets. Its URL mount makes
 //	        that boundary visible in the URL.
 
 // Scope is which module a route belongs to.
@@ -26,8 +26,7 @@ type Route struct {
 	Method string
 	Path   string // the Go 1.22 mux pattern, with {wildcards}
 	Scope  Scope
-	// Auth is false only for the two routes a credential-less caller may reach: the
-	// liveness probe and the stub page. Neither answers with a fact about any request.
+	// Auth is false only for embedded static web assets. They disclose no user state.
 	Auth bool
 	// Mutation marks a route that changes state. Mutations carry the Origin check.
 	Mutation bool

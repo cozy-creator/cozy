@@ -93,8 +93,8 @@ func Hold(l home.Layout, addr, socket string) (*Held, *exit.Error) {
 		f.Close()
 		return nil, exit.New(exit.Conflict,
 			"another Cozy controller already owns %s", l.Root).
-			WithRemedy("one service per local root; stop it with `cozy exit`").
-			WithNext("cozy invoke list", "cozy exit")
+			WithRemedy("one service per local root; stop it with `cozy down`").
+			WithNext("cozy invoke list", "cozy down")
 	}
 	body := fmt.Sprintf("addr=%s\nsocket=%s\npid=%d\nsince=%s\n",
 		addr, socket, os.Getpid(), time.Now().UTC().Format(time.RFC3339))
