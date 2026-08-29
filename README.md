@@ -63,8 +63,7 @@ cozy package search video
 cozy package search org/name
 cozy package install org/name@release \
   --profile torch2.13.0-cu130-cp312-linux-x86 \
-  --major v1 \
-  --reason "local install"
+  --major v1
 cozy package list
 ```
 
@@ -109,7 +108,7 @@ Publish an existing canonical TensorFS snapshot. The remote model name is create
 when absent:
 
 ```sh
-cozy model publish org/model sha256:<snapshot> --reason "initial release"
+cozy model publish org/model sha256:<snapshot>
 ```
 
 Download and publication are resumable and verify content identities before making a local or
@@ -143,7 +142,6 @@ With Tensorhub configured, rent a private worker for an exact package:
 ```sh
 cozy rental new org/package@release \
   --accelerator "NVIDIA H200" \
-  --reason "private generation" \
   --idempotency-key <unique-key>
 
 cozy rental list

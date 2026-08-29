@@ -186,12 +186,3 @@ func packageReleaseRef(value string) (hub.Ref, string, *exit.Error) {
 	ref, problem := hub.ParseRef(name)
 	return ref, release, problem
 }
-
-func mutationReason(ctx *Context, command string) (string, *exit.Error) {
-	reason := strings.TrimSpace(ctx.Inv.Value("--reason"))
-	if reason == "" {
-		return "", exit.Usagef("`cozy %s` needs --reason <why>", command).
-			WithRemedy("Tensorhub records why every mutation or paid acquisition happened before it acts")
-	}
-	return reason, nil
-}

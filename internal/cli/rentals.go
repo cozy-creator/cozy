@@ -63,14 +63,9 @@ func handleRent(ctx *Context) *exit.Error {
 	if acceleratorModel == "" {
 		return exit.Usagef("`cozy rental new` names the compute profile to provision").
 			WithRemedy("--accelerator is required; use CPU or a provider-neutral accelerator model such as NVIDIA H200").
-			WithNext("cozy rental new " + packageRef + " --accelerator CPU --reason <why>")
+			WithNext("cozy rental new " + packageRef + " --accelerator CPU")
 	}
-	reason := strings.TrimSpace(ctx.Inv.Value("--reason"))
-	if reason == "" {
-		return exit.Usagef("`cozy rental new` spends money and the hub records why before it acts").
-			WithRemedy("--reason is required, exactly as it is for every first-party write").
-			WithNext("cozy rental new " + packageRef + " --accelerator '" + acceleratorModel + "' --reason <why>")
-	}
+	reason := "cozy rental new " + packageRef + " on " + acceleratorModel
 	// The wait's ONLY caller-supplied bound. Absent, the wait ends on what the hub says
 	// rather than on a clock: a pod that is still booting is not a pod that has failed.
 	deadline := time.Time{}
@@ -153,8 +148,8 @@ func handleRent(ctx *Context) *exit.Error {
 	if !replay {
 		fmt.Fprintf(ctx.Err, "  rental operation %s persisted; reuse this key to resume\n", operationKey)
 	}
-	// The first recorded reason is the paid operation's audit reason. A retry may be typed
-	// with different prose, but it must not rewrite why the original purchase was made.
+	// The first recorded reason is derived from the immutable paid intent. Replay reads
+	// that durable value rather than accepting a second caller-controlled spelling.
 	reason = op.Reason
 
 	hctx, cancel := rentalCallContext(deadline)
@@ -377,7 +372,7 @@ func waitRental(ctx *Context, c *hub.Client, id string, deadline time.Time,
 			return hub.Rental{}, exit.New(exit.Failed,
 				"rental %s is %s: %s", id, r.State, detailOr(r.Detail)).
 				WithRemedy("the rental is leaving or gone; rent again if you still need a pod").
-				WithNext("cozy rental new <package> --accelerator <model> --reason <why>")
+				WithNext("cozy rental new <package> --accelerator <model>")
 		case r.State == hub.RentalReady:
 			// READY without a whole triple is the hub contradicting itself, and dialling
 			// on a partial one would fail later as something that looks like a network

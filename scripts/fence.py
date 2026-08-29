@@ -550,12 +550,17 @@ def check_manifest():
     for retired in ("StackCmd", "ExitCmd", "WorkflowCmd", "VideoCmd", "JobCmd", "CommandsCmd", "StatusCmd"):
         if retired in source:
             bad.append(f"[grammar] retired command family remains: {retired}")
-    publish = source.split("type PackagePublishCmd struct", 1)[-1].split("type ModelCmd", 1)[0]
-    if "Reason" in publish or '"--reason"' in publish:
-        bad.append("[grammar] package publish retained caller-authored audit prose; decision #662 derives it")
-    handler = pathlib.Path("internal/cli/package_releases.go").read_text()
-    if '"cozy package publish " + ref.String() + "@" + release' not in handler:
-        bad.append("[grammar] package publish no longer derives its internal audit reason from the exact release")
+    if re.search(r"^\s*Reason\s+string\s+`", source, re.M) or '"--reason"' in source:
+        bad.append("[grammar] public Cozy command retained caller-authored audit prose; decision #667 derives every audit reason")
+    derived_audits = {
+        "internal/cli/package_releases.go": '"cozy package publish " + ref.String() + "@" + release',
+        "internal/cli/packages.go": '"cozy package install " + ref.String() + "@" + release + " for " + profiles[0]',
+        "internal/cli/transfer.go": '"cozy model publish " + ref.String() + " " + snapshot',
+        "internal/cli/rentals.go": '"cozy rental new " + packageRef + " on " + acceleratorModel',
+    }
+    for path, spelling in derived_audits.items():
+        if spelling not in pathlib.Path(path).read_text():
+            bad.append(f"[grammar] {path} no longer derives its internal audit reason from exact operation facts")
     app = pathlib.Path("internal/cli/app.go").read_text()
     for spelling in VERSION_SPELLINGS:
         if spelling not in app:

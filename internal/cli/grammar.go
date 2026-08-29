@@ -44,15 +44,13 @@ type PackageInstallCmd struct {
 	Profile       string `help:"Qualified compatibility profile."`
 	Major         string `help:"Local serving major for a qualified release." placeholder:"vN"`
 	GrantTTL      string `help:"Qualified-material grant lifetime." default:"10m"`
-	Reason        string `help:"Audit reason for a qualified install."`
 }
 
 func (c *PackageInstallCmd) Run(r *Runtime) error {
 	return r.call(handleInstall, []string{c.Ref}, bools(
 		"--force", c.Force, "--allow-unsigned", c.AllowUnsigned), values(
 		"--from", c.From, "--dir", c.Dir, "--digest", c.Digest,
-		"--profile", c.Profile, "--major", c.Major, "--grant-ttl", c.GrantTTL,
-		"--reason", c.Reason), false)
+		"--profile", c.Profile, "--major", c.Major, "--grant-ttl", c.GrantTTL), false)
 }
 
 type PackageRemoveCmd struct {
@@ -128,7 +126,6 @@ func (c *ModelListCmd) Run(r *Runtime) error {
 type ModelPublishCmd struct {
 	Ref        string `arg:"" name:"model" help:"Model name (org/name)."`
 	Snapshot   string `arg:"" name:"snapshot" help:"Local sha256 snapshot id."`
-	Reason     string `help:"Audit reason recorded before publication." required:""`
 	DryRun     bool   `help:"Show the transfer plan without moving bytes."`
 	TokenStdin bool   `help:"Read this invocation's hub token from stdin."`
 }
@@ -136,7 +133,7 @@ type ModelPublishCmd struct {
 func (c *ModelPublishCmd) Run(r *Runtime) error {
 	return r.call(handleModelPublish, []string{c.Ref, c.Snapshot}, bools(
 		"--dry-run", c.DryRun, "--token-stdin", c.TokenStdin),
-		values("--reason", c.Reason), false)
+		nil, false)
 }
 
 type InvokeCmd struct {
@@ -199,13 +196,12 @@ type RentalNewCmd struct {
 	Accelerator    string `help:"Provider-neutral accelerator model." required:""`
 	IdempotencyKey string `help:"Stable paid-operation identity."`
 	Timeout        string `help:"Caller wait deadline; does not release the rental."`
-	Reason         string `help:"Audit reason recorded before acquisition." required:""`
 }
 
 func (c *RentalNewCmd) Run(r *Runtime) error {
 	return r.call(handleRent, []string{c.Package}, nil, values(
 		"--accelerator", c.Accelerator, "--idempotency-key", c.IdempotencyKey,
-		"--timeout", c.Timeout, "--reason", c.Reason), true)
+		"--timeout", c.Timeout), true)
 }
 
 type RentalEndCmd struct {

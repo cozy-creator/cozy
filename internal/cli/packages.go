@@ -131,10 +131,7 @@ func handleManagedInstall(ctx *Context, profile string) *exit.Error {
 	if err != nil || ttl <= 0 || ttl > time.Hour {
 		return exit.Usagef("--grant-ttl %q is not a positive duration at or below 1h", ttlText)
 	}
-	reason, e := mutationReason(ctx, "install --profile")
-	if e != nil {
-		return e
-	}
+	reason := "cozy package install " + ref.String() + "@" + release + " for " + profiles[0]
 	l, st, writer, e := open(ctx.Cfg, true)
 	if e != nil {
 		return e
