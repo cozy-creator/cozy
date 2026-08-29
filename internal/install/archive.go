@@ -28,8 +28,8 @@ const (
 )
 
 // Declaration is the release record that travels with the archive: the file set the
-// publisher declared, with a digest each. Pre-hub it is written by scripts/pack.py;
-// cl-011/cl-012 replace it with the hub's own release record over the same fields.
+// publisher declared, with a digest each. The remaining local writer is the real-path
+// fixture beside internal/live; published endpoints use Tensorhub's release tooling.
 type Declaration struct {
 	Endpoint string          `json:"endpoint"`
 	Version  string          `json:"version"`

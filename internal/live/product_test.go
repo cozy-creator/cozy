@@ -289,8 +289,8 @@ func weightlessRelease(t *testing.T) string {
 		t.Skipf("no cozy-runtime peer at %s: %v", repo, err)
 	}
 	dir := t.TempDir()
-	build := exec.Command("/usr/bin/nice", "-n", "19", "bash",
-		"scripts/weightless-release.sh", "--out", dir)
+	build := exec.Command("/usr/bin/nice", "-n", "19", "python3",
+		"internal/live/testdata/build-weightless.py", "--out", dir)
 	build.Dir = "../.."
 	build.Env = childEnv(t, repo, "RUNTIME_REPO="+repo)
 	if out, err := build.CombinedOutput(); err != nil {
