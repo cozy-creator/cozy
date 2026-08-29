@@ -506,7 +506,8 @@ func (s *Store) ObserveRentalWorker(id, accelerator, backend, driverVersion,
 	if err != nil {
 		return exit.Internalf("cannot read rental %s for worker observation: %s", id, err)
 	}
-	if row.State != "ready" || accelerator == "" || backend == "" || instance == "" ||
+	if row.State != "converging" && row.State != "ready" ||
+		accelerator == "" || backend == "" || instance == "" ||
 		bootID == "" || count != 1 {
 		return exit.Named(exit.Conflict, "rental.worker_readback_incomplete",
 			"rental %s ClaimAck is state=%q backend=%q accelerator=%q count=%d instance=%q boot=%q",
