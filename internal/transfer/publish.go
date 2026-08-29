@@ -601,11 +601,17 @@ func send(ctx context.Context, method, url string, open func() (io.ReadCloser, e
 		if err != nil {
 			return false, exit.Internalf("the staged object is unreadable: %s", err)
 		}
-		// The body is COUNTED and the context lives while the count moves: an upload
-		// that is slow is not an upload that has stopped.
-		m := &mover{}
-		rctx, cancel := m.context(ctx)
-		counted := m.readCloser(body)
+		rctx, cancel := ctx, func() {}
+		var counted io.ReadCloser = http.NoBody
+		if length == 0 {
+			body.Close()
+		} else {
+			// The body is COUNTED and the context lives while the count moves: an upload
+			// that is slow is not an upload that has stopped.
+			m := &mover{}
+			rctx, cancel = m.context(ctx)
+			counted = m.readCloser(body)
+		}
 		req, err := http.NewRequestWithContext(rctx, method, url, counted)
 		if err != nil {
 			counted.Close()
