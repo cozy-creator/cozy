@@ -1,5 +1,5 @@
 // Package client is the CLI's client of the LOCAL CLIENT API (cl-010). It exists so
-// invoke, unload, and exit commands are the API's FIRST
+// invoke, unload, and down commands are the API's FIRST
 // CLIENT rather than a parallel implementation the HTTP surface later wraps: every one of
 // them speaks the routes in `docs/client-contract.md` over a real socket, exactly as
 // cl-007's UI and cozy.art do.
@@ -125,8 +125,8 @@ func (c *Client) call(method, path string, body, out any, headers ...string) *ex
 // verb's exit-9 gate carries, because it is the same condition arriving later.
 func (c *Client) unreachable(err error) *exit.Error {
 	return exit.Unavailablef("the Cozy controller stopped answering on %s: %s", c.Addr(), err).
-		WithRemedy("it may have exited mid-request; its log is in the local root").
-		WithNext("cozy invoke list", "cozy invoke list")
+		WithRemedy("it may have stopped mid-request; retry or run `cozy up`").
+		WithNext("cozy up", "cozy invoke list")
 }
 
 // Refusal turns one typed error envelope into a typed CLI error. The NAME is the
@@ -249,13 +249,13 @@ func (c *Client) Unload() (api.UnloadResult, *exit.Error) {
 	return out, e
 }
 
-// Exit performs the controller-side lifecycle fence. Under all=false, active work or
+// Down performs the controller-side lifecycle fence. Under all=false, active work or
 // rentals refuse without mutation. Under all=true, the controller requests cancellation
 // and returns the exact paid obligations the caller must terminate and confirm through
-// Tensorhub before retrying. ShuttingDown=true means the cooperative exit was accepted.
-func (c *Client) Exit(all bool) (api.ExitResult, *exit.Error) {
-	var out api.ExitResult
-	e := c.call(http.MethodPost, "/v1/local/service/exit", map[string]bool{"all": all}, &out)
+// Tensorhub before retrying. ShuttingDown=true means cooperative down was accepted.
+func (c *Client) Down(all bool) (api.DownResult, *exit.Error) {
+	var out api.DownResult
+	e := c.call(http.MethodPost, "/v1/local/service/down", map[string]bool{"all": all}, &out)
 	return out, e
 }
 

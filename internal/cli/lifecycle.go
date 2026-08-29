@@ -50,23 +50,43 @@ func handleUnload(ctx *Context) *exit.Error {
 	return emit(ctx, list)
 }
 
-func handleExit(ctx *Context) *exit.Error {
+func handleUp(ctx *Context) *exit.Error {
+	already := service.Probe(ctx.Cfg).Up
+	state, problem := ensureController(ctx)
+	if problem != nil {
+		return problem
+	}
+	notes := []string{
+		"the controller runs in the background; no log stream is attached",
+		"no endpoint or model was loaded into GPU memory",
+	}
+	if already {
+		notes = append(notes, "already running: up is idempotent")
+	}
+	return emit(ctx, output.Record{Kind: "up", Fields: []output.Field{
+		{K: "controller", V: "running"}, {K: "url", V: "http://" + state.Addr + "/"},
+		{K: "api", V: "http://" + state.Addr}, {K: "pid", V: state.PID},
+		{K: "since", V: state.Since},
+	}, Notes: notes})
+}
+
+func handleDown(ctx *Context) *exit.Error {
 	all := ctx.Inv.Bool("--all")
 	state := service.Probe(ctx.Cfg)
 	if !state.Up {
-		blockers, problem := offlineExitBlockers(ctx)
+		blockers, problem := offlineDownBlockers(ctx)
 		if problem != nil {
 			return problem
 		}
 		if len(blockers) == 0 {
-			return emit(ctx, output.Record{Kind: "exit", Fields: []output.Field{
+			return emit(ctx, output.Record{Kind: "down", Fields: []output.Field{
 				{K: "controller", V: "stopped"}, {K: "all", V: all},
-			}, Notes: []string{"already stopped: exit is idempotent"}})
+			}, Notes: []string{"already stopped: down is idempotent"}})
 		}
 		if !all {
 			return exit.Named(exit.Conflict, "active_work",
-				"controller exit refused: active %s", strings.Join(blockers, ", ")).
-				WithRemedy("cancel/end the named work, or use explicit `cozy exit --all`")
+				"controller down refused: active %s", strings.Join(blockers, ", ")).
+				WithRemedy("cancel/end the named work, or use explicit `cozy down --all`")
 		}
 		state, problem = ensureController(ctx)
 		if problem != nil {
@@ -79,23 +99,23 @@ func handleExit(ctx *Context) *exit.Error {
 		return problem
 	}
 	if !all {
-		result, problem := client.Exit(false)
+		result, problem := client.Down(false)
 		if problem != nil {
 			return problem
 		}
 		if !result.ShuttingDown {
-			return exit.Internalf("safe exit returned without a shutdown decision")
+			return exit.Internalf("safe down returned without a shutdown decision")
 		}
-		return finishControllerExit(ctx, false, nil)
+		return finishControllerDown(ctx, false, nil)
 	}
-	return exitAll(ctx, client)
+	return downAll(ctx, client)
 }
 
-func exitAll(ctx *Context, client *localapi.Client) *exit.Error {
+func downAll(ctx *Context, client *localapi.Client) *exit.Error {
 	canceled := map[string]bool{}
 	ended := map[string]bool{}
 	for {
-		result, problem := client.Exit(true)
+		result, problem := client.Down(true)
 		if problem != nil {
 			return problem.WithRemedy("partial teardown stopped; the controller remains alive for reconciliation")
 		}
@@ -123,7 +143,7 @@ func exitAll(ctx *Context, client *localapi.Client) *exit.Error {
 			}
 		}
 		if result.ShuttingDown {
-			return finishControllerExit(ctx, true, []output.Field{
+			return finishControllerDown(ctx, true, []output.Field{
 				{K: "canceled", V: len(canceled)}, {K: "rentals_ended", V: len(ended)},
 			})
 		}
@@ -213,7 +233,7 @@ func rentalRow(ctx *Context, id string) (*records.Rental, *exit.Error) {
 	return store.RentalRow(id)
 }
 
-func offlineExitBlockers(ctx *Context) ([]string, *exit.Error) {
+func offlineDownBlockers(ctx *Context) ([]string, *exit.Error) {
 	layout, problem := home.Open(ctx.Cfg.Home)
 	if problem != nil {
 		return nil, problem
@@ -254,17 +274,17 @@ func offlineExitBlockers(ctx *Context) ([]string, *exit.Error) {
 	return blockers, nil
 }
 
-func finishControllerExit(ctx *Context, all bool, extra []output.Field) *exit.Error {
+func finishControllerDown(ctx *Context, all bool, extra []output.Field) *exit.Error {
 	deadline := time.Now().Add(2 * orchestrator.StopGrace)
 	for time.Now().Before(deadline) {
 		if !service.Probe(ctx.Cfg).Up {
 			fields := []output.Field{{K: "controller", V: "stopped"}, {K: "all", V: all}}
 			fields = append(fields, extra...)
-			return emit(ctx, output.Record{Kind: "exit", Fields: fields,
+			return emit(ctx, output.Record{Kind: "down", Fields: fields,
 				Notes: []string{"the service lock is free; the controller and local workers are gone"}})
 		}
 		time.Sleep(50 * time.Millisecond)
 	}
-	return exit.New(exit.Conflict, "the controller accepted exit but still holds its service lock").
-		WithRemedy("inspect the controller log; no forced kill was performed")
+	return exit.New(exit.Conflict, "the controller accepted down but still holds its service lock").
+		WithRemedy("the controller did not release its lock; no forced kill was performed")
 }

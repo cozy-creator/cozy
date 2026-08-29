@@ -17,12 +17,13 @@ import (
 	"github.com/cozy-creator/cozy-creator/internal/records"
 	"github.com/cozy-creator/cozy-creator/internal/rental"
 	"github.com/cozy-creator/cozy-creator/internal/service"
+	cozyweb "github.com/cozy-creator/cozy-creator/web"
 )
 
-// handleUp is the private controller entrypoint. Public commands auto-start it;
-// users never manage a stack or invoke this function directly.
+// serveController is the private process entrypoint shared by explicit `up` and
+// commands that ensure the controller is running.
 
-func handleUp(ctx *Context) *exit.Error {
+func serveController(ctx *Context) *exit.Error {
 	l, e := home.Open(ctx.Cfg.Home)
 	if e != nil {
 		return e
@@ -135,7 +136,7 @@ func handleUp(ctx *Context) *exit.Error {
 	stop := make(chan os.Signal, 1)
 	server := api.New(api.Options{
 		Orchestrator: c, Cfg: ctx.Cfg, Creds: creds, Addr: addr,
-		Log: ctx.Out, Endpoints: resolver, Rentals: knownRentals,
+		Log: ctx.Out, Web: cozyweb.Handler(), Endpoints: resolver, Rentals: knownRentals,
 		Shutdown: func() { stop <- syscall.SIGTERM },
 	})
 	handler, e := server.Handler()

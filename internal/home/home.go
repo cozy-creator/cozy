@@ -27,6 +27,9 @@ type Layout struct {
 	// Request rows point here so requeue never depends on the submitting CLI or its
 	// original path still existing.
 	Inputs string
+	// Uploads is the private content-addressed store for bytes received through the
+	// localhost upload API. Browser/API callers name opaque ids, never paths.
+	Uploads string
 	// CAS is the shared local tensorfs store: the one place canonical bytes live on
 	// this host. cozy-creator names it and never writes into it — every byte crosses
 	// through the tfs binary (cl-012).
@@ -82,6 +85,7 @@ func Open(root string) (Layout, *exit.Error) {
 		Workers:     filepath.Join(root, "workers"),
 		Outputs:     filepath.Join(root, "outputs"),
 		Inputs:      filepath.Join(root, "inputs"),
+		Uploads:     filepath.Join(root, "uploads", "sha256"),
 		CAS:         filepath.Join(root, "cas"),
 		Transfer:    filepath.Join(root, "transfer"),
 		Triage:      filepath.Join(root, "triage"),
@@ -95,8 +99,10 @@ func Open(root string) (Layout, *exit.Error) {
 			return Layout{}, exit.Internalf("cannot create %s: %s", dir, err)
 		}
 	}
-	if err := os.MkdirAll(l.Inputs, 0o700); err != nil {
-		return Layout{}, exit.Internalf("cannot create %s: %s", l.Inputs, err)
+	for _, dir := range []string{l.Inputs, l.Uploads} {
+		if err := os.MkdirAll(dir, 0o700); err != nil {
+			return Layout{}, exit.Internalf("cannot create %s: %s", dir, err)
+		}
 	}
 	return l, nil
 }

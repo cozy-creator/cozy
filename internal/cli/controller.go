@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"fmt"
 	"io"
+	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -25,8 +26,8 @@ func ControllerProcess(argv0 string) bool {
 	return filepath.Base(argv0) == controllerProcessName
 }
 
-// RunController owns the persistent loopback service. The public CLI starts this
-// entrypoint automatically and never exposes an up/down command.
+// RunController owns the persistent loopback service. Public `up` and stateful
+// commands start this private process entrypoint.
 func RunController(stdout, stderr io.Writer) int {
 	cfg, problem := config.Load()
 	if problem != nil {
@@ -38,7 +39,7 @@ func RunController(stdout, stderr io.Writer) int {
 			"--port", intText(cfg.Port), "--yield", cfg.Yield), Mode: output.Mode{}},
 		Out: stdout, Err: stderr, Cfg: cfg,
 	}
-	if problem := handleUp(ctx); problem != nil {
+	if problem := serveController(ctx); problem != nil {
 		fmt.Fprintln(stderr, problem.Error())
 		return 1
 	}
@@ -58,10 +59,13 @@ func ensureController(ctx *Context) (service.State, *exit.Error) {
 	if err != nil {
 		return service.State{}, exit.Internalf("cannot locate the Cozy executable: %s", err)
 	}
-	logFile, err := os.OpenFile(filepath.Join(layout.Root, "controller.log"),
-		os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o600)
+	// The controller is a background product process, not an attached Compose-style
+	// log producer. Runtime/request diagnostics are structured state; process chatter
+	// has no persistent user-facing log surface.
+	_ = os.Remove(filepath.Join(layout.Root, "controller.log"))
+	logFile, err := os.OpenFile(os.DevNull, os.O_WRONLY, 0)
 	if err != nil {
-		return service.State{}, exit.Internalf("cannot open the controller log: %s", err)
+		return service.State{}, exit.Internalf("cannot open the null diagnostics sink: %s", err)
 	}
 	defer logFile.Close()
 	command := exec.Command(self)
@@ -90,7 +94,7 @@ func ensureController(ctx *Context) (service.State, *exit.Error) {
 			if state := service.Probe(ctx.Cfg); state.Up {
 				current, _ := os.ReadFile(layout.Client)
 				if !bytes.Equal(current, staleCredential) {
-					if _, problem := api.ClientCredential(layout); problem == nil {
+					if _, problem := api.ClientCredential(layout); problem == nil && uiReady(state.Addr) {
 						return state, nil
 					}
 				}
@@ -98,7 +102,17 @@ func ensureController(ctx *Context) (service.State, *exit.Error) {
 		case <-deadline.C:
 			return service.State{}, exit.New(exit.Conflict,
 				"the Cozy controller did not acquire its service lock").
-				WithRemedy("inspect %s (child result: %v)", filepath.Join(layout.Root, "controller.log"), childErr)
+				WithRemedy("the background controller child returned: %v", childErr)
 		}
 	}
+}
+
+func uiReady(address string) bool {
+	client := &http.Client{Timeout: 250 * time.Millisecond}
+	response, err := client.Get("http://" + address + "/")
+	if err != nil {
+		return false
+	}
+	_ = response.Body.Close()
+	return response.StatusCode == http.StatusOK
 }

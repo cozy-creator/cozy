@@ -62,6 +62,12 @@ var Routes = []Route{
 	{"GET", "/v1/media/{media_id}", Core, true, false, false, "",
 		"one output's bytes by OPAQUE id; bounded Range; never a path",
 		"`cozy invoke run --out`"},
+	{"POST", "/v1/uploads", Local, true, true, false, "",
+		"admit one bounded content-addressed upload from bytes, never a caller path",
+		"localhost web UI foundation"},
+	{"GET", "/v1/uploads/{upload_id}", Local, true, false, false, "",
+		"serve one upload by opaque content id with digest and Range support",
+		"localhost web UI foundation"},
 
 	// ---- the LOCAL extension module ----
 	{"POST", "/v1/local/rentals/{rental_id}/claim", Local, true, true, false, "",
@@ -70,9 +76,9 @@ var Routes = []Route{
 	{"POST", "/v1/local/service/unload", Local, true, true, false, "",
 		"stop idle local serving workers and release their GPU-resident models",
 		"cl-044 `cozy unload`"},
-	{"POST", "/v1/local/service/exit", Local, true, true, false, "",
-		"safely exit, or under explicit all request cancellation before confirmed rental teardown",
-		"cl-044 `cozy exit [--all]`"},
+	{"POST", "/v1/local/service/down", Local, true, true, false, "",
+		"safely stop, or under explicit --all request cancellation before confirmed rental teardown",
+		"cl-045 `cozy down [--all]`"},
 
 	// ---- the JOB family (cl-004), LOCAL by design: the hub's job plane is th-008's,
 	// and a job's typed input trees are directories only a local caller owns.
@@ -85,4 +91,13 @@ var Routes = []Route{
 	{"POST", "/v1/local/jobs/{id}/cancel", Local, true, true, false, "",
 		"request cancellation; a queued job leaves the queue, a running one gets its terminal",
 		"`cozy invoke cancel`"},
+	{"GET", "/{$}", Local, false, false, false, "",
+		"embedded localhost web UI entrypoint",
+		"`cozy up`"},
+	{"GET", "/app.css", Local, false, false, false, "",
+		"embedded localhost web UI stylesheet",
+		"web/index.html"},
+	{"GET", "/app.js", Local, false, false, false, "",
+		"embedded localhost web UI script",
+		"web/index.html"},
 }
