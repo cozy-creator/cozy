@@ -325,13 +325,8 @@ func (c *Orchestrator) onObserved(s *session, r *pb.ObservedWorkerState, frameBy
 			w.noProgress++
 		}
 	}
-	generation, accepted := int64(0), int64(0)
 	phase := trimEnum(pb.WorkerPhase_name[int32(r.WorkerPhase)], "WORKER_PHASE_")
-	if w != nil {
-		generation, accepted = int64(w.generation), int64(w.acceptedRevision)
-	}
 	c.mu.Unlock()
-	_ = c.opt.Store.ReportWorker(s.bootID, phase, accepted, int64(r.ConvergedRevision), generation)
 	if acquisition != nil {
 		if problem := c.opt.Store.ObservePlacementAcquisition(*acquisition); problem != nil {
 			c.logf("placement acquisition observation REFUSED: %s", problem.Message)
@@ -548,7 +543,7 @@ func (c *Orchestrator) onAccepted(s *session, a *pb.AttemptAccepted) {
 	c.emit(a.RequestId, "request.accepted", ordinal, map[string]any{
 		"plan_digest": planDigest, "construction_digest": construction, "plan": summary,
 	})
-	c.waitFor(key(a.RequestId, ordinal)).markAccepted()
+	c.signalAccepted(key(a.RequestId, ordinal))
 }
 
 // planSummary renders the CLOSED observable projection of the chosen plan. The
@@ -788,13 +783,13 @@ func (c *Orchestrator) afterAck(req records.Request, attempt records.Attempt, ho
 	requeue := req.State == "requeue_pending"
 	c.cleanupAttempt(req, uint64(attempt.Attempt), holder, !requeue)
 	verdict := outcomeError(attempt.TerminalStatus, attempt.TerminalCause, attempt.SafeMessage)
-	c.waitFor(key(req.ID, uint64(attempt.Attempt))).markClosed(verdict)
+	c.signalClosed(key(req.ID, uint64(attempt.Attempt)), verdict)
 	if requeue {
 		c.Requeue(req.ID, attempt.TerminalStatus+"/"+attempt.TerminalCause)
 		return
 	}
 	c.frames.forget(req.ID)
-	c.waitRequest(req.ID).markClosed(verdict)
+	c.signalClosed(requestWaitKey(req.ID), verdict)
 }
 
 // cleanupAttempt runs only after the outcome's bytes were mirrored, its terminal commit

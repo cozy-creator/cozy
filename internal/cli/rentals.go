@@ -194,11 +194,8 @@ func handleRent(ctx *Context) *exit.Error {
 	observe := func(seen hub.Rental) *exit.Error {
 		row.Address, row.State = seen.Address, seen.State
 		row.MediaAddress = seen.MediaAddress
-		captureRentalControl(&row, seen)
-		if len(row.ControlSnapshotBytes) > 0 {
-			if e := rental.ValidateControl(row); e != nil {
-				return e
-			}
+		if e := captureRentalControl(&row, seen); e != nil {
+			return e
 		}
 		if e := st.RecordRental(row); e != nil {
 			return e
@@ -223,7 +220,9 @@ func handleRent(ctx *Context) *exit.Error {
 	}
 	row.Address, row.State = attachable.Address, attachable.State
 	row.MediaAddress = attachable.MediaAddress
-	captureRentalControl(&row, attachable)
+	if e := captureRentalControl(&row, attachable); e != nil {
+		return e
+	}
 	if !attachable.HoldsHash(secret.HashHex(token)) {
 		// The pod was provisioned with a credential set this host's token is not in, so
 		// dialling it would 401 and look like a network fault. The hub says which hashes
@@ -367,6 +366,11 @@ func waitRental(ctx *Context, c *hub.Client, id string, deadline time.Time,
 				"rental %s failed to provision: %s", id, detailOr(r.Detail)).
 				WithRemedy("the pod is the hub's to reclaim; `cozy rental end %s` closes it out", id).
 				WithNext("cozy rental end " + id)
+		case r.State == hub.RentalDegraded:
+			return hub.Rental{}, exit.New(exit.Failed,
+				"rental %s is degraded: %s", id, detailOr(r.Detail)).
+				WithRemedy("release it, then rent again; degraded is a settled loss of ready service, not an in-flight boot state").
+				WithNext("cozy rental end " + id)
 		case r.State == hub.RentalReleaseRequested || r.State == hub.RentalReleased:
 			// A rental that is LEAVING is not one that is still coming up, and waiting on
 			// it is waiting for a state it will never reach.
@@ -473,16 +477,41 @@ func missingOf(r hub.Rental) string {
 	return "complete ready projection"
 }
 
-func captureRentalControl(row *records.Rental, seen hub.Rental) {
+func captureRentalControl(row *records.Rental, seen hub.Rental) *exit.Error {
 	if row == nil || seen.ControlSnapshot == nil {
-		return
+		return nil
 	}
-	row.ControlSnapshotDigest = seen.ControlSnapshot.Digest
-	row.ControlSnapshotBytes = append([]byte(nil), seen.ControlSnapshot.CanonicalBytes...)
+	if row.ControlSnapshotDigest == "" {
+		candidate := *row
+		candidate.ControlSnapshotDigest = seen.ControlSnapshot.Digest
+		candidate.ControlSnapshotBytes = append([]byte(nil), seen.ControlSnapshot.CanonicalBytes...)
+		candidate.PlacementRevision = seen.PlacementRevision
+		if seen.PackageRef != "" {
+			candidate.PackageRef = seen.PackageRef
+		}
+		if problem := rental.ValidateControl(candidate); problem != nil {
+			return problem
+		}
+		*row = candidate
+		return nil
+	}
+	if row.ControlSnapshotDigest != seen.ControlSnapshot.Digest ||
+		len(row.ControlSnapshotBytes) != len(seen.ControlSnapshot.CanonicalBytes) ||
+		!bytes.Equal(row.ControlSnapshotBytes, seen.ControlSnapshot.CanonicalBytes) {
+		return exit.Named(exit.Conflict, "rental.control_snapshot_changed",
+			"rental %s changed its acquisition control snapshot after Creator validated it", row.ID).
+			WithRemedy("release it; a different snapshot is a different execution authority")
+	}
+	if row.PlacementRevision > 0 && seen.PlacementRevision < row.PlacementRevision {
+		return exit.Named(exit.Conflict, "rental.placement_revision_regressed",
+			"rental %s placement revision regressed from %d to %d",
+			row.ID, row.PlacementRevision, seen.PlacementRevision)
+	}
 	row.PlacementRevision = seen.PlacementRevision
 	if seen.PackageRef != "" {
 		row.PackageRef = seen.PackageRef
 	}
+	return nil
 }
 
 func handleRentLs(ctx *Context) *exit.Error {

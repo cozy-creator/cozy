@@ -315,7 +315,7 @@ func (c *Orchestrator) Requeue(requestID, why string) {
 			"error_type": e.ErrName(), "error": e.Message,
 			"outputs": []any{}, "requeuing": false,
 		})
-		c.waitRequest(requestID).markClosed(e)
+		c.signalClosed(requestWaitKey(requestID), e)
 		if row, read := c.opt.Store.RequestRow(requestID); read == nil && row != nil {
 			go c.cleanupRequestAssets(*row)
 		}
@@ -324,7 +324,7 @@ func (c *Orchestrator) Requeue(requestID, why string) {
 	if canceled {
 		c.forget(requestID)
 		c.frames.forget(requestID)
-		c.waitRequest(requestID).markClosed(
+		c.signalClosed(requestWaitKey(requestID),
 			exit.New(exit.Canceled, "%s was canceled before its requeue", requestID))
 		if row, read := c.opt.Store.RequestRow(requestID); read == nil && row != nil {
 			go c.cleanupRequestAssets(*row)
@@ -590,7 +590,7 @@ func (c *Orchestrator) failQueued(requestID string, cause *exit.Error) {
 		"outputs": []any{}, "requeuing": false,
 	})
 	c.logf("%s FAILED before any offer: %s", requestID, cause.Message)
-	c.waitRequest(requestID).markClosed(cause)
+	c.signalClosed(requestWaitKey(requestID), cause)
 }
 
 func (c *Orchestrator) dispatch(req records.Request) (uint64, *exit.Error) {
@@ -621,6 +621,8 @@ func (c *Orchestrator) dispatch(req records.Request) (uint64, *exit.Error) {
 	if e != nil {
 		return 0, e
 	}
+	payloadDigest := spellOf(canonical.Digest(req.Payload))
+	outputLimit := c.maxOutputBytes()
 	spec := &pb.InvocationSpec{
 		PackageReleaseId: w.spec.Placement.PackageReleaseID,
 		// `image_digest` is GONE, renamed to what it always meant (#483): "image" is wrong
@@ -628,9 +630,9 @@ func (c *Orchestrator) dispatch(req records.Request) (uint64, *exit.Error) {
 		// daemon was frozen with — a request cannot choose the environment it runs under.
 		EnvironmentSpecDigest: environmentDigest,
 		ConfigDigest:          configDigest,
-		PayloadDigest:         spellOf(canonical.Digest(req.Payload)),
-		Inputs:                inputBindings(req),
-		Outputs:               invocationOutputBindings(splitList(req.Outputs), artifactOutputs, c.maxOutputBytes()),
+		PayloadDigest:         payloadDigest,
+		Inputs:                inputBindings(req, payloadDigest),
+		Outputs:               invocationOutputBindings(splitList(req.Outputs), artifactOutputs, outputLimit),
 		Spec: &pb.InvocationSpec_Serving{Serving: &pb.ServingInvocationSpec{
 			EntrypointBindingPlanId: req.PlanID,
 			// With no adapters the binding IS the plan, so the two ids are equal by
@@ -647,7 +649,7 @@ func (c *Orchestrator) dispatch(req records.Request) (uint64, *exit.Error) {
 			JobDescriptorId: req.PlanID,
 			PublicationContract: &pb.PublicationContract{
 				GrantId: home.ScratchRepo(req.Org, req.ID),
-				Outputs: invocationOutputBindings(splitList(req.Outputs), artifactOutputs, maxOutputBytes),
+				Outputs: invocationOutputBindings(splitList(req.Outputs), artifactOutputs, outputLimit),
 			},
 		}}
 	}
@@ -796,10 +798,10 @@ func spellOf(raw []byte) string {
 
 // inputBindings is the spec's ORDERED input identity list (#439): the payload always,
 // plus a job's materialized trees (their verification is the store's own, so no digest).
-func inputBindings(req records.Request) []*pb.InputBinding {
+func inputBindings(req records.Request, payloadDigest string) []*pb.InputBinding {
 	rows := []*pb.InputBinding{{
 		InputId:  "payload",
-		Digest:   spellOf(canonical.Digest(req.Payload)),
+		Digest:   payloadDigest,
 		Length:   uint64(len(req.Payload)),
 		KindMime: "application/json",
 		Order:    0,
@@ -1124,7 +1126,11 @@ func (c *Orchestrator) grant(requestID string, attempt uint64, req records.Reque
 // and the ack sent. The error it returns is the orchestrator's PROJECTION of the neutral
 // terminal, never a worker-authored retryability claim.
 func (c *Orchestrator) Await(requestID string, attempt uint64, timeout time.Duration) (*Result, *exit.Error) {
-	w := c.waitFor(key(requestID, attempt))
+	w, release := c.acquireWait(key(requestID, attempt))
+	defer release()
+	if row, e := c.opt.Store.AttemptRow(requestID, int64(attempt)); e == nil && row != nil && row.State == "closed" {
+		w.markClosed(outcomeError(row.TerminalStatus, row.TerminalCause, row.SafeMessage))
+	}
 	select {
 	case <-w.closed:
 	case <-time.After(timeout):
@@ -1153,7 +1159,17 @@ func (c *Orchestrator) Await(requestID string, attempt uint64, timeout time.Dura
 // ordinals the orchestrator's projection minted. This is what a caller waits on; an
 // individual attempt is the orchestrator's business.
 func (c *Orchestrator) AwaitSettled(requestID string, timeout time.Duration) (*Result, *exit.Error) {
-	w := c.waitRequest(requestID)
+	w, release := c.acquireWait(requestWaitKey(requestID))
+	defer release()
+	if row, e := c.opt.Store.RequestRow(requestID); e == nil && row != nil && settledState(row.State) {
+		attempts, read := c.opt.Store.Attempts(requestID)
+		if read == nil && len(attempts) > 0 {
+			last := attempts[len(attempts)-1]
+			w.markClosed(outcomeError(last.TerminalStatus, last.TerminalCause, last.SafeMessage))
+		} else {
+			w.markClosed(exit.Named(exit.Failed, row.State, "request %s settled %s before an attempt", requestID, row.State))
+		}
+	}
 	select {
 	case <-w.closed:
 	case <-time.After(timeout):
@@ -1182,7 +1198,16 @@ func (c *Orchestrator) AwaitSettled(requestID string, timeout time.Duration) (*R
 // AwaitAccepted blocks until AttemptAccepted is journaled — the acceptance boundary a
 // submit→accepted benchmark measures.
 func (c *Orchestrator) AwaitAccepted(requestID string, attempt uint64, timeout time.Duration) *exit.Error {
-	w := c.waitFor(key(requestID, attempt))
+	w, release := c.acquireWait(key(requestID, attempt))
+	defer release()
+	if row, e := c.opt.Store.AttemptRow(requestID, int64(attempt)); e == nil && row != nil {
+		if row.AcceptedAt != "" {
+			w.markAccepted()
+		}
+		if row.State == "closed" {
+			w.markClosed(outcomeError(row.TerminalStatus, row.TerminalCause, row.SafeMessage))
+		}
+	}
 	select {
 	case <-w.accepted:
 		return nil

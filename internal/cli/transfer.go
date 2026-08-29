@@ -4,7 +4,6 @@ import (
 	"io"
 	"os"
 	"path/filepath"
-	"strconv"
 	"strings"
 
 	"github.com/cozy-creator/cozy-creator/internal/exit"
@@ -102,11 +101,6 @@ func handleModelPublish(ctx *Context) *exit.Error {
 	// supplied operation id could be replayed with different bytes and is therefore
 	// not part of the product surface.
 	session := "snapshot-" + strings.TrimPrefix(snapshot, "sha256:")
-	failAfter, e := devKill(ctx)
-	if e != nil {
-		return e
-	}
-
 	tool, c, layout, e := tooling(ctx)
 	if e != nil {
 		return e
@@ -114,7 +108,7 @@ func handleModelPublish(ctx *Context) *exit.Error {
 	p := &transfer.Publish{
 		Tool: tool, Hub: c, Ref: ref, Snapshot: snapshot, Session: session,
 		Reason: reason, DryRun: ctx.Inv.Bool("--dry-run"),
-		Progress: progress(ctx), Scratch: scratch(layout, snapshot), FailAfter: failAfter,
+		Progress: progress(ctx), Scratch: scratch(layout, snapshot),
 	}
 	hctx, cancel := hub.LongContext()
 	defer cancel()
@@ -174,18 +168,13 @@ func handleModelPublish(ctx *Context) *exit.Error {
 
 func handleModelDownload(ctx *Context) *exit.Error {
 	spec := ctx.Inv.Args[0]
-	failAfter, e := devKill(ctx)
-	if e != nil {
-		return e
-	}
-
 	tool, c, layout, e := tooling(ctx)
 	if e != nil {
 		return e
 	}
 	f := &transfer.Fetch{
 		Tool: tool, Hub: c, Spec: spec, Lane: strings.TrimSpace(ctx.Inv.Value("--lane")),
-		DryRun: ctx.Inv.Bool("--dry-run"), Progress: progress(ctx), FailAfter: failAfter,
+		DryRun: ctx.Inv.Bool("--dry-run"), Progress: progress(ctx),
 	}
 	hctx, cancel := hub.LongContext()
 	defer cancel()
@@ -327,20 +316,4 @@ func handleModelRemove(ctx *Context) *exit.Error {
 	removed.Aggregates = []output.Field{{K: "changed", V: len(removed.Rows) > 0}}
 	removed.Notes = []string{"local names were released; TensorFS garbage collection decides later byte reclamation"}
 	return emit(ctx, removed)
-}
-
-// devKill parses the development kill point both transfer verbs share. It exists to
-// prove convergence: an interrupted transfer must resume, and the only honest way to
-// show that is to actually interrupt one.
-func devKill(ctx *Context) (int, *exit.Error) {
-	v := strings.TrimSpace(ctx.Inv.Value("--crash-after"))
-	if v == "" {
-		return 0, nil
-	}
-	n, err := strconv.Atoi(v)
-	if err != nil || n < 1 {
-		return 0, exit.Usagef("--crash-after takes a positive object count, not %q", v).
-			WithRemedy("--crash-after 3 stops after the third object has moved")
-	}
-	return n, nil
 }

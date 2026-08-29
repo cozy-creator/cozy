@@ -131,14 +131,6 @@ func handleManagedInstall(ctx *Context, profile string) *exit.Error {
 	if err != nil || ttl <= 0 || ttl > time.Hour {
 		return exit.Usagef("--grant-ttl %q is not a positive duration at or below 1h", ttlText)
 	}
-	deviceText := strings.TrimSpace(ctx.Inv.Value("--device"))
-	if deviceText == "" {
-		deviceText = "0"
-	}
-	device, err := strconv.Atoi(deviceText)
-	if err != nil || device < 0 || device > 63 {
-		return exit.Usagef("--device %q is not an index from 0 through 63", deviceText)
-	}
 	reason, e := mutationReason(ctx, "install --profile")
 	if e != nil {
 		return e
@@ -158,7 +150,7 @@ func handleManagedInstall(ctx *Context, profile string) *exit.Error {
 	}
 	installed, e := managedinstall.Run(hctx, l, st, managedinstall.Request{
 		Package: ref.String(), Release: release, Major: major, Profile: profiles[0],
-		Force: ctx.Inv.Bool("--force"), DeviceIndex: &device, Grant: grant, Config: ctx.Cfg,
+		Force: ctx.Inv.Bool("--force"), Grant: grant, Config: ctx.Cfg,
 	})
 	if e != nil {
 		return e
@@ -174,9 +166,6 @@ func handleManagedInstall(ctx *Context, profile string) *exit.Error {
 		{K: "receipt", V: facts.InstalledReceiptDigest}, {K: "host_evidence", V: facts.HostEvidenceDigest},
 		{K: "lease", V: facts.LeaseID + " until " + facts.LeaseExpiresAt},
 		{K: "disk", V: diskText(g)},
-	}
-	if facts.NativeEvidenceDigest != "" {
-		fields = append(fields, output.Field{K: "native_evidence", V: facts.NativeEvidenceDigest})
 	}
 	if installed.Superseded != "" {
 		reclaimed, problem := install.Reclaim(st, installed.Superseded)

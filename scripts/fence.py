@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Boundary fence (boundaries.md). Architecture enforcement, not a test.
 
-Fourteen families:
+Enforced families:
   deps      forbidden dependencies (raw lines, incl. import paths and go.mod)
   impl      the CANONICAL FORMATS TensorFS parses. A second reader of safetensors/gguf/
             cozytensors here would drift from the one that produced the published bytes.
@@ -48,7 +48,7 @@ word inside help text or a doc comment is never a violation. Doors, both greppab
   //cozy:allow        this line is exempt from the impl family (state the reason)
   //cozy:stdin-value  this line reads stdin as a VALUE (e.g. --token-stdin), never a prompt
 """
-import pathlib, re, sys
+import os, pathlib, re, sys
 
 SCAN = ["go.mod", "main.go", "cmd/**/*.go", "internal/**/*.go", "tests/**/*.go"]
 
@@ -800,12 +800,29 @@ def check_typed_resources():
             bad.append(f"internal/managedinstall/install.go: [resources] managed install contains "
                        f"forbidden resolve/build/path input {retired}")
     for required in ("layout.ManagedBase(grant.BaseRealization.Digest)",
-                     "cozy-environment-proof", '"cozy-native-wheel-proof"',
-                     '"cozy.local.ManagedBaseReceipt/1"'):
+                     "cozy-environment-proof", '"cozy.local.ManagedBaseReceipt/1"'):
         if required not in managed:
             bad.append(f"internal/managedinstall/install.go: [resources] missing managed-local fence {required}")
+    wheel_build = pathlib.Path("internal/wheel/build.go").read_text()
+    if "cmd.Env = config.Frozen().Tool()" not in wheel_build:
+        bad.append("internal/wheel/build.go: [env] uv build inherits the parent environment; "
+                   "the PEP 517 backend executes project code and must receive only Tool()")
+    retired_debug = (pathlib.Path("internal/transfer/fetch.go").read_text() +
+                     pathlib.Path("internal/transfer/publish.go").read_text() +
+                     pathlib.Path("internal/cli/transfer.go").read_text())
+    for retired in ("FailAfter", "--crash-after", "devKill"):
+        if retired in retired_debug:
+            bad.append(f"internal transfer path: [resources] unreachable development kill surface remains: {retired}")
     return bad
 
+
+if sys.argv[1:]:
+    if sys.argv[1:] == ["--help"] or sys.argv[1:] == ["-h"]:
+        print(__doc__.strip())
+        sys.exit(0)
+    print("usage: scripts/fence.py [--help]", file=sys.stderr)
+    sys.exit(2)
+os.chdir(pathlib.Path(__file__).resolve().parent.parent)
 
 violations = (check_sources() + check_matrix() + check_manifest() + check_secret_flags()
               + check_contract() + check_video_boundary() + check_embedded() + check_scripts()

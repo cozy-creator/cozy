@@ -99,7 +99,7 @@ func (c *Orchestrator) sendJobDirective(s *session, w *worker) {
 			// drains a queue publishes into a different scratch repo per request.
 			PublicationContract: &pb.PublicationContract{
 				GrantId: home.ScratchRepo("local", "queue"),
-				Outputs: invocationOutputBindings(plan.Outputs, plan.ArtifactOutputs, maxOutputBytes),
+				Outputs: invocationOutputBindings(plan.Outputs, plan.ArtifactOutputs, c.maxOutputBytes()),
 			},
 			// TERMINAL AND RECLAIM, everywhere. A job worker is one immutable build
 			// running one bounded attempt; deep queueing is the orchestrator's dispatch
@@ -120,8 +120,6 @@ func gpuCountOf(p *JobPlan) int64 {
 	}
 	return 0
 }
-
-const maxOutputBytes = uint64(64) << 20
 
 // ------------------------------------------------------------------ the publication root
 

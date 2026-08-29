@@ -49,9 +49,6 @@ type Fetch struct {
 	DryRun   bool
 	Progress func(string)
 	Scratch  string
-	// FailAfter stops after N objects have been installed, to prove a killed fetch
-	// converges on a re-run. Development only, and every arm using it says so.
-	FailAfter int
 
 	// seen is what THIS run already handled. The rounds overlap by construction —
 	// the closure names the documents round 2 fetched — and counting an object twice
@@ -286,19 +283,7 @@ func (f *Fetch) round(ctx context.Context, row hub.Checkpoint, name string, obje
 		return exit.Internalf("cannot create the fetch scratch: %s", err)
 	}
 	var plan strings.Builder
-	for i, o := range want {
-		if f.FailAfter > 0 && i >= f.FailAfter {
-			// Install what has landed so far, then stop. That is exactly what a real
-			// interruption leaves behind, and the next run must converge from it.
-			if plan.Len() > 0 {
-				if e := f.install(name, plan.String(), out); e != nil {
-					return e
-				}
-			}
-			return exit.Named(exit.Internal, "crash_after_fetch",
-				"development kill point: stopped after %d of %d objects", i, len(want)).
-				WithRemedy("re-run the same model download; the store's verification records are the journal")
-		}
+	for _, o := range want {
 		r, ok := at[o.ID]
 		if !ok {
 			return exit.Named(exit.NotFound, "hub.object_unavailable",

@@ -35,14 +35,10 @@ CREATE TABLE IF NOT EXISTS worker_processes (
   package_release_id      TEXT    NOT NULL,
   worker_id       TEXT    NOT NULL,
   devices         TEXT    NOT NULL,
-  pid             INTEGER NOT NULL,
-  birth           TEXT    NOT NULL,
-  session_id      TEXT,
-  incarnation     INTEGER NOT NULL DEFAULT 0,
-  readiness_epoch INTEGER NOT NULL DEFAULT 0,
-  revision        INTEGER NOT NULL DEFAULT 0,
-  intake          TEXT    NOT NULL DEFAULT '',
-  state           TEXT    NOT NULL,
+	pid             INTEGER NOT NULL,
+	birth           TEXT    NOT NULL,
+	session_id      TEXT,
+	state           TEXT    NOT NULL,
   opened_at       TEXT    NOT NULL,
   closed_at       TEXT    NOT NULL DEFAULT ''
 )`, `
@@ -251,7 +247,6 @@ var rebuild = []tableRebuild{{
 var widen = []string{
 	`ALTER TABLE install_generations ADD COLUMN runtime TEXT NOT NULL DEFAULT ''`,
 	`ALTER TABLE install_generations ADD COLUMN project_dir TEXT NOT NULL DEFAULT ''`,
-	`ALTER TABLE managed_profile_installs ADD COLUMN native_evidence_digest TEXT NOT NULL DEFAULT ''`,
 	`ALTER TABLE requests ADD COLUMN kind TEXT NOT NULL DEFAULT 'serving'`,
 	`ALTER TABLE requests ADD COLUMN worker TEXT NOT NULL DEFAULT ''`,
 	`ALTER TABLE requests ADD COLUMN org TEXT NOT NULL DEFAULT ''`,
@@ -290,19 +285,17 @@ func NewID(prefix string) string {
 // identities it reported, and the generation-scoped device grant it holds. The grant is
 // this row's `Devices` field — one process, one visible device set, one generation.
 type WorkerProcess struct {
-	InstanceID                            string
-	Package                               string
-	Generation                            string
-	PackageReleaseID                      string
-	WorkerID                              string
-	Devices                               []string
-	PID                                   int
-	Birth                                 string // the OS process-birth identity: /proc starttime, never the pid alone
-	SessionID                             string
-	Incarnation, ReadinessEpoch, Revision int64
-	Intake                                string
-	State                                 string // spawned_without_birth | spawned | registered | closed
-	OpenedAt                              string
+	InstanceID       string
+	Package          string
+	Generation       string
+	PackageReleaseID string
+	WorkerID         string
+	Devices          []string
+	PID              int
+	Birth            string // the OS process-birth identity: /proc starttime, never the pid alone
+	SessionID        string
+	State            string // spawned_without_birth | spawned | registered | closed
+	OpenedAt         string
 }
 
 type AcquisitionLeg struct {
@@ -474,7 +467,7 @@ func (s *Store) SpawnWorker(w WorkerProcess) *exit.Error {
 		ON CONFLICT(instance_id) DO UPDATE SET
 		  pid=excluded.pid, birth=excluded.birth, devices=excluded.devices,
 		  generation=excluded.generation, package_release_id=excluded.package_release_id,
-		  session_id=NULL, incarnation=0, readiness_epoch=0, revision=0, intake='',
+		  session_id=NULL,
 		  state='spawned_without_birth', opened_at=excluded.opened_at, closed_at=''`, args...)
 	if err != nil {
 		return exit.Internalf("cannot journal the worker process %s: %s", w.InstanceID, err)
@@ -505,7 +498,7 @@ func (s *Store) AttachWorker(w WorkerProcess) *exit.Error {
 		VALUES(?,?,?,?,?,'',0,'','spawned',?)
 		ON CONFLICT(instance_id) DO UPDATE SET
 		  generation=excluded.generation, package_release_id=excluded.package_release_id,
-		  session_id=NULL, incarnation=0, readiness_epoch=0, revision=0, intake='',
+		  session_id=NULL,
 		  state='spawned', opened_at=excluded.opened_at, closed_at=''`,
 		w.InstanceID, w.Package, nullable(w.Generation), w.PackageReleaseID, w.WorkerID,
 		now()); err != nil {
@@ -563,10 +556,10 @@ func (s *Store) DeviceHolders(devices []string) ([]string, *exit.Error) {
 
 // BindSession records what Register reported. session_id is the WORKER's to mint; the
 // orchestrator only binds it, and the unique index refuses two live workers sharing one.
-func (s *Store) BindSession(instanceID, sessionID string, incarnation int64) *exit.Error {
+func (s *Store) BindSession(instanceID, sessionID string) *exit.Error {
 	res, err := s.db.Exec(`UPDATE worker_processes
-		SET session_id=?, incarnation=?, state='registered'
-		WHERE instance_id=? AND state != 'closed'`, sessionID, incarnation, instanceID)
+		SET session_id=?, state='registered'
+		WHERE instance_id=? AND state != 'closed'`, sessionID, instanceID)
 	if err != nil {
 		return exit.New(exit.Conflict, "cannot bind session %s to %s: %s", sessionID, instanceID, err).
 			WithRemedy("a session_id is bound to at most one live worker")
@@ -574,17 +567,6 @@ func (s *Store) BindSession(instanceID, sessionID string, incarnation int64) *ex
 	if n, _ := res.RowsAffected(); n != 1 {
 		return exit.New(exit.Conflict, "no live worker process %s to bind session %s to",
 			instanceID, sessionID)
-	}
-	return nil
-}
-
-// ReportWorker records the applied baseline a Report echoes.
-func (s *Store) ReportWorker(sessionID, intake string, revision, epoch, incarnation int64) *exit.Error {
-	_, err := s.db.Exec(`UPDATE worker_processes
-		SET intake=?, revision=?, readiness_epoch=?, incarnation=?
-		WHERE session_id=?`, intake, revision, epoch, incarnation, sessionID)
-	if err != nil {
-		return exit.Internalf("cannot record the worker report for %s: %s", sessionID, err)
 	}
 	return nil
 }
@@ -626,8 +608,7 @@ func (s *Store) CloseWorker(instanceID string) *exit.Error {
 // reads it and checks each against its OS process-birth identity before adopting.
 func (s *Store) LiveWorkers() ([]WorkerProcess, *exit.Error) {
 	rows, err := s.db.Query(`SELECT instance_id,package,COALESCE(generation,''),package_release_id,
-		worker_id,devices,pid,birth,COALESCE(session_id,''),incarnation,readiness_epoch,
-		revision,intake,state,opened_at FROM worker_processes WHERE state != 'closed'
+		worker_id,devices,pid,birth,COALESCE(session_id,''),state,opened_at FROM worker_processes WHERE state != 'closed'
 		ORDER BY opened_at`)
 	if err != nil {
 		return nil, exit.Internalf("cannot list worker processes: %s", err)
@@ -638,8 +619,7 @@ func (s *Store) LiveWorkers() ([]WorkerProcess, *exit.Error) {
 		var w WorkerProcess
 		var devices string
 		if err := rows.Scan(&w.InstanceID, &w.Package, &w.Generation, &w.PackageReleaseID,
-			&w.WorkerID, &devices, &w.PID, &w.Birth, &w.SessionID, &w.Incarnation,
-			&w.ReadinessEpoch, &w.Revision, &w.Intake, &w.State, &w.OpenedAt); err != nil {
+			&w.WorkerID, &devices, &w.PID, &w.Birth, &w.SessionID, &w.State, &w.OpenedAt); err != nil {
 			return nil, exit.Internalf("cannot read a worker process row: %s", err)
 		}
 		for _, d := range strings.Split(strings.Trim(devices, "|"), "||") {

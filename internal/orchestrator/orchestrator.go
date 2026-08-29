@@ -58,6 +58,9 @@ type Options struct {
 	// not hardware evidence: a rented worker is not dispatchable until this callback has
 	// durably joined its actual accelerator and worker identity to the rental.
 	ObserveRental func(RentalObservation) *exit.Error
+	// RecordRentalRefusal persists this owner's non-transient verdict on a private worker
+	// before the control stream closes. Without it a rejected ClaimAck exists only in RAM.
+	RecordRentalRefusal func(rentalID string, problem *exit.Error) *exit.Error
 	// ArtifactGrants obtains the next durable, rental-scoped access revision. It is
 	// called only after the worker snapshot barrier is acknowledged. The source owns
 	// revision persistence and authentication; the orchestrator only relays the grant.
@@ -175,6 +178,7 @@ type wait struct {
 	closed   chan struct{}
 	once     sync.Once
 	onceA    sync.Once
+	refs     int
 	err      *exit.Error
 }
 
@@ -294,15 +298,43 @@ func key(requestID string, attempt uint64) string {
 	return fmt.Sprintf("%s#%d", requestID, attempt)
 }
 
-func (c *Orchestrator) waitFor(k string) *wait {
+// acquireWait retains only live callers. Terminal/acceptance signals never create a map
+// entry of their own, so fire-and-forget requests cannot accumulate one wait forever.
+func (c *Orchestrator) acquireWait(k string) (*wait, func()) {
 	c.mu.Lock()
-	defer c.mu.Unlock()
 	w, ok := c.waits[k]
 	if !ok {
 		w = &wait{accepted: make(chan struct{}), closed: make(chan struct{})}
 		c.waits[k] = w
 	}
-	return w
+	w.refs++
+	c.mu.Unlock()
+	return w, func() {
+		c.mu.Lock()
+		w.refs--
+		if w.refs == 0 && c.waits[k] == w {
+			delete(c.waits, k)
+		}
+		c.mu.Unlock()
+	}
+}
+
+func (c *Orchestrator) signalAccepted(k string) {
+	c.mu.Lock()
+	w := c.waits[k]
+	c.mu.Unlock()
+	if w != nil {
+		w.markAccepted()
+	}
+}
+
+func (c *Orchestrator) signalClosed(k string, e *exit.Error) {
+	c.mu.Lock()
+	w := c.waits[k]
+	c.mu.Unlock()
+	if w != nil {
+		w.markClosed(e)
+	}
 }
 
 // enqueue parks a request until some worker advertises its binding as ready.
@@ -656,7 +688,7 @@ func (c *Orchestrator) CancelQueued(requestID string) *exit.Error {
 	c.forget(requestID)
 	c.frames.forget(requestID)
 	c.logf("%s left the dispatch queue: canceled before any attempt", requestID)
-	c.waitRequest(requestID).markClosed(
+	c.signalClosed(requestWaitKey(requestID),
 		exit.New(exit.Canceled, "%s was canceled before any attempt was dispatched", requestID))
 	return nil
 }
@@ -673,9 +705,8 @@ func (c *Orchestrator) forget(requestID string) {
 	c.pending = out
 }
 
-// waitRequest is the REQUEST-level wait: it closes when the request settles, which may
-// be several attempts after the one a caller first saw.
-func (c *Orchestrator) waitRequest(requestID string) *wait { return c.waitFor("request:" + requestID) }
+// requestWaitKey names the request-level wait, which may span several attempt ordinals.
+func requestWaitKey(requestID string) string { return "request:" + requestID }
 
 func (w *wait) markAccepted() { w.onceA.Do(func() { close(w.accepted) }) }
 func (w *wait) markClosed(e *exit.Error) {

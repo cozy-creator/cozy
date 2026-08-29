@@ -243,8 +243,9 @@ func (s *Server) handleOf(row records.Request, attempt uint64) Handle {
 		EventsURL: base + "/events",
 	}
 	if h.Status == "queued" {
-		position := 0
-		h.QueuePosition = &position
+		if position := s.orchestrator.QueuePosition(row.ID); position > 0 {
+			h.QueuePosition = &position
+		}
 	}
 	return h
 }

@@ -34,14 +34,13 @@ import (
 const managedBaseFormat = "cozy.local.ManagedBaseReceipt/1"
 
 type Request struct {
-	Package     string
-	Release     string
-	Major       int
-	Profile     string
-	DeviceIndex *int
-	Force       bool
-	Grant       hub.LocalQualificationMaterials
-	Config      config.Config
+	Package string
+	Release string
+	Major   int
+	Profile string
+	Force   bool
+	Grant   hub.LocalQualificationMaterials
+	Config  config.Config
 }
 
 type Result struct {
@@ -150,7 +149,7 @@ func Run(ctx context.Context, layout home.Layout, store *records.Store, request 
 	}
 	docPaths["descriptor.json"] = descriptorPath
 	wheelFacts, problem := releaseWheelFacts(grant.PackageBundle.CanonicalBytes,
-		grant.ResolvedWheelSet.CanonicalBytes)
+		grant.ResolvedWheelSet.CanonicalBytes, request.Package+"@"+request.Release)
 	if problem != nil {
 		return fail(problem)
 	}
@@ -171,7 +170,6 @@ func Run(ctx context.Context, layout home.Layout, store *records.Store, request 
 	}
 	wheelFiles := map[string]string{}
 	seenRoles := map[string]bool{}
-	nativeCustom := false
 	for _, download := range grant.Downloads {
 		downloadExpiry, expiryErr := time.Parse(time.RFC3339, download.ExpiresAt)
 		if seenRoles[download.Role] || download.Role == "" || !digest(download.Ref.Digest) ||
@@ -191,11 +189,7 @@ func Run(ctx context.Context, layout home.Layout, store *records.Store, request 
 			target, download.Ref.Digest, download.Ref.Length); problem != nil {
 			return fail(problem)
 		}
-		class := wheel.CustomWheel
-		if download.Role == "project_wheel" {
-			class = wheel.ProjectWheel
-		}
-		inspected, problem := wheel.Inspect(target, class)
+		inspected, problem := wheel.Inspect(target)
 		if problem != nil || !sameWheelFact(fact, inspected) {
 			if problem != nil {
 				return fail(problem)
@@ -203,12 +197,11 @@ func Run(ctx context.Context, layout home.Layout, store *records.Store, request 
 			return fail(exit.Named(exit.Structural, "managed_install_wheel_fact_mismatch",
 				"downloaded role %s disagrees with its canonical WheelFact", download.Role))
 		}
-		nativeCustom = nativeCustom || class == wheel.CustomWheel && inspected.Native
 		wheelFiles[download.Ref.Digest] = target
 	}
 	if !seenRoles["project_wheel"] || len(seenRoles) != len(wheelFacts) {
 		return fail(exit.Named(exit.Structural, "managed_install_project_wheel_absent",
-			"local execution did not grant every-and-only project/custom wheel"))
+			"local execution did not grant exactly the project wheel"))
 	}
 
 	environmentRoot := filepath.Join(genDir, "environment")
@@ -259,23 +252,6 @@ func Run(ctx context.Context, layout home.Layout, store *records.Store, request 
 	if problem != nil {
 		return fail(problem)
 	}
-	nativeDigest := ""
-	if nativeCustom {
-		if grant.NativeWheelProof == nil {
-			return fail(exit.Named(exit.Structural, "managed_native_proof_absent",
-				"native custom wheel has no banked operator fixture/result proof request"))
-		}
-		nativeEvidence := filepath.Join(genDir, "native-wheel-qualification.json")
-		nativeDigest, problem = runNativeProof(base, grant, profile, request.DeviceIndex, environmentRoot,
-			proof.Generation, proof.Digest, overlayContentDigest, receiptPath,
-			docPaths["wheelhouse-manifest.json"], nativeEvidence, toolEnv)
-		if problem != nil {
-			return fail(problem)
-		}
-	} else if grant.NativeWheelProof != nil {
-		return fail(exit.Named(exit.Structural, "managed_native_proof_unexpected",
-			"pure overlay received a native-wheel proof request"))
-	}
 	derivedDescriptor, problem := describe(runtimeBin, projectDir, toolEnv)
 	if problem != nil {
 		return fail(problem)
@@ -307,8 +283,8 @@ func Run(ctx context.Context, layout home.Layout, store *records.Store, request 
 		ResolvedWheelSetDigest:   grant.ResolvedWheelSet.Digest,
 		ResolutionLockDigest:     grant.ResolutionLock.Digest,
 		InstalledReceiptDigest:   proof.Digest, InstalledReceiptLength: proof.Length,
-		HostEvidenceDigest: hostDigest, NativeEvidenceDigest: nativeDigest,
-		LeaseID: grant.LeaseID, LeaseExpiresAt: grant.LeaseExpiresAt,
+		HostEvidenceDigest: hostDigest,
+		LeaseID:            grant.LeaseID, LeaseExpiresAt: grant.LeaseExpiresAt,
 	}
 	superseded, problem := store.ActivateManaged(gen, facts)
 	if problem != nil {
@@ -317,7 +293,7 @@ func Run(ctx context.Context, layout home.Layout, store *records.Store, request 
 	return &Result{Install: gen, Facts: facts, Superseded: superseded}, nil
 }
 
-func releaseWheelFacts(bundleBytes, resolvedBytes []byte) (map[string]wheel.Fact, *exit.Error) {
+func releaseWheelFacts(bundleBytes, resolvedBytes []byte, expectedRelease string) (map[string]wheel.Fact, *exit.Error) {
 	var bundle struct {
 		Format             string        `json:"format"`
 		PackageDescriptor  hub.ObjectRef `json:"package_descriptor"`
@@ -333,7 +309,7 @@ func releaseWheelFacts(bundleBytes, resolvedBytes []byte) (map[string]wheel.Fact
 	bundleDecoder := json.NewDecoder(bytes.NewReader(bundleBytes))
 	bundleDecoder.DisallowUnknownFields()
 	if bundleDecoder.Decode(&bundle) != nil || json.Unmarshal(resolvedBytes, &resolved) != nil ||
-		bundle.Format != "tensorhub.package_bundle/3" || bundle.PackageReleaseID == "" ||
+		bundle.Format != "tensorhub.package_bundle/3" || bundle.PackageReleaseID != expectedRelease ||
 		!digest(bundle.PackageDescriptor.Digest) || bundle.PackageDescriptor.Length <= 0 ||
 		!digest(bundle.ResolvedWheelSet.Digest) || bundle.ResolvedWheelSet.Length <= 0 ||
 		!digest(bundle.SourceTree.Digest) || bundle.SourceTree.Length <= 0 ||
@@ -342,23 +318,13 @@ func releaseWheelFacts(bundleBytes, resolvedBytes []byte) (map[string]wheel.Fact
 		bundle.ProjectWheel.Distribution == "" || bundle.ProjectWheel.Version == "" ||
 		bundle.ProjectWheel.Length <= 0 {
 		return nil, exit.Named(exit.Structural, "managed_install_wheel_facts_invalid",
-			"PackageBundle/ResolvedWheelSet carry no complete project/custom WheelFacts")
+			"PackageBundle identity or project WheelFact is incomplete")
+	}
+	if len(resolved.Wheels) != 0 {
+		return nil, exit.Named(exit.Structural, "managed_install_custom_wheels_unsupported",
+			"ResolvedWheelSet carries %d custom wheel(s); the current managed-local lane admits only one pure project wheel", len(resolved.Wheels))
 	}
 	out := map[string]wheel.Fact{"project_wheel": bundle.ProjectWheel}
-	seenDigests := map[string]bool{bundle.ProjectWheel.Digest: true}
-	seenDistributions := map[string]bool{bundle.ProjectWheel.Distribution: true}
-	for _, fact := range resolved.Wheels {
-		role := "custom_wheel:" + fact.Distribution + ":" + strings.TrimPrefix(fact.Digest, "sha256:")
-		if _, duplicate := out[role]; duplicate || !digest(fact.Digest) || fact.Filename == "" ||
-			fact.Distribution == "" || fact.Version == "" || fact.Length <= 0 ||
-			seenDigests[fact.Digest] || seenDistributions[fact.Distribution] {
-			return nil, exit.Named(exit.Structural, "managed_install_wheel_facts_invalid",
-				"ResolvedWheelSet has malformed or duplicate custom WheelFacts")
-		}
-		out[role] = fact
-		seenDigests[fact.Digest] = true
-		seenDistributions[fact.Distribution] = true
-	}
 	return out, nil
 }
 
@@ -394,79 +360,6 @@ type overlayReceipt struct {
 	Format             string                `json:"format"`
 	OverlayWheels      []overlayWheelReceipt `json:"overlay_wheels"`
 	ProjectWheelDigest string                `json:"project_wheel_digest"`
-}
-
-type nativeDistribution struct {
-	Distribution string `json:"distribution"`
-	Version      string `json:"version"`
-}
-
-type nativeSeat struct {
-	CUDAAvailable  bool                 `json:"cuda_available"`
-	Distributions  []nativeDistribution `json:"distributions"`
-	Implementation string               `json:"implementation"`
-	LibcName       string               `json:"libc_name"`
-	LibcVersion    string               `json:"libc_version"`
-	Machine        string               `json:"machine"`
-	PythonABI      string               `json:"python_abi"`
-	System         string               `json:"system"`
-	TorchCUDA      string               `json:"torch_cuda"`
-	TorchVersion   string               `json:"torch_version"`
-}
-
-type nativeGPU struct {
-	DeviceIndex   int    `json:"device_index"`
-	DriverVersion string `json:"driver_version"`
-	Name          string `json:"name"`
-	SM            int    `json:"sm"`
-}
-
-type nativeInspectionMember struct {
-	CubinSMs              []int    `json:"cubin_sms"`
-	CUDASections          []string `json:"cuda_sections"`
-	DefinedSymbolsDigest  string   `json:"defined_symbols_digest"`
-	Member                string   `json:"member"`
-	Needed                []string `json:"needed"`
-	PTXCompute            []int    `json:"ptx_compute"`
-	RequiredSymbolsDigest string   `json:"required_symbols_digest"`
-	Runpaths              []string `json:"runpaths"`
-	Soname                string   `json:"soname"`
-}
-
-type nativeInspection struct {
-	Format  string                   `json:"format"`
-	Members []nativeInspectionMember `json:"members"`
-}
-
-type nativeHostQualification struct {
-	Format           string `json:"format"`
-	GPUSM            *int   `json:"gpu_sm"`
-	HostLibraryCount int    `json:"host_library_count"`
-	InspectionDigest string `json:"inspection_digest"`
-	Qualification    string `json:"qualification"`
-}
-
-type nativeOperatorObservation struct {
-	ExpectedResultDigest string `json:"expected_result_digest"`
-	Fixture              string `json:"fixture"`
-	Format               string `json:"format"`
-	ResultDigest         string `json:"result_digest"`
-}
-
-type nativeQualification struct {
-	BaseWorkerProfile            string `json:"base_worker_profile"`
-	PackageEnvironmentSpecDigest string `json:"package_environment_spec_digest"`
-	Format                       string `json:"format"`
-	HostCapability               struct {
-		GPU  *nativeGPU `json:"gpu"`
-		Seat nativeSeat `json:"seat"`
-	} `json:"host_capability"`
-	HostQualification                 nativeHostQualification   `json:"host_qualification"`
-	InstalledEnvironmentReceiptDigest string                    `json:"installed_environment_receipt_digest"`
-	OperatorObservation               nativeOperatorObservation `json:"operator_observation"`
-	OverlayContentDigest              string                    `json:"overlay_content_digest"`
-	StaticInspection                  nativeInspection          `json:"static_inspection"`
-	WheelhouseManifestDigest          string                    `json:"wheelhouse_manifest_digest"`
 }
 
 func verifyOverlayReceipt(path string, grant hub.LocalQualificationMaterials,
@@ -531,177 +424,6 @@ func verifyOverlayReceipt(path string, grant hub.LocalQualificationMaterials,
 		return "", exit.Internalf("cannot canonicalize overlay content identity: %s", err)
 	}
 	return hash(contentBytes), nil
-}
-
-func runNativeProof(base string, grant hub.LocalQualificationMaterials, profile string, deviceIndex *int,
-	environmentRoot, generation, receiptDigest, overlayContentDigest, receiptPath, wheelhouse,
-	output string, env []string,
-) (string, *exit.Error) {
-	spec := grant.NativeWheelProof
-	if spec == nil || !digest(spec.ExpectedResultDigest) || spec.Fixture == "" ||
-		(deviceIndex != nil && (*deviceIndex < 0 || *deviceIndex > 63)) {
-		return "", exit.Named(exit.Structural, "managed_native_proof_invalid",
-			"native-wheel proof fixture, result digest, or device index is invalid")
-	}
-	binary := filepath.Join(base, "bin", "cozy-native-wheel-proof")
-	if problem := regularExecutable(binary, "managed base native-wheel proof"); problem != nil {
-		return "", problem
-	}
-	request := map[string]any{
-		"format": "cozy.runtime.NativeWheelProofRequest/1", "device_index": deviceIndex,
-		"package_environment_spec_digest": grant.PackageEnvironmentSpec.Digest,
-		"environment_root":                environmentRoot, "expected_result_digest": spec.ExpectedResultDigest,
-		"fixture": spec.Fixture, "installed_environment_receipt_digest": receiptDigest,
-		"python": filepath.Join(base, "bin", "python"), "wheelhouse_manifest": wheelhouse,
-	}
-	requestPath := strings.TrimSuffix(output, filepath.Ext(output)) + "-request.json"
-	if problem := writeJCS(requestPath, request); problem != nil {
-		return "", problem
-	}
-	cmd := exec.Command(binary, requestPath, output)
-	cmd.Env = env
-	var stdout, stderr bytes.Buffer
-	cmd.Stdout, cmd.Stderr = &stdout, &stderr
-	if err := cmd.Run(); err != nil {
-		return "", exit.Named(exit.Structural, "managed_native_proof_refused", "%s", condense(stderr.String()))
-	}
-	var result struct {
-		Digest string `json:"digest"`
-		Length int64  `json:"length"`
-	}
-	if json.Unmarshal(stdout.Bytes(), &result) != nil || verifyFile(output, result.Digest, result.Length) != nil {
-		return "", exit.Internalf("cozy-native-wheel-proof returned incomplete evidence")
-	}
-	if problem := validateNativeEvidence(output, grant, profile, deviceIndex, generation,
-		receiptDigest, overlayContentDigest, receiptPath, wheelhouse); problem != nil {
-		return "", problem
-	}
-	return result.Digest, nil
-}
-
-func validateNativeEvidence(path string, grant hub.LocalQualificationMaterials, profile string,
-	deviceIndex *int, generation, receiptDigest, overlayContentDigest, receiptPath,
-	wheelhouse string,
-) *exit.Error {
-	refuse := func(format string, args ...any) *exit.Error {
-		return exit.Named(exit.Structural, "managed_native_evidence_invalid", format, args...)
-	}
-	raw, err := os.ReadFile(path)
-	if err != nil {
-		return refuse("cannot read native qualification evidence: %v", err)
-	}
-	canonicalBytes, err := canonical.NormalizeJCS(raw)
-	if err != nil || !bytes.Equal(canonicalBytes, raw) {
-		return refuse("native qualification evidence is not exact canonical JCS: %v", err)
-	}
-	var evidence nativeQualification
-	decoder := json.NewDecoder(bytes.NewReader(raw))
-	decoder.DisallowUnknownFields()
-	if err := decoder.Decode(&evidence); err != nil {
-		return refuse("native qualification evidence is not closed: %v", err)
-	}
-	if evidence.Format != "cozy.runtime.NativeWheelQualification/1" ||
-		evidence.BaseWorkerProfile != profile ||
-		evidence.PackageEnvironmentSpecDigest != grant.PackageEnvironmentSpec.Digest ||
-		evidence.WheelhouseManifestDigest != grant.WheelhouseManifest.Digest ||
-		evidence.InstalledEnvironmentReceiptDigest != receiptDigest ||
-		evidence.OverlayContentDigest != overlayContentDigest ||
-		filepath.Base(generation) != strings.TrimPrefix(overlayContentDigest, "sha256:") {
-		return refuse("native qualification evidence does not join the exact profile/environment/receipt/content")
-	}
-	if _, err := os.Stat(receiptPath); err != nil {
-		return refuse("installed Runtime receipt disappeared before native qualification joined it")
-	}
-
-	inspection := evidence.StaticInspection
-	if inspection.Format != "cozy.runtime.NativeWheelInspection/1" || len(inspection.Members) == 0 {
-		return refuse("native qualification has no closed static inspection")
-	}
-	priorMember := ""
-	for i, member := range inspection.Members {
-		if member.Member == "" || member.Member <= priorMember ||
-			!digest(member.DefinedSymbolsDigest) || !digest(member.RequiredSymbolsDigest) ||
-			member.CubinSMs == nil || member.CUDASections == nil || member.Needed == nil ||
-			member.PTXCompute == nil || member.Runpaths == nil {
-			return refuse("native static inspection member %d is malformed or unsorted", i)
-		}
-		priorMember = member.Member
-	}
-	inspectionBytes, err := json.Marshal(inspection)
-	if err != nil {
-		return exit.Internalf("cannot encode native inspection evidence: %s", err)
-	}
-	inspectionBytes, err = canonical.NormalizeJCS(inspectionBytes)
-	if err != nil {
-		return exit.Internalf("cannot canonicalize native inspection evidence: %s", err)
-	}
-	host := evidence.HostQualification
-	if host.Format != "cozy.runtime.NativeHostQualification/1" || host.HostLibraryCount < 0 ||
-		host.InspectionDigest != hash(inspectionBytes) || host.Qualification != "static-host-compatible" {
-		return refuse("native host qualification does not join the measured static inspection")
-	}
-	operator := evidence.OperatorObservation
-	if grant.NativeWheelProof == nil || operator.Format != "cozy.runtime.NativeOperatorObservation/1" ||
-		operator.Fixture != grant.NativeWheelProof.Fixture ||
-		operator.ExpectedResultDigest != grant.NativeWheelProof.ExpectedResultDigest ||
-		operator.ResultDigest != operator.ExpectedResultDigest || !digest(operator.ResultDigest) {
-		return refuse("native operator observation does not reproduce the banked fixture/result")
-	}
-
-	baseBytes, err := os.ReadFile(wheelhouse)
-	if err != nil {
-		return refuse("cannot reread exact WheelhouseManifest: %v", err)
-	}
-	var base struct {
-		BaseDistributions    []nativeDistribution `json:"base_distributions"`
-		CompatibilityProfile struct {
-			TorchRelease     string `json:"torch_release"`
-			AcceleratorBuild string `json:"accelerator_build"`
-			PythonABI        string `json:"python_abi"`
-			OSCPU            string `json:"os_cpu"`
-		} `json:"compatibility_profile"`
-	}
-	if json.Unmarshal(baseBytes, &base) != nil || len(base.BaseDistributions) == 0 {
-		return refuse("WheelhouseManifest carries no base inventory/profile")
-	}
-	baseProfile := "torch" + base.CompatibilityProfile.TorchRelease + "-" +
-		base.CompatibilityProfile.AcceleratorBuild + "-" + base.CompatibilityProfile.PythonABI + "-" +
-		base.CompatibilityProfile.OSCPU
-	seat := evidence.HostCapability.Seat
-	if baseProfile != profile || seat.Implementation != "cpython" || seat.System != "linux" ||
-		(seat.Machine != "x86_64" && seat.Machine != "amd64") ||
-		seat.PythonABI != pythonABI(profile) || seat.LibcName == "" || seat.LibcVersion == "" ||
-		seat.TorchCUDA != acceleratorVersion(profile) ||
-		(seat.TorchVersion != base.CompatibilityProfile.TorchRelease &&
-			!strings.HasPrefix(seat.TorchVersion, base.CompatibilityProfile.TorchRelease+"+")) ||
-		!sameDistributions(seat.Distributions, base.BaseDistributions) {
-		return refuse("native proof seat does not match the exact managed base/profile inventory")
-	}
-	gpu := evidence.HostCapability.GPU
-	if deviceIndex == nil {
-		if gpu != nil || host.GPUSM != nil {
-			return refuse("CPU native proof unexpectedly carries GPU evidence")
-		}
-	} else if gpu == nil || host.GPUSM == nil || gpu.DeviceIndex != *deviceIndex ||
-		gpu.SM <= 0 || *host.GPUSM != gpu.SM || gpu.Name == "" || gpu.DriverVersion == "" ||
-		!seat.CUDAAvailable {
-		return refuse("native proof GPU evidence does not match the selected device/profile")
-	}
-	return nil
-}
-
-func sameDistributions(a, b []nativeDistribution) bool {
-	if len(a) != len(b) {
-		return false
-	}
-	for i := range a {
-		if a[i] != b[i] || a[i].Distribution == "" || a[i].Version == "" ||
-			(i > 0 && (a[i-1].Distribution > a[i].Distribution ||
-				a[i-1].Distribution == a[i].Distribution)) {
-			return false
-		}
-	}
-	return true
 }
 
 func openManagedBase(layout home.Layout, grant hub.LocalQualificationMaterials,

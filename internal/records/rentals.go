@@ -590,9 +590,9 @@ func (s *Store) Rentals() ([]Rental, *exit.Error) {
 	return out, nil
 }
 
-// RentalRelayRefusal is the last durable non-transient verdict Tensorhub returned for
-// this rental's worker-session evidence. Without it the relay could stop retrying one
-// rejected frame while every client continued seeing only `converging`.
+// RentalRelayRefusal is the last durable non-transient private-control verdict, whether
+// the worker rejected Claim or Tensorhub rejected relayed session evidence. Without it
+// every client would continue seeing only `converging` after control had already refused.
 type RentalRelayRefusal struct {
 	RentalID   string
 	Code       exit.Code

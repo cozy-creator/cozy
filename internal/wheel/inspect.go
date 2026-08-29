@@ -1,8 +1,7 @@
 package wheel
 
-// Exact wheel inspection for package publication. Creator never builds, repairs,
-// renames, or retags a custom wheel: it reads the bytes the author named, validates
-// the portable wheel envelope and RECORD, and declares the resulting WheelFact.
+// Exact wheel inspection for package publication. The current public lane admits one
+// portable project wheel and no custom-wheel surface.
 
 import (
 	"archive/zip"
@@ -36,20 +35,11 @@ type Fact struct {
 	Length       int64    `json:"length"`
 	Tags         []string `json:"tags"`
 	Version      string   `json:"version"`
-	Native       bool     `json:"-"`
 }
 
-type InspectClass string
-
-const (
-	ProjectWheel InspectClass = "project"
-	CustomWheel  InspectClass = "custom"
-)
-
-// Inspect reads one wheel exactly as supplied. Project wheels must be one pure
-// py3-none-any payload with no native/build member. Custom wheels may contain native
-// binaries but never native source or a build recipe; they remain prebuilt inputs.
-func Inspect(file string, class InspectClass) (Fact, *exit.Error) {
+// Inspect reads one wheel exactly as supplied. It must be one pure py3-none-any
+// project payload with no native/build member or nested wheel carrier.
+func Inspect(file string) (Fact, *exit.Error) {
 	out := Fact{ImportRoots: []string{}, Tags: []string{}}
 	abs, err := filepath.Abs(file)
 	if err != nil {
@@ -97,12 +87,10 @@ func Inspect(file string, class InspectClass) (Fact, *exit.Error) {
 		if e := checkName(strings.TrimSuffix(name, "/")); e != nil {
 			return out, exit.Named(exit.Validation, "wheel_entry_invalid", "%s: %s", name, e.Message)
 		}
-		if class == ProjectWheel {
-			if code, kind := forbiddenProjectMember(name); code != "" {
-				return out, exit.Named(exit.Validation, code,
-					"%s is %s and cannot enter a package project wheel", name, kind).
-					WithRemedy("exclude local secrets, environments, VCS metadata, caches, and generated output in the project's build-backend configuration")
-			}
+		if code, kind := forbiddenProjectMember(name); code != "" {
+			return out, exit.Named(exit.Validation, code,
+				"%s is %s and cannot enter a package project wheel", name, kind).
+				WithRemedy("exclude local secrets, environments, VCS metadata, caches, and generated output in the project's build-backend configuration")
 		}
 		folded := strings.ToLower(name)
 		if seen[folded] {
@@ -121,27 +109,20 @@ func Inspect(file string, class InspectClass) (Fact, *exit.Error) {
 			return out, exit.Named(exit.Validation, "wheel_entry_invalid", "%s is not a regular file", name)
 		}
 		ext := strings.ToLower(path.Ext(name))
-		if class == ProjectWheel && compiledExt[ext] {
+		if ext == ".whl" {
+			return out, exit.Named(exit.Validation, "project_wheel_nested_wheel",
+				"%s is a nested wheel; package code cannot smuggle a second distribution past the project-wheel tag and ownership checks", name)
+		}
+		if compiledExt[ext] {
 			return out, refuseCompiled(name)
 		}
-		if class == ProjectWheel && privateBuildMember(name) {
+		if privateBuildMember(name) {
 			return out, exit.Named(exit.Validation, "project_wheel_private_member",
 				"%s is local credential, VCS, environment, cache, editor, or build state", name).
 				WithRemedy("exclude it from the declared backend's wheel; project wheels contain only publishable package code")
 		}
-		if class == CustomWheel && nativeSourceExt[ext] {
-			return out, exit.Named(exit.Validation, "custom_wheel_build_input",
-				"%s contains native source; custom wheels are exact prebuilt binaries", name)
-		}
-		if class == CustomWheel && compiledExt[ext] && !nativeSourceExt[ext] {
-			out.Native = true
-		}
 		if buildInputName(name) {
-			code := "project_wheel_build_input"
-			if class == CustomWheel {
-				code = "custom_wheel_build_input"
-			}
-			return out, exit.Named(exit.Validation, code,
+			return out, exit.Named(exit.Validation, "project_wheel_build_input",
 				"%s contains a build input; Creator never builds or repairs package wheels", name)
 		}
 		if ext == ".pth" {
@@ -199,14 +180,9 @@ func Inspect(file string, class InspectClass) (Fact, *exit.Error) {
 		return out, exit.Named(exit.Validation, "wheel_tag_mismatch",
 			"filename tags %v disagree with WHEEL tags %v", filenameTags, wheelTags)
 	}
-	if class == ProjectWheel && (!pure || !equalStrings(wheelTags, []string{Tag})) {
+	if !pure || !equalStrings(wheelTags, []string{Tag}) {
 		return out, exit.Named(exit.Validation, "project_wheel_not_pure",
 			"project wheel must declare Root-Is-Purelib: true and exactly Tag: %s", Tag)
-	}
-	if class == CustomWheel && out.Native && (pure || equalStrings(wheelTags, []string{Tag})) {
-		return out, exit.Named(exit.Validation, "custom_wheel_native_mislabeled",
-			"native custom wheel declares purelib or %s", Tag).
-			WithRemedy("publish the original correctly tagged prebuilt wheel; Creator never retags or repairs it")
 	}
 	if e := verifyRecord(recordDoc, members, distInfo+"/RECORD"); e != nil {
 		return out, e
@@ -216,7 +192,7 @@ func Inspect(file string, class InspectClass) (Fact, *exit.Error) {
 		out.ImportRoots = append(out.ImportRoots, root)
 	}
 	sort.Strings(out.ImportRoots)
-	if class == ProjectWheel && len(out.ImportRoots) == 0 {
+	if len(out.ImportRoots) == 0 {
 		return out, exit.Named(exit.Validation, "project_wheel_import_root_absent",
 			"%s contains no importable Python module", filename).
 			WithRemedy("configure the project build backend so `uv build --wheel` includes the package")
@@ -243,11 +219,6 @@ func privateBuildMember(name string) bool {
 		base == ".npmrc" || base == ".pypirc" || strings.HasPrefix(base, "id_rsa") ||
 		strings.HasSuffix(base, ".pem") || strings.HasSuffix(base, ".key") ||
 		strings.HasSuffix(base, ".pyc") || strings.HasSuffix(base, ".pyo")
-}
-
-var nativeSourceExt = map[string]bool{
-	".c": true, ".h": true, ".cc": true, ".cpp": true, ".cxx": true, ".hpp": true,
-	".pyx": true, ".pxd": true, ".pxi": true, ".rs": true, ".f90": true, ".cu": true,
 }
 
 func parseWheelFilename(filename string) (string, string, []string, *exit.Error) {

@@ -1,7 +1,6 @@
 package cli
 
 import (
-	"encoding/json"
 	"fmt"
 	"os"
 	"os/signal"
@@ -246,7 +245,6 @@ func microUSD(n int64) string {
 // before this process existed. That is the whole reason `follow` reads the durable stream
 // rather than watching for a live frame.
 func followJob(ctx *Context, c *localapi.Client, jobID string, began time.Time) *exit.Error {
-	stream := ctx.Inv.Bool("--json")
 	interrupt := make(chan os.Signal, 1)
 	signal.Notify(interrupt, syscall.SIGINT, syscall.SIGTERM)
 	defer signal.Stop(interrupt)
@@ -268,7 +266,7 @@ func followJob(ctx *Context, c *localapi.Client, jobID string, began time.Time) 
 		}
 	}()
 
-	lines := newJobProgress(ctx, stream)
+	lines := newJobProgress(ctx)
 	terminal, e := c.Watch(jobID, 0, lines.on)
 	lines.done()
 	if e != nil {
@@ -323,27 +321,19 @@ func followJob(ctx *Context, c *localapi.Client, jobID string, began time.Time) 
 	return err
 }
 
-// jobProgress renders the stream. `--json` is NDJSON of the typed envelope for a machine;
-// the default is one rewritten line for a person, on stderr so a piped `job follow` is not
-// polluted by the progress of producing its answer.
+// jobProgress renders one rewritten human line on stderr. Jobs do not expose the serving
+// `--stream` lane; final JSON remains one document on stdout.
 type jobProgress struct {
-	ctx    *Context
-	stream bool
-	last   string
-	dirty  bool
+	ctx   *Context
+	last  string
+	dirty bool
 }
 
-func newJobProgress(ctx *Context, stream bool) *jobProgress {
-	return &jobProgress{ctx: ctx, stream: stream}
+func newJobProgress(ctx *Context) *jobProgress {
+	return &jobProgress{ctx: ctx}
 }
 
 func (p *jobProgress) on(e localapi.Event) bool {
-	if p.stream {
-		if data, err := json.Marshal(e); err == nil {
-			fmt.Fprintln(p.ctx.Err, string(data))
-		}
-		return true
-	}
 	line := progressLine(e)
 	if line == "" || line == p.last {
 		return true
