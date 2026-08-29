@@ -506,20 +506,28 @@ func (s *Store) ObserveRentalWorker(id, accelerator, backend, driverVersion,
 	if err != nil {
 		return exit.Internalf("cannot read rental %s for worker observation: %s", id, err)
 	}
-	if row.State != "converging" && row.State != "ready" ||
-		accelerator == "" || backend == "" || instance == "" ||
-		bootID == "" || count != 1 {
+	cpu := strings.EqualFold(row.AcceleratorModel, "CPU")
+	complete := row.State == "converging" || row.State == "ready"
+	if cpu {
+		complete = complete && accelerator == "" && backend == "none" && count == 0 &&
+			driverVersion == "" && backendVersion == "" && deviceMemory == 0 &&
+			instance != "" && bootID != ""
+	} else {
+		complete = complete && accelerator != "" && backend != "" && count == 1 &&
+			instance != "" && bootID != ""
+	}
+	if !complete {
 		return exit.Named(exit.Conflict, "rental.worker_readback_incomplete",
 			"rental %s ClaimAck is state=%q backend=%q accelerator=%q count=%d instance=%q boot=%q",
 			id, row.State, backend, accelerator, count, instance, bootID)
 	}
-	if !acceleratorMatches(row.AcceleratorModel, accelerator) {
+	if !cpu && !acceleratorMatches(row.AcceleratorModel, accelerator) {
 		return exit.Named(exit.Conflict, "rental.accelerator_readback_mismatch",
 			"rental %s worker reports %q but the paid request selected %q",
 			id, accelerator, row.AcceleratorModel).
 			WithRemedy("release it; never invoke a model on hardware that disagrees with the paid selection")
 	}
-	if row.ObservedAccelerator != "" && (row.ObservedAccelerator != accelerator ||
+	if row.ObservedAt != "" && (row.ObservedAccelerator != accelerator ||
 		row.ObservedAcceleratorCount != count || row.ObservedBackend != backend ||
 		row.ObservedDriverVersion != driverVersion || row.ObservedBackendVersion != backendVersion ||
 		row.ObservedDeviceMemoryTotalBytes != deviceMemory ||

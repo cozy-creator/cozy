@@ -61,9 +61,9 @@ func handleRent(ctx *Context) *exit.Error {
 	endpointRef := strings.TrimSpace(ctx.Inv.Args[0])
 	acceleratorModel := strings.TrimSpace(ctx.Inv.Value("--accelerator"))
 	if acceleratorModel == "" {
-		return exit.Usagef("`cozy rent` names the accelerator to provision").
-			WithRemedy("--accelerator is required; name a provider-neutral model such as NVIDIA H200").
-			WithNext("cozy rent " + endpointRef + " --accelerator 'NVIDIA H200' --reason <why>")
+		return exit.Usagef("`cozy rent` names the compute profile to provision").
+			WithRemedy("--accelerator is required; use CPU or a provider-neutral accelerator model such as NVIDIA H200").
+			WithNext("cozy rent " + endpointRef + " --accelerator CPU --reason <why>")
 	}
 	reason := strings.TrimSpace(ctx.Inv.Value("--reason"))
 	if reason == "" {
