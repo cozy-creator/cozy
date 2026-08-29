@@ -262,7 +262,7 @@ func (s *Server) guard(route Route, h http.HandlerFunc) http.Handler {
 			if s.shuttingDown {
 				s.refuse(w, r, http.StatusServiceUnavailable, "controller_shutting_down",
 					"the controller has accepted shutdown and no longer admits mutations",
-					"wait for the service lock to become free")
+					"wait for the controller to finish stopping")
 				return
 			}
 		}

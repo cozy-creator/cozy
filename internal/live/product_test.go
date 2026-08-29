@@ -4,7 +4,9 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"os"
 	"os/exec"
@@ -71,6 +73,15 @@ func TestControllerWebLifecycle(t *testing.T) {
 		t.Fatalf("concurrent up returned different controller generations: %v\n%s\n%s",
 			err, first.output, second.output)
 	}
+	firstChanged, firstOK := upDocument.Data["changed"].(bool)
+	secondChanged, secondOK := secondDocument.Data["changed"].(bool)
+	if !firstOK || !secondOK || firstChanged == secondChanged {
+		t.Fatalf("concurrent up did not report one winner: first changed=%v second changed=%v\n%s\n%s",
+			upDocument.Data["changed"], secondDocument.Data["changed"], first.output, second.output)
+	}
+	if strings.Contains(strings.ToLower(first.output+second.output), "lock") {
+		t.Fatalf("up exposed its internal singleton mechanism\n%s\n%s", first.output, second.output)
+	}
 	url, _ := upDocument.Data["url"].(string)
 	client := &http.Client{Timeout: 5 * time.Second}
 	response, err := client.Get(url)
@@ -87,8 +98,18 @@ func TestControllerWebLifecycle(t *testing.T) {
 	if _, err := os.Stat(filepath.Join(root, "controller.log")); !os.IsNotExist(err) {
 		t.Fatalf("up created a persistent controller log: %v", err)
 	}
-	if code, out := runCozy(t, root, "up"); code != 0 || !strings.Contains(out, "already running") {
-		t.Fatalf("up is not idempotent [exit %d]\n%s", code, out)
+	if code, out := runCozy(t, root, "up", "--json"); code != 0 {
+		t.Fatalf("repeated up failed [exit %d]\n%s", code, out)
+	} else {
+		var repeated struct {
+			Data map[string]any `json:"data"`
+		}
+		if err := json.Unmarshal([]byte(out), &repeated); err != nil ||
+			repeated.Data["changed"] != false || repeated.Data["url"] != url ||
+			repeated.Data["pid"] != upDocument.Data["pid"] {
+			t.Fatalf("repeated up did not return the same healthy controller with changed=false: %v\n%s",
+				err, out)
+		}
 	}
 	if code, out := runCozy(t, root, "down"); code != 0 || !strings.Contains(out, "controller: stopped") {
 		t.Fatalf("down [exit %d]\n%s", code, out)
@@ -107,6 +128,56 @@ func TestControllerWebLifecycle(t *testing.T) {
 		t.Fatalf("final down [exit %d]\n%s", code, out)
 	}
 }
+
+func TestControllerStartupDiagnostic(t *testing.T) {
+	root := filepath.Join(os.TempDir(), "cozy-live", "controller-startup-diagnostic")
+	must(t, os.RemoveAll(root))
+	must(t, os.MkdirAll(root, 0o755))
+	t.Cleanup(func() { _, _ = runCozy(t, root, "down", "--all") })
+
+	held, err := net.Listen("tcp4", "127.0.0.1:0") //cozy:allow live proof occupies one loopback port to exercise the real startup refusal
+	must(t, err)
+	port := held.Addr().(*net.TCPAddr).Port
+	must(t, os.WriteFile(filepath.Join(root, "config.yaml"),
+		[]byte(fmt.Sprintf("port: %d\n", port)), 0o600))
+
+	began := time.Now()
+	code, out := runCozy(t, root, "up", "--json")
+	if code != 1 {
+		t.Fatalf("failed controller startup exited %d, want operational 1\n%s", code, out)
+	}
+	if took := time.Since(began); took > 5*time.Second {
+		t.Fatalf("failed controller startup waited %s instead of relaying the exited child", took)
+	}
+	var document struct {
+		Error struct {
+			Code    string `json:"code"`
+			Message string `json:"message"`
+		} `json:"error"`
+	}
+	if err := json.Unmarshal([]byte(out), &document); err != nil ||
+		document.Error.Code != "controller_startup_failed" ||
+		!strings.Contains(document.Error.Message, fmt.Sprintf("127.0.0.1:%d", port)) ||
+		!strings.Contains(document.Error.Message, "held by another process") {
+		t.Fatalf("startup failure did not relay its child diagnostic: %v\n%s", err, out)
+	}
+	if strings.Contains(strings.ToLower(out), "lock") {
+		t.Fatalf("startup failure exposed its internal singleton mechanism\n%s", out)
+	}
+	if len(out) > maxControllerDiagnosticOutput {
+		t.Fatalf("startup diagnostic is unbounded: %d bytes", len(out))
+	}
+	if _, err := os.Stat(filepath.Join(root, "controller.log")); !os.IsNotExist(err) {
+		t.Fatalf("failed startup created a persistent controller log: %v", err)
+	}
+
+	must(t, held.Close())
+	if code, out := runCozy(t, root, "up", "--json"); code != 0 {
+		t.Fatalf("root did not recover after the failed child [exit %d]\n%s", code, out)
+	}
+}
+
+const maxControllerDiagnosticOutput = 18 << 10
 
 // TestProductPath drives only the public Kong surface: install a real weightless
 // release, auto-start the controller on invoke, cross Runtime and the worker wire,

@@ -70,7 +70,7 @@ func (r *Runtime) call(h handler, args []string, flags map[string]bool,
 		Out: r.Out, Err: r.Err, Cfg: r.Cfg, Next: next,
 	}
 	if controller {
-		state, problem := ensureController(ctx)
+		state, _, problem := ensureController(ctx)
 		if problem != nil {
 			return problem
 		}
