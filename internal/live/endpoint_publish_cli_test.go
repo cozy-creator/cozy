@@ -54,7 +54,7 @@ func TestEndpointPublishQualifyPromoteCLI(t *testing.T) {
 				ref := roles[role]
 				held := role == "descriptor"
 				row := map[string]any{"role": role, "ref": ref, "already_held": held,
-					"required_headers": map[string]string{}, "expires_at": "2026-08-29T00:00:00Z"}
+					"required_headers": map[string]string{}, "expires_at": "2099-08-29T00:00:00Z"}
 				if !held {
 					row["url"] = server.URL + "/put/" + role
 					row["required_headers"] = map[string]string{"X-Test-Role": role}
@@ -95,8 +95,16 @@ func TestEndpointPublishQualifyPromoteCLI(t *testing.T) {
 			_ = json.NewEncoder(w).Encode(map[string]any{"created": finalizeCount == 1,
 				"release": "1.0.0", "declaration_digest": fixtureDigest(declaration),
 				"profiles": []map[string]any{
-					{"profile": endpointprofile.CU126, "state": "candidate", "candidate_id": "candidate-126"},
-					{"profile": endpointprofile.CU130, "state": "candidate", "candidate_id": "candidate-130"}},
+					{"profile": endpointprofile.CU126, "state": "candidate", "candidate_id": "candidate-126",
+						"base_realization_kind": "oci", "base_realization_digest": "sha256:" + strings.Repeat("a", 64),
+						"endpoint_environment_spec": map[string]any{"digest": "sha256:" + strings.Repeat("b", 64), "length": 1},
+						"resolved_wheel_set":        map[string]any{"digest": "sha256:" + strings.Repeat("c", 64), "length": 1},
+						"resolution_lock":           map[string]any{"digest": "sha256:" + strings.Repeat("d", 64), "length": 1}},
+					{"profile": endpointprofile.CU130, "state": "candidate", "candidate_id": "candidate-130",
+						"base_realization_kind": "oci", "base_realization_digest": "sha256:" + strings.Repeat("e", 64),
+						"endpoint_environment_spec": map[string]any{"digest": "sha256:" + strings.Repeat("f", 64), "length": 1},
+						"resolved_wheel_set":        map[string]any{"digest": "sha256:" + strings.Repeat("1", 64), "length": 1},
+						"resolution_lock":           map[string]any{"digest": "sha256:" + strings.Repeat("2", 64), "length": 1}}},
 				"endpoint_executions": []map[string]string{{"profile": endpointprofile.CU126, "function": "marco", "digest": "sha256:" + strings.Repeat("1", 64), "state": "candidate"}}})
 		case r.Method == http.MethodPost && strings.HasSuffix(r.URL.Path, "/qualify"):
 			var body map[string]any

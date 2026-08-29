@@ -116,6 +116,7 @@ CREATE TABLE IF NOT EXISTS managed_profile_installs (
   installed_receipt_digest     TEXT NOT NULL,
   installed_receipt_length     INTEGER NOT NULL,
   host_evidence_digest         TEXT NOT NULL,
+  native_evidence_digest       TEXT NOT NULL DEFAULT '',
   lease_id                     TEXT NOT NULL,
   lease_expires_at             TEXT NOT NULL,
   recorded_at                  TEXT NOT NULL
@@ -258,6 +259,7 @@ type ManagedProfileInstall struct {
 	InstalledReceiptDigest   string
 	InstalledReceiptLength   int64
 	HostEvidenceDigest       string
+	NativeEvidenceDigest     string
 	LeaseID                  string
 	LeaseExpiresAt           string
 	RecordedAt               string
@@ -318,13 +320,14 @@ func (s *Store) activate(g EndpointInstall, managed *ManagedProfileInstall) (sup
 			base_worker_image_digest,wheelhouse_manifest_digest,environment_spec_digest,
 			endpoint_bundle_digest,resolved_wheel_set_digest,resolution_lock_digest,
 			installed_receipt_digest,installed_receipt_length,host_evidence_digest,
-			lease_id,lease_expires_at,recorded_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+			native_evidence_digest,lease_id,lease_expires_at,recorded_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
 			managed.InstallID, managed.ReleaseID, managed.Profile, managed.CandidateID,
 			managed.BaseRealizationDigest, managed.BaseWorkerImageDigest,
 			managed.WheelhouseManifestDigest, managed.EnvironmentSpecDigest,
 			managed.EndpointBundleDigest, managed.ResolvedWheelSetDigest,
 			managed.ResolutionLockDigest, managed.InstalledReceiptDigest,
 			managed.InstalledReceiptLength, managed.HostEvidenceDigest,
+			managed.NativeEvidenceDigest,
 			managed.LeaseID, managed.LeaseExpiresAt, managed.RecordedAt); err != nil {
 			return "", exit.Internalf("cannot insert managed profile facts for %s: %s", g.ID, err)
 		}
@@ -349,13 +352,13 @@ func (s *Store) ManagedInstall(installID string) (*ManagedProfileInstall, *exit.
 		base_realization_digest,base_worker_image_digest,wheelhouse_manifest_digest,
 		environment_spec_digest,endpoint_bundle_digest,resolved_wheel_set_digest,
 		resolution_lock_digest,installed_receipt_digest,installed_receipt_length,
-		host_evidence_digest,lease_id,lease_expires_at,recorded_at
+		host_evidence_digest,native_evidence_digest,lease_id,lease_expires_at,recorded_at
 		FROM managed_profile_installs WHERE install_id=?`, installID).Scan(
 		&out.InstallID, &out.ReleaseID, &out.Profile, &out.CandidateID,
 		&out.BaseRealizationDigest, &out.BaseWorkerImageDigest, &out.WheelhouseManifestDigest,
 		&out.EnvironmentSpecDigest, &out.EndpointBundleDigest, &out.ResolvedWheelSetDigest,
 		&out.ResolutionLockDigest, &out.InstalledReceiptDigest, &out.InstalledReceiptLength,
-		&out.HostEvidenceDigest, &out.LeaseID, &out.LeaseExpiresAt, &out.RecordedAt)
+		&out.HostEvidenceDigest, &out.NativeEvidenceDigest, &out.LeaseID, &out.LeaseExpiresAt, &out.RecordedAt)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, nil
 	}

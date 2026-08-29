@@ -29,12 +29,13 @@ type EndpointProfileState struct {
 	Profile                 string    `json:"profile"`
 	State                   string    `json:"state"`
 	CandidateID             string    `json:"candidate_id,omitempty"`
-	BaseWorkerImageDigest   string    `json:"base_worker_image_digest,omitempty"`
 	BaseRealizationKind     string    `json:"base_realization_kind,omitempty"`
 	BaseRealizationDigest   string    `json:"base_realization_digest,omitempty"`
 	EndpointEnvironmentSpec ObjectRef `json:"endpoint_environment_spec,omitempty"`
 	ResolvedWheelSet        ObjectRef `json:"resolved_wheel_set,omitempty"`
 	ResolutionLock          ObjectRef `json:"resolution_lock,omitempty"`
+	RefusalCode             string    `json:"refusal_code,omitempty"`
+	RefusalDetail           string    `json:"refusal_detail,omitempty"`
 }
 
 type EndpointReleaseBegin struct {

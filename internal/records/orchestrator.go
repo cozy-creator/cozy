@@ -255,6 +255,7 @@ var rebuild = []tableRebuild{{
 var widen = []string{
 	`ALTER TABLE install_generations ADD COLUMN runtime TEXT NOT NULL DEFAULT ''`,
 	`ALTER TABLE install_generations ADD COLUMN project_dir TEXT NOT NULL DEFAULT ''`,
+	`ALTER TABLE managed_profile_installs ADD COLUMN native_evidence_digest TEXT NOT NULL DEFAULT ''`,
 	`ALTER TABLE requests ADD COLUMN kind TEXT NOT NULL DEFAULT 'serving'`,
 	`ALTER TABLE requests ADD COLUMN worker TEXT NOT NULL DEFAULT ''`,
 	`ALTER TABLE requests ADD COLUMN org TEXT NOT NULL DEFAULT ''`,

@@ -185,6 +185,9 @@ func handleManagedInstall(ctx *Context, profile string) *exit.Error {
 		"installed from a hardware-qualified managed-local candidate; no dependency resolution, Torch/CUDA install, or native build ran",
 		"control install, portable Runtime receipt, local-base fingerprint, host evidence, and lease are separate recorded facts",
 	}, Next: []string{"cozy start " + g.Endpoint + "@v" + strconv.Itoa(g.Major), "cozy run <org/endpoint/vN/function>"}}
+	if facts.NativeEvidenceDigest != "" {
+		rec.Fields = append(rec.Fields, render.Field{K: "native_evidence", V: facts.NativeEvidenceDigest})
+	}
 	if installed.Idempotent {
 		rec.Fields = append(rec.Fields, render.Field{K: "result", V: "already pinned — nothing changed"})
 	}

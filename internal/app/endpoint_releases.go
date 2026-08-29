@@ -65,8 +65,8 @@ func handleEndpointPublish(ctx *Context) *exit.Error {
 	if problem != nil {
 		return problem
 	}
-	if done.Release != release || done.DeclarationDigest != pack.Declaration.Digest() {
-		return exit.Internalf("endpoint finalize returned another release or declaration digest")
+	if problem := validateFinalize(pack, release, done); problem != nil {
+		return problem
 	}
 	profileRows := make([]string, 0, len(done.Profiles))
 	for _, profile := range done.Profiles {
@@ -95,6 +95,11 @@ func validateBegin(pack *endpointpublish.Package, begun hub.EndpointReleaseBegin
 	wantProfiles := pack.Declaration.Profiles
 	gotProfiles := make([]string, 0, len(begun.Profiles))
 	for _, row := range begun.Profiles {
+		if row.State != "candidate_pending" || row.CandidateID != "" ||
+			row.BaseRealizationKind != "" || row.BaseRealizationDigest != "" ||
+			row.RefusalCode != "" || row.RefusalDetail != "" {
+			return exit.Internalf("endpoint begin returned a non-pending profile row for %q", row.Profile)
+		}
 		gotProfiles = append(gotProfiles, row.Profile)
 	}
 	sort.Strings(gotProfiles)
@@ -115,11 +120,88 @@ func validateBegin(pack *endpointpublish.Package, begun hub.EndpointReleaseBegin
 		if !upload.AlreadyHeld && upload.URL == "" {
 			return exit.Internalf("endpoint begin returned no URL for missing role %s", upload.Role)
 		}
+		if !upload.AlreadyHeld {
+			expires, err := time.Parse(time.RFC3339, upload.ExpiresAt)
+			if err != nil || !expires.After(time.Now()) {
+				return exit.Internalf("endpoint begin returned an absent, malformed, or expired upload grant for %s", upload.Role)
+			}
+		}
 	}
 	if len(seen) != len(want) {
 		return exit.Internalf("endpoint begin returned %d of %d declared upload roles", len(seen), len(want))
 	}
 	return nil
+}
+
+func validateFinalize(pack *endpointpublish.Package, release string,
+	done hub.EndpointReleaseFinalize,
+) *exit.Error {
+	if done.Release != release || done.DeclarationDigest != pack.Declaration.Digest() {
+		return exit.Internalf("endpoint finalize returned another release or declaration digest")
+	}
+	declared := map[string]bool{}
+	for _, profile := range pack.Declaration.Profiles {
+		declared[profile] = true
+	}
+	seenProfiles := map[string]bool{}
+	seenRealizations := map[string]bool{}
+	candidateProfiles := map[string]bool{}
+	for _, row := range done.Profiles {
+		if !declared[row.Profile] {
+			return exit.Internalf("endpoint finalize returned unknown profile %q", row.Profile)
+		}
+		seenProfiles[row.Profile] = true
+		key := row.Profile + "\x00" + row.BaseRealizationKind
+		if seenRealizations[key] || (row.BaseRealizationKind != "oci" && row.BaseRealizationKind != "managed-local") ||
+			row.CandidateID == "" || !sha256Digest(row.BaseRealizationDigest) ||
+			!objectRef(row.EndpointEnvironmentSpec) || !objectRef(row.ResolvedWheelSet) ||
+			!objectRef(row.ResolutionLock) {
+			return exit.Internalf("endpoint finalize returned malformed or duplicate realization %q/%q",
+				row.Profile, row.BaseRealizationKind)
+		}
+		seenRealizations[key] = true
+		if row.State != "candidate" && row.State != "refused" {
+			return exit.Internalf("endpoint finalize returned non-candidate profile state %q", row.State)
+		}
+		if row.State == "refused" && row.RefusalCode == "" {
+			return exit.Internalf("endpoint finalize returned a refusal without a typed code")
+		}
+		if row.State == "candidate" {
+			if row.RefusalCode != "" || row.RefusalDetail != "" {
+				return exit.Internalf("endpoint finalize returned refusal detail on a passing candidate")
+			}
+			candidateProfiles[row.Profile] = true
+		}
+	}
+	if len(seenProfiles) != len(declared) {
+		return exit.Internalf("endpoint finalize returned %d of %d declared profiles", len(seenProfiles), len(declared))
+	}
+	seenExecutions := map[string]bool{}
+	for _, execution := range done.EndpointExecutions {
+		key := execution.Profile + "\x00" + execution.Function
+		if !candidateProfiles[execution.Profile] || strings.TrimSpace(execution.Function) == "" ||
+			seenExecutions[key] || !sha256Digest(execution.Digest) ||
+			(execution.State != "candidate" && execution.State != "refused") {
+			return exit.Internalf("endpoint finalize returned malformed or duplicate execution %q/%q",
+				execution.Profile, execution.Function)
+		}
+		seenExecutions[key] = true
+	}
+	return nil
+}
+
+func objectRef(ref hub.ObjectRef) bool { return sha256Digest(ref.Digest) && ref.Length > 0 }
+
+func sha256Digest(value string) bool {
+	if len(value) != 71 || !strings.HasPrefix(value, "sha256:") {
+		return false
+	}
+	for _, r := range strings.TrimPrefix(value, "sha256:") {
+		if !strings.ContainsRune("0123456789abcdef", r) {
+			return false
+		}
+	}
+	return true
 }
 
 type localRole struct {
@@ -251,7 +333,22 @@ func handleEndpointQualify(ctx *Context) *exit.Error {
 	if problem != nil {
 		return problem
 	}
-	return emit(ctx, qualificationRecord(c.Base(), ref, release, profiles[0], qualified))
+	if problem := emit(ctx, qualificationRecord(c.Base(), ref, release, profiles[0], qualified)); problem != nil {
+		return problem
+	}
+	if qualified.State != "qualified" {
+		code := exit.Failed
+		if qualified.State == "canceled" {
+			code = exit.Canceled
+		}
+		return exit.Named(code, "endpoint.qualification_"+qualified.State,
+			"qualification %s ended %s; cost %s; reclaimed=%t; evidence spec=%s observation=%s admission=%s",
+			qualified.QualificationID, qualified.State, microUSD(qualified.ObservedCostUSDMicros),
+			qualified.ReclaimProven, qualified.ModelQualificationSpecDigest,
+			qualified.ExecutionObservationDigest, qualified.ModelAdmissionDecisionDigest).
+			WithRemedy("repair the release/profile evidence and submit a new explicit qualification")
+	}
+	return nil
 }
 
 func waitQualification(ctx *Context, hctx context.Context, c *hub.Client, ref hub.Ref,
@@ -298,13 +395,6 @@ func waitQualification(ctx *Context, hctx context.Context, c *hub.Client, ref hu
 			return current, exit.Internalf("qualification read changed operation or candidate identity")
 		}
 		current = next
-	}
-	if current.State != "qualified" {
-		return current, exit.Named(exit.Failed, "endpoint.qualification_"+current.State,
-			"qualification %s ended %s after %s; cost %s; reclaimed=%t",
-			current.QualificationID, current.State, current.AcceleratorModel,
-			microUSD(current.ObservedCostUSDMicros), current.ReclaimProven).
-			WithRemedy("inspect the banked admission/observation digests, repair the release/profile, and submit a new explicit qualification")
 	}
 	return current, nil
 }
