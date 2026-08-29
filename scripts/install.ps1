@@ -51,7 +51,7 @@ $target = Join-Path $bin "cozy.exe"
 
 $was = "none"
 if (Test-Path $target) {
-    $was = (& $target version --fields tag 2>$null | Select-String '^tag:') -replace '^tag:\s*', ''
+    $was = (& $target -v 2>$null).Trim()
     if (-not $was) { $was = "unreadable" }
 }
 
@@ -80,7 +80,7 @@ finally {
     Remove-Item -Recurse -Force $stage -ErrorAction SilentlyContinue
 }
 
-$now = (& $target version --fields tag 2>$null | Select-String '^tag:') -replace '^tag:\s*', ''
+$now = (& $target -v 2>$null).Trim()
 Write-Output "verified: sha256:$got"
 Write-Output "prefix:   $Prefix"
 Write-Output "was:      $was"

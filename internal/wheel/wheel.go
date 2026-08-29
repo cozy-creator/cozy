@@ -10,7 +10,7 @@
 //
 //	tensorhub env-lane build, §1 stage 2e  ─┐
 //	                                        ├─▶ wheel.Pack ─▶ project_wheel_digest
-//	`cozy pack` / local install            ─┘
+//	`cozy endpoint publish` / local install ─┘
 //
 // Inputs: the canonical tree's path (a directory of regular files), plus the
 // distribution identity — from `[project]` when the tree declares it, otherwise from the

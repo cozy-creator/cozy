@@ -52,7 +52,7 @@ func ParseAssets(ep *Entrypoint, payload json.RawMessage, specs []string) (json.
 		if !assetAt(ep.Request, parts) {
 			return nil, nil, exit.New(exit.Validation,
 				"%s.%s is not an asset field in this release's request schema", ep.Name, fieldPath).
-				WithRemedy("`cozy describe <org/endpoint>/%s` prints the recorded request schema", ep.Name)
+				WithRemedy("the installed endpoint.descriptor.json declares %s's request schema", ep.Name)
 		}
 		assetSpec, _ := AssetSpec(ep, fieldPath)
 		maxBytes := assetSpec.MaxBytes

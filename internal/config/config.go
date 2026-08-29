@@ -1,376 +1,336 @@
-// Package config is THE ONE environment reader in this binary (cl-001). The process
-// entrypoint calls Load exactly once; every later read is of a FROZEN typed value, so a
-// mutation after startup is structurally invisible and no package can disagree with
-// another about what the environment said.
+// Package config owns Cozy Creator's one process-configuration read.
 //
-// The env-read fence (scripts/fence.py, family `env`) is what keeps that true: os.Getenv,
-// os.LookupEnv, os.Environ and syscall.Getenv appear in this file and nowhere else.
-//
-// It is also the child-environment allowlist. cozy-creator starts endpoint processes; a
-// child inherits exactly what Child() names and nothing else (cozy-creator.md: "child env
-// allowlisted before the runtime starts"), which is why os.Environ() has no second caller.
-//
-// LAYERED SOURCES (cl-029). A local product's configuration lives in a FILE, not a shell
-// profile. Load composes, in precedence order (later wins):
-//
-//	defaults -> $COZY_HOME/config.yaml -> .env (cwd) -> process env -> CLI flags
-//
-// The file admits a CLOSED key set of flat `key: value` scalars — an unknown key refuses
-// naming the known set, exactly as an unknown document field does. The .env and process
-// layers admit only the same env names this reader has always had; the CLI layer is the
-// manifest's own flags, applied by their verbs after Load. Every value keeps its source
-// (`default | file | dotenv | env`) so an operator debugging a 401 knows which layer
-// spoke last.
+// Load resolves one private Kong grammar with no argv. Sources are, in order:
+// defaults, $COZY_HOME/config.yaml, and process environment. The result is frozen for the process lifetime.
+// Secrets therefore use Kong's resolver pipeline without becoming command-line
+// flags.
 package config
 
 import (
+	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"sort"
-	"strconv"
 	"strings"
+	"sync"
 
+	"github.com/alecthomas/kong"
 	"github.com/cozy-creator/cozy-creator/internal/exit"
 	"github.com/cozy-creator/cozy-creator/internal/secret"
+	"go.yaml.in/yaml/v3"
 )
 
-// Inherited is the CLOSED set of variables a child process may see from this process's
-// own environment. Everything else a child needs is IMPOSED by its launcher as an
-// explicit value (COZY_HOME, the device grant, the socket) — never inherited.
-// Class-A base inherit list — tracker-v2/spawn-allowlists.md (#616.d) is the authority;
-// keep equal to that row (Tool() adds NO_COLOR=1 per the same row).
+// Inherited is the complete set of environment variables an endpoint process
+// may inherit. Launchers impose every other value explicitly.
 var Inherited = []string{"PATH", "HOME", "LANG", "LC_ALL", "TMPDIR", "SSL_CERT_FILE", "SSL_CERT_DIR"}
 
-// DefaultHubURL is where the catalog verbs look when nothing says otherwise. There is
-// no deployed tensorhub yet (Launch 1 is being built), so the default names a hub on
-// this host rather than inventing a production hostname a user cannot reach. `cozy hub
-// status` always prints the URL AND where it came from, so the default is never silent.
-const DefaultHubURL = "http://127.0.0.1:8080"
+const (
+	DefaultHubURL = "http://127.0.0.1:8080"
+	DefaultPort   = 0
+	FileName      = "config.yaml"
+)
 
-// DefaultPort is the loopback bind `cozy up` uses (cozy-creator.md: 2699, loopback
-// only). It lives here — with the config authority that applies it — after cl-028
-// found its previous spelling was a constant nobody read beside three literal 2699s.
-const DefaultPort = 2699
-
-// Config is the frozen typed value. Every field is decided once, at Load.
+// Config is the frozen value consumed by the rest of the process.
 type Config struct {
-	Home string // the local root: $COZY_HOME, or ~/.cozy
-	// Port is the local client API bind port (loopback only). cl-006 serves routes on it;
-	// cl-001 binds it so `cozy status` can tell up from down without a sidecar file.
-	Port int
-	// Yield is the GPU yield policy: smart | always | never (cozy-creator.md).
+	Home  string
+	Port  int
 	Yield string
 
-	// HubURL is the catalog host the cl-011 verbs read and write (TENSORHUB_URL).
-	HubURL string
-	// HubToken is the ONE static admin token Launch-1 tensorhub admits writes with
-	// (TENSORHUB_TOKEN). Reads need no credential. There is no login act and no
-	// identity plane until th-031 — the env carries a VALUE, never a decision.
-	HubToken secret.Value
-	// Source of each, for rendering: "default" or "env". An operator debugging a 401
-	// needs to know which file lied to them, and a value with no provenance is a guess.
+	HubURL         string
+	HubToken       secret.Value
 	HubURLSource   string
 	HubTokenSource string
 
-	// Tfs is the tensorfs CLI this binary asks every byte-plane question of (COZY_TFS).
-	// cozy-creator owns no byte plane (boundaries.md); it coordinates one.
 	Tfs       string
 	TfsSource string
 
-	// LocalRateMicroUSDPerHour is the rate a user CONFIGURED for their own machine
-	// (COZY_LOCAL_RATE_MICRO_USD_PER_HOUR), as an integer of micro-USD because a cost
-	// fact that cannot be canonicalized cannot be journaled (cr-009's Budget rule).
-	//
-	// ZERO MEANS ABSENT, and absent means the bill is not rendered at all. A local job
-	// costs electricity nobody metered, so `$0.00` would be a fabricated fact — the one
-	// thing cl-004 says a rateless job must never print.
 	LocalRateMicroUSDPerHour int64
 	LocalRateSource          string
 
-	// Bootstrap is the per-spawn worker bootstrap credential a LAUNCHER imposed on this
-	// process (COZY_BOOTSTRAP_CREDENTIAL, #449) — present only in a spawned worker,
-	// never inherited onward.
+	// Bootstrap is launcher-only. It is admitted from the process environment,
+	// never config.yaml, argv, or a child inheritance list.
 	Bootstrap secret.Value
 
-	inherited []string // the allowlisted snapshot, captured at Load
+	inherited []string
 }
 
-var frozen Config
+// values is a config-only Kong grammar. It is never embedded in the public CLI
+// grammar and its parser always receives nil argv.
+type values struct {
+	HubURL                   string `name:"tensorhub_url" default:"http://127.0.0.1:8080"`
+	HubToken                 string `name:"tensorhub_token"`
+	Tfs                      string `name:"tfs" default:"tfs"`
+	LocalRateMicroUSDPerHour int64  `name:"local_rate_micro_usd_per_hour" default:"0"`
+	Port                     int    `name:"port" default:"0"`
+	Yield                    string `name:"yield" default:"smart" enum:"smart,always,never"`
+	Bootstrap                string `name:"bootstrap"`
+}
 
-// FileName is the local product's configuration file, under $COZY_HOME.
-const FileName = "config.yaml"
+func (v *values) Validate() error {
+	if strings.TrimSpace(v.HubURL) == "" {
+		return fmt.Errorf("tensorhub_url must not be empty")
+	}
+	if strings.TrimSpace(v.Tfs) == "" {
+		return fmt.Errorf("tfs must not be empty")
+	}
+	if v.LocalRateMicroUSDPerHour < 0 {
+		return fmt.Errorf("local_rate_micro_usd_per_hour must be non-negative")
+	}
+	if v.Port < 0 || v.Port > 65535 {
+		return fmt.Errorf("port %d is not a TCP port or zero for automatic selection", v.Port)
+	}
+	return nil
+}
 
-// fileKeys is the CLOSED key set config.yaml admits, each with the shape a refusal
-// renders. `local_rate_micro_usd_per_hour` lives here FIRST-CLASS (cl-029): it is a user
-// VALUE, not a credential, and a file is its primary home. The env spelling stays
-// admitted above it — an implementer's recorded call, because the harness and existing
-// dev roots already speak it — and `cozy job status` renders whichever source won.
-var fileKeys = map[string]string{
-	"tensorhub_url":                 "the catalog host the hub verbs talk to",
-	"tensorhub_token":               "the Launch-1 static admin token (writes only)",
-	"tfs":                           "the tensorfs CLI this binary delegates the byte plane to",
-	"local_rate_micro_usd_per_hour": "your machine's own rate, integer micro-USD (250000 = $0.25/hour)",
-	"port":                          "the loopback client API port",
-	"yield":                         "the GPU yield policy: smart | always | never",
+var fileKeys = map[string]bool{
+	"tensorhub_url":                 true,
+	"tensorhub_token":               true,
+	"tfs":                           true,
+	"local_rate_micro_usd_per_hour": true,
+	"port":                          true,
+	"yield":                         true,
+}
+
+var environmentNames = map[string]string{
+	"tensorhub_url":   "TENSORHUB_URL",
+	"tensorhub_token": "TENSORHUB_TOKEN",
+	"tfs":             "COZY_TFS",
+	"bootstrap":       "COZY_BOOTSTRAP_CREDENTIAL",
+}
+
+var processConfig struct {
+	once sync.Once
+	cfg  Config
+	err  *exit.Error
+}
+
+// Load resolves and freezes configuration. The first call owns the process
+// snapshot; later calls return it.
+func Load() (Config, *exit.Error) {
+	processConfig.once.Do(func() {
+		processConfig.cfg, processConfig.err = load()
+	})
+	return processConfig.cfg, processConfig.err
+}
+
+func load() (Config, *exit.Error) {
+	home, problem := resolveHome()
+	if problem != nil {
+		return Config{}, problem
+	}
+
+	file, problem := readConfigFile(filepath.Join(home, FileName))
+	if problem != nil {
+		return Config{}, problem
+	}
+	environment, inherited := readEnvironment()
+
+	input, err := resolve(file, environment)
+	if err != nil {
+		return Config{}, exit.Usagef("configuration is invalid: %s", err).
+			WithRemedy("check %s and the admitted COZY_/TENSORHUB_ environment values", filepath.Join(home, FileName))
+	}
+
+	hubToken := secret.New(input.HubToken)
+	c := Config{
+		Home:                     home,
+		Port:                     input.Port,
+		Yield:                    input.Yield,
+		HubURL:                   strings.TrimRight(strings.TrimSpace(input.HubURL), "/"),
+		HubToken:                 hubToken,
+		HubURLSource:             sourceOf("tensorhub_url", file, environment, "default"),
+		HubTokenSource:           sourceOf("tensorhub_token", file, environment, "unset"),
+		Tfs:                      strings.TrimSpace(input.Tfs),
+		TfsSource:                sourceOf("tfs", file, environment, "default"),
+		LocalRateMicroUSDPerHour: input.LocalRateMicroUSDPerHour,
+		LocalRateSource:          sourceOf("local_rate_micro_usd_per_hour", file, environment, "unset"),
+		Bootstrap:                secret.New(input.Bootstrap),
+		inherited:                inherited,
+	}
+	if !hubToken.Present() {
+		c.HubTokenSource = "unset"
+	}
+	return c, nil
+}
+
+func resolve(file, environment *resolver) (values, error) {
+	var input values
+	parser, err := kong.New(&input,
+		kong.Name("cozy-config"),
+		kong.NoDefaultHelp(),
+		kong.Resolvers(file, environment),
+	)
+	if err != nil {
+		return values{}, fmt.Errorf("cannot construct the configuration grammar: %w", err)
+	}
+	if _, err := parser.Parse(nil); err != nil {
+		return values{}, err
+	}
+	return input, nil
+}
+
+func resolveHome() (string, *exit.Error) {
+	if value := strings.TrimSpace(os.Getenv("COZY_HOME")); value != "" {
+		home, err := filepath.Abs(value)
+		if err != nil {
+			return "", exit.Internalf("COZY_HOME %q is not resolvable: %s", value, err)
+		}
+		return home, nil
+	}
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return "", exit.Internalf("no home directory and COZY_HOME is unset: %s", err)
+	}
+	return filepath.Join(home, ".cozy"), nil
+}
+
+// readEnvironment captures the complete admitted environment once. Only
+// credentials and external locations are resolvable configuration values;
+// runtime behavior stays in config.yaml.
+func readEnvironment() (*resolver, []string) {
+	values := map[string]any{}
+	for field, name := range environmentNames {
+		if value := strings.TrimSpace(os.Getenv(name)); value != "" {
+			values[field] = value
+		}
+	}
+
+	inherited := make([]string, 0, len(Inherited))
+	for _, name := range Inherited {
+		if value, ok := os.LookupEnv(name); ok {
+			inherited = append(inherited, name+"="+value)
+		}
+	}
+	sort.Strings(inherited)
+	return &resolver{values: values}, inherited
+}
+
+type resolver struct{ values map[string]any }
+
+func (r *resolver) Resolve(_ *kong.Context, _ *kong.Path, flag *kong.Flag) (any, error) {
+	return r.values[flag.Name], nil
+}
+
+func (r *resolver) Validate(*kong.Application) error { return nil }
+
+func (r *resolver) has(name string) bool {
+	_, ok := r.values[name]
+	return ok
+}
+
+func sourceOf(name string, file, environment *resolver, fallback string) string {
+	switch {
+	case environment.has(name):
+		return "env"
+	case file.has(name):
+		return "file"
+	default:
+		return fallback
+	}
 }
 
 func knownFileKeys() string {
 	keys := make([]string, 0, len(fileKeys))
-	for k := range fileKeys {
-		keys = append(keys, k)
+	for key := range fileKeys {
+		keys = append(keys, key)
 	}
 	sort.Strings(keys)
 	return strings.Join(keys, ", ")
 }
 
-// dotenvNames is what the `.env` layer admits: exactly the env names this reader speaks,
-// minus the per-spawn bootstrap credential — that one is IMPOSED by a launcher on the
-// child it just created and has no business in a file another process could share.
-// Unknown keys in .env are IGNORED, not refused: the file is a directory-level
-// convention other tools share, and this reader takes only its own names from it.
-var dotenvNames = []string{
-	"COZY_HOME", "COZY_TFS", "COZY_LOCAL_RATE_MICRO_USD_PER_HOUR",
-	"TENSORHUB_URL", "TENSORHUB_TOKEN",
-}
-
-// Load composes the layered sources ONCE and freezes them. Calling it twice returns the
-// same value: a second read cannot see a different world than the first.
-func Load() (Config, *exit.Error) {
-	if frozen.Home != "" {
-		return frozen, nil
-	}
-	c := Config{Port: DefaultPort, Yield: "smart",
-		HubURL: DefaultHubURL, HubURLSource: "default", HubTokenSource: "unset",
-		Tfs: "tfs", TfsSource: "default"}
-	c.LocalRateSource = "unset"
-
-	dotenv, e := readDotEnv(".env")
-	if e != nil {
-		return Config{}, e
-	}
-	// layered answers one name: process env beats .env; "" means neither layer spoke.
-	layered := func(name string) (string, string) {
-		if v := strings.TrimSpace(os.Getenv(name)); v != "" {
-			return v, "env"
-		}
-		if v := strings.TrimSpace(dotenv[name]); v != "" {
-			return v, "dotenv"
-		}
-		return "", ""
-	}
-
-	// HOME FIRST, because the file layer lives under it. It has no config.yaml spelling
-	// for the same reason.
-	if v, _ := layered("COZY_HOME"); v != "" {
-		abs, err := filepath.Abs(v)
-		if err != nil {
-			return Config{}, exit.Internalf("COZY_HOME %q is not resolvable: %s", v, err)
-		}
-		c.Home = abs
-	} else {
-		h, err := os.UserHomeDir()
-		if err != nil {
-			return Config{}, exit.Internalf("no home directory and COZY_HOME is unset: %s", err)
-		}
-		c.Home = filepath.Join(h, ".cozy")
-	}
-
-	// THE FILE LAYER: above defaults, below everything that can vary per invocation.
-	file, e := readConfigFile(filepath.Join(c.Home, FileName))
-	if e != nil {
-		return Config{}, e
-	}
-	if v := file["tensorhub_url"]; v != "" {
-		c.HubURL, c.HubURLSource = strings.TrimRight(v, "/"), "file"
-	}
-	if v := file["tensorhub_token"]; v != "" {
-		c.HubToken, c.HubTokenSource = secret.New(v), "file"
-	}
-	if v := file["tfs"]; v != "" {
-		c.Tfs, c.TfsSource = v, "file"
-	}
-	if v := file["local_rate_micro_usd_per_hour"]; v != "" {
-		n, e := parseRate(v, FileName+" local_rate_micro_usd_per_hour")
-		if e != nil {
-			return Config{}, e
-		}
-		c.LocalRateMicroUSDPerHour, c.LocalRateSource = n, "file"
-	}
-	if v := file["port"]; v != "" {
-		n, err := strconv.Atoi(v)
-		if err != nil || n <= 0 || n > 65535 {
-			return Config{}, exit.Usagef("%s port %q is not a TCP port", FileName, v)
-		}
-		c.Port = n
-	}
-	if v := file["yield"]; v != "" {
-		switch v {
-		case "smart", "always", "never":
-			c.Yield = v
-		default:
-			return Config{}, exit.Usagef("%s yield %q is not smart|always|never", FileName, v)
-		}
-	}
-
-	// THE ENV LAYERS, over the file: .env in this directory, then the process env.
-	if v, src := layered("COZY_TFS"); v != "" {
-		c.Tfs, c.TfsSource = v, src
-	}
-	if v, src := layered("COZY_LOCAL_RATE_MICRO_USD_PER_HOUR"); v != "" {
-		n, e := parseRate(v, "COZY_LOCAL_RATE_MICRO_USD_PER_HOUR="+v)
-		if e != nil {
-			return Config{}, e
-		}
-		c.LocalRateMicroUSDPerHour, c.LocalRateSource = n, src
-	}
-	if v, src := layered("TENSORHUB_URL"); v != "" {
-		c.HubURL, c.HubURLSource = strings.TrimRight(v, "/"), src
-	}
-	if v, src := layered("TENSORHUB_TOKEN"); v != "" {
-		c.HubToken, c.HubTokenSource = secret.New(v), src
-	}
-	// The PER-SPAWN worker bootstrap credential (#449): imposed by the launcher on the
-	// child it just created, read here because this file is the one env reader, consumed
-	// by the worker side of the protocol. Deliberately NOT in the inherited allowlist and
-	// NOT a file or .env key — it exists for exactly one process.
-	if v := os.Getenv("COZY_BOOTSTRAP_CREDENTIAL"); strings.TrimSpace(v) != "" {
-		c.Bootstrap = secret.New(v)
-	}
-
-	for _, name := range Inherited {
-		if v, ok := os.LookupEnv(name); ok {
-			c.inherited = append(c.inherited, name+"="+v)
-		}
-	}
-	sort.Strings(c.inherited)
-	frozen = c
-	return c, nil
-}
-
-func parseRate(v, spelled string) (int64, *exit.Error) {
-	n, err := strconv.ParseInt(v, 10, 64)
-	if err != nil || n < 0 {
-		return 0, exit.Usagef("%s is not a non-negative integer of micro-USD", spelled).
-			WithRemedy("these documents are integer-only; 250000 is $0.25/hour")
-	}
-	return n, nil
-}
-
-// readConfigFile reads $COZY_HOME/config.yaml: flat `key: value` scalars, `#` comments,
-// blank lines, and NOTHING else. The key set is CLOSED — an unknown key refuses naming
-// the known set — and the parser is deliberately this product's own: a general YAML
-// loader would admit structure this vocabulary has no meaning for, and YAML parsing
-// belongs to internal/video (the fence says so).
-func readConfigFile(path string) (map[string]string, *exit.Error) {
-	data, err := os.ReadFile(path)
+func readConfigFile(path string) (*resolver, *exit.Error) {
+	file, err := os.Open(path)
 	if err != nil {
 		if os.IsNotExist(err) {
-			return nil, nil
+			return &resolver{values: map[string]any{}}, nil
 		}
 		return nil, exit.Internalf("cannot read %s: %s", path, err)
 	}
-	out := map[string]string{}
-	for i, line := range strings.Split(string(data), "\n") {
-		s := strings.TrimSpace(line)
-		if s == "" || strings.HasPrefix(s, "#") {
-			continue
-		}
-		key, value, ok := strings.Cut(s, ":")
-		key = strings.TrimSpace(key)
-		if !ok || key == "" || strings.ContainsAny(key, " \t") {
-			return nil, exit.Usagef("%s line %d is not a flat `key: value` scalar: %q",
-				path, i+1, s).
-				WithRemedy("this file admits: %s", knownFileKeys())
-		}
-		if _, known := fileKeys[key]; !known {
-			return nil, exit.Usagef("%s names %q, which this product does not read", path, key).
-				WithRemedy("it reads: %s", knownFileKeys())
-		}
-		if _, dup := out[key]; dup {
-			return nil, exit.Usagef("%s names %q twice; a value has one spelling", path, key)
-		}
-		out[key] = trimQuotes(strings.TrimSpace(value))
-	}
-	return out, nil
-}
+	defer file.Close()
 
-// readDotEnv reads `.env` in the working directory: `KEY=VALUE` lines (an optional
-// `export ` survives), `#` comments and blank lines. Only this reader's own names are
-// taken; everything else in the file belongs to other tools and is ignored.
-func readDotEnv(path string) (map[string]string, *exit.Error) {
-	data, err := os.ReadFile(path)
+	resolved, err := strictYAML(file)
 	if err != nil {
-		if os.IsNotExist(err) {
-			return nil, nil
-		}
-		// Unreadable is not absent: a .env that exists and cannot be read would make
-		// this layer silently vanish, which is a debugging session nobody wants.
-		return nil, exit.Internalf("cannot read %s: %s", path, err)
+		return nil, exit.Usagef("%s is invalid: %s", path, err).
+			WithRemedy("this file admits: %s", knownFileKeys())
 	}
-	admitted := map[string]bool{}
-	for _, name := range dotenvNames {
-		admitted[name] = true
-	}
-	out := map[string]string{}
-	for _, line := range strings.Split(string(data), "\n") {
-		s := strings.TrimSpace(strings.TrimPrefix(strings.TrimSpace(line), "export "))
-		if s == "" || strings.HasPrefix(s, "#") {
-			continue
-		}
-		key, value, ok := strings.Cut(s, "=")
-		key = strings.TrimSpace(key)
-		if !ok || !admitted[key] {
-			continue
-		}
-		out[key] = trimQuotes(strings.TrimSpace(value))
-	}
-	return out, nil
+	return resolved, nil
 }
 
-func trimQuotes(v string) string {
-	if len(v) >= 2 && (v[0] == '"' && v[len(v)-1] == '"' || v[0] == '\'' && v[len(v)-1] == '\'') {
-		return v[1 : len(v)-1]
+// strictYAML accepts one flat YAML mapping. Kong remains the typed assignment
+// and validation engine; this loader only protects the closed file vocabulary.
+func strictYAML(reader io.Reader) (*resolver, error) {
+	decoder := yaml.NewDecoder(reader)
+	var document yaml.Node
+	if err := decoder.Decode(&document); err != nil {
+		if err == io.EOF {
+			return &resolver{values: map[string]any{}}, nil
+		}
+		return nil, err
 	}
-	return v
+	var extra yaml.Node
+	if err := decoder.Decode(&extra); err != io.EOF {
+		if err == nil {
+			return nil, fmt.Errorf("contains more than one YAML document")
+		}
+		return nil, err
+	}
+	if len(document.Content) == 0 {
+		return &resolver{values: map[string]any{}}, nil
+	}
+	root := document.Content[0]
+	if root.Kind != yaml.MappingNode {
+		return nil, fmt.Errorf("must be one flat key-value mapping")
+	}
+
+	values := make(map[string]any, len(root.Content)/2)
+	for i := 0; i < len(root.Content); i += 2 {
+		key, value := root.Content[i], root.Content[i+1]
+		if key.Kind != yaml.ScalarNode || key.Value == "" {
+			return nil, fmt.Errorf("line %d has a non-scalar or empty key", key.Line)
+		}
+		if !fileKeys[key.Value] {
+			return nil, fmt.Errorf("line %d names unknown key %q", key.Line, key.Value)
+		}
+		if _, exists := values[key.Value]; exists {
+			return nil, fmt.Errorf("line %d names %q twice", key.Line, key.Value)
+		}
+		if value.Kind != yaml.ScalarNode {
+			return nil, fmt.Errorf("line %d value for %q is not a scalar", value.Line, key.Value)
+		}
+		values[key.Value] = value.Value
+	}
+	return &resolver{values: values}, nil
 }
 
-// Child builds a child process's whole environment: the allowlisted snapshot plus the
-// exact values the launcher imposes. The result is sorted and deduplicated on the
-// variable name, imposed values winning — a child never sees two spellings of one name.
+// Child constructs a child process's complete environment. Imposed values win
+// over the captured allowlist and each variable appears once.
 func (c Config) Child(imposed ...string) []string {
-	// THE BYTE-PLANE DOOR travels with the launcher, because it is a resolved TOOL PATH
-	// this process already decided and not a decision a child may make again. Without it a
-	// detached `cozy up` — or a driver-started one — came up with no `tfs` on its PATH and
-	// silently could not root a job's declared checkpoints. It is imposed only when it was
-	// configured; the default (`tfs`, found on PATH) needs no help.
-	if c.TfsSource == "env" && c.Tfs != "" {
+	if c.TfsSource != "default" && c.Tfs != "" {
 		imposed = append([]string{"COZY_TFS=" + c.Tfs}, imposed...)
 	}
 	seen := map[string]string{}
-	for _, kv := range c.inherited {
-		name, value, _ := strings.Cut(kv, "=")
+	for _, pair := range c.inherited {
+		name, value, _ := strings.Cut(pair, "=")
 		seen[name] = value
 	}
-	for _, kv := range imposed {
-		name, value, _ := strings.Cut(kv, "=")
+	for _, pair := range imposed {
+		name, value, _ := strings.Cut(pair, "=")
 		seen[name] = value
 	}
-	out := make([]string, 0, len(seen))
+	result := make([]string, 0, len(seen))
 	for name, value := range seen {
-		out = append(out, name+"="+value)
+		result = append(result, name+"="+value)
 	}
-	sort.Strings(out)
-	return out
+	sort.Strings(result)
+	return result
 }
 
-// Tool is the environment for a short-lived tool this process shells out to (uv,
-// nvidia-smi, an endpoint's describe). Same allowlist, plus NO_COLOR so a tool's output
-// is parseable.
+// Tool is Child plus the fixed no-color request used for parseable tool output.
 func (c Config) Tool(imposed ...string) []string {
 	return c.Child(append([]string{"NO_COLOR=1"}, imposed...)...)
 }
 
-// Frozen is the value Load produced. It is how a package deep in a call chain reads
-// configuration without reading the environment; if Load has not run, it is the zero
-// value and every path that needs a root fails loudly rather than inventing one.
-func Frozen() Config { return frozen }
+// Frozen returns the one process snapshot for legacy consumers while cl-044
+// moves them to explicit dependency injection.
+func Frozen() Config { return processConfig.cfg }

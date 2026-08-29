@@ -85,7 +85,7 @@ func CheckRentalSchema(db *sql.DB, path string) *exit.Error {
 		if normalizeDDL(stored) != normalizeDDL(expected) {
 			return exit.Named(exit.Conflict, "records.rental_schema_mismatch",
 				"table %s in %s was written by a different Creator build", table, path).
-				WithRemedy("release its rentals with the binary that wrote it (`cozy rent ls`, `cozy rent release <id> --yes`), or delete %s if nothing there is still rented", path)
+				WithRemedy("release its rentals with the binary that wrote it (`cozy rental list`, `cozy rental end <id> --yes`), or delete %s if nothing there is still rented", path)
 		}
 	}
 	return nil
@@ -169,6 +169,27 @@ func (s *Store) RentalOperation(key string) (*RentalOperation, *exit.Error) {
 		return nil, exit.Internalf("cannot read rental operation %s: %s", key, err)
 	}
 	return &op, nil
+}
+
+// ActiveRentalOperations is every paid acquisition/release operation whose absence has
+// not been proved. A row may precede its provider rental id, so a safe controller exit
+// must fence on the operation key as well as on attached rental rows.
+func (s *Store) ActiveRentalOperations() ([]RentalOperation, *exit.Error) {
+	rows, err := s.db.Query(`SELECT ` + rentalOperationCols + ` FROM rental_operations
+		WHERE state NOT IN ('released','rejected') ORDER BY created_at,operation_key`)
+	if err != nil {
+		return nil, exit.Internalf("cannot list active rental operations: %s", err)
+	}
+	defer rows.Close()
+	var out []RentalOperation
+	for rows.Next() {
+		op, err := scanRentalOperation(rows)
+		if err != nil {
+			return nil, exit.Internalf("cannot read an active rental operation: %s", err)
+		}
+		out = append(out, op)
+	}
+	return out, nil
 }
 
 // AdvanceRentalOperation records facts learned from the hub. Empty rentalID preserves a
@@ -402,56 +423,6 @@ func (s *Store) RecordRental(r Rental) *exit.Error {
 	return nil
 }
 
-// ReviseRentalControl atomically advances the locally durable active desired placement.
-// Equal revision is an exact replay; an older or byte-different answer refuses.
-func (s *Store) ReviseRentalControl(id, endpointRef string, revision uint64,
-	digest string, body []byte) *exit.Error {
-	if id == "" || endpointRef == "" || revision == 0 || digest == "" || len(body) == 0 {
-		return exit.Named(exit.Validation, "rental.placement_revision_invalid",
-			"rental, endpoint, revision, control digest, and exact control bytes are required")
-	}
-	tx, err := s.db.Begin()
-	if err != nil {
-		return exit.Internalf("cannot begin rental %s placement revision: %s", id, err)
-	}
-	defer tx.Rollback()
-	var current uint64
-	var currentEndpoint, currentDigest string
-	var currentBody []byte
-	err = tx.QueryRow(`SELECT placement_revision,endpoint_ref,control_snapshot_digest,
-		control_snapshot_bytes FROM rentals WHERE id=?`, id).Scan(
-		&current, &currentEndpoint, &currentDigest, &currentBody)
-	if errors.Is(err, sql.ErrNoRows) {
-		return exit.New(exit.NotFound, "no rental %s on this host", id)
-	}
-	if err != nil {
-		return exit.Internalf("cannot read rental %s placement revision: %s", id, err)
-	}
-	if revision < current || revision == current &&
-		(endpointRef != currentEndpoint || digest != currentDigest || !bytes.Equal(body, currentBody)) {
-		return exit.Named(exit.Conflict, "rental.placement_revision_regressed",
-			"rental %s active revision is %d and the answer names incompatible revision %d",
-			id, current, revision)
-	}
-	if revision == current {
-		return nil
-	}
-	result, err := tx.Exec(`UPDATE rentals SET endpoint_ref=?,placement_revision=?,
-		control_snapshot_digest=?,control_snapshot_bytes=?
-		WHERE id=? AND placement_revision=?`, endpointRef, revision, digest, body, id, current)
-	if err != nil {
-		return exit.Internalf("cannot advance rental %s placement revision: %s", id, err)
-	}
-	changed, err := result.RowsAffected()
-	if err != nil || changed != 1 {
-		return exit.Internalf("rental %s placement revision changed concurrently", id)
-	}
-	if err := tx.Commit(); err != nil {
-		return exit.Internalf("cannot commit rental %s placement revision: %s", id, err)
-	}
-	return nil
-}
-
 // ReserveArtifactGrantRevision durably allocates the next monotonic access revision.
 // Gaps are harmless; reuse is not. The reservation commits before a network call so a
 // response lost after Tensorhub committed cannot move the next service process backward.
@@ -491,7 +462,7 @@ func (s *Store) ReserveArtifactGrantRevision(id string) (uint64, *exit.Error) {
 // invocation. The requested accelerator is not evidence; the worker's readback must
 // exactly agree with the SKU Tensorhub already qualified in its readiness receipt.
 // The observation is immutable for one rental so a changed machine identity refuses
-// instead of silently rewriting the evidence a workflow is about to freeze.
+// instead of silently rewriting retained execution evidence.
 func (s *Store) ObserveRentalWorker(id, accelerator, backend, driverVersion,
 	backendVersion string, deviceMemory uint64, instance, bootID string, count int) *exit.Error {
 	tx, err := s.db.Begin()

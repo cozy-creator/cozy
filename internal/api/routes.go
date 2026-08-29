@@ -1,7 +1,5 @@
 package api
 
-import "github.com/cozy-creator/cozy-creator/internal/manifest"
-
 // The route table is DATA: one declarative registry drives dispatch and capability
 // tokens. `scripts/fence.py` checks its method, path, scope, and order against
 // `docs/client-contract.md`, so a route present on only one side is CI-red.
@@ -12,7 +10,7 @@ import "github.com/cozy-creator/cozy-creator/internal/manifest"
 //	        future servers. Cross-host parity requires conformance proof; it is not
 //	        asserted by this registry.
 //	Local — the Creator-only extension module: installed endpoints, workers, host doctor,
-//	        triage, jobs, workflows, and video composition. Its /v1/local/ mount makes
+//	        triage, and jobs. Its /v1/local/ mount makes
 //	        that boundary visible in the URL.
 
 // Scope is which module a route belongs to.
@@ -48,127 +46,43 @@ var Routes = []Route{
 	// ---- Creator's implemented request-level CORE ----
 	{"POST", "/v1/requests", Core, true, true, false, "Idempotency-Key",
 		"submit one request; 202 with the request handle",
-		"`cozy run` and Creator's local UI"},
+		"`cozy invoke run`"},
 	{"GET", "/v1/requests", Core, true, false, false, "",
 		"list requests newest-first, optionally filtered by status",
-		"cl-010 `cozy status`"},
+		"`cozy invoke list`"},
 	{"GET", "/v1/requests/{id}", Core, true, false, false, "",
 		"one request: status, attempt, metrics, typed result, media refs",
-		"cl-010 `cozy run`"},
+		"`cozy invoke run`"},
 	{"POST", "/v1/requests/{id}/cancel", Core, true, true, false, "",
 		"request cancellation of the live attempt; the terminal still arrives",
-		"cl-010 `cozy run` on SIGINT"},
+		"`cozy invoke cancel` and invoke-run SIGINT"},
 	{"GET", "/v1/requests/{id}/events", Core, true, false, true, "",
 		"SSE for ONE request: durable lifecycle from a cursor plus live progress; terminal-stop",
-		"cozy.art's SSE client, cl-010 `--stream`"},
-	{"GET", "/v1/events", Core, true, false, true, "",
-		"the MULTIPLEXED SSE stream: every request, one connection, one cursor",
-		"cl-007's UI (the browser connection cap)"},
+		"`cozy invoke run` follow"},
 	{"GET", "/v1/media/{media_id}", Core, true, false, false, "",
 		"one output's bytes by OPAQUE id; bounded Range; never a path",
-		"cl-010 `--out`, cl-007's UI"},
-	{"GET", "/v1/capabilities", Core, true, false, false, "",
-		"feature tokens; presence is a token, never a version string",
-		"cl-002 `cozy capabilities`"},
+		"`cozy invoke run --out`"},
 
 	// ---- the LOCAL extension module ----
-	{"GET", "/v1/local/endpoints", Local, true, false, false, "",
-		"installed endpoints: pin, generation, release, ready plans",
-		"cl-010 `cozy ls`, cl-007's UI"},
-	{"GET", "/v1/local/workers", Local, true, false, false, "",
-		"live endpoint workers: protocol identities, devices, intake state",
-		"cl-010 `cozy status`"},
-	{"POST", "/v1/local/workers", Local, true, true, false, "",
-		"make one local endpoint resident or claim one exact rental without invoking a model",
-		"cl-010 `cozy start`, cl-021 `cozy rent probe`"},
-	{"DELETE", "/v1/local/workers/{instance_id}", Local, true, true, false, "",
-		"drain and stop one worker's whole process group",
-		"cl-010 `cozy stop`"},
-	{"POST", "/v1/local/rentals/{rental_id}/placement-revisions", Local, true, true, false, "Idempotency-Key",
-		"author one Tensorhub placement revision and relay grant-before-set on the claimed worker",
-		"`cozy rent revise`"},
-	{"GET", "/v1/local/doctor", Local, true, false, false, "",
-		"host facts and the service's own state",
-		"cl-010 `cozy doctor`"},
-	{"POST", "/v1/local/service/shutdown", Local, true, true, false, "",
-		"ask the LocalService to drain every worker and exit; exit is proved by the service lock",
-		"cl-010 `cozy down` (#449's cooperative tier)"},
-	{"GET", "/v1/local/attempts/{attempt_key}/triage", Local, true, false, false, "",
-		"the retained WorkerTriageBundle by OPAQUE attempt key, verified against its terminal",
-		"cl-010 `cozy logs <attempt>`"},
+	{"POST", "/v1/local/rentals/{rental_id}/claim", Local, true, true, false, "",
+		"attach the controller to one already-provisioned private worker",
+		"`cozy rental new` convergence"},
+	{"POST", "/v1/local/service/unload", Local, true, true, false, "",
+		"stop idle local serving workers and release their GPU-resident models",
+		"cl-044 `cozy unload`"},
+	{"POST", "/v1/local/service/exit", Local, true, true, false, "",
+		"safely exit, or under explicit all request cancellation before confirmed rental teardown",
+		"cl-044 `cozy exit [--all]`"},
 
 	// ---- the JOB family (cl-004), LOCAL by design: the hub's job plane is th-008's,
 	// and a job's typed input trees are directories only a local caller owns.
 	{"POST", "/v1/local/jobs", Local, true, true, false, "Idempotency-Key",
 		"submit one bounded job; 202 with the job handle and its publication repo",
-		"cl-004 `cozy job submit`"},
-	{"GET", "/v1/local/jobs", Local, true, false, false, "",
-		"list jobs newest-first with per-state counts, optionally filtered",
-		"cl-004 `cozy job ls`"},
+		"`cozy invoke run` for a job callable"},
 	{"GET", "/v1/local/jobs/{id}", Local, true, false, false, "",
 		"one job: state, queue position, retry budget, publication, checkpoints, bill where a rate exists",
-		"cl-004 `cozy job status`"},
+		"`cozy invoke run` follow and cancel"},
 	{"POST", "/v1/local/jobs/{id}/cancel", Local, true, true, false, "",
 		"request cancellation; a queued job leaves the queue, a running one gets its terminal",
-		"cl-004 `cozy job cancel`"},
-
-	// ---- Creator-owned ordered workflows. Children are ordinary /v1/requests rows. ----
-	{"POST", "/v1/local/workflows", Local, true, true, false, "Idempotency-Key",
-		"submit one canonical ordered workflow; 202 fresh or 200 replay",
-		"cl-018 `cozy workflow submit`, cl-024"},
-	{"GET", "/v1/local/workflows/{id}", Local, true, false, false, "",
-		"one workflow with child request states and accepted outputs projected from authority",
-		"cl-018 `cozy workflow status`, cl-024"},
-	{"GET", "/v1/local/workflows/{id}/receipt", Local, true, false, false, "",
-		"durable canonical plan, materialized submissions, and exact frozen rental controls",
-		"cl-024 `cozy workflow download`"},
-	{"POST", "/v1/local/workflows/{id}/cancel", Local, true, true, false, "",
-		"persist workflow cancellation, cancel the active child, and mint nothing later",
-		"cl-018 `cozy workflow cancel`"},
-	{"POST", "/v1/local/video-compositions", Local, true, true, false, "",
-		"compose an exact Cozy Video source or retained creative plan into an ordinary workflow",
-		"cl-024 `cozy video compose`, `cozy video submit`"},
-
-	// ---- unauthenticated: liveness and the stub page ----
-	{"GET", "/healthz", Local, false, false, false, "",
-		"liveness only — it answers `up` and nothing about any request",
-		"cl-002 `internal/service.Probe`"},
-	{"GET", "/{$}", Local, false, false, false, "",
-		"the embedded stub page (cl-007's stub half)",
-		"cl-007"},
-	{"GET", "/app.js", Local, false, false, false, "",
-		"the stub's script — a FILE so the page needs no inline-script CSP",
-		"the stub page"},
-	{"GET", "/app.css", Local, false, false, false, "",
-		"the stub's style — a FILE for the same reason",
-		"the stub page"},
+		"`cozy invoke cancel`"},
 }
-
-// Tokens are the capability tokens this API advertises. Presence is a token; a client
-// never infers a feature from a version string (cl-002's discipline, same registry).
-var Tokens = []string{
-	"api.contract.core.v1",       // the shared client-contract core, this host
-	"api.requests.submit",        // idempotency key + body digest
-	"api.requests.cancel",        // explicit, digest-fenced cancellation
-	"api.events.sse",             // durable lifecycle + cursor resume + terminal-stop
-	"api.events.multiplex",       // one connection for every request
-	"api.media.opaque",           // media by opaque id; no path shape exists
-	"api.errors.envelope",        // one typed {error:{code,message,remedy,request_id}}
-	"api.auth.bearer",            // bearer only; no cookie is read anywhere
-	"api.bind.loopback",          // loopback-only bind, IPv4 and IPv6
-	"api.local.extension",        // the LOCAL module, explicitly not the core
-	"api.local.triage",           // retained bundles by opaque attempt key
-	"api.local.jobs",             // the bounded job family: submit/list/status/cancel
-	"api.jobs.publication",       // a job's landed writes are a durable publication root
-	"api.local.workflows",        // ordered ordinary children, Creator-owned recovery/cancellation
-	"api.local.video",            // strict source composition into the workflow form
-	"api.local.rental-revisions", // same-pod dynamic endpoint convergence
-	"api.stub.embedded",          // the go:embed stub page
-}
-
-// ContractVersion is the request-level core version Creator serves.
-const ContractVersion = "cozy.client.v1"
-
-// ONE registry. `cozy capabilities` and `GET /v1/capabilities` read the same slice, so
-// the CLI cannot advertise a feature the server does not serve.
-func init() { manifest.APITokens = Tokens }

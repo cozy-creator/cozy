@@ -117,7 +117,7 @@ func (f *Facts) Job(function string) (*JobFacts, *exit.Error) {
 		return nil, exit.Named(exit.NotFound, "unknown_job",
 			"%s registers no job named %q", f.Install.Endpoint, function).
 			WithRemedy("it registers: %s", strings.Join(f.Descriptor.Names(), ", ")).
-			WithNext("cozy describe " + f.Install.Endpoint)
+			WithNext("cozy endpoint list --full")
 	}
 	var said struct {
 		DescriptorID string `json:"job_descriptor_id"`

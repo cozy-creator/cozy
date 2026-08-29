@@ -51,10 +51,6 @@ type Totals struct {
 	HeldObjects  int   `json:"held_objects"`
 }
 
-// HeldBytes is what the hub already holds, which it does not count for us: it is the
-// declaration minus what has to move. Subtraction, not a second census.
-func (t Totals) HeldBytes() int64 { return t.DeclaredBytes - t.MissingBytes }
-
 type OpenPublicationResponse struct {
 	Publication Session `json:"publication"`
 	Created     bool    `json:"created"`

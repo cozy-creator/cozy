@@ -1,5 +1,5 @@
 // Package client is the CLI's client of the LOCAL CLIENT API (cl-010). It exists so
-// `cozy run`, `cozy start`, `cozy stop`, `cozy logs` and `cozy doctor` are the API's FIRST
+// invoke, unload, and exit commands are the API's FIRST
 // CLIENT rather than a parallel implementation the HTTP surface later wraps: every one of
 // them speaks the routes in `docs/client-contract.md` over a real socket, exactly as
 // cl-007's UI and cozy.art do.
@@ -33,7 +33,7 @@ import (
 	"github.com/cozy-creator/cozy-creator/internal/service"
 )
 
-// Client is one CLI process's connection to the running LocalService.
+// Client is one CLI process's connection to the running local controller.
 type Client struct {
 	base  string
 	token secret.Value
@@ -55,7 +55,7 @@ func Open(cfg config.Config, st service.State) (*Client, *exit.Error) {
 	return &Client{
 		base:  "http://" + st.Addr,
 		token: token,
-		// No client-wide clock decides whether a local workflow or request stalled.
+		// No client-wide clock decides whether a local request stalled.
 		// Explicit caller deadlines cancel their request; worker liveness and measured
 		// no-progress facts decide operational failure.
 		http: &http.Client{},
@@ -105,7 +105,7 @@ func (c *Client) call(method, path string, body, out any, headers ...string) *ex
 	defer res.Body.Close()
 	data, err := io.ReadAll(io.LimitReader(res.Body, 64<<20))
 	if err != nil {
-		return exit.Internalf("the LocalService answer could not be read: %s", err)
+		return exit.Internalf("the local controller answer could not be read: %s", err)
 	}
 	if res.StatusCode >= 300 {
 		return Refusal(res.StatusCode, data)
@@ -114,7 +114,7 @@ func (c *Client) call(method, path string, body, out any, headers ...string) *ex
 		return nil
 	}
 	if err := json.Unmarshal(data, out); err != nil {
-		return exit.Internalf("the LocalService answered %s with a body this client cannot read: %s",
+		return exit.Internalf("the local controller answered %s with a body this client cannot read: %s",
 			path, err)
 	}
 	return nil
@@ -124,9 +124,9 @@ func (c *Client) call(method, path string, body, out any, headers ...string) *ex
 // refusal document, a transport failure. It carries the SAME remedy every server-backed
 // verb's exit-9 gate carries, because it is the same condition arriving later.
 func (c *Client) unreachable(err error) *exit.Error {
-	return exit.Unavailablef("the cozy LocalService stopped answering on %s: %s", c.Addr(), err).
+	return exit.Unavailablef("the Cozy controller stopped answering on %s: %s", c.Addr(), err).
 		WithRemedy("it may have exited mid-request; its log is in the local root").
-		WithNext("cozy status", "cozy up")
+		WithNext("cozy invoke list", "cozy invoke list")
 }
 
 // Refusal turns one typed error envelope into a typed CLI error. The NAME is the
@@ -148,7 +148,7 @@ func Refusal(status int, data []byte) *exit.Error {
 			body = body[:200] + "…"
 		}
 		return exit.Named(code, "untyped_answer",
-			"the LocalService answered %d with no typed envelope: %s", status, body)
+			"the local controller answered %d with no typed envelope: %s", status, body)
 	}
 	e := exit.Named(code, doc.Error.Code, "%s", doc.Error.Message)
 	if doc.Error.Remedy != "" {
@@ -172,6 +172,21 @@ func (c *Client) Request(id string) (api.Lifecycle, *exit.Error) {
 	var life api.Lifecycle
 	e := c.call("GET", "/v1/requests/"+id, nil, &life)
 	return life, e
+}
+
+// Requests lists ordinary invocations and jobs through the one request lifecycle
+// authority. Kind distinguishes their execution expectation without creating a
+// second public inventory.
+func (c *Client) Requests(status string, limit int) ([]api.Lifecycle, *exit.Error) {
+	var out struct {
+		Requests []api.Lifecycle `json:"requests"`
+	}
+	path := fmt.Sprintf("/v1/requests?limit=%d", limit)
+	if status != "" {
+		path += "&status=" + url.QueryEscape(status)
+	}
+	problem := c.call(http.MethodGet, path, nil, &out)
+	return out.Requests, problem
 }
 
 // Cancel REQUESTS cancellation. The attempt's own journaled terminal settles it, so this
@@ -210,114 +225,7 @@ func (c *Client) Media(mediaID string, receive func(MediaResponse) *exit.Error) 
 
 // ------------------------------------------------------------ the LOCAL extension
 
-// Endpoints lists what this host can serve.
-func (c *Client) Endpoints() ([]api.EndpointRow, *exit.Error) {
-	var out struct {
-		Endpoints []api.EndpointRow `json:"endpoints"`
-	}
-	e := c.call("GET", "/v1/local/endpoints", nil, &out)
-	return out.Endpoints, e
-}
-
-// Worker is one live worker, as the orchestrator reports it. The fields are
-// `orchestrator.WorkerFacts` on the wire; a client reads the ones it renders.
-type Worker struct {
-	InstanceID                 string   `json:"instance_id"`
-	RentalID                   string   `json:"rental_id"`
-	Endpoint                   string   `json:"endpoint"`
-	ReleaseID                  string   `json:"release_id"`
-	PlacementSpecDigest        string   `json:"placement_spec_digest"`
-	RetainedFallbackSpecDigest string   `json:"retained_fallback_spec_digest"`
-	BootID                     string   `json:"worker_boot_id"`
-	PID                        int      `json:"pid"`
-	Exited                     bool     `json:"exited"`
-	Devices                    []string `json:"devices"`
-	// THE TWO AXES, and the machine phase they were pulled out of (#473/#482).
-	// `intake_state` is retired with both of its uses: one enum could not say "staged on
-	// disk but offline", which is the exact state an outgoing spec holds under
-	// fallback-retention.
-	Phase                      string                    `json:"worker_phase"`
-	Materialization            string                    `json:"materialization"`
-	Serving                    string                    `json:"serving"`
-	Plans                      []string                  `json:"dispatchable_plan_ids"`
-	GrantID                    string                    `json:"artifact_grant_id"`
-	GrantRevision              uint64                    `json:"artifact_grant_revision"`
-	AppliedGrantID             string                    `json:"applied_artifact_grant_id"`
-	AppliedGrantRevision       uint64                    `json:"applied_grant_revision"`
-	DesiredRevision            uint64                    `json:"desired_state_revision"`
-	AcceptedRevision           uint64                    `json:"accepted_desired_state_revision"`
-	ConvergedRevision          uint64                    `json:"converged_revision"`
-	AcceptedPlacementSetDigest string                    `json:"accepted_placement_set_digest"`
-	GrantSubjects              []ArtifactSubjectFacts    `json:"artifact_grant_subjects"`
-	Acquisition                PlacementAcquisitionFacts `json:"acquisition"`
-	// QuietMS measures missed protocol reports. ErrorForMS is diagnostic only; typed
-	// faults/refusals settle immediately and no elapsed duration decides readiness.
-	QuietMS    int64  `json:"quiet_ms"`
-	ErrorForMS int64  `json:"error_for_ms"`
-	Fault      string `json:"fault"`
-	// Refusal is the HOST's own verdict about this worker, distinct from the worker's own
-	// fault: a fault may clear, a refusal is settled.
-	Refusal string `json:"refusal"`
-}
-
-type AcquisitionLegFacts struct {
-	StartedNS       uint64 `json:"started_monotonic_ns"`
-	EndedNS         uint64 `json:"ended_monotonic_ns"`
-	DownloadedBytes uint64 `json:"downloaded_bytes"`
-	ReusedBytes     uint64 `json:"reused_bytes"`
-}
-
-type PlacementAcquisitionFacts struct {
-	Endpoint AcquisitionLegFacts `json:"endpoint"`
-	Model    AcquisitionLegFacts `json:"model"`
-}
-
-type ArtifactSubjectFacts struct {
-	Digest    string `json:"digest"`
-	SubjectID string `json:"subject_id"`
-	Kind      string `json:"kind"`
-	Length    uint64 `json:"length"`
-}
-
-// Dispatchable answers whether this worker can take an attempt — the protocol's own fact,
-// not a guess from liveness: a process that is up but has loaded nothing is not warm, and
-// a placement that is STAGED but OFFLINE is not capacity however much of it is on disk.
-func (w Worker) Dispatchable() bool {
-	return !w.Exited && w.Serving == "DISPATCHABLE" && len(w.Plans) > 0
-}
-
-func (c *Client) Workers() ([]Worker, *exit.Error) {
-	var out struct {
-		Workers []Worker `json:"workers"`
-	}
-	e := c.call("GET", "/v1/local/workers", nil, &out)
-	return out.Workers, e
-}
-
-type RentalRevision struct {
-	RentalID              string `json:"rental_id"`
-	PlacementRevision     uint64 `json:"placement_revision"`
-	InstanceID            string `json:"instance_id"`
-	WorkerBootID          string `json:"worker_boot_id"`
-	Endpoint              string `json:"endpoint"`
-	DesiredStateRevision  uint64 `json:"desired_state_revision"`
-	ArtifactGrantRevision uint64 `json:"artifact_grant_revision"`
-}
-
-func (c *Client) ReviseRental(id, endpointRef, idempotencyKey,
-	reason string) (RentalRevision, *exit.Error) {
-	var out RentalRevision
-	e := c.call(http.MethodPost,
-		"/v1/local/rentals/"+url.PathEscape(id)+"/placement-revisions",
-		map[string]string{"endpoint_ref": endpointRef, "idempotency_key": idempotencyKey, "reason": reason},
-		&out, "Idempotency-Key", idempotencyKey)
-	return out, e
-}
-
-// StartResult is the prewarm answer. `Change` says WHICH of the three things happened —
-// `none`, `worker_started`, or `placement_added` (#484). The old `Resident bool` could
-// only answer "was it already there", which is true both of an idempotent no-op and of a
-// live worker that just gained a placement, and those are different answers.
+// StartResult is the rental-claim answer.
 type StartResult struct {
 	InstanceID string `json:"instance_id"`
 	Endpoint   string `json:"endpoint"`
@@ -325,76 +233,30 @@ type StartResult struct {
 	Note       string `json:"note"`
 }
 
-// StartWorker makes an endpoint resident. `warm` false asks the worker to skip its boot
-// warm pass — the route's `warm` field is omitted entirely when it is true, so the wire
-// carries a choice only when one was made.
-func (c *Client) EnsureWorker(endpoint string, warm bool) (StartResult, *exit.Error) {
-	var res StartResult
-	body := map[string]any{"endpoint": endpoint}
-	if !warm {
-		body["warm"] = false
-	}
-	e := c.call("POST", "/v1/local/workers", body, &res)
-	return res, e
-}
-
 // EnsureRental claims one attached rented worker without invoking a model. Its
 // ClaimAck actual-hardware readback becomes durable before this returns ready.
 func (c *Client) EnsureRental(rentalID string) (StartResult, *exit.Error) {
 	var res StartResult
-	e := c.call("POST", "/v1/local/workers", map[string]any{"rental": rentalID}, &res)
+	e := c.call("POST", "/v1/local/rentals/"+url.PathEscape(rentalID)+"/claim", map[string]any{}, &res)
 	return res, e
 }
 
-// StopResult is the drain answer. `Stopped` false means there was nothing to stop, which
-// is a successful no-op and not a refusal.
-type StopResult struct {
-	InstanceID string `json:"instance_id"`
-	Stopped    bool   `json:"stopped"`
-	Note       string `json:"note"`
-}
-
-func (c *Client) ShutdownWorker(instance string) (StopResult, *exit.Error) {
-	var res StopResult
-	e := c.call("DELETE", "/v1/local/workers/"+instance, nil, &res)
-	return res, e
-}
-
-// ShutdownService is `cozy down`'s cooperative ask (#449): the authenticated route that
-// takes the same path a SIGTERM takes. The 202 means the ask was DELIVERED; the exit is
-// proved by the service lock, which the caller watches.
-func (c *Client) ShutdownService() *exit.Error {
-	var out map[string]any
-	return c.call("POST", "/v1/local/service/shutdown", map[string]any{}, &out)
-}
-
-// DoctorDocument is the local service's operational readback. Counts stay typed across
-// the HTTP boundary so status never reinterprets JSON numbers or opens the records store.
-type DoctorDocument struct {
-	Service   map[string]any `json:"service"`
-	Host      map[string]any `json:"host"`
-	Counts    map[string]int `json:"counts"`
-	EventHead int64          `json:"event_head"`
-	Workers   []Worker       `json:"workers"`
-}
-
-// Doctor returns the host/service document verbatim.
-func (c *Client) Doctor() (DoctorDocument, *exit.Error) {
-	var out DoctorDocument
-	e := c.call("GET", "/v1/local/doctor", nil, &out)
+// Unload asks the controller to stop only definitely-idle local serving workers. It
+// never touches remote rentals, run-once jobs, active work, or installed disk bytes.
+func (c *Client) Unload() (api.UnloadResult, *exit.Error) {
+	var out api.UnloadResult
+	e := c.call(http.MethodPost, "/v1/local/service/unload", map[string]any{}, &out)
 	return out, e
 }
 
-// Triage is the retained bundle by OPAQUE attempt key, with the server's own `explain`
-// projection beside the whole document.
-type Triage struct {
-	AttemptKey string         `json:"attempt_key"`
-	SubjectID  string         `json:"subject_id"`
-	Length     int64          `json:"length"`
-	Digest     string         `json:"digest"`
-	Verified   bool           `json:"verified"`
-	Explain    []string       `json:"explain"`
-	Bundle     map[string]any `json:"bundle"`
+// Exit performs the controller-side lifecycle fence. Under all=false, active work or
+// rentals refuse without mutation. Under all=true, the controller requests cancellation
+// and returns the exact paid obligations the caller must terminate and confirm through
+// Tensorhub before retrying. ShuttingDown=true means the cooperative exit was accepted.
+func (c *Client) Exit(all bool) (api.ExitResult, *exit.Error) {
+	var out api.ExitResult
+	e := c.call(http.MethodPost, "/v1/local/service/exit", map[string]bool{"all": all}, &out)
+	return out, e
 }
 
 // ------------------------------------------------------------------ the JOB family
@@ -414,31 +276,8 @@ func (c *Client) Job(id string) (api.JobState, *exit.Error) {
 	return state, e
 }
 
-// Jobs lists jobs newest-first with the server's own per-state counts.
-func (c *Client) Jobs(status, endpoint string, limit int) ([]api.JobState, map[string]int, *exit.Error) {
-	var out struct {
-		Jobs   []api.JobState `json:"jobs"`
-		States map[string]int `json:"states"`
-	}
-	path := fmt.Sprintf("/v1/local/jobs?limit=%d", limit)
-	if status != "" {
-		path += "&status=" + status
-	}
-	if endpoint != "" {
-		path += "&endpoint=" + endpoint
-	}
-	e := c.call("GET", path, nil, &out)
-	return out.Jobs, out.States, e
-}
-
 // CancelJob REQUESTS cancellation. A running job's own journaled terminal settles it; a
 // queued one leaves the queue and settles here.
 func (c *Client) CancelJob(id string) *exit.Error {
 	return c.call("POST", "/v1/local/jobs/"+id+"/cancel", nil, nil)
-}
-
-func (c *Client) Triage(attemptKey string) (Triage, *exit.Error) {
-	var t Triage
-	e := c.call("GET", "/v1/local/attempts/"+attemptKey+"/triage", nil, &t)
-	return t, e
 }

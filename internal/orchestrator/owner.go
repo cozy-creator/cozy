@@ -516,7 +516,6 @@ func (c *Orchestrator) onClaimAck(w *worker, s *session, ack *pb.ClaimAck) *exit
 	c.sessions[ack.WorkerBootId] = s
 	w.bootID = ack.WorkerBootId
 	c.mu.Unlock()
-	c.wakeWorkflows()
 	return nil
 }
 
@@ -770,91 +769,6 @@ func grantSubjectFacts(subjects []*pb.ArtifactSubject) []ArtifactSubjectFacts {
 			Kind: subject.Kind, Length: subject.Length})
 	}
 	return out
-}
-
-// ReviseRental changes the desired endpoint on one already-claimed pod. Tensorhub first
-// durably authors the exact revision; this owner then sends the matching active grant and
-// only after it the set, on the same stream and worker identity.
-func (c *Orchestrator) ReviseRental(ctx context.Context, rentalID, endpointRef,
-	idempotencyKey, reason string) (WorkerFacts, uint64, *exit.Error) {
-	if c.opt.PlacementRevisions == nil || c.opt.ArtifactGrants == nil {
-		return WorkerFacts{}, 0, exit.Unavailablef("this LocalService consumes no live rental revisions")
-	}
-	c.mu.Lock()
-	var w *worker
-	for _, candidate := range c.workers {
-		if candidate.spec.Connection != nil && candidate.spec.Connection.RentalID == rentalID &&
-			!candidate.exited && !candidate.stopping {
-			w = candidate
-			break
-		}
-	}
-	c.mu.Unlock()
-	if w == nil {
-		return WorkerFacts{}, 0, exit.New(exit.NotFound,
-			"rental %s has no claimed worker in this service", rentalID).
-			WithRemedy("claim it first with `cozy rent probe %s`", rentalID)
-	}
-	placement, placementRevision, problem := c.opt.PlacementRevisions(ctx,
-		w.spec.Connection, endpointRef, idempotencyKey, reason)
-	if problem != nil {
-		return WorkerFacts{}, 0, problem
-	}
-	placement.Endpoint = pinnedEndpoint(placement.Endpoint, rentalID)
-	if placement.PlacementID() != w.placementID {
-		return WorkerFacts{}, 0, exit.Named(exit.Conflict, "rental.placement_revision_attempt_changed",
-			"revision %d names placement %s, live worker owns %s",
-			placementRevision, placement.PlacementID(), w.placementID)
-	}
-	c.mu.Lock()
-	if w.spec.Placement.PlacementRevision == placementRevision {
-		if w.spec.Placement.ExactPlacementSetDigest != placement.ExactPlacementSetDigest {
-			c.mu.Unlock()
-			return WorkerFacts{}, 0, exit.Named(exit.Conflict, "rental.placement_revision_conflict",
-				"Tensorhub revision %d changed its exact PlacementSet", placementRevision)
-		}
-		facts := factsOf(w)
-		c.mu.Unlock()
-		return facts, placementRevision, nil
-	}
-	if w.spec.Placement.PlacementRevision > placementRevision {
-		prior := w.spec.Placement.PlacementRevision
-		c.mu.Unlock()
-		return WorkerFacts{}, 0, exit.Named(exit.Conflict, "rental.placement_revision_regressed",
-			"live rental revision %d cannot move backward to %d", prior, placementRevision)
-	}
-	c.mu.Unlock()
-	planIDs, subjects, problem := remoteBindingSubjects(placement)
-	if problem != nil {
-		return WorkerFacts{}, 0, problem
-	}
-	if problem := c.opt.Store.ReviseAttachedWorker(w.instanceID, placement.Endpoint, placement.ReleaseID); problem != nil {
-		return WorkerFacts{}, 0, problem
-	}
-	c.mu.Lock()
-	if c.workers[w.instanceID] != w || w.exited || w.stopping {
-		c.mu.Unlock()
-		return WorkerFacts{}, 0, exit.Unavailablef("worker %s changed while revision %d was authored",
-			w.instanceID, placementRevision)
-	}
-	w.spec.Placement, w.planIDs, w.subjects = placement, planIDs, subjects
-	w.acquisition = PlacementAcquisitionFacts{}
-	s := c.sessions[w.bootID]
-	c.mu.Unlock()
-	if s == nil {
-		return WorkerFacts{}, 0, exit.Unavailablef("worker %s has no claimed stream for revision %d",
-			w.instanceID, placementRevision)
-	}
-	w.grantMu.Lock()
-	_, problem = c.issueRemoteGrant(s.ctx, s, w, placement, true)
-	w.grantMu.Unlock()
-	if problem != nil {
-		return WorkerFacts{}, 0, problem
-	}
-	c.mu.Lock()
-	facts := factsOf(w)
-	c.mu.Unlock()
-	return facts, placementRevision, nil
 }
 
 func grantCovers(placement DesiredPlacement, grant *pb.ArtifactGrant) *exit.Error {

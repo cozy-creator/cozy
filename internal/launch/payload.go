@@ -5,7 +5,6 @@ import (
 	"encoding/json"
 	"io"
 	"os"
-	"sort"
 	"strconv"
 	"strings"
 	"unicode/utf8"
@@ -127,7 +126,7 @@ func ParsePayload(ep *Entrypoint, terms []string, infile string) (json.RawMessag
 }
 
 // ValidatePayload checks one already-rendered request object against the exact descriptor
-// schema. It is the workflow/composer side of the same recorded-schema gate ParsePayload
+// schema. It is the API side of the same recorded-schema gate ParsePayload
 // applies while building a CLI payload.
 func ValidatePayload(ep *Entrypoint, payload json.RawMessage) *exit.Error {
 	decoder := json.NewDecoder(bytes.NewReader(payload))
@@ -155,80 +154,6 @@ func ValidatePayload(ep *Entrypoint, payload json.RawMessage) *exit.Error {
 		}
 		if problem := validateField(field, value, name); problem != nil {
 			return problem
-		}
-	}
-	return nil
-}
-
-// PopulatedAssetPaths returns every request-schema asset field carrying a non-empty
-// reference in one already-validated payload. It lets a workflow prove that each opaque
-// reference has an out-of-band grant instead of accepting a string the worker cannot open.
-func PopulatedAssetPaths(ep *Entrypoint, payload json.RawMessage) ([]string, *exit.Error) {
-	decoder := json.NewDecoder(bytes.NewReader(payload))
-	decoder.UseNumber()
-	var document map[string]any
-	if err := decoder.Decode(&document); err != nil || document == nil {
-		return nil, exit.New(exit.Validation, "%s payload is not one JSON object", ep.Name)
-	}
-	var out []string
-	for _, field := range ep.Request.Fields {
-		value, present := document[field.Name]
-		if !present {
-			continue
-		}
-		if problem := validateRenderedInto(field.Type, value, field.Name, &out); problem != nil {
-			return nil, problem
-		}
-	}
-	sort.Strings(out)
-	return out, nil
-}
-
-// ValidatePayloadAssets validates one authored payload after substituting exact-shaped
-// opaque references at the declared out-of-band grant paths. It is the pre-record gate
-// shared by higher-level composers that know asset identity before the digest exists in
-// a backward workflow binding.
-func ValidatePayloadAssets(ep *Entrypoint, payload json.RawMessage, assetPaths []string) *exit.Error {
-	decoder := json.NewDecoder(bytes.NewReader(payload))
-	decoder.UseNumber()
-	var document map[string]any
-	if err := decoder.Decode(&document); err != nil || document == nil {
-		return exit.New(exit.Validation, "%s payload is not one JSON object", ep.Name)
-	}
-	expected := append([]string(nil), assetPaths...)
-	sort.Strings(expected)
-	for index, path := range expected {
-		if index > 0 && expected[index-1] == path {
-			return exit.New(exit.Validation, "request asset path %s appears more than once", path)
-		}
-		parts, problem := assetPath(path)
-		if problem != nil {
-			return problem
-		}
-		if problem := setAssetRef(document, parts,
-			"sha256:0000000000000000000000000000000000000000000000000000000000000000"); problem != nil {
-			return problem
-		}
-	}
-	rendered, err := json.Marshal(document)
-	if err != nil {
-		return exit.Internalf("cannot render %s validation payload: %s", ep.Name, err)
-	}
-	if problem := ValidatePayload(ep, rendered); problem != nil {
-		return problem
-	}
-	populated, problem := PopulatedAssetPaths(ep, rendered)
-	if problem != nil {
-		return problem
-	}
-	if len(populated) != len(expected) {
-		return exit.Named(exit.Validation, "request_asset_resolution",
-			"%s payload asset references do not exactly match its declared grants", ep.Name)
-	}
-	for index := range populated {
-		if populated[index] != expected[index] {
-			return exit.Named(exit.Validation, "request_asset_resolution",
-				"%s payload asset references do not exactly match its declared grants", ep.Name)
 		}
 	}
 	return nil
@@ -435,7 +360,7 @@ func declared(ep *Entrypoint, key string) *exit.Error {
 	}
 	return exit.New(exit.Validation, "%s declares no request field %q", ep.Name, key).
 		WithRemedy("it declares: %s", strings.Join(ep.RequestFields(), ", ")).
-		WithNext("cozy describe <org/endpoint>")
+		WithNext("cozy endpoint list --full")
 }
 
 // typed spells one scalar the way the field's rendered schema declares it.
@@ -487,5 +412,5 @@ func typed(ep *Entrypoint, key, raw string) (json.RawMessage, *exit.Error) {
 func wrongType(ep *Entrypoint, key, raw, want string) *exit.Error {
 	return exit.New(exit.Validation,
 		"%s.%s is declared %s and %q is not one", ep.Name, key, want, raw).
-		WithRemedy("the schema is the release's own — `cozy describe <org/endpoint>/%s` prints it", ep.Name)
+		WithRemedy("the installed endpoint.descriptor.json declares %s's request schema", ep.Name)
 }

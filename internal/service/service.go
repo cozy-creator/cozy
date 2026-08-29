@@ -1,7 +1,7 @@
-// Package service owns ONE spelling of "is the LocalService running", and it is an OS
+// Package service owns ONE spelling of "is the local controller running", and it is an OS
 // fact rather than a file's contents.
 //
-// The running LocalService holds an exclusive advisory lock on `<home>/service.lock` for
+// The running local controller holds an exclusive advisory lock on `<home>/service.lock` for
 // its whole life. The kernel drops that lock when the process dies — including under
 // SIGKILL — so a reader that CAN take the lock has proof the service is gone, and one
 // that cannot has proof of the opposite. There is no pidfile, no heartbeat and no grace
@@ -53,7 +53,7 @@ func Probe(cfg config.Config) State {
 		// Taking it IS the proof of absence. Release immediately: probing must never
 		// look like holding.
 		_ = flock.Release(f)
-		st.Details = "the service lock is free — no LocalService owns this root"
+		st.Details = "the service lock is free — no local controller owns this root"
 		return st
 	}
 	st.Up = true
@@ -78,12 +78,12 @@ func Probe(cfg config.Config) State {
 	return st
 }
 
-// Held is the live LocalService's own claim on this root. It exists only inside the
+// Held is the live local controller's own claim on this root. It exists only inside the
 // process that is the service; nothing reads it, and nothing outlives it.
 type Held struct{ f *os.File }
 
 // Hold takes the root's exclusive claim and publishes the live addresses under it. A
-// second `cozy up` on one root gets exit 13 here, before it can bind anything.
+// second `cozy invoke list` on one root gets exit 13 here, before it can bind anything.
 func Hold(l home.Layout, addr, socket string) (*Held, *exit.Error) {
 	f, err := os.OpenFile(l.Service, os.O_RDWR|os.O_CREATE, 0o644)
 	if err != nil {
@@ -92,9 +92,9 @@ func Hold(l home.Layout, addr, socket string) (*Held, *exit.Error) {
 	if err := flock.Exclusive(f); err != nil {
 		f.Close()
 		return nil, exit.New(exit.Conflict,
-			"another cozy LocalService already owns %s", l.Root).
-			WithRemedy("one service per local root; stop it with `cozy down`").
-			WithNext("cozy status", "cozy down")
+			"another Cozy controller already owns %s", l.Root).
+			WithRemedy("one service per local root; stop it with `cozy exit`").
+			WithNext("cozy invoke list", "cozy exit")
 	}
 	body := fmt.Sprintf("addr=%s\nsocket=%s\npid=%d\nsince=%s\n",
 		addr, socket, os.Getpid(), time.Now().UTC().Format(time.RFC3339))
@@ -122,7 +122,7 @@ func (h *Held) Release() {
 
 // Unavailable is the typed refusal every server-dependent verb shares.
 func (s State) Unavailable() *exit.Error {
-	return exit.Unavailablef("the cozy LocalService is not running (%s)", s.Addr).
-		WithRemedy("start it with `cozy up`; it binds %s, loopback only", s.Addr).
-		WithNext("cozy up", "cozy status")
+	return exit.Unavailablef("the Cozy controller is not running (%s)", s.Addr).
+		WithRemedy("start it with `cozy invoke list`; it binds %s, loopback only", s.Addr).
+		WithNext("cozy invoke list", "cozy invoke list")
 }

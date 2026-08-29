@@ -3,7 +3,7 @@
 // (cozy-creator.md "Records"). There is no state.json and no second lifecycle store;
 // any JSON output is a derived read.
 //
-// Seam for cl-001: the LocalService adopts THIS package as its lifecycle store and
+// Seam for cl-001: the local controller adopts THIS package as its lifecycle store and
 // adds its own tables (worker sessions, requests, attempts, outputs) to the same
 // database. Nothing here assumes a CLI caller; Open takes a path.
 //
@@ -119,8 +119,7 @@ CREATE TABLE IF NOT EXISTS managed_profile_installs (
   lease_id                     TEXT NOT NULL,
   lease_expires_at             TEXT NOT NULL,
   recorded_at                  TEXT NOT NULL
-)`}, append(orchestratorSchema,
-	append(eventSchema, append(rentalSchema, append(workflowSchema, videoSchema...)...)...)...)...)
+)`}, append(orchestratorSchema, append(eventSchema, rentalSchema...)...)...)
 
 // pragmas ride the DSN rather than being executed after the open, because a pragma is a
 // property of a CONNECTION and database/sql may discard and redial one at any moment: a
@@ -394,7 +393,7 @@ func (s *Store) Install(id string) (*EndpointInstall, *exit.Error) {
 }
 
 // Installed is every active pin joined to its generation, endpoint-major ordered.
-// This is what `cozy ls` reads — records only, never a walk of the filesystem.
+// This is what `cozy endpoint list` reads — records only, never a walk of the filesystem.
 func (s *Store) Installed() ([]EndpointInstall, *exit.Error) {
 	rows, err := s.db.Query(`SELECT ` + genCols("g.") + `
 		FROM install_generations g JOIN pins p ON p.generation = g.id
@@ -418,7 +417,6 @@ func (s *Store) Installed() ([]EndpointInstall, *exit.Error) {
 func (s *Store) Unreferenced() ([]EndpointInstall, *exit.Error) {
 	rows, err := s.db.Query(`SELECT ` + genCols("g.") + `
 		FROM install_generations g WHERE g.id NOT IN (SELECT generation FROM pins)
-		AND g.id NOT IN (SELECT install_id FROM workflow_steps WHERE install_id IS NOT NULL)
 		ORDER BY g.created_at`)
 	if err != nil {
 		return nil, exit.Internalf("cannot list unreferenced generations: %s", err)
@@ -483,12 +481,14 @@ func (s *Store) Unpin(endpoint string, major int) *exit.Error {
 }
 
 // ForgetIfUnreferenced atomically claims one generation for GC. The row goes before
-// filesystem deletion; a newly pinned workflow therefore wins through its foreign key,
-// and a filesystem failure leaves an ordinary orphan the next GC can retry.
+// filesystem deletion, so a failure leaves an ordinary orphan the next GC can retry.
 func (s *Store) ForgetIfUnreferenced(id string) (bool, *exit.Error) {
 	result, err := s.db.Exec(`DELETE FROM install_generations WHERE id=?
 		AND NOT EXISTS (SELECT 1 FROM pins WHERE generation=?)
-		AND NOT EXISTS (SELECT 1 FROM workflow_steps WHERE install_id=?)`, id, id, id)
+		AND NOT EXISTS (SELECT 1 FROM requests WHERE install_id=?
+		  AND state IN ('submitted','queued','dispatching','requeue_pending'))
+		AND NOT EXISTS (SELECT 1 FROM worker_processes WHERE generation=? AND state!='closed')`,
+		id, id, id, id)
 	if err != nil {
 		return false, exit.New(exit.Conflict, "cannot claim generation %s for gc: %s", id, err)
 	}

@@ -64,6 +64,10 @@ func endpointReleasePath(ref Ref, release string) string {
 	return resourcePath("endpoints", ref) + "/releases/" + url.PathEscape(release)
 }
 
+func endpointProfilePath(ref Ref, release, profile string) string {
+	return endpointReleasePath(ref, release) + "/profiles/" + url.PathEscape(profile)
+}
+
 func (c *Client) BeginEndpointRelease(ctx context.Context, ref Ref, release string,
 	declaration []byte, reason string,
 ) (EndpointReleaseBegin, *exit.Error) {
@@ -81,35 +85,6 @@ func (c *Client) FinalizeEndpointRelease(ctx context.Context, ref Ref, release s
 	e := c.do(ctx, call{method: http.MethodPost,
 		path: endpointReleasePath(ref, release) + "/finalize", admin: true, reason: reason,
 		bodyBytes: declaration, byBytes: true, patient: true}, &out)
-	return out, e
-}
-
-func endpointProfilePath(ref Ref, release, profile string) string {
-	return endpointReleasePath(ref, release) + "/profiles/" + url.PathEscape(profile)
-}
-
-type ServingTarget struct {
-	Major    string `json:"major"`
-	Function string `json:"function"`
-}
-
-type ServingResult struct {
-	EndpointRef              string   `json:"endpoint_ref"`
-	EndpointExecutionDigests []string `json:"endpoint_execution_digests"`
-}
-
-type EndpointPromotion struct {
-	Release string          `json:"release"`
-	Serving []ServingResult `json:"serving"`
-}
-
-func (c *Client) PromoteEndpointRelease(ctx context.Context, ref Ref, release string,
-	serving []ServingTarget, reason string,
-) (EndpointPromotion, *exit.Error) {
-	var out EndpointPromotion
-	e := c.do(ctx, call{method: http.MethodPost,
-		path: endpointReleasePath(ref, release) + "/promote", admin: true, reason: reason,
-		body: map[string]any{"serving": serving}, byBytes: true}, &out)
 	return out, e
 }
 

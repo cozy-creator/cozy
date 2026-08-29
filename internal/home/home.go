@@ -20,7 +20,7 @@ type Layout struct {
 	DB          string // the one local SQLite lifecycle database
 	Generations string // one immutable directory per install generation
 	Lock        string // the single-writer flock file
-	Service     string // the LocalService's liveness lock (cl-001; held, never read)
+	Service     string // the local controller's liveness lock (cl-001; held, never read)
 	Workers     string // per-worker roots: journal, logs, staged binding plans
 	Outputs     string // the local output namespace the orchestrator grants into
 	// Inputs is the immutable, content-addressed staging area for caller-owned assets.
@@ -46,7 +46,7 @@ type Layout struct {
 	// by the very act that ends the job that produced it.
 	Publications string
 	// Client is the CLI's local credential file, mode 0600. A credential never rides
-	// argv (cl-011's rule), so the handoff is an OS-protected file the LocalService
+	// argv (cl-011's rule), so the handoff is an OS-protected file the local controller
 	// writes and its own CLI reads.
 	Client string
 	// Rentals holds one rented pod's SECRET MATERIAL: its provisioned owner token (0600)

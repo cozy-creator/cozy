@@ -117,7 +117,7 @@ func TestRentTimeoutInterruptsTricklingHubResponses(t *testing.T) {
 			root := filepath.Join(t.TempDir(), "cozy-home")
 			ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 			defer cancel()
-			args := []string{"-n", "19", cozyBin, "rent", "cozy/endpoint/v1/generate",
+			args := []string{"-n", "19", cozyBin, "rental", "new", "cozy/endpoint/v1/generate",
 				"--accelerator", "NVIDIA H200", "--reason", "liveness proof",
 				"--timeout", "300ms", "--idempotency-key", "rent-timeout-" + phase}
 			cmd := exec.CommandContext(ctx, "/usr/bin/nice", args...)
@@ -127,20 +127,20 @@ func TestRentTimeoutInterruptsTricklingHubResponses(t *testing.T) {
 			data, _ := cmd.CombinedOutput()
 			elapsed := time.Since(started)
 			if ctx.Err() != nil {
-				t.Fatalf("cozy rent ignored --timeout and required harness termination:\n%s", data)
+				t.Fatalf("cozy rental new ignored --timeout and required harness termination:\n%s", data)
 			}
-			if cmd.ProcessState == nil || cmd.ProcessState.ExitCode() != int(exit.Deadline) {
-				t.Fatalf("cozy rent %s exit = %v, want %d after caller deadline:\n%s",
-					phase, cmd.ProcessState, exit.Deadline, data)
+			if cmd.ProcessState == nil || cmd.ProcessState.ExitCode() != 1 || !strings.Contains(string(data), "deadline") {
+				t.Fatalf("cozy rental new %s exit = %v, want operational 1 with deadline detail:\n%s",
+					phase, cmd.ProcessState, data)
 			}
 			if elapsed > 2*time.Second {
-				t.Errorf("cozy rent %s returned after %s, far past its 300ms deadline", phase, elapsed)
+				t.Errorf("cozy rental new %s returned after %s, far past its 300ms deadline", phase, elapsed)
 			}
 			mu.Lock()
 			post, poll := sawPost, sawPoll
 			mu.Unlock()
 			if !post || phase == "poll" && !poll {
-				t.Errorf("cozy rent %s reached post=%t poll=%t", phase, post, poll)
+				t.Errorf("cozy rental new %s reached post=%t poll=%t", phase, post, poll)
 			}
 		})
 	}

@@ -10,17 +10,9 @@ Fourteen families:
             them; they fired on the worker protocol's own field names.)
   prompt    interactive prompts: no cozy command may ever ask a question (AXI)
   matrix    internal/exit/exit.go must equal docs/exit-matrix.md row for row
-  manifest  a reclaiming/removing verb must DECLARE its gate: Destructive (exit 7 without
-            --yes) or PlanFirst (a read without --yes) — exactly one, and it must
-            advertise --yes. Nothing removes bytes on a bare invocation. GlobalFlags
-            never names --version/-v/-V: AXI 10's version probe is a pre-parse fast path
-            in app.Run, and a global row would shadow `cozy pack --version <x.y.z>`. And
-            every IMPLEMENTED row carries AXI 9's disclosure and AXI 10's examples: a
-            `Next:` default (or `SelfContained: true`, the detail-view exemption, whose
-            handler computes a state-dependent one) and at least one `Examples:` line.
-  render    (AXI 6) internal/render writes ONE stream. An error is structured output the
-            agent must read, so it leaves on stdout with the data; stderr is progress and
-            diagnostics, which this layer does not emit.
+  grammar   internal/cli/grammar.go is the sole 19-command Kong tree; the retired manifest
+            and command families stay absent, and -v/-V/--version remain a pre-config fast path.
+  output    internal/output writes one typed document to stdout; progress alone uses stderr.
   env       (cl-001) the environment is read in internal/config/config.go and NOWHERE else:
             one entrypoint reader, a frozen typed value thereafter.
   store     (cl-001) no second lifecycle store: the ONE local SQLite database is the
@@ -29,7 +21,7 @@ Fourteen families:
             one is NOT scanned (check_sources skips lines starting with `//`), and the
             docstring said otherwise until 2026-08-28; a word in prose was never the
             hazard, writing the sidecar is.
-  secret    (cl-011) a credential never rides argv and has ONE raw reader: a manifest flag
+  secret    (cl-011) a credential never rides argv and has ONE raw reader: a Kong field
             whose name is credential-shaped may not take a value (process lists leak;
             `--token-stdin` is the shape that does not), and `secret.Value.Reveal()` may
             be called only where the value becomes an Authorization header.
@@ -195,11 +187,17 @@ RUNTIME_VERBS_DENY = {"run", "job", "serve", "rm", "pull", "ingest", "new"}
 # fence never saw — `tensorfs.parse_header` and a hand-summed tensor table already did.
 # Every multi-line Go string literal that looks like a script (it imports something) is
 # scanned for the byte-plane vocabulary below; the door is //cozy:allow on the line the
-# literal starts on.
+# literal starts on. scripts/*.py are scanned with the same vocabulary.
 DENY_EMBED = [
     "parse_header", "safetensors", "cozytensor", "tensorbytes", "tensorchunk",
     "loadtensor", "weightbytes", "gguf",
 ]
+PY_SCAN = "scripts/*.py"
+# fence.py names the vocabulary in order to deny it. No endpoint implementation is kept
+# under scripts/, so it is the only Python source exempt from its own vocabulary scan.
+PY_ALLOW = {
+    "scripts/fence.py": "the fence itself: it spells the vocabulary to deny it",
+}
 
 # (cl-028) The VERIFICATION HOME is the only place an //cozy:allow door may exempt a listen
 # or a runtime indirection: `internal/live` is the go-test suite and it contains the adversary
@@ -297,6 +295,22 @@ def check_embedded():
     return bad
 
 
+def check_scripts():
+    """(cl-028) scripts/*.py are in the SCAN set, with the explicit fixture allows."""
+    bad = []
+    for p in sorted(pathlib.Path(".").glob(PY_SCAN)):
+        rel = str(p).replace("\\", "/")
+        if rel in PY_ALLOW:
+            continue
+        for i, line in enumerate(p.read_text(errors="ignore").splitlines(), 1):
+            body = line.split("#", 1)[0].lower()
+            for d in DENY_EMBED:
+                if d in body:
+                    bad.append(f"{p}:{i}: [embed] byte-plane vocabulary '{d}' in a repo script — "
+                               f"only the named fixture allows carry it: {line.strip()}")
+    return bad
+
+
 def files():
     for glob in SCAN:
         for p in sorted(pathlib.Path(".").glob(glob)):
@@ -329,16 +343,10 @@ DOCUMENT_KINDS = {
     "cozy.client.JobSubmission/1": "internal/api/jobs.go",
     "cozy.client.Submission/1": "internal/api/requests.go",
     "cozy.local.EntrypointBindingRecord/2": "internal/plan/plan.go",
-    "cozy.local.EvaluatedConfig/1": "internal/app/identity.go",
-    "cozy.local.ExecutionEnvironment/1": "internal/app/identity.go",
+    "cozy.local.EvaluatedConfig/1": "internal/cli/identity.go",
+    "cozy.local.ExecutionEnvironment/1": "internal/cli/identity.go",
     "cozy.local.ManagedBaseReceipt/1": "internal/managedinstall/install.go",
-    "cozy.rental_request/1": "internal/app/rentals.go",
-    "cozy.video/1": "internal/video/source.go",
-    "cozy.video.CreativePlan/1": "internal/video/composition.go",
-    "cozy.workflow.ChildIdentity/1": "internal/workflow/materialize.go",
-    "cozy.workflow.ExecutionIdentity/1": "internal/workflow/engine.go",
-    "cozy.workflow.MaterializedSubmission/1": "internal/workflow/materialize.go",
-    "cozy.workflow.Plan/1": "internal/workflow/plan.go",
+    "cozy.rental_request/1": "internal/cli/rentals.go",
 }
 # Kinds another repo authors and this one only reads: the owner's fence polices the name.
 FOREIGN_KIND_PREFIXES = ("cozy.worker.v1.", "cozy.endpoint.", "cozy.runtime.", "tensorhub.",
@@ -408,8 +416,8 @@ def check_sources():
             for d in DENY_DEPS:
                 if re.search(r"(?<![\w.-])" + re.escape(d) + r"(?![\w-])", s, re.I):
                     bad.append(f"{p}:{i}: [deps] forbidden dependency '{d}': {s}")
-            if p.suffix == ".go" and YAML_IMPORT in s and not str(p).startswith("internal/video/"):
-                bad.append(f"{p}:{i}: [deps] YAML parsing belongs only to internal/video: {s}")
+            if p.suffix == ".go" and YAML_IMPORT in s and str(p) != "internal/config/config.go":
+                bad.append(f"{p}:{i}: [deps] YAML parsing belongs only to centralized config: {s}")
             for d in DENY_STORE:
                 if d in s.lower():
                     bad.append(f"{p}:{i}: [store] lifecycle sidecar '{d}' — the one SQLite "
@@ -502,109 +510,55 @@ def check_sources():
 
 
 def check_secret_flags():
-    """No manifest flag may carry a credential as an argv VALUE (cl-011)."""
-    src_path = pathlib.Path("internal/manifest/commands.go")
+    """No Kong field may turn a credential into an argv value (cl-011)."""
+    src_path = pathlib.Path("internal/cli/grammar.go")
     if not src_path.exists():
-        return ["[secret] missing internal/manifest/commands.go"]
+        return ["[secret] missing internal/cli/grammar.go"]
     bad = []
     for i, line in enumerate(src_path.read_text().splitlines(), 1):
-        m = re.search(r'Name:\s*"(--[A-Za-z0-9-]+)"', line)
-        if not m or not SECRET_FLAG.search(m.group(1)):
+        field = re.search(r'^\s*(\w+)\s+(?:\[\])?string\s+`', line)
+        if not field or not SECRET_FLAG.search("--" + field.group(1).lower()):
             continue
-        if re.search(r'Arg:\s*"', line):
-            bad.append(f"internal/manifest/commands.go:{i}: [secret] flag '{m.group(1)}' takes an "
-                       "argv value and is credential-shaped — argv is world-readable; take it on "
-                       "stdin (--token-stdin) or through an OS-protected handoff")
+        bad.append(f"internal/cli/grammar.go:{i}: [secret] credential-shaped string field "
+                   f"{field.group(1)!r} would take an argv value — use a boolean stdin door or "
+                   "OS-protected configuration")
     return bad
 
 
-# A verb whose name reclaims or removes must declare how it is gated.
-RECLAIM_VERB = re.compile(r"\b(rm|gc|purge|delete|destroy|prune|reset|clean)\b")
-
-# AXI 10's three version spellings. They are answered before the manifest is even read;
-# as GlobalFlags rows they would instead be resolved by parse.findFlag, which checks
-# globals FIRST and would hand `cozy pack --version 1.2.3` to the wrong flag.
+# AXI 10's version spellings are answered before Kong or configuration loads.
 VERSION_SPELLINGS = ("--version", "-v", "-V")
-FLAG_SPELLING = re.compile(r'(?:Name|Short):\s*"(-[-A-Za-z0-9]*)"')
-
-
-def check_global_flags():
-    src_path = pathlib.Path("internal/manifest/manifest.go")
-    if not src_path.exists():
-        return ["[manifest] missing internal/manifest/manifest.go"]
-    bad, seen = [], False
-    inside = False
-    for i, line in enumerate(src_path.read_text().splitlines(), 1):
-        if line.startswith("var GlobalFlags"):
-            inside, seen = True, True
-            continue
-        if not inside:
-            continue
-        if line.startswith("}"):
-            break
-        for m in FLAG_SPELLING.finditer(line):
-            if m.group(1) in VERSION_SPELLINGS:
-                bad.append(f"internal/manifest/manifest.go:{i}: [manifest] GlobalFlags declares "
-                           f"'{m.group(1)}' — the version probe is a pre-parse fast path in "
-                           "app.Run, and a global row shadows `cozy pack --version <x.y.z>` "
-                           "because parse.findFlag resolves globals before command flags")
-    if not seen:
-        bad.append("[manifest] internal/manifest/manifest.go declares no GlobalFlags block")
-    return bad
-
-
-# AXI 9/10, per IMPLEMENTED row. `Next` is the default disclosure the ONE emit seam
-# attaches; `SelfContained: true` is AXI 9's "omit when self-contained" exemption, taken
-# only by a detail view of one thing the caller already named. `Examples` is AXI 10's
-# 2-3 worked invocations, which is what `cozy help <cmd>` renders.
-ROW_NEXT = re.compile(r'\bNext:\s*\[\]string\{\s*"')
-ROW_EXAMPLES = re.compile(r'\bExamples:\s*\[\]string\{\s*"')
-ROW_SELF_CONTAINED = "SelfContained: true"
 
 
 def check_manifest():
-    src_path = pathlib.Path("internal/manifest/commands.go")
+    """Kong is the sole grammar and carries exactly the launch command tree."""
+    src_path = pathlib.Path("internal/cli/grammar.go")
     if not src_path.exists():
-        return ["[manifest] missing internal/manifest/commands.go"]
-    blocks = src_path.read_text().split("\n\t{\n")[1:]
-    bad, rows = check_global_flags(), 0
-    for block in blocks:
-        body = block.split("\n\t},")[0]
-        m = re.search(r"Path:\s*\[\]string\{([^}]*)\}", body)
-        if not m:
-            continue
-        rows += 1
-        name = " ".join(re.findall(r'"([^"]+)"', m.group(1)))
-        destructive = "Destructive: true" in body
-        plan_first = "PlanFirst: true" in body
-        has_yes = "yesFlag" in body or '"--yes"' in body
-        if RECLAIM_VERB.search(name) and not (destructive or plan_first):
-            bad.append(f"[manifest] '{name}' reclaims or removes but declares neither "
-                       "Destructive nor PlanFirst — a bare invocation would mutate silently")
-        if has_yes and destructive == plan_first:
-            joined = "both Destructive and PlanFirst" if destructive else "neither Destructive nor PlanFirst"
-            bad.append(f"[manifest] '{name}' takes --yes but is {joined} — exactly one")
-        if (destructive or plan_first) and not has_yes:
-            bad.append(f"[manifest] '{name}' is gated on --yes but advertises no --yes flag")
-        if "Status: Implemented" not in body:
-            continue
-        if not ROW_NEXT.search(body) and ROW_SELF_CONTAINED not in body:
-            bad.append(f"[manifest] '{name}' is implemented but declares no 'Next:' — AXI 9 wants "
-                       "a next step after normal output, and the emit seam can only attach what "
-                       "the row declares. A detail view whose handler computes its own says so "
-                       "with 'SelfContained: true'")
-        if ROW_NEXT.search(body) and ROW_SELF_CONTAINED in body:
-            bad.append(f"[manifest] '{name}' declares both 'Next:' and 'SelfContained: true' — "
-                       "the exemption means there is no default to declare")
-        if not ROW_EXAMPLES.search(body):
-            bad.append(f"[manifest] '{name}' is implemented but declares no 'Examples:' — AXI 10 "
-                       "wants 2-3 worked, parameterized invocations in `cozy help " + name + "`")
-    if not rows:
-        bad.append("[manifest] no command rows parsed out of commands.go")
+        return ["[grammar] missing internal/cli/grammar.go"]
+    source = src_path.read_text()
+    required = (
+        "Endpoint EndpointCmd", "Model    ModelCmd", "Invoke   InvokeCmd", "Rental   RentalCmd",
+        "Unload   UnloadCmd", "Exit     ExitCmd",
+        "Search  EndpointSearchCmd", "Install EndpointInstallCmd", "Remove  EndpointRemoveCmd",
+        "List    EndpointListCmd", "Publish EndpointPublishCmd",
+        "Search   ModelSearchCmd", "Download ModelDownloadCmd", "Remove   ModelRemoveCmd",
+        "List     ModelListCmd", "Publish  ModelPublishCmd",
+        "Run    InvokeRunCmd", "Cancel InvokeCancelCmd", "List   InvokeListCmd",
+        "New  RentalNewCmd", "End  RentalEndCmd", "List RentalListCmd",
+    )
+    bad = [f"[grammar] missing Kong command field {item!r}" for item in required if item not in source]
+    for retired in ("StackCmd", "WorkflowCmd", "VideoCmd", "JobCmd", "CommandsCmd", "StatusCmd"):
+        if retired in source:
+            bad.append(f"[grammar] retired command family remains: {retired}")
+    app = pathlib.Path("internal/cli/app.go").read_text()
+    for spelling in VERSION_SPELLINGS:
+        if spelling not in app:
+            bad.append(f"[grammar] version fast path omits {spelling}")
+    if pathlib.Path("internal/manifest").exists():
+        bad.append("[grammar] parallel internal/manifest still exists")
     return bad
 
 
-RENDER_SRC = "internal/render/render.go"
+RENDER_SRC = "internal/output/output.go"
 RENDER_STDERR = re.compile(r"Fprint(?:f|ln)?\(\s*(?:[A-Za-z_.]*\.)?[Ss]tderr\b")
 
 
@@ -705,24 +659,13 @@ def check_contract():
 
 
 def check_video_boundary():
-    """Creative source and video CLI never acquire placement/model policy."""
-    commands = pathlib.Path("internal/manifest/commands.go").read_text()
-    start = commands.find("// ---- editable Cozy Video sources")
-    stop = commands.find("// ---- jobs", start)
-    if start < 0 or stop < 0:
-        return ["[video] manifest has no bounded Cozy Video command section"]
-    surface = commands[start:stop]
+    """The retired pre-launch workflow/video plane does not survive the CLI hardcut."""
     bad = []
-    for forbidden in ("--worker", "--lane", "--model", "--provider", "--datacenter",
-                      "--region", "--accelerator", "--snapshot-root", ".artifacts"):
-        if forbidden in surface:
-            bad.append(f"[video] video command surface contains placement/model input {forbidden}")
-    source = pathlib.Path("internal/video/source.go").read_text()
-    forbidden_fields = re.compile(
-        r'yaml:"(?:lane|model|provider|datacenter|region|accelerator|gpu|snapshot|model_root|artifact)'
-    )
-    if match := forbidden_fields.search(source):
-        bad.append(f"[video] cozy.video/1 acquired execution field {match.group(0)}")
+    for retired in ("internal/video", "internal/workflow", "internal/api/videos.go",
+                    "internal/api/workflows.go", "internal/records/video.go",
+                    "internal/records/workflows.go"):
+        if pathlib.Path(retired).exists():
+            bad.append(f"[video] retired plane remains: {retired}")
     return bad
 
 
@@ -730,9 +673,9 @@ def check_typed_resources():
     """The product surface names endpoint and model directly; no generic compatibility door."""
     bad = []
     product_files = [
-        pathlib.Path("internal/manifest/commands.go"),
-        pathlib.Path("internal/app/catalog.go"),
-        pathlib.Path("internal/app/transfer.go"),
+        pathlib.Path("internal/cli/grammar.go"),
+        pathlib.Path("internal/cli/catalog.go"),
+        pathlib.Path("internal/cli/transfer.go"),
         pathlib.Path("internal/hub/hub.go"),
         pathlib.Path("internal/hub/publish.go"),
     ]
@@ -760,26 +703,18 @@ def check_typed_resources():
             if old in text:
                 bad.append(f"{path}: [resources] retired product surface remains: {old!r}")
 
-    manifest = pathlib.Path("internal/manifest/commands.go").read_text()
+    manifest = pathlib.Path("internal/cli/grammar.go").read_text()
     required_commands = (
-        'Path: []string{"endpoint", "create"}',
-        'Path: []string{"endpoint", "show"}',
-        'Path: []string{"endpoint", "search"}',
-        'Path: []string{"endpoint", "publish"}',
-        'Path: []string{"endpoint", "promote"}',
-        'Path: []string{"model", "create"}',
-        'Path: []string{"model", "show"}',
-        'Path: []string{"model", "search"}',
-        'Path: []string{"model", "publish"}',
-        'Path: []string{"model", "download"}',
+        "Search  EndpointSearchCmd", "Install EndpointInstallCmd", "Remove  EndpointRemoveCmd",
+        "List    EndpointListCmd", "Publish EndpointPublishCmd",
+        "Search   ModelSearchCmd", "Download ModelDownloadCmd", "Remove   ModelRemoveCmd",
+        "List     ModelListCmd", "Publish  ModelPublishCmd",
     )
     for command in required_commands:
         if command not in manifest:
-            bad.append(f"internal/manifest/commands.go: [resources] missing typed command {command}")
-    if 'Path: []string{"endpoint", "qualify"}' in manifest:
-        bad.append("internal/manifest/commands.go: [resources] retired endpoint qualify command remains")
+            bad.append(f"internal/cli/grammar.go: [resources] missing typed command {command}")
     if "--kind" in manifest:
-        bad.append("internal/manifest/commands.go: [resources] retired --kind discriminator remains")
+        bad.append("internal/cli/grammar.go: [resources] retired --kind discriminator remains")
 
     hub_sources = (pathlib.Path("internal/hub/hub.go").read_text() +
                    pathlib.Path("internal/hub/publish.go").read_text() +
@@ -792,9 +727,6 @@ def check_typed_resources():
         bad.append("internal/hub/endpoint_releases.go: [resources] retired local-execution route remains")
     if "/local-qualification-materials" not in profile_routes:
         bad.append("internal/hub/endpoint_releases.go: [resources] local qualification-materials route is absent")
-    for retired in (' + "/qualify"', ' + "/qualification"'):
-        if retired in profile_routes:
-            bad.append(f"internal/hub/endpoint_releases.go: [resources] retired endpoint qualification route remains: {retired}")
 
     managed = pathlib.Path("internal/managedinstall/install.go").read_text()
     for retired in ('"base_path"', '"index_url"', '"build_command"', 'exec.Command("uv"',
@@ -811,7 +743,7 @@ def check_typed_resources():
 
 
 violations = (check_sources() + check_matrix() + check_manifest() + check_secret_flags()
-              + check_contract() + check_video_boundary() + check_embedded()
+              + check_contract() + check_video_boundary() + check_embedded() + check_scripts()
               + check_document_kinds() + check_render_streams()
               + check_media_contract() + check_typed_resources() + check_test_boundary())
 if violations:
@@ -823,14 +755,13 @@ print(
     f"fence green — deps({len(DENY_DEPS)}) impl({len(DENY_IMPL)}) "
     f"prompt({len(DENY_PROMPT) + len(DENY_PROMPT_CALLS) + 1}) matrix(15 rows) "
     f"env({len(DENY_ENV_CALLS)} calls@{len(ENV_READERS)} programs) store({len(DENY_STORE)}) "
-    f"manifest({RECLAIM_VERB.pattern} + globals!{'/'.join(VERSION_SPELLINGS)} "
-    f"+ next/examples per implemented row) "
-    f"render(one stream@{RENDER_SRC}) secret({SECRET_FLAG.pattern} + Reveal@{len(REVEAL_SITES)}) "
+    f"grammar(kong@internal/cli/grammar.go + version {'/'.join(VERSION_SPELLINGS)}) "
+    f"output(one document@{RENDER_SRC}) secret({SECRET_FLAG.pattern} + Reveal@{len(REVEAL_SITES)}) "
     f"cas(store-path) tensor(tfs@{len(TFS_SITES)}) "
     f"api({len(DENY_COOKIE)} cookie + cors(absolute@{CORS_ABSOLUTE}) + listen@{len(LISTEN_SITES)} programs) "
     f"media-client({len(MEDIA_CONTRACT_FIELDS)} contract fields@{MEDIA_CONTRACT_HOME}) "
     f"runtime({len(RUNTIME_VERBS_DENY)} denied verbs@{len(RUNTIME_SITES)} + indirection) "
-    f"embed({len(DENY_EMBED)} words) "
+    f"embed({len(DENY_EMBED)} words, scripts allow@{len(PY_ALLOW)}) "
     f"contract({len(parse_go_routes(pathlib.Path('internal/api/routes.go')))} routes) "
-    f"video-boundary resources(typed endpoint/model, no aliases) test(internal/live only)"
+    f"retired-planes(absent) resources(typed endpoint/model, no aliases) test(internal/live only)"
 )

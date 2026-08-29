@@ -51,7 +51,7 @@ type Result struct {
 // records untouched, so the previously pinned generation stays runnable.
 func Run(l home.Layout, st *records.Store, req Request) (*Result, *exit.Error) {
 	if (req.Archive == "") == (req.Dir == "") {
-		return nil, exit.Usagef("`cozy install` needs exactly one source: --from <archive.tar.gz> or --dir <tree>").
+		return nil, exit.Usagef("`cozy endpoint install` needs exactly one source: --from <archive.tar.gz> or --dir <tree>").
 			WithRemedy("--from installs a published release archive; --dir installs an editable local tree").
 			WithNext("cozy help install")
 	}
@@ -128,7 +128,7 @@ func Run(l home.Layout, st *records.Store, req Request) (*Result, *exit.Error) {
 		return nil, exit.New(exit.Conflict,
 			"%s is already installed and pinned to generation %s", gen.Endpoint+majorSuffix(gen.Major), short12(prior.InstallID)).
 			WithRemedy("install never silently upgrades; --force builds a new generation and swaps the pin").
-			WithNext("cozy install " + req.Ref.String() + " --force")
+			WithNext("cozy endpoint install " + req.Ref.String() + " --force")
 	}
 	// A --force that fails must keep the working install: exit 13, nothing mutated.
 	guard := func(err *exit.Error) (*Result, *exit.Error) {
@@ -140,7 +140,7 @@ func Run(l home.Layout, st *records.Store, req Request) (*Result, *exit.Error) {
 			"the replacement generation for %s failed; the working install (generation %s) is untouched and still runnable",
 			gen.Endpoint+majorSuffix(gen.Major), short12(prior.InstallID)).
 			WithRemedy("cause: %s — %s", err.ErrName(), err.Message).
-			WithNext("cozy ls")
+			WithNext("cozy endpoint list")
 	}
 
 	if e := checkCapacity(l.Generations, res.Bytes); e != nil {
@@ -280,7 +280,7 @@ func resolveTarget(gen *records.EndpointInstall, ref Ref) *exit.Error {
 	if gen.SourceKind == "dir" {
 		if !ref.HasMajor {
 			return exit.Usagef("an editable --dir install needs an explicit major").
-				WithRemedy("a local tree carries no release record, so the major is declared: cozy install %s@v1 --dir …", ref.Endpoint).
+				WithRemedy("a local tree carries no release record, so the major is declared: cozy endpoint install %s@v1 --dir …", ref.Endpoint).
 				WithNext("cozy help install")
 		}
 		gen.Major = ref.Major
@@ -322,13 +322,12 @@ func checkCapacity(dir string, staged int64) *exit.Error {
 	return exit.New(exit.Capacity,
 		"not enough disk to build this generation: needed %s, had %s, short by %s on %s",
 		bytesText(need), bytesText(free), bytesText(need-free), dir).
-		WithRemedy("free space or move COZY_HOME to a larger filesystem").
-		WithNext("cozy gc")
+		WithRemedy("free space, remove an installed endpoint, or move COZY_HOME to a larger filesystem").
+		WithNext("cozy endpoint list")
 }
 
-// Remove drops one install: the pin and the generation directory. The generation
-// row survives as unreferenced until `cozy gc` reclaims it, and shared-CAS weights
-// are never touched here.
+// Remove drops one install: its pin, generation row, and exclusive directory.
+// Shared TensorFS bytes are never touched here.
 func Remove(st *records.Store, endpoint string, major int) (int64, *exit.Error) {
 	pin, gen, e := st.ActivePin(endpoint, major)
 	if e != nil || pin == nil {
@@ -337,12 +336,27 @@ func Remove(st *records.Store, endpoint string, major int) (int64, *exit.Error) 
 	if e := st.Unpin(endpoint, major); e != nil {
 		return 0, e
 	}
-	var freed int64
-	if gen != nil {
-		freed = gen.BytesExcl
-		_ = os.RemoveAll(gen.Dir)
+	if gen == nil {
+		return 0, nil
 	}
-	return freed, nil
+	return Reclaim(st, gen.ID)
+}
+
+// Reclaim removes an unpinned generation immediately. The database claim wins
+// before filesystem deletion, so a newly pinned generation is never removed.
+func Reclaim(st *records.Store, id string) (int64, *exit.Error) {
+	gen, problem := st.Install(id)
+	if problem != nil || gen == nil {
+		return 0, problem
+	}
+	claimed, problem := st.ForgetIfUnreferenced(id)
+	if problem != nil || !claimed {
+		return 0, problem
+	}
+	if err := os.RemoveAll(gen.Dir); err != nil {
+		return 0, exit.Internalf("cannot remove generation directory %s: %s", gen.Dir, err)
+	}
+	return gen.BytesExcl, nil
 }
 
 func newGenerationID() (string, *exit.Error) {

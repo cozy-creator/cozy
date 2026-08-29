@@ -218,7 +218,7 @@ print(json.dumps({"digest":"sha256:"+hashlib.sha256(evidence).hexdigest(),"lengt
 		body, _ := cmd.CombinedOutput()
 		return cmd.ProcessState.ExitCode(), string(body)
 	}
-	code, output := run("install", "cozy/marco@1.0.0", "--profile", endpointprofile.CU130,
+	code, output := run("endpoint", "install", "cozy/marco@1.0.0", "--profile", endpointprofile.CU130,
 		"--major", "v1", "--reason", "managed fixture")
 	if code != 0 || !strings.Contains(output, "candidate-local") ||
 		!strings.Contains(output, "no dependency resolution") {
@@ -248,8 +248,8 @@ print(json.dumps({"digest":"sha256:"+hashlib.sha256(evidence).hexdigest(),"lengt
 	if order := strings.TrimSpace(string(mustRead(t, proofOrder))); order != "materialize\nhost\nnative\ndescriptor" {
 		t.Fatalf("endpoint code ran before local hardware proof: %q", order)
 	}
-	if code, output := run("install", "cozy/marco@1.0.0", "--profile", endpointprofile.CU130,
-		"--major", "v1", "--force", "--reason", "OCI substitution fixture"); code != 6 ||
+	if code, output := run("endpoint", "install", "cozy/marco@1.0.0", "--profile", endpointprofile.CU130,
+		"--major", "v1", "--force", "--reason", "OCI substitution fixture"); code != 1 ||
 		!strings.Contains(output, "managed_install_grant_invalid") {
 		t.Fatalf("OCI realization entered managed-local qualification [exit %d]\n%s", code, output)
 	}
@@ -258,7 +258,7 @@ print(json.dumps({"digest":"sha256:"+hashlib.sha256(evidence).hexdigest(),"lengt
 	if active == nil || active.ID != installed[0].ID {
 		t.Fatalf("OCI substitution disturbed active managed-local install: %+v", active)
 	}
-	if code, output := run("install", "cozy/marco@1.0.0", "--profile", endpointprofile.CU130,
+	if code, output := run("endpoint", "install", "cozy/marco@1.0.0", "--profile", endpointprofile.CU130,
 		"--major", "v1", "--reason", "managed fixture replay"); code != 0 ||
 		!strings.Contains(output, "already pinned") {
 		t.Fatalf("managed install replay [exit %d]\n%s", code, output)
@@ -266,8 +266,8 @@ print(json.dumps({"digest":"sha256:"+hashlib.sha256(evidence).hexdigest(),"lengt
 	wrongDigest := "sha256:" + strings.Repeat("e", 64)
 	badNativeEvidence := bytes.Replace(nativeEvidence, []byte(overlayContentDigest), []byte(wrongDigest), 1)
 	writeExecutable(t, filepath.Join(base, "bin", "cozy-native-wheel-proof"), nativeProof(badNativeEvidence))
-	if code, output := run("install", "cozy/marco@1.0.0", "--profile", endpointprofile.CU130,
-		"--major", "v1", "--force", "--reason", "native evidence mismatch fixture"); code != 6 ||
+	if code, output := run("endpoint", "install", "cozy/marco@1.0.0", "--profile", endpointprofile.CU130,
+		"--major", "v1", "--force", "--reason", "native evidence mismatch fixture"); code != 1 ||
 		!strings.Contains(output, "managed_native_evidence_invalid") {
 		t.Fatalf("managed native evidence mismatch [exit %d]\n%s", code, output)
 	}
@@ -279,8 +279,8 @@ print(json.dumps({"digest":"sha256:"+hashlib.sha256(evidence).hexdigest(),"lengt
 	writeExecutable(t, filepath.Join(base, "bin", "cozy-native-wheel-proof"), nativeProof(nativeEvidence))
 	badReceipt := bytes.Replace(runtimeReceipt, []byte(packed.Fact.Digest), []byte(wrongDigest), 1)
 	writeExecutable(t, filepath.Join(base, "bin", "cozy-environment-proof"), environmentProof(badReceipt))
-	if code, output := run("install", "cozy/marco@1.0.0", "--profile", endpointprofile.CU130,
-		"--major", "v1", "--force", "--reason", "receipt mismatch fixture"); code != 6 ||
+	if code, output := run("endpoint", "install", "cozy/marco@1.0.0", "--profile", endpointprofile.CU130,
+		"--major", "v1", "--force", "--reason", "receipt mismatch fixture"); code != 1 ||
 		!strings.Contains(output, "managed_environment_receipt_invalid") {
 		t.Fatalf("managed receipt mismatch [exit %d]\n%s", code, output)
 	}
@@ -297,8 +297,8 @@ if "describe" in sys.argv: print(json.dumps({"descriptor_digest":"sha256:`+strin
 elif "doctor" in sys.argv: print(json.dumps({"device":{"name":"NVIDIA GeForce RTX 4090","state":"present","cuda_version":"13.0"}}))
 else: raise SystemExit(2)
 `)
-	if code, output := run("install", "cozy/marco@1.0.0", "--profile", endpointprofile.CU130,
-		"--major", "v1", "--force", "--reason", "descriptor mismatch fixture"); code != 6 ||
+	if code, output := run("endpoint", "install", "cozy/marco@1.0.0", "--profile", endpointprofile.CU130,
+		"--major", "v1", "--force", "--reason", "descriptor mismatch fixture"); code != 1 ||
 		!strings.Contains(output, "managed_descriptor_mismatch") {
 		t.Fatalf("managed descriptor mismatch [exit %d]\n%s", code, output)
 	}

@@ -175,7 +175,7 @@ type DesiredPlacement struct {
 	ExactPlacementSetBytes            []byte `json:"exact_placement_set_bytes,omitempty"`
 	// PlacementRevision is Tensorhub's monotonic revision for a private rental. It is
 	// the exact DesiredWorkerState.revision Creator relays for remote placements, so Hub
-	// can compare desired, accepted, and converged without guessing a LocalService counter.
+	// can compare desired, accepted, and converged without guessing a local controller counter.
 	PlacementRevision    uint64 `json:"placement_revision,omitempty"`
 	PlacementIDValue     string `json:"placement_id,omitempty"`
 	ModelObjectSetDigest string `json:"model_object_set_digest,omitempty"`
@@ -451,6 +451,11 @@ type worker struct {
 	// For an ATTACHED worker it is zero until its first ClaimAck: the dial / plan delivery
 	// phase is bounded by its own measured progress, not by the report cadence.
 	spawned time.Time
+	// LRU is dispatch-based, not report-based: reports say the worker lives, while an
+	// accepted attempt says a user actually used it. Never-used workers fall back to
+	// residentRevision so two cold holders still have a deterministic oldest member.
+	residentRevision uint64
+	lastUseRevision  uint64
 
 	// THE NO-PROGRESS GROUND'S STATE (cl-025). progressSig is a signature over every
 	// axis the last report carried — states, revisions, plan sets, the activity lane's
@@ -496,7 +501,7 @@ func (w *worker) observeJobs(n int) {
 // a slot already hosting this placement is `none`, a slot that exists without it converges
 // and is `placement_added`, and only an absent slot is spawned or connected.
 //
-// The three answers are not decoration. `cozy start` and POST /v1/local/workers both need
+// The three answers are not decoration. `cozy invoke run` and POST /v1/local/workers both need
 // to tell an idempotent no-op from a real convergence, and a boolean `resident` could only
 // tell them "it was there", which is true of both.
 func (c *Orchestrator) EnsureWorker(spec WorkerLaunchSpec) (string, WorkerChange, *exit.Error) {
@@ -538,7 +543,7 @@ func (c *Orchestrator) EnsureWorker(spec WorkerLaunchSpec) (string, WorkerChange
 				"rental.placement_revision_required",
 				"rental %s is claimed with another desired placement",
 				live.spec.Connection.RentalID).
-				WithRemedy("use `cozy rent revise %s --endpoint-ref ...`; remote desired state always follows its active grant",
+				WithRemedy("use `cozy rental list %s --endpoint-ref ...`; remote desired state always follows its active grant",
 					live.spec.Connection.RentalID)
 		}
 		if e := c.ConvergePlacementSet(instanceID, []DesiredPlacement{spec.Placement}); e != nil {
@@ -559,7 +564,101 @@ func (c *Orchestrator) EnsureWorker(spec WorkerLaunchSpec) (string, WorkerChange
 		return id, ChangeWorkerStarted, e
 	}
 	id, e := c.spawnWorker(spec)
+	originalHolders := map[string]bool{}
+	expectedHolders := 0
+	if e != nil && e.ErrName() == "device_envelope_held" {
+		holders, problem := c.opt.Store.DeviceHolders(spec.Devices)
+		if problem != nil {
+			return "", ChangeNone, problem
+		}
+		for _, holder := range holders {
+			originalHolders[holder] = true
+		}
+		expectedHolders = len(holders)
+	}
+	// A multi-device envelope may be held by one idle serving worker per device. Each
+	// pass re-reads the ledger and may evict exactly one observed LRU holder; the bound is
+	// the requested envelope size, so concurrent/new evidence escapes instead of turning
+	// pressure handling into an unbounded machine drain.
+	for evictions := 0; e != nil && e.ErrName() == "device_envelope_held" &&
+		evictions < len(spec.Devices); evictions++ {
+		evicted, evictionProblem := c.evictLRUIdleDeviceHolder(
+			spec.Devices, originalHolders, expectedHolders)
+		if evictionProblem != nil {
+			return "", ChangeNone, evictionProblem
+		}
+		if !evicted {
+			break
+		}
+		expectedHolders--
+		id, e = c.spawnWorker(spec)
+	}
 	return id, ChangeWorkerStarted, e
+}
+
+// evictLRUIdleDeviceHolder releases one local device envelope under launch pressure.
+// Every holder conflicting with the requested envelope must be an idle local serving
+// worker; an active, remote, job, unknown, offered, reserved, or unacked holder makes the
+// conflict ineligible and preserves all workers. A changed holder set is concurrent/new
+// evidence and is never folded into the original pressure decision. The selected holder
+// is claimed under the orchestrator lock before teardown, so dispatch cannot race into it.
+func (c *Orchestrator) evictLRUIdleDeviceHolder(devices []string,
+	original map[string]bool, expected int) (bool, *exit.Error) {
+	holders, problem := c.opt.Store.DeviceHolders(devices)
+	if problem != nil || len(holders) == 0 {
+		return false, problem
+	}
+	if len(holders) != expected {
+		return false, nil
+	}
+	for _, holder := range holders {
+		if !original[holder] {
+			return false, nil
+		}
+	}
+	active, problem := c.opt.Store.ActiveRequests()
+	if problem != nil {
+		return false, problem
+	}
+
+	c.mu.Lock()
+	eligible := make([]*worker, 0, len(holders))
+	for _, instanceID := range holders {
+		w := c.workers[instanceID]
+		if !c.idleLocalServingWorkerLocked(w, active) {
+			c.mu.Unlock()
+			return false, nil
+		}
+		eligible = append(eligible, w)
+	}
+	sort.Slice(eligible, func(i, j int) bool { return lessRecentlyUsed(eligible[i], eligible[j]) })
+	victim := eligible[0]
+	victim.stopping = true
+	instanceID, endpoint := victim.instanceID, victim.spec.Placement.Endpoint
+	lastUse, resident := victim.lastUseRevision, victim.residentRevision
+	c.mu.Unlock()
+
+	c.logf("device pressure: evicting LRU idle local worker %s (%s, last_use=%d, resident=%d)",
+		instanceID, endpoint, lastUse, resident)
+	if !c.stopClaimedWorker(victim, StopGrace) {
+		return false, exit.New(exit.Conflict,
+			"idle device holder %s changed before it could be evicted", instanceID)
+	}
+	c.reviveQueue()
+	return true, nil
+}
+
+func lessRecentlyUsed(a, b *worker) bool {
+	if (a.lastUseRevision == 0) != (b.lastUseRevision == 0) {
+		return a.lastUseRevision == 0
+	}
+	if a.lastUseRevision != b.lastUseRevision {
+		return a.lastUseRevision < b.lastUseRevision
+	}
+	if a.residentRevision != b.residentRevision {
+		return a.residentRevision < b.residentRevision
+	}
+	return a.instanceID < b.instanceID
 }
 
 // EnsureRental makes an already-provisioned rental's worker resident without invoking
@@ -567,7 +666,7 @@ func (c *Orchestrator) EnsureWorker(spec WorkerLaunchSpec) (string, WorkerChange
 // actual hardware readback before a request can be submitted to the pod.
 func (c *Orchestrator) EnsureRental(id string) (string, string, WorkerChange, *exit.Error) {
 	if c.opt.Rentals == nil {
-		return "", "", ChangeNone, exit.Unavailablef("this LocalService attaches no rented workers")
+		return "", "", ChangeNone, exit.Unavailablef("this local controller attaches no rented workers")
 	}
 	target, problem := c.opt.Rentals(id)
 	if problem != nil {
@@ -739,6 +838,8 @@ func (c *Orchestrator) spawnWorker(spec WorkerLaunchSpec) (string, *exit.Error) 
 	// Registered BEFORE the process can dial: a worker that registers faster than its
 	// launcher can record it would be refused as an instance nobody spawned.
 	c.mu.Lock()
+	c.residentRevision++
+	w.residentRevision = c.residentRevision
 	c.workers[instanceID] = w
 	c.mu.Unlock()
 
@@ -884,7 +985,7 @@ func (c *Orchestrator) connectWorker(spec WorkerLaunchSpec) (string, *exit.Error
 			WithRemedy("a rented pod runs its worker and a co-resident media server " +
 				"(cl-014); this host will not fall back to granting paths on its own disk, " +
 				"because the pod cannot reach them").
-			WithNext("cozy rent ls")
+			WithNext("cozy rental list")
 	}
 	// THE SAME SILENCE BUDGET THE CONTROL LEG LIVES UNDER. One pod, two listeners, one
 	// standard for "has not answered": a byte plane that misses what eight report periods
@@ -1182,7 +1283,7 @@ func (c *Orchestrator) Worker(instanceID string) *WorkerFacts {
 }
 
 // Workers is every worker this service currently owns — the LOCAL extension module's
-// listing (cl-006) and `cozy status`'s source.
+// listing (cl-006) and `cozy invoke list`'s source.
 func (c *Orchestrator) Workers() []WorkerFacts {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -1269,7 +1370,7 @@ type ArtifactSubjectFacts struct {
 
 // trimEnum renders a protocol enum by its own name, minus the type prefix proto3's
 // package-level value scoping forces onto it. The NUMBERS are normative; this is for a
-// person reading `cozy status`.
+// person reading `cozy invoke list`.
 func trimEnum(name, prefix string) string {
 	if name == "" {
 		return "UNSPECIFIED"
@@ -1296,28 +1397,6 @@ func keysOf(m map[string]bool) []string {
 // become ready, and 30 s on the API route, with nothing anywhere saying why the same
 // SIGTERM deserved three budgets.
 const StopGrace = 30 * time.Second
-
-// RetirePlacement converges a live worker onto the desired set WITHOUT this placement —
-// the honest first half of taking one out of service, and a verb of its own because it is
-// not the same act as ending a process (#484). The worker drains what it holds; nothing
-// here waits, because a drain's completion is an OBSERVED fact (converged_revision) and
-// not something a caller can be told synchronously.
-//
-// Retiring the only placement leaves an empty set, which is a worker hosting nothing —
-// legal, and what a slot being replaced should look like before its process is stopped.
-func (c *Orchestrator) RetirePlacement(instanceID, placementID string) *exit.Error {
-	c.mu.Lock()
-	w := c.workers[instanceID]
-	c.mu.Unlock()
-	if w == nil {
-		return exit.New(exit.NotFound, "no worker %s on this host", instanceID)
-	}
-	if w.placementID != placementID {
-		return exit.New(exit.NotFound, "worker %s hosts placement %s, not %s",
-			instanceID, w.placementID, placementID)
-	}
-	return c.retireWorker(w)
-}
 
 // retireWorker is the generation-fenced retirement used by the stall path. A recovered
 // worker intentionally reuses instance and placement ids; only the exact object whose
@@ -1369,6 +1448,16 @@ func (c *Orchestrator) shutdownWorker(w *worker, grace time.Duration) bool {
 		return false
 	}
 	w.stopping = true
+	c.mu.Unlock()
+	return c.stopClaimedWorker(w, grace)
+}
+
+// stopClaimedWorker completes teardown after the caller has atomically withdrawn the
+// worker from selection by setting stopping. Keeping the claim separate lets `unload`
+// stop only a worker it proved idle without reopening a dispatch race between proof and
+// teardown.
+func (c *Orchestrator) stopClaimedWorker(w *worker, grace time.Duration) bool {
+	c.mu.Lock()
 	cancelControl := w.cancelControl
 	attachDone, processDone := w.attachDone, w.processDone
 	pid, exited := 0, w.exited
@@ -1424,6 +1513,72 @@ func (c *Orchestrator) shutdownWorker(w *worker, grace time.Duration) bool {
 		c.logf("worker %s stopped; its device grant is released", w.instanceID)
 	}
 	return true
+}
+
+// UnloadIdleLocalWorkers stops every definitely-idle local serving worker. Remote
+// workers are paid resources owned by the rental lifecycle, job workers are run-once,
+// and any active request, outstanding offer, reservation, or unacked terminal keeps a
+// worker alive. Process exit is the reliable release of its GPU-resident model.
+func (c *Orchestrator) UnloadIdleLocalWorkers() ([]WorkerFacts, *exit.Error) {
+	active, e := c.opt.Store.ActiveRequests()
+	if e != nil {
+		return nil, e
+	}
+
+	c.mu.Lock()
+	candidates := make([]*worker, 0, len(c.workers))
+	for _, w := range c.workers {
+		if w.spec.Connection == nil && !w.spec.IsJob() {
+			candidates = append(candidates, w)
+		}
+	}
+	c.mu.Unlock()
+	sort.Slice(candidates, func(i, j int) bool {
+		return candidates[i].instanceID < candidates[j].instanceID
+	})
+
+	stopped := make([]WorkerFacts, 0, len(candidates))
+	for _, w := range candidates {
+		c.mu.Lock()
+		if !c.idleLocalWorkerLocked(w, active) {
+			c.mu.Unlock()
+			continue
+		}
+		facts := factsOf(w)
+		w.stopping = true
+		c.mu.Unlock()
+		if c.stopClaimedWorker(w, StopGrace) {
+			stopped = append(stopped, facts)
+		}
+	}
+	if len(stopped) > 0 {
+		c.reviveQueue()
+	}
+	return stopped, nil
+}
+
+func (c *Orchestrator) idleLocalWorkerLocked(w *worker, active []records.Request) bool {
+	if w == nil || c.workers[w.instanceID] != w || w.exited || w.stopping ||
+		w.spec.Connection != nil || w.spec.IsJob() || w.reservedSlots != 0 || w.unacked != 0 {
+		return false
+	}
+	for _, reservation := range c.offers {
+		if reservation.worker == w {
+			return false
+		}
+	}
+	for _, req := range active {
+		if req.Worker == "" && staged(w, req.PlanID) {
+			return false
+		}
+	}
+	return true
+}
+
+func (c *Orchestrator) idleLocalServingWorkerLocked(w *worker, active []records.Request) bool {
+	return c.idleLocalWorkerLocked(w, active) &&
+		w.serving == pb.ServingState_SERVING_STATE_DISPATCHABLE &&
+		w.admission == pb.AdmissionState_ADMISSION_STATE_OPEN
 }
 
 // Reconcile runs at boot, before anything is served. Rows describing processes from a

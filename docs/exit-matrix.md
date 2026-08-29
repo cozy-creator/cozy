@@ -1,8 +1,12 @@
-# Exit matrix (frozen)
+# Error vocabulary
 
-Copied verbatim from tracker-v2 `cozy-runtime-cli.md`. `cozy` uses it unchanged — no
-local-only codes. `scripts/fence.py` checks `internal/exit/exit.go` against this table
-(code, name and meaning, row for row); editing one side alone turns the fence red.
+This table is the detailed domain and HTTP refusal vocabulary. `scripts/fence.py` checks
+`internal/exit/exit.go` against it row for row. The CLI preserves each symbolic name in its
+structured error document, but deliberately projects shell exits onto three outcomes:
+
+- `0`: success or idempotent no-op.
+- `2`: invocation or configuration error.
+- `1`: every operational failure, including a failed/canceled invocation terminal.
 
 | code | name | meaning |
 |---|---|---|
@@ -22,4 +26,5 @@ local-only codes. `scripts/fence.py` checks `internal/exit/exit.go` against this
 | 13 | conflict | target exists / concurrent writer / failed replacement kept the working state |
 | 14 | capacity | no proven plan fits BELOW the physical floor — quantified shortfall (needed N, had M, short by N−M for X); fires only after the ladder's deepest authorized rung, never exit 6, never a silent 0 |
 
-Job terminals map onto it: succeeded 0 · failed 11 · canceled 12 · deadline 10.
+The numeric values above remain useful inside the API/domain boundary and for HTTP status
+projection; they are not the CLI process's exit status except for `ok`, `internal`, and `usage`.

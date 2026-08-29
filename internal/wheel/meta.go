@@ -59,7 +59,7 @@ var (
 func malformed(format string, args ...any) *exit.Error {
 	return exit.Named(exit.Validation, "metadata_malformed", format, args...).
 		WithRemedy("the packer reads metadata as DATA; it cannot ask a build backend what the project meant").
-		WithNext("cozy pack --help")
+		WithNext("cozy help endpoint publish")
 }
 
 // read parses the two metadata files a tree may carry. A tree with neither is legal:

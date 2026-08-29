@@ -90,7 +90,7 @@ func MaterializeEnvironment(sourceDir, venvDir string) (*EnvironmentReceipt, *ex
 }
 
 // Disk measures one generation exactly once, at install: bytes only this generation
-// holds, and bytes it shares with another venv through a hardlink. `cozy ls` reads
+// holds, and bytes it shares with another venv through a hardlink. `cozy endpoint list` reads
 // these numbers back out of the record — it never walks 122k files.
 func Disk(dir string) (exclusive, shared int64) {
 	_ = filepath.WalkDir(dir, func(p string, d fs.DirEntry, err error) error {

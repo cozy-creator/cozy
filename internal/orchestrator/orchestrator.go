@@ -1,6 +1,6 @@
 // Package orchestrator is the local client's EMBEDDED ORCHESTRATOR (#455; the record-plane
 // owner of every worker this service runs): the scheduling role of the ONE long-lived
-// LocalService `cozy up` starts (cl-001). Since the 2026-08-25 re-landing (#436) the
+// local controller `cozy invoke list` starts (cl-001). Since the 2026-08-25 re-landing (#436) the
 // WORKER hosts the protocol and this side DIALS it: each spawned worker binds its own
 // local socket, and this owner claims it (Claim -> ClaimAck -> snapshot -> SnapshotAck)
 // before any dispatch. It is the authority for everything the runtime deliberately is
@@ -34,7 +34,7 @@ import (
 	pb "github.com/cozy-creator/cozy-creator/protocol/cozy/worker/v1"
 )
 
-// Options is the frozen input to one LocalService. Every field is decided by the
+// Options is the frozen input to one local controller. Every field is decided by the
 // entrypoint; nothing in this package reads the environment.
 type Options struct {
 	Cfg    config.Config
@@ -51,7 +51,7 @@ type Options struct {
 	// capacity that nothing would ever create.
 	Endpoints Launcher
 
-	// Rentals resolves an attached-worker id (`cozy rent`'s persisted triple) to its
+	// Rentals resolves an attached-worker id (`cozy rental new`'s persisted triple) to its
 	// dial spec. Wired by the entrypoint; nil = this service attaches no remote workers.
 	Rentals func(id string) (*RemoteTarget, *exit.Error)
 	// ObserveRental persists the remote worker's ClaimAck readback. Selection intent is
@@ -62,9 +62,6 @@ type Options struct {
 	// called only after the worker snapshot barrier is acknowledged. The source owns
 	// revision persistence and authentication; the orchestrator only relays the grant.
 	ArtifactGrants ArtifactGrantSource
-	// PlacementRevisions asks Tensorhub to author and durably publish one new desired
-	// placement for this same live rental. It returns exact validated placement bytes.
-	PlacementRevisions PlacementRevisionSource
 	// RelayRentalSession returns authenticated private-worker evidence to Tensorhub.
 	// This RecordOwner remains the only process that dials WorkerControl: the callback
 	// carries deterministic frame bytes over the rental-scoped HTTP authority and never
@@ -84,9 +81,6 @@ type Options struct {
 }
 
 type ArtifactGrantSource func(context.Context, *WorkerConnection) (uint64, *pb.ArtifactGrant, *exit.Error)
-type PlacementRevisionSource func(context.Context, *WorkerConnection, string, string, string) (
-	DesiredPlacement, uint64, *exit.Error)
-
 type RentalSessionEvidence struct {
 	ClaimAck        []byte
 	Snapshot        []byte
@@ -116,8 +110,8 @@ type RentalObservation struct {
 type Launcher interface {
 	ResolvePlacement(endpoint string) (DesiredPlacement, *exit.Error)
 	Resolve(endpoint string) (WorkerLaunchSpec, *exit.Error)
-	// ResolveInstall relaunches one exact immutable local install. Workflow recovery
-	// uses it so a changed active pin cannot change an already-accepted child.
+	// ResolveInstall relaunches the immutable local install a durable request resolved
+	// before entering the queue, so a changed pin cannot change accepted work.
 	ResolveInstall(installID string) (WorkerLaunchSpec, *exit.Error)
 	// ResolveJob is the JOB lane's half: `org/name` plus a job function to the spec that
 	// makes THAT job's worker resident. It is a separate method rather than a flag
@@ -127,7 +121,7 @@ type Launcher interface {
 	ResolveJob(endpoint, function string) (WorkerLaunchSpec, *exit.Error)
 }
 
-// Orchestrator is the LocalService's scheduling role.
+// Orchestrator is the local controller's scheduling role.
 type Orchestrator struct {
 	opt Options
 
@@ -165,17 +159,15 @@ type Orchestrator struct {
 	// ensuring is the per-instance creation fence beneath every caller, including journal
 	// recovery. `starting` serializes queue policy; this prevents two callers that already
 	// chose the same deterministic slot from spawning two processes into it.
-	ensuring map[string]chan struct{}
-	revision uint64 // hub-owned, monotonic; every Directive bumps it
-	events   []string
+	ensuring         map[string]chan struct{}
+	revision         uint64 // hub-owned, monotonic; every Directive bumps it
+	residentRevision uint64 // local serving-worker arrival order; tie-breaks never-used LRU rows
+	lastUseRevision  uint64 // successful local serving dispatch order
+	events           []string
 
 	// frames is the LOSSY live lane's fanout (stream.go). The durable lane is rows in
 	// the records authority; these two are the whole event surface cl-006 serves.
 	frames *fanout
-
-	// workflowWake is an observation-only nudge installed by Creator's local workflow
-	// engine. Durable rows remain authority; a missed wake is covered by reconciliation.
-	workflowWake func()
 }
 
 type wait struct {
@@ -187,7 +179,7 @@ type wait struct {
 }
 
 // Open builds the orchestrator. No listener binds here: the owner DIALS each worker's
-// own socket (#436); a second LocalService on one root fails on the service lock instead.
+// own socket (#436); a second local controller on one root fails on the service lock instead.
 func Open(opt Options) (*Orchestrator, *exit.Error) {
 	if opt.Log == nil {
 		opt.Log = io.Discard
@@ -277,21 +269,6 @@ func (c *Orchestrator) Events() []string {
 // Store is the lifecycle authority this orchestrator writes. cl-006's API reads requests,
 // attempts, outputs and durable events through it — the same rows, never a second copy.
 func (c *Orchestrator) Store() *records.Store { return c.opt.Store }
-
-func (c *Orchestrator) SetWorkflowWake(wake func()) {
-	c.mu.Lock()
-	c.workflowWake = wake
-	c.mu.Unlock()
-}
-
-func (c *Orchestrator) wakeWorkflows() {
-	c.mu.Lock()
-	wake := c.workflowWake
-	c.mu.Unlock()
-	if wake != nil {
-		wake()
-	}
-}
 
 // Layout is the local root this orchestrator grants into.
 func (c *Orchestrator) Layout() home.Layout { return c.opt.Layout }
@@ -681,7 +658,6 @@ func (c *Orchestrator) CancelQueued(requestID string) *exit.Error {
 	c.logf("%s left the dispatch queue: canceled before any attempt", requestID)
 	c.waitRequest(requestID).markClosed(
 		exit.New(exit.Canceled, "%s was canceled before any attempt was dispatched", requestID))
-	c.wakeWorkflows()
 	return nil
 }
 

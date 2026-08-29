@@ -1,6 +1,7 @@
 package api
 
 import (
+	"bytes"
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
@@ -32,9 +33,6 @@ type Submission struct {
 	Function string          `json:"function"`
 	Input    json.RawMessage `json:"input"`
 	Outputs  []string        `json:"outputs,omitempty"`
-	Model    string          `json:"model,omitempty"`
-	Lane     string          `json:"lane,omitempty"`
-	Adapter  string          `json:"adapter,omitempty"`
 	PlanID   string          `json:"plan_id,omitempty"`
 	// LocalAssets is the local API's out-of-band input set. Each source path is ingested into
 	// the service-owned immutable input store before the request row exists; it never
@@ -77,7 +75,17 @@ func (s *Server) submit(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var sub Submission
-	if err := json.Unmarshal(body, &sub); err != nil {
+	decoder := json.NewDecoder(bytes.NewReader(body))
+	decoder.DisallowUnknownFields()
+	err = decoder.Decode(&sub)
+	var trailing any
+	if err == nil {
+		err = decoder.Decode(&trailing)
+		if err == nil {
+			err = fmt.Errorf("multiple JSON values")
+		}
+	}
+	if err != io.EOF {
 		s.refuse(w, r, http.StatusBadRequest, "malformed_body",
 			"the submission is not a JSON object: "+err.Error(), "")
 		return
@@ -91,7 +99,7 @@ func (s *Server) submit(w http.ResponseWriter, r *http.Request) {
 	if len(sub.LocalAssets) > 0 && !s.cliAuthenticated(r) {
 		s.refuse(w, r, http.StatusForbidden, "cli_credential_required",
 			"local_assets may name host filesystem paths and require the OS-protected CLI credential",
-			"use `cozy run --asset <field-path>=<file>`; this build exposes no browser asset-upload route")
+			"use `cozy invoke run --asset <field-path>=<file>`; this build exposes no browser asset-upload route")
 		return
 	}
 	// Staging bytes and recording their request are one ownership handoff even though the
@@ -101,17 +109,6 @@ func (s *Server) submit(w http.ResponseWriter, r *http.Request) {
 		unlock := inputasset.Guard()
 		defer unlock()
 	}
-	// Overrides are ADMISSIBLE HERE and refuse typed on public serving (th-021's
-	// surface scoping). Locally the override is always available — but the machinery
-	// that resolves one is cl-005's, so this host refuses the FIELD rather than
-	// pretending to honour it. An override that is silently ignored is the worse bug.
-	if sub.Model != "" || sub.Lane != "" || sub.Adapter != "" {
-		s.refuse(w, r, http.StatusNotImplemented, "override_unresolved",
-			"model/lane/adapter overrides are admissible on this host but nothing resolves one yet",
-			"the local binding resolver lands with cl-005; this host refuses rather than ignoring it")
-		return
-	}
-
 	key := strings.TrimSpace(r.Header.Get("Idempotency-Key"))
 	existing, e := s.store.RequestByIdempotencyKey(key)
 	if e != nil {
@@ -292,7 +289,7 @@ func (s *Server) resolvePlan(sub Submission) (orchestrator.Submission, *exit.Err
 	var remotePlacement *orchestrator.DesiredPlacement
 	if out.Worker != "" {
 		if s.rentals == nil {
-			return out, exit.Unavailablef("this LocalService attaches no remote workers")
+			return out, exit.Unavailablef("this local controller attaches no remote workers")
 		}
 		var e *exit.Error
 		remotePlacement, e = s.rentals(out.Worker)
@@ -334,7 +331,7 @@ func (s *Server) resolvePlan(sub Submission) (orchestrator.Submission, *exit.Err
 	} else {
 		var placement orchestrator.DesiredPlacement
 		if s.endpoints == nil {
-			return out, exit.Unavailablef("this LocalService resolves no endpoints")
+			return out, exit.Unavailablef("this local controller resolves no endpoints")
 		}
 		var e *exit.Error
 		placement, e = s.endpoints.ResolvePlacement(sub.Endpoint)
@@ -351,6 +348,7 @@ func (s *Server) resolvePlan(sub Submission) (orchestrator.Submission, *exit.Err
 				sub.Endpoint, sub.Function, planID, out.PlanID)
 		}
 		out.PlanID = planID
+		out.InstallID = placement.InstallID
 		if len(out.Outputs) == 0 {
 			out.Outputs = outputs
 		}
@@ -443,6 +441,7 @@ func (s *Server) stageAssets(assets []records.AssetBinding) ([]records.AssetBind
 // fields a local client has and a cloud one does not need to presign: the typed result,
 // the visible media by OPAQUE id, and the triage handle.
 type Lifecycle struct {
+	Kind        string         `json:"kind"`
 	RequestID   string         `json:"request_id"`
 	Status      string         `json:"status"`
 	Endpoint    string         `json:"endpoint"`
@@ -497,8 +496,12 @@ func (s *Server) getRequest(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) lifecycleOf(row records.Request) Lifecycle {
+	kind := "invocation"
+	if row.IsJob() {
+		kind = "job"
+	}
 	life := Lifecycle{
-		RequestID: row.ID, Status: contractStatus(row.State), Endpoint: row.Endpoint,
+		Kind: kind, RequestID: row.ID, Status: contractStatus(row.State), Endpoint: row.Endpoint,
 		Function: row.Entrypoint, Attempt: uint64(row.Ordinal),
 		ResponseURL: "/v1/requests/" + row.ID, CreatedAt: row.CreatedAt,
 		Outputs: []MediaRef{},

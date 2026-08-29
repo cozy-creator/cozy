@@ -215,7 +215,6 @@ func modelObjectSetSubject(p DesiredPlacement) *pb.ArtifactSubject {
 // "your message arrived" and "your intent is satisfied" — are now two separate readable
 // numbers (#473).
 func (c *Orchestrator) onObserved(s *session, r *pb.ObservedWorkerState, frameBytes []byte) {
-	defer c.wakeWorkflows()
 	var status *pb.PlacementStatus
 	var acquisition *records.PlacementAcquisition
 	var desiredRevision uint64
@@ -536,6 +535,12 @@ func (c *Orchestrator) onAccepted(s *session, a *pb.AttemptAccepted) {
 		c.logf("AttemptAccepted for %s#%d REFUSED: %s", a.RequestId, ordinal, e.Message)
 		return
 	}
+	c.mu.Lock()
+	if w := c.workers[row.InstanceID]; w != nil && w.spec.Connection == nil && !w.spec.IsJob() {
+		c.lastUseRevision++
+		w.lastUseRevision = c.lastUseRevision
+	}
+	c.mu.Unlock()
 	c.settleDispatch(a.RequestId, ordinal, true)
 	c.logf("AttemptAccepted %s#%d placement=%s generation=%d plan=%s construction=%s [%s]",
 		a.RequestId, ordinal, a.PlacementId, a.ExecutorGeneration,
@@ -780,7 +785,6 @@ func (c *Orchestrator) onOutcome(s *session, t *pb.AttemptOutcome) {
 // recovery. It is intentionally idempotent: cleanup and BeginRequeue both have durable
 // guards, so a replay cannot spend twice or delete a still-owned asset.
 func (c *Orchestrator) afterAck(req records.Request, attempt records.Attempt, holder *worker) {
-	defer c.wakeWorkflows()
 	requeue := req.State == "requeue_pending"
 	c.cleanupAttempt(req, uint64(attempt.Attempt), holder, !requeue)
 	verdict := outcomeError(attempt.TerminalStatus, attempt.TerminalCause, attempt.SafeMessage)

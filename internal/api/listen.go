@@ -28,13 +28,15 @@ import (
 // refusing to start there would be a worse bug than serving v4 only. What it returns is
 // the truth about which families are live, so `doctor` can say so.
 func Listeners(port int) (v4 net.Listener, v6 net.Listener, addr string, e *exit.Error) {
-	addr = "127.0.0.1:" + strconv.Itoa(port)
-	v4, err := listenLoopback("tcp4", addr)
+	wanted := "127.0.0.1:" + strconv.Itoa(port)
+	v4, err := listenLoopback("tcp4", wanted)
 	if err != nil {
-		return nil, nil, "", exit.New(exit.Conflict, "%s is held by another process: %s", addr, err).
-			WithRemedy("choose another port with --port, or stop what holds it")
+		return nil, nil, "", exit.New(exit.Conflict, "%s is held by another process: %s", wanted, err).
+			WithRemedy("set another port in config.yaml, or stop what holds it")
 	}
-	if l, err := listenLoopback("tcp6", "[::1]:"+strconv.Itoa(port)); err == nil {
+	actual := v4.Addr().(*net.TCPAddr).Port
+	addr = "127.0.0.1:" + strconv.Itoa(actual)
+	if l, err := listenLoopback("tcp6", "[::1]:"+strconv.Itoa(actual)); err == nil {
 		v6 = l
 	}
 	return v4, v6, addr, nil

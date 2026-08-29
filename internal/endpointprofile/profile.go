@@ -52,5 +52,3 @@ func NormalizeSet(raw []string) ([]string, *exit.Error) {
 	sort.Strings(out)
 	return out, nil
 }
-
-func Approved() []string { return []string{CPU, CU126, CU130} }

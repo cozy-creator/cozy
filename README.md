@@ -1,346 +1,199 @@
 # Cozy Creator
 
-Cozy Creator is a local-first command-line application for running generative-media
-endpoints. Install an endpoint once, run it on your own machine or a rented GPU, and keep
-the resulting media and execution history under your control.
+Cozy Creator is a local-first command-line application for generative media. It installs
+endpoint code, downloads models, runs endpoint callables on your machine or a private rented
+worker, and keeps your local execution records and outputs under your control.
 
-The command is named `cozy`.
-
-## What you can do
-
-- Install versioned endpoint releases with locked Python environments.
-- Run generative-media functions locally.
-- Rent a remote GPU through Tensorhub and send work to that exact worker.
-- Search the public endpoint and model catalogs.
-- Download and publish verified model checkpoints.
-- Compose multi-shot videos and submit durable workflows or jobs.
-- Inspect logs, outputs, resource fit, costs, and execution status.
-- Use stable JSON output from scripts and other applications.
-
-Cozy Creator consists of a small CLI and one local background service. The service owns
-endpoint processes and durable execution records; normal `cozy` commands talk to it over
-localhost.
-
-## Project status
-
-Cozy Creator is currently early-access software. There are no published binary releases
-yet, so installation currently requires access to this source repository. Several
-cloud-facing commands are also still marked as planned. Run `cozy commands` to see
-exactly what your installed build supports. Planned commands have a `*` beside their
-names.
+The command is `cozy`.
 
 ## Install
 
-### Requirements
-
-- Go 1.26 or newer while binary releases are unavailable.
-- [`uv`](https://docs.astral.sh/uv/) to install endpoint environments.
-- An NVIDIA GPU and compatible driver only for endpoints that require CUDA.
-- The `tfs` executable only when downloading or publishing model checkpoints.
-
-Clone the repository using your GitHub access, then install the current build:
+Binary releases are not published yet. Building from source currently requires Go 1.26 or
+newer. Endpoint installation also uses `uv`; model download and publication use the `tfs`
+executable from TensorFS.
 
 ```sh
-git clone git@github.com:cozy-creator/cozy-creator.git
+git clone https://github.com/cozy-creator/cozy-creator.git
 cd cozy-creator
 go build -o cozy .
-mkdir -p ~/.local/bin
 install -m 0755 ./cozy ~/.local/bin/cozy
+cozy -v
 ```
 
-Make sure `~/.local/bin` is on `PATH`, then confirm the installation:
-
-```sh
-cozy version
-```
-
-On Windows, build `cozy.exe` and move it into a directory on `PATH`:
+On Windows, build `cozy.exe` and place it in a directory on `PATH`:
 
 ```powershell
 go build -o cozy.exe .
 ```
 
-If you have received a release archive and its `SHA256SUMS`, use the included installer:
+## Discover commands
 
-```sh
-scripts/install.sh --asset ./cozy-<version>-linux-amd64.tar.gz
-```
-
-On Windows, use `scripts/install.ps1 -Asset <archive>` instead. Both installers verify
-the checksum before replacing an existing installation.
-
-## Start Cozy
-
-Start the local service in the background:
-
-```sh
-cozy up -d
-```
-
-Then inspect the current state:
+Running Cozy without arguments shows its complete launch surface. Help and version never load
+configuration or start a background process.
 
 ```sh
 cozy
-cozy doctor
+cozy help endpoint install
+cozy help invoke run
+cozy -v
 ```
 
-Running `cozy` with no command shows the command overview, global flags, and examples.
-`cozy status` is the operational dashboard for the service, installed endpoints, workers,
-jobs, and workflows.
+There is no public stack, `up`, or `down` command. Commands that need durable coordination
+automatically start one lightweight per-user controller. Installed endpoints and downloaded
+models remain files on disk until an invocation needs them.
 
-Stop the service when you are finished:
+## Endpoints
 
-```sh
-cozy down
-```
-
-Stopping Cozy drains its endpoint processes. It does not delete installed endpoints,
-execution records, or outputs.
-
-## Install an endpoint
-
-An endpoint release is a `.tar.gz` archive containing the endpoint code, its descriptor,
-and a locked dependency environment. Install it using the digest supplied by its
-publisher:
+Search the Tensorhub catalog, install an endpoint, and inspect local installations:
 
 ```sh
-cozy install org/endpoint \
-  --from ./endpoint-1.0.0.tar.gz \
-  --digest sha256:<digest>
-```
-
-Inspect what was installed:
-
-```sh
-cozy ls
-cozy describe org/endpoint
-cozy fit org/endpoint
-```
-
-`cozy install` verifies the archive before executing anything from it. The
-`--allow-unsigned` option exists for local development, but should not be used for an
-endpoint obtained from someone else.
-
-## Run an endpoint
-
-Invoke a function by its full reference:
-
-```sh
-cozy run org/endpoint/v1/generate "a watercolor lighthouse at dusk" \
-  --out ./outputs
-```
-
-Arguments can be supplied as `key=value` pairs or as one JSON document:
-
-```sh
-cozy run org/endpoint/v1/generate prompt="a red bicycle" --seed 7
-cozy run org/endpoint/v1/generate --in ./request.json --out ./outputs
-```
-
-Local execution is the default. Cozy starts the endpoint when it is first needed. To
-prewarm it explicitly:
-
-```sh
-cozy start org/endpoint -d
-```
-
-Useful runtime commands:
-
-```sh
-cozy status
-cozy logs org/endpoint
-cozy stop org/endpoint
-cozy media ls
-```
-
-Use `--stream` on `cozy run` for newline-delimited progress and `--timeout <duration>` to
-set a request deadline.
-
-## Use a rented GPU
-
-Configure Tensorhub first, then request a worker for an endpoint:
-
-```sh
-cozy rent org/endpoint \
-  --accelerator <gpu-model> \
-  --reason "video generation" \
-  --idempotency-key <unique-key>
-```
-
-List the rentals attached to this machine and verify a ready worker:
-
-```sh
-cozy rent ls
-cozy rent probe <rental-id>
-```
-
-Send an invocation to that worker:
-
-```sh
-cozy run org/endpoint/v1/generate "a moonlit mountain lake" \
-  --worker <rental-id> \
-  --out ./outputs
-```
-
-Rentals can incur charges until they are explicitly released. Preview the release, then
-confirm it:
-
-```sh
-cozy rent release <rental-id>
-cozy rent release <rental-id> --yes
-```
-
-A timeout while waiting for a rental does not destroy the pod. Check `cozy rent ls` and
-release it when it is no longer needed.
-
-## Endpoint publication and profiles (cl-039/cl-043)
-
-`cozy endpoint publish <org/name> --release <id> --profile <profile> ...` snapshots one
-clean committed source subtree, creates a deterministic provenance archive and pure
-project wheel, canonicalizes the reviewed descriptor/config, and drives Tensorhub's exact
-`begin` → presigned missing-role PUTs → `finalize` route pair. The declaration carries no
-path, credential, URL, image, or command. Its explicit sorted profile set has no mutable
-default. Exact replay sends the same canonical declaration and lets Tensorhub return the
-same pending/committed result; Creator keeps no publication journal.
-
-`endpoint.release.json` is required and contains a non-empty sorted compatible-accelerator-model
-set. Even a weightless endpoint fixes that set because publication may qualify only an
-already-authored execution identity; it cannot mutate release compatibility. The file also carries
-exact `{org,name,checkpoint_id}` model roots,
-and complete path-free model bindings: binding path, checkpoint, exact config document/
-asset refs, construction-order execution layout, and hardware variant. A descriptor with
-model inputs and no bindings refuses before upload. `endpoint.evaluated-config.json` is
-canonicalized when present; its absent weightless spelling is `{}`.
-
-The project wheel is exactly one `py3-none-any` wheel. Repeatable
-`--custom-wheel <profile>=<path>` values are separately inspected immutable prebuilt
-wheels, aggregated by exact digest, and uploaded only under Tensorhub-requested
-`custom_wheel:<distribution>:<digest>` roles. Creator runs no backend/compiler, embeds no
-custom wheel into the project wheel, and never repairs, renames, or retags one.
-
-`cozy endpoint promote <org/name> <release> --serve <vN/function> ...` atomically moves
-one or more serving pointers for profiles made eligible by publication proof; a bare major has no
-guessed function. Publication never rents implicitly.
-`datasets push|pull` waits on th-035.
-
-See [docs/endpoint-publication.md](docs/endpoint-publication.md) for the release file, custom-wheel,
-eligibility, promotion, and independently proved managed-local install contracts.
-
-## Tensorhub catalog and models
-
-Catalog reads are public:
-
-```sh
-cozy hub status
 cozy endpoint search video
-cozy endpoint show org/endpoint
+cozy endpoint search org/name
+cozy endpoint install org/name@release \
+  --profile torch2.13.0-cu130-cp312-linux-x86 \
+  --major v1 \
+  --reason "local install"
+cozy endpoint list
+```
+
+For local endpoint development, install a source tree explicitly:
+
+```sh
+cozy endpoint install org/name --dir ./my-endpoint --allow-unsigned
+```
+
+Remove local endpoint generations with:
+
+```sh
+cozy endpoint remove org/name
+```
+
+Publishing packages one deterministic pure project wheel and an explicit compatibility-profile
+set. The endpoint name is created automatically when absent:
+
+```sh
+cozy endpoint publish org/name \
+  --release 1.0.0 \
+  --profile torch2.13.0-cu130-cp312-linux-x86 \
+  --dir . \
+  --reason "release 1.0.0"
+```
+
+Tensorhub owns hardware qualification and serving promotion; publication does neither implicitly.
+See [endpoint publication](docs/endpoint-publication.md) for the release contract.
+
+## Models
+
+Model checkpoints live in the local TensorFS store:
+
+```sh
 cozy model search flux
-cozy model show org/model
+cozy model download org/model@release --lane task=text-to-image
+cozy model list
+cozy model remove org/model
 ```
 
-Model transfers require the `tfs` executable. Downloads are verified and resumable:
+Publish an existing canonical TensorFS snapshot. The remote model name is created automatically
+when absent:
 
 ```sh
-cozy model download org/model@release --lane task=text-to-video
+cozy model publish org/model sha256:<snapshot> --reason "initial release"
 ```
 
-Creating catalog entries, publishing models, and renting workers require the configured
-Tensorhub token. Account login is not part of the current early-access release.
+Download and publication are resumable and verify content identities before making a local or
+remote root visible.
 
-## Videos, workflows, and jobs
+## Invoke endpoints and jobs
 
-Cozy can turn an editable `cozy.video/1` YAML file into a durable workflow:
+Serving entrypoints and bounded jobs use the same command. Cozy reads the installed descriptor
+to determine the callable lifecycle:
 
 ```sh
-cozy video compose ./film.cozy-video.yaml --h3 org/h3 --out ./film.plan.json
-cozy video submit ./film.cozy-video.yaml \
-  --h3 org/h3 \
+cozy invoke run org/endpoint/v1/generate \
+  prompt="a watercolor lighthouse at dusk" \
+  --out ./outputs
+
+cozy invoke run org/endpoint/v1/train epochs=3 --detach
+cozy invoke list
+cozy invoke cancel <invocation-or-job-id>
+```
+
+An attached invocation follows progress and returns its terminal result. `--detach` returns after
+durable acceptance. Reusing an explicit `--idempotency-key` safely returns the same recorded work.
+
+Local Runtime workers start on demand. Successful serving workers may remain resident for warm
+reuse; job workers are reclaimed at terminal.
+
+## Private rentals
+
+With Tensorhub configured, rent a private worker for an exact endpoint:
+
+```sh
+cozy rental new org/endpoint@release \
+  --accelerator "NVIDIA H200" \
+  --reason "private generation" \
   --idempotency-key <unique-key>
+
+cozy rental list
+cozy invoke run org/endpoint/v1/generate --worker <rental-id> prompt="moonlit lake"
+cozy rental end <rental-id>
 ```
 
-See [docs/cozy-video.md](docs/cozy-video.md) for the source format.
+Rentals can continue billing until Tensorhub confirms their termination. `rental end` and
+`exit --all` keep the local controller alive when remote absence cannot be confirmed.
 
-General workflows and bounded jobs use the same local service:
+## Release GPU memory or exit
+
+These commands have deliberately different scopes:
 
 ```sh
-cozy workflow submit --in ./plan.json --idempotency-key <unique-key>
-cozy workflow status <workflow-id>
-
-cozy job submit org/endpoint/v1/train epochs=3 --follow
-cozy job status <job-id>
+cozy unload       # stop idle local Runtime workers and release their GPU models
+cozy exit         # stop locally; refuses while invocations or rentals are active
+cozy exit --all   # cancel all work, end all rentals, then stop the controller
 ```
 
-Use an idempotency key for paid or long-running work. Retrying the same operation with the
-same key returns the same request instead of creating another one.
+None of them deletes installed endpoint or model bytes. A failed partial `exit --all` leaves the
+controller running so cancellation and paid-resource reconciliation can continue.
 
 ## Configuration
 
-The default data directory is `~/.cozy`. Put user configuration in
-`~/.cozy/config.yaml`:
+The default local root is `~/.cozy`. Configuration is read once from
+`~/.cozy/config.yaml`, then credential/location environment variables override it:
 
 ```yaml
-tensorhub_url: http://127.0.0.1:8080
+tensorhub_url: https://tensorhub.example
 tensorhub_token: replace-with-your-token
 tfs: /usr/local/bin/tfs
 port: 2699
-yield: smart
 local_rate_micro_usd_per_hour: 250000
 ```
 
-Only add the settings you need. `yield` can be `smart`, `always`, or `never`. The local
-rate is optional and is used only to estimate the cost of work on your own machine.
+The YAML schema is strict: unknown keys, duplicate keys, nested structures, and multiple documents
+are refused. Cozy does not load a working-directory `.env` file.
 
-The following environment variables override the file when needed:
+Supported environment variables are limited to:
 
 - `COZY_HOME`
 - `COZY_TFS`
-- `COZY_LOCAL_RATE_MICRO_USD_PER_HOUR`
 - `TENSORHUB_URL`
 - `TENSORHUB_TOKEN`
 
-Run `cozy hub status` or `cozy hub config` to inspect the active Tensorhub configuration
-without printing the raw token.
+The controller launcher also uses a private per-process bootstrap credential. Secrets are never
+accepted as command-line values.
 
-## Storage and cleanup
+## Output and automation
 
-Cozy keeps its database, installed environments, retained outputs, and rental credentials
-under `~/.cozy` by default.
-
-```sh
-cozy ls
-cozy media ls
-cozy gc
-```
-
-`cozy gc` prints a reclaim plan without changing anything. Add `--yes` to execute it.
-Removing an endpoint also requires explicit confirmation:
+Command results and errors are one typed document. TOON is the concise default; `--json` changes
+only the encoding. Progress goes to stderr.
 
 ```sh
-cozy rm org/endpoint --yes
-cozy gc --yes
+cozy endpoint list --fields endpoint,version,disk
+cozy invoke list --json
+cozy model search flux --full
 ```
 
-There are no interactive confirmation prompts, which keeps commands safe and predictable
-in terminals and scripts.
+Shell exits are intentionally small: `0` success or idempotent no-op, `2` invocation/configuration
+error, and `1` operational failure. The structured error document retains the detailed stable code.
 
-## Scripting and help
-
-Most commands support structured output:
-
-```sh
-cozy status --json
-cozy ls --fields endpoint,version,disk
-cozy commands --full
-```
-
-Use the built-in command reference for the exact surface supported by your binary:
-
-```sh
-cozy --help
-cozy commands
-cozy help run
-cozy help rent
-```
-
-Errors are typed and use stable exit codes. See [docs/exit-matrix.md](docs/exit-matrix.md)
-when integrating Cozy into another application.
+Authentication, billing management, datasets, and a web UI are planned later; Cozy does not
+advertise placeholder commands for features that do not exist yet.

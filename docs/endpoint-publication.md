@@ -56,7 +56,6 @@ cozy endpoint publish org/endpoint \
   --release 1.0.0 \
   --profile torch2.13.0-cu126-cp312-linux-x86 \
   --profile torch2.13.0-cu130-cp312-linux-x86 \
-  --create \
   --reason "initial private release"
 ```
 
@@ -81,29 +80,21 @@ digest, and length. It never repairs, renames, retags, or builds a supplied whee
 build files, `.pth` injection, base-distribution collisions, and native bytes inside the project
 wheel refuse.
 
-## Eligibility and promotion
+## Qualification and promotion
 
-Publication proof owns OCI profile eligibility; no paid per-release qualification command or
-background provider operation exists. Native custom-wheel profiles remain ineligible until a
-future need-driven operator smoke gate exists.
-
-Serving promotion is a separate explicit atomic act. Each target is `vN/function`; a bare major
-is never expanded or guessed:
-
-```sh
-cozy endpoint promote org/endpoint 1.0.0 \
-  --serve v1/generate --serve v1/edit \
-  --reason "serve qualified release"
-```
+Hardware qualification and serving promotion are explicit Tensorhub operator/policy acts, not
+Creator commands. Publication never rents a GPU or moves a serving pointer. Tensorhub qualifies
+an exact candidate under a recorded cost bound, then atomically promotes explicit `vN/function`
+targets after their evidence passes.
 
 ## Independently qualified local install
 
-Local execution never borrows OCI eligibility. Tensorhub leases
+Local execution never borrows the paid OCI qualification. Tensorhub leases
 `local-qualification-materials` only for a non-refused CPU/meta candidate with an exact registered
 managed base; those bytes are inputs to Creator's independent local proof, not an execution grant:
 
 ```sh
-cozy install org/endpoint@1.0.0 \
+cozy endpoint install org/endpoint@1.0.0 \
   --profile torch2.13.0-cu130-cp312-linux-x86 \
   --major v1 \
   --reason "qualify and install local release"

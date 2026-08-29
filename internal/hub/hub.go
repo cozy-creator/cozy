@@ -158,22 +158,6 @@ type Resource struct {
 
 func (r Resource) Ref() string { return r.Org + "/" + r.Name }
 
-// Health is GET /healthz.
-type Health struct {
-	Status string `json:"status"`
-	Env    string `json:"env"`
-}
-
-// ConfigKey is one row of the hub's effective configuration. A secret key renders as
-// its digest on the hub side; this client never sees the value and cannot print one.
-type ConfigKey struct {
-	Key    string `json:"key"`
-	Value  string `json:"value"`
-	Source string `json:"source"`
-	Secret bool   `json:"secret"`
-	Doc    string `json:"doc"`
-}
-
 type call struct {
 	method    string
 	path      string
@@ -208,13 +192,6 @@ func (c *Client) WithToken(v secret.Value, source string) *Client {
 	d := *c
 	d.token, d.source = v, source
 	return &d
-}
-
-// Health reads the hub's liveness. Public.
-func (c *Client) Health(ctx context.Context) (Health, *exit.Error) {
-	var out Health
-	e := c.do(ctx, call{method: http.MethodGet, path: "/healthz"}, &out)
-	return out, e
 }
 
 type ResourceSearch struct {
@@ -301,17 +278,6 @@ func resourcePath(collection string, ref Ref) string {
 	return "/v1/" + collection + "/" + ref.Org + "/" + ref.Name
 }
 
-// EffectiveConfig reads the hub's running configuration with per-key provenance.
-// Admin. Secret values arrive already digested by the hub.
-func (c *Client) EffectiveConfig(ctx context.Context) (string, []ConfigKey, *exit.Error) {
-	var out struct {
-		Env  string      `json:"env"`
-		Keys []ConfigKey `json:"keys"`
-	}
-	e := c.do(ctx, call{method: http.MethodGet, path: "/v1/admin/effective-config", admin: true}, &out)
-	return out.Env, out.Keys, e
-}
-
 func (c *Client) do(ctx context.Context, cl call, out any) *exit.Error {
 	// A missing credential is answered BEFORE the dial: a round trip cannot tell the
 	// operator anything the local configuration does not already say.
@@ -319,7 +285,7 @@ func (c *Client) do(ctx context.Context, cl call, out any) *exit.Error {
 		return exit.Named(exit.Credential, "hub.token_missing",
 			"%s %s is a first-party route and no admin token is configured", cl.method, cl.path).
 			WithRemedy("set TENSORHUB_TOKEN to the hub's admin.token; catalog reads need no credential").
-			WithNext("cozy hub status", "cozy endpoint search", "cozy model search")
+			WithNext("cozy endpoint search", "cozy endpoint search", "cozy model search")
 	}
 
 	var body io.Reader
@@ -340,7 +306,7 @@ func (c *Client) do(ctx context.Context, cl call, out any) *exit.Error {
 	if err != nil {
 		return exit.Usagef("%q is not a usable hub URL: %s", c.base, err).
 			WithRemedy("set TENSORHUB_URL to a base URL, e.g. https://hub.example.com").
-			WithNext("cozy hub status")
+			WithNext("cozy endpoint search")
 	}
 	req.Header.Set("Accept", "application/json")
 	req.Header.Set("User-Agent", c.agent)
@@ -401,7 +367,7 @@ func (c *Client) do(ctx context.Context, cl call, out any) *exit.Error {
 			return exit.Named(exit.Deadline, "hub.response_stalled",
 				"the hub at %s stopped sending its response body for %s", c.base, Timeout).
 				WithRemedy("retry; if it persists the hub is up but its response stream is stalled").
-				WithNext("cozy hub status")
+				WithNext("cozy endpoint search")
 		}
 		return c.transport(err)
 	}
@@ -418,7 +384,7 @@ func (c *Client) do(ctx context.Context, cl call, out any) *exit.Error {
 				"%s %s answered %d with a body this client cannot read: %s",
 				cl.method, cl.path, resp.StatusCode, err).
 				WithRemedy("check that TENSORHUB_URL names a tensorhub, not a proxy or a login page").
-				WithNext("cozy hub status")
+				WithNext("cozy endpoint search")
 		}
 	}
 	return nil
@@ -432,11 +398,11 @@ func (c *Client) transport(err error) *exit.Error {
 		(errors.As(err, &netErr) && netErr.Timeout()) {
 		return exit.New(exit.Deadline, "the hub at %s did not answer within %s", c.base, Timeout).
 			WithRemedy("retry; if it persists the hub is up but not serving").
-			WithNext("cozy hub status")
+			WithNext("cozy endpoint search")
 	}
 	return exit.Unavailablef("the hub at %s is unreachable: %s", c.base, unwrapURL(err)).
 		WithRemedy("check TENSORHUB_URL and that the hub is running").
-		WithNext("cozy hub status")
+		WithNext("cozy endpoint search")
 }
 
 // unwrapURL strips net/http's URL wrapper so the message names the cause, not the
@@ -475,8 +441,8 @@ func (c *Client) refusal(status int, raw []byte) *exit.Error {
 		}
 		return exit.Named(code, "hub.untyped_refusal",
 			"the hub answered %d with no typed error envelope: %s", status, snippet).
-			WithRemedy("this route may not exist on this hub build; `cozy hub status` names it and its version").
-			WithNext("cozy hub status")
+			WithRemedy("this route may not exist on this hub build; `cozy endpoint search` names it and its version").
+			WithNext("cozy endpoint search")
 	}
 
 	e := exit.Named(code, env.Error.Code, "%s", env.Error.Message)
@@ -486,7 +452,7 @@ func (c *Client) refusal(status int, raw []byte) *exit.Error {
 	if code == exit.Credential {
 		// The one remedy the hub cannot write for us: it does not know where OUR
 		// token came from. Launch 1 has no login, so the next step is never `cozy login`.
-		e.WithNext("cozy hub status")
+		e.WithNext("cozy endpoint search")
 		if c.source == "unset" {
 			e.WithRemedy("set TENSORHUB_TOKEN to the hub's admin.token (%s)", e.Remedy)
 		}

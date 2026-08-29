@@ -31,9 +31,7 @@ service.
 | `GET /v1/requests/{id}` | core | yes | the lifecycle document |
 | `POST /v1/requests/{id}/cancel` | core | yes | requests cancellation; `?grace_ms=` |
 | `GET /v1/requests/{id}/events` | core | yes | SSE, one request, terminal-stop; `?cursor=` |
-| `GET /v1/events` | core | yes | SSE, multiplexed, never terminal; `?cursor=`, `?from=now` |
 | `GET /v1/media/{media_id}` | core | yes | bytes by opaque id; `HEAD`; one `Range` |
-| `GET /v1/capabilities` | core | yes | feature tokens |
 
 ### Submit
 
@@ -67,8 +65,7 @@ copies the bytes into its private content-addressed input store before recording
 request. Only an opaque digest reference enters `input`; only the field-path identity,
 digest, length, media type, and ordered occurrence enter the invocation spec. A client
 filesystem path is never portable authority. This field requires the OS-protected CLI
-bearer; the browser bearer is refused before any path is read, and this local host does
-not yet expose a browser asset-upload route.
+bearer. A future web UI must upload selected bytes through its own reviewed surface.
 
 The private staged object remains only while some unsettled request references its
 digest. The service serializes the filesystem-to-request-row ownership handoff with the
@@ -213,10 +210,9 @@ Feature presence is a TOKEN. A client never infers a feature from a version stri
            "request_id": "req-…"}}
 ```
 
-`code` is the name from the exit matrix (`docs/exit-matrix.md`), which is also
-what the CLI exits with — one vocabulary from HTTP status to shell exit code. Every
-refusal renders through it, including an unknown route: a client that parses one envelope
-parses every answer.
+`code` is the detailed name from `docs/exit-matrix.md`. The CLI keeps that name in its
+structured error document while projecting process exits to 0/1/2. Every refusal renders
+through one envelope, including an unknown route.
 
 | matrix | HTTP |
 |---|---|
@@ -236,39 +232,20 @@ Mounted under `/v1/local/` so the Creator-only boundary is visible in the URL.
 
 | route | scope | auth | notes |
 |---|---|---|---|
-| `GET /v1/local/endpoints` | local | yes | installed endpoints and their functions |
-| `GET /v1/local/workers` | local | yes | live workers: protocol identities, devices, worker phase, the placement's two axes, the admission fence |
-| `POST /v1/local/workers` | local | yes | ensure one local endpoint resident or claim one exact rental without invoking a model; exactly one of `endpoint` or `rental` |
-| `DELETE /v1/local/workers/{instance_id}` | local | yes | drain and stop the process group |
-| `POST /v1/local/rentals/{rental_id}/placement-revisions` | local | yes | `Idempotency-Key`; author one Tensorhub revision and relay grant-before-set on the same claimed worker |
-| `GET /v1/local/doctor` | local | yes | host facts, bound families, counts |
-| `POST /v1/local/service/shutdown` | local | yes | ask the service to drain every worker and exit (`cozy down`'s cooperative tier); exit is proved by the service lock, never this reply |
-| `GET /v1/local/attempts/{attempt_key}/triage` | local | yes | the retained WorkerTriageBundle |
+| `POST /v1/local/rentals/{rental_id}/claim` | local | yes | attach the controller to one already-provisioned private worker |
+| `POST /v1/local/service/unload` | local | yes | stop definitely-idle local serving workers; never touch active work, jobs, rentals, or installed bytes |
+| `POST /v1/local/service/exit` | local | yes | safe exit fence; `{all:true}` requests local cancellation and returns paid obligations that must be confirmed absent before retrying |
 | `POST /v1/local/jobs` | local | yes | submit one bounded job; `Idempotency-Key`; 202 with the handle and its publication repo |
-| `GET /v1/local/jobs` | local | yes | jobs newest-first with per-state counts; `?status=`, `?endpoint=` |
 | `GET /v1/local/jobs/{id}` | local | yes | one job: state, queue position, retry budget, publication, checkpoints, bill where a rate exists |
 | `POST /v1/local/jobs/{id}/cancel` | local | yes | request cancellation; a queued job leaves the queue, a running one gets its terminal |
-| `POST /v1/local/workflows` | local | yes | submit one canonical ordered workflow; `Idempotency-Key`; 202 fresh or 200 replay |
-| `GET /v1/local/workflows/{id}` | local | yes | one workflow with ordinary child request states and accepted outputs projected from the records authority |
-| `GET /v1/local/workflows/{id}/receipt` | local | yes | canonical plan, materialized submissions, and workflow-owned exact rental controls, independent of live dial authority |
-| `POST /v1/local/workflows/{id}/cancel` | local | yes | persist cancellation, cancel the active child, and prevent every later child |
-| `POST /v1/local/video-compositions` | local | CLI only | compose exact source bytes or one retained creative-plan digest into the existing workflow submission shape; local base paths are resolution-only and never returned or stored |
-| `GET /healthz` | local | no | liveness ONLY; says nothing about any request |
-| `GET /{$}` | local | no | the embedded stub page |
-| `GET /app.js` | local | no | the stub's script — a FILE, so no inline-script CSP |
-| `GET /app.css` | local | no | the stub's style, for the same reason |
-
-Triage is served by the OPAQUE attempt key and verified on read against the digest its
-terminal declared. A bundle whose bytes moved is `409 bundle_corrupt`, never a plausible
-story.
 
 ### The job family is local
 
-A job is an ATTEMPT CLASS in the same local service, not a second scheduler: the same
+A job is an ATTEMPT CLASS in the same local controller, not a second scheduler: the same
 orchestrator places and dispatches it, and the same record owner gives it an ordinal,
 settles its terminal transaction, and streams it over the same durable event route
 (`GET /v1/requests/{id}/events` — there is no second event authority anywhere, and
-`cozy job follow` is that route's client).
+`cozy invoke run` follows it).
 
 The family is local because a job's typed input trees are directories the caller already
 owns (`{"trees":["<ref>=<dir>"]}`). Client filesystem paths are not part of the proposed
@@ -293,70 +270,6 @@ record owner's durable-attempt facts. Several jobs submitted at once queue again
 worker and drain in submission order, while the retry projection over neutral outcomes
 spends a durable budget that the settlement names when it is exhausted.
 
-### The workflow family is local and ordered
-
-A workflow is one immutable maximum-16 ordered plan over ordinary serving requests. Only backward
-output bindings exist, so a cycle is unrepresentable. Creator persists exact materialization before
-submitting each child, derives its ordinary idempotency key from workflow/ordinal/release/action/
-materialized identity, and mints at most one current child. Request attempts, retries, terminals,
-outputs, media and cancellation remain the existing request authority; the workflow status document
-projects those rows and copies none of their lifecycle state.
-
-There is no workflow SSE route, list route, retry verb, cursor, resume verb, endpoint callback,
-YAML parser or timeline object. Re-submitting the same idempotency key is recovery. `workflow
-follow` samples the structured status document and has no elapsed-time verdict; worker liveness and
-measured no-progress facts remain the stall authority. Cancellation persists before it touches the
-active ordinary child.
-
-`POST /v1/local/workflows` carries `{plan, assets?, targets?}`. `assets` contains staged
-digest/length/type resolutions and therefore requires the OS-protected CLI credential; no path is
-accepted. `targets` maps a one-based step to an attached rental id. Targets and local install ids
-do not enter creative or model-execution meaning, but rental targets do enter the submission
-identity so one idempotency key cannot silently move a workflow to another paid machine. The frozen workflow status
-set is `running | canceling | succeeded | failed | canceled`; ordinary child rows are projected as
-`queued | in_progress | completed | failed | canceled` plus workflow-only `pending | prepared`.
-Structured status also projects the existing materialized-submission digest, child key, exact
-resolved output bindings, materialized asset identities, rental id, and media refs. `workflow
-download` obtains a workflow-owned receipt through the local API, independent of the current
-rental table. It writes the canonical workflow and creative plans, each exact materialized
-submission, child lifecycle/event/triage receipts, one content-addressed copy of Tensorhub's exact
-control snapshot, actual ClaimAck GPU identity, and digest-verified media into a sibling staging
-tree. Every path in a receipt is bundle-relative; the destination appears only by one final rename.
-
-### The video composer is a local authoring boundary
-
-`POST /v1/local/video-compositions` is the only YAML-reading route. It requires the OS-protected
-CLI credential because a fresh composition reads caller-owned local paths. Its strict request names
-exactly one of bounded source bytes or a retained `creative_plan_digest`, plus exactly one local H3
-endpoint ref or attached H3 rental id. A rental already fixes its endpoint, so the API refuses a
-second endpoint truth beside it. The fixed CPU assembler is a Creator-owned
-product dependency, not a source or CLI selection. The rental is a Tensorhub-selected
-result handle, never provider or placement policy. The absolute source directory resolves
-relative asset spellings but is never stored, hashed, echoed, or added to a receipt.
-
-The caller retains the editable YAML; Creator retains its exact-byte digest rather than a hidden
-second copy. The response separates that source identity, path-free/deployment-free creative identity, and
-the existing deployment-resolved `cozy.workflow.Plan/1`. Composition starts no workflow. `cozy video
-submit` passes that plan and its staged content identities to `POST /v1/local/workflows`; workflow
-status, cancellation, recovery, attempts, outputs, and events remain the workflow owner's authority. There
-is no video-specific status route, retry policy, cursor, provider selector, endpoint callback, or second
-lifecycle table.
-
-Composition rows are durable project records in v1 and deliberately retain their staged content
-identities after any workflow settles. There is no implicit expiry or GC guess about whether
-creative work is disposable. A future explicit forget verb may release a composition; until then,
-retention is permanent and visible. The entire local root is mode 0700, protecting prompts in the
-records database and SQLite's lazily-created WAL/SHM files from other OS users.
-
-Only `cozy video compose` and `cozy video submit` exist. A formatter would rewrite the very source
-bytes whose identity is being preserved, while an honest validator must resolve schemas and stage
-content and is therefore composition with its result discarded. The source parser lives only in
-Creator's video package; endpoints, Runtime, Tensorhub, worker protocol, and workflow records never
-parse YAML or acquire shot semantics.
-
-`cozy video submit` requires an explicit idempotency key. A client that loses the POST response can
-therefore retry the same key and recover the same workflow rather than minting a duplicate.
-
 ## 8. Local host security posture
 
 A loopback bind is not a boundary — Ollama's DNS-rebinding CVE is the standing proof.
@@ -370,10 +283,9 @@ This host's chain, in order:
 4. **Bearer auth**, no cookie read anywhere.
 5. **No CORS headers at all**, and a strict CSP on every response.
 
-Two per-launch credentials, both dying with the process: the BROWSER token rides
-`--open`'s URL FRAGMENT (never the query string — a fragment reaches neither the server
-nor an access log nor a `Referer`), and the CLI credential is handed over through a 0600
-file. Neither ever appears in argv, a log line, or a rendered error.
+One credential is minted per controller launch and handed to the CLI through a 0600 file.
+It never appears in argv, inherited environment, a log line, or a rendered error. A future
+web UI owns its own authentication design rather than inheriting this filesystem authority.
 
 ## 9. The status-to-exit projection
 
@@ -396,6 +308,5 @@ cannot drift:
 | 507 | 14 capacity |
 
 **A FAILED or CANCELED terminal never comes back through this table.** It is answered
-`200` on purpose — a terminal is an answer, not a transport failure — and a client maps
-the terminal's own status with the job-terminal mapping instead (succeeded 0 · failed 11 ·
-canceled 12 · deadline 10).
+`200` on purpose—a terminal is an answer, not a transport failure. The CLI preserves the
+terminal's detailed symbolic status and returns shell exit 1 for any non-successful outcome.

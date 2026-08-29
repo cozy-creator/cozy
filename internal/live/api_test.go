@@ -6,6 +6,8 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/cozy-creator/cozy-creator/internal/records"
 )
 
 // TestLocalAPIDoor is the only thing standing between a loopback bind and every page the
@@ -19,14 +21,14 @@ func TestLocalAPIDoor(t *testing.T) {
 	svc := startService(t, root)
 
 	// A credential is required, and the refusal is the TYPED envelope naming its scheme.
-	no := svc.call(t, "GET", "/v1/capabilities", nil, "Authorization", "")
+	no := svc.call(t, "GET", "/v1/requests?limit=1", nil, "Authorization", "")
 	if no.Status != http.StatusUnauthorized || no.code() != "unauthenticated" {
 		t.Errorf("a request with NO credential: %s", no.brief())
 	}
 	if no.Header.Get("WWW-Authenticate") == "" {
 		t.Error("the refusal does not name the scheme it wants")
 	}
-	wrong := svc.call(t, "GET", "/v1/capabilities", nil, "Authorization", "Bearer "+strings.Repeat("0", 64))
+	wrong := svc.call(t, "GET", "/v1/requests?limit=1", nil, "Authorization", "Bearer "+strings.Repeat("0", 64))
 	if wrong.Status != http.StatusUnauthorized || wrong.code() != "unauthenticated" {
 		t.Errorf("a WRONG credential: %s", wrong.brief())
 	}
@@ -34,13 +36,13 @@ func TestLocalAPIDoor(t *testing.T) {
 	if strings.HasSuffix(svc.token, "0") {
 		near = "Bearer " + svc.token[:len(svc.token)-1] + "1"
 	}
-	if r := svc.call(t, "GET", "/v1/capabilities", nil, "Authorization", near); r.Status != http.StatusUnauthorized {
+	if r := svc.call(t, "GET", "/v1/requests?limit=1", nil, "Authorization", near); r.Status != http.StatusUnauthorized {
 		t.Errorf("a credential differing in ONE character: %s", r.brief())
 	}
 
 	// THE DNS-REBINDING KILL SWITCH. The request reaches 127.0.0.1 — because that is what
 	// the attacker's DNS answered — and carries the attacker's hostname in Host.
-	rebind := svc.call(t, "GET", "/v1/capabilities", nil, "Host", "cozy.attacker.example")
+	rebind := svc.call(t, "GET", "/v1/requests?limit=1", nil, "Host", "cozy.attacker.example")
 	if rebind.Status != http.StatusForbidden || rebind.code() != "host_not_allowed" {
 		t.Errorf("a rebinding-style foreign Host: %s", rebind.brief())
 	}
@@ -62,13 +64,13 @@ func TestLocalAPIDoor(t *testing.T) {
 	if null.Status != http.StatusForbidden {
 		t.Errorf("a sandboxed-iframe `Origin: null` mutation: %s", null.brief())
 	}
-	same := svc.call(t, "GET", "/v1/capabilities", nil, "Origin", "http://"+svc.addr)
+	same := svc.call(t, "GET", "/v1/requests?limit=1", nil, "Origin", "http://"+svc.addr)
 	if same.Status != http.StatusOK {
 		t.Errorf("a SAME-ORIGIN request: %s", same.brief())
 	}
 
 	// No CORS, no cookies, no sniffing.
-	caps := svc.call(t, "GET", "/v1/capabilities", nil)
+	caps := svc.call(t, "GET", "/v1/requests?limit=1", nil)
 	if got := caps.Header.Get("Access-Control-Allow-Origin"); got != "" { //cozy:allow the SUITE reads this header to prove its ABSENCE; the product sets none
 		t.Errorf("a CORS header is served: %q", got)
 	}
@@ -86,7 +88,7 @@ func TestLocalAPIDoor(t *testing.T) {
 	}
 	// A cookie the server never reads: presenting one instead of a bearer authenticates
 	// nothing, which is the property that makes cross-site ambient authority impossible.
-	cookied := svc.call(t, "GET", "/v1/capabilities", nil,
+	cookied := svc.call(t, "GET", "/v1/requests?limit=1", nil,
 		"Authorization", "", "Cookie", "cozy="+svc.token)
 	if cookied.Status != http.StatusUnauthorized {
 		t.Errorf("a credential presented as a COOKIE authenticated something: %s", cookied.brief())
@@ -130,4 +132,20 @@ func TestLocalAPIDoor(t *testing.T) {
 	if r := svc.call(t, "GET", "/v1/requests/req-nope", nil); strings.Contains(string(r.Body), svc.token) {
 		t.Error("a rendered error contains the credential")
 	}
+
+	// Plain exit is safe by default: one paid obligation refuses shutdown by exact id.
+	store, problem := records.Open(filepath.Join(root, "records.db"))
+	fatal(t, problem)
+	fatal(t, store.RecordRental(records.Rental{
+		ID: "rental-exit-arm", EndpointRef: "cozy/fake/v1/run",
+		AcceleratorModel: "CPU", State: "ready", Hub: "https://hub.invalid",
+	}))
+	blocked := svc.call(t, "POST", "/v1/local/service/exit", map[string]bool{"all": false})
+	if blocked.Status != http.StatusConflict || blocked.code() != "active_work" ||
+		!strings.Contains(string(blocked.Body), "rental-exit-arm") {
+		t.Errorf("plain exit did not name and preserve the rental: %s", blocked.brief())
+	}
+	_, problem = store.ForgetRental("rental-exit-arm")
+	fatal(t, problem)
+	store.Close()
 }

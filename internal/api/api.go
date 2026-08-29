@@ -1,5 +1,5 @@
 // Package api is Creator's local client API server: the request-level CORE served on
-// loopback by the one LocalService, plus an explicitly Creator-only extension module.
+// loopback by the one local controller, plus an explicitly Creator-only extension module.
 //
 // It is a client of internal/orchestrator and nothing else. Every submission still flows
 // orchestrator → worker protocol → runtime; this package adds an HTTP shape, a typed error
@@ -48,6 +48,7 @@ import (
 	"net"
 	"net/http"
 	"strings"
+	"sync"
 
 	"github.com/cozy-creator/cozy-creator/internal/config"
 	"github.com/cozy-creator/cozy-creator/internal/exit"
@@ -61,7 +62,7 @@ import (
 // names files the service ingests, while a network host uses its own upload surface.
 const MaxBody = 8 << 20
 
-// Server is the local client API. One per LocalService.
+// Server is the local client API. One per local controller.
 type Server struct {
 	orchestrator *orchestrator.Orchestrator
 	store        *records.Store
@@ -70,10 +71,6 @@ type Server struct {
 	creds        Credentials
 	addr         string
 	log          io.Writer
-	// bound names the loopback families actually listening ("ipv4", "ipv6"). It is what
-	// `doctor` reports, so the Host allowlist and reality can be compared.
-	bound []string
-
 	// endpoints resolves an endpoint ref to a spec the orchestrator can start. It is the
 	// LOCAL module's resolver; the pod profile (cl-014) supplies its own.
 	endpoints Resolver
@@ -82,14 +79,15 @@ type Server struct {
 	// credential and dial triple remain orchestrator-only and are obtained at dial time.
 	rentals func(id string) (*orchestrator.DesiredPlacement, *exit.Error)
 
-	// shutdown asks the process that owns this server to drain and exit — `cozy down`'s
+	// shutdown asks the process that owns this server to drain and exit — `cozy exit`'s
 	// cooperative tier (#449). The route refuses when the builder wired none.
 	shutdown func()
 
-	// workflows is Creator's LOCAL ordered-child controller. Its children still enter
-	// exclusively through orchestrator.
-	workflows WorkflowController
-	videos    VideoController
+	// lifecycle serializes ordinary mutations against the safe-exit fence. Once exit
+	// commits, no request can slip in after the active-work read and before listeners
+	// close; mutations already in flight finish before the fence reads the records.
+	lifecycle sync.RWMutex
+	exiting   bool
 }
 
 // Resolver exposes control-plane placement facts separately from a local worker launch.
@@ -97,13 +95,11 @@ type Server struct {
 // start may require the target environment through Resolve.
 type Resolver interface {
 	ResolvePlacement(endpoint string) (orchestrator.DesiredPlacement, *exit.Error)
-	Resolve(endpoint string) (orchestrator.WorkerLaunchSpec, *exit.Error)
 	Entrypoint(installID, name string) (*launch.Entrypoint, *exit.Error)
 	// Jobs names the `@job` functions one installed endpoint registers, with the
 	// descriptor id each resolves to. The job submit route resolves a function to its
 	// digest through this and never lets a client name one (cl-004).
 	Jobs(endpoint string) ([]launch.JobFacts, *exit.Error)
-	List() []string
 }
 
 // Options is the frozen input to one API server.
@@ -114,14 +110,11 @@ type Options struct {
 	Addr         string
 	Log          io.Writer
 	Endpoints    Resolver
-	Bound        []string
 	// Rentals resolves an attached worker's exact non-secret placement; nil means this
 	// host attaches no remote workers.
 	Rentals func(id string) (*orchestrator.DesiredPlacement, *exit.Error)
 	// Shutdown is the cooperative-exit hook the shutdown route calls (#449).
-	Shutdown  func()
-	Workflows WorkflowController
-	Videos    VideoController
+	Shutdown func()
 }
 
 // New builds the server and its route table. It binds nothing; Listeners does that.
@@ -132,8 +125,8 @@ func New(opt Options) *Server {
 	return &Server{
 		orchestrator: opt.Orchestrator, store: opt.Orchestrator.Store(),
 		layout: opt.Orchestrator.Layout(), cfg: opt.Cfg, creds: opt.Creds,
-		addr: opt.Addr, log: opt.Log, endpoints: opt.Endpoints, bound: opt.Bound,
-		rentals: opt.Rentals, shutdown: opt.Shutdown, workflows: opt.Workflows, videos: opt.Videos,
+		addr: opt.Addr, log: opt.Log, endpoints: opt.Endpoints,
+		rentals: opt.Rentals, shutdown: opt.Shutdown,
 	}
 }
 
@@ -143,35 +136,18 @@ func New(opt Options) *Server {
 func (s *Server) Handler() (http.Handler, *exit.Error) {
 	mux := http.NewServeMux()
 	handlers := map[string]http.HandlerFunc{
-		"POST /v1/requests":                                      s.submit,
-		"GET /v1/requests":                                       s.listRequests,
-		"GET /v1/requests/{id}":                                  s.getRequest,
-		"POST /v1/requests/{id}/cancel":                          s.cancelRequest,
-		"GET /v1/requests/{id}/events":                           s.requestEvents,
-		"GET /v1/events":                                         s.multiplexedEvents,
-		"GET /v1/media/{media_id}":                               s.media,
-		"GET /v1/capabilities":                                   s.capabilities,
-		"GET /v1/local/endpoints":                                s.localEndpoints,
-		"GET /v1/local/workers":                                  s.localWorkers,
-		"POST /v1/local/workers":                                 s.startWorker,
-		"DELETE /v1/local/workers/{instance_id}":                 s.stopWorker,
-		"POST /v1/local/rentals/{rental_id}/placement-revisions": s.reviseRental,
-		"GET /v1/local/doctor":                                   s.doctor,
-		"POST /v1/local/service/shutdown":                        s.shutdownService,
-		"GET /v1/local/attempts/{attempt_key}/triage":            s.triage,
-		"POST /v1/local/jobs":                                    s.submitJob,
-		"GET /v1/local/jobs":                                     s.listJobs,
-		"GET /v1/local/jobs/{id}":                                s.getJob,
-		"POST /v1/local/jobs/{id}/cancel":                        s.cancelJob,
-		"POST /v1/local/workflows":                               s.submitWorkflow,
-		"GET /v1/local/workflows/{id}":                           s.getWorkflow,
-		"GET /v1/local/workflows/{id}/receipt":                   s.getWorkflowReceipt,
-		"POST /v1/local/workflows/{id}/cancel":                   s.cancelWorkflow,
-		"POST /v1/local/video-compositions":                      s.composeVideo,
-		"GET /healthz":                                           s.healthz,
-		"GET /{$}":                                               s.stub,
-		"GET /app.js":                                            s.stub,
-		"GET /app.css":                                           s.stub,
+		"POST /v1/requests":                        s.submit,
+		"GET /v1/requests":                         s.listRequests,
+		"GET /v1/requests/{id}":                    s.getRequest,
+		"POST /v1/requests/{id}/cancel":            s.cancelRequest,
+		"GET /v1/requests/{id}/events":             s.requestEvents,
+		"GET /v1/media/{media_id}":                 s.media,
+		"POST /v1/local/rentals/{rental_id}/claim": s.claimRental,
+		"POST /v1/local/service/unload":            s.unload,
+		"POST /v1/local/service/exit":              s.exitService,
+		"POST /v1/local/jobs":                      s.submitJob,
+		"GET /v1/local/jobs/{id}":                  s.getJob,
+		"POST /v1/local/jobs/{id}/cancel":          s.cancelJob,
 	}
 	registered := map[string]bool{}
 	for _, r := range Routes {
@@ -254,7 +230,7 @@ func (s *Server) guard(route Route, h http.HandlerFunc) http.Handler {
 			if origin := r.Header.Get("Origin"); origin != "" && !s.allowedOrigin(origin) {
 				s.refuse(w, r, http.StatusForbidden, "origin_not_allowed",
 					fmt.Sprintf("Origin %q may not reach this route", origin),
-					"only a page served by this LocalService may mutate or open a stream")
+					"only a page served by this local controller may mutate or open a stream")
 				return
 			}
 		}
@@ -272,6 +248,16 @@ func (s *Server) guard(route Route, h http.HandlerFunc) http.Handler {
 				"submission needs an "+route.Idempotency+" header",
 				"one key names one request forever; retrying under it is safe by construction")
 			return
+		}
+		if route.Mutation && route.Path != "/v1/local/service/exit" {
+			s.lifecycle.RLock()
+			defer s.lifecycle.RUnlock()
+			if s.exiting {
+				s.refuse(w, r, http.StatusServiceUnavailable, "controller_exiting",
+					"the controller has accepted exit and no longer admits mutations",
+					"wait for the service lock to become free")
+				return
+			}
 		}
 		h(w, r)
 	})
@@ -449,18 +435,4 @@ func (s *Server) ok(w http.ResponseWriter, r *http.Request, status int, body any
 
 func (s *Server) logf(format string, args ...any) {
 	fmt.Fprintf(s.log, "[api] "+format+"\n", args...)
-}
-
-func (s *Server) healthz(w http.ResponseWriter, r *http.Request) {
-	// Deliberately content-free: liveness is the ONE fact an unauthenticated caller may
-	// learn. Counts, endpoints and workers all live behind the credential.
-	s.ok(w, r, http.StatusOK, map[string]any{"service": "up"})
-}
-
-func (s *Server) capabilities(w http.ResponseWriter, r *http.Request) {
-	s.ok(w, r, http.StatusOK, map[string]any{
-		"tokens": Tokens,
-		"host":   "cozy-creator.local",
-		"core":   "cozy.client.v1",
-	})
 }

@@ -1,6 +1,7 @@
 package api
 
 import (
+	"bytes"
 	"encoding/base64"
 	"encoding/json"
 	"io"
@@ -24,7 +25,7 @@ import (
 //
 // The event plane is reused, and that is not an exception: a job is a request row in the
 // one lifecycle authority, so `GET /v1/requests/{id}/events` streams a job's lifecycle
-// with no second event authority anywhere. `cozy job follow` is that route's client.
+// with no second event authority anywhere. `cozy invoke list` is that route's client.
 
 // JobSubmission is the job submit body.
 type JobSubmission struct {
@@ -68,9 +69,20 @@ func (s *Server) submitJob(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var sub JobSubmission
-	if err := json.Unmarshal(body, &sub); err != nil {
+	decoder := json.NewDecoder(bytes.NewReader(body))
+	decoder.DisallowUnknownFields()
+	err = decoder.Decode(&sub)
+	var trailing any
+	if err == nil {
+		err = decoder.Decode(&trailing)
+	}
+	if err != io.EOF {
+		detail := "multiple JSON values"
+		if err != nil {
+			detail = err.Error()
+		}
 		s.refuse(w, r, http.StatusBadRequest, "malformed_body",
-			"the submission is not a JSON object: "+err.Error(), "")
+			"the submission is not one closed JSON object: "+detail, "")
 		return
 	}
 	if sub.Endpoint == "" || sub.Function == "" {
@@ -85,7 +97,7 @@ func (s *Server) submitJob(w http.ResponseWriter, r *http.Request) {
 	if len(sub.Trees) > 0 && !s.cliAuthenticated(r) {
 		s.refuse(w, r, http.StatusForbidden, "cli_credential_required",
 			"trees name host filesystem directories and require the OS-protected CLI credential",
-			"use `cozy job submit --tree <ref>=<dir>`; this build exposes no browser tree-upload route")
+			"use `cozy invoke run --input-tree <ref>=<dir>`; this build exposes no browser tree-upload route")
 		return
 	}
 	spec, e := s.resolveJob(sub)
@@ -150,7 +162,7 @@ func (s *Server) resolveJob(sub JobSubmission) (orchestrator.Submission, *exit.E
 		return out, e
 	}
 	if s.endpoints == nil {
-		return out, exit.Unavailablef("this LocalService resolves no endpoints")
+		return out, exit.Unavailablef("this local controller resolves no endpoints")
 	}
 	jobs, e := s.endpoints.Jobs(sub.Endpoint)
 	if e != nil {
@@ -338,60 +350,10 @@ func (s *Server) jobRow(w http.ResponseWriter, r *http.Request) (records.Request
 	}
 	if row == nil || !row.IsJob() {
 		s.refuse(w, r, http.StatusNotFound, "not_found", "no job "+id+" on this host",
-			"`cozy job ls` lists the jobs this host recorded")
+			"`cozy invoke list` lists the jobs this host recorded")
 		return records.Request{}, false
 	}
 	return *row, true
-}
-
-func (s *Server) listJobs(w http.ResponseWriter, r *http.Request) {
-	limit := 50
-	if v := r.URL.Query().Get("limit"); v != "" {
-		if n, err := strconv.Atoi(v); err == nil && n > 0 && n <= 500 {
-			limit = n
-		}
-	}
-	state, e := storeState(strings.TrimSpace(r.URL.Query().Get("status")))
-	if e != nil {
-		s.refuseTyped(w, r, e)
-		return
-	}
-	rows, err := s.store.RequestsOfKind("job", state, limit)
-	if err != nil {
-		s.refuseTyped(w, r, err)
-		return
-	}
-	endpoint := strings.TrimSpace(r.URL.Query().Get("endpoint"))
-	out := make([]JobState, 0, len(rows))
-	counts := map[string]int{}
-	for _, row := range rows {
-		if endpoint != "" && row.Endpoint != endpoint {
-			continue
-		}
-		state := s.jobStateOf(row)
-		counts[state.Status]++
-		out = append(out, state)
-	}
-	s.ok(w, r, http.StatusOK, map[string]any{
-		"jobs": out, "count": len(out), "states": counts})
-}
-
-// storeState maps the contract's status vocabulary onto the authority's own names.
-func storeState(status string) (string, *exit.Error) {
-	switch status {
-	case "", "any":
-		return "", nil
-	case "queued":
-		return "submitted", nil
-	case "in_progress":
-		return "dispatching", nil
-	case "completed":
-		return "succeeded", nil
-	case "failed", "canceled":
-		return status, nil
-	}
-	return "", exit.Named(exit.Validation, "invalid_status", "unknown status filter %q", status).
-		WithRemedy("any | queued | in_progress | completed | failed | canceled")
 }
 
 func (s *Server) jobStateOf(row records.Request) JobState {
