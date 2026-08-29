@@ -178,7 +178,8 @@ TFS_FIELD = re.compile(r"\.Tfs\b")
 # of verbs they may name. `install.go` runs `describe --check` at install; `artifacts.go`
 # asks for the artifact index, host facts and fit verdicts. Nothing executes a model
 # through this door — that is what the orchestrator and the worker protocol are for.
-RUNTIME_SITES = {"internal/install/install.go", "internal/launch/artifacts.go"}
+RUNTIME_SITES = {"internal/install/install.go", "internal/launch/artifacts.go",
+                 "internal/managedinstall/install.go"}
 RUNTIME_BIN = re.compile(r'"cozy-runtime"')
 # (cl-028) The INDIRECTIONS to the same binary, which the literal above cannot see:
 # `launch.Binary()` resolves the generation venv's cozy-runtime and `launch.RuntimeCLI{}`
@@ -352,6 +353,7 @@ DOCUMENT_KINDS = {
     "cozy.local.EntrypointBindingRecord/2": "internal/plan/plan.go",
     "cozy.local.EvaluatedConfig/1": "internal/app/identity.go",
     "cozy.local.ExecutionEnvironment/1": "internal/app/identity.go",
+    "cozy.local.ManagedBaseReceipt/1": "internal/managedinstall/install.go",
     "cozy.rental_request/1": "internal/app/rentals.go",
     "cozy.video/1": "internal/video/source.go",
     "cozy.video.CreativePlan/1": "internal/video/composition.go",
@@ -364,6 +366,7 @@ DOCUMENT_KINDS = {
 FOREIGN_KIND_PREFIXES = ("cozy.worker.v1.", "cozy.endpoint.", "cozy.runtime.", "tensorhub.",
                          "tensorfs.", "cozytensors")
 KIND_READERS: dict[str, set[str]] = {}
+KIND_READERS["cozy.local.ManagedBaseReceipt/1"] = {"internal/live/managed_install_test.go"}
 # No trailing quote: a domain-separation tag is a PREFIX inside a longer literal — it ends
 # in `\x00` or `\n`, and requiring the close quote made both of this repo's tags invisible
 # to the registry that exists to hold exactly this class of cross-repo agreed name.
@@ -799,10 +802,29 @@ def check_typed_resources():
         bad.append("internal/manifest/commands.go: [resources] retired --kind discriminator remains")
 
     hub_sources = (pathlib.Path("internal/hub/hub.go").read_text() +
-                   pathlib.Path("internal/hub/publish.go").read_text())
+                   pathlib.Path("internal/hub/publish.go").read_text() +
+                   pathlib.Path("internal/hub/endpoint_releases.go").read_text())
     for route in ('"/v1/endpoints"', '"/v1/models"', '"/v1/models/"', '"/publications"'):
         if route not in hub_sources:
             bad.append(f"internal/hub: [resources] missing typed route prefix {route}")
+    profile_routes = (pathlib.Path("internal/hub/endpoint_releases.go").read_text() +
+                      pathlib.Path("scripts/endpoint-profile-live.sh").read_text())
+    if "/local-execution" in profile_routes:
+        bad.append("internal/hub/endpoint_releases.go: [resources] retired local-execution route remains")
+    if "/local-qualification-materials" not in profile_routes:
+        bad.append("internal/hub/endpoint_releases.go: [resources] local qualification-materials route is absent")
+
+    managed = pathlib.Path("internal/managedinstall/install.go").read_text()
+    for retired in ('"base_path"', '"index_url"', '"build_command"', 'exec.Command("uv"',
+                    'exec.Command("pip"', 'exec.Command("docker"'):
+        if retired in managed:
+            bad.append(f"internal/managedinstall/install.go: [resources] managed install contains "
+                       f"forbidden resolve/build/path input {retired}")
+    for required in ("layout.ManagedBase(grant.BaseRealization.Digest)",
+                     "cozy-environment-proof", '"cozy-native-wheel-proof"',
+                     '"cozy.local.ManagedBaseReceipt/1"'):
+        if required not in managed:
+            bad.append(f"internal/managedinstall/install.go: [resources] missing managed-local fence {required}")
     return bad
 
 

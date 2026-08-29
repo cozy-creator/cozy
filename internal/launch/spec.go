@@ -53,7 +53,7 @@ func Read(gen records.EndpointInstall, cozyHome string, env []string) (*Facts, *
 		Install:    gen,
 		Source:     source,
 		Descriptor: d,
-		RuntimeCLI: RuntimeCLI{Bin: Binary(gen.Dir), Dir: source, Home: cozyHome, Env: env},
+		RuntimeCLI: RuntimeCLI{Bin: Binary(gen), Dir: source, Home: cozyHome, Env: env},
 	}, nil
 }
 
@@ -61,6 +61,9 @@ func Read(gen records.EndpointInstall, cozyHome string, env []string) (*Facts, *
 // under the generation; a `--dir` install builds a venv against the live tree and records
 // its absolute path (cl-009's editable development door).
 func SourceDir(gen records.EndpointInstall) string {
+	if gen.ProjectDir != "" {
+		return gen.ProjectDir
+	}
 	if gen.SourceKind == "dir" && gen.SourceRef != "" {
 		return gen.SourceRef
 	}
@@ -188,7 +191,7 @@ func (f *Facts) Spec(devices []string) (orchestrator.WorkerLaunchSpec, *exit.Err
 		// THE WORKER ENTRY is the public verb. Creator never imports Runtime internals or
 		// gives the weightless constructor a second source tree: the exact same f.Source
 		// is both the child working directory and --weightless-endpoint.
-		Python:   Binary(f.Install.Dir),
+		Python:   Binary(f.Install),
 		Args:     args,
 		Dir:      f.Source,
 		Devices:  devices,

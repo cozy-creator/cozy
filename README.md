@@ -193,6 +193,40 @@ cozy rent release <rental-id> --yes
 A timeout while waiting for a rental does not destroy the pod. Check `cozy rent ls` and
 release it when it is no longer needed.
 
+## Endpoint publication and profiles (cl-039/cl-043)
+
+`cozy endpoint publish <org/name> --release <id> --profile <profile> ...` snapshots one
+clean committed source subtree, creates a deterministic provenance archive and pure
+project wheel, canonicalizes the reviewed descriptor/config, and drives Tensorhub's exact
+`begin` → presigned missing-role PUTs → `finalize` route pair. The declaration carries no
+path, credential, URL, image, or command. Its explicit sorted profile set has no mutable
+default. Exact replay sends the same canonical declaration and lets Tensorhub return the
+same pending/committed result; Creator keeps no publication journal.
+
+`endpoint.release.json` is required and contains a non-empty sorted compatible-accelerator-model
+set. Even a weightless endpoint fixes that set because later qualification may prove only an
+already-authored execution identity; it cannot mutate release compatibility. The file also carries
+exact `{org,name,checkpoint_id}` model roots,
+and complete path-free model bindings: binding path, checkpoint, exact config document/
+asset refs, construction-order execution layout, and hardware variant. A descriptor with
+model inputs and no bindings refuses before upload. `endpoint.evaluated-config.json` is
+canonicalized when present; its absent weightless spelling is `{}`.
+
+The project wheel is exactly one `py3-none-any` wheel. Repeatable
+`--custom-wheel <profile>=<path>` values are separately inspected immutable prebuilt
+wheels, aggregated by exact digest, and uploaded only under Tensorhub-requested
+`custom_wheel:<distribution>:<digest>` roles. Creator runs no backend/compiler, embeds no
+custom wheel into the project wheel, and never repairs, renames, or retags one.
+
+`cozy endpoint qualify <org/name>@<release> --profile ... --gpu ... --max-cost ...`
+is the separate cost-bounded hardware act. Publication never rents implicitly.
+`cozy endpoint promote <org/name> <release> --serve <vN/function> ...` atomically moves
+one or more explicit qualified serving pointers; a bare major has no guessed function.
+`datasets push|pull` waits on th-035.
+
+See [docs/endpoint-publication.md](docs/endpoint-publication.md) for the release file, custom-wheel,
+qualification, promotion, and qualified managed-local install contracts.
+
 ## Tensorhub catalog and models
 
 Catalog reads are public:

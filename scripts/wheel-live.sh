@@ -207,25 +207,25 @@ name = "planted"
 version = "0.1.0"
 TOML
   printf 'app = None\n' >"$P/backend/planted.py"
-  arm "custom [build-system] backend" build_backend_unsupported "future sandboxed class" "$P/backend"
+  arm "custom [build-system] backend" project_wheel_build_input "separately prebuilt exact custom wheels" "$P/backend"
 
   # 2. a project whose OWN wheel would need compiled extensions.
   mkdir -p "$P/compiled/planted"
   printf '__all__ = []\n' >"$P/compiled/planted/__init__.py"
   printf '#include <Python.h>\n' >"$P/compiled/planted/_fast.c"
-  arm "compiled-extension source in a package dir" compiled_extension "future sandboxed class" "$P/compiled"
+  arm "compiled-extension source in a package dir" project_wheel_native_file "separately prebuilt exact custom wheel" "$P/compiled"
 
   # 2b. the same door from the other side: a prebuilt binary extension.
   mkdir -p "$P/binary/planted"
   printf '__all__ = []\n' >"$P/binary/planted/__init__.py"
   head -c 64 /dev/urandom >"$P/binary/planted/_fast.cpython-313-x86_64-linux-gnu.so"
-  arm "prebuilt .so in a package dir" compiled_extension "py3-none-any" "$P/binary"
+  arm "prebuilt .so in a package dir" project_wheel_native_file "py3-none-any" "$P/binary"
 
   # 3. a packaging step that wants to RUN project code.
   mkdir -p "$P/setuppy"
   printf 'from setuptools import setup\nsetup(name="planted")\n' >"$P/setuppy/setup.py"
   printf 'app = None\n' >"$P/setuppy/planted.py"
-  arm "setup.py (packaging that executes project code)" project_code_execution "future sandboxed class" "$P/setuppy"
+  arm "setup.py (packaging that executes project code)" project_wheel_build_input "never source" "$P/setuppy"
 
   # 4. metadata that is not metadata.
   mkdir -p "$P/malformed"

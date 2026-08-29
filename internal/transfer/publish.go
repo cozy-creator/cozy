@@ -16,6 +16,8 @@ package transfer
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
 	"io"
 	"net/http"
@@ -642,6 +644,46 @@ func send(ctx context.Context, method, url string, open func() (io.ReadCloser, e
 	}
 	return 0, nil, nil, exit.Unavailablef("object storage is unreachable after %d attempts: %s", attempts, err).
 		WithRemedy("re-run to resume from Tensorhub's durable transfer rows")
+}
+
+// UploadPresigned is the shared storage-edge PUT for endpoint-release role grants.
+// It sends the exact local file under every signed header and reports whether bytes
+// moved. A 412 means another writer won the immutable no-clobber race; Tensorhub still
+// verifies the final bytes during finalize.
+func UploadPresigned(ctx context.Context, subject, path, url, expectedDigest string, length int64,
+	headers map[string]string,
+) (bool, *exit.Error) {
+	info, err := os.Stat(path)
+	if err != nil || !info.Mode().IsRegular() || info.Size() != length {
+		return false, exit.Named(exit.Conflict, "upload.local_bytes_changed",
+			"%s is no longer the declared %d-byte regular file", path, length).
+			WithRemedy("restart endpoint publication from one unchanged committed source package")
+	}
+	f, err := os.Open(path)
+	if err != nil {
+		return false, exit.Internalf("cannot reopen declared %s: %s", subject, err)
+	}
+	h := sha256.New()
+	_, hashErr := io.Copy(h, f)
+	f.Close()
+	observed := "sha256:" + hex.EncodeToString(h.Sum(nil))
+	if hashErr != nil || observed != expectedDigest {
+		return false, exit.Named(exit.Conflict, "upload.local_bytes_changed",
+			"%s now hashes to %s; its declaration names %s", subject, observed, expectedDigest).
+			WithRemedy("restart endpoint publication from one unchanged committed source package")
+	}
+	status, _, body, problem := send(ctx, http.MethodPut, url, opener(path, 0, length), length, headers)
+	if problem != nil {
+		return false, problem
+	}
+	switch status {
+	case http.StatusOK, http.StatusCreated, http.StatusNoContent:
+		return true, nil
+	case http.StatusPreconditionFailed:
+		return false, nil
+	default:
+		return false, storageRefusal(status, subject, body)
+	}
 }
 
 // storageRefusal renders what the storage layer said. It is not our vocabulary and

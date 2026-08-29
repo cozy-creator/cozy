@@ -10,6 +10,7 @@ import (
 
 	"github.com/cozy-creator/cozy-creator/internal/exit"
 	"github.com/cozy-creator/cozy-creator/internal/home"
+	"github.com/cozy-creator/cozy-creator/internal/records"
 )
 
 // DefaultRuntimeQueryTimeout bounds metadata-only runtime questions used while selecting
@@ -46,8 +47,11 @@ type RuntimeCLI struct {
 // Binary is the runtime a generation carries. An install already refused a generation
 // whose venv provides none (cl-009's `runtime_missing`), so this is the same claim,
 // re-asserted where it is used.
-func Binary(generationDir string) string {
-	return home.VenvTool(filepath.Join(generationDir, "venv"), "cozy-runtime")
+func Binary(generation records.EndpointInstall) string {
+	if generation.Runtime != "" {
+		return generation.Runtime
+	}
+	return home.VenvTool(filepath.Join(generation.Dir, "venv"), "cozy-runtime")
 }
 
 // json runs one verb and decodes its `--json` document.

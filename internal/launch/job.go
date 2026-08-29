@@ -90,7 +90,7 @@ func (f *Facts) JobSpec(function string, devices []string) (orchestrator.WorkerL
 			}},
 		},
 		// The same entry the serving lane uses: the runtime's own public verb (spec.go).
-		Python:   Binary(f.Install.Dir),
+		Python:   Binary(f.Install),
 		Args:     []string{"serve"},
 		Dir:      f.Source,
 		Devices:  devices,
