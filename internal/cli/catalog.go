@@ -1,4 +1,4 @@
-package app
+package cli
 
 import (
 	"fmt"
@@ -6,7 +6,7 @@ import (
 
 	"github.com/cozy-creator/cozy-creator/internal/exit"
 	"github.com/cozy-creator/cozy-creator/internal/hub"
-	"github.com/cozy-creator/cozy-creator/internal/render"
+	"github.com/cozy-creator/cozy-creator/internal/output"
 )
 
 // The catalog verbs (cl-011). Launch-1 tensorhub has no identity plane (decisions
@@ -41,7 +41,19 @@ func handleEndpointSearch(ctx *Context) *exit.Error { return handleResourceSearc
 func handleModelSearch(ctx *Context) *exit.Error    { return handleResourceSearch(ctx, "model") }
 
 func handleResourceSearch(ctx *Context, kind string) *exit.Error {
+	if len(ctx.Inv.Args) == 1 {
+		if _, problem := hub.ParseRef(ctx.Inv.Args[0]); problem == nil {
+			return handleResourceShow(ctx, kind)
+		}
+	}
 	query := strings.ToLower(strings.TrimSpace(strings.Join(ctx.Inv.Args, " ")))
+	limit := 20
+	if raw := ctx.Inv.Value("--limit"); raw != "" {
+		var err error
+		if _, err = fmt.Sscan(raw, &limit); err != nil || limit < 1 || limit > 100 {
+			return exit.Usagef("--limit %q is not between 1 and 100", raw)
+		}
+	}
 
 	c := client(ctx)
 	hctx, cancel := hub.Context()
@@ -57,8 +69,11 @@ func handleResourceSearch(ctx *Context, kind string) *exit.Error {
 	if e != nil {
 		return e
 	}
+	if len(resources) > limit {
+		resources = resources[:limit]
+	}
 
-	l := render.List{
+	l := output.List{
 		Kind:      kind + " search",
 		Fields:    []string{"ref", "created"},
 		AllFields: []string{"ref", "created", "org", "name"},
@@ -69,7 +84,7 @@ func handleResourceSearch(ctx *Context, kind string) *exit.Error {
 		})
 	}
 
-	l.Aggregates = []render.Field{
+	l.Aggregates = []output.Field{
 		{K: "results", V: len(l.Rows)},
 		{K: kind + "s", V: search.Total},
 		{K: "hub", V: c.Base()},
@@ -84,12 +99,16 @@ func handleResourceSearch(ctx *Context, kind string) *exit.Error {
 	switch {
 	case len(l.Rows) == 0 && query == "":
 		l.Empty = "0 " + kind + "s in the catalog"
-		l.Next = []string{"cozy " + kind + " create <org/name> --reason <why>"}
+		l.Next = []string{"cozy " + kind + " publish <org/name>"}
 	case len(l.Rows) == 0:
 		l.Empty = "0 results for \"" + query + "\""
 		l.Next = []string{"cozy " + kind + " search"}
 	default:
-		l.Next = []string{"cozy " + kind + " show <org/name>"}
+		verb := "install"
+		if kind == "model" {
+			verb = "download"
+		}
+		l.Next = []string{"cozy " + kind + " " + verb + " <org/name>"}
 	}
 	return emit(ctx, l)
 }
@@ -114,9 +133,9 @@ func handleResourceShow(ctx *Context, kind string) *exit.Error {
 	if e != nil {
 		return e
 	}
-	return emit(ctx, render.Record{
+	return emit(ctx, output.Record{
 		Kind: kind,
-		Fields: []render.Field{
+		Fields: []output.Field{
 			{K: "ref", V: r.Ref()},
 			{K: "created", V: stamp(r.CreatedAt)},
 			{K: "hub", V: c.Base()},
@@ -152,9 +171,9 @@ func handleResourceCreate(ctx *Context, kind string) *exit.Error {
 	if e != nil {
 		return e
 	}
-	return emit(ctx, render.Record{
+	return emit(ctx, output.Record{
 		Kind: kind,
-		Fields: []render.Field{
+		Fields: []output.Field{
 			{K: "ref", V: r.Ref()},
 			{K: "created", V: stamp(r.CreatedAt)},
 			{K: "hub", V: c.Base()},
@@ -170,9 +189,9 @@ func handleHubStatus(ctx *Context) *exit.Error {
 	hctx, cancel := hub.Context()
 	defer cancel()
 
-	rec := render.Record{
+	rec := output.Record{
 		Kind: "hub",
-		Fields: []render.Field{
+		Fields: []output.Field{
 			{K: "url", V: c.Base() + " (" + ctx.Cfg.HubURLSource + ")"},
 			{K: "token", V: c.Token().Digest() + " (" + ctx.Cfg.HubTokenSource + ")"},
 		},
@@ -184,23 +203,23 @@ func handleHubStatus(ctx *Context) *exit.Error {
 		// An unreachable hub is a STATE this verb reports, not a refusal it raises:
 		// the answer to "what hub am I pointed at" is exactly what a user needs when
 		// it is down. Content-first: unreachable is a state this command reports, not an error.
-		rec.Fields = append(rec.Fields, render.Field{K: "reachable", V: false})
+		rec.Fields = append(rec.Fields, output.Field{K: "reachable", V: false})
 		rec.Notes = append([]string{e.Message, e.Remedy}, rec.Notes...)
 		rec.Next = []string{"TENSORHUB_URL=<url> cozy hub status"}
 		return emit(ctx, rec)
 	}
 	rec.Fields = append(rec.Fields,
-		render.Field{K: "reachable", V: true},
-		render.Field{K: "status", V: health.Status},
-		render.Field{K: "env", V: health.Env},
+		output.Field{K: "reachable", V: true},
+		output.Field{K: "status", V: health.Status},
+		output.Field{K: "env", V: health.Env},
 	)
 	if _, search, e := c.Endpoints(hctx, ""); e == nil {
-		rec.Fields = append(rec.Fields, render.Field{K: "endpoints", V: search.Total})
+		rec.Fields = append(rec.Fields, output.Field{K: "endpoints", V: search.Total})
 	} else {
 		rec.Notes = append(rec.Notes, "the endpoint listing refused: "+e.Message)
 	}
 	if _, search, e := c.Models(hctx, ""); e == nil {
-		rec.Fields = append(rec.Fields, render.Field{K: "models", V: search.Total})
+		rec.Fields = append(rec.Fields, output.Field{K: "models", V: search.Total})
 	} else {
 		rec.Notes = append(rec.Notes, "the model listing refused: "+e.Message)
 	}
@@ -220,7 +239,7 @@ func handleHubConfig(ctx *Context) *exit.Error {
 		return e
 	}
 
-	l := render.List{
+	l := output.List{
 		Kind:      "hub config",
 		Fields:    []string{"key", "value", "source"},
 		AllFields: []string{"key", "value", "source", "secret", "doc"},
@@ -236,7 +255,7 @@ func handleHubConfig(ctx *Context) *exit.Error {
 			"secret": boolText(k.Secret), "doc": k.Doc,
 		})
 	}
-	l.Aggregates = []render.Field{
+	l.Aggregates = []output.Field{
 		{K: "keys", V: len(keys)},
 		{K: "secrets", V: secrets},
 		{K: "env", V: env},

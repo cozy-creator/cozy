@@ -329,10 +329,10 @@ DOCUMENT_KINDS = {
     "cozy.client.JobSubmission/1": "internal/api/jobs.go",
     "cozy.client.Submission/1": "internal/api/requests.go",
     "cozy.local.EntrypointBindingRecord/2": "internal/plan/plan.go",
-    "cozy.local.EvaluatedConfig/1": "internal/app/identity.go",
-    "cozy.local.ExecutionEnvironment/1": "internal/app/identity.go",
+    "cozy.local.EvaluatedConfig/1": "internal/cli/identity.go",
+    "cozy.local.ExecutionEnvironment/1": "internal/cli/identity.go",
     "cozy.local.ManagedBaseReceipt/1": "internal/managedinstall/install.go",
-    "cozy.rental_request/1": "internal/app/rentals.go",
+    "cozy.rental_request/1": "internal/cli/rentals.go",
     "cozy.video/1": "internal/video/source.go",
     "cozy.video.CreativePlan/1": "internal/video/composition.go",
     "cozy.workflow.ChildIdentity/1": "internal/workflow/materialize.go",
@@ -731,8 +731,8 @@ def check_typed_resources():
     bad = []
     product_files = [
         pathlib.Path("internal/manifest/commands.go"),
-        pathlib.Path("internal/app/catalog.go"),
-        pathlib.Path("internal/app/transfer.go"),
+        pathlib.Path("internal/cli/catalog.go"),
+        pathlib.Path("internal/cli/transfer.go"),
         pathlib.Path("internal/hub/hub.go"),
         pathlib.Path("internal/hub/publish.go"),
     ]

@@ -3,7 +3,7 @@
 // Detaching and signalling the LocalService — the two process facts this package needs, on
 // the platforms that spell them with a session and a signal. `proc_windows.go` says the
 // same two things the way Windows has them.
-package app
+package cli
 
 import (
 	"os/exec"

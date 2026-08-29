@@ -34,8 +34,8 @@ import (
 
 	"github.com/cozy-creator/cozy-creator/internal/exit"
 	"github.com/cozy-creator/cozy-creator/internal/hub"
-	"github.com/cozy-creator/cozy-creator/internal/render"
 	"github.com/cozy-creator/cozy-creator/internal/tfs"
+	"github.com/cozy-creator/cozy-creator/internal/units"
 )
 
 // Fetch is one checkpoint pulled into the local store.
@@ -454,7 +454,7 @@ func short1(id string) string {
 	return id
 }
 
-func size(n int64) string { return render.Bytes(n) }
+func size(n int64) string { return units.Bytes(n) }
 
 // Timing renders a phase breakdown in one line, longest phase last so the eye lands
 // on where the time went. Phases are named by what they DID, not by which call was

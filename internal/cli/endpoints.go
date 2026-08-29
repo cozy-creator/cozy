@@ -1,4 +1,4 @@
-package app
+package cli
 
 import (
 	"fmt"
@@ -13,8 +13,8 @@ import (
 	"github.com/cozy-creator/cozy-creator/internal/hub"
 	"github.com/cozy-creator/cozy-creator/internal/install"
 	"github.com/cozy-creator/cozy-creator/internal/managedinstall"
+	"github.com/cozy-creator/cozy-creator/internal/output"
 	"github.com/cozy-creator/cozy-creator/internal/records"
-	"github.com/cozy-creator/cozy-creator/internal/render"
 	"github.com/cozy-creator/cozy-creator/internal/retention"
 )
 
@@ -68,9 +68,9 @@ func handleInstall(ctx *Context) *exit.Error {
 		return e
 	}
 	g := res.Gen
-	rec := render.Record{
+	rec := output.Record{
 		Kind: "install",
-		Fields: []render.Field{
+		Fields: []output.Field{
 			{K: "endpoint", V: g.Endpoint},
 			{K: "major", V: g.Major},
 			{K: "version", V: g.Version},
@@ -91,16 +91,16 @@ func handleInstall(ctx *Context) *exit.Error {
 		},
 	}
 	if res.Idempotent {
-		rec.Fields = append(rec.Fields, render.Field{K: "result", V: "already pinned — nothing changed"})
+		rec.Fields = append(rec.Fields, output.Field{K: "result", V: "already pinned — nothing changed"})
 		rec.Next = []string{"cozy ls"}
 		return emit(ctx, rec)
 	}
 	rec.Fields = append(rec.Fields,
-		render.Field{K: "staged", V: fmt.Sprintf("%d files, %s expanded, %s compressed", res.Files, render.Bytes(res.Bytes), render.Bytes(res.Compressed))},
-		render.Field{K: "timings", V: timingsText(res.Timings)},
+		output.Field{K: "staged", V: fmt.Sprintf("%d files, %s expanded, %s compressed", res.Files, output.Bytes(res.Bytes), output.Bytes(res.Compressed))},
+		output.Field{K: "timings", V: timingsText(res.Timings)},
 	)
 	if res.Superseded != "" {
-		rec.Fields = append(rec.Fields, render.Field{K: "superseded", V: res.Superseded})
+		rec.Fields = append(rec.Fields, output.Field{K: "superseded", V: res.Superseded})
 		rec.Notes = append(rec.Notes,
 			"the superseded generation is untouched on disk until `cozy gc` reclaims it")
 	}
@@ -172,7 +172,7 @@ func handleManagedInstall(ctx *Context, profile string) *exit.Error {
 		return e
 	}
 	g, facts := installed.Install, installed.Facts
-	rec := render.Record{Kind: "install", Fields: []render.Field{
+	rec := output.Record{Kind: "install", Fields: []output.Field{
 		{K: "endpoint", V: g.Endpoint}, {K: "major", V: g.Major}, {K: "release", V: g.Version},
 		{K: "profile", V: facts.Profile}, {K: "candidate", V: facts.CandidateID},
 		{K: "generation", V: g.ID}, {K: "base_realization", V: facts.BaseRealizationDigest},
@@ -187,13 +187,13 @@ func handleManagedInstall(ctx *Context, profile string) *exit.Error {
 		"control install, portable Runtime receipt, local-base fingerprint, host evidence, and lease are separate recorded facts",
 	}, Next: []string{"cozy start " + g.Endpoint + "@v" + strconv.Itoa(g.Major), "cozy run <org/endpoint/vN/function>"}}
 	if facts.NativeEvidenceDigest != "" {
-		rec.Fields = append(rec.Fields, render.Field{K: "native_evidence", V: facts.NativeEvidenceDigest})
+		rec.Fields = append(rec.Fields, output.Field{K: "native_evidence", V: facts.NativeEvidenceDigest})
 	}
 	if installed.Idempotent {
-		rec.Fields = append(rec.Fields, render.Field{K: "result", V: "already pinned — nothing changed"})
+		rec.Fields = append(rec.Fields, output.Field{K: "result", V: "already pinned — nothing changed"})
 	}
 	if installed.Superseded != "" {
-		rec.Fields = append(rec.Fields, render.Field{K: "superseded", V: installed.Superseded})
+		rec.Fields = append(rec.Fields, output.Field{K: "superseded", V: installed.Superseded})
 	}
 	return emit(ctx, rec)
 }
@@ -208,7 +208,7 @@ func handleLs(ctx *Context) *exit.Error {
 	if e != nil {
 		return e
 	}
-	l := render.List{
+	l := output.List{
 		Kind:      "ls",
 		Fields:    []string{"endpoint", "major", "version", "disk"},
 		AllFields: []string{"endpoint", "major", "version", "generation", "disk", "exclusive", "shared", "python", "uv", "cuda_extra", "link_mode", "packages", "closure", "descriptor", "source", "verified", "installed"},
@@ -224,8 +224,8 @@ func handleLs(ctx *Context) *exit.Error {
 			"version":    g.Version,
 			"generation": g.ID,
 			"disk":       diskText(g),
-			"exclusive":  render.Bytes(g.BytesExcl),
-			"shared":     render.Bytes(g.BytesShared),
+			"exclusive":  output.Bytes(g.BytesExcl),
+			"shared":     output.Bytes(g.BytesShared),
 			"python":     g.Python,
 			"uv":         g.UV,
 			"cuda_extra": orNone(g.Extra),
@@ -242,10 +242,10 @@ func handleLs(ctx *Context) *exit.Error {
 		l.Next = []string{"cozy install <org/endpoint>", "cozy endpoint search"}
 		return emit(ctx, l)
 	}
-	l.Aggregates = []render.Field{
+	l.Aggregates = []output.Field{
 		{K: "endpoints", V: len(l.Rows)},
-		{K: "exclusive", V: render.Bytes(excl)},
-		{K: "hardlink-shared", V: render.Bytes(shared)},
+		{K: "exclusive", V: output.Bytes(excl)},
+		{K: "hardlink-shared", V: output.Bytes(shared)},
 	}
 	l.Notes = []string{"read from the install records; no directory was walked"}
 	return emit(ctx, l)
@@ -259,7 +259,7 @@ func handleRm(ctx *Context) *exit.Error {
 	defer st.Close()
 	defer w.Unlock()
 
-	removed := render.List{
+	removed := output.List{
 		Kind:      "rm",
 		Fields:    []string{"endpoint", "major", "generation"},
 		AllFields: []string{"endpoint", "major", "generation", "reclaimed"},
@@ -288,7 +288,7 @@ func handleRm(ctx *Context) *exit.Error {
 				"endpoint":   p.Endpoint,
 				"major":      fmt.Sprintf("v%d", p.Major),
 				"generation": p.InstallID,
-				"reclaimed":  render.Bytes(n),
+				"reclaimed":  output.Bytes(n),
 			})
 		}
 	}
@@ -297,9 +297,9 @@ func handleRm(ctx *Context) *exit.Error {
 		removed.Next = []string{"cozy ls"}
 		return emit(ctx, removed)
 	}
-	removed.Aggregates = []render.Field{
+	removed.Aggregates = []output.Field{
 		{K: "removed", V: len(removed.Rows)},
-		{K: "reclaimed", V: render.Bytes(freed)},
+		{K: "reclaimed", V: output.Bytes(freed)},
 	}
 	removed.Notes = []string{"shared-CAS weights are untouched; `cozy gc` reclaims what nothing references"}
 	removed.Next = []string{"cozy gc"}
@@ -337,7 +337,7 @@ func handleGC(ctx *Context) *exit.Error {
 	if e != nil {
 		return e
 	}
-	out := render.List{
+	out := output.List{
 		Kind:      "gc",
 		Fields:    []string{"kind", "id", "endpoint", "bytes"},
 		AllFields: []string{"kind", "id", "endpoint", "version", "age", "bytes", "reason"},
@@ -348,14 +348,14 @@ func handleGC(ctx *Context) *exit.Error {
 		total += r.Bytes
 		out.Rows = append(out.Rows, map[string]string{
 			"kind": r.Kind, "id": r.ID, "endpoint": r.Endpoint, "version": r.Version,
-			"age": "-", "bytes": render.Bytes(r.Bytes), "reason": r.Reason,
+			"age": "-", "bytes": output.Bytes(r.Bytes), "reason": r.Reason,
 		})
 	}
 	for _, m := range media.Items {
 		total += m.Bytes
 		out.Rows = append(out.Rows, map[string]string{
 			"kind": "media", "id": m.MediaID, "endpoint": m.Endpoint, "version": "-",
-			"age": retention.Age(m.Age), "bytes": render.Bytes(m.Bytes), "reason": m.Reason,
+			"age": retention.Age(m.Age), "bytes": output.Bytes(m.Bytes), "reason": m.Reason,
 		})
 	}
 	items := len(plan) + len(media.Items)
@@ -367,18 +367,18 @@ func handleGC(ctx *Context) *exit.Error {
 	if publicationItems > 0 {
 		out.Notes = append(out.Notes, fmt.Sprintf(
 			"%d job publication(s), %s are retained indefinitely; gc reports but never reclaims the durable result plane",
-			publicationItems, render.Bytes(publicationBytes)))
+			publicationItems, output.Bytes(publicationBytes)))
 	}
 	if !write {
-		out.Aggregates = []render.Field{
-			{K: "reclaimable", V: render.Bytes(total)},
+		out.Aggregates = []output.Field{
+			{K: "reclaimable", V: output.Bytes(total)},
 			{K: "items", V: items},
 			{K: "media", V: fmt.Sprintf("%d output(s), %s beyond the %s horizon",
-				len(media.Items), render.Bytes(media.Bytes), retention.Short(horizon))},
+				len(media.Items), output.Bytes(media.Bytes), retention.Short(horizon))},
 			{K: "retained", V: fmt.Sprintf("%d output(s), %s kept",
-				media.RetainedItems, render.Bytes(media.RetainedBytes))},
+				media.RetainedItems, output.Bytes(media.RetainedBytes))},
 			{K: "publications", V: fmt.Sprintf("%d publication(s), %s retained indefinitely",
-				publicationItems, render.Bytes(publicationBytes))},
+				publicationItems, output.Bytes(publicationBytes))},
 			{K: "cas", V: "0 objects (the shared weights CAS lands with cl-012)"},
 		}
 		if items == 0 {
@@ -399,14 +399,14 @@ func handleGC(ctx *Context) *exit.Error {
 	if e != nil {
 		return e
 	}
-	out.Aggregates = []render.Field{
-		{K: "freed", V: render.Bytes(freed + reclaimed)},
+	out.Aggregates = []output.Field{
+		{K: "freed", V: output.Bytes(freed + reclaimed)},
 		{K: "items", V: items},
-		{K: "media", V: fmt.Sprintf("%d output(s), %s", len(media.Items), render.Bytes(reclaimed))},
+		{K: "media", V: fmt.Sprintf("%d output(s), %s", len(media.Items), output.Bytes(reclaimed))},
 		{K: "retained", V: fmt.Sprintf("%d output(s), %s kept",
-			media.RetainedItems, render.Bytes(media.RetainedBytes))},
+			media.RetainedItems, output.Bytes(media.RetainedBytes))},
 		{K: "publications", V: fmt.Sprintf("%d publication(s), %s retained indefinitely",
-			publicationItems, render.Bytes(publicationBytes))},
+			publicationItems, output.Bytes(publicationBytes))},
 	}
 	if items > 0 {
 		out.Notes = append(out.Notes,
@@ -419,9 +419,9 @@ func handleGC(ctx *Context) *exit.Error {
 
 func diskText(g records.EndpointInstall) string {
 	if g.BytesShared == 0 {
-		return render.Bytes(g.BytesExcl)
+		return output.Bytes(g.BytesExcl)
 	}
-	return fmt.Sprintf("%s (+%s shared)", render.Bytes(g.BytesExcl), render.Bytes(g.BytesShared))
+	return fmt.Sprintf("%s (+%s shared)", output.Bytes(g.BytesExcl), output.Bytes(g.BytesShared))
 }
 
 func orNone(s string) string {

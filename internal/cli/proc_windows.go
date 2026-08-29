@@ -5,7 +5,7 @@
 // AUTHENTICATED shutdown route (the service has no console a ctrl event could reach), and
 // only the forced tier ends the process by handle. Exit is still proved the same way it is
 // everywhere — by the LOCK becoming free, never by the pid disappearing.
-package app
+package cli
 
 import (
 	"fmt"

@@ -242,6 +242,8 @@ Mounted under `/v1/local/` so the Creator-only boundary is visible in the URL.
 | `DELETE /v1/local/workers/{instance_id}` | local | yes | drain and stop the process group |
 | `POST /v1/local/rentals/{rental_id}/placement-revisions` | local | yes | `Idempotency-Key`; author one Tensorhub revision and relay grant-before-set on the same claimed worker |
 | `GET /v1/local/doctor` | local | yes | host facts, bound families, counts |
+| `POST /v1/local/service/unload` | local | yes | stop definitely-idle local serving workers; never touch active work, jobs, rentals, or installed bytes |
+| `POST /v1/local/service/exit` | local | yes | safe exit fence; `{all:true}` requests local cancellation and returns paid obligations that must be confirmed absent before retrying |
 | `POST /v1/local/service/shutdown` | local | yes | ask the service to drain every worker and exit (`cozy down`'s cooperative tier); exit is proved by the service lock, never this reply |
 | `GET /v1/local/attempts/{attempt_key}/triage` | local | yes | the retained WorkerTriageBundle |
 | `POST /v1/local/jobs` | local | yes | submit one bounded job; `Idempotency-Key`; 202 with the handle and its publication repo |

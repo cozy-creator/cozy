@@ -418,7 +418,7 @@ func (c *Orchestrator) selectOrStart(req records.Request) {
 	}
 	stale := ""
 	for _, w := range c.workers {
-		if w.exited || w.spec.Placement.Endpoint != pinnedEndpoint(req.Endpoint, req.Worker) ||
+		if w.exited || w.stopping || w.spec.Placement.Endpoint != pinnedEndpoint(req.Endpoint, req.Worker) ||
 			w.spec.IsJob() != req.IsJob() {
 			continue
 		}
@@ -903,7 +903,7 @@ func (c *Orchestrator) pick(req records.Request) (*worker, *session, uint64, *di
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	for _, w := range c.workers {
-		if w.exited || w.spec.Placement.Endpoint != slot {
+		if w.exited || w.stopping || w.spec.Placement.Endpoint != slot {
 			continue
 		}
 		if req.InstallID != "" && w.spec.Placement.InstallID != req.InstallID {

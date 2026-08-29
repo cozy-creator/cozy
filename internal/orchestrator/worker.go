@@ -1369,6 +1369,16 @@ func (c *Orchestrator) shutdownWorker(w *worker, grace time.Duration) bool {
 		return false
 	}
 	w.stopping = true
+	c.mu.Unlock()
+	return c.stopClaimedWorker(w, grace)
+}
+
+// stopClaimedWorker completes teardown after the caller has atomically withdrawn the
+// worker from selection by setting stopping. Keeping the claim separate lets `unload`
+// stop only a worker it proved idle without reopening a dispatch race between proof and
+// teardown.
+func (c *Orchestrator) stopClaimedWorker(w *worker, grace time.Duration) bool {
+	c.mu.Lock()
 	cancelControl := w.cancelControl
 	attachDone, processDone := w.attachDone, w.processDone
 	pid, exited := 0, w.exited
@@ -1422,6 +1432,66 @@ func (c *Orchestrator) shutdownWorker(w *worker, grace time.Duration) bool {
 			w.instanceID, closeProblem.Message)
 	} else {
 		c.logf("worker %s stopped; its device grant is released", w.instanceID)
+	}
+	return true
+}
+
+// UnloadIdleLocalWorkers stops every definitely-idle local serving worker. Remote
+// workers are paid resources owned by the rental lifecycle, job workers are run-once,
+// and any active request, outstanding offer, reservation, or unacked terminal keeps a
+// worker alive. Process exit is the reliable release of its GPU-resident model.
+func (c *Orchestrator) UnloadIdleLocalWorkers() ([]WorkerFacts, *exit.Error) {
+	active, e := c.opt.Store.ActiveRequests()
+	if e != nil {
+		return nil, e
+	}
+
+	c.mu.Lock()
+	candidates := make([]*worker, 0, len(c.workers))
+	for _, w := range c.workers {
+		if w.spec.Connection == nil && !w.spec.IsJob() {
+			candidates = append(candidates, w)
+		}
+	}
+	c.mu.Unlock()
+	sort.Slice(candidates, func(i, j int) bool {
+		return candidates[i].instanceID < candidates[j].instanceID
+	})
+
+	stopped := make([]WorkerFacts, 0, len(candidates))
+	for _, w := range candidates {
+		c.mu.Lock()
+		if !c.idleLocalWorkerLocked(w, active) {
+			c.mu.Unlock()
+			continue
+		}
+		facts := factsOf(w)
+		w.stopping = true
+		c.mu.Unlock()
+		if c.stopClaimedWorker(w, StopGrace) {
+			stopped = append(stopped, facts)
+		}
+	}
+	if len(stopped) > 0 {
+		c.reviveQueue()
+	}
+	return stopped, nil
+}
+
+func (c *Orchestrator) idleLocalWorkerLocked(w *worker, active []records.Request) bool {
+	if w == nil || c.workers[w.instanceID] != w || w.exited || w.stopping ||
+		w.spec.Connection != nil || w.spec.IsJob() || w.reservedSlots != 0 || w.unacked != 0 {
+		return false
+	}
+	for _, reservation := range c.offers {
+		if reservation.worker == w {
+			return false
+		}
+	}
+	for _, req := range active {
+		if req.Worker == "" && staged(w, req.PlanID) {
+			return false
+		}
 	}
 	return true
 }

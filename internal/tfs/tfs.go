@@ -40,6 +40,14 @@ type Tool struct {
 	env    []string
 }
 
+// Root is one name in TensorFS's root authority. Creator renders the fact but
+// never reads or composes the store's metadata files directly.
+type Root struct {
+	Name     string
+	Kind     string
+	Snapshot string
+}
+
 // Open resolves the binary and the store. A missing `tfs` is a structural refusal
 // (exit 6) naming what to install: this binary cannot substitute for it, and a
 // cozy-creator-side reimplementation is exactly what boundaries.md forbids.
@@ -291,6 +299,30 @@ func (t *Tool) Register(name, snapshot string) *exit.Error {
 func (t *Tool) Note(snapshot string) *exit.Error {
 	_, e := t.run("root", "note", t.Root, hex(snapshot), "--hub-published")
 	return e
+}
+
+// Roots lists the local root authority through TensorFS's public CLI.
+func (t *Tool) Roots() ([]Root, *exit.Error) {
+	out, problem := t.run("root", "list", t.Root)
+	if problem != nil {
+		return nil, problem
+	}
+	var roots []Root
+	for _, line := range strings.Split(out, "\n") {
+		fields := strings.Fields(line)
+		if len(fields) != 4 || fields[0] != "root" || !strings.HasPrefix(fields[3], "sha256:") {
+			continue
+		}
+		roots = append(roots, Root{Name: fields[1], Kind: fields[2], Snapshot: fields[3]})
+	}
+	return roots, nil
+}
+
+// ReleaseRoot drops one local name. TensorFS deliberately leaves byte reclaim
+// to its later complete mark/sweep pass.
+func (t *Tool) ReleaseRoot(name string) *exit.Error {
+	_, problem := t.run("root", "release", t.Root, name)
+	return problem
 }
 
 // hex strips the `sha256:` spelling for the argument position tfs takes bare hex in.

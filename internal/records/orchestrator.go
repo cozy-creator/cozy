@@ -804,6 +804,28 @@ func (s *Store) RequestsOfKind(kind, state string, limit int) ([]Request, *exit.
 	return out, nil
 }
 
+// ActiveRequests is every invocation the controller still owes work or a terminal.
+// Lifecycle operations use the complete set rather than a presentation-limited request
+// listing: omitting row 501 from a safety fence would make `exit` destructive by accident.
+func (s *Store) ActiveRequests() ([]Request, *exit.Error) {
+	rows, err := s.db.Query(`SELECT ` + requestCols + ` FROM requests
+		WHERE state IN ('submitted','queued','dispatching','requeue_pending')
+		ORDER BY created_at,id`)
+	if err != nil {
+		return nil, exit.Internalf("cannot list active requests: %s", err)
+	}
+	defer rows.Close()
+	var out []Request
+	for rows.Next() {
+		r, err := scanRequest(rows)
+		if err != nil {
+			return nil, exit.Internalf("cannot read an active request: %s", err)
+		}
+		out = append(out, r)
+	}
+	return out, nil
+}
+
 // Owed is every request this authority still owes work for and that has NO live attempt:
 // the ones a restarted service must put back on its dispatch queue. A request WITH a live
 // or recovered attempt is not owed capacity — it is owed a terminal, and the

@@ -1,4 +1,4 @@
-package app
+package cli
 
 import (
 	"fmt"
@@ -11,7 +11,7 @@ import (
 	"github.com/cozy-creator/cozy-creator/internal/exit"
 	"github.com/cozy-creator/cozy-creator/internal/home"
 	"github.com/cozy-creator/cozy-creator/internal/hub"
-	"github.com/cozy-creator/cozy-creator/internal/render"
+	"github.com/cozy-creator/cozy-creator/internal/output"
 	"github.com/cozy-creator/cozy-creator/internal/secret"
 	"github.com/cozy-creator/cozy-creator/internal/tfs"
 	"github.com/cozy-creator/cozy-creator/internal/transfer"
@@ -123,52 +123,61 @@ func handleModelPublish(ctx *Context) *exit.Error {
 	}
 	hctx, cancel := hub.LongContext()
 	defer cancel()
+	if _, e := c.Model(hctx, ref); e != nil {
+		if e.Code != exit.NotFound {
+			return e
+		}
+		if _, e := c.CreateModel(hctx, ref.Org, ref.Name, reason); e != nil && e.Code != exit.Conflict {
+			return e
+		}
+	}
 	res, e := p.Run(hctx)
 	if e != nil {
 		return e
 	}
 
-	fields := []render.Field{
+	fields := []output.Field{
 		{K: "model", V: ref.String()},
 		{K: "publish_id", V: res.PublishID},
 		{K: "session", V: res.Session},
 		{K: "objects", V: res.Totals.DeclaredObjects},
-		{K: "bytes", V: render.Bytes(res.Totals.DeclaredBytes)},
-		{K: "moved", V: render.Bytes(res.Moved)},
-		{K: "deduped", V: render.Bytes(res.Deduped)},
+		{K: "bytes", V: output.Bytes(res.Totals.DeclaredBytes)},
+		{K: "moved", V: output.Bytes(res.Moved)},
+		{K: "deduped", V: output.Bytes(res.Deduped)},
 	}
 	if p.DryRun {
-		return emit(ctx, render.Record{
+		return emit(ctx, output.Record{
 			Kind: "model publish plan", Fields: append(fields,
-				render.Field{K: "missing", V: res.Totals.MissingObjects},
-				render.Field{K: "held", V: res.Totals.HeldObjects},
-				render.Field{K: "hub", V: c.Base()}),
+				output.Field{K: "missing", V: res.Totals.MissingObjects},
+				output.Field{K: "held", V: res.Totals.HeldObjects},
+				output.Field{K: "hub", V: c.Base()}),
 			Notes: []string{"--dry-run declared and stopped: the plan is the HUB's answer, not a local guess"},
 			Next:  []string{"cozy model publish " + ref.String() + " " + snapshot + " --reason <why>"},
 		})
 	}
 	fields = append(fields,
-		render.Field{K: "uploaded", V: res.Uploaded},
-		render.Field{K: "verified", V: res.Verified},
-		render.Field{K: "checksum_source", V: res.Sources},
-		render.Field{K: "snapshot", V: res.Root.SnapshotID},
-		render.Field{K: "header", V: res.Root.HeaderID},
-		render.Field{K: "topology", V: res.Root.TopologyDigest},
-		render.Field{K: "catalog_root", V: res.Root.CatalogRootID},
-		render.Field{K: "grade", V: res.Grade},
-		render.Field{K: "satisfaction", V: res.Verdict},
-		render.Field{K: "verifier", V: res.Root.VerifierBuild},
-		render.Field{K: "reingested", V: res.Reingest},
-		render.Field{K: "duplicate", V: res.Dup},
-		render.Field{K: "hub", V: c.Base()},
+		output.Field{K: "uploaded", V: res.Uploaded},
+		output.Field{K: "verified", V: res.Verified},
+		output.Field{K: "checksum_source", V: res.Sources},
+		output.Field{K: "snapshot", V: res.Root.SnapshotID},
+		output.Field{K: "header", V: res.Root.HeaderID},
+		output.Field{K: "topology", V: res.Root.TopologyDigest},
+		output.Field{K: "catalog_root", V: res.Root.CatalogRootID},
+		output.Field{K: "grade", V: res.Grade},
+		output.Field{K: "satisfaction", V: res.Verdict},
+		output.Field{K: "verifier", V: res.Root.VerifierBuild},
+		output.Field{K: "reingested", V: res.Reingest},
+		output.Field{K: "duplicate", V: res.Dup},
+		output.Field{K: "hub", V: c.Base()},
 	)
 	notes := []string{
+		"the model name was created idempotently when absent",
 		fmt.Sprintf("the hub re-verified %d already-held objects hermetically: a client receipt substitutes for nothing (law 18)", res.Reingest),
 	}
 	if res.Multipart > 0 {
 		notes = append(notes, fmt.Sprintf("%d objects went as ranged uploads; R2 signs no digest on those, so the hub's own streaming hash discharged it", res.Multipart))
 	}
-	return emit(ctx, render.Record{
+	return emit(ctx, output.Record{
 		Kind: "model publish", Fields: fields, Notes: notes,
 		Next: []string{"cozy model download " + ref.String() + "@" + res.Root.SnapshotID},
 	})
@@ -202,32 +211,32 @@ func handleModelDownload(ctx *Context) *exit.Error {
 		return e
 	}
 
-	fields := []render.Field{
+	fields := []output.Field{
 		{K: "model", V: ref.String()},
 		{K: "snapshot", V: res.Snapshot},
 		{K: "objects", V: res.Objects},
-		{K: "bytes", V: render.Bytes(res.Bytes)},
-		{K: "moved", V: render.Bytes(res.Moved)},
-		{K: "deduped", V: render.Bytes(res.Held)},
+		{K: "bytes", V: output.Bytes(res.Bytes)},
+		{K: "moved", V: output.Bytes(res.Moved)},
+		{K: "deduped", V: output.Bytes(res.Held)},
 	}
 	if f.DryRun {
-		return emit(ctx, render.Record{
-			Kind: "model download plan", Fields: append(fields, render.Field{K: "hub", V: c.Base()}),
+		return emit(ctx, output.Record{
+			Kind: "model download plan", Fields: append(fields, output.Field{K: "hub", V: c.Base()}),
 			Notes: []string{"--dry-run moved nothing; the tensor set is computed from the checkpoint's own documents once they land"},
 			Next:  []string{"cozy model download " + ref.String() + "@" + res.Snapshot},
 		})
 	}
 	fields = append(fields,
-		render.Field{K: "header", V: res.HeaderID},
-		render.Field{K: "admitted", V: res.Admitted},
-		render.Field{K: "skipped", V: res.Skipped},
-		render.Field{K: "tensors", V: res.Tensors},
-		render.Field{K: "parts", V: res.Parts},
-		render.Field{K: "grade", V: res.Grade},
-		render.Field{K: "root", V: tool.Root},
-		render.Field{K: "hub", V: c.Base()},
+		output.Field{K: "header", V: res.HeaderID},
+		output.Field{K: "admitted", V: res.Admitted},
+		output.Field{K: "skipped", V: res.Skipped},
+		output.Field{K: "tensors", V: res.Tensors},
+		output.Field{K: "parts", V: res.Parts},
+		output.Field{K: "grade", V: res.Grade},
+		output.Field{K: "root", V: tool.Root},
+		output.Field{K: "hub", V: c.Base()},
 	)
-	return emit(ctx, render.Record{
+	return emit(ctx, output.Record{
 		Kind: "model download", Fields: fields,
 		Notes: []string{
 			fmt.Sprintf("admitted counts the snapshot manifest too: the closure names what a transfer MOVES (%d objects) and the manifest separately", res.Objects),
@@ -236,6 +245,71 @@ func handleModelDownload(ctx *Context) *exit.Error {
 		},
 		Next: []string{"cozy model download " + ref.String() + "@" + res.Snapshot},
 	})
+}
+
+func localTensorFS(ctx *Context) (*tfs.Tool, *exit.Error) {
+	layout, problem := home.Open(ctx.Cfg.Home)
+	if problem != nil {
+		return nil, problem
+	}
+	return tfs.Open(ctx.Cfg, layout)
+}
+
+func handleModelList(ctx *Context) *exit.Error {
+	tool, problem := localTensorFS(ctx)
+	if problem != nil {
+		return problem
+	}
+	roots, problem := tool.Roots()
+	if problem != nil {
+		return problem
+	}
+	list := output.List{
+		Kind: "model", Fields: []string{"model", "snapshot"},
+		AllFields: []string{"model", "snapshot", "kind"}, Empty: "0 models downloaded",
+	}
+	for _, root := range roots {
+		list.Rows = append(list.Rows, map[string]string{
+			"model": root.Name, "snapshot": root.Snapshot, "kind": root.Kind,
+		})
+	}
+	list.Aggregates = []output.Field{{K: "models", V: len(list.Rows)}}
+	return emit(ctx, list)
+}
+
+func handleModelRemove(ctx *Context) *exit.Error {
+	tool, problem := localTensorFS(ctx)
+	if problem != nil {
+		return problem
+	}
+	roots, problem := tool.Roots()
+	if problem != nil {
+		return problem
+	}
+	held := make(map[string]tfs.Root, len(roots))
+	for _, root := range roots {
+		held[root.Name] = root
+	}
+	removed := output.List{
+		Kind: "model remove", Fields: []string{"model", "snapshot"},
+		AllFields: []string{"model", "snapshot"}, Empty: "0 model roots removed",
+	}
+	for _, name := range ctx.Inv.Args {
+		root, ok := held[name]
+		if !ok {
+			continue
+		}
+		if problem := tool.ReleaseRoot(name); problem != nil {
+			return problem
+		}
+		removed.Rows = append(removed.Rows, map[string]string{
+			"model": root.Name, "snapshot": root.Snapshot,
+		})
+		delete(held, name)
+	}
+	removed.Aggregates = []output.Field{{K: "removed", V: len(removed.Rows)}}
+	removed.Notes = []string{"local names were released; TensorFS garbage collection decides later byte reclamation"}
+	return emit(ctx, removed)
 }
 
 // devKill parses the development kill point both transfer verbs share. It exists to

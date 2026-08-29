@@ -43,6 +43,37 @@ func TestReconcilePreservesWorkerWithUnresolvedBirthIdentity(t *testing.T) {
 	fatal(t, o.store.CloseWorker(pending.InstanceID))
 }
 
+func TestUnloadStopsOnlyIdleLocalServingWorkers(t *testing.T) {
+	o := hostOwner(t, "unload-idle-only")
+	defer o.close()
+
+	idleSpec := fakeSpec("unload-idle", "6", "--arm", "idle")
+	idleID, _, problem := o.c.EnsureWorker(idleSpec)
+	fatal(t, problem)
+	fatal(t, o.c.EnsurePlacementReady(idleID, planIDOf(t, idleSpec)))
+	stopped, problem := o.c.UnloadIdleLocalWorkers()
+	fatal(t, problem)
+	if len(stopped) != 1 || stopped[0].InstanceID != idleID || o.c.Worker(idleID) != nil {
+		t.Fatalf("unload idle = %#v; worker after = %#v", stopped, o.c.Worker(idleID))
+	}
+
+	activeSpec := fakeSpec("unload-active", "6", "--arm", "idle")
+	activeID, _, problem := o.c.EnsureWorker(activeSpec)
+	fatal(t, problem)
+	planID := planIDOf(t, activeSpec)
+	fatal(t, o.c.EnsurePlacementReady(activeID, planID))
+	requestID, attempt, problem := o.c.Submit(submission(
+		planID, "fake/unload-active", "unload-active", map[string]any{"hold": true}))
+	fatal(t, problem)
+	fatal(t, o.c.AwaitAccepted(requestID, attempt, 15*time.Second))
+
+	stopped, problem = o.c.UnloadIdleLocalWorkers()
+	fatal(t, problem)
+	if len(stopped) != 0 || o.c.Worker(activeID) == nil {
+		t.Fatalf("unload touched active worker: stopped=%#v worker=%#v", stopped, o.c.Worker(activeID))
+	}
+}
+
 // TestWorkerRefusals is the interop proof. `internal/live/fakeworker` is a SECOND, independent
 // implementation of the worker protocol that the orchestrator was not co-developed
 // against: it hosts WorkerControl, authors real canonical documents, and lies in exactly

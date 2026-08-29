@@ -1,4 +1,4 @@
-package app
+package cli
 
 import (
 	"fmt"
@@ -15,14 +15,11 @@ import (
 	localapi "github.com/cozy-creator/cozy-creator/internal/client"
 	"github.com/cozy-creator/cozy-creator/internal/exit"
 	"github.com/cozy-creator/cozy-creator/internal/home"
-	"github.com/cozy-creator/cozy-creator/internal/launch"
 	"github.com/cozy-creator/cozy-creator/internal/orchestrator"
+	"github.com/cozy-creator/cozy-creator/internal/output"
 	"github.com/cozy-creator/cozy-creator/internal/records"
-	"github.com/cozy-creator/cozy-creator/internal/render"
 	"github.com/cozy-creator/cozy-creator/internal/rental"
 	"github.com/cozy-creator/cozy-creator/internal/service"
-	"github.com/cozy-creator/cozy-creator/internal/video"
-	"github.com/cozy-creator/cozy-creator/internal/workflow"
 )
 
 // `cozy up` / `cozy down`: the LocalService's own lifecycle (cl-001). The endpoint-process
@@ -51,14 +48,10 @@ func handleUp(ctx *Context) *exit.Error {
 
 	// Already running is idempotent 0 printing the live status.
 	if st := service.Probe(ctx.Cfg); st.Up {
-		return emit(ctx, render.Record{Kind: "service", Fields: []render.Field{
+		return emit(ctx, output.Record{Kind: "service", Fields: []output.Field{
 			{K: "service", V: "up"}, {K: "address", V: st.Addr},
 			{K: "socket", V: st.Socket}, {K: "pid", V: st.PID}, {K: "since", V: st.Since},
 		}, Notes: []string{"already running: `cozy up` is idempotent"}})
-	}
-
-	if ctx.Inv.Bool("--detach") {
-		return detach(ctx, port, yield)
 	}
 
 	socket := l.Root + "/worker.sock"
@@ -122,46 +115,7 @@ func handleUp(ctx *Context) *exit.Error {
 		closeListeners()
 		return e
 	}
-	flows, e := workflow.Open(workflow.Options{
-		Store: st, Owner: c, Resolver: resolver, Rentals: knownRentals, Layout: l, Log: ctx.Out,
-		RemoteEntrypoint: func(worker, name string) (*launch.Entrypoint, *exit.Error) {
-			descriptor, problem := rental.Descriptor(st, worker)
-			if problem != nil {
-				return nil, problem
-			}
-			return descriptor.Function(name)
-		},
-	})
-	if e != nil {
-		closeListeners()
-		return e
-	}
-	c.SetWorkflowWake(flows.Wake)
-	if e := flows.ReconcileCancellations(); e != nil {
-		closeListeners()
-		return e
-	}
 	killed, forgotten, e := c.Reconcile()
-	if e != nil {
-		closeListeners()
-		return e
-	}
-	if e := flows.Reconcile(); e != nil {
-		closeListeners()
-		return e
-	}
-	flows.Start()
-	defer flows.Close()
-	composer, e := video.Open(video.Options{
-		Store: st, Layout: l, Resolver: resolver, Rentals: knownRentals,
-		RemoteEntrypoint: func(worker, name string) (*launch.Entrypoint, *exit.Error) {
-			descriptor, problem := rental.Descriptor(st, worker)
-			if problem != nil {
-				return nil, problem
-			}
-			return descriptor.Function(name)
-		},
-	})
 	if e != nil {
 		closeListeners()
 		return e
@@ -183,9 +137,7 @@ func handleUp(ctx *Context) *exit.Error {
 	server := api.New(api.Options{
 		Orchestrator: c, Cfg: ctx.Cfg, Creds: creds, Addr: addr,
 		Log: ctx.Out, Endpoints: resolver, Bound: bound, Rentals: knownRentals,
-		Shutdown:  func() { stop <- syscall.SIGTERM },
-		Workflows: flows,
-		Videos:    composer,
+		Shutdown: func() { stop <- syscall.SIGTERM },
 	})
 	handler, e := server.Handler()
 	if e != nil {
@@ -206,15 +158,10 @@ func handleUp(ctx *Context) *exit.Error {
 	}
 	go func() { _ = c.Serve() }()
 
-	if ctx.Inv.Bool("--open") {
-		openStub(ctx, creds, addr)
-	}
-
 	signal.Notify(stop, syscall.SIGINT, syscall.SIGTERM)
 	<-stop
 	fmt.Fprintln(ctx.Out, "draining endpoint processes…")
 	closeListeners()
-	flows.Close()
 	c.Close(orchestrator.StopGrace)
 	return nil
 }
@@ -266,7 +213,7 @@ func detach(ctx *Context, port int, yield string) *exit.Error {
 	deadline := time.Now().Add(15 * time.Second)
 	for time.Now().Before(deadline) {
 		if st := service.Probe(ctx.Cfg); st.Up {
-			return emit(ctx, render.Record{Kind: "service", Fields: []render.Field{
+			return emit(ctx, output.Record{Kind: "service", Fields: []output.Field{
 				{K: "service", V: "up"}, {K: "address", V: st.Addr},
 				{K: "socket", V: st.Socket}, {K: "pid", V: st.PID}, {K: "log", V: logPath},
 			}, Next: []string{"cozy status"}})
@@ -288,8 +235,8 @@ func detach(ctx *Context, port int, yield string) *exit.Error {
 func handleDown(ctx *Context) *exit.Error {
 	st := service.Probe(ctx.Cfg)
 	if !st.Up {
-		return emit(ctx, render.Record{Kind: "service",
-			Fields: []render.Field{{K: "service", V: "down"}},
+		return emit(ctx, output.Record{Kind: "service",
+			Fields: []output.Field{{K: "service", V: "down"}},
 			Notes:  []string{"not running: `cozy down` is idempotent"}})
 	}
 	if st.PID <= 0 {
@@ -324,8 +271,8 @@ func handleDown(ctx *Context) *exit.Error {
 		deadline := time.Now().Add(timeout)
 		for time.Now().Before(deadline) {
 			if !service.Probe(ctx.Cfg).Up {
-				return emit(ctx, render.Record{Kind: "service",
-					Fields: []render.Field{{K: "service", V: "down"}, {K: "stopped_pid", V: st.PID}},
+				return emit(ctx, output.Record{Kind: "service",
+					Fields: []output.Field{{K: "service", V: "down"}, {K: "stopped_pid", V: st.PID}},
 					Notes: []string{fmt.Sprintf(
 						"asked over %s; the service lock is free again — the process is provably gone", asked)}})
 			}
@@ -348,7 +295,7 @@ func handleDown(ctx *Context) *exit.Error {
 	if service.Probe(ctx.Cfg).Up {
 		return exit.Internalf("the LocalService (pid %d) survived a kill; its lock is still held", st.PID)
 	}
-	return emit(ctx, render.Record{Kind: "service",
-		Fields: []render.Field{{K: "service", V: "down"}, {K: "stopped_pid", V: st.PID}},
+	return emit(ctx, output.Record{Kind: "service",
+		Fields: []output.Field{{K: "service", V: "down"}, {K: "stopped_pid", V: st.PID}},
 		Notes:  []string{why}})
 }

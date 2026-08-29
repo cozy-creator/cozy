@@ -1,4 +1,4 @@
-package app
+package cli
 
 import (
 	"context"
@@ -12,7 +12,7 @@ import (
 	"github.com/cozy-creator/cozy-creator/internal/endpointpublish"
 	"github.com/cozy-creator/cozy-creator/internal/exit"
 	"github.com/cozy-creator/cozy-creator/internal/hub"
-	"github.com/cozy-creator/cozy-creator/internal/render"
+	"github.com/cozy-creator/cozy-creator/internal/output"
 	"github.com/cozy-creator/cozy-creator/internal/transfer"
 )
 
@@ -43,8 +43,11 @@ func handleEndpointPublish(ctx *Context) *exit.Error {
 	c := client(ctx)
 	hctx, cancel := hub.LongContext()
 	defer cancel()
-	if ctx.Inv.Bool("--create") {
-		if _, problem := c.CreateEndpoint(hctx, ref.Org, ref.Name, reason); problem != nil {
+	if _, problem := c.Endpoint(hctx, ref); problem != nil {
+		if problem.Code != exit.NotFound {
+			return problem
+		}
+		if _, problem := c.CreateEndpoint(hctx, ref.Org, ref.Name, reason); problem != nil && problem.Code != exit.Conflict {
 			return problem
 		}
 	}
@@ -83,25 +86,24 @@ func handleEndpointPublish(ctx *Context) *exit.Error {
 	sort.Strings(profileRows)
 	sort.Strings(candidateIDRows)
 	sort.Strings(refusalRows)
-	fields := []render.Field{
+	fields := []output.Field{
 		{K: "endpoint", V: ref.String()}, {K: "release", V: done.Release},
 		{K: "declaration", V: done.DeclarationDigest}, {K: "created", V: done.Created},
 		{K: "profiles", V: profileRows}, {K: "endpoint_executions", V: len(done.EndpointExecutions)},
-		{K: "uploaded", V: render.Bytes(moved)}, {K: "held", V: render.Bytes(held)},
+		{K: "uploaded", V: output.Bytes(moved)}, {K: "held", V: output.Bytes(held)},
 		{K: "hub", V: c.Base()},
 	}
 	if len(candidateIDRows) > 0 {
-		fields = append(fields, render.Field{K: "candidates", V: candidateIDRows})
+		fields = append(fields, output.Field{K: "candidates", V: candidateIDRows})
 	}
 	if len(refusalRows) > 0 {
-		fields = append(fields, render.Field{K: "profile_refusals", V: refusalRows})
+		fields = append(fields, output.Field{K: "profile_refusals", V: refusalRows})
 	}
-	return emit(ctx, render.Record{Kind: "endpoint publication", Fields: fields, Notes: []string{
-		"source/project bytes were published once; Tensorhub returned each profile's proof-owned eligibility state",
+	return emit(ctx, output.Record{Kind: "endpoint publication", Fields: fields, Notes: []string{
+		"the endpoint name was created idempotently when absent",
+		"source/project bytes were published once; profile candidates are non-serving until Tensorhub qualification",
 		"no endpoint image, Dockerfile, dependency resolver, native build, or serving-pointer move ran",
-	}, Next: []string{
-		"cozy endpoint promote " + ref.String() + " " + release + " --serve <vN/function> --reason <why>",
-	}})
+	}, Next: []string{"cozy endpoint install " + ref.String() + "@" + release}})
 }
 
 func shorten(value string, limit int) string {
@@ -346,7 +348,7 @@ func handleEndpointPromote(ctx *Context) *exit.Error {
 		rows = append(rows, row.EndpointRef+":"+strings.Join(row.EndpointExecutionDigests, ","))
 	}
 	sort.Strings(rows)
-	return emit(ctx, render.Record{Kind: "endpoint promotion", Fields: []render.Field{
+	return emit(ctx, output.Record{Kind: "endpoint promotion", Fields: []output.Field{
 		{K: "endpoint", V: ref.String()}, {K: "release", V: promoted.Release},
 		{K: "serving", V: rows}, {K: "hub", V: c.Base()},
 	}, Notes: []string{"the serving pointers moved in one Tensorhub transaction; endpoint publication never moves them implicitly"}})

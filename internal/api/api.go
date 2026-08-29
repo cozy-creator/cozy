@@ -48,6 +48,7 @@ import (
 	"net"
 	"net/http"
 	"strings"
+	"sync"
 
 	"github.com/cozy-creator/cozy-creator/internal/config"
 	"github.com/cozy-creator/cozy-creator/internal/exit"
@@ -90,6 +91,12 @@ type Server struct {
 	// exclusively through orchestrator.
 	workflows WorkflowController
 	videos    VideoController
+
+	// lifecycle serializes ordinary mutations against the safe-exit fence. Once exit
+	// commits, no request can slip in after the active-work read and before listeners
+	// close; mutations already in flight finish before the fence reads the records.
+	lifecycle sync.RWMutex
+	exiting   bool
 }
 
 // Resolver exposes control-plane placement facts separately from a local worker launch.
@@ -157,6 +164,8 @@ func (s *Server) Handler() (http.Handler, *exit.Error) {
 		"DELETE /v1/local/workers/{instance_id}":                 s.stopWorker,
 		"POST /v1/local/rentals/{rental_id}/placement-revisions": s.reviseRental,
 		"GET /v1/local/doctor":                                   s.doctor,
+		"POST /v1/local/service/unload":                          s.unload,
+		"POST /v1/local/service/exit":                            s.exitService,
 		"POST /v1/local/service/shutdown":                        s.shutdownService,
 		"GET /v1/local/attempts/{attempt_key}/triage":            s.triage,
 		"POST /v1/local/jobs":                                    s.submitJob,
@@ -272,6 +281,16 @@ func (s *Server) guard(route Route, h http.HandlerFunc) http.Handler {
 				"submission needs an "+route.Idempotency+" header",
 				"one key names one request forever; retrying under it is safe by construction")
 			return
+		}
+		if route.Mutation && route.Path != "/v1/local/service/exit" {
+			s.lifecycle.RLock()
+			defer s.lifecycle.RUnlock()
+			if s.exiting {
+				s.refuse(w, r, http.StatusServiceUnavailable, "controller_exiting",
+					"the controller has accepted exit and no longer admits mutations",
+					"wait for the service lock to become free")
+				return
+			}
 		}
 		h(w, r)
 	})

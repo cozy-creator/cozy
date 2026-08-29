@@ -171,6 +171,27 @@ func (s *Store) RentalOperation(key string) (*RentalOperation, *exit.Error) {
 	return &op, nil
 }
 
+// ActiveRentalOperations is every paid acquisition/release operation whose absence has
+// not been proved. A row may precede its provider rental id, so a safe controller exit
+// must fence on the operation key as well as on attached rental rows.
+func (s *Store) ActiveRentalOperations() ([]RentalOperation, *exit.Error) {
+	rows, err := s.db.Query(`SELECT ` + rentalOperationCols + ` FROM rental_operations
+		WHERE state NOT IN ('released','rejected') ORDER BY created_at,operation_key`)
+	if err != nil {
+		return nil, exit.Internalf("cannot list active rental operations: %s", err)
+	}
+	defer rows.Close()
+	var out []RentalOperation
+	for rows.Next() {
+		op, err := scanRentalOperation(rows)
+		if err != nil {
+			return nil, exit.Internalf("cannot read an active rental operation: %s", err)
+		}
+		out = append(out, op)
+	}
+	return out, nil
+}
+
 // AdvanceRentalOperation records facts learned from the hub. Empty rentalID preserves a
 // previously learned id, which keeps a later polling update from erasing the join. The
 // compare-and-swap keeps a delayed poll from moving an operation behind a fact another

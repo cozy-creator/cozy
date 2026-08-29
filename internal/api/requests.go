@@ -443,6 +443,7 @@ func (s *Server) stageAssets(assets []records.AssetBinding) ([]records.AssetBind
 // fields a local client has and a cloud one does not need to presign: the typed result,
 // the visible media by OPAQUE id, and the triage handle.
 type Lifecycle struct {
+	Kind        string         `json:"kind"`
 	RequestID   string         `json:"request_id"`
 	Status      string         `json:"status"`
 	Endpoint    string         `json:"endpoint"`
@@ -497,8 +498,12 @@ func (s *Server) getRequest(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) lifecycleOf(row records.Request) Lifecycle {
+	kind := "invocation"
+	if row.IsJob() {
+		kind = "job"
+	}
 	life := Lifecycle{
-		RequestID: row.ID, Status: contractStatus(row.State), Endpoint: row.Endpoint,
+		Kind: kind, RequestID: row.ID, Status: contractStatus(row.State), Endpoint: row.Endpoint,
 		Function: row.Entrypoint, Attempt: uint64(row.Ordinal),
 		ResponseURL: "/v1/requests/" + row.ID, CreatedAt: row.CreatedAt,
 		Outputs: []MediaRef{},

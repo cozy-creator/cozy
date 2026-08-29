@@ -1,4 +1,4 @@
-package app
+package cli
 
 import (
 	"encoding/json"
@@ -14,7 +14,7 @@ import (
 	localapi "github.com/cozy-creator/cozy-creator/internal/client"
 	"github.com/cozy-creator/cozy-creator/internal/exit"
 	"github.com/cozy-creator/cozy-creator/internal/launch"
-	"github.com/cozy-creator/cozy-creator/internal/render"
+	"github.com/cozy-creator/cozy-creator/internal/output"
 )
 
 // THE JOB VERBS (cl-004): `submit` · `status` · `ls` · `follow` · `cancel`. They are
@@ -89,7 +89,7 @@ func handleJobSubmit(ctx *Context) *exit.Error {
 	if ctx.Inv.Bool("--follow") {
 		return followJob(ctx, c, handle.JobID, began)
 	}
-	fields := []render.Field{
+	fields := []output.Field{
 		{K: "job", V: handle.JobID},
 		{K: "endpoint", V: handle.Endpoint},
 		{K: "function", V: handle.Function},
@@ -101,7 +101,7 @@ func handleJobSubmit(ctx *Context) *exit.Error {
 		notes = append(notes,
 			"this key was already recorded — the SAME job answered, nothing new started")
 	}
-	return emit(ctx, render.Record{Kind: "job", Fields: fields, Notes: notes,
+	return emit(ctx, output.Record{Kind: "job", Fields: fields, Notes: notes,
 		Next: []string{"cozy job follow " + handle.JobID, "cozy job status " + handle.JobID}})
 }
 
@@ -183,15 +183,15 @@ func handleJobStatus(ctx *Context) *exit.Error {
 	// EXIT 0: the READ succeeded. The job's own outcome is DATA here, not this command's
 	// verdict (cozy-creator.md) — a failed job read successfully is exit 0 with `failed`
 	// in the document, and `cozy job follow` is the verb whose exit code is the terminal.
-	return emit(ctx, render.Record{Kind: "job", Fields: jobFields(state, true),
+	return emit(ctx, output.Record{Kind: "job", Fields: jobFields(state, true),
 		Notes: jobNotes(state),
 		Next:  jobNext(state)})
 }
 
 // jobFields renders one job. The BILL LINE IS ABSENT unless a rate exists — the field is
 // not emitted at all, rather than emitted as zero.
-func jobFields(state api.JobState, full bool) []render.Field {
-	fields := []render.Field{
+func jobFields(state api.JobState, full bool) []output.Field {
+	fields := []output.Field{
 		{K: "job", V: state.JobID},
 		{K: "endpoint", V: state.Endpoint},
 		{K: "function", V: state.Function},
@@ -199,28 +199,28 @@ func jobFields(state api.JobState, full bool) []render.Field {
 		{K: "elapsed", V: fmt.Sprintf("%.1fs", float64(state.ElapsedMS)/1000)},
 	}
 	if state.QueuePosition != nil {
-		fields = append(fields, render.Field{K: "queue_position", V: *state.QueuePosition})
+		fields = append(fields, output.Field{K: "queue_position", V: *state.QueuePosition})
 	}
 	if state.Stage != "" {
-		fields = append(fields, render.Field{K: "stage", V: state.Stage})
+		fields = append(fields, output.Field{K: "stage", V: state.Stage})
 	}
 	if state.Progress != nil {
-		fields = append(fields, render.Field{K: "progress", V: compactValue(state.Progress)})
+		fields = append(fields, output.Field{K: "progress", V: compactValue(state.Progress)})
 	}
-	fields = append(fields, render.Field{
+	fields = append(fields, output.Field{
 		K: "retries", V: fmt.Sprintf("%d/%d", state.Requeues, state.RetryBudget)})
 	if state.Bill != nil {
-		fields = append(fields, render.Field{K: "bill", V: microUSD(state.Bill.MicroUSD)})
+		fields = append(fields, output.Field{K: "bill", V: microUSD(state.Bill.MicroUSD)})
 	}
 	if !full {
 		return fields
 	}
 	if p := state.Publication; p != nil {
 		fields = append(fields,
-			render.Field{K: "publication", V: p.Repo},
-			render.Field{K: "publication_root", V: p.Root},
-			render.Field{K: "published", V: fmt.Sprintf("%d entr(y|ies), %s, verdict %s",
-				p.Entries, render.Bytes(p.Bytes), strings.ToLower(p.Status))})
+			output.Field{K: "publication", V: p.Repo},
+			output.Field{K: "publication_root", V: p.Root},
+			output.Field{K: "published", V: fmt.Sprintf("%d entr(y|ies), %s, verdict %s",
+				p.Entries, output.Bytes(p.Bytes), strings.ToLower(p.Status))})
 	}
 	if len(state.Checkpoints) > 0 {
 		rows := make([]string, 0, len(state.Checkpoints))
@@ -228,14 +228,14 @@ func jobFields(state api.JobState, full bool) []render.Field {
 			rows = append(rows, fmt.Sprintf("#%d %s/%s %s", c.Attempt, c.OperationKey,
 				c.LogicalKey, c.Outcome))
 		}
-		fields = append(fields, render.Field{K: "checkpoints_declared", V: rows})
+		fields = append(fields, output.Field{K: "checkpoints_declared", V: rows})
 	}
 	if len(state.Outputs) > 0 {
 		outs := make([]string, 0, len(state.Outputs))
 		for _, o := range state.Outputs {
-			outs = append(outs, o.OutputID+" "+o.MediaID+" "+render.Bytes(o.Length))
+			outs = append(outs, o.OutputID+" "+o.MediaID+" "+output.Bytes(o.Length))
 		}
-		fields = append(fields, render.Field{K: "outputs", V: outs})
+		fields = append(fields, output.Field{K: "outputs", V: outs})
 	}
 	if len(state.Artifacts) > 0 {
 		artifacts := make([]string, 0, len(state.Artifacts))
@@ -248,18 +248,18 @@ func jobFields(state api.JobState, full bool) []render.Field {
 				artifact.Attempt, artifact.OutputSlot, state,
 				artifact.ReceiptDigest, artifact.ScratchRootID))
 		}
-		fields = append(fields, render.Field{K: "artifacts", V: artifacts})
+		fields = append(fields, output.Field{K: "artifacts", V: artifacts})
 	}
 	if state.Result != nil {
-		fields = append(fields, render.Field{K: "result", V: state.Result})
+		fields = append(fields, output.Field{K: "result", V: state.Result})
 	}
 	if state.Metrics != nil {
-		fields = append(fields, render.Field{K: "metrics", V: state.Metrics})
+		fields = append(fields, output.Field{K: "metrics", V: state.Metrics})
 	}
 	if state.ErrorType != "" {
 		fields = append(fields,
-			render.Field{K: "error_type", V: state.ErrorType},
-			render.Field{K: "error", V: state.Error})
+			output.Field{K: "error_type", V: state.ErrorType},
+			output.Field{K: "error", V: state.Error})
 	}
 	return fields
 }
@@ -320,16 +320,16 @@ func handleJobLs(ctx *Context) *exit.Error {
 		}
 		rows = append(rows, row)
 	}
-	aggregates := make([]render.Field, 0, len(counts))
+	aggregates := make([]output.Field, 0, len(counts))
 	states := make([]string, 0, len(counts))
 	for state := range counts {
 		states = append(states, state)
 	}
 	sort.Strings(states)
 	for _, state := range states {
-		aggregates = append(aggregates, render.Field{K: state, V: counts[state]})
+		aggregates = append(aggregates, output.Field{K: state, V: counts[state]})
 	}
-	l := render.List{Kind: "job",
+	l := output.List{Kind: "job",
 		Fields:     []string{"job", "target", "state", "age"},
 		AllFields:  []string{"job", "target", "state", "age", "publication", "bill"},
 		Rows:       rows,
@@ -405,8 +405,8 @@ func followJob(ctx *Context, c *localapi.Client, jobID string, began time.Time) 
 		state.Error, _ = terminal.Payload["error"].(string)
 	}
 	fields := append(jobFields(state, true),
-		render.Field{K: "wall_ms", V: time.Since(began).Milliseconds()})
-	rec := render.Record{Kind: "job", Fields: fields, Notes: jobNotes(state)}
+		output.Field{K: "wall_ms", V: time.Since(began).Milliseconds()})
+	rec := output.Record{Kind: "job", Fields: fields, Notes: jobNotes(state)}
 	code := exit.JobTerminal(mapTerminal(status))
 	if code == exit.OK {
 		if state.Publication != nil {
@@ -486,7 +486,7 @@ func handleJobCancel(ctx *Context) *exit.Error {
 	// ALREADY TERMINAL = IDEMPOTENT 0 printing the terminal. A cancel that arrives after
 	// the terminal is late, not wrong.
 	if settled(state.Status) {
-		return emit(ctx, render.Record{Kind: "job", Fields: jobFields(state, false),
+		return emit(ctx, output.Record{Kind: "job", Fields: jobFields(state, false),
 			Notes: []string{"already terminal: `cozy job cancel` is idempotent"}})
 	}
 	if e := c.CancelJob(jobID); e != nil {
@@ -501,7 +501,7 @@ func handleJobCancel(ctx *Context) *exit.Error {
 	if e != nil {
 		return e
 	}
-	return emit(ctx, render.Record{Kind: "job", Fields: jobFields(final, false),
+	return emit(ctx, output.Record{Kind: "job", Fields: jobFields(final, false),
 		Notes: []string{"the terminal the worker journaled is what settled it, not this request"}})
 }
 

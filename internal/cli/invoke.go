@@ -1,4 +1,4 @@
-package app
+package cli
 
 import (
 	"crypto/rand"
@@ -12,6 +12,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"sort"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -22,8 +23,8 @@ import (
 	"github.com/cozy-creator/cozy-creator/internal/home"
 	"github.com/cozy-creator/cozy-creator/internal/launch"
 	"github.com/cozy-creator/cozy-creator/internal/orchestrator"
+	"github.com/cozy-creator/cozy-creator/internal/output"
 	"github.com/cozy-creator/cozy-creator/internal/records"
-	"github.com/cozy-creator/cozy-creator/internal/render"
 	"github.com/cozy-creator/cozy-creator/internal/rental"
 )
 
@@ -61,36 +62,36 @@ func handleStart(ctx *Context) *exit.Error {
 	if e != nil {
 		return e
 	}
-	fields := []render.Field{
+	fields := []output.Field{
 		{K: "endpoint", V: res.Endpoint},
 		{K: "instance", V: res.InstanceID},
 	}
-	fields = append(fields, render.Field{K: "change", V: res.Change})
+	fields = append(fields, output.Field{K: "change", V: res.Change})
 	if res.Change == "none" {
 		// Already serving = idempotent 0 (cozy-creator.md). It is a STATE this verb
 		// reports, not a refusal it raises.
-		return emit(ctx, render.Record{Kind: "worker",
-			Fields: append(fields, render.Field{K: "state", V: "resident"}),
+		return emit(ctx, output.Record{Kind: "worker",
+			Fields: append(fields, output.Field{K: "state", V: "resident"}),
 			Notes:  []string{res.Note}, Next: []string{"cozy run " + ref + "/<function>"}})
 	}
 	// `-d` returns as soon as the process is spawned; the default WAITS for the worker to
 	// advertise a dispatchable plan, because "started" and "warm" are different facts and
 	// a prewarm verb that returned on the first is useless.
 	if ctx.Inv.Bool("--detach") {
-		return emit(ctx, render.Record{Kind: "worker",
-			Fields: append(fields, render.Field{K: "state", V: "spawned"}),
+		return emit(ctx, output.Record{Kind: "worker",
+			Fields: append(fields, output.Field{K: "state", V: "spawned"}),
 			Notes:  []string{res.Note}, Next: []string{"cozy status"}})
 	}
 	worker, e := waitReady(c, res.InstanceID)
 	if e != nil {
 		return e
 	}
-	return emit(ctx, render.Record{Kind: "worker", Fields: append(fields,
-		render.Field{K: "state", V: "ready"},
-		render.Field{K: "pid", V: worker.PID},
-		render.Field{K: "devices", V: worker.Devices},
-		render.Field{K: "ready_plans", V: len(worker.Plans)},
-		render.Field{K: "took", V: took(began)}),
+	return emit(ctx, output.Record{Kind: "worker", Fields: append(fields,
+		output.Field{K: "state", V: "ready"},
+		output.Field{K: "pid", V: worker.PID},
+		output.Field{K: "devices", V: worker.Devices},
+		output.Field{K: "ready_plans", V: len(worker.Plans)},
+		output.Field{K: "took", V: took(began)}),
 		Next: []string{"cozy run " + ref + "/<function>"}})
 }
 
@@ -198,12 +199,12 @@ func handleStop(ctx *Context) *exit.Error {
 			"stopped": fmt.Sprintf("%t", res.Stopped), "pid": itoa(w.PID),
 		})
 	}
-	l := render.List{Kind: "stop",
+	l := output.List{Kind: "stop",
 		Fields:     []string{"endpoint", "instance", "stopped"},
 		AllFields:  []string{"endpoint", "instance", "stopped", "pid"},
 		Rows:       rows,
 		Empty:      "0 workers to stop",
-		Aggregates: []render.Field{{K: "stopped", V: stopped}},
+		Aggregates: []output.Field{{K: "stopped", V: stopped}},
 	}
 	if len(rows) == 0 {
 		// Not running is an idempotent 0, and it says which fact it is answering.
@@ -238,19 +239,19 @@ func handleLogs(ctx *Context) *exit.Error {
 	// `explain` is the SERVER's projection of the bundle, verified against the accepted
 	// terminal before it was rendered. This prints it; it re-explains nothing.
 	if ctx.Mode().JSON {
-		return emit(ctx, render.Record{Kind: "triage", Fields: []render.Field{
+		return emit(ctx, output.Record{Kind: "triage", Fields: []output.Field{
 			{K: "attempt_key", V: t.AttemptKey}, {K: "subject_id", V: t.SubjectID},
 			{K: "length", V: t.Length}, {K: "digest", V: t.Digest},
 			{K: "verified", V: t.Verified}, {K: "explain", V: t.Explain},
 			{K: "bundle", V: t.Bundle},
 		}})
 	}
-	return emit(ctx, render.Lines{Kind: "triage", Key: "explain", Items: t.Explain,
+	return emit(ctx, output.Lines{Kind: "triage", Key: "explain", Items: t.Explain,
 		Empty: "the bundle carries no explainable section",
-		Extra: []render.Field{
+		Extra: []output.Field{
 			{K: "attempt_key", V: t.AttemptKey},
 			{K: "subject_id", V: t.SubjectID},
-			{K: "bytes", V: render.Bytes(t.Length)},
+			{K: "bytes", V: output.Bytes(t.Length)},
 			{K: "verified", V: t.Verified},
 		},
 		Notes: []string{"verified on read against what the accepted terminal declared"},
@@ -302,13 +303,80 @@ func endpointLog(ctx *Context, c *localapi.Client, endpoint string) *exit.Error 
 	if len(all) > lines {
 		all = all[len(all)-lines:]
 	}
-	return emit(ctx, render.Lines{Kind: "log", Key: "lines", Items: all,
+	return emit(ctx, output.Lines{Kind: "log", Key: "lines", Items: all,
 		Empty: "the worker log is empty",
-		Extra: []render.Field{{K: "endpoint", V: endpoint}, {K: "instance", V: instance}},
+		Extra: []output.Field{{K: "endpoint", V: endpoint}, {K: "instance", V: instance}},
 		Notes: []string{"the orchestrator-owned process log; an attempt's triage bundle is `cozy logs <attempt>`"}})
 }
 
 // ----------------------------------------------------------------------------- run
+
+func handleInvokeRun(ctx *Context) *exit.Error {
+	job, problem := invocationIsJob(ctx)
+	if problem != nil {
+		return problem
+	}
+	if !job {
+		if len(ctx.Inv.Values["--input"]) > 0 {
+			return exit.Usagef("--input-tree applies only to a job callable")
+		}
+		return handleRun(ctx)
+	}
+	if ctx.Inv.Value("--worker") != "" {
+		return exit.Named(exit.Usage, "rental_job_unsupported",
+			"private rental dispatch for job callables is not implemented").
+			WithRemedy("run this job locally, or choose a serving entrypoint on the rental")
+	}
+	if ctx.Inv.Bool("--offline") || ctx.Inv.Bool("--stream") ||
+		len(ctx.Inv.Values["--asset"]) > 0 || ctx.Inv.Value("--out") != "" ||
+		ctx.Inv.Value("--adapter") != "" || ctx.Inv.Value("--lane") != "" ||
+		ctx.Inv.Value("--seed") != "" {
+		return exit.Usagef("the selected callable is a job and received a serving-only flag").
+			WithRemedy("jobs accept payload values, --in, --input-tree, --model, --org, --detach, and placement")
+	}
+	if !ctx.Inv.Bool("--detach") {
+		ctx.Inv.Bools["--follow"] = true
+	}
+	return handleJobSubmit(ctx)
+}
+
+func invocationIsJob(ctx *Context) (bool, *exit.Error) {
+	target, problem := parseTarget(ctx.Inv.Args[0])
+	if problem != nil {
+		return false, problem
+	}
+	var descriptor *launch.Descriptor
+	if worker := strings.TrimSpace(ctx.Inv.Value("--worker")); worker != "" {
+		layout, problem := home.Open(ctx.Cfg.Home)
+		if problem != nil {
+			return false, problem
+		}
+		store, problem := records.Open(layout.DB)
+		if problem != nil {
+			return false, problem
+		}
+		defer store.Close()
+		descriptor, problem = rental.Descriptor(store, worker)
+		if problem != nil {
+			return false, problem
+		}
+	} else {
+		facts, problem := generationFacts(ctx, target.Endpoint, target.Major)
+		if problem != nil {
+			return false, problem
+		}
+		descriptor = facts.Descriptor
+	}
+	for _, job := range descriptor.Jobs {
+		if job.Name == target.Function {
+			return true, nil
+		}
+	}
+	if _, problem := descriptor.Function(target.Function); problem != nil {
+		return false, problem
+	}
+	return false, nil
+}
 
 func handleRun(ctx *Context) *exit.Error {
 	if ctx.Inv.Bool("--cloud") {
@@ -401,6 +469,16 @@ func handleRun(ctx *Context) *exit.Error {
 		return e
 	}
 	submitted := time.Since(began)
+	if ctx.Inv.Bool("--detach") {
+		notes := []string{}
+		if handle.Replay {
+			notes = append(notes, "this idempotency key returned the existing invocation")
+		}
+		return emit(ctx, output.Record{Kind: "invocation", Fields: []output.Field{
+			{K: "id", V: handle.RequestID}, {K: "kind", V: "invocation"},
+			{K: "status", V: handle.Status}, {K: "attempt", V: handle.Attempt},
+		}, Notes: notes, Next: []string{"cozy invoke list", "cozy invoke cancel " + handle.RequestID}})
+	}
 
 	stream := ctx.Inv.Bool("--stream")
 	if !stream && !ctx.Mode().JSON {
@@ -424,6 +502,108 @@ func handleRun(ctx *Context) *exit.Error {
 		return e
 	}
 	return renderRun(ctx, life, terminal, stopped, saved, submitted, began)
+}
+
+func handleInvokeCancel(ctx *Context) *exit.Error {
+	id := ctx.Inv.Args[0]
+	if strings.HasPrefix(id, "job-") {
+		return handleJobCancel(ctx)
+	}
+	client, problem := dial(ctx)
+	if problem != nil {
+		return problem
+	}
+	before, problem := client.Request(id)
+	if problem != nil {
+		return problem
+	}
+	if invocationSettled(before.Status) {
+		return emit(ctx, output.Record{Kind: "invocation", Fields: invocationFields(before),
+			Notes: []string{"already terminal: cancellation is idempotent"}})
+	}
+	if problem := client.Cancel(id); problem != nil {
+		return problem
+	}
+	if _, problem := client.Watch(id, 0, func(localapi.Event) bool { return true }); problem != nil {
+		return problem
+	}
+	after, problem := client.Request(id)
+	if problem != nil {
+		return problem
+	}
+	return emit(ctx, output.Record{Kind: "invocation", Fields: invocationFields(after),
+		Notes: []string{"the worker's durable terminal settled cancellation"}})
+}
+
+func handleInvokeList(ctx *Context) *exit.Error {
+	client, problem := dial(ctx)
+	if problem != nil {
+		return problem
+	}
+	limit := 50
+	if raw := ctx.Inv.Value("--limit"); raw != "" {
+		parsed, err := strconv.Atoi(raw)
+		if err != nil || parsed < 1 || parsed > 500 {
+			return exit.Usagef("--limit %q is not between 1 and 500", raw)
+		}
+		limit = parsed
+	}
+	rows, problem := client.Requests(ctx.Inv.Value("--state"), limit)
+	if problem != nil {
+		return problem
+	}
+	endpoint := strings.TrimSpace(ctx.Inv.Value("--endpoint"))
+	list := output.List{
+		Kind: "invocation", Fields: []string{"id", "kind", "target", "status"},
+		AllFields: []string{"id", "kind", "target", "status", "attempts", "created"},
+		Empty:     "0 invocations",
+	}
+	states := map[string]int{}
+	for _, life := range rows {
+		if endpoint != "" && life.Endpoint != endpoint {
+			continue
+		}
+		kind := life.Kind
+		if kind == "" {
+			kind = "invocation"
+		}
+		list.Rows = append(list.Rows, map[string]string{
+			"id": life.RequestID, "kind": kind,
+			"target": life.Endpoint + "/" + life.Function, "status": life.Status,
+			"attempts": strconv.Itoa(life.Attempts), "created": life.CreatedAt,
+		})
+		states[life.Status]++
+	}
+	keys := make([]string, 0, len(states))
+	for state := range states {
+		keys = append(keys, state)
+	}
+	sort.Strings(keys)
+	for _, state := range keys {
+		list.Aggregates = append(list.Aggregates, output.Field{K: state, V: states[state]})
+	}
+	return emit(ctx, list)
+}
+
+func invocationFields(life api.Lifecycle) []output.Field {
+	kind := life.Kind
+	if kind == "" {
+		kind = "invocation"
+	}
+	return []output.Field{
+		{K: "id", V: life.RequestID}, {K: "kind", V: kind},
+		{K: "target", V: life.Endpoint + "/" + life.Function},
+		{K: "status", V: life.Status}, {K: "attempts", V: life.Attempts},
+	}
+}
+
+func invocationSettled(status string) bool {
+	switch status {
+	case "completed", "failed", "canceled":
+		return true
+	default:
+		return false
+	}
 }
 
 // watch consumes the request's own event stream to its terminal, rendering progress as
@@ -681,7 +861,7 @@ func publishOutputSet(dir string, outputs []api.MediaRef, names []string, fetch 
 			return nil, e
 		}
 		saved = append(saved, map[string]string{
-			"output": out.OutputID, "path": filepath.Join(dir, names[index]), "bytes": render.Bytes(n),
+			"output": out.OutputID, "path": filepath.Join(dir, names[index]), "bytes": output.Bytes(n),
 			"media_id": out.MediaID, "mime": out.MimeType, "digest": digest,
 		})
 	}
@@ -822,7 +1002,7 @@ func renderRun(ctx *Context, life api.Lifecycle, terminal *localapi.Event, stopp
 		// The DEADLINE is why this ended, and the shared matrix has a code for it.
 		status = "deadline"
 	}
-	fields := []render.Field{
+	fields := []output.Field{
 		{K: "request", V: life.RequestID},
 		{K: "endpoint", V: life.Endpoint},
 		{K: "function", V: life.Function},
@@ -830,14 +1010,14 @@ func renderRun(ctx *Context, life api.Lifecycle, terminal *localapi.Event, stopp
 		{K: "attempts", V: life.Attempts},
 	}
 	if life.Result != nil {
-		fields = append(fields, render.Field{K: "result", V: life.Result})
+		fields = append(fields, output.Field{K: "result", V: life.Result})
 	}
 	outs := make([]string, 0, len(life.Outputs))
 	for _, o := range life.Outputs {
-		outs = append(outs, o.OutputID+" "+o.MediaID+" "+render.Bytes(o.Length))
+		outs = append(outs, o.OutputID+" "+o.MediaID+" "+output.Bytes(o.Length))
 	}
 	if len(outs) > 0 {
-		fields = append(fields, render.Field{K: "outputs", V: outs})
+		fields = append(fields, output.Field{K: "outputs", V: outs})
 	}
 	notes := []string{}
 	if len(saved) > 0 {
@@ -847,7 +1027,7 @@ func renderRun(ctx *Context, life api.Lifecycle, terminal *localapi.Event, stopp
 			paths = append(paths, s["path"]+" ("+s["bytes"]+")")
 			opaque = opaque || s["mime"] == opaqueType || s["mime"] == ""
 		}
-		fields = append(fields, render.Field{K: "saved", V: paths})
+		fields = append(fields, output.Field{K: "saved", V: paths})
 		if opaque {
 			// DEGRADE LOUDLY. The file is exactly the bytes the manifest declared and its
 			// digest matched; what is missing is the TYPE, and the runtime is the only
@@ -858,16 +1038,16 @@ func renderRun(ctx *Context, life api.Lifecycle, terminal *localapi.Event, stopp
 		}
 	}
 	if life.Metrics != nil {
-		fields = append(fields, render.Field{K: "metrics", V: life.Metrics})
+		fields = append(fields, output.Field{K: "metrics", V: life.Metrics})
 	}
 	if life.Triage != nil {
-		fields = append(fields, render.Field{K: "attempt_key", V: life.Triage.AttemptKey})
+		fields = append(fields, output.Field{K: "attempt_key", V: life.Triage.AttemptKey})
 	}
 	fields = append(fields,
-		render.Field{K: "submit_ms", V: submitted.Milliseconds()},
-		render.Field{K: "wall_ms", V: time.Since(began).Milliseconds()})
+		output.Field{K: "submit_ms", V: submitted.Milliseconds()},
+		output.Field{K: "wall_ms", V: time.Since(began).Milliseconds()})
 
-	rec := render.Record{Kind: "run", Fields: fields, Notes: notes}
+	rec := output.Record{Kind: "run", Fields: fields, Notes: notes}
 	code := exit.JobTerminal(mapTerminal(status))
 	if code == exit.OK {
 		if life.Triage != nil {

@@ -13,7 +13,7 @@ import (
 	"strings"
 
 	"github.com/cozy-creator/cozy-creator/internal/exit"
-	"github.com/cozy-creator/cozy-creator/internal/render"
+	"github.com/cozy-creator/cozy-creator/internal/units"
 )
 
 // Bounds every staged release archive is read under. A hostile archive is refused
@@ -312,7 +312,7 @@ func safeName(name string) (string, *exit.Error) {
 	return clean, nil
 }
 
-func bytesText(n int64) string { return render.Bytes(n) }
+func bytesText(n int64) string { return units.Bytes(n) }
 
 func short(s string) string {
 	if len(s) > 19 {

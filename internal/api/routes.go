@@ -1,7 +1,5 @@
 package api
 
-import "github.com/cozy-creator/cozy-creator/internal/manifest"
-
 // The route table is DATA: one declarative registry drives dispatch and capability
 // tokens. `scripts/fence.py` checks its method, path, scope, and order against
 // `docs/client-contract.md`, so a route present on only one side is CI-red.
@@ -90,6 +88,12 @@ var Routes = []Route{
 	{"GET", "/v1/local/doctor", Local, true, false, false, "",
 		"host facts and the service's own state",
 		"cl-010 `cozy doctor`"},
+	{"POST", "/v1/local/service/unload", Local, true, true, false, "",
+		"stop idle local serving workers and release their GPU-resident models",
+		"cl-044 `cozy unload`"},
+	{"POST", "/v1/local/service/exit", Local, true, true, false, "",
+		"safely exit, or under explicit all request cancellation before confirmed rental teardown",
+		"cl-044 `cozy exit [--all]`"},
 	{"POST", "/v1/local/service/shutdown", Local, true, true, false, "",
 		"ask the LocalService to drain every worker and exit; exit is proved by the service lock",
 		"cl-010 `cozy down` (#449's cooperative tier)"},
@@ -168,7 +172,3 @@ var Tokens = []string{
 
 // ContractVersion is the request-level core version Creator serves.
 const ContractVersion = "cozy.client.v1"
-
-// ONE registry. `cozy capabilities` and `GET /v1/capabilities` read the same slice, so
-// the CLI cannot advertise a feature the server does not serve.
-func init() { manifest.APITokens = Tokens }

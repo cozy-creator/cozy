@@ -174,6 +174,21 @@ func (c *Client) Request(id string) (api.Lifecycle, *exit.Error) {
 	return life, e
 }
 
+// Requests lists ordinary invocations and jobs through the one request lifecycle
+// authority. Kind distinguishes their execution expectation without creating a
+// second public inventory.
+func (c *Client) Requests(status string, limit int) ([]api.Lifecycle, *exit.Error) {
+	var out struct {
+		Requests []api.Lifecycle `json:"requests"`
+	}
+	path := fmt.Sprintf("/v1/requests?limit=%d", limit)
+	if status != "" {
+		path += "&status=" + url.QueryEscape(status)
+	}
+	problem := c.call(http.MethodGet, path, nil, &out)
+	return out.Requests, problem
+}
+
 // Cancel REQUESTS cancellation. The attempt's own journaled terminal settles it, so this
 // returns as soon as the request is recorded and the caller keeps watching the stream.
 func (c *Client) Cancel(id string) *exit.Error {
@@ -358,6 +373,24 @@ func (c *Client) ShutdownWorker(instance string) (StopResult, *exit.Error) {
 	var res StopResult
 	e := c.call("DELETE", "/v1/local/workers/"+instance, nil, &res)
 	return res, e
+}
+
+// Unload asks the controller to stop only definitely-idle local serving workers. It
+// never touches remote rentals, run-once jobs, active work, or installed disk bytes.
+func (c *Client) Unload() (api.UnloadResult, *exit.Error) {
+	var out api.UnloadResult
+	e := c.call(http.MethodPost, "/v1/local/service/unload", map[string]any{}, &out)
+	return out, e
+}
+
+// Exit performs the controller-side lifecycle fence. Under all=false, active work or
+// rentals refuse without mutation. Under all=true, the controller requests cancellation
+// and returns the exact paid obligations the caller must terminate and confirm through
+// Tensorhub before retrying. ShuttingDown=true means the cooperative exit was accepted.
+func (c *Client) Exit(all bool) (api.ExitResult, *exit.Error) {
+	var out api.ExitResult
+	e := c.call(http.MethodPost, "/v1/local/service/exit", map[string]bool{"all": all}, &out)
+	return out, e
 }
 
 // ShutdownService is `cozy down`'s cooperative ask (#449): the authenticated route that

@@ -1,0 +1,257 @@
+package cli
+
+// CLI is the complete public command grammar. Kong derives parsing and help from
+// this tree; there is no parallel command manifest or string handler registry.
+type CLI struct {
+	JSON   bool     `help:"Emit JSON instead of TOON."`
+	Full   bool     `help:"Include complete values and all available fields."`
+	Fields []string `help:"Select result fields." sep:","`
+
+	Endpoint EndpointCmd `cmd:"" group:"Resources" help:"Find, install, and publish endpoints."`
+	Model    ModelCmd    `cmd:"" group:"Resources" help:"Find, download, and publish models."`
+	Invoke   InvokeCmd   `cmd:"" group:"Work" help:"Run and manage endpoint invocations."`
+	Rental   RentalCmd   `cmd:"" group:"Work" help:"Manage private remote workers."`
+	Unload   UnloadCmd   `cmd:"" group:"Lifecycle" help:"Release idle local GPU memory."`
+	Exit     ExitCmd     `cmd:"" group:"Lifecycle" help:"Stop Cozy locally or tear everything down."`
+}
+
+type EndpointCmd struct {
+	Search  EndpointSearchCmd  `cmd:"" help:"Search the endpoint catalog."`
+	Install EndpointInstallCmd `cmd:"" help:"Install an endpoint on this machine."`
+	Remove  EndpointRemoveCmd  `cmd:"" help:"Remove installed endpoint generations."`
+	List    EndpointListCmd    `cmd:"" help:"List installed endpoints."`
+	Publish EndpointPublishCmd `cmd:"" help:"Publish an endpoint release."`
+}
+
+type EndpointSearchCmd struct {
+	Query []string `arg:"" optional:"" name:"query" help:"Search text or an exact org/name."`
+	Limit int      `help:"Maximum results." default:"20"`
+}
+
+func (c *EndpointSearchCmd) Run(r *Runtime) error {
+	return r.call(handleEndpointSearch, c.Query, nil,
+		values("--limit", intText(c.Limit)), []string{"cozy endpoint install <org/name>"}, false)
+}
+
+type EndpointInstallCmd struct {
+	Ref           string `arg:"" name:"endpoint" help:"Endpoint ref (org/name[@release])."`
+	From          string `help:"Install from a local release archive." type:"path"`
+	Dir           string `help:"Install an editable local source tree." type:"path"`
+	Digest        string `help:"Expected source digest."`
+	Force         bool   `help:"Build and atomically replace an existing pin."`
+	AllowUnsigned bool   `help:"Allow an unverified local development source."`
+	Profile       string `help:"Qualified compatibility profile."`
+	Major         string `help:"Local serving major for a qualified release." placeholder:"vN"`
+	GrantTTL      string `help:"Qualified-material grant lifetime." default:"10m"`
+	Device        int    `help:"Local GPU index used for qualification." default:"0"`
+	Reason        string `help:"Audit reason for a qualified install."`
+}
+
+func (c *EndpointInstallCmd) Run(r *Runtime) error {
+	return r.call(handleInstall, []string{c.Ref}, bools(
+		"--force", c.Force, "--allow-unsigned", c.AllowUnsigned), values(
+		"--from", c.From, "--dir", c.Dir, "--digest", c.Digest,
+		"--profile", c.Profile, "--major", c.Major, "--grant-ttl", c.GrantTTL,
+		"--device", intText(c.Device), "--reason", c.Reason),
+		[]string{"cozy invoke run <org/endpoint/vN/function>"}, false)
+}
+
+type EndpointRemoveCmd struct {
+	Refs []string `arg:"" name:"endpoint" help:"Installed endpoint ref."`
+}
+
+func (c *EndpointRemoveCmd) Run(r *Runtime) error {
+	return r.call(handleRm, c.Refs, nil, nil, []string{"cozy endpoint list"}, false)
+}
+
+type EndpointListCmd struct{}
+
+func (c *EndpointListCmd) Run(r *Runtime) error {
+	return r.call(handleLs, nil, nil, nil, []string{"cozy endpoint search"}, false)
+}
+
+type EndpointPublishCmd struct {
+	Ref         string   `arg:"" name:"endpoint" help:"Endpoint name (org/name)."`
+	Release     string   `help:"Immutable endpoint release id." required:""`
+	Dir         string   `help:"Endpoint source tree." type:"path" default:"."`
+	Profiles    []string `name:"profile" help:"Approved compatibility profile." required:""`
+	CustomWheel []string `help:"Prebuilt custom wheel as profile=path."`
+	Reason      string   `help:"Audit reason recorded before publication." required:""`
+}
+
+func (c *EndpointPublishCmd) Run(r *Runtime) error {
+	return r.call(handleEndpointPublish, []string{c.Ref}, nil, values(
+		"--release", c.Release, "--dir", c.Dir, "--profile", c.Profiles,
+		"--custom-wheel", c.CustomWheel, "--reason", c.Reason),
+		[]string{"cozy endpoint install " + c.Ref + "@" + c.Release}, false)
+}
+
+type ModelCmd struct {
+	Search   ModelSearchCmd   `cmd:"" help:"Search the model catalog."`
+	Download ModelDownloadCmd `cmd:"" help:"Download a model into the local TensorFS store."`
+	Remove   ModelRemoveCmd   `cmd:"" help:"Remove local model roots."`
+	List     ModelListCmd     `cmd:"" help:"List local model roots."`
+	Publish  ModelPublishCmd  `cmd:"" help:"Publish a local TensorFS snapshot."`
+}
+
+type ModelSearchCmd struct {
+	Query []string `arg:"" optional:"" name:"query" help:"Search text or an exact org/name."`
+	Limit int      `help:"Maximum results." default:"20"`
+}
+
+func (c *ModelSearchCmd) Run(r *Runtime) error {
+	return r.call(handleModelSearch, c.Query, nil,
+		values("--limit", intText(c.Limit)), []string{"cozy model download <org/name>"}, false)
+}
+
+type ModelDownloadCmd struct {
+	Ref        string `arg:"" name:"model" help:"Model release or snapshot ref."`
+	Lane       string `help:"Resolve one release lane."`
+	DryRun     bool   `help:"Show the transfer plan without moving bytes."`
+	TokenStdin bool   `help:"Read this invocation's hub token from stdin."`
+}
+
+func (c *ModelDownloadCmd) Run(r *Runtime) error {
+	return r.call(handleModelDownload, []string{c.Ref}, bools(
+		"--dry-run", c.DryRun, "--token-stdin", c.TokenStdin),
+		values("--lane", c.Lane), []string{"cozy model list"}, false)
+}
+
+type ModelRemoveCmd struct {
+	Refs []string `arg:"" name:"model" help:"Local model root name."`
+}
+
+func (c *ModelRemoveCmd) Run(r *Runtime) error {
+	return r.call(handleModelRemove, c.Refs, nil, nil, []string{"cozy model list"}, false)
+}
+
+type ModelListCmd struct{}
+
+func (c *ModelListCmd) Run(r *Runtime) error {
+	return r.call(handleModelList, nil, nil, nil, []string{"cozy model search"}, false)
+}
+
+type ModelPublishCmd struct {
+	Ref        string `arg:"" name:"model" help:"Model name (org/name)."`
+	Snapshot   string `arg:"" name:"snapshot" help:"Local sha256 snapshot id."`
+	Reason     string `help:"Audit reason recorded before publication." required:""`
+	DryRun     bool   `help:"Show the transfer plan without moving bytes."`
+	TokenStdin bool   `help:"Read this invocation's hub token from stdin."`
+}
+
+func (c *ModelPublishCmd) Run(r *Runtime) error {
+	return r.call(handleModelPublish, []string{c.Ref, c.Snapshot}, bools(
+		"--dry-run", c.DryRun, "--token-stdin", c.TokenStdin),
+		values("--reason", c.Reason), []string{"cozy model download " + c.Ref}, false)
+}
+
+type InvokeCmd struct {
+	Run    InvokeRunCmd    `cmd:"" help:"Run an endpoint callable."`
+	Cancel InvokeCancelCmd `cmd:"" help:"Cancel an invocation or job."`
+	List   InvokeListCmd   `cmd:"" help:"List invocations and jobs."`
+}
+
+type InvokeRunCmd struct {
+	Target         string   `arg:"" name:"target" help:"Callable as org/endpoint/vN/function."`
+	Input          []string `arg:"" optional:"" name:"input" help:"Primary value and field=value payload."`
+	Models         []string `name:"model" help:"Override a model binding."`
+	Lane           string   `help:"Pin a release lane."`
+	Adapters       []string `name:"adapter" help:"Stack an adapter in command order."`
+	Seed           string   `help:"Deterministic RNG seed."`
+	Out            string   `help:"Output directory." type:"path"`
+	Offline        bool     `help:"Use only bytes already in local CAS."`
+	Timeout        string   `help:"Request deadline."`
+	Stream         bool     `help:"Emit typed progress deltas."`
+	PayloadFile    string   `name:"in" help:"Read the whole payload from JSON." type:"path"`
+	Assets         []string `name:"asset" help:"Bind a local asset as field-path=file."`
+	Local          bool     `help:"Run on this machine." xor:"placement"`
+	Cloud          bool     `help:"Run on the public fleet." xor:"placement"`
+	Worker         string   `help:"Run on an attached private rental." xor:"placement"`
+	IdempotencyKey string   `help:"Stable request identity for safe retries."`
+	Trees          []string `name:"input-tree" help:"Bind a job input tree as ref=directory."`
+	Org            string   `help:"Job publication organization (defaults to local)."`
+	Detach         bool     `help:"Return after durable acceptance instead of following."`
+}
+
+func (c *InvokeRunCmd) Run(r *Runtime) error {
+	args := append([]string{c.Target}, c.Input...)
+	return r.call(handleInvokeRun, args, bools(
+		"--offline", c.Offline, "--stream", c.Stream, "--local", c.Local,
+		"--cloud", c.Cloud, "--detach", c.Detach), values(
+		"--model", c.Models, "--lane", c.Lane, "--adapter", c.Adapters,
+		"--seed", c.Seed, "--out", c.Out, "--timeout", c.Timeout,
+		"--in", c.PayloadFile, "--asset", c.Assets, "--worker", c.Worker,
+		"--idempotency-key", c.IdempotencyKey, "--input", c.Trees, "--org", c.Org),
+		[]string{"cozy invoke list"}, true)
+}
+
+type InvokeCancelCmd struct {
+	ID string `arg:"" name:"invocation" help:"Request or job id."`
+}
+
+func (c *InvokeCancelCmd) Run(r *Runtime) error {
+	return r.call(handleInvokeCancel, []string{c.ID}, nil, nil,
+		[]string{"cozy invoke list"}, true)
+}
+
+type InvokeListCmd struct {
+	State    string `help:"Filter by lifecycle state."`
+	Endpoint string `help:"Filter by endpoint."`
+	Limit    int    `help:"Maximum rows." default:"50"`
+}
+
+func (c *InvokeListCmd) Run(r *Runtime) error {
+	return r.call(handleInvokeList, nil, nil, values(
+		"--state", c.State, "--endpoint", c.Endpoint, "--limit", intText(c.Limit)),
+		[]string{"cozy invoke run <org/endpoint/vN/function>"}, true)
+}
+
+type RentalCmd struct {
+	New  RentalNewCmd  `cmd:"" help:"Start a private rental."`
+	End  RentalEndCmd  `cmd:"" help:"End a private rental and stop billing."`
+	List RentalListCmd `cmd:"" help:"List private rentals."`
+}
+
+type RentalNewCmd struct {
+	Endpoint       string `arg:"" name:"endpoint" help:"Exact endpoint ref."`
+	Accelerator    string `help:"Provider-neutral accelerator model." required:""`
+	IdempotencyKey string `help:"Stable paid-operation identity."`
+	Timeout        string `help:"Caller wait deadline; does not release the rental."`
+	Reason         string `help:"Audit reason recorded before acquisition." required:""`
+}
+
+func (c *RentalNewCmd) Run(r *Runtime) error {
+	return r.call(handleRent, []string{c.Endpoint}, nil, values(
+		"--accelerator", c.Accelerator, "--idempotency-key", c.IdempotencyKey,
+		"--timeout", c.Timeout, "--reason", c.Reason),
+		[]string{"cozy rental list"}, true)
+}
+
+type RentalEndCmd struct {
+	ID string `arg:"" name:"rental" help:"Private rental id."`
+}
+
+func (c *RentalEndCmd) Run(r *Runtime) error {
+	return r.call(handleRentRelease, []string{c.ID}, bools("--yes", true), nil,
+		[]string{"cozy rental list"}, true)
+}
+
+type RentalListCmd struct{}
+
+func (c *RentalListCmd) Run(r *Runtime) error {
+	return r.call(handleRentLs, nil, nil, nil, []string{"cozy rental new <endpoint>"}, true)
+}
+
+type UnloadCmd struct{}
+
+func (c *UnloadCmd) Run(r *Runtime) error {
+	return r.call(handleUnload, nil, nil, nil, []string{"cozy exit"}, false)
+}
+
+type ExitCmd struct {
+	All bool `help:"Cancel all work, end all rentals, then stop Cozy."`
+}
+
+func (c *ExitCmd) Run(r *Runtime) error {
+	return r.call(handleExit, nil, bools("--all", c.All), nil, nil, false)
+}

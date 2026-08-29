@@ -1,4 +1,4 @@
-package app
+package cli
 
 import (
 	"bytes"
@@ -14,8 +14,8 @@ import (
 	"github.com/cozy-creator/cozy-creator/internal/exit"
 	"github.com/cozy-creator/cozy-creator/internal/home"
 	"github.com/cozy-creator/cozy-creator/internal/hub"
+	"github.com/cozy-creator/cozy-creator/internal/output"
 	"github.com/cozy-creator/cozy-creator/internal/records"
-	"github.com/cozy-creator/cozy-creator/internal/render"
 	"github.com/cozy-creator/cozy-creator/internal/rental"
 	"github.com/cozy-creator/cozy-creator/internal/secret"
 	"github.com/cozy-creator/cozy-creator/internal/service"
@@ -290,7 +290,7 @@ func handleRent(ctx *Context) *exit.Error {
 	if replay {
 		notes[1] += " resumed"
 	}
-	return emit(ctx, render.Record{Kind: "rental", Fields: []render.Field{
+	return emit(ctx, output.Record{Kind: "rental", Fields: []output.Field{
 		{K: "rental", V: ready.ID},
 		{K: "state", V: ready.State},
 		{K: "address", V: ready.Address},
@@ -495,7 +495,7 @@ func handleRentLs(ctx *Context) *exit.Error {
 	if e != nil {
 		return e
 	}
-	list := render.List{
+	list := output.List{
 		Kind:      "rentals",
 		Fields:    []string{"rental", "state", "endpoint", "accelerator", "address"},
 		AllFields: []string{"rental", "state", "endpoint", "accelerator", "address", "media", "hub", "owner_token", "rented"},
@@ -520,7 +520,7 @@ func handleRentLs(ctx *Context) *exit.Error {
 		})
 	}
 	if len(list.Rows) > 0 {
-		list.Aggregates = []render.Field{
+		list.Aggregates = []output.Field{
 			{K: "rentals", V: len(list.Rows)}, {K: "dialable", V: attached},
 		}
 		list.Next = []string{"cozy rent show <rental-id>", "cozy rent release <rental-id>"}
@@ -538,7 +538,7 @@ func handleRentShow(ctx *Context) *exit.Error {
 	if e != nil {
 		return e
 	}
-	return emit(ctx, render.Record{Kind: "rental_control", Fields: []render.Field{
+	return emit(ctx, output.Record{Kind: "rental_control", Fields: []output.Field{
 		{K: "rental", V: row.ID}, {K: "state", V: row.State},
 		{K: "endpoint", V: row.EndpointRef}, {K: "accelerator", V: row.AcceleratorModel},
 		{K: "placement_revision", V: control.PlacementRevision},
@@ -588,7 +588,7 @@ func handleRentProbe(ctx *Context) *exit.Error {
 	if e != nil {
 		return e
 	}
-	return emit(ctx, render.Record{Kind: "rental_probe", Fields: []render.Field{
+	return emit(ctx, output.Record{Kind: "rental_probe", Fields: []output.Field{
 		{K: "rental", V: id}, {K: "state", V: row.State},
 		{K: "endpoint", V: row.EndpointRef}, {K: "accelerator", V: row.AcceleratorModel},
 		{K: "placement_revision", V: control.PlacementRevision},
@@ -621,7 +621,7 @@ func handleRentRevise(ctx *Context) *exit.Error {
 	if problem != nil {
 		return problem
 	}
-	return emit(ctx, render.Record{Kind: "rental_revision", Fields: []render.Field{
+	return emit(ctx, output.Record{Kind: "rental_revision", Fields: []output.Field{
 		{K: "rental", V: revision.RentalID}, {K: "placement_revision", V: revision.PlacementRevision},
 		{K: "instance", V: revision.InstanceID}, {K: "worker_boot_id", V: revision.WorkerBootID},
 		{K: "endpoint", V: revision.Endpoint},
@@ -667,7 +667,7 @@ func handleRentRelease(ctx *Context) *exit.Error {
 		if gone {
 			state = "absent on the hub"
 		}
-		plan := render.Record{Kind: "release-plan", Fields: []render.Field{
+		plan := output.Record{Kind: "release-plan", Fields: []output.Field{
 			{K: "rental", V: id}, {K: "state", V: state}, {K: "hub", V: c.Base()},
 		}, Notes: []string{
 			"the hub DESTROYS the pod: anything resident on it is lost and any run pinned to it stops being placeable",
@@ -675,8 +675,8 @@ func handleRentRelease(ctx *Context) *exit.Error {
 			"this printed the plan and changed nothing — re-run with --yes",
 		}, Next: []string{"cozy rent release " + id + " --yes"}}
 		if row != nil {
-			plan.Fields = append(plan.Fields, render.Field{K: "address", V: row.Address},
-				render.Field{K: "media", V: row.MediaAddress})
+			plan.Fields = append(plan.Fields, output.Field{K: "address", V: row.Address},
+				output.Field{K: "media", V: row.MediaAddress})
 		}
 		return emit(ctx, plan)
 	}
@@ -802,7 +802,7 @@ func (w *releaseWatch) finish(l home.Layout, st *records.Store, operationKey str
 	if !had {
 		notes = []string{note + "; this host held no record of it — already released"}
 	}
-	return emit(w.ctx, render.Record{Kind: "release", Fields: []render.Field{
+	return emit(w.ctx, output.Record{Kind: "release", Fields: []output.Field{
 		{K: "rental", V: w.id}, {K: "released", V: forgotten},
 	}, Notes: notes, Next: []string{"cozy rent ls"}})
 }
