@@ -54,7 +54,7 @@ func Run(l home.Layout, st *records.Store, req Request) (*Result, *exit.Error) {
 	if (req.Archive == "") == (req.Dir == "") {
 		return nil, exit.Usagef("`cozy package install` needs exactly one source: --from <archive.tar.gz> or --dir <tree>").
 			WithRemedy("--from installs a published release archive; --dir installs an editable local tree").
-			WithNext("cozy help install")
+			WithNext("cozy help package install")
 	}
 	id, e := newGenerationID()
 	if e != nil {
@@ -128,8 +128,8 @@ func Run(l home.Layout, st *records.Store, req Request) (*Result, *exit.Error) {
 		_ = os.RemoveAll(genDir)
 		return nil, exit.New(exit.Conflict,
 			"%s is already installed and pinned to generation %s", gen.Package+majorSuffix(gen.Major), short12(prior.InstallID)).
-			WithRemedy("install never silently upgrades; --force builds a new generation and swaps the pin").
-			WithNext("cozy package install " + req.Ref.String() + " --force")
+			WithRemedy("install never silently upgrades; rerun the same source command with --force to build and swap a new generation").
+			WithNext("cozy package list")
 	}
 	// A --force that fails must keep the working install: exit 13, nothing mutated.
 	guard := func(err *exit.Error) (*Result, *exit.Error) {
@@ -197,7 +197,7 @@ func deriveDescriptor(venvDir, sourceDir string) (*launch.PackageDescriptor, *ex
 		return nil, exit.Named(exit.Structural, "runtime_missing",
 			"this generation's venv provides no cozy-runtime at %s", bin).
 			WithRemedy("a package depends on cozy-runtime; its surface is described by the runtime the release itself pinned, never this host's").
-			WithNext("cozy help install")
+			WithNext("cozy help package install")
 	}
 	cmd := exec.Command(bin, "--json", "--dir", sourceDir, "describe")
 	cmd.Env = config.Frozen().Tool()
@@ -235,7 +235,7 @@ func describeRefusal(code int, stderr string) *exit.Error {
 	}
 	return exit.Named(c, name, "%s", doc.Error.Message).
 		WithRemedy("%s", doc.Error.Remedy).
-		WithNext("cozy help install")
+		WithNext("cozy help package install")
 }
 
 // verifySource settles source identity before any build backend or import can run.
@@ -252,7 +252,7 @@ func verifySource(gen *records.PackageInstall, req Request, warn *[]string) *exi
 			return exit.Named(exit.Validation, "source_unverified",
 				"the release archive carries no verified source digest").
 				WithRemedy("pass --digest <sha256:…> from the release record, or --allow-unsigned for a development install").
-				WithNext("cozy help install")
+				WithNext("cozy help package install")
 		}
 		gen.Verified = false
 		*warn = append(*warn, "--allow-unsigned: this generation was installed WITHOUT source verification (development door)")
@@ -262,7 +262,7 @@ func verifySource(gen *records.PackageInstall, req Request, warn *[]string) *exi
 		return exit.Named(exit.Validation, "source_digest_mismatch",
 			"the release archive does not match the declared source digest").
 			WithRemedy("declared %s, archive %s", short(req.ExpectDigest), short(gen.SourceDigest)).
-			WithNext("cozy help install")
+			WithNext("cozy help package install")
 	}
 	gen.Verified = true
 	return nil
@@ -274,7 +274,7 @@ func resolveTarget(gen *records.PackageInstall, ref Ref) *exit.Error {
 		if !ref.HasMajor {
 			return exit.Usagef("an editable --dir install needs an explicit major").
 				WithRemedy("a local tree carries no release record, so the major is declared: cozy package install %s@v1 --dir …", ref.Package).
-				WithNext("cozy help install")
+				WithNext("cozy help package install")
 		}
 		gen.Major = ref.Major
 		return nil

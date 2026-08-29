@@ -887,7 +887,7 @@ func generationFacts(ctx *Context, pkg string, major int) (*launch.Facts, *exit.
 	if len(pins) == 0 {
 		return nil, exit.New(exit.NotFound, "%s is not installed on this host", pkg).
 			WithRemedy("`cozy package list` lists what is").
-			WithNext("cozy package install "+pkg, "cozy package list")
+			WithNext("cozy package search "+pkg, "cozy package list")
 	}
 	chosen, found := pins[0], major == 0
 	for _, p := range pins {

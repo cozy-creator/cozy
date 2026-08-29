@@ -27,7 +27,7 @@ func ParseRef(s string) (Ref, *exit.Error) {
 	bad := func(why string) *exit.Error {
 		return exit.Usagef("%q is not a package ref: %s", s, why).
 			WithRemedy("the grammar is org/package[@vN], e.g. cozy-creator/demo@v1").
-			WithNext("cozy help install")
+			WithNext("cozy help package install")
 	}
 	name, ver, hasVer := strings.Cut(s, "@")
 	org, ep, ok := strings.Cut(name, "/")

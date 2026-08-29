@@ -81,7 +81,7 @@ func MaterializeEnvironment(sourceDir, venvDir string) (*EnvironmentReceipt, *ex
 			"`uv %s` refused for this host — the lock was not resolved, relaxed, or rewritten",
 			strings.Join(args, " ")).
 			WithRemedy("uv said: %s", condense(out.String())).
-			WithNext("cozy help install")
+			WithNext("cozy help package install")
 	}
 
 	env.Python = pythonVersion(venvDir)

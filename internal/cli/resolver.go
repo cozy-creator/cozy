@@ -193,7 +193,7 @@ func (r *Resolver) generation(ref string) (*records.PackageInstall, *exit.Error)
 	if len(pins) == 0 {
 		return nil, exit.New(exit.NotFound, "%s is not installed on this host", pkg).
 			WithRemedy("`cozy package list` shows installed packages").
-			WithNext("cozy package install " + pkg)
+			WithNext("cozy package search " + pkg)
 	}
 	chosen := pins[0]
 	if hasMajor {

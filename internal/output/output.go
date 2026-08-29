@@ -139,6 +139,7 @@ func EmitError(w io.Writer, problem *Error, mode Mode) error {
 
 func writeHumanError(w io.Writer, problem *Error, mode Mode) error {
 	var rendered strings.Builder
+	next := trimNext(problem.Next)
 	if mode.Color {
 		rendered.WriteString("\x1b[1;31m")
 	}
@@ -148,12 +149,15 @@ func writeHumanError(w io.Writer, problem *Error, mode Mode) error {
 		rendered.WriteString("\x1b[0m")
 	}
 	rendered.WriteByte('\n')
+	if strings.TrimSpace(problem.Remedy) != "" || len(next) > 0 {
+		rendered.WriteByte('\n')
+	}
 	if remedy := strings.TrimSpace(problem.Remedy); remedy != "" {
 		rendered.WriteString("Try: ")
 		rendered.WriteString(remedy)
 		rendered.WriteByte('\n')
 	}
-	for _, next := range trimNext(problem.Next) {
+	for _, next := range next {
 		rendered.WriteString("Next: ")
 		rendered.WriteString(next)
 		rendered.WriteByte('\n')

@@ -134,6 +134,22 @@ func writeHumanRecord(w io.Writer, fields []Field, data map[string]any, notes, n
 		width = max(width, utf8.RuneCountInString(field.K))
 	}
 	for _, field := range fields {
+		if values, ok := data[field.K].([]string); ok {
+			rendered.WriteString(field.K)
+			rendered.WriteByte(':')
+			if len(values) == 0 {
+				rendered.WriteString(strings.Repeat(" ", width-utf8.RuneCountInString(field.K)+1))
+				rendered.WriteString("-\n")
+				continue
+			}
+			rendered.WriteByte('\n')
+			for _, value := range values {
+				rendered.WriteString("  - ")
+				rendered.WriteString(humanValue(value, full))
+				rendered.WriteByte('\n')
+			}
+			continue
+		}
 		rendered.WriteString(field.K)
 		rendered.WriteByte(':')
 		rendered.WriteString(strings.Repeat(" ", width-utf8.RuneCountInString(field.K)+1))
@@ -153,6 +169,7 @@ func writeHumanList(w io.Writer, list List, columns []string, shown []map[string
 		fmt.Fprintf(&rendered, "No %s found.\n", list.Name)
 	} else if len(columns) == 1 {
 		for _, row := range shown {
+			rendered.WriteString("- ")
 			rendered.WriteString(orDash(Elide(row[columns[0]], cellCap, full)))
 			rendered.WriteByte('\n')
 		}
@@ -162,12 +179,17 @@ func writeHumanList(w io.Writer, list List, columns []string, shown []map[string
 	if omitted := total - len(shown); omitted > 0 {
 		fmt.Fprintf(&rendered, "%d more not shown. Use --full to show all.\n", omitted)
 	}
+	wroteAggregate := false
 	for _, aggregate := range list.Aggregates {
 		if aggregate.K == list.Name || aggregate.K == "count" || aggregate.K == "results" {
 			continue
 		}
 		if value, ok := document[aggregate.K]; ok {
+			if !wroteAggregate && rendered.Len() > 0 {
+				rendered.WriteByte('\n')
+			}
 			fmt.Fprintf(&rendered, "%s: %s\n", aggregate.K, humanValue(value, full))
+			wroteAggregate = true
 		}
 	}
 	writeHumanGuidance(&rendered, list.Notes, list.Next)
@@ -210,10 +232,17 @@ func writeHumanRow(rendered *strings.Builder, values []string, widths []int) {
 }
 
 func writeHumanGuidance(rendered *strings.Builder, notes, next []string) {
+	next = trimNext(next)
+	if len(notes) == 0 && len(next) == 0 {
+		return
+	}
+	if rendered.Len() > 0 {
+		rendered.WriteByte('\n')
+	}
 	for _, note := range notes {
 		fmt.Fprintf(rendered, "Note: %s\n", strings.TrimSpace(note))
 	}
-	for _, command := range trimNext(next) {
+	for _, command := range next {
 		fmt.Fprintf(rendered, "Next: %s\n", strings.TrimSpace(command))
 	}
 }

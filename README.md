@@ -205,16 +205,16 @@ redirected and JSON output never contain ANSI escapes. Progress goes to stderr.
 
 ```sh
 cozy package search
-# cozy/marco-polo-derived
-# cozy/marco-polo-cu130
-# cozy/marco-polo-launch1
+# - cozy/marco-polo-derived
+# - cozy/marco-polo-cu130
+# - cozy/marco-polo-launch1
 
 cozy package list --fields package,version,disk
 cozy invoke list --json
 cozy model search flux --full
 ```
 
-A one-field list is a scalar collection; multiple selected fields become a compact table. The
+A one-field list uses `- value` bullets; multiple selected fields become a compact table. The
 collection length is already its count. `omitted` appears only when a limit withheld rows, and
 diagnostic fields appear only under `--full` or an explicit `--fields` selection. Human errors
 state the problem and repair directly; `--json` retains the stable class, code, message, remedy,

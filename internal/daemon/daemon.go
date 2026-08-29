@@ -123,6 +123,6 @@ func (h *Held) Release() {
 // Unavailable is the typed refusal every server-dependent verb shares.
 func (s State) Unavailable() *exit.Error {
 	return exit.Unavailablef("the Cozy daemon is not running (%s)", s.Addr).
-		WithRemedy("start it with `cozy invoke list`; it binds %s, loopback only", s.Addr).
-		WithNext("cozy invoke list", "cozy invoke list")
+		WithRemedy("start it with `cozy up`; it binds %s, loopback only", s.Addr).
+		WithNext("cozy up")
 }

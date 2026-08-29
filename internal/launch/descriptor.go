@@ -407,8 +407,7 @@ func ReadDescriptor(path, expectDigest string) (*PackageDescriptor, *exit.Error)
 	if err != nil {
 		return nil, exit.Named(exit.Structural, "descriptor_absent",
 			"this generation carries no private %s", DescriptorFile).
-			WithRemedy("reinstall so the generation's Runtime can derive its descriptor").
-			WithNext("cozy package install <org/package> --force")
+			WithRemedy("reinstall from the original source so its Runtime can derive the descriptor")
 	}
 	d, problem := DecodeDescriptor(data)
 	if problem != nil {
@@ -417,8 +416,7 @@ func ReadDescriptor(path, expectDigest string) (*PackageDescriptor, *exit.Error)
 	if expectDigest != "" && d.Digest != expectDigest {
 		return nil, exit.Named(exit.Conflict, "descriptor_stale",
 			"the private descriptor content digests to %s and this install recorded %s", d.Digest, expectDigest).
-			WithRemedy("the immutable generation is corrupt; reinstall it").
-			WithNext("cozy package install <org/package> --force")
+			WithRemedy("the immutable generation is corrupt; reinstall it from its original source")
 	}
 	return d, nil
 }
