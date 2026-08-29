@@ -40,7 +40,7 @@ type Request struct {
 	Profile     string
 	DeviceIndex *int
 	Force       bool
-	Grant       hub.LocalExecutionGrant
+	Grant       hub.LocalQualificationMaterials
 	Config      config.Config
 }
 
@@ -73,15 +73,15 @@ func Run(ctx context.Context, layout home.Layout, store *records.Store, request 
 	if request.Endpoint == "" || request.Release == "" || request.Major <= 0 ||
 		grant.CandidateID == "" || grant.Profile != request.Profile ||
 		grant.BaseRealization.Kind != "managed-local" || !digest(grant.BaseRealization.Digest) ||
-		!digest(grant.BaseWorkerImageDigest) || grant.LeaseID == "" || grant.LeaseExpiresAt == "" {
+		grant.LeaseID == "" || grant.LeaseExpiresAt == "" {
 		return nil, exit.Named(exit.Structural, "managed_install_grant_invalid",
-			"Tensorhub returned an incomplete or non-managed-local execution grant")
+			"Tensorhub returned incomplete managed-local qualification materials")
 	}
 	leaseExpiry, err := time.Parse(time.RFC3339, grant.LeaseExpiresAt)
 	if err != nil || !leaseExpiry.After(time.Now()) {
 		return nil, exit.Named(exit.Conflict, "managed_install_lease_expired",
-			"managed-local execution lease %s is absent, malformed, or expired", grant.LeaseID).
-			WithRemedy("request a fresh local-execution grant for the same qualified candidate")
+			"managed-local qualification-materials lease %s is absent, malformed, or expired", grant.LeaseID).
+			WithRemedy("request fresh local-qualification materials for the same non-refused candidate")
 	}
 	profiles, problem := endpointprofile.NormalizeSet([]string{request.Profile})
 	if problem != nil {
@@ -261,16 +261,6 @@ func Run(ctx context.Context, layout home.Layout, store *records.Store, request 
 	if problem := regularExecutable(runtimeBin, "managed base cozy-runtime"); problem != nil {
 		return fail(problem)
 	}
-	descriptorDigest, problem := describe(runtimeBin, projectDir, toolEnv)
-	if problem != nil {
-		return fail(problem)
-	}
-	if descriptorDigest != grant.Descriptor.Digest {
-		return fail(exit.Named(exit.Structural, "managed_descriptor_mismatch",
-			"installed endpoint derives descriptor %s; the published release grants %s",
-			descriptorDigest, grant.Descriptor.Digest).
-			WithRemedy("refuse this candidate; its qualified documents and installed project wheel do not describe the same endpoint"))
-	}
 	hostEvidencePath := filepath.Join(genDir, "host-evidence.json")
 	hostDigest, problem := observeHost(runtimeBin, projectDir, hostEvidencePath, profile,
 		toolEnv)
@@ -294,6 +284,16 @@ func Run(ctx context.Context, layout home.Layout, store *records.Store, request 
 		return fail(exit.Named(exit.Structural, "managed_native_proof_unexpected",
 			"pure overlay received a native-wheel proof request"))
 	}
+	descriptorDigest, problem := describe(runtimeBin, projectDir, toolEnv)
+	if problem != nil {
+		return fail(problem)
+	}
+	if descriptorDigest != grant.Descriptor.Digest {
+		return fail(exit.Named(exit.Structural, "managed_descriptor_mismatch",
+			"installed endpoint derives descriptor %s; the published release grants %s",
+			descriptorDigest, grant.Descriptor.Digest).
+			WithRemedy("refuse this candidate; its qualified documents and installed project wheel do not describe the same endpoint"))
+	}
 
 	gen := records.EndpointInstall{
 		ID: id, Endpoint: request.Endpoint, Major: request.Major, Version: request.Release,
@@ -307,7 +307,6 @@ func Run(ctx context.Context, layout home.Layout, store *records.Store, request 
 	facts := records.ManagedProfileInstall{
 		ReleaseID: request.Release, Profile: profile, CandidateID: grant.CandidateID,
 		BaseRealizationDigest:    grant.BaseRealization.Digest,
-		BaseWorkerImageDigest:    grant.BaseWorkerImageDigest,
 		WheelhouseManifestDigest: grant.WheelhouseManifest.Digest,
 		EnvironmentSpecDigest:    grant.EndpointEnvironmentSpec.Digest,
 		EndpointBundleDigest:     grant.EndpointBundle.Digest,
@@ -463,7 +462,7 @@ type nativeQualification struct {
 	WheelhouseManifestDigest          string                    `json:"wheelhouse_manifest_digest"`
 }
 
-func verifyOverlayReceipt(path string, grant hub.LocalExecutionGrant,
+func verifyOverlayReceipt(path string, grant hub.LocalQualificationMaterials,
 	wheelFacts map[string]wheel.Fact,
 ) (string, *exit.Error) {
 	raw, err := os.ReadFile(path)
@@ -527,7 +526,7 @@ func verifyOverlayReceipt(path string, grant hub.LocalExecutionGrant,
 	return hash(contentBytes), nil
 }
 
-func runNativeProof(base string, grant hub.LocalExecutionGrant, profile string, deviceIndex *int,
+func runNativeProof(base string, grant hub.LocalQualificationMaterials, profile string, deviceIndex *int,
 	environmentRoot, generation, receiptDigest, overlayContentDigest, receiptPath, wheelhouse,
 	output string, env []string,
 ) (string, *exit.Error) {
@@ -573,7 +572,7 @@ func runNativeProof(base string, grant hub.LocalExecutionGrant, profile string, 
 	return result.Digest, nil
 }
 
-func validateNativeEvidence(path string, grant hub.LocalExecutionGrant, profile string,
+func validateNativeEvidence(path string, grant hub.LocalQualificationMaterials, profile string,
 	deviceIndex *int, generation, receiptDigest, overlayContentDigest, receiptPath,
 	wheelhouse string,
 ) *exit.Error {
@@ -698,7 +697,7 @@ func sameDistributions(a, b []nativeDistribution) bool {
 	return true
 }
 
-func openManagedBase(layout home.Layout, grant hub.LocalExecutionGrant,
+func openManagedBase(layout home.Layout, grant hub.LocalQualificationMaterials,
 	profile string,
 ) (string, baseReceipt, *exit.Error) {
 	var receipt baseReceipt

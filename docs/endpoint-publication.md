@@ -103,16 +103,17 @@ cozy endpoint promote org/endpoint 1.0.0 \
   --reason "serve qualified release"
 ```
 
-## Qualified local install
+## Independently qualified local install
 
-Local execution uses a separately qualified managed-local realization of the same four-axis
-profile:
+Local execution never borrows the paid OCI qualification. Tensorhub leases
+`local-qualification-materials` only for a non-refused CPU/meta candidate with an exact registered
+managed base; those bytes are inputs to Creator's independent local proof, not an execution grant:
 
 ```sh
 cozy install org/endpoint@1.0.0 \
   --profile torch2.13.0-cu130-cp312-linux-x86 \
   --major v1 \
-  --reason "install qualified local release"
+  --reason "qualify and install local release"
 ```
 
 Managed bases live only at `$COZY_HOME/managed-bases/sha256/<realization hex>/`. The directory has
@@ -121,9 +122,9 @@ canonical `ManagedBaseReceipt.json`, exact `WheelhouseManifest.json`, and regula
 present—`bin/cozy-native-wheel-proof`. The stored receipt digest must equal Tensorhub's managed
 base-realization digest. Tensorhub never supplies a local path.
 
-Creator downloads every-and-only the granted project/custom wheels, invokes Runtime's public
-environment/native proof commands, checks the descriptor, measures current GPU/CUDA host evidence,
-then atomically pins the install. Control-install facts, portable Runtime receipt, managed-base
+Creator downloads every-and-only the granted project/custom wheels, materializes without importing
+endpoint code, measures the base host, runs the native operator proof when required, and only then
+imports/checks the descriptor before atomically pinning. Control-install facts, portable Runtime receipt, managed-base
 identity, current host evidence, and grant lease are stored separately. Missing/mutable base bytes
 refuse; Creator performs no fresh dependency resolution, Torch/CUDA install, index access, or
 native compilation.

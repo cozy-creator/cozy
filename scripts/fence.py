@@ -802,10 +802,17 @@ def check_typed_resources():
         bad.append("internal/manifest/commands.go: [resources] retired --kind discriminator remains")
 
     hub_sources = (pathlib.Path("internal/hub/hub.go").read_text() +
-                   pathlib.Path("internal/hub/publish.go").read_text())
+                   pathlib.Path("internal/hub/publish.go").read_text() +
+                   pathlib.Path("internal/hub/endpoint_releases.go").read_text())
     for route in ('"/v1/endpoints"', '"/v1/models"', '"/v1/models/"', '"/publications"'):
         if route not in hub_sources:
             bad.append(f"internal/hub: [resources] missing typed route prefix {route}")
+    profile_routes = (pathlib.Path("internal/hub/endpoint_releases.go").read_text() +
+                      pathlib.Path("scripts/endpoint-profile-live.sh").read_text())
+    if "/local-execution" in profile_routes:
+        bad.append("internal/hub/endpoint_releases.go: [resources] retired local-execution route remains")
+    if "/local-qualification-materials" not in profile_routes:
+        bad.append("internal/hub/endpoint_releases.go: [resources] local qualification-materials route is absent")
 
     managed = pathlib.Path("internal/managedinstall/install.go").read_text()
     for retired in ('"base_path"', '"index_url"', '"build_command"', 'exec.Command("uv"',

@@ -148,7 +148,7 @@ var Commands = []Command{
 			{Name: "--digest", Arg: "<sha256:…>", Summary: "the source digest the release declares — verified before anything executes"},
 			{Name: "--force", Summary: "build a new generation and swap the pin"},
 			{Name: "--allow-unsigned", Summary: "development-only door past source verification"},
-			{Name: "--profile", Arg: "<profile>", Summary: "install one qualified published profile; forbids source build"},
+			{Name: "--profile", Arg: "<profile>", Summary: "independently qualify and install one published local profile"},
 			{Name: "--major", Arg: "<vN>", Summary: "required local pin major with --profile"},
 			{Name: "--grant-ttl", Arg: "<duration>", Summary: "local wheel/lease grant lifetime", Default: "10m"},
 			{Name: "--device", Arg: "<index>", Summary: "concrete local GPU index for native qualification", Default: "0"},

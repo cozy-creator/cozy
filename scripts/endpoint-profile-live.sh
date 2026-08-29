@@ -104,39 +104,46 @@ CFG=(--config "$WORK/config.yaml" --secrets-dir "$WORK/secrets")
 for _ in $(seq 1 120); do curl -fsS "$BASE/healthz" >/dev/null 2>&1 && break; sleep 0.1; done
 curl -fsS "$BASE/healthz" >/dev/null
 
-# Register the exact approved base manifests. This is platform setup, not endpoint
-# publication: Creator still supplies no image/base choice in the release declaration.
-python3 - "$WORK/hub" "$WORK" <<'PY'
-import hashlib,json,pathlib,sys
-hub,work=map(pathlib.Path,sys.argv[1:])
-rows=[]; files={}
-for build in ("cu126","cu130"):
-    path=hub/f"vectors/base-worker-image-wheelhouse-{build}.json"
-    raw=path.read_bytes(); digest="sha256:"+hashlib.sha256(raw).hexdigest()
-    rows.append({"object_id":digest,"length":len(raw)}); files[digest]=str(path)
-rows.sort(key=lambda row: row["object_id"])
-(work/"base-objects.json").write_text(json.dumps({"operation_id":"creator-profile-base-manifests","objects":rows}))
-(work/"base-files.json").write_text(json.dumps(files))
-PY
-admin=(-H "Authorization: Bearer $ADMIN_TOKEN" -H 'X-Tensorhub-Reason: Creator profile base setup')
-curl -fsS -X POST "$BASE/v1/admin/build-artifacts" "${admin[@]}" -H 'Content-Type: application/json' \
-  --data-binary @"$WORK/base-objects.json" >"$WORK/base-plan.json"
-python3 - "$WORK/base-plan.json" "$WORK/base-files.json" <<'PY'
-import json,pathlib,sys,urllib.request
-plan=json.load(open(sys.argv[1])); files=json.load(open(sys.argv[2]))
-for grant in plan["grants"]:
-    request=urllib.request.Request(grant["url"],data=pathlib.Path(files[grant["object_id"]]).read_bytes(),method="PUT",headers=grant["required_headers"])
-    with urllib.request.urlopen(request) as response:
-        assert 200 <= response.status < 300
-PY
-curl -fsS -X POST "$BASE/v1/admin/build-artifacts/creator-profile-base-manifests/complete" \
-  "${admin[@]}" -H 'Content-Type: application/json' -d '{}' >/dev/null
-DB_URL="postgres://postgres:profile@127.0.0.1:$PG_PORT/postgres?sslmode=disable"
+# Register the exact approved base manifests through the development-only typed
+# StoreSet seed. This is platform setup, not endpoint publication: Creator still
+# supplies no image/base choice in the release declaration.
 for profile in "$PROFILE_A" "$PROFILE_B"; do
   build="${profile#*2.13.0-}"; build="${build%%-*}"
-  (cd "$WORK/hub" && nice -n 19 go run ./cmd/th075-seed-base "$DB_URL" "$profile" \
-    "$WORK/hub/vectors/base-worker-image-wheelhouse-$build.json")
+  (cd "$WORK/hub" && nice -n 19 go run ./cmd/th075-seed-base \
+    --config "$WORK/config.yaml" --secrets-dir "$WORK/secrets" \
+    --profile "$profile" --manifest "$WORK/hub/vectors/base-worker-image-wheelhouse-$build.json")
 done
+
+# Register one exact managed-local realization for profile B and materialize the
+# same receipt-addressed base under Creator's fixed local registry. Registration
+# freezes identity only; it does not qualify endpoint code or borrow OCI evidence.
+python3 - "$RUNTIME_VENV" "$WORK/home" "$PROFILE_B" \
+  "$WORK/hub/vectors/base-worker-image-wheelhouse-cu130.json" "$WORK" <<'PY'
+import base64,hashlib,json,pathlib,shutil,sys
+venv,home,profile,manifest,work=map(pathlib.Path,sys.argv[1:])
+manifest_bytes=manifest.read_bytes()
+manifest_digest="sha256:"+hashlib.sha256(manifest_bytes).hexdigest()
+generation=hashlib.sha256()
+for relative in ("bin/python","bin/cozy-environment-proof","bin/cozy-runtime","bin/cozy-native-wheel-proof"):
+    generation.update(relative.encode()+b"\0"+pathlib.Path(venv/relative).read_bytes())
+receipt={"environment_proof":"bin/cozy-environment-proof","format":"cozy.local.ManagedBaseReceipt/1",
+         "generation_identity":"sha256:"+generation.hexdigest(),"profile":str(profile),
+         "python":"bin/python","python_abi":"cp312","wheelhouse_manifest_digest":manifest_digest}
+receipt_bytes=json.dumps(receipt,separators=(",",":"),sort_keys=True).encode()
+receipt_digest="sha256:"+hashlib.sha256(receipt_bytes).hexdigest()
+base=home/"managed-bases"/"sha256"/receipt_digest.removeprefix("sha256:")
+shutil.copytree(venv,base,symlinks=False)
+(base/"ManagedBaseReceipt.json").write_bytes(receipt_bytes)
+(base/"WheelhouseManifest.json").write_bytes(manifest_bytes)
+registration={"profile":str(profile),"wheelhouse_manifest_digest":manifest_digest,
+              "receipt_digest":receipt_digest,
+              "receipt_bytes_base64":base64.b64encode(receipt_bytes).decode()}
+(work/"managed-base-registration.json").write_text(json.dumps(registration,separators=(",",":"),sort_keys=True))
+PY
+admin=(-H "Authorization: Bearer $ADMIN_TOKEN" -H 'X-Tensorhub-Reason: Creator managed-local base setup')
+curl -fsS -X POST "$BASE/v1/admin/managed-local-bases" "${admin[@]}" \
+  -H 'Content-Type: application/json' --data-binary @"$WORK/managed-base-registration.json" \
+  >"$WORK/managed-base-registration.out"
 
 cat >"$WORK/source/pyproject.toml" <<'EOF'
 [project]
@@ -209,10 +216,16 @@ status=$(curl -sS -o "$WORK/qualification-before.json" -w '%{http_code}' \
 test "$status" = 404
 grep -q 'endpoint_profile.qualification_absent' "$WORK/qualification-before.json"
 status=$(curl -sS -o "$WORK/local-before.json" -w '%{http_code}' -X POST \
-  "$BASE/v1/endpoints/proof/marco/releases/live-1/profiles/$PROFILE_B/local-execution" \
+  "$BASE/v1/endpoints/proof/marco/releases/live-1/profiles/$PROFILE_B/local-qualification-materials" \
   "${admin[@]}" -H 'Content-Type: application/json' -d '{"grant_ttl_seconds":600}')
-test "$status" = 404
-grep -q 'endpoint_profile.candidate_absent' "$WORK/local-before.json"
+if [ "$EXPECTED_PROFILE_STATE" = candidate ]; then
+  test "$status" = 200
+  grep -q 'managed-local' "$WORK/local-before.json"
+  grep -q 'lease_id' "$WORK/local-before.json"
+else
+  test "$status" = 409
+  grep -q 'endpoint_local.candidate_refused' "$WORK/local-before.json"
+fi
 set +e
 "$WORK/cozy" endpoint promote proof/marco live-1 --serve v1/marco --reason "prequalification gate" \
   >"$WORK/promote-before.out" 2>&1
@@ -226,12 +239,8 @@ if [ "$RUN_PAID" = 1 ]; then
     --max-cost "${QUALIFICATION_MAX_COST:-0.25}" --duration "${QUALIFICATION_DURATION:-15m}" \
     --reason "paid Creator endpoint qualification" | tee "$WORK/qualify.out"
   grep -q 'qualified' "$WORK/qualify.out"
-  curl -fsS -X POST "$BASE/v1/endpoints/proof/marco/releases/live-1/profiles/$PROFILE_B/local-execution" \
-    "${admin[@]}" -H 'Content-Type: application/json' -d '{"grant_ttl_seconds":600}' \
-    >"$WORK/local-qualified.json"
-  grep -q 'managed-local' "$WORK/local-qualified.json"
   "$WORK/cozy" endpoint promote proof/marco live-1 --serve v1/marco \
     --reason "qualified Creator endpoint promotion" >"$WORK/promote.out"
 fi
 
-echo "endpoint-profile-live: PASS — publish/replay, two profiles, native refusal, qualify/local/promote gates (paid=$RUN_PAID)"
+echo "endpoint-profile-live: PASS — publish/replay, two profiles, native refusal, qualification absence, local materials/refusal, promote gate (paid=$RUN_PAID)"

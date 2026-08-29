@@ -107,7 +107,6 @@ CREATE TABLE IF NOT EXISTS managed_profile_installs (
   profile                      TEXT NOT NULL,
   candidate_id                 TEXT NOT NULL,
   base_realization_digest      TEXT NOT NULL,
-  base_worker_image_digest     TEXT NOT NULL,
   wheelhouse_manifest_digest   TEXT NOT NULL,
   environment_spec_digest      TEXT NOT NULL,
   endpoint_bundle_digest       TEXT NOT NULL,
@@ -250,7 +249,6 @@ type ManagedProfileInstall struct {
 	Profile                  string
 	CandidateID              string
 	BaseRealizationDigest    string
-	BaseWorkerImageDigest    string
 	WheelhouseManifestDigest string
 	EnvironmentSpecDigest    string
 	EndpointBundleDigest     string
@@ -317,12 +315,12 @@ func (s *Store) activate(g EndpointInstall, managed *ManagedProfileInstall) (sup
 		managed.RecordedAt = g.CreatedAt
 		if _, err := tx.Exec(`INSERT INTO managed_profile_installs(
 			install_id,release_id,profile,candidate_id,base_realization_digest,
-			base_worker_image_digest,wheelhouse_manifest_digest,environment_spec_digest,
+			wheelhouse_manifest_digest,environment_spec_digest,
 			endpoint_bundle_digest,resolved_wheel_set_digest,resolution_lock_digest,
 			installed_receipt_digest,installed_receipt_length,host_evidence_digest,
-			native_evidence_digest,lease_id,lease_expires_at,recorded_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+			native_evidence_digest,lease_id,lease_expires_at,recorded_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
 			managed.InstallID, managed.ReleaseID, managed.Profile, managed.CandidateID,
-			managed.BaseRealizationDigest, managed.BaseWorkerImageDigest,
+			managed.BaseRealizationDigest,
 			managed.WheelhouseManifestDigest, managed.EnvironmentSpecDigest,
 			managed.EndpointBundleDigest, managed.ResolvedWheelSetDigest,
 			managed.ResolutionLockDigest, managed.InstalledReceiptDigest,
@@ -349,13 +347,13 @@ func (s *Store) activate(g EndpointInstall, managed *ManagedProfileInstall) (sup
 func (s *Store) ManagedInstall(installID string) (*ManagedProfileInstall, *exit.Error) {
 	var out ManagedProfileInstall
 	err := s.db.QueryRow(`SELECT install_id,release_id,profile,candidate_id,
-		base_realization_digest,base_worker_image_digest,wheelhouse_manifest_digest,
+		base_realization_digest,wheelhouse_manifest_digest,
 		environment_spec_digest,endpoint_bundle_digest,resolved_wheel_set_digest,
 		resolution_lock_digest,installed_receipt_digest,installed_receipt_length,
 		host_evidence_digest,native_evidence_digest,lease_id,lease_expires_at,recorded_at
 		FROM managed_profile_installs WHERE install_id=?`, installID).Scan(
 		&out.InstallID, &out.ReleaseID, &out.Profile, &out.CandidateID,
-		&out.BaseRealizationDigest, &out.BaseWorkerImageDigest, &out.WheelhouseManifestDigest,
+		&out.BaseRealizationDigest, &out.WheelhouseManifestDigest,
 		&out.EnvironmentSpecDigest, &out.EndpointBundleDigest, &out.ResolvedWheelSetDigest,
 		&out.ResolutionLockDigest, &out.InstalledReceiptDigest, &out.InstalledReceiptLength,
 		&out.HostEvidenceDigest, &out.NativeEvidenceDigest, &out.LeaseID, &out.LeaseExpiresAt, &out.RecordedAt)

@@ -177,12 +177,11 @@ type NativeWheelProof struct {
 	Fixture              string `json:"fixture"`
 }
 
-type LocalExecutionGrant struct {
+type LocalQualificationMaterials struct {
 	CandidateID             string            `json:"candidate_id"`
 	Profile                 string            `json:"profile"`
 	LeaseID                 string            `json:"lease_id"`
 	LeaseExpiresAt          string            `json:"lease_expires_at"`
-	BaseWorkerImageDigest   string            `json:"base_worker_image_digest"`
 	BaseRealization         BaseRealization   `json:"base_realization"`
 	EndpointEnvironmentSpec ExactDocument     `json:"endpoint_environment_spec"`
 	EndpointBundle          ExactDocument     `json:"endpoint_bundle"`
@@ -195,12 +194,12 @@ type LocalExecutionGrant struct {
 	NativeWheelProof        *NativeWheelProof `json:"native_wheel_proof,omitempty"`
 }
 
-func (c *Client) EndpointLocalExecution(ctx context.Context, ref Ref, release, profile string,
+func (c *Client) EndpointLocalQualificationMaterials(ctx context.Context, ref Ref, release, profile string,
 	grantTTLSeconds int64, reason string,
-) (LocalExecutionGrant, *exit.Error) {
-	var out LocalExecutionGrant
+) (LocalQualificationMaterials, *exit.Error) {
+	var out LocalQualificationMaterials
 	e := c.do(ctx, call{method: http.MethodPost,
-		path:  endpointProfilePath(ref, release, profile) + "/local-execution",
+		path:  endpointProfilePath(ref, release, profile) + "/local-qualification-materials",
 		admin: true, reason: reason, byBytes: true, patient: true,
 		body: map[string]int64{"grant_ttl_seconds": grantTTLSeconds}}, &out)
 	return out, e

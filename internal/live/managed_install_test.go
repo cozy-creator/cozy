@@ -126,6 +126,7 @@ func TestQualifiedManagedLocalInstall(t *testing.T) {
 	})
 	baseDigest := digestText(baseReceipt)
 	base := layout.ManagedBase(baseDigest)
+	proofOrder := filepath.Join(cozyHome, "proof-order")
 	must(t, os.MkdirAll(filepath.Join(base, "bin"), 0o755))
 	must(t, os.WriteFile(filepath.Join(base, "ManagedBaseReceipt.json"), baseReceipt, 0o600))
 	must(t, os.WriteFile(filepath.Join(base, "WheelhouseManifest.json"), wheelhouse, 0o600))
@@ -134,6 +135,7 @@ func TestQualifiedManagedLocalInstall(t *testing.T) {
 		return `#!/usr/bin/python3
 import base64,hashlib,json,pathlib,sys
 request=json.loads(pathlib.Path(sys.argv[1]).read_text())
+pathlib.Path("` + proofOrder + `").open("a").write("materialize\n")
 generation=pathlib.Path(request["environment_root"])/"contents"/"` + strings.TrimPrefix(overlayContentDigest, "sha256:") + `"
 (generation/"site-packages").mkdir(parents=True)
 receipt=base64.b64decode("` + base64.StdEncoding.EncodeToString(receipt) + `")
@@ -144,10 +146,12 @@ print(json.dumps({"digest":"sha256:"+hashlib.sha256(receipt).hexdigest(),"genera
 	writeExecutable(t, filepath.Join(base, "bin", "cozy-environment-proof"), environmentProof(runtimeReceipt))
 	writeExecutable(t, filepath.Join(base, "bin", "cozy-runtime"), //cozy:allow independent Runtime CLI fixture, not a product execution door
 		`#!/usr/bin/python3
-import hashlib,json,sys
+import hashlib,json,pathlib,sys
 if "describe" in sys.argv:
+ pathlib.Path("`+proofOrder+`").open("a").write("descriptor\n")
  print(json.dumps({"descriptor_digest":"`+digestText(descriptor)+`"}))
 elif "doctor" in sys.argv:
+ pathlib.Path("`+proofOrder+`").open("a").write("host\n")
  print(json.dumps({"device":{"name":"NVIDIA GeForce RTX 4090","state":"present","sm":89,"vram_total_bytes":1,"driver_version":"580.1.2","cuda_version":"13.0"},"host":{"platform":"fixture","ram_total_bytes":1,"vcpu_count":1},"cas":{"root":"/tmp","present":True,"artifacts":0},"credentials":[],"unreadable":[]}))
 else: raise SystemExit(2)
 `)
@@ -155,6 +159,7 @@ else: raise SystemExit(2)
 		return `#!/usr/bin/python3
 import base64,hashlib,json,pathlib,sys
 request=json.loads(pathlib.Path(sys.argv[1]).read_text())
+pathlib.Path("` + proofOrder + `").open("a").write("native\n")
 assert request["format"]=="cozy.runtime.NativeWheelProofRequest/1"
 assert set(request)=={"device_index","endpoint_environment_spec_digest","environment_root","expected_result_digest","fixture","format","installed_environment_receipt_digest","python","wheelhouse_manifest"}
 assert request["installed_environment_receipt_digest"]=="` + digestText(runtimeReceipt) + `"
@@ -176,17 +181,20 @@ print(json.dumps({"digest":"sha256:"+hashlib.sha256(evidence).hexdigest(),"lengt
 			_, _ = w.Write(customBytes)
 			return
 		}
-		if r.Method == http.MethodPost && strings.HasSuffix(r.URL.Path, "/local-execution") {
+		if r.Method == http.MethodPost && strings.HasSuffix(r.URL.Path, "/local-qualification-materials") {
 			if r.Header.Get("Authorization") != "Bearer admin" {
 				writeHubError(w, http.StatusUnauthorized, "auth.token_invalid", "bad token")
 				return
 			}
 			expiresAt := time.Now().Add(time.Hour).UTC().Format(time.RFC3339)
+			realization := map[string]string{"kind": "managed-local", "digest": baseDigest}
+			if strings.Contains(r.Header.Get("X-Tensorhub-Reason"), "OCI substitution") {
+				realization = map[string]string{"kind": "oci", "digest": "registry.invalid/worker@sha256:" + strings.Repeat("5", 64)}
+			}
 			_ = json.NewEncoder(w).Encode(map[string]any{
 				"candidate_id": "candidate-local", "profile": endpointprofile.CU130,
 				"lease_id": "lease-local", "lease_expires_at": expiresAt,
-				"base_worker_image_digest":  "sha256:" + strings.Repeat("5", 64),
-				"base_realization":          map[string]string{"kind": "managed-local", "digest": baseDigest},
+				"base_realization":          realization,
 				"endpoint_environment_spec": exactDoc(ees), "endpoint_bundle": exactDoc(bundle),
 				"descriptor": exactDoc(descriptor), "evaluated_config": exactDoc(evaluated),
 				"resolved_wheel_set": exactDoc(resolved), "wheelhouse_manifest": exactDoc(wheelhouse),
@@ -237,6 +245,19 @@ print(json.dumps({"digest":"sha256:"+hashlib.sha256(evidence).hexdigest(),"lengt
 		facts.NativeEvidenceDigest != digestText(mustRead(t, filepath.Join(installed[0].Dir, "native-wheel-qualification.json"))) {
 		t.Fatalf("managed host/native evidence digests do not identify their separate stored bytes: %+v", facts)
 	}
+	if order := strings.TrimSpace(string(mustRead(t, proofOrder))); order != "materialize\nhost\nnative\ndescriptor" {
+		t.Fatalf("endpoint code ran before local hardware proof: %q", order)
+	}
+	if code, output := run("install", "cozy/marco@1.0.0", "--profile", endpointprofile.CU130,
+		"--major", "v1", "--force", "--reason", "OCI substitution fixture"); code != 6 ||
+		!strings.Contains(output, "managed_install_grant_invalid") {
+		t.Fatalf("OCI realization entered managed-local qualification [exit %d]\n%s", code, output)
+	}
+	_, active, problem := store.ActivePin("cozy/marco", 1)
+	fatal(t, problem)
+	if active == nil || active.ID != installed[0].ID {
+		t.Fatalf("OCI substitution disturbed active managed-local install: %+v", active)
+	}
 	if code, output := run("install", "cozy/marco@1.0.0", "--profile", endpointprofile.CU130,
 		"--major", "v1", "--reason", "managed fixture replay"); code != 0 ||
 		!strings.Contains(output, "already pinned") {
@@ -250,7 +271,7 @@ print(json.dumps({"digest":"sha256:"+hashlib.sha256(evidence).hexdigest(),"lengt
 		!strings.Contains(output, "managed_native_evidence_invalid") {
 		t.Fatalf("managed native evidence mismatch [exit %d]\n%s", code, output)
 	}
-	_, active, problem := store.ActivePin("cozy/marco", 1)
+	_, active, problem = store.ActivePin("cozy/marco", 1)
 	fatal(t, problem)
 	if active == nil || active.ID != installed[0].ID {
 		t.Fatalf("failed native-evidence replacement disturbed active install: %+v", active)

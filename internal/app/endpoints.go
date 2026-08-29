@@ -160,7 +160,7 @@ func handleManagedInstall(ctx *Context, profile string) *exit.Error {
 	c := client(ctx)
 	hctx, cancel := hub.LongContext()
 	defer cancel()
-	grant, e := c.EndpointLocalExecution(hctx, ref, release, profiles[0], int64(ttl/time.Second), reason)
+	grant, e := c.EndpointLocalQualificationMaterials(hctx, ref, release, profiles[0], int64(ttl/time.Second), reason)
 	if e != nil {
 		return e
 	}
@@ -182,7 +182,8 @@ func handleManagedInstall(ctx *Context, profile string) *exit.Error {
 		{K: "lease", V: facts.LeaseID + " until " + facts.LeaseExpiresAt},
 		{K: "disk", V: diskText(g)},
 	}, Notes: []string{
-		"installed from a hardware-qualified managed-local candidate; no dependency resolution, Torch/CUDA install, or native build ran",
+		"installed only after independent local hardware qualification; no cloud qualification was borrowed",
+		"no dependency resolution, Torch/CUDA install, or native build ran",
 		"control install, portable Runtime receipt, local-base fingerprint, host evidence, and lease are separate recorded facts",
 	}, Next: []string{"cozy start " + g.Endpoint + "@v" + strconv.Itoa(g.Major), "cozy run <org/endpoint/vN/function>"}}
 	if facts.NativeEvidenceDigest != "" {
