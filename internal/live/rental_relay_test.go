@@ -77,3 +77,29 @@ func TestRentalRelayRefusalIsDurableAndClearsOnSuccess(t *testing.T) {
 		t.Fatalf("accepted relay state = %#v", updated)
 	}
 }
+
+func TestObserveRentalWorkerCPU(t *testing.T) {
+	o := hostOwner(t, "rental-cpu-observation")
+	fatal(t, o.store.RecordRental(records.Rental{
+		ID: "pr-cpu", EndpointRef: "cozy/marco-polo-cpu/v1/marco",
+		AcceleratorModel: "CPU", State: "converging", Hub: "http://hub",
+	}))
+	fatal(t, o.store.ObserveRentalWorker(
+		"pr-cpu", "", "none", "", "", 0, "instance-cpu", "boot-1", 0,
+	))
+	row, problem := o.store.RentalRow("pr-cpu")
+	fatal(t, problem)
+	if row == nil || row.ObservedBackend != "none" || row.ObservedAccelerator != "" ||
+		row.ObservedAcceleratorCount != 0 || row.ObservedWorkerInstance != "instance-cpu" ||
+		row.ObservedAt == "" {
+		t.Fatalf("CPU observation = %+v", row)
+	}
+	fatal(t, o.store.ObserveRentalWorker(
+		"pr-cpu", "", "none", "", "", 0, "instance-cpu", "boot-2", 0,
+	))
+	if problem := o.store.ObserveRentalWorker(
+		"pr-cpu", "GPU", "cuda", "580.1", "13.0", 1, "instance-cpu", "boot-3", 1,
+	); problem == nil {
+		t.Fatal("CPU rental accepted GPU Claim facts")
+	}
+}
