@@ -142,17 +142,21 @@ var Commands = []Command{
 	{
 		Path: []string{"install"}, Group: "endpoints",
 		Summary: "resolve, verify, build and pin an endpoint as an immutable generation",
-		Args:    "<org/endpoint[@vN]>", MinArgs: 1, MaxArgs: 1,
+		Args:    "<org/endpoint[@vN|@release]>", MinArgs: 1, MaxArgs: 1,
 		Flags: []Flag{
 			{Name: "--from", Arg: "<archive.tar.gz>", Summary: "install one local release archive"},
 			{Name: "--digest", Arg: "<sha256:…>", Summary: "the source digest the release declares — verified before anything executes"},
 			{Name: "--force", Summary: "build a new generation and swap the pin"},
 			{Name: "--allow-unsigned", Summary: "development-only door past source verification"},
+			{Name: "--profile", Arg: "<profile>", Summary: "install one qualified published profile; forbids source build"},
+			{Name: "--major", Arg: "<vN>", Summary: "required local pin major with --profile"},
+			{Name: "--grant-ttl", Arg: "<duration>", Summary: "local wheel/lease grant lifetime", Default: "10m"},
+			{Name: "--reason", Arg: "<why>", Summary: "required with --profile; recorded before the lease"},
 		},
 		Exits:      []exit.Code{exit.OK, exit.Usage, exit.Validation, exit.NotFound, exit.Credential, exit.Structural, exit.Conflict, exit.Capacity},
 		Capability: "cmd.install", Status: Implemented, Handler: "install",
 		Next:     []string{"cozy run <org/endpoint/vN/function>", "cozy describe <org/endpoint>"},
-		Examples: []string{"cozy install org/endpoint --from ./release.tar.gz --digest sha256:<hex>", "cozy install org/endpoint --from ./release.tar.gz --force"},
+		Examples: []string{"cozy install org/endpoint@1.0.0 --profile torch2.13.0-cu130-cp312-linux-x86 --major v1 --reason <why>", "cozy install org/endpoint --from ./release.tar.gz --digest sha256:<hex>", "cozy install org/endpoint --from ./release.tar.gz --force"},
 	},
 	{
 		Path: []string{"ls"}, Group: "endpoints",

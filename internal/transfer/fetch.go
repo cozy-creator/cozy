@@ -21,6 +21,8 @@ package transfer
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
 	"io"
 	"net/http"
@@ -387,11 +389,53 @@ func fetchOnce(ctx context.Context, url, dst string, length int64) (int64, bool,
 	// The read is bounded by the length the checkpoint DECLARES. A source streaming
 	// more than it should is stopped here; whether the bytes hash correctly is the
 	// byte plane's question, one step later.
-	n, err := io.Copy(f, m.reader(io.LimitReader(resp.Body, length)))
+	n, err := io.Copy(f, m.reader(io.LimitReader(resp.Body, length+1)))
 	if err != nil {
 		return 0, true, exit.Unavailablef("the transfer broke after %s: %s", size(n), err)
 	}
+	if n != length {
+		return 0, false, exit.Named(exit.Validation, "download.length_mismatch",
+			"the granted object delivered %d bytes; its exact ref declares %d", n, length)
+	}
 	return n, false, nil
+}
+
+// DownloadExact fetches one presigned immutable object into a fresh local path and
+// admits it only when full length and SHA-256 match the caller's exact ref.
+func DownloadExact(ctx context.Context, subject, url, dst, digest string, length int64) *exit.Error {
+	if length <= 0 || !strings.HasPrefix(digest, "sha256:") || len(digest) != 71 {
+		return exit.Internalf("download %s has an invalid exact ref", subject)
+	}
+	if err := os.MkdirAll(filepath.Dir(dst), 0o700); err != nil {
+		return exit.Internalf("cannot create download staging for %s: %s", subject, err)
+	}
+	if _, err := os.Stat(dst); err == nil {
+		return exit.Named(exit.Conflict, "download.target_exists", "%s already exists", dst).
+			WithRemedy("use one fresh endpoint generation; never replace an admitted wheel in place")
+	} else if !os.IsNotExist(err) {
+		return exit.Internalf("cannot inspect download target %s: %s", dst, err)
+	}
+	n, problem := download(ctx, url, dst, length)
+	if problem != nil {
+		_ = os.Remove(dst)
+		return problem
+	}
+	f, err := os.Open(dst)
+	if err != nil {
+		_ = os.Remove(dst)
+		return exit.Internalf("cannot verify downloaded %s: %s", subject, err)
+	}
+	h := sha256.New()
+	_, err = io.Copy(h, f)
+	f.Close()
+	observed := "sha256:" + hex.EncodeToString(h.Sum(nil))
+	if err != nil || n != length || observed != digest {
+		_ = os.Remove(dst)
+		return exit.Named(exit.Validation, "download.identity_mismatch",
+			"%s delivered %d bytes hashing to %s; expected %d bytes / %s",
+			subject, n, observed, length, digest)
+	}
+	return nil
 }
 
 func short(ids []string) []string {

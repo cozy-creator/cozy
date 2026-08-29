@@ -40,6 +40,8 @@ type EndpointInstall struct {
 	Verified     bool // false = installed through the --allow-unsigned development door
 	Dir          string
 	Python       string
+	Runtime      string // exact cozy-runtime binary; empty on older source installs derives from venv
+	ProjectDir   string // exact installed project root; empty on source installs derives from source kind
 	UV           string
 	LockDigest   string
 	Platform     string
@@ -78,6 +80,8 @@ CREATE TABLE IF NOT EXISTS install_generations (
   verified      INTEGER NOT NULL,
   dir           TEXT    NOT NULL,
   python        TEXT    NOT NULL,
+  runtime       TEXT    NOT NULL DEFAULT '',
+  project_dir   TEXT    NOT NULL DEFAULT '',
   uv            TEXT    NOT NULL,
   lock_digest   TEXT    NOT NULL,
   platform      TEXT    NOT NULL,
@@ -96,6 +100,25 @@ CREATE TABLE IF NOT EXISTS pins (
   generation   TEXT    NOT NULL REFERENCES install_generations(id),
   activated_at TEXT    NOT NULL,
   PRIMARY KEY (endpoint, major)
+)`, `
+CREATE TABLE IF NOT EXISTS managed_profile_installs (
+  install_id                    TEXT PRIMARY KEY REFERENCES install_generations(id),
+  release_id                   TEXT NOT NULL,
+  profile                      TEXT NOT NULL,
+  candidate_id                 TEXT NOT NULL,
+  base_realization_digest      TEXT NOT NULL,
+  base_worker_image_digest     TEXT NOT NULL,
+  wheelhouse_manifest_digest   TEXT NOT NULL,
+  environment_spec_digest      TEXT NOT NULL,
+  endpoint_bundle_digest       TEXT NOT NULL,
+  resolved_wheel_set_digest    TEXT NOT NULL,
+  resolution_lock_digest       TEXT NOT NULL,
+  installed_receipt_digest     TEXT NOT NULL,
+  installed_receipt_length     INTEGER NOT NULL,
+  host_evidence_digest         TEXT NOT NULL,
+  lease_id                     TEXT NOT NULL,
+  lease_expires_at             TEXT NOT NULL,
+  recorded_at                  TEXT NOT NULL
 )`}, append(orchestratorSchema,
 	append(eventSchema, append(rentalSchema, append(workflowSchema, videoSchema...)...)...)...)...)
 
@@ -185,7 +208,7 @@ func (s *Store) Close() { _ = s.db.Close() }
 
 var genFields = []string{
 	"id", "endpoint", "major", "version", "source_kind", "source_ref", "source_digest",
-	"verified", "dir", "python", "uv", "lock_digest", "platform", "extra", "link_mode",
+	"verified", "dir", "python", "runtime", "project_dir", "uv", "lock_digest", "platform", "extra", "link_mode",
 	"packages", "closure", "descriptor", "bytes_excl", "bytes_shared", "created_at",
 }
 
@@ -206,7 +229,7 @@ func scanGen(rows interface{ Scan(...any) error }) (EndpointInstall, error) {
 	var g EndpointInstall
 	var verified int
 	err := rows.Scan(&g.ID, &g.Endpoint, &g.Major, &g.Version, &g.SourceKind, &g.SourceRef,
-		&g.SourceDigest, &verified, &g.Dir, &g.Python, &g.UV, &g.LockDigest, &g.Platform,
+		&g.SourceDigest, &verified, &g.Dir, &g.Python, &g.Runtime, &g.ProjectDir, &g.UV, &g.LockDigest, &g.Platform,
 		&g.Extra, &g.LinkMode, &g.Packages, &g.Closure, &g.Descriptor,
 		&g.BytesExcl, &g.BytesShared, &g.CreatedAt)
 	g.Verified = verified == 1
@@ -217,6 +240,52 @@ func scanGen(rows interface{ Scan(...any) error }) (EndpointInstall, error) {
 // together or not at all. A crash before Commit leaves the previous pin — and the
 // previous generation's venv — exactly as it was.
 func (s *Store) Activate(g EndpointInstall) (superseded string, e *exit.Error) {
+	return s.activate(g, nil)
+}
+
+type ManagedProfileInstall struct {
+	InstallID                string
+	ReleaseID                string
+	Profile                  string
+	CandidateID              string
+	BaseRealizationDigest    string
+	BaseWorkerImageDigest    string
+	WheelhouseManifestDigest string
+	EnvironmentSpecDigest    string
+	EndpointBundleDigest     string
+	ResolvedWheelSetDigest   string
+	ResolutionLockDigest     string
+	InstalledReceiptDigest   string
+	InstalledReceiptLength   int64
+	HostEvidenceDigest       string
+	LeaseID                  string
+	LeaseExpiresAt           string
+	RecordedAt               string
+}
+
+// ActivateManaged commits the ordinary control install/pin and its independent
+// profile realization, receipt, host evidence, and lease facts in one transaction.
+func (s *Store) ActivateManaged(g EndpointInstall, facts ManagedProfileInstall) (string, *exit.Error) {
+	facts.InstallID = g.ID
+	for name, value := range map[string]string{
+		"release": facts.ReleaseID, "profile": facts.Profile, "candidate": facts.CandidateID,
+		"base realization": facts.BaseRealizationDigest, "wheelhouse": facts.WheelhouseManifestDigest,
+		"environment": facts.EnvironmentSpecDigest, "bundle": facts.EndpointBundleDigest,
+		"resolved wheels": facts.ResolvedWheelSetDigest, "resolution lock": facts.ResolutionLockDigest,
+		"receipt": facts.InstalledReceiptDigest, "host evidence": facts.HostEvidenceDigest,
+		"lease": facts.LeaseID, "lease expiry": facts.LeaseExpiresAt,
+	} {
+		if strings.TrimSpace(value) == "" {
+			return "", exit.Internalf("managed install has no %s fact", name)
+		}
+	}
+	if facts.InstalledReceiptLength <= 0 {
+		return "", exit.Internalf("managed install has no positive receipt length")
+	}
+	return s.activate(g, &facts)
+}
+
+func (s *Store) activate(g EndpointInstall, managed *ManagedProfileInstall) (superseded string, e *exit.Error) {
 	tx, err := s.db.Begin()
 	if err != nil {
 		return "", exit.Internalf("cannot begin the activation transaction: %s", err)
@@ -238,9 +307,27 @@ func (s *Store) Activate(g EndpointInstall) (superseded string, e *exit.Error) {
 	if _, err := tx.Exec(`INSERT INTO install_generations(`+genCols("")+`)
 		VALUES(`+placeholders()+`)`,
 		g.ID, g.Endpoint, g.Major, g.Version, g.SourceKind, g.SourceRef, g.SourceDigest,
-		verified, g.Dir, g.Python, g.UV, g.LockDigest, g.Platform, g.Extra, g.LinkMode,
+		verified, g.Dir, g.Python, g.Runtime, g.ProjectDir, g.UV, g.LockDigest, g.Platform, g.Extra, g.LinkMode,
 		g.Packages, g.Closure, g.Descriptor, g.BytesExcl, g.BytesShared, g.CreatedAt); err != nil {
 		return "", exit.Internalf("cannot insert generation %s: %s", g.ID, err)
+	}
+	if managed != nil {
+		managed.RecordedAt = g.CreatedAt
+		if _, err := tx.Exec(`INSERT INTO managed_profile_installs(
+			install_id,release_id,profile,candidate_id,base_realization_digest,
+			base_worker_image_digest,wheelhouse_manifest_digest,environment_spec_digest,
+			endpoint_bundle_digest,resolved_wheel_set_digest,resolution_lock_digest,
+			installed_receipt_digest,installed_receipt_length,host_evidence_digest,
+			lease_id,lease_expires_at,recorded_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+			managed.InstallID, managed.ReleaseID, managed.Profile, managed.CandidateID,
+			managed.BaseRealizationDigest, managed.BaseWorkerImageDigest,
+			managed.WheelhouseManifestDigest, managed.EnvironmentSpecDigest,
+			managed.EndpointBundleDigest, managed.ResolvedWheelSetDigest,
+			managed.ResolutionLockDigest, managed.InstalledReceiptDigest,
+			managed.InstalledReceiptLength, managed.HostEvidenceDigest,
+			managed.LeaseID, managed.LeaseExpiresAt, managed.RecordedAt); err != nil {
+			return "", exit.Internalf("cannot insert managed profile facts for %s: %s", g.ID, err)
+		}
 	}
 	if _, err := tx.Exec(`INSERT INTO pins(endpoint,major,generation,activated_at)
 		VALUES(?,?,?,?) ON CONFLICT(endpoint,major) DO UPDATE SET generation=excluded.generation,
@@ -254,6 +341,28 @@ func (s *Store) Activate(g EndpointInstall) (superseded string, e *exit.Error) {
 			WithRemedy("the previous pin is untouched; re-run the install")
 	}
 	return prior, nil
+}
+
+func (s *Store) ManagedInstall(installID string) (*ManagedProfileInstall, *exit.Error) {
+	var out ManagedProfileInstall
+	err := s.db.QueryRow(`SELECT install_id,release_id,profile,candidate_id,
+		base_realization_digest,base_worker_image_digest,wheelhouse_manifest_digest,
+		environment_spec_digest,endpoint_bundle_digest,resolved_wheel_set_digest,
+		resolution_lock_digest,installed_receipt_digest,installed_receipt_length,
+		host_evidence_digest,lease_id,lease_expires_at,recorded_at
+		FROM managed_profile_installs WHERE install_id=?`, installID).Scan(
+		&out.InstallID, &out.ReleaseID, &out.Profile, &out.CandidateID,
+		&out.BaseRealizationDigest, &out.BaseWorkerImageDigest, &out.WheelhouseManifestDigest,
+		&out.EnvironmentSpecDigest, &out.EndpointBundleDigest, &out.ResolvedWheelSetDigest,
+		&out.ResolutionLockDigest, &out.InstalledReceiptDigest, &out.InstalledReceiptLength,
+		&out.HostEvidenceDigest, &out.LeaseID, &out.LeaseExpiresAt, &out.RecordedAt)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, exit.Internalf("cannot read managed profile facts for %s: %s", installID, err)
+	}
+	return &out, nil
 }
 
 // ActivePin returns the pinned generation for one (endpoint, major).

@@ -33,6 +33,7 @@ type Fact struct {
 	Length       int64    `json:"length"`
 	Tags         []string `json:"tags"`
 	Version      string   `json:"version"`
+	Native       bool     `json:"-"`
 }
 
 type InspectClass string
@@ -110,6 +111,9 @@ func Inspect(file string, class InspectClass) (Fact, *exit.Error) {
 		if class == CustomWheel && nativeSourceExt[ext] {
 			return out, exit.Named(exit.Validation, "custom_wheel_build_input",
 				"%s contains native source; custom wheels are exact prebuilt binaries", name)
+		}
+		if class == CustomWheel && compiledExt[ext] && !nativeSourceExt[ext] {
+			out.Native = true
 		}
 		if buildInputName(name) {
 			code := "project_wheel_build_input"

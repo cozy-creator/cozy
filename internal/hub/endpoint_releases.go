@@ -172,16 +172,26 @@ type BaseRealization struct {
 	Digest string `json:"digest"`
 }
 
+type NativeWheelProof struct {
+	DeviceIndex          *int   `json:"device_index"`
+	ExpectedResultDigest string `json:"expected_result_digest"`
+	Fixture              string `json:"fixture"`
+}
+
 type LocalExecutionGrant struct {
-	CandidateID             string          `json:"candidate_id"`
-	Profile                 string          `json:"profile"`
-	BaseWorkerImageDigest   string          `json:"base_worker_image_digest"`
-	BaseRealization         BaseRealization `json:"base_realization"`
-	EndpointEnvironmentSpec ExactDocument   `json:"endpoint_environment_spec"`
-	WheelhouseManifest      ExactDocument   `json:"wheelhouse_manifest"`
-	ResolvedWheelSet        ExactDocument   `json:"resolved_wheel_set"`
-	ResolutionLock          ExactDocument   `json:"resolution_lock"`
-	Downloads               []DownloadGrant `json:"downloads"`
+	CandidateID             string            `json:"candidate_id"`
+	Profile                 string            `json:"profile"`
+	LeaseID                 string            `json:"lease_id"`
+	LeaseExpiresAt          string            `json:"lease_expires_at"`
+	BaseWorkerImageDigest   string            `json:"base_worker_image_digest"`
+	BaseRealization         BaseRealization   `json:"base_realization"`
+	EndpointEnvironmentSpec ExactDocument     `json:"endpoint_environment_spec"`
+	EndpointBundle          ExactDocument     `json:"endpoint_bundle"`
+	WheelhouseManifest      ExactDocument     `json:"wheelhouse_manifest"`
+	ResolvedWheelSet        ExactDocument     `json:"resolved_wheel_set"`
+	ResolutionLock          ExactDocument     `json:"resolution_lock"`
+	Downloads               []DownloadGrant   `json:"downloads"`
+	NativeWheelProof        *NativeWheelProof `json:"native_wheel_proof,omitempty"`
 }
 
 func (c *Client) EndpointLocalExecution(ctx context.Context, ref Ref, release, profile string,
