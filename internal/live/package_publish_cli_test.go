@@ -118,7 +118,8 @@ func TestPackagePublishCLI(t *testing.T) {
 	}
 	args := []string{"package", "publish", "cozy/marco", "--release", "1.0.0", "--dir", source,
 		"--reason", "fixture publish"}
-	if code, out := run(args...); code != 0 || !strings.Contains(out, "status: published") ||
+	if code, out := run(args...); code != 0 || !strings.Contains(out, "status:") ||
+		!strings.Contains(out, "published") ||
 		!strings.Contains(out, "qualified") || strings.Contains(out, "candidate-cpu") {
 		t.Fatalf("package publish [exit %d]\n%s", code, out)
 	}
@@ -153,6 +154,19 @@ dependencies = []
 	git(t, repo, "commit", "-qm", "fixture")
 	fakeUV := filepath.Join(repo, ".test-bin", "uv")
 	mustWrite(t, fakeUV, `#!/bin/sh
+if [ "$1" = "build" ]; then
+  shift
+  while [ "$#" -gt 0 ]; do
+    if [ "$1" = "--out-dir" ]; then
+      out="$2"
+      break
+    fi
+    shift
+  done
+  mkdir -p "$out"
+  cp "${0%/*}/marco_polo-1.0.0-py3-none-any.whl" "$out/"
+  exit 0
+fi
 if [ "${0##*/}" = "cozy-runtime" ]; then # //cozy:allow independent Runtime CLI fixture
   printf '%s\n' '{"application":"marco_polo:app","entrypoints":[],"format":"cozy.package.descriptor/1","jobs":[]}'
   exit 0
@@ -162,6 +176,9 @@ cp "$0" "$UV_PROJECT_ENVIRONMENT/bin/cozy-runtime"
 chmod 755 "$UV_PROJECT_ENVIRONMENT/bin/cozy-runtime"
 `)
 	must(t, os.Chmod(fakeUV, 0o755))
+	writeTestWheel(t, filepath.Join(repo, ".test-bin", "marco_polo-1.0.0-py3-none-any.whl"),
+		"marco_polo", "1.0.0", true, []string{"py3-none-any"},
+		map[string][]byte{"marco_polo.py": []byte("app = object()\n")})
 	return repo
 }
 

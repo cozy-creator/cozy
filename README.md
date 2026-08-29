@@ -47,11 +47,11 @@ cozy up
 # open the returned http://127.0.0.1:<port>/ URL
 ```
 
-`up` backgrounds one lightweight per-user controller: web UI, local API, durable records, local
+`up` backgrounds one lightweight per-user Cozy daemon: web UI, local API, durable records, local
 worker manager, and private-rental sessions. It does not attach a log stream or load a package or
 model. Repeating `up` returns the same healthy URL with `changed: false`; concurrent callers
-converge on one controller. A startup failure is returned directly as a bounded diagnostic and does
-not create a persistent log. Commands that require the controller may ensure the same process is
+converge on one daemon. A startup failure is returned directly as a bounded diagnostic and does
+not create a persistent log. Commands that require the daemon may ensure the same process is
 running automatically.
 
 ## Packages
@@ -80,7 +80,8 @@ Remove local package generations with:
 cozy package remove org/name
 ```
 
-Publishing packages one deterministic pure project wheel. Tensorhub derives compatible base
+Publishing asks the project's declared backend for one pure project wheel in private staging, then
+inspects those exact bytes. Tensorhub derives compatible base
 worker profiles from `pyproject.toml`, `uv.lock`, and its image inventory. The package name is
 created automatically when absent:
 
@@ -152,7 +153,7 @@ cozy rental end <rental-id>
 ```
 
 Rentals can continue billing until Tensorhub confirms their termination. `rental end` and
-`down --all` keep the local controller alive when remote absence cannot be confirmed.
+`down --all` keep the Cozy daemon alive when remote absence cannot be confirmed.
 
 ## Release GPU memory or stop Cozy
 
@@ -161,13 +162,13 @@ These commands have deliberately different scopes:
 ```sh
 cozy unload       # stop idle local Runtime workers and release their GPU models
 cozy down         # stop locally; refuses while invocations or rentals are active
-cozy down --all   # cancel all work, end all rentals, then stop the controller
+cozy down --all   # cancel all work, end all rentals, then stop the daemon
 ```
 
 None of them deletes installed package or model bytes. A failed partial `down --all` leaves the
-controller running so cancellation and paid-resource reconciliation can continue.
+daemon running so cancellation and paid-resource reconciliation can continue.
 
-The launch web UI is currently a stub rooted in [`web/`](web/). The controller already serves
+The launch web UI is currently a stub rooted in [`web/`](web/). The daemon already serves
 opaque output media and a bounded authenticated content-addressed upload API; full browser
 authentication, upload-to-invocation binding, and media-history UX come with the real frontend.
 
@@ -194,21 +195,20 @@ Supported environment variables are limited to:
 - `TENSORHUB_URL`
 - `TENSORHUB_TOKEN`
 
-The controller launcher also uses a private per-process bootstrap credential. Secrets are never
+The daemon launcher also uses a private per-process bootstrap credential. Secrets are never
 accepted as command-line values.
 
 ## Output and automation
 
-Command results and errors are one typed document. TOON is the concise default; `--json` changes
-only the encoding. Success output contains the domain answer without an `ok/kind/data` envelope.
-Progress goes to stderr.
+Commands print concise human-readable results by default. `--json` emits stable structured output
+for scripts and other software integrations. Interactive terminals add restrained color to errors;
+redirected and JSON output never contain ANSI escapes. Progress goes to stderr.
 
 ```sh
 cozy package search
-# packages[#3]:
-#   cozy/marco-polo-derived
-#   cozy/marco-polo-cu130
-#   cozy/marco-polo-launch1
+# cozy/marco-polo-derived
+# cozy/marco-polo-cu130
+# cozy/marco-polo-launch1
 
 cozy package list --fields package,version,disk
 cozy invoke list --json
@@ -217,11 +217,12 @@ cozy model search flux --full
 
 A one-field list is a scalar collection; multiple selected fields become a compact table. The
 collection length is already its count. `omitted` appears only when a limit withheld rows, and
-diagnostic fields appear only under `--full` or an explicit `--fields` selection. Errors retain
-their stable class, code, message, remedy, and contextual repair action.
+diagnostic fields appear only under `--full` or an explicit `--fields` selection. Human errors
+state the problem and repair directly; `--json` retains the stable class, code, message, remedy,
+and contextual next action.
 
 Shell exits are intentionally small: `0` success or idempotent no-op, `2` invocation/configuration
-error, and `1` operational failure. The structured error document retains the detailed stable code.
+error, and `1` operational failure.
 
 Authentication, billing management, datasets, and the full web UI are planned later; Cozy does
 not advertise placeholder commands for features that do not exist yet.

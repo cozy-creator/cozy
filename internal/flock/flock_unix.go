@@ -1,7 +1,7 @@
 //go:build unix
 
 // Package flock is the ONE spelling of "an exclusive claim on a file, held by a live
-// process". Two laws rest on it — the local controller's liveness lock and the records
+// process". Two laws rest on it — the Cozy daemon's liveness lock and the records
 // database's single-writer lock — and both need the same property: the KERNEL releases
 // the claim when the holder dies, SIGKILL included. A pidfile cannot promise that, which
 // is why neither law is written as one.

@@ -6,7 +6,7 @@ import (
 	"github.com/cozy-creator/cozy-creator/internal/orchestrator"
 )
 
-// claimRental attaches the controller to one already-provisioned private worker.
+// claimRental attaches the daemon to one already-provisioned private worker.
 // Provider acquisition remains Tensorhub's responsibility.
 func (s *Server) claimRental(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("rental_id")

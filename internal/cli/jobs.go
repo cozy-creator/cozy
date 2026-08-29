@@ -18,7 +18,7 @@ import (
 
 // THE JOB VERBS (cl-004): `submit` · `status` · `ls` · `follow` · `cancel`. They are
 // SIBLINGS of the request verbs, not a second surface — `internal/client` is the one way
-// each of them reaches the service, the durable event stream they follow is the same one
+// each of them reaches the daemon, the durable event stream they follow is the same one
 // `cozy invoke run` follows, and the terminal mapping is the same shared matrix
 // (0 · 11 · 12 · 10, through `exit.JobTerminal`).
 //

@@ -16,7 +16,7 @@ import (
 //
 //   - CURSOR RESUME. Every durable event carries `id:`. A stream that drops without a
 //     terminal is NOT a verdict — reconnect from the last id and the server replays
-//     everything after it, in order, across a service restart.
+//     everything after it, in order, across a daemon restart.
 //   - TERMINAL-STOP. A terminal event closes the per-request stream, and that is where
 //     `cozy invoke run` gets its exit code: the request's own settled status, mapped through the
 //     shared matrix. There is no polling loop and no timeout guessing what happened.
@@ -60,7 +60,7 @@ func (c *Client) Watch(requestID string, from int64, on func(Event) bool) (*Even
 		}
 		// The stream ended with no terminal. That means reconnect, and it is bounded so a
 		// server that closes instantly cannot spin: three consecutive closes with no new
-		// event is a service that is not going to answer.
+		// event is a daemon that is not going to answer.
 		attempts++
 		if attempts > 3 {
 			return nil, exit.Unavailablef(

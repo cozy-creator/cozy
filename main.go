@@ -1,4 +1,4 @@
-// cozy is the short-lived CLI and the private controller process entrypoint.
+// cozy is the short-lived CLI and the private daemon process entrypoint.
 package main
 
 import (
@@ -8,8 +8,8 @@ import (
 )
 
 func main() {
-	if cli.ControllerProcess(os.Args[0]) {
-		os.Exit(cli.RunController(os.Stdout, os.Stderr))
+	if cli.DaemonProcess(os.Args[0]) {
+		os.Exit(cli.RunDaemon(os.Stdout, os.Stderr))
 	}
 	os.Exit(cli.Run(os.Args[1:], os.Stdout, os.Stderr))
 }

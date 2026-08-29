@@ -108,7 +108,7 @@ func Verify(binding records.AssetBinding, max int64) *exit.Error {
 	if digest != binding.Digest || length != binding.Length {
 		return exit.Named(exit.Conflict, "input_asset_changed",
 			"input asset %s no longer matches its request identity", binding.FieldPath).
-			WithRemedy("the service stages immutable input bytes before recording a request; restore the local input store before retrying")
+			WithRemedy("the Cozy daemon stages immutable input bytes before recording a request; restore the local input store before retrying")
 	}
 	if binding.MediaType != "" && mediaType != "" && binding.MediaType != mediaType {
 		return exit.Named(exit.Conflict, "input_asset_type_changed",
@@ -118,7 +118,7 @@ func Verify(binding records.AssetBinding, max int64) *exit.Error {
 	return nil
 }
 
-// Stage verifies a caller's claims and atomically copies the bytes into the service's
+// Stage verifies a caller's claims and atomically copies the bytes into the daemon's
 // private content-addressed input store. If the original path has disappeared but the
 // claimed digest is already staged, the durable copy answers; this is what makes an
 // idempotent replay independent of the submitting CLI still being alive.
@@ -291,7 +291,7 @@ func DropUnowned(layout home.Layout, store *records.Store, assets []records.Asse
 	return nil
 }
 
-// Sweep removes objects a crash left without a request owner. It runs during service
+// Sweep removes objects a crash left without a request owner. It runs during daemon
 // reconciliation, before submissions are admitted, under the same ownership guard as
 // staging and terminal cleanup. Only this package's digest and temporary spellings are
 // touched; an unrelated file in the directory is not guessed to be ours.

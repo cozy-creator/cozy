@@ -85,6 +85,16 @@ object = "marco_polo:app"
 		problem.ErrName() != "project_wheel_not_pure" {
 		t.Fatalf("non-pure project tag was not refused: %v", problem)
 	}
+	private := filepath.Join(t.TempDir(), "private_payload-1.0.0-py3-none-any.whl")
+	writeTestWheel(t, private, "private_payload", "1.0.0", true,
+		[]string{"py3-none-any"}, map[string][]byte{
+			"private_payload/__init__.py": []byte("value=1\n"),
+			"private_payload/.env.local":  []byte("TOKEN=secret\n"),
+		})
+	if _, problem := wheel.Inspect(private, wheel.ProjectWheel); problem == nil ||
+		problem.ErrName() != "project_wheel_private_member" {
+		t.Fatalf("backend-emitted private member was not refused: %v", problem)
+	}
 	mislabeled := filepath.Join(t.TempDir(), "custom_op-1.2.3-py3-none-any.whl")
 	writeTestWheel(t, mislabeled, "custom_op", "1.2.3", true,
 		[]string{"py3-none-any"}, map[string][]byte{"custom_op/_native.so": []byte("native")})
@@ -137,16 +147,17 @@ object = "marco_polo:app"
 	git(t, repo, "add", "-u")
 	git(t, repo, "commit", "-qm", "remove retired descriptor")
 
-	mustWrite(t, filepath.Join(repo, "uncommitted.py"), "x=1\n")
-	if _, problem := packagepublish.Prepare(request); problem == nil || problem.ErrName() != "package_tree_dirty" {
-		t.Fatalf("dirty source tree did not refuse: %v", problem)
-	}
-	must(t, os.Remove(filepath.Join(repo, "uncommitted.py")))
+	// Git is not publication authority. An ordinary untracked file is scanned as source,
+	// so a dangerous untracked member must refuse just like a committed one.
 	mustWrite(t, filepath.Join(repo, "native.so"), "native")
-	git(t, repo, "add", "native.so")
-	git(t, repo, "commit", "-qm", "plant native")
 	if _, problem := packagepublish.Prepare(request); problem == nil || problem.ErrName() != "package_source_native_input" {
-		t.Fatalf("committed native source did not refuse before packaging: %v", problem)
+		t.Fatalf("untracked native source did not refuse before packaging: %v", problem)
+	}
+
+	noGit := t.TempDir()
+	mustWrite(t, filepath.Join(noGit, ".env.local"), "TOKEN=secret\n")
+	if _, problem := packagepublish.Prepare(packagepublish.Request{Tree: noGit, Release: "1"}); problem == nil || problem.ErrName() != "package_source_credential" {
+		t.Fatalf("non-Git source was not scanned for credential material: %v", problem)
 	}
 }
 

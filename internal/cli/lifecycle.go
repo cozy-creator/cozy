@@ -8,6 +8,7 @@ import (
 	"time"
 
 	localapi "github.com/cozy-creator/cozy-creator/internal/client"
+	"github.com/cozy-creator/cozy-creator/internal/daemon"
 	"github.com/cozy-creator/cozy-creator/internal/exit"
 	"github.com/cozy-creator/cozy-creator/internal/home"
 	"github.com/cozy-creator/cozy-creator/internal/hub"
@@ -15,17 +16,16 @@ import (
 	"github.com/cozy-creator/cozy-creator/internal/output"
 	"github.com/cozy-creator/cozy-creator/internal/records"
 	"github.com/cozy-creator/cozy-creator/internal/rental"
-	"github.com/cozy-creator/cozy-creator/internal/service"
 )
 
 func handleUnload(ctx *Context) *exit.Error {
-	state := service.Probe(ctx.Cfg)
+	state := daemon.Probe(ctx.Cfg)
 	if !state.Up {
 		return emit(ctx, output.Record{Fields: []output.Field{
 			{K: "stopped", V: 0}, {K: "released", V: "0B"}, {K: "changed", V: false},
 		}})
 	}
-	ctx.Service = state
+	ctx.Daemon = state
 	client, problem := dial(ctx)
 	if problem != nil {
 		return problem
@@ -49,12 +49,12 @@ func handleUnload(ctx *Context) *exit.Error {
 }
 
 func handleUp(ctx *Context) *exit.Error {
-	state, changed, problem := ensureController(ctx)
+	state, changed, problem := ensureDaemon(ctx)
 	if problem != nil {
 		return problem
 	}
 	fields := []output.Field{
-		{K: "controller", V: "running"}, {K: "url", V: "http://" + state.Addr + "/"},
+		{K: "daemon", V: "running"}, {K: "url", V: "http://" + state.Addr + "/"},
 		{K: "api", V: "http://" + state.Addr}, {K: "pid", V: state.PID},
 		{K: "since", V: state.Since}, {K: "changed", V: changed},
 	}
@@ -63,7 +63,7 @@ func handleUp(ctx *Context) *exit.Error {
 
 func handleDown(ctx *Context) *exit.Error {
 	all := ctx.Inv.Bool("--all")
-	state := service.Probe(ctx.Cfg)
+	state := daemon.Probe(ctx.Cfg)
 	if !state.Up {
 		blockers, problem := offlineDownBlockers(ctx)
 		if problem != nil {
@@ -71,20 +71,20 @@ func handleDown(ctx *Context) *exit.Error {
 		}
 		if len(blockers) == 0 {
 			return emit(ctx, output.Record{Fields: []output.Field{
-				{K: "controller", V: "stopped"}, {K: "changed", V: false},
+				{K: "daemon", V: "stopped"}, {K: "changed", V: false},
 			}})
 		}
 		if !all {
 			return exit.Named(exit.Conflict, "active_work",
-				"controller down refused: active %s", strings.Join(blockers, ", ")).
+				"daemon shutdown refused: active %s", strings.Join(blockers, ", ")).
 				WithRemedy("cancel/end the named work, or use explicit `cozy down --all`")
 		}
-		state, _, problem = ensureController(ctx)
+		state, _, problem = ensureDaemon(ctx)
 		if problem != nil {
 			return problem
 		}
 	}
-	ctx.Service = state
+	ctx.Daemon = state
 	client, problem := dial(ctx)
 	if problem != nil {
 		return problem
@@ -97,7 +97,7 @@ func handleDown(ctx *Context) *exit.Error {
 		if !result.ShuttingDown {
 			return exit.Internalf("safe down returned without a shutdown decision")
 		}
-		return finishControllerDown(ctx, nil)
+		return finishDaemonDown(ctx, nil)
 	}
 	return downAll(ctx, client)
 }
@@ -108,7 +108,7 @@ func downAll(ctx *Context, client *localapi.Client) *exit.Error {
 	for {
 		result, problem := client.Down(true)
 		if problem != nil {
-			return problem.WithRemedy("partial teardown stopped; the controller remains alive for reconciliation")
+			return problem.WithRemedy("partial teardown stopped; the daemon remains alive for reconciliation")
 		}
 		for _, identity := range result.CancellationRequested {
 			canceled[identity.ID] = true
@@ -117,24 +117,24 @@ func downAll(ctx *Context, client *localapi.Client) *exit.Error {
 			switch identity.Kind {
 			case "rental":
 				if problem := endRentalSilently(ctx, identity.ID); problem != nil {
-					return problem.WithRemedy("rental termination was not confirmed; the controller remains alive")
+					return problem.WithRemedy("rental termination was not confirmed; the daemon remains alive")
 				}
 				ended[identity.ID] = true
 			case "rental_operation":
 				id, problem := resolveRentalOperation(ctx, identity.ID)
 				if problem != nil {
-					return problem.WithRemedy("the paid operation remains recorded and the controller remains alive")
+					return problem.WithRemedy("the paid operation remains recorded and the daemon remains alive")
 				}
 				if id != "" {
 					if problem := endRentalSilently(ctx, id); problem != nil {
-						return problem.WithRemedy("rental termination was not confirmed; the controller remains alive")
+						return problem.WithRemedy("rental termination was not confirmed; the daemon remains alive")
 					}
 					ended[id] = true
 				}
 			}
 		}
 		if result.ShuttingDown {
-			return finishControllerDown(ctx, []output.Field{
+			return finishDaemonDown(ctx, []output.Field{
 				{K: "canceled", V: len(canceled)}, {K: "rentals_ended", V: len(ended)},
 			})
 		}
@@ -265,16 +265,16 @@ func offlineDownBlockers(ctx *Context) ([]string, *exit.Error) {
 	return blockers, nil
 }
 
-func finishControllerDown(ctx *Context, extra []output.Field) *exit.Error {
+func finishDaemonDown(ctx *Context, extra []output.Field) *exit.Error {
 	deadline := time.Now().Add(2 * orchestrator.StopGrace)
 	for time.Now().Before(deadline) {
-		if !service.Probe(ctx.Cfg).Up {
-			fields := []output.Field{{K: "controller", V: "stopped"}, {K: "changed", V: true}}
+		if !daemon.Probe(ctx.Cfg).Up {
+			fields := []output.Field{{K: "daemon", V: "stopped"}, {K: "changed", V: true}}
 			fields = append(fields, extra...)
 			return emit(ctx, output.Record{Fields: fields})
 		}
 		time.Sleep(50 * time.Millisecond)
 	}
-	return exit.New(exit.Conflict, "the controller accepted down but did not finish stopping").
-		WithRemedy("the controller remains responsible for its workers; no forced kill was performed")
+	return exit.New(exit.Conflict, "the daemon accepted down but did not finish stopping").
+		WithRemedy("the daemon remains responsible for its workers; no forced kill was performed")
 }

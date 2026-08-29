@@ -3,7 +3,7 @@
 // The process group's Windows analogue: a JOB OBJECT. Windows has no process group a
 // signal can address, so the tree is held by an object instead — every process the worker
 // spawns is inside the job, `TerminateJobObject` ends all of them at once, and
-// `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE` means the tree cannot outlive this service even if
+// `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE` means the tree cannot outlive this daemon even if
 // it dies without stopping anything.
 //
 // The one structural difference from Unix is WHEN: `setpgid` is a fork-time flag, and a job
@@ -132,7 +132,7 @@ func resumeProcess(pid int) error {
 // because asking is not ending. KILL ends the whole job and retires its handle.
 func killGroup(pid int, sig syscall.Signal) error {
 	if sig != syscall.SIGKILL {
-		// The cooperative tier. A detached service shares no console with the child, in
+		// The cooperative tier. A detached daemon shares no console with the child, in
 		// which case this errors and the caller's bounded wait falls through to KILL —
 		// the same shape as a Unix worker that ignores its SIGTERM.
 		return windows.GenerateConsoleCtrlEvent(windows.CTRL_BREAK_EVENT, uint32(pid))
@@ -148,7 +148,7 @@ func killGroup(pid int, sig syscall.Signal) error {
 		_ = windows.CloseHandle(job)
 		return err
 	}
-	// No job: a reconciled orphan from a previous life of this service. Ending the one
+	// No job: a reconciled orphan from a previous life of this daemon. Ending the one
 	// process is all a pid can buy.
 	handle, err := windows.OpenProcess(windows.PROCESS_TERMINATE, false, uint32(pid))
 	if err != nil {

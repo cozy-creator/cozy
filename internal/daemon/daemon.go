@@ -1,16 +1,16 @@
-// Package service owns ONE spelling of "is the local controller running", and it is an OS
+// Package daemon owns ONE spelling of "is the Cozy daemon running", and it is an OS
 // fact rather than a file's contents.
 //
-// The running local controller holds an exclusive advisory lock on `<home>/service.lock` for
+// The running Cozy daemon holds an exclusive advisory lock on `<home>/daemon.lock` for
 // its whole life. The kernel drops that lock when the process dies — including under
-// SIGKILL — so a reader that CAN take the lock has proof the service is gone, and one
+// SIGKILL — so a reader that CAN take the lock has proof the daemon is gone, and one
 // that cannot has proof of the opposite. There is no pidfile, no heartbeat and no grace
 // period, which is exactly the class of bug cl#85/53/83/82 were: a sidecar that outlived
 // its launcher and said COLD forever.
 //
 // The lock file's bytes are written by the holder and are meaningless without the lock:
 // the address is data the live owner publishes, never evidence that it lives.
-package service
+package daemon
 
 import (
 	"fmt"
@@ -42,10 +42,10 @@ func Probe(cfg config.Config) State {
 		st.Details = "no local root"
 		return st
 	}
-	st.Path = cfg.Home + "/service.lock"
+	st.Path = cfg.Home + "/daemon.lock"
 	f, err := os.OpenFile(st.Path, os.O_RDWR|os.O_CREATE, 0o644)
 	if err != nil {
-		st.Details = "the service lock is unreadable: " + err.Error()
+		st.Details = "the daemon lock is unreadable: " + err.Error()
 		return st
 	}
 	defer f.Close()
@@ -53,7 +53,7 @@ func Probe(cfg config.Config) State {
 		// Taking it IS the proof of absence. Release immediately: probing must never
 		// look like holding.
 		_ = flock.Release(f)
-		st.Details = "the service lock is free — no local controller owns this root"
+		st.Details = "the daemon lock is free — no Cozy daemon owns this root"
 		return st
 	}
 	st.Up = true
@@ -74,37 +74,37 @@ func Probe(cfg config.Config) State {
 			st.Since = value
 		}
 	}
-	st.Details = "the service lock is held by pid " + strconv.Itoa(st.PID)
+	st.Details = "the daemon lock is held by pid " + strconv.Itoa(st.PID)
 	return st
 }
 
-// Held is the live local controller's own claim on this root. It exists only inside the
-// process that is the service; nothing reads it, and nothing outlives it.
+// Held is the live Cozy daemon's own claim on this root. It exists only inside the
+// daemon process; nothing reads it, and nothing outlives it.
 type Held struct{ f *os.File }
 
 // Hold takes the root's exclusive claim and publishes the live addresses under it. A
 // second `cozy invoke list` on one root gets exit 13 here, before it can bind anything.
 func Hold(l home.Layout, addr, socket string) (*Held, *exit.Error) {
-	f, err := os.OpenFile(l.Service, os.O_RDWR|os.O_CREATE, 0o644)
+	f, err := os.OpenFile(l.Daemon, os.O_RDWR|os.O_CREATE, 0o644)
 	if err != nil {
-		return nil, exit.Internalf("cannot establish controller ownership for %s: %s", l.Root, err)
+		return nil, exit.Internalf("cannot establish daemon ownership for %s: %s", l.Root, err)
 	}
 	if err := flock.Exclusive(f); err != nil {
 		f.Close()
 		return nil, exit.New(exit.Conflict,
-			"another Cozy controller already owns %s", l.Root).
-			WithRemedy("one service per local root; stop it with `cozy down`").
+			"another Cozy daemon already owns %s", l.Root).
+			WithRemedy("one daemon per local root; stop it with `cozy down`").
 			WithNext("cozy invoke list", "cozy down")
 	}
 	body := fmt.Sprintf("addr=%s\nsocket=%s\npid=%d\nsince=%s\n",
 		addr, socket, os.Getpid(), time.Now().UTC().Format(time.RFC3339))
 	if err := f.Truncate(0); err != nil {
 		f.Close()
-		return nil, exit.Internalf("cannot publish the controller address: %s", err)
+		return nil, exit.Internalf("cannot publish the daemon address: %s", err)
 	}
 	if _, err := f.WriteAt([]byte(body), 0); err != nil {
 		f.Close()
-		return nil, exit.Internalf("cannot publish the controller address: %s", err)
+		return nil, exit.Internalf("cannot publish the daemon address: %s", err)
 	}
 	return &Held{f: f}, nil
 }
@@ -122,7 +122,7 @@ func (h *Held) Release() {
 
 // Unavailable is the typed refusal every server-dependent verb shares.
 func (s State) Unavailable() *exit.Error {
-	return exit.Unavailablef("the Cozy controller is not running (%s)", s.Addr).
+	return exit.Unavailablef("the Cozy daemon is not running (%s)", s.Addr).
 		WithRemedy("start it with `cozy invoke list`; it binds %s, loopback only", s.Addr).
 		WithNext("cozy invoke list", "cozy invoke list")
 }

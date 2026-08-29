@@ -18,6 +18,8 @@ const maxNext = 2
 // Mode carries presentation choices that do not change command semantics.
 type Mode struct {
 	JSON   bool
+	Human  bool
+	Color  bool
 	Full   bool
 	Fields []string
 }
@@ -129,7 +131,35 @@ func EmitError(w io.Writer, problem *Error, mode Mode) error {
 	if strings.TrimSpace(problem.Code) == "" || strings.TrimSpace(problem.Message) == "" {
 		return errors.New("error code and message are required")
 	}
+	if mode.Human && !mode.JSON {
+		return writeHumanError(w, problem, mode)
+	}
 	return Write(w, failure{Error: problem, Next: trimNext(problem.Next)}, mode)
+}
+
+func writeHumanError(w io.Writer, problem *Error, mode Mode) error {
+	var rendered strings.Builder
+	if mode.Color {
+		rendered.WriteString("\x1b[1;31m")
+	}
+	rendered.WriteString("Error: ")
+	rendered.WriteString(strings.TrimSpace(problem.Message))
+	if mode.Color {
+		rendered.WriteString("\x1b[0m")
+	}
+	rendered.WriteByte('\n')
+	if remedy := strings.TrimSpace(problem.Remedy); remedy != "" {
+		rendered.WriteString("Try: ")
+		rendered.WriteString(remedy)
+		rendered.WriteByte('\n')
+	}
+	for _, next := range trimNext(problem.Next) {
+		rendered.WriteString("Next: ")
+		rendered.WriteString(next)
+		rendered.WriteByte('\n')
+	}
+	_, err := io.WriteString(w, rendered.String())
+	return err
 }
 
 // ShellCode projects all detail onto AXI's three shell outcomes.

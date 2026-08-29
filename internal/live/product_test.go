@@ -20,8 +20,8 @@ import (
 
 const weightlessRef = "cozy/weightless"
 
-func TestControllerWebLifecycle(t *testing.T) {
-	root := filepath.Join(os.TempDir(), "cozy-live", "controller-web")
+func TestDaemonWebLifecycle(t *testing.T) {
+	root := filepath.Join(os.TempDir(), "cozy-live", "daemon-web")
 	must(t, os.RemoveAll(root))
 	must(t, os.MkdirAll(root, 0o755))
 	t.Cleanup(func() { _, _ = runCozy(t, root, "down", "--all") })
@@ -40,7 +40,7 @@ func TestControllerWebLifecycle(t *testing.T) {
 			t.Fatalf("bare cozy retained %q\n%s", retired, help)
 		}
 	}
-	if code, out := runCozy(t, root, "exit"); code != 2 || !strings.Contains(out, "cli.usage") {
+	if code, out := runCozy(t, root, "exit"); code != 2 || !strings.Contains(out, "unexpected argument exit") {
 		t.Fatalf("retired exit command did not refuse [exit %d]\n%s", code, out)
 	}
 
@@ -67,11 +67,11 @@ func TestControllerWebLifecycle(t *testing.T) {
 	}
 	if err := json.Unmarshal([]byte(up), &upDocument); err != nil ||
 		upDocument.URL == "" || upDocument.PID == 0 {
-		t.Fatalf("up did not start one controller: %v\n%s", err, up)
+		t.Fatalf("up did not start one daemon: %v\n%s", err, up)
 	}
 	if err := json.Unmarshal([]byte(second.output), &secondDocument); err != nil ||
 		upDocument.PID != secondDocument.PID || upDocument.URL != secondDocument.URL {
-		t.Fatalf("concurrent up returned different controller generations: %v\n%s\n%s",
+		t.Fatalf("concurrent up returned different daemon generations: %v\n%s\n%s",
 			err, first.output, second.output)
 	}
 	if upDocument.Changed == secondDocument.Changed {
@@ -94,8 +94,8 @@ func TestControllerWebLifecycle(t *testing.T) {
 		t.Fatalf("web stub is not ready at up return: status=%d err=%v\n%s",
 			response.StatusCode, readErr, page)
 	}
-	if _, err := os.Stat(filepath.Join(root, "controller.log")); !os.IsNotExist(err) {
-		t.Fatalf("up created a persistent controller log: %v", err)
+	if _, err := os.Stat(filepath.Join(root, "daemon.log")); !os.IsNotExist(err) {
+		t.Fatalf("up created a persistent daemon log: %v", err)
 	}
 	if code, out := runCozy(t, root, "up", "--json", "--full"); code != 0 {
 		t.Fatalf("repeated up failed [exit %d]\n%s", code, out)
@@ -107,30 +107,32 @@ func TestControllerWebLifecycle(t *testing.T) {
 		}
 		if err := json.Unmarshal([]byte(out), &repeated); err != nil ||
 			repeated.Changed || repeated.URL != url || repeated.PID != upDocument.PID {
-			t.Fatalf("repeated up did not return the same healthy controller with changed=false: %v\n%s",
+			t.Fatalf("repeated up did not return the same healthy daemon with changed=false: %v\n%s",
 				err, out)
 		}
 	}
-	if code, out := runCozy(t, root, "down"); code != 0 || !strings.Contains(out, "controller: stopped") {
+	if code, out := runCozy(t, root, "down"); code != 0 ||
+		!strings.Contains(out, "daemon:") || !strings.Contains(out, "stopped") {
 		t.Fatalf("down [exit %d]\n%s", code, out)
 	}
 	if code, out := runCozy(t, root, "invoke", "list", "--json"); code != 0 ||
 		!strings.Contains(out, `"invocations":[]`) {
-		t.Fatalf("stateful command did not auto-start the controller [exit %d]\n%s", code, out)
+		t.Fatalf("stateful command did not auto-start the daemon [exit %d]\n%s", code, out)
 	}
-	if code, out := runCozy(t, root, "unload"); code != 0 || !strings.Contains(out, "workers") {
+	if code, out := runCozy(t, root, "unload"); code != 0 || !strings.Contains(out, "No workers found.") {
 		t.Fatalf("unload [exit %d]\n%s", code, out)
 	}
 	if code, out := runCozy(t, root, "up"); code != 0 || !strings.Contains(out, "changed: false") {
-		t.Fatalf("unload stopped the controller [exit %d]\n%s", code, out)
+		t.Fatalf("unload stopped the daemon [exit %d]\n%s", code, out)
 	}
-	if code, out := runCozy(t, root, "down"); code != 0 || !strings.Contains(out, "controller: stopped") {
+	if code, out := runCozy(t, root, "down"); code != 0 ||
+		!strings.Contains(out, "daemon:") || !strings.Contains(out, "stopped") {
 		t.Fatalf("final down [exit %d]\n%s", code, out)
 	}
 }
 
-func TestControllerStartupDiagnostic(t *testing.T) {
-	root := filepath.Join(os.TempDir(), "cozy-live", "controller-startup-diagnostic")
+func TestDaemonStartupDiagnostic(t *testing.T) {
+	root := filepath.Join(os.TempDir(), "cozy-live", "daemon-startup-diagnostic")
 	must(t, os.RemoveAll(root))
 	must(t, os.MkdirAll(root, 0o755))
 	t.Cleanup(func() { _, _ = runCozy(t, root, "down", "--all") })
@@ -144,10 +146,10 @@ func TestControllerStartupDiagnostic(t *testing.T) {
 	began := time.Now()
 	code, out := runCozy(t, root, "up", "--json")
 	if code != 1 {
-		t.Fatalf("failed controller startup exited %d, want operational 1\n%s", code, out)
+		t.Fatalf("failed daemon startup exited %d, want operational 1\n%s", code, out)
 	}
 	if took := time.Since(began); took > 5*time.Second {
-		t.Fatalf("failed controller startup waited %s instead of relaying the exited child", took)
+		t.Fatalf("failed daemon startup waited %s instead of relaying the exited child", took)
 	}
 	var document struct {
 		Error struct {
@@ -156,7 +158,7 @@ func TestControllerStartupDiagnostic(t *testing.T) {
 		} `json:"error"`
 	}
 	if err := json.Unmarshal([]byte(out), &document); err != nil ||
-		document.Error.Code != "controller_startup_failed" ||
+		document.Error.Code != "daemon_startup_failed" ||
 		!strings.Contains(document.Error.Message, fmt.Sprintf("127.0.0.1:%d", port)) ||
 		!strings.Contains(document.Error.Message, "held by another process") {
 		t.Fatalf("startup failure did not relay its child diagnostic: %v\n%s", err, out)
@@ -164,11 +166,11 @@ func TestControllerStartupDiagnostic(t *testing.T) {
 	if strings.Contains(strings.ToLower(out), "lock") {
 		t.Fatalf("startup failure exposed its internal singleton mechanism\n%s", out)
 	}
-	if len(out) > maxControllerDiagnosticOutput {
+	if len(out) > maxDaemonDiagnosticOutput {
 		t.Fatalf("startup diagnostic is unbounded: %d bytes", len(out))
 	}
-	if _, err := os.Stat(filepath.Join(root, "controller.log")); !os.IsNotExist(err) {
-		t.Fatalf("failed startup created a persistent controller log: %v", err)
+	if _, err := os.Stat(filepath.Join(root, "daemon.log")); !os.IsNotExist(err) {
+		t.Fatalf("failed startup created a persistent daemon log: %v", err)
 	}
 
 	must(t, held.Close())
@@ -177,10 +179,10 @@ func TestControllerStartupDiagnostic(t *testing.T) {
 	}
 }
 
-const maxControllerDiagnosticOutput = 18 << 10
+const maxDaemonDiagnosticOutput = 18 << 10
 
 // TestProductPath drives only the public Kong surface: install a real weightless
-// release, auto-start the controller on invoke, cross Runtime and the worker wire,
+// release, auto-start the daemon on invoke, cross Runtime and the worker wire,
 // accept an output, release idle residency, then stop cleanly.
 func TestProductPath(t *testing.T) {
 	root := filepath.Join(os.TempDir(), "cozy-live", "product")
@@ -245,14 +247,16 @@ func TestProductPath(t *testing.T) {
 	if err != nil || !ok || len(invocations) != 2 {
 		t.Fatalf("invoke list is not one successful JSON document: %v\n%s", err, listed)
 	}
-	if code, out := runCozy(t, root, "invoke", "run", weightlessRef+"/v1/nosuch"); code != 1 || !strings.Contains(out, "not_found") {
+	if code, out := runCozy(t, root, "invoke", "run", weightlessRef+"/v1/nosuch"); code != 1 ||
+		!strings.Contains(out, "registers no function") {
 		t.Fatalf("operational refusal was not shell exit 1 with detail [exit %d]\n%s", code, out)
 	}
 
-	if code, out := runCozy(t, root, "unload"); code != 0 || !strings.Contains(out, "workers") {
+	if code, out := runCozy(t, root, "unload"); code != 0 || !strings.Contains(out, weightlessRef) {
 		t.Fatalf("unload [exit %d]\n%s", code, out)
 	}
-	if code, out := runCozy(t, root, "down"); code != 0 || !strings.Contains(out, "controller: stopped") {
+	if code, out := runCozy(t, root, "down"); code != 0 ||
+		!strings.Contains(out, "daemon:") || !strings.Contains(out, "stopped") {
 		t.Fatalf("down [exit %d]\n%s", code, out)
 	}
 }

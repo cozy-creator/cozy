@@ -12,6 +12,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"io/fs"
 	"os"
 	"os/exec"
 	"path"
@@ -62,15 +63,15 @@ type Request struct {
 	Release string
 }
 
-// Prepare requires a clean committed source subtree, deterministically packs its
-// tracked files and pure project wheel, and canonicalizes the descriptor. Package
-// requirements stay in wheel metadata and uv.lock. No project command executes.
+// Prepare snapshots the current source tree, asks its declared backend for one wheel in
+// disposable staging, inspects that exact wheel, and canonicalizes the descriptor.
+// Git is not publication authority: modified and ordinary untracked files are inputs.
 func Prepare(req Request) (*Package, *exit.Error) {
 	release := strings.TrimSpace(req.Release)
 	if release == "" || strings.ContainsAny(release, `/\`) || release == "." || release == ".." {
 		return nil, exit.Usagef("--release needs one safe immutable release id")
 	}
-	tree, files, e := trackedTree(req.Tree)
+	tree, files, e := sourceTree(req.Tree)
 	if e != nil {
 		return nil, e
 	}
@@ -110,8 +111,7 @@ func Prepare(req Request) (*Package, *exit.Error) {
 			WithRemedy("keep binding intent in package.toml; Tensorhub will resolve model releases there when the model-binding lane lands"))
 	}
 
-	project, e := wheel.Pack(wheel.Request{Tree: tree,
-		OutDir: filepath.Join(root, "project")})
+	projectPath, project, e := buildProjectWheel(tree, files, root)
 	if e != nil {
 		return fail(e)
 	}
@@ -123,18 +123,29 @@ func Prepare(req Request) (*Package, *exit.Error) {
 	result := &Package{Root: root, Files: map[string]string{
 		"source_archive":     archive,
 		"source_lock":        lockPath,
-		"project_wheel":      project.Path,
+		"project_wheel":      projectPath,
 		"package_descriptor": descriptor,
 	}}
 	result.Declaration = Declaration{
 		Format:        "tensorhub.package_release_declaration/1",
 		SourceArchive: archiveRef, SourceLock: lock,
-		ProjectWheel: project.Fact, PackageDescriptor: descriptorRef(descriptor),
+		ProjectWheel: project, PackageDescriptor: descriptorRef(descriptor),
 	}
 	return result, nil
 }
 
-func trackedTree(tree string) (string, []string, *exit.Error) {
+var excludedSourceDir = map[string]bool{
+	".git": true, ".hg": true, ".svn": true, ".jj": true,
+	"__pycache__": true, ".mypy_cache": true, ".ruff_cache": true, ".pytest_cache": true,
+	".venv": true, "venv": true, ".tox": true, "node_modules": true,
+	".idea": true, ".vscode": true, ".test-bin": true, "build": true, "dist": true,
+}
+
+var excludedSourceFile = map[string]bool{
+	".DS_Store": true, "Thumbs.db": true, ".gitignore": true, ".gitattributes": true,
+}
+
+func sourceTree(tree string) (string, []string, *exit.Error) {
 	abs, err := filepath.Abs(tree)
 	if err != nil {
 		return "", nil, exit.Usagef("--dir %q is not resolvable: %s", tree, err)
@@ -143,57 +154,110 @@ func trackedTree(tree string) (string, []string, *exit.Error) {
 	if err != nil || !info.IsDir() {
 		return "", nil, exit.Named(exit.NotFound, "package_tree_absent", "%s is not a directory", abs)
 	}
-	topRaw, err := exec.Command("git", "-C", abs, "rev-parse", "--show-toplevel").Output()
-	if err != nil {
-		return "", nil, exit.Named(exit.Validation, "package_tree_untracked",
-			"%s is not inside a Git working tree", abs).
-			WithRemedy("package publication snapshots committed tracked files, never an unrestricted directory walk")
-	}
-	top := strings.TrimSpace(string(topRaw))
-	rel, err := filepath.Rel(top, abs)
-	if err != nil || rel == ".." || strings.HasPrefix(rel, ".."+string(os.PathSeparator)) {
-		return "", nil, exit.Internalf("package tree %s escaped Git root %s", abs, top)
-	}
-	scope := "."
-	if rel != "." {
-		scope = filepath.ToSlash(rel)
-	}
-	status := exec.Command("git", "-C", top, "status", "--porcelain=v1", "-z", "--untracked-files=all", "--", scope)
-	body, err := status.Output()
-	if err != nil {
-		return "", nil, exit.Named(exit.Structural, "package_tree_unreadable", "git status failed: %v", err)
-	}
-	if len(body) != 0 {
-		return "", nil, exit.Named(exit.Conflict, "package_tree_dirty",
-			"%s has changed or untracked files", abs).
-			WithRemedy("commit the exact package source first; a normal release is one immutable tracked tree")
-	}
-	listing := exec.Command("git", "-C", top, "ls-files", "-z", "--", scope)
-	body, err = listing.Output()
-	if err != nil {
-		return "", nil, exit.Named(exit.Structural, "package_tree_unreadable", "git ls-files failed: %v", err)
-	}
 	var files []string
-	prefix := ""
-	if scope != "." {
-		prefix = scope + "/"
-	}
-	for _, raw := range bytes.Split(body, []byte{0}) {
-		if len(raw) == 0 {
-			continue
+	err = filepath.WalkDir(abs, func(filename string, entry fs.DirEntry, walkErr error) error {
+		if walkErr != nil {
+			return walkErr
 		}
-		name := filepath.ToSlash(string(raw))
-		name = strings.TrimPrefix(name, prefix)
-		if name == "" || strings.HasPrefix(name, "../") {
-			return "", nil, exit.Internalf("git returned out-of-scope package path %q", name)
+		if filename == abs {
+			return nil
+		}
+		rel, relErr := filepath.Rel(abs, filename)
+		if relErr != nil {
+			return relErr
+		}
+		name := filepath.ToSlash(rel)
+		if entry.IsDir() {
+			if excludedSourceDir[entry.Name()] || strings.HasSuffix(entry.Name(), ".egg-info") {
+				return fs.SkipDir
+			}
+			return nil
+		}
+		if excludedSourceFile[entry.Name()] || strings.HasSuffix(entry.Name(), ".pyc") ||
+			strings.HasSuffix(entry.Name(), ".pyo") {
+			return nil
+		}
+		info, infoErr := entry.Info()
+		if infoErr != nil || !info.Mode().IsRegular() {
+			return sourceRefusal("package_source_entry_invalid", name, "non-regular or unreadable entry")
 		}
 		files = append(files, name)
+		return nil
+	})
+	if err != nil {
+		if problem := exit.As(err); problem != nil {
+			return "", nil, problem
+		}
+		return "", nil, exit.Named(exit.Structural, "package_tree_unreadable", "%s: %v", abs, err)
 	}
 	if len(files) == 0 {
-		return "", nil, exit.Named(exit.Validation, "package_tree_empty", "%s has no tracked files", abs)
+		return "", nil, exit.Named(exit.Validation, "package_tree_empty", "%s has no publishable files", abs)
 	}
 	sort.Strings(files)
 	return abs, files, nil
+}
+
+func buildProjectWheel(tree string, files []string, root string) (string, wheel.Fact, *exit.Error) {
+	var fact wheel.Fact
+	buildTree := filepath.Join(root, "build-source")
+	if problem := copySource(tree, files, buildTree); problem != nil {
+		return "", fact, problem
+	}
+	outDir := filepath.Join(root, "project")
+	if err := os.MkdirAll(outDir, 0o700); err != nil {
+		return "", fact, exit.Internalf("cannot create wheel staging: %s", err)
+	}
+	cmd := exec.Command("uv", "build", "--wheel", "--no-progress", "--color", "never",
+		"--no-create-gitignore", "--out-dir", outDir, buildTree)
+	cmd.Env = config.Frozen().Tool()
+	var diagnostic bytes.Buffer
+	cmd.Stdout, cmd.Stderr = io.Discard, &diagnostic
+	if err := cmd.Run(); err != nil {
+		message := strings.Join(strings.Fields(diagnostic.String()), " ")
+		if cmd.ProcessState == nil {
+			message = err.Error()
+		}
+		return "", fact, exit.Named(exit.Structural, "project_wheel_build_refused",
+			"uv build --wheel refused: %s", message).
+			WithRemedy("fix the project's declared build backend; publication accepts exactly one pure py3-none-any wheel")
+	}
+	entries, err := os.ReadDir(outDir)
+	if err != nil {
+		return "", fact, exit.Internalf("cannot inspect wheel staging: %s", err)
+	}
+	var wheels []string
+	for _, entry := range entries {
+		if !entry.IsDir() && strings.HasSuffix(strings.ToLower(entry.Name()), ".whl") {
+			wheels = append(wheels, filepath.Join(outDir, entry.Name()))
+		}
+	}
+	if len(wheels) != 1 {
+		return "", fact, exit.Named(exit.Validation, "project_wheel_count_invalid",
+			"the declared backend emitted %d wheels; expected exactly one", len(wheels))
+	}
+	fact, problem := wheel.Inspect(wheels[0], wheel.ProjectWheel)
+	if problem != nil {
+		return "", fact, problem
+	}
+	return wheels[0], fact, nil
+}
+
+func copySource(source string, files []string, target string) *exit.Error {
+	for _, name := range files {
+		from := filepath.Join(source, filepath.FromSlash(name))
+		to := filepath.Join(target, filepath.FromSlash(name))
+		if err := os.MkdirAll(filepath.Dir(to), 0o700); err != nil {
+			return exit.Internalf("cannot create private wheel staging: %s", err)
+		}
+		body, err := os.ReadFile(from)
+		if err != nil {
+			return exit.Named(exit.Structural, "package_tree_mutated", "%s changed while publication was snapshotting it", name)
+		}
+		if err := os.WriteFile(to, body, 0o600); err != nil {
+			return exit.Internalf("cannot stage %s: %s", name, err)
+		}
+	}
+	return nil
 }
 
 var weightExt = map[string]bool{

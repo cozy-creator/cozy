@@ -27,23 +27,23 @@ import (
 
 	"github.com/cozy-creator/cozy-creator/internal/api"
 	"github.com/cozy-creator/cozy-creator/internal/config"
+	"github.com/cozy-creator/cozy-creator/internal/daemon"
 	"github.com/cozy-creator/cozy-creator/internal/exit"
 	"github.com/cozy-creator/cozy-creator/internal/home"
 	"github.com/cozy-creator/cozy-creator/internal/secret"
-	"github.com/cozy-creator/cozy-creator/internal/service"
 )
 
-// Client is one CLI process's connection to the running local controller.
+// Client is one CLI process's connection to the running Cozy daemon.
 type Client struct {
 	base  string
 	token secret.Value
 	http  *http.Client
 }
 
-// Open reads the running service's address and its 0600 credential. It never probes:
+// Open reads the running daemon's address and its 0600 credential. It never probes:
 // the caller already passed the shared exit-9 gate, and a second probe here would be a
 // second spelling of "is it up".
-func Open(cfg config.Config, st service.State) (*Client, *exit.Error) {
+func Open(cfg config.Config, st daemon.State) (*Client, *exit.Error) {
 	l, e := home.Open(cfg.Home)
 	if e != nil {
 		return nil, e
@@ -62,7 +62,7 @@ func Open(cfg config.Config, st service.State) (*Client, *exit.Error) {
 	}, nil
 }
 
-// Addr is the service address this client talks to, for rendering.
+// Addr is the daemon address this client talks to, for rendering.
 func (c *Client) Addr() string { return strings.TrimPrefix(c.base, "http://") }
 
 func (c *Client) request(method, path string, body any, headers ...string) (*http.Request, *exit.Error) {
@@ -105,7 +105,7 @@ func (c *Client) call(method, path string, body, out any, headers ...string) *ex
 	defer res.Body.Close()
 	data, err := io.ReadAll(io.LimitReader(res.Body, 64<<20))
 	if err != nil {
-		return exit.Internalf("the local controller answer could not be read: %s", err)
+		return exit.Internalf("the Cozy daemon answer could not be read: %s", err)
 	}
 	if res.StatusCode >= 300 {
 		return Refusal(res.StatusCode, data)
@@ -114,17 +114,17 @@ func (c *Client) call(method, path string, body, out any, headers ...string) *ex
 		return nil
 	}
 	if err := json.Unmarshal(data, out); err != nil {
-		return exit.Internalf("the local controller answered %s with a body this client cannot read: %s",
+		return exit.Internalf("the Cozy daemon answered %s with a body this client cannot read: %s",
 			path, err)
 	}
 	return nil
 }
 
-// unreachable is what a dead or dying service looks like from a client's seat: not a
+// unreachable is what a dead or dying daemon looks like from a client's seat: not a
 // refusal document, a transport failure. It carries the SAME remedy every server-backed
 // verb's exit-9 gate carries, because it is the same condition arriving later.
 func (c *Client) unreachable(err error) *exit.Error {
-	return exit.Unavailablef("the Cozy controller stopped answering on %s: %s", c.Addr(), err).
+	return exit.Unavailablef("the Cozy daemon stopped answering on %s: %s", c.Addr(), err).
 		WithRemedy("it may have stopped mid-request; retry or run `cozy up`").
 		WithNext("cozy up", "cozy invoke list")
 }
@@ -148,7 +148,7 @@ func Refusal(status int, data []byte) *exit.Error {
 			body = body[:200] + "…"
 		}
 		return exit.Named(code, "untyped_answer",
-			"the local controller answered %d with no typed envelope: %s", status, body)
+			"the Cozy daemon answered %d with no typed envelope: %s", status, body)
 	}
 	e := exit.Named(code, doc.Error.Code, "%s", doc.Error.Message)
 	if doc.Error.Remedy != "" {
@@ -241,21 +241,21 @@ func (c *Client) EnsureRental(rentalID string) (StartResult, *exit.Error) {
 	return res, e
 }
 
-// Unload asks the controller to stop only definitely-idle local serving workers. It
+// Unload asks the daemon to stop only definitely-idle local serving workers. It
 // never touches remote rentals, run-once jobs, active work, or installed disk bytes.
 func (c *Client) Unload() (api.UnloadResult, *exit.Error) {
 	var out api.UnloadResult
-	e := c.call(http.MethodPost, "/v1/local/service/unload", map[string]any{}, &out)
+	e := c.call(http.MethodPost, "/v1/local/daemon/unload", map[string]any{}, &out)
 	return out, e
 }
 
-// Down performs the controller-side lifecycle fence. Under all=false, active work or
-// rentals refuse without mutation. Under all=true, the controller requests cancellation
+// Down performs the daemon-side lifecycle fence. Under all=false, active work or
+// rentals refuse without mutation. Under all=true, the daemon requests cancellation
 // and returns the exact paid obligations the caller must terminate and confirm through
 // Tensorhub before retrying. ShuttingDown=true means cooperative down was accepted.
 func (c *Client) Down(all bool) (api.DownResult, *exit.Error) {
 	var out api.DownResult
-	e := c.call(http.MethodPost, "/v1/local/service/down", map[string]bool{"all": all}, &out)
+	e := c.call(http.MethodPost, "/v1/local/daemon/down", map[string]bool{"all": all}, &out)
 	return out, e
 }
 

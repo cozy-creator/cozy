@@ -12,7 +12,7 @@ import (
 )
 
 // Credentials is the per-launch CLI credential. It is handed over through a
-// 0600 file, never argv or inherited environment, and dies with the controller.
+// 0600 file, never argv or inherited environment, and dies with the daemon.
 type Credentials struct {
 	CLI secret.Value
 }
@@ -20,8 +20,8 @@ type Credentials struct {
 // Mint generates a fresh credential and writes it to its 0600 handoff file.
 func Mint(l home.Layout) (Credentials, *exit.Error) {
 	c := Credentials{CLI: secret.Mint()}
-	// O_EXCL is not used: a stale file from a dead service is a leftover, and the
-	// service lock already proved no live owner exists on this root. 0600 is the point.
+	// O_EXCL is not used: a stale file from a dead daemon is a leftover, and the
+	// daemon lock already proved no live owner exists on this root. 0600 is the point.
 	f, err := os.OpenFile(l.Client, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o600)
 	if err != nil {
 		return Credentials{}, exit.Internalf("cannot write the local client credential: %s", err)
@@ -53,7 +53,7 @@ func (c Credentials) AdmitsCLI(presented string) bool { return c.CLI.Equal(prese
 // carrier site, so the raw value is read where it becomes a carrier and nowhere else —
 // the `secret` fence family holds that.
 //
-// A missing file means the local controller is not running or is running on another root.
+// A missing file means the Cozy daemon is not running or is running on another root.
 // That is exactly the exit-9 condition every server-backed verb already shares, so it
 // refuses with the same remedy rather than inventing a credential vocabulary.
 func ClientCredential(l home.Layout) (secret.Value, *exit.Error) {
@@ -61,7 +61,7 @@ func ClientCredential(l home.Layout) (secret.Value, *exit.Error) {
 	if err != nil {
 		return secret.Value{}, exit.Unavailablef(
 			"no local client credential at %s", l.Client).
-			WithRemedy("the controller writes it at launch; retry the command to auto-start or reconnect").
+			WithRemedy("the daemon writes it at launch; retry the command to auto-start or reconnect").
 			WithNext("cozy invoke list")
 	}
 	// The mode is CHECKED, not assumed. A credential that became group- or
@@ -73,7 +73,7 @@ func ClientCredential(l home.Layout) (secret.Value, *exit.Error) {
 	if perm := info.Mode().Perm(); perm&0o077 != 0 && runtime.GOOS != "windows" {
 		return secret.Value{}, exit.New(exit.Credential,
 			"%s is mode %#o; the local client credential is 0600 or it is not used", l.Client, perm).
-			WithRemedy("run `cozy down`, fix the file mode, then retry; every controller launch mints a fresh credential")
+			WithRemedy("run `cozy down`, fix the file mode, then retry; every daemon launch mints a fresh credential")
 	}
 	data, err := os.ReadFile(l.Client)
 	if err != nil {

@@ -1,16 +1,11 @@
-// Package wheel is the Cozy deterministic wheel packer (th-039, tensorhub-build.md §0).
+// Package wheel contains Cozy's fixed pure-wheel helper and exact wheel inspector.
 //
-// It is the ONE way a package project becomes an importable unit. It is FIXED
-// first-party code: it does not consult the repo's `[build-system]`, does not import the
-// project, and fires no PEP 517 hook. It copies the canonical path-sorted source tree,
+// Pack is a fixed first-party helper for controlled local materialization and fixtures. Public
+// `cozy package publish` instead runs `uv build --wheel` in private staging and passes the one
+// result through Inspect. Pack does not consult `[build-system]`, import the project, or fire a
+// PEP 517 hook. It copies the canonical path-sorted source tree,
 // synthesizes METADATA/WHEEL/RECORD from declared metadata under fixed field order, fixed
 // timestamps and normalized permissions, and emits a py3-none-any wheel.
-//
-// THE SEAM. `Pack` is the one entry point with two callers, which must agree:
-//
-//	tensorhub env-lane build, §1 stage 2e  ─┐
-//	                                        ├─▶ wheel.Pack ─▶ project_wheel_digest
-//	`cozy package publish` / local install ─┘
 //
 // Inputs: the canonical tree's path (a directory of regular files), plus the
 // distribution identity — from `[project]` when the tree declares it, otherwise from the

@@ -10,19 +10,19 @@ import (
 	"syscall"
 
 	"github.com/cozy-creator/cozy-creator/internal/api"
+	"github.com/cozy-creator/cozy-creator/internal/daemon"
 	"github.com/cozy-creator/cozy-creator/internal/exit"
 	"github.com/cozy-creator/cozy-creator/internal/home"
 	"github.com/cozy-creator/cozy-creator/internal/orchestrator"
 	"github.com/cozy-creator/cozy-creator/internal/output"
 	"github.com/cozy-creator/cozy-creator/internal/records"
 	"github.com/cozy-creator/cozy-creator/internal/rental"
-	"github.com/cozy-creator/cozy-creator/internal/service"
 	cozyweb "github.com/cozy-creator/cozy-creator/web"
 )
 
-// serveController is the private process entrypoint shared by explicit `up` and
-// commands that ensure the controller is running.
-func serveController(ctx *Context) *exit.Error {
+// serveDaemon is the private process entrypoint shared by explicit `up` and
+// commands that ensure the daemon is running.
+func serveDaemon(ctx *Context) *exit.Error {
 	l, e := home.Open(ctx.Cfg.Home)
 	if e != nil {
 		return e
@@ -43,9 +43,9 @@ func serveController(ctx *Context) *exit.Error {
 	}
 
 	// Already running is idempotent 0 printing the live status.
-	if st := service.Probe(ctx.Cfg); st.Up {
+	if st := daemon.Probe(ctx.Cfg); st.Up {
 		return emit(ctx, output.Record{Fields: []output.Field{
-			{K: "service", V: "up"}, {K: "address", V: st.Addr},
+			{K: "daemon", V: "running"}, {K: "address", V: st.Addr},
 			{K: "socket", V: st.Socket}, {K: "pid", V: st.PID}, {K: "since", V: st.Since},
 		}, Notes: []string{"already running: `cozy invoke list` is idempotent"}})
 	}
@@ -70,16 +70,16 @@ func serveController(ctx *Context) *exit.Error {
 		}
 	}
 
-	// The claim: a second service on this root fails here. It comes after the bind so a
+	// The claim: a second daemon on this root fails here. It comes after the bind so a
 	// port conflict is reported as a port conflict, and before anything is written.
-	held, e := service.Hold(l, addr, socket)
+	held, e := daemon.Hold(l, addr, socket)
 	if e != nil {
 		closeListeners()
 		return e
 	}
 	defer held.Release()
-	// The held service lock proves any prior handoff is stale. Only the winning
-	// controller removes it, so concurrent auto-start callers cannot erase a live token.
+	// The held daemon lock proves any prior handoff is stale. Only the winning
+	// daemon removes it, so concurrent auto-start callers cannot erase a live token.
 	_ = os.Remove(l.Client)
 
 	st, e := records.Open(l.DB)
@@ -99,7 +99,7 @@ func serveController(ctx *Context) *exit.Error {
 	rentals := rental.Resolver(l, st)
 	knownRentals := rental.Known(st)
 
-	// The two per-service identity digests every local InvocationSpec rides (cl-022's
+	// The two per-daemon identity digests every local InvocationSpec rides (cl-022's
 	// guard): left unset, dispatch froze empty strings into every persisted invocation.
 	environmentSpec, configDigest := localInvocationIdentity(ctx.Cfg)
 	c, e := orchestrator.Open(orchestrator.Options{
@@ -144,7 +144,7 @@ func serveController(ctx *Context) *exit.Error {
 		return e
 	}
 
-	fmt.Fprintf(ctx.Out, "Cozy controller up: api %s (%s, loopback only) · worker socket %s\n",
+	fmt.Fprintf(ctx.Out, "Cozy daemon up: api %s (%s, loopback only) · worker socket %s\n",
 		addr, strings.Join(bound, "+"), socket)
 	fmt.Fprintf(ctx.Out, "  records %s · yield %s · reconcile killed %d orphan(s), forgot %d stale row(s)\n",
 		l.DB, yield, killed, forgotten)

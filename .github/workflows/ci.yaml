@@ -15,7 +15,7 @@ jobs:
       - run: CGO_ENABLED=0 go build ./...
       - run: go vet ./...
       # THE SUITE (decisions.md #634, amending #160 for this repo). `internal/live` starts
-      # the real system — the real orchestrator, an auto-started controller process, and
+      # the real system — the real orchestrator, an auto-started Cozy daemon process, and
       # `internal/live/fakeworker`, a second independent implementation of the worker protocol —
       # and observes what it does. Nothing in it is a mock. The tests that need a peer this
       # runner does not have (worker-protocol's frozen corpus or a cozy-runtime checkout)

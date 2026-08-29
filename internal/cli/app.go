@@ -5,14 +5,16 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"os"
 	"strconv"
 	"strings"
 
 	"github.com/alecthomas/kong"
 	"github.com/cozy-creator/cozy-creator/internal/config"
+	"github.com/cozy-creator/cozy-creator/internal/daemon"
 	"github.com/cozy-creator/cozy-creator/internal/exit"
 	"github.com/cozy-creator/cozy-creator/internal/output"
-	"github.com/cozy-creator/cozy-creator/internal/service"
+	"github.com/mattn/go-isatty"
 )
 
 const description = "Local-first generative media: install packages, run them, and publish releases."
@@ -39,11 +41,11 @@ func (i *Invocation) Value(name string) string {
 // Context is the retained mechanism boundary. Handlers receive typed values and
 // frozen configuration; they never parse argv or read ambient configuration.
 type Context struct {
-	Inv     *Invocation
-	Out     io.Writer
-	Err     io.Writer
-	Cfg     config.Config
-	Service service.State
+	Inv    *Invocation
+	Out    io.Writer
+	Err    io.Writer
+	Cfg    config.Config
+	Daemon daemon.State
 }
 
 func (c *Context) Mode() output.Mode { return c.Inv.Mode }
@@ -59,7 +61,7 @@ type Runtime struct {
 }
 
 func (r *Runtime) call(h handler, args []string, flags map[string]bool,
-	values map[string][]string, controller bool,
+	values map[string][]string, daemon bool,
 ) error {
 	ctx := &Context{
 		Inv: &Invocation{
@@ -68,12 +70,12 @@ func (r *Runtime) call(h handler, args []string, flags map[string]bool,
 		},
 		Out: r.Out, Err: r.Err, Cfg: r.Cfg,
 	}
-	if controller {
-		state, _, problem := ensureController(ctx)
+	if daemon {
+		state, _, problem := ensureDaemon(ctx)
 		if problem != nil {
 			return problem
 		}
-		ctx.Service = state
+		ctx.Daemon = state
 	}
 	return h(ctx)
 }
@@ -101,7 +103,7 @@ func Run(args []string, stdout, stderr io.Writer) int {
 		}),
 		kong.ConfigureHelp(kong.HelpOptions{Compact: true, FlagsLast: true, WrapUpperBound: 100}),
 	)
-	mode := output.Mode{JSON: wantsJSON}
+	mode := presentationMode(stdout, wantsJSON)
 	if err != nil {
 		problem := output.NewError(output.Operational, "cli.grammar", err.Error())
 		_ = output.EmitError(stdout, problem, mode)
@@ -109,7 +111,8 @@ func Run(args []string, stdout, stderr io.Writer) int {
 	}
 
 	parsed, err := parser.Parse(args)
-	mode = output.Mode{JSON: wantsJSON || grammar.JSON, Full: grammar.Full, Fields: grammar.Fields}
+	mode = presentationMode(stdout, wantsJSON || grammar.JSON)
+	mode.Full, mode.Fields = grammar.Full, grammar.Fields
 	if helpExit >= 0 {
 		return helpExit
 	}
@@ -138,6 +141,14 @@ func Run(args []string, stdout, stderr io.Writer) int {
 		return output.ShellCode(problem)
 	}
 	return 0
+}
+
+func presentationMode(w io.Writer, json bool) output.Mode {
+	mode := output.Mode{JSON: json, Human: !json}
+	if file, ok := w.(*os.File); ok && !json {
+		mode.Color = isatty.IsTerminal(file.Fd()) || isatty.IsCygwinTerminal(file.Fd())
+	}
+	return mode
 }
 
 func jsonRequested(args []string) bool {

@@ -1,7 +1,7 @@
 # Cozy Creator local client API — v1
 
-This document describes the HTTP API implemented by Cozy Creator's local background
-service. The routes in the CORE module are the proposed common request-level API for
+This document describes the HTTP API implemented by the Cozy daemon. The routes in the
+CORE module are the proposed common request-level API for
 future Tensorhub and private-rental servers, but no cross-host parity is claimed until
 those servers exist and pass shared conformance tests. The LOCAL module is Creator-only.
 
@@ -20,7 +20,7 @@ payloads, and behavior are documented below but are outside that row-level fence
 | errors | one envelope, §6 |
 
 Bearer-only prevents a cross-site request from carrying ambient authority into the local
-service.
+daemon.
 
 ## 2. Core routes
 
@@ -54,7 +54,7 @@ The `model`, `lane`, and `adapter` fields are reserved but not resolved by Creat
 Any non-empty value refuses as `501 override_unresolved`; it is never silently ignored.
 
 `worker` is a **LOCAL ADDITION**: it pins the request to an attached rental by id. An id
-this Creator service does not hold is `404` before a request row exists. The pin is not in
+this Cozy daemon does not hold is `404` before a request row exists. The pin is not in
 the idempotency digest because it selects where the same work runs, not what the work is.
 A new rental cannot be pinned until its exact desired placement has been accepted,
 converged, and reported dispatchable; otherwise submission refuses as
@@ -62,7 +62,7 @@ converged, and reported dispatchable; otherwise submission refuses as
 
 `local_assets` is the CLI-only local extension for `--asset
 <field-path>=<file>`. Each row names the exact request-schema field path plus a source
-path, digest, length, and detected media type. The service verifies those claims and
+path, digest, length, and detected media type. The daemon verifies those claims and
 copies the bytes into its private content-addressed input store before recording the
 request. Only an opaque digest reference enters `input`; only the field-path identity,
 digest, length, media type, and ordered occurrence enter the invocation spec. A client
@@ -70,7 +70,7 @@ filesystem path is never portable authority. This field requires the OS-protecte
 bearer. A future web UI must upload selected bytes through its own reviewed surface.
 
 The private staged object remains only while some unsettled request references its
-digest. The service serializes the filesystem-to-request-row ownership handoff with the
+digest. The daemon serializes the filesystem-to-request-row ownership handoff with the
 same guard used by terminal cleanup, so deduplication cannot turn cleanup into a race.
 Per-attempt input directories are removed after the outcome is mirrored, committed, and
 acknowledged; locally mirrored output bytes remain addressable by their media ids. A
@@ -235,9 +235,9 @@ URLs but remain local-scope rows in the same guarded route table.
 
 | route | scope | auth | notes |
 |---|---|---|---|
-| `POST /v1/local/rentals/{rental_id}/claim` | local | yes | attach the controller to one already-provisioned private worker |
-| `POST /v1/local/service/unload` | local | yes | stop definitely-idle local serving workers; never touch active work, jobs, rentals, or installed bytes |
-| `POST /v1/local/service/down` | local | yes | safe down fence; `{all:true}` requests local cancellation and returns paid obligations that must be confirmed absent before retrying |
+| `POST /v1/local/rentals/{rental_id}/claim` | local | yes | attach the daemon to one already-provisioned private worker |
+| `POST /v1/local/daemon/unload` | local | yes | stop definitely-idle local serving workers; never touch active work, jobs, rentals, or installed bytes |
+| `POST /v1/local/daemon/down` | local | yes | safe down fence; `{all:true}` requests local cancellation and returns paid obligations that must be confirmed absent before retrying |
 | `POST /v1/local/jobs` | local | yes | submit one bounded job; `Idempotency-Key`; 202 with the handle and its publication repo |
 | `GET /v1/local/jobs/{id}` | local | yes | one job: state, queue position, retry budget, publication, checkpoints, bill where a rate exists |
 | `POST /v1/local/jobs/{id}/cancel` | local | yes | request cancellation; a queued job leaves the queue, a running one gets its terminal |
@@ -251,7 +251,7 @@ ids into invocation assets; it will never send a host filesystem path.
 
 ### The job family is local
 
-A job is an ATTEMPT CLASS in the same local controller, not a second scheduler: the same
+A job is an ATTEMPT CLASS in the same Cozy daemon, not a second scheduler: the same
 orchestrator places and dispatches it, and the same record owner gives it an ordinal,
 settles its terminal transaction, and streams it over the same durable event route
 (`GET /v1/requests/{id}/events` — there is no second event authority anywhere, and
@@ -294,7 +294,7 @@ This host's chain, in order:
    is read anywhere.
 5. **No CORS headers at all**, and a strict CSP on every response.
 
-One credential is minted per controller launch and handed to the CLI through a 0600 file.
+One credential is minted per daemon launch and handed to the CLI through a 0600 file.
 It never appears in argv, inherited environment, a log line, or a rendered error. A future
 web UI owns its own authentication design rather than inheriting this filesystem authority.
 

@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"github.com/cozy-creator/cozy-creator/internal/config"
+	"github.com/cozy-creator/cozy-creator/internal/daemon"
 	"github.com/cozy-creator/cozy-creator/internal/exit"
 	"github.com/cozy-creator/cozy-creator/internal/home"
 	"github.com/cozy-creator/cozy-creator/internal/orchestrator"
@@ -24,6 +25,26 @@ import (
 
 // The two binaries the suite drives as real processes, built once by TestMain.
 var cozyBin, fakeWorkerBin string
+
+func terminateTestDaemon(t *testing.T, root string) {
+	t.Helper()
+	state := daemon.Probe(config.Config{Home: root})
+	if !state.Up || state.PID <= 0 {
+		return
+	}
+	process, err := os.FindProcess(state.PID)
+	if err == nil {
+		_ = process.Signal(os.Interrupt)
+	}
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		if !daemon.Probe(config.Config{Home: root}).Up {
+			return
+		}
+		time.Sleep(25 * time.Millisecond)
+	}
+	t.Errorf("test-owned Cozy daemon %d did not stop", state.PID)
+}
 
 func TestMain(m *testing.M) {
 	dir, err := os.MkdirTemp("", "cozy-live-bin")
@@ -157,28 +178,28 @@ func countEvents(o *owner, substr string) int {
 	return n
 }
 
-// ------------------------------------------------------------- a real hidden controller process
+// ------------------------------------------------------------- a real hidden daemon process
 
-// service is one controller this suite owns. The separate process is the point:
+// daemonProcess is one Cozy daemon this suite owns. The separate process is the point:
 // the suite is a CLIENT, which is the seat a real client occupies.
-type service struct {
+type daemonProcess struct {
 	root, addr, token string
 	cmd               *exec.Cmd
 }
 
-func startService(t *testing.T, root string) *service {
+func startDaemonProcess(t *testing.T, root string) *daemonProcess {
 	t.Helper()
 	must(t, os.MkdirAll(root, 0o755))
-	log, err := os.Create(filepath.Join(root, "service.log"))
+	log, err := os.Create(filepath.Join(root, "daemon-test.log"))
 	must(t, err)
 	cmd := exec.Command(cozyBin)
-	cmd.Args[0] = "cozy-controller"
+	cmd.Args[0] = "cozy-daemon"
 	cmd.Env = childEnv(t, root)
 	cmd.Stdout, cmd.Stderr = log, log
 	setProcessGroup(cmd)
 	must(t, cmd.Start())
 
-	s := &service{root: root, cmd: cmd}
+	s := &daemonProcess{root: root, cmd: cmd}
 	t.Cleanup(func() {
 		_ = killGroup(cmd.Process.Pid)
 		go func() { _ = cmd.Wait() }()
@@ -186,7 +207,7 @@ func startService(t *testing.T, root string) *service {
 	})
 	deadline := time.Now().Add(30 * time.Second)
 	for time.Now().Before(deadline) {
-		lock, lockErr := os.ReadFile(filepath.Join(root, "service.lock"))
+		lock, lockErr := os.ReadFile(filepath.Join(root, "daemon.lock"))
 		credential, credentialErr := os.ReadFile(filepath.Join(root, "client.cred"))
 		if lockErr == nil && credentialErr == nil {
 			for _, line := range strings.Split(string(lock), "\n") {
@@ -201,7 +222,7 @@ func startService(t *testing.T, root string) *service {
 		}
 		time.Sleep(50 * time.Millisecond)
 	}
-	t.Fatalf("the Cozy controller did not publish its address in 30s\n%s", tail(filepath.Join(root, "service.log")))
+	t.Fatalf("the Cozy daemon did not publish its address in 30s\n%s", tail(filepath.Join(root, "daemon-test.log")))
 	return nil
 }
 
@@ -231,7 +252,7 @@ func (r reply) brief() string {
 
 // call issues one authenticated request. Headers may be overridden per call, which is how
 // the refusal matrix presents a foreign Host or a foreign Origin.
-func (s *service) call(t *testing.T, method, path string, body any, headers ...string) reply {
+func (s *daemonProcess) call(t *testing.T, method, path string, body any, headers ...string) reply {
 	t.Helper()
 	var data []byte
 	var contentType string
@@ -246,7 +267,7 @@ func (s *service) call(t *testing.T, method, path string, body any, headers ...s
 
 // callBytes drives byte-oriented routes without smuggling a host path or JSON encoding
 // into the request. Authentication and hostile-header overrides remain identical to call.
-func (s *service) callBytes(t *testing.T, method, path string, body []byte, contentType string, headers ...string) reply {
+func (s *daemonProcess) callBytes(t *testing.T, method, path string, body []byte, contentType string, headers ...string) reply {
 	t.Helper()
 	var reader io.Reader
 	if body != nil {
@@ -279,7 +300,7 @@ func (s *service) callBytes(t *testing.T, method, path string, body []byte, cont
 
 // ----------------------------------------------------------------- the product binary
 
-// runCozy runs the product binary as a user would type it, against one service root. The
+// runCozy runs the product binary as a user would type it, against one daemon root. The
 // child's environment comes through the PRODUCT's own allowlist: the suite has no business
 // inventing a second child-env mechanism, and the env fence says there is one reader.
 func runCozy(t *testing.T, root string, args ...string) (int, string) {

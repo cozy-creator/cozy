@@ -1,6 +1,6 @@
 // Package orchestrator is the local client's EMBEDDED ORCHESTRATOR (#455; the record-plane
-// owner of every worker this service runs): the scheduling role of the ONE long-lived
-// local controller `cozy invoke list` starts (cl-001). Since the 2026-08-25 re-landing (#436) the
+// owner of every worker this daemon runs): the scheduling role of the ONE long-lived
+// Cozy daemon `cozy invoke list` starts (cl-001). Since the 2026-08-25 re-landing (#436) the
 // WORKER hosts the protocol and this side DIALS it: each spawned worker binds its own
 // local socket, and this owner claims it (Claim -> ClaimAck -> snapshot -> SnapshotAck)
 // before any dispatch. It is the authority for everything the runtime deliberately is
@@ -34,7 +34,7 @@ import (
 	pb "github.com/cozy-creator/cozy-creator/protocol/cozy/worker/v1"
 )
 
-// Options is the frozen input to one local controller. Every field is decided by the
+// Options is the frozen input to one Cozy daemon. Every field is decided by the
 // entrypoint; nothing in this package reads the environment.
 type Options struct {
 	Cfg    config.Config
@@ -52,7 +52,7 @@ type Options struct {
 	Packages Launcher
 
 	// Rentals resolves an attached-worker id (`cozy rental new`'s persisted triple) to its
-	// dial spec. Wired by the entrypoint; nil = this service attaches no remote workers.
+	// dial spec. Wired by the entrypoint; nil = this daemon attaches no remote workers.
 	Rentals func(id string) (*RemoteTarget, *exit.Error)
 	// ObserveRental persists the remote worker's ClaimAck readback. Selection intent is
 	// not hardware evidence: a rented worker is not dispatchable until this callback has
@@ -73,7 +73,7 @@ type Options struct {
 	// the PackageEnvironmentSpec that IS this invocation's execution environment (#483 —
 	// was `ImageDigest`, and "image" is wrong for a native install with no OCI image at
 	// all) and the local evaluated-config document's identity (cr-003's). They are frozen
-	// per service, never per request. A remote placement supplies only Tensorhub's exact
+	// per daemon, never per request. A remote placement supplies only Tensorhub's exact
 	// environment; its model configuration is bound separately.
 	EnvironmentSpecDigest string
 	ConfigDigest          string
@@ -121,11 +121,11 @@ type Launcher interface {
 	ResolveJob(pkg, function string) (WorkerLaunchSpec, *exit.Error)
 }
 
-// Orchestrator is the local controller's scheduling role.
+// Orchestrator is the Cozy daemon's scheduling role.
 type Orchestrator struct {
 	opt Options
 
-	// done closes when the service is closing; Serve blocks on it (the owner DIALS
+	// done closes when the daemon is closing; Serve blocks on it (the owner DIALS
 	// workers, so there is no server here to run, #436). closeOnce makes Close
 	// idempotent — harnesses close defensively and twice is not an event.
 	done      chan struct{}
@@ -150,7 +150,7 @@ type Orchestrator struct {
 	// a request that quietly stops existing because a worker was still loading.
 	pending []string
 	// closing is set by Close: a worker stopped during shutdown must not make the queue
-	// ask for a replacement, because the service that would run it is going away.
+	// ask for a replacement, because the daemon that would run it is going away.
 	closing bool
 	// starting names the packages a select-or-start is already making resident. One
 	// launch per package: three cold requests for one package must not spawn three
@@ -179,7 +179,7 @@ type wait struct {
 }
 
 // Open builds the orchestrator. No listener binds here: the owner DIALS each worker's
-// own socket (#436); a second local controller on one root fails on the service lock instead.
+// own socket (#436); a second Cozy daemon on one root fails on the daemon lock instead.
 func Open(opt Options) (*Orchestrator, *exit.Error) {
 	if opt.Log == nil {
 		opt.Log = io.Discard
@@ -214,7 +214,7 @@ func (c *Orchestrator) Serve() error {
 	return nil
 }
 
-// Close stops every worker this service owns. A worker outliving its launcher is exactly
+// Close stops every worker this daemon owns. A worker outliving its launcher is exactly
 // the class of bug the birth identity exists to catch, so `down` stops what it started
 // rather than orphaning it.
 func (c *Orchestrator) Close(grace time.Duration) {
@@ -454,7 +454,7 @@ func (c *Orchestrator) recoverWorker(spec WorkerLaunchSpec) {
 const NoProgressReports = 15
 
 // retirementLoop samples the retirement grounds on the worker report cadence, for as long
-// as this service lives. A ticker is needed because ground 2 is the ABSENCE of reports —
+// as this daemon lives. A ticker is needed because ground 2 is the ABSENCE of reports —
 // a dead worker produces no frame for a frame handler to run on. The tick itself decides
 // nothing; every ground below is the worker's own word or its silence.
 func (c *Orchestrator) retirementLoop() {

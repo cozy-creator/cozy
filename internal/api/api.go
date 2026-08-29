@@ -1,5 +1,5 @@
 // Package api is Creator's local client API server: the request-level CORE served on
-// loopback by the one local controller, plus an explicitly Creator-only extension module.
+// loopback by the one Cozy daemon, plus an explicitly Creator-only extension module.
 //
 // It is a client of internal/orchestrator and nothing else. Every submission still flows
 // orchestrator → worker protocol → runtime; this package adds an HTTP shape, a typed error
@@ -59,10 +59,10 @@ import (
 )
 
 // MaxBody caps a submitted request body. Asset bytes never ride JSON: the local extension
-// names files the service ingests, while a network host uses its own upload surface.
+// names files the daemon ingests, while a network host uses its own upload surface.
 const MaxBody = 8 << 20
 
-// Server is the local client API. One per local controller.
+// Server is the local client API. One per Cozy daemon.
 type Server struct {
 	orchestrator *orchestrator.Orchestrator
 	store        *records.Store
@@ -147,8 +147,8 @@ func (s *Server) Handler() (http.Handler, *exit.Error) {
 		"POST /v1/uploads":                         s.putUpload,
 		"GET /v1/uploads/{upload_id}":              s.getUpload,
 		"POST /v1/local/rentals/{rental_id}/claim": s.claimRental,
-		"POST /v1/local/service/unload":            s.unload,
-		"POST /v1/local/service/down":              s.downService,
+		"POST /v1/local/daemon/unload":             s.unload,
+		"POST /v1/local/daemon/down":               s.downDaemon,
 		"POST /v1/local/jobs":                      s.submitJob,
 		"GET /v1/local/jobs/{id}":                  s.getJob,
 		"POST /v1/local/jobs/{id}/cancel":          s.cancelJob,
@@ -237,7 +237,7 @@ func (s *Server) guard(route Route, h http.HandlerFunc) http.Handler {
 			if origin := r.Header.Get("Origin"); origin != "" && !s.allowedOrigin(origin) {
 				s.refuse(w, r, http.StatusForbidden, "origin_not_allowed",
 					fmt.Sprintf("Origin %q may not reach this route", origin),
-					"only a page served by this local controller may mutate or open a stream")
+					"only a page served by this Cozy daemon may mutate or open a stream")
 				return
 			}
 		}
@@ -256,13 +256,13 @@ func (s *Server) guard(route Route, h http.HandlerFunc) http.Handler {
 				"one key names one request forever; retrying under it is safe by construction")
 			return
 		}
-		if route.Mutation && route.Path != "/v1/local/service/down" {
+		if route.Mutation && route.Path != "/v1/local/daemon/down" {
 			s.lifecycle.RLock()
 			defer s.lifecycle.RUnlock()
 			if s.shuttingDown {
-				s.refuse(w, r, http.StatusServiceUnavailable, "controller_shutting_down",
-					"the controller has accepted shutdown and no longer admits mutations",
-					"wait for the controller to finish stopping")
+				s.refuse(w, r, http.StatusServiceUnavailable, "daemon_shutting_down",
+					"the daemon has accepted shutdown and no longer admits mutations",
+					"wait for the daemon to finish stopping")
 				return
 			}
 		}

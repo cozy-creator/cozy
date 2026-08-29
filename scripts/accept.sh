@@ -52,21 +52,21 @@ run package
 check "bare noun group shows focused help" "$([ "$CODE" = 0 ] && printf '%s' "$OUT" | grep -q 'Usage: cozy package <command>' && echo 1 || echo 0)" "$OUT"
 
 run exit
-check "retired exit command refuses instead of aliasing" "$([ "$CODE" = 2 ] && printf '%s' "$OUT" | grep -q 'cli.usage' && echo 1 || echo 0)" "$OUT"
+check "retired exit command refuses instead of aliasing" "$([ "$CODE" = 2 ] && printf '%s' "$OUT" | grep -q 'unexpected argument exit' && echo 1 || echo 0)" "$OUT"
 
 run up --json
-check "up returns only useful controller facts" "$([ "$CODE" = 0 ] && printf '%s' "$OUT" | grep -q '"url":"http://127.0.0.1:' && printf '%s' "$OUT" | grep -q '"changed":true' && ! printf '%s' "$OUT" | grep -Eq '"(ok|kind|data)"' && echo 1 || echo 0)" "$OUT"
-check "up creates no persistent controller log" "$([ ! -e "$COZY_HOME/controller.log" ] && echo 1 || echo 0)" "$COZY_HOME/controller.log"
+check "up returns only useful daemon facts" "$([ "$CODE" = 0 ] && printf '%s' "$OUT" | grep -q '"url":"http://127.0.0.1:' && printf '%s' "$OUT" | grep -q '"changed":true' && ! printf '%s' "$OUT" | grep -Eq '"(ok|kind|data)"' && echo 1 || echo 0)" "$OUT"
+check "up creates no persistent daemon log" "$([ ! -e "$COZY_HOME/daemon.log" ] && echo 1 || echo 0)" "$COZY_HOME/daemon.log"
 
 run down
-check "down stops the explicit controller" "$([ "$CODE" = 0 ] && printf '%s' "$OUT" | grep -q 'controller: stopped' && echo 1 || echo 0)" "$OUT"
+check "down stops the explicit daemon" "$([ "$CODE" = 0 ] && printf '%s' "$OUT" | grep -Eq 'daemon: +stopped' && echo 1 || echo 0)" "$OUT"
 
 run invoke list --json
-check "invoke can auto-start the same controller" "$([ "$CODE" = 0 ] && [ -f "$COZY_HOME/service.lock" ] && [ -f "$COZY_HOME/client.cred" ] && echo 1 || echo 0)" "$OUT"
+check "invoke can auto-start the same daemon" "$([ "$CODE" = 0 ] && [ -f "$COZY_HOME/daemon.lock" ] && [ -f "$COZY_HOME/client.cred" ] && echo 1 || echo 0)" "$OUT"
 check "JSON success is domain-shaped without renderer scaffolding" "$(printf '%s' "$OUT" | grep -q '"invocations":\[\]' && ! printf '%s' "$OUT" | grep -Eq '"(ok|kind|data|fields|rows|count|aggregates)"' && echo 1 || echo 0)" "$OUT"
 
 run unload
-check "unload preserves the controller and returns idle residency" "$([ "$CODE" = 0 ] && printf '%s' "$OUT" | grep -q 'workers' && echo 1 || echo 0)" "$OUT"
+check "unload preserves the daemon and returns idle residency" "$([ "$CODE" = 0 ] && printf '%s' "$OUT" | grep -q 'workers' && echo 1 || echo 0)" "$OUT"
 
 if [ -n "$ENDPOINT" ] && [ -f "$ENDPOINT" ]; then
   DIGEST="sha256:$(sha256sum "$ENDPOINT" | cut -d' ' -f1)"
@@ -78,7 +78,7 @@ if [ -n "$ENDPOINT" ] && [ -f "$ENDPOINT" ]; then
 fi
 
 run down
-check "down stops the controller and proves lock release" "$([ "$CODE" = 0 ] && printf '%s' "$OUT" | grep -q 'controller: stopped' && echo 1 || echo 0)" "$OUT"
+check "down stops the daemon and proves lock release" "$([ "$CODE" = 0 ] && printf '%s' "$OUT" | grep -Eq 'daemon: +stopped' && echo 1 || echo 0)" "$OUT"
 
 if [ -n "$UPGRADE" ] && [ -f "$UPGRADE" ]; then
   BEFORE="$("$COZY" -v)"

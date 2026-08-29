@@ -174,7 +174,7 @@ type DesiredPlacement struct {
 	ExactPlacementSetBytes            []byte `json:"exact_placement_set_bytes,omitempty"`
 	// PlacementRevision is Tensorhub's monotonic revision for a private rental. It is
 	// the exact DesiredWorkerState.revision Creator relays for remote placements, so Hub
-	// can compare desired, accepted, and converged without guessing a local controller counter.
+	// can compare desired, accepted, and converged without guessing a local daemon counter.
 	PlacementRevision    uint64 `json:"placement_revision,omitempty"`
 	PlacementIDValue     string `json:"placement_id,omitempty"`
 	ModelObjectSetDigest string `json:"model_object_set_digest,omitempty"`
@@ -190,7 +190,7 @@ type DesiredPlacement struct {
 	Jobs []*JobPlan `json:"jobs,omitempty"`
 }
 
-// WorkerConnection is the dial triple for a worker this service did not spawn (was
+// WorkerConnection is the dial triple for a worker this daemon did not spawn (was
 // RemoteSpec — it describes a CONNECTION, and "remote" was a claim about geography that a
 // loopback pod falsifies). Token is a secret.Value rather than a string so that a spec
 // which is logged, rendered or marshalled prints the credential's DIGEST — there is no
@@ -665,7 +665,7 @@ func lessRecentlyUsed(a, b *worker) bool {
 // actual hardware readback before a request can be submitted to the pod.
 func (c *Orchestrator) EnsureRental(id string) (string, string, WorkerChange, *exit.Error) {
 	if c.opt.Rentals == nil {
-		return "", "", ChangeNone, exit.Unavailablef("this local controller attaches no rented workers")
+		return "", "", ChangeNone, exit.Unavailablef("this Cozy daemon attaches no rented workers")
 	}
 	target, problem := c.opt.Rentals(id)
 	if problem != nil {
@@ -1281,7 +1281,7 @@ func (c *Orchestrator) Worker(instanceID string) *WorkerFacts {
 	return &f
 }
 
-// Workers is every worker this service currently owns — the LOCAL extension module's
+// Workers is every worker this daemon currently owns — the LOCAL extension module's
 // listing (cl-006) and `cozy invoke list`'s source.
 func (c *Orchestrator) Workers() []WorkerFacts {
 	c.mu.Lock()
@@ -1582,7 +1582,7 @@ func (c *Orchestrator) idleLocalServingWorkerLocked(w *worker, active []records.
 
 // Reconcile runs at boot, before anything is served. Rows describing processes from a
 // previous life are checked against their OS BIRTH identity: a matching birth is a real
-// orphan and is killed (it holds a device grant and a socket this service no longer
+// orphan and is killed (it holds a device grant and a socket this daemon no longer
 // knows); a mismatch is a REUSED PID and is never signalled — only its row is closed.
 func (c *Orchestrator) Reconcile() (killed, forgotten int, e *exit.Error) {
 	unlock := inputasset.Guard()
