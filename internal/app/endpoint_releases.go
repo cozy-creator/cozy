@@ -235,23 +235,27 @@ func handleEndpointQualify(ctx *Context) *exit.Error {
 	if problem != nil {
 		return problem
 	}
-	return emit(ctx, qualificationRecord(c.Base(), ref, release, qualified))
+	if qualified.CandidateID == "" || qualified.QualificationID == "" || qualified.State == "" {
+		return exit.Internalf("endpoint qualification returned no candidate, qualification id, or state")
+	}
+	return emit(ctx, qualificationRecord(c.Base(), ref, release, profiles[0], qualified))
 }
 
-func qualificationRecord(base string, ref hub.Ref, release string,
+func qualificationRecord(base string, ref hub.Ref, release, profile string,
 	q hub.EndpointQualification,
 ) render.Record {
 	rec := render.Record{Kind: "endpoint qualification", Fields: []render.Field{
 		{K: "endpoint", V: ref.String()}, {K: "release", V: release},
-		{K: "profile", V: q.Profile}, {K: "state", V: q.State},
+		{K: "profile", V: profile}, {K: "qualification", V: q.QualificationID},
+		{K: "candidate", V: q.CandidateID}, {K: "state", V: q.State},
 		{K: "gpu", V: q.AcceleratorModel}, {K: "provider_resource", V: q.ProviderResourceID},
-		{K: "exposure", V: microUSD(q.ProviderExposureUSDMicros)},
-		{K: "cost", V: microUSD(q.ObservedCostUSDMicros)}, {K: "reclaimed", V: q.Reclaimed},
+		{K: "exposure", V: microUSD(q.ProviderExposureLimitUSDMicros)},
+		{K: "cost", V: microUSD(q.ObservedCostUSDMicros)}, {K: "reclaimed", V: q.ReclaimProven},
+		{K: "qualification_spec", V: q.ModelQualificationSpecDigest},
+		{K: "execution_observation", V: q.ExecutionObservationDigest},
+		{K: "admission_decision", V: q.ModelAdmissionDecisionDigest},
 		{K: "hub", V: base},
 	}}
-	if q.FailureCode != "" {
-		rec.Notes = append(rec.Notes, q.FailureCode+": "+q.FailureDetail)
-	}
 	if q.State == "qualified" {
 		rec.Next = []string{"cozy endpoint promote " + ref.String() + " " + release + " --serve <vN/function> --reason <why>"}
 	}

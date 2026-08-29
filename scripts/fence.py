@@ -806,6 +806,18 @@ def check_typed_resources():
     for route in ('"/v1/endpoints"', '"/v1/models"', '"/v1/models/"', '"/publications"'):
         if route not in hub_sources:
             bad.append(f"internal/hub: [resources] missing typed route prefix {route}")
+
+    managed = pathlib.Path("internal/managedinstall/install.go").read_text()
+    for retired in ('"base_path"', '"index_url"', '"build_command"', 'exec.Command("uv"',
+                    'exec.Command("pip"', 'exec.Command("docker"'):
+        if retired in managed:
+            bad.append(f"internal/managedinstall/install.go: [resources] managed install contains "
+                       f"forbidden resolve/build/path input {retired}")
+    for required in ("layout.ManagedBase(grant.BaseRealization.Digest)",
+                     "cozy-environment-proof", '"cozy-native-wheel-proof"',
+                     '"cozy.local.ManagedBaseReceipt/1"'):
+        if required not in managed:
+            bad.append(f"internal/managedinstall/install.go: [resources] missing managed-local fence {required}")
     return bad
 
 

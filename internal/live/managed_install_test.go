@@ -47,6 +47,9 @@ func TestQualifiedManagedLocalInstall(t *testing.T) {
 	resolved := jcs(t, map[string]any{"format": "ResolvedWheelSet/3", "wheels": []any{customFact}})
 	lock := jcs(t, map[string]any{"format": "tensorhub.resolution_lock/1"})
 	wheelhouse := jcs(t, map[string]any{"format": "WheelhouseManifest/3"})
+	descriptor := jcs(t, map[string]any{"application": "marco:app", "entrypoints": []any{},
+		"format": "cozy.endpoint.descriptor/1", "jobs": []any{}})
+	evaluated := jcs(t, map[string]any{})
 	eesValue, err := canonical.Document(&pb.EndpointEnvironmentSpec{
 		PlatformTarget: &pb.PlatformTarget{OsArch: "linux/amd64", Libc: "glibc2.39",
 			PythonAbi: "cp312", AcceleratorBackend: "cuda", AcceleratorAbi: "cu130"},
@@ -122,9 +125,10 @@ print(json.dumps({"digest":"sha256:"+hashlib.sha256(evidence).hexdigest(),"lengt
 				"base_worker_image_digest":  "sha256:" + strings.Repeat("5", 64),
 				"base_realization":          map[string]string{"kind": "managed-local", "digest": baseDigest},
 				"endpoint_environment_spec": exactDoc(ees), "endpoint_bundle": exactDoc(bundle),
+				"descriptor": exactDoc(descriptor), "evaluated_config": exactDoc(evaluated),
 				"resolved_wheel_set": exactDoc(resolved), "wheelhouse_manifest": exactDoc(wheelhouse),
 				"resolution_lock": exactDoc(lock),
-				"native_wheel_proof": map[string]any{"device_index": 0,
+				"native_wheel_proof": map[string]any{
 					"expected_result_digest": "sha256:" + strings.Repeat("3", 64), "fixture": "custom_op:run"},
 				"downloads": []map[string]any{
 					{"role": "project_wheel", "ref": map[string]any{"digest": packed.Digest, "length": len(wheelBytes)}, "url": server.URL + "/wheel", "expires_at": "2026-08-29T00:00:00Z"},

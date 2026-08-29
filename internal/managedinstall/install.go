@@ -33,13 +33,14 @@ import (
 const managedBaseFormat = "cozy.local.ManagedBaseReceipt/1"
 
 type Request struct {
-	Endpoint string
-	Release  string
-	Major    int
-	Profile  string
-	Force    bool
-	Grant    hub.LocalExecutionGrant
-	Config   config.Config
+	Endpoint    string
+	Release     string
+	Major       int
+	Profile     string
+	DeviceIndex *int
+	Force       bool
+	Grant       hub.LocalExecutionGrant
+	Config      config.Config
 }
 
 type Result struct {
@@ -132,6 +133,19 @@ func Run(ctx context.Context, layout home.Layout, store *records.Store, request 
 	for _, item := range documents {
 		path := filepath.Join(docDir, item.name)
 		if problem := writeExactDocument(path, item.doc, item.format, item.typed); problem != nil {
+			return fail(problem)
+		}
+		docPaths[item.name] = path
+	}
+	for _, item := range []struct {
+		name string
+		doc  hub.ExactDocument
+	}{
+		{"descriptor.json", grant.Descriptor},
+		{"evaluated-config.json", grant.EvaluatedConfig},
+	} {
+		path := filepath.Join(docDir, item.name)
+		if problem := writeSemanticDocument(path, item.doc); problem != nil {
 			return fail(problem)
 		}
 		docPaths[item.name] = path
@@ -244,7 +258,7 @@ func Run(ctx context.Context, layout home.Layout, store *records.Store, request 
 				"native custom wheel has no banked operator fixture/result proof request"))
 		}
 		nativeEvidence := filepath.Join(genDir, "native-wheel-qualification.json")
-		hostDigest, problem = runNativeProof(base, grant, profile, environmentRoot,
+		hostDigest, problem = runNativeProof(base, grant, profile, request.DeviceIndex, environmentRoot,
 			proof.Digest, docPaths["wheelhouse-manifest.json"], nativeEvidence, toolEnv)
 		if problem != nil {
 			return fail(problem)
@@ -325,12 +339,12 @@ func sameWheelFact(a, b wheel.Fact) bool {
 	return true
 }
 
-func runNativeProof(base string, grant hub.LocalExecutionGrant, profile, environmentRoot,
+func runNativeProof(base string, grant hub.LocalExecutionGrant, profile string, deviceIndex *int, environmentRoot,
 	receiptDigest, wheelhouse, output string, env []string,
 ) (string, *exit.Error) {
 	spec := grant.NativeWheelProof
 	if spec == nil || !digest(spec.ExpectedResultDigest) || spec.Fixture == "" ||
-		(spec.DeviceIndex != nil && (*spec.DeviceIndex < 0 || *spec.DeviceIndex > 63)) {
+		(deviceIndex != nil && (*deviceIndex < 0 || *deviceIndex > 63)) {
 		return "", exit.Named(exit.Structural, "managed_native_proof_invalid",
 			"native-wheel proof fixture, result digest, or device index is invalid")
 	}
@@ -342,7 +356,7 @@ func runNativeProof(base string, grant hub.LocalExecutionGrant, profile, environ
 		"format":                  "cozy.runtime.NativeWheelProofRequest/1",
 		"base_realization_digest": grant.BaseRealization.Digest,
 		"base_realization_kind":   grant.BaseRealization.Kind,
-		"base_worker_profile":     profile, "device_index": spec.DeviceIndex,
+		"base_worker_profile":     profile, "device_index": deviceIndex,
 		"endpoint_environment_spec_digest": grant.EndpointEnvironmentSpec.Digest,
 		"environment_root":                 environmentRoot, "expected_result_digest": spec.ExpectedResultDigest,
 		"fixture": spec.Fixture, "installed_environment_receipt_digest": receiptDigest,
@@ -433,6 +447,21 @@ func writeExactDocument(path string, doc hub.ExactDocument, format string, typed
 	}
 	if err := os.WriteFile(path, doc.CanonicalBytes, 0o600); err != nil {
 		return exit.Internalf("cannot stage %s: %s", format, err)
+	}
+	return nil
+}
+
+func writeSemanticDocument(path string, doc hub.ExactDocument) *exit.Error {
+	if problem := exactBytes(doc.Digest, doc.Length, doc.CanonicalBytes); problem != nil {
+		return problem
+	}
+	normalized, err := canonical.NormalizeJCS(doc.CanonicalBytes)
+	if err != nil || !bytes.Equal(normalized, doc.CanonicalBytes) {
+		return exit.Named(exit.Structural, "managed_install_document_invalid",
+			"semantic endpoint document is not exact canonical JCS: %v", err)
+	}
+	if err := os.WriteFile(path, doc.CanonicalBytes, 0o600); err != nil {
+		return exit.Internalf("cannot stage endpoint semantic document: %s", err)
 	}
 	return nil
 }

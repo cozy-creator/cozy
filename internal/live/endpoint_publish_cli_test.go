@@ -106,10 +106,15 @@ func TestEndpointPublishQualifyPromoteCLI(t *testing.T) {
 				body["duration_cap_s"] != float64(900) {
 				t.Errorf("qualification envelope changed: %v", body)
 			}
-			_ = json.NewEncoder(w).Encode(map[string]any{"profile": endpointprofile.CU130,
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"qualification_id": "qualification-1", "candidate_id": "candidate-130",
 				"state": "qualified", "accelerator_model": body["accelerator_model"],
-				"provider_exposure_usd_micros": 250000, "observed_cost_usd_micros": 50000,
-				"provider_resource_id": "pod-1", "reclaimed": true})
+				"provider_exposure_limit_usd_micros": 250000, "duration_cap_s": 900,
+				"observed_cost_usd_micros": 50000, "provider_resource_id": "pod-1",
+				"model_qualification_spec_digest": "sha256:" + strings.Repeat("4", 64),
+				"execution_observation_digest":    "sha256:" + strings.Repeat("5", 64),
+				"model_admission_decision_digest": "sha256:" + strings.Repeat("6", 64),
+				"reclaim_proven":                  true})
 		case r.Method == http.MethodPost && strings.HasSuffix(r.URL.Path, "/promote"):
 			var body struct {
 				Serving []map[string]string `json:"serving"`

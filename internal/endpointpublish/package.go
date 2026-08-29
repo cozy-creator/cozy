@@ -76,18 +76,24 @@ type ModelBinding struct {
 	Path            string               `json:"path"`
 }
 
+type NativeWheelProof struct {
+	ExpectedResultDigest string `json:"expected_result_digest"`
+	Fixture              string `json:"fixture"`
+}
+
 type Declaration struct {
-	Format                      string         `json:"format"`
-	SourceArchive               ObjectRef      `json:"source_archive"`
-	SourceLock                  ObjectRef      `json:"source_lock"`
-	ProjectWheel                wheel.Fact     `json:"project_wheel"`
-	Profiles                    []string       `json:"profiles"`
-	CustomWheels                []CustomWheel  `json:"custom_wheels"`
-	Descriptor                  ObjectRef      `json:"descriptor"`
-	EvaluatedConfig             ObjectRef      `json:"evaluated_config"`
-	CompatibleAcceleratorModels []string       `json:"compatible_accelerator_models"`
-	ModelRoots                  []RootRef      `json:"model_roots"`
-	ModelBindings               []ModelBinding `json:"model_bindings"`
+	Format                      string            `json:"format"`
+	SourceArchive               ObjectRef         `json:"source_archive"`
+	SourceLock                  ObjectRef         `json:"source_lock"`
+	ProjectWheel                wheel.Fact        `json:"project_wheel"`
+	Profiles                    []string          `json:"profiles"`
+	CustomWheels                []CustomWheel     `json:"custom_wheels"`
+	Descriptor                  ObjectRef         `json:"descriptor"`
+	EvaluatedConfig             ObjectRef         `json:"evaluated_config"`
+	CompatibleAcceleratorModels []string          `json:"compatible_accelerator_models"`
+	ModelRoots                  []RootRef         `json:"model_roots"`
+	ModelBindings               []ModelBinding    `json:"model_bindings"`
+	NativeWheelProof            *NativeWheelProof `json:"native_wheel_proof,omitempty"`
 }
 
 // Package retains the exact local bytes for a foreground begin/upload/finalize walk.
@@ -108,9 +114,10 @@ type Request struct {
 }
 
 type releaseConfig struct {
-	CompatibleAcceleratorModels []string       `json:"compatible_accelerator_models"`
-	ModelRoots                  []RootRef      `json:"model_roots"`
-	ModelBindings               []ModelBinding `json:"model_bindings"`
+	CompatibleAcceleratorModels []string          `json:"compatible_accelerator_models"`
+	ModelRoots                  []RootRef         `json:"model_roots"`
+	ModelBindings               []ModelBinding    `json:"model_bindings"`
+	NativeWheelProof            *NativeWheelProof `json:"native_wheel_proof"`
 }
 
 // Prepare requires a clean committed source subtree, deterministically packs its
@@ -183,6 +190,20 @@ func Prepare(req Request) (*Package, *exit.Error) {
 	if e != nil {
 		return fail(e)
 	}
+	native := false
+	for _, item := range custom {
+		native = native || len(item.Wheel.Tags) != 1 || item.Wheel.Tags[0] != wheel.Tag
+	}
+	if native {
+		if config.NativeWheelProof == nil || !digest(config.NativeWheelProof.ExpectedResultDigest) ||
+			!fixtureName(config.NativeWheelProof.Fixture) {
+			return fail(exit.Named(exit.Validation, "native_wheel_proof_absent",
+				"native custom wheels require a banked fixture and expected canonical result digest in endpoint.release.json"))
+		}
+	} else if config.NativeWheelProof != nil {
+		return fail(exit.Named(exit.Validation, "native_wheel_proof_unexpected",
+			"endpoint.release.json declares native proof but no custom wheel contains native bytes"))
+	}
 	archiveRef, e := fileRef(archive, MaxSourceBytes, "source_archive")
 	if e != nil {
 		return fail(e)
@@ -206,6 +227,7 @@ func Prepare(req Request) (*Package, *exit.Error) {
 		CompatibleAcceleratorModels: sortedUnique(config.CompatibleAcceleratorModels),
 		ModelRoots:                  sortedRoots(config.ModelRoots),
 		ModelBindings:               config.ModelBindings,
+		NativeWheelProof:            config.NativeWheelProof,
 	}
 	return result, nil
 }
@@ -461,6 +483,9 @@ func readReleaseConfig(tree string) (releaseConfig, *exit.Error) {
 
 var bindingIdentifier = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_.-]{0,127}$`)
 var hardwareVariant = regexp.MustCompile(`^sm[0-9]{2,}$`)
+var proofFixture = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_.]*:[A-Za-z_][A-Za-z0-9_]*$`)
+
+func fixtureName(value string) bool { return proofFixture.MatchString(value) }
 
 func normalizeBindings(values []ModelBinding) ([]ModelBinding, *exit.Error) {
 	out := append([]ModelBinding{}, values...)

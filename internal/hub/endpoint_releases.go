@@ -5,7 +5,6 @@ package hub
 
 import (
 	"context"
-	"encoding/json"
 	"net/http"
 	"net/url"
 
@@ -91,18 +90,18 @@ type EndpointQualificationRequest struct {
 }
 
 type EndpointQualification struct {
-	Profile                   string          `json:"profile"`
-	State                     string          `json:"state"`
-	AcceleratorModel          string          `json:"accelerator_model"`
-	ProviderResourceID        string          `json:"provider_resource_id"`
-	ProviderExposureUSDMicros int64           `json:"provider_exposure_usd_micros"`
-	ObservedCostUSDMicros     int64           `json:"observed_cost_usd_micros"`
-	Reclaimed                 bool            `json:"reclaimed"`
-	ModelQualificationSpec    json.RawMessage `json:"model_qualification_spec"`
-	ExecutionObservation      json.RawMessage `json:"execution_observation"`
-	ModelAdmissionDecision    json.RawMessage `json:"model_admission_decision"`
-	FailureCode               string          `json:"failure_code"`
-	FailureDetail             string          `json:"failure_detail"`
+	QualificationID                string `json:"qualification_id"`
+	CandidateID                    string `json:"candidate_id"`
+	State                          string `json:"state"`
+	AcceleratorModel               string `json:"accelerator_model"`
+	ProviderExposureLimitUSDMicros int64  `json:"provider_exposure_limit_usd_micros"`
+	DurationCapSeconds             int64  `json:"duration_cap_s"`
+	ProviderResourceID             string `json:"provider_resource_id,omitempty"`
+	ObservedCostUSDMicros          int64  `json:"observed_cost_usd_micros,omitempty"`
+	ModelQualificationSpecDigest   string `json:"model_qualification_spec_digest"`
+	ExecutionObservationDigest     string `json:"execution_observation_digest,omitempty"`
+	ModelAdmissionDecisionDigest   string `json:"model_admission_decision_digest,omitempty"`
+	ReclaimProven                  bool   `json:"reclaim_proven"`
 }
 
 func endpointProfilePath(ref Ref, release, profile string) string {
@@ -173,7 +172,6 @@ type BaseRealization struct {
 }
 
 type NativeWheelProof struct {
-	DeviceIndex          *int   `json:"device_index"`
 	ExpectedResultDigest string `json:"expected_result_digest"`
 	Fixture              string `json:"fixture"`
 }
@@ -187,6 +185,8 @@ type LocalExecutionGrant struct {
 	BaseRealization         BaseRealization   `json:"base_realization"`
 	EndpointEnvironmentSpec ExactDocument     `json:"endpoint_environment_spec"`
 	EndpointBundle          ExactDocument     `json:"endpoint_bundle"`
+	Descriptor              ExactDocument     `json:"descriptor"`
+	EvaluatedConfig         ExactDocument     `json:"evaluated_config"`
 	WheelhouseManifest      ExactDocument     `json:"wheelhouse_manifest"`
 	ResolvedWheelSet        ExactDocument     `json:"resolved_wheel_set"`
 	ResolutionLock          ExactDocument     `json:"resolution_lock"`

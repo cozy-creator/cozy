@@ -108,7 +108,8 @@ object = "marco_polo:app"
 }`)
 	mustWrite(t, filepath.Join(repo, "endpoint.release.json"), `{
   "model_roots": [],
-  "compatible_accelerator_models": ["NVIDIA GeForce RTX 4090", "NVIDIA GeForce RTX 4090"]
+  "compatible_accelerator_models": ["NVIDIA GeForce RTX 4090", "NVIDIA GeForce RTX 4090"],
+  "native_wheel_proof": {"fixture":"custom_op:run","expected_result_digest":"sha256:`+strings.Repeat("c", 64)+`"}
 }`)
 	git(t, repo, "init", "-q")
 	git(t, repo, "config", "user.email", "fixture@example.invalid")
@@ -175,7 +176,8 @@ object = "marco_polo:app"
   "model_bindings": [
     {"path":"z.path","checkpoint":{"org":"cozy","name":"z-model","checkpoint_id":"`+checkpointZ+`"},"config":{"assets":[],"document":`+objectRef+`},"execution_layout":[{"component":"transformer","root":{"org":"cozy","name":"z-model","checkpoint_id":"`+checkpointZ+`"}}],"hardware_variant":"sm90"},
     {"path":"a.path","checkpoint":{"org":"cozy","name":"a-model","checkpoint_id":"`+checkpointA+`"},"config":{"assets":[{"name":"tokenizer","ref":`+objectRef+`}],"document":`+objectRef+`},"execution_layout":[{"component":"encoder","root":{"org":"cozy","name":"a-model","checkpoint_id":"`+checkpointA+`"}}],"hardware_variant":"sm90"}
-  ]
+  ],
+  "native_wheel_proof": {"fixture":"custom_op:run","expected_result_digest":"sha256:`+strings.Repeat("c", 64)+`"}
 }`)
 	git(t, repo, "add", "endpoint.release.json")
 	git(t, repo, "commit", "-qm", "bind models")

@@ -222,6 +222,9 @@ is the separate cost-bounded hardware act. Publication never rents implicitly.
 one or more explicit qualified serving pointers; a bare major has no guessed function.
 `datasets push|pull` waits on th-035.
 
+See [docs/endpoint-publication.md](docs/endpoint-publication.md) for the release file, custom-wheel,
+qualification, promotion, and qualified managed-local install contracts.
+
 ## Tensorhub catalog and models
 
 Catalog reads are public:

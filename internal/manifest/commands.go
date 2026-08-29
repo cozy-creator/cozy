@@ -151,6 +151,7 @@ var Commands = []Command{
 			{Name: "--profile", Arg: "<profile>", Summary: "install one qualified published profile; forbids source build"},
 			{Name: "--major", Arg: "<vN>", Summary: "required local pin major with --profile"},
 			{Name: "--grant-ttl", Arg: "<duration>", Summary: "local wheel/lease grant lifetime", Default: "10m"},
+			{Name: "--device", Arg: "<index>", Summary: "concrete local GPU index for native qualification", Default: "0"},
 			{Name: "--reason", Arg: "<why>", Summary: "required with --profile; recorded before the lease"},
 		},
 		Exits:      []exit.Code{exit.OK, exit.Usage, exit.Validation, exit.NotFound, exit.Credential, exit.Structural, exit.Conflict, exit.Capacity},
