@@ -161,7 +161,7 @@ func TestEndpointPublishQualifyPromoteCLI(t *testing.T) {
 	args := []string{"endpoint", "publish", "cozy/marco", "--release", "1.0.0", "--dir", source,
 		"--profile", endpointprofile.CU130, "--profile", endpointprofile.CU126,
 		"--create", "--reason", "fixture publish"}
-	if code, out := run(args...); code != 0 || !strings.Contains(out, "candidate") || !strings.Contains(out, "serving-pointer move ran") {
+	if code, out := run(args...); code != 0 || !strings.Contains(out, "candidate-130") || !strings.Contains(out, "serving-pointer move ran") {
 		t.Fatalf("endpoint publish [exit %d]\n%s", code, out)
 	}
 	// Exact replay omits create (resource exists) and must send identical declaration bytes.

@@ -69,22 +69,50 @@ func handleEndpointPublish(ctx *Context) *exit.Error {
 		return problem
 	}
 	profileRows := make([]string, 0, len(done.Profiles))
+	var candidateRows, refusalRows []string
 	for _, profile := range done.Profiles {
-		profileRows = append(profileRows, profile.Profile+":"+profile.State)
+		profileRows = append(profileRows, profile.Profile+":"+profile.State+":"+profile.BaseRealizationKind)
+		if profile.State == "candidate" {
+			candidateRows = append(candidateRows, profile.Profile+"/"+profile.BaseRealizationKind+"="+profile.CandidateID)
+		} else {
+			refusal := profile.Profile + "/" + profile.BaseRealizationKind + " " + profile.RefusalCode
+			if profile.RefusalDetail != "" {
+				refusal += ": " + shorten(profile.RefusalDetail, 240)
+			}
+			refusalRows = append(refusalRows, refusal)
+		}
 	}
 	sort.Strings(profileRows)
-	return emit(ctx, render.Record{Kind: "endpoint publication", Fields: []render.Field{
+	sort.Strings(candidateRows)
+	sort.Strings(refusalRows)
+	fields := []render.Field{
 		{K: "endpoint", V: ref.String()}, {K: "release", V: done.Release},
 		{K: "declaration", V: done.DeclarationDigest}, {K: "created", V: done.Created},
 		{K: "profiles", V: profileRows}, {K: "endpoint_executions", V: len(done.EndpointExecutions)},
 		{K: "uploaded", V: render.Bytes(moved)}, {K: "held", V: render.Bytes(held)},
 		{K: "hub", V: c.Base()},
-	}, Notes: []string{
+	}
+	if len(candidateRows) > 0 {
+		fields = append(fields, render.Field{K: "candidates", V: candidateRows})
+	}
+	if len(refusalRows) > 0 {
+		fields = append(fields, render.Field{K: "profile_refusals", V: refusalRows})
+	}
+	return emit(ctx, render.Record{Kind: "endpoint publication", Fields: fields, Notes: []string{
 		"source/project bytes were published once; profile candidates are non-serving until explicit hardware qualification",
 		"no endpoint image, Dockerfile, dependency resolver, native build, or serving-pointer move ran",
 	}, Next: []string{
 		"cozy endpoint qualify " + ref.String() + "@" + release + " --profile <profile> --gpu <model> --max-cost <usd> --reason <why>",
 	}})
+}
+
+func shorten(value string, limit int) string {
+	value = strings.Join(strings.Fields(value), " ")
+	runes := []rune(value)
+	if len(runes) > limit {
+		return string(runes[:limit]) + "…"
+	}
+	return value
 }
 
 func validateBegin(pack *endpointpublish.Package, begun hub.EndpointReleaseBegin) *exit.Error {
