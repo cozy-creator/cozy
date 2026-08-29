@@ -183,7 +183,7 @@ func handleHubStatus(ctx *Context) *exit.Error {
 	if e != nil {
 		// An unreachable hub is a STATE this verb reports, not a refusal it raises:
 		// the answer to "what hub am I pointed at" is exactly what a user needs when
-		// it is down. Content-first, exit 0 — the same rule as bare `cozy`.
+		// it is down. Content-first: unreachable is a state this command reports, not an error.
 		rec.Fields = append(rec.Fields, render.Field{K: "reachable", V: false})
 		rec.Notes = append([]string{e.Message, e.Remedy}, rec.Notes...)
 		rec.Next = []string{"TENSORHUB_URL=<url> cozy hub status"}

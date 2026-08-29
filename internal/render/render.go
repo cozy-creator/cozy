@@ -68,6 +68,7 @@ type List struct {
 	Kind       string
 	Fields     []string // default columns (3-4)
 	AllFields  []string // every available column
+	AllRows    bool     // this listing is an inventory; do not apply the default row cap
 	Rows       []map[string]string
 	Aggregates []Field
 	Empty      string
@@ -343,7 +344,7 @@ func (l List) Emit(w io.Writer, m Mode) error {
 		return nil
 	}
 	shown := l.Rows
-	if !m.Full && len(shown) > rowCap {
+	if !m.Full && !l.AllRows && len(shown) > rowCap {
 		shown = shown[:rowCap]
 	}
 	width := make([]int, len(cols))

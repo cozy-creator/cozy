@@ -113,9 +113,9 @@ section "cozy up — the LocalService on a machine that has never run one"
 "$COZY" up >/tmp/accept-up.log 2>&1 &
 UP=$!
 trap '"$COZY" down >/dev/null 2>&1 || true; kill '"$UP"' 2>/dev/null || true' EXIT
-for _ in $(seq 1 60); do "$COZY" --json 2>/dev/null | grep -q '"service":"up"' && break; sleep 0.5; done
-run --json
-check "bare cozy reports the service up with a pid" \
+for _ in $(seq 1 60); do "$COZY" status --json 2>/dev/null | grep -q '"service":"up"' && break; sleep 0.5; done
+run status --json
+check "cozy status reports the service up with a pid" \
   "$(printf '%s' "$OUT" | grep -q '"service":"up"' && echo 1 || echo 0)" "$(first "$OUT")"
 check "the ONE local record database exists (SQLite, pure-Go driver)" \
   "$([ -f "$COZY_HOME/records.db" ] && echo 1 || echo 0)" \

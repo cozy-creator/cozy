@@ -29,19 +29,42 @@ func TestProductPath(t *testing.T) {
 	must(t, os.RemoveAll(root))
 	must(t, os.MkdirAll(root, 0o755))
 
-	// Bare `cozy` and explicit `cozy status` are the same operational dashboard. A down
-	// service has no invented workload values and no binary identity banner; it identifies
-	// the selected local root and gives the background-start command.
-	for _, args := range [][]string{nil, {"status"}} {
-		code, out := runCozy(t, root, args...)
-		if code != 0 || !strings.Contains(out, "home:") || !strings.Contains(out, root) ||
-			!strings.Contains(out, "service: down") || !strings.Contains(out, "next: cozy up -d") {
-			t.Fatalf("cozy %s down dashboard [exit %d]\n%s", strings.Join(args, " "), code, out)
+	// Bare `cozy` is the discovery surface: groups, global flags, examples and the paths
+	// to the exhaustive and per-command references. It reads no service state.
+	code, out := runCozy(t, root)
+	for _, want := range []string{"usage: cozy", "endpoints", "global flags:", "examples:",
+		"cozy status", "next: cozy commands", "next: cozy help <command>"} {
+		if code != 0 || !strings.Contains(out, want) {
+			t.Fatalf("bare cozy omitted %q [exit %d]\n%s", want, code, out)
 		}
-		for _, noise := range []string{"bin:", "description:", "version:", "unknown"} {
-			if strings.Contains(out, noise) {
-				t.Fatalf("cozy %s down dashboard contains %q\n%s", strings.Join(args, " "), noise, out)
-			}
+	}
+	for _, operational := range []string{"home:", "service: down", root} {
+		if strings.Contains(out, operational) {
+			t.Fatalf("bare cozy leaked operational status %q\n%s", operational, out)
+		}
+	}
+
+	// `cozy commands` is the exhaustive manifest, including the final planned rows; it
+	// never asks the user to repeat the command with --full merely to discover them.
+	code, out = runCozy(t, root, "commands")
+	for _, want := range []string{"status", "endpoint publish", "login", "logout", "planned"} {
+		if code != 0 || !strings.Contains(out, want) {
+			t.Fatalf("cozy commands omitted %q [exit %d]\n%s", want, code, out)
+		}
+	}
+	if strings.Contains(out, "more — --full") {
+		t.Fatalf("cozy commands truncated its own manifest\n%s", out)
+	}
+
+	// Operational state belongs only to the explicit status command.
+	code, out = runCozy(t, root, "status")
+	if code != 0 || !strings.Contains(out, "home:") || !strings.Contains(out, root) ||
+		!strings.Contains(out, "service: down") || !strings.Contains(out, "next: cozy up -d") {
+		t.Fatalf("cozy status down dashboard [exit %d]\n%s", code, out)
+	}
+	for _, noise := range []string{"bin:", "description:", "version:", "unknown"} {
+		if strings.Contains(out, noise) {
+			t.Fatalf("cozy status down dashboard contains %q\n%s", noise, out)
 		}
 	}
 	if code, out := runCozy(t, root, "status", "--fields", "service,endpoints"); code != 0 ||
@@ -110,7 +133,7 @@ func TestProductPath(t *testing.T) {
 	sum, err := os.ReadFile(archive)
 	must(t, err)
 	digest := sha256.Sum256(sum)
-	code, out := runCozy(t, root, "install", weightlessRef,
+	code, out = runCozy(t, root, "install", weightlessRef,
 		"--from", archive, "--digest", "sha256:"+hex.EncodeToString(digest[:]))
 	if code != 0 {
 		t.Fatalf("cozy install [exit %d]\n%s", code, out)

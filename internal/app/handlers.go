@@ -263,6 +263,7 @@ func handleCommands(ctx *Context) *exit.Error {
 		Kind:      "commands",
 		Fields:    []string{"name", "status", "summary"},
 		AllFields: []string{"name", "status", "group", "summary", "capability", "server", "destructive", "exits", "flags", "issue"},
+		AllRows:   true,
 		Empty:     "0 commands",
 	}
 	implemented, planned := 0, 0

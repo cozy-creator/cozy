@@ -90,7 +90,7 @@ func flagSpelling(f manifest.Flag) string {
 func renderRootHelp(ctx *Context) *exit.Error {
 	w := ctx.Out
 	fmt.Fprintln(w, "cozy — "+manifest.Description)
-	fmt.Fprintln(w, "usage: cozy [global flags] <command> [args…]   ·   bare `cozy` prints live status")
+	fmt.Fprintln(w, "usage: cozy [global flags] <command> [args…]")
 	fmt.Fprintln(w)
 	planned := false
 	for _, g := range manifest.Groups {
@@ -129,7 +129,13 @@ func renderRootHelp(ctx *Context) *exit.Error {
 	}
 	fmt.Fprintf(w, "  %-*s  %s\n", width, versionFlags,
 		"print the bare version and exit 0; only as the sole argument (`cozy version` is the full record)")
-	fmt.Fprintln(w, "next: cozy commands --full")
+	fmt.Fprintln(w, "\nexamples:")
+	fmt.Fprintln(w, "  cozy status")
+	fmt.Fprintln(w, "  cozy up -d")
+	fmt.Fprintln(w, "  cozy endpoint search video")
+	fmt.Fprintln(w, "  cozy install org/endpoint --from ./release.tar.gz --digest sha256:<hex>")
+	fmt.Fprintln(w, "  cozy run org/endpoint/v1/generate \"a red bicycle\"")
+	fmt.Fprintln(w, "next: cozy commands")
 	fmt.Fprintln(w, "next: cozy help <command>")
 	return nil
 }

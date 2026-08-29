@@ -84,9 +84,9 @@ cozy
 cozy doctor
 ```
 
-Running `cozy` with no command is the same operational dashboard as `cozy status`. It
-shows whether the service is running and summarizes installed endpoints, workers, jobs,
-and workflows.
+Running `cozy` with no command shows the command overview, global flags, and examples.
+`cozy status` is the operational dashboard for the service, installed endpoints, workers,
+jobs, and workflows.
 
 Stop the service when you are finished:
 

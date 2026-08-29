@@ -1,5 +1,5 @@
 // Package app wires the manifest to dispatch: startup self-check, parse, the
-// shared gates, then one handler. AXI conventions: bare `cozy` is live status,
+// shared gates, then one handler. AXI conventions: bare `cozy` is the root help,
 // -h/--help is concise and never mutates, and no code path reads a prompt.
 package app
 
@@ -57,27 +57,25 @@ func Run(args []string, stdout, stderr io.Writer) int {
 		return int(exit.Of(e))
 	}
 
-	// The ONE environment read of this process, before any handler runs.
-	cfg, e := config.Load()
-	if e != nil {
-		render.EmitError(stdout, e, inv.Mode)
-		return int(exit.Of(e))
-	}
+	ctx := &Context{Inv: inv, Out: stdout, Err: stderr}
 
-	ctx := &Context{Inv: inv, Out: stdout, Err: stderr, Cfg: cfg}
-
-	// -h/--help short-circuits before every gate: help never mutates, never dials.
-	if inv.Help {
+	// Root discovery and -h/--help short-circuit before configuration and every gate:
+	// help never mutates, reads user state, or dials.
+	if inv.Help || inv.Bare {
 		if e := renderHelp(ctx, inv.Cmd); e != nil {
 			render.EmitError(stdout, e, inv.Mode)
 			return int(exit.Of(e))
 		}
 		return int(exit.OK)
 	}
-	// Bare `cozy` is live status, never help.
-	if inv.Bare {
-		inv.Cmd, _ = manifest.Lookup([]string{"status"})
+
+	// The ONE environment read of this process, before any handler runs.
+	cfg, e := config.Load()
+	if e != nil {
+		render.EmitError(stdout, e, inv.Mode)
+		return int(exit.Of(e))
 	}
+	ctx.Cfg = cfg
 
 	// Gates, in precedence order — see gate(). Arity is one of them, deliberately:
 	// checked here rather than in parse so that -h and the planned-row answer come first.

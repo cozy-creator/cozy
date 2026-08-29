@@ -594,7 +594,7 @@ var Commands = []Command{
 		Path: []string{"hub", "status"}, Group: "catalog",
 		Summary: "the configured hub: URL, credential digest, reachability, catalog size",
 		MaxArgs: 0,
-		// Content-first like bare `cozy`: an unreachable hub is a STATE this verb
+		// Content-first: an unreachable hub is a STATE this verb
 		// reports, not a refusal it raises.
 		Exits:      []exit.Code{exit.OK},
 		Capability: "cmd.hub.status", Status: Implemented, Handler: "hub.status",
