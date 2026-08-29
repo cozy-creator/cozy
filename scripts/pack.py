@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
-"""Pack an endpoint tree into a release archive — the pre-hub stand-in for `cozy endpoint publish`.
+"""Pack an endpoint tree into the release archive used by weightless acceptance.
 
-cl-012 replaces this with the real publish path (manifest from `git ls-files`,
-declare-digests-first, presigned PUTs). Until then this writes the same shape the
-installer verifies: release.json FIRST, then exactly the files it declares.
+This writes the shape the installer verifies: release.json FIRST, then exactly the files
+it declares. It is test/release tooling, not endpoint code and not the `cozy pack` wheel
+builder.
 
     scripts/pack.py <tree> <org/endpoint> <version> <out.tar.gz>
 

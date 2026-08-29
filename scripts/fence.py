@@ -200,14 +200,10 @@ DENY_EMBED = [
     "loadtensor", "weightbytes", "gguf",
 ]
 PY_SCAN = "scripts/*.py"
-# fence.py names the vocabulary in order to deny it; sdxl_proof.py is FIXTURE SOURCE for
-# the non-cooperative-cancel arm (cl-003/M4) — copied into the proof release by
-# sdxl-release.sh and executed only inside that released endpoint's own venv, never by
-# Creator. The allow is explicit so a second file of UNet math cannot ride in unseen.
+# fence.py names the vocabulary in order to deny it. No endpoint implementation is kept
+# under scripts/, so it is the only Python source exempt from its own vocabulary scan.
 PY_ALLOW = {
     "scripts/fence.py": "the fence itself: it spells the vocabulary to deny it",
-    "scripts/sdxl_proof.py": "fixture source for the M4 non-cooperative-cancel arm; "
-                             "runs only inside the released endpoint's own venv",
 }
 
 # (cl-028) The VERIFICATION HOME is the only place an //cozy:allow door may exempt a listen

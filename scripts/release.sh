@@ -18,11 +18,9 @@
 #                                    sha256 per platform, and the UNBUILT table
 #
 # UNBUILT is a first-class part of the output. A platform this repository cannot build is
-# named with the reason rather than omitted, because an absent artifact and an artifact
-# nobody tried to build look identical in a directory listing. There is no C wall left to
-# name — `cozy` is pure Go (CGO_ENABLED=0) and every target below is a cross-compile from
-# this one host — so what remains in the table is Go source that still spells a Unix
-# syscall directly, and the reason quotes the compiler saying which.
+# named with the compiler's reason rather than omitted, because an absent artifact and an
+# artifact nobody tried to build look identical in a directory listing. `cozy` is pure Go
+# (CGO_ENABLED=0), so every target below is attempted as a cross-compile from this host.
 #
 # What a build is NOT: proof the binary RUNS. This host executes linux/amd64 and nothing
 # else, so the macOS and Windows rows are static evidence — bytes, size, checksum — until

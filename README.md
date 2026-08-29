@@ -66,7 +66,8 @@ executes with it, reclaiming what nothing references plus retained outputs past 
 retention horizon (cl-033).
 
 `--from <archive>` is the pre-hub source door standing in for the hub resolve (cl-011);
-`scripts/pack.py` is the pre-hub packager an endpoint-release publish (th-003/th-004) replaces.
+`scripts/pack.py` builds the small release archive used by the weightless acceptance path.
+The real endpoint-publication client eventually replaces both.
 
 ## The deterministic wheel packer (th-039)
 
@@ -343,9 +344,6 @@ capacity, and a grant that writes somewhere a reclaim cannot reach.
   same identity replays the receipt, same keys with different bytes conflict, and nothing
   on this side can un-write what the worker already made durable.
 
-`scripts/job-release.sh` builds the census release a live job run installs — cr-009's own
-`structural_census.py`, verbatim from a pinned `git archive`.
-
 ## Local output retention (cl-033)
 
 An attempt's outputs are mirrored onto this host BEFORE its terminal is acknowledged and
@@ -481,10 +479,6 @@ becomes a named local root only after `tfs snapshot verify` proves every declare
 - `--token-stdin` takes this invocation's credential as a VALUE on stdin. It is not a
   prompt and never argv.
 
-**The read plane is real.** `POST …/checkpoints/{snapshot}/reads` and
-`scripts/xfer-realhub.sh` proves model publish → model download end to end against a hub
-built from the current contract, with no shim or retired route anywhere.
-
 `cozy endpoint publish` and `cozy endpoint promote` stay advertised-not-built: cl-039
 owns the Creator client over th-046 release assembly, and cl-041 consumes th-004's serving
 pointer. `datasets push|pull` waits on th-035.
@@ -502,25 +496,16 @@ installed-binary state and release state are four distinct evidence axes, so a g
   and compared; a platform that does not reproduce is reported as UNBUILT rather than
   shipped. The tarball is deterministic (sorted, epoch mtimes, `gzip -n`) — otherwise the
   checksum would be a fact about the clock.
-- **UNBUILT is part of the output, and the C wall is gone from it.** `RELEASE.json` names
-  every platform that was not built and why, because an absent artifact and an artifact
-  nobody attempted look identical in a directory listing. `cozy` is pure Go, so
-  `linux/amd64`, `linux/arm64`, `darwin/arm64` and `darwin/amd64` are four cross-compiles
-  from one host. The per-OS facts that used to be C are Go build tags now —
-  `internal/flock` (flock vs `LockFileEx`), `internal/install` (statfs vs
-  `GetDiskFreeSpaceEx`, `st_dev`/`st_nlink` vs the volume serial), and `internal/orchestrator`'s
-  peer credential (`SO_PEERCRED`, Darwin's `LOCAL_PEERCRED`, and no answer at all
-  elsewhere, which `peerPID` already reads as 0). `windows/amd64` is the one row left, and
-  it is no longer a dependency: `internal/orchestrator/worker.go` spells the worker's process
-  group and its kills as `syscall.SysProcAttr{Setpgid}` and `syscall.Kill`, which Windows
-  answers with Job Objects instead. The UNBUILT reason quotes the compiler naming those
-  five lines, which is a port of one file rather than a wall.
+- **UNBUILT is part of the output.** `RELEASE.json` names every platform that was not built
+  and why, because an absent artifact and an artifact nobody attempted look identical in a
+  directory listing. `cozy` is pure Go and the release builder currently cross-compiles
+  Linux amd64/arm64, macOS amd64/arm64, and Windows amd64 from one host.
 - **A build is not a run, and `RELEASE.json` says which it was.** Each artifact row carries
   `binary_sha256`, `binary_bytes`, the `format` line `file` printed, and `executed` — and
   on a Linux builder only the `linux/amd64` row can say it ran. The macOS and Windows
   binaries are static evidence until a runner of that platform drives `scripts/accept.sh`
-  against them. `scripts/install.sh` is a POSIX installer and the Windows tarball carries
-  `cozy.exe`, so Windows also still owes an installer of its own.
+  against them. `scripts/install.sh` is the POSIX installer and `scripts/install.ps1` is
+  its Windows side-by-side replacement twin.
 - **`scripts/install.sh` verifies the checksum BEFORE anything is replaced**, then stages
   inside the target directory so the final move is a rename on one filesystem. A corrupted
   asset is exit 13 with both digests named and the working installation untouched — the
@@ -568,10 +553,6 @@ Creator is v2's test-suite exception; its suite and scripts drive real processes
   planted file is removed; and each real wheel is `pip install`ed into a throwaway venv
   where `cozy-runtime describe --check` runs THROUGH THE INSTALLED WHEEL — site-packages
   as the project root, no source tree on `sys.path`.
-- `scripts/hub-live.py` drives the real `cozy` against a REAL tensorhub: public reads,
-  admin writes, every refusal arm (wrong token, absent model, closed port, a hub that
-  accepts and never answers, a 200 that is not our document), and a cumulative secrecy
-  check that the raw credential appears in no byte the session printed.
 - `go test ./...` is the permitted Creator suite; `internal/live` starts the real
   system and observe it, with no mocks anywhere. `TestCanonicalDocuments` writes and reads
   worker-protocol's frozen corpus byte-for-byte and refuses every semantic twin by its own
@@ -585,12 +566,6 @@ Creator is v2's test-suite exception; its suite and scripts drive real processes
   crash on the weightless fixture. The remote-placement tests drive the real owner client
   against an independent media-protocol peer rather than importing Tensorhub's server.
   A test whose external peer is absent skips by name.
-- `scripts/xfer-realhub.sh` drives the real `cozy` against a pinned current Tensorhub,
-  its own Postgres container, four freshly bootstrapped storage prefixes, real R2, and
-  a real TensorFS checkpoint. It proves typed endpoint/model create/show/search,
-  incremental model publication, zero-byte committed replay, typed resolution and
-  download, whole-checkpoint verification, warm zero-byte download, retired-command
-  refusals, teardown, and exact R2-prefix cleanup—with no read shim or retired route.
 - `scripts/clean-machine.sh` runs `scripts/accept.sh` inside a throwaway container with a
   fresh user, an empty home, no toolchain and no mount of this repository but `scripts/`:
   the corrupted-asset red arm, the checksum-verified install, the tag and commit the
