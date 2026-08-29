@@ -9,6 +9,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
 	"sort"
 	"strings"
 	"testing"
@@ -32,6 +33,8 @@ version = "1.0.0"
 object = "marco_polo:app"
 `)
 	mustWrite(t, filepath.Join(root, "marco_polo.py"), "app = object()\n")
+	mustWrite(t, filepath.Join(root, "uv.lock"), "version = 1\n")
+	mustWrite(t, filepath.Join(root, "endpoint.release.json"), `{"compatible_accelerator_models":["NVIDIA GeForce RTX 4090"]}`)
 	packed, problem := wheel.Pack(wheel.Request{Tree: root, OutDir: filepath.Join(root, "dist")})
 	if problem != nil {
 		t.Fatalf("pure project pack refused: %s", problem)
@@ -40,6 +43,11 @@ object = "marco_polo:app"
 		strings.Join(packed.Fact.Tags, ",") != wheel.Tag ||
 		strings.Join(packed.Fact.ImportRoots, ",") != "marco_polo" {
 		t.Fatalf("project WheelFact disagrees with packed bytes: %+v / %+v", packed, packed.Fact)
+	}
+	for _, forbidden := range []string{"pyproject.toml", "uv.lock", "endpoint.release.json"} {
+		if slices.Contains(packed.Entries, forbidden) {
+			t.Fatalf("publication-only metadata entered the runtime project wheel: %s", forbidden)
+		}
 	}
 
 	mustWrite(t, filepath.Join(root, "marco_polo.so"), "native")

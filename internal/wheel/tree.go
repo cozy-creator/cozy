@@ -34,6 +34,7 @@ var excludedDir = map[string]bool{
 // excludedFile is the same rule for leaves.
 var excludedFile = map[string]bool{
 	".DS_Store": true, "Thumbs.db": true, ".gitignore": true, ".gitattributes": true,
+	"pyproject.toml": true, "uv.lock": true, "endpoint.release.json": true,
 }
 
 // compiledExt is what a project that needs to COMPILE something carries. Any of these is
