@@ -1,6 +1,7 @@
 package live
 
 import (
+	"encoding/json"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -94,6 +95,52 @@ func TestLocalAPIDoor(t *testing.T) {
 		t.Errorf("a credential presented as a COOKIE authenticated something: %s", cookied.brief())
 	}
 
+	// The embedded launch page is intentionally public on the guarded localhost origin.
+	// It contains no user state and cannot turn a cookie into ambient API authority.
+	page := svc.call(t, "GET", "/", nil, "Authorization", "")
+	if page.Status != http.StatusOK ||
+		!strings.Contains(string(page.Body), "local generative workspace is running") {
+		t.Errorf("the unauthenticated localhost web stub is unavailable: %s", page.brief())
+	}
+	if hostile := svc.call(t, "GET", "/", nil, "Authorization", "", "Host", "cozy.attacker.example"); hostile.Status != http.StatusForbidden {
+		t.Errorf("the public web stub bypassed the Host guard: %s", hostile.brief())
+	}
+
+	// Browser-selected bytes cross one authenticated, bounded, content-addressed door.
+	// The response exposes an opaque id, never a caller filesystem path.
+	uploadBody := []byte("\x89PNG\r\n\x1a\ncozy-upload-arm")
+	unauthenticatedUpload := svc.callBytes(t, "POST", "/v1/uploads", uploadBody, "image/png",
+		"Authorization", "")
+	if unauthenticatedUpload.Status != http.StatusUnauthorized {
+		t.Errorf("an unauthenticated upload was admitted: %s", unauthenticatedUpload.brief())
+	}
+	first := svc.callBytes(t, "POST", "/v1/uploads", uploadBody, "image/png")
+	second := svc.callBytes(t, "POST", "/v1/uploads", uploadBody, "image/png")
+	if first.Status != http.StatusCreated || second.Status != http.StatusCreated {
+		t.Fatalf("content-addressed upload failed: first=%s second=%s", first.brief(), second.brief())
+	}
+	var stored, replayed struct {
+		ID     string `json:"upload_id"`
+		Digest string `json:"digest"`
+		Length int64  `json:"length"`
+		URL    string `json:"url"`
+	}
+	must(t, json.Unmarshal(first.Body, &stored))
+	must(t, json.Unmarshal(second.Body, &replayed))
+	if stored.ID == "" || stored.ID != replayed.ID || stored.Digest != replayed.Digest ||
+		stored.Length != int64(len(uploadBody)) || strings.Contains(string(first.Body), root) {
+		t.Errorf("upload identity is not pathless and idempotent: %s / %s", first.brief(), second.brief())
+	}
+	fetched := svc.call(t, "GET", stored.URL, nil)
+	if fetched.Status != http.StatusOK || string(fetched.Body) != string(uploadBody) ||
+		fetched.Header.Get("X-Cozy-Digest") != stored.Digest {
+		t.Errorf("opaque upload readback changed bytes or identity: %s", fetched.brief())
+	}
+	malformed := svc.call(t, "GET", "/v1/uploads/upl-../../../../etc/passwd", nil)
+	if malformed.Status != http.StatusNotFound {
+		t.Errorf("a path-shaped upload id reached the filesystem: %s", malformed.brief())
+	}
+
 	// The media plane takes opaque ids and nothing that could be a path.
 	for _, attempt := range []string{
 		"/v1/media/../../../../etc/passwd",
@@ -133,19 +180,19 @@ func TestLocalAPIDoor(t *testing.T) {
 		t.Error("a rendered error contains the credential")
 	}
 
-	// Plain exit is safe by default: one paid obligation refuses shutdown by exact id.
+	// Plain down is safe by default: one paid obligation refuses shutdown by exact id.
 	store, problem := records.Open(filepath.Join(root, "records.db"))
 	fatal(t, problem)
 	fatal(t, store.RecordRental(records.Rental{
-		ID: "rental-exit-arm", EndpointRef: "cozy/fake/v1/run",
+		ID: "rental-down-arm", EndpointRef: "cozy/fake/v1/run",
 		AcceleratorModel: "CPU", State: "ready", Hub: "https://hub.invalid",
 	}))
-	blocked := svc.call(t, "POST", "/v1/local/service/exit", map[string]bool{"all": false})
+	blocked := svc.call(t, "POST", "/v1/local/service/down", map[string]bool{"all": false})
 	if blocked.Status != http.StatusConflict || blocked.code() != "active_work" ||
-		!strings.Contains(string(blocked.Body), "rental-exit-arm") {
-		t.Errorf("plain exit did not name and preserve the rental: %s", blocked.brief())
+		!strings.Contains(string(blocked.Body), "rental-down-arm") {
+		t.Errorf("plain down did not name and preserve the rental: %s", blocked.brief())
 	}
-	_, problem = store.ForgetRental("rental-exit-arm")
+	_, problem = store.ForgetRental("rental-down-arm")
 	fatal(t, problem)
 	store.Close()
 }

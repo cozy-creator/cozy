@@ -14,7 +14,7 @@ import (
 	"github.com/cozy-creator/cozy-creator/internal/records"
 )
 
-// LifecycleIdentity is one durable obligation that prevents a safe controller exit.
+// LifecycleIdentity is one durable obligation that prevents a safe controller down.
 // Kind distinguishes ordinary invocations, run-once jobs, provider rentals, and paid
 // acquisition operations that have not learned a provider rental id yet.
 type LifecycleIdentity struct {
@@ -28,11 +28,11 @@ type UnloadResult struct {
 	Count   int                        `json:"count"`
 }
 
-// ExitResult is the controller-side half of `exit [--all]`. ShuttingDown is true only
+// DownResult is the controller-side half of `down [--all]`. ShuttingDown is true only
 // after every local invocation settled and every rental row/operation disappeared.
 // Under --all, a false result tells the caller exactly what cancellation was requested
 // and which paid obligations must be ended through Tensorhub before retrying.
-type ExitResult struct {
+type DownResult struct {
 	ShuttingDown          bool                `json:"shutting_down"`
 	CancellationRequested []LifecycleIdentity `json:"cancellation_requested"`
 	Active                []LifecycleIdentity `json:"active"`
@@ -48,11 +48,11 @@ func (s *Server) unload(w http.ResponseWriter, r *http.Request) {
 	s.ok(w, r, http.StatusOK, UnloadResult{Stopped: stopped, Count: len(stopped)})
 }
 
-func (s *Server) exitService(w http.ResponseWriter, r *http.Request) {
+func (s *Server) downService(w http.ResponseWriter, r *http.Request) {
 	s.lifecycle.Lock()
 	defer s.lifecycle.Unlock()
-	if s.exiting {
-		s.ok(w, r, http.StatusAccepted, ExitResult{ShuttingDown: true})
+	if s.shuttingDown {
+		s.ok(w, r, http.StatusAccepted, DownResult{ShuttingDown: true})
 		return
 	}
 	var body struct {
@@ -68,19 +68,19 @@ func (s *Server) exitService(w http.ResponseWriter, r *http.Request) {
 	}
 	if err != io.EOF {
 		s.refuse(w, r, http.StatusBadRequest, "invalid_request",
-			`this route takes exactly {"all":true|false}`, "send one closed exit request")
+			`this route takes exactly {"all":true|false}`, "send one closed down request")
 		return
 	}
 
-	active, rentals, problem := s.exitBlockers()
+	active, rentals, problem := s.downBlockers()
 	if problem != nil {
 		s.refuseTyped(w, r, problem)
 		return
 	}
 	if !body.All && (len(active) > 0 || len(rentals) > 0) {
 		s.refuseTyped(w, r, exit.Named(exit.Conflict, "active_work",
-			"controller exit refused: active %s", joinLifecycleIdentities(active, rentals)).
-			WithRemedy("cancel the named invocations/jobs and end the named rentals, or use explicit `cozy exit --all`"))
+			"controller down refused: active %s", joinLifecycleIdentities(active, rentals)).
+			WithRemedy("cancel the named invocations/jobs and end the named rentals, or use explicit `cozy down --all`"))
 		return
 	}
 
@@ -95,7 +95,7 @@ func (s *Server) exitService(w http.ResponseWriter, r *http.Request) {
 			if row == nil {
 				continue
 			}
-			changed, cancelProblem := s.cancelForExit(*row)
+			changed, cancelProblem := s.cancelForDown(*row)
 			if cancelProblem != nil {
 				s.refuseTyped(w, r, cancelProblem.WithRemedy(
 					"some cancellation requests may already be recorded; the controller remains alive for reconciliation"))
@@ -109,7 +109,7 @@ func (s *Server) exitService(w http.ResponseWriter, r *http.Request) {
 			// Rental destruction belongs to Tensorhub/provider ownership. Returning the exact
 			// identities while leaving this process alive lets the CLI confirm remote absence,
 			// forget the local rows, and retry this same idempotent request.
-			s.ok(w, r, http.StatusAccepted, ExitResult{
+			s.ok(w, r, http.StatusAccepted, DownResult{
 				CancellationRequested: requested, Active: active, Rentals: rentals,
 			})
 			return
@@ -121,12 +121,12 @@ func (s *Server) exitService(w http.ResponseWriter, r *http.Request) {
 			"this server was built with no shutdown hook", "")
 		return
 	}
-	s.exiting = true
-	s.ok(w, r, http.StatusAccepted, ExitResult{ShuttingDown: true})
+	s.shuttingDown = true
+	s.ok(w, r, http.StatusAccepted, DownResult{ShuttingDown: true})
 	go s.shutdown()
 }
 
-func (s *Server) exitBlockers() ([]LifecycleIdentity, []LifecycleIdentity, *exit.Error) {
+func (s *Server) downBlockers() ([]LifecycleIdentity, []LifecycleIdentity, *exit.Error) {
 	requests, problem := s.store.ActiveRequests()
 	if problem != nil {
 		return nil, nil, problem
@@ -186,10 +186,10 @@ func (s *Server) exitBlockers() ([]LifecycleIdentity, []LifecycleIdentity, *exit
 	return active, rentals, nil
 }
 
-// cancelForExit reuses the request authority's existing queued/live cancellation
+// cancelForDown reuses the request authority's existing queued/live cancellation
 // boundaries. A terminal awaiting acknowledgement is already on its way to settlement;
 // it remains in Active and makes the caller retry rather than receiving a second verdict.
-func (s *Server) cancelForExit(row records.Request) (bool, *exit.Error) {
+func (s *Server) cancelForDown(row records.Request) (bool, *exit.Error) {
 	attempts, problem := s.store.Attempts(row.ID)
 	if problem != nil {
 		return false, problem

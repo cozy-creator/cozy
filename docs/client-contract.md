@@ -32,6 +32,8 @@ service.
 | `POST /v1/requests/{id}/cancel` | core | yes | requests cancellation; `?grace_ms=` |
 | `GET /v1/requests/{id}/events` | core | yes | SSE, one request, terminal-stop; `?cursor=` |
 | `GET /v1/media/{media_id}` | core | yes | bytes by opaque id; `HEAD`; one `Range` |
+| `POST /v1/uploads` | local | yes | admit bounded content-addressed bytes; no caller path |
+| `GET /v1/uploads/{upload_id}` | local | yes | opaque upload bytes with digest and Range support |
 
 ### Submit
 
@@ -228,16 +230,24 @@ through one envelope, including an unknown route.
 
 ## 7. Local extension module
 
-Mounted under `/v1/local/` so the Creator-only boundary is visible in the URL.
+Creator-only control routes use `/v1/local/`. Uploads and embedded web assets use their product
+URLs but remain local-scope rows in the same guarded route table.
 
 | route | scope | auth | notes |
 |---|---|---|---|
 | `POST /v1/local/rentals/{rental_id}/claim` | local | yes | attach the controller to one already-provisioned private worker |
 | `POST /v1/local/service/unload` | local | yes | stop definitely-idle local serving workers; never touch active work, jobs, rentals, or installed bytes |
-| `POST /v1/local/service/exit` | local | yes | safe exit fence; `{all:true}` requests local cancellation and returns paid obligations that must be confirmed absent before retrying |
+| `POST /v1/local/service/down` | local | yes | safe down fence; `{all:true}` requests local cancellation and returns paid obligations that must be confirmed absent before retrying |
 | `POST /v1/local/jobs` | local | yes | submit one bounded job; `Idempotency-Key`; 202 with the handle and its publication repo |
 | `GET /v1/local/jobs/{id}` | local | yes | one job: state, queue position, retry budget, publication, checkpoints, bill where a rate exists |
 | `POST /v1/local/jobs/{id}/cancel` | local | yes | request cancellation; a queued job leaves the queue, a running one gets its terminal |
+| `GET /{$}` | local | no | embedded localhost web UI entrypoint |
+| `GET /app.css` | local | no | embedded localhost web UI stylesheet |
+| `GET /app.js` | local | no | embedded localhost web UI script |
+
+Uploads are capped at 64 MiB, hashed while streaming, atomically published under their sha256,
+deduplicated, and served only by opaque `upl-<sha256>` id. The future browser flow will bind those
+ids into invocation assets; it will never send a host filesystem path.
 
 ### The job family is local
 
@@ -280,7 +290,8 @@ This host's chain, in order:
 2. **Host allowlist** — three exact spellings; a rebinding request carries the attacker's
    hostname and is refused before routing.
 3. **Origin check** on every mutation and every stream open.
-4. **Bearer auth**, no cookie read anywhere.
+4. **Bearer auth** on every state/byte API route; only embedded static assets are public. No cookie
+   is read anywhere.
 5. **No CORS headers at all**, and a strict CSP on every response.
 
 One credential is minted per controller launch and handed to the CLI through a 0600 file.

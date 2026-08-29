@@ -71,6 +71,7 @@ type Server struct {
 	creds        Credentials
 	addr         string
 	log          io.Writer
+	web          http.Handler
 	// endpoints resolves an endpoint ref to a spec the orchestrator can start. It is the
 	// LOCAL module's resolver; the pod profile (cl-014) supplies its own.
 	endpoints Resolver
@@ -79,15 +80,15 @@ type Server struct {
 	// credential and dial triple remain orchestrator-only and are obtained at dial time.
 	rentals func(id string) (*orchestrator.DesiredPlacement, *exit.Error)
 
-	// shutdown asks the process that owns this server to drain and exit — `cozy exit`'s
+	// shutdown asks the process that owns this server to drain and stop — `cozy down`'s
 	// cooperative tier (#449). The route refuses when the builder wired none.
 	shutdown func()
 
-	// lifecycle serializes ordinary mutations against the safe-exit fence. Once exit
+	// lifecycle serializes ordinary mutations against the safe-down fence. Once down
 	// commits, no request can slip in after the active-work read and before listeners
 	// close; mutations already in flight finish before the fence reads the records.
-	lifecycle sync.RWMutex
-	exiting   bool
+	lifecycle    sync.RWMutex
+	shuttingDown bool
 }
 
 // Resolver exposes control-plane placement facts separately from a local worker launch.
@@ -109,11 +110,12 @@ type Options struct {
 	Creds        Credentials
 	Addr         string
 	Log          io.Writer
+	Web          http.Handler
 	Endpoints    Resolver
 	// Rentals resolves an attached worker's exact non-secret placement; nil means this
 	// host attaches no remote workers.
 	Rentals func(id string) (*orchestrator.DesiredPlacement, *exit.Error)
-	// Shutdown is the cooperative-exit hook the shutdown route calls (#449).
+	// Shutdown is the cooperative-down hook the shutdown route calls (#449).
 	Shutdown func()
 }
 
@@ -125,7 +127,7 @@ func New(opt Options) *Server {
 	return &Server{
 		orchestrator: opt.Orchestrator, store: opt.Orchestrator.Store(),
 		layout: opt.Orchestrator.Layout(), cfg: opt.Cfg, creds: opt.Creds,
-		addr: opt.Addr, log: opt.Log, endpoints: opt.Endpoints,
+		addr: opt.Addr, log: opt.Log, web: opt.Web, endpoints: opt.Endpoints,
 		rentals: opt.Rentals, shutdown: opt.Shutdown,
 	}
 }
@@ -142,12 +144,17 @@ func (s *Server) Handler() (http.Handler, *exit.Error) {
 		"POST /v1/requests/{id}/cancel":            s.cancelRequest,
 		"GET /v1/requests/{id}/events":             s.requestEvents,
 		"GET /v1/media/{media_id}":                 s.media,
+		"POST /v1/uploads":                         s.putUpload,
+		"GET /v1/uploads/{upload_id}":              s.getUpload,
 		"POST /v1/local/rentals/{rental_id}/claim": s.claimRental,
 		"POST /v1/local/service/unload":            s.unload,
-		"POST /v1/local/service/exit":              s.exitService,
+		"POST /v1/local/service/down":              s.downService,
 		"POST /v1/local/jobs":                      s.submitJob,
 		"GET /v1/local/jobs/{id}":                  s.getJob,
 		"POST /v1/local/jobs/{id}/cancel":          s.cancelJob,
+		"GET /{$}":                                 s.webUI,
+		"GET /app.css":                             s.webUI,
+		"GET /app.js":                              s.webUI,
 	}
 	registered := map[string]bool{}
 	for _, r := range Routes {
@@ -195,7 +202,7 @@ func (s *Server) baseline(next http.Handler) http.Handler {
 		// and this keeps it true if a future URL ever carries one.
 		h.Set("Referrer-Policy", "no-referrer")
 		// Nothing an API response renders may load, connect, or execute anything. The stub
-		// page sets its own, slightly wider, policy (still no inline script).
+		// page replaces this with its own slightly wider policy (still no inline script).
 		h.Set("Content-Security-Policy",
 			"default-src 'none'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'")
 		// NO Access-Control-Allow-* header is set anywhere in this package, deliberately.
@@ -249,12 +256,12 @@ func (s *Server) guard(route Route, h http.HandlerFunc) http.Handler {
 				"one key names one request forever; retrying under it is safe by construction")
 			return
 		}
-		if route.Mutation && route.Path != "/v1/local/service/exit" {
+		if route.Mutation && route.Path != "/v1/local/service/down" {
 			s.lifecycle.RLock()
 			defer s.lifecycle.RUnlock()
-			if s.exiting {
-				s.refuse(w, r, http.StatusServiceUnavailable, "controller_exiting",
-					"the controller has accepted exit and no longer admits mutations",
+			if s.shuttingDown {
+				s.refuse(w, r, http.StatusServiceUnavailable, "controller_shutting_down",
+					"the controller has accepted shutdown and no longer admits mutations",
 					"wait for the service lock to become free")
 				return
 			}

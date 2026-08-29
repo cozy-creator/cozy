@@ -11,8 +11,9 @@ type CLI struct {
 	Model    ModelCmd    `cmd:"" group:"Resources" help:"Find, download, and publish models."`
 	Invoke   InvokeCmd   `cmd:"" group:"Work" help:"Run and manage endpoint invocations."`
 	Rental   RentalCmd   `cmd:"" group:"Work" help:"Manage private remote workers."`
+	Up       UpCmd       `cmd:"" group:"Lifecycle" help:"Start the Cozy controller and localhost UI."`
+	Down     DownCmd     `cmd:"" group:"Lifecycle" help:"Stop Cozy locally or tear everything down."`
 	Unload   UnloadCmd   `cmd:"" group:"Lifecycle" help:"Release idle local GPU memory."`
-	Exit     ExitCmd     `cmd:"" group:"Lifecycle" help:"Stop Cozy locally or tear everything down."`
 }
 
 type EndpointCmd struct {
@@ -233,13 +234,19 @@ func (c *RentalListCmd) Run(r *Runtime) error {
 type UnloadCmd struct{}
 
 func (c *UnloadCmd) Run(r *Runtime) error {
-	return r.call(handleUnload, nil, nil, nil, []string{"cozy exit"}, false)
+	return r.call(handleUnload, nil, nil, nil, []string{"cozy down"}, false)
 }
 
-type ExitCmd struct {
+type UpCmd struct{}
+
+func (c *UpCmd) Run(r *Runtime) error {
+	return r.call(handleUp, nil, nil, nil, []string{"cozy down"}, false)
+}
+
+type DownCmd struct {
 	All bool `help:"Cancel all work, end all rentals, then stop Cozy."`
 }
 
-func (c *ExitCmd) Run(r *Runtime) error {
-	return r.call(handleExit, nil, bools("--all", c.All), nil, nil, false)
+func (c *DownCmd) Run(r *Runtime) error {
+	return r.call(handleDown, nil, bools("--all", c.All), nil, nil, false)
 }

@@ -43,17 +43,24 @@ run -v
 check "-v reports the release tag without loading config" "$([ "$CODE" = 0 ] && [ "$OUT" = "$WANT_TAG" ] && echo 1 || echo 0)" "$OUT"
 
 run
-for command in "endpoint install" "model download" "invoke run" "rental new" "unload" "exit"; do
+for command in "endpoint install" "model download" "invoke run" "rental new" "up" "down" "unload"; do
   check "root help exposes $command" "$(printf '%s' "$OUT" | grep -q "$command" && echo 1 || echo 0)" "$OUT"
 done
 run help invoke run
 check "contextual Kong help works" "$([ "$CODE" = 0 ] && printf '%s' "$OUT" | grep -q 'Usage: cozy invoke run' && echo 1 || echo 0)" "$OUT"
 
-run up
-check "retired stack commands refuse instead of aliasing" "$([ "$CODE" = 2 ] && printf '%s' "$OUT" | grep -q 'cli.usage' && echo 1 || echo 0)" "$OUT"
+run exit
+check "retired exit command refuses instead of aliasing" "$([ "$CODE" = 2 ] && printf '%s' "$OUT" | grep -q 'cli.usage' && echo 1 || echo 0)" "$OUT"
+
+run up --json
+check "up backgrounds the controller and returns the web URL" "$([ "$CODE" = 0 ] && printf '%s' "$OUT" | grep -q '"kind":"up"' && printf '%s' "$OUT" | grep -q '"url":"http://127.0.0.1:' && echo 1 || echo 0)" "$OUT"
+check "up creates no persistent controller log" "$([ ! -e "$COZY_HOME/controller.log" ] && echo 1 || echo 0)" "$COZY_HOME/controller.log"
+
+run down
+check "down stops the explicit controller" "$([ "$CODE" = 0 ] && printf '%s' "$OUT" | grep -q 'controller: stopped' && echo 1 || echo 0)" "$OUT"
 
 run invoke list --json
-check "invoke auto-starts the hidden controller" "$([ "$CODE" = 0 ] && [ -f "$COZY_HOME/service.lock" ] && [ -f "$COZY_HOME/client.cred" ] && echo 1 || echo 0)" "$OUT"
+check "invoke can auto-start the same controller" "$([ "$CODE" = 0 ] && [ -f "$COZY_HOME/service.lock" ] && [ -f "$COZY_HOME/client.cred" ] && echo 1 || echo 0)" "$OUT"
 check "default JSON result is one successful document" "$(printf '%s' "$OUT" | grep -q '"ok":true' && echo 1 || echo 0)" "$OUT"
 
 run unload
@@ -68,8 +75,8 @@ if [ -n "$ENDPOINT" ] && [ -f "$ENDPOINT" ]; then
   check "one real endpoint invocation completes" "$([ "$CODE" = 0 ] && [ -s "$COZY_HOME/out/image.png" ] && echo 1 || echo 0)" "$OUT"
 fi
 
-run exit
-check "exit stops the controller and proves lock release" "$([ "$CODE" = 0 ] && printf '%s' "$OUT" | grep -q 'controller: stopped' && echo 1 || echo 0)" "$OUT"
+run down
+check "down stops the controller and proves lock release" "$([ "$CODE" = 0 ] && printf '%s' "$OUT" | grep -q 'controller: stopped' && echo 1 || echo 0)" "$OUT"
 
 if [ -n "$UPGRADE" ] && [ -f "$UPGRADE" ]; then
   BEFORE="$("$COZY" -v)"
