@@ -49,7 +49,6 @@ var handlers = map[string]Handler{
 	"endpoint.show":     handleEndpointShow,
 	"endpoint.create":   handleEndpointCreate,
 	"endpoint.publish":  handleEndpointPublish,
-	"endpoint.qualify":  handleEndpointQualify,
 	"endpoint.promote":  handleEndpointPromote,
 	"model.show":        handleModelShow,
 	"model.create":      handleModelCreate,

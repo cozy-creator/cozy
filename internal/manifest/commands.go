@@ -680,8 +680,8 @@ var Commands = []Command{
 		Exits:      []exit.Code{exit.OK, exit.NotFound, exit.Unavailable},
 		Capability: "cmd.model.export", NeedsServer: true, Status: Planned, Issue: "cl-008",
 	},
-	// Endpoint publication, paid profile qualification, and atomic serving promotion
-	// are three explicit acts. None invokes either of the other two.
+	// Endpoint publication proves profile eligibility; serving promotion remains
+	// a separate explicit pointer act.
 	{
 		Path: []string{"endpoint", "publish"}, Group: "transfer",
 		Summary: "publish one source release and frozen profile candidate set",
@@ -696,25 +696,8 @@ var Commands = []Command{
 		},
 		Exits:      []exit.Code{exit.OK, exit.Usage, exit.Validation, exit.NotFound, exit.Credential, exit.Structural, exit.Unavailable, exit.Deadline, exit.Failed, exit.Conflict},
 		Capability: "cmd.endpoint.publish", Status: Implemented, Handler: "endpoint.publish",
-		Next:     []string{"cozy endpoint qualify <org/endpoint>@<release> --profile <profile> --gpu <model> --max-cost <usd> --reason <why>", "cozy endpoint promote <org/endpoint> <release> --serve <vN/function> --reason <why>"},
-		Examples: []string{"cozy endpoint publish org/endpoint --release 1.0.0 --profile torch2.13.0-cu130-cp312-linux-x86 --reason <why>", "cozy endpoint publish org/endpoint --release 1.0.0 --profile torch2.13.0-cu126-cp312-linux-x86 --custom-wheel torch2.13.0-cu126-cp312-linux-x86=./dist/custom.whl --reason <why>"},
-	},
-	{
-		Path: []string{"endpoint", "qualify"}, Group: "transfer",
-		Summary: "explicitly run one endpoint profile on paid compatible hardware",
-		Args:    "<org/endpoint>@<release>", MinArgs: 1, MaxArgs: 1,
-		Flags: []Flag{
-			{Name: "--profile", Arg: "<profile>", Summary: "required exact candidate profile"},
-			{Name: "--gpu", Arg: "<model>", Summary: "required provider-neutral accelerator model"},
-			{Name: "--max-cost", Arg: "<usd>", Summary: "required provider exposure ceiling in USD"},
-			{Name: "--duration", Arg: "<duration>", Summary: "qualification lease cap", Default: "15m"},
-			{Name: "--timeout", Arg: "<duration>", Summary: "optional caller wait deadline; does not alter the paid lease"},
-			{Name: "--reason", Arg: "<why>", Summary: "required; recorded before paid acquisition"},
-		},
-		Exits:      []exit.Code{exit.OK, exit.Usage, exit.Validation, exit.NotFound, exit.Credential, exit.Unavailable, exit.Deadline, exit.Failed, exit.Conflict, exit.Capacity},
-		Capability: "cmd.endpoint.qualify", Status: Implemented, Handler: "endpoint.qualify",
 		Next:     []string{"cozy endpoint promote <org/endpoint> <release> --serve <vN/function> --reason <why>"},
-		Examples: []string{"cozy endpoint qualify org/endpoint@1.0.0 --profile torch2.13.0-cu130-cp312-linux-x86 --gpu 'NVIDIA GeForce RTX 4090' --max-cost 0.25 --reason <why>"},
+		Examples: []string{"cozy endpoint publish org/endpoint --release 1.0.0 --profile torch2.13.0-cu130-cp312-linux-x86 --reason <why>", "cozy endpoint publish org/endpoint --release 1.0.0 --profile torch2.13.0-cu126-cp312-linux-x86 --custom-wheel torch2.13.0-cu126-cp312-linux-x86=./dist/custom.whl --reason <why>"},
 	},
 	{
 		Path: []string{"endpoint", "promote"}, Group: "transfer",

@@ -81,21 +81,14 @@ digest, and length. It never repairs, renames, retags, or builds a supplied whee
 build files, `.pth` injection, base-distribution collisions, and native bytes inside the project
 wheel refuse.
 
-## Qualification and promotion
+## Eligibility and promotion
 
-Hardware qualification is explicit and cost bounded:
+Publication proof owns OCI profile eligibility; no paid per-release qualification command or
+background provider operation exists. Native custom-wheel profiles remain ineligible until a
+future need-driven operator smoke gate exists.
 
-```sh
-cozy endpoint qualify org/endpoint@1.0.0 \
-  --profile torch2.13.0-cu130-cp312-linux-x86 \
-  --gpu "NVIDIA GeForce RTX 4090" \
-  --max-cost 0.25 \
-  --duration 15m \
-  --reason "qualify release candidate"
-```
-
-Serving promotion is another explicit atomic act. Each target is `vN/function`; a bare major is
-never expanded or guessed:
+Serving promotion is a separate explicit atomic act. Each target is `vN/function`; a bare major
+is never expanded or guessed:
 
 ```sh
 cozy endpoint promote org/endpoint 1.0.0 \
@@ -105,7 +98,7 @@ cozy endpoint promote org/endpoint 1.0.0 \
 
 ## Independently qualified local install
 
-Local execution never borrows the paid OCI qualification. Tensorhub leases
+Local execution never borrows OCI eligibility. Tensorhub leases
 `local-qualification-materials` only for a non-refused CPU/meta candidate with an exact registered
 managed base; those bytes are inputs to Creator's independent local proof, not an execution grant:
 

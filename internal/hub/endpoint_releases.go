@@ -84,49 +84,8 @@ func (c *Client) FinalizeEndpointRelease(ctx context.Context, ref Ref, release s
 	return out, e
 }
 
-type EndpointQualificationRequest struct {
-	AcceleratorModel               string `json:"accelerator_model"`
-	ProviderExposureLimitUSDMicros int64  `json:"provider_exposure_limit_usd_micros"`
-	DurationCapSeconds             int64  `json:"duration_cap_s"`
-}
-
-type EndpointQualification struct {
-	QualificationID                string `json:"qualification_id"`
-	CandidateID                    string `json:"candidate_id"`
-	State                          string `json:"state"`
-	AcceleratorModel               string `json:"accelerator_model"`
-	ProviderExposureLimitUSDMicros int64  `json:"provider_exposure_limit_usd_micros"`
-	DurationCapSeconds             int64  `json:"duration_cap_s"`
-	ProviderResourceID             string `json:"provider_resource_id,omitempty"`
-	ObservedCostUSDMicros          int64  `json:"observed_cost_usd_micros,omitempty"`
-	ModelQualificationSpecDigest   string `json:"model_qualification_spec_digest"`
-	ExecutionObservationDigest     string `json:"execution_observation_digest,omitempty"`
-	ModelAdmissionDecisionDigest   string `json:"model_admission_decision_digest,omitempty"`
-	ReclaimProven                  bool   `json:"reclaim_proven"`
-}
-
 func endpointProfilePath(ref Ref, release, profile string) string {
 	return endpointReleasePath(ref, release) + "/profiles/" + url.PathEscape(profile)
-}
-
-func (c *Client) QualifyEndpointProfile(ctx context.Context, ref Ref, release, profile string,
-	request EndpointQualificationRequest, reason string,
-) (EndpointQualification, *exit.Error) {
-	var out EndpointQualification
-	e := c.do(ctx, call{method: http.MethodPost,
-		path:  endpointProfilePath(ref, release, profile) + "/qualify",
-		admin: true, reason: reason, body: request, byBytes: true, patient: true}, &out)
-	return out, e
-}
-
-func (c *Client) EndpointProfileQualification(ctx context.Context, ref Ref, release,
-	profile string,
-) (EndpointQualification, *exit.Error) {
-	var out EndpointQualification
-	e := c.do(ctx, call{method: http.MethodGet,
-		path:  endpointProfilePath(ref, release, profile) + "/qualification",
-		admin: true, byBytes: true}, &out)
-	return out, e
 }
 
 type ServingTarget struct {

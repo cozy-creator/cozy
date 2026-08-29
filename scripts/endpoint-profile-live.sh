@@ -13,7 +13,6 @@ unset TENSORHUB_REPO TENSORHUB_SHA
 TFS_BIN="${TFS_BIN:-$HOME/cozy_v2/tensorfs/target/release/tfs}"
 RUNTIME_VENV="${COZY_RUNTIME_VENV:-$HOME/cozy_v2/.worktrees/cozy-runtime/cr-052-profile-overlay-parity/.venv}"
 unset COZY_RUNTIME_VENV
-RUN_PAID="${RUN_PAID:-0}"
 EXPECTED_PROFILE_STATE="${EXPECTED_PROFILE_STATE:-candidate}"
 MANAGED_BASE_IS_EXACT="${MANAGED_BASE_IS_EXACT:-0}"
 WORK="${WORK:-$(mktemp -d)}"
@@ -80,12 +79,6 @@ for domain in repo_cas dataset_cas endpoint_source user_media; do
   printf '%s' "$S3_ACCESS" >"$WORK/secrets/storage.$domain.access_key_id"
   printf '%s' "$S3_SECRET" >"$WORK/secrets/storage.$domain.secret_access_key"
 done
-if [ "$RUN_PAID" = 1 ]; then
-  : "${RUNPOD_API_KEY:?RUN_PAID=1 requires RUNPOD_API_KEY}"
-  : "${RUNPOD_CONTAINER_REGISTRY_AUTH_ID:?RUN_PAID=1 requires registry auth id}"
-  printf '%s' "$RUNPOD_API_KEY" >"$WORK/secrets/provider.runpod.api_key"
-  printf '%s' "$RUNPOD_CONTAINER_REGISTRY_AUTH_ID" >"$WORK/secrets/provider.runpod.container_registry_auth_id"
-fi
 cat >"$WORK/config.yaml" <<YAML
 env: {name: development}
 server: {host: 127.0.0.1, http_port: $API_PORT}
@@ -119,8 +112,8 @@ done
 # receipt-addressed files under Creator's fixed local registry. In refused-mode
 # this is only a deterministic gate fixture. Candidate proof requires the caller
 # to attest that RUNTIME_VENV is the exact WHM base, never a torch-free source venv.
-if [ "$EXPECTED_PROFILE_STATE" = candidate ] && [ "$MANAGED_BASE_IS_EXACT" != 1 ]; then
-  echo "candidate proof requires MANAGED_BASE_IS_EXACT=1 and an exact WHM Runtime/base venv" >&2
+if [ "$EXPECTED_PROFILE_STATE" != refused ] && [ "$MANAGED_BASE_IS_EXACT" != 1 ]; then
+  echo "non-refused proof requires MANAGED_BASE_IS_EXACT=1 and an exact WHM Runtime/base venv" >&2
   exit 2
 fi
 python3 - "$RUNTIME_VENV" "$WORK/home" "$PROFILE_B" \
@@ -217,14 +210,10 @@ test "$native_rc" = 3
 grep -q 'endpoint_source_native_input' "$WORK/native.out"
 
 admin=(-H "Authorization: Bearer $ADMIN_TOKEN" -H 'X-Tensorhub-Reason: Creator profile gating proof')
-status=$(curl -sS -o "$WORK/qualification-before.json" -w '%{http_code}' \
-  "$BASE/v1/endpoints/proof/marco/releases/live-1/profiles/$PROFILE_B/qualification" "${admin[@]}")
-test "$status" = 404
-grep -q 'endpoint_profile.qualification_absent' "$WORK/qualification-before.json"
 status=$(curl -sS -o "$WORK/local-before.json" -w '%{http_code}' -X POST \
   "$BASE/v1/endpoints/proof/marco/releases/live-1/profiles/$PROFILE_B/local-qualification-materials" \
   "${admin[@]}" -H 'Content-Type: application/json' -d '{"grant_ttl_seconds":600}')
-if [ "$EXPECTED_PROFILE_STATE" = candidate ]; then
+if [ "$EXPECTED_PROFILE_STATE" != refused ]; then
   test "$status" = 200
   grep -q 'managed-local' "$WORK/local-before.json"
   grep -q 'lease_id' "$WORK/local-before.json"
@@ -232,21 +221,16 @@ else
   test "$status" = 409
   grep -q 'endpoint_local.candidate_refused' "$WORK/local-before.json"
 fi
-set +e
-"$WORK/cozy" endpoint promote proof/marco live-1 --serve v1/marco --reason "prequalification gate" \
-  >"$WORK/promote-before.out" 2>&1
-promote_rc=$?
-set -e
-test "$promote_rc" = 13
-
-if [ "$RUN_PAID" = 1 ]; then
-  "$WORK/cozy" endpoint qualify proof/marco@live-1 --profile "$PROFILE_B" \
-    --gpu "${QUALIFICATION_GPU:-NVIDIA GeForce RTX 4090}" \
-    --max-cost "${QUALIFICATION_MAX_COST:-0.25}" --duration "${QUALIFICATION_DURATION:-15m}" \
-    --reason "paid Creator endpoint qualification" | tee "$WORK/qualify.out"
-  grep -q 'qualified' "$WORK/qualify.out"
+if [ "$EXPECTED_PROFILE_STATE" = qualified ]; then
   "$WORK/cozy" endpoint promote proof/marco live-1 --serve v1/marco \
-    --reason "qualified Creator endpoint promotion" >"$WORK/promote.out"
+    --reason "publication-proof-qualified endpoint promotion" >"$WORK/promote.out"
+else
+  set +e
+  "$WORK/cozy" endpoint promote proof/marco live-1 --serve v1/marco --reason "prequalification gate" \
+    >"$WORK/promote-before.out" 2>&1
+  promote_rc=$?
+  set -e
+  test "$promote_rc" = 13
 fi
 
-echo "endpoint-profile-live: PASS — publish/replay, two profiles, native refusal, qualification absence, local materials/refusal, promote gate (paid=$RUN_PAID)"
+echo "endpoint-profile-live: PASS — publish/replay, two profiles, native refusal, local materials/refusal, promotion gate"

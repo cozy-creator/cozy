@@ -204,7 +204,7 @@ default. Exact replay sends the same canonical declaration and lets Tensorhub re
 same pending/committed result; Creator keeps no publication journal.
 
 `endpoint.release.json` is required and contains a non-empty sorted compatible-accelerator-model
-set. Even a weightless endpoint fixes that set because later qualification may prove only an
+set. Even a weightless endpoint fixes that set because publication may qualify only an
 already-authored execution identity; it cannot mutate release compatibility. The file also carries
 exact `{org,name,checkpoint_id}` model roots,
 and complete path-free model bindings: binding path, checkpoint, exact config document/
@@ -218,14 +218,13 @@ wheels, aggregated by exact digest, and uploaded only under Tensorhub-requested
 `custom_wheel:<distribution>:<digest>` roles. Creator runs no backend/compiler, embeds no
 custom wheel into the project wheel, and never repairs, renames, or retags one.
 
-`cozy endpoint qualify <org/name>@<release> --profile ... --gpu ... --max-cost ...`
-is the separate cost-bounded hardware act. Publication never rents implicitly.
 `cozy endpoint promote <org/name> <release> --serve <vN/function> ...` atomically moves
-one or more explicit qualified serving pointers; a bare major has no guessed function.
+one or more serving pointers for profiles made eligible by publication proof; a bare major has no
+guessed function. Publication never rents implicitly.
 `datasets push|pull` waits on th-035.
 
 See [docs/endpoint-publication.md](docs/endpoint-publication.md) for the release file, custom-wheel,
-qualification, promotion, and qualified managed-local install contracts.
+eligibility, promotion, and independently proved managed-local install contracts.
 
 ## Tensorhub catalog and models
 
