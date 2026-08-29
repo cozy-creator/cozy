@@ -1,5 +1,5 @@
-owner: /root
-purpose: remove caller-authored reason from package publication
-branch: codex/remove-package-publish-reason
-base: 9260f01d9408cc20c4d5e280b98e8d640c551bdc
+owner: /root/implement_creator_email_auth
+purpose: implement minimal email-enrolled Creator machine-key authentication
+branch: codex/email-auth
+base: 8718549e5e4d47278ab75fb429a8df14fa24303d
 started: 2026-08-29
