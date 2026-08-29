@@ -100,13 +100,12 @@ object = "marco_polo:app"
 	}
 }
 
-func TestEndpointPublishPackage(t *testing.T) {
+func TestEndpointPublishSourceRefusals(t *testing.T) {
 	repo := t.TempDir()
 	mustWrite(t, filepath.Join(repo, "pyproject.toml"), `[project]
 name = "marco-polo"
 version = "1.0.0"
-requires-python = ">=3.12,<3.13"
-dependencies = ["torch>=2.13,<2.14", "cozy-runtime==2.0.0"]
+dependencies = []
 `)
 	mustWrite(t, filepath.Join(repo, "endpoint.toml"), `[application]
 object = "marco_polo:app"
@@ -118,50 +117,7 @@ object = "marco_polo:app"
 	git(t, repo, "config", "user.name", "Fixture")
 	git(t, repo, "add", ".")
 	git(t, repo, "commit", "-qm", "fixture")
-
-	weightlessDescriptor := `{"application":"marco_polo:app","entrypoints":[],"format":"cozy.endpoint.descriptor/1","jobs":[]}`
-	request := endpointpublish.Request{Tree: repo, Release: "1.0.0",
-		Runtime: fakeDescriptorRuntime(t, weightlessDescriptor)}
-	a, problem := endpointpublish.Prepare(request)
-	if problem != nil {
-		t.Fatalf("first package refused: %s", problem)
-	}
-	defer a.Close()
-	if a.Declaration.Format != "tensorhub.endpoint_release_declaration/1" {
-		t.Fatalf("weightless declaration format is wrong: %+v", a.Declaration)
-	}
-	request.Release = "prod_2026-08-28.a" // release grammar is opaque, never a wheel version
-	b, problem := endpointpublish.Prepare(request)
-	if problem != nil {
-		t.Fatalf("second package refused: %s", problem)
-	}
-	defer b.Close()
-	aBytes, _ := a.Declaration.CanonicalBytes()
-	bBytes, _ := b.Declaration.CanonicalBytes()
-	if !bytes.Equal(aBytes, bBytes) || a.Declaration.SourceArchive != b.Declaration.SourceArchive ||
-		a.Declaration.ProjectWheel.Digest != b.Declaration.ProjectWheel.Digest {
-		t.Fatalf("same committed tree did not reproduce\n%s\n%s", aBytes, bBytes)
-	}
-	if len(a.Files) != 4 {
-		t.Fatalf("incomplete declaration or upload role set: %+v files=%v", a.Declaration, a.Files)
-	}
-	for _, retired := range []string{"profiles", "custom_wheels", "evaluated_config", "compatible_accelerator_models", "model_roots", "model_bindings", "native_wheel_proof"} {
-		if bytes.Contains(aBytes, []byte(`"`+retired+`"`)) {
-			t.Fatalf("retired declaration field %q remains in %s", retired, aBytes)
-		}
-	}
-	if metadata := wheelMetadata(t, a.Files["project_wheel"]); !strings.Contains(metadata, "Requires-Python: >=3.12,<3.13") ||
-		!strings.Contains(metadata, "Requires-Dist: torch>=2.13,<2.14") ||
-		!strings.Contains(metadata, "Requires-Dist: cozy-runtime==2.0.0") {
-		t.Fatalf("project metadata did not carry declared compatibility requirements:\n%s", metadata)
-	}
-
-	request.Runtime = fakeDescriptorRuntime(t,
-		`{"application":"marco_polo:app","entrypoints":[{"models":[{"class":"Model","component_use":{},"path":"marco.models.model","stamps":{}}],"name":"marco","request":{"fields":[]},"result":{"fields":[]}}],"format":"cozy.endpoint.descriptor/1","jobs":[]}`)
-	if _, problem := endpointpublish.Prepare(request); problem == nil || problem.ErrName() != "endpoint_model_binding_deferred" {
-		t.Fatalf("model-bearing publication did not report its explicit deferral: %v", problem)
-	}
-	request.Runtime = fakeDescriptorRuntime(t, weightlessDescriptor)
+	request := endpointpublish.Request{Tree: repo, Release: "1.0.0"}
 	mustWrite(t, filepath.Join(repo, "endpoint.release.json"), `{}`)
 	git(t, repo, "add", ".")
 	git(t, repo, "commit", "-qm", "plant retired metadata")
@@ -171,7 +127,7 @@ object = "marco_polo:app"
 	must(t, os.Remove(filepath.Join(repo, "endpoint.release.json")))
 	git(t, repo, "add", "-u")
 	git(t, repo, "commit", "-qm", "remove retired metadata")
-	mustWrite(t, filepath.Join(repo, "endpoint.descriptor.json"), weightlessDescriptor)
+	mustWrite(t, filepath.Join(repo, "endpoint.descriptor.json"), `{}`)
 	git(t, repo, "add", "endpoint.descriptor.json")
 	git(t, repo, "commit", "-qm", "plant retired descriptor")
 	if _, problem := endpointpublish.Prepare(request); problem == nil || problem.ErrName() != "endpoint_metadata_retired" {
@@ -192,17 +148,6 @@ object = "marco_polo:app"
 	if _, problem := endpointpublish.Prepare(request); problem == nil || problem.ErrName() != "endpoint_source_native_input" {
 		t.Fatalf("committed native source did not refuse before packaging: %v", problem)
 	}
-}
-
-func TestEndpointPublicationNeedsNoPublisherProfile(t *testing.T) {
-	repo := trackedEndpointFixture(t)
-	pack, problem := endpointpublish.Prepare(endpointpublish.Request{Tree: repo, Release: "weightless",
-		Runtime: fakeDescriptorRuntime(t,
-			`{"application":"marco_polo:app","entrypoints":[],"format":"cozy.endpoint.descriptor/1","jobs":[]}`)})
-	if problem != nil {
-		t.Fatalf("weightless pure-Python publication required publisher compatibility input: %v", problem)
-	}
-	defer pack.Close()
 }
 
 func TestEndpointPublishDerivesDescriptorWithLockedRuntime(t *testing.T) {
@@ -231,19 +176,29 @@ func TestEndpointPublishDerivesDescriptorWithLockedRuntime(t *testing.T) {
 		t.Fatalf("real locked Runtime derivation refused: %s", problem.Message)
 	}
 	defer pack.Close()
+	replay, problem := endpointpublish.Prepare(endpointpublish.Request{Tree: fixture, Release: "opaque-release-id"})
+	if problem != nil {
+		t.Fatalf("real locked Runtime replay refused: %s", problem.Message)
+	}
+	defer replay.Close()
+	declaration, _ := pack.Declaration.CanonicalBytes()
+	replayed, _ := replay.Declaration.CanonicalBytes()
+	if !bytes.Equal(declaration, replayed) || len(pack.Files) != 4 {
+		t.Fatalf("same source did not reproduce its four-role declaration:\n%s\n%s", declaration, replayed)
+	}
+	for _, retired := range []string{"profiles", "custom_wheels", "evaluated_config", "compatible_accelerator_models", "model_roots", "model_bindings", "native_wheel_proof"} {
+		if bytes.Contains(declaration, []byte(`"`+retired+`"`)) {
+			t.Fatalf("retired declaration field %q remains in %s", retired, declaration)
+		}
+	}
+	if metadata := wheelMetadata(t, pack.Files["project_wheel"]); !strings.Contains(metadata, "Requires-Dist: cozy-runtime==0.0.3") {
+		t.Fatalf("project wheel lost its Runtime compatibility requirement:\n%s", metadata)
+	}
 	descriptor, problem := launch.DecodeDescriptor(mustRead(t, pack.Files["descriptor"]))
 	fatal(t, problem)
 	if _, problem := descriptor.Function("marco"); problem != nil {
 		t.Fatalf("derived Marco descriptor has no marco function: %s", problem.Message)
 	}
-}
-
-func fakeDescriptorRuntime(t *testing.T, descriptor string) string {
-	t.Helper()
-	file := filepath.Join(t.TempDir(), "cozy-runtime") //cozy:allow independent Runtime descriptor fixture
-	mustWrite(t, file, "#!/bin/sh\nprintf '%s\\n' '"+strings.ReplaceAll(descriptor, "'", "'\"'\"'")+"'\n")
-	must(t, os.Chmod(file, 0o755))
-	return file
 }
 
 func mustWrite(t *testing.T, path, body string) {

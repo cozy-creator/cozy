@@ -60,9 +60,6 @@ func (p *Package) Close() { _ = os.RemoveAll(p.Root) }
 type Request struct {
 	Tree    string
 	Release string
-	// Runtime is an exact cozy-runtime binary used by hermetic callers. The product
-	// leaves it empty and runs the project runtime through uv's locked environment.
-	Runtime string
 }
 
 // Prepare requires a clean committed source subtree, deterministically packs its
@@ -99,7 +96,7 @@ func Prepare(req Request) (*Package, *exit.Error) {
 	if e != nil {
 		return fail(e)
 	}
-	descriptor, e := deriveDescriptor(tree, root, req.Runtime)
+	descriptor, e := deriveDescriptor(tree, root)
 	if e != nil {
 		return fail(e)
 	}
@@ -256,37 +253,35 @@ func auditSource(root string, files []string) *exit.Error {
 	return nil
 }
 
-func deriveDescriptor(tree, root, runtime string) (string, *exit.Error) {
+func deriveDescriptor(tree, root string) (string, *exit.Error) {
 	output := filepath.Join(root, DescriptorName)
 	environment := filepath.Join(root, "descriptor-venv")
 	toolEnv := config.Frozen().Tool(
 		"UV_PROJECT_ENVIRONMENT="+environment,
 		"UV_LINK_MODE=hardlink",
 	)
-	if runtime == "" {
-		sync := exec.Command("uv", "sync", "--locked", "--no-progress", "--no-install-project",
-			"--project", tree)
-		sync.Env = toolEnv
-		var stderr bytes.Buffer
-		sync.Stdout, sync.Stderr = io.Discard, &stderr
-		err := sync.Run()
-		if sync.ProcessState == nil {
-			return "", exit.Named(exit.Structural, "endpoint_descriptor_environment_missing",
-				"cannot run uv for the endpoint's locked environment: %v", err)
-		}
-		if sync.ProcessState.ExitCode() != 0 {
-			return "", exit.Named(exit.Structural, "endpoint_descriptor_environment_refused",
-				"uv sync --locked --no-install-project refused: %s",
-				strings.Join(strings.Fields(stderr.String()), " ")).
-				WithRemedy("make pyproject.toml and uv.lock an exact portable dependency closure")
-		}
-		runtime = home.VenvTool(environment, "cozy-runtime")
+	sync := exec.Command("uv", "sync", "--locked", "--no-progress", "--no-install-project",
+		"--project", tree)
+	sync.Env = toolEnv
+	var syncStderr bytes.Buffer
+	sync.Stdout, sync.Stderr = io.Discard, &syncStderr
+	err := sync.Run()
+	if sync.ProcessState == nil {
+		return "", exit.Named(exit.Structural, "endpoint_descriptor_environment_missing",
+			"cannot run uv for the endpoint's locked environment: %v", err)
 	}
+	if sync.ProcessState.ExitCode() != 0 {
+		return "", exit.Named(exit.Structural, "endpoint_descriptor_environment_refused",
+			"uv sync --locked --no-install-project refused: %s",
+			strings.Join(strings.Fields(syncStderr.String()), " ")).
+			WithRemedy("make pyproject.toml and uv.lock an exact portable dependency closure")
+	}
+	runtime := home.VenvTool(environment, "cozy-runtime")
 	cmd := exec.Command(runtime, "--json", "--dir", tree, "describe")
 	cmd.Env = toolEnv
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout, cmd.Stderr = &stdout, &stderr
-	err := cmd.Run()
+	err = cmd.Run()
 	if cmd.ProcessState == nil {
 		return "", exit.Named(exit.Structural, "endpoint_descriptor_runtime_missing",
 			"cannot run the endpoint's locked cozy-runtime: %v", err).
