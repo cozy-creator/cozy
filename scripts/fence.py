@@ -550,6 +550,12 @@ def check_manifest():
     for retired in ("StackCmd", "ExitCmd", "WorkflowCmd", "VideoCmd", "JobCmd", "CommandsCmd", "StatusCmd"):
         if retired in source:
             bad.append(f"[grammar] retired command family remains: {retired}")
+    publish = source.split("type PackagePublishCmd struct", 1)[-1].split("type ModelCmd", 1)[0]
+    if "Reason" in publish or '"--reason"' in publish:
+        bad.append("[grammar] package publish retained caller-authored audit prose; decision #662 derives it")
+    handler = pathlib.Path("internal/cli/package_releases.go").read_text()
+    if '"cozy package publish " + ref.String() + "@" + release' not in handler:
+        bad.append("[grammar] package publish no longer derives its internal audit reason from the exact release")
     app = pathlib.Path("internal/cli/app.go").read_text()
     for spelling in VERSION_SPELLINGS:
         if spelling not in app:
