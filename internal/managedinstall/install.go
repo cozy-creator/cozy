@@ -15,6 +15,7 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"time"
 
 	"github.com/cozy-creator/cozy-creator/internal/canonical"
 	"github.com/cozy-creator/cozy-creator/internal/config"
@@ -75,6 +76,12 @@ func Run(ctx context.Context, layout home.Layout, store *records.Store, request 
 		grant.LeaseID == "" || grant.LeaseExpiresAt == "" {
 		return nil, exit.Named(exit.Structural, "managed_install_grant_invalid",
 			"Tensorhub returned an incomplete or non-managed-local execution grant")
+	}
+	leaseExpiry, err := time.Parse(time.RFC3339, grant.LeaseExpiresAt)
+	if err != nil || !leaseExpiry.After(time.Now()) {
+		return nil, exit.Named(exit.Conflict, "managed_install_lease_expired",
+			"managed-local execution lease %s is absent, malformed, or expired", grant.LeaseID).
+			WithRemedy("request a fresh local-execution grant for the same qualified candidate")
 	}
 	profiles, problem := endpointprofile.NormalizeSet([]string{request.Profile})
 	if problem != nil {

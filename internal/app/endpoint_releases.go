@@ -166,7 +166,7 @@ func uploadEndpointRoles(ctx context.Context, pack *endpointpublish.Package,
 		go func(upload hub.EndpointUpload, local localRole) {
 			defer group.Done()
 			moved, problem := transfer.UploadPresigned(ctx, upload.Role, local.path,
-				upload.URL, local.ref.Length, upload.RequiredHeaders)
+				upload.URL, local.ref.Digest, local.ref.Length, upload.RequiredHeaders)
 			result := outcome{role: upload.Role, err: problem}
 			if moved {
 				result.moved = local.ref.Length
@@ -228,6 +228,15 @@ func handleEndpointQualify(ctx *Context) *exit.Error {
 	}
 	c := client(ctx)
 	hctx, cancel := hub.LongContext()
+	if timeoutText := strings.TrimSpace(ctx.Inv.Value("--timeout")); timeoutText != "" {
+		timeout, err := time.ParseDuration(timeoutText)
+		if err != nil || timeout <= 0 {
+			cancel()
+			return exit.Usagef("--timeout %q is not a positive duration", timeoutText)
+		}
+		cancel()
+		hctx, cancel = context.WithTimeout(context.Background(), timeout)
+	}
 	defer cancel()
 	qualified, problem := c.QualifyEndpointProfile(hctx, ref, release, profiles[0],
 		hub.EndpointQualificationRequest{AcceleratorModel: gpu,
@@ -238,7 +247,66 @@ func handleEndpointQualify(ctx *Context) *exit.Error {
 	if qualified.CandidateID == "" || qualified.QualificationID == "" || qualified.State == "" {
 		return exit.Internalf("endpoint qualification returned no candidate, qualification id, or state")
 	}
+	qualified, problem = waitQualification(ctx, hctx, c, ref, release, profiles[0], qualified)
+	if problem != nil {
+		return problem
+	}
 	return emit(ctx, qualificationRecord(c.Base(), ref, release, profiles[0], qualified))
+}
+
+func waitQualification(ctx *Context, hctx context.Context, c *hub.Client, ref hub.Ref,
+	release, profile string, current hub.EndpointQualification,
+) (hub.EndpointQualification, *exit.Error) {
+	priorState := ""
+	for {
+		terminal := false
+		switch current.State {
+		case "pending", "acquiring", "booting", "running":
+			if current.ReclaimProven {
+				return current, exit.Internalf("transient qualification state %q incorrectly claims provider reclaim proof", current.State)
+			}
+		case "qualified", "refused", "failed", "canceled":
+			if !current.ReclaimProven {
+				return current, exit.Internalf("terminal qualification state %q arrived before provider reclaim proof", current.State)
+			}
+			terminal = true
+		default:
+			return current, exit.Internalf("Tensorhub returned unknown qualification state %q", current.State)
+		}
+		if terminal {
+			break
+		}
+		if current.State != priorState {
+			fmt.Fprintf(ctx.Err, "  qualification %s: %s (reclaimed=%t)\n",
+				current.QualificationID, current.State, current.ReclaimProven)
+			priorState = current.State
+		}
+		select {
+		case <-hctx.Done():
+			return current, exit.Named(exit.Deadline, "endpoint.qualification_wait_deadline",
+				"qualification %s is %s; the caller wait ended before terminal reclaim proof",
+				current.QualificationID, current.State).
+				WithRemedy("the paid operation remains Tensorhub-owned; re-run the exact qualify command to continue observing it")
+		case <-time.After(2 * time.Second):
+		}
+		next, problem := c.EndpointProfileQualification(hctx, ref, release, profile)
+		if problem != nil {
+			return current, problem
+		}
+		if current.QualificationID != "" && (next.QualificationID != current.QualificationID ||
+			next.CandidateID != current.CandidateID) {
+			return current, exit.Internalf("qualification read changed operation or candidate identity")
+		}
+		current = next
+	}
+	if current.State != "qualified" {
+		return current, exit.Named(exit.Failed, "endpoint.qualification_"+current.State,
+			"qualification %s ended %s after %s; cost %s; reclaimed=%t",
+			current.QualificationID, current.State, current.AcceleratorModel,
+			microUSD(current.ObservedCostUSDMicros), current.ReclaimProven).
+			WithRemedy("inspect the banked admission/observation digests, repair the release/profile, and submit a new explicit qualification")
+	}
+	return current, nil
 }
 
 func qualificationRecord(base string, ref hub.Ref, release, profile string,

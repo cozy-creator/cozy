@@ -102,7 +102,7 @@ CREATE TABLE IF NOT EXISTS pins (
   PRIMARY KEY (endpoint, major)
 )`, `
 CREATE TABLE IF NOT EXISTS managed_profile_installs (
-  install_id                    TEXT PRIMARY KEY REFERENCES install_generations(id),
+  install_id                    TEXT PRIMARY KEY REFERENCES install_generations(id) ON DELETE CASCADE,
   release_id                   TEXT NOT NULL,
   profile                      TEXT NOT NULL,
   candidate_id                 TEXT NOT NULL,

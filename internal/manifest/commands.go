@@ -708,6 +708,7 @@ var Commands = []Command{
 			{Name: "--gpu", Arg: "<model>", Summary: "required provider-neutral accelerator model"},
 			{Name: "--max-cost", Arg: "<usd>", Summary: "required provider exposure ceiling in USD"},
 			{Name: "--duration", Arg: "<duration>", Summary: "qualification lease cap", Default: "15m"},
+			{Name: "--timeout", Arg: "<duration>", Summary: "optional caller wait deadline; does not alter the paid lease"},
 			{Name: "--reason", Arg: "<why>", Summary: "required; recorded before paid acquisition"},
 		},
 		Exits:      []exit.Code{exit.OK, exit.Usage, exit.Validation, exit.NotFound, exit.Credential, exit.Unavailable, exit.Deadline, exit.Failed, exit.Conflict, exit.Capacity},

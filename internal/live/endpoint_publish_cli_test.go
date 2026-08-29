@@ -25,7 +25,7 @@ func TestEndpointPublishQualifyPromoteCLI(t *testing.T) {
 	var declaration []byte
 	var declared endpointpublish.Declaration
 	put := map[string][]byte{}
-	beginCount, finalizeCount := 0, 0
+	beginCount, finalizeCount, qualificationReads := 0, 0, 0
 	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		if r.Method != http.MethodPut && r.Header.Get("Authorization") != "Bearer admin" {
@@ -108,7 +108,17 @@ func TestEndpointPublishQualifyPromoteCLI(t *testing.T) {
 			}
 			_ = json.NewEncoder(w).Encode(map[string]any{
 				"qualification_id": "qualification-1", "candidate_id": "candidate-130",
-				"state": "qualified", "accelerator_model": body["accelerator_model"],
+				"state": "acquiring", "accelerator_model": body["accelerator_model"],
+				"provider_exposure_limit_usd_micros": 250000, "duration_cap_s": 900,
+				"model_qualification_spec_digest": "sha256:" + strings.Repeat("4", 64),
+				"reclaim_proven":                  false})
+		case r.Method == http.MethodGet && strings.HasSuffix(r.URL.Path, "/qualification"):
+			lock.Lock()
+			qualificationReads++
+			lock.Unlock()
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"qualification_id": "qualification-1", "candidate_id": "candidate-130",
+				"state": "qualified", "accelerator_model": "NVIDIA GeForce RTX 4090",
 				"provider_exposure_limit_usd_micros": 250000, "duration_cap_s": 900,
 				"observed_cost_usd_micros": 50000, "provider_resource_id": "pod-1",
 				"model_qualification_spec_digest": "sha256:" + strings.Repeat("4", 64),
@@ -153,7 +163,7 @@ func TestEndpointPublishQualifyPromoteCLI(t *testing.T) {
 		t.Fatalf("endpoint publish replay [exit %d]\n%s", code, out)
 	}
 	if code, out := run("endpoint", "qualify", "cozy/marco@1.0.0", "--profile", endpointprofile.CU130,
-		"--gpu", "NVIDIA GeForce RTX 4090", "--max-cost", "0.25", "--reason", "fixture qualification"); code != 0 || !strings.Contains(out, "qualified") || !strings.Contains(out, "reclaimed:") || !strings.Contains(out, "true") {
+		"--gpu", "NVIDIA GeForce RTX 4090", "--max-cost", "0.25", "--reason", "fixture qualification"); code != 0 || !strings.Contains(out, "acquiring") || !strings.Contains(out, "qualified") || !strings.Contains(out, "reclaimed:") || !strings.Contains(out, "true") {
 		t.Fatalf("endpoint qualify [exit %d]\n%s", code, out)
 	}
 	if code, out := run("endpoint", "promote", "cozy/marco", "1.0.0", "--serve", "v1/marco",
@@ -162,8 +172,8 @@ func TestEndpointPublishQualifyPromoteCLI(t *testing.T) {
 	}
 	lock.Lock()
 	defer lock.Unlock()
-	if beginCount != 2 || finalizeCount != 2 {
-		t.Fatalf("publication calls begin=%d finalize=%d", beginCount, finalizeCount)
+	if beginCount != 2 || finalizeCount != 2 || qualificationReads != 1 {
+		t.Fatalf("calls begin=%d finalize=%d qualification_reads=%d", beginCount, finalizeCount, qualificationReads)
 	}
 }
 

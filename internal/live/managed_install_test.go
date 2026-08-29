@@ -11,6 +11,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/cozy-creator/cozy-creator/internal/canonical"
 	"github.com/cozy-creator/cozy-creator/internal/endpointprofile"
@@ -121,7 +122,7 @@ print(json.dumps({"digest":"sha256:"+hashlib.sha256(evidence).hexdigest(),"lengt
 			}
 			_ = json.NewEncoder(w).Encode(map[string]any{
 				"candidate_id": "candidate-local", "profile": endpointprofile.CU130,
-				"lease_id": "lease-local", "lease_expires_at": "2026-08-29T00:00:00Z",
+				"lease_id": "lease-local", "lease_expires_at": time.Now().Add(time.Hour).UTC().Format(time.RFC3339),
 				"base_worker_image_digest":  "sha256:" + strings.Repeat("5", 64),
 				"base_realization":          map[string]string{"kind": "managed-local", "digest": baseDigest},
 				"endpoint_environment_spec": exactDoc(ees), "endpoint_bundle": exactDoc(bundle),
@@ -168,6 +169,14 @@ print(json.dumps({"digest":"sha256:"+hashlib.sha256(evidence).hexdigest(),"lengt
 	if facts == nil || facts.CandidateID != "candidate-local" || facts.LeaseID != "lease-local" ||
 		facts.HostEvidenceDigest == "" || facts.InstalledReceiptDigest == "" {
 		t.Fatalf("managed evidence/lease facts are incomplete: %+v", facts)
+	}
+	fatal(t, store.Unpin("cozy/marco", 1))
+	forgotten, problem := store.ForgetIfUnreferenced(installed[0].ID)
+	fatal(t, problem)
+	remaining, problem := store.ManagedInstall(installed[0].ID)
+	fatal(t, problem)
+	if !forgotten || remaining != nil {
+		t.Fatalf("managed profile facts did not cascade with reclaimed control install: %t %+v", forgotten, remaining)
 	}
 }
 
