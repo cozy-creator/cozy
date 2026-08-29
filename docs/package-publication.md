@@ -25,14 +25,15 @@ credentials come from Cozy configuration or `TENSORHUB_TOKEN` and never enter pr
 The project also supplies `uv.lock` and `package.toml`. `uv.lock` preserves local installation
 behavior, while standard wheel `Requires-Dist` metadata remains production dependency authority.
 For each runtime requirement backed by a local path or workspace member in `[tool.uv.sources]`, Cozy
-recursively builds a separate non-editable wheel. Cycles, conflicting normalized names, incompatible
+recursively builds a separate non-editable wheel. Requested extras recursively activate their matching
+`[project.optional-dependencies]` groups. Cycles, conflicting normalized names, incompatible
 versions, more than 32 wheels, or more than 512 MiB of dependency wheels refuse before publication.
 Direct URL and VCS requirements are not accepted. Development dependency groups are ignored.
 
-Stable platform-owned names (`cozy-runtime`, `tensorfs`, Torch and its platform components) are not
-dereferenced or uploaded: their standard requirements are checked against each base worker image.
-Tensorhub resolves non-base indexed requirements, mirrors exact wheels, and chooses the base copy for
-any other distribution already owned by a particular profile. An overlay never shadows the base.
+Creator does not infer base ownership from distribution names. It uploads every referenced local
+candidate; Tensorhub checks standard requirements against each exact base worker image, chooses its
+base copy whenever compatible, and leaves that uploaded candidate out of the overlay. Tensorhub also
+resolves non-base indexed requirements and mirrors exact wheels. An overlay never shadows the base.
 Cozy skips `.env*`, credentials, VCS directories, virtual environments, caches, editor state,
 bytecode, and build output. Modified and ordinary untracked files are published normally.
 

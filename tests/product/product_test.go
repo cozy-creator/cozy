@@ -54,20 +54,26 @@ func TestPackagePublishBuildsBoundedLocalDependencyClosure(t *testing.T) {
 	a := filepath.Join(projects, "local-a")
 	b := filepath.Join(projects, "local-b")
 	c := filepath.Join(projects, "local-c")
+	platformCandidate := filepath.Join(projects, "platform-candidate")
 	writePublishProject(t, a, "local-a", "1.0.0",
-		[]string{"local-b>=2,<3", "cozy-runtime>=0.0.3"},
-		"local-b = [{ workspace = true, marker = \"sys_platform == 'linux'\" }, { index = \"pypi\", marker = \"sys_platform != 'linux'\" }]\ncozy-runtime = { path = \"../../absent-runtime\", editable = true }\n", true)
-	writePublishProject(t, b, "local-b", "2.1.0", []string{"local-c==3.0.0"},
-		"local-c = { path = \"../local-c\", editable = true }\n", false)
+		[]string{"local-b>=2,<3", "local-b[images]>=2,<3", "cozy-runtime>=0.0.3"},
+		"local-b = [{ workspace = true, marker = \"sys_platform == 'linux'\" }, { index = \"pypi\", marker = \"sys_platform != 'linux'\" }]\ncozy-runtime = { workspace = true, editable = true }\n", true)
+	writePublishProject(t, b, "local-b", "2.1.0", nil,
+		"local-c = { path = \"../local-c\", editable = true }\nabsent-local = { path = \"../absent-local\" }\n", false)
+	appendProjectTOML(t, b, "\n[project.optional-dependencies]\nimages = [\"local-c==3.0.0\"]\nunused = [\"absent-local==1\"]\n")
 	writePublishProject(t, c, "local-c", "3.0.0", nil, "", false)
+	writePublishProject(t, platformCandidate, "cozy-runtime", "0.0.3", nil, "", false) //cozy:allow distribution fixture, not executable access
 
 	pack, problem := packagepublish.PrepareFrom(a)
 	fatal(t, problem)
 	defer pack.Close()
-	if len(pack.DependencyWheels) != 2 ||
-		pack.DependencyWheels[0].Name != "local-b" || pack.DependencyWheels[0].Version != "2.1.0" ||
-		pack.DependencyWheels[1].Name != "local-c" || pack.DependencyWheels[1].Version != "3.0.0" {
-		t.Fatalf("local dependency closure was not two exact separate wheels: %+v", pack.DependencyWheels)
+	wheels := map[string]string{}
+	for _, dependency := range pack.DependencyWheels {
+		wheels[dependency.Name] = dependency.Version
+	}
+	if len(pack.DependencyWheels) != 3 || wheels["local-b"] != "2.1.0" ||
+		wheels["local-c"] != "3.0.0" || wheels["cozy-runtime"] != "0.0.3" { //cozy:allow distribution assertion, not executable access
+		t.Fatalf("local dependency closure did not include the requested extra and base-name candidate: %+v", pack.DependencyWheels)
 	}
 	for _, dependency := range pack.DependencyWheels {
 		if !strings.HasSuffix(dependency.Filename, ".whl") {
@@ -78,12 +84,11 @@ func TestPackagePublishBuildsBoundedLocalDependencyClosure(t *testing.T) {
 		}
 	}
 
-	// The stable platform-owned Runtime mapping is deliberately absent on disk:
-	// publication retains its requirement but never dereferences or uploads it.
-	for _, dependency := range pack.DependencyWheels {
-		if dependency.Name == "cozy-runtime" { //cozy:allow distribution assertion, not executable access
-			t.Fatalf("base-owned Runtime entered the dependency overlay: %+v", dependency)
-		}
+	// Creator does not guess base ownership. It uploads Runtime as candidate
+	// custody; Tensorhub's exact profile inventory must select the base copy and
+	// omit this wheel from the eventual overlay.
+	if wheels["cozy-runtime"] != "0.0.3" { //cozy:allow distribution assertion, not executable access
+		t.Fatalf("local Runtime candidate was silently discarded: %+v", pack.DependencyWheels)
 	}
 
 	writePublishProject(t, a, "local-a", "1.0.0", []string{"local-b>=3"},
@@ -96,8 +101,8 @@ func TestPackagePublishBuildsBoundedLocalDependencyClosure(t *testing.T) {
 	}
 
 	writePublishProject(t, a, "local-a", "1.0.0",
-		[]string{"local-b>=2,<3", "cozy-runtime>=0.0.3"},
-		"local-b = { workspace = true }\ncozy-runtime = { path = \"../../absent-runtime\" }\n", true)
+		[]string{"local-b[images]>=2,<3"},
+		"local-b = { workspace = true }\n", true)
 	writePublishProject(t, c, "local-c", "3.0.0", []string{"local-a==1.0.0"},
 		"local-a = { path = \"../local-a\" }\n", false)
 	if cycle, problem := packagepublish.PrepareFrom(a); problem == nil || problem.Name != "local_dependency_cycle" {
@@ -203,6 +208,15 @@ module-root = ""
 		must(t, os.WriteFile(filepath.Join(root, "uv.lock"), []byte("version = 1\n"), 0o644))
 	}
 	must(t, os.WriteFile(filepath.Join(root, "pyproject.toml"), []byte(document), 0o644))
+}
+
+func appendProjectTOML(t *testing.T, root, document string) {
+	t.Helper()
+	file, err := os.OpenFile(filepath.Join(root, "pyproject.toml"), os.O_APPEND|os.O_WRONLY, 0)
+	must(t, err)
+	_, err = file.WriteString(document)
+	must(t, err)
+	must(t, file.Close())
 }
 
 func TestDaemonWebLifecycle(t *testing.T) {

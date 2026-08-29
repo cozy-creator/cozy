@@ -88,9 +88,10 @@ func PrepareFrom(projectDir string) (*Package, *exit.Error) {
 
 type projectMetadata struct {
 	Project struct {
-		Name         string   `toml:"name"`
-		Version      string   `toml:"version"`
-		Dependencies []string `toml:"dependencies"`
+		Name                 string              `toml:"name"`
+		Version              string              `toml:"version"`
+		Dependencies         []string            `toml:"dependencies"`
+		OptionalDependencies map[string][]string `toml:"optional-dependencies"`
 	} `toml:"project"`
 	Tool struct {
 		Cozy struct {

@@ -133,7 +133,7 @@ func Run(ctx context.Context, layout home.Layout, store *records.Store, request 
 		{"package-bundle.json", grant.PackageBundle, "tensorhub.package_bundle/3", false},
 		{"resolved-wheel-set.json", grant.ResolvedWheelSet, "ResolvedWheelSet/3", false},
 		{"wheelhouse-manifest.json", grant.WheelhouseManifest, "WheelhouseManifest/3", false},
-		{"resolution-lock.json", grant.ResolutionLock, "tensorhub.resolution_lock/1", false},
+		{"resolution-lock.json", grant.ResolutionLock, "tensorhub.resolution_lock/2", false},
 	}
 	docPaths := map[string]string{}
 	for _, item := range documents {

@@ -81,10 +81,12 @@ cozy package remove org/name
 
 Publishing builds the current working tree with `uv build --wheel`; Git, commits, and a clean tree
 are not publication inputs. Standard `[project].dependencies` remain the runtime authority. Cozy
-recursively builds referenced non-base `[tool.uv.sources]` paths/workspace members as separate exact
-wheels in the same publication. Platform-owned requirements such as Runtime, TensorFS, and Torch are
-kept as compatibility constraints and are not uploaded; Tensorhub resolves indexed requirements and
-freezes their exact wheels. Development dependency groups are not published. The package name and
+recursively builds referenced local `[tool.uv.sources]` paths/workspace members as separate exact
+wheels in the same publication, including local dependencies activated through requested extras.
+Creator does not guess which names a base worker image owns: it uploads local candidates, and
+Tensorhub's exact per-profile inventory chooses a compatible base distribution instead of overlaying
+it. Tensorhub resolves indexed requirements and freezes their exact wheels. Development dependency
+groups are not published. The package name and
 release come from `[project]`; `[tool.cozy]` supplies the Tensorhub organization:
 
 ```toml

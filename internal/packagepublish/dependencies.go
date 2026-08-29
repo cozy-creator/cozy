@@ -34,6 +34,7 @@ type DependencyWheel struct {
 type requirement struct {
 	raw       string
 	name      string
+	extras    []string
 	specifier pep440.Specifiers
 	hasSpec   bool
 	direct    bool
@@ -54,6 +55,7 @@ type dependencyCollector struct {
 	stage  string
 	wheels []DependencyWheel
 	byName map[string]dependencyRecord
+	extras map[string]map[string]bool
 	stack  map[string]bool
 	total  int64
 	count  int
@@ -67,12 +69,13 @@ func collectLocalDependencies(root string, document projectMetadata, stage strin
 		return nil, problem
 	}
 	collector := &dependencyCollector{
-		stage: stage, byName: map[string]dependencyRecord{}, stack: map[string]bool{canonical: true},
+		stage: stage, byName: map[string]dependencyRecord{}, extras: map[string]map[string]bool{},
+		stack: map[string]bool{canonical: true},
 	}
 	if name := normalizedProjectName(document.Project.Name); name != "" {
 		collector.byName[name] = dependencyRecord{source: canonical, version: document.Project.Version}
 	}
-	if problem := collector.collectProject(canonical, document); problem != nil {
+	if problem := collector.collectProject(canonical, document, nil, true); problem != nil {
 		return nil, problem
 	}
 	sort.Slice(collector.wheels, func(i, j int) bool {
@@ -81,12 +84,23 @@ func collectLocalDependencies(root string, document projectMetadata, stage strin
 	return collector.wheels, nil
 }
 
-func (c *dependencyCollector) collectProject(root string, document projectMetadata) *exit.Error {
+func (c *dependencyCollector) collectProject(root string, document projectMetadata, extras []string, includeBase bool) *exit.Error {
 	sources, problem := localSources(document)
 	if problem != nil {
 		return problem
 	}
-	for _, raw := range document.Project.Dependencies {
+	requirements := []string{}
+	if includeBase {
+		requirements = append(requirements, document.Project.Dependencies...)
+	}
+	for _, extra := range extras {
+		optional, problem := optionalDependencyGroup(document, extra)
+		if problem != nil {
+			return problem
+		}
+		requirements = append(requirements, optional...)
+	}
+	for _, raw := range requirements {
 		req, problem := parseRequirement(raw)
 		if problem != nil {
 			return problem
@@ -97,7 +111,7 @@ func (c *dependencyCollector) collectProject(root string, document projectMetada
 				WithRemedy("publish the distribution to an index or use a local path/workspace source")
 		}
 		source, exists := sources[req.name]
-		if !exists || platformReserved(req.name) {
+		if !exists {
 			continue
 		}
 		if source.unsupported != "" {
@@ -173,15 +187,23 @@ func (c *dependencyCollector) collectDirectory(req requirement, source string) *
 		if prior.source != canonical || prior.version != version {
 			return duplicateDependency(name, prior, canonical, version)
 		}
-		return nil
+		newExtras := c.activateExtras(canonical, req.extras)
+		if len(newExtras) == 0 {
+			return nil
+		}
+		c.stack[canonical] = true
+		problem := c.collectProject(canonical, document, newExtras, false)
+		delete(c.stack, canonical)
+		return problem
 	}
 	if c.count >= MaxDependencyWheels {
 		return tooManyDependencies()
 	}
 	c.count++
 	c.byName[name] = dependencyRecord{source: canonical, version: version}
+	newExtras := c.activateExtras(canonical, req.extras)
 	c.stack[canonical] = true
-	if problem := c.collectProject(canonical, document); problem != nil {
+	if problem := c.collectProject(canonical, document, newExtras, true); problem != nil {
 		return problem
 	}
 	delete(c.stack, canonical)
@@ -262,6 +284,39 @@ func duplicateDependency(name string, prior dependencyRecord, source, version st
 		WithRemedy("use one local source and version for each normalized distribution name")
 }
 
+func (c *dependencyCollector) activateExtras(source string, requested []string) []string {
+	active := c.extras[source]
+	if active == nil {
+		active = map[string]bool{}
+		c.extras[source] = active
+	}
+	var added []string
+	for _, extra := range requested {
+		if !active[extra] {
+			active[extra] = true
+			added = append(added, extra)
+		}
+	}
+	return added
+}
+
+func optionalDependencyGroup(document projectMetadata, wanted string) ([]string, *exit.Error) {
+	var matched []string
+	found := false
+	for name, requirements := range document.Project.OptionalDependencies {
+		if normalizedProjectName(name) != wanted {
+			continue
+		}
+		if found {
+			return nil, exit.Named(exit.Validation, "local_dependency_extra_ambiguous",
+				"local project declares more than one optional dependency group normalized as %s", wanted)
+		}
+		found = true
+		matched = requirements
+	}
+	return matched, nil
+}
+
 func parseRequirement(raw string) (requirement, *exit.Error) {
 	value := strings.TrimSpace(raw)
 	match := requirementName.FindString(value)
@@ -274,6 +329,19 @@ func parseRequirement(raw string) (requirement, *exit.Error) {
 		end := strings.IndexByte(rest, ']')
 		if end < 0 {
 			return requirement{}, invalidRequirement(raw)
+		}
+		for _, value := range strings.Split(rest[1:end], ",") {
+			extra := strings.TrimSpace(value)
+			if extra == "" || requirementName.FindString(extra) != extra {
+				return requirement{}, invalidRequirement(raw)
+			}
+			req.extras = append(req.extras, normalizedProjectName(extra))
+		}
+		sort.Strings(req.extras)
+		for i := 1; i < len(req.extras); i++ {
+			if req.extras[i] == req.extras[i-1] {
+				return requirement{}, invalidRequirement(raw)
+			}
 		}
 		rest = strings.TrimSpace(rest[end+1:])
 	}
@@ -525,13 +593,4 @@ func canonicalLocalPath(value string) (string, *exit.Error) {
 		return "", exit.Named(exit.NotFound, "local_dependency_absent", "%s: %v", abs, err)
 	}
 	return filepath.Clean(canonical), nil
-}
-
-func platformReserved(name string) bool {
-	switch name {
-	case "cozy-runtime", "tensorfs", "torch", "torchaudio", "torchvision", "triton": //cozy:allow distribution names, not executable access
-		return true
-	default:
-		return strings.HasPrefix(name, "nvidia-")
-	}
 }
