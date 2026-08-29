@@ -1,6 +1,5 @@
 #!/usr/bin/env bash
-# th-039's LIVE RUN for the deterministic wheel packer. Not a test suite (README: no
-# automated tests; verification is running the real thing) — every line below is the real
+# th-039's LIVE RUN for the deterministic wheel packer. Every line below is the real
 # `cozy pack` binary against real endpoint trees, and it PRINTS what it observed.
 #
 #   CGO_ENABLED=0 go build -o cozy .       # the binary the product ships

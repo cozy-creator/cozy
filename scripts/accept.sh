@@ -11,8 +11,8 @@
 # of the author's state — `scripts/clean-machine.sh` is exactly this file plus an empty
 # machine to run it on.
 #
-# It PRINTS what it observed and counts. It is not a test suite (README: verification is
-# running the real thing); every line below is a real process on a real machine.
+# It PRINTS what it observed and counts. Every line below is a real process on a real
+# machine rather than a simulated release path.
 set -uo pipefail
 
 DIST=""; ASSET=""; UPGRADE=""; ENDPOINT=""

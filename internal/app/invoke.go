@@ -938,7 +938,7 @@ type Target struct {
 }
 
 // parseTarget reads `org/endpoint/vN/function`. The semver-major is a REQUIRED path
-// segment (README §1): it is resolved through that (endpoint, major)'s serving pointer,
+// segment: it is resolved through that (endpoint, major)'s serving pointer,
 // which locally is the install pin, and a majorless target is a usage refusal rather
 // than a default.
 func parseTarget(raw string) (Target, *exit.Error) {
