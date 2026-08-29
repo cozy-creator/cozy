@@ -26,7 +26,7 @@ import (
 var Inherited = []string{"PATH", "HOME", "LANG", "LC_ALL", "TMPDIR", "SSL_CERT_FILE", "SSL_CERT_DIR"}
 
 const (
-	DefaultHubURL = "http://127.0.0.1:8080"
+	DefaultHubURL = "http://127.0.0.1:8819"
 	DefaultPort   = 8818
 	FileName      = "config.yaml"
 )
@@ -61,7 +61,7 @@ type Config struct {
 // values is a config-only Kong grammar. It is never embedded in the public CLI
 // grammar and its parser always receives nil argv.
 type values struct {
-	HubURL                   string `name:"tensorhub_url" default:"http://127.0.0.1:8080"`
+	HubURL                   string `name:"tensorhub_url" default:"http://127.0.0.1:8819"`
 	HubToken                 string `name:"tensorhub_token"`
 	Tfs                      string `name:"tfs" default:"tfs"`
 	LocalRateMicroUSDPerHour int64  `name:"local_rate_micro_usd_per_hour" default:"0"`
