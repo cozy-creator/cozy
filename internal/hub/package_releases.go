@@ -19,27 +19,21 @@ type PackageUpload struct {
 	Path            string            `json:"path,omitempty"`
 	URL             string            `json:"url"`
 	RequiredHeaders map[string]string `json:"required_headers"`
-	ExpiresAt       string            `json:"expires_at"`
 	AlreadyUploaded bool              `json:"already_uploaded"`
 }
 
 type PackageProfileState struct {
-	Profile                string    `json:"profile"`
-	State                  string    `json:"state"`
-	CandidateID            string    `json:"candidate_id,omitempty"`
-	BaseRealizationKind    string    `json:"base_realization_kind,omitempty"`
-	BaseRealizationDigest  string    `json:"base_realization_digest,omitempty"`
-	PackageEnvironmentSpec ObjectRef `json:"package_environment_spec,omitempty"`
-	ResolvedWheelSet       ObjectRef `json:"resolved_wheel_set,omitempty"`
-	ResolutionLock         ObjectRef `json:"resolution_lock,omitempty"`
-	RefusalCode            string    `json:"refusal_code,omitempty"`
-	RefusalDetail          string    `json:"refusal_detail,omitempty"`
+	Profile             string `json:"profile"`
+	State               string `json:"state"`
+	CandidateID         string `json:"candidate_id,omitempty"`
+	BaseRealizationKind string `json:"base_realization_kind,omitempty"`
+	RefusalCode         string `json:"refusal_code,omitempty"`
+	RefusalDetail       string `json:"refusal_detail,omitempty"`
 }
 
 type PackageReleaseBegin struct {
 	Release            string        `json:"release"`
 	State              string        `json:"state"`
-	Created            bool          `json:"created"`
 	ProjectWheelUpload PackageUpload `json:"project_wheel_upload"`
 }
 
@@ -47,12 +41,7 @@ type PackageSourceUploads struct {
 	Uploads []PackageUpload `json:"uploads"`
 }
 
-type PackageExecution struct {
-	Profile  string `json:"profile"`
-	Function string `json:"function"`
-	Digest   string `json:"digest"`
-	State    string `json:"state"`
-}
+type PackageExecution struct{}
 
 type PackageReleaseFinalize struct {
 	Created           bool                  `json:"created"`
