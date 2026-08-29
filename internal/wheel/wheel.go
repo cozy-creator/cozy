@@ -103,6 +103,7 @@ type Result struct {
 	Tag           string
 	PackerVersion string
 	Entries       []string
+	Fact          Fact
 }
 
 // Pack turns a canonical source tree into one wheel. Refusal order is fixed and part of
@@ -170,6 +171,11 @@ func Pack(req Request) (*Result, *exit.Error) {
 	if err := os.WriteFile(out, body, 0o644); err != nil {
 		return nil, exit.Named(exit.Structural, "output_unwritable", "%s: %v", out, err)
 	}
+	fact, e := Inspect(out, ProjectWheel)
+	if e != nil {
+		_ = os.Remove(out)
+		return nil, e
+	}
 
 	sum := sha256.Sum256(body)
 	names := make([]string, len(members))
@@ -188,6 +194,7 @@ func Pack(req Request) (*Result, *exit.Error) {
 		Tag:           Tag,
 		PackerVersion: PackerVersion,
 		Entries:       names,
+		Fact:          fact,
 	}, nil
 }
 

@@ -45,6 +45,16 @@ var compiledExt = map[string]bool{
 	".rs": true, ".f90": true, ".cu": true,
 }
 
+// buildInput is source for a toolchain, not importable endpoint code. The project
+// wheel is always py3-none-any; a native dependency belongs in a separately built,
+// exact custom wheel and is never smuggled into the project payload as a recipe.
+var buildInput = map[string]bool{
+	"cargo.lock": true, "cargo.toml": true, "cmakelists.txt": true,
+	"gnumakefile": true, "makefile": true, "manifest.in": true,
+	"meson.build": true, "meson_options.txt": true,
+	"pyproject-build.toml": true, "setup.cfg": true, "setup.py": true,
+}
+
 // entry is one file that will land in the wheel, at exactly `Path` under site-packages.
 type entry struct {
 	Path string // slash-separated, relative, normalized
@@ -115,14 +125,8 @@ func walk(root string) ([]entry, *exit.Error) {
 		if ext := strings.ToLower(path.Ext(rel)); compiledExt[ext] {
 			return refuseCompiled(rel)
 		}
-		if base := path.Base(rel); base == "setup.py" {
-			return exit.Named(exit.Validation, "project_code_execution",
-				"%s is a packaging step that RUNS project code", rel).
-				WithRemedy("the env lane executes no tenant code at assembly (tensorhub-build.md §0); " +
-					"declare static metadata in pyproject.toml's `[project]` instead").
-				WithNext("packaging that must execute project code is the FUTURE sandboxed class: " +
-					"it runs as hostile input under the VM-class sandbox posture (tensorhub-build.md §1.1), " +
-					"never as an unremarked exception")
+		if buildInputName(rel) {
+			return refuseBuildInput(rel)
 		}
 
 		st, serr := d.Info()
@@ -156,12 +160,21 @@ func walk(root string) ([]entry, *exit.Error) {
 }
 
 func refuseCompiled(rel string) *exit.Error {
-	return exit.Named(exit.Validation, "compiled_extension",
-		"%s is a compiled-extension source or binary; this packer emits %s and nothing else", rel, Tag).
-		WithRemedy("a pure-python endpoint has no such file in its tree").
-		WithNext("compiled project wheels are the FUTURE sandboxed class: they execute a toolchain " +
-			"at assembly and therefore land on the VM-class sandbox posture (tensorhub-build.md §1.1), " +
-			"never as an unremarked exception to \"assembly executes no tenant code\"")
+	return exit.Named(exit.Validation, "project_wheel_native_file",
+		"%s is native source or a native binary; the project wheel is %s", rel, Tag).
+		WithRemedy("remove it from the endpoint project; publish a separately prebuilt exact custom wheel for a missing native dependency")
+}
+
+func buildInputName(rel string) bool {
+	base := strings.ToLower(path.Base(rel))
+	return buildInput[base] || strings.HasPrefix(base, "dockerfile") ||
+		strings.HasSuffix(base, ".cmake")
+}
+
+func refuseBuildInput(rel string) *exit.Error {
+	return exit.Named(exit.Validation, "project_wheel_build_input",
+		"%s is a native/package build input; endpoint publication runs no build request", rel).
+		WithRemedy("keep the project wheel pure; supply only separately prebuilt exact custom wheels, never source, a Dockerfile, a command, or a build environment")
 }
 
 // checkName holds the rule that nothing inside a wheel is an absolute path, a traversal,
@@ -211,13 +224,11 @@ func checkBackend(d declaration) *exit.Error {
 	if !d.hasBuildSy || d.backend == "" {
 		return nil
 	}
-	return exit.Named(exit.Validation, "build_backend_unsupported",
+	return exit.Named(exit.Validation, "project_wheel_build_input",
 		"%s declares `[build-system] build-backend = %q`; the Cozy packer implements no backend and fires no PEP 517 hook",
 		pyprojectName, d.backend).
 		WithRemedy("remove `[build-system]`: a pure-python endpoint is packed from its declared tree, " +
-			"and its dependencies are resolved from the lock, not by a backend").
-		WithNext("custom PEP 517 backends are the FUTURE sandboxed class: a backend is tenant code, " +
-			"so it runs under the VM-class sandbox posture (tensorhub-build.md §1.1) or it does not run")
+			"and native dependencies arrive only as separately prebuilt exact custom wheels")
 }
 
 // checkApplication answers the only structural question the packer can answer about the
