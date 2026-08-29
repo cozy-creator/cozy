@@ -21,7 +21,7 @@ import (
 	pb "github.com/cozy-creator/cozy-creator/protocol/cozy/worker/v1"
 )
 
-// worker-protocol's FROZEN corpus at schema rev 8, checked out beside this repo.
+// worker-protocol's FROZEN corpus at schema rev 9, checked out beside this repo.
 const fixtureDir = "/home/fidika/cozy_v2/worker-protocol/fixtures"
 
 // TestCanonicalDocuments is the identity fence. Every document that crosses a repo or
@@ -53,8 +53,8 @@ func TestCanonicalDocuments(t *testing.T) {
 	if got, _ := canonical.Spell(canonical.Digest(schemaBytes)); got != schema.ID {
 		t.Errorf("the schema digest is not over those document bytes: %s", got)
 	}
-	if pb.WireSchemaRev != 8 || pb.WireMinor != 2 {
-		t.Errorf("this binding declares rev %d minor %d, wanted rev 8 minor 2",
+	if pb.WireSchemaRev != 9 || pb.WireMinor != 2 {
+		t.Errorf("this binding declares rev %d minor %d, wanted rev 9 minor 2",
 			pb.WireSchemaRev, pb.WireMinor)
 	}
 

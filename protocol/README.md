@@ -1,7 +1,7 @@
 # protocol — copied `cozy.worker.v1` bindings
 
 COPIED, never imported as a module (boundaries.md): these four files are byte-identical
-to `worker-protocol@d57d5031` `gen/go/cozy/worker/v1/` — schema rev 8. Rev 8 hard-cuts
+to `worker-protocol@9e754cec` `gen/go/cozy/worker/v1/` — schema rev 9. Rev 9 hard-cuts
 ClaimAck/BootFailure provenance to `control_runtime_digest`: the measured image-owned control
 Runtime wheel, never the image's recursively unknowable OCI digest. cozy-creator DIALS this contract as the record
 owner; the schema is th-024/th-049's and is never edited here.
@@ -10,7 +10,7 @@ Refresh = re-copy from the worker-protocol repo. Editing a file in this director
 one thing that turns a shared contract into two — and `ci.yaml`'s `vendored-protocol` job
 is what makes that unstateable in silence: worker-protocol regenerates from its own
 `.proto` with its own pinned protoc and byte-compares against exactly these files.
-`SHA256SUMS` always proves the checked-in set is the reviewed `d57d5031` set; the live
+`SHA256SUMS` always proves the checked-in set is the reviewed `9e754cec` set; the live
 master comparison additionally arms when CI has a repository-scoped
 `WORKER_PROTOCOL_TOKEN`. GitHub's ordinary per-repo token cannot read a private sibling,
 so absence of that explicit token is a named unarmed drift check, not a fake code failure.
@@ -23,7 +23,8 @@ schema it names. It rides `Claim.wire_schema_digest` and is checked before any o
 field. The retired `wire_minor.go` is deleted: a constant still claiming currency beside a
 fresh binding is the whole of #530-A1.
 
-Schema rev 8 separates worker-measured control Runtime provenance from provider-verified OCI
+Schema rev 9 adds the four public endpoint/base compatibility coordinates while preserving
+worker-measured control Runtime provenance separately from provider-verified OCI
 identity; a RecordOwner requires both facts and neither substitutes for the other. Schema rev 7 makes acquisition overlap and reuse observable without moving identity,
 readiness, convergence, or admission. Schema rev 6 makes the model-object-set subject part of immutable desired state while its
 expiring locations remain on the independently refreshable grant lane. Schema rev 5 moves wire

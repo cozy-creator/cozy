@@ -1,4 +1,4 @@
 3ea436f30a015abcbc6bfc9897891140779d3c561e424fc7065057b06adbbd7c  protocol/cozy/worker/v1/artifact_limits.go
-023832f5b7ffeec9b0fe2d524023e4a4f0b0cc68d51a83730982e3e2e8c22e92  protocol/cozy/worker/v1/wire_identity.go
-844aa094763fddafb940cccea759162701d8ed433b3c87fcdc4df16b27211a41  protocol/cozy/worker/v1/worker.pb.go
+aa13aeac30fc75e4359aa1d856a0d5e361985dbc671b9391218fb2437815f04a  protocol/cozy/worker/v1/wire_identity.go
+c5afa0be4c35b50e2b2f5d3d7f340ae814a471619244e62958b2a35cb710ca8e  protocol/cozy/worker/v1/worker.pb.go
 33840782a327a982f1791e0a8adc94f19189bf18a2f7aa70a88eaa8f1005d759  protocol/cozy/worker/v1/worker_grpc.pb.go
