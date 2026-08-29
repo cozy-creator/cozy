@@ -150,15 +150,6 @@ func (s *Server) downBlockers() ([]LifecycleIdentity, []LifecycleIdentity, *exit
 		known[row.ID] = true
 		rentals = append(rentals, LifecycleIdentity{Kind: "rental", ID: row.ID, State: row.State})
 	}
-	for _, worker := range s.orchestrator.Workers() {
-		if worker.RentalID == "" || known[worker.RentalID] {
-			continue
-		}
-		known[worker.RentalID] = true
-		rentals = append(rentals, LifecycleIdentity{
-			Kind: "rental", ID: worker.RentalID, State: "attached_worker",
-		})
-	}
 	operations, problem := s.store.ActiveRentalOperations()
 	if problem != nil {
 		return nil, nil, problem
