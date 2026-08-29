@@ -481,7 +481,7 @@ func (s *Store) SpawnWorker(w WorkerProcess) *exit.Error {
 	}
 	if n, _ := res.RowsAffected(); n != 1 {
 		held, _ := s.DeviceHolders(w.Devices)
-		return exit.New(exit.Conflict,
+		return exit.Named(exit.Conflict, "device_envelope_held",
 			"the device envelope [%s] is already granted to %s",
 			strings.Join(w.Devices, ","), strings.Join(held, ",")).
 			WithRemedy("one process per device: stop the holding worker first").

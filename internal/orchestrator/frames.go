@@ -535,6 +535,12 @@ func (c *Orchestrator) onAccepted(s *session, a *pb.AttemptAccepted) {
 		c.logf("AttemptAccepted for %s#%d REFUSED: %s", a.RequestId, ordinal, e.Message)
 		return
 	}
+	c.mu.Lock()
+	if w := c.workers[row.InstanceID]; w != nil && w.spec.Connection == nil && !w.spec.IsJob() {
+		c.lastUseRevision++
+		w.lastUseRevision = c.lastUseRevision
+	}
+	c.mu.Unlock()
 	c.settleDispatch(a.RequestId, ordinal, true)
 	c.logf("AttemptAccepted %s#%d placement=%s generation=%d plan=%s construction=%s [%s]",
 		a.RequestId, ordinal, a.PlacementId, a.ExecutorGeneration,

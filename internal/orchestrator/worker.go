@@ -451,6 +451,11 @@ type worker struct {
 	// For an ATTACHED worker it is zero until its first ClaimAck: the dial / plan delivery
 	// phase is bounded by its own measured progress, not by the report cadence.
 	spawned time.Time
+	// LRU is dispatch-based, not report-based: reports say the worker lives, while an
+	// accepted attempt says a user actually used it. Never-used workers fall back to
+	// residentRevision so two cold holders still have a deterministic oldest member.
+	residentRevision uint64
+	lastUseRevision  uint64
 
 	// THE NO-PROGRESS GROUND'S STATE (cl-025). progressSig is a signature over every
 	// axis the last report carried — states, revisions, plan sets, the activity lane's
@@ -559,7 +564,101 @@ func (c *Orchestrator) EnsureWorker(spec WorkerLaunchSpec) (string, WorkerChange
 		return id, ChangeWorkerStarted, e
 	}
 	id, e := c.spawnWorker(spec)
+	originalHolders := map[string]bool{}
+	expectedHolders := 0
+	if e != nil && e.ErrName() == "device_envelope_held" {
+		holders, problem := c.opt.Store.DeviceHolders(spec.Devices)
+		if problem != nil {
+			return "", ChangeNone, problem
+		}
+		for _, holder := range holders {
+			originalHolders[holder] = true
+		}
+		expectedHolders = len(holders)
+	}
+	// A multi-device envelope may be held by one idle serving worker per device. Each
+	// pass re-reads the ledger and may evict exactly one observed LRU holder; the bound is
+	// the requested envelope size, so concurrent/new evidence escapes instead of turning
+	// pressure handling into an unbounded machine drain.
+	for evictions := 0; e != nil && e.ErrName() == "device_envelope_held" &&
+		evictions < len(spec.Devices); evictions++ {
+		evicted, evictionProblem := c.evictLRUIdleDeviceHolder(
+			spec.Devices, originalHolders, expectedHolders)
+		if evictionProblem != nil {
+			return "", ChangeNone, evictionProblem
+		}
+		if !evicted {
+			break
+		}
+		expectedHolders--
+		id, e = c.spawnWorker(spec)
+	}
 	return id, ChangeWorkerStarted, e
+}
+
+// evictLRUIdleDeviceHolder releases one local device envelope under launch pressure.
+// Every holder conflicting with the requested envelope must be an idle local serving
+// worker; an active, remote, job, unknown, offered, reserved, or unacked holder makes the
+// conflict ineligible and preserves all workers. A changed holder set is concurrent/new
+// evidence and is never folded into the original pressure decision. The selected holder
+// is claimed under the orchestrator lock before teardown, so dispatch cannot race into it.
+func (c *Orchestrator) evictLRUIdleDeviceHolder(devices []string,
+	original map[string]bool, expected int) (bool, *exit.Error) {
+	holders, problem := c.opt.Store.DeviceHolders(devices)
+	if problem != nil || len(holders) == 0 {
+		return false, problem
+	}
+	if len(holders) != expected {
+		return false, nil
+	}
+	for _, holder := range holders {
+		if !original[holder] {
+			return false, nil
+		}
+	}
+	active, problem := c.opt.Store.ActiveRequests()
+	if problem != nil {
+		return false, problem
+	}
+
+	c.mu.Lock()
+	eligible := make([]*worker, 0, len(holders))
+	for _, instanceID := range holders {
+		w := c.workers[instanceID]
+		if !c.idleLocalServingWorkerLocked(w, active) {
+			c.mu.Unlock()
+			return false, nil
+		}
+		eligible = append(eligible, w)
+	}
+	sort.Slice(eligible, func(i, j int) bool { return lessRecentlyUsed(eligible[i], eligible[j]) })
+	victim := eligible[0]
+	victim.stopping = true
+	instanceID, endpoint := victim.instanceID, victim.spec.Placement.Endpoint
+	lastUse, resident := victim.lastUseRevision, victim.residentRevision
+	c.mu.Unlock()
+
+	c.logf("device pressure: evicting LRU idle local worker %s (%s, last_use=%d, resident=%d)",
+		instanceID, endpoint, lastUse, resident)
+	if !c.stopClaimedWorker(victim, StopGrace) {
+		return false, exit.New(exit.Conflict,
+			"idle device holder %s changed before it could be evicted", instanceID)
+	}
+	c.reviveQueue()
+	return true, nil
+}
+
+func lessRecentlyUsed(a, b *worker) bool {
+	if (a.lastUseRevision == 0) != (b.lastUseRevision == 0) {
+		return a.lastUseRevision == 0
+	}
+	if a.lastUseRevision != b.lastUseRevision {
+		return a.lastUseRevision < b.lastUseRevision
+	}
+	if a.residentRevision != b.residentRevision {
+		return a.residentRevision < b.residentRevision
+	}
+	return a.instanceID < b.instanceID
 }
 
 // EnsureRental makes an already-provisioned rental's worker resident without invoking
@@ -739,6 +838,8 @@ func (c *Orchestrator) spawnWorker(spec WorkerLaunchSpec) (string, *exit.Error) 
 	// Registered BEFORE the process can dial: a worker that registers faster than its
 	// launcher can record it would be refused as an instance nobody spawned.
 	c.mu.Lock()
+	c.residentRevision++
+	w.residentRevision = c.residentRevision
 	c.workers[instanceID] = w
 	c.mu.Unlock()
 
@@ -1472,6 +1573,12 @@ func (c *Orchestrator) idleLocalWorkerLocked(w *worker, active []records.Request
 		}
 	}
 	return true
+}
+
+func (c *Orchestrator) idleLocalServingWorkerLocked(w *worker, active []records.Request) bool {
+	return c.idleLocalWorkerLocked(w, active) &&
+		w.serving == pb.ServingState_SERVING_STATE_DISPATCHABLE &&
+		w.admission == pb.AdmissionState_ADMISSION_STATE_OPEN
 }
 
 // Reconcile runs at boot, before anything is served. Rows describing processes from a

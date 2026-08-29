@@ -9,6 +9,8 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/cozy-creator/cozy-creator/internal/records"
 )
 
 const weightlessRef = "cozy/weightless"
@@ -63,6 +65,27 @@ func TestProductPath(t *testing.T) {
 	image, err := os.ReadFile(saved)
 	if err != nil || len(image) < 8 || string(image[1:4]) != "PNG" {
 		t.Fatalf("invoke did not publish its declared PNG at %s: %v", saved, err)
+	}
+	// A second invocation reuses the same warm serving worker rather than spawning
+	// another process onto the device envelope.
+	secondOut := filepath.Join(root, "out-2")
+	if code, out := runCozy(t, root, "invoke", "run", weightlessRef+"/v1/tile",
+		"size=16", "seed=8", "--out", secondOut); code != 0 {
+		t.Fatalf("warm invoke [exit %d]\n%s", code, out)
+	}
+	store, problem := records.Open(filepath.Join(root, "records.db"))
+	fatal(t, problem)
+	workers, problem := store.LiveWorkers()
+	fatal(t, problem)
+	store.Close()
+	localWorkers := 0
+	for _, worker := range workers {
+		if worker.WorkerID != "remote" {
+			localWorkers++
+		}
+	}
+	if localWorkers != 1 {
+		t.Fatalf("warm reuse left %d local workers; wanted exactly one", localWorkers)
 	}
 
 	code, listed := runCozy(t, root, "invoke", "list", "--json")
