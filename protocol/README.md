@@ -1,7 +1,8 @@
 # protocol — copied `cozy.worker.v1` bindings
 
 COPIED, never imported as a module (boundaries.md): these four files are byte-identical
-to `worker-protocol@9e754cec` `gen/go/cozy/worker/v1/` — schema rev 9. Rev 9 hard-cuts
+to `worker-protocol@2cf3336` `gen/go/cozy/worker/v1/` — schema rev 9, generated with
+official protoc 35.1 and protoc-gen-go 1.36.11. Rev 9 hard-cuts
 ClaimAck/BootFailure provenance to `control_runtime_digest`: the measured image-owned control
 Runtime wheel, never the image's recursively unknowable OCI digest. cozy-creator DIALS this contract as the record
 owner; the schema is th-024/th-049's and is never edited here.
@@ -10,7 +11,7 @@ Refresh = re-copy from the worker-protocol repo. Editing a file in this director
 one thing that turns a shared contract into two — and `ci.yaml`'s `vendored-protocol` job
 is what makes that unstateable in silence: worker-protocol regenerates from its own
 `.proto` with its own pinned protoc and byte-compares against exactly these files.
-`SHA256SUMS` always proves the checked-in set is the reviewed `9e754cec` set; the live
+`SHA256SUMS` always proves the checked-in set is the reviewed `2cf3336` set; the live
 master comparison additionally arms when CI has a repository-scoped
 `WORKER_PROTOCOL_TOKEN`. GitHub's ordinary per-repo token cannot read a private sibling,
 so absence of that explicit token is a named unarmed drift check, not a fake code failure.
