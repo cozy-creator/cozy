@@ -156,7 +156,6 @@ func sameRef(ref exactRef, document hub.ExactControlDocument) bool {
 type overlayWheel struct {
 	Digest       string
 	Distribution string
-	Length       int64
 	Owner        string
 	Version      string
 }
@@ -166,11 +165,11 @@ func wheelFact(doc canonical.Doc, owner string) (overlayWheel, error) {
 		return overlayWheel{}, err
 	}
 	wheel := overlayWheel{Digest: doc.Str("digest"), Distribution: doc.Str("distribution"), Owner: owner,
-		Length: doc.Int("length"), Version: doc.Str("version")}
+		Version: doc.Str("version")}
 	tags, tagsOK := doc["tags"].([]canonical.Value)
 	roots, rootsOK := doc["import_roots"].([]canonical.Value)
 	if _, err := canonical.Raw(wheel.Digest); err != nil || wheel.Distribution == "" || wheel.Version == "" ||
-		!strings.HasSuffix(doc.Str("filename"), ".whl") || wheel.Length <= 0 || !tagsOK || len(tags) == 0 ||
+		!strings.HasSuffix(doc.Str("filename"), ".whl") || doc.Int("length") <= 0 || !tagsOK || len(tags) == 0 ||
 		!rootsOK || len(roots) == 0 {
 		return overlayWheel{}, fmt.Errorf("wheel fact is incomplete")
 	}
@@ -268,7 +267,7 @@ func validateOverlayReceipt(raw []byte, environmentRef hub.ExactControlDocument,
 		expected[wheel.Distribution] = wheel
 		seenDigests[wheel.Digest] = true
 		priorCustom = wheel.Distribution
-		customBytes += wheel.Length
+		customBytes += row.Int("length")
 	}
 	if resolved.Int("overlay_bytes") != customBytes || customBytes > 512<<20 {
 		return fmt.Errorf("resolved wheel set overlay byte accounting disagrees")
