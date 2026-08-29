@@ -556,7 +556,7 @@ def check_manifest():
         "internal/cli/package_releases.go": '"cozy package publish " + ref.String() + "@" + release',
         "internal/cli/packages.go": '"cozy package install " + ref.String() + "@" + release + " for " + profiles[0]',
         "internal/cli/transfer.go": '"cozy model publish " + ref.String() + " " + snapshot',
-        "internal/cli/rentals.go": '"cozy rental new " + packageRef + " on " + acceleratorModel',
+        "internal/cli/rentals.go": '"cozy rental new " + skuName + " for " + packageRef',
     }
     for path, spelling in derived_audits.items():
         if spelling not in pathlib.Path(path).read_text():

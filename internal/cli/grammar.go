@@ -192,16 +192,15 @@ type RentalCmd struct {
 }
 
 type RentalNewCmd struct {
-	Package        string `arg:"" name:"package" help:"Exact package ref."`
-	Accelerator    string `help:"Provider-neutral accelerator model." required:""`
+	SKU            string `arg:"" optional:"" name:"gpu" help:"Cozy GPU SKU, such as h200."`
+	Package        string `arg:"" optional:"" name:"package" help:"Exact package ref."`
 	IdempotencyKey string `help:"Stable paid-operation identity."`
 	Timeout        string `help:"Caller wait deadline; does not release the rental."`
 }
 
 func (c *RentalNewCmd) Run(r *Runtime) error {
-	return r.call(handleRent, []string{c.Package}, nil, values(
-		"--accelerator", c.Accelerator, "--idempotency-key", c.IdempotencyKey,
-		"--timeout", c.Timeout), true)
+	return r.call(handleRent, []string{c.SKU, c.Package}, nil, values(
+		"--idempotency-key", c.IdempotencyKey, "--timeout", c.Timeout), false)
 }
 
 type RentalEndCmd struct {

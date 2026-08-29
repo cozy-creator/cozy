@@ -58,14 +58,24 @@ func rentalStores(ctx *Context) (home.Layout, *records.Store, *exit.Error) {
 }
 
 func handleRent(ctx *Context) *exit.Error {
-	packageRef := strings.TrimSpace(ctx.Inv.Args[0])
-	acceleratorModel := strings.TrimSpace(ctx.Inv.Value("--accelerator"))
-	if acceleratorModel == "" {
-		return exit.Usagef("`cozy rental new` names the compute profile to provision").
-			WithRemedy("--accelerator is required; use CPU or a provider-neutral accelerator model such as NVIDIA H200").
-			WithNext("cozy rental new " + packageRef + " --accelerator CPU")
+	skuName := strings.TrimSpace(ctx.Inv.Args[0])
+	packageRef := strings.TrimSpace(ctx.Inv.Args[1])
+	if skuName == "" {
+		hctx, cancel := hub.Context()
+		skus, e := client(ctx).RentalSKUs(hctx)
+		cancel()
+		if e != nil {
+			return e
+		}
+		return emitRentalCatalog(ctx, skus)
 	}
-	reason := "cozy rental new " + packageRef + " on " + acceleratorModel
+	if packageRef == "" {
+		return exit.Usagef("`cozy rental new %s` also needs the exact package to run", skuName).
+			WithRemedy("append org/package/vN/function").
+			WithNext("cozy rental new " + skuName + " <org/package/vN/function>")
+	}
+	reason := "cozy rental new " + skuName + " for " + packageRef
+	c := client(ctx)
 	// The wait's ONLY caller-supplied bound. Absent, the wait ends on what the hub says
 	// rather than on a clock: a pod that is still booting is not a pod that has failed.
 	deadline := time.Time{}
@@ -83,13 +93,17 @@ func handleRent(ctx *Context) *exit.Error {
 	}
 	defer st.Close()
 
-	c := client(ctx)
 	if !c.Token().Present() {
 		return exit.Named(exit.Credential, "hub.token_missing",
 			"POST /v1/private-rentals is a first-party route and no admin token is configured").
 			WithRemedy("set TENSORHUB_TOKEN to the hub's admin.token; catalog reads need no credential").
 			WithNext("cozy package search")
 	}
+	state, _, problem := ensureDaemon(ctx)
+	if problem != nil {
+		return problem
+	}
+	ctx.Daemon = state
 	operationKey := strings.TrimSpace(ctx.Inv.Value("--idempotency-key"))
 	if len(operationKey) > 200 {
 		return exit.Usagef("--idempotency-key is %d bytes; the hub admits at most 200", len(operationKey))
@@ -128,7 +142,7 @@ func handleRent(ctx *Context) *exit.Error {
 		return e
 	}
 	tokenHash := secret.HashHex(token)
-	requestBody, e := hub.RentalRequestBytes(packageRef, acceleratorModel, tokenHash)
+	requestBody, e := hub.RentalRequestBytes(packageRef, skuName, tokenHash)
 	if e != nil {
 		return e
 	}
@@ -143,7 +157,7 @@ func handleRent(ctx *Context) *exit.Error {
 	if op.RequestDigest != digest || op.Hub != c.Base() || !bytes.Equal(op.RequestBody, requestBody) {
 		return exit.Named(exit.Conflict, "rental.idempotency_conflict",
 			"rental operation %s already names a different hub or request body", operationKey).
-			WithRemedy("reuse a key only for the exact same hub, package, accelerator, and renter token")
+			WithRemedy("reuse a key only for the exact same hub, package, Cozy GPU SKU, and renter token")
 	}
 	if !replay {
 		fmt.Fprintf(ctx.Err, "  rental operation %s persisted; reuse this key to resume\n", operationKey)
@@ -172,7 +186,7 @@ func handleRent(ctx *Context) *exit.Error {
 		return e
 	}
 	row := records.Rental{ID: r.ID, PackageRef: packageRef,
-		AcceleratorModel: acceleratorModel, State: r.State, Hub: c.Base()}
+		AcceleratorModel: r.AcceleratorModel, State: r.State, Hub: c.Base()}
 	if existing != nil && existing.State == "attached" {
 		stored, problem := st.RentalRow(r.ID)
 		if problem != nil {
@@ -287,16 +301,39 @@ func handleRent(ctx *Context) *exit.Error {
 		{K: "address", V: ready.Address},
 		{K: "media", V: ready.MediaAddress},
 		{K: "package", V: packageRef},
-		{K: "accelerator", V: acceleratorModel},
+		{K: "gpu", V: skuName},
+		{K: "accelerator", V: ready.AcceleratorModel},
 		{K: "changed", V: !replay}, {K: "operation", V: operationKey}, {K: "replayed", V: replay},
 	}
-	rec := compactRecord(fields, "rental", "state", "package", "accelerator", "changed")
+	rec := compactRecord(fields, "rental", "state", "gpu", "package", "changed")
 	rec.Notes = notes
 	rec.Next = []string{
 		"cozy invoke run <org/package/vN/function> --worker " + ready.ID,
 		"cozy rental end " + ready.ID,
 	}
 	return emit(ctx, rec)
+}
+
+func emitRentalCatalog(ctx *Context, skus []hub.RentalSKU) *exit.Error {
+	rows := make([]map[string]string, 0, len(skus))
+	for _, sku := range skus {
+		rows = append(rows, map[string]string{
+			"name": sku.Name, "model": sku.AcceleratorModel,
+			"vram":  fmt.Sprintf("%d GB", sku.VRAMGB),
+			"price": rentalPrice(sku.PriceUSDMicrosPerHour),
+		})
+	}
+	doc := output.List{
+		Name: "gpus", Fields: []string{"name", "model", "vram", "price"},
+		Rows: rows, Total: len(rows),
+		Next: []string{"cozy rental new <gpu-name> <org/package/vN/function>"},
+	}
+	return emit(ctx, doc)
+}
+
+func rentalPrice(micros int64) string {
+	amount := strings.TrimRight(strings.TrimRight(fmt.Sprintf("%.6f", float64(micros)/1_000_000), "0"), ".")
+	return "$" + amount + "/hr"
 }
 
 func rentalRequestDigest(hubAuthority string, requestBody []byte) string {
@@ -372,7 +409,7 @@ func waitRental(ctx *Context, c *hub.Client, id string, deadline time.Time,
 			return hub.Rental{}, exit.New(exit.Failed,
 				"rental %s is %s: %s", id, r.State, detailOr(r.Detail)).
 				WithRemedy("the rental is leaving or gone; rent again if you still need a pod").
-				WithNext("cozy rental new <package> --accelerator <model>")
+				WithNext("cozy rental new <gpu-name> <org/package/vN/function>")
 		case r.State == hub.RentalReady:
 			// READY without a whole triple is the hub contradicting itself, and dialling
 			// on a partial one would fail later as something that looks like a network
@@ -401,7 +438,8 @@ func waitRental(ctx *Context, c *hub.Client, id string, deadline time.Time,
 func sameAttachProjection(attached, seen hub.Rental, tokenHash string) *exit.Error {
 	if !seen.Attachable() || attached.ID != seen.ID || attached.Address != seen.Address ||
 		attached.MediaAddress != seen.MediaAddress || attached.CertPEM != seen.CertPEM ||
-		attached.PackageRef != seen.PackageRef || attached.PlacementRevision != seen.PlacementRevision ||
+		attached.PackageRef != seen.PackageRef || attached.AcceleratorModel != seen.AcceleratorModel ||
+		attached.PlacementRevision != seen.PlacementRevision ||
 		!seen.HoldsHash(tokenHash) || !sameHashSet(attached.TokenSHA256, seen.TokenSHA256) ||
 		attached.ControlSnapshot == nil || seen.ControlSnapshot == nil ||
 		attached.ControlSnapshot.Digest != seen.ControlSnapshot.Digest ||
