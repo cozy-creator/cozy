@@ -121,6 +121,26 @@ CREATE TABLE IF NOT EXISTS managed_profile_installs (
   recorded_at                  TEXT NOT NULL
 )`}, append(orchestratorSchema, append(eventSchema, rentalSchema...)...)...)
 
+// renames is the pre-launch domain hardcut expressed as a database migration instead of
+// a demand that users retain the executable that wrote an older local root. SQLite keeps
+// row values, constraints, indexes and foreign-key references intact when it renames a
+// column. Every identifier here is a source constant, never caller input.
+var renames = []struct{ table, from, to string }{
+	{"install_generations", "endpoint", "package"},
+	{"install_generations", "descriptor", "package_descriptor"},
+	{"pins", "endpoint", "package"},
+	{"managed_profile_installs", "release_id", "package_release_id"},
+	{"managed_profile_installs", "endpoint_bundle_digest", "package_bundle_digest"},
+	{"worker_processes", "endpoint", "package"},
+	{"worker_processes", "release_id", "package_release_id"},
+	{"placement_acquisition_observations", "endpoint_started_ns", "package_started_ns"},
+	{"placement_acquisition_observations", "endpoint_ended_ns", "package_ended_ns"},
+	{"placement_acquisition_observations", "endpoint_downloaded_bytes", "package_downloaded_bytes"},
+	{"placement_acquisition_observations", "endpoint_reused_bytes", "package_reused_bytes"},
+	{"requests", "endpoint", "package"},
+	{"rentals", "endpoint_ref", "package_ref"},
+}
+
 // pragmas ride the DSN rather than being executed after the open, because a pragma is a
 // property of a CONNECTION and database/sql may discard and redial one at any moment: a
 // re-dialled connection with foreign_keys OFF would silently accept the delete Forget
@@ -152,6 +172,14 @@ func Open(path string) (*Store, *exit.Error) {
 			return nil, exit.Internalf("cannot apply the records schema to %s: %s", path, err)
 		}
 	}
+	if e := migrateColumnRenames(db, path); e != nil {
+		db.Close()
+		return nil, e
+	}
+	if e := migrateRentalSchema(db, path); e != nil {
+		db.Close()
+		return nil, e
+	}
 	// A column added to a table an older root already created. `CREATE TABLE IF NOT
 	// EXISTS` is a no-op on that root, so the new column would never appear; adding it
 	// here is the whole migration story a pre-launch single-writer store needs. A
@@ -161,10 +189,6 @@ func Open(path string) (*Store, *exit.Error) {
 			db.Close()
 			return nil, exit.Internalf("cannot widen the records schema in %s: %s", path, err)
 		}
-	}
-	if e := CheckRentalSchema(db, path); e != nil {
-		db.Close()
-		return nil, e
 	}
 	for _, stmt := range normalize {
 		if _, err := db.Exec(stmt); err != nil {
@@ -201,6 +225,51 @@ func Open(path string) (*Store, *exit.Error) {
 		}
 	}
 	return &Store{db: db}, nil
+}
+
+func migrateColumnRenames(db *sql.DB, path string) *exit.Error {
+	known := map[string]map[string]bool{}
+	for _, rename := range renames {
+		columns := known[rename.table]
+		if columns == nil {
+			var err error
+			columns, err = tableColumns(db, rename.table)
+			if err != nil {
+				return exit.Internalf("cannot inspect %s in %s: %s", rename.table, path, err)
+			}
+			known[rename.table] = columns
+		}
+		if !columns[rename.from] || columns[rename.to] {
+			continue
+		}
+		if _, err := db.Exec(`ALTER TABLE ` + rename.table + ` RENAME COLUMN ` +
+			rename.from + ` TO ` + rename.to); err != nil {
+			return exit.Internalf("cannot rename %s.%s to %s in %s: %s",
+				rename.table, rename.from, rename.to, path, err)
+		}
+		delete(columns, rename.from)
+		columns[rename.to] = true
+	}
+	return nil
+}
+
+func tableColumns(db *sql.DB, table string) (map[string]bool, error) {
+	rows, err := db.Query(`PRAGMA table_info(` + table + `)`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	columns := map[string]bool{}
+	for rows.Next() {
+		var id, notNull, primaryKey int
+		var name, columnType string
+		var defaultValue sql.NullString
+		if err := rows.Scan(&id, &name, &columnType, &notNull, &defaultValue, &primaryKey); err != nil {
+			return nil, err
+		}
+		columns[name] = true
+	}
+	return columns, rows.Err()
 }
 
 func (s *Store) Close() { _ = s.db.Close() }

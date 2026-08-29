@@ -72,27 +72,41 @@ CREATE TABLE IF NOT EXISTS rental_relay_refusals (
   observed_at TEXT NOT NULL
 )`}
 
-// CheckRentalSchema refuses a root whose rental tables were created by another shape of
-// this binary. Rentals are paid obligations, so a mismatched table is never rebuilt or
-// dropped here; the operator settles it with the binary that wrote it.
-func CheckRentalSchema(db *sql.DB, path string) *exit.Error {
-	for table, expected := range map[string]string{"rentals": rentalsDDL, "rental_operations": rentalOperationsDDL} {
-		var stored string
-		err := db.QueryRow(`SELECT COALESCE(sql,'') FROM sqlite_master WHERE type='table' AND name=?`, table).Scan(&stored)
-		if err != nil || stored == "" {
+// migrateRentalSchema moves older local roots forward without tying their data to the
+// executable that last wrote it. Paid-rental safety comes from preserving lifecycle rows,
+// not from comparing sqlite_master's formatting with a Go string.
+func migrateRentalSchema(db *sql.DB, path string) *exit.Error {
+	columns, err := tableColumns(db, "rentals")
+	if err != nil {
+		return exit.Internalf("cannot inspect the rentals schema in %s: %s", path, err)
+	}
+	if !columns["package_ref"] {
+		return exit.Internalf("cannot migrate the rentals schema in %s: package_ref is absent", path)
+	}
+	for _, column := range []struct {
+		name string
+		ddl  string
+	}{
+		{"placement_revision", `INTEGER NOT NULL DEFAULT 0`},
+		{"observed_accelerator", `TEXT NOT NULL DEFAULT ''`},
+		{"observed_accelerator_count", `INTEGER NOT NULL DEFAULT 0`},
+		{"observed_backend", `TEXT NOT NULL DEFAULT ''`},
+		{"observed_driver_version", `TEXT NOT NULL DEFAULT ''`},
+		{"observed_backend_version", `TEXT NOT NULL DEFAULT ''`},
+		{"observed_device_memory_total_bytes", `INTEGER NOT NULL DEFAULT 0`},
+		{"observed_worker_instance", `TEXT NOT NULL DEFAULT ''`},
+		{"observed_worker_boot_id", `TEXT NOT NULL DEFAULT ''`},
+		{"observed_at", `TEXT NOT NULL DEFAULT ''`},
+		{"artifact_grant_revision", `INTEGER NOT NULL DEFAULT 0`},
+	} {
+		if columns[column.name] {
 			continue
 		}
-		if normalizeDDL(stored) != normalizeDDL(expected) {
-			return exit.Named(exit.Conflict, "records.rental_schema_mismatch",
-				"table %s in %s was written by a different Creator build", table, path).
-				WithRemedy("release its rentals with the binary that wrote it (`cozy rental list`, `cozy rental end <id> --yes`), or delete %s if nothing there is still rented", path)
+		if _, err := db.Exec(`ALTER TABLE rentals ADD COLUMN ` + column.name + ` ` + column.ddl); err != nil {
+			return exit.Internalf("cannot add rentals.%s in %s: %s", column.name, path, err)
 		}
 	}
 	return nil
-}
-
-func normalizeDDL(ddl string) string {
-	return strings.Join(strings.Fields(strings.Replace(ddl, "IF NOT EXISTS ", "", 1)), " ")
 }
 
 // rentalStateRank orders the hub's lifecycle words so a delayed observation never moves a
