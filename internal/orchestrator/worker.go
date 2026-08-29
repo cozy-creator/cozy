@@ -804,7 +804,7 @@ func (c *Orchestrator) spawnWorker(spec WorkerLaunchSpec) (string, *exit.Error) 
 		"--socket", listen,
 		"--out", filepath.Join(root, "run"),
 		"--instance-id", instanceID,
-		"--package-release-id", spec.Placement.PackageReleaseID,
+		"--release-id", spec.Placement.PackageReleaseID,
 		"--devices", strings.Join(spec.Devices, ","),
 		"--grace", strconv.FormatFloat(graceOr(spec.GraceSec), 'f', -1, 64),
 	)
