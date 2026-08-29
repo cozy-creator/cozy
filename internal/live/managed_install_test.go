@@ -33,7 +33,6 @@ func TestQualifiedManagedLocalInstall(t *testing.T) {
 	mustWrite(t, filepath.Join(projectTree, "pyproject.toml"), "[project]\nname=\"marco\"\nversion=\"1.0.0\"\n")
 	mustWrite(t, filepath.Join(projectTree, "endpoint.toml"), "[application]\nobject=\"marco:app\"\n")
 	mustWrite(t, filepath.Join(projectTree, "marco.py"), "app=object()\n")
-	mustWrite(t, filepath.Join(projectTree, "endpoint.descriptor.json"), `{"application":"marco:app","entrypoints":[],"format":"cozy.endpoint.descriptor/1","jobs":[]}`)
 	packed, problem := wheel.Pack(wheel.Request{Tree: projectTree, OutDir: t.TempDir()})
 	fatal(t, problem)
 	wheelBytes := mustRead(t, packed.Path)
@@ -146,10 +145,10 @@ print(json.dumps({"digest":"sha256:"+hashlib.sha256(receipt).hexdigest(),"genera
 	writeExecutable(t, filepath.Join(base, "bin", "cozy-environment-proof"), environmentProof(runtimeReceipt))
 	writeExecutable(t, filepath.Join(base, "bin", "cozy-runtime"), //cozy:allow independent Runtime CLI fixture, not a product execution door
 		`#!/usr/bin/python3
-import hashlib,json,pathlib,sys
+import base64,hashlib,json,pathlib,sys
 if "describe" in sys.argv:
  pathlib.Path("`+proofOrder+`").open("a").write("descriptor\n")
- print(json.dumps({"descriptor_digest":"`+digestText(descriptor)+`"}))
+ print(base64.b64decode("`+base64.StdEncoding.EncodeToString(descriptor)+`").decode())
 elif "doctor" in sys.argv:
  pathlib.Path("`+proofOrder+`").open("a").write("host\n")
  print(json.dumps({"device":{"name":"NVIDIA GeForce RTX 4090","state":"present","sm":89,"vram_total_bytes":1,"driver_version":"580.1.2","cuda_version":"13.0"},"host":{"platform":"fixture","ram_total_bytes":1,"vcpu_count":1},"cas":{"root":"/tmp","present":True,"artifacts":0},"credentials":[],"unreadable":[]}))
@@ -293,7 +292,7 @@ print(json.dumps({"digest":"sha256:"+hashlib.sha256(evidence).hexdigest(),"lengt
 	writeExecutable(t, filepath.Join(base, "bin", "cozy-runtime"), //cozy:allow independent Runtime CLI mismatch fixture
 		`#!/usr/bin/python3
 import json,sys
-if "describe" in sys.argv: print(json.dumps({"descriptor_digest":"sha256:`+strings.Repeat("d", 64)+`"}))
+if "describe" in sys.argv: print(json.dumps({"application":"other:app","entrypoints":[],"format":"cozy.endpoint.descriptor/1","jobs":[]},separators=(",",":"),sort_keys=True))
 elif "doctor" in sys.argv: print(json.dumps({"device":{"name":"NVIDIA GeForce RTX 4090","state":"present","cuda_version":"13.0"}}))
 else: raise SystemExit(2)
 `)

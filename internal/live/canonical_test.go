@@ -243,7 +243,7 @@ func TestNumberProfile(t *testing.T) {
 // authors and Creator consumes at install. Identity is the canonical content and nothing
 // else, and a descriptor that cannot be read exactly is refused rather than guessed at.
 func TestEndpointDescriptor(t *testing.T) {
-	raw := []byte(`{"application":"probe:app","entrypoints":[{"hidden":false,"name":"run","request":{"fields":[{"constraints":{"gt":0},"name":"strength","type":"float","wire":"required"},{"name":"mode","type":{"literal":["fast","quality"]},"wire":"required"}]},"result":{"fields":[]}}],"format":"cozy.endpoint.descriptor/1","jobs":[]}`)
+	raw := []byte(`{"application":"probe:app","entrypoints":[{"name":"run","request":{"fields":[{"constraints":{"gt":0},"name":"strength","type":"float"},{"name":"mode","type":{"literal":["fast","quality"]}}]},"result":{"fields":[]}}],"format":"cozy.endpoint.descriptor/1","jobs":[]}`)
 	want, err := canonical.Spell(canonical.Digest(raw))
 	must(t, err)
 	doc, problem := launch.DecodeDescriptor(raw)
@@ -256,6 +256,9 @@ func TestEndpointDescriptor(t *testing.T) {
 	}
 	// The declared constraints are real Creator validators, not documentation.
 	ep := &doc.Entrypoints[0]
+	if ep.Request.Fields[0].Wire != "required" || ep.Request.Fields[1].Wire != "required" {
+		t.Fatalf("absent wire did not derive required: %+v", ep.Request.Fields)
+	}
 	if launch.ValidatePayload(ep, []byte(`{"strength":0,"mode":"fast"}`)) == nil {
 		t.Error("gt:0 admitted 0")
 	}
@@ -265,7 +268,7 @@ func TestEndpointDescriptor(t *testing.T) {
 	// Whitespace and key order are NOT identity; a meaning change is.
 	for _, same := range [][]byte{
 		bytes.Replace(raw, []byte(`,"entrypoints"`), []byte(", \"entrypoints\""), 1),
-		[]byte(`{"jobs":[],"format":"cozy.endpoint.descriptor/1","entrypoints":[{"result":{"fields":[]},"request":{"fields":[{"wire":"required","type":"float","name":"strength","constraints":{"gt":0}},{"wire":"required","type":{"literal":["fast","quality"]},"name":"mode"}]},"name":"run","hidden":false}],"application":"probe:app"}`),
+		[]byte(`{"jobs":[],"format":"cozy.endpoint.descriptor/1","entrypoints":[{"result":{"fields":[]},"request":{"fields":[{"type":"float","name":"strength","constraints":{"gt":0}},{"type":{"literal":["fast","quality"]},"name":"mode"}]},"name":"run"}],"application":"probe:app"}`),
 	} {
 		got, problem := launch.DecodeDescriptor(same)
 		if problem != nil || got.Digest != want || !bytes.Equal(got.Raw, raw) {
@@ -282,14 +285,42 @@ func TestEndpointDescriptor(t *testing.T) {
 		"non-finite number": bytes.Replace(raw, []byte(`"gt":0`), []byte(`"gt":NaN`), 1),
 		"embedded surface_digest": bytes.Replace(raw, []byte(`{"application"`),
 			[]byte(`{"surface_digest":"sha256:`+strings.Repeat("0", 64)+`","application"`), 1),
-		"redundant callable kind": bytes.Replace(raw, []byte(`{"hidden"`),
-			[]byte(`{"kind":"entrypoint","hidden"`), 1),
+		"redundant callable kind": bytes.Replace(raw, []byte(`{"name":"run"`),
+			[]byte(`{"kind":"entrypoint","name":"run"`), 1),
+		"retired hidden marker": bytes.Replace(raw, []byte(`{"name":"run"`),
+			[]byte(`{"hidden":false,"name":"run"`), 1),
+		"explicit required wire": bytes.Replace(raw, []byte(`"type":"float"`),
+			[]byte(`"type":"float","wire":"required"`), 1),
 		"unsupported constraint": bytes.Replace(raw, []byte(`"gt":0`), []byte(`"lt":1`), 1),
 		"retired enum grammar": bytes.Replace(raw, []byte(`{"literal":["fast","quality"]}`),
 			[]byte(`{"enum":"Mode","values":["fast","quality"]}`), 1),
 	} {
 		if _, refusal := launch.DecodeDescriptor(planted); refusal == nil {
 			t.Errorf("%s was accepted at the descriptor boundary", name)
+		}
+	}
+}
+
+func TestCompactEndpointDescriptor(t *testing.T) {
+	raw := []byte(`{"application":"probe:app","entrypoints":[{"models":[{"class":"Model","component_use":{"run":["transformer"]},"path":"run.models.model","stamps":{"task":"generate"}}],"name":"run","request":{"fields":[{"name":"message","type":"str"},{"name":"event","type":{"tag_field":"type","union":[{"fields":[{"name":"image","type":"str"}],"tag":"image"},{"fields":[{"name":"video","type":"str"}],"tag":"video"}]}}]},"result":{"fields":[]}}],"format":"cozy.endpoint.descriptor/1","jobs":[]}`)
+	doc, problem := launch.DecodeDescriptor(raw)
+	fatal(t, problem)
+	ep := &doc.Entrypoints[0]
+	if ep.Request.Fields[0].Wire != "required" || len(ep.Models) != 1 || ep.Models[0].Param != "model" {
+		t.Fatalf("compact defaults were not derived: %+v %+v", ep.Request.Fields, ep.Models)
+	}
+
+	for name, planted := range map[string][]byte{
+		"retired model param": bytes.Replace(raw, []byte(`"path":"run.models.model"`),
+			[]byte(`"param":"model","path":"run.models.model"`), 1),
+		"member repeats tag field": bytes.Replace(raw, []byte(`{"fields":[{"name":"image"`),
+			[]byte(`{"fields":[{"name":"type","type":"str"},{"name":"image"`), 1),
+		"member repeats wrapper": bytes.Replace(raw,
+			[]byte(`{"fields":[{"name":"image","type":"str"}],"tag":"image"}`),
+			[]byte(`{"fields":[{"name":"image","type":"str"}],"tag":"image","tag_field":"type"}`), 1),
+	} {
+		if _, refusal := launch.DecodeDescriptor(planted); refusal == nil {
+			t.Errorf("%s was accepted at the compact descriptor boundary", name)
 		}
 	}
 }

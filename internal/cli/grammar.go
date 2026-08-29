@@ -71,18 +71,15 @@ func (c *EndpointListCmd) Run(r *Runtime) error {
 }
 
 type EndpointPublishCmd struct {
-	Ref         string   `arg:"" name:"endpoint" help:"Endpoint name (org/name)."`
-	Release     string   `help:"Immutable endpoint release id." required:""`
-	Dir         string   `help:"Endpoint source tree." type:"path" default:"."`
-	Profiles    []string `name:"profile" help:"Approved compatibility profile." required:""`
-	CustomWheel []string `help:"Prebuilt custom wheel as profile=path."`
-	Reason      string   `help:"Audit reason recorded before publication." required:""`
+	Ref     string `arg:"" name:"endpoint" help:"Endpoint name (org/name)."`
+	Release string `help:"Immutable endpoint release id." required:""`
+	Dir     string `help:"Endpoint source tree." type:"path" default:"."`
+	Reason  string `help:"Audit reason recorded before publication." required:""`
 }
 
 func (c *EndpointPublishCmd) Run(r *Runtime) error {
 	return r.call(handleEndpointPublish, []string{c.Ref}, nil, values(
-		"--release", c.Release, "--dir", c.Dir, "--profile", c.Profiles,
-		"--custom-wheel", c.CustomWheel, "--reason", c.Reason),
+		"--release", c.Release, "--dir", c.Dir, "--reason", c.Reason),
 		[]string{"cozy endpoint install " + c.Ref + "@" + c.Release}, false)
 }
 

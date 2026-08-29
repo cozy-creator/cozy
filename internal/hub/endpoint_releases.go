@@ -39,10 +39,9 @@ type EndpointProfileState struct {
 }
 
 type EndpointReleaseBegin struct {
-	DeclarationDigest string                 `json:"declaration_digest"`
-	State             string                 `json:"state"`
-	Uploads           []EndpointUpload       `json:"uploads"`
-	Profiles          []EndpointProfileState `json:"profiles"`
+	DeclarationDigest string           `json:"declaration_digest"`
+	State             string           `json:"state"`
+	Uploads           []EndpointUpload `json:"uploads"`
 }
 
 type EndpointExecution struct {

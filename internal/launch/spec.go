@@ -45,7 +45,7 @@ type Facts struct {
 // install, and the runtime that proved it.
 func Read(gen records.EndpointInstall, cozyHome string, env []string) (*Facts, *exit.Error) {
 	source := SourceDir(gen)
-	d, e := ReadDescriptor(source, gen.Descriptor)
+	d, e := ReadDescriptor(DescriptorPath(gen.Dir), gen.Descriptor)
 	if e != nil {
 		return nil, e
 	}
@@ -114,26 +114,18 @@ func (f *Facts) Placement() (orchestrator.DesiredPlacement, *exit.Error) {
 		Endpoint:  f.Install.Endpoint,
 		ReleaseID: ReleaseID(f.Install),
 		InstallID: f.Install.ID,
-		// The descriptor this install already VERIFIED in the generation's own venv
-		// (cr-003's `describe --check`). It names the placement's surface by digest.
+		// The descriptor this install derived in the generation's own Runtime. It names
+		// the placement's surface by digest.
 		DescriptorDigest: f.Install.Descriptor,
 	}
-	hidden := []string{}
 	for i := range f.Descriptor.Entrypoints {
 		ep := &f.Descriptor.Entrypoints[i]
-		// THE SERVING SET EXCLUDES HIDDEN SURFACES (#572d). Not a filter on rendering — a
-		// filter on what gets a binding staged at all, which is the only place the hide can
-		// be structural rather than documentary.
-		if ep.Hidden {
-			hidden = append(hidden, ep.Name)
-			continue
-		}
 		var binding *orchestrator.Binding
 		if len(plans) > 0 {
 			p, ok := plans[ep.Name]
 			if !ok {
 				return orchestrator.DesiredPlacement{}, exit.Internalf(
-					"runtime reported no canonical weightless plan for visible entrypoint %s", ep.Name)
+					"runtime reported no canonical weightless plan for entrypoint %s", ep.Name)
 			}
 			binding = &orchestrator.Binding{
 				Entrypoint: ep.Name,
@@ -153,9 +145,6 @@ func (f *Facts) Placement() (orchestrator.DesiredPlacement, *exit.Error) {
 		}
 		placement.Bindings = append(placement.Bindings, binding)
 	}
-	if len(hidden) > 0 {
-		placement.Hidden = hidden
-	}
 	if len(placement.Bindings) == 0 {
 		// A release whose descriptor registers no entrypoint has no plan to advertise. A job
 		// function is not one; `cozy invoke run` selects its job lifecycle instead.
@@ -167,7 +156,7 @@ func (f *Facts) Placement() (orchestrator.DesiredPlacement, *exit.Error) {
 	}
 	if len(plans) != len(placement.Bindings) && len(plans) > 0 {
 		return orchestrator.DesiredPlacement{}, exit.Internalf(
-			"runtime reported %d weightless plans for %d visible entrypoints",
+			"runtime reported %d weightless plans for %d entrypoints",
 			len(plans), len(placement.Bindings))
 	}
 	return placement, nil

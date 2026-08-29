@@ -7,6 +7,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"os/exec"
 	"path/filepath"
 	"sort"
@@ -63,8 +64,7 @@ func TestEndpointPublishCLI(t *testing.T) {
 			}
 			digest := fixtureDigest(body)
 			_ = json.NewEncoder(w).Encode(map[string]any{"declaration_digest": digest,
-				"state": "pending", "uploads": rows,
-				"profiles": []map[string]string{{"profile": endpointprofile.CU126, "state": "candidate_pending"}, {"profile": endpointprofile.CU130, "state": "candidate_pending"}}})
+				"state": "pending", "uploads": rows})
 		case r.Method == http.MethodPut && strings.HasPrefix(r.URL.Path, "/put/"):
 			role := strings.TrimPrefix(r.URL.Path, "/put/")
 			if r.Header.Get("X-Test-Role") != role {
@@ -154,12 +154,12 @@ func TestEndpointPublishCLI(t *testing.T) {
 	home := t.TempDir()
 	run := func(args ...string) (int, string) {
 		cmd := exec.Command("/usr/bin/nice", append([]string{"-n", "19", cozyBin}, args...)...)
-		cmd.Env = childEnv(t, home, "TENSORHUB_URL="+server.URL, "TENSORHUB_TOKEN=admin")
+		cmd.Env = childEnv(t, home, "TENSORHUB_URL="+server.URL, "TENSORHUB_TOKEN=admin",
+			"PATH="+filepath.Join(source, ".test-bin")+":/usr/local/bin:/usr/bin:/bin")
 		body, _ := cmd.CombinedOutput()
 		return cmd.ProcessState.ExitCode(), string(body)
 	}
 	args := []string{"endpoint", "publish", "cozy/marco", "--release", "1.0.0", "--dir", source,
-		"--profile", endpointprofile.CU130, "--profile", endpointprofile.CU126,
 		"--reason", "fixture publish"}
 	if code, out := run(args...); code != 0 || !strings.Contains(out, "candidate-130") || !strings.Contains(out, "serving-pointer move ran") {
 		t.Fatalf("endpoint publish [exit %d]\n%s", code, out)
@@ -186,13 +186,23 @@ dependencies = []
 	mustWrite(t, filepath.Join(repo, "endpoint.toml"), "[application]\nobject = \"marco_polo:app\"\n")
 	mustWrite(t, filepath.Join(repo, "marco_polo.py"), "app = object()\n")
 	mustWrite(t, filepath.Join(repo, "uv.lock"), "version = 1\n")
-	mustWrite(t, filepath.Join(repo, "endpoint.descriptor.json"), `{"application":"marco_polo:app","entrypoints":[],"format":"cozy.endpoint.descriptor/1","jobs":[]}`)
-	mustWrite(t, filepath.Join(repo, "endpoint.release.json"), `{"compatible_accelerator_models":["NVIDIA GeForce RTX 4090"],"model_bindings":[],"model_roots":[]}`)
+	mustWrite(t, filepath.Join(repo, ".gitignore"), ".test-bin/\n.venv/\n")
 	git(t, repo, "init", "-q")
 	git(t, repo, "config", "user.email", "fixture@example.invalid")
 	git(t, repo, "config", "user.name", "Fixture")
 	git(t, repo, "add", ".")
 	git(t, repo, "commit", "-qm", "fixture")
+	fakeUV := filepath.Join(repo, ".test-bin", "uv")
+	mustWrite(t, fakeUV, `#!/bin/sh
+if [ "${0##*/}" = "cozy-runtime" ]; then # //cozy:allow independent Runtime CLI fixture
+  printf '%s\n' '{"application":"marco_polo:app","entrypoints":[],"format":"cozy.endpoint.descriptor/1","jobs":[]}'
+  exit 0
+fi
+mkdir -p "$UV_PROJECT_ENVIRONMENT/bin"
+cp "$0" "$UV_PROJECT_ENVIRONMENT/bin/cozy-runtime"
+chmod 755 "$UV_PROJECT_ENVIRONMENT/bin/cozy-runtime"
+`)
+	must(t, os.Chmod(fakeUV, 0o755))
 	return repo
 }
 
@@ -200,11 +210,7 @@ func fixtureDeclarationRoles(d endpointpublish.Declaration) map[string]endpointp
 	out := map[string]endpointpublish.ObjectRef{
 		"source_archive": d.SourceArchive, "source_lock": d.SourceLock,
 		"project_wheel": {Digest: d.ProjectWheel.Digest, Length: d.ProjectWheel.Length},
-		"descriptor":    d.Descriptor, "evaluated_config": d.EvaluatedConfig,
-	}
-	for _, custom := range d.CustomWheels {
-		role := "custom_wheel:" + custom.Wheel.Distribution + ":" + strings.TrimPrefix(custom.Wheel.Digest, "sha256:")
-		out[role] = endpointpublish.ObjectRef{Digest: custom.Wheel.Digest, Length: custom.Wheel.Length}
+		"descriptor":    d.Descriptor,
 	}
 	return out
 }

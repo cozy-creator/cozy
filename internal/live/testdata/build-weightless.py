@@ -139,7 +139,7 @@ def main() -> int:
             "--dir",
             str(tree),
             "describe",
-            "--write-descriptor",
+            "--json",
             cwd=tree,
             env=env,
         )
