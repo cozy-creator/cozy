@@ -110,7 +110,7 @@ REVEAL_SITES = {
     # worker as `Claim.proof` — the exact dual of the old metadata echo, and the only
     # place the value leaves this process (over the worker's own channel).
     "internal/orchestrator/owner.go",
-    # The byte plane's (#506b): the rental's owner token becomes the Authorization
+    # The byte plane's (#506b): the rental's media bearer becomes the Authorization
     # header for the POD's media server. Same rule as hub/hub.go one plane over — one
     # request builder, and the raw value is read exactly where it becomes a carrier.
     "internal/media/media.go",

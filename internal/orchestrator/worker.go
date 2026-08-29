@@ -964,7 +964,7 @@ func newWorker(instanceID string, spec WorkerLaunchSpec) *worker {
 // connectWorker registers an ALREADY-RUNNING worker (a rented pod's TLS leg, cl-015):
 // no spawn, no device grant (the pod's card is the pod's), no birth identity — the
 // conversation is the same claim the local path runs, dialed at the rental's address
-// with the pinned cert and the owner token as proof (#445).
+// with the pinned server cert and signed Creator ClaimProof (#445/proto-013).
 // The media plane remains the invocation byte path, but it is NOT a package distribution
 // path. Binding plans are ordinary artifact-grant subjects now: Tensorhub supplies their
 // locations and the worker verifies their digests while materializing PlacementSet/2.

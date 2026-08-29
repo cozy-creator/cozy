@@ -13,7 +13,7 @@
 // credential, and is the machine the bytes have to be on anyway (#506b).
 //
 // This client is a plain HTTPS client pinned to the pod's certificate. It holds the
-// rental's owner token because it is the one place that credential becomes an
+// rental's media bearer because it is the one place that credential becomes an
 // `Authorization` header for the media plane — the same rule `internal/hub` keeps for the
 // hub's; this bearer has no WorkerControl or Tensorhub authority.
 package media
@@ -187,7 +187,7 @@ type answer struct {
 	} `json:"error"`
 }
 
-// call is the ONE request builder, and therefore the one place the owner token becomes an
+// call is the ONE request builder, and therefore the one place the media bearer becomes an
 // Authorization header for this plane.
 func (c *Client) call(method, path string, body []byte) (answer, []byte, *exit.Error) {
 	var reader io.Reader
@@ -198,7 +198,7 @@ func (c *Client) call(method, path string, body []byte) (answer, []byte, *exit.E
 	if err != nil {
 		return answer{}, nil, exit.Internalf("cannot build the media request: %s", err)
 	}
-	request.Header.Set("Authorization", "Bearer "+c.spec.Token.Reveal()) //cozy:allow-reveal the one place a rental's owner token becomes the media plane's Authorization header
+	request.Header.Set("Authorization", "Bearer "+c.spec.Token.Reveal()) //cozy:allow-reveal the rental media bearer becomes an Authorization header only here
 	if body != nil {
 		request.Header.Set("Content-Type", "application/octet-stream")
 		request.ContentLength = int64(len(body))

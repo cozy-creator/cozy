@@ -19,11 +19,9 @@ import (
 // certificate to pin. This client provisions nothing and knows no provider; it asks, it
 // polls, and it releases.
 //
-// THE THIRD PIECE OF THE DIAL TRIPLE IS NOT THE HUB'S TO GIVE (#495e). The RENTER mints
-// the access token and sends only its sha256; the hub stores the hash, provisions the pod
-// with the hash, and has no column, no route and no code path that could hand a token
-// back. That is what makes the hub structurally incapable of authenticating to a pod it
-// rented out. A lost token is not recovered — it is re-minted by rotating the hash set.
+// Creator mints one media bearer and one Ed25519 rental key before the paid ask. Only the
+// bearer hash and public key cross this API. Tensorhub cannot open either pod door: the
+// media bearer stays here and the Creator private key signs ClaimProof/ArtifactDelegation.
 //
 // The contract is the hub's and is consumed verbatim, exactly as the catalog's is:
 //
@@ -58,8 +56,8 @@ const (
 	RentalReleased         = "released"
 )
 
-// Rental is one rented pod as the hub reports it. There is no token on it, and there is
-// no route that adds one: this host has the token because this host minted it.
+// Rental is one rented pod as the hub reports it. No plaintext media bearer or private
+// Creator key is part of this view.
 type Rental struct {
 	ID               string
 	State            string
@@ -71,9 +69,10 @@ type Rental struct {
 	// MediaAddress is the pod's BYTE PLANE (cl-014, ruled #506b): the co-resident media
 	// server's own listener, which is where an owner uploads a payload and downloads an
 	// output. The hub observed it and names it.
-	MediaAddress string
-	WorkerID     string
-	WorkerBootID string
+	MediaAddress     string
+	WorkerID         string
+	WorkerBootID     string
+	CreatorPublicKey string
 	// MediaTokenSHA256 is the pod media plane's LIVE credential set, as hashes. It is here so this host can
 	// see that the hash of the token it minted is one the pod was provisioned with —
 	// a comparison neither end can make by saying the token.
@@ -95,11 +94,11 @@ type ExactControlDocument struct {
 }
 
 // Ready answers whether this rental carries the whole dial triple and an observed
-// credential set. The caller still checks that set contains ITS token hash; Ready only
+// media credential set. The caller still checks that set contains its bearer hash; Ready only
 // prevents a partial ready projection from being mistaken for a usable pod.
 func (r Rental) Ready() bool {
 	return r.State == RentalReady && r.Address != "" && r.MediaAddress != "" &&
-		r.CertPEM != "" && r.WorkerID != "" && r.WorkerBootID != "" &&
+		r.CertPEM != "" && r.WorkerID != "" && r.WorkerBootID != "" && r.CreatorPublicKey != "" &&
 		len(r.MediaTokenSHA256) > 0 && r.ControlSnapshot != nil &&
 		r.PlacementRevision > 0
 }
@@ -107,20 +106,17 @@ func (r Rental) Ready() bool {
 // Attachable answers whether Tensorhub has published the complete, receipt-pinned
 // private control projection. Converging is deliberately not ready: it exists so the
 // renter's RecordOwner can claim the private WorkerControl service and return observed
-// convergence evidence without giving Tensorhub the renter credential or a second live
+// convergence evidence without giving Tensorhub the media bearer or a second live
 // control owner.
 func (r Rental) Attachable() bool {
 	return (r.State == RentalConverging || r.State == RentalReady) &&
 		r.Address != "" && r.MediaAddress != "" && r.CertPEM != "" &&
-		r.WorkerID != "" && r.WorkerBootID != "" && len(r.MediaTokenSHA256) > 0 &&
+		r.WorkerID != "" && r.WorkerBootID != "" && r.CreatorPublicKey != "" && len(r.MediaTokenSHA256) > 0 &&
 		r.ControlSnapshot != nil && r.PlacementRevision > 0
 }
 
 // HoldsMediaHash answers whether the pod media plane's live set carries this hash.
-// check that the pod it is about to dial was provisioned with the token it holds. Both
-// spellings are accepted because both exist: the wire's bare hex and the pod hash file's
-// `sha256:` line are one fact, and a comparison that knew only one would read as a
-// mismatch on the other.
+// Both bare and sha256-prefixed spellings describe the same value.
 func (r Rental) HoldsMediaHash(hash string) bool {
 	bare := strings.TrimPrefix(hash, "sha256:")
 	for _, h := range r.MediaTokenSHA256 {
@@ -143,6 +139,7 @@ type wireRental struct {
 	MediaAddress      string                `json:"media_address"`
 	WorkerID          string                `json:"worker_id"`
 	WorkerBootID      string                `json:"worker_boot_id"`
+	CreatorPublicKey  string                `json:"creator_public_key"`
 	MediaTokenSHA256  []string              `json:"media_token_sha256"`
 	ControlSnapshot   *ExactControlDocument `json:"control_snapshot"`
 	PlacementRevision uint64                `json:"placement_revision"`
@@ -171,6 +168,7 @@ func (w wireRental) rental() Rental {
 		Address:          w.WorkerAddress, CertPEM: w.CertPEM,
 		Detail: w.Detail, MediaAddress: w.MediaAddress,
 		WorkerID: w.WorkerID, WorkerBootID: w.WorkerBootID,
+		CreatorPublicKey: w.CreatorPublicKey,
 		MediaTokenSHA256: w.MediaTokenSHA256, ControlSnapshot: w.ControlSnapshot,
 		PlacementRevision: w.PlacementRevision,
 	}
@@ -236,15 +234,14 @@ func (c *Client) RentalSKUs(ctx context.Context) ([]RentalSKU, *exit.Error) {
 	return out, nil
 }
 
-// Rent asks for a pod, presenting the HASH of a token the caller has already minted. It
+// Rent asks for a pod, presenting the media bearer HASH and Creator public key minted before the ask. It
 // returns as soon as the hub has ACCEPTED the ask — provisioning is the hub's work and
 // this client watches it through `Rental`, because a POST that blocked until a pod booted
 // would be a request whose failure mode is a lost id.
 //
-// `tokenSHA256` is the BARE 64 lowercase hex — the spelling the hub's field takes; the
+// `mediaTokenSHA256` is the BARE 64 lowercase hex — the spelling the hub's field takes; the
 // `sha256:` prefix is the token-hash FILE's spelling and belongs to the pod, not the wire.
-// The token itself is not an argument here, in this package, or anywhere on this wire: a
-// hub that was sent a plaintext credential would be a hub that could use it.
+// The bearer itself is not an argument here or anywhere on this wire.
 // Rent retransmits the exact canonical bytes the caller persisted before the
 // paid mutation. The hub authority is bound separately by the local operation
 // digest; a retry against another hub therefore conflicts before this method.

@@ -222,16 +222,30 @@ func (c *Orchestrator) converse(w *worker, addr string) error {
 	}()
 	defer close(s.out)
 
-	proof := w.bootstrap.Reveal()
+	var proof []byte
+	claimWorkerID, claimBootID := "", ""
 	if w.spec.Connection != nil {
-		proof = "" // mutual TLS already proves the provisioned per-rental Creator key
+		if c.opt.RentalClaimProof == nil {
+			return fmt.Errorf("the rental has no ClaimProof signer")
+		}
+		signed, problem := c.opt.RentalClaimProof(w.spec.Connection, recordOwnerEpoch)
+		if problem != nil {
+			c.refuseClaim(w, problem)
+			return fmt.Errorf("%s", problem.Message)
+		}
+		proof = signed
+		claimWorkerID, claimBootID = w.spec.Connection.WorkerID, w.spec.Connection.WorkerBootID
+	} else {
+		proof = []byte(w.bootstrap.Reveal())
 	}
 	s.send(&pb.RecordOwnerFrame{Msg: &pb.RecordOwnerFrame_Claim{Claim: &pb.Claim{
 		RecordOwnerEpoch: recordOwnerEpoch,
 		RecordOwnerId:    recordOwnerID,
+		WorkerId:         claimWorkerID,
+		WorkerBootId:     claimBootID,
 		WireMinor:        pb.WireMinor,
-		Proof:            []byte(proof),
-	}}}) //cozy:allow-reveal local bootstrap proof; rented workers carry an empty proof over authenticated mTLS
+		Proof:            proof,
+	}}}) //cozy:allow-reveal local bootstrap or signed rental ClaimProof crosses only on Claim
 
 	// WatchProgress rides a PHYSICALLY separate connection (01) once the claim lands;
 	// opened after ClaimAck below.

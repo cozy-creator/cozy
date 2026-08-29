@@ -174,6 +174,12 @@ cozy rental end <rental-id>
 GPU names and prices come from Tensorhub's Cozy-owned rental catalog. Creator never exposes or
 reads RunPod SKU names or provider prices.
 
+Each rental has one local Ed25519 Creator key and one separate media bearer. Creator signs the
+exact worker/boot/TLS identity it claims and sends only signed package/model intent over
+WorkerControl. The worker resolves and downloads those artifacts directly from Tensorhub; Creator
+never requests or relays package/model download URLs. Both credentials are removed when the rental
+ends, and a lost Creator key requires a new rental.
+
 Rentals can continue billing until Tensorhub confirms their termination. `rental end` and
 `down --all` keep the Cozy daemon alive when remote absence cannot be confirmed.
 

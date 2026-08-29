@@ -3,10 +3,9 @@
 // the orchestrator attaches a remote worker with.
 //
 // The split is deliberate and is the same one cl-006 already made for the CLI's own
-// credential: the FACTS are rows in the records authority (they are durable lifecycle
-// state and every reader may see them), and the OWNER TOKEN is a 0600 file (every reader
-// of the database may NOT). The pinned certificate is public and sits beside it as a file
-// only because that is what crypto/x509 wants to be handed.
+// credential: facts are rows in the records authority; the media bearer and Creator
+// private key are separate 0600 files. The pinned worker certificate is public and sits
+// beside them because crypto/x509 consumes a file.
 package rental
 
 import (
@@ -69,6 +68,13 @@ func Attach(l home.Layout, st *records.Store, row records.Rental, cert string, t
 					"rental %s changed its pinned certificate before attachment", row.ID)
 			}
 		}
+		if _, err := os.Stat(l.RentalCreatorIdentity(row.ID)); err == nil {
+			existing, problem := loadCreatorIdentity(l.RentalCreatorIdentity(row.ID))
+			if problem != nil || existing.PublicKey() != creator.PublicKey() {
+				return exit.Named(exit.Conflict, "rental.creator_identity_conflict",
+					"rental %s already belongs to another Creator key", row.ID)
+			}
+		}
 	}
 	if err := os.MkdirAll(l.Rentals, 0o700); err != nil {
 		return exit.Internalf("cannot create the rental credential root %s: %s", l.Rentals, err)
@@ -76,7 +82,7 @@ func Attach(l home.Layout, st *records.Store, row records.Rental, cert string, t
 	if err := os.WriteFile(l.RentalCert(row.ID), []byte(cert), 0o644); err != nil {
 		return exit.Internalf("cannot pin the rental's certificate: %s", err)
 	}
-	if e := write0600(l.RentalToken(row.ID), secret.FileBody(token)); e != nil {
+	if e := write0600(l.RentalMediaToken(row.ID), secret.FileBody(token)); e != nil {
 		return e
 	}
 	if len(creator.pem) == 0 {
@@ -92,11 +98,11 @@ func Attach(l home.Layout, st *records.Store, row records.Rental, cert string, t
 // PendingToken establishes the plaintext credential BEFORE a paid POST. O_EXCL makes the
 // file the winner under concurrent retries of one operation key: every contender then
 // reads the same token instead of truncating it with fresh entropy.
-func PendingToken(l home.Layout, operationKey string) (secret.Value, *exit.Error) {
+func PendingMediaToken(l home.Layout, operationKey string) (secret.Value, *exit.Error) {
 	if err := os.MkdirAll(l.Rentals, 0o700); err != nil {
 		return secret.Value{}, exit.Internalf("cannot create the rental credential root %s: %s", l.Rentals, err)
 	}
-	path := l.PendingRentalToken(operationKey)
+	path := l.PendingRentalMediaToken(operationKey)
 	f, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
 	if errors.Is(err, os.ErrExist) {
 		return tokenAt(path, "pending rental operation "+operationKey)
@@ -139,7 +145,7 @@ func PendingToken(l home.Layout, operationKey string) (secret.Value, *exit.Error
 // ForgetPending removes the pre-id token only after the operation is attached or proved
 // terminal. An interrupted poll deliberately leaves it for the exact-key retry.
 func ForgetPending(l home.Layout, operationKey string) {
-	_ = os.Remove(l.PendingRentalToken(operationKey))
+	_ = os.Remove(l.PendingRentalMediaToken(operationKey))
 	_ = os.Remove(l.PendingRentalCreatorIdentity(operationKey))
 }
 
@@ -153,28 +159,28 @@ func Forget(l home.Layout, st *records.Store, id string) (bool, *exit.Error) {
 	if e != nil {
 		return false, e
 	}
-	_ = os.Remove(l.RentalToken(id))
+	_ = os.Remove(l.RentalMediaToken(id))
 	_ = os.Remove(l.RentalCert(id))
 	_ = os.Remove(l.RentalCreatorIdentity(id))
 	return forgotten, nil
 }
 
-// Token reads one rental's owner token back, refusing a file whose mode widened. Reading
+// MediaToken reads one rental's media bearer back, refusing a file whose mode widened. Reading
 // a credential that became group- or world-readable would be this client agreeing to a
 // leak it created the file to prevent — cl-006's rule for the CLI credential, and the
 // same one here because it is the same class of file.
-func Token(l home.Layout, id string) (secret.Value, *exit.Error) {
+func MediaToken(l home.Layout, id string) (secret.Value, *exit.Error) {
 	if e := validID(id); e != nil {
 		return secret.Value{}, e
 	}
-	return tokenAt(l.RentalToken(id), "rental "+id)
+	return tokenAt(l.RentalMediaToken(id), "rental "+id+" media plane")
 }
 
 func tokenAt(path, subject string) (secret.Value, *exit.Error) {
 	info, err := os.Stat(path)
 	if err != nil {
 		return secret.Value{}, exit.New(exit.NotFound,
-			"%s has no owner token on this host", subject).
+			"%s has no media bearer on this host", subject).
 			WithRemedy("`cozy rental new` writes it when the pod comes ready; a rental rented elsewhere is not this host's").
 			WithNext("cozy rental list")
 	}
@@ -182,26 +188,26 @@ func tokenAt(path, subject string) (secret.Value, *exit.Error) {
 	// which already scopes COZY_HOME to the user, so the bits are not consulted.
 	if perm := info.Mode().Perm(); perm&0o077 != 0 && runtime.GOOS != "windows" {
 		return secret.Value{}, exit.New(exit.Credential,
-			"%s is mode %#o; a rental's owner token is 0600 or it is not used", path, perm).
+			"%s is mode %#o; a rental media bearer is 0600 or it is not used", path, perm).
 			WithRemedy("release this rental and rent again: every rental provisions its own token").
 			WithNext("cozy rental list")
 	}
 	data, err := os.ReadFile(path)
 	if err != nil {
 		return secret.Value{}, exit.New(exit.Credential,
-			"%s's owner token is unreadable: %s", subject, err)
+			"%s's media bearer is unreadable: %s", subject, err)
 	}
 	v := secret.New(string(data))
 	if !v.Present() {
 		return secret.Value{}, exit.New(exit.Credential,
-			"%s's owner token file is empty", subject).WithNext("cozy rental list")
+			"%s's media bearer file is empty", subject).WithNext("cozy rental list")
 	}
 	return v, nil
 }
 
 // Known is the non-secret target question. The HTTP layer asks it so a submission
 // naming an absent or not-yet-published pod is refused before a request row exists, and
-// so its plan resolves from the exact persisted snapshot. It never reads the owner token.
+// so its plan resolves from the exact persisted snapshot. It never reads the media bearer.
 func Known(st *records.Store) func(string) (*orchestrator.DesiredPlacement, *exit.Error) {
 	return func(id string) (*orchestrator.DesiredPlacement, *exit.Error) {
 		row, e := st.RentalRow(id)
@@ -298,7 +304,7 @@ func Resolver(l home.Layout, st *records.Store) func(string) (*orchestrator.Remo
 			return nil, e
 		}
 		facts.Placement.PlacementRevision = row.PlacementRevision
-		token, e := Token(l, id)
+		token, e := MediaToken(l, id)
 		if e != nil {
 			return nil, e
 		}
@@ -324,7 +330,7 @@ func Resolver(l home.Layout, st *records.Store) func(string) (*orchestrator.Remo
 			// media server holds its OWN keys — cl-014's rule, and this host pins the same
 			// PEM only because the stand-in provisioner mints one certificate covering both
 			// names. What this host never does is MINT anything: the bearer the media plane
-			// checks is the rental's provisioned owner token, whose digest reached the pod
+			// checks is the rental's provisioned media bearer, whose digest reached the pod
 			// as a launch grant from whoever provisioned it.
 			spec.Media = &media.Spec{Addr: row.MediaAddress, Token: token, CACert: cert}
 		}

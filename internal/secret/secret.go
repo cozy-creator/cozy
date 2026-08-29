@@ -86,7 +86,7 @@ func Mint() Value {
 func EnvEntry(name string, v Value) string { return name + "=" + v.raw }
 
 // FileBody is the FILE CARRIER: the one place a credential becomes the bytes of an
-// OS-protected 0600 handoff file (a rental's provisioned owner token, cl-015). The
+// OS-protected 0600 handoff file (a rental's provisioned media bearer, cl-015). The
 // caller writes bytes it never looked at, which is the same rule EnvEntry keeps.
 func FileBody(v Value) []byte { return []byte(v.raw + "\n") }
 

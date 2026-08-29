@@ -61,6 +61,8 @@ type Options struct {
 	// RecordRentalRefusal persists this owner's non-transient verdict on a private worker
 	// before the control stream closes. Without it a rejected ClaimAck exists only in RAM.
 	RecordRentalRefusal func(rentalID string, problem *exit.Error) *exit.Error
+	// RentalClaimProof signs the exact worker/boot/TLS leaf Creator is about to claim.
+	RentalClaimProof RentalClaimProofSource
 	// ArtifactDelegations signs the exact logical package/model intent after the worker
 	// snapshot barrier. The worker resolves bytes directly from Tensorhub over mTLS.
 	ArtifactDelegations ArtifactDelegationSource
@@ -86,6 +88,8 @@ type ArtifactDelegationRequest struct {
 	WorkerID     string
 	WorkerBootID string
 }
+
+type RentalClaimProofSource func(*WorkerConnection, uint64) ([]byte, *exit.Error)
 
 type ArtifactDelegation struct {
 	CanonicalBytes []byte

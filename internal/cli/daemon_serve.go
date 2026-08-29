@@ -111,6 +111,7 @@ func serveDaemon(ctx *Context) *exit.Error {
 		Cfg: ctx.Cfg, Layout: l, Store: st, Yield: yield, Log: ctx.Out,
 		Packages: resolver, Rentals: rentals, ObserveRental: rental.ObserveWorker(st),
 		RecordRentalRefusal:   rental.RecordControlRefusal(st),
+		RentalClaimProof:      rental.ClaimProof(l),
 		ArtifactDelegations:   rental.ArtifactDelegations(l, st),
 		RelayRentalSession:    rental.RelayWorkerSession(st, client(ctx)),
 		EnvironmentSpecDigest: environmentSpec, ConfigDigest: configDigest,

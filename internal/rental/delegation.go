@@ -15,7 +15,7 @@ import (
 	pb "github.com/cozy-creator/cozy/protocol/cozy/worker/v1"
 )
 
-const artifactDelegationTTL = time.Hour
+const artifactDelegationTTL = 30 * time.Minute
 
 // ArtifactDelegations derives every logical identity from Tensorhub's exact persisted
 // control snapshot. The orchestrator supplies only worker/boot facts learned on ClaimAck.
@@ -34,6 +34,11 @@ func ArtifactDelegations(l home.Layout, st *records.Store) orchestrator.Artifact
 		}
 		if row == nil {
 			return orchestrator.ArtifactDelegation{}, unknown(connection.RentalID)
+		}
+		if request.WorkerID != row.ExpectedWorkerID || request.WorkerBootID != row.ExpectedWorkerBootID {
+			return orchestrator.ArtifactDelegation{}, exit.Named(exit.Conflict,
+				"rental.artifact_delegation_worker_mismatch",
+				"artifact delegation worker/boot identity differs from Tensorhub readiness")
 		}
 		facts, problem := controlFacts(*row)
 		if problem != nil {

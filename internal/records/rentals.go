@@ -16,9 +16,9 @@ import (
 // so what it is lives in the same database as everything else durable here, and NOT in a
 // sidecar file that would outlive the fact it describes.
 //
-// What is deliberately NOT a column: the provisioned owner token. Every reader of this
+// What is deliberately NOT a column: the provisioned media bearer. Every reader of this
 // database would be a reader of that credential; the 0600 handoff beside it is the
-// boundary (home.Layout.RentalToken), exactly as the CLI's own credential is.
+// boundary (home.Layout.RentalMediaToken), exactly as the CLI's own credential is.
 
 const rentalOperationsDDL = `
 CREATE TABLE IF NOT EXISTS rental_operations (
@@ -313,7 +313,7 @@ type Rental struct {
 	RentedAt         string
 	// MediaAddress is where the pod's co-resident media server answers (cl-014). It is a
 	// FACT about the pod like the control address is, so it is a row and not a file; the
-	// credential it takes is the rental's own owner token, which stays 0600 beside it.
+	// credential it takes is the rental's media bearer, which stays 0600 beside it.
 	MediaAddress string
 	// ControlSnapshotBytes is the exact Tensorhub-authored, attempt-bound
 	// snapshot received on the ready view. It remains raw bytes in SQLite so a

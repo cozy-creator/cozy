@@ -3,16 +3,23 @@ package producttest
 import (
 	"bytes"
 	"crypto/ed25519"
+	"crypto/rand"
+	"crypto/x509"
+	"crypto/x509/pkix"
 	"encoding/base64"
 	"encoding/json"
+	"encoding/pem"
+	"math/big"
 	"os"
 	"runtime"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/cozy-creator/cozy/internal/canonical"
 	"github.com/cozy-creator/cozy/internal/home"
 	"github.com/cozy-creator/cozy/internal/hub"
+	"github.com/cozy-creator/cozy/internal/orchestrator"
 	"github.com/cozy-creator/cozy/internal/rental"
 	pb "github.com/cozy-creator/cozy/protocol/cozy/worker/v1"
 )
@@ -36,6 +43,37 @@ func TestRentalCreatorIdentityAndDelegation(t *testing.T) {
 	if runtime.GOOS != "windows" && info.Mode().Perm() != 0o600 {
 		t.Fatalf("Creator identity mode = %#o, want 0600", info.Mode().Perm())
 	}
+	finalIdentity := layout.RentalCreatorIdentity("rnt-01K5PROTO013")
+	must(t, os.Rename(layout.PendingRentalCreatorIdentity("paid-operation-1"), finalIdentity))
+	workerCert := testWorkerCertificate(t)
+	workerCertPath := layout.RentalCert("rnt-01K5PROTO013")
+	must(t, os.WriteFile(workerCertPath, workerCert, 0o644))
+	claimSigner := rental.ClaimProof(layout)
+	claimSignature, problem := claimSigner(&orchestrator.WorkerConnection{
+		RentalID: "rnt-01K5PROTO013", CACert: workerCertPath,
+		WorkerID: "wrk-4070", WorkerBootID: "boot-9f21",
+	}, 41)
+	fatal(t, problem)
+	certificateBlock, _ := pem.Decode(workerCert)
+	certificateDigest := canonical.Digest(certificateBlock.Bytes)
+	claimBytes, err := canonical.Bytes(&pb.ClaimProof{
+		RecordOwnerEpoch: 41, WorkerBootId: "boot-9f21", WorkerId: "wrk-4070",
+		WorkerTlsCertificateDigest: certificateDigest,
+	})
+	must(t, err)
+	if len(claimSignature) != ed25519.SignatureSize || !ed25519.Verify(public, claimBytes, claimSignature) {
+		t.Fatal("ClaimProof was not signed by the persisted rental key")
+	}
+	fixedDigest, _ := canonical.Raw("sha256:4c5b5699f2d99ebf9195c1e518d13c94539bbd4ba670a46199f6d79d58d15721")
+	fixedClaim, err := canonical.Bytes(&pb.ClaimProof{
+		RecordOwnerEpoch: 41, WorkerBootId: "boot-9f21", WorkerId: "wrk-4070",
+		WorkerTlsCertificateDigest: fixedDigest,
+	})
+	must(t, err)
+	wantClaim := []byte(`{"format":"cozy.worker.v1.ClaimProof/1","record_owner_epoch":41,"worker_boot_id":"boot-9f21","worker_id":"wrk-4070","worker_tls_certificate_digest":"sha256:4c5b5699f2d99ebf9195c1e518d13c94539bbd4ba670a46199f6d79d58d15721"}`)
+	if !bytes.Equal(fixedClaim, wantClaim) {
+		t.Fatalf("ClaimProof differs from worker-protocol vector:\n got %s\nwant %s", fixedClaim, wantClaim)
+	}
 
 	request, problem := hub.RentalRequestBytes("cozy/marco-polo/v1/marco", "cpu",
 		strings.Repeat("1", 64), identity.PublicKey())
@@ -47,7 +85,7 @@ func TestRentalCreatorIdentityAndDelegation(t *testing.T) {
 		t.Fatalf("rental create authority is not the hardcut shape: %s", request)
 	}
 
-	certificateDigest, _ := canonical.Raw("sha256:4c5b5699f2d99ebf9195c1e518d13c94539bbd4ba670a46199f6d79d58d15721")
+	certificateDigest = fixedDigest
 	document := &pb.ArtifactDelegation{
 		RentalId: "rnt-01K5PROTO013", WorkerId: "wrk-4070", WorkerBootId: "boot-9f21",
 		WorkerTlsCertificateDigest: certificateDigest, Revision: 4,
@@ -68,4 +106,18 @@ func TestRentalCreatorIdentityAndDelegation(t *testing.T) {
 	if len(signature) != ed25519.SignatureSize || !ed25519.Verify(public, canonicalBytes, signature) {
 		t.Fatal("the persisted rental key did not sign the exact delegation bytes")
 	}
+}
+
+func testWorkerCertificate(t *testing.T) []byte {
+	t.Helper()
+	public, private, err := ed25519.GenerateKey(rand.Reader)
+	must(t, err)
+	template := &x509.Certificate{
+		SerialNumber: big.NewInt(1), Subject: pkix.Name{CommonName: "cozy-worker"},
+		NotBefore: time.Now().Add(-time.Minute), NotAfter: time.Now().Add(time.Hour),
+		KeyUsage: x509.KeyUsageDigitalSignature,
+	}
+	der, err := x509.CreateCertificate(rand.Reader, template, template, public, private)
+	must(t, err)
+	return pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der})
 }
