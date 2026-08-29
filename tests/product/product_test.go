@@ -131,6 +131,49 @@ func TestDaemonWebLifecycle(t *testing.T) {
 	}
 }
 
+func TestDefaultWebPortPreferenceAndFallback(t *testing.T) {
+	held, err := net.Listen("tcp4", "127.0.0.1:8818") //cozy:allow product proof occupies the preferred loopback port to exercise fallback
+	if err != nil {
+		t.Skipf("localhost:8818 is already occupied outside this product test: %v", err)
+	}
+
+	fallbackRoot := filepath.Join(os.TempDir(), "cozy-product-test", "default-port-fallback")
+	must(t, os.RemoveAll(fallbackRoot))
+	code, out := runCozy(t, fallbackRoot, "up", "--json", "--full")
+	if code != 0 {
+		held.Close()
+		t.Fatalf("up with occupied preferred port failed [exit %d]\n%s", code, out)
+	}
+	var fallback struct {
+		URL string `json:"url"`
+	}
+	if err := json.Unmarshal([]byte(out), &fallback); err != nil || fallback.URL == "" ||
+		strings.Contains(fallback.URL, ":8818") {
+		held.Close()
+		t.Fatalf("occupied 8818 did not select a fallback: %v\n%s", err, out)
+	}
+	if code, out := runCozy(t, fallbackRoot, "down"); code != 0 {
+		held.Close()
+		t.Fatalf("fallback daemon down [exit %d]\n%s", code, out)
+	}
+	must(t, held.Close())
+
+	preferredRoot := filepath.Join(os.TempDir(), "cozy-product-test", "default-port-preferred")
+	must(t, os.RemoveAll(preferredRoot))
+	t.Cleanup(func() { _, _ = runCozy(t, preferredRoot, "down", "--all") })
+	code, out = runCozy(t, preferredRoot, "up", "--json", "--full")
+	if code != 0 {
+		t.Fatalf("up on available preferred port failed [exit %d]\n%s", code, out)
+	}
+	var preferred struct {
+		URL string `json:"url"`
+	}
+	if err := json.Unmarshal([]byte(out), &preferred); err != nil ||
+		preferred.URL != "http://127.0.0.1:8818/" {
+		t.Fatalf("available default did not bind 8818: %v\n%s", err, out)
+	}
+}
+
 func TestDaemonStartupDiagnostic(t *testing.T) {
 	root := filepath.Join(os.TempDir(), "cozy-product-test", "daemon-startup-diagnostic")
 	must(t, os.RemoveAll(root))
