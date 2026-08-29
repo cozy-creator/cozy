@@ -3,6 +3,7 @@ package live
 import (
 	"archive/zip"
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -18,7 +19,31 @@ import (
 	"testing"
 
 	"github.com/cozy-creator/cozy-creator/internal/packageprofile"
+	"github.com/cozy-creator/cozy-creator/internal/transfer"
 )
+
+func TestEmptyPresignedUpload(t *testing.T) {
+	empty := filepath.Join(t.TempDir(), "empty.txt")
+	mustWrite(t, empty, "")
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPut || r.ContentLength != 0 || len(r.TransferEncoding) != 0 {
+			w.WriteHeader(http.StatusLengthRequired)
+			return
+		}
+		body, err := io.ReadAll(r.Body)
+		if err != nil || len(body) != 0 {
+			t.Errorf("empty PUT body = %q, %v", body, err)
+		}
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer server.Close()
+
+	uploaded, moved, problem := transfer.UploadPresigned(context.Background(), "empty.txt", empty,
+		server.URL, nil)
+	if problem != nil || !uploaded || moved != 0 {
+		t.Fatalf("empty PUT uploaded=%t bytes=%d: %v", uploaded, moved, problem)
+	}
+}
 
 func TestPackagePublishCLI(t *testing.T) {
 	source, testBin := packageFixture(t)
