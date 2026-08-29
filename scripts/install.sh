@@ -51,7 +51,7 @@ fi
 BIN="$PREFIX/bin"
 mkdir -p "$BIN"
 WAS="none"
-[ -x "$BIN/cozy" ] && WAS="$("$BIN/cozy" version --fields tag 2>/dev/null | grep "^tag:" || echo "tag: unreadable")"
+[ -x "$BIN/cozy" ] && WAS="$("$BIN/cozy" -v 2>/dev/null || echo "unreadable")"
 
 # The staging directory is INSIDE the target directory so the final move is a rename on one
 # filesystem. A cross-device install would copy, and a copy can be observed half-written.
@@ -62,8 +62,8 @@ tar -xzf "$ASSET" -C "$STAGE"
 chmod 0755 "$STAGE/cozy"
 mv -f "$STAGE/cozy" "$BIN/cozy"
 
-NOW="$("$BIN/cozy" version --fields tag 2>/dev/null | grep "^tag:")"
+NOW="$("$BIN/cozy" -v)"
 echo "verified: sha256:$GOT"
 echo "prefix:   $PREFIX"
-echo "was:      ${WAS#tag: }"
-echo "now:      ${NOW#tag: }"
+echo "was:      $WAS"
+echo "now:      $NOW"

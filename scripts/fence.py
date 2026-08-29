@@ -525,14 +525,8 @@ def check_secret_flags():
     return bad
 
 
-# A verb whose name reclaims or removes must declare how it is gated.
-RECLAIM_VERB = re.compile(r"\b(rm|gc|purge|delete|destroy|prune|reset|clean)\b")
-
-# AXI 10's three version spellings. They are answered before the manifest is even read;
-# as GlobalFlags rows they would instead be resolved by parse.findFlag, which checks
-# globals FIRST and would hand `cozy pack --version 1.2.3` to the wrong flag.
+# AXI 10's version spellings are answered before Kong or configuration loads.
 VERSION_SPELLINGS = ("--version", "-v", "-V")
-FLAG_SPELLING = re.compile(r'(?:Name|Short):\s*"(-[-A-Za-z0-9]*)"')
 
 
 def check_manifest():

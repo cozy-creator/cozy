@@ -103,7 +103,7 @@ for target in $TARGETS; do
   size="$(stat -c%s "$D/.build-a/$exe")"
   ran="no (this builder is $(go env GOOS)/$(go env GOARCH))"
   if [ "$goos/$goarch" = "$(go env GOOS)/$(go env GOARCH)" ]; then
-    got="$("$D/.build-a/$exe" version --fields tag 2>/dev/null | sed -n 's/^tag: *//p' || true)"
+    got="$("$D/.build-a/$exe" -v 2>/dev/null || true)"
     ran="ran here, reports tag ${got:-<none>}"
   fi
   echo "  built   $target -> $name (binary sha256:$a, reproduced, $ran)"
