@@ -4,26 +4,22 @@ import (
 	"fmt"
 	"strings"
 
+	"github.com/cozy-creator/cozy/internal/accountauth"
 	"github.com/cozy-creator/cozy/internal/exit"
 	"github.com/cozy-creator/cozy/internal/hub"
 	"github.com/cozy-creator/cozy/internal/output"
 )
 
-// The catalog verbs (cl-011). Launch-1 tensorhub has no identity plane (decisions
-// #229), so these split exactly two ways: a public read that carries no credential,
-// and a first-party write that carries the ONE static admin token. Nothing here
-// stores a credential, refreshes one, or knows what an account is.
+// The catalog verbs (cl-011). Reads are public; writes obtain a short bearer from
+// the account machine key unless the operator explicitly configured a static token.
 //
 // The line every one of them holds: a hub refusal reaches the user verbatim — the
 // hub's code, message and remedy — under a code from the shared exit matrix.
 
-// identityNote is the one sentence that keeps the deferral visible instead of
-// leaving a user to guess why there is no `cozy login`.
-const identityNote = "no accounts at Launch 1: catalog reads are public, first-party writes carry TENSORHUB_TOKEN (th-031 arms identity)"
-
 func client(ctx *Context) *hub.Client {
 	rev, _ := buildStamp()
-	return hub.New(ctx.Cfg, "cozy/"+tag+"+"+rev)
+	return hub.New(ctx.Cfg, "cozy/"+tag+"+"+rev).
+		WithTokenSource(accountauth.New(ctx.Cfg))
 }
 
 // stamp trims a hub timestamp to whole seconds — the catalog's own RFC3339 with

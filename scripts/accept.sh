@@ -43,7 +43,7 @@ run -v
 check "-v reports the release tag without loading config" "$([ "$CODE" = 0 ] && [ "$OUT" = "$WANT_TAG" ] && echo 1 || echo 0)" "$OUT"
 
 run
-for command in "package install" "model download" "invoke run" "rental new" "up" "down" "unload"; do
+for command in "package install" "model download" "auth login" "invoke run" "rental new" "up" "down" "unload"; do
   check "root help exposes $command" "$(printf '%s' "$OUT" | grep -q "$command" && echo 1 || echo 0)" "$OUT"
 done
 run help invoke run

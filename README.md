@@ -105,8 +105,8 @@ cozy package publish
 ```
 
 This publishes `paul/marco-polo-package@1.0.0`; Cozy never invents a `v` prefix. The destination
-comes from `tensorhub_url` configuration and the credential from `tensorhub_token` or
-`TENSORHUB_TOKEN`, not from publish flags.
+comes from `tensorhub_url`. An enrolled machine authenticates automatically; an operator may still
+configure `tensorhub_token` or `TENSORHUB_TOKEN` explicitly.
 
 Publication succeeds even when no compatible base worker image is currently active. The package
 appears in the catalog immediately, and Tensorhub qualifies the same immutable release when a
@@ -226,6 +226,19 @@ Supported environment variables are limited to:
 The daemon launcher also uses a private per-process bootstrap credential. Secrets are never
 accepted as command-line values.
 
+## Authentication
+
+Register or recover this Creator installation directly from the CLI:
+
+```sh
+cozy auth login person@example.com
+```
+
+Tensorhub emails a one-time code. After it is entered, Cozy stores only this installation's
+Ed25519 machine key under its mode-0700 home and mode-0600 credential file. Short AuthKit access
+tokens stay in memory. Later authenticated commands sign a one-time challenge automatically; there
+is no refresh token or repeated login command.
+
 ## Output and automation
 
 Commands print concise human-readable results by default. `--json` emits stable structured output
@@ -252,5 +265,5 @@ and contextual next action.
 Shell exits are intentionally small: `0` success or idempotent no-op, `2` invocation/configuration
 error, and `1` operational failure.
 
-Authentication, billing management, datasets, and the full web UI are planned later; Cozy does
+Billing management, datasets, passkey recovery, and the full web UI are planned later; Cozy does
 not advertise placeholder commands for features that do not exist yet.

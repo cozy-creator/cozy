@@ -242,7 +242,7 @@ func (c *Client) RentalSKUs(ctx context.Context) ([]RentalSKU, *exit.Error) {
 func (c *Client) Rent(ctx context.Context, requestBody []byte, reason, operationKey string) (Rental, *exit.Error) {
 	var out wireRental
 	e := c.do(ctx, call{
-		method: http.MethodPost, path: "/v1/rentals", admin: true, reason: reason,
+		method: http.MethodPost, path: "/v1/rentals", auth: true, reason: reason,
 		idempotency: operationKey, bodyBytes: requestBody, responseBytes: maxRentalResponseBytes,
 	}, &out)
 	if e != nil {
@@ -263,14 +263,14 @@ func (w wireRental) named(what string) *exit.Error {
 	return validateRentalID(w.ID)
 }
 
-// Rental reads one rental's current state. Admin, like every first-party route.
+// Rental reads one rental's current state using the renter's account authority.
 func (c *Client) Rental(ctx context.Context, id string) (Rental, *exit.Error) {
 	if e := validateRentalID(id); e != nil {
 		return Rental{}, e
 	}
 	var out wireRental
 	e := c.do(ctx, call{method: http.MethodGet, path: "/v1/rentals/" + url.PathEscape(id),
-		admin: true, responseBytes: maxRentalResponseBytes}, &out)
+		auth: true, responseBytes: maxRentalResponseBytes}, &out)
 	if e != nil {
 		return Rental{}, e
 	}
@@ -354,7 +354,7 @@ func (c *Client) ObserveWorkerSession(ctx context.Context, id string,
 	e := c.do(ctx, call{
 		method: http.MethodPost,
 		path:   "/v1/rentals/" + url.PathEscape(id) + "/worker-observations",
-		admin:  true, reason: "cozy RecordOwner worker session observation",
+		auth:   true, reason: "cozy RecordOwner worker session observation",
 		body: observation,
 	}, &out)
 	if e != nil {
@@ -408,7 +408,7 @@ func (c *Client) ArtifactGrant(ctx context.Context, id string, revision uint64,
 	e := c.do(ctx, call{
 		method:        http.MethodPost,
 		path:          "/v1/rentals/" + url.PathEscape(id) + "/artifact-grants/" + fmt.Sprint(revision),
-		admin:         true,
+		auth:          true,
 		reason:        reason,
 		responseBytes: maxArtifactGrantResponseBytes,
 		body:          map[string]any{},
@@ -490,6 +490,6 @@ func (c *Client) Release(ctx context.Context, id, reason string) *exit.Error {
 		return e
 	}
 	return c.do(ctx, call{
-		method: http.MethodDelete, path: "/v1/rentals/" + url.PathEscape(id), admin: true, reason: reason,
+		method: http.MethodDelete, path: "/v1/rentals/" + url.PathEscape(id), auth: true, reason: reason,
 	}, nil)
 }

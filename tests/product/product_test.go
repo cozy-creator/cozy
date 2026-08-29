@@ -330,7 +330,7 @@ func TestDaemonWebLifecycle(t *testing.T) {
 
 	code, help := runCozy(t, root)
 	for _, want := range []string{
-		"Usage: cozy", "package install", "model download", "invoke run",
+		"Usage: cozy", "package install", "model download", "auth login", "invoke run",
 		"rental new", "up", "down", "unload",
 	} {
 		if code != 0 || !strings.Contains(help, want) {

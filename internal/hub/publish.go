@@ -54,7 +54,7 @@ func (c *Client) OpenPublication(ctx context.Context, ref Ref, operationID strin
 	var out OpenPublicationResponse
 	e := c.do(ctx, call{
 		method: http.MethodPut,
-		path:   publications(ref) + "/" + url.PathEscape(operationID), admin: true, reason: reason,
+		path:   publications(ref) + "/" + url.PathEscape(operationID), auth: true, reason: reason,
 		body: map[string]any{"objects": objects}, byBytes: true,
 	}, &out)
 	return out, e
@@ -90,7 +90,7 @@ func (c *Client) GrantKnownTransfer(ctx context.Context, ref Ref, operation,
 	e := c.do(ctx, call{
 		method: http.MethodPost,
 		path:   publications(ref) + "/" + url.PathEscape(operation) + "/grants",
-		admin:  true, reason: reason, byBytes: true,
+		auth:   true, reason: reason, byBytes: true,
 		body: map[string]any{"object_ids": []string{objectID}},
 	}, &out)
 	if e != nil {
@@ -126,7 +126,7 @@ func (c *Client) SettleObjects(ctx context.Context, ref Ref, operation string,
 	e := c.do(ctx, call{
 		method: http.MethodPost,
 		path:   publications(ref) + "/" + url.PathEscape(operation) + "/settle",
-		admin:  true, reason: reason, byBytes: true,
+		auth:   true, reason: reason, byBytes: true,
 		body: map[string]any{"objects": objects},
 	}, &out)
 	return out.Objects, e
@@ -178,7 +178,7 @@ func (c *Client) SealPublication(ctx context.Context, ref Ref, operation string,
 	e := c.do(ctx, call{
 		method: http.MethodPost,
 		path:   publications(ref) + "/" + url.PathEscape(operation) + "/seal",
-		admin:  true, reason: reason, byBytes: true,
+		auth:   true, reason: reason, byBytes: true,
 		body: request,
 	}, &out)
 	return out, e
