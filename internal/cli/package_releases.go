@@ -51,12 +51,18 @@ func handlePackagePublish(ctx *Context) *exit.Error {
 	}
 	var moved int64
 	if begun.State == "pending" {
-		sources, problem := c.PackageReleaseSourceUploads(hctx, ref, release,
-			packagepublish.Paths(pack.Files), reason)
-		if problem != nil {
-			return problem
+		paths := packagepublish.Paths(pack.Files)
+		var uploads []hub.PackageUpload
+		for len(paths) > 0 {
+			n := min(len(paths), 1000)
+			batch, problem := c.PackageReleaseSourceUploads(hctx, ref, release, paths[:n], reason)
+			if problem != nil {
+				return problem
+			}
+			uploads = append(uploads, batch.Uploads...)
+			paths = paths[n:]
 		}
-		moved, problem = uploadPackageFiles(hctx, pack, begun.ProjectWheelUpload, sources.Uploads)
+		moved, problem = uploadPackageFiles(hctx, pack, begun.ProjectWheelUpload, uploads)
 		if problem != nil {
 			return problem
 		}
