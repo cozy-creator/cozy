@@ -279,8 +279,9 @@ service, so there is no temporary direct-Go path for the HTTP API to later wrap:
 
 Verified by `go test ./internal/live -run TestProductPath`: install -> up -> invoke ->
 typed result -> the file on disk, both terminal verdicts, the client-side payload grammar,
-and a `kill -9` of the record owner mid-attempt. It runs on `fixtures/weightless/` — a real
-endpoint with no model and no card — so it is the whole product path minus the GPU.
+and a `kill -9` of the record owner mid-attempt. It runs on
+`internal/live/testdata/weightless/` — a real endpoint with no model and no card — so it is
+the whole product path minus the GPU.
 
 ## Cozy Video
 
@@ -529,7 +530,7 @@ installed-binary state and release state are four distinct evidence axes, so a g
 - **`scripts/accept.sh` is the fixture the guard runs**, and it drives the release asset and
   nothing else — no Go toolchain, no repository, no build tree. `scripts/clean-machine.sh`
   is that file plus a throwaway container with an empty home to run it on.
-- **`fixtures/weightless/`** is an endpoint with no `Model` parameter, so `gpu` derives
+- **`internal/live/testdata/weightless/`** is an endpoint with no `Model` parameter, so `gpu` derives
   False and its release depends on the BASE cozy-runtime wheel alone — no torch anywhere in
   its venv. It **serves**: the installed runtime authors one canonical provisioned closure,
   reports exact plan subjects through `bindings --json`, and privately stages the identical

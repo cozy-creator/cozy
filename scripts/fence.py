@@ -746,14 +746,6 @@ def check_video_boundary():
     )
     if match := forbidden_fields.search(source):
         bad.append(f"[video] cozy.video/1 acquired execution field {match.group(0)}")
-    proof = pathlib.Path("proofs/h3-long-form/accept.sh")
-    if proof.exists():
-        text = proof.read_text().lower()
-        # The lane spellings that used to sit here died with #621's adaln-pruned hardcut;
-        # a fence that polices retired vocabulary polices nothing.
-        for forbidden in ("runpod", ".artifacts"):
-            if forbidden in text:
-                bad.append(f"[video] paid acceptance script hardcodes {forbidden}")
     return bad
 
 

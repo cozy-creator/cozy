@@ -3,7 +3,7 @@
 #
 #   scripts/weightless-release.sh [--runtime-sha <sha>] [--out <dir>] [--version <v>]
 #
-# `fixtures/weightless/` is the endpoint; its only dependency is the BASE cozy-runtime
+# `internal/live/testdata/weightless/` is the endpoint; its only dependency is the BASE cozy-runtime
 # wheel (msgspec, protobuf, grpcio — torch-free, tensorfs-free), so the archive is small
 # and its install pulls tens of megabytes rather than a CUDA closure. That is what lets the
 # clean-machine fixture run an install and a real invoke end to end without a card, without
@@ -55,8 +55,8 @@ RUNTIME_WHEEL="$(find "$T/vendor" -maxdepth 1 -type f -name 'cozy_runtime-*.whl'
   exit 2
 }
 
-cp "$ROOT/fixtures/weightless/weightless.py" "$T/weightless.py"
-cp "$ROOT/fixtures/weightless/endpoint.toml" "$T/endpoint.toml"
+cp "$ROOT/internal/live/testdata/weightless/weightless.py" "$T/weightless.py"
+cp "$ROOT/internal/live/testdata/weightless/endpoint.toml" "$T/endpoint.toml"
 
 cat > "$T/pyproject.toml" <<TOML
 [project]

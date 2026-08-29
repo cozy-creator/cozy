@@ -24,8 +24,8 @@ const weightlessRef = "cozy/weightless"
 // before a request exists, and a `kill -9` of the record owner mid-attempt never yields a
 // false success.
 //
-// The fixture is `fixtures/weightless/`: a real endpoint with no model, no weights and no
-// GPU, so this is the whole product path minus the card.
+// The fixture is `internal/live/testdata/weightless/`: a real endpoint with no model, no
+// weights and no GPU, so this is the whole product path minus the card.
 func TestProductPath(t *testing.T) {
 	root := filepath.Join(os.TempDir(), "cozy-live", "product")
 	must(t, os.RemoveAll(root))

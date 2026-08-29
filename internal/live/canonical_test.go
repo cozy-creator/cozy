@@ -175,9 +175,9 @@ func messageFor(name string) proto.Message {
 // TestNumberProfile is the cross-language float hazard, in isolation. Go and Python must
 // spell every double the same way or two canonical documents describing the same thing
 // digest differently, and the whole identity plane silently forks at the boundary.
-// `fixtures/canonical/es6-numbers.txt` is Runtime's own oracle, pinned by digest.
+// `testdata/canonical/es6-numbers.txt` is Runtime's own oracle, pinned by digest.
 func TestNumberProfile(t *testing.T) {
-	corpus, err := os.ReadFile("../../fixtures/canonical/es6-numbers.txt")
+	corpus, err := os.ReadFile("testdata/canonical/es6-numbers.txt")
 	must(t, err)
 	// Pinned: a corpus that moved is a different question, not a passing answer.
 	if got := hex.EncodeToString(sha256Of(corpus)); got !=
