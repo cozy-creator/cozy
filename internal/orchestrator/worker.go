@@ -170,7 +170,6 @@ type DesiredPlacement struct {
 	// and leave these fields empty.
 	EnvironmentSpecDigest             string `json:"environment_spec_digest,omitempty"`
 	InstalledEnvironmentReceiptDigest string `json:"installed_environment_receipt_digest,omitempty"`
-	ConfigDigest                      string `json:"config_digest,omitempty"`
 	ExactPlacementSetDigest           string `json:"exact_placement_set_digest,omitempty"`
 	ExactPlacementSetBytes            []byte `json:"exact_placement_set_bytes,omitempty"`
 	// PlacementRevision is Tensorhub's monotonic revision for a private rental. It is

@@ -767,26 +767,23 @@ func (c *Orchestrator) maxOutputBytes() uint64 {
 	return uint64(maxBytes) << 20
 }
 
-// invocationIdentity names the environment and config digests an invocation on w rides.
-// A worker this service spawned inherits the service's own; an ATTACHED worker's come only
-// from its frozen placement, and an empty one is a refusal rather than a local guess.
+// invocationIdentity names the environment and optional local config digest an
+// invocation on w rides. Tensorhub's frozen remote placement owns the environment;
+// model configuration is bound separately and therefore has no endpoint-wide digest.
 func (c *Orchestrator) invocationIdentity(w *worker) (environment, config string, e *exit.Error) {
-	environment, config = w.spec.Placement.EnvironmentSpecDigest, w.spec.Placement.ConfigDigest
+	environment = w.spec.Placement.EnvironmentSpecDigest
 	if w.spec.Connection != nil {
-		if environment == "" || config == "" {
+		if environment == "" {
 			return "", "", exit.Named(exit.Structural, "remote_placement_identity_missing",
-				"attached worker %s carries no frozen environment/config digest; this host "+
+				"attached worker %s carries no frozen environment digest; this host "+
 					"will not substitute its own", w.instanceID)
 		}
-		return environment, config, nil
+		return environment, "", nil
 	}
 	if environment == "" {
 		environment = c.opt.EnvironmentSpecDigest
 	}
-	if config == "" {
-		config = c.opt.ConfigDigest
-	}
-	return environment, config, nil
+	return environment, c.opt.ConfigDigest, nil
 }
 
 func spellOf(raw []byte) string {
