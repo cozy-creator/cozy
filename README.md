@@ -203,8 +203,10 @@ path, credential, URL, image, or command. Its explicit sorted profile set has no
 default. Exact replay sends the same canonical declaration and lets Tensorhub return the
 same pending/committed result; Creator keeps no publication journal.
 
-`endpoint.release.json` is optional only for a genuinely weightless endpoint. It contains
-the sorted compatible accelerator models, exact `{org,name,checkpoint_id}` model roots,
+`endpoint.release.json` is required and contains a non-empty sorted compatible-accelerator-model
+set. Even a weightless endpoint fixes that set because later qualification may prove only an
+already-authored execution identity; it cannot mutate release compatibility. The file also carries
+exact `{org,name,checkpoint_id}` model roots,
 and complete path-free model bindings: binding path, checkpoint, exact config document/
 asset refs, construction-order execution layout, and hardware variant. A descriptor with
 model inputs and no bindings refuses before upload. `endpoint.evaluated-config.json` is

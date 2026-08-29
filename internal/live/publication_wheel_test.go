@@ -220,6 +220,19 @@ object = "marco_polo:app"
 	}
 }
 
+func TestEndpointPublicationRequiresAcceleratorModel(t *testing.T) {
+	repo := trackedEndpointFixture(t)
+	mustWrite(t, filepath.Join(repo, "endpoint.release.json"),
+		`{"compatible_accelerator_models":[],"model_bindings":[],"model_roots":[]}`)
+	git(t, repo, "add", "endpoint.release.json")
+	git(t, repo, "commit", "-qm", "remove execution compatibility")
+	if _, problem := endpointpublish.Prepare(endpointpublish.Request{Tree: repo, Release: "weightless",
+		Profiles: []string{endpointprofile.CU130}}); problem == nil ||
+		problem.ErrName() != "endpoint_compatible_accelerator_models_absent" {
+		t.Fatalf("empty execution compatibility set did not refuse locally: %v", problem)
+	}
+}
+
 func mustWrite(t *testing.T, path, body string) {
 	t.Helper()
 	must(t, os.MkdirAll(filepath.Dir(path), 0o755))

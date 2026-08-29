@@ -11,10 +11,12 @@ The source directory must be a clean committed Git subtree containing:
 - `uv.lock` as opaque development provenance;
 - `endpoint.toml` and `endpoint.descriptor.json`;
 - pure Python project files; and
-- optionally `endpoint.evaluated-config.json` and `endpoint.release.json`.
+- `endpoint.release.json`; and
+- optionally `endpoint.evaluated-config.json`.
 
-`endpoint.release.json` is absent or has explicit empty arrays for a weightless endpoint. A
-model-bearing endpoint declares complete path-free facts:
+`endpoint.release.json` always names a non-empty exact compatible-accelerator-model set. A
+weightless endpoint uses explicit empty model arrays; a model-bearing endpoint declares complete
+path-free facts:
 
 ```json
 {
@@ -42,7 +44,8 @@ model-bearing endpoint declares complete path-free facts:
 
 Bindings sort by `path`; config assets sort by name; execution-layout order is construction order
 and is preserved. Model roots and binding roots must be every-and-only equal.
-`native_wheel_proof` is required exactly when a custom wheel is not `py3-none-any`; it banks one
+`native_wheel_proof` is required exactly when measured custom-wheel contents include native bytes;
+an oddly platform-tagged but actually pure wheel does not require it. The proof banks one
 argument-free `module:callable` fixture and the canonical expected-result digest. Concrete device
 selection remains a local/qualification-seat fact and never enters this portable declaration.
 

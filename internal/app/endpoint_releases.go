@@ -153,7 +153,7 @@ func validateFinalize(pack *endpointpublish.Package, release string,
 		seenProfiles[row.Profile] = true
 		key := row.Profile + "\x00" + row.BaseRealizationKind
 		if seenRealizations[key] || (row.BaseRealizationKind != "oci" && row.BaseRealizationKind != "managed-local") ||
-			row.CandidateID == "" || !sha256Digest(row.BaseRealizationDigest) ||
+			row.CandidateID == "" || !baseRealization(row.BaseRealizationKind, row.BaseRealizationDigest) ||
 			!objectRef(row.EndpointEnvironmentSpec) || !objectRef(row.ResolvedWheelSet) ||
 			!objectRef(row.ResolutionLock) {
 			return exit.Internalf("endpoint finalize returned malformed or duplicate realization %q/%q",
@@ -191,6 +191,15 @@ func validateFinalize(pack *endpointpublish.Package, release string,
 }
 
 func objectRef(ref hub.ObjectRef) bool { return sha256Digest(ref.Digest) && ref.Length > 0 }
+
+func baseRealization(kind, value string) bool {
+	if kind == "managed-local" {
+		return sha256Digest(value)
+	}
+	repository, manifest, ok := strings.Cut(value, "@")
+	return kind == "oci" && ok && repository != "" && !strings.ContainsAny(repository, "@ \t\r\n") &&
+		sha256Digest(manifest)
+}
 
 func sha256Digest(value string) bool {
 	if len(value) != 71 || !strings.HasPrefix(value, "sha256:") {

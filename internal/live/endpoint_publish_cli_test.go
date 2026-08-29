@@ -92,16 +92,16 @@ func TestEndpointPublishQualifyPromoteCLI(t *testing.T) {
 				}
 			}
 			lock.Unlock()
-			_ = json.NewEncoder(w).Encode(map[string]any{"created": finalizeCount == 1,
+			_ = json.NewEncoder(w).Encode(map[string]any{"created": true,
 				"release": "1.0.0", "declaration_digest": fixtureDigest(declaration),
 				"profiles": []map[string]any{
 					{"profile": endpointprofile.CU126, "state": "candidate", "candidate_id": "candidate-126",
-						"base_realization_kind": "oci", "base_realization_digest": "sha256:" + strings.Repeat("a", 64),
+						"base_realization_kind": "oci", "base_realization_digest": "registry.invalid/tensorhub-worker@sha256:" + strings.Repeat("a", 64),
 						"endpoint_environment_spec": map[string]any{"digest": "sha256:" + strings.Repeat("b", 64), "length": 1},
 						"resolved_wheel_set":        map[string]any{"digest": "sha256:" + strings.Repeat("c", 64), "length": 1},
 						"resolution_lock":           map[string]any{"digest": "sha256:" + strings.Repeat("d", 64), "length": 1}},
 					{"profile": endpointprofile.CU130, "state": "candidate", "candidate_id": "candidate-130",
-						"base_realization_kind": "oci", "base_realization_digest": "sha256:" + strings.Repeat("e", 64),
+						"base_realization_kind": "oci", "base_realization_digest": "registry.invalid/tensorhub-worker@sha256:" + strings.Repeat("e", 64),
 						"endpoint_environment_spec": map[string]any{"digest": "sha256:" + strings.Repeat("f", 64), "length": 1},
 						"resolved_wheel_set":        map[string]any{"digest": "sha256:" + strings.Repeat("1", 64), "length": 1},
 						"resolution_lock":           map[string]any{"digest": "sha256:" + strings.Repeat("2", 64), "length": 1}}},
@@ -167,7 +167,7 @@ func TestEndpointPublishQualifyPromoteCLI(t *testing.T) {
 	// Exact replay omits create (resource exists) and must send identical declaration bytes.
 	replay := append([]string(nil), args...)
 	replay = deleteArg(replay, "--create")
-	if code, out := run(replay...); code != 0 || !strings.Contains(out, "false") || !strings.Contains(out, "candidate") {
+	if code, out := run(replay...); code != 0 || !strings.Contains(out, "true") || !strings.Contains(out, "candidate") {
 		t.Fatalf("endpoint publish replay [exit %d]\n%s", code, out)
 	}
 	if code, out := run("endpoint", "qualify", "cozy/marco@1.0.0", "--profile", endpointprofile.CU130,
@@ -197,6 +197,7 @@ dependencies = []
 	mustWrite(t, filepath.Join(repo, "marco_polo.py"), "app = object()\n")
 	mustWrite(t, filepath.Join(repo, "uv.lock"), "version = 1\n")
 	mustWrite(t, filepath.Join(repo, "endpoint.descriptor.json"), `{"application":"marco_polo:app","entrypoints":[],"format":"cozy.endpoint.descriptor/1","jobs":[]}`)
+	mustWrite(t, filepath.Join(repo, "endpoint.release.json"), `{"compatible_accelerator_models":["NVIDIA GeForce RTX 4090"],"model_bindings":[],"model_roots":[]}`)
 	git(t, repo, "init", "-q")
 	git(t, repo, "config", "user.email", "fixture@example.invalid")
 	git(t, repo, "config", "user.name", "Fixture")

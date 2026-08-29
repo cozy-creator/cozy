@@ -171,6 +171,12 @@ func Prepare(req Request) (*Package, *exit.Error) {
 	if e != nil {
 		return fail(e)
 	}
+	compatibleModels := sortedUnique(config.CompatibleAcceleratorModels)
+	if len(compatibleModels) == 0 {
+		return fail(exit.Named(exit.Validation, "endpoint_compatible_accelerator_models_absent",
+			"endpoint.release.json names no compatible accelerator model").
+			WithRemedy("declare the exact provider-neutral GPU model set this release may qualify; qualification cannot mutate release compatibility"))
+	}
 	needsBindings, e := descriptorNeedsBindings(descriptor)
 	if e != nil {
 		return fail(e)
@@ -224,7 +230,7 @@ func Prepare(req Request) (*Package, *exit.Error) {
 		SourceArchive: archiveRef, SourceLock: lock,
 		ProjectWheel: project.Fact, Profiles: profiles, CustomWheels: custom,
 		Descriptor: descriptorRef(descriptor), EvaluatedConfig: descriptorRef(evaluated),
-		CompatibleAcceleratorModels: sortedUnique(config.CompatibleAcceleratorModels),
+		CompatibleAcceleratorModels: compatibleModels,
 		ModelRoots:                  sortedRoots(config.ModelRoots),
 		ModelBindings:               config.ModelBindings,
 		NativeWheelProof:            config.NativeWheelProof,
