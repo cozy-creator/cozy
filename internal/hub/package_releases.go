@@ -16,6 +16,7 @@ type ObjectRef struct {
 }
 
 type PackageUpload struct {
+	Kind            string            `json:"kind,omitempty"`
 	Path            string            `json:"path,omitempty"`
 	URL             string            `json:"url"`
 	RequiredHeaders map[string]string `json:"required_headers"`
@@ -36,7 +37,7 @@ type PackageReleaseBegin struct {
 	ProjectWheelUpload PackageUpload `json:"project_wheel_upload"`
 }
 
-type PackageSourceUploads struct {
+type PackageUploads struct {
 	Uploads []PackageUpload `json:"uploads"`
 }
 
@@ -67,13 +68,13 @@ func (c *Client) BeginPackageRelease(ctx context.Context, ref Ref, release, reas
 	return out, e
 }
 
-func (c *Client) PackageReleaseSourceUploads(ctx context.Context, ref Ref, release string,
-	paths []string, reason string,
-) (PackageSourceUploads, *exit.Error) {
-	var out PackageSourceUploads
+func (c *Client) PackageReleaseUploads(ctx context.Context, ref Ref, release string,
+	paths, dependencyWheels []string, reason string,
+) (PackageUploads, *exit.Error) {
+	var out PackageUploads
 	e := c.do(ctx, call{method: http.MethodPost,
 		path: packageReleasePath(ref, release) + "/uploads", admin: true, reason: reason,
-		body: map[string]any{"paths": paths}}, &out)
+		body: map[string]any{"paths": paths, "dependency_wheels": dependencyWheels}}, &out)
 	return out, e
 }
 

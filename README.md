@@ -79,12 +79,13 @@ Remove local package generations with:
 cozy package remove org/name
 ```
 
-Publishing builds the current working tree with `uv build --wheel`; Tensorhub accepts only one
-bounded pure project wheel. Git, commits, and a clean tree are not publication inputs. Tensorhub derives
-compatible base worker profiles from wheel metadata and its exact image inventory. The uploaded
-`uv.lock` remains local-install input; Tensorhub does not use local source overrides as execution
-dependencies. The package name and release come from `[project]`; `[tool.cozy]` supplies the
-Tensorhub organization:
+Publishing builds the current working tree with `uv build --wheel`; Git, commits, and a clean tree
+are not publication inputs. Standard `[project].dependencies` remain the runtime authority. Cozy
+recursively builds referenced non-base `[tool.uv.sources]` paths/workspace members as separate exact
+wheels in the same publication. Platform-owned requirements such as Runtime, TensorFS, and Torch are
+kept as compatibility constraints and are not uploaded; Tensorhub resolves indexed requirements and
+freezes their exact wheels. Development dependency groups are not published. The package name and
+release come from `[project]`; `[tool.cozy]` supplies the Tensorhub organization:
 
 ```toml
 [project]

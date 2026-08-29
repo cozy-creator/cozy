@@ -22,12 +22,13 @@ var projectNameSeparator = regexp.MustCompile(`[-_.]+`)
 // Package is the local input to one begin/upload/finalize operation. Tensorhub
 // computes identities and package facts after the bytes arrive.
 type Package struct {
-	Files        map[string]string // source-relative path -> local path
-	Wheel        string
-	Root         string // disposable wheel output
-	Organization string
-	Name         string
-	Release      string
+	Files            map[string]string // source-relative path -> local path
+	Wheel            string
+	DependencyWheels []DependencyWheel
+	Root             string // disposable wheel output
+	Organization     string
+	Name             string
+	Release          string
 }
 
 func (p *Package) Close() { _ = os.RemoveAll(p.Root) }
@@ -35,11 +36,21 @@ func (p *Package) Close() { _ = os.RemoveAll(p.Root) }
 // Prepare reads the current working tree and builds its wheel through the
 // project's standard PEP 517 backend. Git and commit state are irrelevant.
 func Prepare() (*Package, *exit.Error) {
-	tree, files, problem := sourceTree(".")
+	return PrepareFrom(".")
+}
+
+// PrepareFrom exists so the product suite can drive publication staging from
+// an isolated project directory without changing the process working directory.
+func PrepareFrom(projectDir string) (*Package, *exit.Error) {
+	tree, files, problem := sourceTree(projectDir)
 	if problem != nil {
 		return nil, problem
 	}
-	metadata, problem := readProjectMetadata(files["pyproject.toml"])
+	document, problem := readProjectDocument(files["pyproject.toml"])
+	if problem != nil {
+		return nil, problem
+	}
+	metadata, problem := document.publicationMetadata()
 	if problem != nil {
 		return nil, problem
 	}
@@ -64,39 +75,56 @@ func Prepare() (*Package, *exit.Error) {
 			metadata.Name, metadata.Version, fact.Distribution, fact.Version).
 			WithRemedy("fix the build backend so wheel identity comes from [project] name and version")
 	}
+	dependencies, problem := collectLocalDependencies(tree, document, root)
+	if problem != nil {
+		_ = os.RemoveAll(root)
+		return nil, problem
+	}
 	return &Package{
-		Files: files, Wheel: project.Path, Root: root,
+		Files: files, Wheel: project.Path, DependencyWheels: dependencies, Root: root,
 		Organization: metadata.Organization, Name: fact.Distribution, Release: fact.Version,
 	}, nil
 }
 
 type projectMetadata struct {
 	Project struct {
-		Name    string `toml:"name"`
-		Version string `toml:"version"`
+		Name         string   `toml:"name"`
+		Version      string   `toml:"version"`
+		Dependencies []string `toml:"dependencies"`
 	} `toml:"project"`
 	Tool struct {
 		Cozy struct {
 			Organization string `toml:"organization"`
 		} `toml:"cozy"`
+		UV struct {
+			Sources   map[string]any `toml:"sources"`
+			Workspace struct {
+				Members []string `toml:"members"`
+				Exclude []string `toml:"exclude"`
+			} `toml:"workspace"`
+		} `toml:"uv"`
 	} `toml:"tool"`
 }
 
-func readProjectMetadata(path string) (struct {
+func readProjectDocument(path string) (projectMetadata, *exit.Error) {
+	var document projectMetadata
+	raw, err := os.ReadFile(path)
+	if err != nil || len(raw) == 0 || len(raw) > maxProjectMetadataBytes {
+		return document, exit.Named(exit.Validation, "project_metadata_unreadable",
+			"pyproject.toml must be a non-empty TOML file at or below %d bytes", maxProjectMetadataBytes)
+	}
+	if err := toml.Unmarshal(raw, &document); err != nil {
+		return document, exit.Named(exit.Validation, "project_metadata_invalid",
+			"pyproject.toml is not valid TOML: %v", err)
+	}
+	return document, nil
+}
+
+func (document projectMetadata) publicationMetadata() (struct {
 	Name, Version, Organization string
 }, *exit.Error) {
 	var out struct {
 		Name, Version, Organization string
-	}
-	raw, err := os.ReadFile(path)
-	if err != nil || len(raw) == 0 || len(raw) > maxProjectMetadataBytes {
-		return out, exit.Named(exit.Validation, "project_metadata_unreadable",
-			"pyproject.toml must be a non-empty TOML file at or below %d bytes", maxProjectMetadataBytes)
-	}
-	var document projectMetadata
-	if err := toml.Unmarshal(raw, &document); err != nil {
-		return out, exit.Named(exit.Validation, "project_metadata_invalid",
-			"pyproject.toml is not valid TOML: %v", err)
 	}
 	out.Name = strings.TrimSpace(document.Project.Name)
 	out.Version = strings.TrimSpace(document.Project.Version)
@@ -227,4 +255,16 @@ func Paths(files map[string]string) []string {
 	}
 	sort.Strings(paths)
 	return paths
+}
+
+func WheelFilenames(wheels []DependencyWheel) []string {
+	if len(wheels) == 0 {
+		return nil
+	}
+	names := make([]string, 0, len(wheels))
+	for _, wheel := range wheels {
+		names = append(names, wheel.Filename)
+	}
+	sort.Strings(names)
+	return names
 }

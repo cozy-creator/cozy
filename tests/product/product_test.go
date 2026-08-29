@@ -16,6 +16,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/cozy-creator/cozy/internal/packagepublish"
 	"github.com/cozy-creator/cozy/internal/records"
 )
 
@@ -41,6 +42,167 @@ version = "1.0.0"
 	if code != 1 || !strings.Contains(out, "must declare [tool.cozy] organization") {
 		t.Fatalf("missing [tool.cozy] organization was not refused before build [exit %d]\n%s", code, out)
 	}
+}
+
+func TestPackagePublishBuildsBoundedLocalDependencyClosure(t *testing.T) {
+	workspace := t.TempDir()
+	projects := filepath.Join(workspace, "projects")
+	must(t, os.MkdirAll(projects, 0o755))
+	must(t, os.WriteFile(filepath.Join(workspace, "pyproject.toml"), []byte(
+		"[tool.uv.workspace]\nmembers = [\"projects/*\"]\n"), 0o644))
+
+	a := filepath.Join(projects, "local-a")
+	b := filepath.Join(projects, "local-b")
+	c := filepath.Join(projects, "local-c")
+	writePublishProject(t, a, "local-a", "1.0.0",
+		[]string{"local-b>=2,<3", "cozy-runtime>=0.0.3"},
+		"local-b = [{ workspace = true, marker = \"sys_platform == 'linux'\" }, { index = \"pypi\", marker = \"sys_platform != 'linux'\" }]\ncozy-runtime = { path = \"../../absent-runtime\", editable = true }\n", true)
+	writePublishProject(t, b, "local-b", "2.1.0", []string{"local-c==3.0.0"},
+		"local-c = { path = \"../local-c\", editable = true }\n", false)
+	writePublishProject(t, c, "local-c", "3.0.0", nil, "", false)
+
+	pack, problem := packagepublish.PrepareFrom(a)
+	fatal(t, problem)
+	defer pack.Close()
+	if len(pack.DependencyWheels) != 2 ||
+		pack.DependencyWheels[0].Name != "local-b" || pack.DependencyWheels[0].Version != "2.1.0" ||
+		pack.DependencyWheels[1].Name != "local-c" || pack.DependencyWheels[1].Version != "3.0.0" {
+		t.Fatalf("local dependency closure was not two exact separate wheels: %+v", pack.DependencyWheels)
+	}
+	for _, dependency := range pack.DependencyWheels {
+		if !strings.HasSuffix(dependency.Filename, ".whl") {
+			t.Fatalf("dependency did not retain a wheel basename: %+v", dependency)
+		}
+		if info, err := os.Stat(dependency.Path); err != nil || !info.Mode().IsRegular() {
+			t.Fatalf("dependency wheel is not a staged regular file: %+v err=%v", dependency, err)
+		}
+	}
+
+	// The stable platform-owned Runtime mapping is deliberately absent on disk:
+	// publication retains its requirement but never dereferences or uploads it.
+	for _, dependency := range pack.DependencyWheels {
+		if dependency.Name == "cozy-runtime" { //cozy:allow distribution assertion, not executable access
+			t.Fatalf("base-owned Runtime entered the dependency overlay: %+v", dependency)
+		}
+	}
+
+	writePublishProject(t, a, "local-a", "1.0.0", []string{"local-b>=3"},
+		"local-b = { workspace = true }\n", true)
+	if incompatible, problem := packagepublish.PrepareFrom(a); problem == nil || problem.Name != "local_dependency_version_incompatible" {
+		if incompatible != nil {
+			incompatible.Close()
+		}
+		t.Fatalf("local wheel outside the parent PEP 440 requirement did not refuse: %v", problem)
+	}
+
+	writePublishProject(t, a, "local-a", "1.0.0",
+		[]string{"local-b>=2,<3", "cozy-runtime>=0.0.3"},
+		"local-b = { workspace = true }\ncozy-runtime = { path = \"../../absent-runtime\" }\n", true)
+	writePublishProject(t, c, "local-c", "3.0.0", []string{"local-a==1.0.0"},
+		"local-a = { path = \"../local-a\" }\n", false)
+	if cycle, problem := packagepublish.PrepareFrom(a); problem == nil || problem.Name != "local_dependency_cycle" {
+		if cycle != nil {
+			cycle.Close()
+		}
+		t.Fatalf("A->B->C->A did not refuse as a local dependency cycle: %v", problem)
+	}
+
+	conflictRoot := filepath.Join(t.TempDir(), "root")
+	x1 := filepath.Join(filepath.Dir(conflictRoot), "x1")
+	x2 := filepath.Join(filepath.Dir(conflictRoot), "x2")
+	left := filepath.Join(filepath.Dir(conflictRoot), "left")
+	right := filepath.Join(filepath.Dir(conflictRoot), "right")
+	writePublishProject(t, conflictRoot, "conflict-root", "1.0.0",
+		[]string{"left==1", "right==1"},
+		"left = { path = \"../left\" }\nright = { path = \"../right\" }\n", true)
+	writePublishProject(t, left, "left", "1", []string{"shared==1"},
+		"shared = { path = \"../x1\" }\n", false)
+	writePublishProject(t, right, "right", "1", []string{"shared==2"},
+		"shared = { path = \"../x2\" }\n", false)
+	writePublishProject(t, x1, "shared", "1", nil, "", false)
+	writePublishProject(t, x2, "shared", "2", nil, "", false)
+	if conflict, problem := packagepublish.PrepareFrom(conflictRoot); problem == nil || problem.Name != "local_dependency_duplicate" {
+		if conflict != nil {
+			conflict.Close()
+		}
+		t.Fatalf("different sources for one normalized name did not refuse: %v", problem)
+	}
+
+	countRoot := filepath.Join(t.TempDir(), "root")
+	writePublishProject(t, countRoot, "count-root", "1", []string{"count-01==1"},
+		"count-01 = { path = \"../count-01\" }\n", true)
+	countParent := filepath.Dir(countRoot)
+	for i := 1; i <= packagepublish.MaxDependencyWheels+1; i++ {
+		name := fmt.Sprintf("count-%02d", i)
+		var dependencies []string
+		var sources string
+		if i <= packagepublish.MaxDependencyWheels {
+			next := fmt.Sprintf("count-%02d", i+1)
+			dependencies = []string{next + "==1"}
+			sources = fmt.Sprintf("%s = { path = \"../%s\" }\n", next, next)
+		}
+		writePublishProject(t, filepath.Join(countParent, name), name, "1", dependencies, sources, false)
+	}
+	if counted, problem := packagepublish.PrepareFrom(countRoot); problem == nil || problem.Name != "local_dependency_count_exceeded" {
+		if counted != nil {
+			counted.Close()
+		}
+		t.Fatalf("dependency closure above %d wheels was not refused: %v",
+			packagepublish.MaxDependencyWheels, problem)
+	}
+
+	directRoot := filepath.Join(t.TempDir(), "direct")
+	writePublishProject(t, directRoot, "direct-root", "1", []string{"foreign @ https://example.invalid/foreign.whl"}, "", true)
+	if direct, problem := packagepublish.PrepareFrom(directRoot); problem == nil || problem.Name != "project_dependency_direct_url_unsupported" {
+		if direct != nil {
+			direct.Close()
+		}
+		t.Fatalf("direct URL dependency did not refuse: %v", problem)
+	}
+
+	gitRoot := filepath.Join(t.TempDir(), "git")
+	writePublishProject(t, gitRoot, "git-root", "1", []string{"foreign==1"},
+		"foreign = { git = \"https://example.invalid/foreign.git\" }\n", true)
+	if git, problem := packagepublish.PrepareFrom(gitRoot); problem == nil || problem.Name != "project_dependency_source_unsupported" {
+		if git != nil {
+			git.Close()
+		}
+		t.Fatalf("VCS dependency source did not refuse: %v", problem)
+	}
+}
+
+func writePublishProject(t *testing.T, root, name, version string, dependencies []string, sources string, publishable bool) {
+	t.Helper()
+	if dependencies == nil {
+		dependencies = []string{}
+	}
+	must(t, os.MkdirAll(filepath.Join(root, strings.ReplaceAll(name, "-", "_")), 0o755))
+	must(t, os.WriteFile(filepath.Join(root, strings.ReplaceAll(name, "-", "_"), "__init__.py"),
+		[]byte("VALUE = 1\n"), 0o644))
+	dependencyJSON, err := json.Marshal(dependencies)
+	must(t, err)
+	document := fmt.Sprintf(`[build-system]
+requires = ["uv_build>=0.9.18,<0.10"]
+build-backend = "uv_build"
+
+[project]
+name = %q
+version = %q
+dependencies = %s
+
+[tool.uv.build-backend]
+module-root = ""
+`, name, version, dependencyJSON)
+	if sources != "" {
+		document += "\n[tool.uv.sources]\n" + sources
+	}
+	if publishable {
+		document += "\n[tool.cozy]\norganization = \"proof\"\n"
+		must(t, os.WriteFile(filepath.Join(root, "package.toml"), []byte(
+			"[application]\nobject = \""+strings.ReplaceAll(name, "-", "_")+":app\"\n"), 0o644))
+		must(t, os.WriteFile(filepath.Join(root, "uv.lock"), []byte("version = 1\n"), 0o644))
+	}
+	must(t, os.WriteFile(filepath.Join(root, "pyproject.toml"), []byte(document), 0o644))
 }
 
 func TestDaemonWebLifecycle(t *testing.T) {

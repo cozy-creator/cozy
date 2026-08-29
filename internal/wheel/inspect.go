@@ -37,6 +37,75 @@ type Fact struct {
 	Version      string   `json:"version"`
 }
 
+// Identity is the minimum fact Creator needs before offering a dependency
+// wheel to Tensorhub. It deliberately does not decide whether the wheel is safe
+// or compatible with a base worker image; Tensorhub inspects the uploaded bytes
+// independently for each profile.
+type Identity struct {
+	Distribution string
+	Filename     string
+	Length       int64
+	Version      string
+}
+
+// InspectIdentity verifies that one bounded wheel's filename and METADATA name
+// and version agree. Unlike Inspect, it admits native/tagged dependency wheels;
+// project-wheel and overlay policy remains server-owned.
+func InspectIdentity(file string) (Identity, *exit.Error) {
+	var out Identity
+	abs, err := filepath.Abs(file)
+	if err != nil {
+		return out, exit.Usagef("wheel path %q is not resolvable: %s", file, err)
+	}
+	info, err := os.Stat(abs)
+	if err != nil || !info.Mode().IsRegular() || info.Size() <= 0 || info.Size() > MaxWheelBytes {
+		return out, exit.Named(exit.Validation, "wheel_size_invalid",
+			"%s is not a non-empty regular wheel at or below %d B", abs, MaxWheelBytes)
+	}
+	filename := filepath.Base(abs)
+	distribution, version, _, problem := parseWheelFilename(filename)
+	if problem != nil {
+		return out, problem
+	}
+	f, err := os.Open(abs)
+	if err != nil {
+		return out, exit.Named(exit.Structural, "wheel_unreadable", "%s: %v", abs, err)
+	}
+	defer f.Close()
+	zr, err := zip.NewReader(f, info.Size())
+	if err != nil || len(zr.File) == 0 || len(zr.File) > maxZipEntries {
+		return out, exit.Named(exit.Validation, "wheel_zip_invalid", "%s is not a bounded ZIP wheel", filename)
+	}
+	var metadata []byte
+	for _, member := range zr.File {
+		if !strings.HasSuffix(member.Name, ".dist-info/METADATA") {
+			continue
+		}
+		if metadata != nil {
+			return out, wheelStructure("more than one .dist-info/METADATA")
+		}
+		metadata, problem = wheelMember(member)
+		if problem != nil {
+			return out, problem
+		}
+	}
+	if metadata == nil {
+		return out, wheelStructure("one .dist-info/METADATA is required")
+	}
+	metadataName, metadataVersion, problem := metadataIdentity(metadata)
+	if problem != nil {
+		return out, problem
+	}
+	if normalize(metadataName) != distribution || metadataVersion != version {
+		return out, exit.Named(exit.Validation, "wheel_identity_mismatch",
+			"filename says %s==%s while METADATA says %s==%s",
+			distribution, version, normalize(metadataName), metadataVersion)
+	}
+	out.Distribution, out.Filename = distribution, filename
+	out.Length, out.Version = info.Size(), version
+	return out, nil
+}
+
 // Inspect reads one wheel exactly as supplied. It must be one pure py3-none-any
 // project payload with no native/build member or nested wheel carrier.
 func Inspect(file string) (Fact, *exit.Error) {

@@ -44,15 +44,17 @@ func handlePackagePublish(ctx *Context) *exit.Error {
 	var moved int64
 	if begun.State == "pending" {
 		paths := packagepublish.Paths(pack.Files)
+		dependencyWheels := packagepublish.WheelFilenames(pack.DependencyWheels)
 		var uploads []hub.PackageUpload
-		for len(paths) > 0 {
+		for len(paths) > 0 || dependencyWheels != nil {
 			n := min(len(paths), 1000)
-			batch, problem := c.PackageReleaseSourceUploads(hctx, ref, release, paths[:n], reason)
+			batch, problem := c.PackageReleaseUploads(hctx, ref, release, paths[:n], dependencyWheels, reason)
 			if problem != nil {
 				return problem
 			}
 			uploads = append(uploads, batch.Uploads...)
 			paths = paths[n:]
+			dependencyWheels = nil
 		}
 		moved, problem = uploadPackageFiles(hctx, pack, begun.ProjectWheelUpload, uploads)
 		if problem != nil {
@@ -141,24 +143,39 @@ type packageFile struct {
 }
 
 func uploadPackageFiles(ctx context.Context, pack *packagepublish.Package, wheel hub.PackageUpload,
-	sources []hub.PackageUpload,
+	uploads []hub.PackageUpload,
 ) (int64, *exit.Error) {
-	files := make([]packageFile, 0, len(sources)+1)
+	files := make([]packageFile, 0, len(uploads)+1)
 	files = append(files, packageFile{subject: "project_wheel", path: pack.Wheel, upload: wheel})
-	want := make(map[string]string, len(pack.Files))
+	wantSources := make(map[string]string, len(pack.Files))
 	for path, local := range pack.Files {
-		want[path] = local
+		wantSources[path] = local
 	}
-	for _, upload := range sources {
-		local, ok := want[upload.Path]
-		if !ok {
-			return 0, exit.Internalf("package uploads returned unknown or duplicate source path %q", upload.Path)
+	wantDependencies := make(map[string]string, len(pack.DependencyWheels))
+	for _, dependency := range pack.DependencyWheels {
+		wantDependencies[dependency.Filename] = dependency.Path
+	}
+	for _, upload := range uploads {
+		var local string
+		var ok bool
+		switch upload.Kind {
+		case "source":
+			local, ok = wantSources[upload.Path]
+			delete(wantSources, upload.Path)
+		case "dependency_wheel":
+			local, ok = wantDependencies[upload.Path]
+			delete(wantDependencies, upload.Path)
+		default:
+			return 0, exit.Internalf("package uploads returned invalid kind %q for %q", upload.Kind, upload.Path)
 		}
-		delete(want, upload.Path)
+		if !ok {
+			return 0, exit.Internalf("package uploads returned unknown or duplicate %s path %q", upload.Kind, upload.Path)
+		}
 		files = append(files, packageFile{subject: upload.Path, path: local, upload: upload})
 	}
-	if len(want) != 0 {
-		return 0, exit.Internalf("package uploads omitted %d source files", len(want))
+	if len(wantSources) != 0 || len(wantDependencies) != 0 {
+		return 0, exit.Internalf("package uploads omitted %d source files and %d dependency wheels",
+			len(wantSources), len(wantDependencies))
 	}
 
 	type outcome struct {
