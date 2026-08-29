@@ -48,7 +48,6 @@ func TestQualifiedManagedLocalInstall(t *testing.T) {
 	fatal(t, problem)
 	customBytes := mustRead(t, customPath)
 
-	bundle := jcs(t, map[string]any{"format": "tensorhub.package_bundle/2", "project_wheel": projectFact})
 	resolved := jcs(t, map[string]any{"format": "ResolvedWheelSet/3", "wheels": []any{customFact}})
 	lock := jcs(t, map[string]any{"format": "tensorhub.resolution_lock/1"})
 	baseDistributions := []map[string]string{{"distribution": "torch", "version": "2.13.0+cu130"}}
@@ -64,6 +63,16 @@ func TestQualifiedManagedLocalInstall(t *testing.T) {
 	})
 	descriptor := jcs(t, map[string]any{"application": "marco:app", "entrypoints": []any{},
 		"format": "cozy.package.descriptor/1", "jobs": []any{}})
+	sourceTree := jcs(t, map[string]any{"files": []any{}, "format": "tensorhub.source_tree/1"})
+	ref := func(body []byte) map[string]any {
+		return map[string]any{"digest": digestText(body), "length": len(body)}
+	}
+	bundle := jcs(t, map[string]any{
+		"format": "tensorhub.package_bundle/3", "package_descriptor": ref(descriptor),
+		"package_release_id": "cozy/marco@1.0.0", "project_wheel": projectFact,
+		"resolved_wheel_set": ref(resolved), "source_tree": ref(sourceTree),
+		"wheelhouse_manifest": ref(wheelhouse),
+	})
 	eesValue, err := canonical.Document(&pb.PackageEnvironmentSpec{
 		PlatformTarget: &pb.PlatformTarget{OsArch: "linux/amd64", Libc: "glibc2.39",
 			PythonAbi: "cp312", AcceleratorBackend: "cuda", AcceleratorAbi: "cu130"},

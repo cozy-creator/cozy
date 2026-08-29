@@ -131,7 +131,7 @@ func Run(ctx context.Context, layout home.Layout, store *records.Store, request 
 		typed  bool
 	}{
 		{"package-environment-spec.json", grant.PackageEnvironmentSpec, "cozy.worker.v1.PackageEnvironmentSpec/2", true},
-		{"package-bundle.json", grant.PackageBundle, "tensorhub.package_bundle/2", false},
+		{"package-bundle.json", grant.PackageBundle, "tensorhub.package_bundle/3", false},
 		{"resolved-wheel-set.json", grant.ResolvedWheelSet, "ResolvedWheelSet/3", false},
 		{"wheelhouse-manifest.json", grant.WheelhouseManifest, "WheelhouseManifest/3", false},
 		{"resolution-lock.json", grant.ResolutionLock, "tensorhub.resolution_lock/1", false},
@@ -319,12 +319,25 @@ func Run(ctx context.Context, layout home.Layout, store *records.Store, request 
 
 func releaseWheelFacts(bundleBytes, resolvedBytes []byte) (map[string]wheel.Fact, *exit.Error) {
 	var bundle struct {
-		ProjectWheel wheel.Fact `json:"project_wheel"`
+		Format             string        `json:"format"`
+		PackageDescriptor  hub.ObjectRef `json:"package_descriptor"`
+		PackageReleaseID   string        `json:"package_release_id"`
+		ProjectWheel       wheel.Fact    `json:"project_wheel"`
+		ResolvedWheelSet   hub.ObjectRef `json:"resolved_wheel_set"`
+		SourceTree         hub.ObjectRef `json:"source_tree"`
+		WheelhouseManifest hub.ObjectRef `json:"wheelhouse_manifest"`
 	}
 	var resolved struct {
 		Wheels []wheel.Fact `json:"wheels"`
 	}
-	if json.Unmarshal(bundleBytes, &bundle) != nil || json.Unmarshal(resolvedBytes, &resolved) != nil ||
+	bundleDecoder := json.NewDecoder(bytes.NewReader(bundleBytes))
+	bundleDecoder.DisallowUnknownFields()
+	if bundleDecoder.Decode(&bundle) != nil || json.Unmarshal(resolvedBytes, &resolved) != nil ||
+		bundle.Format != "tensorhub.package_bundle/3" || bundle.PackageReleaseID == "" ||
+		!digest(bundle.PackageDescriptor.Digest) || bundle.PackageDescriptor.Length <= 0 ||
+		!digest(bundle.ResolvedWheelSet.Digest) || bundle.ResolvedWheelSet.Length <= 0 ||
+		!digest(bundle.SourceTree.Digest) || bundle.SourceTree.Length <= 0 ||
+		!digest(bundle.WheelhouseManifest.Digest) || bundle.WheelhouseManifest.Length <= 0 ||
 		!digest(bundle.ProjectWheel.Digest) || bundle.ProjectWheel.Filename == "" ||
 		bundle.ProjectWheel.Distribution == "" || bundle.ProjectWheel.Version == "" ||
 		bundle.ProjectWheel.Length <= 0 {
