@@ -12,7 +12,7 @@ import (
 )
 
 type rentalFixture struct {
-	EndpointRef     string                   `json:"endpoint_ref"`
+	PackageRef      string                   `json:"package_ref"`
 	ControlSnapshot hub.ExactControlDocument `json:"control_snapshot"`
 }
 
@@ -40,12 +40,12 @@ func exact(raw []byte) hub.ExactControlDocument {
 
 func TestDecodeCurrentTensorhubRentalSnapshot(t *testing.T) {
 	fixture := currentRental(t)
-	facts, problem := remotecontrol.Decode(fixture.ControlSnapshot, fixture.EndpointRef)
+	facts, problem := remotecontrol.Decode(fixture.ControlSnapshot, fixture.PackageRef)
 	if problem != nil {
 		t.Fatal(problem)
 	}
-	if facts.EndpointExecutionDigest != "sha256:a7b7a2395f5f6759a256631b2692c95479d7bd1012e9d16ba470af012bfc9c8f" ||
-		facts.Placement.Endpoint != "cozy/marco-polo-derived" ||
+	if facts.PackageExecutionDigest != "sha256:a7b7a2395f5f6759a256631b2692c95479d7bd1012e9d16ba470af012bfc9c8f" ||
+		facts.Placement.Package != "cozy/marco-polo-derived" ||
 		facts.Placement.ReleaseID != "cozy/marco-polo-derived@derived-portable-1" ||
 		facts.Placement.EnvironmentSpecDigest == "" || len(facts.Placement.Bindings) != 1 ||
 		facts.Placement.Bindings[0].Entrypoint != "marco" {
@@ -64,13 +64,13 @@ func TestDecodeRefusesRetiredEvaluatedConfigFields(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, problem := remotecontrol.Decode(exact(raw), fixture.EndpointRef); problem == nil ||
+	if _, problem := remotecontrol.Decode(exact(raw), fixture.PackageRef); problem == nil ||
 		problem.ErrName() != "rental.control_snapshot_invalid" {
 		t.Fatalf("retired snapshot evaluated_config was not refused: %v", problem)
 	}
 
 	delete(snapshot, "evaluated_config")
-	bundleRaw, err := json.Marshal(snapshot["endpoint_bundle"])
+	bundleRaw, err := json.Marshal(snapshot["package_bundle"])
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -88,7 +88,7 @@ func TestDecodeRefusesRetiredEvaluatedConfigFields(t *testing.T) {
 		t.Fatal(err)
 	}
 	changedExact := exact(changedBundle)
-	snapshot["endpoint_bundle"] = map[string]any{
+	snapshot["package_bundle"] = map[string]any{
 		"canonical_bytes": changedExact.CanonicalBytes,
 		"digest":          changedExact.Digest,
 		"length":          changedExact.Length,
@@ -97,7 +97,7 @@ func TestDecodeRefusesRetiredEvaluatedConfigFields(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, problem := remotecontrol.Decode(exact(raw), fixture.EndpointRef); problem == nil ||
+	if _, problem := remotecontrol.Decode(exact(raw), fixture.PackageRef); problem == nil ||
 		problem.ErrName() != "rental.control_snapshot_invalid" {
 		t.Fatalf("retired bundle evaluated_config was not refused: %v", problem)
 	}

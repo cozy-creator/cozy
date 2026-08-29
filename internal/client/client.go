@@ -228,7 +228,7 @@ func (c *Client) Media(mediaID string, receive func(MediaResponse) *exit.Error) 
 // StartResult is the rental-claim answer.
 type StartResult struct {
 	InstanceID string `json:"instance_id"`
-	Endpoint   string `json:"endpoint"`
+	Package    string `json:"package"`
 	Change     string `json:"change"`
 	Note       string `json:"note"`
 }

@@ -46,7 +46,7 @@ func Read(data []byte, m proto.Message) (Doc, error) {
 
 // ReadObject validates the shared canonical JSON profile without assigning a
 // document schema. It is for exact control documents whose schemas live outside
-// worker-protocol (for example EndpointBindingRelease). Callers must still
+// worker-protocol (for example PackageBindingRelease). Callers must still
 // enforce their closed key set and semantic joins.
 func ReadObject(data []byte) (Doc, error) {
 	obj, err := ParseObject(data)
@@ -92,7 +92,7 @@ func ParseObject(data []byte) (Doc, error) {
 // "absent", and #485b makes that a wire law rather than a convention.
 func semantics(name string, d Doc) error {
 	switch name {
-	case "cozy.worker.v1.EndpointEnvironmentSpec":
+	case "cozy.worker.v1.PackageEnvironmentSpec":
 		// PLATFORMTARGET HAS ONE CANONICAL ENCODING (#485b). The absent libc is the single
 		// value "none" — never "", never omitted. Two spellings of "no libc" would digest
 		// to two environments and split every cache and receipt built on either, so the

@@ -67,7 +67,7 @@ func handleJobSubmit(ctx *Context) *exit.Error {
 	}
 	began := time.Now()
 	handle, e := c.SubmitJob(api.JobSubmission{
-		Endpoint: target.Endpoint, Function: target.Function, Input: input,
+		Package: target.Package, Function: target.Function, Input: input,
 		Org: ctx.Inv.Value("--org"), Trees: trees,
 	}, key)
 	if e != nil {
@@ -78,9 +78,9 @@ func handleJobSubmit(ctx *Context) *exit.Error {
 	}
 	fields := []output.Field{
 		{K: "id", V: handle.JobID},
-		{K: "target", V: handle.Endpoint + "/" + handle.Function},
+		{K: "target", V: handle.Package + "/" + handle.Function},
 		{K: "job", V: handle.JobID},
-		{K: "endpoint", V: handle.Endpoint},
+		{K: "package", V: handle.Package},
 		{K: "function", V: handle.Function},
 		{K: "status", V: handle.Status},
 		{K: "publication", V: handle.Repo},
@@ -116,7 +116,7 @@ func parseTrees(values []string) ([]string, *exit.Error) {
 // jobFactsOf reads one job's declared surface out of the install records — the same
 // LOCAL read `cozy invoke run` makes of an entrypoint's, and for the same reason.
 func jobFactsOf(ctx *Context, t Target) (*jobSurface, *exit.Error) {
-	facts, e := generationFacts(ctx, t.Endpoint, t.Major)
+	facts, e := generationFacts(ctx, t.Package, t.Major)
 	if e != nil {
 		return nil, e
 	}
@@ -139,14 +139,14 @@ func jobFactsOf(ctx *Context, t Target) (*jobSurface, *exit.Error) {
 	// reach here, and "no such job" would send a reader looking for a typo.
 	if _, e := facts.Descriptor.Function(t.Function); e == nil {
 		return nil, exit.Named(exit.Usage, "not_a_job",
-			"%s registers %q as an ENTRYPOINT, not a @job", t.Endpoint, t.Function).
+			"%s registers %q as an ENTRYPOINT, not a @job", t.Package, t.Function).
 			WithRemedy("an entrypoint is invoked with `cozy invoke run`; a job is run to completion").
 			WithNext("cozy invoke run " + ctx.Inv.Args[0])
 	}
 	return nil, exit.Named(exit.NotFound, "unknown_job",
-		"%s registers no job named %q", t.Endpoint, t.Function).
+		"%s registers no job named %q", t.Package, t.Function).
 		WithRemedy("it registers: %s", known).
-		WithNext("cozy endpoint list --full")
+		WithNext("cozy package list --full")
 }
 
 type jobSurface struct {
@@ -160,7 +160,7 @@ type jobSurface struct {
 func jobFields(state api.JobState, full bool) []output.Field {
 	fields := []output.Field{
 		{K: "job", V: state.JobID},
-		{K: "endpoint", V: state.Endpoint},
+		{K: "package", V: state.Package},
 		{K: "function", V: state.Function},
 		{K: "status", V: state.Status},
 		{K: "elapsed", V: fmt.Sprintf("%.1fs", float64(state.ElapsedMS)/1000)},

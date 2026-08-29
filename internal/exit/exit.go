@@ -39,7 +39,7 @@ var Matrix = []Row{
 	{Internal, "internal", "unexpected fault — a bug, never a user condition"},
 	{Usage, "usage", "bad invocation: unknown flag, malformed `key=value`, majorless target"},
 	{Validation, "validation", "typed payload/schema/bounds refusal; verifier refusal at ingest"},
-	{NotFound, "not_found", "unknown ref/function/endpoint/attempt; hub 404 rendered verbatim"},
+	{NotFound, "not_found", "unknown ref/function/package/attempt; hub 404 rendered verbatim"},
 	{Credential, "credential", "private/gated source without a credential — names the credential to add"},
 	{Structural, "structural", "structural incompatibility — never a fit shortfall (a degradable shortfall degrades and exits 0; a below-floor shortfall is 14)"},
 	{Confirm, "confirm", "destructive op without `--yes`"},

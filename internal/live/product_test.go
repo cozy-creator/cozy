@@ -28,7 +28,7 @@ func TestControllerWebLifecycle(t *testing.T) {
 
 	code, help := runCozy(t, root)
 	for _, want := range []string{
-		"Usage: cozy", "endpoint install", "model download", "invoke run",
+		"Usage: cozy", "package install", "model download", "invoke run",
 		"rental new", "up", "down", "unload",
 	} {
 		if code != 0 || !strings.Contains(help, want) {
@@ -191,14 +191,14 @@ func TestProductPath(t *testing.T) {
 	data, err := os.ReadFile(archive)
 	must(t, err)
 	digest := sha256.Sum256(data)
-	code, out := runCozy(t, root, "endpoint", "install", weightlessRef,
+	code, out := runCozy(t, root, "package", "install", weightlessRef,
 		"--from", archive, "--digest", "sha256:"+hex.EncodeToString(digest[:]))
 	if code != 0 {
-		t.Fatalf("endpoint install [exit %d]\n%s", code, out)
+		t.Fatalf("package install [exit %d]\n%s", code, out)
 	}
-	if code, out := runCozy(t, root, "endpoint", "list", "--json"); code != 0 ||
+	if code, out := runCozy(t, root, "package", "list", "--json"); code != 0 ||
 		!strings.Contains(out, weightlessRef) {
-		t.Fatalf("endpoint list omitted the install [exit %d]\n%s", code, out)
+		t.Fatalf("package list omitted the install [exit %d]\n%s", code, out)
 	}
 
 	outDir := filepath.Join(root, "out")

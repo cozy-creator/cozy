@@ -20,7 +20,7 @@ import (
 //
 // TYPING IS THE DESCRIPTOR'S, not this module's. `steps=20` is an int because the field's
 // rendered schema says int, never because the string looked numeric — the difference shows
-// up the first time an endpoint declares a string field whose value is digits. The schema
+// up the first time a package declares a string field whose value is digits. The schema
 // is the surface the release's own runtime vouched for at install, read back from the
 // generation, so this costs microseconds and no subprocess: cozy-creator.md's
 // "payload validation is client-side from the recorded schema, near-instant".
@@ -360,7 +360,7 @@ func declared(ep *Entrypoint, key string) *exit.Error {
 	}
 	return exit.New(exit.Validation, "%s declares no request field %q", ep.Name, key).
 		WithRemedy("it declares: %s", strings.Join(ep.RequestFields(), ", ")).
-		WithNext("cozy endpoint list --full")
+		WithNext("cozy package list --full")
 }
 
 // typed spells one scalar the way the field's rendered schema declares it.
@@ -412,5 +412,5 @@ func typed(ep *Entrypoint, key, raw string) (json.RawMessage, *exit.Error) {
 func wrongType(ep *Entrypoint, key, raw, want string) *exit.Error {
 	return exit.New(exit.Validation,
 		"%s.%s is declared %s and %q is not one", ep.Name, key, want, raw).
-		WithRemedy("the installed endpoint.descriptor.json declares %s's request schema", ep.Name)
+		WithRemedy("the installed package.descriptor.json declares %s's request schema", ep.Name)
 }

@@ -21,7 +21,7 @@ import (
 	"go.yaml.in/yaml/v3"
 )
 
-// Inherited is the complete set of environment variables an endpoint process
+// Inherited is the complete set of environment variables a package process
 // may inherit. Launchers impose every other value explicitly.
 var Inherited = []string{"PATH", "HOME", "LANG", "LC_ALL", "TMPDIR", "SSL_CERT_FILE", "SSL_CERT_DIR"}
 

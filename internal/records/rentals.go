@@ -36,7 +36,7 @@ CREATE TABLE IF NOT EXISTS rental_operations (
 const rentalsDDL = `
 CREATE TABLE IF NOT EXISTS rentals (
   id                TEXT PRIMARY KEY,
-  endpoint_ref      TEXT NOT NULL,
+  package_ref      TEXT NOT NULL,
   accelerator_model TEXT NOT NULL,
   address           TEXT NOT NULL,
   cert_path         TEXT NOT NULL,
@@ -288,7 +288,7 @@ func (s *Store) RequestRentalRelease(id string) (string, *exit.Error) {
 // Rental is one provider-neutral pod rental this client may attach a worker to.
 type Rental struct {
 	ID               string
-	EndpointRef      string
+	PackageRef       string
 	AcceleratorModel string
 	Address          string
 	CertPath         string
@@ -323,11 +323,11 @@ type Rental struct {
 	ArtifactGrantRevision uint64
 }
 
-const rentalCols = `id,endpoint_ref,accelerator_model,address,cert_path,state,hub,rented_at,media_address,control_snapshot_digest,control_snapshot_bytes,placement_revision,observed_accelerator,observed_accelerator_count,observed_backend,observed_driver_version,observed_backend_version,observed_device_memory_total_bytes,observed_worker_instance,observed_worker_boot_id,observed_at,artifact_grant_revision`
+const rentalCols = `id,package_ref,accelerator_model,address,cert_path,state,hub,rented_at,media_address,control_snapshot_digest,control_snapshot_bytes,placement_revision,observed_accelerator,observed_accelerator_count,observed_backend,observed_driver_version,observed_backend_version,observed_device_memory_total_bytes,observed_worker_instance,observed_worker_boot_id,observed_at,artifact_grant_revision`
 
 func scanRental(row interface{ Scan(...any) error }) (Rental, error) {
 	var r Rental
-	err := row.Scan(&r.ID, &r.EndpointRef, &r.AcceleratorModel, &r.Address, &r.CertPath,
+	err := row.Scan(&r.ID, &r.PackageRef, &r.AcceleratorModel, &r.Address, &r.CertPath,
 		&r.State, &r.Hub, &r.RentedAt, &r.MediaAddress,
 		&r.ControlSnapshotDigest, &r.ControlSnapshotBytes,
 		&r.PlacementRevision,
@@ -393,7 +393,7 @@ func (s *Store) RecordRental(r Rental) *exit.Error {
 		    THEN rentals.observed_worker_boot_id ELSE excluded.observed_worker_boot_id END,
 		  observed_at=CASE WHEN rentals.observed_at<>''
 		    THEN rentals.observed_at ELSE excluded.observed_at END`,
-		r.ID, r.EndpointRef, r.AcceleratorModel, r.Address, r.CertPath, r.State, r.Hub,
+		r.ID, r.PackageRef, r.AcceleratorModel, r.Address, r.CertPath, r.State, r.Hub,
 		r.RentedAt, r.MediaAddress, r.ControlSnapshotDigest,
 		r.ControlSnapshotBytes, r.PlacementRevision, r.ObservedAccelerator,
 		r.ObservedAcceleratorCount, r.ObservedBackend, r.ObservedDriverVersion,

@@ -15,7 +15,7 @@ import (
 	"github.com/cozy-creator/cozy-creator/internal/service"
 )
 
-const description = "Local-first generative media: install endpoints, run them, and publish releases."
+const description = "Local-first generative media: install packages, run them, and publish releases."
 
 // Invocation is the small adapter retained mechanism handlers consume. Kong is
 // the only parser; this value merely carries already-typed command values.
@@ -158,7 +158,7 @@ func helpArgs(args []string) []string {
 	}
 	if len(args) == 1 {
 		switch args[0] {
-		case "endpoint", "model", "invoke", "rental":
+		case "package", "model", "invoke", "rental":
 			return []string{args[0], "--help"}
 		}
 	}
@@ -176,7 +176,7 @@ func helpFor(ctx *kong.Context, args []string) string {
 	if ctx == nil || strings.TrimSpace(ctx.Command()) == "" {
 		if len(args) > 0 {
 			switch args[0] {
-			case "endpoint", "model", "invoke", "rental":
+			case "package", "model", "invoke", "rental":
 				return "cozy help " + args[0]
 			}
 		}

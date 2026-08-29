@@ -1,7 +1,7 @@
 // Package secret is the ONE carrier for a credential value in this binary (cl-011).
 //
 // A Value renders as `sha256:<12 hex>` — the same digest spelling tensorhub uses for
-// its own redacted keys, so an operator can compare `cozy endpoint search` against
+// its own redacted keys, so an operator can compare `cozy package search` against
 // diagnostics can show whether two ends hold the same token WITHOUT either
 // end printing it. The raw string has exactly one reader, `Reveal`, and the `secret`
 // fence family keeps that true: a Reveal call outside the client's request builder is

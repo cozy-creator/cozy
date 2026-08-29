@@ -1,7 +1,7 @@
 # Cozy Creator
 
 Cozy Creator is a local-first command-line application for generative media. It installs
-endpoint code, downloads models, runs endpoint callables on your machine or a private rented
+package code, downloads models, runs package callables on your machine or a private rented
 worker, and keeps your local execution records and outputs under your control.
 
 The command is `cozy`.
@@ -9,7 +9,7 @@ The command is `cozy`.
 ## Install
 
 Binary releases are not published yet. Building from source currently requires Go 1.26 or
-newer. Endpoint installation also uses `uv`; model download and publication use the `tfs`
+newer. Package installation also uses `uv`; model download and publication use the `tfs`
 executable from TensorFS.
 
 ```sh
@@ -33,8 +33,8 @@ configuration or start a background process.
 
 ```sh
 cozy
-cozy endpoint
-cozy help endpoint install
+cozy package
+cozy help package install
 cozy help invoke run
 cozy -v
 ```
@@ -48,51 +48,51 @@ cozy up
 ```
 
 `up` backgrounds one lightweight per-user controller: web UI, local API, durable records, local
-worker manager, and private-rental sessions. It does not attach a log stream or load an endpoint or
+worker manager, and private-rental sessions. It does not attach a log stream or load a package or
 model. Repeating `up` returns the same healthy URL with `changed: false`; concurrent callers
 converge on one controller. A startup failure is returned directly as a bounded diagnostic and does
 not create a persistent log. Commands that require the controller may ensure the same process is
 running automatically.
 
-## Endpoints
+## Packages
 
-Search the Tensorhub catalog, install an endpoint, and inspect local installations:
+Search the Tensorhub catalog, install a package, and inspect local installations:
 
 ```sh
-cozy endpoint search video
-cozy endpoint search org/name
-cozy endpoint install org/name@release \
+cozy package search video
+cozy package search org/name
+cozy package install org/name@release \
   --profile torch2.13.0-cu130-cp312-linux-x86 \
   --major v1 \
   --reason "local install"
-cozy endpoint list
+cozy package list
 ```
 
-For local endpoint development, install a source tree explicitly:
+For local package development, install a source tree explicitly:
 
 ```sh
-cozy endpoint install org/name --dir ./my-endpoint --allow-unsigned
+cozy package install org/name --dir ./my-package --allow-unsigned
 ```
 
-Remove local endpoint generations with:
+Remove local package generations with:
 
 ```sh
-cozy endpoint remove org/name
+cozy package remove org/name
 ```
 
 Publishing packages one deterministic pure project wheel. Tensorhub derives compatible base
-worker profiles from `pyproject.toml`, `uv.lock`, and its image inventory. The endpoint name is
+worker profiles from `pyproject.toml`, `uv.lock`, and its image inventory. The package name is
 created automatically when absent:
 
 ```sh
-cozy endpoint publish org/name \
+cozy package publish org/name \
   --release 1.0.0 \
   --dir . \
   --reason "release 1.0.0"
 ```
 
 Tensorhub owns serving promotion; publication does not move traffic implicitly.
-See [endpoint publication](docs/endpoint-publication.md) for the release contract.
+See [package publication](docs/package-publication.md) for the release contract.
 
 ## Models
 
@@ -115,17 +115,17 @@ cozy model publish org/model sha256:<snapshot> --reason "initial release"
 Download and publication are resumable and verify content identities before making a local or
 remote root visible.
 
-## Invoke endpoints and jobs
+## Invoke packages and jobs
 
 Serving entrypoints and bounded jobs use the same command. Cozy reads the installed descriptor
 to determine the callable lifecycle:
 
 ```sh
-cozy invoke run org/endpoint/v1/generate \
+cozy invoke run org/package/v1/generate \
   prompt="a watercolor lighthouse at dusk" \
   --out ./outputs
 
-cozy invoke run org/endpoint/v1/train epochs=3 --detach
+cozy invoke run org/package/v1/train epochs=3 --detach
 cozy invoke list
 cozy invoke cancel <invocation-or-job-id>
 ```
@@ -138,16 +138,16 @@ reuse; job workers are reclaimed at terminal.
 
 ## Private rentals
 
-With Tensorhub configured, rent a private worker for an exact endpoint:
+With Tensorhub configured, rent a private worker for an exact package:
 
 ```sh
-cozy rental new org/endpoint@release \
+cozy rental new org/package@release \
   --accelerator "NVIDIA H200" \
   --reason "private generation" \
   --idempotency-key <unique-key>
 
 cozy rental list
-cozy invoke run org/endpoint/v1/generate --worker <rental-id> prompt="moonlit lake"
+cozy invoke run org/package/v1/generate --worker <rental-id> prompt="moonlit lake"
 cozy rental end <rental-id>
 ```
 
@@ -164,7 +164,7 @@ cozy down         # stop locally; refuses while invocations or rentals are activ
 cozy down --all   # cancel all work, end all rentals, then stop the controller
 ```
 
-None of them deletes installed endpoint or model bytes. A failed partial `down --all` leaves the
+None of them deletes installed package or model bytes. A failed partial `down --all` leaves the
 controller running so cancellation and paid-resource reconciliation can continue.
 
 The launch web UI is currently a stub rooted in [`web/`](web/). The controller already serves
@@ -204,13 +204,13 @@ only the encoding. Success output contains the domain answer without an `ok/kind
 Progress goes to stderr.
 
 ```sh
-cozy endpoint search
-# endpoints[#3]:
+cozy package search
+# packages[#3]:
 #   cozy/marco-polo-derived
 #   cozy/marco-polo-cu130
 #   cozy/marco-polo-launch1
 
-cozy endpoint list --fields endpoint,version,disk
+cozy package list --fields package,version,disk
 cozy invoke list --json
 cozy model search flux --full
 ```

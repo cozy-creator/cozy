@@ -15,7 +15,7 @@ import (
 // ParseAssets turns repeated `--asset <field-path>=<file>` flags into one payload plus
 // exact byte bindings. The payload carries only an opaque content reference; paths and
 // bytes travel out-of-band through DeliveryGrant. A nested path is resolved against the
-// endpoint's recorded schema, so `references.0.image` cannot accidentally grant a file
+// package's recorded schema, so `references.0.image` cannot accidentally grant a file
 // to a scalar or to a misspelled field.
 func ParseAssets(ep *Entrypoint, payload json.RawMessage, specs []string) (json.RawMessage, []records.AssetBinding, *exit.Error) {
 	if len(specs) == 0 {
@@ -52,7 +52,7 @@ func ParseAssets(ep *Entrypoint, payload json.RawMessage, specs []string) (json.
 		if !assetAt(ep.Request, parts) {
 			return nil, nil, exit.New(exit.Validation,
 				"%s.%s is not an asset field in this release's request schema", ep.Name, fieldPath).
-				WithRemedy("the installed endpoint.descriptor.json declares %s's request schema", ep.Name)
+				WithRemedy("the installed package.descriptor.json declares %s's request schema", ep.Name)
 		}
 		assetSpec, _ := AssetSpec(ep, fieldPath)
 		maxBytes := assetSpec.MaxBytes

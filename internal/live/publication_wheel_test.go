@@ -16,20 +16,20 @@ import (
 	"testing"
 
 	"github.com/cozy-creator/cozy-creator/internal/config"
-	"github.com/cozy-creator/cozy-creator/internal/endpointpublish"
 	"github.com/cozy-creator/cozy-creator/internal/launch"
+	"github.com/cozy-creator/cozy-creator/internal/packagepublish"
 	"github.com/cozy-creator/cozy-creator/internal/wheel"
 )
 
-// TestEndpointPublicationWheels is the release-border matrix: one deterministic
+// TestPackagePublicationWheels is the release-border matrix: one deterministic
 // pure project wheel and planted native/build-input refusals.
-func TestEndpointPublicationWheels(t *testing.T) {
+func TestPackagePublicationWheels(t *testing.T) {
 	root := t.TempDir()
 	mustWrite(t, filepath.Join(root, "pyproject.toml"), `[project]
 name = "marco-polo"
 version = "1.0.0"
 `)
-	mustWrite(t, filepath.Join(root, "endpoint.toml"), `[application]
+	mustWrite(t, filepath.Join(root, "package.toml"), `[application]
 object = "marco_polo:app"
 `)
 	mustWrite(t, filepath.Join(root, "marco_polo.py"), "app = object()\n")
@@ -100,14 +100,14 @@ object = "marco_polo:app"
 	}
 }
 
-func TestEndpointPublishSourceRefusals(t *testing.T) {
+func TestPackagePublishSourceRefusals(t *testing.T) {
 	repo := t.TempDir()
 	mustWrite(t, filepath.Join(repo, "pyproject.toml"), `[project]
 name = "marco-polo"
 version = "1.0.0"
 dependencies = []
 `)
-	mustWrite(t, filepath.Join(repo, "endpoint.toml"), `[application]
+	mustWrite(t, filepath.Join(repo, "package.toml"), `[application]
 object = "marco_polo:app"
 `)
 	mustWrite(t, filepath.Join(repo, "marco_polo.py"), "app = object()\n")
@@ -117,49 +117,49 @@ object = "marco_polo:app"
 	git(t, repo, "config", "user.name", "Fixture")
 	git(t, repo, "add", ".")
 	git(t, repo, "commit", "-qm", "fixture")
-	request := endpointpublish.Request{Tree: repo, Release: "1.0.0"}
-	mustWrite(t, filepath.Join(repo, "endpoint.release.json"), `{}`)
+	request := packagepublish.Request{Tree: repo, Release: "1.0.0"}
+	mustWrite(t, filepath.Join(repo, "package.release.json"), `{}`)
 	git(t, repo, "add", ".")
 	git(t, repo, "commit", "-qm", "plant retired metadata")
-	if _, problem := endpointpublish.Prepare(request); problem == nil || problem.ErrName() != "endpoint_metadata_retired" {
+	if _, problem := packagepublish.Prepare(request); problem == nil || problem.ErrName() != "package_metadata_retired" {
 		t.Fatalf("retired release metadata did not refuse: %v", problem)
 	}
-	must(t, os.Remove(filepath.Join(repo, "endpoint.release.json")))
+	must(t, os.Remove(filepath.Join(repo, "package.release.json")))
 	git(t, repo, "add", "-u")
 	git(t, repo, "commit", "-qm", "remove retired metadata")
-	mustWrite(t, filepath.Join(repo, "endpoint.descriptor.json"), `{}`)
-	git(t, repo, "add", "endpoint.descriptor.json")
+	mustWrite(t, filepath.Join(repo, "package.descriptor.json"), `{}`)
+	git(t, repo, "add", "package.descriptor.json")
 	git(t, repo, "commit", "-qm", "plant retired descriptor")
-	if _, problem := endpointpublish.Prepare(request); problem == nil || problem.ErrName() != "endpoint_metadata_retired" {
+	if _, problem := packagepublish.Prepare(request); problem == nil || problem.ErrName() != "package_metadata_retired" {
 		t.Fatalf("committed generated descriptor did not refuse: %v", problem)
 	}
-	must(t, os.Remove(filepath.Join(repo, "endpoint.descriptor.json")))
+	must(t, os.Remove(filepath.Join(repo, "package.descriptor.json")))
 	git(t, repo, "add", "-u")
 	git(t, repo, "commit", "-qm", "remove retired descriptor")
 
 	mustWrite(t, filepath.Join(repo, "uncommitted.py"), "x=1\n")
-	if _, problem := endpointpublish.Prepare(request); problem == nil || problem.ErrName() != "endpoint_tree_dirty" {
+	if _, problem := packagepublish.Prepare(request); problem == nil || problem.ErrName() != "package_tree_dirty" {
 		t.Fatalf("dirty source tree did not refuse: %v", problem)
 	}
 	must(t, os.Remove(filepath.Join(repo, "uncommitted.py")))
 	mustWrite(t, filepath.Join(repo, "native.so"), "native")
 	git(t, repo, "add", "native.so")
 	git(t, repo, "commit", "-qm", "plant native")
-	if _, problem := endpointpublish.Prepare(request); problem == nil || problem.ErrName() != "endpoint_source_native_input" {
+	if _, problem := packagepublish.Prepare(request); problem == nil || problem.ErrName() != "package_source_native_input" {
 		t.Fatalf("committed native source did not refuse before packaging: %v", problem)
 	}
 }
 
-func TestEndpointPublishDerivesDescriptorWithLockedRuntime(t *testing.T) {
+func TestPackagePublishDerivesDescriptorWithLockedRuntime(t *testing.T) {
 	homeDir, err := os.UserHomeDir()
 	must(t, err)
-	fixture := filepath.Join(homeDir, "cozy_v2", "cozy-runtime", "proofs", "fixtures", "marco-polo-endpoint") //cozy:allow peer Runtime repository fixture
-	for _, required := range []string{"pyproject.toml", "uv.lock", "endpoint.toml"} {
+	fixture := filepath.Join(homeDir, "cozy_v2", "cozy-runtime", "proofs", "fixtures", "marco-polo-package") //cozy:allow peer Runtime repository fixture
+	for _, required := range []string{"pyproject.toml", "uv.lock", "package.toml"} {
 		if _, err := os.Stat(filepath.Join(fixture, required)); err != nil {
 			t.Skipf("Runtime Marco fixture is not present: %v", err)
 		}
 	}
-	for _, retired := range []string{"endpoint.descriptor.json", "endpoint.release.json", "endpoint.evaluated-config.json"} {
+	for _, retired := range []string{"package.descriptor.json", "package.release.json", "package.evaluated-config.json"} {
 		if _, err := os.Stat(filepath.Join(fixture, retired)); err == nil {
 			t.Skipf("Runtime Marco fixture has not landed the source-only hardcut yet: %s", retired)
 		}
@@ -171,12 +171,12 @@ func TestEndpointPublishDerivesDescriptorWithLockedRuntime(t *testing.T) {
 	}
 	_, problem := config.Load()
 	fatal(t, problem)
-	pack, problem := endpointpublish.Prepare(endpointpublish.Request{Tree: fixture, Release: "1.0.0"})
+	pack, problem := packagepublish.Prepare(packagepublish.Request{Tree: fixture, Release: "1.0.0"})
 	if problem != nil {
 		t.Fatalf("real locked Runtime derivation refused: %s", problem.Message)
 	}
 	defer pack.Close()
-	replay, problem := endpointpublish.Prepare(endpointpublish.Request{Tree: fixture, Release: "opaque-release-id"})
+	replay, problem := packagepublish.Prepare(packagepublish.Request{Tree: fixture, Release: "opaque-release-id"})
 	if problem != nil {
 		t.Fatalf("real locked Runtime replay refused: %s", problem.Message)
 	}

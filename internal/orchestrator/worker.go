@@ -25,7 +25,7 @@ import (
 )
 
 // Binding is the record owner's resolution of one `entrypoint_binding_plan_id`. For a
-// wholly weightless local endpoint, RuntimePlan is the installed runtime's exact subject
+// wholly weightless local package, RuntimePlan is the installed runtime's exact subject
 // and Runtime owns the private bytes. The modeled/connected path still carries Record so
 // it can stage or deliver those bytes explicitly.
 //
@@ -36,7 +36,7 @@ type Binding struct {
 	Entrypoint string         `json:"entrypoint"`
 	Record     map[string]any `json:"record"`
 	// RuntimePlan is the exact ArtifactSubject emitted by the installed runtime for a
-	// wholly weightless endpoint. Runtime owns and privately stages those canonical
+	// wholly weightless package. Runtime owns and privately stages those canonical
 	// bytes; this record owner consumes only their measured identity before spawn.
 	RuntimePlan *BindingPlanSubject `json:"runtime_plan,omitempty"`
 	planID      string
@@ -120,7 +120,7 @@ func (b *Binding) artifactSubject() (*pb.ArtifactSubject, *exit.Error) {
 	}, nil
 }
 
-// THE THREE OBJECTS THAT USED TO BE ONE (#484). `EndpointSpec` conflated three
+// THE THREE OBJECTS THAT USED TO BE ONE (#484). `PackageSpec` conflated three
 // independent facts — how a worker PROCESS comes to exist, WHAT that worker is asked to
 // host, and HOW this owner reaches a worker it did not spawn — and the conflation is
 // exactly what rev-2 makes unstateable: a placement set is a full-replace document a
@@ -155,16 +155,16 @@ func (p WarmupPolicy) Or() WarmupPolicy {
 // rev-2's `Placement` (placement_id -> PlacementSpec, #481). It carries the identity
 // facts, and nothing about how a process is started.
 type DesiredPlacement struct {
-	Endpoint  string `json:"endpoint"`   // org/name — the slot this placement serves under
+	Package   string `json:"package"`    // org/name — the slot this placement serves under
 	ReleaseID string `json:"release_id"` // PROVENANCE: what the spec was resolved FROM
 	// InstallID is the install this placement was resolved from ("" = an uninstalled dev
 	// tree). Was `Generation`, which named a protocol word this side does not own (#484).
 	InstallID string `json:"install_id"`
-	// DescriptorDigest is the cr-003 descriptor's own identity, as the install VERIFIED
+	// PackageDescriptorDigest is the cr-003 descriptor's own identity, as the install VERIFIED
 	// it in the generation's own venv. It rides the PlacementSpec because a placement is
 	// named by the bytes it serves, and the descriptor is one of them.
-	DescriptorDigest string     `json:"descriptor_digest"`
-	Bindings         []*Binding `json:"bindings"`
+	PackageDescriptorDigest string     `json:"package_descriptor_digest"`
+	Bindings                []*Binding `json:"bindings"`
 	// Remote control truth comes only from Tensorhub's persisted acquisition
 	// snapshot. Local placements retain their independent install-derived path
 	// and leave these fields empty.
@@ -224,7 +224,7 @@ type RemoteTarget struct {
 // placement. The caller (cl-010's `start`, or cl-001's live driver) resolves it from the
 // install; the orchestrator itself resolves nothing about Python.
 type WorkerLaunchSpec struct {
-	Python   string       `json:"python"` // the interpreter inside the endpoint's own venv
+	Python   string       `json:"python"` // the interpreter inside the package's own venv
 	Args     []string     `json:"args"`
 	Dir      string       `json:"dir"`
 	Imposed  []string     `json:"imposed"` // exact env values the launcher imposes, never inherited
@@ -253,15 +253,15 @@ const (
 	ChangePlacementAdded WorkerChange = "placement_added"
 )
 
-// pinnedEndpoint is the endpoint name a request PINNED to a rental resolves its slot
+// pinnedPackage is the package name a request PINNED to a rental resolves its slot
 // under. One attached worker per rental id: a second request naming the same rental finds
 // the worker already conversing instead of attaching a second control stream to it, and a
 // request naming no rental never lands in a rented worker's slot.
-func pinnedEndpoint(endpoint, rental string) string {
+func pinnedPackage(pkg, rental string) string {
 	if rental == "" {
-		return endpoint
+		return pkg
 	}
-	return endpoint + "@" + rental
+	return pkg + "@" + rental
 }
 
 // IsJob answers the worker's mode.
@@ -285,17 +285,17 @@ func (p DesiredPlacement) RuntimeStagesBindings() bool {
 // IsJob answers the worker's mode, from the one placement it hosts.
 func (s WorkerLaunchSpec) IsJob() bool { return s.Placement.IsJob() }
 
-// InstanceID is the endpoint's local worker SLOT identity, and it is deliberately STABLE
+// InstanceID is the package's local worker SLOT identity, and it is deliberately STABLE
 // across supervisor restarts: `worker_instance_id` names one provisioned instance
 // lifetime, and outcome replay across a restart is authorized by that identity (02 §2). A
 // slot keeps its journal root, which is what lets a restarted worker report its held
 // attempts at all. A NEW install is a genuinely new instance and gets a new id.
 func (p DesiredPlacement) InstanceID() string {
-	slot := "slot/" + p.Endpoint + "/" + p.InstallID
+	slot := "slot/" + p.Package + "/" + p.InstallID
 	if p.IsJob() {
-		// A JOB worker is its own slot: one worker per (endpoint, install, job function),
+		// A JOB worker is its own slot: one worker per (package, install, job function),
 		// because a JobDirective names ONE job and a worker is in one mode. It is also what
-		// lets a serving worker and a job worker of the same endpoint coexist instead of
+		// lets a serving worker and a job worker of the same package coexist instead of
 		// fighting over one instance id.
 		slot += "/job/" + p.Jobs[0].Function
 	}
@@ -542,7 +542,7 @@ func (c *Orchestrator) EnsureWorker(spec WorkerLaunchSpec) (string, WorkerChange
 				"rental.placement_revision_required",
 				"rental %s is claimed with another desired placement",
 				live.spec.Connection.RentalID).
-				WithRemedy("use `cozy rental list %s --endpoint-ref ...`; remote desired state always follows its active grant",
+				WithRemedy("use `cozy rental list %s --package-ref ...`; remote desired state always follows its active grant",
 					live.spec.Connection.RentalID)
 		}
 		if e := c.ConvergePlacementSet(instanceID, []DesiredPlacement{spec.Placement}); e != nil {
@@ -633,12 +633,12 @@ func (c *Orchestrator) evictLRUIdleDeviceHolder(devices []string,
 	sort.Slice(eligible, func(i, j int) bool { return lessRecentlyUsed(eligible[i], eligible[j]) })
 	victim := eligible[0]
 	victim.stopping = true
-	instanceID, endpoint := victim.instanceID, victim.spec.Placement.Endpoint
+	instanceID, pkg := victim.instanceID, victim.spec.Placement.Package
 	lastUse, resident := victim.lastUseRevision, victim.residentRevision
 	c.mu.Unlock()
 
 	c.logf("device pressure: evicting LRU idle local worker %s (%s, last_use=%d, resident=%d)",
-		instanceID, endpoint, lastUse, resident)
+		instanceID, pkg, lastUse, resident)
 	if !c.stopClaimedWorker(victim, StopGrace) {
 		return false, exit.New(exit.Conflict,
 			"idle device holder %s changed before it could be evicted", instanceID)
@@ -661,7 +661,7 @@ func lessRecentlyUsed(a, b *worker) bool {
 }
 
 // EnsureRental makes an already-provisioned rental's worker resident without invoking
-// an endpoint. This is the explicit paid-run preflight: the control claim must persist
+// an package. This is the explicit paid-run preflight: the control claim must persist
 // actual hardware readback before a request can be submitted to the pod.
 func (c *Orchestrator) EnsureRental(id string) (string, string, WorkerChange, *exit.Error) {
 	if c.opt.Rentals == nil {
@@ -677,9 +677,9 @@ func (c *Orchestrator) EnsureRental(id string) (string, string, WorkerChange, *e
 	// The rental IS the slot, exactly as dispatch pins it: the same `org/name@<rental>`
 	// name, so a probe and a later pinned run share ONE connected worker.
 	spec := WorkerLaunchSpec{Placement: target.Placement, Connection: target.Connection}
-	spec.Placement.Endpoint = pinnedEndpoint(spec.Placement.Endpoint, id)
+	spec.Placement.Package = pinnedPackage(spec.Placement.Package, id)
 	instance, change, problem := c.EnsureWorker(spec)
-	return instance, spec.Placement.Endpoint, change, problem
+	return instance, spec.Placement.Package, change, problem
 }
 
 // hostsPlans answers whether a live worker was launched holding exactly the plans this
@@ -771,7 +771,7 @@ func (c *Orchestrator) spawnWorker(spec WorkerLaunchSpec) (string, *exit.Error) 
 	// refuses here means nothing was started, which is why the refusal has no cleanup.
 	if e := c.opt.Store.SpawnWorker(records.WorkerProcess{
 		InstanceID: instanceID,
-		Endpoint:   spec.Placement.Endpoint,
+		Package:    spec.Placement.Package,
 		Generation: spec.Placement.InstallID,
 		ReleaseID:  spec.Placement.ReleaseID,
 		WorkerID:   "local",
@@ -848,7 +848,7 @@ func (c *Orchestrator) spawnWorker(spec WorkerLaunchSpec) (string, *exit.Error) 
 		c.mu.Unlock()
 		_ = c.opt.Store.CloseWorker(instanceID)
 		logFile.Close()
-		return "", exit.Internalf("cannot start the endpoint worker: %s", err)
+		return "", exit.Internalf("cannot start the package worker: %s", err)
 	}
 	// The group is established at fork on Unix and must be ATTACHED after start on Windows,
 	// where the child is created suspended and the job adopts it before it runs. Adoption
@@ -861,7 +861,7 @@ func (c *Orchestrator) spawnWorker(spec WorkerLaunchSpec) (string, *exit.Error) 
 		delete(c.workers, instanceID)
 		c.mu.Unlock()
 		_ = c.opt.Store.CloseWorker(instanceID)
-		return "", exit.Internalf("cannot contain the endpoint worker: %s", err)
+		return "", exit.Internalf("cannot contain the package worker: %s", err)
 	}
 	c.mu.Lock()
 	w.pid = cmd.Process.Pid
@@ -972,7 +972,7 @@ func newWorker(instanceID string, spec WorkerLaunchSpec) *worker {
 // no spawn, no device grant (the pod's card is the pod's), no birth identity — the
 // conversation is the same claim the local path runs, dialed at the rental's address
 // with the pinned cert and the owner token as proof (#445).
-// The media plane remains the invocation byte path, but it is NOT an endpoint distribution
+// The media plane remains the invocation byte path, but it is NOT a package distribution
 // path. Binding plans are ordinary artifact-grant subjects now: Tensorhub supplies their
 // locations and the worker verifies their digests while materializing PlacementSet/2.
 func (c *Orchestrator) connectWorker(spec WorkerLaunchSpec) (string, *exit.Error) {
@@ -980,7 +980,7 @@ func (c *Orchestrator) connectWorker(spec WorkerLaunchSpec) (string, *exit.Error
 	if spec.Connection.Media == nil {
 		return "", exit.Named(exit.Unavailable, "rental_no_media_plane",
 			"rental %s pins a control address and no media plane, and a pod that cannot be "+
-				"handed bytes cannot be served", spec.Placement.Endpoint).
+				"handed bytes cannot be served", spec.Placement.Package).
 			WithRemedy("a rented pod runs its worker and a co-resident media server " +
 				"(cl-014); this host will not fall back to granting paths on its own disk, " +
 				"because the pod cannot reach them").
@@ -1006,7 +1006,7 @@ func (c *Orchestrator) connectWorker(spec WorkerLaunchSpec) (string, *exit.Error
 	// release, which is also why nothing here has a pid or a birth identity to record.
 	if e := c.opt.Store.AttachWorker(records.WorkerProcess{
 		InstanceID: instanceID,
-		Endpoint:   spec.Placement.Endpoint,
+		Package:    spec.Placement.Package,
 		Generation: spec.Placement.InstallID,
 		ReleaseID:  spec.Placement.ReleaseID,
 		WorkerID:   "remote",
@@ -1135,7 +1135,7 @@ func (c *Orchestrator) EnsurePlacementReady(instanceID, planID string) *exit.Err
 		// corollary guard). The live case: submit, then an install --force moves the
 		// active pin before the launch goroutine runs — selectOrStart replaces the stale
 		// worker with one launched for the NEW pin, and this wait would watch it for the
-		// OLD plan forever, holding `starting[slot]` and wedging the endpoint slot until
+		// OLD plan forever, holding `starting[slot]` and wedging the package slot until
 		// restart. A structural mismatch is an answer, not a longer wait.
 		if unstaged {
 			return exit.Named(exit.Conflict, "plan_not_staged",
@@ -1155,7 +1155,7 @@ func (c *Orchestrator) EnsurePlacementReady(instanceID, planID string) *exit.Err
 				return exit.Named(exit.Unavailable, "worker_recycled",
 					"the job worker recycled (exit %d) after its bounded attempt", RecycleExit)
 			}
-			return exit.New(exit.Failed, "the endpoint worker exited before reporting ready").
+			return exit.New(exit.Failed, "the package worker exited before reporting ready").
 				WithRemedy("its log is %s", logPath)
 		}
 		if workerFaulted {
@@ -1168,7 +1168,7 @@ func (c *Orchestrator) EnsurePlacementReady(instanceID, planID string) *exit.Err
 			// worker owes a Report every `ReportCadence` and has missed `SilentReports`
 			// of them. A slow load is not this — a loading worker keeps reporting.
 			return exit.Named(exit.Failed, "worker_silent",
-				"the endpoint worker has reported no observed state for %s, which is %d missed "+
+				"the package worker has reported no observed state for %s, which is %d missed "+
 					"periods of %s: it is stalled, not slow", quiet.Round(time.Second),
 				SilentReports, ReportCadence).WithRemedy("its log is %s", logPath)
 		}
@@ -1191,10 +1191,10 @@ func workerError(fault string) *exit.Error {
 	}
 	if strings.Contains(fault, "shortfall") || strings.Contains(fault, "capacity") {
 		return exit.New(exit.Capacity,
-			"the endpoint worker cannot make its binding resident on this device: %s", said)
+			"the package worker cannot make its binding resident on this device: %s", said)
 	}
 	return exit.New(exit.Failed,
-		"the endpoint worker's placement reported a terminal fault and cannot become "+
+		"the package worker's placement reported a terminal fault and cannot become "+
 			"dispatchable: %s", said)
 }
 
@@ -1218,7 +1218,7 @@ func (c *Orchestrator) WorkerLog(instanceID string) string {
 type WorkerFacts struct {
 	InstanceID                 string   `json:"instance_id"`
 	RentalID                   string   `json:"rental_id,omitempty"`
-	Endpoint                   string   `json:"endpoint"`
+	Package                    string   `json:"package"`
 	ReleaseID                  string   `json:"release_id"`
 	BootID                     string   `json:"worker_boot_id"`
 	PlacementID                string   `json:"placement_id"`
@@ -1295,7 +1295,7 @@ func (c *Orchestrator) Workers() []WorkerFacts {
 
 func factsOf(w *worker) WorkerFacts {
 	f := WorkerFacts{
-		InstanceID: w.instanceID, Endpoint: w.spec.Placement.Endpoint,
+		InstanceID: w.instanceID, Package: w.spec.Placement.Package,
 		ReleaseID: w.spec.Placement.ReleaseID, BootID: w.bootID,
 		PlacementID: w.placementID, Generation: w.generation,
 		Exited: w.exited, Devices: w.spec.Devices,
@@ -1356,8 +1356,8 @@ type AcquisitionLegFacts struct {
 }
 
 type PlacementAcquisitionFacts struct {
-	Endpoint AcquisitionLegFacts `json:"endpoint"`
-	Model    AcquisitionLegFacts `json:"model"`
+	Package AcquisitionLegFacts `json:"package"`
+	Model   AcquisitionLegFacts `json:"model"`
 }
 
 type ArtifactSubjectFacts struct {

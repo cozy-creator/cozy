@@ -35,7 +35,7 @@ func TestRentalRelayRefusalIsDurableAndClearsOnSuccess(t *testing.T) {
 	o := hostOwner(t, "rental-relay-refusal")
 	defer o.close()
 	row := records.Rental{
-		ID: "rental-relay-one", EndpointRef: "cozy/fake/v1/run",
+		ID: "rental-relay-one", PackageRef: "cozy/fake/v1/run",
 		AcceleratorModel: "NVIDIA H200", State: hub.RentalConverging, Hub: server.URL,
 	}
 	fatal(t, o.store.RecordRental(row))
@@ -81,7 +81,7 @@ func TestRentalRelayRefusalIsDurableAndClearsOnSuccess(t *testing.T) {
 func TestObserveRentalWorkerCPU(t *testing.T) {
 	o := hostOwner(t, "rental-cpu-observation")
 	fatal(t, o.store.RecordRental(records.Rental{
-		ID: "pr-cpu", EndpointRef: "cozy/marco-polo-cpu/v1/marco",
+		ID: "pr-cpu", PackageRef: "cozy/marco-polo-cpu/v1/marco",
 		AcceleratorModel: "CPU", State: "converging", Hub: "http://hub",
 	}))
 	fatal(t, o.store.ObserveRentalWorker(

@@ -53,7 +53,7 @@ func MaterializeEnvironment(sourceDir, venvDir string) (*EnvironmentReceipt, *ex
 	if err != nil {
 		return nil, exit.Named(exit.Structural, "lock_missing",
 			"the release carries no uv.lock at %s", lock).
-			WithRemedy("an endpoint release pins its whole closure; `uv sync --locked` has nothing to install without it")
+			WithRemedy("a package release pins its whole closure; `uv sync --locked` has nothing to install without it")
 	}
 
 	env := &EnvironmentReceipt{
@@ -90,7 +90,7 @@ func MaterializeEnvironment(sourceDir, venvDir string) (*EnvironmentReceipt, *ex
 }
 
 // Disk measures one generation exactly once, at install: bytes only this generation
-// holds, and bytes it shares with another venv through a hardlink. `cozy endpoint list` reads
+// holds, and bytes it shares with another venv through a hardlink. `cozy package list` reads
 // these numbers back out of the record — it never walks 122k files.
 func Disk(dir string) (exclusive, shared int64) {
 	_ = filepath.WalkDir(dir, func(p string, d fs.DirEntry, err error) error {
@@ -138,7 +138,7 @@ func SnapshotDigest(dir string) (string, int, int64, *exit.Error) {
 	})
 	if err != nil {
 		return "", 0, 0, exit.New(exit.NotFound, "cannot read the source tree %s: %s", dir, err).
-			WithRemedy("--dir names a readable endpoint project directory")
+			WithRemedy("--dir names a readable package project directory")
 	}
 	sort.Strings(paths)
 	for _, rel := range paths {

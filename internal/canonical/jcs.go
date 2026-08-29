@@ -1,6 +1,6 @@
 package canonical
 
-// This file is RFC 8785 rendering over EndpointDescriptor/1's bounded I-JSON profile.
+// This file is RFC 8785 rendering over PackageDescriptor/1's bounded I-JSON profile.
 // Every numeric value is limited to +/-((2^53)-1), independent of token spelling.
 // Worker-protocol documents continue to use the narrower integer-only printable-ASCII
 // profile in canonical.go/read.go.

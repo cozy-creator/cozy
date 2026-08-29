@@ -12,7 +12,7 @@ import (
 // a larger surface reading the same four keys.
 //
 // Scope is the safety property: a table the packer does not want is SKIPPED WHOLE, so an
-// endpoint's `[bindings."Fl2VAModel"]` or a repo's `[tool.mypy]` never has to be
+// package's `[bindings."Fl2VAModel"]` or a repo's `[tool.mypy]` never has to be
 // expressible here. Inside a wanted table the reader is strict — a line it cannot read is
 // a typed refusal, never a silently dropped field.
 

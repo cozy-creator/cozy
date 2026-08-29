@@ -182,11 +182,11 @@ func body(m protoreflect.Message) (map[string]Value, error) {
 // AttemptOutcomeBody under `/1` and every digest it minted would name the wrong document
 // (#536e).
 var docVersion = map[string]int{
-	"cozy.worker.v1.AttemptOutcomeBody":      3,
-	"cozy.worker.v1.EndpointEnvironmentSpec": 2,
-	"cozy.worker.v1.PlacementSet":            2,
-	"cozy.worker.v1.PlacementSpec":           2,
-	"cozy.worker.v1.WorkerSnapshotBody":      2,
+	"cozy.worker.v1.AttemptOutcomeBody":     3,
+	"cozy.worker.v1.PackageEnvironmentSpec": 2,
+	"cozy.worker.v1.PlacementSet":           2,
+	"cozy.worker.v1.PlacementSpec":          2,
+	"cozy.worker.v1.WorkerSnapshotBody":     2,
 }
 
 // Format is the canonical `format` tag for one message's document: its full name plus the

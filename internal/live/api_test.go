@@ -47,7 +47,7 @@ func TestLocalAPIDoor(t *testing.T) {
 	if rebind.Status != http.StatusForbidden || rebind.code() != "host_not_allowed" {
 		t.Errorf("a rebinding-style foreign Host: %s", rebind.brief())
 	}
-	mutate := svc.call(t, "POST", "/v1/requests", map[string]any{"endpoint": "x/y", "function": "f"},
+	mutate := svc.call(t, "POST", "/v1/requests", map[string]any{"package": "x/y", "function": "f"},
 		"Host", "cozy.attacker.example", "Idempotency-Key", "arm-rebind")
 	if mutate.Status != http.StatusForbidden || mutate.code() != "host_not_allowed" {
 		t.Errorf("a rebinding MUTATION: %s", mutate.brief())
@@ -55,12 +55,12 @@ func TestLocalAPIDoor(t *testing.T) {
 
 	// Origin, on a mutation. A cross-site fetch, form POST and EventSource all send one;
 	// a same-origin GET does not, and a CLI never sends one at all.
-	xs := svc.call(t, "POST", "/v1/requests", map[string]any{"endpoint": "x/y", "function": "f"},
+	xs := svc.call(t, "POST", "/v1/requests", map[string]any{"package": "x/y", "function": "f"},
 		"Origin", "https://evil.example", "Idempotency-Key", "arm-origin")
 	if xs.Status != http.StatusForbidden || xs.code() != "origin_not_allowed" {
 		t.Errorf("a CROSS-ORIGIN mutation: %s", xs.brief())
 	}
-	null := svc.call(t, "POST", "/v1/requests", map[string]any{"endpoint": "x/y", "function": "f"},
+	null := svc.call(t, "POST", "/v1/requests", map[string]any{"package": "x/y", "function": "f"},
 		"Origin", "null", "Idempotency-Key", "arm-null")
 	if null.Status != http.StatusForbidden {
 		t.Errorf("a sandboxed-iframe `Origin: null` mutation: %s", null.brief())
@@ -159,7 +159,7 @@ func TestLocalAPIDoor(t *testing.T) {
 		r.code() != "unknown_route" {
 		t.Errorf("an unknown route answered without the typed envelope: %s", r.brief())
 	}
-	noKey := svc.call(t, "POST", "/v1/requests", map[string]any{"endpoint": "x/y", "function": "f"},
+	noKey := svc.call(t, "POST", "/v1/requests", map[string]any{"package": "x/y", "function": "f"},
 		"Idempotency-Key", "")
 	if noKey.Status != http.StatusBadRequest || noKey.code() != "idempotency_key_required" {
 		t.Errorf("a submission with no Idempotency-Key: %s", noKey.brief())
@@ -184,7 +184,7 @@ func TestLocalAPIDoor(t *testing.T) {
 	store, problem := records.Open(filepath.Join(root, "records.db"))
 	fatal(t, problem)
 	fatal(t, store.RecordRental(records.Rental{
-		ID: "rental-down-arm", EndpointRef: "cozy/fake/v1/run",
+		ID: "rental-down-arm", PackageRef: "cozy/fake/v1/run",
 		AcceleratorModel: "CPU", State: "ready", Hub: "https://hub.invalid",
 	}))
 	blocked := svc.call(t, "POST", "/v1/local/service/down", map[string]bool{"all": false})

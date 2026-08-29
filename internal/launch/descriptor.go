@@ -1,22 +1,22 @@
 // Package launch turns an INSTALLED GENERATION into the facts needed to serve it: the
-// endpoint's verified surface, the artifact its binding selects, and the EndpointSpec the
-// orchestrator launches. It is what replaces cl-006's `--dev-endpoint` document (cl-010).
+// package's verified surface, the artifact its binding selects, and the PackageSpec the
+// orchestrator launches. It is what replaces cl-006's `--dev-package` document (cl-010).
 //
 // Nothing here re-derives a fact its owner already produced:
 //
 //   - THE SURFACE is a generation-private descriptor derived once by the release's own
 //     Runtime at install. Reading it back costs microseconds; re-running `describe` per
-//     invocation would import the endpoint's module graph to learn a fact already frozen.
+//     invocation would import the package's module graph to learn a fact already frozen.
 //     The recorded semantic digest is checked on every read.
 //   - THE ARTIFACT FACTS (store root, per-component snapshots, immutable config, variant,
 //     physical floor) come from the runtime's own local artifact index, read through
 //     `cozy-runtime list --json`. cozy-creator never composes a store path.
-//   - THE SELECTION is `endpoint.toml`'s `[bindings]` table — the author's declared
+//   - THE SELECTION is `package.toml`'s `[bindings]` table — the author's declared
 //     default, in the runtime's own grammar and vocabulary.
 //
-// For a wholly weightless endpoint the installed runtime is the sole canonical plan writer:
+// For a wholly weightless package the installed runtime is the sole canonical plan writer:
 // `bindings --json` reports exact ArtifactSubjects before spawn and
-// `serve --weightless-endpoint` privately stages the same bytes. Creator consumes the
+// `serve --weightless-package` privately stages the same bytes. Creator consumes the
 // identities as record-owner intent and never reconstructs the documents. The older local
 // pinned-binding writer below remains only for the modeled path that still carries it.
 package launch
@@ -37,11 +37,11 @@ import (
 )
 
 // DescriptorFile is Runtime's derived document inside an immutable generation. It is
-// never committed in endpoint source.
+// never committed in package source.
 const DescriptorFile = "descriptor.json"
-const descriptorFormat = "cozy.endpoint.descriptor/1"
+const descriptorFormat = "cozy.package.descriptor/1"
 
-// Descriptor is the closed EndpointDescriptor/1 this host reads. Unknown fields refuse;
+// Descriptor is the closed PackageDescriptor/1 this host reads. Unknown fields refuse;
 // Raw is normalized canonical JSON for control-plane transport and semantic identity.
 type Descriptor struct {
 	Format      string          `json:"format"`
@@ -408,7 +408,7 @@ func ReadDescriptor(path, expectDigest string) (*Descriptor, *exit.Error) {
 		return nil, exit.Named(exit.Structural, "descriptor_absent",
 			"this generation carries no private %s", DescriptorFile).
 			WithRemedy("reinstall so the generation's Runtime can derive its descriptor").
-			WithNext("cozy endpoint install <org/endpoint> --force")
+			WithNext("cozy package install <org/package> --force")
 	}
 	d, problem := DecodeDescriptor(data)
 	if problem != nil {
@@ -418,7 +418,7 @@ func ReadDescriptor(path, expectDigest string) (*Descriptor, *exit.Error) {
 		return nil, exit.Named(exit.Conflict, "descriptor_stale",
 			"the private descriptor content digests to %s and this install recorded %s", d.Digest, expectDigest).
 			WithRemedy("the immutable generation is corrupt; reinstall it").
-			WithNext("cozy endpoint install <org/endpoint> --force")
+			WithNext("cozy package install <org/package> --force")
 	}
 	return d, nil
 }
@@ -501,8 +501,8 @@ func (d *Descriptor) Names() []string {
 
 // AssetPaths is every asset-typed field path of a result struct, dotted for nesting.
 // These ARE the output ids: the orchestrator grants one destination per asset field path,
-// so `--out` is a consequence of the endpoint's declared result rather than a convention
-// the CLI and the endpoint each have to remember. Same walk cr-016's `payload.asset_paths`
+// so `--out` is a consequence of the package's declared result rather than a convention
+// the CLI and the package each have to remember. Same walk cr-016's `payload.asset_paths`
 // makes over the same document.
 func AssetPaths(s Struct) []string {
 	return assetPaths(s, "")

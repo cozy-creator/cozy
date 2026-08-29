@@ -29,7 +29,7 @@ import (
 
 // JobSubmission is the job submit body.
 type JobSubmission struct {
-	Endpoint string          `json:"endpoint"`
+	Package  string          `json:"package"`
 	Function string          `json:"function"`
 	Input    json.RawMessage `json:"input"`
 	// Org is the publishing org whose SCRATCH repo this job lands in
@@ -46,7 +46,7 @@ type JobHandle struct {
 	JobID     string `json:"job_id"`
 	Status    string `json:"status"`
 	Attempt   uint64 `json:"attempt"`
-	Endpoint  string `json:"endpoint"`
+	Package   string `json:"package"`
 	Function  string `json:"function"`
 	Repo      string `json:"publication_repo"`
 	StatusURL string `json:"status_url"`
@@ -85,10 +85,10 @@ func (s *Server) submitJob(w http.ResponseWriter, r *http.Request) {
 			"the submission is not one closed JSON object: "+detail, "")
 		return
 	}
-	if sub.Endpoint == "" || sub.Function == "" {
+	if sub.Package == "" || sub.Function == "" {
 		s.refuse(w, r, http.StatusBadRequest, "invalid_request",
-			"a job submission names an endpoint and a job function",
-			`{"endpoint":"org/name","function":"census","input":{…}}`)
+			"a job submission names a package and a job function",
+			`{"package":"org/name","function":"census","input":{…}}`)
 		return
 	}
 	// A job's trees name HOST DIRECTORIES that become read/write worker grants — the same
@@ -130,7 +130,7 @@ func (s *Server) submitJob(w http.ResponseWriter, r *http.Request) {
 	}
 	handle := JobHandle{
 		JobID: jobID, Status: contractStatus(row.State), Attempt: attempt,
-		Endpoint: row.Endpoint, Function: row.Entrypoint,
+		Package: row.Package, Function: row.Entrypoint,
 		Repo:      home.ScratchRepo(row.Org, row.ID),
 		StatusURL: "/v1/local/jobs/" + jobID,
 		CancelURL: "/v1/local/jobs/" + jobID + "/cancel",
@@ -144,12 +144,12 @@ func (s *Server) submitJob(w http.ResponseWriter, r *http.Request) {
 	s.ok(w, r, status, handle)
 }
 
-// resolveJob turns endpoint+function into the orchestrator's Submission. The
+// resolveJob turns package+function into the orchestrator's Submission. The
 // `job_descriptor_id` is resolved HERE, from the installed generation's own descriptor —
 // a client never names a digest, exactly as it never names a binding plan id.
 func (s *Server) resolveJob(sub JobSubmission) (orchestrator.Submission, *exit.Error) {
 	out := orchestrator.Submission{
-		Kind: "job", Endpoint: sub.Endpoint, Entrypoint: sub.Function,
+		Kind: "job", Package: sub.Package, Entrypoint: sub.Function,
 		Payload: []byte(sub.Input), Org: strings.TrimSpace(sub.Org),
 	}
 	if len(out.Payload) == 0 {
@@ -161,10 +161,10 @@ func (s *Server) resolveJob(sub JobSubmission) (orchestrator.Submission, *exit.E
 	if e := validOrg(out.Org); e != nil {
 		return out, e
 	}
-	if s.endpoints == nil {
-		return out, exit.Unavailablef("this local controller resolves no endpoints")
+	if s.packages == nil {
+		return out, exit.Unavailablef("this local controller resolves no packages")
 	}
-	jobs, e := s.endpoints.Jobs(sub.Endpoint)
+	jobs, e := s.packages.Jobs(sub.Package)
 	if e != nil {
 		return out, e
 	}
@@ -180,7 +180,7 @@ func (s *Server) resolveJob(sub JobSubmission) (orchestrator.Submission, *exit.E
 	}
 	if out.PlanID == "" {
 		return out, exit.Named(exit.NotFound, "unknown_job",
-			"%s registers no job named %q", sub.Endpoint, sub.Function).
+			"%s registers no job named %q", sub.Package, sub.Function).
 			WithRemedy("it registers: %s", strings.Join(names, ", "))
 	}
 	for _, pair := range sub.Trees {
@@ -227,7 +227,7 @@ func jobSubmissionDigest(spec orchestrator.Submission) (string, *exit.Error) {
 	}
 	doc := map[string]canonical.Value{
 		"format":           "cozy.client.JobSubmission/1",
-		"endpoint":         spec.Endpoint,
+		"package":          spec.Package,
 		"function":         spec.Entrypoint,
 		"plan_id":          spec.PlanID,
 		"org":              spec.Org,
@@ -254,7 +254,7 @@ func jobSubmissionDigest(spec orchestrator.Submission) (string, *exit.Error) {
 type JobState struct {
 	JobID    string `json:"job_id"`
 	Status   string `json:"status"`
-	Endpoint string `json:"endpoint"`
+	Package  string `json:"package"`
 	Function string `json:"function"`
 	Attempt  uint64 `json:"attempt"`
 	Attempts int    `json:"attempts"`
@@ -358,7 +358,7 @@ func (s *Server) jobRow(w http.ResponseWriter, r *http.Request) (records.Request
 
 func (s *Server) jobStateOf(row records.Request) JobState {
 	state := JobState{
-		JobID: row.ID, Status: contractStatus(row.State), Endpoint: row.Endpoint,
+		JobID: row.ID, Status: contractStatus(row.State), Package: row.Package,
 		Function: row.Entrypoint, Attempt: uint64(row.Ordinal),
 		Requeues: row.Requeues, RetryBudget: orchestrator.MaxRequeues,
 		Outputs: []MediaRef{}, CreatedAt: row.CreatedAt,

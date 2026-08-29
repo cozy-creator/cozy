@@ -1,8 +1,8 @@
-// Package endpointprofile owns Creator's syntax-only handling of Tensorhub's
-// four-axis endpoint compatibility profile. Approval remains Tensorhub policy; the
+// Package packageprofile owns Creator's syntax-only handling of Tensorhub's
+// four-axis package compatibility profile. Approval remains Tensorhub policy; the
 // client accepts only the currently frozen public spellings and never invents a
 // default profile.
-package endpointprofile
+package packageprofile
 
 import (
 	"regexp"
@@ -30,19 +30,19 @@ func NormalizeSet(raw []string) ([]string, *exit.Error) {
 	for _, value := range raw {
 		profile := strings.TrimSpace(value)
 		if !grammar.MatchString(profile) {
-			return nil, exit.Named(exit.Usage, "endpoint_profile_malformed",
+			return nil, exit.Named(exit.Usage, "package_profile_malformed",
 				"%q is not torch<semver>-<accelerator-build>-<python-abi>-<os-cpu>", value).
 				WithRemedy("use one exact approved profile: %s, %s, or %s", CPU, CU126, CU130)
 		}
 		if !approved[profile] {
-			return nil, exit.Named(exit.Validation, "endpoint_profile_unapproved",
+			return nil, exit.Named(exit.Validation, "package_profile_unapproved",
 				"%s is well-formed but is not in this release's approved profile vocabulary", profile).
 				WithRemedy("approved profiles are %s, %s, and %s; a policy addition requires a new Creator/Tensorhub contract", CPU, CU126, CU130)
 		}
 		seen[profile] = true
 	}
 	if len(seen) == 0 {
-		return nil, exit.Usagef("at least one --profile is required; endpoint publication has no mutable default").
+		return nil, exit.Usagef("at least one --profile is required; package publication has no mutable default").
 			WithRemedy("repeat --profile for the exact frozen set, e.g. --profile %s", CU126)
 	}
 	out := make([]string, 0, len(seen))

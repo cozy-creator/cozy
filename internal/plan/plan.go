@@ -2,7 +2,7 @@
 // merely how this machine resolved it, and the one digest both ends compute.
 //
 // #506a — THE IDENTITY IS PATH-FREE. The record used to be digested whole, and it embeds
-// three machine-local absolute paths: `project` (where this host staged the endpoint
+// three machine-local absolute paths: `project` (where this host staged the package
 // tree), `store` (this host's CAS root) and `config` (a file inside it). So a pod that
 // installed the BYTE-IDENTICAL release archive computed a DIFFERENT plan id for the same
 // plan, and every remote-serving lane was blocked by arithmetic rather than by design.
@@ -49,7 +49,7 @@ const IDKey = "entrypoint_binding_plan_id"
 // record, the identity's referents are. They travel with the record and are NOT digested.
 //
 // Each one is a path today and could not be anything else: the runtime opens `config` as
-// a file, hands `store` to TensorFS as a root, and imports the endpoint tree from
+// a file, hands `store` to TensorFS as a root, and imports the package tree from
 // `project`. What #506a changes is not that they exist but that they stopped being
 // identity — the plan is the same plan wherever those three point.
 var ResolutionKeys = []string{"project", "store", "config"}

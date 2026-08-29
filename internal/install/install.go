@@ -38,7 +38,7 @@ type Timing struct {
 }
 
 type Result struct {
-	Gen        records.EndpointInstall
+	Gen        records.PackageInstall
 	Superseded string
 	Idempotent bool
 	Timings    []Timing
@@ -52,7 +52,7 @@ type Result struct {
 // records untouched, so the previously pinned generation stays runnable.
 func Run(l home.Layout, st *records.Store, req Request) (*Result, *exit.Error) {
 	if (req.Archive == "") == (req.Dir == "") {
-		return nil, exit.Usagef("`cozy endpoint install` needs exactly one source: --from <archive.tar.gz> or --dir <tree>").
+		return nil, exit.Usagef("`cozy package install` needs exactly one source: --from <archive.tar.gz> or --dir <tree>").
 			WithRemedy("--from installs a published release archive; --dir installs an editable local tree").
 			WithNext("cozy help install")
 	}
@@ -72,7 +72,7 @@ func Run(l home.Layout, st *records.Store, req Request) (*Result, *exit.Error) {
 		return nil, err
 	}
 
-	gen := records.EndpointInstall{ID: id, Dir: genDir}
+	gen := records.PackageInstall{ID: id, Dir: genDir}
 
 	// ---- stage: bytes land under bounds; no code from the release has run ----
 	var sourceDir string
@@ -84,7 +84,7 @@ func Run(l home.Layout, st *records.Store, req Request) (*Result, *exit.Error) {
 		}
 		sourceDir = staged.Root
 		gen.SourceKind, gen.SourceRef, gen.SourceDigest = "archive", req.Archive, staged.Digest
-		gen.Endpoint, gen.Version = staged.Decl.Endpoint, staged.Decl.Version
+		gen.Package, gen.Version = staged.Decl.Package, staged.Decl.Version
 		res.Files, res.Bytes, res.Compressed = staged.Files, staged.Bytes, staged.Compressed
 	default:
 		abs, err := filepath.Abs(req.Dir)
@@ -98,7 +98,7 @@ func Run(l home.Layout, st *records.Store, req Request) (*Result, *exit.Error) {
 		// Editable by design: the venv is built against the live tree, never a copy.
 		sourceDir = abs
 		gen.SourceKind, gen.SourceRef, gen.SourceDigest = "dir", abs, digest
-		gen.Endpoint = req.Ref.Endpoint
+		gen.Package = req.Ref.Package
 		gen.Version = "dev+" + strings.TrimPrefix(digest, "sha256:")[:12]
 		res.Files, res.Bytes = files, bytes
 	}
@@ -114,7 +114,7 @@ func Run(l home.Layout, st *records.Store, req Request) (*Result, *exit.Error) {
 	mark("verify")
 
 	// The pin decision is made before the expensive step, never after it.
-	prior, priorGen, e := st.ActivePin(gen.Endpoint, gen.Major)
+	prior, priorGen, e := st.ActivePin(gen.Package, gen.Major)
 	if e != nil {
 		return fail(e)
 	}
@@ -127,9 +127,9 @@ func Run(l home.Layout, st *records.Store, req Request) (*Result, *exit.Error) {
 		}
 		_ = os.RemoveAll(genDir)
 		return nil, exit.New(exit.Conflict,
-			"%s is already installed and pinned to generation %s", gen.Endpoint+majorSuffix(gen.Major), short12(prior.InstallID)).
+			"%s is already installed and pinned to generation %s", gen.Package+majorSuffix(gen.Major), short12(prior.InstallID)).
 			WithRemedy("install never silently upgrades; --force builds a new generation and swaps the pin").
-			WithNext("cozy endpoint install " + req.Ref.String() + " --force")
+			WithNext("cozy package install " + req.Ref.String() + " --force")
 	}
 	// A --force that fails must keep the working install: exit 13, nothing mutated.
 	guard := func(err *exit.Error) (*Result, *exit.Error) {
@@ -139,9 +139,9 @@ func Run(l home.Layout, st *records.Store, req Request) (*Result, *exit.Error) {
 		_ = os.RemoveAll(genDir)
 		return nil, exit.New(exit.Conflict,
 			"the replacement generation for %s failed; the working install (generation %s) is untouched and still runnable",
-			gen.Endpoint+majorSuffix(gen.Major), short12(prior.InstallID)).
+			gen.Package+majorSuffix(gen.Major), short12(prior.InstallID)).
 			WithRemedy("cause: %s — %s", err.ErrName(), err.Message).
-			WithNext("cozy endpoint list")
+			WithNext("cozy package list")
 	}
 
 	if e := checkCapacity(l.Generations, res.Bytes); e != nil {
@@ -196,7 +196,7 @@ func deriveDescriptor(venvDir, sourceDir string) (*launch.Descriptor, *exit.Erro
 	if _, err := os.Stat(bin); err != nil {
 		return nil, exit.Named(exit.Structural, "runtime_missing",
 			"this generation's venv provides no cozy-runtime at %s", bin).
-			WithRemedy("an endpoint depends on cozy-runtime; its surface is described by the runtime the release itself pinned, never this host's").
+			WithRemedy("a package depends on cozy-runtime; its surface is described by the runtime the release itself pinned, never this host's").
 			WithNext("cozy help install")
 	}
 	cmd := exec.Command(bin, "--json", "--dir", sourceDir, "describe")
@@ -239,7 +239,7 @@ func describeRefusal(code int, stderr string) *exit.Error {
 }
 
 // verifySource settles source identity before any build backend or import can run.
-func verifySource(gen *records.EndpointInstall, req Request, warn *[]string) *exit.Error {
+func verifySource(gen *records.PackageInstall, req Request, warn *[]string) *exit.Error {
 	if gen.SourceKind == "dir" {
 		// --dir IS the development trust path: an explicit local tree the operator
 		// already controls. It carries a snapshot identity, never publisher evidence.
@@ -269,23 +269,23 @@ func verifySource(gen *records.EndpointInstall, req Request, warn *[]string) *ex
 }
 
 // resolveTarget reconciles what the release says with what the caller asked for.
-func resolveTarget(gen *records.EndpointInstall, ref Ref) *exit.Error {
+func resolveTarget(gen *records.PackageInstall, ref Ref) *exit.Error {
 	if gen.SourceKind == "dir" {
 		if !ref.HasMajor {
 			return exit.Usagef("an editable --dir install needs an explicit major").
-				WithRemedy("a local tree carries no release record, so the major is declared: cozy endpoint install %s@v1 --dir …", ref.Endpoint).
+				WithRemedy("a local tree carries no release record, so the major is declared: cozy package install %s@v1 --dir …", ref.Package).
 				WithNext("cozy help install")
 		}
 		gen.Major = ref.Major
 		return nil
 	}
-	if gen.Endpoint == "" || gen.Version == "" {
+	if gen.Package == "" || gen.Version == "" {
 		return exit.Named(exit.Validation, "release_undeclared",
-			"%s declares no endpoint and version", DeclName)
+			"%s declares no package and version", DeclName)
 	}
-	if gen.Endpoint != ref.Endpoint {
+	if gen.Package != ref.Package {
 		return exit.Named(exit.Validation, "release_mismatch",
-			"the archive publishes %q but %q was requested", gen.Endpoint, ref.Endpoint).
+			"the archive publishes %q but %q was requested", gen.Package, ref.Package).
 			WithRemedy("install the ref the release declares, or point --from at the right archive")
 	}
 	major, e := MajorOf(gen.Version)
@@ -295,7 +295,7 @@ func resolveTarget(gen *records.EndpointInstall, ref Ref) *exit.Error {
 	if ref.HasMajor && ref.Major != major {
 		return exit.Named(exit.Validation, "release_mismatch",
 			"%s was requested but the archive publishes version %s (major %d)", ref.String(), gen.Version, major).
-			WithRemedy("the pin is per (endpoint, major); majors never substitute for one another")
+			WithRemedy("the pin is per (package, major); majors never substitute for one another")
 	}
 	gen.Major = major
 	return nil
@@ -315,18 +315,18 @@ func checkCapacity(dir string, staged int64) *exit.Error {
 	return exit.New(exit.Capacity,
 		"not enough disk to build this generation: needed %s, had %s, short by %s on %s",
 		bytesText(need), bytesText(free), bytesText(need-free), dir).
-		WithRemedy("free space, remove an installed endpoint, or move COZY_HOME to a larger filesystem").
-		WithNext("cozy endpoint list")
+		WithRemedy("free space, remove an installed package, or move COZY_HOME to a larger filesystem").
+		WithNext("cozy package list")
 }
 
 // Remove drops one install: its pin, generation row, and exclusive directory.
 // Shared TensorFS bytes are never touched here.
-func Remove(st *records.Store, endpoint string, major int) (int64, *exit.Error) {
-	pin, gen, e := st.ActivePin(endpoint, major)
+func Remove(st *records.Store, pkg string, major int) (int64, *exit.Error) {
+	pin, gen, e := st.ActivePin(pkg, major)
 	if e != nil || pin == nil {
 		return 0, e
 	}
-	if e := st.Unpin(endpoint, major); e != nil {
+	if e := st.Unpin(pkg, major); e != nil {
 		return 0, e
 	}
 	if gen == nil {

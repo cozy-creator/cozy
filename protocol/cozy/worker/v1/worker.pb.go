@@ -2569,22 +2569,22 @@ func (x *Placement) GetSpec() *PlacementSpec {
 // placement's IDENTITY.
 //
 // THE DESIRED SET NAMES BYTES, NEVER A POINTER (§1). The worker never resolves a mutable release
-// id: `endpoint_release_id` survives only as PROVENANCE, and every other field is an immutable
+// id: `package_release_id` survives only as PROVENANCE, and every other field is an immutable
 // digest. Two workers handed the same set converge to the same bytes or fault typed; neither can
 // drift by resolving a tag. A single-placement replace is the SAME placement_id carrying a NEW
 // spec digest, so routing identity is stable across an in-place release rollout.
 type PlacementSpec struct {
 	state                 protoimpl.MessageState `protogen:"open.v1"`
-	EndpointReleaseId     string                 `protobuf:"bytes,1,opt,name=endpoint_release_id,json=endpointReleaseId,proto3" json:"endpoint_release_id,omitempty"`             // PROVENANCE: what this spec was resolved FROM
-	EnvironmentSpecDigest []byte                 `protobuf:"bytes,2,opt,name=environment_spec_digest,json=environmentSpecDigest,proto3" json:"environment_spec_digest,omitempty"` // class (a): the EndpointEnvironmentSpec below — the
+	PackageReleaseId      string                 `protobuf:"bytes,1,opt,name=package_release_id,json=packageReleaseId,proto3" json:"package_release_id,omitempty"`                // PROVENANCE: what this spec was resolved FROM
+	EnvironmentSpecDigest []byte                 `protobuf:"bytes,2,opt,name=environment_spec_digest,json=environmentSpecDigest,proto3" json:"environment_spec_digest,omitempty"` // class (a): the PackageEnvironmentSpec below — the
 	// COMPLETE executable environment identity (#483)
 	InstalledEnvironmentReceiptDigest []byte `protobuf:"bytes,3,opt,name=installed_environment_receipt_digest,json=installedEnvironmentReceiptDigest,proto3" json:"installed_environment_receipt_digest,omitempty"` // class (a): what a completed materialization
 	// must MEASURE to. A mismatch is
 	// materialization = FAILED with
 	// FAULT_KIND_ENVIRONMENT_RECEIPT_MISMATCH, never a silent
 	// serve.
-	DescriptorDigest []byte             `protobuf:"bytes,4,opt,name=descriptor_digest,json=descriptorDigest,proto3" json:"descriptor_digest,omitempty"` // class (a): the cr-003 descriptor
-	BindingPlans     []*ArtifactSubject `protobuf:"bytes,5,rep,name=binding_plans,json=bindingPlans,proto3" json:"binding_plans,omitempty"`             // sorted by digest. PLAN-ONLY PROFILE: every
+	PackageDescriptorDigest []byte             `protobuf:"bytes,4,opt,name=package_descriptor_digest,json=packageDescriptorDigest,proto3" json:"package_descriptor_digest,omitempty"` // class (a): the cr-003 PackageDescriptor
+	BindingPlans            []*ArtifactSubject `protobuf:"bytes,5,rep,name=binding_plans,json=bindingPlans,proto3" json:"binding_plans,omitempty"`                                    // sorted by digest. PLAN-ONLY PROFILE: every
 	// subject carries kind == "plan" and subject_id equal to
 	// its own digest spelling — both production ends (the
 	// tensorhub author and the runtime launch consumer)
@@ -2625,9 +2625,9 @@ func (*PlacementSpec) Descriptor() ([]byte, []int) {
 	return file_cozy_worker_v1_worker_proto_rawDescGZIP(), []int{12}
 }
 
-func (x *PlacementSpec) GetEndpointReleaseId() string {
+func (x *PlacementSpec) GetPackageReleaseId() string {
 	if x != nil {
-		return x.EndpointReleaseId
+		return x.PackageReleaseId
 	}
 	return ""
 }
@@ -2646,9 +2646,9 @@ func (x *PlacementSpec) GetInstalledEnvironmentReceiptDigest() []byte {
 	return nil
 }
 
-func (x *PlacementSpec) GetDescriptorDigest() []byte {
+func (x *PlacementSpec) GetPackageDescriptorDigest() []byte {
 	if x != nil {
-		return x.DescriptorDigest
+		return x.PackageDescriptorDigest
 	}
 	return nil
 }
@@ -2738,7 +2738,7 @@ func (x *ArtifactSubject) GetLength() uint64 {
 	return 0
 }
 
-// DOCUMENT SHAPE (not a wire message): canonical form `cozy.worker.v1.EndpointEnvironmentSpec/2`
+// DOCUMENT SHAPE (not a wire message): canonical form `cozy.worker.v1.PackageEnvironmentSpec/2`
 // — the COMPLETE executable environment identity (#483). The FIELDS are owned by
 // tensorhub-build.md (#478/#483); this contract transports and digests the document because
 // PlacementSpec names it by digest, and because PlatformTarget's canonical encoding rule is a
@@ -2754,10 +2754,10 @@ func (x *ArtifactSubject) GetLength() uint64 {
 // author does. So this document's canonical bytes are digested WHOLE, like every other document
 // here. Machine evidence is split honestly: provider readback owns immutable OCI identity, while
 // ClaimAck.control_runtime_digest proves the exact image-owned control Runtime wheel bytes.
-type EndpointEnvironmentSpec struct {
-	state                protoimpl.MessageState `protogen:"open.v1"`
-	PlatformTarget       *PlatformTarget        `protobuf:"bytes,1,opt,name=platform_target,json=platformTarget,proto3" json:"platform_target,omitempty"`
-	EndpointBundleDigest []byte                 `protobuf:"bytes,2,opt,name=endpoint_bundle_digest,json=endpointBundleDigest,proto3" json:"endpoint_bundle_digest,omitempty"` // class (b): excludes base-owned packages (#483 — renamed
+type PackageEnvironmentSpec struct {
+	state               protoimpl.MessageState `protogen:"open.v1"`
+	PlatformTarget      *PlatformTarget        `protobuf:"bytes,1,opt,name=platform_target,json=platformTarget,proto3" json:"platform_target,omitempty"`
+	PackageBundleDigest []byte                 `protobuf:"bytes,2,opt,name=package_bundle_digest,json=packageBundleDigest,proto3" json:"package_bundle_digest,omitempty"` // class (b): excludes base-owned packages (#483 — renamed
 	// from env_closure_digest; it is not a closure)
 	ProjectWheelDigest       []byte `protobuf:"bytes,3,opt,name=project_wheel_digest,json=projectWheelDigest,proto3" json:"project_wheel_digest,omitempty"`                   // class (b): the importable unit (#478)
 	WheelhouseManifestDigest []byte `protobuf:"bytes,4,opt,name=wheelhouse_manifest_digest,json=wheelhouseManifestDigest,proto3" json:"wheelhouse_manifest_digest,omitempty"` // class (a): the exact runtime/torch/TensorFS/bootstrap
@@ -2767,20 +2767,20 @@ type EndpointEnvironmentSpec struct {
 	sizeCache            protoimpl.SizeCache
 }
 
-func (x *EndpointEnvironmentSpec) Reset() {
-	*x = EndpointEnvironmentSpec{}
+func (x *PackageEnvironmentSpec) Reset() {
+	*x = PackageEnvironmentSpec{}
 	mi := &file_cozy_worker_v1_worker_proto_msgTypes[14]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
 
-func (x *EndpointEnvironmentSpec) String() string {
+func (x *PackageEnvironmentSpec) String() string {
 	return protoimpl.X.MessageStringOf(x)
 }
 
-func (*EndpointEnvironmentSpec) ProtoMessage() {}
+func (*PackageEnvironmentSpec) ProtoMessage() {}
 
-func (x *EndpointEnvironmentSpec) ProtoReflect() protoreflect.Message {
+func (x *PackageEnvironmentSpec) ProtoReflect() protoreflect.Message {
 	mi := &file_cozy_worker_v1_worker_proto_msgTypes[14]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
@@ -2792,40 +2792,40 @@ func (x *EndpointEnvironmentSpec) ProtoReflect() protoreflect.Message {
 	return mi.MessageOf(x)
 }
 
-// Deprecated: Use EndpointEnvironmentSpec.ProtoReflect.Descriptor instead.
-func (*EndpointEnvironmentSpec) Descriptor() ([]byte, []int) {
+// Deprecated: Use PackageEnvironmentSpec.ProtoReflect.Descriptor instead.
+func (*PackageEnvironmentSpec) Descriptor() ([]byte, []int) {
 	return file_cozy_worker_v1_worker_proto_rawDescGZIP(), []int{14}
 }
 
-func (x *EndpointEnvironmentSpec) GetPlatformTarget() *PlatformTarget {
+func (x *PackageEnvironmentSpec) GetPlatformTarget() *PlatformTarget {
 	if x != nil {
 		return x.PlatformTarget
 	}
 	return nil
 }
 
-func (x *EndpointEnvironmentSpec) GetEndpointBundleDigest() []byte {
+func (x *PackageEnvironmentSpec) GetPackageBundleDigest() []byte {
 	if x != nil {
-		return x.EndpointBundleDigest
+		return x.PackageBundleDigest
 	}
 	return nil
 }
 
-func (x *EndpointEnvironmentSpec) GetProjectWheelDigest() []byte {
+func (x *PackageEnvironmentSpec) GetProjectWheelDigest() []byte {
 	if x != nil {
 		return x.ProjectWheelDigest
 	}
 	return nil
 }
 
-func (x *EndpointEnvironmentSpec) GetWheelhouseManifestDigest() []byte {
+func (x *PackageEnvironmentSpec) GetWheelhouseManifestDigest() []byte {
 	if x != nil {
 		return x.WheelhouseManifestDigest
 	}
 	return nil
 }
 
-func (x *EndpointEnvironmentSpec) GetCompatibilityProfile() *CompatibilityProfile {
+func (x *PackageEnvironmentSpec) GetCompatibilityProfile() *CompatibilityProfile {
 	if x != nil {
 		return x.CompatibilityProfile
 	}
@@ -3628,13 +3628,13 @@ func (x *PlacementStatus) GetAcquisition() *PlacementAcquisitionObservation {
 	return nil
 }
 
-// Creator-visible proof of concurrent endpoint/model acquisition and cache reuse. Both legs use
+// Creator-visible proof of concurrent package/model acquisition and cache reuse. Both legs use
 // one process-relative monotonic clock and therefore one origin; they reset with the worker
 // process and MUST NOT be compared across worker_boot_id. A leg is absent before it starts. Once
 // present its start is non-zero, counters are cumulative and never decrease, and end is zero
 // while in progress or >= start when terminal. The two terminal intervals prove overlap exactly.
 //
-// Scope is deliberately disjoint. `endpoint` counts the desired endpoint overlay bytes needed
+// Scope is deliberately disjoint. `package` counts the desired package overlay bytes needed
 // above the base worker image (including its project/custom wheels), excluding model bytes.
 // `model` counts the object bytes in PlacementSpec.model_object_set's closure, excluding the
 // object-set document itself. At terminal, downloaded_bytes + reused_bytes is the exact reached
@@ -3643,7 +3643,7 @@ func (x *PlacementStatus) GetAcquisition() *PlacementAcquisitionObservation {
 // far; terminal counters persist as described on PlacementStatus.
 type PlacementAcquisitionObservation struct {
 	state         protoimpl.MessageState     `protogen:"open.v1"`
-	Endpoint      *AcquisitionLegObservation `protobuf:"bytes,1,opt,name=endpoint,proto3" json:"endpoint,omitempty"`
+	Package       *AcquisitionLegObservation `protobuf:"bytes,1,opt,name=package,proto3" json:"package,omitempty"`
 	Model         *AcquisitionLegObservation `protobuf:"bytes,2,opt,name=model,proto3" json:"model,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
@@ -3679,9 +3679,9 @@ func (*PlacementAcquisitionObservation) Descriptor() ([]byte, []int) {
 	return file_cozy_worker_v1_worker_proto_rawDescGZIP(), []int{23}
 }
 
-func (x *PlacementAcquisitionObservation) GetEndpoint() *AcquisitionLegObservation {
+func (x *PlacementAcquisitionObservation) GetPackage() *AcquisitionLegObservation {
 	if x != nil {
-		return x.Endpoint
+		return x.Package
 	}
 	return nil
 }
@@ -6160,8 +6160,8 @@ func (x *AttemptProgress) GetPlacementId() string {
 // placement_id is DELIBERATELY absent: the same invocation is the same work wherever it routes.
 type InvocationSpec struct {
 	state                 protoimpl.MessageState `protogen:"open.v1"`
-	EndpointReleaseId     string                 `protobuf:"bytes,1,opt,name=endpoint_release_id,json=endpointReleaseId,proto3" json:"endpoint_release_id,omitempty"`
-	EnvironmentSpecDigest string                 `protobuf:"bytes,2,opt,name=environment_spec_digest,json=environmentSpecDigest,proto3" json:"environment_spec_digest,omitempty"` // class (a), sha256:<hex>: the EndpointEnvironmentSpec
+	PackageReleaseId      string                 `protobuf:"bytes,1,opt,name=package_release_id,json=packageReleaseId,proto3" json:"package_release_id,omitempty"`
+	EnvironmentSpecDigest string                 `protobuf:"bytes,2,opt,name=environment_spec_digest,json=environmentSpecDigest,proto3" json:"environment_spec_digest,omitempty"` // class (a), sha256:<hex>: the PackageEnvironmentSpec
 	// that IS this invocation's execution environment. Was
 	// `image_digest` — "image" is wrong for a native install
 	// with no OCI image at all (#483).
@@ -6209,9 +6209,9 @@ func (*InvocationSpec) Descriptor() ([]byte, []int) {
 	return file_cozy_worker_v1_worker_proto_rawDescGZIP(), []int{50}
 }
 
-func (x *InvocationSpec) GetEndpointReleaseId() string {
+func (x *InvocationSpec) GetPackageReleaseId() string {
 	if x != nil {
-		return x.EndpointReleaseId
+		return x.PackageReleaseId
 	}
 	return ""
 }
@@ -7779,12 +7779,12 @@ const file_cozy_worker_v1_worker_proto_rawDesc = "" +
 	"placements\"a\n" +
 	"\tPlacement\x12!\n" +
 	"\fplacement_id\x18\x01 \x01(\tR\vplacementId\x121\n" +
-	"\x04spec\x18\x02 \x01(\v2\x1d.cozy.worker.v1.PlacementSpecR\x04spec\"\x86\x03\n" +
-	"\rPlacementSpec\x12.\n" +
-	"\x13endpoint_release_id\x18\x01 \x01(\tR\x11endpointReleaseId\x126\n" +
+	"\x04spec\x18\x02 \x01(\v2\x1d.cozy.worker.v1.PlacementSpecR\x04spec\"\x93\x03\n" +
+	"\rPlacementSpec\x12,\n" +
+	"\x12package_release_id\x18\x01 \x01(\tR\x10packageReleaseId\x126\n" +
 	"\x17environment_spec_digest\x18\x02 \x01(\fR\x15environmentSpecDigest\x12O\n" +
-	"$installed_environment_receipt_digest\x18\x03 \x01(\fR!installedEnvironmentReceiptDigest\x12+\n" +
-	"\x11descriptor_digest\x18\x04 \x01(\fR\x10descriptorDigest\x12D\n" +
+	"$installed_environment_receipt_digest\x18\x03 \x01(\fR!installedEnvironmentReceiptDigest\x12:\n" +
+	"\x19package_descriptor_digest\x18\x04 \x01(\fR\x17packageDescriptorDigest\x12D\n" +
 	"\rbinding_plans\x18\x05 \x03(\v2\x1f.cozy.worker.v1.ArtifactSubjectR\fbindingPlans\x12I\n" +
 	"\x10model_object_set\x18\x06 \x01(\v2\x1f.cozy.worker.v1.ArtifactSubjectR\x0emodelObjectSet\"t\n" +
 	"\x0fArtifactSubject\x12\x16\n" +
@@ -7792,10 +7792,10 @@ const file_cozy_worker_v1_worker_proto_rawDesc = "" +
 	"\n" +
 	"subject_id\x18\x02 \x01(\tR\tsubjectId\x12\x12\n" +
 	"\x04kind\x18\x03 \x01(\tR\x04kind\x12\x16\n" +
-	"\x06length\x18\x04 \x01(\x04R\x06length\"\xe3\x02\n" +
-	"\x17EndpointEnvironmentSpec\x12G\n" +
-	"\x0fplatform_target\x18\x01 \x01(\v2\x1e.cozy.worker.v1.PlatformTargetR\x0eplatformTarget\x124\n" +
-	"\x16endpoint_bundle_digest\x18\x02 \x01(\fR\x14endpointBundleDigest\x120\n" +
+	"\x06length\x18\x04 \x01(\x04R\x06length\"\xe0\x02\n" +
+	"\x16PackageEnvironmentSpec\x12G\n" +
+	"\x0fplatform_target\x18\x01 \x01(\v2\x1e.cozy.worker.v1.PlatformTargetR\x0eplatformTarget\x122\n" +
+	"\x15package_bundle_digest\x18\x02 \x01(\fR\x13packageBundleDigest\x120\n" +
 	"\x14project_wheel_digest\x18\x03 \x01(\fR\x12projectWheelDigest\x12<\n" +
 	"\x1awheelhouse_manifest_digest\x18\x04 \x01(\fR\x18wheelhouseManifestDigest\x12Y\n" +
 	"\x15compatibility_profile\x18\x05 \x01(\v2$.cozy.worker.v1.CompatibilityProfileR\x14compatibilityProfile\"\x9e\x01\n" +
@@ -7870,9 +7870,9 @@ const file_cozy_worker_v1_worker_proto_rawDesc = "" +
 	"\x0fmaterialization\x18\f \x01(\x0e2$.cozy.worker.v1.MaterializationStateR\x0fmaterialization\x126\n" +
 	"\aserving\x18\r \x01(\x0e2\x1c.cozy.worker.v1.ServingStateR\aserving\x12A\n" +
 	"\x1dretained_fallback_spec_digest\x18\x0e \x01(\fR\x1aretainedFallbackSpecDigest\x12Q\n" +
-	"\vacquisition\x18\x0f \x01(\v2/.cozy.worker.v1.PlacementAcquisitionObservationR\vacquisitionJ\x04\b\x02\x10\x03J\x04\b\x03\x10\x04J\x04\b\x05\x10\x06\"\xa9\x01\n" +
-	"\x1fPlacementAcquisitionObservation\x12E\n" +
-	"\bendpoint\x18\x01 \x01(\v2).cozy.worker.v1.AcquisitionLegObservationR\bendpoint\x12?\n" +
+	"\vacquisition\x18\x0f \x01(\v2/.cozy.worker.v1.PlacementAcquisitionObservationR\vacquisitionJ\x04\b\x02\x10\x03J\x04\b\x03\x10\x04J\x04\b\x05\x10\x06\"\xa7\x01\n" +
+	"\x1fPlacementAcquisitionObservation\x12C\n" +
+	"\apackage\x18\x01 \x01(\v2).cozy.worker.v1.AcquisitionLegObservationR\apackage\x12?\n" +
 	"\x05model\x18\x02 \x01(\v2).cozy.worker.v1.AcquisitionLegObservationR\x05model\"\xc9\x01\n" +
 	"\x19AcquisitionLegObservation\x120\n" +
 	"\x14started_monotonic_ns\x18\x01 \x01(\x04R\x12startedMonotonicNs\x12,\n" +
@@ -8122,9 +8122,9 @@ const file_cozy_worker_v1_worker_proto_rawDesc = "" +
 	"\fcontent_type\x18\b \x01(\tR\vcontentType\x12\x12\n" +
 	"\x04data\x18\t \x01(\fR\x04data\x12!\n" +
 	"\fplacement_id\x18\n" +
-	" \x01(\tR\vplacementIdJ\x04\b\x04\x10\x05\"\xdf\x03\n" +
-	"\x0eInvocationSpec\x12.\n" +
-	"\x13endpoint_release_id\x18\x01 \x01(\tR\x11endpointReleaseId\x126\n" +
+	" \x01(\tR\vplacementIdJ\x04\b\x04\x10\x05\"\xdd\x03\n" +
+	"\x0eInvocationSpec\x12,\n" +
+	"\x12package_release_id\x18\x01 \x01(\tR\x10packageReleaseId\x126\n" +
 	"\x17environment_spec_digest\x18\x02 \x01(\tR\x15environmentSpecDigest\x12#\n" +
 	"\rconfig_digest\x18\x03 \x01(\tR\fconfigDigest\x12%\n" +
 	"\x0epayload_digest\x18\x04 \x01(\tR\rpayloadDigest\x124\n" +
@@ -8442,7 +8442,7 @@ var file_cozy_worker_v1_worker_proto_goTypes = []any{
 	(*Placement)(nil),                       // 29: cozy.worker.v1.Placement
 	(*PlacementSpec)(nil),                   // 30: cozy.worker.v1.PlacementSpec
 	(*ArtifactSubject)(nil),                 // 31: cozy.worker.v1.ArtifactSubject
-	(*EndpointEnvironmentSpec)(nil),         // 32: cozy.worker.v1.EndpointEnvironmentSpec
+	(*PackageEnvironmentSpec)(nil),          // 32: cozy.worker.v1.PackageEnvironmentSpec
 	(*CompatibilityProfile)(nil),            // 33: cozy.worker.v1.CompatibilityProfile
 	(*PlatformTarget)(nil),                  // 34: cozy.worker.v1.PlatformTarget
 	(*ArtifactGrantUpdate)(nil),             // 35: cozy.worker.v1.ArtifactGrantUpdate
@@ -8532,8 +8532,8 @@ var file_cozy_worker_v1_worker_proto_depIdxs = []int32{
 	30, // 30: cozy.worker.v1.Placement.spec:type_name -> cozy.worker.v1.PlacementSpec
 	31, // 31: cozy.worker.v1.PlacementSpec.binding_plans:type_name -> cozy.worker.v1.ArtifactSubject
 	31, // 32: cozy.worker.v1.PlacementSpec.model_object_set:type_name -> cozy.worker.v1.ArtifactSubject
-	34, // 33: cozy.worker.v1.EndpointEnvironmentSpec.platform_target:type_name -> cozy.worker.v1.PlatformTarget
-	33, // 34: cozy.worker.v1.EndpointEnvironmentSpec.compatibility_profile:type_name -> cozy.worker.v1.CompatibilityProfile
+	34, // 33: cozy.worker.v1.PackageEnvironmentSpec.platform_target:type_name -> cozy.worker.v1.PlatformTarget
+	33, // 34: cozy.worker.v1.PackageEnvironmentSpec.compatibility_profile:type_name -> cozy.worker.v1.CompatibilityProfile
 	36, // 35: cozy.worker.v1.ArtifactGrantUpdate.grant:type_name -> cozy.worker.v1.ArtifactGrant
 	31, // 36: cozy.worker.v1.ArtifactGrant.subjects:type_name -> cozy.worker.v1.ArtifactSubject
 	76, // 37: cozy.worker.v1.ArtifactGrant.credential:type_name -> cozy.worker.v1.DeliveryAccessCredential
@@ -8552,7 +8552,7 @@ var file_cozy_worker_v1_worker_proto_depIdxs = []int32{
 	2,  // 50: cozy.worker.v1.PlacementStatus.materialization:type_name -> cozy.worker.v1.MaterializationState
 	3,  // 51: cozy.worker.v1.PlacementStatus.serving:type_name -> cozy.worker.v1.ServingState
 	41, // 52: cozy.worker.v1.PlacementStatus.acquisition:type_name -> cozy.worker.v1.PlacementAcquisitionObservation
-	42, // 53: cozy.worker.v1.PlacementAcquisitionObservation.endpoint:type_name -> cozy.worker.v1.AcquisitionLegObservation
+	42, // 53: cozy.worker.v1.PlacementAcquisitionObservation.package:type_name -> cozy.worker.v1.AcquisitionLegObservation
 	42, // 54: cozy.worker.v1.PlacementAcquisitionObservation.model:type_name -> cozy.worker.v1.AcquisitionLegObservation
 	73, // 55: cozy.worker.v1.AttemptOffer.grant:type_name -> cozy.worker.v1.DeliveryGrant
 	47, // 56: cozy.worker.v1.AttemptAccepted.plan:type_name -> cozy.worker.v1.AttemptPlanSummary

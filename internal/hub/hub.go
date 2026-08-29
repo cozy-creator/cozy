@@ -51,7 +51,7 @@ const maxDocument = 64 << 20
 // constant any more: a 30-minute total is a ceiling on how big a checkpoint may be,
 // and it wrapped the per-object bound so tightly that the inner one could never fire.
 
-// Client is one configured hub endpoint. It holds no state between calls.
+// Client is one configured hub package. It holds no state between calls.
 type Client struct {
 	base   string
 	token  secret.Value
@@ -147,7 +147,7 @@ func (r *progressReader) Read(p []byte) (int, error) {
 func (c *Client) Base() string        { return c.base }
 func (c *Client) Token() secret.Value { return c.token }
 
-// Resource is the shared shape of an endpoint or model returned by its typed public
+// Resource is the shared shape of a package or model returned by its typed public
 // route. The route supplies the type; the document therefore carries no `kind`
 // discriminator and Creator never guesses one from its contents.
 type Resource struct {
@@ -201,16 +201,16 @@ type ResourceSearch struct {
 	Query  string `json:"q"`
 }
 
-// Endpoints searches endpoint resources server-side. Public — no credential.
-func (c *Client) Endpoints(ctx context.Context, query string) ([]Resource, ResourceSearch, *exit.Error) {
+// Packages searches package resources server-side. Public — no credential.
+func (c *Client) Packages(ctx context.Context, query string) ([]Resource, ResourceSearch, *exit.Error) {
 	var out struct {
-		Endpoints []Resource     `json:"endpoints"`
-		Search    ResourceSearch `json:"search"`
+		Packages []Resource     `json:"packages"`
+		Search   ResourceSearch `json:"search"`
 	}
-	if e := c.do(ctx, call{method: http.MethodGet, path: resourceSearchPath("endpoints", query)}, &out); e != nil {
+	if e := c.do(ctx, call{method: http.MethodGet, path: resourceSearchPath("packages", query)}, &out); e != nil {
 		return nil, ResourceSearch{}, e
 	}
-	return out.Endpoints, out.Search, nil
+	return out.Packages, out.Search, nil
 }
 
 // Models searches model resources server-side. Public.
@@ -232,13 +232,13 @@ func resourceSearchPath(collection, query string) string {
 	return "/v1/" + collection + "?" + url.Values{"q": []string{query}}.Encode()
 }
 
-// Endpoint resolves one endpoint through its typed public route.
-func (c *Client) Endpoint(ctx context.Context, ref Ref) (Resource, *exit.Error) {
+// Package resolves one package through its typed public route.
+func (c *Client) Package(ctx context.Context, ref Ref) (Resource, *exit.Error) {
 	var out struct {
-		Endpoint Resource `json:"endpoint"`
+		Package Resource `json:"package"`
 	}
-	e := c.do(ctx, call{method: http.MethodGet, path: resourcePath("endpoints", ref)}, &out)
-	return out.Endpoint, e
+	e := c.do(ctx, call{method: http.MethodGet, path: resourcePath("packages", ref)}, &out)
+	return out.Package, e
 }
 
 // Model resolves one model through its typed public route.
@@ -250,16 +250,16 @@ func (c *Client) Model(ctx context.Context, ref Ref) (Resource, *exit.Error) {
 	return out.Model, e
 }
 
-// CreateEndpoint is the first-party endpoint creation door.
-func (c *Client) CreateEndpoint(ctx context.Context, org, name, reason string) (Resource, *exit.Error) {
+// CreatePackage is the first-party package creation door.
+func (c *Client) CreatePackage(ctx context.Context, org, name, reason string) (Resource, *exit.Error) {
 	var out struct {
-		Endpoint Resource `json:"endpoint"`
+		Package Resource `json:"package"`
 	}
 	e := c.do(ctx, call{
-		method: http.MethodPost, path: "/v1/endpoints", admin: true, reason: reason,
+		method: http.MethodPost, path: "/v1/packages", admin: true, reason: reason,
 		body: map[string]string{"org": org, "name": name},
 	}, &out)
-	return out.Endpoint, e
+	return out.Package, e
 }
 
 // CreateModel is the first-party model creation door.
@@ -285,7 +285,7 @@ func (c *Client) do(ctx context.Context, cl call, out any) *exit.Error {
 		return exit.Named(exit.Credential, "hub.token_missing",
 			"%s %s is a first-party route and no admin token is configured", cl.method, cl.path).
 			WithRemedy("set TENSORHUB_TOKEN to the hub's admin.token; catalog reads need no credential").
-			WithNext("cozy endpoint search", "cozy model search")
+			WithNext("cozy package search", "cozy model search")
 	}
 
 	var body io.Reader
@@ -382,7 +382,7 @@ func (c *Client) do(ctx context.Context, cl call, out any) *exit.Error {
 				"%s %s answered %d with a body this client cannot read: %s",
 				cl.method, cl.path, resp.StatusCode, err).
 				WithRemedy("check that TENSORHUB_URL names a tensorhub, not a proxy or a login page").
-				WithNext("cozy endpoint search")
+				WithNext("cozy package search")
 		}
 	}
 	return nil
@@ -437,8 +437,8 @@ func (c *Client) refusal(status int, raw []byte) *exit.Error {
 		}
 		return exit.Named(code, "hub.untyped_refusal",
 			"the hub answered %d with no typed error envelope: %s", status, snippet).
-			WithRemedy("this route may not exist on this hub build; `cozy endpoint search` names it and its version").
-			WithNext("cozy endpoint search")
+			WithRemedy("this route may not exist on this hub build; `cozy package search` names it and its version").
+			WithNext("cozy package search")
 	}
 
 	e := exit.Named(code, env.Error.Code, "%s", env.Error.Message)
@@ -448,7 +448,7 @@ func (c *Client) refusal(status int, raw []byte) *exit.Error {
 	if code == exit.Credential {
 		// The one remedy the hub cannot write for us: it does not know where OUR
 		// token came from. Launch 1 has no login, so the next step is never `cozy login`.
-		e.WithNext("cozy endpoint search")
+		e.WithNext("cozy package search")
 		if c.source == "unset" {
 			e.WithRemedy("set TENSORHUB_TOKEN to the hub's admin.token (%s)", e.Remedy)
 		}
@@ -477,7 +477,7 @@ func statusCode(status int) exit.Code {
 	return exit.Internal
 }
 
-// Ref is one typed `org/name` endpoint or model resource. Commands that accept a release
+// Ref is one typed `org/name` package or model resource. Commands that accept a release
 // pin split it before calling this resource parser.
 type Ref struct {
 	Org  string
@@ -490,13 +490,13 @@ func ParseRef(s string) (Ref, *exit.Error) {
 	if strings.Contains(s, "@") {
 		return Ref{}, exit.Usagef("%q is not a resource name", s).
 			WithRemedy("name exactly org/name here; model download parses @release and @sha256 pins separately").
-			WithNext("cozy endpoint search", "cozy model search")
+			WithNext("cozy package search", "cozy model search")
 	}
 	org, name, ok := strings.Cut(s, "/")
 	if !ok || org == "" || name == "" || strings.Contains(name, "/") {
-		return Ref{}, exit.Usagef("%q is not a model or endpoint ref: expected exactly one org/name separator", s).
+		return Ref{}, exit.Usagef("%q is not a model or package ref: expected exactly one org/name separator", s).
 			WithRemedy("the grammar is org/name, e.g. cozy/sdxl").
-			WithNext("cozy endpoint search", "cozy model search")
+			WithNext("cozy package search", "cozy model search")
 	}
 	return Ref{Org: org, Name: name}, nil
 }

@@ -1,4 +1,4 @@
-// Package managedinstall materializes a published endpoint over one exact, already
+// Package managedinstall materializes a published package over one exact, already
 // qualified managed-local base. It never resolves packages, installs Torch/CUDA, runs
 // a native build, or accepts a base path from Tensorhub.
 package managedinstall
@@ -18,12 +18,12 @@ import (
 
 	"github.com/cozy-creator/cozy-creator/internal/canonical"
 	"github.com/cozy-creator/cozy-creator/internal/config"
-	"github.com/cozy-creator/cozy-creator/internal/endpointprofile"
 	"github.com/cozy-creator/cozy-creator/internal/exit"
 	"github.com/cozy-creator/cozy-creator/internal/home"
 	"github.com/cozy-creator/cozy-creator/internal/hub"
 	"github.com/cozy-creator/cozy-creator/internal/install"
 	"github.com/cozy-creator/cozy-creator/internal/launch"
+	"github.com/cozy-creator/cozy-creator/internal/packageprofile"
 	"github.com/cozy-creator/cozy-creator/internal/records"
 	"github.com/cozy-creator/cozy-creator/internal/transfer"
 	"github.com/cozy-creator/cozy-creator/internal/wheel"
@@ -34,7 +34,7 @@ import (
 const managedBaseFormat = "cozy.local.ManagedBaseReceipt/1"
 
 type Request struct {
-	Endpoint    string
+	Package     string
 	Release     string
 	Major       int
 	Profile     string
@@ -45,7 +45,7 @@ type Request struct {
 }
 
 type Result struct {
-	Install    records.EndpointInstall
+	Install    records.PackageInstall
 	Facts      records.ManagedProfileInstall
 	Superseded string
 	Idempotent bool
@@ -70,7 +70,7 @@ type proofOutput struct {
 
 func Run(ctx context.Context, layout home.Layout, store *records.Store, request Request) (*Result, *exit.Error) {
 	grant := request.Grant
-	if request.Endpoint == "" || request.Release == "" || request.Major <= 0 ||
+	if request.Package == "" || request.Release == "" || request.Major <= 0 ||
 		grant.CandidateID == "" || grant.Profile != request.Profile ||
 		grant.BaseRealization.Kind != "managed-local" || !digest(grant.BaseRealization.Digest) ||
 		grant.LeaseID == "" || grant.LeaseExpiresAt == "" {
@@ -83,7 +83,7 @@ func Run(ctx context.Context, layout home.Layout, store *records.Store, request 
 			"managed-local qualification-materials lease %s is absent, malformed, or expired", grant.LeaseID).
 			WithRemedy("request fresh local-qualification materials for the same non-refused candidate")
 	}
-	profiles, problem := endpointprofile.NormalizeSet([]string{request.Profile})
+	profiles, problem := packageprofile.NormalizeSet([]string{request.Profile})
 	if problem != nil {
 		return nil, problem
 	}
@@ -93,7 +93,7 @@ func Run(ctx context.Context, layout home.Layout, store *records.Store, request 
 		return nil, problem
 	}
 
-	_, priorInstall, problem := store.ActivePin(request.Endpoint, request.Major)
+	_, priorInstall, problem := store.ActivePin(request.Package, request.Major)
 	if problem != nil {
 		return nil, problem
 	}
@@ -107,7 +107,7 @@ func Run(ctx context.Context, layout home.Layout, store *records.Store, request 
 			return &Result{Install: *priorInstall, Facts: *facts, Idempotent: true}, nil
 		}
 		return nil, exit.New(exit.Conflict, "%s@v%d is already pinned to managed candidate %s",
-			request.Endpoint, request.Major, facts.CandidateID).
+			request.Package, request.Major, facts.CandidateID).
 			WithRemedy("use --force to materialize and atomically replace it")
 	}
 
@@ -130,8 +130,8 @@ func Run(ctx context.Context, layout home.Layout, store *records.Store, request 
 		format string
 		typed  bool
 	}{
-		{"endpoint-environment-spec.json", grant.EndpointEnvironmentSpec, "cozy.worker.v1.EndpointEnvironmentSpec/2", true},
-		{"endpoint-bundle.json", grant.EndpointBundle, "tensorhub.endpoint_bundle/2", false},
+		{"package-environment-spec.json", grant.PackageEnvironmentSpec, "cozy.worker.v1.PackageEnvironmentSpec/2", true},
+		{"package-bundle.json", grant.PackageBundle, "tensorhub.package_bundle/2", false},
 		{"resolved-wheel-set.json", grant.ResolvedWheelSet, "ResolvedWheelSet/3", false},
 		{"wheelhouse-manifest.json", grant.WheelhouseManifest, "WheelhouseManifest/3", false},
 		{"resolution-lock.json", grant.ResolutionLock, "tensorhub.resolution_lock/1", false},
@@ -149,7 +149,7 @@ func Run(ctx context.Context, layout home.Layout, store *records.Store, request 
 		return fail(problem)
 	}
 	docPaths["descriptor.json"] = descriptorPath
-	wheelFacts, problem := releaseWheelFacts(grant.EndpointBundle.CanonicalBytes,
+	wheelFacts, problem := releaseWheelFacts(grant.PackageBundle.CanonicalBytes,
 		grant.ResolvedWheelSet.CanonicalBytes)
 	if problem != nil {
 		return fail(problem)
@@ -163,7 +163,7 @@ func Run(ctx context.Context, layout home.Layout, store *records.Store, request 
 	if err != nil || !bytes.Equal(baseBytes, grant.WheelhouseManifest.CanonicalBytes) {
 		return fail(exit.Named(exit.Structural, "managed_base_wheelhouse_mismatch",
 			"managed base %s does not carry the exact granted WheelhouseManifest", base).
-			WithRemedy("install the qualified managed base realization before this endpoint"))
+			WithRemedy("install the qualified managed base realization before this package"))
 	}
 
 	if err := os.MkdirAll(wheelDir, 0o700); err != nil {
@@ -214,12 +214,12 @@ func Run(ctx context.Context, layout home.Layout, store *records.Store, request 
 	environmentRoot := filepath.Join(genDir, "environment")
 	requestPath, receiptPath := filepath.Join(genDir, "environment-proof-request.json"), filepath.Join(genDir, "installed-receipt.json")
 	proofRequest := map[string]any{
-		"format":                    "cozy.runtime.EnvironmentProofRequest/1",
-		"endpoint_environment_spec": docPaths["endpoint-environment-spec.json"],
-		"endpoint_bundle":           docPaths["endpoint-bundle.json"],
-		"resolved_wheel_set":        docPaths["resolved-wheel-set.json"],
-		"wheelhouse_manifest":       docPaths["wheelhouse-manifest.json"],
-		"wheel_files":               wheelFiles, "python": filepath.Join(base, receipt.Python),
+		"format":                   "cozy.runtime.EnvironmentProofRequest/1",
+		"package_environment_spec": docPaths["package-environment-spec.json"],
+		"package_bundle":           docPaths["package-bundle.json"],
+		"resolved_wheel_set":       docPaths["resolved-wheel-set.json"],
+		"wheelhouse_manifest":      docPaths["wheelhouse-manifest.json"],
+		"wheel_files":              wheelFiles, "python": filepath.Join(base, receipt.Python),
 		"environment_root": environmentRoot,
 	}
 	if problem := writeJCS(requestPath, proofRequest); problem != nil {
@@ -284,15 +284,15 @@ func Run(ctx context.Context, layout home.Layout, store *records.Store, request 
 	if descriptorDigest != grant.Descriptor.Digest ||
 		!bytes.Equal(derivedDescriptor.Raw, grant.Descriptor.CanonicalBytes) {
 		return fail(exit.Named(exit.Structural, "managed_descriptor_mismatch",
-			"installed endpoint derives descriptor %s; the published release grants %s with different bytes",
+			"installed package derives descriptor %s; the published release grants %s with different bytes",
 			descriptorDigest, grant.Descriptor.Digest).
-			WithRemedy("refuse this candidate; its qualified documents and installed project wheel do not describe the same endpoint"))
+			WithRemedy("refuse this candidate; its qualified documents and installed project wheel do not describe the same package"))
 	}
 
-	gen := records.EndpointInstall{
-		ID: id, Endpoint: request.Endpoint, Major: request.Major, Version: request.Release,
-		SourceKind: "published-profile", SourceRef: request.Endpoint + "@" + request.Release + "#" + profile,
-		SourceDigest: grant.EndpointBundle.Digest, Verified: true, Dir: genDir,
+	gen := records.PackageInstall{
+		ID: id, Package: request.Package, Major: request.Major, Version: request.Release,
+		SourceKind: "published-profile", SourceRef: request.Package + "@" + request.Release + "#" + profile,
+		SourceDigest: grant.PackageBundle.Digest, Verified: true, Dir: genDir,
 		Python: filepath.Join(base, receipt.Python), Runtime: runtimeBin, ProjectDir: projectDir,
 		LockDigest: grant.ResolutionLock.Digest, Platform: profile, LinkMode: "overlay",
 		Packages: len(wheelFiles), Closure: proof.Digest, Descriptor: descriptorDigest,
@@ -302,8 +302,8 @@ func Run(ctx context.Context, layout home.Layout, store *records.Store, request 
 		ReleaseID: request.Release, Profile: profile, CandidateID: grant.CandidateID,
 		BaseRealizationDigest:    grant.BaseRealization.Digest,
 		WheelhouseManifestDigest: grant.WheelhouseManifest.Digest,
-		EnvironmentSpecDigest:    grant.EndpointEnvironmentSpec.Digest,
-		EndpointBundleDigest:     grant.EndpointBundle.Digest,
+		EnvironmentSpecDigest:    grant.PackageEnvironmentSpec.Digest,
+		PackageBundleDigest:      grant.PackageBundle.Digest,
 		ResolvedWheelSetDigest:   grant.ResolvedWheelSet.Digest,
 		ResolutionLockDigest:     grant.ResolutionLock.Digest,
 		InstalledReceiptDigest:   proof.Digest, InstalledReceiptLength: proof.Length,
@@ -329,7 +329,7 @@ func releaseWheelFacts(bundleBytes, resolvedBytes []byte) (map[string]wheel.Fact
 		bundle.ProjectWheel.Distribution == "" || bundle.ProjectWheel.Version == "" ||
 		bundle.ProjectWheel.Length <= 0 {
 		return nil, exit.Named(exit.Structural, "managed_install_wheel_facts_invalid",
-			"EndpointBundle/ResolvedWheelSet carry no complete project/custom WheelFacts")
+			"PackageBundle/ResolvedWheelSet carry no complete project/custom WheelFacts")
 	}
 	out := map[string]wheel.Fact{"project_wheel": bundle.ProjectWheel}
 	seenDigests := map[string]bool{bundle.ProjectWheel.Digest: true}
@@ -441,10 +441,10 @@ type nativeOperatorObservation struct {
 }
 
 type nativeQualification struct {
-	BaseWorkerProfile             string `json:"base_worker_profile"`
-	EndpointEnvironmentSpecDigest string `json:"endpoint_environment_spec_digest"`
-	Format                        string `json:"format"`
-	HostCapability                struct {
+	BaseWorkerProfile            string `json:"base_worker_profile"`
+	PackageEnvironmentSpecDigest string `json:"package_environment_spec_digest"`
+	Format                       string `json:"format"`
+	HostCapability               struct {
 		GPU  *nativeGPU `json:"gpu"`
 		Seat nativeSeat `json:"seat"`
 	} `json:"host_capability"`
@@ -471,9 +471,9 @@ func verifyOverlayReceipt(path string, grant hub.LocalQualificationMaterials,
 	var receipt overlayReceipt
 	decoder := json.NewDecoder(bytes.NewReader(raw))
 	decoder.DisallowUnknownFields()
-	if err := decoder.Decode(&receipt); err != nil || receipt.Format != "cozy.runtime.EndpointOverlayReceipt/1" ||
+	if err := decoder.Decode(&receipt); err != nil || receipt.Format != "cozy.runtime.PackageOverlayReceipt/1" ||
 		receipt.BaseFamilyDigest != grant.WheelhouseManifest.Digest ||
-		receipt.EnvironmentSpec != grant.EndpointEnvironmentSpec.Digest {
+		receipt.EnvironmentSpec != grant.PackageEnvironmentSpec.Digest {
 		return "", exit.Named(exit.Structural, "managed_environment_receipt_invalid",
 			"Runtime overlay receipt does not bind the granted base/environment: %v", err)
 	}
@@ -509,7 +509,7 @@ func verifyOverlayReceipt(path string, grant hub.LocalQualificationMaterials,
 	}
 	sort.Strings(wheelDigests)
 	contentBytes, err := json.Marshal(map[string]any{"base_family_digest": receipt.BaseFamilyDigest,
-		"format": "cozy.runtime.EndpointOverlayContent/1", "wheel_digests": wheelDigests})
+		"format": "cozy.runtime.PackageOverlayContent/1", "wheel_digests": wheelDigests})
 	if err != nil {
 		return "", exit.Internalf("cannot encode overlay content identity: %s", err)
 	}
@@ -536,8 +536,8 @@ func runNativeProof(base string, grant hub.LocalQualificationMaterials, profile 
 	}
 	request := map[string]any{
 		"format": "cozy.runtime.NativeWheelProofRequest/1", "device_index": deviceIndex,
-		"endpoint_environment_spec_digest": grant.EndpointEnvironmentSpec.Digest,
-		"environment_root":                 environmentRoot, "expected_result_digest": spec.ExpectedResultDigest,
+		"package_environment_spec_digest": grant.PackageEnvironmentSpec.Digest,
+		"environment_root":                environmentRoot, "expected_result_digest": spec.ExpectedResultDigest,
 		"fixture": spec.Fixture, "installed_environment_receipt_digest": receiptDigest,
 		"python": filepath.Join(base, "bin", "python"), "wheelhouse_manifest": wheelhouse,
 	}
@@ -589,7 +589,7 @@ func validateNativeEvidence(path string, grant hub.LocalQualificationMaterials, 
 	}
 	if evidence.Format != "cozy.runtime.NativeWheelQualification/1" ||
 		evidence.BaseWorkerProfile != profile ||
-		evidence.EndpointEnvironmentSpecDigest != grant.EndpointEnvironmentSpec.Digest ||
+		evidence.PackageEnvironmentSpecDigest != grant.PackageEnvironmentSpec.Digest ||
 		evidence.WheelhouseManifestDigest != grant.WheelhouseManifest.Digest ||
 		evidence.InstalledEnvironmentReceiptDigest != receiptDigest ||
 		evidence.OverlayContentDigest != overlayContentDigest ||
@@ -744,7 +744,7 @@ func writeExactDocument(path string, doc hub.ExactDocument, format string, typed
 		return problem
 	}
 	if typed {
-		if _, err := canonical.Read(doc.CanonicalBytes, &pb.EndpointEnvironmentSpec{}); err != nil {
+		if _, err := canonical.Read(doc.CanonicalBytes, &pb.PackageEnvironmentSpec{}); err != nil {
 			return exit.Named(exit.Structural, "managed_install_document_invalid", "%s: %v", format, err)
 		}
 	} else {
@@ -766,10 +766,10 @@ func writeSemanticDocument(path string, doc hub.ExactDocument) *exit.Error {
 	normalized, err := canonical.NormalizeJCS(doc.CanonicalBytes)
 	if err != nil || !bytes.Equal(normalized, doc.CanonicalBytes) {
 		return exit.Named(exit.Structural, "managed_install_document_invalid",
-			"semantic endpoint document is not exact canonical JCS: %v", err)
+			"semantic package document is not exact canonical JCS: %v", err)
 	}
 	if err := os.WriteFile(path, doc.CanonicalBytes, 0o600); err != nil {
-		return exit.Internalf("cannot stage endpoint semantic document: %s", err)
+		return exit.Internalf("cannot stage package semantic document: %s", err)
 	}
 	return nil
 }

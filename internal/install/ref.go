@@ -8,33 +8,33 @@ import (
 	"github.com/cozy-creator/cozy-creator/internal/exit"
 )
 
-// Ref is `org/endpoint[@vN]` — the hub's grammar, consumed verbatim. "unset" has no
+// Ref is `org/package[@vN]` — the hub's grammar, consumed verbatim. "unset" has no
 // spelling in it: Major is present or it is not.
 type Ref struct {
-	Endpoint string // org/name
+	Package  string // org/name
 	Major    int
 	HasMajor bool
 }
 
 func (r Ref) String() string {
 	if r.HasMajor {
-		return fmt.Sprintf("%s@v%d", r.Endpoint, r.Major)
+		return fmt.Sprintf("%s@v%d", r.Package, r.Major)
 	}
-	return r.Endpoint
+	return r.Package
 }
 
 func ParseRef(s string) (Ref, *exit.Error) {
 	bad := func(why string) *exit.Error {
-		return exit.Usagef("%q is not an endpoint ref: %s", s, why).
-			WithRemedy("the grammar is org/endpoint[@vN], e.g. cozy-creator/demo@v1").
+		return exit.Usagef("%q is not a package ref: %s", s, why).
+			WithRemedy("the grammar is org/package[@vN], e.g. cozy-creator/demo@v1").
 			WithNext("cozy help install")
 	}
 	name, ver, hasVer := strings.Cut(s, "@")
 	org, ep, ok := strings.Cut(name, "/")
 	if !ok || org == "" || ep == "" || strings.Contains(ep, "/") {
-		return Ref{}, bad("expected exactly one org/endpoint separator")
+		return Ref{}, bad("expected exactly one org/package separator")
 	}
-	r := Ref{Endpoint: name}
+	r := Ref{Package: name}
 	if !hasVer {
 		return r, nil
 	}

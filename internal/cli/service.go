@@ -104,7 +104,7 @@ func serveController(ctx *Context) *exit.Error {
 	environmentSpec, configDigest := localInvocationIdentity(ctx.Cfg)
 	c, e := orchestrator.Open(orchestrator.Options{
 		Cfg: ctx.Cfg, Layout: l, Store: st, Yield: yield, Log: ctx.Out,
-		Endpoints: resolver, Rentals: rentals, ObserveRental: rental.ObserveWorker(st),
+		Packages: resolver, Rentals: rentals, ObserveRental: rental.ObserveWorker(st),
 		ArtifactGrants:        rental.ArtifactGrants(st, client(ctx)),
 		RelayRentalSession:    rental.RelayWorkerSession(st, client(ctx)),
 		EnvironmentSpecDigest: environmentSpec, ConfigDigest: configDigest,
@@ -135,7 +135,7 @@ func serveController(ctx *Context) *exit.Error {
 	stop := make(chan os.Signal, 1)
 	server := api.New(api.Options{
 		Orchestrator: c, Cfg: ctx.Cfg, Creds: creds, Addr: addr,
-		Log: ctx.Out, Web: cozyweb.Handler(), Endpoints: resolver, Rentals: knownRentals,
+		Log: ctx.Out, Web: cozyweb.Handler(), Packages: resolver, Rentals: knownRentals,
 		Shutdown: func() { stop <- syscall.SIGTERM },
 	})
 	handler, e := server.Handler()
@@ -159,7 +159,7 @@ func serveController(ctx *Context) *exit.Error {
 
 	signal.Notify(stop, syscall.SIGINT, syscall.SIGTERM)
 	<-stop
-	fmt.Fprintln(ctx.Out, "draining endpoint processes…")
+	fmt.Fprintln(ctx.Out, "draining package processes…")
 	closeListeners()
 	c.Close(orchestrator.StopGrace)
 	return nil

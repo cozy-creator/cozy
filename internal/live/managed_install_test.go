@@ -17,8 +17,8 @@ import (
 	"time"
 
 	"github.com/cozy-creator/cozy-creator/internal/canonical"
-	"github.com/cozy-creator/cozy-creator/internal/endpointprofile"
 	"github.com/cozy-creator/cozy-creator/internal/home"
+	"github.com/cozy-creator/cozy-creator/internal/packageprofile"
 	"github.com/cozy-creator/cozy-creator/internal/records"
 	"github.com/cozy-creator/cozy-creator/internal/wheel"
 
@@ -31,7 +31,7 @@ func TestQualifiedManagedLocalInstall(t *testing.T) {
 	fatal(t, problem)
 	projectTree := t.TempDir()
 	mustWrite(t, filepath.Join(projectTree, "pyproject.toml"), "[project]\nname=\"marco\"\nversion=\"1.0.0\"\n")
-	mustWrite(t, filepath.Join(projectTree, "endpoint.toml"), "[application]\nobject=\"marco:app\"\n")
+	mustWrite(t, filepath.Join(projectTree, "package.toml"), "[application]\nobject=\"marco:app\"\n")
 	mustWrite(t, filepath.Join(projectTree, "marco.py"), "app=object()\n")
 	packed, problem := wheel.Pack(wheel.Request{Tree: projectTree, OutDir: t.TempDir()})
 	fatal(t, problem)
@@ -46,7 +46,7 @@ func TestQualifiedManagedLocalInstall(t *testing.T) {
 	fatal(t, problem)
 	customBytes := mustRead(t, customPath)
 
-	bundle := jcs(t, map[string]any{"format": "tensorhub.endpoint_bundle/2", "project_wheel": packed.Fact})
+	bundle := jcs(t, map[string]any{"format": "tensorhub.package_bundle/2", "project_wheel": packed.Fact})
 	resolved := jcs(t, map[string]any{"format": "ResolvedWheelSet/3", "wheels": []any{customFact}})
 	lock := jcs(t, map[string]any{"format": "tensorhub.resolution_lock/1"})
 	baseDistributions := []map[string]string{{"distribution": "torch", "version": "2.13.0+cu130"}}
@@ -61,13 +61,13 @@ func TestQualifiedManagedLocalInstall(t *testing.T) {
 			"length": 1, "tags": []string{"cp312-cp312-manylinux_2_28_x86_64"}, "version": "2.13.0+cu130"}},
 	})
 	descriptor := jcs(t, map[string]any{"application": "marco:app", "entrypoints": []any{},
-		"format": "cozy.endpoint.descriptor/1", "jobs": []any{}})
-	eesValue, err := canonical.Document(&pb.EndpointEnvironmentSpec{
+		"format": "cozy.package.descriptor/1", "jobs": []any{}})
+	eesValue, err := canonical.Document(&pb.PackageEnvironmentSpec{
 		PlatformTarget: &pb.PlatformTarget{OsArch: "linux/amd64", Libc: "glibc2.39",
 			PythonAbi: "cp312", AcceleratorBackend: "cuda", AcceleratorAbi: "cu130"},
 		CompatibilityProfile: &pb.CompatibilityProfile{TorchRelease: "2.13.0",
 			AcceleratorBuild: "cu130", PythonAbi: "cp312", OsCpu: "linux-x86"},
-		EndpointBundleDigest: digestRaw(t, bundle), ProjectWheelDigest: digestRaw(t, wheelBytes),
+		PackageBundleDigest: digestRaw(t, bundle), ProjectWheelDigest: digestRaw(t, wheelBytes),
 		WheelhouseManifestDigest: digestRaw(t, wheelhouse),
 	})
 	must(t, err)
@@ -75,7 +75,7 @@ func TestQualifiedManagedLocalInstall(t *testing.T) {
 	must(t, err)
 	runtimeReceipt := jcs(t, map[string]any{
 		"base_family_digest": digestText(wheelhouse), "environment_spec_digest": digestText(ees),
-		"format": "cozy.runtime.EndpointOverlayReceipt/1",
+		"format": "cozy.runtime.PackageOverlayReceipt/1",
 		"overlay_wheels": []map[string]string{
 			{"digest": customFact.Digest, "distribution": customFact.Distribution, "owner": "custom", "version": customFact.Version},
 			{"digest": packed.Fact.Digest, "distribution": packed.Fact.Distribution, "owner": "project", "version": packed.Fact.Version},
@@ -85,7 +85,7 @@ func TestQualifiedManagedLocalInstall(t *testing.T) {
 	wheelDigests := []string{customFact.Digest, packed.Fact.Digest}
 	sort.Strings(wheelDigests)
 	overlayContentDigest := digestText(jcs(t, map[string]any{
-		"base_family_digest": digestText(wheelhouse), "format": "cozy.runtime.EndpointOverlayContent/1",
+		"base_family_digest": digestText(wheelhouse), "format": "cozy.runtime.PackageOverlayContent/1",
 		"wheel_digests": wheelDigests,
 	}))
 	emptySymbols := digestText(jcs(t, []string{}))
@@ -98,8 +98,8 @@ func TestQualifiedManagedLocalInstall(t *testing.T) {
 	staticInspectionBytes := jcs(t, staticInspection)
 	expectedResultDigest := "sha256:" + strings.Repeat("3", 64)
 	nativeEvidence := jcs(t, map[string]any{
-		"base_worker_profile":              endpointprofile.CU130,
-		"endpoint_environment_spec_digest": digestText(ees), "format": "cozy.runtime.NativeWheelQualification/1",
+		"base_worker_profile":             packageprofile.CU130,
+		"package_environment_spec_digest": digestText(ees), "format": "cozy.runtime.NativeWheelQualification/1",
 		"host_capability": map[string]any{
 			"gpu": map[string]any{"device_index": 0, "driver_version": "580.1.2", "name": "NVIDIA GeForce RTX 4090", "sm": 89},
 			"seat": map[string]any{"cuda_available": true, "distributions": baseDistributions, "implementation": "cpython",
@@ -119,7 +119,7 @@ func TestQualifiedManagedLocalInstall(t *testing.T) {
 		"environment_proof":   "bin/cozy-environment-proof",
 		"format":              "cozy.local.ManagedBaseReceipt/1",
 		"generation_identity": "sha256:" + strings.Repeat("9", 64),
-		"profile":             endpointprofile.CU130, "python": "bin/python", "python_abi": "cp312",
+		"profile":             packageprofile.CU130, "python": "bin/python", "python_abi": "cp312",
 		"wheelhouse_manifest_digest": digestText(wheelhouse),
 	})
 	baseDigest := digestText(baseReceipt)
@@ -159,7 +159,7 @@ import base64,hashlib,json,pathlib,sys
 request=json.loads(pathlib.Path(sys.argv[1]).read_text())
 pathlib.Path("` + proofOrder + `").open("a").write("native\n")
 assert request["format"]=="cozy.runtime.NativeWheelProofRequest/1"
-assert set(request)=={"device_index","endpoint_environment_spec_digest","environment_root","expected_result_digest","fixture","format","installed_environment_receipt_digest","python","wheelhouse_manifest"}
+assert set(request)=={"device_index","package_environment_spec_digest","environment_root","expected_result_digest","fixture","format","installed_environment_receipt_digest","python","wheelhouse_manifest"}
 assert request["installed_environment_receipt_digest"]=="` + digestText(runtimeReceipt) + `"
 evidence=base64.b64decode("` + base64.StdEncoding.EncodeToString(evidence) + `")
 pathlib.Path(sys.argv[2]).write_bytes(evidence)
@@ -190,10 +190,10 @@ print(json.dumps({"digest":"sha256:"+hashlib.sha256(evidence).hexdigest(),"lengt
 				realization = map[string]string{"kind": "oci", "digest": "registry.invalid/worker@sha256:" + strings.Repeat("5", 64)}
 			}
 			_ = json.NewEncoder(w).Encode(map[string]any{
-				"candidate_id": "candidate-local", "profile": endpointprofile.CU130,
+				"candidate_id": "candidate-local", "profile": packageprofile.CU130,
 				"lease_id": "lease-local", "lease_expires_at": expiresAt,
-				"base_realization":          realization,
-				"endpoint_environment_spec": exactDoc(ees), "endpoint_bundle": exactDoc(bundle),
+				"base_realization":         realization,
+				"package_environment_spec": exactDoc(ees), "package_bundle": exactDoc(bundle),
 				"descriptor":         exactDoc(descriptor),
 				"resolved_wheel_set": exactDoc(resolved), "wheelhouse_manifest": exactDoc(wheelhouse),
 				"resolution_lock": exactDoc(lock),
@@ -216,10 +216,10 @@ print(json.dumps({"digest":"sha256:"+hashlib.sha256(evidence).hexdigest(),"lengt
 		body, _ := cmd.CombinedOutput()
 		return cmd.ProcessState.ExitCode(), string(body)
 	}
-	code, output := run("endpoint", "install", "cozy/marco@1.0.0", "--profile", endpointprofile.CU130,
+	code, output := run("package", "install", "cozy/marco@1.0.0", "--profile", packageprofile.CU130,
 		"--major", "v1", "--reason", "managed fixture")
 	if code != 0 || !strings.Contains(output, "status: installed") ||
-		!strings.Contains(output, "profile: "+endpointprofile.CU130) ||
+		!strings.Contains(output, "profile: "+packageprofile.CU130) ||
 		strings.Contains(output, "candidate-local") || strings.Contains(output, "dependency resolution") {
 		t.Fatalf("managed install [exit %d]\n%s", code, output)
 	}
@@ -245,9 +245,9 @@ print(json.dumps({"digest":"sha256:"+hashlib.sha256(evidence).hexdigest(),"lengt
 		t.Fatalf("managed host/native evidence digests do not identify their separate stored bytes: %+v", facts)
 	}
 	if order := strings.TrimSpace(string(mustRead(t, proofOrder))); order != "materialize\nhost\nnative\ndescriptor" {
-		t.Fatalf("endpoint code ran before local hardware proof: %q", order)
+		t.Fatalf("package code ran before local hardware proof: %q", order)
 	}
-	if code, output := run("endpoint", "install", "cozy/marco@1.0.0", "--profile", endpointprofile.CU130,
+	if code, output := run("package", "install", "cozy/marco@1.0.0", "--profile", packageprofile.CU130,
 		"--major", "v1", "--force", "--reason", "OCI substitution fixture"); code != 1 ||
 		!strings.Contains(output, "managed_install_grant_invalid") {
 		t.Fatalf("OCI realization entered managed-local qualification [exit %d]\n%s", code, output)
@@ -257,7 +257,7 @@ print(json.dumps({"digest":"sha256:"+hashlib.sha256(evidence).hexdigest(),"lengt
 	if active == nil || active.ID != installed[0].ID {
 		t.Fatalf("OCI substitution disturbed active managed-local install: %+v", active)
 	}
-	if code, output := run("endpoint", "install", "cozy/marco@1.0.0", "--profile", endpointprofile.CU130,
+	if code, output := run("package", "install", "cozy/marco@1.0.0", "--profile", packageprofile.CU130,
 		"--major", "v1", "--reason", "managed fixture replay"); code != 0 ||
 		!strings.Contains(output, "changed: false") {
 		t.Fatalf("managed install replay [exit %d]\n%s", code, output)
@@ -265,7 +265,7 @@ print(json.dumps({"digest":"sha256:"+hashlib.sha256(evidence).hexdigest(),"lengt
 	wrongDigest := "sha256:" + strings.Repeat("e", 64)
 	badNativeEvidence := bytes.Replace(nativeEvidence, []byte(overlayContentDigest), []byte(wrongDigest), 1)
 	writeExecutable(t, filepath.Join(base, "bin", "cozy-native-wheel-proof"), nativeProof(badNativeEvidence))
-	if code, output := run("endpoint", "install", "cozy/marco@1.0.0", "--profile", endpointprofile.CU130,
+	if code, output := run("package", "install", "cozy/marco@1.0.0", "--profile", packageprofile.CU130,
 		"--major", "v1", "--force", "--reason", "native evidence mismatch fixture"); code != 1 ||
 		!strings.Contains(output, "managed_native_evidence_invalid") {
 		t.Fatalf("managed native evidence mismatch [exit %d]\n%s", code, output)
@@ -278,7 +278,7 @@ print(json.dumps({"digest":"sha256:"+hashlib.sha256(evidence).hexdigest(),"lengt
 	writeExecutable(t, filepath.Join(base, "bin", "cozy-native-wheel-proof"), nativeProof(nativeEvidence))
 	badReceipt := bytes.Replace(runtimeReceipt, []byte(packed.Fact.Digest), []byte(wrongDigest), 1)
 	writeExecutable(t, filepath.Join(base, "bin", "cozy-environment-proof"), environmentProof(badReceipt))
-	if code, output := run("endpoint", "install", "cozy/marco@1.0.0", "--profile", endpointprofile.CU130,
+	if code, output := run("package", "install", "cozy/marco@1.0.0", "--profile", packageprofile.CU130,
 		"--major", "v1", "--force", "--reason", "receipt mismatch fixture"); code != 1 ||
 		!strings.Contains(output, "managed_environment_receipt_invalid") {
 		t.Fatalf("managed receipt mismatch [exit %d]\n%s", code, output)
@@ -292,11 +292,11 @@ print(json.dumps({"digest":"sha256:"+hashlib.sha256(evidence).hexdigest(),"lengt
 	writeExecutable(t, filepath.Join(base, "bin", "cozy-runtime"), //cozy:allow independent Runtime CLI mismatch fixture
 		`#!/usr/bin/python3
 import json,sys
-if "describe" in sys.argv: print(json.dumps({"application":"other:app","entrypoints":[],"format":"cozy.endpoint.descriptor/1","jobs":[]},separators=(",",":"),sort_keys=True))
+if "describe" in sys.argv: print(json.dumps({"application":"other:app","entrypoints":[],"format":"cozy.package.descriptor/1","jobs":[]},separators=(",",":"),sort_keys=True))
 elif "doctor" in sys.argv: print(json.dumps({"device":{"name":"NVIDIA GeForce RTX 4090","state":"present","cuda_version":"13.0"}}))
 else: raise SystemExit(2)
 `)
-	if code, output := run("endpoint", "install", "cozy/marco@1.0.0", "--profile", endpointprofile.CU130,
+	if code, output := run("package", "install", "cozy/marco@1.0.0", "--profile", packageprofile.CU130,
 		"--major", "v1", "--force", "--reason", "descriptor mismatch fixture"); code != 1 ||
 		!strings.Contains(output, "managed_descriptor_mismatch") {
 		t.Fatalf("managed descriptor mismatch [exit %d]\n%s", code, output)

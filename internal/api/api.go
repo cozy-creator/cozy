@@ -72,9 +72,9 @@ type Server struct {
 	addr         string
 	log          io.Writer
 	web          http.Handler
-	// endpoints resolves an endpoint ref to a spec the orchestrator can start. It is the
+	// packages resolves a package ref to a spec the orchestrator can start. It is the
 	// LOCAL module's resolver; the pod profile (cl-014) supplies its own.
-	endpoints Resolver
+	packages Resolver
 
 	// rentals resolves only the non-secret, attempt-bound desired placement. The
 	// credential and dial triple remain orchestrator-only and are obtained at dial time.
@@ -92,15 +92,15 @@ type Server struct {
 }
 
 // Resolver exposes control-plane placement facts separately from a local worker launch.
-// A remote request and endpoint listing use ResolvePlacement; only an explicit local
+// A remote request and package listing use ResolvePlacement; only an explicit local
 // start may require the target environment through Resolve.
 type Resolver interface {
-	ResolvePlacement(endpoint string) (orchestrator.DesiredPlacement, *exit.Error)
+	ResolvePlacement(pkg string) (orchestrator.DesiredPlacement, *exit.Error)
 	Entrypoint(installID, name string) (*launch.Entrypoint, *exit.Error)
-	// Jobs names the `@job` functions one installed endpoint registers, with the
+	// Jobs names the `@job` functions one installed package registers, with the
 	// descriptor id each resolves to. The job submit route resolves a function to its
 	// digest through this and never lets a client name one (cl-004).
-	Jobs(endpoint string) ([]launch.JobFacts, *exit.Error)
+	Jobs(pkg string) ([]launch.JobFacts, *exit.Error)
 }
 
 // Options is the frozen input to one API server.
@@ -111,7 +111,7 @@ type Options struct {
 	Addr         string
 	Log          io.Writer
 	Web          http.Handler
-	Endpoints    Resolver
+	Packages     Resolver
 	// Rentals resolves an attached worker's exact non-secret placement; nil means this
 	// host attaches no remote workers.
 	Rentals func(id string) (*orchestrator.DesiredPlacement, *exit.Error)
@@ -127,7 +127,7 @@ func New(opt Options) *Server {
 	return &Server{
 		orchestrator: opt.Orchestrator, store: opt.Orchestrator.Store(),
 		layout: opt.Orchestrator.Layout(), cfg: opt.Cfg, creds: opt.Creds,
-		addr: opt.Addr, log: opt.Log, web: opt.Web, endpoints: opt.Endpoints,
+		addr: opt.Addr, log: opt.Log, web: opt.Web, packages: opt.Packages,
 		rentals: opt.Rentals, shutdown: opt.Shutdown,
 	}
 }

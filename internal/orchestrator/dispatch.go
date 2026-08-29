@@ -24,7 +24,7 @@ import (
 // WHAT runs; the runtime owns everything about HOW.
 type Submission struct {
 	IdemKey    string // the caller's idempotency key
-	Endpoint   string // org/name
+	Package    string // org/name
 	Entrypoint string // the function
 	PlanID     string // the entrypoint_binding_plan_id this attempt binds
 
@@ -48,7 +48,7 @@ type Submission struct {
 
 	// BodyDigest is the caller's own digest of the WHOLE submission it is making
 	// idempotent, not merely of the payload. cl-006 supplies the digest of
-	// (endpoint, function, input, outputs) so that one key naming a different ENDPOINT
+	// (package, function, input, outputs) so that one key naming a different ENDPOINT
 	// conflicts as loudly as one naming different input — a digest over the payload
 	// alone would let a key be reused across functions and mean two different things.
 	// Empty falls back to the payload's digest.
@@ -159,14 +159,14 @@ func requestRecord(s Submission) (records.Request, map[string]any, *exit.Error) 
 	}
 	req := records.Request{
 		ID: id, IdemKey: s.IdemKey, BodyDigest: bodyDigest,
-		Endpoint: s.Endpoint, Entrypoint: s.Entrypoint, PlanID: s.PlanID, Payload: s.Payload,
+		Package: s.Package, Entrypoint: s.Entrypoint, PlanID: s.PlanID, Payload: s.Payload,
 		Outputs: strings.Join(s.Outputs, ","),
 		Assets:  s.Assets, ArtifactOutputs: string(artifactBytes),
 		Kind: s.Kind, Org: s.Org, Trees: strings.Join(s.Trees, ","),
 		Worker: s.Worker, InstallID: s.InstallID,
 	}
 	event := map[string]any{
-		"endpoint": s.Endpoint, "function": s.Entrypoint,
+		"package": s.Package, "function": s.Entrypoint,
 		"body_digest": bodyDigest, "plan_id": s.PlanID, "outputs": s.Outputs,
 		"artifact_outputs": artifactOutputs,
 	}
@@ -360,7 +360,7 @@ func (c *Orchestrator) Requeue(requestID, why string) {
 		requestID, attempt, n, MaxRequeues, why)
 }
 
-// selectOrStart makes a queued request's endpoint resident. It is the half of `cozy invoke run`
+// selectOrStart makes a queued request's package resident. It is the half of `cozy invoke run`
 // that "cold and warm traverse the same states" rests on: SELECT the worker that already
 // advertises the binding, or START one — never a second invocation mechanism, and never a
 // client's job. `cozy invoke run` is the same act made explicit for prewarming.
@@ -374,15 +374,15 @@ func (c *Orchestrator) Requeue(requestID, why string) {
 // longer wait. A request that queues forever behind a worker that died on boot is the
 // worst of both: no output and no answer.
 func (c *Orchestrator) selectOrStart(req records.Request) {
-	// A JOB names its own slot — one worker per (endpoint, job function) — so the
+	// A JOB names its own slot — one worker per (package, job function) — so the
 	// "already starting" and "already resident" questions are asked about that slot and
-	// not about the endpoint. Without this, submitting a job while a serving worker of
-	// the same endpoint is up would decide a job worker already existed.
+	// not about the package. Without this, submitting a job while a serving worker of
+	// the same package is up would decide a job worker already existed.
 	// A request PINNED to a rental asks its questions about the rental's own slot: the
-	// attached worker's spec carries the pinned endpoint name, so comparing against the
+	// attached worker's spec carries the pinned package name, so comparing against the
 	// bare one would decide no worker was resident and attach a second control stream to
 	// the pod on every request.
-	slot := pinnedEndpoint(req.Endpoint, req.Worker)
+	slot := pinnedPackage(req.Package, req.Worker)
 	if req.InstallID != "" {
 		slot += "/install/" + req.InstallID
 	}
@@ -396,7 +396,7 @@ func (c *Orchestrator) selectOrStart(req records.Request) {
 	}
 	stale := ""
 	for _, w := range c.workers {
-		if w.exited || w.stopping || w.spec.Placement.Endpoint != pinnedEndpoint(req.Endpoint, req.Worker) ||
+		if w.exited || w.stopping || w.spec.Placement.Package != pinnedPackage(req.Package, req.Worker) ||
 			w.spec.IsJob() != req.IsJob() {
 			continue
 		}
@@ -451,18 +451,18 @@ func (c *Orchestrator) selectOrStart(req records.Request) {
 			c.failQueued(req.ID, e)
 			return
 		}
-		c.logf("%s: %s is %s for the queued request", req.Endpoint, instance, change)
+		c.logf("%s: %s is %s for the queued request", req.Package, instance, change)
 		if e := c.EnsurePlacementReady(instance, req.PlanID); e != nil {
 			// AND THE WORKER GOES. A process that cannot make its binding resident still
 			// holds a device grant, and `selectOrStart` returns early whenever a worker
-			// for the endpoint exists — so leaving it would hang the NEXT request behind a
+			// for the package exists — so leaving it would hang the NEXT request behind a
 			// worker that will never serve it, with nothing to start a replacement.
 			if e.ErrName() == "worker_recycled" {
 				// A COMPLETION, not a failure. The worker's own exit already asked the
 				// queue for a replacement; failing the request here would settle a
 				// requeued job after one of its budgeted attempts.
 				c.logf("%s: the worker for %s recycled; the queue asks for the next one",
-					req.Endpoint, req.ID)
+					req.Package, req.ID)
 				done()
 				return
 			}
@@ -507,8 +507,8 @@ func settledState(state string) bool {
 // asks this machine's install to recreate remote meaning.
 func (c *Orchestrator) resolveFor(req records.Request) (WorkerLaunchSpec, *exit.Error) {
 	if req.Worker == "" {
-		if c.opt.Endpoints == nil {
-			return WorkerLaunchSpec{}, exit.Unavailablef("this host resolves no local endpoints")
+		if c.opt.Packages == nil {
+			return WorkerLaunchSpec{}, exit.Unavailablef("this host resolves no local packages")
 		}
 		if req.InstallID != "" {
 			if req.IsJob() {
@@ -516,21 +516,21 @@ func (c *Orchestrator) resolveFor(req records.Request) (WorkerLaunchSpec, *exit.
 					"job_install_unsupported",
 					"an exact serving install cannot dispatch a job callable")
 			}
-			spec, e := c.opt.Endpoints.ResolveInstall(req.InstallID)
+			spec, e := c.opt.Packages.ResolveInstall(req.InstallID)
 			if e != nil {
 				return WorkerLaunchSpec{}, e
 			}
-			if spec.Placement.Endpoint != req.Endpoint {
+			if spec.Placement.Package != req.Package {
 				return WorkerLaunchSpec{}, exit.Named(exit.Conflict,
-					"request_install_endpoint_mismatch",
-					"install %s serves %s, not request endpoint %s",
-					req.InstallID, spec.Placement.Endpoint, req.Endpoint)
+					"request_install_package_mismatch",
+					"install %s serves %s, not request package %s",
+					req.InstallID, spec.Placement.Package, req.Package)
 			}
 			return spec, nil
 		}
-		spec, e := c.opt.Endpoints.Resolve(req.Endpoint)
+		spec, e := c.opt.Packages.Resolve(req.Package)
 		if req.IsJob() {
-			spec, e = c.opt.Endpoints.ResolveJob(req.Endpoint, req.Entrypoint)
+			spec, e = c.opt.Packages.ResolveJob(req.Package, req.Entrypoint)
 		}
 		return spec, e
 	}
@@ -553,7 +553,7 @@ func (c *Orchestrator) resolveFor(req records.Request) (WorkerLaunchSpec, *exit.
 	spec := WorkerLaunchSpec{Placement: remote.Placement, Connection: remote.Connection}
 	// The rental IS the slot: one connected worker per rental id, its own instance
 	// namespace, and no local device envelope (the pod's card is the pod's).
-	spec.Placement.Endpoint = pinnedEndpoint(spec.Placement.Endpoint, req.Worker)
+	spec.Placement.Package = pinnedPackage(spec.Placement.Package, req.Worker)
 	return spec, nil
 }
 
@@ -565,7 +565,7 @@ func (c *Orchestrator) failQueued(requestID string, cause *exit.Error) {
 	// A REQUEST THAT ALREADY SETTLED IS NOT FAILED BY A LATER OBSERVATION. The launch
 	// goroutine that made this request's worker resident OUTLIVES the request: a job
 	// worker is terminal-and-reclaim, so it EXITS the moment its terminal is acknowledged,
-	// and `EnsurePlacementReady` then answers "the endpoint worker exited before reporting ready" —
+	// and `EnsurePlacementReady` then answers "the package worker exited before reporting ready" —
 	// about a process whose exit was the successful end of the work.
 	//
 	// Observed live in cl-004's crash arm, and it is the worst failure class this system
@@ -622,7 +622,7 @@ func (c *Orchestrator) dispatch(req records.Request) (uint64, *exit.Error) {
 		return 0, e
 	}
 	spec := &pb.InvocationSpec{
-		EndpointReleaseId: w.spec.Placement.ReleaseID,
+		PackageReleaseId: w.spec.Placement.ReleaseID,
 		// `image_digest` is GONE, renamed to what it always meant (#483): "image" is wrong
 		// for a native install with no OCI image at all. The value is the same one this
 		// service was frozen with — a request cannot choose the environment it runs under.
@@ -755,7 +755,7 @@ func (c *Orchestrator) rollbackGrant(req records.Request, attempt uint64, w *wor
 }
 
 // DefaultMaxOutputMiB is the per-output bound when Options.MaxOutputMiB is unset. It
-// matches the Runtime/endpoint media object envelope; attempt and pod quotas still bound
+// matches the Runtime/package media object envelope; attempt and pod quotas still bound
 // the aggregate.
 const DefaultMaxOutputMiB int64 = 512
 
@@ -769,7 +769,7 @@ func (c *Orchestrator) maxOutputBytes() uint64 {
 
 // invocationIdentity names the environment and optional local config digest an
 // invocation on w rides. Tensorhub's frozen remote placement owns the environment;
-// model configuration is bound separately and therefore has no endpoint-wide digest.
+// model configuration is bound separately and therefore has no package-wide digest.
 func (c *Orchestrator) invocationIdentity(w *worker) (environment, config string, e *exit.Error) {
 	environment = w.spec.Placement.EnvironmentSpecDigest
 	if w.spec.Connection != nil {
@@ -852,7 +852,7 @@ func invocationOutputBindings(ids []string, artifacts []ArtifactOutput, defaultM
 // capacity, and that defect is arithmetic rather than a race.
 //
 // THE SLOT IS PART OF THE MATCH, not only the binding. Matching on the plan id alone sent
-// a request pinned to rental B to rental A's worker — same endpoint, same plan digest, so
+// a request pinned to rental B to rental A's worker — same package, same plan digest, so
 // it looked like capacity — which made the pin advisory and, worse, let a request run on a
 // pod whose credential it never presented. It cuts the other way too: an UNPINNED request
 // must never land on a rented worker, because someone is being billed for that card and
@@ -865,11 +865,11 @@ type dispatchReservation struct {
 
 func (c *Orchestrator) pick(req records.Request) (*worker, *session, uint64, *dispatchReservation, *exit.Error) {
 	planID := req.PlanID
-	slot := pinnedEndpoint(req.Endpoint, req.Worker)
+	slot := pinnedPackage(req.Package, req.Worker)
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	for _, w := range c.workers {
-		if w.exited || w.stopping || w.spec.Placement.Endpoint != slot {
+		if w.exited || w.stopping || w.spec.Placement.Package != slot {
 			continue
 		}
 		if req.InstallID != "" && w.spec.Placement.InstallID != req.InstallID {

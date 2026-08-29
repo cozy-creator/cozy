@@ -646,7 +646,7 @@ func send(ctx context.Context, method, url string, open func() (io.ReadCloser, e
 		WithRemedy("re-run to resume from Tensorhub's durable transfer rows")
 }
 
-// UploadPresigned is the shared storage-edge PUT for endpoint-release role grants.
+// UploadPresigned is the shared storage-edge PUT for package-release role grants.
 // It sends the exact local file under every signed header and reports whether bytes
 // moved. A 412 means another writer won the immutable no-clobber race; Tensorhub still
 // verifies the final bytes during finalize.
@@ -657,7 +657,7 @@ func UploadPresigned(ctx context.Context, subject, path, url, expectedDigest str
 	if err != nil || !info.Mode().IsRegular() || info.Size() != length {
 		return false, exit.Named(exit.Conflict, "upload.local_bytes_changed",
 			"%s is no longer the declared %d-byte regular file", path, length).
-			WithRemedy("restart endpoint publication from one unchanged committed source package")
+			WithRemedy("restart package publication from one unchanged committed source package")
 	}
 	f, err := os.Open(path)
 	if err != nil {
@@ -670,7 +670,7 @@ func UploadPresigned(ctx context.Context, subject, path, url, expectedDigest str
 	if hashErr != nil || observed != expectedDigest {
 		return false, exit.Named(exit.Conflict, "upload.local_bytes_changed",
 			"%s now hashes to %s; its declaration names %s", subject, observed, expectedDigest).
-			WithRemedy("restart endpoint publication from one unchanged committed source package")
+			WithRemedy("restart package publication from one unchanged committed source package")
 	}
 	status, _, body, problem := send(ctx, http.MethodPut, url, opener(path, 0, length), length, headers)
 	if problem != nil {

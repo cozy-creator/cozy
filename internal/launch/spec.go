@@ -16,7 +16,7 @@ const (
 )
 
 // The budgets this LOCAL orchestrator declares for one attempt. They are ORCHESTRATOR
-// policy, not an endpoint fact — the runtime prices the real ladder against the card's
+// policy, not a package fact — the runtime prices the real ladder against the card's
 // measured free bytes and confesses what it did (cr-008a/cr-008b). The same numbers the
 // runtime's own local-orchestrator adapter uses for a bare-venv run, so the two doors
 // price identically.
@@ -33,9 +33,9 @@ const (
 	pinnedBudget = 256 * mib
 )
 
-// Facts is everything one endpoint install needs to be served, gathered once.
+// Facts is everything one package install needs to be served, gathered once.
 type Facts struct {
-	Install    records.EndpointInstall
+	Install    records.PackageInstall
 	Source     string
 	Descriptor *Descriptor
 	RuntimeCLI RuntimeCLI
@@ -43,7 +43,7 @@ type Facts struct {
 
 // Read gathers a generation's facts: where its source is, the surface it proved at
 // install, and the runtime that proved it.
-func Read(gen records.EndpointInstall, cozyHome string, env []string) (*Facts, *exit.Error) {
+func Read(gen records.PackageInstall, cozyHome string, env []string) (*Facts, *exit.Error) {
 	source := SourceDir(gen)
 	d, e := ReadDescriptor(DescriptorPath(gen.Dir), gen.Descriptor)
 	if e != nil {
@@ -57,10 +57,10 @@ func Read(gen records.EndpointInstall, cozyHome string, env []string) (*Facts, *
 	}, nil
 }
 
-// SourceDir is where a generation's endpoint tree lives. An archive install stages it
+// SourceDir is where a generation's package tree lives. An archive install stages it
 // under the generation; a `--dir` install builds a venv against the live tree and records
 // its absolute path (cl-009's editable development door).
-func SourceDir(gen records.EndpointInstall) string {
+func SourceDir(gen records.PackageInstall) string {
 	if gen.ProjectDir != "" {
 		return gen.ProjectDir
 	}
@@ -70,15 +70,15 @@ func SourceDir(gen records.EndpointInstall) string {
 	return filepath.Join(gen.Dir, "source")
 }
 
-// ReleaseID is the endpoint release identity this host serves the generation under. It is
+// ReleaseID is the package release identity this host serves the generation under. It is
 // what the orchestrator pins and what a registering worker must match: an install
-// generation of one endpoint version is one provisioned instance lifetime.
-func ReleaseID(gen records.EndpointInstall) string {
+// generation of one package version is one provisioned instance lifetime.
+func ReleaseID(gen records.PackageInstall) string {
 	version := gen.Version
 	if version == "" {
 		version = gen.ID
 	}
-	return gen.Endpoint + "@" + version
+	return gen.Package + "@" + version
 }
 
 // Placement builds the platform-neutral control facts a worker is asked to host. It says
@@ -87,7 +87,7 @@ func ReleaseID(gen records.EndpointInstall) string {
 // manifest will supply the same result without constructing a target environment here.
 func (f *Facts) Placement() (orchestrator.DesiredPlacement, *exit.Error) {
 	// THE RESOLVED SELECTION, from the one resolver that owns the grammar
-	// (`cozy-runtime bindings`). cl-010 read `endpoint.toml`'s `[bindings]` table here
+	// (`cozy-runtime bindings`). cl-010 read `package.toml`'s `[bindings]` table here
 	// because no runtime verb emitted the resolved record; cr-016 added the verb, and this
 	// host's second reader of that closed grammar is deleted rather than kept in step.
 	resolved, weightlessPlans, e := f.RuntimeCLI.Bindings()
@@ -111,12 +111,12 @@ func (f *Facts) Placement() (orchestrator.DesiredPlacement, *exit.Error) {
 			"runtime reported modeled bindings and weightless plans for one placement")
 	}
 	placement := orchestrator.DesiredPlacement{
-		Endpoint:  f.Install.Endpoint,
+		Package:   f.Install.Package,
 		ReleaseID: ReleaseID(f.Install),
 		InstallID: f.Install.ID,
 		// The descriptor this install derived in the generation's own Runtime. It names
 		// the placement's surface by digest.
-		DescriptorDigest: f.Install.Descriptor,
+		PackageDescriptorDigest: f.Install.Descriptor,
 	}
 	for i := range f.Descriptor.Entrypoints {
 		ep := &f.Descriptor.Entrypoints[i]
@@ -150,7 +150,7 @@ func (f *Facts) Placement() (orchestrator.DesiredPlacement, *exit.Error) {
 		// function is not one; `cozy invoke run` selects its job lifecycle instead.
 		return orchestrator.DesiredPlacement{}, exit.Named(exit.Structural, "no_servable_function",
 			"%s registers no entrypoint, and a worker with no plan to advertise has nothing to serve",
-			f.Install.Endpoint).
+			f.Install.Package).
 			WithRemedy("its functions: %s — an `@app.entrypoint` is what a request dispatches to",
 				strings.Join(f.Descriptor.Names(), ", "))
 	}
@@ -164,7 +164,7 @@ func (f *Facts) Placement() (orchestrator.DesiredPlacement, *exit.Error) {
 
 // Spec adds this host's target-environment materialization to a placement. The
 // interpreter is the GENERATION'S OWN: the venv `uv sync --locked` built from the
-// release's own lock, so the cozy-runtime that serves an endpoint is the one the release
+// release's own lock, so the cozy-runtime that serves a package is the one the release
 // pinned and never this host's. A connected worker never calls this method.
 func (f *Facts) Spec(devices []string) (orchestrator.WorkerLaunchSpec, *exit.Error) {
 	placement, e := f.Placement()
@@ -173,13 +173,13 @@ func (f *Facts) Spec(devices []string) (orchestrator.WorkerLaunchSpec, *exit.Err
 	}
 	args := []string{"serve"}
 	if placement.RuntimeStagesBindings() {
-		args = append(args, "--weightless-endpoint", f.Source)
+		args = append(args, "--weightless-package", f.Source)
 	}
 	return orchestrator.WorkerLaunchSpec{
 		Placement: placement,
 		// THE WORKER ENTRY is the public verb. Creator never imports Runtime internals or
 		// gives the weightless constructor a second source tree: the exact same f.Source
-		// is both the child working directory and --weightless-endpoint.
+		// is both the child working directory and --weightless-package.
 		Python:   Binary(f.Install),
 		Args:     args,
 		Dir:      f.Source,
@@ -200,11 +200,11 @@ func (f *Facts) binding(ep *Entrypoint, table map[string]Binding) (*orchestrator
 	}
 	record := map[string]any{
 		// RESOLUTION, not identity (#506a): `project` is where THIS machine staged the
-		// endpoint tree, and a pod that installed the byte-identical archive staged it
-		// somewhere else. What names the endpoint inside the identity is
-		// `endpoint_release` below — the same string on both machines by construction.
+		// package tree, and a pod that installed the byte-identical archive staged it
+		// somewhere else. What names the package inside the identity is
+		// `package_release` below — the same string on both machines by construction.
 		"project":                   f.Source,
-		"endpoint_release":          ReleaseID(f.Install),
+		"package_release":           ReleaseID(f.Install),
 		"entrypoint":                ep.Name,
 		"model_construction_digest": "",
 	}
@@ -230,7 +230,7 @@ func (f *Facts) binding(ep *Entrypoint, table map[string]Binding) (*orchestrator
 			ep.Name, slot.Path).
 			WithRemedy("it resolves: %s — code states capability, bindings state selection",
 				strings.Join(known, ", ")).
-			WithNext("cozy endpoint list --full")
+			WithNext("cozy package list --full")
 	}
 	// THE RECORD NAMES THE ARTIFACT, IT DOES NOT RESOLVE IT (#567e).
 	//

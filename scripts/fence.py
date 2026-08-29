@@ -40,7 +40,7 @@ Fourteen families:
   tensor    (cl-012) the tensorfs CLI has ONE caller: internal/tfs. The configured binary
             is read there and in the config authority, nowhere else — a second package
             shelling out to `tfs` is a second byte-plane door with its own vocabulary.
-  resources endpoint and model are the product nouns. Generic repo/create/show routes and
+  resources package and model are the product nouns. Generic repo/create/show routes and
             untyped model-transfer verbs are refused, not retained as aliases.
 
 Identifier families scan Go source with comments and string literals removed, so a
@@ -150,7 +150,7 @@ LISTEN_CALL = re.compile(r"net\.Listen\w*\s*\(")
 # health handshake refuses skew before this client moves bytes.
 MEDIA_CONTRACT_HOME = "internal/mediawire/wire.go"
 MEDIA_CONTRACT_FIELDS = ["contract_rev"]
-# Endpoint distribution is the standing ArtifactGrant lane. The invocation media plane
+# Package distribution is the standing ArtifactGrant lane. The invocation media plane
 # may never grow back the retired owner-push special case for binding plans.
 MEDIA_DISTRIBUTION_DIRS = ("internal/media/",)
 DENY_MEDIA_DISTRIBUTION = ("PutPlan", "/v1/plans/")
@@ -166,12 +166,12 @@ CAS_PATH = re.compile(r'objects\s*[/",\s]+\s*sha256', re.I)
 TFS_SITES = {"internal/config/config.go", "internal/tfs/tfs.go"}
 TFS_FIELD = re.compile(r"\.Tfs\b")
 
-# (cl-010) The files that may reach an endpoint's own cozy-runtime, and the CLOSED set
+# (cl-010) The files that may reach a package's own cozy-runtime, and the CLOSED set
 # of verbs they may name. Publication and install derive the descriptor once; artifacts
 # asks for the artifact index, host facts and fit verdicts. Nothing executes a model
 # through these doors — that is what the orchestrator and worker protocol are for.
 RUNTIME_SITES = {"internal/install/install.go", "internal/launch/artifacts.go",
-                 "internal/managedinstall/install.go", "internal/endpointpublish/package.go"}
+                 "internal/managedinstall/install.go", "internal/packagepublish/package.go"}
 RUNTIME_BIN = re.compile(r'"cozy-runtime"')
 # (cl-028) The INDIRECTIONS to the same binary, which the literal above cannot see:
 # `launch.Binary()` resolves the generation venv's cozy-runtime and `launch.RuntimeCLI{}`
@@ -193,7 +193,7 @@ DENY_EMBED = [
     "loadtensor", "weightbytes", "gguf",
 ]
 PY_SCAN = "scripts/*.py"
-# fence.py names the vocabulary in order to deny it. No endpoint implementation is kept
+# fence.py names the vocabulary in order to deny it. No package implementation is kept
 # under scripts/, so it is the only Python source exempt from its own vocabulary scan.
 PY_ALLOW = {
     "scripts/fence.py": "the fence itself: it spells the vocabulary to deny it",
@@ -349,7 +349,7 @@ DOCUMENT_KINDS = {
     "cozy.rental_request/1": "internal/cli/rentals.go",
 }
 # Kinds another repo authors and this one only reads: the owner's fence polices the name.
-FOREIGN_KIND_PREFIXES = ("cozy.worker.v1.", "cozy.endpoint.", "cozy.runtime.", "tensorhub.",
+FOREIGN_KIND_PREFIXES = ("cozy.worker.v1.", "cozy.package.", "cozy.runtime.", "tensorhub.",
                          "tensorfs.", "cozytensors")
 KIND_READERS: dict[str, set[str]] = {}
 KIND_READERS["cozy.local.ManagedBaseReceipt/1"] = {"internal/live/managed_install_test.go"}
@@ -442,7 +442,7 @@ def check_sources():
             if rel.startswith(MEDIA_DISTRIBUTION_DIRS):
                 for retired in DENY_MEDIA_DISTRIBUTION:
                     if retired in s:
-                        bad.append(f"{p}:{i}: [media] retired endpoint-distribution surface "
+                        bad.append(f"{p}:{i}: [media] retired package-distribution surface "
                                    f"'{retired}' — plans are ordinary ArtifactGrant subjects, "
                                    f"and this plane carries invocation inputs/outputs only: {s}")
         if p.suffix != ".go":
@@ -478,7 +478,7 @@ def check_sources():
             if rel in RUNTIME_SITES:
                 for verb in sorted(RUNTIME_VERBS_DENY):
                     if re.search(r'"' + verb + r'"', src_line):
-                        if rel == "internal/endpointpublish/package.go" and verb == "run" and '"uv"' in src_line:
+                        if rel == "internal/packagepublish/package.go" and verb == "run" and '"uv"' in src_line:
                             continue  # uv run selects the locked Runtime; it is not Runtime's run verb
                         bad.append(f"{p}:{i}: [runtime] this file may name only the READ verbs "
                                    f"({', '.join(sorted(RUNTIME_VERBS_OK))}); '{verb}' would be a "
@@ -538,10 +538,10 @@ def check_manifest():
         return ["[grammar] missing internal/cli/grammar.go"]
     source = src_path.read_text()
     required = (
-        "Endpoint EndpointCmd", "Model    ModelCmd", "Invoke   InvokeCmd", "Rental   RentalCmd",
-        "Up       UpCmd", "Down     DownCmd", "Unload   UnloadCmd",
-        "Search  EndpointSearchCmd", "Install EndpointInstallCmd", "Remove  EndpointRemoveCmd",
-        "List    EndpointListCmd", "Publish EndpointPublishCmd",
+        "Package PackageCmd", "Model   ModelCmd", "Invoke  InvokeCmd", "Rental  RentalCmd",
+        "Up      UpCmd", "Down    DownCmd", "Unload  UnloadCmd",
+        "Search  PackageSearchCmd", "Install PackageInstallCmd", "Remove  PackageRemoveCmd",
+        "List    PackageListCmd", "Publish PackagePublishCmd",
         "Search   ModelSearchCmd", "Download ModelDownloadCmd", "Remove   ModelRemoveCmd",
         "List     ModelListCmd", "Publish  ModelPublishCmd",
         "Run    InvokeRunCmd", "Cancel InvokeCancelCmd", "List   InvokeListCmd",
@@ -713,7 +713,7 @@ def check_video_boundary():
 
 
 def check_typed_resources():
-    """The product surface names endpoint and model directly; no generic compatibility door."""
+    """The product surface names package and model directly; no generic compatibility door."""
     bad = []
     product_files = [
         pathlib.Path("internal/cli/grammar.go"),
@@ -732,7 +732,7 @@ def check_typed_resources():
         "cozy push ",
         "cozy pull ",
         "cozy promote ",
-        "cozy endpoints",
+        "cozy packages",
         "cmd.repo.",
         "cmd.push",
         "cmd.pull",
@@ -748,8 +748,8 @@ def check_typed_resources():
 
     manifest = pathlib.Path("internal/cli/grammar.go").read_text()
     required_commands = (
-        "Search  EndpointSearchCmd", "Install EndpointInstallCmd", "Remove  EndpointRemoveCmd",
-        "List    EndpointListCmd", "Publish EndpointPublishCmd",
+        "Search  PackageSearchCmd", "Install PackageInstallCmd", "Remove  PackageRemoveCmd",
+        "List    PackageListCmd", "Publish PackagePublishCmd",
         "Search   ModelSearchCmd", "Download ModelDownloadCmd", "Remove   ModelRemoveCmd",
         "List     ModelListCmd", "Publish  ModelPublishCmd",
     )
@@ -761,15 +761,15 @@ def check_typed_resources():
 
     hub_sources = (pathlib.Path("internal/hub/hub.go").read_text() +
                    pathlib.Path("internal/hub/publish.go").read_text() +
-                   pathlib.Path("internal/hub/endpoint_releases.go").read_text())
-    for route in ('"/v1/endpoints"', '"/v1/models"', '"/v1/models/"', '"/publications"'):
+                   pathlib.Path("internal/hub/package_releases.go").read_text())
+    for route in ('"/v1/packages"', '"/v1/models"', '"/v1/models/"', '"/publications"'):
         if route not in hub_sources:
             bad.append(f"internal/hub: [resources] missing typed route prefix {route}")
-    profile_routes = pathlib.Path("internal/hub/endpoint_releases.go").read_text()
+    profile_routes = pathlib.Path("internal/hub/package_releases.go").read_text()
     if "/local-execution" in profile_routes:
-        bad.append("internal/hub/endpoint_releases.go: [resources] retired local-execution route remains")
+        bad.append("internal/hub/package_releases.go: [resources] retired local-execution route remains")
     if "/local-qualification-materials" not in profile_routes:
-        bad.append("internal/hub/endpoint_releases.go: [resources] local qualification-materials route is absent")
+        bad.append("internal/hub/package_releases.go: [resources] local qualification-materials route is absent")
 
     managed = pathlib.Path("internal/managedinstall/install.go").read_text()
     for retired in ('"base_path"', '"index_url"', '"build_command"', 'exec.Command("uv"',
@@ -808,5 +808,5 @@ print(
     f"embed({len(DENY_EMBED)} words, scripts allow@{len(PY_ALLOW)}) "
     f"contract({len(parse_go_routes(pathlib.Path('internal/api/routes.go')))} routes) "
     f"web(stub+bounded-upload+no-log) retired-planes(absent) "
-    f"resources(typed endpoint/model, no aliases) test(internal/live only)"
+    f"resources(typed package/model, no aliases) test(internal/live only)"
 )

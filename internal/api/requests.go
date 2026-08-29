@@ -25,11 +25,11 @@ import (
 // status, and explicit cancellation. Creator implements this surface today; other hosts
 // require their own implementation and conformance proof.
 
-// Submission is the request body. `input` is the endpoint's own typed payload and is
+// Submission is the request body. `input` is the package's own typed payload and is
 // carried VERBATIM: the orchestrator digests exactly the bytes the client sent, so a
 // re-submit under one key compares the same request identity.
 type Submission struct {
-	Endpoint string          `json:"endpoint"`
+	Package  string          `json:"package"`
 	Function string          `json:"function"`
 	Input    json.RawMessage `json:"input"`
 	Outputs  []string        `json:"outputs,omitempty"`
@@ -90,10 +90,10 @@ func (s *Server) submit(w http.ResponseWriter, r *http.Request) {
 			"the submission is not a JSON object: "+err.Error(), "")
 		return
 	}
-	if sub.Endpoint == "" || sub.Function == "" {
+	if sub.Package == "" || sub.Function == "" {
 		s.refuse(w, r, http.StatusBadRequest, "invalid_request",
-			"a submission names an endpoint and a function",
-			`{"endpoint":"org/name","function":"denoise","input":{…}}`)
+			"a submission names a package and a function",
+			`{"package":"org/name","function":"denoise","input":{…}}`)
 		return
 	}
 	if len(sub.LocalAssets) > 0 && !s.cliAuthenticated(r) {
@@ -191,7 +191,7 @@ func replaySubmission(sub Submission, recorded records.Request) orchestrator.Sub
 		payload = []byte("{}")
 	}
 	return orchestrator.Submission{
-		Endpoint: sub.Endpoint, Entrypoint: sub.Function, Payload: payload,
+		Package: sub.Package, Entrypoint: sub.Function, Payload: payload,
 		Outputs: outputs, PlanID: planID, Worker: sub.Worker, Assets: assets,
 	}
 }
@@ -202,7 +202,7 @@ func replaySubmission(sub Submission, recorded records.Request) orchestrator.Sub
 func submissionDigest(spec orchestrator.Submission) (string, *exit.Error) {
 	doc := map[string]canonical.Value{
 		"format":   "cozy.client.Submission/1",
-		"endpoint": spec.Endpoint,
+		"package":  spec.Package,
 		"function": spec.Entrypoint,
 		"plan_id":  spec.PlanID,
 		"input":    base64.StdEncoding.EncodeToString(spec.Payload),
@@ -271,13 +271,13 @@ func contractStatus(state string) string {
 	return state
 }
 
-// resolvePlan turns the client's endpoint/function into the orchestrator's Submission.
+// resolvePlan turns the client's package/function into the orchestrator's Submission.
 // The plan id is resolved through the LOCAL resolver — the same object `start` uses — so
 // a client never names a plan digest and a submission can never bind a binding this host
 // did not install.
 func (s *Server) resolvePlan(sub Submission) (orchestrator.Submission, *exit.Error) {
 	out := orchestrator.Submission{
-		Endpoint: sub.Endpoint, Entrypoint: sub.Function, Payload: []byte(sub.Input),
+		Package: sub.Package, Entrypoint: sub.Function, Payload: []byte(sub.Input),
 		Outputs: sub.Outputs, PlanID: sub.PlanID, Worker: sub.Worker, Assets: sub.LocalAssets,
 	}
 	if len(out.Payload) == 0 {
@@ -296,10 +296,10 @@ func (s *Server) resolvePlan(sub Submission) (orchestrator.Submission, *exit.Err
 		if e != nil {
 			return out, e
 		}
-		if remotePlacement.Endpoint != sub.Endpoint {
-			return out, exit.Named(exit.Conflict, "rental.endpoint_mismatch",
+		if remotePlacement.Package != sub.Package {
+			return out, exit.Named(exit.Conflict, "rental.package_mismatch",
 				"rental %s carries exact control for %s, not %s", out.Worker,
-				remotePlacement.Endpoint, sub.Endpoint)
+				remotePlacement.Package, sub.Package)
 		}
 	}
 	if remotePlacement != nil {
@@ -330,11 +330,11 @@ func (s *Server) resolvePlan(sub Submission) (orchestrator.Submission, *exit.Err
 		}
 	} else {
 		var placement orchestrator.DesiredPlacement
-		if s.endpoints == nil {
-			return out, exit.Unavailablef("this local controller resolves no endpoints")
+		if s.packages == nil {
+			return out, exit.Unavailablef("this local controller resolves no packages")
 		}
 		var e *exit.Error
-		placement, e = s.endpoints.ResolvePlacement(sub.Endpoint)
+		placement, e = s.packages.ResolvePlacement(sub.Package)
 		if e != nil {
 			return out, e
 		}
@@ -345,14 +345,14 @@ func (s *Server) resolvePlan(sub Submission) (orchestrator.Submission, *exit.Err
 		if out.PlanID != "" && out.PlanID != planID {
 			return out, exit.Named(exit.Conflict, "plan_mismatch",
 				"%s/%s resolves plan %s, not caller-supplied %s",
-				sub.Endpoint, sub.Function, planID, out.PlanID)
+				sub.Package, sub.Function, planID, out.PlanID)
 		}
 		out.PlanID = planID
 		out.InstallID = placement.InstallID
 		if len(out.Outputs) == 0 {
 			out.Outputs = outputs
 		}
-		entrypoint, e := s.endpoints.Entrypoint(placement.InstallID, sub.Function)
+		entrypoint, e := s.packages.Entrypoint(placement.InstallID, sub.Function)
 		if e != nil {
 			return out, e
 		}
@@ -398,8 +398,8 @@ func placementPlan(placement orchestrator.DesiredPlacement, function string) (st
 		}
 		return id, append([]string(nil), binding.Outputs...), nil
 	}
-	return "", nil, exit.New(exit.NotFound, "%s has no function %q", placement.Endpoint, function).
-		WithRemedy("GET /v1/local/endpoints lists the functions this target serves")
+	return "", nil, exit.New(exit.NotFound, "%s has no function %q", placement.Package, function).
+		WithRemedy("GET /v1/local/packages lists the functions this target serves")
 }
 
 func (s *Server) stageAssets(assets []records.AssetBinding) ([]records.AssetBinding, *exit.Error) {
@@ -444,7 +444,7 @@ type Lifecycle struct {
 	Kind        string         `json:"kind"`
 	RequestID   string         `json:"request_id"`
 	Status      string         `json:"status"`
-	Endpoint    string         `json:"endpoint"`
+	Package     string         `json:"package"`
 	Function    string         `json:"function"`
 	Attempt     uint64         `json:"attempt"`
 	Attempts    int            `json:"attempts"`
@@ -501,7 +501,7 @@ func (s *Server) lifecycleOf(row records.Request) Lifecycle {
 		kind = "job"
 	}
 	life := Lifecycle{
-		Kind: kind, RequestID: row.ID, Status: contractStatus(row.State), Endpoint: row.Endpoint,
+		Kind: kind, RequestID: row.ID, Status: contractStatus(row.State), Package: row.Package,
 		Function: row.Entrypoint, Attempt: uint64(row.Ordinal),
 		ResponseURL: "/v1/requests/" + row.ID, CreatedAt: row.CreatedAt,
 		Outputs: []MediaRef{},

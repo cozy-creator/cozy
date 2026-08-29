@@ -117,7 +117,7 @@ func TestRentTimeoutInterruptsTricklingHubResponses(t *testing.T) {
 			root := filepath.Join(t.TempDir(), "cozy-home")
 			ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 			defer cancel()
-			args := []string{"-n", "19", cozyBin, "rental", "new", "cozy/endpoint/v1/generate",
+			args := []string{"-n", "19", cozyBin, "rental", "new", "cozy/package/v1/generate",
 				"--accelerator", "NVIDIA H200", "--reason", "liveness proof",
 				"--timeout", "300ms", "--idempotency-key", "rent-timeout-" + phase}
 			cmd := exec.CommandContext(ctx, "/usr/bin/nice", args...)

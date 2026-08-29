@@ -1,6 +1,6 @@
 // Package wheel is the Cozy deterministic wheel packer (th-039, tensorhub-build.md §0).
 //
-// It is the ONE way an endpoint project becomes an importable unit. It is FIXED
+// It is the ONE way a package project becomes an importable unit. It is FIXED
 // first-party code: it does not consult the repo's `[build-system]`, does not import the
 // project, and fires no PEP 517 hook. It copies the canonical path-sorted source tree,
 // synthesizes METADATA/WHEEL/RECORD from declared metadata under fixed field order, fixed
@@ -10,11 +10,11 @@
 //
 //	tensorhub env-lane build, §1 stage 2e  ─┐
 //	                                        ├─▶ wheel.Pack ─▶ project_wheel_digest
-//	`cozy endpoint publish` / local install ─┘
+//	`cozy package publish` / local install ─┘
 //
 // Inputs: the canonical tree's path (a directory of regular files), plus the
 // distribution identity — from `[project]` when the tree declares it, otherwise from the
-// caller, because an endpoint's identity is its RELEASE, not a line in its tree.
+// caller, because a package's identity is its RELEASE, not a line in its tree.
 // Outputs: the wheel file, its `project_wheel_digest`, and the `tree_digest` it was
 // computed from. Refusals are typed and named; each one names the door it closed.
 //
@@ -108,7 +108,7 @@ type Result struct {
 
 // Pack turns a canonical source tree into one wheel. Refusal order is fixed and part of
 // the contract: declared metadata, then the build-system door, then the tree itself, then
-// identity, then the endpoint's own application contract. A tree that trips several arms
+// identity, then the package's own application contract. A tree that trips several arms
 // always reports the same one.
 func Pack(req Request) (*Result, *exit.Error) {
 	root, err := filepath.Abs(req.Tree)

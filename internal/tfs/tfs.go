@@ -57,7 +57,7 @@ func Open(cfg config.Config, layout home.Layout) (*Tool, *exit.Error) {
 		return nil, exit.Named(exit.Structural, "tfs_missing",
 			"the tensorfs CLI %q is not on PATH: %s", cfg.Tfs, err).
 			WithRemedy("build it from the tensorfs repo (cargo build --release -p tensorfs-core --bin tfs) and set COZY_TFS to the binary").
-			WithNext("COZY_TFS=/path/to/tfs cozy endpoint search")
+			WithNext("COZY_TFS=/path/to/tfs cozy package search")
 	}
 	t := &Tool{Bin: bin, Root: layout.CAS, Source: cfg.TfsSource, env: cfg.Tool()}
 	if err := os.MkdirAll(t.Root, 0o755); err != nil {

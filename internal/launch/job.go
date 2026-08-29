@@ -50,7 +50,7 @@ type JobFacts struct {
 // which is what puts the DesiredWorkerState's `mode` oneof on the job branch — a worker is
 // in exactly ONE mode until the next revision.
 //
-// ONE WORKER PER (endpoint, install, job function), and it is RECLAIMED at its outcome
+// ONE WORKER PER (package, install, job function), and it is RECLAIMED at its outcome
 // like every other job worker: one immutable build, one bounded attempt, outcome, reclaim
 // (worker-protocol, cr-009). Deep queueing is the ORCHESTRATOR's — the dispatch queue holds
 // the work and select-or-start makes the next worker resident — and it does not require
@@ -63,10 +63,10 @@ func (f *Facts) JobSpec(function string, devices []string) (orchestrator.WorkerL
 	}
 	spec := orchestrator.WorkerLaunchSpec{
 		Placement: orchestrator.DesiredPlacement{
-			Endpoint:         f.Install.Endpoint,
-			ReleaseID:        ReleaseID(f.Install),
-			InstallID:        f.Install.ID,
-			DescriptorDigest: f.Install.Descriptor,
+			Package:                 f.Install.Package,
+			ReleaseID:               ReleaseID(f.Install),
+			InstallID:               f.Install.ID,
+			PackageDescriptorDigest: f.Install.Descriptor,
 			Jobs: []*orchestrator.JobPlan{{
 				Function:        facts.Name,
 				DescriptorID:    facts.DescriptorID,
@@ -115,9 +115,9 @@ func (f *Facts) Job(function string) (*JobFacts, *exit.Error) {
 	}
 	if declared == nil {
 		return nil, exit.Named(exit.NotFound, "unknown_job",
-			"%s registers no job named %q", f.Install.Endpoint, function).
+			"%s registers no job named %q", f.Install.Package, function).
 			WithRemedy("it registers: %s", strings.Join(f.Descriptor.Names(), ", ")).
-			WithNext("cozy endpoint list --full")
+			WithNext("cozy package list --full")
 	}
 	var said struct {
 		DescriptorID string `json:"job_descriptor_id"`

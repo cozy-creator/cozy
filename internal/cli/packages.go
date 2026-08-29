@@ -7,13 +7,13 @@ import (
 	"time"
 
 	"github.com/cozy-creator/cozy-creator/internal/config"
-	"github.com/cozy-creator/cozy-creator/internal/endpointprofile"
 	"github.com/cozy-creator/cozy-creator/internal/exit"
 	"github.com/cozy-creator/cozy-creator/internal/home"
 	"github.com/cozy-creator/cozy-creator/internal/hub"
 	"github.com/cozy-creator/cozy-creator/internal/install"
 	"github.com/cozy-creator/cozy-creator/internal/managedinstall"
 	"github.com/cozy-creator/cozy-creator/internal/output"
+	"github.com/cozy-creator/cozy-creator/internal/packageprofile"
 	"github.com/cozy-creator/cozy-creator/internal/records"
 )
 
@@ -68,7 +68,7 @@ func handleInstall(ctx *Context) *exit.Error {
 	}
 	g := res.Gen
 	fields := []output.Field{
-		{K: "endpoint", V: g.Endpoint}, {K: "major", V: g.Major},
+		{K: "package", V: g.Package}, {K: "major", V: g.Major},
 		{K: "version", V: g.Version}, {K: "status", V: "installed"},
 		{K: "disk", V: diskText(g)}, {K: "changed", V: !res.Idempotent},
 		{K: "generation", V: g.ID}, {K: "source", V: g.SourceKind + " " + g.SourceRef},
@@ -80,7 +80,7 @@ func handleInstall(ctx *Context) *exit.Error {
 		{K: "descriptor", V: g.Descriptor},
 	}
 	if res.Idempotent {
-		return emit(ctx, compactRecord(fields, "endpoint", "major", "version", "status", "changed"))
+		return emit(ctx, compactRecord(fields, "package", "major", "version", "status", "changed"))
 	}
 	fields = append(fields,
 		output.Field{K: "staged", V: fmt.Sprintf("%d files, %s expanded, %s compressed", res.Files, output.Bytes(res.Bytes), output.Bytes(res.Compressed))},
@@ -95,9 +95,9 @@ func handleInstall(ctx *Context) *exit.Error {
 			output.Field{K: "superseded", V: res.Superseded},
 			output.Field{K: "reclaimed", V: output.Bytes(reclaimed)})
 	}
-	rec := compactRecord(fields, "endpoint", "major", "version", "status", "disk", "changed")
+	rec := compactRecord(fields, "package", "major", "version", "status", "disk", "changed")
 	rec.Notes = append(rec.Notes, res.Warnings...)
-	rec.Next = []string{"cozy endpoint list"}
+	rec.Next = []string{"cozy package list"}
 	return emit(ctx, rec)
 }
 
@@ -107,11 +107,11 @@ func handleManagedInstall(ctx *Context, profile string) *exit.Error {
 		return exit.Usagef("published --profile install cannot be combined with --from, --digest, --allow-unsigned, or editable --dir").
 			WithRemedy("a qualified release uses exact Tensorhub documents and prebuilt wheels; development source uses the separate --from/--dir lane")
 	}
-	ref, release, e := endpointReleaseRef(ctx.Inv.Args[0])
+	ref, release, e := packageReleaseRef(ctx.Inv.Args[0])
 	if e != nil {
 		return e
 	}
-	profiles, e := endpointprofile.NormalizeSet([]string{profile})
+	profiles, e := packageprofile.NormalizeSet([]string{profile})
 	if e != nil {
 		return e
 	}
@@ -152,12 +152,12 @@ func handleManagedInstall(ctx *Context, profile string) *exit.Error {
 	c := client(ctx)
 	hctx, cancel := hub.LongContext()
 	defer cancel()
-	grant, e := c.EndpointLocalQualificationMaterials(hctx, ref, release, profiles[0], int64(ttl/time.Second), reason)
+	grant, e := c.PackageLocalQualificationMaterials(hctx, ref, release, profiles[0], int64(ttl/time.Second), reason)
 	if e != nil {
 		return e
 	}
 	installed, e := managedinstall.Run(hctx, l, st, managedinstall.Request{
-		Endpoint: ref.String(), Release: release, Major: major, Profile: profiles[0],
+		Package: ref.String(), Release: release, Major: major, Profile: profiles[0],
 		Force: ctx.Inv.Bool("--force"), DeviceIndex: &device, Grant: grant, Config: ctx.Cfg,
 	})
 	if e != nil {
@@ -165,7 +165,7 @@ func handleManagedInstall(ctx *Context, profile string) *exit.Error {
 	}
 	g, facts := installed.Install, installed.Facts
 	fields := []output.Field{
-		{K: "endpoint", V: g.Endpoint}, {K: "major", V: g.Major}, {K: "release", V: g.Version},
+		{K: "package", V: g.Package}, {K: "major", V: g.Major}, {K: "release", V: g.Version},
 		{K: "status", V: "installed"}, {K: "changed", V: !installed.Idempotent},
 		{K: "profile", V: facts.Profile}, {K: "candidate", V: facts.CandidateID},
 		{K: "generation", V: g.ID}, {K: "base_realization", V: facts.BaseRealizationDigest},
@@ -187,7 +187,7 @@ func handleManagedInstall(ctx *Context, profile string) *exit.Error {
 			output.Field{K: "superseded", V: installed.Superseded},
 			output.Field{K: "reclaimed", V: output.Bytes(reclaimed)})
 	}
-	return emit(ctx, compactRecord(fields, "endpoint", "major", "release", "profile", "status", "disk", "changed"))
+	return emit(ctx, compactRecord(fields, "package", "major", "release", "profile", "status", "disk", "changed"))
 }
 
 func handleLs(ctx *Context) *exit.Error {
@@ -201,13 +201,13 @@ func handleLs(ctx *Context) *exit.Error {
 		return e
 	}
 	l := output.List{
-		Name:      "endpoints",
-		Fields:    []string{"endpoint", "major", "version", "disk"},
-		AllFields: []string{"endpoint", "major", "version", "disk", "generation", "source", "verified", "installed", "exclusive", "shared"},
+		Name:      "packages",
+		Fields:    []string{"package", "major", "version", "disk"},
+		AllFields: []string{"package", "major", "version", "disk", "generation", "source", "verified", "installed", "exclusive", "shared"},
 	}
 	for _, g := range rows {
 		l.Rows = append(l.Rows, map[string]string{
-			"endpoint":   g.Endpoint,
+			"package":    g.Package,
 			"major":      fmt.Sprintf("v%d", g.Major),
 			"version":    g.Version,
 			"generation": g.ID,
@@ -227,7 +227,7 @@ func handleLs(ctx *Context) *exit.Error {
 		})
 	}
 	if len(l.Rows) == 0 {
-		l.Next = []string{"cozy endpoint search"}
+		l.Next = []string{"cozy package search"}
 		return emit(ctx, l)
 	}
 	return emit(ctx, l)
@@ -253,9 +253,9 @@ func handleRm(ctx *Context) *exit.Error {
 			if problem != nil {
 				return problem
 			}
-			if ref.Endpoint == worker.Endpoint {
-				return exit.New(exit.Conflict, "%s is still resident in local worker %s", ref.Endpoint, worker.InstanceID).
-					WithRemedy("run `cozy unload`, then remove the endpoint").
+			if ref.Package == worker.Package {
+				return exit.New(exit.Conflict, "%s is still resident in local worker %s", ref.Package, worker.InstanceID).
+					WithRemedy("run `cozy unload`, then remove the package").
 					WithNext("cozy unload")
 			}
 		}
@@ -270,18 +270,18 @@ func handleRm(ctx *Context) *exit.Error {
 			if problem != nil {
 				return problem
 			}
-			if request.Worker == "" && ref.Endpoint == request.Endpoint {
-				return exit.New(exit.Conflict, "%s still has active invocation %s", ref.Endpoint, request.ID).
-					WithRemedy("cancel the invocation before removing its endpoint").
+			if request.Worker == "" && ref.Package == request.Package {
+				return exit.New(exit.Conflict, "%s still has active invocation %s", ref.Package, request.ID).
+					WithRemedy("cancel the invocation before removing its package").
 					WithNext("cozy invoke cancel " + request.ID)
 			}
 		}
 	}
 
 	removed := output.List{
-		Name:      "endpoints",
-		Fields:    []string{"endpoint", "major", "reclaimed"},
-		AllFields: []string{"endpoint", "major", "reclaimed", "generation"},
+		Name:      "packages",
+		Fields:    []string{"package", "major", "reclaimed"},
+		AllFields: []string{"package", "major", "reclaimed", "generation"},
 	}
 	var freed int64
 	for _, arg := range ctx.Inv.Args {
@@ -289,7 +289,7 @@ func handleRm(ctx *Context) *exit.Error {
 		if e != nil {
 			return e
 		}
-		targets, e := st.Pins(ref.Endpoint)
+		targets, e := st.Pins(ref.Package)
 		if e != nil {
 			return e
 		}
@@ -297,20 +297,20 @@ func handleRm(ctx *Context) *exit.Error {
 			if ref.HasMajor && p.Major != ref.Major {
 				continue
 			}
-			n, e := install.Remove(st, p.Endpoint, p.Major)
+			n, e := install.Remove(st, p.Package, p.Major)
 			if e != nil {
 				return e
 			}
 			freed += n
 			removed.Rows = append(removed.Rows, map[string]string{
-				"endpoint":   p.Endpoint,
+				"package":    p.Package,
 				"major":      fmt.Sprintf("v%d", p.Major),
 				"generation": p.InstallID,
 				"reclaimed":  output.Bytes(n),
 			})
 		}
 	}
-	// Removing an endpoint also clears superseded generations for the same selected
+	// Removing a package also clears superseded generations for the same selected
 	// major. Active requests/workers were fenced above and the database claim rechecks.
 	unreferenced, e := st.Unreferenced()
 	if e != nil {
@@ -323,7 +323,7 @@ func handleRm(ctx *Context) *exit.Error {
 			if problem != nil {
 				return problem
 			}
-			selected = ref.Endpoint == generation.Endpoint && (!ref.HasMajor || ref.Major == generation.Major)
+			selected = ref.Package == generation.Package && (!ref.HasMajor || ref.Major == generation.Major)
 			if selected {
 				break
 			}
@@ -345,12 +345,12 @@ func handleRm(ctx *Context) *exit.Error {
 		{K: "changed", V: true},
 		{K: "reclaimed", V: output.Bytes(freed)},
 	}
-	removed.Notes = []string{"exclusive endpoint bytes were removed; shared TensorFS model bytes were untouched"}
-	removed.Next = []string{"cozy endpoint list"}
+	removed.Notes = []string{"exclusive package bytes were removed; shared TensorFS model bytes were untouched"}
+	removed.Next = []string{"cozy package list"}
 	return emit(ctx, removed)
 }
 
-func diskText(g records.EndpointInstall) string {
+func diskText(g records.PackageInstall) string {
 	if g.BytesShared == 0 {
 		return output.Bytes(g.BytesExcl)
 	}

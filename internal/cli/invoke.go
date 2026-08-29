@@ -102,7 +102,7 @@ func invocationIsJob(ctx *Context) (bool, *exit.Error) {
 			return false, problem
 		}
 	} else {
-		facts, problem := generationFacts(ctx, target.Endpoint, target.Major)
+		facts, problem := generationFacts(ctx, target.Package, target.Major)
 		if problem != nil {
 			return false, problem
 		}
@@ -166,7 +166,7 @@ func handleRun(ctx *Context) *exit.Error {
 	}
 	began := time.Now()
 	handle, e := c.Submit(api.Submission{
-		Endpoint: target.Endpoint, Function: target.Function, Input: input,
+		Package: target.Package, Function: target.Function, Input: input,
 		Worker: worker, LocalAssets: assets,
 	}, key)
 	if e != nil {
@@ -176,7 +176,7 @@ func handleRun(ctx *Context) *exit.Error {
 	if ctx.Inv.Bool("--detach") {
 		fields := []output.Field{
 			{K: "id", V: handle.RequestID}, {K: "kind", V: "invocation"},
-			{K: "target", V: target.Endpoint + "/" + target.Function},
+			{K: "target", V: target.Package + "/" + target.Function},
 			{K: "status", V: handle.Status}, {K: "attempt", V: handle.Attempt},
 			{K: "changed", V: !handle.Replay},
 		}
@@ -257,14 +257,14 @@ func handleInvokeList(ctx *Context) *exit.Error {
 	if problem != nil {
 		return problem
 	}
-	endpoint := strings.TrimSpace(ctx.Inv.Value("--endpoint"))
+	pkg := strings.TrimSpace(ctx.Inv.Value("--package"))
 	list := output.List{
 		Name: "invocations", Fields: []string{"id", "kind", "target", "status"},
 		AllFields: []string{"id", "kind", "target", "status", "attempts", "created"},
 	}
 	states := map[string]int{}
 	for _, life := range rows {
-		if endpoint != "" && life.Endpoint != endpoint {
+		if pkg != "" && life.Package != pkg {
 			continue
 		}
 		kind := life.Kind
@@ -273,7 +273,7 @@ func handleInvokeList(ctx *Context) *exit.Error {
 		}
 		list.Rows = append(list.Rows, map[string]string{
 			"id": life.RequestID, "kind": kind,
-			"target": life.Endpoint + "/" + life.Function, "status": life.Status,
+			"target": life.Package + "/" + life.Function, "status": life.Status,
 			"attempts": strconv.Itoa(life.Attempts), "created": life.CreatedAt,
 		})
 		states[life.Status]++
@@ -296,7 +296,7 @@ func invocationFields(life api.Lifecycle) []output.Field {
 	}
 	return []output.Field{
 		{K: "id", V: life.RequestID}, {K: "kind", V: kind},
-		{K: "target", V: life.Endpoint + "/" + life.Function},
+		{K: "target", V: life.Package + "/" + life.Function},
 		{K: "status", V: life.Status}, {K: "attempts", V: life.Attempts},
 	}
 }
@@ -689,8 +689,8 @@ func renderRun(ctx *Context, life api.Lifecycle, terminal *localapi.Event, stopp
 	}
 	fields := []output.Field{
 		{K: "id", V: life.RequestID},
-		{K: "target", V: life.Endpoint + "/" + life.Function},
-		{K: "endpoint", V: life.Endpoint},
+		{K: "target", V: life.Package + "/" + life.Function},
+		{K: "package", V: life.Package},
 		{K: "function", V: life.Function},
 		{K: "status", V: life.Status},
 		{K: "attempts", V: life.Attempts},
@@ -795,23 +795,23 @@ func mintKey() string {
 
 // ------------------------------------------------------------------- target parsing
 
-// Target is one invocation subject: `org/endpoint/vN/function`.
+// Target is one invocation subject: `org/package/vN/function`.
 type Target struct {
-	Endpoint string
+	Package  string
 	Major    int
 	Function string
-	Ref      string // the endpoint ref as the resolver takes it: `org/endpoint@vN`
+	Ref      string // the package ref as the resolver takes it: `org/package@vN`
 }
 
-// parseTarget reads `org/endpoint/vN/function`. The semver-major is a REQUIRED path
-// segment: it is resolved through that (endpoint, major)'s serving pointer,
+// parseTarget reads `org/package/vN/function`. The semver-major is a REQUIRED path
+// segment: it is resolved through that (package, major)'s serving pointer,
 // which locally is the install pin, and a majorless target is a usage refusal rather
 // than a default.
 func parseTarget(raw string) (Target, *exit.Error) {
 	parts := strings.Split(strings.TrimSpace(raw), "/")
-	usage := exit.Usagef("%q is not org/endpoint/vN/function", raw).
-		WithRemedy("the semver-major is a required path segment — it resolves through that endpoint's serving pointer").
-		WithNext("cozy endpoint list", "cozy help run")
+	usage := exit.Usagef("%q is not org/package/vN/function", raw).
+		WithRemedy("the semver-major is a required path segment — it resolves through that package's serving pointer").
+		WithNext("cozy package list", "cozy help run")
 	if len(parts) != 4 {
 		return Target{}, usage
 	}
@@ -819,10 +819,10 @@ func parseTarget(raw string) (Target, *exit.Error) {
 	if !ok || parts[0] == "" || parts[1] == "" || parts[3] == "" {
 		return Target{}, usage
 	}
-	endpoint := parts[0] + "/" + parts[1]
+	pkg := parts[0] + "/" + parts[1]
 	return Target{
-		Endpoint: endpoint, Major: major, Function: parts[3],
-		Ref: endpoint + "@" + parts[2],
+		Package: pkg, Major: major, Function: parts[3],
+		Ref: pkg + "@" + parts[2],
 	}, nil
 }
 
@@ -845,7 +845,7 @@ func majorOf(segment string) (int, bool) {
 // LOCAL read of a fact the release's own runtime already proved, which is why it costs no
 // subprocess and no round trip.
 func entrypointOf(ctx *Context, t Target) (*launch.Entrypoint, *exit.Error) {
-	facts, e := generationFacts(ctx, t.Endpoint, t.Major)
+	facts, e := generationFacts(ctx, t.Package, t.Major)
 	if e != nil {
 		return nil, e
 	}
@@ -869,8 +869,8 @@ func remoteEntrypointOf(ctx *Context, worker, function string) (*launch.Entrypoi
 	return descriptor.Function(function)
 }
 
-// generationFacts resolves an endpoint ref to its pinned generation's facts.
-func generationFacts(ctx *Context, endpoint string, major int) (*launch.Facts, *exit.Error) {
+// generationFacts resolves a package ref to its pinned generation's facts.
+func generationFacts(ctx *Context, pkg string, major int) (*launch.Facts, *exit.Error) {
 	l, e := home.Open(ctx.Cfg.Home)
 	if e != nil {
 		return nil, e
@@ -880,14 +880,14 @@ func generationFacts(ctx *Context, endpoint string, major int) (*launch.Facts, *
 		return nil, e
 	}
 	defer store.Close()
-	pins, e := store.Pins(endpoint)
+	pins, e := store.Pins(pkg)
 	if e != nil {
 		return nil, e
 	}
 	if len(pins) == 0 {
-		return nil, exit.New(exit.NotFound, "%s is not installed on this host", endpoint).
-			WithRemedy("`cozy endpoint list` lists what is").
-			WithNext("cozy endpoint install "+endpoint, "cozy endpoint list")
+		return nil, exit.New(exit.NotFound, "%s is not installed on this host", pkg).
+			WithRemedy("`cozy package list` lists what is").
+			WithNext("cozy package install "+pkg, "cozy package list")
 	}
 	chosen, found := pins[0], major == 0
 	for _, p := range pins {
@@ -896,9 +896,9 @@ func generationFacts(ctx *Context, endpoint string, major int) (*launch.Facts, *
 		}
 	}
 	if !found {
-		return nil, exit.New(exit.NotFound, "%s is installed, but not at v%d", endpoint, major).
+		return nil, exit.New(exit.NotFound, "%s is installed, but not at v%d", pkg, major).
 			WithRemedy("installed majors: %s", majorsOf(pins)).
-			WithNext("cozy endpoint list")
+			WithNext("cozy package list")
 	}
 	gen, e := store.Install(chosen.InstallID)
 	if e != nil {
@@ -906,7 +906,7 @@ func generationFacts(ctx *Context, endpoint string, major int) (*launch.Facts, *
 	}
 	if gen == nil {
 		return nil, exit.Internalf("%s is pinned to generation %s and that row is gone",
-			endpoint, chosen.InstallID)
+			pkg, chosen.InstallID)
 	}
 	return launch.Read(*gen, ctx.Cfg.Home, ctx.Cfg.Tool())
 }

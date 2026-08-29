@@ -14,7 +14,7 @@ import (
 	"github.com/cozy-creator/cozy-creator/internal/exit"
 )
 
-// MaxTreeBytes caps what one endpoint project may become. An endpoint's wheel is CODE and
+// MaxTreeBytes caps what one package project may become. A package's wheel is CODE and
 // small config: weights, datasets and checkpoints reach a pod through the CAS plane, never
 // through the importable unit.
 const MaxTreeBytes = 256 << 20
@@ -46,7 +46,7 @@ var compiledExt = map[string]bool{
 	".rs": true, ".f90": true, ".cu": true,
 }
 
-// buildInput is source for a toolchain, not importable endpoint code. The project
+// buildInput is source for a toolchain, not importable package code. The project
 // wheel is always py3-none-any; a native dependency belongs in a separately built,
 // exact custom wheel and is never smuggled into the project payload as a recipe.
 var buildInput = map[string]bool{
@@ -123,11 +123,11 @@ func walk(root string) ([]entry, *exit.Error) {
 		}
 		seen[strings.ToLower(rel)] = rel
 		base := strings.ToLower(path.Base(rel))
-		if base == "endpoint.descriptor.json" || base == "endpoint.release.json" ||
-			base == "endpoint.evaluated-config.json" {
-			return exit.Named(exit.Validation, "endpoint_metadata_retired",
+		if base == "package.descriptor.json" || base == "package.release.json" ||
+			base == "package.evaluated-config.json" {
+			return exit.Named(exit.Validation, "package_metadata_retired",
 				"%s is retired generated/publication metadata", rel).
-				WithRemedy("delete it; endpoint.toml is the only author configuration")
+				WithRemedy("delete it; package.toml is the only author configuration")
 		}
 
 		if ext := strings.ToLower(path.Ext(rel)); compiledExt[ext] {
@@ -136,7 +136,7 @@ func walk(root string) ([]entry, *exit.Error) {
 		if strings.EqualFold(path.Ext(rel), ".whl") {
 			return exit.Named(exit.Validation, "project_wheel_nested_wheel",
 				"%s is a wheel nested inside the project wheel", rel).
-				WithRemedy("remove it; endpoint publication accepts dependencies only through pyproject.toml and uv.lock")
+				WithRemedy("remove it; package publication accepts dependencies only through pyproject.toml and uv.lock")
 		}
 		if buildInputName(rel) {
 			return refuseBuildInput(rel)
@@ -175,7 +175,7 @@ func walk(root string) ([]entry, *exit.Error) {
 func refuseCompiled(rel string) *exit.Error {
 	return exit.Named(exit.Validation, "project_wheel_native_file",
 		"%s is native source or a native binary; the project wheel is %s", rel, Tag).
-		WithRemedy("remove it; native endpoint dependencies are deferred until a concrete need justifies an admission lane")
+		WithRemedy("remove it; native package dependencies are deferred until a concrete need justifies an admission lane")
 }
 
 func buildInputName(rel string) bool {
@@ -186,7 +186,7 @@ func buildInputName(rel string) bool {
 
 func refuseBuildInput(rel string) *exit.Error {
 	return exit.Named(exit.Validation, "project_wheel_build_input",
-		"%s is a native/package build input; endpoint publication runs no build request", rel).
+		"%s is a native/package build input; package publication runs no build request", rel).
 		WithRemedy("keep the project wheel pure and declare ordinary dependencies in pyproject.toml; source builds are not admitted")
 }
 
@@ -240,12 +240,12 @@ func checkBackend(d declaration) *exit.Error {
 	return exit.Named(exit.Validation, "project_wheel_build_input",
 		"%s declares `[build-system] build-backend = %q`; the Cozy packer implements no backend and fires no PEP 517 hook",
 		pyprojectName, d.backend).
-		WithRemedy("remove `[build-system]`: a pure-python endpoint is packed from its declared tree, " +
+		WithRemedy("remove `[build-system]`: a pure-python package is packed from its declared tree, " +
 			"and dependencies are derived from pyproject.toml and uv.lock")
 }
 
 // checkApplication answers the only structural question the packer can answer about the
-// endpoint's own contract: whether the module `endpoint.toml` points the runtime at is
+// package's own contract: whether the module `package.toml` points the runtime at is
 // actually IN the wheel. Everything at serve time imports the installed wheel, so a
 // module that is not in it is unservable — said here, not at first invoke.
 func checkApplication(d declaration, entries []entry) *exit.Error {
@@ -259,6 +259,6 @@ func checkApplication(d declaration, entries []entry) *exit.Error {
 		}
 	}
 	return exit.Named(exit.Validation, "application_module_absent",
-		"%s points the runtime at `%s`, which this tree does not contain", endpointName, d.appModule).
+		"%s points the runtime at `%s`, which this tree does not contain", packageName, d.appModule).
 		WithRemedy("describe, conformance and serving all import the INSTALLED wheel; a module outside it is unreachable")
 }

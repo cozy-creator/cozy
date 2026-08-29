@@ -14,7 +14,7 @@ import (
 // never imported, and never handed to a build backend.
 const (
 	pyprojectName = "pyproject.toml"
-	endpointName  = "endpoint.toml"
+	packageName   = "package.toml"
 )
 
 // project is what `[project]` declares, as data. Absent fields stay empty and are then
@@ -37,8 +37,8 @@ type declaration struct {
 	// PEP 517 hook (tensorhub-build.md §0).
 	backend    string
 	hasBuildSy bool
-	// appModule is the module half of endpoint.toml's `[application] object = "mod:attr"`.
-	// The wheel must be able to answer for it, or the endpoint is unservable by
+	// appModule is the module half of package.toml's `[application] object = "mod:attr"`.
+	// The wheel must be able to answer for it, or the package is unservable by
 	// construction and the packer says so at pack time instead of at import time.
 	appModule string
 }
@@ -47,7 +47,7 @@ var (
 	// PEP 508 distribution name.
 	reName = regexp.MustCompile(`^[A-Za-z0-9]([A-Za-z0-9._-]*[A-Za-z0-9])?$`)
 	// A PEP 440 public version plus the local segment. Deliberately narrower than the
-	// full grammar: an endpoint release version this does not admit is a refusal the
+	// full grammar: a package release version this does not admit is a refusal the
 	// author can fix, not a wheel with a version pip and we disagree about.
 	reVersion = regexp.MustCompile(`^[0-9]+(\.[0-9]+)*((a|b|rc)[0-9]+)?(\.post[0-9]+)?(\.dev[0-9]+)?(\+[a-zA-Z0-9]+([.][a-zA-Z0-9]+)*)?$`)
 	// The leading name of a PEP 508 requirement. The rest of the requirement rides
@@ -59,7 +59,7 @@ var (
 func malformed(format string, args ...any) *exit.Error {
 	return exit.Named(exit.Validation, "metadata_malformed", format, args...).
 		WithRemedy("the packer reads metadata as DATA; it cannot ask a build backend what the project meant").
-		WithNext("cozy help endpoint publish")
+		WithNext("cozy help package publish")
 }
 
 // read parses the two metadata files a tree may carry. A tree with neither is legal:
@@ -92,31 +92,31 @@ func readDeclaration(root string) (declaration, *exit.Error) {
 		return d, malformed("%s is unreadable: %v", pyprojectName, err)
 	}
 
-	if body, err := os.ReadFile(filepath.Join(root, endpointName)); err == nil {
-		tables, e := parseTOML(endpointName, body, map[string]bool{"application": true})
+	if body, err := os.ReadFile(filepath.Join(root, packageName)); err == nil {
+		tables, e := parseTOML(packageName, body, map[string]bool{"application": true})
 		if e != nil {
 			return d, e
 		}
 		if t, ok := tables["application"]; ok {
 			obj := t.str("object")
 			if obj == "" {
-				return d, malformed("%s declares `[application]` with no `object`", endpointName)
+				return d, malformed("%s declares `[application]` with no `object`", packageName)
 			}
 			mod, _, ok := strings.Cut(obj, ":")
 			if !ok || mod == "" {
-				return d, malformed("%s `[application] object = %q` is not `module:attribute`", endpointName, obj)
+				return d, malformed("%s `[application] object = %q` is not `module:attribute`", packageName, obj)
 			}
 			d.appModule = mod
 		}
 	} else if !os.IsNotExist(err) {
-		return d, malformed("%s is unreadable: %v", endpointName, err)
+		return d, malformed("%s is unreadable: %v", packageName, err)
 	}
 	return d, nil
 }
 
 // identity settles the distribution name and version. `[project]` is authoritative when
-// present; otherwise the caller supplies them, which is the normal endpoint case — an
-// endpoint's identity is its RELEASE (`org/endpoint` + version), not a line in its tree.
+// present; otherwise the caller supplies them, which is the normal package case — an
+// package's identity is its RELEASE (`org/package` + version), not a line in its tree.
 func identity(d declaration, req Request) (string, string, *exit.Error) {
 	name, version := req.Name, req.Version
 
@@ -147,7 +147,7 @@ func identity(d declaration, req Request) (string, string, *exit.Error) {
 
 	if name == "" {
 		return "", "", malformed("no distribution name: the tree declares no `[project] name` and none was supplied").
-			WithRemedy("pass --name (the env lane passes the endpoint's release name)")
+			WithRemedy("pass --name (the env lane passes the package's release name)")
 	}
 	if version == "" {
 		return "", "", malformed("no version: the tree declares no `[project] version` and none was supplied").

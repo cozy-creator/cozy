@@ -7,35 +7,35 @@ type CLI struct {
 	Full   bool     `help:"Include complete values and all available fields."`
 	Fields []string `help:"Select result fields." sep:","`
 
-	Endpoint EndpointCmd `cmd:"" group:"Resources" help:"Find, install, and publish endpoints."`
-	Model    ModelCmd    `cmd:"" group:"Resources" help:"Find, download, and publish models."`
-	Invoke   InvokeCmd   `cmd:"" group:"Work" help:"Run and manage endpoint invocations."`
-	Rental   RentalCmd   `cmd:"" group:"Work" help:"Manage private remote workers."`
-	Up       UpCmd       `cmd:"" group:"Lifecycle" help:"Start the Cozy controller and localhost UI."`
-	Down     DownCmd     `cmd:"" group:"Lifecycle" help:"Stop Cozy locally or tear everything down."`
-	Unload   UnloadCmd   `cmd:"" group:"Lifecycle" help:"Release idle local GPU memory."`
+	Package PackageCmd `cmd:"" group:"Resources" help:"Find, install, and publish packages."`
+	Model   ModelCmd   `cmd:"" group:"Resources" help:"Find, download, and publish models."`
+	Invoke  InvokeCmd  `cmd:"" group:"Work" help:"Run and manage package invocations."`
+	Rental  RentalCmd  `cmd:"" group:"Work" help:"Manage private remote workers."`
+	Up      UpCmd      `cmd:"" group:"Lifecycle" help:"Start the Cozy controller and localhost UI."`
+	Down    DownCmd    `cmd:"" group:"Lifecycle" help:"Stop Cozy locally or tear everything down."`
+	Unload  UnloadCmd  `cmd:"" group:"Lifecycle" help:"Release idle local GPU memory."`
 }
 
-type EndpointCmd struct {
-	Search  EndpointSearchCmd  `cmd:"" help:"Search the endpoint catalog."`
-	Install EndpointInstallCmd `cmd:"" help:"Install an endpoint on this machine."`
-	Remove  EndpointRemoveCmd  `cmd:"" help:"Remove installed endpoint generations."`
-	List    EndpointListCmd    `cmd:"" help:"List installed endpoints."`
-	Publish EndpointPublishCmd `cmd:"" help:"Publish an endpoint release."`
+type PackageCmd struct {
+	Search  PackageSearchCmd  `cmd:"" help:"Search the package catalog."`
+	Install PackageInstallCmd `cmd:"" help:"Install a package on this machine."`
+	Remove  PackageRemoveCmd  `cmd:"" help:"Remove installed package generations."`
+	List    PackageListCmd    `cmd:"" help:"List installed packages."`
+	Publish PackagePublishCmd `cmd:"" help:"Publish a package release."`
 }
 
-type EndpointSearchCmd struct {
+type PackageSearchCmd struct {
 	Query []string `arg:"" optional:"" name:"query" help:"Search text or an exact org/name."`
 	Limit int      `help:"Maximum results." default:"20"`
 }
 
-func (c *EndpointSearchCmd) Run(r *Runtime) error {
-	return r.call(handleEndpointSearch, c.Query, nil,
+func (c *PackageSearchCmd) Run(r *Runtime) error {
+	return r.call(handlePackageSearch, c.Query, nil,
 		values("--limit", intText(c.Limit)), false)
 }
 
-type EndpointInstallCmd struct {
-	Ref           string `arg:"" name:"endpoint" help:"Endpoint ref (org/name[@release])."`
+type PackageInstallCmd struct {
+	Ref           string `arg:"" name:"package" help:"Package ref (org/name[@release])."`
 	From          string `help:"Install from a local release archive." type:"path"`
 	Dir           string `help:"Install an editable local source tree." type:"path"`
 	Digest        string `help:"Expected source digest."`
@@ -48,7 +48,7 @@ type EndpointInstallCmd struct {
 	Reason        string `help:"Audit reason for a qualified install."`
 }
 
-func (c *EndpointInstallCmd) Run(r *Runtime) error {
+func (c *PackageInstallCmd) Run(r *Runtime) error {
 	return r.call(handleInstall, []string{c.Ref}, bools(
 		"--force", c.Force, "--allow-unsigned", c.AllowUnsigned), values(
 		"--from", c.From, "--dir", c.Dir, "--digest", c.Digest,
@@ -56,29 +56,29 @@ func (c *EndpointInstallCmd) Run(r *Runtime) error {
 		"--device", intText(c.Device), "--reason", c.Reason), false)
 }
 
-type EndpointRemoveCmd struct {
-	Refs []string `arg:"" name:"endpoint" help:"Installed endpoint ref."`
+type PackageRemoveCmd struct {
+	Refs []string `arg:"" name:"package" help:"Installed package ref."`
 }
 
-func (c *EndpointRemoveCmd) Run(r *Runtime) error {
+func (c *PackageRemoveCmd) Run(r *Runtime) error {
 	return r.call(handleRm, c.Refs, nil, nil, false)
 }
 
-type EndpointListCmd struct{}
+type PackageListCmd struct{}
 
-func (c *EndpointListCmd) Run(r *Runtime) error {
+func (c *PackageListCmd) Run(r *Runtime) error {
 	return r.call(handleLs, nil, nil, nil, false)
 }
 
-type EndpointPublishCmd struct {
-	Ref     string `arg:"" name:"endpoint" help:"Endpoint name (org/name)."`
-	Release string `help:"Immutable endpoint release id." required:""`
-	Dir     string `help:"Endpoint source tree." type:"path" default:"."`
+type PackagePublishCmd struct {
+	Ref     string `arg:"" name:"package" help:"Package name (org/name)."`
+	Release string `help:"Immutable package release id." required:""`
+	Dir     string `help:"Package source tree." type:"path" default:"."`
 	Reason  string `help:"Audit reason recorded before publication." required:""`
 }
 
-func (c *EndpointPublishCmd) Run(r *Runtime) error {
-	return r.call(handleEndpointPublish, []string{c.Ref}, nil, values(
+func (c *PackagePublishCmd) Run(r *Runtime) error {
+	return r.call(handlePackagePublish, []string{c.Ref}, nil, values(
 		"--release", c.Release, "--dir", c.Dir, "--reason", c.Reason), false)
 }
 
@@ -142,13 +142,13 @@ func (c *ModelPublishCmd) Run(r *Runtime) error {
 }
 
 type InvokeCmd struct {
-	Run    InvokeRunCmd    `cmd:"" help:"Run an endpoint callable."`
+	Run    InvokeRunCmd    `cmd:"" help:"Run a package callable."`
 	Cancel InvokeCancelCmd `cmd:"" help:"Cancel an invocation or job."`
 	List   InvokeListCmd   `cmd:"" help:"List invocations and jobs."`
 }
 
 type InvokeRunCmd struct {
-	Target         string   `arg:"" name:"target" help:"Callable as org/endpoint/vN/function."`
+	Target         string   `arg:"" name:"target" help:"Callable as org/package/vN/function."`
 	Input          []string `arg:"" optional:"" name:"input" help:"Primary value and field=value payload."`
 	Out            string   `help:"Output directory." type:"path"`
 	Timeout        string   `help:"Request deadline."`
@@ -180,14 +180,14 @@ func (c *InvokeCancelCmd) Run(r *Runtime) error {
 }
 
 type InvokeListCmd struct {
-	State    string `help:"Filter by lifecycle state."`
-	Endpoint string `help:"Filter by endpoint."`
-	Limit    int    `help:"Maximum rows." default:"50"`
+	State   string `help:"Filter by lifecycle state."`
+	Package string `help:"Filter by package."`
+	Limit   int    `help:"Maximum rows." default:"50"`
 }
 
 func (c *InvokeListCmd) Run(r *Runtime) error {
 	return r.call(handleInvokeList, nil, nil, values(
-		"--state", c.State, "--endpoint", c.Endpoint, "--limit", intText(c.Limit)), true)
+		"--state", c.State, "--package", c.Package, "--limit", intText(c.Limit)), true)
 }
 
 type RentalCmd struct {
@@ -197,7 +197,7 @@ type RentalCmd struct {
 }
 
 type RentalNewCmd struct {
-	Endpoint       string `arg:"" name:"endpoint" help:"Exact endpoint ref."`
+	Package        string `arg:"" name:"package" help:"Exact package ref."`
 	Accelerator    string `help:"Provider-neutral accelerator model." required:""`
 	IdempotencyKey string `help:"Stable paid-operation identity."`
 	Timeout        string `help:"Caller wait deadline; does not release the rental."`
@@ -205,7 +205,7 @@ type RentalNewCmd struct {
 }
 
 func (c *RentalNewCmd) Run(r *Runtime) error {
-	return r.call(handleRent, []string{c.Endpoint}, nil, values(
+	return r.call(handleRent, []string{c.Package}, nil, values(
 		"--accelerator", c.Accelerator, "--idempotency-key", c.IdempotencyKey,
 		"--timeout", c.Timeout, "--reason", c.Reason), true)
 }

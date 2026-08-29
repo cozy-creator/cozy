@@ -1,7 +1,7 @@
-// Package endpointpublish prepares one portable endpoint release declaration.
+// Package packagepublish prepares one portable package release declaration.
 // It owns local packaging and nothing server-authoritative: Tensorhub chooses keys,
 // profiles/base revisions, proof seats, execution identities, and serving state.
-package endpointpublish
+package packagepublish
 
 import (
 	"archive/tar"
@@ -28,7 +28,7 @@ import (
 )
 
 const (
-	DescriptorName = "endpoint.descriptor.json"
+	DescriptorName = "package.descriptor.json"
 	LockName       = "uv.lock"
 	MaxLockBytes   = 16 << 20
 	MaxSourceBytes = 512 << 20
@@ -77,9 +77,9 @@ func Prepare(req Request) (*Package, *exit.Error) {
 	if e := auditSource(tree, files); e != nil {
 		return nil, e
 	}
-	root, err := os.MkdirTemp("", "cozy-endpoint-publish-")
+	root, err := os.MkdirTemp("", "cozy-package-publish-")
 	if err != nil {
-		return nil, exit.Internalf("cannot create endpoint publication staging: %s", err)
+		return nil, exit.Internalf("cannot create package publication staging: %s", err)
 	}
 	fail := func(problem *exit.Error) (*Package, *exit.Error) {
 		_ = os.RemoveAll(root)
@@ -105,9 +105,9 @@ func Prepare(req Request) (*Package, *exit.Error) {
 		return fail(e)
 	}
 	if needsBindings {
-		return fail(exit.Named(exit.Validation, "endpoint_model_binding_deferred",
-			"model-bearing endpoint publication is not available yet").
-			WithRemedy("keep binding intent in endpoint.toml; Tensorhub will resolve model releases there when the model-binding lane lands"))
+		return fail(exit.Named(exit.Validation, "package_model_binding_deferred",
+			"model-bearing package publication is not available yet").
+			WithRemedy("keep binding intent in package.toml; Tensorhub will resolve model releases there when the model-binding lane lands"))
 	}
 
 	project, e := wheel.Pack(wheel.Request{Tree: tree,
@@ -127,7 +127,7 @@ func Prepare(req Request) (*Package, *exit.Error) {
 		"descriptor":     descriptor,
 	}}
 	result.Declaration = Declaration{
-		Format:        "tensorhub.endpoint_release_declaration/1",
+		Format:        "tensorhub.package_release_declaration/1",
 		SourceArchive: archiveRef, SourceLock: lock,
 		ProjectWheel: project.Fact, Descriptor: descriptorRef(descriptor),
 	}
@@ -141,18 +141,18 @@ func trackedTree(tree string) (string, []string, *exit.Error) {
 	}
 	info, err := os.Stat(abs)
 	if err != nil || !info.IsDir() {
-		return "", nil, exit.Named(exit.NotFound, "endpoint_tree_absent", "%s is not a directory", abs)
+		return "", nil, exit.Named(exit.NotFound, "package_tree_absent", "%s is not a directory", abs)
 	}
 	topRaw, err := exec.Command("git", "-C", abs, "rev-parse", "--show-toplevel").Output()
 	if err != nil {
-		return "", nil, exit.Named(exit.Validation, "endpoint_tree_untracked",
+		return "", nil, exit.Named(exit.Validation, "package_tree_untracked",
 			"%s is not inside a Git working tree", abs).
-			WithRemedy("endpoint publication snapshots committed tracked files, never an unrestricted directory walk")
+			WithRemedy("package publication snapshots committed tracked files, never an unrestricted directory walk")
 	}
 	top := strings.TrimSpace(string(topRaw))
 	rel, err := filepath.Rel(top, abs)
 	if err != nil || rel == ".." || strings.HasPrefix(rel, ".."+string(os.PathSeparator)) {
-		return "", nil, exit.Internalf("endpoint tree %s escaped Git root %s", abs, top)
+		return "", nil, exit.Internalf("package tree %s escaped Git root %s", abs, top)
 	}
 	scope := "."
 	if rel != "." {
@@ -161,17 +161,17 @@ func trackedTree(tree string) (string, []string, *exit.Error) {
 	status := exec.Command("git", "-C", top, "status", "--porcelain=v1", "-z", "--untracked-files=all", "--", scope)
 	body, err := status.Output()
 	if err != nil {
-		return "", nil, exit.Named(exit.Structural, "endpoint_tree_unreadable", "git status failed: %v", err)
+		return "", nil, exit.Named(exit.Structural, "package_tree_unreadable", "git status failed: %v", err)
 	}
 	if len(body) != 0 {
-		return "", nil, exit.Named(exit.Conflict, "endpoint_tree_dirty",
+		return "", nil, exit.Named(exit.Conflict, "package_tree_dirty",
 			"%s has changed or untracked files", abs).
-			WithRemedy("commit the exact endpoint source first; a normal release is one immutable tracked tree")
+			WithRemedy("commit the exact package source first; a normal release is one immutable tracked tree")
 	}
 	listing := exec.Command("git", "-C", top, "ls-files", "-z", "--", scope)
 	body, err = listing.Output()
 	if err != nil {
-		return "", nil, exit.Named(exit.Structural, "endpoint_tree_unreadable", "git ls-files failed: %v", err)
+		return "", nil, exit.Named(exit.Structural, "package_tree_unreadable", "git ls-files failed: %v", err)
 	}
 	var files []string
 	prefix := ""
@@ -185,12 +185,12 @@ func trackedTree(tree string) (string, []string, *exit.Error) {
 		name := filepath.ToSlash(string(raw))
 		name = strings.TrimPrefix(name, prefix)
 		if name == "" || strings.HasPrefix(name, "../") {
-			return "", nil, exit.Internalf("git returned out-of-scope endpoint path %q", name)
+			return "", nil, exit.Internalf("git returned out-of-scope package path %q", name)
 		}
 		files = append(files, name)
 	}
 	if len(files) == 0 {
-		return "", nil, exit.Named(exit.Validation, "endpoint_tree_empty", "%s has no tracked files", abs)
+		return "", nil, exit.Named(exit.Validation, "package_tree_empty", "%s has no tracked files", abs)
 	}
 	sort.Strings(files)
 	return abs, files, nil
@@ -212,42 +212,42 @@ func auditSource(root string, files []string) *exit.Error {
 	var total int64
 	for _, name := range files {
 		lower, base := strings.ToLower(name), strings.ToLower(path.Base(name))
-		if base == "endpoint.descriptor.json" || base == "endpoint.release.json" ||
-			base == "endpoint.evaluated-config.json" {
-			return exit.Named(exit.Validation, "endpoint_metadata_retired",
-				"%s is retired endpoint publication metadata", name).
-				WithRemedy("delete it; endpoint.toml is the only author configuration, and Tensorhub derives compatibility from pyproject.toml and uv.lock")
+		if base == "package.descriptor.json" || base == "package.release.json" ||
+			base == "package.evaluated-config.json" {
+			return exit.Named(exit.Validation, "package_metadata_retired",
+				"%s is retired package publication metadata", name).
+				WithRemedy("delete it; package.toml is the only author configuration, and Tensorhub derives compatibility from pyproject.toml and uv.lock")
 		}
 		parts := strings.Split(lower, "/")
 		for _, part := range parts[:len(parts)-1] {
 			if part == ".aws" || part == ".ssh" || part == "credentials" || part == "secrets" {
-				return sourceRefusal("endpoint_source_credential", name, "credential directory")
+				return sourceRefusal("package_source_credential", name, "credential directory")
 			}
 		}
 		if base == ".env" || strings.HasPrefix(base, ".env.") || base == ".netrc" ||
 			base == ".npmrc" || base == ".pypirc" || strings.HasPrefix(base, "id_rsa") ||
 			strings.HasSuffix(base, ".pem") || strings.HasSuffix(base, ".key") {
-			return sourceRefusal("endpoint_source_credential", name, "credential/key material")
+			return sourceRefusal("package_source_credential", name, "credential/key material")
 		}
 		ext := strings.ToLower(path.Ext(base))
 		if weightExt[ext] {
-			return sourceRefusal("endpoint_source_model_bytes", name, "model weight/pickle bytes")
+			return sourceRefusal("package_source_model_bytes", name, "model weight/pickle bytes")
 		}
 		if nativeSource[ext] {
-			return sourceRefusal("endpoint_source_native_input", name, "native source or binary")
+			return sourceRefusal("package_source_native_input", name, "native source or binary")
 		}
 		if sourceBuildInput(base) {
-			return sourceRefusal("endpoint_source_build_input", name, "build recipe")
+			return sourceRefusal("package_source_build_input", name, "build recipe")
 		}
 		full := filepath.Join(root, filepath.FromSlash(name))
 		info, err := os.Lstat(full)
 		if err != nil || !info.Mode().IsRegular() {
-			return sourceRefusal("endpoint_source_entry_invalid", name, "non-regular or unreadable entry")
+			return sourceRefusal("package_source_entry_invalid", name, "non-regular or unreadable entry")
 		}
 		total += info.Size()
 		if total > MaxSourceBytes {
-			return exit.Named(exit.Validation, "endpoint_source_too_large",
-				"tracked endpoint source exceeds %d B", MaxSourceBytes)
+			return exit.Named(exit.Validation, "package_source_too_large",
+				"tracked package source exceeds %d B", MaxSourceBytes)
 		}
 	}
 	return nil
@@ -267,11 +267,11 @@ func deriveDescriptor(tree, root string) (string, *exit.Error) {
 	sync.Stdout, sync.Stderr = io.Discard, &syncStderr
 	err := sync.Run()
 	if sync.ProcessState == nil {
-		return "", exit.Named(exit.Structural, "endpoint_descriptor_environment_missing",
-			"cannot run uv for the endpoint's locked environment: %v", err)
+		return "", exit.Named(exit.Structural, "package_descriptor_environment_missing",
+			"cannot run uv for the package's locked environment: %v", err)
 	}
 	if sync.ProcessState.ExitCode() != 0 {
-		return "", exit.Named(exit.Structural, "endpoint_descriptor_environment_refused",
+		return "", exit.Named(exit.Structural, "package_descriptor_environment_refused",
 			"uv sync --locked --no-install-project refused: %s",
 			strings.Join(strings.Fields(syncStderr.String()), " ")).
 			WithRemedy("make pyproject.toml and uv.lock an exact portable dependency closure")
@@ -283,20 +283,20 @@ func deriveDescriptor(tree, root string) (string, *exit.Error) {
 	cmd.Stdout, cmd.Stderr = &stdout, &stderr
 	err = cmd.Run()
 	if cmd.ProcessState == nil {
-		return "", exit.Named(exit.Structural, "endpoint_descriptor_runtime_missing",
-			"cannot run the endpoint's locked cozy-runtime: %v", err).
+		return "", exit.Named(exit.Structural, "package_descriptor_runtime_missing",
+			"cannot run the package's locked cozy-runtime: %v", err).
 			WithRemedy("declare cozy-runtime in pyproject.toml and lock it in uv.lock")
 	}
 	if code := cmd.ProcessState.ExitCode(); code != 0 {
 		return "", descriptorRefusal(code, stderr.Bytes())
 	}
 	if stdout.Len() == 0 || stdout.Len() > canonical.DocMax {
-		return "", exit.Named(exit.Validation, "endpoint_descriptor_invalid",
+		return "", exit.Named(exit.Validation, "package_descriptor_invalid",
 			"cozy-runtime describe returned %d bytes; expected 1..%d", stdout.Len(), canonical.DocMax)
 	}
 	canonicalBytes, err := canonical.NormalizeJCS(stdout.Bytes())
 	if err != nil {
-		return "", exit.Named(exit.Validation, "endpoint_descriptor_invalid",
+		return "", exit.Named(exit.Validation, "package_descriptor_invalid",
 			"cozy-runtime describe returned invalid canonical JSON: %v", err)
 	}
 	if err := os.WriteFile(output, canonicalBytes, 0o600); err != nil {
@@ -320,7 +320,7 @@ func descriptorRefusal(code int, body []byte) *exit.Error {
 	if json.Unmarshal(body, &doc) == nil && doc.Error.Message != "" {
 		name := doc.Error.Name
 		if name == "" {
-			name = "endpoint_descriptor_refused"
+			name = "package_descriptor_refused"
 		}
 		problem := exit.Named(c, name, "%s", doc.Error.Message)
 		if doc.Error.Remedy != "" {
@@ -332,7 +332,7 @@ func descriptorRefusal(code int, body []byte) *exit.Error {
 	if message == "" {
 		message = fmt.Sprintf("cozy-runtime exited %d", code)
 	}
-	return exit.Named(c, "endpoint_descriptor_refused", "%s", message)
+	return exit.Named(c, "package_descriptor_refused", "%s", message)
 }
 
 func sourceBuildInput(base string) bool {
@@ -345,7 +345,7 @@ func sourceBuildInput(base string) bool {
 }
 
 func sourceRefusal(code, name, class string) *exit.Error {
-	return exit.Named(exit.Validation, code, "%s is %s and cannot enter an endpoint release", name, class).
+	return exit.Named(exit.Validation, code, "%s is %s and cannot enter a package release", name, class).
 		WithRemedy("publish pure Python code only; model weights live in model repositories, and source/native builds are not admitted")
 }
 
@@ -406,7 +406,7 @@ func descriptorNeedsBindings(file string) (bool, *exit.Error) {
 		} `json:"jobs"`
 	}
 	if err := json.Unmarshal(body, &descriptor); err != nil {
-		return false, exit.Named(exit.Validation, "endpoint_descriptor_invalid", "%s: %v", DescriptorName, err)
+		return false, exit.Named(exit.Validation, "package_descriptor_invalid", "%s: %v", DescriptorName, err)
 	}
 	for _, entrypoint := range descriptor.Entrypoints {
 		if len(entrypoint.Models) > 0 {
@@ -469,11 +469,11 @@ func descriptorRef(file string) ObjectRef {
 func (d Declaration) CanonicalBytes() ([]byte, *exit.Error) {
 	body, err := json.Marshal(d)
 	if err != nil {
-		return nil, exit.Internalf("cannot encode endpoint declaration: %s", err)
+		return nil, exit.Internalf("cannot encode package declaration: %s", err)
 	}
 	canonicalBytes, err := canonical.NormalizeJCS(body)
 	if err != nil {
-		return nil, exit.Internalf("endpoint declaration is outside canonical JSON: %s", err)
+		return nil, exit.Internalf("package declaration is outside canonical JSON: %s", err)
 	}
 	return canonicalBytes, nil
 }

@@ -89,7 +89,7 @@ func TestCanonicalDocuments(t *testing.T) {
 		"twin_float":                        {"non_integer_number", &pb.InvocationSpec{}},
 		"twin_unknown_key":                  {"unknown_field", &pb.InvocationSpec{}},
 		"twin_whitespace":                   {"noncanonical_encoding", &pb.InvocationSpec{}},
-		"twin_libc_unspelled":               {"libc_unspelled", &pb.EndpointEnvironmentSpec{}},
+		"twin_libc_unspelled":               {"libc_unspelled", &pb.PackageEnvironmentSpec{}},
 		"twin_model_object_set_missing":     {"model_object_set_missing", &pb.PlacementSpec{}},
 		"twin_model_object_set_wrong_kind":  {"model_object_set_shape", &pb.PlacementSpec{}},
 		"twin_model_object_set_zero_length": {"model_object_set_shape", &pb.PlacementSpec{}},
@@ -142,8 +142,8 @@ func messageFor(name string) proto.Message {
 		return &pb.PlacementSet{}
 	case "cozy.worker.v1.PlacementSpec":
 		return &pb.PlacementSpec{}
-	case "cozy.worker.v1.EndpointEnvironmentSpec":
-		return &pb.EndpointEnvironmentSpec{}
+	case "cozy.worker.v1.PackageEnvironmentSpec":
+		return &pb.PackageEnvironmentSpec{}
 	case "cozy.worker.v1.WorkerSnapshotBody":
 		return &pb.WorkerSnapshotBody{}
 	}
@@ -239,11 +239,11 @@ func TestNumberProfile(t *testing.T) {
 	}
 }
 
-// TestEndpointDescriptor is the OTHER side of the identity plane: the grammar Runtime
+// TestPackageDescriptor is the OTHER side of the identity plane: the grammar Runtime
 // authors and Creator consumes at install. Identity is the canonical content and nothing
 // else, and a descriptor that cannot be read exactly is refused rather than guessed at.
-func TestEndpointDescriptor(t *testing.T) {
-	raw := []byte(`{"application":"probe:app","entrypoints":[{"name":"run","request":{"fields":[{"constraints":{"gt":0},"name":"strength","type":"float"},{"name":"mode","type":{"literal":["fast","quality"]}}]},"result":{"fields":[]}}],"format":"cozy.endpoint.descriptor/1","jobs":[]}`)
+func TestPackageDescriptor(t *testing.T) {
+	raw := []byte(`{"application":"probe:app","entrypoints":[{"name":"run","request":{"fields":[{"constraints":{"gt":0},"name":"strength","type":"float"},{"name":"mode","type":{"literal":["fast","quality"]}}]},"result":{"fields":[]}}],"format":"cozy.package.descriptor/1","jobs":[]}`)
 	want, err := canonical.Spell(canonical.Digest(raw))
 	must(t, err)
 	doc, problem := launch.DecodeDescriptor(raw)
@@ -268,7 +268,7 @@ func TestEndpointDescriptor(t *testing.T) {
 	// Whitespace and key order are NOT identity; a meaning change is.
 	for _, same := range [][]byte{
 		bytes.Replace(raw, []byte(`,"entrypoints"`), []byte(", \"entrypoints\""), 1),
-		[]byte(`{"jobs":[],"format":"cozy.endpoint.descriptor/1","entrypoints":[{"result":{"fields":[]},"request":{"fields":[{"type":"float","name":"strength","constraints":{"gt":0}},{"type":{"literal":["fast","quality"]},"name":"mode"}]},"name":"run"}],"application":"probe:app"}`),
+		[]byte(`{"jobs":[],"format":"cozy.package.descriptor/1","entrypoints":[{"result":{"fields":[]},"request":{"fields":[{"type":"float","name":"strength","constraints":{"gt":0}},{"type":{"literal":["fast","quality"]},"name":"mode"}]},"name":"run"}],"application":"probe:app"}`),
 	} {
 		got, problem := launch.DecodeDescriptor(same)
 		if problem != nil || got.Digest != want || !bytes.Equal(got.Raw, raw) {
@@ -301,8 +301,8 @@ func TestEndpointDescriptor(t *testing.T) {
 	}
 }
 
-func TestCompactEndpointDescriptor(t *testing.T) {
-	raw := []byte(`{"application":"probe:app","entrypoints":[{"models":[{"class":"Model","component_use":{"run":["transformer"]},"path":"run.models.model","stamps":{"task":"generate"}}],"name":"run","request":{"fields":[{"name":"message","type":"str"},{"name":"event","type":{"tag_field":"type","union":[{"fields":[{"name":"image","type":"str"}],"tag":"image"},{"fields":[{"name":"video","type":"str"}],"tag":"video"}]}}]},"result":{"fields":[]}}],"format":"cozy.endpoint.descriptor/1","jobs":[]}`)
+func TestCompactPackageDescriptor(t *testing.T) {
+	raw := []byte(`{"application":"probe:app","entrypoints":[{"models":[{"class":"Model","component_use":{"run":["transformer"]},"path":"run.models.model","stamps":{"task":"generate"}}],"name":"run","request":{"fields":[{"name":"message","type":"str"},{"name":"event","type":{"tag_field":"type","union":[{"fields":[{"name":"image","type":"str"}],"tag":"image"},{"fields":[{"name":"video","type":"str"}],"tag":"video"}]}}]},"result":{"fields":[]}}],"format":"cozy.package.descriptor/1","jobs":[]}`)
 	doc, problem := launch.DecodeDescriptor(raw)
 	fatal(t, problem)
 	ep := &doc.Entrypoints[0]

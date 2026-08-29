@@ -411,7 +411,7 @@ func DownloadExact(ctx context.Context, subject, url, dst, digest string, length
 	}
 	if _, err := os.Stat(dst); err == nil {
 		return exit.Named(exit.Conflict, "download.target_exists", "%s already exists", dst).
-			WithRemedy("use one fresh endpoint generation; never replace an admitted wheel in place")
+			WithRemedy("use one fresh package generation; never replace an admitted wheel in place")
 	} else if !os.IsNotExist(err) {
 		return exit.Internalf("cannot inspect download target %s: %s", dst, err)
 	}

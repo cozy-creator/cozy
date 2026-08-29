@@ -153,7 +153,7 @@ func (c *Orchestrator) converge(s *session, w *worker, placements []DesiredPlace
 }
 
 // placementSpec mints the immutable PlacementSpec document for one desired placement. THE
-// DESIRED SET NAMES BYTES, NEVER A POINTER (§1): `endpoint_release_id` survives only as
+// DESIRED SET NAMES BYTES, NEVER A POINTER (§1): `package_release_id` survives only as
 // PROVENANCE and every other field is an immutable digest, so two workers handed the same
 // set converge to the same bytes or fault typed.
 //
@@ -162,9 +162,9 @@ func (c *Orchestrator) converge(s *session, w *worker, placements []DesiredPlace
 // bypasses this author entirely because converge relays Tensorhub's exact PlacementSet.
 func (c *Orchestrator) placementSpec(w *worker, p DesiredPlacement) *pb.PlacementSpec {
 	spec := &pb.PlacementSpec{
-		EndpointReleaseId: p.ReleaseID,
-		BindingPlans:      w.subjects,
-		ModelObjectSet:    modelObjectSetSubject(p),
+		PackageReleaseId: p.ReleaseID,
+		BindingPlans:     w.subjects,
+		ModelObjectSet:   modelObjectSetSubject(p),
 	}
 	environmentDigest := p.EnvironmentSpecDigest
 	if environmentDigest == "" && w.spec.Connection == nil {
@@ -176,8 +176,8 @@ func (c *Orchestrator) placementSpec(w *worker, p DesiredPlacement) *pb.Placemen
 	if raw, err := canonical.Raw(p.InstalledEnvironmentReceiptDigest); err == nil {
 		spec.InstalledEnvironmentReceiptDigest = raw
 	}
-	if raw, err := canonical.Raw(p.DescriptorDigest); err == nil {
-		spec.DescriptorDigest = raw
+	if raw, err := canonical.Raw(p.PackageDescriptorDigest); err == nil {
+		spec.PackageDescriptorDigest = raw
 	}
 	return spec
 }
@@ -185,7 +185,7 @@ func (c *Orchestrator) placementSpec(w *worker, p DesiredPlacement) *pb.Placemen
 const emptyModelObjectSet = `{"kind":"tensorhub.resolved_object_set/1","roots":[]}`
 
 // modelObjectSetSubject makes the required PlacementSpec/2 closure explicit even for a
-// weightless local endpoint. The empty object-set document is a real canonical subject,
+// weightless local package. The empty object-set document is a real canonical subject,
 // not absence; remote placements carry Tensorhub's exact non-empty subject and normally
 // bypass local authoring by relaying the complete PlacementSet bytes.
 func modelObjectSetSubject(p DesiredPlacement) *pb.ArtifactSubject {
@@ -407,12 +407,12 @@ func placementAcquisitionOf(instanceID, bootID string,
 			DownloadedBytes: stored.DownloadedBytes, ReusedBytes: stored.ReusedBytes,
 		}
 	}
-	endpoint, endpointFacts := leg(status.Acquisition.Endpoint)
+	pkg, pkgFacts := leg(status.Acquisition.Package)
 	model, modelFacts := leg(status.Acquisition.Model)
-	facts.Endpoint, facts.Model = endpointFacts, modelFacts
+	facts.Package, facts.Model = pkgFacts, modelFacts
 	return &records.PlacementAcquisition{
 		InstanceID: instanceID, WorkerBootID: bootID, PlacementID: status.PlacementId,
-		PlacementSpecDigest: specDigest, Endpoint: endpoint, Model: model,
+		PlacementSpecDigest: specDigest, Package: pkg, Model: model,
 	}, facts
 }
 
@@ -445,7 +445,7 @@ func progressSignature(r *pb.ObservedWorkerState, status *pb.PlacementStatus) st
 			for _, observed := range []struct {
 				name string
 				leg  *pb.AcquisitionLegObservation
-			}{{"endpoint", acquisition.Endpoint}, {"model", acquisition.Model}} {
+			}{{"package", acquisition.Package}, {"model", acquisition.Model}} {
 				name, leg := observed.name, observed.leg
 				if leg != nil {
 					sig += fmt.Sprintf(" %s=%d/%d/%d/%d", name, leg.StartedMonotonicNs,

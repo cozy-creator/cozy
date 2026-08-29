@@ -15,16 +15,16 @@ import (
 	"sync"
 	"testing"
 
-	"github.com/cozy-creator/cozy-creator/internal/endpointprofile"
-	"github.com/cozy-creator/cozy-creator/internal/endpointpublish"
+	"github.com/cozy-creator/cozy-creator/internal/packageprofile"
+	"github.com/cozy-creator/cozy-creator/internal/packagepublish"
 )
 
-func TestEndpointPublishCLI(t *testing.T) {
-	source := trackedEndpointFixture(t)
+func TestPackagePublishCLI(t *testing.T) {
+	source := trackedPackageFixture(t)
 	var server *httptest.Server
 	var lock sync.Mutex
 	var declaration []byte
-	var declared endpointpublish.Declaration
+	var declared packagepublish.Declaration
 	put := map[string][]byte{}
 	beginCount, finalizeCount := 0, 0
 	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -34,8 +34,8 @@ func TestEndpointPublishCLI(t *testing.T) {
 			return
 		}
 		switch {
-		case r.Method == http.MethodPost && r.URL.Path == "/v1/endpoints":
-			_, _ = w.Write([]byte(`{"endpoint":{"org":"cozy","name":"marco","created_at":"2026-08-28T00:00:00Z"}}`))
+		case r.Method == http.MethodPost && r.URL.Path == "/v1/packages":
+			_, _ = w.Write([]byte(`{"package":{"org":"cozy","name":"marco","created_at":"2026-08-28T00:00:00Z"}}`))
 		case r.Method == http.MethodPost && strings.HasSuffix(r.URL.Path, "/begin"):
 			body, _ := io.ReadAll(r.Body)
 			lock.Lock()
@@ -95,12 +95,12 @@ func TestEndpointPublishCLI(t *testing.T) {
 			_ = json.NewEncoder(w).Encode(map[string]any{"created": true,
 				"release": "1.0.0", "declaration_digest": fixtureDigest(declaration),
 				"profiles": []map[string]any{
-					{"profile": endpointprofile.CPU, "state": "qualified", "candidate_id": "candidate-cpu",
+					{"profile": packageprofile.CPU, "state": "qualified", "candidate_id": "candidate-cpu",
 						"base_realization_kind": "oci", "base_realization_digest": "registry.invalid/tensorhub-worker@sha256:" + strings.Repeat("a", 64),
-						"endpoint_environment_spec": map[string]any{"digest": "sha256:" + strings.Repeat("b", 64), "length": 1},
-						"resolved_wheel_set":        map[string]any{"digest": "sha256:" + strings.Repeat("c", 64), "length": 1},
-						"resolution_lock":           map[string]any{"digest": "sha256:" + strings.Repeat("d", 64), "length": 1}}},
-				"endpoint_executions": []map[string]string{{"profile": endpointprofile.CPU, "function": "marco", "digest": "sha256:" + strings.Repeat("1", 64), "state": "qualified"}}})
+						"package_environment_spec": map[string]any{"digest": "sha256:" + strings.Repeat("b", 64), "length": 1},
+						"resolved_wheel_set":       map[string]any{"digest": "sha256:" + strings.Repeat("c", 64), "length": 1},
+						"resolution_lock":          map[string]any{"digest": "sha256:" + strings.Repeat("d", 64), "length": 1}}},
+				"package_executions": []map[string]string{{"profile": packageprofile.CPU, "function": "marco", "digest": "sha256:" + strings.Repeat("1", 64), "state": "qualified"}}})
 		default:
 			writeHubError(w, http.StatusNotFound, "route.not_found", r.Method+" "+r.URL.Path)
 		}
@@ -116,16 +116,16 @@ func TestEndpointPublishCLI(t *testing.T) {
 		body, _ := cmd.CombinedOutput()
 		return cmd.ProcessState.ExitCode(), string(body)
 	}
-	args := []string{"endpoint", "publish", "cozy/marco", "--release", "1.0.0", "--dir", source,
+	args := []string{"package", "publish", "cozy/marco", "--release", "1.0.0", "--dir", source,
 		"--reason", "fixture publish"}
 	if code, out := run(args...); code != 0 || !strings.Contains(out, "status: published") ||
 		!strings.Contains(out, "qualified") || strings.Contains(out, "candidate-cpu") {
-		t.Fatalf("endpoint publish [exit %d]\n%s", code, out)
+		t.Fatalf("package publish [exit %d]\n%s", code, out)
 	}
 	// Exact replay sends identical declaration bytes and converges without a client journal.
 	if code, out := run(append(args, "--full")...); code != 0 ||
 		!strings.Contains(out, "candidate-cpu") || !strings.Contains(out, "qualified") {
-		t.Fatalf("endpoint publish replay [exit %d]\n%s", code, out)
+		t.Fatalf("package publish replay [exit %d]\n%s", code, out)
 	}
 	lock.Lock()
 	defer lock.Unlock()
@@ -134,7 +134,7 @@ func TestEndpointPublishCLI(t *testing.T) {
 	}
 }
 
-func trackedEndpointFixture(t *testing.T) string {
+func trackedPackageFixture(t *testing.T) string {
 	t.Helper()
 	repo := t.TempDir()
 	mustWrite(t, filepath.Join(repo, "pyproject.toml"), `[project]
@@ -142,7 +142,7 @@ name = "marco-polo"
 version = "1.0.0"
 dependencies = []
 `)
-	mustWrite(t, filepath.Join(repo, "endpoint.toml"), "[application]\nobject = \"marco_polo:app\"\n")
+	mustWrite(t, filepath.Join(repo, "package.toml"), "[application]\nobject = \"marco_polo:app\"\n")
 	mustWrite(t, filepath.Join(repo, "marco_polo.py"), "app = object()\n")
 	mustWrite(t, filepath.Join(repo, "uv.lock"), "version = 1\n")
 	mustWrite(t, filepath.Join(repo, ".gitignore"), ".test-bin/\n.venv/\n")
@@ -154,7 +154,7 @@ dependencies = []
 	fakeUV := filepath.Join(repo, ".test-bin", "uv")
 	mustWrite(t, fakeUV, `#!/bin/sh
 if [ "${0##*/}" = "cozy-runtime" ]; then # //cozy:allow independent Runtime CLI fixture
-  printf '%s\n' '{"application":"marco_polo:app","entrypoints":[],"format":"cozy.endpoint.descriptor/1","jobs":[]}'
+  printf '%s\n' '{"application":"marco_polo:app","entrypoints":[],"format":"cozy.package.descriptor/1","jobs":[]}'
   exit 0
 fi
 mkdir -p "$UV_PROJECT_ENVIRONMENT/bin"
@@ -165,8 +165,8 @@ chmod 755 "$UV_PROJECT_ENVIRONMENT/bin/cozy-runtime"
 	return repo
 }
 
-func fixtureDeclarationRoles(d endpointpublish.Declaration) map[string]endpointpublish.ObjectRef {
-	out := map[string]endpointpublish.ObjectRef{
+func fixtureDeclarationRoles(d packagepublish.Declaration) map[string]packagepublish.ObjectRef {
+	out := map[string]packagepublish.ObjectRef{
 		"source_archive": d.SourceArchive, "source_lock": d.SourceLock,
 		"project_wheel": {Digest: d.ProjectWheel.Digest, Length: d.ProjectWheel.Length},
 		"descriptor":    d.Descriptor,

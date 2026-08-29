@@ -1,7 +1,7 @@
-"""cl-013's acceptance endpoint: a REAL invoke with no model, no weights, no GPU.
+"""cl-013's acceptance package: a REAL invoke with no model, no weights, no GPU.
 
 `gpu` DERIVES from the signature (cozy-runtime `_describe.py`): a handler with no `Model`
-parameter is a CPU handler, so the orchestrator grants it no device and this endpoint runs
+parameter is a CPU handler, so the orchestrator grants it no device and this package runs
 on any machine — including a Windows runner, which is the whole point of the launch tier's
 Windows slice. Its release depends on `cozy-runtime[media]` only (msgspec, protobuf,
 grpcio and the exact PyAV wheel — no torch, CUDA or tensorfs), so a clean machine can

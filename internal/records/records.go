@@ -1,5 +1,5 @@
 // Package records is the ONE local lifecycle authority: install generations and the
-// active pin per (endpoint, major), as rows in ONE local SQLite database
+// active pin per (package, major), as rows in ONE local SQLite database
 // (cozy-creator.md "Records"). There is no state.json and no second lifecycle store;
 // any JSON output is a derived read.
 //
@@ -25,13 +25,13 @@ import (
 	_ "modernc.org/sqlite"
 )
 
-// EndpointInstall is one immutable install: a materialized environment plus the evidence
+// PackageInstall is one immutable install: a materialized environment plus the evidence
 // that produced it. Rows are never updated — a rebuild is a NEW install. Was `Generation`,
 // which the wire spends on executor and admission generations; the local install is not
 // one of those, and one word for three fences is how they drift (#484).
-type EndpointInstall struct {
+type PackageInstall struct {
 	ID           string
-	Endpoint     string // org/name
+	Package      string // org/name
 	Major        int
 	Version      string
 	SourceKind   string // "archive" | "dir"
@@ -55,12 +55,12 @@ type EndpointInstall struct {
 	CreatedAt    string
 }
 
-// Pin is the active install for one (endpoint, major). Two majors of one endpoint coexist
+// Pin is the active install for one (package, major). Two majors of one package coexist
 // because the key is the pair.
 type Pin struct {
-	Endpoint    string
+	Package     string
 	Major       int
-	InstallID   string // was `Generation` (#484): it names an EndpointInstall row's id
+	InstallID   string // was `Generation` (#484): it names an PackageInstall row's id
 	ActivatedAt string
 }
 
@@ -71,7 +71,7 @@ type Store struct{ db *sql.DB }
 var schema = append([]string{`
 CREATE TABLE IF NOT EXISTS install_generations (
   id            TEXT PRIMARY KEY,
-  endpoint      TEXT    NOT NULL,
+  package      TEXT    NOT NULL,
   major         INTEGER NOT NULL,
   version       TEXT    NOT NULL,
   source_kind   TEXT    NOT NULL,
@@ -95,11 +95,11 @@ CREATE TABLE IF NOT EXISTS install_generations (
   created_at    TEXT    NOT NULL
 )`, `
 CREATE TABLE IF NOT EXISTS pins (
-  endpoint     TEXT    NOT NULL,
+  package     TEXT    NOT NULL,
   major        INTEGER NOT NULL,
   generation   TEXT    NOT NULL REFERENCES install_generations(id),
   activated_at TEXT    NOT NULL,
-  PRIMARY KEY (endpoint, major)
+  PRIMARY KEY (package, major)
 )`, `
 CREATE TABLE IF NOT EXISTS managed_profile_installs (
   install_id                    TEXT PRIMARY KEY REFERENCES install_generations(id) ON DELETE CASCADE,
@@ -109,7 +109,7 @@ CREATE TABLE IF NOT EXISTS managed_profile_installs (
   base_realization_digest      TEXT NOT NULL,
   wheelhouse_manifest_digest   TEXT NOT NULL,
   environment_spec_digest      TEXT NOT NULL,
-  endpoint_bundle_digest       TEXT NOT NULL,
+  package_bundle_digest       TEXT NOT NULL,
   resolved_wheel_set_digest    TEXT NOT NULL,
   resolution_lock_digest       TEXT NOT NULL,
   installed_receipt_digest     TEXT NOT NULL,
@@ -206,7 +206,7 @@ func Open(path string) (*Store, *exit.Error) {
 func (s *Store) Close() { _ = s.db.Close() }
 
 var genFields = []string{
-	"id", "endpoint", "major", "version", "source_kind", "source_ref", "source_digest",
+	"id", "package", "major", "version", "source_kind", "source_ref", "source_digest",
 	"verified", "dir", "python", "runtime", "project_dir", "uv", "lock_digest", "platform", "extra", "link_mode",
 	"packages", "closure", "descriptor", "bytes_excl", "bytes_shared", "created_at",
 }
@@ -224,10 +224,10 @@ func placeholders() string {
 	return strings.TrimSuffix(strings.Repeat("?,", len(genFields)), ",")
 }
 
-func scanGen(rows interface{ Scan(...any) error }) (EndpointInstall, error) {
-	var g EndpointInstall
+func scanGen(rows interface{ Scan(...any) error }) (PackageInstall, error) {
+	var g PackageInstall
 	var verified int
-	err := rows.Scan(&g.ID, &g.Endpoint, &g.Major, &g.Version, &g.SourceKind, &g.SourceRef,
+	err := rows.Scan(&g.ID, &g.Package, &g.Major, &g.Version, &g.SourceKind, &g.SourceRef,
 		&g.SourceDigest, &verified, &g.Dir, &g.Python, &g.Runtime, &g.ProjectDir, &g.UV, &g.LockDigest, &g.Platform,
 		&g.Extra, &g.LinkMode, &g.Packages, &g.Closure, &g.Descriptor,
 		&g.BytesExcl, &g.BytesShared, &g.CreatedAt)
@@ -238,7 +238,7 @@ func scanGen(rows interface{ Scan(...any) error }) (EndpointInstall, error) {
 // Activate is THE install transaction: the generation row and the pin swap commit
 // together or not at all. A crash before Commit leaves the previous pin — and the
 // previous generation's venv — exactly as it was.
-func (s *Store) Activate(g EndpointInstall) (superseded string, e *exit.Error) {
+func (s *Store) Activate(g PackageInstall) (superseded string, e *exit.Error) {
 	return s.activate(g, nil)
 }
 
@@ -250,7 +250,7 @@ type ManagedProfileInstall struct {
 	BaseRealizationDigest    string
 	WheelhouseManifestDigest string
 	EnvironmentSpecDigest    string
-	EndpointBundleDigest     string
+	PackageBundleDigest      string
 	ResolvedWheelSetDigest   string
 	ResolutionLockDigest     string
 	InstalledReceiptDigest   string
@@ -264,12 +264,12 @@ type ManagedProfileInstall struct {
 
 // ActivateManaged commits the ordinary control install/pin and its independent
 // profile realization, receipt, host evidence, and lease facts in one transaction.
-func (s *Store) ActivateManaged(g EndpointInstall, facts ManagedProfileInstall) (string, *exit.Error) {
+func (s *Store) ActivateManaged(g PackageInstall, facts ManagedProfileInstall) (string, *exit.Error) {
 	facts.InstallID = g.ID
 	for name, value := range map[string]string{
 		"release": facts.ReleaseID, "profile": facts.Profile, "candidate": facts.CandidateID,
 		"base realization": facts.BaseRealizationDigest, "wheelhouse": facts.WheelhouseManifestDigest,
-		"environment": facts.EnvironmentSpecDigest, "bundle": facts.EndpointBundleDigest,
+		"environment": facts.EnvironmentSpecDigest, "bundle": facts.PackageBundleDigest,
 		"resolved wheels": facts.ResolvedWheelSetDigest, "resolution lock": facts.ResolutionLockDigest,
 		"receipt": facts.InstalledReceiptDigest, "host evidence": facts.HostEvidenceDigest,
 		"lease": facts.LeaseID, "lease expiry": facts.LeaseExpiresAt,
@@ -284,7 +284,7 @@ func (s *Store) ActivateManaged(g EndpointInstall, facts ManagedProfileInstall) 
 	return s.activate(g, &facts)
 }
 
-func (s *Store) activate(g EndpointInstall, managed *ManagedProfileInstall) (superseded string, e *exit.Error) {
+func (s *Store) activate(g PackageInstall, managed *ManagedProfileInstall) (superseded string, e *exit.Error) {
 	tx, err := s.db.Begin()
 	if err != nil {
 		return "", exit.Internalf("cannot begin the activation transaction: %s", err)
@@ -292,8 +292,8 @@ func (s *Store) activate(g EndpointInstall, managed *ManagedProfileInstall) (sup
 	defer tx.Rollback()
 
 	var prior string
-	err = tx.QueryRow(`SELECT generation FROM pins WHERE endpoint=? AND major=?`,
-		g.Endpoint, g.Major).Scan(&prior)
+	err = tx.QueryRow(`SELECT generation FROM pins WHERE package=? AND major=?`,
+		g.Package, g.Major).Scan(&prior)
 	if err != nil && !errors.Is(err, sql.ErrNoRows) {
 		return "", exit.Internalf("cannot read the current pin: %s", err)
 	}
@@ -305,7 +305,7 @@ func (s *Store) activate(g EndpointInstall, managed *ManagedProfileInstall) (sup
 	}
 	if _, err := tx.Exec(`INSERT INTO install_generations(`+genCols("")+`)
 		VALUES(`+placeholders()+`)`,
-		g.ID, g.Endpoint, g.Major, g.Version, g.SourceKind, g.SourceRef, g.SourceDigest,
+		g.ID, g.Package, g.Major, g.Version, g.SourceKind, g.SourceRef, g.SourceDigest,
 		verified, g.Dir, g.Python, g.Runtime, g.ProjectDir, g.UV, g.LockDigest, g.Platform, g.Extra, g.LinkMode,
 		g.Packages, g.Closure, g.Descriptor, g.BytesExcl, g.BytesShared, g.CreatedAt); err != nil {
 		return "", exit.Internalf("cannot insert generation %s: %s", g.ID, err)
@@ -315,13 +315,13 @@ func (s *Store) activate(g EndpointInstall, managed *ManagedProfileInstall) (sup
 		if _, err := tx.Exec(`INSERT INTO managed_profile_installs(
 			install_id,release_id,profile,candidate_id,base_realization_digest,
 			wheelhouse_manifest_digest,environment_spec_digest,
-			endpoint_bundle_digest,resolved_wheel_set_digest,resolution_lock_digest,
+			package_bundle_digest,resolved_wheel_set_digest,resolution_lock_digest,
 			installed_receipt_digest,installed_receipt_length,host_evidence_digest,
 			native_evidence_digest,lease_id,lease_expires_at,recorded_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
 			managed.InstallID, managed.ReleaseID, managed.Profile, managed.CandidateID,
 			managed.BaseRealizationDigest,
 			managed.WheelhouseManifestDigest, managed.EnvironmentSpecDigest,
-			managed.EndpointBundleDigest, managed.ResolvedWheelSetDigest,
+			managed.PackageBundleDigest, managed.ResolvedWheelSetDigest,
 			managed.ResolutionLockDigest, managed.InstalledReceiptDigest,
 			managed.InstalledReceiptLength, managed.HostEvidenceDigest,
 			managed.NativeEvidenceDigest,
@@ -329,15 +329,15 @@ func (s *Store) activate(g EndpointInstall, managed *ManagedProfileInstall) (sup
 			return "", exit.Internalf("cannot insert managed profile facts for %s: %s", g.ID, err)
 		}
 	}
-	if _, err := tx.Exec(`INSERT INTO pins(endpoint,major,generation,activated_at)
-		VALUES(?,?,?,?) ON CONFLICT(endpoint,major) DO UPDATE SET generation=excluded.generation,
+	if _, err := tx.Exec(`INSERT INTO pins(package,major,generation,activated_at)
+		VALUES(?,?,?,?) ON CONFLICT(package,major) DO UPDATE SET generation=excluded.generation,
 		activated_at=excluded.activated_at`,
-		g.Endpoint, g.Major, g.ID, g.CreatedAt); err != nil {
-		return "", exit.Internalf("cannot activate the pin for %s@v%d: %s", g.Endpoint, g.Major, err)
+		g.Package, g.Major, g.ID, g.CreatedAt); err != nil {
+		return "", exit.Internalf("cannot activate the pin for %s@v%d: %s", g.Package, g.Major, err)
 	}
 	if err := tx.Commit(); err != nil {
 		return "", exit.New(exit.Conflict,
-			"the activation transaction did not commit for %s@v%d: %s", g.Endpoint, g.Major, err).
+			"the activation transaction did not commit for %s@v%d: %s", g.Package, g.Major, err).
 			WithRemedy("the previous pin is untouched; re-run the install")
 	}
 	return prior, nil
@@ -347,13 +347,13 @@ func (s *Store) ManagedInstall(installID string) (*ManagedProfileInstall, *exit.
 	var out ManagedProfileInstall
 	err := s.db.QueryRow(`SELECT install_id,release_id,profile,candidate_id,
 		base_realization_digest,wheelhouse_manifest_digest,
-		environment_spec_digest,endpoint_bundle_digest,resolved_wheel_set_digest,
+		environment_spec_digest,package_bundle_digest,resolved_wheel_set_digest,
 		resolution_lock_digest,installed_receipt_digest,installed_receipt_length,
 		host_evidence_digest,native_evidence_digest,lease_id,lease_expires_at,recorded_at
 		FROM managed_profile_installs WHERE install_id=?`, installID).Scan(
 		&out.InstallID, &out.ReleaseID, &out.Profile, &out.CandidateID,
 		&out.BaseRealizationDigest, &out.WheelhouseManifestDigest,
-		&out.EnvironmentSpecDigest, &out.EndpointBundleDigest, &out.ResolvedWheelSetDigest,
+		&out.EnvironmentSpecDigest, &out.PackageBundleDigest, &out.ResolvedWheelSetDigest,
 		&out.ResolutionLockDigest, &out.InstalledReceiptDigest, &out.InstalledReceiptLength,
 		&out.HostEvidenceDigest, &out.NativeEvidenceDigest, &out.LeaseID, &out.LeaseExpiresAt, &out.RecordedAt)
 	if errors.Is(err, sql.ErrNoRows) {
@@ -365,23 +365,23 @@ func (s *Store) ManagedInstall(installID string) (*ManagedProfileInstall, *exit.
 	return &out, nil
 }
 
-// ActivePin returns the pinned generation for one (endpoint, major).
-func (s *Store) ActivePin(endpoint string, major int) (*Pin, *EndpointInstall, *exit.Error) {
+// ActivePin returns the pinned generation for one (package, major).
+func (s *Store) ActivePin(pkg string, major int) (*Pin, *PackageInstall, *exit.Error) {
 	var p Pin
-	err := s.db.QueryRow(`SELECT endpoint,major,generation,activated_at FROM pins
-		WHERE endpoint=? AND major=?`, endpoint, major).
-		Scan(&p.Endpoint, &p.Major, &p.InstallID, &p.ActivatedAt)
+	err := s.db.QueryRow(`SELECT package,major,generation,activated_at FROM pins
+		WHERE package=? AND major=?`, pkg, major).
+		Scan(&p.Package, &p.Major, &p.InstallID, &p.ActivatedAt)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, nil, nil
 	}
 	if err != nil {
-		return nil, nil, exit.Internalf("cannot read the pin for %s@v%d: %s", endpoint, major, err)
+		return nil, nil, exit.Internalf("cannot read the pin for %s@v%d: %s", pkg, major, err)
 	}
 	g, e := s.Install(p.InstallID)
 	return &p, g, e
 }
 
-func (s *Store) Install(id string) (*EndpointInstall, *exit.Error) {
+func (s *Store) Install(id string) (*PackageInstall, *exit.Error) {
 	g, err := scanGen(s.db.QueryRow(`SELECT `+genCols("")+` FROM install_generations WHERE id=?`, id))
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, nil
@@ -392,17 +392,17 @@ func (s *Store) Install(id string) (*EndpointInstall, *exit.Error) {
 	return &g, nil
 }
 
-// Installed is every active pin joined to its generation, endpoint-major ordered.
-// This is what `cozy endpoint list` reads — records only, never a walk of the filesystem.
-func (s *Store) Installed() ([]EndpointInstall, *exit.Error) {
+// Installed is every active pin joined to its generation, package-major ordered.
+// This is what `cozy package list` reads — records only, never a walk of the filesystem.
+func (s *Store) Installed() ([]PackageInstall, *exit.Error) {
 	rows, err := s.db.Query(`SELECT ` + genCols("g.") + `
 		FROM install_generations g JOIN pins p ON p.generation = g.id
-		ORDER BY g.endpoint, g.major`)
+		ORDER BY g.package, g.major`)
 	if err != nil {
-		return nil, exit.Internalf("cannot list installed endpoints: %s", err)
+		return nil, exit.Internalf("cannot list installed packages: %s", err)
 	}
 	defer rows.Close()
-	var out []EndpointInstall
+	var out []PackageInstall
 	for rows.Next() {
 		g, err := scanGen(rows)
 		if err != nil {
@@ -414,7 +414,7 @@ func (s *Store) Installed() ([]EndpointInstall, *exit.Error) {
 }
 
 // Unreferenced is every generation no pin points at — gc's reclaim set.
-func (s *Store) Unreferenced() ([]EndpointInstall, *exit.Error) {
+func (s *Store) Unreferenced() ([]PackageInstall, *exit.Error) {
 	rows, err := s.db.Query(`SELECT ` + genCols("g.") + `
 		FROM install_generations g WHERE g.id NOT IN (SELECT generation FROM pins)
 		ORDER BY g.created_at`)
@@ -422,7 +422,7 @@ func (s *Store) Unreferenced() ([]EndpointInstall, *exit.Error) {
 		return nil, exit.Internalf("cannot list unreferenced generations: %s", err)
 	}
 	defer rows.Close()
-	var out []EndpointInstall
+	var out []PackageInstall
 	for rows.Next() {
 		g, err := scanGen(rows)
 		if err != nil {
@@ -452,18 +452,18 @@ func (s *Store) KnownIDs() (map[string]bool, *exit.Error) {
 	return out, nil
 }
 
-// Pins of one endpoint across every major (rm without an explicit major).
-func (s *Store) Pins(endpoint string) ([]Pin, *exit.Error) {
-	rows, err := s.db.Query(`SELECT endpoint,major,generation,activated_at FROM pins
-		WHERE endpoint=? ORDER BY major`, endpoint)
+// Pins of one package across every major (rm without an explicit major).
+func (s *Store) Pins(pkg string) ([]Pin, *exit.Error) {
+	rows, err := s.db.Query(`SELECT package,major,generation,activated_at FROM pins
+		WHERE package=? ORDER BY major`, pkg)
 	if err != nil {
-		return nil, exit.Internalf("cannot list pins for %s: %s", endpoint, err)
+		return nil, exit.Internalf("cannot list pins for %s: %s", pkg, err)
 	}
 	defer rows.Close()
 	var out []Pin
 	for rows.Next() {
 		var p Pin
-		if err := rows.Scan(&p.Endpoint, &p.Major, &p.InstallID, &p.ActivatedAt); err != nil {
+		if err := rows.Scan(&p.Package, &p.Major, &p.InstallID, &p.ActivatedAt); err != nil {
 			return nil, exit.Internalf("cannot read a pin: %s", err)
 		}
 		out = append(out, p)
@@ -473,9 +473,9 @@ func (s *Store) Pins(endpoint string) ([]Pin, *exit.Error) {
 
 // Unpin drops one pin. The generation row survives as unreferenced until gc — `rm`
 // removes the install, gc reclaims the bytes.
-func (s *Store) Unpin(endpoint string, major int) *exit.Error {
-	if _, err := s.db.Exec(`DELETE FROM pins WHERE endpoint=? AND major=?`, endpoint, major); err != nil {
-		return exit.Internalf("cannot remove the pin for %s@v%d: %s", endpoint, major, err)
+func (s *Store) Unpin(pkg string, major int) *exit.Error {
+	if _, err := s.db.Exec(`DELETE FROM pins WHERE package=? AND major=?`, pkg, major); err != nil {
+		return exit.Internalf("cannot remove the pin for %s@v%d: %s", pkg, major, err)
 	}
 	return nil
 }

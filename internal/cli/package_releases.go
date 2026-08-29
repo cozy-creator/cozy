@@ -7,24 +7,24 @@ import (
 	"sync"
 	"time"
 
-	"github.com/cozy-creator/cozy-creator/internal/endpointpublish"
 	"github.com/cozy-creator/cozy-creator/internal/exit"
 	"github.com/cozy-creator/cozy-creator/internal/hub"
 	"github.com/cozy-creator/cozy-creator/internal/output"
+	"github.com/cozy-creator/cozy-creator/internal/packagepublish"
 	"github.com/cozy-creator/cozy-creator/internal/transfer"
 )
 
-func handleEndpointPublish(ctx *Context) *exit.Error {
+func handlePackagePublish(ctx *Context) *exit.Error {
 	ref, problem := hub.ParseRef(ctx.Inv.Args[0])
 	if problem != nil {
 		return problem
 	}
 	release := strings.TrimSpace(ctx.Inv.Value("--release"))
-	reason, problem := mutationReason(ctx, "endpoint publish")
+	reason, problem := mutationReason(ctx, "package publish")
 	if problem != nil {
 		return problem
 	}
-	pack, problem := endpointpublish.Prepare(endpointpublish.Request{
+	pack, problem := packagepublish.Prepare(packagepublish.Request{
 		Tree: ctx.Inv.Value("--dir"), Release: release,
 	})
 	if problem != nil {
@@ -39,26 +39,26 @@ func handleEndpointPublish(ctx *Context) *exit.Error {
 	c := client(ctx)
 	hctx, cancel := hub.LongContext()
 	defer cancel()
-	if _, problem := c.Endpoint(hctx, ref); problem != nil {
+	if _, problem := c.Package(hctx, ref); problem != nil {
 		if problem.Code != exit.NotFound {
 			return problem
 		}
-		if _, problem := c.CreateEndpoint(hctx, ref.Org, ref.Name, reason); problem != nil && problem.Code != exit.Conflict {
+		if _, problem := c.CreatePackage(hctx, ref.Org, ref.Name, reason); problem != nil && problem.Code != exit.Conflict {
 			return problem
 		}
 	}
-	begun, problem := c.BeginEndpointRelease(hctx, ref, release, declaration, reason)
+	begun, problem := c.BeginPackageRelease(hctx, ref, release, declaration, reason)
 	if problem != nil {
 		return problem
 	}
 	if problem := validateBegin(pack, begun); problem != nil {
 		return problem
 	}
-	moved, held, problem := uploadEndpointRoles(hctx, pack, begun.Uploads)
+	moved, held, problem := uploadPackageRoles(hctx, pack, begun.Uploads)
 	if problem != nil {
 		return problem
 	}
-	done, problem := c.FinalizeEndpointRelease(hctx, ref, release, declaration, reason)
+	done, problem := c.FinalizePackageRelease(hctx, ref, release, declaration, reason)
 	if problem != nil {
 		return problem
 	}
@@ -83,10 +83,10 @@ func handleEndpointPublish(ctx *Context) *exit.Error {
 	sort.Strings(candidateRows)
 	sort.Strings(refusalRows)
 	fields := []output.Field{
-		{K: "endpoint", V: ref.String()}, {K: "release", V: done.Release},
+		{K: "package", V: ref.String()}, {K: "release", V: done.Release},
 		{K: "status", V: "published"}, {K: "changed", V: begun.State != "committed"},
 		{K: "declaration", V: done.DeclarationDigest}, {K: "created", V: done.Created},
-		{K: "profiles", V: profileRows}, {K: "endpoint_executions", V: len(done.EndpointExecutions)},
+		{K: "profiles", V: profileRows}, {K: "package_executions", V: len(done.PackageExecutions)},
 		{K: "uploaded", V: output.Bytes(moved)}, {K: "held", V: output.Bytes(held)},
 		{K: "hub", V: c.Base()},
 	}
@@ -97,7 +97,7 @@ func handleEndpointPublish(ctx *Context) *exit.Error {
 		fields = append(fields, output.Field{K: "profile_refusals", V: refusalRows})
 	}
 	return emit(ctx, compactRecord(fields,
-		"endpoint", "release", "status", "profiles", "uploaded", "changed"))
+		"package", "release", "status", "profiles", "uploaded", "changed"))
 }
 
 func shorten(value string, limit int) string {
@@ -109,81 +109,81 @@ func shorten(value string, limit int) string {
 	return value
 }
 
-func validateBegin(pack *endpointpublish.Package, begun hub.EndpointReleaseBegin) *exit.Error {
+func validateBegin(pack *packagepublish.Package, begun hub.PackageReleaseBegin) *exit.Error {
 	if begun.DeclarationDigest != pack.Declaration.Digest() ||
 		(begun.State != "pending" && begun.State != "committed") {
-		return exit.Internalf("endpoint begin returned another declaration or invalid state %q", begun.State)
+		return exit.Internalf("package begin returned another declaration or invalid state %q", begun.State)
 	}
 	want := declarationRoles(pack)
 	seen := map[string]bool{}
 	for _, upload := range begun.Uploads {
 		local, ok := want[upload.Role]
 		if !ok || seen[upload.Role] {
-			return exit.Internalf("endpoint begin returned unknown or duplicate upload role %q", upload.Role)
+			return exit.Internalf("package begin returned unknown or duplicate upload role %q", upload.Role)
 		}
 		seen[upload.Role] = true
 		if upload.Ref.Digest != local.ref.Digest || upload.Ref.Length != local.ref.Length {
-			return exit.Internalf("endpoint begin changed the identity of role %s", upload.Role)
+			return exit.Internalf("package begin changed the identity of role %s", upload.Role)
 		}
 		if !upload.AlreadyHeld && upload.URL == "" {
-			return exit.Internalf("endpoint begin returned no URL for missing role %s", upload.Role)
+			return exit.Internalf("package begin returned no URL for missing role %s", upload.Role)
 		}
 		if !upload.AlreadyHeld {
 			expires, err := time.Parse(time.RFC3339, upload.ExpiresAt)
 			if err != nil || !expires.After(time.Now()) {
-				return exit.Internalf("endpoint begin returned an absent, malformed, or expired upload grant for %s", upload.Role)
+				return exit.Internalf("package begin returned an absent, malformed, or expired upload grant for %s", upload.Role)
 			}
 		}
 	}
 	if len(seen) != len(want) {
-		return exit.Internalf("endpoint begin returned %d of %d declared upload roles", len(seen), len(want))
+		return exit.Internalf("package begin returned %d of %d declared upload roles", len(seen), len(want))
 	}
 	return nil
 }
 
-func validateFinalize(pack *endpointpublish.Package, release string,
-	done hub.EndpointReleaseFinalize,
+func validateFinalize(pack *packagepublish.Package, release string,
+	done hub.PackageReleaseFinalize,
 ) *exit.Error {
 	if done.Release != release || done.DeclarationDigest != pack.Declaration.Digest() {
-		return exit.Internalf("endpoint finalize returned another release or declaration digest")
+		return exit.Internalf("package finalize returned another release or declaration digest")
 	}
 	seenProfiles := map[string]bool{}
 	seenRealizations := map[string]bool{}
 	qualifiedProfiles := map[string]bool{}
 	for _, row := range done.Profiles {
 		if row.Profile == "" || seenProfiles[row.Profile] {
-			return exit.Internalf("endpoint finalize returned an empty or duplicate profile %q", row.Profile)
+			return exit.Internalf("package finalize returned an empty or duplicate profile %q", row.Profile)
 		}
 		seenProfiles[row.Profile] = true
 		key := row.Profile + "\x00" + row.BaseRealizationKind
 		if seenRealizations[key] || (row.BaseRealizationKind != "oci" && row.BaseRealizationKind != "managed-local") ||
 			row.CandidateID == "" || !baseRealization(row.BaseRealizationKind, row.BaseRealizationDigest) ||
-			!objectRef(row.EndpointEnvironmentSpec) || !objectRef(row.ResolvedWheelSet) ||
+			!objectRef(row.PackageEnvironmentSpec) || !objectRef(row.ResolvedWheelSet) ||
 			!objectRef(row.ResolutionLock) {
-			return exit.Internalf("endpoint finalize returned malformed or duplicate realization %q/%q",
+			return exit.Internalf("package finalize returned malformed or duplicate realization %q/%q",
 				row.Profile, row.BaseRealizationKind)
 		}
 		seenRealizations[key] = true
 		if row.State != "qualified" && row.State != "refused" {
-			return exit.Internalf("endpoint finalize returned unknown profile state %q", row.State)
+			return exit.Internalf("package finalize returned unknown profile state %q", row.State)
 		}
 		if row.State == "refused" && row.RefusalCode == "" {
-			return exit.Internalf("endpoint finalize returned a refusal without a typed code")
+			return exit.Internalf("package finalize returned a refusal without a typed code")
 		}
 		if row.State == "qualified" {
 			if row.RefusalCode != "" || row.RefusalDetail != "" {
-				return exit.Internalf("endpoint finalize returned refusal detail on a passing candidate")
+				return exit.Internalf("package finalize returned refusal detail on a passing candidate")
 			}
 			qualifiedProfiles[row.Profile] = true
 		}
 	}
 	seenExecutions := map[string]bool{}
-	for _, execution := range done.EndpointExecutions {
+	for _, execution := range done.PackageExecutions {
 		key := execution.Profile + "\x00" + execution.Function
 		if !qualifiedProfiles[execution.Profile] || strings.TrimSpace(execution.Function) == "" ||
 			seenExecutions[key] || !sha256Digest(execution.Digest) ||
 			execution.State != "qualified" {
-			return exit.Internalf("endpoint finalize returned malformed or duplicate execution %q/%q",
+			return exit.Internalf("package finalize returned malformed or duplicate execution %q/%q",
 				execution.Profile, execution.Function)
 		}
 		seenExecutions[key] = true
@@ -215,23 +215,23 @@ func sha256Digest(value string) bool {
 }
 
 type localRole struct {
-	ref  endpointpublish.ObjectRef
+	ref  packagepublish.ObjectRef
 	path string
 }
 
-func declarationRoles(pack *endpointpublish.Package) map[string]localRole {
+func declarationRoles(pack *packagepublish.Package) map[string]localRole {
 	d := pack.Declaration
 	out := map[string]localRole{
 		"source_archive": {ref: d.SourceArchive, path: pack.Files["source_archive"]},
 		"source_lock":    {ref: d.SourceLock, path: pack.Files["source_lock"]},
-		"project_wheel":  {ref: endpointpublish.ObjectRef{Digest: d.ProjectWheel.Digest, Length: d.ProjectWheel.Length}, path: pack.Files["project_wheel"]},
+		"project_wheel":  {ref: packagepublish.ObjectRef{Digest: d.ProjectWheel.Digest, Length: d.ProjectWheel.Length}, path: pack.Files["project_wheel"]},
 		"descriptor":     {ref: d.Descriptor, path: pack.Files["descriptor"]},
 	}
 	return out
 }
 
-func uploadEndpointRoles(ctx context.Context, pack *endpointpublish.Package,
-	uploads []hub.EndpointUpload,
+func uploadPackageRoles(ctx context.Context, pack *packagepublish.Package,
+	uploads []hub.PackageUpload,
 ) (int64, int64, *exit.Error) {
 	want := declarationRoles(pack)
 	type outcome struct {
@@ -249,7 +249,7 @@ func uploadEndpointRoles(ctx context.Context, pack *endpointpublish.Package,
 			continue
 		}
 		group.Add(1)
-		go func(upload hub.EndpointUpload, local localRole) {
+		go func(upload hub.PackageUpload, local localRole) {
 			defer group.Done()
 			moved, problem := transfer.UploadPresigned(ctx, upload.Role, local.path,
 				upload.URL, local.ref.Digest, local.ref.Length, upload.RequiredHeaders)
@@ -280,10 +280,10 @@ func uploadEndpointRoles(ctx context.Context, pack *endpointpublish.Package,
 	return moved, held, nil
 }
 
-func endpointReleaseRef(value string) (hub.Ref, string, *exit.Error) {
+func packageReleaseRef(value string) (hub.Ref, string, *exit.Error) {
 	name, release, ok := strings.Cut(strings.TrimSpace(value), "@")
 	if !ok || release == "" || strings.Contains(release, "@") || strings.ContainsAny(release, `/\`) {
-		return hub.Ref{}, "", exit.Usagef("%q is not <org/endpoint>@<release>", value)
+		return hub.Ref{}, "", exit.Usagef("%q is not <org/package>@<release>", value)
 	}
 	ref, problem := hub.ParseRef(name)
 	return ref, release, problem

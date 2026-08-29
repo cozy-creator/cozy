@@ -1,4 +1,4 @@
-"""Build the weightless endpoint archive used by TestProductPath."""
+"""Build the weightless package archive used by TestProductPath."""
 
 from __future__ import annotations
 
@@ -35,7 +35,7 @@ def digest(path: pathlib.Path) -> str:
 
 
 def pack(
-    tree: pathlib.Path, endpoint: str, version: str, archive: pathlib.Path
+    tree: pathlib.Path, package: str, version: str, archive: pathlib.Path
 ) -> None:
     files: list[dict[str, object]] = []
     for path in sorted(tree.rglob("*")):
@@ -55,7 +55,7 @@ def pack(
         )
 
     declaration = json.dumps(
-        {"endpoint": endpoint, "version": version, "files": files}, indent=2
+        {"package": package, "version": version, "files": files}, indent=2
     ).encode()
     with tarfile.open(archive, "w:gz") as output:
         header = tarfile.TarInfo("release.json")
@@ -78,7 +78,7 @@ def main() -> int:
     parser.add_argument("--runtime-sha", default=os.getenv("RUNTIME_SHA", "HEAD"))
     parser.add_argument("--out", required=True)
     parser.add_argument("--version", default="1.0.0")
-    parser.add_argument("--endpoint", default="cozy/weightless")
+    parser.add_argument("--package", default="cozy/weightless")
     args = parser.parse_args()
 
     runtime_repo = pathlib.Path(args.runtime_repo).expanduser().resolve()
@@ -119,10 +119,10 @@ def main() -> int:
             raise RuntimeError(f"expected one cozy-runtime wheel, found {len(wheels)}")
 
         shutil.copy2(FIXTURE / "weightless.py", tree / "weightless.py")
-        shutil.copy2(FIXTURE / "endpoint.toml", tree / "endpoint.toml")
+        shutil.copy2(FIXTURE / "package.toml", tree / "package.toml")
         (tree / "pyproject.toml").write_text(
             "[project]\n"
-            'name = "cozy-weightless-endpoint"\n'
+            'name = "cozy-weightless-package"\n'
             f'version = "{args.version}"\n'
             'requires-python = ">=3.11"\n'
             f'dependencies = ["cozy-runtime[media]=={runtime_version}"]\n\n'
@@ -144,8 +144,8 @@ def main() -> int:
             env=env,
         )
 
-        archive = out / f"{args.endpoint.rsplit('/', 1)[-1]}-{args.version}.tar.gz"
-        pack(tree, args.endpoint, args.version, archive)
+        archive = out / f"{args.package.rsplit('/', 1)[-1]}-{args.version}.tar.gz"
+        pack(tree, args.package, args.version, archive)
         print(f"archive:  {archive}")
         print(f"runtime: {full_sha} (git archive, read-only)")
         print(f"digest:  sha256:{digest(archive)}")

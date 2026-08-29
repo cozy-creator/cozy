@@ -27,7 +27,7 @@ import (
 )
 
 // TestRemotePlacementReceivesGrantBeforeDesired drives the real RecordOwner over a pinned
-// TLS gRPC stream and the real pod media health leg. It proves the endpoint-distribution
+// TLS gRPC stream and the real pod media health leg. It proves the package-distribution
 // hardcut at the process boundary: after SnapshotAck the next frame is ArtifactGrantUpdate,
 // then the exact PlacementSet/2, with no PutPlan request available on the media server.
 func TestRemotePlacementReceivesGrantBeforeDesired(t *testing.T) {
@@ -50,7 +50,7 @@ func TestRemotePlacementReceivesGrantBeforeDesired(t *testing.T) {
 		Kind: "model_object_set", Length: uint64(len(modelData))}
 	setBytes, setDigest, err := canonical.Identity(&pb.PlacementSet{Placements: []*pb.Placement{{
 		PlacementId: "acquisition-1", Spec: &pb.PlacementSpec{
-			EndpointReleaseId: "release-1", BindingPlans: []*pb.ArtifactSubject{planSubject},
+			PackageReleaseId: "release-1", BindingPlans: []*pb.ArtifactSubject{planSubject},
 			ModelObjectSet: modelSubject,
 		},
 	}}})
@@ -58,7 +58,7 @@ func TestRemotePlacementReceivesGrantBeforeDesired(t *testing.T) {
 	setSpelling, _ := canonical.Spell(setDigest)
 	placement := orchestrator.DesiredPlacement{
 		PlacementRevision: 1,
-		Endpoint:          "cozy/endpoint@rental-1", ReleaseID: "release-1",
+		Package:           "cozy/package@rental-1", ReleaseID: "release-1",
 		PlacementIDValue: "acquisition-1", ExactPlacementSetDigest: setSpelling,
 		ExactPlacementSetBytes: setBytes, ModelObjectSetDigest: modelDigest,
 		ModelObjectSetLength: uint64(len(modelData)),

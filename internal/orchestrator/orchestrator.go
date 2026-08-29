@@ -44,12 +44,12 @@ type Options struct {
 	Yield string
 	Log   io.Writer
 
-	// Endpoints resolves `org/name` to the spec that makes its worker resident. It is the
+	// Packages resolves `org/name` to the spec that makes its worker resident. It is the
 	// START-OR-SELECT half of the one execution path (cl-010): a request whose binding no
 	// live worker advertises MAKES one, so a cold invocation and a warm one traverse the
 	// same states and differ only in latency. Without it a cold request queues for
 	// capacity that nothing would ever create.
-	Endpoints Launcher
+	Packages Launcher
 
 	// Rentals resolves an attached-worker id (`cozy rental new`'s persisted triple) to its
 	// dial spec. Wired by the entrypoint; nil = this service attaches no remote workers.
@@ -70,7 +70,7 @@ type Options struct {
 
 	// EnvironmentSpecDigest and ConfigDigest are LOCAL invocation defaults. They ride
 	// INSIDE every local InvocationSpec document:
-	// the EndpointEnvironmentSpec that IS this invocation's execution environment (#483 —
+	// the PackageEnvironmentSpec that IS this invocation's execution environment (#483 —
 	// was `ImageDigest`, and "image" is wrong for a native install with no OCI image at
 	// all) and the local evaluated-config document's identity (cr-003's). They are frozen
 	// per service, never per request. A remote placement supplies only Tensorhub's exact
@@ -103,13 +103,13 @@ type RentalObservation struct {
 	WorkerBootID           string
 }
 
-// Launcher resolves an endpoint ref along the two boundaries #484 split: the
+// Launcher resolves a package ref along the two boundaries #484 split: the
 // platform-neutral desired placement and the local target-environment launch. A connected
 // worker asks only for ResolvePlacement; it must never force this host to materialize or
 // execute the target environment merely to author a remote plan.
 type Launcher interface {
-	ResolvePlacement(endpoint string) (DesiredPlacement, *exit.Error)
-	Resolve(endpoint string) (WorkerLaunchSpec, *exit.Error)
+	ResolvePlacement(pkg string) (DesiredPlacement, *exit.Error)
+	Resolve(pkg string) (WorkerLaunchSpec, *exit.Error)
 	// ResolveInstall relaunches the immutable local install a durable request resolved
 	// before entering the queue, so a changed pin cannot change accepted work.
 	ResolveInstall(installID string) (WorkerLaunchSpec, *exit.Error)
@@ -118,7 +118,7 @@ type Launcher interface {
 	// because the two produce different Directives and different worker slots — the
 	// mode is a fact about the worker, and a resolver that returned "either" would push
 	// the choice into the orchestrator, which resolves nothing.
-	ResolveJob(endpoint, function string) (WorkerLaunchSpec, *exit.Error)
+	ResolveJob(pkg, function string) (WorkerLaunchSpec, *exit.Error)
 }
 
 // Orchestrator is the local controller's scheduling role.
@@ -152,8 +152,8 @@ type Orchestrator struct {
 	// closing is set by Close: a worker stopped during shutdown must not make the queue
 	// ask for a replacement, because the service that would run it is going away.
 	closing bool
-	// starting names the endpoints a select-or-start is already making resident. One
-	// launch per endpoint: three cold requests for one endpoint must not spawn three
+	// starting names the packages a select-or-start is already making resident. One
+	// launch per package: three cold requests for one package must not spawn three
 	// workers and three device grants for a card that serves one attempt at a time.
 	starting map[string]bool
 	// ensuring is the per-instance creation fence beneath every caller, including journal

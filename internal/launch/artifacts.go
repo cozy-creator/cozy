@@ -14,7 +14,7 @@ import (
 )
 
 // DefaultRuntimeQueryTimeout bounds metadata-only runtime questions used while selecting
-// or starting a worker. These verbs read declarations; they do not construct an endpoint,
+// or starting a worker. These verbs read declarations; they do not construct an package,
 // inspect a device, or load weights. A runtime that cannot answer them promptly is stalled,
 // and must not hold an orchestrator slot's in-memory starting fence forever.
 const DefaultRuntimeQueryTimeout = 5 * time.Second
@@ -38,7 +38,7 @@ const DefaultRuntimeQueryTimeout = 5 * time.Second
 // that knows how to invoke it and one place that renders its refusals.
 type RuntimeCLI struct {
 	Bin          string        // the generation venv's cozy-runtime (home.VenvTool spells the platform)
-	Dir          string        // the endpoint project root
+	Dir          string        // the package project root
 	Home         string        // COZY_HOME the runtime reads its artifact index out of
 	Env          []string      // the allowlisted child environment (config.Tool)
 	QueryTimeout time.Duration // metadata-query bound; zero selects DefaultRuntimeQueryTimeout
@@ -47,7 +47,7 @@ type RuntimeCLI struct {
 // Binary is the runtime a generation carries. An install already refused a generation
 // whose venv provides none (cl-009's `runtime_missing`), so this is the same claim,
 // re-asserted where it is used.
-func Binary(generation records.EndpointInstall) string {
+func Binary(generation records.PackageInstall) string {
 	if generation.Runtime != "" {
 		return generation.Runtime
 	}
@@ -88,12 +88,12 @@ func (r RuntimeCLI) callContext(ctx context.Context, out any, verb ...string) *e
 		return exit.Named(exit.Deadline, "runtime_query_stalled",
 			"`cozy-runtime %s` did not answer its metadata query within %s",
 			strings.Join(verb, " "), r.queryTimeout()).
-			WithRemedy("the release's runtime must answer bindings and job-describe metadata without importing or constructing the endpoint")
+			WithRemedy("the release's runtime must answer bindings and job-describe metadata without importing or constructing the package")
 	}
 	if cmd.ProcessState == nil {
 		return exit.Named(exit.Structural, "runtime_missing",
 			"cannot run %s: %s", r.Bin, err).
-			WithRemedy("an endpoint's surface is answered by the runtime the release itself pinned")
+			WithRemedy("a package's surface is answered by the runtime the release itself pinned")
 	}
 	if code := cmd.ProcessState.ExitCode(); code != 0 {
 		return runtimeRefusal(code, strings.Join(verb, " "), stdout.String(), stderr.String())
@@ -159,7 +159,7 @@ func condense(s string) string {
 }
 
 // Binding is one RESOLVED binding record, exactly as `cozy-runtime bindings` reports it.
-// It is the runtime's own resolution of `endpoint.toml`'s selection grammar against the
+// It is the runtime's own resolution of `package.toml`'s selection grammar against the
 // declared slots and the local artifact index. cozy-creator asks the owner rather than
 // reading the table itself: cr-016 built this verb so that second reader could delete.
 type Binding struct {

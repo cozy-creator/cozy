@@ -1,9 +1,9 @@
 // Package media is the OWNER's side of a rented pod's media server (cl-014, ruled #506b):
 // the only byte channel there is between this host and a pod, in either direction.
 //
-// This plane carries per-invocation inputs and outputs only. Endpoint source, plans,
+// This plane carries per-invocation inputs and outputs only. Package source, plans,
 // wheels, and model-object sets are ordinary standing ArtifactGrant subjects fetched by
-// the worker; there is no endpoint-distribution route on this client or the pod server.
+// the worker; there is no package-distribution route on this client or the pod server.
 //
 // WHY THE POD HOSTS IT and not this host: an owner-side byte plane would have to bind
 // off-loopback, which is exactly what `internal/api`'s one-bind-site fence refuses, and it

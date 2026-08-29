@@ -41,11 +41,11 @@ service.
 POST /v1/requests
 Idempotency-Key: <caller's key>
 
-{"endpoint": "org/name", "function": "denoise", "input": {…},
+{"package": "org/name", "function": "denoise", "input": {…},
  "outputs": ["image"]}
 ```
 
-`input` is the endpoint's own typed payload and is carried verbatim to the runtime.
+`input` is the package's own typed payload and is carried verbatim to the runtime.
 `outputs` names result FIELD PATHS (`image`, `detail.thumb`) and defaults to the
 entrypoint's declared set — binding by field path is what makes a two-output result
 unswappable.
@@ -91,7 +91,7 @@ plane does not answer is `media_unreachable` — this host never falls back to g
 path on its own disk, because the pod cannot reach one.
 
 **The idempotency key names one request forever.** The host records the key beside a
-digest of the whole submission — endpoint, function, input, asset identities, outputs —
+digest of the whole submission — package, function, input, asset identities, outputs —
 so the same key with a different FUNCTION conflicts as loudly as one with different input.
 Answers:
 
@@ -113,10 +113,10 @@ Answers:
 ### Status
 
 ```json
-{"request_id": "req-…", "status": "completed", "endpoint": "org/name",
+{"request_id": "req-…", "status": "completed", "package": "org/name",
  "function": "denoise", "attempt": 1, "attempts": 1,
  "metrics": {"runtime_ms": 401, "handler_ms": 398, "peak_vram_bytes": 6…},
- "result": {…the endpoint's typed result…},
+ "result": {…the package's typed result…},
  "outputs": [{"output_id": "image", "media_id": "med-…", "url": "/v1/media/med-…",
               "mime_type": "image/png", "length": 11134, "digest": "sha256:…"}],
  "triage": {"attempt_key": "att-…", "subject_id": "trb-…",
@@ -148,7 +148,7 @@ after it arrives in order, across a host restart. `id:` carries the cursor on th
 
 | type | payload |
 |---|---|
-| `request.submitted` | `endpoint`, `function`, `body_digest`, `plan_id`, `outputs` |
+| `request.submitted` | `package`, `function`, `body_digest`, `plan_id`, `outputs` |
 | `request.queued` | `reason` |
 | `request.dispatch_aborted` | pre-offer preparation failed; `cause`, `error`; no worker saw this ordinal |
 | `request.dispatched` | `instance_id`, `invocation_digest` |

@@ -24,11 +24,11 @@ import (
 
 const (
 	format          = "tensorhub.rental_control_snapshot/2"
-	bindingFormat   = "tensorhub.endpoint_binding_release/1"
-	planFormat      = "cozy.endpoint.EntrypointBindingPlan/1"
-	rmbFormat       = "cozy.endpoint.ResolvedModelBinding/1"
-	bundleFormat    = "tensorhub.endpoint_bundle/2"
-	receiptFormat   = "cozy.runtime.EndpointOverlayReceipt/1"
+	bindingFormat   = "tensorhub.package_binding_release/1"
+	planFormat      = "cozy.package.EntrypointBindingPlan/1"
+	rmbFormat       = "cozy.package.ResolvedModelBinding/1"
+	bundleFormat    = "tensorhub.package_bundle/2"
+	receiptFormat   = "cozy.runtime.PackageOverlayReceipt/1"
 	maxSnapshotSize = 64 << 20
 )
 
@@ -45,8 +45,8 @@ type snapshot struct {
 	BindingDocuments            []bindingDocument        `json:"binding_documents"`
 	BindingRelease              hub.ExactControlDocument `json:"binding_release"`
 	Descriptor                  hub.ExactControlDocument `json:"descriptor"`
-	EndpointBundle              hub.ExactControlDocument `json:"endpoint_bundle"`
-	EndpointExecutionDigest     string                   `json:"endpoint_execution_digest"`
+	PackageBundle               hub.ExactControlDocument `json:"package_bundle"`
+	PackageExecutionDigest      string                   `json:"package_execution_digest"`
 	EnvironmentSpec             hub.ExactControlDocument `json:"environment_spec"`
 	Format                      string                   `json:"format"`
 	InstalledEnvironmentReceipt hub.ExactControlDocument `json:"installed_environment_receipt"`
@@ -59,7 +59,7 @@ type snapshot struct {
 type Facts struct {
 	Descriptor              *launch.Descriptor
 	Placement               orchestrator.DesiredPlacement
-	EndpointExecutionDigest string
+	PackageExecutionDigest  string
 	ArtifactObjectSetDigest string
 	ModelRootDigests        []string
 }
@@ -108,7 +108,7 @@ func decodeSnapshot(exact hub.ExactControlDocument) (snapshot, *exit.Error) {
 	if err != nil || !bytes.Equal(again, exact.CanonicalBytes) {
 		return out, invalid("control snapshot is not its exact canonical encoding")
 	}
-	if out.Format != format || out.AcquisitionAttemptID == "" || out.EndpointExecutionDigest == "" ||
+	if out.Format != format || out.AcquisitionAttemptID == "" || out.PackageExecutionDigest == "" ||
 		len(out.BindingDocuments) == 0 {
 		return out, invalid("control snapshot header is incomplete")
 	}
@@ -317,9 +317,9 @@ func exactOf(document bindingDocument) hub.ExactControlDocument {
 }
 
 // Decode verifies the complete snapshot closure and returns the remote
-// placement. endpointRef is the provider-neutral product ref persisted with the
+// placement. packageRef is the provider-neutral product ref persisted with the
 // rental, not a local installation key.
-func Decode(control hub.ExactControlDocument, endpointRef string) (Facts, *exit.Error) {
+func Decode(control hub.ExactControlDocument, packageRef string) (Facts, *exit.Error) {
 	var facts Facts
 	s, e := decodeSnapshot(control)
 	if e != nil {
@@ -328,7 +328,7 @@ func Decode(control hub.ExactControlDocument, endpointRef string) (Facts, *exit.
 	for name, document := range map[string]hub.ExactControlDocument{
 		"artifact_object_set": s.ArtifactObjectSet,
 		"binding_release":     s.BindingRelease, "descriptor": s.Descriptor,
-		"endpoint_bundle": s.EndpointBundle, "environment_spec": s.EnvironmentSpec,
+		"package_bundle": s.PackageBundle, "environment_spec": s.EnvironmentSpec,
 		"installed_environment_receipt": s.InstalledEnvironmentReceipt,
 		"placement_set":                 s.PlacementSet, "resolved_wheel_set": s.ResolvedWheelSet,
 	} {
@@ -352,9 +352,9 @@ func Decode(control hub.ExactControlDocument, endpointRef string) (Facts, *exit.
 	}
 
 	release, err := canonical.ReadObject(s.BindingRelease.CanonicalBytes)
-	if err != nil || requireKeys(release, "descriptor", "documents", "endpoint_execution_digest",
+	if err != nil || requireKeys(release, "descriptor", "documents", "package_execution_digest",
 		"environment_spec", "format", "installed_environment_receipt", "object_set_digest") != nil ||
-		release.Str("format") != bindingFormat || release.Str("endpoint_execution_digest") != s.EndpointExecutionDigest {
+		release.Str("format") != bindingFormat || release.Str("package_execution_digest") != s.PackageExecutionDigest {
 		return facts, invalid("binding release is not the exact closed release: %v", err)
 	}
 	descriptorRef, err := refOf(release.Sub("descriptor"))
@@ -416,7 +416,7 @@ func Decode(control hub.ExactControlDocument, endpointRef string) (Facts, *exit.
 			placement.Str("placement_id"), s.AcquisitionAttemptID)
 	}
 	placementSpec := placement.Sub("spec")
-	if placementSpec.Str("descriptor_digest") != s.Descriptor.Digest ||
+	if placementSpec.Str("package_descriptor_digest") != s.Descriptor.Digest ||
 		placementSpec.Str("environment_spec_digest") != s.EnvironmentSpec.Digest ||
 		placementSpec.Str("installed_environment_receipt_digest") != s.InstalledEnvironmentReceipt.Digest {
 		return facts, invalid("placement fixed digests disagree with the exact snapshot documents")
@@ -454,30 +454,30 @@ func Decode(control hub.ExactControlDocument, endpointRef string) (Facts, *exit.
 		return facts, invalid("placement reaches a plan outside the binding release")
 	}
 
-	bundle, err := canonical.ReadObject(s.EndpointBundle.CanonicalBytes)
-	if err != nil || requireKeys(bundle, "descriptor", "endpoint_release_id", "format",
+	bundle, err := canonical.ReadObject(s.PackageBundle.CanonicalBytes)
+	if err != nil || requireKeys(bundle, "descriptor", "package_release_id", "format",
 		"project_wheel", "resolved_wheel_set", "source_archive", "source_lock", "wheelhouse_manifest") != nil ||
-		bundle.Str("format") != bundleFormat || bundle.Str("endpoint_release_id") != placementSpec.Str("endpoint_release_id") {
-		return facts, invalid("endpoint bundle disagrees with the placement: %v", err)
+		bundle.Str("format") != bundleFormat || bundle.Str("package_release_id") != placementSpec.Str("package_release_id") {
+		return facts, invalid("package bundle disagrees with the placement: %v", err)
 	}
 	bundleDescriptor, err := refOf(bundle.Sub("descriptor"))
 	if err != nil || !sameRef(bundleDescriptor, s.Descriptor) {
-		return facts, invalid("endpoint bundle descriptor differs from the exact descriptor")
+		return facts, invalid("package bundle descriptor differs from the exact descriptor")
 	}
 	sourceArchive, archiveErr := refOf(bundle.Sub("source_archive"))
 	sourceLock, lockErr := refOf(bundle.Sub("source_lock"))
 	resolvedWheels, resolvedErr := refOf(bundle.Sub("resolved_wheel_set"))
 	if archiveErr != nil || lockErr != nil || resolvedErr != nil ||
 		sourceArchive.Digest == sourceLock.Digest {
-		return facts, invalid("endpoint bundle source archive, lock, or resolved wheel set is absent or malformed")
+		return facts, invalid("package bundle source archive, lock, or resolved wheel set is absent or malformed")
 	}
 	if !sameRef(resolvedWheels, s.ResolvedWheelSet) {
-		return facts, invalid("endpoint bundle resolved wheel set does not match the snapshot document")
+		return facts, invalid("package bundle resolved wheel set does not match the snapshot document")
 	}
 
-	environment, err := canonical.Read(s.EnvironmentSpec.CanonicalBytes, &pb.EndpointEnvironmentSpec{})
-	if err != nil || environment.Str("endpoint_bundle_digest") != s.EndpointBundle.Digest {
-		return facts, invalid("environment spec does not close the endpoint bundle: %v", err)
+	environment, err := canonical.Read(s.EnvironmentSpec.CanonicalBytes, &pb.PackageEnvironmentSpec{})
+	if err != nil || environment.Str("package_bundle_digest") != s.PackageBundle.Digest {
+		return facts, invalid("environment spec does not close the package bundle: %v", err)
 	}
 	if err := validateOverlayReceipt(s.InstalledEnvironmentReceipt.CanonicalBytes, s.EnvironmentSpec, environment,
 		bundle.Sub("project_wheel"), s.ResolvedWheelSet.CanonicalBytes); err != nil {
@@ -486,7 +486,7 @@ func Decode(control hub.ExactControlDocument, endpointRef string) (Facts, *exit.
 
 	descriptor, problem := launch.DecodeDescriptor(s.Descriptor.CanonicalBytes)
 	if problem != nil || descriptor.Digest != s.Descriptor.Digest {
-		return facts, invalid("endpoint descriptor is unreadable or has the wrong digest: %v", problem)
+		return facts, invalid("package descriptor is unreadable or has the wrong digest: %v", problem)
 	}
 	visible := map[string]*launch.Entrypoint{}
 	for i := range descriptor.Entrypoints {
@@ -564,7 +564,7 @@ func Decode(control hub.ExactControlDocument, endpointRef string) (Facts, *exit.
 	}
 	sort.Slice(bindings, func(i, j int) bool { return bindings[i].Entrypoint < bindings[j].Entrypoint })
 
-	parts := strings.Split(strings.TrimSpace(endpointRef), "/")
+	parts := strings.Split(strings.TrimSpace(packageRef), "/")
 	major := uint64(0)
 	var majorErr error
 	if len(parts) == 4 && strings.HasPrefix(parts[2], "v") {
@@ -573,17 +573,17 @@ func Decode(control hub.ExactControlDocument, endpointRef string) (Facts, *exit.
 	repo, repoErr := hub.ParseRef(strings.Join(parts[:min(len(parts), 2)], "/"))
 	if len(parts) != 4 || repoErr != nil || majorErr != nil || major == 0 ||
 		parts[2] != fmt.Sprintf("v%d", major) || parts[3] == "" || visible[parts[3]] == nil {
-		return facts, invalid("rental endpoint_ref %q is not covered by the exact descriptor", endpointRef)
+		return facts, invalid("rental package_ref %q is not covered by the exact descriptor", packageRef)
 	}
 	facts.Descriptor = descriptor
-	facts.EndpointExecutionDigest = s.EndpointExecutionDigest
+	facts.PackageExecutionDigest = s.PackageExecutionDigest
 	facts.ArtifactObjectSetDigest = s.ArtifactObjectSet.Digest
 	facts.Placement = orchestrator.DesiredPlacement{
-		Endpoint: repo.String(), ReleaseID: placementSpec.Str("endpoint_release_id"),
+		Package: repo.String(), ReleaseID: placementSpec.Str("package_release_id"),
 		// No InstallID: a remote placement resolves from Tensorhub's attempt, never a
 		// local install row; the attempt id rides PlacementIDValue.
-		DescriptorDigest: s.Descriptor.Digest,
-		Bindings:         bindings, EnvironmentSpecDigest: s.EnvironmentSpec.Digest,
+		PackageDescriptorDigest: s.Descriptor.Digest,
+		Bindings:                bindings, EnvironmentSpecDigest: s.EnvironmentSpec.Digest,
 		InstalledEnvironmentReceiptDigest: s.InstalledEnvironmentReceipt.Digest,
 		ExactPlacementSetDigest:           s.PlacementSet.Digest,
 		ExactPlacementSetBytes:            append([]byte(nil), s.PlacementSet.CanonicalBytes...),

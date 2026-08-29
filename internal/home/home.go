@@ -59,7 +59,7 @@ type Layout struct {
 	Rentals string
 	// ManagedBases is the operator-populated immutable local equivalent of a base
 	// worker image. Creator selects only by exact realization digest; it never resolves
-	// or builds packages into this registry during endpoint install.
+	// or builds packages into this registry during package install.
 	ManagedBases string
 }
 

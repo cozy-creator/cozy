@@ -12,19 +12,19 @@ import (
 	"github.com/cozy-creator/cozy-creator/internal/records"
 )
 
-// The LOCAL module's endpoint resolver: `org/name` -> the spec that makes its worker
+// The LOCAL module's package resolver: `org/name` -> the spec that makes its worker
 // resident. ONE source, and it is the only one a user's machine will ever use — the
 // INSTALL GENERATION and its pin (cl-009's rows), resolved through internal/launch.
 //
-// cl-006 shipped a second source, `--dev-endpoint <file>`: a hand-written EndpointSpec
+// cl-006 shipped a second source, `--dev-package <file>`: a hand-written PackageSpec
 // document, because the generation could not yet carry the launch facts a supervisor
 // needs and guessing an interpreter would have been worse than refusing. cl-010 DELETES
 // it — a generation carries a venv, a proven descriptor and a binding table, which is
 // every fact that document supplied. Nothing coexists "temporarily": the flag, the
-// loader, and the driver's writer are all gone, and the live driver installs an endpoint
+// loader, and the driver's writer are all gone, and the live driver installs a package
 // exactly as a user does.
 
-// Resolver is the local controller's endpoint resolver.
+// Resolver is the local controller's package resolver.
 type Resolver struct {
 	mu    sync.Mutex
 	store *records.Store
@@ -50,18 +50,18 @@ func NewResolver(store *records.Store, cfg config.Config) *Resolver {
 	}
 }
 
-// ResolvePlacement answers only WHAT an endpoint target should host. The current local
+// ResolvePlacement answers only WHAT a package target should host. The current local
 // install derives that fact from its proven environment; a future control-manifest
 // install can supply it directly without changing the API or orchestrator boundary.
-func (r *Resolver) ResolvePlacement(endpoint string) (orchestrator.DesiredPlacement, *exit.Error) {
-	endpoint = strings.TrimSpace(endpoint)
+func (r *Resolver) ResolvePlacement(pkg string) (orchestrator.DesiredPlacement, *exit.Error) {
+	pkg = strings.TrimSpace(pkg)
 	r.mu.Lock()
-	placement, ok := r.placements[endpoint]
+	placement, ok := r.placements[pkg]
 	r.mu.Unlock()
 	if ok {
 		return placement, nil
 	}
-	gen, e := r.generation(endpoint)
+	gen, e := r.generation(pkg)
 	if e != nil {
 		return orchestrator.DesiredPlacement{}, e
 	}
@@ -74,21 +74,21 @@ func (r *Resolver) ResolvePlacement(endpoint string) (orchestrator.DesiredPlacem
 		return orchestrator.DesiredPlacement{}, e
 	}
 	r.mu.Lock()
-	r.placements[endpoint] = placement
+	r.placements[pkg] = placement
 	r.mu.Unlock()
 	return placement, nil
 }
 
-// Resolve answers with the spec for one endpoint ref.
-func (r *Resolver) Resolve(endpoint string) (orchestrator.WorkerLaunchSpec, *exit.Error) {
-	endpoint = strings.TrimSpace(endpoint)
+// Resolve answers with the spec for one package ref.
+func (r *Resolver) Resolve(pkg string) (orchestrator.WorkerLaunchSpec, *exit.Error) {
+	pkg = strings.TrimSpace(pkg)
 	r.mu.Lock()
-	spec, ok := r.cache[endpoint]
+	spec, ok := r.cache[pkg]
 	r.mu.Unlock()
 	if ok {
 		return spec, nil
 	}
-	gen, e := r.generation(endpoint)
+	gen, e := r.generation(pkg)
 	if e != nil {
 		return orchestrator.WorkerLaunchSpec{}, e
 	}
@@ -101,7 +101,7 @@ func (r *Resolver) Resolve(endpoint string) (orchestrator.WorkerLaunchSpec, *exi
 		return orchestrator.WorkerLaunchSpec{}, e
 	}
 	r.mu.Lock()
-	r.cache[endpoint] = spec
+	r.cache[pkg] = spec
 	r.mu.Unlock()
 	return spec, nil
 }
@@ -141,10 +141,10 @@ func (r *Resolver) installFacts(installID string) (*launch.Facts, *exit.Error) {
 // the same generation, the same venv and the same device envelope as `Resolve` — what
 // differs is the plan record staged for it and the Directive mode it boots into.
 //
-// It is NOT cached: a job spec is per-function, and caching by endpoint alone was exactly
+// It is NOT cached: a job spec is per-function, and caching by package alone was exactly
 // the shape that would hand a serving spec to a job.
-func (r *Resolver) ResolveJob(endpoint, function string) (orchestrator.WorkerLaunchSpec, *exit.Error) {
-	gen, e := r.generation(strings.TrimSpace(endpoint))
+func (r *Resolver) ResolveJob(pkg, function string) (orchestrator.WorkerLaunchSpec, *exit.Error) {
+	gen, e := r.generation(strings.TrimSpace(pkg))
 	if e != nil {
 		return orchestrator.WorkerLaunchSpec{}, e
 	}
@@ -156,10 +156,10 @@ func (r *Resolver) ResolveJob(endpoint, function string) (orchestrator.WorkerLau
 	return spec, e
 }
 
-// Jobs names the `@job` functions one installed endpoint registers, with the descriptor
+// Jobs names the `@job` functions one installed package registers, with the descriptor
 // id each resolves to. `cozy invoke list` and the API's job listing read it.
-func (r *Resolver) Jobs(endpoint string) ([]launch.JobFacts, *exit.Error) {
-	gen, e := r.generation(strings.TrimSpace(endpoint))
+func (r *Resolver) Jobs(pkg string) ([]launch.JobFacts, *exit.Error) {
+	gen, e := r.generation(strings.TrimSpace(pkg))
 	if e != nil {
 		return nil, e
 	}
@@ -178,22 +178,22 @@ func (r *Resolver) Jobs(endpoint string) ([]launch.JobFacts, *exit.Error) {
 	return out, nil
 }
 
-// generation resolves the ACTIVE pin for an endpoint. A ref may name its major
+// generation resolves the ACTIVE pin for an package. A ref may name its major
 // (`org/name@v2`); without one, a single pinned major answers and several refuse rather
 // than picking.
-func (r *Resolver) generation(ref string) (*records.EndpointInstall, *exit.Error) {
-	endpoint, major, hasMajor := splitMajor(ref)
+func (r *Resolver) generation(ref string) (*records.PackageInstall, *exit.Error) {
+	pkg, major, hasMajor := splitMajor(ref)
 	if r.store == nil {
 		return nil, exit.Unavailablef("this local controller has no install records")
 	}
-	pins, e := r.store.Pins(endpoint)
+	pins, e := r.store.Pins(pkg)
 	if e != nil {
 		return nil, e
 	}
 	if len(pins) == 0 {
-		return nil, exit.New(exit.NotFound, "%s is not installed on this host", endpoint).
-			WithRemedy("`cozy endpoint list` shows installed endpoints").
-			WithNext("cozy endpoint install " + endpoint)
+		return nil, exit.New(exit.NotFound, "%s is not installed on this host", pkg).
+			WithRemedy("`cozy package list` shows installed packages").
+			WithNext("cozy package install " + pkg)
 	}
 	chosen := pins[0]
 	if hasMajor {
@@ -204,14 +204,14 @@ func (r *Resolver) generation(ref string) (*records.EndpointInstall, *exit.Error
 			}
 		}
 		if !found {
-			return nil, exit.New(exit.NotFound, "%s is installed, but not at v%d", endpoint, major).
+			return nil, exit.New(exit.NotFound, "%s is installed, but not at v%d", pkg, major).
 				WithRemedy("installed majors: %s", majorsOf(pins)).
-				WithNext("cozy endpoint list")
+				WithNext("cozy package list")
 		}
 	} else if len(pins) > 1 {
-		return nil, exit.Usagef("%s is installed at several majors and a ref must name one", endpoint).
+		return nil, exit.Usagef("%s is installed at several majors and a ref must name one", pkg).
 			WithRemedy("majors: %s — a major is a required path segment, never a default", majorsOf(pins)).
-			WithNext("cozy endpoint list")
+			WithNext("cozy package list")
 	}
 	gen, e := r.store.Install(chosen.InstallID)
 	if e != nil {
@@ -219,13 +219,13 @@ func (r *Resolver) generation(ref string) (*records.EndpointInstall, *exit.Error
 	}
 	if gen == nil {
 		return nil, exit.Internalf("%s is pinned to generation %s and that row is gone",
-			endpoint, chosen.InstallID)
+			pkg, chosen.InstallID)
 	}
 	return gen, nil
 }
 
 // splitMajor cuts `org/name@vN` into its parts.
-func splitMajor(ref string) (endpoint string, major int, ok bool) {
+func splitMajor(ref string) (pkg string, major int, ok bool) {
 	name, suffix, cut := strings.Cut(ref, "@v")
 	if !cut {
 		return ref, 0, false
@@ -263,13 +263,13 @@ func itoa(n int) string {
 	return string(b[i:])
 }
 
-// List names every endpoint this host can resolve.
+// List names every package this host can resolve.
 func (r *Resolver) List() []string {
 	out := []string{}
 	if r.store != nil {
 		if installed, e := r.store.Installed(); e == nil {
 			for _, g := range installed {
-				out = append(out, g.Endpoint)
+				out = append(out, g.Package)
 			}
 		}
 	}

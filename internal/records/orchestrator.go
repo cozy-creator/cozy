@@ -30,7 +30,7 @@ import (
 var orchestratorSchema = []string{`
 CREATE TABLE IF NOT EXISTS worker_processes (
   instance_id     TEXT PRIMARY KEY,
-  endpoint        TEXT    NOT NULL,
+  package        TEXT    NOT NULL,
   generation      TEXT    REFERENCES install_generations(id),
   release_id      TEXT    NOT NULL,
   worker_id       TEXT    NOT NULL,
@@ -53,10 +53,10 @@ CREATE TABLE IF NOT EXISTS placement_acquisition_observations (
   worker_boot_id              TEXT NOT NULL,
   placement_id                TEXT NOT NULL,
   placement_spec_digest       TEXT NOT NULL,
-  endpoint_started_ns         INTEGER NOT NULL,
-  endpoint_ended_ns           INTEGER NOT NULL,
-  endpoint_downloaded_bytes   INTEGER NOT NULL,
-  endpoint_reused_bytes       INTEGER NOT NULL,
+  package_started_ns         INTEGER NOT NULL,
+  package_ended_ns           INTEGER NOT NULL,
+  package_downloaded_bytes   INTEGER NOT NULL,
+  package_reused_bytes       INTEGER NOT NULL,
   model_started_ns            INTEGER NOT NULL,
   model_ended_ns              INTEGER NOT NULL,
   model_downloaded_bytes      INTEGER NOT NULL,
@@ -68,7 +68,7 @@ CREATE TABLE IF NOT EXISTS requests (
   id           TEXT PRIMARY KEY,
   idem_key     TEXT    NOT NULL UNIQUE,
   body_digest  TEXT    NOT NULL,
-  endpoint     TEXT    NOT NULL,
+  package     TEXT    NOT NULL,
   entrypoint   TEXT    NOT NULL,
   plan_id      TEXT    NOT NULL,
   payload      BLOB    NOT NULL,
@@ -286,12 +286,12 @@ func NewID(prefix string) string {
 
 // --------------------------------------------------------------------------- workers
 
-// WorkerProcess is one endpoint worker: its OS process-birth identity, the protocol
+// WorkerProcess is one package worker: its OS process-birth identity, the protocol
 // identities it reported, and the generation-scoped device grant it holds. The grant is
 // this row's `Devices` field — one process, one visible device set, one generation.
 type WorkerProcess struct {
 	InstanceID                            string
-	Endpoint                              string
+	Package                               string
 	Generation                            string
 	ReleaseID                             string
 	WorkerID                              string
@@ -312,19 +312,19 @@ type AcquisitionLeg struct {
 
 type PlacementAcquisition struct {
 	InstanceID, WorkerBootID, PlacementID, PlacementSpecDigest string
-	Endpoint, Model                                            AcquisitionLeg
+	Package, Model                                             AcquisitionLeg
 	ObservedAt                                                 string
 }
 
 const acquisitionColumns = `instance_id,worker_boot_id,placement_id,placement_spec_digest,
-	endpoint_started_ns,endpoint_ended_ns,endpoint_downloaded_bytes,endpoint_reused_bytes,
+	package_started_ns,package_ended_ns,package_downloaded_bytes,package_reused_bytes,
 	model_started_ns,model_ended_ns,model_downloaded_bytes,model_reused_bytes,observed_at`
 
 func scanPlacementAcquisition(row interface{ Scan(...any) error }) (PlacementAcquisition, error) {
 	var out PlacementAcquisition
 	err := row.Scan(&out.InstanceID, &out.WorkerBootID, &out.PlacementID, &out.PlacementSpecDigest,
-		&out.Endpoint.StartedNS, &out.Endpoint.EndedNS,
-		&out.Endpoint.DownloadedBytes, &out.Endpoint.ReusedBytes,
+		&out.Package.StartedNS, &out.Package.EndedNS,
+		&out.Package.DownloadedBytes, &out.Package.ReusedBytes,
 		&out.Model.StartedNS, &out.Model.EndedNS,
 		&out.Model.DownloadedBytes, &out.Model.ReusedBytes, &out.ObservedAt)
 	return out, err
@@ -338,7 +338,7 @@ func (s *Store) ObservePlacementAcquisition(in PlacementAcquisition) *exit.Error
 		return exit.Named(exit.Conflict, "placement.acquisition_identity_missing",
 			"an acquisition observation is missing worker, boot, placement, or spec identity")
 	}
-	if err := validAcquisitionLeg("endpoint", in.Endpoint); err != nil {
+	if err := validAcquisitionLeg("package", in.Package); err != nil {
 		return err
 	}
 	if err := validAcquisitionLeg("model", in.Model); err != nil {
@@ -350,22 +350,22 @@ func (s *Store) ObservePlacementAcquisition(in PlacementAcquisition) *exit.Error
 	result, err := s.db.Exec(`INSERT INTO placement_acquisition_observations(`+acquisitionColumns+`)
 		VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)
 		ON CONFLICT(instance_id,worker_boot_id,placement_id,placement_spec_digest)
-		DO UPDATE SET endpoint_started_ns=excluded.endpoint_started_ns,
-		 endpoint_ended_ns=excluded.endpoint_ended_ns,
-		 endpoint_downloaded_bytes=excluded.endpoint_downloaded_bytes,
-		 endpoint_reused_bytes=excluded.endpoint_reused_bytes,
+		DO UPDATE SET package_started_ns=excluded.package_started_ns,
+		 package_ended_ns=excluded.package_ended_ns,
+		 package_downloaded_bytes=excluded.package_downloaded_bytes,
+		 package_reused_bytes=excluded.package_reused_bytes,
 		 model_started_ns=excluded.model_started_ns,model_ended_ns=excluded.model_ended_ns,
 		 model_downloaded_bytes=excluded.model_downloaded_bytes,
 		 model_reused_bytes=excluded.model_reused_bytes,observed_at=excluded.observed_at
-		WHERE (placement_acquisition_observations.endpoint_started_ns=0 OR
-		       (excluded.endpoint_started_ns=placement_acquisition_observations.endpoint_started_ns AND
-		        excluded.endpoint_ended_ns>=placement_acquisition_observations.endpoint_ended_ns AND
-		        (placement_acquisition_observations.endpoint_ended_ns=0 OR
-		         excluded.endpoint_ended_ns=placement_acquisition_observations.endpoint_ended_ns) AND
-		        excluded.endpoint_downloaded_bytes>=placement_acquisition_observations.endpoint_downloaded_bytes AND
-		        excluded.endpoint_reused_bytes>=placement_acquisition_observations.endpoint_reused_bytes) OR
-		       (placement_acquisition_observations.endpoint_ended_ns>0 AND
-		        excluded.endpoint_started_ns>placement_acquisition_observations.endpoint_ended_ns))
+		WHERE (placement_acquisition_observations.package_started_ns=0 OR
+		       (excluded.package_started_ns=placement_acquisition_observations.package_started_ns AND
+		        excluded.package_ended_ns>=placement_acquisition_observations.package_ended_ns AND
+		        (placement_acquisition_observations.package_ended_ns=0 OR
+		         excluded.package_ended_ns=placement_acquisition_observations.package_ended_ns) AND
+		        excluded.package_downloaded_bytes>=placement_acquisition_observations.package_downloaded_bytes AND
+		        excluded.package_reused_bytes>=placement_acquisition_observations.package_reused_bytes) OR
+		       (placement_acquisition_observations.package_ended_ns>0 AND
+		        excluded.package_started_ns>placement_acquisition_observations.package_ended_ns))
 		  AND (placement_acquisition_observations.model_started_ns=0 OR
 		       (excluded.model_started_ns=placement_acquisition_observations.model_started_ns AND
 		        excluded.model_ended_ns>=placement_acquisition_observations.model_ended_ns AND
@@ -376,7 +376,7 @@ func (s *Store) ObservePlacementAcquisition(in PlacementAcquisition) *exit.Error
 		       (placement_acquisition_observations.model_ended_ns>0 AND
 		        excluded.model_started_ns>placement_acquisition_observations.model_ended_ns))`,
 		in.InstanceID, in.WorkerBootID, in.PlacementID, in.PlacementSpecDigest,
-		in.Endpoint.StartedNS, in.Endpoint.EndedNS, in.Endpoint.DownloadedBytes, in.Endpoint.ReusedBytes,
+		in.Package.StartedNS, in.Package.EndedNS, in.Package.DownloadedBytes, in.Package.ReusedBytes,
 		in.Model.StartedNS, in.Model.EndedNS, in.Model.DownloadedBytes, in.Model.ReusedBytes,
 		in.ObservedAt)
 	if err != nil {
@@ -446,11 +446,11 @@ func deviceList(devices []string) string {
 func (s *Store) SpawnWorker(w WorkerProcess) *exit.Error {
 	if len(w.Devices) == 0 {
 		return exit.New(exit.Validation, "a worker process needs a device envelope, even an empty-named one").
-			WithRemedy("name the devices this endpoint process may see")
+			WithRemedy("name the devices this package process may see")
 	}
 	clauses := make([]string, 0, len(w.Devices))
 	args := []any{
-		w.InstanceID, w.Endpoint, nullable(w.Generation), w.ReleaseID, w.WorkerID,
+		w.InstanceID, w.Package, nullable(w.Generation), w.ReleaseID, w.WorkerID,
 		deviceList(w.Devices), w.PID, w.Birth, "spawned_without_birth", now(),
 	}
 	for _, d := range w.Devices {
@@ -465,7 +465,7 @@ func (s *Store) SpawnWorker(w WorkerProcess) *exit.Error {
 	// this statement is the fence against a DIFFERENT slot.
 	args = append(args, w.InstanceID)
 	res, err := s.db.Exec(`
-		INSERT INTO worker_processes(instance_id,endpoint,generation,release_id,worker_id,
+		INSERT INTO worker_processes(instance_id,package,generation,release_id,worker_id,
 		  devices,pid,birth,state,opened_at)
 		SELECT ?,?,?,?,?,?,?,?,?,?
 		WHERE NOT EXISTS (
@@ -500,24 +500,24 @@ func (s *Store) SpawnWorker(w WorkerProcess) *exit.Error {
 // one rental lands on its own row rather than accumulating one per request.
 func (s *Store) AttachWorker(w WorkerProcess) *exit.Error {
 	if _, err := s.db.Exec(`
-		INSERT INTO worker_processes(instance_id,endpoint,generation,release_id,worker_id,
+		INSERT INTO worker_processes(instance_id,package,generation,release_id,worker_id,
 		  devices,pid,birth,state,opened_at)
 		VALUES(?,?,?,?,?,'',0,'','spawned',?)
 		ON CONFLICT(instance_id) DO UPDATE SET
 		  generation=excluded.generation, release_id=excluded.release_id,
 		  session_id=NULL, incarnation=0, readiness_epoch=0, revision=0, intake='',
 		  state='spawned', opened_at=excluded.opened_at, closed_at=''`,
-		w.InstanceID, w.Endpoint, nullable(w.Generation), w.ReleaseID, w.WorkerID,
+		w.InstanceID, w.Package, nullable(w.Generation), w.ReleaseID, w.WorkerID,
 		now()); err != nil {
 		return exit.Internalf("cannot journal the attached worker %s: %s", w.InstanceID, err)
 	}
 	return nil
 }
 
-func (s *Store) ReviseAttachedWorker(instanceID, endpoint, releaseID string) *exit.Error {
-	result, err := s.db.Exec(`UPDATE worker_processes SET endpoint=?,release_id=?
+func (s *Store) ReviseAttachedWorker(instanceID, pkg, releaseID string) *exit.Error {
+	result, err := s.db.Exec(`UPDATE worker_processes SET package=?,release_id=?
 		WHERE instance_id=? AND worker_id='remote' AND state!='closed'`,
-		endpoint, releaseID, instanceID)
+		pkg, releaseID, instanceID)
 	if err != nil {
 		return exit.Internalf("cannot revise attached worker %s: %s", instanceID, err)
 	}
@@ -625,7 +625,7 @@ func (s *Store) CloseWorker(instanceID string) *exit.Error {
 // LiveWorkers is every process row this root still believes in. Restart reconciliation
 // reads it and checks each against its OS process-birth identity before adopting.
 func (s *Store) LiveWorkers() ([]WorkerProcess, *exit.Error) {
-	rows, err := s.db.Query(`SELECT instance_id,endpoint,COALESCE(generation,''),release_id,
+	rows, err := s.db.Query(`SELECT instance_id,package,COALESCE(generation,''),release_id,
 		worker_id,devices,pid,birth,COALESCE(session_id,''),incarnation,readiness_epoch,
 		revision,intake,state,opened_at FROM worker_processes WHERE state != 'closed'
 		ORDER BY opened_at`)
@@ -637,7 +637,7 @@ func (s *Store) LiveWorkers() ([]WorkerProcess, *exit.Error) {
 	for rows.Next() {
 		var w WorkerProcess
 		var devices string
-		if err := rows.Scan(&w.InstanceID, &w.Endpoint, &w.Generation, &w.ReleaseID,
+		if err := rows.Scan(&w.InstanceID, &w.Package, &w.Generation, &w.ReleaseID,
 			&w.WorkerID, &devices, &w.PID, &w.Birth, &w.SessionID, &w.Incarnation,
 			&w.ReadinessEpoch, &w.Revision, &w.Intake, &w.State, &w.OpenedAt); err != nil {
 			return nil, exit.Internalf("cannot read a worker process row: %s", err)
@@ -658,7 +658,7 @@ type Request struct {
 	ID         string
 	IdemKey    string
 	BodyDigest string
-	Endpoint   string
+	Package    string
 	Entrypoint string
 	PlanID     string
 	Payload    []byte
@@ -712,13 +712,13 @@ type AssetBinding struct {
 	MaxBytes  int64  `json:"max_bytes,omitempty"`
 }
 
-const requestCols = `id,idem_key,body_digest,endpoint,entrypoint,plan_id,payload,outputs,
+const requestCols = `id,idem_key,body_digest,package,entrypoint,plan_id,payload,outputs,
 	state,ordinal,requeues,created_at,kind,org,trees,worker,COALESCE(install_id,''),assets,artifact_outputs`
 
 func scanRequest(row interface{ Scan(...any) error }) (Request, error) {
 	var r Request
 	var assets string
-	err := row.Scan(&r.ID, &r.IdemKey, &r.BodyDigest, &r.Endpoint, &r.Entrypoint, &r.PlanID,
+	err := row.Scan(&r.ID, &r.IdemKey, &r.BodyDigest, &r.Package, &r.Entrypoint, &r.PlanID,
 		&r.Payload, &r.Outputs, &r.State, &r.Ordinal, &r.Requeues, &r.CreatedAt,
 		&r.Kind, &r.Org, &r.Trees, &r.Worker, &r.InstallID, &assets, &r.ArtifactOutputs)
 	if err == nil && assets != "" {
@@ -993,11 +993,11 @@ func submitRequestTx(tx *sql.Tx, r Request, assets string) (Request, bool, *exit
 	if !errors.Is(err, sql.ErrNoRows) {
 		return Request{}, false, exit.Internalf("cannot read request %s: %s", r.IdemKey, err)
 	}
-	if _, err := tx.Exec(`INSERT INTO requests(id,idem_key,body_digest,endpoint,entrypoint,
+	if _, err := tx.Exec(`INSERT INTO requests(id,idem_key,body_digest,package,entrypoint,
 		plan_id,payload,outputs,state,ordinal,requeues,created_at,kind,org,trees,worker,install_id,assets,
 		artifact_outputs)
 		VALUES(?,?,?,?,?,?,?,?,?,0,0,?,?,?,?,?,?,?,?)`,
-		r.ID, r.IdemKey, r.BodyDigest, r.Endpoint, r.Entrypoint, r.PlanID, r.Payload,
+		r.ID, r.IdemKey, r.BodyDigest, r.Package, r.Entrypoint, r.PlanID, r.Payload,
 		r.Outputs, r.State, r.CreatedAt, r.Kind, r.Org, r.Trees, r.Worker, nullable(r.InstallID),
 		assets, r.ArtifactOutputs); err != nil {
 		return Request{}, false, exit.Internalf("cannot record request %s: %s", r.ID, err)
@@ -1968,7 +1968,7 @@ func (s *Store) Checkpoints(requestID string) ([]Checkpoint, *exit.Error) {
 }
 
 // Counts is the durable workload summary exposed by the local API beside its live
-// endpoint and worker counts. Serving requests and jobs are separate products in the
+// package and worker counts. Serving requests and jobs are separate products in the
 // dashboard even though they share one lifecycle table and attempt authority.
 func (s *Store) Counts() (map[string]int, *exit.Error) {
 	out := map[string]int{}

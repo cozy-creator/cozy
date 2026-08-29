@@ -433,7 +433,7 @@ func controlFacts(row records.Rental) (remotecontrol.Facts, *exit.Error) {
 	return remotecontrol.Decode(hub.ExactControlDocument{
 		CanonicalBytes: row.ControlSnapshotBytes, Digest: row.ControlSnapshotDigest,
 		Length: int64(len(row.ControlSnapshotBytes)),
-	}, row.EndpointRef)
+	}, row.PackageRef)
 }
 
 // ValidateControl refuses a hub observation before its bytes become the rental's durable,

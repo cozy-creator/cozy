@@ -58,18 +58,18 @@ func rentalStores(ctx *Context) (home.Layout, *records.Store, *exit.Error) {
 }
 
 func handleRent(ctx *Context) *exit.Error {
-	endpointRef := strings.TrimSpace(ctx.Inv.Args[0])
+	packageRef := strings.TrimSpace(ctx.Inv.Args[0])
 	acceleratorModel := strings.TrimSpace(ctx.Inv.Value("--accelerator"))
 	if acceleratorModel == "" {
 		return exit.Usagef("`cozy rental new` names the compute profile to provision").
 			WithRemedy("--accelerator is required; use CPU or a provider-neutral accelerator model such as NVIDIA H200").
-			WithNext("cozy rental new " + endpointRef + " --accelerator CPU --reason <why>")
+			WithNext("cozy rental new " + packageRef + " --accelerator CPU --reason <why>")
 	}
 	reason := strings.TrimSpace(ctx.Inv.Value("--reason"))
 	if reason == "" {
 		return exit.Usagef("`cozy rental new` spends money and the hub records why before it acts").
 			WithRemedy("--reason is required, exactly as it is for every first-party write").
-			WithNext("cozy rental new " + endpointRef + " --accelerator '" + acceleratorModel + "' --reason <why>")
+			WithNext("cozy rental new " + packageRef + " --accelerator '" + acceleratorModel + "' --reason <why>")
 	}
 	// The wait's ONLY caller-supplied bound. Absent, the wait ends on what the hub says
 	// rather than on a clock: a pod that is still booting is not a pod that has failed.
@@ -93,7 +93,7 @@ func handleRent(ctx *Context) *exit.Error {
 		return exit.Named(exit.Credential, "hub.token_missing",
 			"POST /v1/private-rentals is a first-party route and no admin token is configured").
 			WithRemedy("set TENSORHUB_TOKEN to the hub's admin.token; catalog reads need no credential").
-			WithNext("cozy endpoint search")
+			WithNext("cozy package search")
 	}
 	operationKey := strings.TrimSpace(ctx.Inv.Value("--idempotency-key"))
 	if len(operationKey) > 200 {
@@ -133,7 +133,7 @@ func handleRent(ctx *Context) *exit.Error {
 		return e
 	}
 	tokenHash := secret.HashHex(token)
-	requestBody, e := hub.RentalRequestBytes(endpointRef, acceleratorModel, tokenHash)
+	requestBody, e := hub.RentalRequestBytes(packageRef, acceleratorModel, tokenHash)
 	if e != nil {
 		return e
 	}
@@ -148,7 +148,7 @@ func handleRent(ctx *Context) *exit.Error {
 	if op.RequestDigest != digest || op.Hub != c.Base() || !bytes.Equal(op.RequestBody, requestBody) {
 		return exit.Named(exit.Conflict, "rental.idempotency_conflict",
 			"rental operation %s already names a different hub or request body", operationKey).
-			WithRemedy("reuse a key only for the exact same hub, endpoint, accelerator, and renter token")
+			WithRemedy("reuse a key only for the exact same hub, package, accelerator, and renter token")
 	}
 	if !replay {
 		fmt.Fprintf(ctx.Err, "  rental operation %s persisted; reuse this key to resume\n", operationKey)
@@ -176,7 +176,7 @@ func handleRent(ctx *Context) *exit.Error {
 	if e := st.AdvanceRentalOperation(operationKey, r.ID, r.State); e != nil {
 		return e
 	}
-	row := records.Rental{ID: r.ID, EndpointRef: endpointRef,
+	row := records.Rental{ID: r.ID, PackageRef: packageRef,
 		AcceleratorModel: acceleratorModel, State: r.State, Hub: c.Base()}
 	if existing != nil && existing.State == "attached" {
 		stored, problem := st.RentalRow(r.ID)
@@ -292,14 +292,14 @@ func handleRent(ctx *Context) *exit.Error {
 		{K: "state", V: ready.State},
 		{K: "address", V: ready.Address},
 		{K: "media", V: ready.MediaAddress},
-		{K: "endpoint", V: endpointRef},
+		{K: "package", V: packageRef},
 		{K: "accelerator", V: acceleratorModel},
 		{K: "changed", V: !replay}, {K: "operation", V: operationKey}, {K: "replayed", V: replay},
 	}
-	rec := compactRecord(fields, "rental", "state", "endpoint", "accelerator", "changed")
+	rec := compactRecord(fields, "rental", "state", "package", "accelerator", "changed")
 	rec.Notes = notes
 	rec.Next = []string{
-		"cozy invoke run <org/endpoint/vN/function> --worker " + ready.ID,
+		"cozy invoke run <org/package/vN/function> --worker " + ready.ID,
 		"cozy rental end " + ready.ID,
 	}
 	return emit(ctx, rec)
@@ -373,14 +373,14 @@ func waitRental(ctx *Context, c *hub.Client, id string, deadline time.Time,
 			return hub.Rental{}, exit.New(exit.Failed,
 				"rental %s is %s: %s", id, r.State, detailOr(r.Detail)).
 				WithRemedy("the rental is leaving or gone; rent again if you still need a pod").
-				WithNext("cozy rental new <endpoint> --accelerator <model> --reason <why>")
+				WithNext("cozy rental new <package> --accelerator <model> --reason <why>")
 		case r.State == hub.RentalReady:
 			// READY without a whole triple is the hub contradicting itself, and dialling
 			// on a partial one would fail later as something that looks like a network
 			// fault. Say which piece is missing instead.
 			return hub.Rental{}, exit.New(exit.Failed,
 				"rental %s is ready and carries no %s", id, missingOf(r)).
-				WithRemedy("this hub build may not provision the worker's TLS leg; `cozy endpoint search` names it")
+				WithRemedy("this hub build may not provision the worker's TLS leg; `cozy package search` names it")
 		case r.State == hub.RentalConverging && !r.Attachable():
 			return hub.Rental{}, exit.New(exit.Failed,
 				"rental %s is converging and carries no %s", id, missingOf(r)).
@@ -402,7 +402,7 @@ func waitRental(ctx *Context, c *hub.Client, id string, deadline time.Time,
 func sameAttachProjection(attached, seen hub.Rental, tokenHash string) *exit.Error {
 	if !seen.Attachable() || attached.ID != seen.ID || attached.Address != seen.Address ||
 		attached.MediaAddress != seen.MediaAddress || attached.CertPEM != seen.CertPEM ||
-		attached.EndpointRef != seen.EndpointRef || attached.PlacementRevision != seen.PlacementRevision ||
+		attached.PackageRef != seen.PackageRef || attached.PlacementRevision != seen.PlacementRevision ||
 		!seen.HoldsHash(tokenHash) || !sameHashSet(attached.TokenSHA256, seen.TokenSHA256) ||
 		attached.ControlSnapshot == nil || seen.ControlSnapshot == nil ||
 		attached.ControlSnapshot.Digest != seen.ControlSnapshot.Digest ||
@@ -480,8 +480,8 @@ func captureRentalControl(row *records.Rental, seen hub.Rental) {
 	row.ControlSnapshotDigest = seen.ControlSnapshot.Digest
 	row.ControlSnapshotBytes = append([]byte(nil), seen.ControlSnapshot.CanonicalBytes...)
 	row.PlacementRevision = seen.PlacementRevision
-	if seen.EndpointRef != "" {
-		row.EndpointRef = seen.EndpointRef
+	if seen.PackageRef != "" {
+		row.PackageRef = seen.PackageRef
 	}
 }
 
@@ -497,13 +497,13 @@ func handleRentLs(ctx *Context) *exit.Error {
 	}
 	list := output.List{
 		Name:      "rentals",
-		Fields:    []string{"rental", "state", "endpoint", "accelerator"},
-		AllFields: []string{"rental", "state", "endpoint", "accelerator", "address", "media", "hub", "rented"},
+		Fields:    []string{"rental", "state", "package", "accelerator"},
+		AllFields: []string{"rental", "state", "package", "accelerator", "address", "media", "hub", "rented"},
 		Next:      []string{"cozy help rental new"},
 	}
 	for _, r := range rows {
 		list.Rows = append(list.Rows, map[string]string{
-			"rental": r.ID, "state": r.State, "endpoint": r.EndpointRef,
+			"rental": r.ID, "state": r.State, "package": r.PackageRef,
 			"accelerator": r.AcceleratorModel, "address": r.Address,
 			"media": r.MediaAddress, "hub": r.Hub,
 			"rented": stamp(r.RentedAt),

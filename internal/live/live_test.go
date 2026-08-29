@@ -105,7 +105,7 @@ func fakeSpec(name, device string, args ...string) orchestrator.WorkerLaunchSpec
 		Args:    args,
 		Devices: []string{device},
 		Placement: orchestrator.DesiredPlacement{
-			Endpoint:  "fake/" + name,
+			Package:   "fake/" + name,
 			ReleaseID: fakeRelease,
 			Bindings: []*orchestrator.Binding{{
 				Entrypoint: "fake",
@@ -124,10 +124,10 @@ func planIDOf(t *testing.T, spec orchestrator.WorkerLaunchSpec) string {
 	return id
 }
 
-func submission(planID, endpoint, idem string, body map[string]any) orchestrator.Submission {
+func submission(planID, pkg, idem string, body map[string]any) orchestrator.Submission {
 	data, _ := json.Marshal(body)
 	return orchestrator.Submission{
-		IdemKey: idem, Endpoint: endpoint, Entrypoint: "fake", PlanID: planID,
+		IdemKey: idem, Package: pkg, Entrypoint: "fake", PlanID: planID,
 		Payload: data, Outputs: []string{"image"},
 	}
 }

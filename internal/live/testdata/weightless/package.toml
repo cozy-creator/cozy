@@ -1,4 +1,4 @@
-# No [bindings] table: this endpoint's handlers name no Model parameter, so there is no
+# No [bindings] table: this package's handlers name no Model parameter, so there is no
 # selection to state. Code states CAPABILITY; bindings state SELECTION, and there is none.
 
 [application]

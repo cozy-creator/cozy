@@ -37,8 +37,8 @@ func stamp(ts string) string {
 	return ts
 }
 
-func handleEndpointSearch(ctx *Context) *exit.Error { return handleResourceSearch(ctx, "endpoint") }
-func handleModelSearch(ctx *Context) *exit.Error    { return handleResourceSearch(ctx, "model") }
+func handlePackageSearch(ctx *Context) *exit.Error { return handleResourceSearch(ctx, "package") }
+func handleModelSearch(ctx *Context) *exit.Error   { return handleResourceSearch(ctx, "model") }
 
 func handleResourceSearch(ctx *Context, kind string) *exit.Error {
 	if len(ctx.Inv.Args) == 1 {
@@ -61,8 +61,8 @@ func handleResourceSearch(ctx *Context, kind string) *exit.Error {
 	var resources []hub.Resource
 	var search hub.ResourceSearch
 	var e *exit.Error
-	if kind == "endpoint" {
-		resources, search, e = c.Endpoints(hctx, query)
+	if kind == "package" {
+		resources, search, e = c.Packages(hctx, query)
 	} else {
 		resources, search, e = c.Models(hctx, query)
 	}
@@ -110,8 +110,8 @@ func handleResourceShow(ctx *Context, kind string) *exit.Error {
 	hctx, cancel := hub.Context()
 	defer cancel()
 	var r hub.Resource
-	if kind == "endpoint" {
-		r, e = c.Endpoint(hctx, ref)
+	if kind == "package" {
+		r, e = c.Package(hctx, ref)
 	} else {
 		r, e = c.Model(hctx, ref)
 	}

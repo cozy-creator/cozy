@@ -28,7 +28,7 @@ import (
 //
 // The contract is the hub's and is consumed verbatim, exactly as the catalog's is:
 //
-//	POST   /v1/private-rentals       {endpoint_ref, accelerator_model,
+//	POST   /v1/private-rentals       {package_ref, accelerator_model,
 //	                                 renter_token_sha256:[<64 hex>]}
 //	                                 -> 202 {rental_id, state, ...}
 //	GET    /v1/private-rentals/{id}  -> {state, worker_address, cert_pem, media_address,
@@ -58,12 +58,12 @@ const (
 // Rental is one rented pod as the hub reports it. There is no token on it, and there is
 // no route that adds one: this host has the token because this host minted it.
 type Rental struct {
-	ID          string
-	State       string
-	EndpointRef string
-	Address     string
-	CertPEM     string
-	Detail      string
+	ID         string
+	State      string
+	PackageRef string
+	Address    string
+	CertPEM    string
+	Detail     string
 	// MediaAddress is the pod's BYTE PLANE (cl-014, ruled #506b): the co-resident media
 	// server's own listener, which is where an owner uploads a payload and downloads an
 	// output. The hub observed it and names it.
@@ -127,7 +127,7 @@ func (r Rental) HoldsHash(hash string) bool {
 type wireRental struct {
 	ID                string                `json:"rental_id"`
 	State             string                `json:"state"`
-	EndpointRef       string                `json:"endpoint_ref"`
+	PackageRef        string                `json:"package_ref"`
 	WorkerAddress     string                `json:"worker_address"`
 	CertPEM           string                `json:"cert_pem"`
 	Detail            string                `json:"detail"`
@@ -155,7 +155,7 @@ func validateRentalID(id string) *exit.Error {
 
 func (w wireRental) rental() Rental {
 	return Rental{
-		ID: w.ID, State: w.State, EndpointRef: w.EndpointRef,
+		ID: w.ID, State: w.State, PackageRef: w.PackageRef,
 		Address: w.WorkerAddress, CertPEM: w.CertPEM,
 		Detail: w.Detail, MediaAddress: w.MediaAddress,
 		TokenSHA256: w.TokenSHA256, ControlSnapshot: w.ControlSnapshot,
@@ -167,7 +167,7 @@ func (w wireRental) rental() Rental {
 // datacenter, offer, image, cache volume, disk, and ports do not have fields
 // here: Tensorhub resolves and selects them.
 type RentalRequest struct {
-	EndpointRef       string   `json:"endpoint_ref"`
+	PackageRef        string   `json:"package_ref"`
 	AcceleratorModel  string   `json:"accelerator_model"`
 	RenterTokenSHA256 []string `json:"renter_token_sha256"`
 }
@@ -175,15 +175,15 @@ type RentalRequest struct {
 // RentalRequestBytes authors the exact bytes persisted before POST and replayed
 // unchanged after response loss. There is one encoder, not a digest struct plus
 // a separately marshaled transport map that can drift.
-func RentalRequestBytes(endpointRef, acceleratorModel, tokenSHA256 string) ([]byte, *exit.Error) {
+func RentalRequestBytes(packageRef, acceleratorModel, tokenSHA256 string) ([]byte, *exit.Error) {
 	req := RentalRequest{
-		EndpointRef: strings.TrimSpace(endpointRef), AcceleratorModel: strings.TrimSpace(acceleratorModel),
+		PackageRef: strings.TrimSpace(packageRef), AcceleratorModel: strings.TrimSpace(acceleratorModel),
 		RenterTokenSHA256: []string{strings.TrimPrefix(strings.TrimSpace(tokenSHA256), "sha256:")},
 	}
-	if req.EndpointRef == "" || req.AcceleratorModel == "" ||
+	if req.PackageRef == "" || req.AcceleratorModel == "" ||
 		!bareSHA256Pattern.MatchString(req.RenterTokenSHA256[0]) {
 		return nil, exit.Named(exit.Validation, "rental.intent_incomplete",
-			"endpoint_ref, accelerator_model, and one 64-character lowercase renter_token_sha256 are required")
+			"package_ref, accelerator_model, and one 64-character lowercase renter_token_sha256 are required")
 	}
 	raw, err := json.Marshal(req)
 	if err != nil {
@@ -223,7 +223,7 @@ func (w wireRental) named(what string) *exit.Error {
 	if w.ID == "" {
 		return exit.Named(exit.Internal, "hub.rental_unnamed",
 			"the hub %s and named no rental_id", what).
-			WithRemedy("this route may not exist on this hub build; `cozy endpoint search` names it and its version")
+			WithRemedy("this route may not exist on this hub build; `cozy package search` names it and its version")
 	}
 	return validateRentalID(w.ID)
 }

@@ -1,6 +1,6 @@
 package wheel
 
-// Exact wheel inspection for endpoint publication. Creator never builds, repairs,
+// Exact wheel inspection for package publication. Creator never builds, repairs,
 // renames, or retags a custom wheel: it reads the bytes the author named, validates
 // the portable wheel envelope and RECORD, and declares the resulting WheelFact.
 
@@ -127,7 +127,7 @@ func Inspect(file string, class InspectClass) (Fact, *exit.Error) {
 				code = "custom_wheel_build_input"
 			}
 			return out, exit.Named(exit.Validation, code,
-				"%s contains a build input; Creator never builds or repairs endpoint wheels", name)
+				"%s contains a build input; Creator never builds or repairs package wheels", name)
 		}
 		if ext == ".pth" {
 			return out, exit.Named(exit.Validation, "wheel_path_injection",

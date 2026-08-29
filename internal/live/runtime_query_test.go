@@ -47,7 +47,7 @@ esac
 	})
 	t.Run("job describe", func(t *testing.T) {
 		facts := launch.Facts{
-			Install:    records.EndpointInstall{Endpoint: "fake/slow"},
+			Install:    records.PackageInstall{Package: "fake/slow"},
 			Descriptor: &launch.Descriptor{Jobs: []launch.Entrypoint{{Name: "slow"}}},
 			RuntimeCLI: runtime,
 		}

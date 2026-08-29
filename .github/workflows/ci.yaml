@@ -67,7 +67,7 @@ jobs:
   # fact about the artifact a user would install. They are separate evidence axes and a
   # master-only green may not stand in for this one.
   #
-  # Endpoint execution is covered by internal/live/TestProductPath when a cozy-runtime peer
+  # Package execution is covered by internal/live/TestProductPath when a cozy-runtime peer
   # exists. This job stays about the shipped CLI asset: build, verify, install, run, upgrade.
   release:
     runs-on: ubuntu-latest

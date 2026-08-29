@@ -59,7 +59,7 @@ func readToken(ctx *Context) (secret.Value, *exit.Error) {
 		return secret.Value{}, exit.Named(exit.Credential, "token.empty_stdin",
 			"--token-stdin was given and stdin carried no credential").
 			WithRemedy("pipe the token in: printf %%s \"$TOKEN\" | cozy … --token-stdin").
-			WithNext("cozy endpoint search")
+			WithNext("cozy package search")
 	}
 	return v, nil
 }

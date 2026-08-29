@@ -35,12 +35,12 @@ func handleUnload(ctx *Context) *exit.Error {
 		return problem
 	}
 	list := output.List{
-		Name: "workers", Fields: []string{"endpoint", "devices"},
-		AllFields: []string{"instance", "endpoint", "release", "devices"},
+		Name: "workers", Fields: []string{"package", "devices"},
+		AllFields: []string{"instance", "package", "release", "devices"},
 	}
 	for _, worker := range result.Stopped {
 		list.Rows = append(list.Rows, map[string]string{
-			"instance": worker.InstanceID, "endpoint": worker.Endpoint,
+			"instance": worker.InstanceID, "package": worker.Package,
 			"release": worker.ReleaseID, "devices": strings.Join(worker.Devices, ","),
 		})
 	}
@@ -203,7 +203,7 @@ func resolveRentalOperation(ctx *Context, key string) (string, *exit.Error) {
 		return "", problem
 	}
 	if problem := store.RecordRental(records.Rental{
-		ID: seen.ID, EndpointRef: request.EndpointRef, AcceleratorModel: request.AcceleratorModel,
+		ID: seen.ID, PackageRef: request.PackageRef, AcceleratorModel: request.AcceleratorModel,
 		State: seen.State, Hub: operation.Hub,
 	}); problem != nil {
 		return "", problem
