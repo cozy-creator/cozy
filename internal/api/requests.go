@@ -35,7 +35,7 @@ type Submission struct {
 	Outputs  []string        `json:"outputs,omitempty"`
 	PlanID   string          `json:"plan_id,omitempty"`
 	// LocalAssets is the local API's out-of-band input set. Each source path is ingested into
-	// the service-owned immutable input store before the request row exists; it never
+	// the daemon-owned immutable input store before the request row exists; it never
 	// crosses the worker protocol. The typed payload carries only its opaque reference.
 	LocalAssets []records.AssetBinding `json:"local_assets,omitempty"`
 	// Worker is Creator's local addition: it pins this request to an attached rental id.
@@ -289,7 +289,7 @@ func (s *Server) resolvePlan(sub Submission) (orchestrator.Submission, *exit.Err
 	var remotePlacement *orchestrator.DesiredPlacement
 	if out.Worker != "" {
 		if s.rentals == nil {
-			return out, exit.Unavailablef("this local controller attaches no remote workers")
+			return out, exit.Unavailablef("this Cozy daemon attaches no remote workers")
 		}
 		var e *exit.Error
 		remotePlacement, e = s.rentals(out.Worker)
@@ -331,7 +331,7 @@ func (s *Server) resolvePlan(sub Submission) (orchestrator.Submission, *exit.Err
 	} else {
 		var placement orchestrator.DesiredPlacement
 		if s.packages == nil {
-			return out, exit.Unavailablef("this local controller resolves no packages")
+			return out, exit.Unavailablef("this Cozy daemon resolves no packages")
 		}
 		var e *exit.Error
 		placement, e = s.packages.ResolvePlacement(sub.Package)

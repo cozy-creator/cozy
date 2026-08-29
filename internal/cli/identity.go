@@ -8,14 +8,14 @@ import (
 	"github.com/cozy-creator/cozy-creator/internal/config"
 )
 
-// localInvocationIdentity mints the two per-service identity digests every LOCAL
+// localInvocationIdentity mints the two per-daemon identity digests every LOCAL
 // InvocationSpec rides (cl-022's guard): the execution environment's and the evaluated
 // configuration's. They used to be the orchestrator Options' empty strings, so every
 // local InvocationSpec froze `environment_spec_digest: ""` — an UNDER-SPECIFIED identity
 // persisted forever under the request's digest.
 //
-// Both documents are deliberately `cozy.local.*` formats: a local controller manufactures
-// no Tensorhub document. They are frozen per service run, never per request — a request
+// Both documents are deliberately `cozy.local.*` formats: the Cozy daemon manufactures
+// no Tensorhub document. They are frozen per daemon run, never per request — a request
 // cannot choose the environment it runs under — and the config's one secret enters as
 // its DIGEST, never raw.
 func localInvocationIdentity(cfg config.Config) (environmentSpec, configDigest string) {

@@ -15,37 +15,37 @@ import (
 
 	"github.com/cozy-creator/cozy-creator/internal/api"
 	"github.com/cozy-creator/cozy-creator/internal/config"
+	"github.com/cozy-creator/cozy-creator/internal/daemon"
 	"github.com/cozy-creator/cozy-creator/internal/exit"
 	"github.com/cozy-creator/cozy-creator/internal/home"
 	"github.com/cozy-creator/cozy-creator/internal/output"
-	"github.com/cozy-creator/cozy-creator/internal/service"
 )
 
-const controllerProcessName = "cozy-controller"
+const daemonProcessName = "cozy-daemon"
 
-const maxControllerStartupDiagnostic = 16 << 10
+const maxDaemonStartupDiagnostic = 16 << 10
 
-type controllerExit struct {
+type daemonExit struct {
 	err        error
 	code       exit.Code
 	diagnostic string
 }
 
-type controllerChild struct {
+type daemonChild struct {
 	pid              int
-	done             <-chan controllerExit
+	done             <-chan daemonExit
 	closeDiagnostics func()
 }
 
-// ControllerProcess reports whether argv0 names the binary's private controller
+// DaemonProcess reports whether argv0 names the binary's private daemon
 // entrypoint. It is a process boundary, not a hidden public command.
-func ControllerProcess(argv0 string) bool {
-	return filepath.Base(argv0) == controllerProcessName
+func DaemonProcess(argv0 string) bool {
+	return filepath.Base(argv0) == daemonProcessName
 }
 
-// RunController owns the persistent loopback service. Public `up` and stateful
+// RunDaemon owns the persistent loopback daemon. Public `up` and stateful
 // commands start this private process entrypoint.
-func RunController(stdout, stderr io.Writer) int {
+func RunDaemon(stdout, stderr io.Writer) int {
 	cfg, problem := config.Load()
 	if problem != nil {
 		fmt.Fprintln(stderr, problem.Error())
@@ -59,7 +59,7 @@ func RunController(stdout, stderr io.Writer) int {
 			"--port", intText(cfg.Port), "--yield", cfg.Yield), Mode: output.Mode{}},
 		Out: stdout, Err: stderr, Cfg: cfg,
 	}
-	if problem := serveController(ctx); problem != nil {
+	if problem := serveDaemon(ctx); problem != nil {
 		fmt.Fprintln(stderr, problem.Error())
 		if problem.Code.Valid() && problem.Code != exit.OK {
 			return int(problem.Code)
@@ -69,14 +69,14 @@ func RunController(stdout, stderr io.Writer) int {
 	return 0
 }
 
-func ensureController(ctx *Context) (service.State, bool, *exit.Error) {
+func ensureDaemon(ctx *Context) (daemon.State, bool, *exit.Error) {
 	layout, problem := home.Open(ctx.Cfg.Home)
 	if problem != nil {
-		return service.State{}, false, problem
+		return daemon.State{}, false, problem
 	}
 	staleCredential, _ := os.ReadFile(layout.Client)
-	var child *controllerChild
-	var childResult *controllerExit
+	var child *daemonChild
+	var childResult *daemonExit
 	started := false
 	defer func() {
 		if child != nil {
@@ -89,7 +89,7 @@ func ensureController(ctx *Context) (service.State, bool, *exit.Error) {
 	tick := time.NewTicker(50 * time.Millisecond)
 	defer tick.Stop()
 	for {
-		if state := service.Probe(ctx.Cfg); state.Up {
+		if state := daemon.Probe(ctx.Cfg); state.Up {
 			current, _ := os.ReadFile(layout.Client)
 			credentialReady := !started || !bytes.Equal(current, staleCredential)
 			if credentialReady {
@@ -103,16 +103,16 @@ func ensureController(ctx *Context) (service.State, bool, *exit.Error) {
 				}
 			}
 		} else if childResult != nil {
-			return service.State{}, false, controllerStartupFailure(*childResult)
+			return daemon.State{}, false, daemonStartupFailure(*childResult)
 		} else if !started {
-			spawned, err := startController(ctx)
+			spawned, err := startDaemon(ctx)
 			if err != nil {
-				return service.State{}, false, err
+				return daemon.State{}, false, err
 			}
 			started = true
 			child = spawned
 		}
-		var done <-chan controllerExit
+		var done <-chan daemonExit
 		if child != nil {
 			done = child.done
 		}
@@ -124,22 +124,22 @@ func ensureController(ctx *Context) (service.State, bool, *exit.Error) {
 		case <-tick.C:
 		case <-deadline.C:
 			if childResult != nil {
-				return service.State{}, false, controllerStartupFailure(*childResult)
+				return daemon.State{}, false, daemonStartupFailure(*childResult)
 			}
-			return service.State{}, false, exit.Named(exit.Conflict,
-				"controller_startup_incomplete",
-				"the Cozy controller did not become healthy within 15s").
+			return daemon.State{}, false, exit.Named(exit.Conflict,
+				"daemon_startup_incomplete",
+				"the Cozy daemon did not become healthy within 15s").
 				WithRemedy("retry `cozy up`; startup is complete only after the authenticated API and web UI answer")
 		}
 	}
 }
 
-func startController(ctx *Context) (*controllerChild, *exit.Error) {
+func startDaemon(ctx *Context) (*daemonChild, *exit.Error) {
 	self, err := os.Executable()
 	if err != nil {
 		return nil, exit.Internalf("cannot locate the Cozy executable: %s", err)
 	}
-	// The controller is a background product process, not an attached Compose-style
+	// The daemon is a background product process, not an attached Compose-style
 	// log producer. Runtime/request diagnostics are structured state; process chatter
 	// has no persistent user-facing log surface.
 	discard, err := os.OpenFile(os.DevNull, os.O_WRONLY, 0)
@@ -147,27 +147,27 @@ func startController(ctx *Context) (*controllerChild, *exit.Error) {
 		return nil, exit.Internalf("cannot open the null diagnostics sink: %s", err)
 	}
 	command := exec.Command(self)
-	command.Args[0] = controllerProcessName
+	command.Args[0] = daemonProcessName
 	command.Env = ctx.Cfg.Child("COZY_HOME=" + ctx.Cfg.Home)
 	command.Stdout = discard
 	diagnostics, err := command.StderrPipe()
 	if err != nil {
 		discard.Close()
-		return nil, exit.Internalf("cannot open the controller startup diagnostic pipe: %s", err)
+		return nil, exit.Internalf("cannot open the daemon startup diagnostic pipe: %s", err)
 	}
 	detachProcess(command)
 	if err := command.Start(); err != nil {
 		diagnostics.Close()
 		discard.Close()
-		return nil, exit.Internalf("cannot start the Cozy controller: %s", err)
+		return nil, exit.Internalf("cannot start the Cozy daemon: %s", err)
 	}
 	discard.Close()
 	diagnosticDone := make(chan string, 1)
 	go func() { diagnosticDone <- readBoundedDiagnostic(diagnostics) }()
-	done := make(chan controllerExit, 1)
+	done := make(chan daemonExit, 1)
 	go func() {
 		waitErr := command.Wait()
-		result := controllerExit{err: waitErr, code: exit.Internal, diagnostic: <-diagnosticDone}
+		result := daemonExit{err: waitErr, code: exit.Internal, diagnostic: <-diagnosticDone}
 		var processExit *exec.ExitError
 		if errors.As(waitErr, &processExit) {
 			if code := exit.Code(processExit.ExitCode()); code.Valid() && code != exit.OK {
@@ -177,27 +177,27 @@ func startController(ctx *Context) (*controllerChild, *exit.Error) {
 		done <- result
 	}()
 	var closeOnce sync.Once
-	return &controllerChild{
+	return &daemonChild{
 		pid: command.Process.Pid, done: done,
 		closeDiagnostics: func() { closeOnce.Do(func() { _ = diagnostics.Close() }) },
 	}, nil
 }
 
 func readBoundedDiagnostic(reader io.Reader) string {
-	kept := make([]byte, 0, maxControllerStartupDiagnostic)
+	kept := make([]byte, 0, maxDaemonStartupDiagnostic)
 	buffer := make([]byte, 4096)
 	truncated := false
 	for {
 		n, err := reader.Read(buffer)
 		if n > 0 {
-			remaining := maxControllerStartupDiagnostic - len(kept)
+			remaining := maxDaemonStartupDiagnostic - len(kept)
 			if remaining > 0 {
 				if n < remaining {
 					remaining = n
 				}
 				kept = append(kept, buffer[:remaining]...)
 			}
-			if len(kept) == maxControllerStartupDiagnostic && n > remaining {
+			if len(kept) == maxDaemonStartupDiagnostic && n > remaining {
 				truncated = true
 			}
 		}
@@ -212,17 +212,17 @@ func readBoundedDiagnostic(reader io.Reader) string {
 	return diagnostic
 }
 
-func controllerStartupFailure(result controllerExit) *exit.Error {
+func daemonStartupFailure(result daemonExit) *exit.Error {
 	diagnostic := strings.TrimSpace(result.diagnostic)
 	if diagnostic == "" && result.err != nil {
 		diagnostic = result.err.Error()
 	}
 	if diagnostic == "" {
-		diagnostic = "the background controller exited before publishing a healthy service"
+		diagnostic = "the Cozy daemon exited before publishing a healthy API"
 	}
-	return exit.Named(result.code, "controller_startup_failed",
-		"Cozy controller startup failed: %s", diagnostic).
-		WithRemedy("correct the reported startup condition and retry `cozy up`; no persistent controller log was created")
+	return exit.Named(result.code, "daemon_startup_failed",
+		"Cozy daemon startup failed: %s", diagnostic).
+		WithRemedy("correct the reported startup condition and retry `cozy up`; no persistent daemon log was created")
 }
 
 func uiReady(address string) bool {

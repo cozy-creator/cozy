@@ -61,7 +61,7 @@ STAMP="github.com/cozy-creator/cozy-creator/internal/cli"
 LDFLAGS="-s -w -X $STAMP.tag=$TAG -X $STAMP.commit=$COMMIT"
 
 # One row per target. CGO is OFF for all of them: `internal/records` drives its SQLite
-# through modernc.org/sqlite (SQLite transpiled to Go) and `internal/service` holds the
+# through modernc.org/sqlite (SQLite transpiled to Go) and `internal/daemon` holds the
 # liveness lock through a per-OS pair, so there is no C in this binary and every target is
 # a plain cross-compile from this one host.
 TARGETS="linux/amd64 linux/arm64 darwin/arm64 darwin/amd64 windows/amd64"

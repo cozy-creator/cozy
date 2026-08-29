@@ -123,13 +123,14 @@ func TestPackagePublishCLI(t *testing.T) {
 	}
 	args := []string{"package", "publish", "cozy/marco", "--release", "1.0.0", "--dir", source,
 		"--reason", "fixture publish"}
-	if code, out := run(args...); code != 0 || !strings.Contains(out, "status: published") ||
-		!strings.Contains(out, "qualified") {
+	if code, out := run(args...); code != 0 || !strings.Contains(out, "status:") ||
+		!strings.Contains(out, "published") ||
+		!strings.Contains(out, "qualified") || strings.Contains(out, "candidate-cpu") {
 		t.Fatalf("package publish [exit %d]\n%s", code, out)
 	}
 	if code, out := run(append(args, "--full")...); code != 0 ||
 		!strings.Contains(out, "candidate-cpu") || !strings.Contains(out, "qualified") ||
-		!strings.Contains(out, "uploaded: 0B") {
+		!strings.Contains(out, "uploaded:") || !strings.Contains(out, "0B") {
 		t.Fatalf("package publish replay [exit %d]\n%s", code, out)
 	}
 

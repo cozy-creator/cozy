@@ -14,7 +14,7 @@ import (
 	"github.com/cozy-creator/cozy-creator/internal/records"
 )
 
-// LifecycleIdentity is one durable obligation that prevents a safe controller down.
+// LifecycleIdentity is one durable obligation that prevents a safe daemon down.
 // Kind distinguishes ordinary invocations, run-once jobs, provider rentals, and paid
 // acquisition operations that have not learned a provider rental id yet.
 type LifecycleIdentity struct {
@@ -28,7 +28,7 @@ type UnloadResult struct {
 	Count   int                        `json:"count"`
 }
 
-// DownResult is the controller-side half of `down [--all]`. ShuttingDown is true only
+// DownResult is the daemon-side half of `down [--all]`. ShuttingDown is true only
 // after every local invocation settled and every rental row/operation disappeared.
 // Under --all, a false result tells the caller exactly what cancellation was requested
 // and which paid obligations must be ended through Tensorhub before retrying.
@@ -48,7 +48,7 @@ func (s *Server) unload(w http.ResponseWriter, r *http.Request) {
 	s.ok(w, r, http.StatusOK, UnloadResult{Stopped: stopped, Count: len(stopped)})
 }
 
-func (s *Server) downService(w http.ResponseWriter, r *http.Request) {
+func (s *Server) downDaemon(w http.ResponseWriter, r *http.Request) {
 	s.lifecycle.Lock()
 	defer s.lifecycle.Unlock()
 	if s.shuttingDown {
@@ -79,7 +79,7 @@ func (s *Server) downService(w http.ResponseWriter, r *http.Request) {
 	}
 	if !body.All && (len(active) > 0 || len(rentals) > 0) {
 		s.refuseTyped(w, r, exit.Named(exit.Conflict, "active_work",
-			"controller down refused: active %s", joinLifecycleIdentities(active, rentals)).
+			"daemon shutdown refused: active %s", joinLifecycleIdentities(active, rentals)).
 			WithRemedy("cancel the named invocations/jobs and end the named rentals, or use explicit `cozy down --all`"))
 		return
 	}
@@ -98,7 +98,7 @@ func (s *Server) downService(w http.ResponseWriter, r *http.Request) {
 			changed, cancelProblem := s.cancelForDown(*row)
 			if cancelProblem != nil {
 				s.refuseTyped(w, r, cancelProblem.WithRemedy(
-					"some cancellation requests may already be recorded; the controller remains alive for reconciliation"))
+					"some cancellation requests may already be recorded; the daemon remains alive for reconciliation"))
 				return
 			}
 			if changed {

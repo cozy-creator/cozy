@@ -115,6 +115,7 @@ func TestRentTimeoutInterruptsTricklingHubResponses(t *testing.T) {
 			defer server.Close()
 
 			root := filepath.Join(t.TempDir(), "cozy-home")
+			t.Cleanup(func() { terminateTestDaemon(t, root) })
 			ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 			defer cancel()
 			args := []string{"-n", "19", cozyBin, "rental", "new", "cozy/package/v1/generate",
@@ -129,7 +130,9 @@ func TestRentTimeoutInterruptsTricklingHubResponses(t *testing.T) {
 			if ctx.Err() != nil {
 				t.Fatalf("cozy rental new ignored --timeout and required harness termination:\n%s", data)
 			}
-			if cmd.ProcessState == nil || cmd.ProcessState.ExitCode() != 1 || !strings.Contains(string(data), "deadline") {
+			if cmd.ProcessState == nil || cmd.ProcessState.ExitCode() != 1 ||
+				(!strings.Contains(string(data), "did not answer within") &&
+					!strings.Contains(string(data), "at the --timeout you set")) {
 				t.Fatalf("cozy rental new %s exit = %v, want operational 1 with deadline detail:\n%s",
 					phase, cmd.ProcessState, data)
 			}

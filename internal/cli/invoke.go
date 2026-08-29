@@ -46,7 +46,7 @@ import (
 // dial builds the API client. Every verb here has already passed the shared exit-9 gate,
 // so this is the credential read and nothing else.
 func dial(ctx *Context) (*localapi.Client, *exit.Error) {
-	return localapi.Open(ctx.Cfg, ctx.Service)
+	return localapi.Open(ctx.Cfg, ctx.Daemon)
 }
 
 // ----------------------------------------------------------------------------- run

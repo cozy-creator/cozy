@@ -162,7 +162,7 @@ func (s *Server) resolveJob(sub JobSubmission) (orchestrator.Submission, *exit.E
 		return out, e
 	}
 	if s.packages == nil {
-		return out, exit.Unavailablef("this local controller resolves no packages")
+		return out, exit.Unavailablef("this Cozy daemon resolves no packages")
 	}
 	jobs, e := s.packages.Jobs(sub.Package)
 	if e != nil {

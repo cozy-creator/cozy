@@ -3,23 +3,23 @@ package cli
 // CLI is the complete public command grammar. Kong derives parsing and help from
 // this tree; there is no parallel command manifest or string handler registry.
 type CLI struct {
-	JSON   bool     `help:"Emit JSON instead of TOON."`
+	JSON   bool     `help:"Emit JSON instead of human-readable output."`
 	Full   bool     `help:"Include complete values and all available fields."`
 	Fields []string `help:"Select result fields." sep:","`
 
-	Package PackageCmd `cmd:"" group:"Resources" help:"Find, install, and publish packages."`
-	Model   ModelCmd   `cmd:"" group:"Resources" help:"Find, download, and publish models."`
-	Invoke  InvokeCmd  `cmd:"" group:"Work" help:"Run and manage package invocations."`
-	Rental  RentalCmd  `cmd:"" group:"Work" help:"Manage private remote workers."`
-	Up      UpCmd      `cmd:"" group:"Lifecycle" help:"Start the Cozy controller and localhost UI."`
-	Down    DownCmd    `cmd:"" group:"Lifecycle" help:"Stop Cozy locally or tear everything down."`
+	Package PackageCmd `cmd:"" group:"Resources" help:"Install the source-code that generates media."`
+	Model   ModelCmd   `cmd:"" group:"Resources" help:"Download the tensors that are the AI's mind."`
+	Invoke  InvokeCmd  `cmd:"" group:"Work" help:"Generate media using your installed packages."`
+	Rental  RentalCmd  `cmd:"" group:"Work" help:"Rent a more powerful GPU in the cloud."`
+	Up      UpCmd      `cmd:"" group:"Lifecycle" help:"Start the cozy-daemon and localhost web-ui."`
+	Down    DownCmd    `cmd:"" group:"Lifecycle" help:"Stop cozy-daemon and localhost web-ui."`
 	Unload  UnloadCmd  `cmd:"" group:"Lifecycle" help:"Release idle local GPU memory."`
 }
 
 type PackageCmd struct {
-	Search  PackageSearchCmd  `cmd:"" help:"Search the package catalog."`
-	Install PackageInstallCmd `cmd:"" help:"Install a package on this machine."`
-	Remove  PackageRemoveCmd  `cmd:"" help:"Remove installed package generations."`
+	Search  PackageSearchCmd  `cmd:"" help:"Search for AI magic."`
+	Install PackageInstallCmd `cmd:"" help:"Downloads source-code and installs dependencies."`
+	Remove  PackageRemoveCmd  `cmd:"" help:"Delete source-code."`
 	List    PackageListCmd    `cmd:"" help:"List installed packages."`
 	Publish PackagePublishCmd `cmd:"" help:"Publish a package release."`
 }

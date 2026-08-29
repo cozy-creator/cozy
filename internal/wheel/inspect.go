@@ -124,6 +124,11 @@ func Inspect(file string, class InspectClass) (Fact, *exit.Error) {
 		if class == ProjectWheel && compiledExt[ext] {
 			return out, refuseCompiled(name)
 		}
+		if class == ProjectWheel && privateBuildMember(name) {
+			return out, exit.Named(exit.Validation, "project_wheel_private_member",
+				"%s is local credential, VCS, environment, cache, editor, or build state", name).
+				WithRemedy("exclude it from the declared backend's wheel; project wheels contain only publishable package code")
+		}
 		if class == CustomWheel && nativeSourceExt[ext] {
 			return out, exit.Named(exit.Validation, "custom_wheel_build_input",
 				"%s contains native source; custom wheels are exact prebuilt binaries", name)
@@ -220,6 +225,24 @@ func Inspect(file string, class InspectClass) (Fact, *exit.Error) {
 	out.Distribution, out.Filename, out.Length = distribution, filename, info.Size()
 	out.Tags, out.Version = wheelTags, version
 	return out, nil
+}
+
+func privateBuildMember(name string) bool {
+	lower := strings.ToLower(name)
+	parts := strings.Split(lower, "/")
+	for _, part := range parts[:len(parts)-1] {
+		switch part {
+		case ".git", ".hg", ".svn", ".jj", ".aws", ".ssh", "credentials", "secrets",
+			"__pycache__", ".mypy_cache", ".ruff_cache", ".pytest_cache", ".venv", "venv",
+			".tox", ".idea", ".vscode", "node_modules", "build", "dist":
+			return true
+		}
+	}
+	base := path.Base(lower)
+	return base == ".env" || strings.HasPrefix(base, ".env.") || base == ".netrc" ||
+		base == ".npmrc" || base == ".pypirc" || strings.HasPrefix(base, "id_rsa") ||
+		strings.HasSuffix(base, ".pem") || strings.HasSuffix(base, ".key") ||
+		strings.HasSuffix(base, ".pyc") || strings.HasSuffix(base, ".pyo")
 }
 
 var nativeSourceExt = map[string]bool{

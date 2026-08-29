@@ -567,16 +567,16 @@ def check_web_boundary():
                      "internal/api/uploads.go", "internal/upload/upload.go"):
         if not pathlib.Path(required).is_file():
             bad.append(f"[web] missing {required}")
-    controller = pathlib.Path("internal/cli/controller.go").read_text()
-    for required in ("os.DevNull", "command.StderrPipe()", "maxControllerStartupDiagnostic",
-                     "readBoundedDiagnostic", "controllerStartupFailure"):
-        if required not in controller:
-            bad.append(f"[web] controller startup boundary missing {required!r}")
-    if "controller.log" in controller:
-        bad.append("[web] persistent controller.log surface remains")
+    daemon = pathlib.Path("internal/cli/daemon.go").read_text()
+    for required in ("os.DevNull", "command.StderrPipe()", "maxDaemonStartupDiagnostic",
+                     "readBoundedDiagnostic", "daemonStartupFailure"):
+        if required not in daemon:
+            bad.append(f"[web] daemon startup boundary missing {required!r}")
+    if "daemon.log" in daemon:
+        bad.append("[web] persistent daemon.log surface remains")
     for forbidden in ("os.FindProcess(", 'exec.Command("ps"', 'exec.Command("pgrep"', '"/proc/'):
-        if forbidden in controller:
-            bad.append(f"[web] controller singleton uses process-list evidence {forbidden!r}")
+        if forbidden in daemon:
+            bad.append(f"[web] daemon singleton uses process-list evidence {forbidden!r}")
     upload = pathlib.Path("internal/upload/upload.go").read_text()
     for required in ("MaxBytes int64 = 64 << 20", "io.LimitReader", "sha256.New()", "os.Rename"):
         if required not in upload:

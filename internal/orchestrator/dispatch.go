@@ -32,7 +32,7 @@ type Submission struct {
 	// `payload` — a grant input, never a wire field, so refreshing the grant can never
 	// substitute it.
 	Payload []byte
-	// Assets are immutable, service-staged files bound to exact payload field paths.
+	// Assets are immutable, daemon-staged files bound to exact payload field paths.
 	// The request row keeps them so every requeue derives the same spec and grant.
 	Assets []records.AssetBinding
 
@@ -540,7 +540,7 @@ func (c *Orchestrator) resolveFor(req records.Request) (WorkerLaunchSpec, *exit.
 			WithRemedy("publish and rent an exact job control snapshot before enabling remote jobs")
 	}
 	if c.opt.Rentals == nil {
-		return WorkerLaunchSpec{}, exit.Unavailablef("this local controller attaches no remote workers")
+		return WorkerLaunchSpec{}, exit.Unavailablef("this Cozy daemon attaches no remote workers")
 	}
 	remote, e := c.opt.Rentals(req.Worker)
 	if e != nil {
@@ -625,7 +625,7 @@ func (c *Orchestrator) dispatch(req records.Request) (uint64, *exit.Error) {
 		PackageReleaseId: w.spec.Placement.PackageReleaseID,
 		// `image_digest` is GONE, renamed to what it always meant (#483): "image" is wrong
 		// for a native install with no OCI image at all. The value is the same one this
-		// service was frozen with — a request cannot choose the environment it runs under.
+		// daemon was frozen with — a request cannot choose the environment it runs under.
 		EnvironmentSpecDigest: environmentDigest,
 		ConfigDigest:          configDigest,
 		PayloadDigest:         spellOf(canonical.Digest(req.Payload)),

@@ -689,7 +689,7 @@ type Request struct {
 	InstallID string
 	// Assets are the request's durable input-asset bindings. LocalPath points into the
 	// authority-owned immutable input store, not at the caller's original file: a requeue
-	// after a client exit or service restart therefore grants the same verified bytes.
+	// after a client exit or daemon restart therefore grants the same verified bytes.
 	Assets []AssetBinding
 	// ArtifactOutputs is the immutable ArtifactSink output subset projected beside the
 	// InvocationSpec. Rev5 OutputBinding has no kind, so this may never be inferred from
@@ -799,7 +799,7 @@ func (s *Store) RequestsOfKind(kind, state string, limit int) ([]Request, *exit.
 	return out, nil
 }
 
-// ActiveRequests is every invocation the controller still owes work or a terminal.
+// ActiveRequests is every invocation the daemon still owes work or a terminal.
 // Lifecycle operations use the complete set rather than a presentation-limited request
 // listing: omitting row 501 from a safety fence would make `exit` destructive by accident.
 func (s *Store) ActiveRequests() ([]Request, *exit.Error) {
@@ -822,7 +822,7 @@ func (s *Store) ActiveRequests() ([]Request, *exit.Error) {
 }
 
 // Owed is every request this authority still owes work for and that has NO live attempt:
-// the ones a restarted service must put back on its dispatch queue. A request WITH a live
+// the ones a restarted daemon must put back on its dispatch queue. A request WITH a live
 // or recovered attempt is not owed capacity — it is owed a terminal, and the
 // recovered-attempts law is what settles that.
 func (s *Store) Owed() ([]Request, *exit.Error) {

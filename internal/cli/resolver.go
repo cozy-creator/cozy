@@ -24,7 +24,7 @@ import (
 // loader, and the driver's writer are all gone, and the live driver installs a package
 // exactly as a user does.
 
-// Resolver is the local controller's package resolver.
+// Resolver is the Cozy daemon's package resolver.
 type Resolver struct {
 	mu    sync.Mutex
 	store *records.Store
@@ -184,7 +184,7 @@ func (r *Resolver) Jobs(pkg string) ([]launch.JobFacts, *exit.Error) {
 func (r *Resolver) generation(ref string) (*records.PackageInstall, *exit.Error) {
 	pkg, major, hasMajor := splitMajor(ref)
 	if r.store == nil {
-		return nil, exit.Unavailablef("this local controller has no install records")
+		return nil, exit.Unavailablef("this Cozy daemon has no install records")
 	}
 	pins, e := r.store.Pins(pkg)
 	if e != nil {

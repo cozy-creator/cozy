@@ -22,7 +22,7 @@ import (
 // server could not keep.
 
 // Listeners binds 127.0.0.1 and [::1] on one port. It answers with every listener it
-// bound and the canonical address (the v4 one, which is what the service publishes).
+// bound and the canonical address (the v4 one, which is what the daemon publishes).
 //
 // An IPv6 bind that fails is NOT fatal: a host with IPv6 disabled is ordinary, and
 // refusing to start there would be a worse bug than serving v4 only. What it returns is

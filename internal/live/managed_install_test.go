@@ -220,8 +220,8 @@ print(json.dumps({"digest":"sha256:"+hashlib.sha256(evidence).hexdigest(),"lengt
 	}
 	code, output := run("package", "install", "cozy/marco@1.0.0", "--profile", packageprofile.CU130,
 		"--major", "v1", "--reason", "managed fixture")
-	if code != 0 || !strings.Contains(output, "status: installed") ||
-		!strings.Contains(output, "profile: "+packageprofile.CU130) ||
+	if code != 0 || !strings.Contains(output, "status:") || !strings.Contains(output, "installed") ||
+		!strings.Contains(output, "profile:") || !strings.Contains(output, packageprofile.CU130) ||
 		strings.Contains(output, "candidate-local") || strings.Contains(output, "dependency resolution") {
 		t.Fatalf("managed install [exit %d]\n%s", code, output)
 	}
@@ -251,7 +251,7 @@ print(json.dumps({"digest":"sha256:"+hashlib.sha256(evidence).hexdigest(),"lengt
 	}
 	if code, output := run("package", "install", "cozy/marco@1.0.0", "--profile", packageprofile.CU130,
 		"--major", "v1", "--force", "--reason", "OCI substitution fixture"); code != 1 ||
-		!strings.Contains(output, "managed_install_grant_invalid") {
+		!strings.Contains(output, "incomplete managed-local qualification materials") {
 		t.Fatalf("OCI realization entered managed-local qualification [exit %d]\n%s", code, output)
 	}
 	_, active, problem := store.ActivePin("cozy/marco", 1)
@@ -269,7 +269,7 @@ print(json.dumps({"digest":"sha256:"+hashlib.sha256(evidence).hexdigest(),"lengt
 	writeExecutable(t, filepath.Join(base, "bin", "cozy-native-wheel-proof"), nativeProof(badNativeEvidence))
 	if code, output := run("package", "install", "cozy/marco@1.0.0", "--profile", packageprofile.CU130,
 		"--major", "v1", "--force", "--reason", "native evidence mismatch fixture"); code != 1 ||
-		!strings.Contains(output, "managed_native_evidence_invalid") {
+		!strings.Contains(output, "native qualification evidence does not join") {
 		t.Fatalf("managed native evidence mismatch [exit %d]\n%s", code, output)
 	}
 	_, active, problem = store.ActivePin("cozy/marco", 1)
@@ -282,7 +282,7 @@ print(json.dumps({"digest":"sha256:"+hashlib.sha256(evidence).hexdigest(),"lengt
 	writeExecutable(t, filepath.Join(base, "bin", "cozy-environment-proof"), environmentProof(badReceipt))
 	if code, output := run("package", "install", "cozy/marco@1.0.0", "--profile", packageprofile.CU130,
 		"--major", "v1", "--force", "--reason", "receipt mismatch fixture"); code != 1 ||
-		!strings.Contains(output, "managed_environment_receipt_invalid") {
+		!strings.Contains(output, "Runtime overlay receipt") {
 		t.Fatalf("managed receipt mismatch [exit %d]\n%s", code, output)
 	}
 	_, active, problem = store.ActivePin("cozy/marco", 1)
@@ -300,7 +300,7 @@ else: raise SystemExit(2)
 `)
 	if code, output := run("package", "install", "cozy/marco@1.0.0", "--profile", packageprofile.CU130,
 		"--major", "v1", "--force", "--reason", "descriptor mismatch fixture"); code != 1 ||
-		!strings.Contains(output, "managed_descriptor_mismatch") {
+		!strings.Contains(output, "installed package derives descriptor") {
 		t.Fatalf("managed descriptor mismatch [exit %d]\n%s", code, output)
 	}
 	_, active, problem = store.ActivePin("cozy/marco", 1)

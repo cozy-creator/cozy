@@ -11,6 +11,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/cozy-creator/cozy-creator/internal/daemon"
 	"github.com/cozy-creator/cozy-creator/internal/exit"
 	"github.com/cozy-creator/cozy-creator/internal/home"
 	"github.com/cozy-creator/cozy-creator/internal/hub"
@@ -18,7 +19,6 @@ import (
 	"github.com/cozy-creator/cozy-creator/internal/records"
 	"github.com/cozy-creator/cozy-creator/internal/rental"
 	"github.com/cozy-creator/cozy-creator/internal/secret"
-	"github.com/cozy-creator/cozy-creator/internal/service"
 )
 
 // The rental verbs (cl-015). `cozy rental new` MINTS the pod's access token, asks the hub for a
@@ -243,12 +243,12 @@ func handleRent(ctx *Context) *exit.Error {
 	rental.ForgetPending(l, operationKey)
 
 	// CONVERGING is the handoff to this host's sole RecordOwner. Tensorhub holds only
-	// the token hash and cannot authenticate to WorkerControl; the local controller claims,
+	// the token hash and cannot authenticate to WorkerControl; the Cozy daemon claims,
 	// acknowledges the snapshot barrier, drives desired state, and relays the resulting
 	// authenticated worker frames over the rental-scoped HTTP route.
-	ctx.Service = service.Probe(ctx.Cfg)
-	if !ctx.Service.Up {
-		return ctx.Service.Unavailable().WithRemedy(
+	ctx.Daemon = daemon.Probe(ctx.Cfg)
+	if !ctx.Daemon.Up {
+		return ctx.Daemon.Unavailable().WithRemedy(
 			"the paid rental remains converging and attached on this host; start `cozy invoke list` and resume with the same --idempotency-key")
 	}
 	local, e := dial(ctx)

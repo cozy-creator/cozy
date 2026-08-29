@@ -70,12 +70,12 @@ var Routes = []Route{
 
 	// ---- the LOCAL extension module ----
 	{"POST", "/v1/local/rentals/{rental_id}/claim", Local, true, true, false, "",
-		"attach the controller to one already-provisioned private worker",
+		"attach the daemon to one already-provisioned private worker",
 		"`cozy rental new` convergence"},
-	{"POST", "/v1/local/service/unload", Local, true, true, false, "",
+	{"POST", "/v1/local/daemon/unload", Local, true, true, false, "",
 		"stop idle local serving workers and release their GPU-resident models",
 		"cl-044 `cozy unload`"},
-	{"POST", "/v1/local/service/down", Local, true, true, false, "",
+	{"POST", "/v1/local/daemon/down", Local, true, true, false, "",
 		"safely stop, or under explicit --all request cancellation before confirmed rental teardown",
 		"cl-045 `cozy down [--all]`"},
 

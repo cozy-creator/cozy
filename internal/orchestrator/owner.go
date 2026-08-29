@@ -27,7 +27,7 @@ import (
 // dispatches. One goroutine per worker owns the whole conversation; the `session` is that
 // stream's sender half, fenced by the control stream generation the worker minted.
 //
-// LAUNCH TIER (#437): record_owner_epoch is the constant 1 — this service is the one
+// LAUNCH TIER (#437): record_owner_epoch is the constant 1 — this daemon is the one
 // RecordOwner of every worker it spawns or connects to; the machinery that MINTS competing
 // epochs is the hub's Wave-2 lease. The bearer credential (#445/#449/#463) rides
 // `Claim.proof`: for a spawned worker it is the per-spawn bootstrap credential this
@@ -35,7 +35,7 @@ import (
 
 const recordOwnerEpoch = 1
 
-// recordOwnerID names this owner on Claim. Stable per service run is enough at launch:
+// recordOwnerID names this owner on Claim. Stable per daemon run is enough at launch:
 // equal-epoch claims from the SAME RecordOwner are reconnects, anything else is refused.
 const recordOwnerID = "cozy-local-client"
 

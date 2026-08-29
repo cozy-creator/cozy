@@ -172,7 +172,7 @@ func (s *Store) RentalOperation(key string) (*RentalOperation, *exit.Error) {
 }
 
 // ActiveRentalOperations is every paid acquisition/release operation whose absence has
-// not been proved. A row may precede its provider rental id, so a safe controller exit
+// not been proved. A row may precede its provider rental id, so a safe daemon exit
 // must fence on the operation key as well as on attached rental rows.
 func (s *Store) ActiveRentalOperations() ([]RentalOperation, *exit.Error) {
 	rows, err := s.db.Query(`SELECT ` + rentalOperationCols + ` FROM rental_operations
@@ -318,7 +318,7 @@ type Rental struct {
 	ObservedWorkerBootID           string
 	ObservedAt                     string
 	// ArtifactGrantRevision is the highest renter-owned access revision reserved for
-	// this pod. It advances before the HTTP ask so a lost answer can never make a service
+	// this pod. It advances before the HTTP ask so a lost answer can never make a daemon
 	// restart replay an older revision the worker will ignore.
 	ArtifactGrantRevision uint64
 }
@@ -425,7 +425,7 @@ func (s *Store) RecordRental(r Rental) *exit.Error {
 
 // ReserveArtifactGrantRevision durably allocates the next monotonic access revision.
 // Gaps are harmless; reuse is not. The reservation commits before a network call so a
-// response lost after Tensorhub committed cannot move the next service process backward.
+// response lost after Tensorhub committed cannot move the next daemon process backward.
 func (s *Store) ReserveArtifactGrantRevision(id string) (uint64, *exit.Error) {
 	tx, err := s.db.Begin()
 	if err != nil {

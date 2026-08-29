@@ -397,20 +397,8 @@ func (c *Client) transport(err error) *exit.Error {
 		return exit.New(exit.Deadline, "the hub at %s did not answer within %s", c.base, Timeout).
 			WithRemedy("retry; if it persists the hub is up but not serving")
 	}
-	return exit.Unavailablef("the hub at %s is unreachable: %s", c.base, unwrapURL(err)).
-		WithRemedy("check TENSORHUB_URL and that the hub is running")
-}
-
-// unwrapURL strips net/http's URL wrapper so the message names the cause, not the
-// verb and the URL a second time.
-func unwrapURL(err error) string {
-	var ue interface{ Unwrap() error }
-	if errors.As(err, &ue) {
-		if inner := ue.Unwrap(); inner != nil {
-			return inner.Error()
-		}
-	}
-	return err.Error()
+	return exit.Unavailablef("Tensorhub at %s is unavailable. Try again later.", c.base).
+		WithRemedy("Set TENSORHUB_URL to use a different Tensorhub.")
 }
 
 // refusal renders the hub's own typed envelope under a shared-matrix code. The hub's

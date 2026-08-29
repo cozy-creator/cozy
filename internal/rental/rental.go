@@ -265,10 +265,10 @@ func noAddress(id, state string) *exit.Error {
 		WithNext("cozy rental list")
 }
 
-// Resolver is what the service entrypoint hands the orchestrator as `Options.Rentals`. It
+// Resolver is what the daemon entrypoint hands the orchestrator as `Options.Rentals`. It
 // is the DIAL-TIME resolution — the one place the owner token is read, at the moment it
 // becomes Claim.proof. It reads the store on EVERY call rather than closing over a
-// snapshot: `cozy rental new` is a records-plane act that runs against a service already up, so
+// snapshot: `cozy rental new` is a records-plane act that runs against a daemon already up, so
 // a resolver that cached would refuse the rental the user just made until a restart.
 func Resolver(l home.Layout, st *records.Store) func(string) (*orchestrator.RemoteTarget, *exit.Error) {
 	return func(id string) (*orchestrator.RemoteTarget, *exit.Error) {

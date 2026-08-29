@@ -1,6 +1,7 @@
 package output
 
 import (
+	"encoding/json"
 	"fmt"
 	"io"
 	"strings"
@@ -57,6 +58,9 @@ func (r Record) Emit(w io.Writer, mode Mode) error {
 	}
 	if next := trimNext(r.Next); len(next) > 0 {
 		data["next"] = next
+	}
+	if mode.Human && !mode.JSON {
+		return writeHumanRecord(w, fields, data, r.Notes, r.Next, mode.Full)
 	}
 	return Write(w, data, mode)
 }
@@ -117,7 +121,130 @@ func (l List) Emit(w io.Writer, mode Mode) error {
 	if next := trimNext(l.Next); len(next) > 0 {
 		document["next"] = next
 	}
+	if mode.Human && !mode.JSON {
+		return writeHumanList(w, l, columns, shown, total, document, mode.Full)
+	}
 	return Write(w, document, mode)
+}
+
+func writeHumanRecord(w io.Writer, fields []Field, data map[string]any, notes, next []string, full bool) error {
+	var rendered strings.Builder
+	width := 0
+	for _, field := range fields {
+		width = max(width, utf8.RuneCountInString(field.K))
+	}
+	for _, field := range fields {
+		rendered.WriteString(field.K)
+		rendered.WriteByte(':')
+		rendered.WriteString(strings.Repeat(" ", width-utf8.RuneCountInString(field.K)+1))
+		rendered.WriteString(humanValue(data[field.K], full))
+		rendered.WriteByte('\n')
+	}
+	writeHumanGuidance(&rendered, notes, next)
+	_, err := io.WriteString(w, rendered.String())
+	return err
+}
+
+func writeHumanList(w io.Writer, list List, columns []string, shown []map[string]string,
+	total int, document map[string]any, full bool,
+) error {
+	var rendered strings.Builder
+	if len(shown) == 0 {
+		fmt.Fprintf(&rendered, "No %s found.\n", list.Name)
+	} else if len(columns) == 1 {
+		for _, row := range shown {
+			rendered.WriteString(orDash(Elide(row[columns[0]], cellCap, full)))
+			rendered.WriteByte('\n')
+		}
+	} else {
+		writeHumanTable(&rendered, columns, shown, full)
+	}
+	if omitted := total - len(shown); omitted > 0 {
+		fmt.Fprintf(&rendered, "%d more not shown. Use --full to show all.\n", omitted)
+	}
+	for _, aggregate := range list.Aggregates {
+		if aggregate.K == list.Name || aggregate.K == "count" || aggregate.K == "results" {
+			continue
+		}
+		if value, ok := document[aggregate.K]; ok {
+			fmt.Fprintf(&rendered, "%s: %s\n", aggregate.K, humanValue(value, full))
+		}
+	}
+	writeHumanGuidance(&rendered, list.Notes, list.Next)
+	_, err := io.WriteString(w, rendered.String())
+	return err
+}
+
+func writeHumanTable(rendered *strings.Builder, columns []string, rows []map[string]string, full bool) {
+	widths := make([]int, len(columns))
+	for i, column := range columns {
+		widths[i] = utf8.RuneCountInString(strings.ToUpper(column))
+	}
+	values := make([][]string, len(rows))
+	for i, row := range rows {
+		values[i] = make([]string, len(columns))
+		for j, column := range columns {
+			value := orDash(Elide(row[column], cellCap, full))
+			values[i][j] = value
+			widths[j] = max(widths[j], utf8.RuneCountInString(value))
+		}
+	}
+	headings := make([]string, len(columns))
+	for i, column := range columns {
+		headings[i] = strings.ToUpper(column)
+	}
+	writeHumanRow(rendered, headings, widths)
+	for _, row := range values {
+		writeHumanRow(rendered, row, widths)
+	}
+}
+
+func writeHumanRow(rendered *strings.Builder, values []string, widths []int) {
+	for i, value := range values {
+		rendered.WriteString(value)
+		if i < len(values)-1 {
+			rendered.WriteString(strings.Repeat(" ", widths[i]-utf8.RuneCountInString(value)+2))
+		}
+	}
+	rendered.WriteByte('\n')
+}
+
+func writeHumanGuidance(rendered *strings.Builder, notes, next []string) {
+	for _, note := range notes {
+		fmt.Fprintf(rendered, "Note: %s\n", strings.TrimSpace(note))
+	}
+	for _, command := range trimNext(next) {
+		fmt.Fprintf(rendered, "Next: %s\n", strings.TrimSpace(command))
+	}
+}
+
+func humanValue(value any, full bool) string {
+	if value == nil {
+		return "-"
+	}
+	var text string
+	switch scalar := value.(type) {
+	case string:
+		text = scalar
+	case bool, int, int8, int16, int32, int64, uint, uint8, uint16, uint32, uint64,
+		float32, float64, json.Number:
+		text = fmt.Sprint(scalar)
+	default:
+		encoded, err := json.Marshal(value)
+		if err != nil {
+			text = fmt.Sprint(value)
+		} else {
+			text = string(encoded)
+		}
+	}
+	return orDash(Elide(strings.ReplaceAll(text, "\n", " "), fieldCap, full))
+}
+
+func orDash(value string) string {
+	if strings.TrimSpace(value) == "" {
+		return "-"
+	}
+	return value
 }
 
 func (r Record) selected(mode Mode) ([]Field, error) {

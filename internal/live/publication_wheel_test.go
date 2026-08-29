@@ -100,6 +100,16 @@ object = "marco_polo:app"
 		problem.ErrName() != "project_wheel_not_pure" {
 		t.Fatalf("non-pure project tag was not refused: %v", problem)
 	}
+	private := filepath.Join(t.TempDir(), "private_payload-1.0.0-py3-none-any.whl")
+	writeTestWheel(t, private, "private_payload", "1.0.0", true,
+		[]string{"py3-none-any"}, map[string][]byte{
+			"private_payload/__init__.py": []byte("value=1\n"),
+			"private_payload/.env.local":  []byte("TOKEN=secret\n"),
+		})
+	if _, problem := wheel.Inspect(private, wheel.ProjectWheel); problem == nil ||
+		problem.ErrName() != "project_wheel_credential" {
+		t.Fatalf("backend-emitted private member was not refused: %v", problem)
+	}
 	mislabeled := filepath.Join(t.TempDir(), "custom_op-1.2.3-py3-none-any.whl")
 	writeTestWheel(t, mislabeled, "custom_op", "1.2.3", true,
 		[]string{"py3-none-any"}, map[string][]byte{"custom_op/_native.so": []byte("native")})

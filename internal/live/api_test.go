@@ -19,7 +19,7 @@ import (
 func TestLocalAPIDoor(t *testing.T) {
 	root := filepath.Join(os.TempDir(), "cozy-live", "api-door")
 	must(t, os.RemoveAll(root))
-	svc := startService(t, root)
+	svc := startDaemonProcess(t, root)
 
 	// A credential is required, and the refusal is the TYPED envelope naming its scheme.
 	no := svc.call(t, "GET", "/v1/requests?limit=1", nil, "Authorization", "")
@@ -166,15 +166,15 @@ func TestLocalAPIDoor(t *testing.T) {
 	}
 
 	// The credential is handed over through an OS-protected file, never argv, and never
-	// appears in anything the service writes.
+	// appears in anything the daemon writes.
 	info, err := os.Stat(filepath.Join(root, "client.cred"))
 	must(t, err)
 	if info.Mode().Perm() != 0o600 {
 		t.Errorf("the CLI credential file is %v, wanted 0600", info.Mode().Perm())
 	}
-	log, _ := os.ReadFile(filepath.Join(root, "service.log"))
+	log, _ := os.ReadFile(filepath.Join(root, "daemon-test.log"))
 	if strings.Contains(string(log), svc.token) {
-		t.Error("the service's own log contains the credential")
+		t.Error("the daemon's own log contains the credential")
 	}
 	if r := svc.call(t, "GET", "/v1/requests/req-nope", nil); strings.Contains(string(r.Body), svc.token) {
 		t.Error("a rendered error contains the credential")
@@ -187,7 +187,7 @@ func TestLocalAPIDoor(t *testing.T) {
 		ID: "rental-down-arm", PackageRef: "cozy/fake/v1/run",
 		AcceleratorModel: "CPU", State: "ready", Hub: "https://hub.invalid",
 	}))
-	blocked := svc.call(t, "POST", "/v1/local/service/down", map[string]bool{"all": false})
+	blocked := svc.call(t, "POST", "/v1/local/daemon/down", map[string]bool{"all": false})
 	if blocked.Status != http.StatusConflict || blocked.code() != "active_work" ||
 		!strings.Contains(string(blocked.Body), "rental-down-arm") {
 		t.Errorf("plain down did not name and preserve the rental: %s", blocked.brief())
