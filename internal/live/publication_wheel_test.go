@@ -6,6 +6,7 @@ import (
 	"crypto/sha256"
 	"encoding/base64"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -14,15 +15,12 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/cozy-creator/cozy-creator/internal/endpointprofile"
 	"github.com/cozy-creator/cozy-creator/internal/endpointpublish"
 	"github.com/cozy-creator/cozy-creator/internal/wheel"
 )
 
 // TestEndpointPublicationWheels is the release-border matrix: one deterministic
-// pure project wheel, planted native/build-input refusals, and one separately
-// prebuilt native custom wheel whose exact tags/roots/digest are declared without a
-// build or retag step.
+// pure project wheel and planted native/build-input refusals.
 func TestEndpointPublicationWheels(t *testing.T) {
 	root := t.TempDir()
 	mustWrite(t, filepath.Join(root, "pyproject.toml"), `[project]
@@ -34,7 +32,6 @@ object = "marco_polo:app"
 `)
 	mustWrite(t, filepath.Join(root, "marco_polo.py"), "app = object()\n")
 	mustWrite(t, filepath.Join(root, "uv.lock"), "version = 1\n")
-	mustWrite(t, filepath.Join(root, "endpoint.release.json"), `{"compatible_accelerator_models":["NVIDIA GeForce RTX 4090"]}`)
 	packed, problem := wheel.Pack(wheel.Request{Tree: root, OutDir: filepath.Join(root, "dist")})
 	if problem != nil {
 		t.Fatalf("pure project pack refused: %s", problem)
@@ -44,7 +41,7 @@ object = "marco_polo:app"
 		strings.Join(packed.Fact.ImportRoots, ",") != "marco_polo" {
 		t.Fatalf("project WheelFact disagrees with packed bytes: %+v / %+v", packed, packed.Fact)
 	}
-	for _, forbidden := range []string{"pyproject.toml", "uv.lock", "endpoint.release.json"} {
+	for _, forbidden := range []string{"pyproject.toml", "uv.lock"} {
 		if slices.Contains(packed.Entries, forbidden) {
 			t.Fatalf("publication-only metadata entered the runtime project wheel: %s", forbidden)
 		}
@@ -99,14 +96,6 @@ object = "marco_polo:app"
 	if fact, problem := wheel.Inspect(oddPure, wheel.CustomWheel); problem != nil || fact.Native {
 		t.Fatalf("platform-tagged but measured-pure custom wheel was misclassified: %+v %v", fact, problem)
 	}
-
-	profiles, problem := endpointprofile.NormalizeSet([]string{endpointprofile.CU130, endpointprofile.CU126, endpointprofile.CU130})
-	if problem != nil || strings.Join(profiles, ",") != endpointprofile.CU126+","+endpointprofile.CU130 {
-		t.Fatalf("profile set is not sorted/deduplicated: %v %v", profiles, problem)
-	}
-	if _, problem := endpointprofile.NormalizeSet(nil); problem == nil || problem.ErrName() != "usage" {
-		t.Fatalf("profile default unexpectedly exists: %v", problem)
-	}
 }
 
 func TestEndpointPublishPackage(t *testing.T) {
@@ -114,7 +103,8 @@ func TestEndpointPublishPackage(t *testing.T) {
 	mustWrite(t, filepath.Join(repo, "pyproject.toml"), `[project]
 name = "marco-polo"
 version = "1.0.0"
-dependencies = []
+requires-python = ">=3.12,<3.13"
+dependencies = ["torch>=2.13,<2.14", "cozy-runtime==2.0.0"]
 `)
 	mustWrite(t, filepath.Join(repo, "endpoint.toml"), `[application]
 object = "marco_polo:app"
@@ -127,41 +117,22 @@ object = "marco_polo:app"
   "entrypoints": [],
   "application": "marco_polo:app"
 }`)
-	mustWrite(t, filepath.Join(repo, "endpoint.release.json"), `{
-  "model_roots": [],
-  "compatible_accelerator_models": ["NVIDIA GeForce RTX 4090", "NVIDIA GeForce RTX 4090"],
-  "native_wheel_proof": {"fixture":"custom_op:run","expected_result_digest":"sha256:`+strings.Repeat("c", 64)+`"}
-}`)
 	git(t, repo, "init", "-q")
 	git(t, repo, "config", "user.email", "fixture@example.invalid")
 	git(t, repo, "config", "user.name", "Fixture")
 	git(t, repo, "add", ".")
 	git(t, repo, "commit", "-qm", "fixture")
 
-	custom := filepath.Join(t.TempDir(), "custom_op-1.2.3-cp312-cp312-manylinux_2_28_x86_64.whl")
-	writeTestWheel(t, custom, "custom_op", "1.2.3", false,
-		[]string{"cp312-cp312-manylinux_2_28_x86_64"}, map[string][]byte{
-			"custom_op/__init__.py": []byte("from ._native import run\n"),
-			"custom_op/_native.so":  []byte("prebuilt-native-fixture"),
-		})
-	request := endpointpublish.Request{Tree: repo, Release: "1.0.0",
-		Profiles: []string{endpointprofile.CU130, endpointprofile.CU126},
-		CustomWheels: []string{
-			endpointprofile.CU130 + "=" + custom,
-			endpointprofile.CU126 + "=" + custom,
-		},
-	}
+	request := endpointpublish.Request{Tree: repo, Release: "1.0.0"}
 	a, problem := endpointpublish.Prepare(request)
 	if problem != nil {
 		t.Fatalf("first package refused: %s", problem)
 	}
 	defer a.Close()
-	if a.Declaration.Format != "tensorhub.endpoint_release_declaration/1" ||
-		len(a.Declaration.ModelRoots) != 0 {
-		t.Fatalf("weightless declaration format/root set is wrong: %+v", a.Declaration)
+	if a.Declaration.Format != "tensorhub.endpoint_release_declaration/1" {
+		t.Fatalf("weightless declaration format is wrong: %+v", a.Declaration)
 	}
 	request.Release = "prod_2026-08-28.a" // release grammar is opaque, never a wheel version
-	request.Profiles = []string{endpointprofile.CU126, endpointprofile.CU130, endpointprofile.CU126}
 	b, problem := endpointpublish.Prepare(request)
 	if problem != nil {
 		t.Fatalf("second package refused: %s", problem)
@@ -171,49 +142,38 @@ object = "marco_polo:app"
 	bBytes, _ := b.Declaration.CanonicalBytes()
 	if !bytes.Equal(aBytes, bBytes) || a.Declaration.SourceArchive != b.Declaration.SourceArchive ||
 		a.Declaration.ProjectWheel.Digest != b.Declaration.ProjectWheel.Digest {
-		t.Fatalf("same committed tree/profile set did not reproduce\n%s\n%s", aBytes, bBytes)
+		t.Fatalf("same committed tree did not reproduce\n%s\n%s", aBytes, bBytes)
 	}
-	if len(a.Declaration.CustomWheels) != 1 || len(a.Declaration.CustomWheels[0].Profiles) != 2 ||
-		len(a.Files) != 6 || string(mustRead(t, a.Files["evaluated_config"])) != "{}" {
+	if len(a.Files) != 4 {
 		t.Fatalf("incomplete declaration or upload role set: %+v files=%v", a.Declaration, a.Files)
 	}
+	for _, retired := range []string{"profiles", "custom_wheels", "evaluated_config", "compatible_accelerator_models", "model_roots", "model_bindings", "native_wheel_proof"} {
+		if bytes.Contains(aBytes, []byte(`"`+retired+`"`)) {
+			t.Fatalf("retired declaration field %q remains in %s", retired, aBytes)
+		}
+	}
+	if metadata := wheelMetadata(t, a.Files["project_wheel"]); !strings.Contains(metadata, "Requires-Python: >=3.12,<3.13") ||
+		!strings.Contains(metadata, "Requires-Dist: torch>=2.13,<2.14") ||
+		!strings.Contains(metadata, "Requires-Dist: cozy-runtime==2.0.0") {
+		t.Fatalf("project metadata did not carry declared compatibility requirements:\n%s", metadata)
+	}
 
-	checkpointA := "sha256:" + strings.Repeat("a", 64)
-	checkpointZ := "sha256:" + strings.Repeat("f", 64)
-	objectRef := `{"digest":"sha256:` + strings.Repeat("b", 64) + `","length":10}`
-	mustWrite(t, filepath.Join(repo, "endpoint.descriptor.json"), `{"application":"marco_polo:app","entrypoints":[{"models":[{"class":"Model"}],"name":"marco"}],"format":"cozy.endpoint.descriptor/1","jobs":[]}`)
+	mustWrite(t, filepath.Join(repo, "endpoint.descriptor.json"), `{"application":"marco_polo:app","entrypoints":[{"models":[{"class":"Model","component_use":[],"path":"marco.models.model","stamps":[]}],"name":"marco"}],"format":"cozy.endpoint.descriptor/1","jobs":[]}`)
 	git(t, repo, "add", "endpoint.descriptor.json")
 	git(t, repo, "commit", "-qm", "declare model input")
-	if _, problem := endpointpublish.Prepare(request); problem == nil || problem.ErrName() != "endpoint_model_bindings_absent" {
-		t.Fatalf("model-bearing descriptor without bindings did not refuse: %v", problem)
+	if _, problem := endpointpublish.Prepare(request); problem == nil || problem.ErrName() != "endpoint_model_binding_deferred" {
+		t.Fatalf("model-bearing publication did not report its explicit deferral: %v", problem)
 	}
-	mustWrite(t, filepath.Join(repo, "endpoint.release.json"), `{
-  "compatible_accelerator_models": ["NVIDIA H200"],
-  "model_roots": [
-    {"org":"cozy","name":"z-model","checkpoint_id":"`+checkpointZ+`"},
-    {"org":"cozy","name":"a-model","checkpoint_id":"`+checkpointA+`"},
-    {"org":"cozy","name":"z-model","checkpoint_id":"`+checkpointZ+`"}
-  ],
-  "model_bindings": [
-    {"path":"z.path","checkpoint":{"org":"cozy","name":"z-model","checkpoint_id":"`+checkpointZ+`"},"config":{"assets":[],"document":`+objectRef+`},"execution_layout":[{"component":"transformer","root":{"org":"cozy","name":"z-model","checkpoint_id":"`+checkpointZ+`"}}],"hardware_variant":"sm90"},
-    {"path":"a.path","checkpoint":{"org":"cozy","name":"a-model","checkpoint_id":"`+checkpointA+`"},"config":{"assets":[{"name":"tokenizer","ref":`+objectRef+`}],"document":`+objectRef+`},"execution_layout":[{"component":"encoder","root":{"org":"cozy","name":"a-model","checkpoint_id":"`+checkpointA+`"}}],"hardware_variant":"sm90"}
-  ],
-  "native_wheel_proof": {"fixture":"custom_op:run","expected_result_digest":"sha256:`+strings.Repeat("c", 64)+`"}
-}`)
-	git(t, repo, "add", "endpoint.release.json")
-	git(t, repo, "commit", "-qm", "bind models")
-	modelPackage, problem := endpointpublish.Prepare(request)
-	if problem != nil {
-		t.Fatalf("model-bearing package refused: %s", problem)
+	mustWrite(t, filepath.Join(repo, "endpoint.descriptor.json"), `{"application":"marco_polo:app","entrypoints":[],"format":"cozy.endpoint.descriptor/1","jobs":[]}`)
+	mustWrite(t, filepath.Join(repo, "endpoint.release.json"), `{}`)
+	git(t, repo, "add", ".")
+	git(t, repo, "commit", "-qm", "plant retired metadata")
+	if _, problem := endpointpublish.Prepare(request); problem == nil || problem.ErrName() != "endpoint_metadata_retired" {
+		t.Fatalf("retired release metadata did not refuse: %v", problem)
 	}
-	defer modelPackage.Close()
-	if len(modelPackage.Declaration.ModelRoots) != 2 ||
-		modelPackage.Declaration.ModelRoots[0].Name != "a-model" ||
-		len(modelPackage.Declaration.ModelBindings) != 2 ||
-		modelPackage.Declaration.ModelBindings[0].Path != "a.path" {
-		t.Fatalf("model roots/bindings are not canonical: %+v %+v",
-			modelPackage.Declaration.ModelRoots, modelPackage.Declaration.ModelBindings)
-	}
+	must(t, os.Remove(filepath.Join(repo, "endpoint.release.json")))
+	git(t, repo, "add", "-u")
+	git(t, repo, "commit", "-qm", "remove retired metadata")
 
 	mustWrite(t, filepath.Join(repo, "uncommitted.py"), "x=1\n")
 	if _, problem := endpointpublish.Prepare(request); problem == nil || problem.ErrName() != "endpoint_tree_dirty" {
@@ -228,17 +188,13 @@ object = "marco_polo:app"
 	}
 }
 
-func TestEndpointPublicationRequiresAcceleratorModel(t *testing.T) {
+func TestEndpointPublicationNeedsNoPublisherProfile(t *testing.T) {
 	repo := trackedEndpointFixture(t)
-	mustWrite(t, filepath.Join(repo, "endpoint.release.json"),
-		`{"compatible_accelerator_models":[],"model_bindings":[],"model_roots":[]}`)
-	git(t, repo, "add", "endpoint.release.json")
-	git(t, repo, "commit", "-qm", "remove execution compatibility")
-	if _, problem := endpointpublish.Prepare(endpointpublish.Request{Tree: repo, Release: "weightless",
-		Profiles: []string{endpointprofile.CU130}}); problem == nil ||
-		problem.ErrName() != "endpoint_compatible_accelerator_models_absent" {
-		t.Fatalf("empty execution compatibility set did not refuse locally: %v", problem)
+	pack, problem := endpointpublish.Prepare(endpointpublish.Request{Tree: repo, Release: "weightless"})
+	if problem != nil {
+		t.Fatalf("weightless pure-Python publication required publisher compatibility input: %v", problem)
 	}
+	defer pack.Close()
 }
 
 func mustWrite(t *testing.T, path, body string) {
@@ -252,6 +208,26 @@ func mustRead(t *testing.T, path string) []byte {
 	body, err := os.ReadFile(path)
 	must(t, err)
 	return body
+}
+
+func wheelMetadata(t *testing.T, file string) string {
+	t.Helper()
+	zr, err := zip.OpenReader(file)
+	must(t, err)
+	defer zr.Close()
+	for _, member := range zr.File {
+		if !strings.HasSuffix(member.Name, ".dist-info/METADATA") {
+			continue
+		}
+		reader, err := member.Open()
+		must(t, err)
+		body, err := io.ReadAll(reader)
+		_ = reader.Close()
+		must(t, err)
+		return string(body)
+	}
+	t.Fatal("wheel has no METADATA")
+	return ""
 }
 
 func git(t *testing.T, dir string, args ...string) {

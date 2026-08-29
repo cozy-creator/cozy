@@ -57,14 +57,8 @@ type Descriptor struct {
 // Entrypoint is one callable surface: its request schema, its declared model slots, and
 // its result shape.
 type Entrypoint struct {
-	Name string `json:"name"`
-	Kind string `json:"-"`
-	// Hidden is the author's DECLARED-BUT-NOT-SERVED marker (#572d). The surface stays in
-	// the descriptor because it is real code; it gets no binding staged and takes no
-	// traffic. H3's `reference_to_video` is the case: its vision-conditioning seam is
-	// unbuilt, and staging its binding anyway let it fail to prepare and deny the working
-	// T2VA sibling the card.
-	Hidden    bool   `json:"hidden"`
+	Name      string `json:"name"`
+	Kind      string `json:"-"`
 	Models    []Slot `json:"models"`
 	Request   Struct `json:"request"`
 	Result    Struct `json:"result"`
@@ -87,7 +81,7 @@ type ArtifactOutput struct {
 type Slot struct {
 	Class        string              `json:"class"`
 	Path         string              `json:"path"`
-	Param        string              `json:"param"`
+	Param        string              `json:"-"`
 	Stamps       map[string]string   `json:"stamps"`
 	ComponentUse map[string][]string `json:"component_use"`
 }
@@ -111,6 +105,19 @@ type Field struct {
 		MaxBytes   int64    `json:"max_bytes"`
 		MediaTypes []string `json:"media_types"`
 	} `json:"asset_bound"`
+}
+
+func (f *Field) UnmarshalJSON(data []byte) error {
+	type plain Field
+	var decoded plain
+	if err := json.Unmarshal(data, &decoded); err != nil {
+		return err
+	}
+	*f = Field(decoded)
+	if f.Wire == "" {
+		f.Wire = "required"
+	}
+	return nil
 }
 
 type FieldConstraints struct {
@@ -182,9 +189,7 @@ func validateClosedDescriptor(data []byte) error {
 		for _, row := range rows {
 			required := []string{"name", "request", "result"}
 			optional := []string{"models"}
-			if kind == "entrypoint" {
-				required = append(required, "hidden")
-			} else {
+			if kind == "job" {
 				required = append(required, "publishes")
 				optional = append(optional, "resources", "artifact_outputs")
 			}
@@ -204,7 +209,7 @@ func validateClosedDescriptor(data []byte) error {
 				}
 				for _, slot := range slots {
 					if _, err := exactKeys(slot,
-						[]string{"class", "component_use", "param", "path", "stamps"}, nil); err != nil {
+						[]string{"class", "component_use", "path", "stamps"}, nil); err != nil {
 						return err
 					}
 				}
@@ -241,10 +246,16 @@ func validateStructRaw(raw json.RawMessage) error {
 		return err
 	}
 	for _, rawField := range fields {
-		field, err := exactKeys(rawField, []string{"name", "type", "wire"},
-			[]string{"asset_bound", "constraints"})
+		field, err := exactKeys(rawField, []string{"name", "type"},
+			[]string{"asset_bound", "constraints", "wire"})
 		if err != nil {
 			return err
+		}
+		if rawWire := field["wire"]; rawWire != nil {
+			var wire string
+			if json.Unmarshal(rawWire, &wire) != nil || (wire != "optional" && wire != "omissible") {
+				return fmt.Errorf("wire must be absent for required fields or spell optional|omissible")
+			}
 		}
 		if err := validateTypeRaw(field["type"]); err != nil {
 			return err
@@ -315,6 +326,16 @@ func validateTypeRaw(raw json.RawMessage) error {
 func validateEntrypoint(ep *Entrypoint) *exit.Error {
 	if ep.Name == "" {
 		return exit.New(exit.Validation, "descriptor carries an unnamed %s", ep.Kind)
+	}
+	for i := range ep.Models {
+		slot := &ep.Models[i]
+		prefix := ep.Name + ".models."
+		param := strings.TrimPrefix(slot.Path, prefix)
+		if slot.Class == "" || param == slot.Path || param == "" || strings.Contains(param, ".") {
+			return exit.New(exit.Validation,
+				"%s has invalid model path %q; it must be %s<parameter>", ep.Name, slot.Path, prefix)
+		}
+		slot.Param = param
 	}
 	for _, pair := range []struct {
 		name string

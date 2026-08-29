@@ -34,7 +34,7 @@ var excludedDir = map[string]bool{
 // excludedFile is the same rule for leaves.
 var excludedFile = map[string]bool{
 	".DS_Store": true, "Thumbs.db": true, ".gitignore": true, ".gitattributes": true,
-	"pyproject.toml": true, "uv.lock": true, "endpoint.release.json": true,
+	"pyproject.toml": true, "uv.lock": true,
 }
 
 // compiledExt is what a project that needs to COMPILE something carries. Any of these is
@@ -129,7 +129,7 @@ func walk(root string) ([]entry, *exit.Error) {
 		if strings.EqualFold(path.Ext(rel), ".whl") {
 			return exit.Named(exit.Validation, "project_wheel_nested_wheel",
 				"%s is a wheel nested inside the project wheel", rel).
-				WithRemedy("pass it separately as an exact prebuilt --custom-wheel; Creator never vendors or retags it")
+				WithRemedy("remove it; endpoint publication accepts dependencies only through pyproject.toml and uv.lock")
 		}
 		if buildInputName(rel) {
 			return refuseBuildInput(rel)
@@ -168,7 +168,7 @@ func walk(root string) ([]entry, *exit.Error) {
 func refuseCompiled(rel string) *exit.Error {
 	return exit.Named(exit.Validation, "project_wheel_native_file",
 		"%s is native source or a native binary; the project wheel is %s", rel, Tag).
-		WithRemedy("remove it from the endpoint project; publish a separately prebuilt exact custom wheel for a missing native dependency")
+		WithRemedy("remove it; native endpoint dependencies are deferred until a concrete need justifies an admission lane")
 }
 
 func buildInputName(rel string) bool {
@@ -180,7 +180,7 @@ func buildInputName(rel string) bool {
 func refuseBuildInput(rel string) *exit.Error {
 	return exit.Named(exit.Validation, "project_wheel_build_input",
 		"%s is a native/package build input; endpoint publication runs no build request", rel).
-		WithRemedy("keep the project wheel pure; supply only separately prebuilt exact custom wheels, never source, a Dockerfile, a command, or a build environment")
+		WithRemedy("keep the project wheel pure and declare ordinary dependencies in pyproject.toml; source builds are not admitted")
 }
 
 // checkName holds the rule that nothing inside a wheel is an absolute path, a traversal,
@@ -234,7 +234,7 @@ func checkBackend(d declaration) *exit.Error {
 		"%s declares `[build-system] build-backend = %q`; the Cozy packer implements no backend and fires no PEP 517 hook",
 		pyprojectName, d.backend).
 		WithRemedy("remove `[build-system]`: a pure-python endpoint is packed from its declared tree, " +
-			"and native dependencies arrive only as separately prebuilt exact custom wheels")
+			"and dependencies are derived from pyproject.toml and uv.lock")
 }
 
 // checkApplication answers the only structural question the packer can answer about the

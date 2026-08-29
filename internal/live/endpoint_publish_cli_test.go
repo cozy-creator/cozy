@@ -159,7 +159,6 @@ func TestEndpointPublishCLI(t *testing.T) {
 		return cmd.ProcessState.ExitCode(), string(body)
 	}
 	args := []string{"endpoint", "publish", "cozy/marco", "--release", "1.0.0", "--dir", source,
-		"--profile", endpointprofile.CU130, "--profile", endpointprofile.CU126,
 		"--reason", "fixture publish"}
 	if code, out := run(args...); code != 0 || !strings.Contains(out, "candidate-130") || !strings.Contains(out, "serving-pointer move ran") {
 		t.Fatalf("endpoint publish [exit %d]\n%s", code, out)
@@ -187,7 +186,6 @@ dependencies = []
 	mustWrite(t, filepath.Join(repo, "marco_polo.py"), "app = object()\n")
 	mustWrite(t, filepath.Join(repo, "uv.lock"), "version = 1\n")
 	mustWrite(t, filepath.Join(repo, "endpoint.descriptor.json"), `{"application":"marco_polo:app","entrypoints":[],"format":"cozy.endpoint.descriptor/1","jobs":[]}`)
-	mustWrite(t, filepath.Join(repo, "endpoint.release.json"), `{"compatible_accelerator_models":["NVIDIA GeForce RTX 4090"],"model_bindings":[],"model_roots":[]}`)
 	git(t, repo, "init", "-q")
 	git(t, repo, "config", "user.email", "fixture@example.invalid")
 	git(t, repo, "config", "user.name", "Fixture")
@@ -200,11 +198,7 @@ func fixtureDeclarationRoles(d endpointpublish.Declaration) map[string]endpointp
 	out := map[string]endpointpublish.ObjectRef{
 		"source_archive": d.SourceArchive, "source_lock": d.SourceLock,
 		"project_wheel": {Digest: d.ProjectWheel.Digest, Length: d.ProjectWheel.Length},
-		"descriptor":    d.Descriptor, "evaluated_config": d.EvaluatedConfig,
-	}
-	for _, custom := range d.CustomWheels {
-		role := "custom_wheel:" + custom.Wheel.Distribution + ":" + strings.TrimPrefix(custom.Wheel.Digest, "sha256:")
-		out[role] = endpointpublish.ObjectRef{Digest: custom.Wheel.Digest, Length: custom.Wheel.Length}
+		"descriptor":    d.Descriptor,
 	}
 	return out
 }

@@ -497,12 +497,10 @@ func Decode(control hub.ExactControlDocument, endpointRef string) (Facts, *exit.
 	visible := map[string]*launch.Entrypoint{}
 	for i := range descriptor.Entrypoints {
 		ep := &descriptor.Entrypoints[i]
-		if !ep.Hidden {
-			if visible[ep.Name] != nil {
-				return facts, invalid("descriptor repeats visible entrypoint %q", ep.Name)
-			}
-			visible[ep.Name] = ep
+		if visible[ep.Name] != nil {
+			return facts, invalid("descriptor repeats entrypoint %q", ep.Name)
 		}
+		visible[ep.Name] = ep
 	}
 	reachable := map[string]bool{}
 	referencedRMB := map[string]bool{}

@@ -26,8 +26,6 @@ func handleEndpointPublish(ctx *Context) *exit.Error {
 	}
 	pack, problem := endpointpublish.Prepare(endpointpublish.Request{
 		Tree: ctx.Inv.Value("--dir"), Release: release,
-		Profiles:     append([]string(nil), ctx.Inv.Values["--profile"]...),
-		CustomWheels: append([]string(nil), ctx.Inv.Values["--custom-wheel"]...),
 	})
 	if problem != nil {
 		return problem
@@ -99,7 +97,7 @@ func handleEndpointPublish(ctx *Context) *exit.Error {
 	}
 	return emit(ctx, output.Record{Kind: "endpoint publication", Fields: fields, Notes: []string{
 		"the endpoint name was created idempotently when absent",
-		"source/project bytes were published once; profile candidates are non-serving until Tensorhub qualification",
+		"source/project bytes were published once; Tensorhub derived compatible base worker profiles from package metadata",
 		"no endpoint image, Dockerfile, dependency resolver, native build, or serving-pointer move ran",
 	}, Next: []string{"cozy endpoint install " + ref.String() + "@" + release}})
 }
@@ -118,19 +116,14 @@ func validateBegin(pack *endpointpublish.Package, begun hub.EndpointReleaseBegin
 		(begun.State != "pending" && begun.State != "committed") {
 		return exit.Internalf("endpoint begin returned another declaration or invalid state %q", begun.State)
 	}
-	wantProfiles := pack.Declaration.Profiles
-	gotProfiles := make([]string, 0, len(begun.Profiles))
+	seenProfiles := map[string]bool{}
 	for _, row := range begun.Profiles {
-		if row.State != "candidate_pending" || row.CandidateID != "" ||
+		if row.Profile == "" || seenProfiles[row.Profile] || row.State != "candidate_pending" || row.CandidateID != "" ||
 			row.BaseRealizationKind != "" || row.BaseRealizationDigest != "" ||
 			row.RefusalCode != "" || row.RefusalDetail != "" {
 			return exit.Internalf("endpoint begin returned a non-pending profile row for %q", row.Profile)
 		}
-		gotProfiles = append(gotProfiles, row.Profile)
-	}
-	sort.Strings(gotProfiles)
-	if !sameStrings(wantProfiles, gotProfiles) {
-		return exit.Internalf("endpoint begin profile set differs from the frozen declaration")
+		seenProfiles[row.Profile] = true
 	}
 	want := declarationRoles(pack)
 	seen := map[string]bool{}
@@ -165,16 +158,12 @@ func validateFinalize(pack *endpointpublish.Package, release string,
 	if done.Release != release || done.DeclarationDigest != pack.Declaration.Digest() {
 		return exit.Internalf("endpoint finalize returned another release or declaration digest")
 	}
-	declared := map[string]bool{}
-	for _, profile := range pack.Declaration.Profiles {
-		declared[profile] = true
-	}
 	seenProfiles := map[string]bool{}
 	seenRealizations := map[string]bool{}
 	candidateProfiles := map[string]bool{}
 	for _, row := range done.Profiles {
-		if !declared[row.Profile] {
-			return exit.Internalf("endpoint finalize returned unknown profile %q", row.Profile)
+		if row.Profile == "" || seenProfiles[row.Profile] {
+			return exit.Internalf("endpoint finalize returned an empty or duplicate profile %q", row.Profile)
 		}
 		seenProfiles[row.Profile] = true
 		key := row.Profile + "\x00" + row.BaseRealizationKind
@@ -198,9 +187,6 @@ func validateFinalize(pack *endpointpublish.Package, release string,
 			}
 			candidateProfiles[row.Profile] = true
 		}
-	}
-	if len(seenProfiles) != len(declared) {
-		return exit.Internalf("endpoint finalize returned %d of %d declared profiles", len(seenProfiles), len(declared))
 	}
 	seenExecutions := map[string]bool{}
 	for _, execution := range done.EndpointExecutions {
@@ -247,16 +233,10 @@ type localRole struct {
 func declarationRoles(pack *endpointpublish.Package) map[string]localRole {
 	d := pack.Declaration
 	out := map[string]localRole{
-		"source_archive":   {ref: d.SourceArchive, path: pack.Files["source_archive"]},
-		"source_lock":      {ref: d.SourceLock, path: pack.Files["source_lock"]},
-		"project_wheel":    {ref: endpointpublish.ObjectRef{Digest: d.ProjectWheel.Digest, Length: d.ProjectWheel.Length}, path: pack.Files["project_wheel"]},
-		"descriptor":       {ref: d.Descriptor, path: pack.Files["descriptor"]},
-		"evaluated_config": {ref: d.EvaluatedConfig, path: pack.Files["evaluated_config"]},
-	}
-	for _, custom := range d.CustomWheels {
-		role := "custom_wheel:" + custom.Wheel.Distribution + ":" + strings.TrimPrefix(custom.Wheel.Digest, "sha256:")
-		out[role] = localRole{ref: endpointpublish.ObjectRef{Digest: custom.Wheel.Digest,
-			Length: custom.Wheel.Length}, path: pack.Files[role]}
+		"source_archive": {ref: d.SourceArchive, path: pack.Files["source_archive"]},
+		"source_lock":    {ref: d.SourceLock, path: pack.Files["source_lock"]},
+		"project_wheel":  {ref: endpointpublish.ObjectRef{Digest: d.ProjectWheel.Digest, Length: d.ProjectWheel.Length}, path: pack.Files["project_wheel"]},
+		"descriptor":     {ref: d.Descriptor, path: pack.Files["descriptor"]},
 	}
 	return out
 }
@@ -327,16 +307,4 @@ func mutationReason(ctx *Context, command string) (string, *exit.Error) {
 			WithRemedy("Tensorhub records why every mutation or paid acquisition happened before it acts")
 	}
 	return reason, nil
-}
-
-func sameStrings(a, b []string) bool {
-	if len(a) != len(b) {
-		return false
-	}
-	for i := range a {
-		if a[i] != b[i] {
-			return false
-		}
-	}
-	return true
 }
