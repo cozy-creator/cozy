@@ -87,7 +87,7 @@ type Held struct{ f *os.File }
 func Hold(l home.Layout, addr, socket string) (*Held, *exit.Error) {
 	f, err := os.OpenFile(l.Service, os.O_RDWR|os.O_CREATE, 0o644)
 	if err != nil {
-		return nil, exit.Internalf("cannot open the service lock %s: %s", l.Service, err)
+		return nil, exit.Internalf("cannot establish controller ownership for %s: %s", l.Root, err)
 	}
 	if err := flock.Exclusive(f); err != nil {
 		f.Close()
@@ -100,11 +100,11 @@ func Hold(l home.Layout, addr, socket string) (*Held, *exit.Error) {
 		addr, socket, os.Getpid(), time.Now().UTC().Format(time.RFC3339))
 	if err := f.Truncate(0); err != nil {
 		f.Close()
-		return nil, exit.Internalf("cannot publish the service address: %s", err)
+		return nil, exit.Internalf("cannot publish the controller address: %s", err)
 	}
 	if _, err := f.WriteAt([]byte(body), 0); err != nil {
 		f.Close()
-		return nil, exit.Internalf("cannot publish the service address: %s", err)
+		return nil, exit.Internalf("cannot publish the controller address: %s", err)
 	}
 	return &Held{f: f}, nil
 }

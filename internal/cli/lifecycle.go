@@ -51,8 +51,7 @@ func handleUnload(ctx *Context) *exit.Error {
 }
 
 func handleUp(ctx *Context) *exit.Error {
-	already := service.Probe(ctx.Cfg).Up
-	state, problem := ensureController(ctx)
+	state, changed, problem := ensureController(ctx)
 	if problem != nil {
 		return problem
 	}
@@ -60,13 +59,13 @@ func handleUp(ctx *Context) *exit.Error {
 		"the controller runs in the background; no log stream is attached",
 		"no endpoint or model was loaded into GPU memory",
 	}
-	if already {
+	if !changed {
 		notes = append(notes, "already running: up is idempotent")
 	}
 	return emit(ctx, output.Record{Kind: "up", Fields: []output.Field{
 		{K: "controller", V: "running"}, {K: "url", V: "http://" + state.Addr + "/"},
 		{K: "api", V: "http://" + state.Addr}, {K: "pid", V: state.PID},
-		{K: "since", V: state.Since},
+		{K: "since", V: state.Since}, {K: "changed", V: changed},
 	}, Notes: notes})
 }
 
@@ -88,7 +87,7 @@ func handleDown(ctx *Context) *exit.Error {
 				"controller down refused: active %s", strings.Join(blockers, ", ")).
 				WithRemedy("cancel/end the named work, or use explicit `cozy down --all`")
 		}
-		state, problem = ensureController(ctx)
+		state, _, problem = ensureController(ctx)
 		if problem != nil {
 			return problem
 		}
@@ -281,10 +280,10 @@ func finishControllerDown(ctx *Context, all bool, extra []output.Field) *exit.Er
 			fields := []output.Field{{K: "controller", V: "stopped"}, {K: "all", V: all}}
 			fields = append(fields, extra...)
 			return emit(ctx, output.Record{Kind: "down", Fields: fields,
-				Notes: []string{"the service lock is free; the controller and local workers are gone"}})
+				Notes: []string{"the controller and local workers are gone"}})
 		}
 		time.Sleep(50 * time.Millisecond)
 	}
-	return exit.New(exit.Conflict, "the controller accepted down but still holds its service lock").
-		WithRemedy("the controller did not release its lock; no forced kill was performed")
+	return exit.New(exit.Conflict, "the controller accepted down but did not finish stopping").
+		WithRemedy("the controller remains responsible for its workers; no forced kill was performed")
 }

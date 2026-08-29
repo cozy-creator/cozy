@@ -48,7 +48,10 @@ cozy up
 
 `up` backgrounds one lightweight per-user controller: web UI, local API, durable records, local
 worker manager, and private-rental sessions. It does not attach a log stream or load an endpoint or
-model. Commands that require the controller may ensure the same process is running automatically.
+model. Repeating `up` returns the same healthy URL with `changed: false`; concurrent callers
+converge on one controller. A startup failure is returned directly as a bounded diagnostic and does
+not create a persistent log. Commands that require the controller may ensure the same process is
+running automatically.
 
 ## Endpoints
 
