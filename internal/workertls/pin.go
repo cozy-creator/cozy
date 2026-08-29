@@ -2,6 +2,7 @@ package workertls
 
 import (
 	"bytes"
+	"crypto/sha256"
 	"crypto/tls"
 	"crypto/x509"
 	"encoding/pem"
@@ -13,6 +14,11 @@ import (
 // the certificate pinned at rental time. A root pool would also admit anything that
 // certificate had SIGNED; a pin admits one thing.
 type Pin struct{ der []byte }
+
+func (p *Pin) Digest() []byte {
+	sum := sha256.Sum256(p.der)
+	return append([]byte(nil), sum[:]...)
+}
 
 // LoadPin reads the pinned PEM and keeps its first CERTIFICATE block's DER.
 func LoadPin(path string) (*Pin, error) {

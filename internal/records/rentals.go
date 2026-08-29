@@ -56,7 +56,8 @@ CREATE TABLE IF NOT EXISTS rentals (
   observed_worker_instance   TEXT NOT NULL DEFAULT '',
   observed_worker_boot_id    TEXT NOT NULL DEFAULT '',
   observed_at                TEXT NOT NULL DEFAULT '',
-  artifact_grant_revision    INTEGER NOT NULL DEFAULT 0
+  expected_worker_id         TEXT NOT NULL DEFAULT '',
+  expected_worker_boot_id    TEXT NOT NULL DEFAULT ''
 )`
 
 var rentalSchema = []string{rentalOperationsDDL, rentalsDDL, `
@@ -97,7 +98,8 @@ func migrateRentalSchema(db *sql.DB, path string) *exit.Error {
 		{"observed_worker_instance", `TEXT NOT NULL DEFAULT ''`},
 		{"observed_worker_boot_id", `TEXT NOT NULL DEFAULT ''`},
 		{"observed_at", `TEXT NOT NULL DEFAULT ''`},
-		{"artifact_grant_revision", `INTEGER NOT NULL DEFAULT 0`},
+		{"expected_worker_id", `TEXT NOT NULL DEFAULT ''`},
+		{"expected_worker_boot_id", `TEXT NOT NULL DEFAULT ''`},
 	} {
 		if columns[column.name] {
 			continue
@@ -331,13 +333,11 @@ type Rental struct {
 	ObservedWorkerInstance         string
 	ObservedWorkerBootID           string
 	ObservedAt                     string
-	// ArtifactGrantRevision is the highest renter-owned access revision reserved for
-	// this pod. It advances before the HTTP ask so a lost answer can never make a daemon
-	// restart replay an older revision the worker will ignore.
-	ArtifactGrantRevision uint64
+	ExpectedWorkerID               string
+	ExpectedWorkerBootID           string
 }
 
-const rentalCols = `id,package_ref,accelerator_model,address,cert_path,state,hub,rented_at,media_address,control_snapshot_digest,control_snapshot_bytes,placement_revision,observed_accelerator,observed_accelerator_count,observed_backend,observed_driver_version,observed_backend_version,observed_device_memory_total_bytes,observed_worker_instance,observed_worker_boot_id,observed_at,artifact_grant_revision`
+const rentalCols = `id,package_ref,accelerator_model,address,cert_path,state,hub,rented_at,media_address,control_snapshot_digest,control_snapshot_bytes,placement_revision,observed_accelerator,observed_accelerator_count,observed_backend,observed_driver_version,observed_backend_version,observed_device_memory_total_bytes,observed_worker_instance,observed_worker_boot_id,observed_at,expected_worker_id,expected_worker_boot_id`
 
 func scanRental(row interface{ Scan(...any) error }) (Rental, error) {
 	var r Rental
@@ -348,7 +348,7 @@ func scanRental(row interface{ Scan(...any) error }) (Rental, error) {
 		&r.ObservedAccelerator, &r.ObservedAcceleratorCount, &r.ObservedBackend,
 		&r.ObservedDriverVersion, &r.ObservedBackendVersion, &r.ObservedDeviceMemoryTotalBytes,
 		&r.ObservedWorkerInstance, &r.ObservedWorkerBootID, &r.ObservedAt,
-		&r.ArtifactGrantRevision)
+		&r.ExpectedWorkerID, &r.ExpectedWorkerBootID)
 	return r, err
 }
 
@@ -377,7 +377,7 @@ func (s *Store) RecordRental(r Rental) *exit.Error {
 		r.State = rentalStateForward(current, r.State)
 	}
 	if _, err := tx.Exec(`INSERT INTO rentals(`+rentalCols+`)
-		VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+		VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
 		ON CONFLICT(id) DO UPDATE SET
 		  address=CASE WHEN rentals.address<>'' THEN rentals.address ELSE excluded.address END,
 		  cert_path=CASE WHEN rentals.cert_path<>'' THEN rentals.cert_path ELSE excluded.cert_path END,
@@ -406,13 +406,17 @@ func (s *Store) RecordRental(r Rental) *exit.Error {
 		  observed_worker_boot_id=CASE WHEN rentals.observed_worker_boot_id<>''
 		    THEN rentals.observed_worker_boot_id ELSE excluded.observed_worker_boot_id END,
 		  observed_at=CASE WHEN rentals.observed_at<>''
-		    THEN rentals.observed_at ELSE excluded.observed_at END`,
+		    THEN rentals.observed_at ELSE excluded.observed_at END,
+		  expected_worker_id=CASE WHEN rentals.expected_worker_id<>''
+		    THEN rentals.expected_worker_id ELSE excluded.expected_worker_id END,
+		  expected_worker_boot_id=CASE WHEN rentals.expected_worker_boot_id<>''
+		    THEN rentals.expected_worker_boot_id ELSE excluded.expected_worker_boot_id END`,
 		r.ID, r.PackageRef, r.AcceleratorModel, r.Address, r.CertPath, r.State, r.Hub,
 		r.RentedAt, r.MediaAddress, r.ControlSnapshotDigest,
 		r.ControlSnapshotBytes, r.PlacementRevision, r.ObservedAccelerator,
 		r.ObservedAcceleratorCount, r.ObservedBackend, r.ObservedDriverVersion,
 		r.ObservedBackendVersion, r.ObservedDeviceMemoryTotalBytes, r.ObservedWorkerInstance,
-		r.ObservedWorkerBootID, r.ObservedAt, r.ArtifactGrantRevision); err != nil {
+		r.ObservedWorkerBootID, r.ObservedAt, r.ExpectedWorkerID, r.ExpectedWorkerBootID); err != nil {
 		return exit.Internalf("cannot record rental %s: %s", r.ID, err)
 	}
 	if err := tx.Commit(); err != nil {
@@ -430,46 +434,13 @@ func (s *Store) RecordRental(r Rental) *exit.Error {
 	}
 	if stored == nil || r.Address != "" && stored.Address != r.Address ||
 		r.MediaAddress != "" && stored.MediaAddress != r.MediaAddress ||
-		r.CertPath != "" && stored.CertPath != r.CertPath {
+		r.CertPath != "" && stored.CertPath != r.CertPath ||
+		r.ExpectedWorkerID != "" && stored.ExpectedWorkerID != r.ExpectedWorkerID ||
+		r.ExpectedWorkerBootID != "" && stored.ExpectedWorkerBootID != r.ExpectedWorkerBootID {
 		return exit.Named(exit.Conflict, "rental.attach_projection_conflict",
 			"rental %s already carries another address, media address, or certificate pin", r.ID)
 	}
 	return nil
-}
-
-// ReserveArtifactGrantRevision durably allocates the next monotonic access revision.
-// Gaps are harmless; reuse is not. The reservation commits before a network call so a
-// response lost after Tensorhub committed cannot move the next daemon process backward.
-func (s *Store) ReserveArtifactGrantRevision(id string) (uint64, *exit.Error) {
-	tx, err := s.db.Begin()
-	if err != nil {
-		return 0, exit.Internalf("cannot begin artifact-grant revision for rental %s: %s", id, err)
-	}
-	defer tx.Rollback()
-	var current uint64
-	if err := tx.QueryRow(`SELECT artifact_grant_revision FROM rentals WHERE id=?`, id).Scan(&current); err != nil {
-		if errors.Is(err, sql.ErrNoRows) {
-			return 0, exit.New(exit.NotFound, "no rental %s on this host", id)
-		}
-		return 0, exit.Internalf("cannot read artifact-grant revision for rental %s: %s", id, err)
-	}
-	if current == ^uint64(0) {
-		return 0, exit.Internalf("artifact-grant revision for rental %s is exhausted", id)
-	}
-	next := current + 1
-	result, err := tx.Exec(`UPDATE rentals SET artifact_grant_revision=?
-		WHERE id=? AND artifact_grant_revision=?`, next, id, current)
-	if err != nil {
-		return 0, exit.Internalf("cannot reserve artifact-grant revision for rental %s: %s", id, err)
-	}
-	changed, err := result.RowsAffected()
-	if err != nil || changed != 1 {
-		return 0, exit.Internalf("artifact-grant revision for rental %s changed concurrently", id)
-	}
-	if err := tx.Commit(); err != nil {
-		return 0, exit.Internalf("cannot commit artifact-grant revision for rental %s: %s", id, err)
-	}
-	return next, nil
 }
 
 // ObserveRentalWorker records the actual remote worker ClaimAck before any model
@@ -478,7 +449,7 @@ func (s *Store) ReserveArtifactGrantRevision(id string) (uint64, *exit.Error) {
 // The observation is immutable for one rental so a changed machine identity refuses
 // instead of silently rewriting retained execution evidence.
 func (s *Store) ObserveRentalWorker(id, accelerator, backend, driverVersion,
-	backendVersion string, deviceMemory uint64, instance, bootID string, count int) *exit.Error {
+	backendVersion string, deviceMemory uint64, instance, workerID, bootID string, count int) *exit.Error {
 	tx, err := s.db.Begin()
 	if err != nil {
 		return exit.Internalf("cannot begin rental %s worker observation: %s", id, err)
@@ -496,15 +467,20 @@ func (s *Store) ObserveRentalWorker(id, accelerator, backend, driverVersion,
 	if cpu {
 		complete = complete && accelerator == "" && backend == "none" && count == 0 &&
 			driverVersion == "" && backendVersion == "" && deviceMemory == 0 &&
-			instance != "" && bootID != ""
+			instance != "" && workerID != "" && bootID != ""
 	} else {
 		complete = complete && accelerator != "" && backend != "" && count == 1 &&
-			instance != "" && bootID != ""
+			instance != "" && workerID != "" && bootID != ""
 	}
 	if !complete {
 		return exit.Named(exit.Conflict, "rental.worker_readback_incomplete",
 			"rental %s ClaimAck is state=%q backend=%q accelerator=%q count=%d instance=%q boot=%q",
 			id, row.State, backend, accelerator, count, instance, bootID)
+	}
+	if row.ExpectedWorkerID != workerID || row.ExpectedWorkerBootID != bootID {
+		return exit.Named(exit.Conflict, "rental.worker_identity_mismatch",
+			"rental %s ClaimAck worker/boot identity differs from Tensorhub readiness", id).
+			WithRemedy("release it; Creator signs only the worker and boot Tensorhub authenticated")
 	}
 	if !cpu && !acceleratorMatches(row.AcceleratorModel, accelerator) {
 		return exit.Named(exit.Conflict, "rental.accelerator_readback_mismatch",

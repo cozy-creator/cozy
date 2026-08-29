@@ -17,7 +17,6 @@ import (
 	"path/filepath"
 	"runtime"
 
-	"github.com/cozy-creator/cozy/internal/canonical"
 	"github.com/cozy-creator/cozy/internal/exit"
 	"github.com/cozy-creator/cozy/internal/home"
 	"github.com/cozy-creator/cozy/internal/hub"
@@ -28,7 +27,6 @@ import (
 	"github.com/cozy-creator/cozy/internal/remotecontrol"
 	"github.com/cozy-creator/cozy/internal/rentalid"
 	"github.com/cozy-creator/cozy/internal/secret"
-	pb "github.com/cozy-creator/cozy/protocol/cozy/worker/v1"
 )
 
 func validID(id string) *exit.Error {
@@ -44,7 +42,8 @@ func validID(id string) *exit.Error {
 // files land before the row can advertise a dialable target. The pre-POST operation row
 // already names the paid resource, so a crash at any point resumes rather than orphaning
 // a pod or publishing a row whose credential is absent.
-func Attach(l home.Layout, st *records.Store, row records.Rental, cert string, token secret.Value) *exit.Error {
+func Attach(l home.Layout, st *records.Store, row records.Rental, cert string, token secret.Value,
+	creator CreatorIdentity) *exit.Error {
 	if e := validID(row.ID); e != nil {
 		return e
 	}
@@ -78,6 +77,12 @@ func Attach(l home.Layout, st *records.Store, row records.Rental, cert string, t
 		return exit.Internalf("cannot pin the rental's certificate: %s", err)
 	}
 	if e := write0600(l.RentalToken(row.ID), secret.FileBody(token)); e != nil {
+		return e
+	}
+	if len(creator.pem) == 0 {
+		return exit.Internalf("rental %s has no pending Creator identity", row.ID)
+	}
+	if e := write0600(l.RentalCreatorIdentity(row.ID), creator.pem); e != nil {
 		return e
 	}
 	row.CertPath = l.RentalCert(row.ID)
@@ -135,6 +140,7 @@ func PendingToken(l home.Layout, operationKey string) (secret.Value, *exit.Error
 // terminal. An interrupted poll deliberately leaves it for the exact-key retry.
 func ForgetPending(l home.Layout, operationKey string) {
 	_ = os.Remove(l.PendingRentalToken(operationKey))
+	_ = os.Remove(l.PendingRentalCreatorIdentity(operationKey))
 }
 
 // Forget removes the local half. The pod is the hub's to destroy; this is what stops
@@ -149,6 +155,7 @@ func Forget(l home.Layout, st *records.Store, id string) (bool, *exit.Error) {
 	}
 	_ = os.Remove(l.RentalToken(id))
 	_ = os.Remove(l.RentalCert(id))
+	_ = os.Remove(l.RentalCreatorIdentity(id))
 	return forgotten, nil
 }
 
@@ -266,8 +273,8 @@ func noAddress(id, state string) *exit.Error {
 }
 
 // Resolver is what the daemon entrypoint hands the orchestrator as `Options.Rentals`. It
-// is the DIAL-TIME resolution — the one place the owner token is read, at the moment it
-// becomes Claim.proof. It reads the store on EVERY call rather than closing over a
+// is the DIAL-TIME resolution of Creator mTLS identity and media bearer. It reads the
+// store on EVERY call rather than closing over a
 // snapshot: `cozy rental new` is a records-plane act that runs against a daemon already up, so
 // a resolver that cached would refuse the rental the user just made until a restart.
 func Resolver(l home.Layout, st *records.Store) func(string) (*orchestrator.RemoteTarget, *exit.Error) {
@@ -295,6 +302,9 @@ func Resolver(l home.Layout, st *records.Store) func(string) (*orchestrator.Remo
 		if e != nil {
 			return nil, e
 		}
+		if _, e := loadCreatorIdentity(l.RentalCreatorIdentity(id)); e != nil {
+			return nil, e.WithRemedy("end and re-rent; a lost per-rental Creator key cannot be rotated into the live pod")
+		}
 		cert := row.CertPath
 		if cert == "" {
 			cert = l.RentalCert(id)
@@ -306,7 +316,8 @@ func Resolver(l home.Layout, st *records.Store) func(string) (*orchestrator.Remo
 				WithNext("cozy rental end " + id)
 		}
 		spec := &orchestrator.WorkerConnection{
-			RentalID: row.ID, Addr: row.Address, Token: token, CACert: cert,
+			RentalID: row.ID, Addr: row.Address, CACert: cert,
+			WorkerID: row.ExpectedWorkerID, WorkerBootID: row.ExpectedWorkerBootID,
 		}
 		if row.MediaAddress != "" {
 			// ONE PROVISIONED IDENTITY, TWO LISTENERS (#506b, tonight's tier). The pod's
@@ -321,62 +332,14 @@ func Resolver(l home.Layout, st *records.Store) func(string) (*orchestrator.Remo
 	}
 }
 
-// ArtifactGrants wires the owner-token authenticated Tensorhub route into the RecordOwner.
-// Revision allocation is durable and precedes the request; if the response is lost, the
-// next retry moves forward rather than emitting an update the worker has already applied.
-func ArtifactGrants(st *records.Store, client *hub.Client) orchestrator.ArtifactGrantSource {
-	return func(ctx context.Context, connection *orchestrator.WorkerConnection) (
-		uint64, *pb.ArtifactGrant, *exit.Error) {
-		if connection == nil || connection.RentalID == "" || !connection.Token.Present() {
-			return 0, nil, exit.Named(exit.Credential, "rental.artifact_grant_authority_missing",
-				"the connected worker has no rental identity or owner token")
-		}
-		revision, problem := st.ReserveArtifactGrantRevision(connection.RentalID)
-		if problem != nil {
-			return 0, nil, problem
-		}
-		answer, problem := client.WithToken(connection.Token, "rental owner token").ArtifactGrant(
-			ctx, connection.RentalID, revision, "cozy RecordOwner artifact grant")
-		if problem != nil {
-			return 0, nil, problem
-		}
-		grant := &pb.ArtifactGrant{
-			GrantId: answer.Grant.GrantID, ExpiresAtUnix: answer.Grant.ExpiresAtUnix,
-		}
-		for _, subject := range answer.Grant.Subjects {
-			digest, err := canonical.Raw(subject.Digest)
-			if err != nil {
-				return 0, nil, exit.Named(exit.Conflict, "rental.artifact_grant_invalid",
-					"Tensorhub returned malformed artifact digest %q", subject.Digest)
-			}
-			grant.Subjects = append(grant.Subjects, &pb.ArtifactSubject{
-				Digest: digest, SubjectId: subject.SubjectID, Kind: subject.Kind, Length: subject.Length,
-			})
-		}
-		for _, location := range answer.Grant.Locations {
-			digest, err := canonical.Raw(location.Digest)
-			if err != nil {
-				return 0, nil, exit.Named(exit.Conflict, "rental.artifact_grant_invalid",
-					"Tensorhub returned malformed artifact-location digest %q", location.Digest)
-			}
-			grant.Locations = append(grant.Locations, &pb.ArtifactLocation{
-				Digest: digest, Url: location.URL,
-			})
-		}
-		return revision, grant, nil
-	}
-}
-
-// RelayWorkerSession is the private-rental observation seam. The plaintext renter token
-// already used as Claim.proof authenticates this HTTP call, but it is never persisted in
-// Tensorhub and Tensorhub never dials WorkerControl. A ready answer advances the local
-// rental row so request creation and dispatch remain closed until both authorities agree.
+// RelayWorkerSession is the private-rental observation seam. The ordinary authenticated
+// Hub client carries account authority; the media bearer opens only the pod media plane.
 func RelayWorkerSession(st *records.Store, client *hub.Client) orchestrator.RentalSessionRelay {
 	return func(ctx context.Context, connection *orchestrator.WorkerConnection,
 		evidence orchestrator.RentalSessionEvidence) *exit.Error {
-		if connection == nil || connection.RentalID == "" || !connection.Token.Present() {
+		if connection == nil || connection.RentalID == "" {
 			return exit.Named(exit.Credential, "rental.worker_observation_authority_missing",
-				"the connected worker has no rental identity or owner token")
+				"the connected worker has no rental identity")
 		}
 		row, problem := st.RentalRow(connection.RentalID)
 		if problem != nil {
@@ -390,7 +353,7 @@ func RelayWorkerSession(st *records.Store, client *hub.Client) orchestrator.Rent
 				"rental %s belongs to %s, configured hub is %s",
 				row.ID, row.Hub, client.Base())
 		}
-		answer, problem := client.WithToken(connection.Token, "rental owner token").ObserveWorkerSession(
+		answer, problem := client.ObserveWorkerSession(
 			ctx, connection.RentalID, hub.WorkerSessionObservation{
 				ClaimAck: evidence.ClaimAck, Snapshot: evidence.Snapshot,
 				ObservedState: evidence.ObservedState, BootFailure: evidence.BootFailure,
@@ -427,7 +390,7 @@ func ObserveWorker(st *records.Store) func(orchestrator.RentalObservation) *exit
 	return func(observed orchestrator.RentalObservation) *exit.Error {
 		return st.ObserveRentalWorker(observed.RentalID, observed.Accelerator,
 			observed.Backend, observed.DriverVersion, observed.BackendVersion,
-			observed.DeviceMemoryTotalBytes, observed.WorkerInstance,
+			observed.DeviceMemoryTotalBytes, observed.WorkerInstance, observed.WorkerID,
 			observed.WorkerBootID, observed.DeviceCount)
 	}
 }

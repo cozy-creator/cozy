@@ -119,12 +119,23 @@ func (l Layout) InputAsset(digest string) string {
 // that database, and the whole point of the 0600 handoff is that it is not.
 func (l Layout) RentalToken(id string) string { return filepath.Join(l.Rentals, id+".token") }
 
+// RentalCreatorIdentity is one rental's Ed25519 private key. The worker receives only
+// the public key and verifies signed ClaimProof and ArtifactDelegation documents.
+func (l Layout) RentalCreatorIdentity(id string) string {
+	return filepath.Join(l.Rentals, id+".creator.pem")
+}
+
 // PendingRentalToken is the renter-minted token before the hub has answered with a
 // rental id. The caller's operation key may contain path separators, so only its digest
 // becomes a filename. The operation row keeps the unhashed key needed on the wire.
 func (l Layout) PendingRentalToken(operationKey string) string {
 	sum := sha256.Sum256([]byte(operationKey))
 	return filepath.Join(l.Rentals, "pending-"+hex.EncodeToString(sum[:])+".token")
+}
+
+func (l Layout) PendingRentalCreatorIdentity(operationKey string) string {
+	sum := sha256.Sum256([]byte(operationKey))
+	return filepath.Join(l.Rentals, "pending-"+hex.EncodeToString(sum[:])+".creator.pem")
 }
 
 // RentalCert is the worker certificate this client PINS for one rental. A certificate is

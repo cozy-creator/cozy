@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"crypto/ed25519"
 	"crypto/rand"
 	"crypto/sha256"
 	"encoding/hex"
@@ -111,8 +112,9 @@ func (f *fakeControl) Control(stream pb.WorkerControl_ControlServer) error {
 	send(&pb.WorkerFrame{Msg: &pb.WorkerFrame_Snapshot{Snapshot: snap}})
 	f.say("WorkerSnapshot %s sent (%d B); admission is CLOSED until the ack", snapshotID, len(bodyBytes))
 
-	var grantRevision uint64
-	var grantID string
+	var artifactRevision uint64
+	var delegationID string
+	var authorizationExpires uint64
 	observed := func(revision uint64, placementID string, setDigest []byte, planIDs []string) {
 		r := &pb.ObservedWorkerState{
 			AcceptedDesiredStateRevision: revision, ConvergedRevision: revision,
@@ -121,7 +123,12 @@ func (f *fakeControl) Control(stream pb.WorkerControl_ControlServer) error {
 			AppliedWireMinor:           pb.WireMinor,
 			AdmissionState:             pb.AdmissionState_ADMISSION_STATE_OPEN,
 			AdmissionGeneration:        admissionGeneration, AvailableAttemptSlots: 2,
-			AppliedGrantRevision: grantRevision, AppliedArtifactGrantId: grantID,
+		}
+		if artifactRevision > 0 {
+			r.ArtifactIntent = &pb.ArtifactIntentStatus{
+				Revision: artifactRevision, DelegationId: delegationID,
+				AuthorizationExpiresAtUnix: authorizationExpires,
+			}
 		}
 		if placementID != "" {
 			r.Placements = []*pb.PlacementStatus{{
@@ -167,14 +174,20 @@ func (f *fakeControl) Control(stream pb.WorkerControl_ControlServer) error {
 				time.Sleep(2 * time.Second)
 				return nil
 			}
-		case *pb.RecordOwnerFrame_ArtifactGrantUpdate:
-			update := m.ArtifactGrantUpdate
-			if update.Grant == nil || update.GrantRevision < grantRevision {
+		case *pb.RecordOwnerFrame_EnsureArtifacts:
+			ensure := m.EnsureArtifacts
+			doc, err := canonical.Read(ensure.DelegationCanonicalBytes, &pb.ArtifactDelegation{})
+			if err != nil || len(ensure.CreatorSignature) != ed25519.SignatureSize {
+				f.say("EnsureArtifacts refused: invalid delegation: %v", err)
 				continue
 			}
-			grantRevision, grantID = update.GrantRevision, update.Grant.GrantId
-			f.say("ArtifactGrantUpdate revision=%d grant=%s subjects=%d",
-				grantRevision, grantID, len(update.Grant.Subjects))
+			revision := uint64(doc.Int("revision"))
+			if revision < artifactRevision {
+				continue
+			}
+			artifactRevision, delegationID = revision, doc.Str("delegation_id")
+			authorizationExpires = uint64(doc.Int("expires_at_unix"))
+			f.say("EnsureArtifacts revision=%d delegation=%s", artifactRevision, delegationID)
 		case *pb.RecordOwnerFrame_DesiredState:
 			d := m.DesiredState
 			placementID, planIDs, setDigest := "", []string(nil), []byte(nil)

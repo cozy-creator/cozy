@@ -239,7 +239,11 @@ func (c *Orchestrator) onObserved(s *session, r *pb.ObservedWorkerState, frameBy
 		w.acceptedRevision = r.AcceptedDesiredStateRevision
 		w.convergedRevision = r.ConvergedRevision
 		w.acceptedSetDigest = r.AcceptedPlacementSetDigest
-		w.appliedGrantRevision, w.appliedGrantID = r.AppliedGrantRevision, r.AppliedArtifactGrantId
+		if intent := r.GetArtifactIntent(); intent != nil {
+			w.artifactRevision = intent.Revision
+			w.delegationID = intent.DelegationId
+			w.authorizationExpires = intent.AuthorizationExpiresAtUnix
+		}
 		dispatchable, materializable := map[string]bool{}, map[string]bool{}
 		if w.spec.IsJob() {
 			// THE JOB LANE READS JOB CAPACITY: a job worker is in JobDirective mode and

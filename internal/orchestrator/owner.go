@@ -29,9 +29,8 @@ import (
 //
 // LAUNCH TIER (#437): record_owner_epoch is the constant 1 — this daemon is the one
 // RecordOwner of every worker it spawns or connects to; the machinery that MINTS competing
-// epochs is the hub's Wave-2 lease. The bearer credential (#445/#449/#463) rides
-// `Claim.proof`: for a spawned worker it is the per-spawn bootstrap credential this
-// launcher minted; for a connected worker it is the provisioned renter access token.
+// epochs is the hub's Wave-2 lease. Spawned workers authenticate Claim with their local
+// bootstrap; rented workers authenticate the channel with the provisioned Creator mTLS key.
 
 const recordOwnerEpoch = 1
 
@@ -40,15 +39,15 @@ const recordOwnerEpoch = 1
 const recordOwnerID = "cozy-local-client"
 
 type session struct {
-	ctx                context.Context
-	bootID             string
-	generation         uint64
-	instanceID         string
-	out                chan *pb.RecordOwnerFrame
-	remoteGrantStarted bool
-	claimAck           []byte
-	snapshot           []byte
-	relay              chan RentalSessionEvidence
+	ctx                 context.Context
+	bootID              string
+	generation          uint64
+	instanceID          string
+	out                 chan *pb.RecordOwnerFrame
+	artifactLoopStarted bool
+	claimAck            []byte
+	snapshot            []byte
+	relay               chan RentalSessionEvidence
 }
 
 func (s *session) send(m *pb.RecordOwnerFrame) (sent bool) {
@@ -157,9 +156,8 @@ func (c *Orchestrator) workerAddr(w *worker) (string, *exit.Error) {
 	}
 }
 
-// dialWorker opens the channel: insecure over the unix socket / loopback a spawned worker
-// binds; TLS with the PINNED cert for a remote one (#445 — the presented leaf must equal
-// that PEM byte for byte; never mTLS).
+// dialWorker opens the channel: local sockets use the per-spawn proof; rented workers
+// pin the exact readiness certificate and authenticate Claim with Creator's signature.
 func dialWorker(addr string, remote *WorkerConnection) (*grpc.ClientConn, error) {
 	if remote != nil && remote.CACert != "" {
 		pin, err := workertls.LoadPin(remote.CACert)
@@ -226,14 +224,14 @@ func (c *Orchestrator) converse(w *worker, addr string) error {
 
 	proof := w.bootstrap.Reveal()
 	if w.spec.Connection != nil {
-		proof = w.spec.Connection.Token.Reveal()
+		proof = "" // mutual TLS already proves the provisioned per-rental Creator key
 	}
 	s.send(&pb.RecordOwnerFrame{Msg: &pb.RecordOwnerFrame_Claim{Claim: &pb.Claim{
 		RecordOwnerEpoch: recordOwnerEpoch,
 		RecordOwnerId:    recordOwnerID,
 		WireMinor:        pb.WireMinor,
 		Proof:            []byte(proof),
-	}}}) //cozy:allow-reveal the one place the credential leaves this process: Claim.proof over the worker's own channel
+	}}}) //cozy:allow-reveal local bootstrap proof; rented workers carry an empty proof over authenticated mTLS
 
 	// WatchProgress rides a PHYSICALLY separate connection (01) once the claim lands;
 	// opened after ClaimAck below.
@@ -491,12 +489,21 @@ func (c *Orchestrator) onClaimAck(w *worker, s *session, ack *pb.ClaimAck) *exit
 			c.refuseClaim(w, e)
 			return e
 		}
+		if ack.WorkerId != w.spec.Connection.WorkerID ||
+			ack.WorkerBootId != w.spec.Connection.WorkerBootID ||
+			w.remoteWorkerID != "" && w.remoteWorkerID != ack.WorkerId {
+			e := exit.Named(exit.Conflict, "rental.worker_id_mismatch",
+				"rental %s declared an absent or changed worker id", w.spec.Connection.RentalID)
+			c.refuseClaim(w, e)
+			return e
+		}
 		if e := c.opt.ObserveRental(RentalObservation{
 			RentalID: w.spec.Connection.RentalID, Accelerator: resources.GetDeviceName(),
 			DeviceCount: int(resources.GetDeviceCount()), Backend: resources.GetBackend(),
 			DriverVersion: resources.GetDriverVersion(), BackendVersion: resources.GetBackendVersion(),
 			DeviceMemoryTotalBytes: resources.GetDeviceMemoryTotalBytes(),
-			WorkerInstance:         ack.WorkerInstanceId, WorkerBootID: ack.WorkerBootId,
+			WorkerInstance:         ack.WorkerInstanceId, WorkerID: ack.WorkerId,
+			WorkerBootID: ack.WorkerBootId,
 		}); e != nil {
 			c.refuseClaim(w, e)
 			return e
@@ -510,6 +517,7 @@ func (c *Orchestrator) onClaimAck(w *worker, s *session, ack *pb.ClaimAck) *exit
 	c.mu.Lock()
 	if w.spec.Connection != nil {
 		w.remoteInstance = ack.WorkerInstanceId
+		w.remoteWorkerID = ack.WorkerId
 	}
 	// The ClaimAck is the first thing this worker said; the silence clock runs from here.
 	w.lastReport = time.Now()
@@ -691,11 +699,11 @@ func (c *Orchestrator) onSnapshot(w *worker, s *session, snap *pb.WorkerSnapshot
 		return true
 	}
 	if w.spec.Connection != nil {
-		if s.remoteGrantStarted {
+		if s.artifactLoopStarted {
 			return true
 		}
-		s.remoteGrantStarted = true
-		go c.runRemoteGrantLoop(s, w)
+		s.artifactLoopStarted = true
+		go c.runRemoteArtifactLoop(s, w)
 		return true
 	}
 	if e := c.converge(s, w, []DesiredPlacement{w.spec.Placement}); e != nil {
@@ -704,25 +712,22 @@ func (c *Orchestrator) onSnapshot(w *worker, s *session, snap *pb.WorkerSnapshot
 	return true
 }
 
-// runRemoteGrantLoop owns the standing access lane for one claimed stream. The first
-// successful update is queued before DesiredPlacementSet; later updates touch only
-// grant_revision, so expiring URLs cannot manufacture a new desired revision.
-func (c *Orchestrator) runRemoteGrantLoop(s *session, w *worker) {
-	if c.opt.ArtifactGrants == nil {
-		c.logf("rental %s has no artifact-grant source; desired placement was not issued",
+// runRemoteArtifactLoop sends logical intent before desired placement, then renews the
+// same revision when one third of the signed lifetime remains. No URL crosses this stream.
+func (c *Orchestrator) runRemoteArtifactLoop(s *session, w *worker) {
+	if c.opt.ArtifactDelegations == nil {
+		c.logf("rental %s has no artifact-delegation source; desired placement was not issued",
 			w.spec.Connection.RentalID)
 		return
 	}
 	initial := true
 	for {
-		w.grantMu.Lock()
 		c.mu.Lock()
-		placement := w.spec.Placement
+		placement, workerID := w.spec.Placement, w.remoteWorkerID
 		c.mu.Unlock()
-		grant, problem := c.issueRemoteGrant(s.ctx, s, w, placement, initial)
-		w.grantMu.Unlock()
+		delegation, problem := c.issueRemoteArtifacts(s, w, workerID, placement, initial)
 		if problem != nil {
-			c.logf("rental %s artifact grant was not refreshed: %s",
+			c.logf("rental %s artifact delegation was not refreshed: %s",
 				w.spec.Connection.RentalID, problem.Message)
 			if !waitContext(s.ctx, ReportCadence) {
 				return
@@ -730,115 +735,53 @@ func (c *Orchestrator) runRemoteGrantLoop(s *session, w *worker) {
 			continue
 		}
 		initial = false
-		if !waitContext(s.ctx, grantRefreshDelay(grant.ExpiresAtUnix)) {
+		if !waitContext(s.ctx, delegationRefreshDelay(delegation.ExpiresAtUnix)) {
 			return
 		}
 	}
 }
 
-func (c *Orchestrator) issueRemoteGrant(ctx context.Context, s *session, w *worker,
-	placement DesiredPlacement, issueDesired bool) (*pb.ArtifactGrant, *exit.Error) {
-	revision, grant, problem := c.opt.ArtifactGrants(ctx, w.spec.Connection)
+func (c *Orchestrator) issueRemoteArtifacts(s *session, w *worker, workerID string,
+	placement DesiredPlacement, issueDesired bool) (ArtifactDelegation, *exit.Error) {
+	delegation, problem := c.opt.ArtifactDelegations(w.spec.Connection, ArtifactDelegationRequest{
+		WorkerID: workerID, WorkerBootID: s.bootID,
+	})
 	if problem != nil {
-		return nil, problem
+		return ArtifactDelegation{}, problem
 	}
-	if problem := grantCovers(placement, grant); problem != nil {
-		return nil, problem
+	if delegation.Revision != placement.PlacementRevision || delegation.DelegationID == "" ||
+		delegation.ExpiresAtUnix <= uint64(time.Now().Unix()) || len(delegation.CanonicalBytes) == 0 ||
+		len(delegation.Signature) != 64 {
+		return ArtifactDelegation{}, exit.Named(exit.Conflict, "rental.artifact_delegation_invalid",
+			"the rental artifact delegation is incomplete or names another desired revision")
 	}
-	update := &pb.ArtifactGrantUpdate{GrantRevision: revision, Grant: grant}
-	update.RecordOwnerEpoch, update.ControlStreamGeneration, update.WorkerBootId =
+	ensure := &pb.EnsureArtifacts{
+		DelegationCanonicalBytes: delegation.CanonicalBytes, CreatorSignature: delegation.Signature,
+	}
+	ensure.RecordOwnerEpoch, ensure.ControlStreamGeneration, ensure.WorkerBootId =
 		recordOwnerEpoch, s.generation, s.bootID
-	if !s.send(&pb.RecordOwnerFrame{Msg: &pb.RecordOwnerFrame_ArtifactGrantUpdate{
-		ArtifactGrantUpdate: update,
+	if !s.send(&pb.RecordOwnerFrame{Msg: &pb.RecordOwnerFrame_EnsureArtifacts{
+		EnsureArtifacts: ensure,
 	}}) {
-		return nil, exit.Unavailablef("worker %s control stream closed before its artifact grant", w.instanceID)
+		return ArtifactDelegation{}, exit.Unavailablef(
+			"worker %s control stream closed before its artifact delegation", w.instanceID)
 	}
-	c.mu.Lock()
-	w.grantRevision, w.grantID = revision, grant.GrantId
-	w.grantSubjects = grantSubjectFacts(grant.Subjects)
-	c.mu.Unlock()
-	c.logf("ArtifactGrantUpdate revision=%d grant=%s subjects=%d expires=%d -> %s",
-		revision, grant.GrantId, len(grant.Subjects), grant.ExpiresAtUnix, s.bootID)
+	c.logf("EnsureArtifacts revision=%d delegation=%s expires=%d -> %s",
+		delegation.Revision, delegation.DelegationID, delegation.ExpiresAtUnix, s.bootID)
 	if issueDesired {
 		if problem := c.converge(s, w, []DesiredPlacement{placement}); problem != nil {
-			return nil, problem
+			return ArtifactDelegation{}, problem
 		}
 	}
-	return grant, nil
+	return delegation, nil
 }
 
-func grantSubjectFacts(subjects []*pb.ArtifactSubject) []ArtifactSubjectFacts {
-	out := make([]ArtifactSubjectFacts, 0, len(subjects))
-	for _, subject := range subjects {
-		digest, err := canonical.Spell(subject.Digest)
-		if err != nil {
-			continue
-		}
-		out = append(out, ArtifactSubjectFacts{Digest: digest, SubjectID: subject.SubjectId,
-			Kind: subject.Kind, Length: subject.Length})
-	}
-	return out
-}
-
-func grantCovers(placement DesiredPlacement, grant *pb.ArtifactGrant) *exit.Error {
-	if grant == nil || grant.GrantId == "" || grant.ExpiresAtUnix <= uint64(time.Now().Unix()) {
-		return exit.Named(exit.Conflict, "rental.artifact_grant_invalid",
-			"the rental artifact grant is absent, unnamed, or expired")
-	}
-	type requiredSubject struct {
-		kind, id string
-		length   uint64
-	}
-	want := map[string]requiredSubject{}
-	for _, binding := range placement.Bindings {
-		if binding.RuntimePlan == nil {
-			return exit.Named(exit.Conflict, "rental.artifact_grant_closure_mismatch",
-				"remote binding %s has no exact plan subject", binding.Entrypoint)
-		}
-		want[binding.RuntimePlan.Digest] = requiredSubject{
-			kind: "plan", id: binding.RuntimePlan.SubjectID, length: binding.RuntimePlan.Length,
-		}
-	}
-	if placement.ModelObjectSetDigest == "" || placement.ModelObjectSetLength == 0 {
-		return exit.Named(exit.Conflict, "rental.model_object_set_missing",
-			"the remote placement carries no exact model-object-set subject")
-	}
-	want[placement.ModelObjectSetDigest] = requiredSubject{
-		kind: "model_object_set", id: placement.ModelObjectSetDigest,
-		length: placement.ModelObjectSetLength,
-	}
-	for _, subject := range grant.Subjects {
-		spelled, err := canonical.Spell(subject.Digest)
-		if err != nil {
-			continue
-		}
-		if required, exists := want[spelled]; exists {
-			if required.length != subject.Length || required.kind != subject.Kind ||
-				required.id != subject.SubjectId {
-				return exit.Named(exit.Conflict, "rental.artifact_grant_closure_mismatch",
-					"grant subject %s does not equal desired kind=%s id=%s length=%d",
-					spelled, required.kind, required.id, required.length)
-			}
-			delete(want, spelled)
-		}
-	}
-	if len(want) != 0 {
-		return exit.Named(exit.Conflict, "rental.artifact_grant_closure_mismatch",
-			"the complete rental grant omits %d subject(s) required by desired state", len(want))
-	}
-	return nil
-}
-
-func grantRefreshDelay(expiresAt uint64) time.Duration {
+func delegationRefreshDelay(expiresAt uint64) time.Duration {
 	remaining := time.Until(time.Unix(int64(expiresAt), 0))
 	if remaining <= 0 {
 		return 0
 	}
-	lead := remaining / 3
-	if lead > 5*time.Minute {
-		lead = 5 * time.Minute
-	}
-	if delay := remaining - lead; delay > 0 {
+	if delay := remaining * 2 / 3; delay > 0 {
 		return delay
 	}
 	return 0

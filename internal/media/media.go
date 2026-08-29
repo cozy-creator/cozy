@@ -2,8 +2,8 @@
 // the only byte channel there is between this host and a pod, in either direction.
 //
 // This plane carries per-invocation inputs and outputs only. Package source, plans,
-// wheels, and model-object sets are ordinary standing ArtifactGrant subjects fetched by
-// the worker; there is no package-distribution route on this client or the pod server.
+// wheels, and model-object sets are resolved directly by the worker from signed intent;
+// there is no package-distribution route on this client or the pod server.
 //
 // WHY THE POD HOSTS IT and not this host: an owner-side byte plane would have to bind
 // off-loopback, which is exactly what `internal/api`'s one-bind-site fence refuses, and it
@@ -15,7 +15,7 @@
 // This client is a plain HTTPS client pinned to the pod's certificate. It holds the
 // rental's owner token because it is the one place that credential becomes an
 // `Authorization` header for the media plane — the same rule `internal/hub` keeps for the
-// hub's and `internal/orchestrator/owner.go` keeps for `Claim.proof`.
+// hub's; this bearer has no WorkerControl or Tensorhub authority.
 package media
 
 import (
