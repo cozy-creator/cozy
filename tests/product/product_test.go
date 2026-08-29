@@ -1,7 +1,9 @@
 package producttest
 
 import (
+	"bytes"
 	"crypto/sha256"
+	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
@@ -12,15 +14,116 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
 
+	"github.com/cozy-creator/cozy/internal/exit"
+	"github.com/cozy-creator/cozy/internal/hub"
+	"github.com/cozy-creator/cozy/internal/managedinstall"
 	"github.com/cozy-creator/cozy/internal/packagepublish"
 	"github.com/cozy-creator/cozy/internal/records"
+	"github.com/cozy-creator/cozy/internal/wheel"
 )
 
 const weightlessRef = "cozy/weightless"
+
+func TestManagedInstallExactDependencyOverlayContract(t *testing.T) {
+	fixture := filepath.Join("testdata", "tensorhub-wheel-contract")
+	bundleBytes, err := os.ReadFile(filepath.Join(fixture, "package-bundle.json"))
+	must(t, err)
+	bundleBytes = bytes.TrimSpace(bundleBytes)
+	resolvedBytes, err := os.ReadFile(filepath.Join(fixture, "resolved-wheel-set.json"))
+	must(t, err)
+	resolvedBytes = bytes.TrimSpace(resolvedBytes)
+	exact := func(body []byte) hub.ExactDocument {
+		sum := sha256.Sum256(body)
+		return hub.ExactDocument{Digest: "sha256:" + hex.EncodeToString(sum[:]),
+			Length: int64(len(body)), CanonicalBytes: body}
+	}
+	var links struct {
+		PackageDescriptor  hub.ObjectRef `json:"package_descriptor"`
+		ResolvedWheelSet   hub.ObjectRef `json:"resolved_wheel_set"`
+		WheelhouseManifest hub.ObjectRef `json:"wheelhouse_manifest"`
+	}
+	var resolved struct {
+		ResolutionLockDigest string `json:"resolution_lock_digest"`
+		ResolutionLockLength int64  `json:"resolution_lock_length"`
+	}
+	must(t, json.Unmarshal(bundleBytes, &links))
+	must(t, json.Unmarshal(resolvedBytes, &resolved))
+	grant := hub.LocalQualificationMaterials{
+		PackageBundle:      exact(bundleBytes),
+		ResolvedWheelSet:   exact(resolvedBytes),
+		PackageDescriptor:  hub.ExactDocument{Digest: links.PackageDescriptor.Digest, Length: links.PackageDescriptor.Length},
+		WheelhouseManifest: hub.ExactDocument{Digest: links.WheelhouseManifest.Digest, Length: links.WheelhouseManifest.Length},
+		ResolutionLock:     hub.ExactDocument{Digest: resolved.ResolutionLockDigest, Length: resolved.ResolutionLockLength},
+		PackageEnvironmentSpec: hub.ExactDocument{
+			Digest: "sha256:" + strings.Repeat("1", 64), Length: 1,
+		},
+	}
+	if grant.ResolvedWheelSet.Digest != links.ResolvedWheelSet.Digest ||
+		grant.ResolvedWheelSet.Length != links.ResolvedWheelSet.Length {
+		t.Fatal("vendored Tensorhub bundle no longer binds its resolved-wheel-set vector")
+	}
+	facts, problem := managedinstall.ReleaseWheelFacts(grant, "proof/package@v1")
+	fatal(t, problem)
+	if len(facts) != 2 || facts["project_wheel"].Distribution != "proof-package" ||
+		facts["dependency_wheel/proof-custom"].Distribution != "proof-custom" {
+		t.Fatalf("managed download roles do not cover the exact overlay: %+v", facts)
+	}
+
+	for role, encodedName := range map[string]string{
+		"project_wheel":                 "project-wheel.whl.base64",
+		"dependency_wheel/proof-custom": "dependency-wheel.whl.base64",
+	} {
+		encoded, err := os.ReadFile(filepath.Join(fixture, encodedName))
+		must(t, err)
+		raw, err := base64.StdEncoding.DecodeString(strings.TrimSpace(string(encoded)))
+		must(t, err)
+		path := filepath.Join(t.TempDir(), facts[role].Filename)
+		must(t, os.WriteFile(path, raw, 0o600))
+		var inspected wheel.Fact
+		var inspection *exit.Error
+		if role == "project_wheel" {
+			inspected, inspection = wheel.Inspect(path)
+		} else {
+			inspected, inspection = wheel.InspectDependency(path)
+		}
+		fatal(t, inspection)
+		if !reflect.DeepEqual(inspected, facts[role]) {
+			t.Fatalf("%s bytes disagree with the Tensorhub WheelFact:\n got %+v\nwant %+v", role, inspected, facts[role])
+		}
+	}
+
+	rows := []map[string]any{
+		{"digest": facts["dependency_wheel/proof-custom"].Digest, "distribution": "proof-custom", "owner": "custom", "version": "1.0.0"},
+		{"digest": facts["project_wheel"].Digest, "distribution": "proof-package", "owner": "project", "version": "1.0.0"},
+	}
+	receipt := func(rows []map[string]any) []byte {
+		body, err := json.Marshal(map[string]any{
+			"base_family_digest":      grant.WheelhouseManifest.Digest,
+			"environment_spec_digest": grant.PackageEnvironmentSpec.Digest,
+			"format":                  "cozy.runtime.PackageOverlayReceipt/1", "overlay_wheels": rows,
+			"project_wheel_digest": facts["project_wheel"].Digest,
+		})
+		must(t, err)
+		return body
+	}
+	receiptPath := filepath.Join(t.TempDir(), "receipt.json")
+	must(t, os.WriteFile(receiptPath, receipt(rows), 0o600))
+	contentDigest, problem := managedinstall.VerifyOverlayReceipt(receiptPath, grant, facts)
+	fatal(t, problem)
+	if !strings.HasPrefix(contentDigest, "sha256:") {
+		t.Fatalf("overlay receipt returned malformed content identity %q", contentDigest)
+	}
+	rows[0]["owner"] = "base"
+	must(t, os.WriteFile(receiptPath, receipt(rows), 0o600))
+	if _, problem := managedinstall.VerifyOverlayReceipt(receiptPath, grant, facts); problem == nil {
+		t.Fatal("Runtime receipt changed a selected dependency owner without refusal")
+	}
+}
 
 func TestPackagePublishMetadataGrammar(t *testing.T) {
 	root := t.TempDir()

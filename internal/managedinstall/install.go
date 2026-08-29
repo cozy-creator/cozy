@@ -12,6 +12,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"sort"
 	"strings"
 	"time"
@@ -148,8 +149,7 @@ func Run(ctx context.Context, layout home.Layout, store *records.Store, request 
 		return fail(problem)
 	}
 	docPaths["descriptor.json"] = descriptorPath
-	wheelFacts, problem := releaseWheelFacts(grant.PackageBundle.CanonicalBytes,
-		grant.ResolvedWheelSet.CanonicalBytes, request.Package+"@"+request.Release)
+	wheelFacts, problem := ReleaseWheelFacts(grant, request.Package+"@"+request.Release)
 	if problem != nil {
 		return fail(problem)
 	}
@@ -189,7 +189,13 @@ func Run(ctx context.Context, layout home.Layout, store *records.Store, request 
 			target, download.Ref.Digest, download.Ref.Length); problem != nil {
 			return fail(problem)
 		}
-		inspected, problem := wheel.Inspect(target)
+		var inspected wheel.Fact
+		var problem *exit.Error
+		if download.Role == "project_wheel" {
+			inspected, problem = wheel.Inspect(target)
+		} else {
+			inspected, problem = wheel.InspectDependency(target)
+		}
 		if problem != nil || !sameWheelFact(fact, inspected) {
 			if problem != nil {
 				return fail(problem)
@@ -200,8 +206,8 @@ func Run(ctx context.Context, layout home.Layout, store *records.Store, request 
 		wheelFiles[download.Ref.Digest] = target
 	}
 	if !seenRoles["project_wheel"] || len(seenRoles) != len(wheelFacts) {
-		return fail(exit.Named(exit.Structural, "managed_install_project_wheel_absent",
-			"local execution did not grant exactly the project wheel"))
+		return fail(exit.Named(exit.Structural, "managed_install_wheel_download_absent",
+			"local execution did not grant every exact project and dependency wheel exactly once"))
 	}
 
 	environmentRoot := filepath.Join(genDir, "environment")
@@ -231,7 +237,7 @@ func Run(ctx context.Context, layout home.Layout, store *records.Store, request 
 		return fail(exit.Named(exit.Structural, "managed_environment_reused_fresh_root",
 			"Runtime reported a reused overlay inside a fresh managed generation root"))
 	}
-	overlayContentDigest, problem := verifyOverlayReceipt(receiptPath, grant, wheelFacts)
+	overlayContentDigest, problem := VerifyOverlayReceipt(receiptPath, grant, wheelFacts)
 	if problem != nil {
 		return fail(problem)
 	}
@@ -293,7 +299,9 @@ func Run(ctx context.Context, layout home.Layout, store *records.Store, request 
 	return &Result{Install: gen, Facts: facts, Superseded: superseded}, nil
 }
 
-func releaseWheelFacts(bundleBytes, resolvedBytes []byte, expectedRelease string) (map[string]wheel.Fact, *exit.Error) {
+// ReleaseWheelFacts derives the only accepted download-role inventory from the
+// exact qualified documents. Callers never author a parallel wheel list.
+func ReleaseWheelFacts(grant hub.LocalQualificationMaterials, expectedRelease string) (map[string]wheel.Fact, *exit.Error) {
 	var bundle struct {
 		Format             string        `json:"format"`
 		PackageDescriptor  hub.ObjectRef `json:"package_descriptor"`
@@ -304,28 +312,94 @@ func releaseWheelFacts(bundleBytes, resolvedBytes []byte, expectedRelease string
 		WheelhouseManifest hub.ObjectRef `json:"wheelhouse_manifest"`
 	}
 	var resolved struct {
-		Wheels []wheel.Fact `json:"wheels"`
+		CompatibilityProfile     json.RawMessage `json:"compatibility_profile"`
+		Format                   string          `json:"format"`
+		OverlayBytes             int64           `json:"overlay_bytes"`
+		PlatformTarget           json.RawMessage `json:"platform_target"`
+		ResolutionLockDigest     string          `json:"resolution_lock_digest"`
+		ResolutionLockLength     int64           `json:"resolution_lock_length"`
+		WheelhouseManifestDigest string          `json:"wheelhouse_manifest_digest"`
+		Wheels                   []wheel.Fact    `json:"wheels"`
 	}
-	bundleDecoder := json.NewDecoder(bytes.NewReader(bundleBytes))
+	bundleDecoder := json.NewDecoder(bytes.NewReader(grant.PackageBundle.CanonicalBytes))
 	bundleDecoder.DisallowUnknownFields()
-	if bundleDecoder.Decode(&bundle) != nil || json.Unmarshal(resolvedBytes, &resolved) != nil ||
+	resolvedDecoder := json.NewDecoder(bytes.NewReader(grant.ResolvedWheelSet.CanonicalBytes))
+	resolvedDecoder.DisallowUnknownFields()
+	if bundleDecoder.Decode(&bundle) != nil || resolvedDecoder.Decode(&resolved) != nil ||
 		bundle.Format != "tensorhub.package_bundle/3" || bundle.PackageReleaseID != expectedRelease ||
-		!digest(bundle.PackageDescriptor.Digest) || bundle.PackageDescriptor.Length <= 0 ||
-		!digest(bundle.ResolvedWheelSet.Digest) || bundle.ResolvedWheelSet.Length <= 0 ||
+		bundle.PackageDescriptor != (hub.ObjectRef{Digest: grant.PackageDescriptor.Digest, Length: grant.PackageDescriptor.Length}) ||
+		bundle.ResolvedWheelSet != (hub.ObjectRef{Digest: grant.ResolvedWheelSet.Digest, Length: grant.ResolvedWheelSet.Length}) ||
+		bundle.WheelhouseManifest != (hub.ObjectRef{Digest: grant.WheelhouseManifest.Digest, Length: grant.WheelhouseManifest.Length}) ||
 		!digest(bundle.SourceTree.Digest) || bundle.SourceTree.Length <= 0 ||
-		!digest(bundle.WheelhouseManifest.Digest) || bundle.WheelhouseManifest.Length <= 0 ||
-		!digest(bundle.ProjectWheel.Digest) || bundle.ProjectWheel.Filename == "" ||
-		bundle.ProjectWheel.Distribution == "" || bundle.ProjectWheel.Version == "" ||
-		bundle.ProjectWheel.Length <= 0 {
+		resolved.Format != "ResolvedWheelSet/3" ||
+		resolved.WheelhouseManifestDigest != grant.WheelhouseManifest.Digest ||
+		resolved.ResolutionLockDigest != grant.ResolutionLock.Digest ||
+		resolved.ResolutionLockLength != grant.ResolutionLock.Length ||
+		!validWheelFact(bundle.ProjectWheel) {
 		return nil, exit.Named(exit.Structural, "managed_install_wheel_facts_invalid",
-			"PackageBundle identity or project WheelFact is incomplete")
-	}
-	if len(resolved.Wheels) != 0 {
-		return nil, exit.Named(exit.Structural, "managed_install_custom_wheels_unsupported",
-			"ResolvedWheelSet carries %d custom wheel(s); the current managed-local lane admits only one pure project wheel", len(resolved.Wheels))
+			"PackageBundle, ResolvedWheelSet, or project WheelFact is incomplete or cross-joined")
 	}
 	out := map[string]wheel.Fact{"project_wheel": bundle.ProjectWheel}
+	seenFiles := map[string]bool{bundle.ProjectWheel.Filename: true}
+	seenDigests := map[string]bool{bundle.ProjectWheel.Digest: true}
+	seenDistributions := map[string]bool{bundle.ProjectWheel.Distribution: true}
+	var overlayBytes int64
+	prior := ""
+	for _, fact := range resolved.Wheels {
+		role := "dependency_wheel/" + fact.Distribution
+		if !validWheelFact(fact) || fact.Distribution <= prior || seenFiles[fact.Filename] ||
+			seenDigests[fact.Digest] || seenDistributions[fact.Distribution] {
+			return nil, exit.Named(exit.Structural, "managed_install_wheel_facts_invalid",
+				"ResolvedWheelSet dependency wheels are malformed, duplicated, or unsorted")
+		}
+		if fact.Length > 512<<20-overlayBytes {
+			return nil, exit.Named(exit.Structural, "managed_install_wheel_facts_invalid",
+				"ResolvedWheelSet dependency wheels exceed the overlay bound")
+		}
+		overlayBytes += fact.Length
+		prior = fact.Distribution
+		seenFiles[fact.Filename], seenDigests[fact.Digest] = true, true
+		seenDistributions[fact.Distribution] = true
+		out[role] = fact
+	}
+	if resolved.OverlayBytes != overlayBytes || len(resolved.Wheels) > 127 {
+		return nil, exit.Named(exit.Structural, "managed_install_wheel_facts_invalid",
+			"ResolvedWheelSet overlay byte accounting or wheel count is invalid")
+	}
 	return out, nil
+}
+
+var (
+	distributionName = regexp.MustCompile(`^[a-z0-9]+(?:-[a-z0-9]+)*$`)
+	importRootName   = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]*$`)
+)
+
+func validWheelFact(fact wheel.Fact) bool {
+	if !digest(fact.Digest) || !distributionName.MatchString(fact.Distribution) ||
+		fact.Filename == "" || filepath.Base(fact.Filename) != fact.Filename ||
+		!strings.HasSuffix(fact.Filename, ".whl") || fact.Length <= 0 ||
+		fact.Version == "" || strings.TrimSpace(fact.Version) != fact.Version ||
+		len(fact.ImportRoots) == 0 || len(fact.Tags) == 0 ||
+		!strictStrings(fact.ImportRoots) || !strictStrings(fact.Tags) {
+		return false
+	}
+	for _, root := range fact.ImportRoots {
+		if !importRootName.MatchString(root) {
+			return false
+		}
+	}
+	return true
+}
+
+func strictStrings(values []string) bool {
+	prior := ""
+	for _, value := range values {
+		if value == "" || value <= prior || strings.TrimSpace(value) != value {
+			return false
+		}
+		prior = value
+	}
+	return true
 }
 
 func sameWheelFact(a, b wheel.Fact) bool {
@@ -362,7 +436,9 @@ type overlayReceipt struct {
 	ProjectWheelDigest string                `json:"project_wheel_digest"`
 }
 
-func verifyOverlayReceipt(path string, grant hub.LocalQualificationMaterials,
+// VerifyOverlayReceipt proves Runtime installed exactly the project wheel plus
+// every selected dependency wheel and preserved project/custom ownership.
+func VerifyOverlayReceipt(path string, grant hub.LocalQualificationMaterials,
 	wheelFacts map[string]wheel.Fact,
 ) (string, *exit.Error) {
 	raw, err := os.ReadFile(path)

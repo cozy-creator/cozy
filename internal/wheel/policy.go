@@ -17,7 +17,12 @@ var compiledExt = map[string]bool{
 	".c": true, ".h": true, ".cc": true, ".cpp": true, ".cxx": true, ".hpp": true,
 	".pyx": true, ".pxd": true, ".pxi": true,
 	".so": true, ".pyd": true, ".dylib": true, ".dll": true, ".a": true, ".o": true,
-	".rs": true, ".f90": true, ".cu": true,
+	".rs": true, ".f90": true, ".cu": true, ".cuh": true,
+}
+
+var nativeSourceExt = map[string]bool{
+	".c": true, ".h": true, ".cc": true, ".cpp": true, ".cxx": true, ".hpp": true,
+	".pyx": true, ".pxd": true, ".pxi": true, ".rs": true, ".f90": true, ".cu": true, ".cuh": true,
 }
 
 var buildInput = map[string]bool{

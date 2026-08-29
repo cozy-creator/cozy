@@ -1,7 +1,7 @@
 package wheel
 
-// Exact wheel inspection for package publication. The current public lane admits one
-// portable project wheel and no custom-wheel surface.
+// Exact wheel inspection for package publication and managed installation. Project
+// wheels stay portable; separately selected dependency wheels may be prebuilt native.
 
 import (
 	"archive/zip"
@@ -106,9 +106,21 @@ func InspectIdentity(file string) (Identity, *exit.Error) {
 	return out, nil
 }
 
-// Inspect reads one wheel exactly as supplied. It must be one pure py3-none-any
-// project payload with no native/build member or nested wheel carrier.
+// Inspect reads one package-owned project wheel exactly as supplied. It must be
+// one pure py3-none-any payload with no native/build member or nested wheel.
 func Inspect(file string) (Fact, *exit.Error) {
+	return inspect(file, true)
+}
+
+// InspectDependency reads one prebuilt dependency wheel exactly as supplied.
+// Native binaries are admitted, but native build inputs and executable path
+// injection remain refused. Tensorhub has already selected the wheel's tags for
+// the exact target; Creator re-derives and compares every immutable WheelFact.
+func InspectDependency(file string) (Fact, *exit.Error) {
+	return inspect(file, false)
+}
+
+func inspect(file string, projectWheel bool) (Fact, *exit.Error) {
 	out := Fact{ImportRoots: []string{}, Tags: []string{}}
 	abs, err := filepath.Abs(file)
 	if err != nil {
@@ -182,8 +194,12 @@ func Inspect(file string) (Fact, *exit.Error) {
 			return out, exit.Named(exit.Validation, "project_wheel_nested_wheel",
 				"%s is a nested wheel; package code cannot smuggle a second distribution past the project-wheel tag and ownership checks", name)
 		}
-		if compiledExt[ext] {
+		if projectWheel && compiledExt[ext] {
 			return out, refuseCompiled(name)
+		}
+		if !projectWheel && nativeSourceExt[ext] {
+			return out, exit.Named(exit.Validation, "dependency_wheel_build_input",
+				"%s is a native build input; dependency wheels must be prebuilt", name)
 		}
 		if privateBuildMember(name) {
 			return out, exit.Named(exit.Validation, "project_wheel_private_member",
@@ -249,7 +265,7 @@ func Inspect(file string) (Fact, *exit.Error) {
 		return out, exit.Named(exit.Validation, "wheel_tag_mismatch",
 			"filename tags %v disagree with WHEEL tags %v", filenameTags, wheelTags)
 	}
-	if !pure || !equalStrings(wheelTags, []string{Tag}) {
+	if projectWheel && (!pure || !equalStrings(wheelTags, []string{Tag})) {
 		return out, exit.Named(exit.Validation, "project_wheel_not_pure",
 			"project wheel must declare Root-Is-Purelib: true and exactly Tag: %s", Tag)
 	}
@@ -262,9 +278,13 @@ func Inspect(file string) (Fact, *exit.Error) {
 	}
 	sort.Strings(out.ImportRoots)
 	if len(out.ImportRoots) == 0 {
-		return out, exit.Named(exit.Validation, "project_wheel_import_root_absent",
-			"%s contains no importable Python module", filename).
-			WithRemedy("configure the project build backend so `uv build --wheel` includes the package")
+		if projectWheel {
+			return out, exit.Named(exit.Validation, "project_wheel_import_root_absent",
+				"%s contains no importable Python module", filename).
+				WithRemedy("configure the project build backend so `uv build --wheel` includes the package")
+		}
+		return out, exit.Named(exit.Validation, "wheel_import_root_absent",
+			"%s contains no importable Python module", filename)
 	}
 	out.Digest = "sha256:" + hex.EncodeToString(h.Sum(nil))
 	out.Distribution, out.Filename, out.Length = distribution, filename, info.Size()
