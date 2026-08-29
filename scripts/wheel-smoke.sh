@@ -37,11 +37,13 @@ if [ -z "$skip_build" ]; then
 fi
 wheel=$(ls "$wheels"/tensorfs-*.whl | head -1)
 echo "wheel: $(basename "$wheel")"
+"$py" scripts/version_contract.py wheel "$wheel"
 
 rm -rf "$work/venv"
 "$py" -m venv "$work/venv"
 "$work/venv/bin/pip" install --quiet "$wheel"
 echo "installed into fresh venv: $("$work/venv/bin/python" -V)"
+"$work/venv/bin/python" scripts/version_contract.py installed "$wheel"
 
 "$work/venv/bin/python" - "$PWD" "$SNAP" "$DIGEST" <<'PY'
 import hashlib, pathlib, sys, tempfile

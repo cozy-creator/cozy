@@ -6,6 +6,19 @@ Rust workspace: `tensorfs-core` (torch/CUDA/HTTP/SQL-free) and `tensorfs-py` (ma
 No automated tests (decisions.md #160): verification = live runs + benchmarks. Static analysis
 IS required: `cargo clippy -D warnings`, `cargo fmt --check`, `mypy --strict`, `scripts/fence.py`.
 
+## version contract (proto-014)
+
+TensorFS is prelaunch `0.x`: neither its current Python surface nor compatibility between
+`0.x` releases is promised to external packages. Proto-014 owns the first public-v1 cut. That
+cut will name and freeze the supported author surface; this guard deliberately does not choose
+that surface early. Worker/Hub internals may remain in the same distribution without becoming
+public author API.
+
+Package SemVer is independent from the `v2` store era and stored document identities such as
+`cozytensors/1`. Until proto-014 lands, `scripts/fence.py` keeps the package on major zero and
+requires the pyproject and every Cargo crate to share one version. The wheel smoke additionally
+proves that each built wheel's METADATA and imported `tensorfs.__version__` carry that version.
+
 ## tfs (tfs-013)
 
 ```

@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Architecture fences (boundaries.md, tensorfs.md §10). Enforcement, not tests.
 
+0. package identity       — pyproject/Cargo agree and stay prelaunch 0.x
 1. forbidden dependencies — core is torch/CUDA/HTTP/TLS/SQL/hub-free
 2. no upward imports    — core < layout < py; a crate may name only lower ranks
 3. marshal-only facade  — zero hashing/chunking/parsing/carrier logic in Python
@@ -11,7 +12,19 @@ import pathlib
 import re
 import sys
 
+from version_contract import source_version
+
 ROOT = pathlib.Path(__file__).resolve().parent.parent
+
+
+# --------------------------------------------------------- 0. package identity
+
+def fence_version_contract():
+    try:
+        version = source_version()
+    except (KeyError, OSError, ValueError) as error:
+        return [str(error)], "source versions disagree"
+    return [], f"pyproject + Cargo crates agree on prelaunch version {version}"
 
 # ---------------------------------------------------------------- 1. dependencies
 
@@ -481,7 +494,8 @@ def rel(p):
     return p.relative_to(ROOT)
 
 
-FENCES = [("forbidden dependencies", fence_dependencies),
+FENCES = [("prelaunch package identity", fence_version_contract),
+          ("forbidden dependencies", fence_dependencies),
           ("no upward imports", fence_layering),
           ("marshal-only facade", fence_facade),
           ("one codec, one evaluator", fence_one_codec),
