@@ -67,34 +67,22 @@ func handleInstall(ctx *Context) *exit.Error {
 		return e
 	}
 	g := res.Gen
-	rec := output.Record{
-		Kind: "install",
-		Fields: []output.Field{
-			{K: "endpoint", V: g.Endpoint},
-			{K: "major", V: g.Major},
-			{K: "version", V: g.Version},
-			{K: "generation", V: g.ID},
-			{K: "source", V: g.SourceKind + " " + g.SourceRef},
-			{K: "source_digest", V: g.SourceDigest},
-			{K: "verified", V: g.Verified},
-			{K: "python", V: g.Python},
-			{K: "uv", V: g.UV},
-			{K: "lock", V: g.LockDigest},
-			{K: "platform", V: g.Platform},
-			{K: "cuda_extra", V: orNone(g.Extra)},
-			{K: "link_mode", V: g.LinkMode},
-			{K: "packages", V: g.Packages},
-			{K: "closure", V: strings.ReplaceAll(g.Closure, "\n", " ")},
-			{K: "descriptor", V: g.Descriptor},
-			{K: "disk", V: diskText(g)},
-		},
+	fields := []output.Field{
+		{K: "endpoint", V: g.Endpoint}, {K: "major", V: g.Major},
+		{K: "version", V: g.Version}, {K: "status", V: "installed"},
+		{K: "disk", V: diskText(g)}, {K: "changed", V: !res.Idempotent},
+		{K: "generation", V: g.ID}, {K: "source", V: g.SourceKind + " " + g.SourceRef},
+		{K: "source_digest", V: g.SourceDigest}, {K: "verified", V: g.Verified},
+		{K: "python", V: g.Python}, {K: "uv", V: g.UV}, {K: "lock", V: g.LockDigest},
+		{K: "platform", V: g.Platform}, {K: "cuda_extra", V: orNone(g.Extra)},
+		{K: "link_mode", V: g.LinkMode}, {K: "packages", V: g.Packages},
+		{K: "closure", V: strings.ReplaceAll(g.Closure, "\n", " ")},
+		{K: "descriptor", V: g.Descriptor},
 	}
 	if res.Idempotent {
-		rec.Fields = append(rec.Fields, output.Field{K: "result", V: "already pinned — nothing changed"})
-		rec.Next = []string{"cozy endpoint list"}
-		return emit(ctx, rec)
+		return emit(ctx, compactRecord(fields, "endpoint", "major", "version", "status", "changed"))
 	}
-	rec.Fields = append(rec.Fields,
+	fields = append(fields,
 		output.Field{K: "staged", V: fmt.Sprintf("%d files, %s expanded, %s compressed", res.Files, output.Bytes(res.Bytes), output.Bytes(res.Compressed))},
 		output.Field{K: "timings", V: timingsText(res.Timings)},
 	)
@@ -103,10 +91,11 @@ func handleInstall(ctx *Context) *exit.Error {
 		if problem != nil {
 			return problem
 		}
-		rec.Fields = append(rec.Fields,
+		fields = append(fields,
 			output.Field{K: "superseded", V: res.Superseded},
 			output.Field{K: "reclaimed", V: output.Bytes(reclaimed)})
 	}
+	rec := compactRecord(fields, "endpoint", "major", "version", "status", "disk", "changed")
 	rec.Notes = append(rec.Notes, res.Warnings...)
 	rec.Next = []string{"cozy endpoint list"}
 	return emit(ctx, rec)
@@ -175,8 +164,9 @@ func handleManagedInstall(ctx *Context, profile string) *exit.Error {
 		return e
 	}
 	g, facts := installed.Install, installed.Facts
-	rec := output.Record{Kind: "install", Fields: []output.Field{
+	fields := []output.Field{
 		{K: "endpoint", V: g.Endpoint}, {K: "major", V: g.Major}, {K: "release", V: g.Version},
+		{K: "status", V: "installed"}, {K: "changed", V: !installed.Idempotent},
 		{K: "profile", V: facts.Profile}, {K: "candidate", V: facts.CandidateID},
 		{K: "generation", V: g.ID}, {K: "base_realization", V: facts.BaseRealizationDigest},
 		{K: "wheelhouse", V: facts.WheelhouseManifestDigest},
@@ -184,27 +174,20 @@ func handleManagedInstall(ctx *Context, profile string) *exit.Error {
 		{K: "receipt", V: facts.InstalledReceiptDigest}, {K: "host_evidence", V: facts.HostEvidenceDigest},
 		{K: "lease", V: facts.LeaseID + " until " + facts.LeaseExpiresAt},
 		{K: "disk", V: diskText(g)},
-	}, Notes: []string{
-		"installed only after independent local hardware qualification; no cloud qualification was borrowed",
-		"no dependency resolution, Torch/CUDA install, or native build ran",
-		"control install, portable Runtime receipt, local-base fingerprint, host evidence, and lease are separate recorded facts",
-	}, Next: []string{"cozy invoke run " + g.Endpoint + "@v" + strconv.Itoa(g.Major), "cozy invoke run <org/endpoint/vN/function>"}}
-	if facts.NativeEvidenceDigest != "" {
-		rec.Fields = append(rec.Fields, output.Field{K: "native_evidence", V: facts.NativeEvidenceDigest})
 	}
-	if installed.Idempotent {
-		rec.Fields = append(rec.Fields, output.Field{K: "result", V: "already pinned — nothing changed"})
+	if facts.NativeEvidenceDigest != "" {
+		fields = append(fields, output.Field{K: "native_evidence", V: facts.NativeEvidenceDigest})
 	}
 	if installed.Superseded != "" {
 		reclaimed, problem := install.Reclaim(st, installed.Superseded)
 		if problem != nil {
 			return problem
 		}
-		rec.Fields = append(rec.Fields,
+		fields = append(fields,
 			output.Field{K: "superseded", V: installed.Superseded},
 			output.Field{K: "reclaimed", V: output.Bytes(reclaimed)})
 	}
-	return emit(ctx, rec)
+	return emit(ctx, compactRecord(fields, "endpoint", "major", "release", "profile", "status", "disk", "changed"))
 }
 
 func handleLs(ctx *Context) *exit.Error {
@@ -218,15 +201,11 @@ func handleLs(ctx *Context) *exit.Error {
 		return e
 	}
 	l := output.List{
-		Kind:      "endpoint",
+		Name:      "endpoints",
 		Fields:    []string{"endpoint", "major", "version", "disk"},
-		AllFields: []string{"endpoint", "major", "version", "generation", "disk", "exclusive", "shared", "python", "uv", "cuda_extra", "link_mode", "packages", "closure", "descriptor", "source", "verified", "installed"},
-		Empty:     "0 endpoints installed",
+		AllFields: []string{"endpoint", "major", "version", "disk", "generation", "source", "verified", "installed", "exclusive", "shared"},
 	}
-	var excl, shared int64
 	for _, g := range rows {
-		excl += g.BytesExcl
-		shared += g.BytesShared
 		l.Rows = append(l.Rows, map[string]string{
 			"endpoint":   g.Endpoint,
 			"major":      fmt.Sprintf("v%d", g.Major),
@@ -248,15 +227,9 @@ func handleLs(ctx *Context) *exit.Error {
 		})
 	}
 	if len(l.Rows) == 0 {
-		l.Next = []string{"cozy endpoint install <org/endpoint>", "cozy endpoint search"}
+		l.Next = []string{"cozy endpoint search"}
 		return emit(ctx, l)
 	}
-	l.Aggregates = []output.Field{
-		{K: "endpoints", V: len(l.Rows)},
-		{K: "exclusive", V: output.Bytes(excl)},
-		{K: "hardlink-shared", V: output.Bytes(shared)},
-	}
-	l.Notes = []string{"read from the install records; no directory was walked"}
 	return emit(ctx, l)
 }
 
@@ -306,10 +279,9 @@ func handleRm(ctx *Context) *exit.Error {
 	}
 
 	removed := output.List{
-		Kind:      "endpoint remove",
-		Fields:    []string{"endpoint", "major", "generation"},
-		AllFields: []string{"endpoint", "major", "generation", "reclaimed"},
-		Empty:     "0 installs removed",
+		Name:      "endpoints",
+		Fields:    []string{"endpoint", "major", "reclaimed"},
+		AllFields: []string{"endpoint", "major", "reclaimed", "generation"},
 	}
 	var freed int64
 	for _, arg := range ctx.Inv.Args {
@@ -366,12 +338,11 @@ func handleRm(ctx *Context) *exit.Error {
 		freed += n
 	}
 	if len(removed.Rows) == 0 {
-		removed.Empty = fmt.Sprintf("0 installs removed — %s is not installed", strings.Join(ctx.Inv.Args, ", "))
-		removed.Next = []string{"cozy endpoint list"}
+		removed.Aggregates = []output.Field{{K: "changed", V: false}}
 		return emit(ctx, removed)
 	}
 	removed.Aggregates = []output.Field{
-		{K: "removed", V: len(removed.Rows)},
+		{K: "changed", V: true},
 		{K: "reclaimed", V: output.Bytes(freed)},
 	}
 	removed.Notes = []string{"exclusive endpoint bytes were removed; shared TensorFS model bytes were untouched"}

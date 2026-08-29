@@ -1,7 +1,6 @@
 package cli
 
 import (
-	"fmt"
 	"io"
 	"os"
 	"path/filepath"
@@ -134,6 +133,9 @@ func handleModelPublish(ctx *Context) *exit.Error {
 
 	fields := []output.Field{
 		{K: "model", V: ref.String()},
+		{K: "snapshot", V: snapshot},
+		{K: "status", V: "published"},
+		{K: "changed", V: res.Moved > 0},
 		{K: "publish_id", V: res.PublishID},
 		{K: "session", V: res.Session},
 		{K: "objects", V: res.Totals.DeclaredObjects},
@@ -142,20 +144,19 @@ func handleModelPublish(ctx *Context) *exit.Error {
 		{K: "deduped", V: output.Bytes(res.Deduped)},
 	}
 	if p.DryRun {
-		return emit(ctx, output.Record{
-			Kind: "model publish plan", Fields: append(fields,
-				output.Field{K: "missing", V: res.Totals.MissingObjects},
-				output.Field{K: "held", V: res.Totals.HeldObjects},
-				output.Field{K: "hub", V: c.Base()}),
-			Notes: []string{"--dry-run declared and stopped: the plan is the HUB's answer, not a local guess"},
-			Next:  []string{"cozy model publish " + ref.String() + " " + snapshot + " --reason <why>"},
-		})
+		fields[2].V = "planned"
+		fields[3].V = false
+		fields = append(fields,
+			output.Field{K: "missing", V: res.Totals.MissingObjects},
+			output.Field{K: "held", V: res.Totals.HeldObjects})
+		rec := compactRecord(fields, "model", "snapshot", "status", "missing", "changed")
+		rec.Next = []string{"cozy model publish " + ref.String() + " " + snapshot + " --reason <why>"}
+		return emit(ctx, rec)
 	}
 	fields = append(fields,
 		output.Field{K: "uploaded", V: res.Uploaded},
 		output.Field{K: "verified", V: res.Verified},
 		output.Field{K: "checksum_source", V: res.Sources},
-		output.Field{K: "snapshot", V: res.Root.SnapshotID},
 		output.Field{K: "header", V: res.Root.HeaderID},
 		output.Field{K: "topology", V: res.Root.TopologyDigest},
 		output.Field{K: "catalog_root", V: res.Root.CatalogRootID},
@@ -164,19 +165,9 @@ func handleModelPublish(ctx *Context) *exit.Error {
 		output.Field{K: "verifier", V: res.Root.VerifierBuild},
 		output.Field{K: "reingested", V: res.Reingest},
 		output.Field{K: "duplicate", V: res.Dup},
-		output.Field{K: "hub", V: c.Base()},
 	)
-	notes := []string{
-		"the model name was created idempotently when absent",
-		fmt.Sprintf("the hub re-verified %d already-held objects hermetically: a client receipt substitutes for nothing (law 18)", res.Reingest),
-	}
-	if res.Multipart > 0 {
-		notes = append(notes, fmt.Sprintf("%d objects went as ranged uploads; R2 signs no digest on those, so the hub's own streaming hash discharged it", res.Multipart))
-	}
-	return emit(ctx, output.Record{
-		Kind: "model publish", Fields: fields, Notes: notes,
-		Next: []string{"cozy model download " + ref.String() + "@" + res.Root.SnapshotID},
-	})
+	return emit(ctx, compactRecord(fields,
+		"model", "snapshot", "status", "moved", "deduped", "changed"))
 }
 
 func handleModelDownload(ctx *Context) *exit.Error {
@@ -210,17 +201,19 @@ func handleModelDownload(ctx *Context) *exit.Error {
 	fields := []output.Field{
 		{K: "model", V: ref.String()},
 		{K: "snapshot", V: res.Snapshot},
+		{K: "status", V: "downloaded"},
+		{K: "changed", V: res.Moved > 0},
 		{K: "objects", V: res.Objects},
 		{K: "bytes", V: output.Bytes(res.Bytes)},
 		{K: "moved", V: output.Bytes(res.Moved)},
 		{K: "deduped", V: output.Bytes(res.Held)},
 	}
 	if f.DryRun {
-		return emit(ctx, output.Record{
-			Kind: "model download plan", Fields: append(fields, output.Field{K: "hub", V: c.Base()}),
-			Notes: []string{"--dry-run moved nothing; the tensor set is computed from the checkpoint's own documents once they land"},
-			Next:  []string{"cozy model download " + ref.String() + "@" + res.Snapshot},
-		})
+		fields[2].V = "planned"
+		fields[3].V = false
+		rec := compactRecord(fields, "model", "snapshot", "status", "bytes", "changed")
+		rec.Next = []string{"cozy model download " + ref.String() + "@" + res.Snapshot}
+		return emit(ctx, rec)
 	}
 	fields = append(fields,
 		output.Field{K: "header", V: res.HeaderID},
@@ -230,17 +223,9 @@ func handleModelDownload(ctx *Context) *exit.Error {
 		output.Field{K: "parts", V: res.Parts},
 		output.Field{K: "grade", V: res.Grade},
 		output.Field{K: "root", V: tool.Root},
-		output.Field{K: "hub", V: c.Base()},
 	)
-	return emit(ctx, output.Record{
-		Kind: "model download", Fields: fields,
-		Notes: []string{
-			fmt.Sprintf("admitted counts the snapshot manifest too: the closure names what a transfer MOVES (%d objects) and the manifest separately", res.Objects),
-			"every declared byte was verified before this snapshot became a named local root",
-			"the local root is noted hub_published: durability without a pin — `tfs gc` may still reclaim it",
-		},
-		Next: []string{"cozy model download " + ref.String() + "@" + res.Snapshot},
-	})
+	return emit(ctx, compactRecord(fields,
+		"model", "snapshot", "status", "moved", "deduped", "changed"))
 }
 
 func localTensorFS(ctx *Context) (*tfs.Tool, *exit.Error) {
@@ -261,15 +246,14 @@ func handleModelList(ctx *Context) *exit.Error {
 		return problem
 	}
 	list := output.List{
-		Kind: "model", Fields: []string{"model", "snapshot"},
-		AllFields: []string{"model", "snapshot", "kind"}, Empty: "0 models downloaded",
+		Name: "models", Fields: []string{"model", "snapshot"},
+		AllFields: []string{"model", "snapshot", "kind"},
 	}
 	for _, root := range roots {
 		list.Rows = append(list.Rows, map[string]string{
 			"model": root.Name, "snapshot": root.Snapshot, "kind": root.Kind,
 		})
 	}
-	list.Aggregates = []output.Field{{K: "models", V: len(list.Rows)}}
 	return emit(ctx, list)
 }
 
@@ -320,8 +304,8 @@ func handleModelRemove(ctx *Context) *exit.Error {
 		held[root.Name] = root
 	}
 	removed := output.List{
-		Kind: "model remove", Fields: []string{"model", "snapshot"},
-		AllFields: []string{"model", "snapshot"}, Empty: "0 model roots removed",
+		Name: "models", Fields: []string{"model", "snapshot"},
+		AllFields: []string{"model", "snapshot"},
 	}
 	for _, name := range ctx.Inv.Args {
 		root, ok := held[name]
@@ -336,7 +320,7 @@ func handleModelRemove(ctx *Context) *exit.Error {
 		})
 		delete(held, name)
 	}
-	removed.Aggregates = []output.Field{{K: "removed", V: len(removed.Rows)}}
+	removed.Aggregates = []output.Field{{K: "changed", V: len(removed.Rows) > 0}}
 	removed.Notes = []string{"local names were released; TensorFS garbage collection decides later byte reclamation"}
 	return emit(ctx, removed)
 }

@@ -2,6 +2,7 @@ package cli
 
 import (
 	"errors"
+	"fmt"
 	"runtime/debug"
 
 	"github.com/cozy-creator/cozy-creator/internal/exit"
@@ -40,12 +41,8 @@ func buildStamp() (string, bool) {
 	return revision, dirty
 }
 
-// emit is the only success-document seam. Command-specific documents keep
-// state-dependent next actions; otherwise the selected Kong command supplies them.
+// emit is the only success-document seam.
 func emit(ctx *Context, document output.Document) *exit.Error {
-	if len(ctx.Next) > 0 {
-		document = document.WithDefaultNext(ctx.Next)
-	}
 	if err := document.Emit(ctx.Out, ctx.Mode()); err != nil {
 		var problem *output.Error
 		if errors.As(err, &problem) && problem.Class == output.Usage {
@@ -58,4 +55,22 @@ func emit(ctx *Context, document output.Document) *exit.Error {
 		return exit.As(err)
 	}
 	return nil
+}
+
+// compactRecord keeps command handlers authoritative for all available facts while
+// making the smaller default an explicit product decision.
+func compactRecord(fields []output.Field, defaults ...string) output.Record {
+	byName := make(map[string]output.Field, len(fields))
+	for _, field := range fields {
+		byName[field.K] = field
+	}
+	compact := make([]output.Field, 0, len(defaults))
+	for _, name := range defaults {
+		field, ok := byName[name]
+		if !ok {
+			panic(fmt.Sprintf("compact output field %q is absent", name))
+		}
+		compact = append(compact, field)
+	}
+	return output.Record{Fields: compact, AllFields: fields}
 }

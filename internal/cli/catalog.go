@@ -74,9 +74,10 @@ func handleResourceSearch(ctx *Context, kind string) *exit.Error {
 	}
 
 	l := output.List{
-		Kind:      kind + " search",
-		Fields:    []string{"ref", "created"},
+		Name:      kind + "s",
+		Fields:    []string{"ref"},
 		AllFields: []string{"ref", "created", "org", "name"},
+		Total:     search.Total,
 	}
 	for _, r := range resources {
 		l.Rows = append(l.Rows, map[string]string{
@@ -84,11 +85,6 @@ func handleResourceSearch(ctx *Context, kind string) *exit.Error {
 		})
 	}
 
-	l.Aggregates = []output.Field{
-		{K: "results", V: len(l.Rows)},
-		{K: kind + "s", V: search.Total},
-		{K: "hub", V: c.Base()},
-	}
 	// The public listing is a whole-catalog read filtered here. That is honest at a
 	// catalog this size and dishonest at scale, so it says so at the hub's own cap
 	// rather than silently returning a prefix as if it were the answer.
@@ -98,17 +94,9 @@ func handleResourceSearch(ctx *Context, kind string) *exit.Error {
 	}
 	switch {
 	case len(l.Rows) == 0 && query == "":
-		l.Empty = "0 " + kind + "s in the catalog"
-		l.Next = []string{"cozy " + kind + " publish <org/name>"}
+		l.Next = []string{"cozy help " + kind + " publish"}
 	case len(l.Rows) == 0:
-		l.Empty = "0 results for \"" + query + "\""
 		l.Next = []string{"cozy " + kind + " search"}
-	default:
-		verb := "install"
-		if kind == "model" {
-			verb = "download"
-		}
-		l.Next = []string{"cozy " + kind + " " + verb + " <org/name>"}
 	}
 	return emit(ctx, l)
 }
@@ -130,13 +118,14 @@ func handleResourceShow(ctx *Context, kind string) *exit.Error {
 	if e != nil {
 		return e
 	}
-	return emit(ctx, output.Record{
-		Kind: kind,
+	rec := output.Record{
 		Fields: []output.Field{
 			{K: "ref", V: r.Ref()},
 			{K: "created", V: stamp(r.CreatedAt)},
-			{K: "hub", V: c.Base()},
 		},
-		Next: []string{"cozy " + kind + " search"},
-	})
+	}
+	if kind == "model" {
+		rec.Next = []string{"cozy model download " + r.Ref()}
+	}
+	return emit(ctx, rec)
 }

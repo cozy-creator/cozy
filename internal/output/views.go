@@ -23,45 +23,21 @@ type Field struct {
 }
 
 type Record struct {
-	Kind   string
-	Fields []Field
-	Notes  []string
-	Next   []string
+	Fields    []Field
+	AllFields []Field
+	Notes     []string
+	Next      []string
 }
 
 type List struct {
-	Kind       string
+	Name       string
 	Fields     []string
 	AllFields  []string
-	AllRows    bool
 	Rows       []map[string]string
+	Total      int
 	Aggregates []Field
-	Empty      string
 	Notes      []string
 	Next       []string
-}
-
-type ListData struct {
-	Fields     []string            `json:"fields"`
-	Rows       []map[string]string `json:"rows"`
-	Count      int                 `json:"count"`
-	Omitted    int                 `json:"omitted,omitempty"`
-	Empty      string              `json:"empty,omitempty"`
-	Aggregates map[string]any      `json:"aggregates,omitempty"`
-}
-
-func (r Record) WithDefaultNext(next []string) Document {
-	if len(r.Next) == 0 {
-		r.Next = trimNext(next)
-	}
-	return r
-}
-
-func (l List) WithDefaultNext(next []string) Document {
-	if len(l.Next) == 0 {
-		l.Next = trimNext(next)
-	}
-	return l
 }
 
 func (r Record) Emit(w io.Writer, mode Mode) error {
@@ -73,55 +49,88 @@ func (r Record) Emit(w io.Writer, mode Mode) error {
 	if err != nil {
 		return err
 	}
-	result := Success(r.Kind, data)
-	result.Notes, result.Next = r.Notes, trimNext(r.Next)
-	return Write(w, result, mode)
+	if len(r.Notes) > 0 {
+		data["notes"] = copyStrings(r.Notes)
+	}
+	if next := trimNext(r.Next); len(next) > 0 {
+		data["next"] = next
+	}
+	return Write(w, data, mode)
 }
 
 func (l List) Emit(w io.Writer, mode Mode) error {
+	if strings.TrimSpace(l.Name) == "" {
+		return fmt.Errorf("output list name is required")
+	}
 	columns, err := l.Columns(mode)
 	if err != nil {
 		return err
 	}
 	shown := l.Rows
-	if !mode.Full && !l.AllRows && len(shown) > rowCap {
+	if !mode.Full && len(shown) > rowCap {
 		shown = shown[:rowCap]
 	}
-	rows := make([]map[string]string, 0, len(shown))
-	for _, source := range shown {
-		row := make(map[string]string, len(columns))
-		for _, column := range columns {
-			row[column] = Elide(source[column], cellCap, mode.Full)
+	document := map[string]any{}
+	if len(columns) == 1 {
+		values := make([]string, 0, len(shown))
+		for _, source := range shown {
+			values = append(values, Elide(source[columns[0]], cellCap, mode.Full))
 		}
-		rows = append(rows, row)
-	}
-	aggregates, err := fieldMap(l.Aggregates, mode.Full)
-	if err != nil {
-		return err
-	}
-	empty := ""
-	if len(l.Rows) == 0 {
-		empty = l.Empty
-		if empty == "" {
-			empty = "No " + l.Kind + "."
+		document[l.Name] = values
+	} else {
+		rows := make([]map[string]string, 0, len(shown))
+		for _, source := range shown {
+			row := make(map[string]string, len(columns))
+			for _, column := range columns {
+				row[column] = Elide(source[column], cellCap, mode.Full)
+			}
+			rows = append(rows, row)
 		}
+		document[l.Name] = rows
 	}
-	data := ListData{
-		Fields: copyStrings(columns), Rows: rows, Count: len(l.Rows),
-		Omitted: len(l.Rows) - len(rows), Empty: empty, Aggregates: aggregates,
+	total := l.Total
+	if total < len(l.Rows) {
+		total = len(l.Rows)
 	}
-	result := Success(l.Kind, data)
-	result.Notes, result.Next = l.Notes, trimNext(l.Next)
-	return Write(w, result, mode)
+	if omitted := total - len(shown); omitted > 0 {
+		document["omitted"] = omitted
+	}
+	for _, aggregate := range l.Aggregates {
+		if aggregate.K == l.Name || aggregate.K == "count" || aggregate.K == "results" {
+			continue
+		}
+		if _, exists := document[aggregate.K]; exists {
+			return fmt.Errorf("output field %q occurs twice", aggregate.K)
+		}
+		value := aggregate.V
+		if text, ok := value.(string); ok {
+			value = Elide(text, fieldCap, mode.Full)
+		}
+		document[aggregate.K] = value
+	}
+	if len(l.Notes) > 0 {
+		document["notes"] = copyStrings(l.Notes)
+	}
+	if next := trimNext(l.Next); len(next) > 0 {
+		document["next"] = next
+	}
+	return Write(w, document, mode)
 }
 
 func (r Record) selected(mode Mode) ([]Field, error) {
+	available := r.AllFields
+	if len(available) == 0 {
+		available = r.Fields
+	}
 	if len(mode.Fields) == 0 {
+		if mode.Full {
+			return available, nil
+		}
 		return r.Fields, nil
 	}
-	have := make(map[string]Field, len(r.Fields))
-	names := make([]string, 0, len(r.Fields))
-	for _, field := range r.Fields {
+	have := make(map[string]Field, len(available))
+	names := make([]string, 0, len(available))
+	for _, field := range available {
 		have[field.K] = field
 		names = append(names, field.K)
 	}
@@ -129,7 +138,7 @@ func (r Record) selected(mode Mode) ([]Field, error) {
 	for _, name := range mode.Fields {
 		field, ok := have[name]
 		if !ok {
-			return nil, NewError(Usage, "output.field_unknown", fmt.Sprintf("unknown field %q for %s", name, r.Kind)).
+			return nil, NewError(Usage, "output.field_unknown", fmt.Sprintf("unknown output field %q", name)).
 				WithRemedy("available fields: " + strings.Join(names, ", "))
 		}
 		selected = append(selected, field)
@@ -147,7 +156,7 @@ func (l List) Columns(mode Mode) ([]string, error) {
 	}
 	for _, field := range mode.Fields {
 		if !contains(l.AllFields, field) {
-			return nil, NewError(Usage, "output.field_unknown", fmt.Sprintf("unknown field %q for %s", field, l.Kind)).
+			return nil, NewError(Usage, "output.field_unknown", fmt.Sprintf("unknown output field %q", field)).
 				WithRemedy("available fields: " + strings.Join(l.AllFields, ", "))
 		}
 	}

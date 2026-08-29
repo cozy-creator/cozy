@@ -31,7 +31,7 @@ type EndpointSearchCmd struct {
 
 func (c *EndpointSearchCmd) Run(r *Runtime) error {
 	return r.call(handleEndpointSearch, c.Query, nil,
-		values("--limit", intText(c.Limit)), []string{"cozy endpoint install <org/name>"}, false)
+		values("--limit", intText(c.Limit)), false)
 }
 
 type EndpointInstallCmd struct {
@@ -53,8 +53,7 @@ func (c *EndpointInstallCmd) Run(r *Runtime) error {
 		"--force", c.Force, "--allow-unsigned", c.AllowUnsigned), values(
 		"--from", c.From, "--dir", c.Dir, "--digest", c.Digest,
 		"--profile", c.Profile, "--major", c.Major, "--grant-ttl", c.GrantTTL,
-		"--device", intText(c.Device), "--reason", c.Reason),
-		[]string{"cozy invoke run <org/endpoint/vN/function>"}, false)
+		"--device", intText(c.Device), "--reason", c.Reason), false)
 }
 
 type EndpointRemoveCmd struct {
@@ -62,13 +61,13 @@ type EndpointRemoveCmd struct {
 }
 
 func (c *EndpointRemoveCmd) Run(r *Runtime) error {
-	return r.call(handleRm, c.Refs, nil, nil, []string{"cozy endpoint list"}, false)
+	return r.call(handleRm, c.Refs, nil, nil, false)
 }
 
 type EndpointListCmd struct{}
 
 func (c *EndpointListCmd) Run(r *Runtime) error {
-	return r.call(handleLs, nil, nil, nil, []string{"cozy endpoint search"}, false)
+	return r.call(handleLs, nil, nil, nil, false)
 }
 
 type EndpointPublishCmd struct {
@@ -80,8 +79,7 @@ type EndpointPublishCmd struct {
 
 func (c *EndpointPublishCmd) Run(r *Runtime) error {
 	return r.call(handleEndpointPublish, []string{c.Ref}, nil, values(
-		"--release", c.Release, "--dir", c.Dir, "--reason", c.Reason),
-		[]string{"cozy endpoint install " + c.Ref + "@" + c.Release}, false)
+		"--release", c.Release, "--dir", c.Dir, "--reason", c.Reason), false)
 }
 
 type ModelCmd struct {
@@ -99,7 +97,7 @@ type ModelSearchCmd struct {
 
 func (c *ModelSearchCmd) Run(r *Runtime) error {
 	return r.call(handleModelSearch, c.Query, nil,
-		values("--limit", intText(c.Limit)), []string{"cozy model download <org/name>"}, false)
+		values("--limit", intText(c.Limit)), false)
 }
 
 type ModelDownloadCmd struct {
@@ -112,7 +110,7 @@ type ModelDownloadCmd struct {
 func (c *ModelDownloadCmd) Run(r *Runtime) error {
 	return r.call(handleModelDownload, []string{c.Ref}, bools(
 		"--dry-run", c.DryRun, "--token-stdin", c.TokenStdin),
-		values("--lane", c.Lane), []string{"cozy model list"}, false)
+		values("--lane", c.Lane), false)
 }
 
 type ModelRemoveCmd struct {
@@ -120,13 +118,13 @@ type ModelRemoveCmd struct {
 }
 
 func (c *ModelRemoveCmd) Run(r *Runtime) error {
-	return r.call(handleModelRemove, c.Refs, nil, nil, []string{"cozy model list"}, false)
+	return r.call(handleModelRemove, c.Refs, nil, nil, false)
 }
 
 type ModelListCmd struct{}
 
 func (c *ModelListCmd) Run(r *Runtime) error {
-	return r.call(handleModelList, nil, nil, nil, []string{"cozy model search"}, false)
+	return r.call(handleModelList, nil, nil, nil, false)
 }
 
 type ModelPublishCmd struct {
@@ -140,7 +138,7 @@ type ModelPublishCmd struct {
 func (c *ModelPublishCmd) Run(r *Runtime) error {
 	return r.call(handleModelPublish, []string{c.Ref, c.Snapshot}, bools(
 		"--dry-run", c.DryRun, "--token-stdin", c.TokenStdin),
-		values("--reason", c.Reason), []string{"cozy model download " + c.Ref}, false)
+		values("--reason", c.Reason), false)
 }
 
 type InvokeCmd struct {
@@ -170,8 +168,7 @@ func (c *InvokeRunCmd) Run(r *Runtime) error {
 		"--stream", c.Stream, "--detach", c.Detach), values(
 		"--out", c.Out, "--timeout", c.Timeout,
 		"--in", c.PayloadFile, "--asset", c.Assets, "--worker", c.Worker,
-		"--idempotency-key", c.IdempotencyKey, "--input", c.Trees, "--org", c.Org),
-		[]string{"cozy invoke list"}, true)
+		"--idempotency-key", c.IdempotencyKey, "--input", c.Trees, "--org", c.Org), true)
 }
 
 type InvokeCancelCmd struct {
@@ -179,8 +176,7 @@ type InvokeCancelCmd struct {
 }
 
 func (c *InvokeCancelCmd) Run(r *Runtime) error {
-	return r.call(handleInvokeCancel, []string{c.ID}, nil, nil,
-		[]string{"cozy invoke list"}, true)
+	return r.call(handleInvokeCancel, []string{c.ID}, nil, nil, true)
 }
 
 type InvokeListCmd struct {
@@ -191,8 +187,7 @@ type InvokeListCmd struct {
 
 func (c *InvokeListCmd) Run(r *Runtime) error {
 	return r.call(handleInvokeList, nil, nil, values(
-		"--state", c.State, "--endpoint", c.Endpoint, "--limit", intText(c.Limit)),
-		[]string{"cozy invoke run <org/endpoint/vN/function>"}, true)
+		"--state", c.State, "--endpoint", c.Endpoint, "--limit", intText(c.Limit)), true)
 }
 
 type RentalCmd struct {
@@ -212,8 +207,7 @@ type RentalNewCmd struct {
 func (c *RentalNewCmd) Run(r *Runtime) error {
 	return r.call(handleRent, []string{c.Endpoint}, nil, values(
 		"--accelerator", c.Accelerator, "--idempotency-key", c.IdempotencyKey,
-		"--timeout", c.Timeout, "--reason", c.Reason),
-		[]string{"cozy rental list"}, true)
+		"--timeout", c.Timeout, "--reason", c.Reason), true)
 }
 
 type RentalEndCmd struct {
@@ -221,26 +215,25 @@ type RentalEndCmd struct {
 }
 
 func (c *RentalEndCmd) Run(r *Runtime) error {
-	return r.call(handleRentRelease, []string{c.ID}, nil, nil,
-		[]string{"cozy rental list"}, true)
+	return r.call(handleRentRelease, []string{c.ID}, nil, nil, true)
 }
 
 type RentalListCmd struct{}
 
 func (c *RentalListCmd) Run(r *Runtime) error {
-	return r.call(handleRentLs, nil, nil, nil, []string{"cozy rental new <endpoint>"}, true)
+	return r.call(handleRentLs, nil, nil, nil, true)
 }
 
 type UnloadCmd struct{}
 
 func (c *UnloadCmd) Run(r *Runtime) error {
-	return r.call(handleUnload, nil, nil, nil, []string{"cozy down"}, false)
+	return r.call(handleUnload, nil, nil, nil, false)
 }
 
 type UpCmd struct{}
 
 func (c *UpCmd) Run(r *Runtime) error {
-	return r.call(handleUp, nil, nil, nil, []string{"cozy down"}, false)
+	return r.call(handleUp, nil, nil, nil, false)
 }
 
 type DownCmd struct {
@@ -248,5 +241,5 @@ type DownCmd struct {
 }
 
 func (c *DownCmd) Run(r *Runtime) error {
-	return r.call(handleDown, nil, bools("--all", c.All), nil, nil, false)
+	return r.call(handleDown, nil, bools("--all", c.All), nil, false)
 }

@@ -77,19 +77,18 @@ func handleJobSubmit(ctx *Context) *exit.Error {
 		return followJob(ctx, c, handle.JobID, began)
 	}
 	fields := []output.Field{
+		{K: "id", V: handle.JobID},
+		{K: "target", V: handle.Endpoint + "/" + handle.Function},
 		{K: "job", V: handle.JobID},
 		{K: "endpoint", V: handle.Endpoint},
 		{K: "function", V: handle.Function},
 		{K: "status", V: handle.Status},
 		{K: "publication", V: handle.Repo},
+		{K: "changed", V: !handle.Replay},
 	}
-	notes := []string{}
-	if handle.Replay {
-		notes = append(notes,
-			"this key was already recorded — the SAME job answered, nothing new started")
-	}
-	return emit(ctx, output.Record{Kind: "job", Fields: fields, Notes: notes,
-		Next: []string{"cozy invoke list " + handle.JobID, "cozy invoke list " + handle.JobID}})
+	rec := compactRecord(fields, "id", "target", "status", "changed")
+	rec.Next = []string{"cozy invoke cancel " + handle.JobID}
+	return emit(ctx, rec)
 }
 
 // parseTrees reads `--input-tree <ref>=<dir>`, the typed input TREES a job's fields hydrate
@@ -232,18 +231,6 @@ func jobFields(state api.JobState, full bool) []output.Field {
 	return fields
 }
 
-func jobNotes(state api.JobState) []string {
-	notes := []string{}
-	if state.Bill == nil {
-		// ABSENT IS ABSENT, and it says WHY — a reader who expected a number needs to
-		// know nothing was measured rather than that the job was free.
-		notes = append(notes,
-			"no cost: this host has no configured local rate, so there is no bill to render "+
-				"(COZY_LOCAL_RATE_MICRO_USD_PER_HOUR)")
-	}
-	return notes
-}
-
 func microUSD(n int64) string {
 	return fmt.Sprintf("$%d.%06d", n/1_000_000, n%1_000_000)
 }
@@ -305,7 +292,15 @@ func followJob(ctx *Context, c *localapi.Client, jobID string, began time.Time) 
 	}
 	fields := append(jobFields(state, true),
 		output.Field{K: "wall_ms", V: time.Since(began).Milliseconds()})
-	rec := output.Record{Kind: "job", Fields: fields, Notes: jobNotes(state)}
+	defaults := []string{"job", "status"}
+	if state.Result != nil {
+		defaults = append(defaults, "result")
+	}
+	if state.Publication != nil {
+		defaults = append(defaults, "publication")
+	}
+	defaults = append(defaults, "wall_ms")
+	rec := compactRecord(fields, defaults...)
 	code := exit.JobTerminal(mapTerminal(status))
 	if code == exit.OK {
 		if state.Publication != nil {
@@ -379,8 +374,8 @@ func handleJobCancel(ctx *Context) *exit.Error {
 	// ALREADY TERMINAL = IDEMPOTENT 0 printing the terminal. A cancel that arrives after
 	// the terminal is late, not wrong.
 	if settled(state.Status) {
-		return emit(ctx, output.Record{Kind: "job", Fields: jobFields(state, false),
-			Notes: []string{"already terminal: `cozy invoke cancel` is idempotent"}})
+		fields := append(jobFields(state, true), output.Field{K: "changed", V: false})
+		return emit(ctx, compactRecord(fields, "job", "status", "changed"))
 	}
 	if e := c.CancelJob(jobID); e != nil {
 		return e
@@ -394,8 +389,8 @@ func handleJobCancel(ctx *Context) *exit.Error {
 	if e != nil {
 		return e
 	}
-	return emit(ctx, output.Record{Kind: "job", Fields: jobFields(final, false),
-		Notes: []string{"the terminal the worker journaled is what settled it, not this request"}})
+	fields := append(jobFields(final, true), output.Field{K: "changed", V: true})
+	return emit(ctx, compactRecord(fields, "job", "status", "changed"))
 }
 
 func settled(status string) bool {

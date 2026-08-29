@@ -118,11 +118,13 @@ func TestEndpointPublishCLI(t *testing.T) {
 	}
 	args := []string{"endpoint", "publish", "cozy/marco", "--release", "1.0.0", "--dir", source,
 		"--reason", "fixture publish"}
-	if code, out := run(args...); code != 0 || !strings.Contains(out, "candidate-cpu") || !strings.Contains(out, "qualified") {
+	if code, out := run(args...); code != 0 || !strings.Contains(out, "status: published") ||
+		!strings.Contains(out, "qualified") || strings.Contains(out, "candidate-cpu") {
 		t.Fatalf("endpoint publish [exit %d]\n%s", code, out)
 	}
 	// Exact replay sends identical declaration bytes and converges without a client journal.
-	if code, out := run(args...); code != 0 || !strings.Contains(out, "true") || !strings.Contains(out, "qualified") {
+	if code, out := run(append(args, "--full")...); code != 0 ||
+		!strings.Contains(out, "candidate-cpu") || !strings.Contains(out, "qualified") {
 		t.Fatalf("endpoint publish replay [exit %d]\n%s", code, out)
 	}
 	lock.Lock()

@@ -44,7 +44,7 @@ func serveController(ctx *Context) *exit.Error {
 
 	// Already running is idempotent 0 printing the live status.
 	if st := service.Probe(ctx.Cfg); st.Up {
-		return emit(ctx, output.Record{Kind: "service", Fields: []output.Field{
+		return emit(ctx, output.Record{Fields: []output.Field{
 			{K: "service", V: "up"}, {K: "address", V: st.Addr},
 			{K: "socket", V: st.Socket}, {K: "pid", V: st.PID}, {K: "since", V: st.Since},
 		}, Notes: []string{"already running: `cozy invoke list` is idempotent"}})

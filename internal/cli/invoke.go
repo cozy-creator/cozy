@@ -174,14 +174,15 @@ func handleRun(ctx *Context) *exit.Error {
 	}
 	submitted := time.Since(began)
 	if ctx.Inv.Bool("--detach") {
-		notes := []string{}
-		if handle.Replay {
-			notes = append(notes, "this idempotency key returned the existing invocation")
-		}
-		return emit(ctx, output.Record{Kind: "invocation", Fields: []output.Field{
+		fields := []output.Field{
 			{K: "id", V: handle.RequestID}, {K: "kind", V: "invocation"},
+			{K: "target", V: target.Endpoint + "/" + target.Function},
 			{K: "status", V: handle.Status}, {K: "attempt", V: handle.Attempt},
-		}, Notes: notes, Next: []string{"cozy invoke list", "cozy invoke cancel " + handle.RequestID}})
+			{K: "changed", V: !handle.Replay},
+		}
+		rec := compactRecord(fields, "id", "target", "status", "changed")
+		rec.Next = []string{"cozy invoke cancel " + handle.RequestID}
+		return emit(ctx, rec)
 	}
 
 	stream := ctx.Inv.Bool("--stream")
@@ -222,8 +223,8 @@ func handleInvokeCancel(ctx *Context) *exit.Error {
 		return problem
 	}
 	if invocationSettled(before.Status) {
-		return emit(ctx, output.Record{Kind: "invocation", Fields: invocationFields(before),
-			Notes: []string{"already terminal: cancellation is idempotent"}})
+		fields := append(invocationFields(before), output.Field{K: "changed", V: false})
+		return emit(ctx, compactRecord(fields, "id", "target", "status", "changed"))
 	}
 	if problem := client.Cancel(id); problem != nil {
 		return problem
@@ -235,8 +236,8 @@ func handleInvokeCancel(ctx *Context) *exit.Error {
 	if problem != nil {
 		return problem
 	}
-	return emit(ctx, output.Record{Kind: "invocation", Fields: invocationFields(after),
-		Notes: []string{"the worker's durable terminal settled cancellation"}})
+	fields := append(invocationFields(after), output.Field{K: "changed", V: true})
+	return emit(ctx, compactRecord(fields, "id", "target", "status", "changed"))
 }
 
 func handleInvokeList(ctx *Context) *exit.Error {
@@ -258,9 +259,8 @@ func handleInvokeList(ctx *Context) *exit.Error {
 	}
 	endpoint := strings.TrimSpace(ctx.Inv.Value("--endpoint"))
 	list := output.List{
-		Kind: "invocation", Fields: []string{"id", "kind", "target", "status"},
+		Name: "invocations", Fields: []string{"id", "kind", "target", "status"},
 		AllFields: []string{"id", "kind", "target", "status", "attempts", "created"},
-		Empty:     "0 invocations",
 	}
 	states := map[string]int{}
 	for _, life := range rows {
@@ -688,7 +688,8 @@ func renderRun(ctx *Context, life api.Lifecycle, terminal *localapi.Event, stopp
 		status = "deadline"
 	}
 	fields := []output.Field{
-		{K: "request", V: life.RequestID},
+		{K: "id", V: life.RequestID},
+		{K: "target", V: life.Endpoint + "/" + life.Function},
 		{K: "endpoint", V: life.Endpoint},
 		{K: "function", V: life.Function},
 		{K: "status", V: life.Status},
@@ -732,7 +733,16 @@ func renderRun(ctx *Context, life api.Lifecycle, terminal *localapi.Event, stopp
 		output.Field{K: "submit_ms", V: submitted.Milliseconds()},
 		output.Field{K: "wall_ms", V: time.Since(began).Milliseconds()})
 
-	rec := output.Record{Kind: "run", Fields: fields, Notes: notes}
+	defaults := []string{"id", "target", "status"}
+	if life.Result != nil {
+		defaults = append(defaults, "result")
+	}
+	if len(saved) > 0 {
+		defaults = append(defaults, "saved")
+	}
+	defaults = append(defaults, "wall_ms")
+	rec := compactRecord(fields, defaults...)
+	rec.Notes = notes
 	code := exit.JobTerminal(mapTerminal(status))
 	if code == exit.OK {
 		if life.Triage != nil {

@@ -1,5 +1,5 @@
-// Package output is the CLI's one result boundary. Commands build one logical
-// document; JSON is an encoding switch, while progress remains on stderr.
+// Package output is the CLI's one result boundary. Commands build domain data;
+// JSON is an encoding switch, while progress remains on stderr.
 package output
 
 import (
@@ -63,54 +63,15 @@ func (e *Error) WithNext(next ...string) *Error {
 	return e
 }
 
-// Result is the sole logical stdout document for both success and failure.
-type Result struct {
-	OK    bool     `json:"ok"`
-	Kind  string   `json:"kind"`
-	Data  any      `json:"data,omitempty"`
-	Error *Error   `json:"error,omitempty"`
-	Notes []string `json:"notes,omitempty"`
-	Next  []string `json:"next,omitempty"`
-}
-
-// Success builds a successful logical document.
-func Success(kind string, data any) Result {
-	return Result{OK: true, Kind: kind, Data: data}
-}
-
-// Failure builds the logical error document written to stdout.
-func Failure(problem *Error) Result {
-	result := Result{Kind: "error", Error: problem}
-	if problem != nil {
-		result.Next = trimNext(problem.Next)
-	}
-	return result
-}
-
-// Document is the small compatibility surface used by command handlers.
+// Document is one domain-shaped success document.
 type Document interface {
 	Emit(io.Writer, Mode) error
-	WithDefaultNext([]string) Document
 }
 
-func (r Result) WithDefaultNext(next []string) Document {
-	if len(r.Next) == 0 {
-		r.Next = trimNext(next)
-	}
-	return r
-}
-
-func (r Result) Emit(w io.Writer, mode Mode) error {
-	return Write(w, r, mode)
-}
-
-// Write emits exactly one logical document. TOON is the default; JSON changes
-// only the encoding. Both formats pass through the same TOON data model first.
-func Write(w io.Writer, result Result, mode Mode) error {
-	if err := result.valid(); err != nil {
-		return err
-	}
-	logical, toonBytes, err := normalize(result)
+// Write emits one logical document. TOON is the default; JSON changes only the
+// encoding. Both formats pass through the same TOON data model first.
+func Write(w io.Writer, document any, mode Mode) error {
+	logical, toonBytes, err := normalize(document)
 	if err != nil {
 		return err
 	}
@@ -128,35 +89,10 @@ func Write(w io.Writer, result Result, mode Mode) error {
 	return err
 }
 
-func (r Result) valid() error {
-	if strings.TrimSpace(r.Kind) == "" {
-		return errors.New("output kind is required")
-	}
-	if r.OK && r.Error != nil {
-		return errors.New("successful output cannot carry an error")
-	}
-	if !r.OK && r.Error == nil {
-		return errors.New("failed output must carry an error")
-	}
-	if r.Error == nil {
-		return nil
-	}
-	if r.Data != nil {
-		return errors.New("failed output cannot carry success data")
-	}
-	if r.Error.Class != Usage && r.Error.Class != Config && r.Error.Class != Operational {
-		return fmt.Errorf("unknown error class %q", r.Error.Class)
-	}
-	if strings.TrimSpace(r.Error.Code) == "" || strings.TrimSpace(r.Error.Message) == "" {
-		return errors.New("error code and message are required")
-	}
-	return nil
-}
-
 // normalize makes the TOON library's JSON-like model authoritative, then uses
 // that same value for JSON. This also honors json tags on domain payloads.
-func normalize(result Result) (any, []byte, error) {
-	encoded, err := json.Marshal(result)
+func normalize(document any) (any, []byte, error) {
+	encoded, err := json.Marshal(document)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -177,9 +113,23 @@ func normalize(result Result) (any, []byte, error) {
 	return logical, toonBytes, nil
 }
 
-// EmitError writes a structured failure to stdout.
+type failure struct {
+	Error *Error   `json:"error"`
+	Next  []string `json:"next,omitempty"`
+}
+
+// EmitError writes one structured failure to stdout.
 func EmitError(w io.Writer, problem *Error, mode Mode) error {
-	return Write(w, Failure(problem), mode)
+	if problem == nil {
+		return errors.New("output error is required")
+	}
+	if problem.Class != Usage && problem.Class != Config && problem.Class != Operational {
+		return fmt.Errorf("unknown error class %q", problem.Class)
+	}
+	if strings.TrimSpace(problem.Code) == "" || strings.TrimSpace(problem.Message) == "" {
+		return errors.New("error code and message are required")
+	}
+	return Write(w, failure{Error: problem, Next: trimNext(problem.Next)}, mode)
 }
 
 // ShellCode projects all detail onto AXI's three shell outcomes.

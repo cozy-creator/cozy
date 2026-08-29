@@ -218,8 +218,9 @@ print(json.dumps({"digest":"sha256:"+hashlib.sha256(evidence).hexdigest(),"lengt
 	}
 	code, output := run("endpoint", "install", "cozy/marco@1.0.0", "--profile", endpointprofile.CU130,
 		"--major", "v1", "--reason", "managed fixture")
-	if code != 0 || !strings.Contains(output, "candidate-local") ||
-		!strings.Contains(output, "no dependency resolution") {
+	if code != 0 || !strings.Contains(output, "status: installed") ||
+		!strings.Contains(output, "profile: "+endpointprofile.CU130) ||
+		strings.Contains(output, "candidate-local") || strings.Contains(output, "dependency resolution") {
 		t.Fatalf("managed install [exit %d]\n%s", code, output)
 	}
 	store, problem := records.Open(layout.DB)
@@ -258,7 +259,7 @@ print(json.dumps({"digest":"sha256:"+hashlib.sha256(evidence).hexdigest(),"lengt
 	}
 	if code, output := run("endpoint", "install", "cozy/marco@1.0.0", "--profile", endpointprofile.CU130,
 		"--major", "v1", "--reason", "managed fixture replay"); code != 0 ||
-		!strings.Contains(output, "already pinned") {
+		!strings.Contains(output, "changed: false") {
 		t.Fatalf("managed install replay [exit %d]\n%s", code, output)
 	}
 	wrongDigest := "sha256:" + strings.Repeat("e", 64)

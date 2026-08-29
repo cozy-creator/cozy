@@ -283,26 +283,26 @@ func handleRent(ctx *Context) *exit.Error {
 	if e != nil {
 		return e
 	}
-	notes := []string{
-		"this host MINTED the owner token and holds it at mode 0600; the hub and the pod hold only its sha256, so neither can dial this pod as you",
-		"rental operation " + operationKey,
-	}
+	notes := []string{"billing continues until `cozy rental end " + ready.ID + "` confirms release"}
 	if replay {
-		notes[1] += " resumed"
+		notes = append(notes, "the existing rental operation resumed")
 	}
-	return emit(ctx, output.Record{Kind: "rental", Fields: []output.Field{
+	fields := []output.Field{
 		{K: "rental", V: ready.ID},
 		{K: "state", V: ready.State},
 		{K: "address", V: ready.Address},
 		{K: "media", V: ready.MediaAddress},
 		{K: "endpoint", V: endpointRef},
 		{K: "accelerator", V: acceleratorModel},
-		// The DIGEST, which is the only rendering a credential has here: it is
-		// comparable against the pod's own without either end printing the value.
-		{K: "owner_token", V: token.Digest()},
-		{K: "pinned_cert", V: l.RentalCert(ready.ID)},
-	}, Notes: notes,
-		Next: []string{"cozy invoke run <org/endpoint/vN/function> --worker " + ready.ID}})
+		{K: "changed", V: !replay}, {K: "operation", V: operationKey}, {K: "replayed", V: replay},
+	}
+	rec := compactRecord(fields, "rental", "state", "endpoint", "accelerator", "changed")
+	rec.Notes = notes
+	rec.Next = []string{
+		"cozy invoke run <org/endpoint/vN/function> --worker " + ready.ID,
+		"cozy rental end " + ready.ID,
+	}
+	return emit(ctx, rec)
 }
 
 func rentalRequestDigest(hubAuthority string, requestBody []byte) string {
@@ -486,7 +486,7 @@ func captureRentalControl(row *records.Rental, seen hub.Rental) {
 }
 
 func handleRentLs(ctx *Context) *exit.Error {
-	l, st, e := rentalStores(ctx)
+	_, st, e := rentalStores(ctx)
 	if e != nil {
 		return e
 	}
@@ -496,34 +496,21 @@ func handleRentLs(ctx *Context) *exit.Error {
 		return e
 	}
 	list := output.List{
-		Kind:      "rentals",
-		Fields:    []string{"rental", "state", "endpoint", "accelerator", "address"},
-		AllFields: []string{"rental", "state", "endpoint", "accelerator", "address", "media", "hub", "owner_token", "rented"},
-		Empty:     "0 rentals on this host",
-		Next:      []string{"cozy rental new <endpoint-ref> --accelerator <model> --reason <why>"},
+		Name:      "rentals",
+		Fields:    []string{"rental", "state", "endpoint", "accelerator"},
+		AllFields: []string{"rental", "state", "endpoint", "accelerator", "address", "media", "hub", "rented"},
+		Next:      []string{"cozy help rental new"},
 	}
-	attached := 0
 	for _, r := range rows {
-		// The token is read only to DIGEST it: a rental whose credential went missing is
-		// worth seeing in the listing, because it is a pod that still costs money and can
-		// no longer be dialled.
-		digest := "unset"
-		if v, e := rental.Token(l, r.ID); e == nil {
-			digest = v.Digest()
-			attached++
-		}
 		list.Rows = append(list.Rows, map[string]string{
 			"rental": r.ID, "state": r.State, "endpoint": r.EndpointRef,
 			"accelerator": r.AcceleratorModel, "address": r.Address,
 			"media": r.MediaAddress, "hub": r.Hub,
-			"owner_token": digest, "rented": stamp(r.RentedAt),
+			"rented": stamp(r.RentedAt),
 		})
 	}
 	if len(list.Rows) > 0 {
-		list.Aggregates = []output.Field{
-			{K: "rentals", V: len(list.Rows)}, {K: "dialable", V: attached},
-		}
-		list.Next = []string{"cozy rental list", "cozy rental end <rental-id>"}
+		list.Next = []string{"cozy rental end " + list.Rows[0]["rental"]}
 	}
 	return emit(ctx, list)
 }
@@ -674,7 +661,7 @@ func (w *releaseWatch) finish(l home.Layout, st *records.Store, operationKey str
 	if !had {
 		notes = []string{note + "; this host held no record of it — already released"}
 	}
-	return emit(w.ctx, output.Record{Kind: "release", Fields: []output.Field{
-		{K: "rental", V: w.id}, {K: "released", V: forgotten},
-	}, Notes: notes, Next: []string{"cozy rental list"}})
+	return emit(w.ctx, output.Record{Fields: []output.Field{
+		{K: "rental", V: w.id}, {K: "state", V: "ended"}, {K: "changed", V: forgotten},
+	}, Notes: notes})
 }

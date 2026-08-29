@@ -604,6 +604,23 @@ def check_render_streams():
     return bad
 
 
+def check_output_shape():
+    """cl-046: success is domain data, never generic renderer metadata."""
+    output = pathlib.Path("internal/output/output.go").read_text()
+    views = pathlib.Path("internal/output/views.go").read_text()
+    bad = []
+    for forbidden in ('json:"ok"', 'json:"kind"', 'json:"data"', "type Result struct", "type ListData struct"):
+        if forbidden in output or forbidden in views:
+            bad.append(f"[output] generic success scaffolding remains: {forbidden!r}")
+    for required in ('document[l.Name] = values', 'document[l.Name] = rows'):
+        if required not in views:
+            bad.append(f"[output] domain list projection missing {required!r}")
+    cli = "\n".join(path.read_text() for path in pathlib.Path("internal/cli").glob("*.go"))
+    if re.search(r"output\.(?:Record|List)\s*\{[^}]*\bKind\s*:", cli, re.S):
+        bad.append("[output] command success still carries a generic kind discriminator")
+    return bad
+
+
 def parse_doc_matrix(path: pathlib.Path):
     rows = []
     for line in path.read_text().splitlines():
@@ -770,7 +787,7 @@ def check_typed_resources():
 
 violations = (check_sources() + check_matrix() + check_manifest() + check_secret_flags()
               + check_contract() + check_video_boundary() + check_embedded() + check_scripts()
-              + check_document_kinds() + check_render_streams()
+              + check_document_kinds() + check_render_streams() + check_output_shape()
               + check_media_contract() + check_typed_resources() + check_web_boundary()
               + check_test_boundary())
 if violations:
@@ -783,7 +800,7 @@ print(
     f"prompt({len(DENY_PROMPT) + len(DENY_PROMPT_CALLS) + 1}) matrix(15 rows) "
     f"env({len(DENY_ENV_CALLS)} calls@{len(ENV_READERS)} programs) store({len(DENY_STORE)}) "
     f"grammar(kong@internal/cli/grammar.go + version {'/'.join(VERSION_SPELLINGS)}) "
-    f"output(one document@{RENDER_SRC}) secret({SECRET_FLAG.pattern} + Reveal@{len(REVEAL_SITES)}) "
+    f"output(domain-shaped, one document@{RENDER_SRC}) secret({SECRET_FLAG.pattern} + Reveal@{len(REVEAL_SITES)}) "
     f"cas(store-path) tensor(tfs@{len(TFS_SITES)}) "
     f"api({len(DENY_COOKIE)} cookie + cors(absolute@{CORS_ABSOLUTE}) + listen@{len(LISTEN_SITES)} programs) "
     f"media-client({len(MEDIA_CONTRACT_FIELDS)} contract fields@{MEDIA_CONTRACT_HOME}) "

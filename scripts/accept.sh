@@ -48,12 +48,14 @@ for command in "endpoint install" "model download" "invoke run" "rental new" "up
 done
 run help invoke run
 check "contextual Kong help works" "$([ "$CODE" = 0 ] && printf '%s' "$OUT" | grep -q 'Usage: cozy invoke run' && echo 1 || echo 0)" "$OUT"
+run endpoint
+check "bare noun group shows focused help" "$([ "$CODE" = 0 ] && printf '%s' "$OUT" | grep -q 'Usage: cozy endpoint <command>' && echo 1 || echo 0)" "$OUT"
 
 run exit
 check "retired exit command refuses instead of aliasing" "$([ "$CODE" = 2 ] && printf '%s' "$OUT" | grep -q 'cli.usage' && echo 1 || echo 0)" "$OUT"
 
 run up --json
-check "up backgrounds the controller and returns the web URL" "$([ "$CODE" = 0 ] && printf '%s' "$OUT" | grep -q '"kind":"up"' && printf '%s' "$OUT" | grep -q '"url":"http://127.0.0.1:' && echo 1 || echo 0)" "$OUT"
+check "up returns only useful controller facts" "$([ "$CODE" = 0 ] && printf '%s' "$OUT" | grep -q '"url":"http://127.0.0.1:' && printf '%s' "$OUT" | grep -q '"changed":true' && ! printf '%s' "$OUT" | grep -Eq '"(ok|kind|data)"' && echo 1 || echo 0)" "$OUT"
 check "up creates no persistent controller log" "$([ ! -e "$COZY_HOME/controller.log" ] && echo 1 || echo 0)" "$COZY_HOME/controller.log"
 
 run down
@@ -61,10 +63,10 @@ check "down stops the explicit controller" "$([ "$CODE" = 0 ] && printf '%s' "$O
 
 run invoke list --json
 check "invoke can auto-start the same controller" "$([ "$CODE" = 0 ] && [ -f "$COZY_HOME/service.lock" ] && [ -f "$COZY_HOME/client.cred" ] && echo 1 || echo 0)" "$OUT"
-check "default JSON result is one successful document" "$(printf '%s' "$OUT" | grep -q '"ok":true' && echo 1 || echo 0)" "$OUT"
+check "JSON success is domain-shaped without renderer scaffolding" "$(printf '%s' "$OUT" | grep -q '"invocations":\[\]' && ! printf '%s' "$OUT" | grep -Eq '"(ok|kind|data|fields|rows|count|aggregates)"' && echo 1 || echo 0)" "$OUT"
 
 run unload
-check "unload preserves the controller and returns idle residency" "$([ "$CODE" = 0 ] && printf '%s' "$OUT" | grep -q 'stopped' && echo 1 || echo 0)" "$OUT"
+check "unload preserves the controller and returns idle residency" "$([ "$CODE" = 0 ] && printf '%s' "$OUT" | grep -q 'workers' && echo 1 || echo 0)" "$OUT"
 
 if [ -n "$ENDPOINT" ] && [ -f "$ENDPOINT" ]; then
   DIGEST="sha256:$(sha256sum "$ENDPOINT" | cut -d' ' -f1)"

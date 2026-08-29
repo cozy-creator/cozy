@@ -285,7 +285,7 @@ func (c *Client) do(ctx context.Context, cl call, out any) *exit.Error {
 		return exit.Named(exit.Credential, "hub.token_missing",
 			"%s %s is a first-party route and no admin token is configured", cl.method, cl.path).
 			WithRemedy("set TENSORHUB_TOKEN to the hub's admin.token; catalog reads need no credential").
-			WithNext("cozy endpoint search", "cozy endpoint search", "cozy model search")
+			WithNext("cozy endpoint search", "cozy model search")
 	}
 
 	var body io.Reader
@@ -305,8 +305,7 @@ func (c *Client) do(ctx context.Context, cl call, out any) *exit.Error {
 	req, err := http.NewRequestWithContext(ctx, cl.method, c.base+cl.path, body)
 	if err != nil {
 		return exit.Usagef("%q is not a usable hub URL: %s", c.base, err).
-			WithRemedy("set TENSORHUB_URL to a base URL, e.g. https://hub.example.com").
-			WithNext("cozy endpoint search")
+			WithRemedy("set TENSORHUB_URL to a base URL, e.g. https://hub.example.com")
 	}
 	req.Header.Set("Accept", "application/json")
 	req.Header.Set("User-Agent", c.agent)
@@ -366,8 +365,7 @@ func (c *Client) do(ctx context.Context, cl call, out any) *exit.Error {
 		if progress != nil && progress.stalled() {
 			return exit.Named(exit.Deadline, "hub.response_stalled",
 				"the hub at %s stopped sending its response body for %s", c.base, Timeout).
-				WithRemedy("retry; if it persists the hub is up but its response stream is stalled").
-				WithNext("cozy endpoint search")
+				WithRemedy("retry; if it persists the hub is up but its response stream is stalled")
 		}
 		return c.transport(err)
 	}
@@ -397,12 +395,10 @@ func (c *Client) transport(err error) *exit.Error {
 	if errors.Is(err, context.DeadlineExceeded) || strings.Contains(err.Error(), "Client.Timeout") ||
 		(errors.As(err, &netErr) && netErr.Timeout()) {
 		return exit.New(exit.Deadline, "the hub at %s did not answer within %s", c.base, Timeout).
-			WithRemedy("retry; if it persists the hub is up but not serving").
-			WithNext("cozy endpoint search")
+			WithRemedy("retry; if it persists the hub is up but not serving")
 	}
 	return exit.Unavailablef("the hub at %s is unreachable: %s", c.base, unwrapURL(err)).
-		WithRemedy("check TENSORHUB_URL and that the hub is running").
-		WithNext("cozy endpoint search")
+		WithRemedy("check TENSORHUB_URL and that the hub is running")
 }
 
 // unwrapURL strips net/http's URL wrapper so the message names the cause, not the

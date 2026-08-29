@@ -44,7 +44,6 @@ type Context struct {
 	Err     io.Writer
 	Cfg     config.Config
 	Service service.State
-	Next    []string
 }
 
 func (c *Context) Mode() output.Mode { return c.Inv.Mode }
@@ -60,14 +59,14 @@ type Runtime struct {
 }
 
 func (r *Runtime) call(h handler, args []string, flags map[string]bool,
-	values map[string][]string, next []string, controller bool,
+	values map[string][]string, controller bool,
 ) error {
 	ctx := &Context{
 		Inv: &Invocation{
 			Args: append([]string(nil), args...), Bools: flags,
 			Values: values, Mode: r.Mode,
 		},
-		Out: r.Out, Err: r.Err, Cfg: r.Cfg, Next: next,
+		Out: r.Out, Err: r.Err, Cfg: r.Cfg,
 	}
 	if controller {
 		state, _, problem := ensureController(ctx)
@@ -116,7 +115,7 @@ func Run(args []string, stdout, stderr io.Writer) int {
 	}
 	if err != nil {
 		problem := output.NewError(output.Usage, "cli.usage", err.Error()).
-			WithNext(helpFor(parsed))
+			WithNext(helpFor(parsed, args))
 		_ = output.EmitError(stdout, problem, mode)
 		return output.ShellCode(problem)
 	}
@@ -157,6 +156,12 @@ func helpArgs(args []string) []string {
 	if len(args) == 0 {
 		return []string{"--help"}
 	}
+	if len(args) == 1 {
+		switch args[0] {
+		case "endpoint", "model", "invoke", "rental":
+			return []string{args[0], "--help"}
+		}
+	}
 	if args[0] != "help" {
 		return args
 	}
@@ -167,8 +172,14 @@ func helpArgs(args []string) []string {
 	return append(out, "--help")
 }
 
-func helpFor(ctx *kong.Context) string {
+func helpFor(ctx *kong.Context, args []string) string {
 	if ctx == nil || strings.TrimSpace(ctx.Command()) == "" {
+		if len(args) > 0 {
+			switch args[0] {
+			case "endpoint", "model", "invoke", "rental":
+				return "cozy help " + args[0]
+			}
+		}
 		return "cozy help"
 	}
 	return "cozy help " + strings.ReplaceAll(ctx.Command(), " <", "")

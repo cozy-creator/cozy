@@ -33,6 +33,7 @@ configuration or start a background process.
 
 ```sh
 cozy
+cozy endpoint
 cozy help endpoint install
 cozy help invoke run
 cozy -v
@@ -199,13 +200,25 @@ accepted as command-line values.
 ## Output and automation
 
 Command results and errors are one typed document. TOON is the concise default; `--json` changes
-only the encoding. Progress goes to stderr.
+only the encoding. Success output contains the domain answer without an `ok/kind/data` envelope.
+Progress goes to stderr.
 
 ```sh
+cozy endpoint search
+# endpoints[#3]:
+#   cozy/marco-polo-derived
+#   cozy/marco-polo-cu130
+#   cozy/marco-polo-launch1
+
 cozy endpoint list --fields endpoint,version,disk
 cozy invoke list --json
 cozy model search flux --full
 ```
+
+A one-field list is a scalar collection; multiple selected fields become a compact table. The
+collection length is already its count. `omitted` appears only when a limit withheld rows, and
+diagnostic fields appear only under `--full` or an explicit `--fields` selection. Errors retain
+their stable class, code, message, remedy, and contextual repair action.
 
 Shell exits are intentionally small: `0` success or idempotent no-op, `2` invocation/configuration
 error, and `1` operational failure. The structured error document retains the detailed stable code.

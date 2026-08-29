@@ -21,9 +21,9 @@ import (
 func handleUnload(ctx *Context) *exit.Error {
 	state := service.Probe(ctx.Cfg)
 	if !state.Up {
-		return emit(ctx, output.Record{Kind: "unload", Fields: []output.Field{
-			{K: "stopped", V: 0}, {K: "released", V: "0B"},
-		}, Notes: []string{"the controller is not running; no local Runtime worker holds GPU memory"}})
+		return emit(ctx, output.Record{Fields: []output.Field{
+			{K: "stopped", V: 0}, {K: "released", V: "0B"}, {K: "changed", V: false},
+		}})
 	}
 	ctx.Service = state
 	client, problem := dial(ctx)
@@ -35,10 +35,8 @@ func handleUnload(ctx *Context) *exit.Error {
 		return problem
 	}
 	list := output.List{
-		Kind: "unload", Fields: []string{"instance", "endpoint", "devices"},
+		Name: "workers", Fields: []string{"endpoint", "devices"},
 		AllFields: []string{"instance", "endpoint", "release", "devices"},
-		Empty:     "0 idle local workers unloaded",
-		Notes:     []string{"active work, private rentals, the controller, and installed disk bytes were untouched"},
 	}
 	for _, worker := range result.Stopped {
 		list.Rows = append(list.Rows, map[string]string{
@@ -46,7 +44,7 @@ func handleUnload(ctx *Context) *exit.Error {
 			"release": worker.ReleaseID, "devices": strings.Join(worker.Devices, ","),
 		})
 	}
-	list.Aggregates = []output.Field{{K: "stopped", V: result.Count}}
+	list.Aggregates = []output.Field{{K: "changed", V: result.Count > 0}}
 	return emit(ctx, list)
 }
 
@@ -55,18 +53,12 @@ func handleUp(ctx *Context) *exit.Error {
 	if problem != nil {
 		return problem
 	}
-	notes := []string{
-		"the controller runs in the background; no log stream is attached",
-		"no endpoint or model was loaded into GPU memory",
-	}
-	if !changed {
-		notes = append(notes, "already running: up is idempotent")
-	}
-	return emit(ctx, output.Record{Kind: "up", Fields: []output.Field{
+	fields := []output.Field{
 		{K: "controller", V: "running"}, {K: "url", V: "http://" + state.Addr + "/"},
 		{K: "api", V: "http://" + state.Addr}, {K: "pid", V: state.PID},
 		{K: "since", V: state.Since}, {K: "changed", V: changed},
-	}, Notes: notes})
+	}
+	return emit(ctx, compactRecord(fields, "url", "changed"))
 }
 
 func handleDown(ctx *Context) *exit.Error {
@@ -78,9 +70,9 @@ func handleDown(ctx *Context) *exit.Error {
 			return problem
 		}
 		if len(blockers) == 0 {
-			return emit(ctx, output.Record{Kind: "down", Fields: []output.Field{
-				{K: "controller", V: "stopped"}, {K: "all", V: all},
-			}, Notes: []string{"already stopped: down is idempotent"}})
+			return emit(ctx, output.Record{Fields: []output.Field{
+				{K: "controller", V: "stopped"}, {K: "changed", V: false},
+			}})
 		}
 		if !all {
 			return exit.Named(exit.Conflict, "active_work",
@@ -105,7 +97,7 @@ func handleDown(ctx *Context) *exit.Error {
 		if !result.ShuttingDown {
 			return exit.Internalf("safe down returned without a shutdown decision")
 		}
-		return finishControllerDown(ctx, false, nil)
+		return finishControllerDown(ctx, nil)
 	}
 	return downAll(ctx, client)
 }
@@ -142,7 +134,7 @@ func downAll(ctx *Context, client *localapi.Client) *exit.Error {
 			}
 		}
 		if result.ShuttingDown {
-			return finishControllerDown(ctx, true, []output.Field{
+			return finishControllerDown(ctx, []output.Field{
 				{K: "canceled", V: len(canceled)}, {K: "rentals_ended", V: len(ended)},
 			})
 		}
@@ -273,14 +265,13 @@ func offlineDownBlockers(ctx *Context) ([]string, *exit.Error) {
 	return blockers, nil
 }
 
-func finishControllerDown(ctx *Context, all bool, extra []output.Field) *exit.Error {
+func finishControllerDown(ctx *Context, extra []output.Field) *exit.Error {
 	deadline := time.Now().Add(2 * orchestrator.StopGrace)
 	for time.Now().Before(deadline) {
 		if !service.Probe(ctx.Cfg).Up {
-			fields := []output.Field{{K: "controller", V: "stopped"}, {K: "all", V: all}}
+			fields := []output.Field{{K: "controller", V: "stopped"}, {K: "changed", V: true}}
 			fields = append(fields, extra...)
-			return emit(ctx, output.Record{Kind: "down", Fields: fields,
-				Notes: []string{"the controller and local workers are gone"}})
+			return emit(ctx, output.Record{Fields: fields})
 		}
 		time.Sleep(50 * time.Millisecond)
 	}

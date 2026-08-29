@@ -84,6 +84,7 @@ func handleEndpointPublish(ctx *Context) *exit.Error {
 	sort.Strings(refusalRows)
 	fields := []output.Field{
 		{K: "endpoint", V: ref.String()}, {K: "release", V: done.Release},
+		{K: "status", V: "published"}, {K: "changed", V: begun.State != "committed"},
 		{K: "declaration", V: done.DeclarationDigest}, {K: "created", V: done.Created},
 		{K: "profiles", V: profileRows}, {K: "endpoint_executions", V: len(done.EndpointExecutions)},
 		{K: "uploaded", V: output.Bytes(moved)}, {K: "held", V: output.Bytes(held)},
@@ -95,11 +96,8 @@ func handleEndpointPublish(ctx *Context) *exit.Error {
 	if len(refusalRows) > 0 {
 		fields = append(fields, output.Field{K: "profile_refusals", V: refusalRows})
 	}
-	return emit(ctx, output.Record{Kind: "endpoint publication", Fields: fields, Notes: []string{
-		"the endpoint name was created idempotently when absent",
-		"source/project bytes were published once; Tensorhub derived compatible base worker profiles from package metadata",
-		"no endpoint image, Dockerfile, dependency resolver, native build, or serving-pointer move ran",
-	}, Next: []string{"cozy endpoint install " + ref.String() + "@" + release}})
+	return emit(ctx, compactRecord(fields,
+		"endpoint", "release", "status", "profiles", "uploaded", "changed"))
 }
 
 func shorten(value string, limit int) string {

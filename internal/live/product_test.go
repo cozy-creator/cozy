@@ -47,7 +47,7 @@ func TestControllerWebLifecycle(t *testing.T) {
 	env := childEnv(t, root)
 	results := make(chan cozyResult, 2)
 	for range 2 {
-		go func() { results <- runCozyEnv(env, "up", "--json") }()
+		go func() { results <- runCozyEnv(env, "up", "--json", "--full") }()
 	}
 	first, second := <-results, <-results
 	if first.code != 0 || second.code != 0 {
@@ -56,33 +56,32 @@ func TestControllerWebLifecycle(t *testing.T) {
 	}
 	up := first.output
 	var upDocument struct {
-		OK   bool           `json:"ok"`
-		Kind string         `json:"kind"`
-		Data map[string]any `json:"data"`
+		URL     string `json:"url"`
+		PID     int    `json:"pid"`
+		Changed bool   `json:"changed"`
 	}
 	var secondDocument struct {
-		Data map[string]any `json:"data"`
+		URL     string `json:"url"`
+		PID     int    `json:"pid"`
+		Changed bool   `json:"changed"`
 	}
 	if err := json.Unmarshal([]byte(up), &upDocument); err != nil ||
-		!upDocument.OK || upDocument.Kind != "up" {
+		upDocument.URL == "" || upDocument.PID == 0 {
 		t.Fatalf("up did not start one controller: %v\n%s", err, up)
 	}
 	if err := json.Unmarshal([]byte(second.output), &secondDocument); err != nil ||
-		upDocument.Data["pid"] != secondDocument.Data["pid"] ||
-		upDocument.Data["url"] != secondDocument.Data["url"] {
+		upDocument.PID != secondDocument.PID || upDocument.URL != secondDocument.URL {
 		t.Fatalf("concurrent up returned different controller generations: %v\n%s\n%s",
 			err, first.output, second.output)
 	}
-	firstChanged, firstOK := upDocument.Data["changed"].(bool)
-	secondChanged, secondOK := secondDocument.Data["changed"].(bool)
-	if !firstOK || !secondOK || firstChanged == secondChanged {
+	if upDocument.Changed == secondDocument.Changed {
 		t.Fatalf("concurrent up did not report one winner: first changed=%v second changed=%v\n%s\n%s",
-			upDocument.Data["changed"], secondDocument.Data["changed"], first.output, second.output)
+			upDocument.Changed, secondDocument.Changed, first.output, second.output)
 	}
 	if strings.Contains(strings.ToLower(first.output+second.output), "lock") {
 		t.Fatalf("up exposed its internal singleton mechanism\n%s\n%s", first.output, second.output)
 	}
-	url, _ := upDocument.Data["url"].(string)
+	url := upDocument.URL
 	client := &http.Client{Timeout: 5 * time.Second}
 	response, err := client.Get(url)
 	if err != nil {
@@ -102,11 +101,12 @@ func TestControllerWebLifecycle(t *testing.T) {
 		t.Fatalf("repeated up failed [exit %d]\n%s", code, out)
 	} else {
 		var repeated struct {
-			Data map[string]any `json:"data"`
+			URL     string `json:"url"`
+			PID     int    `json:"pid"`
+			Changed bool   `json:"changed"`
 		}
 		if err := json.Unmarshal([]byte(out), &repeated); err != nil ||
-			repeated.Data["changed"] != false || repeated.Data["url"] != url ||
-			repeated.Data["pid"] != upDocument.Data["pid"] {
+			repeated.Changed || repeated.URL != url || repeated.PID != upDocument.PID {
 			t.Fatalf("repeated up did not return the same healthy controller with changed=false: %v\n%s",
 				err, out)
 		}
@@ -115,13 +115,13 @@ func TestControllerWebLifecycle(t *testing.T) {
 		t.Fatalf("down [exit %d]\n%s", code, out)
 	}
 	if code, out := runCozy(t, root, "invoke", "list", "--json"); code != 0 ||
-		!strings.Contains(out, `"ok":true`) {
+		!strings.Contains(out, `"invocations":[]`) {
 		t.Fatalf("stateful command did not auto-start the controller [exit %d]\n%s", code, out)
 	}
-	if code, out := runCozy(t, root, "unload"); code != 0 || !strings.Contains(out, "stopped") {
+	if code, out := runCozy(t, root, "unload"); code != 0 || !strings.Contains(out, "workers") {
 		t.Fatalf("unload [exit %d]\n%s", code, out)
 	}
-	if code, out := runCozy(t, root, "up"); code != 0 || !strings.Contains(out, "already running") {
+	if code, out := runCozy(t, root, "up"); code != 0 || !strings.Contains(out, "changed: false") {
 		t.Fatalf("unload stopped the controller [exit %d]\n%s", code, out)
 	}
 	if code, out := runCozy(t, root, "down"); code != 0 || !strings.Contains(out, "controller: stopped") {
@@ -240,14 +240,16 @@ func TestProductPath(t *testing.T) {
 		t.Fatalf("invoke list [exit %d]\n%s", code, listed)
 	}
 	var document map[string]any
-	if err := json.Unmarshal([]byte(listed), &document); err != nil || document["ok"] != true {
+	err = json.Unmarshal([]byte(listed), &document)
+	invocations, ok := document["invocations"].([]any)
+	if err != nil || !ok || len(invocations) != 2 {
 		t.Fatalf("invoke list is not one successful JSON document: %v\n%s", err, listed)
 	}
 	if code, out := runCozy(t, root, "invoke", "run", weightlessRef+"/v1/nosuch"); code != 1 || !strings.Contains(out, "not_found") {
 		t.Fatalf("operational refusal was not shell exit 1 with detail [exit %d]\n%s", code, out)
 	}
 
-	if code, out := runCozy(t, root, "unload"); code != 0 || !strings.Contains(out, "stopped") {
+	if code, out := runCozy(t, root, "unload"); code != 0 || !strings.Contains(out, "workers") {
 		t.Fatalf("unload [exit %d]\n%s", code, out)
 	}
 	if code, out := runCozy(t, root, "down"); code != 0 || !strings.Contains(out, "controller: stopped") {
