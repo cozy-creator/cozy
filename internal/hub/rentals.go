@@ -2,14 +2,12 @@ package hub
 
 import (
 	"context"
-	"encoding/hex"
+	"encoding/base64"
 	"encoding/json"
-	"fmt"
 	"net/http"
 	"net/url"
 	"regexp"
 	"strings"
-	"time"
 
 	"github.com/cozy-creator/cozy/internal/exit"
 	"github.com/cozy-creator/cozy/internal/rentalid"
@@ -21,21 +19,20 @@ import (
 // certificate to pin. This client provisions nothing and knows no provider; it asks, it
 // polls, and it releases.
 //
-// THE THIRD PIECE OF THE DIAL TRIPLE IS NOT THE HUB'S TO GIVE (#495e). The RENTER mints
-// the access token and sends only its sha256; the hub stores the hash, provisions the pod
-// with the hash, and has no column, no route and no code path that could hand a token
-// back. That is what makes the hub structurally incapable of authenticating to a pod it
-// rented out. A lost token is not recovered — it is re-minted by rotating the hash set.
+// Creator mints one media bearer and one Ed25519 rental key before the paid ask. Only the
+// bearer hash and public key cross this API. Tensorhub cannot open either pod door: the
+// media bearer stays here and the Creator private key signs ClaimProof/ArtifactDelegation.
 //
 // The contract is the hub's and is consumed verbatim, exactly as the catalog's is:
 //
 //	GET    /v1/rental-skus           -> {skus:[{name, accelerator_model, vram_gb,
 //	                                 price_usd_micros_per_hour}]}
 //	POST   /v1/rentals               {package_ref, sku,
-//	                                 renter_token_sha256:<64 hex>}
+//	                                 media_token_sha256:<64 hex>, creator_public_key}
 //	                                 -> 202 {rental_id, state, ...}
 //	GET    /v1/rentals/{id}          -> {state, worker_address, cert_pem, media_address,
-//	                                     detail, renter_token_sha256:[...],
+//	                                     detail, worker_id, worker_boot_id,
+//	                                     media_token_sha256:[...],
 //	                                     control_snapshot:{digest,length,canonical_bytes}}
 //	POST   /v1/rentals/{id}/worker-observations
 //	                                     -> renter-authenticated deterministic WorkerFrames
@@ -59,8 +56,8 @@ const (
 	RentalReleased         = "released"
 )
 
-// Rental is one rented pod as the hub reports it. There is no token on it, and there is
-// no route that adds one: this host has the token because this host minted it.
+// Rental is one rented pod as the hub reports it. No plaintext media bearer or private
+// Creator key is part of this view.
 type Rental struct {
 	ID               string
 	State            string
@@ -72,11 +69,14 @@ type Rental struct {
 	// MediaAddress is the pod's BYTE PLANE (cl-014, ruled #506b): the co-resident media
 	// server's own listener, which is where an owner uploads a payload and downloads an
 	// output. The hub observed it and names it.
-	MediaAddress string
-	// TokenSHA256 is the pod's LIVE credential set, as hashes. It is here so this host can
+	MediaAddress     string
+	WorkerID         string
+	WorkerBootID     string
+	CreatorPublicKey string
+	// MediaTokenSHA256 is the pod media plane's LIVE credential set, as hashes. It is here so this host can
 	// see that the hash of the token it minted is one the pod was provisioned with —
 	// a comparison neither end can make by saying the token.
-	TokenSHA256 []string
+	MediaTokenSHA256 []string
 	// ControlSnapshot is Tensorhub's exact acquisition-attempt control truth. Its
 	// canonical bytes were persisted before provider Create; Cozy verifies and
 	// stores those same bytes before publishing a remote target.
@@ -94,33 +94,32 @@ type ExactControlDocument struct {
 }
 
 // Ready answers whether this rental carries the whole dial triple and an observed
-// credential set. The caller still checks that set contains ITS token hash; Ready only
+// media credential set. The caller still checks that set contains its bearer hash; Ready only
 // prevents a partial ready projection from being mistaken for a usable pod.
 func (r Rental) Ready() bool {
 	return r.State == RentalReady && r.Address != "" && r.MediaAddress != "" &&
-		r.CertPEM != "" && len(r.TokenSHA256) > 0 && r.ControlSnapshot != nil &&
+		r.CertPEM != "" && r.WorkerID != "" && r.WorkerBootID != "" && r.CreatorPublicKey != "" &&
+		len(r.MediaTokenSHA256) > 0 && r.ControlSnapshot != nil &&
 		r.PlacementRevision > 0
 }
 
 // Attachable answers whether Tensorhub has published the complete, receipt-pinned
 // private control projection. Converging is deliberately not ready: it exists so the
 // renter's RecordOwner can claim the private WorkerControl service and return observed
-// convergence evidence without giving Tensorhub the renter credential or a second live
+// convergence evidence without giving Tensorhub the media bearer or a second live
 // control owner.
 func (r Rental) Attachable() bool {
 	return (r.State == RentalConverging || r.State == RentalReady) &&
 		r.Address != "" && r.MediaAddress != "" && r.CertPEM != "" &&
-		len(r.TokenSHA256) > 0 && r.ControlSnapshot != nil && r.PlacementRevision > 0
+		r.WorkerID != "" && r.WorkerBootID != "" && r.CreatorPublicKey != "" && len(r.MediaTokenSHA256) > 0 &&
+		r.ControlSnapshot != nil && r.PlacementRevision > 0
 }
 
-// HoldsHash answers whether the hub's live set carries this hash — the renter's own
-// check that the pod it is about to dial was provisioned with the token it holds. Both
-// spellings are accepted because both exist: the wire's bare hex and the pod hash file's
-// `sha256:` line are one fact, and a comparison that knew only one would read as a
-// mismatch on the other.
-func (r Rental) HoldsHash(hash string) bool {
+// HoldsMediaHash answers whether the pod media plane's live set carries this hash.
+// Both bare and sha256-prefixed spellings describe the same value.
+func (r Rental) HoldsMediaHash(hash string) bool {
 	bare := strings.TrimPrefix(hash, "sha256:")
-	for _, h := range r.TokenSHA256 {
+	for _, h := range r.MediaTokenSHA256 {
 		if strings.TrimPrefix(h, "sha256:") == bare {
 			return true
 		}
@@ -138,7 +137,10 @@ type wireRental struct {
 	CertPEM           string                `json:"cert_pem"`
 	Detail            string                `json:"detail"`
 	MediaAddress      string                `json:"media_address"`
-	TokenSHA256       []string              `json:"renter_token_sha256"`
+	WorkerID          string                `json:"worker_id"`
+	WorkerBootID      string                `json:"worker_boot_id"`
+	CreatorPublicKey  string                `json:"creator_public_key"`
+	MediaTokenSHA256  []string              `json:"media_token_sha256"`
 	ControlSnapshot   *ExactControlDocument `json:"control_snapshot"`
 	PlacementRevision uint64                `json:"placement_revision"`
 }
@@ -165,7 +167,9 @@ func (w wireRental) rental() Rental {
 		AcceleratorModel: w.AcceleratorModel,
 		Address:          w.WorkerAddress, CertPEM: w.CertPEM,
 		Detail: w.Detail, MediaAddress: w.MediaAddress,
-		TokenSHA256: w.TokenSHA256, ControlSnapshot: w.ControlSnapshot,
+		WorkerID: w.WorkerID, WorkerBootID: w.WorkerBootID,
+		CreatorPublicKey: w.CreatorPublicKey,
+		MediaTokenSHA256: w.MediaTokenSHA256, ControlSnapshot: w.ControlSnapshot,
 		PlacementRevision: w.PlacementRevision,
 	}
 }
@@ -174,23 +178,26 @@ func (w wireRental) rental() Rental {
 // datacenter, offer, image, cache volume, disk, and ports do not have fields
 // here: Tensorhub resolves and selects them.
 type RentalRequest struct {
-	PackageRef        string `json:"package_ref"`
-	SKU               string `json:"sku"`
-	RenterTokenSHA256 string `json:"renter_token_sha256"`
+	PackageRef       string `json:"package_ref"`
+	SKU              string `json:"sku"`
+	MediaTokenSHA256 string `json:"media_token_sha256"`
+	CreatorPublicKey string `json:"creator_public_key"`
 }
 
 // RentalRequestBytes authors the exact bytes persisted before POST and replayed
 // unchanged after response loss. There is one encoder, not a digest struct plus
 // a separately marshaled transport map that can drift.
-func RentalRequestBytes(packageRef, sku, tokenSHA256 string) ([]byte, *exit.Error) {
+func RentalRequestBytes(packageRef, sku, mediaTokenSHA256, creatorPublicKey string) ([]byte, *exit.Error) {
 	req := RentalRequest{
 		PackageRef: strings.TrimSpace(packageRef), SKU: strings.TrimSpace(sku),
-		RenterTokenSHA256: strings.TrimPrefix(strings.TrimSpace(tokenSHA256), "sha256:"),
+		MediaTokenSHA256: strings.TrimPrefix(strings.TrimSpace(mediaTokenSHA256), "sha256:"),
+		CreatorPublicKey: strings.TrimSpace(creatorPublicKey),
 	}
+	public, publicErr := base64.RawURLEncoding.DecodeString(req.CreatorPublicKey)
 	if req.PackageRef == "" || req.SKU == "" ||
-		!bareSHA256Pattern.MatchString(req.RenterTokenSHA256) {
+		!bareSHA256Pattern.MatchString(req.MediaTokenSHA256) || publicErr != nil || len(public) != 32 {
 		return nil, exit.Named(exit.Validation, "rental.intent_incomplete",
-			"package_ref, sku, and one 64-character lowercase renter_token_sha256 are required")
+			"package_ref, sku, media token hash, and one Ed25519 Creator public key are required")
 	}
 	raw, err := json.Marshal(req)
 	if err != nil {
@@ -227,15 +234,14 @@ func (c *Client) RentalSKUs(ctx context.Context) ([]RentalSKU, *exit.Error) {
 	return out, nil
 }
 
-// Rent asks for a pod, presenting the HASH of a token the caller has already minted. It
+// Rent asks for a pod, presenting the media bearer HASH and Creator public key minted before the ask. It
 // returns as soon as the hub has ACCEPTED the ask — provisioning is the hub's work and
 // this client watches it through `Rental`, because a POST that blocked until a pod booted
 // would be a request whose failure mode is a lost id.
 //
-// `tokenSHA256` is the BARE 64 lowercase hex — the spelling the hub's field takes; the
+// `mediaTokenSHA256` is the BARE 64 lowercase hex — the spelling the hub's field takes; the
 // `sha256:` prefix is the token-hash FILE's spelling and belongs to the pod, not the wire.
-// The token itself is not an argument here, in this package, or anywhere on this wire: a
-// hub that was sent a plaintext credential would be a hub that could use it.
+// The bearer itself is not an argument here or anywhere on this wire.
 // Rent retransmits the exact canonical bytes the caller persisted before the
 // paid mutation. The hub authority is bound separately by the local operation
 // digest; a retry against another hub therefore conflicts before this method.
@@ -285,33 +291,6 @@ func (c *Client) Rental(ctx context.Context, id string) (Rental, *exit.Error) {
 	return out.rental(), nil
 }
 
-// ArtifactGrant is one complete, expiring authorization for the immutable subjects
-// Tensorhub selected for a rental. Identity remains in PlacementSet/2; this answer carries
-// only access locations and can therefore be refreshed without changing desired state.
-type ArtifactGrant struct {
-	GrantID       string                  `json:"grant_id"`
-	Subjects      []ArtifactGrantSubject  `json:"subjects"`
-	Locations     []ArtifactGrantLocation `json:"locations"`
-	ExpiresAtUnix uint64                  `json:"expires_at_unix"`
-}
-
-type ArtifactGrantSubject struct {
-	Digest    string `json:"digest"`
-	Kind      string `json:"kind"`
-	Length    uint64 `json:"length"`
-	SubjectID string `json:"subject_id"`
-}
-
-type ArtifactGrantLocation struct {
-	Digest string `json:"digest"`
-	URL    string `json:"url"`
-}
-
-type RentalArtifactGrant struct {
-	GrantRevision uint64        `json:"grant_revision"`
-	Grant         ArtifactGrant `json:"grant"`
-}
-
 // WorkerSessionObservation is the renter RecordOwner's exact evidence relay. The three
 // normal frames are deterministic protobuf encodings of WorkerFrame and must be supplied
 // together with the DesiredWorkerState revision that owner issued. BootFailure is the
@@ -334,10 +313,8 @@ type WorkerSessionObservationResult struct {
 	Detail            string `json:"detail,omitempty"`
 }
 
-// ObserveWorkerSession relays evidence obtained by the renter's already-authenticated
-// WorkerControl stream. WithToken supplies that same rental owner credential to this
-// route; Tensorhub never receives the plaintext through rental creation or readback and
-// never dials the private worker itself.
+// ObserveWorkerSession relays evidence obtained by the Creator-authenticated
+// WorkerControl stream. Tensorhub never dials the private worker itself.
 func (c *Client) ObserveWorkerSession(ctx context.Context, id string,
 	observation WorkerSessionObservation) (WorkerSessionObservationResult, *exit.Error) {
 	var out WorkerSessionObservationResult
@@ -377,110 +354,6 @@ func (c *Client) ObserveWorkerSession(ctx context.Context, id string,
 			out.DesiredRevision, out.AcceptedRevision, out.ConvergedRevision)
 	}
 	return out, nil
-}
-
-const maxArtifactGrantResponseBytes = 64 << 20
-
-// ArtifactGrant asks Tensorhub for fresh, rental-scoped locations using the renter token
-// that already authenticates Claim. The request is deliberately only revision plus TTL:
-// callers cannot choose, omit, or substitute a subject selected by Tensorhub.
-func (c *Client) ArtifactGrant(ctx context.Context, id string, revision uint64,
-	reason string) (RentalArtifactGrant, *exit.Error) {
-	var out RentalArtifactGrant
-	if e := validateRentalID(id); e != nil {
-		return out, e
-	}
-	if revision == 0 {
-		return out, exit.Internalf("rental artifact grant requires a non-zero revision")
-	}
-	var compact struct {
-		Revision      uint64 `json:"revision"`
-		GrantID       string `json:"grant_id"`
-		ExpiresAtUnix uint64 `json:"expires_at_unix"`
-		Artifacts     []struct {
-			Digest    string `json:"digest"`
-			Kind      string `json:"kind"`
-			Length    uint64 `json:"length"`
-			SubjectID string `json:"subject_id"`
-			URL       string `json:"url"`
-		} `json:"artifacts"`
-	}
-	e := c.do(ctx, call{
-		method:        http.MethodPost,
-		path:          "/v1/rentals/" + url.PathEscape(id) + "/artifact-grants/" + fmt.Sprint(revision),
-		auth:          true,
-		reason:        reason,
-		responseBytes: maxArtifactGrantResponseBytes,
-		body:          map[string]any{},
-	}, &compact)
-	if e != nil {
-		return out, e
-	}
-	if compact.Revision != revision {
-		return out, artifactGrantInvalid("answered revision %d for requested revision %d",
-			compact.Revision, revision)
-	}
-	out.GrantRevision = compact.Revision
-	out.Grant.GrantID = compact.GrantID
-	out.Grant.ExpiresAtUnix = compact.ExpiresAtUnix
-	for _, artifact := range compact.Artifacts {
-		out.Grant.Subjects = append(out.Grant.Subjects, ArtifactGrantSubject{
-			Digest: artifact.Digest, Kind: artifact.Kind, Length: artifact.Length,
-			SubjectID: artifact.SubjectID,
-		})
-		out.Grant.Locations = append(out.Grant.Locations, ArtifactGrantLocation{
-			Digest: artifact.Digest, URL: artifact.URL,
-		})
-	}
-	if e := validateArtifactGrant(out.Grant); e != nil {
-		return out, e
-	}
-	return out, nil
-}
-
-func artifactGrantInvalid(format string, args ...any) *exit.Error {
-	return exit.Named(exit.Conflict, "rental.artifact_grant_invalid", format, args...).
-		WithRemedy("release this rental; Cozy will not repair or widen Tensorhub's artifact authority")
-}
-
-func validateArtifactGrant(grant ArtifactGrant) *exit.Error {
-	if grant.GrantID == "" || len(grant.Subjects) == 0 ||
-		grant.ExpiresAtUnix <= uint64(time.Now().Unix()) {
-		return artifactGrantInvalid("the grant header is incomplete or already expired")
-	}
-	locations := make(map[string]string, len(grant.Locations))
-	prior := ""
-	for i, location := range grant.Locations {
-		if !validDigest(location.Digest) || location.URL == "" ||
-			(i > 0 && location.Digest <= prior) {
-			return artifactGrantInvalid("artifact location %d is malformed, duplicated, or unsorted", i)
-		}
-		locations[location.Digest] = location.URL
-		prior = location.Digest
-	}
-	prior = ""
-	for i, subject := range grant.Subjects {
-		if !validDigest(subject.Digest) || subject.SubjectID == "" || subject.Kind == "" ||
-			subject.Length == 0 || (i > 0 && subject.Digest <= prior) {
-			return artifactGrantInvalid("artifact subject %d is malformed, duplicated, or unsorted", i)
-		}
-		if locations[subject.Digest] == "" {
-			return artifactGrantInvalid("artifact subject %s has no acquisition location", subject.Digest)
-		}
-		prior = subject.Digest
-	}
-	if len(locations) != len(grant.Subjects) {
-		return artifactGrantInvalid("the grant has %d subjects and %d locations",
-			len(grant.Subjects), len(locations))
-	}
-	return nil
-}
-
-func validDigest(spelled string) bool {
-	raw := strings.TrimPrefix(spelled, "sha256:")
-	decoded, err := hex.DecodeString(raw)
-	return strings.HasPrefix(spelled, "sha256:") && err == nil && len(decoded) == 32 &&
-		raw == strings.ToLower(raw)
 }
 
 // Release asks the hub to tear the pod down. The hub answers 204 and nothing is decoded;

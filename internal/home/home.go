@@ -52,7 +52,7 @@ type Layout struct {
 	// argv (cl-011's rule), so the handoff is an OS-protected file the Cozy daemon
 	// writes and its own CLI reads.
 	Client string
-	// Rentals holds one rented pod's SECRET MATERIAL: its provisioned owner token (0600)
+	// Rentals holds one rented pod's SECRET MATERIAL: its media bearer (0600)
 	// and the certificate this client pins when it dials (cl-015). The rental's facts —
 	// address, pod id, state — are rows in the one records authority; only what must not
 	// be readable by another user on this host lives out here as files.
@@ -114,17 +114,30 @@ func (l Layout) InputAsset(digest string) string {
 	return filepath.Join(l.Inputs, strings.TrimPrefix(digest, "sha256:"))
 }
 
-// RentalToken is one rental's provisioned owner token, mode 0600. It is deliberately
+// RentalMediaToken is one rental's provisioned media bearer, mode 0600. It is deliberately
 // NOT a row: a credential in the records database would be readable by every reader of
 // that database, and the whole point of the 0600 handoff is that it is not.
-func (l Layout) RentalToken(id string) string { return filepath.Join(l.Rentals, id+".token") }
+func (l Layout) RentalMediaToken(id string) string {
+	return filepath.Join(l.Rentals, id+".media-token")
+}
 
-// PendingRentalToken is the renter-minted token before the hub has answered with a
+// RentalCreatorIdentity is one rental's Ed25519 private key. The worker receives only
+// the public key and verifies signed ClaimProof and ArtifactDelegation documents.
+func (l Layout) RentalCreatorIdentity(id string) string {
+	return filepath.Join(l.Rentals, id+".creator.pem")
+}
+
+// PendingRentalMediaToken is the Creator-minted media bearer before the hub has answered with a
 // rental id. The caller's operation key may contain path separators, so only its digest
 // becomes a filename. The operation row keeps the unhashed key needed on the wire.
-func (l Layout) PendingRentalToken(operationKey string) string {
+func (l Layout) PendingRentalMediaToken(operationKey string) string {
 	sum := sha256.Sum256([]byte(operationKey))
-	return filepath.Join(l.Rentals, "pending-"+hex.EncodeToString(sum[:])+".token")
+	return filepath.Join(l.Rentals, "pending-"+hex.EncodeToString(sum[:])+".media-token")
+}
+
+func (l Layout) PendingRentalCreatorIdentity(operationKey string) string {
+	sum := sha256.Sum256([]byte(operationKey))
+	return filepath.Join(l.Rentals, "pending-"+hex.EncodeToString(sum[:])+".creator.pem")
 }
 
 // RentalCert is the worker certificate this client PINS for one rental. A certificate is

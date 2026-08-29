@@ -3,10 +3,9 @@
 // the orchestrator attaches a remote worker with.
 //
 // The split is deliberate and is the same one cl-006 already made for the CLI's own
-// credential: the FACTS are rows in the records authority (they are durable lifecycle
-// state and every reader may see them), and the OWNER TOKEN is a 0600 file (every reader
-// of the database may NOT). The pinned certificate is public and sits beside it as a file
-// only because that is what crypto/x509 wants to be handed.
+// credential: facts are rows in the records authority; the media bearer and Creator
+// private key are separate 0600 files. The pinned worker certificate is public and sits
+// beside them because crypto/x509 consumes a file.
 package rental
 
 import (
@@ -17,7 +16,6 @@ import (
 	"path/filepath"
 	"runtime"
 
-	"github.com/cozy-creator/cozy/internal/canonical"
 	"github.com/cozy-creator/cozy/internal/exit"
 	"github.com/cozy-creator/cozy/internal/home"
 	"github.com/cozy-creator/cozy/internal/hub"
@@ -28,7 +26,6 @@ import (
 	"github.com/cozy-creator/cozy/internal/remotecontrol"
 	"github.com/cozy-creator/cozy/internal/rentalid"
 	"github.com/cozy-creator/cozy/internal/secret"
-	pb "github.com/cozy-creator/cozy/protocol/cozy/worker/v1"
 )
 
 func validID(id string) *exit.Error {
@@ -44,7 +41,8 @@ func validID(id string) *exit.Error {
 // files land before the row can advertise a dialable target. The pre-POST operation row
 // already names the paid resource, so a crash at any point resumes rather than orphaning
 // a pod or publishing a row whose credential is absent.
-func Attach(l home.Layout, st *records.Store, row records.Rental, cert string, token secret.Value) *exit.Error {
+func Attach(l home.Layout, st *records.Store, row records.Rental, cert string, token secret.Value,
+	creator CreatorIdentity) *exit.Error {
 	if e := validID(row.ID); e != nil {
 		return e
 	}
@@ -70,6 +68,13 @@ func Attach(l home.Layout, st *records.Store, row records.Rental, cert string, t
 					"rental %s changed its pinned certificate before attachment", row.ID)
 			}
 		}
+		if _, err := os.Stat(l.RentalCreatorIdentity(row.ID)); err == nil {
+			existing, problem := loadCreatorIdentity(l.RentalCreatorIdentity(row.ID))
+			if problem != nil || existing.PublicKey() != creator.PublicKey() {
+				return exit.Named(exit.Conflict, "rental.creator_identity_conflict",
+					"rental %s already belongs to another Creator key", row.ID)
+			}
+		}
 	}
 	if err := os.MkdirAll(l.Rentals, 0o700); err != nil {
 		return exit.Internalf("cannot create the rental credential root %s: %s", l.Rentals, err)
@@ -77,7 +82,13 @@ func Attach(l home.Layout, st *records.Store, row records.Rental, cert string, t
 	if err := os.WriteFile(l.RentalCert(row.ID), []byte(cert), 0o644); err != nil {
 		return exit.Internalf("cannot pin the rental's certificate: %s", err)
 	}
-	if e := write0600(l.RentalToken(row.ID), secret.FileBody(token)); e != nil {
+	if e := write0600(l.RentalMediaToken(row.ID), secret.FileBody(token)); e != nil {
+		return e
+	}
+	if len(creator.pem) == 0 {
+		return exit.Internalf("rental %s has no pending Creator identity", row.ID)
+	}
+	if e := write0600(l.RentalCreatorIdentity(row.ID), creator.pem); e != nil {
 		return e
 	}
 	row.CertPath = l.RentalCert(row.ID)
@@ -87,11 +98,11 @@ func Attach(l home.Layout, st *records.Store, row records.Rental, cert string, t
 // PendingToken establishes the plaintext credential BEFORE a paid POST. O_EXCL makes the
 // file the winner under concurrent retries of one operation key: every contender then
 // reads the same token instead of truncating it with fresh entropy.
-func PendingToken(l home.Layout, operationKey string) (secret.Value, *exit.Error) {
+func PendingMediaToken(l home.Layout, operationKey string) (secret.Value, *exit.Error) {
 	if err := os.MkdirAll(l.Rentals, 0o700); err != nil {
 		return secret.Value{}, exit.Internalf("cannot create the rental credential root %s: %s", l.Rentals, err)
 	}
-	path := l.PendingRentalToken(operationKey)
+	path := l.PendingRentalMediaToken(operationKey)
 	f, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
 	if errors.Is(err, os.ErrExist) {
 		return tokenAt(path, "pending rental operation "+operationKey)
@@ -134,7 +145,8 @@ func PendingToken(l home.Layout, operationKey string) (secret.Value, *exit.Error
 // ForgetPending removes the pre-id token only after the operation is attached or proved
 // terminal. An interrupted poll deliberately leaves it for the exact-key retry.
 func ForgetPending(l home.Layout, operationKey string) {
-	_ = os.Remove(l.PendingRentalToken(operationKey))
+	_ = os.Remove(l.PendingRentalMediaToken(operationKey))
+	_ = os.Remove(l.PendingRentalCreatorIdentity(operationKey))
 }
 
 // Forget removes the local half. The pod is the hub's to destroy; this is what stops
@@ -147,27 +159,28 @@ func Forget(l home.Layout, st *records.Store, id string) (bool, *exit.Error) {
 	if e != nil {
 		return false, e
 	}
-	_ = os.Remove(l.RentalToken(id))
+	_ = os.Remove(l.RentalMediaToken(id))
 	_ = os.Remove(l.RentalCert(id))
+	_ = os.Remove(l.RentalCreatorIdentity(id))
 	return forgotten, nil
 }
 
-// Token reads one rental's owner token back, refusing a file whose mode widened. Reading
+// MediaToken reads one rental's media bearer back, refusing a file whose mode widened. Reading
 // a credential that became group- or world-readable would be this client agreeing to a
 // leak it created the file to prevent — cl-006's rule for the CLI credential, and the
 // same one here because it is the same class of file.
-func Token(l home.Layout, id string) (secret.Value, *exit.Error) {
+func MediaToken(l home.Layout, id string) (secret.Value, *exit.Error) {
 	if e := validID(id); e != nil {
 		return secret.Value{}, e
 	}
-	return tokenAt(l.RentalToken(id), "rental "+id)
+	return tokenAt(l.RentalMediaToken(id), "rental "+id+" media plane")
 }
 
 func tokenAt(path, subject string) (secret.Value, *exit.Error) {
 	info, err := os.Stat(path)
 	if err != nil {
 		return secret.Value{}, exit.New(exit.NotFound,
-			"%s has no owner token on this host", subject).
+			"%s has no media bearer on this host", subject).
 			WithRemedy("`cozy rental new` writes it when the pod comes ready; a rental rented elsewhere is not this host's").
 			WithNext("cozy rental list")
 	}
@@ -175,26 +188,26 @@ func tokenAt(path, subject string) (secret.Value, *exit.Error) {
 	// which already scopes COZY_HOME to the user, so the bits are not consulted.
 	if perm := info.Mode().Perm(); perm&0o077 != 0 && runtime.GOOS != "windows" {
 		return secret.Value{}, exit.New(exit.Credential,
-			"%s is mode %#o; a rental's owner token is 0600 or it is not used", path, perm).
+			"%s is mode %#o; a rental media bearer is 0600 or it is not used", path, perm).
 			WithRemedy("release this rental and rent again: every rental provisions its own token").
 			WithNext("cozy rental list")
 	}
 	data, err := os.ReadFile(path)
 	if err != nil {
 		return secret.Value{}, exit.New(exit.Credential,
-			"%s's owner token is unreadable: %s", subject, err)
+			"%s's media bearer is unreadable: %s", subject, err)
 	}
 	v := secret.New(string(data))
 	if !v.Present() {
 		return secret.Value{}, exit.New(exit.Credential,
-			"%s's owner token file is empty", subject).WithNext("cozy rental list")
+			"%s's media bearer file is empty", subject).WithNext("cozy rental list")
 	}
 	return v, nil
 }
 
 // Known is the non-secret target question. The HTTP layer asks it so a submission
 // naming an absent or not-yet-published pod is refused before a request row exists, and
-// so its plan resolves from the exact persisted snapshot. It never reads the owner token.
+// so its plan resolves from the exact persisted snapshot. It never reads the media bearer.
 func Known(st *records.Store) func(string) (*orchestrator.DesiredPlacement, *exit.Error) {
 	return func(id string) (*orchestrator.DesiredPlacement, *exit.Error) {
 		row, e := st.RentalRow(id)
@@ -266,8 +279,8 @@ func noAddress(id, state string) *exit.Error {
 }
 
 // Resolver is what the daemon entrypoint hands the orchestrator as `Options.Rentals`. It
-// is the DIAL-TIME resolution — the one place the owner token is read, at the moment it
-// becomes Claim.proof. It reads the store on EVERY call rather than closing over a
+// is the DIAL-TIME resolution of Creator mTLS identity and media bearer. It reads the
+// store on EVERY call rather than closing over a
 // snapshot: `cozy rental new` is a records-plane act that runs against a daemon already up, so
 // a resolver that cached would refuse the rental the user just made until a restart.
 func Resolver(l home.Layout, st *records.Store) func(string) (*orchestrator.RemoteTarget, *exit.Error) {
@@ -291,9 +304,12 @@ func Resolver(l home.Layout, st *records.Store) func(string) (*orchestrator.Remo
 			return nil, e
 		}
 		facts.Placement.PlacementRevision = row.PlacementRevision
-		token, e := Token(l, id)
+		token, e := MediaToken(l, id)
 		if e != nil {
 			return nil, e
+		}
+		if _, e := loadCreatorIdentity(l.RentalCreatorIdentity(id)); e != nil {
+			return nil, e.WithRemedy("end and re-rent; a lost per-rental Creator key cannot be rotated into the live pod")
 		}
 		cert := row.CertPath
 		if cert == "" {
@@ -306,14 +322,15 @@ func Resolver(l home.Layout, st *records.Store) func(string) (*orchestrator.Remo
 				WithNext("cozy rental end " + id)
 		}
 		spec := &orchestrator.WorkerConnection{
-			RentalID: row.ID, Addr: row.Address, Token: token, CACert: cert,
+			RentalID: row.ID, Addr: row.Address, CACert: cert,
+			WorkerID: row.ExpectedWorkerID, WorkerBootID: row.ExpectedWorkerBootID,
 		}
 		if row.MediaAddress != "" {
 			// ONE PROVISIONED IDENTITY, TWO LISTENERS (#506b, tonight's tier). The pod's
 			// media server holds its OWN keys — cl-014's rule, and this host pins the same
 			// PEM only because the stand-in provisioner mints one certificate covering both
 			// names. What this host never does is MINT anything: the bearer the media plane
-			// checks is the rental's provisioned owner token, whose digest reached the pod
+			// checks is the rental's provisioned media bearer, whose digest reached the pod
 			// as a launch grant from whoever provisioned it.
 			spec.Media = &media.Spec{Addr: row.MediaAddress, Token: token, CACert: cert}
 		}
@@ -321,62 +338,14 @@ func Resolver(l home.Layout, st *records.Store) func(string) (*orchestrator.Remo
 	}
 }
 
-// ArtifactGrants wires the owner-token authenticated Tensorhub route into the RecordOwner.
-// Revision allocation is durable and precedes the request; if the response is lost, the
-// next retry moves forward rather than emitting an update the worker has already applied.
-func ArtifactGrants(st *records.Store, client *hub.Client) orchestrator.ArtifactGrantSource {
-	return func(ctx context.Context, connection *orchestrator.WorkerConnection) (
-		uint64, *pb.ArtifactGrant, *exit.Error) {
-		if connection == nil || connection.RentalID == "" || !connection.Token.Present() {
-			return 0, nil, exit.Named(exit.Credential, "rental.artifact_grant_authority_missing",
-				"the connected worker has no rental identity or owner token")
-		}
-		revision, problem := st.ReserveArtifactGrantRevision(connection.RentalID)
-		if problem != nil {
-			return 0, nil, problem
-		}
-		answer, problem := client.WithToken(connection.Token, "rental owner token").ArtifactGrant(
-			ctx, connection.RentalID, revision, "cozy RecordOwner artifact grant")
-		if problem != nil {
-			return 0, nil, problem
-		}
-		grant := &pb.ArtifactGrant{
-			GrantId: answer.Grant.GrantID, ExpiresAtUnix: answer.Grant.ExpiresAtUnix,
-		}
-		for _, subject := range answer.Grant.Subjects {
-			digest, err := canonical.Raw(subject.Digest)
-			if err != nil {
-				return 0, nil, exit.Named(exit.Conflict, "rental.artifact_grant_invalid",
-					"Tensorhub returned malformed artifact digest %q", subject.Digest)
-			}
-			grant.Subjects = append(grant.Subjects, &pb.ArtifactSubject{
-				Digest: digest, SubjectId: subject.SubjectID, Kind: subject.Kind, Length: subject.Length,
-			})
-		}
-		for _, location := range answer.Grant.Locations {
-			digest, err := canonical.Raw(location.Digest)
-			if err != nil {
-				return 0, nil, exit.Named(exit.Conflict, "rental.artifact_grant_invalid",
-					"Tensorhub returned malformed artifact-location digest %q", location.Digest)
-			}
-			grant.Locations = append(grant.Locations, &pb.ArtifactLocation{
-				Digest: digest, Url: location.URL,
-			})
-		}
-		return revision, grant, nil
-	}
-}
-
-// RelayWorkerSession is the private-rental observation seam. The plaintext renter token
-// already used as Claim.proof authenticates this HTTP call, but it is never persisted in
-// Tensorhub and Tensorhub never dials WorkerControl. A ready answer advances the local
-// rental row so request creation and dispatch remain closed until both authorities agree.
+// RelayWorkerSession is the private-rental observation seam. The ordinary authenticated
+// Hub client carries account authority; the media bearer opens only the pod media plane.
 func RelayWorkerSession(st *records.Store, client *hub.Client) orchestrator.RentalSessionRelay {
 	return func(ctx context.Context, connection *orchestrator.WorkerConnection,
 		evidence orchestrator.RentalSessionEvidence) *exit.Error {
-		if connection == nil || connection.RentalID == "" || !connection.Token.Present() {
+		if connection == nil || connection.RentalID == "" {
 			return exit.Named(exit.Credential, "rental.worker_observation_authority_missing",
-				"the connected worker has no rental identity or owner token")
+				"the connected worker has no rental identity")
 		}
 		row, problem := st.RentalRow(connection.RentalID)
 		if problem != nil {
@@ -390,7 +359,7 @@ func RelayWorkerSession(st *records.Store, client *hub.Client) orchestrator.Rent
 				"rental %s belongs to %s, configured hub is %s",
 				row.ID, row.Hub, client.Base())
 		}
-		answer, problem := client.WithToken(connection.Token, "rental owner token").ObserveWorkerSession(
+		answer, problem := client.ObserveWorkerSession(
 			ctx, connection.RentalID, hub.WorkerSessionObservation{
 				ClaimAck: evidence.ClaimAck, Snapshot: evidence.Snapshot,
 				ObservedState: evidence.ObservedState, BootFailure: evidence.BootFailure,
@@ -427,7 +396,7 @@ func ObserveWorker(st *records.Store) func(orchestrator.RentalObservation) *exit
 	return func(observed orchestrator.RentalObservation) *exit.Error {
 		return st.ObserveRentalWorker(observed.RentalID, observed.Accelerator,
 			observed.Backend, observed.DriverVersion, observed.BackendVersion,
-			observed.DeviceMemoryTotalBytes, observed.WorkerInstance,
+			observed.DeviceMemoryTotalBytes, observed.WorkerInstance, observed.WorkerID,
 			observed.WorkerBootID, observed.DeviceCount)
 	}
 }

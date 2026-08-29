@@ -109,7 +109,7 @@ func handleRent(ctx *Context) *exit.Error {
 	}
 
 	// THE DURABLE MINT, BEFORE THE ASK. O_EXCL makes concurrent same-key callers read one
-	// token, and the operation row makes a lost HTTP response resumable. Only the token's
+	// media bearer and Creator key; the operation row makes a lost HTTP response resumable.
 	// hash crosses the wire.
 	existing, e := st.RentalOperation(operationKey)
 	if e != nil {
@@ -127,16 +127,23 @@ func handleRent(ctx *Context) *exit.Error {
 			WithNext("cozy rental end " + existing.RentalID)
 	}
 	var token secret.Value
+	var creator rental.CreatorIdentity
 	if existing != nil && existing.State == "attached" && existing.RentalID != "" {
-		token, e = rental.Token(l, existing.RentalID)
+		token, e = rental.MediaToken(l, existing.RentalID)
+		if e == nil {
+			creator, e = rental.CreatorIdentityFor(l, existing.RentalID)
+		}
 	} else {
-		token, e = rental.PendingToken(l, operationKey)
+		token, e = rental.PendingMediaToken(l, operationKey)
+		if e == nil {
+			creator, e = rental.PendingCreatorIdentity(l, operationKey)
+		}
 	}
 	if e != nil {
 		return e
 	}
 	tokenHash := secret.HashHex(token)
-	requestBody, e := hub.RentalRequestBytes(packageRef, skuName, tokenHash)
+	requestBody, e := hub.RentalRequestBytes(packageRef, skuName, tokenHash, creator.PublicKey())
 	if e != nil {
 		return e
 	}
@@ -151,7 +158,7 @@ func handleRent(ctx *Context) *exit.Error {
 	if op.RequestDigest != digest || op.Hub != c.Base() || !bytes.Equal(op.RequestBody, requestBody) {
 		return exit.Named(exit.Conflict, "rental.idempotency_conflict",
 			"rental operation %s already names a different hub or request body", operationKey).
-			WithRemedy("reuse a key only for the exact same hub, package, Cozy GPU SKU, and renter token")
+			WithRemedy("reuse a key only for the exact same hub, package, GPU SKU, media token, and Creator key")
 	}
 	if !replay {
 		fmt.Fprintf(ctx.Err, "  rental operation %s persisted; reuse this key to resume\n", operationKey)
@@ -197,6 +204,7 @@ func handleRent(ctx *Context) *exit.Error {
 	observe := func(seen hub.Rental) *exit.Error {
 		row.Address, row.State = seen.Address, seen.State
 		row.MediaAddress = seen.MediaAddress
+		row.ExpectedWorkerID, row.ExpectedWorkerBootID = seen.WorkerID, seen.WorkerBootID
 		if e := captureRentalControl(&row, seen); e != nil {
 			return e
 		}
@@ -223,10 +231,11 @@ func handleRent(ctx *Context) *exit.Error {
 	}
 	row.Address, row.State = attachable.Address, attachable.State
 	row.MediaAddress = attachable.MediaAddress
+	row.ExpectedWorkerID, row.ExpectedWorkerBootID = attachable.WorkerID, attachable.WorkerBootID
 	if e := captureRentalControl(&row, attachable); e != nil {
 		return e
 	}
-	if !attachable.HoldsHash(secret.HashHex(token)) {
+	if !attachable.HoldsMediaHash(secret.HashHex(token)) {
 		// The pod was provisioned with a credential set this host's token is not in, so
 		// dialling it would 401 and look like a network fault. The hub says which hashes
 		// are live; neither end has to say a token to find this out.
@@ -235,7 +244,12 @@ func handleRent(ctx *Context) *exit.Error {
 			WithRemedy("release it and rent again; a pod nobody can authenticate to still costs money").
 			WithNext("cozy rental end " + attachable.ID)
 	}
-	if e := rental.Attach(l, st, row, attachable.CertPEM, token); e != nil {
+	if attachable.CreatorPublicKey != creator.PublicKey() {
+		return exit.Named(exit.Conflict, "rental.creator_key_changed",
+			"rental %s did not retain the Creator key sent at create", attachable.ID).
+			WithRemedy("release it; this host will not sign for a rental bound to another key")
+	}
+	if e := rental.Attach(l, st, row, attachable.CertPEM, token, creator); e != nil {
 		return e
 	}
 	row.CertPath = l.RentalCert(attachable.ID)
@@ -280,7 +294,7 @@ func handleRent(ctx *Context) *exit.Error {
 		}
 		return nil
 	}
-	ready, e := waitRental(ctx, c.WithToken(token, "rental owner token"), attachable.ID,
+	ready, e := waitRental(ctx, c, attachable.ID,
 		deadline, observeConvergence, func(r hub.Rental) bool { return r.Ready() })
 	if e != nil {
 		return e
@@ -432,9 +446,12 @@ func waitRental(ctx *Context, c *hub.Client, id string, deadline time.Time,
 func sameAttachProjection(attached, seen hub.Rental, tokenHash string) *exit.Error {
 	if !seen.Attachable() || attached.ID != seen.ID || attached.Address != seen.Address ||
 		attached.MediaAddress != seen.MediaAddress || attached.CertPEM != seen.CertPEM ||
+		attached.WorkerID != seen.WorkerID || attached.WorkerBootID != seen.WorkerBootID ||
+		attached.CreatorPublicKey != seen.CreatorPublicKey ||
 		attached.PackageRef != seen.PackageRef || attached.AcceleratorModel != seen.AcceleratorModel ||
 		attached.PlacementRevision != seen.PlacementRevision ||
-		!seen.HoldsHash(tokenHash) || !sameHashSet(attached.TokenSHA256, seen.TokenSHA256) ||
+		!seen.HoldsMediaHash(tokenHash) ||
+		!sameHashSet(attached.MediaTokenSHA256, seen.MediaTokenSHA256) ||
 		attached.ControlSnapshot == nil || seen.ControlSnapshot == nil ||
 		attached.ControlSnapshot.Digest != seen.ControlSnapshot.Digest ||
 		attached.ControlSnapshot.Length != seen.ControlSnapshot.Length ||
@@ -492,8 +509,14 @@ func missingOf(r hub.Rental) string {
 	if r.CertPEM == "" {
 		return "certificate to pin"
 	}
-	if len(r.TokenSHA256) == 0 {
-		return "observed renter-token hash set"
+	if len(r.MediaTokenSHA256) == 0 {
+		return "observed media-token hash set"
+	}
+	if r.WorkerID == "" || r.WorkerBootID == "" {
+		return "worker and boot identity"
+	}
+	if r.CreatorPublicKey == "" {
+		return "Creator public key"
 	}
 	if r.ControlSnapshot == nil {
 		return "attempt-bound control snapshot"
@@ -713,7 +736,7 @@ func (w *releaseWatch) finish(l home.Layout, st *records.Store, operationKey str
 	if operationKey != "" {
 		rental.ForgetPending(l, operationKey)
 	}
-	notes := []string{note + "; its owner token and pinned certificate are gone from this host"}
+	notes := []string{note + "; its media bearer, Creator key, and pinned certificate are gone from this host"}
 	if !had {
 		notes = []string{note + "; this host held no record of it — already released"}
 	}

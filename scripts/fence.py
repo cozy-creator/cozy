@@ -110,7 +110,7 @@ REVEAL_SITES = {
     # worker as `Claim.proof` — the exact dual of the old metadata echo, and the only
     # place the value leaves this process (over the worker's own channel).
     "internal/orchestrator/owner.go",
-    # The byte plane's (#506b): the rental's owner token becomes the Authorization
+    # The byte plane's (#506b): the rental's media bearer becomes the Authorization
     # header for the POD's media server. Same rule as hub/hub.go one plane over — one
     # request builder, and the raw value is read exactly where it becomes a carrier.
     "internal/media/media.go",
@@ -150,8 +150,8 @@ LISTEN_CALL = re.compile(r"net\.Listen\w*\s*\(")
 # health handshake refuses skew before this client moves bytes.
 MEDIA_CONTRACT_HOME = "internal/mediawire/wire.go"
 MEDIA_CONTRACT_FIELDS = ["contract_rev"]
-# Package distribution is the standing ArtifactGrant lane. The invocation media plane
-# may never grow back the retired owner-push special case for binding plans.
+# Package distribution is the worker's signed-intent Tensorhub lane. The invocation
+# media plane may never grow back the retired owner-push special case for binding plans.
 MEDIA_DISTRIBUTION_DIRS = ("internal/media/",)
 DENY_MEDIA_DISTRIBUTION = ("PutPlan", "/v1/plans/")
 
@@ -442,8 +442,8 @@ def check_sources():
                 for retired in DENY_MEDIA_DISTRIBUTION:
                     if retired in s:
                         bad.append(f"{p}:{i}: [media] retired package-distribution surface "
-                                   f"'{retired}' — plans are ordinary ArtifactGrant subjects, "
-                                   f"and this plane carries invocation inputs/outputs only: {s}")
+                                   f"'{retired}' — the worker resolves signed package intent "
+                                   f"directly, and this plane carries invocation inputs/outputs only: {s}")
         if p.suffix != ".go":
             continue
         for i, line in enumerate(strip_go(raw).splitlines(), 1):

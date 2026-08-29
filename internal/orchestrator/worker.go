@@ -10,7 +10,6 @@ import (
 	"sort"
 	"strconv"
 	"strings"
-	"sync"
 	"syscall"
 	"time"
 
@@ -50,9 +49,8 @@ type Binding struct {
 
 // BindingPlanSubject is the wire identity of one canonical plan document.
 // Runtime-owned and remote plans both carry identity only. Local Runtime stages its
-// private plan; a rented worker obtains the exact bytes as an ordinary ArtifactGrant
-// subject. Cozy validates remote plan bytes in the control snapshot but never relays
-// them through an alternate byte path.
+// private plan; a rented worker resolves signed package intent directly from Tensorhub.
+// Cozy validates remote plan bytes in the control snapshot but never relays them.
 type BindingPlanSubject struct {
 	SubjectID string `json:"subject_id"`
 	Kind      string `json:"kind"`
@@ -85,7 +83,7 @@ func (b *Binding) PlanID() (string, *exit.Error) {
 func (b *Binding) Staged() (string, []byte, *exit.Error) {
 	if b.RuntimePlan != nil {
 		return "", nil, exit.Named(exit.Structural, "binding_plan_bytes_unavailable",
-			"binding plan %s is materialized by its runtime or standing artifact grant", b.RuntimePlan.SubjectID)
+			"binding plan %s is materialized by its runtime or direct worker acquisition", b.RuntimePlan.SubjectID)
 	}
 	id, e := b.PlanID()
 	if e != nil {
@@ -190,17 +188,15 @@ type DesiredPlacement struct {
 	Jobs []*JobPlan `json:"jobs,omitempty"`
 }
 
-// WorkerConnection is the dial triple for a worker this daemon did not spawn (was
-// RemoteSpec — it describes a CONNECTION, and "remote" was a claim about geography that a
-// loopback pod falsifies). Token is a secret.Value rather than a string so that a spec
-// which is logged, rendered or marshalled prints the credential's DIGEST — there is no
-// formatting verb that leaks it, and its one raw read is the same Claim.proof carrier a
-// spawned worker's bootstrap uses.
+// WorkerConnection is the dial identity for a worker this daemon did not spawn. The
+// worker server certificate is pinned exactly, and Creator signs Claim with the
+// per-rental Ed25519 key whose public half Tensorhub provisioned into the pod.
 type WorkerConnection struct {
-	RentalID string       `json:"rental_id"`
-	Addr     string       `json:"addr"`
-	Token    secret.Value `json:"token"`
-	CACert   string       `json:"ca_cert"` // path to the worker's pinned PEM
+	RentalID     string `json:"rental_id"`
+	Addr         string `json:"addr"`
+	CACert       string `json:"ca_cert"` // path to the worker's pinned PEM
+	WorkerID     string `json:"worker_id"`
+	WorkerBootID string `json:"worker_boot_id"`
 	// Media is the pod's BYTE PLANE (cl-014, ruled #506b): the co-resident media server
 	// this owner uploads inputs and binding records to and downloads outputs from. It is
 	// the pod's own listener with its own keys, not a second use of the control leg —
@@ -235,9 +231,8 @@ type WorkerLaunchSpec struct {
 	// (worker-protocol header): a longer set is a typed refusal at the worker, so this
 	// side names one placement rather than pretending to a generality it cannot deliver.
 	Placement DesiredPlacement `json:"placement"`
-	// Connection attaches an ALREADY-RUNNING worker (a rented pod's TLS leg, cl-015/#445)
-	// instead of spawning one: the owner dials Addr with the cert at CACert pinned and
-	// presents Token as Claim.proof. Nil = the ordinary local spawn.
+	// Connection attaches an ALREADY-RUNNING worker instead of spawning one: the owner
+	// pins CACert and signs Claim with its per-rental key. Nil = the ordinary local spawn.
 	Connection *WorkerConnection `json:"connection,omitempty"`
 }
 
@@ -323,7 +318,6 @@ func (p DesiredPlacement) PlacementID() string {
 }
 
 type worker struct {
-	grantMu    sync.Mutex
 	instanceID string
 	spec       WorkerLaunchSpec
 	cmd        *exec.Cmd
@@ -356,6 +350,7 @@ type worker struct {
 	// not CHANGE under it. Empty for a locally spawned worker, whose identity is this
 	// launcher's by construction.
 	remoteInstance string
+	remoteWorkerID string
 
 	// what the worker itself reported; the orchestrator echoes, never invents
 	exited bool
@@ -425,11 +420,9 @@ type worker struct {
 	// set it issued. The set travels as bytes, so the owner keeps the bytes it authored:
 	// a worker's accepted digest is compared against these, never re-canonicalized.
 	revision             uint64
-	grantRevision        uint64
-	grantID              string
-	grantSubjects        []ArtifactSubjectFacts
-	appliedGrantRevision uint64
-	appliedGrantID       string
+	artifactRevision     uint64
+	delegationID         string
+	authorizationExpires uint64
 	acquisition          PlacementAcquisitionFacts
 	setDigest            []byte
 	setBytes             []byte
@@ -971,7 +964,7 @@ func newWorker(instanceID string, spec WorkerLaunchSpec) *worker {
 // connectWorker registers an ALREADY-RUNNING worker (a rented pod's TLS leg, cl-015):
 // no spawn, no device grant (the pod's card is the pod's), no birth identity — the
 // conversation is the same claim the local path runs, dialed at the rental's address
-// with the pinned cert and the owner token as proof (#445).
+// with the pinned server cert and signed Creator ClaimProof (#445/proto-013).
 // The media plane remains the invocation byte path, but it is NOT a package distribution
 // path. Binding plans are ordinary artifact-grant subjects now: Tensorhub supplies their
 // locations and the worker verifies their digests while materializing PlacementSet/2.
@@ -1251,11 +1244,9 @@ type WorkerFacts struct {
 	AcceptedRevision           uint64                    `json:"accepted_desired_state_revision"`
 	ConvergedRevision          uint64                    `json:"converged_revision"`
 	AcceptedPlacementSetDigest string                    `json:"accepted_placement_set_digest"`
-	GrantID                    string                    `json:"artifact_grant_id"`
-	GrantRevision              uint64                    `json:"artifact_grant_revision"`
-	GrantSubjects              []ArtifactSubjectFacts    `json:"artifact_grant_subjects"`
-	AppliedGrantID             string                    `json:"applied_artifact_grant_id"`
-	AppliedGrantRevision       uint64                    `json:"applied_grant_revision"`
+	ArtifactRevision           uint64                    `json:"artifact_revision"`
+	DelegationID               string                    `json:"artifact_delegation_id"`
+	AuthorizationExpiresAtUnix uint64                    `json:"artifact_authorization_expires_at_unix"`
 	Acquisition                PlacementAcquisitionFacts `json:"acquisition"`
 
 	// QuietMS makes missed protocol reports visible. ErrorForMS is diagnostic history
@@ -1311,14 +1302,13 @@ func factsOf(w *worker) WorkerFacts {
 		AvailableSlots:      w.slots,
 		UnackedOutcomes:     w.unacked,
 
-		DesiredRevision:      w.revision,
-		AcceptedRevision:     w.acceptedRevision,
-		ConvergedRevision:    w.convergedRevision,
-		GrantID:              w.grantID,
-		GrantRevision:        w.grantRevision,
-		AppliedGrantID:       w.appliedGrantID,
-		AppliedGrantRevision: w.appliedGrantRevision,
-		Acquisition:          w.acquisition,
+		DesiredRevision:            w.revision,
+		AcceptedRevision:           w.acceptedRevision,
+		ConvergedRevision:          w.convergedRevision,
+		ArtifactRevision:           w.artifactRevision,
+		DelegationID:               w.delegationID,
+		AuthorizationExpiresAtUnix: w.authorizationExpires,
+		Acquisition:                w.acquisition,
 
 		Fault: w.fault,
 	}
@@ -1328,7 +1318,6 @@ func factsOf(w *worker) WorkerFacts {
 	f.PlacementSpecDigest, _ = canonical.Spell(w.specDigest)
 	f.RetainedFallbackSpecDigest, _ = canonical.Spell(w.fallbackPin)
 	f.AcceptedPlacementSetDigest, _ = canonical.Spell(w.acceptedSetDigest)
-	f.GrantSubjects = append([]ArtifactSubjectFacts(nil), w.grantSubjects...)
 	// THIS OWNER'S OWN VERDICT IS A FACT ABOUT THE WORKER, so it is reported as one — in
 	// its own field. A claim this side refused is the answer a poller of
 	// `/v1/local/workers` needs; without it the only observable was a readiness wait that
@@ -1358,13 +1347,6 @@ type AcquisitionLegFacts struct {
 type PlacementAcquisitionFacts struct {
 	Package AcquisitionLegFacts `json:"package"`
 	Model   AcquisitionLegFacts `json:"model"`
-}
-
-type ArtifactSubjectFacts struct {
-	Digest    string `json:"digest"`
-	SubjectID string `json:"subject_id"`
-	Kind      string `json:"kind"`
-	Length    uint64 `json:"length"`
 }
 
 // trimEnum renders a protocol enum by its own name, minus the type prefix proto3's

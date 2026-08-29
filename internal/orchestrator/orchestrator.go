@@ -61,10 +61,11 @@ type Options struct {
 	// RecordRentalRefusal persists this owner's non-transient verdict on a private worker
 	// before the control stream closes. Without it a rejected ClaimAck exists only in RAM.
 	RecordRentalRefusal func(rentalID string, problem *exit.Error) *exit.Error
-	// ArtifactGrants obtains the next durable, rental-scoped access revision. It is
-	// called only after the worker snapshot barrier is acknowledged. The source owns
-	// revision persistence and authentication; the orchestrator only relays the grant.
-	ArtifactGrants ArtifactGrantSource
+	// RentalClaimProof signs the exact worker/boot/TLS leaf Creator is about to claim.
+	RentalClaimProof RentalClaimProofSource
+	// ArtifactDelegations signs the exact logical package/model intent after the worker
+	// snapshot barrier. The worker resolves bytes directly from Tensorhub over mTLS.
+	ArtifactDelegations ArtifactDelegationSource
 	// RelayRentalSession returns authenticated private-worker evidence to Tensorhub.
 	// This RecordOwner remains the only process that dials WorkerControl: the callback
 	// carries deterministic frame bytes over the rental-scoped HTTP authority and never
@@ -83,7 +84,22 @@ type Options struct {
 	MaxOutputMiB          int64
 }
 
-type ArtifactGrantSource func(context.Context, *WorkerConnection) (uint64, *pb.ArtifactGrant, *exit.Error)
+type ArtifactDelegationRequest struct {
+	WorkerID     string
+	WorkerBootID string
+}
+
+type RentalClaimProofSource func(*WorkerConnection, uint64) ([]byte, *exit.Error)
+
+type ArtifactDelegation struct {
+	CanonicalBytes []byte
+	Signature      []byte
+	DelegationID   string
+	Revision       uint64
+	ExpiresAtUnix  uint64
+}
+
+type ArtifactDelegationSource func(*WorkerConnection, ArtifactDelegationRequest) (ArtifactDelegation, *exit.Error)
 type RentalSessionEvidence struct {
 	ClaimAck        []byte
 	Snapshot        []byte
@@ -103,6 +119,7 @@ type RentalObservation struct {
 	BackendVersion         string
 	DeviceMemoryTotalBytes uint64
 	WorkerInstance         string
+	WorkerID               string
 	WorkerBootID           string
 }
 

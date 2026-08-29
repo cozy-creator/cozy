@@ -138,6 +138,10 @@ func messageFor(name string) proto.Message {
 		return &pb.ArtifactFinalizeDecision{}
 	case "cozy.worker.v1.ArtifactFinalizeResult":
 		return &pb.ArtifactFinalizeResult{}
+	case "cozy.worker.v1.ArtifactDelegation":
+		return &pb.ArtifactDelegation{}
+	case "cozy.worker.v1.ClaimProof":
+		return &pb.ClaimProof{}
 	case "cozy.worker.v1.PlacementSet":
 		return &pb.PlacementSet{}
 	case "cozy.worker.v1.PlacementSpec":
