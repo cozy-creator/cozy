@@ -49,7 +49,7 @@ type EndpointInstall struct {
 	LinkMode     string // "hardlink" | "copy" (cross-mount degradation)
 	Packages     int
 	Closure      string // one "name==version" per line
-	Descriptor   string // exact descriptor_digest, checked in this generation's own venv
+	Descriptor   string // exact digest of the generation-private Runtime-derived descriptor
 	BytesExcl    int64
 	BytesShared  int64
 	CreatedAt    string

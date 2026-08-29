@@ -122,6 +122,13 @@ func walk(root string) ([]entry, *exit.Error) {
 				"%s and %s differ only by case; the wheel must install on a case-insensitive filesystem too", prior, rel)
 		}
 		seen[strings.ToLower(rel)] = rel
+		base := strings.ToLower(path.Base(rel))
+		if base == "endpoint.descriptor.json" || base == "endpoint.release.json" ||
+			base == "endpoint.evaluated-config.json" {
+			return exit.Named(exit.Validation, "endpoint_metadata_retired",
+				"%s is retired generated/publication metadata", rel).
+				WithRemedy("delete it; endpoint.toml is the only author configuration")
+		}
 
 		if ext := strings.ToLower(path.Ext(rel)); compiledExt[ext] {
 			return refuseCompiled(rel)

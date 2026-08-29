@@ -166,12 +166,12 @@ CAS_PATH = re.compile(r'objects\s*[/",\s]+\s*sha256', re.I)
 TFS_SITES = {"internal/config/config.go", "internal/tfs/tfs.go"}
 TFS_FIELD = re.compile(r"\.Tfs\b")
 
-# (cl-010) The two files that may reach an endpoint's own cozy-runtime, and the CLOSED set
-# of verbs they may name. `install.go` runs `describe --check` at install; `artifacts.go`
+# (cl-010) The files that may reach an endpoint's own cozy-runtime, and the CLOSED set
+# of verbs they may name. Publication and install derive the descriptor once; artifacts
 # asks for the artifact index, host facts and fit verdicts. Nothing executes a model
-# through this door — that is what the orchestrator and the worker protocol are for.
+# through these doors — that is what the orchestrator and worker protocol are for.
 RUNTIME_SITES = {"internal/install/install.go", "internal/launch/artifacts.go",
-                 "internal/managedinstall/install.go"}
+                 "internal/managedinstall/install.go", "internal/endpointpublish/package.go"}
 RUNTIME_BIN = re.compile(r'"cozy-runtime"')
 # (cl-028) The INDIRECTIONS to the same binary, which the literal above cannot see:
 # `launch.Binary()` resolves the generation venv's cozy-runtime and `launch.RuntimeCLI{}`
@@ -478,6 +478,8 @@ def check_sources():
             if rel in RUNTIME_SITES:
                 for verb in sorted(RUNTIME_VERBS_DENY):
                     if re.search(r'"' + verb + r'"', src_line):
+                        if rel == "internal/endpointpublish/package.go" and verb == "run" and '"uv"' in src_line:
+                            continue  # uv run selects the locked Runtime; it is not Runtime's run verb
                         bad.append(f"{p}:{i}: [runtime] this file may name only the READ verbs "
                                    f"({', '.join(sorted(RUNTIME_VERBS_OK))}); '{verb}' would be a "
                                    f"second execution door: {src_line.strip()}")

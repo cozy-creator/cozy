@@ -10,12 +10,12 @@ The source directory must be a clean committed Git subtree containing:
 - static project metadata and dependencies in `pyproject.toml`;
 - an exact `uv.lock`;
 - author intent in `endpoint.toml`;
-- a reviewed `endpoint.descriptor.json`; and
 - pure Python project files.
 
 `endpoint.toml` is the only author configuration. `endpoint.release.json` and
-`endpoint.evaluated-config.json` are retired. Native files, build recipes, nested wheels,
-model weights, credentials, symlinks, and unsafe paths refuse.
+`endpoint.evaluated-config.json` are retired, as is committed `endpoint.descriptor.json`.
+Native files, build recipes, nested wheels, model weights, credentials, symlinks, and
+unsafe paths refuse.
 
 ```sh
 cozy endpoint publish org/endpoint \
@@ -24,7 +24,9 @@ cozy endpoint publish org/endpoint \
   --reason "initial release"
 ```
 
-Creator deterministically builds one `py3-none-any` project wheel. Its METADATA carries
+Creator runs the project-pinned `cozy-runtime --json --dir PROJECT describe` through
+`uv run --locked`; Runtime derives the descriptor without writing the source tree. Creator
+then deterministically builds one `py3-none-any` project wheel. Its METADATA carries
 `Requires-Python` and `Requires-Dist` directly from `pyproject.toml`; `uv.lock` supplies the
 exact lock bytes. There is no public profile, GPU, or custom-wheel selection.
 

@@ -15,7 +15,9 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/cozy-creator/cozy-creator/internal/config"
 	"github.com/cozy-creator/cozy-creator/internal/endpointpublish"
+	"github.com/cozy-creator/cozy-creator/internal/launch"
 	"github.com/cozy-creator/cozy-creator/internal/wheel"
 )
 
@@ -111,19 +113,15 @@ object = "marco_polo:app"
 `)
 	mustWrite(t, filepath.Join(repo, "marco_polo.py"), "app = object()\n")
 	mustWrite(t, filepath.Join(repo, "uv.lock"), "version = 1\n")
-	mustWrite(t, filepath.Join(repo, "endpoint.descriptor.json"), `{
-  "jobs": [],
-  "format": "cozy.endpoint.descriptor/1",
-  "entrypoints": [],
-  "application": "marco_polo:app"
-}`)
 	git(t, repo, "init", "-q")
 	git(t, repo, "config", "user.email", "fixture@example.invalid")
 	git(t, repo, "config", "user.name", "Fixture")
 	git(t, repo, "add", ".")
 	git(t, repo, "commit", "-qm", "fixture")
 
-	request := endpointpublish.Request{Tree: repo, Release: "1.0.0"}
+	weightlessDescriptor := `{"application":"marco_polo:app","entrypoints":[],"format":"cozy.endpoint.descriptor/1","jobs":[]}`
+	request := endpointpublish.Request{Tree: repo, Release: "1.0.0",
+		Runtime: fakeDescriptorRuntime(t, weightlessDescriptor)}
 	a, problem := endpointpublish.Prepare(request)
 	if problem != nil {
 		t.Fatalf("first package refused: %s", problem)
@@ -158,13 +156,12 @@ object = "marco_polo:app"
 		t.Fatalf("project metadata did not carry declared compatibility requirements:\n%s", metadata)
 	}
 
-	mustWrite(t, filepath.Join(repo, "endpoint.descriptor.json"), `{"application":"marco_polo:app","entrypoints":[{"models":[{"class":"Model","component_use":[],"path":"marco.models.model","stamps":[]}],"name":"marco"}],"format":"cozy.endpoint.descriptor/1","jobs":[]}`)
-	git(t, repo, "add", "endpoint.descriptor.json")
-	git(t, repo, "commit", "-qm", "declare model input")
+	request.Runtime = fakeDescriptorRuntime(t,
+		`{"application":"marco_polo:app","entrypoints":[{"models":[{"class":"Model","component_use":{},"path":"marco.models.model","stamps":{}}],"name":"marco","request":{"fields":[]},"result":{"fields":[]}}],"format":"cozy.endpoint.descriptor/1","jobs":[]}`)
 	if _, problem := endpointpublish.Prepare(request); problem == nil || problem.ErrName() != "endpoint_model_binding_deferred" {
 		t.Fatalf("model-bearing publication did not report its explicit deferral: %v", problem)
 	}
-	mustWrite(t, filepath.Join(repo, "endpoint.descriptor.json"), `{"application":"marco_polo:app","entrypoints":[],"format":"cozy.endpoint.descriptor/1","jobs":[]}`)
+	request.Runtime = fakeDescriptorRuntime(t, weightlessDescriptor)
 	mustWrite(t, filepath.Join(repo, "endpoint.release.json"), `{}`)
 	git(t, repo, "add", ".")
 	git(t, repo, "commit", "-qm", "plant retired metadata")
@@ -174,6 +171,15 @@ object = "marco_polo:app"
 	must(t, os.Remove(filepath.Join(repo, "endpoint.release.json")))
 	git(t, repo, "add", "-u")
 	git(t, repo, "commit", "-qm", "remove retired metadata")
+	mustWrite(t, filepath.Join(repo, "endpoint.descriptor.json"), weightlessDescriptor)
+	git(t, repo, "add", "endpoint.descriptor.json")
+	git(t, repo, "commit", "-qm", "plant retired descriptor")
+	if _, problem := endpointpublish.Prepare(request); problem == nil || problem.ErrName() != "endpoint_metadata_retired" {
+		t.Fatalf("committed generated descriptor did not refuse: %v", problem)
+	}
+	must(t, os.Remove(filepath.Join(repo, "endpoint.descriptor.json")))
+	git(t, repo, "add", "-u")
+	git(t, repo, "commit", "-qm", "remove retired descriptor")
 
 	mustWrite(t, filepath.Join(repo, "uncommitted.py"), "x=1\n")
 	if _, problem := endpointpublish.Prepare(request); problem == nil || problem.ErrName() != "endpoint_tree_dirty" {
@@ -190,11 +196,53 @@ object = "marco_polo:app"
 
 func TestEndpointPublicationNeedsNoPublisherProfile(t *testing.T) {
 	repo := trackedEndpointFixture(t)
-	pack, problem := endpointpublish.Prepare(endpointpublish.Request{Tree: repo, Release: "weightless"})
+	pack, problem := endpointpublish.Prepare(endpointpublish.Request{Tree: repo, Release: "weightless",
+		Runtime: filepath.Join(repo, ".test-bin", "uv")})
 	if problem != nil {
 		t.Fatalf("weightless pure-Python publication required publisher compatibility input: %v", problem)
 	}
 	defer pack.Close()
+}
+
+func TestEndpointPublishDerivesDescriptorWithLockedRuntime(t *testing.T) {
+	homeDir, err := os.UserHomeDir()
+	must(t, err)
+	fixture := filepath.Join(homeDir, "cozy_v2", "cozy-runtime", "proofs", "fixtures", "marco-polo-endpoint") //cozy:allow peer Runtime repository fixture
+	for _, required := range []string{"pyproject.toml", "uv.lock", "endpoint.toml"} {
+		if _, err := os.Stat(filepath.Join(fixture, required)); err != nil {
+			t.Skipf("Runtime Marco fixture is not present: %v", err)
+		}
+	}
+	for _, retired := range []string{"endpoint.descriptor.json", "endpoint.release.json", "endpoint.evaluated-config.json"} {
+		if _, err := os.Stat(filepath.Join(fixture, retired)); err == nil {
+			t.Skipf("Runtime Marco fixture has not landed the source-only hardcut yet: %s", retired)
+		}
+	}
+	pyproject := string(mustRead(t, filepath.Join(fixture, "pyproject.toml")))
+	lock := string(mustRead(t, filepath.Join(fixture, "uv.lock")))
+	if !strings.Contains(pyproject, "cozy-runtime==") || !strings.Contains(lock, `name = "cozy-runtime"`) { //cozy:allow assertion over peer fixture metadata
+		t.Fatal("Marco fixture does not carry cozy-runtime in both pyproject.toml and uv.lock")
+	}
+	_, problem := config.Load()
+	fatal(t, problem)
+	pack, problem := endpointpublish.Prepare(endpointpublish.Request{Tree: fixture, Release: "1.0.0"})
+	if problem != nil {
+		t.Fatalf("real locked Runtime derivation refused: %s", problem.Message)
+	}
+	defer pack.Close()
+	descriptor, problem := launch.DecodeDescriptor(mustRead(t, pack.Files["descriptor"]))
+	fatal(t, problem)
+	if _, problem := descriptor.Function("marco"); problem != nil {
+		t.Fatalf("derived Marco descriptor has no marco function: %s", problem.Message)
+	}
+}
+
+func fakeDescriptorRuntime(t *testing.T, descriptor string) string {
+	t.Helper()
+	file := filepath.Join(t.TempDir(), "cozy-runtime") //cozy:allow independent Runtime descriptor fixture
+	mustWrite(t, file, "#!/bin/sh\nprintf '%s\\n' '"+strings.ReplaceAll(descriptor, "'", "'\"'\"'")+"'\n")
+	must(t, os.Chmod(file, 0o755))
+	return file
 }
 
 func mustWrite(t *testing.T, path, body string) {

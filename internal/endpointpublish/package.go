@@ -21,6 +21,7 @@ import (
 	"time"
 
 	"github.com/cozy-creator/cozy-creator/internal/canonical"
+	"github.com/cozy-creator/cozy-creator/internal/config"
 	"github.com/cozy-creator/cozy-creator/internal/exit"
 	"github.com/cozy-creator/cozy-creator/internal/wheel"
 )
@@ -58,6 +59,9 @@ func (p *Package) Close() { _ = os.RemoveAll(p.Root) }
 type Request struct {
 	Tree    string
 	Release string
+	// Runtime is an exact cozy-runtime binary used by hermetic callers. The product
+	// leaves it empty and runs the project runtime through uv's locked environment.
+	Runtime string
 }
 
 // Prepare requires a clean committed source subtree, deterministically packs its
@@ -94,8 +98,7 @@ func Prepare(req Request) (*Package, *exit.Error) {
 	if e != nil {
 		return fail(e)
 	}
-	descriptorSource := filepath.Join(tree, DescriptorName)
-	descriptor, e := canonicalDocument(descriptorSource, filepath.Join(root, DescriptorName), false)
+	descriptor, e := deriveDescriptor(tree, root, req.Runtime)
 	if e != nil {
 		return fail(e)
 	}
@@ -211,7 +214,8 @@ func auditSource(root string, files []string) *exit.Error {
 	var total int64
 	for _, name := range files {
 		lower, base := strings.ToLower(name), strings.ToLower(path.Base(name))
-		if base == "endpoint.release.json" || base == "endpoint.evaluated-config.json" {
+		if base == "endpoint.descriptor.json" || base == "endpoint.release.json" ||
+			base == "endpoint.evaluated-config.json" {
 			return exit.Named(exit.Validation, "endpoint_metadata_retired",
 				"%s is retired endpoint publication metadata", name).
 				WithRemedy("delete it; endpoint.toml is the only author configuration, and Tensorhub derives compatibility from pyproject.toml and uv.lock")
@@ -249,6 +253,75 @@ func auditSource(root string, files []string) *exit.Error {
 		}
 	}
 	return nil
+}
+
+func deriveDescriptor(tree, root, runtime string) (string, *exit.Error) {
+	output := filepath.Join(root, DescriptorName)
+	var cmd *exec.Cmd
+	if runtime != "" {
+		cmd = exec.Command(runtime, "--json", "--dir", tree, "describe")
+	} else {
+		cmd = exec.Command("uv", "run", "--locked", "--no-progress", "--project", tree,
+			"cozy-runtime", "--json", "--dir", tree, "describe")
+	}
+	cmd.Env = config.Frozen().Tool(
+		"UV_PROJECT_ENVIRONMENT="+filepath.Join(root, "descriptor-venv"),
+		"UV_LINK_MODE=hardlink",
+	)
+	var stdout, stderr bytes.Buffer
+	cmd.Stdout, cmd.Stderr = &stdout, &stderr
+	err := cmd.Run()
+	if cmd.ProcessState == nil {
+		return "", exit.Named(exit.Structural, "endpoint_descriptor_runtime_missing",
+			"cannot run the endpoint's locked cozy-runtime: %v", err).
+			WithRemedy("declare cozy-runtime in pyproject.toml and lock it in uv.lock")
+	}
+	if code := cmd.ProcessState.ExitCode(); code != 0 {
+		return "", descriptorRefusal(code, stderr.Bytes())
+	}
+	if stdout.Len() == 0 || stdout.Len() > canonical.DocMax {
+		return "", exit.Named(exit.Validation, "endpoint_descriptor_invalid",
+			"cozy-runtime describe returned %d bytes; expected 1..%d", stdout.Len(), canonical.DocMax)
+	}
+	canonicalBytes, err := canonical.NormalizeJCS(stdout.Bytes())
+	if err != nil {
+		return "", exit.Named(exit.Validation, "endpoint_descriptor_invalid",
+			"cozy-runtime describe returned invalid canonical JSON: %v", err)
+	}
+	if err := os.WriteFile(output, canonicalBytes, 0o600); err != nil {
+		return "", exit.Internalf("cannot stage derived descriptor: %s", err)
+	}
+	return output, nil
+}
+
+func descriptorRefusal(code int, body []byte) *exit.Error {
+	c := exit.Code(code)
+	if !c.Valid() {
+		c = exit.Internal
+	}
+	var doc struct {
+		Error struct {
+			Name    string `json:"name"`
+			Message string `json:"message"`
+			Remedy  string `json:"remedy"`
+		} `json:"error"`
+	}
+	if json.Unmarshal(body, &doc) == nil && doc.Error.Message != "" {
+		name := doc.Error.Name
+		if name == "" {
+			name = "endpoint_descriptor_refused"
+		}
+		problem := exit.Named(c, name, "%s", doc.Error.Message)
+		if doc.Error.Remedy != "" {
+			problem.WithRemedy("%s", doc.Error.Remedy)
+		}
+		return problem
+	}
+	message := strings.Join(strings.Fields(string(body)), " ")
+	if message == "" {
+		message = fmt.Sprintf("cozy-runtime exited %d", code)
+	}
+	return exit.Named(c, "endpoint_descriptor_refused", "%s", message)
 }
 
 func sourceBuildInput(base string) bool {
@@ -306,23 +379,6 @@ func sourceArchive(root string, files []string, output string) *exit.Error {
 		return exit.Internalf("cannot finish source gzip: %s", err)
 	}
 	return nil
-}
-
-func canonicalDocument(source, output string, allowAbsent bool) (string, *exit.Error) {
-	body, err := os.ReadFile(source)
-	if os.IsNotExist(err) && allowAbsent {
-		body = []byte("{}")
-	} else if err != nil {
-		return "", exit.Named(exit.NotFound, "endpoint_document_absent", "%s is required: %v", source, err)
-	}
-	canonicalBytes, err := canonical.NormalizeJCS(body)
-	if err != nil {
-		return "", exit.Named(exit.Validation, "endpoint_document_invalid", "%s: %v", filepath.Base(source), err)
-	}
-	if err := os.WriteFile(output, canonicalBytes, 0o600); err != nil {
-		return "", exit.Internalf("cannot stage %s: %s", filepath.Base(source), err)
-	}
-	return output, nil
 }
 
 func descriptorNeedsBindings(file string) (bool, *exit.Error) {

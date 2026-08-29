@@ -7,6 +7,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"os/exec"
 	"path/filepath"
 	"sort"
@@ -63,8 +64,7 @@ func TestEndpointPublishCLI(t *testing.T) {
 			}
 			digest := fixtureDigest(body)
 			_ = json.NewEncoder(w).Encode(map[string]any{"declaration_digest": digest,
-				"state": "pending", "uploads": rows,
-				"profiles": []map[string]string{{"profile": endpointprofile.CU126, "state": "candidate_pending"}, {"profile": endpointprofile.CU130, "state": "candidate_pending"}}})
+				"state": "pending", "uploads": rows})
 		case r.Method == http.MethodPut && strings.HasPrefix(r.URL.Path, "/put/"):
 			role := strings.TrimPrefix(r.URL.Path, "/put/")
 			if r.Header.Get("X-Test-Role") != role {
@@ -154,7 +154,8 @@ func TestEndpointPublishCLI(t *testing.T) {
 	home := t.TempDir()
 	run := func(args ...string) (int, string) {
 		cmd := exec.Command("/usr/bin/nice", append([]string{"-n", "19", cozyBin}, args...)...)
-		cmd.Env = childEnv(t, home, "TENSORHUB_URL="+server.URL, "TENSORHUB_TOKEN=admin")
+		cmd.Env = childEnv(t, home, "TENSORHUB_URL="+server.URL, "TENSORHUB_TOKEN=admin",
+			"PATH="+filepath.Join(source, ".test-bin")+":/usr/local/bin:/usr/bin:/bin")
 		body, _ := cmd.CombinedOutput()
 		return cmd.ProcessState.ExitCode(), string(body)
 	}
@@ -185,12 +186,15 @@ dependencies = []
 	mustWrite(t, filepath.Join(repo, "endpoint.toml"), "[application]\nobject = \"marco_polo:app\"\n")
 	mustWrite(t, filepath.Join(repo, "marco_polo.py"), "app = object()\n")
 	mustWrite(t, filepath.Join(repo, "uv.lock"), "version = 1\n")
-	mustWrite(t, filepath.Join(repo, "endpoint.descriptor.json"), `{"application":"marco_polo:app","entrypoints":[],"format":"cozy.endpoint.descriptor/1","jobs":[]}`)
+	mustWrite(t, filepath.Join(repo, ".gitignore"), ".test-bin/\n.venv/\n")
 	git(t, repo, "init", "-q")
 	git(t, repo, "config", "user.email", "fixture@example.invalid")
 	git(t, repo, "config", "user.name", "Fixture")
 	git(t, repo, "add", ".")
 	git(t, repo, "commit", "-qm", "fixture")
+	fakeUV := filepath.Join(repo, ".test-bin", "uv")
+	mustWrite(t, fakeUV, "#!/bin/sh\nprintf '%s\\n' '{\"application\":\"marco_polo:app\",\"entrypoints\":[],\"format\":\"cozy.endpoint.descriptor/1\",\"jobs\":[]}'\n")
+	must(t, os.Chmod(fakeUV, 0o755))
 	return repo
 }
 

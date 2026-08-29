@@ -4,12 +4,10 @@
 //
 // Nothing here re-derives a fact its owner already produced:
 //
-//   - THE SURFACE is `endpoint.descriptor.json`, committed in the release's own source and
-//     PROVEN at install by the release's own runtime (`cozy-runtime describe --check`, cl-009).
-//     Reading it back costs microseconds; re-running `describe` per invocation would import
-//     the endpoint's whole module graph to learn a fact already vouched for. The recorded
-//     semantic `descriptor_digest` is checked on every read, so a meaning change refuses
-//     while whitespace and object-key order remain irrelevant.
+//   - THE SURFACE is a generation-private descriptor derived once by the release's own
+//     Runtime at install. Reading it back costs microseconds; re-running `describe` per
+//     invocation would import the endpoint's module graph to learn a fact already frozen.
+//     The recorded semantic digest is checked on every read.
 //   - THE ARTIFACT FACTS (store root, per-component snapshots, immutable config, variant,
 //     physical floor) come from the runtime's own local artifact index, read through
 //     `cozy-runtime list --json`. cozy-creator never composes a store path.
@@ -38,9 +36,9 @@ import (
 	"github.com/cozy-creator/cozy-creator/internal/orchestrator"
 )
 
-// DescriptorFile is the name cr-003 froze. It is committed in the endpoint's source and
-// `describe --check` is what proves it current.
-const DescriptorFile = "endpoint.descriptor.json"
+// DescriptorFile is Runtime's derived document inside an immutable generation. It is
+// never committed in endpoint source.
+const DescriptorFile = "descriptor.json"
 const descriptorFormat = "cozy.endpoint.descriptor/1"
 
 // Descriptor is the closed EndpointDescriptor/1 this host reads. Unknown fields refuse;
@@ -241,6 +239,14 @@ func validateStructRaw(raw json.RawMessage) error {
 	if err != nil {
 		return err
 	}
+	tagged := object["tag_field"] != nil || object["tag"] != nil
+	var tagField string
+	if tagged {
+		if object["tag_field"] == nil || object["tag"] == nil ||
+			json.Unmarshal(object["tag_field"], &tagField) != nil || tagField == "" {
+			return fmt.Errorf("tagged struct must carry one non-empty tag_field and tag")
+		}
+	}
 	var fields []json.RawMessage
 	if err := json.Unmarshal(object["fields"], &fields); err != nil {
 		return err
@@ -250,6 +256,12 @@ func validateStructRaw(raw json.RawMessage) error {
 			[]string{"asset_bound", "constraints", "wire"})
 		if err != nil {
 			return err
+		}
+		if tagged {
+			var name string
+			if json.Unmarshal(field["name"], &name) != nil || name == tagField {
+				return fmt.Errorf("tagged struct repeats its synthetic discriminator field")
+			}
 		}
 		if rawWire := field["wire"]; rawWire != nil {
 			var wire string
@@ -304,7 +316,8 @@ func validateTypeRaw(raw json.RawMessage) error {
 		}
 		return validateTypeRaw(object["list"])
 	case object["union"] != nil:
-		if _, err := exactKeys(raw, []string{"union"}, []string{"tag_field"}); err != nil {
+		union, err := exactKeys(raw, []string{"union"}, []string{"tag_field"})
+		if err != nil {
 			return err
 		}
 		var branches []json.RawMessage
@@ -312,6 +325,21 @@ func validateTypeRaw(raw json.RawMessage) error {
 			return fmt.Errorf("empty descriptor union")
 		}
 		for _, branch := range branches {
+			if union["tag_field"] != nil {
+				member, err := exactKeys(branch, []string{"fields", "tag"}, nil)
+				if err != nil {
+					return err
+				}
+				member["tag_field"] = union["tag_field"]
+				expanded, err := json.Marshal(member)
+				if err != nil {
+					return err
+				}
+				if err := validateStructRaw(expanded); err != nil {
+					return err
+				}
+				continue
+			}
 			if err := validateTypeRaw(branch); err != nil {
 				return err
 			}
@@ -368,20 +396,18 @@ func validateEntrypoint(ep *Entrypoint) *exit.Error {
 	return nil
 }
 
-// ReadDescriptor reads the committed descriptor projection out of a generation's source
-// tree and checks its canonical semantic digest against the install record.
-//
-// The check is the whole point of reading it here rather than re-deriving: cl-009 ran the
-// release's OWN runtime over this file and recorded what it vouched for. If the two
-// disagree now, the source tree moved under an install (the `--dir` editable door is
-// exactly how), and serving a stale surface would be worse than refusing.
-func ReadDescriptor(sourceDir, expectDigest string) (*Descriptor, *exit.Error) {
-	path := filepath.Join(sourceDir, DescriptorFile)
+// DescriptorPath is the one generation-private location for Runtime-derived bytes.
+func DescriptorPath(generationDir string) string {
+	return filepath.Join(generationDir, "documents", DescriptorFile)
+}
+
+// ReadDescriptor reads the private descriptor and joins it to the install record.
+func ReadDescriptor(path, expectDigest string) (*Descriptor, *exit.Error) {
 	data, err := os.ReadFile(path)
 	if err != nil {
 		return nil, exit.Named(exit.Structural, "descriptor_absent",
-			"this generation's source carries no %s", DescriptorFile).
-			WithRemedy("an installed release commits its descriptor; `cozy-runtime describe --write-descriptor` is what writes one").
+			"this generation carries no private %s", DescriptorFile).
+			WithRemedy("reinstall so the generation's Runtime can derive its descriptor").
 			WithNext("cozy endpoint install <org/endpoint> --force")
 	}
 	d, problem := DecodeDescriptor(data)
@@ -390,8 +416,8 @@ func ReadDescriptor(sourceDir, expectDigest string) (*Descriptor, *exit.Error) {
 	}
 	if expectDigest != "" && d.Digest != expectDigest {
 		return nil, exit.Named(exit.Conflict, "descriptor_stale",
-			"the committed descriptor content digests to %s and this install recorded %s", d.Digest, expectDigest).
-			WithRemedy("the source tree changed after the install; reinstall so the surface and the record are one document").
+			"the private descriptor content digests to %s and this install recorded %s", d.Digest, expectDigest).
+			WithRemedy("the immutable generation is corrupt; reinstall it").
 			WithNext("cozy endpoint install <org/endpoint> --force")
 	}
 	return d, nil

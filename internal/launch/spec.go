@@ -45,7 +45,7 @@ type Facts struct {
 // install, and the runtime that proved it.
 func Read(gen records.EndpointInstall, cozyHome string, env []string) (*Facts, *exit.Error) {
 	source := SourceDir(gen)
-	d, e := ReadDescriptor(source, gen.Descriptor)
+	d, e := ReadDescriptor(DescriptorPath(gen.Dir), gen.Descriptor)
 	if e != nil {
 		return nil, e
 	}
@@ -114,8 +114,8 @@ func (f *Facts) Placement() (orchestrator.DesiredPlacement, *exit.Error) {
 		Endpoint:  f.Install.Endpoint,
 		ReleaseID: ReleaseID(f.Install),
 		InstallID: f.Install.ID,
-		// The descriptor this install already VERIFIED in the generation's own venv
-		// (cr-003's `describe --check`). It names the placement's surface by digest.
+		// The descriptor this install derived in the generation's own Runtime. It names
+		// the placement's surface by digest.
 		DescriptorDigest: f.Install.Descriptor,
 	}
 	for i := range f.Descriptor.Entrypoints {

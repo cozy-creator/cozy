@@ -23,6 +23,7 @@ import (
 	"github.com/cozy-creator/cozy-creator/internal/home"
 	"github.com/cozy-creator/cozy-creator/internal/hub"
 	"github.com/cozy-creator/cozy-creator/internal/install"
+	"github.com/cozy-creator/cozy-creator/internal/launch"
 	"github.com/cozy-creator/cozy-creator/internal/records"
 	"github.com/cozy-creator/cozy-creator/internal/transfer"
 	"github.com/cozy-creator/cozy-creator/internal/wheel"
@@ -283,13 +284,15 @@ func Run(ctx context.Context, layout home.Layout, store *records.Store, request 
 		return fail(exit.Named(exit.Structural, "managed_native_proof_unexpected",
 			"pure overlay received a native-wheel proof request"))
 	}
-	descriptorDigest, problem := describe(runtimeBin, projectDir, toolEnv)
+	derivedDescriptor, problem := describe(runtimeBin, projectDir, toolEnv)
 	if problem != nil {
 		return fail(problem)
 	}
-	if descriptorDigest != grant.Descriptor.Digest {
+	descriptorDigest := derivedDescriptor.Digest
+	if descriptorDigest != grant.Descriptor.Digest ||
+		!bytes.Equal(derivedDescriptor.Raw, grant.Descriptor.CanonicalBytes) {
 		return fail(exit.Named(exit.Structural, "managed_descriptor_mismatch",
-			"installed endpoint derives descriptor %s; the published release grants %s",
+			"installed endpoint derives descriptor %s; the published release grants %s with different bytes",
 			descriptorDigest, grant.Descriptor.Digest).
 			WithRemedy("refuse this candidate; its qualified documents and installed project wheel do not describe the same endpoint"))
 	}
@@ -800,21 +803,20 @@ func runProof(binary, request, receipt string, env []string) (proofOutput, *exit
 	return out, nil
 }
 
-func describe(runtime, project string, env []string) (string, *exit.Error) {
-	cmd := exec.Command(runtime, "--json", "--dir", project, "describe", "--check")
+func describe(runtime, project string, env []string) (*launch.Descriptor, *exit.Error) {
+	cmd := exec.Command(runtime, "--json", "--dir", project, "describe")
 	cmd.Env = env
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout, cmd.Stderr = &stdout, &stderr
 	if err := cmd.Run(); err != nil {
-		return "", exit.Named(exit.Structural, "managed_descriptor_refused", "%s", condense(stderr.String()))
+		return nil, exit.Named(exit.Structural, "managed_descriptor_refused", "%s", condense(stderr.String()))
 	}
-	var out struct {
-		DescriptorDigest string `json:"descriptor_digest"`
+	descriptor, problem := launch.DecodeDescriptor(stdout.Bytes())
+	if problem != nil {
+		return nil, exit.Named(exit.Structural, "managed_descriptor_refused",
+			"managed cozy-runtime returned an invalid descriptor: %s", problem.Message)
 	}
-	if json.Unmarshal(stdout.Bytes(), &out) != nil || !digest(out.DescriptorDigest) {
-		return "", exit.Internalf("managed cozy-runtime describe returned no descriptor digest")
-	}
-	return out.DescriptorDigest, nil
+	return descriptor, nil
 }
 
 func observeHost(runtime, project, output, profile string, env []string) (string, *exit.Error) {

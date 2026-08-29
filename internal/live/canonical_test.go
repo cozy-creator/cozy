@@ -300,3 +300,27 @@ func TestEndpointDescriptor(t *testing.T) {
 		}
 	}
 }
+
+func TestCompactEndpointDescriptor(t *testing.T) {
+	raw := []byte(`{"application":"probe:app","entrypoints":[{"models":[{"class":"Model","component_use":{"run":["transformer"]},"path":"run.models.model","stamps":{"task":"generate"}}],"name":"run","request":{"fields":[{"name":"message","type":"str"},{"name":"event","type":{"tag_field":"type","union":[{"fields":[{"name":"image","type":"str"}],"tag":"image"},{"fields":[{"name":"video","type":"str"}],"tag":"video"}]}}]},"result":{"fields":[]}}],"format":"cozy.endpoint.descriptor/1","jobs":[]}`)
+	doc, problem := launch.DecodeDescriptor(raw)
+	fatal(t, problem)
+	ep := &doc.Entrypoints[0]
+	if ep.Request.Fields[0].Wire != "required" || len(ep.Models) != 1 || ep.Models[0].Param != "model" {
+		t.Fatalf("compact defaults were not derived: %+v %+v", ep.Request.Fields, ep.Models)
+	}
+
+	for name, planted := range map[string][]byte{
+		"retired model param": bytes.Replace(raw, []byte(`"path":"run.models.model"`),
+			[]byte(`"param":"model","path":"run.models.model"`), 1),
+		"member repeats tag field": bytes.Replace(raw, []byte(`{"fields":[{"name":"image"`),
+			[]byte(`{"fields":[{"name":"type","type":"str"},{"name":"image"`), 1),
+		"member repeats wrapper": bytes.Replace(raw,
+			[]byte(`{"fields":[{"name":"image","type":"str"}],"tag":"image"}`),
+			[]byte(`{"fields":[{"name":"image","type":"str"}],"tag":"image","tag_field":"type"}`), 1),
+	} {
+		if _, refusal := launch.DecodeDescriptor(planted); refusal == nil {
+			t.Errorf("%s was accepted at the compact descriptor boundary", name)
+		}
+	}
+}

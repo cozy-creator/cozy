@@ -19,6 +19,7 @@ import (
 	"github.com/cozy-creator/cozy-creator/internal/config"
 	"github.com/cozy-creator/cozy-creator/internal/exit"
 	"github.com/cozy-creator/cozy-creator/internal/home"
+	"github.com/cozy-creator/cozy-creator/internal/launch"
 	"github.com/cozy-creator/cozy-creator/internal/records"
 )
 
@@ -159,12 +160,19 @@ func Run(l home.Layout, st *records.Store, req Request) (*Result, *exit.Error) {
 	res.Warnings = append(res.Warnings, env.Warnings...)
 	mark("venv")
 
-	// ---- descriptor: the release's OWN runtime checks its OWN committed surface ----
-	digest, e := deriveDescriptor(venvDir, sourceDir)
+	// ---- descriptor: the release's own Runtime derives a private generation document ----
+	descriptor, e := deriveDescriptor(venvDir, sourceDir)
 	if e != nil {
 		return guard(e)
 	}
-	gen.Descriptor = digest
+	descriptorPath := launch.DescriptorPath(genDir)
+	if err := os.MkdirAll(filepath.Dir(descriptorPath), 0o700); err != nil {
+		return guard(exit.Internalf("cannot create private descriptor root: %s", err))
+	}
+	if err := os.WriteFile(descriptorPath, descriptor.Raw, 0o600); err != nil {
+		return guard(exit.Internalf("cannot store private descriptor: %s", err))
+	}
+	gen.Descriptor = descriptor.Digest
 	mark("descriptor")
 
 	// Disk is measured once, here, and read back from the record forever after.
@@ -180,46 +188,37 @@ func Run(l home.Layout, st *records.Store, req Request) (*Result, *exit.Error) {
 	return res, nil
 }
 
-// deriveDescriptor runs `cozy-runtime describe --check` in the generation's OWN venv
-// over the generation's OWN source (cr-003). The runtime imports the app, derives the
-// surface without loading weights, and compares it against the committed
-// endpoint.descriptor.json: `--check` IS the comparison, so nothing is re-derived or
-// re-compared here. Exit 0 hands back the semantic `descriptor_digest` the release's runtime
-// vouched for, and the install records it; 13 and 3 are its typed refusals, passed
-// through with the runtime's own words. No door widens either one — a descriptor that
-// disagrees with the code that built the venv refuses the install.
-func deriveDescriptor(venvDir, sourceDir string) (string, *exit.Error) {
+// deriveDescriptor runs the generation's own Runtime over its source. Runtime emits the
+// complete descriptor without writing the source tree; Creator validates the closed grammar
+// and stores the canonical bytes under the immutable generation root.
+func deriveDescriptor(venvDir, sourceDir string) (*launch.Descriptor, *exit.Error) {
 	bin := home.VenvTool(venvDir, "cozy-runtime")
 	if _, err := os.Stat(bin); err != nil {
-		return "", exit.Named(exit.Structural, "runtime_missing",
+		return nil, exit.Named(exit.Structural, "runtime_missing",
 			"this generation's venv provides no cozy-runtime at %s", bin).
 			WithRemedy("an endpoint depends on cozy-runtime; its surface is described by the runtime the release itself pinned, never this host's").
 			WithNext("cozy help install")
 	}
-	cmd := exec.Command(bin, "--json", "--dir", sourceDir, "describe", "--check")
+	cmd := exec.Command(bin, "--json", "--dir", sourceDir, "describe")
 	cmd.Env = config.Frozen().Tool()
 	var stdout, stderr strings.Builder
 	cmd.Stdout, cmd.Stderr = &stdout, &stderr
 	err := cmd.Run()
 	if cmd.ProcessState == nil {
-		return "", exit.Internalf("cannot run %s: %s", bin, err)
+		return nil, exit.Internalf("cannot run %s: %s", bin, err)
 	}
 	if code := cmd.ProcessState.ExitCode(); code != 0 {
-		return "", describeRefusal(code, stderr.String())
+		return nil, describeRefusal(code, stderr.String())
 	}
-	var doc struct {
-		Digest string `json:"descriptor_digest"`
+	descriptor, problem := launch.DecodeDescriptor([]byte(stdout.String()))
+	if problem != nil {
+		return nil, exit.Named(exit.Validation, "descriptor_invalid",
+			"cozy-runtime describe returned an invalid descriptor: %s", problem.Message)
 	}
-	if json.Unmarshal([]byte(stdout.String()), &doc) != nil || doc.Digest == "" {
-		return "", exit.Internalf(
-			"`cozy-runtime describe --check` passed but named no descriptor_digest: %s", condense(stdout.String()))
-	}
-	return doc.Digest, nil
+	return descriptor, nil
 }
 
-// describeRefusal renders the runtime's typed refusal as this install's refusal: its
-// code, its name, its words. 13 = the committed descriptor and the built surface
-// diverge (the runtime names which pair); 3 = the surface itself is invalid.
+// describeRefusal renders the runtime's typed refusal under the shared exit vocabulary.
 func describeRefusal(code int, stderr string) *exit.Error {
 	var doc struct {
 		Error struct{ Name, Message, Remedy string } `json:"error"`
@@ -229,15 +228,9 @@ func describeRefusal(code int, stderr string) *exit.Error {
 		c = exit.Internal
 	}
 	name := "descriptor_refused"
-	switch c {
-	case exit.Conflict:
-		name = "descriptor_stale"
-	case exit.Validation:
-		name = "descriptor_invalid"
-	}
 	if json.Unmarshal([]byte(stderr), &doc) != nil || doc.Error.Message == "" {
 		return exit.Named(c, name,
-			"`cozy-runtime describe --check` refused this generation (exit %d)", code).
+			"`cozy-runtime describe` refused this generation (exit %d)", code).
 			WithRemedy("%s", condense(stderr))
 	}
 	return exit.Named(c, name, "%s", doc.Error.Message).

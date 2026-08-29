@@ -116,15 +116,6 @@ func validateBegin(pack *endpointpublish.Package, begun hub.EndpointReleaseBegin
 		(begun.State != "pending" && begun.State != "committed") {
 		return exit.Internalf("endpoint begin returned another declaration or invalid state %q", begun.State)
 	}
-	seenProfiles := map[string]bool{}
-	for _, row := range begun.Profiles {
-		if row.Profile == "" || seenProfiles[row.Profile] || row.State != "candidate_pending" || row.CandidateID != "" ||
-			row.BaseRealizationKind != "" || row.BaseRealizationDigest != "" ||
-			row.RefusalCode != "" || row.RefusalDetail != "" {
-			return exit.Internalf("endpoint begin returned a non-pending profile row for %q", row.Profile)
-		}
-		seenProfiles[row.Profile] = true
-	}
 	want := declarationRoles(pack)
 	seen := map[string]bool{}
 	for _, upload := range begun.Uploads {
