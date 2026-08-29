@@ -8,5 +8,8 @@ func (s *Server) webUI(w http.ResponseWriter, r *http.Request) {
 			"this build carries no localhost web UI", "install a complete Cozy Creator release")
 		return
 	}
+	w.Header().Set("Content-Security-Policy",
+		"default-src 'none'; script-src 'self'; style-src 'self'; img-src 'self' data: blob:; "+
+			"connect-src 'self'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'")
 	s.web.ServeHTTP(w, r)
 }

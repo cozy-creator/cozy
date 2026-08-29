@@ -1,4 +1,4 @@
-package upload
+package live
 
 import (
 	"io"
@@ -7,6 +7,7 @@ import (
 	"testing"
 
 	"github.com/cozy-creator/cozy-creator/internal/home"
+	"github.com/cozy-creator/cozy-creator/internal/upload"
 )
 
 func TestPutPublishesOneOpaqueContentIdentity(t *testing.T) {
@@ -15,11 +16,11 @@ func TestPutPublishesOneOpaqueContentIdentity(t *testing.T) {
 		t.Fatal(problem.Message)
 	}
 	body := "cozy-upload-bytes"
-	first, problem := Put(layout, strings.NewReader(body), int64(len(body)), "text/plain; charset=utf-8")
+	first, problem := upload.Put(layout, strings.NewReader(body), int64(len(body)), "text/plain; charset=utf-8")
 	if problem != nil {
 		t.Fatal(problem.Message)
 	}
-	second, problem := Put(layout, strings.NewReader(body), -1, "text/plain")
+	second, problem := upload.Put(layout, strings.NewReader(body), -1, "text/plain")
 	if problem != nil {
 		t.Fatal(problem.Message)
 	}
@@ -30,7 +31,7 @@ func TestPutPublishesOneOpaqueContentIdentity(t *testing.T) {
 		t.Fatalf("upload exposed a path-shaped identity: %#v", first)
 	}
 
-	file, digest, problem := Open(layout, first.ID)
+	file, digest, problem := upload.Open(layout, first.ID)
 	if problem != nil {
 		t.Fatal(problem.Message)
 	}
@@ -54,7 +55,7 @@ func TestPutRejectsDeclaredOverLimitWithoutReading(t *testing.T) {
 		t.Fatal(problem.Message)
 	}
 	reader := &countingReader{}
-	_, problem = Put(layout, reader, MaxBytes+1, "application/octet-stream")
+	_, problem = upload.Put(layout, reader, upload.MaxBytes+1, "application/octet-stream")
 	if problem == nil || problem.ErrName() != "upload_too_large" {
 		t.Fatalf("oversize declaration returned %#v", problem)
 	}
@@ -69,7 +70,7 @@ func TestOpenRejectsNonOpaqueIDs(t *testing.T) {
 		t.Fatal(problem.Message)
 	}
 	for _, id := range []string{"../../etc/passwd", "upl-../records.db", "upl-" + strings.Repeat("A", 64)} {
-		file, _, problem := Open(layout, id)
+		file, _, problem := upload.Open(layout, id)
 		if file != nil {
 			file.Close()
 		}

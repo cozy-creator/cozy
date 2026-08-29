@@ -202,10 +202,9 @@ func (s *Server) baseline(next http.Handler) http.Handler {
 		// and this keeps it true if a future URL ever carries one.
 		h.Set("Referrer-Policy", "no-referrer")
 		// Nothing an API response renders may load, connect, or execute anything. The stub
-		// page sets its own, slightly wider, policy (still no inline script).
+		// page replaces this with its own slightly wider policy (still no inline script).
 		h.Set("Content-Security-Policy",
-			"default-src 'none'; script-src 'self'; style-src 'self'; img-src 'self' data: blob:; "+
-				"connect-src 'self'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'")
+			"default-src 'none'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'")
 		// NO Access-Control-Allow-* header is set anywhere in this package, deliberately.
 		next.ServeHTTP(w, r)
 	})
