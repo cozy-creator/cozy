@@ -18,14 +18,14 @@ import (
 	"github.com/cozy-creator/cozy-creator/internal/endpointpublish"
 )
 
-func TestEndpointPublishQualifyPromoteCLI(t *testing.T) {
+func TestEndpointPublishPromoteCLI(t *testing.T) {
 	source := trackedEndpointFixture(t)
 	var server *httptest.Server
 	var lock sync.Mutex
 	var declaration []byte
 	var declared endpointpublish.Declaration
 	put := map[string][]byte{}
-	beginCount, finalizeCount, qualificationReads := 0, 0, 0
+	beginCount, finalizeCount := 0, 0
 	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		if r.Method != http.MethodPut && r.Header.Get("Authorization") != "Bearer admin" {
@@ -106,33 +106,6 @@ func TestEndpointPublishQualifyPromoteCLI(t *testing.T) {
 						"resolved_wheel_set":        map[string]any{"digest": "sha256:" + strings.Repeat("1", 64), "length": 1},
 						"resolution_lock":           map[string]any{"digest": "sha256:" + strings.Repeat("2", 64), "length": 1}}},
 				"endpoint_executions": []map[string]string{{"profile": endpointprofile.CU126, "function": "marco", "digest": "sha256:" + strings.Repeat("1", 64), "state": "candidate"}}})
-		case r.Method == http.MethodPost && strings.HasSuffix(r.URL.Path, "/qualify"):
-			var body map[string]any
-			_ = json.NewDecoder(r.Body).Decode(&body)
-			if body["accelerator_model"] != "NVIDIA GeForce RTX 4090" ||
-				body["provider_exposure_limit_usd_micros"] != float64(250000) ||
-				body["duration_cap_s"] != float64(900) {
-				t.Errorf("qualification envelope changed: %v", body)
-			}
-			_ = json.NewEncoder(w).Encode(map[string]any{
-				"qualification_id": "qualification-1", "candidate_id": "candidate-130",
-				"state": "acquiring", "accelerator_model": body["accelerator_model"],
-				"provider_exposure_limit_usd_micros": 250000, "duration_cap_s": 900,
-				"model_qualification_spec_digest": "sha256:" + strings.Repeat("4", 64),
-				"reclaim_proven":                  false})
-		case r.Method == http.MethodGet && strings.HasSuffix(r.URL.Path, "/qualification"):
-			lock.Lock()
-			qualificationReads++
-			lock.Unlock()
-			_ = json.NewEncoder(w).Encode(map[string]any{
-				"qualification_id": "qualification-1", "candidate_id": "candidate-130",
-				"state": "qualified", "accelerator_model": "NVIDIA GeForce RTX 4090",
-				"provider_exposure_limit_usd_micros": 250000, "duration_cap_s": 900,
-				"observed_cost_usd_micros": 50000, "provider_resource_id": "pod-1",
-				"model_qualification_spec_digest": "sha256:" + strings.Repeat("4", 64),
-				"execution_observation_digest":    "sha256:" + strings.Repeat("5", 64),
-				"model_admission_decision_digest": "sha256:" + strings.Repeat("6", 64),
-				"reclaim_proven":                  true})
 		case r.Method == http.MethodPost && strings.HasSuffix(r.URL.Path, "/promote"):
 			var body struct {
 				Serving []map[string]string `json:"serving"`
@@ -170,18 +143,14 @@ func TestEndpointPublishQualifyPromoteCLI(t *testing.T) {
 	if code, out := run(replay...); code != 0 || !strings.Contains(out, "true") || !strings.Contains(out, "candidate") {
 		t.Fatalf("endpoint publish replay [exit %d]\n%s", code, out)
 	}
-	if code, out := run("endpoint", "qualify", "cozy/marco@1.0.0", "--profile", endpointprofile.CU130,
-		"--gpu", "NVIDIA GeForce RTX 4090", "--max-cost", "0.25", "--reason", "fixture qualification"); code != 0 || !strings.Contains(out, "acquiring") || !strings.Contains(out, "qualified") || !strings.Contains(out, "reclaimed:") || !strings.Contains(out, "true") {
-		t.Fatalf("endpoint qualify [exit %d]\n%s", code, out)
-	}
 	if code, out := run("endpoint", "promote", "cozy/marco", "1.0.0", "--serve", "v1/marco",
 		"--serve", "v1/edit", "--reason", "fixture promotion"); code != 0 || !strings.Contains(out, "serving:") || !strings.Contains(out, "one Tensorhub transaction") {
 		t.Fatalf("endpoint promote [exit %d]\n%s", code, out)
 	}
 	lock.Lock()
 	defer lock.Unlock()
-	if beginCount != 2 || finalizeCount != 2 || qualificationReads != 1 {
-		t.Fatalf("calls begin=%d finalize=%d qualification_reads=%d", beginCount, finalizeCount, qualificationReads)
+	if beginCount != 2 || finalizeCount != 2 {
+		t.Fatalf("calls begin=%d finalize=%d", beginCount, finalizeCount)
 	}
 }
 

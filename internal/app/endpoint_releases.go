@@ -5,12 +5,10 @@ import (
 	"fmt"
 	"regexp"
 	"sort"
-	"strconv"
 	"strings"
 	"sync"
 	"time"
 
-	"github.com/cozy-creator/cozy-creator/internal/endpointprofile"
 	"github.com/cozy-creator/cozy-creator/internal/endpointpublish"
 	"github.com/cozy-creator/cozy-creator/internal/exit"
 	"github.com/cozy-creator/cozy-creator/internal/hub"
@@ -99,10 +97,10 @@ func handleEndpointPublish(ctx *Context) *exit.Error {
 		fields = append(fields, render.Field{K: "profile_refusals", V: refusalRows})
 	}
 	return emit(ctx, render.Record{Kind: "endpoint publication", Fields: fields, Notes: []string{
-		"source/project bytes were published once; profile candidates are non-serving until explicit hardware qualification",
+		"source/project bytes were published once; Tensorhub returned each profile's proof-owned eligibility state",
 		"no endpoint image, Dockerfile, dependency resolver, native build, or serving-pointer move ran",
 	}, Next: []string{
-		"cozy endpoint qualify " + ref.String() + "@" + release + " --profile <profile> --gpu <model> --max-cost <usd> --reason <why>",
+		"cozy endpoint promote " + ref.String() + " " + release + " --serve <vN/function> --reason <why>",
 	}})
 }
 
@@ -313,150 +311,6 @@ func uploadEndpointRoles(ctx context.Context, pack *endpointpublish.Package,
 	return moved, held, nil
 }
 
-func handleEndpointQualify(ctx *Context) *exit.Error {
-	ref, release, problem := endpointReleaseRef(ctx.Inv.Args[0])
-	if problem != nil {
-		return problem
-	}
-	profiles, problem := endpointprofile.NormalizeSet(ctx.Inv.Values["--profile"])
-	if problem != nil {
-		return problem
-	}
-	if len(profiles) != 1 {
-		return exit.Usagef("`cozy endpoint qualify` takes exactly one --profile per paid operation")
-	}
-	gpu := strings.TrimSpace(ctx.Inv.Value("--gpu"))
-	if gpu == "" {
-		return exit.Usagef("`cozy endpoint qualify` needs --gpu <provider-neutral-model>")
-	}
-	maxCost, problem := parseUSDMicros(ctx.Inv.Value("--max-cost"))
-	if problem != nil {
-		return problem
-	}
-	durationText := strings.TrimSpace(ctx.Inv.Value("--duration"))
-	if durationText == "" {
-		durationText = "15m"
-	}
-	duration, err := time.ParseDuration(durationText)
-	if err != nil || duration <= 0 || duration > 24*time.Hour {
-		return exit.Usagef("--duration %q is not a positive duration at or below 24h", durationText)
-	}
-	reason, problem := mutationReason(ctx, "endpoint qualify")
-	if problem != nil {
-		return problem
-	}
-	c := client(ctx)
-	hctx, cancel := hub.LongContext()
-	if timeoutText := strings.TrimSpace(ctx.Inv.Value("--timeout")); timeoutText != "" {
-		timeout, err := time.ParseDuration(timeoutText)
-		if err != nil || timeout <= 0 {
-			cancel()
-			return exit.Usagef("--timeout %q is not a positive duration", timeoutText)
-		}
-		cancel()
-		hctx, cancel = context.WithTimeout(context.Background(), timeout)
-	}
-	defer cancel()
-	qualified, problem := c.QualifyEndpointProfile(hctx, ref, release, profiles[0],
-		hub.EndpointQualificationRequest{AcceleratorModel: gpu,
-			ProviderExposureLimitUSDMicros: maxCost, DurationCapSeconds: int64(duration / time.Second)}, reason)
-	if problem != nil {
-		return problem
-	}
-	if qualified.CandidateID == "" || qualified.QualificationID == "" || qualified.State == "" {
-		return exit.Internalf("endpoint qualification returned no candidate, qualification id, or state")
-	}
-	qualified, problem = waitQualification(ctx, hctx, c, ref, release, profiles[0], qualified)
-	if problem != nil {
-		return problem
-	}
-	if problem := emit(ctx, qualificationRecord(c.Base(), ref, release, profiles[0], qualified)); problem != nil {
-		return problem
-	}
-	if qualified.State != "qualified" {
-		code := exit.Failed
-		if qualified.State == "canceled" {
-			code = exit.Canceled
-		}
-		return exit.Named(code, "endpoint.qualification_"+qualified.State,
-			"qualification %s ended %s; cost %s; reclaimed=%t; evidence spec=%s observation=%s admission=%s",
-			qualified.QualificationID, qualified.State, microUSD(qualified.ObservedCostUSDMicros),
-			qualified.ReclaimProven, qualified.ModelQualificationSpecDigest,
-			qualified.ExecutionObservationDigest, qualified.ModelAdmissionDecisionDigest).
-			WithRemedy("repair the release/profile evidence and submit a new explicit qualification")
-	}
-	return nil
-}
-
-func waitQualification(ctx *Context, hctx context.Context, c *hub.Client, ref hub.Ref,
-	release, profile string, current hub.EndpointQualification,
-) (hub.EndpointQualification, *exit.Error) {
-	priorState := ""
-	for {
-		terminal := false
-		switch current.State {
-		case "pending", "acquiring", "booting", "running":
-			if current.ReclaimProven {
-				return current, exit.Internalf("transient qualification state %q incorrectly claims provider reclaim proof", current.State)
-			}
-		case "qualified", "refused", "failed", "canceled":
-			if !current.ReclaimProven {
-				return current, exit.Internalf("terminal qualification state %q arrived before provider reclaim proof", current.State)
-			}
-			terminal = true
-		default:
-			return current, exit.Internalf("Tensorhub returned unknown qualification state %q", current.State)
-		}
-		if terminal {
-			break
-		}
-		if current.State != priorState {
-			fmt.Fprintf(ctx.Err, "  qualification %s: %s (reclaimed=%t)\n",
-				current.QualificationID, current.State, current.ReclaimProven)
-			priorState = current.State
-		}
-		select {
-		case <-hctx.Done():
-			return current, exit.Named(exit.Deadline, "endpoint.qualification_wait_deadline",
-				"qualification %s is %s; the caller wait ended before terminal reclaim proof",
-				current.QualificationID, current.State).
-				WithRemedy("the paid operation remains Tensorhub-owned; re-run the exact qualify command to continue observing it")
-		case <-time.After(2 * time.Second):
-		}
-		next, problem := c.EndpointProfileQualification(hctx, ref, release, profile)
-		if problem != nil {
-			return current, problem
-		}
-		if current.QualificationID != "" && (next.QualificationID != current.QualificationID ||
-			next.CandidateID != current.CandidateID) {
-			return current, exit.Internalf("qualification read changed operation or candidate identity")
-		}
-		current = next
-	}
-	return current, nil
-}
-
-func qualificationRecord(base string, ref hub.Ref, release, profile string,
-	q hub.EndpointQualification,
-) render.Record {
-	rec := render.Record{Kind: "endpoint qualification", Fields: []render.Field{
-		{K: "endpoint", V: ref.String()}, {K: "release", V: release},
-		{K: "profile", V: profile}, {K: "qualification", V: q.QualificationID},
-		{K: "candidate", V: q.CandidateID}, {K: "state", V: q.State},
-		{K: "gpu", V: q.AcceleratorModel}, {K: "provider_resource", V: q.ProviderResourceID},
-		{K: "exposure", V: microUSD(q.ProviderExposureLimitUSDMicros)},
-		{K: "cost", V: microUSD(q.ObservedCostUSDMicros)}, {K: "reclaimed", V: q.ReclaimProven},
-		{K: "qualification_spec", V: q.ModelQualificationSpecDigest},
-		{K: "execution_observation", V: q.ExecutionObservationDigest},
-		{K: "admission_decision", V: q.ModelAdmissionDecisionDigest},
-		{K: "hub", V: base},
-	}}
-	if q.State == "qualified" {
-		rec.Next = []string{"cozy endpoint promote " + ref.String() + " " + release + " --serve <vN/function> --reason <why>"}
-	}
-	return rec
-}
-
 func handleEndpointPromote(ctx *Context) *exit.Error {
 	ref, problem := hub.ParseRef(ctx.Inv.Args[0])
 	if problem != nil {
@@ -534,39 +388,9 @@ func mutationReason(ctx *Context, command string) (string, *exit.Error) {
 	reason := strings.TrimSpace(ctx.Inv.Value("--reason"))
 	if reason == "" {
 		return "", exit.Usagef("`cozy %s` needs --reason <why>", command).
-			WithRemedy("Tensorhub records why every mutation or paid acquisition happened before it acts")
+			WithRemedy("Tensorhub records why every mutation happened before it acts")
 	}
 	return reason, nil
-}
-
-func parseUSDMicros(raw string) (int64, *exit.Error) {
-	value := strings.TrimSpace(strings.TrimPrefix(strings.TrimSpace(raw), "$"))
-	whole, fraction, found := strings.Cut(value, ".")
-	if !found {
-		fraction = ""
-	}
-	if whole == "" {
-		whole = "0"
-	}
-	if len(fraction) > 6 {
-		return 0, exit.Usagef("--max-cost %q has more than six decimal USD places", raw)
-	}
-	for len(fraction) < 6 {
-		fraction += "0"
-	}
-	if strings.HasPrefix(whole, "+") || strings.HasPrefix(whole, "-") {
-		return 0, exit.Usagef("--max-cost %q is not a positive USD amount", raw)
-	}
-	dollars, err1 := strconv.ParseInt(whole, 10, 64)
-	micros, err2 := strconv.ParseInt(fraction, 10, 64)
-	if err1 != nil || err2 != nil || dollars > (1<<53-1)/1_000_000 {
-		return 0, exit.Usagef("--max-cost %q is not an exact bounded USD amount", raw)
-	}
-	total := dollars*1_000_000 + micros
-	if total <= 0 {
-		return 0, exit.Usagef("--max-cost must be greater than zero")
-	}
-	return total, nil
 }
 
 func sameStrings(a, b []string) bool {
