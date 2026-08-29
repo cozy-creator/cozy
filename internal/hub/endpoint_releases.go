@@ -119,7 +119,6 @@ type LocalQualificationMaterials struct {
 	EndpointEnvironmentSpec ExactDocument     `json:"endpoint_environment_spec"`
 	EndpointBundle          ExactDocument     `json:"endpoint_bundle"`
 	Descriptor              ExactDocument     `json:"descriptor"`
-	EvaluatedConfig         ExactDocument     `json:"evaluated_config"`
 	WheelhouseManifest      ExactDocument     `json:"wheelhouse_manifest"`
 	ResolvedWheelSet        ExactDocument     `json:"resolved_wheel_set"`
 	ResolutionLock          ExactDocument     `json:"resolution_lock"`

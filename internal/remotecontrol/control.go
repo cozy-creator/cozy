@@ -48,7 +48,6 @@ type snapshot struct {
 	EndpointBundle              hub.ExactControlDocument `json:"endpoint_bundle"`
 	EndpointExecutionDigest     string                   `json:"endpoint_execution_digest"`
 	EnvironmentSpec             hub.ExactControlDocument `json:"environment_spec"`
-	EvaluatedConfig             hub.ExactControlDocument `json:"evaluated_config"`
 	Format                      string                   `json:"format"`
 	InstalledEnvironmentReceipt hub.ExactControlDocument `json:"installed_environment_receipt"`
 	PlacementSet                hub.ExactControlDocument `json:"placement_set"`
@@ -330,7 +329,6 @@ func Decode(control hub.ExactControlDocument, endpointRef string) (Facts, *exit.
 		"artifact_object_set": s.ArtifactObjectSet,
 		"binding_release":     s.BindingRelease, "descriptor": s.Descriptor,
 		"endpoint_bundle": s.EndpointBundle, "environment_spec": s.EnvironmentSpec,
-		"evaluated_config":              s.EvaluatedConfig,
 		"installed_environment_receipt": s.InstalledEnvironmentReceipt,
 		"placement_set":                 s.PlacementSet, "resolved_wheel_set": s.ResolvedWheelSet,
 	} {
@@ -457,7 +455,7 @@ func Decode(control hub.ExactControlDocument, endpointRef string) (Facts, *exit.
 	}
 
 	bundle, err := canonical.ReadObject(s.EndpointBundle.CanonicalBytes)
-	if err != nil || requireKeys(bundle, "descriptor", "endpoint_release_id", "evaluated_config", "format",
+	if err != nil || requireKeys(bundle, "descriptor", "endpoint_release_id", "format",
 		"project_wheel", "resolved_wheel_set", "source_archive", "source_lock", "wheelhouse_manifest") != nil ||
 		bundle.Str("format") != bundleFormat || bundle.Str("endpoint_release_id") != placementSpec.Str("endpoint_release_id") {
 		return facts, invalid("endpoint bundle disagrees with the placement: %v", err)
@@ -465,10 +463,6 @@ func Decode(control hub.ExactControlDocument, endpointRef string) (Facts, *exit.
 	bundleDescriptor, err := refOf(bundle.Sub("descriptor"))
 	if err != nil || !sameRef(bundleDescriptor, s.Descriptor) {
 		return facts, invalid("endpoint bundle descriptor differs from the exact descriptor")
-	}
-	configRef, err := refOf(bundle.Sub("evaluated_config"))
-	if err != nil || !sameRef(configRef, s.EvaluatedConfig) {
-		return facts, invalid("endpoint bundle evaluated config differs from the exact config")
 	}
 	sourceArchive, archiveErr := refOf(bundle.Sub("source_archive"))
 	sourceLock, lockErr := refOf(bundle.Sub("source_lock"))
@@ -591,11 +585,11 @@ func Decode(control hub.ExactControlDocument, endpointRef string) (Facts, *exit.
 		DescriptorDigest: s.Descriptor.Digest,
 		Bindings:         bindings, EnvironmentSpecDigest: s.EnvironmentSpec.Digest,
 		InstalledEnvironmentReceiptDigest: s.InstalledEnvironmentReceipt.Digest,
-		ConfigDigest:                      s.EvaluatedConfig.Digest, ExactPlacementSetDigest: s.PlacementSet.Digest,
-		ExactPlacementSetBytes: append([]byte(nil), s.PlacementSet.CanonicalBytes...),
-		PlacementIDValue:       s.AcquisitionAttemptID,
-		ModelObjectSetDigest:   s.ArtifactObjectSet.Digest,
-		ModelObjectSetLength:   uint64(s.ArtifactObjectSet.Length),
+		ExactPlacementSetDigest:           s.PlacementSet.Digest,
+		ExactPlacementSetBytes:            append([]byte(nil), s.PlacementSet.CanonicalBytes...),
+		PlacementIDValue:                  s.AcquisitionAttemptID,
+		ModelObjectSetDigest:              s.ArtifactObjectSet.Digest,
+		ModelObjectSetLength:              uint64(s.ArtifactObjectSet.Length),
 	}
 	return facts, nil
 }

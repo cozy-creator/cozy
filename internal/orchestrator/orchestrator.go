@@ -68,13 +68,13 @@ type Options struct {
 	// grants Tensorhub a worker credential or a competing control stream.
 	RelayRentalSession RentalSessionRelay
 
-	// EnvironmentSpecDigest and ConfigDigest are LOCAL placement defaults. They ride
+	// EnvironmentSpecDigest and ConfigDigest are LOCAL invocation defaults. They ride
 	// INSIDE every local InvocationSpec document:
 	// the EndpointEnvironmentSpec that IS this invocation's execution environment (#483 —
 	// was `ImageDigest`, and "image" is wrong for a native install with no OCI image at
-	// all) and the evaluated-config document's identity (cr-003's). They are frozen per
-	// service, never per request. A remote placement overrides both from Tensorhub's
-	// persisted attempt snapshot; a request cannot choose either environment.
+	// all) and the local evaluated-config document's identity (cr-003's). They are frozen
+	// per service, never per request. A remote placement supplies only Tensorhub's exact
+	// environment; its model configuration is bound separately.
 	EnvironmentSpecDigest string
 	ConfigDigest          string
 	MaxOutputMiB          int64

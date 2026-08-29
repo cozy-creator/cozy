@@ -62,7 +62,6 @@ func TestQualifiedManagedLocalInstall(t *testing.T) {
 	})
 	descriptor := jcs(t, map[string]any{"application": "marco:app", "entrypoints": []any{},
 		"format": "cozy.endpoint.descriptor/1", "jobs": []any{}})
-	evaluated := jcs(t, map[string]any{})
 	eesValue, err := canonical.Document(&pb.EndpointEnvironmentSpec{
 		PlatformTarget: &pb.PlatformTarget{OsArch: "linux/amd64", Libc: "glibc2.39",
 			PythonAbi: "cp312", AcceleratorBackend: "cuda", AcceleratorAbi: "cu130"},
@@ -195,7 +194,7 @@ print(json.dumps({"digest":"sha256:"+hashlib.sha256(evidence).hexdigest(),"lengt
 				"lease_id": "lease-local", "lease_expires_at": expiresAt,
 				"base_realization":          realization,
 				"endpoint_environment_spec": exactDoc(ees), "endpoint_bundle": exactDoc(bundle),
-				"descriptor": exactDoc(descriptor), "evaluated_config": exactDoc(evaluated),
+				"descriptor":         exactDoc(descriptor),
 				"resolved_wheel_set": exactDoc(resolved), "wheelhouse_manifest": exactDoc(wheelhouse),
 				"resolution_lock": exactDoc(lock),
 				"native_wheel_proof": map[string]any{

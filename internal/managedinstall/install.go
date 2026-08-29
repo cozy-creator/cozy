@@ -144,19 +144,11 @@ func Run(ctx context.Context, layout home.Layout, store *records.Store, request 
 		}
 		docPaths[item.name] = path
 	}
-	for _, item := range []struct {
-		name string
-		doc  hub.ExactDocument
-	}{
-		{"descriptor.json", grant.Descriptor},
-		{"evaluated-config.json", grant.EvaluatedConfig},
-	} {
-		path := filepath.Join(docDir, item.name)
-		if problem := writeSemanticDocument(path, item.doc); problem != nil {
-			return fail(problem)
-		}
-		docPaths[item.name] = path
+	descriptorPath := filepath.Join(docDir, "descriptor.json")
+	if problem := writeSemanticDocument(descriptorPath, grant.Descriptor); problem != nil {
+		return fail(problem)
 	}
+	docPaths["descriptor.json"] = descriptorPath
 	wheelFacts, problem := releaseWheelFacts(grant.EndpointBundle.CanonicalBytes,
 		grant.ResolvedWheelSet.CanonicalBytes)
 	if problem != nil {
