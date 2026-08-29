@@ -11,6 +11,7 @@ import (
 	"github.com/cozy-creator/cozy/internal/daemon"
 	"github.com/cozy-creator/cozy/internal/exit"
 	"github.com/cozy-creator/cozy/internal/home"
+	"github.com/cozy-creator/cozy/internal/hostgpu"
 	"github.com/cozy-creator/cozy/internal/hub"
 	"github.com/cozy-creator/cozy/internal/orchestrator"
 	"github.com/cozy-creator/cozy/internal/output"
@@ -53,12 +54,32 @@ func handleUp(ctx *Context) *exit.Error {
 	if problem != nil {
 		return problem
 	}
+	inventory := hostgpu.Probe(ctx.Cfg)
+	summaries := make([]string, 0, len(inventory.GPUs))
+	for _, gpu := range inventory.GPUs {
+		cuda := "driver CUDA unknown"
+		if gpu.DriverCUDAVersion != "" {
+			cuda = "driver CUDA " + gpu.DriverCUDAVersion
+		}
+		summaries = append(summaries, fmt.Sprintf(
+			"GPU %d · %s · %.1f / %.1f GiB free · driver %s · %s · %s",
+			gpu.Index, gpu.Model, float64(gpu.VRAMFreeBytes)/(1<<30),
+			float64(gpu.VRAMTotalBytes)/(1<<30), gpu.DriverVersion, cuda, gpu.SM))
+	}
 	fields := []output.Field{
 		{K: "daemon", V: "running"}, {K: "url", V: "http://" + state.Addr + "/"},
 		{K: "api", V: "http://" + state.Addr}, {K: "pid", V: state.PID},
-		{K: "since", V: state.Since}, {K: "changed", V: changed},
+		{K: "since", V: state.Since}, {K: "gpus", V: summaries},
+		{K: "gpu_count", V: len(inventory.GPUs)}, {K: "gpu_details", V: inventory.GPUs},
+		{K: "changed", V: changed},
 	}
-	return emit(ctx, compactRecord(fields, "url", "changed"))
+	record := compactRecord(fields, "url", "gpus", "changed")
+	if inventory.Diagnostic != "" {
+		record.Notes = append(record.Notes, inventory.Diagnostic)
+	} else if len(inventory.GPUs) == 0 {
+		record.Notes = append(record.Notes, "no NVIDIA GPUs detected")
+	}
+	return emit(ctx, record)
 }
 
 func handleDown(ctx *Context) *exit.Error {
@@ -203,7 +224,7 @@ func resolveRentalOperation(ctx *Context, key string) (string, *exit.Error) {
 		return "", problem
 	}
 	if problem := store.RecordRental(records.Rental{
-		ID: seen.ID, PackageRef: request.PackageRef, AcceleratorModel: request.AcceleratorModel,
+		ID: seen.ID, PackageRef: request.PackageRef, AcceleratorModel: seen.AcceleratorModel,
 		State: seen.State, Hub: operation.Hub,
 	}); problem != nil {
 		return "", problem

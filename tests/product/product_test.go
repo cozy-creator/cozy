@@ -8,6 +8,7 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"net/http/httptest"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -128,6 +129,88 @@ func TestDaemonWebLifecycle(t *testing.T) {
 	if code, out := runCozy(t, root, "down"); code != 0 ||
 		!strings.Contains(out, "daemon:") || !strings.Contains(out, "stopped") {
 		t.Fatalf("final down [exit %d]\n%s", code, out)
+	}
+}
+
+func TestUpReportsLocalGPUCompatibility(t *testing.T) {
+	root := filepath.Join(os.TempDir(), "cozy-product-test", "up-gpu-compatibility")
+	must(t, os.RemoveAll(root))
+	toolDir := t.TempDir()
+	nvidiaSMI := filepath.Join(toolDir, "nvidia-smi")
+	must(t, os.WriteFile(nvidiaSMI, []byte(`#!/bin/sh
+case "$1" in
+  --query-gpu=*) printf '0,"NVIDIA, Test GPU",12288,24576,550.54,8.9\n' ;;
+  *) printf '| NVIDIA-SMI 550.54 Driver Version: 550.54 CUDA Version: 12.6 |\n' ;;
+esac
+`), 0o755))
+	env := childEnv(t, root, "PATH="+toolDir)
+	t.Cleanup(func() { _ = runCozyEnv(env, "down", "--all") })
+
+	result := runCozyEnv(env, "up", "--json", "--full")
+	if result.code != 0 {
+		t.Fatalf("up with NVIDIA GPU failed [exit %d]\n%s", result.code, result.output)
+	}
+	var document struct {
+		GPUs       []string `json:"gpus"`
+		GPUCount   int      `json:"gpu_count"`
+		GPUDetails []struct {
+			Model             string `json:"model"`
+			VRAMFreeBytes     int64  `json:"vram_free_bytes"`
+			VRAMTotalBytes    int64  `json:"vram_total_bytes"`
+			DriverVersion     string `json:"driver_version"`
+			DriverCUDAVersion string `json:"driver_cuda_version"`
+			ComputeCapability string `json:"compute_capability"`
+			SM                string `json:"sm"`
+		} `json:"gpu_details"`
+	}
+	if err := json.Unmarshal([]byte(result.output), &document); err != nil ||
+		document.GPUCount != 1 || len(document.GPUs) != 1 || len(document.GPUDetails) != 1 {
+		t.Fatalf("up did not return one typed GPU: %v\n%s", err, result.output)
+	}
+	gpu := document.GPUDetails[0]
+	if gpu.Model != "NVIDIA, Test GPU" || gpu.VRAMFreeBytes != 12<<30 ||
+		gpu.VRAMTotalBytes != 24<<30 || gpu.DriverVersion != "550.54" ||
+		gpu.DriverCUDAVersion != "12.6" || gpu.ComputeCapability != "8.9" || gpu.SM != "sm_89" {
+		t.Fatalf("up GPU compatibility facts drifted: %+v", gpu)
+	}
+	for _, want := range []string{"NVIDIA, Test GPU", "12.0 / 24.0 GiB free", "driver 550.54", "driver CUDA 12.6", "sm_89"} {
+		if !strings.Contains(document.GPUs[0], want) {
+			t.Fatalf("up GPU summary omitted %q: %s", want, document.GPUs[0])
+		}
+	}
+}
+
+func TestRentalGPUCatalog(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet || r.URL.Path != "/v1/rental-skus" {
+			http.NotFound(w, r)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{"skus":[{"name":"h200","accelerator_model":"NVIDIA H200","vram_gb":141,"price_usd_micros_per_hour":6000000},{"name":"rtx-4090","accelerator_model":"NVIDIA GeForce RTX 4090","vram_gb":24,"price_usd_micros_per_hour":1250000}]}`)
+	}))
+	defer server.Close()
+	root := filepath.Join(os.TempDir(), "cozy-product-test", "rental-gpu-catalog")
+	must(t, os.RemoveAll(root))
+	env := childEnv(t, root, "TENSORHUB_URL="+server.URL)
+
+	result := runCozyEnv(env, "rental", "new", "--json")
+	if result.code != 0 {
+		t.Fatalf("rental catalog failed [exit %d]\n%s", result.code, result.output)
+	}
+	var document struct {
+		GPUs []map[string]string `json:"gpus"`
+	}
+	if err := json.Unmarshal([]byte(result.output), &document); err != nil || len(document.GPUs) != 2 {
+		t.Fatalf("rental catalog was not a two-row GPU list: %v\n%s", err, result.output)
+	}
+	if document.GPUs[0]["name"] != "h200" || document.GPUs[0]["model"] != "NVIDIA H200" ||
+		document.GPUs[0]["vram"] != "141 GB" || document.GPUs[0]["price"] != "$6/hr" ||
+		document.GPUs[1]["price"] != "$1.25/hr" {
+		t.Fatalf("rental catalog values drifted: %#v", document.GPUs)
+	}
+	if result := runCozyEnv(env, "rental", "new", "h200"); result.code != 2 || !strings.Contains(result.output, "org/package/vN/function") {
+		t.Fatalf("selected GPU without package did not explain the remaining argument [exit %d]\n%s", result.code, result.output)
 	}
 }
 

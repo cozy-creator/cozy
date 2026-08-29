@@ -28,7 +28,9 @@ import (
 //
 // The contract is the hub's and is consumed verbatim, exactly as the catalog's is:
 //
-//	POST   /v1/private-rentals       {package_ref, accelerator_model,
+//	GET    /v1/rental-skus           -> {skus:[{name, accelerator_model, vram_gb,
+//	                                 price_usd_micros_per_hour}]}
+//	POST   /v1/private-rentals       {package_ref, sku,
 //	                                 renter_token_sha256:[<64 hex>]}
 //	                                 -> 202 {rental_id, state, ...}
 //	GET    /v1/private-rentals/{id}  -> {state, worker_address, cert_pem, media_address,
@@ -59,12 +61,13 @@ const (
 // Rental is one rented pod as the hub reports it. There is no token on it, and there is
 // no route that adds one: this host has the token because this host minted it.
 type Rental struct {
-	ID         string
-	State      string
-	PackageRef string
-	Address    string
-	CertPEM    string
-	Detail     string
+	ID               string
+	State            string
+	PackageRef       string
+	AcceleratorModel string
+	Address          string
+	CertPEM          string
+	Detail           string
 	// MediaAddress is the pod's BYTE PLANE (cl-014, ruled #506b): the co-resident media
 	// server's own listener, which is where an owner uploads a payload and downloads an
 	// output. The hub observed it and names it.
@@ -129,6 +132,7 @@ type wireRental struct {
 	ID                string                `json:"rental_id"`
 	State             string                `json:"state"`
 	PackageRef        string                `json:"package_ref"`
+	AcceleratorModel  string                `json:"requested_accelerator_model"`
 	WorkerAddress     string                `json:"worker_address"`
 	CertPEM           string                `json:"cert_pem"`
 	Detail            string                `json:"detail"`
@@ -157,7 +161,8 @@ func validateRentalID(id string) *exit.Error {
 func (w wireRental) rental() Rental {
 	return Rental{
 		ID: w.ID, State: w.State, PackageRef: w.PackageRef,
-		Address: w.WorkerAddress, CertPEM: w.CertPEM,
+		AcceleratorModel: w.AcceleratorModel,
+		Address:          w.WorkerAddress, CertPEM: w.CertPEM,
 		Detail: w.Detail, MediaAddress: w.MediaAddress,
 		TokenSHA256: w.TokenSHA256, ControlSnapshot: w.ControlSnapshot,
 		PlacementRevision: w.PlacementRevision,
@@ -169,28 +174,58 @@ func (w wireRental) rental() Rental {
 // here: Tensorhub resolves and selects them.
 type RentalRequest struct {
 	PackageRef        string   `json:"package_ref"`
-	AcceleratorModel  string   `json:"accelerator_model"`
+	SKU               string   `json:"sku"`
 	RenterTokenSHA256 []string `json:"renter_token_sha256"`
 }
 
 // RentalRequestBytes authors the exact bytes persisted before POST and replayed
 // unchanged after response loss. There is one encoder, not a digest struct plus
 // a separately marshaled transport map that can drift.
-func RentalRequestBytes(packageRef, acceleratorModel, tokenSHA256 string) ([]byte, *exit.Error) {
+func RentalRequestBytes(packageRef, sku, tokenSHA256 string) ([]byte, *exit.Error) {
 	req := RentalRequest{
-		PackageRef: strings.TrimSpace(packageRef), AcceleratorModel: strings.TrimSpace(acceleratorModel),
+		PackageRef: strings.TrimSpace(packageRef), SKU: strings.TrimSpace(sku),
 		RenterTokenSHA256: []string{strings.TrimPrefix(strings.TrimSpace(tokenSHA256), "sha256:")},
 	}
-	if req.PackageRef == "" || req.AcceleratorModel == "" ||
+	if req.PackageRef == "" || req.SKU == "" ||
 		!bareSHA256Pattern.MatchString(req.RenterTokenSHA256[0]) {
 		return nil, exit.Named(exit.Validation, "rental.intent_incomplete",
-			"package_ref, accelerator_model, and one 64-character lowercase renter_token_sha256 are required")
+			"package_ref, sku, and one 64-character lowercase renter_token_sha256 are required")
 	}
 	raw, err := json.Marshal(req)
 	if err != nil {
 		return nil, exit.Internalf("cannot encode the closed rental request: %s", err)
 	}
 	return raw, nil
+}
+
+// RentalSKU is one Cozy-priced product choice. Provider offer names and prices
+// are deliberately absent: the caller rents from Tensorhub, not its adapter.
+type RentalSKU struct {
+	Name                  string `json:"name"`
+	AcceleratorModel      string `json:"accelerator_model"`
+	VRAMGB                int64  `json:"vram_gb"`
+	PriceUSDMicrosPerHour int64  `json:"price_usd_micros_per_hour"`
+}
+
+// RentalSKUs reads Tensorhub's public product catalog.
+func (c *Client) RentalSKUs(ctx context.Context) ([]RentalSKU, *exit.Error) {
+	var out struct {
+		SKUs []RentalSKU `json:"skus"`
+	}
+	if e := c.do(ctx, call{method: http.MethodGet, path: "/v1/rental-skus"}, &out); e != nil {
+		return nil, e
+	}
+	seen := map[string]bool{}
+	for _, sku := range out.SKUs {
+		if strings.TrimSpace(sku.Name) == "" || strings.TrimSpace(sku.AcceleratorModel) == "" ||
+			sku.VRAMGB <= 0 || sku.PriceUSDMicrosPerHour <= 0 || seen[sku.Name] {
+			return nil, exit.Named(exit.Conflict, "hub.rental_catalog_invalid",
+				"the hub returned an invalid or duplicate rental SKU %q", sku.Name).
+				WithRemedy("Tensorhub must publish unique names with model, positive VRAM, and positive Cozy price")
+		}
+		seen[sku.Name] = true
+	}
+	return out.SKUs, nil
 }
 
 // Rent asks for a pod, presenting the HASH of a token the caller has already minted. It

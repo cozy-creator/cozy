@@ -140,14 +140,17 @@ reuse; job workers are reclaimed at terminal.
 With Tensorhub configured, rent a private worker for an exact package:
 
 ```sh
-cozy rental new org/package@release \
-  --accelerator "NVIDIA H200" \
+cozy rental new                    # Cozy GPUs, VRAM, and retail hourly prices
+cozy rental new h200 org/package/v1/generate \
   --idempotency-key <unique-key>
 
 cozy rental list
 cozy invoke run org/package/v1/generate --worker <rental-id> prompt="moonlit lake"
 cozy rental end <rental-id>
 ```
+
+GPU names and prices come from Tensorhub's Cozy-owned rental catalog. Creator never exposes or
+reads RunPod SKU names or provider prices.
 
 Rentals can continue billing until Tensorhub confirms their termination. `rental end` and
 `down --all` keep the Cozy daemon alive when remote absence cannot be confirmed.
