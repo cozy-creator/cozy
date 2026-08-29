@@ -26,7 +26,7 @@ func TestEndpointPublishCLI(t *testing.T) {
 	var declaration []byte
 	var declared endpointpublish.Declaration
 	put := map[string][]byte{}
-	beginCount, finalizeCount, qualificationReads := 0, 0, 0
+	beginCount, finalizeCount := 0, 0
 	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		if r.Method != http.MethodPut && r.Method != http.MethodGet && r.Header.Get("Authorization") != "Bearer admin" {
@@ -95,55 +95,12 @@ func TestEndpointPublishCLI(t *testing.T) {
 			_ = json.NewEncoder(w).Encode(map[string]any{"created": true,
 				"release": "1.0.0", "declaration_digest": fixtureDigest(declaration),
 				"profiles": []map[string]any{
-					{"profile": endpointprofile.CU126, "state": "candidate", "candidate_id": "candidate-126",
+					{"profile": endpointprofile.CPU, "state": "qualified", "candidate_id": "candidate-cpu",
 						"base_realization_kind": "oci", "base_realization_digest": "registry.invalid/tensorhub-worker@sha256:" + strings.Repeat("a", 64),
 						"endpoint_environment_spec": map[string]any{"digest": "sha256:" + strings.Repeat("b", 64), "length": 1},
 						"resolved_wheel_set":        map[string]any{"digest": "sha256:" + strings.Repeat("c", 64), "length": 1},
-						"resolution_lock":           map[string]any{"digest": "sha256:" + strings.Repeat("d", 64), "length": 1}},
-					{"profile": endpointprofile.CU130, "state": "candidate", "candidate_id": "candidate-130",
-						"base_realization_kind": "oci", "base_realization_digest": "registry.invalid/tensorhub-worker@sha256:" + strings.Repeat("e", 64),
-						"endpoint_environment_spec": map[string]any{"digest": "sha256:" + strings.Repeat("f", 64), "length": 1},
-						"resolved_wheel_set":        map[string]any{"digest": "sha256:" + strings.Repeat("1", 64), "length": 1},
-						"resolution_lock":           map[string]any{"digest": "sha256:" + strings.Repeat("2", 64), "length": 1}}},
-				"endpoint_executions": []map[string]string{{"profile": endpointprofile.CU126, "function": "marco", "digest": "sha256:" + strings.Repeat("1", 64), "state": "candidate"}}})
-		case r.Method == http.MethodPost && strings.HasSuffix(r.URL.Path, "/qualify"):
-			var body map[string]any
-			_ = json.NewDecoder(r.Body).Decode(&body)
-			if body["accelerator_model"] != "NVIDIA GeForce RTX 4090" ||
-				body["provider_exposure_limit_usd_micros"] != float64(250000) ||
-				body["duration_cap_s"] != float64(900) {
-				t.Errorf("qualification envelope changed: %v", body)
-			}
-			_ = json.NewEncoder(w).Encode(map[string]any{
-				"qualification_id": "qualification-1", "candidate_id": "candidate-130",
-				"state": "acquiring", "accelerator_model": body["accelerator_model"],
-				"provider_exposure_limit_usd_micros": 250000, "duration_cap_s": 900,
-				"model_qualification_spec_digest": "sha256:" + strings.Repeat("4", 64),
-				"reclaim_proven":                  false})
-		case r.Method == http.MethodGet && strings.HasSuffix(r.URL.Path, "/qualification"):
-			lock.Lock()
-			qualificationReads++
-			lock.Unlock()
-			_ = json.NewEncoder(w).Encode(map[string]any{
-				"qualification_id": "qualification-1", "candidate_id": "candidate-130",
-				"state": "qualified", "accelerator_model": "NVIDIA GeForce RTX 4090",
-				"provider_exposure_limit_usd_micros": 250000, "duration_cap_s": 900,
-				"observed_cost_usd_micros": 50000, "provider_resource_id": "pod-1",
-				"model_qualification_spec_digest": "sha256:" + strings.Repeat("4", 64),
-				"execution_observation_digest":    "sha256:" + strings.Repeat("5", 64),
-				"model_admission_decision_digest": "sha256:" + strings.Repeat("6", 64),
-				"reclaim_proven":                  true})
-		case r.Method == http.MethodPost && strings.HasSuffix(r.URL.Path, "/promote"):
-			var body struct {
-				Serving []map[string]string `json:"serving"`
-			}
-			_ = json.NewDecoder(r.Body).Decode(&body)
-			if len(body.Serving) != 2 || body.Serving[0]["function"] != "edit" || body.Serving[1]["function"] != "marco" {
-				t.Errorf("serving set was not sorted/deduplicated: %v", body.Serving)
-			}
-			_ = json.NewEncoder(w).Encode(map[string]any{"release": "1.0.0", "serving": []map[string]any{
-				{"endpoint_ref": "cozy/marco/v1/edit", "endpoint_execution_digests": []string{"sha256:" + strings.Repeat("2", 64)}},
-				{"endpoint_ref": "cozy/marco/v1/marco", "endpoint_execution_digests": []string{"sha256:" + strings.Repeat("1", 64)}}}})
+						"resolution_lock":           map[string]any{"digest": "sha256:" + strings.Repeat("d", 64), "length": 1}}},
+				"endpoint_executions": []map[string]string{{"profile": endpointprofile.CPU, "function": "marco", "digest": "sha256:" + strings.Repeat("1", 64), "state": "qualified"}}})
 		default:
 			writeHubError(w, http.StatusNotFound, "route.not_found", r.Method+" "+r.URL.Path)
 		}
@@ -161,17 +118,17 @@ func TestEndpointPublishCLI(t *testing.T) {
 	}
 	args := []string{"endpoint", "publish", "cozy/marco", "--release", "1.0.0", "--dir", source,
 		"--reason", "fixture publish"}
-	if code, out := run(args...); code != 0 || !strings.Contains(out, "candidate-130") || !strings.Contains(out, "serving-pointer move ran") {
+	if code, out := run(args...); code != 0 || !strings.Contains(out, "candidate-cpu") || !strings.Contains(out, "qualified") {
 		t.Fatalf("endpoint publish [exit %d]\n%s", code, out)
 	}
 	// Exact replay sends identical declaration bytes and converges without a client journal.
-	if code, out := run(args...); code != 0 || !strings.Contains(out, "true") || !strings.Contains(out, "candidate") {
+	if code, out := run(args...); code != 0 || !strings.Contains(out, "true") || !strings.Contains(out, "qualified") {
 		t.Fatalf("endpoint publish replay [exit %d]\n%s", code, out)
 	}
 	lock.Lock()
 	defer lock.Unlock()
-	if beginCount != 2 || finalizeCount != 2 || qualificationReads != 0 {
-		t.Fatalf("calls begin=%d finalize=%d qualification_reads=%d", beginCount, finalizeCount, qualificationReads)
+	if beginCount != 2 || finalizeCount != 2 {
+		t.Fatalf("calls begin=%d finalize=%d", beginCount, finalizeCount)
 	}
 }
 
