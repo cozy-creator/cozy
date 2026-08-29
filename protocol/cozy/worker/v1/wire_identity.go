@@ -5,8 +5,8 @@ package workerprotov1
 const WireMinor uint32 = 2
 
 // WireSchemaRev is which SHAPE this is (#530-A1). Diagnostics and ordering only.
-const WireSchemaRev uint32 = 8
+const WireSchemaRev uint32 = 9
 
 // SchemaDigest is THE FENCE: sha256 of the canonical `cozy.worker.v1.WireSchema/1` document.
 // Carried on Claim/ClaimAck; a mismatch or an absence refuses at the handshake.
-const SchemaDigest = "sha256:1f1f3d0d36d881000bd713bad55dd5c00414a69c663edd3662f502ea211004e7"
+const SchemaDigest = "sha256:bd5b140301ad81a6bb4b2d2ad16f2aadd549566142760996b3f3e665acc50537"

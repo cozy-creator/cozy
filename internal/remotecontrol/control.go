@@ -219,11 +219,11 @@ func validateOverlayReceipt(raw []byte, environmentRef hub.ExactControlDocument,
 	if err != nil {
 		return fmt.Errorf("resolved wheel set is not canonical: %w", err)
 	}
-	if err := requireKeys(resolved, "format", "lock_digest", "platform_target",
+	if err := requireKeys(resolved, "compatibility_profile", "format", "lock_digest", "platform_target",
 		"wheelhouse_manifest_digest", "wheels"); err != nil {
 		return fmt.Errorf("resolved wheel set is not closed: %w", err)
 	}
-	if resolved.Str("format") != "ResolvedWheelSet/2" ||
+	if resolved.Str("format") != "ResolvedWheelSet/3" ||
 		resolved.Str("wheelhouse_manifest_digest") != environment.Str("wheelhouse_manifest_digest") {
 		return fmt.Errorf("resolved wheel set disagrees with the selected environment")
 	}
@@ -237,6 +237,15 @@ func validateOverlayReceipt(raw []byte, environmentRef hub.ExactControlDocument,
 	for _, key := range []string{"accelerator_abi", "accelerator_backend", "libc", "os_arch", "python_abi"} {
 		if resolvedTarget.Str(key) == "" || resolvedTarget.Str(key) != environmentTarget.Str(key) {
 			return fmt.Errorf("resolved wheel set platform target disagrees on %s", key)
+		}
+	}
+	resolvedProfile, environmentProfile := resolved.Sub("compatibility_profile"), environment.Sub("compatibility_profile")
+	if err := requireKeys(resolvedProfile, "accelerator_build", "os_cpu", "python_abi", "torch_release"); err != nil {
+		return fmt.Errorf("resolved wheel set compatibility profile: %w", err)
+	}
+	for _, key := range []string{"accelerator_build", "os_cpu", "python_abi", "torch_release"} {
+		if resolvedProfile.Str(key) == "" || resolvedProfile.Str(key) != environmentProfile.Str(key) {
+			return fmt.Errorf("resolved wheel set compatibility profile disagrees on %s", key)
 		}
 	}
 	rawCustom, ok := resolved["wheels"].([]canonical.Value)
