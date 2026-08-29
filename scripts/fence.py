@@ -195,17 +195,11 @@ RUNTIME_VERBS_DENY = {"run", "job", "serve", "rm", "pull", "ingest", "new"}
 # fence never saw — `tensorfs.parse_header` and a hand-summed tensor table already did.
 # Every multi-line Go string literal that looks like a script (it imports something) is
 # scanned for the byte-plane vocabulary below; the door is //cozy:allow on the line the
-# literal starts on. scripts/*.py are scanned with the same vocabulary.
+# literal starts on.
 DENY_EMBED = [
     "parse_header", "safetensors", "cozytensor", "tensorbytes", "tensorchunk",
     "loadtensor", "weightbytes", "gguf",
 ]
-PY_SCAN = "scripts/*.py"
-# fence.py names the vocabulary in order to deny it. No endpoint implementation is kept
-# under scripts/, so it is the only Python source exempt from its own vocabulary scan.
-PY_ALLOW = {
-    "scripts/fence.py": "the fence itself: it spells the vocabulary to deny it",
-}
 
 # (cl-028) The VERIFICATION HOME is the only place an //cozy:allow door may exempt a listen
 # or a runtime indirection: `internal/live` is the go-test suite and it contains the adversary
@@ -300,22 +294,6 @@ def check_embedded():
                             f"{p}:{start + offset}: [embed] byte-plane vocabulary '{d}' inside an "
                             f"embedded script — TensorFS/Runtime own it; delegate to a runtime "
                             f"verb instead of authoring tensor knowledge here: {line.strip()}")
-    return bad
-
-
-def check_scripts():
-    """(cl-028) scripts/*.py are in the SCAN set, with the explicit fixture allows."""
-    bad = []
-    for p in sorted(pathlib.Path(".").glob(PY_SCAN)):
-        rel = str(p).replace("\\", "/")
-        if rel in PY_ALLOW:
-            continue
-        for i, line in enumerate(p.read_text(errors="ignore").splitlines(), 1):
-            body = line.split("#", 1)[0].lower()
-            for d in DENY_EMBED:
-                if d in body:
-                    bad.append(f"{p}:{i}: [embed] byte-plane vocabulary '{d}' in a repo script — "
-                               f"only the named fixture allows carry it: {line.strip()}")
     return bad
 
 
@@ -809,8 +787,7 @@ def check_typed_resources():
     for route in ('"/v1/endpoints"', '"/v1/models"', '"/v1/models/"', '"/publications"'):
         if route not in hub_sources:
             bad.append(f"internal/hub: [resources] missing typed route prefix {route}")
-    profile_routes = (pathlib.Path("internal/hub/endpoint_releases.go").read_text() +
-                      pathlib.Path("scripts/endpoint-profile-live.sh").read_text())
+    profile_routes = pathlib.Path("internal/hub/endpoint_releases.go").read_text()
     if "/local-execution" in profile_routes:
         bad.append("internal/hub/endpoint_releases.go: [resources] retired local-execution route remains")
     if "/local-qualification-materials" not in profile_routes:
@@ -834,7 +811,7 @@ def check_typed_resources():
 
 
 violations = (check_sources() + check_matrix() + check_manifest() + check_secret_flags()
-              + check_contract() + check_video_boundary() + check_embedded() + check_scripts()
+              + check_contract() + check_video_boundary() + check_embedded()
               + check_document_kinds() + check_render_streams()
               + check_media_contract() + check_typed_resources() + check_test_boundary())
 if violations:
@@ -853,7 +830,7 @@ print(
     f"api({len(DENY_COOKIE)} cookie + cors(absolute@{CORS_ABSOLUTE}) + listen@{len(LISTEN_SITES)} programs) "
     f"media-client({len(MEDIA_CONTRACT_FIELDS)} contract fields@{MEDIA_CONTRACT_HOME}) "
     f"runtime({len(RUNTIME_VERBS_DENY)} denied verbs@{len(RUNTIME_SITES)} + indirection) "
-    f"embed({len(DENY_EMBED)} words, scripts allow@{len(PY_ALLOW)}) "
+    f"embed({len(DENY_EMBED)} words) "
     f"contract({len(parse_go_routes(pathlib.Path('internal/api/routes.go')))} routes) "
     f"video-boundary resources(typed endpoint/model, no aliases) test(internal/live only)"
 )

@@ -72,9 +72,8 @@ jobs:
   # fact about the artifact a user would install. They are separate evidence axes and a
   # master-only green may not stand in for this one.
   #
-  # The weightless ENDPOINT leg is deliberately absent here: it needs the cozy-runtime peer
-  # to build its release, which this runner does not have. `scripts/clean-machine.sh` runs
-  # the same fixture with `--endpoint` on a machine that does.
+  # Endpoint execution is covered by internal/live/TestProductPath when a cozy-runtime peer
+  # exists. This job stays about the shipped CLI asset: build, verify, install, run, upgrade.
   release:
     runs-on: ubuntu-latest
     steps:

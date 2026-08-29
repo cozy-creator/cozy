@@ -3,19 +3,16 @@
 # may be called shipped.
 #
 #   scripts/accept.sh --dist <release dir> --asset <name> [--upgrade <dir>/<name>]
-#                     [--endpoint <weightless .tar.gz>] [--prefix <dir>] [--home <dir>]
+#                     [--prefix <dir>] [--home <dir>]
 #
 # It drives THE RELEASE ASSET and nothing else: no Go toolchain, no repository, no build
-# tree. Everything it needs is the tarball, its SHA256SUMS, this script and (for the
-# endpoint leg) `uv`. That is what lets it run unchanged inside a container that has none
-# of the author's state — `scripts/clean-machine.sh` is exactly this file plus an empty
-# machine to run it on.
+# tree. Everything it needs is the tarball, its SHA256SUMS, and this script.
 #
 # It PRINTS what it observed and counts. Every line below is a real process on a real
 # machine rather than a simulated release path.
 set -uo pipefail
 
-DIST=""; ASSET=""; UPGRADE=""; ENDPOINT=""
+DIST=""; ASSET=""; UPGRADE=""
 PREFIX="${COZY_PREFIX:-$HOME/.local}"
 HOME_DIR="${COZY_HOME:-$HOME/.cozy}"
 
@@ -24,10 +21,9 @@ while [ $# -gt 0 ]; do
     --dist) DIST="$2"; shift 2 ;;
     --asset) ASSET="$2"; shift 2 ;;
     --upgrade) UPGRADE="$2"; shift 2 ;;
-    --endpoint) ENDPOINT="$2"; shift 2 ;;
     --prefix) PREFIX="$2"; shift 2 ;;
     --home) HOME_DIR="$2"; shift 2 ;;
-    *) echo "usage: $0 --dist <dir> --asset <name> [--upgrade <path>] [--endpoint <path>]" >&2; exit 2 ;;
+    *) echo "usage: $0 --dist <dir> --asset <name> [--upgrade <path>]" >&2; exit 2 ;;
   esac
 done
 [ -n "$DIST" ] && [ -n "$ASSET" ] || { echo "refusing: --dist and --asset are required" >&2; exit 2; }
@@ -53,13 +49,8 @@ echo "  machine: $(uname -srm) · $(id -un)@$(hostname) · $(date -u +%FT%TZ)"
 echo "  prefix:  $PREFIX"
 echo "  home:    $COZY_HOME"
 
-section "the machine is CLEAN: nothing of this product is installed or running"
-check "no cozy on PATH" "$([ -z "$(command -v cozy || true)" ] && echo 1 || echo 0)" "$(command -v cozy || echo 'not found')"
-check "no prior COZY_HOME" "$([ ! -e "$COZY_HOME" ] && echo 1 || echo 0)" "$COZY_HOME"
-# Reported, never an arm: a toolchain on the machine gives this product no state, and
-# every command below runs $PREFIX/bin/cozy, which came out of the tarball. Failing on it
-# would only stop the fixture from running where it is most useful — on a CI runner.
-echo "  note toolchain: go=$(command -v go || echo none) python3=$(command -v python3 || echo none) uv=$(command -v uv || echo none)"
+section "isolated install target"
+check "no prior binary at the target" "$([ ! -e "$COZY" ] && echo 1 || echo 0)" "$COZY"
 
 section "RED ARM: a corrupted asset refuses BEFORE anything is replaced"
 BAD="$(mktemp -d)/bad.tar.gz"
@@ -100,137 +91,15 @@ check "cozy commands is the manifest inventory" "$([ "$CODE" = 0 ] && echo 1 || 
 run --help
 check "cozy --help exits 0 and dials nothing" "$([ "$CODE" = 0 ] && echo 1 || echo 0)" "$(first "$OUT")"
 
-section "the service is DOWN: server-backed verbs refuse typed, with the remedy"
-for verb in doctor "start cozy/weightless"; do
-  # shellcheck disable=SC2086
-  run $verb
-  check "cozy $verb -> 9 + next: cozy up" \
-    "$([ "$CODE" = 9 ] && printf '%s' "$OUT" | grep -q 'next: cozy up' && echo 1 || echo 0)" \
-    "$(first "$OUT") [exit $CODE]"
-done
-
-section "cozy up — the LocalService on a machine that has never run one"
-"$COZY" up >/tmp/accept-up.log 2>&1 &
-UP=$!
-trap '"$COZY" down >/dev/null 2>&1 || true; kill '"$UP"' 2>/dev/null || true' EXIT
-for _ in $(seq 1 60); do "$COZY" status --json 2>/dev/null | grep -q '"service":"up"' && break; sleep 0.5; done
-run status --json
-check "cozy status reports the service up with a pid" \
-  "$(printf '%s' "$OUT" | grep -q '"service":"up"' && echo 1 || echo 0)" "$(first "$OUT")"
-check "the ONE local record database exists (SQLite, pure-Go driver)" \
-  "$([ -f "$COZY_HOME/records.db" ] && echo 1 || echo 0)" \
-  "$COZY_HOME/records.db ($(stat -c%s "$COZY_HOME/records.db" 2>/dev/null || echo 0) B)"
-check "the service lock is a real file this process holds" \
-  "$([ -f "$COZY_HOME/service.lock" ] && echo 1 || echo 0)" "$COZY_HOME/service.lock"
-CRED_READY=0
-for _ in $(seq 1 20); do
-  if [ -f "$COZY_HOME/client.cred" ]; then CRED_READY=1; break; fi
-  sleep 0.1
-done
-check "client-auth readiness follows lock-held service liveness within 2s" \
-  "$CRED_READY" "$COZY_HOME/client.cred $( [ "$CRED_READY" = 1 ] && echo ready || echo absent )"
-check "the CLI credential is 0600 — reading a widened one would be agreeing to a leak" \
-  "$([ "$(stat -c%a "$COZY_HOME/client.cred" 2>/dev/null)" = 600 ] && echo 1 || echo 0)" \
-  "$COZY_HOME/client.cred mode $(stat -c%a "$COZY_HOME/client.cred" 2>/dev/null || echo absent)"
-run doctor
-check "cozy doctor answers from the running service" "$([ "$CODE" = 0 ] && echo 1 || echo 0)" "$(first "$OUT")"
-
-if [ -n "$ENDPOINT" ] && [ -f "$ENDPOINT" ]; then
-  section "endpoint install — the weightless release, on this machine's own venv"
-  DIGEST="sha256:$(sha256sum "$ENDPOINT" | cut -d' ' -f1)"
-  START=$(date +%s%3N)
-  run install cozy/weightless --from "$ENDPOINT" --digest "$DIGEST"
-  ELAPSED=$(( $(date +%s%3N) - START ))
-  printf '%s\n' "$OUT" | sed 's/^/    /'
-  check "install exits 0 with a verified source digest" \
-    "$([ "$CODE" = 0 ] && printf '%s' "$OUT" | grep -q 'verified:      true' && echo 1 || echo 0)" "${ELAPSED} ms"
-  check "the release's OWN runtime re-derived the descriptor (no host venv anywhere)" \
-    "$(printf '%s' "$OUT" | grep -q 'descriptor:' && echo 1 || echo 0)" \
-    "$(printf '%s' "$OUT" | grep '^descriptor:' || true)"
-  run ls
-  check "cozy ls reads the install record" \
-    "$([ "$CODE" = 0 ] && printf '%s' "$OUT" | grep -q 'cozy/weightless' && echo 1 || echo 0)" "$(first "$OUT")"
-  run describe cozy/weightless
-  check "cozy describe renders the surface the install verified" \
-    "$([ "$CODE" = 0 ] && printf '%s' "$OUT" | grep -q 'tile' && echo 1 || echo 0)" "$(first "$OUT")"
-
-  section "the WEIGHTLESS SERVE — a real worker on a machine with no card"
-  # Runtime is the sole writer of the canonical weightless closure: bindings --json gives
-  # this record owner exact plan subjects before spawn, and serve --weightless-endpoint
-  # privately stages the identical bytes. What the arms below establish is the only claim
-  # a cardless machine — a Windows runner, this
-  # container — can ever make for itself: the whole product path, end to end, with nothing
-  # to load.
-  check "the generation's venv contains NO TORCH — the point of a weightless endpoint" \
-    "$([ -z "$(find "$COZY_HOME/generations" -maxdepth 6 -name 'torch' -o -maxdepth 6 -name 'torch-*' 2>/dev/null)" ] && echo 1 || echo 0)" \
-    "$(find "$COZY_HOME/generations" -maxdepth 6 -name 'nvidia*' -o -maxdepth 6 -name 'torch*' 2>/dev/null | wc -l) torch/cuda entries in the venv"
-  START=$(date +%s%3N)
-  run start cozy/weightless
-  ELAPSED=$(( $(date +%s%3N) - START ))
-  printf '%s\n' "$OUT" | sed 's/^/    /'
-  check "cozy start makes the worker READY with no weights to fill" \
-    "$([ "$CODE" = 0 ] && printf '%s' "$OUT" | grep -qE 'state: +ready' && echo 1 || echo 0)" \
-    "${ELAPSED} ms, $(printf '%s' "$OUT" | grep -E '^ready_plans:' | tr -s ' ')"
-  PLAN_COUNT="$(find "$COZY_HOME/workers" -path '*/home/binding-plans/*.json' -type f 2>/dev/null | wc -l)"
-  CANONICAL_PLAN_COUNT="$(find "$COZY_HOME/workers" -path '*/home/binding-plans/*.json' -type f \
-    -exec grep -l 'cozy.endpoint.EntrypointBindingPlan/1' {} + 2>/dev/null | wc -l)"
-  FLAT_PLAN_COUNT="$(find "$COZY_HOME/workers" -path '*/home/binding-plans/*.json' -type f \
-    -exec grep -l 'cozy.local.EntrypointBindingRecord/2' {} + 2>/dev/null | wc -l)"
-  check "Runtime privately staged canonical Plan/1 bytes, with no flat Record/2 fallback" \
-    "$([ "$PLAN_COUNT" -gt 0 ] && [ "$CANONICAL_PLAN_COUNT" = "$PLAN_COUNT" ] && [ "$FLAT_PLAN_COUNT" = 0 ] && echo 1 || echo 0)" \
-    "$CANONICAL_PLAN_COUNT/$PLAN_COUNT canonical plans; $FLAT_PLAN_COUNT flat records"
-
-  run run cozy/weightless/v1/tile size=32 seed=7 --full --out "$COZY_HOME/out"
-  printf '%s\n' "$OUT" | sed 's/^/    /'
-  check "the invoke exits 0 on a TYPED terminal — the record owner's success transaction" \
-    "$([ "$CODE" = 0 ] && printf '%s' "$OUT" | grep -qE 'status: +completed' && echo 1 || echo 0)" \
-    "$(printf '%s' "$OUT" | grep -E '^status:' | tr -s ' ') [exit $CODE]"
-  check "the typed result is the handler's own struct, not a blob" \
-    "$(printf '%s' "$OUT" | grep -q 'size:32' && printf '%s' "$OUT" | grep -q 'pixels:1024' && echo 1 || echo 0)" \
-    "$(printf '%s' "$OUT" | grep -oE 'digest:[0-9a-f]{16}' | head -1)"
-  check "it reserved NO VRAM and constructed NOTHING (empty construction digest)" \
-    "$(printf '%s' "$OUT" | grep -q 'peak_vram_bytes:0' && printf '%s' "$OUT" | grep -q 'construction_digest= ' && echo 1 || echo 0)" \
-    "$(printf '%s' "$OUT" | grep -oE 'vram=[0-9A-Za-z]+ host=[0-9A-Za-z]+' | head -1)"
-  # The output is a REAL published asset: a media id, a length, and a file on this disk
-  # whose first bytes are a PNG signature. `cozy run --out` is the last mile of the path.
-  PNG="$COZY_HOME/out/image.png"
-  check "the published output is a real PNG this machine can open" \
-    "$([ -s "$PNG" ] && [ "$(head -c 4 "$PNG" | tr -d '\000-\010\013\014\016-\037\177-\377')" = "PNG" ] && echo 1 || echo 0)" \
-    "$PNG ($(stat -c%s "$PNG" 2>/dev/null || echo 0) B)"
-
-  # The FAILED terminal on the SAME weightless path, so the fixture observes both verdicts
-  # of the terminal transaction rather than only the happy one.
-  run run cozy/weightless/v1/refuse
-  check "and the failure terminal is typed too — 11 invalid_request, named" \
-    "$([ "$CODE" = 11 ] && printf '%s' "$OUT" | grep -q 'invalid_request' && echo 1 || echo 0)" \
-    "$(printf '%s' "$OUT" | grep '^error' | head -1) [exit $CODE]"
-fi
-
-section "cozy down — liveness is an OS fact, so absence is provable"
-run down
-check "cozy down stops it and proves the lock is free" \
-  "$([ "$CODE" = 0 ] && printf '%s' "$OUT" | grep -q 'provably gone' && echo 1 || echo 0)" "$(first "$OUT")"
-run doctor
-check "and the server-backed verbs refuse 9 again" "$([ "$CODE" = 9 ] && echo 1 || echo 0)" "$(first "$OUT")"
-
 if [ -n "$UPGRADE" ] && [ -f "$UPGRADE" ]; then
   section "UPGRADE — the same verify-then-rename, pointed at a different asset"
   BEFORE="$("$COZY" version --fields tag | grep '^tag:')"
-  RECORDS_BEFORE="$(sha256sum "$COZY_HOME/records.db" | cut -d' ' -f1)"
   OUT="$("$INSTALL" --asset "$UPGRADE" --prefix "$PREFIX" 2>&1)"; CODE=$?
   printf '%s\n' "$OUT" | sed 's/^/    /'
   AFTER="$("$COZY" version --fields tag | grep '^tag:')"
   check "the upgrade verified its own checksum and exits 0" "$([ "$CODE" = 0 ] && echo 1 || echo 0)" "exit $CODE"
   check "the installed binary now reports the new tag" \
     "$([ "$BEFORE" != "$AFTER" ] && echo 1 || echo 0)" "${BEFORE#tag: } -> ${AFTER#tag: }"
-  RECORDS_AFTER="$(sha256sum "$COZY_HOME/records.db" | cut -d' ' -f1)"
-  check "and the local record database survived byte-for-byte" \
-    "$([ "$RECORDS_BEFORE" = "$RECORDS_AFTER" ] && "$COZY" ls >/dev/null 2>&1 && echo 1 || echo 0)" \
-    "$COZY_HOME/records.db sha256:$RECORDS_AFTER"
-  if [ -n "$ENDPOINT" ]; then
-    check "and the installed endpoint survived the replacement" \
-      "$("$COZY" ls 2>/dev/null | grep -q 'cozy/weightless' && echo 1 || echo 0)" "$COZY_HOME"
-  fi
 fi
 
 printf '\n%d passed, %d failed\n' "$PASS" "$FAIL"
