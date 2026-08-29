@@ -1,15 +1,20 @@
 package live
 
 import (
+	"archive/tar"
+	"bytes"
+	"compress/gzip"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
 	"sort"
 	"strings"
 	"sync"
@@ -20,7 +25,7 @@ import (
 )
 
 func TestEndpointPublishCLI(t *testing.T) {
-	source := trackedEndpointFixture(t)
+	source, testBin := endpointFixture(t)
 	var server *httptest.Server
 	var lock sync.Mutex
 	var declaration []byte
@@ -112,7 +117,7 @@ func TestEndpointPublishCLI(t *testing.T) {
 	run := func(args ...string) (int, string) {
 		cmd := exec.Command("/usr/bin/nice", append([]string{"-n", "19", cozyBin}, args...)...)
 		cmd.Env = childEnv(t, home, "TENSORHUB_URL="+server.URL, "TENSORHUB_TOKEN=admin",
-			"PATH="+filepath.Join(source, ".test-bin")+":/usr/local/bin:/usr/bin:/bin")
+			"PATH="+testBin+":/usr/local/bin:/usr/bin:/bin")
 		body, _ := cmd.CombinedOutput()
 		return cmd.ProcessState.ExitCode(), string(body)
 	}
@@ -130,37 +135,81 @@ func TestEndpointPublishCLI(t *testing.T) {
 	if beginCount != 2 || finalizeCount != 2 {
 		t.Fatalf("calls begin=%d finalize=%d", beginCount, finalizeCount)
 	}
+	sourceNames := tarGzipNames(t, put["source_archive"])
+	for _, required := range []string{"endpoint.toml", "marco_polo/__init__.py",
+		"marco_polo/untracked.py", "notes.txt", "pyproject.toml", "uv.lock"} {
+		if !slices.Contains(sourceNames, required) {
+			t.Errorf("current working-tree file %s is absent from source archive %v", required, sourceNames)
+		}
+	}
+	for _, forbidden := range []string{".env.local", ".ssh/id_rsa", ".venv/marker", "dist/stale.whl"} {
+		if slices.Contains(sourceNames, forbidden) {
+			t.Errorf("local-only file %s entered source archive %v", forbidden, sourceNames)
+		}
+	}
 }
 
-func trackedEndpointFixture(t *testing.T) string {
+func endpointFixture(t *testing.T) (string, string) {
 	t.Helper()
 	repo := t.TempDir()
-	mustWrite(t, filepath.Join(repo, "pyproject.toml"), `[project]
+	mustWrite(t, filepath.Join(repo, "pyproject.toml"), `[build-system]
+requires = ["uv_build>=0.9.18,<0.10"]
+build-backend = "uv_build"
+
+[project]
 name = "marco-polo"
 version = "1.0.0"
 dependencies = []
+
+[tool.uv.build-backend]
+module-root = ""
 `)
 	mustWrite(t, filepath.Join(repo, "endpoint.toml"), "[application]\nobject = \"marco_polo:app\"\n")
-	mustWrite(t, filepath.Join(repo, "marco_polo.py"), "app = object()\n")
+	mustWrite(t, filepath.Join(repo, "marco_polo", "__init__.py"), "app = object()\n")
+	mustWrite(t, filepath.Join(repo, "marco_polo", "untracked.py"), "value = 'current tree'\n")
+	mustWrite(t, filepath.Join(repo, "notes.txt"), "ordinary untracked provenance\n")
+	mustWrite(t, filepath.Join(repo, ".env.local"), "TOKEN=secret\n")
+	mustWrite(t, filepath.Join(repo, ".ssh", "id_rsa"), "secret\n")
+	mustWrite(t, filepath.Join(repo, ".venv", "marker"), "local environment\n")
+	mustWrite(t, filepath.Join(repo, "dist", "stale.whl"), "stale output\n")
 	mustWrite(t, filepath.Join(repo, "uv.lock"), "version = 1\n")
-	mustWrite(t, filepath.Join(repo, ".gitignore"), ".test-bin/\n.venv/\n")
-	git(t, repo, "init", "-q")
-	git(t, repo, "config", "user.email", "fixture@example.invalid")
-	git(t, repo, "config", "user.name", "Fixture")
-	git(t, repo, "add", ".")
-	git(t, repo, "commit", "-qm", "fixture")
-	fakeUV := filepath.Join(repo, ".test-bin", "uv")
-	mustWrite(t, fakeUV, `#!/bin/sh
+	testBin := t.TempDir()
+	realUV, err := exec.LookPath("uv")
+	must(t, err)
+	fakeUV := filepath.Join(testBin, "uv")
+	mustWrite(t, fakeUV, fmt.Sprintf(`#!/bin/sh
+if [ "${1-}" = build ]; then
+  exec %q "$@"
+fi
 if [ "${0##*/}" = "cozy-runtime" ]; then # //cozy:allow independent Runtime CLI fixture
-  printf '%s\n' '{"application":"marco_polo:app","entrypoints":[],"format":"cozy.endpoint.descriptor/1","jobs":[]}'
+  printf '%%s\n' '{"application":"marco_polo:app","entrypoints":[],"format":"cozy.endpoint.descriptor/1","jobs":[]}'
   exit 0
 fi
 mkdir -p "$UV_PROJECT_ENVIRONMENT/bin"
 cp "$0" "$UV_PROJECT_ENVIRONMENT/bin/cozy-runtime"
 chmod 755 "$UV_PROJECT_ENVIRONMENT/bin/cozy-runtime"
-`)
+`, realUV))
 	must(t, os.Chmod(fakeUV, 0o755))
-	return repo
+	return repo, testBin
+}
+
+func tarGzipNames(t *testing.T, body []byte) []string {
+	t.Helper()
+	gz, err := gzip.NewReader(bytes.NewReader(body))
+	must(t, err)
+	defer gz.Close()
+	tr := tar.NewReader(gz)
+	var names []string
+	for {
+		header, err := tr.Next()
+		if err == io.EOF {
+			break
+		}
+		must(t, err)
+		names = append(names, header.Name)
+	}
+	sort.Strings(names)
+	return names
 }
 
 func fixtureDeclarationRoles(d endpointpublish.Declaration) map[string]endpointpublish.ObjectRef {

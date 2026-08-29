@@ -12,6 +12,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"io/fs"
 	"os"
 	"os/exec"
 	"path"
@@ -62,15 +63,14 @@ type Request struct {
 	Release string
 }
 
-// Prepare requires a clean committed source subtree, deterministically packs its
-// tracked files and pure project wheel, and canonicalizes the descriptor. Package
-// requirements stay in wheel metadata and uv.lock. No project command executes.
+// Prepare snapshots the current working tree, delegates wheel construction to
+// `uv build`, and canonicalizes the descriptor. Git is not a publication input.
 func Prepare(req Request) (*Package, *exit.Error) {
 	release := strings.TrimSpace(req.Release)
 	if release == "" || strings.ContainsAny(release, `/\`) || release == "." || release == ".." {
 		return nil, exit.Usagef("--release needs one safe immutable release id")
 	}
-	tree, files, e := trackedTree(req.Tree)
+	tree, files, e := sourceTree(req.Tree)
 	if e != nil {
 		return nil, e
 	}
@@ -110,7 +110,7 @@ func Prepare(req Request) (*Package, *exit.Error) {
 			WithRemedy("keep binding intent in endpoint.toml; Tensorhub will resolve model releases there when the model-binding lane lands"))
 	}
 
-	project, e := wheel.Pack(wheel.Request{Tree: tree,
+	project, e := wheel.Build(wheel.Request{Tree: tree,
 		OutDir: filepath.Join(root, "project")})
 	if e != nil {
 		return fail(e)
@@ -134,7 +134,23 @@ func Prepare(req Request) (*Package, *exit.Error) {
 	return result, nil
 }
 
-func trackedTree(tree string) (string, []string, *exit.Error) {
+var ignoredSourceDir = map[string]bool{
+	".git": true, ".hg": true, ".svn": true, ".jj": true,
+	"__pycache__": true, ".mypy_cache": true, ".ruff_cache": true,
+	".pytest_cache": true, ".tox": true,
+}
+
+var ignoredRootSourceDir = map[string]bool{
+	".venv": true, "venv": true, "node_modules": true,
+	".idea": true, ".vscode": true, ".aws": true, ".ssh": true,
+	"credentials": true, "secrets": true,
+}
+
+var ignoredSourceFile = map[string]bool{
+	".ds_store": true, "thumbs.db": true, ".gitignore": true, ".gitattributes": true,
+}
+
+func sourceTree(tree string) (string, []string, *exit.Error) {
 	abs, err := filepath.Abs(tree)
 	if err != nil {
 		return "", nil, exit.Usagef("--dir %q is not resolvable: %s", tree, err)
@@ -143,69 +159,71 @@ func trackedTree(tree string) (string, []string, *exit.Error) {
 	if err != nil || !info.IsDir() {
 		return "", nil, exit.Named(exit.NotFound, "endpoint_tree_absent", "%s is not a directory", abs)
 	}
-	topRaw, err := exec.Command("git", "-C", abs, "rev-parse", "--show-toplevel").Output()
-	if err != nil {
-		return "", nil, exit.Named(exit.Validation, "endpoint_tree_untracked",
-			"%s is not inside a Git working tree", abs).
-			WithRemedy("endpoint publication snapshots committed tracked files, never an unrestricted directory walk")
-	}
-	top := strings.TrimSpace(string(topRaw))
-	rel, err := filepath.Rel(top, abs)
-	if err != nil || rel == ".." || strings.HasPrefix(rel, ".."+string(os.PathSeparator)) {
-		return "", nil, exit.Internalf("endpoint tree %s escaped Git root %s", abs, top)
-	}
-	scope := "."
-	if rel != "." {
-		scope = filepath.ToSlash(rel)
-	}
-	status := exec.Command("git", "-C", top, "status", "--porcelain=v1", "-z", "--untracked-files=all", "--", scope)
-	body, err := status.Output()
-	if err != nil {
-		return "", nil, exit.Named(exit.Structural, "endpoint_tree_unreadable", "git status failed: %v", err)
-	}
-	if len(body) != 0 {
-		return "", nil, exit.Named(exit.Conflict, "endpoint_tree_dirty",
-			"%s has changed or untracked files", abs).
-			WithRemedy("commit the exact endpoint source first; a normal release is one immutable tracked tree")
-	}
-	listing := exec.Command("git", "-C", top, "ls-files", "-z", "--", scope)
-	body, err = listing.Output()
-	if err != nil {
-		return "", nil, exit.Named(exit.Structural, "endpoint_tree_unreadable", "git ls-files failed: %v", err)
-	}
 	var files []string
-	prefix := ""
-	if scope != "." {
-		prefix = scope + "/"
-	}
-	for _, raw := range bytes.Split(body, []byte{0}) {
-		if len(raw) == 0 {
-			continue
+	folded := map[string]string{}
+	err = filepath.WalkDir(abs, func(file string, entry fs.DirEntry, walkErr error) error {
+		if walkErr != nil {
+			return walkErr
 		}
-		name := filepath.ToSlash(string(raw))
-		name = strings.TrimPrefix(name, prefix)
-		if name == "" || strings.HasPrefix(name, "../") {
-			return "", nil, exit.Internalf("git returned out-of-scope endpoint path %q", name)
+		if file == abs {
+			return nil
 		}
-		files = append(files, name)
+		rel, err := filepath.Rel(abs, file)
+		if err != nil {
+			return err
+		}
+		rel = filepath.ToSlash(rel)
+		lowerName := strings.ToLower(entry.Name())
+		if entry.IsDir() {
+			atRoot := !strings.Contains(rel, "/")
+			rootLocal := atRoot && (ignoredRootSourceDir[lowerName] || lowerName == "build" || lowerName == "dist")
+			if ignoredSourceDir[lowerName] || strings.HasSuffix(lowerName, ".egg-info") || rootLocal {
+				return fs.SkipDir
+			}
+			return nil
+		}
+		if ignoredSourceFile[lowerName] || credentialFile(lowerName) ||
+			strings.HasSuffix(lowerName, ".pyc") || strings.HasSuffix(lowerName, ".pyo") {
+			return nil
+		}
+		if entry.Type()&fs.ModeSymlink != 0 {
+			return sourceRefusal("endpoint_source_entry_invalid", rel, "a symlink")
+		}
+		info, err := entry.Info()
+		if err != nil || !info.Mode().IsRegular() {
+			return sourceRefusal("endpoint_source_entry_invalid", rel, "non-regular or unreadable")
+		}
+		key := strings.ToLower(rel)
+		if prior := folded[key]; prior != "" {
+			return sourceRefusal("endpoint_source_entry_invalid", rel,
+				"a case-insensitive collision with "+prior)
+		}
+		folded[key] = rel
+		files = append(files, rel)
+		return nil
+	})
+	if err != nil {
+		if problem := exit.As(err); problem != nil {
+			return "", nil, problem
+		}
+		return "", nil, exit.Named(exit.Structural, "endpoint_tree_unreadable", "%s: %v", abs, err)
 	}
 	if len(files) == 0 {
-		return "", nil, exit.Named(exit.Validation, "endpoint_tree_empty", "%s has no tracked files", abs)
+		return "", nil, exit.Named(exit.Validation, "endpoint_tree_empty", "%s has no publishable files", abs)
 	}
 	sort.Strings(files)
 	return abs, files, nil
 }
 
+func credentialFile(base string) bool {
+	return base == ".env" || strings.HasPrefix(base, ".env.") || base == ".netrc" ||
+		base == ".npmrc" || base == ".pypirc" || strings.HasPrefix(base, "id_rsa") ||
+		strings.HasSuffix(base, ".pem") || strings.HasSuffix(base, ".key")
+}
+
 var weightExt = map[string]bool{
 	".bin": true, ".ckpt": true, ".gguf": true, ".onnx": true, ".pickle": true,
 	".pkl": true, ".pt": true, ".pth": true, ".safetensors": true,
-}
-
-var nativeSource = map[string]bool{
-	".a": true, ".c": true, ".cc": true, ".cpp": true, ".cu": true, ".cxx": true,
-	".dll": true, ".dylib": true, ".f90": true, ".h": true, ".hpp": true,
-	".o": true, ".pxd": true, ".pxi": true, ".pyd": true, ".pyx": true,
-	".rs": true, ".so": true,
 }
 
 func auditSource(root string, files []string) *exit.Error {
@@ -219,25 +237,16 @@ func auditSource(root string, files []string) *exit.Error {
 				WithRemedy("delete it; endpoint.toml is the only author configuration, and Tensorhub derives compatibility from pyproject.toml and uv.lock")
 		}
 		parts := strings.Split(lower, "/")
-		for _, part := range parts[:len(parts)-1] {
-			if part == ".aws" || part == ".ssh" || part == "credentials" || part == "secrets" {
-				return sourceRefusal("endpoint_source_credential", name, "credential directory")
-			}
+		if len(parts) > 1 && (parts[0] == ".aws" || parts[0] == ".ssh" ||
+			parts[0] == "credentials" || parts[0] == "secrets") {
+			return sourceRefusal("endpoint_source_credential", name, "credential directory")
 		}
-		if base == ".env" || strings.HasPrefix(base, ".env.") || base == ".netrc" ||
-			base == ".npmrc" || base == ".pypirc" || strings.HasPrefix(base, "id_rsa") ||
-			strings.HasSuffix(base, ".pem") || strings.HasSuffix(base, ".key") {
+		if credentialFile(base) {
 			return sourceRefusal("endpoint_source_credential", name, "credential/key material")
 		}
 		ext := strings.ToLower(path.Ext(base))
 		if weightExt[ext] {
 			return sourceRefusal("endpoint_source_model_bytes", name, "model weight/pickle bytes")
-		}
-		if nativeSource[ext] {
-			return sourceRefusal("endpoint_source_native_input", name, "native source or binary")
-		}
-		if sourceBuildInput(base) {
-			return sourceRefusal("endpoint_source_build_input", name, "build recipe")
 		}
 		full := filepath.Join(root, filepath.FromSlash(name))
 		info, err := os.Lstat(full)
@@ -247,7 +256,7 @@ func auditSource(root string, files []string) *exit.Error {
 		total += info.Size()
 		if total > MaxSourceBytes {
 			return exit.Named(exit.Validation, "endpoint_source_too_large",
-				"tracked endpoint source exceeds %d B", MaxSourceBytes)
+				"endpoint source exceeds %d B", MaxSourceBytes)
 		}
 	}
 	return nil
@@ -335,18 +344,9 @@ func descriptorRefusal(code int, body []byte) *exit.Error {
 	return exit.Named(c, "endpoint_descriptor_refused", "%s", message)
 }
 
-func sourceBuildInput(base string) bool {
-	switch base {
-	case "cargo.lock", "cargo.toml", "cmakelists.txt", "gnumakefile", "makefile",
-		"manifest.in", "meson.build", "meson_options.txt", "setup.cfg", "setup.py":
-		return true
-	}
-	return strings.HasPrefix(base, "dockerfile") || strings.HasSuffix(base, ".cmake")
-}
-
 func sourceRefusal(code, name, class string) *exit.Error {
 	return exit.Named(exit.Validation, code, "%s is %s and cannot enter an endpoint release", name, class).
-		WithRemedy("publish pure Python code only; model weights live in model repositories, and source/native builds are not admitted")
+		WithRemedy("remove it from published source; secrets and local state stay local, model weights live in model repositories, and included entries must be regular files")
 }
 
 func sourceArchive(root string, files []string, output string) *exit.Error {
@@ -365,7 +365,7 @@ func sourceArchive(root string, files []string, output string) *exit.Error {
 		full := filepath.Join(root, filepath.FromSlash(name))
 		info, err := os.Stat(full)
 		if err != nil {
-			return exit.Internalf("tracked source %s disappeared: %s", name, err)
+			return exit.Internalf("source %s disappeared: %s", name, err)
 		}
 		header := &tar.Header{Name: name, Mode: 0o644, Size: info.Size(),
 			ModTime: time.Unix(0, 0), AccessTime: time.Unix(0, 0), ChangeTime: time.Unix(0, 0),

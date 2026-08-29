@@ -76,9 +76,10 @@ Remove local endpoint generations with:
 cozy endpoint remove org/name
 ```
 
-Publishing packages one deterministic pure project wheel. Tensorhub derives compatible base
-worker profiles from `pyproject.toml`, `uv.lock`, and its image inventory. The endpoint name is
-created automatically when absent:
+Publishing builds the current working tree with `uv build --wheel`, then accepts only one bounded
+pure project wheel. Git, commits, and a clean tree are not publication inputs. Tensorhub derives
+compatible base worker profiles from wheel metadata, `uv.lock`, and its image inventory. The
+endpoint name is created automatically when absent:
 
 ```sh
 cozy endpoint publish org/name \

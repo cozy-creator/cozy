@@ -657,7 +657,7 @@ func UploadPresigned(ctx context.Context, subject, path, url, expectedDigest str
 	if err != nil || !info.Mode().IsRegular() || info.Size() != length {
 		return false, exit.Named(exit.Conflict, "upload.local_bytes_changed",
 			"%s is no longer the declared %d-byte regular file", path, length).
-			WithRemedy("restart endpoint publication from one unchanged committed source package")
+			WithRemedy("restart endpoint publication from one unchanged staged package")
 	}
 	f, err := os.Open(path)
 	if err != nil {
@@ -670,7 +670,7 @@ func UploadPresigned(ctx context.Context, subject, path, url, expectedDigest str
 	if hashErr != nil || observed != expectedDigest {
 		return false, exit.Named(exit.Conflict, "upload.local_bytes_changed",
 			"%s now hashes to %s; its declaration names %s", subject, observed, expectedDigest).
-			WithRemedy("restart endpoint publication from one unchanged committed source package")
+			WithRemedy("restart endpoint publication from one unchanged staged package")
 	}
 	status, _, body, problem := send(ctx, http.MethodPut, url, opener(path, 0, length), length, headers)
 	if problem != nil {
