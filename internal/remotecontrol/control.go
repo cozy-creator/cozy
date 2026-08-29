@@ -219,16 +219,17 @@ func validateOverlayReceipt(raw []byte, environmentRef hub.ExactControlDocument,
 	if err != nil {
 		return fmt.Errorf("resolved wheel set is not canonical: %w", err)
 	}
-	if err := requireKeys(resolved, "compatibility_profile", "format", "lock_digest", "platform_target",
-		"wheelhouse_manifest_digest", "wheels"); err != nil {
+	if err := requireKeys(resolved, "compatibility_profile", "format", "overlay_bytes", "platform_target",
+		"resolution_lock_digest", "resolution_lock_length", "wheelhouse_manifest_digest", "wheels"); err != nil {
 		return fmt.Errorf("resolved wheel set is not closed: %w", err)
 	}
 	if resolved.Str("format") != "ResolvedWheelSet/3" ||
 		resolved.Str("wheelhouse_manifest_digest") != environment.Str("wheelhouse_manifest_digest") {
 		return fmt.Errorf("resolved wheel set disagrees with the selected environment")
 	}
-	if _, err := canonical.Raw(resolved.Str("lock_digest")); err != nil {
-		return fmt.Errorf("resolved wheel set lock digest is malformed")
+	if _, err := canonical.Raw(resolved.Str("resolution_lock_digest")); err != nil ||
+		resolved.Int("resolution_lock_length") <= 0 || resolved.Int("resolution_lock_length") > 16<<20 {
+		return fmt.Errorf("resolved wheel set resolution lock identity is malformed")
 	}
 	resolvedTarget, environmentTarget := resolved.Sub("platform_target"), environment.Sub("platform_target")
 	if err := requireKeys(resolvedTarget, "accelerator_abi", "accelerator_backend", "libc", "os_arch", "python_abi"); err != nil {
@@ -256,6 +257,7 @@ func validateOverlayReceipt(raw []byte, environmentRef hub.ExactControlDocument,
 	expected := map[string]overlayWheel{project.Distribution: project}
 	seenDigests := map[string]bool{project.Digest: true}
 	priorCustom := ""
+	var customBytes int64
 	for i, row := range custom {
 		wheel, err := wheelFact(row, "custom")
 		if err != nil || wheel.Distribution <= priorCustom || expected[wheel.Distribution].Distribution != "" ||
@@ -265,6 +267,10 @@ func validateOverlayReceipt(raw []byte, environmentRef hub.ExactControlDocument,
 		expected[wheel.Distribution] = wheel
 		seenDigests[wheel.Digest] = true
 		priorCustom = wheel.Distribution
+		customBytes += row.Int("length")
+	}
+	if resolved.Int("overlay_bytes") != customBytes || customBytes > 512<<20 {
+		return fmt.Errorf("resolved wheel set overlay byte accounting disagrees")
 	}
 
 	receipt, err := canonical.ReadObject(raw)
