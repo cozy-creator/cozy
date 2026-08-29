@@ -1,39 +1,18 @@
-# protocol — copied `cozy.worker.v1` bindings
+# Vendored worker protocol
 
-COPIED, never imported as a module (boundaries.md): these four files are byte-identical
-to `worker-protocol@2cf3336` `gen/go/cozy/worker/v1/` — schema rev 9, generated with
-official protoc 35.1 and protoc-gen-go 1.36.11. Rev 9 hard-cuts
-ClaimAck/BootFailure provenance to `control_runtime_digest`: the measured image-owned control
-Runtime wheel, never the image's recursively unknowable OCI digest. cozy-creator DIALS this contract as the record
-owner; the schema is th-024/th-049's and is never edited here.
+This directory contains the Go files Cozy Creator needs from
+`cozy-creator/worker-protocol-v2` commit
+`34f2993e91c65076850a828e37c3d9bd0215eefc`.
 
-Refresh = re-copy from the worker-protocol repo. Editing a file in this directory is the
-one thing that turns a shared contract into two — and `ci.yaml`'s `vendored-protocol` job
-is what makes that unstateable in silence: worker-protocol regenerates from its own
-`.proto` with its own pinned protoc and byte-compares against exactly these files.
-`SHA256SUMS` always proves the checked-in set is the reviewed `2cf3336` set; the live
-master comparison additionally arms when CI has a repository-scoped
-`WORKER_PROTOCOL_TOKEN`. GitHub's ordinary per-repo token cannot read a private sibling,
-so absence of that explicit token is a named unarmed drift check, not a fake code failure.
+The four files under `cozy/worker/v1/` are byte-identical to that commit's
+`gen/go/cozy/worker/v1/` output. They were generated with official protoc 35.1,
+protoc-gen-go 1.36.11, and the worker-protocol repository's pinned regeneration command.
+They are copied rather than imported as another Go module and must never be edited here.
 
-`wire_identity.go` carries the three answers to three different questions. `WireMinor` is
-the additive-train position and does NOT move for a breaking in-place revision, so it
-fences nothing; `WireSchemaRev` is the human ordinal; `SchemaDigest` is the FENCE — the
-digest of the schema's own descriptor, which a stale copy cannot spell without being the
-schema it names. It rides `Claim.wire_schema_digest` and is checked before any other body
-field. The retired `wire_minor.go` is deleted: a constant still claiming currency beside a
-fresh binding is the whole of #530-A1.
+`cozy.worker.v1` is the wire major because it is part of the protobuf package and gRPC
+service path. `WireMinor` is its additive compatibility level. Additive changes bump the
+minor; a breaking change creates `cozy.worker.v2` instead of revising v1 in place.
 
-Schema rev 9 adds the four public endpoint/base compatibility coordinates while preserving
-worker-measured control Runtime provenance separately from provider-verified OCI
-identity; a RecordOwner requires both facts and neither substitutes for the other. Schema rev 7 makes acquisition overlap and reuse observable without moving identity,
-readiness, convergence, or admission. Schema rev 6 makes the model-object-set subject part of immutable desired state while its
-expiring locations remain on the independently refreshable grant lane. Schema rev 5 moves wire
-minor to 1 for the paired finalize frame slots and changes the canonical
-outcome document to `AttemptOutcomeBody/3`; the schema digest remains the live-session shape
-fence. Rev 4 changed no live wire number or document version: it only tombstoned the two retired
-field numbers (`OutputManifest` 2, `TriageBundleRef` 2), moving the descriptor and schema digest.
-Rev 3 before it also changed no wire number or document version; it hardcut numeric origin 4 from
-`SUPERVISOR` to `WORKER` and numeric origin 7 from `COORDINATOR` to `RECORD_OWNER`, with no
-aliases. The descriptor and schema digest move, so a mixed rev-2/rev-3 live session refuses
-at the handshake even though already-journaled outcome bytes remain replayable.
+`SHA256SUMS` verifies the reviewed vendored bytes on every CI run. When CI has permission
+to read the private worker-protocol repository, it also regenerates the source schema and
+byte-compares the complete generated set against this directory.

@@ -21,7 +21,7 @@ import (
 	pb "github.com/cozy-creator/cozy-creator/protocol/cozy/worker/v1"
 )
 
-// worker-protocol's FROZEN corpus at schema rev 9, checked out beside this repo.
+// worker-protocol's frozen corpus, checked out beside this repo.
 const fixtureDir = "/home/fidika/cozy_v2/worker-protocol/fixtures"
 
 // TestCanonicalDocuments is the identity fence. Every document that crosses a repo or
@@ -40,32 +40,10 @@ func TestCanonicalDocuments(t *testing.T) {
 	must(t, err)
 	must(t, json.Unmarshal(data, &manifest))
 
-	// THE SCHEMA FENCE (#530-A1). A version constant that can agree while the bytes
-	// disagree is not a fence; this is the digest `regen.sh` derived from the descriptor
-	// these bindings were generated from, compared against the frozen document. A stale
-	// `protocol/` copy fails here without any peer being dialed.
-	schema := manifest.Canonical["wire_schema"]
-	if pb.SchemaDigest != schema.ID {
-		t.Errorf("vendored SchemaDigest %s != frozen WireSchema/1 id %s", pb.SchemaDigest, schema.ID)
-	}
-	schemaBytes, err := os.ReadFile(filepath.Join(fixtureDir, "canonical", "wire_schema.json"))
-	must(t, err)
-	if got, _ := canonical.Spell(canonical.Digest(schemaBytes)); got != schema.ID {
-		t.Errorf("the schema digest is not over those document bytes: %s", got)
-	}
-	if pb.WireSchemaRev != 9 || pb.WireMinor != 2 {
-		t.Errorf("this binding declares rev %d minor %d, wanted rev 9 minor 2",
-			pb.WireSchemaRev, pb.WireMinor)
-	}
-
 	// This Go writer against the frozen documents, and this Go reader back over them.
-	// `wire_schema` is DERIVED from the schema's own descriptor rather than marshaled from
-	// a message in it, so it has no `.bin` and its stronger arm is above.
 	names := make([]string, 0, len(manifest.Canonical))
 	for name := range manifest.Canonical {
-		if name != "wire_schema" {
-			names = append(names, name)
-		}
+		names = append(names, name)
 	}
 	sort.Strings(names)
 	for _, name := range names {

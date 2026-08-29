@@ -79,30 +79,14 @@ func (s *session) trySend(m *pb.RecordOwnerFrame) (sent bool) {
 	}
 }
 
-// schemaDigest is THE FENCE (#530-A1), as the 32 raw bytes the wire carries. It is derived
-// from the schema this binary was generated against — `wire_identity.go`'s SchemaDigest —
-// so a stale vendored copy cannot spell it without BEING the schema it names. WIRE_MINOR
-// could not do this job: the minor is the ADDITIVE train, it does not move for a breaking
-// in-place revision, and all three stale bindings sat there declaring 0 at each other.
-func schemaDigest() []byte {
-	raw, err := canonical.Raw(pb.SchemaDigest)
-	if err != nil {
-		// Unreachable by construction: regen.sh writes the constant and this repo's CI
-		// byte-compares the whole file set against it. A panic here beats dialing with a
-		// fence nobody can check.
-		panic("the vendored wire_identity.go carries an unspellable schema digest: " + err.Error())
-	}
-	return raw
-}
-
 // attach owns one worker's control conversation for the life of its process: read the
 // published address, dial, claim, reconcile, direct, then pump frames. On a stream drop
 // with the process still alive it re-dials and RE-CLAIMS the same boot (the worker mints
 // a fresh control generation and resends its snapshot; replay covers the durables).
 //
 // A RECORDED REFUSAL ENDS THE LOOP. The verdicts this owner reaches at claim time — a
-// foreign instance identity, an unpinned release, a schema this build does not speak — are
-// facts about the THING AT THE OTHER END, and redialing cannot change any of them. Left
+// foreign instance identity or an unpinned release — are facts about the THING AT THE
+// OTHER END, and redialing cannot change any of them. Left
 // running, the loop burns one of the worker's control generations every 200 ms forever;
 // observed at 1,111 generations against a pre-rev-2 worker while a waiter sat on a
 // readiness poll that was never going to end. The refusal is already the waiter's answer
@@ -249,11 +233,6 @@ func (c *Orchestrator) converse(w *worker, addr string) error {
 		RecordOwnerId:    recordOwnerID,
 		WireMinor:        pb.WireMinor,
 		Proof:            []byte(proof),
-		// THE SCHEMA FENCE RIDES THE CLAIM and is checked before any other body field, in
-		// BOTH directions: a stale RecordOwner sends none, a stale worker answers with
-		// none, and either way the stream closes instead of a renumbered field being
-		// misparsed mid-conversation.
-		WireSchemaDigest: schemaDigest(),
 	}}}) //cozy:allow-reveal the one place the credential leaves this process: Claim.proof over the worker's own channel
 
 	// WatchProgress rides a PHYSICALLY separate connection (01) once the claim lands;
@@ -274,15 +253,6 @@ func (c *Orchestrator) converse(w *worker, addr string) error {
 		switch m := frame.Msg.(type) {
 		case *pb.WorkerFrame_ClaimAck:
 			ack := m.ClaimAck
-			// THE SCHEMA DIGEST IS READ FIRST — before `accepted`, before the rejection
-			// code, before anything. A peer that does not speak this schema cannot be
-			// trusted to have MEANT the enum value it put in `rejection`, so reading that
-			// first would be believing a number from a shape we have just established we
-			// do not share.
-			if e := c.schemaFence(w, ack.WireSchemaDigest); e != nil {
-				c.refuseClaim(w, e)
-				return fmt.Errorf("%s", e.Message)
-			}
 			if !ack.Accepted {
 				c.logf("Claim REFUSED by %s: %s", w.instanceID,
 					pb.ClaimRejection_name[int32(ack.Rejection)])
@@ -468,30 +438,6 @@ func (c *Orchestrator) runRentalSessionRelay(s *session, connection *WorkerConne
 	}
 }
 
-// schemaFence is #530-A1's owner half. Absence IS the stale signal: a pre-rev-2 binding
-// cannot populate the field at all, so an empty digest names a peer revisions behind
-// rather than a peer that chose not to answer. R8's absence-default rule is exempted here
-// deliberately and by the rev — this is a breaking in-place revision on an unreleased
-// major, where an older peer MUST NOT interoperate.
-func (c *Orchestrator) schemaFence(w *worker, declared []byte) *exit.Error {
-	ours := schemaDigest()
-	if bytes.Equal(declared, ours) {
-		return nil
-	}
-	spelled, _ := canonical.Spell(declared)
-	said := spelled
-	if said == "" {
-		said = "nothing — a binding older than the fence itself"
-	}
-	return exit.Named(exit.Conflict, "wire_schema_mismatch",
-		"the worker at this address declares wire schema %s and this build speaks %s",
-		said, pb.SchemaDigest).
-		WithRemedy("the two ends were generated from different `cozy.worker.v1` schemas, so "+
-			"no later frame is worth parsing: a renumbered field would be misparsed rather "+
-			"than refused. Both sides regenerate from one worker-protocol revision (this "+
-			"build is rev %d)", pb.WireSchemaRev)
-}
-
 // fenced evaluates the three-field envelope in its fixed order, BEFORE any body field is
 // interpreted (02 §0).
 func (c *Orchestrator) fenced(s *session, epoch, generation uint64, bootID string) bool {
@@ -513,9 +459,9 @@ func (c *Orchestrator) fenced(s *session, epoch, generation uint64, bootID strin
 // onClaimAck binds the claimed boot to the worker slot: identity checks, the durable
 // binding, and the session registry (the ClaimAck is the flip's Register successor).
 func (c *Orchestrator) onClaimAck(w *worker, s *session, ack *pb.ClaimAck) *exit.Error {
-	c.logf("ClaimAck boot=%s generation=%d instance=%s minor=%d schema=rev%d backend=%q device=%q",
+	c.logf("ClaimAck boot=%s generation=%d instance=%s minor=%d backend=%q device=%q",
 		ack.WorkerBootId, ack.ControlStreamGeneration, ack.WorkerInstanceId, ack.WireMinor,
-		pb.WireSchemaRev, ack.Resources.GetBackend(), ack.Resources.GetDeviceName())
+		ack.Resources.GetBackend(), ack.Resources.GetDeviceName())
 	if e := instancePin(w, ack.WorkerInstanceId); e != nil {
 		// Nothing is dispatched to it; the stream ends on the next recv when we stop
 		// talking.

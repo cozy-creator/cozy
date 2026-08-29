@@ -11,17 +11,13 @@
 // TLS over a private network or authenticated overlay remotely. A worker control port is NEVER
 // required to be publicly exposed for topology symmetry.
 //
-// REV-2, THE DYNAMIC-SERVING REV (decisions #471-#475, #480-#483, #485b/c, #486, #487/#489,
-// #507d). BREAKING IN PLACE on the unreleased `cozy.worker.v1` (#480g): field numbers are
-// reserved at their sites, deleted messages keep their numbers reserved, both reference halves
-// and the conformance corpus regenerate together. No shim speaks both shapes; no rename ships
-// an alias. This is the fifth in-place revision (5b07b79 -> 732763b -> 8d90461 -> c6dbc12 ->
-// this) and it renumbers freely, per the 2026-08-24 precedent.
-//
-// VERSIONING (03 §1, §2 R1-R8): the MAJOR is the package path (`cozy.worker.v1`); the MINOR is
-// `wire_minor`, a linear-train number declared at Claim/ClaimAck — never a negotiation. R7 IS AN
-// AUTHORING RULE ONLY: `reserved` numbers are compiler-enforced tombstones against REUSE;
-// ordinary proto3 decoders do not refuse them on the wire and no runtime polices them.
+// VERSIONING: the MAJOR is the package path (`cozy.worker.v1`). The MINOR is `wire_minor`, an
+// additive linear-train number declared at Claim/ClaimAck — never a negotiation. A future
+// breaking change MUST use a new package major (`cozy.worker.v2`); it must not revise v1 in
+// place. R7 IS AN AUTHORING RULE ONLY: `reserved` numbers and names are compiler-enforced
+// tombstones against reuse; ordinary proto3 decoders do not refuse them on the wire and no
+// runtime polices them. This file includes the final pre-release v1 hardcut; all generated
+// bindings and fixtures were regenerated together before v1 shipped.
 //
 // IDENTITY IS CANONICAL BYTES, PROTOBUF IS TRANSPORT: no digest is ever computed over
 // protobuf-marshaled bytes. A meaning-fencing digest is the SHA-256 of a DOCUMENT's exact
@@ -797,15 +793,10 @@ const (
 	ClaimRejection_CLAIM_REJECTION_EPOCH_HELD               ClaimRejection = 3 // equal epoch, different record_owner_id
 	ClaimRejection_CLAIM_REJECTION_WORKER_ID_MISMATCH       ClaimRejection = 4
 	ClaimRejection_CLAIM_REJECTION_RELEASE_ID_MISMATCH      ClaimRejection = 5
-	ClaimRejection_CLAIM_REJECTION_UNSUPPORTED_MINOR        ClaimRejection = 6
 	// #507d: the worker cannot establish a durable journal, so it cannot honour journal-before-send
 	// and must not accept the stream. The frozen wire could only route this to
 	// BootFailure(DISK_SHAPE) — representable and true, but less direct.
 	ClaimRejection_CLAIM_REJECTION_UNDURABLE ClaimRejection = 7
-	// #530-A1: the peer's wire_schema_digest is absent or is not this worker's. The two ends do
-	// not speak the same schema, and no later frame is worth parsing. `detail` names the peer's
-	// rev when SCHEMA_REVS can identify its digest, and says "unknown schema" when it cannot.
-	ClaimRejection_CLAIM_REJECTION_SCHEMA_DIGEST_MISMATCH ClaimRejection = 8
 )
 
 // Enum value maps for ClaimRejection.
@@ -817,9 +808,7 @@ var (
 		3: "CLAIM_REJECTION_EPOCH_HELD",
 		4: "CLAIM_REJECTION_WORKER_ID_MISMATCH",
 		5: "CLAIM_REJECTION_RELEASE_ID_MISMATCH",
-		6: "CLAIM_REJECTION_UNSUPPORTED_MINOR",
 		7: "CLAIM_REJECTION_UNDURABLE",
-		8: "CLAIM_REJECTION_SCHEMA_DIGEST_MISMATCH",
 	}
 	ClaimRejection_value = map[string]int32{
 		"CLAIM_REJECTION_UNSPECIFIED":              0,
@@ -828,9 +817,7 @@ var (
 		"CLAIM_REJECTION_EPOCH_HELD":               3,
 		"CLAIM_REJECTION_WORKER_ID_MISMATCH":       4,
 		"CLAIM_REJECTION_RELEASE_ID_MISMATCH":      5,
-		"CLAIM_REJECTION_UNSUPPORTED_MINOR":        6,
 		"CLAIM_REJECTION_UNDURABLE":                7,
-		"CLAIM_REJECTION_SCHEMA_DIGEST_MISMATCH":   8,
 	}
 )
 
@@ -1633,10 +1620,8 @@ type Claim struct {
 	WorkerId                string                 `protobuf:"bytes,6,opt,name=worker_id,json=workerId,proto3" json:"worker_id,omitempty"`                                                 // the worker identity the RecordOwner expects to be claiming
 	WireMinor               uint32                 `protobuf:"varint,7,opt,name=wire_minor,json=wireMinor,proto3" json:"wire_minor,omitempty"`                                             // highest minor the RECORDOWNER implements
 	Proof                   []byte                 `protobuf:"bytes,8,opt,name=proof,proto3" json:"proof,omitempty"`                                                                       // RecordOwner-authority proof where the transport does not
-	// carry it (mTLS client identity is the primary; 02 §4)
-	WireSchemaDigest []byte `protobuf:"bytes,9,opt,name=wire_schema_digest,json=wireSchemaDigest,proto3" json:"wire_schema_digest,omitempty"` // class (a): THE SCHEMA FENCE (#530-A1). See ClaimAck 14.
-	unknownFields    protoimpl.UnknownFields
-	sizeCache        protoimpl.SizeCache
+	unknownFields           protoimpl.UnknownFields
+	sizeCache               protoimpl.SizeCache
 }
 
 func (x *Claim) Reset() {
@@ -1718,13 +1703,6 @@ func (x *Claim) GetProof() []byte {
 	return nil
 }
 
-func (x *Claim) GetWireSchemaDigest() []byte {
-	if x != nil {
-		return x.WireSchemaDigest
-	}
-	return nil
-}
-
 // Claim acceptance: the worker fences the previous stream (if any), increments
 // control_stream_generation, and answers with its identity + one WorkerSnapshot. DISPATCH STAYS
 // CLOSED until the RecordOwner's SnapshotAck (02 §6) — admission_state reports CLOSED until then.
@@ -1747,35 +1725,10 @@ type ClaimAck struct {
 	// own manifest digest without a self-reference. The provisioner
 	// independently verifies the selected immutable OCI identity;
 	// a RecordOwner needs BOTH facts to admit the machine.
-	GitCommit string           `protobuf:"bytes,12,opt,name=git_commit,json=gitCommit,proto3" json:"git_commit,omitempty"`
-	Resources *WorkerResources `protobuf:"bytes,13,opt,name=resources,proto3" json:"resources,omitempty"` // torch-free worker statics; never re-sent mid-stream.
-	// THE SCHEMA FENCE (#530-A1), class (a): sha256 of the canonical
-	// `cozy.worker.v1.WireSchema/1` document — this file's own FileDescriptorProto under the
-	// writer every other digest here uses. It is DERIVED from the schema, never declared beside
-	// it, so a stale binding cannot spell it without BEING the schema it names.
-	//
-	// Why this and not `wire_minor`: the minor is the ADDITIVE linear train (03 §1.3, §4) where
-	// unknown = ignore, absent = the pre-introduction default, and a mismatch is explicitly never
-	// a refusal. A breaking in-place revision on an unreleased major (#480g) breaks every one of
-	// those promises, so a breaking revision cannot honestly move the minor — and the old
-	// WIRE_MINOR=0 agreement fenced NOTHING while two vendored bindings sat revisions behind. A number
-	// that can agree while the bytes disagree is not a fence; this is the same correction §4
-	// applied to the placement set, where a CLAIMED echo became a RECOMPUTED byte fence.
-	//
-	// R8 EXEMPTION, stated rather than discovered: this field's absence-default is a REFUSAL, not
-	// the pre-introduction behavior. That is legal ONLY because this is a breaking in-place
-	// revision on an unreleased major, where an older peer MUST NOT interoperate. Absence is
-	// precisely the stale signal, and it works because a pre-rev-2 binding cannot spell the field
-	// at all.
-	//
-	// The fence is checked at the HANDSHAKE, before any later frame's body is read: a mismatch or
-	// an absent digest refuses CLAIM_REJECTION_SCHEMA_DIGEST_MISMATCH and the stream closes,
-	// instead of a stale peer misparsing a renumbered field mid-stream. Both directions are
-	// covered by the one pair — a stale RecordOwner sends no digest, and a stale worker answers
-	// with none.
-	WireSchemaDigest []byte `protobuf:"bytes,14,opt,name=wire_schema_digest,json=wireSchemaDigest,proto3" json:"wire_schema_digest,omitempty"`
-	unknownFields    protoimpl.UnknownFields
-	sizeCache        protoimpl.SizeCache
+	GitCommit     string           `protobuf:"bytes,12,opt,name=git_commit,json=gitCommit,proto3" json:"git_commit,omitempty"`
+	Resources     *WorkerResources `protobuf:"bytes,13,opt,name=resources,proto3" json:"resources,omitempty"` // torch-free worker statics; never re-sent mid-stream.
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
 }
 
 func (x *ClaimAck) Reset() {
@@ -1888,13 +1841,6 @@ func (x *ClaimAck) GetGitCommit() string {
 func (x *ClaimAck) GetResources() *WorkerResources {
 	if x != nil {
 		return x.Resources
-	}
-	return nil
-}
-
-func (x *ClaimAck) GetWireSchemaDigest() []byte {
-	if x != nil {
-		return x.WireSchemaDigest
 	}
 	return nil
 }
@@ -7741,7 +7687,7 @@ const file_cozy_worker_v1_worker_proto_rawDesc = "" +
 	"\x0echeckpoint_ack\x18\v \x01(\v2 .cozy.worker.v1.JobCheckpointAckH\x00R\rcheckpointAck\x12<\n" +
 	"\bsnapshot\x18\f \x01(\v2\x1e.cozy.worker.v1.WorkerSnapshotH\x00R\bsnapshot\x12g\n" +
 	"\x18artifact_finalize_result\x18\x10 \x01(\v2+.cozy.worker.v1.ArtifactFinalizeResultFrameH\x00R\x16artifactFinalizeResultB\x05\n" +
-	"\x03msgJ\x04\b\r\x10\x0eJ\x04\b\x0e\x10\x0fJ\x04\b\x0f\x10\x10\"\xc5\x02\n" +
+	"\x03msgJ\x04\b\r\x10\x0eJ\x04\b\x0e\x10\x0fJ\x04\b\x0f\x10\x10\"\xb1\x02\n" +
 	"\x05Claim\x12,\n" +
 	"\x12record_owner_epoch\x18\x01 \x01(\x04R\x10recordOwnerEpoch\x12:\n" +
 	"\x19control_stream_generation\x18\x02 \x01(\x04R\x17controlStreamGeneration\x12$\n" +
@@ -7750,8 +7696,8 @@ const file_cozy_worker_v1_worker_proto_rawDesc = "" +
 	"\tworker_id\x18\x06 \x01(\tR\bworkerId\x12\x1d\n" +
 	"\n" +
 	"wire_minor\x18\a \x01(\rR\twireMinor\x12\x14\n" +
-	"\x05proof\x18\b \x01(\fR\x05proof\x12,\n" +
-	"\x12wire_schema_digest\x18\t \x01(\fR\x10wireSchemaDigestJ\x04\b\x04\x10\x05\"\xd2\x04\n" +
+	"\x05proof\x18\b \x01(\fR\x05proofJ\x04\b\x04\x10\x05J\x04\b\t\x10\n" +
+	"R\x12wire_schema_digest\"\xbe\x04\n" +
 	"\bClaimAck\x12,\n" +
 	"\x12record_owner_epoch\x18\x01 \x01(\x04R\x10recordOwnerEpoch\x12:\n" +
 	"\x19control_stream_generation\x18\x02 \x01(\x04R\x17controlStreamGeneration\x12$\n" +
@@ -7767,8 +7713,7 @@ const file_cozy_worker_v1_worker_proto_rawDesc = "" +
 	"\x16control_runtime_digest\x18\v \x01(\tR\x14controlRuntimeDigest\x12\x1d\n" +
 	"\n" +
 	"git_commit\x18\f \x01(\tR\tgitCommit\x12=\n" +
-	"\tresources\x18\r \x01(\v2\x1f.cozy.worker.v1.WorkerResourcesR\tresources\x12,\n" +
-	"\x12wire_schema_digest\x18\x0e \x01(\fR\x10wireSchemaDigestJ\x04\b\x04\x10\x05\"\xe2\x03\n" +
+	"\tresources\x18\r \x01(\v2\x1f.cozy.worker.v1.WorkerResourcesR\tresourcesJ\x04\b\x04\x10\x05J\x04\b\x0e\x10\x0fR\x12wire_schema_digest\"\xe2\x03\n" +
 	"\vBootFailure\x12,\n" +
 	"\x12record_owner_epoch\x18\x01 \x01(\x04R\x10recordOwnerEpoch\x12:\n" +
 	"\x19control_stream_generation\x18\x02 \x01(\x04R\x17controlStreamGeneration\x12$\n" +
@@ -8388,17 +8333,15 @@ const file_cozy_worker_v1_worker_proto_rawDesc = "" +
 	"\x13CANCEL_REASON_DRAIN\x10\x02\x12\x1c\n" +
 	"\x18CANCEL_REASON_SUPERSEDED\x10\x03\x12\x18\n" +
 	"\x14CANCEL_REASON_POLICY\x10\x04\x12\x1a\n" +
-	"\x16CANCEL_REASON_DEADLINE\x10\x05*\xe7\x02\n" +
+	"\x16CANCEL_REASON_DEADLINE\x10\x05*\xeb\x02\n" +
 	"\x0eClaimRejection\x12\x1f\n" +
 	"\x1bCLAIM_REJECTION_UNSPECIFIED\x10\x00\x12#\n" +
 	"\x1fCLAIM_REJECTION_UNAUTHENTICATED\x10\x01\x12,\n" +
 	"(CLAIM_REJECTION_STALE_RECORD_OWNER_EPOCH\x10\x02\x12\x1e\n" +
 	"\x1aCLAIM_REJECTION_EPOCH_HELD\x10\x03\x12&\n" +
 	"\"CLAIM_REJECTION_WORKER_ID_MISMATCH\x10\x04\x12'\n" +
-	"#CLAIM_REJECTION_RELEASE_ID_MISMATCH\x10\x05\x12%\n" +
-	"!CLAIM_REJECTION_UNSUPPORTED_MINOR\x10\x06\x12\x1d\n" +
-	"\x19CLAIM_REJECTION_UNDURABLE\x10\a\x12*\n" +
-	"&CLAIM_REJECTION_SCHEMA_DIGEST_MISMATCH\x10\b*\xd4\x04\n" +
+	"#CLAIM_REJECTION_RELEASE_ID_MISMATCH\x10\x05\x12\x1d\n" +
+	"\x19CLAIM_REJECTION_UNDURABLE\x10\a\"\x04\b\x06\x10\x06\"\x04\b\b\x10\b*!CLAIM_REJECTION_UNSUPPORTED_MINOR*&CLAIM_REJECTION_SCHEMA_DIGEST_MISMATCH*\xd4\x04\n" +
 	"\tFaultKind\x12\x1a\n" +
 	"\x16FAULT_KIND_UNSPECIFIED\x10\x00\x12\"\n" +
 	"\x1eFAULT_KIND_BINDING_UNAVAILABLE\x10\x01\x12\x1f\n" +

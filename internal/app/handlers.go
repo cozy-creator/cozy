@@ -12,6 +12,7 @@ import (
 	"github.com/cozy-creator/cozy-creator/internal/manifest"
 	"github.com/cozy-creator/cozy-creator/internal/render"
 	"github.com/cozy-creator/cozy-creator/internal/service"
+	pb "github.com/cozy-creator/cozy-creator/protocol/cozy/worker/v1"
 )
 
 // Build identity. tag/commit may be stamped with -ldflags -X; otherwise the Go
@@ -19,9 +20,8 @@ import (
 var (
 	tag    = "0.0.0-dev"
 	commit = ""
-	// The published worker protocol (worker-protocol-v2, th-024). Asserted here as a
-	// constant; the binding link to a running worker arrives with cl-001.
-	protocolVersion = "cozy.worker.v1 (wire_minor 2)"
+	// The package path is the major; the additive minor comes from the vendored binding.
+	protocolVersion = fmt.Sprintf("cozy.worker.v1 (wire_minor %d)", pb.WireMinor)
 	// The local client API contract this binary serves (cl-006). It is the SHARED
 	// contract's core version, not a local build number: the same string is what
 	// Tensorhub's host and the pod profile answer with when they serve the same core.

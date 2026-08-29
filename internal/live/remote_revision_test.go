@@ -211,15 +211,14 @@ func (p *revisionPeer) Control(stream pb.WorkerControl_ControlServer) error {
 		return err
 	}
 	claim := first.GetClaim()
-	schemaDigest, _ := canonical.Raw(pb.SchemaDigest)
 	const bootID = "boot-revision"
 	const generation = 1
 	if err := stream.Send(&pb.WorkerFrame{Msg: &pb.WorkerFrame_ClaimAck{ClaimAck: &pb.ClaimAck{
 		RecordOwnerEpoch: claim.RecordOwnerEpoch, ControlStreamGeneration: generation,
 		WorkerBootId: bootID, Accepted: true, WireMinor: pb.WireMinor,
 		WorkerId: "worker-revision", WorkerInstanceId: "worker-instance-revision",
-		WorkerReleaseId: "release-a", WireSchemaDigest: schemaDigest,
-		Resources: &pb.WorkerResources{Backend: "cuda", DeviceName: "NVIDIA H100", DeviceCount: 1},
+		WorkerReleaseId: "release-a",
+		Resources:       &pb.WorkerResources{Backend: "cuda", DeviceName: "NVIDIA H100", DeviceCount: 1},
 	}}}); err != nil {
 		return err
 	}

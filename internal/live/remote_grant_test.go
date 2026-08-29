@@ -188,12 +188,11 @@ func (p *grantPeer) Control(stream pb.WorkerControl_ControlServer) error {
 	}
 	claim := first.GetClaim()
 	bootID, generation := "boot-remote", uint64(1)
-	schemaDigest, _ := canonical.Raw(pb.SchemaDigest)
 	if err := stream.Send(&pb.WorkerFrame{Msg: &pb.WorkerFrame_ClaimAck{ClaimAck: &pb.ClaimAck{
 		RecordOwnerEpoch: claim.RecordOwnerEpoch, ControlStreamGeneration: generation,
 		WorkerBootId: bootID, Accepted: true, WireMinor: pb.WireMinor,
 		WorkerId: "worker-remote", WorkerInstanceId: "worker-instance-remote",
-		WorkerReleaseId: "release-1", WireSchemaDigest: schemaDigest,
+		WorkerReleaseId:      "release-1",
 		ControlRuntimeDigest: "sha256:1111111111111111111111111111111111111111111111111111111111111111",
 		Resources:            &pb.WorkerResources{Backend: "cuda", DeviceName: "NVIDIA H100", DeviceCount: 1},
 	}}}); err != nil {

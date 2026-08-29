@@ -10,8 +10,6 @@ import (
 	"strings"
 	"testing"
 	"time"
-
-	pb "github.com/cozy-creator/cozy-creator/protocol/cozy/worker/v1"
 )
 
 const weightlessRef = "cozy/weightless"
@@ -256,24 +254,16 @@ func TestProductPath(t *testing.T) {
 	}
 }
 
-// weightlessRelease builds the fixture archive from THIS tree and the runtime commit that
-// speaks this tree's wire schema. There is no cache and no derivation record: an archive
-// built from a peer at another revision refuses `wire_schema_mismatch` at Claim, which is
-// a fact about the two repositories rather than something a test can work around.
+// weightlessRelease builds the fixture archive from the current Runtime checkout. The
+// released endpoint owns that exact Runtime wheel and lock; Creator does not substitute a
+// host package for it.
 func weightlessRelease(t *testing.T) string {
 	t.Helper()
 	home, err := os.UserHomeDir()
 	must(t, err)
 	repo := filepath.Join(home, "cozy_v2", "cozy-runtime") //cozy:allow the peer REPOSITORY the fixture is built from, not the runtime binary; nothing here executes it
-	declared, err := exec.Command("git", "-C", repo, "show",
-		"HEAD:src/cozy/worker/v1/wire_identity.py").Output()
-	if err != nil {
+	if _, err := os.Stat(filepath.Join(repo, "pyproject.toml")); err != nil {
 		t.Skipf("no cozy-runtime peer at %s: %v", repo, err)
-	}
-	if !strings.Contains(string(declared), pb.SchemaDigest) {
-		t.Skipf("cr-043: the cozy-runtime peer at %s declares another wire schema; this tree "+
-			"speaks rev %d %s, so every release built from it would refuse "+
-			"wire_schema_mismatch at Claim", repo, pb.WireSchemaRev, pb.SchemaDigest)
 	}
 	dir := t.TempDir()
 	build := exec.Command("/usr/bin/nice", "-n", "19", "bash",

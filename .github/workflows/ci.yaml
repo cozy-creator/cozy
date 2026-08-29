@@ -18,22 +18,20 @@ jobs:
       # the real system — the real orchestrator, a real `cozy up` process, and
       # `internal/live/fakeworker`, a second independent implementation of the worker protocol —
       # and observes what it does. Nothing in it is a mock. The tests that need a peer this
-      # runner does not have (worker-protocol's frozen corpus, a cozy-runtime whose wire
-      # schema matches this tree) SKIP by name rather than passing vacuously.
+      # runner does not have (worker-protocol's frozen corpus or a cozy-runtime checkout)
+      # SKIP by name rather than passing vacuously.
       - run: nice -n 19 go test ./... -timeout 20m
       - run: python3 scripts/fence.py
 
-  # THE VENDORED-BINDING FENCE (#530-A1/#536d). `protocol/` is COPIED, never imported, so
-  # nothing in a Go build can notice that the copy is revisions behind the contract — and
-  # `wire_minor` could not notice either, because the minor is the ADDITIVE train and does
-  # not move for a breaking in-place revision. `wire_schema_digest` catches a stale peer at
-  # the HANDSHAKE, which is a run-time discovery by an operator on a live stream. This
-  # catches the same fact at BUILD time: worker-protocol regenerates from its own .proto
-  # with its own pinned protoc and byte-compares against what is vendored here.
+  # THE VENDORED-BINDING CHECK. `protocol/` is copied, never imported as a module, so
+  # worker-protocol regenerates from its own .proto with its pinned toolchain and
+  # byte-compares against what is vendored here. Exact source custody belongs at build
+  # time; live peers use the protobuf package major and additive wire minor.
   #
   # It tracks worker-protocol's master deliberately. A pinned ref would only ever prove
-  # that nobody edited this directory by hand; the fact worth knowing is that the contract
-  # moved and this consumer has not flipped. That red IS the flip obligation arriving.
+  # that nobody edited this directory by hand; comparing master also surfaces generated
+  # contract updates for review in this consumer. It is a source-custody check, not a live
+  # compatibility gate.
   vendored-protocol:
     runs-on: ubuntu-latest
     env:
@@ -43,8 +41,7 @@ jobs:
         with:
           path: cozy-creator
       # This arm is self-contained and always executes. It proves that the copied bytes are the
-      # exact reviewed worker-protocol@2cf3336 set recorded in protocol/SHA256SUMS. Runtime's
-      # wire_schema_digest remains the safety fence if the private peer later advances.
+      # exact reviewed worker-protocol set recorded in protocol/SHA256SUMS.
       - name: Verify reviewed vendored bytes
         working-directory: cozy-creator
         run: sha256sum --check protocol/SHA256SUMS

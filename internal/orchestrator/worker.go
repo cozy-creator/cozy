@@ -1164,7 +1164,7 @@ type WorkerFacts struct {
 	ErrorForMS int64  `json:"error_for_ms"`
 	Fault      string `json:"fault"`
 	// Refusal is THIS OWNER'S OWN VERDICT about the thing at the other end — a foreign
-	// instance identity, an unpinned release, a wire schema this build does not speak. It
+	// instance identity or an unpinned release. It
 	// is deliberately NOT `Fault`: fault rows explain worker state, while FAILED axes decide
 	// terminality. A refusal is this owner's settled verdict and waits on no error clock.
 	Refusal string `json:"refusal"`

@@ -11,17 +11,13 @@
 // TLS over a private network or authenticated overlay remotely. A worker control port is NEVER
 // required to be publicly exposed for topology symmetry.
 //
-// REV-2, THE DYNAMIC-SERVING REV (decisions #471-#475, #480-#483, #485b/c, #486, #487/#489,
-// #507d). BREAKING IN PLACE on the unreleased `cozy.worker.v1` (#480g): field numbers are
-// reserved at their sites, deleted messages keep their numbers reserved, both reference halves
-// and the conformance corpus regenerate together. No shim speaks both shapes; no rename ships
-// an alias. This is the fifth in-place revision (5b07b79 -> 732763b -> 8d90461 -> c6dbc12 ->
-// this) and it renumbers freely, per the 2026-08-24 precedent.
-//
-// VERSIONING (03 §1, §2 R1-R8): the MAJOR is the package path (`cozy.worker.v1`); the MINOR is
-// `wire_minor`, a linear-train number declared at Claim/ClaimAck — never a negotiation. R7 IS AN
-// AUTHORING RULE ONLY: `reserved` numbers are compiler-enforced tombstones against REUSE;
-// ordinary proto3 decoders do not refuse them on the wire and no runtime polices them.
+// VERSIONING: the MAJOR is the package path (`cozy.worker.v1`). The MINOR is `wire_minor`, an
+// additive linear-train number declared at Claim/ClaimAck — never a negotiation. A future
+// breaking change MUST use a new package major (`cozy.worker.v2`); it must not revise v1 in
+// place. R7 IS AN AUTHORING RULE ONLY: `reserved` numbers and names are compiler-enforced
+// tombstones against reuse; ordinary proto3 decoders do not refuse them on the wire and no
+// runtime polices them. This file includes the final pre-release v1 hardcut; all generated
+// bindings and fixtures were regenerated together before v1 shipped.
 //
 // IDENTITY IS CANONICAL BYTES, PROTOBUF IS TRANSPORT: no digest is ever computed over
 // protobuf-marshaled bytes. A meaning-fencing digest is the SHA-256 of a DOCUMENT's exact

@@ -286,9 +286,8 @@ func codeFor(status int) exit.Code {
 // into its base worker image while this client floats with Creator master, so a route or a
 // field can move on one side alone. The revision closes that: a plane at another revision,
 // or one too old to declare a revision at all, is refused here rather than fed bytes whose
-// answer shape this host would misread. It is the byte plane's `pb.WireSchemaRev` check
-// (`internal/orchestrator/owner.go`), and it FAILS CLOSED for the same reason — a peer
-// that says nothing is the skew case, not an exemption from it.
+// answer shape this host would misread. This media contract has its own explicit revision;
+// it is independent of the protobuf worker protocol.
 func (c *Client) Health() *exit.Error {
 	_, data, e := c.call(http.MethodGet, "/v1/health", nil)
 	if e != nil {

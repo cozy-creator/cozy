@@ -60,20 +60,12 @@ func (f *fakeControl) Control(stream pb.WorkerControl_ControlServer) error {
 		}
 	}
 	refuseClaim := func(reason pb.ClaimRejection, why string) {
-		ack := &pb.ClaimAck{Accepted: false, Rejection: reason, WireMinor: pb.WireMinor,
-			WireSchemaDigest: mySchemaDigest()}
+		ack := &pb.ClaimAck{Accepted: false, Rejection: reason, WireMinor: pb.WireMinor}
 		env(func(e, g uint64, b string) {
 			ack.RecordOwnerEpoch, ack.ControlStreamGeneration, ack.WorkerBootId = e, g, b
 		})
 		send(&pb.WorkerFrame{Msg: &pb.WorkerFrame_ClaimAck{ClaimAck: ack}})
 		f.say("Claim REFUSED (%s): %s", pb.ClaimRejection_name[int32(reason)], why)
-	}
-	// THE SCHEMA FENCE IS CHECKED BEFORE ANY OTHER BODY FIELD (#530-A1). A worker that
-	// authenticated a peer it cannot parse would be trusting a shape, not a credential.
-	if !bytes.Equal(claim.WireSchemaDigest, mySchemaDigest()) {
-		refuseClaim(pb.ClaimRejection_CLAIM_REJECTION_SCHEMA_DIGEST_MISMATCH,
-			"the RecordOwner declares a wire schema this worker does not speak")
-		return nil
 	}
 	if !f.verify(string(claim.Proof)) {
 		refuseClaim(pb.ClaimRejection_CLAIM_REJECTION_UNAUTHENTICATED,
@@ -83,14 +75,14 @@ func (f *fakeControl) Control(stream pb.WorkerControl_ControlServer) error {
 	ack := &pb.ClaimAck{
 		Accepted: true, WireMinor: pb.WireMinor, WorkerId: "local",
 		WorkerInstanceId: f.instance, WorkerReleaseId: f.releaseID,
-		WireSchemaDigest: mySchemaDigest(), Resources: &pb.WorkerResources{Platform: "fake"},
+		Resources: &pb.WorkerResources{Platform: "fake"},
 	}
 	env(func(e, g uint64, b string) {
 		ack.RecordOwnerEpoch, ack.ControlStreamGeneration, ack.WorkerBootId = e, g, b
 	})
 	send(&pb.WorkerFrame{Msg: &pb.WorkerFrame_ClaimAck{ClaimAck: ack}})
-	f.say("ClaimAck sent: boot=%s instance=%s release=%s schema=rev%d",
-		f.bootID, f.instance, f.releaseID, pb.WireSchemaRev)
+	f.say("ClaimAck sent: boot=%s instance=%s release=%s minor=%d",
+		f.bootID, f.instance, f.releaseID, pb.WireMinor)
 
 	// ONE BOUNDED, DIGEST-ACKED SNAPSHOT (§5). The body is a real canonical document and
 	// the digest is over exactly its bytes, so a truncated snapshot cannot match one.
@@ -431,17 +423,6 @@ func (f *fakeControl) stealOutcome(emit func(*pb.AttemptOutcome)) {
 // onePixelPNG is a 1x1 PNG, hex-encoded: the smallest thing that is really an image.
 const onePixelPNG = "89504e470d0a1a0a0000000d4948445200000001000000010806000000" +
 	"1f15c4890000000d49444154789c6360000002000100ffff03000006000557bfabd40000000049454e44ae426082"
-
-// mySchemaDigest is THE FENCE as the raw bytes the wire carries, read from the same
-// constant the RecordOwner reads: two peers built from one worker-protocol revision agree,
-// and any other pair refuses at the handshake.
-func mySchemaDigest() []byte {
-	raw, err := canonical.Raw(pb.SchemaDigest)
-	if err != nil {
-		panic("the vendored wire_identity.go carries an unspellable schema digest: " + err.Error())
-	}
-	return raw
-}
 
 func randomHex(n int) string {
 	b := make([]byte, n)
