@@ -68,18 +68,18 @@ Remove local endpoint generations with:
 cozy endpoint remove org/name
 ```
 
-Publishing packages one deterministic pure project wheel and an explicit compatibility-profile
-set. The endpoint name is created automatically when absent:
+Publishing packages one deterministic pure project wheel. Tensorhub derives compatible base
+worker profiles from `pyproject.toml`, `uv.lock`, and its image inventory. The endpoint name is
+created automatically when absent:
 
 ```sh
 cozy endpoint publish org/name \
   --release 1.0.0 \
-  --profile torch2.13.0-cu130-cp312-linux-x86 \
   --dir . \
   --reason "release 1.0.0"
 ```
 
-Tensorhub owns hardware qualification and serving promotion; publication does neither implicitly.
+Tensorhub owns serving promotion; publication does not move traffic implicitly.
 See [endpoint publication](docs/endpoint-publication.md) for the release contract.
 
 ## Models

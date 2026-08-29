@@ -20,7 +20,6 @@ unsafe paths refuse.
 ```sh
 cozy endpoint publish org/endpoint \
   --release 1.0.0 \
-  --create \
   --reason "initial release"
 ```
 
@@ -45,10 +44,5 @@ returns the typed `endpoint_model_binding_deferred` refusal; binding intent stay
 
 ## Promotion
 
-Publication does not move traffic. Promotion is a separate explicit transaction:
-
-```sh
-cozy endpoint promote org/endpoint 1.0.0 \
-  --serve v1/generate \
-  --reason "serve verified release"
-```
+Publication does not move traffic. Tensorhub promotion is a separate explicit operator/policy
+transaction; Creator has no promotion command.
