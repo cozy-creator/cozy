@@ -18,6 +18,7 @@ import (
 	"github.com/cozy-creator/cozy-creator/internal/render"
 	"github.com/cozy-creator/cozy-creator/internal/rental"
 	"github.com/cozy-creator/cozy-creator/internal/secret"
+	"github.com/cozy-creator/cozy-creator/internal/service"
 )
 
 // The rental verbs (cl-015). `cozy rent` MINTS the pod's access token, asks the hub for a
@@ -245,6 +246,11 @@ func handleRent(ctx *Context) *exit.Error {
 	// the token hash and cannot authenticate to WorkerControl; the LocalService claims,
 	// acknowledges the snapshot barrier, drives desired state, and relays the resulting
 	// authenticated worker frames over the rental-scoped HTTP route.
+	ctx.Service = service.Probe(ctx.Cfg)
+	if !ctx.Service.Up {
+		return ctx.Service.Unavailable().WithRemedy(
+			"the paid rental remains converging and attached on this host; start `cozy up` and resume with the same --idempotency-key")
+	}
 	local, e := dial(ctx)
 	if e != nil {
 		return e.WithRemedy("the paid rental remains converging and attached on this host; start `cozy up` and resume with the same --idempotency-key")
