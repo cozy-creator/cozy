@@ -69,7 +69,7 @@ func handleEndpointPublish(ctx *Context) *exit.Error {
 	var candidateRows, refusalRows []string
 	for _, profile := range done.Profiles {
 		profileRows = append(profileRows, profile.Profile+":"+profile.State+":"+profile.BaseRealizationKind)
-		if profile.State == "candidate" {
+		if profile.State == "qualified" {
 			candidateRows = append(candidateRows, profile.Profile+"/"+profile.BaseRealizationKind+"="+profile.CandidateID)
 		} else {
 			refusal := profile.Profile + "/" + profile.BaseRealizationKind + " " + profile.RefusalCode
@@ -151,7 +151,7 @@ func validateFinalize(pack *endpointpublish.Package, release string,
 	}
 	seenProfiles := map[string]bool{}
 	seenRealizations := map[string]bool{}
-	candidateProfiles := map[string]bool{}
+	qualifiedProfiles := map[string]bool{}
 	for _, row := range done.Profiles {
 		if row.Profile == "" || seenProfiles[row.Profile] {
 			return exit.Internalf("endpoint finalize returned an empty or duplicate profile %q", row.Profile)
@@ -166,25 +166,25 @@ func validateFinalize(pack *endpointpublish.Package, release string,
 				row.Profile, row.BaseRealizationKind)
 		}
 		seenRealizations[key] = true
-		if row.State != "candidate" && row.State != "refused" {
-			return exit.Internalf("endpoint finalize returned non-candidate profile state %q", row.State)
+		if row.State != "qualified" && row.State != "refused" {
+			return exit.Internalf("endpoint finalize returned unknown profile state %q", row.State)
 		}
 		if row.State == "refused" && row.RefusalCode == "" {
 			return exit.Internalf("endpoint finalize returned a refusal without a typed code")
 		}
-		if row.State == "candidate" {
+		if row.State == "qualified" {
 			if row.RefusalCode != "" || row.RefusalDetail != "" {
 				return exit.Internalf("endpoint finalize returned refusal detail on a passing candidate")
 			}
-			candidateProfiles[row.Profile] = true
+			qualifiedProfiles[row.Profile] = true
 		}
 	}
 	seenExecutions := map[string]bool{}
 	for _, execution := range done.EndpointExecutions {
 		key := execution.Profile + "\x00" + execution.Function
-		if !candidateProfiles[execution.Profile] || strings.TrimSpace(execution.Function) == "" ||
+		if !qualifiedProfiles[execution.Profile] || strings.TrimSpace(execution.Function) == "" ||
 			seenExecutions[key] || !sha256Digest(execution.Digest) ||
-			(execution.State != "candidate" && execution.State != "refused") {
+			execution.State != "qualified" {
 			return exit.Internalf("endpoint finalize returned malformed or duplicate execution %q/%q",
 				execution.Profile, execution.Function)
 		}
