@@ -8,6 +8,7 @@ jobs:
       - uses: actions/setup-go@v5
         with:
           go-version: stable
+      - uses: astral-sh/setup-uv@v5
       # CGO_ENABLED=0 is the LAW, not a default: `internal/records` drives SQLite through
       # modernc.org/sqlite and nothing in this binary is C. Building with it off here is
       # what keeps a C dependency from arriving unnoticed and silently ending the

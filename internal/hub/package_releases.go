@@ -1,10 +1,10 @@
 package hub
 
-// Typed package release/profile routes. Declaration bytes are caller-canonical and
-// replayed exactly; this client never re-marshals them into a second identity.
+// Typed package release/profile routes.
 
 import (
 	"context"
+	"encoding/json"
 	"net/http"
 	"net/url"
 
@@ -17,46 +17,36 @@ type ObjectRef struct {
 }
 
 type PackageUpload struct {
-	Role            string            `json:"role"`
-	Ref             ObjectRef         `json:"ref"`
+	Path            string            `json:"path,omitempty"`
 	URL             string            `json:"url"`
 	RequiredHeaders map[string]string `json:"required_headers"`
-	ExpiresAt       string            `json:"expires_at"`
-	AlreadyHeld     bool              `json:"already_held"`
+	AlreadyUploaded bool              `json:"already_uploaded"`
 }
 
 type PackageProfileState struct {
-	Profile                string    `json:"profile"`
-	State                  string    `json:"state"`
-	CandidateID            string    `json:"candidate_id,omitempty"`
-	BaseRealizationKind    string    `json:"base_realization_kind,omitempty"`
-	BaseRealizationDigest  string    `json:"base_realization_digest,omitempty"`
-	PackageEnvironmentSpec ObjectRef `json:"package_environment_spec,omitempty"`
-	ResolvedWheelSet       ObjectRef `json:"resolved_wheel_set,omitempty"`
-	ResolutionLock         ObjectRef `json:"resolution_lock,omitempty"`
-	RefusalCode            string    `json:"refusal_code,omitempty"`
-	RefusalDetail          string    `json:"refusal_detail,omitempty"`
+	Profile             string `json:"profile"`
+	State               string `json:"state"`
+	CandidateID         string `json:"candidate_id,omitempty"`
+	BaseRealizationKind string `json:"base_realization_kind,omitempty"`
+	RefusalCode         string `json:"refusal_code,omitempty"`
+	RefusalDetail       string `json:"refusal_detail,omitempty"`
 }
 
 type PackageReleaseBegin struct {
-	DeclarationDigest string          `json:"declaration_digest"`
-	State             string          `json:"state"`
-	Uploads           []PackageUpload `json:"uploads"`
+	Release            string        `json:"release"`
+	State              string        `json:"state"`
+	ProjectWheelUpload PackageUpload `json:"project_wheel_upload"`
 }
 
-type PackageExecution struct {
-	Profile  string `json:"profile"`
-	Function string `json:"function"`
-	Digest   string `json:"digest"`
-	State    string `json:"state"`
+type PackageSourceUploads struct {
+	Uploads []PackageUpload `json:"uploads"`
 }
 
 type PackageReleaseFinalize struct {
 	Created           bool                  `json:"created"`
 	Release           string                `json:"release"`
-	DeclarationDigest string                `json:"declaration_digest"`
 	Profiles          []PackageProfileState `json:"profiles"`
-	PackageExecutions []PackageExecution    `json:"package_executions"`
+	PackageExecutions []json.RawMessage     `json:"package_executions"`
 }
 
 func packageReleasePath(ref Ref, release string) string {
@@ -67,23 +57,29 @@ func packageProfilePath(ref Ref, release, profile string) string {
 	return packageReleasePath(ref, release) + "/profiles/" + url.PathEscape(profile)
 }
 
-func (c *Client) BeginPackageRelease(ctx context.Context, ref Ref, release string,
-	declaration []byte, reason string,
-) (PackageReleaseBegin, *exit.Error) {
+func (c *Client) BeginPackageRelease(ctx context.Context, ref Ref, release, reason string) (PackageReleaseBegin, *exit.Error) {
 	var out PackageReleaseBegin
 	e := c.do(ctx, call{method: http.MethodPost,
 		path: packageReleasePath(ref, release) + "/begin", admin: true, reason: reason,
-		bodyBytes: declaration, byBytes: true, patient: true}, &out)
+		body: map[string]any{}}, &out)
 	return out, e
 }
 
-func (c *Client) FinalizePackageRelease(ctx context.Context, ref Ref, release string,
-	declaration []byte, reason string,
-) (PackageReleaseFinalize, *exit.Error) {
+func (c *Client) PackageReleaseSourceUploads(ctx context.Context, ref Ref, release string,
+	paths []string, reason string,
+) (PackageSourceUploads, *exit.Error) {
+	var out PackageSourceUploads
+	e := c.do(ctx, call{method: http.MethodPost,
+		path: packageReleasePath(ref, release) + "/uploads", admin: true, reason: reason,
+		body: map[string]any{"paths": paths}}, &out)
+	return out, e
+}
+
+func (c *Client) FinalizePackageRelease(ctx context.Context, ref Ref, release, reason string) (PackageReleaseFinalize, *exit.Error) {
 	var out PackageReleaseFinalize
 	e := c.do(ctx, call{method: http.MethodPost,
 		path: packageReleasePath(ref, release) + "/finalize", admin: true, reason: reason,
-		bodyBytes: declaration, byBytes: true, patient: true}, &out)
+		body: map[string]any{}, patient: true}, &out)
 	return out, e
 }
 

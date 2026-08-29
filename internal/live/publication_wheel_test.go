@@ -8,55 +8,70 @@ import (
 	"fmt"
 	"io"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"slices"
 	"sort"
 	"strings"
 	"testing"
 
-	"github.com/cozy-creator/cozy-creator/internal/config"
-	"github.com/cozy-creator/cozy-creator/internal/launch"
 	"github.com/cozy-creator/cozy-creator/internal/packagepublish"
 	"github.com/cozy-creator/cozy-creator/internal/wheel"
 )
 
-// TestPackagePublicationWheels is the release-border matrix: one deterministic
-// pure project wheel and planted native/build-input refusals.
+// TestPackagePublicationWheels verifies that standard uv builds are admitted only
+// when their emitted wheel is portable pure Python.
 func TestPackagePublicationWheels(t *testing.T) {
 	root := t.TempDir()
-	mustWrite(t, filepath.Join(root, "pyproject.toml"), `[project]
+	mustWrite(t, filepath.Join(root, "pyproject.toml"), `[build-system]
+requires = ["uv_build>=0.9.18,<0.10"]
+build-backend = "uv_build"
+
+[project]
 name = "marco-polo"
 version = "1.0.0"
+
+[tool.uv.build-backend]
+module-root = ""
 `)
 	mustWrite(t, filepath.Join(root, "package.toml"), `[application]
 object = "marco_polo:app"
 `)
-	mustWrite(t, filepath.Join(root, "marco_polo.py"), "app = object()\n")
+	mustWrite(t, filepath.Join(root, "marco_polo", "__init__.py"), "app = 'committed'\n")
 	mustWrite(t, filepath.Join(root, "uv.lock"), "version = 1\n")
-	packed, problem := wheel.Pack(wheel.Request{Tree: root, OutDir: filepath.Join(root, "dist")})
+	mustWrite(t, filepath.Join(root, "marco_polo", "__init__.py"), "app = 'modified'\n")
+	mustWrite(t, filepath.Join(root, "marco_polo", "untracked.py"), "value = 'untracked'\n")
+	packed, problem := wheel.Build(wheel.Request{Tree: root, OutDir: filepath.Join(root, "wheel-out")})
 	if problem != nil {
-		t.Fatalf("pure project pack refused: %s", problem)
+		t.Fatalf("current working tree build refused: %s", problem)
 	}
-	if packed.Fact.Digest != packed.Digest || packed.Fact.Length != packed.Bytes ||
-		strings.Join(packed.Fact.Tags, ",") != wheel.Tag ||
-		strings.Join(packed.Fact.ImportRoots, ",") != "marco_polo" {
-		t.Fatalf("project WheelFact disagrees with packed bytes: %+v / %+v", packed, packed.Fact)
+	fact, problem := wheel.Inspect(packed.Path, wheel.ProjectWheel)
+	if problem != nil || strings.Join(fact.Tags, ",") != wheel.Tag ||
+		strings.Join(fact.ImportRoots, ",") != "marco_polo" {
+		t.Fatalf("project WheelFact disagrees with built bytes: %+v %v", fact, problem)
 	}
-	for _, forbidden := range []string{"pyproject.toml", "uv.lock"} {
-		if slices.Contains(packed.Entries, forbidden) {
-			t.Fatalf("publication-only metadata entered the runtime project wheel: %s", forbidden)
+	entries := wheelEntries(t, packed.Path)
+	for _, required := range []string{"marco_polo/__init__.py", "marco_polo/untracked.py"} {
+		if !slices.Contains(entries, required) {
+			t.Fatalf("current working-tree member %s is absent from %v", required, entries)
 		}
 	}
 
-	mustWrite(t, filepath.Join(root, "marco_polo.so"), "native")
-	if _, problem := wheel.Pack(wheel.Request{Tree: root, OutDir: filepath.Join(root, "dist2")}); problem == nil || problem.ErrName() != "project_wheel_native_file" {
+	mustWrite(t, filepath.Join(root, "marco_polo", "native.so"), "native")
+	native, problem := wheel.Build(wheel.Request{Tree: root, OutDir: filepath.Join(root, "native-out")})
+	if problem != nil {
+		t.Fatalf("standard native wheel build failed before Tensorhub inspection: %s", problem.Message)
+	}
+	if _, problem := wheel.Inspect(native.Path, wheel.ProjectWheel); problem == nil || problem.ErrName() != "project_wheel_native_file" {
 		t.Fatalf("native project file was not refused by name: %v", problem)
 	}
-	must(t, os.Remove(filepath.Join(root, "marco_polo.so")))
-	mustWrite(t, filepath.Join(root, "setup.py"), "raise SystemExit('must not run')\n")
-	if _, problem := wheel.Pack(wheel.Request{Tree: root, OutDir: filepath.Join(root, "dist3")}); problem == nil || problem.ErrName() != "project_wheel_build_input" {
-		t.Fatalf("project build input was not refused by name: %v", problem)
+	must(t, os.Remove(filepath.Join(root, "marco_polo", "native.so")))
+	mustWrite(t, filepath.Join(root, "marco_polo", ".env.local"), "TOKEN=secret\n")
+	secret, problem := wheel.Build(wheel.Request{Tree: root, OutDir: filepath.Join(root, "secret-out")})
+	if problem != nil {
+		t.Fatalf("standard credential wheel build failed before Tensorhub inspection: %s", problem.Message)
+	}
+	if _, problem := wheel.Inspect(secret.Path, wheel.ProjectWheel); problem == nil || problem.ErrName() != "project_wheel_credential" {
+		t.Fatalf("project wheel credential was not refused: %v", problem)
 	}
 
 	custom := filepath.Join(t.TempDir(), "custom_op-1.2.3-cp312-cp312-manylinux_2_28_x86_64.whl")
@@ -65,7 +80,7 @@ object = "marco_polo:app"
 			"custom_op/__init__.py": []byte("from ._native import run\n"),
 			"custom_op/_native.so":  []byte("prebuilt-native-fixture"),
 		})
-	fact, problem := wheel.Inspect(custom, wheel.CustomWheel)
+	fact, problem = wheel.Inspect(custom, wheel.CustomWheel)
 	if problem != nil {
 		t.Fatalf("prebuilt custom wheel refused: %s", problem)
 	}
@@ -92,7 +107,7 @@ object = "marco_polo:app"
 			"private_payload/.env.local":  []byte("TOKEN=secret\n"),
 		})
 	if _, problem := wheel.Inspect(private, wheel.ProjectWheel); problem == nil ||
-		problem.ErrName() != "project_wheel_private_member" {
+		problem.ErrName() != "project_wheel_credential" {
 		t.Fatalf("backend-emitted private member was not refused: %v", problem)
 	}
 	mislabeled := filepath.Join(t.TempDir(), "custom_op-1.2.3-py3-none-any.whl")
@@ -110,58 +125,42 @@ object = "marco_polo:app"
 	}
 }
 
-func TestPackagePublishSourceRefusals(t *testing.T) {
+func TestPackagePublishSkipsLocalAndRetiredFiles(t *testing.T) {
 	repo := t.TempDir()
-	mustWrite(t, filepath.Join(repo, "pyproject.toml"), `[project]
+	mustWrite(t, filepath.Join(repo, "pyproject.toml"), `[build-system]
+requires = ["uv_build>=0.9.18,<0.10"]
+build-backend = "uv_build"
+
+[project]
 name = "marco-polo"
 version = "1.0.0"
 dependencies = []
+
+[tool.uv.build-backend]
+module-root = ""
 `)
 	mustWrite(t, filepath.Join(repo, "package.toml"), `[application]
 object = "marco_polo:app"
 `)
-	mustWrite(t, filepath.Join(repo, "marco_polo.py"), "app = object()\n")
+	mustWrite(t, filepath.Join(repo, "marco_polo", "__init__.py"), "app = object()\n")
 	mustWrite(t, filepath.Join(repo, "uv.lock"), "version = 1\n")
-	git(t, repo, "init", "-q")
-	git(t, repo, "config", "user.email", "fixture@example.invalid")
-	git(t, repo, "config", "user.name", "Fixture")
-	git(t, repo, "add", ".")
-	git(t, repo, "commit", "-qm", "fixture")
+	mustWrite(t, filepath.Join(repo, ".env.local"), "TOKEN=secret\n")
 	request := packagepublish.Request{Tree: repo, Release: "1.0.0"}
 	mustWrite(t, filepath.Join(repo, "package.release.json"), `{}`)
-	git(t, repo, "add", ".")
-	git(t, repo, "commit", "-qm", "plant retired metadata")
-	if _, problem := packagepublish.Prepare(request); problem == nil || problem.ErrName() != "package_metadata_retired" {
-		t.Fatalf("retired release metadata did not refuse: %v", problem)
-	}
-	must(t, os.Remove(filepath.Join(repo, "package.release.json")))
-	git(t, repo, "add", "-u")
-	git(t, repo, "commit", "-qm", "remove retired metadata")
 	mustWrite(t, filepath.Join(repo, "package.descriptor.json"), `{}`)
-	git(t, repo, "add", "package.descriptor.json")
-	git(t, repo, "commit", "-qm", "plant retired descriptor")
-	if _, problem := packagepublish.Prepare(request); problem == nil || problem.ErrName() != "package_metadata_retired" {
-		t.Fatalf("committed generated descriptor did not refuse: %v", problem)
+	pack, problem := packagepublish.Prepare(request)
+	if problem != nil {
+		t.Fatalf("ordinary current tree was refused: %s", problem.Message)
 	}
-	must(t, os.Remove(filepath.Join(repo, "package.descriptor.json")))
-	git(t, repo, "add", "-u")
-	git(t, repo, "commit", "-qm", "remove retired descriptor")
-
-	// Git is not publication authority. An ordinary untracked file is scanned as source,
-	// so a dangerous untracked member must refuse just like a committed one.
-	mustWrite(t, filepath.Join(repo, "native.so"), "native")
-	if _, problem := packagepublish.Prepare(request); problem == nil || problem.ErrName() != "package_source_native_input" {
-		t.Fatalf("untracked native source did not refuse before packaging: %v", problem)
-	}
-
-	noGit := t.TempDir()
-	mustWrite(t, filepath.Join(noGit, ".env.local"), "TOKEN=secret\n")
-	if _, problem := packagepublish.Prepare(packagepublish.Request{Tree: noGit, Release: "1"}); problem == nil || problem.ErrName() != "package_source_credential" {
-		t.Fatalf("non-Git source was not scanned for credential material: %v", problem)
+	defer pack.Close()
+	for _, skipped := range []string{".env.local", "package.release.json", "package.descriptor.json"} {
+		if pack.Files[skipped] != "" {
+			t.Errorf("%s entered package source uploads", skipped)
+		}
 	}
 }
 
-func TestPackagePublishDerivesDescriptorWithLockedRuntime(t *testing.T) {
+func TestPackagePublishBuildsLockedRuntimeFixture(t *testing.T) {
 	homeDir, err := os.UserHomeDir()
 	must(t, err)
 	fixture := filepath.Join(homeDir, "cozy_v2", "cozy-runtime", "proofs", "fixtures", "marco-polo-package") //cozy:allow peer Runtime repository fixture
@@ -180,35 +179,22 @@ func TestPackagePublishDerivesDescriptorWithLockedRuntime(t *testing.T) {
 	if !strings.Contains(pyproject, "cozy-runtime==") || !strings.Contains(lock, `name = "cozy-runtime"`) { //cozy:allow assertion over peer fixture metadata
 		t.Fatal("Marco fixture does not carry cozy-runtime in both pyproject.toml and uv.lock")
 	}
-	_, problem := config.Load()
-	fatal(t, problem)
 	pack, problem := packagepublish.Prepare(packagepublish.Request{Tree: fixture, Release: "1.0.0"})
 	if problem != nil {
 		t.Fatalf("real locked Runtime derivation refused: %s", problem.Message)
 	}
 	defer pack.Close()
-	replay, problem := packagepublish.Prepare(packagepublish.Request{Tree: fixture, Release: "opaque-release-id"})
-	if problem != nil {
-		t.Fatalf("real locked Runtime replay refused: %s", problem.Message)
-	}
-	defer replay.Close()
-	declaration, _ := pack.Declaration.CanonicalBytes()
-	replayed, _ := replay.Declaration.CanonicalBytes()
-	if !bytes.Equal(declaration, replayed) || len(pack.Files) != 4 {
-		t.Fatalf("same source did not reproduce its four-role declaration:\n%s\n%s", declaration, replayed)
-	}
-	for _, retired := range []string{"profiles", "custom_wheels", "evaluated_config", "compatible_accelerator_models", "model_roots", "model_bindings", "native_wheel_proof"} {
-		if bytes.Contains(declaration, []byte(`"`+retired+`"`)) {
-			t.Fatalf("retired declaration field %q remains in %s", retired, declaration)
+	for _, required := range []string{"package.toml", "pyproject.toml", "uv.lock"} {
+		if pack.Files[required] == "" {
+			t.Fatalf("source uploads omit %s", required)
 		}
 	}
-	if metadata := wheelMetadata(t, pack.Files["project_wheel"]); !strings.Contains(metadata, "Requires-Dist: cozy-runtime==0.0.3") {
+	if metadata := wheelMetadata(t, pack.Wheel); !strings.Contains(metadata, "Requires-Dist: cozy-runtime==0.0.3") {
 		t.Fatalf("project wheel lost its Runtime compatibility requirement:\n%s", metadata)
 	}
-	descriptor, problem := launch.DecodeDescriptor(mustRead(t, pack.Files["package_descriptor"]))
-	fatal(t, problem)
-	if _, problem := descriptor.Function("marco"); problem != nil {
-		t.Fatalf("derived Marco descriptor has no marco function: %s", problem.Message)
+	fact, problem := wheel.Inspect(pack.Wheel, wheel.ProjectWheel)
+	if problem != nil || len(fact.ImportRoots) == 0 {
+		t.Fatalf("built Marco wheel is not portable: %+v %v", fact, problem)
 	}
 }
 
@@ -245,12 +231,19 @@ func wheelMetadata(t *testing.T, file string) string {
 	return ""
 }
 
-func git(t *testing.T, dir string, args ...string) {
+func wheelEntries(t *testing.T, file string) []string {
 	t.Helper()
-	cmd := exec.Command("git", append([]string{"-C", dir}, args...)...)
-	if out, err := cmd.CombinedOutput(); err != nil {
-		t.Fatalf("git %s: %s\n%s", strings.Join(args, " "), err, out)
+	zr, err := zip.OpenReader(file)
+	must(t, err)
+	defer zr.Close()
+	entries := make([]string, 0, len(zr.File))
+	for _, member := range zr.File {
+		if !member.FileInfo().IsDir() {
+			entries = append(entries, member.Name)
+		}
 	}
+	sort.Strings(entries)
+	return entries
 }
 
 func writeTestWheel(t *testing.T, filename, distribution, version string, pure bool,

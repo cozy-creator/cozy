@@ -16,8 +16,6 @@ package transfer
 
 import (
 	"context"
-	"crypto/sha256"
-	"encoding/hex"
 	"fmt"
 	"io"
 	"net/http"
@@ -646,43 +644,26 @@ func send(ctx context.Context, method, url string, open func() (io.ReadCloser, e
 		WithRemedy("re-run to resume from Tensorhub's durable transfer rows")
 }
 
-// UploadPresigned is the shared storage-edge PUT for package-release role grants.
-// It sends the exact local file under every signed header and reports whether bytes
-// moved. A 412 means another writer won the immutable no-clobber race; Tensorhub still
-// verifies the final bytes during finalize.
-func UploadPresigned(ctx context.Context, subject, path, url, expectedDigest string, length int64,
-	headers map[string]string,
-) (bool, *exit.Error) {
+// UploadPresigned sends one local file to a release-scoped storage grant. Tensorhub
+// reads the stored bytes and computes their identity during finalize.
+func UploadPresigned(ctx context.Context, subject, path, url string, headers map[string]string) (bool, int64, *exit.Error) {
 	info, err := os.Stat(path)
-	if err != nil || !info.Mode().IsRegular() || info.Size() != length {
-		return false, exit.Named(exit.Conflict, "upload.local_bytes_changed",
-			"%s is no longer the declared %d-byte regular file", path, length).
-			WithRemedy("restart package publication from one unchanged committed source package")
+	if err != nil || !info.Mode().IsRegular() {
+		return false, 0, exit.Named(exit.Conflict, "upload.local_file_unreadable",
+			"%s is no longer a regular file", path)
 	}
-	f, err := os.Open(path)
-	if err != nil {
-		return false, exit.Internalf("cannot reopen declared %s: %s", subject, err)
-	}
-	h := sha256.New()
-	_, hashErr := io.Copy(h, f)
-	f.Close()
-	observed := "sha256:" + hex.EncodeToString(h.Sum(nil))
-	if hashErr != nil || observed != expectedDigest {
-		return false, exit.Named(exit.Conflict, "upload.local_bytes_changed",
-			"%s now hashes to %s; its declaration names %s", subject, observed, expectedDigest).
-			WithRemedy("restart package publication from one unchanged committed source package")
-	}
+	length := info.Size()
 	status, _, body, problem := send(ctx, http.MethodPut, url, opener(path, 0, length), length, headers)
 	if problem != nil {
-		return false, problem
+		return false, 0, problem
 	}
 	switch status {
 	case http.StatusOK, http.StatusCreated, http.StatusNoContent:
-		return true, nil
+		return true, length, nil
 	case http.StatusPreconditionFailed:
-		return false, nil
+		return false, length, nil
 	default:
-		return false, storageRefusal(status, subject, body)
+		return false, 0, storageRefusal(status, subject, body)
 	}
 }
 

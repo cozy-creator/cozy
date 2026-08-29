@@ -1,52 +1,39 @@
 # Package publication
 
-Creator publishes package code. It never builds a package Docker image or selects a GPU.
-It runs the project's declared Python wheel backend only in private publication staging.
-
-## Source release
-
-The source directory does not need to be a Git checkout or have a clean working tree. Its current
-modified and ordinary untracked files are publication inputs. It contains:
-
-- static project metadata and dependencies in `pyproject.toml`;
-- an exact `uv.lock`;
-- author intent in `package.toml`;
-- pure Python project files.
-
-`package.toml` is the only author configuration. `package.release.json` and
-`package.evaluated-config.json` are retired, as is committed `package.descriptor.json`.
-Native files, build recipes, nested wheels, model weights, credentials, symlinks, and
-unsafe paths refuse. VCS metadata, virtual environments, caches, editor state, and prior build
-output are excluded from the private snapshot.
+Creator publishes the current project tree. A Git repository, commit, or clean
+working tree is not required.
 
 ```sh
 cozy package publish org/package \
   --release 1.0.0 \
+  --dir . \
   --reason "initial release"
 ```
 
-Creator snapshots the source, runs `uv build --wheel` against a disposable copy, requires exactly
-one wheel, and inspects it as bounded, native-free `py3-none-any` bytes. A backend that emits local
-credentials, VCS/environment/cache/editor/build state, native files, path injection, or an invalid
-`RECORD` is refused. Creator separately syncs the locked dependencies into disposable storage with
-`uv sync --locked --no-install-project`, then runs that environment's exact
-`cozy-runtime --json --dir PROJECT describe`. The package project itself is not installed,
-so Runtime derives the package descriptor without writing the source tree. The wheel's METADATA
-carries the backend's declared requirements; `uv.lock` supplies the exact lock bytes. There is no
-public profile, GPU, or custom-wheel selection.
+The project supplies `pyproject.toml`, `uv.lock`, and `package.toml`. Creator
+skips `.env*`, credentials, VCS directories, virtual environments, caches,
+editor state, bytecode, and build output. Modified and ordinary untracked files
+are published normally.
 
-Creator sends a canonical declaration containing only the source archive, lock, project
-wheel, and package descriptor identities. Tensorhub returns presigned PUTs for missing objects;
-Creator uploads them concurrently and finalizes with the byte-identical declaration.
-Tensorhub derives compatible base worker profiles from package requirements and its own
-image inventory. Exact replay is idempotent.
+Creator runs `uv build --wheel` against that current tree. `uv` invokes the
+project's declared PEP 517 backend; Creator does not maintain another Python
+package builder. Creator uploads the one resulting wheel, and Tensorhub verifies
+that it is bounded `py3-none-any` content without native code, nested wheels,
+credentials, unsafe paths, or executable `.pth` behavior.
 
-Until a real dependency requires more machinery, a package absent from approved base images
-refuses instead of invoking a package index or native build. Model-bearing publication also
-returns the typed `package_model_binding_deferred` refusal; binding intent stays in
-`package.toml` for Tensorhub's future model-release resolver.
+Publication is one small release transaction:
 
-## Promotion
+1. Creator opens the release with `POST .../begin`.
+2. It registers safe relative source paths and receives release-scoped upload
+   URLs for those files plus the wheel.
+3. It uploads the files directly to object storage.
+4. It calls `POST .../finalize` with an empty JSON object.
 
-Publication does not move traffic. Tensorhub promotion is a separate explicit operator/policy
-transaction; Creator has no promotion command.
+Creator sends no digest/length manifest, descriptor, profile, GPU selection,
+dependency list, model binding, or custom-wheel declaration. Tensorhub reads the
+uploaded bytes, computes their hashes and lengths, inspects package metadata,
+and derives compatible base worker images from its own inventory. Reopening a
+committed release is an idempotent no-upload replay.
+
+Publication never builds an endpoint-specific Docker image and does not move
+serving traffic.

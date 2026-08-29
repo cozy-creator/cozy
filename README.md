@@ -80,10 +80,10 @@ Remove local package generations with:
 cozy package remove org/name
 ```
 
-Publishing asks the project's declared backend for one pure project wheel in private staging, then
-inspects those exact bytes. Tensorhub derives compatible base
-worker profiles from `pyproject.toml`, `uv.lock`, and its image inventory. The package name is
-created automatically when absent:
+Publishing builds the current working tree with `uv build --wheel`; Tensorhub accepts only one
+bounded pure project wheel. Git, commits, and a clean tree are not publication inputs. Tensorhub derives
+compatible base worker profiles from wheel metadata, `uv.lock`, and its image inventory. The
+package name is created automatically when absent:
 
 ```sh
 cozy package publish org/name \
