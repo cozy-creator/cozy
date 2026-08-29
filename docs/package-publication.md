@@ -20,7 +20,8 @@ organization = "paul"
 
 The example publishes as `paul/marco-polo-package@1.0.0`. Cozy does not add a `v` prefix or accept
 a second name/version on the command line. The configured `tensorhub_url` is the destination;
-credentials come from Cozy configuration or `TENSORHUB_TOKEN` and never enter project metadata.
+an enrolled machine authenticates automatically. An explicit operator credential may still come
+from Cozy configuration or `TENSORHUB_TOKEN`; credentials never enter project metadata.
 
 The project also supplies `uv.lock` and `package.toml`. `uv.lock` preserves local installation
 behavior, while standard wheel `Requires-Dist` metadata remains production dependency authority.

@@ -14,11 +14,6 @@ import (
 )
 
 func handlePackagePublish(ctx *Context) *exit.Error {
-	if !ctx.Cfg.HubToken.Present() {
-		return exit.Named(exit.Credential, "hub.publish_credential_missing",
-			"publishing to %s requires a configured Tensorhub token", ctx.Cfg.HubURL).
-			WithRemedy("set tensorhub_token in %s/config.yaml or set TENSORHUB_TOKEN", ctx.Cfg.Home)
-	}
 	pack, problem := packagepublish.Prepare()
 	if problem != nil {
 		return problem

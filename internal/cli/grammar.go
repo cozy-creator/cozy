@@ -9,11 +9,26 @@ type CLI struct {
 
 	Package PackageCmd `cmd:"" group:"Resources" help:"Install the source-code that generates media."`
 	Model   ModelCmd   `cmd:"" group:"Resources" help:"Download the tensors that are the AI's mind."`
+	Auth    AuthCmd    `cmd:"" group:"Resources" help:"Authenticate this machine to Tensorhub."`
 	Invoke  InvokeCmd  `cmd:"" group:"Work" help:"Generate media using your installed packages."`
 	Rental  RentalCmd  `cmd:"" group:"Work" help:"Rent a more powerful GPU in the cloud."`
 	Up      UpCmd      `cmd:"" group:"Lifecycle" help:"Start the cozy-daemon and localhost web-ui."`
 	Down    DownCmd    `cmd:"" group:"Lifecycle" help:"Stop cozy-daemon and localhost web-ui."`
 	Unload  UnloadCmd  `cmd:"" group:"Lifecycle" help:"Empty cached GPU AI models to free up VRAM."`
+}
+
+// Auth intentionally starts with one operation. Registration and recovery are the
+// same email-root enrollment; a valid stored key authenticates automatically.
+type AuthCmd struct {
+	Login AuthLoginCmd `cmd:"" help:"Register or authenticate this machine by email."`
+}
+
+type AuthLoginCmd struct {
+	Email string `arg:"" name:"email" help:"Tensorhub account email."`
+}
+
+func (c *AuthLoginCmd) Run(r *Runtime) error {
+	return r.call(handleAuthLogin, []string{c.Email}, nil, nil, false)
 }
 
 type PackageCmd struct {

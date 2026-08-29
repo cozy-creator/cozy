@@ -63,7 +63,7 @@ func packageProfilePath(ref Ref, release, profile string) string {
 func (c *Client) BeginPackageRelease(ctx context.Context, ref Ref, release, reason string) (PackageReleaseBegin, *exit.Error) {
 	var out PackageReleaseBegin
 	e := c.do(ctx, call{method: http.MethodPost,
-		path: packageReleasePath(ref, release), admin: true, reason: reason,
+		path: packageReleasePath(ref, release), auth: true, reason: reason,
 		body: map[string]any{}}, &out)
 	return out, e
 }
@@ -73,7 +73,7 @@ func (c *Client) PackageReleaseUploads(ctx context.Context, ref Ref, release str
 ) (PackageUploads, *exit.Error) {
 	var out PackageUploads
 	e := c.do(ctx, call{method: http.MethodPost,
-		path: packageReleasePath(ref, release) + "/uploads", admin: true, reason: reason,
+		path: packageReleasePath(ref, release) + "/uploads", auth: true, reason: reason,
 		body: map[string]any{"paths": paths, "dependency_wheels": dependencyWheels}}, &out)
 	return out, e
 }
@@ -81,7 +81,7 @@ func (c *Client) PackageReleaseUploads(ctx context.Context, ref Ref, release str
 func (c *Client) FinalizePackageRelease(ctx context.Context, ref Ref, release, reason string) (PackageReleaseFinalize, *exit.Error) {
 	var out PackageReleaseFinalize
 	e := c.do(ctx, call{method: http.MethodPut,
-		path: packageReleasePath(ref, release), admin: true, reason: reason,
+		path: packageReleasePath(ref, release), auth: true, reason: reason,
 		body: map[string]any{}, patient: true}, &out)
 	return out, e
 }
@@ -125,7 +125,7 @@ func (c *Client) PackageLocalQualificationMaterials(ctx context.Context, ref Ref
 	var out LocalQualificationMaterials
 	e := c.do(ctx, call{method: http.MethodPost,
 		path:  packageProfilePath(ref, release, profile) + "/install",
-		admin: true, reason: reason, byBytes: true, patient: true,
+		auth: true, reason: reason, byBytes: true, patient: true,
 		body: map[string]any{}}, &out)
 	return out, e
 }

@@ -3,10 +3,9 @@
 // the hub sends reaches the user VERBATIM — its code, its message, its remedy — under
 // a code from the shared exit matrix.
 //
-// Launch 1 has no identity plane (decisions #229): reads are public and carry no
-// credential; writes carry the ONE static admin token the config authority holds.
-// There is no login act, no session, no refresh and no org — th-031 arms all of that
-// in Wave 2, and nothing here anticipates it.
+// Catalog reads are public. Authenticated calls use either the operator's configured
+// token or Creator's machine-key TokenSource; the resulting short bearer exists only
+// in memory and this package remains its one HTTP carrier.
 //
 // This package is also the seam cl-012 (publish/transfer) extends: `do` owns the
 // request build, the credential, the reason header and the whole error mapping, so
@@ -66,6 +65,13 @@ type Client struct {
 	slow    *http.Client
 	patient *http.Client // paid/proof operations: caller envelope bounds work, not a header clock
 	agent   string
+	tokens  TokenSource
+}
+
+// TokenSource silently turns a persisted machine key into a short AuthKit bearer.
+// The interface lives here so this HTTP package does not own account-key storage.
+type TokenSource interface {
+	AccessToken(context.Context) (secret.Value, *exit.Error)
 }
 
 // New builds the client from the frozen config value. It reads no environment.
@@ -147,8 +153,7 @@ func (r *progressReader) Read(p []byte) (int, error) {
 	return n, err
 }
 
-func (c *Client) Base() string        { return c.base }
-func (c *Client) Token() secret.Value { return c.token }
+func (c *Client) Base() string { return c.base }
 
 // Resource is the shared shape of a package or model returned by its typed public
 // route. The route supplies the type; the document therefore carries no `kind`
@@ -166,7 +171,7 @@ type call struct {
 	path      string
 	body      any
 	bodyBytes []byte // exact caller-persisted JSON; never re-marshaled on replay
-	admin     bool   // carries the admin token
+	auth      bool   // carries the configured operator token or a short user token
 	reason    string // X-Tensorhub-Reason; the hub refuses a mutation without one
 	// idempotency is the caller-owned operation identity for a paid mutation. It is
 	// distinct from Tensorhub's provider operation id and survives a lost HTTP answer.
@@ -193,7 +198,15 @@ type call struct {
 // reaches argv, a record, or a log line — the secret fence keeps Reveal() here.
 func (c *Client) WithToken(v secret.Value, source string) *Client {
 	d := *c
-	d.token, d.source = v, source
+	d.token, d.source, d.tokens = v, source, nil
+	return &d
+}
+
+// WithTokenSource returns a copy that obtains a short user bearer when no explicit
+// operator token is configured. A configured token remains an intentional override.
+func (c *Client) WithTokenSource(source TokenSource) *Client {
+	d := *c
+	d.tokens = source
 	return &d
 }
 
@@ -202,6 +215,22 @@ type ResourceSearch struct {
 	Limit  int    `json:"limit"`
 	Capped bool   `json:"capped"`
 	Query  string `json:"q"`
+}
+
+type Account struct {
+	UserID      string `json:"user_id"`
+	PersonalOrg string `json:"personal_org"`
+}
+
+// Account materializes and reads Tensorhub's stable ownership root for this AuthKit user.
+func (c *Client) Account(ctx context.Context) (Account, *exit.Error) {
+	var out Account
+	problem := c.do(ctx, call{method: http.MethodGet, path: "/v1/account", auth: true}, &out)
+	if problem == nil && (out.UserID == "" || out.PersonalOrg == "") {
+		problem = exit.Named(exit.Internal, "hub.account_invalid",
+			"Tensorhub returned an incomplete account identity")
+	}
+	return out, problem
 }
 
 // Packages searches package resources server-side. Public — no credential.
@@ -258,13 +287,18 @@ func resourcePath(collection string, ref Ref) string {
 }
 
 func (c *Client) do(ctx context.Context, cl call, out any) *exit.Error {
-	// A missing credential is answered BEFORE the dial: a round trip cannot tell the
-	// operator anything the local configuration does not already say.
-	if cl.admin && !c.token.Present() {
+	token := c.token
+	if cl.auth && !token.Present() && c.tokens != nil {
+		var problem *exit.Error
+		token, problem = c.tokens.AccessToken(ctx)
+		if problem != nil {
+			return problem
+		}
+	}
+	if cl.auth && !token.Present() {
 		return exit.Named(exit.Credential, "hub.token_missing",
-			"%s %s is a first-party route and no admin token is configured", cl.method, cl.path).
-			WithRemedy("set TENSORHUB_TOKEN to the hub's admin.token; catalog reads need no credential").
-			WithNext("cozy package search", "cozy model search")
+			"%s %s requires a Tensorhub login", cl.method, cl.path).
+			WithNext("cozy auth login <email>")
 	}
 
 	var body io.Reader
@@ -297,10 +331,10 @@ func (c *Client) do(ctx context.Context, cl call, out any) *exit.Error {
 	if cl.idempotency != "" {
 		req.Header.Set("Idempotency-Key", cl.idempotency)
 	}
-	if cl.admin {
+	if cl.auth {
 		// The ONE raw read of the credential in this binary. It goes into a header on
 		// a request and nowhere else: not a log line, not a record, not a rendering.
-		req.Header.Set("Authorization", "Bearer "+c.token.Reveal())
+		req.Header.Set("Authorization", "Bearer "+token.Reveal())
 	}
 
 	client := c.http
@@ -413,10 +447,10 @@ func (c *Client) refusal(status int, raw []byte) *exit.Error {
 		e.WithRemedy("%s", env.Error.Remedy)
 	}
 	if code == exit.Credential {
-		// The one remedy the hub cannot write for us: it does not know where OUR
-		// token came from. Launch 1 has no login, so the next step is never `cozy login`.
-		e.WithNext("cozy package search")
-		if c.source == "unset" {
+		// The one next step the hub cannot write for us: it does not know where this
+		// Creator stores its machine credential.
+		e.WithNext("cozy auth login <email>")
+		if c.source == "unset" && c.tokens == nil {
 			e.WithRemedy("set TENSORHUB_TOKEN to the hub's admin.token (%s)", e.Remedy)
 		}
 	}
