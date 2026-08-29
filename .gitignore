@@ -5,6 +5,5 @@ __pycache__/
 dist/
 *.egg-info/
 /cozy
-/cozy-fakeworker
-/cozy-media
-/cozy-bootstrap
+.owner-agent
+*.exe
