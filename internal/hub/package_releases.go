@@ -4,6 +4,7 @@ package hub
 
 import (
 	"context"
+	"encoding/json"
 	"net/http"
 	"net/url"
 
@@ -41,13 +42,11 @@ type PackageSourceUploads struct {
 	Uploads []PackageUpload `json:"uploads"`
 }
 
-type PackageExecution struct{}
-
 type PackageReleaseFinalize struct {
 	Created           bool                  `json:"created"`
 	Release           string                `json:"release"`
 	Profiles          []PackageProfileState `json:"profiles"`
-	PackageExecutions []PackageExecution    `json:"package_executions"`
+	PackageExecutions []json.RawMessage     `json:"package_executions"`
 }
 
 func packageReleasePath(ref Ref, release string) string {
