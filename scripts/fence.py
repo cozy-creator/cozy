@@ -798,6 +798,8 @@ def check_typed_resources():
     for command in required_commands:
         if command not in manifest:
             bad.append(f"internal/manifest/commands.go: [resources] missing typed command {command}")
+    if 'Path: []string{"endpoint", "qualify"}' in manifest:
+        bad.append("internal/manifest/commands.go: [resources] retired endpoint qualify command remains")
     if "--kind" in manifest:
         bad.append("internal/manifest/commands.go: [resources] retired --kind discriminator remains")
 
@@ -813,6 +815,9 @@ def check_typed_resources():
         bad.append("internal/hub/endpoint_releases.go: [resources] retired local-execution route remains")
     if "/local-qualification-materials" not in profile_routes:
         bad.append("internal/hub/endpoint_releases.go: [resources] local qualification-materials route is absent")
+    for retired in (' + "/qualify"', ' + "/qualification"'):
+        if retired in profile_routes:
+            bad.append(f"internal/hub/endpoint_releases.go: [resources] retired endpoint qualification route remains: {retired}")
 
     managed = pathlib.Path("internal/managedinstall/install.go").read_text()
     for retired in ('"base_path"', '"index_url"', '"build_command"', 'exec.Command("uv"',
