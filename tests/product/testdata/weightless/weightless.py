@@ -8,11 +8,11 @@ grpcio and the exact PyAV wheel — no torch, CUDA or tensorfs), so a clean mach
 install it over a residential line in seconds. PyAV exists solely for the `relay` fixture.
 
 What an invoke of `tile` exercises is everything except the model: the install generation's
-own venv, `describe --check`'s derived surface, the supervisor, the executor, the worker
+own venv, `describe --check`'s derived surface, the Runtime worker, the executor, the worker
 protocol, the record owner's terminal transaction, the output publication, the media id, and
 `cozy run --out`. `refuse` is the failure terminal on the same path.
 
-`video_transport` exists only so the remote live driver can exercise a text/image request
+`video_transport` exists only so the remote product proof can exercise a text/image request
 and MP4 result contract through an adversarial worker. It refuses local execution and is
 explicitly not a model or video-generation fixture.
 """
@@ -124,7 +124,7 @@ def relay(
 
 @app.entrypoint
 def video_transport(payload: VideoTransportInput) -> VideoTransportOutput:
-    """A package-descriptor-only seam for the remote byte-plane live proof.
+    """A package-descriptor-only seam for the remote byte-plane product proof.
 
     The fake remote worker consumes this request under an exact DeliveryGrant and emits a
     tiny MP4-shaped transport fixture. This handler deliberately refuses if somebody runs

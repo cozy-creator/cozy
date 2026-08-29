@@ -1,4 +1,4 @@
-package live
+package producttest
 
 import (
 	"bufio"

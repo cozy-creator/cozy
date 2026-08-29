@@ -29,7 +29,7 @@ const (
 
 // Declaration is the release record that travels with the archive: the file set the
 // publisher declared, with a digest each. The remaining local writer is the real-path
-// fixture beside internal/live; published packages use Tensorhub's release tooling.
+// fixture beside tests/product; published packages use Tensorhub's release tooling.
 type Declaration struct {
 	Package string          `json:"package"`
 	Version string          `json:"version"`
