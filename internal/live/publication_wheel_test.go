@@ -197,7 +197,8 @@ object = "marco_polo:app"
 func TestEndpointPublicationNeedsNoPublisherProfile(t *testing.T) {
 	repo := trackedEndpointFixture(t)
 	pack, problem := endpointpublish.Prepare(endpointpublish.Request{Tree: repo, Release: "weightless",
-		Runtime: filepath.Join(repo, ".test-bin", "uv")})
+		Runtime: fakeDescriptorRuntime(t,
+			`{"application":"marco_polo:app","entrypoints":[],"format":"cozy.endpoint.descriptor/1","jobs":[]}`)})
 	if problem != nil {
 		t.Fatalf("weightless pure-Python publication required publisher compatibility input: %v", problem)
 	}

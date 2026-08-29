@@ -193,7 +193,15 @@ dependencies = []
 	git(t, repo, "add", ".")
 	git(t, repo, "commit", "-qm", "fixture")
 	fakeUV := filepath.Join(repo, ".test-bin", "uv")
-	mustWrite(t, fakeUV, "#!/bin/sh\nprintf '%s\\n' '{\"application\":\"marco_polo:app\",\"entrypoints\":[],\"format\":\"cozy.endpoint.descriptor/1\",\"jobs\":[]}'\n")
+	mustWrite(t, fakeUV, `#!/bin/sh
+if [ "${0##*/}" = "cozy-runtime" ]; then # //cozy:allow independent Runtime CLI fixture
+  printf '%s\n' '{"application":"marco_polo:app","entrypoints":[],"format":"cozy.endpoint.descriptor/1","jobs":[]}'
+  exit 0
+fi
+mkdir -p "$UV_PROJECT_ENVIRONMENT/bin"
+cp "$0" "$UV_PROJECT_ENVIRONMENT/bin/cozy-runtime"
+chmod 755 "$UV_PROJECT_ENVIRONMENT/bin/cozy-runtime"
+`)
 	must(t, os.Chmod(fakeUV, 0o755))
 	return repo
 }

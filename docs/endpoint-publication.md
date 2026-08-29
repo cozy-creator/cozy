@@ -24,9 +24,11 @@ cozy endpoint publish org/endpoint \
   --reason "initial release"
 ```
 
-Creator runs the project-pinned `cozy-runtime --json --dir PROJECT describe` through
-`uv run --locked`; Runtime derives the descriptor without writing the source tree. Creator
-then deterministically builds one `py3-none-any` project wheel. Its METADATA carries
+Creator syncs the locked dependencies into disposable storage with
+`uv sync --locked --no-install-project`, then runs that environment's exact
+`cozy-runtime --json --dir PROJECT describe`. The endpoint project itself is not installed,
+so Runtime derives the descriptor without writing the source tree. Creator then
+deterministically builds one `py3-none-any` project wheel. Its METADATA carries
 `Requires-Python` and `Requires-Dist` directly from `pyproject.toml`; `uv.lock` supplies the
 exact lock bytes. There is no public profile, GPU, or custom-wheel selection.
 

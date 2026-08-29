@@ -23,6 +23,7 @@ import (
 	"github.com/cozy-creator/cozy-creator/internal/canonical"
 	"github.com/cozy-creator/cozy-creator/internal/config"
 	"github.com/cozy-creator/cozy-creator/internal/exit"
+	"github.com/cozy-creator/cozy-creator/internal/home"
 	"github.com/cozy-creator/cozy-creator/internal/wheel"
 )
 
@@ -257,17 +258,32 @@ func auditSource(root string, files []string) *exit.Error {
 
 func deriveDescriptor(tree, root, runtime string) (string, *exit.Error) {
 	output := filepath.Join(root, DescriptorName)
-	var cmd *exec.Cmd
-	if runtime != "" {
-		cmd = exec.Command(runtime, "--json", "--dir", tree, "describe")
-	} else {
-		cmd = exec.Command("uv", "run", "--locked", "--no-progress", "--project", tree,
-			"cozy-runtime", "--json", "--dir", tree, "describe")
-	}
-	cmd.Env = config.Frozen().Tool(
-		"UV_PROJECT_ENVIRONMENT="+filepath.Join(root, "descriptor-venv"),
+	environment := filepath.Join(root, "descriptor-venv")
+	toolEnv := config.Frozen().Tool(
+		"UV_PROJECT_ENVIRONMENT="+environment,
 		"UV_LINK_MODE=hardlink",
 	)
+	if runtime == "" {
+		sync := exec.Command("uv", "sync", "--locked", "--no-progress", "--no-install-project",
+			"--project", tree)
+		sync.Env = toolEnv
+		var stderr bytes.Buffer
+		sync.Stdout, sync.Stderr = io.Discard, &stderr
+		err := sync.Run()
+		if sync.ProcessState == nil {
+			return "", exit.Named(exit.Structural, "endpoint_descriptor_environment_missing",
+				"cannot run uv for the endpoint's locked environment: %v", err)
+		}
+		if sync.ProcessState.ExitCode() != 0 {
+			return "", exit.Named(exit.Structural, "endpoint_descriptor_environment_refused",
+				"uv sync --locked --no-install-project refused: %s",
+				strings.Join(strings.Fields(stderr.String()), " ")).
+				WithRemedy("make pyproject.toml and uv.lock an exact portable dependency closure")
+		}
+		runtime = home.VenvTool(environment, "cozy-runtime")
+	}
+	cmd := exec.Command(runtime, "--json", "--dir", tree, "describe")
+	cmd.Env = toolEnv
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout, cmd.Stderr = &stdout, &stderr
 	err := cmd.Run()
