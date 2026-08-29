@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"strings"
 
+	"github.com/cozy-creator/cozy-creator/internal/config"
 	"github.com/cozy-creator/cozy-creator/internal/exit"
 )
 
@@ -47,6 +48,7 @@ func Build(req Request) (*Result, *exit.Error) {
 
 	cmd := exec.Command("uv", "build", "--wheel", "--out-dir", out,
 		"--no-build-logs", "--no-progress", root)
+	cmd.Env = config.Frozen().Tool()
 	body, runErr := cmd.CombinedOutput()
 	if cmd.ProcessState == nil {
 		return nil, exit.Named(exit.Structural, "project_wheel_builder_missing",

@@ -44,7 +44,6 @@ type PackageInstallCmd struct {
 	Profile       string `help:"Qualified compatibility profile."`
 	Major         string `help:"Local serving major for a qualified release." placeholder:"vN"`
 	GrantTTL      string `help:"Qualified-material grant lifetime." default:"10m"`
-	Device        int    `help:"Local GPU index used for qualification." default:"0"`
 	Reason        string `help:"Audit reason for a qualified install."`
 }
 
@@ -53,7 +52,7 @@ func (c *PackageInstallCmd) Run(r *Runtime) error {
 		"--force", c.Force, "--allow-unsigned", c.AllowUnsigned), values(
 		"--from", c.From, "--dir", c.Dir, "--digest", c.Digest,
 		"--profile", c.Profile, "--major", c.Major, "--grant-ttl", c.GrantTTL,
-		"--device", intText(c.Device), "--reason", c.Reason), false)
+		"--reason", c.Reason), false)
 }
 
 type PackageRemoveCmd struct {

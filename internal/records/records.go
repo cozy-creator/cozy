@@ -112,11 +112,10 @@ CREATE TABLE IF NOT EXISTS managed_profile_installs (
   package_bundle_digest       TEXT NOT NULL,
   resolved_wheel_set_digest    TEXT NOT NULL,
   resolution_lock_digest       TEXT NOT NULL,
-  installed_receipt_digest     TEXT NOT NULL,
-  installed_receipt_length     INTEGER NOT NULL,
-  host_evidence_digest         TEXT NOT NULL,
-  native_evidence_digest       TEXT NOT NULL DEFAULT '',
-  lease_id                     TEXT NOT NULL,
+	installed_receipt_digest     TEXT NOT NULL,
+	installed_receipt_length     INTEGER NOT NULL,
+	host_evidence_digest         TEXT NOT NULL,
+	lease_id                     TEXT NOT NULL,
   lease_expires_at             TEXT NOT NULL,
   recorded_at                  TEXT NOT NULL
 )`}, append(orchestratorSchema, append(eventSchema, rentalSchema...)...)...)
@@ -325,7 +324,6 @@ type ManagedProfileInstall struct {
 	InstalledReceiptDigest   string
 	InstalledReceiptLength   int64
 	HostEvidenceDigest       string
-	NativeEvidenceDigest     string
 	LeaseID                  string
 	LeaseExpiresAt           string
 	RecordedAt               string
@@ -386,14 +384,13 @@ func (s *Store) activate(g PackageInstall, managed *ManagedProfileInstall) (supe
 			wheelhouse_manifest_digest,environment_spec_digest,
 			package_bundle_digest,resolved_wheel_set_digest,resolution_lock_digest,
 			installed_receipt_digest,installed_receipt_length,host_evidence_digest,
-			native_evidence_digest,lease_id,lease_expires_at,recorded_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+			lease_id,lease_expires_at,recorded_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
 			managed.InstallID, managed.PackageReleaseID, managed.Profile, managed.CandidateID,
 			managed.BaseRealizationDigest,
 			managed.WheelhouseManifestDigest, managed.EnvironmentSpecDigest,
 			managed.PackageBundleDigest, managed.ResolvedWheelSetDigest,
 			managed.ResolutionLockDigest, managed.InstalledReceiptDigest,
 			managed.InstalledReceiptLength, managed.HostEvidenceDigest,
-			managed.NativeEvidenceDigest,
 			managed.LeaseID, managed.LeaseExpiresAt, managed.RecordedAt); err != nil {
 			return "", exit.Internalf("cannot insert managed profile facts for %s: %s", g.ID, err)
 		}
@@ -416,15 +413,15 @@ func (s *Store) ManagedInstall(installID string) (*ManagedProfileInstall, *exit.
 	var out ManagedProfileInstall
 	err := s.db.QueryRow(`SELECT install_id,package_release_id,profile,candidate_id,
 		base_realization_digest,wheelhouse_manifest_digest,
-		environment_spec_digest,package_bundle_digest,resolved_wheel_set_digest,
-		resolution_lock_digest,installed_receipt_digest,installed_receipt_length,
-		host_evidence_digest,native_evidence_digest,lease_id,lease_expires_at,recorded_at
+			environment_spec_digest,package_bundle_digest,resolved_wheel_set_digest,
+			resolution_lock_digest,installed_receipt_digest,installed_receipt_length,
+			host_evidence_digest,lease_id,lease_expires_at,recorded_at
 		FROM managed_profile_installs WHERE install_id=?`, installID).Scan(
 		&out.InstallID, &out.PackageReleaseID, &out.Profile, &out.CandidateID,
 		&out.BaseRealizationDigest, &out.WheelhouseManifestDigest,
 		&out.EnvironmentSpecDigest, &out.PackageBundleDigest, &out.ResolvedWheelSetDigest,
 		&out.ResolutionLockDigest, &out.InstalledReceiptDigest, &out.InstalledReceiptLength,
-		&out.HostEvidenceDigest, &out.NativeEvidenceDigest, &out.LeaseID, &out.LeaseExpiresAt, &out.RecordedAt)
+		&out.HostEvidenceDigest, &out.LeaseID, &out.LeaseExpiresAt, &out.RecordedAt)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, nil
 	}

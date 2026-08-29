@@ -811,7 +811,7 @@ func parseTarget(raw string) (Target, *exit.Error) {
 	parts := strings.Split(strings.TrimSpace(raw), "/")
 	usage := exit.Usagef("%q is not org/package/vN/function", raw).
 		WithRemedy("the semver-major is a required path segment — it resolves through that package's serving pointer").
-		WithNext("cozy package list", "cozy help run")
+		WithNext("cozy package list", "cozy help invoke run")
 	if len(parts) != 4 {
 		return Target{}, usage
 	}

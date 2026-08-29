@@ -254,9 +254,13 @@ func (c *Orchestrator) converse(w *worker, addr string) error {
 		case *pb.WorkerFrame_ClaimAck:
 			ack := m.ClaimAck
 			if !ack.Accepted {
-				c.logf("Claim REFUSED by %s: %s", w.instanceID,
-					pb.ClaimRejection_name[int32(ack.Rejection)])
-				return fmt.Errorf("claim refused: %s", pb.ClaimRejection_name[int32(ack.Rejection)])
+				name := pb.ClaimRejection_name[int32(ack.Rejection)]
+				problem := exit.Named(exit.Conflict, "rental.worker_claim_refused",
+					"worker %s refused this owner's claim: %s", w.instanceID, name).
+					WithRemedy("release the rental; a worker that rejects its renter's owner credential cannot converge")
+				c.logf("Claim REFUSED by %s: %s", w.instanceID, name)
+				c.refuseClaim(w, problem)
+				return fmt.Errorf("%s", problem.Message)
 			}
 			s.bootID, s.generation = ack.WorkerBootId, ack.ControlStreamGeneration
 			if e := c.onClaimAck(w, s, ack); e != nil {
@@ -498,8 +502,7 @@ func (c *Orchestrator) onClaimAck(w *worker, s *session, ack *pb.ClaimAck) *exit
 			return e
 		}
 	}
-	if e := c.opt.Store.BindSession(w.instanceID, ack.WorkerBootId,
-		int64(ack.ControlStreamGeneration)); e != nil {
+	if e := c.opt.Store.BindSession(w.instanceID, ack.WorkerBootId); e != nil {
 		c.logf("boot binding for %s REFUSED: %s", w.instanceID, e.Message)
 		c.refuseClaim(w, e)
 		return e
@@ -599,6 +602,12 @@ func (c *Orchestrator) refuseClaim(w *worker, e *exit.Error) {
 	w.refusal = e
 	c.mu.Unlock()
 	c.logf("REFUSING the claimed worker %s (%s): %s", w.instanceID, e.ErrName(), e.Message)
+	if w.spec.Connection != nil && c.opt.RecordRentalRefusal != nil {
+		if problem := c.opt.RecordRentalRefusal(w.spec.Connection.RentalID, e); problem != nil {
+			c.logf("rental %s claim refusal was not persisted: %s",
+				w.spec.Connection.RentalID, problem.Message)
+		}
+	}
 }
 
 // onSnapshot is THE ONE DIGEST-ACKED BARRIER (§5). The three-message

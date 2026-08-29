@@ -101,25 +101,19 @@ type BaseRealization struct {
 	Digest string `json:"digest"`
 }
 
-type NativeWheelProof struct {
-	ExpectedResultDigest string `json:"expected_result_digest"`
-	Fixture              string `json:"fixture"`
-}
-
 type LocalQualificationMaterials struct {
-	CandidateID            string            `json:"candidate_id"`
-	Profile                string            `json:"profile"`
-	LeaseID                string            `json:"lease_id"`
-	LeaseExpiresAt         string            `json:"lease_expires_at"`
-	BaseRealization        BaseRealization   `json:"base_realization"`
-	PackageEnvironmentSpec ExactDocument     `json:"package_environment_spec"`
-	PackageBundle          ExactDocument     `json:"package_bundle"`
-	PackageDescriptor      ExactDocument     `json:"package_descriptor"`
-	WheelhouseManifest     ExactDocument     `json:"wheelhouse_manifest"`
-	ResolvedWheelSet       ExactDocument     `json:"resolved_wheel_set"`
-	ResolutionLock         ExactDocument     `json:"resolution_lock"`
-	Downloads              []DownloadGrant   `json:"downloads"`
-	NativeWheelProof       *NativeWheelProof `json:"native_wheel_proof,omitempty"`
+	CandidateID            string          `json:"candidate_id"`
+	Profile                string          `json:"profile"`
+	LeaseID                string          `json:"lease_id"`
+	LeaseExpiresAt         string          `json:"lease_expires_at"`
+	BaseRealization        BaseRealization `json:"base_realization"`
+	PackageEnvironmentSpec ExactDocument   `json:"package_environment_spec"`
+	PackageBundle          ExactDocument   `json:"package_bundle"`
+	PackageDescriptor      ExactDocument   `json:"package_descriptor"`
+	WheelhouseManifest     ExactDocument   `json:"wheelhouse_manifest"`
+	ResolvedWheelSet       ExactDocument   `json:"resolved_wheel_set"`
+	ResolutionLock         ExactDocument   `json:"resolution_lock"`
+	Downloads              []DownloadGrant `json:"downloads"`
 }
 
 func (c *Client) PackageLocalQualificationMaterials(ctx context.Context, ref Ref, release, profile string,

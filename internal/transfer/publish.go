@@ -50,10 +50,6 @@ type Publish struct {
 	Progress func(string)
 	// Scratch is where objects are staged out of the store on their way to the wire.
 	Scratch string
-	// FailAfter is a development kill point (`--crash-after upload:<n>`) used to
-	// prove that an interrupted publish converges on a re-run. It is not a product
-	// behaviour and every arm that uses it names itself.
-	FailAfter int
 }
 
 // Result is what a publish did.
@@ -327,11 +323,6 @@ type uploadOutcome struct {
 
 func (p *Publish) upload(ctx context.Context, transfers []hub.Transfer, res *Result, ms map[string]int64) *exit.Error {
 	parallelism := publishParallelism
-	if p.FailAfter > 0 {
-		// The development kill point promises an exact completed-object count. Keep
-		// that proof serial without slowing the production path.
-		parallelism = 1
-	}
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 	started := time.Now()
@@ -432,12 +423,6 @@ func (p *Publish) uploadOne(ctx context.Context, publicationID string, index int
 	transfer hub.Transfer,
 ) uploadOutcome {
 	outcome := uploadOutcome{index: index}
-	if p.FailAfter > 0 && index >= p.FailAfter {
-		outcome.err = exit.Named(exit.Internal, "crash_after_upload",
-			"development kill point: stopped after %d objects", index).
-			WithRemedy("re-run the same model publication; Tensorhub's transfer rows are the restart journal")
-		return outcome
-	}
 	answer, e := p.Hub.GrantKnownTransfer(ctx, p.Ref, publicationID, transfer.TransferID, p.Reason)
 	if e != nil {
 		outcome.err = e

@@ -50,6 +50,7 @@ import (
 const (
 	RentalConverging       = "converging"
 	RentalReady            = "ready"
+	RentalDegraded         = "degraded"
 	RentalFailed           = "failed"
 	RentalReleaseRequested = "release_requested"
 	RentalReleased         = "released"

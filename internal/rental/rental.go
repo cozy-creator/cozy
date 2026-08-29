@@ -412,6 +412,14 @@ func RelayWorkerSession(st *records.Store, client *hub.Client) orchestrator.Rent
 	}
 }
 
+// RecordControlRefusal makes a private-worker Claim or owner-side identity refusal durable.
+// The convergence poll already reads this authority; no separate claim-refusal table exists.
+func RecordControlRefusal(st *records.Store) func(string, *exit.Error) *exit.Error {
+	return func(rentalID string, problem *exit.Error) *exit.Error {
+		return st.RecordRentalRelayRefusal(rentalID, problem)
+	}
+}
+
 // ObserveWorker turns a remote ClaimAck into the rental's durable actual-hardware
 // readback. It is wired into the orchestrator so no remote session can become
 // dispatchable without crossing this records boundary.

@@ -101,8 +101,7 @@ func sourceTree(tree string) (string, map[string]string, *exit.Error) {
 			}
 			return nil
 		}
-		if ignoredFile[name] || credentialFile(name) || strings.HasSuffix(name, ".pyc") ||
-			strings.HasSuffix(name, ".pyo") {
+		if ignoredFile[name] || refusedSourceFile(name) {
 			return nil
 		}
 		rel, err := filepath.Rel(root, file)
@@ -140,10 +139,19 @@ func sourceTree(tree string) (string, map[string]string, *exit.Error) {
 	return root, files, nil
 }
 
-func credentialFile(name string) bool {
-	return name == ".env" || strings.HasPrefix(name, ".env.") || name == ".netrc" ||
-		name == ".npmrc" || name == ".pypirc" || strings.HasPrefix(name, "id_rsa") ||
-		strings.HasSuffix(name, ".pem") || strings.HasSuffix(name, ".key")
+func refusedSourceFile(name string) bool {
+	if name == ".env" || strings.HasPrefix(name, ".env.") || name == ".netrc" ||
+		name == ".npmrc" || name == ".pypirc" || name == "credentials.json" ||
+		name == "service-account.json" || name == "id_ed25519" || strings.HasPrefix(name, "id_rsa") {
+		return true
+	}
+	for _, suffix := range []string{".pyc", ".pyo", ".pem", ".key", ".p12", ".pfx", ".jks",
+		".pickle", ".pkl", ".pt", ".ckpt", ".safetensors", ".onnx", ".gguf"} {
+		if strings.HasSuffix(name, suffix) {
+			return true
+		}
+	}
+	return false
 }
 
 func Paths(files map[string]string) []string {
