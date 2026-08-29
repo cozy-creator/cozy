@@ -59,6 +59,10 @@ func TestPackagePublishCLI(t *testing.T) {
 			writeHubError(w, http.StatusUnauthorized, "auth.token_invalid", "wrong token")
 			return
 		}
+		if r.Method == http.MethodPost && r.Header.Get("X-Tensorhub-Reason") !=
+			"cozy package publish cozy/marco@1.0.0" {
+			t.Errorf("package mutation audit reason = %q", r.Header.Get("X-Tensorhub-Reason"))
+		}
 		switch {
 		case r.Method == http.MethodPost && r.URL.Path == "/v1/packages":
 			_, _ = w.Write([]byte(`{"package":{"org":"cozy","name":"marco","created_at":"2026-08-28T00:00:00Z"}}`))
@@ -146,8 +150,7 @@ func TestPackagePublishCLI(t *testing.T) {
 		body, _ := cmd.CombinedOutput()
 		return cmd.ProcessState.ExitCode(), string(body)
 	}
-	args := []string{"package", "publish", "cozy/marco", "--release", "1.0.0", "--dir", source,
-		"--reason", "fixture publish"}
+	args := []string{"package", "publish", "cozy/marco", "--release", "1.0.0", "--dir", source}
 	if code, out := run(args...); code != 0 || !strings.Contains(out, "status:") ||
 		!strings.Contains(out, "published") ||
 		!strings.Contains(out, "qualified") || strings.Contains(out, "candidate-cpu") {

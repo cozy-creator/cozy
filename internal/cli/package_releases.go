@@ -19,10 +19,7 @@ func handlePackagePublish(ctx *Context) *exit.Error {
 		return problem
 	}
 	release := strings.TrimSpace(ctx.Inv.Value("--release"))
-	reason, problem := mutationReason(ctx, "package publish")
-	if problem != nil {
-		return problem
-	}
+	reason := "cozy package publish " + ref.String() + "@" + release
 	pack, problem := packagepublish.Prepare(packagepublish.Request{
 		Tree: ctx.Inv.Value("--dir"), Release: release,
 	})

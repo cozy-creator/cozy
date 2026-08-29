@@ -88,8 +88,7 @@ package name is created automatically when absent:
 ```sh
 cozy package publish org/name \
   --release 1.0.0 \
-  --dir . \
-  --reason "release 1.0.0"
+  --dir .
 ```
 
 Tensorhub owns serving promotion; publication does not move traffic implicitly.

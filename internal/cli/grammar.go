@@ -74,12 +74,11 @@ type PackagePublishCmd struct {
 	Ref     string `arg:"" name:"package" help:"Package name (org/name)."`
 	Release string `help:"Immutable package release id." required:""`
 	Dir     string `help:"Package source tree." type:"path" default:"."`
-	Reason  string `help:"Audit reason recorded before publication." required:""`
 }
 
 func (c *PackagePublishCmd) Run(r *Runtime) error {
 	return r.call(handlePackagePublish, []string{c.Ref}, nil, values(
-		"--release", c.Release, "--dir", c.Dir, "--reason", c.Reason), false)
+		"--release", c.Release, "--dir", c.Dir), false)
 }
 
 type ModelCmd struct {

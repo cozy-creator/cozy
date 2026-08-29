@@ -6,8 +6,7 @@ working tree is not required.
 ```sh
 cozy package publish org/package \
   --release 1.0.0 \
-  --dir . \
-  --reason "initial release"
+  --dir .
 ```
 
 The project supplies `pyproject.toml`, `uv.lock`, and `package.toml`. Creator
@@ -34,6 +33,9 @@ dependency list, model binding, or custom-wheel declaration. Tensorhub reads the
 uploaded bytes, computes their hashes and lengths, inspects package metadata,
 and derives compatible base worker images from its own inventory. Reopening a
 committed release is an idempotent no-upload replay.
+
+Creator also supplies Tensorhub's internal audit text from the command and exact
+package release. Publishers do not write an audit reason or release message.
 
 Publication never builds an endpoint-specific Docker image and does not move
 serving traffic.
