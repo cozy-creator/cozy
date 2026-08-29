@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/hex"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/url"
 	"regexp"
@@ -30,15 +31,15 @@ import (
 //
 //	GET    /v1/rental-skus           -> {skus:[{name, accelerator_model, vram_gb,
 //	                                 price_usd_micros_per_hour}]}
-//	POST   /v1/private-rentals       {package_ref, sku,
-//	                                 renter_token_sha256:[<64 hex>]}
+//	POST   /v1/rentals               {package_ref, sku,
+//	                                 renter_token_sha256:<64 hex>}
 //	                                 -> 202 {rental_id, state, ...}
-//	GET    /v1/private-rentals/{id}  -> {state, worker_address, cert_pem, media_address,
+//	GET    /v1/rentals/{id}          -> {state, worker_address, cert_pem, media_address,
 //	                                     detail, renter_token_sha256:[...],
 //	                                     control_snapshot:{digest,length,canonical_bytes}}
-//	POST   /v1/private-rentals/{id}/worker-session-observations
+//	POST   /v1/rentals/{id}/worker-observations
 //	                                     -> renter-authenticated deterministic WorkerFrames
-//	DELETE /v1/private-rentals/{id}  -> 204
+//	DELETE /v1/rentals/{id}          -> 204
 //
 // `media_address` is now ALWAYS the hub's own word. The client used to derive it from the
 // control address by a stated host:port+1 convention, because the pinned demo contract had
@@ -173,9 +174,9 @@ func (w wireRental) rental() Rental {
 // datacenter, offer, image, cache volume, disk, and ports do not have fields
 // here: Tensorhub resolves and selects them.
 type RentalRequest struct {
-	PackageRef        string   `json:"package_ref"`
-	SKU               string   `json:"sku"`
-	RenterTokenSHA256 []string `json:"renter_token_sha256"`
+	PackageRef        string `json:"package_ref"`
+	SKU               string `json:"sku"`
+	RenterTokenSHA256 string `json:"renter_token_sha256"`
 }
 
 // RentalRequestBytes authors the exact bytes persisted before POST and replayed
@@ -184,10 +185,10 @@ type RentalRequest struct {
 func RentalRequestBytes(packageRef, sku, tokenSHA256 string) ([]byte, *exit.Error) {
 	req := RentalRequest{
 		PackageRef: strings.TrimSpace(packageRef), SKU: strings.TrimSpace(sku),
-		RenterTokenSHA256: []string{strings.TrimPrefix(strings.TrimSpace(tokenSHA256), "sha256:")},
+		RenterTokenSHA256: strings.TrimPrefix(strings.TrimSpace(tokenSHA256), "sha256:"),
 	}
 	if req.PackageRef == "" || req.SKU == "" ||
-		!bareSHA256Pattern.MatchString(req.RenterTokenSHA256[0]) {
+		!bareSHA256Pattern.MatchString(req.RenterTokenSHA256) {
 		return nil, exit.Named(exit.Validation, "rental.intent_incomplete",
 			"package_ref, sku, and one 64-character lowercase renter_token_sha256 are required")
 	}
@@ -209,14 +210,12 @@ type RentalSKU struct {
 
 // RentalSKUs reads Tensorhub's public product catalog.
 func (c *Client) RentalSKUs(ctx context.Context) ([]RentalSKU, *exit.Error) {
-	var out struct {
-		SKUs []RentalSKU `json:"skus"`
-	}
+	var out []RentalSKU
 	if e := c.do(ctx, call{method: http.MethodGet, path: "/v1/rental-skus"}, &out); e != nil {
 		return nil, e
 	}
 	seen := map[string]bool{}
-	for _, sku := range out.SKUs {
+	for _, sku := range out {
 		if strings.TrimSpace(sku.Name) == "" || strings.TrimSpace(sku.AcceleratorModel) == "" ||
 			sku.VRAMGB <= 0 || sku.PriceUSDMicrosPerHour <= 0 || seen[sku.Name] {
 			return nil, exit.Named(exit.Conflict, "hub.rental_catalog_invalid",
@@ -225,7 +224,7 @@ func (c *Client) RentalSKUs(ctx context.Context) ([]RentalSKU, *exit.Error) {
 		}
 		seen[sku.Name] = true
 	}
-	return out.SKUs, nil
+	return out, nil
 }
 
 // Rent asks for a pod, presenting the HASH of a token the caller has already minted. It
@@ -243,7 +242,7 @@ func (c *Client) RentalSKUs(ctx context.Context) ([]RentalSKU, *exit.Error) {
 func (c *Client) Rent(ctx context.Context, requestBody []byte, reason, operationKey string) (Rental, *exit.Error) {
 	var out wireRental
 	e := c.do(ctx, call{
-		method: http.MethodPost, path: "/v1/private-rentals", admin: true, reason: reason,
+		method: http.MethodPost, path: "/v1/rentals", admin: true, reason: reason,
 		idempotency: operationKey, bodyBytes: requestBody, responseBytes: maxRentalResponseBytes,
 	}, &out)
 	if e != nil {
@@ -270,7 +269,7 @@ func (c *Client) Rental(ctx context.Context, id string) (Rental, *exit.Error) {
 		return Rental{}, e
 	}
 	var out wireRental
-	e := c.do(ctx, call{method: http.MethodGet, path: "/v1/private-rentals/" + url.PathEscape(id),
+	e := c.do(ctx, call{method: http.MethodGet, path: "/v1/rentals/" + url.PathEscape(id),
 		admin: true, responseBytes: maxRentalResponseBytes}, &out)
 	if e != nil {
 		return Rental{}, e
@@ -324,7 +323,7 @@ type WorkerSessionObservation struct {
 	Snapshot        []byte `json:"snapshot_base64,omitempty"`
 	ObservedState   []byte `json:"observed_state_base64,omitempty"`
 	BootFailure     []byte `json:"boot_failure_base64,omitempty"`
-	DesiredRevision uint64 `json:"desired_revision,omitempty"`
+	DesiredRevision uint64 `json:"-"`
 }
 
 type WorkerSessionObservationResult struct {
@@ -354,7 +353,7 @@ func (c *Client) ObserveWorkerSession(ctx context.Context, id string,
 	}
 	e := c.do(ctx, call{
 		method: http.MethodPost,
-		path:   "/v1/private-rentals/" + url.PathEscape(id) + "/worker-session-observations",
+		path:   "/v1/rentals/" + url.PathEscape(id) + "/worker-observations",
 		admin:  true, reason: "cozy RecordOwner worker session observation",
 		body: observation,
 	}, &out)
@@ -385,32 +384,53 @@ const maxArtifactGrantResponseBytes = 64 << 20
 // ArtifactGrant asks Tensorhub for fresh, rental-scoped locations using the renter token
 // that already authenticates Claim. The request is deliberately only revision plus TTL:
 // callers cannot choose, omit, or substitute a subject selected by Tensorhub.
-func (c *Client) ArtifactGrant(ctx context.Context, id string, revision, ttlSeconds uint64,
+func (c *Client) ArtifactGrant(ctx context.Context, id string, revision uint64,
 	reason string) (RentalArtifactGrant, *exit.Error) {
 	var out RentalArtifactGrant
 	if e := validateRentalID(id); e != nil {
 		return out, e
 	}
-	if revision == 0 || ttlSeconds == 0 {
-		return out, exit.Internalf("rental artifact grant requires non-zero revision and TTL")
+	if revision == 0 {
+		return out, exit.Internalf("rental artifact grant requires a non-zero revision")
+	}
+	var compact struct {
+		Revision      uint64 `json:"revision"`
+		GrantID       string `json:"grant_id"`
+		ExpiresAtUnix uint64 `json:"expires_at_unix"`
+		Artifacts     []struct {
+			Digest    string `json:"digest"`
+			Kind      string `json:"kind"`
+			Length    uint64 `json:"length"`
+			SubjectID string `json:"subject_id"`
+			URL       string `json:"url"`
+		} `json:"artifacts"`
 	}
 	e := c.do(ctx, call{
 		method:        http.MethodPost,
-		path:          "/v1/private-rentals/" + url.PathEscape(id) + "/artifact-grants",
+		path:          "/v1/rentals/" + url.PathEscape(id) + "/artifact-grants/" + fmt.Sprint(revision),
 		admin:         true,
 		reason:        reason,
 		responseBytes: maxArtifactGrantResponseBytes,
-		body: struct {
-			GrantRevision uint64 `json:"grant_revision"`
-			TTLSeconds    uint64 `json:"ttl_seconds"`
-		}{GrantRevision: revision, TTLSeconds: ttlSeconds},
-	}, &out)
+		body:          map[string]any{},
+	}, &compact)
 	if e != nil {
 		return out, e
 	}
-	if out.GrantRevision != revision {
+	if compact.Revision != revision {
 		return out, artifactGrantInvalid("answered revision %d for requested revision %d",
-			out.GrantRevision, revision)
+			compact.Revision, revision)
+	}
+	out.GrantRevision = compact.Revision
+	out.Grant.GrantID = compact.GrantID
+	out.Grant.ExpiresAtUnix = compact.ExpiresAtUnix
+	for _, artifact := range compact.Artifacts {
+		out.Grant.Subjects = append(out.Grant.Subjects, ArtifactGrantSubject{
+			Digest: artifact.Digest, Kind: artifact.Kind, Length: artifact.Length,
+			SubjectID: artifact.SubjectID,
+		})
+		out.Grant.Locations = append(out.Grant.Locations, ArtifactGrantLocation{
+			Digest: artifact.Digest, URL: artifact.URL,
+		})
 	}
 	if e := validateArtifactGrant(out.Grant); e != nil {
 		return out, e
@@ -470,6 +490,6 @@ func (c *Client) Release(ctx context.Context, id, reason string) *exit.Error {
 		return e
 	}
 	return c.do(ctx, call{
-		method: http.MethodDelete, path: "/v1/private-rentals/" + url.PathEscape(id), admin: true, reason: reason,
+		method: http.MethodDelete, path: "/v1/rentals/" + url.PathEscape(id), admin: true, reason: reason,
 	}, nil)
 }

@@ -795,14 +795,14 @@ def check_typed_resources():
     hub_sources = (pathlib.Path("internal/hub/hub.go").read_text() +
                    pathlib.Path("internal/hub/publish.go").read_text() +
                    pathlib.Path("internal/hub/package_releases.go").read_text())
-    for route in ('"/v1/packages"', '"/v1/models"', '"/v1/models/"', '"/publications"'):
+    for route in ('resourceSearchPath("packages"', 'resourceSearchPath("models"', '"/v1/models/"', '"/publications"'):
         if route not in hub_sources:
             bad.append(f"internal/hub: [resources] missing typed route prefix {route}")
     profile_routes = pathlib.Path("internal/hub/package_releases.go").read_text()
     if "/local-execution" in profile_routes:
         bad.append("internal/hub/package_releases.go: [resources] retired local-execution route remains")
-    if "/local-qualification-materials" not in profile_routes:
-        bad.append("internal/hub/package_releases.go: [resources] local qualification-materials route is absent")
+    if ' + "/install"' not in profile_routes:
+        bad.append("internal/hub/package_releases.go: [resources] package install route is absent")
 
     managed = pathlib.Path("internal/managedinstall/install.go").read_text()
     for retired in ('"base_path"', '"index_url"', '"build_command"', 'exec.Command("uv"',

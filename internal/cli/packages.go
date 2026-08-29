@@ -4,7 +4,6 @@ import (
 	"fmt"
 	"strconv"
 	"strings"
-	"time"
 
 	"github.com/cozy-creator/cozy/internal/config"
 	"github.com/cozy-creator/cozy/internal/exit"
@@ -123,14 +122,6 @@ func handleManagedInstall(ctx *Context, profile string) *exit.Error {
 	if err != nil || major <= 0 {
 		return exit.Usagef("--major %q is not vN with N greater than zero", majorText)
 	}
-	ttlText := strings.TrimSpace(ctx.Inv.Value("--grant-ttl"))
-	if ttlText == "" {
-		ttlText = "10m"
-	}
-	ttl, err := time.ParseDuration(ttlText)
-	if err != nil || ttl <= 0 || ttl > time.Hour {
-		return exit.Usagef("--grant-ttl %q is not a positive duration at or below 1h", ttlText)
-	}
 	reason := "cozy package install " + ref.String() + "@" + release + " for " + profiles[0]
 	l, st, writer, e := open(ctx.Cfg, true)
 	if e != nil {
@@ -141,7 +132,7 @@ func handleManagedInstall(ctx *Context, profile string) *exit.Error {
 	c := client(ctx)
 	hctx, cancel := hub.LongContext()
 	defer cancel()
-	grant, e := c.PackageLocalQualificationMaterials(hctx, ref, release, profiles[0], int64(ttl/time.Second), reason)
+	grant, e := c.PackageLocalQualificationMaterials(hctx, ref, release, profiles[0], reason)
 	if e != nil {
 		return e
 	}

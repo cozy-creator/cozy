@@ -95,7 +95,7 @@ func handleRent(ctx *Context) *exit.Error {
 
 	if !c.Token().Present() {
 		return exit.Named(exit.Credential, "hub.token_missing",
-			"POST /v1/private-rentals is a first-party route and no admin token is configured").
+			"POST /v1/rentals is a first-party route and no admin token is configured").
 			WithRemedy("set TENSORHUB_TOKEN to the hub's admin.token; catalog reads need no credential").
 			WithNext("cozy package search")
 	}

@@ -209,7 +209,7 @@ func TestRentalGPUCatalog(t *testing.T) {
 			return
 		}
 		w.Header().Set("Content-Type", "application/json")
-		_, _ = io.WriteString(w, `{"skus":[{"name":"h200","accelerator_model":"NVIDIA H200","vram_gb":141,"price_usd_micros_per_hour":6000000},{"name":"rtx-4090","accelerator_model":"NVIDIA GeForce RTX 4090","vram_gb":24,"price_usd_micros_per_hour":1250000}]}`)
+		_, _ = io.WriteString(w, `[{"name":"h200","accelerator_model":"NVIDIA H200","vram_gb":141,"price_usd_micros_per_hour":6000000},{"name":"rtx-4090","accelerator_model":"NVIDIA GeForce RTX 4090","vram_gb":24,"price_usd_micros_per_hour":1250000}]`)
 	}))
 	defer server.Close()
 	root := filepath.Join(os.TempDir(), "cozy-product-test", "rental-gpu-catalog")

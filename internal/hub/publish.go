@@ -24,19 +24,11 @@ type Object struct {
 // B64 wraps exact document bytes for the declaration.
 func B64(raw []byte) string { return base64.StdEncoding.EncodeToString(raw) }
 
-// Session is the hub's durable view of one publication.
+// Session is the compact durable view returned by the idempotent publication PUT.
 type Session struct {
-	ID              string `json:"publish_id"`
-	Session         string `json:"session"`
-	StorageDomain   string `json:"storage_domain"`
-	CustodyScope    string `json:"custody_scope"`
-	State           string `json:"state"`
-	ClosureID       string `json:"closure_id"`
-	SnapshotID      string `json:"snapshot_id"`
-	HeaderID        string `json:"header_id"`
-	DeclaredObjects int    `json:"declared_objects"`
-	DeclaredBytes   int64  `json:"declared_bytes"`
-	ExpiresAt       string `json:"expires_at"`
+	Operation string     `json:"operation"`
+	State     string     `json:"state"`
+	Objects   []Transfer `json:"objects"`
 }
 
 // Totals is Cozy's accounting over the exact transfer rows Tensorhub returned.
@@ -56,39 +48,23 @@ type OpenPublicationResponse struct {
 	Created     bool    `json:"created"`
 }
 
-func (c *Client) OpenPublication(ctx context.Context, ref Ref, operationID, reason string) (OpenPublicationResponse, *exit.Error) {
+func (c *Client) OpenPublication(ctx context.Context, ref Ref, operationID string,
+	objects []Object, reason string,
+) (OpenPublicationResponse, *exit.Error) {
 	var out OpenPublicationResponse
 	e := c.do(ctx, call{
-		method: http.MethodPost, path: publications(ref), admin: true, reason: reason,
-		body: map[string]string{"operation_id": operationID},
+		method: http.MethodPut,
+		path:   publications(ref) + "/" + url.PathEscape(operationID), admin: true, reason: reason,
+		body: map[string]any{"objects": objects}, byBytes: true,
 	}, &out)
 	return out, e
 }
 
 // Transfer is one durable known-object transfer row. Its state is the restart journal.
 type Transfer struct {
-	TransferID    string `json:"transfer_id"`
-	IntakeMode    string `json:"intake_mode"`
-	ObjectID      string `json:"object_id"`
-	Length        int64  `json:"length"`
-	State         string `json:"state"`
-	ReceivedBytes int64  `json:"received_bytes"`
-	VerifiedBytes int64  `json:"verified_bytes"`
-}
-
-func (c *Client) ClaimKnownTransfers(ctx context.Context, ref Ref, publicationID string,
-	objects []Object, reason string,
-) ([]Transfer, *exit.Error) {
-	var out struct {
-		Transfers []Transfer `json:"transfers"`
-	}
-	e := c.do(ctx, call{
-		method: http.MethodPost,
-		path:   publications(ref) + "/" + publicationID + "/known-transfers",
-		admin:  true, reason: reason, byBytes: true,
-		body: map[string]any{"objects": objects},
-	}, &out)
-	return out.Transfers, e
+	ObjectID string `json:"object_id"`
+	Length   int64  `json:"length"`
+	State    string `json:"state"`
 }
 
 // Grant is one authorization to write one known object at its final content key.
@@ -124,88 +100,54 @@ type GrantResponse struct {
 
 // GrantKnownTransfer asks for one transfer immediately before its bytes move. One at
 // a time keeps a large multipart response bounded.
-func (c *Client) GrantKnownTransfer(ctx context.Context, ref Ref, publicationID,
-	transferID, reason string,
+func (c *Client) GrantKnownTransfer(ctx context.Context, ref Ref, operation,
+	objectID, reason string,
 ) (GrantResponse, *exit.Error) {
 	var out GrantResponse
 	e := c.do(ctx, call{
 		method: http.MethodPost,
-		path:   publications(ref) + "/" + publicationID + "/known-transfers/grants",
+		path:   publications(ref) + "/" + url.PathEscape(operation) + "/grants",
 		admin:  true, reason: reason, byBytes: true,
-		body: map[string]any{"transfer_ids": []string{transferID}},
+		body: map[string]any{"object_ids": []string{objectID}},
 	}, &out)
 	if e != nil {
 		return GrantResponse{}, e
 	}
 	if len(out.Grants)+len(out.Held) != 1 {
 		return GrantResponse{}, exit.Internalf(
-			"grant for transfer %s answered %d grants and %d held rows",
-			transferID, len(out.Grants), len(out.Held),
+			"grant for object %s answered %d grants and %d held rows",
+			objectID, len(out.Grants), len(out.Held),
 		)
 	}
 	return out, nil
 }
 
-type ReceivedTransfer struct {
-	TransferID    string `json:"transfer_id"`
-	ReceivedBytes int64  `json:"received_bytes"`
-	Precondition  string `json:"precondition"`
+type SettleObject struct {
+	ObjectID       string   `json:"object_id"`
+	AlreadyPresent bool     `json:"already_present,omitempty"`
+	PartETags      []string `json:"part_etags,omitempty"`
 }
 
-func (c *Client) MarkTransfersReceived(ctx context.Context, ref Ref, publicationID string,
-	transfers []ReceivedTransfer, reason string,
-) ([]Transfer, *exit.Error) {
-	var out struct {
-		Transfers []Transfer `json:"transfers"`
-	}
-	e := c.do(ctx, call{
-		method: http.MethodPost,
-		path:   publications(ref) + "/" + publicationID + "/known-transfers/received",
-		admin:  true, reason: reason, byBytes: true,
-		body: map[string]any{"transfers": transfers},
-	}, &out)
-	return out.Transfers, e
-}
-
-// Verdict is Tensorhub's own full-byte reading of one transfer.
-type Verdict struct {
+type SettledObject struct {
 	ObjectID       string `json:"object_id"`
 	State          string `json:"state"`
-	Bytes          int64  `json:"bytes"`
 	ChecksumSource string `json:"checksum_source"`
-	Precondition   string `json:"precondition"`
-	MS             int64  `json:"ms"`
-	Detail         string `json:"detail"`
+	Conflict       bool   `json:"conflict"`
 }
 
-func (c *Client) VerifyKnownTransfers(ctx context.Context, ref Ref, publicationID string,
-	transferIDs []string, reason string,
-) ([]Verdict, *exit.Error) {
+func (c *Client) SettleObjects(ctx context.Context, ref Ref, operation string,
+	objects []SettleObject, reason string,
+) ([]SettledObject, *exit.Error) {
 	var out struct {
-		Transfers []Verdict `json:"transfers"`
+		Objects []SettledObject `json:"objects"`
 	}
 	e := c.do(ctx, call{
 		method: http.MethodPost,
-		path:   publications(ref) + "/" + publicationID + "/known-transfers/verify",
+		path:   publications(ref) + "/" + url.PathEscape(operation) + "/settle",
 		admin:  true, reason: reason, byBytes: true,
-		body: map[string]any{"transfer_ids": transferIDs},
+		body: map[string]any{"objects": objects},
 	}, &out)
-	return out.Transfers, e
-}
-
-// FinishMultipart assembles a ranged upload. Tensorhub owns the final no-clobber
-// conditional.
-func (c *Client) FinishMultipart(ctx context.Context, ref Ref, publicationID, objectID string, etags []string, reason string) (bool, *exit.Error) {
-	var out struct {
-		Conflict bool `json:"conflict"`
-	}
-	e := c.do(ctx, call{
-		method: http.MethodPost,
-		path:   publications(ref) + "/" + publicationID + "/multipart/complete",
-		admin:  true, reason: reason, byBytes: true,
-		body: map[string]any{"object_id": objectID, "etags": etags},
-	}, &out)
-	return out.Conflict, e
+	return out.Objects, e
 }
 
 type SealPublicationRequest struct {
@@ -247,13 +189,13 @@ type CompleteResponse struct {
 	Duplicate             bool             `json:"duplicate"`
 }
 
-func (c *Client) SealPublication(ctx context.Context, ref Ref, publicationID string,
+func (c *Client) SealPublication(ctx context.Context, ref Ref, operation string,
 	request SealPublicationRequest, reason string,
 ) (CompleteResponse, *exit.Error) {
 	var out CompleteResponse
 	e := c.do(ctx, call{
 		method: http.MethodPost,
-		path:   publications(ref) + "/" + publicationID + "/seal",
+		path:   publications(ref) + "/" + url.PathEscape(operation) + "/seal",
 		admin:  true, reason: reason, byBytes: true,
 		body: request,
 	}, &out)

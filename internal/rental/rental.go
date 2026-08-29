@@ -336,7 +336,7 @@ func ArtifactGrants(st *records.Store, client *hub.Client) orchestrator.Artifact
 			return 0, nil, problem
 		}
 		answer, problem := client.WithToken(connection.Token, "rental owner token").ArtifactGrant(
-			ctx, connection.RentalID, revision, 3600, "cozy RecordOwner artifact grant")
+			ctx, connection.RentalID, revision, "cozy RecordOwner artifact grant")
 		if problem != nil {
 			return 0, nil, problem
 		}

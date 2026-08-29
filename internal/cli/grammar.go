@@ -43,14 +43,13 @@ type PackageInstallCmd struct {
 	AllowUnsigned bool   `help:"Allow an unverified local development source."`
 	Profile       string `help:"Qualified compatibility profile."`
 	Major         string `help:"Local serving major for a qualified release." placeholder:"vN"`
-	GrantTTL      string `help:"Qualified-material grant lifetime." default:"10m"`
 }
 
 func (c *PackageInstallCmd) Run(r *Runtime) error {
 	return r.call(handleInstall, []string{c.Ref}, bools(
 		"--force", c.Force, "--allow-unsigned", c.AllowUnsigned), values(
 		"--from", c.From, "--dir", c.Dir, "--digest", c.Digest,
-		"--profile", c.Profile, "--major", c.Major, "--grant-ttl", c.GrantTTL), false)
+		"--profile", c.Profile, "--major", c.Major), false)
 }
 
 type PackageRemoveCmd struct {

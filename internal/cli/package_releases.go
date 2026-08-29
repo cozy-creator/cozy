@@ -34,20 +34,12 @@ func handlePackagePublish(ctx *Context) *exit.Error {
 	c := client(ctx)
 	hctx, cancel := hub.LongContext()
 	defer cancel()
-	if _, problem := c.Package(hctx, ref); problem != nil {
-		if problem.Code != exit.NotFound {
-			return problem
-		}
-		if _, problem := c.CreatePackage(hctx, ref.Org, ref.Name, reason); problem != nil && problem.Code != exit.Conflict {
-			return problem
-		}
-	}
 	begun, problem := c.BeginPackageRelease(hctx, ref, release, reason)
 	if problem != nil {
 		return problem
 	}
-	if begun.Release != release || (begun.State != "pending" && begun.State != "committed") {
-		return exit.Internalf("package begin returned another release or invalid state %q", begun.State)
+	if begun.State != "pending" && begun.State != "committed" {
+		return exit.Internalf("package begin returned invalid state %q", begun.State)
 	}
 	var moved int64
 	if begun.State == "pending" {
@@ -70,9 +62,6 @@ func handlePackagePublish(ctx *Context) *exit.Error {
 	done, problem := c.FinalizePackageRelease(hctx, ref, release, reason)
 	if problem != nil {
 		return problem
-	}
-	if done.Release != release {
-		return exit.Internalf("package finalize returned another release %q", done.Release)
 	}
 	switch done.QualificationState {
 	case "pending", "qualified", "refused", "unsupported":
@@ -98,12 +87,12 @@ func handlePackagePublish(ctx *Context) *exit.Error {
 	sort.Strings(candidateRows)
 	sort.Strings(refusalRows)
 	fields := []output.Field{
-		{K: "package", V: ref.String()}, {K: "release", V: done.Release},
+		{K: "package", V: ref.String()}, {K: "release", V: release},
 		{K: "status", V: "published"}, {K: "changed", V: begun.State != "committed"},
 		{K: "created", V: done.Created}, {K: "qualification", V: done.QualificationState},
 		{K: "qualification_error", V: done.QualificationError},
 		{K: "compatible_profiles", V: done.CompatibleProfiles}, {K: "profiles", V: profileRows},
-		{K: "package_executions", V: len(done.PackageExecutions)},
+		{K: "package_executions", V: done.ExecutionCount},
 		{K: "requires_python", V: done.RequiresPython}, {K: "requirements", V: done.Requirements},
 		{K: "uploaded", V: output.Bytes(moved)}, {K: "hub", V: c.Base()},
 	}

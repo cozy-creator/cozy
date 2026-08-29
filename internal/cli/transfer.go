@@ -107,14 +107,6 @@ func handleModelPublish(ctx *Context) *exit.Error {
 	}
 	hctx, cancel := hub.LongContext()
 	defer cancel()
-	if _, e := c.Model(hctx, ref); e != nil {
-		if e.Code != exit.NotFound {
-			return e
-		}
-		if _, e := c.CreateModel(hctx, ref.Org, ref.Name, reason); e != nil && e.Code != exit.Conflict {
-			return e
-		}
-	}
 	res, e := p.Run(hctx)
 	if e != nil {
 		return e

@@ -253,30 +253,6 @@ func (c *Client) Model(ctx context.Context, ref Ref) (Resource, *exit.Error) {
 	return out.Model, e
 }
 
-// CreatePackage is the first-party package creation door.
-func (c *Client) CreatePackage(ctx context.Context, org, name, reason string) (Resource, *exit.Error) {
-	var out struct {
-		Package Resource `json:"package"`
-	}
-	e := c.do(ctx, call{
-		method: http.MethodPost, path: "/v1/packages", admin: true, reason: reason,
-		body: map[string]string{"org": org, "name": name},
-	}, &out)
-	return out.Package, e
-}
-
-// CreateModel is the first-party model creation door.
-func (c *Client) CreateModel(ctx context.Context, org, name, reason string) (Resource, *exit.Error) {
-	var out struct {
-		Model Resource `json:"model"`
-	}
-	e := c.do(ctx, call{
-		method: http.MethodPost, path: "/v1/models", admin: true, reason: reason,
-		body: map[string]string{"org": org, "name": name},
-	}, &out)
-	return out.Model, e
-}
-
 func resourcePath(collection string, ref Ref) string {
 	return "/v1/" + collection + "/" + ref.Org + "/" + ref.Name
 }

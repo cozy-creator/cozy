@@ -136,40 +136,36 @@ func (p *Publish) Run(ctx context.Context) (Result, *exit.Error) {
 	// 2. Open under the caller-stable operation id. Reopening returns the same durable
 	//    publication, including a committed one whose seal result can be replayed.
 	t0 = time.Now()
-	opened, e := p.Hub.OpenPublication(ctx, p.Ref, p.Session, p.Reason)
+	opened, e := p.Hub.OpenPublication(ctx, p.Ref, p.Session, declared, p.Reason)
 	if e != nil {
 		return res, e
 	}
 	ms["open"] = since(t0)
 	publication := opened.Publication
-	res.PublishID, res.Created, res.Session = publication.ID, opened.Created, publication.Session
+	res.PublishID, res.Created, res.Session = publication.Operation, opened.Created, publication.Operation
 	verb := "resumed"
 	if opened.Created {
 		verb = "opened"
 	}
 	p.say("%s publication %s in state %s", verb, res.PublishID, publication.State)
 	if publication.State != "open" {
-		res.Totals.DeclaredObjects = publication.DeclaredObjects
-		res.Totals.DeclaredBytes = publication.DeclaredBytes
-		res.Totals.HeldObjects = publication.DeclaredObjects
-		res.Deduped = publication.DeclaredBytes
+		for _, object := range publication.Objects {
+			res.Totals.DeclaredObjects++
+			res.Totals.DeclaredBytes += object.Length
+		}
+		res.Totals.HeldObjects = res.Totals.DeclaredObjects
+		res.Deduped = res.Totals.DeclaredBytes
 		return p.seal(ctx, seal, res, ms)
 	}
 
-	// 3. Claim the exact sorted transfer set. Identical claims replay rows with their
-	//    current states; changed lengths require another operation id.
-	t0 = time.Now()
-	transfers, e := p.Hub.ClaimKnownTransfers(ctx, p.Ref, res.PublishID, declared, p.Reason)
-	if e != nil {
-		return res, e
-	}
-	ms["claim"] = since(t0)
+	// 3. The idempotent PUT froze and returned the exact object set.
+	transfers := publication.Objects
 	if e := exactTransfers(declared, transfers); e != nil {
 		return res, e
 	}
 
 	toUpload := make([]hub.Transfer, 0, len(transfers))
-	toVerify := make([]string, 0, len(transfers))
+	toVerify := make([]hub.Transfer, 0, len(transfers))
 	for _, transfer := range transfers {
 		res.Totals.DeclaredObjects++
 		res.Totals.DeclaredBytes += transfer.Length
@@ -180,14 +176,14 @@ func (p *Publish) Run(ctx context.Context) (Result, *exit.Error) {
 		case "verifying":
 			res.Totals.HeldObjects++
 			res.Deduped += transfer.Length
-			toVerify = append(toVerify, transfer.TransferID)
+			toVerify = append(toVerify, transfer)
 		case "claimed", "transferring":
 			res.Totals.MissingObjects++
 			res.Totals.MissingBytes += transfer.Length
 			toUpload = append(toUpload, transfer)
 		default:
 			return res, exit.New(exit.Conflict,
-				"publication transfer %s for %s is %s", transfer.TransferID, transfer.ObjectID, transfer.State).
+				"publication object %s is %s", transfer.ObjectID, transfer.State).
 				WithRemedy("repair the refused immutable snapshot publication before replaying it")
 		}
 	}
@@ -203,16 +199,24 @@ func (p *Publish) Run(ctx context.Context) (Result, *exit.Error) {
 	// 4. Resume transfers whose bytes reached storage before the earlier process died.
 	if len(toVerify) > 0 {
 		t0 = time.Now()
-		verdicts, e := p.Hub.VerifyKnownTransfers(ctx, p.Ref, res.PublishID, toVerify, p.Reason)
-		if e != nil {
-			return res, e
-		}
-		if e := acceptedVerdicts(verdicts, len(toVerify)); e != nil {
-			return res, e
-		}
-		res.Verified += len(verdicts)
-		for _, verdict := range verdicts {
-			res.Sources = appendUnique(res.Sources, verdict.ChecksumSource)
+		for len(toVerify) > 0 {
+			n := min(len(toVerify), 128)
+			settlements := make([]hub.SettleObject, 0, n)
+			for _, transfer := range toVerify[:n] {
+				settlements = append(settlements, hub.SettleObject{ObjectID: transfer.ObjectID})
+			}
+			settled, e := p.Hub.SettleObjects(ctx, p.Ref, res.PublishID, settlements, p.Reason)
+			if e != nil {
+				return res, e
+			}
+			if e := acceptedSettlements(settled, n); e != nil {
+				return res, e
+			}
+			res.Verified += len(settled)
+			for _, object := range settled {
+				res.Sources = appendUnique(res.Sources, object.ChecksumSource)
+			}
+			toVerify = toVerify[n:]
 		}
 		ms["resume_verify"] = since(t0)
 	}
@@ -269,8 +273,7 @@ func exactTransfers(declared []hub.Object, transfers []hub.Transfer) *exit.Error
 	seen := map[string]bool{}
 	for _, transfer := range transfers {
 		length, ok := want[transfer.ObjectID]
-		if !ok || seen[transfer.ObjectID] || transfer.TransferID == "" ||
-			transfer.IntakeMode != "known" || length != transfer.Length {
+		if !ok || seen[transfer.ObjectID] || length != transfer.Length {
 			return exit.Internalf("claim answered a missing, duplicate, or changed transfer for %s", transfer.ObjectID)
 		}
 		seen[transfer.ObjectID] = true
@@ -278,14 +281,14 @@ func exactTransfers(declared []hub.Object, transfers []hub.Transfer) *exit.Error
 	return nil
 }
 
-func acceptedVerdicts(verdicts []hub.Verdict, want int) *exit.Error {
-	if len(verdicts) != want {
-		return exit.Internalf("verification of %d transfers answered %d verdicts", want, len(verdicts))
+func acceptedSettlements(objects []hub.SettledObject, want int) *exit.Error {
+	if len(objects) != want {
+		return exit.Internalf("settlement of %d objects answered %d rows", want, len(objects))
 	}
-	for _, verdict := range verdicts {
-		if verdict.ObjectID == "" || verdict.State != "accepted" {
-			return exit.Internalf("verification for %s returned state %q: %s",
-				verdict.ObjectID, verdict.State, verdict.Detail)
+	for _, object := range objects {
+		if object.ObjectID == "" || object.State != "accepted" {
+			return exit.Internalf("settlement for %s returned state %q",
+				object.ObjectID, object.State)
 		}
 	}
 	return nil
@@ -423,16 +426,16 @@ func (p *Publish) uploadOne(ctx context.Context, publicationID string, index int
 	transfer hub.Transfer,
 ) uploadOutcome {
 	outcome := uploadOutcome{index: index}
-	answer, e := p.Hub.GrantKnownTransfer(ctx, p.Ref, publicationID, transfer.TransferID, p.Reason)
+	answer, e := p.Hub.GrantKnownTransfer(ctx, p.Ref, publicationID, transfer.ObjectID, p.Reason)
 	if e != nil {
 		outcome.err = e
 		return outcome
 	}
 	if len(answer.Held) == 1 {
 		held := answer.Held[0]
-		if held.TransferID != transfer.TransferID || held.ObjectID != transfer.ObjectID ||
-			held.Length != transfer.Length || held.State != "accepted" {
-			outcome.err = exit.Internalf("grant for %s returned a changed held transfer", transfer.TransferID)
+		if held.ObjectID != transfer.ObjectID || held.Length != transfer.Length ||
+			held.State != "accepted" {
+			outcome.err = exit.Internalf("grant for %s returned a changed held object", transfer.ObjectID)
 			return outcome
 		}
 		outcome.deduped = transfer.Length
@@ -440,7 +443,7 @@ func (p *Publish) uploadOne(ctx context.Context, publicationID string, index int
 	}
 	grant := answer.Grants[0]
 	if grant.ObjectID != transfer.ObjectID || grant.Length != transfer.Length {
-		outcome.err = exit.Internalf("grant for %s returned another object", transfer.TransferID)
+		outcome.err = exit.Internalf("grant for %s returned another object", transfer.ObjectID)
 		return outcome
 	}
 	outcome.multipart = grant.Multipart()
@@ -454,10 +457,10 @@ func (p *Publish) uploadOne(ctx context.Context, publicationID string, index int
 		outcome.err = e
 		return outcome
 	}
-	conflict, e := p.put(ctx, grant, staged, &local)
+	put, e := p.put(ctx, grant, staged, &local)
 	if e != nil && e.Name == "grant.expired_replan" {
 		freshAnswer, e2 := p.Hub.GrantKnownTransfer(ctx, p.Ref, publicationID,
-			transfer.TransferID, p.Reason)
+			transfer.ObjectID, p.Reason)
 		if e2 != nil {
 			outcome.err = e2
 			return outcome
@@ -467,7 +470,7 @@ func (p *Publish) uploadOne(ctx context.Context, publicationID string, index int
 			return outcome
 		}
 		fresh := freshAnswer.Grants[0]
-		conflict, e = p.put(ctx, fresh, staged, &local)
+		put, e = p.put(ctx, fresh, staged, &local)
 	}
 	if e != nil {
 		outcome.err = e
@@ -475,49 +478,32 @@ func (p *Publish) uploadOne(ctx context.Context, publicationID string, index int
 	}
 	outcome.moved = local.Moved
 	outcome.uploaded = true
-	outcome.conflict = conflict
-	if conflict {
-		outcome.deduped = transfer.Length
-	}
-	precondition := "uploaded"
-	if conflict {
-		precondition = "already_present"
-	}
-	received, receiveErr := p.Hub.MarkTransfersReceived(ctx, p.Ref, publicationID,
-		[]hub.ReceivedTransfer{{TransferID: transfer.TransferID,
-			ReceivedBytes: transfer.Length, Precondition: precondition}}, p.Reason)
-	if receiveErr != nil {
-		outcome.err = receiveErr
+	settled, settleErr := p.Hub.SettleObjects(ctx, p.Ref, publicationID,
+		[]hub.SettleObject{{ObjectID: transfer.ObjectID, AlreadyPresent: put.conflict,
+			PartETags: put.partETags}}, p.Reason)
+	if settleErr != nil {
+		outcome.err = settleErr
 		return outcome
 	}
-	if len(received) != 1 || received[0].TransferID != transfer.TransferID ||
-		received[0].State != "verifying" || received[0].ReceivedBytes != transfer.Length {
-		outcome.err = exit.Internalf("received acknowledgement for %s was incomplete", transfer.TransferID)
-		return outcome
-	}
-	verdicts, verifyErr := p.Hub.VerifyKnownTransfers(
-		ctx, p.Ref, publicationID, []string{transfer.TransferID}, p.Reason,
-	)
-	if verifyErr != nil {
-		outcome.err = verifyErr
-		return outcome
-	}
-	if len(verdicts) != 1 || verdicts[0].ObjectID != grant.ObjectID {
+	if len(settled) != 1 || settled[0].ObjectID != grant.ObjectID {
 		outcome.err = exit.Internalf(
-			"verification for %s answered %d rows or another object",
+			"settlement for %s answered %d rows or another object",
 			grant.ObjectID,
-			len(verdicts),
+			len(settled),
 		)
 		return outcome
 	}
-	outcome.verified = verdicts[0].State == "accepted"
-	outcome.source = verdicts[0].ChecksumSource
+	outcome.conflict = settled[0].Conflict
+	if outcome.conflict {
+		outcome.deduped = transfer.Length
+	}
+	outcome.verified = settled[0].State == "accepted"
+	outcome.source = settled[0].ChecksumSource
 	if !outcome.verified {
 		outcome.err = exit.Internalf(
-			"verification for %s returned state %q: %s",
+			"settlement for %s returned state %q",
 			grant.ObjectID,
-			verdicts[0].State,
-			verdicts[0].Detail,
+			settled[0].State,
 		)
 	}
 	return outcome
@@ -526,44 +512,48 @@ func (p *Publish) uploadOne(ctx context.Context, publicationID string, index int
 // put writes one object at its final content key. Every required header is sent
 // verbatim: they are signed into the URL, so stripping one is 403 and a wrong body
 // is 400 — neither is a branch a client may take.
-func (p *Publish) put(ctx context.Context, g hub.Grant, path string, res *Result) (bool, *exit.Error) {
+type putResult struct {
+	conflict  bool
+	partETags []string
+}
+
+func (p *Publish) put(ctx context.Context, g hub.Grant, path string, res *Result) (putResult, *exit.Error) {
 	if g.Multipart() {
 		return p.putRanged(ctx, g, path, res)
 	}
 	status, _, body, e := send(ctx, http.MethodPut, g.URL, opener(path, 0, g.Length), g.Length, g.Headers)
 	if e != nil {
-		return false, e
+		return putResult{}, e
 	}
 	switch status {
 	case http.StatusOK:
 		res.Moved += g.Length
-		return false, nil
+		return putResult{}, nil
 	case http.StatusPreconditionFailed:
 		// Someone already holds this exact key. That is not a failure — the key is
 		// the digest, so whoever wrote it wrote these bytes. The hub still proves it.
-		return true, nil
+		return putResult{conflict: true}, nil
 	default:
-		return false, storageRefusal(status, g.ObjectID, body)
+		return putResult{}, storageRefusal(status, g.ObjectID, body)
 	}
 }
 
-func (p *Publish) putRanged(ctx context.Context, g hub.Grant, path string, res *Result) (bool, *exit.Error) {
+func (p *Publish) putRanged(ctx context.Context, g hub.Grant, path string, res *Result) (putResult, *exit.Error) {
 	etags := make([]string, 0, len(g.Parts))
 	for _, part := range g.Parts {
 		status, headers, body, e := send(ctx, http.MethodPut, part.URL,
 			opener(path, part.Offset, part.Length), part.Length, nil)
 		if e != nil {
-			return false, e
+			return putResult{}, e
 		}
 		if status != http.StatusOK {
-			return false, storageRefusal(status, fmt.Sprintf("%s part %d", g.ObjectID, part.Number), body)
+			return putResult{}, storageRefusal(status, fmt.Sprintf("%s part %d", g.ObjectID, part.Number), body)
 		}
 		etags = append(etags, strings.Trim(headers.Get("ETag"), `"`))
 		res.Moved += part.Length
 	}
-	// The hub assembles: that call carries the no-clobber precondition, and a client
-	// that assembled its own could replace verified bytes.
-	return p.Hub.FinishMultipart(ctx, p.Ref, res.PublishID, g.ObjectID, etags, p.Reason)
+	// Tensorhub assembles and verifies in the following settle call.
+	return putResult{partETags: etags}, nil
 }
 
 // attempts bounds transport retries at the storage edge. A hiccup on a residential
