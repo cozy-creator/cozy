@@ -53,7 +53,7 @@ func TestPackagePublishCLI(t *testing.T) {
 			rows := make([]map[string]any, 0, len(roles))
 			for _, role := range sortedKeys(roles) {
 				ref := roles[role]
-				held := role == "descriptor"
+				held := role == "package_descriptor"
 				row := map[string]any{"role": role, "ref": ref, "already_held": held,
 					"required_headers": map[string]string{}, "expires_at": "2099-08-29T00:00:00Z"}
 				if !held {
@@ -83,7 +83,7 @@ func TestPackagePublishCLI(t *testing.T) {
 				t.Errorf("finalize changed declaration bytes")
 			}
 			for role, ref := range fixtureDeclarationRoles(declared) {
-				if role == "descriptor" {
+				if role == "package_descriptor" {
 					continue
 				}
 				body := put[role]
@@ -168,8 +168,8 @@ chmod 755 "$UV_PROJECT_ENVIRONMENT/bin/cozy-runtime"
 func fixtureDeclarationRoles(d packagepublish.Declaration) map[string]packagepublish.ObjectRef {
 	out := map[string]packagepublish.ObjectRef{
 		"source_archive": d.SourceArchive, "source_lock": d.SourceLock,
-		"project_wheel": {Digest: d.ProjectWheel.Digest, Length: d.ProjectWheel.Length},
-		"descriptor":    d.Descriptor,
+		"project_wheel":      {Digest: d.ProjectWheel.Digest, Length: d.ProjectWheel.Length},
+		"package_descriptor": d.PackageDescriptor,
 	}
 	return out
 }

@@ -317,7 +317,7 @@ func (s *Server) resolvePlan(sub Submission) (orchestrator.Submission, *exit.Err
 			out.Outputs = outputs
 		}
 		// The rental's FROZEN descriptor is the schema; no local install is consulted.
-		descriptor, e := rental.Descriptor(s.store, out.Worker)
+		descriptor, e := rental.PackageDescriptor(s.store, out.Worker)
 		if e != nil {
 			return out, e
 		}

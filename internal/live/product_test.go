@@ -56,8 +56,9 @@ func TestControllerWebLifecycle(t *testing.T) {
 	}
 	up := first.output
 	var upDocument struct {
-		URL string `json:"url"`
-		PID int    `json:"pid"`
+		URL     string `json:"url"`
+		PID     int    `json:"pid"`
+		Changed bool   `json:"changed"`
 	}
 	var secondDocument struct {
 		URL     string `json:"url"`
@@ -96,7 +97,7 @@ func TestControllerWebLifecycle(t *testing.T) {
 	if _, err := os.Stat(filepath.Join(root, "controller.log")); !os.IsNotExist(err) {
 		t.Fatalf("up created a persistent controller log: %v", err)
 	}
-	if code, out := runCozy(t, root, "up", "--json"); code != 0 {
+	if code, out := runCozy(t, root, "up", "--json", "--full"); code != 0 {
 		t.Fatalf("repeated up failed [exit %d]\n%s", code, out)
 	} else {
 		var repeated struct {

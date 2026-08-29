@@ -121,7 +121,7 @@ func (r *Resolver) Entrypoint(installID, name string) (*launch.Entrypoint, *exit
 	if e != nil {
 		return nil, e
 	}
-	return facts.Descriptor.Function(name)
+	return facts.PackageDescriptor.Function(name)
 }
 
 func (r *Resolver) installFacts(installID string) (*launch.Facts, *exit.Error) {
@@ -168,7 +168,7 @@ func (r *Resolver) Jobs(pkg string) ([]launch.JobFacts, *exit.Error) {
 		return nil, e
 	}
 	out := []launch.JobFacts{}
-	for _, job := range facts.Descriptor.Jobs {
+	for _, job := range facts.PackageDescriptor.Jobs {
 		one, e := facts.Job(job.Name)
 		if e != nil {
 			return nil, e

@@ -120,15 +120,15 @@ func jobFactsOf(ctx *Context, t Target) (*jobSurface, *exit.Error) {
 	if e != nil {
 		return nil, e
 	}
-	for i := range facts.Descriptor.Jobs {
-		job := &facts.Descriptor.Jobs[i]
+	for i := range facts.PackageDescriptor.Jobs {
+		job := &facts.PackageDescriptor.Jobs[i]
 		if job.Name != t.Function {
 			continue
 		}
 		return &jobSurface{Name: job.Name, Request: job.Request, Result: job.Result}, nil
 	}
 	names := []string{}
-	for _, job := range facts.Descriptor.Jobs {
+	for _, job := range facts.PackageDescriptor.Jobs {
 		names = append(names, job.Name)
 	}
 	known := strings.Join(names, ", ")
@@ -137,7 +137,7 @@ func jobFactsOf(ctx *Context, t Target) (*jobSurface, *exit.Error) {
 	}
 	// A NAME THAT IS AN ENTRYPOINT is worth saying out loud: it is the commonest way to
 	// reach here, and "no such job" would send a reader looking for a typo.
-	if _, e := facts.Descriptor.Function(t.Function); e == nil {
+	if _, e := facts.PackageDescriptor.Function(t.Function); e == nil {
 		return nil, exit.Named(exit.Usage, "not_a_job",
 			"%s registers %q as an ENTRYPOINT, not a @job", t.Package, t.Function).
 			WithRemedy("an entrypoint is invoked with `cozy invoke run`; a job is run to completion").

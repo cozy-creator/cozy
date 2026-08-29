@@ -28,10 +28,10 @@ import (
 )
 
 const (
-	DescriptorName = "package.descriptor.json"
-	LockName       = "uv.lock"
-	MaxLockBytes   = 16 << 20
-	MaxSourceBytes = 512 << 20
+	PackageDescriptorName = "package.descriptor.json"
+	LockName              = "uv.lock"
+	MaxLockBytes          = 16 << 20
+	MaxSourceBytes        = 512 << 20
 )
 
 type ObjectRef struct {
@@ -40,11 +40,11 @@ type ObjectRef struct {
 }
 
 type Declaration struct {
-	Format        string     `json:"format"`
-	SourceArchive ObjectRef  `json:"source_archive"`
-	SourceLock    ObjectRef  `json:"source_lock"`
-	ProjectWheel  wheel.Fact `json:"project_wheel"`
-	Descriptor    ObjectRef  `json:"descriptor"`
+	Format            string     `json:"format"`
+	SourceArchive     ObjectRef  `json:"source_archive"`
+	SourceLock        ObjectRef  `json:"source_lock"`
+	ProjectWheel      wheel.Fact `json:"project_wheel"`
+	PackageDescriptor ObjectRef  `json:"package_descriptor"`
 }
 
 // Package retains the exact local bytes for a foreground begin/upload/finalize walk.
@@ -121,15 +121,15 @@ func Prepare(req Request) (*Package, *exit.Error) {
 	}
 
 	result := &Package{Root: root, Files: map[string]string{
-		"source_archive": archive,
-		"source_lock":    lockPath,
-		"project_wheel":  project.Path,
-		"descriptor":     descriptor,
+		"source_archive":     archive,
+		"source_lock":        lockPath,
+		"project_wheel":      project.Path,
+		"package_descriptor": descriptor,
 	}}
 	result.Declaration = Declaration{
 		Format:        "tensorhub.package_release_declaration/1",
 		SourceArchive: archiveRef, SourceLock: lock,
-		ProjectWheel: project.Fact, Descriptor: descriptorRef(descriptor),
+		ProjectWheel: project.Fact, PackageDescriptor: descriptorRef(descriptor),
 	}
 	return result, nil
 }
@@ -254,7 +254,7 @@ func auditSource(root string, files []string) *exit.Error {
 }
 
 func deriveDescriptor(tree, root string) (string, *exit.Error) {
-	output := filepath.Join(root, DescriptorName)
+	output := filepath.Join(root, PackageDescriptorName)
 	environment := filepath.Join(root, "descriptor-venv")
 	toolEnv := config.Frozen().Tool(
 		"UV_PROJECT_ENVIRONMENT="+environment,
@@ -406,7 +406,7 @@ func descriptorNeedsBindings(file string) (bool, *exit.Error) {
 		} `json:"jobs"`
 	}
 	if err := json.Unmarshal(body, &descriptor); err != nil {
-		return false, exit.Named(exit.Validation, "package_descriptor_invalid", "%s: %v", DescriptorName, err)
+		return false, exit.Named(exit.Validation, "package_descriptor_invalid", "%s: %v", PackageDescriptorName, err)
 	}
 	for _, entrypoint := range descriptor.Entrypoints {
 		if len(entrypoint.Models) > 0 {

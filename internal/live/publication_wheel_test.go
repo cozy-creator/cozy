@@ -194,7 +194,7 @@ func TestPackagePublishDerivesDescriptorWithLockedRuntime(t *testing.T) {
 	if metadata := wheelMetadata(t, pack.Files["project_wheel"]); !strings.Contains(metadata, "Requires-Dist: cozy-runtime==0.0.3") {
 		t.Fatalf("project wheel lost its Runtime compatibility requirement:\n%s", metadata)
 	}
-	descriptor, problem := launch.DecodeDescriptor(mustRead(t, pack.Files["descriptor"]))
+	descriptor, problem := launch.DecodeDescriptor(mustRead(t, pack.Files["package_descriptor"]))
 	fatal(t, problem)
 	if _, problem := descriptor.Function("marco"); problem != nil {
 		t.Fatalf("derived Marco descriptor has no marco function: %s", problem.Message)

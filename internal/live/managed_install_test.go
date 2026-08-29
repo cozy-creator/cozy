@@ -194,7 +194,7 @@ print(json.dumps({"digest":"sha256:"+hashlib.sha256(evidence).hexdigest(),"lengt
 				"lease_id": "lease-local", "lease_expires_at": expiresAt,
 				"base_realization":         realization,
 				"package_environment_spec": exactDoc(ees), "package_bundle": exactDoc(bundle),
-				"descriptor":         exactDoc(descriptor),
+				"package_descriptor": exactDoc(descriptor),
 				"resolved_wheel_set": exactDoc(resolved), "wheelhouse_manifest": exactDoc(wheelhouse),
 				"resolution_lock": exactDoc(lock),
 				"native_wheel_proof": map[string]any{

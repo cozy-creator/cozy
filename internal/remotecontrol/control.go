@@ -44,7 +44,7 @@ type snapshot struct {
 	ArtifactObjectSet           hub.ExactControlDocument `json:"artifact_object_set"`
 	BindingDocuments            []bindingDocument        `json:"binding_documents"`
 	BindingRelease              hub.ExactControlDocument `json:"binding_release"`
-	Descriptor                  hub.ExactControlDocument `json:"descriptor"`
+	PackageDescriptor           hub.ExactControlDocument `json:"package_descriptor"`
 	PackageBundle               hub.ExactControlDocument `json:"package_bundle"`
 	PackageExecutionDigest      string                   `json:"package_execution_digest"`
 	EnvironmentSpec             hub.ExactControlDocument `json:"environment_spec"`
@@ -54,10 +54,10 @@ type snapshot struct {
 	ResolvedWheelSet            hub.ExactControlDocument `json:"resolved_wheel_set"`
 }
 
-// Facts is the verified remote-only projection. Descriptor is used for payload
+// Facts is the verified remote-only projection. PackageDescriptor is used for payload
 // typing; Placement is handed directly to the orchestrator.
 type Facts struct {
-	Descriptor              *launch.Descriptor
+	PackageDescriptor       *launch.PackageDescriptor
 	Placement               orchestrator.DesiredPlacement
 	PackageExecutionDigest  string
 	ArtifactObjectSetDigest string
@@ -327,7 +327,7 @@ func Decode(control hub.ExactControlDocument, packageRef string) (Facts, *exit.E
 	}
 	for name, document := range map[string]hub.ExactControlDocument{
 		"artifact_object_set": s.ArtifactObjectSet,
-		"binding_release":     s.BindingRelease, "descriptor": s.Descriptor,
+		"binding_release":     s.BindingRelease, "package_descriptor": s.PackageDescriptor,
 		"package_bundle": s.PackageBundle, "environment_spec": s.EnvironmentSpec,
 		"installed_environment_receipt": s.InstalledEnvironmentReceipt,
 		"placement_set":                 s.PlacementSet, "resolved_wheel_set": s.ResolvedWheelSet,
@@ -352,13 +352,13 @@ func Decode(control hub.ExactControlDocument, packageRef string) (Facts, *exit.E
 	}
 
 	release, err := canonical.ReadObject(s.BindingRelease.CanonicalBytes)
-	if err != nil || requireKeys(release, "descriptor", "documents", "package_execution_digest",
+	if err != nil || requireKeys(release, "package_descriptor", "documents", "package_execution_digest",
 		"environment_spec", "format", "installed_environment_receipt", "object_set_digest") != nil ||
 		release.Str("format") != bindingFormat || release.Str("package_execution_digest") != s.PackageExecutionDigest {
 		return facts, invalid("binding release is not the exact closed release: %v", err)
 	}
-	descriptorRef, err := refOf(release.Sub("descriptor"))
-	if err != nil || !sameRef(descriptorRef, s.Descriptor) {
+	descriptorRef, err := refOf(release.Sub("package_descriptor"))
+	if err != nil || !sameRef(descriptorRef, s.PackageDescriptor) {
 		return facts, invalid("binding release descriptor does not match the snapshot descriptor")
 	}
 	environmentRef, err := refOf(release.Sub("environment_spec"))
@@ -416,7 +416,7 @@ func Decode(control hub.ExactControlDocument, packageRef string) (Facts, *exit.E
 			placement.Str("placement_id"), s.AcquisitionAttemptID)
 	}
 	placementSpec := placement.Sub("spec")
-	if placementSpec.Str("package_descriptor_digest") != s.Descriptor.Digest ||
+	if placementSpec.Str("package_descriptor_digest") != s.PackageDescriptor.Digest ||
 		placementSpec.Str("environment_spec_digest") != s.EnvironmentSpec.Digest ||
 		placementSpec.Str("installed_environment_receipt_digest") != s.InstalledEnvironmentReceipt.Digest {
 		return facts, invalid("placement fixed digests disagree with the exact snapshot documents")
@@ -455,13 +455,13 @@ func Decode(control hub.ExactControlDocument, packageRef string) (Facts, *exit.E
 	}
 
 	bundle, err := canonical.ReadObject(s.PackageBundle.CanonicalBytes)
-	if err != nil || requireKeys(bundle, "descriptor", "package_release_id", "format",
+	if err != nil || requireKeys(bundle, "package_descriptor", "package_release_id", "format",
 		"project_wheel", "resolved_wheel_set", "source_archive", "source_lock", "wheelhouse_manifest") != nil ||
 		bundle.Str("format") != bundleFormat || bundle.Str("package_release_id") != placementSpec.Str("package_release_id") {
 		return facts, invalid("package bundle disagrees with the placement: %v", err)
 	}
-	bundleDescriptor, err := refOf(bundle.Sub("descriptor"))
-	if err != nil || !sameRef(bundleDescriptor, s.Descriptor) {
+	bundleDescriptor, err := refOf(bundle.Sub("package_descriptor"))
+	if err != nil || !sameRef(bundleDescriptor, s.PackageDescriptor) {
 		return facts, invalid("package bundle descriptor differs from the exact descriptor")
 	}
 	sourceArchive, archiveErr := refOf(bundle.Sub("source_archive"))
@@ -484,8 +484,8 @@ func Decode(control hub.ExactControlDocument, packageRef string) (Facts, *exit.E
 		return facts, invalid("installed-environment receipt does not close the selected environment: %v", err)
 	}
 
-	descriptor, problem := launch.DecodeDescriptor(s.Descriptor.CanonicalBytes)
-	if problem != nil || descriptor.Digest != s.Descriptor.Digest {
+	descriptor, problem := launch.DecodeDescriptor(s.PackageDescriptor.CanonicalBytes)
+	if problem != nil || descriptor.Digest != s.PackageDescriptor.Digest {
 		return facts, invalid("package descriptor is unreadable or has the wrong digest: %v", problem)
 	}
 	visible := map[string]*launch.Entrypoint{}
@@ -505,14 +505,14 @@ func Decode(control hub.ExactControlDocument, packageRef string) (Facts, *exit.E
 			continue
 		}
 		plan, err := canonical.ReadObject(document.CanonicalBytes)
-		if err != nil || requireKeys(plan, "bindings", "descriptor", "entrypoint", "format") != nil ||
+		if err != nil || requireKeys(plan, "bindings", "package_descriptor", "entrypoint", "format") != nil ||
 			plan.Str("format") != planFormat {
 			return facts, invalid("binding plan %s is not the closed canonical plan: %v", digest, err)
 		}
-		planDescriptor, err := refOf(plan.Sub("descriptor"))
+		planDescriptor, err := refOf(plan.Sub("package_descriptor"))
 		entrypoint := plan.Str("entrypoint")
 		ep := visible[entrypoint]
-		if err != nil || !sameRef(planDescriptor, s.Descriptor) || ep == nil ||
+		if err != nil || !sameRef(planDescriptor, s.PackageDescriptor) || ep == nil ||
 			boundEntrypoints[entrypoint] {
 			return facts, invalid("binding plan %s disagrees with the descriptor", digest)
 		}
@@ -575,14 +575,14 @@ func Decode(control hub.ExactControlDocument, packageRef string) (Facts, *exit.E
 		parts[2] != fmt.Sprintf("v%d", major) || parts[3] == "" || visible[parts[3]] == nil {
 		return facts, invalid("rental package_ref %q is not covered by the exact descriptor", packageRef)
 	}
-	facts.Descriptor = descriptor
+	facts.PackageDescriptor = descriptor
 	facts.PackageExecutionDigest = s.PackageExecutionDigest
 	facts.ArtifactObjectSetDigest = s.ArtifactObjectSet.Digest
 	facts.Placement = orchestrator.DesiredPlacement{
 		Package: repo.String(), ReleaseID: placementSpec.Str("package_release_id"),
 		// No InstallID: a remote placement resolves from Tensorhub's attempt, never a
 		// local install row; the attempt id rides PlacementIDValue.
-		PackageDescriptorDigest: s.Descriptor.Digest,
+		PackageDescriptorDigest: s.PackageDescriptor.Digest,
 		Bindings:                bindings, EnvironmentSpecDigest: s.EnvironmentSpec.Digest,
 		InstalledEnvironmentReceiptDigest: s.InstalledEnvironmentReceipt.Digest,
 		ExactPlacementSetDigest:           s.PlacementSet.Digest,

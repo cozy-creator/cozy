@@ -124,7 +124,7 @@ def relay(
 
 @app.entrypoint
 def video_transport(payload: VideoTransportInput) -> VideoTransportOutput:
-    """A descriptor-only seam for the remote byte-plane live proof.
+    """A package-descriptor-only seam for the remote byte-plane live proof.
 
     The fake remote worker consumes this request under an exact DeliveryGrant and emits a
     tiny MP4-shaped transport fixture. This handler deliberately refuses if somebody runs

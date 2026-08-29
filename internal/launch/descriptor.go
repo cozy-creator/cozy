@@ -41,9 +41,9 @@ import (
 const DescriptorFile = "descriptor.json"
 const descriptorFormat = "cozy.package.descriptor/1"
 
-// Descriptor is the closed PackageDescriptor/1 this host reads. Unknown fields refuse;
+// PackageDescriptor is the closed PackageDescriptor/1 this host reads. Unknown fields refuse;
 // Raw is normalized canonical JSON for control-plane transport and semantic identity.
-type Descriptor struct {
+type PackageDescriptor struct {
 	Format      string          `json:"format"`
 	Application string          `json:"application"`
 	Entrypoints []Entrypoint    `json:"entrypoints"`
@@ -402,7 +402,7 @@ func DescriptorPath(generationDir string) string {
 }
 
 // ReadDescriptor reads the private descriptor and joins it to the install record.
-func ReadDescriptor(path, expectDigest string) (*Descriptor, *exit.Error) {
+func ReadDescriptor(path, expectDigest string) (*PackageDescriptor, *exit.Error) {
 	data, err := os.ReadFile(path)
 	if err != nil {
 		return nil, exit.Named(exit.Structural, "descriptor_absent",
@@ -426,7 +426,7 @@ func ReadDescriptor(path, expectDigest string) (*Descriptor, *exit.Error) {
 // DecodeDescriptor reads the one closed descriptor/1 grammar and derives its canonical
 // semantic identity. Collection membership supplies callable kind; the document does not
 // repeat it.
-func DecodeDescriptor(data []byte) (*Descriptor, *exit.Error) {
+func DecodeDescriptor(data []byte) (*PackageDescriptor, *exit.Error) {
 	if len(data) > canonical.DocMax {
 		return nil, exit.New(exit.Validation, "%s exceeds the %d-byte cap", DescriptorFile, canonical.DocMax)
 	}
@@ -439,7 +439,7 @@ func DecodeDescriptor(data []byte) (*Descriptor, *exit.Error) {
 	}
 	decoder := json.NewDecoder(bytes.NewReader(normalized))
 	decoder.DisallowUnknownFields()
-	var d Descriptor
+	var d PackageDescriptor
 	if err := decoder.Decode(&d); err != nil {
 		return nil, exit.New(exit.Validation, "%s is not a descriptor document: %s", DescriptorFile, err)
 	}
@@ -471,7 +471,7 @@ func DecodeDescriptor(data []byte) (*Descriptor, *exit.Error) {
 }
 
 // Function finds one entrypoint or job by name.
-func (d *Descriptor) Function(name string) (*Entrypoint, *exit.Error) {
+func (d *PackageDescriptor) Function(name string) (*Entrypoint, *exit.Error) {
 	for i := range d.Entrypoints {
 		if d.Entrypoints[i].Name == name {
 			return &d.Entrypoints[i], nil
@@ -487,7 +487,7 @@ func (d *Descriptor) Function(name string) (*Entrypoint, *exit.Error) {
 }
 
 // Names is every callable this release registers.
-func (d *Descriptor) Names() []string {
+func (d *PackageDescriptor) Names() []string {
 	out := []string{}
 	for _, e := range d.Entrypoints {
 		out = append(out, e.Name)

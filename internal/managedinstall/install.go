@@ -145,7 +145,7 @@ func Run(ctx context.Context, layout home.Layout, store *records.Store, request 
 		docPaths[item.name] = path
 	}
 	descriptorPath := filepath.Join(docDir, "descriptor.json")
-	if problem := writeSemanticDocument(descriptorPath, grant.Descriptor); problem != nil {
+	if problem := writeSemanticDocument(descriptorPath, grant.PackageDescriptor); problem != nil {
 		return fail(problem)
 	}
 	docPaths["descriptor.json"] = descriptorPath
@@ -281,11 +281,11 @@ func Run(ctx context.Context, layout home.Layout, store *records.Store, request 
 		return fail(problem)
 	}
 	descriptorDigest := derivedDescriptor.Digest
-	if descriptorDigest != grant.Descriptor.Digest ||
-		!bytes.Equal(derivedDescriptor.Raw, grant.Descriptor.CanonicalBytes) {
+	if descriptorDigest != grant.PackageDescriptor.Digest ||
+		!bytes.Equal(derivedDescriptor.Raw, grant.PackageDescriptor.CanonicalBytes) {
 		return fail(exit.Named(exit.Structural, "managed_descriptor_mismatch",
 			"installed package derives descriptor %s; the published release grants %s with different bytes",
-			descriptorDigest, grant.Descriptor.Digest).
+			descriptorDigest, grant.PackageDescriptor.Digest).
 			WithRemedy("refuse this candidate; its qualified documents and installed project wheel do not describe the same package"))
 	}
 
@@ -295,7 +295,7 @@ func Run(ctx context.Context, layout home.Layout, store *records.Store, request 
 		SourceDigest: grant.PackageBundle.Digest, Verified: true, Dir: genDir,
 		Python: filepath.Join(base, receipt.Python), Runtime: runtimeBin, ProjectDir: projectDir,
 		LockDigest: grant.ResolutionLock.Digest, Platform: profile, LinkMode: "overlay",
-		Packages: len(wheelFiles), Closure: proof.Digest, Descriptor: descriptorDigest,
+		Packages: len(wheelFiles), Closure: proof.Digest, PackageDescriptor: descriptorDigest,
 	}
 	gen.BytesExcl, gen.BytesShared = install.Disk(genDir)
 	facts := records.ManagedProfileInstall{
@@ -795,7 +795,7 @@ func runProof(binary, request, receipt string, env []string) (proofOutput, *exit
 	return out, nil
 }
 
-func describe(runtime, project string, env []string) (*launch.Descriptor, *exit.Error) {
+func describe(runtime, project string, env []string) (*launch.PackageDescriptor, *exit.Error) {
 	cmd := exec.Command(runtime, "--json", "--dir", project, "describe")
 	cmd.Env = env
 	var stdout, stderr bytes.Buffer

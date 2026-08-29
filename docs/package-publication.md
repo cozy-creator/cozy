@@ -26,13 +26,13 @@ cozy package publish org/package \
 Creator syncs the locked dependencies into disposable storage with
 `uv sync --locked --no-install-project`, then runs that environment's exact
 `cozy-runtime --json --dir PROJECT describe`. The package project itself is not installed,
-so Runtime derives the descriptor without writing the source tree. Creator then
+so Runtime derives the package descriptor without writing the source tree. Creator then
 deterministically builds one `py3-none-any` project wheel. Its METADATA carries
 `Requires-Python` and `Requires-Dist` directly from `pyproject.toml`; `uv.lock` supplies the
 exact lock bytes. There is no public profile, GPU, or custom-wheel selection.
 
 Creator sends a canonical declaration containing only the source archive, lock, project
-wheel, and descriptor identities. Tensorhub returns presigned PUTs for missing objects;
+wheel, and package descriptor identities. Tensorhub returns presigned PUTs for missing objects;
 Creator uploads them concurrently and finalizes with the byte-identical declaration.
 Tensorhub derives compatible base worker profiles from package requirements and its own
 image inventory. Exact replay is idempotent.

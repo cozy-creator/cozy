@@ -172,8 +172,8 @@ func Run(l home.Layout, st *records.Store, req Request) (*Result, *exit.Error) {
 	if err := os.WriteFile(descriptorPath, descriptor.Raw, 0o600); err != nil {
 		return guard(exit.Internalf("cannot store private descriptor: %s", err))
 	}
-	gen.Descriptor = descriptor.Digest
-	mark("descriptor")
+	gen.PackageDescriptor = descriptor.Digest
+	mark("package_descriptor")
 
 	// Disk is measured once, here, and read back from the record forever after.
 	gen.BytesExcl, gen.BytesShared = Disk(genDir)
@@ -191,7 +191,7 @@ func Run(l home.Layout, st *records.Store, req Request) (*Result, *exit.Error) {
 // deriveDescriptor runs the generation's own Runtime over its source. Runtime emits the
 // complete descriptor without writing the source tree; Creator validates the closed grammar
 // and stores the canonical bytes under the immutable generation root.
-func deriveDescriptor(venvDir, sourceDir string) (*launch.Descriptor, *exit.Error) {
+func deriveDescriptor(venvDir, sourceDir string) (*launch.PackageDescriptor, *exit.Error) {
 	bin := home.VenvTool(venvDir, "cozy-runtime")
 	if _, err := os.Stat(bin); err != nil {
 		return nil, exit.Named(exit.Structural, "runtime_missing",

@@ -222,10 +222,10 @@ type localRole struct {
 func declarationRoles(pack *packagepublish.Package) map[string]localRole {
 	d := pack.Declaration
 	out := map[string]localRole{
-		"source_archive": {ref: d.SourceArchive, path: pack.Files["source_archive"]},
-		"source_lock":    {ref: d.SourceLock, path: pack.Files["source_lock"]},
-		"project_wheel":  {ref: packagepublish.ObjectRef{Digest: d.ProjectWheel.Digest, Length: d.ProjectWheel.Length}, path: pack.Files["project_wheel"]},
-		"descriptor":     {ref: d.Descriptor, path: pack.Files["descriptor"]},
+		"source_archive":     {ref: d.SourceArchive, path: pack.Files["source_archive"]},
+		"source_lock":        {ref: d.SourceLock, path: pack.Files["source_lock"]},
+		"project_wheel":      {ref: packagepublish.ObjectRef{Digest: d.ProjectWheel.Digest, Length: d.ProjectWheel.Length}, path: pack.Files["project_wheel"]},
+		"package_descriptor": {ref: d.PackageDescriptor, path: pack.Files["package_descriptor"]},
 	}
 	return out
 }

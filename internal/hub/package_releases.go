@@ -118,7 +118,7 @@ type LocalQualificationMaterials struct {
 	BaseRealization        BaseRealization   `json:"base_realization"`
 	PackageEnvironmentSpec ExactDocument     `json:"package_environment_spec"`
 	PackageBundle          ExactDocument     `json:"package_bundle"`
-	Descriptor             ExactDocument     `json:"descriptor"`
+	PackageDescriptor      ExactDocument     `json:"package_descriptor"`
 	WheelhouseManifest     ExactDocument     `json:"wheelhouse_manifest"`
 	ResolvedWheelSet       ExactDocument     `json:"resolved_wheel_set"`
 	ResolutionLock         ExactDocument     `json:"resolution_lock"`

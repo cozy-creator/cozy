@@ -47,9 +47,9 @@ esac
 	})
 	t.Run("job describe", func(t *testing.T) {
 		facts := launch.Facts{
-			Install:    records.PackageInstall{Package: "fake/slow"},
-			Descriptor: &launch.Descriptor{Jobs: []launch.Entrypoint{{Name: "slow"}}},
-			RuntimeCLI: runtime,
+			Install:           records.PackageInstall{Package: "fake/slow"},
+			PackageDescriptor: &launch.PackageDescriptor{Jobs: []launch.Entrypoint{{Name: "slow"}}},
+			RuntimeCLI:        runtime,
 		}
 		_, e := facts.Job("slow")
 		assertStalled(t, e)

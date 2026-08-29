@@ -66,7 +66,7 @@ func (f *Facts) JobSpec(function string, devices []string) (orchestrator.WorkerL
 			Package:                 f.Install.Package,
 			ReleaseID:               ReleaseID(f.Install),
 			InstallID:               f.Install.ID,
-			PackageDescriptorDigest: f.Install.Descriptor,
+			PackageDescriptorDigest: f.Install.PackageDescriptor,
 			Jobs: []*orchestrator.JobPlan{{
 				Function:        facts.Name,
 				DescriptorID:    facts.DescriptorID,
@@ -107,16 +107,16 @@ func (f *Facts) JobSpec(function string, devices []string) (orchestrator.WorkerL
 // default) — deletes with it.
 func (f *Facts) Job(function string) (*JobFacts, *exit.Error) {
 	var declared *Entrypoint
-	for i := range f.Descriptor.Jobs {
-		if f.Descriptor.Jobs[i].Name == function {
-			declared = &f.Descriptor.Jobs[i]
+	for i := range f.PackageDescriptor.Jobs {
+		if f.PackageDescriptor.Jobs[i].Name == function {
+			declared = &f.PackageDescriptor.Jobs[i]
 			break
 		}
 	}
 	if declared == nil {
 		return nil, exit.Named(exit.NotFound, "unknown_job",
 			"%s registers no job named %q", f.Install.Package, function).
-			WithRemedy("it registers: %s", strings.Join(f.Descriptor.Names(), ", ")).
+			WithRemedy("it registers: %s", strings.Join(f.PackageDescriptor.Names(), ", ")).
 			WithNext("cozy package list --full")
 	}
 	var said struct {

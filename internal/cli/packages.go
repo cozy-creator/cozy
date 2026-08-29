@@ -77,7 +77,7 @@ func handleInstall(ctx *Context) *exit.Error {
 		{K: "platform", V: g.Platform}, {K: "cuda_extra", V: orNone(g.Extra)},
 		{K: "link_mode", V: g.LinkMode}, {K: "packages", V: g.Packages},
 		{K: "closure", V: strings.ReplaceAll(g.Closure, "\n", " ")},
-		{K: "descriptor", V: g.Descriptor},
+		{K: "package_descriptor", V: g.PackageDescriptor},
 	}
 	if res.Idempotent {
 		return emit(ctx, compactRecord(fields, "package", "major", "version", "status", "changed"))
@@ -207,23 +207,23 @@ func handleLs(ctx *Context) *exit.Error {
 	}
 	for _, g := range rows {
 		l.Rows = append(l.Rows, map[string]string{
-			"package":    g.Package,
-			"major":      fmt.Sprintf("v%d", g.Major),
-			"version":    g.Version,
-			"generation": g.ID,
-			"disk":       diskText(g),
-			"exclusive":  output.Bytes(g.BytesExcl),
-			"shared":     output.Bytes(g.BytesShared),
-			"python":     g.Python,
-			"uv":         g.UV,
-			"cuda_extra": orNone(g.Extra),
-			"link_mode":  g.LinkMode,
-			"packages":   fmt.Sprintf("%d", g.Packages),
-			"closure":    strings.ReplaceAll(g.Closure, "\n", " "),
-			"descriptor": g.Descriptor,
-			"source":     g.SourceKind + " " + g.SourceRef,
-			"verified":   fmt.Sprintf("%t", g.Verified),
-			"installed":  g.CreatedAt,
+			"package":            g.Package,
+			"major":              fmt.Sprintf("v%d", g.Major),
+			"version":            g.Version,
+			"generation":         g.ID,
+			"disk":               diskText(g),
+			"exclusive":          output.Bytes(g.BytesExcl),
+			"shared":             output.Bytes(g.BytesShared),
+			"python":             g.Python,
+			"uv":                 g.UV,
+			"cuda_extra":         orNone(g.Extra),
+			"link_mode":          g.LinkMode,
+			"packages":           fmt.Sprintf("%d", g.Packages),
+			"closure":            strings.ReplaceAll(g.Closure, "\n", " "),
+			"package_descriptor": g.PackageDescriptor,
+			"source":             g.SourceKind + " " + g.SourceRef,
+			"verified":           fmt.Sprintf("%t", g.Verified),
+			"installed":          g.CreatedAt,
 		})
 	}
 	if len(l.Rows) == 0 {

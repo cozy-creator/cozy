@@ -59,7 +59,7 @@ func TestDecodeRefusesRetiredEvaluatedConfigFields(t *testing.T) {
 	if err := json.Unmarshal(fixture.ControlSnapshot.CanonicalBytes, &snapshot); err != nil {
 		t.Fatal(err)
 	}
-	snapshot["evaluated_config"] = snapshot["descriptor"]
+	snapshot["evaluated_config"] = snapshot["package_descriptor"]
 	raw, err := json.Marshal(snapshot)
 	if err != nil {
 		t.Fatal(err)
@@ -82,7 +82,7 @@ func TestDecodeRefusesRetiredEvaluatedConfigFields(t *testing.T) {
 	if err := json.Unmarshal(bundleDocument.CanonicalBytes, &bundle); err != nil {
 		t.Fatal(err)
 	}
-	bundle["evaluated_config"] = bundle["descriptor"]
+	bundle["evaluated_config"] = bundle["package_descriptor"]
 	changedBundle, err := json.Marshal(bundle)
 	if err != nil {
 		t.Fatal(err)

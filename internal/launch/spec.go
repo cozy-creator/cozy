@@ -35,25 +35,25 @@ const (
 
 // Facts is everything one package install needs to be served, gathered once.
 type Facts struct {
-	Install    records.PackageInstall
-	Source     string
-	Descriptor *Descriptor
-	RuntimeCLI RuntimeCLI
+	Install           records.PackageInstall
+	Source            string
+	PackageDescriptor *PackageDescriptor
+	RuntimeCLI        RuntimeCLI
 }
 
 // Read gathers a generation's facts: where its source is, the surface it proved at
 // install, and the runtime that proved it.
 func Read(gen records.PackageInstall, cozyHome string, env []string) (*Facts, *exit.Error) {
 	source := SourceDir(gen)
-	d, e := ReadDescriptor(DescriptorPath(gen.Dir), gen.Descriptor)
+	d, e := ReadDescriptor(DescriptorPath(gen.Dir), gen.PackageDescriptor)
 	if e != nil {
 		return nil, e
 	}
 	return &Facts{
-		Install:    gen,
-		Source:     source,
-		Descriptor: d,
-		RuntimeCLI: RuntimeCLI{Bin: Binary(gen), Dir: source, Home: cozyHome, Env: env},
+		Install:           gen,
+		Source:            source,
+		PackageDescriptor: d,
+		RuntimeCLI:        RuntimeCLI{Bin: Binary(gen), Dir: source, Home: cozyHome, Env: env},
 	}, nil
 }
 
@@ -116,10 +116,10 @@ func (f *Facts) Placement() (orchestrator.DesiredPlacement, *exit.Error) {
 		InstallID: f.Install.ID,
 		// The descriptor this install derived in the generation's own Runtime. It names
 		// the placement's surface by digest.
-		PackageDescriptorDigest: f.Install.Descriptor,
+		PackageDescriptorDigest: f.Install.PackageDescriptor,
 	}
-	for i := range f.Descriptor.Entrypoints {
-		ep := &f.Descriptor.Entrypoints[i]
+	for i := range f.PackageDescriptor.Entrypoints {
+		ep := &f.PackageDescriptor.Entrypoints[i]
 		var binding *orchestrator.Binding
 		if len(plans) > 0 {
 			p, ok := plans[ep.Name]
@@ -152,7 +152,7 @@ func (f *Facts) Placement() (orchestrator.DesiredPlacement, *exit.Error) {
 			"%s registers no entrypoint, and a worker with no plan to advertise has nothing to serve",
 			f.Install.Package).
 			WithRemedy("its functions: %s — an `@app.entrypoint` is what a request dispatches to",
-				strings.Join(f.Descriptor.Names(), ", "))
+				strings.Join(f.PackageDescriptor.Names(), ", "))
 	}
 	if len(plans) != len(placement.Bindings) && len(plans) > 0 {
 		return orchestrator.DesiredPlacement{}, exit.Internalf(

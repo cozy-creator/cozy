@@ -233,9 +233,9 @@ func Known(st *records.Store) func(string) (*orchestrator.DesiredPlacement, *exi
 	}
 }
 
-// Descriptor returns the exact remote descriptor already frozen into one
+// PackageDescriptor returns the exact remote descriptor already frozen into one
 // rental. It is the CLI payload surface for --worker; no local install is read.
-func Descriptor(st *records.Store, id string) (*launch.Descriptor, *exit.Error) {
+func PackageDescriptor(st *records.Store, id string) (*launch.PackageDescriptor, *exit.Error) {
 	row, e := st.RentalRow(id)
 	if e != nil {
 		return nil, e
@@ -250,7 +250,7 @@ func Descriptor(st *records.Store, id string) (*launch.Descriptor, *exit.Error) 
 	if e != nil {
 		return nil, e
 	}
-	return facts.Descriptor, nil
+	return facts.PackageDescriptor, nil
 }
 
 func unknown(id string) *exit.Error {

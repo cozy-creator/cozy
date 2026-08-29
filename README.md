@@ -117,7 +117,7 @@ remote root visible.
 
 ## Invoke packages and jobs
 
-Serving entrypoints and bounded jobs use the same command. Cozy reads the installed descriptor
+Serving entrypoints and bounded jobs use the same command. Cozy reads the installed package descriptor
 to determine the callable lifecycle:
 
 ```sh

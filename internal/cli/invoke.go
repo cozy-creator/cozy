@@ -86,7 +86,7 @@ func invocationIsJob(ctx *Context) (bool, *exit.Error) {
 	if problem != nil {
 		return false, problem
 	}
-	var descriptor *launch.Descriptor
+	var descriptor *launch.PackageDescriptor
 	if worker := strings.TrimSpace(ctx.Inv.Value("--worker")); worker != "" {
 		layout, problem := home.Open(ctx.Cfg.Home)
 		if problem != nil {
@@ -97,7 +97,7 @@ func invocationIsJob(ctx *Context) (bool, *exit.Error) {
 			return false, problem
 		}
 		defer store.Close()
-		descriptor, problem = rental.Descriptor(store, worker)
+		descriptor, problem = rental.PackageDescriptor(store, worker)
 		if problem != nil {
 			return false, problem
 		}
@@ -106,7 +106,7 @@ func invocationIsJob(ctx *Context) (bool, *exit.Error) {
 		if problem != nil {
 			return false, problem
 		}
-		descriptor = facts.Descriptor
+		descriptor = facts.PackageDescriptor
 	}
 	for _, job := range descriptor.Jobs {
 		if job.Name == target.Function {
@@ -849,7 +849,7 @@ func entrypointOf(ctx *Context, t Target) (*launch.Entrypoint, *exit.Error) {
 	if e != nil {
 		return nil, e
 	}
-	return facts.Descriptor.Function(t.Function)
+	return facts.PackageDescriptor.Function(t.Function)
 }
 
 func remoteEntrypointOf(ctx *Context, worker, function string) (*launch.Entrypoint, *exit.Error) {
@@ -862,7 +862,7 @@ func remoteEntrypointOf(ctx *Context, worker, function string) (*launch.Entrypoi
 		return nil, e
 	}
 	defer store.Close()
-	descriptor, e := rental.Descriptor(store, worker)
+	descriptor, e := rental.PackageDescriptor(store, worker)
 	if e != nil {
 		return nil, e
 	}
