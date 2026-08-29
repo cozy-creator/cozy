@@ -5,7 +5,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
-	"net"
 	"net/http"
 	"os"
 	"os/exec"
@@ -47,7 +46,7 @@ func TestMain(m *testing.M) {
 
 // ---------------------------------------------------------------- the in-process owner
 
-// owner is the REAL orchestrator and record owner on a fresh root — everything `cozy up`
+// owner is the REAL orchestrator and record owner on a fresh root — everything `cozy invoke list`
 // hosts, minus the HTTP transport a test that drives the orchestrator directly has no use
 // for.
 type owner struct {
@@ -94,7 +93,7 @@ func hostOwner(t *testing.T, name string) *owner {
 	return o
 }
 
-// close releases the root so a later `cozy up` on the same root is the only owner of it.
+// close releases the root so a later `cozy invoke list` on the same root is the only owner of it.
 func (o *owner) close() { o.once.Do(o.closer) }
 
 // fakeSpec is a worker slot whose process is internal/live/fakeworker speaking raw protocol
@@ -157,9 +156,9 @@ func countEvents(o *owner, substr string) int {
 	return n
 }
 
-// ------------------------------------------------------------- a real `cozy up` process
+// ------------------------------------------------------------- a real hidden controller process
 
-// service is one detached `cozy up` this suite owns. The separate process is the point:
+// service is one controller this suite owns. The separate process is the point:
 // the suite is a CLIENT, which is the seat a real client occupies.
 type service struct {
 	root, addr, token string
@@ -169,16 +168,16 @@ type service struct {
 func startService(t *testing.T, root string) *service {
 	t.Helper()
 	must(t, os.MkdirAll(root, 0o755))
-	port := freePort(t)
 	log, err := os.Create(filepath.Join(root, "service.log"))
 	must(t, err)
-	cmd := exec.Command("/usr/bin/nice", "-n", "19", cozyBin, "up", "--port", fmt.Sprint(port))
+	cmd := exec.Command(cozyBin)
+	cmd.Args[0] = "cozy-controller"
 	cmd.Env = childEnv(t, root)
 	cmd.Stdout, cmd.Stderr = log, log
 	setProcessGroup(cmd)
 	must(t, cmd.Start())
 
-	s := &service{root: root, addr: fmt.Sprintf("127.0.0.1:%d", port), cmd: cmd}
+	s := &service{root: root, cmd: cmd}
 	t.Cleanup(func() {
 		_ = killGroup(cmd.Process.Pid)
 		go func() { _ = cmd.Wait() }()
@@ -186,26 +185,23 @@ func startService(t *testing.T, root string) *service {
 	})
 	deadline := time.Now().Add(30 * time.Second)
 	for time.Now().Before(deadline) {
-		if s.alive() {
-			if data, err := os.ReadFile(filepath.Join(root, "client.cred")); err == nil {
-				s.token = strings.TrimSpace(string(data))
+		lock, lockErr := os.ReadFile(filepath.Join(root, "service.lock"))
+		credential, credentialErr := os.ReadFile(filepath.Join(root, "client.cred"))
+		if lockErr == nil && credentialErr == nil {
+			for _, line := range strings.Split(string(lock), "\n") {
+				if value, ok := strings.CutPrefix(line, "addr="); ok {
+					s.addr = strings.TrimSpace(value)
+				}
+			}
+			if s.addr != "" {
+				s.token = strings.TrimSpace(string(credential))
 				return s
 			}
 		}
 		time.Sleep(50 * time.Millisecond)
 	}
-	t.Fatalf("cozy up did not answer on %s in 30s\n%s", s.addr, tail(filepath.Join(root, "service.log")))
+	t.Fatalf("the Cozy controller did not publish its address in 30s\n%s", tail(filepath.Join(root, "service.log")))
 	return nil
-}
-
-func (s *service) alive() bool {
-	res, err := (&http.Client{Timeout: time.Second}).Get("http://" + s.addr + "/healthz")
-	if err != nil {
-		return false
-	}
-	defer res.Body.Close()
-	_, _ = io.Copy(io.Discard, res.Body)
-	return res.StatusCode == http.StatusOK
 }
 
 type reply struct {
@@ -313,14 +309,6 @@ func briefly(e *exit.Error) string {
 		return "accepted"
 	}
 	return e.Message
-}
-
-func freePort(t *testing.T) int {
-	t.Helper()
-	ln, err := net.Listen("tcp", "127.0.0.1:0") //cozy:allow the SUITE probes for a free port; the product binds through internal/api
-	must(t, err)
-	defer ln.Close()
-	return ln.Addr().(*net.TCPAddr).Port
 }
 
 func tail(path string) string {

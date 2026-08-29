@@ -1,6 +1,5 @@
-// Package exit is the ONE shared exit-code and typed-error layer for `cozy`.
-// The matrix is cozy-runtime-cli.md's verbatim (docs/exit-matrix.md is the frozen
-// copy the fence checks this file against). No local-only codes exist.
+// Package exit is the detailed domain/API refusal vocabulary. The CLI output
+// boundary preserves these names while projecting process exits to 0/1/2.
 package exit
 
 import (
@@ -88,16 +87,6 @@ func JobTerminal(state string) Code {
 	return Internal
 }
 
-// TerminalMapping renders the job terminal mapping line from the matrix itself.
-func TerminalMapping() string {
-	parts := []string{}
-	for _, s := range []string{"succeeded", "failed", "canceled", "deadline"} {
-		c := JobTerminal(s)
-		parts = append(parts, fmt.Sprintf("%s %d", s, int(c)))
-	}
-	return strings.Join(parts, " · ")
-}
-
 // Error is the one typed CLI error. Name may be more specific than the matrix
 // name (for example not_implemented under usage), but Code is always a matrix code.
 type Error struct {
@@ -143,19 +132,7 @@ func (e *Error) WithNext(next ...string) *Error {
 
 func Usagef(format string, args ...any) *Error       { return New(Usage, format, args...) }
 func Unavailablef(format string, args ...any) *Error { return New(Unavailable, format, args...) }
-func Confirmf(format string, args ...any) *Error     { return New(Confirm, format, args...) }
 func Internalf(format string, args ...any) *Error    { return New(Internal, format, args...) }
-
-// Of extracts the matrix code from any error; a non-typed error is a bug (1).
-func Of(err error) Code {
-	if err == nil {
-		return OK
-	}
-	if e, ok := err.(*Error); ok {
-		return e.Code
-	}
-	return Internal
-}
 
 // As returns err as a typed *Error, wrapping an untyped one as internal.
 func As(err error) *Error {

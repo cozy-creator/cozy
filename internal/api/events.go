@@ -60,11 +60,7 @@ func (s *Server) requestEvents(w http.ResponseWriter, r *http.Request) {
 	s.stream(w, r, id)
 }
 
-func (s *Server) multiplexedEvents(w http.ResponseWriter, r *http.Request) {
-	s.stream(w, r, "")
-}
-
-// stream is the one implementation. `requestID == ""` is the multiplexed stream.
+// stream serves one request's durable and live events.
 func (s *Server) stream(w http.ResponseWriter, r *http.Request, requestID string) {
 	flusher, ok := w.(http.Flusher)
 	if !ok {

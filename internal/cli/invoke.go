@@ -32,7 +32,7 @@ import (
 // client API. There is no direct-Go path from a verb to the orchestrator: `dial` is the
 // only way into any of them, and what it returns speaks HTTP to a separate process.
 //
-// ONE PRODUCT EXECUTION PATH. `cozy run` is
+// ONE PRODUCT EXECUTION PATH. `cozy invoke run` is
 //
 //	POST /v1/requests            durable request, idempotency key + body digest
 //	GET  /v1/requests/{id}/events  the attempt's own lifecycle, terminal-stop
@@ -49,266 +49,6 @@ func dial(ctx *Context) (*localapi.Client, *exit.Error) {
 	return localapi.Open(ctx.Cfg, ctx.Service)
 }
 
-// ---------------------------------------------------------------------- start / stop
-
-func handleStart(ctx *Context) *exit.Error {
-	c, e := dial(ctx)
-	if e != nil {
-		return e
-	}
-	ref := ctx.Inv.Args[0]
-	began := time.Now()
-	res, e := c.EnsureWorker(ref, !ctx.Inv.Bool("--no-warm"))
-	if e != nil {
-		return e
-	}
-	fields := []output.Field{
-		{K: "endpoint", V: res.Endpoint},
-		{K: "instance", V: res.InstanceID},
-	}
-	fields = append(fields, output.Field{K: "change", V: res.Change})
-	if res.Change == "none" {
-		// Already serving = idempotent 0 (cozy-creator.md). It is a STATE this verb
-		// reports, not a refusal it raises.
-		return emit(ctx, output.Record{Kind: "worker",
-			Fields: append(fields, output.Field{K: "state", V: "resident"}),
-			Notes:  []string{res.Note}, Next: []string{"cozy run " + ref + "/<function>"}})
-	}
-	// `-d` returns as soon as the process is spawned; the default WAITS for the worker to
-	// advertise a dispatchable plan, because "started" and "warm" are different facts and
-	// a prewarm verb that returned on the first is useless.
-	if ctx.Inv.Bool("--detach") {
-		return emit(ctx, output.Record{Kind: "worker",
-			Fields: append(fields, output.Field{K: "state", V: "spawned"}),
-			Notes:  []string{res.Note}, Next: []string{"cozy status"}})
-	}
-	worker, e := waitReady(c, res.InstanceID)
-	if e != nil {
-		return e
-	}
-	return emit(ctx, output.Record{Kind: "worker", Fields: append(fields,
-		output.Field{K: "state", V: "ready"},
-		output.Field{K: "pid", V: worker.PID},
-		output.Field{K: "devices", V: worker.Devices},
-		output.Field{K: "ready_plans", V: len(worker.Plans)},
-		output.Field{K: "took", V: took(began)}),
-		Next: []string{"cozy run " + ref + "/<function>"}})
-}
-
-// waitReady polls the workers listing until the protocol says dispatchable. The fact is
-// the WORKER's own — the placement's SERVING AXIS at DISPATCHABLE plus at least one
-// advertised plan — read through the API, never a clock and never "the process is alive".
-//
-// It said "never a clock" while holding one: a 10-minute ceiling, which is a statement
-// about how large a model may be rather than about anything having gone wrong. The ways
-// this fails are all the worker's own and all visible through the listing — it EXITS, it
-// goes SILENT, reports a FAILED axis, or this owner REFUSED it — which is the same set
-// `orchestrator.EnsurePlacementReady` decides on, so the two sides of the same wait cannot
-// disagree.
-func waitReady(c *localapi.Client, instance string) (localapi.Worker, *exit.Error) {
-	silent := (orchestrator.SilentReports * orchestrator.ReportCadence).Milliseconds()
-	for {
-		// THIS OWNER'S OWN VERDICT COMES FIRST, exactly as it does inside the orchestrator:
-		// a worker whose claim was refused here is not slow and not silent, and waiting out
-		// eight missed report periods to call it stalled would report a network symptom for
-		// an identity fact this process already established.
-		workers, e := c.Workers()
-		if e != nil {
-			return localapi.Worker{}, e
-		}
-		found := false
-		for _, w := range workers {
-			if w.InstanceID != instance {
-				continue
-			}
-			found = true
-			if w.Exited {
-				return localapi.Worker{}, exit.New(exit.Failed,
-					"the endpoint worker exited before advertising a plan").
-					WithRemedy("its log is under the local root's workers/%s", instance).
-					WithNext("cozy logs <org/endpoint>")
-			}
-			if w.Dispatchable() {
-				return w, nil
-			}
-			if w.Refusal != "" {
-				// A refusal this host recorded at claim time is a SETTLED verdict, not a
-				// state the worker might leave — so it answers now instead of after eight
-				// missed report periods. A FAILED axis is the worker's settled verdict below.
-				return localapi.Worker{}, exit.New(exit.Conflict,
-					"this host refused the worker at that address: %s", w.Refusal).
-					WithNext("cozy logs <org/endpoint>")
-			}
-			if w.QuietMS > silent {
-				return localapi.Worker{}, exit.Named(exit.Failed, "worker_silent",
-					"the endpoint worker has reported no observed state for %d ms, which is %d missed "+
-						"periods of %s: it is stalled, not slow", w.QuietMS,
-					orchestrator.SilentReports, orchestrator.ReportCadence).
-					WithNext("cozy logs <org/endpoint>")
-			}
-			if w.Phase == "FAILED" || w.Materialization == "FAILED" {
-				return localapi.Worker{}, exit.New(exit.Failed,
-					"the endpoint worker's placement reported a terminal fault and cannot "+
-						"become dispatchable: %s", w.Fault).
-					WithNext("cozy logs <org/endpoint>")
-			}
-		}
-		if !found {
-			return localapi.Worker{}, exit.New(exit.Failed,
-				"worker %s is no longer registered with the orchestrator", instance)
-		}
-		time.Sleep(100 * time.Millisecond)
-	}
-}
-
-func handleStop(ctx *Context) *exit.Error {
-	c, e := dial(ctx)
-	if e != nil {
-		return e
-	}
-	all := ctx.Inv.Bool("--all")
-	if !all && len(ctx.Inv.Args) == 0 {
-		return exit.Usagef("`cozy stop` needs <org/endpoint> or --all").
-			WithNext("cozy help stop")
-	}
-	workers, e := c.Workers()
-	if e != nil {
-		return e
-	}
-	target := ""
-	if !all {
-		target = ctx.Inv.Args[0]
-	}
-	stopped, rows := 0, []map[string]string{}
-	for _, w := range workers {
-		if !all && w.Endpoint != target {
-			continue
-		}
-		// The DRAIN happens on the orchestrator's side of this call and it BLOCKS: the
-		// route returns after the whole process group has gone. A remembered pid is
-		// never signalled from here — the orchestrator stops what the orchestrator started.
-		res, e := c.ShutdownWorker(w.InstanceID)
-		if e != nil {
-			return e
-		}
-		if res.Stopped {
-			stopped++
-		}
-		rows = append(rows, map[string]string{
-			"endpoint": w.Endpoint, "instance": w.InstanceID,
-			"stopped": fmt.Sprintf("%t", res.Stopped), "pid": itoa(w.PID),
-		})
-	}
-	l := output.List{Kind: "stop",
-		Fields:     []string{"endpoint", "instance", "stopped"},
-		AllFields:  []string{"endpoint", "instance", "stopped", "pid"},
-		Rows:       rows,
-		Empty:      "0 workers to stop",
-		Aggregates: []output.Field{{K: "stopped", V: stopped}},
-	}
-	if len(rows) == 0 {
-		// Not running is an idempotent 0, and it says which fact it is answering.
-		l.Notes = []string{"nothing was running: `cozy stop` is idempotent"}
-	}
-	return emit(ctx, l)
-}
-
-// ---------------------------------------------------------------------------- logs
-
-func handleLogs(ctx *Context) *exit.Error {
-	subject := ctx.Inv.Args[0]
-	// A PATH-SHAPED attempt input refuses (cozy-creator.md). Triage is addressed by the
-	// orchestrator's OPAQUE attempt key; there is no path form, and the route this verb
-	// calls takes no path parameter at all.
-	if strings.ContainsAny(subject, "/\\") && !looksLikeEndpoint(subject) {
-		return exit.Usagef("%q is a path, and an attempt is named by its opaque key", subject).
-			WithRemedy("`cozy run` prints the attempt key; `cozy status --full` lists them").
-			WithNext("cozy help logs")
-	}
-	c, e := dial(ctx)
-	if e != nil {
-		return e
-	}
-	if looksLikeEndpoint(subject) {
-		return endpointLog(ctx, c, subject)
-	}
-	t, e := c.Triage(subject)
-	if e != nil {
-		return e
-	}
-	// `explain` is the SERVER's projection of the bundle, verified against the accepted
-	// terminal before it was rendered. This prints it; it re-explains nothing.
-	if ctx.Mode().JSON {
-		return emit(ctx, output.Record{Kind: "triage", Fields: []output.Field{
-			{K: "attempt_key", V: t.AttemptKey}, {K: "subject_id", V: t.SubjectID},
-			{K: "length", V: t.Length}, {K: "digest", V: t.Digest},
-			{K: "verified", V: t.Verified}, {K: "explain", V: t.Explain},
-			{K: "bundle", V: t.Bundle},
-		}})
-	}
-	return emit(ctx, output.Lines{Kind: "triage", Key: "explain", Items: t.Explain,
-		Empty: "the bundle carries no explainable section",
-		Extra: []output.Field{
-			{K: "attempt_key", V: t.AttemptKey},
-			{K: "subject_id", V: t.SubjectID},
-			{K: "bytes", V: output.Bytes(t.Length)},
-			{K: "verified", V: t.Verified},
-		},
-		Notes: []string{"verified on read against what the accepted terminal declared"},
-		Next:  []string{"cozy logs " + t.AttemptKey + " --json"}})
-}
-
-func looksLikeEndpoint(s string) bool {
-	org, name, ok := strings.Cut(s, "/")
-	return ok && org != "" && name != "" && !strings.Contains(name, "/") && !strings.HasPrefix(s, ".")
-}
-
-// endpointLog tails one endpoint worker's process log. The log is a FILE in the local
-// root the orchestrator owns; the worker listing is what says which instance owns it, so
-// the path is derived from an identity the server issued and never from user input.
-func endpointLog(ctx *Context, c *localapi.Client, endpoint string) *exit.Error {
-	workers, e := c.Workers()
-	if e != nil {
-		return e
-	}
-	instance := ""
-	for _, w := range workers {
-		if w.Endpoint == endpoint {
-			instance = w.InstanceID
-		}
-	}
-	if instance == "" {
-		return exit.New(exit.NotFound, "no worker of %s is running on this host", endpoint).
-			WithRemedy("an endpoint's process log exists while its worker does; an attempt's triage bundle outlives it").
-			WithNext("cozy start "+endpoint, "cozy status")
-	}
-	l, e := home.Open(ctx.Cfg.Home)
-	if e != nil {
-		return e
-	}
-	path := filepath.Join(l.WorkerDir(instance), "worker.log")
-	lines := 100
-	if v := ctx.Inv.Value("--lines"); v != "" {
-		n := 0
-		if _, err := fmt.Sscanf(v, "%d", &n); err != nil || n <= 0 {
-			return exit.Usagef("--lines %q is not a positive count", v)
-		}
-		lines = n
-	}
-	data, err := os.ReadFile(path)
-	if err != nil {
-		return exit.New(exit.NotFound, "worker %s has no log at %s", instance, path)
-	}
-	all := strings.Split(strings.TrimRight(string(data), "\n"), "\n")
-	if len(all) > lines {
-		all = all[len(all)-lines:]
-	}
-	return emit(ctx, output.Lines{Kind: "log", Key: "lines", Items: all,
-		Empty: "the worker log is empty",
-		Extra: []output.Field{{K: "endpoint", V: endpoint}, {K: "instance", V: instance}},
-		Notes: []string{"the orchestrator-owned process log; an attempt's triage bundle is `cozy logs <attempt>`"}})
-}
-
 // ----------------------------------------------------------------------------- run
 
 func handleInvokeRun(ctx *Context) *exit.Error {
@@ -320,6 +60,9 @@ func handleInvokeRun(ctx *Context) *exit.Error {
 		if len(ctx.Inv.Values["--input"]) > 0 {
 			return exit.Usagef("--input-tree applies only to a job callable")
 		}
+		if ctx.Inv.Value("--org") != "" {
+			return exit.Usagef("--org applies only to a job callable")
+		}
 		return handleRun(ctx)
 	}
 	if ctx.Inv.Value("--worker") != "" {
@@ -327,12 +70,10 @@ func handleInvokeRun(ctx *Context) *exit.Error {
 			"private rental dispatch for job callables is not implemented").
 			WithRemedy("run this job locally, or choose a serving entrypoint on the rental")
 	}
-	if ctx.Inv.Bool("--offline") || ctx.Inv.Bool("--stream") ||
-		len(ctx.Inv.Values["--asset"]) > 0 || ctx.Inv.Value("--out") != "" ||
-		ctx.Inv.Value("--adapter") != "" || ctx.Inv.Value("--lane") != "" ||
-		ctx.Inv.Value("--seed") != "" {
+	if ctx.Inv.Bool("--stream") || len(ctx.Inv.Values["--asset"]) > 0 ||
+		ctx.Inv.Value("--out") != "" || ctx.Inv.Value("--timeout") != "" {
 		return exit.Usagef("the selected callable is a job and received a serving-only flag").
-			WithRemedy("jobs accept payload values, --in, --input-tree, --model, --org, --detach, and placement")
+			WithRemedy("jobs accept payload values, --in, --input-tree, --org, --detach, and local execution")
 	}
 	if !ctx.Inv.Bool("--detach") {
 		ctx.Inv.Bools["--follow"] = true
@@ -379,46 +120,9 @@ func invocationIsJob(ctx *Context) (bool, *exit.Error) {
 }
 
 func handleRun(ctx *Context) *exit.Error {
-	if ctx.Inv.Bool("--cloud") {
-		// PLACEMENT IS A CLIENT-BOUNDARY CHOICE, and the cloud host does not exist yet:
-		// Launch-1 tensorhub is a headless distribution hub with no request plane
-		// (decisions #229). Refusing by name beats a flag that silently runs locally.
-		return exit.Named(exit.Usage, "not_implemented",
-			"--cloud names a host this build cannot submit to").
-			WithRemedy("Launch-1 tensorhub carries no request plane; the serving routes land with th-004+").
-			WithNext("cozy run " + ctx.Inv.Args[0] + " --local")
-	}
 	target, e := parseTarget(ctx.Inv.Args[0])
 	if e != nil {
 		return e
-	}
-	// Overrides refuse HERE as well as at the API, and for the same reason: nothing
-	// resolves one until cl-005, and an override that is silently ignored is the worse
-	// bug. The refusal is the CLIENT's so it costs no round trip.
-	for _, flag := range []string{"--model", "--lane", "--adapter"} {
-		if v := ctx.Inv.Value(flag); v != "" {
-			return exit.Named(exit.Usage, "override_unresolved",
-				"%s is admissible on this host and nothing resolves one yet", flag).
-				WithRemedy("the local binding resolver lands with cl-005; this build refuses rather than ignoring it")
-		}
-	}
-	// TWO RUNTIME FLAGS HAVE NO WIRE FIELD, and they refuse rather than being dropped.
-	// `--seed` and `--offline` are cozy-runtime's own (a deterministic RNG at construction,
-	// a CAS-only acquisition), and the submission this host makes carries neither — the
-	// ExecutionSpec's key set is closed and adding a member is a th-024 change. A flag
-	// silently ignored is the failure mode `override_unresolved` exists to prevent, and
-	// these are the same shape.
-	if v := ctx.Inv.Value("--seed"); v != "" {
-		return exit.Named(exit.Usage, "not_implemented",
-			"--seed names the runtime's construction RNG and no wire field carries it").
-			WithRemedy("if the endpoint declares a seed field, pass it as payload: `seed=%s`", v).
-			WithNext("cozy describe <org/endpoint>/<function>")
-	}
-	if ctx.Inv.Bool("--offline") {
-		return exit.Named(exit.Usage, "not_implemented",
-			"--offline is the runtime's CAS-only acquisition mode and no wire field carries it").
-			WithRemedy("this host serves what its local artifact index already holds; a miss refuses at start").
-			WithNext("cozy-runtime run <fn> --offline (the standalone door)")
 	}
 	deadline, e := runDeadline(ctx)
 	if e != nil {
@@ -481,11 +185,11 @@ func handleRun(ctx *Context) *exit.Error {
 	}
 
 	stream := ctx.Inv.Bool("--stream")
-	if !stream && !ctx.Mode().JSON {
-		fmt.Fprintf(ctx.Out, "request %s · attempt %d · %s\n",
+	if !stream {
+		fmt.Fprintf(ctx.Err, "request %s · attempt %d · %s\n",
 			handle.RequestID, handle.Attempt, handle.Status)
 		if handle.Replay {
-			fmt.Fprintln(ctx.Out, "note: this key was already recorded — the SAME request answered, nothing new started")
+			fmt.Fprintln(ctx.Err, "note: this key returned the existing invocation")
 		}
 	}
 
@@ -694,7 +398,7 @@ func (p *runProgress) on(e localapi.Event) bool {
 	if p.stream {
 		data, err := json.Marshal(e)
 		if err == nil {
-			fmt.Fprintln(p.ctx.Out, string(data))
+			fmt.Fprintln(p.ctx.Err, string(data))
 		}
 		return true
 	}
@@ -706,7 +410,7 @@ func (p *runProgress) on(e localapi.Event) bool {
 		return true
 	}
 	p.last, p.dirty = line, true
-	// stderr, deliberately: stdout carries the RESULT, so a piped `cozy run` is not
+	// stderr, deliberately: stdout carries the RESULT, so a piped `cozy invoke run` is not
 	// polluted by the progress of producing it.
 	fmt.Fprintf(p.ctx.Err, "\r\033[K%s", line)
 	return true
@@ -768,7 +472,7 @@ func saveOutputs(ctx *Context, c *localapi.Client, life api.Lifecycle) ([]map[st
 }
 
 // saveOutputsAt is the one verified local-download path for ordinary requests and
-// workflow exports: every output is received through the opaque media API, hashed
+// accepted result downloads: every output is received through the opaque media API, hashed
 // independently, checked against the request manifest, and published as one set.
 func saveOutputsAt(c *localapi.Client, life api.Lifecycle, dir string) ([]map[string]string, *exit.Error) {
 	if dir == "" || len(life.Outputs) == 0 {
@@ -922,25 +626,6 @@ func receiveVerified(path string, expectedLength int64, expectedDigest string,
 }
 
 // syncTree fsyncs every directory under root, children before parents.
-func syncTree(root string) *exit.Error {
-	var dirs []string
-	err := filepath.WalkDir(root, func(path string, entry os.DirEntry, err error) error {
-		if err == nil && entry.IsDir() {
-			dirs = append(dirs, path)
-		}
-		return err
-	})
-	if err != nil {
-		return exit.Internalf("cannot inspect staged directory %s: %s", root, err)
-	}
-	for index := len(dirs) - 1; index >= 0; index-- {
-		if e := syncDirectory(dirs[index]); e != nil {
-			return e
-		}
-	}
-	return nil
-}
-
 func syncDirectory(path string) *exit.Error {
 	if runtime.GOOS == "windows" {
 		return nil
@@ -1051,14 +736,9 @@ func renderRun(ctx *Context, life api.Lifecycle, terminal *localapi.Event, stopp
 	code := exit.JobTerminal(mapTerminal(status))
 	if code == exit.OK {
 		if life.Triage != nil {
-			rec.Next = []string{"cozy logs " + life.Triage.AttemptKey}
+			rec.Next = []string{"cozy invoke list --full"}
 		}
 		return emit(ctx, rec)
-	}
-	// A FAILING terminal is still an ANSWER: the whole record is printed before the
-	// typed refusal, so a failure carries its metrics, its attempt key and its outputs.
-	if err := rec.Emit(ctx.Out, ctx.Mode()); err != nil && !ctx.Mode().JSON {
-		return exit.As(err)
 	}
 	e := exit.Named(code, status, "request %s ended %s", life.RequestID, status)
 	errType, why := life.ErrorType, life.Error
@@ -1075,7 +755,7 @@ func renderRun(ctx *Context, life api.Lifecycle, terminal *localapi.Event, stopp
 	}
 	if life.Triage != nil {
 		e.WithRemedy("the retained triage bundle explains it").
-			WithNext("cozy logs " + life.Triage.AttemptKey)
+			WithNext("cozy invoke list --full")
 	}
 	return e
 }
@@ -1090,10 +770,6 @@ func mapTerminal(status string) string {
 		return "failed"
 	}
 	return status
-}
-
-func took(began time.Time) string {
-	return fmt.Sprintf("%.2fs", time.Since(began).Seconds())
 }
 
 // mintKey mints this invocation's idempotency key. One key names one request forever, so
@@ -1125,7 +801,7 @@ func parseTarget(raw string) (Target, *exit.Error) {
 	parts := strings.Split(strings.TrimSpace(raw), "/")
 	usage := exit.Usagef("%q is not org/endpoint/vN/function", raw).
 		WithRemedy("the semver-major is a required path segment — it resolves through that endpoint's serving pointer").
-		WithNext("cozy ls", "cozy help run")
+		WithNext("cozy endpoint list", "cozy help run")
 	if len(parts) != 4 {
 		return Target{}, usage
 	}
@@ -1200,8 +876,8 @@ func generationFacts(ctx *Context, endpoint string, major int) (*launch.Facts, *
 	}
 	if len(pins) == 0 {
 		return nil, exit.New(exit.NotFound, "%s is not installed on this host", endpoint).
-			WithRemedy("`cozy ls` lists what is").
-			WithNext("cozy install "+endpoint, "cozy ls")
+			WithRemedy("`cozy endpoint list` lists what is").
+			WithNext("cozy endpoint install "+endpoint, "cozy endpoint list")
 	}
 	chosen, found := pins[0], major == 0
 	for _, p := range pins {
@@ -1212,7 +888,7 @@ func generationFacts(ctx *Context, endpoint string, major int) (*launch.Facts, *
 	if !found {
 		return nil, exit.New(exit.NotFound, "%s is installed, but not at v%d", endpoint, major).
 			WithRemedy("installed majors: %s", majorsOf(pins)).
-			WithNext("cozy ls")
+			WithNext("cozy endpoint list")
 	}
 	gen, e := store.Install(chosen.InstallID)
 	if e != nil {

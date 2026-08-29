@@ -87,6 +87,7 @@ func Run(args []string, stdout, stderr io.Writer) int {
 	}
 
 	args = helpArgs(args)
+	wantsJSON := jsonRequested(args)
 	var grammar CLI
 	helpExit := -1
 	parser, err := kong.New(&grammar,
@@ -101,7 +102,7 @@ func Run(args []string, stdout, stderr io.Writer) int {
 		}),
 		kong.ConfigureHelp(kong.HelpOptions{Compact: true, FlagsLast: true, WrapUpperBound: 100}),
 	)
-	mode := output.Mode{}
+	mode := output.Mode{JSON: wantsJSON}
 	if err != nil {
 		problem := output.NewError(output.Operational, "cli.grammar", err.Error())
 		_ = output.EmitError(stdout, problem, mode)
@@ -109,7 +110,7 @@ func Run(args []string, stdout, stderr io.Writer) int {
 	}
 
 	parsed, err := parser.Parse(args)
-	mode = output.Mode{JSON: grammar.JSON, Full: grammar.Full, Fields: grammar.Fields}
+	mode = output.Mode{JSON: wantsJSON || grammar.JSON, Full: grammar.Full, Fields: grammar.Fields}
 	if helpExit >= 0 {
 		return helpExit
 	}
@@ -138,6 +139,18 @@ func Run(args []string, stdout, stderr io.Writer) int {
 		return output.ShellCode(problem)
 	}
 	return 0
+}
+
+func jsonRequested(args []string) bool {
+	for _, arg := range args {
+		if arg == "--" {
+			return false
+		}
+		if arg == "--json" {
+			return true
+		}
+	}
+	return false
 }
 
 func helpArgs(args []string) []string {

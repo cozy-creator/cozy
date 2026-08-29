@@ -175,7 +175,7 @@ type DesiredPlacement struct {
 	ExactPlacementSetBytes            []byte `json:"exact_placement_set_bytes,omitempty"`
 	// PlacementRevision is Tensorhub's monotonic revision for a private rental. It is
 	// the exact DesiredWorkerState.revision Creator relays for remote placements, so Hub
-	// can compare desired, accepted, and converged without guessing a LocalService counter.
+	// can compare desired, accepted, and converged without guessing a local controller counter.
 	PlacementRevision    uint64 `json:"placement_revision,omitempty"`
 	PlacementIDValue     string `json:"placement_id,omitempty"`
 	ModelObjectSetDigest string `json:"model_object_set_digest,omitempty"`
@@ -496,7 +496,7 @@ func (w *worker) observeJobs(n int) {
 // a slot already hosting this placement is `none`, a slot that exists without it converges
 // and is `placement_added`, and only an absent slot is spawned or connected.
 //
-// The three answers are not decoration. `cozy start` and POST /v1/local/workers both need
+// The three answers are not decoration. `cozy invoke run` and POST /v1/local/workers both need
 // to tell an idempotent no-op from a real convergence, and a boolean `resident` could only
 // tell them "it was there", which is true of both.
 func (c *Orchestrator) EnsureWorker(spec WorkerLaunchSpec) (string, WorkerChange, *exit.Error) {
@@ -538,7 +538,7 @@ func (c *Orchestrator) EnsureWorker(spec WorkerLaunchSpec) (string, WorkerChange
 				"rental.placement_revision_required",
 				"rental %s is claimed with another desired placement",
 				live.spec.Connection.RentalID).
-				WithRemedy("use `cozy rent revise %s --endpoint-ref ...`; remote desired state always follows its active grant",
+				WithRemedy("use `cozy rental list %s --endpoint-ref ...`; remote desired state always follows its active grant",
 					live.spec.Connection.RentalID)
 		}
 		if e := c.ConvergePlacementSet(instanceID, []DesiredPlacement{spec.Placement}); e != nil {
@@ -567,7 +567,7 @@ func (c *Orchestrator) EnsureWorker(spec WorkerLaunchSpec) (string, WorkerChange
 // actual hardware readback before a request can be submitted to the pod.
 func (c *Orchestrator) EnsureRental(id string) (string, string, WorkerChange, *exit.Error) {
 	if c.opt.Rentals == nil {
-		return "", "", ChangeNone, exit.Unavailablef("this LocalService attaches no rented workers")
+		return "", "", ChangeNone, exit.Unavailablef("this local controller attaches no rented workers")
 	}
 	target, problem := c.opt.Rentals(id)
 	if problem != nil {
@@ -884,7 +884,7 @@ func (c *Orchestrator) connectWorker(spec WorkerLaunchSpec) (string, *exit.Error
 			WithRemedy("a rented pod runs its worker and a co-resident media server " +
 				"(cl-014); this host will not fall back to granting paths on its own disk, " +
 				"because the pod cannot reach them").
-			WithNext("cozy rent ls")
+			WithNext("cozy rental list")
 	}
 	// THE SAME SILENCE BUDGET THE CONTROL LEG LIVES UNDER. One pod, two listeners, one
 	// standard for "has not answered": a byte plane that misses what eight report periods
@@ -1182,7 +1182,7 @@ func (c *Orchestrator) Worker(instanceID string) *WorkerFacts {
 }
 
 // Workers is every worker this service currently owns — the LOCAL extension module's
-// listing (cl-006) and `cozy status`'s source.
+// listing (cl-006) and `cozy invoke list`'s source.
 func (c *Orchestrator) Workers() []WorkerFacts {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -1269,7 +1269,7 @@ type ArtifactSubjectFacts struct {
 
 // trimEnum renders a protocol enum by its own name, minus the type prefix proto3's
 // package-level value scoping forces onto it. The NUMBERS are normative; this is for a
-// person reading `cozy status`.
+// person reading `cozy invoke list`.
 func trimEnum(name, prefix string) string {
 	if name == "" {
 		return "UNSPECIFIED"
@@ -1296,28 +1296,6 @@ func keysOf(m map[string]bool) []string {
 // become ready, and 30 s on the API route, with nothing anywhere saying why the same
 // SIGTERM deserved three budgets.
 const StopGrace = 30 * time.Second
-
-// RetirePlacement converges a live worker onto the desired set WITHOUT this placement —
-// the honest first half of taking one out of service, and a verb of its own because it is
-// not the same act as ending a process (#484). The worker drains what it holds; nothing
-// here waits, because a drain's completion is an OBSERVED fact (converged_revision) and
-// not something a caller can be told synchronously.
-//
-// Retiring the only placement leaves an empty set, which is a worker hosting nothing —
-// legal, and what a slot being replaced should look like before its process is stopped.
-func (c *Orchestrator) RetirePlacement(instanceID, placementID string) *exit.Error {
-	c.mu.Lock()
-	w := c.workers[instanceID]
-	c.mu.Unlock()
-	if w == nil {
-		return exit.New(exit.NotFound, "no worker %s on this host", instanceID)
-	}
-	if w.placementID != placementID {
-		return exit.New(exit.NotFound, "worker %s hosts placement %s, not %s",
-			instanceID, w.placementID, placementID)
-	}
-	return c.retireWorker(w)
-}
 
 // retireWorker is the generation-fenced retirement used by the stall path. A recovered
 // worker intentionally reuses instance and placement ids; only the exact object whose

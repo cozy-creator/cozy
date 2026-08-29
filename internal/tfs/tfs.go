@@ -57,7 +57,7 @@ func Open(cfg config.Config, layout home.Layout) (*Tool, *exit.Error) {
 		return nil, exit.Named(exit.Structural, "tfs_missing",
 			"the tensorfs CLI %q is not on PATH: %s", cfg.Tfs, err).
 			WithRemedy("build it from the tensorfs repo (cargo build --release -p tensorfs-core --bin tfs) and set COZY_TFS to the binary").
-			WithNext("COZY_TFS=/path/to/tfs cozy hub status")
+			WithNext("COZY_TFS=/path/to/tfs cozy endpoint search")
 	}
 	t := &Tool{Bin: bin, Root: layout.CAS, Source: cfg.TfsSource, env: cfg.Tool()}
 	if err := os.MkdirAll(t.Root, 0o755); err != nil {
@@ -313,7 +313,11 @@ func (t *Tool) Roots() ([]Root, *exit.Error) {
 		if len(fields) != 4 || fields[0] != "root" || !strings.HasPrefix(fields[3], "sha256:") {
 			continue
 		}
-		roots = append(roots, Root{Name: fields[1], Kind: fields[2], Snapshot: fields[3]})
+		name := fields[1]
+		if decoded, err := strconv.Unquote(name); err == nil {
+			name = decoded
+		}
+		roots = append(roots, Root{Name: name, Kind: fields[2], Snapshot: fields[3]})
 	}
 	return roots, nil
 }

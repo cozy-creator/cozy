@@ -2,8 +2,6 @@ package cli
 
 import (
 	"context"
-	"fmt"
-	"regexp"
 	"sort"
 	"strings"
 	"sync"
@@ -70,11 +68,11 @@ func handleEndpointPublish(ctx *Context) *exit.Error {
 		return problem
 	}
 	profileRows := make([]string, 0, len(done.Profiles))
-	var candidateIDRows, refusalRows []string
+	var candidateRows, refusalRows []string
 	for _, profile := range done.Profiles {
 		profileRows = append(profileRows, profile.Profile+":"+profile.State+":"+profile.BaseRealizationKind)
-		if profile.State != "refused" {
-			candidateIDRows = append(candidateIDRows, profile.Profile+"/"+profile.BaseRealizationKind+"="+profile.CandidateID)
+		if profile.State == "candidate" {
+			candidateRows = append(candidateRows, profile.Profile+"/"+profile.BaseRealizationKind+"="+profile.CandidateID)
 		} else {
 			refusal := profile.Profile + "/" + profile.BaseRealizationKind + " " + profile.RefusalCode
 			if profile.RefusalDetail != "" {
@@ -84,7 +82,7 @@ func handleEndpointPublish(ctx *Context) *exit.Error {
 		}
 	}
 	sort.Strings(profileRows)
-	sort.Strings(candidateIDRows)
+	sort.Strings(candidateRows)
 	sort.Strings(refusalRows)
 	fields := []output.Field{
 		{K: "endpoint", V: ref.String()}, {K: "release", V: done.Release},
@@ -93,8 +91,8 @@ func handleEndpointPublish(ctx *Context) *exit.Error {
 		{K: "uploaded", V: output.Bytes(moved)}, {K: "held", V: output.Bytes(held)},
 		{K: "hub", V: c.Base()},
 	}
-	if len(candidateIDRows) > 0 {
-		fields = append(fields, output.Field{K: "candidates", V: candidateIDRows})
+	if len(candidateRows) > 0 {
+		fields = append(fields, output.Field{K: "candidates", V: candidateRows})
 	}
 	if len(refusalRows) > 0 {
 		fields = append(fields, output.Field{K: "profile_refusals", V: refusalRows})
@@ -173,7 +171,7 @@ func validateFinalize(pack *endpointpublish.Package, release string,
 	}
 	seenProfiles := map[string]bool{}
 	seenRealizations := map[string]bool{}
-	executionProfileStates := map[string]string{}
+	candidateProfiles := map[string]bool{}
 	for _, row := range done.Profiles {
 		if !declared[row.Profile] {
 			return exit.Internalf("endpoint finalize returned unknown profile %q", row.Profile)
@@ -188,19 +186,17 @@ func validateFinalize(pack *endpointpublish.Package, release string,
 				row.Profile, row.BaseRealizationKind)
 		}
 		seenRealizations[key] = true
-		if !endpointProfileState(row.State) {
-			return exit.Internalf("endpoint finalize returned unknown profile state %q", row.State)
+		if row.State != "candidate" && row.State != "refused" {
+			return exit.Internalf("endpoint finalize returned non-candidate profile state %q", row.State)
 		}
 		if row.State == "refused" && row.RefusalCode == "" {
 			return exit.Internalf("endpoint finalize returned a refusal without a typed code")
 		}
-		if row.State != "refused" {
+		if row.State == "candidate" {
 			if row.RefusalCode != "" || row.RefusalDetail != "" {
-				return exit.Internalf("endpoint finalize returned refusal detail on a non-refused profile")
+				return exit.Internalf("endpoint finalize returned refusal detail on a passing candidate")
 			}
-			if row.BaseRealizationKind == "oci" {
-				executionProfileStates[row.Profile] = row.State
-			}
+			candidateProfiles[row.Profile] = true
 		}
 	}
 	if len(seenProfiles) != len(declared) {
@@ -209,19 +205,15 @@ func validateFinalize(pack *endpointpublish.Package, release string,
 	seenExecutions := map[string]bool{}
 	for _, execution := range done.EndpointExecutions {
 		key := execution.Profile + "\x00" + execution.Function
-		if executionProfileStates[execution.Profile] == "" || strings.TrimSpace(execution.Function) == "" ||
+		if !candidateProfiles[execution.Profile] || strings.TrimSpace(execution.Function) == "" ||
 			seenExecutions[key] || !sha256Digest(execution.Digest) ||
-			execution.State != executionProfileStates[execution.Profile] {
+			(execution.State != "candidate" && execution.State != "refused") {
 			return exit.Internalf("endpoint finalize returned malformed or duplicate execution %q/%q",
 				execution.Profile, execution.Function)
 		}
 		seenExecutions[key] = true
 	}
 	return nil
-}
-
-func endpointProfileState(state string) bool {
-	return state == "candidate" || state == "qualified" || state == "refused"
 }
 
 func objectRef(ref hub.ObjectRef) bool { return sha256Digest(ref.Digest) && ref.Length > 0 }
@@ -319,70 +311,6 @@ func uploadEndpointRoles(ctx context.Context, pack *endpointpublish.Package,
 	return moved, held, nil
 }
 
-func handleEndpointPromote(ctx *Context) *exit.Error {
-	ref, problem := hub.ParseRef(ctx.Inv.Args[0])
-	if problem != nil {
-		return problem
-	}
-	release := strings.TrimSpace(ctx.Inv.Args[1])
-	if release == "" {
-		return exit.Usagef("endpoint release id is required")
-	}
-	serving, problem := servingTargets(ctx.Inv.Values["--serve"])
-	if problem != nil {
-		return problem
-	}
-	reason, problem := mutationReason(ctx, "endpoint promote")
-	if problem != nil {
-		return problem
-	}
-	c := client(ctx)
-	hctx, cancel := hub.LongContext()
-	defer cancel()
-	promoted, problem := c.PromoteEndpointRelease(hctx, ref, release, serving, reason)
-	if problem != nil {
-		return problem
-	}
-	var rows []string
-	for _, row := range promoted.Serving {
-		rows = append(rows, row.EndpointRef+":"+strings.Join(row.EndpointExecutionDigests, ","))
-	}
-	sort.Strings(rows)
-	return emit(ctx, output.Record{Kind: "endpoint promotion", Fields: []output.Field{
-		{K: "endpoint", V: ref.String()}, {K: "release", V: promoted.Release},
-		{K: "serving", V: rows}, {K: "hub", V: c.Base()},
-	}, Notes: []string{"the serving pointers moved in one Tensorhub transaction; endpoint publication never moves them implicitly"}})
-}
-
-var functionName = regexp.MustCompile(`^[A-Za-z][A-Za-z0-9_-]{0,127}$`)
-
-func servingTargets(values []string) ([]hub.ServingTarget, *exit.Error) {
-	seen := map[string]bool{}
-	var out []hub.ServingTarget
-	for _, value := range values {
-		major, function, ok := strings.Cut(strings.TrimSpace(value), "/")
-		if !ok || !regexp.MustCompile(`^v[1-9][0-9]*$`).MatchString(major) ||
-			!functionName.MatchString(function) || strings.Contains(function, "/") {
-			return nil, exit.Usagef("--serve %q is not vN/function; a bare major has no atomic function set", value)
-		}
-		key := major + "/" + function
-		if !seen[key] {
-			seen[key] = true
-			out = append(out, hub.ServingTarget{Major: major, Function: function})
-		}
-	}
-	if len(out) == 0 {
-		return nil, exit.Usagef("`cozy endpoint promote` needs at least one --serve <vN/function>")
-	}
-	sort.Slice(out, func(i, j int) bool {
-		if out[i].Major != out[j].Major {
-			return out[i].Major < out[j].Major
-		}
-		return out[i].Function < out[j].Function
-	})
-	return out, nil
-}
-
 func endpointReleaseRef(value string) (hub.Ref, string, *exit.Error) {
 	name, release, ok := strings.Cut(strings.TrimSpace(value), "@")
 	if !ok || release == "" || strings.Contains(release, "@") || strings.ContainsAny(release, `/\`) {
@@ -396,7 +324,7 @@ func mutationReason(ctx *Context, command string) (string, *exit.Error) {
 	reason := strings.TrimSpace(ctx.Inv.Value("--reason"))
 	if reason == "" {
 		return "", exit.Usagef("`cozy %s` needs --reason <why>", command).
-			WithRemedy("Tensorhub records why every mutation happened before it acts")
+			WithRemedy("Tensorhub records why every mutation or paid acquisition happened before it acts")
 	}
 	return reason, nil
 }
@@ -411,8 +339,4 @@ func sameStrings(a, b []string) bool {
 		}
 	}
 	return true
-}
-
-func fmtProfileState(row hub.EndpointProfileState) string {
-	return fmt.Sprintf("%s:%s", row.Profile, row.State)
 }

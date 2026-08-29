@@ -158,7 +158,7 @@ func (f *Facts) Placement() (orchestrator.DesiredPlacement, *exit.Error) {
 	}
 	if len(placement.Bindings) == 0 {
 		// A release whose descriptor registers no entrypoint has no plan to advertise. A job
-		// function is not one; it is served through `cozy job`, on a spec of its own.
+		// function is not one; `cozy invoke run` selects its job lifecycle instead.
 		return orchestrator.DesiredPlacement{}, exit.Named(exit.Structural, "no_servable_function",
 			"%s registers no entrypoint, and a worker with no plan to advertise has nothing to serve",
 			f.Install.Endpoint).
@@ -241,7 +241,7 @@ func (f *Facts) binding(ep *Entrypoint, table map[string]Binding) (*orchestrator
 			ep.Name, slot.Path).
 			WithRemedy("it resolves: %s — code states capability, bindings state selection",
 				strings.Join(known, ", ")).
-			WithNext("cozy describe " + f.Install.Endpoint)
+			WithNext("cozy endpoint list --full")
 	}
 	// THE RECORD NAMES THE ARTIFACT, IT DOES NOT RESOLVE IT (#567e).
 	//

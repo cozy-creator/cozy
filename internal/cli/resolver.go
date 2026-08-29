@@ -5,7 +5,6 @@ import (
 	"strings"
 	"sync"
 
-	"github.com/cozy-creator/cozy-creator/internal/api"
 	"github.com/cozy-creator/cozy-creator/internal/config"
 	"github.com/cozy-creator/cozy-creator/internal/exit"
 	"github.com/cozy-creator/cozy-creator/internal/launch"
@@ -25,7 +24,7 @@ import (
 // loader, and the driver's writer are all gone, and the live driver installs an endpoint
 // exactly as a user does.
 
-// Resolver is the LocalService's endpoint resolver.
+// Resolver is the local controller's endpoint resolver.
 type Resolver struct {
 	mu    sync.Mutex
 	store *records.Store
@@ -107,8 +106,7 @@ func (r *Resolver) Resolve(endpoint string) (orchestrator.WorkerLaunchSpec, *exi
 	return spec, nil
 }
 
-// ResolveInstall answers from one exact immutable install row rather than the active pin.
-// It is the workflow recovery path: resolution can be retained without becoming identity.
+// ResolveInstall answers from the exact immutable row a durable request retained.
 func (r *Resolver) ResolveInstall(installID string) (orchestrator.WorkerLaunchSpec, *exit.Error) {
 	facts, e := r.installFacts(installID)
 	if e != nil {
@@ -117,8 +115,7 @@ func (r *Resolver) ResolveInstall(installID string) (orchestrator.WorkerLaunchSp
 	return facts.Spec(r.Devices)
 }
 
-// Entrypoint returns one exact install's verified request/result schema for workflow
-// validation before any child request exists.
+// Entrypoint returns one exact install's verified request/result schema.
 func (r *Resolver) Entrypoint(installID, name string) (*launch.Entrypoint, *exit.Error) {
 	facts, e := r.installFacts(installID)
 	if e != nil {
@@ -134,8 +131,8 @@ func (r *Resolver) installFacts(installID string) (*launch.Facts, *exit.Error) {
 	}
 	if install == nil {
 		return nil, exit.New(exit.NotFound,
-			"workflow install %s is no longer present", installID).
-			WithRemedy("a live workflow pins its immutable install; restore the records/directory before retrying")
+			"request install %s is no longer present", installID).
+			WithRemedy("the durable request retains its immutable install until terminal")
 	}
 	return launch.Read(*install, r.cfg.Home, r.cfg.Tool())
 }
@@ -160,7 +157,7 @@ func (r *Resolver) ResolveJob(endpoint, function string) (orchestrator.WorkerLau
 }
 
 // Jobs names the `@job` functions one installed endpoint registers, with the descriptor
-// id each resolves to. `cozy job ls` and the API's job listing read it.
+// id each resolves to. `cozy invoke list` and the API's job listing read it.
 func (r *Resolver) Jobs(endpoint string) ([]launch.JobFacts, *exit.Error) {
 	gen, e := r.generation(strings.TrimSpace(endpoint))
 	if e != nil {
@@ -187,14 +184,16 @@ func (r *Resolver) Jobs(endpoint string) ([]launch.JobFacts, *exit.Error) {
 func (r *Resolver) generation(ref string) (*records.EndpointInstall, *exit.Error) {
 	endpoint, major, hasMajor := splitMajor(ref)
 	if r.store == nil {
-		return nil, exit.Unavailablef("this LocalService has no install records")
+		return nil, exit.Unavailablef("this local controller has no install records")
 	}
 	pins, e := r.store.Pins(endpoint)
 	if e != nil {
 		return nil, e
 	}
 	if len(pins) == 0 {
-		return nil, api.UnknownEndpoint(endpoint)
+		return nil, exit.New(exit.NotFound, "%s is not installed on this host", endpoint).
+			WithRemedy("`cozy endpoint list` shows installed endpoints").
+			WithNext("cozy endpoint install " + endpoint)
 	}
 	chosen := pins[0]
 	if hasMajor {
@@ -207,12 +206,12 @@ func (r *Resolver) generation(ref string) (*records.EndpointInstall, *exit.Error
 		if !found {
 			return nil, exit.New(exit.NotFound, "%s is installed, but not at v%d", endpoint, major).
 				WithRemedy("installed majors: %s", majorsOf(pins)).
-				WithNext("cozy ls")
+				WithNext("cozy endpoint list")
 		}
 	} else if len(pins) > 1 {
 		return nil, exit.Usagef("%s is installed at several majors and a ref must name one", endpoint).
 			WithRemedy("majors: %s — a major is a required path segment, never a default", majorsOf(pins)).
-			WithNext("cozy ls")
+			WithNext("cozy endpoint list")
 	}
 	gen, e := r.store.Install(chosen.InstallID)
 	if e != nil {

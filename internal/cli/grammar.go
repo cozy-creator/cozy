@@ -154,19 +154,12 @@ type InvokeCmd struct {
 type InvokeRunCmd struct {
 	Target         string   `arg:"" name:"target" help:"Callable as org/endpoint/vN/function."`
 	Input          []string `arg:"" optional:"" name:"input" help:"Primary value and field=value payload."`
-	Models         []string `name:"model" help:"Override a model binding."`
-	Lane           string   `help:"Pin a release lane."`
-	Adapters       []string `name:"adapter" help:"Stack an adapter in command order."`
-	Seed           string   `help:"Deterministic RNG seed."`
 	Out            string   `help:"Output directory." type:"path"`
-	Offline        bool     `help:"Use only bytes already in local CAS."`
 	Timeout        string   `help:"Request deadline."`
 	Stream         bool     `help:"Emit typed progress deltas."`
 	PayloadFile    string   `name:"in" help:"Read the whole payload from JSON." type:"path"`
 	Assets         []string `name:"asset" help:"Bind a local asset as field-path=file."`
-	Local          bool     `help:"Run on this machine." xor:"placement"`
-	Cloud          bool     `help:"Run on the public fleet." xor:"placement"`
-	Worker         string   `help:"Run on an attached private rental." xor:"placement"`
+	Worker         string   `help:"Run on an attached private rental."`
 	IdempotencyKey string   `help:"Stable request identity for safe retries."`
 	Trees          []string `name:"input-tree" help:"Bind a job input tree as ref=directory."`
 	Org            string   `help:"Job publication organization (defaults to local)."`
@@ -176,10 +169,8 @@ type InvokeRunCmd struct {
 func (c *InvokeRunCmd) Run(r *Runtime) error {
 	args := append([]string{c.Target}, c.Input...)
 	return r.call(handleInvokeRun, args, bools(
-		"--offline", c.Offline, "--stream", c.Stream, "--local", c.Local,
-		"--cloud", c.Cloud, "--detach", c.Detach), values(
-		"--model", c.Models, "--lane", c.Lane, "--adapter", c.Adapters,
-		"--seed", c.Seed, "--out", c.Out, "--timeout", c.Timeout,
+		"--stream", c.Stream, "--detach", c.Detach), values(
+		"--out", c.Out, "--timeout", c.Timeout,
 		"--in", c.PayloadFile, "--asset", c.Assets, "--worker", c.Worker,
 		"--idempotency-key", c.IdempotencyKey, "--input", c.Trees, "--org", c.Org),
 		[]string{"cozy invoke list"}, true)
@@ -232,7 +223,7 @@ type RentalEndCmd struct {
 }
 
 func (c *RentalEndCmd) Run(r *Runtime) error {
-	return r.call(handleRentRelease, []string{c.ID}, bools("--yes", true), nil,
+	return r.call(handleRentRelease, []string{c.ID}, nil, nil,
 		[]string{"cozy rental list"}, true)
 }
 

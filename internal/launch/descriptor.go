@@ -361,7 +361,7 @@ func ReadDescriptor(sourceDir, expectDigest string) (*Descriptor, *exit.Error) {
 		return nil, exit.Named(exit.Structural, "descriptor_absent",
 			"this generation's source carries no %s", DescriptorFile).
 			WithRemedy("an installed release commits its descriptor; `cozy-runtime describe --write-descriptor` is what writes one").
-			WithNext("cozy install <org/endpoint> --force")
+			WithNext("cozy endpoint install <org/endpoint> --force")
 	}
 	d, problem := DecodeDescriptor(data)
 	if problem != nil {
@@ -371,7 +371,7 @@ func ReadDescriptor(sourceDir, expectDigest string) (*Descriptor, *exit.Error) {
 		return nil, exit.Named(exit.Conflict, "descriptor_stale",
 			"the committed descriptor content digests to %s and this install recorded %s", d.Digest, expectDigest).
 			WithRemedy("the source tree changed after the install; reinstall so the surface and the record are one document").
-			WithNext("cozy install <org/endpoint> --force")
+			WithNext("cozy endpoint install <org/endpoint> --force")
 	}
 	return d, nil
 }

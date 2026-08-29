@@ -65,8 +65,8 @@ type Submission struct {
 	// Worker pins this request to an ATTACHED remote worker (a rental id resolved
 	// through Options.Rentals). Empty = any local worker.
 	Worker string
-	// InstallID pins a workflow child to one immutable local install resolution.
-	// Empty retains the ordinary active-pin behavior; remote requests never set it.
+	// InstallID pins a durable request to one immutable local install resolution.
+	// Remote requests leave it empty.
 	InstallID string
 }
 
@@ -121,8 +121,7 @@ func (c *Orchestrator) SubmitDetail(s Submission) (string, uint64, bool, *exit.E
 	return req.ID, attempt, true, e
 }
 
-// RecordSubmission crosses only the durable ordinary-request boundary. Workflow children
-// use RecordWorkflowChild instead, because their request row and parent link are one fact.
+// RecordSubmission crosses the durable ordinary-request boundary.
 func (c *Orchestrator) RecordSubmission(s Submission) (records.Request, bool, *exit.Error) {
 	req, event, e := requestRecord(s)
 	if e != nil {
@@ -138,26 +137,6 @@ func (c *Orchestrator) RecordSubmission(s Submission) (records.Request, bool, *e
 	}
 	c.emit(req.ID, "request.submitted", 0, event)
 	return req, true, nil
-}
-
-// RecordWorkflowChild commits the ordinary request and its workflow-step link in the same
-// SQLite transaction. Scheduling starts only after this returns, so cancellation and boot
-// recovery can always discover the child before Owed can activate it.
-func (c *Orchestrator) RecordWorkflowChild(workflowID string, ordinal int, childKey string,
-	s Submission) (records.Request, bool, *exit.Error) {
-	req, event, e := requestRecord(s)
-	if e != nil {
-		return records.Request{}, false, e
-	}
-	req, fresh, e := c.opt.Store.SubmitWorkflowChild(
-		workflowID, ordinal, childKey, req, event)
-	if e != nil {
-		return records.Request{}, false, e
-	}
-	if !fresh {
-		c.logRecordedReplay(req, s.IdemKey)
-	}
-	return req, fresh, nil
 }
 
 func requestRecord(s Submission) (records.Request, map[string]any, *exit.Error) {
@@ -325,7 +304,7 @@ func (c *Orchestrator) Requeue(requestID, why string) {
 		// THE REQUEST ENDS HERE, and it has to SAY so. Settling the row without emitting a
 		// terminal event left a client watching the durable stream with `attempt_failed
 		// (requeuing: true)` as its last frame and nothing after it — the contract's
-		// terminal-stop rule never fired, and `cozy run` waited on a request that had been
+		// terminal-stop rule never fired, and `cozy invoke run` waited on a request that had been
 		// settled for ten minutes. Observed live, in cl-003's ARM 3.
 		c.logf("%s NOT requeued (%s): %s", requestID, why, e.Message)
 		c.forget(requestID)
@@ -350,7 +329,6 @@ func (c *Orchestrator) Requeue(requestID, why string) {
 		if row, read := c.opt.Store.RequestRow(requestID); read == nil && row != nil {
 			go c.cleanupRequestAssets(*row)
 		}
-		c.wakeWorkflows()
 		return
 	}
 	if !started {
@@ -382,10 +360,10 @@ func (c *Orchestrator) Requeue(requestID, why string) {
 		requestID, attempt, n, MaxRequeues, why)
 }
 
-// selectOrStart makes a queued request's endpoint resident. It is the half of `cozy run`
+// selectOrStart makes a queued request's endpoint resident. It is the half of `cozy invoke run`
 // that "cold and warm traverse the same states" rests on: SELECT the worker that already
 // advertises the binding, or START one — never a second invocation mechanism, and never a
-// client's job. `cozy start` is the same act made explicit for prewarming.
+// client's job. `cozy invoke run` is the same act made explicit for prewarming.
 //
 // It runs off the caller's goroutine because a cold start is a 4.782 GiB fill, and the
 // submitting client is already watching the event stream that will say when it lands. The
@@ -535,8 +513,8 @@ func (c *Orchestrator) resolveFor(req records.Request) (WorkerLaunchSpec, *exit.
 		if req.InstallID != "" {
 			if req.IsJob() {
 				return WorkerLaunchSpec{}, exit.Named(exit.Structural,
-					"workflow_job_install_unsupported",
-					"an exact workflow install may dispatch serving children only")
+					"job_install_unsupported",
+					"an exact serving install cannot dispatch a job callable")
 			}
 			spec, e := c.opt.Endpoints.ResolveInstall(req.InstallID)
 			if e != nil {
@@ -544,7 +522,7 @@ func (c *Orchestrator) resolveFor(req records.Request) (WorkerLaunchSpec, *exit.
 			}
 			if spec.Placement.Endpoint != req.Endpoint {
 				return WorkerLaunchSpec{}, exit.Named(exit.Conflict,
-					"workflow_install_endpoint_mismatch",
+					"request_install_endpoint_mismatch",
 					"install %s serves %s, not request endpoint %s",
 					req.InstallID, spec.Placement.Endpoint, req.Endpoint)
 			}
@@ -562,7 +540,7 @@ func (c *Orchestrator) resolveFor(req records.Request) (WorkerLaunchSpec, *exit.
 			WithRemedy("publish and rent an exact job control snapshot before enabling remote jobs")
 	}
 	if c.opt.Rentals == nil {
-		return WorkerLaunchSpec{}, exit.Unavailablef("this LocalService attaches no remote workers")
+		return WorkerLaunchSpec{}, exit.Unavailablef("this local controller attaches no remote workers")
 	}
 	remote, e := c.opt.Rentals(req.Worker)
 	if e != nil {
@@ -583,7 +561,6 @@ func (c *Orchestrator) resolveFor(req records.Request) (WorkerLaunchSpec, *exit.
 // no offer crossed to a worker, so there is no worker terminal to replay and the request
 // row is what settles. A closed dispatch_aborted row may remain as preparation history.
 func (c *Orchestrator) failQueued(requestID string, cause *exit.Error) {
-	defer c.wakeWorkflows()
 	c.forget(requestID)
 	// A REQUEST THAT ALREADY SETTLED IS NOT FAILED BY A LATER OBSERVATION. The launch
 	// goroutine that made this request's worker resident OUTLIVES the request: a job
@@ -848,14 +825,6 @@ func inputBindings(req records.Request) []*pb.InputBinding {
 		order++
 	}
 	return rows
-}
-
-func outputBindings(ids []string, maxBytes uint64) []*pb.OutputBinding {
-	out := make([]*pb.OutputBinding, 0, len(ids))
-	for _, id := range ids {
-		out = append(out, &pb.OutputBinding{OutputId: id, MaxBytes: maxBytes})
-	}
-	return out
 }
 
 func invocationOutputBindings(ids []string, artifacts []ArtifactOutput, defaultMax uint64) []*pb.OutputBinding {
@@ -1228,7 +1197,7 @@ func (c *Orchestrator) AwaitAccepted(requestID string, attempt uint64, timeout t
 }
 
 // ClientCancelGraceMS is the one cooperative attempt-cancellation policy. It is a
-// cancellation budget carried to Runtime, never a stall or workflow deadline.
+// cancellation budget carried to Runtime, never a stall or caller deadline.
 const ClientCancelGraceMS uint64 = 5000
 
 // CancelClient is the client-reason cancel, for the callers that have no business

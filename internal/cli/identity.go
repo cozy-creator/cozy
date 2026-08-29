@@ -14,7 +14,7 @@ import (
 // local InvocationSpec froze `environment_spec_digest: ""` — an UNDER-SPECIFIED identity
 // persisted forever under the request's digest.
 //
-// Both documents are deliberately `cozy.local.*` formats: a local service manufactures
+// Both documents are deliberately `cozy.local.*` formats: a local controller manufactures
 // no Tensorhub document. They are frozen per service run, never per request — a request
 // cannot choose the environment it runs under — and the config's one secret enters as
 // its DIGEST, never raw.

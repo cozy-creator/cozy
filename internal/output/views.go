@@ -15,8 +15,8 @@ const (
 	fieldCap = 900
 )
 
-// Field, Record, Lines, and List keep retained handlers declarative while all
-// four surfaces collapse into the same Result at the output boundary.
+// Field, Record, and List keep handlers declarative while both surfaces collapse
+// into the same Result at the output boundary.
 type Field struct {
 	K string
 	V any
@@ -29,16 +29,6 @@ type Record struct {
 	Next   []string
 }
 
-type Lines struct {
-	Kind  string
-	Key   string
-	Items []string
-	Empty string
-	Extra []Field
-	Notes []string
-	Next  []string
-}
-
 type List struct {
 	Kind       string
 	Fields     []string
@@ -49,14 +39,6 @@ type List struct {
 	Empty      string
 	Notes      []string
 	Next       []string
-}
-
-type LinesData struct {
-	Items   []string       `json:"items"`
-	Count   int            `json:"count"`
-	Omitted int            `json:"omitted,omitempty"`
-	Empty   string         `json:"empty,omitempty"`
-	Extra   map[string]any `json:"extra,omitempty"`
 }
 
 type ListData struct {
@@ -73,13 +55,6 @@ func (r Record) WithDefaultNext(next []string) Document {
 		r.Next = trimNext(next)
 	}
 	return r
-}
-
-func (l Lines) WithDefaultNext(next []string) Document {
-	if len(l.Next) == 0 {
-		l.Next = trimNext(next)
-	}
-	return l
 }
 
 func (l List) WithDefaultNext(next []string) Document {
@@ -100,31 +75,6 @@ func (r Record) Emit(w io.Writer, mode Mode) error {
 	}
 	result := Success(r.Kind, data)
 	result.Notes, result.Next = r.Notes, trimNext(r.Next)
-	return Write(w, result, mode)
-}
-
-func (l Lines) Emit(w io.Writer, mode Mode) error {
-	shown := l.Items
-	if !mode.Full && len(shown) > rowCap {
-		shown = shown[:rowCap]
-	}
-	extra, err := fieldMap(l.Extra, mode.Full)
-	if err != nil {
-		return err
-	}
-	empty := ""
-	if len(l.Items) == 0 {
-		empty = l.Empty
-		if empty == "" {
-			empty = "No " + l.Kind + "."
-		}
-	}
-	data := LinesData{
-		Items: copyStrings(shown), Count: len(l.Items),
-		Omitted: len(l.Items) - len(shown), Empty: empty, Extra: extra,
-	}
-	result := Success(l.Kind, data)
-	result.Notes, result.Next = l.Notes, trimNext(l.Next)
 	return Write(w, result, mode)
 }
 

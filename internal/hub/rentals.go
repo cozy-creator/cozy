@@ -2,7 +2,6 @@ package hub
 
 import (
 	"context"
-	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
 	"net/http"
@@ -224,7 +223,7 @@ func (w wireRental) named(what string) *exit.Error {
 	if w.ID == "" {
 		return exit.Named(exit.Internal, "hub.rental_unnamed",
 			"the hub %s and named no rental_id", what).
-			WithRemedy("this route may not exist on this hub build; `cozy hub status` names it and its version")
+			WithRemedy("this route may not exist on this hub build; `cozy endpoint search` names it and its version")
 	}
 	return validateRentalID(w.ID)
 }
@@ -276,14 +275,6 @@ type ArtifactGrantLocation struct {
 type RentalArtifactGrant struct {
 	GrantRevision uint64        `json:"grant_revision"`
 	Grant         ArtifactGrant `json:"grant"`
-}
-
-type RentalPlacementRevision struct {
-	RentalID          string               `json:"rental_id"`
-	EndpointRef       string               `json:"endpoint_ref"`
-	PlacementRevision uint64               `json:"placement_revision"`
-	ControlSnapshot   ExactControlDocument `json:"control_snapshot"`
-	PlacementSet      ExactControlDocument `json:"placement_set"`
 }
 
 // WorkerSessionObservation is the renter RecordOwner's exact evidence relay. The three
@@ -354,56 +345,6 @@ func (c *Client) ObserveWorkerSession(ctx context.Context, id string,
 }
 
 const maxArtifactGrantResponseBytes = 64 << 20
-
-// ReviseRentalPlacement asks Tensorhub's operator authority to author one immutable
-// desired placement for the already-live pod. The request chooses only endpoint_ref;
-// execution, model closure, documents, image and subjects remain server-derived.
-func (c *Client) ReviseRentalPlacement(ctx context.Context, id, endpointRef,
-	idempotencyKey, reason string) (RentalPlacementRevision, *exit.Error) {
-	var out RentalPlacementRevision
-	if e := validateRentalID(id); e != nil {
-		return out, e
-	}
-	if strings.TrimSpace(endpointRef) != endpointRef || endpointRef == "" ||
-		strings.TrimSpace(idempotencyKey) == "" || len(idempotencyKey) > 200 {
-		return out, exit.Named(exit.Validation, "rental.placement_revision_invalid",
-			"endpoint_ref and an Idempotency-Key of at most 200 characters are required")
-	}
-	e := c.do(ctx, call{
-		method: http.MethodPost,
-		path:   "/v1/admin/private-rentals/" + url.PathEscape(id) + "/placement-revisions",
-		admin:  true, reason: reason, idempotency: idempotencyKey,
-		body: struct {
-			EndpointRef string `json:"endpoint_ref"`
-		}{EndpointRef: endpointRef},
-		responseBytes: maxRentalResponseBytes,
-	}, &out)
-	if e != nil {
-		return out, e
-	}
-	if out.RentalID != id || out.EndpointRef != endpointRef || out.PlacementRevision < 2 {
-		return out, placementRevisionInvalid("answer changed rental, endpoint, or revision")
-	}
-	for name, exact := range map[string]ExactControlDocument{
-		"control_snapshot": out.ControlSnapshot, "placement_set": out.PlacementSet,
-	} {
-		if exact.Length <= 0 || int64(len(exact.CanonicalBytes)) != exact.Length ||
-			!validDigest(exact.Digest) || exact.Digest != digestOf(exact.CanonicalBytes) {
-			return out, placementRevisionInvalid("%s has invalid stored-byte identity", name)
-		}
-	}
-	return out, nil
-}
-
-func placementRevisionInvalid(format string, args ...any) *exit.Error {
-	return exit.Named(exit.Conflict, "rental.placement_revision_invalid", format, args...).
-		WithRemedy("preserve the prior desired revision; Creator will not repair Tensorhub-authored identity")
-}
-
-func digestOf(raw []byte) string {
-	sum := sha256.Sum256(raw)
-	return "sha256:" + hex.EncodeToString(sum[:])
-}
 
 // ArtifactGrant asks Tensorhub for fresh, rental-scoped locations using the renter token
 // that already authenticates Claim. The request is deliberately only revision plus TTL:

@@ -1,6 +1,7 @@
 package cli
 
 import (
+	"bytes"
 	"fmt"
 	"io"
 	"os"
@@ -8,6 +9,7 @@ import (
 	"path/filepath"
 	"time"
 
+	"github.com/cozy-creator/cozy-creator/internal/api"
 	"github.com/cozy-creator/cozy-creator/internal/config"
 	"github.com/cozy-creator/cozy-creator/internal/exit"
 	"github.com/cozy-creator/cozy-creator/internal/home"
@@ -51,6 +53,7 @@ func ensureController(ctx *Context) (service.State, *exit.Error) {
 	if problem != nil {
 		return service.State{}, problem
 	}
+	staleCredential, _ := os.ReadFile(layout.Client)
 	self, err := os.Executable()
 	if err != nil {
 		return service.State{}, exit.Internalf("cannot locate the Cozy executable: %s", err)
@@ -61,7 +64,6 @@ func ensureController(ctx *Context) (service.State, *exit.Error) {
 		return service.State{}, exit.Internalf("cannot open the controller log: %s", err)
 	}
 	defer logFile.Close()
-
 	command := exec.Command(self)
 	command.Args[0] = controllerProcessName
 	command.Env = ctx.Cfg.Child("COZY_HOME=" + ctx.Cfg.Home)
@@ -72,6 +74,7 @@ func ensureController(ctx *Context) (service.State, *exit.Error) {
 	}
 	done := make(chan error, 1)
 	go func() { done <- command.Wait() }()
+	var childErr error
 
 	deadline := time.NewTimer(15 * time.Second)
 	defer deadline.Stop()
@@ -80,17 +83,22 @@ func ensureController(ctx *Context) (service.State, *exit.Error) {
 	for {
 		select {
 		case err := <-done:
-			return service.State{}, exit.New(exit.Conflict,
-				"the Cozy controller exited before acquiring its service lock").
-				WithRemedy("inspect %s: %v", filepath.Join(layout.Root, "controller.log"), err)
+			// Another concurrent auto-start may be the winner. Keep observing the
+			// shared lock/credential readiness until it appears or the startup bound ends.
+			childErr, done = err, nil
 		case <-tick.C:
 			if state := service.Probe(ctx.Cfg); state.Up {
-				return state, nil
+				current, _ := os.ReadFile(layout.Client)
+				if !bytes.Equal(current, staleCredential) {
+					if _, problem := api.ClientCredential(layout); problem == nil {
+						return state, nil
+					}
+				}
 			}
 		case <-deadline.C:
 			return service.State{}, exit.New(exit.Conflict,
 				"the Cozy controller did not acquire its service lock").
-				WithRemedy("inspect %s", filepath.Join(layout.Root, "controller.log"))
+				WithRemedy("inspect %s (child result: %v)", filepath.Join(layout.Root, "controller.log"), childErr)
 		}
 	}
 }

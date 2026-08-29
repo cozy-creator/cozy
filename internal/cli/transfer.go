@@ -12,6 +12,7 @@ import (
 	"github.com/cozy-creator/cozy-creator/internal/home"
 	"github.com/cozy-creator/cozy-creator/internal/hub"
 	"github.com/cozy-creator/cozy-creator/internal/output"
+	"github.com/cozy-creator/cozy-creator/internal/records"
 	"github.com/cozy-creator/cozy-creator/internal/secret"
 	"github.com/cozy-creator/cozy-creator/internal/tfs"
 	"github.com/cozy-creator/cozy-creator/internal/transfer"
@@ -59,7 +60,7 @@ func readToken(ctx *Context) (secret.Value, *exit.Error) {
 		return secret.Value{}, exit.Named(exit.Credential, "token.empty_stdin",
 			"--token-stdin was given and stdin carried no credential").
 			WithRemedy("pipe the token in: printf %%s \"$TOKEN\" | cozy … --token-stdin").
-			WithNext("cozy hub status")
+			WithNext("cozy endpoint search")
 	}
 	return v, nil
 }
@@ -71,12 +72,7 @@ func scratch(layout home.Layout, subject string) string {
 }
 
 func progress(ctx *Context) func(string) {
-	if ctx.Mode().JSON {
-		// Under --json stdout carries exactly ONE document. Progress goes to stderr
-		// or nowhere; a machine consumer reads the result, not the narration.
-		return func(line string) { fmt.Fprintln(ctx.Err, line) }
-	}
-	return func(line string) { fmt.Fprintln(ctx.Out, line) }
+	return func(line string) { _ = output.Progress(ctx.Err, line) }
 }
 
 func handleModelPublish(ctx *Context) *exit.Error {
@@ -278,6 +274,39 @@ func handleModelList(ctx *Context) *exit.Error {
 }
 
 func handleModelRemove(ctx *Context) *exit.Error {
+	layout, problem := home.Open(ctx.Cfg.Home)
+	if problem != nil {
+		return problem
+	}
+	store, problem := records.Open(layout.DB)
+	if problem != nil {
+		return problem
+	}
+	live, problem := store.LiveWorkers()
+	if problem != nil {
+		store.Close()
+		return problem
+	}
+	for _, worker := range live {
+		if worker.WorkerID != "remote" {
+			store.Close()
+			return exit.New(exit.Conflict, "local worker %s may still hold model residency", worker.InstanceID).
+				WithRemedy("run `cozy unload`, then remove the model root").
+				WithNext("cozy unload")
+		}
+	}
+	active, problem := store.ActiveRequests()
+	store.Close()
+	if problem != nil {
+		return problem
+	}
+	for _, request := range active {
+		if request.Worker == "" {
+			return exit.New(exit.Conflict, "active invocation %s may still need local model bytes", request.ID).
+				WithRemedy("cancel active local work before removing a model root").
+				WithNext("cozy invoke cancel " + request.ID)
+		}
+	}
 	tool, problem := localTensorFS(ctx)
 	if problem != nil {
 		return problem

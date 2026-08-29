@@ -140,7 +140,7 @@ func endRentalSilently(ctx *Context, id string) *exit.Error {
 	}
 	sub := *ctx
 	sub.Out = io.Discard
-	sub.Inv = &Invocation{Args: []string{id}, Bools: bools("--yes", true),
+	sub.Inv = &Invocation{Args: []string{id}, Bools: map[string]bool{},
 		Values: map[string][]string{}, Mode: ctx.Mode()}
 	if row != nil {
 		sub.Cfg.HubURL = row.Hub

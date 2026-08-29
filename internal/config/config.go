@@ -1,8 +1,7 @@
 // Package config owns Cozy Creator's one process-configuration read.
 //
 // Load resolves one private Kong grammar with no argv. Sources are, in order:
-// defaults, $COZY_HOME/config.yaml, process environment, and typed safe
-// overrides supplied by the CLI. The result is frozen for the process lifetime.
+// defaults, $COZY_HOME/config.yaml, and process environment. The result is frozen for the process lifetime.
 // Secrets therefore use Kong's resolver pipeline without becoming command-line
 // flags.
 package config
@@ -28,7 +27,7 @@ var Inherited = []string{"PATH", "HOME", "LANG", "LC_ALL", "TMPDIR", "SSL_CERT_F
 
 const (
 	DefaultHubURL = "http://127.0.0.1:8080"
-	DefaultPort   = 2699
+	DefaultPort   = 0
 	FileName      = "config.yaml"
 )
 
@@ -56,14 +55,6 @@ type Config struct {
 	inherited []string
 }
 
-// Overrides is the deliberately small set of non-secret values the command
-// grammar may place above file and environment configuration. Pointer fields
-// distinguish an omitted flag from an explicit zero value.
-type Overrides struct {
-	Port  *int
-	Yield *string
-}
-
 // values is a config-only Kong grammar. It is never embedded in the public CLI
 // grammar and its parser always receives nil argv.
 type values struct {
@@ -71,7 +62,7 @@ type values struct {
 	HubToken                 string `name:"tensorhub_token"`
 	Tfs                      string `name:"tfs" default:"tfs"`
 	LocalRateMicroUSDPerHour int64  `name:"local_rate_micro_usd_per_hour" default:"0"`
-	Port                     int    `name:"port" default:"2699"`
+	Port                     int    `name:"port" default:"0"`
 	Yield                    string `name:"yield" default:"smart" enum:"smart,always,never"`
 	Bootstrap                string `name:"bootstrap"`
 }
@@ -86,8 +77,8 @@ func (v *values) Validate() error {
 	if v.LocalRateMicroUSDPerHour < 0 {
 		return fmt.Errorf("local_rate_micro_usd_per_hour must be non-negative")
 	}
-	if v.Port <= 0 || v.Port > 65535 {
-		return fmt.Errorf("port %d is not a TCP port", v.Port)
+	if v.Port < 0 || v.Port > 65535 {
+		return fmt.Errorf("port %d is not a TCP port or zero for automatic selection", v.Port)
 	}
 	return nil
 }
@@ -114,20 +105,16 @@ var processConfig struct {
 	err  *exit.Error
 }
 
-// Load resolves and freezes configuration without command-line overrides.
-func Load() (Config, *exit.Error) { return LoadWith(Overrides{}) }
-
-// LoadWith resolves and freezes configuration with safe command-line
-// overrides. The first call owns the process snapshot; later calls return it.
-// There is intentionally no override field for a credential.
-func LoadWith(overrides Overrides) (Config, *exit.Error) {
+// Load resolves and freezes configuration. The first call owns the process
+// snapshot; later calls return it.
+func Load() (Config, *exit.Error) {
 	processConfig.once.Do(func() {
-		processConfig.cfg, processConfig.err = load(overrides)
+		processConfig.cfg, processConfig.err = load()
 	})
 	return processConfig.cfg, processConfig.err
 }
 
-func load(overrides Overrides) (Config, *exit.Error) {
+func load() (Config, *exit.Error) {
 	home, problem := resolveHome()
 	if problem != nil {
 		return Config{}, problem
@@ -138,9 +125,8 @@ func load(overrides Overrides) (Config, *exit.Error) {
 		return Config{}, problem
 	}
 	environment, inherited := readEnvironment()
-	override := overrideResolver(overrides)
 
-	input, err := resolve(file, environment, override)
+	input, err := resolve(file, environment)
 	if err != nil {
 		return Config{}, exit.Usagef("configuration is invalid: %s", err).
 			WithRemedy("check %s and the admitted COZY_/TENSORHUB_ environment values", filepath.Join(home, FileName))
@@ -153,12 +139,12 @@ func load(overrides Overrides) (Config, *exit.Error) {
 		Yield:                    input.Yield,
 		HubURL:                   strings.TrimRight(strings.TrimSpace(input.HubURL), "/"),
 		HubToken:                 hubToken,
-		HubURLSource:             sourceOf("tensorhub_url", file, environment, override, "default"),
-		HubTokenSource:           sourceOf("tensorhub_token", file, environment, override, "unset"),
+		HubURLSource:             sourceOf("tensorhub_url", file, environment, "default"),
+		HubTokenSource:           sourceOf("tensorhub_token", file, environment, "unset"),
 		Tfs:                      strings.TrimSpace(input.Tfs),
-		TfsSource:                sourceOf("tfs", file, environment, override, "default"),
+		TfsSource:                sourceOf("tfs", file, environment, "default"),
 		LocalRateMicroUSDPerHour: input.LocalRateMicroUSDPerHour,
-		LocalRateSource:          sourceOf("local_rate_micro_usd_per_hour", file, environment, override, "unset"),
+		LocalRateSource:          sourceOf("local_rate_micro_usd_per_hour", file, environment, "unset"),
 		Bootstrap:                secret.New(input.Bootstrap),
 		inherited:                inherited,
 	}
@@ -168,12 +154,12 @@ func load(overrides Overrides) (Config, *exit.Error) {
 	return c, nil
 }
 
-func resolve(file, environment, override *resolver) (values, error) {
+func resolve(file, environment *resolver) (values, error) {
 	var input values
 	parser, err := kong.New(&input,
 		kong.Name("cozy-config"),
 		kong.NoDefaultHelp(),
-		kong.Resolvers(file, environment, override),
+		kong.Resolvers(file, environment),
 	)
 	if err != nil {
 		return values{}, fmt.Errorf("cannot construct the configuration grammar: %w", err)
@@ -201,7 +187,7 @@ func resolveHome() (string, *exit.Error) {
 
 // readEnvironment captures the complete admitted environment once. Only
 // credentials and external locations are resolvable configuration values;
-// runtime behavior stays in config.yaml or typed command overrides.
+// runtime behavior stays in config.yaml.
 func readEnvironment() (*resolver, []string) {
 	values := map[string]any{}
 	for field, name := range environmentNames {
@@ -220,17 +206,6 @@ func readEnvironment() (*resolver, []string) {
 	return &resolver{values: values}, inherited
 }
 
-func overrideResolver(overrides Overrides) *resolver {
-	values := map[string]any{}
-	if overrides.Port != nil {
-		values["port"] = *overrides.Port
-	}
-	if overrides.Yield != nil {
-		values["yield"] = *overrides.Yield
-	}
-	return &resolver{values: values}
-}
-
 type resolver struct{ values map[string]any }
 
 func (r *resolver) Resolve(_ *kong.Context, _ *kong.Path, flag *kong.Flag) (any, error) {
@@ -244,10 +219,8 @@ func (r *resolver) has(name string) bool {
 	return ok
 }
 
-func sourceOf(name string, file, environment, override *resolver, fallback string) string {
+func sourceOf(name string, file, environment *resolver, fallback string) string {
 	switch {
-	case override.has(name):
-		return "cli"
 	case environment.has(name):
 		return "env"
 	case file.has(name):

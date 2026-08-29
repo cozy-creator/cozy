@@ -9,7 +9,6 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
-	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -930,14 +929,4 @@ func condense(value string) string {
 		return value[:400] + "…"
 	}
 	return value
-}
-
-func SortedDownloads(rows []hub.DownloadGrant) []hub.DownloadGrant {
-	out := append([]hub.DownloadGrant{}, rows...)
-	sort.Slice(out, func(i, j int) bool { return out[i].Role < out[j].Role })
-	return out
-}
-
-func (r Result) String() string {
-	return fmt.Sprintf("%s %s %s", r.Install.Endpoint, r.Facts.Profile, r.Facts.InstalledReceiptDigest)
 }

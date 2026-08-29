@@ -15,7 +15,6 @@ import (
 	"github.com/cozy-creator/cozy-creator/internal/managedinstall"
 	"github.com/cozy-creator/cozy-creator/internal/output"
 	"github.com/cozy-creator/cozy-creator/internal/records"
-	"github.com/cozy-creator/cozy-creator/internal/retention"
 )
 
 // open resolves the local layout and the ONE lifecycle database. Mutating verbs
@@ -92,7 +91,7 @@ func handleInstall(ctx *Context) *exit.Error {
 	}
 	if res.Idempotent {
 		rec.Fields = append(rec.Fields, output.Field{K: "result", V: "already pinned — nothing changed"})
-		rec.Next = []string{"cozy ls"}
+		rec.Next = []string{"cozy endpoint list"}
 		return emit(ctx, rec)
 	}
 	rec.Fields = append(rec.Fields,
@@ -100,12 +99,16 @@ func handleInstall(ctx *Context) *exit.Error {
 		output.Field{K: "timings", V: timingsText(res.Timings)},
 	)
 	if res.Superseded != "" {
-		rec.Fields = append(rec.Fields, output.Field{K: "superseded", V: res.Superseded})
-		rec.Notes = append(rec.Notes,
-			"the superseded generation is untouched on disk until `cozy gc` reclaims it")
+		reclaimed, problem := install.Reclaim(st, res.Superseded)
+		if problem != nil {
+			return problem
+		}
+		rec.Fields = append(rec.Fields,
+			output.Field{K: "superseded", V: res.Superseded},
+			output.Field{K: "reclaimed", V: output.Bytes(reclaimed)})
 	}
 	rec.Notes = append(rec.Notes, res.Warnings...)
-	rec.Next = []string{"cozy ls"}
+	rec.Next = []string{"cozy endpoint list"}
 	return emit(ctx, rec)
 }
 
@@ -185,7 +188,7 @@ func handleManagedInstall(ctx *Context, profile string) *exit.Error {
 		"installed only after independent local hardware qualification; no cloud qualification was borrowed",
 		"no dependency resolution, Torch/CUDA install, or native build ran",
 		"control install, portable Runtime receipt, local-base fingerprint, host evidence, and lease are separate recorded facts",
-	}, Next: []string{"cozy start " + g.Endpoint + "@v" + strconv.Itoa(g.Major), "cozy run <org/endpoint/vN/function>"}}
+	}, Next: []string{"cozy invoke run " + g.Endpoint + "@v" + strconv.Itoa(g.Major), "cozy invoke run <org/endpoint/vN/function>"}}
 	if facts.NativeEvidenceDigest != "" {
 		rec.Fields = append(rec.Fields, output.Field{K: "native_evidence", V: facts.NativeEvidenceDigest})
 	}
@@ -193,7 +196,13 @@ func handleManagedInstall(ctx *Context, profile string) *exit.Error {
 		rec.Fields = append(rec.Fields, output.Field{K: "result", V: "already pinned — nothing changed"})
 	}
 	if installed.Superseded != "" {
-		rec.Fields = append(rec.Fields, output.Field{K: "superseded", V: installed.Superseded})
+		reclaimed, problem := install.Reclaim(st, installed.Superseded)
+		if problem != nil {
+			return problem
+		}
+		rec.Fields = append(rec.Fields,
+			output.Field{K: "superseded", V: installed.Superseded},
+			output.Field{K: "reclaimed", V: output.Bytes(reclaimed)})
 	}
 	return emit(ctx, rec)
 }
@@ -209,7 +218,7 @@ func handleLs(ctx *Context) *exit.Error {
 		return e
 	}
 	l := output.List{
-		Kind:      "ls",
+		Kind:      "endpoint",
 		Fields:    []string{"endpoint", "major", "version", "disk"},
 		AllFields: []string{"endpoint", "major", "version", "generation", "disk", "exclusive", "shared", "python", "uv", "cuda_extra", "link_mode", "packages", "closure", "descriptor", "source", "verified", "installed"},
 		Empty:     "0 endpoints installed",
@@ -239,7 +248,7 @@ func handleLs(ctx *Context) *exit.Error {
 		})
 	}
 	if len(l.Rows) == 0 {
-		l.Next = []string{"cozy install <org/endpoint>", "cozy endpoint search"}
+		l.Next = []string{"cozy endpoint install <org/endpoint>", "cozy endpoint search"}
 		return emit(ctx, l)
 	}
 	l.Aggregates = []output.Field{
@@ -258,9 +267,46 @@ func handleRm(ctx *Context) *exit.Error {
 	}
 	defer st.Close()
 	defer w.Unlock()
+	live, e := st.LiveWorkers()
+	if e != nil {
+		return e
+	}
+	for _, worker := range live {
+		if worker.WorkerID == "remote" {
+			continue
+		}
+		for _, arg := range ctx.Inv.Args {
+			ref, problem := install.ParseRef(arg)
+			if problem != nil {
+				return problem
+			}
+			if ref.Endpoint == worker.Endpoint {
+				return exit.New(exit.Conflict, "%s is still resident in local worker %s", ref.Endpoint, worker.InstanceID).
+					WithRemedy("run `cozy unload`, then remove the endpoint").
+					WithNext("cozy unload")
+			}
+		}
+	}
+	active, e := st.ActiveRequests()
+	if e != nil {
+		return e
+	}
+	for _, request := range active {
+		for _, arg := range ctx.Inv.Args {
+			ref, problem := install.ParseRef(arg)
+			if problem != nil {
+				return problem
+			}
+			if request.Worker == "" && ref.Endpoint == request.Endpoint {
+				return exit.New(exit.Conflict, "%s still has active invocation %s", ref.Endpoint, request.ID).
+					WithRemedy("cancel the invocation before removing its endpoint").
+					WithNext("cozy invoke cancel " + request.ID)
+			}
+		}
+	}
 
 	removed := output.List{
-		Kind:      "rm",
+		Kind:      "endpoint remove",
 		Fields:    []string{"endpoint", "major", "generation"},
 		AllFields: []string{"endpoint", "major", "generation", "reclaimed"},
 		Empty:     "0 installs removed",
@@ -292,129 +338,45 @@ func handleRm(ctx *Context) *exit.Error {
 			})
 		}
 	}
+	// Removing an endpoint also clears superseded generations for the same selected
+	// major. Active requests/workers were fenced above and the database claim rechecks.
+	unreferenced, e := st.Unreferenced()
+	if e != nil {
+		return e
+	}
+	for _, generation := range unreferenced {
+		selected := false
+		for _, arg := range ctx.Inv.Args {
+			ref, problem := install.ParseRef(arg)
+			if problem != nil {
+				return problem
+			}
+			selected = ref.Endpoint == generation.Endpoint && (!ref.HasMajor || ref.Major == generation.Major)
+			if selected {
+				break
+			}
+		}
+		if !selected {
+			continue
+		}
+		n, problem := install.Reclaim(st, generation.ID)
+		if problem != nil {
+			return problem
+		}
+		freed += n
+	}
 	if len(removed.Rows) == 0 {
 		removed.Empty = fmt.Sprintf("0 installs removed — %s is not installed", strings.Join(ctx.Inv.Args, ", "))
-		removed.Next = []string{"cozy ls"}
+		removed.Next = []string{"cozy endpoint list"}
 		return emit(ctx, removed)
 	}
 	removed.Aggregates = []output.Field{
 		{K: "removed", V: len(removed.Rows)},
 		{K: "reclaimed", V: output.Bytes(freed)},
 	}
-	removed.Notes = []string{"shared-CAS weights are untouched; `cozy gc` reclaims what nothing references"}
-	removed.Next = []string{"cozy gc"}
+	removed.Notes = []string{"exclusive endpoint bytes were removed; shared TensorFS model bytes were untouched"}
+	removed.Next = []string{"cozy endpoint list"}
 	return emit(ctx, removed)
-}
-
-func handleGC(ctx *Context) *exit.Error {
-	write := ctx.Inv.Bool("--yes")
-	horizon, e := retention.ParseHorizon(ctx.Inv.Value("--keep-media"))
-	if e != nil {
-		return e
-	}
-	l, st, w, e := open(ctx.Cfg, write)
-	if e != nil {
-		return e
-	}
-	defer st.Close()
-	if w != nil {
-		defer w.Unlock()
-	}
-	plan, e := install.Plan(l, st)
-	if e != nil {
-		return e
-	}
-	// THE SECOND PLANE (cl-033). Unreferenced generations are garbage; retained outputs
-	// are the user's work, kept on purpose after the pod that made them was destroyed.
-	// They share `gc` because they share the question — what is this root storing, and
-	// what may go — but not the rule: one is reclaimed because nothing points at it, the
-	// other only because it is older than the declared horizon.
-	media, e := retention.Build(l, st, horizon, time.Now())
-	if e != nil {
-		return e
-	}
-	publicationItems, publicationBytes, e := st.PublicationStats()
-	if e != nil {
-		return e
-	}
-	out := output.List{
-		Kind:      "gc",
-		Fields:    []string{"kind", "id", "endpoint", "bytes"},
-		AllFields: []string{"kind", "id", "endpoint", "version", "age", "bytes", "reason"},
-		Empty:     "0 bytes reclaimable",
-	}
-	var total int64
-	for _, r := range plan {
-		total += r.Bytes
-		out.Rows = append(out.Rows, map[string]string{
-			"kind": r.Kind, "id": r.ID, "endpoint": r.Endpoint, "version": r.Version,
-			"age": "-", "bytes": output.Bytes(r.Bytes), "reason": r.Reason,
-		})
-	}
-	for _, m := range media.Items {
-		total += m.Bytes
-		out.Rows = append(out.Rows, map[string]string{
-			"kind": "media", "id": m.MediaID, "endpoint": m.Endpoint, "version": "-",
-			"age": retention.Age(m.Age), "bytes": output.Bytes(m.Bytes), "reason": m.Reason,
-		})
-	}
-	items := len(plan) + len(media.Items)
-	if media.Foreign > 0 {
-		out.Notes = append(out.Notes, fmt.Sprintf(
-			"%d output row(s) record a path outside the local output namespace and were NOT planned",
-			media.Foreign))
-	}
-	if publicationItems > 0 {
-		out.Notes = append(out.Notes, fmt.Sprintf(
-			"%d job publication(s), %s are retained indefinitely; gc reports but never reclaims the durable result plane",
-			publicationItems, output.Bytes(publicationBytes)))
-	}
-	if !write {
-		out.Aggregates = []output.Field{
-			{K: "reclaimable", V: output.Bytes(total)},
-			{K: "items", V: items},
-			{K: "media", V: fmt.Sprintf("%d output(s), %s beyond the %s horizon",
-				len(media.Items), output.Bytes(media.Bytes), retention.Short(horizon))},
-			{K: "retained", V: fmt.Sprintf("%d output(s), %s kept",
-				media.RetainedItems, output.Bytes(media.RetainedBytes))},
-			{K: "publications", V: fmt.Sprintf("%d publication(s), %s retained indefinitely",
-				publicationItems, output.Bytes(publicationBytes))},
-			{K: "cas", V: "0 objects (the shared weights CAS lands with cl-012)"},
-		}
-		if items == 0 {
-			out.Notes = append(out.Notes, "nothing is unreferenced and no output is past the "+
-				retention.Short(horizon)+" horizon — this is the answer, not an empty listing")
-			out.Next = []string{"cozy media ls"}
-		} else {
-			out.Notes = append(out.Notes, "this is the plan; nothing was removed")
-			out.Next = []string{"cozy gc --yes"}
-		}
-		return emit(ctx, out)
-	}
-	freed, e := install.Collect(l, st, plan)
-	if e != nil {
-		return e
-	}
-	reclaimed, e := retention.Collect(l, st, media)
-	if e != nil {
-		return e
-	}
-	out.Aggregates = []output.Field{
-		{K: "freed", V: output.Bytes(freed + reclaimed)},
-		{K: "items", V: items},
-		{K: "media", V: fmt.Sprintf("%d output(s), %s", len(media.Items), output.Bytes(reclaimed))},
-		{K: "retained", V: fmt.Sprintf("%d output(s), %s kept",
-			media.RetainedItems, output.Bytes(media.RetainedBytes))},
-		{K: "publications", V: fmt.Sprintf("%d publication(s), %s retained indefinitely",
-			publicationItems, output.Bytes(publicationBytes))},
-	}
-	if items > 0 {
-		out.Notes = append(out.Notes,
-			"only generations nothing references and outputs past the "+retention.Short(horizon)+
-				" horizon were reclaimed; a reclaimed media id answers 410, never 404")
-		out.Next = []string{"cozy media ls"}
-	}
-	return emit(ctx, out)
 }
 
 func diskText(g records.EndpointInstall) string {

@@ -81,7 +81,7 @@ CREATE TABLE IF NOT EXISTS requests (
   org          TEXT    NOT NULL DEFAULT '',
   trees        TEXT    NOT NULL DEFAULT '',
   worker       TEXT    NOT NULL DEFAULT '',
-  install_id   TEXT    NOT NULL DEFAULT '',
+  install_id   TEXT    REFERENCES install_generations(id),
   assets       TEXT    NOT NULL DEFAULT '[]',
   artifact_outputs TEXT NOT NULL DEFAULT '[]'
 )`, `
@@ -164,10 +164,6 @@ CREATE TABLE IF NOT EXISTS outputs (
   length     INTEGER NOT NULL,
   mime_type  TEXT    NOT NULL,
   visible_at TEXT    NOT NULL,
-  -- cl-033: the retention lifecycle fact. Empty while the bytes are on disk; stamped
-  -- when cozy gc reclaims them. The ROW is the tombstone, so a reclaimed media id
-  -- answers the honest 410 rather than a 404 that would claim it never existed.
-  reclaimed_at TEXT   NOT NULL DEFAULT '',
   PRIMARY KEY (request_id, attempt, output_id),
   FOREIGN KEY (request_id, attempt) REFERENCES attempts(request_id, attempt)
 )`, `
@@ -489,7 +485,7 @@ func (s *Store) SpawnWorker(w WorkerProcess) *exit.Error {
 			"the device envelope [%s] is already granted to %s",
 			strings.Join(w.Devices, ","), strings.Join(held, ",")).
 			WithRemedy("one process per device: stop the holding worker first").
-			WithNext("cozy status")
+			WithNext("cozy invoke list")
 	}
 	return nil
 }
@@ -688,9 +684,8 @@ type Request struct {
 	// It lives on the request because a requeue must re-derive the same placement
 	// without a client saying so again. Empty = any local worker.
 	Worker string
-	// InstallID pins a Creator-owned workflow child to the exact immutable local
-	// generation resolved when the workflow was accepted. Empty uses the active pin.
-	// It is resolution, not request identity.
+	// InstallID pins a durable local request to the exact immutable generation
+	// resolved before submission. Remote requests leave it empty.
 	InstallID string
 	// Assets are the request's durable input-asset bindings. LocalPath points into the
 	// authority-owned immutable input store, not at the caller's original file: a requeue
@@ -718,7 +713,7 @@ type AssetBinding struct {
 }
 
 const requestCols = `id,idem_key,body_digest,endpoint,entrypoint,plan_id,payload,outputs,
-	state,ordinal,requeues,created_at,kind,org,trees,worker,install_id,assets,artifact_outputs`
+	state,ordinal,requeues,created_at,kind,org,trees,worker,COALESCE(install_id,''),assets,artifact_outputs`
 
 func scanRequest(row interface{ Scan(...any) error }) (Request, error) {
 	var r Request
@@ -769,7 +764,7 @@ func (s *Store) Requests(state string, limit int) ([]Request, *exit.Error) {
 	return s.RequestsOfKind("", state, limit)
 }
 
-// RequestsOfKind narrows the same listing to one ATTEMPT CLASS. `cozy job ls` reads jobs
+// RequestsOfKind narrows the same listing to one ATTEMPT CLASS. `cozy invoke list` reads jobs
 // and the request listing reads serving rows — one table, one reader, two questions.
 func (s *Store) RequestsOfKind(kind, state string, limit int) ([]Request, *exit.Error) {
 	query := `SELECT ` + requestCols + ` FROM requests`
@@ -901,11 +896,7 @@ func (s *Store) AssetInUse(digest string) (bool, *exit.Error) {
 			}
 		}
 	}
-	used, problem := s.workflowAssetInUse(digest)
-	if problem != nil || used {
-		return used, problem
-	}
-	return s.compositionAssetInUse(digest)
+	return false, nil
 }
 
 // SettleRequest records the request's final state. Only a terminal the orchestrator
@@ -933,29 +924,6 @@ func (s *Store) BeginRequeue(id string, max int64) (count int64, started, cancel
 	}
 	if state != "requeue_pending" {
 		return count, false, false, nil
-	}
-	var workflowCancel int
-	if err := tx.QueryRow(`SELECT EXISTS(
-		SELECT 1 FROM workflow_steps s JOIN workflow_executions w ON w.id=s.workflow_id
-		WHERE s.child_request_id=? AND w.state='canceling')`, id).Scan(&workflowCancel); err != nil {
-		return 0, false, false, exit.Internalf("cannot read workflow cancellation for %s: %s", id, err)
-	}
-	if workflowCancel == 1 {
-		if _, err := tx.Exec(`UPDATE requests SET state='canceled' WHERE id=? AND state='requeue_pending'`, id); err != nil {
-			return 0, false, false, exit.Internalf("cannot cancel pending requeue %s: %s", id, err)
-		}
-		if err := appendEventTx(tx, id, "request.canceled", 0, map[string]any{
-			"status": "CANCELED", "cause": "CLIENT_CANCELED",
-			"error_type": "CLIENT_CANCELED",
-			"error":      "the parent workflow was canceled before this request could requeue",
-			"outputs":    []any{}, "requeuing": false,
-		}); err != nil {
-			return 0, false, false, exit.Internalf("cannot append requeue cancellation for %s: %s", id, err)
-		}
-		if err := tx.Commit(); err != nil {
-			return 0, false, false, exit.Internalf("cannot commit requeue cancellation %s: %s", id, err)
-		}
-		return count, false, true, nil
 	}
 	if count >= max {
 		return count, false, false, exit.New(exit.Failed, "%s exhausted its requeue budget of %d", id, max)
@@ -1030,7 +998,7 @@ func submitRequestTx(tx *sql.Tx, r Request, assets string) (Request, bool, *exit
 		artifact_outputs)
 		VALUES(?,?,?,?,?,?,?,?,?,0,0,?,?,?,?,?,?,?,?)`,
 		r.ID, r.IdemKey, r.BodyDigest, r.Endpoint, r.Entrypoint, r.PlanID, r.Payload,
-		r.Outputs, r.State, r.CreatedAt, r.Kind, r.Org, r.Trees, r.Worker, r.InstallID,
+		r.Outputs, r.State, r.CreatedAt, r.Kind, r.Org, r.Trees, r.Worker, nullable(r.InstallID),
 		assets, r.ArtifactOutputs); err != nil {
 		return Request{}, false, exit.Internalf("cannot record request %s: %s", r.ID, err)
 	}
@@ -1087,16 +1055,6 @@ func ordinalLaws(tx *sql.Tx, requestID string) (int64, *exit.Error) {
 	if requestState != "submitted" && requestState != "queued" {
 		return 0, exit.New(exit.Conflict,
 			"request %s is %s and may not mint another attempt", requestID, requestState)
-	}
-	var workflowCancel int
-	if err := tx.QueryRow(`SELECT EXISTS(
-		SELECT 1 FROM workflow_steps s JOIN workflow_executions w ON w.id=s.workflow_id
-		WHERE s.child_request_id=? AND w.state='canceling')`, requestID).Scan(&workflowCancel); err != nil {
-		return 0, exit.Internalf("cannot read workflow cancellation for %s: %s", requestID, err)
-	}
-	if workflowCancel == 1 {
-		return 0, exit.New(exit.Conflict,
-			"request %s belongs to a canceling workflow and may not dispatch", requestID)
 	}
 	var open int
 	if err := tx.QueryRow(`SELECT COUNT(*) FROM attempts
@@ -1873,100 +1831,6 @@ func (s *Store) Media(mediaID string) (*Output, string, int64, *exit.Error) {
 	return &o, requestID, attempt, nil
 }
 
-// ------------------------------------------------------------------ retention (cl-033)
-//
-// Locally mirrored outputs are the ONE thing on this host that grows forever: the bytes
-// are fetched before the terminal is acked and are deliberately never dropped with the
-// pod (that is the whole point — a rental costs $2/hr and its results must outlive it).
-// Retention is therefore a POLICY, and it lives here as two reads and one stamp:
-//
-//	RetainedOutputs     what is on this disk, so a user can ask before anything decides
-//	ReclaimableOutputs  the plan's one query: settled, older than the horizon, not a job
-//	MarkOutputReclaimed the row survives its bytes, so a reclaimed id is a 410, not a 404
-//
-// The row is NEVER deleted. `api/media.go` already answers `media_reclaimed` when the
-// bytes are gone, and "was reclaimed" is a different fact from "never existed".
-
-// RetainedOutput is one published output plus the facts retention decides on: which
-// request produced it, what kind of request that was, when it became visible, and
-// whether its bytes are still here.
-type RetainedOutput struct {
-	Output
-	RequestID   string
-	Attempt     int64
-	Endpoint    string
-	Kind        string
-	VisibleAt   string
-	ReclaimedAt string
-}
-
-const retainedCols = `o.output_id,o.media_id,o.path,o.digest,o.length,o.mime_type,
-	o.request_id,o.attempt,r.endpoint,r.kind,o.visible_at,o.reclaimed_at`
-
-func scanRetained(rows *sql.Rows) (RetainedOutput, error) {
-	var x RetainedOutput
-	err := rows.Scan(&x.OutputID, &x.MediaID, &x.Path, &x.Digest, &x.Length, &x.MimeType,
-		&x.RequestID, &x.Attempt, &x.Endpoint, &x.Kind, &x.VisibleAt, &x.ReclaimedAt)
-	return x, err
-}
-
-func (s *Store) retained(where string, args ...any) ([]RetainedOutput, *exit.Error) {
-	rows, err := s.db.Query(`SELECT `+retainedCols+` FROM outputs o
-		JOIN attempts a ON a.request_id=o.request_id AND a.attempt=o.attempt
-		JOIN requests r ON r.id=o.request_id
-		WHERE a.state IN ('terminal','closed') `+where, args...)
-	if err != nil {
-		return nil, exit.Internalf("cannot read the retained outputs: %s", err)
-	}
-	defer rows.Close()
-	out := []RetainedOutput{}
-	for rows.Next() {
-		x, err := scanRetained(rows)
-		if err != nil {
-			return nil, exit.Internalf("cannot read a retained output row: %s", err)
-		}
-		out = append(out, x)
-	}
-	return out, nil
-}
-
-// RetainedOutputs is everything this host published, newest first — reclaimed rows
-// included and marked as such, because "I had 40 of these and gc took 12" is the answer
-// a user asking about their disk actually wants.
-func (s *Store) RetainedOutputs() ([]RetainedOutput, *exit.Error) {
-	return s.retained(`ORDER BY o.visible_at DESC, o.output_id`)
-}
-
-// ReclaimableOutputs is the retention plan's ONE query, and every clause in it is a
-// refusal to delete something someone still needs:
-//
-//	reclaimed_at=''   its bytes have not already been reclaimed
-//	visible_at < cut  it is older than the horizon — nothing recent is ever a candidate,
-//	                  which is what makes "shut the pod down, then look at the files" safe
-//	r.kind <> 'job'   a job's bytes are its durable PUBLICATION (cl-004), not a mirror
-//	no live attempt   the request is settled; an in-flight attempt owns its directory
-//
-// This is deliberately NOT an unreferenced sweep. Every retained output belongs to a
-// settled request by construction, so "nothing references it" is true of ALL of them and
-// would reclaim exactly the files this plane exists to keep.
-func (s *Store) ReclaimableOutputs(cutoff string) ([]RetainedOutput, *exit.Error) {
-	return s.retained(`AND o.reclaimed_at='' AND o.visible_at < ? AND r.kind <> 'job'
-		AND NOT EXISTS (SELECT 1 FROM attempts la WHERE la.request_id=o.request_id
-		  AND la.state IN ('preparing','offered','accepted','recovered_open'))
-		ORDER BY o.visible_at, o.output_id`, cutoff)
-}
-
-// MarkOutputReclaimed stamps one row after its bytes are gone. Idempotent: the stamp is
-// written only over an empty one, so a crash between the unlink and the stamp converges
-// on the next `cozy gc` instead of needing a journal of its own.
-func (s *Store) MarkOutputReclaimed(mediaID string) *exit.Error {
-	if _, err := s.db.Exec(`UPDATE outputs SET reclaimed_at=? WHERE media_id=? AND reclaimed_at=''`,
-		now(), mediaID); err != nil {
-		return exit.Internalf("cannot mark %s reclaimed: %s", mediaID, err)
-	}
-	return nil
-}
-
 // ---------------------------------------------------------------- publications (cl-004)
 
 const publicationCols = `request_id,attempt,repo,root,status,cause,entries,bytes,committed_at`
@@ -1990,36 +1854,6 @@ func (s *Store) PublicationOf(requestID string) (*Publication, *exit.Error) {
 		return nil, exit.Internalf("cannot read the publication of %s: %s", requestID, err)
 	}
 	return &p, nil
-}
-
-// Publications lists every committed publication, newest first.
-func (s *Store) Publications(limit int) ([]Publication, *exit.Error) {
-	rows, err := s.db.Query(`SELECT `+publicationCols+` FROM publications
-		ORDER BY committed_at DESC LIMIT ?`, limit)
-	if err != nil {
-		return nil, exit.Internalf("cannot list publications: %s", err)
-	}
-	defer rows.Close()
-	var out []Publication
-	for rows.Next() {
-		p, err := scanPublication(rows)
-		if err != nil {
-			return nil, exit.Internalf("cannot read a publication row: %s", err)
-		}
-		out = append(out, p)
-	}
-	return out, nil
-}
-
-// PublicationStats is the part of local disk ownership `cozy gc` must disclose even
-// though it may not reclaim it. A job publication is the durable result, not a cache or
-// mirrored output governed by the media horizon.
-func (s *Store) PublicationStats() (items int, bytes int64, e *exit.Error) {
-	if err := s.db.QueryRow(`SELECT count(*),COALESCE(sum(bytes),0) FROM publications`).Scan(
-		&items, &bytes); err != nil {
-		return 0, 0, exit.Internalf("cannot summarize retained job publications: %s", err)
-	}
-	return items, bytes, nil
 }
 
 // ---------------------------------------------------------------- job checkpoints
@@ -2149,8 +1983,6 @@ func (s *Store) Counts() (map[string]int, *exit.Error) {
 		"active_attempts":    `SELECT COUNT(*) FROM attempts WHERE state IN ('preparing','offered','accepted','terminal')`,
 		"recovered_attempts": `SELECT COUNT(*) FROM attempts WHERE state='recovered_open'`,
 		"outputs":            `SELECT COUNT(*) FROM outputs`,
-		"workflows":          `SELECT COUNT(*) FROM workflow_executions`,
-		"active_workflows":   `SELECT COUNT(*) FROM workflow_executions WHERE state IN ('running','canceling')`,
 	} {
 		var n int
 		if err := s.db.QueryRow(query).Scan(&n); err != nil {

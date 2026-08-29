@@ -16,7 +16,6 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
-	"sort"
 
 	"github.com/cozy-creator/cozy-creator/internal/canonical"
 	"github.com/cozy-creator/cozy-creator/internal/exit"
@@ -169,8 +168,8 @@ func tokenAt(path, subject string) (secret.Value, *exit.Error) {
 	if err != nil {
 		return secret.Value{}, exit.New(exit.NotFound,
 			"%s has no owner token on this host", subject).
-			WithRemedy("`cozy rent` writes it when the pod comes ready; a rental rented elsewhere is not this host's").
-			WithNext("cozy rent ls")
+			WithRemedy("`cozy rental new` writes it when the pod comes ready; a rental rented elsewhere is not this host's").
+			WithNext("cozy rental list")
 	}
 	// Windows reports 0666 for every file: the boundary there is the user profile's ACL,
 	// which already scopes COZY_HOME to the user, so the bits are not consulted.
@@ -178,7 +177,7 @@ func tokenAt(path, subject string) (secret.Value, *exit.Error) {
 		return secret.Value{}, exit.New(exit.Credential,
 			"%s is mode %#o; a rental's owner token is 0600 or it is not used", path, perm).
 			WithRemedy("release this rental and rent again: every rental provisions its own token").
-			WithNext("cozy rent ls")
+			WithNext("cozy rental list")
 	}
 	data, err := os.ReadFile(path)
 	if err != nil {
@@ -188,7 +187,7 @@ func tokenAt(path, subject string) (secret.Value, *exit.Error) {
 	v := secret.New(string(data))
 	if !v.Present() {
 		return secret.Value{}, exit.New(exit.Credential,
-			"%s's owner token file is empty", subject).WithNext("cozy rent ls")
+			"%s's owner token file is empty", subject).WithNext("cozy rental list")
 	}
 	return v, nil
 }
@@ -216,14 +215,14 @@ func Known(st *records.Store) func(string) (*orchestrator.DesiredPlacement, *exi
 			return nil, exit.Named(exit.Unavailable, "rental.convergence_pending",
 				"rental %s is %s; Tensorhub has not accepted its relayed worker convergence evidence",
 				id, row.State).
-				WithRemedy("keep `cozy up` running so this host's RecordOwner can claim and converge the private worker")
+				WithRemedy("keep `cozy invoke list` running so this host's RecordOwner can claim and converge the private worker")
 		}
 		if row.Address == "" {
 			return nil, noAddress(id, row.State)
 		}
 		if row.CertPath == "" {
 			return nil, exit.Unavailablef("rental %s has exact control but its WorkerTarget is not attached yet", id).
-				WithRemedy("wait for `cozy rent` to validate and atomically publish the target")
+				WithRemedy("wait for `cozy rental new` to validate and atomically publish the target")
 		}
 		facts, e := controlFacts(*row)
 		if e != nil {
@@ -254,86 +253,22 @@ func Descriptor(st *records.Store, id string) (*launch.Descriptor, *exit.Error) 
 	return facts.Descriptor, nil
 }
 
-// ControlSummary is the exact, non-secret execution closure Tensorhub selected for one
-// attached rental. It is an observation surface for acceptance and diagnosis, never an
-// input to selection: callers still ask only for endpoint + provider-neutral accelerator.
-type ControlSummary struct {
-	PlacementRevision                 uint64   `json:"placement_revision"`
-	ControlSnapshotDigest             string   `json:"control_snapshot_digest"`
-	EndpointExecutionDigest           string   `json:"endpoint_execution_digest"`
-	ArtifactObjectSetDigest           string   `json:"artifact_object_set_digest"`
-	ModelRootDigests                  []string `json:"model_root_digests"`
-	EndpointReleaseID                 string   `json:"endpoint_release_id"`
-	DescriptorDigest                  string   `json:"descriptor_digest"`
-	EnvironmentSpecDigest             string   `json:"environment_spec_digest"`
-	InstalledEnvironmentReceiptDigest string   `json:"installed_environment_receipt_digest"`
-	PlacementSetDigest                string   `json:"placement_set_digest"`
-	BindingPlanDigests                []string `json:"binding_plan_digests"`
-}
-
-// Inspect returns the persisted rental row plus the verified projection of its exact
-// acquisition-attempt control snapshot. No provider resource id, lane selector, or secret
-// is exposed or reconstructed.
-func Inspect(st *records.Store, id string) (*records.Rental, ControlSummary, *exit.Error) {
-	row, e := st.RentalRow(id)
-	if e != nil || row == nil {
-		if e == nil {
-			e = unknown(id)
-		}
-		return row, ControlSummary{}, e
-	}
-	summary, e := Summarize(*row)
-	return row, summary, e
-}
-
-// Summarize verifies and projects one retained exact control snapshot without
-// consulting the live rentals table. Workflow receipts use it after dial authority
-// has been released.
-func Summarize(row records.Rental) (ControlSummary, *exit.Error) {
-	facts, e := controlFacts(row)
-	if e != nil {
-		return ControlSummary{}, e
-	}
-	plans := make([]string, 0, len(facts.Placement.Bindings))
-	for _, binding := range facts.Placement.Bindings {
-		planID, problem := binding.PlanID()
-		if problem != nil {
-			return ControlSummary{}, problem
-		}
-		plans = append(plans, planID)
-	}
-	sort.Strings(plans)
-	return ControlSummary{
-		PlacementRevision:                 row.PlacementRevision,
-		ControlSnapshotDigest:             row.ControlSnapshotDigest,
-		EndpointExecutionDigest:           facts.EndpointExecutionDigest,
-		ArtifactObjectSetDigest:           facts.ArtifactObjectSetDigest,
-		ModelRootDigests:                  append([]string(nil), facts.ModelRootDigests...),
-		EndpointReleaseID:                 facts.Placement.ReleaseID,
-		DescriptorDigest:                  facts.Placement.DescriptorDigest,
-		EnvironmentSpecDigest:             facts.Placement.EnvironmentSpecDigest,
-		InstalledEnvironmentReceiptDigest: facts.Placement.InstalledEnvironmentReceiptDigest,
-		PlacementSetDigest:                facts.Placement.ExactPlacementSetDigest,
-		BindingPlanDigests:                plans,
-	}, nil
-}
-
 func unknown(id string) *exit.Error {
 	return exit.New(exit.NotFound, "no rental %s on this host", id).
-		WithRemedy("`cozy rent ls` names the pods this host holds").
-		WithNext("cozy rent ls")
+		WithRemedy("`cozy rental list` names the pods this host holds").
+		WithNext("cozy rental list")
 }
 
 func noAddress(id, state string) *exit.Error {
 	return exit.Unavailablef("rental %s is %s and carries no address yet", id, state).
-		WithRemedy("`cozy rent ls` shows its state; a pod that failed to provision never gets one").
-		WithNext("cozy rent ls")
+		WithRemedy("`cozy rental list` shows its state; a pod that failed to provision never gets one").
+		WithNext("cozy rental list")
 }
 
 // Resolver is what the service entrypoint hands the orchestrator as `Options.Rentals`. It
 // is the DIAL-TIME resolution — the one place the owner token is read, at the moment it
 // becomes Claim.proof. It reads the store on EVERY call rather than closing over a
-// snapshot: `cozy rent` is a records-plane act that runs against a service already up, so
+// snapshot: `cozy rental new` is a records-plane act that runs against a service already up, so
 // a resolver that cached would refuse the rental the user just made until a restart.
 func Resolver(l home.Layout, st *records.Store) func(string) (*orchestrator.RemoteTarget, *exit.Error) {
 	return func(id string) (*orchestrator.RemoteTarget, *exit.Error) {
@@ -368,7 +303,7 @@ func Resolver(l home.Layout, st *records.Store) func(string) (*orchestrator.Remo
 			return nil, exit.New(exit.NotFound,
 				"rental %s pins a certificate this host cannot read: %s", id, err).
 				WithRemedy("release this rental and rent again; the pin is written with the token").
-				WithNext("cozy rent release " + id + " --yes")
+				WithNext("cozy rental end " + id)
 		}
 		spec := &orchestrator.WorkerConnection{
 			RentalID: row.ID, Addr: row.Address, Token: token, CACert: cert,
@@ -429,49 +364,6 @@ func ArtifactGrants(st *records.Store, client *hub.Client) orchestrator.Artifact
 			})
 		}
 		return revision, grant, nil
-	}
-}
-
-func PlacementRevisions(st *records.Store, client *hub.Client) orchestrator.PlacementRevisionSource {
-	return func(ctx context.Context, connection *orchestrator.WorkerConnection,
-		endpointRef, idempotencyKey, reason string) (orchestrator.DesiredPlacement, uint64, *exit.Error) {
-		if connection == nil || connection.RentalID == "" {
-			return orchestrator.DesiredPlacement{}, 0,
-				exit.Named(exit.Validation, "rental.placement_revision_invalid", "rental identity is absent")
-		}
-		row, problem := st.RentalRow(connection.RentalID)
-		if problem != nil {
-			return orchestrator.DesiredPlacement{}, 0, problem
-		}
-		if row == nil {
-			return orchestrator.DesiredPlacement{}, 0, unknown(connection.RentalID)
-		}
-		if row.Hub != client.Base() {
-			return orchestrator.DesiredPlacement{}, 0, exit.Named(exit.Conflict, "rental.hub_mismatch",
-				"rental %s belongs to %s, configured hub is %s", row.ID, row.Hub, client.Base())
-		}
-		answer, problem := client.ReviseRentalPlacement(ctx, row.ID, endpointRef, idempotencyKey, reason)
-		if problem != nil {
-			return orchestrator.DesiredPlacement{}, 0, problem
-		}
-		facts, problem := remotecontrol.Decode(answer.ControlSnapshot, answer.EndpointRef)
-		if problem != nil {
-			return orchestrator.DesiredPlacement{}, 0, problem
-		}
-		if facts.Placement.ExactPlacementSetDigest != answer.PlacementSet.Digest ||
-			!bytes.Equal(facts.Placement.ExactPlacementSetBytes, answer.PlacementSet.CanonicalBytes) ||
-			int64(len(facts.Placement.ExactPlacementSetBytes)) != answer.PlacementSet.Length {
-			return orchestrator.DesiredPlacement{}, 0, exit.Named(exit.Conflict,
-				"rental.placement_revision_invalid",
-				"revision %d control snapshot and placement_set response disagree",
-				answer.PlacementRevision)
-		}
-		facts.Placement.PlacementRevision = answer.PlacementRevision
-		if problem := st.ReviseRentalControl(row.ID, answer.EndpointRef, answer.PlacementRevision,
-			answer.ControlSnapshot.Digest, answer.ControlSnapshot.CanonicalBytes); problem != nil {
-			return orchestrator.DesiredPlacement{}, 0, problem
-		}
-		return facts.Placement, answer.PlacementRevision, nil
 	}
 }
 

@@ -27,7 +27,6 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
-	"sort"
 	"strconv"
 	"strings"
 
@@ -237,54 +236,4 @@ func Stage(dir string, record map[string]any) (string, *exit.Error) {
 		return "", exit.Internalf("cannot stage the binding record: %s", err)
 	}
 	return id, nil
-}
-
-// Verify re-derives a staged record's id from its own bytes and checks it against the
-// name it was delivered under. It is what makes the media server's plan route fail-closed:
-// a record that does not hash to its own name is not the plan the owner dispatched
-// against, whoever sent it, and the pod refuses it rather than staging a plan the
-// orchestrator will then name in a directive.
-//
-// This check exists only because the identity became path-free: under `/1` the pod could
-// not have recomputed the id at all, because the digest covered the owner's own paths.
-func Verify(data []byte, claimed string) (map[string]any, *exit.Error) {
-	var record map[string]any
-	if err := json.Unmarshal(data, &record); err != nil {
-		return nil, exit.New(exit.Validation,
-			"the binding record is not a JSON document: %s", err)
-	}
-	if stated, _ := record[IDKey].(string); stated != "" && stated != claimed {
-		return nil, exit.Named(exit.Validation, "plan_id_disagreement",
-			"the record names itself %s and was delivered as %s", short(stated), short(claimed))
-	}
-	id, e := ID(record)
-	if e != nil {
-		return nil, e
-	}
-	if id != claimed {
-		return nil, exit.Named(exit.Validation, "plan_id_mismatch",
-			"this record's identity hashes to %s and it was delivered as %s: a binding plan "+
-				"is named by the digest of its own identity, so a record that does not hash "+
-				"to its name is not the plan the owner dispatched against",
-			short(id), short(claimed)).
-			WithRemedy("identity fields: %s", strings.Join(sortedKeys(Identity(record)), ", "))
-	}
-	return record, nil
-}
-
-func sortedKeys(m map[string]any) []string {
-	out := make([]string, 0, len(m))
-	for k := range m {
-		out = append(out, k)
-	}
-	sort.Strings(out)
-	return out
-}
-
-func short(id string) string {
-	bare := strings.TrimPrefix(id, "sha256:")
-	if len(bare) > 12 {
-		return "sha256:" + bare[:12] + "…"
-	}
-	return id
 }

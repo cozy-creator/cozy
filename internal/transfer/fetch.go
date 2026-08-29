@@ -438,14 +438,6 @@ func DownloadExact(ctx context.Context, subject, url, dst, digest string, length
 	return nil
 }
 
-func short(ids []string) []string {
-	out := make([]string, 0, len(ids))
-	for _, id := range ids {
-		out = append(out, short1(id))
-	}
-	return out
-}
-
 func short1(id string) string {
 	h := strings.TrimPrefix(id, "sha256:")
 	if len(h) > 12 {
