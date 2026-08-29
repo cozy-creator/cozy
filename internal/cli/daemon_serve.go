@@ -10,6 +10,7 @@ import (
 	"syscall"
 
 	"github.com/cozy-creator/cozy-creator/internal/api"
+	"github.com/cozy-creator/cozy-creator/internal/config"
 	"github.com/cozy-creator/cozy-creator/internal/daemon"
 	"github.com/cozy-creator/cozy-creator/internal/exit"
 	"github.com/cozy-creator/cozy-creator/internal/home"
@@ -55,7 +56,11 @@ func serveDaemon(ctx *Context) *exit.Error {
 	// LOOPBACK-ONLY, and the bind happens before anything durable does. internal/api
 	// owns the only net.Listen("tcp", …) in this binary; there is no flag that widens
 	// it, because the LAN door is deferred behind TLS and its own threat review.
-	v4, v6, addr, e := api.Listeners(port)
+	listen := api.Listeners
+	if ctx.Cfg.PortSource == "default" && port == config.DefaultPort {
+		listen = api.PreferredListeners
+	}
+	v4, v6, addr, e := listen(port)
 	if e != nil {
 		return e
 	}

@@ -27,15 +27,18 @@ var Inherited = []string{"PATH", "HOME", "LANG", "LC_ALL", "TMPDIR", "SSL_CERT_F
 
 const (
 	DefaultHubURL = "http://127.0.0.1:8080"
-	DefaultPort   = 0
+	DefaultPort   = 8818
 	FileName      = "config.yaml"
 )
 
 // Config is the frozen value consumed by the rest of the process.
 type Config struct {
-	Home  string
-	Port  int
-	Yield string
+	Home string
+	Port int
+	// PortSource distinguishes the product default, which may fall back when
+	// occupied, from an operator-selected port that must bind exactly.
+	PortSource string
+	Yield      string
 
 	HubURL         string
 	HubToken       secret.Value
@@ -62,7 +65,7 @@ type values struct {
 	HubToken                 string `name:"tensorhub_token"`
 	Tfs                      string `name:"tfs" default:"tfs"`
 	LocalRateMicroUSDPerHour int64  `name:"local_rate_micro_usd_per_hour" default:"0"`
-	Port                     int    `name:"port" default:"0"`
+	Port                     int    `name:"port" default:"8818"`
 	Yield                    string `name:"yield" default:"smart" enum:"smart,always,never"`
 	Bootstrap                string `name:"bootstrap"`
 }
@@ -136,6 +139,7 @@ func load() (Config, *exit.Error) {
 	c := Config{
 		Home:                     home,
 		Port:                     input.Port,
+		PortSource:               sourceOf("port", file, environment, "default"),
 		Yield:                    input.Yield,
 		HubURL:                   strings.TrimRight(strings.TrimSpace(input.HubURL), "/"),
 		HubToken:                 hubToken,

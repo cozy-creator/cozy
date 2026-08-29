@@ -1,8 +1,10 @@
 package api
 
 import (
+	"errors"
 	"net"
 	"strconv"
+	"syscall"
 
 	"github.com/cozy-creator/cozy-creator/internal/exit"
 )
@@ -28,8 +30,23 @@ import (
 // refusing to start there would be a worse bug than serving v4 only. What it returns is
 // the truth about which families are live, so `doctor` can say so.
 func Listeners(port int) (v4 net.Listener, v6 net.Listener, addr string, e *exit.Error) {
+	return listeners(port, false)
+}
+
+// PreferredListeners binds the stable product port when available and falls
+// back to an OS-selected loopback port only when another process already owns
+// it. Explicitly configured ports use Listeners and remain strict.
+func PreferredListeners(port int) (v4 net.Listener, v6 net.Listener, addr string, e *exit.Error) {
+	return listeners(port, true)
+}
+
+func listeners(port int, fallbackIfHeld bool) (v4 net.Listener, v6 net.Listener, addr string, e *exit.Error) {
 	wanted := "127.0.0.1:" + strconv.Itoa(port)
 	v4, err := listenLoopback("tcp4", wanted)
+	if err != nil && fallbackIfHeld && errors.Is(err, syscall.EADDRINUSE) {
+		wanted = "127.0.0.1:0"
+		v4, err = listenLoopback("tcp4", wanted)
+	}
 	if err != nil {
 		return nil, nil, "", exit.New(exit.Conflict, "%s is held by another process: %s", wanted, err).
 			WithRemedy("set another port in config.yaml, or stop what holds it")

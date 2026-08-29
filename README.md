@@ -44,7 +44,7 @@ localhost UI available:
 
 ```sh
 cozy up
-# open the returned http://127.0.0.1:<port>/ URL
+# open http://127.0.0.1:8818/ (or the returned fallback URL when 8818 is occupied)
 ```
 
 `up` backgrounds one lightweight per-user Cozy daemon: web UI, local API, durable records, local
@@ -180,9 +180,13 @@ The default local root is `~/.cozy`. Configuration is read once from
 tensorhub_url: https://tensorhub.example
 tensorhub_token: replace-with-your-token
 tfs: /usr/local/bin/tfs
-port: 2699
+port: 8818
 local_rate_micro_usd_per_hour: 250000
 ```
+
+Without a configured `port`, Cozy prefers `127.0.0.1:8818` and falls back to an available
+loopback port when another process owns 8818. A configured nonzero port is strict; `port: 0`
+explicitly asks the OS to select any available port.
 
 The YAML schema is strict: unknown keys, duplicate keys, nested structures, and multiple documents
 are refused. Cozy does not load a working-directory `.env` file.
