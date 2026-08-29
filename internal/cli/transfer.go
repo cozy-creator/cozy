@@ -131,11 +131,15 @@ func handleModelPublish(ctx *Context) *exit.Error {
 		return e
 	}
 
+	status, changed := "published", res.Moved > 0
+	if p.DryRun {
+		status, changed = "planned", false
+	}
 	fields := []output.Field{
 		{K: "model", V: ref.String()},
 		{K: "snapshot", V: snapshot},
-		{K: "status", V: "published"},
-		{K: "changed", V: res.Moved > 0},
+		{K: "status", V: status},
+		{K: "changed", V: changed},
 		{K: "publish_id", V: res.PublishID},
 		{K: "session", V: res.Session},
 		{K: "objects", V: res.Totals.DeclaredObjects},
@@ -144,8 +148,6 @@ func handleModelPublish(ctx *Context) *exit.Error {
 		{K: "deduped", V: output.Bytes(res.Deduped)},
 	}
 	if p.DryRun {
-		fields[2].V = "planned"
-		fields[3].V = false
 		fields = append(fields,
 			output.Field{K: "missing", V: res.Totals.MissingObjects},
 			output.Field{K: "held", V: res.Totals.HeldObjects})
@@ -198,19 +200,21 @@ func handleModelDownload(ctx *Context) *exit.Error {
 		return e
 	}
 
+	status, changed := "downloaded", res.Moved > 0
+	if f.DryRun {
+		status, changed = "planned", false
+	}
 	fields := []output.Field{
 		{K: "model", V: ref.String()},
 		{K: "snapshot", V: res.Snapshot},
-		{K: "status", V: "downloaded"},
-		{K: "changed", V: res.Moved > 0},
+		{K: "status", V: status},
+		{K: "changed", V: changed},
 		{K: "objects", V: res.Objects},
 		{K: "bytes", V: output.Bytes(res.Bytes)},
 		{K: "moved", V: output.Bytes(res.Moved)},
 		{K: "deduped", V: output.Bytes(res.Held)},
 	}
 	if f.DryRun {
-		fields[2].V = "planned"
-		fields[3].V = false
 		rec := compactRecord(fields, "model", "snapshot", "status", "bytes", "changed")
 		rec.Next = []string{"cozy model download " + ref.String() + "@" + res.Snapshot}
 		return emit(ctx, rec)
