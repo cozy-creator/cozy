@@ -1,4 +1,4 @@
-package remotecontrol
+package live
 
 import (
 	"crypto/sha256"
@@ -8,6 +8,7 @@ import (
 	"testing"
 
 	"github.com/cozy-creator/cozy-creator/internal/hub"
+	"github.com/cozy-creator/cozy-creator/internal/remotecontrol"
 )
 
 type rentalFixture struct {
@@ -39,7 +40,7 @@ func exact(raw []byte) hub.ExactControlDocument {
 
 func TestDecodeCurrentTensorhubRentalSnapshot(t *testing.T) {
 	fixture := currentRental(t)
-	facts, problem := Decode(fixture.ControlSnapshot, fixture.EndpointRef)
+	facts, problem := remotecontrol.Decode(fixture.ControlSnapshot, fixture.EndpointRef)
 	if problem != nil {
 		t.Fatal(problem)
 	}
@@ -63,7 +64,7 @@ func TestDecodeRefusesRetiredEvaluatedConfigFields(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, problem := Decode(exact(raw), fixture.EndpointRef); problem == nil ||
+	if _, problem := remotecontrol.Decode(exact(raw), fixture.EndpointRef); problem == nil ||
 		problem.ErrName() != "rental.control_snapshot_invalid" {
 		t.Fatalf("retired snapshot evaluated_config was not refused: %v", problem)
 	}
@@ -96,7 +97,7 @@ func TestDecodeRefusesRetiredEvaluatedConfigFields(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, problem := Decode(exact(raw), fixture.EndpointRef); problem == nil ||
+	if _, problem := remotecontrol.Decode(exact(raw), fixture.EndpointRef); problem == nil ||
 		problem.ErrName() != "rental.control_snapshot_invalid" {
 		t.Fatalf("retired bundle evaluated_config was not refused: %v", problem)
 	}
