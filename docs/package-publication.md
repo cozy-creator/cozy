@@ -22,8 +22,9 @@ The example publishes as `paul/marco-polo-package@1.0.0`. Cozy does not add a `v
 a second name/version on the command line. The configured `tensorhub_url` is the destination;
 credentials come from Cozy configuration or `TENSORHUB_TOKEN` and never enter project metadata.
 
-The project also supplies `uv.lock` and `package.toml`. Cozy
-skips `.env*`, credentials, VCS directories, virtual environments, caches,
+The project also supplies `uv.lock` and `package.toml`. `uv.lock` preserves local installation
+behavior; Tensorhub derives execution requirements from the built wheel and never dereferences
+`[tool.uv.sources]`. Cozy skips `.env*`, credentials, VCS directories, virtual environments, caches,
 editor state, bytecode, and build output. Modified and ordinary untracked files
 are published normally.
 
@@ -47,6 +48,11 @@ dependency list, model binding, or custom-wheel declaration. Tensorhub reads the
 uploaded bytes, computes their hashes and lengths, inspects package metadata,
 and derives compatible base worker images from its own inventory. Reopening a
 committed release is an idempotent no-upload replay.
+
+Finalize commits valid package custody even when no compatible base is active. In that case Cozy
+reports a successful publication with zero qualified executions. Tensorhub later reconciles the
+same release after base activation; it does not require another upload or package version. Serving
+and rental selection remain closed until exact profile proof creates a qualified execution.
 
 Cozy also supplies Tensorhub's internal audit text from the command and exact
 package release. Publishers do not write an audit reason or release message.
