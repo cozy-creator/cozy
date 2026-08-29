@@ -95,17 +95,17 @@ func TestEndpointPublishPromoteCLI(t *testing.T) {
 			_ = json.NewEncoder(w).Encode(map[string]any{"created": true,
 				"release": "1.0.0", "declaration_digest": fixtureDigest(declaration),
 				"profiles": []map[string]any{
-					{"profile": endpointprofile.CU126, "state": "candidate", "candidate_id": "candidate-126",
+					{"profile": endpointprofile.CU126, "state": "qualified", "candidate_id": "candidate-126",
 						"base_realization_kind": "oci", "base_realization_digest": "registry.invalid/tensorhub-worker@sha256:" + strings.Repeat("a", 64),
 						"endpoint_environment_spec": map[string]any{"digest": "sha256:" + strings.Repeat("b", 64), "length": 1},
 						"resolved_wheel_set":        map[string]any{"digest": "sha256:" + strings.Repeat("c", 64), "length": 1},
 						"resolution_lock":           map[string]any{"digest": "sha256:" + strings.Repeat("d", 64), "length": 1}},
-					{"profile": endpointprofile.CU130, "state": "candidate", "candidate_id": "candidate-130",
+					{"profile": endpointprofile.CU130, "state": "qualified", "candidate_id": "candidate-130",
 						"base_realization_kind": "oci", "base_realization_digest": "registry.invalid/tensorhub-worker@sha256:" + strings.Repeat("e", 64),
 						"endpoint_environment_spec": map[string]any{"digest": "sha256:" + strings.Repeat("f", 64), "length": 1},
 						"resolved_wheel_set":        map[string]any{"digest": "sha256:" + strings.Repeat("1", 64), "length": 1},
 						"resolution_lock":           map[string]any{"digest": "sha256:" + strings.Repeat("2", 64), "length": 1}}},
-				"endpoint_executions": []map[string]string{{"profile": endpointprofile.CU126, "function": "marco", "digest": "sha256:" + strings.Repeat("1", 64), "state": "candidate"}}})
+				"endpoint_executions": []map[string]string{{"profile": endpointprofile.CU126, "function": "marco", "digest": "sha256:" + strings.Repeat("1", 64), "state": "qualified"}}})
 		case r.Method == http.MethodPost && strings.HasSuffix(r.URL.Path, "/promote"):
 			var body struct {
 				Serving []map[string]string `json:"serving"`
@@ -140,7 +140,7 @@ func TestEndpointPublishPromoteCLI(t *testing.T) {
 	// Exact replay omits create (resource exists) and must send identical declaration bytes.
 	replay := append([]string(nil), args...)
 	replay = deleteArg(replay, "--create")
-	if code, out := run(replay...); code != 0 || !strings.Contains(out, "true") || !strings.Contains(out, "candidate") {
+	if code, out := run(replay...); code != 0 || !strings.Contains(out, "true") || !strings.Contains(out, "qualified") {
 		t.Fatalf("endpoint publish replay [exit %d]\n%s", code, out)
 	}
 	if code, out := run("endpoint", "promote", "cozy/marco", "1.0.0", "--serve", "v1/marco",

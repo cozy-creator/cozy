@@ -112,8 +112,8 @@ done
 # receipt-addressed files under Creator's fixed local registry. In refused-mode
 # this is only a deterministic gate fixture. Candidate proof requires the caller
 # to attest that RUNTIME_VENV is the exact WHM base, never a torch-free source venv.
-if [ "$EXPECTED_PROFILE_STATE" = candidate ] && [ "$MANAGED_BASE_IS_EXACT" != 1 ]; then
-  echo "candidate proof requires MANAGED_BASE_IS_EXACT=1 and an exact WHM Runtime/base venv" >&2
+if [ "$EXPECTED_PROFILE_STATE" != refused ] && [ "$MANAGED_BASE_IS_EXACT" != 1 ]; then
+  echo "non-refused proof requires MANAGED_BASE_IS_EXACT=1 and an exact WHM Runtime/base venv" >&2
   exit 2
 fi
 python3 - "$RUNTIME_VENV" "$WORK/home" "$PROFILE_B" \
@@ -213,7 +213,7 @@ admin=(-H "Authorization: Bearer $ADMIN_TOKEN" -H 'X-Tensorhub-Reason: Creator p
 status=$(curl -sS -o "$WORK/local-before.json" -w '%{http_code}' -X POST \
   "$BASE/v1/endpoints/proof/marco/releases/live-1/profiles/$PROFILE_B/local-qualification-materials" \
   "${admin[@]}" -H 'Content-Type: application/json' -d '{"grant_ttl_seconds":600}')
-if [ "$EXPECTED_PROFILE_STATE" = candidate ]; then
+if [ "$EXPECTED_PROFILE_STATE" != refused ]; then
   test "$status" = 200
   grep -q 'managed-local' "$WORK/local-before.json"
   grep -q 'lease_id' "$WORK/local-before.json"
@@ -221,11 +221,16 @@ else
   test "$status" = 409
   grep -q 'endpoint_local.candidate_refused' "$WORK/local-before.json"
 fi
-set +e
-"$WORK/cozy" endpoint promote proof/marco live-1 --serve v1/marco --reason "prequalification gate" \
-  >"$WORK/promote-before.out" 2>&1
-promote_rc=$?
-set -e
-test "$promote_rc" = 13
+if [ "$EXPECTED_PROFILE_STATE" = qualified ]; then
+  "$WORK/cozy" endpoint promote proof/marco live-1 --serve v1/marco \
+    --reason "publication-proof-qualified endpoint promotion" >"$WORK/promote.out"
+else
+  set +e
+  "$WORK/cozy" endpoint promote proof/marco live-1 --serve v1/marco --reason "prequalification gate" \
+    >"$WORK/promote-before.out" 2>&1
+  promote_rc=$?
+  set -e
+  test "$promote_rc" = 13
+fi
 
 echo "endpoint-profile-live: PASS — publish/replay, two profiles, native refusal, local materials/refusal, promotion gate"
