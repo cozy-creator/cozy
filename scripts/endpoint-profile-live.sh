@@ -15,6 +15,7 @@ RUNTIME_VENV="${COZY_RUNTIME_VENV:-$HOME/cozy_v2/.worktrees/cozy-runtime/cr-052-
 unset COZY_RUNTIME_VENV
 RUN_PAID="${RUN_PAID:-0}"
 EXPECTED_PROFILE_STATE="${EXPECTED_PROFILE_STATE:-candidate}"
+MANAGED_BASE_IS_EXACT="${MANAGED_BASE_IS_EXACT:-0}"
 WORK="${WORK:-$(mktemp -d)}"
 PG_NAME="creator-endpoint-profile-pg-$$"
 S3_NAME="creator-endpoint-profile-s3-$$"
@@ -114,9 +115,14 @@ for profile in "$PROFILE_A" "$PROFILE_B"; do
     --profile "$profile" --manifest "$WORK/hub/vectors/base-worker-image-wheelhouse-$build.json")
 done
 
-# Register one exact managed-local realization for profile B and materialize the
-# same receipt-addressed base under Creator's fixed local registry. Registration
-# freezes identity only; it does not qualify endpoint code or borrow OCI evidence.
+# Register one managed-local receipt for profile B and materialize the same
+# receipt-addressed files under Creator's fixed local registry. In refused-mode
+# this is only a deterministic gate fixture. Candidate proof requires the caller
+# to attest that RUNTIME_VENV is the exact WHM base, never a torch-free source venv.
+if [ "$EXPECTED_PROFILE_STATE" = candidate ] && [ "$MANAGED_BASE_IS_EXACT" != 1 ]; then
+  echo "candidate proof requires MANAGED_BASE_IS_EXACT=1 and an exact WHM Runtime/base venv" >&2
+  exit 2
+fi
 python3 - "$RUNTIME_VENV" "$WORK/home" "$PROFILE_B" \
   "$WORK/hub/vectors/base-worker-image-wheelhouse-cu130.json" "$WORK" <<'PY'
 import base64,hashlib,json,pathlib,shutil,sys
