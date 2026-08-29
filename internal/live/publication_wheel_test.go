@@ -7,12 +7,14 @@ import (
 	"encoding/base64"
 	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"sort"
 	"strings"
 	"testing"
 
 	"github.com/cozy-creator/cozy-creator/internal/endpointprofile"
+	"github.com/cozy-creator/cozy-creator/internal/endpointpublish"
 	"github.com/cozy-creator/cozy-creator/internal/wheel"
 )
 
@@ -86,10 +88,142 @@ object = "marco_polo:app"
 	}
 }
 
+func TestEndpointPublishPackage(t *testing.T) {
+	repo := t.TempDir()
+	mustWrite(t, filepath.Join(repo, "pyproject.toml"), `[project]
+name = "marco-polo"
+version = "1.0.0"
+dependencies = []
+`)
+	mustWrite(t, filepath.Join(repo, "endpoint.toml"), `[application]
+object = "marco_polo:app"
+`)
+	mustWrite(t, filepath.Join(repo, "marco_polo.py"), "app = object()\n")
+	mustWrite(t, filepath.Join(repo, "uv.lock"), "version = 1\n")
+	mustWrite(t, filepath.Join(repo, "endpoint.descriptor.json"), `{
+  "jobs": [],
+  "format": "cozy.endpoint.descriptor/1",
+  "entrypoints": [],
+  "application": "marco_polo:app"
+}`)
+	mustWrite(t, filepath.Join(repo, "endpoint.release.json"), `{
+  "model_roots": [],
+  "compatible_accelerator_models": ["NVIDIA GeForce RTX 4090", "NVIDIA GeForce RTX 4090"]
+}`)
+	git(t, repo, "init", "-q")
+	git(t, repo, "config", "user.email", "fixture@example.invalid")
+	git(t, repo, "config", "user.name", "Fixture")
+	git(t, repo, "add", ".")
+	git(t, repo, "commit", "-qm", "fixture")
+
+	custom := filepath.Join(t.TempDir(), "custom_op-1.2.3-cp312-cp312-manylinux_2_28_x86_64.whl")
+	writeTestWheel(t, custom, "custom_op", "1.2.3", false,
+		[]string{"cp312-cp312-manylinux_2_28_x86_64"}, map[string][]byte{
+			"custom_op/__init__.py": []byte("from ._native import run\n"),
+			"custom_op/_native.so":  []byte("prebuilt-native-fixture"),
+		})
+	request := endpointpublish.Request{Tree: repo, Release: "1.0.0",
+		Profiles: []string{endpointprofile.CU130, endpointprofile.CU126},
+		CustomWheels: []string{
+			endpointprofile.CU130 + "=" + custom,
+			endpointprofile.CU126 + "=" + custom,
+		},
+	}
+	a, problem := endpointpublish.Prepare(request)
+	if problem != nil {
+		t.Fatalf("first package refused: %s", problem)
+	}
+	defer a.Close()
+	if a.Declaration.Format != "tensorhub.endpoint_release_declaration/1" ||
+		len(a.Declaration.ModelRoots) != 0 {
+		t.Fatalf("weightless declaration format/root set is wrong: %+v", a.Declaration)
+	}
+	request.Release = "prod_2026-08-28.a" // release grammar is opaque, never a wheel version
+	request.Profiles = []string{endpointprofile.CU126, endpointprofile.CU130, endpointprofile.CU126}
+	b, problem := endpointpublish.Prepare(request)
+	if problem != nil {
+		t.Fatalf("second package refused: %s", problem)
+	}
+	defer b.Close()
+	aBytes, _ := a.Declaration.CanonicalBytes()
+	bBytes, _ := b.Declaration.CanonicalBytes()
+	if !bytes.Equal(aBytes, bBytes) || a.Declaration.SourceArchive != b.Declaration.SourceArchive ||
+		a.Declaration.ProjectWheel.Digest != b.Declaration.ProjectWheel.Digest {
+		t.Fatalf("same committed tree/profile set did not reproduce\n%s\n%s", aBytes, bBytes)
+	}
+	if len(a.Declaration.CustomWheels) != 1 || len(a.Declaration.CustomWheels[0].Profiles) != 2 ||
+		len(a.Files) != 6 || string(mustRead(t, a.Files["evaluated_config"])) != "{}" {
+		t.Fatalf("incomplete declaration or upload role set: %+v files=%v", a.Declaration, a.Files)
+	}
+
+	checkpointA := "sha256:" + strings.Repeat("a", 64)
+	checkpointZ := "sha256:" + strings.Repeat("f", 64)
+	objectRef := `{"digest":"sha256:` + strings.Repeat("b", 64) + `","length":10}`
+	mustWrite(t, filepath.Join(repo, "endpoint.descriptor.json"), `{"application":"marco_polo:app","entrypoints":[{"models":[{"class":"Model"}],"name":"marco"}],"format":"cozy.endpoint.descriptor/1","jobs":[]}`)
+	git(t, repo, "add", "endpoint.descriptor.json")
+	git(t, repo, "commit", "-qm", "declare model input")
+	if _, problem := endpointpublish.Prepare(request); problem == nil || problem.ErrName() != "endpoint_model_bindings_absent" {
+		t.Fatalf("model-bearing descriptor without bindings did not refuse: %v", problem)
+	}
+	mustWrite(t, filepath.Join(repo, "endpoint.release.json"), `{
+  "compatible_accelerator_models": ["NVIDIA H200"],
+  "model_roots": [
+    {"org":"cozy","name":"z-model","checkpoint_id":"`+checkpointZ+`"},
+    {"org":"cozy","name":"a-model","checkpoint_id":"`+checkpointA+`"},
+    {"org":"cozy","name":"z-model","checkpoint_id":"`+checkpointZ+`"}
+  ],
+  "model_bindings": [
+    {"path":"z.path","checkpoint":{"org":"cozy","name":"z-model","checkpoint_id":"`+checkpointZ+`"},"config":{"assets":[],"document":`+objectRef+`},"execution_layout":[{"component":"transformer","root":{"org":"cozy","name":"z-model","checkpoint_id":"`+checkpointZ+`"}}],"hardware_variant":"sm90"},
+    {"path":"a.path","checkpoint":{"org":"cozy","name":"a-model","checkpoint_id":"`+checkpointA+`"},"config":{"assets":[{"name":"tokenizer","ref":`+objectRef+`}],"document":`+objectRef+`},"execution_layout":[{"component":"encoder","root":{"org":"cozy","name":"a-model","checkpoint_id":"`+checkpointA+`"}}],"hardware_variant":"sm90"}
+  ]
+}`)
+	git(t, repo, "add", "endpoint.release.json")
+	git(t, repo, "commit", "-qm", "bind models")
+	modelPackage, problem := endpointpublish.Prepare(request)
+	if problem != nil {
+		t.Fatalf("model-bearing package refused: %s", problem)
+	}
+	defer modelPackage.Close()
+	if len(modelPackage.Declaration.ModelRoots) != 2 ||
+		modelPackage.Declaration.ModelRoots[0].Name != "a-model" ||
+		len(modelPackage.Declaration.ModelBindings) != 2 ||
+		modelPackage.Declaration.ModelBindings[0].Path != "a.path" {
+		t.Fatalf("model roots/bindings are not canonical: %+v %+v",
+			modelPackage.Declaration.ModelRoots, modelPackage.Declaration.ModelBindings)
+	}
+
+	mustWrite(t, filepath.Join(repo, "uncommitted.py"), "x=1\n")
+	if _, problem := endpointpublish.Prepare(request); problem == nil || problem.ErrName() != "endpoint_tree_dirty" {
+		t.Fatalf("dirty source tree did not refuse: %v", problem)
+	}
+	must(t, os.Remove(filepath.Join(repo, "uncommitted.py")))
+	mustWrite(t, filepath.Join(repo, "native.so"), "native")
+	git(t, repo, "add", "native.so")
+	git(t, repo, "commit", "-qm", "plant native")
+	if _, problem := endpointpublish.Prepare(request); problem == nil || problem.ErrName() != "endpoint_source_native_input" {
+		t.Fatalf("committed native source did not refuse before packaging: %v", problem)
+	}
+}
+
 func mustWrite(t *testing.T, path, body string) {
 	t.Helper()
 	must(t, os.MkdirAll(filepath.Dir(path), 0o755))
 	must(t, os.WriteFile(path, []byte(body), 0o644))
+}
+
+func mustRead(t *testing.T, path string) []byte {
+	t.Helper()
+	body, err := os.ReadFile(path)
+	must(t, err)
+	return body
+}
+
+func git(t *testing.T, dir string, args ...string) {
+	t.Helper()
+	cmd := exec.Command("git", append([]string{"-C", dir}, args...)...)
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("git %s: %s\n%s", strings.Join(args, " "), err, out)
+	}
 }
 
 func writeTestWheel(t *testing.T, filename, distribution, version string, pure bool,

@@ -644,6 +644,33 @@ func send(ctx context.Context, method, url string, open func() (io.ReadCloser, e
 		WithRemedy("re-run to resume from Tensorhub's durable transfer rows")
 }
 
+// UploadPresigned is the shared storage-edge PUT for endpoint-release role grants.
+// It sends the exact local file under every signed header and reports whether bytes
+// moved. A 412 means another writer won the immutable no-clobber race; Tensorhub still
+// verifies the final bytes during finalize.
+func UploadPresigned(ctx context.Context, subject, path, url string, length int64,
+	headers map[string]string,
+) (bool, *exit.Error) {
+	info, err := os.Stat(path)
+	if err != nil || !info.Mode().IsRegular() || info.Size() != length {
+		return false, exit.Named(exit.Conflict, "upload.local_bytes_changed",
+			"%s is no longer the declared %d-byte regular file", path, length).
+			WithRemedy("restart endpoint publication from one unchanged committed source package")
+	}
+	status, _, body, problem := send(ctx, http.MethodPut, url, opener(path, 0, length), length, headers)
+	if problem != nil {
+		return false, problem
+	}
+	switch status {
+	case http.StatusOK, http.StatusCreated, http.StatusNoContent:
+		return true, nil
+	case http.StatusPreconditionFailed:
+		return false, nil
+	default:
+		return false, storageRefusal(status, subject, body)
+	}
+}
+
 // storageRefusal renders what the storage layer said. It is not our vocabulary and
 // is not translated: BadDigest and SignatureDoesNotMatch mean exactly what they say.
 func storageRefusal(status int, subject string, body []byte) *exit.Error {

@@ -46,7 +46,7 @@ const (
 // py3-none-any payload with no native/build member. Custom wheels may contain native
 // binaries but never native source or a build recipe; they remain prebuilt inputs.
 func Inspect(file string, class InspectClass) (Fact, *exit.Error) {
-	var out Fact
+	out := Fact{ImportRoots: []string{}, Tags: []string{}}
 	abs, err := filepath.Abs(file)
 	if err != nil {
 		return out, exit.Usagef("wheel path %q is not resolvable: %s", file, err)

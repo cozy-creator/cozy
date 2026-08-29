@@ -83,7 +83,7 @@ func TestProductPath(t *testing.T) {
 		{[]string{"rm"}, 7, "error(confirm)"},
 		{[]string{"model", "export", "anything"}, 9, "error(unavailable)"},
 		{[]string{"datasets", "push"}, 2, "it lands with issue th-035"},
-		{[]string{"endpoint", "publish", "cozy/example", "--release", "v1"}, 2, "it lands with issue cl-039"},
+		{[]string{"endpoint", "publish", "cozy/example", "--release", "v1", "--reason", "fixture"}, 2, "at least one --profile is required"},
 		{[]string{"repo", "show", "cozy/example"}, 2, `unknown command "repo show"`},
 		{[]string{"search"}, 2, `unknown command "search"`},
 		{[]string{"endpoints", "show", "cozy/example"}, 2, `unknown command "endpoints show"`},

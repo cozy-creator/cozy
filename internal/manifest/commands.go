@@ -675,30 +675,53 @@ var Commands = []Command{
 		Exits:      []exit.Code{exit.OK, exit.NotFound, exit.Unavailable},
 		Capability: "cmd.model.export", NeedsServer: true, Status: Planned, Issue: "cl-008",
 	},
-	// `endpoint publish` is cl-039's Creator client over th-046 release assembly.
-	// `endpoint promote` is cl-041's explicit consumer of th-004's serving pointer.
-	// Both are advertised-but-unbuilt here; th-003 is already complete.
+	// Endpoint publication, paid profile qualification, and atomic serving promotion
+	// are three explicit acts. None invokes either of the other two.
 	{
 		Path: []string{"endpoint", "publish"}, Group: "transfer",
-		Summary: "publish an endpoint release — deferred to cl-039's th-046 client",
+		Summary: "publish one source release and frozen profile candidate set",
 		Args:    "<org/endpoint>", MinArgs: 1, MaxArgs: 1,
 		Flags: []Flag{
-			{Name: "--release", Arg: "<id>", Summary: "immutable endpoint release id"},
+			{Name: "--release", Arg: "<id>", Summary: "required immutable endpoint release id"},
 			{Name: "--dir", Arg: "<tree>", Summary: "endpoint source tree", Default: "the working directory"},
+			{Name: "--profile", Arg: "<profile>", Summary: "required approved compatibility profile (repeatable)"},
+			{Name: "--custom-wheel", Arg: "<profile>=<path>", Summary: "exact prebuilt custom wheel (repeatable)"},
 			{Name: "--create", Summary: "required for the first publish of a new name"},
-			{Name: "--detach", Summary: "return after upload"},
+			{Name: "--reason", Arg: "<why>", Summary: "required; recorded before each mutation"},
 		},
-		Exits:      []exit.Code{exit.OK, exit.NotFound, exit.Credential, exit.Failed},
-		Capability: "cmd.endpoint.publish", Status: Planned, Issue: "cl-039",
-		Examples: []string{"cozy endpoint publish org/endpoint --release 1.0.0 --dir ."},
+		Exits:      []exit.Code{exit.OK, exit.Usage, exit.Validation, exit.NotFound, exit.Credential, exit.Structural, exit.Unavailable, exit.Deadline, exit.Failed, exit.Conflict},
+		Capability: "cmd.endpoint.publish", Status: Implemented, Handler: "endpoint.publish",
+		Next:     []string{"cozy endpoint qualify <org/endpoint>@<release> --profile <profile> --gpu <model> --max-cost <usd> --reason <why>", "cozy endpoint promote <org/endpoint> <release> --serve <vN/function> --reason <why>"},
+		Examples: []string{"cozy endpoint publish org/endpoint --release 1.0.0 --profile torch2.13.0-cu130-cp312-linux-x86 --reason <why>", "cozy endpoint publish org/endpoint --release 1.0.0 --profile torch2.13.0-cu126-cp312-linux-x86 --custom-wheel torch2.13.0-cu126-cp312-linux-x86=./dist/custom.whl --reason <why>"},
+	},
+	{
+		Path: []string{"endpoint", "qualify"}, Group: "transfer",
+		Summary: "explicitly run one endpoint profile on paid compatible hardware",
+		Args:    "<org/endpoint>@<release>", MinArgs: 1, MaxArgs: 1,
+		Flags: []Flag{
+			{Name: "--profile", Arg: "<profile>", Summary: "required exact candidate profile"},
+			{Name: "--gpu", Arg: "<model>", Summary: "required provider-neutral accelerator model"},
+			{Name: "--max-cost", Arg: "<usd>", Summary: "required provider exposure ceiling in USD"},
+			{Name: "--duration", Arg: "<duration>", Summary: "qualification lease cap", Default: "15m"},
+			{Name: "--reason", Arg: "<why>", Summary: "required; recorded before paid acquisition"},
+		},
+		Exits:      []exit.Code{exit.OK, exit.Usage, exit.Validation, exit.NotFound, exit.Credential, exit.Unavailable, exit.Deadline, exit.Failed, exit.Conflict, exit.Capacity},
+		Capability: "cmd.endpoint.qualify", Status: Implemented, Handler: "endpoint.qualify",
+		Next:     []string{"cozy endpoint promote <org/endpoint> <release> --serve <vN/function> --reason <why>"},
+		Examples: []string{"cozy endpoint qualify org/endpoint@1.0.0 --profile torch2.13.0-cu130-cp312-linux-x86 --gpu 'NVIDIA GeForce RTX 4090' --max-cost 0.25 --reason <why>"},
 	},
 	{
 		Path: []string{"endpoint", "promote"}, Group: "transfer",
-		Summary: "move the serving pointer — deferred to cl-041 over th-004",
+		Summary: "atomically move explicit qualified release serving pointers",
 		Args:    "<org/endpoint> <release-id>", MinArgs: 2, MaxArgs: 2,
-		Flags:      []Flag{{Name: "--serve", Arg: "<major>", Summary: "required; no default"}},
-		Exits:      []exit.Code{exit.OK, exit.Usage, exit.NotFound, exit.Credential},
-		Capability: "cmd.endpoint.promote", Status: Planned, Issue: "cl-041",
+		Flags: []Flag{
+			{Name: "--serve", Arg: "<vN/function>", Summary: "required serving target (repeatable; no bare major)"},
+			{Name: "--reason", Arg: "<why>", Summary: "required; recorded before the pointer transaction"},
+		},
+		Exits:      []exit.Code{exit.OK, exit.Usage, exit.Validation, exit.NotFound, exit.Credential, exit.Unavailable, exit.Deadline, exit.Conflict},
+		Capability: "cmd.endpoint.promote", Status: Implemented, Handler: "endpoint.promote",
+		Next:     []string{"cozy endpoint show <org/endpoint>"},
+		Examples: []string{"cozy endpoint promote org/endpoint 1.0.0 --serve v1/generate --reason <why>", "cozy endpoint promote org/endpoint 1.0.0 --serve v1/generate --serve v1/edit --reason <why>"},
 	},
 
 	// ---- account (th-031, Wave 2) ----

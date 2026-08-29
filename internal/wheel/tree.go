@@ -125,6 +125,11 @@ func walk(root string) ([]entry, *exit.Error) {
 		if ext := strings.ToLower(path.Ext(rel)); compiledExt[ext] {
 			return refuseCompiled(rel)
 		}
+		if strings.EqualFold(path.Ext(rel), ".whl") {
+			return exit.Named(exit.Validation, "project_wheel_nested_wheel",
+				"%s is a wheel nested inside the project wheel", rel).
+				WithRemedy("pass it separately as an exact prebuilt --custom-wheel; Creator never vendors or retags it")
+		}
 		if buildInputName(rel) {
 			return refuseBuildInput(rel)
 		}

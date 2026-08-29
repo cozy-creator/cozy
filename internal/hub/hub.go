@@ -60,19 +60,21 @@ type Client struct {
 	// slow answers calls whose work or response is bounded by bytes rather than total
 	// wall time. Connection setup and headers are still bounded, and response bodies are
 	// guarded below by observed byte progress.
-	slow  *http.Client
-	agent string
+	slow    *http.Client
+	patient *http.Client // paid/proof operations: caller envelope bounds work, not a header clock
+	agent   string
 }
 
 // New builds the client from the frozen config value. It reads no environment.
 func New(cfg config.Config, agent string) *Client {
 	return &Client{
-		base:   strings.TrimRight(cfg.HubURL, "/"),
-		token:  cfg.HubToken,
-		source: cfg.HubTokenSource,
-		http:   &http.Client{Timeout: Timeout},
-		slow:   &http.Client{Transport: slowTransport()},
-		agent:  agent,
+		base:    strings.TrimRight(cfg.HubURL, "/"),
+		token:   cfg.HubToken,
+		source:  cfg.HubTokenSource,
+		http:    &http.Client{Timeout: Timeout},
+		slow:    &http.Client{Transport: slowTransport()},
+		patient: &http.Client{Transport: patientTransport()},
+		agent:   agent,
 	}
 }
 
@@ -80,6 +82,12 @@ func slowTransport() *http.Transport {
 	t := http.DefaultTransport.(*http.Transport).Clone()
 	t.DialContext = (&net.Dialer{Timeout: Timeout, KeepAlive: 30 * time.Second}).DialContext
 	t.ResponseHeaderTimeout = Timeout
+	return t
+}
+
+func patientTransport() *http.Transport {
+	t := slowTransport()
+	t.ResponseHeaderTimeout = 0
 	return t
 }
 
@@ -179,6 +187,10 @@ type call struct {
 	// byBytes drops the total wall clock for work bounded by bytes. Connection setup and
 	// headers remain bounded, and an answer body must keep making byte progress.
 	byBytes bool
+	// patient removes the response-header clock for a server-side operation already
+	// bounded by its own explicit resource/cost/duration envelope. Once headers arrive,
+	// the ordinary response-body progress guard applies.
+	patient bool
 	// responseBytes widens the ordinary small-JSON cap for one explicitly bounded
 	// response shape and moves the call onto the slow client: a large snapshot body
 	// is bounded by these bytes, not by Timeout.
@@ -352,6 +364,12 @@ func (c *Client) do(ctx context.Context, cl call, out any) *exit.Error {
 	if cl.byBytes || cl.responseBytes > 0 {
 		client = c.slow
 		req, progress = guardResponse(req)
+	}
+	if cl.patient {
+		client = c.patient
+		if progress == nil {
+			req, progress = guardResponse(req)
+		}
 	}
 	resp, err := client.Do(req)
 	if err != nil {
