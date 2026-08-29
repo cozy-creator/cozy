@@ -5,7 +5,6 @@ import (
 	"sort"
 	"strings"
 	"sync"
-	"time"
 
 	"github.com/cozy-creator/cozy-creator/internal/exit"
 	"github.com/cozy-creator/cozy-creator/internal/hub"
@@ -31,10 +30,6 @@ func handlePackagePublish(ctx *Context) *exit.Error {
 		return problem
 	}
 	defer pack.Close()
-	declaration, problem := pack.Declaration.CanonicalBytes()
-	if problem != nil {
-		return problem
-	}
 
 	c := client(ctx)
 	hctx, cancel := hub.LongContext()
@@ -47,24 +42,33 @@ func handlePackagePublish(ctx *Context) *exit.Error {
 			return problem
 		}
 	}
-	begun, problem := c.BeginPackageRelease(hctx, ref, release, declaration, reason)
+	begun, problem := c.BeginPackageRelease(hctx, ref, release, reason)
 	if problem != nil {
 		return problem
 	}
-	if problem := validateBegin(pack, begun); problem != nil {
-		return problem
+	if begun.Release != release || (begun.State != "pending" && begun.State != "committed") {
+		return exit.Internalf("package begin returned another release or invalid state %q", begun.State)
 	}
-	moved, held, problem := uploadPackageRoles(hctx, pack, begun.Uploads)
+	var moved int64
+	if begun.State == "pending" {
+		sources, problem := c.PackageReleaseSourceUploads(hctx, ref, release,
+			packagepublish.Paths(pack.Files), reason)
+		if problem != nil {
+			return problem
+		}
+		moved, problem = uploadPackageFiles(hctx, pack, begun.ProjectWheelUpload, sources.Uploads)
+		if problem != nil {
+			return problem
+		}
+	}
+	done, problem := c.FinalizePackageRelease(hctx, ref, release, reason)
 	if problem != nil {
 		return problem
 	}
-	done, problem := c.FinalizePackageRelease(hctx, ref, release, declaration, reason)
-	if problem != nil {
-		return problem
+	if done.Release != release {
+		return exit.Internalf("package finalize returned another release %q", done.Release)
 	}
-	if problem := validateFinalize(pack, release, done); problem != nil {
-		return problem
-	}
+
 	profileRows := make([]string, 0, len(done.Profiles))
 	var candidateRows, refusalRows []string
 	for _, profile := range done.Profiles {
@@ -85,10 +89,9 @@ func handlePackagePublish(ctx *Context) *exit.Error {
 	fields := []output.Field{
 		{K: "package", V: ref.String()}, {K: "release", V: done.Release},
 		{K: "status", V: "published"}, {K: "changed", V: begun.State != "committed"},
-		{K: "declaration", V: done.DeclarationDigest}, {K: "created", V: done.Created},
-		{K: "profiles", V: profileRows}, {K: "package_executions", V: len(done.PackageExecutions)},
-		{K: "uploaded", V: output.Bytes(moved)}, {K: "held", V: output.Bytes(held)},
-		{K: "hub", V: c.Base()},
+		{K: "created", V: done.Created}, {K: "profiles", V: profileRows},
+		{K: "package_executions", V: len(done.PackageExecutions)},
+		{K: "uploaded", V: output.Bytes(moved)}, {K: "hub", V: c.Base()},
 	}
 	if len(candidateRows) > 0 {
 		fields = append(fields, output.Field{K: "candidates", V: candidateRows})
@@ -109,180 +112,72 @@ func shorten(value string, limit int) string {
 	return value
 }
 
-func validateBegin(pack *packagepublish.Package, begun hub.PackageReleaseBegin) *exit.Error {
-	if begun.DeclarationDigest != pack.Declaration.Digest() ||
-		(begun.State != "pending" && begun.State != "committed") {
-		return exit.Internalf("package begin returned another declaration or invalid state %q", begun.State)
-	}
-	want := declarationRoles(pack)
-	seen := map[string]bool{}
-	for _, upload := range begun.Uploads {
-		local, ok := want[upload.Role]
-		if !ok || seen[upload.Role] {
-			return exit.Internalf("package begin returned unknown or duplicate upload role %q", upload.Role)
-		}
-		seen[upload.Role] = true
-		if upload.Ref.Digest != local.ref.Digest || upload.Ref.Length != local.ref.Length {
-			return exit.Internalf("package begin changed the identity of role %s", upload.Role)
-		}
-		if !upload.AlreadyHeld && upload.URL == "" {
-			return exit.Internalf("package begin returned no URL for missing role %s", upload.Role)
-		}
-		if !upload.AlreadyHeld {
-			expires, err := time.Parse(time.RFC3339, upload.ExpiresAt)
-			if err != nil || !expires.After(time.Now()) {
-				return exit.Internalf("package begin returned an absent, malformed, or expired upload grant for %s", upload.Role)
-			}
-		}
-	}
-	if len(seen) != len(want) {
-		return exit.Internalf("package begin returned %d of %d declared upload roles", len(seen), len(want))
-	}
-	return nil
+type packageFile struct {
+	subject string
+	path    string
+	upload  hub.PackageUpload
 }
 
-func validateFinalize(pack *packagepublish.Package, release string,
-	done hub.PackageReleaseFinalize,
-) *exit.Error {
-	if done.Release != release || done.DeclarationDigest != pack.Declaration.Digest() {
-		return exit.Internalf("package finalize returned another release or declaration digest")
+func uploadPackageFiles(ctx context.Context, pack *packagepublish.Package, wheel hub.PackageUpload,
+	sources []hub.PackageUpload,
+) (int64, *exit.Error) {
+	files := make([]packageFile, 0, len(sources)+1)
+	files = append(files, packageFile{subject: "project_wheel", path: pack.Wheel, upload: wheel})
+	want := make(map[string]string, len(pack.Files))
+	for path, local := range pack.Files {
+		want[path] = local
 	}
-	seenProfiles := map[string]bool{}
-	seenRealizations := map[string]bool{}
-	qualifiedProfiles := map[string]bool{}
-	for _, row := range done.Profiles {
-		if row.Profile == "" || seenProfiles[row.Profile] {
-			return exit.Internalf("package finalize returned an empty or duplicate profile %q", row.Profile)
+	for _, upload := range sources {
+		local, ok := want[upload.Path]
+		if !ok {
+			return 0, exit.Internalf("package uploads returned unknown or duplicate source path %q", upload.Path)
 		}
-		seenProfiles[row.Profile] = true
-		key := row.Profile + "\x00" + row.BaseRealizationKind
-		if seenRealizations[key] || (row.BaseRealizationKind != "oci" && row.BaseRealizationKind != "managed-local") ||
-			row.CandidateID == "" || !baseRealization(row.BaseRealizationKind, row.BaseRealizationDigest) ||
-			!objectRef(row.PackageEnvironmentSpec) || !objectRef(row.ResolvedWheelSet) ||
-			!objectRef(row.ResolutionLock) {
-			return exit.Internalf("package finalize returned malformed or duplicate realization %q/%q",
-				row.Profile, row.BaseRealizationKind)
-		}
-		seenRealizations[key] = true
-		if row.State != "qualified" && row.State != "refused" {
-			return exit.Internalf("package finalize returned unknown profile state %q", row.State)
-		}
-		if row.State == "refused" && row.RefusalCode == "" {
-			return exit.Internalf("package finalize returned a refusal without a typed code")
-		}
-		if row.State == "qualified" {
-			if row.RefusalCode != "" || row.RefusalDetail != "" {
-				return exit.Internalf("package finalize returned refusal detail on a passing candidate")
-			}
-			qualifiedProfiles[row.Profile] = true
-		}
+		delete(want, upload.Path)
+		files = append(files, packageFile{subject: upload.Path, path: local, upload: upload})
 	}
-	seenExecutions := map[string]bool{}
-	for _, execution := range done.PackageExecutions {
-		key := execution.Profile + "\x00" + execution.Function
-		if !qualifiedProfiles[execution.Profile] || strings.TrimSpace(execution.Function) == "" ||
-			seenExecutions[key] || !sha256Digest(execution.Digest) ||
-			execution.State != "qualified" {
-			return exit.Internalf("package finalize returned malformed or duplicate execution %q/%q",
-				execution.Profile, execution.Function)
-		}
-		seenExecutions[key] = true
+	if len(want) != 0 {
+		return 0, exit.Internalf("package uploads omitted %d source files", len(want))
 	}
-	return nil
-}
 
-func objectRef(ref hub.ObjectRef) bool { return sha256Digest(ref.Digest) && ref.Length > 0 }
-
-func baseRealization(kind, value string) bool {
-	if kind == "managed-local" {
-		return sha256Digest(value)
-	}
-	repository, manifest, ok := strings.Cut(value, "@")
-	return kind == "oci" && ok && repository != "" && !strings.ContainsAny(repository, "@ \t\r\n") &&
-		sha256Digest(manifest)
-}
-
-func sha256Digest(value string) bool {
-	if len(value) != 71 || !strings.HasPrefix(value, "sha256:") {
-		return false
-	}
-	for _, r := range strings.TrimPrefix(value, "sha256:") {
-		if !strings.ContainsRune("0123456789abcdef", r) {
-			return false
-		}
-	}
-	return true
-}
-
-type localRole struct {
-	ref  packagepublish.ObjectRef
-	path string
-}
-
-func declarationRoles(pack *packagepublish.Package) map[string]localRole {
-	d := pack.Declaration
-	out := map[string]localRole{
-		"source_archive":     {ref: d.SourceArchive, path: pack.Files["source_archive"]},
-		"source_lock":        {ref: d.SourceLock, path: pack.Files["source_lock"]},
-		"project_wheel":      {ref: packagepublish.ObjectRef{Digest: d.ProjectWheel.Digest, Length: d.ProjectWheel.Length}, path: pack.Files["project_wheel"]},
-		"package_descriptor": {ref: d.PackageDescriptor, path: pack.Files["package_descriptor"]},
-	}
-	return out
-}
-
-func uploadPackageRoles(ctx context.Context, pack *packagepublish.Package,
-	uploads []hub.PackageUpload,
-) (int64, int64, *exit.Error) {
-	want := declarationRoles(pack)
 	type outcome struct {
-		role  string
 		moved int64
-		held  int64
 		err   *exit.Error
 	}
-	results := make(chan outcome, len(uploads))
+	results := make(chan outcome, len(files))
 	var group sync.WaitGroup
-	for _, upload := range uploads {
-		local := want[upload.Role]
-		if upload.AlreadyHeld {
-			results <- outcome{role: upload.Role, held: local.ref.Length}
+	for _, file := range files {
+		if file.upload.AlreadyUploaded {
 			continue
 		}
+		if file.upload.URL == "" {
+			return 0, exit.Internalf("package upload returned no URL for %s", file.subject)
+		}
 		group.Add(1)
-		go func(upload hub.PackageUpload, local localRole) {
+		go func(file packageFile) {
 			defer group.Done()
-			moved, problem := transfer.UploadPresigned(ctx, upload.Role, local.path,
-				upload.URL, local.ref.Digest, local.ref.Length, upload.RequiredHeaders)
-			result := outcome{role: upload.Role, err: problem}
-			if moved {
-				result.moved = local.ref.Length
-			} else if problem == nil {
-				result.held = local.ref.Length
+			uploaded, bytes, problem := transfer.UploadPresigned(ctx, file.subject, file.path,
+				file.upload.URL, file.upload.RequiredHeaders)
+			if !uploaded {
+				bytes = 0
 			}
-			results <- result
-		}(upload, local)
+			results <- outcome{moved: bytes, err: problem}
+		}(file)
 	}
 	group.Wait()
 	close(results)
-	var moved, held int64
-	var failures []outcome
+	var moved int64
 	for result := range results {
 		moved += result.moved
-		held += result.held
 		if result.err != nil {
-			failures = append(failures, result)
+			return moved, result.err
 		}
 	}
-	if len(failures) > 0 {
-		sort.Slice(failures, func(i, j int) bool { return failures[i].role < failures[j].role })
-		return moved, held, failures[0].err
-	}
-	return moved, held, nil
+	return moved, nil
 }
 
 func packageReleaseRef(value string) (hub.Ref, string, *exit.Error) {
 	name, release, ok := strings.Cut(strings.TrimSpace(value), "@")
-	if !ok || release == "" || strings.Contains(release, "@") || strings.ContainsAny(release, `/\`) {
+	if !ok || release == "" || strings.Contains(release, "@") || strings.ContainsAny(release, `/\\`) {
 		return hub.Ref{}, "", exit.Usagef("%q is not <org/package>@<release>", value)
 	}
 	ref, problem := hub.ParseRef(name)

@@ -30,10 +30,10 @@ func TestQualifiedManagedLocalInstall(t *testing.T) {
 	layout, problem := home.Open(cozyHome)
 	fatal(t, problem)
 	projectTree := t.TempDir()
-	mustWrite(t, filepath.Join(projectTree, "pyproject.toml"), "[project]\nname=\"marco\"\nversion=\"1.0.0\"\n")
+	mustWrite(t, filepath.Join(projectTree, "pyproject.toml"), "[build-system]\nrequires=[\"uv_build>=0.9.18,<0.10\"]\nbuild-backend=\"uv_build\"\n\n[project]\nname=\"marco\"\nversion=\"1.0.0\"\n\n[tool.uv.build-backend]\nmodule-root=\"\"\n")
 	mustWrite(t, filepath.Join(projectTree, "package.toml"), "[application]\nobject=\"marco:app\"\n")
-	mustWrite(t, filepath.Join(projectTree, "marco.py"), "app=object()\n")
-	packed, problem := wheel.Pack(wheel.Request{Tree: projectTree, OutDir: t.TempDir()})
+	mustWrite(t, filepath.Join(projectTree, "marco", "__init__.py"), "app=object()\n")
+	packed, problem := wheel.Build(wheel.Request{Tree: projectTree, OutDir: t.TempDir()})
 	fatal(t, problem)
 	wheelBytes := mustRead(t, packed.Path)
 	customPath := filepath.Join(t.TempDir(), "custom_op-1.2.3-cp312-cp312-manylinux_2_28_x86_64.whl")
@@ -200,7 +200,7 @@ print(json.dumps({"digest":"sha256:"+hashlib.sha256(evidence).hexdigest(),"lengt
 				"native_wheel_proof": map[string]any{
 					"expected_result_digest": "sha256:" + strings.Repeat("3", 64), "fixture": "custom_op:run"},
 				"downloads": []map[string]any{
-					{"role": "project_wheel", "ref": map[string]any{"digest": packed.Digest, "length": len(wheelBytes)}, "url": server.URL + "/wheel", "expires_at": expiresAt},
+					{"role": "project_wheel", "ref": map[string]any{"digest": packed.Fact.Digest, "length": len(wheelBytes)}, "url": server.URL + "/wheel", "expires_at": expiresAt},
 					{"role": "custom_wheel:custom-op:" + strings.TrimPrefix(customFact.Digest, "sha256:"), "ref": map[string]any{"digest": customFact.Digest, "length": len(customBytes)}, "url": server.URL + "/custom", "expires_at": expiresAt},
 				},
 			})

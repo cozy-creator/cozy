@@ -1,35 +1,36 @@
 package live
 
 import (
-	"crypto/sha256"
-	"encoding/hex"
+	"archive/zip"
+	"bytes"
 	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
 	"sort"
 	"strings"
 	"sync"
 	"testing"
 
 	"github.com/cozy-creator/cozy-creator/internal/packageprofile"
-	"github.com/cozy-creator/cozy-creator/internal/packagepublish"
 )
 
 func TestPackagePublishCLI(t *testing.T) {
-	source := trackedPackageFixture(t)
+	source, testBin := packageFixture(t)
 	var server *httptest.Server
 	var lock sync.Mutex
-	var declaration []byte
-	var declared packagepublish.Declaration
+	state := "pending"
 	put := map[string][]byte{}
-	beginCount, finalizeCount := 0, 0
+	sourcePaths := map[string]string{}
+	beginCount, uploadsCount, finalizeCount := 0, 0, 0
 	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
-		if r.Method != http.MethodPut && r.Method != http.MethodGet && r.Header.Get("Authorization") != "Bearer admin" {
+		if r.Method == http.MethodPost && r.Header.Get("Authorization") != "Bearer admin" {
 			writeHubError(w, http.StatusUnauthorized, "auth.token_invalid", "wrong token")
 			return
 		}
@@ -37,70 +38,74 @@ func TestPackagePublishCLI(t *testing.T) {
 		case r.Method == http.MethodPost && r.URL.Path == "/v1/packages":
 			_, _ = w.Write([]byte(`{"package":{"org":"cozy","name":"marco","created_at":"2026-08-28T00:00:00Z"}}`))
 		case r.Method == http.MethodPost && strings.HasSuffix(r.URL.Path, "/begin"):
-			body, _ := io.ReadAll(r.Body)
+			var body map[string]any
+			if json.NewDecoder(r.Body).Decode(&body) != nil || len(body) != 0 {
+				t.Errorf("begin body is not empty JSON: %#v", body)
+			}
 			lock.Lock()
 			beginCount++
-			if declaration == nil {
-				declaration = append([]byte(nil), body...)
-				if err := json.Unmarshal(body, &declared); err != nil {
-					t.Errorf("begin declaration: %s", err)
-				}
-			} else if string(declaration) != string(body) {
-				t.Errorf("begin replay changed declaration bytes")
+			current := state
+			lock.Unlock()
+			wheel := map[string]any{"already_uploaded": current == "committed"}
+			if current == "pending" {
+				wheel["url"] = server.URL + "/put/wheel"
+				wheel["required_headers"] = map[string]string{"X-Test-Path": "project_wheel"}
+			}
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"release": "1.0.0", "state": current, "created": beginCount == 1,
+				"project_wheel_upload": wheel,
+			})
+		case r.Method == http.MethodPost && strings.HasSuffix(r.URL.Path, "/uploads"):
+			var request struct {
+				Paths []string `json:"paths"`
+			}
+			if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
+				t.Errorf("source upload request: %s", err)
+			}
+			rows := make([]map[string]any, 0, len(request.Paths))
+			lock.Lock()
+			uploadsCount++
+			for index, path := range request.Paths {
+				id := fmt.Sprintf("source-%d", index)
+				sourcePaths[id] = path
+				rows = append(rows, map[string]any{"path": path, "url": server.URL + "/put/" + id,
+					"required_headers": map[string]string{"X-Test-Path": path}, "already_uploaded": false})
 			}
 			lock.Unlock()
-			roles := fixtureDeclarationRoles(declared)
-			rows := make([]map[string]any, 0, len(roles))
-			for _, role := range sortedKeys(roles) {
-				ref := roles[role]
-				held := role == "package_descriptor"
-				row := map[string]any{"role": role, "ref": ref, "already_held": held,
-					"required_headers": map[string]string{}, "expires_at": "2099-08-29T00:00:00Z"}
-				if !held {
-					row["url"] = server.URL + "/put/" + role
-					row["required_headers"] = map[string]string{"X-Test-Role": role}
-				}
-				rows = append(rows, row)
-			}
-			digest := fixtureDigest(body)
-			_ = json.NewEncoder(w).Encode(map[string]any{"declaration_digest": digest,
-				"state": "pending", "uploads": rows})
+			_ = json.NewEncoder(w).Encode(map[string]any{"uploads": rows})
 		case r.Method == http.MethodPut && strings.HasPrefix(r.URL.Path, "/put/"):
-			role := strings.TrimPrefix(r.URL.Path, "/put/")
-			if r.Header.Get("X-Test-Role") != role {
-				t.Errorf("PUT %s omitted signed header", role)
+			id := strings.TrimPrefix(r.URL.Path, "/put/")
+			lock.Lock()
+			path := sourcePaths[id]
+			if id == "wheel" {
+				path = "project_wheel"
+			}
+			lock.Unlock()
+			if r.Header.Get("X-Test-Path") != path {
+				t.Errorf("PUT %s omitted signed header for %s", id, path)
 			}
 			body, _ := io.ReadAll(r.Body)
 			lock.Lock()
-			put[role] = body
+			put[path] = body
 			lock.Unlock()
-			w.WriteHeader(http.StatusOK)
+			w.WriteHeader(http.StatusNoContent)
 		case r.Method == http.MethodPost && strings.HasSuffix(r.URL.Path, "/finalize"):
-			body, _ := io.ReadAll(r.Body)
+			var body map[string]any
+			if json.NewDecoder(r.Body).Decode(&body) != nil || len(body) != 0 {
+				t.Errorf("finalize body is not empty JSON: %#v", body)
+			}
 			lock.Lock()
 			finalizeCount++
-			if string(declaration) != string(body) {
-				t.Errorf("finalize changed declaration bytes")
-			}
-			for role, ref := range fixtureDeclarationRoles(declared) {
-				if role == "package_descriptor" {
-					continue
-				}
-				body := put[role]
-				if int64(len(body)) != ref.Length || fixtureDigest(body) != ref.Digest {
-					t.Errorf("uploaded role %s disagrees with declaration", role)
-				}
-			}
+			created := state != "committed"
+			state = "committed"
 			lock.Unlock()
-			_ = json.NewEncoder(w).Encode(map[string]any{"created": true,
-				"release": "1.0.0", "declaration_digest": fixtureDigest(declaration),
-				"profiles": []map[string]any{
-					{"profile": packageprofile.CPU, "state": "qualified", "candidate_id": "candidate-cpu",
-						"base_realization_kind": "oci", "base_realization_digest": "registry.invalid/tensorhub-worker@sha256:" + strings.Repeat("a", 64),
-						"package_environment_spec": map[string]any{"digest": "sha256:" + strings.Repeat("b", 64), "length": 1},
-						"resolved_wheel_set":       map[string]any{"digest": "sha256:" + strings.Repeat("c", 64), "length": 1},
-						"resolution_lock":          map[string]any{"digest": "sha256:" + strings.Repeat("d", 64), "length": 1}}},
-				"package_executions": []map[string]string{{"profile": packageprofile.CPU, "function": "marco", "digest": "sha256:" + strings.Repeat("1", 64), "state": "qualified"}}})
+			_ = json.NewEncoder(w).Encode(map[string]any{"created": created,
+				"release": "1.0.0",
+				"profiles": []map[string]any{{"profile": packageprofile.CPU, "state": "qualified",
+					"candidate_id": "candidate-cpu", "base_realization_kind": "oci"}},
+				"package_executions": []map[string]string{{"profile": packageprofile.CPU,
+					"function": "marco", "state": "qualified"}},
+			})
 		default:
 			writeHubError(w, http.StatusNotFound, "route.not_found", r.Method+" "+r.URL.Path)
 		}
@@ -112,80 +117,91 @@ func TestPackagePublishCLI(t *testing.T) {
 	run := func(args ...string) (int, string) {
 		cmd := exec.Command("/usr/bin/nice", append([]string{"-n", "19", cozyBin}, args...)...)
 		cmd.Env = childEnv(t, home, "TENSORHUB_URL="+server.URL, "TENSORHUB_TOKEN=admin",
-			"PATH="+filepath.Join(source, ".test-bin")+":/usr/local/bin:/usr/bin:/bin")
+			"PATH="+testBin+":/usr/local/bin:/usr/bin:/bin")
 		body, _ := cmd.CombinedOutput()
 		return cmd.ProcessState.ExitCode(), string(body)
 	}
 	args := []string{"package", "publish", "cozy/marco", "--release", "1.0.0", "--dir", source,
 		"--reason", "fixture publish"}
 	if code, out := run(args...); code != 0 || !strings.Contains(out, "status: published") ||
-		!strings.Contains(out, "qualified") || strings.Contains(out, "candidate-cpu") {
+		!strings.Contains(out, "qualified") {
 		t.Fatalf("package publish [exit %d]\n%s", code, out)
 	}
-	// Exact replay sends identical declaration bytes and converges without a client journal.
 	if code, out := run(append(args, "--full")...); code != 0 ||
-		!strings.Contains(out, "candidate-cpu") || !strings.Contains(out, "qualified") {
+		!strings.Contains(out, "candidate-cpu") || !strings.Contains(out, "qualified") ||
+		!strings.Contains(out, "uploaded: 0B") {
 		t.Fatalf("package publish replay [exit %d]\n%s", code, out)
 	}
+
 	lock.Lock()
 	defer lock.Unlock()
-	if beginCount != 2 || finalizeCount != 2 {
-		t.Fatalf("calls begin=%d finalize=%d", beginCount, finalizeCount)
+	if beginCount != 2 || uploadsCount != 1 || finalizeCount != 2 {
+		t.Fatalf("calls begin=%d uploads=%d finalize=%d", beginCount, uploadsCount, finalizeCount)
+	}
+	for _, required := range []string{"package.toml", "marco_polo/__init__.py",
+		"marco_polo/untracked.py", "notes.txt", "pyproject.toml", "uv.lock"} {
+		if _, ok := put[required]; !ok {
+			t.Errorf("current working-tree file %s was not uploaded", required)
+		}
+	}
+	for _, forbidden := range []string{".env.local", ".ssh/id_rsa", ".venv/marker", "dist/stale.whl"} {
+		if _, ok := put[forbidden]; ok {
+			t.Errorf("local-only file %s was uploaded", forbidden)
+		}
+	}
+	wheelNames := wheelBytesNames(t, put["project_wheel"])
+	for _, required := range []string{"marco_polo/__init__.py", "marco_polo/untracked.py"} {
+		if !slices.Contains(wheelNames, required) {
+			t.Errorf("current working-tree file %s is absent from wheel %v", required, wheelNames)
+		}
 	}
 }
 
-func trackedPackageFixture(t *testing.T) string {
+func packageFixture(t *testing.T) (string, string) {
 	t.Helper()
 	repo := t.TempDir()
-	mustWrite(t, filepath.Join(repo, "pyproject.toml"), `[project]
+	mustWrite(t, filepath.Join(repo, "pyproject.toml"), `[build-system]
+requires = ["uv_build>=0.9.18,<0.10"]
+build-backend = "uv_build"
+
+[project]
 name = "marco-polo"
 version = "1.0.0"
 dependencies = []
+
+[tool.uv.build-backend]
+module-root = ""
 `)
 	mustWrite(t, filepath.Join(repo, "package.toml"), "[application]\nobject = \"marco_polo:app\"\n")
-	mustWrite(t, filepath.Join(repo, "marco_polo.py"), "app = object()\n")
+	mustWrite(t, filepath.Join(repo, "marco_polo", "__init__.py"), "app = object()\n")
+	mustWrite(t, filepath.Join(repo, "marco_polo", "untracked.py"), "value = 'current tree'\n")
+	mustWrite(t, filepath.Join(repo, "notes.txt"), "ordinary untracked provenance\n")
+	mustWrite(t, filepath.Join(repo, ".env.local"), "TOKEN=secret\n")
+	mustWrite(t, filepath.Join(repo, ".ssh", "id_rsa"), "secret\n")
+	mustWrite(t, filepath.Join(repo, ".venv", "marker"), "local environment\n")
+	mustWrite(t, filepath.Join(repo, "dist", "stale.whl"), "stale output\n")
 	mustWrite(t, filepath.Join(repo, "uv.lock"), "version = 1\n")
-	mustWrite(t, filepath.Join(repo, ".gitignore"), ".test-bin/\n.venv/\n")
-	git(t, repo, "init", "-q")
-	git(t, repo, "config", "user.email", "fixture@example.invalid")
-	git(t, repo, "config", "user.name", "Fixture")
-	git(t, repo, "add", ".")
-	git(t, repo, "commit", "-qm", "fixture")
-	fakeUV := filepath.Join(repo, ".test-bin", "uv")
-	mustWrite(t, fakeUV, `#!/bin/sh
-if [ "${0##*/}" = "cozy-runtime" ]; then # //cozy:allow independent Runtime CLI fixture
-  printf '%s\n' '{"application":"marco_polo:app","entrypoints":[],"format":"cozy.package.descriptor/1","jobs":[]}'
-  exit 0
-fi
-mkdir -p "$UV_PROJECT_ENVIRONMENT/bin"
-cp "$0" "$UV_PROJECT_ENVIRONMENT/bin/cozy-runtime"
-chmod 755 "$UV_PROJECT_ENVIRONMENT/bin/cozy-runtime"
-`)
+	testBin := t.TempDir()
+	realUV, err := exec.LookPath("uv")
+	must(t, err)
+	fakeUV := filepath.Join(testBin, "uv")
+	mustWrite(t, fakeUV, fmt.Sprintf("#!/bin/sh\nexec %q \"$@\"\n", realUV))
 	must(t, os.Chmod(fakeUV, 0o755))
-	return repo
+	return repo, testBin
 }
 
-func fixtureDeclarationRoles(d packagepublish.Declaration) map[string]packagepublish.ObjectRef {
-	out := map[string]packagepublish.ObjectRef{
-		"source_archive": d.SourceArchive, "source_lock": d.SourceLock,
-		"project_wheel":      {Digest: d.ProjectWheel.Digest, Length: d.ProjectWheel.Length},
-		"package_descriptor": d.PackageDescriptor,
+func wheelBytesNames(t *testing.T, body []byte) []string {
+	t.Helper()
+	zr, err := zip.NewReader(bytes.NewReader(body), int64(len(body)))
+	must(t, err)
+	names := make([]string, 0, len(zr.File))
+	for _, member := range zr.File {
+		if !member.FileInfo().IsDir() {
+			names = append(names, member.Name)
+		}
 	}
-	return out
-}
-
-func sortedKeys[V any](values map[string]V) []string {
-	keys := make([]string, 0, len(values))
-	for key := range values {
-		keys = append(keys, key)
-	}
-	sort.Strings(keys)
-	return keys
-}
-
-func fixtureDigest(body []byte) string {
-	sum := sha256.Sum256(body)
-	return "sha256:" + hex.EncodeToString(sum[:])
+	sort.Strings(names)
+	return names
 }
 
 func writeHubError(w http.ResponseWriter, status int, code, message string) {

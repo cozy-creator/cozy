@@ -22,7 +22,10 @@ import (
 	"github.com/cozy-creator/cozy-creator/internal/exit"
 )
 
-const MaxWheelBytes int64 = 512 << 20
+const (
+	MaxWheelBytes int64 = 512 << 20
+	maxZipEntries       = 0xfffe
+)
 
 // Fact is the exact portable WheelFact wire shape frozen by th-075.
 type Fact struct {
@@ -93,6 +96,13 @@ func Inspect(file string, class InspectClass) (Fact, *exit.Error) {
 		name := member.Name
 		if e := checkName(strings.TrimSuffix(name, "/")); e != nil {
 			return out, exit.Named(exit.Validation, "wheel_entry_invalid", "%s: %s", name, e.Message)
+		}
+		if class == ProjectWheel {
+			if code, kind := forbiddenProjectMember(name); code != "" {
+				return out, exit.Named(exit.Validation, code,
+					"%s is %s and cannot enter a package project wheel", name, kind).
+					WithRemedy("exclude local secrets, environments, VCS metadata, caches, and generated output in the project's build-backend configuration")
+			}
 		}
 		folded := strings.ToLower(name)
 		if seen[folded] {
@@ -201,6 +211,11 @@ func Inspect(file string, class InspectClass) (Fact, *exit.Error) {
 		out.ImportRoots = append(out.ImportRoots, root)
 	}
 	sort.Strings(out.ImportRoots)
+	if class == ProjectWheel && len(out.ImportRoots) == 0 {
+		return out, exit.Named(exit.Validation, "project_wheel_import_root_absent",
+			"%s contains no importable Python module", filename).
+			WithRemedy("configure the project build backend so `uv build --wheel` includes the package")
+	}
 	out.Digest = "sha256:" + hex.EncodeToString(h.Sum(nil))
 	out.Distribution, out.Filename, out.Length = distribution, filename, info.Size()
 	out.Tags, out.Version = wheelTags, version
