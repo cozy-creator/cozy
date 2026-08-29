@@ -304,9 +304,14 @@ func (s *daemonProcess) callBytes(t *testing.T, method, path string, body []byte
 // child's environment comes through the PRODUCT's own allowlist: the suite has no business
 // inventing a second child-env mechanism, and the env fence says there is one reader.
 func runCozy(t *testing.T, root string, args ...string) (int, string) {
+	return runCozyDir(t, root, "", nil, args...)
+}
+
+func runCozyDir(t *testing.T, root, dir string, imposed []string, args ...string) (int, string) {
 	t.Helper()
 	cmd := exec.Command("/usr/bin/nice", append([]string{"-n", "19", cozyBin}, args...)...)
-	cmd.Env = childEnv(t, root)
+	cmd.Env = childEnv(t, root, imposed...)
+	cmd.Dir = dir
 	data, _ := cmd.CombinedOutput()
 	code := 0
 	if cmd.ProcessState != nil {

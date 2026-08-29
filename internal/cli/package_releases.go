@@ -14,19 +14,22 @@ import (
 )
 
 func handlePackagePublish(ctx *Context) *exit.Error {
-	ref, problem := hub.ParseRef(ctx.Inv.Args[0])
-	if problem != nil {
-		return problem
+	if !ctx.Cfg.HubToken.Present() {
+		return exit.Named(exit.Credential, "hub.publish_credential_missing",
+			"publishing to %s requires a configured Tensorhub token", ctx.Cfg.HubURL).
+			WithRemedy("set tensorhub_token in %s/config.yaml or set TENSORHUB_TOKEN", ctx.Cfg.Home)
 	}
-	release := strings.TrimSpace(ctx.Inv.Value("--release"))
-	reason := "cozy package publish " + ref.String() + "@" + release
-	pack, problem := packagepublish.Prepare(packagepublish.Request{
-		Tree: ctx.Inv.Value("--dir"), Release: release,
-	})
+	pack, problem := packagepublish.Prepare()
 	if problem != nil {
 		return problem
 	}
 	defer pack.Close()
+	ref, problem := hub.ParseRef(pack.Organization + "/" + pack.Name)
+	if problem != nil {
+		return problem.WithRemedy("fix [tool.cozy] organization or [project] name in pyproject.toml")
+	}
+	release := pack.Release
+	reason := "cozy package publish " + ref.String() + "@" + release
 
 	c := client(ctx)
 	hctx, cancel := hub.LongContext()

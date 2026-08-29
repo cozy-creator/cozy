@@ -4,19 +4,33 @@ Cozy publishes the current project tree. A Git repository, commit, or clean
 working tree is not required.
 
 ```sh
-cozy package publish org/package \
-  --release 1.0.0 \
-  --dir .
+cozy package publish
 ```
 
-The project supplies `pyproject.toml`, `uv.lock`, and `package.toml`. Cozy
+`pyproject.toml` is the publication authority:
+
+```toml
+[project]
+name = "marco-polo-package"
+version = "1.0.0"
+
+[tool.cozy]
+organization = "paul"
+```
+
+The example publishes as `paul/marco-polo-package@1.0.0`. Cozy does not add a `v` prefix or accept
+a second name/version on the command line. The configured `tensorhub_url` is the destination;
+credentials come from Cozy configuration or `TENSORHUB_TOKEN` and never enter project metadata.
+
+The project also supplies `uv.lock` and `package.toml`. Cozy
 skips `.env*`, credentials, VCS directories, virtual environments, caches,
 editor state, bytecode, and build output. Modified and ordinary untracked files
 are published normally.
 
-Cozy runs `uv build --wheel` against that current tree. `uv` invokes the
+Cozy runs `uv build --wheel` against the current tree. `uv` invokes the
 project's declared PEP 517 backend; Cozy does not maintain another Python
-package builder. Cozy uploads the one resulting wheel, and Tensorhub verifies
+package builder. Cozy verifies that the wheel name/version agrees with `[project]`, uploads it, and
+Tensorhub independently verifies
 that it is bounded `py3-none-any` content without native code, nested wheels,
 credentials, unsafe paths, or executable `.pth` behavior.
 

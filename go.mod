@@ -4,6 +4,8 @@ go 1.26
 
 require (
 	github.com/alecthomas/kong v1.16.1
+	github.com/mattn/go-isatty v0.0.24
+	github.com/pelletier/go-toml/v2 v2.2.4
 	github.com/toon-format/toon-go v0.0.0-20251202084852-7ca0e27c4e8c
 	go.yaml.in/yaml/v3 v3.0.5
 	golang.org/x/sys v0.47.0
@@ -15,7 +17,6 @@ require (
 require (
 	github.com/dustin/go-humanize v1.0.1 // indirect
 	github.com/google/uuid v1.6.0 // indirect
-	github.com/mattn/go-isatty v0.0.24 // indirect
 	github.com/ncruces/go-strftime v1.0.0 // indirect
 	github.com/remyoudompheng/bigfft v0.0.0-20230129092748-24d4a6f8daec // indirect
 	golang.org/x/net v0.53.0 // indirect

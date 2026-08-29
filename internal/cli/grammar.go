@@ -13,7 +13,7 @@ type CLI struct {
 	Rental  RentalCmd  `cmd:"" group:"Work" help:"Rent a more powerful GPU in the cloud."`
 	Up      UpCmd      `cmd:"" group:"Lifecycle" help:"Start the cozy-daemon and localhost web-ui."`
 	Down    DownCmd    `cmd:"" group:"Lifecycle" help:"Stop cozy-daemon and localhost web-ui."`
-	Unload  UnloadCmd  `cmd:"" group:"Lifecycle" help:"Release idle local GPU memory."`
+	Unload  UnloadCmd  `cmd:"" group:"Lifecycle" help:"Empty cached GPU AI models to free up VRAM."`
 }
 
 type PackageCmd struct {
@@ -67,15 +67,10 @@ func (c *PackageListCmd) Run(r *Runtime) error {
 	return r.call(handleLs, nil, nil, nil, false)
 }
 
-type PackagePublishCmd struct {
-	Ref     string `arg:"" name:"package" help:"Package name (org/name)."`
-	Release string `help:"Immutable package release id." required:""`
-	Dir     string `help:"Package source tree." type:"path" default:"."`
-}
+type PackagePublishCmd struct{}
 
 func (c *PackagePublishCmd) Run(r *Runtime) error {
-	return r.call(handlePackagePublish, []string{c.Ref}, nil, values(
-		"--release", c.Release, "--dir", c.Dir), false)
+	return r.call(handlePackagePublish, nil, nil, nil, false)
 }
 
 type ModelCmd struct {

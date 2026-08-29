@@ -23,6 +23,7 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"regexp"
 	"strings"
 	"sync/atomic"
 	"time"
@@ -45,6 +46,8 @@ const maxBody = 4 << 20
 // It is the hub's own declaration-document ceiling: a manifest larger than the hub
 // would accept cannot be one the hub installed.
 const maxDocument = 64 << 20
+
+var resourceSlug = regexp.MustCompile(`^[a-z0-9](?:[a-z0-9._-]{0,62}[a-z0-9])?$`)
 
 // A call whose work is proportional to the bytes it moves is bounded by THOSE BYTES,
 // at the storage edge where they are (`transfer.mover`). There is no `Transfer`
@@ -481,9 +484,9 @@ func ParseRef(s string) (Ref, *exit.Error) {
 			WithNext("cozy package search", "cozy model search")
 	}
 	org, name, ok := strings.Cut(s, "/")
-	if !ok || org == "" || name == "" || strings.Contains(name, "/") {
+	if !ok || !resourceSlug.MatchString(org) || !resourceSlug.MatchString(name) {
 		return Ref{}, exit.Usagef("%q is not a model or package ref: expected exactly one org/name separator", s).
-			WithRemedy("the grammar is org/name, e.g. cozy/sdxl").
+			WithRemedy("org and name use lowercase letters, digits, dots, underscores, or hyphens").
 			WithNext("cozy package search", "cozy model search")
 	}
 	return Ref{Org: org, Name: name}, nil

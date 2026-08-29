@@ -5,38 +5,41 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"regexp"
 	"sort"
 	"strings"
 
 	"github.com/cozy-creator/cozy/internal/exit"
 	"github.com/cozy-creator/cozy/internal/wheel"
+	"github.com/pelletier/go-toml/v2"
 )
 
 const MaxSourceBytes int64 = 512 << 20
+const maxProjectMetadataBytes = 1 << 20
+
+var projectNameSeparator = regexp.MustCompile(`[-_.]+`)
 
 // Package is the local input to one begin/upload/finalize operation. Tensorhub
 // computes identities and package facts after the bytes arrive.
 type Package struct {
-	Files map[string]string // source-relative path -> local path
-	Wheel string
-	Root  string // disposable wheel output
+	Files        map[string]string // source-relative path -> local path
+	Wheel        string
+	Root         string // disposable wheel output
+	Organization string
+	Name         string
+	Release      string
 }
 
 func (p *Package) Close() { _ = os.RemoveAll(p.Root) }
 
-type Request struct {
-	Tree    string
-	Release string
-}
-
 // Prepare reads the current working tree and builds its wheel through the
 // project's standard PEP 517 backend. Git and commit state are irrelevant.
-func Prepare(req Request) (*Package, *exit.Error) {
-	release := strings.TrimSpace(req.Release)
-	if release == "" || strings.ContainsAny(release, `/\\`) || release == "." || release == ".." {
-		return nil, exit.Usagef("--release needs one safe immutable release id")
+func Prepare() (*Package, *exit.Error) {
+	tree, files, problem := sourceTree(".")
+	if problem != nil {
+		return nil, problem
 	}
-	tree, files, problem := sourceTree(req.Tree)
+	metadata, problem := readProjectMetadata(files["pyproject.toml"])
 	if problem != nil {
 		return nil, problem
 	}
@@ -49,7 +52,70 @@ func Prepare(req Request) (*Package, *exit.Error) {
 		_ = os.RemoveAll(root)
 		return nil, problem
 	}
-	return &Package{Files: files, Wheel: project.Path, Root: root}, nil
+	fact, problem := wheel.Inspect(project.Path)
+	if problem != nil {
+		_ = os.RemoveAll(root)
+		return nil, problem
+	}
+	if normalizedProjectName(metadata.Name) != fact.Distribution || metadata.Version != fact.Version {
+		_ = os.RemoveAll(root)
+		return nil, exit.Named(exit.Validation, "project_metadata_mismatch",
+			"pyproject.toml declares %s==%s but the built wheel declares %s==%s",
+			metadata.Name, metadata.Version, fact.Distribution, fact.Version).
+			WithRemedy("fix the build backend so wheel identity comes from [project] name and version")
+	}
+	return &Package{
+		Files: files, Wheel: project.Path, Root: root,
+		Organization: metadata.Organization, Name: fact.Distribution, Release: fact.Version,
+	}, nil
+}
+
+type projectMetadata struct {
+	Project struct {
+		Name    string `toml:"name"`
+		Version string `toml:"version"`
+	} `toml:"project"`
+	Tool struct {
+		Cozy struct {
+			Organization string `toml:"organization"`
+		} `toml:"cozy"`
+	} `toml:"tool"`
+}
+
+func readProjectMetadata(path string) (struct {
+	Name, Version, Organization string
+}, *exit.Error) {
+	var out struct {
+		Name, Version, Organization string
+	}
+	raw, err := os.ReadFile(path)
+	if err != nil || len(raw) == 0 || len(raw) > maxProjectMetadataBytes {
+		return out, exit.Named(exit.Validation, "project_metadata_unreadable",
+			"pyproject.toml must be a non-empty TOML file at or below %d bytes", maxProjectMetadataBytes)
+	}
+	var document projectMetadata
+	if err := toml.Unmarshal(raw, &document); err != nil {
+		return out, exit.Named(exit.Validation, "project_metadata_invalid",
+			"pyproject.toml is not valid TOML: %v", err)
+	}
+	out.Name = strings.TrimSpace(document.Project.Name)
+	out.Version = strings.TrimSpace(document.Project.Version)
+	out.Organization = strings.TrimSpace(document.Tool.Cozy.Organization)
+	if out.Name == "" || out.Name != document.Project.Name || out.Version == "" ||
+		out.Version != document.Project.Version {
+		return out, exit.Named(exit.Validation, "project_identity_missing",
+			"pyproject.toml [project] must declare one untrimmed name and version")
+	}
+	if out.Organization == "" || out.Organization != document.Tool.Cozy.Organization {
+		return out, exit.Named(exit.Validation, "project_organization_missing",
+			"pyproject.toml must declare [tool.cozy] organization").
+			WithRemedy("add `[tool.cozy]` and `organization = \"your-org\"`")
+	}
+	return out, nil
+}
+
+func normalizedProjectName(value string) string {
+	return projectNameSeparator.ReplaceAllString(strings.ToLower(value), "-")
 }
 
 var ignoredDir = map[string]bool{

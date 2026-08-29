@@ -21,6 +21,28 @@ import (
 
 const weightlessRef = "cozy/weightless"
 
+func TestPackagePublishMetadataGrammar(t *testing.T) {
+	root := t.TempDir()
+	if code, help := runCozy(t, root, "package", "publish", "--help"); code != 0 ||
+		strings.Contains(help, "--release") || strings.Contains(help, "--dir") ||
+		strings.Contains(help, "<package>") {
+		t.Fatalf("package publish retained caller-authored identity [exit %d]\n%s", code, help)
+	}
+	project := t.TempDir()
+	must(t, os.WriteFile(filepath.Join(project, "pyproject.toml"), []byte(`[project]
+name = "proof-package"
+version = "1.0.0"
+`), 0o644))
+	must(t, os.WriteFile(filepath.Join(project, "package.toml"), []byte(
+		"[application]\nobject = \"proof_package:app\"\n"), 0o644))
+	must(t, os.WriteFile(filepath.Join(project, "uv.lock"), []byte("version = 1\n"), 0o644))
+	code, out := runCozyDir(t, root, project, []string{"TENSORHUB_TOKEN=proof-token"},
+		"package", "publish")
+	if code != 1 || !strings.Contains(out, "must declare [tool.cozy] organization") {
+		t.Fatalf("missing [tool.cozy] organization was not refused before build [exit %d]\n%s", code, out)
+	}
+}
+
 func TestDaemonWebLifecycle(t *testing.T) {
 	root := filepath.Join(os.TempDir(), "cozy-product-test", "daemon-web")
 	must(t, os.RemoveAll(root))

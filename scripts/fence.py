@@ -552,6 +552,12 @@ def check_manifest():
             bad.append(f"[grammar] retired command family remains: {retired}")
     if re.search(r"^\s*Reason\s+string\s+`", source, re.M) or '"--reason"' in source:
         bad.append("[grammar] public Cozy command retained caller-authored audit prose; decision #667 derives every audit reason")
+    if (
+        "type PackagePublishCmd struct{}" not in source
+        or '"--release"' in source
+        or "Package source tree." in source
+    ):
+        bad.append("[grammar] package publish identity must come only from project metadata")
     derived_audits = {
         "internal/cli/package_releases.go": '"cozy package publish " + ref.String() + "@" + release',
         "internal/cli/packages.go": '"cozy package install " + ref.String() + "@" + release + " for " + profiles[0]',
