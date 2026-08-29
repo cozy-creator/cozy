@@ -41,7 +41,7 @@ type EnvironmentReceipt struct {
 // exact words.
 //
 // The spelling is `uv sync --locked`, not the design's `uv sync --frozen`. Observed
-// live on uv 0.9.18: `--frozen` skips the up-to-date check entirely and happily
+// on uv 0.12.7: `--frozen` skips the up-to-date check and happily
 // installs a lock that does not match the release's pyproject, which is exactly the
 // silent-different-closure outcome the rule exists to prevent. `--locked` refuses
 // that, never writes uv.lock, and never falls back to a resolve; a matching lock

@@ -290,7 +290,7 @@ func writePublishProject(t *testing.T, root, name, version string, dependencies 
 	dependencyJSON, err := json.Marshal(dependencies)
 	must(t, err)
 	document := fmt.Sprintf(`[build-system]
-requires = ["uv_build>=0.9.18,<0.10"]
+requires = ["uv_build>=0.12.7,<0.13"]
 build-backend = "uv_build"
 
 [project]
