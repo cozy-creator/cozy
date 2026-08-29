@@ -56,9 +56,8 @@ func TestControllerWebLifecycle(t *testing.T) {
 	}
 	up := first.output
 	var upDocument struct {
-		URL     string `json:"url"`
-		PID     int    `json:"pid"`
-		Changed bool   `json:"changed"`
+		URL string `json:"url"`
+		PID int    `json:"pid"`
 	}
 	var secondDocument struct {
 		URL     string `json:"url"`
