@@ -72,34 +72,17 @@ type Grant struct {
 	ObjectID string            `json:"object_id"`
 	Length   int64             `json:"length"`
 	Key      string            `json:"key"`
-	Method   string            `json:"method"`
 	URL      string            `json:"url"`
 	Expires  string            `json:"expires_at"`
 	Headers  map[string]string `json:"required_headers"`
-	UploadID string            `json:"upload_id"`
-	Parts    []Part            `json:"parts"`
 }
-
-// Part is one ranged upload leg. Its number and range are transport, never identity.
-type Part struct {
-	Number int    `json:"number"`
-	URL    string `json:"url"`
-	Offset int64  `json:"offset"`
-	Length int64  `json:"length"`
-}
-
-// Multipart says whether this grant is the ranged plan. R2 implements no sha256
-// checksum on multipart (decisions #310), so the ranged path keeps no-clobber and
-// the hub's own streaming hash discharges the digest.
-func (g Grant) Multipart() bool { return g.Method == "MULTIPART" }
 
 type GrantResponse struct {
 	Grants []Grant    `json:"grants"`
 	Held   []Transfer `json:"held"`
 }
 
-// GrantKnownTransfer asks for one transfer immediately before its bytes move. One at
-// a time keeps a large multipart response bounded.
+// GrantKnownTransfer asks for one transfer immediately before its bytes move.
 func (c *Client) GrantKnownTransfer(ctx context.Context, ref Ref, operation,
 	objectID, reason string,
 ) (GrantResponse, *exit.Error) {
@@ -123,9 +106,8 @@ func (c *Client) GrantKnownTransfer(ctx context.Context, ref Ref, operation,
 }
 
 type SettleObject struct {
-	ObjectID       string   `json:"object_id"`
-	AlreadyPresent bool     `json:"already_present,omitempty"`
-	PartETags      []string `json:"part_etags,omitempty"`
+	ObjectID       string `json:"object_id"`
+	AlreadyPresent bool   `json:"already_present,omitempty"`
 }
 
 type SettledObject struct {

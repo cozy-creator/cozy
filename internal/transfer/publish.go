@@ -59,7 +59,6 @@ type Result struct {
 	Session   string
 	Totals    hub.Totals
 	Grants    int
-	Multipart int
 	Uploaded  int
 	Conflicts int
 	Verified  int
@@ -312,16 +311,15 @@ func appendUnique(values []string, value string) []string {
 const publishParallelism = 16
 
 type uploadOutcome struct {
-	index     int
-	moved     int64
-	deduped   int64
-	multipart bool
-	uploaded  bool
-	conflict  bool
-	verified  bool
-	source    string
-	primary   bool
-	err       *exit.Error
+	index    int
+	moved    int64
+	deduped  int64
+	uploaded bool
+	conflict bool
+	verified bool
+	source   string
+	primary  bool
+	err      *exit.Error
 }
 
 func (p *Publish) upload(ctx context.Context, transfers []hub.Transfer, res *Result, ms map[string]int64) *exit.Error {
@@ -397,9 +395,6 @@ func (p *Publish) upload(ctx context.Context, transfers []hub.Transfer, res *Res
 		if outcome.uploaded {
 			res.Uploaded++
 		}
-		if outcome.multipart {
-			res.Multipart++
-		}
 		if outcome.conflict {
 			res.Conflicts++
 		}
@@ -415,8 +410,8 @@ func (p *Publish) upload(ctx context.Context, transfers []hub.Transfer, res *Res
 	}
 	sort.Strings(res.Sources)
 	ms["grant_upload_verify"] = since(started)
-	p.say("requested %d transfer grants and uploaded %d objects (%d ranged): %s moved · %s deduped",
-		len(transfers), res.Uploaded, res.Multipart, size(res.Moved), size(res.Deduped))
+	p.say("requested %d transfer grants and uploaded %d objects: %s moved · %s deduped",
+		len(transfers), res.Uploaded, size(res.Moved), size(res.Deduped))
 	p.say("Tensorhub accepted %d transfer verifications (%s)",
 		res.Verified, strings.Join(res.Sources, ", "))
 	return nil
@@ -446,18 +441,16 @@ func (p *Publish) uploadOne(ctx context.Context, publicationID string, index int
 		outcome.err = exit.Internalf("grant for %s returned another object", transfer.ObjectID)
 		return outcome
 	}
-	outcome.multipart = grant.Multipart()
 	staged := filepath.Join(p.Scratch, fmt.Sprintf("object-%06d", index))
 	defer os.Remove(staged)
 
 	// The bytes leave the store through a VERIFIED read, so a publisher cannot
 	// upload what its own store silently corrupted.
-	local := Result{PublishID: publicationID}
 	if e := p.Tool.Extract(grant.ObjectID, staged); e != nil {
 		outcome.err = e
 		return outcome
 	}
-	put, e := p.put(ctx, grant, staged, &local)
+	conflict, e := put(ctx, grant, staged)
 	if e != nil && e.Name == "grant.expired_replan" {
 		freshAnswer, e2 := p.Hub.GrantKnownTransfer(ctx, p.Ref, publicationID,
 			transfer.ObjectID, p.Reason)
@@ -469,18 +462,23 @@ func (p *Publish) uploadOne(ctx context.Context, publicationID string, index int
 			outcome.deduped = transfer.Length
 			return outcome
 		}
-		fresh := freshAnswer.Grants[0]
-		put, e = p.put(ctx, fresh, staged, &local)
+		grant = freshAnswer.Grants[0]
+		if grant.ObjectID != transfer.ObjectID || grant.Length != transfer.Length {
+			outcome.err = exit.Internalf("replacement grant for %s returned another object", transfer.ObjectID)
+			return outcome
+		}
+		conflict, e = put(ctx, grant, staged)
 	}
 	if e != nil {
 		outcome.err = e
 		return outcome
 	}
-	outcome.moved = local.Moved
+	if !conflict {
+		outcome.moved = grant.Length
+	}
 	outcome.uploaded = true
 	settled, settleErr := p.Hub.SettleObjects(ctx, p.Ref, publicationID,
-		[]hub.SettleObject{{ObjectID: transfer.ObjectID, AlreadyPresent: put.conflict,
-			PartETags: put.partETags}}, p.Reason)
+		[]hub.SettleObject{{ObjectID: transfer.ObjectID, AlreadyPresent: conflict}}, p.Reason)
 	if settleErr != nil {
 		outcome.err = settleErr
 		return outcome
@@ -509,51 +507,24 @@ func (p *Publish) uploadOne(ctx context.Context, publicationID string, index int
 	return outcome
 }
 
-// put writes one object at its final content key. Every required header is sent
-// verbatim: they are signed into the URL, so stripping one is 403 and a wrong body
-// is 400 — neither is a branch a client may take.
-type putResult struct {
-	conflict  bool
-	partETags []string
-}
-
-func (p *Publish) put(ctx context.Context, g hub.Grant, path string, res *Result) (putResult, *exit.Error) {
-	if g.Multipart() {
-		return p.putRanged(ctx, g, path, res)
-	}
+// put writes one bounded object at its final content key. Every required header is
+// sent verbatim: they are signed into the URL, so stripping one is 403 and a wrong
+// body is 400 — neither is a branch a client may take.
+func put(ctx context.Context, g hub.Grant, path string) (bool, *exit.Error) {
 	status, _, body, e := send(ctx, http.MethodPut, g.URL, opener(path, 0, g.Length), g.Length, g.Headers)
 	if e != nil {
-		return putResult{}, e
+		return false, e
 	}
 	switch status {
 	case http.StatusOK:
-		res.Moved += g.Length
-		return putResult{}, nil
+		return false, nil
 	case http.StatusPreconditionFailed:
 		// Someone already holds this exact key. That is not a failure — the key is
 		// the digest, so whoever wrote it wrote these bytes. The hub still proves it.
-		return putResult{conflict: true}, nil
+		return true, nil
 	default:
-		return putResult{}, storageRefusal(status, g.ObjectID, body)
+		return false, storageRefusal(status, g.ObjectID, body)
 	}
-}
-
-func (p *Publish) putRanged(ctx context.Context, g hub.Grant, path string, res *Result) (putResult, *exit.Error) {
-	etags := make([]string, 0, len(g.Parts))
-	for _, part := range g.Parts {
-		status, headers, body, e := send(ctx, http.MethodPut, part.URL,
-			opener(path, part.Offset, part.Length), part.Length, nil)
-		if e != nil {
-			return putResult{}, e
-		}
-		if status != http.StatusOK {
-			return putResult{}, storageRefusal(status, fmt.Sprintf("%s part %d", g.ObjectID, part.Number), body)
-		}
-		etags = append(etags, strings.Trim(headers.Get("ETag"), `"`))
-		res.Moved += part.Length
-	}
-	// Tensorhub assembles and verifies in the following settle call.
-	return putResult{partETags: etags}, nil
 }
 
 // attempts bounds transport retries at the storage edge. A hiccup on a residential
