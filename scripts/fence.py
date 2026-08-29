@@ -577,6 +577,23 @@ def check_web_boundary():
     for forbidden in ("os.FindProcess(", 'exec.Command("ps"', 'exec.Command("pgrep"', '"/proc/'):
         if forbidden in daemon:
             bad.append(f"[web] daemon singleton uses process-list evidence {forbidden!r}")
+    if pathlib.Path("internal/service").exists():
+        bad.append("[web] retired internal/service package remains")
+    retired_names = (
+        "cozy-controller", "Cozy controller", "local controller", "controller.log",
+        "controller_startup_", "/v1/local/service/", "service.lock",
+    )
+    for source in pathlib.Path(".").rglob("*"):
+        if not source.is_file() or source == pathlib.Path("scripts/fence.py"):
+            continue
+        if any(part in {".git", "dist", "vendor"} for part in source.parts):
+            continue
+        if source.suffix not in {".go", ".md", ".html", ".sh", ".py", ".yaml", ".yml"}:
+            continue
+        text = source.read_text(errors="replace")
+        for retired in retired_names:
+            if retired in text:
+                bad.append(f"[web] {source} retains whole-process alias {retired!r}")
     upload = pathlib.Path("internal/upload/upload.go").read_text()
     for required in ("MaxBytes int64 = 64 << 20", "io.LimitReader", "sha256.New()", "os.Rename"):
         if required not in upload:
