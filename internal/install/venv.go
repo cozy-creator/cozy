@@ -112,7 +112,7 @@ func MaterializePublishedEnvironment(_ string, venvDir string, wheels []string) 
 			"uv could not create the package environment").WithRemedy("uv said: %s", condense(output.String()))
 	}
 	args := []string{"pip", "install", "--python", home.VenvPython(venvDir), "--no-progress",
-		"--only-binary", ":all:", "--link-mode", env.LinkMode}
+		"--only-binary", ":all:", "--no-deps", "--link-mode", env.LinkMode}
 	args = append(args, wheels...)
 	install := exec.Command("uv", args...)
 	install.Env = config.Frozen().Tool()
