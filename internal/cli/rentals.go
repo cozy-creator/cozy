@@ -728,9 +728,15 @@ func (w *releaseWatch) interrupted() *exit.Error {
 func (w *releaseWatch) finish(l home.Layout, st *records.Store, operationKey string, had bool, note string) *exit.Error {
 	forgotten := false
 	if had {
-		var e *exit.Error
-		if forgotten, e = rental.Forget(l, st, w.id); e != nil {
-			return e
+		local, problem := dial(w.ctx)
+		if problem != nil {
+			return problem.WithRemedy("the rental is gone at the hub, but its local credentials are kept until the daemon's worker control loop can detach")
+		}
+		if _, problem := local.DetachRental(w.id); problem != nil {
+			return problem.WithRemedy("the rental is gone at the hub, but its local credentials are kept until the daemon's worker control loop can detach")
+		}
+		if forgotten, problem = rental.Forget(l, st, w.id); problem != nil {
+			return problem
 		}
 	}
 	if operationKey != "" {

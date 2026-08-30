@@ -241,6 +241,17 @@ func (c *Client) EnsureRental(rentalID string) (StartResult, *exit.Error) {
 	return res, e
 }
 
+// DetachRental waits until the daemon no longer holds this rental's worker-control slot.
+// The result is false when the slot was already absent.
+func (c *Client) DetachRental(rentalID string) (bool, *exit.Error) {
+	var out struct {
+		Changed bool `json:"changed"`
+	}
+	e := c.call(http.MethodDelete,
+		"/v1/local/rentals/"+url.PathEscape(rentalID)+"/claim", nil, &out)
+	return out.Changed, e
+}
+
 // Unload asks the daemon to stop only definitely-idle local serving workers. It
 // never touches remote rentals, run-once jobs, active work, or installed disk bytes.
 func (c *Client) Unload() (api.UnloadResult, *exit.Error) {

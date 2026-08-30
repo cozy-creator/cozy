@@ -236,6 +236,7 @@ URLs but remain local-scope rows in the same guarded route table.
 | route | scope | auth | notes |
 |---|---|---|---|
 | `POST /v1/local/rentals/{rental_id}/claim` | local | yes | attach the daemon to one already-provisioned private worker |
+| `DELETE /v1/local/rentals/{rental_id}/claim` | local | yes | detach that worker and wait for its control loop before rental credentials are removed |
 | `POST /v1/local/daemon/unload` | local | yes | stop definitely-idle local serving workers; never touch active work, jobs, rentals, or installed bytes |
 | `POST /v1/local/daemon/down` | local | yes | safe down fence; `{all:true}` requests local cancellation and returns paid obligations that must be confirmed absent before retrying |
 | `POST /v1/local/jobs` | local | yes | submit one bounded job; `Idempotency-Key`; 202 with the handle and its publication repo |
