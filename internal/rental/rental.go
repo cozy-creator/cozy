@@ -398,7 +398,6 @@ func ObserveWorker(st *records.Store) func(orchestrator.RentalObservation) *exit
 
 func selectedPlacement(row records.Rental) (orchestrator.DesiredPlacement, *exit.Error) {
 	if row.PlacementSetDigest == "" || len(row.PlacementSetBytes) == 0 ||
-		row.PackageReleaseDigest == "" || len(row.PackageReleaseBytes) == 0 ||
 		row.PackageDescriptorDigest == "" || len(row.PackageDescriptorBytes) == 0 ||
 		row.QualificationDigest == "" || len(row.QualificationBytes) == 0 {
 		return orchestrator.DesiredPlacement{}, exit.Named(exit.Conflict, "rental.selection_missing",
@@ -408,7 +407,6 @@ func selectedPlacement(row records.Rental) (orchestrator.DesiredPlacement, *exit
 		digest string
 		data   []byte
 	}{
-		"package_release":    {row.PackageReleaseDigest, row.PackageReleaseBytes},
 		"package_descriptor": {row.PackageDescriptorDigest, row.PackageDescriptorBytes},
 		"qualification":      {row.QualificationDigest, row.QualificationBytes},
 	} {

@@ -42,7 +42,7 @@ func handleUnload(ctx *Context) *exit.Error {
 	for _, worker := range result.Stopped {
 		list.Rows = append(list.Rows, map[string]string{
 			"instance": worker.InstanceID, "package": worker.Package,
-			"release": worker.PackageReleaseID, "devices": strings.Join(worker.Devices, ","),
+			"release": worker.PackageRevisionDigest, "devices": strings.Join(worker.Devices, ","),
 		})
 	}
 	list.Aggregates = []output.Field{{K: "changed", V: result.Count > 0}}

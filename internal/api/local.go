@@ -3,8 +3,21 @@ package api
 import (
 	"net/http"
 
+	"github.com/cozy-creator/cozy/internal/exit"
 	"github.com/cozy-creator/cozy/internal/orchestrator"
 )
+
+func (s *Server) refreshPackage(pkg string) (installID string, editable, changed bool, problem *exit.Error) {
+	if s.packages == nil {
+		return "", false, false, exit.Unavailablef("this Cozy daemon resolves no packages")
+	}
+	installID, editable, changed, problem = s.packages.RefreshEditable(pkg)
+	if problem != nil || !editable {
+		return
+	}
+	_, problem = s.orchestrator.UnloadIdleLocalPackage(pkg, installID)
+	return
+}
 
 // claimRental attaches the daemon to one already-provisioned private worker.
 // Provider acquisition remains Tensorhub's responsibility.

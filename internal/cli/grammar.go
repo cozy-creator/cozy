@@ -58,13 +58,8 @@ func (c *PackageSearchCmd) Run(r *Runtime) error {
 }
 
 type PackageInstallCmd struct {
-	Ref           string `arg:"" name:"package-or-directory" help:"Published org/name or explicit directory such as . or ./project."`
-	Version       string `help:"Install this release instead of the newest, e.g. 1.2.3."`
-	From          string `hidden:"" type:"path"`
-	Dir           string `hidden:"" type:"path"`
-	Digest        string `hidden:""`
-	Force         bool   `hidden:""`
-	AllowUnsigned bool   `hidden:""`
+	Ref     string `arg:"" name:"package-or-directory" help:"Published org/name or explicit directory such as . or ./project."`
+	Version string `help:"Install this release instead of the newest, e.g. 1.2.3."`
 }
 
 type PackageYankCmd struct {
@@ -77,9 +72,7 @@ func (c *PackageYankCmd) Run(r *Runtime) error {
 }
 
 func (c *PackageInstallCmd) Run(r *Runtime) error {
-	return r.call(handleInstall, []string{c.Ref}, bools(
-		"--force", c.Force, "--allow-unsigned", c.AllowUnsigned), values(
-		"--version", c.Version, "--from", c.From, "--dir", c.Dir, "--digest", c.Digest), false)
+	return r.call(handleInstall, []string{c.Ref}, nil, values("--version", c.Version), false)
 }
 
 type PackageRemoveCmd struct {

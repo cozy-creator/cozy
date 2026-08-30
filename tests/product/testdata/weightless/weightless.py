@@ -39,6 +39,7 @@ from cozy_runtime.author import (
 )
 
 app = App()
+REVISION = "first"
 
 
 class TileInput(msgspec.Struct, forbid_unknown_fields=True):
@@ -52,6 +53,7 @@ class TileOutput(msgspec.Struct):
     pixels: int
     digest: str
     warm: bool
+    revision: str
 
 
 class RefuseInput(msgspec.Struct, forbid_unknown_fields=True):
@@ -97,6 +99,7 @@ def tile(ctx: Context, payload: TileInput, out: Outputs, tel: Telemetry) -> Tile
         pixels=side * side,
         digest=hashlib.sha256(pixels).hexdigest(),
         warm=ctx.boot_warmup,
+        revision=REVISION,
     )
 
 

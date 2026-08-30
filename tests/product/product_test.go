@@ -24,6 +24,7 @@ import (
 )
 
 const weightlessRef = "cozy/cozy-weightless-package"
+const editableRuntimeFixtureSHA = "4347d064040f2cc48e939ba204ebdfd48e79f991"
 
 func TestLegacyAttemptColumnsMigrate(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "records.db")
@@ -200,15 +201,15 @@ func TestPackageInstallExplicitDirectoryGrammar(t *testing.T) {
 	}
 }
 
-func TestLocalPackageIdentityBindsSourceAndWheelBytes(t *testing.T) {
+func TestLocalPackageIdentityBindsSourceBytesWithoutBuilding(t *testing.T) {
 	project := t.TempDir()
 	writePublishProject(t, project, "local-identity", "1.0.0", nil, "", true)
-	first, problem := preparePublishPackage(project)
+	first, problem := packagepublish.PrepareFrom(project)
 	fatal(t, problem)
 	defer first.Close()
-	firstDigest, files, bytes, problem := first.LocalIdentity()
+	firstDigest, files, bytes, problem := first.SourceIdentity()
 	fatal(t, problem)
-	replayDigest, replayFiles, replayBytes, problem := first.LocalIdentity()
+	replayDigest, replayFiles, replayBytes, problem := first.SourceIdentity()
 	fatal(t, problem)
 	if firstDigest != replayDigest || files != replayFiles || bytes != replayBytes {
 		t.Fatalf("unchanged local build identity drifted: %s/%d/%d vs %s/%d/%d",
@@ -216,13 +217,13 @@ func TestLocalPackageIdentityBindsSourceAndWheelBytes(t *testing.T) {
 	}
 	must(t, os.WriteFile(filepath.Join(project, "local_identity", "__init__.py"),
 		[]byte("VALUE = 2\n"), 0o644))
-	second, problem := preparePublishPackage(project)
+	second, problem := packagepublish.PrepareFrom(project)
 	fatal(t, problem)
 	defer second.Close()
-	secondDigest, _, _, problem := second.LocalIdentity()
+	secondDigest, _, _, problem := second.SourceIdentity()
 	fatal(t, problem)
 	if secondDigest == firstDigest {
-		t.Fatalf("changed source and wheel retained local build identity %s", firstDigest)
+		t.Fatalf("changed source retained local source identity %s", firstDigest)
 	}
 }
 
@@ -313,7 +314,7 @@ func TestPackagePublishCommittedReplayStaysCompact(t *testing.T) {
 		case http.MethodPost:
 			_, _ = io.WriteString(w, `{"state":"committed","uploads":[]}`)
 		case http.MethodPut:
-			_, _ = io.WriteString(w, `{"state":"committed","qualification_state":"qualified","package_release":{"canonical_bytes":"e30=","digest":"sha256:44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a","length":2}}`)
+			_, _ = io.WriteString(w, `{"state":"committed","qualification_state":"qualified","release_digest":"sha256:44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a"}`)
 		default:
 			http.Error(w, "unexpected method", http.StatusMethodNotAllowed)
 		}
@@ -805,18 +806,21 @@ func TestDaemonStartupDiagnostic(t *testing.T) {
 
 const maxDaemonDiagnosticOutput = 18 << 10
 
-// A local directory remains a build/install input, but cannot invent the exact
-// PackageRelease, Qualification, and PlacementSet required for execution.
-func TestDevelopmentInstallIsNotRunnable(t *testing.T) {
-	root := t.TempDir()
-	t.Cleanup(func() { _, _ = runCozy(t, root, "down", "--all") })
+func TestDevelopmentInstallRefreshesBeforeInvocation(t *testing.T) {
+	root := filepath.Join(os.TempDir(), "cozy-product-test", "editable-refresh")
+	must(t, os.RemoveAll(root))
+	must(t, os.MkdirAll(root, 0o755))
+	t.Cleanup(func() {
+		_, _ = runCozy(t, root, "down", "--all")
+		_ = os.RemoveAll(root)
+	})
 
 	project := weightlessProject(t)
 	code, out := runCozy(t, root, "package", "install", project)
 	if code != 0 {
 		t.Fatalf("local directory package install [exit %d]\n%s", code, out)
 	}
-	if !strings.Contains(out, "source and wheel bytes are pinned locally") {
+	if !strings.Contains(out, "source bytes are pinned locally") {
 		t.Fatalf("local install omitted its unqualified identity note\n%s", out)
 	}
 	if code, out := runCozy(t, root, "package", "list", "--full", "--json"); code != 0 ||
@@ -833,10 +837,87 @@ func TestDevelopmentInstallIsNotRunnable(t *testing.T) {
 	}
 
 	code, out = runCozy(t, root, "run", weightlessRef+"/tile",
-		"size=32", "seed=7")
-	if code != 1 || !strings.Contains(out, "without an exact Hub-selected PlacementSet") {
-		t.Fatalf("development install became runnable [exit %d]\n%s", code, out)
+		"size=32", "seed=7", "--json")
+	if code != 0 || !strings.Contains(out, `"revision":"first"`) {
+		t.Fatalf("first editable invocation did not run source [exit %d]\n%s\n%s",
+			code, out, productWorkerLogs(root))
 	}
+	first := activePackageInstall(t, root)
+
+	source := filepath.Join(project, "weightless.py")
+	body, err := os.ReadFile(source)
+	must(t, err)
+	body = []byte(strings.Replace(string(body), `REVISION = "first"`, `REVISION = "second"`, 1))
+	must(t, os.WriteFile(source, body, 0o644))
+	code, out = runCozy(t, root, "run", weightlessRef+"/tile",
+		"size=32", "seed=7", "--json")
+	if code != 0 || !strings.Contains(out, `"revision":"second"`) {
+		t.Fatalf("edited body was not live on the next invocation [exit %d]\n%s", code, out)
+	}
+	second := activePackageInstall(t, root)
+	if second.ID == first.ID || second.SourceDigest == first.SourceDigest {
+		t.Fatalf("body edit did not advance the editable generation: %#v -> %#v", first, second)
+	}
+
+	pyproject := filepath.Join(project, "pyproject.toml")
+	metadata, err := os.ReadFile(pyproject)
+	must(t, err)
+	must(t, os.WriteFile(pyproject, append(metadata, []byte("\n# editable metadata refresh\n")...), 0o644))
+	lock := filepath.Join(project, "uv.lock")
+	lockBytes, err := os.ReadFile(lock)
+	must(t, err)
+	must(t, os.WriteFile(lock, append(lockBytes, []byte("\n# editable lock refresh\n")...), 0o644))
+	code, out = runCozy(t, root, "run", weightlessRef+"/tile",
+		"size=32", "seed=7", "--json")
+	if code != 0 || !strings.Contains(out, `"revision":"second"`) {
+		t.Fatalf("metadata/lock refresh did not remain runnable [exit %d]\n%s", code, out)
+	}
+	third := activePackageInstall(t, root)
+	if third.ID == second.ID || third.LockDigest == second.LockDigest {
+		t.Fatalf("metadata/lock edit did not atomically refresh the environment: %#v -> %#v", second, third)
+	}
+
+	goodMetadata, err := os.ReadFile(pyproject)
+	must(t, err)
+	must(t, os.WriteFile(pyproject, []byte("[project\n"), 0o644))
+	code, out = runCozy(t, root, "run", weightlessRef+"/tile",
+		"size=32", "seed=7", "--json")
+	if code != 1 || !strings.Contains(out, `"code":"editable_refresh_failed"`) {
+		t.Fatalf("failed edit did not return the typed refresh refusal [exit %d]\n%s", code, out)
+	}
+	failed := activePackageInstall(t, root)
+	if failed.ID != third.ID || failed.SourceDigest != third.SourceDigest {
+		t.Fatalf("failed refresh displaced the last good generation: %#v -> %#v", third, failed)
+	}
+	must(t, os.WriteFile(pyproject, goodMetadata, 0o644))
+	code, out = runCozy(t, root, "run", weightlessRef+"/tile",
+		"size=32", "seed=7", "--json")
+	if code != 0 || !strings.Contains(out, `"revision":"second"`) {
+		t.Fatalf("restored source did not reuse the last good generation [exit %d]\n%s", code, out)
+	}
+}
+
+func productWorkerLogs(root string) string {
+	paths, _ := filepath.Glob(filepath.Join(root, "workers", "*", "worker.log"))
+	var out strings.Builder
+	for _, path := range paths {
+		data, _ := os.ReadFile(path)
+		fmt.Fprintf(&out, "worker log %s:\n%s\n", filepath.Base(filepath.Dir(path)), data)
+	}
+	return out.String()
+}
+
+func activePackageInstall(t *testing.T, root string) records.PackageInstall {
+	t.Helper()
+	store, problem := records.Open(filepath.Join(root, "records.db"))
+	fatal(t, problem)
+	defer store.Close()
+	_, install, problem := store.ActivePackage(weightlessRef)
+	fatal(t, problem)
+	if install == nil {
+		t.Fatal("editable package has no active install")
+	}
+	return *install
 }
 
 type cozyResult struct {
@@ -859,14 +940,15 @@ func weightlessProject(t *testing.T) string {
 	t.Helper()
 	home, err := os.UserHomeDir()
 	must(t, err)
-	repo := filepath.Join(home, "cozy_v2", "cozy-runtime") //cozy:allow peer source; the fixture builds it and never executes a host runtime
+	repo := filepath.Join(home, "cozy_v2", "cozy-runtime") //cozy:allow peer source; the fixture builds the exact generation Runtime
 	if _, err := os.Stat(filepath.Join(repo, "pyproject.toml")); err != nil {
 		t.Skipf("no cozy-runtime peer at %s: %v", repo, err)
 	}
 	dir := t.TempDir()
 	project := filepath.Join(dir, "source")
 	build := exec.Command("/usr/bin/nice", "-n", "19", "python3",
-		"tests/product/testdata/build-weightless.py", "--out", dir, "--source-out", project)
+		"tests/product/testdata/build-weightless.py", "--out", dir, "--source-out", project,
+		"--runtime-sha", editableRuntimeFixtureSHA)
 	build.Dir = "../.."
 	build.Env = childEnv(t, repo, "RUNTIME_REPO="+repo)
 	if out, err := build.CombinedOutput(); err != nil {

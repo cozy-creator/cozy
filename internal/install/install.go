@@ -23,44 +23,42 @@ import (
 	"github.com/cozy-creator/cozy/internal/exit"
 	"github.com/cozy-creator/cozy/internal/home"
 	"github.com/cozy-creator/cozy/internal/launch"
+	"github.com/cozy-creator/cozy/internal/packagepublish"
 	"github.com/cozy-creator/cozy/internal/records"
+	"github.com/cozy-creator/cozy/internal/units"
 	pb "github.com/cozy-creator/cozy/protocol/cozy/worker/v1"
 )
 
 type Request struct {
-	Ref           Ref
-	Archive       string // --from: the local release archive (pre-hub door; cl-011 resolves it instead)
-	ExpectDigest  string // --digest: the source digest the publisher declared
-	Dir           string // --dir: an editable local tree, the development trust path
-	AllowUnsigned bool
-	Force         bool
-	Local         *LocalSource
-	Published     *PublishedSource
+	Ref       Ref
+	Force     bool
+	Local     *LocalSource
+	Published *PublishedSource
 }
 
-// LocalSource is one author-controlled directory after Creator's ordinary
-// bounded source scan and wheel build have succeeded. It is deliberately not a
-// PackageRelease or Qualification: the local build digest is its exact identity.
+// LocalSource is one author-controlled directory after Creator's bounded source
+// scan. It is deliberately neither a wheel nor a Hub release/qualification: the
+// live source digest is its local-only identity.
 type LocalSource struct {
-	BuildDigest string
-	Bytes       int64
-	Files       int
-	Package     string
-	Release     string
-	Tree        string
-}
-
-type PublishedSource struct {
-	Artifacts    map[string]string
+	SourceDigest string
 	Bytes        int64
 	Files        int
 	Package      string
-	ProjectWheel string
 	Release      string
-	SourceDigest string
-	SourceDir    string
-	Wheels       []string
-	Selection    Selection
+	Tree         string
+}
+
+type PublishedSource struct {
+	Artifacts          map[string]string
+	Bytes              int64
+	Files              int
+	Package            string
+	ProjectWheel       string
+	ProjectWheelDigest string
+	Release            string
+	SourceDigest       string
+	Wheels             []string
+	Selection          Selection
 }
 
 type ExactDocument struct {
@@ -72,14 +70,14 @@ type ExactDocument struct {
 type Selection struct {
 	Profile            string
 	PlacementSet       ExactDocument
-	PackageRelease     ExactDocument
 	PackageDescriptor  ExactDocument
 	Qualification      ExactDocument
 	EnvironmentReceipt ExactDocument
 	WheelhouseManifest ExactDocument
 }
 
-func persistSelection(genDir string, gen *records.PackageInstall, selection Selection) *exit.Error {
+func persistSelection(genDir string, gen *records.PackageInstall, published *PublishedSource) *exit.Error {
+	selection := published.Selection
 	if selection.Profile == "" {
 		return exit.Named(exit.Structural, "package_selection_missing",
 			"published install has no selected compatibility profile")
@@ -90,7 +88,6 @@ func persistSelection(genDir string, gen *records.PackageInstall, selection Sele
 		exact  ExactDocument
 	}{
 		{"placement_set", "cozy.worker.v1.PlacementSet/1", selection.PlacementSet},
-		{"package_release", "cozy.package.release/1", selection.PackageRelease},
 		{"package_descriptor", "cozy.package.descriptor/1", selection.PackageDescriptor},
 		{"qualification", "cozy.runtime.Qualification/1", selection.Qualification},
 		{"environment_receipt", "cozy.runtime.EnvironmentReceipt/1", selection.EnvironmentReceipt},
@@ -123,8 +120,15 @@ func persistSelection(genDir string, gen *records.PackageInstall, selection Sele
 			"selected PlacementSet must carry exactly one placement")
 	}
 	placement := set.List("placements")[0]
+	packageFact := placement.Sub("package")
+	if packageFact.Str("package") != gen.Package || packageFact.Str("release") != gen.Version ||
+		packageFact.Str("release_digest") != gen.SourceDigest ||
+		packageFact.Sub("project_wheel").Sub("ref").Str("digest") != published.ProjectWheelDigest {
+		return exit.Named(exit.Conflict, "package_selection_release_mismatch",
+			"PlacementSet package facts do not name %s@%s with release digest %s",
+			gen.Package, gen.Version, gen.SourceDigest)
+	}
 	for name, exact := range map[string]ExactDocument{
-		"package_release":    selection.PackageRelease,
 		"package_descriptor": selection.PackageDescriptor,
 		"qualification":      selection.Qualification,
 	} {
@@ -152,26 +156,12 @@ type Result struct {
 	Warnings   []string
 	Files      int
 	Bytes      int64
-	Compressed int64
 }
 
 // Run executes the whole transaction. Every refusal before Activate leaves the
 // records untouched, so the previously pinned generation stays runnable.
 func Run(l home.Layout, st *records.Store, req Request) (*Result, *exit.Error) {
-	sources := 0
-	if req.Archive != "" {
-		sources++
-	}
-	if req.Dir != "" {
-		sources++
-	}
-	if req.Published != nil {
-		sources++
-	}
-	if req.Local != nil {
-		sources++
-	}
-	if sources != 1 {
+	if (req.Published == nil) == (req.Local == nil) {
 		return nil, exit.Usagef("`cozy package install` needs exactly one package source").
 			WithRemedy("pass org/package for Tensorhub, or an explicit directory such as . or ./project").
 			WithNext("cozy help package install")
@@ -208,13 +198,13 @@ func Run(l home.Layout, st *records.Store, req Request) (*Result, *exit.Error) {
 		}
 		gen.SourceKind, gen.SourceRef, gen.SourceDigest = "tensorhub", req.Published.Package+"@"+req.Published.Release, req.Published.SourceDigest
 		gen.Package, gen.Version, gen.ProjectDir = req.Published.Package, req.Published.Release, genDir
-		if e := persistSelection(genDir, &gen, req.Published.Selection); e != nil {
+		if e := persistSelection(genDir, &gen, req.Published); e != nil {
 			return fail(e)
 		}
 		res.Files, res.Bytes = req.Published.Files, req.Published.Bytes
 	case req.Local != nil:
 		local := req.Local
-		if local.Package == "" || local.Release == "" || local.Tree == "" || local.BuildDigest == "" {
+		if local.Package == "" || local.Release == "" || local.Tree == "" || local.SourceDigest == "" {
 			return fail(exit.Internalf("local package build input is incomplete"))
 		}
 		abs, err := filepath.Abs(local.Tree)
@@ -222,38 +212,14 @@ func Run(l home.Layout, st *records.Store, req Request) (*Result, *exit.Error) {
 			return fail(exit.Usagef("local package directory %q is not resolvable: %s", local.Tree, err))
 		}
 		sourceDir = abs
-		gen.SourceKind, gen.SourceRef, gen.SourceDigest = "local", abs, local.BuildDigest
+		gen.SourceKind, gen.SourceRef, gen.SourceDigest = "local", abs, local.SourceDigest
 		gen.Package, gen.Version = local.Package, local.Release
 		res.Files, res.Bytes = local.Files, local.Bytes
-	case req.Archive != "":
-		staged, err := StageArchive(req.Archive, filepath.Join(genDir, "source"))
-		if err != nil {
-			return fail(err)
-		}
-		sourceDir = staged.Root
-		gen.SourceKind, gen.SourceRef, gen.SourceDigest = "archive", req.Archive, staged.Digest
-		gen.Package, gen.Version = staged.Decl.Package, staged.Decl.Version
-		res.Files, res.Bytes, res.Compressed = staged.Files, staged.Bytes, staged.Compressed
-	default:
-		abs, err := filepath.Abs(req.Dir)
-		if err != nil {
-			return fail(exit.Usagef("--dir %q is not resolvable: %s", req.Dir, err))
-		}
-		digest, files, bytes, e := SnapshotDigest(abs)
-		if e != nil {
-			return fail(e)
-		}
-		// Editable by design: the venv is built against the live tree, never a copy.
-		sourceDir = abs
-		gen.SourceKind, gen.SourceRef, gen.SourceDigest = "dir", abs, digest
-		gen.Package = req.Ref.Package
-		gen.Version = "dev+" + strings.TrimPrefix(digest, "sha256:")[:12]
-		res.Files, res.Bytes = files, bytes
 	}
 	mark("stage")
 
 	// ---- verify: source identity settles BEFORE anything can execute ----
-	if e := verifySource(&gen, req, &res.Warnings); e != nil {
+	if e := verifySource(&gen, &res.Warnings); e != nil {
 		return fail(e)
 	}
 	if e := resolveTarget(&gen, req.Ref); e != nil {
@@ -326,13 +292,15 @@ func Run(l home.Layout, st *records.Store, req Request) (*Result, *exit.Error) {
 	res.Warnings = append(res.Warnings, env.Warnings...)
 	mark("venv")
 
-	// ---- descriptor: published installs consume the exact qualified descriptor;
-	// development installs still derive their local, non-runnable surface.
+	// ---- descriptor: published installs consume the exact selected descriptor;
+	// editable installs ask their own Runtime for the descriptor and local-only
+	// DevelopmentPackage placement in one metadata-only operation.
 	var descriptor *launch.PackageDescriptor
+	var developmentSet ExactDocument
 	if req.Published != nil {
 		descriptor, e = launch.DecodeDescriptor(req.Published.Selection.PackageDescriptor.Bytes)
 	} else {
-		descriptor, e = deriveDescriptor(venvDir, sourceDir)
+		descriptor, developmentSet, e = deriveDevelopmentPlacement(venvDir, sourceDir, *req.Local)
 	}
 	if e != nil {
 		return guard(e)
@@ -350,7 +318,34 @@ func Run(l home.Layout, st *records.Store, req Request) (*Result, *exit.Error) {
 			"the installed package derived descriptor %s, selected release requires %s",
 			descriptor.Digest, req.Published.Selection.PackageDescriptor.Digest))
 	}
+	if req.Local != nil {
+		cache := filepath.Join(genDir, "artifact-cache")
+		if err := os.MkdirAll(cache, 0o700); err != nil {
+			return guard(exit.Internalf("cannot create editable placement cache: %s", err))
+		}
+		if err := os.WriteFile(filepath.Join(cache,
+			strings.TrimPrefix(developmentSet.Digest, "sha256:")), developmentSet.Bytes, 0o600); err != nil {
+			return guard(exit.Internalf("cannot store editable PlacementSet: %s", err))
+		}
+		gen.PlacementSetDigest = developmentSet.Digest
+	}
 	mark("package_descriptor")
+	if req.Local != nil {
+		current, problem := packagepublish.PrepareFrom(sourceDir)
+		if problem != nil {
+			return guard(exit.Named(exit.Conflict, "editable_source_changed",
+				"the editable package changed while its replacement was being prepared").
+				WithRemedy("source recheck failed: %s", problem.Message))
+		}
+		defer current.Close()
+		digest, _, _, problem := current.SourceIdentity()
+		if problem != nil || digest != req.Local.SourceDigest ||
+			current.Organization+"/"+current.Name != req.Local.Package || current.Release != req.Local.Release {
+			return guard(exit.Named(exit.Conflict, "editable_source_changed",
+				"the editable package changed while its replacement was being prepared").
+				WithRemedy("retry after the source tree is stable"))
+		}
+	}
 
 	// Disk is measured once, here, and read back from the record forever after.
 	gen.BytesExcl, gen.BytesShared = Disk(genDir)
@@ -398,35 +393,89 @@ func persistPublishedArtifacts(genDir string, artifacts map[string]string) *exit
 // deriveDescriptor runs the generation's own Runtime over its source. Runtime emits the
 // complete descriptor without writing the source tree; Cozy validates the closed grammar
 // and stores the canonical bytes under the immutable generation root.
-func deriveDescriptor(venvDir, sourceDir string) (*launch.PackageDescriptor, *exit.Error) {
+func deriveDevelopmentPlacement(venvDir, sourceDir string, local LocalSource) (
+	*launch.PackageDescriptor, ExactDocument, *exit.Error,
+) {
+	var empty ExactDocument
 	bin := home.VenvTool(venvDir, "cozy-runtime")
 	if _, err := os.Stat(bin); err != nil {
-		return nil, exit.Named(exit.Structural, "runtime_missing",
+		return nil, empty, exit.Named(exit.Structural, "runtime_missing",
 			"this generation's venv provides no cozy-runtime at %s", bin).
 			WithRemedy("a package depends on cozy-runtime; its surface is described by the runtime the release itself pinned, never this host's").
 			WithNext("cozy help package install")
 	}
-	cmd := exec.Command(bin, "--json", "--dir", sourceDir, "describe")
+	cmd := exec.Command(bin, "--json", "--dir", sourceDir, "development-placement",
+		"--package", local.Package, "--release", local.Release,
+		"--source-digest", local.SourceDigest)
 	cmd.Env = config.Frozen().Tool()
 	var stdout, stderr strings.Builder
 	cmd.Stdout, cmd.Stderr = &stdout, &stderr
 	err := cmd.Run()
 	if cmd.ProcessState == nil {
-		return nil, exit.Internalf("cannot run %s: %s", bin, err)
+		return nil, empty, exit.Internalf("cannot run %s: %s", bin, err)
 	}
 	if code := cmd.ProcessState.ExitCode(); code != 0 {
-		return nil, describeRefusal(code, stderr.String())
+		return nil, empty, metadataRefusal(code, "development-placement", stderr.String())
 	}
-	descriptor, problem := launch.DecodeDescriptor([]byte(stdout.String()))
-	if problem != nil {
-		return nil, exit.Named(exit.Validation, "descriptor_invalid",
-			"cozy-runtime describe returned an invalid descriptor: %s", problem.Message)
+	type exact struct {
+		Bytes  []byte `json:"canonical_bytes_base64"`
+		Digest string `json:"digest"`
+		Length int64  `json:"length"`
 	}
-	return descriptor, nil
+	var answer struct {
+		Package           string `json:"package"`
+		Release           string `json:"release"`
+		SourceDigest      string `json:"source_digest"`
+		PlacementSet      exact  `json:"placement_set"`
+		PackageDescriptor exact  `json:"package_descriptor"`
+	}
+	decoder := json.NewDecoder(strings.NewReader(stdout.String()))
+	decoder.DisallowUnknownFields()
+	decodeErr := decoder.Decode(&answer)
+	var trailing any
+	if decodeErr == nil {
+		decodeErr = decoder.Decode(&trailing)
+	}
+	if decodeErr != io.EOF || answer.Package != local.Package ||
+		answer.Release != local.Release || answer.SourceDigest != local.SourceDigest {
+		return nil, empty, exit.Named(exit.Structural, "editable_placement_invalid",
+			"cozy-runtime development-placement returned a mismatched answer")
+	}
+	validExact := func(value exact) bool {
+		digest, err := canonical.Raw(value.Digest)
+		return err == nil && value.Length == int64(len(value.Bytes)) &&
+			bytes.Equal(canonical.Digest(value.Bytes), digest)
+	}
+	if !validExact(answer.PlacementSet) || !validExact(answer.PackageDescriptor) {
+		return nil, empty, exit.Named(exit.Structural, "editable_placement_identity_mismatch",
+			"cozy-runtime development-placement returned bytes that do not match their digest and length")
+	}
+	descriptor, problem := launch.DecodeDescriptor(answer.PackageDescriptor.Bytes)
+	if problem != nil || descriptor.Digest != answer.PackageDescriptor.Digest {
+		return nil, empty, exit.Named(exit.Validation, "descriptor_invalid",
+			"cozy-runtime development-placement returned an invalid package descriptor")
+	}
+	set, readErr := canonical.Read(answer.PlacementSet.Bytes, &pb.PlacementSet{})
+	if readErr != nil || len(set.List("placements")) != 1 {
+		return nil, empty, exit.Named(exit.Structural, "editable_placement_invalid",
+			"cozy-runtime returned an invalid development PlacementSet")
+	}
+	placement := set.List("placements")[0]
+	development := placement.Sub("development")
+	if development.Str("package") != local.Package || development.Str("release") != local.Release ||
+		development.Str("source_digest") != local.SourceDigest ||
+		placement.Sub("package_descriptor").Str("digest") != answer.PackageDescriptor.Digest ||
+		placement.Sub("package_descriptor").Int("length") != answer.PackageDescriptor.Length ||
+		placement.Sub("qualification").Str("digest") != "" || placement.Str("environment_digest") != "" {
+		return nil, empty, exit.Named(exit.Structural, "editable_placement_invalid",
+			"cozy-runtime development PlacementSet mixes local source with published selection facts")
+	}
+	return descriptor, ExactDocument{Bytes: answer.PlacementSet.Bytes,
+		Digest: answer.PlacementSet.Digest, Length: answer.PlacementSet.Length}, nil
 }
 
-// describeRefusal renders the runtime's typed refusal under the shared exit vocabulary.
-func describeRefusal(code int, stderr string) *exit.Error {
+// metadataRefusal preserves Runtime's typed metadata refusal under the shared exit vocabulary.
+func metadataRefusal(code int, verb, stderr string) *exit.Error {
 	var doc struct {
 		Error struct{ Name, Message, Remedy string } `json:"error"`
 	}
@@ -434,11 +483,14 @@ func describeRefusal(code int, stderr string) *exit.Error {
 	if !c.Valid() {
 		c = exit.Internal
 	}
-	name := "descriptor_refused"
 	if json.Unmarshal([]byte(stderr), &doc) != nil || doc.Error.Message == "" {
-		return exit.Named(c, name,
-			"`cozy-runtime describe` refused this generation (exit %d)", code).
+		return exit.Named(c, "runtime_metadata_refused",
+			"`cozy-runtime %s` refused this generation (exit %d)", verb, code).
 			WithRemedy("%s", condense(stderr))
+	}
+	name := doc.Error.Name
+	if name == "" {
+		name = "runtime_metadata_refused"
 	}
 	return exit.Named(c, name, "%s", doc.Error.Message).
 		WithRemedy("%s", doc.Error.Remedy).
@@ -446,7 +498,7 @@ func describeRefusal(code int, stderr string) *exit.Error {
 }
 
 // verifySource settles source identity before any build backend or import can run.
-func verifySource(gen *records.PackageInstall, req Request, warn *[]string) *exit.Error {
+func verifySource(gen *records.PackageInstall, warn *[]string) *exit.Error {
 	if gen.SourceKind == "tensorhub" {
 		gen.Verified = true
 		return nil
@@ -454,35 +506,10 @@ func verifySource(gen *records.PackageInstall, req Request, warn *[]string) *exi
 	if gen.SourceKind == "local" {
 		gen.Verified = false
 		*warn = append(*warn,
-			"local directory install: source and wheel bytes are pinned locally but are not a published or qualified Tensorhub release")
+			"local directory install: source bytes are pinned locally but are not a published Tensorhub release")
 		return nil
 	}
-	if gen.SourceKind == "dir" {
-		// --dir IS the development trust path: an explicit local tree the operator
-		// already controls. It carries a snapshot identity, never publisher evidence.
-		gen.Verified = false
-		*warn = append(*warn, "editable --dir install: source identity is a local snapshot digest, not publisher evidence")
-		return nil
-	}
-	if req.ExpectDigest == "" {
-		if !req.AllowUnsigned {
-			return exit.Named(exit.Validation, "source_unverified",
-				"the release archive carries no verified source digest").
-				WithRemedy("pass --digest <sha256:…> from the release record, or --allow-unsigned for a development install").
-				WithNext("cozy help package install")
-		}
-		gen.Verified = false
-		*warn = append(*warn, "--allow-unsigned: this generation was installed WITHOUT source verification (development door)")
-		return nil
-	}
-	if !strings.EqualFold(strings.TrimSpace(req.ExpectDigest), gen.SourceDigest) {
-		return exit.Named(exit.Validation, "source_digest_mismatch",
-			"the release archive does not match the declared source digest").
-			WithRemedy("declared %s, archive %s", short(req.ExpectDigest), short(gen.SourceDigest)).
-			WithNext("cozy help package install")
-	}
-	gen.Verified = true
-	return nil
+	return exit.Internalf("unknown package source kind %q", gen.SourceKind)
 }
 
 // resolveTarget reconciles what the release says with what the caller asked for.
@@ -495,23 +522,13 @@ func resolveTarget(gen *records.PackageInstall, ref Ref) *exit.Error {
 		gen.Major = major
 		return nil
 	}
-	if gen.SourceKind == "dir" {
-		if !ref.HasMajor {
-			return exit.Usagef("an editable --dir install needs an explicit major").
-				WithRemedy("a local tree carries no release record, so the major is declared: cozy package install %s@v1 --dir …", ref.Package).
-				WithNext("cozy help package install")
-		}
-		gen.Major = ref.Major
-		return nil
-	}
 	if gen.Package == "" || gen.Version == "" {
-		return exit.Named(exit.Validation, "release_undeclared",
-			"%s declares no package and version", DeclName)
+		return exit.Named(exit.Validation, "release_undeclared", "the package source declares no package and version")
 	}
 	if gen.Package != ref.Package {
 		return exit.Named(exit.Validation, "release_mismatch",
-			"the archive publishes %q but %q was requested", gen.Package, ref.Package).
-			WithRemedy("install the ref the release declares, or point --from at the right archive")
+			"the package source names %q but %q was requested", gen.Package, ref.Package).
+			WithRemedy("install the package named by its project metadata")
 	}
 	major, e := MajorOf(gen.Version)
 	if e != nil {
@@ -539,7 +556,7 @@ func checkCapacity(dir string, staged int64) *exit.Error {
 	}
 	return exit.New(exit.Capacity,
 		"not enough disk to build this generation: needed %s, had %s, short by %s on %s",
-		bytesText(need), bytesText(free), bytesText(need-free), dir).
+		units.Bytes(need), units.Bytes(free), units.Bytes(need-free), dir).
 		WithRemedy("free space, remove an installed package, or move COZY_HOME to a larger filesystem").
 		WithNext("cozy package list")
 }

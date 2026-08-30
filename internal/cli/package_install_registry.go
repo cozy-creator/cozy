@@ -10,12 +10,14 @@ import (
 	"sync"
 
 	pep440 "github.com/aquasecurity/go-pep440-version"
+	"github.com/cozy-creator/cozy/internal/canonical"
 	"github.com/cozy-creator/cozy/internal/exit"
 	"github.com/cozy-creator/cozy/internal/home"
 	"github.com/cozy-creator/cozy/internal/hostgpu"
 	"github.com/cozy-creator/cozy/internal/hub"
 	"github.com/cozy-creator/cozy/internal/install"
 	"github.com/cozy-creator/cozy/internal/transfer"
+	pb "github.com/cozy-creator/cozy/protocol/cozy/worker/v1"
 )
 
 func handleRegistryInstall(ctx *Context) *exit.Error {
@@ -49,6 +51,10 @@ func handleRegistryInstall(ctx *Context) *exit.Error {
 	if problem != nil {
 		return problem
 	}
+	releaseDigest, problem := selectedReleaseDigest(plan.PlacementSet, ref.String(), release)
+	if problem != nil {
+		return problem
+	}
 	_, existing, _, problem := open(ctx.Cfg, false)
 	if problem != nil {
 		return problem
@@ -58,7 +64,7 @@ func handleRegistryInstall(ctx *Context) *exit.Error {
 		existing.Close()
 		return problem
 	}
-	if generation != nil && generation.SourceDigest == plan.PackageRelease.Digest &&
+	if generation != nil && generation.SourceDigest == releaseDigest &&
 		generation.PlacementSetDigest == plan.PlacementSet.Digest {
 		defer existing.Close()
 		return emitInstallResult(ctx, existing, &install.Result{Gen: *generation, Idempotent: true})
@@ -76,7 +82,7 @@ func handleRegistryInstall(ctx *Context) *exit.Error {
 		return exit.Internalf("cannot create package download scratch: %s", err)
 	}
 	defer os.RemoveAll(scratch)
-	published, problem := downloadPackageInstallPlan(hctx, ctx, scratch, ref, release, plan)
+	published, problem := downloadPackageInstallPlan(hctx, ctx, scratch, ref, release, releaseDigest, plan)
 	if problem != nil {
 		return problem
 	}
@@ -181,18 +187,17 @@ func registryPackageRef(value, release string) (hub.Ref, string, *exit.Error) {
 }
 
 func downloadPackageInstallPlan(ctx context.Context, cli *Context, scratch string, ref hub.Ref,
-	release string, plan hub.PackageInstallPlan,
+	release, releaseDigest string, plan hub.PackageInstallPlan,
 ) (*install.PublishedSource, *exit.Error) {
 	if plan.Profile == "" || len(plan.Downloads) == 0 || len(plan.Downloads) > 20_033 {
 		return nil, exit.Internalf("Tensorhub returned an invalid package install plan")
 	}
 	published := &install.PublishedSource{
-		Package: ref.String(), Release: release, SourceDigest: plan.PackageRelease.Digest,
+		Package: ref.String(), Release: release, SourceDigest: releaseDigest,
 		Artifacts: map[string]string{},
 		Selection: install.Selection{
 			Profile:            plan.Profile,
 			PlacementSet:       install.ExactDocument{Bytes: plan.PlacementSet.CanonicalBytes, Digest: plan.PlacementSet.Digest, Length: plan.PlacementSet.Length},
-			PackageRelease:     install.ExactDocument{Bytes: plan.PackageRelease.CanonicalBytes, Digest: plan.PackageRelease.Digest, Length: plan.PackageRelease.Length},
 			PackageDescriptor:  install.ExactDocument{Bytes: plan.PackageDescriptor.CanonicalBytes, Digest: plan.PackageDescriptor.Digest, Length: plan.PackageDescriptor.Length},
 			Qualification:      install.ExactDocument{Bytes: plan.Qualification.CanonicalBytes, Digest: plan.Qualification.Digest, Length: plan.Qualification.Length},
 			EnvironmentReceipt: install.ExactDocument{Bytes: plan.EnvironmentReceipt.CanonicalBytes, Digest: plan.EnvironmentReceipt.Digest, Length: plan.EnvironmentReceipt.Length},
@@ -218,6 +223,7 @@ func downloadPackageInstallPlan(ctx context.Context, cli *Context, scratch strin
 					return nil, exit.Internalf("Tensorhub returned more than one project wheel")
 				}
 				published.ProjectWheel = dst
+				published.ProjectWheelDigest = download.Digest
 			} else {
 				published.Wheels = append(published.Wheels, dst)
 			}
@@ -238,6 +244,12 @@ func downloadPackageInstallPlan(ctx context.Context, cli *Context, scratch strin
 	}
 	if published.ProjectWheel == "" {
 		return nil, exit.Internalf("Tensorhub package install plan has no project wheel")
+	}
+	set, err := canonical.Read(plan.PlacementSet.CanonicalBytes, &pb.PlacementSet{})
+	if err != nil || len(set.List("placements")) != 1 ||
+		set.List("placements")[0].Sub("package").Sub("project_wheel").Sub("ref").Str("digest") != published.ProjectWheelDigest {
+		return nil, exit.Named(exit.Conflict, "package_selection_project_wheel_mismatch",
+			"Tensorhub project wheel download does not match the selected PlacementSet")
 	}
 	queue := make(chan job, len(jobs))
 	results := make(chan *exit.Error, len(jobs))
@@ -280,4 +292,24 @@ func downloadPackageInstallPlan(ctx context.Context, cli *Context, scratch strin
 		published.Bytes += item.download.Length
 	}
 	return published, nil
+}
+
+func selectedReleaseDigest(document hub.ExactDocument, pkg, release string) (string, *exit.Error) {
+	set, err := canonical.Read(document.CanonicalBytes, &pb.PlacementSet{})
+	if err != nil || len(set.List("placements")) != 1 {
+		return "", exit.Named(exit.Structural, "package_selection_placement_invalid",
+			"Tensorhub returned an invalid single-package PlacementSet")
+	}
+	fact := set.List("placements")[0].Sub("package")
+	digest := fact.Str("release_digest")
+	if fact.Str("package") != pkg || fact.Str("release") != release {
+		return "", exit.Named(exit.Conflict, "package_selection_release_mismatch",
+			"Tensorhub selected %s@%s while %s@%s was requested",
+			fact.Str("package"), fact.Str("release"), pkg, release)
+	}
+	if _, err := canonical.Raw(digest); err != nil {
+		return "", exit.Named(exit.Structural, "package_selection_release_digest_invalid",
+			"Tensorhub selected an invalid release digest")
+	}
+	return digest, nil
 }

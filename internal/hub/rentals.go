@@ -33,7 +33,7 @@ import (
 //	GET    /v1/rentals/{id}          -> {state, worker_address, cert_pem, media_address,
 //	                                     detail, worker_id, worker_boot_id,
 //	                                     media_token_sha256:[...],
-//	                                     selection:{profile,placement_set,package_release,
+//	                                     selection:{profile,placement_set,
 //	                                                package_descriptor,qualification}}
 //	POST   /v1/rentals/{id}/worker-observations
 //	                                     -> renter-authenticated deterministic WorkerFrames
@@ -93,7 +93,6 @@ type ExactDocument struct {
 type PackageSelection struct {
 	Profile           string        `json:"profile"`
 	PlacementSet      ExactDocument `json:"placement_set"`
-	PackageRelease    ExactDocument `json:"package_release"`
 	PackageDescriptor ExactDocument `json:"package_descriptor"`
 	Qualification     ExactDocument `json:"qualification"`
 }

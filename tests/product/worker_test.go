@@ -40,12 +40,49 @@ func TestProgressWatchOpensAfterSnapshotBarrier(t *testing.T) {
 	t.Fatal("the progress connection did not open after the snapshot barrier")
 }
 
+func TestPackageScopedUnloadPreservesUnrelatedWarmWorker(t *testing.T) {
+	o := hostOwner(t, "package-scoped-unload")
+	for _, id := range []string{"old-editable-install", "current-editable-install"} {
+		_, problem := o.store.Activate(records.PackageInstall{
+			ID: id, Package: "fake/editable-left", Major: 1, Version: "1.0.0",
+			SourceKind: "local", SourceRef: t.TempDir(), SourceDigest: fakeRelease,
+			Dir: t.TempDir(),
+		})
+		fatal(t, problem)
+	}
+	left, right := fakeSpec("editable-left", "0"), fakeSpec("warm-right", "1")
+	left.Placement.InstallID = "old-editable-install"
+	leftID, _, problem := o.c.EnsureWorker(left)
+	fatal(t, problem)
+	fatal(t, o.c.EnsurePlacementReady(leftID, planIDOf(t, left)))
+	rightID, _, problem := o.c.EnsureWorker(right)
+	fatal(t, problem)
+	fatal(t, o.c.EnsurePlacementReady(rightID, planIDOf(t, right)))
+	current := fakeSpec("editable-left", "2")
+	current.Placement.InstallID = "current-editable-install"
+	currentID, _, problem := o.c.EnsureWorker(current)
+	fatal(t, problem)
+	fatal(t, o.c.EnsurePlacementReady(currentID, planIDOf(t, current)))
+
+	stopped, problem := o.c.UnloadIdleLocalPackage("fake/editable-left", "current-editable-install")
+	fatal(t, problem)
+	if len(stopped) != 1 || stopped[0].InstanceID != leftID || o.c.Worker(leftID) != nil {
+		t.Fatalf("scoped unload did not retire only the edited package: %#v", stopped)
+	}
+	if worker := o.c.Worker(rightID); worker == nil || worker.Package != "fake/warm-right" {
+		t.Fatalf("scoped unload evicted unrelated warm package: %#v", worker)
+	}
+	if worker := o.c.Worker(currentID); worker == nil || worker.Package != "fake/editable-left" {
+		t.Fatalf("scoped unload evicted the current editable generation: %#v", worker)
+	}
+}
+
 func TestReconcilePreservesWorkerWithUnresolvedBirthIdentity(t *testing.T) {
 	o := hostOwner(t, "unresolved-birth")
 	defer o.close()
 
 	pending := records.WorkerProcess{
-		InstanceID: "ins-pending-birth", Package: "fake/pending", PackageReleaseID: fakeRelease,
+		InstanceID: "ins-pending-birth", Package: "fake/pending", PackageRevisionDigest: fakeRelease,
 		WorkerID: "local", Devices: []string{"7"},
 	}
 	fatal(t, o.store.SpawnWorker(pending))
@@ -62,7 +99,7 @@ func TestReconcilePreservesWorkerWithUnresolvedBirthIdentity(t *testing.T) {
 		t.Fatalf("unresolved worker row was not retained: %#v", rows)
 	}
 	if problem := o.store.SpawnWorker(records.WorkerProcess{
-		InstanceID: "ins-rival", Package: "fake/rival", PackageReleaseID: fakeRelease,
+		InstanceID: "ins-rival", Package: "fake/rival", PackageRevisionDigest: fakeRelease,
 		WorkerID: "local", Devices: []string{"7"},
 	}); problem == nil || problem.Code != exit.Conflict {
 		t.Fatalf("retained unresolved grant did not block a second worker: %v", problem)

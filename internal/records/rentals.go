@@ -47,12 +47,10 @@ CREATE TABLE IF NOT EXISTS rentals (
   hub               TEXT NOT NULL,
   rented_at         TEXT NOT NULL,
   media_address     TEXT NOT NULL DEFAULT '',
-  placement_set_digest TEXT NOT NULL DEFAULT '',
-  placement_set_bytes  BLOB NOT NULL DEFAULT x'',
-  selection_profile TEXT NOT NULL DEFAULT '',
-  package_release_digest TEXT NOT NULL DEFAULT '',
-  package_release_bytes BLOB NOT NULL DEFAULT x'',
-  package_descriptor_digest TEXT NOT NULL DEFAULT '',
+	  placement_set_digest TEXT NOT NULL DEFAULT '',
+	  placement_set_bytes  BLOB NOT NULL DEFAULT x'',
+	  selection_profile TEXT NOT NULL DEFAULT '',
+	  package_descriptor_digest TEXT NOT NULL DEFAULT '',
   package_descriptor_bytes BLOB NOT NULL DEFAULT x'',
   qualification_digest TEXT NOT NULL DEFAULT '',
   qualification_bytes BLOB NOT NULL DEFAULT x'',
@@ -94,6 +92,15 @@ func migrateRentalSchema(db *sql.DB, path string) *exit.Error {
 	if !columns["package_ref"] {
 		return exit.Internalf("cannot migrate the rentals schema in %s: package_ref is absent", path)
 	}
+	for _, retired := range []string{"package_release_digest", "package_release_bytes"} {
+		if !columns[retired] {
+			continue
+		}
+		if _, err := db.Exec(`ALTER TABLE rentals DROP COLUMN ` + retired); err != nil {
+			return exit.Internalf("cannot remove retired rentals.%s from %s: %s", retired, path, err)
+		}
+		delete(columns, retired)
+	}
 	for _, column := range []struct {
 		name string
 		ddl  string
@@ -102,8 +109,6 @@ func migrateRentalSchema(db *sql.DB, path string) *exit.Error {
 		{"placement_set_bytes", `BLOB NOT NULL DEFAULT x''`},
 		{"placement_revision", `INTEGER NOT NULL DEFAULT 0`},
 		{"selection_profile", `TEXT NOT NULL DEFAULT ''`},
-		{"package_release_digest", `TEXT NOT NULL DEFAULT ''`},
-		{"package_release_bytes", `BLOB NOT NULL DEFAULT x''`},
 		{"package_descriptor_digest", `TEXT NOT NULL DEFAULT ''`},
 		{"package_descriptor_bytes", `BLOB NOT NULL DEFAULT x''`},
 		{"qualification_digest", `TEXT NOT NULL DEFAULT ''`},
@@ -373,8 +378,6 @@ type Rental struct {
 	PlacementSetDigest      string
 	PlacementSetBytes       []byte
 	SelectionProfile        string
-	PackageReleaseDigest    string
-	PackageReleaseBytes     []byte
 	PackageDescriptorDigest string
 	PackageDescriptorBytes  []byte
 	QualificationDigest     string
@@ -396,14 +399,14 @@ type Rental struct {
 	ExpectedWorkerBootID           string
 }
 
-const rentalCols = `id,machine_name,sku,package_ref,accelerator_model,address,cert_path,state,hub,rented_at,media_address,placement_set_digest,placement_set_bytes,selection_profile,package_release_digest,package_release_bytes,package_descriptor_digest,package_descriptor_bytes,qualification_digest,qualification_bytes,placement_revision,observed_accelerator,observed_accelerator_count,observed_backend,observed_driver_version,observed_backend_version,observed_device_memory_total_bytes,observed_worker_instance,observed_worker_boot_id,observed_at,expected_worker_id,expected_worker_boot_id`
+const rentalCols = `id,machine_name,sku,package_ref,accelerator_model,address,cert_path,state,hub,rented_at,media_address,placement_set_digest,placement_set_bytes,selection_profile,package_descriptor_digest,package_descriptor_bytes,qualification_digest,qualification_bytes,placement_revision,observed_accelerator,observed_accelerator_count,observed_backend,observed_driver_version,observed_backend_version,observed_device_memory_total_bytes,observed_worker_instance,observed_worker_boot_id,observed_at,expected_worker_id,expected_worker_boot_id`
 
 func scanRental(row interface{ Scan(...any) error }) (Rental, error) {
 	var r Rental
 	err := row.Scan(&r.ID, &r.MachineName, &r.SKU, &r.PackageRef, &r.AcceleratorModel, &r.Address, &r.CertPath,
 		&r.State, &r.Hub, &r.RentedAt, &r.MediaAddress,
 		&r.PlacementSetDigest, &r.PlacementSetBytes,
-		&r.SelectionProfile, &r.PackageReleaseDigest, &r.PackageReleaseBytes,
+		&r.SelectionProfile,
 		&r.PackageDescriptorDigest, &r.PackageDescriptorBytes,
 		&r.QualificationDigest, &r.QualificationBytes,
 		&r.PlacementRevision,
@@ -471,9 +474,6 @@ func (s *Store) recordRental(r Rental) *exit.Error {
 	if r.PlacementSetBytes == nil {
 		r.PlacementSetBytes = []byte{}
 	}
-	if r.PackageReleaseBytes == nil {
-		r.PackageReleaseBytes = []byte{}
-	}
 	if r.PackageDescriptorBytes == nil {
 		r.PackageDescriptorBytes = []byte{}
 	}
@@ -494,7 +494,7 @@ func (s *Store) recordRental(r Rental) *exit.Error {
 		r.State = rentalStateForward(current, r.State)
 	}
 	if _, err := tx.Exec(`INSERT INTO rentals(`+rentalCols+`)
-		VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+			VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
 		ON CONFLICT(id) DO UPDATE SET
 		  machine_name=CASE WHEN rentals.machine_name<>'' THEN rentals.machine_name ELSE excluded.machine_name END,
 		  sku=CASE WHEN rentals.sku<>'' THEN rentals.sku ELSE excluded.sku END,
@@ -507,8 +507,6 @@ func (s *Store) recordRental(r Rental) *exit.Error {
 		  placement_set_bytes=CASE WHEN length(rentals.placement_set_bytes)>0
 		    THEN rentals.placement_set_bytes ELSE excluded.placement_set_bytes END,
 		  selection_profile=CASE WHEN rentals.selection_profile<>'' THEN rentals.selection_profile ELSE excluded.selection_profile END,
-		  package_release_digest=CASE WHEN length(rentals.package_release_bytes)>0 THEN rentals.package_release_digest ELSE excluded.package_release_digest END,
-		  package_release_bytes=CASE WHEN length(rentals.package_release_bytes)>0 THEN rentals.package_release_bytes ELSE excluded.package_release_bytes END,
 		  package_descriptor_digest=CASE WHEN length(rentals.package_descriptor_bytes)>0 THEN rentals.package_descriptor_digest ELSE excluded.package_descriptor_digest END,
 		  package_descriptor_bytes=CASE WHEN length(rentals.package_descriptor_bytes)>0 THEN rentals.package_descriptor_bytes ELSE excluded.package_descriptor_bytes END,
 		  qualification_digest=CASE WHEN length(rentals.qualification_bytes)>0 THEN rentals.qualification_digest ELSE excluded.qualification_digest END,
@@ -539,8 +537,7 @@ func (s *Store) recordRental(r Rental) *exit.Error {
 		    THEN rentals.expected_worker_boot_id ELSE excluded.expected_worker_boot_id END`,
 		r.ID, r.MachineName, r.SKU, r.PackageRef, r.AcceleratorModel, r.Address, r.CertPath, r.State, r.Hub,
 		r.RentedAt, r.MediaAddress, r.PlacementSetDigest,
-		r.PlacementSetBytes, r.SelectionProfile, r.PackageReleaseDigest, r.PackageReleaseBytes,
-		r.PackageDescriptorDigest, r.PackageDescriptorBytes, r.QualificationDigest,
+		r.PlacementSetBytes, r.SelectionProfile, r.PackageDescriptorDigest, r.PackageDescriptorBytes, r.QualificationDigest,
 		r.QualificationBytes, r.PlacementRevision, r.ObservedAccelerator,
 		r.ObservedAcceleratorCount, r.ObservedBackend, r.ObservedDriverVersion,
 		r.ObservedBackendVersion, r.ObservedDeviceMemoryTotalBytes, r.ObservedWorkerInstance,
@@ -607,12 +604,10 @@ func (s *Store) ReplaceRentalSelection(next Rental) *exit.Error {
 			next.ID, next.PlacementRevision, current.PlacementRevision)
 	}
 	result, err := s.db.Exec(`UPDATE rentals SET package_ref=?,placement_set_digest=?,placement_set_bytes=?,
-		selection_profile=?,package_release_digest=?,package_release_bytes=?,
-		package_descriptor_digest=?,package_descriptor_bytes=?,qualification_digest=?,qualification_bytes=?,
-		placement_revision=? WHERE id=? AND placement_revision=?`,
+			selection_profile=?,package_descriptor_digest=?,package_descriptor_bytes=?,qualification_digest=?,qualification_bytes=?,
+			placement_revision=? WHERE id=? AND placement_revision=?`,
 		next.PackageRef, next.PlacementSetDigest, next.PlacementSetBytes, next.SelectionProfile,
-		next.PackageReleaseDigest, next.PackageReleaseBytes, next.PackageDescriptorDigest,
-		next.PackageDescriptorBytes, next.QualificationDigest, next.QualificationBytes,
+		next.PackageDescriptorDigest, next.PackageDescriptorBytes, next.QualificationDigest, next.QualificationBytes,
 		next.PlacementRevision, next.ID, current.PlacementRevision)
 	if err != nil {
 		return exit.Internalf("cannot replace rental %s selection: %s", next.ID, err)

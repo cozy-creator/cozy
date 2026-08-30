@@ -168,59 +168,6 @@ func Disk(dir string) (exclusive, shared int64) {
 	return
 }
 
-// SnapshotDigest is the identity of an editable `--dir` tree: one digest over every
-// path and its content, so a development install still has a source identity on
-// record even though no publisher signed it.
-func SnapshotDigest(dir string) (string, int, int64, *exit.Error) {
-	h := sha256.New()
-	files, bytes := 0, int64(0)
-	var paths []string
-	err := filepath.WalkDir(dir, func(p string, d fs.DirEntry, err error) error {
-		if err != nil {
-			return err
-		}
-		rel, _ := filepath.Rel(dir, p)
-		rel = filepath.ToSlash(rel)
-		if d.IsDir() {
-			if skipDir(filepath.Base(p)) && rel != "." {
-				return filepath.SkipDir
-			}
-			return nil
-		}
-		if d.Type()&fs.ModeSymlink != 0 {
-			return nil
-		}
-		paths = append(paths, rel)
-		return nil
-	})
-	if err != nil {
-		return "", 0, 0, exit.New(exit.NotFound, "cannot read the source tree %s: %s", dir, err).
-			WithRemedy("--dir names a readable package project directory")
-	}
-	sort.Strings(paths)
-	for _, rel := range paths {
-		d, err := fileDigest(filepath.Join(dir, rel))
-		if err != nil {
-			return "", 0, 0, exit.Internalf("cannot read %s: %s", rel, err)
-		}
-		info, _ := os.Stat(filepath.Join(dir, rel))
-		fmt.Fprintf(h, "%s %s\n", d, rel)
-		files++
-		if info != nil {
-			bytes += info.Size()
-		}
-	}
-	return "sha256:" + hex.EncodeToString(h.Sum(nil)), files, bytes, nil
-}
-
-func skipDir(name string) bool {
-	switch name {
-	case ".git", ".venv", "__pycache__", ".mypy_cache", ".ruff_cache", "node_modules", "dist":
-		return true
-	}
-	return false
-}
-
 func fileDigest(p string) (string, error) {
 	f, err := os.Open(p)
 	if err != nil {

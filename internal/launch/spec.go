@@ -44,28 +44,22 @@ func Read(gen records.PackageInstall, cozyHome string, env []string) (*Facts, *e
 	}, nil
 }
 
-// SourceDir is where a generation's package tree lives. An archive install stages it
-// under the generation; local-directory development installs retain their explicit
-// absolute author-controlled path.
+// SourceDir is where a generation's package tree lives. Editable installs retain
+// their explicit absolute author-controlled path.
 func SourceDir(gen records.PackageInstall) string {
 	if gen.ProjectDir != "" {
 		return gen.ProjectDir
 	}
-	if (gen.SourceKind == "dir" || gen.SourceKind == "local") && gen.SourceRef != "" {
+	if gen.SourceKind == "local" && gen.SourceRef != "" {
 		return gen.SourceRef
 	}
 	return filepath.Join(gen.Dir, "source")
 }
 
-// PackageReleaseID is the package release identity this host serves the generation under. It is
-// what the orchestrator pins and what a registering worker must match: an install
-// generation of one package version is one provisioned instance lifetime.
-func PackageReleaseID(gen records.PackageInstall) string {
-	version := gen.Version
-	if version == "" {
-		version = gen.ID
-	}
-	return gen.Package + "@" + version
+// PackageRevisionDigest is the exact published release or editable source digest
+// this generation serves. The same digest pins invocation and worker identity.
+func PackageRevisionDigest(gen records.PackageInstall) string {
+	return gen.SourceDigest
 }
 
 // Placement reads the exact Hub-selected PlacementSet stored at install. Creator never
@@ -74,9 +68,9 @@ func (f *Facts) Placement() (orchestrator.DesiredPlacement, *exit.Error) {
 	if f.Install.PlacementSetDigest == "" {
 		return orchestrator.DesiredPlacement{}, exit.Named(exit.Structural,
 			"package_selection_missing",
-			"%s was installed without an exact Hub-selected PlacementSet",
+			"%s was installed without an exact PlacementSet",
 			f.Install.Package).WithRemedy(
-			"publish and install the release for an approved profile; local directory installs are build inputs, not runnable placements")
+			"reinstall the package; published and editable installs both retain their exact execution selection")
 	}
 	path := filepath.Join(f.Install.Dir, "artifact-cache",
 		strings.TrimPrefix(f.Install.PlacementSetDigest, "sha256:"))
@@ -102,11 +96,22 @@ func (f *Facts) Spec(devices []string) (orchestrator.WorkerLaunchSpec, *exit.Err
 	if e != nil {
 		return orchestrator.WorkerLaunchSpec{}, e
 	}
+	cache := filepath.Join(f.Install.Dir, "artifact-cache")
+	if f.Install.SourceKind == "local" {
+		return orchestrator.WorkerLaunchSpec{
+			Placement: placement,
+			Python:    Binary(f.Install), Args: []string{"serve",
+				"--development-project", f.Source,
+				"--development-package", placement.Package,
+				"--development-release", placement.Release,
+				"--development-source-digest", placement.SourceDigest},
+			Dir: f.Source, Devices: devices, GraceSec: 3,
+		}, nil
+	}
 	runtimeBin, e := HostRuntime()
 	if e != nil {
 		return orchestrator.WorkerLaunchSpec{}, e
 	}
-	cache := filepath.Join(f.Install.Dir, "artifact-cache")
 	return orchestrator.WorkerLaunchSpec{
 		Placement: placement,
 		Python:    runtimeBin, Args: []string{"serve"},

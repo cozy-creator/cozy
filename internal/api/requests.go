@@ -339,6 +339,13 @@ func (s *Server) resolvePlan(sub Submission) (orchestrator.Submission, *exit.Err
 		if s.packages == nil {
 			return out, exit.Unavailablef("this Cozy daemon resolves no packages")
 		}
+		refreshed, editable, _, refreshProblem := s.refreshPackage(sub.Package)
+		if refreshProblem != nil {
+			return out, refreshProblem
+		}
+		if editable {
+			sub.InstallID = refreshed
+		}
 		var e *exit.Error
 		if sub.InstallID != "" {
 			var spec orchestrator.WorkerLaunchSpec
