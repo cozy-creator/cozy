@@ -153,7 +153,6 @@ type InvokeCmd struct {
 type InvokeRunCmd struct {
 	Target         string   `arg:"" name:"target" help:"Package or callable as org/package[/function]."`
 	Input          []string `arg:"" optional:"" name:"input" help:"Primary value and field=value payload."`
-	Version        string   `help:"Run one installed release instead of the newest, e.g. 1.0.2."`
 	Out            string   `help:"Output directory." type:"path"`
 	Timeout        string   `help:"Request deadline."`
 	Stream         bool     `help:"Emit typed progress deltas."`
@@ -170,7 +169,7 @@ func (c *InvokeRunCmd) Run(r *Runtime) error {
 	args := append([]string{c.Target}, c.Input...)
 	return r.call(handleInvokeRun, args, bools(
 		"--stream", c.Stream, "--detach", c.Detach), values(
-		"--out", c.Out, "--timeout", c.Timeout, "--version", c.Version,
+		"--out", c.Out, "--timeout", c.Timeout,
 		"--in", c.PayloadFile, "--asset", c.Assets, "--worker", c.Worker,
 		"--idempotency-key", c.IdempotencyKey, "--input", c.Trees, "--org", c.Org), true)
 }

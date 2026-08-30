@@ -17,7 +17,6 @@ import (
 	"syscall"
 	"time"
 
-	pep440 "github.com/aquasecurity/go-pep440-version"
 	"github.com/cozy-creator/cozy/internal/api"
 	localapi "github.com/cozy-creator/cozy/internal/client"
 	"github.com/cozy-creator/cozy/internal/exit"
@@ -756,7 +755,6 @@ func mintKey() string {
 type Target struct {
 	Package   string
 	Function  string
-	Version   string
 	InstallID string
 }
 
@@ -769,8 +767,7 @@ func parseTarget(raw string) (Target, *exit.Error) {
 		WithNext("cozy package list", "cozy help invoke run")
 	if len(parts) == 4 && strings.HasPrefix(parts[2], "v") {
 		return Target{}, exit.Usagef("a version does not belong in the invocation path").
-			WithRemedy("use %s/%s/%s --version %s", parts[0], parts[1], parts[3],
-				strings.TrimPrefix(parts[2], "v")).
+			WithRemedy("use %s/%s/%s; Cozy always runs the installed release", parts[0], parts[1], parts[3]).
 			WithNext("cozy help invoke run")
 	}
 	if len(parts) != 2 && len(parts) != 3 {
@@ -791,13 +788,8 @@ func invocationTarget(ctx *Context) (Target, *launch.PackageDescriptor, *exit.Er
 	if problem != nil {
 		return Target{}, nil, problem
 	}
-	version := strings.TrimSpace(ctx.Inv.Value("--version"))
 	worker := strings.TrimSpace(ctx.Inv.Value("--worker"))
 	if worker != "" {
-		if version != "" {
-			return Target{}, nil, exit.Usagef("--version cannot change a private rental's fixed package release").
-				WithRemedy("omit --version; the rental already binds one exact release")
-		}
 		layout, problem := home.Open(ctx.Cfg.Home)
 		if problem != nil {
 			return Target{}, nil, problem
@@ -810,18 +802,10 @@ func invocationTarget(ctx *Context) (Target, *launch.PackageDescriptor, *exit.Er
 		descriptor, problem := rental.PackageDescriptor(store, worker)
 		return target, descriptor, problem
 	}
-	version = strings.TrimPrefix(version, "v")
-	if version != "" {
-		if _, err := pep440.Parse(version); err != nil {
-			return Target{}, nil, exit.Usagef("--version %q is not a Python package version", version).
-				WithRemedy("use the release from `cozy package list --full`, e.g. --version 1.0.2")
-		}
-	}
-	facts, problem := generationFacts(ctx, target.Package, version)
+	facts, problem := generationFacts(ctx, target.Package)
 	if problem != nil {
 		return Target{}, nil, problem
 	}
-	target.Version = facts.Install.Version
 	target.InstallID = facts.Install.ID
 	return target, facts.PackageDescriptor, nil
 }
@@ -850,9 +834,8 @@ func unknownFunction(target Target, descriptor *launch.PackageDescriptor) *exit.
 	return problem
 }
 
-// generationFacts selects the newest active release by default. An explicit version may
-// select a retained superseded release in any still-installed major.
-func generationFacts(ctx *Context, pkg, version string) (*launch.Facts, *exit.Error) {
+// generationFacts resolves the package's one active install.
+func generationFacts(ctx *Context, pkg string) (*launch.Facts, *exit.Error) {
 	l, e := home.Open(ctx.Cfg.Home)
 	if e != nil {
 		return nil, e
@@ -871,72 +854,20 @@ func generationFacts(ctx *Context, pkg, version string) (*launch.Facts, *exit.Er
 			WithRemedy("`cozy package list` lists what is").
 			WithNext("cozy package search "+pkg, "cozy package list")
 	}
-	installs, e := store.PackageInstalls(pkg)
+	chosen := pins[0]
+	for _, pin := range pins[1:] {
+		if pin.ActivatedAt > chosen.ActivatedAt {
+			chosen = pin
+		}
+	}
+	install, e := store.Install(chosen.InstallID)
 	if e != nil {
 		return nil, e
 	}
-	active := make(map[string]bool, len(pins))
-	activeMajors := make(map[int]bool, len(pins))
-	for _, pin := range pins {
-		active[pin.InstallID] = true
-		activeMajors[pin.Major] = true
+	if install == nil {
+		return nil, exit.Internalf("%s is pinned to install %s and that row is gone", pkg, chosen.InstallID)
 	}
-	var chosen *records.PackageInstall
-	for i := range installs {
-		candidate := &installs[i]
-		if version != "" {
-			if activeMajors[candidate.Major] && sameVersion(candidate.Version, version) {
-				chosen = candidate
-				break
-			}
-			continue
-		}
-		if active[candidate.ID] && (chosen == nil || newerInstall(*candidate, *chosen)) {
-			chosen = candidate
-		}
-	}
-	if chosen == nil && version != "" {
-		return nil, exit.New(exit.NotFound, "%s version %s is not installed", pkg, version).
-			WithRemedy("installed versions: %s", installedVersions(installs, activeMajors)).
-			WithNext("cozy package install "+pkg+"@"+version, "cozy package list")
-	}
-	if chosen == nil {
-		return nil, exit.Internalf("%s has pins but no corresponding install", pkg)
-	}
-	return launch.Read(*chosen, ctx.Cfg.Home, ctx.Cfg.Tool())
-}
-
-func sameVersion(left, right string) bool {
-	a, errA := pep440.Parse(left)
-	b, errB := pep440.Parse(right)
-	return errA == nil && errB == nil && a.Equal(b)
-}
-
-func newerInstall(left, right records.PackageInstall) bool {
-	a, errA := pep440.Parse(left.Version)
-	b, errB := pep440.Parse(right.Version)
-	if errA == nil && errB == nil && !a.Equal(b) {
-		return a.GreaterThan(b)
-	}
-	if left.Major != right.Major {
-		return left.Major > right.Major
-	}
-	return left.CreatedAt > right.CreatedAt
-}
-
-func installedVersions(installs []records.PackageInstall, activeMajors map[int]bool) string {
-	seen := map[string]bool{}
-	versions := []string{}
-	for _, install := range installs {
-		if activeMajors[install.Major] && !seen[install.Version] {
-			seen[install.Version] = true
-			versions = append(versions, install.Version)
-		}
-	}
-	if len(versions) == 0 {
-		return "none"
-	}
-	return strings.Join(versions, ", ")
+	return launch.Read(*install, ctx.Cfg.Home, ctx.Cfg.Tool())
 }
 
 // eventText reads one string field out of an event's payload. It is how a pre-attempt

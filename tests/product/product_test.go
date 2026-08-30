@@ -25,6 +25,32 @@ import (
 
 const weightlessRef = "cozy/weightless"
 
+func TestPackageHasOneActiveVersion(t *testing.T) {
+	store, problem := records.Open(filepath.Join(t.TempDir(), "records.db"))
+	fatal(t, problem)
+	defer store.Close()
+	install := func(id, version string, major int) records.PackageInstall {
+		return records.PackageInstall{
+			ID: id, Package: "cozy/example", Major: major, Version: version,
+			SourceKind: "tensorhub", SourceRef: "cozy/example@" + version,
+			SourceDigest: "sha256:" + strings.Repeat(id, 64/len(id)), Verified: true,
+			Dir: filepath.Join(t.TempDir(), id),
+		}
+	}
+	first := install("a", "1.0.0", 1)
+	second := install("b", "2.0.0", 2)
+	if _, problem = store.Activate(first); problem != nil {
+		t.Fatal(problem)
+	}
+	if superseded, problem := store.Activate(second); problem != nil || superseded != first.ID {
+		t.Fatalf("replacement = %q, %v", superseded, problem)
+	}
+	pins, problem := store.Pins("cozy/example")
+	if problem != nil || len(pins) != 1 || pins[0].InstallID != second.ID {
+		t.Fatalf("active pins = %+v, %v", pins, problem)
+	}
+}
+
 func TestModelManifestGrammar(t *testing.T) {
 	root := t.TempDir()
 	code, help := runCozy(t, root, "model", "publish", "--help")
@@ -46,6 +72,11 @@ func TestModelManifestGrammar(t *testing.T) {
 
 func TestPackagePublishMetadataGrammar(t *testing.T) {
 	root := t.TempDir()
+	if code, help := runCozy(t, root, "invoke", "run", "--help"); code != 0 ||
+		strings.Contains(help, "--version") || strings.Contains(help, "vN/function") ||
+		!strings.Contains(help, "org/package[/function]") {
+		t.Fatalf("invoke run retained versioned target grammar [exit %d]\n%s", code, help)
+	}
 	if code, help := runCozy(t, root, "package", "publish", "--help"); code != 0 ||
 		strings.Contains(help, "--release") || strings.Contains(help, "--dir") ||
 		strings.Contains(help, "<package>") {
@@ -627,7 +658,7 @@ func TestProductPath(t *testing.T) {
 		t.Fatalf("package-only invoke did not list functions [exit %d]\n%s", code, out)
 	}
 	if code, out := runCozy(t, root, "invoke", "run", weightlessRef+"/v1.0.0/tile"); code != 2 ||
-		!strings.Contains(out, "--version 1.0.0") {
+		!strings.Contains(out, weightlessRef+"/tile") || !strings.Contains(out, "installed release") {
 		t.Fatalf("version-in-path remedy was not useful [exit %d]\n%s", code, out)
 	}
 
@@ -646,7 +677,7 @@ func TestProductPath(t *testing.T) {
 	// another process onto the device envelope.
 	secondOut := filepath.Join(root, "out-2")
 	if code, out := runCozy(t, root, "invoke", "run", weightlessRef+"/tile",
-		"size=16", "seed=8", "--version", "1.0.0", "--out", secondOut); code != 0 {
+		"size=16", "seed=8", "--out", secondOut); code != 0 {
 		t.Fatalf("warm invoke [exit %d]\n%s", code, out)
 	}
 	store, problem := records.Open(filepath.Join(root, "records.db"))

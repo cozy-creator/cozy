@@ -151,7 +151,7 @@ func Run(l home.Layout, st *records.Store, req Request) (*Result, *exit.Error) {
 	mark("verify")
 
 	// The pin decision is made before the expensive step, never after it.
-	prior, priorGen, e := st.ActivePin(gen.Package, gen.Major)
+	prior, priorGen, e := st.ActivePackage(gen.Package)
 	if e != nil {
 		return fail(e)
 	}
@@ -343,7 +343,7 @@ func resolveTarget(gen *records.PackageInstall, ref Ref) *exit.Error {
 	if ref.HasMajor && ref.Major != major {
 		return exit.Named(exit.Validation, "release_mismatch",
 			"%s was requested but the archive publishes version %s (major %d)", ref.String(), gen.Version, major).
-			WithRemedy("the pin is per (package, major); majors never substitute for one another")
+			WithRemedy("install the requested release; one package has only one active version")
 	}
 	gen.Major = major
 	return nil

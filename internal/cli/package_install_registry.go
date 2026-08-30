@@ -39,15 +39,11 @@ func handleRegistryInstall(ctx *Context) *exit.Error {
 	if problem != nil {
 		return problem
 	}
-	major, majorProblem := install.MajorOf(release)
-	if majorProblem != nil {
-		return majorProblem
-	}
 	_, existing, _, problem := open(ctx.Cfg, false)
 	if problem != nil {
 		return problem
 	}
-	_, generation, problem := existing.ActivePin(ref.String(), major)
+	_, generation, problem := existing.ActivePackage(ref.String())
 	if problem != nil {
 		existing.Close()
 		return problem
