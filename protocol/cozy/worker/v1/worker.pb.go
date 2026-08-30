@@ -3190,11 +3190,12 @@ type Slot struct {
 	Slot                      string                 `protobuf:"bytes,1,opt,name=slot,proto3" json:"slot,omitempty"`
 	ReferenceModelId          string                 `protobuf:"bytes,2,opt,name=reference_model_id,json=referenceModelId,proto3" json:"reference_model_id,omitempty"` // must name one Placement.models id
 	Config                    *Config                `protobuf:"bytes,3,opt,name=config,proto3" json:"config,omitempty"`
-	Components                []*Component           `protobuf:"bytes,4,rep,name=components,proto3" json:"components,omitempty"` // ORDERED MCC destination sequence; never sorted
-	ModelConstructionContract *Ref                   `protobuf:"bytes,5,opt,name=model_construction_contract,json=modelConstructionContract,proto3" json:"model_construction_contract,omitempty"`
-	Stamps                    []*Stamp               `protobuf:"bytes,6,rep,name=stamps,proto3" json:"stamps,omitempty"` // sorted unique by (component,key)
-	unknownFields             protoimpl.UnknownFields
-	sizeCache                 protoimpl.SizeCache
+	Components                []*Component           `protobuf:"bytes,4,rep,name=components,proto3" json:"components,omitempty"`                                                                  // ORDERED MCC destination sequence; never sorted
+	ModelConstructionContract *Ref                   `protobuf:"bytes,5,opt,name=model_construction_contract,json=modelConstructionContract,proto3" json:"model_construction_contract,omitempty"` // required for qualified publication; omitted when
+	// DevelopmentPackage derives it from source + local model
+	Stamps        []*Stamp `protobuf:"bytes,6,rep,name=stamps,proto3" json:"stamps,omitempty"` // sorted unique by (component,key)
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
 }
 
 func (x *Slot) Reset() {

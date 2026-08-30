@@ -24,7 +24,8 @@ import (
 )
 
 const weightlessRef = "cozy/cozy-weightless-package"
-const editableRuntimeFixtureSHA = "5fe749e0057186cb48ca6fbd2f204bf38dd1ae64"
+const editableRuntimeFixtureSHA = "47a4f9e86aac8bd4fdb4f9d209ea07f0762b1adf"
+const editableTensorFSFixtureSHA = "f645ee6a777cd32dca22144985099faa2276af4b"
 
 func TestLegacyAttemptColumnsMigrate(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "records.db")
@@ -898,6 +899,70 @@ func TestDevelopmentInstallRefreshesBeforeInvocation(t *testing.T) {
 	}
 }
 
+func TestModeledDevelopmentInstallRefreshesAndKeepsLastGoodSelection(t *testing.T) {
+	root := filepath.Join(os.TempDir(), "cozy-product-test", "modeled-editable-refresh")
+	must(t, os.RemoveAll(root))
+	must(t, os.MkdirAll(root, 0o755))
+	t.Cleanup(func() {
+		_, _ = runCozy(t, root, "down", "--all")
+		_ = os.RemoveAll(root)
+	})
+
+	project := modeledDevelopmentProject(t, root)
+	code, out := runCozy(t, root, "package", "install", project, "--json", "--full")
+	if code != 0 || !strings.Contains(out, `"package":"cozy/modeled-development-package"`) {
+		t.Fatalf("modeled editable install failed [exit %d]\n%s", code, out)
+	}
+	code, out = runCozy(t, root, "run", "cozy/modeled-development-package/render",
+		"value=7", "--json")
+	if code != 0 || !strings.Contains(out, `"value":7`) {
+		t.Fatalf("modeled editable invocation failed [exit %d]\n%s\n%s",
+			code, out, productWorkerLogs(root))
+	}
+	first := activeInstall(t, root, "cozy/modeled-development-package")
+
+	source := filepath.Join(project, "src", "modeled_development_package", "__init__.py")
+	body, err := os.ReadFile(source)
+	must(t, err)
+	body = []byte(strings.Replace(string(body), "return Result(payload.value)",
+		"return Result(payload.value + 1)", 1))
+	must(t, os.WriteFile(source, body, 0o644))
+	code, out = runCozy(t, root, "run", "cozy/modeled-development-package/render",
+		"value=7", "--json")
+	if code != 0 || !strings.Contains(out, `"value":8`) {
+		t.Fatalf("modeled source edit was not live on the next invocation [exit %d]\n%s\n%s",
+			code, out, productWorkerLogs(root))
+	}
+	second := activeInstall(t, root, "cozy/modeled-development-package")
+	if second.ID == first.ID || second.SourceDigest == first.SourceDigest {
+		t.Fatalf("modeled body edit did not advance generation: %#v -> %#v", first, second)
+	}
+
+	binding := filepath.Join(project, "package.toml")
+	goodBinding, err := os.ReadFile(binding)
+	must(t, err)
+	brokenBinding := strings.Replace(string(goodBinding), `release = "1.0.0"`,
+		`release = "9.9.9"`, 1)
+	must(t, os.WriteFile(binding, []byte(brokenBinding), 0o644))
+	code, out = runCozy(t, root, "run", "cozy/modeled-development-package/render",
+		"value=7", "--json")
+	if code != 1 || !strings.Contains(out, `"code":"editable_refresh_failed"`) {
+		t.Fatalf("absent modeled release did not return typed last-good refusal [exit %d]\n%s",
+			code, out)
+	}
+	failed := activeInstall(t, root, "cozy/modeled-development-package")
+	if failed.ID != second.ID || failed.SourceDigest != second.SourceDigest {
+		t.Fatalf("failed modeled refresh displaced last good generation: %#v -> %#v", second, failed)
+	}
+	must(t, os.WriteFile(binding, goodBinding, 0o644))
+	code, out = runCozy(t, root, "run", "cozy/modeled-development-package/render",
+		"value=7", "--json")
+	if code != 0 || !strings.Contains(out, `"value":8`) {
+		t.Fatalf("restored modeled selection did not reuse last good generation [exit %d]\n%s",
+			code, out)
+	}
+}
+
 func productWorkerLogs(root string) string {
 	paths, _ := filepath.Glob(filepath.Join(root, "workers", "*", "worker.log"))
 	var out strings.Builder
@@ -909,16 +974,46 @@ func productWorkerLogs(root string) string {
 }
 
 func activePackageInstall(t *testing.T, root string) records.PackageInstall {
+	return activeInstall(t, root, weightlessRef)
+}
+
+func activeInstall(t *testing.T, root, packageRef string) records.PackageInstall {
 	t.Helper()
 	store, problem := records.Open(filepath.Join(root, "records.db"))
 	fatal(t, problem)
 	defer store.Close()
-	_, install, problem := store.ActivePackage(weightlessRef)
+	_, install, problem := store.ActivePackage(packageRef)
 	fatal(t, problem)
 	if install == nil {
-		t.Fatal("editable package has no active install")
+		t.Fatalf("editable package %s has no active install", packageRef)
 	}
 	return *install
+}
+
+func modeledDevelopmentProject(t *testing.T, root string) string {
+	t.Helper()
+	home, err := os.UserHomeDir()
+	must(t, err)
+	runtimeRepo := filepath.Join(home, "cozy_v2", "cozy-runtime") //cozy:allow peer source; exact test wheel
+	tensorfsRepo := filepath.Join(home, "cozy_v2", "tensorfs")    //cozy:allow peer source; exact test wheel
+	for _, repo := range []string{runtimeRepo, tensorfsRepo} {
+		if _, err := os.Stat(filepath.Join(repo, "pyproject.toml")); err != nil {
+			t.Skipf("no peer source at %s: %v", repo, err)
+		}
+	}
+	dir := t.TempDir()
+	project := filepath.Join(dir, "source")
+	build := exec.Command("/usr/bin/nice", "-n", "19", "python3",
+		"tests/product/testdata/build-modeled-editable.py",
+		"--runtime-repo", runtimeRepo, "--runtime-sha", editableRuntimeFixtureSHA,
+		"--tensorfs-repo", tensorfsRepo, "--tensorfs-sha", editableTensorFSFixtureSHA,
+		"--out", dir, "--source-out", project, "--store", filepath.Join(root, "cas"))
+	build.Dir = "../.."
+	build.Env = childEnv(t, root)
+	if out, err := build.CombinedOutput(); err != nil {
+		t.Fatalf("building modeled editable fixture: %v\n%s", err, out)
+	}
+	return project
 }
 
 type cozyResult struct {
