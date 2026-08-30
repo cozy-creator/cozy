@@ -24,7 +24,7 @@ import (
 )
 
 const weightlessRef = "cozy/cozy-weightless-package"
-const editableRuntimeFixtureSHA = "4347d064040f2cc48e939ba204ebdfd48e79f991"
+const editableRuntimeFixtureSHA = "5fe749e0057186cb48ca6fbd2f204bf38dd1ae64"
 
 func TestLegacyAttemptColumnsMigrate(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "records.db")
