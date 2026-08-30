@@ -58,7 +58,7 @@ func ArtifactDelegations(l home.Layout, st *records.Store) orchestrator.Artifact
 			return orchestrator.ArtifactDelegation{}, exit.New(exit.Credential,
 				"the worker certificate pin is unreadable: %s", err)
 		}
-		models := append([]string(nil), facts.ModelRootDigests...)
+		models := append([]string{}, facts.ModelRootDigests...)
 		sort.Strings(models)
 		for index := 1; index < len(models); index++ {
 			if models[index] == models[index-1] {
@@ -72,10 +72,12 @@ func ArtifactDelegations(l home.Layout, st *records.Store) orchestrator.Artifact
 			return orchestrator.ArtifactDelegation{}, problem
 		}
 		expires := uint64(time.Now().Add(artifactDelegationTTL).Unix())
+		packages := []string{facts.Placement.PackageReleaseID}
+		sort.Strings(packages)
 		document := &pb.ArtifactDelegation{
 			RentalId: row.ID, WorkerId: request.WorkerID, WorkerBootId: request.WorkerBootID,
 			WorkerTlsCertificateDigest: pin.Digest(), Revision: row.PlacementRevision,
-			PackageReleaseIds:  []string{facts.Placement.PackageReleaseID},
+			PackageReleaseIds:  packages,
 			ModelCheckpointIds: models, DelegationId: delegationID, ExpiresAtUnix: expires,
 		}
 		canonicalBytes, err := canonical.Bytes(document)

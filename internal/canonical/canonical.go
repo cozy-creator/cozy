@@ -209,6 +209,16 @@ func Document(m proto.Message) (Doc, error) {
 	if _, taken := b["format"]; taken {
 		return nil, refuse("unknown_field", "`format` is reserved for the document tag")
 	}
+	// ArtifactDelegation/1 carries two exact sets. An empty repeated protobuf
+	// field is indistinguishable from an unset one to reflection, but the
+	// canonical document has one spelling for the empty set: [].
+	if string(m.ProtoReflect().Descriptor().FullName()) == "cozy.worker.v1.ArtifactDelegation" {
+		for _, name := range []string{"model_checkpoint_ids", "package_release_ids"} {
+			if _, present := b[name]; !present {
+				b[name] = []Value{}
+			}
+		}
+	}
 	b["format"] = Format(m)
 	return b, nil
 }
