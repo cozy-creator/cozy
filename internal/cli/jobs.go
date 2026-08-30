@@ -1,6 +1,7 @@
 package cli
 
 import (
+	"context"
 	"fmt"
 	"os"
 	"os/signal"
@@ -195,9 +196,13 @@ func microUSD(n int64) string {
 // before this process existed. That is the whole reason `follow` reads the durable stream
 // rather than watching for a live frame.
 func followJob(ctx *Context, c *localapi.Client, jobID string, began time.Time) *exit.Error {
-	interrupt := make(chan os.Signal, 1)
+	interrupt := make(chan os.Signal, 2)
 	signal.Notify(interrupt, syscall.SIGINT, syscall.SIGTERM)
 	defer signal.Stop(interrupt)
+	watchCtx, stopWatch := context.WithCancel(context.Background())
+	defer stopWatch()
+	forced := make(chan struct{}, 1)
+	cancelFailed := make(chan *exit.Error, 1)
 	done := make(chan struct{})
 	defer close(done)
 	go func() {
@@ -209,16 +214,51 @@ func followJob(ctx *Context, c *localapi.Client, jobID string, began time.Time) 
 			// SIGINT CANCELS, it does not abandon: the job's own journaled terminal is
 			// what settles it, and walking away would leave the worker running.
 			fmt.Fprintln(ctx.Err, "\ncancel requested — the job's own terminal still settles it")
-			if e := c.CancelJob(jobID); e != nil {
-				fmt.Fprintf(ctx.Err, "cancel: %s\n", e.Message)
+		case <-done:
+			return
+		}
+		cancelResult := make(chan *exit.Error, 1)
+		go func() { cancelResult <- c.CancelJob(jobID) }()
+		select {
+		case <-interrupt:
+			fmt.Fprintln(ctx.Err, "second interrupt — stopped waiting; the job remains recorded")
+			forced <- struct{}{}
+			stopWatch()
+			return
+		case problem := <-cancelResult:
+			if problem != nil {
+				fmt.Fprintf(ctx.Err, "cancel: %s\n", problem.Message)
+				cancelFailed <- problem
+				stopWatch()
+				return
 			}
+		case <-done:
+			return
+		}
+		select {
+		case <-interrupt:
+			fmt.Fprintln(ctx.Err, "second interrupt — stopped waiting; the job remains recorded")
+			forced <- struct{}{}
+			stopWatch()
 		case <-done:
 		}
 	}()
 
 	lines := newJobProgress(ctx)
-	terminal, e := c.Watch(jobID, 0, lines.on)
+	terminal, e := c.WatchContext(watchCtx, jobID, 0, lines.on)
 	lines.done()
+	select {
+	case problem := <-cancelFailed:
+		return problem
+	default:
+	}
+	select {
+	case <-forced:
+		return exit.New(exit.Canceled,
+			"stopped waiting for %s; it remains visible in `cozy invoke list`", jobID).
+			WithNext("cozy invoke list")
+	default:
+	}
 	if e != nil {
 		return e
 	}

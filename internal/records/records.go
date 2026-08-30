@@ -473,7 +473,14 @@ func (s *Store) ForgetIfUnreferenced(id string) (bool, *exit.Error) {
 	defer tx.Rollback()
 	if _, err := tx.Exec(`UPDATE requests SET install_id=NULL WHERE install_id=?
 		AND state NOT IN ('submitted','queued','dispatching','requeue_pending')`, id); err != nil {
-		return false, exit.New(exit.Conflict, "cannot release terminal requests from generation %s: %s", id, err)
+		// Older roots gained install_id through a pre-launch NOT NULL widen and carry no
+		// foreign key on that column. Empty is their historical spelling of no install;
+		// fresh roots use nullable FK-backed identity.
+		if _, fallback := tx.Exec(`UPDATE requests SET install_id='' WHERE install_id=?
+			AND state NOT IN ('submitted','queued','dispatching','requeue_pending')`, id); fallback != nil {
+			return false, exit.New(exit.Conflict,
+				"cannot release terminal requests from generation %s: %s", id, err)
+		}
 	}
 	if _, err := tx.Exec(`UPDATE worker_processes SET generation=NULL WHERE generation=?
 		AND state='closed'`, id); err != nil {

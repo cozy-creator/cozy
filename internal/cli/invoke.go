@@ -755,25 +755,24 @@ func renderRun(ctx *Context, life api.Lifecycle, terminal *localapi.Event, stopp
 	if life.Triage != nil {
 		fields = append(fields, output.Field{K: "attempt_key", V: life.Triage.AttemptKey})
 	}
+	elapsed := time.Since(began)
 	fields = append(fields,
+		output.Field{K: "elapsed", V: fmt.Sprintf("%.1fs", elapsed.Seconds())},
 		output.Field{K: "submit_ms", V: submitted.Milliseconds()},
-		output.Field{K: "wall_ms", V: time.Since(began).Milliseconds()})
+		output.Field{K: "wall_ms", V: elapsed.Milliseconds()})
 
-	defaults := []string{"id", "target", "status"}
+	defaults := []string{"target", "status"}
 	if life.Result != nil {
 		defaults = append(defaults, "result")
 	}
 	if len(saved) > 0 {
 		defaults = append(defaults, "saved")
 	}
-	defaults = append(defaults, "wall_ms")
+	defaults = append(defaults, "elapsed")
 	rec := compactRecord(fields, defaults...)
 	rec.Notes = notes
 	code := exit.JobTerminal(mapTerminal(status))
 	if code == exit.OK {
-		if life.Triage != nil {
-			rec.Next = []string{"cozy invoke list --full"}
-		}
 		return emit(ctx, rec)
 	}
 	e := exit.Named(code, status, "request %s ended %s", life.RequestID, status)
