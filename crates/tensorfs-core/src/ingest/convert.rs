@@ -1386,8 +1386,8 @@ fn rekey(conv: &Converter, key: &str) -> String {
     match conv.name {
         "single_file.identity/1" => SINGLE_FILE_PREFIXES
             .iter()
-            .find(|(from, _)| key.starts_with(*from))
-            .map(|(from, to)| format!("{to}{}", &key[from.len()..]))
+            .find(|(from, _, _)| key.starts_with(*from))
+            .map(|(from, _, to)| format!("{to}{}", &key[from.len()..]))
             .unwrap_or_else(|| key.to_string()),
         // Leaf first, then the block prefix — the two halves of the ratified map's own
         // `rekey` block, applied in the order it lists them.
@@ -1521,12 +1521,54 @@ pub fn is_fused_attention(key: &str) -> bool {
 
 /// The reviewed single-file → canonical component prefix map. Data, not inference: a prefix
 /// that is not here does not get guessed at, it stays as it is and the fingerprint decides.
-pub const SINGLE_FILE_PREFIXES: [(&str, &str); 4] = [
-    ("model.diffusion_model.", ""),
-    ("first_stage_model.", ""),
-    ("conditioner.embedders.0.transformer.", ""),
-    ("conditioner.embedders.1.model.", ""),
+pub const SINGLE_FILE_PREFIXES: [(&str, &str, &str); 4] = [
+    ("model.diffusion_model.", "unet", ""),
+    ("first_stage_model.", "vae", ""),
+    ("conditioner.embedders.0.transformer.", "text_encoder", ""),
+    ("conditioner.embedders.1.model.", "text_encoder_2", ""),
 ];
+
+/// Project one reviewed component out of a multi-component single-file carrier. The
+/// source offsets remain those of the original file; only the key set presented to
+/// fingerprinting and planning narrows. A caller cannot invent a prefix: the closed map
+/// above is the sole authority and an absent component refuses.
+pub fn single_file_component(component: &str, source: &SourceHeader) -> Result<SourceHeader> {
+    let prefix = match SINGLE_FILE_PREFIXES
+        .iter()
+        .find(|(_, target, _)| *target == component)
+    {
+        Some((prefix, _, _)) => *prefix,
+        None => {
+            return refuse(
+                Code::MISSING_TENSOR,
+                format!("single-file carriers define no reviewed component {component:?}"),
+            )
+        }
+    };
+    let tensors: Vec<_> = source
+        .tensors
+        .iter()
+        .filter(|tensor| tensor.key.starts_with(prefix))
+        .cloned()
+        .collect();
+    if tensors.is_empty() {
+        return refuse(
+            Code::MISSING_TENSOR,
+            format!("single-file carrier contains no {component:?} tensors under {prefix:?}"),
+        );
+    }
+    let claimed: u64 = tensors.iter().map(|tensor| tensor.nbytes()).sum();
+    let data_bytes = source.file_len.saturating_sub(source.data_start);
+    Ok(SourceHeader {
+        tensors,
+        metadata: source.metadata.clone(),
+        header_bytes: source.header_bytes,
+        data_start: source.data_start,
+        file_len: source.file_len,
+        gap_bytes: data_bytes.saturating_sub(claimed),
+        shards: source.shards.clone(),
+    })
+}
 
 /// The bounded-buffer guard for a permutation op.
 pub fn check_permute_size(what: &str, nbytes: u64) -> Result<()> {

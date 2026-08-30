@@ -448,7 +448,12 @@ pub fn cmd_bank(
         Err(_) => FingerprintRegistry::default(),
     };
     for (component, path) in &srcs {
-        let (h, raw) = ok!(read_carrier(path));
+        let (full, raw) = ok!(read_carrier(path));
+        let h = if conv.name == "single_file.identity/1" {
+            ok!(convert::single_file_component(component, &full))
+        } else {
+            full
+        };
         let fp = ok!(fingerprint::fingerprint(component, &h));
         let sd = source_digest(&h, &raw);
         reg.merge(Banked {
@@ -576,19 +581,37 @@ fn prepare(f: &Flags, target: &str) -> Result<Prepared, ExitCode> {
     let (mut files, mut raws, mut verdicts, mut fps) =
         (Vec::new(), Vec::new(), Vec::new(), Vec::new());
     for (component, path) in &srcs {
-        let (h, raw) = match read_carrier(path) {
+        let (full, raw) = match read_carrier(path) {
             Ok(v) => v,
             Err(e) => return Err(bail(e)),
         };
-        let fp = match fingerprint::fingerprint(component, &h) {
-            Ok(v) => v,
-            Err(e) => return Err(bail(e)),
-        };
-        // A REVIEWED registry hit IS the profile authorization. Ambiguity and absence both
-        // refuse; neither falls back to a filename, a directory, or a config.
-        let banked = match reg.authorize(component, &fp) {
-            Ok(b) => b,
-            Err(e) => return Err(bail(e)),
+        // A reviewed single-file prefix may project one component from a combined carrier.
+        // Try that closed projection first; ordinary component files fall through to their
+        // complete header. Authorization still comes only from the reviewed fingerprint.
+        let projected = convert::single_file_component(component, &full).ok();
+        let mut selected = None;
+        if let Some(view) = projected {
+            let fp = match fingerprint::fingerprint(component, &view) {
+                Ok(value) => value,
+                Err(e) => return Err(bail(e)),
+            };
+            if let Ok(banked) = reg.authorize(component, &fp) {
+                selected = Some((view, fp, banked));
+            }
+        }
+        let (h, fp, banked) = match selected {
+            Some(value) => value,
+            None => {
+                let fp = match fingerprint::fingerprint(component, &full) {
+                    Ok(value) => value,
+                    Err(e) => return Err(bail(e)),
+                };
+                let banked = match reg.authorize(component, &fp) {
+                    Ok(value) => value,
+                    Err(e) => return Err(bail(e)),
+                };
+                (full, fp, banked)
+            }
         };
         verdicts.push(banked);
         fps.push(fp);
