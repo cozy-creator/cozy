@@ -227,6 +227,8 @@ type CurrentUser struct {
 // CurrentUser reads AuthKit's canonical current-user route through Tensorhub's mount.
 func (c *Client) CurrentUser(ctx context.Context) (CurrentUser, *exit.Error) {
 	var out CurrentUser
+	// AuthKit owns and may extend this document. Decode the stable id projection
+	// without applying Creator's strict decoder for Creator-owned contracts.
 	problem := c.do(ctx, call{method: http.MethodGet, path: "/v1/auth/me", auth: true}, &out)
 	if problem == nil && out.ID == "" {
 		problem = exit.Named(exit.Internal, "auth.current_user_invalid",

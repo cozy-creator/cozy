@@ -101,6 +101,7 @@ func TestEmailMachineLoginAndAutomaticReauthentication(t *testing.T) {
 			writeAuthJSON(t, w, http.StatusOK, map[string]any{
 				"id": "140e338a-ebd5-48c5-a124-703f2457195a", "email": "person@example.com",
 				"email_verified": true, "entitlements": []string{},
+				"availability": []map[string]any{{"action": "update_username", "allowed": true}},
 			})
 		case "/v1/rentals":
 			if r.Header.Get("Authorization") != "Bearer second-access-token" {
