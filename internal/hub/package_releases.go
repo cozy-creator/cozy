@@ -24,8 +24,10 @@ type PackageReleaseDraft struct {
 }
 
 type PackageReleaseCommit struct {
-	State          string        `json:"state"`
-	PackageRelease ExactDocument `json:"package_release"`
+	State              string        `json:"state"`
+	PackageRelease     ExactDocument `json:"package_release"`
+	QualificationState string        `json:"qualification_state"`
+	QualificationError string        `json:"qualification_error,omitempty"`
 }
 
 type PackageInstallDownload struct {

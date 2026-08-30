@@ -78,14 +78,20 @@ func handlePackagePublish(ctx *Context) *exit.Error {
 	fields := []output.Field{
 		{K: "package", V: ref.String()}, {K: "release", V: release},
 		{K: "status", V: status}, {K: "changed", V: !replay},
+		{K: "qualification", V: done.QualificationState},
+		{K: "qualification_error", V: done.QualificationError},
 		{K: "package_release_digest", V: done.PackageRelease.Digest},
 		{K: "uploaded", V: output.Bytes(moved)}, {K: "hub", V: c.Base()},
 	}
 	defaults := []string{"package", "release", "status"}
-	if !replay {
-		defaults = append(defaults, "package_release_digest", "uploaded", "changed")
+	if done.QualificationState != "qualified" {
+		defaults = append(defaults, "qualification")
 	}
-	return emit(ctx, compactRecord(fields, defaults...))
+	record := compactRecord(fields, defaults...)
+	if done.QualificationError != "" {
+		record.Notes = append(record.Notes, done.QualificationError)
+	}
+	return emit(ctx, record)
 }
 
 func shorten(value string, limit int) string {

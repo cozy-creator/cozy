@@ -48,7 +48,7 @@ func TestPackageReleaseClientContract(t *testing.T) {
 			return
 		case r.Method == http.MethodPut && r.URL.Path == releasePath:
 			assertEmptyObject(t, r.Body)
-			_ = json.NewEncoder(w).Encode(map[string]any{"state": "committed", "package_release": map[string]any{
+			_ = json.NewEncoder(w).Encode(map[string]any{"state": "committed", "qualification_state": "qualified", "package_release": map[string]any{
 				"canonical_bytes": []byte(`{"format":"cozy.package.release/1"}`),
 				"digest":          "sha256:" + strings.Repeat("a", 64), "length": 35,
 			}})
@@ -197,7 +197,7 @@ func TestPackagePublishPendingWireFlowBoundsUploads(t *testing.T) {
 			finalized.Add(1)
 			releaseBytes := []byte(`{"format":"cozy.package.release/1"}`)
 			_ = json.NewEncoder(w).Encode(map[string]any{
-				"state": "committed", "package_release": map[string]any{
+				"state": "committed", "qualification_state": "qualified", "package_release": map[string]any{
 					"canonical_bytes": releaseBytes, "digest": "sha256:" + strings.Repeat("4", 64),
 					"length": len(releaseBytes),
 				},
@@ -210,7 +210,8 @@ func TestPackagePublishPendingWireFlowBoundsUploads(t *testing.T) {
 
 	code, out := runCozyDir(t, t.TempDir(), project,
 		[]string{"TENSORHUB_URL=" + server.URL, "TENSORHUB_TOKEN=proof-token"}, "package", "publish")
-	if code != 0 || !strings.Contains(out, "package_release_digest:") ||
+	if code != 0 || !strings.Contains(out, "status:  published") ||
+		strings.Contains(out, "package_release_digest:") || strings.Contains(out, "qualification:") ||
 		!strings.Contains(out, "Building package wheel and local dependencies...") ||
 		!strings.Contains(out, "Declaring 52 source files and 0 dependency wheels...") ||
 		!strings.Contains(out, "Uploading files: 0/53") ||

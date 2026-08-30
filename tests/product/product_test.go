@@ -180,7 +180,7 @@ func TestPackagePublishCommittedReplayStaysCompact(t *testing.T) {
 		case http.MethodPost:
 			_, _ = io.WriteString(w, `{"state":"committed","uploads":[]}`)
 		case http.MethodPut:
-			_, _ = io.WriteString(w, `{"state":"committed","package_release":{"canonical_bytes":"e30=","digest":"sha256:44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a","length":2}}`)
+			_, _ = io.WriteString(w, `{"state":"committed","qualification_state":"qualified","package_release":{"canonical_bytes":"e30=","digest":"sha256:44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a","length":2}}`)
 		default:
 			http.Error(w, "unexpected method", http.StatusMethodNotAllowed)
 		}
