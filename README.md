@@ -63,7 +63,7 @@ scripts/snapshot-runs.sh all        # the whole plane plus its red arms
 and their vector sets) live at `closure/<digest>.json`, where the path terminal IS the
 digest; the header attachment is TYPED and must be projected at exactly one path.
 
-Target tfs-033 simplifies this vocabulary and layout: the public type is `Manifest`; its exact
+Target tfs-034 simplifies this vocabulary and layout: the public type is `Manifest`; its exact
 canonical JSON bytes live under `manifests/<hash>.json`, and that hash is the `manifest_id`.
 The fixed namespace supplies the type, so the JSON has no embedded format/version tag. There is no
 separate Snapshot document or `snapshot_id` noun. The file map carries one
@@ -99,19 +99,26 @@ tfs materialize <store> <manifest> <path> <destination>
 ## roots, holds and GC (tfs-006)
 
 As implemented today, `meta/state.json` under `meta/LOCK` is the sole local root authority;
-`refs/` is a rendering with none. Target design tfs-033 deletes that model. Local filesystems and R2
+`refs/` is a rendering with none. Target design tfs-034 deletes that model. Local filesystems and R2
 share the same three authoritative namespaces: `repos/<org>/<name>.json`, immutable
 `manifests/<hash>.json`, and immutable `blobs/<hash>`. One repo JSON maps `(version,lane)` releases
 directly to manifests; manifests map virtual filenames to blobs. The manifest hash is the snapshot
 id in the current implementation and becomes `manifest_id` at the hardcut; no separate Snapshot
-document or id remains. Local checkout trees are optional disposable symlink views. An in-process
+document or id remains. Each release stores bounded provenance/classification/verification evidence
+inline in repo JSON, so evidence survives without another CAS document or changing `manifest_id`.
+Local checkout trees are optional disposable symlink views. An in-process
 `tensorfs.sqlite` mirrors repo/release metadata for lookup;
 Tensorhub uses the same logical projection in PostgreSQL. Either database rebuilds from repo files
-and never authorizes GC.
+and never authorizes GC. Database loss enters recovery-only mode; rebuild refuses until writers are
+gone and grants are revoked/expired or live writers have re-registered their exact holds.
 
 GC is only `repos -> manifests -> blobs`: enumerate every repo file, mark its release manifests,
-mark every transitively referenced blob, then collect the unmarked remainder under an exclusive
-maintenance operation. Missing/corrupt data or an incomplete listing makes the pass report-only.
+mark every transitively referenced blob plus exact publication key holds, then collect the unmarked
+remainder. Slow publications do not block the store: GC uses short census/delete fences and rechecks
+repos/holds before each bounded delete batch. R2 pagination must reach one terminal continuation
+token with strictly increasing keys; any page/token fault, missing/corrupt data, or failed recheck
+makes the pass report-only. Seven progress-free days only permits explicit abandonment after the
+writer/grants are gone; time never releases holds automatically.
 The current root/hold commands below describe the implementation being replaced, not the target API.
 
 A hold is reapable exactly when its owner is PROVABLY dead — the kernel drops the
