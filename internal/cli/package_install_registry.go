@@ -7,6 +7,7 @@ import (
 	"strings"
 	"sync"
 
+	pep440 "github.com/aquasecurity/go-pep440-version"
 	"github.com/cozy-creator/cozy/internal/exit"
 	"github.com/cozy-creator/cozy/internal/home"
 	"github.com/cozy-creator/cozy/internal/hub"
@@ -15,7 +16,7 @@ import (
 )
 
 func handleRegistryInstall(ctx *Context) *exit.Error {
-	ref, release, problem := registryPackageRef(ctx.Inv.Args[0])
+	ref, release, problem := registryPackageRef(ctx.Inv.Args[0], ctx.Inv.Value("--version"))
 	if problem != nil {
 		return problem
 	}
@@ -32,7 +33,10 @@ func handleRegistryInstall(ctx *Context) *exit.Error {
 			return exit.New(exit.NotFound, "%s has no published releases", ref.String()).
 				WithNext("cozy package search " + ref.String())
 		}
-		release = card.Releases[0].Release
+		release, problem = latestPackageRelease(card.Releases)
+		if problem != nil {
+			return problem
+		}
 	}
 	profile := strings.TrimSpace(ctx.Inv.Value("--profile"))
 	if profile == "" {
@@ -42,15 +46,11 @@ func handleRegistryInstall(ctx *Context) *exit.Error {
 	if problem != nil {
 		return problem
 	}
-	major, majorProblem := install.MajorOf(release)
-	if majorProblem != nil {
-		return majorProblem
-	}
 	_, existing, _, problem := open(ctx.Cfg, false)
 	if problem != nil {
 		return problem
 	}
-	_, generation, problem := existing.ActivePin(ref.String(), major)
+	_, generation, problem := existing.ActivePackage(ref.String())
 	if problem != nil {
 		existing.Close()
 		return problem
@@ -98,10 +98,31 @@ func handleRegistryInstall(ctx *Context) *exit.Error {
 	return emitInstallResult(ctx, st, result)
 }
 
-func registryPackageRef(value string) (hub.Ref, string, *exit.Error) {
-	name, release, hasRelease := strings.Cut(strings.TrimSpace(value), "@")
-	if hasRelease && (release == "" || strings.ContainsAny(release, `@/\`)) {
-		return hub.Ref{}, "", exit.Usagef("%q is not org/package[@release]", value)
+func latestPackageRelease(releases []hub.ReleaseSummary) (string, *exit.Error) {
+	var chosen pep440.Version
+	name := ""
+	for _, release := range releases {
+		version, err := pep440.Parse(release.Release)
+		if err != nil {
+			return "", exit.Named(exit.Structural, "package.release_version_invalid",
+				"Tensorhub returned package release %q, which is not a Python package version", release.Release)
+		}
+		if name == "" || version.GreaterThan(chosen) {
+			chosen, name = version, release.Release
+		}
+	}
+	return name, nil
+}
+
+func registryPackageRef(value, release string) (hub.Ref, string, *exit.Error) {
+	name := strings.TrimSpace(value)
+	if strings.Contains(name, "@") {
+		return hub.Ref{}, "", exit.Usagef("a version does not belong in the package name").
+			WithRemedy("use cozy package install org/package --version 1.2.3")
+	}
+	release = strings.TrimSpace(release)
+	if strings.ContainsAny(release, `@/\`) {
+		return hub.Ref{}, "", exit.Usagef("--version %q is not a release name", release)
 	}
 	ref, problem := hub.ParseRef(name)
 	return ref, release, problem

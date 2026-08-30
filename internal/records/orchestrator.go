@@ -210,6 +210,26 @@ type tableRebuild struct {
 
 var rebuild = []tableRebuild{
 	{
+		table: "pins",
+		stale: "PRIMARY KEY (package, major)",
+		steps: []string{
+			`ALTER TABLE pins RENAME TO pins_per_major`,
+			`CREATE TABLE pins (
+  package      TEXT PRIMARY KEY,
+  major        INTEGER NOT NULL,
+  generation   TEXT NOT NULL REFERENCES install_generations(id),
+  activated_at TEXT NOT NULL
+)`,
+			`INSERT INTO pins(package,major,generation,activated_at)
+ SELECT old.package,old.major,old.generation,old.activated_at
+ FROM pins_per_major old
+ WHERE old.rowid=(SELECT newest.rowid FROM pins_per_major newest
+                  WHERE newest.package=old.package
+                  ORDER BY newest.activated_at DESC,newest.rowid DESC LIMIT 1)`,
+			`DROP TABLE pins_per_major`,
+		},
+	},
+	{
 		table: "job_checkpoints",
 		stale: "PRIMARY KEY (request_id, operation_key, logical_key)",
 		steps: []string{

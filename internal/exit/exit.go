@@ -37,7 +37,7 @@ type Row struct {
 var Matrix = []Row{
 	{OK, "ok", "success, including idempotent no-ops"},
 	{Internal, "internal", "unexpected fault — a bug, never a user condition"},
-	{Usage, "usage", "bad invocation: unknown flag, malformed `key=value`, majorless target"},
+	{Usage, "usage", "bad invocation: unknown flag, malformed `key=value`, malformed target"},
 	{Validation, "validation", "typed payload/schema/bounds refusal; verifier refusal at ingest"},
 	{NotFound, "not_found", "unknown ref/function/package/attempt; hub 404 rendered verbatim"},
 	{Credential, "credential", "private/gated source without a credential — names the credential to add"},

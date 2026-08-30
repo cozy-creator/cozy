@@ -1,5 +1,5 @@
 // Package records is the ONE local lifecycle authority: install generations and the
-// active pin per (package, major), as rows in ONE local SQLite database
+// one active pin per package, as rows in ONE local SQLite database
 // (cozy-creator.md "Records"). There is no state.json and no second lifecycle store;
 // any JSON output is a derived read.
 //
@@ -56,8 +56,8 @@ type PackageInstall struct {
 	CreatedAt          string
 }
 
-// Pin is the active install for one (package, major). Two majors of one package coexist
-// because the key is the pair.
+// Pin is the package's one active install. Major remains recorded for package metadata
+// and removal output; activating any release replaces the package's previous pin.
 type Pin struct {
 	Package     string
 	Major       int
@@ -101,7 +101,7 @@ CREATE TABLE IF NOT EXISTS pins (
   major        INTEGER NOT NULL,
   generation   TEXT    NOT NULL REFERENCES install_generations(id),
   activated_at TEXT    NOT NULL,
-  PRIMARY KEY (package, major)
+  PRIMARY KEY (package)
 )`}, append(orchestratorSchema, append(eventSchema, rentalSchema...)...)...)
 
 // renames is the pre-launch domain hardcut expressed as a database migration instead of
@@ -119,6 +119,8 @@ var renames = []struct{ table, from, to string }{
 	{"placement_acquisition_observations", "endpoint_downloaded_bytes", "package_downloaded_bytes"},
 	{"placement_acquisition_observations", "endpoint_reused_bytes", "package_reused_bytes"},
 	{"requests", "endpoint", "package"},
+	{"attempts", "exec_spec_digest", "invocation_digest"},
+	{"attempts", "exec_spec", "invocation"},
 	{"rentals", "endpoint_ref", "package_ref"},
 	{"rentals", "control_snapshot_digest", "placement_set_digest"},
 	{"rentals", "control_snapshot_bytes", "placement_set_bytes"},
@@ -298,8 +300,8 @@ func (s *Store) Activate(g PackageInstall) (superseded string, e *exit.Error) {
 	defer tx.Rollback()
 
 	var prior string
-	err = tx.QueryRow(`SELECT generation FROM pins WHERE package=? AND major=?`,
-		g.Package, g.Major).Scan(&prior)
+	err = tx.QueryRow(`SELECT generation FROM pins WHERE package=?
+		ORDER BY activated_at DESC LIMIT 1`, g.Package).Scan(&prior)
 	if err != nil && !errors.Is(err, sql.ErrNoRows) {
 		return "", exit.Internalf("cannot read the current pin: %s", err)
 	}
@@ -317,9 +319,11 @@ func (s *Store) Activate(g PackageInstall) (superseded string, e *exit.Error) {
 		g.BytesExcl, g.BytesShared, g.CreatedAt); err != nil {
 		return "", exit.Internalf("cannot insert generation %s: %s", g.ID, err)
 	}
+	if _, err := tx.Exec(`DELETE FROM pins WHERE package=?`, g.Package); err != nil {
+		return "", exit.Internalf("cannot replace the active pin for %s: %s", g.Package, err)
+	}
 	if _, err := tx.Exec(`INSERT INTO pins(package,major,generation,activated_at)
-		VALUES(?,?,?,?) ON CONFLICT(package,major) DO UPDATE SET generation=excluded.generation,
-		activated_at=excluded.activated_at`,
+		VALUES(?,?,?,?)`,
 		g.Package, g.Major, g.ID, g.CreatedAt); err != nil {
 		return "", exit.Internalf("cannot activate the pin for %s@v%d: %s", g.Package, g.Major, err)
 	}
@@ -331,7 +335,24 @@ func (s *Store) Activate(g PackageInstall) (superseded string, e *exit.Error) {
 	return prior, nil
 }
 
-// ActivePin returns the pinned generation for one (package, major).
+// ActivePackage returns the package's one active install.
+func (s *Store) ActivePackage(pkg string) (*Pin, *PackageInstall, *exit.Error) {
+	var p Pin
+	err := s.db.QueryRow(`SELECT package,major,generation,activated_at FROM pins
+		WHERE package=? ORDER BY activated_at DESC LIMIT 1`, pkg).
+		Scan(&p.Package, &p.Major, &p.InstallID, &p.ActivatedAt)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, nil, nil
+	}
+	if err != nil {
+		return nil, nil, exit.Internalf("cannot read the pin for %s: %s", pkg, err)
+	}
+	g, e := s.Install(p.InstallID)
+	return &p, g, e
+}
+
+// ActivePin returns the package pin only when it has the requested major. Removal uses
+// this after listing the active pin; installation uses ActivePackage.
 func (s *Store) ActivePin(pkg string, major int) (*Pin, *PackageInstall, *exit.Error) {
 	var p Pin
 	err := s.db.QueryRow(`SELECT package,major,generation,activated_at FROM pins
@@ -358,7 +379,7 @@ func (s *Store) Install(id string) (*PackageInstall, *exit.Error) {
 	return &g, nil
 }
 
-// Installed is every active pin joined to its generation, package-major ordered.
+// Installed is every active package pin joined to its generation, package ordered.
 // This is what `cozy package list` reads — records only, never a walk of the filesystem.
 func (s *Store) Installed() ([]PackageInstall, *exit.Error) {
 	rows, err := s.db.Query(`SELECT ` + genCols("g.") + `
@@ -418,7 +439,8 @@ func (s *Store) KnownIDs() (map[string]bool, *exit.Error) {
 	return out, nil
 }
 
-// Pins of one package across every major (rm without an explicit major).
+// Pins returns the package's active pin. The slice shape remains useful to old local
+// databases long enough for the next activation to collapse any historical duplicates.
 func (s *Store) Pins(pkg string) ([]Pin, *exit.Error) {
 	rows, err := s.db.Query(`SELECT package,major,generation,activated_at FROM pins
 		WHERE package=? ORDER BY major`, pkg)
@@ -440,7 +462,7 @@ func (s *Store) Pins(pkg string) ([]Pin, *exit.Error) {
 // Unpin drops one pin. The generation row survives as unreferenced until gc — `rm`
 // removes the install, gc reclaims the bytes.
 func (s *Store) Unpin(pkg string, major int) *exit.Error {
-	if _, err := s.db.Exec(`DELETE FROM pins WHERE package=? AND major=?`, pkg, major); err != nil {
+	if _, err := s.db.Exec(`DELETE FROM pins WHERE package=?`, pkg); err != nil {
 		return exit.Internalf("cannot remove the pin for %s@v%d: %s", pkg, major, err)
 	}
 	return nil
@@ -449,7 +471,20 @@ func (s *Store) Unpin(pkg string, major int) *exit.Error {
 // ForgetIfUnreferenced atomically claims one generation for GC. The row goes before
 // filesystem deletion, so a failure leaves an ordinary orphan the next GC can retry.
 func (s *Store) ForgetIfUnreferenced(id string) (bool, *exit.Error) {
-	result, err := s.db.Exec(`DELETE FROM install_generations WHERE id=?
+	tx, err := s.db.Begin()
+	if err != nil {
+		return false, exit.New(exit.Conflict, "cannot begin generation %s gc: %s", id, err)
+	}
+	defer tx.Rollback()
+	if _, err := tx.Exec(`UPDATE requests SET install_id=NULL WHERE install_id=?
+		AND state NOT IN ('submitted','queued','dispatching','requeue_pending')`, id); err != nil {
+		return false, exit.New(exit.Conflict, "cannot release terminal requests from generation %s: %s", id, err)
+	}
+	if _, err := tx.Exec(`UPDATE worker_processes SET generation=NULL WHERE generation=?
+		AND state='closed'`, id); err != nil {
+		return false, exit.New(exit.Conflict, "cannot release closed workers from generation %s: %s", id, err)
+	}
+	result, err := tx.Exec(`DELETE FROM install_generations WHERE id=?
 		AND NOT EXISTS (SELECT 1 FROM pins WHERE generation=?)
 		AND NOT EXISTS (SELECT 1 FROM requests WHERE install_id=?
 		  AND state IN ('submitted','queued','dispatching','requeue_pending'))
@@ -459,5 +494,8 @@ func (s *Store) ForgetIfUnreferenced(id string) (bool, *exit.Error) {
 		return false, exit.New(exit.Conflict, "cannot claim generation %s for gc: %s", id, err)
 	}
 	n, _ := result.RowsAffected()
+	if err := tx.Commit(); err != nil {
+		return false, exit.New(exit.Conflict, "cannot commit generation %s gc: %s", id, err)
+	}
 	return n == 1, nil
 }

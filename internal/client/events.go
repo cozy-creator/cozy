@@ -2,6 +2,7 @@ package client
 
 import (
 	"bufio"
+	"context"
 	"encoding/json"
 	"io"
 	"strconv"
@@ -44,10 +45,19 @@ func Terminal(t string) bool {
 // It returns the terminal event when one arrived. A nil terminal with no error means the
 // caller stopped it.
 func (c *Client) Watch(requestID string, from int64, on func(Event) bool) (*Event, *exit.Error) {
+	return c.WatchContext(context.Background(), requestID, from, on)
+}
+
+// WatchContext is Watch with an explicit caller stop. Canceling the context stops the
+// open SSE read without changing the durable request; the caller decides whether it has
+// already requested server-side cancellation.
+func (c *Client) WatchContext(ctx context.Context, requestID string, from int64,
+	on func(Event) bool,
+) (*Event, *exit.Error) {
 	cursor := from
 	attempts := 0
 	for {
-		terminal, last, stopped, e := c.readStream(requestID, cursor, on)
+		terminal, last, stopped, e := c.readStream(ctx, requestID, cursor, on)
 		if last > cursor {
 			cursor = last
 			attempts = 0 // progress resets the budget: a long run is not a broken one
@@ -71,15 +81,19 @@ func (c *Client) Watch(requestID string, from int64, on func(Event) bool) (*Even
 	}
 }
 
-func (c *Client) readStream(requestID string, cursor int64, on func(Event) bool) (
+func (c *Client) readStream(ctx context.Context, requestID string, cursor int64, on func(Event) bool) (
 	terminal *Event, last int64, stopped bool, fail *exit.Error) {
 	path := "/v1/requests/" + requestID + "/events?cursor=" + strconv.FormatInt(cursor, 10)
 	req, e := c.request("GET", path, nil, "Accept", "text/event-stream")
 	if e != nil {
 		return nil, cursor, false, e
 	}
+	req = req.WithContext(ctx)
 	res, err := c.http.Do(req)
 	if err != nil {
+		if ctx.Err() != nil {
+			return nil, cursor, true, nil
+		}
 		return nil, cursor, false, c.unreachable(err)
 	}
 	defer res.Body.Close()
@@ -93,6 +107,9 @@ func (c *Client) readStream(requestID string, cursor int64, on func(Event) bool)
 	for {
 		line, err := reader.ReadString('\n')
 		if err != nil {
+			if ctx.Err() != nil {
+				return nil, last, true, nil
+			}
 			// A transport end. Not a verdict — Watch decides whether to resume.
 			return nil, last, false, nil
 		}

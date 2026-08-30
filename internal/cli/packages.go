@@ -92,11 +92,13 @@ func emitInstallResult(ctx *Context, st *records.Store, res *install.Result) *ex
 	if res.Superseded != "" {
 		reclaimed, problem := install.Reclaim(st, res.Superseded)
 		if problem != nil {
-			return problem
+			res.Warnings = append(res.Warnings,
+				"the new version is active; cleanup of the prior version was deferred: "+problem.Message)
+		} else {
+			fields = append(fields,
+				output.Field{K: "superseded", V: res.Superseded},
+				output.Field{K: "reclaimed", V: output.Bytes(reclaimed)})
 		}
-		fields = append(fields,
-			output.Field{K: "superseded", V: res.Superseded},
-			output.Field{K: "reclaimed", V: output.Bytes(reclaimed)})
 	}
 	rec := compactRecord(fields, "package", "major", "version", "status", "disk", "changed")
 	rec.Notes = append(rec.Notes, res.Warnings...)
@@ -154,43 +156,6 @@ func handleRm(ctx *Context) *exit.Error {
 	}
 	defer st.Close()
 	defer w.Unlock()
-	live, e := st.LiveWorkers()
-	if e != nil {
-		return e
-	}
-	for _, worker := range live {
-		if worker.WorkerID == "remote" {
-			continue
-		}
-		for _, arg := range ctx.Inv.Args {
-			ref, problem := install.ParseRef(arg)
-			if problem != nil {
-				return problem
-			}
-			if ref.Package == worker.Package {
-				return exit.New(exit.Conflict, "%s is still resident in local worker %s", ref.Package, worker.InstanceID).
-					WithRemedy("run `cozy unload`, then remove the package").
-					WithNext("cozy unload")
-			}
-		}
-	}
-	active, e := st.ActiveRequests()
-	if e != nil {
-		return e
-	}
-	for _, request := range active {
-		for _, arg := range ctx.Inv.Args {
-			ref, problem := install.ParseRef(arg)
-			if problem != nil {
-				return problem
-			}
-			if request.Worker == "" && ref.Package == request.Package {
-				return exit.New(exit.Conflict, "%s still has active invocation %s", ref.Package, request.ID).
-					WithRemedy("cancel the invocation before removing its package").
-					WithNext("cozy invoke cancel " + request.ID)
-			}
-		}
-	}
 
 	removed := output.List{
 		Name:      "packages",
@@ -203,6 +168,10 @@ func handleRm(ctx *Context) *exit.Error {
 		if e != nil {
 			return e
 		}
+		if ref.HasMajor {
+			return exit.Usagef("a package removal does not take a version").
+				WithRemedy("use `cozy package remove %s`; only one version can be installed", ref.Package)
+		}
 		targets, e := st.Pins(ref.Package)
 		if e != nil {
 			return e
@@ -214,6 +183,10 @@ func handleRm(ctx *Context) *exit.Error {
 			n, e := install.Remove(st, p.Package, p.Major)
 			if e != nil {
 				return e
+			}
+			if n == 0 {
+				removed.Notes = append(removed.Notes,
+					"package files are retained until accepted work finishes and its worker exits")
 			}
 			freed += n
 			removed.Rows = append(removed.Rows, map[string]string{

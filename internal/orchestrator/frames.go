@@ -112,6 +112,7 @@ func (c *Orchestrator) converge(s *session, w *worker, placements []DesiredPlace
 	}
 	c.mu.Lock()
 	w.revision, w.setDigest, w.setBytes = rev, digest, setBytes
+	w.desiredRefusal = nil
 	c.mu.Unlock()
 
 	d := &pb.DesiredWorkerState{
@@ -232,6 +233,14 @@ func (c *Orchestrator) onObserved(s *session, r *pb.ObservedWorkerState, frameBy
 		}
 		for _, f := range r.Faults {
 			w.fault = fmt.Sprintf("%s: %s", f.Reason, brief(f.Detail, 240))
+			if r.AcceptedDesiredStateRevision < desiredRevision &&
+				f.Subject == fmt.Sprintf("revision %d", desiredRevision) && permanentDesiredRefusal(f.Kind) {
+				w.desiredRefusal = exit.Named(exit.Structural, "placement_config_refused",
+					"the package worker refused its placement: %s — %s", f.Reason, brief(f.Detail, 240))
+			}
+		}
+		if r.AcceptedDesiredStateRevision >= desiredRevision {
+			w.desiredRefusal = nil
 		}
 		if len(r.Faults) == 0 && status != nil {
 			for _, f := range status.Faults {
@@ -305,6 +314,16 @@ func (c *Orchestrator) onObserved(s *session, r *pb.ObservedWorkerState, frameBy
 	}
 	c.logf("observed phase=%s accepted=%d converged=%d (no placement applied yet)",
 		phase, r.AcceptedDesiredStateRevision, r.ConvergedRevision)
+}
+
+func permanentDesiredRefusal(kind pb.FaultKind) bool {
+	switch kind {
+	case pb.FaultKind_FAULT_KIND_CONFIG_REFUSED,
+		pb.FaultKind_FAULT_KIND_PLACEMENT_SET_UNSUPPORTED,
+		pb.FaultKind_FAULT_KIND_PLACEMENT_SET_DIGEST_MISMATCH:
+		return true
+	}
+	return false
 }
 
 func placementAcquisitionOf(instanceID, bootID string,

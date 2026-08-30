@@ -3,6 +3,7 @@ package producttest
 import (
 	"context"
 	"crypto/sha256"
+	"database/sql"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
@@ -18,11 +19,78 @@ import (
 	"time"
 
 	"github.com/cozy-creator/cozy/internal/exit"
+	"github.com/cozy-creator/cozy/internal/launch"
 	"github.com/cozy-creator/cozy/internal/packagepublish"
+	"github.com/cozy-creator/cozy/internal/records"
 	"github.com/cozy-creator/cozy/internal/wheel"
 )
 
 const weightlessRef = "cozy/weightless"
+
+func TestLegacyAttemptColumnsMigrate(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "records.db")
+	store, problem := records.Open(path)
+	fatal(t, problem)
+	store.Close()
+	db, err := sql.Open("sqlite", path)
+	must(t, err)
+	_, err = db.Exec(`ALTER TABLE attempts RENAME COLUMN invocation_digest TO exec_spec_digest`)
+	must(t, err)
+	_, err = db.Exec(`ALTER TABLE attempts RENAME COLUMN invocation TO exec_spec`)
+	must(t, err)
+	must(t, db.Close())
+
+	store, problem = records.Open(path)
+	fatal(t, problem)
+	defer store.Close()
+	if _, problem = store.Attempts("no-such-request"); problem != nil {
+		t.Fatalf("migrated attempts are unreadable: %v", problem)
+	}
+}
+
+func TestLiteralPayloadUsesOrdinaryScalarSyntax(t *testing.T) {
+	entrypoint := &launch.Entrypoint{
+		Name: "marco",
+		Request: launch.Struct{Fields: []launch.Field{{
+			Name: "message", Type: json.RawMessage(`{"literal":["marco"]}`), Wire: "required",
+		}}},
+	}
+	for _, terms := range [][]string{{"message=marco"}, {"marco"}} {
+		payload, problem := launch.ParsePayload(entrypoint, terms, "")
+		if problem != nil || string(payload) != `{"message":"marco"}` {
+			t.Fatalf("ParsePayload(%q) = %s, %v", terms, payload, problem)
+		}
+	}
+	if _, problem := launch.ParsePayload(entrypoint, []string{"message=polo"}, ""); problem == nil || !strings.Contains(problem.Message, `must be one of: "marco"`) {
+		t.Fatalf("wrong literal was not explained: %v", problem)
+	}
+}
+
+func TestPackageHasOneActiveVersion(t *testing.T) {
+	store, problem := records.Open(filepath.Join(t.TempDir(), "records.db"))
+	fatal(t, problem)
+	defer store.Close()
+	install := func(id, version string, major int) records.PackageInstall {
+		return records.PackageInstall{
+			ID: id, Package: "cozy/example", Major: major, Version: version,
+			SourceKind: "tensorhub", SourceRef: "cozy/example@" + version,
+			SourceDigest: "sha256:" + strings.Repeat(id, 64/len(id)), Verified: true,
+			Dir: filepath.Join(t.TempDir(), id),
+		}
+	}
+	first := install("a", "1.0.0", 1)
+	second := install("b", "2.0.0", 2)
+	if _, problem = store.Activate(first); problem != nil {
+		t.Fatal(problem)
+	}
+	if superseded, problem := store.Activate(second); problem != nil || superseded != first.ID {
+		t.Fatalf("replacement = %q, %v", superseded, problem)
+	}
+	pins, problem := store.Pins("cozy/example")
+	if problem != nil || len(pins) != 1 || pins[0].InstallID != second.ID {
+		t.Fatalf("active pins = %+v, %v", pins, problem)
+	}
+}
 
 func TestModelManifestGrammar(t *testing.T) {
 	root := t.TempDir()
@@ -45,17 +113,27 @@ func TestModelManifestGrammar(t *testing.T) {
 
 func TestPackagePublishMetadataGrammar(t *testing.T) {
 	root := t.TempDir()
+	if code, help := runCozy(t, root, "invoke", "run", "--help"); code != 0 ||
+		strings.Contains(help, "--version") || strings.Contains(help, "vN/function") ||
+		!strings.Contains(help, "org/package[/function]") {
+		t.Fatalf("invoke run retained versioned target grammar [exit %d]\n%s", code, help)
+	}
 	if code, help := runCozy(t, root, "package", "publish", "--help"); code != 0 ||
 		strings.Contains(help, "--release") || strings.Contains(help, "--dir") ||
 		strings.Contains(help, "<package>") {
 		t.Fatalf("package publish retained caller-authored identity [exit %d]\n%s", code, help)
 	}
 	if code, help := runCozy(t, root, "package", "install", "--help"); code != 0 ||
-		strings.Contains(help, "--major") ||
+		!strings.Contains(help, "--version") ||
+		!strings.Contains(help, "--profile") || strings.Contains(help, "--major") ||
 		strings.Contains(help, "--from") || strings.Contains(help, "--dir") ||
 		strings.Contains(help, "--digest") || strings.Contains(help, "--allow-unsigned") ||
 		strings.Contains(help, "--force") {
 		t.Fatalf("package install exposed internal source/destination flags [exit %d]\n%s", code, help)
+	}
+	if code, out := runCozy(t, root, "package", "install", "cozy/example@1.2.3"); code != 2 ||
+		!strings.Contains(out, "--version 1.2.3") {
+		t.Fatalf("inline install version did not point to --version [exit %d]\n%s", code, out)
 	}
 	project := t.TempDir()
 	must(t, os.WriteFile(filepath.Join(project, "pyproject.toml"), []byte(`[project]
@@ -85,31 +163,17 @@ func TestPackagePublishRefusesSilentlyOmittedPrivateFiles(t *testing.T) {
 	}
 }
 
-func TestPackagePublishCommittedReplaySkipsBuildAndStaysCompact(t *testing.T) {
+func TestPackagePublishCommittedReplayStaysCompact(t *testing.T) {
 	project := t.TempDir()
-	must(t, os.Mkdir(filepath.Join(project, "replay_package"), 0o755))
-	must(t, os.WriteFile(filepath.Join(project, "replay_package", "__init__.py"), []byte("VALUE = 1\n"), 0o644))
-	must(t, os.WriteFile(filepath.Join(project, "pyproject.toml"), []byte(`[build-system]
-requires = []
-build-backend = "backend.that.does.not.exist"
-
-[project]
-name = "replay-package"
-version = "1.0.0"
-
-[tool.cozy]
-organization = "proof"
-`), 0o644))
-	must(t, os.WriteFile(filepath.Join(project, "package.toml"), []byte("[application]\nobject = \"replay_package:app\"\n"), 0o644))
-	must(t, os.WriteFile(filepath.Join(project, "uv.lock"), []byte("version = 1\n"), 0o644))
+	writePublishProject(t, project, "replay-package", "1.0.0", nil, "", true)
 
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		switch r.Method {
 		case http.MethodPost:
-			_, _ = io.WriteString(w, `{"project_wheel_upload":{"already_uploaded":true,"required_headers":{},"url":""},"state":"committed"}`)
+			_, _ = io.WriteString(w, `{"state":"committed","uploads":[]}`)
 		case http.MethodPut:
-			_, _ = io.WriteString(w, `{"compatible_profiles":[],"package_executions":[],"profiles":[],"qualification_state":"future-compatible-state","requirements":[],"requires_python":""}`)
+			_, _ = io.WriteString(w, `{"state":"committed","package_release":{"canonical_bytes":"e30=","digest":"sha256:44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a","length":2}}`)
 		default:
 			http.Error(w, "unexpected method", http.StatusMethodNotAllowed)
 		}
@@ -120,9 +184,9 @@ organization = "proof"
 	if code != 0 || !strings.Contains(out, "status:  already published") ||
 		!strings.Contains(out, "Checking proof/replay-package@1.0.0...") ||
 		!strings.Contains(out, "Release already published; refreshing status...") ||
-		!strings.Contains(out, "Finalizing release and evaluating worker profiles...") ||
+		!strings.Contains(out, "Committing exact package release...") ||
 		strings.Contains(out, "qualification:") || strings.Contains(out, "changed:") {
-		t.Fatalf("committed replay built the project or emitted verbose state [exit %d]\n%s", code, out)
+		t.Fatalf("committed replay emitted verbose state [exit %d]\n%s", code, out)
 	}
 }
 
@@ -604,9 +668,7 @@ const maxDaemonDiagnosticOutput = 18 << 10
 // A local archive remains a build/install input, but cannot invent the exact
 // PackageRelease, Qualification, and PlacementSet required for execution.
 func TestDevelopmentInstallIsNotRunnable(t *testing.T) {
-	root := filepath.Join(os.TempDir(), "cozy-product-test", "product")
-	must(t, os.RemoveAll(root))
-	must(t, os.MkdirAll(root, 0o755))
+	root := t.TempDir()
 	t.Cleanup(func() { _, _ = runCozy(t, root, "down", "--all") })
 
 	archive := weightlessRelease(t)
@@ -622,8 +684,16 @@ func TestDevelopmentInstallIsNotRunnable(t *testing.T) {
 		!strings.Contains(out, weightlessRef) {
 		t.Fatalf("package list omitted the install [exit %d]\n%s", code, out)
 	}
+	if code, out := runCozy(t, root, "invoke", "run", weightlessRef); code != 0 ||
+		!strings.Contains(out, "- tile") || !strings.Contains(out, "- refuse") {
+		t.Fatalf("package-only invoke did not list functions [exit %d]\n%s", code, out)
+	}
+	if code, out := runCozy(t, root, "invoke", "run", weightlessRef+"/v1.0.0/tile"); code != 2 ||
+		!strings.Contains(out, weightlessRef+"/tile") || !strings.Contains(out, "installed release") {
+		t.Fatalf("version-in-path remedy was not useful [exit %d]\n%s", code, out)
+	}
 
-	code, out = runCozy(t, root, "invoke", "run", weightlessRef+"/v1/tile",
+	code, out = runCozy(t, root, "invoke", "run", weightlessRef+"/tile",
 		"size=32", "seed=7")
 	if code != 1 || !strings.Contains(out, "without an exact Hub-selected PlacementSet") {
 		t.Fatalf("development install became runnable [exit %d]\n%s", code, out)

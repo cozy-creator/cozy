@@ -115,6 +115,7 @@ type Launcher interface {
 	// mode is a fact about the worker, and a resolver that returned "either" would push
 	// the choice into the orchestrator, which resolves nothing.
 	ResolveJob(pkg, function string) (WorkerLaunchSpec, *exit.Error)
+	ResolveJobInstall(installID, function string) (WorkerLaunchSpec, *exit.Error)
 }
 
 // Orchestrator is the Cozy daemon's scheduling role.

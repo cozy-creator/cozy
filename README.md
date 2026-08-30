@@ -62,7 +62,7 @@ Search the Tensorhub catalog, install a package, and inspect local installations
 cozy package search video
 cozy package search org/name
 cozy package install org/name
-cozy package install org/name@1.2.3
+cozy package install org/name --version 1.2.3
 cozy package list
 ```
 
@@ -143,11 +143,11 @@ Serving entrypoints and bounded jobs use the same command. Cozy reads the instal
 to determine the callable lifecycle:
 
 ```sh
-cozy invoke run org/package/v1/generate \
+cozy invoke run org/package/generate \
   prompt="a watercolor lighthouse at dusk" \
   --out ./outputs
 
-cozy invoke run org/package/v1/train epochs=3 --detach
+cozy invoke run org/package/train epochs=3 --detach
 cozy invoke list
 cozy invoke cancel <invocation-or-job-id>
 ```
@@ -168,7 +168,7 @@ cozy rental new h200 org/package/v1/generate \
   --idempotency-key <unique-key>
 
 cozy rental list
-cozy invoke run org/package/v1/generate --worker <rental-id> prompt="moonlit lake"
+cozy invoke run org/package/generate --worker <rental-id> prompt="moonlit lake"
 cozy rental end <rental-id>
 ```
 

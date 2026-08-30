@@ -1,6 +1,7 @@
 package cli
 
 import (
+	"context"
 	"crypto/rand"
 	"crypto/sha256"
 	"encoding/hex"
@@ -52,18 +53,25 @@ func dial(ctx *Context) (*localapi.Client, *exit.Error) {
 // ----------------------------------------------------------------------------- run
 
 func handleInvokeRun(ctx *Context) *exit.Error {
-	job, problem := invocationIsJob(ctx)
+	target, descriptor, problem := invocationTarget(ctx)
 	if problem != nil {
 		return problem
 	}
-	if !job {
+	if target.Function == "" {
+		return emitFunctions(ctx, target, descriptor)
+	}
+	callable, problem := descriptor.Function(target.Function)
+	if problem != nil {
+		return unknownFunction(target, descriptor)
+	}
+	if callable.Kind != "job" {
 		if len(ctx.Inv.Values["--input"]) > 0 {
 			return exit.Usagef("--input-tree applies only to a job callable")
 		}
 		if ctx.Inv.Value("--org") != "" {
 			return exit.Usagef("--org applies only to a job callable")
 		}
-		return handleRun(ctx)
+		return handleRun(ctx, target, callable)
 	}
 	if ctx.Inv.Value("--worker") != "" {
 		return exit.Named(exit.Usage, "rental_job_unsupported",
@@ -78,52 +86,10 @@ func handleInvokeRun(ctx *Context) *exit.Error {
 	if !ctx.Inv.Bool("--detach") {
 		ctx.Inv.Bools["--follow"] = true
 	}
-	return handleJobSubmit(ctx)
+	return handleJobSubmit(ctx, target, callable)
 }
 
-func invocationIsJob(ctx *Context) (bool, *exit.Error) {
-	target, problem := parseTarget(ctx.Inv.Args[0])
-	if problem != nil {
-		return false, problem
-	}
-	var descriptor *launch.PackageDescriptor
-	if worker := strings.TrimSpace(ctx.Inv.Value("--worker")); worker != "" {
-		layout, problem := home.Open(ctx.Cfg.Home)
-		if problem != nil {
-			return false, problem
-		}
-		store, problem := records.Open(layout.DB)
-		if problem != nil {
-			return false, problem
-		}
-		defer store.Close()
-		descriptor, problem = rental.PackageDescriptor(store, worker)
-		if problem != nil {
-			return false, problem
-		}
-	} else {
-		facts, problem := generationFacts(ctx, target.Package, target.Major)
-		if problem != nil {
-			return false, problem
-		}
-		descriptor = facts.PackageDescriptor
-	}
-	for _, job := range descriptor.Jobs {
-		if job.Name == target.Function {
-			return true, nil
-		}
-	}
-	if _, problem := descriptor.Function(target.Function); problem != nil {
-		return false, problem
-	}
-	return false, nil
-}
-
-func handleRun(ctx *Context) *exit.Error {
-	target, e := parseTarget(ctx.Inv.Args[0])
-	if e != nil {
-		return e
-	}
+func handleRun(ctx *Context, target Target, ep *launch.Entrypoint) *exit.Error {
 	deadline, e := runDeadline(ctx)
 	if e != nil {
 		return e
@@ -133,15 +99,6 @@ func handleRun(ctx *Context) *exit.Error {
 	// runtime vouched for at install — so a typo costs a millisecond instead of a model
 	// load, and `steps=2` is an int because the schema says int.
 	worker := strings.TrimSpace(ctx.Inv.Value("--worker"))
-	var ep *launch.Entrypoint
-	if worker != "" {
-		ep, e = remoteEntrypointOf(ctx, worker, target.Function)
-	} else {
-		ep, e = entrypointOf(ctx, target)
-	}
-	if e != nil {
-		return e
-	}
 	if legacy := launch.LegacyFileTerm(ctx.Inv.Args[1:]); worker != "" && legacy != "" {
 		return exit.Named(exit.Usage, "remote_file_input_ambiguous",
 			"%s embeds file bytes into a JSON string and cannot name a remote input grant", legacy).
@@ -167,7 +124,7 @@ func handleRun(ctx *Context) *exit.Error {
 	began := time.Now()
 	handle, e := c.Submit(api.Submission{
 		Package: target.Package, Function: target.Function, Input: input,
-		Worker: worker, LocalAssets: assets,
+		Worker: worker, LocalAssets: assets, InstallID: target.InstallID,
 	}, key)
 	if e != nil {
 		return e
@@ -187,8 +144,12 @@ func handleRun(ctx *Context) *exit.Error {
 
 	stream := ctx.Inv.Bool("--stream")
 	if !stream {
-		fmt.Fprintf(ctx.Err, "request %s · attempt %d · %s\n",
-			handle.RequestID, handle.Attempt, handle.Status)
+		if ctx.Mode().Full {
+			fmt.Fprintf(ctx.Err, "request %s · attempt %d · %s\n",
+				handle.RequestID, handle.Attempt, handle.Status)
+		} else {
+			fmt.Fprintf(ctx.Err, "Invoking %s/%s...\n", target.Package, target.Function)
+		}
 		if handle.Replay {
 			fmt.Fprintln(ctx.Err, "note: this key returned the existing invocation")
 		}
@@ -320,42 +281,84 @@ func invocationSettled(status string) bool {
 // happened.
 func watch(ctx *Context, c *localapi.Client, requestID string, stream bool,
 	deadline time.Duration) (*localapi.Event, string, *exit.Error) {
-	interrupt := make(chan os.Signal, 1)
+	interrupt := make(chan os.Signal, 2)
 	signal.Notify(interrupt, syscall.SIGINT, syscall.SIGTERM)
 	defer signal.Stop(interrupt)
 
-	stopped := ""
-	cancel := func(why string) {
-		fmt.Fprintf(ctx.Err, "\n%s — the attempt's own terminal still settles it\n", why)
-		if e := c.Cancel(requestID); e != nil {
-			fmt.Fprintf(ctx.Err, "cancel: %s\n", e.Message)
-		}
-	}
+	watchCtx, stopWatch := context.WithCancel(context.Background())
+	defer stopWatch()
+	stopped := make(chan string, 1)
+	forced := make(chan struct{}, 1)
+	cancelFailed := make(chan *exit.Error, 1)
 	done := make(chan struct{})
 	defer close(done)
 	go func() {
+		reason, message := "", ""
 		select {
 		case _, ok := <-interrupt:
 			if !ok {
 				return
 			}
-			stopped = "canceled"
-			cancel("cancel requested")
+			reason, message = "canceled", "cancel requested"
 		case <-deadlineC(deadline):
 			// `--timeout` is a REQUEST DEADLINE the client enforces the only way a client
 			// honestly can: by asking the orchestrator to cancel. It is not the
 			// supervisor's watchdog deadline (that one is on the attempt, and this host
 			// has no wire field for it) — walking away instead would leave the card held.
-			stopped = "deadline"
-			cancel(fmt.Sprintf("--timeout %s expired", deadline))
+			reason, message = "deadline", fmt.Sprintf("--timeout %s expired", deadline)
+		case <-done:
+			return
+		}
+		stopped <- reason
+		fmt.Fprintf(ctx.Err, "\n%s — the attempt's own terminal still settles it\n", message)
+		cancelResult := make(chan *exit.Error, 1)
+		go func() { cancelResult <- c.Cancel(requestID) }()
+		select {
+		case <-interrupt:
+			fmt.Fprintln(ctx.Err, "second interrupt — stopped waiting; the request remains recorded")
+			forced <- struct{}{}
+			stopWatch()
+			return
+		case problem := <-cancelResult:
+			if problem != nil {
+				fmt.Fprintf(ctx.Err, "cancel: %s\n", problem.Message)
+				cancelFailed <- problem
+				stopWatch()
+				return
+			}
+		case <-done:
+			return
+		}
+		select {
+		case <-interrupt:
+			fmt.Fprintln(ctx.Err, "second interrupt — stopped waiting; the request remains recorded")
+			forced <- struct{}{}
+			stopWatch()
 		case <-done:
 		}
 	}()
 
 	lines := newProgress(ctx, stream)
-	terminal, e := c.Watch(requestID, 0, lines.on)
+	terminal, e := c.WatchContext(watchCtx, requestID, 0, lines.on)
 	lines.done()
-	return terminal, stopped, e
+	select {
+	case problem := <-cancelFailed:
+		return nil, "cancel_failed", problem
+	default:
+	}
+	select {
+	case <-forced:
+		return nil, "interrupted", exit.New(exit.Canceled,
+			"stopped waiting for %s; it remains visible in `cozy invoke list`", requestID).
+			WithNext("cozy invoke list")
+	default:
+	}
+	reason := ""
+	select {
+	case reason = <-stopped:
+	default:
+	}
+	return terminal, reason, e
 }
 
 // deadlineC is a timer channel, or one that never fires when no deadline was set.
@@ -405,7 +408,7 @@ func (p *runProgress) on(e localapi.Event) bool {
 	if p.ctx.Mode().JSON {
 		return true // one JSON document on stdout: the run's own, at the end
 	}
-	line := progressLine(e)
+	line := progressLine(e, p.ctx.Mode().Full)
 	if line == "" || line == p.last {
 		return true
 	}
@@ -424,7 +427,7 @@ func (p *runProgress) done() {
 
 // progressLine renders one event. The runtime's own frame vocabulary is carried through
 // (`progress`, `stage`, `metric`) rather than translated into a second one.
-func progressLine(e localapi.Event) string {
+func progressLine(e localapi.Event, full bool) string {
 	kind := strings.TrimPrefix(e.Type, "request.")
 	switch kind {
 	case "progress":
@@ -436,14 +439,37 @@ func progressLine(e localapi.Event) string {
 			return "  " + kind + " " + compactValue(v)
 		}
 	case "queued":
+		if !full {
+			return "  preparing a local worker"
+		}
 		if reason, ok := e.Payload["reason"].(string); ok {
 			return "  queued — " + reason
 		}
 		return "  queued"
-	case "dispatched", "accepted", "submitted", "requeued", "attempt_failed":
-		return "  " + kind + " " + compactValue(e.Payload)
+	case "submitted":
+		if !full {
+			return ""
+		}
+	case "dispatched":
+		if !full {
+			return "  worker selected"
+		}
+	case "accepted":
+		if !full {
+			return "  running"
+		}
+	case "requeued":
+		if !full {
+			return "  retrying"
+		}
+	case "attempt_failed":
+		if !full {
+			return "  attempt failed; retrying"
+		}
+	default:
+		return ""
 	}
-	return ""
+	return "  " + kind + " " + compactValue(e.Payload)
 }
 
 func compactValue(v map[string]any) string {
@@ -795,82 +821,91 @@ func mintKey() string {
 
 // ------------------------------------------------------------------- target parsing
 
-// Target is one invocation subject: `org/package/vN/function`.
+// Target is one installed package and optional callable selected for invocation.
 type Target struct {
-	Package  string
-	Major    int
-	Function string
-	Ref      string // the package ref as the resolver takes it: `org/package@vN`
+	Package   string
+	Function  string
+	InstallID string
 }
 
-// parseTarget reads `org/package/vN/function`. The semver-major is a REQUIRED path
-// segment: it is resolved through that (package, major)'s serving pointer,
-// which locally is the install pin, and a majorless target is a usage refusal rather
-// than a default.
+// parseTarget reads the user-facing package grammar. Versions are flags, not path
+// segments: the common spelling stays stable while installed releases change.
 func parseTarget(raw string) (Target, *exit.Error) {
 	parts := strings.Split(strings.TrimSpace(raw), "/")
-	usage := exit.Usagef("%q is not org/package/vN/function", raw).
-		WithRemedy("the semver-major is a required path segment — it resolves through that package's serving pointer").
+	usage := exit.Usagef("%q is not org/package[/function]", raw).
+		WithRemedy("use org/package/function; omit /function to list the package's callables").
 		WithNext("cozy package list", "cozy help invoke run")
-	if len(parts) != 4 {
+	if len(parts) == 4 && strings.HasPrefix(parts[2], "v") {
+		return Target{}, exit.Usagef("a version does not belong in the invocation path").
+			WithRemedy("use %s/%s/%s; Cozy always runs the installed release", parts[0], parts[1], parts[3]).
+			WithNext("cozy help invoke run")
+	}
+	if len(parts) != 2 && len(parts) != 3 {
 		return Target{}, usage
 	}
-	major, ok := majorOf(parts[2])
-	if !ok || parts[0] == "" || parts[1] == "" || parts[3] == "" {
+	if parts[0] == "" || parts[1] == "" || (len(parts) == 3 && parts[2] == "") {
 		return Target{}, usage
 	}
-	pkg := parts[0] + "/" + parts[1]
-	return Target{
-		Package: pkg, Major: major, Function: parts[3],
-		Ref: pkg + "@" + parts[2],
-	}, nil
+	target := Target{Package: parts[0] + "/" + parts[1]}
+	if len(parts) == 3 {
+		target.Function = parts[2]
+	}
+	return target, nil
 }
 
-func majorOf(segment string) (int, bool) {
-	digits, ok := strings.CutPrefix(segment, "v")
-	if !ok || digits == "" {
-		return 0, false
+func invocationTarget(ctx *Context) (Target, *launch.PackageDescriptor, *exit.Error) {
+	target, problem := parseTarget(ctx.Inv.Args[0])
+	if problem != nil {
+		return Target{}, nil, problem
 	}
-	n := 0
-	for _, c := range digits {
-		if c < '0' || c > '9' {
-			return 0, false
+	worker := strings.TrimSpace(ctx.Inv.Value("--worker"))
+	if worker != "" {
+		layout, problem := home.Open(ctx.Cfg.Home)
+		if problem != nil {
+			return Target{}, nil, problem
 		}
-		n = n*10 + int(c-'0')
+		store, problem := records.Open(layout.DB)
+		if problem != nil {
+			return Target{}, nil, problem
+		}
+		defer store.Close()
+		descriptor, problem := rental.PackageDescriptor(store, worker)
+		return target, descriptor, problem
 	}
-	return n, true
+	facts, problem := generationFacts(ctx, target.Package)
+	if problem != nil {
+		return Target{}, nil, problem
+	}
+	target.InstallID = facts.Install.ID
+	return target, facts.PackageDescriptor, nil
 }
 
-// entrypointOf reads one function's declared surface out of the install records. It is a
-// LOCAL read of a fact the release's own runtime already proved, which is why it costs no
-// subprocess and no round trip.
-func entrypointOf(ctx *Context, t Target) (*launch.Entrypoint, *exit.Error) {
-	facts, e := generationFacts(ctx, t.Package, t.Major)
-	if e != nil {
-		return nil, e
+func emitFunctions(ctx *Context, target Target, descriptor *launch.PackageDescriptor) *exit.Error {
+	list := output.List{Name: "functions", Fields: []string{"function"}, AllFields: []string{"function"}}
+	for _, name := range descriptor.Names() {
+		list.Rows = append(list.Rows, map[string]string{"function": name})
+		if len(list.Next) < 2 {
+			list.Next = append(list.Next, "cozy invoke run "+target.Package+"/"+name)
+		}
 	}
-	return facts.PackageDescriptor.Function(t.Function)
+	return emit(ctx, list)
 }
 
-func remoteEntrypointOf(ctx *Context, worker, function string) (*launch.Entrypoint, *exit.Error) {
-	l, e := home.Open(ctx.Cfg.Home)
-	if e != nil {
-		return nil, e
+func unknownFunction(target Target, descriptor *launch.PackageDescriptor) *exit.Error {
+	names := descriptor.Names()
+	problem := exit.New(exit.NotFound, "%s registers no function %q", target.Package, target.Function)
+	if len(names) == 0 {
+		return problem.WithRemedy("this release registers no callable functions")
 	}
-	store, e := records.Open(l.DB)
-	if e != nil {
-		return nil, e
+	problem.WithRemedy("available functions: %s", strings.Join(names, ", "))
+	for _, name := range names {
+		problem.WithNext("cozy invoke run " + target.Package + "/" + name)
 	}
-	defer store.Close()
-	descriptor, e := rental.PackageDescriptor(store, worker)
-	if e != nil {
-		return nil, e
-	}
-	return descriptor.Function(function)
+	return problem
 }
 
-// generationFacts resolves a package ref to its pinned generation's facts.
-func generationFacts(ctx *Context, pkg string, major int) (*launch.Facts, *exit.Error) {
+// generationFacts resolves the package's one active install.
+func generationFacts(ctx *Context, pkg string) (*launch.Facts, *exit.Error) {
 	l, e := home.Open(ctx.Cfg.Home)
 	if e != nil {
 		return nil, e
@@ -889,26 +924,20 @@ func generationFacts(ctx *Context, pkg string, major int) (*launch.Facts, *exit.
 			WithRemedy("`cozy package list` lists what is").
 			WithNext("cozy package search "+pkg, "cozy package list")
 	}
-	chosen, found := pins[0], major == 0
-	for _, p := range pins {
-		if p.Major == major {
-			chosen, found = p, true
+	chosen := pins[0]
+	for _, pin := range pins[1:] {
+		if pin.ActivatedAt > chosen.ActivatedAt {
+			chosen = pin
 		}
 	}
-	if !found {
-		return nil, exit.New(exit.NotFound, "%s is installed, but not at v%d", pkg, major).
-			WithRemedy("installed majors: %s", majorsOf(pins)).
-			WithNext("cozy package list")
-	}
-	gen, e := store.Install(chosen.InstallID)
+	install, e := store.Install(chosen.InstallID)
 	if e != nil {
 		return nil, e
 	}
-	if gen == nil {
-		return nil, exit.Internalf("%s is pinned to generation %s and that row is gone",
-			pkg, chosen.InstallID)
+	if install == nil {
+		return nil, exit.Internalf("%s is pinned to install %s and that row is gone", pkg, chosen.InstallID)
 	}
-	return launch.Read(*gen, ctx.Cfg.Home, ctx.Cfg.Tool())
+	return launch.Read(*install, ctx.Cfg.Home, ctx.Cfg.Tool())
 }
 
 // eventText reads one string field out of an event's payload. It is how a pre-attempt

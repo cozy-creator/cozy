@@ -512,9 +512,7 @@ func (c *Orchestrator) resolveFor(req records.Request) (WorkerLaunchSpec, *exit.
 		}
 		if req.InstallID != "" {
 			if req.IsJob() {
-				return WorkerLaunchSpec{}, exit.Named(exit.Structural,
-					"job_install_unsupported",
-					"an exact serving install cannot dispatch a job callable")
+				return c.opt.Packages.ResolveJobInstall(req.InstallID, req.Entrypoint)
 			}
 			spec, e := c.opt.Packages.ResolveInstall(req.InstallID)
 			if e != nil {

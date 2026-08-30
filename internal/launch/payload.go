@@ -397,6 +397,8 @@ func typed(ep *Entrypoint, key, raw string) (json.RawMessage, *exit.Error) {
 			return nil, exit.Internalf("cannot carry %s: %s", key, err)
 		}
 		return encoded, nil
+	case "literal":
+		return typedLiteral(ep, key, rendered, raw)
 	case "asset":
 		return nil, exit.New(exit.Validation,
 			"%s.%s is an input asset and `key=value` cannot grant its bytes", ep.Name, key).
@@ -407,6 +409,40 @@ func typed(ep *Entrypoint, key, raw string) (json.RawMessage, *exit.Error) {
 	return nil, exit.New(exit.Validation,
 		"%s.%s is not a scalar and `key=value` cannot spell one", ep.Name, key).
 		WithRemedy("carry it as `%s:=<json>`; asset fields use `--asset <field-path>=<file>`", key)
+}
+
+func typedLiteral(ep *Entrypoint, key string, rendered json.RawMessage, raw string) (json.RawMessage, *exit.Error) {
+	var schema struct {
+		Literal []json.RawMessage `json:"literal"`
+	}
+	if json.Unmarshal(rendered, &schema) != nil || len(schema.Literal) == 0 {
+		return nil, exit.Named(exit.Structural, "descriptor_type_unknown",
+			"%s.%s has an unreadable literal type", ep.Name, key)
+	}
+	// A bare CLI token naturally spells a string literal. Check strings first so a
+	// declaration containing both "1" and 1 resolves `field=1` to the string.
+	for _, member := range schema.Literal {
+		var text string
+		if json.Unmarshal(member, &text) == nil && text == raw {
+			encoded, _ := json.Marshal(raw)
+			return encoded, nil
+		}
+	}
+	// Numeric, boolean and null literals already have unambiguous JSON spellings.
+	if json.Valid([]byte(raw)) {
+		decoder := json.NewDecoder(strings.NewReader(raw))
+		decoder.UseNumber()
+		var value any
+		if decoder.Decode(&value) == nil && validateRenderedInto(rendered, value, key, nil) == nil {
+			return json.RawMessage(raw), nil
+		}
+	}
+	allowed := make([]string, 0, len(schema.Literal))
+	for _, member := range schema.Literal {
+		allowed = append(allowed, string(member))
+	}
+	return nil, exit.New(exit.Validation,
+		"%s.%s must be one of: %s", ep.Name, key, strings.Join(allowed, ", "))
 }
 
 func wrongType(ep *Entrypoint, key, raw, want string) *exit.Error {

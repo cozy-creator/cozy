@@ -321,7 +321,7 @@ func handleRent(ctx *Context) *exit.Error {
 	rec := compactRecord(fields, "rental", "state", "gpu", "package", "changed")
 	rec.Notes = notes
 	rec.Next = []string{
-		"cozy invoke run <org/package/vN/function> --worker " + ready.ID,
+		"cozy invoke run <org/package/function> --worker " + ready.ID,
 		"cozy rental end " + ready.ID,
 	}
 	return emit(ctx, rec)

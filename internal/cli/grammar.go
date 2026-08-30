@@ -52,7 +52,8 @@ func (c *PackageSearchCmd) Run(r *Runtime) error {
 }
 
 type PackageInstallCmd struct {
-	Ref           string `arg:"" name:"package" help:"Published package ref (org/name[@release])."`
+	Ref           string `arg:"" name:"package" help:"Published package name (org/name)."`
+	Version       string `help:"Install this release instead of the newest, e.g. 1.2.3."`
 	Profile       string `help:"Approved base-worker profile."`
 	From          string `hidden:"" type:"path"`
 	Dir           string `hidden:"" type:"path"`
@@ -64,7 +65,8 @@ type PackageInstallCmd struct {
 func (c *PackageInstallCmd) Run(r *Runtime) error {
 	return r.call(handleInstall, []string{c.Ref}, bools(
 		"--force", c.Force, "--allow-unsigned", c.AllowUnsigned), values(
-		"--profile", c.Profile, "--from", c.From, "--dir", c.Dir, "--digest", c.Digest), false)
+		"--version", c.Version, "--profile", c.Profile,
+		"--from", c.From, "--dir", c.Dir, "--digest", c.Digest), false)
 }
 
 type PackageRemoveCmd struct {
@@ -154,7 +156,7 @@ type InvokeCmd struct {
 }
 
 type InvokeRunCmd struct {
-	Target         string   `arg:"" name:"target" help:"Callable as org/package/vN/function."`
+	Target         string   `arg:"" name:"target" help:"Package or callable as org/package[/function]."`
 	Input          []string `arg:"" optional:"" name:"input" help:"Primary value and field=value payload."`
 	Out            string   `help:"Output directory." type:"path"`
 	Timeout        string   `help:"Request deadline."`
