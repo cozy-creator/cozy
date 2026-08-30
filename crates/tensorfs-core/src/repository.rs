@@ -5,7 +5,7 @@
 use std::cmp::Ordering;
 
 use crate::canon::{as_arr, Fields, Value};
-use crate::err::{refuse, Code, Refusal, Result};
+use crate::err::{refuse, Code, Result};
 use crate::ids::{ascii_name, hex64, prefixed, Doc, ObjectRef};
 
 pub const MAX_REPOSITORY_BYTES: usize = 8 * 1024 * 1024;
@@ -291,9 +291,13 @@ impl ReleaseEvidence {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Release {
-    pub evidence: ReleaseEvidence,
+    /// Present only for a CozyTensors model release. Ordinary package, dataset, and user-file
+    /// repositories need no fabricated model-classification payload.
+    pub evidence: Option<ReleaseEvidence>,
     pub lane: String,
     pub manifest: ObjectRef,
+    /// Optional domain metadata stored as an ordinary blob (for example PackageRelease).
+    pub metadata: Option<ObjectRef>,
     pub version: String,
 }
 
@@ -309,24 +313,40 @@ impl Release {
         if self.manifest.length == 0 {
             return refuse(Code::LENGTH_MISMATCH, "release manifest has zero length");
         }
-        // Round through the strict evidence reader so programmatic construction has the
-        // same caps as stored bytes.
-        ReleaseEvidence::from_value(&self.evidence.to_value())?;
+        if let Some(metadata) = &self.metadata {
+            hex64("Release.metadata", &metadata.sha256)?;
+            if metadata.length == 0 {
+                return refuse(Code::LENGTH_MISMATCH, "release metadata has zero length");
+            }
+        }
+        if let Some(evidence) = &self.evidence {
+            // Round through the strict evidence reader so programmatic construction has the
+            // same caps as stored bytes.
+            ReleaseEvidence::from_value(&evidence.to_value())?;
+        }
         Ok(())
     }
 
     fn from_value(v: &Value) -> Result<Self> {
         let mut fields = Fields::new("Repository.release", v)?;
-        let evidence = ReleaseEvidence::from_value(fields.req("evidence")?)?;
+        let evidence = fields
+            .opt("evidence")
+            .map(ReleaseEvidence::from_value)
+            .transpose()?;
         let lane = fields.req_str("lane")?.to_string();
         let manifest =
             ObjectRef::from_value("Repository.release.manifest", fields.req("manifest")?)?;
+        let metadata = fields
+            .opt("metadata")
+            .map(|value| ObjectRef::from_value("Repository.release.metadata", value))
+            .transpose()?;
         let version = fields.req_str("version")?.to_string();
         fields.done()?;
         let release = Self {
             evidence,
             lane,
             manifest,
+            metadata,
             version,
         };
         release.validate()?;
@@ -334,12 +354,18 @@ impl Release {
     }
 
     fn to_value(&self) -> Value {
-        Value::obj(vec![
-            ("evidence", self.evidence.to_value()),
+        let mut fields = vec![
             ("lane", Value::str(self.lane.clone())),
             ("manifest", self.manifest.to_value()),
             ("version", Value::str(self.version.clone())),
-        ])
+        ];
+        if let Some(evidence) = &self.evidence {
+            fields.push(("evidence", evidence.to_value()));
+        }
+        if let Some(metadata) = &self.metadata {
+            fields.push(("metadata", metadata.to_value()));
+        }
+        Value::obj(fields)
     }
 }
 
@@ -461,8 +487,9 @@ pub enum Mutation {
         repo: RepositoryName,
         lane: String,
         manifest: ObjectRef,
+        metadata: Option<ObjectRef>,
         version: String,
-        evidence: Box<ReleaseEvidence>,
+        evidence: Option<Box<ReleaseEvidence>>,
     },
     RemoveRelease {
         repo: RepositoryName,
@@ -481,18 +508,30 @@ impl Mutation {
         let action = fields.req_str("action")?.to_string();
         let result = match action.as_str() {
             "put_release" => {
-                let evidence = Box::new(ReleaseEvidence::parse(&crate::b64::decode(
-                    fields.req_str("evidence_base64")?,
-                )?)?);
+                let evidence = fields
+                    .opt("evidence_base64")
+                    .map(|value| {
+                        let encoded =
+                            crate::canon::as_str("RepositoryMutation", "evidence_base64", value)?;
+                        Ok(Box::new(ReleaseEvidence::parse(&crate::b64::decode(
+                            encoded,
+                        )?)?))
+                    })
+                    .transpose()?;
                 let lane = fields.req_str("lane")?.to_string();
                 let manifest =
                     ObjectRef::from_value("RepositoryMutation.manifest", fields.req("manifest")?)?;
+                let metadata = fields
+                    .opt("metadata")
+                    .map(|value| ObjectRef::from_value("RepositoryMutation.metadata", value))
+                    .transpose()?;
                 let repo = RepositoryName::from_value(fields.req("repo")?)?;
                 let version = fields.req_str("version")?.to_string();
                 Mutation::PutRelease {
                     repo,
                     lane,
                     manifest,
+                    metadata,
                     version,
                     evidence,
                 }
@@ -537,12 +576,13 @@ impl Mutation {
             repo,
             lane: lane.into(),
             manifest,
+            metadata: None,
             version: version.into(),
-            evidence: Box::new(ReleaseEvidence {
+            evidence: Some(Box::new(ReleaseEvidence {
                 classification_digest: classification_digest.into(),
                 ingest: Some(ingest),
                 verification: Some(verification),
-            }),
+            })),
         }
     }
 }
@@ -570,30 +610,45 @@ pub fn apply(
             repo,
             lane,
             manifest,
+            metadata,
             version,
             evidence,
         } => {
-            let classification_digest = classification_digest.ok_or_else(|| Refusal {
-                code: Code::MISSING_FIELD,
-                detail: "put_release requires the header-derived topology digest".into(),
-            })?;
-            let derived = prefixed("classification_digest", classification_digest)?;
-            if evidence.classification_digest != derived {
-                return refuse(
-                    Code::TOPOLOGY_MISMATCH,
-                    format!(
-                        "release evidence classification {} differs from derived {derived}",
-                        evidence.classification_digest
-                    ),
-                );
+            match (evidence.as_deref(), classification_digest) {
+                (Some(evidence), Some(classification_digest)) => {
+                    let derived = prefixed("classification_digest", classification_digest)?;
+                    if evidence.classification_digest != derived {
+                        return refuse(
+                            Code::TOPOLOGY_MISMATCH,
+                            format!(
+                                "release evidence classification {} differs from derived {derived}",
+                                evidence.classification_digest
+                            ),
+                        );
+                    }
+                }
+                (None, None) => {}
+                (Some(_), None) => {
+                    return refuse(
+                        Code::ATTACHMENT_CARDINALITY,
+                        "model evidence requires one CozyTensors manifest entry",
+                    )
+                }
+                (None, Some(_)) => {
+                    return refuse(
+                        Code::MISSING_FIELD,
+                        "a CozyTensors release requires model evidence",
+                    )
+                }
             }
             Ok(Some(
                 existing
                     .unwrap_or_else(|| Repository::empty(repo.clone()))
                     .put_release(Release {
-                        evidence: (**evidence).clone(),
+                        evidence: evidence.as_deref().cloned(),
                         lane: lane.clone(),
                         manifest: manifest.clone(),
+                        metadata: metadata.clone(),
                         version: version.clone(),
                     })?,
             ))
@@ -632,12 +687,13 @@ mod tests {
 
     fn release(version: &str, lane: &str, seed: u8) -> Release {
         Release {
-            evidence: evidence(seed),
+            evidence: Some(evidence(seed)),
             lane: lane.into(),
             manifest: ObjectRef {
                 sha256: format!("{:02x}", seed + 1).repeat(32),
                 length: 12,
             },
+            metadata: None,
             version: version.into(),
         }
     }

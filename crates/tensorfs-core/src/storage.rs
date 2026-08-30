@@ -150,9 +150,9 @@ pub struct RepoRow {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ReleaseRow {
-    pub evidence_json: Vec<u8>,
-    pub header_length: u64,
-    pub header_sha256: String,
+    pub evidence_json: Option<Vec<u8>>,
+    pub header_length: Option<u64>,
+    pub header_sha256: Option<String>,
     pub lane: String,
     pub manifest_length: u64,
     pub manifest_sha256: String,
@@ -160,7 +160,7 @@ pub struct ReleaseRow {
     pub object_bytes: u64,
     pub object_count: u64,
     pub org: String,
-    pub topology_digest: String,
+    pub topology_digest: Option<String>,
     pub version: String,
 }
 
@@ -228,15 +228,7 @@ impl Projection {
             ])));
         }
         for row in &self.releases {
-            let evidence = crate::canon::parse_canonical(
-                &row.evidence_json,
-                crate::repository::MAX_EVIDENCE_BYTES,
-            )
-            .expect("validated evidence bytes");
-            lines.push(crate::canon::write(&Value::obj(vec![
-                ("evidence", evidence),
-                ("header_length", Value::uint(row.header_length)),
-                ("header_sha256", Value::str(row.header_sha256.clone())),
+            let mut fields = vec![
                 ("kind", Value::str("release")),
                 ("lane", Value::str(row.lane.clone())),
                 ("manifest_length", Value::uint(row.manifest_length)),
@@ -245,9 +237,23 @@ impl Projection {
                 ("object_bytes", Value::uint(row.object_bytes)),
                 ("object_count", Value::uint(row.object_count)),
                 ("org", Value::str(row.org.clone())),
-                ("topology_digest", Value::str(row.topology_digest.clone())),
                 ("version", Value::str(row.version.clone())),
-            ])));
+            ];
+            if let Some(evidence) = &row.evidence_json {
+                fields.push((
+                    "evidence",
+                    crate::canon::parse_canonical(evidence, crate::repository::MAX_EVIDENCE_BYTES)
+                        .expect("validated evidence bytes"),
+                ));
+            }
+            if let (Some(sha256), Some(length), Some(topology)) =
+                (&row.header_sha256, row.header_length, &row.topology_digest)
+            {
+                fields.push(("header_length", Value::uint(length)));
+                fields.push(("header_sha256", Value::str(sha256.clone())));
+                fields.push(("topology_digest", Value::str(topology.clone())));
+            }
+            lines.push(crate::canon::write(&Value::obj(fields)));
         }
         for row in &self.objects {
             lines.push(crate::canon::write(&Value::obj(vec![
@@ -318,7 +324,7 @@ impl Census {
         repository_bytes: &[u8],
         release: &Release,
         manifest_bytes: &[u8],
-        header_bytes: &[u8],
+        header_bytes: Option<&[u8]>,
         inventory: BTreeMap<String, InventoryEntry>,
     ) -> Result<Projection> {
         if repository.canonical_bytes() != repository_bytes {
@@ -340,17 +346,30 @@ impl Census {
             );
         }
         let manifest = Manifest::parse(manifest_bytes)?;
-        let header_ref = manifest.header().ok_or_else(|| Refusal {
-            code: Code::ATTACHMENT_CARDINALITY,
-            detail: "release manifest has no cozytensors entry".into(),
-        })?;
-        if ObjectRef::of(header_bytes) != *header_ref {
-            return refuse(
-                Code::OBJECT_ID_MISMATCH,
-                "staged header bytes disagree with the manifest reference",
-            );
+        match (manifest.header(), header_bytes) {
+            (Some(header_ref), Some(bytes)) => {
+                if ObjectRef::of(bytes) != *header_ref {
+                    return refuse(
+                        Code::OBJECT_ID_MISMATCH,
+                        "staged header bytes disagree with the manifest reference",
+                    );
+                }
+                Header::parse(bytes)?;
+            }
+            (None, None) => {}
+            (Some(_), None) => {
+                return refuse(
+                    Code::MISSING_FIELD,
+                    "model release requires staged header bytes",
+                )
+            }
+            (None, Some(_)) => {
+                return refuse(
+                    Code::ATTACHMENT_CARDINALITY,
+                    "ordinary release cannot supply CozyTensors header bytes",
+                )
+            }
         }
-        Header::parse(header_bytes)?;
 
         let mut manifests = BTreeMap::new();
         manifests.insert(
@@ -369,12 +388,7 @@ impl Census {
             name: repository.repo.name.clone(),
             org: repository.repo.org.clone(),
         });
-        census.project_release_with_header(
-            repository,
-            release,
-            &mut projection,
-            Some(header_bytes),
-        )?;
+        census.project_release_with_header(repository, release, &mut projection, header_bytes)?;
         Ok(projection)
     }
 
@@ -602,80 +616,107 @@ impl Census {
         header_bytes: Option<&[u8]>,
     ) -> Result<()> {
         let (manifest, _) = self.manifest(&release.manifest)?;
-        let header_ref = manifest.header().ok_or_else(|| Refusal {
-            code: Code::ATTACHMENT_CARDINALITY,
-            detail: format!(
-                "release ({},{}) has no cozytensors entry",
-                release.version, release.lane
-            ),
-        })?;
-        let header = match header_bytes {
-            Some(bytes) => {
-                if ObjectRef::of(bytes) != *header_ref {
+        let model = match (manifest.header(), release.evidence.as_ref()) {
+            (Some(header_ref), Some(evidence)) => {
+                let header = match header_bytes {
+                    Some(bytes) => {
+                        if ObjectRef::of(bytes) != *header_ref {
+                            return refuse(
+                                Code::OBJECT_ID_MISMATCH,
+                                "staged header bytes disagree with manifest",
+                            );
+                        }
+                        Header::parse(bytes)?
+                    }
+                    None => self.header(header_ref)?,
+                };
+                let topology_digest = header.topology_digest();
+                if evidence.classification_digest != topology_digest {
                     return refuse(
-                        Code::OBJECT_ID_MISMATCH,
-                        "staged header bytes disagree with manifest",
+                        Code::TOPOLOGY_MISMATCH,
+                        format!(
+                            "release classification {} differs from header topology {topology_digest}",
+                            evidence.classification_digest
+                        ),
                     );
                 }
-                Header::parse(bytes)?
-            }
-            None => self.header(header_ref)?,
-        };
-        let topology_digest = header.topology_digest();
-        if release.evidence.classification_digest != topology_digest {
-            return refuse(
-                Code::TOPOLOGY_MISMATCH,
-                format!(
-                    "release classification {} differs from header topology {topology_digest}",
-                    release.evidence.classification_digest
-                ),
-            );
-        }
-        for (path, required) in release.evidence.required_files()? {
-            let found = manifest
-                .entries()
-                .iter()
-                .find(|(candidate, _)| candidate == path);
-            match found {
-                Some((_, Entry::File(actual))) if actual == &required => {}
-                _ => {
-                    return refuse(
-                        Code::NOT_CONTAINED,
-                        format!(
-                            "release evidence {} must be the ordinary manifest file {path:?}",
-                            required.id()
-                        ),
-                    )
+                for (path, required) in evidence.required_files()? {
+                    let found = manifest
+                        .entries()
+                        .iter()
+                        .find(|(candidate, _)| candidate == path);
+                    match found {
+                        Some((_, Entry::File(actual))) if actual == &required => {}
+                        _ => {
+                            return refuse(
+                                Code::NOT_CONTAINED,
+                                format!(
+                                "release evidence {} must be the ordinary manifest file {path:?}",
+                                required.id()
+                            ),
+                            )
+                        }
+                    }
                 }
+                Some((header_ref, header, topology_digest))
             }
-        }
+            (None, None) if header_bytes.is_none() => None,
+            (Some(_), None) => {
+                return refuse(
+                    Code::MISSING_FIELD,
+                    "a CozyTensors release requires model evidence",
+                )
+            }
+            (None, Some(_)) => {
+                return refuse(
+                    Code::ATTACHMENT_CARDINALITY,
+                    "model evidence requires one CozyTensors manifest entry",
+                )
+            }
+            (None, None) => {
+                return refuse(
+                    Code::ATTACHMENT_CARDINALITY,
+                    "ordinary release cannot supply CozyTensors header bytes",
+                )
+            }
+        };
         let mut objects: BTreeMap<String, (&'static str, ObjectRef)> = BTreeMap::new();
-        insert_ref(&mut objects, "header", header_ref)?;
         for (_, entry) in manifest.entries() {
-            if let Entry::File(object) = entry {
-                insert_ref(&mut objects, "file", object)?;
-            }
-        }
-        for (_, config) in &header.configs {
             insert_ref(
                 &mut objects,
-                "config",
-                &ObjectRef {
-                    sha256: config.sha256.clone(),
-                    length: config.length,
+                if matches!(entry, Entry::CozyTensors(_)) {
+                    "header"
+                } else {
+                    "file"
                 },
+                entry.blob(),
             )?;
         }
-        for (_, asset) in &header.assets {
-            for object in &asset.segments {
-                insert_ref(&mut objects, "model_asset", object)?;
-            }
+        if let Some(metadata) = &release.metadata {
+            insert_ref(&mut objects, "metadata", metadata)?;
         }
-        for (_, _, tensor) in header.tensors() {
-            for (_, part) in &tensor.parts {
-                if let Body::Segments(segments) = &part.body {
-                    for object in segments {
-                        insert_ref(&mut objects, "part", object)?;
+        if let Some((_, header, _)) = &model {
+            for (_, config) in &header.configs {
+                insert_ref(
+                    &mut objects,
+                    "config",
+                    &ObjectRef {
+                        sha256: config.sha256.clone(),
+                        length: config.length,
+                    },
+                )?;
+            }
+            for (_, asset) in &header.assets {
+                for object in &asset.segments {
+                    insert_ref(&mut objects, "model_asset", object)?;
+                }
+            }
+            for (_, _, tensor) in header.tensors() {
+                for (_, part) in &tensor.parts {
+                    if let Body::Segments(segments) = &part.body {
+                        for object in segments {
+                            insert_ref(&mut objects, "part", object)?;
+                        }
                     }
                 }
             }
@@ -718,9 +759,14 @@ impl Census {
             });
         }
         projection.releases.push(ReleaseRow {
-            evidence_json: crate::canon::write(&release.evidence.to_value()),
-            header_length: header_ref.length,
-            header_sha256: header_ref.sha256.clone(),
+            evidence_json: release
+                .evidence
+                .as_ref()
+                .map(|evidence| crate::canon::write(&evidence.to_value())),
+            header_length: model.as_ref().map(|(reference, _, _)| reference.length),
+            header_sha256: model
+                .as_ref()
+                .map(|(reference, _, _)| reference.sha256.clone()),
             lane: release.lane.clone(),
             manifest_length: release.manifest.length,
             manifest_sha256: release.manifest.sha256.clone(),
@@ -728,9 +774,12 @@ impl Census {
             object_bytes,
             object_count: objects.len() as u64,
             org: repository.repo.org.clone(),
-            topology_digest,
+            topology_digest: model.as_ref().map(|(_, _, digest)| digest.clone()),
             version: release.version.clone(),
         });
+        let Some((_, header, _)) = model else {
+            return Ok(());
+        };
         for spec in &header.encodings {
             let encoding_id = spec.object_id();
             let aliases: Vec<String> = crate::registry::seeds()
@@ -1048,15 +1097,21 @@ pub fn repository_release_lines(root: &Path) -> Result<Vec<Vec<u8>>> {
     let mut lines = Vec::new();
     for (repository, _) in read_repositories(root)? {
         for release in repository.releases {
-            lines.push(crate::canon::write(&Value::obj(vec![
-                ("evidence", release.evidence.to_value()),
+            let mut fields = vec![
                 ("lane", Value::str(release.lane)),
                 ("manifest_length", Value::uint(release.manifest.length)),
                 ("manifest_sha256", Value::str(release.manifest.sha256)),
                 ("name", Value::str(repository.repo.name.clone())),
                 ("org", Value::str(repository.repo.org.clone())),
                 ("version", Value::str(release.version)),
-            ])));
+            ];
+            if let Some(evidence) = release.evidence {
+                fields.push(("evidence", evidence.to_value()));
+            }
+            if let Some(metadata) = release.metadata {
+                fields.push(("metadata", metadata.to_value()));
+            }
+            lines.push(crate::canon::write(&Value::obj(fields)));
         }
     }
     Ok(lines)
@@ -1142,8 +1197,9 @@ mod tests {
             repo: repo.clone(),
             lane: "cpu".into(),
             manifest: manifest.clone(),
+            metadata: None,
             version: "1.0.0".into(),
-            evidence: Box::new(evidence(&store, &manifest)),
+            evidence: Some(Box::new(evidence(&store, &manifest))),
         };
         store
             .apply_repository(None, &put, &Fault::default())
@@ -1206,8 +1262,9 @@ mod tests {
                     &Mutation::PutRelease {
                         repo,
                         lane: "cpu".into(),
-                        evidence: Box::new(evidence(&store, &manifest)),
+                        evidence: Some(Box::new(evidence(&store, &manifest))),
                         manifest,
+                        metadata: None,
                         version: version.into(),
                     },
                     &Fault::default(),
@@ -1241,13 +1298,14 @@ mod tests {
         let header_ref = manifest.header().unwrap();
         let header_bytes = fs::read(store.blob_path(&header_ref.sha256)).unwrap();
         let release = Release {
-            evidence: ReleaseEvidence {
+            evidence: Some(ReleaseEvidence {
                 classification_digest: Header::parse(&header_bytes).unwrap().topology_digest(),
                 ingest: None,
                 verification: None,
-            },
+            }),
             lane: "cpu".into(),
             manifest: manifest_ref.clone(),
+            metadata: None,
             version: "1.0.0".into(),
         };
         let repository = Repository::empty(repo)
@@ -1260,7 +1318,7 @@ mod tests {
             &repository_bytes,
             &release,
             &manifest_bytes,
-            &header_bytes,
+            Some(&header_bytes),
             inventory.clone(),
         )
         .unwrap();
@@ -1279,7 +1337,7 @@ mod tests {
             .unwrap()
             .obj;
         let evidence_release = Release {
-            evidence: ReleaseEvidence {
+            evidence: Some(ReleaseEvidence {
                 classification_digest: Header::parse(&header_bytes).unwrap().topology_digest(),
                 ingest: Some(IngestProvenance {
                     source_dialect: "cozytensors".into(),
@@ -1291,7 +1349,7 @@ mod tests {
                     implementation: format!("sha256:{}", "22".repeat(32)),
                     recipe,
                 }),
-            },
+            }),
             ..release.clone()
         };
         let evidence_repository = Repository::empty(repository.repo.clone())
@@ -1303,7 +1361,7 @@ mod tests {
                 &evidence_repository.canonical_bytes(),
                 &evidence_release,
                 &manifest_bytes,
-                &header_bytes,
+                Some(&header_bytes),
                 inventory_from_tree(&root).unwrap(),
             )
             .unwrap_err()
@@ -1319,7 +1377,7 @@ mod tests {
                 &repository_bytes,
                 &release,
                 &manifest_bytes,
-                &header_bytes,
+                Some(&header_bytes),
                 missing_header,
             )
             .unwrap_err()
@@ -1332,7 +1390,7 @@ mod tests {
                 &repository_bytes,
                 &release,
                 &manifest_bytes,
-                b"not the header",
+                Some(b"not the header"),
                 BTreeMap::new(),
             )
             .unwrap_err()
@@ -1354,8 +1412,9 @@ mod tests {
                     repo: repo.clone(),
                     lane: "cpu".into(),
                     manifest: manifest.clone(),
+                    metadata: None,
                     version: "1.0.0".into(),
-                    evidence: Box::new(evidence(&store, &manifest)),
+                    evidence: Some(Box::new(evidence(&store, &manifest))),
                 },
                 &Fault::default(),
             )
@@ -1376,8 +1435,9 @@ mod tests {
         let append = Mutation::PutRelease {
             repo: repo.clone(),
             lane: "cpu".into(),
-            evidence: Box::new(evidence(&store, &manifest)),
+            evidence: Some(Box::new(evidence(&store, &manifest))),
             manifest,
+            metadata: None,
             version: "2.0.0".into(),
         };
         assert_eq!(
@@ -1472,12 +1532,13 @@ mod tests {
                 &Mutation::PutRelease {
                     repo,
                     lane: "cpu".into(),
-                    evidence: Box::new(ReleaseEvidence {
+                    evidence: Some(Box::new(ReleaseEvidence {
                         classification_digest: header.topology_digest(),
                         ingest: None,
                         verification: None,
-                    }),
+                    })),
                     manifest: manifest_ref,
+                    metadata: None,
                     version: "1.0.0".into(),
                 },
                 &Fault::default(),

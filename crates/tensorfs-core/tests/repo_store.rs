@@ -200,6 +200,208 @@ fn manifest_build_is_the_single_ordinary_file_producer() {
     let _ = fs::remove_dir_all(root);
 }
 
+fn projection_snapshot(root: &Path) -> Vec<String> {
+    let db = rusqlite::Connection::open(root.join("tensorfs.sqlite")).unwrap();
+    let mut out = Vec::new();
+    for sql in [
+        "SELECT org||'|'||name||'|'||document_sha256 FROM tensorfs_repos ORDER BY 1",
+        "SELECT org||'|'||name||'|'||version||'|'||lane||'|'||manifest_sha256||'|'||manifest_length||'|'||hex(evidence_json)||'|'||header_sha256||'|'||header_length||'|'||topology_digest||'|'||object_count||'|'||object_bytes FROM tensorfs_releases ORDER BY 1",
+        "SELECT org||'|'||name||'|'||version||'|'||lane||'|'||sha256||'|'||length||'|'||object_kind FROM tensorfs_release_objects ORDER BY 1",
+    ] {
+        let mut statement = db.prepare(sql).unwrap();
+        out.extend(
+            statement
+                .query_map([], |row| row.get::<_, String>(0))
+                .unwrap()
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap(),
+        );
+    }
+    out
+}
+
+#[test]
+fn four_domain_ordinary_repositories_rebuild_after_projection_tables_are_emptied() {
+    let root = temporary("four-domain-rebuild");
+    for domain in ["repo_cas", "package_source", "dataset_cas", "user_media"] {
+        let store_root = root.join(domain);
+        let store = Store::init(&store_root).unwrap();
+        let payload = format!("{domain} durable bytes\n").into_bytes();
+        let blob = store
+            .put_stream(
+                &mut payload.as_slice(),
+                Some(&ObjectRef::of(&payload)),
+                &Fault::default(),
+            )
+            .unwrap()
+            .obj;
+        let manifest = Manifest::from_files(vec![("content.bin".into(), blob)]).unwrap();
+        let manifest_ref = store.put_manifest(&manifest).unwrap().obj;
+        let metadata = if domain == "package_source" {
+            let bytes = b"{\"format\":\"cozy.package.release/1\"}";
+            Some(
+                store
+                    .put_stream(
+                        &mut bytes.as_slice(),
+                        Some(&ObjectRef::of(bytes)),
+                        &Fault::default(),
+                    )
+                    .unwrap()
+                    .obj,
+            )
+        } else {
+            None
+        };
+        let repo = tensorfs_core::repository::RepositoryName::new("recovery", domain).unwrap();
+        store
+            .apply_repository(
+                None,
+                &Mutation::PutRelease {
+                    repo: repo.clone(),
+                    lane: "main".into(),
+                    manifest: manifest_ref,
+                    metadata: metadata.clone(),
+                    version: "1.0.0".into(),
+                    evidence: None,
+                },
+                &Fault::default(),
+            )
+            .unwrap();
+        let repository_bytes = fs::read(store.repository_path(&repo)).unwrap();
+        assert!(
+            !String::from_utf8_lossy(&repository_bytes).contains("evidence"),
+            "ordinary repositories must not fabricate model evidence"
+        );
+        let before = projection_snapshot(&store_root);
+        assert_eq!(
+            before.len(),
+            if metadata.is_some() { 4 } else { 3 },
+            "one repo, release, and every reached blob"
+        );
+
+        let db = rusqlite::Connection::open(store_root.join("tensorfs.sqlite")).unwrap();
+        db.execute("DELETE FROM tensorfs_repos", []).unwrap();
+        drop(db);
+        assert!(projection_snapshot(&store_root).is_empty());
+
+        let rows = store_root.join("rebuild.jsonl");
+        let result = Command::new(env!("CARGO_BIN_EXE_tfs"))
+            .args([
+                "store",
+                "rebuild",
+                store_root.to_str().unwrap(),
+                "--rows",
+                rows.to_str().unwrap(),
+                "--sqlite",
+                store_root.join("tensorfs.sqlite").to_str().unwrap(),
+            ])
+            .output()
+            .unwrap();
+        assert!(
+            result.status.success(),
+            "{domain}: {}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+        assert_eq!(projection_snapshot(&store_root), before, "{domain}");
+        let rows = fs::read_to_string(rows).unwrap();
+        assert!(rows.contains("\"kind\":\"repo\""));
+        assert!(rows.contains("\"kind\":\"release\""));
+        assert!(rows.contains("\"kind\":\"release_object\""));
+    }
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn ordinary_repo_apply_needs_no_model_header_or_evidence() {
+    let root = temporary("ordinary-repo-apply");
+    fs::create_dir_all(&root).unwrap();
+    let content = ObjectRef::of(b"package source");
+    let metadata = ObjectRef::of(b"package release");
+    let manifest = Manifest::from_files(vec![("src/package.py".into(), content.clone())]).unwrap();
+    let manifest_bytes = manifest.canonical_bytes();
+    let manifest_ref = ObjectRef::of(&manifest_bytes);
+    let manifest_path = root.join("manifest.json");
+    fs::write(&manifest_path, &manifest_bytes).unwrap();
+    let inventory = root.join("blobs.jsonl");
+    let mut inventory_rows = [content.clone(), metadata.clone()]
+        .into_iter()
+        .map(|object| {
+            tensorfs_core::canon::write(&Value::obj(vec![
+                (
+                    "key",
+                    Value::str(tensorfs_core::storage::blob_key(&object.sha256).unwrap()),
+                ),
+                ("length", Value::uint(object.length)),
+            ]))
+        })
+        .collect::<Vec<_>>();
+    inventory_rows.sort();
+    fs::write(
+        &inventory,
+        inventory_rows
+            .into_iter()
+            .flat_map(|mut row| {
+                row.push(b'\n');
+                row
+            })
+            .collect::<Vec<_>>(),
+    )
+    .unwrap();
+    let mutation = root.join("mutation.json");
+    fs::write(
+        &mutation,
+        tensorfs_core::canon::write(&Value::obj(vec![
+            ("action", Value::str("put_release")),
+            ("lane", Value::str("source")),
+            ("manifest", manifest_ref.to_value()),
+            ("metadata", metadata.to_value()),
+            (
+                "repo",
+                Value::obj(vec![
+                    ("name", Value::str("marco-polo")),
+                    ("org", Value::str("cozy")),
+                ]),
+            ),
+            ("version", Value::str("1.0.0")),
+        ])),
+    )
+    .unwrap();
+    let replacement = root.join("repository.json");
+    let rows = root.join("rows.jsonl");
+    let result = Command::new(env!("CARGO_BIN_EXE_tfs"))
+        .args([
+            "repo",
+            "apply",
+            "-",
+            mutation.to_str().unwrap(),
+            "--manifest",
+            manifest_path.to_str().unwrap(),
+            "--inventory",
+            inventory.to_str().unwrap(),
+            "--out",
+            replacement.to_str().unwrap(),
+            "--rows",
+            rows.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        result.status.success(),
+        "{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    let repository = Repository::parse(&fs::read(replacement).unwrap()).unwrap();
+    assert_eq!(repository.releases.len(), 1);
+    assert!(repository.releases[0].evidence.is_none());
+    assert_eq!(repository.releases[0].metadata.as_ref(), Some(&metadata));
+    let rows = fs::read_to_string(rows).unwrap();
+    assert!(rows.contains("\"object_kind\":\"file\""));
+    assert!(rows.contains("\"object_kind\":\"metadata\""));
+    assert!(!rows.contains("header_sha256"));
+    assert!(!rows.contains("topology_digest"));
+    let _ = fs::remove_dir_all(root);
+}
+
 #[test]
 fn crash_after_repo_replace_rebuilds_sql_from_files() {
     let root = temporary("crash-rebuild");
@@ -436,10 +638,12 @@ fn repo_list_evidence_round_trips_as_an_opaque_raw_message() {
     let repository_bytes = fs::read(store.repository_path(first_mutation.repo())).unwrap();
     let repository = Repository::parse(&repository_bytes).unwrap();
     assert_eq!(repository.releases.len(), 2);
-    assert!(repository
-        .releases
-        .iter()
-        .all(|release| release.evidence.canonical_bytes() == raw_message));
+    assert!(repository.releases.iter().all(|release| release
+        .evidence
+        .as_ref()
+        .unwrap()
+        .canonical_bytes()
+        == raw_message));
 
     let before_red = repository_bytes;
     let current_red = root.join("current-red.json");

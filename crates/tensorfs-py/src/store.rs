@@ -1023,9 +1023,10 @@ impl PyOperation {
             version: version.to_string(),
             lane: lane.to_string(),
             manifest: obj_ref(py, manifest_id, manifest_length)?,
-            evidence: Box::new(
+            metadata: None,
+            evidence: Some(Box::new(
                 tensorfs_core::repository::ReleaseEvidence::parse(evidence).or_refuse(py)?,
-            ),
+            )),
         };
         let repository = py
             .allow_threads(|| {

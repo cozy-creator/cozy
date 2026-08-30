@@ -1,6 +1,6 @@
 # TensorFS
 
-TensorFS stores model repositories as one graph:
+TensorFS stores every domain repository as the same graph:
 
 ```text
 repos/<org>/<name>.json
@@ -11,8 +11,11 @@ checkouts/<manifest-sha256>/...    # optional disposable local view
 ```
 
 Repository files are authoritative mutable release indexes. Manifests are immutable virtual file
-trees. Blobs are immutable content bytes. SQLite locally and PostgreSQL in Tensorhub are query and
-coordination projections that rebuild from repository files; SQL never decides GC liveness.
+trees. Blobs are immutable content bytes. The same engine is used independently for model,
+package-source, dataset, and user-file stores; the physical domain/bucket supplies access and
+erasure isolation, not a different catalog format. SQLite locally and PostgreSQL in Tensorhub are
+query and coordination projections that rebuild from repository files; SQL never decides GC
+liveness.
 
 TensorFS has exactly three stored schemas:
 
@@ -87,9 +90,15 @@ Publication order is blobs, manifest, repository compare-and-swap, then SQL proj
 before repository replacement leaves harmless unreachable content. A crash afterward leaves
 storage ahead of SQL; `store rebuild` catches SQL up. The database never leads the repository file.
 
-Each `repo list` release row carries the repository's exact canonical `evidence` object. Clients
-may preserve those bytes opaquely and base64-wrap them for a later `put_release`; TensorFS remains
-the only parser and canonical writer.
+Each model row emitted by `repo list` carries the repository's exact canonical `evidence` object.
+Clients may preserve those bytes opaquely and base64-wrap them for a later `put_release`; TensorFS
+remains the only parser and canonical writer. Ordinary release rows omit evidence.
+
+Evidence is present only for a Manifest containing one typed CozyTensors header. Ordinary releases
+do not fabricate model classification. A release may carry one optional `metadata` blob ref;
+package repositories use it for their exact PackageRelease while datasets and user files may omit
+it. Rebuild always recovers the repository, metadata, Manifest, and complete reached blob set;
+model headers additionally recover topology, component, encoding, and config projections.
 
 `repo apply` derives full release projection rows from the exact manifest, header, and complete
 blob inventory before the caller may perform its repository CAS. Missing or length-mismatched bytes
