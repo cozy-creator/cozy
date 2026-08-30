@@ -152,6 +152,13 @@ func messageFor(name string) proto.Message {
 // spell every double the same way or two canonical documents describing the same thing
 // digest differently, and the whole identity plane silently forks at the boundary.
 // `testdata/canonical/es6-numbers.txt` is Runtime's own oracle, pinned by digest.
+func TestPlacementSetNestedSpecHardcut(t *testing.T) {
+	_, err := canonical.Read([]byte(`{"format":"cozy.worker.v1.PlacementSet/2","placements":[{"spec":{}}]}`), &pb.PlacementSet{})
+	if canonical.Code(err) != "placement_nested_spec_retired" {
+		t.Fatalf("nested PlacementSet spec refusal = %v", err)
+	}
+}
+
 func TestNumberProfile(t *testing.T) {
 	corpus, err := os.ReadFile("testdata/canonical/es6-numbers.txt")
 	must(t, err)

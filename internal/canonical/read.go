@@ -116,6 +116,9 @@ func semantics(name string, d Doc) error {
 			if !ok {
 				return refuse("placement_shape", "a placement is not an object")
 			}
+			if _, legacy := placement["spec"]; legacy {
+				return refuse("placement_nested_spec_retired", "PlacementSet/2 is flat")
+			}
 			if err := placementModelObjectSet(Doc(placement)); err != nil {
 				return err
 			}

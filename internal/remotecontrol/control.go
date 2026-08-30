@@ -415,7 +415,7 @@ func Decode(control hub.ExactControlDocument, packageRef string) (Facts, *exit.E
 		return facts, invalid("placement id %q does not equal acquisition attempt %q",
 			placement.Str("placement_id"), s.AcquisitionAttemptID)
 	}
-	placementSpec := placement.Sub("spec")
+	placementSpec := placement
 	if placementSpec.Str("package_descriptor_digest") != s.PackageDescriptor.Digest ||
 		placementSpec.Str("environment_spec_digest") != s.EnvironmentSpec.Digest ||
 		placementSpec.Str("installed_environment_receipt_digest") != s.InstalledEnvironmentReceipt.Digest {
