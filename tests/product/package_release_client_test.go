@@ -155,10 +155,16 @@ func TestPackagePublishPendingWireFlowBoundsUploads(t *testing.T) {
 			finalized.Add(1)
 			_ = json.NewEncoder(w).Encode(map[string]any{
 				"compatible_profiles": []string{"cpu-py311-torch213"},
-				"package_executions": []map[string]any{{
-					"digest": "sha256:" + strings.Repeat("4", 64), "function": "generate",
-					"profile": "cpu-py311-torch213", "state": "qualified",
-				}},
+				"package_executions": []map[string]any{
+					{
+						"digest": "sha256:" + strings.Repeat("4", 64), "function": "generate",
+						"profile": "cpu-py311-torch213", "state": "qualified",
+					},
+					{
+						"digest": "sha256:" + strings.Repeat("5", 64), "function": "inspect",
+						"profile": "cpu-py311-torch213", "state": "qualified",
+					},
+				},
 				"profiles": []map[string]any{{
 					"base_realization_kind": "base-worker-image", "candidate_id": "pqc-proof",
 					"profile": "cpu-py311-torch213", "state": "qualified",
@@ -174,7 +180,9 @@ func TestPackagePublishPendingWireFlowBoundsUploads(t *testing.T) {
 	code, out := runCozyDir(t, t.TempDir(), project,
 		[]string{"TENSORHUB_URL=" + server.URL, "TENSORHUB_TOKEN=proof-token"}, "package", "publish")
 	if code != 0 || !strings.Contains(out, "eligible_worker_profiles:") ||
-		!strings.Contains(out, "generate@cpu-py311-torch213=qualified") ||
+		!strings.Contains(out, "- cpu-py311-torch213") ||
+		strings.Count(out, "cpu-py311-torch213") != 1 ||
+		strings.Contains(out, "generate@") || strings.Contains(out, "sha256:") ||
 		!strings.Contains(out, "Building package wheel and local dependencies...") ||
 		!strings.Contains(out, "Registering 52 source files and 0 dependency wheels...") ||
 		!strings.Contains(out, "Uploading files: 0/53") ||
