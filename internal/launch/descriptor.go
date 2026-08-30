@@ -522,7 +522,7 @@ func assetPaths(s Struct, prefix string) []string {
 }
 
 // typeOf classifies one rendered type: "scalar" (with the scalar's name in `scalar`),
-// "asset", "list", or "struct" (with the nested struct).
+// "literal", "asset", "list", or "struct" (with the nested struct).
 func typeOf(raw json.RawMessage) (kind string, nested Struct) {
 	if len(raw) == 0 {
 		return "unknown", Struct{}
@@ -537,6 +537,9 @@ func typeOf(raw json.RawMessage) (kind string, nested Struct) {
 	}
 	if _, ok := object["asset"]; ok {
 		return "asset", Struct{}
+	}
+	if _, ok := object["literal"]; ok {
+		return "literal", Struct{}
 	}
 	// A job's typed INPUT tree (cr-009). It is not an asset and not a scalar struct: its
 	// wire value is a REF, and the grant is what turns that ref into a readable path.

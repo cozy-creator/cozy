@@ -18,12 +18,31 @@ import (
 	"time"
 
 	"github.com/cozy-creator/cozy/internal/exit"
+	"github.com/cozy-creator/cozy/internal/launch"
 	"github.com/cozy-creator/cozy/internal/packagepublish"
 	"github.com/cozy-creator/cozy/internal/records"
 	"github.com/cozy-creator/cozy/internal/wheel"
 )
 
 const weightlessRef = "cozy/weightless"
+
+func TestLiteralPayloadUsesOrdinaryScalarSyntax(t *testing.T) {
+	entrypoint := &launch.Entrypoint{
+		Name: "marco",
+		Request: launch.Struct{Fields: []launch.Field{{
+			Name: "message", Type: json.RawMessage(`{"literal":["marco"]}`), Wire: "required",
+		}}},
+	}
+	for _, terms := range [][]string{{"message=marco"}, {"marco"}} {
+		payload, problem := launch.ParsePayload(entrypoint, terms, "")
+		if problem != nil || string(payload) != `{"message":"marco"}` {
+			t.Fatalf("ParsePayload(%q) = %s, %v", terms, payload, problem)
+		}
+	}
+	if _, problem := launch.ParsePayload(entrypoint, []string{"message=polo"}, ""); problem == nil || !strings.Contains(problem.Message, `must be one of: "marco"`) {
+		t.Fatalf("wrong literal was not explained: %v", problem)
+	}
+}
 
 func TestPackageHasOneActiveVersion(t *testing.T) {
 	store, problem := records.Open(filepath.Join(t.TempDir(), "records.db"))
