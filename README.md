@@ -63,6 +63,12 @@ scripts/snapshot-runs.sh all        # the whole plane plus its red arms
 and their vector sets) live at `closure/<digest>.json`, where the path terminal IS the
 digest; the header attachment is TYPED and must be projected at exactly one path.
 
+Target tfs-033 simplifies this vocabulary and layout: the public type/format is
+`Manifest`/`tensorfs.manifest/1`, its exact JSON
+bytes live under `manifests/<hash>.json`, and that hash is the snapshot id. The file map carries one
+typed `model.cozytensors` header entry rather than repeating it in an attachment field. All content
+bytes reached by the manifest live under `blobs/<hash>`.
+
 ## reads and projection (tfs-005)
 
 `read_into(range, caller_buffer, lease)` is the one byte door. The caller owns every buffer;
@@ -83,8 +89,22 @@ scripts/read-runs.sh arms|real|bench
 
 ## roots, holds and GC (tfs-006)
 
-`meta/state.json` under `meta/LOCK` is the SOLE root authority; `refs/` is a rendering with
-none. A hold is reapable exactly when its owner is PROVABLY dead — the kernel drops the
+As implemented today, `meta/state.json` under `meta/LOCK` is the sole local root authority;
+`refs/` is a rendering with none. Target design tfs-033 deletes that model. Local filesystems and R2
+share the same three authoritative namespaces: `repos/<org>/<name>.json`, immutable
+`manifests/<hash>.json`, and immutable `blobs/<hash>`. One repo JSON maps `(version,lane)` releases
+directly to manifests; manifests map virtual filenames to blobs. The manifest hash is the snapshot
+id, and a snapshot is not another stored document. Local `snapshots/<manifest>/` is an optional
+disposable symlink view. An in-process `tensorfs.sqlite` mirrors repo/release metadata for lookup;
+Tensorhub uses the same logical projection in PostgreSQL. Either database rebuilds from repo files
+and never authorizes GC.
+
+GC is only `repos -> manifests -> blobs`: enumerate every repo file, mark its release manifests,
+mark every transitively referenced blob, then collect the unmarked remainder under an exclusive
+maintenance operation. Missing/corrupt data or an incomplete listing makes the pass report-only.
+The current root/hold commands below describe the implementation being replaced, not the target API.
+
+A hold is reapable exactly when its owner is PROVABLY dead — the kernel drops the
 owner's lock on SIGKILL, so there is no wall-clock grace. `exclusive` is a promise: deleting
 a root reclaims exactly those bytes.
 
