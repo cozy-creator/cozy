@@ -48,11 +48,11 @@ type PackageInstallPlan struct {
 // PackageInstallTarget carries only measured local compatibility facts. Tensorhub
 // remains the authority that ranks qualified profiles and returns one exact selection.
 type PackageInstallTarget struct {
-	Accelerator       string
-	OS                string
-	Architecture      string
-	DriverCUDA        string
-	ComputeCapability string
+	Accelerator       string `json:"accelerator"`
+	OS                string `json:"os"`
+	Arch              string `json:"arch"`
+	DriverCUDA        string `json:"driver_cuda"`
+	ComputeCapability string `json:"compute_capability"`
 }
 
 func packageReleasePath(ref Ref, release string) string {
@@ -80,23 +80,18 @@ func (c *Client) PackageInstallPlan(ctx context.Context, ref Ref, release string
 	target PackageInstallTarget,
 ) (PackageInstallPlan, *exit.Error) {
 	var out PackageInstallPlan
-	if target.OS == "" || target.Architecture == "" ||
+	if target.OS == "" || target.Arch == "" ||
 		(target.Accelerator != "cpu" && target.Accelerator != "nvidia") ||
 		target.Accelerator == "cpu" && (target.DriverCUDA != "" || target.ComputeCapability != "") ||
 		target.Accelerator == "nvidia" && (target.DriverCUDA == "" || target.ComputeCapability == "") {
 		return out, exit.Internalf("package install target is incomplete or contradictory")
 	}
-	query := url.Values{
-		"accelerator": {target.Accelerator},
-		"os":          {target.OS},
-		"arch":        {target.Architecture},
-	}
-	if target.Accelerator == "nvidia" {
-		query.Set("driver_cuda", target.DriverCUDA)
-		query.Set("compute_capability", target.ComputeCapability)
-	}
-	e := c.do(ctx, call{method: http.MethodGet,
-		path: packageReleasePath(ref, release) + "/install?" + query.Encode(), strict: true,
+	body := struct {
+		Capability      PackageInstallTarget `json:"capability"`
+		ModelSelections []ModelSelection     `json:"model_selections"`
+	}{Capability: target, ModelSelections: []ModelSelection{}}
+	e := c.do(ctx, call{method: http.MethodPost,
+		path: packageReleasePath(ref, release) + "/selection", body: body, strict: true,
 		responseBytes: 16 << 20}, &out)
 	return out, e
 }

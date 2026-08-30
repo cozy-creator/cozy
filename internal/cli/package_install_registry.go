@@ -103,7 +103,7 @@ func handleRegistryInstall(ctx *Context) *exit.Error {
 
 func localPackageInstallTarget(ctx *Context) (hub.PackageInstallTarget, *exit.Error) {
 	target := hub.PackageInstallTarget{
-		Accelerator: "cpu", OS: runtime.GOOS, Architecture: packageInstallArchitecture(runtime.GOARCH),
+		Accelerator: "cpu", OS: runtime.GOOS, Arch: packageInstallArchitecture(runtime.GOARCH),
 	}
 	inventory := hostgpu.Probe(ctx.Cfg)
 	if len(inventory.GPUs) == 0 {
@@ -130,7 +130,7 @@ func localPackageInstallTarget(ctx *Context) (hub.PackageInstallTarget, *exit.Er
 func packageInstallArchitecture(arch string) string {
 	switch arch {
 	case "amd64":
-		return "x86_64"
+		return "x86"
 	case "arm64":
 		return "aarch64"
 	default:
