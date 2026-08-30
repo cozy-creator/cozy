@@ -1,5 +1,0 @@
-owner: /root/implement_creator_email_auth
-purpose: implement proto-013 rental identity and direct worker artifact delegation
-branch: codex/rental-delegation
-base: 8718549e5e4d47278ab75fb429a8df14fa24303d
-started: 2026-08-29
