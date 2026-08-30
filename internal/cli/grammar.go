@@ -18,8 +18,14 @@ type CLI struct {
 }
 
 type AuthCmd struct {
-	Login  AuthLoginCmd `cmd:"" help:"Register or authenticate this machine by email."`
-	Status AuthStatus   `cmd:"" help:"Show who this machine is logged in as."`
+	Login   AuthLoginCmd `cmd:"" help:"Register or authenticate this machine by email."`
+	Current AuthCurrent  `cmd:"" default:"1" hidden:""`
+}
+
+type AuthCurrent struct{}
+
+func (c *AuthCurrent) Run(r *Runtime) error {
+	return r.call(handleAuthStatus, nil, nil, nil, false)
 }
 
 type AuthLoginCmd struct {
@@ -28,12 +34,6 @@ type AuthLoginCmd struct {
 
 func (c *AuthLoginCmd) Run(r *Runtime) error {
 	return r.call(handleAuthLogin, []string{c.Email}, nil, nil, false)
-}
-
-type AuthStatus struct{}
-
-func (c *AuthStatus) Run(r *Runtime) error {
-	return r.call(handleAuthStatus, nil, nil, nil, false)
 }
 
 type PackageCmd struct {

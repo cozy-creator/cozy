@@ -239,14 +239,15 @@ Register or recover this Creator installation directly from the CLI:
 
 ```sh
 cozy auth login person@example.com
-cozy auth status
+cozy auth
 ```
 
 Tensorhub emails a one-time code. After it is entered, Cozy stores only this installation's
 Ed25519 machine key under its mode-0700 home and mode-0600 credential file. Short AuthKit access
 tokens stay in memory. Later authenticated commands sign a one-time challenge automatically; there
-is no refresh token or repeated login command. `cozy auth status` verifies the stored key and
-shows the account email, or reports `not logged in` when this installation has no usable key.
+is no refresh token or repeated login command. `cozy auth` verifies the stored key, shows the
+account email and available auth commands, or reports `not logged in` when this installation has
+no usable key.
 
 ## Output and automation
 
