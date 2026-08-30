@@ -23,6 +23,7 @@ pub struct Checkout {
     pub dirs: usize,
     pub links: usize,
     pub copies: usize,
+    pub cozytensors_headers: usize,
     pub bytes: u64,
 }
 
@@ -44,8 +45,10 @@ fn relative(from_dir: &Path, to: &Path) -> PathBuf {
     path
 }
 
-/// Create a normal-looking tree. Ordinary files are relative symlinks where possible;
-/// CozyTensors is omitted because its header is not a conventional weight file.
+/// Create a faithful manifest tree. Ordinary files and the one typed CozyTensors header
+/// are relative symlinks where possible; `force_copy` writes small read-only copies.
+/// Tensor payload segments are transitive CAS objects, not manifest entries, and never
+/// appear in this disposable view.
 pub fn checkout(
     store: &Store,
     manifest: &Manifest,
@@ -59,9 +62,12 @@ pub fn checkout(
     let mut result = Checkout::default();
     let mut directories = HashSet::new();
     for (virtual_path, entry) in manifest.entries() {
-        let blob = match entry {
-            Entry::CozyTensors(_) => continue,
-            Entry::File(blob) => blob,
+        let (blob, cozytensors) = match entry {
+            Entry::CozyTensors(blob) => {
+                crate::checkpoint::load_header(store, blob)?;
+                (blob, true)
+            }
+            Entry::File(blob) => (blob, false),
         };
         let source = store.blob_path(&blob.sha256);
         let metadata = fs::metadata(&source).map_err(|error| {
@@ -110,6 +116,9 @@ pub fn checkout(
                 .map_err(|error| io("chmod checkout copy", error))?;
             result.copies += 1;
         }
+        if cozytensors {
+            result.cozytensors_headers += 1;
+        }
         result.bytes = result
             .bytes
             .checked_add(blob.length)
@@ -119,6 +128,26 @@ pub fn checkout(
             })?;
     }
     Ok(result)
+}
+
+/// Resolve the one kind `materialize` may copy. A typed CozyTensors entry is visible in
+/// checkout, but remains a header rather than an ordinary-file materialization subject.
+pub fn ordinary_file<'a>(manifest: &'a Manifest, path: &str) -> Result<&'a ObjectRef> {
+    match manifest
+        .entries()
+        .iter()
+        .find(|(candidate, _)| candidate == path)
+    {
+        Some((_, Entry::File(blob))) => Ok(blob),
+        Some((_, Entry::CozyTensors(_))) => refuse(
+            Code::PROJECTION_WEIGHT_PATH,
+            "materialize selects ordinary files only",
+        ),
+        None => refuse(
+            Code::NOT_CONTAINED,
+            format!("manifest has no path {path:?}"),
+        ),
+    }
 }
 
 /// Write an independent physical copy of one selected ordinary manifest entry.
@@ -176,8 +205,199 @@ pub fn render(bytes: &[u8], max: usize) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::dtype::Dtype;
+    use crate::header::{Closure, Header, Part, Tensor};
+    use crate::manifest::Draft;
     use crate::store::{Fault, Store};
+    use std::os::unix::fs::PermissionsExt;
     use std::sync::{Arc, Barrier};
+
+    fn temporary(name: &str) -> PathBuf {
+        std::env::temp_dir().join(format!(
+            "tensorfs-project-{name}-{}-{}",
+            std::process::id(),
+            crate::meta::now_nanos_unique()
+        ))
+    }
+
+    fn put(store: &Store, bytes: &[u8]) -> ObjectRef {
+        let mut source = bytes;
+        store
+            .put_stream(&mut source, Some(&ObjectRef::of(bytes)), &Fault::default())
+            .unwrap()
+            .obj
+    }
+
+    struct ProjectionFixture {
+        root: PathBuf,
+        store: Store,
+        manifest: Manifest,
+        header: ObjectRef,
+        ordinary: ObjectRef,
+        payload: ObjectRef,
+        header_bytes: Vec<u8>,
+        ordinary_bytes: Vec<u8>,
+    }
+
+    fn projection_fixture(name: &str) -> ProjectionFixture {
+        let root = temporary(name);
+        let store = Store::init(&root).unwrap();
+        let spec = crate::registry::seeds()
+            .into_iter()
+            .find(|seed| seed.alias == "plain/1")
+            .unwrap()
+            .spec;
+        let payload_bytes = vec![7u8; 512];
+        let payload = put(&store, &payload_bytes);
+        let tensor = Tensor {
+            dtype: Dtype::F32,
+            shape: vec![128],
+            encoding: spec.object_id(),
+            parts: vec![(
+                "value".into(),
+                Part::plan(Dtype::F32, vec![128], &payload_bytes),
+            )],
+        };
+        assert_eq!(tensor.parts[0].1.segments(), std::slice::from_ref(&payload));
+        let header = Header {
+            configs: Vec::new(),
+            assets: Vec::new(),
+            encodings: vec![spec],
+            components: vec![("model".into(), vec![("weight".into(), tensor)])],
+        };
+        header.validate(&Closure::default()).unwrap();
+        let header_bytes = header.canonical_bytes().unwrap();
+        let header = put(&store, &header_bytes);
+        let ordinary_bytes = b"ordinary file\n".to_vec();
+        let ordinary = put(&store, &ordinary_bytes);
+        let manifest = Draft {
+            entries: vec![
+                ("config.txt".into(), Entry::File(ordinary.clone())),
+                (
+                    "model.cozytensors".into(),
+                    Entry::CozyTensors(header.clone()),
+                ),
+            ],
+        }
+        .seal()
+        .unwrap();
+        ProjectionFixture {
+            root,
+            store,
+            manifest,
+            header,
+            ordinary,
+            payload,
+            header_bytes,
+            ordinary_bytes,
+        }
+    }
+
+    #[test]
+    fn checkout_links_header_and_ordinary_file_without_payload_duplication() {
+        let fixture = projection_fixture("header-link");
+        let destination = fixture.root.join("checkout");
+        let result = checkout(&fixture.store, &fixture.manifest, &destination, false).unwrap();
+        assert_eq!(result.cozytensors_headers, 1);
+        assert_eq!(result.links, 2);
+        assert_eq!(result.copies, 0);
+        assert_eq!(
+            result.bytes,
+            fixture.header.length + fixture.ordinary.length
+        );
+        for (path, bytes) in [
+            ("model.cozytensors", fixture.header_bytes.as_slice()),
+            ("config.txt", fixture.ordinary_bytes.as_slice()),
+        ] {
+            let projected = destination.join(path);
+            assert!(fs::symlink_metadata(&projected)
+                .unwrap()
+                .file_type()
+                .is_symlink());
+            assert!(fs::read_link(&projected).unwrap().is_relative());
+            assert_eq!(fs::read(projected).unwrap(), bytes);
+        }
+        assert!(fixture.store.blob_path(&fixture.payload.sha256).is_file());
+        assert_eq!(fs::read_dir(&destination).unwrap().count(), 2);
+        fs::remove_dir_all(fixture.root).unwrap();
+    }
+
+    #[test]
+    fn checkout_no_symlink_copies_small_header_and_ordinary_file_read_only() {
+        let fixture = projection_fixture("header-copy");
+        let destination = fixture.root.join("checkout");
+        let result = checkout(&fixture.store, &fixture.manifest, &destination, true).unwrap();
+        assert_eq!(result.cozytensors_headers, 1);
+        assert_eq!(result.links, 0);
+        assert_eq!(result.copies, 2);
+        for (path, bytes) in [
+            ("model.cozytensors", fixture.header_bytes.as_slice()),
+            ("config.txt", fixture.ordinary_bytes.as_slice()),
+        ] {
+            let projected = destination.join(path);
+            let metadata = fs::symlink_metadata(&projected).unwrap();
+            assert!(metadata.file_type().is_file());
+            assert_eq!(metadata.permissions().mode() & 0o777, 0o444);
+            assert_eq!(fs::read(projected).unwrap(), bytes);
+        }
+        assert_eq!(fs::read_dir(&destination).unwrap().count(), 2);
+        fs::remove_dir_all(fixture.root).unwrap();
+    }
+
+    #[test]
+    fn checkout_refuses_missing_cozytensors_header() {
+        let root = temporary("header-missing");
+        let store = Store::init(&root).unwrap();
+        let header = ObjectRef::of(b"absent header");
+        let manifest = Draft {
+            entries: vec![("model.cozytensors".into(), Entry::CozyTensors(header))],
+        }
+        .seal()
+        .unwrap();
+        let error = checkout(&store, &manifest, &root.join("checkout"), false).unwrap_err();
+        assert_eq!(error.code, Code::OBJECT_ABSENT);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn checkout_refuses_wrong_length_cozytensors_header() {
+        let fixture = projection_fixture("header-wrong-length");
+        let manifest = Draft {
+            entries: vec![(
+                "model.cozytensors".into(),
+                Entry::CozyTensors(ObjectRef {
+                    sha256: fixture.header.sha256.clone(),
+                    length: fixture.header.length + 1,
+                }),
+            )],
+        }
+        .seal()
+        .unwrap();
+        let error =
+            checkout(&fixture.store, &manifest, &fixture.root.join("bad"), false).unwrap_err();
+        assert_eq!(error.code, Code::LENGTH_MISMATCH);
+        fs::remove_dir_all(fixture.root).unwrap();
+    }
+
+    #[test]
+    fn materialize_selection_keeps_cozytensors_typed_and_ordinary_files_unchanged() {
+        let fixture = projection_fixture("materialize-kind");
+        assert_eq!(
+            ordinary_file(&fixture.manifest, "config.txt").unwrap(),
+            &fixture.ordinary
+        );
+        assert_eq!(
+            ordinary_file(&fixture.manifest, "model.cozytensors")
+                .unwrap_err()
+                .code,
+            Code::PROJECTION_WEIGHT_PATH
+        );
+        assert_eq!(
+            ordinary_file(&fixture.manifest, "absent").unwrap_err().code,
+            Code::NOT_CONTAINED
+        );
+        fs::remove_dir_all(fixture.root).unwrap();
+    }
 
     #[test]
     fn concurrent_materializations_do_not_share_a_temp_name() {

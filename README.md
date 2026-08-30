@@ -114,9 +114,16 @@ tfs checkout <store> <manifest> <destination>
 tfs materialize <store> <manifest> <path> <destination>
 ```
 
-A checkout is a disposable relative-symlink view of ordinary manifest files. CozyTensors entries
-are omitted because a header is not a conventional weight file. Materialization writes one
-independent ordinary file atomically.
+A checkout is a faithful disposable relative-symlink view of every manifest entry, including the
+validated typed CozyTensors header. `--no-symlink` writes small read-only copies instead. Tensor
+payload segments remain CAS-only and are never duplicated into the checkout. Materialization
+writes one independent ordinary file atomically and continues to refuse CozyTensors entries.
+
+Inspect a checked-out header with `tfs cbor check <checkout>/model.cozytensors` (or decode its
+diagnostic projection with `tfs cbor decode <path>`). Python readers use
+`tensorfs.parse_header(path.read_bytes())`. The file is canonical `cozytensors/1` CBOR containing
+CAS ObjectRefs; it is not a self-contained weights file, so tensor payload reads still require the
+original TensorFS store.
 
 ## GC and recovery
 

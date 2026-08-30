@@ -372,7 +372,18 @@ pub fn cmd_checkout(root: &Path, hex: &str, dest: &Path, f: &Flags) -> ExitCode 
         "checkout:   {} dirs, {} symlinks, {} copies, {} B",
         p.dirs, p.links, p.copies, p.bytes
     );
-    println!("cozytensors: omitted (header blobs are not conventional weight files)");
+    println!(
+        "cozytensors: {} validated header{}; payload segments remain CAS-only",
+        p.cozytensors_headers,
+        if p.cozytensors_headers == 1 { "" } else { "s" }
+    );
+    if let Some((path, Entry::CozyTensors(_))) = m
+        .entries()
+        .iter()
+        .find(|(_, entry)| matches!(entry, Entry::CozyTensors(_)))
+    {
+        println!("inspect:    tfs cbor check {}", dest.join(path).display());
+    }
     ExitCode::SUCCESS
 }
 
@@ -390,17 +401,7 @@ pub fn cmd_materialize(root: &Path, manifest: &str, path: &str, dest: &Path) -> 
         sha256: hex.to_string(),
         length
     }));
-    let blob = match m.entries().iter().find(|(candidate, _)| candidate == path) {
-        Some((_, Entry::File(blob))) => blob,
-        Some((_, Entry::CozyTensors(_))) => {
-            eprintln!("REFUSED PROJECTION_WEIGHT_PATH: materialize selects ordinary files only");
-            return ExitCode::FAILURE;
-        }
-        None => {
-            eprintln!("REFUSED NOT_CONTAINED: manifest has no path {path:?}");
-            return ExitCode::FAILURE;
-        }
-    };
+    let blob = ok!(project::ordinary_file(&m, path));
     let t0 = Instant::now();
     let n = ok!(project::materialize(&s, blob, dest));
     println!(
