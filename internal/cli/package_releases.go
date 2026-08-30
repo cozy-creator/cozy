@@ -82,7 +82,7 @@ func handlePackagePublish(ctx *Context) *exit.Error {
 		return exit.Internalf("package finalize returned no qualification state")
 	}
 	profileRows := make([]string, 0, len(done.Profiles))
-	var candidateRows, executionRows, refusalRows []string
+	var candidateRows, refusalRows []string
 	for _, profile := range done.Profiles {
 		profileRows = append(profileRows, profile.Profile+":"+profile.State+":"+profile.BaseRealizationKind+"@"+
 			profile.BaseRealizationDigest)
@@ -96,13 +96,19 @@ func handlePackagePublish(ctx *Context) *exit.Error {
 			refusalRows = append(refusalRows, refusal)
 		}
 	}
+	eligibleSet := map[string]bool{}
 	for _, execution := range done.PackageExecutions {
-		executionRows = append(executionRows, execution.Function+"@"+execution.Profile+"="+
-			execution.State+" ("+execution.Digest+")")
+		if execution.State == "qualified" && execution.Profile != "" {
+			eligibleSet[execution.Profile] = true
+		}
+	}
+	eligibleWorkerProfiles := make([]string, 0, len(eligibleSet))
+	for profile := range eligibleSet {
+		eligibleWorkerProfiles = append(eligibleWorkerProfiles, profile)
 	}
 	sort.Strings(profileRows)
 	sort.Strings(candidateRows)
-	sort.Strings(executionRows)
+	sort.Strings(eligibleWorkerProfiles)
 	sort.Strings(refusalRows)
 	replay := begun.State == "committed"
 	status := "published"
@@ -119,7 +125,7 @@ func handlePackagePublish(ctx *Context) *exit.Error {
 	fields = append(fields, []output.Field{
 		{K: "qualification_error", V: done.QualificationError},
 		{K: "compatible_profiles", V: done.CompatibleProfiles}, {K: "profiles", V: profileRows},
-		{K: "eligible_worker_profiles", V: executionRows},
+		{K: "eligible_worker_profiles", V: eligibleWorkerProfiles},
 		{K: "requires_python", V: done.RequiresPython}, {K: "requirements", V: done.Requirements},
 		{K: "uploaded", V: output.Bytes(moved)}, {K: "hub", V: c.Base()},
 	}...)
