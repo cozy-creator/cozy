@@ -61,6 +61,7 @@ live under their typed namespace.
 ## Repository publication
 
 ```text
+tfs manifest build <entries.jsonl> --out <manifest.json>
 tfs manifest inspect <manifest.json> --refs <refs.jsonl>
 tfs manifest get <store> <manifest_id> --out <manifest.json>
 tfs manifest admit <store> <manifest.json> --expect <sha256> [--expect-length <bytes>]
@@ -76,6 +77,11 @@ tfs key blob <sha256>
 tfs key manifest <sha256>
 tfs key repo <org> <name>
 ```
+
+`manifest build` is the one ordinary-file producer. Its strictly path-sorted canonical JSONL rows
+are `{blob:{length,sha256},path}`; it validates the common Manifest grammar, writes exact canonical
+bytes, and prints their ObjectRef. Local and cloud callers use this seam instead of defining a
+second source-tree codec.
 
 Publication order is blobs, manifest, repository compare-and-swap, then SQL projection. A crash
 before repository replacement leaves harmless unreachable content. A crash afterward leaves

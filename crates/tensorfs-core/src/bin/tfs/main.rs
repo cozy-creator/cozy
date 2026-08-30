@@ -29,6 +29,7 @@
 //!
 //! The repository/manifest/blob store (tfs-034).
 //!
+//!   tfs manifest build <entries.jsonl> --out <manifest.json>
 //!   tfs manifest admit|get|show|walk|verify <root> ...
 //!   tfs manifest inspect <manifest.json> --refs <jsonl>
 //!   tfs repo inspect <repo.json> --rows <jsonl>
@@ -154,6 +155,7 @@ fn main() -> ExitCode {
         ["manifest", "admit", r, p] => snap::cmd_admit(Path::new(r), Path::new(p), &flags),
         ["manifest", "walk", r, h] => snap::cmd_walk(Path::new(r), h, &flags),
         ["manifest", "verify", r, h] => snap::cmd_verify(Path::new(r), h),
+        ["manifest", "build", entries] => repo::cmd_manifest_build(Path::new(entries), &flags),
         ["checkpoint", "reproduce", r, h, e] => {
             snap::cmd_reproduce(Path::new(r), Path::new(h), Path::new(e), &flags)
         }
