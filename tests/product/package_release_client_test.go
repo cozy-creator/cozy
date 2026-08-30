@@ -73,6 +73,34 @@ func TestPackageReleaseClientContract(t *testing.T) {
 	}
 }
 
+func TestPackageReleaseYankClientContract(t *testing.T) {
+	ref := hub.Ref{Org: "proof", Name: "package"}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodDelete || r.URL.Path != "/v1/packages/proof/package/releases/1.2.3" {
+			http.NotFound(w, r)
+			return
+		}
+		if r.Header.Get("Authorization") != "Bearer proof-token" ||
+			r.Header.Get("X-Tensorhub-Reason") != "cozy package yank proof/package@1.2.3" {
+			t.Errorf("package yank omitted authentication or derived audit text")
+		}
+		assertEmptyObject(t, r.Body)
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"state": "yanked", "release": "1.2.3", "changed": true,
+			"yanked_at": "2026-08-30T12:34:56Z",
+		})
+	}))
+	defer server.Close()
+	client := hub.New(config.Config{HubURL: server.URL,
+		HubToken: secret.New("proof-token")}, "cozy-test")
+	yanked, problem := client.YankPackageRelease(context.Background(), ref, "1.2.3",
+		"cozy package yank proof/package@1.2.3")
+	if problem != nil || yanked.State != "yanked" || yanked.Release != "1.2.3" ||
+		!yanked.Changed || yanked.YankedAt != "2026-08-30T12:34:56Z" {
+		t.Fatalf("package yank response changed: %+v problem=%v", yanked, problem)
+	}
+}
+
 func TestPackageReleaseClientRejectsUnknownResponseFields(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		_, _ = io.WriteString(w, `{"state":"committed","uploads":[],"renamed_field":true}`)

@@ -30,6 +30,13 @@ type PackageReleaseCommit struct {
 	QualificationError string        `json:"qualification_error,omitempty"`
 }
 
+type PackageReleaseYank struct {
+	Changed  bool   `json:"changed"`
+	Release  string `json:"release"`
+	State    string `json:"state"`
+	YankedAt string `json:"yanked_at"`
+}
+
 type PackageInstallDownload struct {
 	Digest string `json:"digest"`
 	Kind   string `json:"kind"`
@@ -77,6 +84,14 @@ func (c *Client) CommitPackageRelease(ctx context.Context, ref Ref, release, rea
 	e := c.do(ctx, call{method: http.MethodPut,
 		path: packageReleasePath(ref, release), auth: true, reason: reason,
 		body: map[string]any{}, patient: true, strict: true}, &out)
+	return out, e
+}
+
+func (c *Client) YankPackageRelease(ctx context.Context, ref Ref, release, reason string) (PackageReleaseYank, *exit.Error) {
+	var out PackageReleaseYank
+	e := c.do(ctx, call{method: http.MethodDelete,
+		path: packageReleasePath(ref, release), auth: true, reason: reason,
+		body: map[string]any{}, strict: true}, &out)
 	return out, e
 }
 

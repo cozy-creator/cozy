@@ -165,8 +165,10 @@ type Resource struct {
 }
 
 type ReleaseSummary struct {
-	CutAt   string `json:"cut_at"`
-	Release string `json:"release"`
+	CutAt    string `json:"cut_at"`
+	Release  string `json:"release"`
+	Yanked   bool   `json:"yanked,omitempty"`
+	YankedAt string `json:"yanked_at,omitempty"`
 }
 
 type PackageCard struct {

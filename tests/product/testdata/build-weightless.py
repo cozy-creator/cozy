@@ -77,6 +77,7 @@ def main() -> int:
     )
     parser.add_argument("--runtime-sha", default=os.getenv("RUNTIME_SHA", "HEAD"))
     parser.add_argument("--out", required=True)
+    parser.add_argument("--source-out")
     parser.add_argument("--version", default="1.0.0")
     parser.add_argument("--package", default="cozy/weightless")
     args = parser.parse_args()
@@ -128,6 +129,7 @@ def main() -> int:
             f'dependencies = ["cozy-runtime[media]=={runtime_version}"]\n\n'
             "[tool.uv.sources]\n"
             f'cozy-runtime = {{ path = "vendor/{wheels[0].name}" }}\n'
+            '\n[tool.cozy]\norganization = "cozy"\n'
         )
         run("uv", "lock", "--quiet", cwd=tree)
         run("uv", "sync", "--locked", "--quiet", cwd=tree)
@@ -146,6 +148,13 @@ def main() -> int:
 
         archive = out / f"{args.package.rsplit('/', 1)[-1]}-{args.version}.tar.gz"
         pack(tree, args.package, args.version, archive)
+        if args.source_out:
+            source_out = pathlib.Path(args.source_out).resolve()
+            shutil.copytree(
+                tree,
+                source_out,
+                ignore=shutil.ignore_patterns(".venv", "__pycache__", "dist"),
+            )
         print(f"archive:  {archive}")
         print(f"runtime: {full_sha} (git archive, read-only)")
         print(f"digest:  sha256:{digest(archive)}")

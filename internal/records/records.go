@@ -34,10 +34,10 @@ type PackageInstall struct {
 	Package            string // org/name
 	Major              int
 	Version            string
-	SourceKind         string // "tensorhub" | "archive" | "dir"
+	SourceKind         string // "tensorhub" | "local" | legacy "archive"/"dir"
 	SourceRef          string
 	SourceDigest       string
-	Verified           bool // false = installed through the --allow-unsigned development door
+	Verified           bool // false = an explicit local/development install, not published custody
 	Dir                string
 	Python             string
 	Runtime            string // exact cozy-runtime binary; empty on older source installs derives from venv

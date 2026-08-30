@@ -63,13 +63,26 @@ cozy package search video
 cozy package search org/name
 cozy package install org/name
 cozy package install org/name --version 1.2.3
+cozy package install .
 cozy package list
 ```
+
+An explicit directory (`.`, `..`, `./project`, `../project`, or an absolute path) runs the same
+bounded source scan and wheel build used by publication, then creates a local development install.
+Its exact source/build digest is pinned locally, but it is not a published PackageRelease,
+Qualification, or rentable deployment.
 
 Remove local package generations with:
 
 ```sh
 cozy package remove org/name
+```
+
+Package authors may permanently yank an immutable release without freeing its package/version
+coordinate for reuse:
+
+```sh
+cozy package yank org/name --version 1.2.3
 ```
 
 Publishing builds the current working tree with `uv build --wheel`; Git, commits, and a clean tree

@@ -147,6 +147,9 @@ func latestPackageRelease(releases []hub.ReleaseSummary) (string, *exit.Error) {
 	var chosen pep440.Version
 	name := ""
 	for _, release := range releases {
+		if release.Yanked {
+			continue
+		}
 		version, err := pep440.Parse(release.Release)
 		if err != nil {
 			return "", exit.Named(exit.Structural, "package.release_version_invalid",
@@ -155,6 +158,10 @@ func latestPackageRelease(releases []hub.ReleaseSummary) (string, *exit.Error) {
 		if name == "" || version.GreaterThan(chosen) {
 			chosen, name = version, release.Release
 		}
+	}
+	if name == "" {
+		return "", exit.New(exit.NotFound, "the package has no installable releases").
+			WithRemedy("publish a new immutable release; yanked versions remain unavailable")
 	}
 	return name, nil
 }

@@ -45,13 +45,13 @@ func Read(gen records.PackageInstall, cozyHome string, env []string) (*Facts, *e
 }
 
 // SourceDir is where a generation's package tree lives. An archive install stages it
-// under the generation; a `--dir` install builds a venv against the live tree and records
-// its absolute path (cl-009's editable development door).
+// under the generation; local-directory development installs retain their explicit
+// absolute author-controlled path.
 func SourceDir(gen records.PackageInstall) string {
 	if gen.ProjectDir != "" {
 		return gen.ProjectDir
 	}
-	if gen.SourceKind == "dir" && gen.SourceRef != "" {
+	if (gen.SourceKind == "dir" || gen.SourceKind == "local") && gen.SourceRef != "" {
 		return gen.SourceRef
 	}
 	return filepath.Join(gen.Dir, "source")
@@ -76,7 +76,7 @@ func (f *Facts) Placement() (orchestrator.DesiredPlacement, *exit.Error) {
 			"package_selection_missing",
 			"%s was installed without an exact Hub-selected PlacementSet",
 			f.Install.Package).WithRemedy(
-			"publish and install the release for an approved profile; editable --dir installs are build inputs, not runnable placements")
+			"publish and install the release for an approved profile; local directory installs are build inputs, not runnable placements")
 	}
 	path := filepath.Join(f.Install.Dir, "artifact-cache",
 		strings.TrimPrefix(f.Install.PlacementSetDigest, "sha256:"))

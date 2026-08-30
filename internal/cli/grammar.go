@@ -40,10 +40,11 @@ func (c *AuthLoginCmd) Run(r *Runtime) error {
 
 type PackageCmd struct {
 	Search  PackageSearchCmd  `cmd:"" help:"Search for AI magic."`
-	Install PackageInstallCmd `cmd:"" help:"Downloads source-code and installs dependencies."`
+	Install PackageInstallCmd `cmd:"" help:"Install a published package or explicit local directory."`
 	Remove  PackageRemoveCmd  `cmd:"" help:"Delete source-code."`
 	List    PackageListCmd    `cmd:"" help:"List installed packages."`
 	Publish PackagePublishCmd `cmd:"" help:"Publish a package release."`
+	Yank    PackageYankCmd    `cmd:"" help:"Permanently yank a package release."`
 }
 
 type PackageSearchCmd struct {
@@ -57,13 +58,22 @@ func (c *PackageSearchCmd) Run(r *Runtime) error {
 }
 
 type PackageInstallCmd struct {
-	Ref           string `arg:"" name:"package" help:"Published package name (org/name)."`
+	Ref           string `arg:"" name:"package-or-directory" help:"Published org/name or explicit directory such as . or ./project."`
 	Version       string `help:"Install this release instead of the newest, e.g. 1.2.3."`
 	From          string `hidden:"" type:"path"`
 	Dir           string `hidden:"" type:"path"`
 	Digest        string `hidden:""`
 	Force         bool   `hidden:""`
 	AllowUnsigned bool   `hidden:""`
+}
+
+type PackageYankCmd struct {
+	Ref     string `arg:"" name:"package" help:"Published package name (org/name)."`
+	Version string `help:"Immutable N.M.P release to yank." required:""`
+}
+
+func (c *PackageYankCmd) Run(r *Runtime) error {
+	return r.call(handlePackageYank, []string{c.Ref}, nil, values("--version", c.Version), false)
 }
 
 func (c *PackageInstallCmd) Run(r *Runtime) error {
