@@ -44,8 +44,15 @@ CREATE TABLE IF NOT EXISTS rentals (
   hub               TEXT NOT NULL,
   rented_at         TEXT NOT NULL,
   media_address     TEXT NOT NULL DEFAULT '',
-  control_snapshot_digest TEXT NOT NULL DEFAULT '',
-  control_snapshot_bytes  BLOB NOT NULL DEFAULT x'',
+  placement_set_digest TEXT NOT NULL DEFAULT '',
+  placement_set_bytes  BLOB NOT NULL DEFAULT x'',
+  selection_profile TEXT NOT NULL DEFAULT '',
+  package_release_digest TEXT NOT NULL DEFAULT '',
+  package_release_bytes BLOB NOT NULL DEFAULT x'',
+  package_descriptor_digest TEXT NOT NULL DEFAULT '',
+  package_descriptor_bytes BLOB NOT NULL DEFAULT x'',
+  qualification_digest TEXT NOT NULL DEFAULT '',
+  qualification_bytes BLOB NOT NULL DEFAULT x'',
   placement_revision      INTEGER NOT NULL DEFAULT 0,
   observed_accelerator       TEXT NOT NULL DEFAULT '',
   observed_accelerator_count INTEGER NOT NULL DEFAULT 0,
@@ -89,6 +96,13 @@ func migrateRentalSchema(db *sql.DB, path string) *exit.Error {
 		ddl  string
 	}{
 		{"placement_revision", `INTEGER NOT NULL DEFAULT 0`},
+		{"selection_profile", `TEXT NOT NULL DEFAULT ''`},
+		{"package_release_digest", `TEXT NOT NULL DEFAULT ''`},
+		{"package_release_bytes", `BLOB NOT NULL DEFAULT x''`},
+		{"package_descriptor_digest", `TEXT NOT NULL DEFAULT ''`},
+		{"package_descriptor_bytes", `BLOB NOT NULL DEFAULT x''`},
+		{"qualification_digest", `TEXT NOT NULL DEFAULT ''`},
+		{"qualification_bytes", `BLOB NOT NULL DEFAULT x''`},
 		{"observed_accelerator", `TEXT NOT NULL DEFAULT ''`},
 		{"observed_accelerator_count", `INTEGER NOT NULL DEFAULT 0`},
 		{"observed_backend", `TEXT NOT NULL DEFAULT ''`},
@@ -315,12 +329,18 @@ type Rental struct {
 	// FACT about the pod like the control address is, so it is a row and not a file; the
 	// credential it takes is the rental's media bearer, which stays 0600 beside it.
 	MediaAddress string
-	// ControlSnapshotBytes is the exact Tensorhub-authored, attempt-bound
-	// snapshot received on the ready view. It remains raw bytes in SQLite so a
-	// restart cannot re-render remote execution meaning from a local install.
-	ControlSnapshotDigest string
-	ControlSnapshotBytes  []byte
-	PlacementRevision     uint64
+	// PlacementSetBytes are Tensorhub's exact selected desired state. They remain
+	// raw bytes so a restart relays rather than re-renders execution meaning.
+	PlacementSetDigest      string
+	PlacementSetBytes       []byte
+	SelectionProfile        string
+	PackageReleaseDigest    string
+	PackageReleaseBytes     []byte
+	PackageDescriptorDigest string
+	PackageDescriptorBytes  []byte
+	QualificationDigest     string
+	QualificationBytes      []byte
+	PlacementRevision       uint64
 	// Observed* is the remote worker's ClaimAck readback. AcceleratorModel above is
 	// only the caller's requested SKU; these fields are absent until Cozy has
 	// actually claimed the rented worker without invoking a model.
@@ -337,13 +357,16 @@ type Rental struct {
 	ExpectedWorkerBootID           string
 }
 
-const rentalCols = `id,package_ref,accelerator_model,address,cert_path,state,hub,rented_at,media_address,control_snapshot_digest,control_snapshot_bytes,placement_revision,observed_accelerator,observed_accelerator_count,observed_backend,observed_driver_version,observed_backend_version,observed_device_memory_total_bytes,observed_worker_instance,observed_worker_boot_id,observed_at,expected_worker_id,expected_worker_boot_id`
+const rentalCols = `id,package_ref,accelerator_model,address,cert_path,state,hub,rented_at,media_address,placement_set_digest,placement_set_bytes,selection_profile,package_release_digest,package_release_bytes,package_descriptor_digest,package_descriptor_bytes,qualification_digest,qualification_bytes,placement_revision,observed_accelerator,observed_accelerator_count,observed_backend,observed_driver_version,observed_backend_version,observed_device_memory_total_bytes,observed_worker_instance,observed_worker_boot_id,observed_at,expected_worker_id,expected_worker_boot_id`
 
 func scanRental(row interface{ Scan(...any) error }) (Rental, error) {
 	var r Rental
 	err := row.Scan(&r.ID, &r.PackageRef, &r.AcceleratorModel, &r.Address, &r.CertPath,
 		&r.State, &r.Hub, &r.RentedAt, &r.MediaAddress,
-		&r.ControlSnapshotDigest, &r.ControlSnapshotBytes,
+		&r.PlacementSetDigest, &r.PlacementSetBytes,
+		&r.SelectionProfile, &r.PackageReleaseDigest, &r.PackageReleaseBytes,
+		&r.PackageDescriptorDigest, &r.PackageDescriptorBytes,
+		&r.QualificationDigest, &r.QualificationBytes,
 		&r.PlacementRevision,
 		&r.ObservedAccelerator, &r.ObservedAcceleratorCount, &r.ObservedBackend,
 		&r.ObservedDriverVersion, &r.ObservedBackendVersion, &r.ObservedDeviceMemoryTotalBytes,
@@ -360,8 +383,17 @@ func (s *Store) RecordRental(r Rental) *exit.Error {
 	if r.RentedAt == "" {
 		r.RentedAt = now()
 	}
-	if r.ControlSnapshotBytes == nil {
-		r.ControlSnapshotBytes = []byte{}
+	if r.PlacementSetBytes == nil {
+		r.PlacementSetBytes = []byte{}
+	}
+	if r.PackageReleaseBytes == nil {
+		r.PackageReleaseBytes = []byte{}
+	}
+	if r.PackageDescriptorBytes == nil {
+		r.PackageDescriptorBytes = []byte{}
+	}
+	if r.QualificationBytes == nil {
+		r.QualificationBytes = []byte{}
 	}
 	tx, err := s.db.Begin()
 	if err != nil {
@@ -377,16 +409,23 @@ func (s *Store) RecordRental(r Rental) *exit.Error {
 		r.State = rentalStateForward(current, r.State)
 	}
 	if _, err := tx.Exec(`INSERT INTO rentals(`+rentalCols+`)
-		VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+		VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
 		ON CONFLICT(id) DO UPDATE SET
 		  address=CASE WHEN rentals.address<>'' THEN rentals.address ELSE excluded.address END,
 		  cert_path=CASE WHEN rentals.cert_path<>'' THEN rentals.cert_path ELSE excluded.cert_path END,
 		  state=excluded.state,
 		  media_address=CASE WHEN rentals.media_address<>'' THEN rentals.media_address ELSE excluded.media_address END,
-		  control_snapshot_digest=CASE WHEN length(rentals.control_snapshot_bytes)>0
-		    THEN rentals.control_snapshot_digest ELSE excluded.control_snapshot_digest END,
-		  control_snapshot_bytes=CASE WHEN length(rentals.control_snapshot_bytes)>0
-		    THEN rentals.control_snapshot_bytes ELSE excluded.control_snapshot_bytes END,
+		  placement_set_digest=CASE WHEN length(rentals.placement_set_bytes)>0
+		    THEN rentals.placement_set_digest ELSE excluded.placement_set_digest END,
+		  placement_set_bytes=CASE WHEN length(rentals.placement_set_bytes)>0
+		    THEN rentals.placement_set_bytes ELSE excluded.placement_set_bytes END,
+		  selection_profile=CASE WHEN rentals.selection_profile<>'' THEN rentals.selection_profile ELSE excluded.selection_profile END,
+		  package_release_digest=CASE WHEN length(rentals.package_release_bytes)>0 THEN rentals.package_release_digest ELSE excluded.package_release_digest END,
+		  package_release_bytes=CASE WHEN length(rentals.package_release_bytes)>0 THEN rentals.package_release_bytes ELSE excluded.package_release_bytes END,
+		  package_descriptor_digest=CASE WHEN length(rentals.package_descriptor_bytes)>0 THEN rentals.package_descriptor_digest ELSE excluded.package_descriptor_digest END,
+		  package_descriptor_bytes=CASE WHEN length(rentals.package_descriptor_bytes)>0 THEN rentals.package_descriptor_bytes ELSE excluded.package_descriptor_bytes END,
+		  qualification_digest=CASE WHEN length(rentals.qualification_bytes)>0 THEN rentals.qualification_digest ELSE excluded.qualification_digest END,
+		  qualification_bytes=CASE WHEN length(rentals.qualification_bytes)>0 THEN rentals.qualification_bytes ELSE excluded.qualification_bytes END,
 		  placement_revision=CASE WHEN rentals.placement_revision>0
 		    THEN rentals.placement_revision ELSE excluded.placement_revision END,
 		  observed_accelerator=CASE WHEN rentals.observed_accelerator<>''
@@ -412,8 +451,10 @@ func (s *Store) RecordRental(r Rental) *exit.Error {
 		  expected_worker_boot_id=CASE WHEN rentals.expected_worker_boot_id<>''
 		    THEN rentals.expected_worker_boot_id ELSE excluded.expected_worker_boot_id END`,
 		r.ID, r.PackageRef, r.AcceleratorModel, r.Address, r.CertPath, r.State, r.Hub,
-		r.RentedAt, r.MediaAddress, r.ControlSnapshotDigest,
-		r.ControlSnapshotBytes, r.PlacementRevision, r.ObservedAccelerator,
+		r.RentedAt, r.MediaAddress, r.PlacementSetDigest,
+		r.PlacementSetBytes, r.SelectionProfile, r.PackageReleaseDigest, r.PackageReleaseBytes,
+		r.PackageDescriptorDigest, r.PackageDescriptorBytes, r.QualificationDigest,
+		r.QualificationBytes, r.PlacementRevision, r.ObservedAccelerator,
 		r.ObservedAcceleratorCount, r.ObservedBackend, r.ObservedDriverVersion,
 		r.ObservedBackendVersion, r.ObservedDeviceMemoryTotalBytes, r.ObservedWorkerInstance,
 		r.ObservedWorkerBootID, r.ObservedAt, r.ExpectedWorkerID, r.ExpectedWorkerBootID); err != nil {
@@ -426,11 +467,11 @@ func (s *Store) RecordRental(r Rental) *exit.Error {
 	if e != nil {
 		return e
 	}
-	if len(r.ControlSnapshotBytes) > 0 && (stored == nil ||
-		stored.ControlSnapshotDigest != r.ControlSnapshotDigest ||
-		!bytes.Equal(stored.ControlSnapshotBytes, r.ControlSnapshotBytes)) {
-		return exit.Named(exit.Conflict, "rental.control_snapshot_conflict",
-			"rental %s already carries another exact acquisition-attempt control snapshot", r.ID)
+	if len(r.PlacementSetBytes) > 0 && (stored == nil ||
+		stored.PlacementSetDigest != r.PlacementSetDigest ||
+		!bytes.Equal(stored.PlacementSetBytes, r.PlacementSetBytes)) {
+		return exit.Named(exit.Conflict, "rental.placement_set_conflict",
+			"rental %s already carries another exact PlacementSet", r.ID)
 	}
 	if stored == nil || r.Address != "" && stored.Address != r.Address ||
 		r.MediaAddress != "" && stored.MediaAddress != r.MediaAddress ||
@@ -439,6 +480,46 @@ func (s *Store) RecordRental(r Rental) *exit.Error {
 		r.ExpectedWorkerBootID != "" && stored.ExpectedWorkerBootID != r.ExpectedWorkerBootID {
 		return exit.Named(exit.Conflict, "rental.attach_projection_conflict",
 			"rental %s already carries another address, media address, or certificate pin", r.ID)
+	}
+	return nil
+}
+
+// ReplaceRentalSelection installs the Hub-authored replacement after its exact
+// desired revision is known. It is the only path allowed to change PlacementSet.
+func (s *Store) ReplaceRentalSelection(next Rental) *exit.Error {
+	current, e := s.RentalRow(next.ID)
+	if e != nil {
+		return e
+	}
+	if current == nil {
+		return exit.New(exit.NotFound, "no rental %s on this host", next.ID)
+	}
+	same := current.PackageRef == next.PackageRef && current.PlacementRevision == next.PlacementRevision &&
+		current.PlacementSetDigest == next.PlacementSetDigest &&
+		bytes.Equal(current.PlacementSetBytes, next.PlacementSetBytes)
+	if same {
+		return nil
+	}
+	if next.PlacementRevision <= current.PlacementRevision {
+		return exit.Named(exit.Conflict, "rental.placement_revision_regressed",
+			"rental %s replacement revision %d does not advance %d",
+			next.ID, next.PlacementRevision, current.PlacementRevision)
+	}
+	result, err := s.db.Exec(`UPDATE rentals SET package_ref=?,placement_set_digest=?,placement_set_bytes=?,
+		selection_profile=?,package_release_digest=?,package_release_bytes=?,
+		package_descriptor_digest=?,package_descriptor_bytes=?,qualification_digest=?,qualification_bytes=?,
+		placement_revision=? WHERE id=? AND placement_revision=?`,
+		next.PackageRef, next.PlacementSetDigest, next.PlacementSetBytes, next.SelectionProfile,
+		next.PackageReleaseDigest, next.PackageReleaseBytes, next.PackageDescriptorDigest,
+		next.PackageDescriptorBytes, next.QualificationDigest, next.QualificationBytes,
+		next.PlacementRevision, next.ID, current.PlacementRevision)
+	if err != nil {
+		return exit.Internalf("cannot replace rental %s selection: %s", next.ID, err)
+	}
+	changed, _ := result.RowsAffected()
+	if changed != 1 {
+		return exit.Named(exit.Conflict, "rental.placement_update_raced",
+			"rental %s selection advanced concurrently", next.ID)
 	}
 	return nil
 }

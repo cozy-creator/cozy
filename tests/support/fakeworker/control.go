@@ -2,7 +2,6 @@ package main
 
 import (
 	"bytes"
-	"crypto/ed25519"
 	"crypto/rand"
 	"crypto/sha256"
 	"encoding/hex"
@@ -125,9 +124,6 @@ func (f *fakeControl) Control(stream pb.WorkerControl_ControlServer) error {
 	f.snapshotSent.Store(true)
 	f.say("WorkerSnapshot %s sent (%d B); admission is CLOSED until the ack", snapshotID, len(bodyBytes))
 
-	var artifactRevision uint64
-	var delegationID string
-	var authorizationExpires uint64
 	observed := func(revision uint64, placementID string, setDigest []byte, planIDs []string) {
 		r := &pb.ObservedWorkerState{
 			AcceptedDesiredStateRevision: revision, ConvergedRevision: revision,
@@ -137,18 +133,19 @@ func (f *fakeControl) Control(stream pb.WorkerControl_ControlServer) error {
 			AdmissionState:             pb.AdmissionState_ADMISSION_STATE_OPEN,
 			AdmissionGeneration:        admissionGeneration, AvailableAttemptSlots: 2,
 		}
-		if artifactRevision > 0 {
-			r.ArtifactIntent = &pb.ArtifactIntentStatus{
-				Revision: artifactRevision, DelegationId: delegationID,
-				AuthorizationExpiresAtUnix: authorizationExpires,
-			}
-		}
 		if placementID != "" {
+			var bindingDigests [][]byte
+			for _, planID := range planIDs {
+				digest, err := canonical.Raw(planID)
+				if err == nil {
+					bindingDigests = append(bindingDigests, digest)
+				}
+			}
 			r.Placements = []*pb.PlacementStatus{{
 				PlacementId:        placementID,
 				Materialization:    pb.MaterializationState_MATERIALIZATION_STATE_STAGED,
 				Serving:            pb.ServingState_SERVING_STATE_DISPATCHABLE,
-				ExecutorGeneration: 1, DispatchablePlanIds: planIDs,
+				ExecutorGeneration: 1, DispatchableBindingDigests: bindingDigests,
 				PlacementSetDigest: setDigest,
 			}}
 		}
@@ -187,20 +184,6 @@ func (f *fakeControl) Control(stream pb.WorkerControl_ControlServer) error {
 				time.Sleep(2 * time.Second)
 				return nil
 			}
-		case *pb.RecordOwnerFrame_EnsureArtifacts:
-			ensure := m.EnsureArtifacts
-			doc, err := canonical.Read(ensure.DelegationCanonicalBytes, &pb.ArtifactDelegation{})
-			if err != nil || len(ensure.CreatorSignature) != ed25519.SignatureSize {
-				f.say("EnsureArtifacts refused: invalid delegation: %v", err)
-				continue
-			}
-			revision := uint64(doc.Int("revision"))
-			if revision < artifactRevision {
-				continue
-			}
-			artifactRevision, delegationID = revision, doc.Str("delegation_id")
-			authorizationExpires = uint64(doc.Int("expires_at_unix"))
-			f.say("EnsureArtifacts revision=%d delegation=%s", artifactRevision, delegationID)
 		case *pb.RecordOwnerFrame_DesiredState:
 			d := m.DesiredState
 			placementID, planIDs, setDigest := "", []string(nil), []byte(nil)
@@ -218,22 +201,11 @@ func (f *fakeControl) Control(stream pb.WorkerControl_ControlServer) error {
 					f.say("ARM: the placement set document is inadmissible: %v", err)
 					continue
 				}
-				validSet := true
 				for _, p := range doc.List("placements") {
 					placementID = p.Str("placement_id")
-					model := p.Sub("model_object_set")
-					if model.Str("kind") != "model_object_set" ||
-						model.Str("subject_id") != model.Str("digest") || model.Int("length") <= 0 {
-						f.say("ARM: placement %s has no exact model-object-set subject — UNAPPLIED", placementID)
-						validSet = false
-						break
+					for _, entrypoint := range p.List("entrypoints") {
+						planIDs = append(planIDs, entrypoint.Str("entrypoint_binding_digest"))
 					}
-					for _, sub := range p.List("binding_plans") {
-						planIDs = append(planIDs, sub.Str("subject_id"))
-					}
-				}
-				if !validSet {
-					continue
 				}
 			}
 			f.say("DesiredWorkerState revision=%d placement=%s plans=%d", d.Revision,

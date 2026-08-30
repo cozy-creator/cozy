@@ -15,12 +15,14 @@ import (
 	"testing"
 	"time"
 
+	"github.com/cozy-creator/cozy/internal/canonical"
 	"github.com/cozy-creator/cozy/internal/config"
 	"github.com/cozy-creator/cozy/internal/daemon"
 	"github.com/cozy-creator/cozy/internal/exit"
 	"github.com/cozy-creator/cozy/internal/home"
 	"github.com/cozy-creator/cozy/internal/orchestrator"
 	"github.com/cozy-creator/cozy/internal/records"
+	pb "github.com/cozy-creator/cozy/protocol/cozy/worker/v1"
 )
 
 // The two binaries the suite drives as real processes, built once by TestMain.
@@ -99,9 +101,7 @@ func hostOwner(t *testing.T, name string) *owner {
 	must(t, err)
 	c, e := orchestrator.Open(orchestrator.Options{
 		Cfg: cfg, Layout: l, Store: st, Yield: "smart", Log: log,
-		EnvironmentSpecDigest: "sha256:" + strings.Repeat("11", 32),
-		ConfigDigest:          "sha256:" + strings.Repeat("22", 32),
-		MaxOutputMiB:          8,
+		ConfigDigest: "sha256:" + strings.Repeat("22", 32), MaxOutputMiB: 8,
 	})
 	fatal(t, e)
 	go func() { _ = c.Serve() }()
@@ -121,28 +121,63 @@ func (o *owner) close() { o.once.Do(o.closer) }
 // fakeSpec is a worker slot whose process is tests/support/fakeworker speaking raw protocol
 // bytes: a real process dialing the real socket over the committed contract.
 func fakeSpec(name, device string, args ...string) orchestrator.WorkerLaunchSpec {
-	return orchestrator.WorkerLaunchSpec{
-		Python:  fakeWorkerBin,
-		Args:    args,
-		Devices: []string{device},
-		Placement: orchestrator.DesiredPlacement{
-			Package:          "fake/" + name,
-			PackageReleaseID: fakeRelease,
-			Bindings: []*orchestrator.Binding{{
-				Entrypoint: "fake",
-				Record:     map[string]any{"entrypoint": "fake", "slot": name},
-			}},
+	ref := func(label string) *pb.Ref {
+		digest := sha256.Sum256([]byte(label))
+		return &pb.Ref{Digest: digest[:], Length: uint64(len(label))}
+	}
+	spelled := func(raw []byte) string { value, _ := canonical.Spell(raw); return value }
+	wheelhouse := ref("fake-wheelhouse")
+	environment := map[string]canonical.Value{
+		"wheelhouse_manifest": map[string]canonical.Value{
+			"digest": spelled(wheelhouse.Digest), "length": int64(wheelhouse.Length),
 		},
+		"wheels": []canonical.Value{},
+	}
+	environmentBytes, _ := canonical.Write(environment)
+	entrypointIdentity := map[string]canonical.Value{
+		"name": "fake", "slots": []canonical.Value{},
+	}
+	entrypointBytes, _ := canonical.Write(entrypointIdentity)
+	entrypointDigest := canonical.Digest(entrypointBytes)
+	entrypoints := []canonical.Value{map[string]canonical.Value{
+		"entrypoint_binding_digest": spelled(entrypointDigest),
+		"name":                      "fake", "slots": []canonical.Value{},
+	}}
+	bindingsBytes, _ := canonical.Write(map[string]canonical.Value{
+		"entrypoints": entrypoints, "models": []canonical.Value{},
+	})
+	setBytes, setDigest, _ := canonical.Identity(&pb.PlacementSet{Placements: []*pb.Placement{{
+		PlacementId: "plc-fake-" + name, PackageRelease: ref("fake-release"),
+		EnvironmentDigest:        canonical.Digest(environmentBytes),
+		EnvironmentReceiptDigest: canonical.Digest([]byte("fake-receipt")),
+		PackageDescriptor:        ref("fake-descriptor"), BindingsDigest: canonical.Digest(bindingsBytes),
+		Entrypoints:   []*pb.Entrypoint{{Name: "fake", EntrypointBindingDigest: entrypointDigest}},
+		Qualification: ref("fake-qualification"),
+		Environment:   &pb.Environment{WheelhouseManifest: wheelhouse},
+	}}})
+	setID := spelled(setDigest)
+	placement, problem := orchestrator.PlacementFromExact("fake/"+name, "", setID,
+		setBytes, map[string][]string{"fake": []string{"image"}})
+	if problem != nil {
+		panic(problem.Message)
+	}
+	return orchestrator.WorkerLaunchSpec{
+		Python:    fakeWorkerBin,
+		Args:      args,
+		Devices:   []string{device},
+		Placement: placement,
 	}
 }
 
-const fakeRelease = "cozy/fake@live"
+var fakeRelease = func() string {
+	digest := sha256.Sum256([]byte("fake-release"))
+	value, _ := canonical.Spell(digest[:])
+	return value
+}()
 
 func planIDOf(t *testing.T, spec orchestrator.WorkerLaunchSpec) string {
 	t.Helper()
-	id, e := spec.Placement.Bindings[0].PlanID()
-	fatal(t, e)
-	return id
+	return spec.Placement.Entrypoints[0].Digest
 }
 
 func submission(planID, pkg, idem string, body map[string]any) orchestrator.Submission {

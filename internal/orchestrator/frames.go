@@ -71,38 +71,25 @@ func (c *Orchestrator) ConvergePlacementSet(instanceID string, placements []Desi
 
 func (c *Orchestrator) converge(s *session, w *worker, placements []DesiredPlacement) *exit.Error {
 	var setBytes, digest []byte
-	if len(placements) == 1 && len(placements[0].ExactPlacementSetBytes) > 0 {
-		// REMOTE: relay Tensorhub's exact acquisition-attempt bytes. Parsing is
-		// validation only; these bytes are never marshaled again.
+	if len(placements) == 1 {
 		p := placements[0]
-		declared, err := canonical.Raw(p.ExactPlacementSetDigest)
-		if err != nil || !bytes.Equal(canonical.Digest(p.ExactPlacementSetBytes), declared) {
+		declared, err := canonical.Raw(p.PlacementSetDigest)
+		if err != nil || !bytes.Equal(canonical.Digest(p.PlacementSetBytes), declared) {
 			return exit.Named(exit.Conflict, "placement_set_identity_mismatch",
-				"the persisted remote PlacementSet bytes do not match %s", p.ExactPlacementSetDigest)
+				"the persisted PlacementSet bytes do not match %s", p.PlacementSetDigest)
 		}
-		doc, err := canonical.Read(p.ExactPlacementSetBytes, &pb.PlacementSet{})
+		doc, err := canonical.Read(p.PlacementSetBytes, &pb.PlacementSet{})
 		if err != nil || len(doc.List("placements")) != 1 ||
 			doc.List("placements")[0].Str("placement_id") != p.PlacementID() {
 			return exit.Named(exit.Conflict, "placement_set_closure_mismatch",
-				"the persisted remote PlacementSet does not name placement %s: %v", p.PlacementID(), err)
+				"the persisted PlacementSet does not name placement %s: %v", p.PlacementID(), err)
 		}
-		setBytes, digest = append([]byte(nil), p.ExactPlacementSetBytes...), append([]byte(nil), declared...)
+		setBytes, digest = append([]byte(nil), p.PlacementSetBytes...), append([]byte(nil), declared...)
 	} else {
-		// LOCAL: retain the independent install-derived authoring path. An attached
-		// worker never gets this host's identity digests substituted for its own.
-		set := &pb.PlacementSet{}
-		for _, p := range placements {
-			if w.spec.Connection != nil && p.EnvironmentSpecDigest == "" {
-				return exit.Named(exit.Structural, "remote_placement_identity_missing",
-					"attached worker %s placement %s carries no frozen environment digest",
-					w.instanceID, p.PlacementID())
-			}
-			set.Placements = append(set.Placements, c.placement(w, p))
-		}
 		var err error
-		setBytes, digest, err = canonical.Identity(set)
+		setBytes, digest, err = canonical.Identity(&pb.PlacementSet{})
 		if err != nil {
-			return exit.Internalf("cannot mint the PlacementSet document for %s: %s", w.instanceID, err)
+			return exit.Internalf("cannot mint the empty PlacementSet for %s: %s", w.instanceID, err)
 		}
 	}
 	rev := uint64(0)
@@ -149,63 +136,6 @@ func (c *Orchestrator) converge(s *session, w *worker, placements []DesiredPlace
 	return nil
 }
 
-// placement mints one immutable Placement nested directly in the desired set. THE
-// DESIRED SET NAMES BYTES, NEVER A POINTER (§1): `package_release_id` survives only as
-// PROVENANCE and every other field is an immutable digest, so two workers handed the same
-// set converge to the same bytes or fault typed.
-//
-// A local install leaves environment/receipt empty unless its own launcher supplied
-// those facts; it never manufactures Tensorhub documents. A remote placement normally
-// bypasses this author entirely because converge relays Tensorhub's exact PlacementSet.
-func (c *Orchestrator) placement(w *worker, p DesiredPlacement) *pb.Placement {
-	placement := &pb.Placement{
-		PlacementId:      p.PlacementID(),
-		PackageReleaseId: p.PackageReleaseID,
-		BindingPlans:     w.subjects,
-		ModelObjectSet:   modelObjectSetSubject(p),
-	}
-	environmentDigest := p.EnvironmentSpecDigest
-	if environmentDigest == "" && w.spec.Connection == nil {
-		environmentDigest = c.opt.EnvironmentSpecDigest
-	}
-	if raw, err := canonical.Raw(environmentDigest); err == nil {
-		placement.EnvironmentSpecDigest = raw
-	}
-	if raw, err := canonical.Raw(p.InstalledEnvironmentReceiptDigest); err == nil {
-		placement.InstalledEnvironmentReceiptDigest = raw
-	}
-	if raw, err := canonical.Raw(p.PackageDescriptorDigest); err == nil {
-		placement.PackageDescriptorDigest = raw
-	}
-	return placement
-}
-
-const emptyModelObjectSet = `{"kind":"tensorhub.resolved_object_set/1","roots":[]}`
-
-// modelObjectSetSubject makes the required PlacementSet/2 closure explicit even for a
-// weightless local package. The empty object-set document is a real canonical subject,
-// not absence; remote placements carry Tensorhub's exact non-empty subject and normally
-// bypass local authoring by relaying the complete PlacementSet bytes.
-func modelObjectSetSubject(p DesiredPlacement) *pb.ArtifactSubject {
-	digest, length := p.ModelObjectSetDigest, p.ModelObjectSetLength
-	var raw []byte
-	if digest == "" {
-		raw = canonical.Digest([]byte(emptyModelObjectSet))
-		digest, _ = canonical.Spell(raw)
-		length = uint64(len(emptyModelObjectSet))
-	} else {
-		var err error
-		raw, err = canonical.Raw(digest)
-		if err != nil {
-			return nil
-		}
-	}
-	if length == 0 {
-		return nil
-	}
-	return &pb.ArtifactSubject{Digest: raw, SubjectId: digest, Kind: "model_object_set", Length: length}
-}
-
 // ------------------------------------------------------------------- observed state
 
 // onObserved applies one ObservedWorkerState. Nothing here infers: every field is the
@@ -237,11 +167,6 @@ func (c *Orchestrator) onObserved(s *session, r *pb.ObservedWorkerState, frameBy
 		w.acceptedRevision = r.AcceptedDesiredStateRevision
 		w.convergedRevision = r.ConvergedRevision
 		w.acceptedSetDigest = r.AcceptedPlacementSetDigest
-		if intent := r.GetArtifactIntent(); intent != nil {
-			w.artifactRevision = intent.Revision
-			w.delegationID = intent.DelegationId
-			w.authorizationExpires = intent.AuthorizationExpiresAtUnix
-		}
 		dispatchable, materializable := map[string]bool{}, map[string]bool{}
 		if w.spec.IsJob() {
 			// THE JOB LANE READS JOB CAPACITY: a job worker is in JobDirective mode and
@@ -273,11 +198,11 @@ func (c *Orchestrator) onObserved(s *session, r *pb.ObservedWorkerState, frameBy
 				if observed != nil {
 					acquisition = observed
 				}
-				for _, id := range status.DispatchablePlanIds {
-					dispatchable[id] = true
+				for _, digest := range status.DispatchableBindingDigests {
+					dispatchable[spellOf(digest)] = true
 				}
-				for _, id := range status.MaterializablePlanIds {
-					materializable[id] = true
+				for _, digest := range status.MaterializableBindingDigests {
+					materializable[spellOf(digest)] = true
 				}
 				for _, f := range status.Faults {
 					w.fault = fmt.Sprintf("%s: %s", f.Reason, brief(f.Detail, 240))
@@ -375,7 +300,7 @@ func (c *Orchestrator) onObserved(s *session, r *pb.ObservedWorkerState, frameBy
 			status.ExecutorGeneration,
 			trimEnum(pb.AdmissionState_name[int32(r.AdmissionState)], "ADMISSION_STATE_"),
 			r.AdmissionGeneration, r.AvailableAttemptSlots,
-			len(status.DispatchablePlanIds), len(r.HeldAttempts))
+			len(status.DispatchableBindingDigests), len(r.HeldAttempts))
 		return
 	}
 	c.logf("observed phase=%s accepted=%d converged=%d (no placement applied yet)",
@@ -437,8 +362,8 @@ func progressSignature(r *pb.ObservedWorkerState, status *pb.PlacementStatus) st
 	if status != nil {
 		sig += fmt.Sprintf(" mat=%d srv=%d gen=%d disp=%s matz=%s set=%x",
 			status.Materialization, status.Serving, status.ExecutorGeneration,
-			strings.Join(status.DispatchablePlanIds, ","),
-			strings.Join(status.MaterializablePlanIds, ","), status.PlacementSetDigest)
+			strings.Join(spellDigests(status.DispatchableBindingDigests), ","),
+			strings.Join(spellDigests(status.MaterializableBindingDigests), ","), status.PlacementSetDigest)
 		if acquisition := status.GetAcquisition(); acquisition != nil {
 			for _, observed := range []struct {
 				name string
@@ -453,6 +378,14 @@ func progressSignature(r *pb.ObservedWorkerState, status *pb.PlacementStatus) st
 		}
 	}
 	return sig
+}
+
+func spellDigests(digests [][]byte) []string {
+	out := make([]string, 0, len(digests))
+	for _, digest := range digests {
+		out = append(out, spellOf(digest))
+	}
+	return out
 }
 
 // wedgeDeclared reads the worker's OWN no-progress verdict off the activity lane: its

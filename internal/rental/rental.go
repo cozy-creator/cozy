@@ -15,7 +15,9 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"strings"
 
+	"github.com/cozy-creator/cozy/internal/canonical"
 	"github.com/cozy-creator/cozy/internal/exit"
 	"github.com/cozy-creator/cozy/internal/home"
 	"github.com/cozy-creator/cozy/internal/hub"
@@ -23,7 +25,6 @@ import (
 	"github.com/cozy-creator/cozy/internal/media"
 	"github.com/cozy-creator/cozy/internal/orchestrator"
 	"github.com/cozy-creator/cozy/internal/records"
-	"github.com/cozy-creator/cozy/internal/remotecontrol"
 	"github.com/cozy-creator/cozy/internal/rentalid"
 	"github.com/cozy-creator/cozy/internal/secret"
 )
@@ -46,9 +47,8 @@ func Attach(l home.Layout, st *records.Store, row records.Rental, cert string, t
 	if e := validID(row.ID); e != nil {
 		return e
 	}
-	// Validate and project the complete exact snapshot BEFORE files or a dialable
-	// rental row become visible. A bad snapshot never publishes a WorkerTarget.
-	if _, e := controlFacts(row); e != nil {
+	// Validate the exact selection BEFORE files or a dialable rental row become visible.
+	if _, e := selectedPlacement(row); e != nil {
 		return e
 	}
 	stored, e := st.RentalRow(row.ID)
@@ -237,11 +237,10 @@ func Known(st *records.Store) func(string) (*orchestrator.DesiredPlacement, *exi
 			return nil, exit.Unavailablef("rental %s has exact control but its WorkerTarget is not attached yet", id).
 				WithRemedy("wait for `cozy rental new` to validate and atomically publish the target")
 		}
-		facts, e := controlFacts(*row)
+		placement, e := selectedPlacement(*row)
 		if e != nil {
 			return nil, e
 		}
-		placement := facts.Placement
 		return &placement, nil
 	}
 }
@@ -259,11 +258,7 @@ func PackageDescriptor(st *records.Store, id string) (*launch.PackageDescriptor,
 	if row.CertPath == "" {
 		return nil, exit.Unavailablef("rental %s has not published its WorkerTarget", id)
 	}
-	facts, e := controlFacts(*row)
-	if e != nil {
-		return nil, e
-	}
-	return facts.PackageDescriptor, nil
+	return launch.DecodeDescriptor(row.PackageDescriptorBytes)
 }
 
 func unknown(id string) *exit.Error {
@@ -299,11 +294,11 @@ func Resolver(l home.Layout, st *records.Store) func(string) (*orchestrator.Remo
 			return nil, exit.Unavailablef("rental %s is not attached on this host", id).
 				WithRemedy("resume the original rental operation so control, certificate, and token publish together")
 		}
-		facts, e := controlFacts(*row)
+		placement, e := selectedPlacement(*row)
 		if e != nil {
 			return nil, e
 		}
-		facts.Placement.PlacementRevision = row.PlacementRevision
+		placement.PlacementRevision = row.PlacementRevision
 		token, e := MediaToken(l, id)
 		if e != nil {
 			return nil, e
@@ -334,7 +329,7 @@ func Resolver(l home.Layout, st *records.Store) func(string) (*orchestrator.Remo
 			// as a launch grant from whoever provisioned it.
 			spec.Media = &media.Spec{Addr: row.MediaAddress, Token: token, CACert: cert}
 		}
-		return &orchestrator.RemoteTarget{Connection: spec, Placement: facts.Placement}, nil
+		return &orchestrator.RemoteTarget{Connection: spec, Placement: placement}, nil
 	}
 }
 
@@ -401,22 +396,49 @@ func ObserveWorker(st *records.Store) func(orchestrator.RentalObservation) *exit
 	}
 }
 
-func controlFacts(row records.Rental) (remotecontrol.Facts, *exit.Error) {
-	if row.ControlSnapshotDigest == "" || len(row.ControlSnapshotBytes) == 0 {
-		return remotecontrol.Facts{}, exit.Named(exit.Conflict, "rental.control_snapshot_missing",
-			"rental %s has no persisted acquisition-attempt control snapshot", row.ID).
-			WithRemedy("release it and rent again; Cozy will not resolve a remote pod from the local install")
+func selectedPlacement(row records.Rental) (orchestrator.DesiredPlacement, *exit.Error) {
+	if row.PlacementSetDigest == "" || len(row.PlacementSetBytes) == 0 ||
+		row.PackageReleaseDigest == "" || len(row.PackageReleaseBytes) == 0 ||
+		row.PackageDescriptorDigest == "" || len(row.PackageDescriptorBytes) == 0 ||
+		row.QualificationDigest == "" || len(row.QualificationBytes) == 0 {
+		return orchestrator.DesiredPlacement{}, exit.Named(exit.Conflict, "rental.selection_missing",
+			"rental %s has no complete exact package selection", row.ID)
 	}
-	return remotecontrol.Decode(hub.ExactControlDocument{
-		CanonicalBytes: row.ControlSnapshotBytes, Digest: row.ControlSnapshotDigest,
-		Length: int64(len(row.ControlSnapshotBytes)),
-	}, row.PackageRef)
+	for name, exact := range map[string]struct {
+		digest string
+		data   []byte
+	}{
+		"package_release":    {row.PackageReleaseDigest, row.PackageReleaseBytes},
+		"package_descriptor": {row.PackageDescriptorDigest, row.PackageDescriptorBytes},
+		"qualification":      {row.QualificationDigest, row.QualificationBytes},
+	} {
+		want, err := canonical.Raw(exact.digest)
+		if err != nil || !bytes.Equal(canonical.Digest(exact.data), want) {
+			return orchestrator.DesiredPlacement{}, exit.Named(exit.Conflict,
+				"rental.selection_identity_mismatch", "rental %s %s bytes do not match %s",
+				row.ID, name, exact.digest)
+		}
+	}
+	descriptor, e := launch.DecodeDescriptor(row.PackageDescriptorBytes)
+	if e != nil {
+		return orchestrator.DesiredPlacement{}, e
+	}
+	outputs := map[string][]string{}
+	for _, entrypoint := range descriptor.Entrypoints {
+		outputs[entrypoint.Name] = launch.AssetPaths(entrypoint.Result)
+	}
+	parts := strings.Split(row.PackageRef, "/")
+	pkg := row.PackageRef
+	if len(parts) >= 2 {
+		pkg = parts[0] + "/" + parts[1]
+	}
+	return orchestrator.PlacementFromExact(pkg, "", row.PlacementSetDigest,
+		row.PlacementSetBytes, outputs)
 }
 
-// ValidateControl refuses a hub observation before its bytes become the rental's durable,
-// write-once control snapshot. Attach repeats the same check at the publication boundary.
-func ValidateControl(row records.Rental) *exit.Error {
-	_, e := controlFacts(row)
+// ValidateSelection refuses a Hub observation before its exact bytes become durable.
+func ValidateSelection(row records.Rental) *exit.Error {
+	_, e := selectedPlacement(row)
 	return e
 }
 

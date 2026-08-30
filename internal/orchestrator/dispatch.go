@@ -628,13 +628,13 @@ func (c *Orchestrator) dispatch(req records.Request) (uint64, *exit.Error) {
 		// `image_digest` is GONE, renamed to what it always meant (#483): "image" is wrong
 		// for a native install with no OCI image at all. The value is the same one this
 		// daemon was frozen with — a request cannot choose the environment it runs under.
-		EnvironmentSpecDigest: environmentDigest,
-		ConfigDigest:          configDigest,
-		PayloadDigest:         payloadDigest,
-		Inputs:                inputBindings(req, payloadDigest),
-		Outputs:               invocationOutputBindings(splitList(req.Outputs), artifactOutputs, outputLimit),
+		EnvironmentDigest: environmentDigest,
+		ConfigDigest:      configDigest,
+		PayloadDigest:     payloadDigest,
+		Inputs:            inputBindings(req, payloadDigest),
+		Outputs:           invocationOutputBindings(splitList(req.Outputs), artifactOutputs, outputLimit),
 		Spec: &pb.InvocationSpec_Serving{Serving: &pb.ServingInvocationSpec{
-			EntrypointBindingPlanId: req.PlanID,
+			EntrypointBindingDigest: req.PlanID,
 			// With no adapters the binding IS the plan, so the two ids are equal by
 			// construction rather than by copying a value around.
 			AttemptBindingId: req.PlanID,
@@ -773,17 +773,13 @@ func (c *Orchestrator) maxOutputBytes() uint64 {
 // invocation on w rides. Tensorhub's frozen remote placement owns the environment;
 // model configuration is bound separately and therefore has no package-wide digest.
 func (c *Orchestrator) invocationIdentity(w *worker) (environment, config string, e *exit.Error) {
-	environment = w.spec.Placement.EnvironmentSpecDigest
-	if w.spec.Connection != nil {
-		if environment == "" {
-			return "", "", exit.Named(exit.Structural, "remote_placement_identity_missing",
-				"attached worker %s carries no frozen environment digest; this host "+
-					"will not substitute its own", w.instanceID)
-		}
-		return environment, "", nil
-	}
+	environment = w.spec.Placement.EnvironmentDigest
 	if environment == "" {
-		environment = c.opt.EnvironmentSpecDigest
+		return "", "", exit.Named(exit.Structural, "placement_identity_missing",
+			"worker %s carries no selected environment digest", w.instanceID)
+	}
+	if w.spec.Connection != nil {
+		return environment, "", nil
 	}
 	return environment, c.opt.ConfigDigest, nil
 }

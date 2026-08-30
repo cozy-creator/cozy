@@ -2577,14 +2577,15 @@ type Placement struct {
 	// materialization = FAILED with
 	// FAULT_KIND_ENVIRONMENT_RECEIPT_MISMATCH, never a silent
 	// serve.
-	PackageDescriptor *Ref          `protobuf:"bytes,5,opt,name=package_descriptor,json=packageDescriptor,proto3" json:"package_descriptor,omitempty"` // exact PackageDescriptor bytes
-	BindingsDigest    []byte        `protobuf:"bytes,6,opt,name=bindings_digest,json=bindingsDigest,proto3" json:"bindings_digest,omitempty"`          // class (a): exact selected binding identity
-	Models            []*Model      `protobuf:"bytes,7,rep,name=models,proto3" json:"models,omitempty"`                                                // sorted unique by id; [] for a weightless package
-	Entrypoints       []*Entrypoint `protobuf:"bytes,8,rep,name=entrypoints,proto3" json:"entrypoints,omitempty"`                                      // sorted unique by name
-	Qualification     *Ref          `protobuf:"bytes,9,opt,name=qualification,proto3" json:"qualification,omitempty"`                                  // exact Qualification bytes authorizing this selection
-	Environment       *Environment  `protobuf:"bytes,10,opt,name=environment,proto3" json:"environment,omitempty"`                                     // selected overlay only; base packages derive from the
-	unknownFields     protoimpl.UnknownFields
-	sizeCache         protoimpl.SizeCache
+	PackageDescriptor *Ref   `protobuf:"bytes,5,opt,name=package_descriptor,json=packageDescriptor,proto3" json:"package_descriptor,omitempty"` // exact PackageDescriptor bytes
+	BindingsDigest    []byte `protobuf:"bytes,6,opt,name=bindings_digest,json=bindingsDigest,proto3" json:"bindings_digest,omitempty"`          // class (a): sha256(canonical JSON of exactly
+	// {entrypoints:<field 8>,models:<field 7>})
+	Models        []*Model      `protobuf:"bytes,7,rep,name=models,proto3" json:"models,omitempty"`               // sorted unique by id; [] for a weightless package
+	Entrypoints   []*Entrypoint `protobuf:"bytes,8,rep,name=entrypoints,proto3" json:"entrypoints,omitempty"`     // sorted unique by name
+	Qualification *Ref          `protobuf:"bytes,9,opt,name=qualification,proto3" json:"qualification,omitempty"` // exact Qualification bytes authorizing this selection
+	Environment   *Environment  `protobuf:"bytes,10,opt,name=environment,proto3" json:"environment,omitempty"`    // selected overlay only; base packages derive from the
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
 }
 
 func (x *Placement) Reset() {
@@ -2958,10 +2959,11 @@ func (x *Model) GetManifest() *Ref {
 type Entrypoint struct {
 	state                   protoimpl.MessageState `protogen:"open.v1"`
 	Name                    string                 `protobuf:"bytes,1,opt,name=name,proto3" json:"name,omitempty"`
-	EntrypointBindingDigest []byte                 `protobuf:"bytes,2,opt,name=entrypoint_binding_digest,json=entrypointBindingDigest,proto3" json:"entrypoint_binding_digest,omitempty"`
-	Slots                   []*Slot                `protobuf:"bytes,3,rep,name=slots,proto3" json:"slots,omitempty"` // sorted unique by slot; [] for a weightless entrypoint
-	unknownFields           protoimpl.UnknownFields
-	sizeCache               protoimpl.SizeCache
+	EntrypointBindingDigest []byte                 `protobuf:"bytes,2,opt,name=entrypoint_binding_digest,json=entrypointBindingDigest,proto3" json:"entrypoint_binding_digest,omitempty"` // sha256(canonical JSON of exactly
+	// {name:<field 1>,slots:<field 3>})
+	Slots         []*Slot `protobuf:"bytes,3,rep,name=slots,proto3" json:"slots,omitempty"` // sorted unique by slot; [] for a weightless entrypoint
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
 }
 
 func (x *Entrypoint) Reset() {

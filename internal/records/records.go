@@ -30,29 +30,30 @@ import (
 // which the wire spends on executor and admission generations; the local install is not
 // one of those, and one word for three fences is how they drift (#484).
 type PackageInstall struct {
-	ID                string
-	Package           string // org/name
-	Major             int
-	Version           string
-	SourceKind        string // "archive" | "dir"
-	SourceRef         string
-	SourceDigest      string
-	Verified          bool // false = installed through the --allow-unsigned development door
-	Dir               string
-	Python            string
-	Runtime           string // exact cozy-runtime binary; empty on older source installs derives from venv
-	ProjectDir        string // exact installed project root; empty on source installs derives from source kind
-	UV                string
-	LockDigest        string
-	Platform          string
-	Extra             string // the CUDA-extra pick ("" = none declared or no accelerator)
-	LinkMode          string // "hardlink" | "copy" (cross-mount degradation)
-	Packages          int
-	Closure           string // one "name==version" per line
-	PackageDescriptor string // exact digest of the generation-private Runtime-derived descriptor
-	BytesExcl         int64
-	BytesShared       int64
-	CreatedAt         string
+	ID                 string
+	Package            string // org/name
+	Major              int
+	Version            string
+	SourceKind         string // "archive" | "dir"
+	SourceRef          string
+	SourceDigest       string
+	Verified           bool // false = installed through the --allow-unsigned development door
+	Dir                string
+	Python             string
+	Runtime            string // exact cozy-runtime binary; empty on older source installs derives from venv
+	ProjectDir         string // exact installed project root; empty on source installs derives from source kind
+	UV                 string
+	LockDigest         string
+	Platform           string
+	Extra              string // the CUDA-extra pick ("" = none declared or no accelerator)
+	LinkMode           string // "hardlink" | "copy" (cross-mount degradation)
+	Packages           int
+	Closure            string // one "name==version" per line
+	PackageDescriptor  string // exact digest of the generation-private Runtime-derived descriptor
+	PlacementSetDigest string // exact Hub-selected PlacementSet/3 stored in the artifact cache
+	BytesExcl          int64
+	BytesShared        int64
+	CreatedAt          string
 }
 
 // Pin is the active install for one (package, major). Two majors of one package coexist
@@ -90,6 +91,7 @@ CREATE TABLE IF NOT EXISTS install_generations (
   packages      INTEGER NOT NULL,
   closure       TEXT    NOT NULL,
   package_descriptor TEXT    NOT NULL,
+  placement_set_digest TEXT  NOT NULL DEFAULT '',
   bytes_excl    INTEGER NOT NULL,
   bytes_shared  INTEGER NOT NULL,
   created_at    TEXT    NOT NULL
@@ -118,6 +120,8 @@ var renames = []struct{ table, from, to string }{
 	{"placement_acquisition_observations", "endpoint_reused_bytes", "package_reused_bytes"},
 	{"requests", "endpoint", "package"},
 	{"rentals", "endpoint_ref", "package_ref"},
+	{"rentals", "control_snapshot_digest", "placement_set_digest"},
+	{"rentals", "control_snapshot_bytes", "placement_set_bytes"},
 }
 
 // pragmas ride the DSN rather than being executed after the open, because a pragma is a
@@ -256,7 +260,7 @@ func (s *Store) Close() { _ = s.db.Close() }
 var genFields = []string{
 	"id", "package", "major", "version", "source_kind", "source_ref", "source_digest",
 	"verified", "dir", "python", "runtime", "project_dir", "uv", "lock_digest", "platform", "extra", "link_mode",
-	"packages", "closure", "package_descriptor", "bytes_excl", "bytes_shared", "created_at",
+	"packages", "closure", "package_descriptor", "placement_set_digest", "bytes_excl", "bytes_shared", "created_at",
 }
 
 // genCols is the select list, optionally table-qualified for a join.
@@ -277,7 +281,7 @@ func scanGen(rows interface{ Scan(...any) error }) (PackageInstall, error) {
 	var verified int
 	err := rows.Scan(&g.ID, &g.Package, &g.Major, &g.Version, &g.SourceKind, &g.SourceRef,
 		&g.SourceDigest, &verified, &g.Dir, &g.Python, &g.Runtime, &g.ProjectDir, &g.UV, &g.LockDigest, &g.Platform,
-		&g.Extra, &g.LinkMode, &g.Packages, &g.Closure, &g.PackageDescriptor,
+		&g.Extra, &g.LinkMode, &g.Packages, &g.Closure, &g.PackageDescriptor, &g.PlacementSetDigest,
 		&g.BytesExcl, &g.BytesShared, &g.CreatedAt)
 	g.Verified = verified == 1
 	return g, err
@@ -309,7 +313,8 @@ func (s *Store) Activate(g PackageInstall) (superseded string, e *exit.Error) {
 		VALUES(`+placeholders()+`)`,
 		g.ID, g.Package, g.Major, g.Version, g.SourceKind, g.SourceRef, g.SourceDigest,
 		verified, g.Dir, g.Python, g.Runtime, g.ProjectDir, g.UV, g.LockDigest, g.Platform, g.Extra, g.LinkMode,
-		g.Packages, g.Closure, g.PackageDescriptor, g.BytesExcl, g.BytesShared, g.CreatedAt); err != nil {
+		g.Packages, g.Closure, g.PackageDescriptor, g.PlacementSetDigest,
+		g.BytesExcl, g.BytesShared, g.CreatedAt); err != nil {
 		return "", exit.Internalf("cannot insert generation %s: %s", g.ID, err)
 	}
 	if _, err := tx.Exec(`INSERT INTO pins(package,major,generation,activated_at)

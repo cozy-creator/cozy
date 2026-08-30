@@ -77,20 +77,24 @@ type Rental struct {
 	// see that the hash of the token it minted is one the pod was provisioned with —
 	// a comparison neither end can make by saying the token.
 	MediaTokenSHA256 []string
-	// ControlSnapshot is Tensorhub's exact acquisition-attempt control truth. Its
-	// canonical bytes were persisted before provider Create; Cozy verifies and
-	// stores those same bytes before publishing a remote target.
-	ControlSnapshot   *ExactControlDocument
+	// Selection is the exact PlacementSet and its three small referenced documents.
+	// It is the same DTO package install returns for a local venv.
+	Selection         *PackageSelection
 	PlacementRevision uint64
 }
 
-// ExactControlDocument is one bounded exact-byte document transported by the
-// existing ready rental view. CanonicalBytes is base64 on JSON; Digest and
-// Length fence the decoded bytes.
-type ExactControlDocument struct {
+type ExactDocument struct {
 	CanonicalBytes []byte `json:"canonical_bytes"`
 	Digest         string `json:"digest"`
 	Length         int64  `json:"length"`
+}
+
+type PackageSelection struct {
+	Profile           string        `json:"profile"`
+	PlacementSet      ExactDocument `json:"placement_set"`
+	PackageRelease    ExactDocument `json:"package_release"`
+	PackageDescriptor ExactDocument `json:"package_descriptor"`
+	Qualification     ExactDocument `json:"qualification"`
 }
 
 // Ready answers whether this rental carries the whole dial triple and an observed
@@ -99,7 +103,7 @@ type ExactControlDocument struct {
 func (r Rental) Ready() bool {
 	return r.State == RentalReady && r.Address != "" && r.MediaAddress != "" &&
 		r.CertPEM != "" && r.WorkerID != "" && r.WorkerBootID != "" && r.CreatorPublicKey != "" &&
-		len(r.MediaTokenSHA256) > 0 && r.ControlSnapshot != nil &&
+		len(r.MediaTokenSHA256) > 0 && r.Selection != nil &&
 		r.PlacementRevision > 0
 }
 
@@ -112,7 +116,7 @@ func (r Rental) Attachable() bool {
 	return (r.State == RentalConverging || r.State == RentalReady) &&
 		r.Address != "" && r.MediaAddress != "" && r.CertPEM != "" &&
 		r.WorkerID != "" && r.WorkerBootID != "" && r.CreatorPublicKey != "" && len(r.MediaTokenSHA256) > 0 &&
-		r.ControlSnapshot != nil && r.PlacementRevision > 0
+		r.Selection != nil && r.PlacementRevision > 0
 }
 
 // HoldsMediaHash answers whether the pod media plane's live set carries this hash.
@@ -129,20 +133,20 @@ func (r Rental) HoldsMediaHash(hash string) bool {
 
 // wireRental is the answer's own shape.
 type wireRental struct {
-	ID                string                `json:"rental_id"`
-	State             string                `json:"state"`
-	PackageRef        string                `json:"package_ref"`
-	AcceleratorModel  string                `json:"requested_accelerator_model"`
-	WorkerAddress     string                `json:"worker_address"`
-	CertPEM           string                `json:"cert_pem"`
-	Detail            string                `json:"detail"`
-	MediaAddress      string                `json:"media_address"`
-	WorkerID          string                `json:"worker_id"`
-	WorkerBootID      string                `json:"worker_boot_id"`
-	CreatorPublicKey  string                `json:"creator_public_key"`
-	MediaTokenSHA256  []string              `json:"media_token_sha256"`
-	ControlSnapshot   *ExactControlDocument `json:"control_snapshot"`
-	PlacementRevision uint64                `json:"placement_revision"`
+	ID                string            `json:"rental_id"`
+	State             string            `json:"state"`
+	PackageRef        string            `json:"package_ref"`
+	AcceleratorModel  string            `json:"requested_accelerator_model"`
+	WorkerAddress     string            `json:"worker_address"`
+	CertPEM           string            `json:"cert_pem"`
+	Detail            string            `json:"detail"`
+	MediaAddress      string            `json:"media_address"`
+	WorkerID          string            `json:"worker_id"`
+	WorkerBootID      string            `json:"worker_boot_id"`
+	CreatorPublicKey  string            `json:"creator_public_key"`
+	MediaTokenSHA256  []string          `json:"media_token_sha256"`
+	Selection         *PackageSelection `json:"selection"`
+	PlacementRevision uint64            `json:"desired_revision"`
 }
 
 var bareSHA256Pattern = regexp.MustCompile(`^[0-9a-f]{64}$`)
@@ -169,7 +173,7 @@ func (w wireRental) rental() Rental {
 		Detail: w.Detail, MediaAddress: w.MediaAddress,
 		WorkerID: w.WorkerID, WorkerBootID: w.WorkerBootID,
 		CreatorPublicKey: w.CreatorPublicKey,
-		MediaTokenSHA256: w.MediaTokenSHA256, ControlSnapshot: w.ControlSnapshot,
+		MediaTokenSHA256: w.MediaTokenSHA256, Selection: w.Selection,
 		PlacementRevision: w.PlacementRevision,
 	}
 }
@@ -178,20 +182,32 @@ func (w wireRental) rental() Rental {
 // datacenter, offer, image, cache volume, disk, and ports do not have fields
 // here: Tensorhub resolves and selects them.
 type RentalRequest struct {
-	PackageRef       string `json:"package_ref"`
-	SKU              string `json:"sku"`
-	MediaTokenSHA256 string `json:"media_token_sha256"`
-	CreatorPublicKey string `json:"creator_public_key"`
+	PackageRef       string           `json:"package_ref"`
+	ModelSelections  []ModelSelection `json:"model_selections"`
+	SKU              string           `json:"sku"`
+	MediaTokenSHA256 string           `json:"media_token_sha256"`
+	CreatorPublicKey string           `json:"creator_public_key"`
+}
+
+type ModelSelection struct {
+	ID       string `json:"id"`
+	ModelRef string `json:"model_ref"`
+	Lane     string `json:"lane"`
 }
 
 // RentalRequestBytes authors the exact bytes persisted before POST and replayed
 // unchanged after response loss. There is one encoder, not a digest struct plus
 // a separately marshaled transport map that can drift.
-func RentalRequestBytes(packageRef, sku, mediaTokenSHA256, creatorPublicKey string) ([]byte, *exit.Error) {
+func RentalRequestBytes(packageRef string, models []ModelSelection, sku, mediaTokenSHA256,
+	creatorPublicKey string) ([]byte, *exit.Error) {
 	req := RentalRequest{
 		PackageRef: strings.TrimSpace(packageRef), SKU: strings.TrimSpace(sku),
 		MediaTokenSHA256: strings.TrimPrefix(strings.TrimSpace(mediaTokenSHA256), "sha256:"),
 		CreatorPublicKey: strings.TrimSpace(creatorPublicKey),
+		ModelSelections:  append([]ModelSelection{}, models...),
+	}
+	if e := validateModelSelections(req.ModelSelections); e != nil {
+		return nil, e
 	}
 	public, publicErr := base64.RawURLEncoding.DecodeString(req.CreatorPublicKey)
 	if req.PackageRef == "" || req.SKU == "" ||
@@ -204,6 +220,64 @@ func RentalRequestBytes(packageRef, sku, mediaTokenSHA256, creatorPublicKey stri
 		return nil, exit.Internalf("cannot encode the closed rental request: %s", err)
 	}
 	return raw, nil
+}
+
+func PlacementRequestBytes(packageRef string, models []ModelSelection) ([]byte, *exit.Error) {
+	request := struct {
+		PackageRef      string           `json:"package_ref"`
+		ModelSelections []ModelSelection `json:"model_selections"`
+	}{PackageRef: strings.TrimSpace(packageRef), ModelSelections: append([]ModelSelection{}, models...)}
+	if request.PackageRef == "" {
+		return nil, exit.Named(exit.Validation, "rental.intent_incomplete", "package_ref is required")
+	}
+	if e := validateModelSelections(models); e != nil {
+		return nil, e
+	}
+	raw, err := json.Marshal(request)
+	if err != nil {
+		return nil, exit.Internalf("cannot encode placement request: %s", err)
+	}
+	return raw, nil
+}
+
+func validateModelSelections(models []ModelSelection) *exit.Error {
+	prior := ""
+	for _, model := range models {
+		if strings.TrimSpace(model.ID) == "" || strings.TrimSpace(model.ModelRef) == "" ||
+			strings.TrimSpace(model.Lane) == "" || model.ID <= prior {
+			return exit.Named(exit.Validation, "rental.model_selections_invalid",
+				"model selections must be complete, unique, and sorted by id")
+		}
+		prior = model.ID
+	}
+	return nil
+}
+
+type RentalPlacementResult struct {
+	RentalID        string           `json:"rental_id"`
+	PackageRef      string           `json:"package_ref"`
+	DesiredRevision uint64           `json:"desired_revision"`
+	Selection       PackageSelection `json:"selection"`
+}
+
+func (c *Client) ReplaceRentalPlacement(ctx context.Context, id string, body []byte,
+	operationKey string) (RentalPlacementResult, *exit.Error) {
+	var out RentalPlacementResult
+	if e := validateRentalID(id); e != nil {
+		return out, e
+	}
+	e := c.do(ctx, call{method: http.MethodPut,
+		path: "/v1/rentals/" + url.PathEscape(id) + "/placement", auth: true,
+		reason: "cozy rental placement replacement", idempotency: operationKey,
+		bodyBytes: body, strict: true, responseBytes: maxRentalResponseBytes}, &out)
+	if e != nil {
+		return out, e
+	}
+	if out.RentalID != id || out.PackageRef == "" || out.DesiredRevision < 2 || out.Selection.Profile == "" {
+		return out, exit.Named(exit.Conflict, "rental.placement_response_invalid",
+			"Tensorhub returned an invalid rental placement replacement")
+	}
+	return out, nil
 }
 
 // RentalSKU is one Cozy-priced product choice. Provider offer names and prices

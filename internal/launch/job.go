@@ -7,6 +7,8 @@ import (
 	"github.com/cozy-creator/cozy/internal/orchestrator"
 )
 
+const gib = 1 << 30
+
 // THE JOB HALF of an installed generation (cl-004). A job is an attempt class on the one
 // machinery (cr-009), so this file mints exactly what the serving half mints — a local
 // plan record and the digest that names it — over the descriptor's `jobs` list instead of
@@ -63,10 +65,9 @@ func (f *Facts) JobSpec(function string, devices []string) (orchestrator.WorkerL
 	}
 	spec := orchestrator.WorkerLaunchSpec{
 		Placement: orchestrator.DesiredPlacement{
-			Package:                 f.Install.Package,
-			PackageReleaseID:        PackageReleaseID(f.Install),
-			InstallID:               f.Install.ID,
-			PackageDescriptorDigest: f.Install.PackageDescriptor,
+			Package:          f.Install.Package,
+			PackageReleaseID: PackageReleaseID(f.Install),
+			InstallID:        f.Install.ID,
 			Jobs: []*orchestrator.JobPlan{{
 				Function:        facts.Name,
 				DescriptorID:    facts.DescriptorID,

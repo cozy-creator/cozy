@@ -3,7 +3,7 @@ package cli
 import (
 	"context"
 	"fmt"
-	"sort"
+	"path/filepath"
 	"strings"
 	"sync"
 	"time"
@@ -32,36 +32,25 @@ func handlePackagePublish(ctx *Context) *exit.Error {
 	c := client(ctx)
 	hctx, cancel := hub.LongContext()
 	defer cancel()
-	begun, problem := c.BeginPackageRelease(hctx, ref, release, reason)
+	if problem := packagePublishStage(ctx, "Building package wheel and local dependencies", func() *exit.Error {
+		return pack.Build(hctx)
+	}); problem != nil {
+		return problem
+	}
+	paths := packagepublish.Paths(pack.Files)
+	dependencyWheels := packagepublish.WheelFilenames(pack.DependencyWheels)
+	packagePublishStatus(ctx, "Declaring %d source files and %d dependency wheels...",
+		len(paths), len(dependencyWheels))
+	draft, problem := c.DeclarePackageRelease(hctx, ref, release, paths, dependencyWheels, reason)
 	if problem != nil {
 		return problem
 	}
-	if begun.State != "pending" && begun.State != "committed" {
-		return exit.Internalf("package begin returned invalid state %q", begun.State)
+	if draft.State != "pending" && draft.State != "committed" {
+		return exit.Internalf("package declaration returned invalid state %q", draft.State)
 	}
 	var moved int64
-	if begun.State == "pending" {
-		if problem := packagePublishStage(ctx, "Building package wheel and local dependencies", func() *exit.Error {
-			return pack.Build(hctx)
-		}); problem != nil {
-			return problem
-		}
-		paths := packagepublish.Paths(pack.Files)
-		dependencyWheels := packagepublish.WheelFilenames(pack.DependencyWheels)
-		packagePublishStatus(ctx, "Registering %d source files and %d dependency wheels...",
-			len(paths), len(dependencyWheels))
-		var uploads []hub.PackageUpload
-		for len(paths) > 0 || dependencyWheels != nil {
-			n := min(len(paths), 1000)
-			batch, problem := c.PackageReleaseUploads(hctx, ref, release, paths[:n], dependencyWheels, reason)
-			if problem != nil {
-				return problem
-			}
-			uploads = append(uploads, batch.Uploads...)
-			paths = paths[n:]
-			dependencyWheels = nil
-		}
-		moved, problem = uploadPackageFiles(hctx, pack, begun.ProjectWheelUpload, uploads,
+	if draft.State == "pending" {
+		moved, problem = uploadPackageFiles(hctx, pack, draft.Uploads,
 			packageUploadCounter(ctx))
 		if problem != nil {
 			return problem
@@ -69,48 +58,20 @@ func handlePackagePublish(ctx *Context) *exit.Error {
 	} else {
 		packagePublishStatus(ctx, "Release already published; refreshing status...")
 	}
-	var done hub.PackageReleaseFinalize
-	problem = packagePublishStage(ctx, "Finalizing release and evaluating worker profiles", func() *exit.Error {
+	var done hub.PackageReleaseCommit
+	problem = packagePublishStage(ctx, "Committing exact package release", func() *exit.Error {
 		var finalProblem *exit.Error
-		done, finalProblem = c.FinalizePackageRelease(hctx, ref, release, reason)
+		done, finalProblem = c.CommitPackageRelease(hctx, ref, release, reason)
 		return finalProblem
 	})
 	if problem != nil {
 		return problem
 	}
-	if strings.TrimSpace(done.QualificationState) == "" {
-		return exit.Internalf("package finalize returned no qualification state")
+	if done.State != "committed" || done.PackageRelease.Digest == "" ||
+		done.PackageRelease.Length != int64(len(done.PackageRelease.CanonicalBytes)) {
+		return exit.Internalf("package commit returned no exact PackageRelease")
 	}
-	profileRows := make([]string, 0, len(done.Profiles))
-	var candidateRows, refusalRows []string
-	for _, profile := range done.Profiles {
-		profileRows = append(profileRows, profile.Profile+":"+profile.State+":"+profile.BaseRealizationKind+"@"+
-			profile.BaseRealizationDigest)
-		if profile.State == "qualified" {
-			candidateRows = append(candidateRows, profile.Profile+"/"+profile.BaseRealizationKind+"="+profile.CandidateID)
-		} else {
-			refusal := profile.Profile + "/" + profile.BaseRealizationKind + " " + profile.RefusalCode
-			if profile.RefusalDetail != "" {
-				refusal += ": " + shorten(profile.RefusalDetail, 240)
-			}
-			refusalRows = append(refusalRows, refusal)
-		}
-	}
-	eligibleSet := map[string]bool{}
-	for _, execution := range done.PackageExecutions {
-		if execution.State == "qualified" && execution.Profile != "" {
-			eligibleSet[execution.Profile] = true
-		}
-	}
-	eligibleWorkerProfiles := make([]string, 0, len(eligibleSet))
-	for profile := range eligibleSet {
-		eligibleWorkerProfiles = append(eligibleWorkerProfiles, profile)
-	}
-	sort.Strings(profileRows)
-	sort.Strings(candidateRows)
-	sort.Strings(eligibleWorkerProfiles)
-	sort.Strings(refusalRows)
-	replay := begun.State == "committed"
+	replay := draft.State == "committed"
 	status := "published"
 	if replay {
 		status = "already published"
@@ -118,48 +79,14 @@ func handlePackagePublish(ctx *Context) *exit.Error {
 	fields := []output.Field{
 		{K: "package", V: ref.String()}, {K: "release", V: release},
 		{K: "status", V: status}, {K: "changed", V: !replay},
-	}
-	if done.QualificationState != "qualified" {
-		fields = append(fields, output.Field{K: "qualification", V: done.QualificationState})
-	}
-	fields = append(fields, []output.Field{
-		{K: "qualification_error", V: done.QualificationError},
-		{K: "compatible_profiles", V: done.CompatibleProfiles}, {K: "profiles", V: profileRows},
-		{K: "eligible_worker_profiles", V: eligibleWorkerProfiles},
-		{K: "requires_python", V: done.RequiresPython}, {K: "requirements", V: done.Requirements},
+		{K: "package_release_digest", V: done.PackageRelease.Digest},
 		{K: "uploaded", V: output.Bytes(moved)}, {K: "hub", V: c.Base()},
-	}...)
-	if len(candidateRows) > 0 {
-		fields = append(fields, output.Field{K: "candidates", V: candidateRows})
-	}
-	if len(refusalRows) > 0 {
-		fields = append(fields, output.Field{K: "profile_refusals", V: refusalRows})
 	}
 	defaults := []string{"package", "release", "status"}
 	if !replay {
-		if done.QualificationState != "qualified" {
-			defaults = append(defaults, "qualification", "requires_python", "requirements", "compatible_profiles")
-		}
-		if done.QualificationState == "refused" && len(refusalRows) > 0 {
-			defaults = append(defaults, "profile_refusals")
-		}
-		if done.QualificationError != "" {
-			defaults = append(defaults, "qualification_error")
-		}
-		defaults = append(defaults, "eligible_worker_profiles", "uploaded", "changed")
+		defaults = append(defaults, "package_release_digest", "uploaded", "changed")
 	}
-	record := compactRecord(fields, defaults...)
-	if !replay {
-		switch done.QualificationState {
-		case "pending":
-			record.Notes = append(record.Notes,
-				"published successfully; Tensorhub will qualify it when a compatible base worker image becomes active")
-		case "refused", "unsupported":
-			record.Notes = append(record.Notes,
-				"published successfully, but no execution is currently eligible for placement")
-		}
-	}
-	return emit(ctx, record)
+	return emit(ctx, compactRecord(fields, defaults...))
 }
 
 func shorten(value string, limit int) string {
@@ -179,11 +106,10 @@ type packageFile struct {
 
 const maxConcurrentPackageUploads = 16
 
-func uploadPackageFiles(ctx context.Context, pack *packagepublish.Package, wheel hub.PackageUpload,
+func uploadPackageFiles(ctx context.Context, pack *packagepublish.Package,
 	uploads []hub.PackageUpload, progress func(completed, total int),
 ) (int64, *exit.Error) {
-	files := make([]packageFile, 0, len(uploads)+1)
-	files = append(files, packageFile{subject: "project_wheel", path: pack.Wheel, upload: wheel})
+	files := make([]packageFile, 0, len(uploads))
 	wantSources := make(map[string]string, len(pack.Files))
 	for path, local := range pack.Files {
 		wantSources[path] = local
@@ -192,10 +118,17 @@ func uploadPackageFiles(ctx context.Context, pack *packagepublish.Package, wheel
 	for _, dependency := range pack.DependencyWheels {
 		wantDependencies[dependency.Filename] = dependency.Path
 	}
+	wantProject := true
 	for _, upload := range uploads {
 		var local string
 		var ok bool
 		switch upload.Kind {
+		case "project_wheel":
+			if !wantProject || upload.Path != filepath.Base(pack.Wheel) {
+				return 0, exit.Internalf("package uploads returned unknown project wheel %q", upload.Path)
+			}
+			local, ok = pack.Wheel, true
+			wantProject = false
 		case "source":
 			local, ok = wantSources[upload.Path]
 			delete(wantSources, upload.Path)
@@ -210,7 +143,7 @@ func uploadPackageFiles(ctx context.Context, pack *packagepublish.Package, wheel
 		}
 		files = append(files, packageFile{subject: upload.Path, path: local, upload: upload})
 	}
-	if len(wantSources) != 0 || len(wantDependencies) != 0 {
+	if wantProject || len(wantSources) != 0 || len(wantDependencies) != 0 {
 		return 0, exit.Internalf("package uploads omitted %d source files and %d dependency wheels",
 			len(wantSources), len(wantDependencies))
 	}

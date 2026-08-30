@@ -19,7 +19,6 @@ import (
 
 	"github.com/cozy-creator/cozy/internal/exit"
 	"github.com/cozy-creator/cozy/internal/packagepublish"
-	"github.com/cozy-creator/cozy/internal/records"
 	"github.com/cozy-creator/cozy/internal/wheel"
 )
 
@@ -52,7 +51,7 @@ func TestPackagePublishMetadataGrammar(t *testing.T) {
 		t.Fatalf("package publish retained caller-authored identity [exit %d]\n%s", code, help)
 	}
 	if code, help := runCozy(t, root, "package", "install", "--help"); code != 0 ||
-		strings.Contains(help, "--profile") || strings.Contains(help, "--major") ||
+		strings.Contains(help, "--major") ||
 		strings.Contains(help, "--from") || strings.Contains(help, "--dir") ||
 		strings.Contains(help, "--digest") || strings.Contains(help, "--allow-unsigned") ||
 		strings.Contains(help, "--force") {
@@ -602,10 +601,9 @@ func TestDaemonStartupDiagnostic(t *testing.T) {
 
 const maxDaemonDiagnosticOutput = 18 << 10
 
-// TestProductPath drives only the public Kong surface: install a real weightless
-// release, auto-start the daemon on invoke, cross Runtime and the worker wire,
-// accept an output, release idle residency, then stop cleanly.
-func TestProductPath(t *testing.T) {
+// A local archive remains a build/install input, but cannot invent the exact
+// PackageRelease, Qualification, and PlacementSet required for execution.
+func TestDevelopmentInstallIsNotRunnable(t *testing.T) {
 	root := filepath.Join(os.TempDir(), "cozy-product-test", "product")
 	must(t, os.RemoveAll(root))
 	must(t, os.MkdirAll(root, 0o755))
@@ -625,60 +623,10 @@ func TestProductPath(t *testing.T) {
 		t.Fatalf("package list omitted the install [exit %d]\n%s", code, out)
 	}
 
-	outDir := filepath.Join(root, "out")
 	code, out = runCozy(t, root, "invoke", "run", weightlessRef+"/v1/tile",
-		"size=32", "seed=7", "--out", outDir)
-	if code != 0 {
-		t.Fatalf("invoke run [exit %d]\n%s", code, out)
-	}
-	saved := filepath.Join(outDir, "image.png")
-	image, err := os.ReadFile(saved)
-	if err != nil || len(image) < 8 || string(image[1:4]) != "PNG" {
-		t.Fatalf("invoke did not publish its declared PNG at %s: %v", saved, err)
-	}
-	// A second invocation reuses the same warm serving worker rather than spawning
-	// another process onto the device envelope.
-	secondOut := filepath.Join(root, "out-2")
-	if code, out := runCozy(t, root, "invoke", "run", weightlessRef+"/v1/tile",
-		"size=16", "seed=8", "--out", secondOut); code != 0 {
-		t.Fatalf("warm invoke [exit %d]\n%s", code, out)
-	}
-	store, problem := records.Open(filepath.Join(root, "records.db"))
-	fatal(t, problem)
-	workers, problem := store.LiveWorkers()
-	fatal(t, problem)
-	store.Close()
-	localWorkers := 0
-	for _, worker := range workers {
-		if worker.WorkerID != "remote" {
-			localWorkers++
-		}
-	}
-	if localWorkers != 1 {
-		t.Fatalf("warm reuse left %d local workers; wanted exactly one", localWorkers)
-	}
-
-	code, listed := runCozy(t, root, "invoke", "list", "--json")
-	if code != 0 {
-		t.Fatalf("invoke list [exit %d]\n%s", code, listed)
-	}
-	var document map[string]any
-	err = json.Unmarshal([]byte(listed), &document)
-	invocations, ok := document["invocations"].([]any)
-	if err != nil || !ok || len(invocations) != 2 {
-		t.Fatalf("invoke list is not one successful JSON document: %v\n%s", err, listed)
-	}
-	if code, out := runCozy(t, root, "invoke", "run", weightlessRef+"/v1/nosuch"); code != 1 ||
-		!strings.Contains(out, "registers no function") {
-		t.Fatalf("operational refusal was not shell exit 1 with detail [exit %d]\n%s", code, out)
-	}
-
-	if code, out := runCozy(t, root, "unload"); code != 0 || !strings.Contains(out, weightlessRef) {
-		t.Fatalf("unload [exit %d]\n%s", code, out)
-	}
-	if code, out := runCozy(t, root, "down"); code != 0 ||
-		!strings.Contains(out, "daemon:") || !strings.Contains(out, "stopped") {
-		t.Fatalf("down [exit %d]\n%s", code, out)
+		"size=32", "seed=7")
+	if code != 1 || !strings.Contains(out, "without an exact Hub-selected PlacementSet") {
+		t.Fatalf("development install became runnable [exit %d]\n%s", code, out)
 	}
 }
 

@@ -389,15 +389,11 @@ func validateInputs(entrypoint *launch.Entrypoint, out *orchestrator.Submission)
 }
 
 func placementPlan(placement orchestrator.DesiredPlacement, function string) (string, []string, *exit.Error) {
-	for _, binding := range placement.Bindings {
-		if binding.Entrypoint != function {
+	for _, entrypoint := range placement.Entrypoints {
+		if entrypoint.Name != function {
 			continue
 		}
-		id, e := binding.PlanID()
-		if e != nil {
-			return "", nil, e
-		}
-		return id, append([]string(nil), binding.Outputs...), nil
+		return entrypoint.Digest, append([]string(nil), entrypoint.Outputs...), nil
 	}
 	return "", nil, exit.New(exit.NotFound, "%s has no function %q", placement.Package, function).
 		WithRemedy("GET /v1/local/packages lists the functions this target serves")

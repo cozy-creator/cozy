@@ -158,48 +158,6 @@ func condense(s string) string {
 	return s
 }
 
-// Binding is one RESOLVED binding record, exactly as `cozy-runtime bindings` reports it.
-// It is the runtime's own resolution of `package.toml`'s selection grammar against the
-// declared slots and the local artifact index. cozy-creator asks the owner rather than
-// reading the table itself: cr-016 built this verb so that second reader could delete.
-type Binding struct {
-	Path       string            `json:"model_binding_path"`
-	Param      string            `json:"model_parameter_name"`
-	ModelClass string            `json:"model_class"`
-	Ref        string            `json:"ref"`
-	Lane       string            `json:"lane"`
-	Source     string            `json:"source"`
-	Components []string          `json:"components"`
-	Store      string            `json:"store"`
-	Snapshots  map[string]string `json:"snapshots"`
-	Custody    string            `json:"custody"`
-	Installed  bool              `json:"installed"`
-}
-
-// WeightlessPlan is one exact ArtifactSubject for a canonical weightless binding plan.
-// The runtime is the sole writer of those documents. Cozy consumes their identities
-// here before spawn and never reconstructs the private bytes.
-type WeightlessPlan struct {
-	Entrypoint string `json:"entrypoint"`
-	SubjectID  string `json:"subject_id"`
-	Kind       string `json:"kind"`
-	Digest     string `json:"digest"`
-	Length     uint64 `json:"length"`
-}
-
-// Bindings is what this project SELECTS, resolved by the one resolver that owns the
-// grammar. It constructs nothing, touches no device and loads no weights.
-func (r RuntimeCLI) Bindings() ([]Binding, []WeightlessPlan, *exit.Error) {
-	var doc struct {
-		Bindings        []Binding        `json:"bindings"`
-		WeightlessPlans []WeightlessPlan `json:"weightless_plans"`
-	}
-	if e := r.query(&doc, "bindings"); e != nil {
-		return nil, nil, e
-	}
-	return doc.Bindings, doc.WeightlessPlans, nil
-}
-
 // Verdict is one function's fit verdict, as the runtime's own document carries it.
 type Verdict struct {
 	Function string `json:"function"`
