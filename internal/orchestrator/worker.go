@@ -129,7 +129,13 @@ func PlacementFromExact(pkg, installID, digest string, data []byte,
 		return DesiredPlacement{}, exit.Named(exit.Structural, "placement_set_incomplete",
 			"PlacementSet omits its placement, package release, or environment identity")
 	}
-	if !digestMatches(row["environment"], placement.EnvironmentDigest) {
+	environment := row.Sub("environment")
+	environmentIdentity := map[string]canonical.Value{
+		"format":              "cozy.worker.v1.Environment/1",
+		"wheelhouse_manifest": environment["wheelhouse_manifest"],
+		"wheels":              environment["wheels"],
+	}
+	if !digestMatches(environmentIdentity, placement.EnvironmentDigest) {
 		return DesiredPlacement{}, exit.Named(exit.Conflict, "environment_identity_mismatch",
 			"environment_digest does not hash the exact nested Environment")
 	}
