@@ -419,6 +419,17 @@ func scanRental(row interface{ Scan(...any) error }) (Rental, error) {
 // ready must land on the same row rather than accumulate one per poll. State only moves
 // forward: a delayed poll answering `acquiring` after `ready` was recorded is stale.
 func (s *Store) RecordRental(r Rental) *exit.Error {
+	var problem *exit.Error
+	for range 3 {
+		problem = s.recordRental(r)
+		if problem == nil || !strings.Contains(problem.Message, "SQLITE_BUSY") {
+			return problem
+		}
+	}
+	return problem
+}
+
+func (s *Store) recordRental(r Rental) *exit.Error {
 	if r.MachineName == "" || r.SKU == "" {
 		var existingName, existingSKU string
 		err := s.db.QueryRow(`SELECT machine_name,sku FROM rentals WHERE id=?`, r.ID).
