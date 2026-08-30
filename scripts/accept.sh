@@ -43,11 +43,11 @@ run -v
 check "-v reports the release tag without loading config" "$([ "$CODE" = 0 ] && [ "$OUT" = "$WANT_TAG" ] && echo 1 || echo 0)" "$OUT"
 
 run
-for command in "package install" "model download" "auth login" "invoke run" "rental new" "up" "down" "unload"; do
+for command in "package install" "model download" "auth login" "run cancel" "rental new" "up" "down" "unload"; do
   check "root help exposes $command" "$(printf '%s' "$OUT" | grep -q "$command" && echo 1 || echo 0)" "$OUT"
 done
-run help invoke run
-check "contextual Kong help works" "$([ "$CODE" = 0 ] && printf '%s' "$OUT" | grep -q 'Usage: cozy invoke run' && echo 1 || echo 0)" "$OUT"
+run help run
+check "contextual Kong help works" "$([ "$CODE" = 0 ] && printf '%s' "$OUT" | grep -q 'Usage: cozy run' && echo 1 || echo 0)" "$OUT"
 run package
 check "bare noun group shows focused help" "$([ "$CODE" = 0 ] && printf '%s' "$OUT" | grep -q 'Usage: cozy package <command>' && echo 1 || echo 0)" "$OUT"
 
@@ -61,8 +61,8 @@ check "up creates no persistent daemon log" "$([ ! -e "$COZY_HOME/daemon.log" ] 
 run down
 check "down stops the explicit daemon" "$([ "$CODE" = 0 ] && printf '%s' "$OUT" | grep -Eq 'daemon: +stopped' && echo 1 || echo 0)" "$OUT"
 
-run invoke list --json
-check "invoke can auto-start the same daemon" "$([ "$CODE" = 0 ] && [ -f "$COZY_HOME/daemon.lock" ] && [ -f "$COZY_HOME/client.cred" ] && echo 1 || echo 0)" "$OUT"
+run run list --json
+check "run list can auto-start the same daemon" "$([ "$CODE" = 0 ] && [ -f "$COZY_HOME/daemon.lock" ] && [ -f "$COZY_HOME/client.cred" ] && echo 1 || echo 0)" "$OUT"
 check "JSON success is domain-shaped without renderer scaffolding" "$(printf '%s' "$OUT" | grep -q '"invocations":\[\]' && ! printf '%s' "$OUT" | grep -Eq '"(ok|kind|data|fields|rows|count|aggregates)"' && echo 1 || echo 0)" "$OUT"
 
 run unload
@@ -73,7 +73,7 @@ if [ -n "$ENDPOINT" ] && [ -f "$ENDPOINT" ]; then
   run package install cozy/weightless --from "$ENDPOINT" --digest "$DIGEST"
   check "package install verifies the release" "$([ "$CODE" = 0 ] && printf '%s' "$OUT" | grep -q 'cozy/weightless' && echo 1 || echo 0)" "$OUT"
 
-  run invoke run cozy/weightless/tile size=32 seed=7 --out "$COZY_HOME/out"
+  run run cozy/weightless/tile size=32 seed=7 --out "$COZY_HOME/out"
   check "one real package invocation completes" "$([ "$CODE" = 0 ] && [ -s "$COZY_HOME/out/image.png" ] && echo 1 || echo 0)" "$OUT"
 fi
 

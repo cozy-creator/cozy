@@ -102,7 +102,7 @@ func (s *Server) submit(w http.ResponseWriter, r *http.Request) {
 	if len(sub.LocalAssets) > 0 && !s.cliAuthenticated(r) {
 		s.refuse(w, r, http.StatusForbidden, "cli_credential_required",
 			"local_assets may name host filesystem paths and require the OS-protected CLI credential",
-			"use `cozy invoke run --asset <field-path>=<file>`; this build exposes no browser asset-upload route")
+			"use `cozy run --asset <field-path>=<file>`; this build exposes no browser asset-upload route")
 		return
 	}
 	// Staging bytes and recording their request are one ownership handoff even though the

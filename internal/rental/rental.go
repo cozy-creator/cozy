@@ -182,7 +182,7 @@ func tokenAt(path, subject string) (secret.Value, *exit.Error) {
 		return secret.Value{}, exit.New(exit.NotFound,
 			"%s has no media bearer on this host", subject).
 			WithRemedy("`cozy rental new` writes it when the pod comes ready; a rental rented elsewhere is not this host's").
-			WithNext("cozy rental list")
+			WithNext("cozy rental")
 	}
 	// Windows reports 0666 for every file: the boundary there is the user profile's ACL,
 	// which already scopes COZY_HOME to the user, so the bits are not consulted.
@@ -190,7 +190,7 @@ func tokenAt(path, subject string) (secret.Value, *exit.Error) {
 		return secret.Value{}, exit.New(exit.Credential,
 			"%s is mode %#o; a rental media bearer is 0600 or it is not used", path, perm).
 			WithRemedy("release this rental and rent again: every rental provisions its own token").
-			WithNext("cozy rental list")
+			WithNext("cozy rental")
 	}
 	data, err := os.ReadFile(path)
 	if err != nil {
@@ -200,7 +200,7 @@ func tokenAt(path, subject string) (secret.Value, *exit.Error) {
 	v := secret.New(string(data))
 	if !v.Present() {
 		return secret.Value{}, exit.New(exit.Credential,
-			"%s's media bearer file is empty", subject).WithNext("cozy rental list")
+			"%s's media bearer file is empty", subject).WithNext("cozy rental")
 	}
 	return v, nil
 }
@@ -228,7 +228,7 @@ func Known(st *records.Store) func(string) (*orchestrator.DesiredPlacement, *exi
 			return nil, exit.Named(exit.Unavailable, "rental.convergence_pending",
 				"rental %s is %s; Tensorhub has not accepted its relayed worker convergence evidence",
 				id, row.State).
-				WithRemedy("keep `cozy invoke list` running so this host's RecordOwner can claim and converge the private worker")
+				WithRemedy("keep `cozy run list` running so this host's RecordOwner can claim and converge the private worker")
 		}
 		if row.Address == "" {
 			return nil, noAddress(id, row.State)
@@ -246,7 +246,7 @@ func Known(st *records.Store) func(string) (*orchestrator.DesiredPlacement, *exi
 }
 
 // PackageDescriptor returns the exact remote descriptor already frozen into one
-// rental. It is the CLI payload surface for --worker; no local install is read.
+// rental. It is the CLI payload surface for --machine; no local install is read.
 func PackageDescriptor(st *records.Store, id string) (*launch.PackageDescriptor, *exit.Error) {
 	row, e := st.RentalRow(id)
 	if e != nil {
@@ -263,14 +263,14 @@ func PackageDescriptor(st *records.Store, id string) (*launch.PackageDescriptor,
 
 func unknown(id string) *exit.Error {
 	return exit.New(exit.NotFound, "no rental %s on this host", id).
-		WithRemedy("`cozy rental list` names the pods this host holds").
-		WithNext("cozy rental list")
+		WithRemedy("`cozy rental` names the machines this host rents").
+		WithNext("cozy rental")
 }
 
 func noAddress(id, state string) *exit.Error {
 	return exit.Unavailablef("rental %s is %s and carries no address yet", id, state).
-		WithRemedy("`cozy rental list` shows its state; a pod that failed to provision never gets one").
-		WithNext("cozy rental list")
+		WithRemedy("`cozy rental` shows its state; a pod that failed to provision never gets one").
+		WithNext("cozy rental")
 }
 
 // Resolver is what the daemon entrypoint hands the orchestrator as `Options.Rentals`. It

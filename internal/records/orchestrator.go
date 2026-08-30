@@ -529,7 +529,7 @@ func (s *Store) SpawnWorker(w WorkerProcess) *exit.Error {
 			"the device envelope [%s] is already granted to %s",
 			strings.Join(w.Devices, ","), strings.Join(held, ",")).
 			WithRemedy("one process per device: stop the holding worker first").
-			WithNext("cozy invoke list")
+			WithNext("cozy run list")
 	}
 	return nil
 }
@@ -795,7 +795,7 @@ func (s *Store) Requests(state string, limit int) ([]Request, *exit.Error) {
 	return s.RequestsOfKind("", state, limit)
 }
 
-// RequestsOfKind narrows the same listing to one ATTEMPT CLASS. `cozy invoke list` reads jobs
+// RequestsOfKind narrows the same listing to one ATTEMPT CLASS. `cozy run list` reads jobs
 // and the request listing reads serving rows — one table, one reader, two questions.
 func (s *Store) RequestsOfKind(kind, state string, limit int) ([]Request, *exit.Error) {
 	query := `SELECT ` + requestCols + ` FROM requests`

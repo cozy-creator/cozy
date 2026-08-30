@@ -12,7 +12,7 @@ type CLI struct {
 	Package PackageCmd `cmd:"" group:"Resources" help:"Install the source-code that generates media."`
 	Model   ModelCmd   `cmd:"" group:"Resources" help:"Download the tensors that are the AI's mind."`
 	Auth    AuthCmd    `cmd:"" group:"Resources" help:"Authenticate this machine to Tensorhub."`
-	Invoke  InvokeCmd  `cmd:"" group:"Work" help:"Generate media using your installed packages."`
+	Run     RunCmd     `cmd:"" group:"Work" help:"Run a package function on a local or rented machine."`
 	Rental  RentalCmd  `cmd:"" group:"Work" help:"Rent a more powerful GPU in the cloud."`
 	Up      UpCmd      `cmd:"" group:"Lifecycle" help:"Start the cozy-daemon and localhost web-ui."`
 	Down    DownCmd    `cmd:"" group:"Lifecycle" help:"Stop cozy-daemon and localhost web-ui."`
@@ -152,13 +152,13 @@ func (c *ModelPublishCmd) Run(r *Runtime) error {
 		values("--release", c.Release, "--lane", c.Lane), false)
 }
 
-type InvokeCmd struct {
-	Run    InvokeRunCmd    `cmd:"" help:"Run a package callable."`
-	Cancel InvokeCancelCmd `cmd:"" help:"Cancel an invocation or job."`
-	List   InvokeListCmd   `cmd:"" help:"List invocations and jobs."`
+type RunCmd struct {
+	Execute RunExecuteCmd `cmd:"" default:"withargs" hidden:""`
+	Cancel  RunCancelCmd  `cmd:"" help:"Cancel a queued or running run."`
+	List    RunListCmd    `cmd:"" help:"List current and past runs."`
 }
 
-type InvokeRunCmd struct {
+type RunExecuteCmd struct {
 	Target         string   `arg:"" name:"target" help:"Package or callable as org/package[/function]."`
 	Input          []string `arg:"" optional:"" name:"input" help:"Primary value and field=value payload."`
 	Out            string   `help:"Output directory." type:"path"`
@@ -166,46 +166,46 @@ type InvokeRunCmd struct {
 	Stream         bool     `help:"Emit typed progress deltas."`
 	PayloadFile    string   `name:"in" help:"Read the whole payload from JSON." type:"path"`
 	Assets         []string `name:"asset" help:"Bind a local asset as field-path=file."`
-	Worker         string   `help:"Run on an attached private rental."`
+	Machine        string   `help:"Machine name; local runs on this computer." default:"local"`
 	IdempotencyKey string   `help:"Stable request identity for safe retries."`
 	Trees          []string `name:"input-tree" help:"Bind a job input tree as ref=directory."`
 	Org            string   `help:"Job publication organization (defaults to local)."`
 	Detach         bool     `help:"Return after durable acceptance instead of following."`
 }
 
-func (c *InvokeRunCmd) Run(r *Runtime) error {
+func (c *RunExecuteCmd) Run(r *Runtime) error {
 	args := append([]string{c.Target}, c.Input...)
-	return r.call(handleInvokeRun, args, bools(
+	return r.call(handleRunExecute, args, bools(
 		"--stream", c.Stream, "--detach", c.Detach), values(
 		"--out", c.Out, "--timeout", c.Timeout,
-		"--in", c.PayloadFile, "--asset", c.Assets, "--worker", c.Worker,
+		"--in", c.PayloadFile, "--asset", c.Assets, "--machine", c.Machine,
 		"--idempotency-key", c.IdempotencyKey, "--input", c.Trees, "--org", c.Org), true)
 }
 
-type InvokeCancelCmd struct {
-	ID string `arg:"" name:"invocation" help:"Request or job id."`
+type RunCancelCmd struct {
+	ID string `arg:"" name:"run" help:"Run id."`
 }
 
-func (c *InvokeCancelCmd) Run(r *Runtime) error {
-	return r.call(handleInvokeCancel, []string{c.ID}, nil, nil, true)
+func (c *RunCancelCmd) Run(r *Runtime) error {
+	return r.call(handleRunCancel, []string{c.ID}, nil, nil, true)
 }
 
-type InvokeListCmd struct {
+type RunListCmd struct {
 	State   string `help:"Filter by lifecycle state."`
 	Package string `help:"Filter by package."`
 	Limit   int    `help:"Maximum rows." default:"50"`
 }
 
-func (c *InvokeListCmd) Run(r *Runtime) error {
-	return r.call(handleInvokeList, nil, nil, values(
+func (c *RunListCmd) Run(r *Runtime) error {
+	return r.call(handleRunList, nil, nil, values(
 		"--state", c.State, "--package", c.Package, "--limit", intText(c.Limit)), true)
 }
 
 type RentalCmd struct {
-	New    RentalNewCmd    `cmd:"" help:"Start a private rental."`
-	Update RentalUpdateCmd `cmd:"" help:"Replace a rental's exact package and model selection."`
-	End    RentalEndCmd    `cmd:"" help:"End a private rental and stop billing."`
-	List   RentalListCmd   `cmd:"" help:"List private rentals."`
+	Current RentalListCmd   `cmd:"" default:"1" hidden:""`
+	New     RentalNewCmd    `cmd:"" help:"Start a private rental."`
+	Update  RentalUpdateCmd `cmd:"" help:"Replace a rental's exact package and model selection."`
+	End     RentalEndCmd    `cmd:"" help:"End a private rental and stop billing."`
 }
 
 type RentalUpdateCmd struct {
@@ -223,6 +223,7 @@ func (c *RentalUpdateCmd) Run(r *Runtime) error {
 type RentalNewCmd struct {
 	SKU            string   `arg:"" optional:"" name:"gpu" help:"Cozy GPU SKU, such as h200."`
 	Package        string   `arg:"" optional:"" name:"package" help:"Exact package ref."`
+	Name           string   `help:"Memorable name for this rented machine."`
 	IdempotencyKey string   `help:"Stable paid-operation identity."`
 	Timeout        string   `help:"Caller wait deadline; does not release the rental."`
 	Models         []string `name:"model" help:"Model selection id=org/name@release#lane."`
@@ -231,7 +232,7 @@ type RentalNewCmd struct {
 func (c *RentalNewCmd) Run(r *Runtime) error {
 	return r.call(handleRent, []string{c.SKU, c.Package}, nil, values(
 		"--idempotency-key", c.IdempotencyKey, "--timeout", c.Timeout,
-		"--models", strings.Join(c.Models, ",")), false)
+		"--models", strings.Join(c.Models, ","), "--name", c.Name), false)
 }
 
 type RentalEndCmd struct {
@@ -245,7 +246,7 @@ func (c *RentalEndCmd) Run(r *Runtime) error {
 type RentalListCmd struct{}
 
 func (c *RentalListCmd) Run(r *Runtime) error {
-	return r.call(handleRentLs, nil, nil, nil, true)
+	return r.call(handleRentLs, nil, nil, nil, false)
 }
 
 type UnloadCmd struct{}

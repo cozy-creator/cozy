@@ -1,6 +1,6 @@
 // Package orchestrator is the local client's EMBEDDED ORCHESTRATOR (#455; the record-plane
 // owner of every worker this daemon runs): the scheduling role of the ONE long-lived
-// Cozy daemon `cozy invoke list` starts (cl-001). Since the 2026-08-25 re-landing (#436) the
+// Cozy daemon `cozy run list` starts (cl-001). Since the 2026-08-25 re-landing (#436) the
 // WORKER hosts the protocol and this side DIALS it: each spawned worker binds its own
 // local socket, and this owner claims it (Claim -> ClaimAck -> snapshot -> SnapshotAck)
 // before any dispatch. It is the authority for everything the runtime deliberately is

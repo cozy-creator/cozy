@@ -9,6 +9,7 @@ import (
 	"unicode"
 
 	"github.com/cozy-creator/cozy/internal/exit"
+	"github.com/cozy-creator/cozy/internal/rentalid"
 )
 
 // The RENTAL half of the one lifecycle authority (cl-015). A rented pod outlives the
@@ -36,6 +37,8 @@ CREATE TABLE IF NOT EXISTS rental_operations (
 const rentalsDDL = `
 CREATE TABLE IF NOT EXISTS rentals (
   id                TEXT PRIMARY KEY,
+  machine_name      TEXT NOT NULL DEFAULT '',
+  sku               TEXT NOT NULL DEFAULT '',
   package_ref      TEXT NOT NULL,
   accelerator_model TEXT NOT NULL,
   address           TEXT NOT NULL,
@@ -116,6 +119,8 @@ func migrateRentalSchema(db *sql.DB, path string) *exit.Error {
 		{"observed_at", `TEXT NOT NULL DEFAULT ''`},
 		{"expected_worker_id", `TEXT NOT NULL DEFAULT ''`},
 		{"expected_worker_boot_id", `TEXT NOT NULL DEFAULT ''`},
+		{"machine_name", `TEXT NOT NULL DEFAULT ''`},
+		{"sku", `TEXT NOT NULL DEFAULT ''`},
 	} {
 		if columns[column.name] {
 			continue
@@ -123,6 +128,36 @@ func migrateRentalSchema(db *sql.DB, path string) *exit.Error {
 		if _, err := db.Exec(`ALTER TABLE rentals ADD COLUMN ` + column.name + ` ` + column.ddl); err != nil {
 			return exit.Internalf("cannot add rentals.%s in %s: %s", column.name, path, err)
 		}
+	}
+	rows, err := db.Query(`SELECT id,machine_name FROM rentals`)
+	if err != nil {
+		return exit.Internalf("cannot read rental machine names in %s: %s", path, err)
+	}
+	type rentalName struct{ id, name string }
+	var names []rentalName
+	for rows.Next() {
+		var row rentalName
+		if err := rows.Scan(&row.id, &row.name); err != nil {
+			rows.Close()
+			return exit.Internalf("cannot read a rental machine name in %s: %s", path, err)
+		}
+		names = append(names, row)
+	}
+	if err := rows.Close(); err != nil {
+		return exit.Internalf("cannot finish reading rental machine names in %s: %s", path, err)
+	}
+	for _, row := range names {
+		if row.name != "" {
+			continue
+		}
+		if _, err := db.Exec(`UPDATE rentals SET machine_name=? WHERE id=?`,
+			rentalid.MachineName(row.id), row.id); err != nil {
+			return exit.Internalf("cannot name rental %s in %s: %s", row.id, path, err)
+		}
+	}
+	if _, err := db.Exec(`CREATE UNIQUE INDEX IF NOT EXISTS rentals_machine_name
+		ON rentals(machine_name) WHERE machine_name<>''`); err != nil {
+		return exit.Internalf("cannot index rental machine names in %s: %s", path, err)
 	}
 	return nil
 }
@@ -320,6 +355,8 @@ func (s *Store) RequestRentalRelease(id string) (string, *exit.Error) {
 // Rental is one provider-neutral pod rental this client may attach a worker to.
 type Rental struct {
 	ID               string
+	MachineName      string
+	SKU              string
 	PackageRef       string
 	AcceleratorModel string
 	Address          string
@@ -359,11 +396,11 @@ type Rental struct {
 	ExpectedWorkerBootID           string
 }
 
-const rentalCols = `id,package_ref,accelerator_model,address,cert_path,state,hub,rented_at,media_address,placement_set_digest,placement_set_bytes,selection_profile,package_release_digest,package_release_bytes,package_descriptor_digest,package_descriptor_bytes,qualification_digest,qualification_bytes,placement_revision,observed_accelerator,observed_accelerator_count,observed_backend,observed_driver_version,observed_backend_version,observed_device_memory_total_bytes,observed_worker_instance,observed_worker_boot_id,observed_at,expected_worker_id,expected_worker_boot_id`
+const rentalCols = `id,machine_name,sku,package_ref,accelerator_model,address,cert_path,state,hub,rented_at,media_address,placement_set_digest,placement_set_bytes,selection_profile,package_release_digest,package_release_bytes,package_descriptor_digest,package_descriptor_bytes,qualification_digest,qualification_bytes,placement_revision,observed_accelerator,observed_accelerator_count,observed_backend,observed_driver_version,observed_backend_version,observed_device_memory_total_bytes,observed_worker_instance,observed_worker_boot_id,observed_at,expected_worker_id,expected_worker_boot_id`
 
 func scanRental(row interface{ Scan(...any) error }) (Rental, error) {
 	var r Rental
-	err := row.Scan(&r.ID, &r.PackageRef, &r.AcceleratorModel, &r.Address, &r.CertPath,
+	err := row.Scan(&r.ID, &r.MachineName, &r.SKU, &r.PackageRef, &r.AcceleratorModel, &r.Address, &r.CertPath,
 		&r.State, &r.Hub, &r.RentedAt, &r.MediaAddress,
 		&r.PlacementSetDigest, &r.PlacementSetBytes,
 		&r.SelectionProfile, &r.PackageReleaseDigest, &r.PackageReleaseBytes,
@@ -382,6 +419,41 @@ func scanRental(row interface{ Scan(...any) error }) (Rental, error) {
 // ready must land on the same row rather than accumulate one per poll. State only moves
 // forward: a delayed poll answering `acquiring` after `ready` was recorded is stale.
 func (s *Store) RecordRental(r Rental) *exit.Error {
+	if r.MachineName == "" || r.SKU == "" {
+		var existingName, existingSKU string
+		err := s.db.QueryRow(`SELECT machine_name,sku FROM rentals WHERE id=?`, r.ID).
+			Scan(&existingName, &existingSKU)
+		if err == nil {
+			if r.MachineName == "" {
+				r.MachineName = existingName
+			}
+			if r.SKU == "" {
+				r.SKU = existingSKU
+			}
+		} else if err != nil && !errors.Is(err, sql.ErrNoRows) {
+			return exit.Internalf("cannot read rental %s local identity: %s", r.ID, err)
+		}
+	}
+	if r.MachineName == "" {
+		r.MachineName = rentalid.MachineName(r.ID)
+	}
+	if !rentalid.ValidMachineName(r.MachineName) {
+		return exit.Named(exit.Validation, "rental.machine_name_invalid",
+			"%q is not a machine name", r.MachineName).
+			WithRemedy("use 1-32 lowercase letters, numbers, and hyphens; local is reserved")
+	}
+	var conflictingID string
+	err := s.db.QueryRow(`SELECT id FROM rentals
+		WHERE id<>? AND (id=? OR machine_name=?) LIMIT 1`,
+		r.ID, r.MachineName, r.MachineName).Scan(&conflictingID)
+	if err == nil {
+		return exit.Named(exit.Conflict, "rental.machine_name_conflict",
+			"machine name %q already identifies rental %s", r.MachineName, conflictingID).
+			WithRemedy("choose another --name")
+	}
+	if !errors.Is(err, sql.ErrNoRows) {
+		return exit.Internalf("cannot check rental machine name %s: %s", r.MachineName, err)
+	}
 	if r.RentedAt == "" {
 		r.RentedAt = now()
 	}
@@ -411,8 +483,10 @@ func (s *Store) RecordRental(r Rental) *exit.Error {
 		r.State = rentalStateForward(current, r.State)
 	}
 	if _, err := tx.Exec(`INSERT INTO rentals(`+rentalCols+`)
-		VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+		VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
 		ON CONFLICT(id) DO UPDATE SET
+		  machine_name=CASE WHEN rentals.machine_name<>'' THEN rentals.machine_name ELSE excluded.machine_name END,
+		  sku=CASE WHEN rentals.sku<>'' THEN rentals.sku ELSE excluded.sku END,
 		  address=CASE WHEN rentals.address<>'' THEN rentals.address ELSE excluded.address END,
 		  cert_path=CASE WHEN rentals.cert_path<>'' THEN rentals.cert_path ELSE excluded.cert_path END,
 		  state=excluded.state,
@@ -452,7 +526,7 @@ func (s *Store) RecordRental(r Rental) *exit.Error {
 		    THEN rentals.expected_worker_id ELSE excluded.expected_worker_id END,
 		  expected_worker_boot_id=CASE WHEN rentals.expected_worker_boot_id<>''
 		    THEN rentals.expected_worker_boot_id ELSE excluded.expected_worker_boot_id END`,
-		r.ID, r.PackageRef, r.AcceleratorModel, r.Address, r.CertPath, r.State, r.Hub,
+		r.ID, r.MachineName, r.SKU, r.PackageRef, r.AcceleratorModel, r.Address, r.CertPath, r.State, r.Hub,
 		r.RentedAt, r.MediaAddress, r.PlacementSetDigest,
 		r.PlacementSetBytes, r.SelectionProfile, r.PackageReleaseDigest, r.PackageReleaseBytes,
 		r.PackageDescriptorDigest, r.PackageDescriptorBytes, r.QualificationDigest,
@@ -475,7 +549,8 @@ func (s *Store) RecordRental(r Rental) *exit.Error {
 		return exit.Named(exit.Conflict, "rental.placement_set_conflict",
 			"rental %s already carries another exact PlacementSet", r.ID)
 	}
-	if stored == nil || r.Address != "" && stored.Address != r.Address ||
+	if stored == nil || stored.MachineName != r.MachineName || stored.SKU != r.SKU ||
+		r.Address != "" && stored.Address != r.Address ||
 		r.MediaAddress != "" && stored.MediaAddress != r.MediaAddress ||
 		r.CertPath != "" && stored.CertPath != r.CertPath ||
 		r.ExpectedWorkerID != "" && stored.ExpectedWorkerID != r.ExpectedWorkerID ||
@@ -484,6 +559,19 @@ func (s *Store) RecordRental(r Rental) *exit.Error {
 			"rental %s already carries another address, media address, or certificate pin", r.ID)
 	}
 	return nil
+}
+
+// RentalByMachine resolves either a memorable machine name or the opaque Tensorhub id.
+func (s *Store) RentalByMachine(name string) (*Rental, *exit.Error) {
+	r, err := scanRental(s.db.QueryRow(
+		`SELECT `+rentalCols+` FROM rentals WHERE machine_name=? OR id=?`, name, name))
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, exit.Internalf("cannot read rented machine %s: %s", name, err)
+	}
+	return &r, nil
 }
 
 // ReplaceRentalSelection installs the Hub-authored replacement after its exact
@@ -647,6 +735,18 @@ func (s *Store) Rentals() ([]Rental, *exit.Error) {
 		out = append(out, r)
 	}
 	return out, nil
+}
+
+// RentalRunCounts derives the current queue and active-attempt counts for one machine.
+func (s *Store) RentalRunCounts(id string) (queued, running int, problem *exit.Error) {
+	err := s.db.QueryRow(`SELECT
+		COALESCE(SUM(CASE WHEN state IN ('submitted','queued','requeue_pending') THEN 1 ELSE 0 END),0),
+		COALESCE(SUM(CASE WHEN state IN ('dispatching','in_progress') THEN 1 ELSE 0 END),0)
+		FROM requests WHERE worker=?`, id).Scan(&queued, &running)
+	if err != nil {
+		return 0, 0, exit.Internalf("cannot count runs for rented machine %s: %s", id, err)
+	}
+	return queued, running, nil
 }
 
 // RentalRelayRefusal is the last durable non-transient private-control verdict, whether

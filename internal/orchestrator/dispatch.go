@@ -304,7 +304,7 @@ func (c *Orchestrator) Requeue(requestID, why string) {
 		// THE REQUEST ENDS HERE, and it has to SAY so. Settling the row without emitting a
 		// terminal event left a client watching the durable stream with `attempt_failed
 		// (requeuing: true)` as its last frame and nothing after it — the contract's
-		// terminal-stop rule never fired, and `cozy invoke run` waited on a request that had been
+		// terminal-stop rule never fired, and `cozy run` waited on a request that had been
 		// settled for ten minutes. Observed live, in cl-003's ARM 3.
 		c.logf("%s NOT requeued (%s): %s", requestID, why, e.Message)
 		c.forget(requestID)
@@ -360,10 +360,10 @@ func (c *Orchestrator) Requeue(requestID, why string) {
 		requestID, attempt, n, MaxRequeues, why)
 }
 
-// selectOrStart makes a queued request's package resident. It is the half of `cozy invoke run`
+// selectOrStart makes a queued request's package resident. It is the half of `cozy run`
 // that "cold and warm traverse the same states" rests on: SELECT the worker that already
 // advertises the binding, or START one — never a second invocation mechanism, and never a
-// client's job. `cozy invoke run` is the same act made explicit for prewarming.
+// client's job. `cozy run` is the same act made explicit for prewarming.
 //
 // It runs off the caller's goroutine because a cold start is a 4.782 GiB fill, and the
 // submitting client is already watching the event stream that will say when it lands. The
@@ -998,7 +998,7 @@ func localGrantSupport(goos string) *exit.Error {
 	}
 	return exit.Named(exit.Structural, "local_file_grant_unsupported",
 		"local worker grants are not yet supported on Windows").
-		WithRemedy("use --worker with a remote pod; local file URL authorization is currently POSIX-only")
+		WithRemedy("use --machine with a rented machine; local file URL authorization is currently POSIX-only")
 }
 
 // remoteGrant builds the grant for an attempt that will run on a POD (cl-014/#506b).

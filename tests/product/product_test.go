@@ -120,10 +120,10 @@ func TestModelManifestGrammar(t *testing.T) {
 
 func TestPackagePublishMetadataGrammar(t *testing.T) {
 	root := t.TempDir()
-	if code, help := runCozy(t, root, "invoke", "run", "--help"); code != 0 ||
+	if code, help := runCozy(t, root, "run", "cozy/example/function", "--help"); code != 0 ||
 		strings.Contains(help, "--version") || strings.Contains(help, "vN/function") ||
 		!strings.Contains(help, "org/package[/function]") {
-		t.Fatalf("invoke run retained versioned target grammar [exit %d]\n%s", code, help)
+		t.Fatalf("run retained versioned target grammar [exit %d]\n%s", code, help)
 	}
 	if code, help := runCozy(t, root, "package", "publish", "--help"); code != 0 ||
 		strings.Contains(help, "--release") || strings.Contains(help, "--dir") ||
@@ -154,6 +154,70 @@ version = "1.0.0"
 		"package", "publish")
 	if code != 1 || !strings.Contains(out, "must declare [tool.cozy] organization") {
 		t.Fatalf("missing [tool.cozy] organization was not refused before build [exit %d]\n%s", code, out)
+	}
+}
+
+func TestRunAutoInstallsAMissingLocalPackage(t *testing.T) {
+	root := t.TempDir()
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet || r.URL.Path != "/v1/packages/proof/missing" {
+			http.NotFound(w, r)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{"package":{"org":"proof","name":"missing","created_at":"2026-08-30T00:00:00Z"},"releases":[]}`)
+	}))
+	defer server.Close()
+	t.Cleanup(func() { _, _ = runCozy(t, root, "down", "--all") })
+
+	code, out := runCozyDir(t, root, ".", []string{"TENSORHUB_URL=" + server.URL},
+		"run", "proof/missing/generate")
+	if code != 1 || !strings.Contains(out, "is not installed; installing it from Tensorhub") ||
+		!strings.Contains(out, "has no published releases") || strings.Contains(out, "is not installed on this host") {
+		t.Fatalf("missing package did not enter automatic registry installation [exit %d]\n%s", code, out)
+	}
+}
+
+func TestRentalCommandsSeparateInventoryFromCatalog(t *testing.T) {
+	root := t.TempDir()
+	store, problem := records.Open(filepath.Join(root, "records.db"))
+	fatal(t, problem)
+	problem = store.RecordRental(records.Rental{
+		ID: "rnt-proof", MachineName: "studio", SKU: "h200", PackageRef: "proof/example/v1/generate",
+		AcceleratorModel: "NVIDIA H200 SXM", State: "ready", Hub: "https://tensorhub.test",
+		SelectionProfile: "torch2.13.0-cu130-cp312-linux-x86", ObservedDriverVersion: "580.82",
+	})
+	fatal(t, problem)
+	store.Close()
+
+	if code, out := runCozy(t, root, "rental"); code != 0 ||
+		!strings.Contains(out, "studio") || !strings.Contains(out, "h200") ||
+		!strings.Contains(out, "torch 2.13.0") || !strings.Contains(out, "CUDA 13.0") {
+		t.Fatalf("bare rental did not show current machines [exit %d]\n%s", code, out)
+	}
+	if code, out := runCozy(t, root, "rental", "list"); code != 2 ||
+		!strings.Contains(out, "unexpected argument list") {
+		t.Fatalf("retired rental list did not refuse [exit %d]\n%s", code, out)
+	}
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet || r.URL.Path != "/v1/rental-skus" {
+			http.NotFound(w, r)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `[{"name":"h200","accelerator_model":"NVIDIA H200 SXM","compute_capability":"9.0","vram_gb":141,"price_usd_micros_per_hour":3990000}]`)
+	}))
+	defer server.Close()
+	code, out := runCozyDir(t, root, ".", []string{"TENSORHUB_URL=" + server.URL}, "rental", "new")
+	if code != 0 || !strings.Contains(out, "h200") || !strings.Contains(out, "NVIDIA H200 SXM") ||
+		!strings.Contains(out, "sm_90") || !strings.Contains(out, "141 GB") || !strings.Contains(out, "$3.99/hr") {
+		t.Fatalf("rental new did not show the SKU catalog [exit %d]\n%s", code, out)
+	}
+	if code, out := runCozyDir(t, root, ".", []string{"TENSORHUB_URL=" + server.URL},
+		"rental", "new", "--name", "studio"); code != 2 ||
+		!strings.Contains(out, "options require a GPU SKU and package") {
+		t.Fatalf("catalog view silently accepted rental options [exit %d]\n%s", code, out)
 	}
 }
 
@@ -394,7 +458,7 @@ func TestDaemonWebLifecycle(t *testing.T) {
 
 	code, help := runCozy(t, root)
 	for _, want := range []string{
-		"Usage: cozy", "package install", "model download", "auth login", "invoke run",
+		"Usage: cozy", "package install", "model download", "auth login", "run cancel",
 		"rental new", "up", "down", "unload",
 	} {
 		if code != 0 || !strings.Contains(help, want) {
@@ -481,7 +545,7 @@ func TestDaemonWebLifecycle(t *testing.T) {
 		!strings.Contains(out, "daemon:") || !strings.Contains(out, "stopped") {
 		t.Fatalf("down [exit %d]\n%s", code, out)
 	}
-	if code, out := runCozy(t, root, "invoke", "list", "--json"); code != 0 ||
+	if code, out := runCozy(t, root, "run", "list", "--json"); code != 0 ||
 		!strings.Contains(out, `"invocations":[]`) {
 		t.Fatalf("stateful command did not auto-start the daemon [exit %d]\n%s", code, out)
 	}
@@ -552,7 +616,7 @@ func TestRentalGPUCatalog(t *testing.T) {
 			return
 		}
 		w.Header().Set("Content-Type", "application/json")
-		_, _ = io.WriteString(w, `[{"name":"h200","accelerator_model":"NVIDIA H200","vram_gb":141,"price_usd_micros_per_hour":6000000},{"name":"rtx-4090","accelerator_model":"NVIDIA GeForce RTX 4090","vram_gb":24,"price_usd_micros_per_hour":1250000}]`)
+		_, _ = io.WriteString(w, `[{"name":"h200","accelerator_model":"NVIDIA H200","compute_capability":"9.0","vram_gb":141,"price_usd_micros_per_hour":6000000},{"name":"rtx-4090","accelerator_model":"NVIDIA GeForce RTX 4090","compute_capability":"8.9","vram_gb":24,"price_usd_micros_per_hour":1250000}]`)
 	}))
 	defer server.Close()
 	root := filepath.Join(os.TempDir(), "cozy-product-test", "rental-gpu-catalog")
@@ -570,7 +634,7 @@ func TestRentalGPUCatalog(t *testing.T) {
 		t.Fatalf("rental catalog was not a two-row GPU list: %v\n%s", err, result.output)
 	}
 	if document.GPUs[0]["name"] != "h200" || document.GPUs[0]["model"] != "NVIDIA H200" ||
-		document.GPUs[0]["vram"] != "141 GB" || document.GPUs[0]["price"] != "$6/hr" ||
+		document.GPUs[0]["compute"] != "sm_90" || document.GPUs[0]["vram"] != "141 GB" || document.GPUs[0]["price"] != "$6/hr" ||
 		document.GPUs[1]["price"] != "$1.25/hr" {
 		t.Fatalf("rental catalog values drifted: %#v", document.GPUs)
 	}
@@ -691,16 +755,16 @@ func TestDevelopmentInstallIsNotRunnable(t *testing.T) {
 		!strings.Contains(out, weightlessRef) {
 		t.Fatalf("package list omitted the install [exit %d]\n%s", code, out)
 	}
-	if code, out := runCozy(t, root, "invoke", "run", weightlessRef); code != 0 ||
+	if code, out := runCozy(t, root, "run", weightlessRef); code != 0 ||
 		!strings.Contains(out, "- tile") || !strings.Contains(out, "- refuse") {
-		t.Fatalf("package-only invoke did not list functions [exit %d]\n%s", code, out)
+		t.Fatalf("package-only run did not list functions [exit %d]\n%s", code, out)
 	}
-	if code, out := runCozy(t, root, "invoke", "run", weightlessRef+"/v1.0.0/tile"); code != 2 ||
+	if code, out := runCozy(t, root, "run", weightlessRef+"/v1.0.0/tile"); code != 2 ||
 		!strings.Contains(out, weightlessRef+"/tile") || !strings.Contains(out, "installed release") {
 		t.Fatalf("version-in-path remedy was not useful [exit %d]\n%s", code, out)
 	}
 
-	code, out = runCozy(t, root, "invoke", "run", weightlessRef+"/tile",
+	code, out = runCozy(t, root, "run", weightlessRef+"/tile",
 		"size=32", "seed=7")
 	if code != 1 || !strings.Contains(out, "without an exact Hub-selected PlacementSet") {
 		t.Fatalf("development install became runnable [exit %d]\n%s", code, out)

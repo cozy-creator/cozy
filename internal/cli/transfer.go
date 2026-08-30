@@ -280,7 +280,7 @@ func handleModelRemove(ctx *Context) *exit.Error {
 		if request.Worker == "" {
 			return exit.New(exit.Conflict, "active invocation %s may still need local model bytes", request.ID).
 				WithRemedy("cancel active local work before removing a model repository").
-				WithNext("cozy invoke cancel " + request.ID)
+				WithNext("cozy run cancel " + request.ID)
 		}
 	}
 	tool, _, problem := localTensorFS(ctx)

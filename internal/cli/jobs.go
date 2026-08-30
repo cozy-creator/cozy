@@ -19,7 +19,7 @@ import (
 // THE JOB VERBS (cl-004): `submit` · `status` · `ls` · `follow` · `cancel`. They are
 // SIBLINGS of the request verbs, not a second surface — `internal/client` is the one way
 // each of them reaches the daemon, the durable event stream they follow is the same one
-// `cozy invoke run` follows, and the terminal mapping is the same shared matrix
+// `cozy run` follows, and the terminal mapping is the same shared matrix
 // (0 · 11 · 12 · 10, through `exit.JobTerminal`).
 //
 // What the job verbs say that `run` does not:
@@ -37,7 +37,7 @@ import (
 
 func handleJobSubmit(ctx *Context, target Target, job *launch.Entrypoint) *exit.Error {
 	// THE PAYLOAD IS TYPED AGAINST THE RECORDED SCHEMA before a job exists — the same
-	// client-side check `cozy invoke run` makes, over the job's own declared request struct.
+	// client-side check `cozy run` makes, over the job's own declared request struct.
 	input, e := launch.ParsePayload(&launch.Entrypoint{
 		Name: job.Name, Request: job.Request, Result: job.Result,
 	}, ctx.Inv.Args[1:], ctx.Inv.Value("--in"))
@@ -79,7 +79,7 @@ func handleJobSubmit(ctx *Context, target Target, job *launch.Entrypoint) *exit.
 		{K: "changed", V: !handle.Replay},
 	}
 	rec := compactRecord(fields, "id", "target", "status", "changed")
-	rec.Next = []string{"cozy invoke cancel " + handle.JobID}
+	rec.Next = []string{"cozy run cancel " + handle.JobID}
 	return emit(ctx, rec)
 }
 
@@ -93,7 +93,7 @@ func parseTrees(values []string) ([]string, *exit.Error) {
 		if !ok || ref == "" || dir == "" {
 			return nil, exit.Usagef("--input-tree %q is not <ref>=<directory>", v).
 				WithRemedy("a job's typed model/dataset input arrives as a materialized tree").
-				WithNext("cozy invoke run <target> --input-tree cozy/sdxl@lane=/path/to/store")
+				WithNext("cozy run <target> --input-tree cozy/sdxl@lane=/path/to/store")
 		}
 		info, err := os.Stat(dir)
 		if err != nil || !info.IsDir() {
@@ -255,8 +255,8 @@ func followJob(ctx *Context, c *localapi.Client, jobID string, began time.Time) 
 	select {
 	case <-forced:
 		return exit.New(exit.Canceled,
-			"stopped waiting for %s; it remains visible in `cozy invoke list`", jobID).
-			WithNext("cozy invoke list")
+			"stopped waiting for %s; it remains visible in `cozy run list`", jobID).
+			WithNext("cozy run list")
 	default:
 	}
 	if e != nil {
@@ -292,7 +292,7 @@ func followJob(ctx *Context, c *localapi.Client, jobID string, began time.Time) 
 	code := exit.JobTerminal(mapTerminal(status))
 	if code == exit.OK {
 		if state.Publication != nil {
-			rec.Next = []string{"cozy invoke list --full"}
+			rec.Next = []string{"cozy run list --full"}
 		}
 		return emit(ctx, rec)
 	}
@@ -306,7 +306,7 @@ func followJob(ctx *Context, c *localapi.Client, jobID string, began time.Time) 
 			"on neutral outcomes before settling", state.Requeues, state.RetryBudget)
 	}
 	if state.Triage != nil {
-		err.WithNext("cozy invoke list --full")
+		err.WithNext("cozy run list --full")
 	}
 	return err
 }

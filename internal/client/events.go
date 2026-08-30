@@ -19,7 +19,7 @@ import (
 //     terminal is NOT a verdict — reconnect from the last id and the server replays
 //     everything after it, in order, across a daemon restart.
 //   - TERMINAL-STOP. A terminal event closes the per-request stream, and that is where
-//     `cozy invoke run` gets its exit code: the request's own settled status, mapped through the
+//     `cozy run` gets its exit code: the request's own settled status, mapped through the
 //     shared matrix. There is no polling loop and no timeout guessing what happened.
 //   - LIVE FRAMES ARE NOT DURABLE. `event_id: 0` says so in the data. They are what the
 //     progress line renders and are never counted as history.
@@ -75,8 +75,8 @@ func (c *Client) WatchContext(ctx context.Context, requestID string, from int64,
 		if attempts > 3 {
 			return nil, exit.Unavailablef(
 				"the event stream for %s closed %d times without a terminal", requestID, attempts).
-				WithRemedy("the request is still recorded; read it with `cozy invoke list`").
-				WithNext("cozy invoke list")
+				WithRemedy("the request is still recorded; read it with `cozy run list`").
+				WithNext("cozy run list")
 		}
 	}
 }

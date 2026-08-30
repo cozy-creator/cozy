@@ -83,7 +83,7 @@ func Probe(cfg config.Config) State {
 type Held struct{ f *os.File }
 
 // Hold takes the root's exclusive claim and publishes the live addresses under it. A
-// second `cozy invoke list` on one root gets exit 13 here, before it can bind anything.
+// second `cozy run list` on one root gets exit 13 here, before it can bind anything.
 func Hold(l home.Layout, addr, socket string) (*Held, *exit.Error) {
 	f, err := os.OpenFile(l.Daemon, os.O_RDWR|os.O_CREATE, 0o644)
 	if err != nil {
@@ -94,7 +94,7 @@ func Hold(l home.Layout, addr, socket string) (*Held, *exit.Error) {
 		return nil, exit.New(exit.Conflict,
 			"another Cozy daemon already owns %s", l.Root).
 			WithRemedy("one daemon per local root; stop it with `cozy down`").
-			WithNext("cozy invoke list", "cozy down")
+			WithNext("cozy run list", "cozy down")
 	}
 	body := fmt.Sprintf("addr=%s\nsocket=%s\npid=%d\nsince=%s\n",
 		addr, socket, os.Getpid(), time.Now().UTC().Format(time.RFC3339))

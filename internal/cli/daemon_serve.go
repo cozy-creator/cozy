@@ -48,7 +48,7 @@ func serveDaemon(ctx *Context) *exit.Error {
 		return emit(ctx, output.Record{Fields: []output.Field{
 			{K: "daemon", V: "running"}, {K: "address", V: st.Addr},
 			{K: "socket", V: st.Socket}, {K: "pid", V: st.PID}, {K: "since", V: st.Since},
-		}, Notes: []string{"already running: `cozy invoke list` is idempotent"}})
+		}, Notes: []string{"already running: `cozy run list` is idempotent"}})
 	}
 
 	socket := l.Root + "/worker.sock"
@@ -155,7 +155,7 @@ func serveDaemon(ctx *Context) *exit.Error {
 	fmt.Fprintf(ctx.Out, "  records %s · yield %s · reconcile killed %d orphan(s), forgot %d stale row(s)\n",
 		l.DB, yield, killed, forgotten)
 	fmt.Fprintf(ctx.Out, "  client credential %s (%s, mode 0600)\n", creds.CLI.Digest(), l.Client)
-	fmt.Fprintf(ctx.Out, "  next: cozy invoke list · stop with cozy down\n")
+	fmt.Fprintf(ctx.Out, "  next: cozy run list · stop with cozy down\n")
 
 	go func() { _ = http.Serve(v4, handler) }()
 	if v6 != nil {

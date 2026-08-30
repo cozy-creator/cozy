@@ -168,7 +168,7 @@ func (r *Resolver) ResolveJobInstall(installID, function string) (orchestrator.W
 }
 
 // Jobs names the `@job` functions one installed package registers, with the descriptor
-// id each resolves to. `cozy invoke list` and the API's job listing read it.
+// id each resolves to. `cozy run list` and the API's job listing read it.
 func (r *Resolver) Jobs(pkg string) ([]launch.JobFacts, *exit.Error) {
 	gen, e := r.generation(strings.TrimSpace(pkg))
 	if e != nil {

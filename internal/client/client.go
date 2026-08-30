@@ -126,7 +126,7 @@ func (c *Client) call(method, path string, body, out any, headers ...string) *ex
 func (c *Client) unreachable(err error) *exit.Error {
 	return exit.Unavailablef("the Cozy daemon stopped answering on %s: %s", c.Addr(), err).
 		WithRemedy("it may have stopped mid-request; retry or run `cozy up`").
-		WithNext("cozy up", "cozy invoke list")
+		WithNext("cozy up", "cozy run list")
 }
 
 // Refusal turns one typed error envelope into a typed CLI error. The NAME is the

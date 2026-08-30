@@ -26,7 +26,7 @@ import (
 //
 // The event plane is reused, and that is not an exception: a job is a request row in the
 // one lifecycle authority, so `GET /v1/requests/{id}/events` streams a job's lifecycle
-// with no second event authority anywhere. `cozy invoke list` is that route's client.
+// with no second event authority anywhere. `cozy run list` is that route's client.
 
 // JobSubmission is the job submit body.
 type JobSubmission struct {
@@ -99,7 +99,7 @@ func (s *Server) submitJob(w http.ResponseWriter, r *http.Request) {
 	if len(sub.Trees) > 0 && !s.cliAuthenticated(r) {
 		s.refuse(w, r, http.StatusForbidden, "cli_credential_required",
 			"trees name host filesystem directories and require the OS-protected CLI credential",
-			"use `cozy invoke run --input-tree <ref>=<dir>`; this build exposes no browser tree-upload route")
+			"use `cozy run --input-tree <ref>=<dir>`; this build exposes no browser tree-upload route")
 		return
 	}
 	spec, e := s.resolveJob(sub)
@@ -368,7 +368,7 @@ func (s *Server) jobRow(w http.ResponseWriter, r *http.Request) (records.Request
 	}
 	if row == nil || !row.IsJob() {
 		s.refuse(w, r, http.StatusNotFound, "not_found", "no job "+id+" on this host",
-			"`cozy invoke list` lists the jobs this host recorded")
+			"`cozy run list` lists the jobs this host recorded")
 		return records.Request{}, false
 	}
 	return *row, true
