@@ -89,6 +89,52 @@ func MaterializeEnvironment(sourceDir, venvDir string) (*EnvironmentReceipt, *ex
 	return env, nil
 }
 
+// MaterializePublishedEnvironment installs the exact project and attached
+// local wheels Tensorhub granted. Ordinary wheel dependencies resolve from the
+// configured Python index; source distributions and build backends are refused.
+// The author-machine tool.uv.sources paths and development lock never control a
+// registry install.
+func MaterializePublishedEnvironment(sourceDir, venvDir string, wheels []string) (*EnvironmentReceipt, *exit.Error) {
+	if len(wheels) == 0 {
+		return nil, exit.Internalf("published package install has no project wheel")
+	}
+	lockDigest, err := fileDigest(filepath.Join(sourceDir, "uv.lock"))
+	if err != nil {
+		return nil, exit.Named(exit.Structural, "lock_missing",
+			"the published source carries no uv.lock").WithNext("cozy package install")
+	}
+	env := &EnvironmentReceipt{
+		LockDigest: "sha256:" + lockDigest,
+		Platform:   runtime.GOOS + "/" + runtime.GOARCH,
+		UV:         toolVersion("uv", "--version"),
+	}
+	env.LinkMode = pickLinkMode(venvDir, &env.Warnings)
+	create := exec.Command("uv", "venv", "--no-progress", venvDir)
+	create.Env = config.Frozen().Tool()
+	var output strings.Builder
+	create.Stdout, create.Stderr = &output, &output
+	if err := create.Run(); err != nil {
+		return nil, exit.Named(exit.Structural, "published_venv_refused",
+			"uv could not create the package environment").WithRemedy("uv said: %s", condense(output.String()))
+	}
+	args := []string{"pip", "install", "--python", home.VenvPython(venvDir), "--no-progress",
+		"--only-binary", ":all:", "--link-mode", env.LinkMode}
+	args = append(args, wheels...)
+	install := exec.Command("uv", args...)
+	install.Env = config.Frozen().Tool()
+	output.Reset()
+	install.Stdout, install.Stderr = &output, &output
+	if err := install.Run(); err != nil {
+		return nil, exit.Named(exit.Structural, "published_wheel_install_refused",
+			"uv could not install the published wheel set").
+			WithRemedy("uv said: %s", condense(output.String())).
+			WithNext("cozy package install")
+	}
+	env.Python = pythonVersion(venvDir)
+	env.Packages, env.Closure = closure(venvDir)
+	return env, nil
+}
+
 // Disk measures one generation exactly once, at install: bytes only this generation
 // holds, and bytes it shares with another venv through a hardlink. `cozy package list` reads
 // these numbers back out of the record — it never walks 122k files.

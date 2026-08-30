@@ -50,12 +50,12 @@ func (c *PackageSearchCmd) Run(r *Runtime) error {
 }
 
 type PackageInstallCmd struct {
-	Ref           string `arg:"" name:"package" help:"Package ref (org/name[@release])."`
-	From          string `help:"Install from a local release archive." type:"path"`
-	Dir           string `help:"Install an editable local source tree." type:"path"`
-	Digest        string `help:"Expected source digest."`
-	Force         bool   `help:"Build and atomically replace an existing pin."`
-	AllowUnsigned bool   `help:"Allow an unverified local development source."`
+	Ref           string `arg:"" name:"package" help:"Published package ref (org/name[@release])."`
+	From          string `hidden:"" type:"path"`
+	Dir           string `hidden:"" type:"path"`
+	Digest        string `hidden:""`
+	Force         bool   `hidden:""`
+	AllowUnsigned bool   `hidden:""`
 }
 
 func (c *PackageInstallCmd) Run(r *Runtime) error {

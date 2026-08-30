@@ -33,8 +33,11 @@ func TestPackagePublishMetadataGrammar(t *testing.T) {
 		t.Fatalf("package publish retained caller-authored identity [exit %d]\n%s", code, help)
 	}
 	if code, help := runCozy(t, root, "package", "install", "--help"); code != 0 ||
-		strings.Contains(help, "--profile") || strings.Contains(help, "--major") {
-		t.Fatalf("package install retained the unusable managed-local lane [exit %d]\n%s", code, help)
+		strings.Contains(help, "--profile") || strings.Contains(help, "--major") ||
+		strings.Contains(help, "--from") || strings.Contains(help, "--dir") ||
+		strings.Contains(help, "--digest") || strings.Contains(help, "--allow-unsigned") ||
+		strings.Contains(help, "--force") {
+		t.Fatalf("package install exposed internal source/destination flags [exit %d]\n%s", code, help)
 	}
 	project := t.TempDir()
 	must(t, os.WriteFile(filepath.Join(project, "pyproject.toml"), []byte(`[project]

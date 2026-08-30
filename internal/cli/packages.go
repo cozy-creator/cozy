@@ -36,6 +36,13 @@ func open(cfg config.Config, write bool) (home.Layout, *records.Store, *install.
 }
 
 func handleInstall(ctx *Context) *exit.Error {
+	if ctx.Inv.Value("--from") == "" && ctx.Inv.Value("--dir") == "" {
+		return handleRegistryInstall(ctx)
+	}
+	return handleLocalInstall(ctx)
+}
+
+func handleLocalInstall(ctx *Context) *exit.Error {
 	ref, e := install.ParseRef(ctx.Inv.Args[0])
 	if e != nil {
 		return e
@@ -58,6 +65,10 @@ func handleInstall(ctx *Context) *exit.Error {
 	if e != nil {
 		return e
 	}
+	return emitInstallResult(ctx, st, res)
+}
+
+func emitInstallResult(ctx *Context, st *records.Store, res *install.Result) *exit.Error {
 	g := res.Gen
 	fields := []output.Field{
 		{K: "package", V: g.Package}, {K: "major", V: g.Major},

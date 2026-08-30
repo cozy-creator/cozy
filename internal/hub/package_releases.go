@@ -62,6 +62,21 @@ type PackageExecution struct {
 	State    string `json:"state"`
 }
 
+type PackageInstallDownload struct {
+	Digest string `json:"digest"`
+	Kind   string `json:"kind"`
+	Length int64  `json:"length"`
+	Path   string `json:"path"`
+	URL    string `json:"url"`
+}
+
+type PackageInstallPlan struct {
+	Downloads        []PackageInstallDownload `json:"downloads"`
+	Package          string                   `json:"package"`
+	Release          string                   `json:"release"`
+	SourceTreeDigest string                   `json:"source_tree_digest"`
+}
+
 func packageReleasePath(ref Ref, release string) string {
 	return resourcePath("packages", ref) + "/releases/" + url.PathEscape(release)
 }
@@ -89,5 +104,13 @@ func (c *Client) FinalizePackageRelease(ctx context.Context, ref Ref, release, r
 	e := c.do(ctx, call{method: http.MethodPut,
 		path: packageReleasePath(ref, release), auth: true, reason: reason,
 		body: map[string]any{}, patient: true, strict: true}, &out)
+	return out, e
+}
+
+func (c *Client) PackageInstallPlan(ctx context.Context, ref Ref, release string) (PackageInstallPlan, *exit.Error) {
+	var out PackageInstallPlan
+	e := c.do(ctx, call{method: http.MethodGet,
+		path: packageReleasePath(ref, release) + "/install", strict: true,
+		responseBytes: 16 << 20}, &out)
 	return out, e
 }

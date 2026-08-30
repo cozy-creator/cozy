@@ -98,6 +98,32 @@ func TestPackageReleaseClientRejectsUnknownResponseFields(t *testing.T) {
 	}
 }
 
+func TestPackageInstallPlanContract(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch r.URL.Path {
+		case "/v1/packages/proof/package":
+			_, _ = io.WriteString(w, `{"package":{"org":"proof","name":"package","created_at":"2026-08-30T00:00:00Z"},"releases":[{"release":"1.2.3","cut_at":"2026-08-30T00:00:00Z"}]}`)
+		case "/v1/packages/proof/package/releases/1.2.3/install":
+			_, _ = io.WriteString(w, `{"downloads":[{"digest":"sha256:`+strings.Repeat("1", 64)+`","kind":"source","length":4,"path":"package.toml","url":"https://storage.invalid/package.toml"}],"package":"proof/package","release":"1.2.3","source_tree_digest":"sha256:`+strings.Repeat("2", 64)+`"}`)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+	client := hub.New(config.Config{HubURL: server.URL}, "cozy-test")
+	ref := hub.Ref{Org: "proof", Name: "package"}
+	card, problem := client.PackageCard(context.Background(), ref)
+	if problem != nil || len(card.Releases) != 1 || card.Releases[0].Release != "1.2.3" {
+		t.Fatalf("package card changed: %+v problem=%v", card, problem)
+	}
+	plan, problem := client.PackageInstallPlan(context.Background(), ref, "1.2.3")
+	if problem != nil || plan.Package != "proof/package" || plan.Release != "1.2.3" ||
+		len(plan.Downloads) != 1 || plan.Downloads[0].Path != "package.toml" {
+		t.Fatalf("package install plan changed: %+v problem=%v", plan, problem)
+	}
+}
+
 func TestPackagePublishPendingWireFlowBoundsUploads(t *testing.T) {
 	project := t.TempDir()
 	writePublishProject(t, project, "wire-package", "1.0.0", nil, "", true)

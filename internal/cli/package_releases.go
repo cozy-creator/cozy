@@ -303,11 +303,15 @@ func packagePublishStage(ctx *Context, label string, run func() *exit.Error) *ex
 }
 
 func packageUploadCounter(ctx *Context) func(completed, total int) {
+	return packageFileCounter(ctx, "Uploading files")
+}
+
+func packageFileCounter(ctx *Context, label string) func(completed, total int) {
 	last := -1
 	return func(completed, total int) {
 		if total == 0 {
 			if last < 0 {
-				packagePublishStatus(ctx, "Uploading files: all already present")
+				packagePublishStatus(ctx, "%s: all already present", label)
 				last = 0
 			}
 			return
@@ -316,7 +320,7 @@ func packageUploadCounter(ctx *Context) func(completed, total int) {
 		if completed != 0 && completed != total && completed-last < step {
 			return
 		}
-		packagePublishStatus(ctx, "Uploading files: %d/%d", completed, total)
+		packagePublishStatus(ctx, "%s: %d/%d", label, completed, total)
 		last = completed
 	}
 }
