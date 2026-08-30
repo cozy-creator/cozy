@@ -16,7 +16,7 @@ import (
 )
 
 func handleRegistryInstall(ctx *Context) *exit.Error {
-	ref, release, problem := registryPackageRef(ctx.Inv.Args[0])
+	ref, release, problem := registryPackageRef(ctx.Inv.Args[0], ctx.Inv.Value("--version"))
 	if problem != nil {
 		return problem
 	}
@@ -90,10 +90,15 @@ func handleRegistryInstall(ctx *Context) *exit.Error {
 	return emitInstallResult(ctx, st, result)
 }
 
-func registryPackageRef(value string) (hub.Ref, string, *exit.Error) {
-	name, release, hasRelease := strings.Cut(strings.TrimSpace(value), "@")
-	if hasRelease && (release == "" || strings.ContainsAny(release, `@/\`)) {
-		return hub.Ref{}, "", exit.Usagef("%q is not org/package[@release]", value)
+func registryPackageRef(value, release string) (hub.Ref, string, *exit.Error) {
+	name := strings.TrimSpace(value)
+	if strings.Contains(name, "@") {
+		return hub.Ref{}, "", exit.Usagef("a version does not belong in the package name").
+			WithRemedy("use cozy package install org/package --version 1.2.3")
+	}
+	release = strings.TrimSpace(release)
+	if strings.ContainsAny(release, `@/\`) {
+		return hub.Ref{}, "", exit.Usagef("--version %q is not a release name", release)
 	}
 	ref, problem := hub.ParseRef(name)
 	return ref, release, problem

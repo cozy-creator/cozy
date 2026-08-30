@@ -62,7 +62,7 @@ Search the Tensorhub catalog, install a package, and inspect local installations
 cozy package search video
 cozy package search org/name
 cozy package install org/name
-cozy package install org/name@1.2.3
+cozy package install org/name --version 1.2.3
 cozy package list
 ```
 

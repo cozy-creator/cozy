@@ -83,11 +83,16 @@ func TestPackagePublishMetadataGrammar(t *testing.T) {
 		t.Fatalf("package publish retained caller-authored identity [exit %d]\n%s", code, help)
 	}
 	if code, help := runCozy(t, root, "package", "install", "--help"); code != 0 ||
+		!strings.Contains(help, "--version") ||
 		strings.Contains(help, "--profile") || strings.Contains(help, "--major") ||
 		strings.Contains(help, "--from") || strings.Contains(help, "--dir") ||
 		strings.Contains(help, "--digest") || strings.Contains(help, "--allow-unsigned") ||
 		strings.Contains(help, "--force") {
 		t.Fatalf("package install exposed internal source/destination flags [exit %d]\n%s", code, help)
+	}
+	if code, out := runCozy(t, root, "package", "install", "cozy/example@1.2.3"); code != 2 ||
+		!strings.Contains(out, "--version 1.2.3") {
+		t.Fatalf("inline install version did not point to --version [exit %d]\n%s", code, out)
 	}
 	project := t.TempDir()
 	must(t, os.WriteFile(filepath.Join(project, "pyproject.toml"), []byte(`[project]
