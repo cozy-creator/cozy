@@ -120,6 +120,9 @@ func Build(req Request) (*Result, *exit.Error) {
 		} else {
 			runErr = cmd.Wait()
 		}
+		// A backend may have spawned descendants that outlived uv itself. The
+		// build transaction ends the entire contained tree on every exit path.
+		_ = processtree.Kill(pid, syscall.SIGKILL)
 		processtree.Release(pid)
 	}
 	close(done)
