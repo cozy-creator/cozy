@@ -923,10 +923,7 @@ func weightlessProject(t *testing.T) string {
 	t.Helper()
 	home, err := os.UserHomeDir()
 	must(t, err)
-	repo := strings.TrimSpace(os.Getenv("COZY_RUNTIME_REPO"))
-	if repo == "" {
-		repo = filepath.Join(home, "cozy_v2", "cozy-runtime") //cozy:allow peer source; the fixture builds the exact generation Runtime
-	}
+	repo := filepath.Join(home, "cozy_v2", "cozy-runtime") //cozy:allow peer source; the fixture builds the exact generation Runtime
 	if _, err := os.Stat(filepath.Join(repo, "pyproject.toml")); err != nil {
 		t.Skipf("no cozy-runtime peer at %s: %v", repo, err)
 	}
