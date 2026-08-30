@@ -109,12 +109,17 @@ func semantics(name string, d Doc) error {
 		return artifactReceiptList(d)
 	case "cozy.worker.v1.ArtifactReceipt":
 		return artifactReceipt(d)
-	case "cozy.worker.v1.ArtifactFinalizeDecision":
-		return artifactFinalizeDecision(d)
-	case "cozy.worker.v1.ArtifactFinalizeResult":
-		return artifactFinalizeResult(d)
-	case "cozy.worker.v1.PlacementSpec":
-		return placementModelObjectSet(d)
+	case "cozy.worker.v1.PlacementSet":
+		placements, _ := d["placements"].([]Value)
+		for _, raw := range placements {
+			placement, ok := raw.(map[string]Value)
+			if !ok {
+				return refuse("placement_shape", "a placement is not an object")
+			}
+			if err := placementModelObjectSet(Doc(placement)); err != nil {
+				return err
+			}
+		}
 	}
 	return nil
 }
@@ -122,7 +127,7 @@ func semantics(name string, d Doc) error {
 func placementModelObjectSet(d Doc) error {
 	raw, ok := d["model_object_set"]
 	if !ok {
-		return refuse("model_object_set_missing", "PlacementSpec/2 requires model_object_set")
+		return refuse("model_object_set_missing", "PlacementSet/2 requires model_object_set")
 	}
 	subject, ok := raw.(map[string]Value)
 	if !ok {
@@ -196,62 +201,6 @@ func artifactReceipt(d Doc) error {
 		return refuse("artifact_receipt_identity_malformed", "invocation_spec_digest: %s", err)
 	}
 	return nil
-}
-
-func artifactFinalizeDecision(d Doc) error {
-	for _, field := range []string{"owner_authority_scope", "request_id", "invocation_spec_digest", "output_slot"} {
-		if d.Str(field) == "" {
-			return refuse("artifact_finalize_decision_incomplete", "%s is empty or absent", field)
-		}
-	}
-	disposition := d.Int("disposition")
-	receipt, root := d.Str("artifact_receipt_digest"), d.Str("scratch_root_id")
-	if receipt != "" {
-		if _, err := Raw(receipt); err != nil {
-			return refuse("artifact_finalize_decision_shape", "artifact_receipt_digest: %s", err)
-		}
-	}
-	switch pb.ArtifactFinalizeDisposition(disposition) {
-	case pb.ArtifactFinalizeDisposition_ARTIFACT_FINALIZE_DISPOSITION_ADOPT:
-		if receipt != "" && root != "" {
-			return nil
-		}
-	case pb.ArtifactFinalizeDisposition_ARTIFACT_FINALIZE_DISPOSITION_ABANDON:
-		if receipt != "" && root == "" {
-			return nil
-		}
-	case pb.ArtifactFinalizeDisposition_ARTIFACT_FINALIZE_DISPOSITION_ABANDON_UNCOMMITTED:
-		if receipt == "" && root == "" {
-			return nil
-		}
-	}
-	return refuse("artifact_finalize_decision_shape", "disposition %d has an invalid receipt/root shape", disposition)
-}
-
-func artifactFinalizeResult(d Doc) error {
-	for _, field := range []string{"owner_authority_scope", "request_id", "invocation_spec_digest", "output_slot"} {
-		if d.Str(field) == "" {
-			return refuse("artifact_finalize_result_incomplete", "%s is empty or absent", field)
-		}
-	}
-	outcome := pb.ArtifactFinalizeOutcome(d.Int("outcome"))
-	rawReceipt, hasReceipt := d["artifact_receipt"]
-	if outcome != pb.ArtifactFinalizeOutcome_ARTIFACT_FINALIZE_OUTCOME_ADOPTED &&
-		outcome != pb.ArtifactFinalizeOutcome_ARTIFACT_FINALIZE_OUTCOME_ABANDONED {
-		return refuse("artifact_finalize_result_shape", "outcome %d is not final", outcome)
-	}
-	if outcome == pb.ArtifactFinalizeOutcome_ARTIFACT_FINALIZE_OUTCOME_ADOPTED && !hasReceipt {
-		return refuse("artifact_finalize_result_shape", "ADOPTED requires its exact receipt")
-	}
-	if !hasReceipt {
-		return nil
-	}
-	fields, ok := rawReceipt.(map[string]Value)
-	if !ok {
-		return refuse("artifact_finalize_result_shape", "artifact_receipt is not an object")
-	}
-	_, _, err := readArtifactReceiptRef(Doc(fields))
-	return err
 }
 
 func readArtifactReceiptRef(ref Doc) (Doc, int, error) {

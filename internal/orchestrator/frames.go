@@ -97,10 +97,7 @@ func (c *Orchestrator) converge(s *session, w *worker, placements []DesiredPlace
 					"attached worker %s placement %s carries no frozen environment digest",
 					w.instanceID, p.PlacementID())
 			}
-			set.Placements = append(set.Placements, &pb.Placement{
-				PlacementId: p.PlacementID(),
-				Spec:        c.placementSpec(w, p),
-			})
+			set.Placements = append(set.Placements, c.placement(w, p))
 		}
 		var err error
 		setBytes, digest, err = canonical.Identity(set)
@@ -152,7 +149,7 @@ func (c *Orchestrator) converge(s *session, w *worker, placements []DesiredPlace
 	return nil
 }
 
-// placementSpec mints the immutable PlacementSpec document for one desired placement. THE
+// placement mints one immutable Placement nested directly in the desired set. THE
 // DESIRED SET NAMES BYTES, NEVER A POINTER (§1): `package_release_id` survives only as
 // PROVENANCE and every other field is an immutable digest, so two workers handed the same
 // set converge to the same bytes or fault typed.
@@ -160,8 +157,9 @@ func (c *Orchestrator) converge(s *session, w *worker, placements []DesiredPlace
 // A local install leaves environment/receipt empty unless its own launcher supplied
 // those facts; it never manufactures Tensorhub documents. A remote placement normally
 // bypasses this author entirely because converge relays Tensorhub's exact PlacementSet.
-func (c *Orchestrator) placementSpec(w *worker, p DesiredPlacement) *pb.PlacementSpec {
-	spec := &pb.PlacementSpec{
+func (c *Orchestrator) placement(w *worker, p DesiredPlacement) *pb.Placement {
+	placement := &pb.Placement{
+		PlacementId:      p.PlacementID(),
 		PackageReleaseId: p.PackageReleaseID,
 		BindingPlans:     w.subjects,
 		ModelObjectSet:   modelObjectSetSubject(p),
@@ -171,20 +169,20 @@ func (c *Orchestrator) placementSpec(w *worker, p DesiredPlacement) *pb.Placemen
 		environmentDigest = c.opt.EnvironmentSpecDigest
 	}
 	if raw, err := canonical.Raw(environmentDigest); err == nil {
-		spec.EnvironmentSpecDigest = raw
+		placement.EnvironmentSpecDigest = raw
 	}
 	if raw, err := canonical.Raw(p.InstalledEnvironmentReceiptDigest); err == nil {
-		spec.InstalledEnvironmentReceiptDigest = raw
+		placement.InstalledEnvironmentReceiptDigest = raw
 	}
 	if raw, err := canonical.Raw(p.PackageDescriptorDigest); err == nil {
-		spec.PackageDescriptorDigest = raw
+		placement.PackageDescriptorDigest = raw
 	}
-	return spec
+	return placement
 }
 
 const emptyModelObjectSet = `{"kind":"tensorhub.resolved_object_set/1","roots":[]}`
 
-// modelObjectSetSubject makes the required PlacementSpec/2 closure explicit even for a
+// modelObjectSetSubject makes the required PlacementSet/2 closure explicit even for a
 // weightless local package. The empty object-set document is a real canonical subject,
 // not absence; remote placements carry Tensorhub's exact non-empty subject and normally
 // bypass local authoring by relaying the complete PlacementSet bytes.
@@ -268,7 +266,8 @@ func (c *Orchestrator) onObserved(s *session, r *pb.ObservedWorkerState, frameBy
 			if status != nil {
 				w.materialization, w.serving = status.Materialization, status.Serving
 				w.generation = status.ExecutorGeneration
-				w.specDigest, w.fallbackPin = status.PlacementSpecDigest, status.RetainedFallbackSpecDigest
+				w.heldSetDigest = status.PlacementSetDigest
+				w.fallbackSetDigest = status.RetainedFallbackPlacementSetDigest
 				observed, facts := placementAcquisitionOf(w.instanceID, s.bootID, status)
 				w.acquisition = facts
 				if observed != nil {
@@ -389,7 +388,7 @@ func placementAcquisitionOf(instanceID, bootID string,
 	if status == nil || status.Acquisition == nil {
 		return nil, facts
 	}
-	specDigest, err := canonical.Spell(status.PlacementSpecDigest)
+	setDigest, err := canonical.Spell(status.PlacementSetDigest)
 	if err != nil {
 		return nil, facts
 	}
@@ -411,7 +410,7 @@ func placementAcquisitionOf(instanceID, bootID string,
 	facts.Package, facts.Model = pkgFacts, modelFacts
 	return &records.PlacementAcquisition{
 		InstanceID: instanceID, WorkerBootID: bootID, PlacementID: status.PlacementId,
-		PlacementSpecDigest: specDigest, Package: pkg, Model: model,
+		PlacementSetDigest: setDigest, Package: pkg, Model: model,
 	}, facts
 }
 
@@ -436,10 +435,10 @@ func progressSignature(r *pb.ObservedWorkerState, status *pb.PlacementStatus) st
 		sig += fmt.Sprintf(" jobs=%d/%d", jc.GetJobsAvailable(), jc.GetJobsInFlight())
 	}
 	if status != nil {
-		sig += fmt.Sprintf(" mat=%d srv=%d gen=%d disp=%s matz=%s spec=%x",
+		sig += fmt.Sprintf(" mat=%d srv=%d gen=%d disp=%s matz=%s set=%x",
 			status.Materialization, status.Serving, status.ExecutorGeneration,
 			strings.Join(status.DispatchablePlanIds, ","),
-			strings.Join(status.MaterializablePlanIds, ","), status.PlacementSpecDigest)
+			strings.Join(status.MaterializablePlanIds, ","), status.PlacementSetDigest)
 		if acquisition := status.GetAcquisition(); acquisition != nil {
 			for _, observed := range []struct {
 				name string

@@ -136,7 +136,7 @@ func (f *fakeControl) Control(stream pb.WorkerControl_ControlServer) error {
 				Materialization:    pb.MaterializationState_MATERIALIZATION_STATE_STAGED,
 				Serving:            pb.ServingState_SERVING_STATE_DISPATCHABLE,
 				ExecutorGeneration: 1, DispatchablePlanIds: planIDs,
-				PlacementSpecDigest: setDigest,
+				PlacementSetDigest: setDigest,
 			}}
 		}
 		env(func(e, g uint64, b string) {
@@ -208,15 +208,14 @@ func (f *fakeControl) Control(stream pb.WorkerControl_ControlServer) error {
 				validSet := true
 				for _, p := range doc.List("placements") {
 					placementID = p.Str("placement_id")
-					spec := p.Sub("spec")
-					model := spec.Sub("model_object_set")
+					model := p.Sub("model_object_set")
 					if model.Str("kind") != "model_object_set" ||
 						model.Str("subject_id") != model.Str("digest") || model.Int("length") <= 0 {
 						f.say("ARM: placement %s has no exact model-object-set subject — UNAPPLIED", placementID)
 						validSet = false
 						break
 					}
-					for _, sub := range spec.List("binding_plans") {
+					for _, sub := range p.List("binding_plans") {
 						planIDs = append(planIDs, sub.Str("subject_id"))
 					}
 				}

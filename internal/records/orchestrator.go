@@ -48,7 +48,7 @@ CREATE TABLE IF NOT EXISTS placement_acquisition_observations (
   instance_id                 TEXT NOT NULL,
   worker_boot_id              TEXT NOT NULL,
   placement_id                TEXT NOT NULL,
-  placement_spec_digest       TEXT NOT NULL,
+  placement_set_digest        TEXT NOT NULL,
   package_started_ns         INTEGER NOT NULL,
   package_ended_ns           INTEGER NOT NULL,
   package_downloaded_bytes   INTEGER NOT NULL,
@@ -58,7 +58,7 @@ CREATE TABLE IF NOT EXISTS placement_acquisition_observations (
   model_downloaded_bytes      INTEGER NOT NULL,
   model_reused_bytes          INTEGER NOT NULL,
   observed_at                 TEXT NOT NULL,
-  PRIMARY KEY (instance_id, worker_boot_id, placement_id, placement_spec_digest)
+  PRIMARY KEY (instance_id, worker_boot_id, placement_id, placement_set_digest)
 )`, `
 CREATE TABLE IF NOT EXISTS requests (
   id           TEXT PRIMARY KEY,
@@ -178,8 +178,7 @@ CREATE TABLE IF NOT EXISTS artifact_receipts (
   PRIMARY KEY (request_id, attempt, output_slot),
   FOREIGN KEY (request_id, attempt) REFERENCES attempts(request_id, attempt)
 )`, `
--- Cozy's first-wins artifact disposition. The exact decision is journaled before send;
--- the exact Runtime result is journaled before the outcome is acknowledged.
+-- Cozy's first-wins typed artifact disposition and Runtime completion.
 CREATE TABLE IF NOT EXISTS artifact_finalizations (
   request_id         TEXT    NOT NULL,
   attempt            INTEGER NOT NULL,
@@ -190,11 +189,7 @@ CREATE TABLE IF NOT EXISTS artifact_finalizations (
   disposition        TEXT    NOT NULL,
   receipt_digest     TEXT    NOT NULL DEFAULT '',
   scratch_root_id    TEXT    NOT NULL DEFAULT '',
-  decision_digest    TEXT    NOT NULL,
-  decision_bytes     BLOB    NOT NULL,
   result_outcome     TEXT    NOT NULL DEFAULT '',
-  result_digest      TEXT    NOT NULL DEFAULT '',
-  result_bytes       BLOB    NOT NULL DEFAULT x'',
   result_receipt_digest TEXT NOT NULL DEFAULT '',
   result_receipt_bytes  BLOB NOT NULL DEFAULT x'',
   recorded_at        TEXT    NOT NULL,
@@ -213,14 +208,15 @@ type tableRebuild struct {
 	steps []string
 }
 
-var rebuild = []tableRebuild{{
-	table: "job_checkpoints",
-	stale: "PRIMARY KEY (request_id, operation_key, logical_key)",
-	steps: []string{
-		`ALTER TABLE job_checkpoints RENAME TO job_checkpoints_pre_attempt_key`,
-		// Recreated by `schema` on the next Open? No — this runs inside the same Open, so
-		// the new shape is created here, from the same text the schema declares.
-		`CREATE TABLE job_checkpoints (
+var rebuild = []tableRebuild{
+	{
+		table: "job_checkpoints",
+		stale: "PRIMARY KEY (request_id, operation_key, logical_key)",
+		steps: []string{
+			`ALTER TABLE job_checkpoints RENAME TO job_checkpoints_pre_attempt_key`,
+			// Recreated by `schema` on the next Open? No — this runs inside the same Open, so
+			// the new shape is created here, from the same text the schema declares.
+			`CREATE TABLE job_checkpoints (
   request_id    TEXT    NOT NULL,
   attempt       INTEGER NOT NULL,
   operation_key TEXT    NOT NULL,
@@ -232,15 +228,48 @@ var rebuild = []tableRebuild{{
   PRIMARY KEY (request_id, attempt, operation_key, logical_key),
   FOREIGN KEY (request_id, attempt) REFERENCES attempts(request_id, attempt)
 )`,
-		// Rows whose attempt does not exist are dropped, and that is the correction, not a
-		// loss: under the new identity a checkpoint of an attempt that was never dispatched
-		// is exactly the row this key exists to make unrepresentable.
-		`INSERT INTO job_checkpoints SELECT c.* FROM job_checkpoints_pre_attempt_key c
+			// Rows whose attempt does not exist are dropped, and that is the correction, not a
+			// loss: under the new identity a checkpoint of an attempt that was never dispatched
+			// is exactly the row this key exists to make unrepresentable.
+			`INSERT INTO job_checkpoints SELECT c.* FROM job_checkpoints_pre_attempt_key c
 		   WHERE EXISTS (SELECT 1 FROM attempts a
 		                 WHERE a.request_id=c.request_id AND a.attempt=c.attempt)`,
-		`DROP TABLE job_checkpoints_pre_attempt_key`,
+			`DROP TABLE job_checkpoints_pre_attempt_key`,
+		},
 	},
-}}
+	{
+		table: "artifact_finalizations",
+		stale: "decision_digest    TEXT",
+		steps: []string{
+			`ALTER TABLE artifact_finalizations RENAME TO artifact_finalizations_canonical_docs`,
+			`CREATE TABLE artifact_finalizations (
+  request_id         TEXT    NOT NULL,
+  attempt            INTEGER NOT NULL,
+  instance_id        TEXT    NOT NULL,
+  owner_scope        TEXT    NOT NULL,
+  invocation_digest  TEXT    NOT NULL,
+  output_slot        TEXT    NOT NULL,
+  disposition        TEXT    NOT NULL,
+  receipt_digest     TEXT    NOT NULL DEFAULT '',
+  scratch_root_id    TEXT    NOT NULL DEFAULT '',
+  result_outcome     TEXT    NOT NULL DEFAULT '',
+  result_receipt_digest TEXT NOT NULL DEFAULT '',
+  result_receipt_bytes  BLOB NOT NULL DEFAULT x'',
+  recorded_at        TEXT    NOT NULL,
+  completed_at       TEXT    NOT NULL DEFAULT '',
+  PRIMARY KEY (request_id, invocation_digest, output_slot),
+  FOREIGN KEY (request_id, attempt) REFERENCES attempts(request_id, attempt)
+)`,
+			`INSERT INTO artifact_finalizations(request_id,attempt,instance_id,owner_scope,
+  invocation_digest,output_slot,disposition,receipt_digest,scratch_root_id,result_outcome,
+  result_receipt_digest,result_receipt_bytes,recorded_at,completed_at)
+ SELECT request_id,attempt,instance_id,owner_scope,invocation_digest,output_slot,disposition,
+  receipt_digest,scratch_root_id,result_outcome,result_receipt_digest,result_receipt_bytes,
+  recorded_at,completed_at FROM artifact_finalizations_canonical_docs`,
+			`DROP TABLE artifact_finalizations_canonical_docs`,
+		},
+	},
+}
 
 // widen carries the columns a table gained after some root already created it. Applied
 // after `schema`, and a duplicate-column answer means it is already there.
@@ -304,18 +333,18 @@ type AcquisitionLeg struct {
 }
 
 type PlacementAcquisition struct {
-	InstanceID, WorkerBootID, PlacementID, PlacementSpecDigest string
-	Package, Model                                             AcquisitionLeg
-	ObservedAt                                                 string
+	InstanceID, WorkerBootID, PlacementID, PlacementSetDigest string
+	Package, Model                                            AcquisitionLeg
+	ObservedAt                                                string
 }
 
-const acquisitionColumns = `instance_id,worker_boot_id,placement_id,placement_spec_digest,
+const acquisitionColumns = `instance_id,worker_boot_id,placement_id,placement_set_digest,
 	package_started_ns,package_ended_ns,package_downloaded_bytes,package_reused_bytes,
 	model_started_ns,model_ended_ns,model_downloaded_bytes,model_reused_bytes,observed_at`
 
 func scanPlacementAcquisition(row interface{ Scan(...any) error }) (PlacementAcquisition, error) {
 	var out PlacementAcquisition
-	err := row.Scan(&out.InstanceID, &out.WorkerBootID, &out.PlacementID, &out.PlacementSpecDigest,
+	err := row.Scan(&out.InstanceID, &out.WorkerBootID, &out.PlacementID, &out.PlacementSetDigest,
 		&out.Package.StartedNS, &out.Package.EndedNS,
 		&out.Package.DownloadedBytes, &out.Package.ReusedBytes,
 		&out.Model.StartedNS, &out.Model.EndedNS,
@@ -327,7 +356,7 @@ func scanPlacementAcquisition(row interface{ Scan(...any) error }) (PlacementAcq
 // exact placement spec. Counters and clock points may advance; they never move backward.
 func (s *Store) ObservePlacementAcquisition(in PlacementAcquisition) *exit.Error {
 	if in.InstanceID == "" || in.WorkerBootID == "" || in.PlacementID == "" ||
-		in.PlacementSpecDigest == "" {
+		in.PlacementSetDigest == "" {
 		return exit.Named(exit.Conflict, "placement.acquisition_identity_missing",
 			"an acquisition observation is missing worker, boot, placement, or spec identity")
 	}
@@ -342,7 +371,7 @@ func (s *Store) ObservePlacementAcquisition(in PlacementAcquisition) *exit.Error
 	}
 	result, err := s.db.Exec(`INSERT INTO placement_acquisition_observations(`+acquisitionColumns+`)
 		VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)
-		ON CONFLICT(instance_id,worker_boot_id,placement_id,placement_spec_digest)
+		ON CONFLICT(instance_id,worker_boot_id,placement_id,placement_set_digest)
 		DO UPDATE SET package_started_ns=excluded.package_started_ns,
 		 package_ended_ns=excluded.package_ended_ns,
 		 package_downloaded_bytes=excluded.package_downloaded_bytes,
@@ -368,7 +397,7 @@ func (s *Store) ObservePlacementAcquisition(in PlacementAcquisition) *exit.Error
 		        excluded.model_reused_bytes>=placement_acquisition_observations.model_reused_bytes) OR
 		       (placement_acquisition_observations.model_ended_ns>0 AND
 		        excluded.model_started_ns>placement_acquisition_observations.model_ended_ns))`,
-		in.InstanceID, in.WorkerBootID, in.PlacementID, in.PlacementSpecDigest,
+		in.InstanceID, in.WorkerBootID, in.PlacementID, in.PlacementSetDigest,
 		in.Package.StartedNS, in.Package.EndedNS, in.Package.DownloadedBytes, in.Package.ReusedBytes,
 		in.Model.StartedNS, in.Model.EndedNS, in.Model.DownloadedBytes, in.Model.ReusedBytes,
 		in.ObservedAt)
@@ -408,11 +437,11 @@ func validAcquisitionLeg(name string, leg AcquisitionLeg) *exit.Error {
 }
 
 func (s *Store) PlacementAcquisition(instanceID, bootID, placementID,
-	specDigest string) (*PlacementAcquisition, *exit.Error) {
+	setDigest string) (*PlacementAcquisition, *exit.Error) {
 	out, err := scanPlacementAcquisition(s.db.QueryRow(`SELECT `+acquisitionColumns+`
 		FROM placement_acquisition_observations
-		WHERE instance_id=? AND worker_boot_id=? AND placement_id=? AND placement_spec_digest=?`,
-		instanceID, bootID, placementID, specDigest))
+		WHERE instance_id=? AND worker_boot_id=? AND placement_id=? AND placement_set_digest=?`,
+		instanceID, bootID, placementID, setDigest))
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, nil
 	}
@@ -1250,17 +1279,12 @@ type ArtifactReceipt struct {
 	RecordedAt                                                         string
 }
 
-// ArtifactFinalization is Cozy's durable first-wins disposition and Runtime's exact
-// replayable completion. DecisionDigest/Bytes are persisted before send; ResultDigest/Bytes
-// are persisted before AttemptOutcomeAck.
+// ArtifactFinalization is Cozy's durable typed first-wins disposition and Runtime completion.
 type ArtifactFinalization struct {
 	RequestID, InstanceID, OwnerScope, InvocationDigest, OutputSlot string
 	Attempt                                                         int64
 	Disposition, ReceiptDigest, ScratchRootID                       string
-	DecisionDigest                                                  string
-	DecisionBytes                                                   []byte
-	ResultOutcome, ResultDigest                                     string
-	ResultBytes                                                     []byte
+	ResultOutcome                                                   string
 	ResultReceiptDigest                                             string
 	ResultReceiptBytes                                              []byte
 	RecordedAt, CompletedAt                                         string
@@ -1400,15 +1424,22 @@ func (s *Store) AcceptTerminal(t Terminal) (applied bool, e *exit.Error) {
 		}
 	}
 	for _, finalization := range t.ArtifactFinalizations {
-		var held string
-		err := tx.QueryRow(`SELECT decision_digest FROM artifact_finalizations
+		var held ArtifactFinalization
+		err := tx.QueryRow(`SELECT attempt,instance_id,owner_scope,disposition,
+			receipt_digest,scratch_root_id FROM artifact_finalizations
 			WHERE request_id=? AND invocation_digest=? AND output_slot=?`, finalization.RequestID,
-			finalization.InvocationDigest, finalization.OutputSlot).Scan(&held)
+			finalization.InvocationDigest, finalization.OutputSlot).Scan(&held.Attempt,
+			&held.InstanceID, &held.OwnerScope, &held.Disposition, &held.ReceiptDigest,
+			&held.ScratchRootID)
 		if err == nil {
-			if held != finalization.DecisionDigest {
+			if held.Attempt != finalization.Attempt || held.InstanceID != finalization.InstanceID ||
+				held.OwnerScope != finalization.OwnerScope ||
+				held.Disposition != finalization.Disposition ||
+				held.ReceiptDigest != finalization.ReceiptDigest ||
+				held.ScratchRootID != finalization.ScratchRootID {
 				return false, exit.New(exit.Conflict,
-					"artifact output %s already has final intent %s, not %s",
-					finalization.OutputSlot, short(held), short(finalization.DecisionDigest))
+					"artifact output %s already has a different typed final intent",
+					finalization.OutputSlot)
 			}
 			continue
 		}
@@ -1418,11 +1449,11 @@ func (s *Store) AcceptTerminal(t Terminal) (applied bool, e *exit.Error) {
 		}
 		if _, err := tx.Exec(`INSERT INTO artifact_finalizations(request_id,attempt,instance_id,
 			owner_scope,invocation_digest,output_slot,disposition,receipt_digest,scratch_root_id,
-			decision_digest,decision_bytes,recorded_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)`,
+			recorded_at) VALUES(?,?,?,?,?,?,?,?,?,?)`,
 			finalization.RequestID, finalization.Attempt, finalization.InstanceID,
 			finalization.OwnerScope, finalization.InvocationDigest, finalization.OutputSlot,
 			finalization.Disposition, finalization.ReceiptDigest, finalization.ScratchRootID,
-			finalization.DecisionDigest, finalization.DecisionBytes, visible); err != nil {
+			visible); err != nil {
 			return false, exit.Internalf("cannot record artifact final intent %s of %s#%d: %s",
 				finalization.OutputSlot, t.RequestID, t.Attempt, err)
 		}
@@ -1589,16 +1620,15 @@ func (s *Store) attemptsWhere(where string, args ...any) ([]Attempt, *exit.Error
 }
 
 const artifactFinalizationCols = `request_id,attempt,instance_id,owner_scope,invocation_digest,
-	output_slot,disposition,receipt_digest,scratch_root_id,decision_digest,decision_bytes,
-	result_outcome,result_digest,result_bytes,result_receipt_digest,result_receipt_bytes,
+	output_slot,disposition,receipt_digest,scratch_root_id,result_outcome,
+	result_receipt_digest,result_receipt_bytes,
 	recorded_at,completed_at`
 
 func scanArtifactFinalization(row interface{ Scan(...any) error }) (ArtifactFinalization, error) {
 	var f ArtifactFinalization
 	err := row.Scan(&f.RequestID, &f.Attempt, &f.InstanceID, &f.OwnerScope,
 		&f.InvocationDigest, &f.OutputSlot, &f.Disposition, &f.ReceiptDigest,
-		&f.ScratchRootID, &f.DecisionDigest, &f.DecisionBytes, &f.ResultOutcome,
-		&f.ResultDigest, &f.ResultBytes, &f.ResultReceiptDigest, &f.ResultReceiptBytes,
+		&f.ScratchRootID, &f.ResultOutcome, &f.ResultReceiptDigest, &f.ResultReceiptBytes,
 		&f.RecordedAt, &f.CompletedAt)
 	return f, err
 }
@@ -1622,7 +1652,7 @@ func (s *Store) ArtifactFinalization(requestID, invocationDigest, outputSlot str
 // this attempt's outcome may be acknowledged. Ordering by slot makes replay deterministic.
 func (s *Store) PendingArtifactFinalizations(requestID string, attempt int64) ([]ArtifactFinalization, *exit.Error) {
 	rows, err := s.db.Query(`SELECT `+artifactFinalizationCols+` FROM artifact_finalizations
-		WHERE request_id=? AND attempt=? AND result_digest='' ORDER BY output_slot`, requestID, attempt)
+		WHERE request_id=? AND attempt=? AND completed_at='' ORDER BY output_slot`, requestID, attempt)
 	if err != nil {
 		return nil, exit.Internalf("cannot read pending artifact finalizations of %s#%d: %s",
 			requestID, attempt, err)
@@ -1657,8 +1687,8 @@ func (s *Store) ArtifactFinalizationsOf(requestID string) ([]ArtifactFinalizatio
 	return out, nil
 }
 
-// RecordArtifactFinalizeResult journals Runtime's exact replayable result. The same result
-// is idempotent; any changed bytes for the first-wins decision conflict forever.
+// RecordArtifactFinalizeResult journals Runtime's typed replayable result. The same result is
+// idempotent; a changed result for the first-wins decision conflicts forever.
 func (s *Store) RecordArtifactFinalizeResult(result ArtifactFinalization) (applied bool, e *exit.Error) {
 	tx, err := s.db.Begin()
 	if err != nil {
@@ -1681,20 +1711,21 @@ func (s *Store) RecordArtifactFinalizeResult(result ArtifactFinalization) (appli
 			"artifact finalize result for %s/%s came from worker %s; %s owns the transaction",
 			result.RequestID, result.OutputSlot, result.InstanceID, held.InstanceID)
 	}
-	if held.ResultDigest != "" {
-		if held.ResultDigest != result.ResultDigest || !bytes.Equal(held.ResultBytes, result.ResultBytes) {
+	if held.CompletedAt != "" {
+		if held.ResultOutcome != result.ResultOutcome ||
+			held.ResultReceiptDigest != result.ResultReceiptDigest ||
+			!bytes.Equal(held.ResultReceiptBytes, result.ResultReceiptBytes) {
 			return false, exit.New(exit.Conflict,
-				"artifact finalization %s/%s already completed with %s, not %s",
-				result.RequestID, result.OutputSlot, short(held.ResultDigest), short(result.ResultDigest))
+				"artifact finalization %s/%s already completed with a different typed result",
+				result.RequestID, result.OutputSlot)
 		}
 		return false, nil
 	}
 	completed := now()
-	updated, err := tx.Exec(`UPDATE artifact_finalizations SET result_outcome=?,result_digest=?,
-		result_bytes=?,result_receipt_digest=?,result_receipt_bytes=?,completed_at=?
-		WHERE request_id=? AND invocation_digest=? AND output_slot=? AND result_digest=''`,
-		result.ResultOutcome, result.ResultDigest, blob(result.ResultBytes),
-		result.ResultReceiptDigest, blob(result.ResultReceiptBytes), completed,
+	updated, err := tx.Exec(`UPDATE artifact_finalizations SET result_outcome=?,
+		result_receipt_digest=?,result_receipt_bytes=?,completed_at=?
+		WHERE request_id=? AND invocation_digest=? AND output_slot=? AND completed_at=''`,
+		result.ResultOutcome, result.ResultReceiptDigest, blob(result.ResultReceiptBytes), completed,
 		result.RequestID, result.InvocationDigest, result.OutputSlot)
 	if err != nil {
 		return false, exit.Internalf("cannot record artifact finalize result %s/%s: %s",

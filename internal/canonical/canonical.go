@@ -173,8 +173,8 @@ func body(m protoreflect.Message) (map[string]Value, error) {
 // versioned (01 §3): an unknown key REFUSES, so a new key is a NEW DOCUMENT VERSION and
 // the version rides the `format` tag. Every document is at /1 except
 // `AttemptOutcomeBody/3`, which carries th-049's exact artifact receipts on top of /2's
-// `execution_started` bit and the frozen wire's TerminalBody/1 lineage; PlacementSet and
-// PlacementSpec are /2 because the required model-object-set subject changes their keys.
+// `execution_started` bit and the frozen wire's TerminalBody/1 lineage; PlacementSet is /2
+// because the required model-object-set subject changes its keys.
 //
 // The map is read INDEPENDENTLY per language (#510g) rather than derived from the
 // binding, because the version is a property of the document's key set and not of the
@@ -185,7 +185,6 @@ var docVersion = map[string]int{
 	"cozy.worker.v1.AttemptOutcomeBody":     3,
 	"cozy.worker.v1.PackageEnvironmentSpec": 2,
 	"cozy.worker.v1.PlacementSet":           2,
-	"cozy.worker.v1.PlacementSpec":          2,
 	"cozy.worker.v1.WorkerSnapshotBody":     2,
 }
 
