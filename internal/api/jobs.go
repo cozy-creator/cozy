@@ -532,7 +532,13 @@ func (s *Server) cancelJob(w http.ResponseWriter, r *http.Request) {
 			s.refuseTyped(w, r, e)
 			return
 		}
-		s.ok(w, r, http.StatusOK, s.jobStateOf(row))
+		updated, e := s.store.RequestRow(row.ID)
+		if e != nil || updated == nil {
+			s.refuse(w, r, http.StatusInternalServerError, "internal",
+				"the queued job was canceled and cannot be read back", "")
+			return
+		}
+		s.ok(w, r, http.StatusOK, s.jobStateOf(*updated))
 		return
 	}
 	last := attempts[len(attempts)-1]

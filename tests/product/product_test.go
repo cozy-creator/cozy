@@ -3,6 +3,7 @@ package producttest
 import (
 	"context"
 	"crypto/sha256"
+	"database/sql"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
@@ -25,6 +26,27 @@ import (
 )
 
 const weightlessRef = "cozy/weightless"
+
+func TestLegacyAttemptColumnsMigrate(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "records.db")
+	store, problem := records.Open(path)
+	fatal(t, problem)
+	store.Close()
+	db, err := sql.Open("sqlite", path)
+	must(t, err)
+	_, err = db.Exec(`ALTER TABLE attempts RENAME COLUMN invocation_digest TO exec_spec_digest`)
+	must(t, err)
+	_, err = db.Exec(`ALTER TABLE attempts RENAME COLUMN invocation TO exec_spec`)
+	must(t, err)
+	must(t, db.Close())
+
+	store, problem = records.Open(path)
+	fatal(t, problem)
+	defer store.Close()
+	if _, problem = store.Attempts("no-such-request"); problem != nil {
+		t.Fatalf("migrated attempts are unreadable: %v", problem)
+	}
+}
 
 func TestLiteralPayloadUsesOrdinaryScalarSyntax(t *testing.T) {
 	entrypoint := &launch.Entrypoint{

@@ -1,6 +1,7 @@
 package cli
 
 import (
+	"context"
 	"crypto/rand"
 	"crypto/sha256"
 	"encoding/hex"
@@ -276,42 +277,84 @@ func invocationSettled(status string) bool {
 // happened.
 func watch(ctx *Context, c *localapi.Client, requestID string, stream bool,
 	deadline time.Duration) (*localapi.Event, string, *exit.Error) {
-	interrupt := make(chan os.Signal, 1)
+	interrupt := make(chan os.Signal, 2)
 	signal.Notify(interrupt, syscall.SIGINT, syscall.SIGTERM)
 	defer signal.Stop(interrupt)
 
-	stopped := ""
-	cancel := func(why string) {
-		fmt.Fprintf(ctx.Err, "\n%s — the attempt's own terminal still settles it\n", why)
-		if e := c.Cancel(requestID); e != nil {
-			fmt.Fprintf(ctx.Err, "cancel: %s\n", e.Message)
-		}
-	}
+	watchCtx, stopWatch := context.WithCancel(context.Background())
+	defer stopWatch()
+	stopped := make(chan string, 1)
+	forced := make(chan struct{}, 1)
+	cancelFailed := make(chan *exit.Error, 1)
 	done := make(chan struct{})
 	defer close(done)
 	go func() {
+		reason, message := "", ""
 		select {
 		case _, ok := <-interrupt:
 			if !ok {
 				return
 			}
-			stopped = "canceled"
-			cancel("cancel requested")
+			reason, message = "canceled", "cancel requested"
 		case <-deadlineC(deadline):
 			// `--timeout` is a REQUEST DEADLINE the client enforces the only way a client
 			// honestly can: by asking the orchestrator to cancel. It is not the
 			// supervisor's watchdog deadline (that one is on the attempt, and this host
 			// has no wire field for it) — walking away instead would leave the card held.
-			stopped = "deadline"
-			cancel(fmt.Sprintf("--timeout %s expired", deadline))
+			reason, message = "deadline", fmt.Sprintf("--timeout %s expired", deadline)
+		case <-done:
+			return
+		}
+		stopped <- reason
+		fmt.Fprintf(ctx.Err, "\n%s — the attempt's own terminal still settles it\n", message)
+		cancelResult := make(chan *exit.Error, 1)
+		go func() { cancelResult <- c.Cancel(requestID) }()
+		select {
+		case <-interrupt:
+			fmt.Fprintln(ctx.Err, "second interrupt — stopped waiting; the request remains recorded")
+			forced <- struct{}{}
+			stopWatch()
+			return
+		case problem := <-cancelResult:
+			if problem != nil {
+				fmt.Fprintf(ctx.Err, "cancel: %s\n", problem.Message)
+				cancelFailed <- problem
+				stopWatch()
+				return
+			}
+		case <-done:
+			return
+		}
+		select {
+		case <-interrupt:
+			fmt.Fprintln(ctx.Err, "second interrupt — stopped waiting; the request remains recorded")
+			forced <- struct{}{}
+			stopWatch()
 		case <-done:
 		}
 	}()
 
 	lines := newProgress(ctx, stream)
-	terminal, e := c.Watch(requestID, 0, lines.on)
+	terminal, e := c.WatchContext(watchCtx, requestID, 0, lines.on)
 	lines.done()
-	return terminal, stopped, e
+	select {
+	case problem := <-cancelFailed:
+		return nil, "cancel_failed", problem
+	default:
+	}
+	select {
+	case <-forced:
+		return nil, "interrupted", exit.New(exit.Canceled,
+			"stopped waiting for %s; it remains visible in `cozy invoke list`", requestID).
+			WithNext("cozy invoke list")
+	default:
+	}
+	reason := ""
+	select {
+	case reason = <-stopped:
+	default:
+	}
+	return terminal, reason, e
 }
 
 // deadlineC is a timer channel, or one that never fires when no deadline was set.

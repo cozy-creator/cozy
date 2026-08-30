@@ -8,6 +8,7 @@ import (
 	"strings"
 	"sync"
 
+	pep440 "github.com/aquasecurity/go-pep440-version"
 	"github.com/cozy-creator/cozy/internal/exit"
 	"github.com/cozy-creator/cozy/internal/home"
 	"github.com/cozy-creator/cozy/internal/hub"
@@ -33,7 +34,10 @@ func handleRegistryInstall(ctx *Context) *exit.Error {
 			return exit.New(exit.NotFound, "%s has no published releases", ref.String()).
 				WithNext("cozy package search " + ref.String())
 		}
-		release = card.Releases[0].Release
+		release, problem = latestPackageRelease(card.Releases)
+		if problem != nil {
+			return problem
+		}
 	}
 	plan, problem := c.PackageInstallPlan(hctx, ref, release)
 	if problem != nil {
@@ -88,6 +92,22 @@ func handleRegistryInstall(ctx *Context) *exit.Error {
 		return problem
 	}
 	return emitInstallResult(ctx, st, result)
+}
+
+func latestPackageRelease(releases []hub.ReleaseSummary) (string, *exit.Error) {
+	var chosen pep440.Version
+	name := ""
+	for _, release := range releases {
+		version, err := pep440.Parse(release.Release)
+		if err != nil {
+			return "", exit.Named(exit.Structural, "package.release_version_invalid",
+				"Tensorhub returned package release %q, which is not a Python package version", release.Release)
+		}
+		if name == "" || version.GreaterThan(chosen) {
+			chosen, name = version, release.Release
+		}
+	}
+	return name, nil
 }
 
 func registryPackageRef(value, release string) (hub.Ref, string, *exit.Error) {

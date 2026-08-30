@@ -117,6 +117,8 @@ var renames = []struct{ table, from, to string }{
 	{"placement_acquisition_observations", "endpoint_downloaded_bytes", "package_downloaded_bytes"},
 	{"placement_acquisition_observations", "endpoint_reused_bytes", "package_reused_bytes"},
 	{"requests", "endpoint", "package"},
+	{"attempts", "exec_spec_digest", "invocation_digest"},
+	{"attempts", "exec_spec", "invocation"},
 	{"rentals", "endpoint_ref", "package_ref"},
 }
 
