@@ -276,6 +276,8 @@ func downloadPackageInstallPlan(ctx context.Context, cli *Context, scratch strin
 	}
 	for _, item := range jobs {
 		published.Artifacts[item.download.Digest] = item.dst
+		published.Files++
+		published.Bytes += item.download.Length
 	}
 	return published, nil
 }
