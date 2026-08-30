@@ -9,7 +9,6 @@ import (
 	"strings"
 	"sync"
 
-	pep440 "github.com/aquasecurity/go-pep440-version"
 	"github.com/cozy-creator/cozy/internal/canonical"
 	"github.com/cozy-creator/cozy/internal/exit"
 	"github.com/cozy-creator/cozy/internal/home"
@@ -29,28 +28,18 @@ func handleRegistryInstall(ctx *Context) *exit.Error {
 	hctx, cancel := hub.LongContext()
 	defer cancel()
 	packagePublishStatus(ctx, "Resolving %s...", ref.String())
-	if release == "" {
-		card, problem := c.PackageCard(hctx, ref)
-		if problem != nil {
-			return problem
-		}
-		if len(card.Releases) == 0 {
-			return exit.New(exit.NotFound, "%s has no published releases", ref.String()).
-				WithNext("cozy package search " + ref.String())
-		}
-		release, problem = latestPackageRelease(card.Releases)
-		if problem != nil {
-			return problem
-		}
-	}
 	target, problem := localPackageInstallTarget(ctx)
 	if problem != nil {
 		return problem
 	}
-	plan, problem := c.PackageInstallPlan(hctx, ref, release, target)
+	plan, problem := c.PackageDownloads(hctx, ref, release, target)
 	if problem != nil {
 		return problem
 	}
+	if plan.Release == "" || release != "" && plan.Release != release {
+		return exit.Internalf("Tensorhub returned a changed or absent package release")
+	}
+	release = plan.Release
 	releaseDigest, problem := selectedReleaseDigest(plan.PlacementSet, ref.String(), release)
 	if problem != nil {
 		return problem
@@ -149,29 +138,6 @@ func gpuCapability(gpu hostgpu.GPU) int {
 	return value
 }
 
-func latestPackageRelease(releases []hub.ReleaseSummary) (string, *exit.Error) {
-	var chosen pep440.Version
-	name := ""
-	for _, release := range releases {
-		if release.Yanked {
-			continue
-		}
-		version, err := pep440.Parse(release.Release)
-		if err != nil {
-			return "", exit.Named(exit.Structural, "package.release_version_invalid",
-				"Tensorhub returned package release %q, which is not a Python package version", release.Release)
-		}
-		if name == "" || version.GreaterThan(chosen) {
-			chosen, name = version, release.Release
-		}
-	}
-	if name == "" {
-		return "", exit.New(exit.NotFound, "the package has no installable releases").
-			WithRemedy("publish a new immutable release; yanked versions remain unavailable")
-	}
-	return name, nil
-}
-
 func registryPackageRef(value, release string) (hub.Ref, string, *exit.Error) {
 	name := strings.TrimSpace(value)
 	if strings.Contains(name, "@") {
@@ -187,7 +153,7 @@ func registryPackageRef(value, release string) (hub.Ref, string, *exit.Error) {
 }
 
 func downloadPackageInstallPlan(ctx context.Context, cli *Context, scratch string, ref hub.Ref,
-	release, releaseDigest string, plan hub.PackageInstallPlan,
+	release, releaseDigest string, plan hub.PackageDownloadPlan,
 ) (*install.PublishedSource, *exit.Error) {
 	if plan.Profile == "" || len(plan.Downloads) == 0 || len(plan.Downloads) > 20_033 {
 		return nil, exit.Internalf("Tensorhub returned an invalid package install plan")

@@ -45,7 +45,8 @@ type PackageInstallDownload struct {
 	URL    string `json:"url"`
 }
 
-type PackageInstallPlan struct {
+type PackageDownloadPlan struct {
+	Release            string                   `json:"release"`
 	Profile            string                   `json:"profile"`
 	PlacementSet       ExactDocument            `json:"placement_set"`
 	PackageDescriptor  ExactDocument            `json:"package_descriptor"`
@@ -69,19 +70,23 @@ func packageReleasePath(ref Ref, release string) string {
 	return resourcePath("packages", ref) + "/releases/" + url.PathEscape(release)
 }
 
+func packagePublishPath(ref Ref, release string) string {
+	return resourcePath("packages", ref) + "/publish/" + url.PathEscape(release)
+}
+
 func (c *Client) DeclarePackageRelease(ctx context.Context, ref Ref, release string,
 	paths, dependencyWheels []string, reason string) (PackageReleaseDraft, *exit.Error) {
 	var out PackageReleaseDraft
 	e := c.do(ctx, call{method: http.MethodPost,
-		path: packageReleasePath(ref, release), auth: true, reason: reason,
+		path: packagePublishPath(ref, release), auth: true, reason: reason,
 		body: map[string]any{"paths": paths, "dependency_wheels": dependencyWheels}, strict: true}, &out)
 	return out, e
 }
 
 func (c *Client) CommitPackageRelease(ctx context.Context, ref Ref, release, reason string) (PackageReleaseCommit, *exit.Error) {
 	var out PackageReleaseCommit
-	e := c.do(ctx, call{method: http.MethodPut,
-		path: packageReleasePath(ref, release), auth: true, reason: reason,
+	e := c.do(ctx, call{method: http.MethodPost,
+		path: packagePublishPath(ref, release) + "/finalize", auth: true, reason: reason,
 		body: map[string]any{}, patient: true, strict: true}, &out)
 	return out, e
 }
@@ -94,10 +99,10 @@ func (c *Client) YankPackageRelease(ctx context.Context, ref Ref, release, reaso
 	return out, e
 }
 
-func (c *Client) PackageInstallPlan(ctx context.Context, ref Ref, release string,
+func (c *Client) PackageDownloads(ctx context.Context, ref Ref, release string,
 	target PackageInstallTarget,
-) (PackageInstallPlan, *exit.Error) {
-	var out PackageInstallPlan
+) (PackageDownloadPlan, *exit.Error) {
+	var out PackageDownloadPlan
 	if target.OS == "" || target.Arch == "" ||
 		(target.Accelerator != "cpu" && target.Accelerator != "nvidia") ||
 		target.Accelerator == "cpu" && (target.DriverCUDA != "" || target.ComputeCapability != "") ||
@@ -108,8 +113,16 @@ func (c *Client) PackageInstallPlan(ctx context.Context, ref Ref, release string
 		Capability      PackageInstallTarget `json:"capability"`
 		ModelSelections []ModelSelection     `json:"model_selections"`
 	}{Capability: target, ModelSelections: []ModelSelection{}}
+	query := url.Values{}
+	if release != "" {
+		query.Set("release", release)
+	}
+	path := resourcePath("packages", ref) + "/download"
+	if len(query) != 0 {
+		path += "?" + query.Encode()
+	}
 	e := c.do(ctx, call{method: http.MethodPost,
-		path: packageReleasePath(ref, release) + "/selection", body: body, strict: true,
+		path: path, body: body, strict: true,
 		responseBytes: 16 << 20}, &out)
 	return out, e
 }

@@ -69,7 +69,6 @@ type Result struct {
 	// hub already held. Their sum is the artifact.
 	Moved          int64
 	Deduped        int64
-	Sources        []string
 	Manifest       hub.ManifestRef
 	TopologyDigest string
 	Dup            bool
@@ -83,8 +82,8 @@ func (p *Publish) say(format string, args ...any) {
 }
 
 // Run opens an incremental publication, claims the exact known-object transfers,
-// uploads only what is not already accepted, verifies every settled transfer, and
-// seals the TensorFS-authored documents. Tensorhub's transfer rows are the only
+// uploads only what is not already accepted, then asks Tensorhub to verify the
+// complete declared set and seal the TensorFS-authored documents. Tensorhub's rows are the only
 // restart journal.
 func (p *Publish) Run(ctx context.Context) (Result, *exit.Error) {
 	var res Result
@@ -161,7 +160,6 @@ func (p *Publish) Run(ctx context.Context) (Result, *exit.Error) {
 	}
 
 	toUpload := make([]hub.Transfer, 0, len(transfers))
-	toVerify := make([]hub.Transfer, 0, len(transfers))
 	for _, transfer := range transfers {
 		res.Totals.DeclaredObjects++
 		res.Totals.DeclaredBytes += transfer.Length
@@ -172,7 +170,6 @@ func (p *Publish) Run(ctx context.Context) (Result, *exit.Error) {
 		case "verifying":
 			res.Totals.HeldObjects++
 			res.Deduped += transfer.Length
-			toVerify = append(toVerify, transfer)
 		case "claimed", "transferring":
 			res.Totals.MissingObjects++
 			res.Totals.MissingBytes += transfer.Length
@@ -192,38 +189,13 @@ func (p *Publish) Run(ctx context.Context) (Result, *exit.Error) {
 		return res, nil
 	}
 
-	// 4. Resume transfers whose bytes reached storage before the earlier process died.
-	if len(toVerify) > 0 {
-		t0 = time.Now()
-		for len(toVerify) > 0 {
-			n := min(len(toVerify), 128)
-			settlements := make([]hub.SettleObject, 0, n)
-			for _, transfer := range toVerify[:n] {
-				settlements = append(settlements, hub.SettleObject{ObjectID: transfer.ObjectID})
-			}
-			settled, e := p.Hub.SettleObjects(ctx, p.Ref, res.PublishID, settlements, p.Reason)
-			if e != nil {
-				return res, e
-			}
-			if e := acceptedSettlements(settled, n); e != nil {
-				return res, e
-			}
-			res.Verified += len(settled)
-			for _, object := range settled {
-				res.Sources = appendUnique(res.Sources, object.ChecksumSource)
-			}
-			toVerify = toVerify[n:]
-		}
-		ms["resume_verify"] = since(t0)
-	}
-
-	// 5. Grants and writes. Nothing uploads without an exact transfer grant.
+	// 4. Grants and writes. Nothing uploads without an exact transfer grant.
 	if len(toUpload) > 0 {
 		if e := p.upload(ctx, toUpload, &res, ms); e != nil {
 			return res, e
 		}
 	} else {
-		p.say("0 bytes to upload: every transfer is already accepted or ready to verify")
+		p.say("0 bytes to upload: every transfer is ready for final verification")
 	}
 
 	return p.seal(ctx, seal, res, ms)
@@ -243,9 +215,11 @@ func (p *Publish) seal(ctx context.Context, request hub.SealPublicationRequest,
 		return res, exit.Internalf("Tensorhub committed a different publication identity")
 	}
 	res.Manifest, res.TopologyDigest, res.Dup = done.Manifest, done.TopologyDigest, done.Duplicate
+	res.Verified = done.Objects
 	if res.Dup {
 		p.say("this exact publication already sealed: Tensorhub replayed the same release")
 	}
+	p.say("Tensorhub verified %d declared uploads and committed the release", res.Verified)
 	p.say("timing: %s", Timing(ms))
 	return res, nil
 }
@@ -269,38 +243,14 @@ func exactTransfers(declared []hub.Object, transfers []hub.Transfer) *exit.Error
 	return nil
 }
 
-func acceptedSettlements(objects []hub.SettledObject, want int) *exit.Error {
-	if len(objects) != want {
-		return exit.Internalf("settlement of %d objects answered %d rows", want, len(objects))
-	}
-	for _, object := range objects {
-		if object.ObjectID == "" || object.State != "accepted" {
-			return exit.Internalf("settlement for %s returned state %q",
-				object.ObjectID, object.State)
-		}
-	}
-	return nil
-}
-
-func appendUnique(values []string, value string) []string {
-	if value == "" {
-		return values
-	}
-	for _, prior := range values {
-		if prior == value {
-			return values
-		}
-	}
-	return append(values, value)
-}
-
-// upload requests grants, writes each object at its final content key under every
-// condition the grant signed, and then asks the hub to prove them. An expired grant
-// comes back as a REPLAN and is answered by asking again — never by failing.
-// Two concurrent presigned writes keep a residential uplink and R2's connection
-// churn stable. Publication is resumable, so throughput comes from sustained writes,
-// not a burst large enough to reset every socket in the batch.
-const publishParallelism = 2
+// upload requests grants in the same bounded batches Tensorhub accepts and writes
+// each object at its final content key under every signed condition. Two concurrent
+// presigned writes keep a residential uplink and R2's connection churn stable;
+// finalization verifies the complete declared set in one act.
+const (
+	publicationObjectBatch = 128
+	publishParallelism     = 2
+)
 
 type uploadOutcome struct {
 	index    int
@@ -308,27 +258,67 @@ type uploadOutcome struct {
 	deduped  int64
 	uploaded bool
 	conflict bool
-	verified bool
-	source   string
 	primary  bool
 	err      *exit.Error
 }
 
 func (p *Publish) upload(ctx context.Context, transfers []hub.Transfer, res *Result, ms map[string]int64) *exit.Error {
-	parallelism := publishParallelism
-	ctx, cancel := context.WithCancel(ctx)
-	defer cancel()
 	started := time.Now()
+	for offset := 0; offset < len(transfers); offset += publicationObjectBatch {
+		end := min(offset+publicationObjectBatch, len(transfers))
+		if e := p.uploadBatch(ctx, transfers[offset:end], offset, res); e != nil {
+			return e
+		}
+	}
+	ms["grant_upload_verify"] = since(started)
+	p.say("requested %d transfer grants and uploaded %d objects: %s moved · %s deduped",
+		len(transfers), res.Uploaded, size(res.Moved), size(res.Deduped))
+	return nil
+}
+
+func (p *Publish) uploadBatch(ctx context.Context, transfers []hub.Transfer, indexBase int,
+	res *Result,
+) *exit.Error {
+	objectIDs := make([]string, 0, len(transfers))
+	byObject := make(map[string]int, len(transfers))
+	for index, transfer := range transfers {
+		objectIDs = append(objectIDs, transfer.ObjectID)
+		byObject[transfer.ObjectID] = index
+	}
+	answer, e := p.Hub.GrantKnownTransfers(ctx, p.Ref, res.PublishID, objectIDs, p.Reason)
+	if e != nil {
+		return e
+	}
+
+	ordered := make([]*uploadOutcome, len(transfers))
+	grants := make(map[int]hub.Grant, len(answer.Grants))
+	for _, held := range answer.Held {
+		index, ok := byObject[held.ObjectID]
+		if !ok || held.Length != transfers[index].Length || held.State != "accepted" {
+			return exit.Internalf("grant returned a changed held object %s", held.ObjectID)
+		}
+		ordered[index] = &uploadOutcome{index: indexBase + index, deduped: held.Length}
+	}
+	for _, grant := range answer.Grants {
+		index, ok := byObject[grant.ObjectID]
+		if !ok || grant.Length != transfers[index].Length || ordered[index] != nil {
+			return exit.Internalf("grant returned a missing, duplicate, or changed object %s", grant.ObjectID)
+		}
+		grants[index] = grant
+	}
+
+	uploadCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
 	jobs := make(chan int)
-	outcomes := make(chan uploadOutcome, parallelism)
+	outcomes := make(chan uploadOutcome, publishParallelism)
 	var workers sync.WaitGroup
 	var cancelOnce sync.Once
-	for range parallelism {
+	for range publishParallelism {
 		workers.Add(1)
 		go func() {
 			defer workers.Done()
 			for index := range jobs {
-				outcome := p.uploadOne(ctx, res.PublishID, index, transfers[index])
+				outcome := p.uploadOne(uploadCtx, indexBase+index, transfers[index], grants[index])
 				if outcome.err != nil {
 					cancelOnce.Do(func() {
 						outcome.primary = true
@@ -344,9 +334,12 @@ func (p *Publish) upload(ctx context.Context, transfers []hub.Transfer, res *Res
 	go func() {
 		defer close(outcomes)
 		for index := range transfers {
+			if _, ok := grants[index]; !ok {
+				continue
+			}
 			select {
 			case jobs <- index:
-			case <-ctx.Done():
+			case <-uploadCtx.Done():
 				close(jobs)
 				workers.Wait()
 				return
@@ -356,32 +349,25 @@ func (p *Publish) upload(ctx context.Context, transfers []hub.Transfer, res *Res
 		workers.Wait()
 	}()
 
-	ordered := make([]*uploadOutcome, len(transfers))
 	for outcome := range outcomes {
 		copy := outcome
-		ordered[outcome.index] = &copy
+		ordered[outcome.index-indexBase] = &copy
 	}
 	var primary *exit.Error
 	for _, outcome := range ordered {
-		if outcome == nil {
-			continue
-		}
-		if outcome.primary {
+		if outcome != nil && outcome.primary {
 			primary = outcome.err
 		}
 	}
-	if primary != nil {
-		return primary
-	}
-	for index, outcome := range ordered {
-		if outcome == nil {
-			return exit.Internalf("upload stopped before transfer %d/%d produced a verdict", index, len(transfers))
-		}
-	}
 
-	sources := map[string]bool{}
+	res.Grants += len(transfers)
 	for _, outcome := range ordered {
-		res.Grants++
+		if outcome == nil {
+			if primary != nil {
+				continue
+			}
+			return exit.Internalf("upload stopped before a transfer produced a verdict")
+		}
 		res.Moved += outcome.moved
 		res.Deduped += outcome.deduped
 		if outcome.uploaded {
@@ -390,49 +376,13 @@ func (p *Publish) upload(ctx context.Context, transfers []hub.Transfer, res *Res
 		if outcome.conflict {
 			res.Conflicts++
 		}
-		if outcome.verified {
-			res.Verified++
-		}
-		if outcome.source != "" {
-			sources[outcome.source] = true
-		}
 	}
-	for source := range sources {
-		res.Sources = appendUnique(res.Sources, source)
-	}
-	sort.Strings(res.Sources)
-	ms["grant_upload_verify"] = since(started)
-	p.say("requested %d transfer grants and uploaded %d objects: %s moved · %s deduped",
-		len(transfers), res.Uploaded, size(res.Moved), size(res.Deduped))
-	p.say("Tensorhub accepted %d transfer verifications (%s)",
-		res.Verified, strings.Join(res.Sources, ", "))
-	return nil
+	return primary
 }
 
-func (p *Publish) uploadOne(ctx context.Context, publicationID string, index int,
-	transfer hub.Transfer,
+func (p *Publish) uploadOne(ctx context.Context, index int, transfer hub.Transfer, grant hub.Grant,
 ) uploadOutcome {
 	outcome := uploadOutcome{index: index}
-	answer, e := p.Hub.GrantKnownTransfer(ctx, p.Ref, publicationID, transfer.ObjectID, p.Reason)
-	if e != nil {
-		outcome.err = e
-		return outcome
-	}
-	if len(answer.Held) == 1 {
-		held := answer.Held[0]
-		if held.ObjectID != transfer.ObjectID || held.Length != transfer.Length ||
-			held.State != "accepted" {
-			outcome.err = exit.Internalf("grant for %s returned a changed held object", transfer.ObjectID)
-			return outcome
-		}
-		outcome.deduped = transfer.Length
-		return outcome
-	}
-	grant := answer.Grants[0]
-	if grant.ObjectID != transfer.ObjectID || grant.Length != transfer.Length {
-		outcome.err = exit.Internalf("grant for %s returned another object", transfer.ObjectID)
-		return outcome
-	}
 	staged := filepath.Join(p.Scratch, fmt.Sprintf("object-%06d", index))
 	defer os.Remove(staged)
 
@@ -443,24 +393,6 @@ func (p *Publish) uploadOne(ctx context.Context, publicationID string, index int
 		return outcome
 	}
 	conflict, e := put(ctx, grant, staged)
-	if e != nil && e.Name == "grant.expired_replan" {
-		freshAnswer, e2 := p.Hub.GrantKnownTransfer(ctx, p.Ref, publicationID,
-			transfer.ObjectID, p.Reason)
-		if e2 != nil {
-			outcome.err = e2
-			return outcome
-		}
-		if len(freshAnswer.Held) == 1 {
-			outcome.deduped = transfer.Length
-			return outcome
-		}
-		grant = freshAnswer.Grants[0]
-		if grant.ObjectID != transfer.ObjectID || grant.Length != transfer.Length {
-			outcome.err = exit.Internalf("replacement grant for %s returned another object", transfer.ObjectID)
-			return outcome
-		}
-		conflict, e = put(ctx, grant, staged)
-	}
 	if e != nil {
 		outcome.err = e
 		return outcome
@@ -469,32 +401,9 @@ func (p *Publish) uploadOne(ctx context.Context, publicationID string, index int
 		outcome.moved = grant.Length
 	}
 	outcome.uploaded = true
-	settled, settleErr := p.Hub.SettleObjects(ctx, p.Ref, publicationID,
-		[]hub.SettleObject{{ObjectID: transfer.ObjectID, AlreadyPresent: conflict}}, p.Reason)
-	if settleErr != nil {
-		outcome.err = settleErr
-		return outcome
-	}
-	if len(settled) != 1 || settled[0].ObjectID != grant.ObjectID {
-		outcome.err = exit.Internalf(
-			"settlement for %s answered %d rows or another object",
-			grant.ObjectID,
-			len(settled),
-		)
-		return outcome
-	}
-	outcome.conflict = settled[0].Conflict
-	if outcome.conflict {
+	outcome.conflict = conflict
+	if conflict {
 		outcome.deduped = transfer.Length
-	}
-	outcome.verified = settled[0].State == "accepted"
-	outcome.source = settled[0].ChecksumSource
-	if !outcome.verified {
-		outcome.err = exit.Internalf(
-			"settlement for %s returned state %q",
-			grant.ObjectID,
-			settled[0].State,
-		)
 	}
 	return outcome
 }

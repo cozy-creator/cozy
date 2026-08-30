@@ -49,12 +49,12 @@ compatibility. A build that repeatedly emits no output is stopped as stalled.
 
 Publication is one small release transaction:
 
-1. Cozy opens the release with `POST /v1/packages/{org}/{name}/releases/{release}`.
+1. Cozy opens the release with `POST /v1/packages/{org}/{name}/publish/{release}`.
 2. It registers safe relative source paths and local dependency-wheel basenames with `POST` to that
    release's `/uploads` route, then receives
    release-scoped upload URLs for those files plus the project wheel.
 3. It uploads the exact files and separate wheels directly to object storage.
-4. It finalizes with `PUT /v1/packages/{org}/{name}/releases/{release}` and an empty JSON object.
+4. It finalizes with `POST /v1/packages/{org}/{name}/publish/{release}/finalize` and an empty JSON object.
 
 The open call happens before wheel construction. A committed replay therefore skips every build
 and upload. At most 16 outstanding file uploads run concurrently.

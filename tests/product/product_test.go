@@ -230,12 +230,13 @@ func TestLocalPackageIdentityBindsSourceBytesWithoutBuilding(t *testing.T) {
 func TestRunAutoInstallsAMissingLocalPackage(t *testing.T) {
 	root := t.TempDir()
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodGet || r.URL.Path != "/v1/packages/proof/missing" {
+		if r.Method != http.MethodPost || r.URL.Path != "/v1/packages/proof/missing/download" {
 			http.NotFound(w, r)
 			return
 		}
 		w.Header().Set("Content-Type", "application/json")
-		_, _ = io.WriteString(w, `{"package":{"org":"proof","name":"missing","created_at":"2026-08-30T00:00:00Z"},"releases":[]}`)
+		w.WriteHeader(http.StatusConflict)
+		_, _ = io.WriteString(w, `{"error":{"code":"package_download.no_compatible_release","message":"no non-yanked package release has a compatible active qualification","remedy":"publish a compatible release"}}`)
 	}))
 	defer server.Close()
 	t.Cleanup(func() { _, _ = runCozy(t, root, "down", "--all") })
@@ -243,7 +244,7 @@ func TestRunAutoInstallsAMissingLocalPackage(t *testing.T) {
 	code, out := runCozyDir(t, root, ".", []string{"TENSORHUB_URL=" + server.URL},
 		"run", "proof/missing/generate")
 	if code != 1 || !strings.Contains(out, "is not installed; installing it from Tensorhub") ||
-		!strings.Contains(out, "has no published releases") || strings.Contains(out, "is not installed on this host") {
+		!strings.Contains(out, "no non-yanked package release") || strings.Contains(out, "is not installed on this host") {
 		t.Fatalf("missing package did not enter automatic registry installation [exit %d]\n%s", code, out)
 	}
 }
@@ -310,11 +311,11 @@ func TestPackagePublishCommittedReplayStaysCompact(t *testing.T) {
 
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
-		switch r.Method {
-		case http.MethodPost:
-			_, _ = io.WriteString(w, `{"state":"committed","uploads":[]}`)
-		case http.MethodPut:
+		switch {
+		case r.Method == http.MethodPost && strings.HasSuffix(r.URL.Path, "/finalize"):
 			_, _ = io.WriteString(w, `{"state":"committed","qualification_state":"qualified","release_digest":"sha256:44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a"}`)
+		case r.Method == http.MethodPost:
+			_, _ = io.WriteString(w, `{"state":"committed","uploads":[]}`)
 		default:
 			http.Error(w, "unexpected method", http.StatusMethodNotAllowed)
 		}
