@@ -81,6 +81,10 @@ Publication order is blobs, manifest, repository compare-and-swap, then SQL proj
 before repository replacement leaves harmless unreachable content. A crash afterward leaves
 storage ahead of SQL; `store rebuild` catches SQL up. The database never leads the repository file.
 
+Each `repo list` release row carries the repository's exact canonical `evidence` object. Clients
+may preserve those bytes opaquely and base64-wrap them for a later `put_release`; TensorFS remains
+the only parser and canonical writer.
+
 `repo apply` derives full release projection rows from the exact manifest, header, and complete
 blob inventory before the caller may perform its repository CAS. Missing or length-mismatched bytes
 refuse publication.
