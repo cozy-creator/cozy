@@ -73,7 +73,7 @@ if [ -n "$ENDPOINT" ] && [ -f "$ENDPOINT" ]; then
   run package install cozy/weightless --from "$ENDPOINT" --digest "$DIGEST"
   check "package install verifies the release" "$([ "$CODE" = 0 ] && printf '%s' "$OUT" | grep -q 'cozy/weightless' && echo 1 || echo 0)" "$OUT"
 
-  run invoke run cozy/weightless/v1/tile size=32 seed=7 --out "$COZY_HOME/out"
+  run invoke run cozy/weightless/tile size=32 seed=7 --out "$COZY_HOME/out"
   check "one real package invocation completes" "$([ "$CODE" = 0 ] && [ -s "$COZY_HOME/out/image.png" ] && echo 1 || echo 0)" "$OUT"
 fi
 

@@ -374,6 +374,26 @@ func (s *Store) Installed() ([]PackageInstall, *exit.Error) {
 	return out, nil
 }
 
+// PackageInstalls returns every retained install of one package, including superseded
+// releases that remain available until garbage collection reclaims them.
+func (s *Store) PackageInstalls(pkg string) ([]PackageInstall, *exit.Error) {
+	rows, err := s.db.Query(`SELECT `+genCols("")+` FROM install_generations
+		WHERE package=? ORDER BY created_at DESC,id DESC`, pkg)
+	if err != nil {
+		return nil, exit.Internalf("cannot list installs for %s: %s", pkg, err)
+	}
+	defer rows.Close()
+	var out []PackageInstall
+	for rows.Next() {
+		g, err := scanGen(rows)
+		if err != nil {
+			return nil, exit.Internalf("cannot read an install record: %s", err)
+		}
+		out = append(out, g)
+	}
+	return out, nil
+}
+
 // Unreferenced is every generation no pin points at — gc's reclaim set.
 func (s *Store) Unreferenced() ([]PackageInstall, *exit.Error) {
 	rows, err := s.db.Query(`SELECT ` + genCols("g.") + `

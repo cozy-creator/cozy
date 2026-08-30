@@ -14,6 +14,7 @@ import (
 	"github.com/cozy-creator/cozy/internal/canonical"
 	"github.com/cozy-creator/cozy/internal/exit"
 	"github.com/cozy-creator/cozy/internal/home"
+	"github.com/cozy-creator/cozy/internal/launch"
 	"github.com/cozy-creator/cozy/internal/orchestrator"
 	"github.com/cozy-creator/cozy/internal/records"
 	pb "github.com/cozy-creator/cozy/protocol/cozy/worker/v1"
@@ -29,9 +30,10 @@ import (
 
 // JobSubmission is the job submit body.
 type JobSubmission struct {
-	Package  string          `json:"package"`
-	Function string          `json:"function"`
-	Input    json.RawMessage `json:"input"`
+	Package   string          `json:"package"`
+	Function  string          `json:"function"`
+	Input     json.RawMessage `json:"input"`
+	InstallID string          `json:"install_id,omitempty"`
 	// Org is the publishing org whose SCRATCH repo this job lands in
 	// (`<org>/_job-<request-id>`). It defaults to `local` — a local host has no identity
 	// plane yet (decisions #229) and inventing one would be a fake account.
@@ -164,7 +166,22 @@ func (s *Server) resolveJob(sub JobSubmission) (orchestrator.Submission, *exit.E
 	if s.packages == nil {
 		return out, exit.Unavailablef("this Cozy daemon resolves no packages")
 	}
-	jobs, e := s.packages.Jobs(sub.Package)
+	var jobs []launch.JobFacts
+	var e *exit.Error
+	if sub.InstallID != "" {
+		var spec orchestrator.WorkerLaunchSpec
+		spec, e = s.packages.ResolveInstall(sub.InstallID)
+		if e == nil && spec.Placement.Package != sub.Package {
+			e = exit.Named(exit.Conflict, "install_package_mismatch",
+				"install %s serves %s, not %s", sub.InstallID, spec.Placement.Package, sub.Package)
+		}
+		if e == nil {
+			jobs, e = s.packages.JobsInstall(sub.InstallID)
+			out.InstallID = sub.InstallID
+		}
+	} else {
+		jobs, e = s.packages.Jobs(sub.Package)
+	}
 	if e != nil {
 		return out, e
 	}
@@ -230,6 +247,7 @@ func jobSubmissionDigest(spec orchestrator.Submission) (string, *exit.Error) {
 		"package":          spec.Package,
 		"function":         spec.Entrypoint,
 		"plan_id":          spec.PlanID,
+		"install_id":       spec.InstallID,
 		"org":              spec.Org,
 		"input":            base64.StdEncoding.EncodeToString(spec.Payload),
 		"outputs":          strings.Join(spec.Outputs, ","),

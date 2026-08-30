@@ -12,7 +12,7 @@ structured error document, but deliberately projects shell exits onto three outc
 |---|---|---|
 | 0 | ok | success, including idempotent no-ops |
 | 1 | internal | unexpected fault — a bug, never a user condition |
-| 2 | usage | bad invocation: unknown flag, malformed `key=value`, majorless target |
+| 2 | usage | bad invocation: unknown flag, malformed `key=value`, malformed target |
 | 3 | validation | typed payload/schema/bounds refusal; verifier refusal at ingest |
 | 4 | not_found | unknown ref/function/package/attempt; hub 404 rendered verbatim |
 | 5 | credential | private/gated source without a credential — names the credential to add |

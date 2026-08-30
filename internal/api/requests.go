@@ -32,8 +32,11 @@ type Submission struct {
 	Package  string          `json:"package"`
 	Function string          `json:"function"`
 	Input    json.RawMessage `json:"input"`
-	Outputs  []string        `json:"outputs,omitempty"`
-	PlanID   string          `json:"plan_id,omitempty"`
+	// InstallID is the immutable local install selected by the CLI. It is opaque to users;
+	// omitting it asks the daemon to resolve the active package pointer.
+	InstallID string   `json:"install_id,omitempty"`
+	Outputs   []string `json:"outputs,omitempty"`
+	PlanID    string   `json:"plan_id,omitempty"`
 	// LocalAssets is the local API's out-of-band input set. Each source path is ingested into
 	// the daemon-owned immutable input store before the request row exists; it never
 	// crosses the worker protocol. The typed payload carries only its opaque reference.
@@ -193,6 +196,7 @@ func replaySubmission(sub Submission, recorded records.Request) orchestrator.Sub
 	return orchestrator.Submission{
 		Package: sub.Package, Entrypoint: sub.Function, Payload: payload,
 		Outputs: outputs, PlanID: planID, Worker: sub.Worker, Assets: assets,
+		InstallID: sub.InstallID,
 	}
 }
 
@@ -201,12 +205,13 @@ func replaySubmission(sub Submission, recorded records.Request) orchestrator.Sub
 // authority recorded.
 func submissionDigest(spec orchestrator.Submission) (string, *exit.Error) {
 	doc := map[string]canonical.Value{
-		"kind":     "serve",
-		"package":  spec.Package,
-		"function": spec.Entrypoint,
-		"plan_id":  spec.PlanID,
-		"input":    base64.StdEncoding.EncodeToString(spec.Payload),
-		"outputs":  strings.Join(spec.Outputs, ","),
+		"kind":       "serve",
+		"package":    spec.Package,
+		"function":   spec.Entrypoint,
+		"plan_id":    spec.PlanID,
+		"install_id": spec.InstallID,
+		"input":      base64.StdEncoding.EncodeToString(spec.Payload),
+		"outputs":    strings.Join(spec.Outputs, ","),
 	}
 	assets := make([]canonical.Value, 0, len(spec.Assets))
 	for _, asset := range spec.Assets {
@@ -335,9 +340,19 @@ func (s *Server) resolvePlan(sub Submission) (orchestrator.Submission, *exit.Err
 			return out, exit.Unavailablef("this Cozy daemon resolves no packages")
 		}
 		var e *exit.Error
-		placement, e = s.packages.ResolvePlacement(sub.Package)
+		if sub.InstallID != "" {
+			var spec orchestrator.WorkerLaunchSpec
+			spec, e = s.packages.ResolveInstall(sub.InstallID)
+			placement = spec.Placement
+		} else {
+			placement, e = s.packages.ResolvePlacement(sub.Package)
+		}
 		if e != nil {
 			return out, e
+		}
+		if placement.Package != sub.Package {
+			return out, exit.Named(exit.Conflict, "install_package_mismatch",
+				"install %s serves %s, not %s", sub.InstallID, placement.Package, sub.Package)
 		}
 		planID, outputs, e := placementPlan(placement, sub.Function)
 		if e != nil {

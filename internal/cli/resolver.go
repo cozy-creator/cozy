@@ -156,6 +156,17 @@ func (r *Resolver) ResolveJob(pkg, function string) (orchestrator.WorkerLaunchSp
 	return spec, e
 }
 
+// ResolveJobInstall starts a job from the exact immutable install selected before the
+// request entered the queue.
+func (r *Resolver) ResolveJobInstall(installID, function string) (orchestrator.WorkerLaunchSpec, *exit.Error) {
+	facts, e := r.installFacts(installID)
+	if e != nil {
+		return orchestrator.WorkerLaunchSpec{}, e
+	}
+	spec, _, e := facts.JobSpec(function, r.Devices)
+	return spec, e
+}
+
 // Jobs names the `@job` functions one installed package registers, with the descriptor
 // id each resolves to. `cozy invoke list` and the API's job listing read it.
 func (r *Resolver) Jobs(pkg string) ([]launch.JobFacts, *exit.Error) {
@@ -167,6 +178,19 @@ func (r *Resolver) Jobs(pkg string) ([]launch.JobFacts, *exit.Error) {
 	if e != nil {
 		return nil, e
 	}
+	return jobsOf(facts)
+}
+
+// JobsInstall lists jobs from one exact immutable install.
+func (r *Resolver) JobsInstall(installID string) ([]launch.JobFacts, *exit.Error) {
+	facts, e := r.installFacts(installID)
+	if e != nil {
+		return nil, e
+	}
+	return jobsOf(facts)
+}
+
+func jobsOf(facts *launch.Facts) ([]launch.JobFacts, *exit.Error) {
 	out := []launch.JobFacts{}
 	for _, job := range facts.PackageDescriptor.Jobs {
 		one, e := facts.Job(job.Name)
@@ -178,9 +202,8 @@ func (r *Resolver) Jobs(pkg string) ([]launch.JobFacts, *exit.Error) {
 	return out, nil
 }
 
-// generation resolves the ACTIVE pin for an package. A ref may name its major
-// (`org/name@v2`); without one, a single pinned major answers and several refuse rather
-// than picking.
+// generation resolves an active package pin. Internal callers may name a major as
+// `org/name@v2`; otherwise the newest installed major wins.
 func (r *Resolver) generation(ref string) (*records.PackageInstall, *exit.Error) {
 	pkg, major, hasMajor := splitMajor(ref)
 	if r.store == nil {
@@ -195,7 +218,7 @@ func (r *Resolver) generation(ref string) (*records.PackageInstall, *exit.Error)
 			WithRemedy("`cozy package list` shows installed packages").
 			WithNext("cozy package search " + pkg)
 	}
-	chosen := pins[0]
+	chosen := pins[len(pins)-1]
 	if hasMajor {
 		found := false
 		for _, p := range pins {
@@ -208,10 +231,6 @@ func (r *Resolver) generation(ref string) (*records.PackageInstall, *exit.Error)
 				WithRemedy("installed majors: %s", majorsOf(pins)).
 				WithNext("cozy package list")
 		}
-	} else if len(pins) > 1 {
-		return nil, exit.Usagef("%s is installed at several majors and a ref must name one", pkg).
-			WithRemedy("majors: %s — a major is a required path segment, never a default", majorsOf(pins)).
-			WithNext("cozy package list")
 	}
 	gen, e := r.store.Install(chosen.InstallID)
 	if e != nil {

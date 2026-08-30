@@ -50,6 +50,11 @@ Idempotency-Key: <caller's key>
 entrypoint's declared set — binding by field path is what makes a two-output result
 unswappable.
 
+`install_id` is Cozy's local, opaque exact-install selector. The CLI sends it after
+resolving the newest installed release or an explicit `--version`; the daemon verifies
+that the install belongs to `package` and records it with the request. Other clients may
+omit it and use the active package pointer.
+
 The `model`, `lane`, and `adapter` fields are reserved but not resolved by Cozy yet.
 Any non-empty value refuses as `501 override_unresolved`; it is never silently ignored.
 

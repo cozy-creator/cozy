@@ -17,6 +17,7 @@ import (
 	"syscall"
 	"time"
 
+	pep440 "github.com/aquasecurity/go-pep440-version"
 	"github.com/cozy-creator/cozy/internal/api"
 	localapi "github.com/cozy-creator/cozy/internal/client"
 	"github.com/cozy-creator/cozy/internal/exit"
@@ -52,18 +53,25 @@ func dial(ctx *Context) (*localapi.Client, *exit.Error) {
 // ----------------------------------------------------------------------------- run
 
 func handleInvokeRun(ctx *Context) *exit.Error {
-	job, problem := invocationIsJob(ctx)
+	target, descriptor, problem := invocationTarget(ctx)
 	if problem != nil {
 		return problem
 	}
-	if !job {
+	if target.Function == "" {
+		return emitFunctions(ctx, target, descriptor)
+	}
+	callable, problem := descriptor.Function(target.Function)
+	if problem != nil {
+		return unknownFunction(target, descriptor)
+	}
+	if callable.Kind != "job" {
 		if len(ctx.Inv.Values["--input"]) > 0 {
 			return exit.Usagef("--input-tree applies only to a job callable")
 		}
 		if ctx.Inv.Value("--org") != "" {
 			return exit.Usagef("--org applies only to a job callable")
 		}
-		return handleRun(ctx)
+		return handleRun(ctx, target, callable)
 	}
 	if ctx.Inv.Value("--worker") != "" {
 		return exit.Named(exit.Usage, "rental_job_unsupported",
@@ -78,52 +86,10 @@ func handleInvokeRun(ctx *Context) *exit.Error {
 	if !ctx.Inv.Bool("--detach") {
 		ctx.Inv.Bools["--follow"] = true
 	}
-	return handleJobSubmit(ctx)
+	return handleJobSubmit(ctx, target, callable)
 }
 
-func invocationIsJob(ctx *Context) (bool, *exit.Error) {
-	target, problem := parseTarget(ctx.Inv.Args[0])
-	if problem != nil {
-		return false, problem
-	}
-	var descriptor *launch.PackageDescriptor
-	if worker := strings.TrimSpace(ctx.Inv.Value("--worker")); worker != "" {
-		layout, problem := home.Open(ctx.Cfg.Home)
-		if problem != nil {
-			return false, problem
-		}
-		store, problem := records.Open(layout.DB)
-		if problem != nil {
-			return false, problem
-		}
-		defer store.Close()
-		descriptor, problem = rental.PackageDescriptor(store, worker)
-		if problem != nil {
-			return false, problem
-		}
-	} else {
-		facts, problem := generationFacts(ctx, target.Package, target.Major)
-		if problem != nil {
-			return false, problem
-		}
-		descriptor = facts.PackageDescriptor
-	}
-	for _, job := range descriptor.Jobs {
-		if job.Name == target.Function {
-			return true, nil
-		}
-	}
-	if _, problem := descriptor.Function(target.Function); problem != nil {
-		return false, problem
-	}
-	return false, nil
-}
-
-func handleRun(ctx *Context) *exit.Error {
-	target, e := parseTarget(ctx.Inv.Args[0])
-	if e != nil {
-		return e
-	}
+func handleRun(ctx *Context, target Target, ep *launch.Entrypoint) *exit.Error {
 	deadline, e := runDeadline(ctx)
 	if e != nil {
 		return e
@@ -133,15 +99,6 @@ func handleRun(ctx *Context) *exit.Error {
 	// runtime vouched for at install — so a typo costs a millisecond instead of a model
 	// load, and `steps=2` is an int because the schema says int.
 	worker := strings.TrimSpace(ctx.Inv.Value("--worker"))
-	var ep *launch.Entrypoint
-	if worker != "" {
-		ep, e = remoteEntrypointOf(ctx, worker, target.Function)
-	} else {
-		ep, e = entrypointOf(ctx, target)
-	}
-	if e != nil {
-		return e
-	}
 	if legacy := launch.LegacyFileTerm(ctx.Inv.Args[1:]); worker != "" && legacy != "" {
 		return exit.Named(exit.Usage, "remote_file_input_ambiguous",
 			"%s embeds file bytes into a JSON string and cannot name a remote input grant", legacy).
@@ -167,7 +124,7 @@ func handleRun(ctx *Context) *exit.Error {
 	began := time.Now()
 	handle, e := c.Submit(api.Submission{
 		Package: target.Package, Function: target.Function, Input: input,
-		Worker: worker, LocalAssets: assets,
+		Worker: worker, LocalAssets: assets, InstallID: target.InstallID,
 	}, key)
 	if e != nil {
 		return e
@@ -795,82 +752,107 @@ func mintKey() string {
 
 // ------------------------------------------------------------------- target parsing
 
-// Target is one invocation subject: `org/package/vN/function`.
+// Target is one installed package and optional callable selected for invocation.
 type Target struct {
-	Package  string
-	Major    int
-	Function string
-	Ref      string // the package ref as the resolver takes it: `org/package@vN`
+	Package   string
+	Function  string
+	Version   string
+	InstallID string
 }
 
-// parseTarget reads `org/package/vN/function`. The semver-major is a REQUIRED path
-// segment: it is resolved through that (package, major)'s serving pointer,
-// which locally is the install pin, and a majorless target is a usage refusal rather
-// than a default.
+// parseTarget reads the user-facing package grammar. Versions are flags, not path
+// segments: the common spelling stays stable while installed releases change.
 func parseTarget(raw string) (Target, *exit.Error) {
 	parts := strings.Split(strings.TrimSpace(raw), "/")
-	usage := exit.Usagef("%q is not org/package/vN/function", raw).
-		WithRemedy("the semver-major is a required path segment — it resolves through that package's serving pointer").
+	usage := exit.Usagef("%q is not org/package[/function]", raw).
+		WithRemedy("use org/package/function; omit /function to list the package's callables").
 		WithNext("cozy package list", "cozy help invoke run")
-	if len(parts) != 4 {
+	if len(parts) == 4 && strings.HasPrefix(parts[2], "v") {
+		return Target{}, exit.Usagef("a version does not belong in the invocation path").
+			WithRemedy("use %s/%s/%s --version %s", parts[0], parts[1], parts[3],
+				strings.TrimPrefix(parts[2], "v")).
+			WithNext("cozy help invoke run")
+	}
+	if len(parts) != 2 && len(parts) != 3 {
 		return Target{}, usage
 	}
-	major, ok := majorOf(parts[2])
-	if !ok || parts[0] == "" || parts[1] == "" || parts[3] == "" {
+	if parts[0] == "" || parts[1] == "" || (len(parts) == 3 && parts[2] == "") {
 		return Target{}, usage
 	}
-	pkg := parts[0] + "/" + parts[1]
-	return Target{
-		Package: pkg, Major: major, Function: parts[3],
-		Ref: pkg + "@" + parts[2],
-	}, nil
+	target := Target{Package: parts[0] + "/" + parts[1]}
+	if len(parts) == 3 {
+		target.Function = parts[2]
+	}
+	return target, nil
 }
 
-func majorOf(segment string) (int, bool) {
-	digits, ok := strings.CutPrefix(segment, "v")
-	if !ok || digits == "" {
-		return 0, false
+func invocationTarget(ctx *Context) (Target, *launch.PackageDescriptor, *exit.Error) {
+	target, problem := parseTarget(ctx.Inv.Args[0])
+	if problem != nil {
+		return Target{}, nil, problem
 	}
-	n := 0
-	for _, c := range digits {
-		if c < '0' || c > '9' {
-			return 0, false
+	version := strings.TrimSpace(ctx.Inv.Value("--version"))
+	worker := strings.TrimSpace(ctx.Inv.Value("--worker"))
+	if worker != "" {
+		if version != "" {
+			return Target{}, nil, exit.Usagef("--version cannot change a private rental's fixed package release").
+				WithRemedy("omit --version; the rental already binds one exact release")
 		}
-		n = n*10 + int(c-'0')
+		layout, problem := home.Open(ctx.Cfg.Home)
+		if problem != nil {
+			return Target{}, nil, problem
+		}
+		store, problem := records.Open(layout.DB)
+		if problem != nil {
+			return Target{}, nil, problem
+		}
+		defer store.Close()
+		descriptor, problem := rental.PackageDescriptor(store, worker)
+		return target, descriptor, problem
 	}
-	return n, true
+	version = strings.TrimPrefix(version, "v")
+	if version != "" {
+		if _, err := pep440.Parse(version); err != nil {
+			return Target{}, nil, exit.Usagef("--version %q is not a Python package version", version).
+				WithRemedy("use the release from `cozy package list --full`, e.g. --version 1.0.2")
+		}
+	}
+	facts, problem := generationFacts(ctx, target.Package, version)
+	if problem != nil {
+		return Target{}, nil, problem
+	}
+	target.Version = facts.Install.Version
+	target.InstallID = facts.Install.ID
+	return target, facts.PackageDescriptor, nil
 }
 
-// entrypointOf reads one function's declared surface out of the install records. It is a
-// LOCAL read of a fact the release's own runtime already proved, which is why it costs no
-// subprocess and no round trip.
-func entrypointOf(ctx *Context, t Target) (*launch.Entrypoint, *exit.Error) {
-	facts, e := generationFacts(ctx, t.Package, t.Major)
-	if e != nil {
-		return nil, e
+func emitFunctions(ctx *Context, target Target, descriptor *launch.PackageDescriptor) *exit.Error {
+	list := output.List{Name: "functions", Fields: []string{"function"}, AllFields: []string{"function"}}
+	for _, name := range descriptor.Names() {
+		list.Rows = append(list.Rows, map[string]string{"function": name})
+		if len(list.Next) < 2 {
+			list.Next = append(list.Next, "cozy invoke run "+target.Package+"/"+name)
+		}
 	}
-	return facts.PackageDescriptor.Function(t.Function)
+	return emit(ctx, list)
 }
 
-func remoteEntrypointOf(ctx *Context, worker, function string) (*launch.Entrypoint, *exit.Error) {
-	l, e := home.Open(ctx.Cfg.Home)
-	if e != nil {
-		return nil, e
+func unknownFunction(target Target, descriptor *launch.PackageDescriptor) *exit.Error {
+	names := descriptor.Names()
+	problem := exit.New(exit.NotFound, "%s registers no function %q", target.Package, target.Function)
+	if len(names) == 0 {
+		return problem.WithRemedy("this release registers no callable functions")
 	}
-	store, e := records.Open(l.DB)
-	if e != nil {
-		return nil, e
+	problem.WithRemedy("available functions: %s", strings.Join(names, ", "))
+	for _, name := range names {
+		problem.WithNext("cozy invoke run " + target.Package + "/" + name)
 	}
-	defer store.Close()
-	descriptor, e := rental.PackageDescriptor(store, worker)
-	if e != nil {
-		return nil, e
-	}
-	return descriptor.Function(function)
+	return problem
 }
 
-// generationFacts resolves a package ref to its pinned generation's facts.
-func generationFacts(ctx *Context, pkg string, major int) (*launch.Facts, *exit.Error) {
+// generationFacts selects the newest active release by default. An explicit version may
+// select a retained superseded release in any still-installed major.
+func generationFacts(ctx *Context, pkg, version string) (*launch.Facts, *exit.Error) {
 	l, e := home.Open(ctx.Cfg.Home)
 	if e != nil {
 		return nil, e
@@ -889,26 +871,72 @@ func generationFacts(ctx *Context, pkg string, major int) (*launch.Facts, *exit.
 			WithRemedy("`cozy package list` lists what is").
 			WithNext("cozy package search "+pkg, "cozy package list")
 	}
-	chosen, found := pins[0], major == 0
-	for _, p := range pins {
-		if p.Major == major {
-			chosen, found = p, true
-		}
-	}
-	if !found {
-		return nil, exit.New(exit.NotFound, "%s is installed, but not at v%d", pkg, major).
-			WithRemedy("installed majors: %s", majorsOf(pins)).
-			WithNext("cozy package list")
-	}
-	gen, e := store.Install(chosen.InstallID)
+	installs, e := store.PackageInstalls(pkg)
 	if e != nil {
 		return nil, e
 	}
-	if gen == nil {
-		return nil, exit.Internalf("%s is pinned to generation %s and that row is gone",
-			pkg, chosen.InstallID)
+	active := make(map[string]bool, len(pins))
+	activeMajors := make(map[int]bool, len(pins))
+	for _, pin := range pins {
+		active[pin.InstallID] = true
+		activeMajors[pin.Major] = true
 	}
-	return launch.Read(*gen, ctx.Cfg.Home, ctx.Cfg.Tool())
+	var chosen *records.PackageInstall
+	for i := range installs {
+		candidate := &installs[i]
+		if version != "" {
+			if activeMajors[candidate.Major] && sameVersion(candidate.Version, version) {
+				chosen = candidate
+				break
+			}
+			continue
+		}
+		if active[candidate.ID] && (chosen == nil || newerInstall(*candidate, *chosen)) {
+			chosen = candidate
+		}
+	}
+	if chosen == nil && version != "" {
+		return nil, exit.New(exit.NotFound, "%s version %s is not installed", pkg, version).
+			WithRemedy("installed versions: %s", installedVersions(installs, activeMajors)).
+			WithNext("cozy package install "+pkg+"@"+version, "cozy package list")
+	}
+	if chosen == nil {
+		return nil, exit.Internalf("%s has pins but no corresponding install", pkg)
+	}
+	return launch.Read(*chosen, ctx.Cfg.Home, ctx.Cfg.Tool())
+}
+
+func sameVersion(left, right string) bool {
+	a, errA := pep440.Parse(left)
+	b, errB := pep440.Parse(right)
+	return errA == nil && errB == nil && a.Equal(b)
+}
+
+func newerInstall(left, right records.PackageInstall) bool {
+	a, errA := pep440.Parse(left.Version)
+	b, errB := pep440.Parse(right.Version)
+	if errA == nil && errB == nil && !a.Equal(b) {
+		return a.GreaterThan(b)
+	}
+	if left.Major != right.Major {
+		return left.Major > right.Major
+	}
+	return left.CreatedAt > right.CreatedAt
+}
+
+func installedVersions(installs []records.PackageInstall, activeMajors map[int]bool) string {
+	seen := map[string]bool{}
+	versions := []string{}
+	for _, install := range installs {
+		if activeMajors[install.Major] && !seen[install.Version] {
+			seen[install.Version] = true
+			versions = append(versions, install.Version)
+		}
+	}
+	if len(versions) == 0 {
+		return "none"
+	}
+	return strings.Join(versions, ", ")
 }
 
 // eventText reads one string field out of an event's payload. It is how a pre-attempt

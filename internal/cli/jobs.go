@@ -34,15 +34,7 @@ import (
 
 // ---------------------------------------------------------------------- job submit
 
-func handleJobSubmit(ctx *Context) *exit.Error {
-	target, e := parseTarget(ctx.Inv.Args[0])
-	if e != nil {
-		return e
-	}
-	job, e := jobFactsOf(ctx, target)
-	if e != nil {
-		return e
-	}
+func handleJobSubmit(ctx *Context, target Target, job *launch.Entrypoint) *exit.Error {
 	// THE PAYLOAD IS TYPED AGAINST THE RECORDED SCHEMA before a job exists — the same
 	// client-side check `cozy invoke run` makes, over the job's own declared request struct.
 	input, e := launch.ParsePayload(&launch.Entrypoint{
@@ -67,7 +59,7 @@ func handleJobSubmit(ctx *Context) *exit.Error {
 	began := time.Now()
 	handle, e := c.SubmitJob(api.JobSubmission{
 		Package: target.Package, Function: target.Function, Input: input,
-		Org: ctx.Inv.Value("--org"), Trees: trees,
+		Org: ctx.Inv.Value("--org"), Trees: trees, InstallID: target.InstallID,
 	}, key)
 	if e != nil {
 		return e
@@ -110,48 +102,6 @@ func parseTrees(values []string) ([]string, *exit.Error) {
 		out = append(out, v)
 	}
 	return out, nil
-}
-
-// jobFactsOf reads one job's declared surface out of the install records — the same
-// LOCAL read `cozy invoke run` makes of an entrypoint's, and for the same reason.
-func jobFactsOf(ctx *Context, t Target) (*jobSurface, *exit.Error) {
-	facts, e := generationFacts(ctx, t.Package, t.Major)
-	if e != nil {
-		return nil, e
-	}
-	for i := range facts.PackageDescriptor.Jobs {
-		job := &facts.PackageDescriptor.Jobs[i]
-		if job.Name != t.Function {
-			continue
-		}
-		return &jobSurface{Name: job.Name, Request: job.Request, Result: job.Result}, nil
-	}
-	names := []string{}
-	for _, job := range facts.PackageDescriptor.Jobs {
-		names = append(names, job.Name)
-	}
-	known := strings.Join(names, ", ")
-	if known == "" {
-		known = "no jobs"
-	}
-	// A NAME THAT IS AN ENTRYPOINT is worth saying out loud: it is the commonest way to
-	// reach here, and "no such job" would send a reader looking for a typo.
-	if _, e := facts.PackageDescriptor.Function(t.Function); e == nil {
-		return nil, exit.Named(exit.Usage, "not_a_job",
-			"%s registers %q as an ENTRYPOINT, not a @job", t.Package, t.Function).
-			WithRemedy("an entrypoint is invoked with `cozy invoke run`; a job is run to completion").
-			WithNext("cozy invoke run " + ctx.Inv.Args[0])
-	}
-	return nil, exit.Named(exit.NotFound, "unknown_job",
-		"%s registers no job named %q", t.Package, t.Function).
-		WithRemedy("it registers: %s", known).
-		WithNext("cozy package list --full")
-}
-
-type jobSurface struct {
-	Name    string
-	Request launch.Struct
-	Result  launch.Struct
 }
 
 // ---------------------------------------------------------------------- job status

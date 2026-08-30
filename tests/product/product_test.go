@@ -606,9 +606,7 @@ const maxDaemonDiagnosticOutput = 18 << 10
 // release, auto-start the daemon on invoke, cross Runtime and the worker wire,
 // accept an output, release idle residency, then stop cleanly.
 func TestProductPath(t *testing.T) {
-	root := filepath.Join(os.TempDir(), "cozy-product-test", "product")
-	must(t, os.RemoveAll(root))
-	must(t, os.MkdirAll(root, 0o755))
+	root := t.TempDir()
 	t.Cleanup(func() { _, _ = runCozy(t, root, "down", "--all") })
 
 	archive := weightlessRelease(t)
@@ -624,9 +622,17 @@ func TestProductPath(t *testing.T) {
 		!strings.Contains(out, weightlessRef) {
 		t.Fatalf("package list omitted the install [exit %d]\n%s", code, out)
 	}
+	if code, out := runCozy(t, root, "invoke", "run", weightlessRef); code != 0 ||
+		!strings.Contains(out, "- tile") || !strings.Contains(out, "- refuse") {
+		t.Fatalf("package-only invoke did not list functions [exit %d]\n%s", code, out)
+	}
+	if code, out := runCozy(t, root, "invoke", "run", weightlessRef+"/v1.0.0/tile"); code != 2 ||
+		!strings.Contains(out, "--version 1.0.0") {
+		t.Fatalf("version-in-path remedy was not useful [exit %d]\n%s", code, out)
+	}
 
 	outDir := filepath.Join(root, "out")
-	code, out = runCozy(t, root, "invoke", "run", weightlessRef+"/v1/tile",
+	code, out = runCozy(t, root, "invoke", "run", weightlessRef+"/tile",
 		"size=32", "seed=7", "--out", outDir)
 	if code != 0 {
 		t.Fatalf("invoke run [exit %d]\n%s", code, out)
@@ -639,8 +645,8 @@ func TestProductPath(t *testing.T) {
 	// A second invocation reuses the same warm serving worker rather than spawning
 	// another process onto the device envelope.
 	secondOut := filepath.Join(root, "out-2")
-	if code, out := runCozy(t, root, "invoke", "run", weightlessRef+"/v1/tile",
-		"size=16", "seed=8", "--out", secondOut); code != 0 {
+	if code, out := runCozy(t, root, "invoke", "run", weightlessRef+"/tile",
+		"size=16", "seed=8", "--version", "1.0.0", "--out", secondOut); code != 0 {
 		t.Fatalf("warm invoke [exit %d]\n%s", code, out)
 	}
 	store, problem := records.Open(filepath.Join(root, "records.db"))
@@ -668,8 +674,8 @@ func TestProductPath(t *testing.T) {
 	if err != nil || !ok || len(invocations) != 2 {
 		t.Fatalf("invoke list is not one successful JSON document: %v\n%s", err, listed)
 	}
-	if code, out := runCozy(t, root, "invoke", "run", weightlessRef+"/v1/nosuch"); code != 1 ||
-		!strings.Contains(out, "registers no function") {
+	if code, out := runCozy(t, root, "invoke", "run", weightlessRef+"/nosuch"); code != 1 ||
+		!strings.Contains(out, "registers no function") || !strings.Contains(out, "available functions") {
 		t.Fatalf("operational refusal was not shell exit 1 with detail [exit %d]\n%s", code, out)
 	}
 
