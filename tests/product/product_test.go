@@ -97,6 +97,9 @@ organization = "proof"
 	code, out := runCozyDir(t, t.TempDir(), project,
 		[]string{"TENSORHUB_URL=" + server.URL, "TENSORHUB_TOKEN=proof-token"}, "package", "publish")
 	if code != 0 || !strings.Contains(out, "status:  already published") ||
+		!strings.Contains(out, "Checking proof/replay-package@1.0.0...") ||
+		!strings.Contains(out, "Release already published; refreshing status...") ||
+		!strings.Contains(out, "Finalizing release and evaluating worker profiles...") ||
 		strings.Contains(out, "qualification:") || strings.Contains(out, "changed:") {
 		t.Fatalf("committed replay built the project or emitted verbose state [exit %d]\n%s", code, out)
 	}
