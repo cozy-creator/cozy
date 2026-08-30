@@ -92,6 +92,21 @@ func TestPackageInstallPlanContract(t *testing.T) {
 		case "/v1/packages/proof/package":
 			_, _ = io.WriteString(w, `{"package":{"org":"proof","name":"package","created_at":"2026-08-30T00:00:00Z"},"releases":[{"release":"1.2.3","cut_at":"2026-08-30T00:00:00Z"}]}`)
 		case "/v1/packages/proof/package/releases/1.2.3/install":
+			got := r.URL.Query()
+			switch got.Get("accelerator") {
+			case "cpu":
+				if got.Get("os") != "linux" || got.Get("arch") != "x86_64" ||
+					got.Has("driver_cuda") || got.Has("compute_capability") {
+					t.Errorf("CPU package install target changed: %s", r.URL.RawQuery)
+				}
+			case "nvidia":
+				if got.Get("os") != "linux" || got.Get("arch") != "x86_64" ||
+					got.Get("driver_cuda") != "13.2" || got.Get("compute_capability") != "8.9" {
+					t.Errorf("NVIDIA package install target changed: %s", r.URL.RawQuery)
+				}
+			default:
+				t.Errorf("package install target omitted accelerator: %s", r.URL.RawQuery)
+			}
 			_, _ = io.WriteString(w, `{"profile":"cpu-test","placement_set":{"canonical_bytes":"e30=","digest":"sha256:`+strings.Repeat("2", 64)+`","length":2},"package_release":{"canonical_bytes":"e30=","digest":"sha256:`+strings.Repeat("3", 64)+`","length":2},"package_descriptor":{"canonical_bytes":"e30=","digest":"sha256:`+strings.Repeat("4", 64)+`","length":2},"qualification":{"canonical_bytes":"e30=","digest":"sha256:`+strings.Repeat("5", 64)+`","length":2},"downloads":[{"digest":"sha256:`+strings.Repeat("1", 64)+`","kind":"project_wheel","length":4,"path":"proof.whl","url":"https://storage.invalid/proof.whl"}]}`)
 		default:
 			http.NotFound(w, r)
@@ -104,10 +119,19 @@ func TestPackageInstallPlanContract(t *testing.T) {
 	if problem != nil || len(card.Releases) != 1 || card.Releases[0].Release != "1.2.3" {
 		t.Fatalf("package card changed: %+v problem=%v", card, problem)
 	}
-	plan, problem := client.PackageInstallPlan(context.Background(), ref, "1.2.3", "cpu-test")
+	plan, problem := client.PackageInstallPlan(context.Background(), ref, "1.2.3", hub.PackageInstallTarget{
+		Accelerator: "cpu", OS: "linux", Architecture: "x86_64",
+	})
 	if problem != nil || plan.Profile != "cpu-test" ||
 		len(plan.Downloads) != 1 || plan.Downloads[0].Path != "proof.whl" {
 		t.Fatalf("package install plan changed: %+v problem=%v", plan, problem)
+	}
+	_, problem = client.PackageInstallPlan(context.Background(), ref, "1.2.3", hub.PackageInstallTarget{
+		Accelerator: "nvidia", OS: "linux", Architecture: "x86_64",
+		DriverCUDA: "13.2", ComputeCapability: "8.9",
+	})
+	if problem != nil {
+		t.Fatalf("NVIDIA package install target was refused: %v", problem)
 	}
 }
 

@@ -4,12 +4,15 @@ import (
 	"context"
 	"os"
 	"path/filepath"
+	"runtime"
+	"strconv"
 	"strings"
 	"sync"
 
 	pep440 "github.com/aquasecurity/go-pep440-version"
 	"github.com/cozy-creator/cozy/internal/exit"
 	"github.com/cozy-creator/cozy/internal/home"
+	"github.com/cozy-creator/cozy/internal/hostgpu"
 	"github.com/cozy-creator/cozy/internal/hub"
 	"github.com/cozy-creator/cozy/internal/install"
 	"github.com/cozy-creator/cozy/internal/transfer"
@@ -38,11 +41,11 @@ func handleRegistryInstall(ctx *Context) *exit.Error {
 			return problem
 		}
 	}
-	profile := strings.TrimSpace(ctx.Inv.Value("--profile"))
-	if profile == "" {
-		return exit.Usagef("cozy package install requires --profile <approved-profile>")
+	target, problem := localPackageInstallTarget(ctx)
+	if problem != nil {
+		return problem
 	}
-	plan, problem := c.PackageInstallPlan(hctx, ref, release, profile)
+	plan, problem := c.PackageInstallPlan(hctx, ref, release, target)
 	if problem != nil {
 		return problem
 	}
@@ -96,6 +99,48 @@ func handleRegistryInstall(ctx *Context) *exit.Error {
 		return problem
 	}
 	return emitInstallResult(ctx, st, result)
+}
+
+func localPackageInstallTarget(ctx *Context) (hub.PackageInstallTarget, *exit.Error) {
+	target := hub.PackageInstallTarget{
+		Accelerator: "cpu", OS: runtime.GOOS, Architecture: packageInstallArchitecture(runtime.GOARCH),
+	}
+	inventory := hostgpu.Probe(ctx.Cfg)
+	if len(inventory.GPUs) == 0 {
+		return target, nil
+	}
+	gpu := inventory.GPUs[0]
+	for _, candidate := range inventory.GPUs[1:] {
+		if gpuCapability(candidate) > gpuCapability(gpu) ||
+			gpuCapability(candidate) == gpuCapability(gpu) && candidate.Index < gpu.Index {
+			gpu = candidate
+		}
+	}
+	if gpu.DriverCUDAVersion == "" {
+		return target, exit.Named(exit.Unavailable, "local_gpu.compatibility_unknown",
+			"the local NVIDIA driver did not report its CUDA compatibility").
+			WithRemedy("check that `nvidia-smi` runs successfully, then retry the install")
+	}
+	target.Accelerator = "nvidia"
+	target.DriverCUDA = gpu.DriverCUDAVersion
+	target.ComputeCapability = gpu.ComputeCapability
+	return target, nil
+}
+
+func packageInstallArchitecture(arch string) string {
+	switch arch {
+	case "amd64":
+		return "x86_64"
+	case "arm64":
+		return "aarch64"
+	default:
+		return arch
+	}
+}
+
+func gpuCapability(gpu hostgpu.GPU) int {
+	value, _ := strconv.Atoi(strings.TrimPrefix(gpu.SM, "sm_"))
+	return value
 }
 
 func latestPackageRelease(releases []hub.ReleaseSummary) (string, *exit.Error) {

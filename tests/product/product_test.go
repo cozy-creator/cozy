@@ -80,6 +80,8 @@ func TestPackageHasOneActiveVersion(t *testing.T) {
 	}
 	first := install("a", "1.0.0", 1)
 	second := install("b", "2.0.0", 2)
+	second.SelectionProfile = "torch2.13.0-cpu-cp312-linux-x86"
+	second.PlacementSetDigest = "sha256:" + strings.Repeat("b", 64)
 	if _, problem = store.Activate(first); problem != nil {
 		t.Fatal(problem)
 	}
@@ -89,6 +91,11 @@ func TestPackageHasOneActiveVersion(t *testing.T) {
 	pins, problem := store.Pins("cozy/example")
 	if problem != nil || len(pins) != 1 || pins[0].InstallID != second.ID {
 		t.Fatalf("active pins = %+v, %v", pins, problem)
+	}
+	_, active, problem := store.ActivePackage("cozy/example")
+	if problem != nil || active == nil || active.SelectionProfile != second.SelectionProfile ||
+		active.PlacementSetDigest != second.PlacementSetDigest {
+		t.Fatalf("active selection = %+v, %v", active, problem)
 	}
 }
 
@@ -125,7 +132,7 @@ func TestPackagePublishMetadataGrammar(t *testing.T) {
 	}
 	if code, help := runCozy(t, root, "package", "install", "--help"); code != 0 ||
 		!strings.Contains(help, "--version") ||
-		!strings.Contains(help, "--profile") || strings.Contains(help, "--major") ||
+		strings.Contains(help, "--profile") || strings.Contains(help, "--major") ||
 		strings.Contains(help, "--from") || strings.Contains(help, "--dir") ||
 		strings.Contains(help, "--digest") || strings.Contains(help, "--allow-unsigned") ||
 		strings.Contains(help, "--force") {

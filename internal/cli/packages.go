@@ -81,9 +81,11 @@ func emitInstallResult(ctx *Context, st *records.Store, res *install.Result) *ex
 		{K: "link_mode", V: g.LinkMode}, {K: "packages", V: g.Packages},
 		{K: "closure", V: strings.ReplaceAll(g.Closure, "\n", " ")},
 		{K: "package_descriptor", V: g.PackageDescriptor},
+		{K: "profile", V: g.SelectionProfile},
+		{K: "placement_set", V: g.PlacementSetDigest},
 	}
 	if res.Idempotent {
-		return emit(ctx, compactRecord(fields, "package", "major", "version", "status", "changed"))
+		return emit(ctx, compactRecord(fields, "package", "version", "status", "changed"))
 	}
 	fields = append(fields,
 		output.Field{K: "staged", V: fmt.Sprintf("%d files, %s expanded, %s compressed", res.Files, output.Bytes(res.Bytes), output.Bytes(res.Compressed))},
@@ -100,7 +102,7 @@ func emitInstallResult(ctx *Context, st *records.Store, res *install.Result) *ex
 				output.Field{K: "reclaimed", V: output.Bytes(reclaimed)})
 		}
 	}
-	rec := compactRecord(fields, "package", "major", "version", "status", "disk", "changed")
+	rec := compactRecord(fields, "package", "version", "status", "disk", "changed")
 	rec.Notes = append(rec.Notes, res.Warnings...)
 	rec.Next = []string{"cozy package list"}
 	return emit(ctx, rec)
@@ -118,8 +120,8 @@ func handleLs(ctx *Context) *exit.Error {
 	}
 	l := output.List{
 		Name:      "packages",
-		Fields:    []string{"package", "major", "version", "disk"},
-		AllFields: []string{"package", "major", "version", "disk", "generation", "source", "verified", "installed", "exclusive", "shared"},
+		Fields:    []string{"package", "version", "disk"},
+		AllFields: []string{"package", "major", "version", "disk", "profile", "placement_set", "generation", "source", "verified", "installed", "exclusive", "shared"},
 	}
 	for _, g := range rows {
 		l.Rows = append(l.Rows, map[string]string{
@@ -137,6 +139,8 @@ func handleLs(ctx *Context) *exit.Error {
 			"packages":           fmt.Sprintf("%d", g.Packages),
 			"closure":            strings.ReplaceAll(g.Closure, "\n", " "),
 			"package_descriptor": g.PackageDescriptor,
+			"profile":            g.SelectionProfile,
+			"placement_set":      g.PlacementSetDigest,
 			"source":             g.SourceKind + " " + g.SourceRef,
 			"verified":           fmt.Sprintf("%t", g.Verified),
 			"installed":          g.CreatedAt,
@@ -159,7 +163,7 @@ func handleRm(ctx *Context) *exit.Error {
 
 	removed := output.List{
 		Name:      "packages",
-		Fields:    []string{"package", "major", "reclaimed"},
+		Fields:    []string{"package", "reclaimed"},
 		AllFields: []string{"package", "major", "reclaimed", "generation"},
 	}
 	var freed int64

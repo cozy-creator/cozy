@@ -116,6 +116,7 @@ func persistSelection(genDir string, gen *records.PackageInstall, selection Sele
 		}
 	}
 	gen.PlacementSetDigest = selection.PlacementSet.Digest
+	gen.SelectionProfile = selection.Profile
 	return nil
 }
 

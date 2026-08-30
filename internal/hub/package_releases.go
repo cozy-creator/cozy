@@ -45,6 +45,16 @@ type PackageInstallPlan struct {
 	Downloads         []PackageInstallDownload `json:"downloads"`
 }
 
+// PackageInstallTarget carries only measured local compatibility facts. Tensorhub
+// remains the authority that ranks qualified profiles and returns one exact selection.
+type PackageInstallTarget struct {
+	Accelerator       string
+	OS                string
+	Architecture      string
+	DriverCUDA        string
+	ComputeCapability string
+}
+
 func packageReleasePath(ref Ref, release string) string {
 	return resourcePath("packages", ref) + "/releases/" + url.PathEscape(release)
 }
@@ -66,10 +76,27 @@ func (c *Client) CommitPackageRelease(ctx context.Context, ref Ref, release, rea
 	return out, e
 }
 
-func (c *Client) PackageInstallPlan(ctx context.Context, ref Ref, release, profile string) (PackageInstallPlan, *exit.Error) {
+func (c *Client) PackageInstallPlan(ctx context.Context, ref Ref, release string,
+	target PackageInstallTarget,
+) (PackageInstallPlan, *exit.Error) {
 	var out PackageInstallPlan
+	if target.OS == "" || target.Architecture == "" ||
+		(target.Accelerator != "cpu" && target.Accelerator != "nvidia") ||
+		target.Accelerator == "cpu" && (target.DriverCUDA != "" || target.ComputeCapability != "") ||
+		target.Accelerator == "nvidia" && (target.DriverCUDA == "" || target.ComputeCapability == "") {
+		return out, exit.Internalf("package install target is incomplete or contradictory")
+	}
+	query := url.Values{
+		"accelerator": {target.Accelerator},
+		"os":          {target.OS},
+		"arch":        {target.Architecture},
+	}
+	if target.Accelerator == "nvidia" {
+		query.Set("driver_cuda", target.DriverCUDA)
+		query.Set("compute_capability", target.ComputeCapability)
+	}
 	e := c.do(ctx, call{method: http.MethodGet,
-		path: packageReleasePath(ref, release) + "/install?profile=" + url.QueryEscape(profile), strict: true,
+		path: packageReleasePath(ref, release) + "/install?" + query.Encode(), strict: true,
 		responseBytes: 16 << 20}, &out)
 	return out, e
 }
