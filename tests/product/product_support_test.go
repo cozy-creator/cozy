@@ -133,7 +133,12 @@ func fakeSpec(name, device string, args ...string) orchestrator.WorkerLaunchSpec
 		},
 		"wheels": []canonical.Value{},
 	}
-	environmentBytes, _ := canonical.Write(environment)
+	environmentIdentity := map[string]canonical.Value{
+		"format":              "cozy.worker.v1.Environment/1",
+		"wheelhouse_manifest": environment["wheelhouse_manifest"],
+		"wheels":              environment["wheels"],
+	}
+	environmentBytes, _ := canonical.Write(environmentIdentity)
 	entrypointIdentity := map[string]canonical.Value{
 		"name": "fake", "slots": []canonical.Value{},
 	}
