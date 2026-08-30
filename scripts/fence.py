@@ -335,17 +335,12 @@ DOCUMENT_KINDS = {
     # repo/process boundary AND is stored or digested. A literal outside this table is a new
     # name without its decision row; a literal in a second file is a second declaration.
     #
-    # Two rows are HMAC DOMAIN-SEPARATION TAGS rather than stored documents
-    # (`cozy.rental_request/1`). They are registered for the same
-    # reason and are if anything stricter: a peer repo reproduces those exact bytes to
-    # verify a MAC, so a silent edit does not misparse — it fails authentication at a
-    # rental boundary, which is the worst place to discover a renamed constant.
-    "cozy.client.JobSubmission/1": "internal/api/jobs.go",
-    "cozy.client.Submission/1": "internal/api/requests.go",
-    "cozy.local.EntrypointBindingRecord/2": "internal/plan/plan.go",
-    "cozy.local.EvaluatedConfig/1": "internal/cli/identity.go",
-    "cozy.local.ExecutionEnvironment/1": "internal/cli/identity.go",
     "cozy.local.ManagedBaseReceipt/1": "internal/managedinstall/install.go",
+}
+# HMAC domain-separation tags are security protocol constants, not document formats. A peer repo
+# reproduces these exact bytes, so they remain single-owner fenced without inflating the document
+# count.
+HMAC_DOMAINS = {
     "cozy.rental_request/1": "internal/cli/rentals.go",
 }
 # Kinds another repo authors and this one only reads: the owner's fence polices the name.
@@ -368,7 +363,7 @@ def check_document_kinds():
             for kind in KIND_LITERAL.findall(line):
                 if kind.startswith(FOREIGN_KIND_PREFIXES):
                     continue
-                owner = DOCUMENT_KINDS.get(kind)
+                owner = DOCUMENT_KINDS.get(kind) or HMAC_DOMAINS.get(kind)
                 if owner is None:
                     bad.append(f"{rel}:{i}: [kinds] names '{kind}', a document kind outside "
                                "DOCUMENT_KINDS — a new kind needs a decision row (#616.a) and a "

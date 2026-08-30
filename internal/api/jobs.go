@@ -226,7 +226,7 @@ func jobSubmissionDigest(spec orchestrator.Submission) (string, *exit.Error) {
 		})
 	}
 	doc := map[string]canonical.Value{
-		"format":           "cozy.client.JobSubmission/1",
+		"kind":             "job",
 		"package":          spec.Package,
 		"function":         spec.Entrypoint,
 		"plan_id":          spec.PlanID,
