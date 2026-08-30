@@ -260,7 +260,7 @@ func (c *Orchestrator) converse(w *worker, addr string) error {
 		frame, err := stream.Recv()
 		if err != nil {
 			c.dropSession(s)
-			return nil
+			return fmt.Errorf("receive worker frame: %w", err)
 		}
 		switch m := frame.Msg.(type) {
 		case *pb.WorkerFrame_ClaimAck:
@@ -284,7 +284,6 @@ func (c *Orchestrator) converse(w *worker, addr string) error {
 				return fmt.Errorf("%s", e.Message)
 			}
 			s.claimAck = raw
-			watchCancel = c.openWatch(addr, w, s)
 		case *pb.WorkerFrame_BootFailure:
 			c.logf("BOOT FAILURE from %s: %s (%s)", m.BootFailure.WorkerInstanceId,
 				pb.BootFailureReason_name[int32(m.BootFailure.Reason)], m.BootFailure.Detail)
@@ -303,6 +302,13 @@ func (c *Orchestrator) converse(w *worker, addr string) error {
 					continue
 				}
 				s.snapshot = raw
+				// Open the lossy progress lane only after the durable recovery barrier is
+				// acknowledged. ClaimAck and WorkerSnapshot are one control transition;
+				// a second connection before that pair completes adds no useful progress
+				// visibility and must not perturb bootstrap on provider TCP relays.
+				if watchCancel == nil {
+					watchCancel = c.openWatch(addr, w, s)
+				}
 			}
 		case *pb.WorkerFrame_ObservedState:
 			r := m.ObservedState
