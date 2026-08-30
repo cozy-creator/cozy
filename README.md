@@ -71,7 +71,9 @@ An explicit directory (`.`, `..`, `./project`, `../project`, or an absolute path
 local-only editable install after a bounded source scan. Every invocation checks that live tree;
 a change atomically prepares a new generation and restarts stale execution state. A failed refresh
 keeps the last good generation pinned and refuses the invocation. Editable installs are neither
-published releases nor rentable deployments, and currently support model-free entrypoints only.
+published releases nor rentable deployments. Model bindings resolve the exact release and lane
+declared in `package.toml` from the local TensorFS store; they never synthesize Hub qualification
+or release records.
 
 Remove local package generations with:
 

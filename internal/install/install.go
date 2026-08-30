@@ -300,7 +300,8 @@ func Run(l home.Layout, st *records.Store, req Request) (*Result, *exit.Error) {
 	if req.Published != nil {
 		descriptor, e = launch.DecodeDescriptor(req.Published.Selection.PackageDescriptor.Bytes)
 	} else {
-		descriptor, developmentSet, e = deriveDevelopmentPlacement(venvDir, sourceDir, *req.Local)
+		descriptor, developmentSet, e = deriveDevelopmentPlacement(
+			venvDir, sourceDir, l.CAS, *req.Local)
 	}
 	if e != nil {
 		return guard(e)
@@ -393,7 +394,7 @@ func persistPublishedArtifacts(genDir string, artifacts map[string]string) *exit
 // deriveDescriptor runs the generation's own Runtime over its source. Runtime emits the
 // complete descriptor without writing the source tree; Cozy validates the closed grammar
 // and stores the canonical bytes under the immutable generation root.
-func deriveDevelopmentPlacement(venvDir, sourceDir string, local LocalSource) (
+func deriveDevelopmentPlacement(venvDir, sourceDir, artifactStore string, local LocalSource) (
 	*launch.PackageDescriptor, ExactDocument, *exit.Error,
 ) {
 	var empty ExactDocument
@@ -406,7 +407,7 @@ func deriveDevelopmentPlacement(venvDir, sourceDir string, local LocalSource) (
 	}
 	cmd := exec.Command(bin, "--json", "--dir", sourceDir, "development-placement",
 		"--package", local.Package, "--release", local.Release,
-		"--source-digest", local.SourceDigest)
+		"--source-digest", local.SourceDigest, "--artifact-store", artifactStore)
 	cmd.Env = config.Frozen().Tool()
 	var stdout, stderr strings.Builder
 	cmd.Stdout, cmd.Stderr = &stdout, &stderr

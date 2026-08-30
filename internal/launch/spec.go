@@ -106,6 +106,7 @@ func (f *Facts) Spec(devices []string) (orchestrator.WorkerLaunchSpec, *exit.Err
 				"--development-release", placement.Release,
 				"--development-source-digest", placement.SourceDigest},
 			Dir: f.Source, Devices: devices, GraceSec: 3,
+			ArtifactStore: filepath.Join(filepath.Dir(filepath.Dir(f.Install.Dir)), "cas"),
 		}, nil
 	}
 	runtimeBin, e := HostRuntime()
