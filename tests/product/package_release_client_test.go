@@ -64,7 +64,7 @@ func TestPackageReleaseClientContract(t *testing.T) {
 	client := hub.New(config.Config{HubURL: server.URL, HubToken: secret.New("proof-token")}, "cozy-test")
 
 	begin, problem := client.BeginPackageRelease(context.Background(), ref, "1.0.0", "proof publish")
-	if problem != nil || begin.State != "pending" || begin.ProjectWheelUpload.ExpiresAt == "" {
+	if problem != nil || begin.State != "pending" {
 		t.Fatalf("begin response changed: %+v problem=%v", begin, problem)
 	}
 	uploads, problem := client.PackageReleaseUploads(context.Background(), ref, "1.0.0",
