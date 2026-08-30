@@ -17,6 +17,7 @@ package tfs
 
 import (
 	"bytes"
+	"encoding/base64"
 	"encoding/json"
 	"os"
 	"os/exec"
@@ -273,12 +274,13 @@ func (t *Tool) VerifyManifest(id string) *exit.Error {
 
 // Release is one authoritative local repository row returned by TensorFS.
 type Release struct {
-	Org            string `json:"org"`
-	Name           string `json:"name"`
-	Version        string `json:"version"`
-	Lane           string `json:"lane"`
-	ManifestSHA256 string `json:"manifest_sha256"`
-	ManifestLength int64  `json:"manifest_length"`
+	Org            string          `json:"org"`
+	Name           string          `json:"name"`
+	Version        string          `json:"version"`
+	Lane           string          `json:"lane"`
+	ManifestSHA256 string          `json:"manifest_sha256"`
+	ManifestLength int64           `json:"manifest_length"`
+	Evidence       json.RawMessage `json:"evidence"`
 }
 
 // Releases lists repository metadata through TensorFS, never through SQLite or
@@ -298,12 +300,44 @@ func (t *Tool) Releases(outPath string) ([]Release, *exit.Error) {
 		}
 		var row Release
 		if err := json.Unmarshal([]byte(text), &row); err != nil || row.Org == "" || row.Name == "" ||
-			row.Version == "" || row.Lane == "" || len(row.ManifestSHA256) != 64 || row.ManifestLength <= 0 {
+			row.Version == "" || row.Lane == "" || len(row.ManifestSHA256) != 64 || row.ManifestLength <= 0 ||
+			len(row.Evidence) == 0 {
 			return nil, exit.Internalf("tfs returned an invalid repository row at line %d", line+1)
 		}
 		rows = append(rows, row)
 	}
 	return rows, nil
+}
+
+// ReleaseEvidence returns the one exact canonical evidence value attached to a
+// manifest in the named local repository. Repeating the same bytes across lanes is
+// harmless; absent or disagreeing bytes refuse rather than inventing classification.
+func (t *Tool) ReleaseEvidence(org, name, manifestID, outPath string) ([]byte, *exit.Error) {
+	rows, e := t.Releases(outPath)
+	if e != nil {
+		return nil, e
+	}
+	var evidence []byte
+	for _, row := range rows {
+		if row.Org != org || row.Name != name || "sha256:"+row.ManifestSHA256 != manifestID {
+			continue
+		}
+		if evidence == nil {
+			evidence = append([]byte(nil), row.Evidence...)
+			continue
+		}
+		if !bytes.Equal(evidence, row.Evidence) {
+			return nil, exit.Named(exit.Conflict, "model.release_evidence_ambiguous",
+				"local repository %s/%s carries conflicting evidence for manifest %s", org, name, manifestID).
+				WithRemedy("remove the contradictory local release before publishing")
+		}
+	}
+	if evidence == nil {
+		return nil, exit.Named(exit.NotFound, "model.release_evidence_absent",
+			"local repository %s/%s has no release for manifest %s", org, name, manifestID).
+			WithRemedy("ingest or download the manifest into this model repository before publishing it")
+	}
+	return evidence, nil
 }
 
 func writeJSON(path string, value any) *exit.Error {
@@ -340,7 +374,12 @@ func (t *Tool) observedRepository(org, name, scratch string) (string, *exit.Erro
 }
 
 // CommitRelease makes one verified manifest visible under the local repository.
-func (t *Tool) CommitRelease(org, name, version, lane, manifestID string, length int64, scratch string) *exit.Error {
+func (t *Tool) CommitRelease(org, name, version, lane, manifestID string, length int64,
+	evidence []byte, scratch string,
+) *exit.Error {
+	if len(evidence) == 0 {
+		return exit.Internalf("cannot commit a model release without exact evidence")
+	}
 	current, e := t.observedRepository(org, name, scratch)
 	if e != nil {
 		return e
@@ -348,8 +387,9 @@ func (t *Tool) CommitRelease(org, name, version, lane, manifestID string, length
 	mutation := filepath.Join(scratch, "repo-put.json")
 	if e := writeJSON(mutation, map[string]any{
 		"action": "put_release", "lane": lane,
-		"manifest": map[string]any{"length": length, "sha256": hex(manifestID)},
-		"repo":     map[string]string{"name": name, "org": org}, "version": version,
+		"evidence_base64": base64.StdEncoding.EncodeToString(evidence),
+		"manifest":        map[string]any{"length": length, "sha256": hex(manifestID)},
+		"repo":            map[string]string{"name": name, "org": org}, "version": version,
 	}); e != nil {
 		return e
 	}

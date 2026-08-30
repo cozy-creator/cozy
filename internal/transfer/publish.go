@@ -96,6 +96,11 @@ func (p *Publish) Run(ctx context.Context) (Result, *exit.Error) {
 	if err := os.MkdirAll(p.Scratch, 0o700); err != nil {
 		return res, exit.Internalf("cannot create the transfer scratch at %s: %s", p.Scratch, err)
 	}
+	evidence, e := p.Tool.ReleaseEvidence(p.Ref.Org, p.Ref.Name, p.ManifestID,
+		filepath.Join(p.Scratch, "repo-releases.jsonl"))
+	if e != nil {
+		return res, e
+	}
 	objects, e := p.Tool.ManifestObjects(p.ManifestID, filepath.Join(p.Scratch, "objects.jsonl"))
 	if e != nil {
 		return res, e
@@ -109,7 +114,9 @@ func (p *Publish) Run(ctx context.Context) (Result, *exit.Error) {
 		return res, exit.Internalf("the manifest tfs extracted is unreadable: %s", err)
 	}
 	res.Manifest = hub.ManifestRef{SHA256: strings.TrimPrefix(p.ManifestID, "sha256:"), Length: int64(len(manifest))}
-	seal := hub.SealPublicationRequest{Manifest: hub.B64(manifest)}
+	seal := hub.SealPublicationRequest{
+		Manifest: hub.B64(manifest), ReleaseEvidenceBase64: hub.B64(evidence),
+	}
 	declared := make([]hub.Object, 0, len(objects))
 	for _, o := range objects {
 		declared = append(declared, hub.Object{ID: o.ID, Length: o.Length})
@@ -231,7 +238,7 @@ func (p *Publish) seal(ctx context.Context, request hub.SealPublicationRequest,
 	}
 	ms["seal"] = since(t0)
 	if done.PublishID != res.PublishID || done.Release != p.Release || done.Lane != p.Lane ||
-		done.Manifest != res.Manifest {
+		done.Manifest != res.Manifest || done.ReleaseEvidenceBase64 != request.ReleaseEvidenceBase64 {
 		return res, exit.Internalf("Tensorhub committed a different publication identity")
 	}
 	res.Manifest, res.TopologyDigest, res.Dup = done.Manifest, done.TopologyDigest, done.Duplicate

@@ -22,6 +22,7 @@ package transfer
 import (
 	"context"
 	"crypto/sha256"
+	"encoding/base64"
 	"encoding/hex"
 	"fmt"
 	"io"
@@ -99,11 +100,17 @@ func (f *Fetch) Resolve(ctx context.Context) (hub.ModelManifest, *exit.Error) {
 			"%q resolves only a manifest digest; a local repository requires a release and lane", f.Spec).
 			WithRemedy("download an immutable release and select one exact lane")
 	}
+	evidence, err := base64.StdEncoding.Strict().DecodeString(resolved.ReleaseEvidenceBase64)
+	if err != nil || len(evidence) == 0 ||
+		base64.StdEncoding.EncodeToString(evidence) != resolved.ReleaseEvidenceBase64 {
+		return hub.ModelManifest{}, exit.Named(exit.Internal, "hub.release_evidence_invalid",
+			"model resolution for %q returned invalid release evidence", f.Spec)
+	}
 	f.Ref, f.ManifestID = ref, resolved.ManifestID
 	return hub.ModelManifest{
 		Org: ref.Org, Name: ref.Name, Release: resolved.Release, Lane: resolved.Lane,
 		ManifestID: resolved.ManifestID, HeaderID: resolved.HeaderID,
-		Objects: resolved.Objects, Bytes: resolved.Bytes,
+		Objects: resolved.Objects, Bytes: resolved.Bytes, ReleaseEvidence: evidence,
 	}, nil
 }
 
@@ -189,7 +196,7 @@ func (f *Fetch) Run(ctx context.Context, row hub.ModelManifest) (Fetched, *exit.
 	f.say("verified %d blobs — every declared byte", len(objects))
 
 	if e := f.Tool.CommitRelease(f.Ref.Org, f.Ref.Name, row.Release, row.Lane,
-		row.ManifestID, int64(len(doc)), f.Scratch); e != nil {
+		row.ManifestID, int64(len(doc)), row.ReleaseEvidence, f.Scratch); e != nil {
 		return out, e
 	}
 	f.say("timing: %s", Timing(out.MS))

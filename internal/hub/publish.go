@@ -135,7 +135,8 @@ func (c *Client) SettleObjects(ctx context.Context, ref Ref, operation string,
 }
 
 type SealPublicationRequest struct {
-	Manifest string `json:"manifest"`
+	Manifest              string `json:"manifest"`
+	ReleaseEvidenceBase64 string `json:"release_evidence_base64"`
 }
 
 type ManifestRef struct {
@@ -146,14 +147,15 @@ type ManifestRef struct {
 // CompleteResponse is the committed (release,lane)->manifest result. Exact replay
 // returns the original result with duplicate=true.
 type CompleteResponse struct {
-	PublishID      string      `json:"publish_id"`
-	Release        string      `json:"release"`
-	Lane           string      `json:"lane"`
-	Manifest       ManifestRef `json:"manifest"`
-	TopologyDigest string      `json:"topology_digest"`
-	Objects        int         `json:"objects"`
-	Bytes          int64       `json:"bytes"`
-	Duplicate      bool        `json:"duplicate"`
+	PublishID             string      `json:"publish_id"`
+	Release               string      `json:"release"`
+	Lane                  string      `json:"lane"`
+	Manifest              ManifestRef `json:"manifest"`
+	TopologyDigest        string      `json:"topology_digest"`
+	Objects               int         `json:"objects"`
+	Bytes                 int64       `json:"bytes"`
+	ReleaseEvidenceBase64 string      `json:"release_evidence_base64"`
+	Duplicate             bool        `json:"duplicate"`
 }
 
 func (c *Client) SealPublication(ctx context.Context, ref Ref, operation string,
@@ -180,26 +182,28 @@ func publications(ref Ref) string {
 
 // ModelManifest is one resolved immutable model tree.
 type ModelManifest struct {
-	Org        string `json:"org"`
-	Name       string `json:"name"`
-	Release    string `json:"release"`
-	Lane       string `json:"lane"`
-	ManifestID string `json:"manifest_id"`
-	HeaderID   string `json:"header_digest"`
-	Objects    int    `json:"objects"`
-	Bytes      int64  `json:"bytes"`
+	Org             string `json:"org"`
+	Name            string `json:"name"`
+	Release         string `json:"release"`
+	Lane            string `json:"lane"`
+	ManifestID      string `json:"manifest_id"`
+	HeaderID        string `json:"header_digest"`
+	Objects         int    `json:"objects"`
+	Bytes           int64  `json:"bytes"`
+	ReleaseEvidence []byte `json:"-"`
 }
 
 // ModelResolution is Tensorhub's exact answer to a human model ref. Download never
 // lists manifests and guesses: digest or release selection happens at this route.
 type ModelResolution struct {
-	Model      string `json:"model"`
-	Release    string `json:"release"`
-	Lane       string `json:"lane"`
-	ManifestID string `json:"manifest_id"`
-	HeaderID   string `json:"header_digest"`
-	Objects    int    `json:"objects"`
-	Bytes      int64  `json:"bytes"`
+	Model                 string `json:"model"`
+	Release               string `json:"release"`
+	Lane                  string `json:"lane"`
+	ManifestID            string `json:"manifest_id"`
+	HeaderID              string `json:"header_digest"`
+	Objects               int    `json:"objects"`
+	Bytes                 int64  `json:"bytes"`
+	ReleaseEvidenceBase64 string `json:"release_evidence_base64"`
 }
 
 func (c *Client) ResolveModel(ctx context.Context, spec, lane string) (ModelResolution, *exit.Error) {
