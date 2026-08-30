@@ -3,7 +3,6 @@ package cli
 import (
 	"context"
 	"fmt"
-	"path/filepath"
 	"strings"
 	"sync"
 	"time"
@@ -124,7 +123,7 @@ func uploadPackageFiles(ctx context.Context, pack *packagepublish.Package,
 		var ok bool
 		switch upload.Kind {
 		case "project_wheel":
-			if !wantProject || upload.Path != filepath.Base(pack.Wheel) {
+			if !wantProject || upload.Path != "project.whl" {
 				return 0, exit.Internalf("package uploads returned unknown project wheel %q", upload.Path)
 			}
 			local, ok = pack.Wheel, true

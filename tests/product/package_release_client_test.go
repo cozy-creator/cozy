@@ -41,7 +41,7 @@ func TestPackageReleaseClientContract(t *testing.T) {
 				t.Errorf("package declaration changed: %+v err=%v", body, err)
 			}
 			_ = json.NewEncoder(w).Encode(map[string]any{"state": "pending", "uploads": []map[string]any{
-				{"kind": "project_wheel", "path": "package-1.0.0-py3-none-any.whl", "url": "https://storage.invalid/project", "required_headers": map[string]string{}, "already_uploaded": false},
+				{"kind": "project_wheel", "path": "project.whl", "url": "https://storage.invalid/project", "required_headers": map[string]string{}, "already_uploaded": false},
 				{"kind": "source", "path": "package.toml", "url": "https://storage.invalid/source", "required_headers": map[string]string{}, "already_uploaded": false},
 				{"kind": "dependency_wheel", "path": "proof_dependency-1.0.0-py3-none-any.whl", "url": "https://storage.invalid/dependency", "required_headers": map[string]string{}, "already_uploaded": false},
 			}})
@@ -182,7 +182,7 @@ func TestPackagePublishPendingWireFlowBoundsUploads(t *testing.T) {
 			}
 			uploads := []map[string]any{{
 				"already_uploaded": false, "kind": "project_wheel",
-				"path":             "wire_package-1.0.0-py3-none-any.whl",
+				"path":             "project.whl",
 				"required_headers": map[string]string{}, "url": server.URL + "/storage/project",
 			}}
 			for i, path := range body.Paths {
