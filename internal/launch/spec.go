@@ -84,19 +84,22 @@ func (f *Facts) Placement() (orchestrator.DesiredPlacement, *exit.Error) {
 		f.Install.PlacementSetDigest, data, outputs)
 }
 
-// Spec adds this host's target-environment materialization to a placement. The
-// interpreter is the GENERATION'S OWN: the venv `uv sync --locked` built from the
-// release's own lock, so the cozy-runtime that serves a package is the one the release
-// pinned and never this host's. A connected worker never calls this method.
+// Spec adds this host's target-environment materialization to a placement. The trusted
+// host Runtime owns worker control; the generation venv is only the selected executor
+// overlay. A connected worker never calls this method.
 func (f *Facts) Spec(devices []string) (orchestrator.WorkerLaunchSpec, *exit.Error) {
 	placement, e := f.Placement()
+	if e != nil {
+		return orchestrator.WorkerLaunchSpec{}, e
+	}
+	runtimeBin, e := HostRuntime()
 	if e != nil {
 		return orchestrator.WorkerLaunchSpec{}, e
 	}
 	cache := filepath.Join(f.Install.Dir, "artifact-cache")
 	return orchestrator.WorkerLaunchSpec{
 		Placement: placement,
-		Python:    Binary(f.Install), Args: []string{"serve"},
+		Python:    runtimeBin, Args: []string{"serve"},
 		Dir:             f.Source,
 		Devices:         devices,
 		GraceSec:        3,

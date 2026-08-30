@@ -63,6 +63,10 @@ func (f *Facts) JobSpec(function string, devices []string) (orchestrator.WorkerL
 	if e != nil {
 		return orchestrator.WorkerLaunchSpec{}, nil, e
 	}
+	runtimeBin, e := HostRuntime()
+	if e != nil {
+		return orchestrator.WorkerLaunchSpec{}, nil, e
+	}
 	spec := orchestrator.WorkerLaunchSpec{
 		Placement: orchestrator.DesiredPlacement{
 			Package:          f.Install.Package,
@@ -91,7 +95,7 @@ func (f *Facts) JobSpec(function string, devices []string) (orchestrator.WorkerL
 			}},
 		},
 		// The same entry the serving lane uses: the runtime's own public verb (spec.go).
-		Python:   Binary(f.Install),
+		Python:   runtimeBin,
 		Args:     []string{"serve"},
 		Dir:      f.Source,
 		Devices:  devices,
