@@ -10,7 +10,7 @@
 //!   carrier     — strict bounded foreign-carrier decode (refuse before allocation)
 //!   fingerprint — classification into a reviewed registry verdict; ambiguity refuses
 //!   convert     — the PLAN (pure function of headers + target) and the reviewed converters
-//!   transaction — quarantine-rooted write through the real CAS, receipt, install/reap
+//!   transaction — temporary candidate write through the real CAS, receipt, install/reap
 
 pub mod carrier;
 pub mod convert;

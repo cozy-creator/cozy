@@ -33,7 +33,7 @@ crash_section() {
     wait $pid 2>/dev/null
     local objs temps partial
     objs=$(count_objects "$S")
-    temps=$(find "$S/.tensorfs/tmp" -type f | wc -l)
+    temps=$(find "$S/tmp" -type f | wc -l)
     # A partial blob is any file under blobs/ whose name is not its own digest.
     partial=0
     while read -r f; do
@@ -93,16 +93,16 @@ red_section() {
   head -c "$len" /dev/urandom > "$obj"; chmod 0444 "$obj"
   echo "planted $(stat -c%s "$obj") bytes at the id of a $len-byte object"
   "$TFS" contains "$S" "$want"
-  echo "--- a verified read refuses and quarantines ---"
+  echo "--- a verified read refuses and removes corrupt bytes ---"
   "$TFS" get "$S" "$want"; echo "get exit=$?"
-  echo "quarantine: $(ls "$S/.tensorfs/quarantine")"
+  test ! -e "$obj"; echo "corrupt path removed: yes"
   "$TFS" verify "$S" "$want"; echo "verify exit=$?"
   echo "--- plant it again: resume must not skip it either ---"
-  rm -rf "${S:?}/.tensorfs/quarantine"/*; mkdir -p "$(dirname "$obj")"
+  mkdir -p "$(dirname "$obj")"
   head -c "$len" /dev/urandom > "$obj"; chmod 0444 "$obj"
   printf '%s %s %s\n' "$want" "$len" "$SRC" > "$S/plan"
   "$TFS" fill "$S" "$S/plan"; echo "fill exit=$?"
-  echo "quarantine: $(ls "$S/.tensorfs/quarantine")"
+  echo "replacement installed: $(test -e "$obj" && echo yes || echo NO)"
   echo "healed and verified: $("$TFS" verify "$S" "$want")"
   echo "stored bytes match source: $(cmp -s "$SRC" "$obj" && echo yes || echo NO)"
 
@@ -118,7 +118,7 @@ red_section() {
   chmod 0644 "$obj"; printf 'X' | dd of="$obj" bs=1 seek=100 conv=notrunc status=none; chmod 0444 "$obj"
   "$TFS" contains "$S" "$want"
   "$TFS" get "$S" "$want"; echo "get exit=$?"
-  echo "quarantine: $(ls "$S/.tensorfs/quarantine")"
+  test ! -e "$obj"; echo "corrupt path removed: yes"
 
   hr "RED 3 — a legacy v1 layout is not a current store"
   local V="$WORK/v1"; rm -rf "$V"; mkdir -p "$V/objects" "$V/refs"; : > "$V/metadata.sqlite3"
@@ -170,15 +170,16 @@ red_section() {
   chmod 0444 "$S/blobs/${last:0:2}/${last:2:2}/$last"
   echo "--- resume ---"
   "$TFS" fill "$S" "$S/plan"; echo "fill exit=$?"
-  echo "quarantine: $(ls "$S/.tensorfs/quarantine")"
-  hr "RED 6b — scrub finds a planted corruption at rate 1.0 and quarantines it"
+  echo "replacement installed: $(test -e "$S/blobs/${last:0:2}/${last:2:2}/$last" && echo yes || echo NO)"
+  hr "RED 6b — scrub finds a planted corruption at rate 1.0 and removes it"
   local first; first=$(head -1 "$S/plan" | cut -d' ' -f1)
   local flen; flen=$(head -1 "$S/plan" | cut -d' ' -f2)
   chmod 0644 "$S/blobs/${first:0:2}/${first:2:2}/$first"
   head -c "$flen" /dev/urandom > "$S/blobs/${first:0:2}/${first:2:2}/$first"
   chmod 0444 "$S/blobs/${first:0:2}/${first:2:2}/$first"
   "$TFS" scrub "$S" --rate 1.0; echo "scrub exit=$?"
-  echo "quarantine now: $(ls "$S/.tensorfs/quarantine" | tr '\n' ' ')"
+  test ! -e "$S/blobs/${first:0:2}/${first:2:2}/$first"
+  echo "corrupt scrub subject removed: yes"
   echo "--- the same store at a partial rate (one knob) ---"
   "$TFS" scrub "$S" --rate 0.25 --pass 7
 
@@ -218,7 +219,7 @@ red_section() {
   echo "bytes read == the forged twin:      $(cmp -s "$WORK/forged" "$WORK/got" && echo yes || echo NO)"
   echo "(the fd pins the inode: the swap is not caught, it is INERT)"
 
-  hr "RED 7b — the same replacement landing BEFORE the open: refused and quarantined"
+  hr "RED 7b — the same replacement landing BEFORE the open: refused and removed"
   fresh "$S"; obj="$S/blobs/${want:0:2}/${want:2:2}/$want"
   "$TFS" put "$S" "$SRC" >/dev/null
   "$TFS" verify "$S" "$want"
@@ -226,7 +227,7 @@ red_section() {
   chmod 0444 "$obj"
   echo "same length, different bytes, new inode — the record's only unbound field is content"
   "$TFS" get "$S" "$want" > /dev/null; echo "get exit=$?"
-  echo "quarantine: $(ls "$S/.tensorfs/quarantine")"
+  test ! -e "$obj"; echo "corrupt path removed: yes"
 }
 
 case "$SECTION" in

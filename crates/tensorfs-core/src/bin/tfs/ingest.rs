@@ -9,13 +9,13 @@
 //!                        plan structurally cannot read them, and evidence is their home.
 //!   `run`                spawns an ISOLATED child. The parent never parses the carrier.
 //!   `ingest-worker`      the hermetic child: it parses, converts, writes candidates under
-//!                        an expiring quarantine root, and emits a receipt. It cannot
+//!                        an expiring temporary candidate, and emits a receipt. It cannot
 //!                        install a manifest and it has no network stack linked into it.
 //!   `install`            the COORDINATOR's act. It consumes the receipt, verifies the
 //!                        binding, walks the tree, and alone promotes one root.
 //!   `reap`               what happens to everything that never reached `install`.
 //!
-//! A candidate is never a release. Its quarantine session is the visible difference.
+//! A candidate is never a release. Its temporary session is the visible difference.
 
 use std::fs;
 use std::io::Read;
@@ -889,7 +889,7 @@ pub fn cmd_run(root: &Path, target: &str, f: &Flags) -> ExitCode {
         }
         Ok(s) => {
             eprintln!(
-                "worker exited {:?} — the quarantine root stays reapable and nothing installed",
+                "worker exited {:?} — the candidate stays reapable and nothing installed",
                 s.code()
             );
             ExitCode::FAILURE
@@ -1154,7 +1154,7 @@ pub fn cmd_worker(root: &Path, target: &str, f: &Flags) -> ExitCode {
         })
     );
     ok!(tx::write_session(store.root(), &ingest_root));
-    let dir = tx::quarantine_dir(store.root(), &session);
+    let dir = tx::candidate_dir(store.root(), &session);
     for (name, bytes) in [
         ("receipt.json", receipt.canonical_bytes()),
         ("stamp.json", stamped.stamp.canonical_bytes()),
@@ -1178,7 +1178,7 @@ pub fn cmd_worker(root: &Path, target: &str, f: &Flags) -> ExitCode {
     println!("  golden     {}", stamped.stamp.golden);
     println!("receipt      {}", receipt_ref.id());
     println!(
-        "quarantine   {} expires at {} — NOT a checkpoint until `tfs ingest install`",
+        "candidate    {} expires at {} — NOT a checkpoint until `tfs ingest install`",
         session, ingest_root.expires_at
     );
     ExitCode::SUCCESS
@@ -1350,7 +1350,7 @@ pub fn cmd_reingest(root: &Path, header_hex: &str, target: &str, f: &Flags) -> E
 
 // ------------------------------------------------------------------ install / reap
 
-/// The coordinator's act. Nothing else turns a quarantine session into a repository release.
+/// The coordinator's act. Nothing else turns a candidate session into a repository release.
 pub fn cmd_install(
     root: &Path,
     session: &str,
@@ -1360,7 +1360,7 @@ pub fn cmd_install(
     lane: &str,
 ) -> ExitCode {
     let store = ok!(Store::open(root));
-    let dir = tx::quarantine_dir(store.root(), session);
+    let dir = tx::candidate_dir(store.root(), session);
     let read = |n: &str| fs::read(dir.join(n));
     let (rb, sb, tb, pb) = match (
         read("receipt.json"),
@@ -1439,7 +1439,7 @@ pub fn cmd_sessions(root: &Path) -> ExitCode {
     }
     let (_, live) = ok!(tx::reap(&store, 0));
     for s in &live {
-        println!("candidate    {s} (quarantined — not a release)");
+        println!("candidate    {s} (temporary — not a release)");
     }
     println!(
         "{} released manifests, {} candidate sessions",
@@ -1553,7 +1553,7 @@ pub fn cmd_converters() -> ExitCode {
 
 // ------------------------------------------------------------------ restamp
 
-/// Re-run `Stamp` over a quarantine session's documents, against the bytes the store holds.
+/// Re-run `Stamp` over a candidate session's documents, against the bytes the store holds.
 ///
 /// Two jobs. It is the RE-VERIFICATION surface a coordinator has (th-002 verifies a receipt
 /// against exactly these facts and must never build a second checker), and it is where the
@@ -1563,7 +1563,7 @@ pub fn cmd_converters() -> ExitCode {
 /// library nobody can trust in production.
 pub fn cmd_restamp(root: &Path, session: &str, flags: &Flags) -> ExitCode {
     let store = ok!(Store::open(root));
-    let dir = tx::quarantine_dir(store.root(), session);
+    let dir = tx::candidate_dir(store.root(), session);
     let read = |n: &str| match fs::read(dir.join(n)) {
         Ok(b) => Ok(b),
         Err(_) => {

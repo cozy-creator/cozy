@@ -39,7 +39,7 @@
    "detail": "under their identity, unchanged"
   },
   {
-   "arm": "a resident that is NOT ours quarantines",
+   "arm": "a resident that is NOT ours is removed",
    "ok": true,
    "observed": 1,
    "detail": "REFUSED OBJECT_CORRUPT: final-key mismatch at objects/sha256/21/48/2148c93613ec8e563732936"
@@ -75,7 +75,7 @@
    "detail": "REFUSED NOT_CONTAINED: sha256:0000000000000000000000000000000000000000000000000000000000000000: not "
   },
   {
-   "arm": "a final-key checksum mismatch quarantines",
+   "arm": "a final-key checksum mismatch is removed",
    "ok": true,
    "observed": 1,
    "detail": "REFUSED OBJECT_CORRUPT: sha256:2148c93613ec8e563732936e74a585f5623953f3d053dfc12bd72780f37d4f09: the"

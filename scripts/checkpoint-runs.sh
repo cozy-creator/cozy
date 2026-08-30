@@ -126,7 +126,8 @@ red_section() {
   chmod u+w "$(objpath "$RED" "$seg")"
   printf 'tampered' | dd of="$(objpath "$RED" "$seg")" bs=1 seek=1000 conv=notrunc status=none
   "$TFS" checkpoint read "$RED" "$h" --blocks 1 2>&1 | head -3
-  echo "quarantined: $(find "$RED/.tensorfs/quarantine" -type f | wc -l) blob(s)"
+  test ! -e "$(objpath "$RED" "$seg")"
+  echo "corrupt segment removed: yes"
 
   hr "RED 5 — whole-document totals, built in memory (too large to freeze as vectors)"
   "$TFS" checkpoint caps

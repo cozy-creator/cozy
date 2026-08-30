@@ -55,7 +55,7 @@ pub struct Meta {
 impl Meta {
     pub fn open(store: &Store) -> Result<Self> {
         crate::catalog::Catalog::open(store.root())?;
-        let lease_dir = store.root().join(".tensorfs/leases");
+        let lease_dir = store.root().join("tmp/leases");
         fs::create_dir_all(&lease_dir).map_err(|error| io("mkdir lease markers", error))?;
         Ok(Self {
             db: crate::catalog::Catalog::path(store.root()),

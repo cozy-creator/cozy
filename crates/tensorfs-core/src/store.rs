@@ -13,7 +13,7 @@
 //! `contains` is a PRESENCE HINT and nothing more. Trusting bytes requires a durable
 //! verification record bound to object id, length, file identity (dev, ino), size and
 //! change token (mtime). Any mismatch invalidates the record and
-//! forces a rehash; a rehash that disagrees quarantines.
+//! forces a rehash; a rehash that disagrees removes the corrupt bytes.
 
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
@@ -208,7 +208,7 @@ impl Seek for VerifiedFile {
 pub enum Verdict {
     Verified { rehashed: bool },
     Invalidated { why: String },
-    Quarantined { to: PathBuf, why: String },
+    CorruptRemoved { why: String },
 }
 
 #[derive(Debug, Default, Clone)]
@@ -216,20 +216,13 @@ pub struct Scrub {
     pub scanned: usize,
     pub sampled: usize,
     pub rehashed: usize,
-    pub quarantined: usize,
+    pub removed: usize,
     pub bytes_hashed: u64,
 }
 
 impl Store {
     pub fn init(root: &Path) -> Result<Store> {
-        for d in [
-            "repos",
-            "manifests",
-            "blobs",
-            "checkouts",
-            ".tensorfs/tmp",
-            ".tensorfs/quarantine",
-        ] {
+        for d in ["repos", "manifests", "blobs", "checkouts", "tmp"] {
             fs::create_dir_all(root.join(d)).map_err(|e| io(format!("mkdir {d}"), e))?;
         }
         crate::catalog::Catalog::initialize(root)?;
@@ -253,6 +246,7 @@ impl Store {
                 ),
             );
         }
+        fs::create_dir_all(root.join("tmp")).map_err(|error| io("mkdir tmp", error))?;
         Ok(Store {
             root: root.to_path_buf(),
         })
@@ -542,7 +536,7 @@ impl Store {
     ) -> Result<Put> {
         let catalog = crate::catalog::Catalog::open(&self.root)?;
         let _writer = crate::catalog::WriterGuard::acquire(&self.root)?;
-        let tmp = self.root.join(".tensorfs/tmp").join(format!(
+        let tmp = self.root.join("tmp").join(format!(
             "put-{}-{}",
             std::process::id(),
             now_nanos_unique()
@@ -784,7 +778,7 @@ impl Store {
     }
 
     /// A verified handle: trusted from a valid record, otherwise rehashed. Bytes that
-    /// disagree with their id are quarantined, never returned.
+    /// disagree with their id are removed, never returned.
     ///
     /// THE FILE THAT WAS VERIFIED IS THE FILE THAT IS READ. v1 verified a PATHNAME and then
     /// re-opened that pathname to read it — two resolutions of one name, with a window
@@ -803,9 +797,9 @@ impl Store {
         let (verdict, file) = self.verify_pinned(hex, false)?;
         let rehashed = !matches!(verdict, Verdict::Verified { rehashed: false });
         match (verdict, file) {
-            (Verdict::Quarantined { to, why }, _) => refuse(
+            (Verdict::CorruptRemoved { why }, _) => refuse(
                 Code::OBJECT_CORRUPT,
-                format!("sha256:{hex} quarantined to {}: {why}", to.display()),
+                format!("sha256:{hex} was corrupt and removed: {why}"),
             ),
             (_, Some(mut f)) => {
                 let len = f.metadata().map_err(|e| io("stat object", e))?.len();
@@ -866,7 +860,7 @@ impl Store {
         }
     }
 
-    // ------------------------------------------------------------ verify / quarantine
+    // ------------------------------------------------------------ verify / corrupt removal
 
     /// A valid verification record IS the answer; a rehash happens exactly when the record
     /// is missing or any bound fact moved. That rehash is CORRECTNESS, not paranoia, and it
@@ -891,7 +885,7 @@ impl Store {
     ///
     /// Every fact this consults comes from the open fd — `fstat` for the record binding,
     /// the fd itself for the rehash — so the pathname is resolved exactly once. The
-    /// returned `File` is the object those facts are about; `None` only on quarantine,
+    /// returned `File` is the object those facts are about; `None` only after corrupt removal,
     /// where there is nothing to hand out.
     fn verify_pinned(&self, hex: &str, force: bool) -> Result<(Verdict, Option<File>)> {
         let mut f = self.open_nofollow(hex)?;
@@ -906,12 +900,11 @@ impl Store {
         let got = hash_fd(&mut f)?;
         if got != hex {
             let why = disagreement.unwrap_or_else(|| "scrub rehash".to_string());
-            // Take the NAME: whatever is at the path now must stop satisfying reads. The
+            // Remove the NAME: whatever is at the path now must stop satisfying reads. The
             // descriptor is dropped with `f` — corrupt bytes are never handed back.
-            let to = self.quarantine(hex)?;
+            self.remove_corrupt_blob(hex)?;
             return Ok((
-                Verdict::Quarantined {
-                    to,
+                Verdict::CorruptRemoved {
                     why: format!("{why}; rehash gave sha256:{got}"),
                 },
                 None,
@@ -932,49 +925,33 @@ impl Store {
         hash_fd(&mut self.open_nofollow(hex)?)
     }
 
-    /// Take the NAME first: rename out of `blobs/` so exactly one remover wins and the
-    /// bad bytes can never satisfy another read.
-    pub fn quarantine(&self, hex: &str) -> Result<PathBuf> {
-        let dir = self.root.join(".tensorfs/quarantine");
-        fs::create_dir_all(&dir).map_err(|e| io("mkdir quarantine", e))?;
-        let mut to = dir.join(hex);
-        let mut n = 1;
-        while to.exists() {
-            to = dir.join(format!("{hex}.{n}"));
-            n += 1;
-        }
-        match fs::rename(self.object_path(hex), &to) {
+    /// Remove the corrupt authoritative name. A concurrent remover that got there first has
+    /// already established the same safe state.
+    pub fn remove_corrupt_blob(&self, hex: &str) -> Result<()> {
+        let path = self.object_path(hex);
+        match fs::remove_file(&path) {
             Ok(()) => {}
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                // RACING QUARANTINERS: the rename loser finds the name already taken.
-                // What quarantine promises — nothing at this id satisfies another read —
-                // is already true, so losing the race is the promise kept, not IO_FAILED;
-                // `open_verified` then reports the honest OBJECT_CORRUPT.
                 self.drop_record(hex);
-                let winner = dir.join(hex);
-                return Ok(if winner.exists() { winner } else { to });
+                return Ok(());
             }
-            Err(e) => return Err(io("quarantine rename", e)),
+            Err(e) => return Err(io("remove corrupt blob", e)),
         }
         self.drop_record(hex);
-        Ok(to)
+        fsync_dir(path.parent().unwrap())?;
+        Ok(())
     }
 
-    pub fn quarantine_manifest(&self, hex: &str) -> Result<PathBuf> {
+    pub fn remove_corrupt_manifest(&self, hex: &str) -> Result<()> {
         crate::ids::hex64("manifest", hex)?;
         let _writer = crate::catalog::WriterGuard::acquire(&self.root)?;
-        let directory = self.root.join(".tensorfs/quarantine/manifests");
-        fs::create_dir_all(&directory).map_err(|error| io("mkdir manifest quarantine", error))?;
-        let mut destination = directory.join(hex);
-        let mut suffix = 1u64;
-        while destination.exists() {
-            destination = directory.join(format!("{hex}.{suffix}"));
-            suffix += 1;
+        let path = self.manifest_path(hex);
+        match fs::remove_file(&path) {
+            Ok(()) => fsync_dir(path.parent().unwrap())?,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(io("remove corrupt manifest", error)),
         }
-        fs::rename(self.manifest_path(hex), &destination)
-            .map_err(|error| io("quarantine manifest", error))?;
-        fsync_dir(&directory)?;
-        Ok(destination)
+        Ok(())
     }
 
     // ------------------------------------------------------------ scrub / reap
@@ -1025,10 +1002,10 @@ impl Store {
                     s.rehashed += 1;
                     s.bytes_hashed += size;
                 }
-                Verdict::Quarantined { .. } => {
+                Verdict::CorruptRemoved { .. } => {
                     s.rehashed += 1;
                     s.bytes_hashed += size;
-                    s.quarantined += 1;
+                    s.removed += 1;
                 }
             }
         }
@@ -1039,10 +1016,14 @@ impl Store {
     /// nothing references it, so removing an old one can never lose an object.
     pub fn reap(&self, max_age_secs: u64) -> Result<(usize, usize)> {
         let (mut gone, mut kept) = (0, 0);
-        for p in read_dir(&self.root.join(".tensorfs/tmp"))? {
-            let age = fs::metadata(&p)
+        for p in read_dir(&self.root.join("tmp"))? {
+            let metadata = match fs::metadata(&p) {
+                Ok(metadata) if metadata.is_file() => metadata,
+                _ => continue,
+            };
+            let age = metadata
+                .modified()
                 .ok()
-                .and_then(|m| m.modified().ok())
                 .and_then(|t| SystemTime::now().duration_since(t).ok())
                 .map(|d| d.as_secs())
                 .unwrap_or(0);

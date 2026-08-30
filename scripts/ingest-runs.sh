@@ -473,7 +473,7 @@ banner "REAL 2 — bank the reviewed registry, then plan (headers only)"
   --source text_encoder_2="$SDXL/text_encoder_2/model.fp16.safetensors" \
   --source-name stabilityai/stable-diffusion-xl-base-1.0 | tail -1
 
-banner "REAL 3 — the isolated run: carrier bytes -> canonical manifest under quarantine"
+banner "REAL 3 — the isolated run: carrier bytes -> canonical manifest under a temporary candidate"
 /usr/bin/time -f "  wall %e s   peak RSS %M KiB" \
 "$TFS" ingest run "$STORE" unet=plain/1,vae=plain/1,text_encoder=plain/1,text_encoder_2=plain/1 \
   --registry "$REG" --session sdxl \

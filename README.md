@@ -8,6 +8,7 @@ manifests/<aa>/<bb>/<sha256>.json
 blobs/<aa>/<bb>/<sha256>
 tensorfs.sqlite                    # local rebuildable projection
 checkouts/<manifest-sha256>/...    # optional disposable local view
+tmp/                               # all transient local state; delete when stopped
 ```
 
 Repository files are authoritative mutable release indexes. Manifests are immutable virtual file
@@ -55,11 +56,13 @@ tfs get <root> <sha256>
 tfs contains <root> <sha256>
 tfs verify <root> <sha256>
 tfs scrub <root>
+tfs reap <root>
 ```
 
 Blob admission hashes while streaming, installs with no-clobber semantics, and records its
 rebuildable verification observation in SQLite. Manifests use the same digest/length identity but
-live under their typed namespace.
+live under their typed namespace. A blob or Manifest that fails an exact rehash is removed from its
+authoritative path immediately; TensorFS retains no forensic copy.
 
 ## Repository publication
 
@@ -129,7 +132,9 @@ of everything else. Inventory and hold JSONL rows contain only `{key,length}` an
 metadata, missing referenced byte, length mismatch, incomplete/out-of-order inventory, or failed
 fence makes the pass delete nothing.
 
-Local writers retain advisory-locked marker files, so database rebuild refuses while a writer is
+All temporary admission files, ingest candidates, writer markers, and read-lease markers live under
+`tmp/`. The whole directory is disposable when no TensorFS process is running. Local writers retain
+advisory-locked marker files there, so database rebuild refuses while a writer is
 alive and reaps only markers whose lock the kernel releases. Open operations hold exact keys.
 Seven days without accepted object/byte progress only makes an operation eligible for an explicit
 abandonment after its writer is gone and its grants are revoked; time never releases holds itself.

@@ -45,7 +45,7 @@ work_copy() { # hardlinked blobs (records stay valid: same dev/ino), metadata co
   mkdir -p "$WORK/bench"
   cp -al "$BENCH/blobs" "$WORK/bench/blobs"
   cp -a "$BENCH/manifests" "$BENCH/repos" "$BENCH/tensorfs.sqlite" "$WORK/bench/"
-  mkdir -p "$WORK/bench/.tensorfs/tmp" "$WORK/bench/.tensorfs/quarantine"
+  mkdir -p "$WORK/bench/tmp"
 }
 
 # ---------------------------------------------------------------- a fresh subject
