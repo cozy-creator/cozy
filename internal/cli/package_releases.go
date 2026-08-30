@@ -238,11 +238,8 @@ func uploadPackageFiles(ctx context.Context, pack *packagepublish.Package, wheel
 		go func() {
 			defer group.Done()
 			for file := range jobs {
-				uploaded, bytes, problem := transfer.UploadPresigned(ctx, file.subject, file.path,
+				bytes, problem := transfer.UploadPresigned(ctx, file.subject, file.path,
 					file.upload.URL, file.upload.RequiredHeaders)
-				if !uploaded {
-					bytes = 0
-				}
 				results <- outcome{moved: bytes, err: problem}
 			}
 		}()

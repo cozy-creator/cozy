@@ -511,7 +511,7 @@ func (p *Publish) uploadOne(ctx context.Context, publicationID string, index int
 // sent verbatim: they are signed into the URL, so stripping one is 403 and a wrong
 // body is 400 — neither is a branch a client may take.
 func put(ctx context.Context, g hub.Grant, path string) (bool, *exit.Error) {
-	status, _, body, e := send(ctx, http.MethodPut, g.URL, opener(path, 0, g.Length), g.Length, g.Headers)
+	status, _, body, _, e := send(ctx, http.MethodPut, g.URL, opener(path, 0, g.Length), g.Length, g.Headers)
 	if e != nil {
 		return false, e
 	}
@@ -537,10 +537,11 @@ const attempts = 3
 
 // send is the one storage-edge write in this binary. It talks to object storage,
 // never to the hub: the URL is presigned and carries no credential of ours.
-func send(ctx context.Context, method, url string, open func() (io.ReadCloser, error), length int64, headers map[string]string) (int, http.Header, []byte, *exit.Error) {
+func send(ctx context.Context, method, url string, open func() (io.ReadCloser, error), length int64, headers map[string]string) (int, http.Header, []byte, int64, *exit.Error) {
 	var status int
 	var header http.Header
 	var raw []byte
+	var moved int64
 	exhausted, err := retryStorage(func(int) (bool, error) {
 		status, header, raw = 0, nil, nil
 		body, err := open()
@@ -549,15 +550,21 @@ func send(ctx context.Context, method, url string, open func() (io.ReadCloser, e
 		}
 		rctx, cancel := ctx, func() {}
 		var counted io.ReadCloser = http.NoBody
+		var meter *mover
 		if length == 0 {
 			body.Close()
 		} else {
 			// The body is COUNTED and the context lives while the count moves: an upload
 			// that is slow is not an upload that has stopped.
-			m := &mover{}
-			rctx, cancel = m.context(ctx)
-			counted = m.readCloser(body)
+			meter = &mover{}
+			rctx, cancel = meter.context(ctx)
+			counted = meter.readCloser(body)
 		}
+		defer func() {
+			if meter != nil {
+				moved += meter.moved.Load()
+			}
+		}()
 		req, err := http.NewRequestWithContext(rctx, method, url, counted)
 		if err != nil {
 			counted.Close()
@@ -587,35 +594,40 @@ func send(ctx context.Context, method, url string, open func() (io.ReadCloser, e
 		return false, nil
 	})
 	if err == nil || (exhausted && status != 0) {
-		return status, header, raw, nil
+		return status, header, raw, moved, nil
 	}
 	if !exhausted {
-		return 0, nil, nil, err.(*exit.Error)
+		return 0, nil, nil, moved, err.(*exit.Error)
 	}
-	return 0, nil, nil, exit.Unavailablef("object storage is unreachable after %d attempts: %s", attempts, err).
+	return 0, nil, nil, moved, exit.Unavailablef("object storage is unreachable after %d attempts: %s", attempts, err).
 		WithRemedy("re-run to resume from Tensorhub's durable transfer rows")
 }
 
 // UploadPresigned sends one local file to a release-scoped storage grant. Tensorhub
-// reads the stored bytes and computes their identity during finalize.
-func UploadPresigned(ctx context.Context, subject, path, url string, headers map[string]string) (bool, int64, *exit.Error) {
+// reads the stored bytes and computes their identity during finalize. The byte
+// count is the file length once any PUT attempt read those bytes, capped so
+// retries do not count one immutable file twice. A successful PUT whose response
+// was lost must not become 0 B when its retry correctly answers that the object
+// already exists.
+func UploadPresigned(ctx context.Context, subject, path, url string, headers map[string]string) (int64, *exit.Error) {
 	info, err := os.Stat(path)
 	if err != nil || !info.Mode().IsRegular() {
-		return false, 0, exit.Named(exit.Conflict, "upload.local_file_unreadable",
+		return 0, exit.Named(exit.Conflict, "upload.local_file_unreadable",
 			"%s is no longer a regular file", path)
 	}
 	length := info.Size()
-	status, _, body, problem := send(ctx, http.MethodPut, url, opener(path, 0, length), length, headers)
+	status, _, body, moved, problem := send(ctx, http.MethodPut, url, opener(path, 0, length), length, headers)
 	if problem != nil {
-		return false, 0, problem
+		return min(moved, length), problem
 	}
+	moved = min(moved, length) // retries do not make one immutable file larger
 	switch status {
 	case http.StatusOK, http.StatusCreated, http.StatusNoContent:
-		return true, length, nil
+		return moved, nil
 	case http.StatusPreconditionFailed:
-		return false, length, nil
+		return moved, nil
 	default:
-		return false, 0, storageRefusal(status, subject, body)
+		return moved, storageRefusal(status, subject, body)
 	}
 }
 
