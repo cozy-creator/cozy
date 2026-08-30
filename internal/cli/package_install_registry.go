@@ -181,12 +181,15 @@ func downloadPackageInstallPlan(ctx context.Context, cli *Context, scratch strin
 	}
 	published := &install.PublishedSource{
 		Package: ref.String(), Release: release, SourceDigest: plan.PackageRelease.Digest,
+		Artifacts: map[string]string{},
 		Selection: install.Selection{
-			Profile:           plan.Profile,
-			PlacementSet:      install.ExactDocument{Bytes: plan.PlacementSet.CanonicalBytes, Digest: plan.PlacementSet.Digest, Length: plan.PlacementSet.Length},
-			PackageRelease:    install.ExactDocument{Bytes: plan.PackageRelease.CanonicalBytes, Digest: plan.PackageRelease.Digest, Length: plan.PackageRelease.Length},
-			PackageDescriptor: install.ExactDocument{Bytes: plan.PackageDescriptor.CanonicalBytes, Digest: plan.PackageDescriptor.Digest, Length: plan.PackageDescriptor.Length},
-			Qualification:     install.ExactDocument{Bytes: plan.Qualification.CanonicalBytes, Digest: plan.Qualification.Digest, Length: plan.Qualification.Length},
+			Profile:            plan.Profile,
+			PlacementSet:       install.ExactDocument{Bytes: plan.PlacementSet.CanonicalBytes, Digest: plan.PlacementSet.Digest, Length: plan.PlacementSet.Length},
+			PackageRelease:     install.ExactDocument{Bytes: plan.PackageRelease.CanonicalBytes, Digest: plan.PackageRelease.Digest, Length: plan.PackageRelease.Length},
+			PackageDescriptor:  install.ExactDocument{Bytes: plan.PackageDescriptor.CanonicalBytes, Digest: plan.PackageDescriptor.Digest, Length: plan.PackageDescriptor.Length},
+			Qualification:      install.ExactDocument{Bytes: plan.Qualification.CanonicalBytes, Digest: plan.Qualification.Digest, Length: plan.Qualification.Length},
+			EnvironmentReceipt: install.ExactDocument{Bytes: plan.EnvironmentReceipt.CanonicalBytes, Digest: plan.EnvironmentReceipt.Digest, Length: plan.EnvironmentReceipt.Length},
+			WheelhouseManifest: install.ExactDocument{Bytes: plan.WheelhouseManifest.CanonicalBytes, Digest: plan.WheelhouseManifest.Digest, Length: plan.WheelhouseManifest.Length},
 		},
 	}
 	seen := map[string]bool{}
@@ -257,6 +260,9 @@ func downloadPackageInstallPlan(ctx context.Context, cli *Context, scratch strin
 	}
 	if firstProblem != nil {
 		return nil, firstProblem
+	}
+	for _, item := range jobs {
+		published.Artifacts[item.download.Digest] = item.dst
 	}
 	return published, nil
 }

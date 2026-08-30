@@ -39,12 +39,14 @@ type PackageInstallDownload struct {
 }
 
 type PackageInstallPlan struct {
-	Profile           string                   `json:"profile"`
-	PlacementSet      ExactDocument            `json:"placement_set"`
-	PackageRelease    ExactDocument            `json:"package_release"`
-	PackageDescriptor ExactDocument            `json:"package_descriptor"`
-	Qualification     ExactDocument            `json:"qualification"`
-	Downloads         []PackageInstallDownload `json:"downloads"`
+	Profile            string                   `json:"profile"`
+	PlacementSet       ExactDocument            `json:"placement_set"`
+	PackageRelease     ExactDocument            `json:"package_release"`
+	PackageDescriptor  ExactDocument            `json:"package_descriptor"`
+	Qualification      ExactDocument            `json:"qualification"`
+	EnvironmentReceipt ExactDocument            `json:"environment_receipt"`
+	WheelhouseManifest ExactDocument            `json:"wheelhouse_manifest"`
+	Downloads          []PackageInstallDownload `json:"downloads"`
 }
 
 // PackageInstallTarget carries only measured local compatibility facts. Tensorhub

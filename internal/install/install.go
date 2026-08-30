@@ -11,6 +11,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -37,6 +38,7 @@ type Request struct {
 }
 
 type PublishedSource struct {
+	Artifacts    map[string]string
 	Bytes        int64
 	Files        int
 	Package      string
@@ -55,11 +57,13 @@ type ExactDocument struct {
 }
 
 type Selection struct {
-	Profile           string
-	PlacementSet      ExactDocument
-	PackageRelease    ExactDocument
-	PackageDescriptor ExactDocument
-	Qualification     ExactDocument
+	Profile            string
+	PlacementSet       ExactDocument
+	PackageRelease     ExactDocument
+	PackageDescriptor  ExactDocument
+	Qualification      ExactDocument
+	EnvironmentReceipt ExactDocument
+	WheelhouseManifest ExactDocument
 }
 
 func persistSelection(genDir string, gen *records.PackageInstall, selection Selection) *exit.Error {
@@ -76,6 +80,8 @@ func persistSelection(genDir string, gen *records.PackageInstall, selection Sele
 		{"package_release", "cozy.package.release/1", selection.PackageRelease},
 		{"package_descriptor", "cozy.package.descriptor/1", selection.PackageDescriptor},
 		{"qualification", "cozy.runtime.Qualification/1", selection.Qualification},
+		{"environment_receipt", "cozy.runtime.EnvironmentReceipt/1", selection.EnvironmentReceipt},
+		{"wheelhouse_manifest", "WheelhouseManifest/3", selection.WheelhouseManifest},
 	}
 	cache := filepath.Join(genDir, "artifact-cache")
 	if err := os.MkdirAll(cache, 0o700); err != nil {
@@ -274,6 +280,11 @@ func Run(l home.Layout, st *records.Store, req Request) (*Result, *exit.Error) {
 	if err != nil {
 		return guard(err)
 	}
+	if req.Published != nil {
+		if e := persistPublishedArtifacts(genDir, req.Published.Artifacts); e != nil {
+			return guard(e)
+		}
+	}
 	gen.Python, gen.UV, gen.LockDigest = env.Python, env.UV, env.LockDigest
 	gen.Platform, gen.Extra, gen.LinkMode = env.Platform, env.Extra, env.LinkMode
 	gen.Packages, gen.Closure = env.Packages, env.Closure
@@ -317,6 +328,36 @@ func Run(l home.Layout, st *records.Store, req Request) (*Result, *exit.Error) {
 	res.Gen, res.Superseded = gen, superseded
 	mark("activate")
 	return res, nil
+}
+
+func persistPublishedArtifacts(genDir string, artifacts map[string]string) *exit.Error {
+	cache := filepath.Join(genDir, "artifact-cache")
+	for digest, source := range artifacts {
+		if _, err := canonical.Raw(digest); err != nil {
+			return exit.Internalf("downloaded package artifact has invalid digest %q", digest)
+		}
+		target := filepath.Join(cache, strings.TrimPrefix(digest, "sha256:"))
+		if err := os.Link(source, target); err == nil {
+			continue
+		}
+		input, err := os.Open(source)
+		if err != nil {
+			return exit.Internalf("cannot reopen downloaded package artifact: %s", err)
+		}
+		output, err := os.OpenFile(target, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
+		if err == nil {
+			_, err = io.Copy(output, input)
+		}
+		closeInput, closeOutput := input.Close(), error(nil)
+		if output != nil {
+			closeOutput = output.Close()
+		}
+		if err != nil || closeInput != nil || closeOutput != nil {
+			_ = os.Remove(target)
+			return exit.Internalf("cannot retain downloaded package artifact")
+		}
+	}
+	return nil
 }
 
 // deriveDescriptor runs the generation's own Runtime over its source. Runtime emits the
