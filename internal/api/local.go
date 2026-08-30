@@ -12,10 +12,10 @@ func (s *Server) refreshPackage(pkg string) (installID string, editable, changed
 		return "", false, false, exit.Unavailablef("this Cozy daemon resolves no packages")
 	}
 	installID, editable, changed, problem = s.packages.RefreshEditable(pkg)
-	if problem != nil || !changed {
+	if problem != nil || !editable {
 		return
 	}
-	_, problem = s.orchestrator.UnloadIdleLocalPackage(pkg)
+	_, problem = s.orchestrator.UnloadIdleLocalPackage(pkg, installID)
 	return
 }
 

@@ -773,6 +773,9 @@ func (c *Orchestrator) maxOutputBytes() uint64 {
 func (c *Orchestrator) invocationIdentity(w *worker) (environment, config string, e *exit.Error) {
 	environment = w.spec.Placement.EnvironmentDigest
 	if environment == "" {
+		if w.spec.Connection == nil && w.spec.Placement.SourceDigest != "" {
+			return "", c.opt.ConfigDigest, nil
+		}
 		return "", "", exit.Named(exit.Structural, "placement_identity_missing",
 			"worker %s carries no selected environment digest", w.instanceID)
 	}

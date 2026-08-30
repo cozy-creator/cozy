@@ -24,6 +24,7 @@ import (
 )
 
 const weightlessRef = "cozy/cozy-weightless-package"
+const editableRuntimeFixtureSHA = "4347d064040f2cc48e939ba204ebdfd48e79f991"
 
 func TestLegacyAttemptColumnsMigrate(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "records.db")
@@ -806,8 +807,13 @@ func TestDaemonStartupDiagnostic(t *testing.T) {
 const maxDaemonDiagnosticOutput = 18 << 10
 
 func TestDevelopmentInstallRefreshesBeforeInvocation(t *testing.T) {
-	root := t.TempDir()
-	t.Cleanup(func() { _, _ = runCozy(t, root, "down", "--all") })
+	root := filepath.Join(os.TempDir(), "cozy-product-test", "editable-refresh")
+	must(t, os.RemoveAll(root))
+	must(t, os.MkdirAll(root, 0o755))
+	t.Cleanup(func() {
+		_, _ = runCozy(t, root, "down", "--all")
+		_ = os.RemoveAll(root)
+	})
 
 	project := weightlessProject(t)
 	code, out := runCozy(t, root, "package", "install", project)
@@ -833,7 +839,8 @@ func TestDevelopmentInstallRefreshesBeforeInvocation(t *testing.T) {
 	code, out = runCozy(t, root, "run", weightlessRef+"/tile",
 		"size=32", "seed=7", "--json")
 	if code != 0 || !strings.Contains(out, `"revision":"first"`) {
-		t.Fatalf("first editable invocation did not run source [exit %d]\n%s", code, out)
+		t.Fatalf("first editable invocation did not run source [exit %d]\n%s\n%s",
+			code, out, productWorkerLogs(root))
 	}
 	first := activePackageInstall(t, root)
 
@@ -890,6 +897,16 @@ func TestDevelopmentInstallRefreshesBeforeInvocation(t *testing.T) {
 	}
 }
 
+func productWorkerLogs(root string) string {
+	paths, _ := filepath.Glob(filepath.Join(root, "workers", "*", "worker.log"))
+	var out strings.Builder
+	for _, path := range paths {
+		data, _ := os.ReadFile(path)
+		fmt.Fprintf(&out, "worker log %s:\n%s\n", filepath.Base(filepath.Dir(path)), data)
+	}
+	return out.String()
+}
+
 func activePackageInstall(t *testing.T, root string) records.PackageInstall {
 	t.Helper()
 	store, problem := records.Open(filepath.Join(root, "records.db"))
@@ -930,7 +947,8 @@ func weightlessProject(t *testing.T) string {
 	dir := t.TempDir()
 	project := filepath.Join(dir, "source")
 	build := exec.Command("/usr/bin/nice", "-n", "19", "python3",
-		"tests/product/testdata/build-weightless.py", "--out", dir, "--source-out", project)
+		"tests/product/testdata/build-weightless.py", "--out", dir, "--source-out", project,
+		"--runtime-sha", editableRuntimeFixtureSHA)
 	build.Dir = "../.."
 	build.Env = childEnv(t, repo, "RUNTIME_REPO="+repo)
 	if out, err := build.CombinedOutput(); err != nil {

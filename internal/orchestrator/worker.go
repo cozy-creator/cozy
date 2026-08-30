@@ -149,7 +149,7 @@ func PlacementFromExact(pkg, installID, digest string, data []byte,
 		environmentIdentity := map[string]canonical.Value{
 			"format":              "cozy.worker.v1.Environment/1",
 			"wheelhouse_manifest": environment["wheelhouse_manifest"],
-			"wheels":              environment["wheels"],
+			"wheels":              arrayOrEmpty(environment["wheels"]),
 		}
 		if !digestMatches(environmentIdentity, placement.EnvironmentDigest) {
 			return DesiredPlacement{}, exit.Named(exit.Conflict, "environment_identity_mismatch",
@@ -158,7 +158,9 @@ func PlacementFromExact(pkg, installID, digest string, data []byte,
 	}
 	for _, entrypoint := range row.List("entrypoints") {
 		name, binding := entrypoint.Str("name"), entrypoint.Str("entrypoint_binding_digest")
-		identity := map[string]canonical.Value{"name": entrypoint["name"], "slots": entrypoint["slots"]}
+		identity := map[string]canonical.Value{
+			"name": entrypoint["name"], "slots": arrayOrEmpty(entrypoint["slots"]),
+		}
 		if name == "" || binding == "" || !digestMatches(identity, binding) {
 			return DesiredPlacement{}, exit.Named(exit.Conflict, "entrypoint_binding_identity_mismatch",
 				"entrypoint %q has an invalid binding digest", name)
@@ -168,13 +170,20 @@ func PlacementFromExact(pkg, installID, digest string, data []byte,
 		})
 	}
 	bindings := map[string]canonical.Value{
-		"entrypoints": row["entrypoints"], "models": row["models"],
+		"entrypoints": arrayOrEmpty(row["entrypoints"]), "models": arrayOrEmpty(row["models"]),
 	}
 	if !digestMatches(bindings, row.Str("bindings_digest")) {
 		return DesiredPlacement{}, exit.Named(exit.Conflict, "bindings_identity_mismatch",
 			"bindings_digest does not hash the exact selected entrypoints and models")
 	}
 	return placement, nil
+}
+
+func arrayOrEmpty(value canonical.Value) canonical.Value {
+	if value == nil {
+		return []canonical.Value{}
+	}
+	return value
 }
 
 func digestMatches(value canonical.Value, spelled string) bool {
@@ -1475,16 +1484,16 @@ func (c *Orchestrator) stopClaimedWorker(w *worker, grace time.Duration) bool {
 // and any active request, outstanding offer, reservation, or unacked terminal keeps a
 // worker alive. Process exit is the reliable release of its GPU-resident model.
 func (c *Orchestrator) UnloadIdleLocalWorkers() ([]WorkerFacts, *exit.Error) {
-	return c.unloadIdleLocalWorkers("")
+	return c.unloadIdleLocalWorkers("", "")
 }
 
 // UnloadIdleLocalPackage stops only stale idle workers for one refreshed package.
-// Other warm packages stay resident; active work still wins the ordinary idle fence.
-func (c *Orchestrator) UnloadIdleLocalPackage(pkg string) ([]WorkerFacts, *exit.Error) {
-	return c.unloadIdleLocalWorkers(pkg)
+// The current install stays warm; other warm packages and active work also stay alive.
+func (c *Orchestrator) UnloadIdleLocalPackage(pkg, keepInstallID string) ([]WorkerFacts, *exit.Error) {
+	return c.unloadIdleLocalWorkers(pkg, keepInstallID)
 }
 
-func (c *Orchestrator) unloadIdleLocalWorkers(pkg string) ([]WorkerFacts, *exit.Error) {
+func (c *Orchestrator) unloadIdleLocalWorkers(pkg, keepInstallID string) ([]WorkerFacts, *exit.Error) {
 	active, e := c.opt.Store.ActiveRequests()
 	if e != nil {
 		return nil, e
@@ -1494,7 +1503,8 @@ func (c *Orchestrator) unloadIdleLocalWorkers(pkg string) ([]WorkerFacts, *exit.
 	candidates := make([]*worker, 0, len(c.workers))
 	for _, w := range c.workers {
 		if w.spec.Connection == nil && !w.spec.IsJob() &&
-			(pkg == "" || w.spec.Placement.Package == pkg) {
+			(pkg == "" || w.spec.Placement.Package == pkg) &&
+			(keepInstallID == "" || w.spec.Placement.InstallID != keepInstallID) {
 			candidates = append(candidates, w)
 		}
 	}
