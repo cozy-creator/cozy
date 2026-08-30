@@ -1,0 +1,4 @@
+doc: encoding
+expect: ok
+id: sha256:71409d585d82c513f364ac730d2f573f0261828c4700ce653333a758d15e14bd
+note: entry zero; carries vectors

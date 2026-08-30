@@ -1,1 +1,1 @@
-{"components":{"transformer":{"blocks.0.attn.to_q.weight":{"accepts":[],"dtype":"bf16","shape":[64,128]},"blocks.0.norm.weight":{"accepts":"any","dtype":"bf16","shape":[128]}}},"contract":"sha256:08c86a9508e960ed2a8500377ec045b0a7d8e0d33719fbd3f3afdc9bb9595486","format":"cozytensors.code_topology/1"}
+{"components":{"transformer":{"blocks.0.attn.to_q.weight":{"accepts":[],"dtype":"bf16","shape":[64,128]},"blocks.0.norm.weight":{"accepts":"any","dtype":"bf16","shape":[128]}}},"contract":"sha256:08c86a9508e960ed2a8500377ec045b0a7d8e0d33719fbd3f3afdc9bb9595486"}

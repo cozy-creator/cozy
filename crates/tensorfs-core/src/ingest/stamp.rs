@@ -18,13 +18,13 @@
 //! Without it every consumer re-derives them — which is a second decision layer wearing a
 //! consumer's clothes. th-002 verifies precisely this set.
 
-use crate::canon::{as_arr, as_obj, as_str, Fields, Value};
+use crate::canon::{as_arr, as_obj, Fields, Value};
 use crate::checkpoint as ck;
 use crate::err::{refuse, Code, Result};
 use crate::header::Header;
-use crate::ids::{ascii_name, check_format, prefixed, Doc, ObjectRef};
+use crate::ids::{ascii_name, prefixed, Doc, ObjectRef, Plain};
 use crate::limits;
-use crate::manifest::SnapshotManifest;
+use crate::manifest::Manifest;
 use crate::store::Store;
 
 use super::transaction::Outcome;
@@ -40,7 +40,7 @@ pub struct Stamp {
     pub subject: ObjectRef,
     pub profile: ObjectRef,
     pub header: ObjectRef,
-    pub snapshot: ObjectRef,
+    pub manifest: ObjectRef,
     /// COMPUTED from the header that was actually written — never copied from the profile.
     pub topology_digest: String,
     pub converter_build: String,
@@ -63,17 +63,11 @@ pub fn candidate_set_digest(ids: &[String]) -> String {
     )))
 }
 
-impl Doc for Stamp {
-    const FORMAT: &'static str = "tensorfs.stamp/1";
+impl Plain for Stamp {
     const MAX_BYTES: usize = limits::SPEC_MAX_BYTES;
 
     fn from_value(v: &Value) -> Result<Self> {
         let mut f = Fields::new("Stamp", v)?;
-        check_format(
-            "Stamp",
-            as_str("Stamp", "format", f.req("format")?)?,
-            Self::FORMAT,
-        )?;
         let mut accounting = Vec::new();
         for (k, av) in as_obj("Stamp", "accounting", f.req("accounting")?)? {
             ascii_name("Stamp.accounting", k, limits::MAX_NAME_BYTES)?;
@@ -98,7 +92,7 @@ impl Doc for Stamp {
         let header = ObjectRef::from_value("Stamp.header", f.req("header")?)?;
         let isolation_tier = f.req_uint("isolation_tier")?;
         let profile = ObjectRef::from_value("Stamp.profile", f.req("profile")?)?;
-        let snapshot = ObjectRef::from_value("Stamp.snapshot", f.req("snapshot")?)?;
+        let manifest = ObjectRef::from_value("Stamp.manifest", f.req("manifest")?)?;
         let mut sources = Vec::new();
         for s in as_arr("Stamp", "sources", f.req("sources")?)? {
             let mut sf = Fields::new("Stamp.source", s)?;
@@ -123,7 +117,7 @@ impl Doc for Stamp {
             subject,
             profile,
             header,
-            snapshot,
+            manifest,
             topology_digest,
             converter_build,
             converter_recipe,
@@ -149,12 +143,11 @@ impl Doc for Stamp {
             ("candidate_set", Value::str(self.candidate_set.clone())),
             ("converter_build", Value::str(self.converter_build.clone())),
             ("converter_recipe", self.converter_recipe.to_value()),
-            ("format", Value::str(Self::FORMAT)),
             ("golden", Value::str(self.golden.clone())),
             ("header", self.header.to_value()),
             ("isolation_tier", Value::uint(self.isolation_tier)),
             ("profile", self.profile.to_value()),
-            ("snapshot", self.snapshot.to_value()),
+            ("manifest", self.manifest.to_value()),
             (
                 "sources",
                 Value::arr(
@@ -268,12 +261,12 @@ pub fn stamp(store: &Store, p: Presented) -> Result<Stamped> {
     //    role set is what the tensors carry (header.validate proved the second half).
     let allowed: Vec<String> = p.profile.allowed_encodings.iter().map(|e| e.id()).collect();
     for r in &header.encodings {
-        if !allowed.contains(&r.id()) {
+        if !allowed.contains(&r.object_id()) {
             return refuse(
                 Code::UNREGISTERED_ENCODING,
                 format!(
                     "{}: cited by the candidate header but outside the profile's allowed set",
-                    r.id()
+                    r.object_id()
                 ),
             );
         }
@@ -281,15 +274,15 @@ pub fn stamp(store: &Store, p: Presented) -> Result<Stamped> {
 
     // 7. the candidate object set, EVERY AND ONLY. The walk is the authority; the subject's
     //    list is the claim.
-    let snapshot: SnapshotManifest = ck::load_manifest(store, &p.outcome.snapshot_ref)?;
-    if snapshot != p.outcome.snapshot {
+    let manifest: Manifest = ck::load_manifest(store, &p.outcome.manifest_ref)?;
+    if manifest != p.outcome.manifest {
         return Err(disagree(
-            "snapshot",
-            &snapshot.object_ref().id(),
-            &p.outcome.snapshot.object_ref().id(),
+            "manifest",
+            &manifest.object_ref().id(),
+            &p.outcome.manifest.object_ref().id(),
         ));
     }
-    let walk = ck::walk(store, &snapshot)?;
+    let walk = ck::walk(store, &manifest)?;
     let reached: Vec<String> = walk.distinct().iter().map(|o| o.id()).collect();
     let claimed: Vec<String> = p.subject.candidates.iter().map(|c| c.id()).collect();
     let reached_set = candidate_set_digest(&reached);
@@ -300,7 +293,7 @@ pub fn stamp(store: &Store, p: Presented) -> Result<Stamped> {
         return refuse(
             Code::STAMP_MISMATCH,
             format!(
-                "candidate set disagrees: the snapshot reaches {} object(s), the subject claims \
+                "candidate set disagrees: the manifest reaches {} object(s), the subject claims \
                  {}. First reached-but-unclaimed {:?}; first claimed-but-unreached {:?}",
                 reached.len(),
                 claimed.len(),
@@ -387,7 +380,7 @@ pub fn stamp(store: &Store, p: Presented) -> Result<Stamped> {
         subject: p.subject.object_ref(),
         profile: p.profile_ref.clone(),
         header: p.outcome.header_ref.clone(),
-        snapshot: p.outcome.snapshot_ref.clone(),
+        manifest: p.outcome.manifest_ref.clone(),
         topology_digest,
         converter_build: p.profile.converter_build.clone(),
         converter_recipe: p.profile.converter_recipe.clone(),
@@ -399,7 +392,7 @@ pub fn stamp(store: &Store, p: Presented) -> Result<Stamped> {
     };
     let receipt = IngestVerificationReceipt {
         subject: stamp.subject.clone(),
-        snapshot: stamp.snapshot.clone(),
+        manifest: stamp.manifest.clone(),
         header: stamp.header.clone(),
         stamp: stamp.object_ref(),
         evidence: p.evidence,

@@ -16,4 +16,6 @@ path = "src/bin/tfs/main.rs"
 required-features = ["grade"]
 
 [dependencies]
+fs2 = "0.4"
 minicbor = { version = "2.3.0", default-features = false, features = ["alloc"] }
+rusqlite = { version = "0.32", features = ["bundled"] }

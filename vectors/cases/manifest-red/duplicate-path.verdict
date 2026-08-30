@@ -1,4 +1,0 @@
-doc: manifest
-expect: refuse
-code: PATH_ORDER
-note: one path, one entry: strict ascent IS the duplicate refusal

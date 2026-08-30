@@ -176,6 +176,153 @@ def sorted_unique(rows: list[list[Any]], key: int, where: str) -> None:
         refuse("SORT_ORDER", f"{where} must be sorted and unique")
 
 
+def _optional(value: Any, where: str, read: Any) -> list[Any]:
+    row = array(value, None, where)
+    if len(row) > 1:
+        refuse("WRONG_ARITY", f"{where} must be [] or [value]")
+    return [] if not row else [read(row[0])]
+
+
+def _dim(value: Any, where: str, *, diagnostic: bool) -> list[Any]:
+    if diagnostic:
+        if type(value) is not dict or "t" not in value:
+            refuse("WRONG_TYPE", f"{where} must be a tagged dimension object")
+        tag = value["t"]
+        shapes = {
+            "axis": ({"axis", "t"}, 0, ("axis",)),
+            "div": ({"axis", "by", "rem", "t"}, 1, ("axis", "by")),
+            "ceil_div": ({"axis", "by", "t"}, 2, ("axis", "by")),
+            "ceil_block": ({"axis", "block", "mul", "t"}, 3, ("axis", "block", "mul")),
+            "elements_div": ({"by", "rem", "t"}, 4, ("by",)),
+            "lit": ({"t", "value"}, 5, ("value",)),
+        }
+        if tag not in shapes:
+            refuse("UNKNOWN_RELATION", f"{where} has unknown dimension tag")
+        fields, code, names = shapes[tag]
+        if set(value) != fields or ("rem" in value and value["rem"] != "forbid"):
+            refuse("WRONG_FIELDS", f"{where} has wrong dimension fields")
+        return [code, *(uint(value[name], f"{where}.{name}", positive=name != "axis") for name in names)]
+    row = array(value, None, where)
+    if not row:
+        refuse("WRONG_ARITY", f"{where} is empty")
+    code = uint(row[0], f"{where}.tag")
+    arities = {0: 2, 1: 3, 2: 3, 3: 4, 4: 2, 5: 2}
+    if arities.get(code) != len(row):
+        refuse("UNKNOWN_RELATION", f"{where} has unknown tag/arity")
+    return [code, *(uint(v, f"{where}.value", positive=i > 0 or code != 0) for i, v in enumerate(row[1:]))]
+
+
+def _relation(value: Any, where: str, *, diagnostic: bool) -> list[Any]:
+    if diagnostic:
+        if type(value) is not dict or value.get("t") not in {"same", "dims"}:
+            refuse("UNKNOWN_RELATION", f"{where} has unknown relation")
+        if value["t"] == "same":
+            if set(value) != {"t"}:
+                refuse("WRONG_FIELDS", f"{where} same relation has extra fields")
+            return [0]
+        if set(value) != {"dims", "t"}:
+            refuse("WRONG_FIELDS", f"{where} dims relation has wrong fields")
+        dims = [_dim(v, f"{where}.dims[{i}]", diagnostic=True) for i, v in enumerate(array(value["dims"], None, f"{where}.dims"))]
+        if len(dims) > MAX_RANK:
+            refuse("COUNT_CAP", f"{where}.dims exceeds rank cap")
+        return [1, dims]
+    row = array(value, None, where)
+    if row == [0]:
+        return row
+    if len(row) != 2 or row[0] != 1:
+        refuse("UNKNOWN_RELATION", f"{where} has unknown tag/arity")
+    dims = [_dim(v, f"{where}.dims[{i}]", diagnostic=False) for i, v in enumerate(array(row[1], None, f"{where}.dims"))]
+    if len(dims) > MAX_RANK:
+        refuse("COUNT_CAP", f"{where}.dims exceeds rank cap")
+    return [1, dims]
+
+
+def _carrier(value: Any, where: str, *, diagnostic: bool) -> list[Any]:
+    if diagnostic:
+        if type(value) is not dict or value.get("t") not in {"same_as_logical", "set"}:
+            refuse("UNKNOWN_RELATION", f"{where} has unknown carrier")
+        if value["t"] == "same_as_logical":
+            if set(value) != {"t"}:
+                refuse("WRONG_FIELDS", f"{where} carrier has extra fields")
+            return [0]
+        if set(value) != {"dtypes", "t"}:
+            refuse("WRONG_FIELDS", f"{where} carrier has wrong fields")
+        dtypes = [dtype_code(v, f"{where}.dtypes[{i}]", diagnostic=True) for i, v in enumerate(array(value["dtypes"], None, f"{where}.dtypes"))]
+        if not dtypes or dtypes != sorted(set(dtypes)):
+            refuse("SORT_ORDER", f"{where}.dtypes must be sorted and unique")
+        return [1, dtypes]
+    row = array(value, None, where)
+    if row == [0]:
+        return row
+    if len(row) != 2 or row[0] != 1:
+        refuse("UNKNOWN_RELATION", f"{where} has unknown carrier tag/arity")
+    dtypes = [dtype_code(v, f"{where}.dtypes[{i}]", diagnostic=False) for i, v in enumerate(array(row[1], None, f"{where}.dtypes"))]
+    if not dtypes or dtypes != sorted(set(dtypes)):
+        refuse("SORT_ORDER", f"{where}.dtypes must be sorted and unique")
+    return [1, dtypes]
+
+
+def encoding_spec(value: Any, where: str, *, diagnostic: bool) -> list[Any]:
+    if diagnostic:
+        if type(value) is not dict or not {"logical_dtypes", "roles"}.issubset(value) or not set(value) <= {"logical_dtypes", "logical_rank", "roles", "doc", "vectors"}:
+            refuse("WRONG_FIELDS", f"{where} has wrong encoding fields")
+        dtypes = [dtype_code(v, f"{where}.logical_dtypes[{i}]", diagnostic=True) for i, v in enumerate(array(value["logical_dtypes"], None, f"{where}.logical_dtypes"))]
+        rank = [] if "logical_rank" not in value else [uint(value["logical_rank"], f"{where}.logical_rank", positive=True)]
+        if type(value["roles"]) is not dict:
+            refuse("WRONG_TYPE", f"{where}.roles must be an object")
+        roles = []
+        for role_name, role in value["roles"].items():
+            if type(role) is not dict or set(role) != {"carrier", "shape"}:
+                refuse("WRONG_FIELDS", f"{where}.roles.{role_name} has wrong fields")
+            roles.append([name(role_name, f"{where}.role", MAX_NAME), _carrier(role["carrier"], f"{where}.{role_name}.carrier", diagnostic=True), _relation(role["shape"], f"{where}.{role_name}.shape", diagnostic=True)])
+        doc = [] if "doc" not in value else [text(value["doc"], f"{where}.doc", 4096)]
+        if "vectors" not in value:
+            vectors = []
+        else:
+            ref = value["vectors"]
+            if type(ref) is not dict or set(ref) != {"length", "sha256"}:
+                refuse("WRONG_FIELDS", f"{where}.vectors has wrong fields")
+            vectors = [[diagnostic_digest(ref["sha256"], f"{where}.vectors.sha256"), uint(ref["length"], f"{where}.vectors.length", positive=True)]]
+    else:
+        row = array(value, 5, where)
+        dtypes = [dtype_code(v, f"{where}.logical_dtypes[{i}]", diagnostic=False) for i, v in enumerate(array(row[0], None, f"{where}.logical_dtypes"))]
+        rank = _optional(row[1], f"{where}.logical_rank", lambda v: uint(v, f"{where}.logical_rank.value", positive=True))
+        roles = []
+        for i, role in enumerate(array(row[2], None, f"{where}.roles")):
+            role = array(role, 3, f"{where}.roles[{i}]")
+            roles.append([name(role[0], f"{where}.roles[{i}].name", MAX_NAME), _carrier(role[1], f"{where}.roles[{i}].carrier", diagnostic=False), _relation(role[2], f"{where}.roles[{i}].shape", diagnostic=False)])
+        doc = _optional(row[3], f"{where}.doc", lambda v: text(v, f"{where}.doc.value", 4096))
+        vectors = _optional(row[4], f"{where}.vectors", lambda v: object_ref(v, f"{where}.vectors.value", diagnostic=False))
+    if not dtypes or dtypes != sorted(set(dtypes)) or not roles or len(roles) > MAX_PARTS:
+        refuse("SORT_ORDER", f"{where} dtypes/roles are empty, unsorted, duplicate, or over cap")
+    sorted_unique(roles, 0, f"{where}.roles")
+    return [dtypes, rank, roles, doc, vectors]
+
+
+def project_encoding(value: list[Any]) -> dict[str, Any]:
+    dim_names = ("axis", "div", "ceil_div", "ceil_block", "elements_div", "lit")
+    def dim(row: list[Any]) -> dict[str, Any]:
+        tag = row[0]
+        if tag == 0: return {"axis": row[1], "t": "axis"}
+        if tag == 1: return {"axis": row[1], "by": row[2], "rem": "forbid", "t": "div"}
+        if tag == 2: return {"axis": row[1], "by": row[2], "t": "ceil_div"}
+        if tag == 3: return {"axis": row[1], "block": row[2], "mul": row[3], "t": "ceil_block"}
+        if tag == 4: return {"by": row[1], "rem": "forbid", "t": "elements_div"}
+        return {"t": dim_names[tag], "value": row[1]}
+    def relation(row: list[Any]) -> dict[str, Any]:
+        return {"t": "same"} if row[0] == 0 else {"dims": [dim(v) for v in row[1]], "t": "dims"}
+    def carrier(row: list[Any]) -> dict[str, Any]:
+        return {"t": "same_as_logical"} if row[0] == 0 else {"dtypes": [DTYPE_NAMES[v] for v in row[1]], "t": "set"}
+    out: dict[str, Any] = {
+        "logical_dtypes": [DTYPE_NAMES[v] for v in value[0]],
+        "roles": {role[0]: {"carrier": carrier(role[1]), "shape": relation(role[2])} for role in value[2]},
+    }
+    if value[1]: out["logical_rank"] = value[1][0]
+    if value[3]: out["doc"] = value[3][0]
+    if value[4]: out["vectors"] = {"length": value[4][0][1], "sha256": "sha256:" + value[4][0][0].hex()}
+    return out
+
+
 def normalize_diagnostic(value: Any) -> list[Any]:
     if type(value) is not dict or set(value) != {
         "format",
@@ -253,20 +400,21 @@ def normalize_header(document: Any, *, diagnostic: bool = False) -> list[Any]:
         refuse("DUPLICATE_KEY", "asset names collide under ASCII case-folding")
 
     encodings = [
-        object_ref(v, f"encodings[{i}]", diagnostic=diagnostic)
+        encoding_spec(v, f"encodings[{i}]", diagnostic=diagnostic)
         for i, v in enumerate(array(root[3], None, "encodings"))
     ]
     if not encodings or len(encodings) > MAX_TOTAL_REFS:
         refuse("COUNT_CAP", "encoding count is out of bounds")
-    sorted_unique(encodings, 0, "encodings")
+    encoding_ids = [hashlib.sha256(cbor2.dumps(value, canonical=True)).digest() for value in encodings]
+    if encoding_ids != sorted(set(encoding_ids)):
+        refuse("SORT_ORDER", "encodings must be sorted and unique by identity")
 
     components: list[list[Any]] = []
     component_names: set[str] = set()
     tensor_count = 0
-    total_refs = len(configs) + len(encodings) + sum(len(asset[4]) for asset in assets)
+    total_refs = len(configs) + sum(len(asset[4]) for asset in assets)
     total_bytes = (
         sum(config[2] for config in configs)
-        + sum(encoding[1] for encoding in encodings)
         + sum(asset[2] for asset in assets)
     )
     if total_refs > MAX_TOTAL_REFS or total_bytes > MAX_TOTAL_BYTES:
@@ -413,7 +561,7 @@ def project(header: list[Any]) -> dict[str, Any]:
             [r[0], "sha256:" + r[1].hex(), r[2], r[3], [ref(s) for s in r[4]]]
             for r in header[2]
         ],
-        "encodings": [ref(r) for r in header[3]],
+        "encodings": [project_encoding(value) for value in header[3]],
         "components": [
             [
                 c[0],

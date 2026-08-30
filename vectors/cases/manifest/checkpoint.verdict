@@ -1,5 +1,5 @@
 doc: manifest
 expect: ok
-id: sha256:a4a514c0346dd1cef176ade42611b2e363a1e9fff1d25cc4a8a2fb2fc57e31a0
-checkpoint: sha256:a4a514c0346dd1cef176ade42611b2e363a1e9fff1d25cc4a8a2fb2fc57e31a0
-note: checkpoint_id = snapshot_id, header attached structurally
+id: sha256:4650cf69bee447f2b1dacffffed1324a2cc34848f88d38e7b8c64e5d775926e1
+manifest: sha256:4650cf69bee447f2b1dacffffed1324a2cc34848f88d38e7b8c64e5d775926e1
+note: manifest identity is its exact virtual-tree bytes

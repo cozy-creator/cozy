@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"sort"
 	"strconv"
 	"strings"
 
@@ -292,16 +293,367 @@ func sortedStrings(rows []any, where string) error {
 	return nil
 }
 
-func sortedDigests(rows []any, where string) error {
+func sortedEncodings(rows []any, where string) error {
 	var last []byte
 	for i, value := range rows {
-		key := value.([]any)[0].([]byte)
+		encoded, err := encMode.Marshal(value)
+		if err != nil {
+			return err
+		}
+		digest := sha256.Sum256(encoded)
+		key := digest[:]
 		if i > 0 && bytes.Compare(key, last) <= 0 {
 			return fail("SORT_ORDER", "%s must be sorted and unique", where)
 		}
 		last = key
 	}
 	return nil
+}
+
+func optional(v any, where string, read func(any) (any, error)) ([]any, error) {
+	row, err := array(v, -1, where)
+	if err != nil || len(row) > 1 {
+		return nil, fail("WRONG_ARITY", "%s must be [] or [value]", where)
+	}
+	if len(row) == 0 {
+		return []any{}, nil
+	}
+	value, err := read(row[0])
+	if err != nil {
+		return nil, err
+	}
+	return []any{value}, nil
+}
+
+func encodingDim(v any, where string, diagnostic bool) ([]any, error) {
+	if diagnostic {
+		m, ok := v.(map[string]any)
+		if !ok {
+			return nil, fail("WRONG_TYPE", "%s must be a dimension object", where)
+		}
+		tag, _ := m["t"].(string)
+		var code uint64
+		var fields []string
+		switch tag {
+		case "axis":
+			code, fields = 0, []string{"axis"}
+		case "div":
+			code, fields = 1, []string{"axis", "by"}
+		case "ceil_div":
+			code, fields = 2, []string{"axis", "by"}
+		case "ceil_block":
+			code, fields = 3, []string{"axis", "block", "mul"}
+		case "elements_div":
+			code, fields = 4, []string{"by"}
+		case "lit":
+			code, fields = 5, []string{"value"}
+		default:
+			return nil, fail("UNKNOWN_RELATION", "%s has unknown dimension tag", where)
+		}
+		want := len(fields) + 1
+		if tag == "div" || tag == "elements_div" {
+			want++
+			if m["rem"] != "forbid" {
+				return nil, fail("UNKNOWN_RELATION", "%s rem must be forbid", where)
+			}
+		}
+		if len(m) != want {
+			return nil, fail("WRONG_FIELDS", "%s has wrong dimension fields", where)
+		}
+		out := []any{code}
+		for _, field := range fields {
+			n, err := unsigned(m[field], where+"."+field, field != "axis")
+			if err != nil {
+				return nil, err
+			}
+			out = append(out, n)
+		}
+		return out, nil
+	}
+	row, err := array(v, -1, where)
+	if err != nil || len(row) == 0 {
+		return nil, fail("WRONG_ARITY", "%s is empty", where)
+	}
+	tag, err := unsigned(row[0], where+".tag", false)
+	if err != nil {
+		return nil, err
+	}
+	arities := map[uint64]int{0: 2, 1: 3, 2: 3, 3: 4, 4: 2, 5: 2}
+	if arities[tag] != len(row) {
+		return nil, fail("UNKNOWN_RELATION", "%s has unknown tag/arity", where)
+	}
+	out := []any{tag}
+	for i, value := range row[1:] {
+		n, err := unsigned(value, fmt.Sprintf("%s.value[%d]", where, i), tag != 0 || i != 0)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, n)
+	}
+	return out, nil
+}
+
+func encodingRelation(v any, where string, diagnostic bool) ([]any, error) {
+	if diagnostic {
+		m, ok := v.(map[string]any)
+		if !ok {
+			return nil, fail("WRONG_TYPE", "%s must be a relation object", where)
+		}
+		if m["t"] == "same" && len(m) == 1 {
+			return []any{uint64(0)}, nil
+		}
+		if m["t"] != "dims" || len(m) != 2 {
+			return nil, fail("UNKNOWN_RELATION", "%s has unknown relation", where)
+		}
+		values, err := array(m["dims"], -1, where+".dims")
+		if err != nil || len(values) > maxRank {
+			return nil, fail("COUNT_CAP", "%s dims over cap", where)
+		}
+		dims := []any{}
+		for i, value := range values {
+			d, err := encodingDim(value, fmt.Sprintf("%s.dims[%d]", where, i), true)
+			if err != nil {
+				return nil, err
+			}
+			dims = append(dims, d)
+		}
+		return []any{uint64(1), dims}, nil
+	}
+	row, err := array(v, -1, where)
+	if err != nil {
+		return nil, err
+	}
+	if len(row) == 1 {
+		tag, e := unsigned(row[0], where+".tag", false)
+		if e == nil && tag == 0 {
+			return []any{uint64(0)}, nil
+		}
+	}
+	if len(row) != 2 {
+		return nil, fail("UNKNOWN_RELATION", "%s has unknown tag/arity", where)
+	}
+	tag, err := unsigned(row[0], where+".tag", false)
+	if err != nil || tag != 1 {
+		return nil, fail("UNKNOWN_RELATION", "%s has unknown tag", where)
+	}
+	values, err := array(row[1], -1, where+".dims")
+	if err != nil || len(values) > maxRank {
+		return nil, fail("COUNT_CAP", "%s dims over cap", where)
+	}
+	dims := []any{}
+	for i, value := range values {
+		d, e := encodingDim(value, fmt.Sprintf("%s.dims[%d]", where, i), false)
+		if e != nil {
+			return nil, e
+		}
+		dims = append(dims, d)
+	}
+	return []any{uint64(1), dims}, nil
+}
+
+func encodingCarrier(v any, where string, diagnostic bool) ([]any, error) {
+	if diagnostic {
+		m, ok := v.(map[string]any)
+		if !ok {
+			return nil, fail("WRONG_TYPE", "%s must be a carrier object", where)
+		}
+		if m["t"] == "same_as_logical" && len(m) == 1 {
+			return []any{uint64(0)}, nil
+		}
+		if m["t"] != "set" || len(m) != 2 {
+			return nil, fail("UNKNOWN_RELATION", "%s has unknown carrier", where)
+		}
+		values, e := array(m["dtypes"], -1, where+".dtypes")
+		if e != nil || len(values) == 0 {
+			return nil, fail("COUNT_CAP", "%s dtypes empty", where)
+		}
+		out := []any{}
+		for i, value := range values {
+			n, e := dtype(value, fmt.Sprintf("%s.dtypes[%d]", where, i), true)
+			if e != nil {
+				return nil, e
+			}
+			out = append(out, n)
+		}
+		return []any{uint64(1), out}, nil
+	}
+	row, e := array(v, -1, where)
+	if e != nil {
+		return nil, e
+	}
+	if len(row) == 1 {
+		tag, x := unsigned(row[0], where+".tag", false)
+		if x == nil && tag == 0 {
+			return []any{uint64(0)}, nil
+		}
+	}
+	if len(row) != 2 {
+		return nil, fail("UNKNOWN_RELATION", "%s has unknown carrier tag/arity", where)
+	}
+	tag, e := unsigned(row[0], where+".tag", false)
+	if e != nil || tag != 1 {
+		return nil, fail("UNKNOWN_RELATION", "%s has unknown carrier", where)
+	}
+	values, e := array(row[1], -1, where+".dtypes")
+	if e != nil || len(values) == 0 {
+		return nil, fail("COUNT_CAP", "%s dtypes empty", where)
+	}
+	out := []any{}
+	for i, value := range values {
+		n, e := dtype(value, fmt.Sprintf("%s.dtypes[%d]", where, i), false)
+		if e != nil {
+			return nil, e
+		}
+		out = append(out, n)
+	}
+	return []any{uint64(1), out}, nil
+}
+
+func encodingSpec(value any, where string, diagnostic bool) ([]any, error) {
+	var dts, rank, roles, doc, vectors []any
+	if diagnostic {
+		m, ok := value.(map[string]any)
+		if !ok {
+			return nil, fail("WRONG_TYPE", "%s must be an encoding object", where)
+		}
+		for key := range m {
+			if key != "logical_dtypes" && key != "logical_rank" && key != "roles" && key != "doc" && key != "vectors" {
+				return nil, fail("WRONG_FIELDS", "%s has unknown field", where)
+			}
+		}
+		values, e := array(m["logical_dtypes"], -1, where+".logical_dtypes")
+		if e != nil {
+			return nil, e
+		}
+		for i, value := range values {
+			n, e := dtype(value, fmt.Sprintf("%s.logical_dtypes[%d]", where, i), true)
+			if e != nil {
+				return nil, e
+			}
+			dts = append(dts, n)
+		}
+		if value, ok := m["logical_rank"]; ok {
+			n, e := unsigned(value, where+".logical_rank", true)
+			if e != nil {
+				return nil, e
+			}
+			rank = []any{n}
+		} else {
+			rank = []any{}
+		}
+		rm, ok := m["roles"].(map[string]any)
+		if !ok {
+			return nil, fail("WRONG_TYPE", "%s.roles must be an object", where)
+		}
+		names := []string{}
+		for name := range rm {
+			names = append(names, name)
+		}
+		sort.Strings(names)
+		for _, roleName := range names {
+			role, ok := rm[roleName].(map[string]any)
+			if !ok || len(role) != 2 {
+				return nil, fail("WRONG_FIELDS", "%s role has wrong fields", where)
+			}
+			n, e := closedName(roleName, where+".role", maxName)
+			if e != nil {
+				return nil, e
+			}
+			carrier, e := encodingCarrier(role["carrier"], where+"."+n+".carrier", true)
+			if e != nil {
+				return nil, e
+			}
+			relation, e := encodingRelation(role["shape"], where+"."+n+".shape", true)
+			if e != nil {
+				return nil, e
+			}
+			roles = append(roles, []any{n, carrier, relation})
+		}
+		if value, ok := m["doc"]; ok {
+			s, e := text(value, where+".doc", 4096, false)
+			if e != nil {
+				return nil, e
+			}
+			doc = []any{s}
+		} else {
+			doc = []any{}
+		}
+		if value, ok := m["vectors"]; ok {
+			vm, ok := value.(map[string]any)
+			if !ok || len(vm) != 2 {
+				return nil, fail("WRONG_FIELDS", "%s vectors has wrong fields", where)
+			}
+			dg, e := diagnosticDigest(vm["sha256"], where+".vectors.sha256")
+			if e != nil {
+				return nil, e
+			}
+			n, e := unsigned(vm["length"], where+".vectors.length", true)
+			if e != nil {
+				return nil, e
+			}
+			vectors = []any{[]any{dg, n}}
+		} else {
+			vectors = []any{}
+		}
+	} else {
+		row, e := array(value, 5, where)
+		if e != nil {
+			return nil, e
+		}
+		values, e := array(row[0], -1, where+".logical_dtypes")
+		if e != nil {
+			return nil, e
+		}
+		for i, value := range values {
+			n, e := dtype(value, fmt.Sprintf("%s.logical_dtypes[%d]", where, i), false)
+			if e != nil {
+				return nil, e
+			}
+			dts = append(dts, n)
+		}
+		rank, e = optional(row[1], where+".logical_rank", func(v any) (any, error) { return unsigned(v, where+".logical_rank.value", true) })
+		if e != nil {
+			return nil, e
+		}
+		values, e = array(row[2], -1, where+".roles")
+		if e != nil {
+			return nil, e
+		}
+		for i, value := range values {
+			role, e := array(value, 3, fmt.Sprintf("%s.roles[%d]", where, i))
+			if e != nil {
+				return nil, e
+			}
+			n, e := closedName(role[0], where+".role", maxName)
+			if e != nil {
+				return nil, e
+			}
+			carrier, e := encodingCarrier(role[1], where+"."+n+".carrier", false)
+			if e != nil {
+				return nil, e
+			}
+			relation, e := encodingRelation(role[2], where+"."+n+".shape", false)
+			if e != nil {
+				return nil, e
+			}
+			roles = append(roles, []any{n, carrier, relation})
+		}
+		doc, e = optional(row[3], where+".doc", func(v any) (any, error) { return text(v, where+".doc.value", 4096, false) })
+		if e != nil {
+			return nil, e
+		}
+		vectors, e = optional(row[4], where+".vectors", func(v any) (any, error) { return objectRef(v, where+".vectors.value", false) })
+		if e != nil {
+			return nil, e
+		}
+	}
+	if len(dts) == 0 || len(roles) == 0 || len(roles) > maxParts {
+		return nil, fail("COUNT_CAP", "%s encoding is empty or over cap", where)
+	}
+	if err := sortedStrings(roles, where+".roles"); err != nil {
+		return nil, err
+	}
+	return []any{dts, rank, roles, doc, vectors}, nil
 }
 
 func normalizeDiagnostic(v any) ([]any, error) {
@@ -443,13 +795,13 @@ func normalizeHeader(v any, diagnostic bool) ([]any, error) {
 	}
 	encodings := make([]any, 0, len(rawEncodings))
 	for i, value := range rawEncodings {
-		ref, e := objectRef(value, fmt.Sprintf("encodings[%d]", i), diagnostic)
+		ref, e := encodingSpec(value, fmt.Sprintf("encodings[%d]", i), diagnostic)
 		if e != nil {
 			return nil, e
 		}
 		encodings = append(encodings, ref)
 	}
-	if err := sortedDigests(encodings, "encodings"); err != nil {
+	if err := sortedEncodings(encodings, "encodings"); err != nil {
 		return nil, err
 	}
 
@@ -464,16 +816,10 @@ func normalizeHeader(v any, diagnostic bool) ([]any, error) {
 	componentNames := map[string]bool{}
 	cited := map[uint64]bool{}
 	tensorCount := 0
-	totalRefs := len(configs) + len(encodings)
+	totalRefs := len(configs)
 	var totalBytes uint64
 	for _, value := range configs {
 		totalBytes, err = addBytes(totalBytes, value.([]any)[2].(uint64), "configs")
-		if err != nil {
-			return nil, err
-		}
-	}
-	for _, value := range encodings {
-		totalBytes, err = addBytes(totalBytes, value.([]any)[1].(uint64), "encodings")
 		if err != nil {
 			return nil, err
 		}
@@ -720,6 +1066,67 @@ func decodeStrict(raw []byte) ([]any, error) {
 
 func ref(row []any) []any { return []any{"sha256:" + hex.EncodeToString(row[0].([]byte)), row[1]} }
 
+func projectEncoding(value []any) map[string]any {
+	projectDim := func(row []any) map[string]any { return nil }
+	projectDim = func(row []any) map[string]any {
+		switch row[0].(uint64) {
+		case 0:
+			return map[string]any{"axis": row[1], "t": "axis"}
+		case 1:
+			return map[string]any{"axis": row[1], "by": row[2], "rem": "forbid", "t": "div"}
+		case 2:
+			return map[string]any{"axis": row[1], "by": row[2], "t": "ceil_div"}
+		case 3:
+			return map[string]any{"axis": row[1], "block": row[2], "mul": row[3], "t": "ceil_block"}
+		case 4:
+			return map[string]any{"by": row[1], "rem": "forbid", "t": "elements_div"}
+		default:
+			return map[string]any{"t": "lit", "value": row[1]}
+		}
+	}
+	projectRelation := func(row []any) map[string]any {
+		if row[0].(uint64) == 0 {
+			return map[string]any{"t": "same"}
+		}
+		dims := []any{}
+		for _, value := range row[1].([]any) {
+			dims = append(dims, projectDim(value.([]any)))
+		}
+		return map[string]any{"dims": dims, "t": "dims"}
+	}
+	projectCarrier := func(row []any) map[string]any {
+		if row[0].(uint64) == 0 {
+			return map[string]any{"t": "same_as_logical"}
+		}
+		dts := []any{}
+		for _, value := range row[1].([]any) {
+			dts = append(dts, dtypeNames[value.(uint64)])
+		}
+		return map[string]any{"dtypes": dts, "t": "set"}
+	}
+	dts := []any{}
+	for _, v := range value[0].([]any) {
+		dts = append(dts, dtypeNames[v.(uint64)])
+	}
+	roles := map[string]any{}
+	for _, v := range value[2].([]any) {
+		r := v.([]any)
+		roles[r[0].(string)] = map[string]any{"carrier": projectCarrier(r[1].([]any)), "shape": projectRelation(r[2].([]any))}
+	}
+	out := map[string]any{"logical_dtypes": dts, "roles": roles}
+	if v := value[1].([]any); len(v) == 1 {
+		out["logical_rank"] = v[0]
+	}
+	if v := value[3].([]any); len(v) == 1 {
+		out["doc"] = v[0]
+	}
+	if v := value[4].([]any); len(v) == 1 {
+		r := v[0].([]any)
+		out["vectors"] = map[string]any{"length": r[1], "sha256": "sha256:" + hex.EncodeToString(r[0].([]byte))}
+	}
+	return out
+}
+
 func project(h []any) map[string]any {
 	configs := []any{}
 	for _, value := range h[1].([]any) {
@@ -737,7 +1144,7 @@ func project(h []any) map[string]any {
 	}
 	encodings := []any{}
 	for _, value := range h[3].([]any) {
-		encodings = append(encodings, ref(value.([]any)))
+		encodings = append(encodings, projectEncoding(value.([]any)))
 	}
 	components := []any{}
 	for _, cv := range h[4].([]any) {

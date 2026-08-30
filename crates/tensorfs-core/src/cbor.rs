@@ -9,6 +9,8 @@ use crate::err::{refuse, Code, Refusal, Result};
 use crate::header::{Asset, Body, Header, Part, Tensor};
 use crate::ids::{ConfigRef, ObjectRef};
 use crate::limits;
+use crate::relation::{Carrier, Dim, Relation};
+use crate::spec::{EncodingSpec, Role};
 
 fn malformed(what: &str, error: impl std::fmt::Display) -> Refusal {
     Refusal {
@@ -166,6 +168,263 @@ fn decode_shape(d: &mut Decoder<'_>, what: &str) -> Result<Vec<u64>> {
     (0..n).map(|_| uint(d, what)).collect()
 }
 
+fn encode_optional<T>(
+    e: &mut Encoder<Bounded>,
+    value: Option<&T>,
+    write: impl FnOnce(&mut Encoder<Bounded>, &T) -> Result<()>,
+) -> Result<()> {
+    emit("optional", e.array(u64::from(value.is_some())))?;
+    if let Some(value) = value {
+        write(e, value)?;
+    }
+    Ok(())
+}
+
+fn decode_optional<T>(
+    d: &mut Decoder<'_>,
+    what: &str,
+    read: impl FnOnce(&mut Decoder<'_>) -> Result<T>,
+) -> Result<Option<T>> {
+    match list_len(d, what, 1, false)? {
+        0 => Ok(None),
+        1 => read(d).map(Some),
+        _ => unreachable!(),
+    }
+}
+
+fn encode_carrier(e: &mut Encoder<Bounded>, carrier: &Carrier) -> Result<()> {
+    match carrier {
+        Carrier::SameAsLogical => {
+            emit("encoding.carrier", e.array(1))?;
+            emit("encoding.carrier.tag", e.u8(0))?;
+        }
+        Carrier::Set(dtypes) => {
+            emit("encoding.carrier", e.array(2))?;
+            emit("encoding.carrier.tag", e.u8(1))?;
+            emit("encoding.carrier.dtypes", e.array(dtypes.len() as u64))?;
+            for dtype in dtypes {
+                emit("encoding.carrier.dtype", e.u8(dtype.code()))?;
+            }
+        }
+    }
+    Ok(())
+}
+
+fn decode_carrier(d: &mut Decoder<'_>, what: &str) -> Result<Carrier> {
+    let length = list_len(d, what, 2, true)?;
+    match uint(d, &format!("{what}.tag"))? {
+        0 if length == 1 => Ok(Carrier::SameAsLogical),
+        1 if length == 2 => {
+            let count = list_len(d, &format!("{what}.dtypes"), 32, true)?;
+            let dtypes = (0..count)
+                .map(|_| Dtype::from_code(uint(d, &format!("{what}.dtype"))?))
+                .collect::<Result<Vec<_>>>()?;
+            Ok(Carrier::Set(dtypes))
+        }
+        tag => refuse(
+            Code::UNKNOWN_RELATION,
+            format!("{what}: carrier tag/arity ({tag},{length}) is unknown"),
+        ),
+    }
+}
+
+fn encode_dim(e: &mut Encoder<Bounded>, dim: &Dim) -> Result<()> {
+    match dim {
+        Dim::Axis { axis } => {
+            emit("encoding.dim", e.array(2))?;
+            emit("encoding.dim.tag", e.u8(0))?;
+            emit("encoding.dim.axis", e.u64(*axis))?;
+        }
+        Dim::Div { axis, by } => {
+            emit("encoding.dim", e.array(3))?;
+            emit("encoding.dim.tag", e.u8(1))?;
+            emit("encoding.dim.axis", e.u64(*axis))?;
+            emit("encoding.dim.by", e.u64(*by))?;
+        }
+        Dim::CeilDiv { axis, by } => {
+            emit("encoding.dim", e.array(3))?;
+            emit("encoding.dim.tag", e.u8(2))?;
+            emit("encoding.dim.axis", e.u64(*axis))?;
+            emit("encoding.dim.by", e.u64(*by))?;
+        }
+        Dim::CeilBlock { axis, block, mul } => {
+            emit("encoding.dim", e.array(4))?;
+            emit("encoding.dim.tag", e.u8(3))?;
+            emit("encoding.dim.axis", e.u64(*axis))?;
+            emit("encoding.dim.block", e.u64(*block))?;
+            emit("encoding.dim.mul", e.u64(*mul))?;
+        }
+        Dim::ElementsDiv { by } => {
+            emit("encoding.dim", e.array(2))?;
+            emit("encoding.dim.tag", e.u8(4))?;
+            emit("encoding.dim.by", e.u64(*by))?;
+        }
+        Dim::Lit { value } => {
+            emit("encoding.dim", e.array(2))?;
+            emit("encoding.dim.tag", e.u8(5))?;
+            emit("encoding.dim.value", e.u64(*value))?;
+        }
+    }
+    Ok(())
+}
+
+fn decode_dim(d: &mut Decoder<'_>, what: &str) -> Result<Dim> {
+    let length = list_len(d, what, 4, true)?;
+    let tag = uint(d, &format!("{what}.tag"))?;
+    let dim = match (tag, length) {
+        (0, 2) => Dim::Axis {
+            axis: uint(d, &format!("{what}.axis"))?,
+        },
+        (1, 3) => Dim::Div {
+            axis: uint(d, &format!("{what}.axis"))?,
+            by: uint(d, &format!("{what}.by"))?,
+        },
+        (2, 3) => Dim::CeilDiv {
+            axis: uint(d, &format!("{what}.axis"))?,
+            by: uint(d, &format!("{what}.by"))?,
+        },
+        (3, 4) => Dim::CeilBlock {
+            axis: uint(d, &format!("{what}.axis"))?,
+            block: uint(d, &format!("{what}.block"))?,
+            mul: uint(d, &format!("{what}.mul"))?,
+        },
+        (4, 2) => Dim::ElementsDiv {
+            by: uint(d, &format!("{what}.by"))?,
+        },
+        (5, 2) => Dim::Lit {
+            value: uint(d, &format!("{what}.value"))?,
+        },
+        _ => {
+            return refuse(
+                Code::UNKNOWN_RELATION,
+                format!("{what}: dimension tag/arity ({tag},{length}) is unknown"),
+            )
+        }
+    };
+    Ok(dim)
+}
+
+fn encode_relation(e: &mut Encoder<Bounded>, relation: &Relation) -> Result<()> {
+    match relation {
+        Relation::Same => {
+            emit("encoding.relation", e.array(1))?;
+            emit("encoding.relation.tag", e.u8(0))?;
+        }
+        Relation::Dims(dims) => {
+            emit("encoding.relation", e.array(2))?;
+            emit("encoding.relation.tag", e.u8(1))?;
+            emit("encoding.relation.dims", e.array(dims.len() as u64))?;
+            for dim in dims {
+                encode_dim(e, dim)?;
+            }
+        }
+    }
+    Ok(())
+}
+
+fn decode_relation(d: &mut Decoder<'_>, what: &str) -> Result<Relation> {
+    let length = list_len(d, what, 2, true)?;
+    match uint(d, &format!("{what}.tag"))? {
+        0 if length == 1 => Ok(Relation::Same),
+        1 if length == 2 => {
+            let count = list_len(d, &format!("{what}.dims"), limits::MAX_RANK, false)?;
+            let dims = (0..count)
+                .map(|index| decode_dim(d, &format!("{what}.dims[{index}]")))
+                .collect::<Result<Vec<_>>>()?;
+            Ok(Relation::Dims(dims))
+        }
+        tag => refuse(
+            Code::UNKNOWN_RELATION,
+            format!("{what}: relation tag/arity ({tag},{length}) is unknown"),
+        ),
+    }
+}
+
+fn encode_encoding_into(e: &mut Encoder<Bounded>, spec: &EncodingSpec) -> Result<()> {
+    emit("encoding", e.array(5))?;
+    emit(
+        "encoding.logical_dtypes",
+        e.array(spec.logical_dtypes.len() as u64),
+    )?;
+    for dtype in &spec.logical_dtypes {
+        emit("encoding.logical_dtype", e.u8(dtype.code()))?;
+    }
+    encode_optional(e, spec.logical_rank.as_ref(), |e, rank| {
+        emit("encoding.logical_rank", e.u64(*rank))?;
+        Ok(())
+    })?;
+    emit("encoding.roles", e.array(spec.roles.len() as u64))?;
+    for (name, role) in &spec.roles {
+        emit("encoding.role", e.array(3))?;
+        emit("encoding.role.name", e.str(name))?;
+        encode_carrier(e, &role.carrier)?;
+        encode_relation(e, &role.shape)?;
+    }
+    encode_optional(e, spec.doc.as_ref(), |e, doc| {
+        emit("encoding.doc", e.str(doc))?;
+        Ok(())
+    })?;
+    encode_optional(e, spec.vectors.as_ref(), encode_ref)?;
+    Ok(())
+}
+
+fn decode_encoding_from(d: &mut Decoder<'_>, what: &str) -> Result<EncodingSpec> {
+    exact_array(d, what, 5)?;
+    let count = list_len(d, &format!("{what}.logical_dtypes"), 32, true)?;
+    let logical_dtypes = (0..count)
+        .map(|_| Dtype::from_code(uint(d, &format!("{what}.logical_dtype"))?))
+        .collect::<Result<Vec<_>>>()?;
+    let logical_rank = decode_optional(d, &format!("{what}.logical_rank"), |d| {
+        uint(d, &format!("{what}.logical_rank.value"))
+    })?;
+    let count = list_len(d, &format!("{what}.roles"), limits::MAX_PARTS, true)?;
+    let mut roles = Vec::with_capacity(count);
+    for index in 0..count {
+        let role_what = format!("{what}.roles[{index}]");
+        exact_array(d, &role_what, 3)?;
+        let name = text(d, &format!("{role_what}.name"), limits::MAX_NAME_BYTES)?;
+        let carrier = decode_carrier(d, &format!("{role_what}.carrier"))?;
+        let shape = decode_relation(d, &format!("{role_what}.shape"))?;
+        roles.push((name, Role { carrier, shape }));
+    }
+    let doc = decode_optional(d, &format!("{what}.doc"), |d| {
+        text(d, &format!("{what}.doc.value"), limits::MAX_DOC_TEXT_BYTES)
+    })?;
+    let vectors = decode_optional(d, &format!("{what}.vectors"), |d| {
+        decode_ref(d, &format!("{what}.vectors.value"))
+    })?;
+    let spec = EncodingSpec {
+        logical_dtypes,
+        logical_rank,
+        roles,
+        doc,
+        vectors,
+    };
+    EncodingSpec::from_value(&spec.to_value())
+}
+
+pub(crate) fn encode_encoding(spec: &EncodingSpec) -> Result<Vec<u8>> {
+    EncodingSpec::from_value(&spec.to_value())?;
+    let mut encoder = Encoder::new(Bounded { bytes: Vec::new() });
+    encode_encoding_into(&mut encoder, spec)?;
+    Ok(encoder.into_writer().bytes)
+}
+
+pub(crate) fn decode_encoding(bytes: &[u8]) -> Result<EncodingSpec> {
+    if bytes.len() > limits::SPEC_MAX_BYTES {
+        return refuse(Code::SIZE_CAP, "nested encoding exceeds its cap");
+    }
+    let mut decoder = Decoder::new(bytes);
+    let spec = decode_encoding_from(&mut decoder, "encoding")?;
+    if decoder.position() != bytes.len() || encode_encoding(&spec)? != bytes {
+        return refuse(
+            Code::NONCANONICAL_ENCODING,
+            "encoding bytes are not the exact nested deterministic CBOR value",
+        );
+    }
+    Ok(spec)
+}
+
 fn encode_part(e: &mut Encoder<Bounded>, role: &str, part: &Part) -> Result<()> {
     emit("part", e.array(4))?;
     emit("part.role", e.str(role))?;
@@ -251,7 +510,7 @@ fn encode_tensor(
 fn decode_tensor(
     d: &mut Decoder<'_>,
     what: &str,
-    encodings: &[ObjectRef],
+    encodings: &[EncodingSpec],
 ) -> Result<(String, Tensor)> {
     exact_array(d, what, 5)?;
     let key = text(d, &format!("{what}.key"), limits::MAX_KEY_BYTES)?;
@@ -271,7 +530,7 @@ fn decode_tensor(
                 encodings.len()
             ),
         })?
-        .id();
+        .object_id();
     let n = list_len(d, &format!("{what}.parts"), limits::MAX_PARTS, true)?;
     let mut parts = Vec::with_capacity(n);
     for i in 0..n {
@@ -299,7 +558,7 @@ pub fn encode_header_unvalidated(header: &Header) -> Result<Vec<u8>> {
         .encodings
         .iter()
         .enumerate()
-        .map(|(index, encoding)| (encoding.id(), index))
+        .map(|(index, encoding)| (encoding.object_id(), index))
         .collect();
     emit("header", e.array(5))?;
     emit("header.format", e.str(Header::FORMAT))?;
@@ -337,7 +596,7 @@ pub fn encode_header_unvalidated(header: &Header) -> Result<Vec<u8>> {
 
     emit("header.encodings", e.array(header.encodings.len() as u64))?;
     for encoding in &header.encodings {
-        encode_ref(&mut e, encoding)?;
+        encode_encoding_into(&mut e, encoding)?;
     }
 
     emit("header.components", e.array(header.components.len() as u64))?;
@@ -421,7 +680,8 @@ fn decode(bytes: &[u8]) -> Result<Header> {
     let encoding_count = list_len(&mut d, "header.encodings", limits::MAX_TOTAL_REFS, true)?;
     let mut encodings = Vec::with_capacity(encoding_count);
     for i in 0..encoding_count {
-        encodings.push(decode_ref(&mut d, &format!("header.encodings[{i}]"))?);
+        let what = format!("header.encodings[{i}]");
+        encodings.push(decode_encoding_from(&mut d, &what)?);
     }
 
     let component_count = list_len(&mut d, "header.components", limits::MAX_COMPONENTS, false)?;

@@ -10,13 +10,13 @@
 #
 # BENCH points at the tfs-018 store, which is a QUARRY: this script only ever makes a
 # hardlinked working copy of it, and the destructive arms refuse to run on a store whose
-# objects share inodes with another tree.
-set -uo pipefail
+# blobs share inodes with another tree.
+set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 TFS="$ROOT/target/release/tfs"
 WORK="${WORK:-/home/fidika/cozy_v2/tfs-005-work}"
 BENCH="${BENCH:-/home/fidika/cozy_v2/tensorfs-bench/store}"
-BENCH_SNAP="${BENCH_SNAP:-108c585af313e4db4410ed6c20a313b072fd84610ef786246e8c846847d340e6}"
+BENCH_MANIFEST="${BENCH_MANIFEST:-108c585af313e4db4410ed6c20a313b072fd84610ef786246e8c846847d340e6}"
 MODE="${1:-arms}"
 
 say() { printf '\n=== %s ===\n' "$*"; }
@@ -26,7 +26,7 @@ evict() { # posix_fadvise(DONTNEED) — there is no passwordless sudo on this bo
 import os, sys, pathlib
 root = pathlib.Path(sys.argv[1])
 n = b = 0
-for p in (root / "objects/sha256").rglob("*"):
+for p in (root / "blobs").rglob("*"):
     if not p.is_file():
         continue
     fd = os.open(p, os.O_RDONLY)
@@ -36,16 +36,16 @@ for p in (root / "objects/sha256").rglob("*"):
         n += 1; b += st.st_size
     finally:
         os.close(fd)
-print(f"evicted {n} objects, {b} B")
+print(f"evicted {n} blobs, {b} B")
 PY
 }
 
-work_copy() { # hardlinked objects (records stay valid: same dev/ino), everything else real
+work_copy() { # hardlinked blobs (records stay valid: same dev/ino), metadata copied
   rm -rf "$WORK/bench"
   mkdir -p "$WORK/bench"
-  cp -al "$BENCH/objects" "$WORK/bench/objects"
-  cp -a "$BENCH/store.json" "$BENCH/verified" "$WORK/bench/"
-  mkdir -p "$WORK/bench/tmp" "$WORK/bench/quarantine"
+  cp -al "$BENCH/blobs" "$WORK/bench/blobs"
+  cp -a "$BENCH/manifests" "$BENCH/repos" "$BENCH/tensorfs.sqlite" "$WORK/bench/"
+  mkdir -p "$WORK/bench/.tensorfs/tmp" "$WORK/bench/.tensorfs/quarantine"
 }
 
 # ---------------------------------------------------------------- a fresh subject
@@ -53,9 +53,10 @@ work_copy() { # hardlinked objects (records stay valid: same dev/ino), everythin
 if [ "$MODE" = "arms" ]; then
   rm -rf "$WORK/syn"
   say "a real checkpoint through the real CAS"
-  "$TFS" checkpoint write "$WORK/syn" | tail -5
-  SYN=$("$TFS" checkpoint write "$WORK/syn" 2>&1 | grep -oE 'checkpoint_id   sha256:[0-9a-f]{64}' | head -1 | grep -oE '[0-9a-f]{64}')
-  echo "snapshot $SYN"
+  write=$("$TFS" checkpoint write "$WORK/syn")
+  printf '%s\n' "$write" | tail -5
+  SYN=$(printf '%s\n' "$write" | grep -oE 'manifest_id +sha256:[0-9a-f]{64}' | head -1 | grep -oE '[0-9a-f]{64}')
+  echo "manifest $SYN"
 
   say "1. the lease: acquire, verify, release"
   "$TFS" read lease "$WORK/syn" "$SYN"
@@ -85,16 +86,16 @@ if [ "$MODE" = "arms" ]; then
   "$TFS" read arms "$WORK/syn" "$SYN"
 
   say "10. projection tier 2 — relative symlinks, no weight paths"
-  rm -rf "$WORK/proj"; "$TFS" project "$WORK/syn" "$SYN" "$WORK/proj"
+  rm -rf "$WORK/proj"; "$TFS" checkout "$WORK/syn" "$SYN" "$WORK/proj"
   find "$WORK/proj" -type l | head -1 | xargs -I{} sh -c 'echo "  {} -> $(readlink {})"'
 
   say "11. a filesystem without symlinks falls back to copies, and confesses"
-  rm -rf "$WORK/proj2"; "$TFS" project "$WORK/syn" "$SYN" "$WORK/proj2" --no-symlink | head -4
+  rm -rf "$WORK/proj2"; "$TFS" checkout "$WORK/syn" "$SYN" "$WORK/proj2" --no-symlink | head -4
 
-  say "12. tier 3 — a RETAINED carrier blob, streamed"
+  say "12. an ordinary retained blob, streamed through the typed blob door"
   head -c 5000000 /dev/urandom > "$WORK/carrier.bin"
-  "$TFS" snapshot blob put "$WORK/syn" "$WORK/carrier.bin" | head -3
-  "$TFS" materialize "$WORK/syn" "$WORK/carrier.bin" "$WORK/carrier.out"
+  CARRIER=$("$TFS" put "$WORK/syn" "$WORK/carrier.bin" | grep -oE '[0-9a-f]{64}')
+  "$TFS" get "$WORK/syn" "$CARRIER" --out "$WORK/carrier.out"
   cmp "$WORK/carrier.bin" "$WORK/carrier.out" && echo "  byte-identical to the source"
 
   say "13. the ONE fill transform: arithmetic decomposition + the block-granularity rule"
@@ -115,12 +116,12 @@ work_copy
 
 if [ "$MODE" = "real" ]; then
   say "the real 4.78 GiB SDXL UNet checkpoint"
-  "$TFS" read plan "$WORK/bench" "$BENCH_SNAP" | head -6
-  "$TFS" read lease "$WORK/bench" "$BENCH_SNAP"
-  "$TFS" read prove "$WORK/bench" "$BENCH_SNAP" --sample 120
-  "$TFS" read arms "$WORK/bench" "$BENCH_SNAP"
+  "$TFS" read plan "$WORK/bench" "$BENCH_MANIFEST" | head -6
+  "$TFS" read lease "$WORK/bench" "$BENCH_MANIFEST"
+  "$TFS" read prove "$WORK/bench" "$BENCH_MANIFEST" --sample 120
+  "$TFS" read arms "$WORK/bench" "$BENCH_MANIFEST"
   say "the destructive arm refuses on a hardlinked working copy"
-  "$TFS" read tear "$WORK/bench" "$BENCH_SNAP"
+  "$TFS" read tear "$WORK/bench" "$BENCH_MANIFEST"
   exit 0
 fi
 
@@ -130,22 +131,22 @@ say "reader-pool depth (cold = fadvise-evicted, warm = the run straight after)"
 printf '%-8s %-10s %-9s %-9s\n' workers window cold warm
 for w in 1 2 4 8 16; do
   evict "$WORK/bench" > /dev/null
-  cold=$(nice -n 19 "$TFS" read fill "$WORK/bench" "$BENCH_SNAP" --workers "$w" --window 16777216 --ring 1073741824 --no-digest | grep throughput | awk '{print $2}')
-  warm=$(nice -n 19 "$TFS" read fill "$WORK/bench" "$BENCH_SNAP" --workers "$w" --window 16777216 --ring 1073741824 --no-digest | grep throughput | awk '{print $2}')
+  cold=$(nice -n 19 "$TFS" read fill "$WORK/bench" "$BENCH_MANIFEST" --workers "$w" --window 16777216 --ring 1073741824 --no-digest | grep throughput | awk '{print $2}')
+  warm=$(nice -n 19 "$TFS" read fill "$WORK/bench" "$BENCH_MANIFEST" --workers "$w" --window 16777216 --ring 1073741824 --no-digest | grep throughput | awk '{print $2}')
   printf '%-8s %-10s %-9s %-9s GB/s\n' "$w" 16MiB "$cold" "$warm"
 done
 
 say "transfer window at depth 8 (cold)"
 for win in 1048576 4194304 16777216 67108864; do
   evict "$WORK/bench" > /dev/null
-  v=$(nice -n 19 "$TFS" read fill "$WORK/bench" "$BENCH_SNAP" --workers 8 --window "$win" --ring 1073741824 --no-digest | grep throughput | awk '{print $2}')
+  v=$(nice -n 19 "$TFS" read fill "$WORK/bench" "$BENCH_MANIFEST" --workers 8 --window "$win" --ring 1073741824 --no-digest | grep throughput | awk '{print $2}')
   printf '  window %-10s %s GB/s\n' "$win" "$v"
 done
 
 say "caller ring size at depth 8 (cold) — every batch boundary is a pool drain"
 for ring in 67108864 268435456 1073741824; do
   evict "$WORK/bench" > /dev/null
-  v=$(nice -n 19 "$TFS" read fill "$WORK/bench" "$BENCH_SNAP" --workers 8 --window 4194304 --ring "$ring" --no-digest | grep -E 'throughput|batches' | tr '\n' ' ')
+  v=$(nice -n 19 "$TFS" read fill "$WORK/bench" "$BENCH_MANIFEST" --workers 8 --window 4194304 --ring "$ring" --no-digest | grep -E 'throughput|batches' | tr '\n' ' ')
   printf '  ring %-11s %s\n' "$ring" "$v"
 done
 
@@ -154,7 +155,7 @@ say "the denominator: the SAME object files, at the SAME depth, no tensorfs"
 cat > "$WORK/raw.py" <<'RAWPY'
 import os, sys, time, pathlib, concurrent.futures as cf
 root, workers = pathlib.Path(sys.argv[1]), int(sys.argv[2])
-files = sorted(p for p in (root / "objects/sha256").rglob("*") if p.is_file())
+files = sorted(p for p in (root / "blobs").rglob("*") if p.is_file())
 def rd(p):
     n = 0
     with open(p, "rb", buffering=0) as f:
@@ -172,8 +173,8 @@ RAWPY
 printf '%-6s %-10s %-10s %-10s %-10s\n' depth tfs-cold raw-cold tfs-warm raw-warm
 for d in 1 4 16; do
   evict "$WORK/bench" > /dev/null
-  tc=$(nice -n 19 "$TFS" read fill "$WORK/bench" "$BENCH_SNAP" --workers "$d" --window 4194304 --ring 1073741824 --no-digest | grep throughput | awk '{print $2}')
-  tw=$(nice -n 19 "$TFS" read fill "$WORK/bench" "$BENCH_SNAP" --workers "$d" --window 4194304 --ring 1073741824 --no-digest | grep throughput | awk '{print $2}')
+  tc=$(nice -n 19 "$TFS" read fill "$WORK/bench" "$BENCH_MANIFEST" --workers "$d" --window 4194304 --ring 1073741824 --no-digest | grep throughput | awk '{print $2}')
+  tw=$(nice -n 19 "$TFS" read fill "$WORK/bench" "$BENCH_MANIFEST" --workers "$d" --window 4194304 --ring 1073741824 --no-digest | grep throughput | awk '{print $2}')
   evict "$WORK/bench" > /dev/null
   rc=$(nice -n 19 python3 "$WORK/raw.py" "$WORK/bench" "$d")
   rw=$(nice -n 19 python3 "$WORK/raw.py" "$WORK/bench" "$d")

@@ -63,15 +63,26 @@ def main() -> None:
         "8192",
         "--no-configs",
     )
-    match = re.search(r"checkpoint_id\s+(sha256:[0-9a-f]{64})", output)
+    match = re.search(r"manifest_id\s+(sha256:[0-9a-f]{64})", output)
     if match is None:
-        raise RuntimeError("checkpoint write did not print checkpoint_id")
+        raise RuntimeError("checkpoint write did not print manifest_id")
     source_id = match.group(1)
-    run(str(args.tfs), "root", "register", str(args.store), "plain-source", source_id)
 
     store = tensorfs.Store.open(str(args.store))
-    source_length = len(store.document(source_id))
-    source = store.snapshot(source_id)
+    source = store.manifest(source_id)
+    source_length = len(source["manifest"])
+    operation = store.begin_operation("registry-source", "proof", "plain-source", 1)
+    operation.hold_manifest(source_id, source_length)
+    for reached in store.walk(source_id):
+        operation.hold_blob(reached["id"], reached["length"])
+    evidence = json.dumps(
+        {"classification_digest": tensorfs.topology_digest(source["header"])},
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode()
+    operation.commit_release(
+        None, "1.0.0", "local", source_id, source_length, evidence
+    )
     source_header = tensorfs.parse_header(source["header"])
     if len(source_header["encodings"]) != 1:
         raise RuntimeError("the source is not a plain/1-only closure")
@@ -125,30 +136,17 @@ def main() -> None:
     if replay != {"state": "committed", "receipt": receipt}:
         raise RuntimeError("the committed receipt did not replay byte-for-byte")
 
-    spec = json.loads(store.document(encoding))
-    expected_registry = {
-        encoding,
-        f"sha256:{spec['vectors']['sha256']}",
-    }
-    snapshot_id = f"sha256:{receipt['snapshot']['sha256']}"
-    reached = store.walk(snapshot_id)
-    reached_registry = {
-        row["id"] for row in reached if row["kind"] in {"spec", "vectors"}
-    }
-    if not expected_registry <= reached_registry:
-        raise RuntimeError("target snapshot closure does not reach adopted spec+vectors")
-
-    target_snapshot = store.snapshot(snapshot_id)
-    closure = tensorfs.Closure()
-    for row in reached:
-        if row["kind"] == "spec":
-            closure.insert(store.document(row["id"]))
-    tensorfs.run_doc("header", target_snapshot["header"], closure)
-    tensorfs.run_doc("header-serving", target_snapshot["header"], closure)
+    manifest_id = f"sha256:{receipt['manifest']['sha256']}"
+    target_manifest = store.manifest(manifest_id)
+    target_header = tensorfs.parse_header(target_manifest["header"])
+    if encoding not in {row["id"] for row in target_header["encodings"]}:
+        raise RuntimeError("target header did not inline the adopted registry encoding")
+    tensorfs.run_doc("header", target_manifest["header"])
+    tensorfs.run_doc("header-serving", target_manifest["header"])
 
     print(
         "DERIVED REGISTRY PASS plain/1->fp8-rowwise/1 "
-        f"encoding={encoding} closure_objects=2 receipt_replay=stable "
+        f"encoding={encoding} nested_encoding=present receipt_replay=stable "
         "unknown=refused serving=admitted"
     )
 

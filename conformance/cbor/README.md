@@ -16,7 +16,7 @@ The diagnostic JSON accepted by all three seats is projection-only:
   "configs": [[name, "sha256:<hex>", length, media_type], ...],
   "assets": [[name, "sha256:<logical>", length, media_type,
               [["sha256:<segment>", length], ...]], ...],
-  "encodings": [["sha256:<hex>", length], ...],
+  "encodings": [{logical_dtypes, logical_rank?, roles, doc?, vectors?}, ...],
   "components": [[name, [[key, dtype_name, shape, encoding_index,
                           [[role, dtype_name, shape,
                             {"inline_hex": "..."} |

@@ -1,10 +1,9 @@
-//! EncodingSpec — the only encoding identity is this object's content digest.
-//! Registry names are aliases (registry.rs), never identity.
+//! One nested encoding value inside a CozyTensors header. It is not a standalone document.
 
 use crate::canon::{as_arr, as_obj, as_str, Fields, Value};
 use crate::dtype::Dtype;
 use crate::err::{refuse, Code, Result};
-use crate::ids::{ascii_name, check_format, Doc, ObjectRef};
+use crate::ids::{ascii_name, ObjectRef};
 use crate::limits;
 use crate::relation::{Carrier, Relation};
 
@@ -26,6 +25,24 @@ pub struct EncodingSpec {
 }
 
 impl EncodingSpec {
+    pub fn canonical_bytes(&self) -> Vec<u8> {
+        crate::cbor::encode_encoding(self).expect("validated encoding value")
+    }
+
+    pub fn object_id(&self) -> String {
+        crate::ids::object_id(&self.canonical_bytes())
+    }
+
+    pub fn object_ref(&self) -> ObjectRef {
+        ObjectRef::of(&self.canonical_bytes())
+    }
+
+    /// Qualification-fixture seam for the exact nested CBOR value. Production headers
+    /// decode this value in place and never store it as an independent document.
+    pub fn decode_nested(bytes: &[u8]) -> Result<Self> {
+        crate::cbor::decode_encoding(bytes)
+    }
+
     pub fn role(&self, name: &str) -> Option<&Role> {
         self.roles.iter().find(|(n, _)| n == name).map(|(_, r)| r)
     }
@@ -49,17 +66,9 @@ impl EncodingSpec {
     }
 }
 
-impl Doc for EncodingSpec {
-    const FORMAT: &'static str = "tensorfs.encoding_spec/1";
-    const MAX_BYTES: usize = limits::SPEC_MAX_BYTES;
-
-    fn from_value(v: &Value) -> Result<Self> {
+impl EncodingSpec {
+    pub fn from_value(v: &Value) -> Result<Self> {
         let mut f = Fields::new("EncodingSpec", v)?;
-        check_format(
-            "EncodingSpec",
-            as_str("EncodingSpec", "format", f.req("format")?)?,
-            Self::FORMAT,
-        )?;
 
         let dts = as_arr("EncodingSpec", "logical_dtypes", f.req("logical_dtypes")?)?;
         if dts.is_empty() {
@@ -151,9 +160,8 @@ impl Doc for EncodingSpec {
         })
     }
 
-    fn to_value(&self) -> Value {
+    pub fn to_value(&self) -> Value {
         let mut fields = vec![
-            ("format", Value::str(Self::FORMAT)),
             (
                 "logical_dtypes",
                 Value::arr(

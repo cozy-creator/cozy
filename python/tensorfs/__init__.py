@@ -10,13 +10,13 @@ element sizes come from `DTYPES`, which is the compiled dtype enum, exported onc
     import torch, tensorfs
 
     store = tensorfs.Store.open("/var/lib/cozy/store")
-    snap  = store.snapshot(snapshot_id)
-    plan  = tensorfs.plan(snap["header"], traversal, window=WINDOW)
+    manifest = store.manifest(manifest_id)
+    plan  = tensorfs.plan(manifest["header"], traversal, window=WINDOW)
 
     slots = [torch.empty(SLOT, dtype=torch.uint8, pin_memory=True) for _ in range(4)]
     views = [memoryview(s.numpy()) for s in slots]
 
-    with store.acquire_snapshot(snapshot_id) as lease:
+    with store.acquire_manifest(manifest_id) as lease:
         def on_batch(b: tensorfs.Batch) -> None:
             copy_h2d(slots[b.slot][: b.nbytes])   # asynchronous
             b.release()                            # after the completion event
@@ -32,23 +32,20 @@ from __future__ import annotations
 
 from . import errors
 from ._ext import (
-    ERA,
     Batch,
     Closure,
     DerivedWriter,
+    Operation,
     ReadLease,
     ReadPlan,
     Store,
     __version__,
-    doc_kinds,
     dtypes,
+    doc_kinds,
     fetch_admit,
     fetch_complete,
     fetch_plan,
-    ingest_installed,
-    ingest_open_root,
-    ingest_read_root,
-    ingest_reap,
+    manifest_max_bytes,
     object_id,
     parse_header,
     parse_manifest,
@@ -62,6 +59,7 @@ from ._ext import (
     seed_digests,
     topology_digest,
     transfer_object,
+    transfer_manifest,
 )
 
 #: The closed carrier/logical dtype enum and its element sizes. The ONE export of dtype
@@ -71,24 +69,21 @@ DTYPES: dict[str, int] = dtypes()
 
 __all__ = [
     "DTYPES",
-    "ERA",
     "Batch",
     "Closure",
     "DerivedWriter",
+    "Operation",
     "ReadLease",
     "ReadPlan",
     "Store",
     "__version__",
-    "doc_kinds",
     "dtypes",
+    "doc_kinds",
     "errors",
     "fetch_admit",
     "fetch_complete",
     "fetch_plan",
-    "ingest_installed",
-    "ingest_open_root",
-    "ingest_read_root",
-    "ingest_reap",
+    "manifest_max_bytes",
     "object_id",
     "parse_header",
     "parse_manifest",
@@ -102,4 +97,5 @@ __all__ = [
     "seed_digests",
     "topology_digest",
     "transfer_object",
+    "transfer_manifest",
 ]

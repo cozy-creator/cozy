@@ -27,7 +27,7 @@ pub use gguf::{check_twin as gguf_check_twin, plan as gguf_plan, GgufPlan, Shape
 
 use crate::canon::{as_arr, as_str, Fields, Value};
 use crate::err::{refuse, Code, Result};
-use crate::ids::{ascii_name, check_format, prefixed, Doc, ObjectRef};
+use crate::ids::{ascii_name, prefixed, Doc, ObjectRef, Plain};
 use crate::limits;
 
 const DIALECTS: [&str; 5] = [
@@ -75,17 +75,11 @@ impl IngestProfile {
     }
 }
 
-impl Doc for IngestProfile {
-    const FORMAT: &'static str = "tensorfs.ingest_profile/1";
+impl Plain for IngestProfile {
     const MAX_BYTES: usize = limits::SPEC_MAX_BYTES;
 
     fn from_value(v: &Value) -> Result<Self> {
         let mut f = Fields::new("IngestProfile", v)?;
-        check_format(
-            "IngestProfile",
-            as_str("IngestProfile", "format", f.req("format")?)?,
-            Self::FORMAT,
-        )?;
         let class = f.req_str("class")?.to_string();
         if class != "normal" && class != "authorized_one_shot" {
             return refuse(
@@ -156,7 +150,6 @@ impl Doc for IngestProfile {
                 "expected_topology_digest",
                 Value::str(self.expected_topology_digest.clone()),
             ),
-            ("format", Value::str(Self::FORMAT)),
             (
                 "limits",
                 Value::obj(vec![
@@ -179,9 +172,8 @@ pub struct IngestSubject {
     pub candidates: Vec<ObjectRef>,
 }
 
-impl Doc for IngestSubject {
-    const FORMAT: &'static str = "tensorfs.ingest_subject/1";
-    // The subject's `candidates` is EVERY object the snapshot reaches, so it scales with the
+impl Plain for IngestSubject {
+    // The subject's `candidates` is EVERY object the manifest reaches, so it scales with the
     // artifact exactly as the header and the manifest do — 2,601 refs for a 6.9 GB SDXL
     // tree, 244 KiB of canonical bytes. It shared the fixed 64 KiB spec cap and therefore
     // WROTE fine and REFUSED SIZE_CAP on the way back in, which made `install` impossible
@@ -190,11 +182,6 @@ impl Doc for IngestSubject {
 
     fn from_value(v: &Value) -> Result<Self> {
         let mut f = Fields::new("IngestSubject", v)?;
-        check_format(
-            "IngestSubject",
-            as_str("IngestSubject", "format", f.req("format")?)?,
-            Self::FORMAT,
-        )?;
         let mut candidates = Vec::new();
         for c in as_arr("IngestSubject", "candidates", f.req("candidates")?)? {
             candidates.push(ObjectRef::from_value("candidates", c)?);
@@ -231,7 +218,6 @@ impl Doc for IngestSubject {
                 "candidates",
                 Value::arr(self.candidates.iter().map(|c| c.to_value()).collect()),
             ),
-            ("format", Value::str(Self::FORMAT)),
             ("profile", self.profile.to_value()),
             ("proposed_header", self.proposed_header.to_value()),
             (
@@ -270,7 +256,7 @@ pub enum Evidence {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct IngestVerificationReceipt {
     pub subject: ObjectRef,
-    pub snapshot: ObjectRef,
+    pub manifest: ObjectRef,
     pub header: ObjectRef,
     /// The ledger of what Stamp actually verified (tfs-009). The receipt attests; the
     /// stamp records the facts a consumer would otherwise have to re-derive — which is how
@@ -283,17 +269,17 @@ pub struct IngestVerificationReceipt {
 }
 
 impl IngestVerificationReceipt {
-    /// A receipt is evidence about ONE exact subject/snapshot/header/stamp tuple.
+    /// A receipt is evidence about ONE exact subject/manifest/header/stamp tuple.
     pub fn binds(
         &self,
         subject: &IngestSubject,
-        snapshot: &crate::manifest::SnapshotManifest,
+        manifest: &crate::manifest::Manifest,
         header: &crate::header::Header,
         stamp: &stamp::Stamp,
     ) -> Result<()> {
         for (what, got, want) in [
             ("subject", self.subject.clone(), subject.object_ref()),
-            ("snapshot", self.snapshot.clone(), snapshot.object_ref()),
+            ("manifest", self.manifest.clone(), manifest.object_ref()),
             ("header", self.header.clone(), header.object_ref()?),
             ("stamp", self.stamp.clone(), stamp.object_ref()),
         ] {
@@ -308,17 +294,11 @@ impl IngestVerificationReceipt {
     }
 }
 
-impl Doc for IngestVerificationReceipt {
-    const FORMAT: &'static str = "tensorfs.ingest_receipt/1";
+impl Plain for IngestVerificationReceipt {
     const MAX_BYTES: usize = limits::SPEC_MAX_BYTES;
 
     fn from_value(v: &Value) -> Result<Self> {
         let mut f = Fields::new("IngestVerificationReceipt", v)?;
-        check_format(
-            "IngestVerificationReceipt",
-            as_str("IngestVerificationReceipt", "format", f.req("format")?)?,
-            Self::FORMAT,
-        )?;
         let arms = as_arr("IngestVerificationReceipt", "evidence", f.req("evidence")?)?;
         if arms.len() != 1 {
             return refuse(
@@ -366,13 +346,13 @@ impl Doc for IngestVerificationReceipt {
         }
         let signature = f.req_str("signature")?.to_string();
         let signer = f.req_str("signer")?.to_string();
-        let snapshot = ObjectRef::from_value("receipt.snapshot", f.req("snapshot")?)?;
+        let manifest = ObjectRef::from_value("receipt.manifest", f.req("manifest")?)?;
         let stamp = ObjectRef::from_value("receipt.stamp", f.req("stamp")?)?;
         let subject = ObjectRef::from_value("receipt.subject", f.req("subject")?)?;
         f.done()?;
         Ok(IngestVerificationReceipt {
             subject,
-            snapshot,
+            manifest,
             header,
             stamp,
             evidence,
@@ -403,7 +383,6 @@ impl Doc for IngestVerificationReceipt {
         };
         Value::obj(vec![
             ("evidence", Value::arr(vec![arm])),
-            ("format", Value::str(Self::FORMAT)),
             ("header", self.header.to_value()),
             (
                 "observations",
@@ -416,7 +395,7 @@ impl Doc for IngestVerificationReceipt {
             ),
             ("signature", Value::str(self.signature.clone())),
             ("signer", Value::str(self.signer.clone())),
-            ("snapshot", self.snapshot.to_value()),
+            ("manifest", self.manifest.to_value()),
             ("stamp", self.stamp.to_value()),
             ("subject", self.subject.to_value()),
         ])

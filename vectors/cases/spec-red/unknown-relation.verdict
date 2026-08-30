@@ -1,4 +1,0 @@
-doc: spec
-expect: refuse
-code: UNKNOWN_RELATION
-note: tag outside the closed grammar

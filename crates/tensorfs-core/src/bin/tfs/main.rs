@@ -1,10 +1,6 @@
-//! tfs — the runnable conformance/benchmark tool for tfs-013.
+//! tfs — TensorFS store and CozyTensors inspection tool.
 //!
 //!   tfs registry                 print the seeded platform namespace (alias -> digest)
-//!   tfs vectors gen [dir]        (re)write the frozen golden-vector corpus
-//!   tfs vectors verify [dir]     run every vector live, print per-vector verdicts
-//!   tfs bench [tensors] [reps]   canonical-writer throughput + peak RSS
-//!   tfs flip                     identity-flip matrix over live documents
 //!   tfs id <file>                object id (+ derived ids) of a stored document
 //!   tfs cbor encode|decode|check <file>  header conformance seam; JSON is diagnostic only
 //!
@@ -12,9 +8,8 @@
 //! --range <off>:<len> --rate <f> --pass <n> --max-age <s> --slow-ms <n>
 //! --size <bytes> --small <n>, plus the dev-only kill points --fault <stage> --ready <path>.
 //!
-//!   tfs store init|info|bump <root>
-//!   tfs store record-arms       verification-record numeric/string boundary proof
-//!   tfs store migrate-records <root>  explicit no-payload NFS record hardcut
+//!   tfs store init|info <root>
+//!   tfs store rebuild <census> --rows <jsonl> [--sqlite <tensorfs.sqlite>]
 //!   tfs put <root> <file>        stream one object in (any shape)
 //!   tfs get <root> <hex>         verified read, whole or ranged
 //!   tfs contains <root> <hex>    the presence HINT, and what it is worth
@@ -32,14 +27,17 @@
 //!   tfs structure list                                  the bank, with provenance
 //!   tfs structure match <root> <hex>                    does this checkpoint match one?
 //!
-//! The snapshot plane (tfs-004). Flags: --iters <n>
+//! The repository/manifest/blob store (tfs-034).
 //!
-//!   tfs snapshot show <root> <hex>           strict decode, decode->re-encode identity, entries
-//!   tfs snapshot walk <root> <hex>           transitive root; every-and-only vs the store census
-//!   tfs snapshot verify <root> <hex>         full-checkpoint verify: every declared byte
-//!   tfs snapshot flip <root> <hex>           what moves checkpoint_id / header_digest / topology
-//!   tfs snapshot fuzz <root> <hex>           bounded mutation fuzz over canonical bytes
-//!   tfs snapshot blob put|read|repair <root> <file> [i]
+//!   tfs manifest admit|get|show|walk|verify <root> ...
+//!   tfs manifest inspect <manifest.json> --refs <jsonl>
+//!   tfs repo inspect <repo.json> --rows <jsonl>
+//!   tfs repo apply <current.json|-> <mutation.json> --out <replacement> --rows <jsonl>
+//!                  put_release also requires --manifest, --header and --inventory
+//!   tfs repo commit <store> <current.json|-> <mutation.json>
+//!   tfs key blob|manifest <sha256> | repo <org> <name>
+//!   tfs gc headers <census> --out <requests.jsonl>
+//!   tfs gc plan <census> --holds <holds.jsonl> --out <plan.jsonl>
 //!
 //! The checkpoint plane (tfs-015). Flags: --blocks <n> --pin <alias|empty> --seed <s>
 //! `write`/`read` also accept `--plain`, the closed all-`plain/1` fixture in PyTorch
@@ -51,99 +49,26 @@
 //!   tfs checkpoint locate <root> <hex> <component> <key> <role> <off> <len>
 //!   tfs checkpoint admit <root> <hex>        serving admission against the local pin
 //!   tfs checkpoint reproduce <root> <header.json> <entries.json>
-//!                                            verified refs -> canonical header + snapshot
+//!                                            verified refs -> canonical header + manifest
 //!   tfs checkpoint caps                      whole-document total caps, armed live
 //!   tfs checkpoint size [n]                  uniform-form header cost at H3 cardinality
-//!
-//! The ingest border (tfs-003) — the ONE normal tensor-ingest door. A `--source` names its
-//! component; a filename never authorizes anything. Flags: --source <c>=<path> (repeated)
-//! --config <c>=<path> --registry <path> --spec-variant <n> --session <s> --tenant <t>
-//! --ttl <s> --rekey <c>=<from>:<to> --order <construction.json>
-//! --rlimit-as-mb/-cpu-s/-fsize-mb --no-netns --now
-//!
-//!   tfs ingest inspect [--markers]           hermetic bounded decode + classification
-//!                                            --markers also decodes the `.comfy_quant`
-//!                                            payloads — the only tensor bytes inspect reads
-//!   tfs ingest bank <dialect> <fam> <var> <converter>   the REVIEW act: bank a fingerprint
-//!   tfs ingest plan <c=alias,...>            the plan, from headers alone: 0 tensor bytes
-//!                                            a component repeats for its ALLOWED SET
-//!   tfs ingest run <root> <c=alias,...>      spawn the isolated worker; candidate + receipt
-//!   tfs ingest-worker <root> <c=alias,...>   the hermetic child (invoked by `run`)
-//!   tfs ingest install <root> <session>      the coordinator promotes ONE root
-//!   tfs ingest restamp <root> <session>      re-verify a candidate; --plant <what> for arms
-//!   tfs ingest reingest <root> <hex> <target>  inherit by object reference: 0 bytes hashed
-//!   tfs ingest roots|reap <root>             candidates are not checkpoints
-//!   tfs ingest converters | golden           reviewed converters; geometry run live
-//!
-//! The gguf-v1 PLANNER (tfs-011) — a PLAN over a metadata region, never a second door.
-//! Flags: --probe (the input is a bounded metadata region) --tensors <n> --twin <rows.json>
-//!
-//!   tfs gguf plan <file>                     carrier-blob + per-tensor views, 0 weight bytes
-//!   tfs gguf admit <file>                    the same, then the admission verdict (refuses)
 //!
 //! Reads and projection (tfs-005). Flags: --workers <n> --window <b> --ring <b>
 //! --hold-secs <s> --drop-unreleased --no-symlink
 //!
-//!   tfs read lease <root> <snap>             acquire/verify/release one ReadLease
-//!   tfs read plan <root> <snap>              stored construction order + drift refusal
-//!   tfs read fill <root> <snap>              the pooled fill into a caller-owned ring
-//!   tfs read verify-fill <root> <snap>       the same bytes through the sequential path
-//!   tfs read span <root> <snap> <c> <k> <role> <off> <len>
-//!   tfs read arms <root> <snap>              the read/projection red arms, planted live
-//!   tfs read tear <root> <snap>              tear a verified object UNDER a live lease
-//!   tfs read prove <root> <snap>             delivered bytes vs the digests the header declares
+//!   tfs read lease <root> <manifest>         acquire/verify/release one ReadLease
+//!   tfs read plan <root> <manifest>          stored construction order + drift refusal
+//!   tfs read fill <root> <manifest>          the pooled fill into a caller-owned ring
+//!   tfs read verify-fill <root> <manifest>   the same bytes through the sequential path
+//!   tfs read span <root> <manifest> <c> <k> <role> <off> <len>
+//!   tfs read arms <root> <manifest>          the read/projection red arms, planted live
+//!   tfs read tear <root> <manifest>          tear a verified blob UNDER a live lease
+//!   tfs read prove <root> <manifest>         delivered bytes vs header digests
 //!   tfs read transform                       run decomposition + the block-granularity rule
-//!   tfs project <root> <snap> <dest>         tier 2: relative-symlink tree, no weight paths
-//!   tfs materialize <root> <file> <dest>     tier 3: stream a RETAINED carrier blob
+//!   tfs checkout <root> <manifest> <dest>    disposable relative-symlink tree
+//!   tfs materialize <root> <manifest> <path> <dest>  independent ordinary-file bytes
 //!   tfs render <root> <hex>                  pretty PROJECTION of a canonical document
 //!
-//! The layout plane (tfs-009) — Stamp is at the border; this is the SECOND operation.
-//! Flags: --contract <name> --closure <a,b> --pin <d,...> --lane canonical|local_unbordered
-//! --survey (every measured role set and the spec it selects, instead of the first gap)
-//! --registry <a,b> --corpus <f> --out <f> --truncate-at <n>
-//!
-//!   tfs compat import <rows.json>            measured rows -> canonical header + contract
-//!   tfs compat topology <root> <hex>         a header's own topology as a code contract
-//!   tfs compat check <code.json> <header.cbor>   Satisfied | Mismatch(details) + the facts
-//!   tfs compat release-cut <report.json>     unclassified extras never cut a release
-//!   tfs grade <report.json>                  COMPATIBLE|CONVERTIBLE|PRODUCIBLE|INCOMPATIBLE
-//!   tfs grade register <name> <kind> <spec>  the registration ACT: runs A->B->A
-//!   tfs grade decision <file>                read one grade decision, or refuse
-//!   tfs verify-request <code.json> <header.cbor>   build the bounded request document
-//!   tfs verify-compat <request> <response>   the hermetic verifier: one file in, one out
-//!   tfs verify-consume <request> <response>  the hub's side; partial output mints nothing
-//!
-//! The cloud publish protocol (tfs-017), GREEN branch. Core links no HTTP: these emit what
-//! a coordinator must sign and consume what the backend reported.
-//! Flags: --out <f> --expires-at <t> --length <n>
-//!
-//!   tfs cloud closure <root> <snap> <session>   DECLARE FIRST: the exact object set
-//!   tfs cloud artifact-set <document>           canonical first-party build object set
-//!   tfs cloud grant <set> <object-id>           both conditions, derived, not optional
-//!   tfs cloud verified <grant> <version> <etag> <checksum-b64>
-//!   tfs cloud conflict <grant> <resident-checksum>   honest duplicate, or quarantine
-//!   tfs cloud publish <closure> <facts-dir>     the atomic root, over facts only
-//!
-//! The pull plane (tfs-003 row 220) — cloud run backwards. Core links no HTTP, so the
-//! transport is the caller's and the bytes arrive on stdin. Flags: --out <path> --why
-//!
-//!   tfs fetch plan <root> <closure> <session>   split the declared set: HELD vs WANTED
-//!   tfs fetch admit <root> <plan> <object-id>   THE DOOR — stdin in, verified object out
-//!   tfs fetch complete <root> <plan>            every declared object verifiably resident
-//!
-//! Roots, holds and local GC (tfs-006, exclusive-and-explicit per tfs-020). Flags:
-//! --kind <k> --expect-generation <n> --source-url <u> --hold-secs <s> --ready <p>
-//! --limit <n> --dry-run --allow-empty --wait
-//!
-//!   tfs root list|register|release|open <root> [name] [snap]
-//!   tfs root note <root> <snap> --source-url <u>  provenance WITHOUT pinning
-//!   tfs root reconcile <root> <name>=<snap>...   the supervisor's binding set
-//!   tfs hold take|reap|steal <root> [snap|id]    owner-liveness holds
-//!   tfs rm <root> <snap>                         THE explicit tombstone — the only act
-//!                                                that makes bytes collectable
-//!   tfs gc mark|usage|sweep|reap|refs <root>     the census, the numbers, the cycle
-//!   tfs gc arms <root>                           the roots/GC red arms, planted live
-
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -152,13 +77,13 @@ use std::time::Instant;
 use tensorfs_core::canon;
 use tensorfs_core::compat::{self, Accepts, CodeTopology, CompatibilityReport, Lane, Requirement};
 use tensorfs_core::dtype::Dtype;
-use tensorfs_core::err::{refuse, Code, Refusal};
+use tensorfs_core::err::Refusal;
 use tensorfs_core::grade::{self, ConversionRegistration, Mapping};
 use tensorfs_core::header::{Asset, Body, Closure, Header, Part, Tensor};
-use tensorfs_core::ids::{ConfigRef, Doc, ObjectRef};
+use tensorfs_core::ids::{ConfigRef, Doc, ObjectRef, Plain};
 use tensorfs_core::ingest::stamp::Stamp;
 use tensorfs_core::ingest::{Evidence, IngestProfile, IngestSubject, IngestVerificationReceipt};
-use tensorfs_core::manifest::{BlobDescriptor, Draft, Entry, SnapshotManifest};
+use tensorfs_core::manifest::{Draft, Entry, Manifest};
 use tensorfs_core::registry;
 use tensorfs_core::spec::EncodingSpec;
 use tensorfs_core::store::{Fault, Store, Verdict, FAULT_STAGES};
@@ -191,9 +116,7 @@ fn main() -> ExitCode {
     match a.as_slice() {
         ["store", "init", r] => cmd_store(Path::new(r), "init"),
         ["store", "info", r] => cmd_store(Path::new(r), "info"),
-        ["store", "bump", r] => cmd_store(Path::new(r), "bump"),
-        ["store", "record-arms"] => record::cmd_arms(),
-        ["store", "migrate-records", r] => record::cmd_migrate(Path::new(r)),
+        ["store", "rebuild", r] => repo::cmd_rebuild(Path::new(r), &flags),
         ["put", r, f] => cmd_put(Path::new(r), Path::new(f), &flags),
         ["get", r, h] => cmd_get(Path::new(r), h, &flags),
         ["contains", r, h] => cmd_contains(Path::new(r), h),
@@ -213,9 +136,6 @@ fn main() -> ExitCode {
             len.parse().unwrap_or(0),
             &flags,
         ),
-        ["checkpoint", "reproduce", r, h, e] => {
-            snap::cmd_reproduce(Path::new(r), Path::new(h), Path::new(e), &flags)
-        }
         ["checkpoint", "admit", r, h] => ckpt::cmd_admit(Path::new(r), h, &flags),
         ["conform"] => conform::cmd_conform(None, &flags),
         ["conform", w] => conform::cmd_conform(Some(w), &flags),
@@ -229,24 +149,28 @@ fn main() -> ExitCode {
         }
         ["structure", "list"] => fixtures::cmd_list(),
         ["structure", "match", r, h] => fixtures::cmd_match(Path::new(r), h),
-        ["snapshot", "show", r, h] => snap::cmd_show(Path::new(r), h),
-        ["snapshot", "walk", r, h] => snap::cmd_walk(Path::new(r), h),
-        ["snapshot", "verify", r, h] => snap::cmd_verify(Path::new(r), h),
-        ["snapshot", "flip", r, h] => snap::cmd_flip(Path::new(r), h, &flags),
-        ["snapshot", "arms", r, h] => snap::cmd_arms(Path::new(r), h),
-        ["snapshot", "fuzz", r, h] => {
-            snap::cmd_fuzz(Path::new(r), h, flag_num(&flags, "iters", 20000))
+        ["manifest", "show", r, h] => snap::cmd_show(Path::new(r), h),
+        ["manifest", "get", r, h] => snap::cmd_get(Path::new(r), h, &flags),
+        ["manifest", "admit", r, p] => snap::cmd_admit(Path::new(r), Path::new(p), &flags),
+        ["manifest", "walk", r, h] => snap::cmd_walk(Path::new(r), h, &flags),
+        ["manifest", "verify", r, h] => snap::cmd_verify(Path::new(r), h),
+        ["checkpoint", "reproduce", r, h, e] => {
+            snap::cmd_reproduce(Path::new(r), Path::new(h), Path::new(e), &flags)
         }
-        ["snapshot", "blob", "put", r, f] => snap::cmd_blob_put(Path::new(r), Path::new(f)),
-        ["snapshot", "blob", "read", r, f] => {
-            snap::cmd_blob_read(Path::new(r), Path::new(f), &flags)
+        ["manifest", "inspect", p] => repo::cmd_manifest_inspect(Path::new(p), &flags),
+        ["repo", "inspect", p] => repo::cmd_repo_inspect(Path::new(p), &flags),
+        ["repo", "list", r] => repo::cmd_repo_list(Path::new(r), &flags),
+        ["repo", "get", r, org, name] => repo::cmd_repo_get(Path::new(r), org, name, &flags),
+        ["repo", "apply", current, mutation] => {
+            repo::cmd_repo_apply(current, Path::new(mutation), &flags)
         }
-        ["snapshot", "blob", "repair", r, f, i] => {
-            snap::cmd_blob_repair(Path::new(r), Path::new(f), i.parse().unwrap_or(0))
+        ["repo", "commit", store, current, mutation] => {
+            repo::cmd_repo_commit(Path::new(store), current, Path::new(mutation), &flags)
         }
-        ["checkpoint", "caps"] => ckpt::cmd_caps(),
-        ["checkpoint", "size"] => ckpt::cmd_size(3699),
-        ["checkpoint", "size", n] => ckpt::cmd_size(n.parse().unwrap_or(3699)),
+        ["key", kind, rest @ ..] => repo::cmd_key(kind, rest),
+        ["gc", "headers", census] => repo::cmd_gc_headers(Path::new(census), &flags),
+        ["gc", "holds", store] => repo::cmd_gc_holds(Path::new(store), &flags),
+        ["gc", "plan", census] => repo::cmd_gc_plan(Path::new(census), &flags),
         ["ingest", "inspect"] => ingest::cmd_inspect(&flags),
         ["gguf", "plan", f] => ingest::cmd_gguf_plan(Path::new(f), false, &flags),
         ["gguf", "admit", f] => ingest::cmd_gguf_plan(Path::new(f), true, &flags),
@@ -257,10 +181,15 @@ fn main() -> ExitCode {
         ["ingest", "run", r, t] => ingest::cmd_run(Path::new(r), t, &flags),
         ["ingest-worker", r, t] => ingest::cmd_worker(Path::new(r), t, &flags),
         ["ingest", "reingest", r, h, t] => ingest::cmd_reingest(Path::new(r), h, t, &flags),
-        ["ingest", "install", r, s] => ingest::cmd_install(Path::new(r), s),
+        ["ingest", "install", r, s, org, name, version, lane] => {
+            ingest::cmd_install(Path::new(r), s, org, name, version, lane)
+        }
         ["ingest", "restamp", r, s] => ingest::cmd_restamp(Path::new(r), s, &flags),
         ["ingest", "reap", r] => ingest::cmd_reap(Path::new(r), &flags),
-        ["ingest", "roots", r] => ingest::cmd_roots(Path::new(r)),
+        ["ingest", "sessions", r] => ingest::cmd_sessions(Path::new(r)),
+        ["checkpoint", "caps"] => ckpt::cmd_caps(),
+        ["checkpoint", "size"] => ckpt::cmd_size(3699),
+        ["checkpoint", "size", n] => ckpt::cmd_size(n.parse().unwrap_or(3699)),
         ["read", "lease", r, h] => rd::cmd_lease(Path::new(r), h, &flags),
         ["read", "plan", r, h] => rd::cmd_plan(Path::new(r), h, &flags),
         ["read", "fill", r, h] => rd::cmd_fill(Path::new(r), h, &flags),
@@ -278,35 +207,9 @@ fn main() -> ExitCode {
         ["read", "swap", r, h] => rd::cmd_swap(Path::new(r), h),
         ["read", "prove", r, h] => rd::cmd_prove(Path::new(r), h, &flags),
         ["read", "transform"] => rd::cmd_transform(),
-        ["project", r, h, d] => rd::cmd_project(Path::new(r), h, Path::new(d), &flags),
-        ["materialize", r, f, d] => rd::cmd_materialize(Path::new(r), Path::new(f), Path::new(d)),
+        ["checkout", r, h, d] => rd::cmd_checkout(Path::new(r), h, Path::new(d), &flags),
+        ["materialize", r, h, p, d] => rd::cmd_materialize(Path::new(r), h, p, Path::new(d)),
         ["render", r, h] => rd::cmd_render(Path::new(r), h),
-        ["root", v] => roots::cmd_root(Path::new(v), "list", &[], &flags),
-        ["root", "list", r] => roots::cmd_root(Path::new(r), "list", &[], &flags),
-        ["root", "register", r, n, h] => roots::cmd_root(Path::new(r), "register", &[n, h], &flags),
-        ["root", "note", r, h] => roots::cmd_root(Path::new(r), "note", &[h], &flags),
-        ["root", "release", r, n] => roots::cmd_root(Path::new(r), "release", &[n], &flags),
-        ["root", "open", r, n] => roots::cmd_root(Path::new(r), "open", &[n], &flags),
-        ["root", "reconcile", r, rest @ ..] => {
-            roots::cmd_root(Path::new(r), "reconcile", rest, &flags)
-        }
-        ["hold", "take", r] => roots::cmd_hold(Path::new(r), "take", &[], &flags),
-        ["hold", "take", r, h] => roots::cmd_hold(Path::new(r), "take", &[h], &flags),
-        ["hold", "reap", r] => roots::cmd_hold(Path::new(r), "reap", &[], &flags),
-        ["hold", "steal", r, i] => roots::cmd_hold(Path::new(r), "steal", &[i], &flags),
-        ["gc", "mark", r] => roots::cmd_gc(Path::new(r), "mark", &flags),
-        ["gc", "usage", r] => roots::cmd_gc(Path::new(r), "usage", &flags),
-        ["gc", "sweep", r] => roots::cmd_gc(Path::new(r), "sweep", &flags),
-        ["gc", "reap", r] => roots::cmd_gc(Path::new(r), "reap", &flags),
-        ["gc", "refs", r] => roots::cmd_gc(Path::new(r), "refs", &flags),
-        ["gc", "arms", r] => roots::cmd_arms(Path::new(r)),
-        ["rm", r, h] => roots::cmd_rm(Path::new(r), h),
-        ["cloud", "closure", r, h, s] => cloud::cmd_closure(Path::new(r), h, s, &flags),
-        ["cloud", "artifact-set", d] => cloud::cmd_artifact_set(Path::new(d), &flags),
-        ["cloud", "grant", c, i] => cloud::cmd_grant(Path::new(c), i, &flags),
-        ["cloud", "verified", g, v, e, c] => cloud::cmd_verified(Path::new(g), v, e, c, &flags),
-        ["cloud", "conflict", g, r] => cloud::cmd_conflict(Path::new(g), r),
-        ["cloud", "publish", c, d] => cloud::cmd_publish(Path::new(c), Path::new(d), &flags),
         ["fetch", "plan", r, d, s] => fetch::cmd_plan(Path::new(r), Path::new(d), s, &flags),
         ["fetch", "admit", r, p, i] => fetch::cmd_admit(Path::new(r), Path::new(p), i, &flags),
         ["fetch", "complete", r, p] => fetch::cmd_complete(Path::new(r), Path::new(p)),
@@ -322,13 +225,9 @@ fn main() -> ExitCode {
         ["verify-consume", q, o] => layout::cmd_consume(Path::new(q), Path::new(o)),
         ["registry"] => cmd_registry(),
         ["vectors", "gen"] => cmd_gen(&default_dir()),
-        ["vectors", "gen", d] => cmd_gen(Path::new(d)),
+        ["vectors", "gen", dir] => cmd_gen(Path::new(dir)),
         ["vectors", "verify"] => cmd_verify(&default_dir()),
-        ["vectors", "verify", d] => cmd_verify(Path::new(d)),
-        ["bench"] => cmd_bench(2000, 20),
-        ["bench", n] => cmd_bench(n.parse().unwrap_or(2000), 20),
-        ["bench", n, r] => cmd_bench(n.parse().unwrap_or(2000), r.parse().unwrap_or(20)),
-        ["flip"] => cmd_flip(),
+        ["vectors", "verify", dir] => cmd_verify(Path::new(dir)),
         ["cbor", "encode", f] => cmd_cbor("encode", Path::new(f), &flags),
         ["cbor", "decode", f] => cmd_cbor("decode", Path::new(f), &flags),
         ["cbor", "check", f] => cmd_cbor("check", Path::new(f), &flags),
@@ -389,30 +288,22 @@ macro_rules! ok {
 }
 
 mod ckpt;
-mod cloud;
 mod conform;
 mod fetch;
 mod fixtures;
 mod ingest;
 mod layout;
 mod rd;
-mod record;
-mod roots;
+mod repo;
 mod snap;
 
 fn cmd_store(root: &Path, verb: &str) -> ExitCode {
-    let mut s = match verb {
+    let s = match verb {
         "init" => ok!(Store::init(root)),
         _ => ok!(Store::open(root)),
     };
-    if verb == "bump" {
-        let g = ok!(s.bump_generation());
-        println!("generation bumped to {g} — every verification record is now stale");
-    }
     println!("root:       {}", s.root().display());
-    println!("era:        {}", tensorfs_core::store::ERA);
-    println!("generation: {}", s.generation());
-    println!("objects:    {}", ok!(s.objects()).len());
+    println!("blobs:      {}", ok!(s.objects()).len());
     ExitCode::SUCCESS
 }
 
@@ -463,8 +354,8 @@ fn cmd_contains(root: &Path, hex: &str) -> ExitCode {
     println!("contains:  {present}   (presence HINT only)");
     match s.record_valid(hex) {
         Ok(r) => println!(
-            "record:    valid (dev:ino {}:{}, {} bytes, generation {})",
-            r.dev, r.ino, r.length, r.generation
+            "record:    valid (dev:ino {}:{}, {} bytes)",
+            r.dev, r.ino, r.length
         ),
         Err(why) => println!("record:    INVALID — {why}"),
     }
@@ -707,6 +598,16 @@ fn cmd_bench_store(root: &Path, f: &Flags) -> ExitCode {
     ExitCode::SUCCESS
 }
 
+fn rss_kb(field: &str) -> u64 {
+    fs::read_to_string("/proc/self/status")
+        .unwrap_or_default()
+        .lines()
+        .find(|line| line.starts_with(field))
+        .and_then(|line| line.split_whitespace().nth(1))
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(0)
+}
+
 fn default_dir() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../vectors")
 }
@@ -792,9 +693,9 @@ fn config_ref() -> ConfigRef {
     }
 }
 
-fn encodings_of(specs: &[&EncodingSpec]) -> Vec<ObjectRef> {
-    let mut v: Vec<ObjectRef> = specs.iter().map(|s| s.object_ref()).collect();
-    v.sort_by(|a, b| a.sha256.cmp(&b.sha256));
+fn encodings_of(specs: &[&EncodingSpec]) -> Vec<EncodingSpec> {
+    let mut v: Vec<EncodingSpec> = specs.iter().map(|spec| (*spec).clone()).collect();
+    v.sort_by_key(EncodingSpec::object_id);
     v
 }
 
@@ -879,23 +780,22 @@ fn header_nvfp4() -> (Header, EncodingSpec) {
     (h, spec)
 }
 
-fn manifest_checkpoint(header: &Header, extra_file: bool) -> TfsResult<SnapshotManifest> {
-    let blob = BlobDescriptor::of(&pattern(4096));
+fn manifest_checkpoint(header: &Header, extra_file: bool) -> TfsResult<Manifest> {
     let mut entries = vec![
-        // The attachment is TYPED; this is the one path the same object is projected to.
         (
             "model.cozytensors".to_string(),
-            Entry::File(header.object_ref()?),
+            Entry::CozyTensors(header.object_ref()?),
         ),
-        ("tokenizer.model".to_string(), Entry::Blob(blob)),
-        ("transformer".to_string(), Entry::Dir),
+        (
+            "tokenizer.model".to_string(),
+            Entry::File(ObjectRef::of(&pattern(4096))),
+        ),
         (
             "transformer/config.json".to_string(),
             Entry::File(ObjectRef::of(br#"{"hidden_size":1536}"#)),
         ),
-        (tensorfs_core::manifest::ASSET_DIR.to_string(), Entry::Dir),
         (
-            tensorfs_core::manifest::asset_path(&tensorfs_core::sha256::hex_digest(b"one\ntwo\n")),
+            "assets/prompt.txt".to_string(),
             Entry::File(ObjectRef::of(b"one\ntwo\n")),
         ),
     ];
@@ -905,12 +805,8 @@ fn manifest_checkpoint(header: &Header, extra_file: bool) -> TfsResult<SnapshotM
             Entry::File(ObjectRef::of(br#"{"steps":30}"#)),
         ));
     }
-    entries.sort_by(|a, b| a.0.cmp(&b.0));
-    Draft {
-        header: Some(header.object_ref()?),
-        entries,
-    }
-    .seal()
+    entries.sort_by(|left, right| left.0.cmp(&right.0));
+    Draft { entries }.seal()
 }
 
 fn profile_normal(allowed: Vec<ObjectRef>, dialect: &str) -> IngestProfile {
@@ -941,14 +837,14 @@ fn subject(profile: &IngestProfile, header: &Header, tenant: &str) -> TfsResult<
 fn stamp_doc(
     prof: &IngestProfile,
     sub: &IngestSubject,
-    snap: &SnapshotManifest,
+    snap: &Manifest,
     header: &Header,
 ) -> TfsResult<Stamp> {
     Ok(Stamp {
         subject: sub.object_ref(),
         profile: prof.object_ref(),
         header: header.object_ref()?,
-        snapshot: snap.object_ref(),
+        manifest: snap.object_ref(),
         topology_digest: header.topology_digest(),
         converter_build: prof.converter_build.clone(),
         converter_recipe: prof.converter_recipe.clone(),
@@ -997,7 +893,7 @@ fn layout_plane_docs(
             })
             .collect(),
     };
-    let pin: Vec<String> = h.encodings.iter().map(|e| e.id()).collect();
+    let pin: Vec<String> = h.encodings.iter().map(EncodingSpec::object_id).collect();
     let out = compat::check_compatibility(&code, h, closure, &pin, Lane::Canonical, &[])?;
     let report = CompatibilityReport::of(&code, h, Lane::Canonical, &out)?;
     let reg = ConversionRegistration::register(
@@ -1013,14 +909,14 @@ fn layout_plane_docs(
 
 fn receipt(
     sub: &IngestSubject,
-    snap: &SnapshotManifest,
+    snap: &Manifest,
     header: &Header,
     stamp: &Stamp,
     signer: &str,
 ) -> TfsResult<IngestVerificationReceipt> {
     Ok(IngestVerificationReceipt {
         subject: sub.object_ref(),
-        snapshot: snap.object_ref(),
+        manifest: snap.object_ref(),
         header: header.object_ref()?,
         stamp: stamp.object_ref(),
         evidence: Evidence::ApprovedProducer {
@@ -1152,23 +1048,23 @@ fn build_corpus() -> TfsResult<(Vec<Case>, Vec<EncodingSpec>)> {
         "same topology and objects, opposite identity-bearing tensor order",
     ));
     cases.push(ok_case(
-        "spec",
+        "encoding",
         "plain",
-        "spec",
+        "encoding",
         plain.canonical_bytes(),
         "entry zero; carries vectors",
     ));
     cases.push(ok_case(
-        "spec",
+        "encoding",
         "mxfp8",
-        "spec",
+        "encoding",
         mxfp8.canonical_bytes(),
         "ceil-block scale relation; vectorless",
     ));
     cases.push(ok_case(
-        "spec",
+        "encoding",
         "svdq-microscale",
-        "spec",
+        "encoding",
         svdq.canonical_bytes(),
         "rank-7 permuted scale grid mined from v1",
     ));
@@ -1176,7 +1072,7 @@ fn build_corpus() -> TfsResult<(Vec<Case>, Vec<EncodingSpec>)> {
         "encoding_vectors",
         "plain",
         "vectors",
-        registry::plain_vectors().canonical_bytes(),
+        registry::plain_vectors().fixture_bytes(),
         "raw bit patterns: signed zero, NaN payload, infinity, rank-0",
     ));
 
@@ -1187,14 +1083,14 @@ fn build_corpus() -> TfsResult<(Vec<Case>, Vec<EncodingSpec>)> {
         "checkpoint",
         "manifest",
         snap.canonical_bytes(),
-        "checkpoint_id = snapshot_id, header attached structurally",
+        "manifest identity is its exact virtual-tree bytes",
     ));
     cases.push(ok_case(
         "manifest",
         "checkpoint-extra-file",
         "manifest",
         snap2.canonical_bytes(),
-        "one more sibling file: new checkpoint_id, same header id",
+        "one more sibling file: new manifest_id, same header id",
     ));
 
     let prof = profile_normal(
@@ -1478,8 +1374,8 @@ fn build_corpus() -> TfsResult<(Vec<Case>, Vec<EncodingSpec>)> {
         "segmented body is a non-empty ObjectRef array",
     ));
     let mut h = ha.clone();
-    h.encodings.push(ObjectRef::of(b"an uncited spec object"));
-    h.encodings.sort_by(|a, b| a.sha256.cmp(&b.sha256));
+    h.encodings.push(probe_spec());
+    h.encodings.sort_by_key(EncodingSpec::object_id);
     cases.push(red_case(
         g,
         "uncited-encoding",
@@ -1487,20 +1383,6 @@ fn build_corpus() -> TfsResult<(Vec<Case>, Vec<EncodingSpec>)> {
         h.conformance_bytes()?,
         "UNCITED_ENCODING",
         "derivable-fact law",
-    ));
-    let mut h = ha.clone();
-    h.components[0].1[1].1.encoding = tensorfs_core::ids::object_id(b"a spec nobody shipped");
-    let old = seed_spec("plain/1", 0).object_id();
-    h.encodings.retain(|encoding| encoding.id() != old);
-    h.encodings.push(ObjectRef::of(b"a spec nobody shipped"));
-    h.encodings.sort_by(|a, b| a.sha256.cmp(&b.sha256));
-    cases.push(red_case(
-        g,
-        "dangling-spec",
-        "header",
-        h.conformance_bytes()?,
-        "UNKNOWN_ENCODING",
-        "cited digest absent from the closure",
     ));
     let mut h = ha_bytes.clone();
     let key = b"blocks.0.norm.weight";
@@ -1746,311 +1628,86 @@ fn build_corpus() -> TfsResult<(Vec<Case>, Vec<EncodingSpec>)> {
         "carrier no longer equals the logical dtype",
     ));
 
-    // --- spec reds
-    let g = "spec-red";
-    let plain_bytes = plain.canonical_bytes();
+    // --- location-typed Manifest reds
+    let manifest_bytes = snap.canonical_bytes();
     cases.push(red_case(
-        g,
-        "optional-role",
-        "spec",
-        sub(
-            &plain_bytes,
-            "\"shape\":{\"t\":\"same\"}",
-            "\"optional\":true,\"shape\":{\"t\":\"same\"}",
-        ),
-        "OPTIONAL_ROLE_FORBIDDEN",
-        "no optional roles: one digest, one byte contract",
-    ));
-    cases.push(red_case(
-        g,
-        "unknown-relation",
-        "spec",
-        sub(&plain_bytes, "\"t\":\"same\"", "\"t\":\"stride\""),
-        "UNKNOWN_RELATION",
-        "tag outside the closed grammar",
-    ));
-    let mxfp8_bytes = mxfp8.canonical_bytes();
-    cases.push(red_case(
-        g,
-        "missing-logical-rank",
-        "spec",
-        sub(&mxfp8_bytes, ",\"logical_rank\":2", ""),
-        "MISSING_FIELD",
-        "dims relations require a pinned logical rank",
-    ));
-    cases.push(red_case(
-        g,
-        "unsorted-logical-dtypes",
-        "spec",
-        sub(
-            &mxfp8_bytes,
-            "[\"bf16\",\"f16\",\"f32\"]",
-            "[\"f32\",\"bf16\",\"f16\"]",
-        ),
-        "SORT_ORDER",
-        "closed set must be sorted unique",
-    ));
-
-    // --- manifest reds
-    let g = "manifest-red";
-    let header_ref = ha.object_ref()?;
-    let mut m = Draft::of(&snap);
-    let first = m
-        .entries
-        .iter()
-        .position(|(path, _)| path == "model.cozytensors")
-        .ok_or_else(|| Refusal {
-            code: Code::MISSING_FIELD,
-            detail: "corpus manifest lacks model.cozytensors".into(),
-        })?;
-    let second = m
-        .entries
-        .iter()
-        .position(|(path, _)| path == "tokenizer.model")
-        .ok_or_else(|| Refusal {
-            code: Code::MISSING_FIELD,
-            detail: "corpus manifest lacks tokenizer.model".into(),
-        })?;
-    m.entries.swap(first, second);
-    cases.push(red_case(
-        g,
-        "path-order",
-        "manifest",
-        m.canonical_bytes(),
-        "PATH_ORDER",
-        "entries must strictly ascend by bytes",
-    ));
-    let mut m = Draft::of(&snap);
-    m.entries.retain(|(p, _)| p != "transformer");
-    cases.push(red_case(
-        g,
-        "parent-missing",
-        "manifest",
-        m.canonical_bytes(),
-        "PATH_PARENT_MISSING",
-        "parents-before-children",
-    ));
-    let mut m = Draft::of(&snap);
-    m.entries.push((
-        "transformer/CONFIG.json".to_string(),
-        Entry::File(ObjectRef::of(b"x")),
-    ));
-    m.entries.sort_by(|a, b| a.0.cmp(&b.0));
-    cases.push(red_case(
-        g,
-        "case-collision",
-        "manifest",
-        m.canonical_bytes(),
-        "PATH_CASE_COLLISION",
-        "case-fold collision inside one tree",
-    ));
-    let mut m = Draft::of(&snap);
-    m.entries[1].0 = "../escape.bin".to_string();
-    m.entries.sort_by(|a, b| a.0.cmp(&b.0));
-    cases.push(red_case(
-        g,
-        "path-dotdot",
-        "manifest",
-        m.canonical_bytes(),
-        "PATH_ILLEGAL",
-        "dot component",
-    ));
-    let mut m = Draft::of(&snap);
-    m.entries[1].0 = "nul.bin".to_string();
-    m.entries.sort_by(|a, b| a.0.cmp(&b.0));
-    cases.push(red_case(
-        g,
-        "windows-reserved",
-        "manifest",
-        m.canonical_bytes(),
-        "PATH_RESERVED",
-        "reserved stem",
-    ));
-    let mut m = Draft::of(&snap);
-    if let Some((_, Entry::Blob(b))) = m
-        .entries
-        .iter_mut()
-        .find(|(path, _)| path == "tokenizer.model")
-    {
-        b.logical_size += 1;
-    }
-    cases.push(red_case(
-        g,
-        "blob-length",
-        "manifest",
-        m.canonical_bytes(),
-        "BYTE_LENGTH_MISMATCH",
-        "a GAP: the descriptor claims a byte the segments never deliver",
-    ));
-
-    // tfs-004: the reduced path semantics, the typed attachment, and the content-addressed
-    // closure. Every one of these is a document a foreign tree could ask us to represent.
-    let snap_bytes = snap.canonical_bytes();
-    cases.push(red_case(
-        g,
+        "manifest-red",
         "entry-kind-symlink",
         "manifest",
-        sub(&snap_bytes, "\"kind\":\"dir\"", "\"kind\":\"symlink\""),
+        sub(&manifest_bytes, "\"kind\":\"file\"", "\"kind\":\"symlink\""),
         "UNKNOWN_FIELD",
-        "REDUCED semantics: symlinks are unrepresentable, not merely unused",
+        "only file and cozytensors entries exist",
     ));
+    let mut draft = Draft::of(&snap);
+    draft.entries.clear();
     cases.push(red_case(
-        g,
-        "entry-executable-bit",
-        "manifest",
-        sub(
-            &snap_bytes,
-            "\"kind\":\"dir\"",
-            "\"executable\":true,\"kind\":\"dir\"",
-        ),
-        "UNKNOWN_FIELD",
-        "no executable bit: a mode is not a storage fact",
-    ));
-    cases.push(red_case(
-        g,
-        "unknown-version",
-        "manifest",
-        sub(&snap_bytes, "tensorfs.snapshot/1", "tensorfs.snapshot/2"),
-        "UNKNOWN_FORMAT",
-        "an unknown snapshot version refuses, never degrades",
-    ));
-    cases.push(red_case(
-        g,
-        "trailing-bytes",
-        "manifest",
-        [snap_bytes.clone(), b"{}".to_vec()].concat(),
-        "TRAILING_BYTES",
-        "one trailing byte: a semantic twin is never READ as a snapshot",
-    ));
-    cases.push(red_case(
-        g,
-        "path-backslash",
-        "manifest",
-        sub(
-            &snap_bytes,
-            "transformer/config.json",
-            "transformer\\\\up.json",
-        ),
-        "PATH_ILLEGAL",
-        "traversal by the other separator",
-    ));
-    let mut m = Draft::of(&snap);
-    m.entries.push((
-        "transformer/config.json".to_string(),
-        Entry::File(ObjectRef::of(b"twin")),
-    ));
-    m.entries.sort_by(|a, b| a.0.cmp(&b.0));
-    cases.push(red_case(
-        g,
-        "duplicate-path",
-        "manifest",
-        m.canonical_bytes(),
-        "PATH_ORDER",
-        "one path, one entry: strict ascent IS the duplicate refusal",
-    ));
-    let mut m = Draft::of(&snap);
-    m.entries.retain(|(p, _)| p != "model.cozytensors");
-    cases.push(red_case(
-        g,
-        "attachment-unlisted",
-        "manifest",
-        m.canonical_bytes(),
-        "ATTACHMENT_CARDINALITY",
-        "a header the projected tree does not contain",
-    ));
-    let mut m = Draft::of(&snap);
-    m.entries.push((
-        "model2.cozytensors".to_string(),
-        Entry::File(header_ref.clone()),
-    ));
-    m.entries.sort_by(|a, b| a.0.cmp(&b.0));
-    cases.push(red_case(
-        g,
-        "attachment-twice",
-        "manifest",
-        m.canonical_bytes(),
-        "ATTACHMENT_CARDINALITY",
-        "two pathnames for one header: which one is the checkpoint?",
-    ));
-    let mut m = Draft::of(&snap);
-    m.entries = vec![];
-    cases.push(red_case(
-        g,
+        "manifest-red",
         "entries-empty",
         "manifest",
-        m.canonical_bytes(),
+        draft.canonical_bytes(),
         "MISSING_FIELD",
-        "a snapshot with nothing in it",
+        "a manifest lists at least one path",
     ));
-    let mut m = Draft::of(&snap);
-    let spec_obj = plain.object_ref();
-    m.entries
-        .push((tensorfs_core::manifest::CLOSURE_DIR.to_string(), Entry::Dir));
-    m.entries.push((
-        tensorfs_core::manifest::closure_path(&spec_obj.sha256),
-        Entry::File(spec_obj.clone()),
+    let mut draft = Draft::of(&snap);
+    draft.entries.push((
+        "../escape".to_string(),
+        Entry::File(ObjectRef::of(b"escape")),
     ));
-    m.entries.sort_by(|a, b| a.0.cmp(&b.0));
-    cases.push(ok_case(
-        g,
-        "closure-contained",
-        "manifest",
-        m.canonical_bytes(),
-        "a contained EncodingSpec at the path whose terminal IS its digest",
-    ));
-    let good = m.canonical_bytes();
-    let mut wrong = spec_obj.sha256.clone();
-    wrong.replace_range(0..1, if wrong.starts_with('a') { "b" } else { "a" });
+    draft.entries.sort_by(|left, right| left.0.cmp(&right.0));
     cases.push(red_case(
-        g,
-        "closure-digest-mismatch",
+        "manifest-red",
+        "path-dotdot",
         "manifest",
-        sub(
-            &good,
-            &format!("closure/{}.json", spec_obj.sha256),
-            &format!("closure/{wrong}.json"),
-        ),
-        "PATH_DIGEST_MISMATCH",
-        "a content-addressed path that names something else",
+        draft.canonical_bytes(),
+        "PATH_ILLEGAL",
+        "dot components are unrepresentable",
     ));
-    let mut m = Draft::of(&snap);
-    if let Some((_, Entry::Blob(b))) = m
-        .entries
-        .iter_mut()
-        .find(|(path, _)| path == "tokenizer.model")
-    {
-        // a HOLE: a non-final segment short of the profile grid
-        b.segments.push(b.segments[0].clone());
-        b.logical_size *= 2;
-    }
-    cases.push(red_case(
-        g,
-        "blob-hole",
-        "manifest",
-        m.canonical_bytes(),
-        "BYTE_LENGTH_MISMATCH",
-        "sparse holes are unrepresentable: the profile fixes every boundary",
+    let mut draft = Draft::of(&snap);
+    draft.entries.push((
+        "TOKENIZER.MODEL".to_string(),
+        Entry::File(ObjectRef::of(b"case")),
     ));
-    let mut m = Draft::of(&snap);
-    if let Some((_, Entry::Blob(b))) = m
-        .entries
-        .iter_mut()
-        .find(|(path, _)| path == "tokenizer.model")
-    {
-        b.logical_size -= 1;
-    }
+    draft.entries.sort_by(|left, right| left.0.cmp(&right.0));
     cases.push(red_case(
-        g,
-        "blob-overlap",
+        "manifest-red",
+        "case-collision",
         "manifest",
-        m.canonical_bytes(),
-        "BYTE_LENGTH_MISMATCH",
-        "segments that claim more bytes than the blob has",
+        draft.canonical_bytes(),
+        "PATH_CASE_COLLISION",
+        "portable paths cannot collide under ASCII case folding",
+    ));
+    let mut draft = Draft::of(&snap);
+    draft.entries.push((
+        "CON.txt".to_string(),
+        Entry::File(ObjectRef::of(b"reserved")),
+    ));
+    draft.entries.sort_by(|left, right| left.0.cmp(&right.0));
+    cases.push(red_case(
+        "manifest-red",
+        "windows-reserved",
+        "manifest",
+        draft.canonical_bytes(),
+        "PATH_RESERVED",
+        "portable paths reject Windows reserved stems",
+    ));
+    let mut draft = Draft::of(&snap);
+    draft.entries.push((
+        "model2.cozytensors".to_string(),
+        Entry::CozyTensors(ha.object_ref()?),
+    ));
+    draft.entries.sort_by(|left, right| left.0.cmp(&right.0));
+    cases.push(red_case(
+        "manifest-red",
+        "cozytensors-twice",
+        "manifest",
+        draft.canonical_bytes(),
+        "ATTACHMENT_CARDINALITY",
+        "one manifest carries at most one CozyTensors header",
     ));
 
     // --- the border's own documents (tfs-003)
     let g = "ingest";
-    let root = tensorfs_core::ingest::transaction::IngestRoot {
+    let session = tensorfs_core::ingest::transaction::IngestSession {
         session: "e3b0c44298fc1c14".to_string(),
         tenant: "acme".to_string(),
         created: 1787600000,
@@ -2059,20 +1716,20 @@ fn build_corpus() -> TfsResult<(Vec<Case>, Vec<EncodingSpec>)> {
     };
     cases.push(ok_case(
         g,
-        "ingest-root",
-        "root",
-        root.canonical_bytes(),
-        "an expiring quarantine root: a candidate is never a checkpoint",
+        "ingest-session",
+        "session",
+        session.canonical_bytes(),
+        "an expiring quarantine session: a candidate is never a release",
     ));
 
     // --- ingest reds
     let g = "ingest-red";
-    let mut future = root.clone();
+    let mut future = session.clone();
     future.session = "not a session name".to_string();
     cases.push(red_case(
         g,
-        "root-session-grammar",
-        "root",
+        "session-grammar",
+        "session",
         future.canonical_bytes(),
         "KEY_GRAMMAR",
         "a session id is an ASCII name, never free text",
@@ -2140,126 +1797,7 @@ fn build_corpus() -> TfsResult<(Vec<Case>, Vec<EncodingSpec>)> {
         });
     }
 
-    cases.extend(meta_cases());
     Ok((cases, specs))
-}
-
-/// The metadata authority document (tfs-006) and the degraded-behaviour receipt (tfs-005).
-/// The authority is the one document that decides what may be deleted, so its decoder is
-/// frozen here with the same discipline as the header's.
-fn meta_cases() -> Vec<Case> {
-    use tensorfs_core::meta::{HoldRow, QRow, RootRow, SnapshotRow, State};
-
-    let snap = "a".repeat(64);
-    let other = "b".repeat(64);
-    let full = State::from_records(
-        7,
-        vec![
-            SnapshotRow {
-                snapshot: snap.clone(),
-                known_at: 100,
-                tombstoned: false,
-                source_url: String::new(),
-                last_used: 140,
-                // The ingest receipt this snapshot keeps beside its transitive graph.
-                evidence: vec!["e".repeat(64)],
-            },
-            SnapshotRow {
-                snapshot: other.clone(),
-                known_at: 101,
-                tombstoned: true,
-                source_url: "https://example.invalid/m".to_string(),
-                last_used: 141,
-                evidence: Vec::new(),
-            },
-        ],
-        vec![RootRow {
-            name: "binding-0".to_string(),
-            snapshot: snap.clone(),
-            kind: "binding".to_string(),
-            created: 120,
-        }],
-        vec![HoldRow {
-            id: "read-1-2".to_string(),
-            kind: "read".to_string(),
-            snapshot: other.clone(),
-            objects: vec!["c".repeat(64)],
-            owner_pid: 4242,
-            boot_epoch: 1700000000,
-            acquired: 130,
-        }],
-        vec![QRow {
-            object: "d".repeat(64),
-            claim_generation: 6,
-        }],
-    );
-    let bytes = full.canonical_bytes();
-    let mut out = vec![ok_case(
-        "meta",
-        "authority-full",
-        "meta",
-        bytes.clone(),
-        "all four record kinds in one transaction document",
-    )];
-
-    // Order is part of the document: an unsorted twin re-encodes differently, so it can
-    // neither round-trip nor be believed. Two authorities disagreeing is what this refuses.
-    let unsorted = String::from_utf8(bytes.clone()).unwrap();
-    let swapped = {
-        // Emit the snapshots array with the two rows exchanged, by rendering a state whose
-        // decode order is reversed. Canonical writing sorts, so plant the bytes directly.
-        let mut s = unsorted.clone();
-        let a = format!("\"snapshot\":\"{snap}\"");
-        let b = format!("\"snapshot\":\"{other}\"");
-        let (ia, ib) = (s.find(&a).unwrap(), s.rfind(&b).unwrap());
-        if ia < ib {
-            s.replace_range(ib..ib + b.len(), &a);
-            s.replace_range(ia..ia + a.len(), &b);
-        }
-        s
-    };
-    out.push(red_case(
-        "meta-red",
-        "records-out-of-order",
-        "meta",
-        swapped.into_bytes(),
-        "SORT_ORDER",
-        "two snapshot rows in descending order — an unsorted authority is refused",
-    ));
-    out.push(red_case(
-        "meta-red",
-        "hold-nonhex-snapshot",
-        "meta",
-        String::from_utf8(bytes.clone())
-            .unwrap()
-            .replacen(
-                &format!("\"snapshot\":\"{other}\""),
-                "\"snapshot\":\"latest\"",
-                1,
-            )
-            .into_bytes(),
-        "MALFORMED_DIGEST",
-        "a hold pinning a NAME instead of an immutable snapshot id",
-    ));
-    out.push(red_case(
-        "meta-red",
-        "unknown-record-field",
-        "meta",
-        String::from_utf8(bytes)
-            .unwrap()
-            // Inserted in SORTED position on purpose: out of order it would be refused one
-            // layer earlier, by the canonical reader, and this arm is about the FIELD.
-            .replacen(
-                "\"boot_epoch\":1700000000",
-                "\"boot_epoch\":1700000000,\"expires_at\":999",
-                1,
-            )
-            .into_bytes(),
-        "UNKNOWN_FIELD",
-        "a wall-clock expiry smuggled onto a LOCAL hold — local liveness is owner-evidence",
-    ));
-
-    out
 }
 
 // ------------------------------------------------------------------ gen
@@ -2278,7 +1816,7 @@ fn cmd_gen(dir: &Path) -> ExitCode {
     for s in &specs {
         let id = s.object_id();
         fs::write(
-            dir.join("closure").join(format!("{}.json", &id[7..19])),
+            dir.join("closure").join(format!("{}.cbor", &id[7..19])),
             s.canonical_bytes(),
         )
         .unwrap();
@@ -2287,7 +1825,7 @@ fn cmd_gen(dir: &Path) -> ExitCode {
     for c in &cases {
         let d = dir.join("cases").join(c.group);
         fs::create_dir_all(&d).unwrap();
-        let extension = if matches!(c.doc, "header" | "header-serving") {
+        let extension = if matches!(c.doc, "header" | "header-serving" | "encoding") {
             "cbor"
         } else {
             "json"
@@ -2304,10 +1842,8 @@ fn cmd_gen(dir: &Path) -> ExitCode {
                 v += &format!("topology: {}\n", h.topology_digest());
             }
             if c.doc == "manifest" {
-                let m = SnapshotManifest::parse(&c.bytes).unwrap();
-                if let Ok(cid) = m.checkpoint_id() {
-                    v += &format!("checkpoint: {cid}\n");
-                }
+                let m = Manifest::parse(&c.bytes).unwrap();
+                v += &format!("manifest: {}\n", m.manifest_id());
             }
         }
         v += &format!("note: {}\n", c.note);
@@ -2328,7 +1864,7 @@ enum Outcome {
     Ok {
         id: String,
         topology: Option<String>,
-        checkpoint: Option<String>,
+        manifest: Option<String>,
     },
     Refused(Refusal),
 }
@@ -2339,7 +1875,7 @@ fn run_doc(doc: &str, bytes: &[u8], closure: &Closure, platform: &[String]) -> O
         Ok(o) => Outcome::Ok {
             id: o.id,
             topology: o.topology,
-            checkpoint: o.checkpoint,
+            manifest: o.manifest,
         },
         Err(e) => Outcome::Refused(e),
     }
@@ -2367,7 +1903,7 @@ fn cmd_verify(dir: &Path) -> ExitCode {
     for e in fs::read_dir(dir.join("closure")).expect("closure dir") {
         let p = e.unwrap().path();
         let bytes = fs::read(&p).unwrap();
-        match EncodingSpec::parse(&bytes) {
+        match EncodingSpec::decode_nested(&bytes) {
             Ok(s) => closure.insert(s),
             Err(err) => {
                 println!("FAIL closure/{}: {err}", p.display());
@@ -2413,7 +1949,7 @@ fn cmd_verify(dir: &Path) -> ExitCode {
                     Outcome::Ok {
                         id,
                         topology,
-                        checkpoint,
+                        manifest,
                     },
                 ) => {
                     let mut bad = Vec::new();
@@ -2425,9 +1961,9 @@ fn cmd_verify(dir: &Path) -> ExitCode {
                             bad.push(format!("topology {topology:?} != frozen {t}"));
                         }
                     }
-                    if let Some(c) = field(&v, "checkpoint") {
-                        if checkpoint.as_deref() != Some(c.as_str()) {
-                            bad.push(format!("checkpoint {checkpoint:?} != frozen {c}"));
+                    if let Some(expected) = field(&v, "manifest") {
+                        if manifest.as_deref() != Some(expected.as_str()) {
+                            bad.push(format!("manifest {manifest:?} != frozen {expected}"));
                         }
                     }
                     if bad.is_empty() {
@@ -2496,8 +2032,7 @@ fn cmd_verify(dir: &Path) -> ExitCode {
     let cpof = |n: &str| -> String {
         match get(n) {
             Some(Outcome::Ok {
-                checkpoint: Some(c),
-                ..
+                manifest: Some(c), ..
             }) => c.clone(),
             _ => String::new(),
         }
@@ -2505,13 +2040,13 @@ fn cmd_verify(dir: &Path) -> ExitCode {
     let short = |value: String| value.chars().take(19).collect::<String>();
     let mut cross: Vec<(String, bool, String)> = Vec::new();
     cross.push((
-        "checkpoint_id == snapshot_id (unconditional)".into(),
+        "manifest_id == manifest_id (unconditional)".into(),
         cpof("manifest/checkpoint") == idof("manifest/checkpoint")
             && !cpof("manifest/checkpoint").is_empty(),
         cpof("manifest/checkpoint"),
     ));
     cross.push((
-        "header ObjectId != checkpoint_id".into(),
+        "header ObjectId != manifest_id".into(),
         idof("header/plain-fp8") != cpof("manifest/checkpoint"),
         format!(
             "{} vs {}",
@@ -2532,7 +2067,7 @@ fn cmd_verify(dir: &Path) -> ExitCode {
         topof("header/plain-fp8-reordered"),
     ));
     cross.push((
-        "one more sibling file flips checkpoint_id only".into(),
+        "one more sibling file flips manifest_id only".into(),
         cpof("manifest/checkpoint") != cpof("manifest/checkpoint-extra-file"),
         cpof("manifest/checkpoint-extra-file"),
     ));
@@ -2546,7 +2081,7 @@ fn cmd_verify(dir: &Path) -> ExitCode {
     let cstamp = ok!(stamp_doc(&cprof, &csub, &csnap, &cha));
     let crcpt = ok!(receipt(&csub, &csnap, &cha, &cstamp, "platform-key-1"));
     cross.push((
-        "receipt binds its exact subject/snapshot/header/stamp".into(),
+        "receipt binds its exact subject/manifest/header/stamp".into(),
         crcpt.binds(&csub, &csnap, &cha, &cstamp).is_ok(),
         String::new(),
     ));
@@ -2597,298 +2132,6 @@ fn truncate(s: &str, n: usize) -> String {
     }
 }
 
-// ------------------------------------------------------------------ bench
-
-fn rss_kb(field: &str) -> u64 {
-    fs::read_to_string("/proc/self/status")
-        .unwrap_or_default()
-        .lines()
-        .find(|l| l.starts_with(field))
-        .and_then(|l| l.split_whitespace().nth(1).and_then(|n| n.parse().ok()))
-        .unwrap_or(0)
-}
-
-fn cmd_bench(tensors: usize, reps: usize) -> ExitCode {
-    let plain = seed_spec("plain/1", 0);
-    let fp8 = seed_spec("fp8-rowwise/1", 0);
-    let mut closure = Closure::default();
-    closure.insert(plain.clone());
-    closure.insert(fp8.clone());
-
-    let build = Instant::now();
-    let mut ts = Vec::with_capacity(tensors);
-    for i in 0..tensors {
-        let key = format!(
-            "blocks.{}.attn.to_{}.weight",
-            i / 4,
-            "qkvo".as_bytes()[i % 4] as char
-        );
-        ts.push((
-            key,
-            Tensor {
-                dtype: Dtype::Bf16,
-                shape: vec![4096, 4096],
-                encoding: fp8.object_id(),
-                parts: vec![
-                    (
-                        "data".to_string(),
-                        Part {
-                            dtype: Dtype::F8E4M3FN,
-                            shape: vec![4096, 4096],
-                            body: Body::Segments(
-                                (0..4)
-                                    .map(|s| ObjectRef {
-                                        sha256: tensorfs_core::sha256::hex_digest(
-                                            format!("{i}:{s}").as_bytes(),
-                                        ),
-                                        length: 4 * 1024 * 1024,
-                                    })
-                                    .collect(),
-                            ),
-                        },
-                    ),
-                    ("scale".to_string(), part_of(Dtype::F32, vec![4096])),
-                ],
-            },
-        ));
-    }
-    let h = Header {
-        configs: vec![("transformer".to_string(), config_ref())],
-        assets: vec![],
-        encodings: encodings_of(&[&fp8]),
-        components: vec![("transformer".to_string(), ts)],
-    };
-    let build_s = build.elapsed().as_secs_f64();
-
-    let t = Instant::now();
-    let mut bytes = Vec::new();
-    for _ in 0..reps {
-        bytes = ok!(h.canonical_bytes());
-    }
-    let write_s = t.elapsed().as_secs_f64();
-
-    let t = Instant::now();
-    let mut id = String::new();
-    for _ in 0..reps {
-        id = tensorfs_core::ids::object_id(&bytes);
-    }
-    let hash_s = t.elapsed().as_secs_f64();
-
-    let t = Instant::now();
-    for _ in 0..reps {
-        ok!(Header::parse(&bytes));
-    }
-    let parse_s = t.elapsed().as_secs_f64();
-
-    let parsed = ok!(Header::parse(&bytes));
-    let t = Instant::now();
-    for _ in 0..reps {
-        ok!(parsed.validate(&closure));
-    }
-    let val_s = t.elapsed().as_secs_f64();
-
-    let t = Instant::now();
-    let mut topo = String::new();
-    for _ in 0..reps {
-        topo = parsed.topology_digest();
-    }
-    let topo_s = t.elapsed().as_secs_f64();
-
-    let mb = bytes.len() as f64 / (1024.0 * 1024.0);
-    println!(
-        "header: {tensors} tensors, {} B canonical ({mb:.2} MiB), built in {build_s:.3}s",
-        bytes.len()
-    );
-    println!("id: {id}");
-    println!("topology_digest: {topo}");
-    println!("reps: {reps}");
-    let row = |what: &str, s: f64| {
-        println!(
-            "  {what:<22} {:>8.1} ms/doc   {:>7.1} docs/s   {:>8.1} MiB/s",
-            s / reps as f64 * 1000.0,
-            reps as f64 / s,
-            mb * reps as f64 / s
-        )
-    };
-    row("canonical write", write_s);
-    row("sha256 id", hash_s);
-    row("strict parse", parse_s);
-    row("validate", val_s);
-    row("topology projection", topo_s);
-    println!(
-        "  peak RSS {:.1} MiB (current {:.1} MiB)",
-        rss_kb("VmHWM") as f64 / 1024.0,
-        rss_kb("VmRSS") as f64 / 1024.0
-    );
-    ExitCode::SUCCESS
-}
-
-// ------------------------------------------------------------------ flip matrix
-
-fn cmd_flip() -> ExitCode {
-    match flip_matrix() {
-        Ok(()) => ExitCode::SUCCESS,
-        Err(error) => bail(error),
-    }
-}
-
-fn flip_matrix() -> TfsResult<()> {
-    let (ha, _) = header_a(Some(config_ref()));
-    let snap = manifest_checkpoint(&ha, false)?;
-    let prof = profile_normal(
-        vec![seed_spec("plain/1", 0).object_ref()],
-        "safetensors.diffusers",
-    );
-    let sub0 = subject(&prof, &ha, "acme")?;
-    let st0 = stamp_doc(&prof, &sub0, &snap, &ha)?;
-    let r0 = receipt(&sub0, &snap, &ha, &st0, "platform-key-1")?;
-
-    let base = (
-        ha.object_id()?,
-        ha.topology_digest(),
-        snap.checkpoint_id()?,
-        sub0.object_id(),
-        r0.object_id(),
-    );
-
-    // (what changed, the five ids it produced, which of the five flipped)
-    type FlipRow = (
-        &'static str,
-        (String, String, String, String, String),
-        [bool; 5],
-    );
-    let mut rows: Vec<FlipRow> = Vec::new();
-
-    let mut h = ha.clone();
-    if let Body::Segments(s) = &mut h.components[0].1[0].1.parts[0].1.body {
-        s[0].sha256 = tensorfs_core::sha256::hex_digest(b"different weight bytes");
-    }
-    let s = manifest_checkpoint(&h, false)?;
-    rows.push((
-        "artifact bytes change",
-        (
-            h.object_id()?,
-            h.topology_digest(),
-            s.checkpoint_id()?,
-            sub0.object_id(),
-            r0.object_id(),
-        ),
-        [true, false, true, false, false],
-    ));
-
-    let mut h = ha.clone();
-    h.components[0].1[1].1.dtype = Dtype::F16;
-    h.components[0].1[1].1.parts[0].1.dtype = Dtype::F16;
-    let s = manifest_checkpoint(&h, false)?;
-    rows.push((
-        "logical dtype change",
-        (
-            h.object_id()?,
-            h.topology_digest(),
-            s.checkpoint_id()?,
-            sub0.object_id(),
-            r0.object_id(),
-        ),
-        [true, true, true, false, false],
-    ));
-
-    let (h, _) = header_a(None);
-    let s = manifest_checkpoint(&h, false)?;
-    rows.push((
-        "config change",
-        (
-            h.object_id()?,
-            h.topology_digest(),
-            s.checkpoint_id()?,
-            sub0.object_id(),
-            r0.object_id(),
-        ),
-        [true, false, true, false, false],
-    ));
-
-    let s = manifest_checkpoint(&ha, true)?;
-    rows.push((
-        "snapshot gains a file",
-        (
-            ha.object_id()?,
-            ha.topology_digest(),
-            s.checkpoint_id()?,
-            sub0.object_id(),
-            r0.object_id(),
-        ),
-        [false, false, true, false, false],
-    ));
-
-    let sub1 = subject(&prof, &ha, "other-tenant")?;
-    rows.push((
-        "tenant change",
-        (
-            ha.object_id()?,
-            ha.topology_digest(),
-            snap.checkpoint_id()?,
-            sub1.object_id(),
-            r0.object_id(),
-        ),
-        [false, false, false, true, false],
-    ));
-
-    let r1 = receipt(&sub0, &snap, &ha, &st0, "platform-key-2-rotated")?;
-    rows.push((
-        "signer rotation",
-        (
-            ha.object_id()?,
-            ha.topology_digest(),
-            snap.checkpoint_id()?,
-            sub0.object_id(),
-            r1.object_id(),
-        ),
-        [false, false, false, false, true],
-    ));
-
-    println!("identity-flip matrix (expected flips vs observed)");
-    println!(
-        "{:<24} {:>10} {:>10} {:>12} {:>10} {:>10}",
-        "change", "header", "topology", "checkpoint", "subject", "receipt"
-    );
-    let mut ok = true;
-    for (what, got, want) in &rows {
-        let obs = [
-            got.0 != base.0,
-            got.1 != base.1,
-            got.2 != base.2,
-            got.3 != base.3,
-            got.4 != base.4,
-        ];
-        let cell = |i: usize| {
-            let mark = if obs[i] == want[i] { "" } else { " <-WRONG" };
-            ok &= obs[i] == want[i];
-            format!("{}{}", if obs[i] { "FLIP" } else { "same" }, mark)
-        };
-        let cells: Vec<String> = (0..5).map(cell).collect();
-        println!(
-            "{what:<24} {:>10} {:>10} {:>12} {:>10} {:>10}",
-            cells[0], cells[1], cells[2], cells[3], cells[4]
-        );
-    }
-    // alias identity: the alias lives outside the spec object, so renaming flips nothing.
-    let plain = seed_spec("plain/1", 0);
-    let mut renamed = plain.clone();
-    renamed.doc = plain.doc.clone();
-    let alias_stable = renamed.object_id() == plain.object_id();
-    println!(
-        "{:<24} {:>10}",
-        "alias rename/promotion",
-        if alias_stable { "same" } else { "FLIP <-WRONG" }
-    );
-    ok &= alias_stable;
-    if ok {
-        println!("\nall flips as designed");
-        Ok(())
-    } else {
-        refuse(Code::OBJECT_ID_MISMATCH, "identity flip matrix disagrees")
-    }
-}
-
 // ------------------------------------------------------------------ id
 
 fn cmd_id(p: &Path) -> ExitCode {
@@ -2909,14 +2152,9 @@ fn cmd_id(p: &Path) -> ExitCode {
             Ok(value) => println!("pretty:\n{}", canon::pretty(&value, 0)),
             Err(error) => return bail(error),
         }
-    } else if let Ok(m) = SnapshotManifest::parse(&bytes) {
-        println!("kind:      snapshot manifest");
-        match m.checkpoint_id() {
-            Ok(c) => println!("checkpoint_id: {c}"),
-            Err(e) => println!("checkpoint_id: n/a ({})", e.code.as_str()),
-        }
-    } else if let Ok(s) = EncodingSpec::parse(&bytes) {
-        println!("kind:      encoding spec ({} roles)", s.roles.len());
+    } else if let Ok(m) = Manifest::parse(&bytes) {
+        println!("kind:      manifest");
+        println!("manifest_id: {}", m.manifest_id());
     } else {
         println!(
             "kind:      NOT a tensorfs document — {}",

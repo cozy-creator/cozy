@@ -16,7 +16,7 @@ use tensorfs_core::compat::{
 use tensorfs_core::dtype::Dtype;
 use tensorfs_core::grade::{self, ConversionRegistration, Grade, GradeDecision, Mapping, Registry};
 use tensorfs_core::header::Header;
-use tensorfs_core::ids::{Doc, ObjectRef};
+use tensorfs_core::ids::{ObjectRef, Plain};
 use tensorfs_core::ingest::fingerprint::MARKER_SUFFIXES;
 use tensorfs_core::limits;
 use tensorfs_core::registry;
@@ -289,8 +289,9 @@ pub fn cmd_import(rows_p: &Path, flags: &Flags) -> ExitCode {
         );
         return ExitCode::SUCCESS;
     }
-    let mut encodings: Vec<ObjectRef> = closure.specs.iter().map(|(_, s)| s.object_ref()).collect();
-    encodings.sort_by(|a, b| a.sha256.cmp(&b.sha256));
+    let mut encodings: Vec<EncodingSpec> =
+        closure.specs.iter().map(|(_, spec)| spec.clone()).collect();
+    encodings.sort_by_key(EncodingSpec::object_id);
     let header = tensorfs_core::header::Header {
         configs: vec![],
         assets: vec![],
@@ -415,7 +416,7 @@ fn placeholder_part(
     }
 }
 
-fn emit<D: Doc>(d: &D, flags: &Flags) {
+fn emit<D: Plain>(d: &D, flags: &Flags) {
     emit_bytes(&d.canonical_bytes(), flags);
 }
 
@@ -438,7 +439,7 @@ pub fn cmd_check(code_p: &Path, header_p: &Path, flags: &Flags) -> ExitCode {
         if p.is_empty() {
             continue;
         }
-        closure.insert(ok!(EncodingSpec::parse(&rd!(Path::new(p)))));
+        closure.insert(ok!(EncodingSpec::decode_nested(&rd!(Path::new(p)))));
     }
     let pin: Vec<String> = match flag(flags, "pin") {
         Some(p) if !p.is_empty() => p.split(',').map(|s| s.to_string()).collect(),
@@ -689,12 +690,16 @@ pub fn cmd_grade(report_p: &Path, flags: &Flags) -> ExitCode {
             let mut closure = tensorfs_core::header::Closure::default();
             for p in flag(flags, "closure").unwrap_or("").split(',') {
                 if !p.is_empty() {
-                    closure.insert(ok!(EncodingSpec::parse(&rd!(Path::new(p)))));
+                    closure.insert(ok!(EncodingSpec::decode_nested(&rd!(Path::new(p)))));
                 }
             }
             let pin: Vec<String> = match flag(flags, "pin") {
                 Some(p) if !p.is_empty() => p.split(',').map(|s| s.to_string()).collect(),
-                _ => header.encodings.iter().map(|e| e.id()).collect(),
+                _ => header
+                    .encodings
+                    .iter()
+                    .map(EncodingSpec::object_id)
+                    .collect(),
             };
             ok!(grade::resolve(
                 &code,
@@ -764,7 +769,11 @@ pub fn cmd_request(code_p: &Path, header_p: &Path, flags: &Flags) -> ExitCode {
     }
     let pin: Vec<String> = match flag(flags, "pin") {
         Some(p) if !p.is_empty() => p.split(',').map(|s| s.to_string()).collect(),
-        _ => header.encodings.iter().map(|e| e.id()).collect(),
+        _ => header
+            .encodings
+            .iter()
+            .map(EncodingSpec::object_id)
+            .collect(),
     };
     let req = VerifyRequest {
         code_topology,

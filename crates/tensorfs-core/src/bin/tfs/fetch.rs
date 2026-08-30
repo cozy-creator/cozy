@@ -12,8 +12,9 @@ use std::io;
 use std::path::Path;
 use std::process::ExitCode;
 
-use tensorfs_core::fetch::{DeliveryGrant, FetchPlan};
+use tensorfs_core::fetch::{self, DeliveryGrant, FetchPlan};
 use tensorfs_core::ids::{Doc, ObjectRef};
+use tensorfs_core::manifest::Manifest;
 use tensorfs_core::store::Store;
 
 use crate::{bail, flag, Flags};
@@ -56,27 +57,26 @@ fn emit_bytes(bytes: &[u8], flags: &Flags) {
 /// it is where idempotency lives — an object already installed and vouched for is HELD and
 /// no grant can be minted for it.
 ///
-/// `declared` is a canonical `tensorfs.publish_closure/1` (what the hub's manifest reach and
-/// the publisher's own closure both spell), so the pull side reads the publish side's
-/// document rather than a second description of the same set.
-pub fn cmd_plan(root: &Path, declared_p: &Path, session: &str, flags: &Flags) -> ExitCode {
+/// The manifest bytes and the sorted `manifest walk --refs` JSONL are the declaration. No
+/// wrapper document duplicates them.
+pub fn cmd_plan(root: &Path, manifest_p: &Path, session: &str, flags: &Flags) -> ExitCode {
     let store = ok!(Store::open(root));
-    let closure = ok!(tensorfs_core::cloud::PublishClosure::parse(&read!(
-        declared_p
-    )));
-    let (plan, why) = ok!(FetchPlan::of(
-        &store,
-        session,
-        &closure.snapshot,
-        &closure.objects
-    ));
+    let manifest_bytes = read!(manifest_p);
+    let _manifest = ok!(Manifest::parse(&manifest_bytes));
+    let manifest = ObjectRef::of(&manifest_bytes);
+    let Some(refs_path) = flag(flags, "refs") else {
+        eprintln!("--refs <jsonl> is required");
+        return ExitCode::from(2);
+    };
+    let refs = ok!(fetch::parse_refs_jsonl(&read!(Path::new(refs_path))));
+    let (plan, why) = ok!(FetchPlan::of(&store, session, &manifest, &refs));
     emit_bytes(&plan.canonical_bytes(), flags);
     println!(
         "plan         {}",
         tensorfs_core::ids::object_id(&plan.canonical_bytes())
     );
     println!("session      {}", plan.session);
-    println!("snapshot     {}", plan.snapshot.id());
+    println!("manifest     {}", plan.manifest.id());
     println!(
         "held         {} object(s), {} B — NOT fetched",
         plan.held.len(),
@@ -137,7 +137,7 @@ pub fn cmd_complete(root: &Path, plan_p: &Path) -> ExitCode {
     let store = ok!(Store::open(root));
     let plan = ok!(FetchPlan::parse(&read!(plan_p)));
     ok!(plan.complete(&store));
-    println!("complete     {}", plan.snapshot.id());
+    println!("complete     {}", plan.manifest.id());
     println!(
         "resident     {} object(s), {} B, every one verifiably local",
         plan.held.len() + plan.wanted.len(),

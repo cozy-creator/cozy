@@ -1,4 +1,0 @@
-doc: manifest
-expect: refuse
-code: PATH_DIGEST_MISMATCH
-note: a content-addressed path that names something else

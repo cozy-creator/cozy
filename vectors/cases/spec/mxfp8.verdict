@@ -1,4 +1,0 @@
-doc: spec
-expect: ok
-id: sha256:d16296b28ddfc0813d713e1e245cbd06cbff7d71dc90347cd1ac3cb7efc1f92d
-note: ceil-block scale relation; vectorless

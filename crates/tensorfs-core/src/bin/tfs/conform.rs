@@ -13,7 +13,6 @@
 use std::process::ExitCode;
 
 use tensorfs_core::dtype::Dtype;
-use tensorfs_core::ids::Doc;
 use tensorfs_core::registry;
 use tensorfs_core::spec::EncodingSpec;
 use tensorfs_core::vectors::{Case, EncodingVectors};
@@ -457,7 +456,7 @@ pub fn cmd_conform(which: Option<&str>, _f: &Flags) -> ExitCode {
         match (&s.vectors, s.spec.require_executable()) {
             (Some(v), Ok(r)) => {
                 // The reference must be the bytes the spec COMMITS, not a twin beside it.
-                let bytes = v.canonical_bytes();
+                let bytes = v.fixture_bytes();
                 if tensorfs_core::ids::ObjectRef::of(&bytes) != *r {
                     println!("  VECTOR REFERENCE MISMATCH: the spec names other bytes");
                     bad = true;
@@ -593,8 +592,8 @@ pub fn cmd_mine(rows: &std::path::Path, name: &str, f: &Flags) -> ExitCode {
         return ExitCode::from(2);
     }
     let v = EncodingVectors { cases };
-    let bytes = v.canonical_bytes();
-    if let Err(e) = EncodingVectors::parse(&bytes) {
+    let bytes = v.fixture_bytes();
+    if let Err(e) = EncodingVectors::parse_fixture(&bytes) {
         return bail(e);
     }
     let d = crate::fixtures::dir().parent().unwrap().join("mined");
@@ -609,7 +608,10 @@ pub fn cmd_mine(rows: &std::path::Path, name: &str, f: &Flags) -> ExitCode {
     }
     println!("mined {} ({} B)", path.display(), bytes.len());
     println!("  cases     {}", v.cases.len());
-    println!("  object_id {}", v.object_id());
+    println!(
+        "  fixture_id {}",
+        tensorfs_core::ids::object_id(&v.fixture_bytes())
+    );
     for c in &v.cases {
         println!(
             "    {:<34} logical {} {:?}, roles {:?}",

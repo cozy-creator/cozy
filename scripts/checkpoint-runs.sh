@@ -13,7 +13,7 @@ SECTION=${1:-all}
 
 hr() { printf '\n===== %s =====\n' "$*"; }
 hex() { grep -o '[0-9a-f]\{64\}' | head -1; }
-objpath() { echo "$1/objects/sha256/${2:0:2}/${2:2:2}/$2"; }
+objpath() { echo "$1/blobs/${2:0:2}/${2:2:2}/$2"; }
 
 # One shared big checkpoint: written once, read many.
 big_header() {
@@ -29,13 +29,13 @@ write_section() {
   rm -rf "$BIG" "$WORK/big.header"; mkdir -p "$BIG"
   nice -n 19 "$TFS" checkpoint write "$BIG" | tee "$WORK/big.write"
   grep header_digest "$WORK/big.write" | hex > "$WORK/big.header"
-  echo "objects installed: $(find "$BIG/objects" -type f | wc -l)"
+  echo "blobs installed: $(find "$BIG/blobs" -type f | wc -l)"
 
   hr "the same tree objectizes deterministically into an independent store"
   rm -rf "$WORK/det"; mkdir -p "$WORK/det"
-  nice -n 19 "$TFS" checkpoint write "$WORK/det" --blocks 1 | grep -E 'header_digest|checkpoint_id|topology' > "$WORK/det.a"
+  nice -n 19 "$TFS" checkpoint write "$WORK/det" --blocks 1 | grep -E 'header_digest|manifest_id|topology' > "$WORK/det.a"
   rm -rf "$WORK/det2"; mkdir -p "$WORK/det2"
-  nice -n 19 "$TFS" checkpoint write "$WORK/det2" --blocks 1 | grep -E 'header_digest|checkpoint_id|topology' > "$WORK/det.b"
+  nice -n 19 "$TFS" checkpoint write "$WORK/det2" --blocks 1 | grep -E 'header_digest|manifest_id|topology' > "$WORK/det.b"
   cat "$WORK/det.a"
   if diff -q "$WORK/det.a" "$WORK/det.b" >/dev/null; then
     echo "  IDENTICAL across two independent stores"
@@ -56,8 +56,8 @@ query_section() {
   "$TFS" checkpoint info "$BIG" "$h"
   hr "the same query under strace: which objects were opened?"
   strace -f -e trace=openat -o "$WORK/info.strace" "$TFS" checkpoint info "$BIG" "$h" >/dev/null 2>&1
-  echo "object opens: $(grep -c 'objects/sha256' "$WORK/info.strace")"
-  grep -o 'objects/sha256/[a-z0-9/]*' "$WORK/info.strace" | sed 's|.*/||' | sort -u | sed 's/^/  opened /'
+  echo "blob opens: $(grep -c '/blobs/' "$WORK/info.strace")"
+  grep -o 'blobs/[a-z0-9/]*' "$WORK/info.strace" | sed 's|.*/||' | sort -u | sed 's/^/  opened /'
   echo "  header is $h"
 }
 
@@ -97,8 +97,8 @@ red_section() {
   local lie; lie=$("$TFS" put "$RED" "$WORK/lie.cbor" | hex)
   echo "doctored header admitted at $lie"
   strace -f -e trace=openat -o "$WORK/lie.strace" "$TFS" checkpoint read "$RED" "$lie" --blocks 1
-  echo "object opens during the refusal: $(grep -c 'objects/sha256' "$WORK/lie.strace") \
-(header + $(($(grep -c 'objects/sha256' "$WORK/lie.strace") - 1)) spec/config objects; zero tensor segments)"
+  echo "blob opens during the refusal: $(grep -c '/blobs/' "$WORK/lie.strace") \
+(header + $(($(grep -c '/blobs/' "$WORK/lie.strace") - 1)) config blobs; zero tensor segments)"
 
   hr "RED 2 — the same content, one trailing byte: never readable AS a header"
   cp "$(objpath "$RED" "$h")" "$WORK/twin.cbor"; chmod u+w "$WORK/twin.cbor"
@@ -111,23 +111,22 @@ red_section() {
   local asset_lie; asset_lie=$("$TFS" put "$RED" "$WORK/asset-lie.cbor" | hex)
   "$TFS" checkpoint read "$RED" "$asset_lie" --blocks 1
 
-  hr "RED 3 — a spec object missing from the closure: cannot install as self-describing"
-  local spec; spec=$("$TFS" checkpoint info "$RED" "$h" | grep '^encoding' | head -1 | hex)
-  rm -f "$WORK/spec.bak"; cp "$(objpath "$RED" "$spec")" "$WORK/spec.bak"
-  rm -f "$(objpath "$RED" "$spec")"
+  hr "RED 3 — a missing inline-encoding header cannot be read"
+  rm -f "$WORK/header.bak"; cp "$(objpath "$RED" "$h")" "$WORK/header.bak"
+  rm -f "$(objpath "$RED" "$h")"
   "$TFS" checkpoint read "$RED" "$h" --blocks 1
-  cp "$WORK/spec.bak" "$(objpath "$RED" "$spec")"; chmod 444 "$(objpath "$RED" "$spec")"
+  cp "$WORK/header.bak" "$(objpath "$RED" "$h")"; chmod 444 "$(objpath "$RED" "$h")"
 
   hr "RED 4 — a tensor segment corrupted under the store: never reconstructed"
   local seg
   seg=$("$TFS" checkpoint locate "$RED" "$h" unet blocks.0.attn1.to_out.0.weight value 0 8 \
         | grep 'segment 0' | grep -o 'sha256:[0-9a-f]*' | cut -d: -f2)
-  seg=$(find "$RED/objects" -name "${seg}*" -printf '%f\n' | head -1)
+  seg=$(find "$RED/blobs" -name "${seg}*" -printf '%f\n' | head -1)
   rm -f "$WORK/seg.bak"; cp "$(objpath "$RED" "$seg")" "$WORK/seg.bak"
   chmod u+w "$(objpath "$RED" "$seg")"
   printf 'tampered' | dd of="$(objpath "$RED" "$seg")" bs=1 seek=1000 conv=notrunc status=none
   "$TFS" checkpoint read "$RED" "$h" --blocks 1 2>&1 | head -3
-  echo "quarantined: $(find "$RED/quarantine" -type f | wc -l) object(s)"
+  echo "quarantined: $(find "$RED/.tensorfs/quarantine" -type f | wc -l) blob(s)"
 
   hr "RED 5 — whole-document totals, built in memory (too large to freeze as vectors)"
   "$TFS" checkpoint caps

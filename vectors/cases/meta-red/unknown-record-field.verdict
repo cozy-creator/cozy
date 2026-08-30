@@ -1,4 +1,0 @@
-doc: meta
-expect: refuse
-code: UNKNOWN_FIELD
-note: a wall-clock expiry smuggled onto a LOCAL hold — local liveness is owner-evidence

@@ -14,6 +14,7 @@ use std::sync::{Arc, Mutex};
 use pyo3::buffer::PyBuffer;
 use pyo3::prelude::*;
 use pyo3::types::{PyBytes, PyDict, PyList};
+use tensorfs_core::catalog::{Catalog, WriterGuard};
 use tensorfs_core::checkpoint;
 use tensorfs_core::derived::{
     self, ComponentDeclaration, ConfigDeclaration, Declaration, PartDeclaration, Source,
@@ -22,11 +23,13 @@ use tensorfs_core::derived::{
 use tensorfs_core::err::{refuse, Code, Refusal, Result as TResult};
 use tensorfs_core::header::Header;
 use tensorfs_core::ids::{Doc, ObjectRef};
-use tensorfs_core::manifest::{BlobDescriptor, Entry, SnapshotManifest};
+use tensorfs_core::manifest::{Entry, Manifest};
 use tensorfs_core::meta::{Hold, Meta};
 use tensorfs_core::project;
 use tensorfs_core::read::{self, ObjectRange, ReadLease as CoreLease, Source as ReadSource};
 use tensorfs_core::receipt::Receipts;
+use tensorfs_core::repository::{Mutation, RepositoryName};
+use tensorfs_core::storage;
 use tensorfs_core::store::{Fault, Store as CoreStore, Verdict};
 
 use crate::docs::marshal;
@@ -211,10 +214,10 @@ fn parse_declaration(
     let mut source_rows = Vec::with_capacity(sources.len());
     for (alias, value) in sources.iter() {
         let alias: String = alias.extract()?;
-        let (snapshot, length): (String, u64) = value.extract()?;
+        let (manifest, length): (String, u64) = value.extract()?;
         source_rows.push(Source {
             alias,
-            snapshot: obj_ref(py, &snapshot, length)?,
+            manifest: obj_ref(py, &manifest, length)?,
         });
     }
 
@@ -358,8 +361,8 @@ fn source_facts<'p>(py: Python<'p>, views: &[derived::SourceView]) -> PyResult<B
         let fact = &view.fact;
         let row = PyDict::new(py);
         row.set_item("alias", &fact.alias)?;
-        row.set_item("snapshot_id", fact.snapshot.id())?;
-        row.set_item("snapshot_length", fact.snapshot.length)?;
+        row.set_item("manifest_id", fact.manifest.id())?;
+        row.set_item("manifest_length", fact.manifest.length)?;
         row.set_item("header_id", fact.header.id())?;
         row.set_item("header_length", fact.header.length)?;
         row.set_item("components", &fact.components)?;
@@ -443,22 +446,78 @@ impl PyStore {
         self.store.root().display().to_string()
     }
 
-    #[getter]
-    fn generation(&self) -> u64 {
-        self.store.generation()
-    }
-
-    #[getter]
-    fn era(&self) -> &'static str {
-        tensorfs_core::store::ERA
-    }
-
     fn contains(&self, hex: &str) -> bool {
         self.store.contains(hex.trim_start_matches("sha256:"))
     }
 
     fn objects(&self, py: Python<'_>) -> PyResult<Vec<String>> {
         self.store.objects().or_refuse(py)
+    }
+
+    fn repo_get<'p>(&self, py: Python<'p>, org: &str, name: &str) -> PyResult<Bound<'p, PyBytes>> {
+        let repo = RepositoryName::new(org, name).or_refuse(py)?;
+        let path = self.store.repository_path(&repo);
+        let bytes = std::fs::read(&path).map_err(|error| {
+            to_py(
+                py,
+                &Refusal {
+                    code: if error.kind() == std::io::ErrorKind::NotFound {
+                        Code::REPOSITORY_ABSENT
+                    } else {
+                        Code::IO_FAILED
+                    },
+                    detail: format!("read {}: {error}", path.display()),
+                },
+            )
+        })?;
+        tensorfs_core::repository::Repository::parse(&bytes).or_refuse(py)?;
+        Ok(PyBytes::new(py, &bytes))
+    }
+
+    fn begin_operation(
+        &self,
+        py: Python<'_>,
+        operation_id: &str,
+        org: &str,
+        name: &str,
+        now: u64,
+    ) -> PyResult<PyOperation> {
+        let repo = RepositoryName::new(org, name).or_refuse(py)?;
+        let catalog = Catalog::open(self.store.root()).or_refuse(py)?;
+        let guard = catalog
+            .resume_operation(operation_id, &repo.org, &repo.name, now)
+            .or_refuse(py)?;
+        Ok(PyOperation {
+            store: Arc::clone(&self.store),
+            catalog,
+            operation_id: operation_id.to_string(),
+            repo,
+            guard: Some(guard),
+        })
+    }
+
+    fn remove_release<'p>(
+        &self,
+        py: Python<'p>,
+        current: &[u8],
+        org: &str,
+        name: &str,
+        version: &str,
+        lane: &str,
+    ) -> PyResult<Bound<'p, PyBytes>> {
+        let mutation = Mutation::RemoveRelease {
+            repo: RepositoryName::new(org, name).or_refuse(py)?,
+            version: version.to_string(),
+            lane: lane.to_string(),
+        };
+        let repository = py
+            .allow_threads(|| {
+                self.store
+                    .apply_repository(Some(current), &mutation, &Fault::default())
+            })
+            .or_refuse(py)?
+            .expect("release removal retains the repository");
+        Ok(PyBytes::new(py, &repository.canonical_bytes()))
     }
 
     /// Stream a file into the CAS. `expect` is a full ObjectRef (id AND length) or nothing;
@@ -535,6 +594,55 @@ impl PyStore {
         Ok(d)
     }
 
+    /// Strictly parse and admit canonical Manifest bytes into the typed manifests namespace.
+    #[pyo3(signature = (data, expect=None, expect_length=None))]
+    fn put_manifest<'p>(
+        &self,
+        py: Python<'p>,
+        data: &[u8],
+        expect: Option<&str>,
+        expect_length: Option<u64>,
+    ) -> PyResult<Bound<'p, PyDict>> {
+        let manifest = Manifest::parse(data).or_refuse(py)?;
+        let observed = ObjectRef::of(data);
+        match (expect, expect_length) {
+            (Some(identity), Some(length)) => {
+                let wanted = obj_ref(py, identity, length)?;
+                if wanted != observed {
+                    return Err(to_py(
+                        py,
+                        &Refusal {
+                            code: Code::OBJECT_ID_MISMATCH,
+                            detail: format!(
+                                "manifest bytes are {}, expected {}",
+                                observed.id(),
+                                wanted.id()
+                            ),
+                        },
+                    ));
+                }
+            }
+            (None, None) => {}
+            _ => {
+                return Err(to_py(
+                    py,
+                    &Refusal {
+                        code: Code::LENGTH_MISMATCH,
+                        detail: "expect requires expect_length".into(),
+                    },
+                ))
+            }
+        }
+        let put = py
+            .allow_threads(|| self.store.put_manifest(&manifest))
+            .or_refuse(py)?;
+        let out = PyDict::new(py);
+        out.set_item("id", put.obj.id())?;
+        out.set_item("length", put.obj.length)?;
+        out.set_item("admitted", put.admitted)?;
+        Ok(out)
+    }
+
     fn verify<'p>(&self, py: Python<'p>, hex: &str) -> PyResult<Bound<'p, PyDict>> {
         let hex = hex.trim_start_matches("sha256:").to_string();
         let v = py.allow_threads(|| self.store.verify(&hex)).or_refuse(py)?;
@@ -585,18 +693,17 @@ impl PyStore {
         Ok(PyBytes::new(py, &v))
     }
 
-    /// Canonical bytes of a snapshot's manifest and of the header it attaches.
-    fn snapshot<'p>(&self, py: Python<'p>, hex: &str) -> PyResult<Bound<'p, PyDict>> {
+    /// Canonical manifest bytes and the CozyTensors header selected by its typed entry.
+    fn manifest<'p>(&self, py: Python<'p>, hex: &str) -> PyResult<Bound<'p, PyDict>> {
         let (m, mb, hb) = self.load(py, hex)?;
         let d = PyDict::new(py);
-        d.set_item("snapshot_id", m.snapshot_id())?;
-        d.set_item("checkpoint_id", m.checkpoint_id().or_refuse(py)?)?;
+        d.set_item("manifest_id", m.manifest_id())?;
         d.set_item("manifest", PyBytes::new(py, &mb))?;
         d.set_item("header", PyBytes::new(py, &hb))?;
         Ok(d)
     }
 
-    /// The transitive walk: every object the snapshot commits, with what it was reached AS.
+    /// The transitive walk: every blob the manifest commits, with what it was reached AS.
     fn walk<'p>(&self, py: Python<'p>, hex: &str) -> PyResult<Bound<'p, PyList>> {
         let (m, _, _) = self.load(py, hex)?;
         let w = py
@@ -613,20 +720,20 @@ impl PyStore {
         Ok(l)
     }
 
-    /// `ReadLease = store.acquire(snapshot, object_set)`. Verifies every object first and
+    /// `ReadLease = store.acquire(manifest, object_set)`. Verifies every object first and
     /// registers the hold BEFORE the first byte moves.
-    #[pyo3(signature = (snapshot, objects))]
+    #[pyo3(signature = (manifest, objects))]
     fn acquire(
         &self,
         py: Python<'_>,
-        snapshot: &str,
+        manifest: &str,
         objects: Vec<(String, u64)>,
     ) -> PyResult<PyLease> {
         let mut refs = Vec::with_capacity(objects.len());
         for (h, n) in &objects {
             refs.push(obj_ref(py, h, *n)?);
         }
-        let snap = snapshot.trim_start_matches("sha256:").to_string();
+        let snap = manifest.trim_start_matches("sha256:").to_string();
         let (lease, rx) = py
             .allow_threads(|| read::acquire(&self.store, &self.meta, &snap, refs))
             .or_refuse(py)?;
@@ -637,11 +744,11 @@ impl PyStore {
         })
     }
 
-    /// Acquire over everything one snapshot commits — the serving case.
-    fn acquire_snapshot(&self, py: Python<'_>, hex: &str) -> PyResult<PyLease> {
+    /// Acquire over everything one manifest commits — the serving case.
+    fn acquire_manifest(&self, py: Python<'_>, hex: &str) -> PyResult<PyLease> {
         let (m, _, _) = self.load(py, hex)?;
         let (lease, rx) = py
-            .allow_threads(|| read::acquire_snapshot(&self.store, &self.meta, &m))
+            .allow_threads(|| read::acquire_manifest(&self.store, &self.meta, &m))
             .or_refuse(py)?;
         Ok(PyLease {
             lease: Mutex::new(Some(lease)),
@@ -653,7 +760,7 @@ impl PyStore {
     /// Tier 2 of the projection ladder: config assets and canonical documents as ordinary
     /// files. A weight path cannot appear, and the refusal says why.
     #[pyo3(signature = (hex, dest, symlink=true))]
-    fn project<'p>(
+    fn checkout<'p>(
         &self,
         py: Python<'p>,
         hex: &str,
@@ -661,31 +768,28 @@ impl PyStore {
         symlink: bool,
     ) -> PyResult<Bound<'p, PyDict>> {
         let (m, _, _) = self.load(py, hex)?;
-        let mut rx = Receipts::default();
-        let p =
-            project::project_snapshot(&self.store, &m, &dest, !symlink, &mut rx).or_refuse(py)?;
+        let p = project::checkout(&self.store, &m, &dest, !symlink).or_refuse(py)?;
         let d = PyDict::new(py);
         d.set_item("dirs", p.dirs)?;
         d.set_item("links", p.links)?;
         d.set_item("copies", p.copies)?;
         d.set_item("bytes", p.bytes)?;
-        d.set_item("receipts", receipts_to_py(py, &rx)?)?;
         Ok(d)
     }
 
     /// Tier 3: a private streamed copy of an ALREADY-RETAINED carrier named by its path in
-    /// the snapshot. Never a synthesis — an unretained carrier refuses.
+    /// the manifest. Never a synthesis — an unretained carrier refuses.
     fn materialize(&self, py: Python<'_>, hex: &str, path: &str, dest: PathBuf) -> PyResult<u64> {
         let (m, _, _) = self.load(py, hex)?;
         let entry = m.entries().iter().find(|(p, _)| p == path);
-        let b: BlobDescriptor = match entry {
-            Some((_, Entry::Blob(b))) => b.clone(),
-            Some((_, _)) => {
+        let blob = match entry {
+            Some((_, Entry::File(blob))) => blob.clone(),
+            Some((_, Entry::CozyTensors(_))) => {
                 return Err(to_py(
                     py,
                     &Refusal {
                         code: Code::BLOB_NOT_RETAINED,
-                        detail: format!("{path:?} is not a retained blob in this snapshot"),
+                        detail: format!("{path:?} is a CozyTensors header, not an ordinary file"),
                     },
                 ))
             }
@@ -694,37 +798,30 @@ impl PyStore {
                     py,
                     &Refusal {
                         code: Code::NOT_CONTAINED,
-                        detail: format!("{path:?} is not a path in snapshot {hex}"),
+                        detail: format!("{path:?} is not a path in manifest {hex}"),
                     },
                 ))
             }
         };
-        py.allow_threads(|| project::materialize_blob(&self.store, path, &b, &dest))
+        py.allow_threads(|| project::materialize(&self.store, &blob, &dest))
             .or_refuse(py)
-    }
-
-    /// The local root/hold authority, as plain data. Read-only here: roots and sweeps are
-    /// the store owner's verbs, not a reader's.
-    fn state<'p>(&self, py: Python<'p>) -> PyResult<Bound<'p, PyAny>> {
-        let s = self.meta.read().or_refuse(py)?;
-        marshal(py, &s.to_value())
     }
 
     fn reap_holds(&self, py: Python<'_>) -> PyResult<Vec<String>> {
         py.allow_threads(|| self.meta.reap_holds()).or_refuse(py)
     }
 
-    /// Exact pre-transaction preview for a granted source snapshot. Selected tensor
+    /// Exact pre-transaction preview for a granted source manifest. Selected tensor
     /// declarations contain no ObjectRefs; selected config bytes cross one verified lease.
     fn inspect_derived_source<'p>(
         &self,
         py: Python<'p>,
-        snapshot: &str,
-        snapshot_length: u64,
+        manifest: &str,
+        manifest_length: u64,
         components: Vec<String>,
         configs: Vec<String>,
     ) -> PyResult<Bound<'p, PyDict>> {
-        let reference = obj_ref(py, snapshot, snapshot_length)?;
+        let reference = obj_ref(py, manifest, manifest_length)?;
         let inspection = py
             .allow_threads(|| {
                 derived::inspect_source(&self.store, &self.meta, reference, components, configs)
@@ -857,31 +954,102 @@ impl PyStore {
         Ok(out)
     }
 
-    /// Atomically transfer the private committed root to a scratch root, or release it.
-    #[pyo3(signature = (transaction_id, scratch_root=None))]
+    /// Release the committed transaction after its manifest has been published or rejected.
     fn derived_dispose<'p>(
         &self,
         py: Python<'p>,
         transaction_id: &str,
-        scratch_root: Option<&str>,
     ) -> PyResult<Bound<'p, PyAny>> {
         let value = py
-            .allow_threads(|| derived::dispose(&self.meta, transaction_id, scratch_root))
+            .allow_threads(|| derived::dispose(&self.meta, transaction_id))
             .or_refuse(py)?;
         marshal(py, &value.to_value())
     }
 
     fn __repr__(&self) -> String {
+        format!("<tensorfs.Store {}>", self.store.root().display())
+    }
+}
+
+// ---------------------------------------------------------------- exact acquisition operation
+
+#[pyclass(name = "Operation", unsendable)]
+pub struct PyOperation {
+    store: Arc<CoreStore>,
+    catalog: Catalog,
+    operation_id: String,
+    repo: RepositoryName,
+    guard: Option<WriterGuard>,
+}
+
+#[pymethods]
+impl PyOperation {
+    fn hold_blob(&self, py: Python<'_>, identity: &str, length: u64) -> PyResult<()> {
+        let digest = identity.trim_start_matches("sha256:");
+        let key = storage::blob_key(digest).or_refuse(py)?;
+        self.catalog
+            .hold(&self.operation_id, &key, length)
+            .or_refuse(py)
+    }
+
+    fn hold_manifest(&self, py: Python<'_>, identity: &str, length: u64) -> PyResult<()> {
+        let digest = identity.trim_start_matches("sha256:");
+        let key = storage::manifest_key(digest).or_refuse(py)?;
+        self.catalog
+            .hold(&self.operation_id, &key, length)
+            .or_refuse(py)
+    }
+
+    fn progress(&self, py: Python<'_>, now: u64, objects: u64, bytes: u64) -> PyResult<()> {
+        self.catalog
+            .progress(&self.operation_id, now, objects, bytes)
+            .or_refuse(py)
+    }
+
+    #[pyo3(signature = (current, version, lane, manifest_id, manifest_length, evidence))]
+    #[allow(clippy::too_many_arguments)]
+    fn commit_release<'p>(
+        &mut self,
+        py: Python<'p>,
+        current: Option<&[u8]>,
+        version: &str,
+        lane: &str,
+        manifest_id: &str,
+        manifest_length: u64,
+        evidence: &[u8],
+    ) -> PyResult<Bound<'p, PyBytes>> {
+        let mutation = Mutation::PutRelease {
+            repo: self.repo.clone(),
+            version: version.to_string(),
+            lane: lane.to_string(),
+            manifest: obj_ref(py, manifest_id, manifest_length)?,
+            evidence: Box::new(
+                tensorfs_core::repository::ReleaseEvidence::parse(evidence).or_refuse(py)?,
+            ),
+        };
+        let repository = py
+            .allow_threads(|| {
+                self.store
+                    .apply_repository(current, &mutation, &Fault::default())
+            })
+            .or_refuse(py)?
+            .expect("put_release retains the repository");
+        self.catalog
+            .complete_operation(&self.operation_id)
+            .or_refuse(py)?;
+        self.guard = None;
+        Ok(PyBytes::new(py, &repository.canonical_bytes()))
+    }
+
+    fn __repr__(&self) -> String {
         format!(
-            "<tensorfs.Store {} era={} generation={}>",
-            self.store.root().display(),
-            tensorfs_core::store::ERA,
-            self.store.generation()
+            "<tensorfs.Operation {} repo={}/{}>",
+            self.operation_id, self.repo.org, self.repo.name
         )
     }
 }
 
-// ---------------------------------------------------------------- exact derived snapshots
+// ---------------------------------------------------------------- exact derived manifests
 
 #[pyclass(name = "DerivedWriter")]
 pub struct PyDerivedWriter {
@@ -1127,9 +1295,9 @@ impl PyDerivedWriter {
 }
 
 impl PyStore {
-    fn load(&self, py: Python<'_>, hex: &str) -> PyResult<(SnapshotManifest, Vec<u8>, Vec<u8>)> {
+    fn load(&self, py: Python<'_>, hex: &str) -> PyResult<(Manifest, Vec<u8>, Vec<u8>)> {
         let hex = hex.trim_start_matches("sha256:").to_string();
-        let len = std::fs::metadata(self.store.object_path(&hex))
+        let len = std::fs::metadata(self.store.manifest_path(&hex))
             .map(|m| m.len())
             .unwrap_or(0);
         let r = ObjectRef {
@@ -1144,7 +1312,7 @@ impl PyStore {
                     py,
                     &Refusal {
                         code: Code::MISSING_FIELD,
-                        detail: format!("snapshot {} attaches no header", m.snapshot_id()),
+                        detail: format!("manifest {} attaches no header", m.manifest_id()),
                     },
                 ))
             }
@@ -1273,9 +1441,9 @@ impl PyLease {
     }
 
     #[getter]
-    fn snapshot(&self, py: Python<'_>) -> PyResult<String> {
+    fn manifest(&self, py: Python<'_>) -> PyResult<String> {
         let g = self.lease.lock().unwrap();
-        Ok(g.as_ref().ok_or_else(|| released(py))?.snapshot.clone())
+        Ok(g.as_ref().ok_or_else(|| released(py))?.manifest.clone())
     }
 
     #[getter]
@@ -1513,53 +1681,7 @@ impl PyBatch {
     }
 }
 
-// ---------------------------------------------------------------- ingest transaction
-
-/// The ingest border's TRANSACTION seam. Carrier decode, classification and conversion stay
-/// inside the border (they are the border), but the quarantine root that bounds them is a
-/// caller-visible fact: who opened it, what it expires at, and whether it installed.
-#[pyfunction]
-#[pyo3(signature = (store, session, tenant, ttl_secs))]
-pub fn ingest_open_root<'p>(
-    py: Python<'p>,
-    store: &PyStore,
-    session: &str,
-    tenant: &str,
-    ttl_secs: u64,
-) -> PyResult<Bound<'p, PyAny>> {
-    let r = tensorfs_core::ingest::transaction::open_root(&store.store, session, tenant, ttl_secs)
-        .or_refuse(py)?;
-    tensorfs_core::ingest::transaction::write_root(store.store.root(), &r).or_refuse(py)?;
-    marshal(py, &r.to_value())
-}
-
-#[pyfunction]
-pub fn ingest_read_root<'p>(
-    py: Python<'p>,
-    store: &PyStore,
-    session: &str,
-) -> PyResult<Bound<'p, PyAny>> {
-    let r =
-        tensorfs_core::ingest::transaction::read_root(store.store.root(), session).or_refuse(py)?;
-    marshal(py, &r.to_value())
-}
-
-#[pyfunction]
-pub fn ingest_reap<'p>(py: Python<'p>, store: &PyStore, now: u64) -> PyResult<Bound<'p, PyDict>> {
-    let (expired, kept) =
-        tensorfs_core::ingest::transaction::reap(&store.store, now).or_refuse(py)?;
-    let d = PyDict::new(py);
-    d.set_item("expired", expired)?;
-    d.set_item("kept", kept)?;
-    Ok(d)
-}
-
-#[pyfunction]
-pub fn ingest_installed(store: &PyStore) -> Vec<String> {
-    tensorfs_core::ingest::transaction::installed(&store.store)
-}
-
-// ---------------------------------------------------------------- the pull plane
+// ---------------------------------------------------------------- store transfer
 
 /// Move one exact object between TensorFS stores without exposing either store's layout.
 /// The source is a verified pinned descriptor; the destination uses the ordinary hashing,
@@ -1583,62 +1705,67 @@ pub fn transfer_object<'p>(
     Ok(result)
 }
 
-/// The fetch plan, computed by core against a real store (tfs-003 row 220).
-///
-/// The transport adapter asks this ONE question — what must actually move? — instead of
-/// answering it itself. A puller that re-derived "is it already here" in Python would be a
-/// second opinion about residency, and the two would disagree the first time a verification
-/// record went stale.
-///
-/// `declared` is the remote catalog's claim: `[(object_id, length), ...]`. The snapshot is
-/// folded into the covered set whether or not the claim listed it — an artifact without its
-/// own manifest is bytes nobody can open.
 #[pyfunction]
-#[pyo3(signature = (store, session, snapshot, snapshot_length, declared))]
+pub fn transfer_manifest<'p>(
+    py: Python<'p>,
+    source: &PyStore,
+    destination: &PyStore,
+    manifest_id: &str,
+    expected_length: u64,
+) -> PyResult<Bound<'p, PyDict>> {
+    let wanted = obj_ref(py, manifest_id, expected_length)?;
+    let put = py
+        .allow_threads(|| source.store.transfer_manifest(&destination.store, &wanted))
+        .or_refuse(py)?;
+    let result = PyDict::new(py);
+    result.set_item("id", put.obj.id())?;
+    result.set_item("length", put.obj.length)?;
+    result.set_item("admitted", put.admitted)?;
+    Ok(result)
+}
+
+/// Split one typed Manifest plus its declared blob closure into held and wanted keys.
+/// `fetch_admit` routes the root to `manifests/` and every other grant to `blobs/`.
+#[pyfunction]
+#[pyo3(signature = (store, session, manifest, manifest_length, declared))]
 pub fn fetch_plan<'p>(
     py: Python<'p>,
     store: &PyStore,
     session: &str,
-    snapshot: &str,
-    snapshot_length: u64,
+    manifest: &str,
+    manifest_length: u64,
     declared: Vec<(String, u64)>,
 ) -> PyResult<Bound<'p, PyDict>> {
-    let snap = obj_ref(py, snapshot, snapshot_length)?;
-    let mut refs = Vec::with_capacity(declared.len());
-    for (id, length) in &declared {
-        refs.push(obj_ref(py, id, *length)?);
-    }
-    let (plan, why) =
-        tensorfs_core::fetch::FetchPlan::of(&store.store, session, &snap, &refs).or_refuse(py)?;
-
-    let set = |v: &[ObjectRef]| -> PyResult<Bound<'p, PyList>> {
-        let l = PyList::empty(py);
-        for o in v {
-            l.append((o.id(), o.length))?;
+    let manifest = obj_ref(py, manifest, manifest_length)?;
+    let refs = declared
+        .iter()
+        .map(|(identity, length)| obj_ref(py, identity, *length))
+        .collect::<PyResult<Vec<_>>>()?;
+    let (plan, why) = tensorfs_core::fetch::FetchPlan::of(&store.store, session, &manifest, &refs)
+        .or_refuse(py)?;
+    let objects = |values: &[ObjectRef]| -> PyResult<Bound<'p, PyList>> {
+        let result = PyList::empty(py);
+        for object in values {
+            result.append((object.id(), object.length))?;
         }
-        Ok(l)
+        Ok(result)
     };
     let presence = PyDict::new(py);
-    for (o, p) in &why {
-        presence.set_item(o.id(), p.as_str())?;
+    for (object, reason) in why {
+        presence.set_item(object.id(), reason.as_str())?;
     }
-    let d = PyDict::new(py);
-    d.set_item("session", &plan.session)?;
-    d.set_item("snapshot", plan.snapshot.id())?;
-    d.set_item("held", set(&plan.held)?)?;
-    d.set_item("wanted", set(&plan.wanted)?)?;
-    d.set_item("wanted_bytes", plan.wanted_bytes())?;
-    d.set_item("held_bytes", plan.held_bytes())?;
-    d.set_item("presence", presence)?;
-    // The canonical document, so a transport can hand the same plan to `tfs fetch admit`
-    // and to this module and neither can drift from the other.
-    d.set_item("document", PyBytes::new(py, &plan.canonical_bytes()))?;
-    Ok(d)
+    let result = PyDict::new(py);
+    result.set_item("session", &plan.session)?;
+    result.set_item("manifest", plan.manifest.id())?;
+    result.set_item("held", objects(&plan.held)?)?;
+    result.set_item("wanted", objects(&plan.wanted)?)?;
+    result.set_item("wanted_bytes", plan.wanted_bytes())?;
+    result.set_item("held_bytes", plan.held_bytes())?;
+    result.set_item("presence", presence)?;
+    result.set_item("document", PyBytes::new(py, &plan.canonical_bytes()))?;
+    Ok(result)
 }
 
-/// THE DOOR, plan-bound. Admits one object's bytes from a Python reader, and only an object
-/// the plan actually wants: an already-held digest refuses `NOT_CONTAINED` rather than
-/// quietly re-downloading, which is what makes idempotency a property instead of a habit.
 #[pyfunction]
 #[pyo3(signature = (store, plan, object_id, reader))]
 pub fn fetch_admit<'p>(
@@ -1649,37 +1776,33 @@ pub fn fetch_admit<'p>(
     reader: &Bound<'p, PyAny>,
 ) -> PyResult<Bound<'p, PyDict>> {
     let plan = tensorfs_core::fetch::FetchPlan::parse(plan).or_refuse(py)?;
-    let hex = object_id.trim_start_matches("sha256:");
+    let digest = object_id.trim_start_matches("sha256:");
     let length = plan
         .wanted
         .iter()
-        .chain(plan.held.iter())
-        .find(|o| o.sha256 == hex)
-        .map(|o| o.length)
+        .chain(&plan.held)
+        .find(|object| object.sha256 == digest)
+        .map(|object| object.length)
         .unwrap_or(0);
-    let want = obj_ref(py, hex, length)?;
-    let grant = tensorfs_core::fetch::DeliveryGrant::mint(&plan, &want).or_refuse(py)?;
-    let mut src = Readable {
+    let object = obj_ref(py, digest, length)?;
+    let grant = tensorfs_core::fetch::DeliveryGrant::mint(&plan, &object).or_refuse(py)?;
+    let mut source = Readable {
         obj: reader.clone().unbind(),
         err: None,
     };
-    let admitted = py.allow_threads(|| grant.admit(&store.store, &mut src));
-    let admitted = match admitted {
-        Ok(a) => a,
-        Err(e) => return Err(src.err.take().unwrap_or_else(|| to_py(py, &e))),
+    let admitted = match py.allow_threads(|| grant.admit(&store.store, &mut source)) {
+        Ok(admitted) => admitted,
+        Err(error) => return Err(source.err.take().unwrap_or_else(|| to_py(py, &error))),
     };
-    let d = PyDict::new(py);
-    d.set_item("id", admitted.object.id())?;
-    d.set_item("length", admitted.object.length)?;
-    d.set_item("admitted", admitted.first_writer)?;
-    d.set_item("key", grant.key())?;
-    Ok(d)
+    let result = PyDict::new(py);
+    result.set_item("id", admitted.object.id())?;
+    result.set_item("length", admitted.object.length)?;
+    result.set_item("admitted", admitted.first_writer)?;
+    result.set_item("key", grant.key())?;
+    Ok(result)
 }
 
-/// The PROOF: every object the plan declared is installed and this store's own record
-/// vouches for it. Refuses `DURABILITY_UNPROVEN` naming the first that is not.
 #[pyfunction]
-#[pyo3(signature = (store, plan))]
 pub fn fetch_complete(py: Python<'_>, store: &PyStore, plan: &[u8]) -> PyResult<u64> {
     let plan = tensorfs_core::fetch::FetchPlan::parse(plan).or_refuse(py)?;
     py.allow_threads(|| plan.complete(&store.store))

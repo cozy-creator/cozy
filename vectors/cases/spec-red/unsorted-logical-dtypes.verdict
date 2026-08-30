@@ -1,4 +1,0 @@
-doc: spec
-expect: refuse
-code: SORT_ORDER
-note: closed set must be sorted unique

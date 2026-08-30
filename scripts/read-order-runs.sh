@@ -9,10 +9,10 @@ WORK="$(mktemp -d /tmp/tfs-read-order.XXXXXX)"
 trap 'rm -rf -- "$WORK"' EXIT
 
 output="$($TFS checkpoint write "$WORK/store" --blocks 1 --scale 8)"
-snapshot="$(sed -n 's/.*checkpoint_id   sha256:\([0-9a-f]\{64\}\).*/\1/p' <<<"$output")"
-test -n "$snapshot"
+manifest="$(sed -n 's/.*manifest_id     sha256:\([0-9a-f]\{64\}\).*/\1/p' <<<"$output")"
+test -n "$manifest"
 
-arms="$($TFS read arms "$WORK/store" "$snapshot")"
+arms="$($TFS read arms "$WORK/store" "$manifest")"
 for evidence in \
   "construction-order destination gap: RANGE_BOUNDS, destination untouched" \
   "construction-order destination overlap: RANGE_BOUNDS, destination untouched" \

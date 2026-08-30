@@ -131,6 +131,35 @@ pub trait Doc: Sized {
     }
 }
 
+/// Strict canonical JSON used only as a bounded command/hash-preimage struct. Plain values
+/// have no embedded format tag, no CAS namespace, and no compatibility reader.
+pub trait Plain: Sized {
+    const MAX_BYTES: usize;
+    fn from_value(value: &Value) -> Result<Self>;
+    fn to_value(&self) -> Value;
+
+    fn parse(bytes: &[u8]) -> Result<Self> {
+        let value = crate::canon::parse_canonical(bytes, Self::MAX_BYTES)?;
+        let parsed = Self::from_value(&value)?;
+        if parsed.canonical_bytes() != bytes {
+            return refuse(Code::NONCANONICAL_ENCODING, "plain value is not canonical");
+        }
+        Ok(parsed)
+    }
+
+    fn canonical_bytes(&self) -> Vec<u8> {
+        crate::canon::write(&self.to_value())
+    }
+
+    fn object_id(&self) -> String {
+        object_id(&self.canonical_bytes())
+    }
+
+    fn object_ref(&self) -> ObjectRef {
+        ObjectRef::of(&self.canonical_bytes())
+    }
+}
+
 /// Exact stored-byte documents. Most TensorFS documents use [`Doc`]'s bounded canonical
 /// JSON implementation; the CozyTensors header implements this trait directly because its
 /// one stored representation is restricted deterministic CBOR.

@@ -1,0 +1,1 @@
+{"action":"put_release","evidence_base64":"eyJjbGFzc2lmaWNhdGlvbl9kaWdlc3QiOiJzaGEyNTY6MDcwOTY3ZGQzZmE2ZTMzYTY5OTNkYTIyMDU1ZDEyMTZlNjU5MjkwM2FjOGQ3YjQwZjAyOTk5OTdiMjUxODkxNCJ9","lane":"cpu","manifest":{"length":160,"sha256":"08eff27435bd16bdb609e659362b2480f2934084d2d0790f955a7107f94ba631"},"repo":{"name":"marco-polo","org":"tensorhub"},"version":"1.0.0"}

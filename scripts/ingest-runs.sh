@@ -257,19 +257,19 @@ MIXSTORE="$WORK/mixstore"
 "$TFS" ingest run "$MIXSTORE" mix=fp8-scaled-scalar/1 --registry "$REG" --session mix \
   --source mix="$WORK/carriers/mixed-fp8.safetensors" 2>&1 \
   | grep -E "^encodings|^ +[0-9]+ +|^topology|^stamp|^receipt|parts |tensors "
-green "install the mixed candidate" "$TFS" ingest install "$MIXSTORE" mix
-MIXSNAP=$("$TFS" ingest roots "$MIXSTORE" | grep installed | head -1 | awk '{print $2}' | cut -d: -f2)
-# ONE spelling both directions: the id `ingest roots` PRINTED, pasted back verbatim.
+green "install the mixed candidate" "$TFS" ingest install "$MIXSTORE" mix proof mixed 1.0.0 local
+MIXSNAP=$("$TFS" ingest sessions "$MIXSTORE" | grep manifest | head -1 | awk '{print $2}' | cut -d: -f2)
+# ONE spelling both directions: the id `ingest sessions` PRINTED, pasted back verbatim.
 green "the printed sha256: id is accepted as itself" \
-    "$TFS" snapshot show "$MIXSTORE" "sha256:$MIXSNAP"
+    "$TFS" manifest show "$MIXSTORE" "sha256:$MIXSNAP"
 # and ONLY that spelling: the prefix is accepted as itself, not stripped off anything
 red OBJECT_ABSENT "an id spelled any other way resolves to nothing" \
-    "$TFS" snapshot show "$MIXSTORE" "SHA256:$MIXSNAP"
-"$TFS" snapshot walk "$MIXSTORE" "$MIXSNAP" | sed -n '2,3p'
+    "$TFS" manifest show "$MIXSTORE" "SHA256:$MIXSNAP"
+"$TFS" manifest walk "$MIXSTORE" "$MIXSNAP" | sed -n '2,3p'
 green "delivered bytes hash to the digests the header declares" \
     "$TFS" read prove "$MIXSTORE" "$MIXSNAP"
 "$TFS" read prove "$MIXSTORE" "$MIXSNAP" | sed 's/^/    /'
-MIXHDR=$("$TFS" snapshot show "$MIXSTORE" "$MIXSNAP" | grep attachment | grep -oE '[0-9a-f]{64}')
+MIXHDR=$("$TFS" manifest show "$MIXSTORE" "$MIXSNAP" | grep cozytensors | grep -oE '[0-9a-f]{64}')
 red CONVERTS_NOTHING "re-ingest of the mixed result changes nothing" \
     "$TFS" ingest reingest "$MIXSTORE" "$MIXHDR" mix=fp8-scaled-scalar/1 --session m0
 echo "  a MIXED canonical header re-keyed: three encodings matched by DIGEST, zero bytes hashed"
@@ -353,8 +353,8 @@ NSTORE="$WORK/nstore"
 "$TFS" ingest run "$NSTORE" transformer=plain/1 --registry "$NREG" --session nat \
   --source transformer="$WORK/carriers/native-qkv.safetensors" 2>&1 \
   | grep -E "segments|inline_parts|peak_rss_kb|bytes_written" | sed 's/^/  /'
-green "install the native candidate" "$TFS" ingest install "$NSTORE" nat
-NSNAP=$("$TFS" ingest roots "$NSTORE" | grep installed | head -1 | awk '{print $2}' | cut -d: -f2)
+green "install the native candidate" "$TFS" ingest install "$NSTORE" nat proof native 1.0.0 local
+NSNAP=$("$TFS" ingest sessions "$NSTORE" | grep manifest | head -1 | awk '{print $2}' | cut -d: -f2)
 green "permuted bytes hash to the digests the header declares" \
     "$TFS" read prove "$NSTORE" "$NSNAP"
 "$TFS" read prove "$NSTORE" "$NSNAP" | sed 's/^/    /'
@@ -395,14 +395,14 @@ NVSTORE="$WORK/nvstore"
 "$TFS" ingest run "$NVSTORE" nv=nvfp4-w4a4/1 --registry "$REG" --session nv \
   --source nv="$WORK/carriers/nvfp4.safetensors" 2>&1 \
   | grep -E "^encodings|^ +[0-9]+ +|^topology|parts |tensors " | sed 's/^/  /'
-green "install the packed-data-role candidate" "$TFS" ingest install "$NVSTORE" nv
-NVSNAP=$("$TFS" ingest roots "$NVSTORE" | grep installed | head -1 | awk '{print $2}' | cut -d: -f2)
+green "install the packed-data-role candidate" "$TFS" ingest install "$NVSTORE" nv proof nv 1.0.0 local
+NVSNAP=$("$TFS" ingest sessions "$NVSTORE" | grep manifest | head -1 | awk '{print $2}' | cut -d: -f2)
 green "delivered bytes hash to the digests the header declares" \
     "$TFS" read prove "$NVSTORE" "$NVSNAP"
 
 banner "RED 6f — one component, several encodings: the candidate SET"
 # The STORE has always admitted heterogeneous per-tensor encodings — `encoding` is a
-# per-TENSOR header field, and a two-COMPONENT snapshot citing three spec digests was
+# per-TENSOR header field, and a two-COMPONENT manifest citing three encoding digests was
 # already green. The planner filtered the encoded candidates to `a == alias` for the ONE
 # alias `Target::get` found, so a component whose producer allocated two encodings across
 # its own tensors was unreachable by construction, in both directions.
@@ -419,16 +419,16 @@ M2STORE="$WORK/mix2store"
 "$TFS" ingest run "$M2STORE" mix2=mxfp8/1,mix2=fp8-rowwise/1 --registry "$REG" --session m2 \
   --source mix2="$WORK/carriers/two-encodings.safetensors" 2>&1 \
   | grep -E "^encodings|^ +[0-9]+ +|^topology|tensors " | sed 's/^/  /'
-green "install the two-encoding component" "$TFS" ingest install "$M2STORE" m2
-M2SNAP=$("$TFS" ingest roots "$M2STORE" | grep installed | head -1 | awk '{print $2}' | cut -d: -f2)
+green "install the two-encoding component" "$TFS" ingest install "$M2STORE" m2 proof mixed-two 1.0.0 local
+M2SNAP=$("$TFS" ingest sessions "$M2STORE" | grep manifest | head -1 | awk '{print $2}' | cut -d: -f2)
 green "delivered bytes hash to the digests the header declares" \
     "$TFS" read prove "$M2STORE" "$M2SNAP"
 # The set widens the vocabulary, never the judgement: a tensor whose roles match NO alias in
 # the set still refuses typed, with every candidate tried named in the verdict.
 red DOUBLE_ENCODE "a .weight_scale_2 role no alias in the set declares" \
     "$TFS" ingest plan nv=mxfp8/1,nv=fp8-rowwise/1 --source nv="$WORK/carriers/nvfp4.safetensors" --registry "$REG"
-# And the set is scoped to the COMPONENT, not the snapshot: `fp8-rowwise/1` declared for
-# `nv` does not reach `mix2`'s tensors. A snapshot-wide set is exactly the one-rule-over-
+# And the set is scoped to the COMPONENT, not the manifest: `fp8-rowwise/1` declared for
+# `nv` does not reach `mix2`'s tensors. A manifest-wide set is exactly the one-rule-over-
 # the-tree that `Target` exists to refuse.
 red SHAPE_MISMATCH "an alias declared for ANOTHER component does not widen this one" \
     "$TFS" ingest plan mix2=mxfp8/1,nv=fp8-rowwise/1 \
@@ -473,7 +473,7 @@ banner "REAL 2 — bank the reviewed registry, then plan (headers only)"
   --source text_encoder_2="$SDXL/text_encoder_2/model.fp16.safetensors" \
   --source-name stabilityai/stable-diffusion-xl-base-1.0 | tail -1
 
-banner "REAL 3 — the isolated run: carrier bytes -> canonical snapshot under quarantine"
+banner "REAL 3 — the isolated run: carrier bytes -> canonical manifest under quarantine"
 /usr/bin/time -f "  wall %e s   peak RSS %M KiB" \
 "$TFS" ingest run "$STORE" unet=plain/1,vae=plain/1,text_encoder=plain/1,text_encoder_2=plain/1 \
   --registry "$REG" --session sdxl \
@@ -485,30 +485,30 @@ banner "REAL 3 — the isolated run: carrier bytes -> canonical snapshot under q
   --config text_encoder="$SDXL/text_encoder/config.json" \
   --config text_encoder_2="$SDXL/text_encoder_2/config.json"
 
-SNAP=$("$TFS" ingest roots "$STORE" 2>/dev/null | true)
-banner "REAL 4 — a candidate is NOT a checkpoint"
-"$TFS" ingest roots "$STORE"
+SNAP=$("$TFS" ingest sessions "$STORE" 2>/dev/null | true)
+banner "REAL 4 — a candidate is NOT a release"
+"$TFS" ingest sessions "$STORE"
 
 banner "REAL 5 — install: the coordinator's act, against the receipt"
 # An ARM, not a bare command. This step printed `REFUSED SIZE_CAP` for a whole release and
 # nothing counted it, because a bare line's refusal is invisible: the subject's candidate
-# set is EVERY object the snapshot reaches — 2,601 for this tree — against a 64 KiB cap it
+# set is EVERY blob the manifest reaches — 2,601 for this tree — against a 64 KiB cap it
 # shared with the fixed-size documents. A step whose failure is not an arm is not verified.
-INS=$("$TFS" ingest install "$STORE" sdxl 2>&1)
+INS=$("$TFS" ingest install "$STORE" sdxl proof sdxl 1.0.0 local 2>&1)
 if grep -q REFUSED <<<"$INS"; then
   MISS=$((MISS+1)); printf '  MISS %-42s %s\n' "install a 2,601-object candidate" "$(head -1 <<<"$INS")"
 else
   PASS=$((PASS+1)); printf '  ok   %s\n' "install a 2,601-object candidate (the subject's real candidate set)"
 fi
 sed 's/^/    /' <<<"$INS"
-"$TFS" ingest roots "$STORE"
+"$TFS" ingest sessions "$STORE"
 
-CK=$("$TFS" ingest roots "$STORE" | grep installed | head -1 | awk '{print $2}' | cut -d: -f2)
+CK=$("$TFS" ingest sessions "$STORE" | grep manifest | head -1 | awk '{print $2}' | cut -d: -f2)
 banner "REAL 6 — the transitive walk verifies the installed result"
-"$TFS" snapshot walk "$STORE" "$CK" | head -6
+"$TFS" manifest walk "$STORE" "$CK" | head -6
 
 banner "REAL 7 — inherit by object reference: a re-ingest that hashes NOTHING"
-HDR=$("$TFS" snapshot show "$STORE" "$CK" | grep attachment | grep -oE "[0-9a-f]{64}")
+HDR=$("$TFS" manifest show "$STORE" "$CK" | grep cozytensors | grep -oE "[0-9a-f]{64}")
 red CONVERTS_NOTHING "re-ingest with no change at all" \
     "$TFS" ingest reingest "$STORE" "$HDR" unet=plain/1,vae=plain/1,text_encoder=plain/1,text_encoder_2=plain/1 --session r0
 "$TFS" ingest reingest "$STORE" "$HDR" unet=plain/1,vae=plain/1,text_encoder=plain/1,text_encoder_2=plain/1 \
@@ -531,8 +531,8 @@ echo "  and the same bytes through the diffusers packaging, into the SAME store:
 "$TFS" ingest run "$WORK/conv" vae=plain/1 --registry "$REG" --session df \
   --source vae="$SDXL/vae/diffusion_pytorch_model.fp16.safetensors" 2>&1 | grep -E "^topology|bytes_deduped|bytes_hashed|^candidate"
 
-banner "REAL 8b — crash mid-ingest: kill -9 leaves no visible checkpoint"
-BEFORE=$("$TFS" ingest roots "$STORE" | tail -1)
+banner "REAL 8b — crash mid-ingest: kill -9 leaves no visible release"
+BEFORE=$("$TFS" ingest sessions "$STORE" | tail -1)
 "$TFS" ingest run "$STORE" unet=plain/1 --registry "$REG" --session crashed \
   --source unet="$SDXL/unet/diffusion_pytorch_model.fp16.safetensors" >"$WORK/crash.log" 2>&1 &
 RUNPID=$!
@@ -542,14 +542,15 @@ kill -9 $RUNPID 2>/dev/null
 wait $RUNPID 2>/dev/null
 echo "  killed mid-stream (-9, no unwinding, no cleanup handler)"
 echo "  before: $BEFORE"
-echo "  after:  $("$TFS" ingest roots "$STORE" | tail -1)"
+echo "  after:  $("$TFS" ingest sessions "$STORE" | tail -1)"
 red ROOT_ABSENT "installing a session the crash never completed" \
-    "$TFS" ingest install "$STORE" crashed
-echo "  reaping the expiring roots:"
+    "$TFS" ingest install "$STORE" crashed proof crashed 1.0.0 local
+echo "  reaping the expiring sessions:"
 "$TFS" ingest reap "$STORE" --now | sed 's/^/    /'
-red ROOT_ABSENT "installing after the root was reaped" "$TFS" ingest install "$STORE" rekey
-echo "  installed checkpoints after the crash and the reap:"
-"$TFS" ingest roots "$STORE" | sed 's/^/    /'
+red ROOT_ABSENT "installing after the session was reaped" \
+    "$TFS" ingest install "$STORE" rekey proof rekey 1.0.0 local
+echo "  released manifests after the crash and the reap:"
+"$TFS" ingest sessions "$STORE" | sed 's/^/    /'
 
 fi   # sdxl present
 fi   # real

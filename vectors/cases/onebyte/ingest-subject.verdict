@@ -1,3 +1,3 @@
 doc: subject
 expect: mutant
-note: one byte flipped at offset 162 of sha256:4429d1033d7ce8fb3f5afc73699f89e2065b966b6a21db3ec8897108126029d6
+note: one byte flipped at offset 150 of sha256:cc4dfca964084519a776336827df65a49ba2a3d4bdef6d4aa2107624c56ad171

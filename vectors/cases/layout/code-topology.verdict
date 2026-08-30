@@ -1,4 +1,4 @@
 doc: code_topology
 expect: ok
-id: sha256:14136b8d926fc69e72877dbc88a609171175acf8ff11bfc22f917d7fd0df9c76
+id: sha256:4fe7ec76d50b5fa9edbb118dc62dcd56b8b5087c657b714c2aabdbf8cd8e3054
 note: the bounded projection of a ModelConstructionContract

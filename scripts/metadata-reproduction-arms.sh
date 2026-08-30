@@ -10,12 +10,12 @@ cargo build --quiet --release --bin tfs --manifest-path "$repo_root/Cargo.toml"
 "$tfs" store init "$proof_root/store" >/dev/null
 write=$({ "$tfs" checkpoint write "$proof_root/store" --blocks 1; } 2>&1)
 header=$(printf '%s\n' "$write" | sed -n 's/.*header_digest   sha256:\([0-9a-f]\{64\}\).*/\1/p')
-snapshot=$(printf '%s\n' "$write" | sed -n 's/.*checkpoint_id   sha256:\([0-9a-f]\{64\}\).*/\1/p')
-test -n "$header" && test -n "$snapshot"
+manifest=$(printf '%s\n' "$write" | sed -n 's/.*manifest_id     sha256:\([0-9a-f]\{64\}\).*/\1/p')
+test -n "$header" && test -n "$manifest"
 
 "$tfs" get "$proof_root/store" "$header" --out "$proof_root/header.cbor" >/dev/null
 "$tfs" cbor decode "$proof_root/header.cbor" --out "$proof_root/header.json"
-"$tfs" get "$proof_root/store" "$snapshot" --out "$proof_root/snapshot.json" >/dev/null
+"$tfs" manifest get "$proof_root/store" "$manifest" --out "$proof_root/manifest.json" >/dev/null
 
 python3 - "$proof_root" <<'PY'
 import json
@@ -24,15 +24,13 @@ import sys
 
 root = pathlib.Path(sys.argv[1])
 header = json.loads((root / "header.json").read_text())
-snapshot = json.loads((root / "snapshot.json").read_text())
+manifest = json.loads((root / "manifest.json").read_text())
 entries = []
-for row in snapshot["entries"]:
-    if row["kind"] == "dir":
-        entries.append([row["path"], "dir"])
-    elif row["path"] == "model.cozytensors":
-        entries.append([row["path"], "header"])
+for row in manifest["entries"]:
+    if row["kind"] == "cozytensors":
+        entries.append([row["path"], "cozytensors"])
     else:
-        entries.append([row["path"], "file", row["object"]])
+        entries.append([row["path"], "file", row["blob"]])
 order = [
     [component[0], tensor[0]]
     for component in header["components"]
@@ -52,16 +50,13 @@ old["configs"] = {row[0]: row[1] for row in header["configs"]}
 
 unverified = json.loads(json.dumps(entries))
 for row in unverified:
-    if row[1] == "file" and not row[0].startswith(("assets/", "closure/")):
+    if row[1] == "file":
         row[2]["sha256"] = "0" * 64
         break
 (root / "unverified.json").write_text(json.dumps(unverified, separators=(",", ":")))
 
-missing = [
-    row for row in entries
-    if not (row[0].startswith("closure/") and row[1] == "file")
-]
-(root / "missing-closure.json").write_text(json.dumps(missing, separators=(",", ":")))
+missing_header = [row for row in entries if row[1] != "cozytensors"]
+(root / "missing-header.json").write_text(json.dumps(missing_header, separators=(",", ":")))
 PY
 
 reproduced=$(
@@ -69,7 +64,7 @@ reproduced=$(
     "$proof_root/entries.json" --order "$proof_root/order.json"
 )
 grep -q "header       sha256:$header" <<<"$reproduced"
-grep -q "snapshot     sha256:$snapshot" <<<"$reproduced"
+grep -q "manifest     sha256:$manifest" <<<"$reproduced"
 grep -q 'tensor_payload_read 0' <<<"$reproduced"
 grep -q 'tensor_payload_hash 0' <<<"$reproduced"
 
@@ -78,7 +73,7 @@ minified=$(
     "$proof_root/entries.json" --order "$proof_root/order.json"
 )
 grep -q "header       sha256:$header" <<<"$minified"
-grep -q "snapshot     sha256:$snapshot" <<<"$minified"
+grep -q "manifest     sha256:$manifest" <<<"$minified"
 
 refuse() {
   local code=$1
@@ -99,12 +94,8 @@ refuse WRONG_TYPE \
 refuse OBJECT_CORRUPT \
   "$tfs" checkpoint reproduce "$proof_root/store" "$proof_root/header.json" \
     "$proof_root/unverified.json" --order "$proof_root/order.json"
-refuse NOT_CONTAINED \
+refuse ATTACHMENT_CARDINALITY \
   "$tfs" checkpoint reproduce "$proof_root/store" "$proof_root/header.json" \
-    "$proof_root/missing-closure.json" --order "$proof_root/order.json"
-"$tfs" store bump "$proof_root/store" >/dev/null
-refuse OBJECT_CORRUPT \
-  "$tfs" checkpoint reproduce "$proof_root/store" "$proof_root/header.json" \
-    "$proof_root/entries.json" --order "$proof_root/order.json"
+    "$proof_root/missing-header.json" --order "$proof_root/order.json"
 
-printf 'tfs-029 metadata reproduction: 7/7 arms green\n'
+printf 'tfs-029 metadata reproduction: 6/6 arms green\n'
