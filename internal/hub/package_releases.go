@@ -19,12 +19,21 @@ type PackageUpload struct {
 }
 
 type PackageProfileState struct {
-	Profile             string `json:"profile"`
-	State               string `json:"state"`
-	CandidateID         string `json:"candidate_id,omitempty"`
-	BaseRealizationKind string `json:"base_realization_kind,omitempty"`
-	RefusalCode         string `json:"refusal_code,omitempty"`
-	RefusalDetail       string `json:"refusal_detail,omitempty"`
+	Profile                string             `json:"profile"`
+	State                  string             `json:"state"`
+	CandidateID            string             `json:"candidate_id,omitempty"`
+	BaseRealizationKind    string             `json:"base_realization_kind,omitempty"`
+	BaseRealizationDigest  string             `json:"base_realization_digest,omitempty"`
+	PackageEnvironmentSpec PackageDocumentRef `json:"package_environment_spec"`
+	ResolutionLock         PackageDocumentRef `json:"resolution_lock"`
+	ResolvedWheelSet       PackageDocumentRef `json:"resolved_wheel_set"`
+	RefusalCode            string             `json:"refusal_code,omitempty"`
+	RefusalDetail          string             `json:"refusal_detail,omitempty"`
+}
+
+type PackageDocumentRef struct {
+	Digest string `json:"digest"`
+	Length int64  `json:"length"`
 }
 
 type PackageReleaseBegin struct {

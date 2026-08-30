@@ -12,9 +12,22 @@
   ],
   "profiles": [
     {
+      "base_realization_digest": "index.docker.io/tensorhub/worker@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
       "base_realization_kind": "base-worker-image",
       "candidate_id": "pqc-01K5PACKAGEPROOF",
+      "package_environment_spec": {
+        "digest": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        "length": 501
+      },
       "profile": "cpu-py311-torch213",
+      "resolution_lock": {
+        "digest": "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+        "length": 502
+      },
+      "resolved_wheel_set": {
+        "digest": "sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+        "length": 503
+      },
       "state": "qualified"
     }
   ],
