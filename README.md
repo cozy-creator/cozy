@@ -30,16 +30,21 @@ rows—not additional stored document formats.
 
 ## Build and test
 
+The Python package supports normal GIL-enabled CPython 3.14 only. Its native wheel is
+`cp314-abi3`; free-threaded CPython 3.14t has a different ABI and is refused at the tooling and
+import boundaries.
+
 ```bash
+export PYO3_PYTHON="$(uv python find 3.14)"
 cargo test --workspace --all-features
 cargo clippy --workspace --all-targets --all-features -- -D warnings
 cargo fmt --all -- --check
 
 cargo build --release --bin tfs
-uv run --project conformance/cbor/python \
+uv run --python 3.14 --project conformance/cbor/python \
   python scripts/cbor-conformance.py --tfs target/release/tfs conform
-uv run python scripts/fence.py
-uv run python scripts/version_contract.py
+uv run --no-project --python 3.14 python scripts/fence.py
+uv run --no-project --python 3.14 python scripts/version_contract.py source
 ```
 
 The CBOR gate runs independent Rust, Go, and Python codecs over the same green and red vectors.

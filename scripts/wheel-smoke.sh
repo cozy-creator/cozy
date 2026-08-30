@@ -24,6 +24,7 @@ while [ $# -gt 0 ]; do
 done
 work="${work:-$(mktemp -d)}"
 mkdir -p "$work"
+"$py" scripts/version_contract.py source
 
 wheels="${wheels:-$work/wheels}"
 if [ -z "$skip_build" ]; then

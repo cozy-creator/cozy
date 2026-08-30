@@ -5,7 +5,7 @@
 //! 1. **The caller owns the memory.** Every read fills a buffer Python already owns, through
 //!    the stable-ABI `Py_buffer`. TensorFS allocates no destination, and the runtime's one
 //!    budgeted pinned pool stays the runtime's. Nothing is copied to hand bytes to Python.
-//! 2. **The GIL is not held while bytes move.** Every read runs inside `allow_threads`, so a
+//! 2. **The GIL is not held while bytes move.** Every read runs inside `Python::detach`, so a
 //!    reader pool of N genuinely reads N-wide from a Python caller.
 
 use std::path::PathBuf;
@@ -104,7 +104,7 @@ struct Readable {
 impl std::io::Read for Readable {
     fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
         let want = buf.len();
-        Python::with_gil(|py| {
+        Python::attach(|py| {
             let chunk = match self.obj.bind(py).call_method1("read", (want,)) {
                 Ok(c) => c,
                 Err(e) => {
@@ -113,7 +113,7 @@ impl std::io::Read for Readable {
                     return Err(std::io::Error::other(msg));
                 }
             };
-            let bytes: Vec<u8> = if let Ok(b) = chunk.downcast::<PyBytes>() {
+            let bytes: Vec<u8> = if let Ok(b) = chunk.cast::<PyBytes>() {
                 b.as_bytes().to_vec()
             } else {
                 match chunk.extract::<Vec<u8>>() {
@@ -224,7 +224,7 @@ fn parse_declaration(
     let mut components = Vec::with_capacity(targets.len());
     for (target, value) in targets.iter() {
         let target: String = target.extract()?;
-        let value = value.downcast::<PyDict>()?;
+        let value = value.cast::<PyDict>()?;
         only_keys(
             py,
             value,
@@ -240,11 +240,11 @@ fn parse_declaration(
             .map(|value| value.extract::<String>())
             .transpose()?;
         let drop: Vec<String> = required(py, value, "target", "drop")?.extract()?;
-        let additions = required(py, value, "target", "add")?.downcast_into::<PyDict>()?;
+        let additions = required(py, value, "target", "add")?.cast_into::<PyDict>()?;
         let mut add = Vec::with_capacity(additions.len());
         for (tensor_key, tensor_value) in additions.iter() {
             let tensor_key: String = tensor_key.extract()?;
-            let tensor = tensor_value.downcast::<PyDict>()?;
+            let tensor = tensor_value.cast::<PyDict>()?;
             only_keys(
                 py,
                 tensor,
@@ -257,12 +257,11 @@ fn parse_declaration(
             .or_refuse(py)?;
             let shape: Vec<u64> = required(py, tensor, "addition", "shape")?.extract()?;
             let encoding: String = required(py, tensor, "addition", "encoding")?.extract()?;
-            let part_values =
-                required(py, tensor, "addition", "parts")?.downcast_into::<PyDict>()?;
+            let part_values = required(py, tensor, "addition", "parts")?.cast_into::<PyDict>()?;
             let mut parts = Vec::with_capacity(part_values.len());
             for (role, part_value) in part_values.iter() {
                 let role: String = role.extract()?;
-                let part = part_value.downcast::<PyDict>()?;
+                let part = part_value.cast::<PyDict>()?;
                 only_keys(
                     py,
                     part,
@@ -296,7 +295,7 @@ fn parse_declaration(
     let mut config_rows = Vec::with_capacity(configs.len());
     for (target, value) in configs.iter() {
         let target: String = target.extract()?;
-        let value = value.downcast::<PyDict>()?;
+        let value = value.cast::<PyDict>()?;
         only_keys(
             py,
             value,
@@ -563,7 +562,7 @@ impl PyStore {
             lane: lane.to_string(),
         };
         let repository = py
-            .allow_threads(|| {
+            .detach(|| {
                 self.store
                     .apply_repository(Some(current), &mutation, &Fault::default())
             })
@@ -597,7 +596,7 @@ impl PyStore {
             }
         };
         let p = py
-            .allow_threads(|| self.store.put_file(&path, want.as_ref(), &Fault::default()))
+            .detach(|| self.store.put_file(&path, want.as_ref(), &Fault::default()))
             .or_refuse(py)?;
         let d = PyDict::new(py);
         d.set_item("id", p.obj.id())?;
@@ -628,7 +627,7 @@ impl PyStore {
             obj: reader.clone().unbind(),
             err: None,
         };
-        let put = py.allow_threads(|| {
+        let put = py.detach(|| {
             self.store
                 .put_stream(&mut src, Some(&want), &Fault::default())
         });
@@ -686,7 +685,7 @@ impl PyStore {
             }
         }
         let put = py
-            .allow_threads(|| self.store.put_manifest(&manifest))
+            .detach(|| self.store.put_manifest(&manifest))
             .or_refuse(py)?;
         let out = PyDict::new(py);
         out.set_item("id", put.obj.id())?;
@@ -697,7 +696,7 @@ impl PyStore {
 
     fn verify<'p>(&self, py: Python<'p>, hex: &str) -> PyResult<Bound<'p, PyDict>> {
         let hex = hex.trim_start_matches("sha256:").to_string();
-        let v = py.allow_threads(|| self.store.verify(&hex)).or_refuse(py)?;
+        let v = py.detach(|| self.store.verify(&hex)).or_refuse(py)?;
         let d = PyDict::new(py);
         match v {
             Verdict::Verified { rehashed } => {
@@ -739,7 +738,7 @@ impl PyStore {
             ));
         }
         let v = py
-            .allow_threads(|| self.store.read_range(&hex, 0, size))
+            .detach(|| self.store.read_range(&hex, 0, size))
             .or_refuse(py)?;
         Ok(PyBytes::new(py, &v))
     }
@@ -758,7 +757,7 @@ impl PyStore {
     fn walk<'p>(&self, py: Python<'p>, hex: &str) -> PyResult<Bound<'p, PyList>> {
         let (m, _, _) = self.load(py, hex)?;
         let w = py
-            .allow_threads(|| checkpoint::walk(&self.store, &m))
+            .detach(|| checkpoint::walk(&self.store, &m))
             .or_refuse(py)?;
         let l = PyList::empty(py);
         for r in &w.objects {
@@ -786,7 +785,7 @@ impl PyStore {
         }
         let snap = manifest.trim_start_matches("sha256:").to_string();
         let (lease, rx) = py
-            .allow_threads(|| read::acquire(&self.store, &self.meta, &snap, refs))
+            .detach(|| read::acquire(&self.store, &self.meta, &snap, refs))
             .or_refuse(py)?;
         Ok(PyLease {
             lease: Mutex::new(Some(lease)),
@@ -799,7 +798,7 @@ impl PyStore {
     fn acquire_manifest(&self, py: Python<'_>, hex: &str) -> PyResult<PyLease> {
         let (m, _, _) = self.load(py, hex)?;
         let (lease, rx) = py
-            .allow_threads(|| read::acquire_manifest(&self.store, &self.meta, &m))
+            .detach(|| read::acquire_manifest(&self.store, &self.meta, &m))
             .or_refuse(py)?;
         Ok(PyLease {
             lease: Mutex::new(Some(lease)),
@@ -854,12 +853,12 @@ impl PyStore {
                 ))
             }
         };
-        py.allow_threads(|| project::materialize(&self.store, &blob, &dest))
+        py.detach(|| project::materialize(&self.store, &blob, &dest))
             .or_refuse(py)
     }
 
     fn reap_holds(&self, py: Python<'_>) -> PyResult<Vec<String>> {
-        py.allow_threads(|| self.meta.reap_holds()).or_refuse(py)
+        py.detach(|| self.meta.reap_holds()).or_refuse(py)
     }
 
     /// Exact pre-transaction preview for a granted source manifest. Selected tensor
@@ -874,7 +873,7 @@ impl PyStore {
     ) -> PyResult<Bound<'p, PyDict>> {
         let reference = obj_ref(py, manifest, manifest_length)?;
         let inspection = py
-            .allow_threads(|| {
+            .detach(|| {
                 derived::inspect_source(&self.store, &self.meta, reference, components, configs)
             })
             .or_refuse(py)?;
@@ -923,7 +922,7 @@ impl PyStore {
     ) -> PyResult<PyDerivedWriter> {
         let declaration = parse_declaration(py, sources, targets, configs, order, max_new_bytes)?;
         let begin = py
-            .allow_threads(|| {
+            .detach(|| {
                 derived::begin(
                     &self.store,
                     &self.meta,
@@ -953,7 +952,7 @@ impl PyStore {
         transaction_id: &str,
     ) -> PyResult<Bound<'p, PyDict>> {
         let result = py
-            .allow_threads(|| derived::lookup(&self.meta, transaction_id))
+            .detach(|| derived::lookup(&self.meta, transaction_id))
             .or_refuse(py)?;
         let out = PyDict::new(py);
         match result {
@@ -981,7 +980,7 @@ impl PyStore {
         transaction_id: &str,
         writer_session_id: u64,
     ) -> PyResult<bool> {
-        py.allow_threads(|| derived::fence(&self.meta, transaction_id, writer_session_id))
+        py.detach(|| derived::fence(&self.meta, transaction_id, writer_session_id))
             .or_refuse(py)
     }
 
@@ -992,7 +991,7 @@ impl PyStore {
         transaction_id: &str,
     ) -> PyResult<Bound<'p, PyDict>> {
         let result = py
-            .allow_threads(|| derived::abandon(&self.meta, transaction_id))
+            .detach(|| derived::abandon(&self.meta, transaction_id))
             .or_refuse(py)?;
         let out = PyDict::new(py);
         match result {
@@ -1012,7 +1011,7 @@ impl PyStore {
         transaction_id: &str,
     ) -> PyResult<Bound<'p, PyAny>> {
         let value = py
-            .allow_threads(|| derived::dispose(&self.meta, transaction_id))
+            .detach(|| derived::dispose(&self.meta, transaction_id))
             .or_refuse(py)?;
         marshal(py, &value.to_value())
     }
@@ -1080,7 +1079,7 @@ impl PyOperation {
             )),
         };
         let repository = py
-            .allow_threads(|| {
+            .detach(|| {
                 self.store
                     .apply_repository(current, &mutation, &Fault::default())
             })
@@ -1225,7 +1224,7 @@ impl PyDerivedWriter {
                 )
             })?;
         let what = format!("{component}/{key}#{role}");
-        py.allow_threads(|| {
+        py.detach(|| {
             derived::check_writer(&self.meta, &self.transaction_id, self.writer_session_id)?;
             read::read_part_into(
                 lease,
@@ -1254,7 +1253,7 @@ impl PyDerivedWriter {
             obj: reader.clone().unbind(),
             err: None,
         };
-        let result = py.allow_threads(|| {
+        let result = py.detach(|| {
             derived::add_part(
                 &self.store,
                 &self.meta,
@@ -1293,7 +1292,7 @@ impl PyDerivedWriter {
             obj: reader.clone().unbind(),
             err: None,
         };
-        let result = py.allow_threads(|| {
+        let result = py.detach(|| {
             derived::add_config(
                 &self.store,
                 &self.meta,
@@ -1315,7 +1314,7 @@ impl PyDerivedWriter {
 
     fn commit<'p>(&self, py: Python<'p>) -> PyResult<Bound<'p, PyAny>> {
         let value = py
-            .allow_threads(|| {
+            .detach(|| {
                 derived::commit(
                     &self.store,
                     &self.meta,
@@ -1330,9 +1329,7 @@ impl PyDerivedWriter {
 
     fn fence(&self, py: Python<'_>) -> PyResult<bool> {
         let fenced = py
-            .allow_threads(|| {
-                derived::fence(&self.meta, &self.transaction_id, self.writer_session_id)
-            })
+            .detach(|| derived::fence(&self.meta, &self.transaction_id, self.writer_session_id))
             .or_refuse(py)?;
         self.release_holds();
         Ok(fenced)
@@ -1536,7 +1533,7 @@ impl PyLease {
     fn release(&self, py: Python<'_>) -> PyResult<()> {
         let l = self.lease.lock().unwrap().take();
         match l {
-            Some(l) => py.allow_threads(|| l.release(&self.meta)).or_refuse(py),
+            Some(l) => py.detach(|| l.release(&self.meta)).or_refuse(py),
             None => Err(released(py)),
         }
     }
@@ -1578,8 +1575,7 @@ impl PyLease {
             off,
             len: length,
         };
-        py.allow_threads(|| read::read_into(lease, &r, dest))
-            .or_refuse(py)
+        py.detach(|| read::read_into(lease, &r, dest)).or_refuse(py)
     }
 
     /// **The streaming shape.** One plan, a ring of CALLER-owned slots, and a reader pool
@@ -1610,14 +1606,14 @@ impl PyLease {
         let raised: Mutex<Option<PyErr>> = Mutex::new(None);
         let cb = on_batch.unbind();
         let started = std::time::Instant::now();
-        let out = py.allow_threads(|| {
+        let out = py.detach(|| {
             read::pump(
                 lease,
                 &plan.plan,
                 views,
                 readers,
                 |filled, slot| -> TResult<()> {
-                    Python::with_gil(|py| {
+                    Python::attach(|py| {
                         let b = PyBatch {
                             index: filled.index,
                             slot: slot.index(),
@@ -1748,7 +1744,7 @@ pub fn transfer_object<'p>(
 ) -> PyResult<Bound<'p, PyDict>> {
     let want = obj_ref(py, object_id, expected_length)?;
     let put = py
-        .allow_threads(|| source.store.transfer_object(&destination.store, &want))
+        .detach(|| source.store.transfer_object(&destination.store, &want))
         .or_refuse(py)?;
     let result = PyDict::new(py);
     result.set_item("id", put.obj.id())?;
@@ -1767,7 +1763,7 @@ pub fn transfer_manifest<'p>(
 ) -> PyResult<Bound<'p, PyDict>> {
     let wanted = obj_ref(py, manifest_id, expected_length)?;
     let put = py
-        .allow_threads(|| source.store.transfer_manifest(&destination.store, &wanted))
+        .detach(|| source.store.transfer_manifest(&destination.store, &wanted))
         .or_refuse(py)?;
     let result = PyDict::new(py);
     result.set_item("id", put.obj.id())?;
@@ -1842,7 +1838,7 @@ pub fn fetch_admit<'p>(
         obj: reader.clone().unbind(),
         err: None,
     };
-    let admitted = match py.allow_threads(|| grant.admit(&store.store, &mut source)) {
+    let admitted = match py.detach(|| grant.admit(&store.store, &mut source)) {
         Ok(admitted) => admitted,
         Err(error) => return Err(source.err.take().unwrap_or_else(|| to_py(py, &error))),
     };
@@ -1857,7 +1853,6 @@ pub fn fetch_admit<'p>(
 #[pyfunction]
 pub fn fetch_complete(py: Python<'_>, store: &PyStore, plan: &[u8]) -> PyResult<u64> {
     let plan = tensorfs_core::fetch::FetchPlan::parse(plan).or_refuse(py)?;
-    py.allow_threads(|| plan.complete(&store.store))
-        .or_refuse(py)?;
+    py.detach(|| plan.complete(&store.store)).or_refuse(py)?;
     Ok(plan.declared_bytes())
 }

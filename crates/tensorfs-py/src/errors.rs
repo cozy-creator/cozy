@@ -14,12 +14,12 @@ use std::collections::HashMap;
 use std::ffi::CString;
 
 use pyo3::prelude::*;
-use pyo3::sync::GILOnceCell;
+use pyo3::sync::PyOnceLock;
 use pyo3::types::{PyDict, PyType};
 use tensorfs_core::err::{Code, Refusal};
 
-static BASE: GILOnceCell<Py<PyType>> = GILOnceCell::new();
-static CLASSES: GILOnceCell<HashMap<&'static str, Py<PyType>>> = GILOnceCell::new();
+static BASE: PyOnceLock<Py<PyType>> = PyOnceLock::new();
+static CLASSES: PyOnceLock<HashMap<&'static str, Py<PyType>>> = PyOnceLock::new();
 
 /// `SHORT_READ` -> `ShortRead`. The wire name stays the code; this is the Python spelling.
 fn camel(code: &str) -> String {
