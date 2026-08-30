@@ -63,7 +63,7 @@ func PrepareFrom(projectDir string) (*Package, *exit.Error) {
 		_ = os.RemoveAll(root)
 		return nil, problem
 	}
-	fact, problem := wheel.Inspect(project.Path)
+	fact, problem := wheel.InspectIdentity(project.Path)
 	if problem != nil {
 		_ = os.RemoveAll(root)
 		return nil, problem

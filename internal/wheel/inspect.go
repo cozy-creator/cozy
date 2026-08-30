@@ -9,7 +9,6 @@ import (
 	"encoding/base64"
 	"encoding/csv"
 	"encoding/hex"
-	"fmt"
 	"io"
 	"os"
 	"path"
@@ -518,8 +517,4 @@ func equalStrings(a, b []string) bool {
 		}
 	}
 	return true
-}
-
-func (f Fact) String() string {
-	return fmt.Sprintf("%s==%s %s %dB", f.Distribution, f.Version, f.Digest, f.Length)
 }
