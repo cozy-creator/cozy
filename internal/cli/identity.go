@@ -14,10 +14,10 @@ import (
 // local InvocationSpec froze `environment_spec_digest: ""` — an UNDER-SPECIFIED identity
 // persisted forever under the request's digest.
 //
-// Both documents are deliberately `cozy.local.*` formats: the Cozy daemon manufactures
-// no Tensorhub document. They are frozen per daemon run, never per request — a request
-// cannot choose the environment it runs under — and the config's one secret enters as
-// its DIGEST, never raw.
+// These are digest preimages, not stored documents. A closed `kind` value separates the
+// two meanings without inventing two versioned file formats. They are frozen per daemon
+// run, never per request — a request cannot choose the environment it runs under — and
+// the config's one secret enters as its DIGEST, never raw.
 func localInvocationIdentity(cfg config.Config) (environmentSpec, configDigest string) {
 	build := "unknown"
 	if info, ok := debug.ReadBuildInfo(); ok {
@@ -31,13 +31,13 @@ func localInvocationIdentity(cfg config.Config) (environmentSpec, configDigest s
 		}
 	}
 	environmentSpec = spellOf(map[string]canonical.Value{
-		"format":        "cozy.local.ExecutionEnvironment/1",
+		"kind":          "execution_environment",
 		"os":            runtime.GOOS,
 		"arch":          runtime.GOARCH,
 		"service_build": build,
 	})
 	configDigest = spellOf(map[string]canonical.Value{
-		"format":           "cozy.local.EvaluatedConfig/1",
+		"kind":             "evaluated_config",
 		"home":             cfg.Home,
 		"port":             int64(cfg.Port),
 		"yield":            cfg.Yield,

@@ -144,7 +144,7 @@ func (s *Server) submit(w http.ResponseWriter, r *http.Request) {
 	spec.IdemKey = key
 	// THE BODY DIGEST is over the whole submission the key names, not over the payload
 	// alone: one key that named a different FUNCTION must conflict as loudly as one
-	// that named different input. The canonical document is the digest's subject, so
+	// that named different input. The canonical preimage is the digest's subject, so
 	// two clients that spell the same submission differently still agree.
 	digest, e := submissionDigest(spec)
 	if e != nil {
@@ -201,7 +201,7 @@ func replaySubmission(sub Submission, recorded records.Request) orchestrator.Sub
 // authority recorded.
 func submissionDigest(spec orchestrator.Submission) (string, *exit.Error) {
 	doc := map[string]canonical.Value{
-		"format":   "cozy.client.Submission/1",
+		"kind":     "serve",
 		"package":  spec.Package,
 		"function": spec.Entrypoint,
 		"plan_id":  spec.PlanID,

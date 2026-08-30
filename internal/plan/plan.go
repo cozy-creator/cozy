@@ -34,15 +34,8 @@ import (
 	"github.com/cozy-creator/cozy/internal/exit"
 )
 
-// Format is the identity document's format tag. It moved from `/1` to `/2` with the
-// partition: `/1` digested the whole record including its paths, so the two versions
-// name genuinely different documents and an id minted under one never collides with the
-// other's. Pre-launch there is nothing to migrate — a `/1` id exists only inside a
-// running worker's staged directory, which dies with the worker.
-const Format = "cozy.local.EntrypointBindingRecord/2"
-
-// IDKey is the record's own id field. A document never contains its own digest, so it is
-// excluded from the identity by name.
+// IDKey is the record's own id field. A hash preimage never contains its own digest, so it
+// is excluded from the identity by name.
 const IDKey = "entrypoint_binding_plan_id"
 
 // ResolutionKeys are the record fields that say WHERE, on the machine that staged the
@@ -98,7 +91,9 @@ func ID(record map[string]any) (string, *exit.Error) {
 		}
 		doc[k] = value
 	}
-	doc["format"] = Format
+	// Identity is a hash preimage, not a stored portable document. The closed kind value
+	// prevents collision with another canonical preimage without creating a file format.
+	doc["kind"] = "entrypoint_binding_plan"
 	data, err := canonical.Write(doc)
 	if err != nil {
 		return "", exit.Internalf("cannot canonicalize the binding record's identity: %s", err)
