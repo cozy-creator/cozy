@@ -174,6 +174,11 @@ func TestPackagePublishPendingWireFlowBoundsUploads(t *testing.T) {
 		[]string{"TENSORHUB_URL=" + server.URL, "TENSORHUB_TOKEN=proof-token"}, "package", "publish")
 	if code != 0 || !strings.Contains(out, "eligible_worker_profiles:") ||
 		!strings.Contains(out, "generate@cpu-py311-torch213=qualified") ||
+		!strings.Contains(out, "Building package wheel and local dependencies...") ||
+		!strings.Contains(out, "Registering 52 source files and 0 dependency wheels...") ||
+		!strings.Contains(out, "Uploading files: 0/53") ||
+		!strings.Contains(out, "Uploading files: 53/53") ||
+		!strings.Contains(out, "Finalizing release and evaluating worker profiles...") ||
 		strings.Contains(out, "qualification:") {
 		t.Fatalf("pending package wire flow failed [exit %d]\n%s", code, out)
 	}

@@ -2,9 +2,11 @@ package cli
 
 import (
 	"context"
+	"fmt"
 	"sort"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/cozy-creator/cozy/internal/exit"
 	"github.com/cozy-creator/cozy/internal/hub"
@@ -25,6 +27,7 @@ func handlePackagePublish(ctx *Context) *exit.Error {
 	}
 	release := pack.Release
 	reason := "cozy package publish " + ref.String() + "@" + release
+	packagePublishStatus(ctx, "Checking %s@%s...", ref.String(), release)
 
 	c := client(ctx)
 	hctx, cancel := hub.LongContext()
@@ -38,11 +41,15 @@ func handlePackagePublish(ctx *Context) *exit.Error {
 	}
 	var moved int64
 	if begun.State == "pending" {
-		if problem := pack.Build(hctx); problem != nil {
+		if problem := packagePublishStage(ctx, "Building package wheel and local dependencies", func() *exit.Error {
+			return pack.Build(hctx)
+		}); problem != nil {
 			return problem
 		}
 		paths := packagepublish.Paths(pack.Files)
 		dependencyWheels := packagepublish.WheelFilenames(pack.DependencyWheels)
+		packagePublishStatus(ctx, "Registering %d source files and %d dependency wheels...",
+			len(paths), len(dependencyWheels))
 		var uploads []hub.PackageUpload
 		for len(paths) > 0 || dependencyWheels != nil {
 			n := min(len(paths), 1000)
@@ -54,12 +61,20 @@ func handlePackagePublish(ctx *Context) *exit.Error {
 			paths = paths[n:]
 			dependencyWheels = nil
 		}
-		moved, problem = uploadPackageFiles(hctx, pack, begun.ProjectWheelUpload, uploads)
+		moved, problem = uploadPackageFiles(hctx, pack, begun.ProjectWheelUpload, uploads,
+			packageUploadCounter(ctx))
 		if problem != nil {
 			return problem
 		}
+	} else {
+		packagePublishStatus(ctx, "Release already published; refreshing status...")
 	}
-	done, problem := c.FinalizePackageRelease(hctx, ref, release, reason)
+	var done hub.PackageReleaseFinalize
+	problem = packagePublishStage(ctx, "Finalizing release and evaluating worker profiles", func() *exit.Error {
+		var finalProblem *exit.Error
+		done, finalProblem = c.FinalizePackageRelease(hctx, ref, release, reason)
+		return finalProblem
+	})
 	if problem != nil {
 		return problem
 	}
@@ -159,7 +174,7 @@ type packageFile struct {
 const maxConcurrentPackageUploads = 16
 
 func uploadPackageFiles(ctx context.Context, pack *packagepublish.Package, wheel hub.PackageUpload,
-	uploads []hub.PackageUpload,
+	uploads []hub.PackageUpload, progress func(completed, total int),
 ) (int64, *exit.Error) {
 	files := make([]packageFile, 0, len(uploads)+1)
 	files = append(files, packageFile{subject: "project_wheel", path: pack.Wheel, upload: wheel})
@@ -204,6 +219,9 @@ func uploadPackageFiles(ctx context.Context, pack *packagepublish.Package, wheel
 		}
 		pending = append(pending, file)
 	}
+	if progress != nil {
+		progress(0, len(pending))
+	}
 	type outcome struct {
 		moved int64
 		err   *exit.Error
@@ -229,14 +247,73 @@ func uploadPackageFiles(ctx context.Context, pack *packagepublish.Package, wheel
 			}
 		}()
 	}
-	group.Wait()
-	close(results)
+	go func() {
+		group.Wait()
+		close(results)
+	}()
 	var moved int64
+	var firstProblem *exit.Error
+	completed := 0
 	for result := range results {
+		completed++
+		if progress != nil {
+			progress(completed, len(pending))
+		}
 		moved += result.moved
-		if result.err != nil {
-			return moved, result.err
+		if firstProblem == nil && result.err != nil {
+			firstProblem = result.err
 		}
 	}
-	return moved, nil
+	return moved, firstProblem
+}
+
+const packagePublishHeartbeat = 15 * time.Second
+
+func packagePublishStatus(ctx *Context, format string, args ...any) {
+	_ = output.Progress(ctx.Err, fmt.Sprintf(format, args...))
+}
+
+func packagePublishStage(ctx *Context, label string, run func() *exit.Error) *exit.Error {
+	packagePublishStatus(ctx, "%s...", label)
+	done := make(chan struct{})
+	var group sync.WaitGroup
+	group.Add(1)
+	go func() {
+		defer group.Done()
+		started := time.Now()
+		ticker := time.NewTicker(packagePublishHeartbeat)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-done:
+				return
+			case <-ticker.C:
+				packagePublishStatus(ctx, "%s... %s elapsed", label,
+					time.Since(started).Round(time.Second))
+			}
+		}
+	}()
+	problem := run()
+	close(done)
+	group.Wait()
+	return problem
+}
+
+func packageUploadCounter(ctx *Context) func(completed, total int) {
+	last := -1
+	return func(completed, total int) {
+		if total == 0 {
+			if last < 0 {
+				packagePublishStatus(ctx, "Uploading files: all already present")
+				last = 0
+			}
+			return
+		}
+		step := max(1, (total+19)/20)
+		if completed != 0 && completed != total && completed-last < step {
+			return
+		}
+		packagePublishStatus(ctx, "Uploading files: %d/%d", completed, total)
+		last = completed
+	}
 }
