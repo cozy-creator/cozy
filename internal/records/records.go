@@ -111,20 +111,11 @@ CREATE TABLE IF NOT EXISTS pins (
 // row values, constraints, indexes and foreign-key references intact when it renames a
 // column. Every identifier here is a source constant, never caller input.
 var renames = []struct{ table, from, to string }{
-	{"install_generations", "endpoint", "package"},
 	{"install_generations", "descriptor", "package_descriptor"},
-	{"pins", "endpoint", "package"},
-	{"worker_processes", "endpoint", "package"},
 	{"worker_processes", "release_id", "package_revision_digest"},
 	{"worker_processes", "package_release_id", "package_revision_digest"},
-	{"placement_acquisition_observations", "endpoint_started_ns", "package_started_ns"},
-	{"placement_acquisition_observations", "endpoint_ended_ns", "package_ended_ns"},
-	{"placement_acquisition_observations", "endpoint_downloaded_bytes", "package_downloaded_bytes"},
-	{"placement_acquisition_observations", "endpoint_reused_bytes", "package_reused_bytes"},
-	{"requests", "endpoint", "package"},
 	{"attempts", "exec_spec_digest", "invocation_digest"},
 	{"attempts", "exec_spec", "invocation"},
-	{"rentals", "endpoint_ref", "package_ref"},
 }
 
 // pragmas ride the DSN rather than being executed after the open, because a pragma is a

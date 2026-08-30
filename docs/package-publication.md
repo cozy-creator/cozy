@@ -77,5 +77,5 @@ and rental selection remain closed until exact profile proof creates a qualified
 Cozy also supplies Tensorhub's internal audit text from the command and exact
 package release. Publishers do not write an audit reason or release message.
 
-Publication never builds an endpoint-specific Docker image and does not move
+Publication never builds a package-specific Docker image and does not move
 serving traffic.

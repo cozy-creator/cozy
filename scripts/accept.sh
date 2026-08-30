@@ -3,7 +3,7 @@
 # binary on a fresh home; no source package is called directly.
 set -uo pipefail
 
-DIST=""; ASSET=""; UPGRADE=""; ENDPOINT=""
+DIST=""; ASSET=""; UPGRADE=""; PACKAGE_ARCHIVE=""
 PREFIX="${COZY_PREFIX:-$HOME/.local}"
 HOME_DIR="${COZY_HOME:-$HOME/.cozy}"
 while [ $# -gt 0 ]; do
@@ -11,7 +11,7 @@ while [ $# -gt 0 ]; do
     --dist) DIST="$2"; shift 2 ;;
     --asset) ASSET="$2"; shift 2 ;;
     --upgrade) UPGRADE="$2"; shift 2 ;;
-    --package) ENDPOINT="$2"; shift 2 ;;
+    --package) PACKAGE_ARCHIVE="$2"; shift 2 ;;
     --prefix) PREFIX="$2"; shift 2 ;;
     --home) HOME_DIR="$2"; shift 2 ;;
     *) echo "usage: $0 --dist <dir> --asset <name> [--upgrade <path>] [--package <path>]" >&2; exit 2 ;;
@@ -68,9 +68,9 @@ check "JSON success is domain-shaped without renderer scaffolding" "$(printf '%s
 run unload
 check "unload preserves the daemon and returns idle residency" "$([ "$CODE" = 0 ] && printf '%s' "$OUT" | grep -q 'workers' && echo 1 || echo 0)" "$OUT"
 
-if [ -n "$ENDPOINT" ] && [ -f "$ENDPOINT" ]; then
-  DIGEST="sha256:$(sha256sum "$ENDPOINT" | cut -d' ' -f1)"
-  run package install cozy/weightless --from "$ENDPOINT" --digest "$DIGEST"
+if [ -n "$PACKAGE_ARCHIVE" ] && [ -f "$PACKAGE_ARCHIVE" ]; then
+  DIGEST="sha256:$(sha256sum "$PACKAGE_ARCHIVE" | cut -d' ' -f1)"
+  run package install cozy/weightless --from "$PACKAGE_ARCHIVE" --digest "$DIGEST"
   check "package install verifies the release" "$([ "$CODE" = 0 ] && printf '%s' "$OUT" | grep -q 'cozy/weightless' && echo 1 || echo 0)" "$OUT"
 
   run run cozy/weightless/tile size=32 seed=7 --out "$COZY_HOME/out"

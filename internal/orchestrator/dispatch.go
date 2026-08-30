@@ -48,7 +48,7 @@ type Submission struct {
 
 	// BodyDigest is the caller's own digest of the WHOLE submission it is making
 	// idempotent, not merely of the payload. cl-006 supplies the digest of
-	// (package, function, input, outputs) so that one key naming a different ENDPOINT
+	// (package, function, input, outputs) so that one key naming a different PACKAGE
 	// conflicts as loudly as one naming different input — a digest over the payload
 	// alone would let a key be reused across functions and mean two different things.
 	// Empty falls back to the payload's digest.
