@@ -51,7 +51,7 @@ type PackageInstall struct {
 	Closure            string // one "name==version" per line
 	PackageDescriptor  string // exact digest of the generation-private Runtime-derived descriptor
 	SelectionProfile   string // Hub-selected base-worker compatibility profile
-	PlacementSetDigest string // exact Hub-selected PlacementSet/3 stored in the artifact cache
+	PlacementSetDigest string // exact Hub-selected PlacementSet/1 stored in the artifact cache
 	BytesExcl          int64
 	BytesShared        int64
 	CreatedAt          string

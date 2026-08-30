@@ -30,15 +30,10 @@
 // BYTES NAMING LAW: a `bytes` field named `digest`, `*_digest`, or repeated `*_digests` IS a
 // 32-byte SHA-256; every other `bytes` field is an opaque payload (base64 in documents).
 //
-// DOCUMENT VERSIONS. A digest-fenced document is NOT additively versioned: an unknown key
-// REFUSES, and a new key is a new document version. The canonical `format` tag is the message's
-// full name plus its document version. Every document here is at /1 except
-// `cozy.worker.v1.AttemptOutcomeBody/3`, `InvocationSpec/2`, `PlacementSet/3`, and
-// `WorkerSnapshotBody/3`. AttemptOutcomeBody /2 added
-// `execution_started` under #480c; /3 adds
-// exact committed job artifact receipts under th-049 on the frozen TerminalBody/1 lineage
-// (#481). PlacementSet /3 carries the selected environment and binding graph directly;
-// WorkerSnapshotBody /3 uses binding digests in placement observations.
+// DOCUMENT VERSIONS. Every current pre-release document is `/1`. A digest-fenced document is NOT
+// additively versioned: an unknown key REFUSES, and shape changes hardcut the `/1` definition
+// across every writer, reader, and stored byte together. The canonical `format` tag is the
+// message's full name plus `/1`; there are no compatibility readers or version aliases.
 //
 // THE ENVELOPE (every message, fields 1-3): the ownership + boot fence, checked BEFORE any body
 // field is read, in this order:
@@ -2109,7 +2104,7 @@ func (x *WorkerSnapshot) GetAcceptedPlacementSetCanonicalBytes() []byte {
 	return nil
 }
 
-// DOCUMENT SHAPE (not a wire message): canonical form `cozy.worker.v1.WorkerSnapshotBody/3`, the
+// DOCUMENT SHAPE (not a wire message): canonical form `cozy.worker.v1.WorkerSnapshotBody/1`, the
 // subject of WorkerSnapshot.snapshot_digest.
 //
 // NAMING (implementation resolution, rev §5): the rev document calls both the wire message and
@@ -2519,7 +2514,7 @@ func (x *DesiredPlacementSet) GetPlacementSetCanonicalBytes() []byte {
 	return nil
 }
 
-// DOCUMENT SHAPE (not a wire message): canonical form `cozy.worker.v1.PlacementSet/3`.
+// DOCUMENT SHAPE (not a wire message): canonical form `cozy.worker.v1.PlacementSet/1`.
 // Placements sorted by placement_id. LAUNCH ENFORCES len(placements) <= 1 (header note); #475
 // adds that when the clamp lifts, multi-placement serving launches CO-FITTING ONLY.
 type PlacementSet struct {
@@ -4610,9 +4605,8 @@ func (x *AttemptOutcome) GetPlacementId() string {
 	return ""
 }
 
-// DOCUMENT SHAPE (not a wire message): canonical form `cozy.worker.v1.AttemptOutcomeBody/3` —
-// version 3 adds exact committed artifact receipts to the /2 execution_started lineage. A
-// digest-fenced document is not additively versioned (#480c/#481/th-049).
+// DOCUMENT SHAPE (not a wire message): canonical form
+// `cozy.worker.v1.AttemptOutcomeBody/1` (#480c/#481/th-049).
 type AttemptOutcomeBody struct {
 	state                protoimpl.MessageState `protogen:"open.v1"`
 	RequestId            string                 `protobuf:"bytes,1,opt,name=request_id,json=requestId,proto3" json:"request_id,omitempty"`
@@ -4752,7 +4746,7 @@ func (x *AttemptOutcomeBody) GetArtifactReceipts() []*ArtifactReceiptRef {
 }
 
 // Carried exact bytes, not a structured duplicate. The receiver hashes 2, compares 1, then opens
-// the canonical ArtifactReceipt document. This reference is nested in AttemptOutcomeBody/3 and
+// the canonical ArtifactReceipt document. This reference is nested in AttemptOutcomeBody/1 and
 // therefore has no format tag of its own.
 type ArtifactReceiptRef struct {
 	state                         protoimpl.MessageState `protogen:"open.v1"`
@@ -6106,7 +6100,7 @@ func (x *AttemptProgress) GetPlacementId() string {
 }
 
 // DOCUMENT SHAPE (not a wire message): the subject of `invocation_spec_digest`. Canonical form
-// `cozy.worker.v1.InvocationSpec/2`. The key set is CLOSED (01 §3 law 4): no human
+// `cozy.worker.v1.InvocationSpec/1`. The key set is CLOSED (01 §3 law 4): no human
 // model/adapter ref is spellable; unknown keys refuse on read and are unwritable on author.
 // placement_id is DELIBERATELY absent: the same invocation is the same work wherever it routes.
 type InvocationSpec struct {

@@ -276,7 +276,7 @@ func (f *fakeControl) Control(stream pb.WorkerControl_ControlServer) error {
 	}
 }
 
-// outcomeFor builds one journaled AttemptOutcomeBody/3 and its envelope, the way a worker
+// outcomeFor builds one journaled AttemptOutcomeBody/1 and its envelope, the way a worker
 // does: the document is canonicalized once, the digest is over exactly those bytes, and the
 // envelope's routing copies are copies of the document's own fields.
 //

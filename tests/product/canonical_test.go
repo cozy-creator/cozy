@@ -24,6 +24,22 @@ import (
 // worker-protocol's frozen corpus, checked out beside this repo.
 const fixtureDir = "/home/fidika/cozy_v2/worker-protocol/fixtures"
 
+func TestCanonicalFormatsAreVersionOne(t *testing.T) {
+	for _, msg := range []proto.Message{
+		&pb.InvocationSpec{},
+		&pb.AttemptOutcomeBody{},
+		&pb.ArtifactReceipt{},
+		&pb.ClaimProof{},
+		&pb.PlacementSet{},
+		&pb.WorkerSnapshotBody{},
+	} {
+		name := string(msg.ProtoReflect().Descriptor().FullName())
+		if got, want := canonical.Format(msg), name+"/1"; got != want {
+			t.Errorf("%s format = %q, want %q", name, got, want)
+		}
+	}
+}
+
 // TestCanonicalDocuments is the identity fence. Every document that crosses a repo or
 // process boundary is named by the sha256 of its canonical bytes, so two independent
 // writers in two languages must produce byte-identical documents or nothing downstream —
@@ -69,8 +85,8 @@ func TestCanonicalDocuments(t *testing.T) {
 		if spelled, _ := canonical.Spell(digest); spelled != row.ID {
 			t.Errorf("%s: id %s != frozen %s", name, spelled, row.ID)
 		}
-		// THE DOCUMENT VERSION IS PART OF THE IDENTITY (#536e). An AttemptOutcomeBody
-		// spelled under `/1` would digest to a document that does not exist.
+		// THE DOCUMENT VERSION IS PART OF THE IDENTITY (#536e). Every current
+		// pre-release document is spelled under the sole `/1` format.
 		if canonical.Format(msg) != row.Document {
 			t.Errorf("%s: format tag %s != frozen %s", name, canonical.Format(msg), row.Document)
 		}
@@ -144,13 +160,6 @@ func messageFor(name string) proto.Message {
 // spell every double the same way or two canonical documents describing the same thing
 // digest differently, and the whole identity plane silently forks at the boundary.
 // `testdata/canonical/es6-numbers.txt` is Runtime's own oracle, pinned by digest.
-func TestPlacementSetNestedSpecHardcut(t *testing.T) {
-	_, err := canonical.Read([]byte(`{"format":"cozy.worker.v1.PlacementSet/2","placements":[{"spec":{}}]}`), &pb.PlacementSet{})
-	if canonical.Code(err) != "unknown_format" {
-		t.Fatalf("nested PlacementSet spec refusal = %v", err)
-	}
-}
-
 func TestNumberProfile(t *testing.T) {
 	corpus, err := os.ReadFile("testdata/canonical/es6-numbers.txt")
 	must(t, err)
