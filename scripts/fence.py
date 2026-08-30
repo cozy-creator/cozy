@@ -10,6 +10,7 @@
 import ast
 import pathlib
 import re
+import subprocess
 import sys
 
 from version_contract import source_version
@@ -483,16 +484,22 @@ def fence_env():
 def fence_temp_layout():
     """All local transient state lives under store-root tmp; corrupt bytes are deleted."""
     bad = []
-    roots = [ROOT / "crates", ROOT / "scripts", ROOT / "vectors", ROOT / "README.md"]
-    for root in roots:
-        paths = [root] if root.is_file() else sorted(path for path in root.rglob("*") if path.is_file())
-        for path in paths:
-            if path.resolve() == pathlib.Path(__file__).resolve() or path.suffix == ".pyc":
-                continue
-            text = path.read_text(errors="ignore").lower()
-            for spelling in (".tensorfs", "quarantine"):
-                if spelling in text:
-                    bad.append(f"{rel(path)} retains deleted temporary layout spelling {spelling!r}")
+    tracked = subprocess.check_output(
+        ["git", "ls-files", "-z"], cwd=ROOT
+    ).decode().split("\0")
+    paths = [
+        ROOT / path
+        for path in tracked
+        if path in {"README.md", ".gitignore"}
+        or path.startswith(("crates/", "scripts/", "vectors/"))
+    ]
+    for path in paths:
+        if not path.is_file() or path.resolve() == pathlib.Path(__file__).resolve():
+            continue
+        text = path.read_text(errors="ignore").lower()
+        for spelling in (".tensorfs", "quarantine"):
+            if spelling in text:
+                bad.append(f"{rel(path)} retains deleted temporary layout spelling {spelling!r}")
     store = (ROOT / "crates/tensorfs-core/src/store.rs").read_text()
     if '"checkouts", "tmp"' not in store:
         bad.append("Store::init no longer creates the one root tmp directory")
