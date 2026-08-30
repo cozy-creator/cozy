@@ -1,4 +1,0 @@
-doc: spec
-expect: refuse
-code: OPTIONAL_ROLE_FORBIDDEN
-note: no optional roles: one digest, one byte contract

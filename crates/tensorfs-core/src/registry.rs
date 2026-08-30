@@ -2,7 +2,7 @@
 //! (display/discovery only). Promotion or an alias rename changes no artifact id.
 
 use crate::dtype::Dtype;
-use crate::ids::{Doc, ObjectRef};
+use crate::ids::ObjectRef;
 use crate::relation::{Carrier, Dim, Relation};
 use crate::spec::{EncodingSpec, Role};
 use crate::vectors::{Case, EncodingVectors, RoleBits};
@@ -100,9 +100,7 @@ fn seed(
     doc: &str,
     vectors: Option<EncodingVectors>,
 ) -> Seed {
-    let vref = vectors
-        .as_ref()
-        .map(|v| ObjectRef::of(&v.canonical_bytes()));
+    let vref = vectors.as_ref().map(|v| v.fixture_ref());
     Seed {
         alias,
         spec: spec(logical_dtypes, logical_rank, roles, doc, vref),
@@ -126,7 +124,7 @@ fn mined(name: &str) -> EncodingVectors {
         "mxfp8" => include_bytes!("../../../vectors/mined/mxfp8.json"),
         other => panic!("no mined vector set {other:?}"),
     };
-    EncodingVectors::parse(bytes).expect("mined vectors are frozen canonical data")
+    EncodingVectors::parse_fixture(bytes).expect("mined vectors are frozen canonical data")
 }
 
 /// The seeded platform namespace.

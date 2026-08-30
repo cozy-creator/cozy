@@ -5,7 +5,7 @@ use crate::b64;
 use crate::canon::{as_arr, as_obj, as_str, Fields, Value};
 use crate::dtype::{checked_bytes, checked_elements, Dtype};
 use crate::err::{refuse, Code, Result};
-use crate::ids::{check_format, Doc};
+use crate::ids::ObjectRef;
 use crate::limits;
 use crate::spec::EncodingSpec;
 
@@ -121,17 +121,22 @@ impl EncodingVectors {
     }
 }
 
-impl Doc for EncodingVectors {
-    const FORMAT: &'static str = "tensorfs.encoding_vectors/1";
-    const MAX_BYTES: usize = limits::DOC_MAX_BYTES;
+impl EncodingVectors {
+    pub fn parse_fixture(bytes: &[u8]) -> Result<Self> {
+        let value = crate::canon::parse_canonical(bytes, limits::DOC_MAX_BYTES)?;
+        Self::from_value(&value)
+    }
+
+    pub fn fixture_bytes(&self) -> Vec<u8> {
+        crate::canon::write(&self.to_value())
+    }
+
+    pub fn fixture_ref(&self) -> ObjectRef {
+        ObjectRef::of(&self.fixture_bytes())
+    }
 
     fn from_value(v: &Value) -> Result<Self> {
         let mut f = Fields::new("EncodingVectors", v)?;
-        check_format(
-            "EncodingVectors",
-            as_str("EncodingVectors", "format", f.req("format")?)?,
-            Self::FORMAT,
-        )?;
         let mut cases = Vec::new();
         for cv in as_arr("EncodingVectors", "cases", f.req("cases")?)? {
             let mut cf = Fields::new("case", cv)?;
@@ -167,50 +172,47 @@ impl Doc for EncodingVectors {
     }
 
     fn to_value(&self) -> Value {
-        Value::obj(vec![
-            ("format", Value::str(Self::FORMAT)),
-            (
-                "cases",
-                Value::arr(
-                    self.cases
-                        .iter()
-                        .map(|c| {
-                            Value::obj(vec![
-                                (
-                                    "expect_logical_bits",
-                                    Value::str(b64::encode(&c.expect_logical_bits)),
-                                ),
-                                (
-                                    "logical",
-                                    Value::obj(vec![
-                                        ("dtype", Value::str(c.logical_dtype.name())),
-                                        ("shape", shape_value(&c.logical_shape)),
-                                    ]),
-                                ),
-                                ("name", Value::str(c.name.clone())),
-                                (
-                                    "roles",
-                                    Value::map({
-                                        c.roles
-                                            .iter()
-                                            .map(|(n, r)| {
-                                                (
-                                                    n.clone(),
-                                                    Value::obj(vec![
-                                                        ("bits", Value::str(b64::encode(&r.bits))),
-                                                        ("dtype", Value::str(r.dtype.name())),
-                                                        ("shape", shape_value(&r.shape)),
-                                                    ]),
-                                                )
-                                            })
-                                            .collect()
-                                    }),
-                                ),
-                            ])
-                        })
-                        .collect(),
-                ),
+        Value::obj(vec![(
+            "cases",
+            Value::arr(
+                self.cases
+                    .iter()
+                    .map(|c| {
+                        Value::obj(vec![
+                            (
+                                "expect_logical_bits",
+                                Value::str(b64::encode(&c.expect_logical_bits)),
+                            ),
+                            (
+                                "logical",
+                                Value::obj(vec![
+                                    ("dtype", Value::str(c.logical_dtype.name())),
+                                    ("shape", shape_value(&c.logical_shape)),
+                                ]),
+                            ),
+                            ("name", Value::str(c.name.clone())),
+                            (
+                                "roles",
+                                Value::map({
+                                    c.roles
+                                        .iter()
+                                        .map(|(n, r)| {
+                                            (
+                                                n.clone(),
+                                                Value::obj(vec![
+                                                    ("bits", Value::str(b64::encode(&r.bits))),
+                                                    ("dtype", Value::str(r.dtype.name())),
+                                                    ("shape", shape_value(&r.shape)),
+                                                ]),
+                                            )
+                                        })
+                                        .collect()
+                                }),
+                            ),
+                        ])
+                    })
+                    .collect(),
             ),
-        ])
+        )])
     }
 }

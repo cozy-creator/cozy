@@ -1,0 +1,4 @@
+doc: session
+expect: refuse
+code: KEY_GRAMMAR
+note: a session id is an ASCII name, never free text

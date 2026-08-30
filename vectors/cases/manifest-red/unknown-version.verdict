@@ -1,4 +1,0 @@
-doc: manifest
-expect: refuse
-code: UNKNOWN_FORMAT
-note: an unknown snapshot version refuses, never degrades

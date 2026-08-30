@@ -4,7 +4,7 @@
 use crate::canon::Value;
 use crate::dtype::{checked_bytes, checked_elements, Dtype};
 use crate::err::{refuse, Code, Refusal, Result};
-use crate::ids::{ascii_name, ConfigRef, Doc, ObjectRef};
+use crate::ids::{ascii_name, ConfigRef, ObjectRef};
 use crate::limits;
 use crate::spec::EncodingSpec;
 
@@ -105,7 +105,7 @@ pub struct Asset {
 pub struct Header {
     pub configs: Vec<(String, ConfigRef)>,
     pub assets: Vec<(String, Asset)>,
-    pub encodings: Vec<ObjectRef>,
+    pub encodings: Vec<EncodingSpec>,
     pub components: Vec<(String, Vec<(String, Tensor)>)>,
 }
 
@@ -444,16 +444,10 @@ impl Header {
         if self.encodings.is_empty() {
             return refuse(Code::COUNT_CAP, "encodings is empty");
         }
-        for encoding in &self.encodings {
-            crate::ids::hex64("encoding digest", &encoding.sha256)?;
-            if encoding.length == 0 {
-                return refuse(Code::ZERO_ELEMENT, "zero-length EncodingSpec reference");
-            }
-        }
         let mut sorted = self
             .encodings
             .iter()
-            .map(|r| r.sha256.clone())
+            .map(EncodingSpec::object_id)
             .collect::<Vec<_>>();
         let given = sorted.clone();
         sorted.sort();
@@ -465,7 +459,7 @@ impl Header {
             .encodings
             .iter()
             .enumerate()
-            .map(|(index, encoding)| (encoding.id(), index))
+            .map(|(index, encoding)| (encoding.object_id(), index))
             .collect();
         let mut cited = vec![false; self.encodings.len()];
         let mut count = 0usize;
@@ -473,19 +467,13 @@ impl Header {
         let mut refs = self
             .configs
             .len()
-            .checked_add(self.encodings.len())
-            .and_then(|count| count.checked_add(asset_refs))
+            .checked_add(asset_refs)
             .ok_or_else(|| Refusal {
                 code: Code::ARITH_OVERFLOW,
                 detail: "header reference total overflows".into(),
             })?;
         let mut total_bytes = asset_bytes;
-        for length in self
-            .configs
-            .iter()
-            .map(|(_, config)| config.length)
-            .chain(self.encodings.iter().map(|encoding| encoding.length))
-        {
+        for length in self.configs.iter().map(|(_, config)| config.length) {
             total_bytes = total_bytes.checked_add(length).ok_or_else(|| Refusal {
                 code: Code::ARITH_OVERFLOW,
                 detail: "header referenced-byte total overflows".into(),
@@ -598,7 +586,7 @@ impl Header {
                     Code::UNCITED_ENCODING,
                     format!(
                         "`encodings` lists {} which no tensor cites (derivable-fact law)",
-                        r.id()
+                        r.object_id()
                     ),
                 );
             }
@@ -607,18 +595,26 @@ impl Header {
     }
 
     /// Structural validation against the checkpoint's exact EncodingSpec closure.
-    pub fn validate(&self, closure: &Closure) -> Result<()> {
+    pub fn validate(&self, _closure: &Closure) -> Result<()> {
         self.validate_structure()?;
+        let specs: std::collections::HashMap<String, &EncodingSpec> = self
+            .encodings
+            .iter()
+            .map(|spec| (spec.object_id(), spec))
+            .collect();
         for (comp, key, tensor) in self.tensors() {
             let what = format!("{comp}/{key}");
             let elements = checked_elements(&what, &tensor.shape)?;
-            let spec = closure.get(&tensor.encoding).ok_or_else(|| Refusal {
-                code: Code::UNKNOWN_ENCODING,
-                detail: format!(
-                    "{what}: spec object {} is absent from the closure",
-                    tensor.encoding
-                ),
-            })?;
+            let spec = specs
+                .get(&tensor.encoding)
+                .copied()
+                .ok_or_else(|| Refusal {
+                    code: Code::UNKNOWN_ENCODING,
+                    detail: format!(
+                        "{what}: encoding {} is absent from the header",
+                        tensor.encoding
+                    ),
+                })?;
             if !spec.admits_logical(tensor.dtype) {
                 return refuse(
                     Code::DTYPE_MISMATCH,
@@ -683,14 +679,14 @@ impl Header {
     pub fn admit_for_serving(&self, closure: &Closure, pin: &[String]) -> Result<()> {
         self.validate(closure)?;
         for r in &self.encodings {
-            if !pin.contains(&r.id()) {
+            if !pin.contains(&r.object_id()) {
                 return refuse(
                     Code::UNKNOWN_TO_LOCAL_CAPABILITY,
                     format!(
                         "spec {} carries no alias in this runtime's pin — unregistered and \
                          newer-than-pin are indistinguishable offline; the checkpoint is \
                          valid data, its execution is unsupported here",
-                        r.id()
+                        r.object_id()
                     ),
                 );
             }
@@ -830,8 +826,7 @@ impl Header {
         }
         let encodings = as_arr("Header diagnostic", "encodings", fields.req("encodings")?)?
             .iter()
-            .enumerate()
-            .map(|(i, value)| object_ref(&format!("encodings[{i}]"), value))
+            .map(EncodingSpec::from_value)
             .collect::<Result<Vec<_>>>()?;
         let mut components = Vec::new();
         for (i, value) in as_arr("Header diagnostic", "components", fields.req("components")?)?
@@ -899,7 +894,7 @@ impl Header {
                     Tensor {
                         dtype: Dtype::parse(as_str(&tensor_what, "dtype", &values[1])?)?,
                         shape: shape(&tensor_what, &values[2])?,
-                        encoding: encoding.id(),
+                        encoding: encoding.object_id(),
                         parts,
                     },
                 ));
@@ -924,7 +919,7 @@ impl Header {
             .encodings
             .iter()
             .enumerate()
-            .map(|(index, encoding)| (encoding.id(), index))
+            .map(|(index, encoding)| (encoding.object_id(), index))
             .collect();
         let mut component_values = Vec::with_capacity(self.components.len());
         for (component, rows) in &self.components {
@@ -1009,7 +1004,7 @@ impl Header {
             ),
             (
                 "encodings",
-                Value::arr(self.encodings.iter().map(&object_ref).collect()),
+                Value::arr(self.encodings.iter().map(EncodingSpec::to_value).collect()),
             ),
             ("components", Value::arr(component_values)),
         ]))

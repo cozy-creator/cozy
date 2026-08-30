@@ -11,7 +11,7 @@ use tensorfs_core::corpus;
 use tensorfs_core::dtype::Dtype;
 use tensorfs_core::header::{Closure as CoreClosure, Header};
 use tensorfs_core::ids::{self, Doc};
-use tensorfs_core::manifest::SnapshotManifest;
+use tensorfs_core::manifest::Manifest;
 use tensorfs_core::registry;
 use tensorfs_core::spec::EncodingSpec;
 
@@ -78,8 +78,8 @@ fn marshal_header<'p>(py: Python<'p>, header: &Header) -> PyResult<Bound<'p, PyA
     let encodings = PyList::empty(py);
     for encoding in &header.encodings {
         let row = PyDict::new(py);
-        row.set_item("sha256", &encoding.sha256)?;
-        row.set_item("length", encoding.length)?;
+        row.set_item("id", encoding.object_id())?;
+        row.set_item("definition", marshal(py, &encoding.to_value())?)?;
         encodings.append(row)?;
     }
     root.set_item("encodings", encodings)?;
@@ -140,10 +140,9 @@ impl PyClosure {
         }
     }
 
-    /// Add one canonical EncodingSpec object. Its digest is its identity — computed here,
-    /// never supplied.
+    /// Add one exact nested encoding value from a qualification fixture.
     fn insert(&mut self, py: Python<'_>, data: &[u8]) -> PyResult<String> {
-        let s = EncodingSpec::parse(data).or_refuse(py)?;
+        let s = EncodingSpec::decode_nested(data).or_refuse(py)?;
         let id = s.object_id();
         self.inner.insert(s);
         Ok(id)
@@ -185,15 +184,13 @@ pub fn topology_digest(py: Python<'_>, data: &[u8]) -> PyResult<String> {
     Ok(Header::parse(data).or_refuse(py)?.topology_digest())
 }
 
-/// Validate canonical SnapshotManifest bytes; `checkpoint_id == snapshot_id`, always.
+/// Validate canonical Manifest bytes.
 #[pyfunction]
 pub fn parse_manifest<'p>(py: Python<'p>, data: &[u8]) -> PyResult<Bound<'p, PyAny>> {
-    let m = SnapshotManifest::parse(data).or_refuse(py)?;
+    let m = Manifest::parse(data).or_refuse(py)?;
     marshal(py, &m.to_value())
 }
 
-/// The corpus dispatch (tfs-013), shared with the Rust harness: one document kind, one
-/// reader. Returns the identities the frozen verdict names; raises the typed refusal.
 #[pyfunction]
 #[pyo3(signature = (doc, data, closure=None, platform=None))]
 pub fn run_doc<'p>(
@@ -204,17 +201,16 @@ pub fn run_doc<'p>(
     platform: Option<Vec<String>>,
 ) -> PyResult<Bound<'p, PyDict>> {
     let empty = CoreClosure::default();
-    let c = closure.map(|c| &c.inner).unwrap_or(&empty);
-    let p = platform.unwrap_or_else(registry::platform_digests);
-    let o = corpus::run_doc(doc, data, c, &p).or_refuse(py)?;
-    let d = PyDict::new(py);
-    d.set_item("id", o.id)?;
-    d.set_item("topology", o.topology)?;
-    d.set_item("checkpoint", o.checkpoint)?;
-    Ok(d)
+    let closure = closure.map(|closure| &closure.inner).unwrap_or(&empty);
+    let platform = platform.unwrap_or_else(registry::platform_digests);
+    let outcome = corpus::run_doc(doc, data, closure, &platform).or_refuse(py)?;
+    let result = PyDict::new(py);
+    result.set_item("id", outcome.id)?;
+    result.set_item("topology", outcome.topology)?;
+    result.set_item("manifest", outcome.manifest)?;
+    Ok(result)
 }
 
-/// The receipt binds its exact subject/snapshot/header/stamp — the cross-vector assertion.
 #[pyfunction]
 pub fn receipt_binds(
     py: Python<'_>,
@@ -229,7 +225,10 @@ pub fn receipt_binds(
 
 #[pyfunction]
 pub fn doc_kinds() -> Vec<String> {
-    corpus::DOC_KINDS.iter().map(|s| s.to_string()).collect()
+    corpus::DOC_KINDS
+        .iter()
+        .map(|kind| kind.to_string())
+        .collect()
 }
 
 /// The platform-aliased encoding digests this build admits at the border.
@@ -272,6 +271,11 @@ pub fn dtypes(py: Python<'_>) -> PyResult<Bound<'_, PyDict>> {
     Ok(d)
 }
 
+#[pyfunction]
+pub fn manifest_max_bytes() -> usize {
+    Manifest::MAX_BYTES
+}
+
 /// Bytes -> the pretty PROJECTION of a canonical document. Projection-only by construction:
 /// what comes back is a string, and no reader in this system accepts it.
 #[pyfunction]
@@ -288,10 +292,7 @@ pub fn recanonicalize<'p>(py: Python<'p>, doc: &str, data: &[u8]) -> PyResult<Bo
             .or_refuse(py)?
             .canonical_bytes()
             .or_refuse(py)?,
-        "manifest" => SnapshotManifest::parse(data)
-            .or_refuse(py)?
-            .canonical_bytes(),
-        "spec" => EncodingSpec::parse(data).or_refuse(py)?.canonical_bytes(),
+        "manifest" => Manifest::parse(data).or_refuse(py)?.canonical_bytes(),
         other => {
             return Err(pyo3::exceptions::PyValueError::new_err(format!(
                 "recanonicalize does not carry {other:?}"

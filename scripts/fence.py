@@ -2,7 +2,7 @@
 """Architecture fences (boundaries.md, tensorfs.md §10). Enforcement, not tests.
 
 0. package identity       — pyproject/Cargo agree and stay prelaunch 0.x
-1. forbidden dependencies — core is torch/CUDA/HTTP/TLS/SQL/hub-free
+1. forbidden dependencies — core is torch/CUDA/HTTP/TLS/server-DB/hub-free; embedded SQLite is local
 2. no upward imports    — core < layout < py; a crate may name only lower ranks
 3. marshal-only facade  — zero hashing/chunking/parsing/carrier logic in Python
 """
@@ -29,7 +29,7 @@ def fence_version_contract():
 # ---------------------------------------------------------------- 1. dependencies
 
 DENY = ["torch", "cudarc", "cust", "tch", "reqwest", "hyper", "ureq", "curl", "openssl",
-        "rustls", "native-tls", "sqlx", "rusqlite", "postgres", "tensorhub-v2",
+        "rustls", "native-tls", "sqlx", "postgres", "tensorhub-v2",
         "cozy-creator-v2", "cozy-runtime-v2", "worker-protocol-v2"]
 SCAN = ["crates/*/Cargo.toml", "crates/*/src/**/*.rs"]
 
@@ -132,31 +132,11 @@ def fence_facade():
 # OWNS each identity-bearing format: a file that names a format mark is either that format's
 # one implementation or a rival to it, whatever language it is written in.
 CODEC_OWNERS = {
-    "tensorfs.snapshot/1": {"crates/tensorfs-core/src/manifest.rs"},
     "cozytensors/1": {"crates/tensorfs-core/src/header.rs"},
-    "tensorfs.encoding_spec/1": {"crates/tensorfs-core/src/spec.rs"},
-    "tensorfs.encoding_vectors/1": {"crates/tensorfs-core/src/vectors.rs"},
-    "tensorfs.meta/1": {"crates/tensorfs-core/src/meta.rs"},
-    "tensorfs.store/1": {"crates/tensorfs-core/src/store.rs"},
-    "tensorfs.verification/1": {"crates/tensorfs-core/src/store.rs"},
-    # the ingest border (tfs-003): every document is a CAS object or a transaction root
-    "tensorfs.ingest_profile/1": {"crates/tensorfs-core/src/ingest/mod.rs"},
-    "tensorfs.ingest_subject/1": {"crates/tensorfs-core/src/ingest/mod.rs"},
-    "tensorfs.ingest_receipt/1": {"crates/tensorfs-core/src/ingest/mod.rs"},
-    "tensorfs.ingest_root/1": {"crates/tensorfs-core/src/ingest/transaction.rs"},
-    "tensorfs.stamp/1": {"crates/tensorfs-core/src/ingest/stamp.rs"},
-    # the layout plane (tfs-009)
-    "cozytensors.code_topology/1": {"crates/tensorfs-core/src/compat.rs"},
-    "tensorfs.compatibility_report/1": {"crates/tensorfs-core/src/compat.rs"},
-    "tensorfs.verify_request/1": {"crates/tensorfs-core/src/verifier.rs"},
-    "tensorfs.verify_response/1": {"crates/tensorfs-core/src/verifier.rs"},
-    # the cloud publish protocol (tfs-017); the upload set's draft is authored by tensorhub
-    "tensorfs.publish_closure/1": {"crates/tensorfs-core/src/cloud.rs"},
-    "tensorfs.artifact_upload_set/1": {"crates/tensorfs-core/src/cloud.rs"},
-    "tensorfs.publish_grant/1": {"crates/tensorfs-core/src/cloud.rs"},
-    "tensorfs.verified_object/1": {"crates/tensorfs-core/src/cloud.rs"},
-    "tensorfs.catalog_root/1": {"crates/tensorfs-core/src/cloud.rs"},
 }
+LOCATION_TYPED_SCHEMAS = {"repository", "manifest"}
+assert len(CODEC_OWNERS) + len(LOCATION_TYPED_SCHEMAS) == 3, \
+    "TensorFS must have exactly Repository, Manifest and cozytensors/1 schemas"
 # Identity domains can remain stable without pretending their hash preimages are standalone
 # documents. They have one owner, no parser, no stored bytes, and do not count as formats.
 IDENTITY_DOMAIN_OWNERS = {
@@ -308,7 +288,9 @@ def fence_one_codec():
                 bad.append(f"{r}: names identity domain '{domain}' owned by {sorted(owners)}"
                            " — topology identity has one hash-preimage writer")
         # (b) grammar tags live in exactly one file
-        if r not in GRAMMAR_HOME:
+        # The Go/Python CBOR seats independently validate the frozen nested header grammar;
+        # they are test-only interoperability implementations with no product import path.
+        if r not in GRAMMAR_HOME and not r.startswith("conformance/cbor/"):
             for t in GRAMMAR_TAGS:
                 if re.search(r'"' + t + r'"', text):
                     bad.append(f"{r}: emits grammar tag '{t}' — a SECOND shape evaluator")

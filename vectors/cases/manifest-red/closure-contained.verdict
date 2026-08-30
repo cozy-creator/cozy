@@ -1,5 +1,0 @@
-doc: manifest
-expect: ok
-id: sha256:775bce5d3622c253bbfe857cd035a622ffcebf367f5b1fe5dfe36edad97a5529
-checkpoint: sha256:775bce5d3622c253bbfe857cd035a622ffcebf367f5b1fe5dfe36edad97a5529
-note: a contained EncodingSpec at the path whose terminal IS its digest

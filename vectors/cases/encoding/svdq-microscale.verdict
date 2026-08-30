@@ -1,0 +1,4 @@
+doc: encoding
+expect: ok
+id: sha256:c1b041a274d0b0d96b94bb5d8573818c7d0ee020caa8e378f3fea569f32b7274
+note: rank-7 permuted scale grid mined from v1

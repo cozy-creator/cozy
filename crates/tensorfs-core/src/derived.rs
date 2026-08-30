@@ -1,4 +1,4 @@
-//! Exact derived-snapshot composition (tfs-019).
+//! Exact derived-manifest composition (tfs-019).
 //!
 //! This is a storage transaction, not a tensor transform. The caller declares a closed
 //! component map; this module copies unchanged tensor metadata and ObjectRefs, drops whole
@@ -10,14 +10,14 @@ use std::collections::HashSet;
 use std::io::Read;
 
 use crate::canon::{as_arr, as_obj, as_str, Fields, Value};
-use crate::checkpoint::{self, build_snapshot};
+use crate::checkpoint::{self, build_manifest};
 use crate::dtype::{checked_bytes, Dtype};
 use crate::err::{refuse, Code, Refusal, Result};
 use crate::header::{Body, Closure, Header, Part, Tensor};
-use crate::ids::{ascii_name, prefixed, ConfigRef, Doc, ObjectRef};
+use crate::ids::{ascii_name, prefixed, ConfigRef, ObjectRef};
 use crate::limits;
-use crate::manifest::SnapshotManifest;
-use crate::meta::{Hold, Meta, RootRow, SnapshotRow};
+use crate::manifest::Manifest;
+use crate::meta::{Hold, Meta};
 use crate::read::{self, ReadLease};
 use crate::store::{Fault, Store};
 use crate::{registry, spec::EncodingSpec, vectors::EncodingVectors};
@@ -74,7 +74,7 @@ fn shape_value(v: &[u64]) -> Value {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Source {
     pub alias: String,
-    pub snapshot: ObjectRef,
+    pub manifest: ObjectRef,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -185,10 +185,10 @@ impl Declaration {
 
         for source in &self.sources {
             name("source alias", &source.alias)?;
-            if source.snapshot.length == 0 {
-                return refuse(Code::ZERO_ELEMENT, "source snapshot length is zero");
+            if source.manifest.length == 0 {
+                return refuse(Code::ZERO_ELEMENT, "source manifest length is zero");
             }
-            crate::ids::hex64("source snapshot", &source.snapshot.sha256)?;
+            crate::ids::hex64("source manifest", &source.manifest.sha256)?;
         }
         self.sources.sort_by(|a, b| a.alias.cmp(&b.alias));
         if let Some(pair) = self.sources.windows(2).find(|w| w[0].alias == w[1].alias) {
@@ -489,12 +489,12 @@ impl Declaration {
         let mut sources = Vec::new();
         for (alias, source_value) in as_obj("DerivedDeclaration", "sources", f.req("sources")?)? {
             let mut sf = Fields::new("DerivedDeclaration.source", source_value)?;
-            let snapshot =
-                ObjectRef::from_value("DerivedDeclaration.source.snapshot", sf.req("snapshot")?)?;
+            let manifest =
+                ObjectRef::from_value("DerivedDeclaration.source.manifest", sf.req("manifest")?)?;
             sf.done()?;
             sources.push(Source {
                 alias: alias.clone(),
-                snapshot,
+                manifest,
             });
         }
 
@@ -787,7 +787,7 @@ impl Declaration {
                         .map(|source| {
                             (
                                 source.alias.clone(),
-                                Value::obj(vec![("snapshot", source.snapshot.to_value())]),
+                                Value::obj(vec![("manifest", source.manifest.to_value())]),
                             )
                         })
                         .collect(),
@@ -872,7 +872,6 @@ impl TransactionState {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum Disposition {
     Pending,
-    Transferred(String),
     Released,
 }
 
@@ -889,7 +888,7 @@ pub(crate) struct TransactionRow {
     pub(crate) inherited_payload_objects: u64,
     pub(crate) inherited_payload_bytes: u64,
     pub(crate) header: Option<ObjectRef>,
-    pub(crate) snapshot: Option<ObjectRef>,
+    pub(crate) manifest: Option<ObjectRef>,
 }
 
 fn part_value(part: &Part) -> Value {
@@ -1008,7 +1007,7 @@ impl TransactionRow {
                 components.push(as_str("source_fact", "component", component)?.to_string());
             }
             let header = ObjectRef::from_value("source_fact.header", sf.req("header")?)?;
-            let snapshot = ObjectRef::from_value("source_fact.snapshot", sf.req("snapshot")?)?;
+            let manifest = ObjectRef::from_value("source_fact.manifest", sf.req("manifest")?)?;
             sf.done()?;
             name("source fact alias", &alias)?;
             for component in &components {
@@ -1022,7 +1021,7 @@ impl TransactionRow {
             }
             source_facts.push(SourceFact {
                 alias,
-                snapshot,
+                manifest,
                 header,
                 components,
             });
@@ -1031,24 +1030,19 @@ impl TransactionRow {
             .opt("header")
             .map(|v| ObjectRef::from_value("DerivedTransaction.header", v))
             .transpose()?;
-        let snapshot = f
-            .opt("snapshot")
-            .map(|v| ObjectRef::from_value("DerivedTransaction.snapshot", v))
+        let manifest = f
+            .opt("manifest")
+            .map(|v| ObjectRef::from_value("DerivedTransaction.manifest", v))
             .transpose()?;
         let disposition = match f.opt("disposition") {
             None => None,
             Some(value) => {
                 let mut df = Fields::new("DerivedTransaction.disposition", value)?;
                 let kind = df.req_str("kind")?;
-                let root = df
-                    .opt("root")
-                    .map(|v| as_str("disposition", "root", v).map(str::to_string))
-                    .transpose()?;
                 df.done()?;
-                Some(match (kind, root) {
-                    ("pending", None) => Disposition::Pending,
-                    ("released", None) => Disposition::Released,
-                    ("transferred", Some(root)) => Disposition::Transferred(root),
+                Some(match kind {
+                    "pending" => Disposition::Pending,
+                    "released" => Disposition::Released,
                     _ => return refuse(Code::UNKNOWN_FIELD, "invalid derived root disposition"),
                 })
             }
@@ -1089,7 +1083,7 @@ impl TransactionRow {
                 .map(|source| {
                     (
                         source.alias.as_str(),
-                        &source.snapshot,
+                        &source.manifest,
                         selected_components(&declaration, &source.alias),
                     )
                 })
@@ -1099,7 +1093,7 @@ impl TransactionRow {
                 .map(|source| {
                     (
                         source.alias.as_str(),
-                        &source.snapshot,
+                        &source.manifest,
                         source.components.clone(),
                     )
                 })
@@ -1128,7 +1122,7 @@ impl TransactionRow {
             inherited_payload_objects,
             inherited_payload_bytes,
             header,
-            snapshot,
+            manifest,
         };
         let before_parts = row.added_parts.clone();
         let before_configs = row.added_configs.clone();
@@ -1153,7 +1147,7 @@ impl TransactionRow {
             TransactionState::Open => {
                 if row.declaration.is_none()
                     || row.header.is_some()
-                    || row.snapshot.is_some()
+                    || row.manifest.is_some()
                     || row.inherited_payload_objects != 0
                     || row.inherited_payload_bytes != 0
                 {
@@ -1167,7 +1161,7 @@ impl TransactionRow {
                 if row.declaration.is_none()
                     || row.current_session.is_some()
                     || row.header.is_none()
-                    || row.snapshot.is_none()
+                    || row.manifest.is_none()
                     || row.inherited_payload_objects > limits::MAX_TOTAL_REFS as u64
                     || row.inherited_payload_bytes > limits::MAX_TOTAL_BYTES
                 {
@@ -1180,7 +1174,7 @@ impl TransactionRow {
             TransactionState::Abandoned => {
                 if row.current_session.is_some()
                     || row.header.is_some()
-                    || row.snapshot.is_some()
+                    || row.manifest.is_some()
                     || !row.added_parts.is_empty()
                     || !row.added_configs.is_empty()
                     || row.inherited_payload_objects != 0
@@ -1268,7 +1262,7 @@ impl TransactionRow {
                                     ),
                                 ),
                                 ("header", source.header.to_value()),
-                                ("snapshot", source.snapshot.to_value()),
+                                ("manifest", source.manifest.to_value()),
                             ])
                         })
                         .collect(),
@@ -1285,17 +1279,13 @@ impl TransactionRow {
         if let Some(header) = &self.header {
             fields.push(("header".to_string(), header.to_value()));
         }
-        if let Some(snapshot) = &self.snapshot {
-            fields.push(("snapshot".to_string(), snapshot.to_value()));
+        if let Some(manifest) = &self.manifest {
+            fields.push(("manifest".to_string(), manifest.to_value()));
         }
         if let TransactionState::Committed(disposition) = &self.state {
             let value = match disposition {
                 Disposition::Pending => Value::obj(vec![("kind", Value::str("pending"))]),
                 Disposition::Released => Value::obj(vec![("kind", Value::str("released"))]),
-                Disposition::Transferred(root) => Value::obj(vec![
-                    ("kind", Value::str("transferred")),
-                    ("root", Value::str(root.clone())),
-                ]),
             };
             fields.push(("disposition".to_string(), value));
         }
@@ -1306,7 +1296,7 @@ impl TransactionRow {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SourceFact {
     pub alias: String,
-    pub snapshot: ObjectRef,
+    pub manifest: ObjectRef,
     pub header: ObjectRef,
     pub components: Vec<String>,
 }
@@ -1314,9 +1304,8 @@ pub struct SourceFact {
 #[derive(Debug)]
 struct SourceData {
     fact: SourceFact,
-    manifest: SnapshotManifest,
+    manifest: Manifest,
     header: Header,
-    closure: Closure,
 }
 
 fn source<'a>(sources: &'a [SourceData], alias: &str) -> Result<&'a SourceData> {
@@ -1356,35 +1345,25 @@ fn resolve_sources(
     meta: &Meta,
     declaration: &Declaration,
 ) -> Result<Vec<SourceData>> {
-    let state = meta.read()?;
     let mut out = Vec::new();
     for declared in &declaration.sources {
-        match state.snapshot(&declared.snapshot.sha256) {
-            Some(row) if !row.tombstoned => {}
-            Some(_) => {
-                return refuse(
-                    Code::ROOT_ABSENT,
-                    format!("source {} is explicitly tombstoned", declared.snapshot.id()),
-                )
-            }
-            None => {
-                return refuse(
-                    Code::ROOT_ABSENT,
-                    format!(
-                        "source {} is not an installed/known snapshot in this store",
-                        declared.snapshot.id()
-                    ),
-                )
-            }
+        if !meta.manifest_is_released(&declared.manifest.sha256)? {
+            return refuse(
+                Code::ROOT_ABSENT,
+                format!(
+                    "source {} is not referenced by a repository release",
+                    declared.manifest.id()
+                ),
+            );
         }
-        let manifest = checkpoint::load_manifest(store, &declared.snapshot)?;
-        if manifest.checkpoint_id()? != declared.snapshot.id() {
+        let manifest = checkpoint::load_manifest(store, &declared.manifest)?;
+        if manifest.manifest_id() != declared.manifest.id() {
             return refuse(
                 Code::OBJECT_ID_MISMATCH,
                 format!(
                     "source alias {:?}: manifest identity does not equal {}",
                     declared.alias,
-                    declared.snapshot.id()
+                    declared.manifest.id()
                 ),
             );
         }
@@ -1392,7 +1371,7 @@ fn resolve_sources(
             code: Code::ATTACHMENT_CARDINALITY,
             detail: format!(
                 "source {} carries no CozyTensors header",
-                declared.snapshot.id()
+                declared.manifest.id()
             ),
         })?;
         let header = checkpoint::load_header(store, &header_ref)?;
@@ -1411,13 +1390,12 @@ fn resolve_sources(
         out.push(SourceData {
             fact: SourceFact {
                 alias: declared.alias.clone(),
-                snapshot: declared.snapshot.clone(),
+                manifest: declared.manifest.clone(),
                 header: header_ref,
                 components,
             },
             manifest,
             header,
-            closure,
         });
     }
     Ok(out)
@@ -1479,19 +1457,19 @@ fn registry_adoption(encoding: &str) -> Result<RegistryAdoption> {
             "target cites {encoding}, absent from every exact source closure and the compiled platform registry"
         ),
     })?;
-    let spec = EncodingSpec::parse(&seed.spec.canonical_bytes())?;
+    let spec = EncodingSpec::decode_nested(&seed.spec.canonical_bytes())?;
     let vectors = seed.vectors.ok_or_else(|| Refusal {
         code: Code::VECTORS_REQUIRED,
         detail: format!(
-            "compiled registry spec {encoding} has no conformance-vector document and cannot be introduced into a derived snapshot"
+            "compiled registry spec {encoding} has no conformance-vector document and cannot be introduced into a derived manifest"
         ),
     })?;
-    let vectors = EncodingVectors::parse(&vectors.canonical_bytes())?;
+    let vectors = EncodingVectors::parse_fixture(&vectors.fixture_bytes())?;
     let expected = spec.vectors.as_ref().ok_or_else(|| Refusal {
         code: Code::VECTOR_MISMATCH,
         detail: format!("compiled registry spec {encoding} does not reference its vectors"),
     })?;
-    let actual = vectors.object_ref();
+    let actual = vectors.fixture_ref();
     if &actual != expected {
         return refuse(
             Code::VECTOR_MISMATCH,
@@ -1508,10 +1486,10 @@ fn registry_adoption(encoding: &str) -> Result<RegistryAdoption> {
 
 fn admit_registry(store: &Store, adoptions: &[RegistryAdoption]) -> Result<()> {
     for adoption in adoptions {
-        // Referenced bytes land first, through the same content-addressed Store path as
-        // every other document. The snapshot root is published only after both exist.
-        checkpoint::put_doc(store, &adoption.vectors)?;
-        checkpoint::put_doc(store, &adoption.spec)?;
+        // Qualification vectors remain fixture blobs. The encoding value itself is nested
+        // in the CozyTensors header and is never admitted as another stored document.
+        let _ = store;
+        adoption.vectors.check(&adoption.spec)?;
     }
     Ok(())
 }
@@ -1752,42 +1730,42 @@ fn build_header(
     let mut closure = Closure::default();
     let mut registry_adoptions = Vec::new();
     for encoding in cited {
-        let mut found: Option<(ObjectRef, crate::spec::EncodingSpec)> = None;
+        let mut found: Option<crate::spec::EncodingSpec> = None;
         for source in sources {
-            if let Some(reference) = source.header.encodings.iter().find(|r| r.id() == encoding) {
-                let spec = source
-                    .closure
-                    .get(&encoding)
-                    .cloned()
-                    .ok_or_else(|| Refusal {
-                        code: Code::UNKNOWN_ENCODING,
-                        detail: format!("source {:?} lacks spec {encoding}", source.fact.alias),
-                    })?;
+            if let Some(spec) = source
+                .header
+                .encodings
+                .iter()
+                .find(|spec| spec.object_id() == encoding)
+                .cloned()
+            {
                 match &found {
-                    Some((existing, _)) if existing != reference => {
+                    Some(existing) if existing != &spec => {
                         return refuse(
                             Code::TRANSACTION_CONFLICT,
-                            format!("encoding {encoding} has conflicting length-bearing references across sources"),
+                            format!(
+                                "encoding {encoding} has conflicting definitions across sources"
+                            ),
                         )
                     }
-                    None => found = Some((reference.clone(), spec)),
+                    None => found = Some(spec),
                     _ => {}
                 }
             }
         }
-        let (reference, spec) = match found {
+        let spec = match found {
             Some(found) => found,
             None => {
                 let adoption = registry_adoption(&encoding)?;
-                let found = (adoption.spec.object_ref(), adoption.spec.clone());
+                let found = adoption.spec.clone();
                 registry_adoptions.push(adoption);
                 found
             }
         };
-        encodings.push(reference);
+        encodings.push(spec.clone());
         closure.insert(spec);
     }
-    encodings.sort_by(|a, b| a.sha256.cmp(&b.sha256));
+    encodings.sort_by_key(crate::spec::EncodingSpec::object_id);
     configs.sort_by(|a, b| a.0.cmp(&b.0));
     let mut config_refs = HashSet::new();
     for (config_name, config) in &configs {
@@ -1837,12 +1815,12 @@ pub struct SourceInspection {
     pub configs: Vec<InspectedConfig>,
 }
 
-/// Bounded metadata/config preview for a source the caller already holds by exact snapshot.
+/// Bounded metadata/config preview for a source the caller already holds by exact manifest.
 /// The lease pins and verifies every config read; tensor payload ObjectRefs never leave TensorFS.
 pub fn inspect_source(
     store: &Store,
     meta: &Meta,
-    snapshot: ObjectRef,
+    manifest: ObjectRef,
     component_names: Vec<String>,
     config_names: Vec<String>,
 ) -> Result<SourceInspection> {
@@ -1850,7 +1828,7 @@ pub fn inspect_source(
     let mut declaration = Declaration {
         sources: vec![Source {
             alias: alias.clone(),
-            snapshot,
+            manifest,
         }],
         components: component_names
             .iter()
@@ -1896,7 +1874,7 @@ pub fn inspect_source(
             length: config.length,
         });
     }
-    let (lease, _receipts) = read::acquire(store, meta, &source.fact.snapshot.sha256, config_refs)?;
+    let (lease, _receipts) = read::acquire(store, meta, &source.fact.manifest.sha256, config_refs)?;
     let result = (|| {
         let mut configs = Vec::new();
         for name in &config_names {
@@ -2001,7 +1979,7 @@ pub fn begin(
     }
     let mut source_leases = Vec::new();
     for source in &sources {
-        match read::acquire_snapshot(store, meta, &source.manifest) {
+        match read::acquire_manifest(store, meta, &source.manifest) {
             Ok((lease, receipts)) if receipts.0.is_empty() => {
                 source_leases.push((source.fact.alias.clone(), lease));
             }
@@ -2034,12 +2012,7 @@ pub fn begin(
         .collect();
 
     let mut txn = meta.txn()?;
-    let result = match txn
-        .state
-        .derived
-        .iter_mut()
-        .find(|row| row.id == transaction)
-    {
+    let result = match txn.rows.iter_mut().find(|row| row.id == transaction) {
         Some(row) => match row.state {
             TransactionState::Committed(_) => refuse(
                 Code::TRANSACTION_CLOSED,
@@ -2080,7 +2053,7 @@ pub fn begin(
             }
         },
         None => {
-            txn.state.derived.push(TransactionRow {
+            txn.rows.push(TransactionRow {
                 id: transaction.clone(),
                 declaration: Some(declaration_text),
                 state: TransactionState::Open,
@@ -2092,7 +2065,7 @@ pub fn begin(
                 inherited_payload_objects: 0,
                 inherited_payload_bytes: 0,
                 header: None,
-                snapshot: None,
+                manifest: None,
             });
             Ok(())
         }
@@ -2146,7 +2119,7 @@ fn open_row<'a>(
 pub fn check_writer(meta: &Meta, transaction: &str, writer_session: u64) -> Result<()> {
     let transaction = transaction_id(transaction)?;
     let mut txn = meta.txn()?;
-    open_row(&mut txn.state.derived, &transaction, writer_session)?;
+    open_row(&mut txn.rows, &transaction, writer_session)?;
     Ok(())
 }
 
@@ -2169,7 +2142,7 @@ pub fn add_part<R: Read>(
     let transaction = transaction_id(transaction)?;
     let (declaration, expected) = {
         let mut txn = meta.txn()?;
-        let row = open_row(&mut txn.state.derived, &transaction, writer_session)?;
+        let row = open_row(&mut txn.rows, &transaction, writer_session)?;
         if row.added_parts.iter().any(|added| {
             added.component == component && added.key == tensor_key && added.role == role
         }) {
@@ -2235,7 +2208,7 @@ pub fn add_part<R: Read>(
     }
 
     let mut txn = meta.txn()?;
-    let row = open_row(&mut txn.state.derived, &transaction, writer_session)?;
+    let row = open_row(&mut txn.rows, &transaction, writer_session)?;
     if row
         .added_parts
         .iter()
@@ -2268,7 +2241,7 @@ pub fn add_config<R: Read>(
     let transaction = transaction_id(transaction)?;
     let (media_type, expected_length) = {
         let mut txn = meta.txn()?;
-        let row = open_row(&mut txn.state.derived, &transaction, writer_session)?;
+        let row = open_row(&mut txn.rows, &transaction, writer_session)?;
         if row
             .added_configs
             .iter()
@@ -2335,7 +2308,7 @@ pub fn add_config<R: Read>(
     }
 
     let mut txn = meta.txn()?;
-    let row = open_row(&mut txn.state.derived, &transaction, writer_session)?;
+    let row = open_row(&mut txn.rows, &transaction, writer_session)?;
     if row
         .added_configs
         .iter()
@@ -2365,7 +2338,7 @@ pub struct ReceiptFacts {
     pub declaration: Declaration,
     pub sources: Vec<SourceFact>,
     pub header: ObjectRef,
-    pub snapshot: ObjectRef,
+    pub manifest: ObjectRef,
     pub added_objects: Vec<ObjectRef>,
     pub inherited_payload_objects: u64,
     pub inherited_payload_bytes: u64,
@@ -2389,7 +2362,7 @@ impl ReceiptFacts {
                     ("reads", Value::uint(0)),
                 ]),
             ),
-            ("snapshot", self.snapshot.to_value()),
+            ("manifest", self.manifest.to_value()),
             (
                 "sources",
                 Value::arr(
@@ -2409,7 +2382,7 @@ impl ReceiptFacts {
                                     ),
                                 ),
                                 ("header", source.header.to_value()),
-                                ("snapshot", source.snapshot.to_value()),
+                                ("manifest", source.manifest.to_value()),
                             ])
                         })
                         .collect(),
@@ -2418,10 +2391,6 @@ impl ReceiptFacts {
             ("transaction_id", Value::str(self.transaction.clone())),
         ])
     }
-}
-
-fn private_root(transaction: &str) -> String {
-    format!("derived.{}", transaction.trim_start_matches("sha256:"))
 }
 
 fn added_objects(row: &TransactionRow) -> Vec<ObjectRef> {
@@ -2470,16 +2439,16 @@ fn receipt_from(row: &TransactionRow) -> Result<ReceiptFacts> {
         code: Code::ARTIFACT_INCOMPLETE,
         detail: format!("committed transaction {} has no header", row.id),
     })?;
-    let snapshot = row.snapshot.clone().ok_or_else(|| Refusal {
+    let manifest = row.manifest.clone().ok_or_else(|| Refusal {
         code: Code::ARTIFACT_INCOMPLETE,
-        detail: format!("committed transaction {} has no snapshot", row.id),
+        detail: format!("committed transaction {} has no manifest", row.id),
     })?;
     Ok(ReceiptFacts {
         transaction: row.id.clone(),
         declaration,
         sources: row.source_facts.clone(),
         header,
-        snapshot,
+        manifest,
         added_objects: added_objects(row),
         inherited_payload_objects: row.inherited_payload_objects,
         inherited_payload_bytes: row.inherited_payload_bytes,
@@ -2495,7 +2464,7 @@ pub fn commit(
     let transaction = transaction_id(transaction)?;
     let row_before = {
         let mut txn = meta.txn()?;
-        open_row(&mut txn.state.derived, &transaction, writer_session)?.clone()
+        open_row(&mut txn.rows, &transaction, writer_session)?.clone()
     };
     let declaration = declaration(&row_before)?;
     let sources = resolve_sources(store, meta, &declaration)?;
@@ -2508,57 +2477,26 @@ pub fn commit(
     )?;
     admit_registry(store, &registry_adoptions)?;
     let header_ref = checkpoint::put_doc(store, &header)?;
-    let manifest = build_snapshot(&header, &header_ref, &closure)?;
-    let snapshot_ref = checkpoint::put_doc(store, &manifest)?;
-    let installed_manifest = store.open_verified(&snapshot_ref.sha256)?;
-    if installed_manifest.len() != snapshot_ref.length {
-        return refuse(
-            Code::LENGTH_MISMATCH,
-            format!(
-                "target manifest {} verified at {} bytes, reference says {}",
-                snapshot_ref.id(),
-                installed_manifest.len(),
-                snapshot_ref.length
-            ),
-        );
-    }
+    let manifest = build_manifest(&header, &header_ref, &closure)?;
+    let manifest_ref = store.put_manifest(&manifest)?.obj;
+    store.read_manifest(&manifest_ref)?;
     let walk = checkpoint::walk(store, &manifest)?;
     walk.require_resident(store)?;
     let (inherited_payload_objects, inherited_payload_bytes) =
         inherit_observation(&header, &row_before)?;
 
     let mut txn = meta.txn()?;
-    let row = open_row(&mut txn.state.derived, &transaction, writer_session)?;
+    let row = open_row(&mut txn.rows, &transaction, writer_session)?;
     if row.added_parts != row_before.added_parts || row.added_configs != row_before.added_configs {
         return refuse(
             Code::TRANSACTION_CONFLICT,
             "the addition set changed while commit constructed the target; retry commit",
         );
     }
-    let root_name = private_root(&transaction);
-    match txn.state.roots.iter().find(|root| root.name == root_name) {
-        Some(root) if root.snapshot == snapshot_ref.sha256 => {}
-        Some(root) => {
-            return refuse(
-                Code::TRANSACTION_CONFLICT,
-                format!(
-                    "private root {root_name:?} already names sha256:{}, not {}",
-                    root.snapshot,
-                    snapshot_ref.id()
-                ),
-            )
-        }
-        None => txn.state.roots.push(RootRow {
-            name: root_name,
-            snapshot: snapshot_ref.sha256.clone(),
-            kind: "derived".to_string(),
-            created: crate::meta::now_secs(),
-        }),
-    }
     row.state = TransactionState::Committed(Disposition::Pending);
     row.current_session = None;
     row.header = Some(header_ref);
-    row.snapshot = Some(snapshot_ref);
+    row.manifest = Some(manifest_ref);
     row.inherited_payload_objects = inherited_payload_objects as u64;
     row.inherited_payload_bytes = inherited_payload_bytes;
     let committed = row.clone();
@@ -2576,8 +2514,8 @@ pub enum Lookup {
 
 pub fn lookup(meta: &Meta, transaction: &str) -> Result<Lookup> {
     let transaction = transaction_id(transaction)?;
-    let state = meta.read()?;
-    let Some(row) = state.derived.iter().find(|row| row.id == transaction) else {
+    let rows = meta.derived_rows()?;
+    let Some(row) = rows.iter().find(|row| row.id == transaction) else {
         return Ok(Lookup::Absent);
     };
     match row.state {
@@ -2593,8 +2531,7 @@ pub fn fence(meta: &Meta, transaction: &str, writer_session: u64) -> Result<bool
     let transaction = transaction_id(transaction)?;
     let mut txn = meta.txn()?;
     let row = txn
-        .state
-        .derived
+        .rows
         .iter_mut()
         .find(|row| row.id == transaction)
         .ok_or_else(|| Refusal {
@@ -2614,14 +2551,9 @@ pub fn fence(meta: &Meta, transaction: &str, writer_session: u64) -> Result<bool
 pub fn abandon(meta: &Meta, transaction: &str) -> Result<Option<ReceiptFacts>> {
     let transaction = transaction_id(transaction)?;
     let mut txn = meta.txn()?;
-    let result = match txn
-        .state
-        .derived
-        .iter_mut()
-        .find(|row| row.id == transaction)
-    {
+    let result = match txn.rows.iter_mut().find(|row| row.id == transaction) {
         None => {
-            txn.state.derived.push(TransactionRow {
+            txn.rows.push(TransactionRow {
                 id: transaction,
                 declaration: None,
                 state: TransactionState::Abandoned,
@@ -2633,7 +2565,7 @@ pub fn abandon(meta: &Meta, transaction: &str) -> Result<Option<ReceiptFacts>> {
                 inherited_payload_objects: 0,
                 inherited_payload_bytes: 0,
                 header: None,
-                snapshot: None,
+                manifest: None,
             });
             None
         }
@@ -2676,10 +2608,6 @@ impl DispositionResult {
         let disposition = match &self.disposition {
             Disposition::Pending => Value::obj(vec![("kind", Value::str("pending"))]),
             Disposition::Released => Value::obj(vec![("kind", Value::str("released"))]),
-            Disposition::Transferred(root) => Value::obj(vec![
-                ("kind", Value::str("transferred")),
-                ("root", Value::str(root.clone())),
-            ]),
         };
         Value::obj(vec![
             ("disposition", disposition),
@@ -2688,40 +2616,26 @@ impl DispositionResult {
     }
 }
 
-pub fn dispose(
-    meta: &Meta,
-    transaction: &str,
-    scratch_root: Option<&str>,
-) -> Result<DispositionResult> {
+pub fn dispose(meta: &Meta, transaction: &str) -> Result<DispositionResult> {
     let transaction = transaction_id(transaction)?;
-    if let Some(root) = scratch_root {
-        name("scratch root", root)?;
-    }
     let mut txn = meta.txn()?;
     let index = txn
-        .state
-        .derived
+        .rows
         .iter()
         .position(|row| row.id == transaction)
         .ok_or_else(|| Refusal {
             code: Code::ROOT_ABSENT,
             detail: format!("no derived transaction {transaction}"),
         })?;
-    let row_snapshot = txn.state.derived[index]
-        .snapshot
-        .clone()
-        .ok_or_else(|| Refusal {
-            code: Code::TRANSACTION_CLOSED,
-            detail: format!("{transaction} is not committed"),
-        })?;
-    let desired = match scratch_root {
-        Some(root) => Disposition::Transferred(root.to_string()),
-        None => Disposition::Released,
-    };
-    match &txn.state.derived[index].state {
+    txn.rows[index].manifest.as_ref().ok_or_else(|| Refusal {
+        code: Code::TRANSACTION_CLOSED,
+        detail: format!("{transaction} is not committed"),
+    })?;
+    let desired = Disposition::Released;
+    match &txn.rows[index].state {
         TransactionState::Committed(Disposition::Pending) => {}
         TransactionState::Committed(existing) if existing == &desired => {
-            let row = txn.state.derived[index].clone();
+            let row = txn.rows[index].clone();
             drop(txn);
             return Ok(DispositionResult {
                 receipt: receipt_from(&row)?,
@@ -2731,81 +2645,19 @@ pub fn dispose(
         TransactionState::Committed(existing) => {
             return refuse(
                 Code::DISPOSITION_CONFLICT,
-                format!(
-                "{transaction} already has root disposition {existing:?}, cannot apply {desired:?}"
-            ),
+                format!("{transaction} already has disposition {existing:?}, cannot release"),
             )
         }
         _ => {
             return refuse(
                 Code::TRANSACTION_CLOSED,
-                format!("{transaction} has no committed root disposition"),
+                format!("{transaction} is not committed"),
             )
         }
     }
 
-    if let Some(root_name) = scratch_root {
-        match txn.state.roots.iter().find(|root| root.name == root_name) {
-            Some(root) if root.snapshot == row_snapshot.sha256 => {}
-            Some(root) => {
-                return refuse(
-                    Code::DISPOSITION_CONFLICT,
-                    format!(
-                        "scratch root {root_name:?} names sha256:{}, not {}",
-                        root.snapshot,
-                        row_snapshot.id()
-                    ),
-                )
-            }
-            None => txn.state.roots.push(RootRow {
-                name: root_name.to_string(),
-                snapshot: row_snapshot.sha256.clone(),
-                kind: "scratch".to_string(),
-                created: crate::meta::now_secs(),
-            }),
-        }
-        // Transfer makes this an ordinary known snapshot. Later scratch cleanup uses the
-        // existing explicit release+tombstone lifecycle rather than a second GC policy.
-        let now = crate::meta::now_secs();
-        match txn
-            .state
-            .snapshots
-            .iter_mut()
-            .find(|snapshot| snapshot.snapshot == row_snapshot.sha256)
-        {
-            Some(snapshot) => {
-                snapshot.tombstoned = false;
-                snapshot.last_used = now;
-            }
-            None => txn.state.snapshots.push(SnapshotRow {
-                snapshot: row_snapshot.sha256.clone(),
-                known_at: now,
-                tombstoned: false,
-                source_url: String::new(),
-                last_used: now,
-                evidence: Vec::new(),
-            }),
-        }
-    } else if !txn
-        .state
-        .snapshots
-        .iter()
-        .any(|snapshot| snapshot.snapshot == row_snapshot.sha256)
-    {
-        let now = crate::meta::now_secs();
-        txn.state.snapshots.push(SnapshotRow {
-            snapshot: row_snapshot.sha256.clone(),
-            known_at: now,
-            tombstoned: true,
-            source_url: String::new(),
-            last_used: now,
-            evidence: Vec::new(),
-        });
-    }
-    let private = private_root(&transaction);
-    txn.state.roots.retain(|root| root.name != private);
-    txn.state.derived[index].state = TransactionState::Committed(desired.clone());
-    let row = txn.state.derived[index].clone();
+    txn.rows[index].state = TransactionState::Committed(desired.clone());
+    let row = txn.rows[index].clone();
     txn.commit()?;
     Ok(DispositionResult {
         receipt: receipt_from(&row)?,

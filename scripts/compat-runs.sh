@@ -251,9 +251,9 @@ arms_section() {
     surplus vae-f32 vae-f16 canonical
   verdict_of "Mismatch EXTRA_TENSOR" "canonical: the surplus itself refuses, named" \
     surplus2 vae-shared vae-f16 canonical
-  echo "  the same surplus on a LOCAL UN-BORDERED snapshot is warn-ignore-confess:"
+  echo "  the same surplus on a LOCAL UN-BORDERED manifest is warn-ignore-confess:"
   chk unbordered vae-shared vae-f16 local_unbordered | grep -E '^unconsumed|^verdict' | sed 's/^/     /'
-  red UNCLASSIFIED_EXTRAS "an unclassified-extras snapshot refuses at release cut" \
+  red UNCLASSIFIED_EXTRAS "an unclassified-extras manifest refuses at release cut" \
     "$TFS" compat release-cut "$W/compat.vae.json"
   green "a fully classified candidate cuts" "$TFS" compat release-cut "$W/compat.ref2va.json"
 
@@ -339,7 +339,8 @@ stamp_section() {
   nice -n 19 "$TFS" ingest run "$S/store" toy=plain/1 --source toy="$S/carriers/good.safetensors" \
     --registry "$S/registry.json" --session s2 --tenant acme 2>&1 \
     | grep -E '^(stamp|  topology|  candidates|  golden|receipt)' | sed 's/^/  /'
-  green "install consumes the stamp AND the receipt" "$TFS" ingest install "$S/store" s2
+  green "install consumes the stamp AND the receipt" \
+    "$TFS" ingest install "$S/store" s2 proof stamp 2.0.0 s2
 
   hr "restamp: the coordinator's re-verification, byte for byte"
   green "restamping the clean candidate reproduces the exact receipt" \
@@ -388,13 +389,13 @@ import pathlib
 p=pathlib.Path('$Q/subject.json')
 p.write_bytes(p.read_bytes().replace(b'\"generation\":1', b'\"generation\":2'))"
   red CROSS_SUBJECT_REPLAY "a source generation bumped under the same receipt" \
-    "$TFS" ingest install "$S/store" s1
+    "$TFS" ingest install "$S/store" s1 proof stamp 1.0.0 s1
   python3 -c "
 import pathlib
 p=pathlib.Path('$Q/subject.bak')
 pathlib.Path('$Q/subject.json').write_bytes(p.read_bytes().replace(b'\"tenant\":\"acme\"', b'\"tenant\":\"acmf\"'))"
   red CROSS_SUBJECT_REPLAY "another tenant on the same candidate (receipt replay)" \
-    "$TFS" ingest install "$S/store" s1
+    "$TFS" ingest install "$S/store" s1 proof stamp 1.0.0 s1
   cp "$Q/subject.bak" "$Q/subject.json"; rm -f "$Q/subject.bak"
 
   hr "a receipt is not a publication, and install binds the stamp"
@@ -404,11 +405,12 @@ import pathlib
 p=pathlib.Path('$Q/stamp.json')
 p.write_bytes(p.read_bytes().replace(b'\"isolation_tier\":1', b'\"isolation_tier\":2'))"
   red CROSS_SUBJECT_REPLAY "install with a receipt bound to another stamp" \
-    "$TFS" ingest install "$S/store" s1
+    "$TFS" ingest install "$S/store" s1 proof stamp 1.0.0 s1
   cp "$Q/stamp.bak" "$Q/stamp.json"; rm -f "$Q/stamp.bak"
   red ROOT_ABSENT "install with the stamp document removed" \
-    bash -c "mv $Q/stamp.json $Q/stamp.hidden; $TFS ingest install $S/store s1; mv $Q/stamp.hidden $Q/stamp.json"
-  green "and with everything intact it installs" "$TFS" ingest install "$S/store" s1
+    bash -c "mv $Q/stamp.json $Q/stamp.hidden; $TFS ingest install $S/store s1 proof stamp 1.0.0 s1; mv $Q/stamp.hidden $Q/stamp.json"
+  green "and with everything intact it installs" \
+    "$TFS" ingest install "$S/store" s1 proof stamp 1.0.0 s1
 }
 
 bench_section() {

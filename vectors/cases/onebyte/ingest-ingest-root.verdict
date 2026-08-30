@@ -1,3 +1,0 @@
-doc: root
-expect: mutant
-note: one byte flipped at offset 76 of sha256:1521d8181613e04d9c99f910b2d94101a0b42a1cd2618362ad08bbc03b0f3148

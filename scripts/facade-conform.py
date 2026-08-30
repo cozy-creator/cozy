@@ -74,8 +74,8 @@ def main() -> int:
                     bad.append(f"id {ok['id']} != frozen {v.get('id')!r}")
                 if "topology" in v and ok["topology"] != v["topology"]:
                     bad.append(f"topology {ok['topology']!r} != frozen {v['topology']}")
-                if "checkpoint" in v and ok["checkpoint"] != v["checkpoint"]:
-                    bad.append(f"checkpoint {ok['checkpoint']!r} != frozen {v['checkpoint']}")
+                if "manifest" in v and ok["manifest"] != v["manifest"]:
+                    bad.append(f"manifest {ok['manifest']!r} != frozen {v['manifest']}")
                 good = not bad
                 why = "; ".join(bad) if bad else f"id={str(ok['id'])[7:19]}"
         elif expect == "refuse":
@@ -113,22 +113,23 @@ def main() -> int:
     def topof(n: str) -> str:
         return str(outcomes.get(n, {}).get("topology") or "")
 
-    def cpof(n: str) -> str:
-        return str(outcomes.get(n, {}).get("checkpoint") or "")
+    def manifest_of(n: str) -> str:
+        return str(outcomes.get(n, {}).get("manifest") or "")
 
     cross: list[tuple[str, bool, str]] = []
     cross.append(
         (
-            "checkpoint_id == snapshot_id (unconditional)",
-            cpof("manifest/checkpoint") == idof("manifest/checkpoint") and bool(cpof("manifest/checkpoint")),
-            cpof("manifest/checkpoint"),
+            "manifest identity is the hash of its exact bytes",
+            manifest_of("manifest/checkpoint") == idof("manifest/checkpoint")
+            and bool(manifest_of("manifest/checkpoint")),
+            manifest_of("manifest/checkpoint"),
         )
     )
     cross.append(
         (
-            "header ObjectId != checkpoint_id",
-            idof("header/plain-fp8") != cpof("manifest/checkpoint"),
-            f"{idof('header/plain-fp8')[:19]} vs {cpof('manifest/checkpoint')[:19]}",
+            "header ObjectId != manifest id",
+            idof("header/plain-fp8") != manifest_of("manifest/checkpoint"),
+            f"{idof('header/plain-fp8')[:19]} vs {manifest_of('manifest/checkpoint')[:19]}",
         )
     )
     cross.append(
@@ -150,22 +151,23 @@ def main() -> int:
     )
     cross.append(
         (
-            "one more sibling file flips checkpoint_id only",
-            cpof("manifest/checkpoint") != cpof("manifest/checkpoint-extra-file"),
-            cpof("manifest/checkpoint-extra-file"),
+            "one more ordinary file flips only the manifest id",
+            manifest_of("manifest/checkpoint")
+            != manifest_of("manifest/checkpoint-extra-file"),
+            manifest_of("manifest/checkpoint-extra-file"),
         )
     )
 
     rcpt = (VEC / "cases/ingest/receipt.json").read_bytes()
     subj = (VEC / "cases/ingest/subject.json").read_bytes()
-    snap = (VEC / "cases/manifest/checkpoint.json").read_bytes()
+    manifest = (VEC / "cases/manifest/checkpoint.json").read_bytes()
     hdr = (VEC / "cases/header/plain-fp8.cbor").read_bytes()
     stamp = (VEC / "cases/ingest/stamp.json").read_bytes()
     try:
-        tensorfs.receipt_binds(rcpt, subj, snap, hdr, stamp)
-        cross.append(("receipt binds its exact subject/snapshot/header", True, ""))
+        tensorfs.receipt_binds(rcpt, subj, manifest, hdr, stamp)
+        cross.append(("receipt binds its exact subject/manifest/header", True, ""))
     except errors.Refusal as e:
-        cross.append(("receipt binds its exact subject/snapshot/header", False, e.detail))
+        cross.append(("receipt binds its exact subject/manifest/header", False, e.detail))
 
     # The replay arm needs a DIFFERENT subject. Plant one: the tenant is a value, so
     # swapping it leaves canonical bytes canonical — and the facade re-reads them through
@@ -174,7 +176,7 @@ def main() -> int:
     assert other != subj, "the tenant plant did not apply"
     tensorfs.run_doc("subject", other, closure)
     try:
-        tensorfs.receipt_binds(rcpt, other, snap, hdr, stamp)
+        tensorfs.receipt_binds(rcpt, other, manifest, hdr, stamp)
         cross.append(("cross-subject replay refuses", False, "it bound"))
     except errors.Refusal as e:
         cross.append(("cross-subject replay refuses", e.code == "CROSS_SUBJECT_REPLAY", e.detail))

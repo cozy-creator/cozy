@@ -16,7 +16,7 @@
 use crate::dtype::{checked_bytes, Dtype};
 use crate::err::{refuse, Code, Result};
 use crate::header::{Header, Part};
-use crate::ids::{Doc, ObjectRef};
+use crate::ids::ObjectRef;
 use crate::limits;
 use crate::spec::EncodingSpec;
 
@@ -219,7 +219,7 @@ pub struct Op {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Effect {
-    /// A new canonical container over untouched bytes: a foreign carrier becomes a snapshot.
+    /// A new canonical container over untouched bytes: a foreign carrier becomes a manifest.
     Recontain,
     /// Key changes, bytes do not.
     Rekey,
@@ -378,7 +378,7 @@ impl Plan {
     }
 
     /// A converter that converts NOTHING refuses: a bit-identical copy must never stamp as a
-    /// new encoding. `Recontain` is real work (a foreign carrier is not a snapshot); an
+    /// new encoding. `Recontain` is real work (a foreign carrier is not a manifest); an
     /// all-`None` plan over an already-canonical source is the refused class.
     pub fn check_converts_something(&self) -> Result<()> {
         if self.ops.iter().all(|o| o.effect == Effect::None) {

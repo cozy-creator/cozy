@@ -25,7 +25,7 @@ use crate::canon::{as_arr, as_obj, as_str, Fields, Value};
 use crate::dtype::Dtype;
 use crate::err::{refuse, Code, Result};
 use crate::header::{Closure, Header};
-use crate::ids::{ascii_name, check_format, prefixed, Doc};
+use crate::ids::{ascii_name, prefixed, Plain};
 use crate::limits;
 
 // ---------------------------------------------------------------- the required side
@@ -129,17 +129,11 @@ impl CodeTopology {
     }
 }
 
-impl Doc for CodeTopology {
-    const FORMAT: &'static str = "cozytensors.code_topology/1";
+impl Plain for CodeTopology {
     const MAX_BYTES: usize = limits::DOC_MAX_BYTES;
 
     fn from_value(v: &Value) -> Result<Self> {
         let mut f = Fields::new("CodeTopology", v)?;
-        check_format(
-            "CodeTopology",
-            as_str("CodeTopology", "format", f.req("format")?)?,
-            Self::FORMAT,
-        )?;
         let contract = prefixed("CodeTopology.contract", f.req_str("contract")?)?;
         let mut components = Vec::new();
         let mut total = 0usize;
@@ -235,7 +229,6 @@ impl Doc for CodeTopology {
                 ),
             ),
             ("contract", Value::str(self.contract.clone())),
-            ("format", Value::str(Self::FORMAT)),
         ])
     }
 }
@@ -248,7 +241,7 @@ impl Doc for CodeTopology {
 pub enum Lane {
     /// The border classified every key. A surplus at serve time is drift or corruption.
     Canonical,
-    /// A local snapshot that never crossed the border: unknown extras are confessed.
+    /// A local manifest that never crossed the border: unknown extras are confessed.
     LocalUnbordered,
 }
 
@@ -398,7 +391,7 @@ pub struct ComponentFacts {
 }
 
 /// Everything one call produced: the two-valued satisfaction, the component-granular facts
-/// grading consumes, and the UNCONSUMED set — extra keys a local un-bordered snapshot
+/// grading consumes, and the UNCONSUMED set — extra keys a local un-bordered manifest
 /// carried that nothing classified. The unconsumed set is a recorded fact, never a third
 /// verdict: `release_cut` is what refuses on it.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -723,15 +716,15 @@ impl CompatibilityReport {
         })
     }
 
-    /// A release cut takes only a snapshot whose extras were all classified. An
-    /// un-bordered snapshot that quietly carried unknown keys never becomes a catalog
+    /// A release cut takes only a manifest whose extras were all classified. An
+    /// un-bordered manifest that quietly carried unknown keys never becomes a catalog
     /// release: warn-ignore-confess is a LOCAL affordance, not a publication policy.
     pub fn release_cut(&self) -> Result<()> {
         if !self.unconsumed.is_empty() {
             return refuse(
                 Code::UNCLASSIFIED_EXTRAS,
                 format!(
-                    "{} unclassified extra key(s), first {:?}: an un-bordered snapshot with \
+                    "{} unclassified extra key(s), first {:?}: an un-bordered manifest with \
                      unconsumed keys never cuts into a catalog release",
                     self.unconsumed.len(),
                     self.unconsumed[0]
@@ -768,17 +761,11 @@ fn dtype_hist_from(what: &str, v: &Value) -> Result<Vec<(Dtype, u64)>> {
     Ok(out)
 }
 
-impl Doc for CompatibilityReport {
-    const FORMAT: &'static str = "tensorfs.compatibility_report/1";
+impl Plain for CompatibilityReport {
     const MAX_BYTES: usize = limits::DOC_MAX_BYTES;
 
     fn from_value(v: &Value) -> Result<Self> {
         let mut f = Fields::new("CompatibilityReport", v)?;
-        check_format(
-            "CompatibilityReport",
-            as_str("CompatibilityReport", "format", f.req("format")?)?,
-            Self::FORMAT,
-        )?;
         let contract = prefixed("report.contract", f.req_str("contract")?)?;
         let mut facts = Vec::new();
         for fv in as_arr("CompatibilityReport", "facts", f.req("facts")?)? {
@@ -998,7 +985,6 @@ impl Doc for CompatibilityReport {
                         .collect(),
                 ),
             ),
-            ("format", Value::str(Self::FORMAT)),
             ("header", Value::str(self.header.clone())),
             ("lane", Value::str(self.lane.name())),
             ("satisfaction", satisfaction),

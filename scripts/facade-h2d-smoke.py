@@ -12,7 +12,7 @@ The property being demonstrated is not throughput alone: **a slot goes back to t
 only when its H2D completion event has fired**, which is the lease discipline reaching
 across the FFI. `Batch.release()` is called from the drain loop, not from the callback.
 
-    PYTHONPATH=<torch site-packages> python scripts/facade-h2d-smoke.py <store> <snapshot>
+    PYTHONPATH=<torch site-packages> python scripts/facade-h2d-smoke.py <store> <manifest>
 """
 
 from __future__ import annotations
@@ -39,7 +39,7 @@ _spec.loader.exec_module(_fr)
 def main() -> int:
     p = argparse.ArgumentParser()
     p.add_argument("store")
-    p.add_argument("snapshot")
+    p.add_argument("manifest")
     p.add_argument("--slot-bytes", type=int, default=16 << 20)
     p.add_argument("--slots", type=int, default=4)
     p.add_argument("--readers", type=int, default=8)
@@ -50,7 +50,7 @@ def main() -> int:
     p.add_argument("--expect", default="")
     a = p.parse_args()
 
-    store, header, header_bytes = _fr.load(a.store, a.snapshot)
+    store, header, header_bytes = _fr.load(a.store, a.manifest)
     plan = tensorfs.plan(header_bytes, _fr.construction_order(header), window=a.window)
     dev = torch.device("cuda:0")
     print(f"device:     {torch.cuda.get_device_name(0)}  torch {torch.__version__}")
@@ -71,7 +71,7 @@ def main() -> int:
         print(f"evicted:    {n} objects, {b} B (fadvise DONTNEED)")
 
     keep = a.inflight or max(1, a.slots // 2)
-    lease = store.acquire_snapshot(a.snapshot)
+    lease = store.acquire_manifest(a.manifest)
 
     def drain(keep: int) -> None:
         """Release slots whose H2D has actually completed. NEVER on the return of a

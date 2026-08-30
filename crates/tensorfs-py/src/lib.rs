@@ -63,7 +63,6 @@ fn _ext(m: &Bound<'_, PyModule>) -> PyResult<()> {
     platform_gate(&plat).map_err(|e| errors::to_py(py, &e))?;
 
     m.add("__version__", env!("CARGO_PKG_VERSION"))?;
-    m.add("ERA", tensorfs_core::store::ERA)?;
     m.add_function(wrap_pyfunction!(py_platform_gate, m)?)?;
 
     m.add_function(wrap_pyfunction!(docs::object_id, m)?)?;
@@ -76,20 +75,19 @@ fn _ext(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(docs::platform_digests, m)?)?;
     m.add_function(wrap_pyfunction!(docs::seed_digests, m)?)?;
     m.add_function(wrap_pyfunction!(docs::dtypes, m)?)?;
+    m.add_function(wrap_pyfunction!(docs::manifest_max_bytes, m)?)?;
     m.add_function(wrap_pyfunction!(docs::render, m)?)?;
     m.add_function(wrap_pyfunction!(docs::recanonicalize, m)?)?;
     m.add_class::<docs::PyClosure>()?;
 
     m.add_function(wrap_pyfunction!(store::plan, m)?)?;
-    m.add_function(wrap_pyfunction!(store::ingest_open_root, m)?)?;
-    m.add_function(wrap_pyfunction!(store::ingest_read_root, m)?)?;
-    m.add_function(wrap_pyfunction!(store::ingest_reap, m)?)?;
-    m.add_function(wrap_pyfunction!(store::ingest_installed, m)?)?;
+    m.add_function(wrap_pyfunction!(store::transfer_object, m)?)?;
+    m.add_function(wrap_pyfunction!(store::transfer_manifest, m)?)?;
     m.add_function(wrap_pyfunction!(store::fetch_plan, m)?)?;
     m.add_function(wrap_pyfunction!(store::fetch_admit, m)?)?;
     m.add_function(wrap_pyfunction!(store::fetch_complete, m)?)?;
-    m.add_function(wrap_pyfunction!(store::transfer_object, m)?)?;
     m.add_class::<store::PyStore>()?;
+    m.add_class::<store::PyOperation>()?;
     m.add_class::<store::PyDerivedWriter>()?;
     m.add_class::<store::PyLease>()?;
     m.add_class::<store::PyPlan>()?;

@@ -7,11 +7,10 @@
 
 use crate::err::{refuse, Code, Refusal, Result};
 use crate::header::{Closure, Header};
-use crate::ids::Doc;
-use crate::ingest::transaction::IngestRoot;
+use crate::ids::{Doc, Plain};
+use crate::ingest::transaction::IngestSession;
 use crate::ingest::{IngestProfile, IngestSubject, IngestVerificationReceipt};
-use crate::manifest::SnapshotManifest;
-use crate::meta::State;
+use crate::manifest::Manifest;
 use crate::registry;
 use crate::spec::EncodingSpec;
 use crate::vectors::EncodingVectors;
@@ -23,21 +22,20 @@ use crate::vectors::EncodingVectors;
 pub struct DocOutcome {
     pub id: String,
     pub topology: Option<String>,
-    pub checkpoint: Option<String>,
+    pub manifest: Option<String>,
 }
 
 pub const DOC_KINDS: &[&str] = &[
     "header",
     "header-serving",
-    "spec",
+    "encoding",
     "vectors",
     "manifest",
     "profile",
     "subject",
-    "root",
+    "session",
     "receipt",
     "stamp",
-    "meta",
     "code_topology",
     "compat_report",
 ];
@@ -49,7 +47,7 @@ pub fn run_doc(
     platform: &[String],
 ) -> Result<DocOutcome> {
     let id = crate::ids::object_id(bytes);
-    let (topology, checkpoint) = match doc {
+    let (topology, manifest) = match doc {
         "header" => Header::parse(bytes).and_then(|h| {
             h.validate(closure)?;
             Ok((Some(h.topology_digest()), None))
@@ -60,8 +58,8 @@ pub fn run_doc(
             h.admit_for_serving(closure, platform)?;
             Ok((Some(h.topology_digest()), None))
         })?,
-        "spec" => EncodingSpec::parse(bytes).map(|_| (None, None))?,
-        "vectors" => EncodingVectors::parse(bytes).and_then(|v| {
+        "encoding" => EncodingSpec::decode_nested(bytes).map(|_| (None, None))?,
+        "vectors" => EncodingVectors::parse_fixture(bytes).and_then(|v| {
             let plain = registry::seeds()
                 .into_iter()
                 .find(|s| s.alias == "plain/1")
@@ -70,18 +68,17 @@ pub fn run_doc(
             v.check(&plain)?;
             Ok((None, None))
         })?,
-        // A decode IS the path law now: `SnapshotManifest` cannot exist unvalidated, so
+        // A decode IS the path law now: `Manifest` cannot exist unvalidated, so
         // parsing is the whole check and there is no second validate() to forget.
-        "manifest" => SnapshotManifest::parse(bytes).map(|m| (None, m.checkpoint_id().ok()))?,
+        "manifest" => Manifest::parse(bytes).map(|m| (None, Some(m.manifest_id())))?,
         "profile" => IngestProfile::parse(bytes).and_then(|p| {
             p.validate(platform)?;
             Ok((None, None))
         })?,
         "subject" => IngestSubject::parse(bytes).map(|_| (None, None))?,
-        "root" => IngestRoot::parse(bytes).map(|_| (None, None))?,
+        "session" => IngestSession::parse(bytes).map(|_| (None, None))?,
         "receipt" => IngestVerificationReceipt::parse(bytes).map(|_| (None, None))?,
         "stamp" => crate::ingest::stamp::Stamp::parse(bytes).map(|_| (None, None))?,
-        "meta" => State::parse(bytes).map(|_| (None, None))?,
         // The layout plane's documents (tfs-009). A code topology projects to the SAME
         // frozen projection a header does, so its digest is reported here too.
         "code_topology" => {
@@ -100,7 +97,7 @@ pub fn run_doc(
     Ok(DocOutcome {
         id,
         topology,
-        checkpoint,
+        manifest,
     })
 }
 
@@ -115,7 +112,7 @@ pub fn receipt_binds(
 ) -> std::result::Result<(), Refusal> {
     let r = IngestVerificationReceipt::parse(receipt)?;
     let s = IngestSubject::parse(subject)?;
-    let m = SnapshotManifest::parse(manifest)?;
+    let m = Manifest::parse(manifest)?;
     let h = Header::parse(header)?;
     let t = crate::ingest::stamp::Stamp::parse(stamp)?;
     r.binds(&s, &m, &h, &t)

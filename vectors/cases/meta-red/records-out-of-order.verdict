@@ -1,4 +1,0 @@
-doc: meta
-expect: refuse
-code: SORT_ORDER
-note: two snapshot rows in descending order — an unsorted authority is refused

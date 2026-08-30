@@ -26,7 +26,7 @@ use crate::checkpoint;
 use crate::err::{refuse, Code, Refusal, Result};
 use crate::header::{Body, Header, Located, Part};
 use crate::ids::ObjectRef;
-use crate::manifest::SnapshotManifest;
+use crate::manifest::Manifest;
 use crate::meta::{Hold, Meta};
 use crate::receipt::{Receipt, Receipts};
 use crate::store::{Store, VerifiedFile};
@@ -63,7 +63,7 @@ impl ObjectRange {
 
 // ---------------------------------------------------------------- the lease
 
-/// `ReadLease = store.acquire(snapshot, object_set)` — verified PINNED descriptors.
+/// `ReadLease = store.acquire(manifest, object_set)` — verified PINNED descriptors.
 ///
 /// The hold is registered BEFORE the first byte is verified or fetched, so GC racing a
 /// starting fill is fenced by construction rather than by timing. The lease lives until the
@@ -82,7 +82,7 @@ impl ObjectRange {
 /// resolution, which is exactly the defect this type exists to kill.
 pub struct ReadLease {
     hold: Hold,
-    pub snapshot: String,
+    pub manifest: String,
     objects: Vec<ObjectRef>,
     files: HashMap<String, VerifiedFile>,
 }
@@ -152,11 +152,11 @@ fn fd_shortfall(need: usize) -> Option<(u64, u64, u64)> {
 pub fn acquire(
     store: &Store,
     meta: &Meta,
-    snapshot: &str,
+    manifest: &str,
     objects: Vec<ObjectRef>,
 ) -> Result<(ReadLease, Receipts)> {
     // The hold FIRST: registered before the first fetch (tensorfs.md §2, pin root class 2).
-    let hold = meta.acquire_hold("read", snapshot, Vec::new())?;
+    let hold = meta.acquire_hold("read", manifest, Vec::new())?;
     // Admission proves RLIMIT_NOFILE headroom for the COMPLETE descriptor set (H3 serves
     // 3,627 distinct objects — never an assumable count) or refuses typed.
     let distinct: HashSet<&str> = objects.iter().map(|o| o.sha256.as_str()).collect();
@@ -218,8 +218,7 @@ pub fn acquire(
             rx.emit(Receipt::new(
                 "acquire",
                 "record-invalidated-rehash",
-                snapshot,
-                store.generation(),
+                manifest,
                 format!("{}: rehashed on acquire", o.id()),
             ));
         }
@@ -228,7 +227,7 @@ pub fn acquire(
     Ok((
         ReadLease {
             hold,
-            snapshot: snapshot.to_string(),
+            manifest: manifest.to_string(),
             objects,
             files,
         },
@@ -236,16 +235,16 @@ pub fn acquire(
     ))
 }
 
-/// Acquire over everything one snapshot commits — the serving case. The transitive walk is
+/// Acquire over everything one manifest commits — the serving case. The transitive walk is
 /// the object set, so the lease covers exactly what the checkpoint declares and nothing else.
-pub fn acquire_snapshot(
+pub fn acquire_manifest(
     store: &Store,
     meta: &Meta,
-    snap: &SnapshotManifest,
+    snap: &Manifest,
 ) -> Result<(ReadLease, Receipts)> {
     let walk = checkpoint::walk(store, snap)?;
     let objects: Vec<ObjectRef> = walk.distinct().into_iter().cloned().collect();
-    let hex = snap.snapshot_id();
+    let hex = snap.manifest_id();
     acquire(
         store,
         meta,
@@ -535,14 +534,14 @@ fn tally(items: &[PlanItem]) -> (u64, u64, usize) {
 ///
 /// The check used to be whole-header, and tfs-007's reason for it is unchanged and still
 /// enforced: a fill that silently skips a tensor is a wrong model, not a fast one. What was
-/// wrong was the SCOPE. An N-ary artifact packages several components under one snapshot —
+/// wrong was the SCOPE. An N-ary artifact packages several components under one manifest —
 /// the canonical shape for every multi-task family — and a role class constructs only its
 /// own graph, so a whole-header rule made the standard packaging unservable: H3's Fl2VA
 /// class names 917 of 3445 tensors and was refused for the 2528 belonging to a sibling
 /// transformer it must not touch. It also contradicted the per-component residency the rest
 /// of the design assumes everywhere, which stages components independently by construction.
 ///
-/// So the hole this closes is stated per component rather than per snapshot. A traversal
+/// So the hole this closes is stated per component rather than per manifest. A traversal
 /// missing one tensor of a component it REQUESTED still refuses, exactly as before. A
 /// traversal naming a tensor from a component it did not request refuses too — declaring a
 /// narrow scope and then reading outside it is the smuggling case, and it is the reason the

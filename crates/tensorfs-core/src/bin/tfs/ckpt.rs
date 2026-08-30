@@ -11,10 +11,10 @@ use std::path::Path;
 use std::process::ExitCode;
 use std::time::Instant;
 
-use tensorfs_core::checkpoint::{self as ck, build_snapshot};
+use tensorfs_core::checkpoint::{self as ck, build_manifest};
 use tensorfs_core::dtype::Dtype;
 use tensorfs_core::header::{Asset, Body, Closure, Header, Located, Part, Tensor};
-use tensorfs_core::ids::{ConfigRef, Doc, ObjectRef};
+use tensorfs_core::ids::{ConfigRef, ObjectRef};
 use tensorfs_core::limits;
 use tensorfs_core::registry;
 use tensorfs_core::relation::Carrier;
@@ -268,20 +268,16 @@ pub fn cmd_write(root: &Path, f: &Flags) -> ExitCode {
     aliases.sort_unstable();
     aliases.dedup();
     let mut closure = Closure::default();
-    let mut enc_refs = Vec::new();
+    let mut encodings = Vec::new();
     for a in &aliases {
         let sd = registry_seed(a);
-        // A spec's `vectors` reference must resolve INSIDE the closure it ships with.
-        if let Some(v) = &sd.vectors {
-            ok!(ck::put_doc(&store, v));
-        }
-        enc_refs.push(ok!(ck::put_doc(&store, &sd.spec)));
+        encodings.push(sd.spec.clone());
         closure.insert(sd.spec);
     }
-    enc_refs.sort_by(|a: &ObjectRef, b: &ObjectRef| a.sha256.cmp(&b.sha256));
+    encodings.sort_by_key(EncodingSpec::object_id);
 
     // --no-configs is the TENSORS-ONLY shape: one header plus its closure, zero sibling
-    // assets. `checkpoint_id` derives identically — there is no "has a snapshot" branch.
+    // assets. The manifest id derives once from the virtual tree.
     let mut cfg_refs: Vec<(String, ConfigRef)> = Vec::new();
     let cfgs = if flag_on(f, "no-configs") {
         Vec::new()
@@ -364,7 +360,7 @@ pub fn cmd_write(root: &Path, f: &Flags) -> ExitCode {
     let header = Header {
         configs: cfg_refs,
         assets,
-        encodings: enc_refs,
+        encodings,
         components: comps,
     };
     let t = Instant::now();
@@ -373,14 +369,14 @@ pub fn cmd_write(root: &Path, f: &Flags) -> ExitCode {
     ok!(header.validate(&closure));
     let href = ok!(ck::put_doc(&store, &header));
 
-    // The snapshot is unconditional: checkpoint_id is its ObjectId, one derivation always.
-    let snap = ok!(build_snapshot(&header, &href, &closure));
-    let sref = ok!(ck::put_doc(&store, &snap));
+    // The manifest is unconditional: manifest_id is its ObjectId, one derivation always.
+    let snap = ok!(build_manifest(&header, &href, &closure));
+    let sref = ok!(store.put_manifest(&snap)).obj;
 
     let mb = bytes as f64 / (1024.0 * 1024.0);
     println!("checkpoint written to {}", root.display());
     println!("  header_digest   {}", href.id());
-    println!("  checkpoint_id   {}", sref.id());
+    println!("  manifest_id     {}", sref.id());
     println!("  topology_digest {}", header.topology_digest());
     println!(
         "  components {}  tensors {}  parts {}  segments {}  inline {}",
@@ -561,7 +557,7 @@ pub fn cmd_info(root: &Path, hex: &str) -> ExitCode {
         );
     }
     for r in &header.encodings {
-        println!("encoding {} ({} B)", r.id(), r.length);
+        println!("encoding {} (inlined)", r.object_id());
     }
     for (comp, ts) in &header.components {
         let (mut bytes, mut parts, mut segs) = (0u64, 0usize, 0usize);
@@ -717,7 +713,7 @@ pub fn cmd_caps() -> ExitCode {
     let refs_doc = Header {
         configs: vec![],
         assets: vec![],
-        encodings: vec![plain.object_ref()],
+        encodings: vec![plain.clone()],
         components: vec![("transformer".to_string(), tensors)],
     };
     println!(
@@ -739,7 +735,7 @@ pub fn cmd_caps() -> ExitCode {
     let bytes_doc = Header {
         configs: vec![],
         assets: vec![],
-        encodings: vec![plain.object_ref()],
+        encodings: vec![plain.clone()],
         components: vec![(
             "transformer".to_string(),
             vec![(
@@ -853,8 +849,8 @@ pub fn cmd_size(n: usize) -> ExitCode {
             None => comps.push((comp.to_string(), vec![(key, t)])),
         }
     }
-    let mut enc: Vec<ObjectRef> = specs.iter().map(|s| s.object_ref()).collect();
-    enc.sort_by(|a, b| a.sha256.cmp(&b.sha256));
+    let mut enc: Vec<EncodingSpec> = specs.clone();
+    enc.sort_by_key(EncodingSpec::object_id);
     let h = Header {
         configs: vec![],
         assets: vec![],
@@ -1070,7 +1066,11 @@ mod tests {
     fn default_writer_emits_a_mixed_header_and_closure() {
         let (_root, _href, header, closure, _flags) = write_and_load("mixed", false);
         let ids = encoding_ids(&header);
-        let header_ids: BTreeSet<String> = header.encodings.iter().map(ObjectRef::id).collect();
+        let header_ids: BTreeSet<String> = header
+            .encodings
+            .iter()
+            .map(EncodingSpec::object_id)
+            .collect();
         let closure_ids: BTreeSet<String> =
             closure.specs.iter().map(|(id, _)| id.clone()).collect();
         assert!(
@@ -1097,7 +1097,7 @@ mod tests {
             header
                 .encodings
                 .iter()
-                .map(ObjectRef::id)
+                .map(EncodingSpec::object_id)
                 .collect::<Vec<_>>(),
             vec![plain_id.clone()],
             "the header closure must cite only plain/1"

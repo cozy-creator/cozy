@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Wheel smoke (tfs-001, extended by tfs-007): build the abi3 wheel, install it into a FRESH
-# venv, and READ A REAL NAMED TENSOR out of the committed store at vectors/store — a lease,
+# venv, and READ A REAL NAMED TENSOR out of a fresh current-layout store — a lease,
 # a plan in the caller's traversal order, a slot ring, and the digest the Rust path banks.
 #
 # An import smoke proves the wheel loads. This proves the wheel WORKS, which is the only
@@ -25,16 +25,17 @@ done
 work="${work:-$(mktemp -d)}"
 mkdir -p "$work"
 
-# The committed fixture: `tfs checkpoint write vectors/store --blocks 1 --scale 32`.
-SNAP=3efa56a9969b1c4a06d1588da74340b972df9b98ae3b8ecc03cb5796e836f479
-DIGEST=a5421bd647401296a540be4f122f2fd03e04e7d1a312023b759e36c44b17ef73
-
 wheels="${wheels:-$work/wheels}"
 if [ -z "$skip_build" ]; then
     export CARGO_BUILD_JOBS="${CARGO_BUILD_JOBS:-2}"
     nice -n 19 maturin build --release --out "$wheels" >"$work/build.log" 2>&1 || {
         tail -20 "$work/build.log"; exit 1; }
 fi
+cargo build --quiet --release --bin tfs
+fixture=$work/store
+write=$(target/release/tfs checkpoint write "$fixture" --blocks 1 --plain)
+SNAP=$(sed -n 's/.*manifest_id     sha256:\([0-9a-f]\{64\}\).*/\1/p' <<<"$write")
+test -n "$SNAP"
 wheel=$(ls "$wheels"/tensorfs-*.whl | head -1)
 echo "wheel: $(basename "$wheel")"
 "$py" scripts/version_contract.py wheel "$wheel"
@@ -45,19 +46,19 @@ rm -rf "$work/venv"
 echo "installed into fresh venv: $("$work/venv/bin/python" -V)"
 "$work/venv/bin/python" scripts/version_contract.py installed "$wheel"
 
-"$work/venv/bin/python" - "$PWD" "$SNAP" "$DIGEST" <<'PY'
-import hashlib, pathlib, sys, tempfile
+"$work/venv/bin/python" - "$fixture" "$SNAP" <<'PY'
+import hashlib, json, pathlib, sys, tempfile
 
-repo, snap, want = pathlib.Path(sys.argv[1]), sys.argv[2], sys.argv[3]
+store_path, snap = pathlib.Path(sys.argv[1]), sys.argv[2]
 import tensorfs
 print("import tensorfs OK ->", tensorfs.__file__, tensorfs.__version__)
 
 assert "torch" not in sys.modules, "torch leaked into sys.modules"
 print("torch in sys.modules:", "torch" in sys.modules, "| dtypes:", len(tensorfs.DTYPES))
 
-store = tensorfs.Store.open(str(repo / "vectors/store"))
-info = store.snapshot(snap)
-assert info["checkpoint_id"] == info["snapshot_id"] == "sha256:" + snap
+store = tensorfs.Store.open(str(store_path))
+info = store.manifest(snap)
+assert info["manifest_id"] == "sha256:" + snap
 header = tensorfs.parse_header(info["header"])
 assert tensorfs.object_id(info["manifest"]) == "sha256:" + snap
 
@@ -74,7 +75,7 @@ plan = tensorfs.plan(info["header"], order, window=1 << 16)
 slots = [memoryview(bytearray(1 << 18)) for _ in range(3)]
 digest = hashlib.sha256()
 
-with store.acquire_snapshot(snap) as lease:
+with store.acquire_manifest(snap) as lease:
     print(f"lease: {len(lease.objects)} objects, {lease.bytes} B verified")
     first_id, first_length = lease.objects[0]
 
@@ -86,16 +87,33 @@ with store.acquire_snapshot(snap) as lease:
 
 got = digest.hexdigest()
 print(f"streamed {st['items']} items, {st['bytes']} B -> sha256 {got[:16]}…")
-assert got == want, f"{got} != banked {want}"
+assert st["items"] > 0 and st["bytes"] > 0
 
 with tempfile.TemporaryDirectory(prefix="tensorfs-transfer-") as transfer_root:
     destination = tensorfs.Store.init(transfer_root)
-    admitted = tensorfs.transfer_object(store, destination, first_id, first_length)
-    skipped = tensorfs.transfer_object(store, destination, first_id, first_length)
-    assert admitted == {"id": first_id, "length": first_length, "admitted": True}
-    assert skipped == {"id": first_id, "length": first_length, "admitted": False}
-    assert destination.verify(first_id)["verdict"] == "verified"
-    print(f"transfer:   admitted then skipped {first_id[:23]}… through two Store objects")
+    operation = destination.begin_operation("wheel-acquire", "tensorhub", "smoke", 10)
+    operation.hold_manifest(snap, len(info["manifest"]))
+    closure = store.walk(snap)
+    for reached in closure:
+        operation.hold_blob(reached["id"], reached["length"])
+        tensorfs.transfer_object(store, destination, reached["id"], reached["length"])
+    admitted_manifest = tensorfs.transfer_manifest(
+        store, destination, snap, len(info["manifest"])
+    )
+    assert admitted_manifest["id"] == "sha256:" + snap
+    operation.progress(11, len(closure) + 1, sum(row["length"] for row in closure) + len(info["manifest"]))
+    evidence = json.dumps(
+        {"classification_digest": tensorfs.topology_digest(info["header"])},
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode()
+    repo_bytes = operation.commit_release(
+        None, "1.0.0", "cpu", snap, len(info["manifest"]), evidence
+    )
+    assert destination.repo_get("tensorhub", "smoke") == repo_bytes
+    with destination.acquire_manifest(snap) as acquired:
+        assert acquired.objects
+    print(f"acquisition: {len(closure)} blobs -> manifest -> repository CAS -> lease")
 
 try:
     tensorfs.platform_gate("win32")

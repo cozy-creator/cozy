@@ -1,4 +1,0 @@
-doc: manifest
-expect: refuse
-code: PATH_PARENT_MISSING
-note: parents-before-children

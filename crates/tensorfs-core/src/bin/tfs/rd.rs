@@ -10,11 +10,10 @@ use tensorfs_core::err::{Code, Refusal};
 use tensorfs_core::fill::{guard_block_granular, Class, Xform};
 use tensorfs_core::header::Header;
 use tensorfs_core::ids::ObjectRef;
-use tensorfs_core::manifest::{Draft, Entry, SnapshotManifest};
+use tensorfs_core::manifest::{Entry, Manifest};
 use tensorfs_core::meta::Meta;
 use tensorfs_core::project;
 use tensorfs_core::read::{self, ObjectRange, Order, PlanItem, ReadPlan, Source as ReadSource};
-use tensorfs_core::receipt::Receipts;
 use tensorfs_core::sha256::{self, Sha256};
 use tensorfs_core::store::Store;
 
@@ -29,13 +28,14 @@ macro_rules! ok {
     };
 }
 
-fn load(root: &Path, hex: &str) -> Result<(Store, SnapshotManifest, Header), Refusal> {
+fn load(root: &Path, hex: &str) -> Result<(Store, Manifest, Header), Refusal> {
     let s = Store::open(root)?;
+    let hex = hex.trim_start_matches("sha256:");
     let m = checkpoint::load_manifest(
         &s,
         &ObjectRef {
             sha256: hex.to_string(),
-            length: std::fs::metadata(s.object_path(hex))
+            length: std::fs::metadata(s.manifest_path(hex))
                 .map(|m| m.len())
                 .unwrap_or(0),
         },
@@ -63,8 +63,8 @@ pub fn cmd_lease(root: &Path, hex: &str, f: &Flags) -> ExitCode {
     let (s, m, _) = ok!(load(root, hex));
     let meta = ok!(Meta::open(&s));
     let t0 = Instant::now();
-    let (lease, rx) = ok!(read::acquire_snapshot(&s, &meta, &m));
-    println!("snapshot:   sha256:{hex}");
+    let (lease, rx) = ok!(read::acquire_manifest(&s, &meta, &m));
+    println!("manifest:   sha256:{hex}");
     println!("hold:       {}", lease.hold_id());
     println!(
         "verified:   {} objects, {} B in {} ms",
@@ -153,7 +153,7 @@ pub fn cmd_fill(root: &Path, hex: &str, f: &Flags) -> ExitCode {
     let plan = ok!(plan_of(&h, f));
     let workers: usize = flag_num(f, "workers", 4);
     let ring: u64 = flag_num(f, "ring", 256 << 20);
-    let (lease, mut rx) = ok!(read::acquire_snapshot(&s, &meta, &m));
+    let (lease, mut rx) = ok!(read::acquire_manifest(&s, &meta, &m));
     if flag_on(f, "direct") {
         // The caller asked for O_DIRECT and did not get it. tensorfs.md §4 keeps direct I/O
         // deliberately non-default and NEVER a silent fallback where unsupported — so the
@@ -162,7 +162,6 @@ pub fn cmd_fill(root: &Path, hex: &str, f: &Flags) -> ExitCode {
             "read_fill",
             "buffered-instead-of-direct",
             hex,
-            s.generation(),
             "O_DIRECT requested; the v1 buffered baselines are unbeaten and the page cache is \
              what makes warm reloads nearly free — served buffered"
                 .to_string(),
@@ -231,7 +230,7 @@ pub fn cmd_stream(root: &Path, hex: &str, f: &Flags) -> ExitCode {
     let workers: usize = flag_num(f, "workers", 4);
     let nslots: usize = flag_num(f, "slots", 4);
     let slot_bytes: usize = flag_num(f, "slot-bytes", 16 << 20);
-    let (lease, rx) = ok!(read::acquire_snapshot(&s, &meta, &m));
+    let (lease, rx) = ok!(read::acquire_manifest(&s, &meta, &m));
     rx.print();
 
     let mut owned: Vec<Vec<u8>> = (0..nslots).map(|_| vec![0u8; slot_bytes]).collect();
@@ -352,7 +351,7 @@ pub fn cmd_span(root: &Path, hex: &str, ck: [&str; 3], off: u64, len: u64) -> Ex
             return ExitCode::FAILURE;
         }
     };
-    let (lease, _) = ok!(read::acquire_snapshot(&s, &meta, &m));
+    let (lease, _) = ok!(read::acquire_manifest(&s, &meta, &m));
     let mut buf = vec![0u8; len as usize];
     let what = format!("{}/{}#{}", ck[0], ck[1], ck[2]);
     let r = read::read_part_into(&lease, &what, part, off, len, &mut buf);
@@ -365,42 +364,45 @@ pub fn cmd_span(root: &Path, hex: &str, ck: [&str; 3], off: u64, len: u64) -> Ex
 
 // ---------------------------------------------------------------- projection
 
-pub fn cmd_project(root: &Path, hex: &str, dest: &Path, f: &Flags) -> ExitCode {
+pub fn cmd_checkout(root: &Path, hex: &str, dest: &Path, f: &Flags) -> ExitCode {
     let (s, m, _) = ok!(load(root, hex));
-    let mut rx = Receipts::default();
-    let p = ok!(project::project_snapshot(
-        &s,
-        &m,
-        dest,
-        flag_on(f, "no-symlink"),
-        &mut rx
-    ));
+    let p = ok!(project::checkout(&s, &m, dest, flag_on(f, "no-symlink")));
     println!("dest:       {}", dest.display());
     println!(
-        "projected:  {} dirs, {} symlinks, {} copies, {} B",
+        "checkout:   {} dirs, {} symlinks, {} copies, {} B",
         p.dirs, p.links, p.copies, p.bytes
     );
-    println!("weights:    0 paths — a projected tree cannot carry one at any tier");
-    rx.print();
+    println!("cozytensors: omitted (header blobs are not conventional weight files)");
     ExitCode::SUCCESS
 }
 
-/// Tier 3 over a RETAINED carrier: the descriptor is derived from the caller's copy of the
-/// source, and every segment must already be in the store or the call refuses. Deriving the
-/// descriptor is not fetching the bytes — the stream comes from the CAS.
-pub fn cmd_materialize(root: &Path, src: &Path, dest: &Path) -> ExitCode {
+pub fn cmd_materialize(root: &Path, manifest: &str, path: &str, dest: &Path) -> ExitCode {
     let s = ok!(Store::open(root));
-    let bytes = match std::fs::read(src) {
-        Ok(b) => b,
-        Err(e) => {
-            eprintln!("REFUSED IO_FAILED: read {}: {e}", src.display());
+    let hex = manifest.trim_start_matches("sha256:");
+    let manifest_path = s.manifest_path(hex);
+    let length = ok!(std::fs::metadata(&manifest_path)
+        .map(|metadata| metadata.len())
+        .map_err(|error| Refusal {
+            code: Code::OBJECT_ABSENT,
+            detail: format!("manifest sha256:{hex} is absent: {error}"),
+        }));
+    let m = ok!(s.read_manifest(&ObjectRef {
+        sha256: hex.to_string(),
+        length
+    }));
+    let blob = match m.entries().iter().find(|(candidate, _)| candidate == path) {
+        Some((_, Entry::File(blob))) => blob,
+        Some((_, Entry::CozyTensors(_))) => {
+            eprintln!("REFUSED PROJECTION_WEIGHT_PATH: materialize selects ordinary files only");
+            return ExitCode::FAILURE;
+        }
+        None => {
+            eprintln!("REFUSED NOT_CONTAINED: manifest has no path {path:?}");
             return ExitCode::FAILURE;
         }
     };
-    let b = tensorfs_core::manifest::BlobDescriptor::of(&bytes);
-    drop(bytes);
     let t0 = Instant::now();
-    let n = ok!(project::materialize_blob(&s, "carrier", &b, dest));
+    let n = ok!(project::materialize(&s, blob, dest));
     println!(
         "materialized {n} B to {} in {} ms (O(one segment) resident, atomic)",
         dest.display(),
@@ -515,7 +517,7 @@ pub fn cmd_prove(root: &Path, hex: &str, f: &Flags) -> ExitCode {
     let (s, m, h) = ok!(load(root, hex));
     let meta = ok!(Meta::open(&s));
     let sample: usize = flag_num(f, "sample", 64);
-    let (lease, _) = ok!(read::acquire_snapshot(&s, &meta, &m));
+    let (lease, _) = ok!(read::acquire_manifest(&s, &meta, &m));
 
     let parts: Vec<(String, &tensorfs_core::header::Part)> = h
         .tensors()
@@ -625,7 +627,7 @@ pub fn cmd_swap(root: &Path, hex: &str) -> ExitCode {
         return ExitCode::FAILURE;
     }
 
-    let (lease, _) = ok!(read::acquire_snapshot(&s, &meta, &m));
+    let (lease, _) = ok!(read::acquire_manifest(&s, &meta, &m));
     let keep = std::fs::read(&path).unwrap_or_default();
 
     // The swap, as an attacker would install it: same length, different bytes, atomic
@@ -719,7 +721,7 @@ pub fn cmd_tear(root: &Path, hex: &str) -> ExitCode {
         return ExitCode::FAILURE;
     }
 
-    let (lease, _) = ok!(read::acquire_snapshot(&s, &meta, &m));
+    let (lease, _) = ok!(read::acquire_manifest(&s, &meta, &m));
     let keep = std::fs::read(&path).unwrap_or_default();
     let mut perms = md.permissions();
     std::os::unix::fs::PermissionsExt::set_mode(&mut perms, 0o644);
@@ -851,7 +853,7 @@ pub fn cmd_arms(root: &Path, hex: &str) -> ExitCode {
         fired: 0,
         missed: 0,
     };
-    let (lease, _) = ok!(read::acquire_snapshot(&s, &meta, &m));
+    let (lease, _) = ok!(read::acquire_manifest(&s, &meta, &m));
     let first = lease.objects()[0].clone();
 
     println!("read-path red arms, planted live:");
@@ -992,7 +994,7 @@ pub fn cmd_arms(root: &Path, hex: &str) -> ExitCode {
         read::plan_for_traversal(&h, &short, &all_components(&h), 1 << 20),
     );
 
-    // 5a-5d. COMPONENT-SCOPED COMPLETENESS (#570b). The scope moved from the snapshot to
+    // 5a-5d. COMPONENT-SCOPED COMPLETENESS (#570b). The scope moved from the manifest to
     // the declared component set; the hole it forbids did not move at all.
     let comps = all_components(&h);
     let one = comps[0].clone();
@@ -1064,32 +1066,7 @@ pub fn cmd_arms(root: &Path, hex: &str) -> ExitCode {
         guard_block_granular("qkv", 16, 32),
     );
 
-    // 7. a projected tree that tries to carry a weight path
-    let part = h
-        .tensors()
-        .flat_map(|(_, _, t)| t.parts.iter())
-        .flat_map(|(_, p)| p.segments())
-        .next()
-        .cloned();
-    match part {
-        None => println!("  SKIP   weight path: this checkpoint has no segmented part"),
-        Some(p) => {
-            let mut d = Draft::of(&m);
-            d.entries.push(("weights.bin".to_string(), Entry::File(p)));
-            d.entries.sort_by(|x, y| x.0.cmp(&y.0));
-            let planted = ok!(d.seal());
-            let tmp = std::env::temp_dir().join(format!("tfs-arm-project-{}", std::process::id()));
-            let mut rx = Receipts::default();
-            a.arm(
-                "projected tree carrying a weight path",
-                Code::PROJECTION_WEIGHT_PATH,
-                project::project_snapshot(&s, &planted, &tmp, false, &mut rx),
-            );
-            let _ = std::fs::remove_dir_all(&tmp);
-        }
-    }
-
-    // 8. a pretty twin is a projection, never a stored document
+    // 7. a pretty twin is a projection, never a stored document
     let hb = ok!(checkpoint::read_object(&s, m.header().unwrap(), 1 << 26));
     let pretty = ok!(project::render(&hb, 1 << 26));
     a.arm(
@@ -1103,27 +1080,14 @@ pub fn cmd_arms(root: &Path, hex: &str) -> ExitCode {
         &sha256::hex_digest(pretty.as_bytes())[..12]
     );
 
-    // 9. a lease removed from the authority behind the reader's back
-    let id = lease.hold_id().to_string();
-    ok!(meta.steal_hold(&id));
-    a.arm(
-        "stolen lease still serving",
-        Code::LEASE_REVOKED,
-        lease.recheck(&meta),
-    );
-    drop(lease);
+    ok!(lease.release(&meta));
 
-    // 10. materializing a carrier the store never retained
-    let fake = tensorfs_core::manifest::BlobDescriptor::of(b"a carrier this store has never seen");
+    // 8. materializing a carrier the store never retained
+    let fake = ObjectRef::of(b"a carrier this store has never seen");
     a.arm(
         "materialize a non-retained carrier",
-        Code::BLOB_NOT_RETAINED,
-        project::materialize_blob(
-            &s,
-            "absent",
-            &fake,
-            &std::env::temp_dir().join("tfs-arm-blob"),
-        ),
+        Code::OBJECT_ABSENT,
+        project::materialize(&s, &fake, &std::env::temp_dir().join("tfs-arm-blob")),
     );
 
     println!("\n{} fired, {} missed", a.fired, a.missed);

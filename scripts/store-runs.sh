@@ -10,7 +10,7 @@ SECTION=${1:-all}
 
 hr() { printf '\n===== %s =====\n' "$*"; }
 fresh() { rm -rf "$1"; mkdir -p "$1"; "$TFS" store init "$1" >/dev/null; }
-count_objects() { find "$1/objects" -type f 2>/dev/null | wc -l; }
+count_objects() { find "$1/blobs" -type f 2>/dev/null | wc -l; }
 
 # ---------------------------------------------------------------- crash injection
 
@@ -33,14 +33,14 @@ crash_section() {
     wait $pid 2>/dev/null
     local objs temps partial
     objs=$(count_objects "$S")
-    temps=$(find "$S/tmp" -type f | wc -l)
-    # A partial object is any file under objects/ whose name is not its own digest.
+    temps=$(find "$S/.tensorfs/tmp" -type f | wc -l)
+    # A partial blob is any file under blobs/ whose name is not its own digest.
     partial=0
     while read -r f; do
       [ -z "$f" ] && continue
       [ "$(sha256sum "$f" | cut -d' ' -f1)" = "$(basename "$f")" ] || partial=$((partial+1))
-    done < <(find "$S/objects" -type f)
-    local rec; rec=$([ -f "$S/verified/${want:0:2}/${want:2:2}/$want" ] && echo present || echo absent)
+    done < <(find "$S/blobs" -type f)
+    local rec; rec=$("$TFS" contains "$S" "$want" | sed -n 's/^record: *//p' | cut -d' ' -f1)
     # What a restarted filler concludes about this store, and whether it heals it.
     printf '%s %s %s\n' "$want" "$len" "$SRC" > "$S/plan"
     local resume; resume=$("$TFS" fill "$S" "$S/plan")
@@ -49,7 +49,7 @@ crash_section() {
     "$TFS" verify "$S" "$want" >/dev/null || echo "  !! post-resume verify FAILED at $stage"
     "$TFS" reap "$S" --max-age 0 >/dev/null
   done
-  echo "(partial = a file under objects/ whose bytes do not hash to its own name)"
+  echo "(partial = a file under blobs/ whose bytes do not hash to its own name)"
 }
 
 # ---------------------------------------------------------------- concurrent writers
@@ -69,14 +69,13 @@ race_section() {
   for p in "${pids[@]}"; do wait "$p"; done
   echo "admitted: $(grep -lc '^admitted' "$S"/racer.* 2>/dev/null | wc -l)"
   echo "present:  $(grep -l '^present'  "$S"/racer.* 2>/dev/null | wc -l)"
-  echo "objects under objects/: $(count_objects "$S")"
-  echo "verification records:   $(find "$S/verified" -type f | wc -l)"
+  echo "blobs under blobs/: $(count_objects "$S")"
   "$TFS" contains "$S" "$want"
   # Paranoid mode is DELETED (owner ruling 2026-08-25): a read rehashes when its record
   # is missing or stale, and `scrub --rate 1.0` is the deliberate full-rehash door.
   "$TFS" verify "$S" "$want"
   "$TFS" scrub "$S" --rate 1.0
-  echo "stored bytes match source: $(cmp -s "$SRC" "$S/objects/sha256/${want:0:2}/${want:2:2}/$want" && echo yes || echo NO)"
+  echo "stored bytes match source: $(cmp -s "$SRC" "$S/blobs/${want:0:2}/${want:2:2}/$want" && echo yes || echo NO)"
 }
 
 # ---------------------------------------------------------------- red arms
@@ -87,7 +86,7 @@ red_section() {
   head -c 4000000 /dev/urandom > "$SRC"
   local want; want=$(sha256sum "$SRC" | cut -d' ' -f1)
   local len; len=$(stat -c%s "$SRC")
-  local obj="$S/objects/sha256/${want:0:2}/${want:2:2}/$want"
+  local obj="$S/blobs/${want:0:2}/${want:2:2}/$want"
 
   hr "RED 1 — planted same-length corrupt object: contains true, verified read refuses"
   mkdir -p "$(dirname "$obj")"
@@ -96,19 +95,19 @@ red_section() {
   "$TFS" contains "$S" "$want"
   echo "--- a verified read refuses and quarantines ---"
   "$TFS" get "$S" "$want"; echo "get exit=$?"
-  echo "quarantine: $(ls "$S/quarantine")"
+  echo "quarantine: $(ls "$S/.tensorfs/quarantine")"
   "$TFS" verify "$S" "$want"; echo "verify exit=$?"
   echo "--- plant it again: resume must not skip it either ---"
-  rm -rf "${S:?}/quarantine"/*; mkdir -p "$(dirname "$obj")"
+  rm -rf "${S:?}/.tensorfs/quarantine"/*; mkdir -p "$(dirname "$obj")"
   head -c "$len" /dev/urandom > "$obj"; chmod 0444 "$obj"
   printf '%s %s %s\n' "$want" "$len" "$SRC" > "$S/plan"
   "$TFS" fill "$S" "$S/plan"; echo "fill exit=$?"
-  echo "quarantine: $(ls "$S/quarantine")"
+  echo "quarantine: $(ls "$S/.tensorfs/quarantine")"
   echo "healed and verified: $("$TFS" verify "$S" "$want")"
   echo "stored bytes match source: $(cmp -s "$SRC" "$obj" && echo yes || echo NO)"
 
   hr "RED 2 — mutate a verified inode: the record invalidates"
-  fresh "$S"; obj="$S/objects/sha256/${want:0:2}/${want:2:2}/$want"
+  fresh "$S"; obj="$S/blobs/${want:0:2}/${want:2:2}/$want"
   "$TFS" put "$S" "$SRC" >/dev/null
   "$TFS" contains "$S" "$want"
   echo "--- (a) same bytes, new inode+mtime (replace the file) ---"
@@ -119,26 +118,13 @@ red_section() {
   chmod 0644 "$obj"; printf 'X' | dd of="$obj" bs=1 seek=100 conv=notrunc status=none; chmod 0444 "$obj"
   "$TFS" contains "$S" "$want"
   "$TFS" get "$S" "$want"; echo "get exit=$?"
-  echo "quarantine: $(ls "$S/quarantine")"
+  echo "quarantine: $(ls "$S/.tensorfs/quarantine")"
 
-  hr "RED 3 — store generation bump invalidates every record wholesale"
-  fresh "$S"; "$TFS" put "$S" "$SRC" >/dev/null
-  "$TFS" contains "$S" "$want"
-  "$TFS" store bump "$S" | grep generation
-  "$TFS" contains "$S" "$want"
-  "$TFS" verify "$S" "$want"
-  "$TFS" contains "$S" "$want"
-
-  hr "RED 4 — planted v1-era root refuses to open as v2"
+  hr "RED 3 — a legacy v1 layout is not a current store"
   local V="$WORK/v1"; rm -rf "$V"; mkdir -p "$V/objects" "$V/refs"; : > "$V/metadata.sqlite3"
   "$TFS" store info "$V"; echo "exit=$?"
-  echo "--- and a root carrying an explicit v1 era marker ---"
-  local V2="$WORK/v1marker"; rm -rf "$V2"; mkdir -p "$V2"
-  printf '{"era":"v1","format":"tensorfs.store/1","generation":1,"object_hash":"sha256"}' > "$V2/store.json"
-  "$TFS" store info "$V2"; echo "exit=$?"
-
-  hr "RED 4b — a symlink planted at an object path is never followed"
-  fresh "$S"; obj="$S/objects/sha256/${want:0:2}/${want:2:2}/$want"
+  hr "RED 3b — a symlink planted at a blob path is never followed"
+  fresh "$S"; obj="$S/blobs/${want:0:2}/${want:2:2}/$want"
   mkdir -p "$(dirname "$obj")"; ln -s "$SRC" "$obj"
   echo "planted symlink: $(ls -l "$obj" | sed 's/.*-> /-> /')"
   echo "(the target holds exactly the right bytes — only the no-follow open refuses it)"
@@ -175,24 +161,24 @@ red_section() {
   local fpid=$!
   sleep 1.2; kill -9 $fpid; wait $fpid 2>/dev/null
   local done_n; done_n=$(grep -c '^put' "$S/fill.1")
-  echo "kill -9 mid-fill after $done_n objects; objects/ holds $(count_objects "$S")"
+  echo "kill -9 mid-fill after $done_n blobs; blobs/ holds $(count_objects "$S")"
   echo "--- now plant a same-length corrupt object for a NOT-yet-filled entry ---"
   local last; last=$(tail -1 "$S/plan" | cut -d' ' -f1)
   local llen; llen=$(tail -1 "$S/plan" | cut -d' ' -f2)
-  mkdir -p "$S/objects/sha256/${last:0:2}/${last:2:2}"
-  head -c "$llen" /dev/urandom > "$S/objects/sha256/${last:0:2}/${last:2:2}/$last"
-  chmod 0444 "$S/objects/sha256/${last:0:2}/${last:2:2}/$last"
+  mkdir -p "$S/blobs/${last:0:2}/${last:2:2}"
+  head -c "$llen" /dev/urandom > "$S/blobs/${last:0:2}/${last:2:2}/$last"
+  chmod 0444 "$S/blobs/${last:0:2}/${last:2:2}/$last"
   echo "--- resume ---"
   "$TFS" fill "$S" "$S/plan"; echo "fill exit=$?"
-  echo "quarantine: $(ls "$S/quarantine")"
+  echo "quarantine: $(ls "$S/.tensorfs/quarantine")"
   hr "RED 6b — scrub finds a planted corruption at rate 1.0 and quarantines it"
   local first; first=$(head -1 "$S/plan" | cut -d' ' -f1)
   local flen; flen=$(head -1 "$S/plan" | cut -d' ' -f2)
-  chmod 0644 "$S/objects/sha256/${first:0:2}/${first:2:2}/$first"
-  head -c "$flen" /dev/urandom > "$S/objects/sha256/${first:0:2}/${first:2:2}/$first"
-  chmod 0444 "$S/objects/sha256/${first:0:2}/${first:2:2}/$first"
+  chmod 0644 "$S/blobs/${first:0:2}/${first:2:2}/$first"
+  head -c "$flen" /dev/urandom > "$S/blobs/${first:0:2}/${first:2:2}/$first"
+  chmod 0444 "$S/blobs/${first:0:2}/${first:2:2}/$first"
   "$TFS" scrub "$S" --rate 1.0; echo "scrub exit=$?"
-  echo "quarantine now: $(ls "$S/quarantine" | tr '\n' ' ')"
+  echo "quarantine now: $(ls "$S/.tensorfs/quarantine" | tr '\n' ' ')"
   echo "--- the same store at a partial rate (one knob) ---"
   "$TFS" scrub "$S" --rate 0.25 --pass 7
 
@@ -203,7 +189,7 @@ red_section() {
   # descriptor. Both halves of the old window are armed here.
 
   hr "RED 7 — replace the pathname MID-READ: the descriptor pins the inode"
-  fresh "$S"; obj="$S/objects/sha256/${want:0:2}/${want:2:2}/$want"
+  fresh "$S"; obj="$S/blobs/${want:0:2}/${want:2:2}/$want"
   "$TFS" put "$S" "$SRC" >/dev/null
   head -c "$len" /dev/urandom > "$WORK/forged"
   echo "forged twin: $(stat -c%s "$WORK/forged") bytes — exactly the length the record binds"
@@ -233,14 +219,14 @@ red_section() {
   echo "(the fd pins the inode: the swap is not caught, it is INERT)"
 
   hr "RED 7b — the same replacement landing BEFORE the open: refused and quarantined"
-  fresh "$S"; obj="$S/objects/sha256/${want:0:2}/${want:2:2}/$want"
+  fresh "$S"; obj="$S/blobs/${want:0:2}/${want:2:2}/$want"
   "$TFS" put "$S" "$SRC" >/dev/null
   "$TFS" verify "$S" "$want"
   chmod 0644 "$obj"; cp "$WORK/forged" "$WORK/forged.stage"; mv "$WORK/forged.stage" "$obj"
   chmod 0444 "$obj"
   echo "same length, different bytes, new inode — the record's only unbound field is content"
   "$TFS" get "$S" "$want" > /dev/null; echo "get exit=$?"
-  echo "quarantine: $(ls "$S/quarantine")"
+  echo "quarantine: $(ls "$S/.tensorfs/quarantine")"
 }
 
 case "$SECTION" in

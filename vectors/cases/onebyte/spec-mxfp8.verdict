@@ -1,3 +1,0 @@
-doc: spec
-expect: mutant
-note: one byte flipped at offset 336 of sha256:d16296b28ddfc0813d713e1e245cbd06cbff7d71dc90347cd1ac3cb7efc1f92d

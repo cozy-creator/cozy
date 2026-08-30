@@ -1,3 +1,3 @@
 doc: header
 expect: mutant
-note: one byte flipped at offset 82 of sha256:4ecdc988b29dce7d473c3245531a405fc21fb0c195335ef47671dc0c7e831f79
+note: one byte flipped at offset 242 of sha256:797bfee78612aec9312a352e8cf16c938a92927254a6f51baf13d64b690f3fdd

@@ -11,11 +11,10 @@ use std::io::{Read, Write};
 use crate::dtype::{checked_bytes, Dtype};
 use crate::err::{refuse, Code, Refusal, Result};
 use crate::header::{Body, Closure, Header, Located, Part};
-use crate::ids::{Doc, ObjectRef};
+use crate::ids::ObjectRef;
 use crate::limits;
-use crate::manifest::{BlobDescriptor, SnapshotManifest};
+use crate::manifest::Manifest;
 use crate::sha256::{self, Sha256};
-use crate::spec::EncodingSpec;
 use crate::store::{Fault, Store};
 
 fn io(what: impl AsRef<str>, e: std::io::Error) -> Refusal {
@@ -77,6 +76,17 @@ pub fn objectize<R: Read>(
     shape: Vec<u64>,
     src: &mut R,
 ) -> Result<Written> {
+    objectize_held(store, what, dtype, shape, src, None)
+}
+
+pub fn objectize_held<R: Read>(
+    store: &Store,
+    what: &str,
+    dtype: Dtype,
+    shape: Vec<u64>,
+    src: &mut R,
+    operation: Option<&str>,
+) -> Result<Written> {
     let want = checked_bytes(what, &shape, dtype)?;
     let mut h = Sha256::new();
 
@@ -107,7 +117,7 @@ pub fn objectize<R: Read>(
             r: (&mut *src).take(n),
             h: &mut h,
         };
-        let put = store.put_stream(&mut t, None, &Fault::default())?;
+        let put = store.put_stream_held(&mut t, None, &Fault::default(), operation)?;
         if put.obj.length != n {
             return refuse(
                 Code::LENGTH_MISMATCH,
@@ -249,63 +259,16 @@ pub fn load_header(store: &Store, r: &ObjectRef) -> Result<Header> {
 /// The closure the header's `encodings` list names. An absent spec object is state (3) of
 /// cozytensors.md §4 — it cannot install as self-describing at all.
 pub fn load_closure(store: &Store, h: &Header) -> Result<Closure> {
+    let _ = store;
     let mut c = Closure::default();
-    for r in &h.encodings {
-        c.insert(EncodingSpec::parse(&read_object(
-            store,
-            r,
-            limits::SPEC_MAX_BYTES,
-        )?)?);
+    for spec in &h.encodings {
+        c.insert(spec.clone());
     }
     Ok(c)
 }
 
-pub fn load_manifest(store: &Store, r: &ObjectRef) -> Result<SnapshotManifest> {
-    SnapshotManifest::parse(&read_object(store, r, limits::DOC_MAX_BYTES)?)
-}
-
-// ------------------------------------------------------------------ blobs
-
-/// A blob's whole digest is its file identity; the ordered segment list is its read plan.
-/// Both are checked: a repaired or swapped segment under an unchanged `whole_sha256` is
-/// exactly the failure this verifies away.
-pub fn read_blob<W: Write>(store: &Store, what: &str, b: &BlobDescriptor, w: &mut W) -> Result<()> {
-    let mut h = Sha256::new();
-    let mut total = 0u64;
-    for (i, s) in b.segments.iter().enumerate() {
-        let mut t = TeeW { w, h: &mut h };
-        let n = store.read_into(&s.sha256, &mut t)?;
-        if n != s.length {
-            return refuse(
-                Code::LENGTH_MISMATCH,
-                format!(
-                    "{what}: segment {i} delivered {n} B, its record promised {}",
-                    s.length
-                ),
-            );
-        }
-        total = total.checked_add(n).ok_or_else(|| Refusal {
-            code: Code::ARITH_OVERFLOW,
-            detail: format!("{what}: blob length overflows"),
-        })?;
-    }
-    let got = sha256::hex(&h.finish());
-    if total != b.logical_size {
-        return refuse(
-            Code::BYTE_LENGTH_MISMATCH,
-            format!("{what}: {total} B read, logical_size {}", b.logical_size),
-        );
-    }
-    if got != b.whole_sha256 {
-        return refuse(
-            Code::WHOLE_DIGEST_MISMATCH,
-            format!(
-                "{what}: segments reassemble to sha256:{got}, the descriptor claims sha256:{}",
-                b.whole_sha256
-            ),
-        );
-    }
-    Ok(())
+pub fn load_manifest(store: &Store, r: &ObjectRef) -> Result<Manifest> {
+    store.read_manifest(r)
 }
 
 /// Stream one model-runtime asset in declared segment order and verify its logical whole.
@@ -356,75 +319,12 @@ pub fn read_asset<W: Write>(
 ///
 /// One writer, two consumers (the synthetic checkpoint plane and the ingest border) — the
 /// alternative is two spellings of one tree, which `walk` would then have to forgive.
-pub fn build_snapshot(
-    header: &Header,
-    href: &ObjectRef,
-    closure: &Closure,
-) -> Result<SnapshotManifest> {
+pub fn build_manifest(header: &Header, href: &ObjectRef, _closure: &Closure) -> Result<Manifest> {
     let mut entries: Vec<(String, crate::manifest::Entry)> = vec![(
         "model.cozytensors".to_string(),
-        crate::manifest::Entry::File(href.clone()),
+        crate::manifest::Entry::CozyTensors(href.clone()),
     )];
-    let mut contained: Vec<(String, crate::manifest::Entry)> = Vec::new();
-    for r in &header.encodings {
-        contained.push((
-            crate::manifest::closure_path(&r.sha256),
-            crate::manifest::Entry::File(r.clone()),
-        ));
-        if let Some(v) = closure.get(&r.id()).and_then(|s| s.vectors.clone()) {
-            contained.push((
-                crate::manifest::closure_path(&v.sha256),
-                crate::manifest::Entry::File(v),
-            ));
-        }
-    }
-    if !contained.is_empty() {
-        entries.push((
-            crate::manifest::CLOSURE_DIR.to_string(),
-            crate::manifest::Entry::Dir,
-        ));
-        entries.extend(contained);
-    }
-    let mut assets = Vec::new();
-    for (_, asset) in &header.assets {
-        for segment in &asset.segments {
-            assets.push((
-                crate::manifest::asset_path(&segment.sha256),
-                crate::manifest::Entry::File(segment.clone()),
-            ));
-        }
-    }
-    assets.sort_by(|a, b| a.0.cmp(&b.0));
-    if let Some(pair) = assets
-        .windows(2)
-        .find(|pair| pair[0].0 == pair[1].0 && pair[0].1 != pair[1].1)
-    {
-        let (left, right) = match (&pair[0].1, &pair[1].1) {
-            (crate::manifest::Entry::File(left), crate::manifest::Entry::File(right)) => {
-                (left, right)
-            }
-            _ => unreachable!("asset closure contains only files"),
-        };
-        return refuse(
-            Code::LENGTH_MISMATCH,
-            format!(
-                "asset object {} is declared at conflicting lengths {} and {}",
-                left.id(),
-                left.length,
-                right.length
-            ),
-        );
-    }
-    assets.dedup_by(|a, b| a == b);
-    if !assets.is_empty() {
-        entries.push((
-            crate::manifest::ASSET_DIR.to_string(),
-            crate::manifest::Entry::Dir,
-        ));
-        entries.extend(assets);
-    }
     for (name, c) in &header.configs {
-        entries.push((name.clone(), crate::manifest::Entry::Dir));
         entries.push((
             format!("{name}/config.json"),
             crate::manifest::Entry::File(ObjectRef {
@@ -436,11 +336,7 @@ pub fn build_snapshot(
     entries.sort_by(|a, b| a.0.cmp(&b.0));
     // Two specs may cite the SAME vector set: one object, one path, listed once.
     entries.dedup_by(|a, b| a.0 == b.0);
-    crate::manifest::Draft {
-        header: Some(href.clone()),
-        entries,
-    }
-    .seal()
+    crate::manifest::Draft { entries }.seal()
 }
 
 // ------------------------------------------------------------------ the transitive root
@@ -482,7 +378,7 @@ impl Walk {
     /// Every reached object PRESENT in the store, or the first absent one as a refusal.
     /// The walk itself proves containment (the manifest lists what the header reaches);
     /// this proves residency — `install`'s gate (tfs-020), so a root can never commit
-    /// over missing objects. A partially fetched snapshot legitimately fails this; it is
+    /// over missing objects. A partially fetched manifest legitimately fails this; it is
     /// an install precondition, not a walk invariant.
     pub fn require_resident(&self, store: &Store) -> Result<()> {
         for r in self.distinct() {
@@ -490,7 +386,7 @@ impl Walk {
                 return refuse(
                     Code::OBJECT_ABSENT,
                     format!(
-                        "{} is committed by this snapshot but absent from the store — \
+                        "{} is committed by this manifest but absent from the store — \
                          refusing to install a root over missing objects",
                         r.id()
                     ),
@@ -501,18 +397,18 @@ impl Walk {
     }
 }
 
-/// SnapshotManifest → CozyTensorsHeader → contained tensor rules → storage-part object runs.
-/// Reaches every and only the objects this snapshot commits, and refuses when a reference
-/// the header makes is not CONTAINED in the snapshot that carries it.
-pub fn walk(store: &Store, snap: &SnapshotManifest) -> Result<Walk> {
-    // The path law already ran: a SnapshotManifest cannot exist unvalidated (manifest.rs).
+/// Manifest → CozyTensorsHeader → contained tensor rules → storage-part object runs.
+/// Reaches every and only the objects this manifest commits, and refuses when a reference
+/// the header makes is not CONTAINED in the manifest that carries it.
+pub fn walk(store: &Store, snap: &Manifest) -> Result<Walk> {
+    // The path law already ran: a Manifest cannot exist unvalidated (manifest.rs).
     let mut w = Walk::default();
     let href = match snap.header() {
         Some(h) => h.clone(),
         None => {
             return refuse(
                 Code::ATTACHMENT_CARDINALITY,
-                "not a checkpoint snapshot: no cozytensors header attachment",
+                "not a checkpoint manifest: no cozytensors header attachment",
             )
         }
     };
@@ -522,39 +418,11 @@ pub fn walk(store: &Store, snap: &SnapshotManifest) -> Result<Walk> {
     });
     let header = load_header(store, &href)?;
 
-    // Every contained document must be listed, and content-addressed ones at their digest.
-    let contained = |kind: &'static str, r: &ObjectRef, addressed: bool| -> Result<()> {
-        let want = crate::manifest::closure_path(&r.sha256);
-        let paths = snap.listings(r);
-        if addressed {
-            if paths != [want.as_str()] {
-                return refuse(
-                    Code::NOT_CONTAINED,
-                    format!(
-                        "{kind} {} resolves to {paths:?}, not exactly one {want:?}",
-                        r.id()
-                    ),
-                );
-            }
-        } else if paths.len() != 1 {
-            return refuse(
-                Code::NOT_CONTAINED,
-                format!(
-                    "{kind} {} is listed at {} paths, not 1",
-                    r.id(),
-                    paths.len()
-                ),
-            );
-        }
-        Ok(())
-    };
-
     for (name, c) in &header.configs {
         let r = ObjectRef {
             sha256: c.sha256.clone(),
             length: c.length,
         };
-        contained("config", &r, false)?;
         let _ = name;
         w.objects.push(Reached {
             kind: "config",
@@ -563,36 +431,12 @@ pub fn walk(store: &Store, snap: &SnapshotManifest) -> Result<Walk> {
     }
 
     let mut closure = Closure::default();
-    for r in &header.encodings {
-        contained("EncodingSpec", r, true)?;
-        let spec = EncodingSpec::parse(&read_object(store, r, limits::SPEC_MAX_BYTES)?)?;
-        if let Some(v) = &spec.vectors {
-            contained("EncodingVectors", v, true)?;
-            w.objects.push(Reached {
-                kind: "vectors",
-                obj: v.clone(),
-            });
-        }
-        w.objects.push(Reached {
-            kind: "spec",
-            obj: r.clone(),
-        });
-        closure.insert(spec);
+    for spec in &header.encodings {
+        closure.insert(spec.clone());
     }
 
     for (_, asset) in &header.assets {
         for segment in &asset.segments {
-            let want = crate::manifest::asset_path(&segment.sha256);
-            let paths = snap.listings(segment);
-            if paths != [want.as_str()] {
-                return refuse(
-                    Code::NOT_CONTAINED,
-                    format!(
-                        "model asset segment {} resolves to {paths:?}, not exactly one {want:?}",
-                        segment.id()
-                    ),
-                );
-            }
             w.objects.push(Reached {
                 kind: "model_asset",
                 obj: segment.clone(),
@@ -633,29 +477,9 @@ pub fn walk(store: &Store, snap: &SnapshotManifest) -> Result<Walk> {
         .map(|r| (r.obj.sha256.clone(), r.obj.length))
         .collect();
     for (path, e) in snap.entries() {
-        let contained_ns = [crate::manifest::CLOSURE_DIR, crate::manifest::ASSET_DIR]
-            .iter()
-            .any(|dir| {
-                path.strip_prefix(dir)
-                    .and_then(|r| r.strip_prefix('/'))
-                    .is_some()
-            });
         match e {
-            crate::manifest::Entry::Dir => {}
             crate::manifest::Entry::File(o) => {
                 if !accounted.contains(&(o.sha256.clone(), o.length)) {
-                    if contained_ns {
-                        return refuse(
-                            Code::NOT_CONTAINED,
-                            format!(
-                                "{path:?}: an orphan under {}/ — {} is reached by no header \
-                                 reference, so the checkpoint does not commit the document \
-                                 the path claims it does",
-                                crate::manifest::CLOSURE_DIR,
-                                o.id()
-                            ),
-                        );
-                    }
                     w.siblings.push(path.clone());
                     w.objects.push(Reached {
                         kind: "asset",
@@ -663,15 +487,7 @@ pub fn walk(store: &Store, snap: &SnapshotManifest) -> Result<Walk> {
                     });
                 }
             }
-            crate::manifest::Entry::Blob(b) => {
-                w.siblings.push(path.clone());
-                for s in &b.segments {
-                    w.objects.push(Reached {
-                        kind: "blob",
-                        obj: s.clone(),
-                    });
-                }
-            }
+            crate::manifest::Entry::CozyTensors(_) => {}
         }
     }
     Ok(w)

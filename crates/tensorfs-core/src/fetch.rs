@@ -1,7 +1,5 @@
-//! The fetch/admit plane (tfs-003 row 220, cr-016's `pull`) — cloud.rs run backwards.
-//!
-//! `cloud.rs` is bytes LEAVING: the store already holds the truth, so a grant only has to
-//! bind the upload to it. This is bytes ARRIVING, and the asymmetry is the whole design:
+//! The fetch/admit plane (tfs-003 row 220, cr-016's `pull`). Bytes are ARRIVING, and
+//! nothing about arriving bytes is known until the last one is hashed, so:
 //! nothing about arriving bytes is known until the last one is hashed, so the authorization
 //! is an EXPECTATION and the thing that enforces it is `Store::put_stream` — a streaming,
 //! bounded-buffer, no-clobber door that commits at the digest it computed or commits
@@ -25,15 +23,42 @@
 
 use crate::canon::{self, as_arr, Fields, Value};
 use crate::err::{refuse, Code, Result};
-use crate::ids::{ascii_name, hex64, ObjectRef};
+use crate::ids::{ascii_name, hex64, Doc, ObjectRef};
 use crate::limits;
 use crate::store::{Store, Verdict};
 use std::io::Read;
 
-/// Where an object lives in a content-addressed backend. Deliberately the SAME derivation
-/// `cloud::final_key` publishes at: if pull and publish ever computed different keys, one of
-/// them would be writing where nobody reads.
-pub use crate::cloud::final_key;
+pub fn parse_refs_jsonl(bytes: &[u8]) -> Result<Vec<ObjectRef>> {
+    let mut result = Vec::new();
+    for line in bytes
+        .split(|byte| *byte == b'\n')
+        .filter(|line| !line.is_empty())
+    {
+        let value = canon::parse_canonical(line, 16 * 1024)?;
+        let mut fields = Fields::new("FetchRef", &value)?;
+        let length = fields.req_uint("length")?;
+        let sha256 = hex64("FetchRef.sha256", fields.req_str("sha256")?)?;
+        fields.done()?;
+        result.push(ObjectRef { sha256, length });
+    }
+    if result.is_empty() {
+        return refuse(Code::MISSING_FIELD, "fetch refs are empty");
+    }
+    if result
+        .windows(2)
+        .any(|pair| pair[0].sha256 >= pair[1].sha256)
+    {
+        return refuse(
+            Code::SORT_ORDER,
+            "fetch refs must be strictly sorted and unique by digest",
+        );
+    }
+    Ok(result)
+}
+
+pub fn final_key(sha256: &str) -> Result<String> {
+    crate::storage::blob_key(sha256)
+}
 
 // ---------------------------------------------------------------- the plan
 
@@ -74,7 +99,7 @@ impl Presence {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FetchPlan {
     pub session: String,
-    pub snapshot: ObjectRef,
+    pub manifest: ObjectRef,
     /// Sorted unique by digest. Present and trustworthy: NOT fetched.
     pub held: Vec<ObjectRef>,
     /// Sorted unique by digest. The only objects a grant may be minted for.
@@ -87,10 +112,11 @@ impl FetchPlan {
     pub fn of(
         store: &Store,
         session: &str,
-        snapshot: &ObjectRef,
+        manifest: &ObjectRef,
         declared: &[ObjectRef],
     ) -> Result<(FetchPlan, Vec<(ObjectRef, Presence)>)> {
         ascii_name("FetchPlan.session", session, limits::MAX_NAME_BYTES)?;
+        validate_manifest_ref(manifest)?;
         if declared.is_empty() {
             return refuse(
                 Code::MISSING_FIELD,
@@ -108,24 +134,20 @@ impl FetchPlan {
                  bytes this pull moves",
             );
         }
-        // THE ROOT IS PART OF THE PULL. A publish closure lists what the snapshot REACHES
-        // and carries the snapshot beside it, because the publisher already holds the
-        // manifest. A puller does not: landing every reachable object without the manifest
-        // produces a store full of bytes and no artifact, and `snapshot verify` in the
-        // destination says OBJECT_ABSENT for the very digest that was asked for. Observed on
-        // the first live pull, and fixed here rather than in each caller — a rule every
-        // transport adapter has to remember separately is a rule one of them will forget.
-        if !sorted.iter().any(|o| o.sha256 == snapshot.sha256) {
-            sorted.push(snapshot.clone());
-            sorted.sort_by(|a, b| a.sha256.cmp(&b.sha256));
+        if !sorted.iter().any(|object| object.sha256 == manifest.sha256) {
+            sorted.push(manifest.clone());
+            sorted.sort_by(|left, right| left.sha256.cmp(&right.sha256));
         }
-
         let mut held = Vec::new();
         let mut wanted = Vec::new();
         let mut why = Vec::new();
         for o in sorted {
             hex64("FetchPlan.object", &o.sha256)?;
-            let p = presence(store, &o)?;
+            let p = if o.sha256 == manifest.sha256 {
+                manifest_presence(store, &o)?
+            } else {
+                presence(store, &o)?
+            };
             if p.held() {
                 held.push(o.clone());
             } else {
@@ -136,7 +158,7 @@ impl FetchPlan {
         Ok((
             FetchPlan {
                 session: session.to_string(),
-                snapshot: snapshot.clone(),
+                manifest: manifest.clone(),
                 held,
                 wanted,
             },
@@ -163,8 +185,28 @@ impl FetchPlan {
     /// This is deliberately not "the transfer reported success": a 200 on every GET says the
     /// remote answered, and says nothing about what is on this disk.
     pub fn complete(&self, store: &Store) -> Result<()> {
+        let manifest = store.read_manifest(&self.manifest)?;
+        let reached = crate::checkpoint::walk(store, &manifest)?;
+        let mut declared: Vec<ObjectRef> = self.held.iter().chain(&self.wanted).cloned().collect();
+        declared
+            .sort_by(|left, right| (&left.sha256, left.length).cmp(&(&right.sha256, right.length)));
+        let mut actual: Vec<ObjectRef> = reached.distinct().into_iter().cloned().collect();
+        actual.push(self.manifest.clone());
+        actual
+            .sort_by(|left, right| (&left.sha256, left.length).cmp(&(&right.sha256, right.length)));
+        if declared != actual {
+            return refuse(
+                Code::NOT_CONTAINED,
+                "fetch plan blob set differs from the admitted manifest closure",
+            );
+        }
         for o in self.held.iter().chain(self.wanted.iter()) {
-            if !presence(store, o)?.held() {
+            let resident = if o.sha256 == self.manifest.sha256 {
+                manifest_presence(store, o)?
+            } else {
+                presence(store, o)?
+            };
+            if !resident.held() {
                 return refuse(
                     Code::DURABILITY_UNPROVEN,
                     format!(
@@ -176,6 +218,18 @@ impl FetchPlan {
             }
         }
         Ok(())
+    }
+}
+
+fn manifest_presence(store: &Store, object: &ObjectRef) -> Result<Presence> {
+    match store.read_manifest(object) {
+        Ok(_) => Ok(Presence::Recorded),
+        Err(error) if error.code == Code::OBJECT_ABSENT => Ok(Presence::Absent),
+        Err(error) => {
+            let why = error.to_string();
+            store.quarantine_manifest(&object.sha256)?;
+            Ok(Presence::Quarantined { why })
+        }
     }
 }
 
@@ -210,7 +264,8 @@ impl FetchPlan {
             held.push(ObjectRef::from_value("FetchPlan.held", o)?);
         }
         let session = f.req_str("session")?.to_string();
-        let snapshot = ObjectRef::from_value("FetchPlan.snapshot", f.req("snapshot")?)?;
+        let manifest = ObjectRef::from_value("FetchPlan.manifest", f.req("manifest")?)?;
+        validate_manifest_ref(&manifest)?;
         let mut wanted = Vec::new();
         for o in as_arr("FetchPlan", "wanted", f.req("wanted")?)? {
             wanted.push(ObjectRef::from_value("FetchPlan.wanted", o)?);
@@ -234,7 +289,7 @@ impl FetchPlan {
         }
         Ok(FetchPlan {
             session,
-            snapshot,
+            manifest,
             held,
             wanted,
         })
@@ -247,13 +302,31 @@ impl FetchPlan {
                 Value::arr(self.held.iter().map(|o| o.to_value()).collect()),
             ),
             ("session", Value::str(self.session.clone())),
-            ("snapshot", self.snapshot.to_value()),
+            ("manifest", self.manifest.to_value()),
             (
                 "wanted",
                 Value::arr(self.wanted.iter().map(|o| o.to_value()).collect()),
             ),
         ])
     }
+}
+
+fn validate_manifest_ref(manifest: &ObjectRef) -> Result<()> {
+    if manifest.length == 0 || manifest.length > crate::manifest::Manifest::MAX_BYTES as u64 {
+        return refuse(
+            Code::SIZE_CAP,
+            format!(
+                "manifest length {} is outside 1..={}",
+                manifest.length,
+                crate::manifest::Manifest::MAX_BYTES
+            ),
+        );
+    }
+    usize::try_from(manifest.length).map_err(|_| crate::err::Refusal {
+        code: Code::SIZE_CAP,
+        detail: "manifest length exceeds this platform's address space".into(),
+    })?;
+    Ok(())
 }
 
 // ---------------------------------------------------------------- the grant
@@ -269,6 +342,7 @@ impl FetchPlan {
 pub struct DeliveryGrant {
     pub session: String,
     pub object: ObjectRef,
+    pub manifest: bool,
 }
 
 impl DeliveryGrant {
@@ -306,13 +380,19 @@ impl DeliveryGrant {
             Some(o) => Ok(DeliveryGrant {
                 session: plan.session.clone(),
                 object: o.clone(),
+                manifest: o.sha256 == plan.manifest.sha256,
             }),
         }
     }
 
     /// DERIVED, not stored — the same key publish wrote to.
     pub fn key(&self) -> String {
-        final_key(&self.object.sha256)
+        if self.manifest {
+            crate::storage::manifest_key(&self.object.sha256)
+                .expect("DeliveryGrant carries a validated digest")
+        } else {
+            final_key(&self.object.sha256).expect("DeliveryGrant carries a validated digest")
+        }
     }
 
     /// THE DOOR. Every byte this system pulls from anywhere crosses exactly this call:
@@ -322,11 +402,168 @@ impl DeliveryGrant {
     ///
     /// `r` is whatever the transport adapter opened. This plane neither knows nor asks.
     pub fn admit<R: Read>(&self, store: &Store, r: &mut R) -> Result<Admitted> {
-        let put = store.put_stream(r, Some(&self.object), &Default::default())?;
+        let put = if self.manifest {
+            validate_manifest_ref(&self.object)?;
+            let capacity =
+                usize::try_from(self.object.length).map_err(|_| crate::err::Refusal {
+                    code: Code::SIZE_CAP,
+                    detail: "manifest length exceeds this platform's address space".into(),
+                })?;
+            let mut bytes = Vec::with_capacity(capacity);
+            r.take(self.object.length.saturating_add(1))
+                .read_to_end(&mut bytes)
+                .map_err(|error| crate::err::Refusal {
+                    code: Code::IO_FAILED,
+                    detail: format!("read manifest body: {error}"),
+                })?;
+            if ObjectRef::of(&bytes) != self.object {
+                return refuse(
+                    Code::OBJECT_ID_MISMATCH,
+                    "fetched manifest bytes disagree with the plan",
+                );
+            }
+            let manifest = crate::manifest::Manifest::parse(&bytes)?;
+            store.put_manifest(&manifest)?
+        } else {
+            store.put_stream(r, Some(&self.object), &Default::default())?
+        };
         Ok(Admitted {
             object: put.obj,
             first_writer: put.admitted,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::dtype::Dtype;
+    use crate::header::{Closure, Header, Part, Tensor};
+    use crate::manifest::{Draft, Entry, Manifest};
+    use crate::registry;
+    use crate::store::Fault;
+    use std::fs;
+
+    fn temporary(name: &str) -> std::path::PathBuf {
+        std::env::temp_dir().join(format!(
+            "tensorfs-fetch-{name}-{}-{}",
+            std::process::id(),
+            crate::meta::now_nanos_unique()
+        ))
+    }
+
+    fn fixture(root: &std::path::Path) -> (Store, ObjectRef, ObjectRef, Vec<u8>) {
+        let store = Store::init(root).unwrap();
+        let spec = registry::seeds()
+            .into_iter()
+            .find(|seed| seed.alias == "plain/1")
+            .unwrap()
+            .spec;
+        let header = Header {
+            configs: Vec::new(),
+            assets: Vec::new(),
+            encodings: vec![spec.clone()],
+            components: vec![(
+                "model".into(),
+                vec![(
+                    "weight".into(),
+                    Tensor {
+                        dtype: Dtype::F32,
+                        shape: vec![1],
+                        encoding: spec.object_id(),
+                        parts: vec![("value".into(), Part::plan(Dtype::F32, vec![1], &[0; 4]))],
+                    },
+                )],
+            )],
+        };
+        header.validate(&Closure::default()).unwrap();
+        let header_bytes = header.canonical_bytes().unwrap();
+        let header_ref = store
+            .put_stream(
+                &mut header_bytes.as_slice(),
+                Some(&ObjectRef::of(&header_bytes)),
+                &Fault::default(),
+            )
+            .unwrap()
+            .obj;
+        let manifest = Draft {
+            entries: vec![(
+                "model.cozytensors".into(),
+                Entry::CozyTensors(header_ref.clone()),
+            )],
+        }
+        .seal()
+        .unwrap();
+        let manifest_bytes = manifest.canonical_bytes();
+        let manifest_ref = store.put_manifest(&manifest).unwrap().obj;
+        (store, manifest_ref, header_ref, manifest_bytes)
+    }
+
+    #[test]
+    fn manifest_length_cap_refuses_before_allocation() {
+        let root = temporary("cap");
+        let store = Store::init(&root).unwrap();
+        let manifest = ObjectRef {
+            sha256: "11".repeat(32),
+            length: Manifest::MAX_BYTES as u64 + 1,
+        };
+        assert_eq!(
+            FetchPlan::of(&store, "pull", &manifest, &[ObjectRef::of(b"blob")],)
+                .unwrap_err()
+                .code,
+            Code::SIZE_CAP
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn corrupt_manifest_is_quarantined_and_readmitted_without_touching_blobs() {
+        let root = temporary("repair");
+        let (store, manifest, header, manifest_bytes) = fixture(&root);
+        let path = store.manifest_path(&manifest.sha256);
+        let mut permissions = fs::metadata(&path).unwrap().permissions();
+        std::os::unix::fs::PermissionsExt::set_mode(&mut permissions, 0o644);
+        fs::set_permissions(&path, permissions).unwrap();
+        fs::write(&path, vec![b'x'; manifest.length as usize]).unwrap();
+
+        let (plan, why) =
+            FetchPlan::of(&store, "repair", &manifest, std::slice::from_ref(&header)).unwrap();
+        assert!(matches!(
+            why.iter()
+                .find(|(object, _)| object == &manifest)
+                .unwrap()
+                .1,
+            Presence::Quarantined { .. }
+        ));
+        assert!(!path.exists());
+        assert!(store.blob_path(&header.sha256).exists());
+        let grant = DeliveryGrant::mint(&plan, &manifest).unwrap();
+        grant.admit(&store, &mut manifest_bytes.as_slice()).unwrap();
+        plan.complete(&store).unwrap();
+        assert!(root.join(".tensorfs/quarantine/manifests").is_dir());
+
+        let second = temporary("oversized-body");
+        let destination = Store::init(&second).unwrap();
+        let (plan, _) = FetchPlan::of(
+            &destination,
+            "oversized",
+            &manifest,
+            std::slice::from_ref(&header),
+        )
+        .unwrap();
+        let grant = DeliveryGrant::mint(&plan, &manifest).unwrap();
+        let mut oversized = manifest_bytes;
+        oversized.push(b'x');
+        assert_eq!(
+            grant
+                .admit(&destination, &mut oversized.as_slice())
+                .unwrap_err()
+                .code,
+            Code::OBJECT_ID_MISMATCH
+        );
+        assert!(!destination.manifest_path(&manifest.sha256).exists());
+        let _ = fs::remove_dir_all(root);
+        let _ = fs::remove_dir_all(second);
     }
 }
 
@@ -349,17 +586,31 @@ impl DeliveryGrant {
 
     pub fn from_value(v: &Value) -> Result<Self> {
         let mut f = Fields::new("DeliveryGrant", v)?;
+        let kind = f.req_str("kind")?;
+        let manifest = match kind {
+            "blob" => false,
+            "manifest" => true,
+            _ => return refuse(Code::UNKNOWN_FIELD, "grant kind must be blob or manifest"),
+        };
         let object = ObjectRef::from_value("DeliveryGrant.object", f.req("object")?)?;
         let session = f.req_str("session")?.to_string();
         f.done()?;
         ascii_name("DeliveryGrant.session", &session, limits::MAX_NAME_BYTES)?;
-        Ok(DeliveryGrant { session, object })
+        Ok(DeliveryGrant {
+            session,
+            object,
+            manifest,
+        })
     }
 
     pub fn to_value(&self) -> Value {
         // `key` is deliberately ABSENT for the same reason `PublishGrant` omits it: a
         // derivable fact stored beside its source is a second authority waiting to disagree.
         Value::obj(vec![
+            (
+                "kind",
+                Value::str(if self.manifest { "manifest" } else { "blob" }),
+            ),
             ("object", self.object.to_value()),
             ("session", Value::str(self.session.clone())),
         ])

@@ -68,7 +68,7 @@ codes![
     OPTIONAL_ROLE_FORBIDDEN,
     UNKNOWN_RELATION,
     VECTORS_REQUIRED,
-    // snapshot manifest
+    // manifest
     PATH_ILLEGAL,
     PATH_ORDER,
     PATH_PARENT_MISSING,
@@ -169,6 +169,12 @@ codes![
     SNAPSHOT_PINNED,
     STORE_BUSY,
     DURABILITY_UNPROVEN,
+    // repository graph
+    REPOSITORY_FULL,
+    REPOSITORY_CONFLICT,
+    REPOSITORY_ABSENT,
+    RELEASE_CONFLICT,
+    RELEASE_ABSENT,
 ];
 
 #[derive(Debug, Clone)]

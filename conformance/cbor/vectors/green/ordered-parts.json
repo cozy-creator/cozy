@@ -18,6 +18,6 @@
     ]
   ],
   "configs": [],
-  "encodings": [["sha256:1111111111111111111111111111111111111111111111111111111111111111", 470]],
+  "encodings": [{"logical_dtypes":["bf16"],"roles":{"value":{"carrier":{"t":"same_as_logical"},"shape":{"t":"same"}}}}],
   "format": "cozytensors/1"
 }

@@ -10,13 +10,12 @@
 //!   `run`                spawns an ISOLATED child. The parent never parses the carrier.
 //!   `ingest-worker`      the hermetic child: it parses, converts, writes candidates under
 //!                        an expiring quarantine root, and emits a receipt. It cannot
-//!                        install a snapshot and it has no network stack linked into it.
+//!                        install a manifest and it has no network stack linked into it.
 //!   `install`            the COORDINATOR's act. It consumes the receipt, verifies the
 //!                        binding, walks the tree, and alone promotes one root.
 //!   `reap`               what happens to everything that never reached `install`.
 //!
-//! A candidate is never a checkpoint. That is the whole design, and `roots/` is the only
-//! place the difference is visible.
+//! A candidate is never a release. Its quarantine session is the visible difference.
 
 use std::fs;
 use std::io::Read;
@@ -28,7 +27,7 @@ use tensorfs_core::canon::{self, Value};
 use tensorfs_core::checkpoint as ck;
 use tensorfs_core::dtype::Dtype;
 use tensorfs_core::header::{topology_digest_of, topology_value};
-use tensorfs_core::ids::{ConfigRef, Doc, ObjectRef};
+use tensorfs_core::ids::{ConfigRef, ObjectRef, Plain};
 use tensorfs_core::ingest::carrier::{self, SourceHeader};
 use tensorfs_core::ingest::convert::{self, Class, Converter, Effect, Plan, Rekey, Source, Target};
 use tensorfs_core::ingest::fingerprint::{self, Banked, Fingerprint, FingerprintRegistry};
@@ -36,6 +35,7 @@ use tensorfs_core::ingest::stamp::{self, Stamp};
 use tensorfs_core::ingest::transaction::{self as tx, SourceFile};
 use tensorfs_core::ingest::{Evidence, IngestProfile, IngestSubject, IngestVerificationReceipt};
 use tensorfs_core::limits;
+use tensorfs_core::manifest::{Draft, Entry};
 use tensorfs_core::registry;
 use tensorfs_core::spec::EncodingSpec;
 use tensorfs_core::store::Store;
@@ -926,7 +926,7 @@ pub fn cmd_worker(root: &Path, target: &str, f: &Flags) -> ExitCode {
     let store = ok!(Store::init(root));
 
     // The root goes down FIRST. From this line on the session is reapable whatever happens.
-    let mut ingest_root = ok!(tx::open_root(&store, &session, &tenant, ttl));
+    let (mut ingest_root, _operation_writer) = ok!(tx::open_root(&store, &session, &tenant, ttl));
 
     // Configs are sidecar bytes the header commits BY REFERENCE.
     let mut configs: Vec<(String, ConfigRef)> = Vec::new();
@@ -948,10 +948,11 @@ pub fn cmd_worker(root: &Path, target: &str, f: &Flags) -> ExitCode {
                 return ExitCode::FAILURE;
             }
         };
-        let put = ok!(store.put_stream(
+        let put = ok!(store.put_stream_held(
             &mut bytes.as_slice(),
             Some(&ObjectRef::of(&bytes)),
-            &Default::default()
+            &Default::default(),
+            Some(&session),
         ));
         configs.push((
             name.to_string(),
@@ -970,19 +971,19 @@ pub fn cmd_worker(root: &Path, target: &str, f: &Flags) -> ExitCode {
     println!("golden       {golden} cases reassembled bit-for-bit");
 
     let predicted = topology_digest_of(&plan_topology(&p.plan));
-    // A spec's `vectors` reference must resolve INSIDE the closure it ships with, so the
-    // vector documents are admitted before the header that will name them.
+    // Qualification fixtures are build data, not model-store objects.
     for (_, seed) in &p.seeds {
         if let Some(v) = &seed.vectors {
-            ok!(ck::put_doc(&store, v));
+            ok!(v.check(&seed.spec));
         }
     }
-    let out = ok!(tx::execute(
+    let mut out = ok!(tx::execute(
         &store,
         &p.plan,
         &p.files,
         &plain_specs(&p.seeds),
-        &configs
+        &configs,
+        &session,
     ));
     let got = out.header.topology_digest();
     if got != predicted {
@@ -1022,10 +1023,11 @@ pub fn cmd_worker(root: &Path, target: &str, f: &Flags) -> ExitCode {
             }),
         ),
     ]));
-    let recipe = ok!(store.put_stream(
+    let recipe = ok!(store.put_stream_held(
         &mut recipe_bytes.as_slice(),
         Some(&ObjectRef::of(&recipe_bytes)),
-        &Default::default()
+        &Default::default(),
+        Some(&session),
     ))
     .obj;
     let build = tensorfs_core::ids::object_id(
@@ -1047,7 +1049,16 @@ pub fn cmd_worker(root: &Path, target: &str, f: &Flags) -> ExitCode {
         max_tensors: limits::MAX_TENSORS as u64,
     };
     ok!(profile.validate(&registry::platform_digests()));
-    let profile_ref = ok!(ck::put_doc(&store, &profile));
+    let profile_ref = profile.object_ref();
+
+    let mut manifest = Draft::of(&out.manifest);
+    manifest.entries.push((
+        "evidence/converter-recipe".to_string(),
+        Entry::File(recipe.clone()),
+    ));
+    manifest.entries.sort_by(|left, right| left.0.cmp(&right.0));
+    out.manifest = ok!(manifest.seal());
+    out.manifest_ref = ok!(store.put_manifest_held(&out.manifest, Some(&session))).obj;
 
     let subject = IngestSubject {
         profile: profile_ref,
@@ -1059,18 +1070,17 @@ pub fn cmd_worker(root: &Path, target: &str, f: &Flags) -> ExitCode {
             .map(|(sf, raw)| (source_digest(&sf.header, raw), 1u64))
             .collect(),
         proposed_header: out.header_ref.clone(),
-        // The candidate set is EVERY AND ONLY what the snapshot reaches. Stamp re-walks it
+        // The candidate set is EVERY AND ONLY what the manifest reaches. Stamp re-walks it
         // and refuses on any difference, so a hand-written short list would simply fail.
-        candidates: ok!(ck::walk(&store, &out.snapshot))
+        candidates: ok!(ck::walk(&store, &out.manifest))
             .distinct()
             .into_iter()
             .cloned()
             .collect(),
     };
-    let subject_ref = ok!(ck::put_doc(&store, &subject));
+    let subject_ref = subject.object_ref();
 
     let isolation_tier: u64 = flag_num(f, "isolation-tier", 1);
-    let mut out = out;
     out.obs
         .push(("source_bytes".to_string(), profile.max_source_bytes as i64));
     out.obs.push(("golden_cases".to_string(), golden as i64));
@@ -1117,18 +1127,33 @@ pub fn cmd_worker(root: &Path, target: &str, f: &Flags) -> ExitCode {
             pin: &registry::platform_digests(),
         }
     ));
-    let stamp_ref = ok!(ck::put_doc(&store, &stamped.stamp));
+    let stamp_ref = stamped.stamp.object_ref();
     let receipt = stamped.receipt;
-    let receipt_ref = ok!(ck::put_doc(&store, &receipt));
+    let receipt_ref = receipt.object_ref();
 
     ingest_root.candidates = vec![
         out.header_ref.clone(),
-        out.snapshot_ref.clone(),
+        out.manifest_ref.clone(),
         subject_ref,
         stamp_ref.clone(),
         receipt_ref.clone(),
     ];
-    ok!(tx::write_root(store.root(), &ingest_root));
+    let accepted_bytes = ingest_root
+        .candidates
+        .iter()
+        .map(|candidate| candidate.length)
+        .sum();
+    ok!(
+        tensorfs_core::catalog::Catalog::open(store.root()).and_then(|catalog| {
+            catalog.progress(
+                &session,
+                tx::now_secs(),
+                ingest_root.candidates.len() as u64,
+                accepted_bytes,
+            )
+        })
+    );
+    ok!(tx::write_session(store.root(), &ingest_root));
     let dir = tx::quarantine_dir(store.root(), &session);
     for (name, bytes) in [
         ("receipt.json", receipt.canonical_bytes()),
@@ -1146,7 +1171,7 @@ pub fn cmd_worker(root: &Path, target: &str, f: &Flags) -> ExitCode {
         println!("  {k:<36} {v}");
     }
     println!("candidate    header {}", out.header_ref.id());
-    println!("candidate    snapshot {}", out.snapshot_ref.id());
+    println!("candidate    manifest {}", out.manifest_ref.id());
     println!("stamp        {}", stamp_ref.id());
     println!("  topology   {}", stamped.stamp.topology_digest);
     println!("  candidates {}", stamped.stamp.candidate_set);
@@ -1276,7 +1301,7 @@ pub fn cmd_reingest(root: &Path, header_hex: &str, target: &str, f: &Flags) -> E
 
     let session = flag(f, "session").unwrap_or("reingest").to_string();
     let tenant = flag(f, "tenant").unwrap_or("dev").to_string();
-    let mut ingest_root = ok!(tx::open_root(
+    let (mut ingest_root, _operation_writer) = ok!(tx::open_root(
         &store,
         &session,
         &tenant,
@@ -1287,10 +1312,11 @@ pub fn cmd_reingest(root: &Path, header_hex: &str, target: &str, f: &Flags) -> E
         &plan,
         &[],
         &plain_specs(&seeds),
-        &header.configs
+        &header.configs,
+        &session,
     ));
-    ingest_root.candidates = vec![out.header_ref.clone(), out.snapshot_ref.clone()];
-    ok!(tx::write_root(store.root(), &ingest_root));
+    ingest_root.candidates = vec![out.header_ref.clone(), out.manifest_ref.clone()];
+    ok!(tx::write_session(store.root(), &ingest_root));
 
     for k in [
         "bytes_hashed",
@@ -1313,7 +1339,7 @@ pub fn cmd_reingest(root: &Path, header_hex: &str, target: &str, f: &Flags) -> E
         }
     );
     println!("candidate    header {}", out.header_ref.id());
-    println!("candidate    snapshot {}", out.snapshot_ref.id());
+    println!("candidate    manifest {}", out.manifest_ref.id());
     println!(
         "in {:.1} ms, peak RSS {:.1} MiB",
         t0.elapsed().as_secs_f64() * 1000.0,
@@ -1324,17 +1350,25 @@ pub fn cmd_reingest(root: &Path, header_hex: &str, target: &str, f: &Flags) -> E
 
 // ------------------------------------------------------------------ install / reap
 
-/// The coordinator's act. Nothing else in this binary writes `roots/`.
-pub fn cmd_install(root: &Path, session: &str) -> ExitCode {
+/// The coordinator's act. Nothing else turns a quarantine session into a repository release.
+pub fn cmd_install(
+    root: &Path,
+    session: &str,
+    org: &str,
+    name: &str,
+    version: &str,
+    lane: &str,
+) -> ExitCode {
     let store = ok!(Store::open(root));
     let dir = tx::quarantine_dir(store.root(), session);
     let read = |n: &str| fs::read(dir.join(n));
-    let (rb, sb, tb) = match (
+    let (rb, sb, tb, pb) = match (
         read("receipt.json"),
         read("subject.json"),
         read("stamp.json"),
+        read("profile.json"),
     ) {
-        (Ok(a), Ok(b), Ok(c)) => (a, b, c),
+        (Ok(a), Ok(b), Ok(c), Ok(d)) => (a, b, c, d),
         _ => {
             eprintln!(
                 "REFUSED ROOT_ABSENT: no candidate {session:?} — reaped, never created, or \
@@ -1346,12 +1380,32 @@ pub fn cmd_install(root: &Path, session: &str) -> ExitCode {
     let receipt = ok!(IngestVerificationReceipt::parse(&rb));
     let subject = ok!(IngestSubject::parse(&sb));
     let stamp_doc = ok!(Stamp::parse(&tb));
-    let snap = ok!(ck::load_manifest(&store, &receipt.snapshot));
+    let profile = ok!(IngestProfile::parse(&pb));
+    let snap = ok!(ck::load_manifest(&store, &receipt.manifest));
     let header = ok!(ck::load_header(&store, &receipt.header));
-    let id = ok!(tx::install(
-        &store, session, &receipt, &subject, &snap, &header, &stamp_doc
+    let repo = ok!(tensorfs_core::repository::RepositoryName::new(org, name));
+    let _operation_writer = ok!(tx::resume_operation(
+        &store,
+        session,
+        &receipt.manifest,
+        &snap,
     ));
-    println!("installed    {id}");
+    let id = ok!(tx::install(
+        &store,
+        tx::Install {
+            session,
+            receipt: &receipt,
+            subject: &subject,
+            manifest: &snap,
+            header: &header,
+            stamp: &stamp_doc,
+            profile: &profile,
+            repo,
+            version,
+            lane,
+        },
+    ));
+    println!("installed    {id} as {org}/{name} {version} {lane}");
     println!("             from receipt {}", receipt.object_ref().id());
     ExitCode::SUCCESS
 }
@@ -1369,7 +1423,7 @@ pub fn cmd_reap(root: &Path, f: &Flags) -> ExitCode {
         println!("reaped       {g}");
     }
     println!(
-        "{} reaped, {} live, {} installed checkpoints (unchanged by reaping)",
+        "{} reaped, {} live, {} released manifests (unchanged by reaping)",
         gone.len(),
         kept.len(),
         tx::installed(&store).len()
@@ -1377,17 +1431,21 @@ pub fn cmd_reap(root: &Path, f: &Flags) -> ExitCode {
     ExitCode::SUCCESS
 }
 
-pub fn cmd_roots(root: &Path) -> ExitCode {
+pub fn cmd_sessions(root: &Path) -> ExitCode {
     let store = ok!(Store::open(root));
     let installed = tx::installed(&store);
     for i in &installed {
-        println!("installed    sha256:{i}");
+        println!("manifest     sha256:{i}");
     }
     let (_, live) = ok!(tx::reap(&store, 0));
     for s in &live {
-        println!("candidate    {s} (quarantined — not a checkpoint)");
+        println!("candidate    {s} (quarantined — not a release)");
     }
-    println!("{} installed, {} candidates", installed.len(), live.len());
+    println!(
+        "{} released manifests, {} candidate sessions",
+        installed.len(),
+        live.len()
+    );
     ExitCode::SUCCESS
 }
 
@@ -1526,16 +1584,16 @@ pub fn cmd_restamp(root: &Path, session: &str, flags: &Flags) -> ExitCode {
     let receipt = ok!(IngestVerificationReceipt::parse(&rb));
 
     // The outcome, reconstructed from the store rather than remembered: the header and
-    // snapshot are objects, and the accounting rode the receipt.
+    // manifest are objects, and the accounting rode the receipt.
     let header = ok!(ck::load_header(&store, &subject.proposed_header));
     let closure = ok!(ck::load_closure(&store, &header));
-    let snapshot = ok!(ck::load_manifest(&store, &receipt.snapshot));
+    let manifest = ok!(ck::load_manifest(&store, &receipt.manifest));
     let mut out = tx::Outcome {
         header_ref: subject.proposed_header.clone(),
-        snapshot_ref: receipt.snapshot.clone(),
+        manifest_ref: receipt.manifest.clone(),
         header,
         closure,
-        snapshot,
+        manifest,
         obs: receipt.observations.clone(),
     };
     let mut evidence = receipt.evidence.clone();
@@ -1577,7 +1635,7 @@ pub fn cmd_restamp(root: &Path, session: &str, flags: &Flags) -> ExitCode {
         "profile-bytes" => profile.max_tensors += 1,
         "structure" => {
             // One tensor's logical shape moved: the header no longer projects the topology
-            // the profile pinned, and the snapshot no longer describes what is in the store.
+            // the profile pinned, and the manifest no longer describes what is in the store.
             if let Some((_, ts)) = out.header.components.first_mut() {
                 if let Some((_, t)) = ts.first_mut() {
                     t.shape.push(1);

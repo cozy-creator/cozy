@@ -21,8 +21,8 @@
     ["transformer", "sha256:4444444444444444444444444444444444444444444444444444444444444444", 81, "application/json"]
   ],
   "encodings": [
-    ["sha256:1111111111111111111111111111111111111111111111111111111111111111", 470],
-    ["sha256:2222222222222222222222222222222222222222222222222222222222222222", 512]
+    {"logical_dtypes":["bf16"],"roles":{"value":{"carrier":{"t":"same_as_logical"},"shape":{"t":"same"}}}},
+    {"doc":"second","logical_dtypes":["bf16"],"roles":{"value":{"carrier":{"t":"same_as_logical"},"shape":{"t":"same"}}}}
   ],
   "format": "cozytensors/1"
 }

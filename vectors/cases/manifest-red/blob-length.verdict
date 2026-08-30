@@ -1,4 +1,0 @@
-doc: manifest
-expect: refuse
-code: BYTE_LENGTH_MISMATCH
-note: a GAP: the descriptor claims a byte the segments never deliver

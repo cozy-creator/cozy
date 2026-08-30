@@ -1,4 +1,0 @@
-doc: spec
-expect: refuse
-code: MISSING_FIELD
-note: dims relations require a pinned logical rank

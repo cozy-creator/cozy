@@ -1,4 +1,4 @@
 doc: manifest
 expect: refuse
 code: MISSING_FIELD
-note: a snapshot with nothing in it
+note: a manifest lists at least one path

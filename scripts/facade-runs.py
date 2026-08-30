@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """tfs-007 — the Python facade, run live against real stores.
 
-    scripts/facade-runs.py arms    <store> <snapshot>   typed refusals across the boundary
-    scripts/facade-runs.py real    <store> <snapshot>   lease + verified full read + digest
-    scripts/facade-runs.py bench   <store> <snapshot>   the facade / interim-reader sweep
+    scripts/facade-runs.py arms    <store> <manifest>   typed refusals across the boundary
+    scripts/facade-runs.py real    <store> <manifest>   lease + verified full read + digest
+    scripts/facade-runs.py bench   <store> <manifest>   the facade / interim-reader sweep
 
 No test framework, no asserts-as-tests: every line below drives a real store and prints
 what actually happened (tracker README #160).
@@ -50,7 +50,7 @@ def construction_order(header: dict[str, Any]) -> list[tuple[str, str]]:
 def evict(store: str) -> tuple[int, int]:
     """posix_fadvise(DONTNEED) — no passwordless sudo on this box for drop_caches."""
     n = b = 0
-    for p in (pathlib.Path(store) / "objects/sha256").rglob("*"):
+    for p in (pathlib.Path(store) / "blobs").rglob("*"):
         if not p.is_file():
             continue
         fd = os.open(p, os.O_RDONLY)
@@ -64,11 +64,11 @@ def evict(store: str) -> tuple[int, int]:
     return n, b
 
 
-def load(store_path: str, snapshot: str) -> tuple[Any, dict[str, Any], bytes]:
+def load(store_path: str, manifest: str) -> tuple[Any, dict[str, Any], bytes]:
     store = tensorfs.Store.open(store_path)
-    snap = store.snapshot(snapshot)
-    header = tensorfs.parse_header(snap["header"])
-    return store, header, snap["header"]
+    observed = store.manifest(manifest)
+    header = tensorfs.parse_header(observed["header"])
+    return store, header, observed["header"]
 
 
 # --------------------------------------------------------------------------- streaming
@@ -172,13 +172,13 @@ def open_interim(store_path: str) -> Any:
 
 
 def cmd_real(a: argparse.Namespace) -> int:
-    store, header, header_bytes = load(a.store, a.snapshot)
-    print(f"store:      {store.root} era={store.era} generation={store.generation}")
+    store, header, header_bytes = load(a.store, a.manifest)
+    print(f"store:      {store.root}")
     order = construction_order(header)
     print(f"traversal:  {len(order)} tensors in module order, first {order[0][1]}")
 
     t0 = time.perf_counter()
-    lease = store.acquire_snapshot(a.snapshot)
+    lease = store.acquire_manifest(a.manifest)
     ms = (time.perf_counter() - t0) * 1000
     print(
         f"lease:      {len(lease.objects)} objects, {lease.bytes} B verified in {ms:.0f} ms, "
@@ -227,7 +227,7 @@ def cmd_real(a: argparse.Namespace) -> int:
 
 
 def cmd_bench(a: argparse.Namespace) -> int:
-    store, header, header_bytes = load(a.store, a.snapshot)
+    store, header, header_bytes = load(a.store, a.manifest)
     order = construction_order(header)
     plan = tensorfs.plan(header_bytes, order, window=a.window)
     print(f"# {plan.io_bytes} B disk leg, window {a.window} B, slot {a.slot_bytes} B, {a.slots} slots")
@@ -241,7 +241,7 @@ def cmd_bench(a: argparse.Namespace) -> int:
                     evict(a.store)
                 t0 = time.perf_counter()
                 if arm == "facade":
-                    lease = store.acquire_snapshot(a.snapshot)
+                    lease = store.acquire_manifest(a.manifest)
                     acq = time.perf_counter() - t0
                     t0 = time.perf_counter()
                     stream_facade(lease, plan, a.slot_bytes, a.slots, depth, None)
@@ -252,7 +252,7 @@ def cmd_bench(a: argparse.Namespace) -> int:
                     # against `facade` is the marshal boundary and nothing else.
                     acq = 0.0
                     out = subprocess.run(
-                        [str(TFS), "read", "stream", a.store, a.snapshot,
+                        [str(TFS), "read", "stream", a.store, a.manifest,
                          "--workers", str(depth), "--slots", str(a.slots),
                          "--slot-bytes", str(a.slot_bytes), "--window", str(a.window),
                          "--no-digest"],
@@ -306,10 +306,10 @@ class Arms:
 def cmd_arms(a: argparse.Namespace) -> int:
     work = pathlib.Path(a.work)
     arms = Arms()
-    store, header, header_bytes = load(a.store, a.snapshot)
+    store, header, header_bytes = load(a.store, a.manifest)
     order = construction_order(header)
     plan = tensorfs.plan(header_bytes, order, window=a.window)
-    lease = store.acquire_snapshot(a.snapshot)
+    lease = store.acquire_manifest(a.manifest)
     first = lease.objects[0]
 
     # ---- the in-place claim, proved rather than asserted -------------------------
@@ -401,7 +401,7 @@ def cmd_arms(a: argparse.Namespace) -> int:
     shutil.copytree(a.store, corrupt)
     victim = tensorfs.Store.open(str(corrupt))
     oid = lease.objects[1][0].removeprefix("sha256:")
-    path = pathlib.Path(str(corrupt)) / "objects/sha256" / oid[:2] / oid[2:4] / oid
+    path = pathlib.Path(str(corrupt)) / "blobs" / oid[:2] / oid[2:4] / oid
     path.chmod(0o644)
     with open(path, "r+b") as f:
         f.seek(0)
@@ -411,7 +411,7 @@ def cmd_arms(a: argparse.Namespace) -> int:
     arms.arm(
         "an object whose bytes disagree with its id",
         "OBJECT_CORRUPT",
-        lambda: victim.acquire_snapshot(a.snapshot),
+        lambda: victim.acquire_manifest(a.manifest),
     )
 
     # Truncation UNDER a live lease: admission passed, the bytes left afterwards.
@@ -419,10 +419,10 @@ def cmd_arms(a: argparse.Namespace) -> int:
     shutil.rmtree(torn, ignore_errors=True)
     shutil.copytree(a.store, torn)
     tstore = tensorfs.Store.open(str(torn))
-    tlease = tstore.acquire_snapshot(a.snapshot)
+    tlease = tstore.acquire_manifest(a.manifest)
     toid = tlease.objects[1][0].removeprefix("sha256:")
     tlen = tlease.objects[1][1]
-    tpath = pathlib.Path(str(torn)) / "objects/sha256" / toid[:2] / toid[2:4] / toid
+    tpath = pathlib.Path(str(torn)) / "blobs" / toid[:2] / toid[2:4] / toid
     tpath.chmod(0o644)
     os.truncate(tpath, max(tlen - 512, 0))
     arms.arm(
@@ -434,7 +434,7 @@ def cmd_arms(a: argparse.Namespace) -> int:
 
     # The hold, stolen from the authority behind the reader's back.
     stolen = tensorfs.Store.open(a.store)
-    slease = stolen.acquire_snapshot(a.snapshot)
+    slease = stolen.acquire_manifest(a.manifest)
     subprocess.run([str(TFS), "hold", "steal", a.store, slease.hold_id], check=True,
                    capture_output=True)
     arms.arm("a lease the authority no longer knows", "LEASE_REVOKED", slease.recheck)
@@ -462,7 +462,7 @@ def cmd_arms(a: argparse.Namespace) -> int:
     arms.arm(
         "a manifest read as a header",
         "UNKNOWN_FORMAT",
-        lambda: tensorfs.parse_header(store.snapshot(a.snapshot)["manifest"]),
+        lambda: tensorfs.parse_header(store.manifest(a.manifest)["manifest"]),
     )
     arms.arm(
         "an unknown document kind",
@@ -488,7 +488,7 @@ def main() -> int:
     for name in ("real", "bench", "arms"):
         s = sub.add_parser(name)
         s.add_argument("store")
-        s.add_argument("snapshot")
+        s.add_argument("manifest")
         s.add_argument("--window", type=int, default=4 << 20)
         s.add_argument("--slot-bytes", type=int, default=16 << 20)
         s.add_argument("--slots", type=int, default=4)

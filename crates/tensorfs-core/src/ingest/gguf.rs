@@ -3,7 +3,7 @@
 //!
 //! This is not a second ingest door and it does not widen the first one. `carrier::sniff`
 //! still refuses `GGUF_REFUSED` on the normal path, and nothing in this file can produce a
-//! candidate, a receipt or a snapshot. What it produces is a PLAN — a statement of the two
+//! candidate, a receipt or a manifest. What it produces is a PLAN — a statement of the two
 //! views a lane gets and of exactly which tensors the platform can and cannot describe:
 //!
 //! 1. the RETAINED CARRIER BLOB — the whole `.gguf` as one opaque CAS object, which is

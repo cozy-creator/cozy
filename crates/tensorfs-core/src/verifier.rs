@@ -25,7 +25,7 @@ use crate::compat::{CodeTopology, CompatibilityReport, Lane};
 use crate::err::{refuse, Code, Result};
 use crate::grade::{self, ConversionRegistration, GradeDecision, Registry};
 use crate::header::{Closure, Header};
-use crate::ids::{check_format, object_id, prefixed, Doc};
+use crate::ids::{object_id, prefixed, Plain};
 use crate::limits;
 use crate::spec::EncodingSpec;
 
@@ -51,17 +51,11 @@ pub struct VerifyRequest {
     pub known_markers: Vec<String>,
 }
 
-impl Doc for VerifyRequest {
-    const FORMAT: &'static str = "tensorfs.verify_request/1";
+impl Plain for VerifyRequest {
     const MAX_BYTES: usize = limits::DOC_MAX_BYTES;
 
     fn from_value(v: &Value) -> Result<Self> {
         let mut f = Fields::new("VerifyRequest", v)?;
-        check_format(
-            "VerifyRequest",
-            as_str("VerifyRequest", "format", f.req("format")?)?,
-            Self::FORMAT,
-        )?;
         let closure = b64_list("closure", f.req("closure")?)?;
         let code_topology = b64::decode(f.req_str("code_topology")?)?;
         let header = b64::decode(f.req_str("header")?)?;
@@ -102,7 +96,6 @@ impl Doc for VerifyRequest {
                 "code_topology",
                 Value::str(b64::encode(&self.code_topology)),
             ),
-            ("format", Value::str(Self::FORMAT)),
             ("header", Value::str(b64::encode(&self.header))),
             (
                 "known_markers",
@@ -140,17 +133,11 @@ pub struct VerifyResponse {
     pub verifier_build: String,
 }
 
-impl Doc for VerifyResponse {
-    const FORMAT: &'static str = "tensorfs.verify_response/1";
+impl Plain for VerifyResponse {
     const MAX_BYTES: usize = limits::DOC_MAX_BYTES;
 
     fn from_value(v: &Value) -> Result<Self> {
         let mut f = Fields::new("VerifyResponse", v)?;
-        check_format(
-            "VerifyResponse",
-            as_str("VerifyResponse", "format", f.req("format")?)?,
-            Self::FORMAT,
-        )?;
         let decision = b64::decode(f.req_str("decision")?)?;
         let report = b64::decode(f.req_str("report")?)?;
         let request = prefixed("VerifyResponse.request", f.req_str("request")?)?;
@@ -167,7 +154,6 @@ impl Doc for VerifyResponse {
     fn to_value(&self) -> Value {
         Value::obj(vec![
             ("decision", Value::str(b64::encode(&self.decision))),
-            ("format", Value::str(Self::FORMAT)),
             ("report", Value::str(b64::encode(&self.report))),
             ("request", Value::str(self.request.clone())),
             ("verifier_build", Value::str(self.verifier_build.clone())),
@@ -184,7 +170,7 @@ pub fn run(request_bytes: &[u8]) -> Result<Vec<u8>> {
     let header = Header::parse(&req.header)?;
     let mut closure = Closure::default();
     for c in &req.closure {
-        closure.insert(EncodingSpec::parse(c)?);
+        closure.insert(EncodingSpec::decode_nested(c)?);
     }
     let mut registry = Registry::default();
     for r in &req.registrations {

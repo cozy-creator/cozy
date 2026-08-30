@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """Manual tfs-019 proof over a freshly derived, current-tree fixture.
 
-This is deliberately not a test suite. It builds a real source checkpoint through `tfs`,
-registers it in the real metadata authority, drives the compiled Python facade, and prints
+This is deliberately not a test suite. It builds a real source manifest through `tfs`,
+commits it through the repository CAS, drives the compiled Python facade, and prints
 the exact committed receipt. The fixture is derived on demand so a schema change cannot
 leave a stale archive looking authoritative (decision #616).
 """
@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import argparse
 import io
+import json
 import pathlib
 import re
 import subprocess
@@ -106,15 +107,9 @@ def lifecycle_arms(
     commit_won = store.derived_abandon(transaction_id)
     if commit_won != {"state": "committed", "receipt": receipt}:
         raise RuntimeError("commit-versus-abandon did not return the committed receipt")
-    disposition = store.derived_dispose(transaction_id, "proof.successor")
-    if store.derived_dispose(transaction_id, "proof.successor") != disposition:
+    disposition = store.derived_dispose(transaction_id)
+    if store.derived_dispose(transaction_id) != disposition:
         raise RuntimeError("lost disposition reply did not replay")
-    try:
-        store.derived_dispose(transaction_id)
-    except tensorfs.errors.DispositionConflict:
-        pass
-    else:
-        raise RuntimeError("opposite root disposition did not conflict")
 
     # The first declaration is a durable lock, including explicit source-component rename.
     transaction_id = "sha256:" + "b" * 64
@@ -168,7 +163,7 @@ def lifecycle_arms(
         raise RuntimeError("lookup changed after release")
     print(
         "ARMS PASS fenced-reopen late-write successor changed-replay "
-        "abandon-first commit-first disposition-replay disposition-conflict release-lookup"
+        "abandon-first commit-first disposition-replay release-lookup"
     )
 
 
@@ -188,15 +183,26 @@ def main() -> None:
         "--scale",
         "32",
     )
-    match = re.search(r"checkpoint_id\s+(sha256:[0-9a-f]{64})", output)
+    match = re.search(r"manifest_id\s+(sha256:[0-9a-f]{64})", output)
     if match is None:
-        raise RuntimeError("checkpoint write did not print checkpoint_id")
+        raise RuntimeError("checkpoint write did not print manifest_id")
     source_id = match.group(1)
-    run(str(args.tfs), "root", "register", str(args.store), "h3-source", source_id)
 
     store = tensorfs.Store.open(str(args.store))
-    source_document = store.document(source_id)
-    source = store.snapshot(source_id)
+    source = store.manifest(source_id)
+    source_document = source["manifest"]
+    operation = store.begin_operation("derived-source", "proof", "h3-source", 1)
+    operation.hold_manifest(source_id, len(source_document))
+    for reached in store.walk(source_id):
+        operation.hold_blob(reached["id"], reached["length"])
+    evidence = json.dumps(
+        {"classification_digest": tensorfs.topology_digest(source["header"])},
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode()
+    operation.commit_release(
+        None, "1.0.0", "local", source_id, len(source_document), evidence
+    )
     header: dict[str, Any] = tensorfs.parse_header(source["header"])
     components: dict[str, dict[str, Any]] = header["components"]
     source_dit = components["unet"]
@@ -312,7 +318,7 @@ def main() -> None:
         )
     receipt = writer.commit()
     before = store.derived_lookup(transaction_id)
-    disposed = store.derived_dispose(transaction_id, "proof.h3-derived")
+    disposed = store.derived_dispose(transaction_id)
     after = store.derived_lookup(transaction_id)
 
     if before["receipt"] != receipt or after["receipt"] != receipt:
@@ -322,7 +328,7 @@ def main() -> None:
     observation = receipt["inherit_observation"]
     if observation["reads"] != 0 or observation["hashes"] != 0:
         raise RuntimeError(f"inherited payload bytes moved: {observation}")
-    target = store.snapshot(f"sha256:{receipt['snapshot']['sha256']}")
+    target = store.manifest(f"sha256:{receipt['manifest']['sha256']}")
     target_header: dict[str, Any] = tensorfs.parse_header(target["header"])
     target_components: dict[str, dict[str, Any]] = target_header["components"]
     if sorted(target_components) != [

@@ -1,4 +1,0 @@
-doc: meta
-expect: refuse
-code: MALFORMED_DIGEST
-note: a hold pinning a NAME instead of an immutable snapshot id

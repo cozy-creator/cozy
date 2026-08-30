@@ -1,4 +1,5 @@
-//! The object store (tfs-002): shape-agnostic mixed CAS at `objects/sha256/xx/yy/<hex>`.
+//! Immutable blobs at `blobs/xx/yy/<hex>` plus immutable manifests at
+//! `manifests/xx/yy/<hex>.json`.
 //!
 //! Tensor parts, blob segments and documents admit through ONE put path; the store knows
 //! no shapes (tensorfs.md §1). Identity is `sha256(stored_bytes)`, so an identity-bearing
@@ -11,7 +12,7 @@
 //!
 //! `contains` is a PRESENCE HINT and nothing more. Trusting bytes requires a durable
 //! verification record bound to object id, length, file identity (dev, ino), size and
-//! change token (mtime), and the store generation. Any mismatch invalidates the record and
+//! change token (mtime). Any mismatch invalidates the record and
 //! forces a rehash; a rehash that disagrees quarantines.
 
 use std::fs::{self, File, OpenOptions};
@@ -20,12 +21,10 @@ use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use crate::canon::{Fields, Value};
 use crate::err::{refuse, Code, Refusal, Result};
-use crate::ids::{check_format, hex64, Doc, ObjectRef};
+use crate::ids::{hex64, Doc, ObjectRef};
 use crate::sha256::{self, Sha256};
 
-pub const ERA: &str = "v2";
 const BUF: usize = 1 << 20;
 
 #[cfg(target_os = "linux")]
@@ -37,51 +36,6 @@ fn io(what: impl AsRef<str>, e: std::io::Error) -> Refusal {
     Refusal {
         code: Code::IO_FAILED,
         detail: format!("{}: {e}", what.as_ref()),
-    }
-}
-
-// ---------------------------------------------------------------- era marker
-
-/// `<root>/store.json` — the era marker (tensorfs.md §10b). Opening an unmarked or
-/// v1-era root as v2 refuses; the generation binds every verification record.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Marker {
-    pub era: String,
-    pub generation: u64,
-    pub object_hash: String,
-}
-
-impl Doc for Marker {
-    const FORMAT: &'static str = "tensorfs.store/1";
-    const MAX_BYTES: usize = 4096;
-
-    fn from_value(v: &Value) -> Result<Self> {
-        let mut f = Fields::new("Marker", v)?;
-        let era = f.req_str("era")?.to_string();
-        check_format("Marker", f.req_str("format")?, Self::FORMAT)?;
-        let generation = f.req_uint("generation")?;
-        let object_hash = f.req_str("object_hash")?.to_string();
-        f.done()?;
-        if object_hash != "sha256" {
-            return refuse(
-                Code::UNKNOWN_FORMAT,
-                format!("store object_hash {object_hash:?} is not sha256"),
-            );
-        }
-        Ok(Marker {
-            era,
-            generation,
-            object_hash,
-        })
-    }
-
-    fn to_value(&self) -> Value {
-        Value::obj(vec![
-            ("era", Value::str(self.era.clone())),
-            ("format", Value::str(Self::FORMAT)),
-            ("generation", Value::uint(self.generation)),
-            ("object_hash", Value::str(self.object_hash.clone())),
-        ])
     }
 }
 
@@ -97,99 +51,10 @@ pub struct VRecord {
     pub ino: u64,
     pub mtime_s: u64,
     pub mtime_ns: u64,
-    pub generation: u64,
-}
-
-impl Doc for VRecord {
-    const FORMAT: &'static str = "tensorfs.verification/1";
-    const MAX_BYTES: usize = 4096;
-
-    fn from_value(v: &Value) -> Result<Self> {
-        let mut f = Fields::new("VRecord", v)?;
-        let dev = file_identity(&mut f, "dev")?;
-        check_format("VRecord", f.req_str("format")?, Self::FORMAT)?;
-        let generation = f.req_uint("generation")?;
-        let ino = file_identity(&mut f, "ino")?;
-        let length = f.req_uint("length")?;
-        let mtime_ns = f.req_uint("mtime_ns")?;
-        let mtime_s = f.req_uint("mtime_s")?;
-        let sha256 = hex64("VRecord", f.req_str("sha256")?)?;
-        f.done()?;
-        Ok(VRecord {
-            sha256,
-            length,
-            dev,
-            ino,
-            mtime_s,
-            mtime_ns,
-            generation,
-        })
-    }
-
-    fn to_value(&self) -> Value {
-        Value::obj(vec![
-            ("dev", file_identity_value(self.dev)),
-            ("format", Value::str(Self::FORMAT)),
-            ("generation", Value::uint(self.generation)),
-            ("ino", file_identity_value(self.ino)),
-            ("length", Value::uint(self.length)),
-            ("mtime_ns", Value::uint(self.mtime_ns)),
-            ("mtime_s", Value::uint(self.mtime_s)),
-            ("sha256", Value::str(self.sha256.clone())),
-        ])
-    }
-}
-
-/// OS device/inode identifiers are u64, while the shared canonical-JSON profile admits integers
-/// only through 2^53-1. Small values retain their existing numeric bytes; values the numeric form
-/// cannot represent use one canonical unsigned-decimal string. No previously valid record moves.
-fn file_identity_value(value: u64) -> Value {
-    if value <= crate::limits::INT_MAX as u64 {
-        Value::uint(value)
-    } else {
-        Value::str(value.to_string())
-    }
-}
-
-fn file_identity(fields: &mut Fields<'_>, key: &str) -> Result<u64> {
-    match fields.req(key)? {
-        Value::Int(value) if *value >= 0 => Ok(*value as u64),
-        Value::Str(value) => {
-            if value.is_empty()
-                || (value.len() > 1 && value.starts_with('0'))
-                || !value.bytes().all(|byte| byte.is_ascii_digit())
-            {
-                return refuse(
-                    Code::NONCANONICAL_ENCODING,
-                    format!("VRecord.{key}: file identity is not canonical unsigned decimal"),
-                );
-            }
-            let parsed = value.parse::<u64>().map_err(|_| Refusal {
-                code: Code::NUMBER_RANGE,
-                detail: format!("VRecord.{key}: file identity is outside u64"),
-            })?;
-            if parsed <= crate::limits::INT_MAX as u64 {
-                return refuse(
-                    Code::NONCANONICAL_ENCODING,
-                    format!(
-                        "VRecord.{key}: {parsed} fits the canonical JSON integer form and may not be a string"
-                    ),
-                );
-            }
-            Ok(parsed)
-        }
-        other => refuse(
-            Code::WRONG_TYPE,
-            format!(
-                "VRecord.{key}: expected non-negative integer or large unsigned-decimal string, got {}",
-                other.kind()
-            ),
-        ),
-    }
 }
 
 impl VRecord {
-    fn of(hex: &str, md: &fs::Metadata, generation: u64) -> VRecord {
+    fn of(hex: &str, md: &fs::Metadata) -> VRecord {
         VRecord {
             sha256: hex.to_string(),
             length: md.len(),
@@ -197,34 +62,22 @@ impl VRecord {
             ino: md.ino(),
             mtime_s: md.mtime().max(0) as u64,
             mtime_ns: md.mtime_nsec().max(0) as u64,
-            generation,
         }
     }
     /// The first disagreeing bound fact, or None when the record still stands.
-    fn disagreement(&self, hex: &str, md: &fs::Metadata, generation: u64) -> Option<String> {
+    fn disagreement(&self, hex: &str, md: &fs::Metadata) -> Option<String> {
         if self.dev != md.dev() {
             return Some(format!("file device {} != {}", self.dev, md.dev()));
         }
-        self.portable_disagreement(hex, md, generation)
+        self.portable_disagreement(hex, md)
     }
 
     /// Everything stable across a remount of the same NFS object. Used only by the explicit
     /// record migration; normal reads continue to require exact mount-local device identity.
-    fn portable_disagreement(
-        &self,
-        hex: &str,
-        md: &fs::Metadata,
-        generation: u64,
-    ) -> Option<String> {
-        let now = VRecord::of(hex, md, generation);
+    fn portable_disagreement(&self, hex: &str, md: &fs::Metadata) -> Option<String> {
+        let now = VRecord::of(hex, md);
         if self.sha256 != now.sha256 {
             return Some(format!("object id {} != {}", self.sha256, now.sha256));
-        }
-        if self.generation != now.generation {
-            return Some(format!(
-                "store generation {} != {}",
-                self.generation, now.generation
-            ));
         }
         if self.ino != now.ino {
             return Some(format!("file inode {} != {}", self.ino, now.ino));
@@ -240,113 +93,6 @@ impl VRecord {
         }
         None
     }
-}
-
-fn legacy_file_identity_record(bytes: &[u8]) -> Result<VRecord> {
-    fn take<'a>(input: &mut &'a str, delimiter: &str, field: &str) -> Result<&'a str> {
-        let (value, rest) = input.split_once(delimiter).ok_or_else(|| Refusal {
-            code: Code::MALFORMED_JSON,
-            detail: format!("legacy VRecord.{field}: missing delimiter"),
-        })?;
-        *input = rest;
-        Ok(value)
-    }
-    fn unsigned(input: &mut &str, delimiter: &str, field: &str) -> Result<u64> {
-        let value = take(input, delimiter, field)?;
-        if value.is_empty() || (value.len() > 1 && value.starts_with('0')) || !value.is_ascii() {
-            return refuse(
-                Code::NONCANONICAL_ENCODING,
-                format!("legacy VRecord.{field}: not canonical unsigned decimal"),
-            );
-        }
-        if !value.bytes().all(|byte| byte.is_ascii_digit()) {
-            return refuse(
-                Code::NONCANONICAL_ENCODING,
-                format!("legacy VRecord.{field}: not canonical unsigned decimal"),
-            );
-        }
-        value.parse::<u64>().map_err(|_| Refusal {
-            code: Code::NUMBER_RANGE,
-            detail: format!("legacy VRecord.{field}: outside u64"),
-        })
-    }
-    fn identity(input: &mut &str, delimiter: &str, field: &str) -> Result<u64> {
-        let value = take(input, delimiter, field)?;
-        if let Some(magnitude) = value.strip_prefix('-') {
-            if value == "-0"
-                || magnitude.is_empty()
-                || (magnitude.len() > 1 && magnitude.starts_with('0'))
-                || !magnitude.bytes().all(|byte| byte.is_ascii_digit())
-            {
-                return refuse(
-                    Code::NONCANONICAL_ENCODING,
-                    format!("legacy VRecord.{field}: not canonical signed decimal"),
-                );
-            }
-            return value
-                .parse::<i64>()
-                .map(|signed| signed as u64)
-                .map_err(|_| Refusal {
-                    code: Code::NUMBER_RANGE,
-                    detail: format!("legacy VRecord.{field}: outside old i64 writer range"),
-                });
-        }
-        if value.is_empty()
-            || (value.len() > 1 && value.starts_with('0'))
-            || !value.bytes().all(|byte| byte.is_ascii_digit())
-        {
-            return refuse(
-                Code::NONCANONICAL_ENCODING,
-                format!("legacy VRecord.{field}: not canonical unsigned decimal"),
-            );
-        }
-        value.parse::<u64>().map_err(|_| Refusal {
-            code: Code::NUMBER_RANGE,
-            detail: format!("legacy VRecord.{field}: outside u64"),
-        })
-    }
-
-    let mut input = std::str::from_utf8(bytes)
-        .map_err(|_| Refusal {
-            code: Code::MALFORMED_JSON,
-            detail: "legacy VRecord is not UTF-8".into(),
-        })?
-        .strip_prefix("{\"dev\":")
-        .ok_or_else(|| Refusal {
-            code: Code::MALFORMED_JSON,
-            detail: "legacy VRecord has no exact dev prefix".into(),
-        })?;
-    let dev = identity(
-        &mut input,
-        ",\"format\":\"tensorfs.verification/1\",\"generation\":",
-        "dev",
-    )?;
-    let generation = unsigned(&mut input, ",\"ino\":", "generation")?;
-    let ino = identity(&mut input, ",\"length\":", "ino")?;
-    let length = unsigned(&mut input, ",\"mtime_ns\":", "length")?;
-    let mtime_ns = unsigned(&mut input, ",\"mtime_s\":", "mtime_ns")?;
-    let mtime_s = unsigned(&mut input, ",\"sha256\":\"", "mtime_s")?;
-    let sha256 = input.strip_suffix("\"}").ok_or_else(|| Refusal {
-        code: Code::MALFORMED_JSON,
-        detail: "legacy VRecord has no exact sha256 suffix".into(),
-    })?;
-    let sha256 = crate::ids::hex64("legacy VRecord.sha256", sha256)?;
-    Ok(VRecord {
-        sha256,
-        length,
-        dev,
-        ino,
-        mtime_s,
-        mtime_ns,
-        generation,
-    })
-}
-
-#[derive(Debug, Default, Clone, PartialEq, Eq)]
-pub struct RecordMigration {
-    pub scanned: usize,
-    pub current: usize,
-    pub migrated: usize,
 }
 
 // ---------------------------------------------------------------- fault injection
@@ -389,7 +135,6 @@ impl Fault {
 #[derive(Debug, Clone)]
 pub struct Store {
     root: PathBuf,
-    marker: Marker,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -477,82 +222,44 @@ pub struct Scrub {
 
 impl Store {
     pub fn init(root: &Path) -> Result<Store> {
-        for d in ["objects/sha256", "verified", "tmp", "quarantine"] {
+        for d in [
+            "repos",
+            "manifests",
+            "blobs",
+            "checkouts",
+            ".tensorfs/tmp",
+            ".tensorfs/quarantine",
+        ] {
             fs::create_dir_all(root.join(d)).map_err(|e| io(format!("mkdir {d}"), e))?;
         }
-        let p = root.join("store.json");
-        if p.exists() {
-            return Store::open(root);
-        }
-        let marker = Marker {
-            era: ERA.to_string(),
-            generation: now_secs(),
-            object_hash: "sha256".to_string(),
-        };
-        write_doc(&p, &marker.canonical_bytes(), true)?;
+        crate::catalog::Catalog::initialize(root)?;
         Ok(Store {
             root: root.to_path_buf(),
-            marker,
         })
     }
 
-    /// Typed refusal for an unmarked or non-v2 root (tensorfs.md §10b).
+    /// The three authoritative namespaces identify a TensorFS store. Old mixed-object and
+    /// state.json layouts are a prelaunch hardcut and never dual-read.
     pub fn open(root: &Path) -> Result<Store> {
-        let p = root.join("store.json");
-        let bytes = match fs::read(&p) {
-            Ok(b) => b,
-            Err(_) => {
-                let v1: Vec<&str> = ["metadata.sqlite3", "refs", "objects", "blobs", "store.toml"]
-                    .into_iter()
-                    .filter(|n| root.join(n).exists())
-                    .collect();
-                return refuse(
-                    Code::STORE_ERA,
-                    if v1.is_empty() {
-                        format!("{}: no era marker — not a tensorfs store", root.display())
-                    } else {
-                        format!(
-                            "{}: no v2 era marker beside {v1:?} — refusing to open unknown \
-                             or v1-era state as v2",
-                            root.display()
-                        )
-                    },
-                );
-            }
-        };
-        let marker = Marker::parse(&bytes)?;
-        if marker.era != ERA {
+        if !["repos", "manifests", "blobs"]
+            .iter()
+            .all(|name| root.join(name).is_dir())
+        {
             return refuse(
                 Code::STORE_ERA,
                 format!(
-                    "store era {:?} != {ERA:?} — v1-era state never opens as v2 (§10b)",
-                    marker.era
+                    "{} lacks the repos/manifests/blobs layout; old stores require an offline migration",
+                    root.display()
                 ),
             );
         }
         Ok(Store {
             root: root.to_path_buf(),
-            marker,
         })
     }
 
     pub fn root(&self) -> &Path {
         &self.root
-    }
-    pub fn generation(&self) -> u64 {
-        self.marker.generation
-    }
-
-    /// A new generation invalidates every verification record at once — the recovery lever
-    /// after a restore, a clone, or any event that breaks file identity wholesale.
-    pub fn bump_generation(&mut self) -> Result<u64> {
-        self.marker.generation = now_secs().max(self.marker.generation + 1);
-        write_doc(
-            &self.root.join("store.json"),
-            &self.marker.canonical_bytes(),
-            true,
-        )?;
-        Ok(self.marker.generation)
     }
 
     /// A malformed id has NO path in this store. `hex[0..2]` panics on a short string, and a
@@ -571,12 +278,222 @@ impl Store {
             .join(hex)
     }
     pub fn object_path(&self, hex: &str) -> PathBuf {
-        self.shard("objects/sha256", hex)
+        self.shard("blobs", hex)
     }
-    fn record_path(&self, hex: &str) -> PathBuf {
-        self.shard("verified", hex)
+    pub fn blob_path(&self, hex: &str) -> PathBuf {
+        self.object_path(hex)
+    }
+    pub fn manifest_path(&self, hex: &str) -> PathBuf {
+        let mut path = self.shard("manifests", hex);
+        path.set_extension("json");
+        path
     }
 
+    pub fn read_manifest(&self, reference: &ObjectRef) -> Result<crate::manifest::Manifest> {
+        let path = self.manifest_path(&reference.sha256);
+        let bytes = fs::read(&path).map_err(|error| {
+            if error.kind() == std::io::ErrorKind::NotFound {
+                Refusal {
+                    code: Code::OBJECT_ABSENT,
+                    detail: format!("manifest {} is absent", reference.id()),
+                }
+            } else {
+                io(format!("read {}", path.display()), error)
+            }
+        })?;
+        if bytes.len() as u64 != reference.length {
+            return refuse(
+                Code::LENGTH_MISMATCH,
+                format!(
+                    "manifest {} is {} bytes, expected {}",
+                    reference.id(),
+                    bytes.len(),
+                    reference.length
+                ),
+            );
+        }
+        if crate::sha256::hex_digest(&bytes) != reference.sha256 {
+            return refuse(
+                Code::OBJECT_ID_MISMATCH,
+                format!("manifest {} bytes disagree with its key", reference.id()),
+            );
+        }
+        crate::manifest::Manifest::parse(&bytes)
+    }
+
+    pub fn put_manifest(&self, manifest: &crate::manifest::Manifest) -> Result<Put> {
+        self.put_manifest_held(manifest, None)
+    }
+
+    pub fn put_manifest_held(
+        &self,
+        manifest: &crate::manifest::Manifest,
+        operation: Option<&str>,
+    ) -> Result<Put> {
+        let catalog = crate::catalog::Catalog::open(&self.root)?;
+        let _writer = crate::catalog::WriterGuard::acquire(&self.root)?;
+        let bytes = manifest.canonical_bytes();
+        let object = ObjectRef::of(&bytes);
+        if let Some(operation) = operation {
+            catalog.hold(
+                operation,
+                &crate::storage::manifest_key(&object.sha256)?,
+                object.length,
+            )?;
+        }
+        let path = self.manifest_path(&object.sha256);
+        fs::create_dir_all(path.parent().unwrap()).map_err(|error| io("mkdir manifest", error))?;
+        if path.exists() {
+            self.read_manifest(&object)?;
+            return Ok(Put {
+                obj: object,
+                admitted: false,
+            });
+        }
+        let temporary = path.parent().unwrap().join(format!(
+            ".{}.{}.{}",
+            path.file_name().unwrap().to_string_lossy(),
+            std::process::id(),
+            now_nanos_unique()
+        ));
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&temporary)
+            .map_err(|error| io("create manifest temp", error))?;
+        file.write_all(&bytes)
+            .map_err(|error| io("write manifest", error))?;
+        file.sync_all()
+            .map_err(|error| io("fsync manifest", error))?;
+        fs::set_permissions(&temporary, fs::Permissions::from_mode(0o444))
+            .map_err(|error| io("chmod manifest", error))?;
+        let admitted = match fs::hard_link(&temporary, &path) {
+            Ok(()) => true,
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => false,
+            Err(error) => return cleanup(&temporary, io("install manifest", error)),
+        };
+        let _ = fs::remove_file(&temporary);
+        if admitted {
+            fsync_dir(path.parent().unwrap())?;
+        }
+        self.read_manifest(&object)?;
+        Ok(Put {
+            obj: object,
+            admitted,
+        })
+    }
+
+    pub fn repository_path(&self, repo: &crate::repository::RepositoryName) -> PathBuf {
+        self.root
+            .join("repos")
+            .join(&repo.org)
+            .join(format!("{}.json", repo.name))
+    }
+
+    /// Local repository CAS. `observed` is exactly the body the caller read, or `None` for
+    /// create. The durable rename/delete happens before the SQLite projection commit.
+    pub fn apply_repository(
+        &self,
+        observed: Option<&[u8]>,
+        mutation: &crate::repository::Mutation,
+        fault: &Fault,
+    ) -> Result<Option<crate::repository::Repository>> {
+        let catalog = crate::catalog::Catalog::open(&self.root)?;
+        let _writer = crate::catalog::WriterGuard::acquire(&self.root)?;
+        let path = self.repository_path(mutation.repo());
+        let current = match fs::read(&path) {
+            Ok(bytes) => Some(bytes),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+            Err(error) => return Err(io(format!("read {}", path.display()), error)),
+        };
+        if current.as_deref() != observed {
+            return refuse(
+                Code::REPOSITORY_CONFLICT,
+                "repository bytes changed since the caller observed them",
+            );
+        }
+        let classification = match mutation {
+            crate::repository::Mutation::PutRelease { manifest, .. } => {
+                let parsed = self.read_manifest(manifest)?;
+                let header_ref = parsed.header().ok_or_else(|| Refusal {
+                    code: Code::ATTACHMENT_CARDINALITY,
+                    detail: "release manifest has no cozytensors entry".into(),
+                })?;
+                let header = crate::checkpoint::load_header(self, header_ref)?;
+                crate::checkpoint::walk(self, &parsed)?.require_resident(self)?;
+                Some(header.topology_digest())
+            }
+            crate::repository::Mutation::RemoveRelease { .. }
+            | crate::repository::Mutation::DeleteRepository { .. } => None,
+        };
+        let replacement = crate::repository::apply(observed, mutation, classification.as_deref())?;
+        if let Some(repository) = &replacement {
+            for release in &repository.releases {
+                self.read_manifest(&release.manifest)?;
+            }
+        }
+        let org = mutation.repo().org.clone();
+        let name = mutation.repo().name.clone();
+        let expected = current;
+        let replacement_for_write = replacement.clone();
+        let path_for_write = path.clone();
+        catalog.commit_repository(&org, &name, || {
+            let actual = match fs::read(&path_for_write) {
+                Ok(bytes) => Some(bytes),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+                Err(error) => return Err(io("read repository under coordination", error)),
+            };
+            if actual != expected {
+                return refuse(
+                    Code::REPOSITORY_CONFLICT,
+                    "repository changed while acquiring SQLite coordination",
+                );
+            }
+            fault.hit("repo-before-replace");
+            match &replacement_for_write {
+                Some(repository) => {
+                    let bytes = repository.canonical_bytes();
+                    if actual.as_deref() != Some(bytes.as_slice()) {
+                        let directory = path_for_write.parent().unwrap();
+                        fs::create_dir_all(directory)
+                            .map_err(|error| io("mkdir repository org", error))?;
+                        let temporary = directory.join(format!(
+                            ".{}.{}.{}",
+                            path_for_write.file_name().unwrap().to_string_lossy(),
+                            std::process::id(),
+                            now_nanos_unique()
+                        ));
+                        let mut file = OpenOptions::new()
+                            .write(true)
+                            .create_new(true)
+                            .mode(0o600)
+                            .open(&temporary)
+                            .map_err(|error| io("create repository temp", error))?;
+                        if let Err(error) = file.write_all(&bytes) {
+                            return cleanup(&temporary, io("write repository", error));
+                        }
+                        if let Err(error) = file.sync_all() {
+                            return cleanup(&temporary, io("fsync repository", error));
+                        }
+                        drop(file);
+                        if let Err(error) = fs::rename(&temporary, &path_for_write) {
+                            return cleanup(&temporary, io("rename repository", error));
+                        }
+                        fsync_dir(directory)?;
+                    }
+                }
+                None => {
+                    fs::remove_file(&path_for_write)
+                        .map_err(|error| io("delete repository", error))?;
+                    fsync_dir(path_for_write.parent().unwrap())?;
+                }
+            }
+            fault.hit("repo-after-replace");
+            crate::storage::Census::open_metadata(&self.root)?.projection_for(&org, &name)
+        })?;
+        Ok(replacement)
+    }
     /// PRESENCE HINT ONLY. True says an object file exists at that id; it says nothing
     /// about its bytes. Resume must consult `record` or rehash.
     pub fn contains(&self, hex: &str) -> bool {
@@ -591,7 +508,19 @@ impl Store {
         expect: Option<&ObjectRef>,
         fault: &Fault,
     ) -> Result<Put> {
-        let tmp = self.root.join("tmp").join(format!(
+        self.put_stream_held(r, expect, fault, None)
+    }
+
+    pub fn put_stream_held<R: Read>(
+        &self,
+        r: &mut R,
+        expect: Option<&ObjectRef>,
+        fault: &Fault,
+        operation: Option<&str>,
+    ) -> Result<Put> {
+        let catalog = crate::catalog::Catalog::open(&self.root)?;
+        let _writer = crate::catalog::WriterGuard::acquire(&self.root)?;
+        let tmp = self.root.join(".tensorfs/tmp").join(format!(
             "put-{}-{}",
             std::process::id(),
             now_nanos_unique()
@@ -652,6 +581,9 @@ impl Store {
                 );
             }
         }
+        if let Some(operation) = operation {
+            catalog.hold(operation, &crate::storage::blob_key(&hex)?, len)?;
+        }
 
         if let Err(e) = fs::set_permissions(&tmp, fs::Permissions::from_mode(0o444)) {
             return cleanup(&tmp, io("chmod 0444", e));
@@ -679,7 +611,7 @@ impl Store {
         // never saw the installed file's bytes, so we make no claim about them.
         if admitted {
             let md = stat(&dst)?;
-            self.write_record(&VRecord::of(&hex, &md, self.marker.generation))?;
+            self.write_record(&VRecord::of(&hex, &md))?;
         }
         fault.hit("record");
         Ok(Put {
@@ -752,23 +684,35 @@ impl Store {
         Ok(put)
     }
 
+    pub fn transfer_manifest(&self, destination: &Store, want: &ObjectRef) -> Result<Put> {
+        let manifest = self.read_manifest(want)?;
+        let put = destination.put_manifest(&manifest)?;
+        if put.obj != *want {
+            return refuse(
+                Code::OBJECT_ID_MISMATCH,
+                "transferred manifest identity changed during admission",
+            );
+        }
+        Ok(put)
+    }
+
     // ------------------------------------------------------------ records
 
     fn write_record(&self, rec: &VRecord) -> Result<()> {
-        let p = self.record_path(&rec.sha256);
-        fs::create_dir_all(p.parent().unwrap()).map_err(|e| io("mkdir verified", e))?;
-        // Not fsynced, deliberately: a record is a CACHED FACT. Losing one costs a rehash,
-        // and a torn one cannot be observed (atomic rename) nor believed (canonical parse
-        // + inode/mtime/generation binding). Paying fsync here doubled small-object cost.
-        write_doc(&p, &rec.canonical_bytes(), false)
+        crate::catalog::Catalog::open(&self.root)?.write_verification(rec)
     }
 
     fn record(&self, hex: &str) -> Option<VRecord> {
-        VRecord::parse(&fs::read(self.record_path(hex)).ok()?).ok()
+        crate::catalog::Catalog::open(&self.root)
+            .and_then(|catalog| catalog.verification(hex))
+            .ok()
+            .flatten()
     }
 
     fn drop_record(&self, hex: &str) {
-        let _ = fs::remove_file(self.record_path(hex));
+        if let Ok(catalog) = crate::catalog::Catalog::open(&self.root) {
+            catalog.drop_verification(hex);
+        }
     }
 
     /// The one question the read and resume paths ask: may these bytes be trusted without
@@ -781,72 +725,10 @@ impl Store {
         let rec = self
             .record(hex)
             .ok_or_else(|| "no verification record".to_string())?;
-        match rec.disagreement(hex, &md, self.marker.generation) {
+        match rec.disagreement(hex, &md) {
             Some(why) => Err(why),
             None => Ok(rec),
         }
-    }
-
-    /// Explicit hardcut migration for records with a large old-writer identity or a mount-local
-    /// device id from another NFS client. It trusts no pathname absence and hashes no payload: the
-    /// exact record grammar plus stable inode/length/mtime/generation must agree, then the new writer
-    /// rebinds only the operational record to this mount. Ordinary reads never call this.
-    pub fn migrate_file_identity_records(&self) -> Result<RecordMigration> {
-        let mut result = RecordMigration::default();
-        for hex in self.objects()? {
-            result.scanned += 1;
-            if self.record_valid(&hex).is_ok() {
-                result.current += 1;
-                continue;
-            }
-            let path = self.record_path(&hex);
-            let bytes =
-                fs::read(&path).map_err(|error| io(format!("read {}", path.display()), error))?;
-            let mut record = match VRecord::parse(&bytes) {
-                Ok(record) => record,
-                Err(error)
-                    if error.code == Code::NUMBER_RANGE || error.code == Code::WRONG_TYPE =>
-                {
-                    legacy_file_identity_record(&bytes)?
-                }
-                Err(error) => {
-                    return refuse(
-                        Code::OBJECT_CORRUPT,
-                        format!(
-                            "sha256:{hex}: record is not a large/remounted identity row ({error})"
-                        ),
-                    )
-                }
-            };
-            let metadata = stat(&self.object_path(&hex))?;
-            if let Some(why) = record.portable_disagreement(&hex, &metadata, self.marker.generation)
-            {
-                return refuse(
-                    Code::OBJECT_CORRUPT,
-                    format!("sha256:{hex}: legacy record no longer describes the object ({why})"),
-                );
-            }
-            if record.dev == metadata.dev()
-                && record.dev <= crate::limits::INT_MAX as u64
-                && record.ino <= crate::limits::INT_MAX as u64
-            {
-                return refuse(
-                    Code::OBJECT_CORRUPT,
-                    format!(
-                        "sha256:{hex}: record failed despite having no large or remounted identity"
-                    ),
-                );
-            }
-            record.dev = metadata.dev();
-            record.ino = metadata.ino();
-            self.write_record(&record)?;
-            self.record_valid(&hex).map_err(|why| Refusal {
-                code: Code::OBJECT_CORRUPT,
-                detail: format!("sha256:{hex}: migrated record is not current ({why})"),
-            })?;
-            result.migrated += 1;
-        }
-        Ok(result)
     }
 
     // ------------------------------------------------------------ reads
@@ -994,7 +876,7 @@ impl Store {
         let md = f.metadata().map_err(|e| io("fstat object", e))?;
         let disagreement = match self.record(hex) {
             None => Some("no verification record".to_string()),
-            Some(rec) => rec.disagreement(hex, &md, self.marker.generation),
+            Some(rec) => rec.disagreement(hex, &md),
         };
         if disagreement.is_none() && !force {
             return Ok((Verdict::Verified { rehashed: false }, Some(f)));
@@ -1014,7 +896,7 @@ impl Store {
             ));
         }
         let md = f.metadata().map_err(|e| io("fstat object", e))?;
-        self.write_record(&VRecord::of(hex, &md, self.marker.generation))?;
+        self.write_record(&VRecord::of(hex, &md))?;
         Ok((
             match disagreement {
                 None => Verdict::Verified { rehashed: true },
@@ -1028,10 +910,10 @@ impl Store {
         hash_fd(&mut self.open_nofollow(hex)?)
     }
 
-    /// Take the NAME first: rename out of `objects/` so exactly one remover wins and the
+    /// Take the NAME first: rename out of `blobs/` so exactly one remover wins and the
     /// bad bytes can never satisfy another read.
     pub fn quarantine(&self, hex: &str) -> Result<PathBuf> {
-        let dir = self.root.join("quarantine");
+        let dir = self.root.join(".tensorfs/quarantine");
         fs::create_dir_all(&dir).map_err(|e| io("mkdir quarantine", e))?;
         let mut to = dir.join(hex);
         let mut n = 1;
@@ -1056,11 +938,28 @@ impl Store {
         Ok(to)
     }
 
+    pub fn quarantine_manifest(&self, hex: &str) -> Result<PathBuf> {
+        crate::ids::hex64("manifest", hex)?;
+        let _writer = crate::catalog::WriterGuard::acquire(&self.root)?;
+        let directory = self.root.join(".tensorfs/quarantine/manifests");
+        fs::create_dir_all(&directory).map_err(|error| io("mkdir manifest quarantine", error))?;
+        let mut destination = directory.join(hex);
+        let mut suffix = 1u64;
+        while destination.exists() {
+            destination = directory.join(format!("{hex}.{suffix}"));
+            suffix += 1;
+        }
+        fs::rename(self.manifest_path(hex), &destination)
+            .map_err(|error| io("quarantine manifest", error))?;
+        fsync_dir(&directory)?;
+        Ok(destination)
+    }
+
     // ------------------------------------------------------------ scrub / reap
 
     pub fn objects(&self) -> Result<Vec<String>> {
         let mut out = Vec::new();
-        let base = self.root.join("objects/sha256");
+        let base = self.root.join("blobs");
         for a in read_dir(&base)? {
             for b in read_dir(&a)? {
                 for o in read_dir(&b)? {
@@ -1118,7 +1017,7 @@ impl Store {
     /// nothing references it, so removing an old one can never lose an object.
     pub fn reap(&self, max_age_secs: u64) -> Result<(usize, usize)> {
         let (mut gone, mut kept) = (0, 0);
-        for p in read_dir(&self.root.join("tmp"))? {
+        for p in read_dir(&self.root.join(".tensorfs/tmp"))? {
             let age = fs::metadata(&p)
                 .ok()
                 .and_then(|m| m.modified().ok())
@@ -1192,39 +1091,10 @@ fn read_dir(p: &Path) -> Result<Vec<PathBuf>> {
     Ok(out)
 }
 
-/// Atomic small-document write: temp beside the target, fsync, rename, fsync the dir.
-fn write_doc(p: &Path, bytes: &[u8], durable: bool) -> Result<()> {
-    let dir = p.parent().unwrap();
-    let tmp = dir.join(format!(
-        ".{}.{}.{}",
-        p.file_name().unwrap().to_string_lossy(),
-        std::process::id(),
-        now_nanos_unique()
-    ));
-    let mut f = File::create(&tmp).map_err(|e| io(format!("create {}", tmp.display()), e))?;
-    f.write_all(bytes).map_err(|e| io("write doc", e))?;
-    if durable {
-        f.sync_all().map_err(|e| io("fsync doc", e))?;
-    }
-    drop(f);
-    fs::rename(&tmp, p).map_err(|e| io(format!("rename {}", p.display()), e))?;
-    if durable {
-        fsync_dir(dir)?;
-    }
-    Ok(())
-}
-
 fn fsync_dir(dir: &Path) -> Result<()> {
     File::open(dir)
         .and_then(|d| d.sync_all())
         .map_err(|e| io(format!("fsync dir {}", dir.display()), e))
-}
-
-fn now_secs() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0)
 }
 
 fn now_nanos_unique() -> u128 {

@@ -1,0 +1,4 @@
+doc: session
+expect: ok
+id: sha256:5af09f6888c0be34e2de711e6659c31d9edc51480f1b3a90f2c274dfce231beb
+note: an expiring quarantine session: a candidate is never a release

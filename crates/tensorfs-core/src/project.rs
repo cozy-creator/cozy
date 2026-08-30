@@ -1,217 +1,230 @@
-//! The projection plane (tfs-005) — tiers 2 and 3 of the permanent projection ladder, plus
-//! the rule that keeps tier 1 the only way to reach a weight.
-//!
-//! ```text
-//! 1  native reads          all our code, every tensor            (read.rs)
-//! 2  project_snapshot      configs and documents as plain files through relative symlinks
-//! 3  materialize_blob      a private streamed copy of an ALREADY-RETAINED opaque carrier
-//! ```
-//!
-//! **Weight files have no path form at any tier.** A projected tree carries configs and
-//! documents only, and this module refuses to project an entry whose object the checkpoint
-//! reached as a storage part. The v1 pointer stub died with the tensor paths it stood in
-//! for: with no tensor paths in trees, a stub has nothing to stand in for.
-//!
-//! **Pretty rendering is a PROJECTION, never storable bytes.** `render` exists so a human
-//! can read a canonical document; its output has a different digest and is refused by every
-//! decoder, so a SnapshotManifest can never reference one (tensorfs.md §7).
+//! Disposable local checkouts and explicit byte materialization.
 
-use std::fs::{self, File};
+use std::collections::HashSet;
+use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::path::{Component, Path, PathBuf};
 
 use crate::canon;
-use crate::checkpoint;
 use crate::err::{refuse, Code, Refusal, Result};
-use crate::manifest::{BlobDescriptor, Entry, SnapshotManifest};
-use crate::receipt::{Receipt, Receipts};
+use crate::ids::ObjectRef;
+use crate::manifest::{Entry, Manifest};
 use crate::store::Store;
 
-fn io(what: impl AsRef<str>, e: std::io::Error) -> Refusal {
+fn io(what: impl AsRef<str>, error: std::io::Error) -> Refusal {
     Refusal {
         code: Code::IO_FAILED,
-        detail: format!("{}: {e}", what.as_ref()),
+        detail: format!("{}: {error}", what.as_ref()),
     }
 }
 
 #[derive(Debug, Default, Clone)]
-pub struct Projection {
+pub struct Checkout {
     pub dirs: usize,
     pub links: usize,
     pub copies: usize,
     pub bytes: u64,
 }
 
-/// The relative path from `from_dir` to `to`, so a projected tree survives the store and the
-/// tree moving together. Both must be absolute.
 fn relative(from_dir: &Path, to: &Path) -> PathBuf {
-    let a: Vec<Component> = from_dir.components().collect();
-    let b: Vec<Component> = to.components().collect();
-    let common = a.iter().zip(b.iter()).take_while(|(x, y)| x == y).count();
-    let mut p = PathBuf::new();
-    for _ in common..a.len() {
-        p.push("..");
-    }
-    for c in &b[common..] {
-        p.push(c.as_os_str());
-    }
-    p
-}
-
-/// Tier 2. Config assets and canonical documents become plain files a third party can open;
-/// weights cannot appear, and the refusal says why rather than skipping quietly.
-pub fn project_snapshot(
-    store: &Store,
-    snap: &SnapshotManifest,
-    dest: &Path,
-    force_copy: bool,
-    rx: &mut Receipts,
-) -> Result<Projection> {
-    // The walk is the classifier: it says what each object was reached AS, and "part" is the
-    // one answer a projected path may never carry.
-    let walk = checkpoint::walk(store, snap)?;
-    let weights: Vec<&str> = walk
-        .objects
+    let left: Vec<Component> = from_dir.components().collect();
+    let right: Vec<Component> = to.components().collect();
+    let common = left
         .iter()
-        .filter(|r| r.kind == "part")
-        .map(|r| r.obj.sha256.as_str())
-        .collect();
-
-    let snap_hex = snap.snapshot_id();
-    let snap_hex = snap_hex.strip_prefix("sha256:").unwrap_or(&snap_hex);
-    fs::create_dir_all(dest).map_err(|e| io("mkdir projection", e))?;
-    let dest = dest
-        .canonicalize()
-        .map_err(|e| io("canonicalize projection root", e))?;
-    let objects = store
-        .root()
-        .canonicalize()
-        .map_err(|e| io("canonicalize store root", e))?;
-
-    let mut p = Projection::default();
-    for (path, e) in snap.entries() {
-        let target = dest.join(path);
-        match e {
-            Entry::Dir => {
-                fs::create_dir_all(&target).map_err(|e| io("mkdir", e))?;
-                p.dirs += 1;
-            }
-            Entry::File(o) => {
-                if weights.contains(&o.sha256.as_str()) {
-                    return refuse(
-                        Code::PROJECTION_WEIGHT_PATH,
-                        format!(
-                            "{path:?} names {}, which this checkpoint reaches as a storage \
-                             part — a projected tree cannot synthesize a weight-container \
-                             path at any tier",
-                            o.id()
-                        ),
-                    );
-                }
-                let src = objects
-                    .join("objects/sha256")
-                    .join(&o.sha256[0..2])
-                    .join(&o.sha256[2..4])
-                    .join(&o.sha256);
-                if !src.is_file() {
-                    return refuse(
-                        Code::OBJECT_ABSENT,
-                        format!("{path:?}: {} is not in this store", o.id()),
-                    );
-                }
-                fs::create_dir_all(target.parent().unwrap()).map_err(|e| io("mkdir parent", e))?;
-                let _ = fs::remove_file(&target);
-                let linked = if force_copy {
-                    false
-                } else {
-                    std::os::unix::fs::symlink(relative(target.parent().unwrap(), &src), &target)
-                        .is_ok()
-                };
-                if linked {
-                    p.links += 1;
-                } else {
-                    fs::copy(&src, &target).map_err(|e| io("copy asset", e))?;
-                    // Read-only, like the object it stands for.
-                    let mut perms = fs::metadata(&target)
-                        .map_err(|e| io("stat copy", e))?
-                        .permissions();
-                    std::os::unix::fs::PermissionsExt::set_mode(&mut perms, 0o444);
-                    let _ = fs::set_permissions(&target, perms);
-                    p.copies += 1;
-                    rx.emit(Receipt::new(
-                        "project_snapshot",
-                        "symlink-fell-back-to-copy",
-                        snap_hex,
-                        store.generation(),
-                        format!(
-                            "{path:?}: {} bytes copied — dedup lost, correctness kept",
-                            o.length
-                        ),
-                    ));
-                }
-                p.bytes += o.length;
-            }
-            Entry::Blob(_) => {
-                // A retained opaque carrier is tier 3's subject, taken whole and on demand.
-                // Projecting it as a path here would be exactly the weight-container path
-                // the ladder exists to forbid.
-                return refuse(
-                    Code::PROJECTION_WEIGHT_PATH,
-                    format!(
-                        "{path:?} is a retained blob — tier 3 `materialize_blob` streams it \
-                         on demand; a projected tree never carries one"
-                    ),
-                );
-            }
-        }
+        .zip(right.iter())
+        .take_while(|(a, b)| a == b)
+        .count();
+    let mut path = PathBuf::new();
+    for _ in common..left.len() {
+        path.push("..");
     }
-    Ok(p)
+    for component in &right[common..] {
+        path.push(component.as_os_str());
+    }
+    path
 }
 
-/// Tier 3. A private streamed copy of an ALREADY-RETAINED opaque carrier or document:
-/// O(one segment) resident, atomic by rename, and never a synthesis — a carrier that was
-/// never retained is `export_checkpoint` in a named exporter package (tfs-016), not this.
-pub fn materialize_blob(store: &Store, what: &str, b: &BlobDescriptor, dest: &Path) -> Result<u64> {
-    for (i, s) in b.segments.iter().enumerate() {
-        if !store.contains(&s.sha256) {
+/// Create a normal-looking tree. Ordinary files are relative symlinks where possible;
+/// CozyTensors is omitted because its header is not a conventional weight file.
+pub fn checkout(
+    store: &Store,
+    manifest: &Manifest,
+    destination: &Path,
+    force_copy: bool,
+) -> Result<Checkout> {
+    fs::create_dir_all(destination).map_err(|error| io("mkdir checkout", error))?;
+    let destination = destination
+        .canonicalize()
+        .map_err(|error| io("canonicalize checkout", error))?;
+    let mut result = Checkout::default();
+    let mut directories = HashSet::new();
+    for (virtual_path, entry) in manifest.entries() {
+        let blob = match entry {
+            Entry::CozyTensors(_) => continue,
+            Entry::File(blob) => blob,
+        };
+        let source = store.blob_path(&blob.sha256);
+        let metadata = fs::metadata(&source).map_err(|error| {
+            if error.kind() == std::io::ErrorKind::NotFound {
+                Refusal {
+                    code: Code::OBJECT_ABSENT,
+                    detail: format!("{virtual_path:?}: {} is absent", blob.id()),
+                }
+            } else {
+                io(format!("stat {}", source.display()), error)
+            }
+        })?;
+        if metadata.len() != blob.length {
             return refuse(
-                Code::BLOB_NOT_RETAINED,
+                Code::LENGTH_MISMATCH,
                 format!(
-                    "{what}: segment {i} {} is not retained here — materialization streams a \
-                     carrier the store HOLDS; it never synthesizes one",
-                    s.id()
+                    "{virtual_path:?}: {} is {} bytes, manifest promises {}",
+                    blob.id(),
+                    metadata.len(),
+                    blob.length
                 ),
             );
         }
+        let target = destination.join(virtual_path);
+        let parent = target.parent().unwrap();
+        fs::create_dir_all(parent).map_err(|error| io("mkdir checkout parent", error))?;
+        let mut cursor = parent;
+        while cursor.starts_with(&destination) && cursor != destination {
+            if directories.insert(cursor.to_path_buf()) {
+                result.dirs += 1;
+            }
+            cursor = cursor.parent().unwrap_or(&destination);
+        }
+        let _ = fs::remove_file(&target);
+        let linked =
+            !force_copy && std::os::unix::fs::symlink(relative(parent, &source), &target).is_ok();
+        if linked {
+            result.links += 1;
+        } else {
+            fs::copy(&source, &target).map_err(|error| io("copy checkout file", error))?;
+            let mut permissions = fs::metadata(&target)
+                .map_err(|error| io("stat checkout copy", error))?
+                .permissions();
+            std::os::unix::fs::PermissionsExt::set_mode(&mut permissions, 0o444);
+            fs::set_permissions(&target, permissions)
+                .map_err(|error| io("chmod checkout copy", error))?;
+            result.copies += 1;
+        }
+        result.bytes = result
+            .bytes
+            .checked_add(blob.length)
+            .ok_or_else(|| Refusal {
+                code: Code::ARITH_OVERFLOW,
+                detail: "checkout byte count overflow".into(),
+            })?;
     }
-    let dir = dest.parent().unwrap_or(Path::new("."));
-    fs::create_dir_all(dir).map_err(|e| io("mkdir materialize", e))?;
-    let tmp = dir.join(format!(
-        ".materialize-{}-{}",
-        std::process::id(),
-        &b.whole_sha256[0..12]
-    ));
-    let mut f = File::create(&tmp).map_err(|e| io("create materialize temp", e))?;
-    // read_blob checks every segment length AND the whole digest as the bytes pass.
-    let r = checkpoint::read_blob(store, what, b, &mut f);
-    if let Err(e) = r {
-        let _ = fs::remove_file(&tmp);
-        return Err(e);
-    }
-    f.flush().map_err(|e| io("flush", e))?;
-    f.sync_all().map_err(|e| io("fsync materialized", e))?;
-    drop(f);
-    fs::rename(&tmp, dest).map_err(|e| io("rename materialized", e))?;
-    Ok(b.logical_size)
+    Ok(result)
 }
 
-/// Pretty rendering — an ephemeral CLI/projection output. It parses the CANONICAL bytes
-/// first, so it can only render a document the store would admit, and what it returns is
-/// deliberately not admissible anywhere.
+/// Write an independent physical copy of one selected ordinary manifest entry.
+pub fn materialize(store: &Store, blob: &ObjectRef, destination: &Path) -> Result<u64> {
+    let directory = destination.parent().unwrap_or(Path::new("."));
+    fs::create_dir_all(directory).map_err(|error| io("mkdir materialize", error))?;
+    let temporary = directory.join(format!(
+        ".materialize-{}-{}-{}",
+        std::process::id(),
+        &blob.sha256[..12],
+        crate::meta::now_nanos_unique(),
+    ));
+    let mut output = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&temporary)
+        .map_err(|error| io("create materialize", error))?;
+    let written = match store.read_into(&blob.sha256, &mut output) {
+        Ok(written) => written,
+        Err(error) => {
+            let _ = fs::remove_file(&temporary);
+            return Err(error);
+        }
+    };
+    if written != blob.length {
+        let _ = fs::remove_file(&temporary);
+        return refuse(
+            Code::LENGTH_MISMATCH,
+            format!(
+                "{} delivered {written} bytes, expected {}",
+                blob.id(),
+                blob.length
+            ),
+        );
+    }
+    output
+        .flush()
+        .map_err(|error| io("flush materialized file", error))?;
+    output
+        .sync_all()
+        .map_err(|error| io("fsync materialized file", error))?;
+    drop(output);
+    fs::rename(&temporary, destination).map_err(|error| io("rename materialized file", error))?;
+    Ok(written)
+}
+
 pub fn render(bytes: &[u8], max: usize) -> Result<String> {
     if let Ok(header) = crate::header::Header::parse(bytes) {
         return Ok(canon::pretty(&header.diagnostic_value()?, 0));
     }
-    let v = canon::parse_canonical(bytes, max)?;
-    Ok(canon::pretty(&v, 0))
+    let value = canon::parse_canonical(bytes, max)?;
+    Ok(canon::pretty(&value, 0))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::store::{Fault, Store};
+    use std::sync::{Arc, Barrier};
+
+    #[test]
+    fn concurrent_materializations_do_not_share_a_temp_name() {
+        let root = std::env::temp_dir().join(format!(
+            "tensorfs-materialize-{}-{}",
+            std::process::id(),
+            crate::meta::now_nanos_unique()
+        ));
+        let store = Arc::new(Store::init(&root).unwrap());
+        let bytes = vec![7u8; 1 << 20];
+        let object = store
+            .put_stream(
+                &mut bytes.as_slice(),
+                Some(&ObjectRef::of(&bytes)),
+                &Fault::default(),
+            )
+            .unwrap()
+            .obj;
+        let destination = root.join("out.bin");
+        let barrier = Arc::new(Barrier::new(3));
+        let mut threads = Vec::new();
+        for _ in 0..2 {
+            let store = Arc::clone(&store);
+            let object = object.clone();
+            let destination = destination.clone();
+            let barrier = Arc::clone(&barrier);
+            threads.push(std::thread::spawn(move || {
+                barrier.wait();
+                materialize(&store, &object, &destination)
+            }));
+        }
+        barrier.wait();
+        for thread in threads {
+            assert_eq!(thread.join().unwrap().unwrap(), bytes.len() as u64);
+        }
+        assert_eq!(fs::read(destination).unwrap(), bytes);
+        assert_eq!(
+            fs::read_dir(&root)
+                .unwrap()
+                .flatten()
+                .filter(|entry| entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with(".materialize-"))
+                .count(),
+            0
+        );
+        let _ = fs::remove_dir_all(root);
+    }
 }
