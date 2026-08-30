@@ -106,6 +106,17 @@ func TestRentalCreatorIdentityAndDelegation(t *testing.T) {
 	if len(signature) != ed25519.SignatureSize || !ed25519.Verify(public, canonicalBytes, signature) {
 		t.Fatal("the persisted rental key did not sign the exact delegation bytes")
 	}
+	noModel, err := canonical.Bytes(&pb.ArtifactDelegation{
+		RentalId: "rnt-01K5PROTO013", WorkerId: "wrk-4070", WorkerBootId: "boot-9f21",
+		WorkerTlsCertificateDigest: certificateDigest, Revision: 5,
+		PackageReleaseIds: []string{"cozy/marco-polo@v1"}, ModelCheckpointIds: []string{},
+		DelegationId: "dlg-2026-08-29-no-model", ExpiresAtUnix: 1787004000,
+	})
+	must(t, err)
+	wantNoModel := []byte(`{"delegation_id":"dlg-2026-08-29-no-model","expires_at_unix":1787004000,"format":"cozy.worker.v1.ArtifactDelegation/1","model_checkpoint_ids":[],"package_release_ids":["cozy/marco-polo@v1"],"rental_id":"rnt-01K5PROTO013","revision":5,"worker_boot_id":"boot-9f21","worker_id":"wrk-4070","worker_tls_certificate_digest":"sha256:4c5b5699f2d99ebf9195c1e518d13c94539bbd4ba670a46199f6d79d58d15721"}`)
+	if !bytes.Equal(noModel, wantNoModel) {
+		t.Fatalf("no-model ArtifactDelegation omitted the explicit empty set:\n got %s\nwant %s", noModel, wantNoModel)
+	}
 }
 
 func testWorkerCertificate(t *testing.T) []byte {
