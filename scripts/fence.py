@@ -134,19 +134,16 @@ def fence_facade():
 CODEC_OWNERS = {
     "tensorfs.snapshot/1": {"crates/tensorfs-core/src/manifest.rs"},
     "cozytensors/1": {"crates/tensorfs-core/src/header.rs"},
-    "cozytensors.topology/1": {"crates/tensorfs-core/src/header.rs"},
     "tensorfs.encoding_spec/1": {"crates/tensorfs-core/src/spec.rs"},
     "tensorfs.encoding_vectors/1": {"crates/tensorfs-core/src/vectors.rs"},
     "tensorfs.meta/1": {"crates/tensorfs-core/src/meta.rs"},
     "tensorfs.store/1": {"crates/tensorfs-core/src/store.rs"},
     "tensorfs.verification/1": {"crates/tensorfs-core/src/store.rs"},
-    "tensorfs.structure_fixture/1": {"crates/tensorfs-core/src/structure.rs"},
     # the ingest border (tfs-003): every document is a CAS object or a transaction root
     "tensorfs.ingest_profile/1": {"crates/tensorfs-core/src/ingest/mod.rs"},
     "tensorfs.ingest_subject/1": {"crates/tensorfs-core/src/ingest/mod.rs"},
     "tensorfs.ingest_receipt/1": {"crates/tensorfs-core/src/ingest/mod.rs"},
     "tensorfs.ingest_root/1": {"crates/tensorfs-core/src/ingest/transaction.rs"},
-    "tensorfs.fingerprint_registry/1": {"crates/tensorfs-core/src/ingest/fingerprint.rs"},
     "tensorfs.stamp/1": {"crates/tensorfs-core/src/ingest/stamp.rs"},
     # the layout plane (tfs-009)
     "cozytensors.code_topology/1": {"crates/tensorfs-core/src/compat.rs"},
@@ -159,6 +156,11 @@ CODEC_OWNERS = {
     "tensorfs.publish_grant/1": {"crates/tensorfs-core/src/cloud.rs"},
     "tensorfs.verified_object/1": {"crates/tensorfs-core/src/cloud.rs"},
     "tensorfs.catalog_root/1": {"crates/tensorfs-core/src/cloud.rs"},
+}
+# Identity domains can remain stable without pretending their hash preimages are standalone
+# documents. They have one owner, no parser, no stored bytes, and do not count as formats.
+IDENTITY_DOMAIN_OWNERS = {
+    "cozytensors.topology/1": {"crates/tensorfs-core/src/header.rs"},
 }
 # proto-007: a format name exists ONLY for a document that crosses a repo/process boundary
 # AND is stored or digested. The dict above IS the registry; a `const FORMAT` the crate
@@ -301,6 +303,10 @@ def fence_one_codec():
                 why = "sits outside the owning crate"
             bad.append(f"{r}: names format '{m}' owned by {sorted(owners)} and {why}"
                        " — a rival implementation of an identity-bearing codec")
+        for domain, owners in IDENTITY_DOMAIN_OWNERS.items():
+            if domain in text and r not in owners:
+                bad.append(f"{r}: names identity domain '{domain}' owned by {sorted(owners)}"
+                           " — topology identity has one hash-preimage writer")
         # (b) grammar tags live in exactly one file
         if r not in GRAMMAR_HOME:
             for t in GRAMMAR_TAGS:
@@ -324,7 +330,9 @@ def fence_one_codec():
                         continue
                     if re.search(r"(?<![\w])" + w + r"(?![\w])", s):
                         bad.append(f"{r}:{i}: deleted vocabulary '{w}': {s}")
-    return bad, (f"{len(CODEC_MARKS)} owned formats, {len(GRAMMAR_TAGS)} grammar tags in "
+    return bad, (f"{len(CODEC_MARKS)} owned formats, "
+                 f"{len(IDENTITY_DOMAIN_OWNERS)} identity domain, "
+                 f"{len(GRAMMAR_TAGS)} grammar tags in "
                  f"{len(GRAMMAR_HOME)} file, {len(FOREIGN)} foreign parsers confined to "
                  f"{INGEST_OK_PREFIX}, {len(EXCLUDED)} deleted words")
 

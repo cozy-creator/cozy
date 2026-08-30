@@ -8,14 +8,12 @@
 use crate::err::{refuse, Code, Refusal, Result};
 use crate::header::{Closure, Header};
 use crate::ids::Doc;
-use crate::ingest::fingerprint::FingerprintRegistry;
 use crate::ingest::transaction::IngestRoot;
 use crate::ingest::{IngestProfile, IngestSubject, IngestVerificationReceipt};
 use crate::manifest::SnapshotManifest;
 use crate::meta::State;
 use crate::registry;
 use crate::spec::EncodingSpec;
-use crate::structure::StructureFixture;
 use crate::vectors::EncodingVectors;
 
 /// What a vector's bytes turned into. `id` is the universal identity law
@@ -33,11 +31,9 @@ pub const DOC_KINDS: &[&str] = &[
     "header-serving",
     "spec",
     "vectors",
-    "structure",
     "manifest",
     "profile",
     "subject",
-    "registry",
     "root",
     "receipt",
     "stamp",
@@ -74,9 +70,6 @@ pub fn run_doc(
             v.check(&plain)?;
             Ok((None, None))
         })?,
-        // A structure fixture's banked key is its topology_digest, so that is what the
-        // corpus freezes: a fixture whose projection drifts announces itself here.
-        "structure" => StructureFixture::parse(bytes).map(|f| (Some(f.topology_digest()), None))?,
         // A decode IS the path law now: `SnapshotManifest` cannot exist unvalidated, so
         // parsing is the whole check and there is no second validate() to forget.
         "manifest" => SnapshotManifest::parse(bytes).map(|m| (None, m.checkpoint_id().ok()))?,
@@ -85,7 +78,6 @@ pub fn run_doc(
             Ok((None, None))
         })?,
         "subject" => IngestSubject::parse(bytes).map(|_| (None, None))?,
-        "registry" => FingerprintRegistry::parse(bytes).map(|_| (None, None))?,
         "root" => IngestRoot::parse(bytes).map(|_| (None, None))?,
         "receipt" => IngestVerificationReceipt::parse(bytes).map(|_| (None, None))?,
         "stamp" => crate::ingest::stamp::Stamp::parse(bytes).map(|_| (None, None))?,

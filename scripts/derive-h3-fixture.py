@@ -4,8 +4,7 @@
 This is a TRANSCRIPTION of evidence, not a parser and not a codec: it reads one committed
 safetensors header JSON (already extracted from the real artifact — no container is opened
 here) and emits `component<TAB>key<TAB>logical_dtype<TAB>d,d,d` rows on stdout. `tfs
-structure bank` turns those rows into the canonical document, so canonical bytes have
-exactly one writer.
+structure bank` validates those rows and writes reviewed fixture data.
 
 **The source must be named explicitly, and the old default is GONE.**
 `minimax_h3_fl2va_fp8_scaled.header.json` was proven fabricated (2026-08-25): 943 logical
@@ -93,7 +92,7 @@ h.pop("__metadata__", None)
 # whole, leaving `blocks.0.attn.out_proj`, which matches no key — so rule 2 never fired
 # once in the life of this script. It was invisible while the source was the fabricated
 # header, whose tensors were declared BF16 anyway; against a real fp8 carrier it banks 200
-# F8_E4M3 CARRIER dtypes into a document whose whole subject is the logical structure.
+# F8_E4M3 CARRIER dtypes into fixture data whose whole subject is the logical structure.
 quantized = {k[: -len("_scale")] for k in h if k.endswith(".weight_scale")}
 unknown = sorted(
     k for k in h

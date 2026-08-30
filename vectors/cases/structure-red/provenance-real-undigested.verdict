@@ -1,4 +1,0 @@
-doc: structure
-expect: refuse
-code: MISSING_FIELD
-note: a claim of realness with no source digest is unfalsifiable

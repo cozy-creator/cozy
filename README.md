@@ -63,13 +63,14 @@ scripts/snapshot-runs.sh all        # the whole plane plus its red arms
 and their vector sets) live at `closure/<digest>.json`, where the path terminal IS the
 digest; the header attachment is TYPED and must be projected at exactly one path.
 
-Target tfs-033 simplifies this vocabulary and layout: the public type/format is
-`Manifest`/`tensorfs.manifest/1`, its exact JSON
-bytes live under `manifests/<hash>.json`, and that hash is the snapshot id. The file map carries one
+Target tfs-033 simplifies this vocabulary and layout: the public type is `Manifest`; its exact
+canonical JSON bytes live under `manifests/<hash>.json`, and that hash is the `manifest_id`.
+The fixed namespace supplies the type, so the JSON has no embedded format/version tag. There is no
+separate Snapshot document or `snapshot_id` noun. The file map carries one
 typed `model.cozytensors` header entry rather than repeating it in an attachment field. All content
 bytes reached by the manifest live under `blobs/<hash>`.
 
-## reads and projection (tfs-005)
+## reads, checkout, and materialization (tfs-005)
 
 `read_into(range, caller_buffer, lease)` is the one byte door. The caller owns every buffer;
 TensorFS owns range validation, verified identity, short reads and the lease. There is no
@@ -87,6 +88,14 @@ tfs materialize <root> <file> <dest>    # tier 3: stream a RETAINED carrier blob
 scripts/read-runs.sh arms|real|bench
 ```
 
+The command block above is the current pre-hardcut grammar. The target names the disposable
+symlink tree a **checkout** and reserves **materialize** for writing independent bytes:
+
+```bash
+tfs checkout <store> <manifest> <destination>
+tfs materialize <store> <manifest> <path> <destination>
+```
+
 ## roots, holds and GC (tfs-006)
 
 As implemented today, `meta/state.json` under `meta/LOCK` is the sole local root authority;
@@ -94,8 +103,9 @@ As implemented today, `meta/state.json` under `meta/LOCK` is the sole local root
 share the same three authoritative namespaces: `repos/<org>/<name>.json`, immutable
 `manifests/<hash>.json`, and immutable `blobs/<hash>`. One repo JSON maps `(version,lane)` releases
 directly to manifests; manifests map virtual filenames to blobs. The manifest hash is the snapshot
-id, and a snapshot is not another stored document. Local `snapshots/<manifest>/` is an optional
-disposable symlink view. An in-process `tensorfs.sqlite` mirrors repo/release metadata for lookup;
+id in the current implementation and becomes `manifest_id` at the hardcut; no separate Snapshot
+document or id remains. Local checkout trees are optional disposable symlink views. An in-process
+`tensorfs.sqlite` mirrors repo/release metadata for lookup;
 Tensorhub uses the same logical projection in PostgreSQL. Either database rebuilds from repo files
 and never authorizes GC.
 
@@ -175,10 +185,11 @@ three non-base variants). Adding vectors CHANGES the spec digest — an immutabl
 gained normative content — so anything that pinned the old one must re-derive.
 
 `vectors/` is frozen DATA: `closure/` holds the platform EncodingSpec objects, `fingerprints/`
-the reviewed classification registry, `cases/<group>/`
+holds plain reviewed classification data, `cases/<group>/`
 holds each vector's exact stored bytes plus a `.verdict` (expected outcome, frozen ids),
-`mined/` holds the producer-mined conformance vectors and `structure/` the banked
-structure fixtures. `vectors gen` regenerates only `cases/` and `closure/` — the other two
+`mined/` holds the producer-mined conformance vectors and `structure/` plain reviewed
+structure data. Neither structure nor fingerprint data is a product document or has an
+ObjectId. `vectors gen` regenerates only `cases/` and `closure/` — the other two
 are evidence with their own provenance and their own banking commands.
 Caps in `limits.rs` are PROVISIONAL until proto-001's real H3+SDXL corpus ratifies them.
 
@@ -315,11 +326,14 @@ Verdicts and arms are frozen under `vectors/qualification/`.
 
 A format name (`tensorfs.<kind>/1`) exists only for a document that crosses a repo or process
 boundary AND is stored or digested; everything else is a plain struct with no format string and
-no version. The registry is `CODEC_OWNERS` in `scripts/fence.py` (24 marks, one owning module
-each); the fence refuses a `const FORMAT` the crate declares outside it. Demoted 2026-08-27:
+no version. The registry is `CODEC_OWNERS` in `scripts/fence.py` (21 formats, one owning module
+each); the fence refuses a `const FORMAT` the crate declares outside it. The topology hash
+domain is counted separately because it has no stored bytes or parser. Demoted 2026-08-27:
 `operation_receipt` (stdout only), `capability_records` (compiled-in), `fetch_plan` +
 `delivery_grant` (one pull session's scratch), `grade_decision` + `conversion_registration`
-(verifier-internal). Kept by caution: the ingest quartet (their refs are snapshot evidence).
+(verifier-internal). Demoted 2026-08-29: structure fixtures and the fingerprint registry
+(plain reviewed data), plus the topology projection marker (an internal identity domain).
+Kept by caution: the ingest quartet (their refs are snapshot evidence).
 
 ## exact derived snapshots (tfs-019)
 
@@ -376,7 +390,7 @@ language can drift.
 ```bash
 scripts/wheel-smoke.sh                  # build, install into a fresh venv, read a NAMED
                                         # tensor out of vectors/store, match the banked digest
-scripts/facade-conform.py               # the 122 shared vectors, verdict-for-verdict
+scripts/facade-conform.py               # the 115 shared document vectors, verdict-for-verdict
 scripts/facade-runs.py arms|real|bench <store> <snap>
 scripts/facade-h2d-smoke.py <store> <snap>   # cr-005's fill loop with the facade as reader
 scripts/transfer-runs.py                      # exact admit/skip/corruption Store transfer

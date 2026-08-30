@@ -485,7 +485,7 @@ pub fn cmd_bank(
     // The REVIEW ACT does not get to leave behind a document the border cannot read. A
     // `--source-name` with one em dash in it wrote a registry that every later run refused
     // NON_ASCII_FIELD, at the far end of the pipeline and with the review already "done".
-    let bytes = reg.canonical_bytes();
+    let bytes = reg.to_bytes();
     ok!(FingerprintRegistry::parse(&bytes));
     if let Err(e) = fs::write(&p, &bytes) {
         eprintln!("REFUSED IO_FAILED: write {}: {e}", p.display());

@@ -1,7 +1,7 @@
-//! Structure fixtures (tfs-008): a banked canonical projection plus its `topology_digest`
+//! Structure fixtures (tfs-008): reviewed source data plus its `topology_digest`
 //! for ONE (task family, structural variant).
 //!
-//! A fixture is EVIDENCE, so it carries its provenance in the same bytes that carry its
+//! A fixture is evidence, so it carries its provenance in the same data that carries its
 //! claim. `real` names the exact source artifact by digest; `synthetic` says so out loud.
 //! There is no third state and no default — a fixture cannot be banked without saying
 //! where its shapes came from, which is the only thing that stops a fabrication from
@@ -14,7 +14,7 @@ use crate::canon::{as_arr, as_obj, as_str, Fields, Value};
 use crate::dtype::Dtype;
 use crate::err::{refuse, Code, Result};
 use crate::header::{topology_digest_of, topology_value};
-use crate::ids::{ascii_name, check_format, hex64, Doc};
+use crate::ids::{ascii_name, hex64};
 use crate::limits;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -47,6 +47,19 @@ pub struct StructureFixture {
 }
 
 impl StructureFixture {
+    /// Read reviewed fixture data. A fixture is source/configuration data, not a stored or
+    /// digested TensorFS document, so its containing path supplies the type and there is no
+    /// format/version field or canonical-byte identity.
+    pub fn parse(bytes: &[u8]) -> Result<Self> {
+        Self::from_value(&crate::canon::parse(bytes, limits::DOC_MAX_BYTES)?)
+    }
+
+    /// Stable source rendering for the banking command. These bytes are convenient output,
+    /// not an ObjectId and not part of the product document registry.
+    pub fn to_bytes(&self) -> Vec<u8> {
+        crate::canon::write(&self.to_value())
+    }
+
     pub fn tensors(&self) -> impl Iterator<Item = (&str, &str, Dtype, &[u64])> {
         self.components.iter().flat_map(|(c, ks)| {
             ks.iter()
@@ -77,18 +90,9 @@ fn shape_value(s: &[u64]) -> Value {
     Value::arr(s.iter().map(|d| Value::uint(*d)).collect())
 }
 
-impl Doc for StructureFixture {
-    const FORMAT: &'static str = "tensorfs.structure_fixture/1";
-    const MAX_BYTES: usize = limits::DOC_MAX_BYTES;
-
+impl StructureFixture {
     fn from_value(v: &Value) -> Result<Self> {
         let mut f = Fields::new("StructureFixture", v)?;
-        check_format(
-            "StructureFixture",
-            as_str("StructureFixture", "format", f.req("format")?)?,
-            Self::FORMAT,
-        )?;
-
         let mut components = Vec::new();
         for (name, cv) in as_obj("StructureFixture", "components", f.req("components")?)? {
             ascii_name("StructureFixture.component", name, limits::MAX_NAME_BYTES)?;
@@ -223,7 +227,6 @@ impl Doc for StructureFixture {
                         .collect(),
                 ),
             ),
-            ("format", Value::str(Self::FORMAT)),
             ("provenance", Value::obj(p)),
             (
                 "structural_variant",
@@ -231,5 +234,49 @@ impl Doc for StructureFixture {
             ),
             ("task_family", Value::str(self.task_family.clone())),
         ])
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn fixture() -> StructureFixture {
+        StructureFixture {
+            task_family: "test".into(),
+            structural_variant: "minimal".into(),
+            provenance: Provenance {
+                kind: SYNTHETIC.into(),
+                source: "unit test".into(),
+                source_sha256: None,
+                note: "plain reviewed data".into(),
+            },
+            components: vec![(
+                "model".into(),
+                vec![(
+                    "weight".into(),
+                    Logical {
+                        dtype: Dtype::F32,
+                        shape: vec![1],
+                    },
+                )],
+            )],
+        }
+    }
+
+    #[test]
+    fn fixture_is_plain_data_not_a_document_format() {
+        let fixture = fixture();
+        let bytes = fixture.to_bytes();
+        assert!(!String::from_utf8_lossy(&bytes).contains("format"));
+        assert_eq!(StructureFixture::parse(&bytes).unwrap(), fixture);
+
+        let old = String::from_utf8(bytes)
+            .unwrap()
+            .replacen('{', r#"{"format":"retired","#, 1);
+        assert_eq!(
+            StructureFixture::parse(old.as_bytes()).unwrap_err().code,
+            Code::UNKNOWN_FIELD
+        );
     }
 }

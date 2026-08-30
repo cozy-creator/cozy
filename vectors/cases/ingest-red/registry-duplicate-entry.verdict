@@ -1,4 +1,0 @@
-doc: registry
-expect: refuse
-code: DUPLICATE_KEY
-note: one (key set, component) is banked once — twice is a review defect
