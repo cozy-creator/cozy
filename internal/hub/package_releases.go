@@ -16,9 +16,6 @@ type PackageUpload struct {
 	URL             string            `json:"url"`
 	RequiredHeaders map[string]string `json:"required_headers"`
 	AlreadyUploaded bool              `json:"already_uploaded"`
-	// ExpiresAt is deliberately decoded so strict response validation accepts
-	// the storage grant's informational expiry. Upload execution does not need it.
-	ExpiresAt string `json:"expires_at,omitempty"`
 }
 
 type PackageProfileState struct {

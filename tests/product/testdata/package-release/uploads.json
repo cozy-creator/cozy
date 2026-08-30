@@ -2,7 +2,6 @@
   "uploads": [
     {
       "already_uploaded": false,
-      "expires_at": "2026-08-29T18:00:00Z",
       "kind": "source",
       "path": "package.toml",
       "required_headers": {},
