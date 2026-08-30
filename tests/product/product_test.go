@@ -214,6 +214,11 @@ func TestRentalCommandsSeparateInventoryFromCatalog(t *testing.T) {
 		!strings.Contains(out, "sm_90") || !strings.Contains(out, "141 GB") || !strings.Contains(out, "$3.99/hr") {
 		t.Fatalf("rental new did not show the SKU catalog [exit %d]\n%s", code, out)
 	}
+	if code, out := runCozyDir(t, root, ".", []string{"TENSORHUB_URL=" + server.URL},
+		"rental", "new", "--name", "studio"); code != 2 ||
+		!strings.Contains(out, "options require a GPU SKU and package") {
+		t.Fatalf("catalog view silently accepted rental options [exit %d]\n%s", code, out)
+	}
 }
 
 func TestPackagePublishRefusesSilentlyOmittedPrivateFiles(t *testing.T) {

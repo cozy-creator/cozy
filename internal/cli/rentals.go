@@ -63,7 +63,13 @@ func rentalStores(ctx *Context) (home.Layout, *records.Store, *exit.Error) {
 func handleRent(ctx *Context) *exit.Error {
 	skuName := strings.TrimSpace(ctx.Inv.Args[0])
 	packageRef := strings.TrimSpace(ctx.Inv.Args[1])
+	requestedMachineName := strings.TrimSpace(ctx.Inv.Value("--name"))
 	if skuName == "" {
+		if requestedMachineName != "" || ctx.Inv.Value("--idempotency-key") != "" ||
+			ctx.Inv.Value("--timeout") != "" || ctx.Inv.Value("--models") != "" {
+			return exit.Usagef("rental options require a GPU SKU and package").
+				WithRemedy("use `cozy rental new` alone to list available machines")
+		}
 		hctx, cancel := hub.Context()
 		skus, e := client(ctx).RentalSKUs(hctx)
 		cancel()
@@ -77,7 +83,6 @@ func handleRent(ctx *Context) *exit.Error {
 			WithRemedy("append org/package/vN/function").
 			WithNext("cozy rental new " + skuName + " <org/package/vN/function>")
 	}
-	requestedMachineName := strings.TrimSpace(ctx.Inv.Value("--name"))
 	if requestedMachineName != "" && !rentalid.ValidMachineName(requestedMachineName) {
 		return exit.Usagef("--name %q is not a machine name", requestedMachineName).
 			WithRemedy("use 1-32 lowercase letters, numbers, and hyphens; local is reserved")
