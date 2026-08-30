@@ -414,15 +414,37 @@ impl Store {
             );
         }
         let classification = match mutation {
-            crate::repository::Mutation::PutRelease { manifest, .. } => {
+            crate::repository::Mutation::PutRelease {
+                manifest, metadata, ..
+            } => {
                 let parsed = self.read_manifest(manifest)?;
-                let header_ref = parsed.header().ok_or_else(|| Refusal {
-                    code: Code::ATTACHMENT_CARDINALITY,
-                    detail: "release manifest has no cozytensors entry".into(),
-                })?;
-                let header = crate::checkpoint::load_header(self, header_ref)?;
-                crate::checkpoint::walk(self, &parsed)?.require_resident(self)?;
-                Some(header.topology_digest())
+                for (_, entry) in parsed.entries() {
+                    let object = entry.blob();
+                    let file = self.open_verified(&object.sha256)?;
+                    if file.len() != object.length {
+                        return refuse(
+                            Code::LENGTH_MISMATCH,
+                            format!("{} length differs from manifest", object.id()),
+                        );
+                    }
+                }
+                if let Some(metadata) = metadata {
+                    let file = self.open_verified(&metadata.sha256)?;
+                    if file.len() != metadata.length {
+                        return refuse(
+                            Code::LENGTH_MISMATCH,
+                            format!("{} length differs from release metadata", metadata.id()),
+                        );
+                    }
+                }
+                match parsed.header() {
+                    Some(header_ref) => {
+                        let header = crate::checkpoint::load_header(self, header_ref)?;
+                        crate::checkpoint::walk(self, &parsed)?.require_resident(self)?;
+                        Some(header.topology_digest())
+                    }
+                    None => None,
+                }
             }
             crate::repository::Mutation::RemoveRelease { .. }
             | crate::repository::Mutation::DeleteRepository { .. } => None,

@@ -129,8 +129,7 @@ fn repo_rows(repository: &Repository, bytes: &[u8]) -> Vec<Vec<u8>> {
         ("org", Value::str(repository.repo.org.clone())),
     ]))];
     for release in &repository.releases {
-        rows.push(tensorfs_core::canon::write(&Value::obj(vec![
-            ("evidence", release.evidence.to_value()),
+        let mut fields = vec![
             ("kind", Value::str("release")),
             ("lane", Value::str(release.lane.clone())),
             ("manifest_length", Value::uint(release.manifest.length)),
@@ -141,7 +140,14 @@ fn repo_rows(repository: &Repository, bytes: &[u8]) -> Vec<Vec<u8>> {
             ("name", Value::str(repository.repo.name.clone())),
             ("org", Value::str(repository.repo.org.clone())),
             ("version", Value::str(release.version.clone())),
-        ])));
+        ];
+        if let Some(evidence) = &release.evidence {
+            fields.push(("evidence", evidence.to_value()));
+        }
+        if let Some(metadata) = &release.metadata {
+            fields.push(("metadata", metadata.to_value()));
+        }
+        rows.push(tensorfs_core::canon::write(&Value::obj(fields)));
     }
     rows
 }
@@ -250,14 +256,10 @@ pub fn cmd_repo_apply(current: &str, mutation: &Path, flags: &Flags) -> ExitCode
 
     let inputs = match &mutation {
         Mutation::PutRelease { manifest, .. } => {
-            let (Some(manifest_path), Some(header_path), Some(inventory_path)) = (
-                flag(flags, "manifest"),
-                flag(flags, "header"),
-                flag(flags, "inventory"),
-            ) else {
-                eprintln!(
-                    "put_release requires --manifest <json> --header <cbor> --inventory <jsonl>"
-                );
+            let (Some(manifest_path), Some(inventory_path)) =
+                (flag(flags, "manifest"), flag(flags, "inventory"))
+            else {
+                eprintln!("put_release requires --manifest <json> --inventory <jsonl>");
                 return ExitCode::from(2);
             };
             let manifest_bytes = match read(Path::new(manifest_path)) {
@@ -274,45 +276,46 @@ pub fn cmd_repo_apply(current: &str, mutation: &Path, flags: &Flags) -> ExitCode
                 Ok(value) => value,
                 Err(error) => return bail(error),
             };
-            let header_ref = match parsed.header() {
-                Some(value) => value,
-                None => {
-                    return bail(Refusal {
-                        code: Code::ATTACHMENT_CARDINALITY,
-                        detail: "release manifest has no cozytensors entry".into(),
-                    })
+            let (header_bytes, classification) = match (parsed.header(), flag(flags, "header")) {
+                (Some(header_ref), Some(header_path)) => {
+                    let bytes = match read(Path::new(header_path)) {
+                        Ok(value) => value,
+                        Err(error) => return bail(error),
+                    };
+                    if ObjectRef::of(&bytes) != *header_ref {
+                        return bail(Refusal {
+                            code: Code::OBJECT_ID_MISMATCH,
+                            detail: "staged header bytes disagree with manifest".into(),
+                        });
+                    }
+                    let header = match Header::parse(&bytes) {
+                        Ok(value) => value,
+                        Err(error) => return bail(error),
+                    };
+                    let topology = header.topology_digest();
+                    println!("topology_digest {topology}");
+                    (Some(bytes), Some(topology))
+                }
+                (None, None) => (None, None),
+                (Some(_), None) => {
+                    eprintln!("a CozyTensors manifest also requires --header <cbor>");
+                    return ExitCode::from(2);
+                }
+                (None, Some(_)) => {
+                    eprintln!("--header is invalid for an ordinary-file manifest");
+                    return ExitCode::from(2);
                 }
             };
-            let header_bytes = match read(Path::new(header_path)) {
-                Ok(value) => value,
-                Err(error) => return bail(error),
-            };
-            if ObjectRef::of(&header_bytes) != *header_ref {
-                return bail(Refusal {
-                    code: Code::OBJECT_ID_MISMATCH,
-                    detail: "staged header bytes disagree with manifest".into(),
-                });
-            }
-            let header = match Header::parse(&header_bytes) {
-                Ok(value) => value,
-                Err(error) => return bail(error),
-            };
-            println!("topology_digest {}", header.topology_digest());
             let inventory = match storage::read_inventory(Path::new(inventory_path)) {
                 Ok(value) => value,
                 Err(error) => return bail(error),
             };
-            Some((
-                manifest_bytes,
-                header_bytes,
-                inventory,
-                header.topology_digest(),
-            ))
+            Some((manifest_bytes, header_bytes, inventory, classification))
         }
         Mutation::RemoveRelease { .. } | Mutation::DeleteRepository { .. } => None,
     };
 
-    let classification = inputs.as_ref().map(|inputs| inputs.3.as_str());
+    let classification = inputs.as_ref().and_then(|inputs| inputs.3.as_deref());
     let replacement = match repository::apply(current_bytes.as_deref(), &mutation, classification) {
         Ok(value) => value,
         Err(error) => return bail(error),
@@ -335,7 +338,7 @@ pub fn cmd_repo_apply(current: &str, mutation: &Path, flags: &Flags) -> ExitCode
                         &bytes,
                         release,
                         &manifest,
-                        &header,
+                        header.as_deref(),
                         inventory,
                     ) {
                         Ok(projection) => projection.json_lines(),
