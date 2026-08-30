@@ -172,7 +172,9 @@ func TestPackagePublishPendingWireFlowBoundsUploads(t *testing.T) {
 
 	code, out := runCozyDir(t, t.TempDir(), project,
 		[]string{"TENSORHUB_URL=" + server.URL, "TENSORHUB_TOKEN=proof-token"}, "package", "publish")
-	if code != 0 || !strings.Contains(out, "generate@cpu-py311-torch213=qualified") {
+	if code != 0 || !strings.Contains(out, "eligible_worker_profiles:") ||
+		!strings.Contains(out, "generate@cpu-py311-torch213=qualified") ||
+		strings.Contains(out, "qualification:") {
 		t.Fatalf("pending package wire flow failed [exit %d]\n%s", code, out)
 	}
 	if began.Load() != 1 || registered.Load() != 1 || finalized.Load() != 1 {

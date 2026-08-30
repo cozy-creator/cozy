@@ -64,7 +64,7 @@ func TestPackagePublishRefusesSilentlyOmittedPrivateFiles(t *testing.T) {
 	}
 }
 
-func TestPackagePublishCommittedReplaySkipsBuildAndCarriesFutureQualification(t *testing.T) {
+func TestPackagePublishCommittedReplaySkipsBuildAndStaysCompact(t *testing.T) {
 	project := t.TempDir()
 	must(t, os.Mkdir(filepath.Join(project, "replay_package"), 0o755))
 	must(t, os.WriteFile(filepath.Join(project, "replay_package", "__init__.py"), []byte("VALUE = 1\n"), 0o644))
@@ -96,9 +96,9 @@ organization = "proof"
 	defer server.Close()
 	code, out := runCozyDir(t, t.TempDir(), project,
 		[]string{"TENSORHUB_URL=" + server.URL, "TENSORHUB_TOKEN=proof-token"}, "package", "publish")
-	if code != 0 || !strings.Contains(out, "future-compatible-state") ||
-		!strings.Contains(out, "changed:") || !strings.Contains(out, "false") {
-		t.Fatalf("committed replay built the project or rejected a future qualification state [exit %d]\n%s", code, out)
+	if code != 0 || !strings.Contains(out, "status:  already published") ||
+		strings.Contains(out, "qualification:") || strings.Contains(out, "changed:") {
+		t.Fatalf("committed replay built the project or emitted verbose state [exit %d]\n%s", code, out)
 	}
 }
 
