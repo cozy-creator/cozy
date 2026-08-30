@@ -18,7 +18,7 @@ func handleAuthLogin(ctx *Context) *exit.Error {
 	session, problem := manager.Authenticate(hctx)
 	cancel()
 	if problem == nil {
-		return emitAuthSession(ctx, session, false)
+		return emitAuthSession(ctx, session, "authenticated")
 	}
 	if !canEnroll(problem) {
 		return problem
@@ -43,7 +43,24 @@ func handleAuthLogin(ctx *Context) *exit.Error {
 	if problem != nil {
 		return problem
 	}
-	return emitAuthSession(ctx, session, true)
+	return emitAuthSession(ctx, session, "registered")
+}
+
+func handleAuthStatus(ctx *Context) *exit.Error {
+	manager := accountauth.New(ctx.Cfg)
+	hctx, cancel := hub.Context()
+	session, problem := manager.Authenticate(hctx)
+	cancel()
+	if problem != nil {
+		if canEnroll(problem) {
+			return emit(ctx, compactRecord([]output.Field{
+				{K: "status", V: "not logged in"},
+				{K: "hub", V: ctx.Cfg.HubURL},
+			}, "status"))
+		}
+		return problem
+	}
+	return emitAuthSession(ctx, session, "logged in")
 }
 
 func canEnroll(problem *exit.Error) bool {
@@ -58,22 +75,18 @@ func canEnroll(problem *exit.Error) bool {
 	return false
 }
 
-func emitAuthSession(ctx *Context, session accountauth.Session, enrolled bool) *exit.Error {
+func emitAuthSession(ctx *Context, session accountauth.Session, status string) *exit.Error {
 	hctx, cancel := hub.Context()
 	_, problem := client(ctx).WithToken(session.AccessToken, "machine login").CurrentUser(hctx)
 	cancel()
 	if problem != nil {
 		return problem
 	}
-	status := "authenticated"
-	if enrolled {
-		status = "registered"
-	}
-	return emit(ctx, output.Record{Fields: []output.Field{
+	return emit(ctx, compactRecord([]output.Field{
 		{K: "status", V: status},
 		{K: "email", V: session.Email},
 		{K: "machine", V: session.DeviceKeyID},
 		{K: "hub", V: ctx.Cfg.HubURL},
 		{K: "access_expires", V: session.ExpiresAt},
-	}})
+	}, "status", "email"))
 }

@@ -119,6 +119,10 @@ func TestEmailMachineLoginAndAutomaticReauthentication(t *testing.T) {
 	defer server.Close()
 
 	root := t.TempDir()
+	before := runAuthCozy(t, root, server.URL, "", "auth", "status", "--json")
+	if before.code != 0 || !strings.Contains(before.stdout, `"status":"not logged in"`) || before.stderr != "" {
+		t.Fatalf("status before login [exit %d]\nstdout: %s\nstderr: %s", before.code, before.stdout, before.stderr)
+	}
 	first := runAuthCozy(t, root, server.URL, "123456\n", "auth", "login", "person@example.com", "--json")
 	if first.code != 0 || !strings.Contains(first.stdout, `"status":"registered"`) ||
 		strings.Contains(first.stdout, "personal_org") ||
@@ -149,6 +153,11 @@ func TestEmailMachineLoginAndAutomaticReauthentication(t *testing.T) {
 	if second.code != 0 || !strings.Contains(second.stdout, `"status":"authenticated"`) || second.stderr != "" {
 		t.Fatalf("automatic login [exit %d]\nstdout: %s\nstderr: %s", second.code, second.stdout, second.stderr)
 	}
+	status := runAuthCozy(t, root, server.URL, "", "auth", "status", "--json")
+	if status.code != 0 || !strings.Contains(status.stdout, `"status":"logged in"`) ||
+		!strings.Contains(status.stdout, `"email":"person@example.com"`) || status.stderr != "" {
+		t.Fatalf("status after login [exit %d]\nstdout: %s\nstderr: %s", status.code, status.stdout, status.stderr)
+	}
 	manager := accountauth.New(config.Config{Home: root, HubURL: server.URL})
 	hubClient := hub.New(config.Config{HubURL: server.URL}, "cozy-product-auth-test").WithTokenSource(manager)
 	requestBody, problem := hub.RentalRequestBytes("proof/marco@release", "cpu", strings.Repeat("1", 64),
@@ -161,8 +170,8 @@ func TestEmailMachineLoginAndAutomaticReauthentication(t *testing.T) {
 	}
 	mu.Lock()
 	defer mu.Unlock()
-	if loginBegins != 2 {
-		t.Fatalf("login begin calls = %d, want 2", loginBegins)
+	if loginBegins != 3 {
+		t.Fatalf("login begin calls = %d, want 3", loginBegins)
 	}
 }
 
