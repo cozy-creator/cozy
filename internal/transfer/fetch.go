@@ -1,6 +1,6 @@
 package transfer
 
-// The fetch half: a hub-held checkpoint into the local canonical store.
+// The fetch half: a hub-held manifest into the local canonical store.
 //
 // It is cl-009's transactional install with a different source. The shape is the
 // same and so are the guarantees: nothing is visible until it is verified, a killed
@@ -9,11 +9,11 @@ package transfer
 // store's own verification records, which is why this keeps no state of its own.
 //
 // The walk is DECLARE-FIRST in reverse, and it needs no route that lists a
-// checkpoint's objects, because the artifact declares itself:
+// manifest's blobs, because the artifact declares itself:
 //
-//	round 1  the snapshot manifest, admitted only if it hashes to the id asked for
-//	round 2  everything the manifest names directly — header, encoding specs, configs
-//	round 3  the transitive closure tfs computes from those documents: the tensors
+//	round 1  the manifest, admitted only if it hashes to the id asked for
+//	round 2  every direct blob, including the CozyTensors header
+//	round 3  the transitive closure TensorFS computes from the resident header
 //
 // After round 2 the byte plane can compute the whole object set locally, so round 3
 // asks the hub for bytes and never for an inventory. A hub that lied about any of it
@@ -22,6 +22,7 @@ package transfer
 import (
 	"context"
 	"crypto/sha256"
+	"encoding/base64"
 	"encoding/hex"
 	"fmt"
 	"io"
@@ -38,17 +39,17 @@ import (
 	"github.com/cozy-creator/cozy/internal/units"
 )
 
-// Fetch is one checkpoint pulled into the local store.
+// Fetch is one manifest pulled into the local store.
 type Fetch struct {
-	Tool     *tfs.Tool
-	Hub      *hub.Client
-	Spec     string
-	Lane     string
-	Ref      hub.Ref
-	Snapshot string
-	DryRun   bool
-	Progress func(string)
-	Scratch  string
+	Tool       *tfs.Tool
+	Hub        *hub.Client
+	Spec       string
+	Lane       string
+	Ref        hub.Ref
+	ManifestID string
+	DryRun     bool
+	Progress   func(string)
+	Scratch    string
 
 	// seen is what THIS run already handled. The rounds overlap by construction —
 	// the closure names the documents round 2 fetched — and counting an object twice
@@ -59,20 +60,20 @@ type Fetch struct {
 
 // Fetched is what a fetch did.
 type Fetched struct {
-	Snapshot string
-	HeaderID string
-	Objects  int
-	Bytes    int64
-	// Moved is what came off the wire this run; Held is what the store already had
-	// verified and therefore skipped. Their sum is the checkpoint.
+	ManifestID string
+	HeaderID   string
+	Release    string
+	Lane       string
+	Objects    int
+	Bytes      int64
+	// Moved is blob payload that came off the object plane; Held is verified blob
+	// payload skipped. The small manifest control document is reported by its own
+	// progress phase and is not mixed into blob accounting.
 	Moved    int64
 	Held     int64
 	Admitted int
 	Skipped  int
 	Rounds   int
-	Tensors  int
-	Parts    int
-	Grade    string
 	MS       map[string]int64
 }
 
@@ -82,29 +83,42 @@ func (f *Fetch) say(format string, args ...any) {
 	}
 }
 
-// Resolve asks Tensorhub's typed model resolver for exactly one checkpoint. Cozy
+// Resolve asks Tensorhub's typed model resolver for exactly one manifest. Cozy
 // never lists candidates or invents a default release locally.
-func (f *Fetch) Resolve(ctx context.Context) (hub.Checkpoint, *exit.Error) {
+func (f *Fetch) Resolve(ctx context.Context) (hub.ModelManifest, *exit.Error) {
 	resolved, e := f.Hub.ResolveModel(ctx, f.Spec, f.Lane)
 	if e != nil {
-		return hub.Checkpoint{}, e
+		return hub.ModelManifest{}, e
 	}
 	ref, parseErr := hub.ParseRef(resolved.Model)
-	if parseErr != nil || resolved.Checkpoint == "" || resolved.HeaderID == "" {
-		return hub.Checkpoint{}, exit.Internalf(
-			"model resolution for %q returned an invalid model, checkpoint, or header", f.Spec)
+	if parseErr != nil || resolved.ManifestID == "" || resolved.HeaderID == "" {
+		return hub.ModelManifest{}, exit.Internalf(
+			"model resolution for %q returned an invalid model, manifest, or header", f.Spec)
 	}
-	f.Ref, f.Snapshot = ref, resolved.Checkpoint
-	return hub.Checkpoint{
-		Org: ref.Org, Name: ref.Name, SnapshotID: resolved.Checkpoint,
-		HeaderID: resolved.HeaderID, Objects: resolved.Objects, Bytes: resolved.Bytes,
+	if resolved.Release == "" || resolved.Lane == "" {
+		return hub.ModelManifest{}, exit.Named(exit.Usage, "model.release_required",
+			"%q resolves only a manifest digest; a local repository requires a release and lane", f.Spec).
+			WithRemedy("download an immutable release and select one exact lane")
+	}
+	evidence, err := base64.StdEncoding.Strict().DecodeString(resolved.ReleaseEvidenceBase64)
+	if err != nil || len(evidence) == 0 ||
+		base64.StdEncoding.EncodeToString(evidence) != resolved.ReleaseEvidenceBase64 {
+		return hub.ModelManifest{}, exit.Named(exit.Internal, "hub.release_evidence_invalid",
+			"model resolution for %q returned invalid release evidence", f.Spec)
+	}
+	f.Ref, f.ManifestID = ref, resolved.ManifestID
+	return hub.ModelManifest{
+		Org: ref.Org, Name: ref.Name, Release: resolved.Release, Lane: resolved.Lane,
+		ManifestID: resolved.ManifestID, HeaderID: resolved.HeaderID,
+		Objects: resolved.Objects, Bytes: resolved.Bytes, ReleaseEvidence: evidence,
 	}, nil
 }
 
-// Run installs the checkpoint transactionally: verified writes, and a local root
-// registered only after the whole checkpoint verifies.
-func (f *Fetch) Run(ctx context.Context, row hub.Checkpoint) (Fetched, *exit.Error) {
-	out := Fetched{Snapshot: row.SnapshotID, HeaderID: row.HeaderID, Grade: row.Grade, MS: map[string]int64{}}
+// Run installs the manifest transactionally: verified writes, then one repository
+// commit after the whole closure verifies.
+func (f *Fetch) Run(ctx context.Context, row hub.ModelManifest) (Fetched, *exit.Error) {
+	out := Fetched{ManifestID: row.ManifestID, HeaderID: row.HeaderID,
+		Release: row.Release, Lane: row.Lane, MS: map[string]int64{}}
 	f.seen = map[string]bool{}
 	if err := os.MkdirAll(f.Scratch, 0o700); err != nil {
 		return out, exit.Internalf("cannot create the transfer scratch at %s: %s", f.Scratch, err)
@@ -113,10 +127,10 @@ func (f *Fetch) Run(ctx context.Context, row hub.Checkpoint) (Fetched, *exit.Err
 		return f.plan(ctx, row, out)
 	}
 
-	// Round 1 — the manifest. It arrives as exact bytes and is admitted under the
-	// snapshot id: the document proves itself or it does not enter the store.
+	// Round 1 — the manifest. It proves its own identity before entering the typed
+	// manifest namespace.
 	t0 := time.Now()
-	doc, e := f.Hub.Manifest(ctx, f.Ref, row.SnapshotID)
+	doc, e := f.Hub.Manifest(ctx, f.Ref, row.ManifestID)
 	if e != nil {
 		return out, e
 	}
@@ -124,31 +138,28 @@ func (f *Fetch) Run(ctx context.Context, row hub.Checkpoint) (Fetched, *exit.Err
 	if err := os.WriteFile(path, doc, 0o644); err != nil {
 		return out, exit.Internalf("cannot stage the manifest: %s", err)
 	}
-	held, e := f.Tool.Held(row.SnapshotID)
+	admitted, e := f.Tool.AdmitManifest(path, row.ManifestID, int64(len(doc)))
 	if e != nil {
 		return out, e
 	}
-	if !held {
-		if e := f.Tool.Admit(path, row.SnapshotID, int64(len(doc))); e != nil {
-			return out, e
-		}
-		out.Moved += int64(len(doc))
-		out.Admitted++
-	} else {
-		out.Held += int64(len(doc))
-		out.Skipped++
-	}
-	f.seen[row.SnapshotID] = true
 	out.MS["manifest"] = since(t0)
 	out.Rounds = 1
-	f.say("manifest %s admitted (%s)", short1(row.SnapshotID), size(int64(len(doc))))
+	verb := "already resident"
+	if admitted {
+		verb = "admitted"
+	}
+	f.say("manifest %s %s (%s)", short1(row.ManifestID), verb, size(int64(len(doc))))
 
 	// Round 2 — what the manifest names directly: the header, the encoding specs and
 	// their vectors, the configs. With these resident the closure below is computable
-	// locally, which is why no route needs to list a checkpoint's objects.
-	entries, e := f.Tool.Entries(row.SnapshotID)
+	// locally, which is why no route needs to list a manifest's blobs.
+	entries, headerID, e := f.Tool.ManifestEntries(path, filepath.Join(f.Scratch, "direct.jsonl"))
 	if e != nil {
 		return out, e
+	}
+	if headerID != row.HeaderID {
+		return out, exit.Named(exit.Validation, "manifest.header_mismatch",
+			"manifest %s names header %s; resolution named %s", row.ManifestID, headerID, row.HeaderID)
 	}
 	t0 = time.Now()
 	if e := f.round(ctx, row, "documents", entries, &out); e != nil {
@@ -160,7 +171,7 @@ func (f *Fetch) Run(ctx context.Context, row hub.Checkpoint) (Fetched, *exit.Err
 	// Round 3 — the transitive closure, computed by the byte plane from documents it
 	// now holds. This is the tensors.
 	t0 = time.Now()
-	_, objects, e := f.Tool.Closure(row.SnapshotID, "s-fetch", filepath.Join(f.Scratch, "closure.json"))
+	objects, e := f.Tool.ManifestObjects(row.ManifestID, filepath.Join(f.Scratch, "objects.jsonl"))
 	if e != nil {
 		return out, e
 	}
@@ -174,19 +185,18 @@ func (f *Fetch) Run(ctx context.Context, row hub.Checkpoint) (Fetched, *exit.Err
 	out.MS["objects"] = since(t0)
 	out.Rounds = 3
 
-	// The proof. Every declared byte, hashed. Only now does the snapshot become a
-	// named local root — before this it is objects in a store and nothing points at
+	// The proof. Every declared byte, hashed. Only now does the manifest become a
+	// named local release — before this it is objects in a store and nothing points at
 	// them, which is what "no partial visibility" means on this side.
 	t0 = time.Now()
-	tensors, parts, objs, e := f.Tool.Verify(row.SnapshotID)
-	if e != nil {
+	if e := f.Tool.VerifyManifest(row.ManifestID); e != nil {
 		return out, e
 	}
-	out.Tensors, out.Parts = tensors, parts
 	out.MS["verify"] = since(t0)
-	f.say("verified %d objects, %d tensors, %d parts — every declared byte", objs, tensors, parts)
+	f.say("verified %d blobs — every declared byte", len(objects))
 
-	if e := f.Tool.Register(f.Ref.String(), row.SnapshotID); e != nil {
+	if e := f.Tool.CommitRelease(f.Ref.Org, f.Ref.Name, row.Release, row.Lane,
+		row.ManifestID, int64(len(doc)), row.ReleaseEvidence, f.Scratch); e != nil {
 		return out, e
 	}
 	f.say("timing: %s", Timing(out.MS))
@@ -195,25 +205,31 @@ func (f *Fetch) Run(ctx context.Context, row hub.Checkpoint) (Fetched, *exit.Err
 
 // plan answers what a fetch WOULD move, and moves nothing at all — not even the
 // manifest. What it can be exact about depends on what is already local: with the
-// checkpoint's own documents in the store the closure is computable and the answer is
+// manifest's own blobs in the store the closure is computable and the answer is
 // object-for-object; without them the answer is the hub's row, and it says so. A plan
 // that fetched documents to sharpen its own numbers would be a transfer with a
 // misleading name.
-func (f *Fetch) plan(ctx context.Context, row hub.Checkpoint, out Fetched) (Fetched, *exit.Error) {
+func (f *Fetch) plan(ctx context.Context, row hub.ModelManifest, out Fetched) (Fetched, *exit.Error) {
 	out.Objects, out.Bytes = row.Objects, row.Bytes
-	f.say("the hub's row: %d objects, %s, grade %s", row.Objects, size(row.Bytes), row.Grade)
+	f.say("the hub's row: %d objects, %s", row.Objects, size(row.Bytes))
 
-	held, e := f.Tool.Held(row.SnapshotID)
+	releases, e := f.Tool.Releases(filepath.Join(f.Scratch, "plan-releases.jsonl"))
 	if e != nil {
 		return out, e
 	}
-	if !held {
+	resident := false
+	for _, release := range releases {
+		if "sha256:"+release.ManifestSHA256 == row.ManifestID {
+			resident = true
+			break
+		}
+	}
+	if !resident {
 		out.Moved = row.Bytes
-		f.say("this store holds none of it: the whole checkpoint would move")
-		f.say("an object-for-object plan needs the checkpoint's own documents, and fetching those would not be a plan")
+		f.say("this store has no release for the manifest: its whole closure would move")
 		return out, nil
 	}
-	_, objects, e := f.Tool.Closure(row.SnapshotID, "s-plan", filepath.Join(f.Scratch, "plan-closure.json"))
+	objects, e := f.Tool.ManifestObjects(row.ManifestID, filepath.Join(f.Scratch, "plan-objects.jsonl"))
 	if e != nil {
 		return out, e
 	}
@@ -242,7 +258,7 @@ func (f *Fetch) plan(ctx context.Context, row hub.Checkpoint, out Fetched) (Fetc
 // `tfs fill` skips only objects with a VALID verification record, rehashes a
 // present-but-unverified one, and quarantines a corrupt squatter — so a resumed
 // fetch converges on verified state rather than on whatever files happen to exist.
-func (f *Fetch) round(ctx context.Context, row hub.Checkpoint, name string, objects []tfs.Object, out *Fetched) *exit.Error {
+func (f *Fetch) round(ctx context.Context, row hub.ModelManifest, name string, objects []tfs.Object, out *Fetched) *exit.Error {
 	var want []tfs.Object
 	for _, o := range objects {
 		if f.seen[o.ID] {
@@ -269,7 +285,7 @@ func (f *Fetch) round(ctx context.Context, row hub.Checkpoint, name string, obje
 	for _, o := range want {
 		ids = append(ids, o.ID)
 	}
-	reads, e := f.Hub.Reads(ctx, f.Ref, row.SnapshotID, ids)
+	reads, e := f.Hub.Reads(ctx, f.Ref, row.ManifestID, ids)
 	if e != nil {
 		return e
 	}
@@ -288,7 +304,7 @@ func (f *Fetch) round(ctx context.Context, row hub.Checkpoint, name string, obje
 		if !ok {
 			return exit.Named(exit.NotFound, "hub.object_unavailable",
 				"the hub granted no read for %s", short1(o.ID)).
-				WithRemedy("the checkpoint's catalog row and its object custody disagree; the hub owns that reconciliation")
+				WithRemedy("the manifest's catalog row and its object custody disagree; the hub owns that reconciliation")
 		}
 		dst := filepath.Join(dir, strings.TrimPrefix(o.ID, "sha256:"))
 		n, e := download(ctx, r.URL, dst, o.Length)
@@ -313,7 +329,7 @@ func (f *Fetch) install(name, plan string, out *Fetched) *exit.Error {
 	if res.Refused > 0 {
 		return exit.Named(exit.Validation, "fetch.object_refused",
 			"the byte plane refused %d of %d fetched objects", res.Refused, res.Put+res.Skipped+res.Refused).
-			WithRemedy("a refused object did not hash to the identity the checkpoint declares; nothing was installed under a name it did not earn")
+			WithRemedy("a refused object did not hash to the identity the manifest declares; nothing was installed under a name it did not earn")
 	}
 	out.Admitted += res.Put
 	out.Skipped += res.Skipped
@@ -371,7 +387,7 @@ func fetchOnce(ctx context.Context, url, dst string, length int64) (int64, bool,
 		return 0, false, exit.Internalf("cannot stage a fetched object: %s", err)
 	}
 	defer f.Close()
-	// The read is bounded by the length the checkpoint DECLARES. A source streaming
+	// The read is bounded by the length the manifest DECLARES. A source streaming
 	// more than it should is stopped here; whether the bytes hash correctly is the
 	// byte plane's question, one step later.
 	n, err := io.Copy(f, m.reader(io.LimitReader(resp.Body, length+1)))

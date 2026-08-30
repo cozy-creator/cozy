@@ -1,6 +1,8 @@
 package cli
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"io"
 	"os"
 	"path/filepath"
@@ -81,29 +83,33 @@ func handleModelPublish(ctx *Context) *exit.Error {
 	subject := ctx.Inv.Args[1]
 	if strings.ContainsRune(subject, os.PathSeparator) || strings.HasPrefix(subject, ".") {
 		// A path is an INGEST subject, not a publish subject (decisions #58's two-step
-		// model): the border runs where the bytes are, and only a canonical snapshot
+		// model): the border runs where the bytes are, and only a canonical manifest
 		// is publishable. Refusing by name beats growing a second border here.
 		return exit.Usagef("%q is a path, and a path is not publishable", subject).
-			WithRemedy("ingest it first — `tfs ingest run <store> <component=alias> --source …` then `tfs ingest install` — and publish the snapshot id it prints").
+			WithRemedy("ingest it first and publish the manifest id TensorFS prints").
 			WithNext("cozy help model publish")
 	}
-	snapshot, e := tfs.Snapshot(subject)
+	manifestID, e := tfs.ManifestID(subject)
 	if e != nil {
 		return e
 	}
-	reason := "cozy model publish " + ref.String() + " " + snapshot
-	// The operation is bound to the complete immutable snapshot identity. A user-
-	// supplied operation id could be replayed with different bytes and is therefore
-	// not part of the product surface.
-	session := "snapshot-" + strings.TrimPrefix(snapshot, "sha256:")
+	release, lane := strings.TrimSpace(ctx.Inv.Value("--release")), strings.TrimSpace(ctx.Inv.Value("--lane"))
+	if release == "" || lane == "" {
+		return exit.Usagef("model publish requires --release and --lane")
+	}
+	reason := "cozy model publish " + ref.String() + " " + manifestID + " --release " + release + " --lane " + lane
+	// The operation id binds the complete destination tuple without exposing an
+	// independently caller-authored replay key.
+	sum := sha256.Sum256([]byte(ref.String() + "\x00" + release + "\x00" + lane + "\x00" + manifestID))
+	session := "manifest-" + hex.EncodeToString(sum[:])
 	tool, c, layout, e := tooling(ctx)
 	if e != nil {
 		return e
 	}
 	p := &transfer.Publish{
-		Tool: tool, Hub: c, Ref: ref, Snapshot: snapshot, Session: session,
+		Tool: tool, Hub: c, Ref: ref, ManifestID: manifestID, Release: release, Lane: lane, Session: session,
 		Reason: reason, DryRun: ctx.Inv.Bool("--dry-run"),
-		Progress: progress(ctx), Scratch: scratch(layout, snapshot),
+		Progress: progress(ctx), Scratch: scratch(layout, manifestID),
 	}
 	hctx, cancel := hub.LongContext()
 	defer cancel()
@@ -118,7 +124,9 @@ func handleModelPublish(ctx *Context) *exit.Error {
 	}
 	fields := []output.Field{
 		{K: "model", V: ref.String()},
-		{K: "snapshot", V: snapshot},
+		{K: "manifest_id", V: manifestID},
+		{K: "release", V: release},
+		{K: "lane", V: lane},
 		{K: "status", V: status},
 		{K: "changed", V: changed},
 		{K: "publish_id", V: res.PublishID},
@@ -132,25 +140,20 @@ func handleModelPublish(ctx *Context) *exit.Error {
 		fields = append(fields,
 			output.Field{K: "missing", V: res.Totals.MissingObjects},
 			output.Field{K: "held", V: res.Totals.HeldObjects})
-		rec := compactRecord(fields, "model", "snapshot", "status", "missing", "changed")
-		rec.Next = []string{"cozy model publish " + ref.String() + " " + snapshot}
+		rec := compactRecord(fields, "model", "release", "lane", "manifest_id", "status", "missing", "changed")
+		rec.Next = []string{reason}
 		return emit(ctx, rec)
 	}
 	fields = append(fields,
 		output.Field{K: "uploaded", V: res.Uploaded},
 		output.Field{K: "verified", V: res.Verified},
 		output.Field{K: "checksum_source", V: res.Sources},
-		output.Field{K: "header", V: res.Root.HeaderID},
-		output.Field{K: "topology", V: res.Root.TopologyDigest},
-		output.Field{K: "catalog_root", V: res.Root.CatalogRootID},
-		output.Field{K: "grade", V: res.Grade},
-		output.Field{K: "satisfaction", V: res.Verdict},
-		output.Field{K: "verifier", V: res.Root.VerifierBuild},
-		output.Field{K: "reingested", V: res.Reingest},
+		output.Field{K: "manifest_length", V: res.Manifest.Length},
+		output.Field{K: "topology", V: res.TopologyDigest},
 		output.Field{K: "duplicate", V: res.Dup},
 	)
 	return emit(ctx, compactRecord(fields,
-		"model", "snapshot", "status", "moved", "deduped", "changed"))
+		"model", "release", "lane", "manifest_id", "status", "moved", "deduped", "changed"))
 }
 
 func handleModelDownload(ctx *Context) *exit.Error {
@@ -170,7 +173,7 @@ func handleModelDownload(ctx *Context) *exit.Error {
 		return e
 	}
 	ref := f.Ref
-	f.Scratch = scratch(layout, row.SnapshotID)
+	f.Scratch = scratch(layout, row.ManifestID)
 	res, e := f.Run(hctx, row)
 	if e != nil {
 		return e
@@ -182,7 +185,9 @@ func handleModelDownload(ctx *Context) *exit.Error {
 	}
 	fields := []output.Field{
 		{K: "model", V: ref.String()},
-		{K: "snapshot", V: res.Snapshot},
+		{K: "manifest_id", V: res.ManifestID},
+		{K: "release", V: res.Release},
+		{K: "lane", V: res.Lane},
 		{K: "status", V: status},
 		{K: "changed", V: changed},
 		{K: "objects", V: res.Objects},
@@ -191,47 +196,54 @@ func handleModelDownload(ctx *Context) *exit.Error {
 		{K: "deduped", V: output.Bytes(res.Held)},
 	}
 	if f.DryRun {
-		rec := compactRecord(fields, "model", "snapshot", "status", "bytes", "changed")
-		rec.Next = []string{"cozy model download " + ref.String() + "@" + res.Snapshot}
+		rec := compactRecord(fields, "model", "release", "lane", "manifest_id", "status", "bytes", "changed")
+		rec.Next = []string{"cozy model download " + ref.String() + "@" + res.Release + " --lane " + res.Lane}
 		return emit(ctx, rec)
 	}
 	fields = append(fields,
 		output.Field{K: "header", V: res.HeaderID},
 		output.Field{K: "admitted", V: res.Admitted},
 		output.Field{K: "skipped", V: res.Skipped},
-		output.Field{K: "tensors", V: res.Tensors},
-		output.Field{K: "parts", V: res.Parts},
-		output.Field{K: "grade", V: res.Grade},
-		output.Field{K: "root", V: tool.Root},
+		output.Field{K: "store", V: tool.Root},
 	)
 	return emit(ctx, compactRecord(fields,
-		"model", "snapshot", "status", "moved", "deduped", "changed"))
+		"model", "release", "lane", "manifest_id", "status", "moved", "deduped", "changed"))
 }
 
-func localTensorFS(ctx *Context) (*tfs.Tool, *exit.Error) {
+func localTensorFS(ctx *Context) (*tfs.Tool, home.Layout, *exit.Error) {
 	layout, problem := home.Open(ctx.Cfg.Home)
 	if problem != nil {
-		return nil, problem
+		return nil, layout, problem
 	}
-	return tfs.Open(ctx.Cfg, layout)
+	tool, problem := tfs.Open(ctx.Cfg, layout)
+	return tool, layout, problem
 }
 
 func handleModelList(ctx *Context) *exit.Error {
-	tool, problem := localTensorFS(ctx)
+	tool, layout, problem := localTensorFS(ctx)
 	if problem != nil {
 		return problem
 	}
-	roots, problem := tool.Roots()
+	if err := os.MkdirAll(layout.Transfer, 0o700); err != nil {
+		return exit.Internalf("cannot create transfer scratch: %s", err)
+	}
+	scratch, err := os.MkdirTemp(layout.Transfer, "repo-list-")
+	if err != nil {
+		return exit.Internalf("cannot create repository-list scratch: %s", err)
+	}
+	defer os.RemoveAll(scratch)
+	releases, problem := tool.Releases(filepath.Join(scratch, "rows.jsonl"))
 	if problem != nil {
 		return problem
 	}
 	list := output.List{
-		Name: "models", Fields: []string{"model", "snapshot"},
-		AllFields: []string{"model", "snapshot", "kind"},
+		Name: "models", Fields: []string{"model", "release", "lane", "manifest_id"},
+		AllFields: []string{"model", "release", "lane", "manifest_id"},
 	}
-	for _, root := range roots {
+	for _, release := range releases {
 		list.Rows = append(list.Rows, map[string]string{
-			"model": root.Name, "snapshot": root.Snapshot, "kind": root.Kind,
+			"model": release.Org + "/" + release.Name, "release": release.Version,
+			"lane": release.Lane, "manifest_id": "sha256:" + release.ManifestSHA256,
 		})
 	}
 	return emit(ctx, list)
@@ -255,7 +267,7 @@ func handleModelRemove(ctx *Context) *exit.Error {
 		if worker.WorkerID != "remote" {
 			store.Close()
 			return exit.New(exit.Conflict, "local worker %s may still hold model residency", worker.InstanceID).
-				WithRemedy("run `cozy unload`, then remove the model root").
+				WithRemedy("run `cozy unload`, then remove the model repository").
 				WithNext("cozy unload")
 		}
 	}
@@ -267,40 +279,52 @@ func handleModelRemove(ctx *Context) *exit.Error {
 	for _, request := range active {
 		if request.Worker == "" {
 			return exit.New(exit.Conflict, "active invocation %s may still need local model bytes", request.ID).
-				WithRemedy("cancel active local work before removing a model root").
+				WithRemedy("cancel active local work before removing a model repository").
 				WithNext("cozy invoke cancel " + request.ID)
 		}
 	}
-	tool, problem := localTensorFS(ctx)
+	tool, _, problem := localTensorFS(ctx)
 	if problem != nil {
 		return problem
 	}
-	roots, problem := tool.Roots()
+	if err := os.MkdirAll(layout.Transfer, 0o700); err != nil {
+		return exit.Internalf("cannot create transfer scratch: %s", err)
+	}
+	scratchDir, err := os.MkdirTemp(layout.Transfer, "repo-remove-")
+	if err != nil {
+		return exit.Internalf("cannot create repository-remove scratch: %s", err)
+	}
+	defer os.RemoveAll(scratchDir)
+	releases, problem := tool.Releases(filepath.Join(scratchDir, "rows.jsonl"))
 	if problem != nil {
 		return problem
 	}
-	held := make(map[string]tfs.Root, len(roots))
-	for _, root := range roots {
-		held[root.Name] = root
+	held := make(map[string]bool, len(releases))
+	for _, release := range releases {
+		held[release.Org+"/"+release.Name] = true
 	}
 	removed := output.List{
-		Name: "models", Fields: []string{"model", "snapshot"},
-		AllFields: []string{"model", "snapshot"},
+		Name: "models", Fields: []string{"model"}, AllFields: []string{"model"},
 	}
 	for _, name := range ctx.Inv.Args {
-		root, ok := held[name]
-		if !ok {
+		ref, parseProblem := hub.ParseRef(name)
+		if parseProblem != nil {
+			return parseProblem
+		}
+		if !held[ref.String()] {
 			continue
 		}
-		if problem := tool.ReleaseRoot(name); problem != nil {
+		repoScratch := filepath.Join(scratchDir, strings.ReplaceAll(ref.String(), "/", "-"))
+		if err := os.MkdirAll(repoScratch, 0o700); err != nil {
+			return exit.Internalf("cannot create repository-remove scratch: %s", err)
+		}
+		if problem := tool.DeleteRepository(ref.Org, ref.Name, repoScratch); problem != nil {
 			return problem
 		}
-		removed.Rows = append(removed.Rows, map[string]string{
-			"model": root.Name, "snapshot": root.Snapshot,
-		})
-		delete(held, name)
+		removed.Rows = append(removed.Rows, map[string]string{"model": ref.String()})
+		delete(held, ref.String())
 	}
 	removed.Aggregates = []output.Field{{K: "changed", V: len(removed.Rows) > 0}}
-	removed.Notes = []string{"local names were released; TensorFS garbage collection decides later byte reclamation"}
+	removed.Notes = []string{"local repositories were deleted; TensorFS garbage collection decides later byte reclamation"}
 	return emit(ctx, removed)
 }

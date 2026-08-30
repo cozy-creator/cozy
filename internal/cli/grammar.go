@@ -87,9 +87,9 @@ func (c *PackagePublishCmd) Run(r *Runtime) error {
 type ModelCmd struct {
 	Search   ModelSearchCmd   `cmd:"" help:"Search the model catalog."`
 	Download ModelDownloadCmd `cmd:"" help:"Download a model into the local TensorFS store."`
-	Remove   ModelRemoveCmd   `cmd:"" help:"Remove local model roots."`
-	List     ModelListCmd     `cmd:"" help:"List local model roots."`
-	Publish  ModelPublishCmd  `cmd:"" help:"Publish a local TensorFS snapshot."`
+	Remove   ModelRemoveCmd   `cmd:"" help:"Remove local model repositories."`
+	List     ModelListCmd     `cmd:"" help:"List local model releases."`
+	Publish  ModelPublishCmd  `cmd:"" help:"Publish a local TensorFS manifest as one release lane."`
 }
 
 type ModelSearchCmd struct {
@@ -103,7 +103,7 @@ func (c *ModelSearchCmd) Run(r *Runtime) error {
 }
 
 type ModelDownloadCmd struct {
-	Ref        string `arg:"" name:"model" help:"Model release or snapshot ref."`
+	Ref        string `arg:"" name:"model" help:"Model release ref."`
 	Lane       string `help:"Resolve one release lane."`
 	DryRun     bool   `help:"Show the transfer plan without moving bytes."`
 	TokenStdin bool   `help:"Read this invocation's hub token from stdin."`
@@ -116,7 +116,7 @@ func (c *ModelDownloadCmd) Run(r *Runtime) error {
 }
 
 type ModelRemoveCmd struct {
-	Refs []string `arg:"" name:"model" help:"Local model root name."`
+	Refs []string `arg:"" name:"model" help:"Local model repository name."`
 }
 
 func (c *ModelRemoveCmd) Run(r *Runtime) error {
@@ -131,15 +131,17 @@ func (c *ModelListCmd) Run(r *Runtime) error {
 
 type ModelPublishCmd struct {
 	Ref        string `arg:"" name:"model" help:"Model name (org/name)."`
-	Snapshot   string `arg:"" name:"snapshot" help:"Local sha256 snapshot id."`
+	Manifest   string `arg:"" name:"manifest" help:"Local sha256 manifest id."`
+	Release    string `help:"Immutable release version."`
+	Lane       string `help:"Portable release lane."`
 	DryRun     bool   `help:"Show the transfer plan without moving bytes."`
 	TokenStdin bool   `help:"Read this invocation's hub token from stdin."`
 }
 
 func (c *ModelPublishCmd) Run(r *Runtime) error {
-	return r.call(handleModelPublish, []string{c.Ref, c.Snapshot}, bools(
+	return r.call(handleModelPublish, []string{c.Ref, c.Manifest}, bools(
 		"--dry-run", c.DryRun, "--token-stdin", c.TokenStdin),
-		nil, false)
+		values("--release", c.Release, "--lane", c.Lane), false)
 }
 
 type InvokeCmd struct {

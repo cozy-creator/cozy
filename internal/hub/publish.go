@@ -1,6 +1,6 @@
 package hub
 
-// Tensorhub's incremental model-publication protocol and checkpoint reads, as methods
+// Tensorhub's incremental model-publication protocol and manifest reads, as methods
 // on the ONE client. `do` still owns request construction, credentials, reasons, and
 // error mapping. A publication opens under a stable operation id, claims known object
 // transfers, settles each transfer through grant -> received -> verify, then seals the
@@ -27,6 +27,8 @@ func B64(raw []byte) string { return base64.StdEncoding.EncodeToString(raw) }
 // Session is the compact durable view returned by the idempotent publication PUT.
 type Session struct {
 	Operation string     `json:"operation"`
+	Release   string     `json:"release"`
+	Lane      string     `json:"lane"`
 	State     string     `json:"state"`
 	Objects   []Transfer `json:"objects"`
 }
@@ -48,14 +50,14 @@ type OpenPublicationResponse struct {
 	Created     bool    `json:"created"`
 }
 
-func (c *Client) OpenPublication(ctx context.Context, ref Ref, operationID string,
+func (c *Client) OpenPublication(ctx context.Context, ref Ref, operationID, release, lane string,
 	objects []Object, reason string,
 ) (OpenPublicationResponse, *exit.Error) {
 	var out OpenPublicationResponse
 	e := c.do(ctx, call{
 		method: http.MethodPut,
 		path:   publications(ref) + "/" + url.PathEscape(operationID), auth: true, reason: reason,
-		body: map[string]any{"objects": objects}, byBytes: true,
+		body: map[string]any{"release": release, "lane": lane, "objects": objects}, byBytes: true,
 	}, &out)
 	return out, e
 }
@@ -133,42 +135,27 @@ func (c *Client) SettleObjects(ctx context.Context, ref Ref, operation string,
 }
 
 type SealPublicationRequest struct {
-	Closure      string           `json:"closure"`
-	CodeTopology string           `json:"code_topology"`
-	SnapshotID   string           `json:"snapshot_id"`
-	Manifest     string           `json:"manifest"`
-	HeaderID     string           `json:"header_id"`
-	Stamps       []map[string]any `json:"stamps"`
-	Receipt      any              `json:"receipt"`
+	Manifest              string `json:"manifest"`
+	ReleaseEvidenceBase64 string `json:"release_evidence_base64"`
 }
 
-// Root is the installed checkpoint: exactly one snapshot, committed idempotently.
-type Root struct {
-	SnapshotID     string `json:"snapshot_id"`
-	HeaderID       string `json:"header_id"`
-	TopologyDigest string `json:"topology_digest"`
-	CatalogRootID  string `json:"catalog_root_id"`
-	CatalogRootKey string `json:"catalog_root_key"`
-	Objects        int    `json:"objects"`
-	Bytes          int64  `json:"bytes"`
-	VerifierBuild  string `json:"verifier_build"`
-	Grade          string `json:"grade"`
+type ManifestRef struct {
+	SHA256 string `json:"sha256"`
+	Length int64  `json:"length"`
 }
 
-// CompleteResponse is the committed seal result. Exact replay returns the original
-// result with duplicate=true.
+// CompleteResponse is the committed (release,lane)->manifest result. Exact replay
+// returns the original result with duplicate=true.
 type CompleteResponse struct {
-	PublishID string `json:"publish_id"`
-	Root      Root   `json:"root"`
-	Verifier  struct {
-		Report       string `json:"Report"`
-		Lane         string `json:"Lane"`
-		Satisfaction string `json:"Satisfaction"`
-		Grade        string `json:"Grade"`
-	} `json:"verifier"`
-	MS                    map[string]int64 `json:"ms"`
-	ReingestedHeldObjects int              `json:"reingested_held_objects"`
-	Duplicate             bool             `json:"duplicate"`
+	PublishID             string      `json:"publish_id"`
+	Release               string      `json:"release"`
+	Lane                  string      `json:"lane"`
+	Manifest              ManifestRef `json:"manifest"`
+	TopologyDigest        string      `json:"topology_digest"`
+	Objects               int         `json:"objects"`
+	Bytes                 int64       `json:"bytes"`
+	ReleaseEvidenceBase64 string      `json:"release_evidence_base64"`
+	Duplicate             bool        `json:"duplicate"`
 }
 
 func (c *Client) SealPublication(ctx context.Context, ref Ref, operation string,
@@ -191,39 +178,32 @@ func publications(ref Ref) string {
 // The old whole-closure Begin/Grant/VerifyObjects/Complete API is absent.
 // Publication progress is durable only as transfer rows in Tensorhub.
 
-// ---------------------------------------------------------------- checkpoint reads
+// ---------------------------------------------------------------- manifest reads
 
-// Checkpoint is one installed checkpoint row. Public: reads carry no credential.
-type Checkpoint struct {
-	Org            string `json:"org"`
-	Name           string `json:"name"`
-	SnapshotID     string `json:"snapshot_id"`
-	HeaderID       string `json:"header_id"`
-	TopologyDigest string `json:"topology_digest"`
-	Objects        int    `json:"objects"`
-	Bytes          int64  `json:"bytes"`
-	Grade          string `json:"grade"`
-	VerifierBuild  string `json:"verifier_build"`
-	InstalledAt    string `json:"installed_at"`
+// ModelManifest is one resolved immutable model tree.
+type ModelManifest struct {
+	Org             string `json:"org"`
+	Name            string `json:"name"`
+	Release         string `json:"release"`
+	Lane            string `json:"lane"`
+	ManifestID      string `json:"manifest_id"`
+	HeaderID        string `json:"header_digest"`
+	Objects         int    `json:"objects"`
+	Bytes           int64  `json:"bytes"`
+	ReleaseEvidence []byte `json:"-"`
 }
 
 // ModelResolution is Tensorhub's exact answer to a human model ref. Download never
-// lists checkpoints and guesses: digest or release selection happens at this route.
+// lists manifests and guesses: digest or release selection happens at this route.
 type ModelResolution struct {
-	Ref        string   `json:"ref"`
-	Model      string   `json:"model"`
-	Release    string   `json:"release"`
-	Alias      string   `json:"alias"`
-	Lane       string   `json:"lane"`
-	LaneID     string   `json:"lane_id"`
-	Checkpoint string   `json:"checkpoint_id"`
-	HeaderID   string   `json:"header_digest"`
-	Structure  string   `json:"structure"`
-	Encodings  []string `json:"encodings"`
-	Objects    int      `json:"objects"`
-	Bytes      int64    `json:"bytes"`
-	Pinned     string   `json:"pinned"`
-	Note       string   `json:"note"`
+	Model                 string `json:"model"`
+	Release               string `json:"release"`
+	Lane                  string `json:"lane"`
+	ManifestID            string `json:"manifest_id"`
+	HeaderID              string `json:"header_digest"`
+	Objects               int    `json:"objects"`
+	Bytes                 int64  `json:"bytes"`
+	ReleaseEvidenceBase64 string `json:"release_evidence_base64"`
 }
 
 func (c *Client) ResolveModel(ctx context.Context, spec, lane string) (ModelResolution, *exit.Error) {
@@ -237,14 +217,14 @@ func (c *Client) ResolveModel(ctx context.Context, spec, lane string) (ModelReso
 	return out, e
 }
 
-// Manifest reads the exact SnapshotManifest bytes back, verbatim. They are handed
-// straight to the byte plane, which admits them only if they hash to the snapshot id
+// Manifest reads the exact manifest bytes back, verbatim. They are handed straight
+// to the byte plane, which admits them only if they hash to the manifest id
 // asked for — so a hub that lied about a manifest cannot install one.
-func (c *Client) Manifest(ctx context.Context, ref Ref, snapshot string) ([]byte, *exit.Error) {
+func (c *Client) Manifest(ctx context.Context, ref Ref, manifestID string) ([]byte, *exit.Error) {
 	var raw []byte
 	e := c.do(ctx, call{
 		method: http.MethodGet,
-		path:   "/v1/models/" + ref.Org + "/" + ref.Name + "/checkpoints/" + snapshot + "/manifest",
+		path:   "/v1/models/" + ref.Org + "/" + ref.Name + "/manifests/" + manifestID,
 		raw:    &raw, byBytes: true,
 	}, nil)
 	return raw, e
@@ -261,21 +241,21 @@ type Read struct {
 }
 
 // Reads asks Tensorhub's live typed model route for download authorization over the
-// named objects of one installed checkpoint. Cozy never constructs a bucket URL or
+// named objects of one released manifest. Cozy never constructs a bucket URL or
 // reaches storage with credentials of its own.
-func (c *Client) Reads(ctx context.Context, ref Ref, snapshot string, ids []string) ([]Read, *exit.Error) {
+func (c *Client) Reads(ctx context.Context, ref Ref, manifestID string, ids []string) ([]Read, *exit.Error) {
 	var out struct {
 		Reads []Read `json:"reads"`
 	}
 	e := c.do(ctx, call{
 		method: http.MethodPost, byBytes: true,
-		path: "/v1/models/" + ref.Org + "/" + ref.Name + "/checkpoints/" + snapshot + "/reads",
+		path: "/v1/models/" + ref.Org + "/" + ref.Name + "/manifests/" + manifestID + "/reads",
 		body: map[string]any{"object_ids": ids},
 	}, &out)
 	if e != nil && (e.Name == "hub.untyped_refusal" || e.Name == "route.not_found") {
 		return nil, exit.Named(exit.Unavailable, "hub.no_read_plane",
 			"the hub at %s serves no object-read route: POST %s answered %q", c.base,
-			"…/checkpoints/{snapshot}/reads", e.Name).
+			"…/manifests/{manifest}/reads", e.Name).
 			WithRemedy("this hub can take custody of bytes and cannot hand them back yet; the read grant is the missing half of th-002's transfer protocol").
 			WithNext("cozy model publish <org/model> <sha256:…>", "cozy model download --dry-run "+ref.String())
 	}

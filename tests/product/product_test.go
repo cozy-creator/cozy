@@ -25,6 +25,25 @@ import (
 
 const weightlessRef = "cozy/weightless"
 
+func TestModelManifestGrammar(t *testing.T) {
+	root := t.TempDir()
+	code, help := runCozy(t, root, "model", "publish", "--help")
+	if code != 0 || !strings.Contains(help, "<manifest>") ||
+		!strings.Contains(help, "--release") || !strings.Contains(help, "--lane") ||
+		strings.Contains(strings.ToLower(help), "snapshot") {
+		t.Fatalf("model publish did not expose only manifest/release/lane [exit %d]\n%s", code, help)
+	}
+	code, out := runCozy(t, root, "model", "publish", "acme/model",
+		"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
+	if code != 2 || !strings.Contains(out, "--release") || !strings.Contains(out, "--lane") {
+		t.Fatalf("model publish accepted missing release/lane [exit %d]\n%s", code, out)
+	}
+	code, help = runCozy(t, root, "model", "download", "--help")
+	if code != 0 || strings.Contains(strings.ToLower(help), "snapshot") {
+		t.Fatalf("model download retained snapshot vocabulary [exit %d]\n%s", code, help)
+	}
+}
+
 func TestPackagePublishMetadataGrammar(t *testing.T) {
 	root := t.TempDir()
 	if code, help := runCozy(t, root, "package", "publish", "--help"); code != 0 ||

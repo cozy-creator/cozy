@@ -542,13 +542,12 @@ def check_manifest():
         bad.append("[grammar] public Cozy command retained caller-authored audit prose; decision #667 derives every audit reason")
     if (
         "type PackagePublishCmd struct{}" not in source
-        or '"--release"' in source
         or "Package source tree." in source
     ):
         bad.append("[grammar] package publish identity must come only from project metadata")
     derived_audits = {
         "internal/cli/package_releases.go": '"cozy package publish " + ref.String() + "@" + release',
-        "internal/cli/transfer.go": '"cozy model publish " + ref.String() + " " + snapshot',
+        "internal/cli/transfer.go": '"cozy model publish " + ref.String() + " " + manifestID',
         "internal/cli/rentals.go": '"cozy rental new " + skuName + " for " + packageRef',
     }
     for path, spelling in derived_audits.items():
@@ -746,6 +745,7 @@ def check_typed_resources():
         "/v1/repos",
         "/v1/resolve",
         "/v1/checkpoints",
+        "/checkpoints/",
         "/publishes",
         "cozy repo ",
         "cozy search",
