@@ -155,7 +155,7 @@ fn manifest_build_is_the_single_ordinary_file_producer() {
         ])),
         tensorfs_core::canon::write(&Value::obj(vec![
             ("blob", source.clone().to_value()),
-            ("path", Value::str("marco/endpoint.py")),
+            ("path", Value::str("marco/package.py")),
         ])),
     ];
     let mut bytes = Vec::new();
@@ -183,7 +183,7 @@ fn manifest_build_is_the_single_ordinary_file_producer() {
 
     let expected = Manifest::from_files(vec![
         ("marco/__init__.py".into(), empty),
-        ("marco/endpoint.py".into(), source),
+        ("marco/package.py".into(), source),
     ])
     .unwrap();
     let stored = fs::read(&output).unwrap();
