@@ -19,6 +19,7 @@ import (
 	"github.com/cozy-creator/cozy/internal/config"
 	"github.com/cozy-creator/cozy/internal/hub"
 	"github.com/cozy-creator/cozy/internal/secret"
+	"github.com/cozy-creator/cozy/internal/transfer"
 )
 
 func TestPackageReleaseClientContract(t *testing.T) {
@@ -188,6 +189,28 @@ func TestPackagePublishPendingWireFlowBoundsUploads(t *testing.T) {
 	}
 	if got := peak.Load(); got > 16 || got < 2 {
 		t.Fatalf("package upload concurrency=%d, want 2..16", got)
+	}
+}
+
+func TestPackageUploadCountsBytesWhenSuccessResponseIsLost(t *testing.T) {
+	payload := []byte("exact package bytes")
+	path := filepath.Join(t.TempDir(), "package.whl")
+	must(t, os.WriteFile(path, payload, 0o600))
+	var attempts atomic.Int64
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if attempts.Add(1) == 1 {
+			_, _ = io.Copy(io.Discard, r.Body)
+			panic(http.ErrAbortHandler) // bytes landed; only the success response was lost
+		}
+		w.WriteHeader(http.StatusPreconditionFailed)
+	}))
+	defer server.Close()
+
+	moved, problem := transfer.UploadPresigned(context.Background(), "project_wheel", path,
+		server.URL, map[string]string{"if-none-match": "*"})
+	if problem != nil || moved != int64(len(payload)) || attempts.Load() != 2 {
+		t.Fatalf("lost-response accounting: moved=%d attempts=%d problem=%v",
+			moved, attempts.Load(), problem)
 	}
 }
 
