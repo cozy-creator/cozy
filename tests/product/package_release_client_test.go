@@ -112,13 +112,13 @@ func TestPackageReleaseClientRejectsUnknownResponseFields(t *testing.T) {
 	}
 }
 
-func TestPackageInstallPlanContract(t *testing.T) {
+func TestPackageDownloadPlanContract(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		switch r.URL.Path {
 		case "/v1/packages/proof/package":
 			_, _ = io.WriteString(w, `{"package":{"org":"proof","name":"package","created_at":"2026-08-30T00:00:00Z"},"releases":[{"release":"1.2.3","cut_at":"2026-08-30T00:00:00Z"}]}`)
-		case "/v1/packages/proof/package/releases/1.2.3/selection":
+		case "/v1/packages/proof/package/releases/1.2.3/downloads":
 			if r.Method != http.MethodPost {
 				t.Errorf("package selection used %s", r.Method)
 			}
@@ -156,14 +156,14 @@ func TestPackageInstallPlanContract(t *testing.T) {
 	if problem != nil || len(card.Releases) != 1 || card.Releases[0].Release != "1.2.3" {
 		t.Fatalf("package card changed: %+v problem=%v", card, problem)
 	}
-	plan, problem := client.PackageInstallPlan(context.Background(), ref, "1.2.3", hub.PackageInstallTarget{
+	plan, problem := client.PackageDownloads(context.Background(), ref, "1.2.3", hub.PackageInstallTarget{
 		Accelerator: "cpu", OS: "linux", Arch: "x86",
 	})
 	if problem != nil || plan.Profile != "cpu-test" ||
 		len(plan.Downloads) != 1 || plan.Downloads[0].Path != "proof.whl" {
 		t.Fatalf("package install plan changed: %+v problem=%v", plan, problem)
 	}
-	_, problem = client.PackageInstallPlan(context.Background(), ref, "1.2.3", hub.PackageInstallTarget{
+	_, problem = client.PackageDownloads(context.Background(), ref, "1.2.3", hub.PackageInstallTarget{
 		Accelerator: "nvidia", OS: "linux", Arch: "x86",
 		DriverCUDA: "13.2", ComputeCapability: "8.9",
 	})

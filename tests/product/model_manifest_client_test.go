@@ -4,12 +4,15 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"reflect"
+	"strings"
+	"sync/atomic"
 	"testing"
 
 	"github.com/cozy-creator/cozy/internal/config"
@@ -240,5 +243,115 @@ func TestPublicationUsesReleaseLaneAndManifestOnlySeal(t *testing.T) {
 	if problem != nil || done.Manifest.Length != 2 || done.Release != "1.0.0" || done.Lane != "bf16" ||
 		done.ReleaseEvidenceBase64 != evidenceBase64 {
 		t.Fatalf("SealPublication = %#v, %v", done, problem)
+	}
+}
+
+func TestModelPublicationBatchesGrantAndSettlementRequests(t *testing.T) {
+	const objectCount = 257
+	manifestID := "sha256:" + manifestA
+	manifest := []byte(`{}`)
+	evidence := releaseEvidence()
+	evidenceBase64 := base64.StdEncoding.EncodeToString(evidence)
+
+	transfers := make([]hub.Transfer, 0, objectCount)
+	var refs strings.Builder
+	for i := range objectCount {
+		objectID := "sha256:" + fmt.Sprintf("%064x", i+1)
+		transfers = append(transfers, hub.Transfer{ObjectID: objectID, Length: 1, State: "claimed"})
+		fmt.Fprintf(&refs, `{"sha256":"%s","length":1}`+"\n", strings.TrimPrefix(objectID, "sha256:"))
+	}
+
+	toolDir := t.TempDir()
+	releasesPath := filepath.Join(toolDir, "releases.jsonl")
+	refsPath := filepath.Join(toolDir, "refs.jsonl")
+	manifestPath := filepath.Join(toolDir, "manifest.json")
+	if err := os.WriteFile(releasesPath, []byte(releaseRow(string(evidence), "bf16")+"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(refsPath, []byte(refs.String()), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(manifestPath, manifest, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	tfsPath := filepath.Join(toolDir, "tfs")
+	script := "#!/bin/sh\n" +
+		"if [ \"$1:$2\" = repo:list ]; then /usr/bin/cp '" + releasesPath + "' \"$5\"; exit; fi\n" +
+		"if [ \"$1:$2\" = manifest:walk ]; then /usr/bin/cp '" + refsPath + "' \"$6\"; exit; fi\n" +
+		"if [ \"$1:$2\" = manifest:get ]; then /usr/bin/cp '" + manifestPath + "' \"$6\"; exit; fi\n" +
+		"if [ \"$1\" = get ]; then printf x > \"$5\"; exit; fi\n" +
+		"exit 1\n"
+	if err := os.WriteFile(tfsPath, []byte(script), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	tool := &tfs.Tool{Bin: tfsPath, Root: toolDir}
+
+	var grantCalls, settleCalls atomic.Int32
+	publicationPath := "/v1/models/acme/model/publications/batch-proof"
+	var server *httptest.Server
+	server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodPut && r.URL.Path == publicationPath:
+			_ = json.NewEncoder(w).Encode(hub.OpenPublicationResponse{Created: true,
+				Publication: hub.Session{Operation: "batch-proof", Release: "1.0.0", Lane: "bf16", State: "open", Objects: transfers}})
+		case r.Method == http.MethodPost && r.URL.Path == publicationPath+"/grants":
+			var body struct {
+				ObjectIDs []string `json:"object_ids"`
+			}
+			if err := json.NewDecoder(r.Body).Decode(&body); err != nil || len(body.ObjectIDs) == 0 || len(body.ObjectIDs) > 128 {
+				t.Errorf("grant batch size = %d, %v", len(body.ObjectIDs), err)
+			}
+			grantCalls.Add(1)
+			answer := hub.GrantResponse{Grants: make([]hub.Grant, 0, len(body.ObjectIDs))}
+			for _, objectID := range body.ObjectIDs {
+				answer.Grants = append(answer.Grants, hub.Grant{ObjectID: objectID, Length: 1,
+					URL: server.URL + "/objects/" + objectID})
+			}
+			_ = json.NewEncoder(w).Encode(answer)
+		case r.Method == http.MethodPut && strings.HasPrefix(r.URL.Path, "/objects/"):
+			raw, err := io.ReadAll(r.Body)
+			if err != nil || string(raw) != "x" {
+				t.Errorf("object upload = %q, %v", raw, err)
+			}
+			w.WriteHeader(http.StatusOK)
+		case r.Method == http.MethodPost && r.URL.Path == publicationPath+"/settle":
+			var body struct {
+				Objects []hub.SettleObject `json:"objects"`
+			}
+			if err := json.NewDecoder(r.Body).Decode(&body); err != nil || len(body.Objects) == 0 || len(body.Objects) > 128 {
+				t.Errorf("settlement batch size = %d, %v", len(body.Objects), err)
+			}
+			settleCalls.Add(1)
+			settled := make([]hub.SettledObject, 0, len(body.Objects))
+			for _, object := range body.Objects {
+				settled = append(settled, hub.SettledObject{ObjectID: object.ObjectID,
+					State: "accepted", ChecksumSource: "streamed_sha256", Conflict: object.AlreadyPresent})
+			}
+			_ = json.NewEncoder(w).Encode(map[string]any{"objects": settled})
+		case r.Method == http.MethodPost && r.URL.Path == publicationPath+"/seal":
+			_ = json.NewEncoder(w).Encode(hub.CompleteResponse{PublishID: "batch-proof",
+				Release: "1.0.0", Lane: "bf16", Manifest: hub.ManifestRef{SHA256: manifestA, Length: int64(len(manifest))},
+				TopologyDigest: "sha256:" + topologyC, Objects: objectCount, Bytes: objectCount,
+				ReleaseEvidenceBase64: evidenceBase64})
+		default:
+			t.Errorf("unexpected request %s %s", r.Method, r.URL.Path)
+			http.Error(w, "unexpected", http.StatusNotFound)
+		}
+	}))
+	defer server.Close()
+
+	publish := transfer.Publish{Tool: tool,
+		Hub: hub.New(config.Config{HubURL: server.URL, HubToken: secret.New("token")}, "test"),
+		Ref: hub.Ref{Org: "acme", Name: "model"}, ManifestID: manifestID,
+		Release: "1.0.0", Lane: "bf16", Session: "batch-proof", Reason: "proof", Scratch: t.TempDir()}
+	result, problem := publish.Run(context.Background())
+	if problem != nil {
+		t.Fatal(problem)
+	}
+	if grantCalls.Load() != 3 || settleCalls.Load() != 3 {
+		t.Fatalf("control requests: grants=%d settle=%d, want 3 each", grantCalls.Load(), settleCalls.Load())
+	}
+	if result.Uploaded != objectCount || result.Verified != objectCount || result.Moved != objectCount {
+		t.Fatalf("publication result = %#v", result)
 	}
 }

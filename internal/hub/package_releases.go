@@ -45,7 +45,7 @@ type PackageInstallDownload struct {
 	URL    string `json:"url"`
 }
 
-type PackageInstallPlan struct {
+type PackageDownloadPlan struct {
 	Profile            string                   `json:"profile"`
 	PlacementSet       ExactDocument            `json:"placement_set"`
 	PackageDescriptor  ExactDocument            `json:"package_descriptor"`
@@ -94,10 +94,10 @@ func (c *Client) YankPackageRelease(ctx context.Context, ref Ref, release, reaso
 	return out, e
 }
 
-func (c *Client) PackageInstallPlan(ctx context.Context, ref Ref, release string,
+func (c *Client) PackageDownloads(ctx context.Context, ref Ref, release string,
 	target PackageInstallTarget,
-) (PackageInstallPlan, *exit.Error) {
-	var out PackageInstallPlan
+) (PackageDownloadPlan, *exit.Error) {
+	var out PackageDownloadPlan
 	if target.OS == "" || target.Arch == "" ||
 		(target.Accelerator != "cpu" && target.Accelerator != "nvidia") ||
 		target.Accelerator == "cpu" && (target.DriverCUDA != "" || target.ComputeCapability != "") ||
@@ -109,7 +109,7 @@ func (c *Client) PackageInstallPlan(ctx context.Context, ref Ref, release string
 		ModelSelections []ModelSelection     `json:"model_selections"`
 	}{Capability: target, ModelSelections: []ModelSelection{}}
 	e := c.do(ctx, call{method: http.MethodPost,
-		path: packageReleasePath(ref, release) + "/selection", body: body, strict: true,
+		path: packageReleasePath(ref, release) + "/downloads", body: body, strict: true,
 		responseBytes: 16 << 20}, &out)
 	return out, e
 }

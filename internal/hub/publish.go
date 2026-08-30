@@ -85,25 +85,46 @@ type GrantResponse struct {
 	Held   []Transfer `json:"held"`
 }
 
-// GrantKnownTransfer asks for one transfer immediately before its bytes move.
-func (c *Client) GrantKnownTransfer(ctx context.Context, ref Ref, operation,
-	objectID, reason string,
+// GrantKnownTransfers asks for one bounded transfer batch immediately before its
+// bytes move. Tensorhub returns exactly one grant or held row per requested object.
+func (c *Client) GrantKnownTransfers(ctx context.Context, ref Ref, operation string,
+	objectIDs []string, reason string,
 ) (GrantResponse, *exit.Error) {
 	var out GrantResponse
 	e := c.do(ctx, call{
 		method: http.MethodPost,
 		path:   publications(ref) + "/" + url.PathEscape(operation) + "/grants",
 		auth:   true, reason: reason, byBytes: true, patient: true,
-		body: map[string]any{"object_ids": []string{objectID}},
+		body: map[string]any{"object_ids": objectIDs},
 	}, &out)
 	if e != nil {
 		return GrantResponse{}, e
 	}
-	if len(out.Grants)+len(out.Held) != 1 {
+	if len(out.Grants)+len(out.Held) != len(objectIDs) {
 		return GrantResponse{}, exit.Internalf(
-			"grant for object %s answered %d grants and %d held rows",
-			objectID, len(out.Grants), len(out.Held),
+			"grant for %d objects answered %d grants and %d held rows",
+			len(objectIDs), len(out.Grants), len(out.Held),
 		)
+	}
+	want := make(map[string]bool, len(objectIDs))
+	for _, objectID := range objectIDs {
+		if objectID == "" || want[objectID] {
+			return GrantResponse{}, exit.Internalf("grant request contains an empty or duplicate object id")
+		}
+		want[objectID] = true
+	}
+	seen := make(map[string]bool, len(objectIDs))
+	for _, grant := range out.Grants {
+		if !want[grant.ObjectID] || seen[grant.ObjectID] {
+			return GrantResponse{}, exit.Internalf("grant response contains an absent or duplicate object %s", grant.ObjectID)
+		}
+		seen[grant.ObjectID] = true
+	}
+	for _, held := range out.Held {
+		if !want[held.ObjectID] || seen[held.ObjectID] {
+			return GrantResponse{}, exit.Internalf("grant response contains an absent or duplicate held object %s", held.ObjectID)
+		}
+		seen[held.ObjectID] = true
 	}
 	return out, nil
 }
