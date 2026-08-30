@@ -164,6 +164,16 @@ type Resource struct {
 	CreatedAt string `json:"created_at"`
 }
 
+type ReleaseSummary struct {
+	CutAt   string `json:"cut_at"`
+	Release string `json:"release"`
+}
+
+type PackageCard struct {
+	Package  Resource         `json:"package"`
+	Releases []ReleaseSummary `json:"releases"`
+}
+
 func (r Resource) Ref() string { return r.Org + "/" + r.Name }
 
 type call struct {
@@ -275,6 +285,12 @@ func (c *Client) Package(ctx context.Context, ref Ref) (Resource, *exit.Error) {
 	}
 	e := c.do(ctx, call{method: http.MethodGet, path: resourcePath("packages", ref)}, &out)
 	return out.Package, e
+}
+
+func (c *Client) PackageCard(ctx context.Context, ref Ref) (PackageCard, *exit.Error) {
+	var out PackageCard
+	e := c.do(ctx, call{method: http.MethodGet, path: resourcePath("packages", ref)}, &out)
+	return out, e
 }
 
 // Model resolves one model through its typed public route.

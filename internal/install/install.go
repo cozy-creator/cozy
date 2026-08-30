@@ -30,6 +30,18 @@ type Request struct {
 	Dir           string // --dir: an editable local tree, the development trust path
 	AllowUnsigned bool
 	Force         bool
+	Published     *PublishedSource
+}
+
+type PublishedSource struct {
+	Bytes        int64
+	Files        int
+	Package      string
+	ProjectWheel string
+	Release      string
+	SourceDigest string
+	SourceDir    string
+	Wheels       []string
 }
 
 type Timing struct {
@@ -51,7 +63,17 @@ type Result struct {
 // Run executes the whole transaction. Every refusal before Activate leaves the
 // records untouched, so the previously pinned generation stays runnable.
 func Run(l home.Layout, st *records.Store, req Request) (*Result, *exit.Error) {
-	if (req.Archive == "") == (req.Dir == "") {
+	sources := 0
+	if req.Archive != "" {
+		sources++
+	}
+	if req.Dir != "" {
+		sources++
+	}
+	if req.Published != nil {
+		sources++
+	}
+	if sources != 1 {
 		return nil, exit.Usagef("`cozy package install` needs exactly one source: --from <archive.tar.gz> or --dir <tree>").
 			WithRemedy("--from installs a published release archive; --dir installs an editable local tree").
 			WithNext("cozy help package install")
@@ -77,6 +99,21 @@ func Run(l home.Layout, st *records.Store, req Request) (*Result, *exit.Error) {
 	// ---- stage: bytes land under bounds; no code from the release has run ----
 	var sourceDir string
 	switch {
+	case req.Published != nil:
+		if req.Published.Package == "" || req.Published.Release == "" || req.Published.SourceDigest == "" ||
+			req.Published.SourceDir == "" || req.Published.ProjectWheel == "" {
+			return fail(exit.Internalf("published package source is incomplete"))
+		}
+		sourceDir = filepath.Join(genDir, "source")
+		if err := os.MkdirAll(genDir, 0o700); err != nil {
+			return fail(exit.Internalf("cannot create package generation: %s", err))
+		}
+		if err := os.Rename(req.Published.SourceDir, sourceDir); err != nil {
+			return fail(exit.Internalf("cannot adopt downloaded package source: %s", err))
+		}
+		gen.SourceKind, gen.SourceRef, gen.SourceDigest = "tensorhub", req.Published.Package+"@"+req.Published.Release, req.Published.SourceDigest
+		gen.Package, gen.Version = req.Published.Package, req.Published.Release
+		res.Files, res.Bytes = req.Published.Files, req.Published.Bytes
 	case req.Archive != "":
 		staged, err := StageArchive(req.Archive, filepath.Join(genDir, "source"))
 		if err != nil {
@@ -118,13 +155,13 @@ func Run(l home.Layout, st *records.Store, req Request) (*Result, *exit.Error) {
 	if e != nil {
 		return fail(e)
 	}
+	if prior != nil && priorGen != nil && priorGen.SourceDigest == gen.SourceDigest {
+		res.Idempotent = true
+		res.Gen = *priorGen
+		_ = os.RemoveAll(genDir)
+		return res, nil
+	}
 	if prior != nil && !req.Force {
-		if priorGen != nil && priorGen.SourceDigest == gen.SourceDigest {
-			res.Idempotent = true
-			res.Gen = *priorGen
-			_ = os.RemoveAll(genDir)
-			return res, nil
-		}
 		_ = os.RemoveAll(genDir)
 		return nil, exit.New(exit.Conflict,
 			"%s is already installed and pinned to generation %s", gen.Package+majorSuffix(gen.Major), short12(prior.InstallID)).
@@ -150,7 +187,14 @@ func Run(l home.Layout, st *records.Store, req Request) (*Result, *exit.Error) {
 
 	// ---- venv: the first code-executing step, on verified source only ----
 	venvDir := filepath.Join(genDir, "venv")
-	env, err := MaterializeEnvironment(sourceDir, venvDir)
+	var env *EnvironmentReceipt
+	var err *exit.Error
+	if req.Published != nil {
+		wheels := append([]string{req.Published.ProjectWheel}, req.Published.Wheels...)
+		env, err = MaterializePublishedEnvironment(sourceDir, venvDir, wheels)
+	} else {
+		env, err = MaterializeEnvironment(sourceDir, venvDir)
+	}
 	if err != nil {
 		return guard(err)
 	}
@@ -240,6 +284,10 @@ func describeRefusal(code int, stderr string) *exit.Error {
 
 // verifySource settles source identity before any build backend or import can run.
 func verifySource(gen *records.PackageInstall, req Request, warn *[]string) *exit.Error {
+	if gen.SourceKind == "tensorhub" {
+		gen.Verified = true
+		return nil
+	}
 	if gen.SourceKind == "dir" {
 		// --dir IS the development trust path: an explicit local tree the operator
 		// already controls. It carries a snapshot identity, never publisher evidence.

@@ -61,14 +61,9 @@ Search the Tensorhub catalog, install a package, and inspect local installations
 ```sh
 cozy package search video
 cozy package search org/name
-cozy package install org/name@v1 --from ./package.tar.gz
+cozy package install org/name
+cozy package install org/name@1.2.3
 cozy package list
-```
-
-For local package development, install a source tree explicitly:
-
-```sh
-cozy package install org/name --dir ./my-package --allow-unsigned
 ```
 
 Remove local package generations with:
