@@ -60,6 +60,11 @@ type JobFacts struct {
 // keeping a job worker warm after it finishes. Warm persistence is a serving concern and
 // stays one.
 func (f *Facts) JobSpec(function string, devices []string) (orchestrator.WorkerLaunchSpec, *JobFacts, *exit.Error) {
+	if f.Install.SourceKind == "local" {
+		return orchestrator.WorkerLaunchSpec{}, nil, exit.Named(exit.Structural,
+			"editable_jobs_unsupported", "editable source checkouts do not run job callables").
+			WithRemedy("publish the package before running its job callable")
+	}
 	facts, e := f.Job(function)
 	if e != nil {
 		return orchestrator.WorkerLaunchSpec{}, nil, e
@@ -87,7 +92,7 @@ func (f *Facts) JobSpec(function string, devices []string) (orchestrator.WorkerL
 		// refuses an unknown key, exactly as the binding record's reader does.
 		Record: map[string]any{
 			"job_descriptor_id":           facts.DescriptorID,
-			"build_id":                    PackageReleaseID(f.Install),
+			"build_id":                    PackageRevisionDigest(f.Install),
 			"application":                 f.PackageDescriptor.Application,
 			"package_descriptor":          DescriptorPath(f.Install.Dir),
 			"overlay":                     overlays[0],

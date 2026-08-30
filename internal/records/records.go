@@ -34,7 +34,7 @@ type PackageInstall struct {
 	Package            string // org/name
 	Major              int
 	Version            string
-	SourceKind         string // "tensorhub" | "local" | legacy "archive"/"dir"
+	SourceKind         string // "tensorhub" | "local"
 	SourceRef          string
 	SourceDigest       string
 	Verified           bool // false = an explicit local/development install, not published custody
@@ -115,7 +115,8 @@ var renames = []struct{ table, from, to string }{
 	{"install_generations", "descriptor", "package_descriptor"},
 	{"pins", "endpoint", "package"},
 	{"worker_processes", "endpoint", "package"},
-	{"worker_processes", "release_id", "package_release_id"},
+	{"worker_processes", "release_id", "package_revision_digest"},
+	{"worker_processes", "package_release_id", "package_revision_digest"},
 	{"placement_acquisition_observations", "endpoint_started_ns", "package_started_ns"},
 	{"placement_acquisition_observations", "endpoint_ended_ns", "package_ended_ns"},
 	{"placement_acquisition_observations", "endpoint_downloaded_bytes", "package_downloaded_bytes"},

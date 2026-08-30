@@ -7,8 +7,11 @@ import (
 
 	"github.com/cozy-creator/cozy/internal/config"
 	"github.com/cozy-creator/cozy/internal/exit"
+	"github.com/cozy-creator/cozy/internal/home"
+	"github.com/cozy-creator/cozy/internal/install"
 	"github.com/cozy-creator/cozy/internal/launch"
 	"github.com/cozy-creator/cozy/internal/orchestrator"
+	"github.com/cozy-creator/cozy/internal/packagepublish"
 	"github.com/cozy-creator/cozy/internal/records"
 )
 
@@ -26,9 +29,10 @@ import (
 
 // Resolver is the Cozy daemon's package resolver.
 type Resolver struct {
-	mu    sync.Mutex
-	store *records.Store
-	cfg   config.Config
+	mu        sync.Mutex
+	refreshMu sync.Mutex
+	store     *records.Store
+	cfg       config.Config
 	// cache holds the specs already derived this launch. Deriving one reads a descriptor
 	// and asks the runtime for its artifact index; a generation is IMMUTABLE, so doing it
 	// twice would answer the same thing twice.
@@ -38,6 +42,98 @@ type Resolver struct {
 	placements map[string]orchestrator.DesiredPlacement
 	// Devices is the device envelope a worker this host launches may SEE.
 	Devices []string
+}
+
+// RefreshEditable is the daemon-owned pre-invocation fence for live source trees.
+// It snapshots the current tree, builds a complete replacement generation when it
+// moved, and swaps the active pin only after Runtime accepted the replacement.
+// A failure returns a typed refusal and leaves the last good generation active.
+func (r *Resolver) RefreshEditable(pkg string) (installID string, editable, changed bool, problem *exit.Error) {
+	r.refreshMu.Lock()
+	defer r.refreshMu.Unlock()
+	pkg = strings.TrimSpace(pkg)
+	current, problem := r.generation(pkg)
+	if problem != nil {
+		return "", false, false, problem
+	}
+	if current.SourceKind != "local" {
+		return current.ID, false, false, nil
+	}
+	refreshFailure := func(cause *exit.Error) (string, bool, bool, *exit.Error) {
+		return current.ID, true, false, exit.Named(cause.Code, "editable_refresh_failed",
+			"editable package %s could not refresh; generation %s remains active",
+			pkg, short12(current.ID)).
+			WithRemedy("%s: %s", cause.ErrName(), cause.Message)
+	}
+	pack, problem := packagepublish.PrepareFrom(current.SourceRef)
+	if problem != nil {
+		return refreshFailure(problem)
+	}
+	defer pack.Close()
+	if pack.Organization+"/"+pack.Name != current.Package || pack.Release != current.Version {
+		return refreshFailure(exit.Named(exit.Conflict, "editable_identity_changed",
+			"editable metadata now names %s/%s@%s, not installed %s@%s",
+			pack.Organization, pack.Name, pack.Release, current.Package, current.Version).
+			WithRemedy("install the renamed package directory explicitly"))
+	}
+	digest, files, bytes, problem := pack.SourceIdentity()
+	if problem != nil {
+		return refreshFailure(problem)
+	}
+	if digest == current.SourceDigest {
+		return current.ID, true, false, nil
+	}
+	layout, problem := home.Open(r.cfg.Home)
+	if problem != nil {
+		return refreshFailure(problem)
+	}
+	writer, problem := install.Lock(layout)
+	if problem != nil {
+		return refreshFailure(problem)
+	}
+	defer writer.Unlock()
+	latest, problem := r.generation(pkg)
+	if problem != nil {
+		return refreshFailure(problem)
+	}
+	if latest.ID != current.ID {
+		current = latest
+		if current.SourceKind != "local" {
+			return current.ID, false, false, nil
+		}
+		if current.SourceRef != pack.Tree || current.Package != pack.Organization+"/"+pack.Name ||
+			current.Version != pack.Release {
+			return refreshFailure(exit.Named(exit.Conflict, "editable_refresh_raced",
+				"the active package changed while its editable source was being checked").
+				WithRemedy("retry against the current install"))
+		}
+		if current.SourceDigest == digest {
+			return current.ID, true, false, nil
+		}
+	}
+	result, problem := install.Run(layout, r.store, install.Request{
+		Ref: install.Ref{Package: current.Package}, Force: true,
+		Local: &install.LocalSource{SourceDigest: digest, Bytes: bytes, Files: files,
+			Package: current.Package, Release: current.Version, Tree: current.SourceRef},
+	})
+	if problem != nil {
+		return refreshFailure(problem)
+	}
+	r.mu.Lock()
+	delete(r.cache, pkg)
+	delete(r.placements, pkg)
+	r.mu.Unlock()
+	if result.Gen.ID == "" {
+		return refreshFailure(exit.Internalf("editable refresh returned no active generation"))
+	}
+	return result.Gen.ID, true, !result.Idempotent, nil
+}
+
+func short12(value string) string {
+	if len(value) > 12 {
+		return value[:12]
+	}
+	return value
 }
 
 // NewResolver builds the resolver over the lifecycle authority.

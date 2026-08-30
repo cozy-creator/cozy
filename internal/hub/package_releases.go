@@ -24,10 +24,10 @@ type PackageReleaseDraft struct {
 }
 
 type PackageReleaseCommit struct {
-	State              string        `json:"state"`
-	PackageRelease     ExactDocument `json:"package_release"`
-	QualificationState string        `json:"qualification_state"`
-	QualificationError string        `json:"qualification_error,omitempty"`
+	State              string `json:"state"`
+	ReleaseDigest      string `json:"release_digest"`
+	QualificationState string `json:"qualification_state"`
+	QualificationError string `json:"qualification_error,omitempty"`
 }
 
 type PackageReleaseYank struct {
@@ -48,7 +48,6 @@ type PackageInstallDownload struct {
 type PackageInstallPlan struct {
 	Profile            string                   `json:"profile"`
 	PlacementSet       ExactDocument            `json:"placement_set"`
-	PackageRelease     ExactDocument            `json:"package_release"`
 	PackageDescriptor  ExactDocument            `json:"package_descriptor"`
 	Qualification      ExactDocument            `json:"qualification"`
 	EnvironmentReceipt ExactDocument            `json:"environment_receipt"`

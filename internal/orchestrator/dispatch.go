@@ -622,7 +622,7 @@ func (c *Orchestrator) dispatch(req records.Request) (uint64, *exit.Error) {
 	payloadDigest := spellOf(canonical.Digest(req.Payload))
 	outputLimit := c.maxOutputBytes()
 	spec := &pb.InvocationSpec{
-		PackageReleaseId: w.spec.Placement.PackageReleaseID,
+		PackageRevisionDigest: w.spec.Placement.PackageRevisionDigest,
 		// `image_digest` is GONE, renamed to what it always meant (#483): "image" is wrong
 		// for a native install with no OCI image at all. The value is the same one this
 		// daemon was frozen with — a request cannot choose the environment it runs under.
@@ -643,7 +643,7 @@ func (c *Orchestrator) dispatch(req records.Request) (uint64, *exit.Error) {
 		// request's scratch repo, which is why a queue-serving worker can hold one
 		// directive and still publish each attempt into its own place.
 		spec.Spec = &pb.InvocationSpec_Job{Job: &pb.JobInvocationSpec{
-			BuildId:         w.spec.Placement.PackageReleaseID,
+			BuildId:         w.spec.Placement.PackageRevisionDigest,
 			JobDescriptorId: req.PlanID,
 			PublicationContract: &pb.PublicationContract{
 				GrantId: home.ScratchRepo(req.Org, req.ID),

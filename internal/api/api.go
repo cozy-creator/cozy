@@ -95,6 +95,7 @@ type Server struct {
 // A remote request and package listing use ResolvePlacement; only an explicit local
 // start may require the target environment through Resolve.
 type Resolver interface {
+	RefreshEditable(pkg string) (installID string, editable, changed bool, problem *exit.Error)
 	ResolvePlacement(pkg string) (orchestrator.DesiredPlacement, *exit.Error)
 	ResolveInstall(installID string) (orchestrator.WorkerLaunchSpec, *exit.Error)
 	Entrypoint(installID, name string) (*launch.Entrypoint, *exit.Error)

@@ -42,15 +42,14 @@ type Package struct {
 	Release          string
 }
 
-type localIdentityFile struct {
+type sourceIdentityFile struct {
 	Digest string `json:"digest"`
 	Length int64  `json:"length"`
 	Path   string `json:"path"`
 }
 
-type localIdentityDocument struct {
-	Sources []localIdentityFile `json:"sources"`
-	Wheels  []localIdentityFile `json:"wheels"`
+type sourceIdentityDocument struct {
+	Sources []sourceIdentityFile `json:"sources"`
 }
 
 func (p *Package) Close() { _ = os.RemoveAll(p.Root) }
@@ -128,51 +127,32 @@ func (p *Package) Build(ctx context.Context) *exit.Error {
 	return nil
 }
 
-// LocalIdentity binds one development install to the exact publishable source
-// files and wheel bytes its ordinary build produced. Package/version remain
-// human catalog coordinates; this digest is the local immutable generation
-// input and never claims to be a Tensorhub PackageRelease.
-func (p *Package) LocalIdentity() (string, int, int64, *exit.Error) {
-	if p.Wheel == "" || p.Root == "" {
-		return "", 0, 0, exit.Internalf("local package identity requested before its wheel build")
-	}
-	document := localIdentityDocument{}
+// SourceIdentity binds an editable install to the exact publishable source tree.
+// It neither builds nor claims a wheel: editable execution uses this live tree,
+// while published execution remains the separate wheel-backed path.
+func (p *Package) SourceIdentity() (string, int, int64, *exit.Error) {
+	document := sourceIdentityDocument{}
 	var sourceBytes int64
 	for _, path := range Paths(p.Files) {
-		row, problem := localIdentityFileAt(path, p.Files[path])
+		row, problem := sourceIdentityFileAt(path, p.Files[path])
 		if problem != nil {
 			return "", 0, 0, problem
 		}
 		document.Sources = append(document.Sources, row)
 		sourceBytes += row.Length
 	}
-	project, problem := localIdentityFileAt(filepath.Base(p.Wheel), p.Wheel)
-	if problem != nil {
-		return "", 0, 0, problem
-	}
-	document.Wheels = append(document.Wheels, project)
-	for _, dependency := range p.DependencyWheels {
-		row, problem := localIdentityFileAt(dependency.Filename, dependency.Path)
-		if problem != nil {
-			return "", 0, 0, problem
-		}
-		document.Wheels = append(document.Wheels, row)
-	}
-	sort.Slice(document.Wheels, func(i, j int) bool {
-		return document.Wheels[i].Path < document.Wheels[j].Path
-	})
 	raw, err := json.Marshal(document)
 	if err != nil {
-		return "", 0, 0, exit.Internalf("cannot encode local package build identity: %s", err)
+		return "", 0, 0, exit.Internalf("cannot encode local package source identity: %s", err)
 	}
 	digest := sha256.Sum256(raw)
 	return "sha256:" + hex.EncodeToString(digest[:]), len(document.Sources), sourceBytes, nil
 }
 
-func localIdentityFileAt(name, file string) (localIdentityFile, *exit.Error) {
+func sourceIdentityFileAt(name, file string) (sourceIdentityFile, *exit.Error) {
 	input, err := os.Open(file)
 	if err != nil {
-		return localIdentityFile{}, exit.Named(exit.Structural, "local_package_build_changed",
+		return sourceIdentityFile{}, exit.Named(exit.Structural, "local_package_source_changed",
 			"cannot read %s while fixing the local build identity: %s", name, err).
 			WithRemedy("stop changing the project while `cozy package install` is building it")
 	}
@@ -180,11 +160,11 @@ func localIdentityFileAt(name, file string) (localIdentityFile, *exit.Error) {
 	length, copyErr := io.Copy(hash, input)
 	closeErr := input.Close()
 	if copyErr != nil || closeErr != nil {
-		return localIdentityFile{}, exit.Named(exit.Structural, "local_package_build_changed",
+		return sourceIdentityFile{}, exit.Named(exit.Structural, "local_package_source_changed",
 			"cannot finish reading %s while fixing the local build identity", name).
 			WithRemedy("stop changing the project while `cozy package install` is building it")
 	}
-	return localIdentityFile{Path: name, Length: length,
+	return sourceIdentityFile{Path: name, Length: length,
 		Digest: "sha256:" + hex.EncodeToString(hash.Sum(nil))}, nil
 }
 
@@ -266,7 +246,7 @@ var ignoredRootDir = map[string]bool{
 
 var ignoredFile = map[string]bool{
 	".ds_store": true, "thumbs.db": true, ".gitignore": true, ".gitattributes": true,
-	"package.descriptor.json": true, "package.release.json": true,
+	"package.descriptor.json":       true,
 	"package.evaluated-config.json": true,
 }
 

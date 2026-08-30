@@ -166,6 +166,13 @@ func (s *Server) resolveJob(sub JobSubmission) (orchestrator.Submission, *exit.E
 	if s.packages == nil {
 		return out, exit.Unavailablef("this Cozy daemon resolves no packages")
 	}
+	refreshed, editable, _, refreshProblem := s.refreshPackage(sub.Package)
+	if refreshProblem != nil {
+		return out, refreshProblem
+	}
+	if editable {
+		sub.InstallID = refreshed
+	}
 	var jobs []launch.JobFacts
 	var e *exit.Error
 	if sub.InstallID != "" {

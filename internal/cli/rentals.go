@@ -408,8 +408,6 @@ func handleRentalUpdate(ctx *Context) *exit.Error {
 	next.SelectionProfile = answer.Selection.Profile
 	next.PlacementSetDigest = answer.Selection.PlacementSet.Digest
 	next.PlacementSetBytes = append([]byte(nil), answer.Selection.PlacementSet.CanonicalBytes...)
-	next.PackageReleaseDigest = answer.Selection.PackageRelease.Digest
-	next.PackageReleaseBytes = append([]byte(nil), answer.Selection.PackageRelease.CanonicalBytes...)
 	next.PackageDescriptorDigest = answer.Selection.PackageDescriptor.Digest
 	next.PackageDescriptorBytes = append([]byte(nil), answer.Selection.PackageDescriptor.CanonicalBytes...)
 	next.QualificationDigest = answer.Selection.Qualification.Digest
@@ -661,8 +659,6 @@ func captureRentalSelection(row *records.Rental, seen hub.Rental) *exit.Error {
 		candidate.SelectionProfile = selection.Profile
 		candidate.PlacementSetDigest = selection.PlacementSet.Digest
 		candidate.PlacementSetBytes = append([]byte(nil), selection.PlacementSet.CanonicalBytes...)
-		candidate.PackageReleaseDigest = selection.PackageRelease.Digest
-		candidate.PackageReleaseBytes = append([]byte(nil), selection.PackageRelease.CanonicalBytes...)
 		candidate.PackageDescriptorDigest = selection.PackageDescriptor.Digest
 		candidate.PackageDescriptorBytes = append([]byte(nil), selection.PackageDescriptor.CanonicalBytes...)
 		candidate.QualificationDigest = selection.Qualification.Digest
@@ -680,7 +676,6 @@ func captureRentalSelection(row *records.Rental, seen hub.Rental) *exit.Error {
 	stored := &hub.PackageSelection{
 		Profile:           row.SelectionProfile,
 		PlacementSet:      hub.ExactDocument{Digest: row.PlacementSetDigest, Length: int64(len(row.PlacementSetBytes)), CanonicalBytes: row.PlacementSetBytes},
-		PackageRelease:    hub.ExactDocument{Digest: row.PackageReleaseDigest, Length: int64(len(row.PackageReleaseBytes)), CanonicalBytes: row.PackageReleaseBytes},
 		PackageDescriptor: hub.ExactDocument{Digest: row.PackageDescriptorDigest, Length: int64(len(row.PackageDescriptorBytes)), CanonicalBytes: row.PackageDescriptorBytes},
 		Qualification:     hub.ExactDocument{Digest: row.QualificationDigest, Length: int64(len(row.QualificationBytes)), CanonicalBytes: row.QualificationBytes},
 	}
@@ -706,7 +701,7 @@ func sameSelection(a, b *hub.PackageSelection) bool {
 		return false
 	}
 	for _, pair := range [][2]hub.ExactDocument{
-		{a.PlacementSet, b.PlacementSet}, {a.PackageRelease, b.PackageRelease},
+		{a.PlacementSet, b.PlacementSet},
 		{a.PackageDescriptor, b.PackageDescriptor}, {a.Qualification, b.Qualification},
 	} {
 		if pair[0].Digest != pair[1].Digest || pair[0].Length != pair[1].Length ||

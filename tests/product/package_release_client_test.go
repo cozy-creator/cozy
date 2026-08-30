@@ -48,10 +48,8 @@ func TestPackageReleaseClientContract(t *testing.T) {
 			return
 		case r.Method == http.MethodPut && r.URL.Path == releasePath:
 			assertEmptyObject(t, r.Body)
-			_ = json.NewEncoder(w).Encode(map[string]any{"state": "committed", "qualification_state": "qualified", "package_release": map[string]any{
-				"canonical_bytes": []byte(`{"format":"cozy.package.release/1"}`),
-				"digest":          "sha256:" + strings.Repeat("a", 64), "length": 35,
-			}})
+			_ = json.NewEncoder(w).Encode(map[string]any{"state": "committed",
+				"qualification_state": "qualified", "release_digest": "sha256:" + strings.Repeat("a", 64)})
 			return
 		default:
 			http.NotFound(w, r)
@@ -68,7 +66,8 @@ func TestPackageReleaseClientContract(t *testing.T) {
 		t.Fatalf("declaration response changed: %+v problem=%v", draft, problem)
 	}
 	committed, problem := client.CommitPackageRelease(context.Background(), ref, "1.0.0", "proof publish")
-	if problem != nil || committed.State != "committed" || committed.PackageRelease.Length != 35 {
+	if problem != nil || committed.State != "committed" ||
+		committed.ReleaseDigest != "sha256:"+strings.Repeat("a", 64) {
 		t.Fatalf("commit response changed: %+v problem=%v", committed, problem)
 	}
 }
@@ -145,7 +144,7 @@ func TestPackageInstallPlanContract(t *testing.T) {
 			default:
 				t.Errorf("package install target omitted accelerator: %+v", body.Capability)
 			}
-			_, _ = io.WriteString(w, `{"profile":"cpu-test","placement_set":{"canonical_bytes":"e30=","digest":"sha256:`+strings.Repeat("2", 64)+`","length":2},"package_release":{"canonical_bytes":"e30=","digest":"sha256:`+strings.Repeat("3", 64)+`","length":2},"package_descriptor":{"canonical_bytes":"e30=","digest":"sha256:`+strings.Repeat("4", 64)+`","length":2},"qualification":{"canonical_bytes":"e30=","digest":"sha256:`+strings.Repeat("5", 64)+`","length":2},"downloads":[{"digest":"sha256:`+strings.Repeat("1", 64)+`","kind":"project_wheel","length":4,"path":"proof.whl","url":"https://storage.invalid/proof.whl"}]}`)
+			_, _ = io.WriteString(w, `{"profile":"cpu-test","placement_set":{"canonical_bytes":"e30=","digest":"sha256:`+strings.Repeat("2", 64)+`","length":2},"package_descriptor":{"canonical_bytes":"e30=","digest":"sha256:`+strings.Repeat("4", 64)+`","length":2},"qualification":{"canonical_bytes":"e30=","digest":"sha256:`+strings.Repeat("5", 64)+`","length":2},"downloads":[{"digest":"sha256:`+strings.Repeat("1", 64)+`","kind":"project_wheel","length":4,"path":"proof.whl","url":"https://storage.invalid/proof.whl"}]}`)
 		default:
 			http.NotFound(w, r)
 		}
@@ -223,12 +222,9 @@ func TestPackagePublishPendingWireFlowBoundsUploads(t *testing.T) {
 			_ = json.NewEncoder(w).Encode(map[string]any{"state": "pending", "uploads": uploads})
 		case r.Method == http.MethodPut && r.URL.Path == releasePath:
 			finalized.Add(1)
-			releaseBytes := []byte(`{"format":"cozy.package.release/1"}`)
 			_ = json.NewEncoder(w).Encode(map[string]any{
-				"state": "committed", "qualification_state": "qualified", "package_release": map[string]any{
-					"canonical_bytes": releaseBytes, "digest": "sha256:" + strings.Repeat("4", 64),
-					"length": len(releaseBytes),
-				},
+				"state": "committed", "qualification_state": "qualified",
+				"release_digest": "sha256:" + strings.Repeat("4", 64),
 			})
 		default:
 			http.Error(w, "unexpected route", http.StatusNotFound)

@@ -8,6 +8,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/cozy-creator/cozy/internal/canonical"
 	"github.com/cozy-creator/cozy/internal/exit"
 	"github.com/cozy-creator/cozy/internal/hub"
 	"github.com/cozy-creator/cozy/internal/output"
@@ -69,9 +70,11 @@ func handlePackagePublish(ctx *Context) *exit.Error {
 	if problem != nil {
 		return problem
 	}
-	if done.State != "committed" || done.PackageRelease.Digest == "" ||
-		done.PackageRelease.Length != int64(len(done.PackageRelease.CanonicalBytes)) {
-		return exit.Internalf("package commit returned no exact PackageRelease")
+	if done.State != "committed" {
+		return exit.Internalf("package commit did not reach committed state")
+	}
+	if _, err := canonical.Raw(done.ReleaseDigest); err != nil {
+		return exit.Internalf("package commit returned no exact release digest")
 	}
 	replay := draft.State == "committed"
 	status := "published"
@@ -83,7 +86,7 @@ func handlePackagePublish(ctx *Context) *exit.Error {
 		{K: "status", V: status}, {K: "changed", V: !replay},
 		{K: "qualification", V: done.QualificationState},
 		{K: "qualification_error", V: done.QualificationError},
-		{K: "package_release_digest", V: done.PackageRelease.Digest},
+		{K: "release_digest", V: done.ReleaseDigest},
 		{K: "uploaded", V: output.Bytes(moved)}, {K: "hub", V: c.Base()},
 	}
 	defaults := []string{"package", "release", "status"}

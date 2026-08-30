@@ -67,10 +67,11 @@ cozy package install .
 cozy package list
 ```
 
-An explicit directory (`.`, `..`, `./project`, `../project`, or an absolute path) runs the same
-bounded source scan and wheel build used by publication, then creates a local development install.
-Its exact source/build digest is pinned locally, but it is not a published PackageRelease,
-Qualification, or rentable deployment.
+An explicit directory (`.`, `..`, `./project`, `../project`, or an absolute path) creates a
+local-only editable install after a bounded source scan. Every invocation checks that live tree;
+a change atomically prepares a new generation and restarts stale execution state. A failed refresh
+keeps the last good generation pinned and refuses the invocation. Editable installs are neither
+published releases nor rentable deployments, and currently support model-free entrypoints only.
 
 Remove local package generations with:
 

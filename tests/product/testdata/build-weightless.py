@@ -1,22 +1,18 @@
-"""Build the weightless package archive used by TestProductPath."""
+"""Build the editable weightless source tree used by the product test."""
 
 from __future__ import annotations
 
 import argparse
-import hashlib
 import io
-import json
 import os
 import pathlib
 import shutil
 import subprocess
 import tarfile
 import tempfile
-import time
 
 import tomllib
 
-SKIP = {".git", ".venv", "__pycache__", ".mypy_cache", ".ruff_cache", "dist"}
 FIXTURE = pathlib.Path(__file__).with_name("weightless")
 
 
@@ -24,50 +20,6 @@ def run(
     *args: str, cwd: pathlib.Path | None = None, env: dict[str, str] | None = None
 ) -> None:
     subprocess.run(args, cwd=cwd, env=env, check=True)
-
-
-def digest(path: pathlib.Path) -> str:
-    value = hashlib.sha256()
-    with path.open("rb") as source:
-        for block in iter(lambda: source.read(1 << 20), b""):
-            value.update(block)
-    return value.hexdigest()
-
-
-def pack(
-    tree: pathlib.Path, package: str, version: str, archive: pathlib.Path
-) -> None:
-    files: list[dict[str, object]] = []
-    for path in sorted(tree.rglob("*")):
-        relative = path.relative_to(tree)
-        if (
-            any(part in SKIP for part in relative.parts)
-            or not path.is_file()
-            or path.is_symlink()
-        ):
-            continue
-        files.append(
-            {
-                "path": relative.as_posix(),
-                "sha256": digest(path),
-                "size": path.stat().st_size,
-            }
-        )
-
-    declaration = json.dumps(
-        {"package": package, "version": version, "files": files}, indent=2
-    ).encode()
-    with tarfile.open(archive, "w:gz") as output:
-        header = tarfile.TarInfo("release.json")
-        header.size, header.mtime, header.mode = (
-            len(declaration),
-            int(time.time()),
-            0o644,
-        )
-        output.addfile(header, io.BytesIO(declaration))
-        for row in files:
-            name = str(row["path"])
-            output.add(tree / name, arcname=name, recursive=False)
 
 
 def main() -> int:
@@ -79,7 +31,6 @@ def main() -> int:
     parser.add_argument("--out", required=True)
     parser.add_argument("--source-out")
     parser.add_argument("--version", default="1.0.0")
-    parser.add_argument("--package", default="cozy/weightless")
     args = parser.parse_args()
 
     runtime_repo = pathlib.Path(args.runtime_repo).expanduser().resolve()
@@ -146,8 +97,6 @@ def main() -> int:
             env=env,
         )
 
-        archive = out / f"{args.package.rsplit('/', 1)[-1]}-{args.version}.tar.gz"
-        pack(tree, args.package, args.version, archive)
         if args.source_out:
             source_out = pathlib.Path(args.source_out).resolve()
             shutil.copytree(
@@ -155,9 +104,8 @@ def main() -> int:
                 source_out,
                 ignore=shutil.ignore_patterns(".venv", "__pycache__", "dist"),
             )
-        print(f"archive:  {archive}")
+        print(f"source:   {source_out if args.source_out else tree}")
         print(f"runtime: {full_sha} (git archive, read-only)")
-        print(f"digest:  sha256:{digest(archive)}")
     return 0
 
 

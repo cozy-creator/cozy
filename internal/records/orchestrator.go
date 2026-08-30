@@ -32,7 +32,7 @@ CREATE TABLE IF NOT EXISTS worker_processes (
   instance_id     TEXT PRIMARY KEY,
   package        TEXT    NOT NULL,
   generation      TEXT    REFERENCES install_generations(id),
-  package_release_id      TEXT    NOT NULL,
+  package_revision_digest      TEXT    NOT NULL,
   worker_id       TEXT    NOT NULL,
   devices         TEXT    NOT NULL,
 	pid             INTEGER NOT NULL,
@@ -336,17 +336,17 @@ func NewID(prefix string) string {
 // identities it reported, and the generation-scoped device grant it holds. The grant is
 // this row's `Devices` field — one process, one visible device set, one generation.
 type WorkerProcess struct {
-	InstanceID       string
-	Package          string
-	Generation       string
-	PackageReleaseID string
-	WorkerID         string
-	Devices          []string
-	PID              int
-	Birth            string // the OS process-birth identity: /proc starttime, never the pid alone
-	SessionID        string
-	State            string // spawned_without_birth | spawned | registered | closed
-	OpenedAt         string
+	InstanceID            string
+	Package               string
+	Generation            string
+	PackageRevisionDigest string
+	WorkerID              string
+	Devices               []string
+	PID                   int
+	Birth                 string // the OS process-birth identity: /proc starttime, never the pid alone
+	SessionID             string
+	State                 string // spawned_without_birth | spawned | registered | closed
+	OpenedAt              string
 }
 
 type AcquisitionLeg struct {
@@ -494,7 +494,7 @@ func (s *Store) SpawnWorker(w WorkerProcess) *exit.Error {
 	}
 	clauses := make([]string, 0, len(w.Devices))
 	args := []any{
-		w.InstanceID, w.Package, nullable(w.Generation), w.PackageReleaseID, w.WorkerID,
+		w.InstanceID, w.Package, nullable(w.Generation), w.PackageRevisionDigest, w.WorkerID,
 		deviceList(w.Devices), w.PID, w.Birth, "spawned_without_birth", now(),
 	}
 	for _, d := range w.Devices {
@@ -509,7 +509,7 @@ func (s *Store) SpawnWorker(w WorkerProcess) *exit.Error {
 	// this statement is the fence against a DIFFERENT slot.
 	args = append(args, w.InstanceID)
 	res, err := s.db.Exec(`
-		INSERT INTO worker_processes(instance_id,package,generation,package_release_id,worker_id,
+		INSERT INTO worker_processes(instance_id,package,generation,package_revision_digest,worker_id,
 		  devices,pid,birth,state,opened_at)
 		SELECT ?,?,?,?,?,?,?,?,?,?
 		WHERE NOT EXISTS (
@@ -517,7 +517,7 @@ func (s *Store) SpawnWorker(w WorkerProcess) *exit.Error {
 		strings.Join(clauses, " OR ")+`) AND w.instance_id != ?)
 		ON CONFLICT(instance_id) DO UPDATE SET
 		  pid=excluded.pid, birth=excluded.birth, devices=excluded.devices,
-		  generation=excluded.generation, package_release_id=excluded.package_release_id,
+		  generation=excluded.generation, package_revision_digest=excluded.package_revision_digest,
 		  session_id=NULL,
 		  state='spawned_without_birth', opened_at=excluded.opened_at, closed_at=''`, args...)
 	if err != nil {
@@ -544,14 +544,14 @@ func (s *Store) SpawnWorker(w WorkerProcess) *exit.Error {
 // one rental lands on its own row rather than accumulating one per request.
 func (s *Store) AttachWorker(w WorkerProcess) *exit.Error {
 	if _, err := s.db.Exec(`
-		INSERT INTO worker_processes(instance_id,package,generation,package_release_id,worker_id,
+		INSERT INTO worker_processes(instance_id,package,generation,package_revision_digest,worker_id,
 		  devices,pid,birth,state,opened_at)
 		VALUES(?,?,?,?,?,'',0,'','spawned',?)
 		ON CONFLICT(instance_id) DO UPDATE SET
-		  generation=excluded.generation, package_release_id=excluded.package_release_id,
+		  generation=excluded.generation, package_revision_digest=excluded.package_revision_digest,
 		  session_id=NULL,
 		  state='spawned', opened_at=excluded.opened_at, closed_at=''`,
-		w.InstanceID, w.Package, nullable(w.Generation), w.PackageReleaseID, w.WorkerID,
+		w.InstanceID, w.Package, nullable(w.Generation), w.PackageRevisionDigest, w.WorkerID,
 		now()); err != nil {
 		return exit.Internalf("cannot journal the attached worker %s: %s", w.InstanceID, err)
 	}
@@ -559,7 +559,7 @@ func (s *Store) AttachWorker(w WorkerProcess) *exit.Error {
 }
 
 func (s *Store) ReviseAttachedWorker(instanceID, pkg, releaseID string) *exit.Error {
-	result, err := s.db.Exec(`UPDATE worker_processes SET package=?,package_release_id=?
+	result, err := s.db.Exec(`UPDATE worker_processes SET package=?,package_revision_digest=?
 		WHERE instance_id=? AND worker_id='remote' AND state!='closed'`,
 		pkg, releaseID, instanceID)
 	if err != nil {
@@ -658,7 +658,7 @@ func (s *Store) CloseWorker(instanceID string) *exit.Error {
 // LiveWorkers is every process row this root still believes in. Restart reconciliation
 // reads it and checks each against its OS process-birth identity before adopting.
 func (s *Store) LiveWorkers() ([]WorkerProcess, *exit.Error) {
-	rows, err := s.db.Query(`SELECT instance_id,package,COALESCE(generation,''),package_release_id,
+	rows, err := s.db.Query(`SELECT instance_id,package,COALESCE(generation,''),package_revision_digest,
 		worker_id,devices,pid,birth,COALESCE(session_id,''),state,opened_at FROM worker_processes WHERE state != 'closed'
 		ORDER BY opened_at`)
 	if err != nil {
@@ -669,7 +669,7 @@ func (s *Store) LiveWorkers() ([]WorkerProcess, *exit.Error) {
 	for rows.Next() {
 		var w WorkerProcess
 		var devices string
-		if err := rows.Scan(&w.InstanceID, &w.Package, &w.Generation, &w.PackageReleaseID,
+		if err := rows.Scan(&w.InstanceID, &w.Package, &w.Generation, &w.PackageRevisionDigest,
 			&w.WorkerID, &devices, &w.PID, &w.Birth, &w.SessionID, &w.State, &w.OpenedAt); err != nil {
 			return nil, exit.Internalf("cannot read a worker process row: %s", err)
 		}

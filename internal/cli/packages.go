@@ -8,7 +8,6 @@ import (
 	"github.com/cozy-creator/cozy/internal/config"
 	"github.com/cozy-creator/cozy/internal/exit"
 	"github.com/cozy-creator/cozy/internal/home"
-	"github.com/cozy-creator/cozy/internal/hub"
 	"github.com/cozy-creator/cozy/internal/install"
 	"github.com/cozy-creator/cozy/internal/output"
 	"github.com/cozy-creator/cozy/internal/packagepublish"
@@ -42,10 +41,7 @@ func handleInstall(ctx *Context) *exit.Error {
 	if explicitPackageDirectory(ctx.Inv.Args[0]) {
 		return handleDirectoryInstall(ctx)
 	}
-	if ctx.Inv.Value("--from") == "" && ctx.Inv.Value("--dir") == "" {
-		return handleRegistryInstall(ctx)
-	}
-	return handleLocalInstall(ctx)
+	return handleRegistryInstall(ctx)
 }
 
 func explicitPackageDirectory(value string) bool {
@@ -57,9 +53,7 @@ func explicitPackageDirectory(value string) bool {
 
 func handleDirectoryInstall(ctx *Context) *exit.Error {
 	path := strings.TrimSpace(ctx.Inv.Args[0])
-	if ctx.Inv.Value("--version") != "" || ctx.Inv.Value("--from") != "" ||
-		ctx.Inv.Value("--dir") != "" || ctx.Inv.Value("--digest") != "" ||
-		ctx.Inv.Bool("--allow-unsigned") || ctx.Inv.Bool("--force") {
+	if ctx.Inv.Value("--version") != "" {
 		return exit.Usagef("an explicit package directory does not take registry or legacy source options").
 			WithRemedy("use `cozy package install %s` by itself", path)
 	}
@@ -68,14 +62,7 @@ func handleDirectoryInstall(ctx *Context) *exit.Error {
 		return problem
 	}
 	defer pack.Close()
-	hctx, cancel := hub.LongContext()
-	defer cancel()
-	if problem := packagePublishStage(ctx, "Building and checking local package wheel", func() *exit.Error {
-		return pack.Build(hctx)
-	}); problem != nil {
-		return problem
-	}
-	buildDigest, files, bytes, problem := pack.LocalIdentity()
+	sourceDigest, files, bytes, problem := pack.SourceIdentity()
 	if problem != nil {
 		return problem
 	}
@@ -93,7 +80,7 @@ func handleDirectoryInstall(ctx *Context) *exit.Error {
 	problem = packagePublishStage(ctx, "Creating local package environment", func() *exit.Error {
 		var installProblem *exit.Error
 		result, installProblem = install.Run(l, st, install.Request{Ref: ref, Force: true,
-			Local: &install.LocalSource{BuildDigest: buildDigest, Bytes: bytes, Files: files,
+			Local: &install.LocalSource{SourceDigest: sourceDigest, Bytes: bytes, Files: files,
 				Package: ref.Package, Release: pack.Release, Tree: pack.Tree}})
 		return installProblem
 	})
@@ -101,32 +88,6 @@ func handleDirectoryInstall(ctx *Context) *exit.Error {
 		return problem
 	}
 	return emitInstallResult(ctx, st, result)
-}
-
-func handleLocalInstall(ctx *Context) *exit.Error {
-	ref, e := install.ParseRef(ctx.Inv.Args[0])
-	if e != nil {
-		return e
-	}
-	l, st, w, e := open(ctx.Cfg, true)
-	if e != nil {
-		return e
-	}
-	defer st.Close()
-	defer w.Unlock()
-
-	res, e := install.Run(l, st, install.Request{
-		Ref:           ref,
-		Archive:       ctx.Inv.Value("--from"),
-		ExpectDigest:  ctx.Inv.Value("--digest"),
-		Dir:           ctx.Inv.Value("--dir"),
-		AllowUnsigned: ctx.Inv.Bool("--allow-unsigned"),
-		Force:         ctx.Inv.Bool("--force"),
-	})
-	if e != nil {
-		return e
-	}
-	return emitInstallResult(ctx, st, res)
 }
 
 func emitInstallResult(ctx *Context, st *records.Store, res *install.Result) *exit.Error {
@@ -149,7 +110,7 @@ func emitInstallResult(ctx *Context, st *records.Store, res *install.Result) *ex
 		return emit(ctx, compactRecord(fields, "package", "version", "status", "changed"))
 	}
 	fields = append(fields,
-		output.Field{K: "staged", V: fmt.Sprintf("%d files, %s expanded, %s compressed", res.Files, output.Bytes(res.Bytes), output.Bytes(res.Compressed))},
+		output.Field{K: "staged", V: fmt.Sprintf("%d files, %s", res.Files, output.Bytes(res.Bytes))},
 		output.Field{K: "timings", V: timingsText(res.Timings)},
 	)
 	if res.Superseded != "" {

@@ -67,8 +67,10 @@ func (p WarmupPolicy) Or() WarmupPolicy {
 // rev-2's Placement nested directly in PlacementSet (#481). It carries the identity
 // facts, and nothing about how a process is started.
 type DesiredPlacement struct {
-	Package          string `json:"package"`            // org/name — the slot this placement serves under
-	PackageReleaseID string `json:"package_release_id"` // exact PackageRelease digest spelling
+	Package               string `json:"package"`                 // org/name — the slot this placement serves under
+	PackageRevisionDigest string `json:"package_revision_digest"` // exact selected release digest spelling
+	Release               string `json:"release"`
+	SourceDigest          string `json:"source_digest,omitempty"` // local-only DevelopmentPackage identity
 	// InstallID is the install this placement was resolved from ("" = an uninstalled dev
 	// tree). Was `Generation`, which named a protocol word this side does not own (#484).
 	InstallID string `json:"install_id"`
@@ -117,27 +119,42 @@ func PlacementFromExact(pkg, installID, digest string, data []byte,
 			"Creator supports exactly one placement, got %d", len(rows))
 	}
 	row := rows[0]
+	packageFact, development := row.Sub("package"), row.Sub("development")
 	placement := DesiredPlacement{
 		Package: pkg, InstallID: installID, PlacementIDValue: row.Str("placement_id"),
-		PackageReleaseID:         row.Sub("package_release").Str("digest"),
+		PackageRevisionDigest:    packageFact.Str("release_digest"),
+		Release:                  packageFact.Str("release"),
 		EnvironmentDigest:        row.Str("environment_digest"),
 		WheelhouseManifestDigest: row.Sub("environment").Sub("wheelhouse_manifest").Str("digest"),
 		PlacementSetDigest:       digest, PlacementSetBytes: append([]byte(nil), data...),
 	}
-	if placement.PackageReleaseID == "" || placement.EnvironmentDigest == "" ||
+	if development.Str("source_digest") != "" {
+		placement.PackageRevisionDigest = development.Str("source_digest")
+		placement.Release = development.Str("release")
+		placement.SourceDigest = development.Str("source_digest")
+		if development.Str("package") != pkg || placement.Release == "" ||
+			placement.PlacementIDValue == "" || placement.EnvironmentDigest != "" ||
+			row.Sub("qualification").Str("digest") != "" {
+			return DesiredPlacement{}, exit.Named(exit.Structural, "development_placement_incomplete",
+				"development PlacementSet mixes local source with published selection facts")
+		}
+	} else if packageFact.Str("package") != pkg || placement.Release == "" ||
+		placement.PackageRevisionDigest == "" || placement.EnvironmentDigest == "" ||
 		placement.PlacementIDValue == "" {
 		return DesiredPlacement{}, exit.Named(exit.Structural, "placement_set_incomplete",
-			"PlacementSet omits its placement, package release, or environment identity")
+			"PlacementSet omits or mismatches its placement, package selection, or environment identity")
 	}
 	environment := row.Sub("environment")
-	environmentIdentity := map[string]canonical.Value{
-		"format":              "cozy.worker.v1.Environment/1",
-		"wheelhouse_manifest": environment["wheelhouse_manifest"],
-		"wheels":              environment["wheels"],
-	}
-	if !digestMatches(environmentIdentity, placement.EnvironmentDigest) {
-		return DesiredPlacement{}, exit.Named(exit.Conflict, "environment_identity_mismatch",
-			"environment_digest does not hash the exact nested Environment")
+	if placement.SourceDigest == "" {
+		environmentIdentity := map[string]canonical.Value{
+			"format":              "cozy.worker.v1.Environment/1",
+			"wheelhouse_manifest": environment["wheelhouse_manifest"],
+			"wheels":              environment["wheels"],
+		}
+		if !digestMatches(environmentIdentity, placement.EnvironmentDigest) {
+			return DesiredPlacement{}, exit.Named(exit.Conflict, "environment_identity_mismatch",
+				"environment_digest does not hash the exact nested Environment")
+		}
 	}
 	for _, entrypoint := range row.List("entrypoints") {
 		name, binding := entrypoint.Str("name"), entrypoint.Str("entrypoint_binding_digest")
@@ -751,12 +768,12 @@ func (c *Orchestrator) spawnWorker(spec WorkerLaunchSpec) (string, *exit.Error) 
 	// The GRANT IS JOURNALED FIRST, before any process exists. An admission that
 	// refuses here means nothing was started, which is why the refusal has no cleanup.
 	if e := c.opt.Store.SpawnWorker(records.WorkerProcess{
-		InstanceID:       instanceID,
-		Package:          spec.Placement.Package,
-		Generation:       spec.Placement.InstallID,
-		PackageReleaseID: spec.Placement.PackageReleaseID,
-		WorkerID:         "local",
-		Devices:          spec.Devices,
+		InstanceID:            instanceID,
+		Package:               spec.Placement.Package,
+		Generation:            spec.Placement.InstallID,
+		PackageRevisionDigest: spec.Placement.PackageRevisionDigest,
+		WorkerID:              "local",
+		Devices:               spec.Devices,
 	}); e != nil {
 		logFile.Close()
 		return "", e
@@ -785,7 +802,7 @@ func (c *Orchestrator) spawnWorker(spec WorkerLaunchSpec) (string, *exit.Error) 
 		"--socket", listen,
 		"--out", filepath.Join(root, "run"),
 		"--instance-id", instanceID,
-		"--release-id", spec.Placement.PackageReleaseID,
+		"--release-id", spec.Placement.PackageRevisionDigest,
 		"--devices", strings.Join(spec.Devices, ","),
 		"--grace", strconv.FormatFloat(graceOr(spec.GraceSec), 'f', -1, 64),
 	)
@@ -997,11 +1014,11 @@ func (c *Orchestrator) connectWorker(spec WorkerLaunchSpec) (string, *exit.Error
 	// cards, and the pod's card is the pod's. There is no grant to journal and none to
 	// release, which is also why nothing here has a pid or a birth identity to record.
 	if e := c.opt.Store.AttachWorker(records.WorkerProcess{
-		InstanceID:       instanceID,
-		Package:          spec.Placement.Package,
-		Generation:       spec.Placement.InstallID,
-		PackageReleaseID: spec.Placement.PackageReleaseID,
-		WorkerID:         "remote",
+		InstanceID:            instanceID,
+		Package:               spec.Placement.Package,
+		Generation:            spec.Placement.InstallID,
+		PackageRevisionDigest: spec.Placement.PackageRevisionDigest,
+		WorkerID:              "remote",
 	}); e != nil {
 		return "", e
 	}
@@ -1175,7 +1192,7 @@ type WorkerFacts struct {
 	InstanceID                string   `json:"instance_id"`
 	RentalID                  string   `json:"rental_id,omitempty"`
 	Package                   string   `json:"package"`
-	PackageReleaseID          string   `json:"package_release_id"`
+	PackageRevisionDigest     string   `json:"package_revision_digest"`
 	BootID                    string   `json:"worker_boot_id"`
 	PlacementID               string   `json:"placement_id"`
 	PlacementSetDigest        string   `json:"placement_set_digest"`
@@ -1247,7 +1264,7 @@ func (c *Orchestrator) Workers() []WorkerFacts {
 func factsOf(w *worker) WorkerFacts {
 	f := WorkerFacts{
 		InstanceID: w.instanceID, Package: w.spec.Placement.Package,
-		PackageReleaseID: w.spec.Placement.PackageReleaseID, BootID: w.bootID,
+		PackageRevisionDigest: w.spec.Placement.PackageRevisionDigest, BootID: w.bootID,
 		PlacementID: w.placementID, Generation: w.generation,
 		Exited: w.exited, Devices: w.spec.Devices,
 
@@ -1458,6 +1475,16 @@ func (c *Orchestrator) stopClaimedWorker(w *worker, grace time.Duration) bool {
 // and any active request, outstanding offer, reservation, or unacked terminal keeps a
 // worker alive. Process exit is the reliable release of its GPU-resident model.
 func (c *Orchestrator) UnloadIdleLocalWorkers() ([]WorkerFacts, *exit.Error) {
+	return c.unloadIdleLocalWorkers("")
+}
+
+// UnloadIdleLocalPackage stops only stale idle workers for one refreshed package.
+// Other warm packages stay resident; active work still wins the ordinary idle fence.
+func (c *Orchestrator) UnloadIdleLocalPackage(pkg string) ([]WorkerFacts, *exit.Error) {
+	return c.unloadIdleLocalWorkers(pkg)
+}
+
+func (c *Orchestrator) unloadIdleLocalWorkers(pkg string) ([]WorkerFacts, *exit.Error) {
 	active, e := c.opt.Store.ActiveRequests()
 	if e != nil {
 		return nil, e
@@ -1466,7 +1493,8 @@ func (c *Orchestrator) UnloadIdleLocalWorkers() ([]WorkerFacts, *exit.Error) {
 	c.mu.Lock()
 	candidates := make([]*worker, 0, len(c.workers))
 	for _, w := range c.workers {
-		if w.spec.Connection == nil && !w.spec.IsJob() {
+		if w.spec.Connection == nil && !w.spec.IsJob() &&
+			(pkg == "" || w.spec.Placement.Package == pkg) {
 			candidates = append(candidates, w)
 		}
 	}
