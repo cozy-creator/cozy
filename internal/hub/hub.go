@@ -220,18 +220,19 @@ type ResourceSearch struct {
 	Query  string `json:"q"`
 }
 
-type Account struct {
-	UserID      string `json:"user_id"`
-	PersonalOrg string `json:"personal_org"`
+type CurrentUser struct {
+	ID string `json:"id"`
 }
 
-// Account materializes and reads Tensorhub's stable ownership root for this AuthKit user.
-func (c *Client) Account(ctx context.Context) (Account, *exit.Error) {
-	var out Account
-	problem := c.do(ctx, call{method: http.MethodGet, path: "/v1/account", auth: true}, &out)
-	if problem == nil && (out.UserID == "" || out.PersonalOrg == "") {
-		problem = exit.Named(exit.Internal, "hub.account_invalid",
-			"Tensorhub returned an incomplete account identity")
+// CurrentUser reads AuthKit's canonical current-user route through Tensorhub's mount.
+func (c *Client) CurrentUser(ctx context.Context) (CurrentUser, *exit.Error) {
+	var out CurrentUser
+	// AuthKit owns and may extend this document. Decode the stable id projection
+	// without applying Creator's strict decoder for Creator-owned contracts.
+	problem := c.do(ctx, call{method: http.MethodGet, path: "/v1/auth/me", auth: true}, &out)
+	if problem == nil && out.ID == "" {
+		problem = exit.Named(exit.Internal, "auth.current_user_invalid",
+			"AuthKit returned a current-user document without an id")
 	}
 	return out, problem
 }
