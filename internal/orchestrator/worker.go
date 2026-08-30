@@ -301,10 +301,14 @@ func (p DesiredPlacement) InstanceID() string {
 
 func (s WorkerLaunchSpec) InstanceID() string {
 	if s.Connection != nil && s.Connection.RentalID != "" {
-		sum := sha256.Sum256([]byte("rental/" + s.Connection.RentalID))
-		return "ins-" + hex.EncodeToString(sum[:12])
+		return rentalInstanceID(s.Connection.RentalID)
 	}
 	return s.Placement.InstanceID()
+}
+
+func rentalInstanceID(id string) string {
+	sum := sha256.Sum256([]byte("rental/" + id))
+	return "ins-" + hex.EncodeToString(sum[:12])
 }
 
 // PlacementID is the RecordOwner-minted routing + journal key for the one placement this
@@ -674,6 +678,29 @@ func (c *Orchestrator) EnsureRental(id string) (string, string, WorkerChange, *e
 	spec.Placement.Package = pinnedPackage(spec.Placement.Package, id)
 	instance, change, problem := c.EnsureWorker(spec)
 	return instance, spec.Placement.Package, change, problem
+}
+
+// DetachRental stops this daemon's control loop for one rented worker. It waits for an
+// in-flight attach to finish choosing the slot, then waits for the exact worker generation
+// to quiesce. The caller may delete the rental's pinned certificate only after this returns.
+func (c *Orchestrator) DetachRental(id string) bool {
+	instanceID := rentalInstanceID(id)
+	for {
+		c.mu.Lock()
+		if inFlight := c.ensuring[instanceID]; inFlight != nil {
+			c.mu.Unlock()
+			<-inFlight
+			continue
+		}
+		w := c.workers[instanceID]
+		if w == nil || w.spec.Connection == nil || w.spec.Connection.RentalID != id {
+			c.mu.Unlock()
+			return false
+		}
+		c.mu.Unlock()
+		c.shutdownWorker(w, StopGrace)
+		return true
+	}
 }
 
 // hostsPlans answers whether a live worker was launched holding exactly the plans this
