@@ -1049,6 +1049,7 @@ pub fn repository_release_lines(root: &Path) -> Result<Vec<Vec<u8>>> {
     for (repository, _) in read_repositories(root)? {
         for release in repository.releases {
             lines.push(crate::canon::write(&Value::obj(vec![
+                ("evidence", release.evidence.to_value()),
                 ("lane", Value::str(release.lane)),
                 ("manifest_length", Value::uint(release.manifest.length)),
                 ("manifest_sha256", Value::str(release.manifest.sha256)),
