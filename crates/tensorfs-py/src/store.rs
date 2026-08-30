@@ -28,7 +28,7 @@ use tensorfs_core::meta::{Hold, Meta};
 use tensorfs_core::project;
 use tensorfs_core::read::{self, ObjectRange, ReadLease as CoreLease, Source as ReadSource};
 use tensorfs_core::receipt::Receipts;
-use tensorfs_core::repository::{Mutation, RepositoryName};
+use tensorfs_core::repository::{Mutation, Repository, RepositoryName};
 use tensorfs_core::storage;
 use tensorfs_core::store::{Fault, Store as CoreStore, Verdict};
 
@@ -472,6 +472,58 @@ impl PyStore {
         })?;
         tensorfs_core::repository::Repository::parse(&bytes).or_refuse(py)?;
         Ok(PyBytes::new(py, &bytes))
+    }
+
+    /// Resolve one exact local repository release without exporting Repository bytes for a
+    /// foreign parser. Package/model selection stays in the caller; TensorFS alone interprets
+    /// its stored repository and returns the immutable Manifest reference it names.
+    fn resolve_release<'p>(
+        &self,
+        py: Python<'p>,
+        org: &str,
+        name: &str,
+        version: &str,
+        lane: &str,
+    ) -> PyResult<Bound<'p, PyDict>> {
+        let repo = RepositoryName::new(org, name).or_refuse(py)?;
+        let path = self.store.repository_path(&repo);
+        let bytes = std::fs::read(&path).map_err(|error| {
+            to_py(
+                py,
+                &Refusal {
+                    code: if error.kind() == std::io::ErrorKind::NotFound {
+                        Code::REPOSITORY_ABSENT
+                    } else {
+                        Code::IO_FAILED
+                    },
+                    detail: format!("read {}: {error}", path.display()),
+                },
+            )
+        })?;
+        let repository = Repository::parse(&bytes).or_refuse(py)?;
+        let release = repository
+            .releases
+            .iter()
+            .find(|release| release.version == version && release.lane == lane)
+            .ok_or_else(|| {
+                to_py(
+                    py,
+                    &Refusal {
+                        code: Code::RELEASE_ABSENT,
+                        detail: format!(
+                            "repository {org}/{name} has no release ({version},{lane})"
+                        ),
+                    },
+                )
+            })?;
+        let out = PyDict::new(py);
+        out.set_item("org", org)?;
+        out.set_item("name", name)?;
+        out.set_item("version", &release.version)?;
+        out.set_item("lane", &release.lane)?;
+        out.set_item("manifest_digest", release.manifest.id())?;
+        out.set_item("manifest_length", release.manifest.length)?;
+        Ok(out)
     }
 
     fn begin_operation(

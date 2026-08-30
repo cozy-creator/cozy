@@ -111,6 +111,19 @@ with tempfile.TemporaryDirectory(prefix="tensorfs-transfer-") as transfer_root:
         None, "1.0.0", "cpu", snap, len(info["manifest"]), evidence
     )
     assert destination.repo_get("tensorhub", "smoke") == repo_bytes
+    assert destination.resolve_release("tensorhub", "smoke", "1.0.0", "cpu") == {
+        "org": "tensorhub",
+        "name": "smoke",
+        "version": "1.0.0",
+        "lane": "cpu",
+        "manifest_digest": "sha256:" + snap,
+        "manifest_length": len(info["manifest"]),
+    }
+    try:
+        destination.resolve_release("tensorhub", "smoke", "1.0.1", "cpu")
+        raise AssertionError("missing release resolved")
+    except tensorfs.errors.ReleaseAbsent:
+        pass
     with destination.acquire_manifest(snap) as acquired:
         assert acquired.objects
     print(f"acquisition: {len(closure)} blobs -> manifest -> repository CAS -> lease")
