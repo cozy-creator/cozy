@@ -95,6 +95,8 @@ func migrateRentalSchema(db *sql.DB, path string) *exit.Error {
 		name string
 		ddl  string
 	}{
+		{"placement_set_digest", `TEXT NOT NULL DEFAULT ''`},
+		{"placement_set_bytes", `BLOB NOT NULL DEFAULT x''`},
 		{"placement_revision", `INTEGER NOT NULL DEFAULT 0`},
 		{"selection_profile", `TEXT NOT NULL DEFAULT ''`},
 		{"package_release_digest", `TEXT NOT NULL DEFAULT ''`},

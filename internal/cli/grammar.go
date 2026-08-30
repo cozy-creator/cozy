@@ -77,7 +77,7 @@ type PackageRemoveCmd struct {
 }
 
 func (c *PackageRemoveCmd) Run(r *Runtime) error {
-	return r.call(handleRm, c.Refs, nil, nil, false)
+	return r.call(handleRm, c.Refs, nil, nil, true)
 }
 
 type PackageListCmd struct{}
