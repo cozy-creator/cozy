@@ -33,8 +33,9 @@
 // DOCUMENT VERSIONS. A digest-fenced document is NOT additively versioned: an unknown key
 // REFUSES, and a new key is a new document version. The canonical `format` tag is the message's
 // full name plus its document version. Every document here is at /1 except
-// `cozy.worker.v1.AttemptOutcomeBody/3`, `PlacementSet/2`, and
-// `WorkerSnapshotBody/2`. AttemptOutcomeBody /2 added `execution_started` under #480c; /3 adds
+// `cozy.worker.v1.ArtifactDelegation/2`, `AttemptOutcomeBody/3`,
+// `PackageEnvironmentSpec/2`, `PlacementSet/2`, and `WorkerSnapshotBody/2`. AttemptOutcomeBody
+// /2 added `execution_started` under #480c; /3 adds
 // exact committed job artifact receipts under th-049 on the frozen TerminalBody/1 lineage
 // (#481). PlacementSet /2 adds exact desired model closure; WorkerSnapshotBody /2 carries
 // observation-only placement acquisition telemetry.
@@ -3005,15 +3006,16 @@ func (x *PlatformTarget) GetAcceleratorAbi() string {
 }
 
 // Creator's exact signed logical artifact intent (proto-013). The frame duplicates none of the
-// document's revision or package/model ids. The worker parses these signed bytes once and sends
-// the same bytes and signature to Tensorhub over its readiness-pinned mTLS connection. No
-// package/model acquisition URL, Tensorhub/user credential, or HTTP request signature is present.
+// document's revision, package-release ids, or model-manifest ids. The worker parses these signed
+// bytes once and sends the same bytes and signature to Tensorhub over its readiness-pinned mTLS
+// connection. It carries no package/model acquisition URL, Tensorhub/user credential, or HTTP
+// request signature.
 type EnsureArtifacts struct {
 	state                    protoimpl.MessageState `protogen:"open.v1"`
 	RecordOwnerEpoch         uint64                 `protobuf:"varint,1,opt,name=record_owner_epoch,json=recordOwnerEpoch,proto3" json:"record_owner_epoch,omitempty"`
 	ControlStreamGeneration  uint64                 `protobuf:"varint,2,opt,name=control_stream_generation,json=controlStreamGeneration,proto3" json:"control_stream_generation,omitempty"`
 	WorkerBootId             string                 `protobuf:"bytes,3,opt,name=worker_boot_id,json=workerBootId,proto3" json:"worker_boot_id,omitempty"`
-	DelegationCanonicalBytes []byte                 `protobuf:"bytes,5,opt,name=delegation_canonical_bytes,json=delegationCanonicalBytes,proto3" json:"delegation_canonical_bytes,omitempty"` // exact ArtifactDelegation/1 canonical JSON bytes
+	DelegationCanonicalBytes []byte                 `protobuf:"bytes,5,opt,name=delegation_canonical_bytes,json=delegationCanonicalBytes,proto3" json:"delegation_canonical_bytes,omitempty"` // exact ArtifactDelegation/2 canonical JSON bytes
 	CreatorSignature         []byte                 `protobuf:"bytes,6,opt,name=creator_signature,json=creatorSignature,proto3" json:"creator_signature,omitempty"`                           // 64-byte Ed25519 signature over field 5
 	unknownFields            protoimpl.UnknownFields
 	sizeCache                protoimpl.SizeCache
@@ -3084,11 +3086,11 @@ func (x *EnsureArtifacts) GetCreatorSignature() []byte {
 	return nil
 }
 
-// DOCUMENT SHAPE (not a wire message): canonical form `cozy.worker.v1.ArtifactDelegation/1`.
-// Package/model ids are exact immutable Tensorhub identities, sorted unique in each list. The
-// per-rental Creator key signs these bytes. `worker_tls_certificate_digest` binds redemption to
-// the active per-boot certificate; Tensorhub separately compares the actual mTLS peer leaf DER
-// with readiness before it authorizes anything.
+// DOCUMENT SHAPE (not a wire message): canonical form `cozy.worker.v1.ArtifactDelegation/2`.
+// Package release/model manifest ids are exact immutable Tensorhub identities, sorted unique in
+// each list. The per-rental Creator key signs these bytes. `worker_tls_certificate_digest` binds
+// redemption to the active per-boot certificate; Tensorhub separately compares the actual mTLS
+// peer leaf DER with readiness before it authorizes anything.
 type ArtifactDelegation struct {
 	state                      protoimpl.MessageState `protogen:"open.v1"`
 	RentalId                   string                 `protobuf:"bytes,1,opt,name=rental_id,json=rentalId,proto3" json:"rental_id,omitempty"`
@@ -3097,7 +3099,7 @@ type ArtifactDelegation struct {
 	WorkerTlsCertificateDigest []byte                 `protobuf:"bytes,4,opt,name=worker_tls_certificate_digest,json=workerTlsCertificateDigest,proto3" json:"worker_tls_certificate_digest,omitempty"` // SHA-256 of exact readiness-pinned leaf DER
 	Revision                   uint64                 `protobuf:"varint,5,opt,name=revision,proto3" json:"revision,omitempty"`                                                                          // monotonic desired set; renewal keeps it unchanged
 	PackageReleaseIds          []string               `protobuf:"bytes,6,rep,name=package_release_ids,json=packageReleaseIds,proto3" json:"package_release_ids,omitempty"`
-	ModelCheckpointIds         []string               `protobuf:"bytes,7,rep,name=model_checkpoint_ids,json=modelCheckpointIds,proto3" json:"model_checkpoint_ids,omitempty"`
+	ModelManifestIds           []string               `protobuf:"bytes,7,rep,name=model_manifest_ids,json=modelManifestIds,proto3" json:"model_manifest_ids,omitempty"`
 	DelegationId               string                 `protobuf:"bytes,8,opt,name=delegation_id,json=delegationId,proto3" json:"delegation_id,omitempty"`       // changes on renewal; excluded from desired-set identity
 	ExpiresAtUnix              uint64                 `protobuf:"varint,9,opt,name=expires_at_unix,json=expiresAtUnix,proto3" json:"expires_at_unix,omitempty"` // Tensorhub clock authority; no issued-at or not-before
 	unknownFields              protoimpl.UnknownFields
@@ -3176,9 +3178,9 @@ func (x *ArtifactDelegation) GetPackageReleaseIds() []string {
 	return nil
 }
 
-func (x *ArtifactDelegation) GetModelCheckpointIds() []string {
+func (x *ArtifactDelegation) GetModelManifestIds() []string {
 	if x != nil {
-		return x.ModelCheckpointIds
+		return x.ModelManifestIds
 	}
 	return nil
 }
@@ -7714,15 +7716,15 @@ const file_cozy_worker_v1_worker_proto_rawDesc = "" +
 	"\x19control_stream_generation\x18\x02 \x01(\x04R\x17controlStreamGeneration\x12$\n" +
 	"\x0eworker_boot_id\x18\x03 \x01(\tR\fworkerBootId\x12<\n" +
 	"\x1adelegation_canonical_bytes\x18\x05 \x01(\fR\x18delegationCanonicalBytes\x12+\n" +
-	"\x11creator_signature\x18\x06 \x01(\fR\x10creatorSignatureJ\x04\b\x04\x10\x05\"\x82\x03\n" +
+	"\x11creator_signature\x18\x06 \x01(\fR\x10creatorSignatureJ\x04\b\x04\x10\x05\"\xfe\x02\n" +
 	"\x12ArtifactDelegation\x12\x1b\n" +
 	"\trental_id\x18\x01 \x01(\tR\brentalId\x12\x1b\n" +
 	"\tworker_id\x18\x02 \x01(\tR\bworkerId\x12$\n" +
 	"\x0eworker_boot_id\x18\x03 \x01(\tR\fworkerBootId\x12A\n" +
 	"\x1dworker_tls_certificate_digest\x18\x04 \x01(\fR\x1aworkerTlsCertificateDigest\x12\x1a\n" +
 	"\brevision\x18\x05 \x01(\x04R\brevision\x12.\n" +
-	"\x13package_release_ids\x18\x06 \x03(\tR\x11packageReleaseIds\x120\n" +
-	"\x14model_checkpoint_ids\x18\a \x03(\tR\x12modelCheckpointIds\x12#\n" +
+	"\x13package_release_ids\x18\x06 \x03(\tR\x11packageReleaseIds\x12,\n" +
+	"\x12model_manifest_ids\x18\a \x03(\tR\x10modelManifestIds\x12#\n" +
 	"\rdelegation_id\x18\b \x01(\tR\fdelegationId\x12&\n" +
 	"\x0fexpires_at_unix\x18\t \x01(\x04R\rexpiresAtUnix\"\xc3\x02\n" +
 	"\fJobDirective\x12\x19\n" +
