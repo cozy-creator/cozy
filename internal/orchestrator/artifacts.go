@@ -124,17 +124,6 @@ func artifactFinalizationIntents(req records.Request, attempt records.Attempt, s
 			disposition = pb.ArtifactFinalizeDisposition_ARTIFACT_FINALIZE_DISPOSITION_ABANDON
 			receiptDigest = receipt.ReceiptDigest
 		}
-		decision := &pb.ArtifactFinalizeDecision{
-			OwnerAuthorityScope: recordOwnerID, RequestId: req.ID,
-			InvocationSpecDigest: attempt.InvocationDigest, OutputSlot: output.OutputID,
-			Disposition: disposition, ArtifactReceiptDigest: receiptDigest, ScratchRootId: scratchRoot,
-		}
-		decisionBytes, decisionRaw, err := canonical.Identity(decision)
-		if err != nil {
-			return nil, exit.Internalf("cannot mint artifact final decision for %s: %s",
-				output.OutputID, err)
-		}
-		decisionDigest, _ := canonical.Spell(decisionRaw)
 		out = append(out, records.ArtifactFinalization{
 			RequestID: req.ID, Attempt: attempt.Attempt, InstanceID: attempt.InstanceID,
 			OwnerScope: recordOwnerID, InvocationDigest: attempt.InvocationDigest,
@@ -142,7 +131,6 @@ func artifactFinalizationIntents(req records.Request, attempt records.Attempt, s
 			Disposition: trimEnum(pb.ArtifactFinalizeDisposition_name[int32(disposition)],
 				"ARTIFACT_FINALIZE_DISPOSITION_"),
 			ReceiptDigest: receiptDigest, ScratchRootID: scratchRoot,
-			DecisionDigest: decisionDigest, DecisionBytes: decisionBytes,
 		})
 	}
 	return out, nil
@@ -185,15 +173,25 @@ func (c *Orchestrator) sendPendingArtifactFinalizations(s *session, requestID st
 		if err != nil {
 			return len(rows), exit.Internalf("persisted invocation digest is malformed: %s", err)
 		}
-		decisionDigest, err := canonical.Raw(row.DecisionDigest)
-		if err != nil {
-			return len(rows), exit.Internalf("persisted finalize decision digest is malformed: %s", err)
+		disposition, ok := pb.ArtifactFinalizeDisposition_value["ARTIFACT_FINALIZE_DISPOSITION_"+row.Disposition]
+		if !ok {
+			return len(rows), exit.Internalf("persisted finalize disposition %q is malformed",
+				row.Disposition)
+		}
+		var receiptDigest []byte
+		if row.ReceiptDigest != "" {
+			receiptDigest, err = canonical.Raw(row.ReceiptDigest)
+			if err != nil {
+				return len(rows), exit.Internalf("persisted receipt digest is malformed: %s", err)
+			}
 		}
 		request := &pb.ArtifactFinalizeRequest{
 			RecordOwnerEpoch: recordOwnerEpoch, ControlStreamGeneration: s.generation,
 			WorkerBootId: s.bootID, RequestId: row.RequestID,
 			InvocationSpecDigest: specDigest, OutputSlot: row.OutputSlot,
-			DecisionDigest: decisionDigest, DecisionCanonicalBytes: row.DecisionBytes,
+			Disposition:           pb.ArtifactFinalizeDisposition(disposition),
+			ArtifactReceiptDigest: receiptDigest, ScratchRootId: row.ScratchRootID,
+			OwnerAuthorityScope: row.OwnerScope,
 		}
 		if !s.send(&pb.RecordOwnerFrame{Msg: &pb.RecordOwnerFrame_ArtifactFinalizeRequest{
 			ArtifactFinalizeRequest: request,
@@ -201,32 +199,21 @@ func (c *Orchestrator) sendPendingArtifactFinalizations(s *session, requestID st
 			return len(rows), exit.Unavailablef("the stream closed before artifact finalization %s/%s was sent",
 				row.RequestID, row.OutputSlot)
 		}
-		c.logf("ArtifactFinalizeRequest %s/%s %s decision=%s -> %s", row.RequestID,
-			row.OutputSlot, row.Disposition, shortDigest(row.DecisionDigest), s.bootID)
+		c.logf("ArtifactFinalizeRequest %s/%s %s -> %s", row.RequestID,
+			row.OutputSlot, row.Disposition, s.bootID)
 	}
 	return len(rows), nil
 }
 
-func (c *Orchestrator) onArtifactFinalizeResult(s *session, frame *pb.ArtifactFinalizeResultFrame) {
+func (c *Orchestrator) onArtifactFinalizeResult(s *session, frame *pb.ArtifactFinalizeResult) {
 	refuse := func(format string, args ...any) {
 		c.logf("ArtifactFinalizeResult %s/%s REFUSED: "+format,
 			append([]any{frame.RequestId, frame.OutputSlot}, args...)...)
 	}
-	if !bytes.Equal(canonical.Digest(frame.ResultCanonicalBytes), frame.ResultDigest) {
-		refuse("result digest does not hash the exact carried bytes")
-		return
-	}
-	doc, err := canonical.Read(frame.ResultCanonicalBytes, &pb.ArtifactFinalizeResult{})
-	if err != nil {
-		refuse("inadmissible result document: %s", err)
-		return
-	}
 	spelledSpec, err := canonical.Spell(frame.InvocationSpecDigest)
-	if err != nil || doc.Str("request_id") != frame.RequestId ||
-		doc.Str("invocation_spec_digest") != spelledSpec ||
-		doc.Str("output_slot") != frame.OutputSlot ||
-		doc.Str("owner_authority_scope") != recordOwnerID {
-		refuse("envelope/document/owner divergence")
+	if err != nil || frame.RequestId == "" || frame.OutputSlot == "" ||
+		frame.OwnerAuthorityScope != recordOwnerID {
+		refuse("incomplete identity or owner divergence")
 		return
 	}
 	intent, e := c.opt.Store.ArtifactFinalization(frame.RequestId, spelledSpec, frame.OutputSlot)
@@ -242,7 +229,7 @@ func (c *Orchestrator) onArtifactFinalizeResult(s *session, frame *pb.ArtifactFi
 		refuse("worker %s sent a result for %s's transaction", s.instanceID, intent.InstanceID)
 		return
 	}
-	outcome := trimEnum(pb.ArtifactFinalizeOutcome_name[int32(doc.Int("outcome"))],
+	outcome := trimEnum(pb.ArtifactFinalizeOutcome_name[int32(frame.Outcome)],
 		"ARTIFACT_FINALIZE_OUTCOME_")
 	if (intent.Disposition == "ADOPT" && outcome != "ADOPTED") ||
 		(intent.Disposition != "ADOPT" && outcome != "ABANDONED") {
@@ -251,8 +238,16 @@ func (c *Orchestrator) onArtifactFinalizeResult(s *session, frame *pb.ArtifactFi
 	}
 	resultReceiptDigest := ""
 	var resultReceiptBytes []byte
-	if receiptRef := doc.Sub("artifact_receipt"); len(receiptRef) > 0 {
-		receipt, problem := parseArtifactReceiptRef(receiptRef)
+	if receiptRef := frame.ArtifactReceipt; receiptRef != nil {
+		digest, digestErr := canonical.Spell(receiptRef.ArtifactReceiptDigest)
+		if digestErr != nil {
+			refuse("returned receipt digest is malformed")
+			return
+		}
+		receipt, problem := parseArtifactReceiptRef(canonical.Doc{
+			"artifact_receipt_digest":          digest,
+			"artifact_receipt_canonical_bytes": base64.StdEncoding.EncodeToString(receiptRef.ArtifactReceiptCanonicalBytes),
+		})
 		if problem != nil {
 			refuse("%s", problem.Message)
 			return
@@ -273,12 +268,10 @@ func (c *Orchestrator) onArtifactFinalizeResult(s *session, frame *pb.ArtifactFi
 		refuse("ADOPTED omitted the exact adopted receipt")
 		return
 	}
-	resultDigest, _ := canonical.Spell(frame.ResultDigest)
 	applied, e := c.opt.Store.RecordArtifactFinalizeResult(records.ArtifactFinalization{
 		RequestID: frame.RequestId, Attempt: intent.Attempt, InstanceID: s.instanceID,
 		InvocationDigest: spelledSpec, OutputSlot: frame.OutputSlot,
-		ResultOutcome: outcome, ResultDigest: resultDigest,
-		ResultBytes:         append([]byte(nil), frame.ResultCanonicalBytes...),
+		ResultOutcome:       outcome,
 		ResultReceiptDigest: resultReceiptDigest, ResultReceiptBytes: resultReceiptBytes,
 	})
 	if e != nil {
@@ -286,8 +279,8 @@ func (c *Orchestrator) onArtifactFinalizeResult(s *session, frame *pb.ArtifactFi
 		return
 	}
 	if applied {
-		c.logf("ArtifactFinalizeResult %s/%s %s persisted before outcome ack (%s)",
-			frame.RequestId, frame.OutputSlot, outcome, shortDigest(resultDigest))
+		c.logf("ArtifactFinalizeResult %s/%s %s persisted before outcome ack",
+			frame.RequestId, frame.OutputSlot, outcome)
 	}
 	pending, e := c.opt.Store.PendingArtifactFinalizations(frame.RequestId, intent.Attempt)
 	if e != nil {

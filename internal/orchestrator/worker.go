@@ -151,7 +151,7 @@ func (p WarmupPolicy) Or() WarmupPolicy {
 }
 
 // DesiredPlacement is ONE assignment this owner wants a worker to host — the local half of
-// rev-2's `Placement` (placement_id -> PlacementSpec, #481). It carries the identity
+// rev-2's Placement nested directly in PlacementSet (#481). It carries the identity
 // facts, and nothing about how a process is started.
 type DesiredPlacement struct {
 	Package          string `json:"package"`            // org/name — the slot this placement serves under
@@ -160,7 +160,7 @@ type DesiredPlacement struct {
 	// tree). Was `Generation`, which named a protocol word this side does not own (#484).
 	InstallID string `json:"install_id"`
 	// PackageDescriptorDigest is the cr-003 descriptor's own identity, as the install VERIFIED
-	// it in the generation's own venv. It rides the PlacementSpec because a placement is
+	// it in the generation's own venv. It rides the Placement because a placement is
 	// named by the bytes it serves, and the descriptor is one of them.
 	PackageDescriptorDigest string     `json:"package_descriptor_digest"`
 	Bindings                []*Binding `json:"bindings"`
@@ -326,7 +326,7 @@ type worker struct {
 	home       string
 	planIDs    []string
 	// subjects is each staged binding-plan record as an ArtifactSubject — the exact bytes
-	// a PlacementSpec names, sorted by digest. Kept from the staging pass so the placement
+	// a Placement names, sorted by digest. Kept from the staging pass so the placement
 	// document names what was actually written rather than re-deriving it later.
 	subjects []*pb.ArtifactSubject
 	// media is the pod's byte plane, dialled once at connect. Nil for a locally spawned
@@ -378,14 +378,14 @@ type worker struct {
 	// the worker's own last word, and the two axes exist because ONE enum cannot say
 	// "staged on disk but offline" — the exact state an outgoing spec holds under
 	// fallback-retention (#473/#482).
-	phase           pb.WorkerPhase          // machine lifecycle, out of the placement enum
-	materialization pb.MaterializationState // axis 1: what is on disk
-	serving         pb.ServingState         // axis 2: what it will take
-	generation      uint64                  // THIS placement's executor generation
-	dispatchable    map[string]bool         // dispatchable_plan_ids
-	materializable  map[string]bool         // DISJOINT from dispatchable
-	specDigest      []byte                  // what the placement actually HOLDS right now
-	fallbackPin     []byte                  // the predecessor kept for restore; empty = replacement PAUSED
+	phase             pb.WorkerPhase          // machine lifecycle, out of the placement enum
+	materialization   pb.MaterializationState // axis 1: what is on disk
+	serving           pb.ServingState         // axis 2: what it will take
+	generation        uint64                  // THIS placement's executor generation
+	dispatchable      map[string]bool         // dispatchable_plan_ids
+	materializable    map[string]bool         // DISJOINT from dispatchable
+	heldSetDigest     []byte                  // parent set the placement actually holds
+	fallbackSetDigest []byte                  // predecessor set kept for restore; empty = replacement PAUSED
 
 	// THE ONE ADMISSION FENCE (#472e/#482/#486c). Per-placement credits are DELETED: N
 	// counters over ONE serialized device advertise N x the real capacity. Capacity is a
@@ -1040,7 +1040,7 @@ func remoteBindingSubjects(placement DesiredPlacement) ([]string, []*pb.Artifact
 }
 
 // subjectOf names the exact bytes of one staged binding-plan record, as the
-// `ArtifactSubject` a PlacementSpec carries. The subject_id is the plan id (a `sha256:`
+// `ArtifactSubject` a Placement carries. The subject_id is the plan id (a `sha256:`
 // document identity) and the digest is over the record as it lands on the worker's disk:
 // the id fences MEANING, the digest fences the BYTES, and they are deliberately not the
 // same number.
@@ -1210,18 +1210,18 @@ func (c *Orchestrator) WorkerLog(instanceID string) string {
 // worker-level admission fence — and `applied_revision` splits into the two facts it was
 // pretending to be (#473).
 type WorkerFacts struct {
-	InstanceID                 string   `json:"instance_id"`
-	RentalID                   string   `json:"rental_id,omitempty"`
-	Package                    string   `json:"package"`
-	PackageReleaseID           string   `json:"package_release_id"`
-	BootID                     string   `json:"worker_boot_id"`
-	PlacementID                string   `json:"placement_id"`
-	PlacementSpecDigest        string   `json:"placement_spec_digest"`
-	RetainedFallbackSpecDigest string   `json:"retained_fallback_spec_digest"`
-	PID                        int      `json:"pid"`
-	Generation                 uint64   `json:"executor_generation"`
-	Exited                     bool     `json:"exited"`
-	Devices                    []string `json:"devices"`
+	InstanceID                string   `json:"instance_id"`
+	RentalID                  string   `json:"rental_id,omitempty"`
+	Package                   string   `json:"package"`
+	PackageReleaseID          string   `json:"package_release_id"`
+	BootID                    string   `json:"worker_boot_id"`
+	PlacementID               string   `json:"placement_id"`
+	PlacementSetDigest        string   `json:"placement_set_digest"`
+	RetainedFallbackSetDigest string   `json:"retained_fallback_placement_set_digest"`
+	PID                       int      `json:"pid"`
+	Generation                uint64   `json:"executor_generation"`
+	Exited                    bool     `json:"exited"`
+	Devices                   []string `json:"devices"`
 
 	Phase           string `json:"worker_phase"`
 	Materialization string `json:"materialization"`
@@ -1316,8 +1316,8 @@ func factsOf(w *worker) WorkerFacts {
 	if w.spec.Connection != nil {
 		f.RentalID = w.spec.Connection.RentalID
 	}
-	f.PlacementSpecDigest, _ = canonical.Spell(w.specDigest)
-	f.RetainedFallbackSpecDigest, _ = canonical.Spell(w.fallbackPin)
+	f.PlacementSetDigest, _ = canonical.Spell(w.heldSetDigest)
+	f.RetainedFallbackSetDigest, _ = canonical.Spell(w.fallbackSetDigest)
 	f.AcceptedPlacementSetDigest, _ = canonical.Spell(w.acceptedSetDigest)
 	// THIS OWNER'S OWN VERDICT IS A FACT ABOUT THE WORKER, so it is reported as one — in
 	// its own field. A claim this side refused is the answer a poller of

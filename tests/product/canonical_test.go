@@ -90,9 +90,9 @@ func TestCanonicalDocuments(t *testing.T) {
 		"twin_unknown_key":                  {"unknown_field", &pb.InvocationSpec{}},
 		"twin_whitespace":                   {"noncanonical_encoding", &pb.InvocationSpec{}},
 		"twin_libc_unspelled":               {"libc_unspelled", &pb.PackageEnvironmentSpec{}},
-		"twin_model_object_set_missing":     {"model_object_set_missing", &pb.PlacementSpec{}},
-		"twin_model_object_set_wrong_kind":  {"model_object_set_shape", &pb.PlacementSpec{}},
-		"twin_model_object_set_zero_length": {"model_object_set_shape", &pb.PlacementSpec{}},
+		"twin_model_object_set_missing":     {"model_object_set_missing", &pb.PlacementSet{}},
+		"twin_model_object_set_wrong_kind":  {"model_object_set_shape", &pb.PlacementSet{}},
+		"twin_model_object_set_zero_length": {"model_object_set_shape", &pb.PlacementSet{}},
 	} {
 		body, err := os.ReadFile(filepath.Join(fixtureDir, "red", name+".json"))
 		must(t, err)
@@ -134,18 +134,12 @@ func messageFor(name string) proto.Message {
 		return &pb.AttemptOutcomeBody{}
 	case "cozy.worker.v1.ArtifactReceipt":
 		return &pb.ArtifactReceipt{}
-	case "cozy.worker.v1.ArtifactFinalizeDecision":
-		return &pb.ArtifactFinalizeDecision{}
-	case "cozy.worker.v1.ArtifactFinalizeResult":
-		return &pb.ArtifactFinalizeResult{}
 	case "cozy.worker.v1.ArtifactDelegation":
 		return &pb.ArtifactDelegation{}
 	case "cozy.worker.v1.ClaimProof":
 		return &pb.ClaimProof{}
 	case "cozy.worker.v1.PlacementSet":
 		return &pb.PlacementSet{}
-	case "cozy.worker.v1.PlacementSpec":
-		return &pb.PlacementSpec{}
 	case "cozy.worker.v1.PackageEnvironmentSpec":
 		return &pb.PackageEnvironmentSpec{}
 	case "cozy.worker.v1.WorkerSnapshotBody":

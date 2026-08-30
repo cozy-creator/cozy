@@ -33,10 +33,10 @@
 // DOCUMENT VERSIONS. A digest-fenced document is NOT additively versioned: an unknown key
 // REFUSES, and a new key is a new document version. The canonical `format` tag is the message's
 // full name plus its document version. Every document here is at /1 except
-// `cozy.worker.v1.AttemptOutcomeBody/3`, `PlacementSet/2`, `PlacementSpec/2`, and
+// `cozy.worker.v1.AttemptOutcomeBody/3`, `PlacementSet/2`, and
 // `WorkerSnapshotBody/2`. AttemptOutcomeBody /2 added `execution_started` under #480c; /3 adds
 // exact committed job artifact receipts under th-049 on the frozen TerminalBody/1 lineage
-// (#481). The Placement pair /2 adds exact desired model closure; WorkerSnapshotBody /2 carries
+// (#481). PlacementSet /2 adds exact desired model closure; WorkerSnapshotBody /2 carries
 // observation-only placement acquisition telemetry.
 //
 // THE ENVELOPE (every message, fields 1-3): the ownership + boot fence, checked BEFORE any body
@@ -54,9 +54,10 @@
 //
 // PLACEMENTS (#481; renamed from DEPLOYMENTS — tensorhub's "deployment" is an id-less semantic
 // tuple and the collision was real). `placement_id` is the RecordOwner-minted routing + journal
-// key for one hosted assignment. The desired set maps placement_id -> PlacementSpec, a fully
-// resolved IMMUTABLE document: the worker never resolves a mutable release id, so two workers
-// handed the same set converge to the same bytes or fault typed. LAUNCH ENFORCES
+// key for one hosted assignment. A placement's fully resolved immutable definition lives directly
+// inside PlacementSet. Its identity is `(placement_set_digest, placement_id)`; there is no
+// independent PlacementSpec document or digest. The worker never resolves a mutable release id,
+// so two workers handed the same set converge to the same bytes or fault typed. LAUNCH ENFORCES
 // len(placements) <= 1: a longer set is a typed refusal (FAULT_KIND_PLACEMENT_SET_UNSUPPORTED)
 // with the desired state UNAPPLIED.
 //
