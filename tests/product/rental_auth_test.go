@@ -90,15 +90,15 @@ func TestRentalCreatorIdentityAndDelegation(t *testing.T) {
 		RentalId: "rnt-01K5PROTO013", WorkerId: "wrk-4070", WorkerBootId: "boot-9f21",
 		WorkerTlsCertificateDigest: certificateDigest, Revision: 4,
 		PackageReleaseIds: []string{"cozy/marco-polo@v1", "cozy/upscale@v3"},
-		ModelCheckpointIds: []string{
-			"sha256:3be1c8def2c244b9c2a727a6ef424fd222850dd39795d262a8520ecff74e2831",
-			"sha256:92ba6b2513e9e1531f2a902536113b8e53c4c750861c150730baefa9ed811ba5",
+		ModelManifestIds: []string{
+			"sha256:6d71b9c29a444029755492e433597672b5f757c6fc5a6a83bdd26fc9a6153718",
+			"sha256:d984214cfcb6d61878a1251037851276f0c892ae90f5359a5bee522635975e19",
 		},
 		DelegationId: "dlg-2026-08-29-a", ExpiresAtUnix: 1787004000,
 	}
 	canonicalBytes, err := canonical.Bytes(document)
 	must(t, err)
-	want := []byte(`{"delegation_id":"dlg-2026-08-29-a","expires_at_unix":1787004000,"format":"cozy.worker.v1.ArtifactDelegation/1","model_checkpoint_ids":["sha256:3be1c8def2c244b9c2a727a6ef424fd222850dd39795d262a8520ecff74e2831","sha256:92ba6b2513e9e1531f2a902536113b8e53c4c750861c150730baefa9ed811ba5"],"package_release_ids":["cozy/marco-polo@v1","cozy/upscale@v3"],"rental_id":"rnt-01K5PROTO013","revision":4,"worker_boot_id":"boot-9f21","worker_id":"wrk-4070","worker_tls_certificate_digest":"sha256:4c5b5699f2d99ebf9195c1e518d13c94539bbd4ba670a46199f6d79d58d15721"}`)
+	want := []byte(`{"delegation_id":"dlg-2026-08-29-a","expires_at_unix":1787004000,"format":"cozy.worker.v1.ArtifactDelegation/2","model_manifest_ids":["sha256:6d71b9c29a444029755492e433597672b5f757c6fc5a6a83bdd26fc9a6153718","sha256:d984214cfcb6d61878a1251037851276f0c892ae90f5359a5bee522635975e19"],"package_release_ids":["cozy/marco-polo@v1","cozy/upscale@v3"],"rental_id":"rnt-01K5PROTO013","revision":4,"worker_boot_id":"boot-9f21","worker_id":"wrk-4070","worker_tls_certificate_digest":"sha256:4c5b5699f2d99ebf9195c1e518d13c94539bbd4ba670a46199f6d79d58d15721"}`)
 	if !bytes.Equal(canonicalBytes, want) {
 		t.Fatalf("ArtifactDelegation differs from worker-protocol vector:\n got %s\nwant %s", canonicalBytes, want)
 	}
@@ -109,11 +109,11 @@ func TestRentalCreatorIdentityAndDelegation(t *testing.T) {
 	noModel, err := canonical.Bytes(&pb.ArtifactDelegation{
 		RentalId: "rnt-01K5PROTO013", WorkerId: "wrk-4070", WorkerBootId: "boot-9f21",
 		WorkerTlsCertificateDigest: certificateDigest, Revision: 5,
-		PackageReleaseIds: []string{"cozy/marco-polo@v1"}, ModelCheckpointIds: []string{},
+		PackageReleaseIds: []string{"cozy/marco-polo@v1"}, ModelManifestIds: []string{},
 		DelegationId: "dlg-2026-08-29-no-model", ExpiresAtUnix: 1787004000,
 	})
 	must(t, err)
-	wantNoModel := []byte(`{"delegation_id":"dlg-2026-08-29-no-model","expires_at_unix":1787004000,"format":"cozy.worker.v1.ArtifactDelegation/1","model_checkpoint_ids":[],"package_release_ids":["cozy/marco-polo@v1"],"rental_id":"rnt-01K5PROTO013","revision":5,"worker_boot_id":"boot-9f21","worker_id":"wrk-4070","worker_tls_certificate_digest":"sha256:4c5b5699f2d99ebf9195c1e518d13c94539bbd4ba670a46199f6d79d58d15721"}`)
+	wantNoModel := []byte(`{"delegation_id":"dlg-2026-08-29-no-model","expires_at_unix":1787004000,"format":"cozy.worker.v1.ArtifactDelegation/2","model_manifest_ids":[],"package_release_ids":["cozy/marco-polo@v1"],"rental_id":"rnt-01K5PROTO013","revision":5,"worker_boot_id":"boot-9f21","worker_id":"wrk-4070","worker_tls_certificate_digest":"sha256:4c5b5699f2d99ebf9195c1e518d13c94539bbd4ba670a46199f6d79d58d15721"}`)
 	if !bytes.Equal(noModel, wantNoModel) {
 		t.Fatalf("no-model ArtifactDelegation omitted the explicit empty set:\n got %s\nwant %s", noModel, wantNoModel)
 	}

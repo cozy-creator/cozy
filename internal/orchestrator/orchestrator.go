@@ -63,7 +63,7 @@ type Options struct {
 	RecordRentalRefusal func(rentalID string, problem *exit.Error) *exit.Error
 	// RentalClaimProof signs the exact worker/boot/TLS leaf Creator is about to claim.
 	RentalClaimProof RentalClaimProofSource
-	// ArtifactDelegations signs the exact logical package/model intent after the worker
+	// ArtifactDelegations signs the exact logical package-release/model-manifest intent after the worker
 	// snapshot barrier. The worker resolves bytes directly from Tensorhub over mTLS.
 	ArtifactDelegations ArtifactDelegationSource
 	// RelayRentalSession returns authenticated private-worker evidence to Tensorhub.

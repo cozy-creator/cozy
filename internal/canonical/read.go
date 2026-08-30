@@ -124,7 +124,7 @@ func semantics(name string, d Doc) error {
 			}
 		}
 	case "cozy.worker.v1.ArtifactDelegation":
-		for _, field := range []string{"model_checkpoint_ids", "package_release_ids"} {
+		for _, field := range []string{"model_manifest_ids", "package_release_ids"} {
 			if _, ok := d[field].([]Value); !ok {
 				return refuse("artifact_delegation_ids_invalid", "%s must be an explicit array", field)
 			}

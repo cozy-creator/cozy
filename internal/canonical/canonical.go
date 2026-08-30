@@ -172,7 +172,8 @@ func body(m protoreflect.Message) (map[string]Value, error) {
 // docVersion is the DOCUMENT VERSION MAP. A digest-fenced document is NOT additively
 // versioned (01 §3): an unknown key REFUSES, so a new key is a NEW DOCUMENT VERSION and
 // the version rides the `format` tag. Every document is at /1 except
-// `AttemptOutcomeBody/3`, which carries th-049's exact artifact receipts on top of /2's
+// `ArtifactDelegation/2`, which names exact model manifests; `AttemptOutcomeBody/3`, which
+// carries th-049's exact artifact receipts on top of /2's
 // `execution_started` bit and the frozen wire's TerminalBody/1 lineage; PlacementSet is /2
 // because the required model-object-set subject changes its keys.
 //
@@ -182,6 +183,7 @@ func body(m protoreflect.Message) (map[string]Value, error) {
 // AttemptOutcomeBody under `/1` and every digest it minted would name the wrong document
 // (#536e).
 var docVersion = map[string]int{
+	"cozy.worker.v1.ArtifactDelegation":     2,
 	"cozy.worker.v1.AttemptOutcomeBody":     3,
 	"cozy.worker.v1.PackageEnvironmentSpec": 2,
 	"cozy.worker.v1.PlacementSet":           2,
@@ -209,11 +211,11 @@ func Document(m proto.Message) (Doc, error) {
 	if _, taken := b["format"]; taken {
 		return nil, refuse("unknown_field", "`format` is reserved for the document tag")
 	}
-	// ArtifactDelegation/1 carries two exact sets. An empty repeated protobuf
+	// ArtifactDelegation/2 carries two exact sets. An empty repeated protobuf
 	// field is indistinguishable from an unset one to reflection, but the
 	// canonical document has one spelling for the empty set: [].
 	if string(m.ProtoReflect().Descriptor().FullName()) == "cozy.worker.v1.ArtifactDelegation" {
-		for _, name := range []string{"model_checkpoint_ids", "package_release_ids"} {
+		for _, name := range []string{"model_manifest_ids", "package_release_ids"} {
 			if _, present := b[name]; !present {
 				b[name] = []Value{}
 			}
