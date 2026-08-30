@@ -253,7 +253,7 @@ var ignoredFile = map[string]bool{
 func sourceTree(tree string) (string, map[string]string, *exit.Error) {
 	root, err := filepath.Abs(tree)
 	if err != nil {
-		return "", nil, exit.Usagef("--dir %q is not resolvable: %s", tree, err)
+		return "", nil, exit.Usagef("package directory %q is not resolvable: %s", tree, err)
 	}
 	info, err := os.Stat(root)
 	if err != nil || !info.IsDir() {
