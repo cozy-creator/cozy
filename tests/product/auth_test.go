@@ -93,13 +93,14 @@ func TestEmailMachineLoginAndAutomaticReauthentication(t *testing.T) {
 				return
 			}
 			writeAuthToken(t, w, "second-access-token", expires)
-		case "/v1/account":
+		case "/v1/auth/me":
 			if authorization := r.Header.Get("Authorization"); authorization != "Bearer first-access-token" && authorization != "Bearer second-access-token" {
-				t.Errorf("account read carried %q", authorization)
+				t.Errorf("current-user read carried %q", authorization)
 				return
 			}
-			writeAuthJSON(t, w, http.StatusOK, map[string]string{
-				"user_id": "140e338a-ebd5-48c5-a124-703f2457195a", "personal_org": "u-140e338aebd548c5a124703f2457195a",
+			writeAuthJSON(t, w, http.StatusOK, map[string]any{
+				"id": "140e338a-ebd5-48c5-a124-703f2457195a", "email": "person@example.com",
+				"email_verified": true, "entitlements": []string{},
 			})
 		case "/v1/rentals":
 			if r.Header.Get("Authorization") != "Bearer second-access-token" {
@@ -119,7 +120,7 @@ func TestEmailMachineLoginAndAutomaticReauthentication(t *testing.T) {
 	root := t.TempDir()
 	first := runAuthCozy(t, root, server.URL, "123456\n", "auth", "login", "person@example.com", "--json")
 	if first.code != 0 || !strings.Contains(first.stdout, `"status":"registered"`) ||
-		!strings.Contains(first.stdout, `"personal_org":"u-140e338aebd548c5a124703f2457195a"`) ||
+		strings.Contains(first.stdout, "personal_org") ||
 		!strings.Contains(first.stderr, "A verification code was sent") {
 		t.Fatalf("first login [exit %d]\nstdout: %s\nstderr: %s", first.code, first.stdout, first.stderr)
 	}

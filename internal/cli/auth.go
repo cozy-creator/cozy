@@ -60,7 +60,7 @@ func canEnroll(problem *exit.Error) bool {
 
 func emitAuthSession(ctx *Context, session accountauth.Session, enrolled bool) *exit.Error {
 	hctx, cancel := hub.Context()
-	account, problem := client(ctx).WithToken(session.AccessToken, "machine login").Account(hctx)
+	_, problem := client(ctx).WithToken(session.AccessToken, "machine login").CurrentUser(hctx)
 	cancel()
 	if problem != nil {
 		return problem
@@ -73,7 +73,6 @@ func emitAuthSession(ctx *Context, session accountauth.Session, enrolled bool) *
 		{K: "status", V: status},
 		{K: "email", V: session.Email},
 		{K: "machine", V: session.DeviceKeyID},
-		{K: "personal_org", V: account.PersonalOrg},
 		{K: "hub", V: ctx.Cfg.HubURL},
 		{K: "access_expires", V: session.ExpiresAt},
 	}})
