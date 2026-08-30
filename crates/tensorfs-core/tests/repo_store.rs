@@ -113,6 +113,94 @@ fn mutation_from_evidence(
 }
 
 #[test]
+fn manifest_build_is_the_single_ordinary_file_producer() {
+    let root = temporary("manifest-build");
+    fs::create_dir_all(&root).unwrap();
+    let entries = root.join("entries.jsonl");
+    let output = root.join("manifest.json");
+    let empty = ObjectRef::of(b"");
+    let source = ObjectRef::of(b"print('polo')\n");
+    let rows = [
+        tensorfs_core::canon::write(&Value::obj(vec![
+            ("blob", empty.to_value()),
+            ("path", Value::str("marco/__init__.py")),
+        ])),
+        tensorfs_core::canon::write(&Value::obj(vec![
+            ("blob", source.clone().to_value()),
+            ("path", Value::str("marco/endpoint.py")),
+        ])),
+    ];
+    let mut bytes = Vec::new();
+    for row in rows {
+        bytes.extend_from_slice(&row);
+        bytes.push(b'\n');
+    }
+    fs::write(&entries, bytes).unwrap();
+
+    let result = Command::new(env!("CARGO_BIN_EXE_tfs"))
+        .args([
+            "manifest",
+            "build",
+            entries.to_str().unwrap(),
+            "--out",
+            output.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        result.status.success(),
+        "{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+
+    let expected = Manifest::from_files(vec![
+        ("marco/__init__.py".into(), empty),
+        ("marco/endpoint.py".into(), source),
+    ])
+    .unwrap();
+    let stored = fs::read(&output).unwrap();
+    assert_eq!(stored, expected.canonical_bytes());
+    assert_eq!(
+        result.stdout,
+        [
+            tensorfs_core::canon::write(&ObjectRef::of(&stored).to_value()),
+            b"\n".to_vec(),
+        ]
+        .concat()
+    );
+
+    fs::write(
+        &entries,
+        [
+            tensorfs_core::canon::write(&Value::obj(vec![
+                ("blob", ObjectRef::of(b"later").to_value()),
+                ("path", Value::str("z.py")),
+            ])),
+            b"\n".to_vec(),
+            tensorfs_core::canon::write(&Value::obj(vec![
+                ("blob", ObjectRef::of(b"earlier").to_value()),
+                ("path", Value::str("a.py")),
+            ])),
+        ]
+        .concat(),
+    )
+    .unwrap();
+    let refused = Command::new(env!("CARGO_BIN_EXE_tfs"))
+        .args([
+            "manifest",
+            "build",
+            entries.to_str().unwrap(),
+            "--out",
+            output.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(!refused.status.success());
+    assert!(String::from_utf8_lossy(&refused.stderr).contains("PATH_ORDER"));
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
 fn crash_after_repo_replace_rebuilds_sql_from_files() {
     let root = temporary("crash-rebuild");
     let (manifest, evidence) = fixture(&root);

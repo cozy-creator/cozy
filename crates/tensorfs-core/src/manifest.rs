@@ -41,6 +41,9 @@ impl Draft {
             entries: self.entries,
         };
         manifest.validate()?;
+        if manifest.canonical_bytes().len() > Manifest::MAX_BYTES {
+            return refuse(Code::SIZE_CAP, "manifest canonical bytes exceed cap");
+        }
         Ok(manifest)
     }
 }
@@ -102,6 +105,18 @@ pub(crate) fn check_path(path: &str) -> Result<()> {
 impl Manifest {
     pub const MAX_BYTES: usize = limits::DOC_MAX_BYTES;
 
+    /// Build one ordinary-file tree from already measured blob references. This is the shared
+    /// producer used by local callers and cloud adapters; it creates no second source-tree shape.
+    pub fn from_files(entries: Vec<(String, ObjectRef)>) -> Result<Self> {
+        Draft {
+            entries: entries
+                .into_iter()
+                .map(|(path, blob)| (path, Entry::File(blob)))
+                .collect(),
+        }
+        .seal()
+    }
+
     pub fn entries(&self) -> &[(String, Entry)] {
         &self.entries
     }
@@ -146,7 +161,7 @@ impl Manifest {
             previous = Some(path);
             folded.push(path.to_ascii_lowercase());
             crate::ids::hex64("Manifest.entry.blob", &entry.blob().sha256)?;
-            if entry.blob().length == 0 {
+            if entry.blob().length == 0 && matches!(entry, Entry::CozyTensors(_)) {
                 return refuse(Code::LENGTH_MISMATCH, format!("{path:?}: zero-length blob"));
             }
             if matches!(entry, Entry::CozyTensors(_)) {
@@ -252,5 +267,14 @@ mod tests {
         let bytes = manifest.canonical_bytes();
         assert!(!String::from_utf8_lossy(&bytes).contains("format"));
         assert_eq!(Manifest::parse(&bytes).unwrap(), manifest);
+    }
+
+    #[test]
+    fn ordinary_files_include_empty_content() {
+        let manifest = Manifest::from_files(vec![("empty.py".into(), ObjectRef::of(b""))]).unwrap();
+        assert_eq!(
+            Manifest::parse(&manifest.canonical_bytes()).unwrap(),
+            manifest
+        );
     }
 }

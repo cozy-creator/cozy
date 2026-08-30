@@ -15,6 +15,89 @@ use tensorfs_core::store::{Fault, Store};
 
 use crate::{bail, flag, Flags};
 
+pub fn cmd_manifest_build(entries_path: &Path, flags: &Flags) -> ExitCode {
+    let Some(output) = flag(flags, "out") else {
+        eprintln!("--out <manifest.json> is required");
+        return ExitCode::from(2);
+    };
+    let input_length = match fs::metadata(entries_path) {
+        Ok(metadata) => metadata.len(),
+        Err(error) => {
+            return bail(Refusal {
+                code: Code::IO_FAILED,
+                detail: format!("stat {}: {error}", entries_path.display()),
+            })
+        }
+    };
+    if input_length > Manifest::MAX_BYTES as u64 {
+        return bail(Refusal {
+            code: Code::SIZE_CAP,
+            detail: format!(
+                "manifest rows are {input_length} bytes, cap is {}",
+                Manifest::MAX_BYTES
+            ),
+        });
+    }
+    let bytes = match read(entries_path) {
+        Ok(value) => value,
+        Err(error) => return bail(error),
+    };
+    let rows = bytes.strip_suffix(b"\n").unwrap_or(&bytes);
+    if rows.is_empty() {
+        return bail(Refusal {
+            code: Code::MISSING_FIELD,
+            detail: "manifest rows list is empty".into(),
+        });
+    }
+    let mut files = Vec::new();
+    for line in rows.split(|byte| *byte == b'\n') {
+        if line.is_empty() {
+            return bail(Refusal {
+                code: Code::MALFORMED_JSON,
+                detail: "manifest rows contain an empty line".into(),
+            });
+        }
+        let value = match tensorfs_core::canon::parse_canonical(line, Manifest::MAX_BYTES) {
+            Ok(value) => value,
+            Err(error) => return bail(error),
+        };
+        let mut fields = match tensorfs_core::canon::Fields::new("ManifestFileRow", &value) {
+            Ok(fields) => fields,
+            Err(error) => return bail(error),
+        };
+        let blob = match fields
+            .req("blob")
+            .and_then(|value| ObjectRef::from_value("ManifestFileRow.blob", value))
+        {
+            Ok(blob) => blob,
+            Err(error) => return bail(error),
+        };
+        let path = match fields.req_str("path") {
+            Ok(path) => path.to_string(),
+            Err(error) => return bail(error),
+        };
+        if let Err(error) = fields.done() {
+            return bail(error);
+        }
+        files.push((path, blob));
+    }
+    let manifest = match Manifest::from_files(files) {
+        Ok(manifest) => manifest,
+        Err(error) => return bail(error),
+    };
+    let manifest_bytes = manifest.canonical_bytes();
+    if let Err(error) = write(Path::new(output), &manifest_bytes) {
+        return bail(error);
+    }
+    let reference = ObjectRef::of(&manifest_bytes);
+    println!(
+        "{}",
+        String::from_utf8(tensorfs_core::canon::write(&reference.to_value()))
+            .expect("canonical JSON is UTF-8")
+    );
+    ExitCode::SUCCESS
+}
+
 fn read(path: &Path) -> tensorfs_core::err::Result<Vec<u8>> {
     fs::read(path).map_err(|error| Refusal {
         code: Code::IO_FAILED,
