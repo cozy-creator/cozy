@@ -2,9 +2,7 @@ package producttest
 
 import (
 	"context"
-	"crypto/sha256"
 	"database/sql"
-	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -25,7 +23,7 @@ import (
 	"github.com/cozy-creator/cozy/internal/wheel"
 )
 
-const weightlessRef = "cozy/weightless"
+const weightlessRef = "cozy/cozy-weightless-package"
 
 func TestLegacyAttemptColumnsMigrate(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "records.db")
@@ -131,7 +129,7 @@ func TestPackagePublishMetadataGrammar(t *testing.T) {
 		t.Fatalf("package publish retained caller-authored identity [exit %d]\n%s", code, help)
 	}
 	if code, help := runCozy(t, root, "package", "install", "--help"); code != 0 ||
-		!strings.Contains(help, "--version") ||
+		!strings.Contains(help, "--version") || !strings.Contains(help, "explicit directory") ||
 		strings.Contains(help, "--profile") || strings.Contains(help, "--major") ||
 		strings.Contains(help, "--from") || strings.Contains(help, "--dir") ||
 		strings.Contains(help, "--digest") || strings.Contains(help, "--allow-unsigned") ||
@@ -141,6 +139,13 @@ func TestPackagePublishMetadataGrammar(t *testing.T) {
 	if code, out := runCozy(t, root, "package", "install", "cozy/example@1.2.3"); code != 2 ||
 		!strings.Contains(out, "--version 1.2.3") {
 		t.Fatalf("inline install version did not point to --version [exit %d]\n%s", code, out)
+	}
+	if code, help := runCozy(t, root, "package", "yank", "--help"); code != 0 ||
+		!strings.Contains(help, "--version") || strings.Contains(help, "unyank") {
+		t.Fatalf("package yank grammar changed [exit %d]\n%s", code, help)
+	}
+	if code, out := runCozy(t, root, "package", "yank", "cozy/example", "--version", "1.2"); code != 2 || !strings.Contains(out, "N.M.P") {
+		t.Fatalf("package yank admitted a non-N.M.P release [exit %d]\n%s", code, out)
 	}
 	project := t.TempDir()
 	must(t, os.WriteFile(filepath.Join(project, "pyproject.toml"), []byte(`[project]
@@ -154,6 +159,70 @@ version = "1.0.0"
 		"package", "publish")
 	if code != 1 || !strings.Contains(out, "must declare [tool.cozy] organization") {
 		t.Fatalf("missing [tool.cozy] organization was not refused before build [exit %d]\n%s", code, out)
+	}
+}
+
+func TestPackageYankUsesPermanentReleaseEndpoint(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodDelete || r.URL.Path != "/v1/packages/proof/example/releases/1.2.3" {
+			http.NotFound(w, r)
+			return
+		}
+		if r.Header.Get("X-Tensorhub-Reason") != "cozy package yank proof/example@1.2.3" {
+			t.Errorf("package yank audit text = %q", r.Header.Get("X-Tensorhub-Reason"))
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w,
+			`{"state":"yanked","release":"1.2.3","changed":true,"yanked_at":"2026-08-30T12:34:56Z"}`)
+	}))
+	defer server.Close()
+	code, out := runCozyDir(t, t.TempDir(), ".", []string{
+		"TENSORHUB_URL=" + server.URL, "TENSORHUB_TOKEN=proof-token",
+	}, "package", "yank", "proof/example", "--version", "1.2.3")
+	if code != 0 || !strings.Contains(out, "package: proof/example") ||
+		!strings.Contains(out, "release: 1.2.3") || !strings.Contains(out, "status:  yanked") {
+		t.Fatalf("package yank result changed [exit %d]\n%s", code, out)
+	}
+}
+
+func TestPackageInstallExplicitDirectoryGrammar(t *testing.T) {
+	root := t.TempDir()
+	parent := t.TempDir()
+	child := filepath.Join(parent, "child")
+	must(t, os.Mkdir(child, 0o755))
+	missing := filepath.Join(parent, "missing")
+	for _, path := range []string{".", "..", "./missing", "../missing", missing} {
+		code, out := runCozyDir(t, root, child, nil, "package", "install", path)
+		if code != 1 || (!strings.Contains(out, "package source has no package.toml") &&
+			!strings.Contains(out, "is not a directory")) || strings.Contains(out, "org/package") {
+			t.Fatalf("explicit directory %q entered registry resolution [exit %d]\n%s", path, code, out)
+		}
+	}
+}
+
+func TestLocalPackageIdentityBindsSourceAndWheelBytes(t *testing.T) {
+	project := t.TempDir()
+	writePublishProject(t, project, "local-identity", "1.0.0", nil, "", true)
+	first, problem := preparePublishPackage(project)
+	fatal(t, problem)
+	defer first.Close()
+	firstDigest, files, bytes, problem := first.LocalIdentity()
+	fatal(t, problem)
+	replayDigest, replayFiles, replayBytes, problem := first.LocalIdentity()
+	fatal(t, problem)
+	if firstDigest != replayDigest || files != replayFiles || bytes != replayBytes {
+		t.Fatalf("unchanged local build identity drifted: %s/%d/%d vs %s/%d/%d",
+			firstDigest, files, bytes, replayDigest, replayFiles, replayBytes)
+	}
+	must(t, os.WriteFile(filepath.Join(project, "local_identity", "__init__.py"),
+		[]byte("VALUE = 2\n"), 0o644))
+	second, problem := preparePublishPackage(project)
+	fatal(t, problem)
+	defer second.Close()
+	secondDigest, _, _, problem := second.LocalIdentity()
+	fatal(t, problem)
+	if secondDigest == firstDigest {
+		t.Fatalf("changed source and wheel retained local build identity %s", firstDigest)
 	}
 }
 
@@ -736,23 +805,22 @@ func TestDaemonStartupDiagnostic(t *testing.T) {
 
 const maxDaemonDiagnosticOutput = 18 << 10
 
-// A local archive remains a build/install input, but cannot invent the exact
+// A local directory remains a build/install input, but cannot invent the exact
 // PackageRelease, Qualification, and PlacementSet required for execution.
 func TestDevelopmentInstallIsNotRunnable(t *testing.T) {
 	root := t.TempDir()
 	t.Cleanup(func() { _, _ = runCozy(t, root, "down", "--all") })
 
-	archive := weightlessRelease(t)
-	data, err := os.ReadFile(archive)
-	must(t, err)
-	digest := sha256.Sum256(data)
-	code, out := runCozy(t, root, "package", "install", weightlessRef,
-		"--from", archive, "--digest", "sha256:"+hex.EncodeToString(digest[:]))
+	project := weightlessProject(t)
+	code, out := runCozy(t, root, "package", "install", project)
 	if code != 0 {
-		t.Fatalf("package install [exit %d]\n%s", code, out)
+		t.Fatalf("local directory package install [exit %d]\n%s", code, out)
 	}
-	if code, out := runCozy(t, root, "package", "list", "--json"); code != 0 ||
-		!strings.Contains(out, weightlessRef) {
+	if !strings.Contains(out, "source and wheel bytes are pinned locally") {
+		t.Fatalf("local install omitted its unqualified identity note\n%s", out)
+	}
+	if code, out := runCozy(t, root, "package", "list", "--full", "--json"); code != 0 ||
+		!strings.Contains(out, weightlessRef) || !strings.Contains(out, `"source":"local `) {
 		t.Fatalf("package list omitted the install [exit %d]\n%s", code, out)
 	}
 	if code, out := runCozy(t, root, "run", weightlessRef); code != 0 ||
@@ -787,7 +855,7 @@ func runCozyEnv(env []string, args ...string) cozyResult {
 	return cozyResult{code: code, output: string(data)}
 }
 
-func weightlessRelease(t *testing.T) string {
+func weightlessProject(t *testing.T) string {
 	t.Helper()
 	home, err := os.UserHomeDir()
 	must(t, err)
@@ -796,12 +864,13 @@ func weightlessRelease(t *testing.T) string {
 		t.Skipf("no cozy-runtime peer at %s: %v", repo, err)
 	}
 	dir := t.TempDir()
+	project := filepath.Join(dir, "source")
 	build := exec.Command("/usr/bin/nice", "-n", "19", "python3",
-		"tests/product/testdata/build-weightless.py", "--out", dir)
+		"tests/product/testdata/build-weightless.py", "--out", dir, "--source-out", project)
 	build.Dir = "../.."
 	build.Env = childEnv(t, repo, "RUNTIME_REPO="+repo)
 	if out, err := build.CombinedOutput(); err != nil {
 		t.Fatalf("building the weightless release: %v\n%s", err, out)
 	}
-	return filepath.Join(dir, "weightless-1.0.0.tar.gz")
+	return project
 }

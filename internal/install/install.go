@@ -34,7 +34,20 @@ type Request struct {
 	Dir           string // --dir: an editable local tree, the development trust path
 	AllowUnsigned bool
 	Force         bool
+	Local         *LocalSource
 	Published     *PublishedSource
+}
+
+// LocalSource is one author-controlled directory after Creator's ordinary
+// bounded source scan and wheel build have succeeded. It is deliberately not a
+// PackageRelease or Qualification: the local build digest is its exact identity.
+type LocalSource struct {
+	BuildDigest string
+	Bytes       int64
+	Files       int
+	Package     string
+	Release     string
+	Tree        string
 }
 
 type PublishedSource struct {
@@ -77,7 +90,7 @@ func persistSelection(genDir string, gen *records.PackageInstall, selection Sele
 		exact  ExactDocument
 	}{
 		{"placement_set", "cozy.worker.v1.PlacementSet/3", selection.PlacementSet},
-		{"package_release", "cozy.package.release/1", selection.PackageRelease},
+		{"package_release", "cozy.package.release/2", selection.PackageRelease},
 		{"package_descriptor", "cozy.package.descriptor/1", selection.PackageDescriptor},
 		{"qualification", "cozy.runtime.Qualification/1", selection.Qualification},
 		{"environment_receipt", "cozy.runtime.EnvironmentReceipt/1", selection.EnvironmentReceipt},
@@ -155,9 +168,12 @@ func Run(l home.Layout, st *records.Store, req Request) (*Result, *exit.Error) {
 	if req.Published != nil {
 		sources++
 	}
+	if req.Local != nil {
+		sources++
+	}
 	if sources != 1 {
-		return nil, exit.Usagef("`cozy package install` needs exactly one source: --from <archive.tar.gz> or --dir <tree>").
-			WithRemedy("--from installs a published release archive; --dir installs an editable local tree").
+		return nil, exit.Usagef("`cozy package install` needs exactly one package source").
+			WithRemedy("pass org/package for Tensorhub, or an explicit directory such as . or ./project").
 			WithNext("cozy help package install")
 	}
 	id, e := newGenerationID()
@@ -196,6 +212,19 @@ func Run(l home.Layout, st *records.Store, req Request) (*Result, *exit.Error) {
 			return fail(e)
 		}
 		res.Files, res.Bytes = req.Published.Files, req.Published.Bytes
+	case req.Local != nil:
+		local := req.Local
+		if local.Package == "" || local.Release == "" || local.Tree == "" || local.BuildDigest == "" {
+			return fail(exit.Internalf("local package build input is incomplete"))
+		}
+		abs, err := filepath.Abs(local.Tree)
+		if err != nil {
+			return fail(exit.Usagef("local package directory %q is not resolvable: %s", local.Tree, err))
+		}
+		sourceDir = abs
+		gen.SourceKind, gen.SourceRef, gen.SourceDigest = "local", abs, local.BuildDigest
+		gen.Package, gen.Version = local.Package, local.Release
+		res.Files, res.Bytes = local.Files, local.Bytes
 	case req.Archive != "":
 		staged, err := StageArchive(req.Archive, filepath.Join(genDir, "source"))
 		if err != nil {
@@ -422,6 +451,12 @@ func verifySource(gen *records.PackageInstall, req Request, warn *[]string) *exi
 		gen.Verified = true
 		return nil
 	}
+	if gen.SourceKind == "local" {
+		gen.Verified = false
+		*warn = append(*warn,
+			"local directory install: source and wheel bytes are pinned locally but are not a published or qualified Tensorhub release")
+		return nil
+	}
 	if gen.SourceKind == "dir" {
 		// --dir IS the development trust path: an explicit local tree the operator
 		// already controls. It carries a snapshot identity, never publisher evidence.
@@ -452,6 +487,14 @@ func verifySource(gen *records.PackageInstall, req Request, warn *[]string) *exi
 
 // resolveTarget reconciles what the release says with what the caller asked for.
 func resolveTarget(gen *records.PackageInstall, ref Ref) *exit.Error {
+	if gen.SourceKind == "local" {
+		major, e := MajorOf(gen.Version)
+		if e != nil {
+			return e
+		}
+		gen.Major = major
+		return nil
+	}
 	if gen.SourceKind == "dir" {
 		if !ref.HasMajor {
 			return exit.Usagef("an editable --dir install needs an explicit major").

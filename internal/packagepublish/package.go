@@ -3,6 +3,10 @@ package packagepublish
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
+	"io"
 	"io/fs"
 	"os"
 	"path/filepath"
@@ -36,6 +40,18 @@ type Package struct {
 	Organization     string
 	Name             string
 	Release          string
+}
+
+type localIdentityFile struct {
+	Digest string `json:"digest"`
+	Length int64  `json:"length"`
+	Path   string `json:"path"`
+}
+
+type localIdentityDocument struct {
+	Format  string              `json:"format"`
+	Sources []localIdentityFile `json:"sources"`
+	Wheels  []localIdentityFile `json:"wheels"`
 }
 
 func (p *Package) Close() { _ = os.RemoveAll(p.Root) }
@@ -111,6 +127,66 @@ func (p *Package) Build(ctx context.Context) *exit.Error {
 	}
 	p.Wheel, p.DependencyWheels = project.Path, dependencies
 	return nil
+}
+
+// LocalIdentity binds one development install to the exact publishable source
+// files and wheel bytes its ordinary build produced. Package/version remain
+// human catalog coordinates; this digest is the local immutable generation
+// input and never claims to be a Tensorhub PackageRelease.
+func (p *Package) LocalIdentity() (string, int, int64, *exit.Error) {
+	if p.Wheel == "" || p.Root == "" {
+		return "", 0, 0, exit.Internalf("local package identity requested before its wheel build")
+	}
+	document := localIdentityDocument{Format: "cozy.local-package-build/1"}
+	var sourceBytes int64
+	for _, path := range Paths(p.Files) {
+		row, problem := localIdentityFileAt(path, p.Files[path])
+		if problem != nil {
+			return "", 0, 0, problem
+		}
+		document.Sources = append(document.Sources, row)
+		sourceBytes += row.Length
+	}
+	project, problem := localIdentityFileAt(filepath.Base(p.Wheel), p.Wheel)
+	if problem != nil {
+		return "", 0, 0, problem
+	}
+	document.Wheels = append(document.Wheels, project)
+	for _, dependency := range p.DependencyWheels {
+		row, problem := localIdentityFileAt(dependency.Filename, dependency.Path)
+		if problem != nil {
+			return "", 0, 0, problem
+		}
+		document.Wheels = append(document.Wheels, row)
+	}
+	sort.Slice(document.Wheels, func(i, j int) bool {
+		return document.Wheels[i].Path < document.Wheels[j].Path
+	})
+	raw, err := json.Marshal(document)
+	if err != nil {
+		return "", 0, 0, exit.Internalf("cannot encode local package build identity: %s", err)
+	}
+	digest := sha256.Sum256(raw)
+	return "sha256:" + hex.EncodeToString(digest[:]), len(document.Sources), sourceBytes, nil
+}
+
+func localIdentityFileAt(name, file string) (localIdentityFile, *exit.Error) {
+	input, err := os.Open(file)
+	if err != nil {
+		return localIdentityFile{}, exit.Named(exit.Structural, "local_package_build_changed",
+			"cannot read %s while fixing the local build identity: %s", name, err).
+			WithRemedy("stop changing the project while `cozy package install` is building it")
+	}
+	hash := sha256.New()
+	length, copyErr := io.Copy(hash, input)
+	closeErr := input.Close()
+	if copyErr != nil || closeErr != nil {
+		return localIdentityFile{}, exit.Named(exit.Structural, "local_package_build_changed",
+			"cannot finish reading %s while fixing the local build identity", name).
+			WithRemedy("stop changing the project while `cozy package install` is building it")
+	}
+	return localIdentityFile{Path: name, Length: length,
+		Digest: "sha256:" + hex.EncodeToString(hash.Sum(nil))}, nil
 }
 
 type projectMetadata struct {

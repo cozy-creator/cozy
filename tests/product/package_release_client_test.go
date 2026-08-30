@@ -49,7 +49,7 @@ func TestPackageReleaseClientContract(t *testing.T) {
 		case r.Method == http.MethodPut && r.URL.Path == releasePath:
 			assertEmptyObject(t, r.Body)
 			_ = json.NewEncoder(w).Encode(map[string]any{"state": "committed", "qualification_state": "qualified", "package_release": map[string]any{
-				"canonical_bytes": []byte(`{"format":"cozy.package.release/1"}`),
+				"canonical_bytes": []byte(`{"format":"cozy.package.release/2"}`),
 				"digest":          "sha256:" + strings.Repeat("a", 64), "length": 35,
 			}})
 			return
@@ -70,6 +70,34 @@ func TestPackageReleaseClientContract(t *testing.T) {
 	committed, problem := client.CommitPackageRelease(context.Background(), ref, "1.0.0", "proof publish")
 	if problem != nil || committed.State != "committed" || committed.PackageRelease.Length != 35 {
 		t.Fatalf("commit response changed: %+v problem=%v", committed, problem)
+	}
+}
+
+func TestPackageReleaseYankClientContract(t *testing.T) {
+	ref := hub.Ref{Org: "proof", Name: "package"}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodDelete || r.URL.Path != "/v1/packages/proof/package/releases/1.2.3" {
+			http.NotFound(w, r)
+			return
+		}
+		if r.Header.Get("Authorization") != "Bearer proof-token" ||
+			r.Header.Get("X-Tensorhub-Reason") != "cozy package yank proof/package@1.2.3" {
+			t.Errorf("package yank omitted authentication or derived audit text")
+		}
+		assertEmptyObject(t, r.Body)
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"state": "yanked", "release": "1.2.3", "changed": true,
+			"yanked_at": "2026-08-30T12:34:56Z",
+		})
+	}))
+	defer server.Close()
+	client := hub.New(config.Config{HubURL: server.URL,
+		HubToken: secret.New("proof-token")}, "cozy-test")
+	yanked, problem := client.YankPackageRelease(context.Background(), ref, "1.2.3",
+		"cozy package yank proof/package@1.2.3")
+	if problem != nil || yanked.State != "yanked" || yanked.Release != "1.2.3" ||
+		!yanked.Changed || yanked.YankedAt != "2026-08-30T12:34:56Z" {
+		t.Fatalf("package yank response changed: %+v problem=%v", yanked, problem)
 	}
 }
 
@@ -195,7 +223,7 @@ func TestPackagePublishPendingWireFlowBoundsUploads(t *testing.T) {
 			_ = json.NewEncoder(w).Encode(map[string]any{"state": "pending", "uploads": uploads})
 		case r.Method == http.MethodPut && r.URL.Path == releasePath:
 			finalized.Add(1)
-			releaseBytes := []byte(`{"format":"cozy.package.release/1"}`)
+			releaseBytes := []byte(`{"format":"cozy.package.release/2"}`)
 			_ = json.NewEncoder(w).Encode(map[string]any{
 				"state": "committed", "qualification_state": "qualified", "package_release": map[string]any{
 					"canonical_bytes": releaseBytes, "digest": "sha256:" + strings.Repeat("4", 64),

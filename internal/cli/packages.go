@@ -2,13 +2,16 @@ package cli
 
 import (
 	"fmt"
+	"path/filepath"
 	"strings"
 
 	"github.com/cozy-creator/cozy/internal/config"
 	"github.com/cozy-creator/cozy/internal/exit"
 	"github.com/cozy-creator/cozy/internal/home"
+	"github.com/cozy-creator/cozy/internal/hub"
 	"github.com/cozy-creator/cozy/internal/install"
 	"github.com/cozy-creator/cozy/internal/output"
+	"github.com/cozy-creator/cozy/internal/packagepublish"
 	"github.com/cozy-creator/cozy/internal/records"
 )
 
@@ -36,10 +39,68 @@ func open(cfg config.Config, write bool) (home.Layout, *records.Store, *install.
 }
 
 func handleInstall(ctx *Context) *exit.Error {
+	if explicitPackageDirectory(ctx.Inv.Args[0]) {
+		return handleDirectoryInstall(ctx)
+	}
 	if ctx.Inv.Value("--from") == "" && ctx.Inv.Value("--dir") == "" {
 		return handleRegistryInstall(ctx)
 	}
 	return handleLocalInstall(ctx)
+}
+
+func explicitPackageDirectory(value string) bool {
+	value = strings.TrimSpace(value)
+	return value == "." || value == ".." || filepath.IsAbs(value) ||
+		strings.HasPrefix(value, "./") || strings.HasPrefix(value, "../") ||
+		strings.HasPrefix(value, `.\`) || strings.HasPrefix(value, `..\`)
+}
+
+func handleDirectoryInstall(ctx *Context) *exit.Error {
+	path := strings.TrimSpace(ctx.Inv.Args[0])
+	if ctx.Inv.Value("--version") != "" || ctx.Inv.Value("--from") != "" ||
+		ctx.Inv.Value("--dir") != "" || ctx.Inv.Value("--digest") != "" ||
+		ctx.Inv.Bool("--allow-unsigned") || ctx.Inv.Bool("--force") {
+		return exit.Usagef("an explicit package directory does not take registry or legacy source options").
+			WithRemedy("use `cozy package install %s` by itself", path)
+	}
+	pack, problem := packagepublish.PrepareFrom(path)
+	if problem != nil {
+		return problem
+	}
+	defer pack.Close()
+	hctx, cancel := hub.LongContext()
+	defer cancel()
+	if problem := packagePublishStage(ctx, "Building and checking local package wheel", func() *exit.Error {
+		return pack.Build(hctx)
+	}); problem != nil {
+		return problem
+	}
+	buildDigest, files, bytes, problem := pack.LocalIdentity()
+	if problem != nil {
+		return problem
+	}
+	ref, problem := install.ParseRef(pack.Organization + "/" + pack.Name)
+	if problem != nil {
+		return problem
+	}
+	l, st, writer, problem := open(ctx.Cfg, true)
+	if problem != nil {
+		return problem
+	}
+	defer st.Close()
+	defer writer.Unlock()
+	var result *install.Result
+	problem = packagePublishStage(ctx, "Creating local package environment", func() *exit.Error {
+		var installProblem *exit.Error
+		result, installProblem = install.Run(l, st, install.Request{Ref: ref, Force: true,
+			Local: &install.LocalSource{BuildDigest: buildDigest, Bytes: bytes, Files: files,
+				Package: ref.Package, Release: pack.Release, Tree: pack.Tree}})
+		return installProblem
+	})
+	if problem != nil {
+		return problem
+	}
+	return emitInstallResult(ctx, st, result)
 }
 
 func handleLocalInstall(ctx *Context) *exit.Error {

@@ -3,6 +3,7 @@ package cli
 import (
 	"context"
 	"fmt"
+	"regexp"
 	"strings"
 	"sync"
 	"time"
@@ -13,6 +14,8 @@ import (
 	"github.com/cozy-creator/cozy/internal/packagepublish"
 	"github.com/cozy-creator/cozy/internal/transfer"
 )
+
+var immutablePackageVersion = regexp.MustCompile(`^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$`)
 
 func handlePackagePublish(ctx *Context) *exit.Error {
 	pack, problem := packagepublish.Prepare()
@@ -92,6 +95,36 @@ func handlePackagePublish(ctx *Context) *exit.Error {
 		record.Notes = append(record.Notes, done.QualificationError)
 	}
 	return emit(ctx, record)
+}
+
+func handlePackageYank(ctx *Context) *exit.Error {
+	ref, problem := hub.ParseRef(strings.TrimSpace(ctx.Inv.Args[0]))
+	if problem != nil {
+		return problem
+	}
+	release := strings.TrimSpace(ctx.Inv.Value("--version"))
+	if !immutablePackageVersion.MatchString(release) {
+		return exit.Usagef("--version %q is not an immutable N.M.P package release", release).
+			WithRemedy("use a release such as 1.2.3")
+	}
+	reason := "cozy package yank " + ref.String() + "@" + release
+	hctx, cancel := hub.LongContext()
+	defer cancel()
+	yanked, problem := client(ctx).YankPackageRelease(hctx, ref, release, reason)
+	if problem != nil {
+		return problem
+	}
+	if yanked.State != "yanked" || yanked.Release != release || yanked.YankedAt == "" {
+		return exit.Internalf("package yank returned an invalid release tombstone")
+	}
+	if _, err := time.Parse(time.RFC3339Nano, yanked.YankedAt); err != nil {
+		return exit.Internalf("package yank returned invalid yanked_at %q", yanked.YankedAt)
+	}
+	return emit(ctx, compactRecord([]output.Field{
+		{K: "package", V: ref.String()}, {K: "release", V: release},
+		{K: "status", V: "yanked"}, {K: "changed", V: yanked.Changed},
+		{K: "yanked_at", V: yanked.YankedAt},
+	}, "package", "release", "status"))
 }
 
 func shorten(value string, limit int) string {
