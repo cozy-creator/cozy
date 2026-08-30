@@ -273,7 +273,13 @@ func Run(l home.Layout, st *records.Store, req Request) (*Result, *exit.Error) {
 	var err *exit.Error
 	if req.Published != nil {
 		wheels := append([]string{req.Published.ProjectWheel}, req.Published.Wheels...)
-		env, err = MaterializePublishedEnvironment(sourceDir, venvDir, wheels)
+		manifest, manifestErr := canonical.ReadObject(req.Published.Selection.WheelhouseManifest.Bytes)
+		if manifestErr != nil {
+			return guard(exit.Named(exit.Structural, "published_wheelhouse_invalid",
+				"selected base worker image inventory is unreadable: %s", manifestErr))
+		}
+		env, err = MaterializePublishedEnvironment(
+			manifest.Sub("compatibility_profile").Str("python_abi"), venvDir, wheels)
 	} else {
 		env, err = MaterializeEnvironment(sourceDir, venvDir)
 	}

@@ -18,6 +18,7 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -296,7 +297,10 @@ func appendUnique(values []string, value string) []string {
 // upload requests grants, writes each object at its final content key under every
 // condition the grant signed, and then asks the hub to prove them. An expired grant
 // comes back as a REPLAN and is answered by asking again — never by failing.
-const publishParallelism = 16
+// Two concurrent presigned writes keep a residential uplink and R2's connection
+// churn stable. Publication is resumable, so throughput comes from sustained writes,
+// not a burst large enough to reset every socket in the batch.
+const publishParallelism = 2
 
 type uploadOutcome struct {
 	index    int
@@ -523,6 +527,15 @@ func put(ctx context.Context, g hub.Grant, path string) (bool, *exit.Error) {
 // land are already the hub's.
 const attempts = 3
 
+var storageIPv4Client = func() *http.Client {
+	transport := http.DefaultTransport.(*http.Transport).Clone()
+	dialer := &net.Dialer{Timeout: 10 * time.Second, KeepAlive: 30 * time.Second}
+	transport.DialContext = func(ctx context.Context, _, address string) (net.Conn, error) {
+		return dialer.DialContext(ctx, "tcp4", address)
+	}
+	return &http.Client{Transport: transport}
+}()
+
 // send is the one storage-edge write in this binary. It talks to object storage,
 // never to the hub: the URL is presigned and carries no credential of ours.
 func send(ctx context.Context, method, url string, open func() (io.ReadCloser, error), length int64, headers map[string]string) (int, http.Header, []byte, int64, *exit.Error) {
@@ -530,7 +543,7 @@ func send(ctx context.Context, method, url string, open func() (io.ReadCloser, e
 	var header http.Header
 	var raw []byte
 	var moved int64
-	exhausted, err := retryStorage(func(int) (bool, error) {
+	exhausted, err := retryStorage(func(attempt int) (bool, error) {
 		status, header, raw = 0, nil, nil
 		body, err := open()
 		if err != nil {
@@ -563,8 +576,13 @@ func send(ctx context.Context, method, url string, open func() (io.ReadCloser, e
 		for k, v := range headers {
 			req.Header.Set(k, v)
 		}
-		resp, err := http.DefaultClient.Do(req)
+		client := http.DefaultClient
+		if attempt > 0 {
+			client = storageIPv4Client
+		}
+		resp, err := client.Do(req)
 		if err != nil {
+			client.CloseIdleConnections()
 			counted.Close()
 			cancel()
 			return true, err

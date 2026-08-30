@@ -54,6 +54,10 @@ func RunDaemon(stdout, stderr io.Writer) int {
 		}
 		return int(exit.Internal)
 	}
+	if err := raiseOpenFileLimit(); err != nil {
+		fmt.Fprintf(stderr, "cannot raise cozy-daemon's open-file limit: %v\n", err)
+		return int(exit.Internal)
+	}
 	ctx := &Context{
 		Inv: &Invocation{Bools: map[string]bool{}, Values: values(
 			"--port", intText(cfg.Port), "--yield", cfg.Yield), Mode: output.Mode{}},
