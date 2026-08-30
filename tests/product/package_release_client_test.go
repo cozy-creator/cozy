@@ -29,13 +29,8 @@ func TestPackageReleaseClientContract(t *testing.T) {
 		if r.Header.Get("Authorization") != "Bearer proof-token" || r.Header.Get("X-Tensorhub-Reason") != "proof publish" {
 			t.Errorf("package mutation omitted authentication or audit reason")
 		}
-		fixture := ""
 		switch {
 		case r.Method == http.MethodPost && r.URL.Path == releasePath:
-			fixture = "begin.json"
-			assertEmptyObject(t, r.Body)
-		case r.Method == http.MethodPost && r.URL.Path == releasePath+"/uploads":
-			fixture = "uploads.json"
 			var body struct {
 				Paths            []string `json:"paths"`
 				DependencyWheels []string `json:"dependency_wheels"`
@@ -43,56 +38,48 @@ func TestPackageReleaseClientContract(t *testing.T) {
 			if err := json.NewDecoder(r.Body).Decode(&body); err != nil ||
 				!reflect.DeepEqual(body.Paths, []string{"package.toml"}) ||
 				!reflect.DeepEqual(body.DependencyWheels, []string{"proof_dependency-1.0.0-py3-none-any.whl"}) {
-				t.Errorf("upload registration changed: %+v err=%v", body, err)
+				t.Errorf("package declaration changed: %+v err=%v", body, err)
 			}
+			_ = json.NewEncoder(w).Encode(map[string]any{"state": "pending", "uploads": []map[string]any{
+				{"kind": "project_wheel", "path": "package-1.0.0-py3-none-any.whl", "url": "https://storage.invalid/project", "required_headers": map[string]string{}, "already_uploaded": false},
+				{"kind": "source", "path": "package.toml", "url": "https://storage.invalid/source", "required_headers": map[string]string{}, "already_uploaded": false},
+				{"kind": "dependency_wheel", "path": "proof_dependency-1.0.0-py3-none-any.whl", "url": "https://storage.invalid/dependency", "required_headers": map[string]string{}, "already_uploaded": false},
+			}})
+			return
 		case r.Method == http.MethodPut && r.URL.Path == releasePath:
-			fixture = "finalize.json"
 			assertEmptyObject(t, r.Body)
+			_ = json.NewEncoder(w).Encode(map[string]any{"state": "committed", "package_release": map[string]any{
+				"canonical_bytes": []byte(`{"format":"cozy.package.release/1"}`),
+				"digest":          "sha256:" + strings.Repeat("a", 64), "length": 35,
+			}})
+			return
 		default:
 			http.NotFound(w, r)
 			return
 		}
-		raw, err := os.ReadFile(filepath.Join("testdata", "package-release", fixture))
-		if err != nil {
-			t.Error(err)
-			w.WriteHeader(http.StatusInternalServerError)
-			return
-		}
-		w.Header().Set("Content-Type", "application/json")
-		_, _ = w.Write(raw)
 	}))
 	defer server.Close()
 	client := hub.New(config.Config{HubURL: server.URL, HubToken: secret.New("proof-token")}, "cozy-test")
 
-	begin, problem := client.BeginPackageRelease(context.Background(), ref, "1.0.0", "proof publish")
-	if problem != nil || begin.State != "pending" {
-		t.Fatalf("begin response changed: %+v problem=%v", begin, problem)
-	}
-	uploads, problem := client.PackageReleaseUploads(context.Background(), ref, "1.0.0",
+	draft, problem := client.DeclarePackageRelease(context.Background(), ref, "1.0.0",
 		[]string{"package.toml"}, []string{"proof_dependency-1.0.0-py3-none-any.whl"}, "proof publish")
-	if problem != nil || len(uploads.Uploads) != 2 || uploads.Uploads[0].Kind != "source" ||
-		uploads.Uploads[1].Kind != "dependency_wheel" {
-		t.Fatalf("uploads response changed: %+v problem=%v", uploads, problem)
+	if problem != nil || draft.State != "pending" || len(draft.Uploads) != 3 ||
+		draft.Uploads[0].Kind != "project_wheel" || draft.Uploads[2].Kind != "dependency_wheel" {
+		t.Fatalf("declaration response changed: %+v problem=%v", draft, problem)
 	}
-	finalized, problem := client.FinalizePackageRelease(context.Background(), ref, "1.0.0", "proof publish")
-	if problem != nil || finalized.QualificationState != "qualified" ||
-		len(finalized.PackageExecutions) != 1 || finalized.PackageExecutions[0].Function != "generate" ||
-		len(finalized.Profiles) != 1 ||
-		finalized.Profiles[0].BaseRealizationDigest != "index.docker.io/tensorhub/worker@sha256:"+strings.Repeat("a", 64) ||
-		finalized.Profiles[0].PackageEnvironmentSpec.Length != 501 ||
-		finalized.Profiles[0].ResolutionLock.Length != 502 ||
-		finalized.Profiles[0].ResolvedWheelSet.Length != 503 {
-		t.Fatalf("finalize response changed: %+v problem=%v", finalized, problem)
+	committed, problem := client.CommitPackageRelease(context.Background(), ref, "1.0.0", "proof publish")
+	if problem != nil || committed.State != "committed" || committed.PackageRelease.Length != 35 {
+		t.Fatalf("commit response changed: %+v problem=%v", committed, problem)
 	}
 }
 
 func TestPackageReleaseClientRejectsUnknownResponseFields(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		_, _ = io.WriteString(w, `{"project_wheel_upload":{"already_uploaded":true,"required_headers":{},"url":""},"state":"committed","renamed_field":true}`)
+		_, _ = io.WriteString(w, `{"state":"committed","uploads":[],"renamed_field":true}`)
 	}))
 	defer server.Close()
 	client := hub.New(config.Config{HubURL: server.URL, HubToken: secret.New("proof-token")}, "cozy-test")
-	_, problem := client.BeginPackageRelease(context.Background(), hub.Ref{Org: "proof", Name: "package"}, "1.0.0", "proof")
+	_, problem := client.DeclarePackageRelease(context.Background(), hub.Ref{Org: "proof", Name: "package"}, "1.0.0", nil, nil, "proof")
 	if problem == nil || problem.Name != "hub.unreadable_answer" {
 		t.Fatalf("unknown package response field did not become version-skew refusal: %v", problem)
 	}
@@ -104,8 +91,33 @@ func TestPackageInstallPlanContract(t *testing.T) {
 		switch r.URL.Path {
 		case "/v1/packages/proof/package":
 			_, _ = io.WriteString(w, `{"package":{"org":"proof","name":"package","created_at":"2026-08-30T00:00:00Z"},"releases":[{"release":"1.2.3","cut_at":"2026-08-30T00:00:00Z"}]}`)
-		case "/v1/packages/proof/package/releases/1.2.3/install":
-			_, _ = io.WriteString(w, `{"downloads":[{"digest":"sha256:`+strings.Repeat("1", 64)+`","kind":"source","length":4,"path":"package.toml","url":"https://storage.invalid/package.toml"}],"package":"proof/package","release":"1.2.3","source_tree_digest":"sha256:`+strings.Repeat("2", 64)+`"}`)
+		case "/v1/packages/proof/package/releases/1.2.3/selection":
+			if r.Method != http.MethodPost {
+				t.Errorf("package selection used %s", r.Method)
+			}
+			var body struct {
+				Capability      hub.PackageInstallTarget `json:"capability"`
+				ModelSelections []hub.ModelSelection     `json:"model_selections"`
+			}
+			if err := json.NewDecoder(r.Body).Decode(&body); err != nil || body.ModelSelections == nil ||
+				len(body.ModelSelections) != 0 {
+				t.Errorf("package selection body changed: %+v err=%v", body, err)
+			}
+			switch body.Capability.Accelerator {
+			case "cpu":
+				if body.Capability.OS != "linux" || body.Capability.Arch != "x86" ||
+					body.Capability.DriverCUDA != "" || body.Capability.ComputeCapability != "" {
+					t.Errorf("CPU package install target changed: %+v", body.Capability)
+				}
+			case "nvidia":
+				if body.Capability.OS != "linux" || body.Capability.Arch != "x86" ||
+					body.Capability.DriverCUDA != "13.2" || body.Capability.ComputeCapability != "8.9" {
+					t.Errorf("NVIDIA package install target changed: %+v", body.Capability)
+				}
+			default:
+				t.Errorf("package install target omitted accelerator: %+v", body.Capability)
+			}
+			_, _ = io.WriteString(w, `{"profile":"cpu-test","placement_set":{"canonical_bytes":"e30=","digest":"sha256:`+strings.Repeat("2", 64)+`","length":2},"package_release":{"canonical_bytes":"e30=","digest":"sha256:`+strings.Repeat("3", 64)+`","length":2},"package_descriptor":{"canonical_bytes":"e30=","digest":"sha256:`+strings.Repeat("4", 64)+`","length":2},"qualification":{"canonical_bytes":"e30=","digest":"sha256:`+strings.Repeat("5", 64)+`","length":2},"downloads":[{"digest":"sha256:`+strings.Repeat("1", 64)+`","kind":"project_wheel","length":4,"path":"proof.whl","url":"https://storage.invalid/proof.whl"}]}`)
 		default:
 			http.NotFound(w, r)
 		}
@@ -117,10 +129,19 @@ func TestPackageInstallPlanContract(t *testing.T) {
 	if problem != nil || len(card.Releases) != 1 || card.Releases[0].Release != "1.2.3" {
 		t.Fatalf("package card changed: %+v problem=%v", card, problem)
 	}
-	plan, problem := client.PackageInstallPlan(context.Background(), ref, "1.2.3")
-	if problem != nil || plan.Package != "proof/package" || plan.Release != "1.2.3" ||
-		len(plan.Downloads) != 1 || plan.Downloads[0].Path != "package.toml" {
+	plan, problem := client.PackageInstallPlan(context.Background(), ref, "1.2.3", hub.PackageInstallTarget{
+		Accelerator: "cpu", OS: "linux", Arch: "x86",
+	})
+	if problem != nil || plan.Profile != "cpu-test" ||
+		len(plan.Downloads) != 1 || plan.Downloads[0].Path != "proof.whl" {
 		t.Fatalf("package install plan changed: %+v problem=%v", plan, problem)
+	}
+	_, problem = client.PackageInstallPlan(context.Background(), ref, "1.2.3", hub.PackageInstallTarget{
+		Accelerator: "nvidia", OS: "linux", Arch: "x86",
+		DriverCUDA: "13.2", ComputeCapability: "8.9",
+	})
+	if problem != nil {
+		t.Fatalf("NVIDIA package install target was refused: %v", problem)
 	}
 }
 
@@ -132,7 +153,7 @@ func TestPackagePublishPendingWireFlowBoundsUploads(t *testing.T) {
 		must(t, os.WriteFile(name, []byte("VALUE = 1\n"), 0o644))
 	}
 
-	var active, peak, began, registered, finalized atomic.Int64
+	var active, peak, began, finalized atomic.Int64
 	releasePath := "/v1/packages/proof/wire-package/releases/1.0.0"
 	var server *httptest.Server
 	server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -151,24 +172,19 @@ func TestPackagePublishPendingWireFlowBoundsUploads(t *testing.T) {
 			w.WriteHeader(http.StatusNoContent)
 		case r.Method == http.MethodPost && r.URL.Path == releasePath:
 			began.Add(1)
-			_ = json.NewEncoder(w).Encode(map[string]any{
-				"state": "pending",
-				"project_wheel_upload": map[string]any{
-					"already_uploaded": false, "required_headers": map[string]string{},
-					"url": server.URL + "/storage/project",
-				},
-			})
-		case r.Method == http.MethodPost && r.URL.Path == releasePath+"/uploads":
-			registered.Add(1)
 			var body struct {
 				Paths            []string `json:"paths"`
 				DependencyWheels []string `json:"dependency_wheels"`
 			}
 			if err := json.NewDecoder(r.Body).Decode(&body); err != nil || len(body.Paths) < 50 || len(body.DependencyWheels) != 0 {
-				t.Errorf("Creator did not register the complete source set: paths=%d dependencies=%v err=%v",
+				t.Errorf("Creator did not declare the complete source set: paths=%d dependencies=%v err=%v",
 					len(body.Paths), body.DependencyWheels, err)
 			}
-			uploads := make([]map[string]any, 0, len(body.Paths))
+			uploads := []map[string]any{{
+				"already_uploaded": false, "kind": "project_wheel",
+				"path":             "wire_package-1.0.0-py3-none-any.whl",
+				"required_headers": map[string]string{}, "url": server.URL + "/storage/project",
+			}}
 			for i, path := range body.Paths {
 				uploads = append(uploads, map[string]any{
 					"already_uploaded": false, "kind": "source", "path": path,
@@ -176,26 +192,15 @@ func TestPackagePublishPendingWireFlowBoundsUploads(t *testing.T) {
 					"url":              server.URL + "/storage/" + strconv.Itoa(i),
 				})
 			}
-			_ = json.NewEncoder(w).Encode(map[string]any{"uploads": uploads})
+			_ = json.NewEncoder(w).Encode(map[string]any{"state": "pending", "uploads": uploads})
 		case r.Method == http.MethodPut && r.URL.Path == releasePath:
 			finalized.Add(1)
+			releaseBytes := []byte(`{"format":"cozy.package.release/1"}`)
 			_ = json.NewEncoder(w).Encode(map[string]any{
-				"compatible_profiles": []string{"cpu-py311-torch213"},
-				"package_executions": []map[string]any{
-					{
-						"digest": "sha256:" + strings.Repeat("4", 64), "function": "generate",
-						"profile": "cpu-py311-torch213", "state": "qualified",
-					},
-					{
-						"digest": "sha256:" + strings.Repeat("5", 64), "function": "inspect",
-						"profile": "cpu-py311-torch213", "state": "qualified",
-					},
+				"state": "committed", "package_release": map[string]any{
+					"canonical_bytes": releaseBytes, "digest": "sha256:" + strings.Repeat("4", 64),
+					"length": len(releaseBytes),
 				},
-				"profiles": []map[string]any{{
-					"base_realization_kind": "base-worker-image", "candidate_id": "pqc-proof",
-					"profile": "cpu-py311-torch213", "state": "qualified",
-				}},
-				"qualification_state": "qualified", "requirements": []string{}, "requires_python": ">=3.11",
 			})
 		default:
 			http.Error(w, "unexpected route", http.StatusNotFound)
@@ -205,21 +210,16 @@ func TestPackagePublishPendingWireFlowBoundsUploads(t *testing.T) {
 
 	code, out := runCozyDir(t, t.TempDir(), project,
 		[]string{"TENSORHUB_URL=" + server.URL, "TENSORHUB_TOKEN=proof-token"}, "package", "publish")
-	if code != 0 || !strings.Contains(out, "eligible_worker_profiles:") ||
-		!strings.Contains(out, "- cpu-py311-torch213") ||
-		strings.Count(out, "cpu-py311-torch213") != 1 ||
-		strings.Contains(out, "generate@") || strings.Contains(out, "sha256:") ||
+	if code != 0 || !strings.Contains(out, "package_release_digest:") ||
 		!strings.Contains(out, "Building package wheel and local dependencies...") ||
-		!strings.Contains(out, "Registering 52 source files and 0 dependency wheels...") ||
+		!strings.Contains(out, "Declaring 52 source files and 0 dependency wheels...") ||
 		!strings.Contains(out, "Uploading files: 0/53") ||
 		!strings.Contains(out, "Uploading files: 53/53") ||
-		!strings.Contains(out, "Finalizing release and evaluating worker profiles...") ||
-		strings.Contains(out, "qualification:") {
+		!strings.Contains(out, "Committing exact package release...") {
 		t.Fatalf("pending package wire flow failed [exit %d]\n%s", code, out)
 	}
-	if began.Load() != 1 || registered.Load() != 1 || finalized.Load() != 1 {
-		t.Fatalf("package route calls changed: begin=%d uploads=%d finalize=%d",
-			began.Load(), registered.Load(), finalized.Load())
+	if began.Load() != 1 || finalized.Load() != 1 {
+		t.Fatalf("package route calls changed: declare=%d commit=%d", began.Load(), finalized.Load())
 	}
 	if got := peak.Load(); got > 16 || got < 2 {
 		t.Fatalf("package upload concurrency=%d, want 2..16", got)

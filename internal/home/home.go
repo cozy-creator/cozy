@@ -117,7 +117,7 @@ func (l Layout) RentalMediaToken(id string) string {
 }
 
 // RentalCreatorIdentity is one rental's Ed25519 private key. The worker receives only
-// the public key and verifies signed ClaimProof and ArtifactDelegation documents.
+// the public key and verifies the signed ClaimProof.
 func (l Layout) RentalCreatorIdentity(id string) string {
 	return filepath.Join(l.Rentals, id+".creator.pem")
 }

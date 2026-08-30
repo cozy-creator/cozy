@@ -39,15 +39,14 @@ const recordOwnerEpoch = 1
 const recordOwnerID = "cozy-local-client"
 
 type session struct {
-	ctx                 context.Context
-	bootID              string
-	generation          uint64
-	instanceID          string
-	out                 chan *pb.RecordOwnerFrame
-	artifactLoopStarted bool
-	claimAck            []byte
-	snapshot            []byte
-	relay               chan RentalSessionEvidence
+	ctx        context.Context
+	bootID     string
+	generation uint64
+	instanceID string
+	out        chan *pb.RecordOwnerFrame
+	claimAck   []byte
+	snapshot   []byte
+	relay      chan RentalSessionEvidence
 }
 
 func (s *session) send(m *pb.RecordOwnerFrame) (sent bool) {
@@ -718,104 +717,10 @@ func (c *Orchestrator) onSnapshot(w *worker, s *session, snap *pb.WorkerSnapshot
 		c.sendJobDirective(s, w)
 		return true
 	}
-	if w.spec.Connection != nil {
-		if s.artifactLoopStarted {
-			return true
-		}
-		s.artifactLoopStarted = true
-		go c.runRemoteArtifactLoop(s, w)
-		return true
-	}
 	if e := c.converge(s, w, []DesiredPlacement{w.spec.Placement}); e != nil {
 		c.logf("the desired placement set for %s could not be issued: %s", w.instanceID, e.Message)
 	}
 	return true
-}
-
-// runRemoteArtifactLoop sends logical intent before desired placement, then renews the
-// same revision when one third of the signed lifetime remains. No URL crosses this stream.
-func (c *Orchestrator) runRemoteArtifactLoop(s *session, w *worker) {
-	if c.opt.ArtifactDelegations == nil {
-		c.logf("rental %s has no artifact-delegation source; desired placement was not issued",
-			w.spec.Connection.RentalID)
-		return
-	}
-	initial := true
-	for {
-		c.mu.Lock()
-		placement, workerID := w.spec.Placement, w.remoteWorkerID
-		c.mu.Unlock()
-		delegation, problem := c.issueRemoteArtifacts(s, w, workerID, placement, initial)
-		if problem != nil {
-			c.logf("rental %s artifact delegation was not refreshed: %s",
-				w.spec.Connection.RentalID, problem.Message)
-			if !waitContext(s.ctx, ReportCadence) {
-				return
-			}
-			continue
-		}
-		initial = false
-		if !waitContext(s.ctx, delegationRefreshDelay(delegation.ExpiresAtUnix)) {
-			return
-		}
-	}
-}
-
-func (c *Orchestrator) issueRemoteArtifacts(s *session, w *worker, workerID string,
-	placement DesiredPlacement, issueDesired bool) (ArtifactDelegation, *exit.Error) {
-	delegation, problem := c.opt.ArtifactDelegations(w.spec.Connection, ArtifactDelegationRequest{
-		WorkerID: workerID, WorkerBootID: s.bootID,
-	})
-	if problem != nil {
-		return ArtifactDelegation{}, problem
-	}
-	if delegation.Revision != placement.PlacementRevision || delegation.DelegationID == "" ||
-		delegation.ExpiresAtUnix <= uint64(time.Now().Unix()) || len(delegation.CanonicalBytes) == 0 ||
-		len(delegation.Signature) != 64 {
-		return ArtifactDelegation{}, exit.Named(exit.Conflict, "rental.artifact_delegation_invalid",
-			"the rental artifact delegation is incomplete or names another desired revision")
-	}
-	ensure := &pb.EnsureArtifacts{
-		DelegationCanonicalBytes: delegation.CanonicalBytes, CreatorSignature: delegation.Signature,
-	}
-	ensure.RecordOwnerEpoch, ensure.ControlStreamGeneration, ensure.WorkerBootId =
-		recordOwnerEpoch, s.generation, s.bootID
-	if !s.send(&pb.RecordOwnerFrame{Msg: &pb.RecordOwnerFrame_EnsureArtifacts{
-		EnsureArtifacts: ensure,
-	}}) {
-		return ArtifactDelegation{}, exit.Unavailablef(
-			"worker %s control stream closed before its artifact delegation", w.instanceID)
-	}
-	c.logf("EnsureArtifacts revision=%d delegation=%s expires=%d -> %s",
-		delegation.Revision, delegation.DelegationID, delegation.ExpiresAtUnix, s.bootID)
-	if issueDesired {
-		if problem := c.converge(s, w, []DesiredPlacement{placement}); problem != nil {
-			return ArtifactDelegation{}, problem
-		}
-	}
-	return delegation, nil
-}
-
-func delegationRefreshDelay(expiresAt uint64) time.Duration {
-	remaining := time.Until(time.Unix(int64(expiresAt), 0))
-	if remaining <= 0 {
-		return 0
-	}
-	if delay := remaining * 2 / 3; delay > 0 {
-		return delay
-	}
-	return 0
-}
-
-func waitContext(ctx context.Context, delay time.Duration) bool {
-	timer := time.NewTimer(delay)
-	defer timer.Stop()
-	select {
-	case <-ctx.Done():
-		return false
-	case <-timer.C:
-		return true
-	}
 }
 
 type snapshotContinuation struct {

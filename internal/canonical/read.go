@@ -92,63 +92,10 @@ func parseObject(data []byte) (Doc, error) {
 // "absent", and #485b makes that a wire law rather than a convention.
 func semantics(name string, d Doc) error {
 	switch name {
-	case "cozy.worker.v1.PackageEnvironmentSpec":
-		// PLATFORMTARGET HAS ONE CANONICAL ENCODING (#485b). The absent libc is the single
-		// value "none" — never "", never omitted. Two spellings of "no libc" would digest
-		// to two environments and split every cache and receipt built on either, so the
-		// unspelled form refuses at parse instead of quietly becoming a second identity.
-		if pt, ok := d["platform_target"]; ok {
-			target, _ := pt.(map[string]Value)
-			if libc, _ := target["libc"].(string); libc == "" {
-				return refuse("libc_unspelled",
-					"platform_target.libc has one canonical encoding and the absent case is "+
-						`"none"; an omitted or empty libc is a second spelling of the same environment`)
-			}
-		}
 	case "cozy.worker.v1.AttemptOutcomeBody":
 		return artifactReceiptList(d)
 	case "cozy.worker.v1.ArtifactReceipt":
 		return artifactReceipt(d)
-	case "cozy.worker.v1.PlacementSet":
-		placements, _ := d["placements"].([]Value)
-		for _, raw := range placements {
-			placement, ok := raw.(map[string]Value)
-			if !ok {
-				return refuse("placement_shape", "a placement is not an object")
-			}
-			if _, legacy := placement["spec"]; legacy {
-				return refuse("placement_nested_spec_retired", "PlacementSet/2 is flat")
-			}
-			if err := placementModelObjectSet(Doc(placement)); err != nil {
-				return err
-			}
-		}
-	case "cozy.worker.v1.ArtifactDelegation":
-		for _, field := range []string{"model_manifest_ids", "package_release_ids"} {
-			if _, ok := d[field].([]Value); !ok {
-				return refuse("artifact_delegation_ids_invalid", "%s must be an explicit array", field)
-			}
-		}
-	}
-	return nil
-}
-
-func placementModelObjectSet(d Doc) error {
-	raw, ok := d["model_object_set"]
-	if !ok {
-		return refuse("model_object_set_missing", "PlacementSet/2 requires model_object_set")
-	}
-	subject, ok := raw.(map[string]Value)
-	if !ok {
-		return refuse("model_object_set_shape", "model_object_set is not an ArtifactSubject")
-	}
-	digest, _ := subject["digest"].(string)
-	id, _ := subject["subject_id"].(string)
-	kind, _ := subject["kind"].(string)
-	length, _ := subject["length"].(int64)
-	if _, err := Raw(digest); err != nil || id != digest || kind != "model_object_set" || length <= 0 {
-		return refuse("model_object_set_shape",
-			"model_object_set requires kind=model_object_set, subject_id=digest, and non-zero length")
 	}
 	return nil
 }

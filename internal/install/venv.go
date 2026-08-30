@@ -94,19 +94,13 @@ func MaterializeEnvironment(sourceDir, venvDir string) (*EnvironmentReceipt, *ex
 // configured Python index; source distributions and build backends are refused.
 // The author-machine tool.uv.sources paths and development lock never control a
 // registry install.
-func MaterializePublishedEnvironment(sourceDir, venvDir string, wheels []string) (*EnvironmentReceipt, *exit.Error) {
+func MaterializePublishedEnvironment(_ string, venvDir string, wheels []string) (*EnvironmentReceipt, *exit.Error) {
 	if len(wheels) == 0 {
 		return nil, exit.Internalf("published package install has no project wheel")
 	}
-	lockDigest, err := fileDigest(filepath.Join(sourceDir, "uv.lock"))
-	if err != nil {
-		return nil, exit.Named(exit.Structural, "lock_missing",
-			"the published source carries no uv.lock").WithNext("cozy package install")
-	}
 	env := &EnvironmentReceipt{
-		LockDigest: "sha256:" + lockDigest,
-		Platform:   runtime.GOOS + "/" + runtime.GOARCH,
-		UV:         toolVersion("uv", "--version"),
+		Platform: runtime.GOOS + "/" + runtime.GOARCH,
+		UV:       toolVersion("uv", "--version"),
 	}
 	env.LinkMode = pickLinkMode(venvDir, &env.Warnings)
 	create := exec.Command("uv", "venv", "--no-progress", venvDir)

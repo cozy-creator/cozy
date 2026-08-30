@@ -80,6 +80,8 @@ func TestPackageHasOneActiveVersion(t *testing.T) {
 	}
 	first := install("a", "1.0.0", 1)
 	second := install("b", "2.0.0", 2)
+	second.SelectionProfile = "torch2.13.0-cpu-cp312-linux-x86"
+	second.PlacementSetDigest = "sha256:" + strings.Repeat("b", 64)
 	if _, problem = store.Activate(first); problem != nil {
 		t.Fatal(problem)
 	}
@@ -89,6 +91,11 @@ func TestPackageHasOneActiveVersion(t *testing.T) {
 	pins, problem := store.Pins("cozy/example")
 	if problem != nil || len(pins) != 1 || pins[0].InstallID != second.ID {
 		t.Fatalf("active pins = %+v, %v", pins, problem)
+	}
+	_, active, problem := store.ActivePackage("cozy/example")
+	if problem != nil || active == nil || active.SelectionProfile != second.SelectionProfile ||
+		active.PlacementSetDigest != second.PlacementSetDigest {
+		t.Fatalf("active selection = %+v, %v", active, problem)
 	}
 }
 
@@ -163,31 +170,17 @@ func TestPackagePublishRefusesSilentlyOmittedPrivateFiles(t *testing.T) {
 	}
 }
 
-func TestPackagePublishCommittedReplaySkipsBuildAndStaysCompact(t *testing.T) {
+func TestPackagePublishCommittedReplayStaysCompact(t *testing.T) {
 	project := t.TempDir()
-	must(t, os.Mkdir(filepath.Join(project, "replay_package"), 0o755))
-	must(t, os.WriteFile(filepath.Join(project, "replay_package", "__init__.py"), []byte("VALUE = 1\n"), 0o644))
-	must(t, os.WriteFile(filepath.Join(project, "pyproject.toml"), []byte(`[build-system]
-requires = []
-build-backend = "backend.that.does.not.exist"
-
-[project]
-name = "replay-package"
-version = "1.0.0"
-
-[tool.cozy]
-organization = "proof"
-`), 0o644))
-	must(t, os.WriteFile(filepath.Join(project, "package.toml"), []byte("[application]\nobject = \"replay_package:app\"\n"), 0o644))
-	must(t, os.WriteFile(filepath.Join(project, "uv.lock"), []byte("version = 1\n"), 0o644))
+	writePublishProject(t, project, "replay-package", "1.0.0", nil, "", true)
 
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		switch r.Method {
 		case http.MethodPost:
-			_, _ = io.WriteString(w, `{"project_wheel_upload":{"already_uploaded":true,"required_headers":{},"url":""},"state":"committed"}`)
+			_, _ = io.WriteString(w, `{"state":"committed","uploads":[]}`)
 		case http.MethodPut:
-			_, _ = io.WriteString(w, `{"compatible_profiles":[],"package_executions":[],"profiles":[],"qualification_state":"future-compatible-state","requirements":[],"requires_python":""}`)
+			_, _ = io.WriteString(w, `{"state":"committed","package_release":{"canonical_bytes":"e30=","digest":"sha256:44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a","length":2}}`)
 		default:
 			http.Error(w, "unexpected method", http.StatusMethodNotAllowed)
 		}
@@ -198,9 +191,9 @@ organization = "proof"
 	if code != 0 || !strings.Contains(out, "status:  already published") ||
 		!strings.Contains(out, "Checking proof/replay-package@1.0.0...") ||
 		!strings.Contains(out, "Release already published; refreshing status...") ||
-		!strings.Contains(out, "Finalizing release and evaluating worker profiles...") ||
+		!strings.Contains(out, "Committing exact package release...") ||
 		strings.Contains(out, "qualification:") || strings.Contains(out, "changed:") {
-		t.Fatalf("committed replay built the project or emitted verbose state [exit %d]\n%s", code, out)
+		t.Fatalf("committed replay emitted verbose state [exit %d]\n%s", code, out)
 	}
 }
 
@@ -679,10 +672,9 @@ func TestDaemonStartupDiagnostic(t *testing.T) {
 
 const maxDaemonDiagnosticOutput = 18 << 10
 
-// TestProductPath drives only the public Kong surface: install a real weightless
-// release, auto-start the daemon on invoke, cross Runtime and the worker wire,
-// accept an output, release idle residency, then stop cleanly.
-func TestProductPath(t *testing.T) {
+// A local archive remains a build/install input, but cannot invent the exact
+// PackageRelease, Qualification, and PlacementSet required for execution.
+func TestDevelopmentInstallIsNotRunnable(t *testing.T) {
 	root := t.TempDir()
 	t.Cleanup(func() { _, _ = runCozy(t, root, "down", "--all") })
 
@@ -708,60 +700,10 @@ func TestProductPath(t *testing.T) {
 		t.Fatalf("version-in-path remedy was not useful [exit %d]\n%s", code, out)
 	}
 
-	outDir := filepath.Join(root, "out")
 	code, out = runCozy(t, root, "invoke", "run", weightlessRef+"/tile",
-		"size=32", "seed=7", "--out", outDir)
-	if code != 0 {
-		t.Fatalf("invoke run [exit %d]\n%s", code, out)
-	}
-	saved := filepath.Join(outDir, "image.png")
-	image, err := os.ReadFile(saved)
-	if err != nil || len(image) < 8 || string(image[1:4]) != "PNG" {
-		t.Fatalf("invoke did not publish its declared PNG at %s: %v", saved, err)
-	}
-	// A second invocation reuses the same warm serving worker rather than spawning
-	// another process onto the device envelope.
-	secondOut := filepath.Join(root, "out-2")
-	if code, out := runCozy(t, root, "invoke", "run", weightlessRef+"/tile",
-		"size=16", "seed=8", "--out", secondOut); code != 0 {
-		t.Fatalf("warm invoke [exit %d]\n%s", code, out)
-	}
-	store, problem := records.Open(filepath.Join(root, "records.db"))
-	fatal(t, problem)
-	workers, problem := store.LiveWorkers()
-	fatal(t, problem)
-	store.Close()
-	localWorkers := 0
-	for _, worker := range workers {
-		if worker.WorkerID != "remote" {
-			localWorkers++
-		}
-	}
-	if localWorkers != 1 {
-		t.Fatalf("warm reuse left %d local workers; wanted exactly one", localWorkers)
-	}
-
-	code, listed := runCozy(t, root, "invoke", "list", "--json")
-	if code != 0 {
-		t.Fatalf("invoke list [exit %d]\n%s", code, listed)
-	}
-	var document map[string]any
-	err = json.Unmarshal([]byte(listed), &document)
-	invocations, ok := document["invocations"].([]any)
-	if err != nil || !ok || len(invocations) != 2 {
-		t.Fatalf("invoke list is not one successful JSON document: %v\n%s", err, listed)
-	}
-	if code, out := runCozy(t, root, "invoke", "run", weightlessRef+"/nosuch"); code != 1 ||
-		!strings.Contains(out, "registers no function") || !strings.Contains(out, "available functions") {
-		t.Fatalf("operational refusal was not shell exit 1 with detail [exit %d]\n%s", code, out)
-	}
-
-	if code, out := runCozy(t, root, "unload"); code != 0 || !strings.Contains(out, weightlessRef) {
-		t.Fatalf("unload [exit %d]\n%s", code, out)
-	}
-	if code, out := runCozy(t, root, "down"); code != 0 ||
-		!strings.Contains(out, "daemon:") || !strings.Contains(out, "stopped") {
-		t.Fatalf("down [exit %d]\n%s", code, out)
+		"size=32", "seed=7")
+	if code != 1 || !strings.Contains(out, "without an exact Hub-selected PlacementSet") {
+		t.Fatalf("development install became runnable [exit %d]\n%s", code, out)
 	}
 }
 

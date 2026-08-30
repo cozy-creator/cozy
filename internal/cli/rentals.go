@@ -7,6 +7,7 @@ import (
 	"encoding/hex"
 	"fmt"
 	"os/signal"
+	"sort"
 	"strings"
 	"syscall"
 	"time"
@@ -143,7 +144,11 @@ func handleRent(ctx *Context) *exit.Error {
 		return e
 	}
 	tokenHash := secret.HashHex(token)
-	requestBody, e := hub.RentalRequestBytes(packageRef, skuName, tokenHash, creator.PublicKey())
+	models, e := parseModelSelections(ctx.Inv.Value("--models"))
+	if e != nil {
+		return e
+	}
+	requestBody, e := hub.RentalRequestBytes(packageRef, models, skuName, tokenHash, creator.PublicKey())
 	if e != nil {
 		return e
 	}
@@ -205,7 +210,7 @@ func handleRent(ctx *Context) *exit.Error {
 		row.Address, row.State = seen.Address, seen.State
 		row.MediaAddress = seen.MediaAddress
 		row.ExpectedWorkerID, row.ExpectedWorkerBootID = seen.WorkerID, seen.WorkerBootID
-		if e := captureRentalControl(&row, seen); e != nil {
+		if e := captureRentalSelection(&row, seen); e != nil {
 			return e
 		}
 		if e := st.RecordRental(row); e != nil {
@@ -232,7 +237,7 @@ func handleRent(ctx *Context) *exit.Error {
 	row.Address, row.State = attachable.Address, attachable.State
 	row.MediaAddress = attachable.MediaAddress
 	row.ExpectedWorkerID, row.ExpectedWorkerBootID = attachable.WorkerID, attachable.WorkerBootID
-	if e := captureRentalControl(&row, attachable); e != nil {
+	if e := captureRentalSelection(&row, attachable); e != nil {
 		return e
 	}
 	if !attachable.HoldsMediaHash(secret.HashHex(token)) {
@@ -320,6 +325,94 @@ func handleRent(ctx *Context) *exit.Error {
 		"cozy rental end " + ready.ID,
 	}
 	return emit(ctx, rec)
+}
+
+func parseModelSelections(value string) ([]hub.ModelSelection, *exit.Error) {
+	if strings.TrimSpace(value) == "" {
+		return []hub.ModelSelection{}, nil
+	}
+	var out []hub.ModelSelection
+	for _, item := range strings.Split(value, ",") {
+		id, selected, ok := strings.Cut(strings.TrimSpace(item), "=")
+		laneAt := strings.LastIndexByte(selected, '#')
+		if !ok || id == "" || laneAt <= 0 || laneAt == len(selected)-1 {
+			return nil, exit.Usagef("--model %q is not id=org/name@release#lane", item)
+		}
+		out = append(out, hub.ModelSelection{ID: id, ModelRef: selected[:laneAt], Lane: selected[laneAt+1:]})
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].ID < out[j].ID })
+	return out, nil
+}
+
+func handleRentalUpdate(ctx *Context) *exit.Error {
+	id, packageRef := strings.TrimSpace(ctx.Inv.Args[0]), strings.TrimSpace(ctx.Inv.Args[1])
+	models, problem := parseModelSelections(ctx.Inv.Value("--models"))
+	if problem != nil {
+		return problem
+	}
+	body, problem := hub.PlacementRequestBytes(packageRef, models)
+	if problem != nil {
+		return problem
+	}
+	operationKey := strings.TrimSpace(ctx.Inv.Value("--idempotency-key"))
+	if operationKey == "" {
+		return exit.Usagef("cozy rental update requires --idempotency-key")
+	}
+	l, st, problem := rentalStores(ctx)
+	if problem != nil {
+		return problem
+	}
+	defer st.Close()
+	_ = l
+	row, problem := st.RentalRow(id)
+	if problem != nil {
+		return problem
+	}
+	if row == nil {
+		return exit.New(exit.NotFound, "no rental %s on this host", id)
+	}
+	hctx, cancel := hub.LongContext()
+	answer, problem := client(ctx).ReplaceRentalPlacement(hctx, id, body, operationKey)
+	cancel()
+	if problem != nil {
+		return problem
+	}
+	next := *row
+	next.PackageRef, next.PlacementRevision = answer.PackageRef, answer.DesiredRevision
+	next.SelectionProfile = answer.Selection.Profile
+	next.PlacementSetDigest = answer.Selection.PlacementSet.Digest
+	next.PlacementSetBytes = append([]byte(nil), answer.Selection.PlacementSet.CanonicalBytes...)
+	next.PackageReleaseDigest = answer.Selection.PackageRelease.Digest
+	next.PackageReleaseBytes = append([]byte(nil), answer.Selection.PackageRelease.CanonicalBytes...)
+	next.PackageDescriptorDigest = answer.Selection.PackageDescriptor.Digest
+	next.PackageDescriptorBytes = append([]byte(nil), answer.Selection.PackageDescriptor.CanonicalBytes...)
+	next.QualificationDigest = answer.Selection.Qualification.Digest
+	next.QualificationBytes = append([]byte(nil), answer.Selection.Qualification.CanonicalBytes...)
+	if problem := rental.ValidateSelection(next); problem != nil {
+		return problem
+	}
+	if problem := st.ReplaceRentalSelection(next); problem != nil {
+		return problem
+	}
+	ctx.Daemon = daemon.Probe(ctx.Cfg)
+	if !ctx.Daemon.Up {
+		return ctx.Daemon.Unavailable().WithRemedy(
+			"the replacement is registered and durable; start Cozy to relay it to the worker")
+	}
+	local, problem := dial(ctx)
+	if problem != nil {
+		return problem
+	}
+	started, problem := local.EnsureRental(id)
+	if problem != nil {
+		return problem
+	}
+	return emit(ctx, compactRecord([]output.Field{
+		{K: "rental", V: id}, {K: "package", V: packageRef},
+		{K: "desired_revision", V: answer.DesiredRevision},
+		{K: "placement_set_digest", V: answer.Selection.PlacementSet.Digest},
+		{K: "worker", V: started.InstanceID},
+	}, "rental", "package", "desired_revision", "placement_set_digest"))
 }
 
 func emitRentalCatalog(ctx *Context, skus []hub.RentalSKU) *exit.Error {
@@ -452,10 +545,7 @@ func sameAttachProjection(attached, seen hub.Rental, tokenHash string) *exit.Err
 		attached.PlacementRevision != seen.PlacementRevision ||
 		!seen.HoldsMediaHash(tokenHash) ||
 		!sameHashSet(attached.MediaTokenSHA256, seen.MediaTokenSHA256) ||
-		attached.ControlSnapshot == nil || seen.ControlSnapshot == nil ||
-		attached.ControlSnapshot.Digest != seen.ControlSnapshot.Digest ||
-		attached.ControlSnapshot.Length != seen.ControlSnapshot.Length ||
-		!bytes.Equal(attached.ControlSnapshot.CanonicalBytes, seen.ControlSnapshot.CanonicalBytes) {
+		!sameSelection(attached.Selection, seen.Selection) {
 		return exit.Named(exit.Conflict, "rental.attach_projection_changed",
 			"rental %s changed its receipt-pinned control projection while this host was converging it",
 			attached.ID).
@@ -518,8 +608,8 @@ func missingOf(r hub.Rental) string {
 	if r.CreatorPublicKey == "" {
 		return "Creator public key"
 	}
-	if r.ControlSnapshot == nil {
-		return "attempt-bound control snapshot"
+	if r.Selection == nil {
+		return "exact package selection"
 	}
 	if r.PlacementRevision == 0 {
 		return "active placement revision"
@@ -527,30 +617,43 @@ func missingOf(r hub.Rental) string {
 	return "complete ready projection"
 }
 
-func captureRentalControl(row *records.Rental, seen hub.Rental) *exit.Error {
-	if row == nil || seen.ControlSnapshot == nil {
+func captureRentalSelection(row *records.Rental, seen hub.Rental) *exit.Error {
+	if row == nil || seen.Selection == nil {
 		return nil
 	}
-	if row.ControlSnapshotDigest == "" {
+	selection := seen.Selection
+	if row.PlacementSetDigest == "" {
 		candidate := *row
-		candidate.ControlSnapshotDigest = seen.ControlSnapshot.Digest
-		candidate.ControlSnapshotBytes = append([]byte(nil), seen.ControlSnapshot.CanonicalBytes...)
+		candidate.SelectionProfile = selection.Profile
+		candidate.PlacementSetDigest = selection.PlacementSet.Digest
+		candidate.PlacementSetBytes = append([]byte(nil), selection.PlacementSet.CanonicalBytes...)
+		candidate.PackageReleaseDigest = selection.PackageRelease.Digest
+		candidate.PackageReleaseBytes = append([]byte(nil), selection.PackageRelease.CanonicalBytes...)
+		candidate.PackageDescriptorDigest = selection.PackageDescriptor.Digest
+		candidate.PackageDescriptorBytes = append([]byte(nil), selection.PackageDescriptor.CanonicalBytes...)
+		candidate.QualificationDigest = selection.Qualification.Digest
+		candidate.QualificationBytes = append([]byte(nil), selection.Qualification.CanonicalBytes...)
 		candidate.PlacementRevision = seen.PlacementRevision
 		if seen.PackageRef != "" {
 			candidate.PackageRef = seen.PackageRef
 		}
-		if problem := rental.ValidateControl(candidate); problem != nil {
+		if problem := rental.ValidateSelection(candidate); problem != nil {
 			return problem
 		}
 		*row = candidate
 		return nil
 	}
-	if row.ControlSnapshotDigest != seen.ControlSnapshot.Digest ||
-		len(row.ControlSnapshotBytes) != len(seen.ControlSnapshot.CanonicalBytes) ||
-		!bytes.Equal(row.ControlSnapshotBytes, seen.ControlSnapshot.CanonicalBytes) {
-		return exit.Named(exit.Conflict, "rental.control_snapshot_changed",
-			"rental %s changed its acquisition control snapshot after Cozy validated it", row.ID).
-			WithRemedy("release it; a different snapshot is a different execution authority")
+	stored := &hub.PackageSelection{
+		Profile:           row.SelectionProfile,
+		PlacementSet:      hub.ExactDocument{Digest: row.PlacementSetDigest, Length: int64(len(row.PlacementSetBytes)), CanonicalBytes: row.PlacementSetBytes},
+		PackageRelease:    hub.ExactDocument{Digest: row.PackageReleaseDigest, Length: int64(len(row.PackageReleaseBytes)), CanonicalBytes: row.PackageReleaseBytes},
+		PackageDescriptor: hub.ExactDocument{Digest: row.PackageDescriptorDigest, Length: int64(len(row.PackageDescriptorBytes)), CanonicalBytes: row.PackageDescriptorBytes},
+		Qualification:     hub.ExactDocument{Digest: row.QualificationDigest, Length: int64(len(row.QualificationBytes)), CanonicalBytes: row.QualificationBytes},
+	}
+	if !sameSelection(stored, selection) {
+		return exit.Named(exit.Conflict, "rental.selection_changed",
+			"rental %s changed its exact package selection after Cozy validated it", row.ID).
+			WithRemedy("release it; a different PlacementSet is different execution authority")
 	}
 	if row.PlacementRevision > 0 && seen.PlacementRevision < row.PlacementRevision {
 		return exit.Named(exit.Conflict, "rental.placement_revision_regressed",
@@ -562,6 +665,22 @@ func captureRentalControl(row *records.Rental, seen hub.Rental) *exit.Error {
 		row.PackageRef = seen.PackageRef
 	}
 	return nil
+}
+
+func sameSelection(a, b *hub.PackageSelection) bool {
+	if a == nil || b == nil || a.Profile != b.Profile {
+		return false
+	}
+	for _, pair := range [][2]hub.ExactDocument{
+		{a.PlacementSet, b.PlacementSet}, {a.PackageRelease, b.PackageRelease},
+		{a.PackageDescriptor, b.PackageDescriptor}, {a.Qualification, b.Qualification},
+	} {
+		if pair[0].Digest != pair[1].Digest || pair[0].Length != pair[1].Length ||
+			!bytes.Equal(pair[0].CanonicalBytes, pair[1].CanonicalBytes) {
+			return false
+		}
+	}
+	return true
 }
 
 func handleRentLs(ctx *Context) *exit.Error {

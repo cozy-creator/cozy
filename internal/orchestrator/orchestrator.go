@@ -63,43 +63,19 @@ type Options struct {
 	RecordRentalRefusal func(rentalID string, problem *exit.Error) *exit.Error
 	// RentalClaimProof signs the exact worker/boot/TLS leaf Creator is about to claim.
 	RentalClaimProof RentalClaimProofSource
-	// ArtifactDelegations signs the exact logical package-release/model-manifest intent after the worker
-	// snapshot barrier. The worker resolves bytes directly from Tensorhub over mTLS.
-	ArtifactDelegations ArtifactDelegationSource
 	// RelayRentalSession returns authenticated private-worker evidence to Tensorhub.
 	// This RecordOwner remains the only process that dials WorkerControl: the callback
 	// carries deterministic frame bytes over the rental-scoped HTTP authority and never
 	// grants Tensorhub a worker credential or a competing control stream.
 	RelayRentalSession RentalSessionRelay
 
-	// EnvironmentSpecDigest and ConfigDigest are LOCAL invocation defaults. They ride
-	// INSIDE every local InvocationSpec document:
-	// the PackageEnvironmentSpec that IS this invocation's execution environment (#483 —
-	// was `ImageDigest`, and "image" is wrong for a native install with no OCI image at
-	// all) and the local evaluated-config document's identity (cr-003's). They are frozen
-	// per daemon, never per request. A remote placement supplies only Tensorhub's exact
-	// environment; its model configuration is bound separately.
-	EnvironmentSpecDigest string
-	ConfigDigest          string
-	MaxOutputMiB          int64
-}
-
-type ArtifactDelegationRequest struct {
-	WorkerID     string
-	WorkerBootID string
+	// ConfigDigest is the local evaluated-config identity. Environment identity
+	// comes only from the exact selected PlacementSet.
+	ConfigDigest string
+	MaxOutputMiB int64
 }
 
 type RentalClaimProofSource func(*WorkerConnection, uint64) ([]byte, *exit.Error)
-
-type ArtifactDelegation struct {
-	CanonicalBytes []byte
-	Signature      []byte
-	DelegationID   string
-	Revision       uint64
-	ExpiresAtUnix  uint64
-}
-
-type ArtifactDelegationSource func(*WorkerConnection, ArtifactDelegationRequest) (ArtifactDelegation, *exit.Error)
 type RentalSessionEvidence struct {
 	ClaimAck        []byte
 	Snapshot        []byte

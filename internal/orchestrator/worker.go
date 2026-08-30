@@ -17,106 +17,19 @@ import (
 	"github.com/cozy-creator/cozy/internal/exit"
 	"github.com/cozy-creator/cozy/internal/inputasset"
 	"github.com/cozy-creator/cozy/internal/media"
-	"github.com/cozy-creator/cozy/internal/plan"
 	"github.com/cozy-creator/cozy/internal/processtree"
 	"github.com/cozy-creator/cozy/internal/records"
 	"github.com/cozy-creator/cozy/internal/secret"
 	pb "github.com/cozy-creator/cozy/protocol/cozy/worker/v1"
 )
 
-// Binding is the record owner's resolution of one `entrypoint_binding_plan_id`. For a
-// wholly weightless local package, RuntimePlan is the installed runtime's exact subject
-// and Runtime owns the private bytes. The modeled/connected path still carries Record so
-// it can stage or deliver those bytes explicitly.
-//
-// `Record` is the WHOLE older modeled record; which half is IDENTITY and which half is
-// this machine's RESOLUTION is declared once in internal/plan (#506a). RuntimePlan never
-// revives that format: its id, digest and length are consumed exactly as Runtime reports.
-type Binding struct {
-	Entrypoint string         `json:"entrypoint"`
-	Record     map[string]any `json:"record"`
-	// RuntimePlan is the exact ArtifactSubject emitted by the installed runtime for a
-	// wholly weightless package. Runtime owns and privately stages those canonical
-	// bytes; this record owner consumes only their measured identity before spawn.
-	RuntimePlan *BindingPlanSubject `json:"runtime_plan,omitempty"`
-	planID      string
-	// Outputs names this entrypoint's RESULT FIELD PATHS (`image`, `preview`,
-	// `detail.thumb`). It is not part of the binding record's canonical bytes — it is
-	// the LAUNCHER's knowledge of the entrypoint's declared result shape, which cl-006
-	// needs so a client is not forced to restate it on every submission. cr-003's
-	// descriptor is where it comes from once an installed generation exists.
+// Entrypoint is the small dispatch projection of one entrypoint already bound inside
+// the exact PlacementSet. Digest is the wire identity; Outputs comes from the exact
+// PackageDescriptor and is presentation metadata, never a second binding document.
+type Entrypoint struct {
+	Name    string   `json:"name"`
+	Digest  string   `json:"digest"`
 	Outputs []string `json:"outputs,omitempty"`
-}
-
-// BindingPlanSubject is the wire identity of one canonical plan document.
-// Runtime-owned and remote plans both carry identity only. Local Runtime stages its
-// private plan; a rented worker resolves signed package intent directly from Tensorhub.
-// Cozy validates remote plan bytes in the control snapshot but never relays them.
-type BindingPlanSubject struct {
-	SubjectID string `json:"subject_id"`
-	Kind      string `json:"kind"`
-	Digest    string `json:"digest"`
-	Length    uint64 `json:"length"`
-}
-
-// PlanID is the binding's identity. Runtime-owned plans carry it exactly; an older modeled
-// record derives it from the canonical bytes of its IDENTITY half (#506a).
-func (b *Binding) PlanID() (string, *exit.Error) {
-	if b.RuntimePlan != nil {
-		if _, err := canonical.Raw(b.RuntimePlan.SubjectID); err != nil {
-			return "", exit.Internalf("binding-plan subject id is malformed: %s", err)
-		}
-		return b.RuntimePlan.SubjectID, nil
-	}
-	if b.planID != "" {
-		return b.planID, nil
-	}
-	id, e := plan.ID(b.Record)
-	if e != nil {
-		return "", e
-	}
-	b.planID = id
-	return id, nil
-}
-
-// Staged renders an older local modeled record exactly as it lands on a spawned worker's
-// disk. Runtime-owned and remote grant subjects deliberately have no bytes on this path.
-func (b *Binding) Staged() (string, []byte, *exit.Error) {
-	if b.RuntimePlan != nil {
-		return "", nil, exit.Named(exit.Structural, "binding_plan_bytes_unavailable",
-			"binding plan %s is materialized by its runtime or direct worker acquisition", b.RuntimePlan.SubjectID)
-	}
-	id, e := b.PlanID()
-	if e != nil {
-		return "", nil, e
-	}
-	data, e := plan.Render(b.Record, id)
-	if e != nil {
-		return "", nil, e
-	}
-	return id, data, nil
-}
-
-// artifactSubject returns the exact wire subject carried by Runtime or Tensorhub.
-// Older modeled local records obtain their subject from Staged's exact bytes instead.
-func (b *Binding) artifactSubject() (*pb.ArtifactSubject, *exit.Error) {
-	if b.RuntimePlan.Kind != "plan" {
-		return nil, exit.Internalf("binding-plan subject kind is %q, want plan", b.RuntimePlan.Kind)
-	}
-	digest, err := canonical.Raw(b.RuntimePlan.Digest)
-	if err != nil {
-		return nil, exit.Internalf("binding-plan subject has a malformed digest: %s", err)
-	}
-	id, e := b.PlanID()
-	if e != nil {
-		return nil, e
-	}
-	if b.RuntimePlan.Length == 0 {
-		return nil, exit.Internalf("binding-plan subject %s has zero length", id)
-	}
-	return &pb.ArtifactSubject{
-		Digest: digest, SubjectId: id, Kind: b.RuntimePlan.Kind, Length: b.RuntimePlan.Length,
-	}, nil
 }
 
 // THE THREE OBJECTS THAT USED TO BE ONE (#484). `PackageSpec` conflated three
@@ -155,38 +68,99 @@ func (p WarmupPolicy) Or() WarmupPolicy {
 // facts, and nothing about how a process is started.
 type DesiredPlacement struct {
 	Package          string `json:"package"`            // org/name — the slot this placement serves under
-	PackageReleaseID string `json:"package_release_id"` // PROVENANCE: what the spec was resolved FROM
+	PackageReleaseID string `json:"package_release_id"` // exact PackageRelease digest spelling
 	// InstallID is the install this placement was resolved from ("" = an uninstalled dev
 	// tree). Was `Generation`, which named a protocol word this side does not own (#484).
 	InstallID string `json:"install_id"`
-	// PackageDescriptorDigest is the cr-003 descriptor's own identity, as the install VERIFIED
-	// it in the generation's own venv. It rides the Placement because a placement is
-	// named by the bytes it serves, and the descriptor is one of them.
-	PackageDescriptorDigest string     `json:"package_descriptor_digest"`
-	Bindings                []*Binding `json:"bindings"`
-	// Remote control truth comes only from Tensorhub's persisted acquisition
-	// snapshot. Local placements retain their independent install-derived path
-	// and leave these fields empty.
-	EnvironmentSpecDigest             string `json:"environment_spec_digest,omitempty"`
-	InstalledEnvironmentReceiptDigest string `json:"installed_environment_receipt_digest,omitempty"`
-	ExactPlacementSetDigest           string `json:"exact_placement_set_digest,omitempty"`
-	ExactPlacementSetBytes            []byte `json:"exact_placement_set_bytes,omitempty"`
+	// PlacementSetBytes are the exact Hub-selected PlacementSet/3 bytes. Creator
+	// validates and relays them unchanged for both a local venv and a rented pod.
+	// Entrypoints is a read-only projection used for request selection; it never
+	// participates in identity.
+	PlacementSetDigest       string       `json:"placement_set_digest"`
+	PlacementSetBytes        []byte       `json:"placement_set_bytes"`
+	EnvironmentDigest        string       `json:"environment_digest"`
+	WheelhouseManifestDigest string       `json:"wheelhouse_manifest_digest"`
+	Entrypoints              []Entrypoint `json:"entrypoints"`
 	// PlacementRevision is Tensorhub's monotonic revision for a private rental. It is
 	// the exact DesiredWorkerState.revision Cozy relays for remote placements, so Hub
 	// can compare desired, accepted, and converged without guessing a local daemon counter.
-	PlacementRevision    uint64 `json:"placement_revision,omitempty"`
-	PlacementIDValue     string `json:"placement_id,omitempty"`
-	ModelObjectSetDigest string `json:"model_object_set_digest,omitempty"`
-	ModelObjectSetLength uint64 `json:"model_object_set_length,omitempty"`
+	PlacementRevision uint64 `json:"placement_revision,omitempty"`
+	PlacementIDValue  string `json:"placement_id,omitempty"`
 	// Hidden names the entrypoints this placement deliberately does NOT serve (#572d).
 	// Recorded so an operator reading a placement can tell "no binding was staged" from
 	// "a binding was staged and broke".
-	Hidden []string `json:"hidden,omitempty"`
 	// Jobs is the JOB-mode declaration (cl-004). A worker is in exactly ONE mode — the
 	// DesiredWorkerState's own oneof says which — so a placement carries bindings or jobs,
 	// never both, and `IsJob` is read from it rather than re-derived from what happens to
 	// be populated later.
 	Jobs []*JobPlan `json:"jobs,omitempty"`
+}
+
+// PlacementFromExact validates the one selected PlacementSet and builds only the
+// small request-routing projection Creator needs. The exact bytes remain the sole
+// desired-state authority.
+func PlacementFromExact(pkg, installID, digest string, data []byte,
+	outputs map[string][]string) (DesiredPlacement, *exit.Error) {
+	declared, err := canonical.Raw(digest)
+	if err != nil || !bytes.Equal(canonical.Digest(data), declared) {
+		return DesiredPlacement{}, exit.Named(exit.Conflict, "placement_set_identity_mismatch",
+			"PlacementSet bytes do not match %s", digest)
+	}
+	doc, err := canonical.Read(data, &pb.PlacementSet{})
+	if err != nil {
+		return DesiredPlacement{}, exit.Named(exit.Conflict, "placement_set_invalid",
+			"PlacementSet is not its closed canonical /3 document: %s", err)
+	}
+	rows := doc.List("placements")
+	if len(rows) != 1 {
+		return DesiredPlacement{}, exit.Named(exit.Structural, "placement_set_cardinality",
+			"Creator supports exactly one placement, got %d", len(rows))
+	}
+	row := rows[0]
+	placement := DesiredPlacement{
+		Package: pkg, InstallID: installID, PlacementIDValue: row.Str("placement_id"),
+		PackageReleaseID:         row.Sub("package_release").Str("digest"),
+		EnvironmentDigest:        row.Str("environment_digest"),
+		WheelhouseManifestDigest: row.Sub("environment").Sub("wheelhouse_manifest").Str("digest"),
+		PlacementSetDigest:       digest, PlacementSetBytes: append([]byte(nil), data...),
+	}
+	if placement.PackageReleaseID == "" || placement.EnvironmentDigest == "" ||
+		placement.PlacementIDValue == "" {
+		return DesiredPlacement{}, exit.Named(exit.Structural, "placement_set_incomplete",
+			"PlacementSet omits its placement, package release, or environment identity")
+	}
+	if !digestMatches(row["environment"], placement.EnvironmentDigest) {
+		return DesiredPlacement{}, exit.Named(exit.Conflict, "environment_identity_mismatch",
+			"environment_digest does not hash the exact nested Environment")
+	}
+	for _, entrypoint := range row.List("entrypoints") {
+		name, binding := entrypoint.Str("name"), entrypoint.Str("entrypoint_binding_digest")
+		identity := map[string]canonical.Value{"name": entrypoint["name"], "slots": entrypoint["slots"]}
+		if name == "" || binding == "" || !digestMatches(identity, binding) {
+			return DesiredPlacement{}, exit.Named(exit.Conflict, "entrypoint_binding_identity_mismatch",
+				"entrypoint %q has an invalid binding digest", name)
+		}
+		placement.Entrypoints = append(placement.Entrypoints, Entrypoint{
+			Name: name, Digest: binding, Outputs: append([]string(nil), outputs[name]...),
+		})
+	}
+	bindings := map[string]canonical.Value{
+		"entrypoints": row["entrypoints"], "models": row["models"],
+	}
+	if !digestMatches(bindings, row.Str("bindings_digest")) {
+		return DesiredPlacement{}, exit.Named(exit.Conflict, "bindings_identity_mismatch",
+			"bindings_digest does not hash the exact selected entrypoints and models")
+	}
+	return placement, nil
+}
+
+func digestMatches(value canonical.Value, spelled string) bool {
+	data, err := canonical.Write(value)
+	if err != nil {
+		return false
+	}
+	want, err := canonical.Raw(spelled)
+	return err == nil && bytes.Equal(canonical.Digest(data), want)
 }
 
 // WorkerConnection is the dial identity for a worker this daemon did not spawn. The
@@ -221,13 +195,17 @@ type RemoteTarget struct {
 // placement. The caller (cl-010's `start`, or cl-001's live driver) resolves it from the
 // install; the orchestrator itself resolves nothing about Python.
 type WorkerLaunchSpec struct {
-	Python   string       `json:"python"` // the interpreter inside the package's own venv
-	Args     []string     `json:"args"`
-	Dir      string       `json:"dir"`
-	Imposed  []string     `json:"imposed"` // exact env values the launcher imposes, never inherited
-	Devices  []string     `json:"devices"` // the device envelope this process may SEE
-	GraceSec float64      `json:"grace_sec"`
-	Warmup   WarmupPolicy `json:"warmup,omitempty"`
+	Python          string       `json:"python"` // the interpreter inside the package's own venv
+	Args            []string     `json:"args"`
+	Dir             string       `json:"dir"`
+	Imposed         []string     `json:"imposed"` // exact env values the launcher imposes, never inherited
+	Devices         []string     `json:"devices"` // the device envelope this process may SEE
+	GraceSec        float64      `json:"grace_sec"`
+	Warmup          WarmupPolicy `json:"warmup,omitempty"`
+	ArtifactCache   string       `json:"artifact_cache,omitempty"`
+	EnvironmentRoot string       `json:"environment_root,omitempty"`
+	ArtifactStore   string       `json:"artifact_store,omitempty"`
+	BaseManifest    string       `json:"base_manifest,omitempty"`
 	// Placement is what this worker is launched to host. LAUNCH CLAMPS THE SET TO ONE
 	// (worker-protocol header): a longer set is a typed refusal at the worker, so this
 	// side names one placement rather than pretending to a generality it cannot deliver.
@@ -263,19 +241,14 @@ func pinnedPackage(pkg, rental string) string {
 // IsJob answers the worker's mode.
 func (p DesiredPlacement) IsJob() bool { return len(p.Jobs) > 0 }
 
-// RuntimeStagesBindings reports the one local launch mode in which the installed runtime
-// owns every canonical binding-plan byte. A partial set is never a launch mode: older
-// modeled local placements retain their explicit staging path.
-func (p DesiredPlacement) RuntimeStagesBindings() bool {
-	if len(p.Bindings) == 0 {
-		return false
-	}
-	for _, b := range p.Bindings {
-		if b.RuntimePlan == nil {
-			return false
+func (p DesiredPlacement) EntrypointDigest(name string) (string, *exit.Error) {
+	for _, entrypoint := range p.Entrypoints {
+		if entrypoint.Name == name {
+			return entrypoint.Digest, nil
 		}
 	}
-	return true
+	return "", exit.Named(exit.NotFound, "entrypoint_not_selected",
+		"the selected PlacementSet has no entrypoint %q", name)
 }
 
 // IsJob answers the worker's mode, from the one placement it hosts.
@@ -329,10 +302,6 @@ type worker struct {
 	logPath    string
 	home       string
 	planIDs    []string
-	// subjects is each staged binding-plan record as an ArtifactSubject — the exact bytes
-	// a Placement names, sorted by digest. Kept from the staging pass so the placement
-	// document names what was actually written rather than re-deriving it later.
-	subjects []*pb.ArtifactSubject
 	// media is the pod's byte plane, dialled once at connect. Nil for a locally spawned
 	// worker: it shares this host's filesystem, so its grant IS a path and there is
 	// nothing to transport.
@@ -428,13 +397,10 @@ type worker struct {
 	// revision is the desired-state revision THIS owner last issued, with the placement
 	// set it issued. The set travels as bytes, so the owner keeps the bytes it authored:
 	// a worker's accepted digest is compared against these, never re-canonicalized.
-	revision             uint64
-	artifactRevision     uint64
-	delegationID         string
-	authorizationExpires uint64
-	acquisition          PlacementAcquisitionFacts
-	setDigest            []byte
-	setBytes             []byte
+	revision    uint64
+	acquisition PlacementAcquisitionFacts
+	setDigest   []byte
+	setBytes    []byte
 	// The worker's last diagnostic fault and the first report that carried it. The FAILED
 	// axes, not this text, decide terminality: BINDING_DEGRADED may coexist with service.
 	fault      string
@@ -540,12 +506,26 @@ func (c *Orchestrator) EnsureWorker(spec WorkerLaunchSpec) (string, WorkerChange
 			return instanceID, ChangeNone, nil
 		}
 		if live.spec.Connection != nil {
-			return instanceID, ChangeNone, exit.Named(exit.Conflict,
-				"rental.placement_revision_required",
-				"rental %s is claimed with another desired placement",
-				live.spec.Connection.RentalID).
-				WithRemedy("use `cozy rental list %s --package-ref ...`; remote desired state always follows its active grant",
-					live.spec.Connection.RentalID)
+			if spec.Placement.PlacementRevision <= live.spec.Placement.PlacementRevision {
+				return instanceID, ChangeNone, exit.Named(exit.Conflict,
+					"rental.placement_revision_required",
+					"rental %s replacement revision %d does not advance %d",
+					live.spec.Connection.RentalID, spec.Placement.PlacementRevision,
+					live.spec.Placement.PlacementRevision).
+					WithRemedy("register the replacement PlacementSet with Tensorhub before sending it to the worker")
+			}
+			if e := c.ConvergePlacementSet(instanceID, []DesiredPlacement{spec.Placement}); e != nil {
+				return instanceID, ChangeNone, e
+			}
+			c.mu.Lock()
+			live.spec.Placement = spec.Placement
+			live.planIDs = live.planIDs[:0]
+			for _, entrypoint := range spec.Placement.Entrypoints {
+				live.planIDs = append(live.planIDs, entrypoint.Digest)
+			}
+			sort.Strings(live.planIDs)
+			c.mu.Unlock()
+			return instanceID, ChangePlacementAdded, nil
 		}
 		if e := c.ConvergePlacementSet(instanceID, []DesiredPlacement{spec.Placement}); e != nil {
 			return instanceID, ChangeNone, e
@@ -707,17 +687,12 @@ func (c *Orchestrator) DetachRental(id string) bool {
 	}
 }
 
-// hostsPlans answers whether a live worker was launched holding exactly the plans this
-// placement names. It reads what the LAUNCHER staged, not what the worker has got around
-// to advertising: a worker still materializing already holds the placement.
+// hostsPlans answers whether a live worker was launched for exactly the selected
+// entrypoint bindings. The exact PlacementSet remains the authority.
 func hostsPlans(w *worker, p DesiredPlacement) bool {
 	want := map[string]bool{}
-	for _, b := range p.Bindings {
-		id, e := b.PlanID()
-		if e != nil {
-			return false
-		}
-		want[id] = true
+	for _, entrypoint := range p.Entrypoints {
+		want[entrypoint.Digest] = true
 	}
 	for _, j := range p.Jobs {
 		want[j.DescriptorID] = true
@@ -733,9 +708,8 @@ func hostsPlans(w *worker, p DesiredPlacement) bool {
 	return true
 }
 
-// spawnWorker journals the device grant, resolves exact binding subjects, and spawns the
-// worker. It stages older modeled records; weightless canonical bytes are staged by the
-// runtime's explicit launch mode. The grant is journaled BEFORE the process exists: a process that was never
+// spawnWorker journals the device grant and spawns the worker for one exact
+// PlacementSet. The grant is journaled BEFORE the process exists: a process that was never
 // granted an envelope cannot appear, and two concurrent starts cannot both consume one.
 func (c *Orchestrator) spawnWorker(spec WorkerLaunchSpec) (string, *exit.Error) {
 	instanceID := spec.InstanceID()
@@ -744,39 +718,15 @@ func (c *Orchestrator) spawnWorker(spec WorkerLaunchSpec) (string, *exit.Error) 
 	// absence this protocol refuses to manufacture.
 	root := c.opt.Layout.WorkerDir(instanceID)
 	workerHome := filepath.Join(root, "home")
-	if err := os.MkdirAll(filepath.Join(workerHome, "binding-plans"), 0o755); err != nil {
+	if err := os.MkdirAll(workerHome, 0o755); err != nil {
 		return "", exit.Internalf("cannot create the worker home %s: %s", workerHome, err)
 	}
 
 	var planIDs []string
-	var subjects []*pb.ArtifactSubject
-	for _, b := range spec.Placement.Bindings {
-		var id string
-		var subject *pb.ArtifactSubject
-		if b.RuntimePlan != nil {
-			var e *exit.Error
-			subject, e = b.artifactSubject()
-			if e != nil {
-				return "", e
-			}
-			id = subject.SubjectId
-		} else {
-			var data []byte
-			var e *exit.Error
-			id, data, e = b.Staged()
-			if e != nil {
-				return "", e
-			}
-			if _, e := plan.Stage(filepath.Join(workerHome, "binding-plans"), b.Record); e != nil {
-				return "", e
-			}
-			subject = subjectOf(id, data)
-		}
-		planIDs = append(planIDs, id)
-		subjects = append(subjects, subject)
+	for _, entrypoint := range spec.Placement.Entrypoints {
+		planIDs = append(planIDs, entrypoint.Digest)
 	}
-	sort.Strings(planIDs) // the wire field is sorted lexicographic ascending
-	sortSubjects(subjects)
+	sort.Strings(planIDs)
 	if spec.IsJob() {
 		if e := stageJobPlans(workerHome, spec.Placement.Jobs); e != nil {
 			return "", e
@@ -833,6 +783,16 @@ func (c *Orchestrator) spawnWorker(spec WorkerLaunchSpec) (string, *exit.Error) 
 		"--devices", strings.Join(spec.Devices, ","),
 		"--grace", strconv.FormatFloat(graceOr(spec.GraceSec), 'f', -1, 64),
 	)
+	for _, option := range []struct{ flag, value string }{
+		{"--artifact-cache", spec.ArtifactCache},
+		{"--environment-root", spec.EnvironmentRoot},
+		{"--artifact-store", spec.ArtifactStore},
+		{"--base-manifest", spec.BaseManifest},
+	} {
+		if option.value != "" {
+			args = append(args, option.flag, option.value)
+		}
+	}
 	if spec.Warmup.Or() == WarmupNone {
 		args = append(args, "--no-warm")
 	}
@@ -857,7 +817,7 @@ func (c *Orchestrator) spawnWorker(spec WorkerLaunchSpec) (string, *exit.Error) 
 
 	w := newWorker(instanceID, spec)
 	w.cmd, w.logPath, w.home = cmd, logPath, workerHome
-	w.planIDs, w.subjects, w.bootstrap = planIDs, subjects, bootstrap
+	w.planIDs, w.bootstrap = planIDs, bootstrap
 	w.processDone = make(chan struct{})
 	// Registered BEFORE the process can dial: a worker that registers faster than its
 	// launcher can record it would be refused as an instance nobody spawned.
@@ -1022,10 +982,11 @@ func (c *Orchestrator) connectWorker(spec WorkerLaunchSpec) (string, *exit.Error
 	if e := byteplane.Health(); e != nil {
 		return "", e
 	}
-	planIDs, subjects, e := remoteBindingSubjects(spec.Placement)
-	if e != nil {
-		return "", e
+	planIDs := make([]string, 0, len(spec.Placement.Entrypoints))
+	for _, entrypoint := range spec.Placement.Entrypoints {
+		planIDs = append(planIDs, entrypoint.Digest)
 	}
+	sort.Strings(planIDs)
 	// AttachWorker, not SpawnWorker: the device-envelope admission arbitrates THIS host's
 	// cards, and the pod's card is the pod's. There is no grant to journal and none to
 	// release, which is also why nothing here has a pid or a birth identity to record.
@@ -1040,7 +1001,7 @@ func (c *Orchestrator) connectWorker(spec WorkerLaunchSpec) (string, *exit.Error
 	}
 	w := newWorker(instanceID, spec)
 	w.logPath = "(connected worker: its log lives on the pod)"
-	w.planIDs, w.subjects, w.media = planIDs, subjects, byteplane
+	w.planIDs, w.media = planIDs, byteplane
 	c.mu.Lock()
 	c.workers[instanceID] = w
 	c.mu.Unlock()
@@ -1048,47 +1009,6 @@ func (c *Orchestrator) connectWorker(spec WorkerLaunchSpec) (string, *exit.Error
 		instanceID, spec.Connection.Addr, byteplane.Addr(), len(planIDs))
 	go c.attach(w)
 	return instanceID, nil
-}
-
-func remoteBindingSubjects(placement DesiredPlacement) ([]string, []*pb.ArtifactSubject, *exit.Error) {
-	var planIDs []string
-	var subjects []*pb.ArtifactSubject
-	for _, b := range placement.Bindings {
-		if b.RuntimePlan == nil {
-			return nil, nil, exit.Named(exit.Structural, "remote_binding_plan_subject_missing",
-				"remote binding %s carries no exact artifact subject", b.Entrypoint)
-		}
-		subject, e := b.artifactSubject()
-		if e != nil {
-			return nil, nil, e
-		}
-		planIDs = append(planIDs, subject.SubjectId)
-		subjects = append(subjects, subject)
-	}
-	sort.Strings(planIDs)
-	sortSubjects(subjects)
-	return planIDs, subjects, nil
-}
-
-// subjectOf names the exact bytes of one staged binding-plan record, as the
-// `ArtifactSubject` a Placement carries. The subject_id is the plan id (a `sha256:`
-// document identity) and the digest is over the record as it lands on the worker's disk:
-// the id fences MEANING, the digest fences the BYTES, and they are deliberately not the
-// same number.
-func subjectOf(planID string, data []byte) *pb.ArtifactSubject {
-	return &pb.ArtifactSubject{
-		Digest:    canonical.Digest(data),
-		SubjectId: planID,
-		Kind:      "plan",
-		Length:    uint64(len(data)),
-	}
-}
-
-// sortSubjects puts the list in the order the wire declares — by digest, ascending.
-func sortSubjects(subjects []*pb.ArtifactSubject) {
-	sort.Slice(subjects, func(i, j int) bool {
-		return bytes.Compare(subjects[i].Digest, subjects[j].Digest) < 0
-	})
 }
 
 func graceOr(v float64) float64 {
@@ -1281,9 +1201,6 @@ type WorkerFacts struct {
 	AcceptedRevision           uint64                    `json:"accepted_desired_state_revision"`
 	ConvergedRevision          uint64                    `json:"converged_revision"`
 	AcceptedPlacementSetDigest string                    `json:"accepted_placement_set_digest"`
-	ArtifactRevision           uint64                    `json:"artifact_revision"`
-	DelegationID               string                    `json:"artifact_delegation_id"`
-	AuthorizationExpiresAtUnix uint64                    `json:"artifact_authorization_expires_at_unix"`
 	Acquisition                PlacementAcquisitionFacts `json:"acquisition"`
 
 	// QuietMS makes missed protocol reports visible. ErrorForMS is diagnostic history
@@ -1339,13 +1256,10 @@ func factsOf(w *worker) WorkerFacts {
 		AvailableSlots:      w.slots,
 		UnackedOutcomes:     w.unacked,
 
-		DesiredRevision:            w.revision,
-		AcceptedRevision:           w.acceptedRevision,
-		ConvergedRevision:          w.convergedRevision,
-		ArtifactRevision:           w.artifactRevision,
-		DelegationID:               w.delegationID,
-		AuthorizationExpiresAtUnix: w.authorizationExpires,
-		Acquisition:                w.acquisition,
+		DesiredRevision:   w.revision,
+		AcceptedRevision:  w.acceptedRevision,
+		ConvergedRevision: w.convergedRevision,
+		Acquisition:       w.acquisition,
 
 		Fault: w.fault,
 	}

@@ -3,14 +3,16 @@ package cli
 import (
 	"context"
 	"os"
-	"path"
 	"path/filepath"
+	"runtime"
+	"strconv"
 	"strings"
 	"sync"
 
 	pep440 "github.com/aquasecurity/go-pep440-version"
 	"github.com/cozy-creator/cozy/internal/exit"
 	"github.com/cozy-creator/cozy/internal/home"
+	"github.com/cozy-creator/cozy/internal/hostgpu"
 	"github.com/cozy-creator/cozy/internal/hub"
 	"github.com/cozy-creator/cozy/internal/install"
 	"github.com/cozy-creator/cozy/internal/transfer"
@@ -39,7 +41,11 @@ func handleRegistryInstall(ctx *Context) *exit.Error {
 			return problem
 		}
 	}
-	plan, problem := c.PackageInstallPlan(hctx, ref, release)
+	target, problem := localPackageInstallTarget(ctx)
+	if problem != nil {
+		return problem
+	}
+	plan, problem := c.PackageInstallPlan(hctx, ref, release, target)
 	if problem != nil {
 		return problem
 	}
@@ -52,7 +58,8 @@ func handleRegistryInstall(ctx *Context) *exit.Error {
 		existing.Close()
 		return problem
 	}
-	if generation != nil && generation.SourceDigest == plan.SourceTreeDigest {
+	if generation != nil && generation.SourceDigest == plan.PackageRelease.Digest &&
+		generation.PlacementSetDigest == plan.PlacementSet.Digest {
 		defer existing.Close()
 		return emitInstallResult(ctx, existing, &install.Result{Gen: *generation, Idempotent: true})
 	}
@@ -94,6 +101,48 @@ func handleRegistryInstall(ctx *Context) *exit.Error {
 	return emitInstallResult(ctx, st, result)
 }
 
+func localPackageInstallTarget(ctx *Context) (hub.PackageInstallTarget, *exit.Error) {
+	target := hub.PackageInstallTarget{
+		Accelerator: "cpu", OS: runtime.GOOS, Arch: packageInstallArchitecture(runtime.GOARCH),
+	}
+	inventory := hostgpu.Probe(ctx.Cfg)
+	if len(inventory.GPUs) == 0 {
+		return target, nil
+	}
+	gpu := inventory.GPUs[0]
+	for _, candidate := range inventory.GPUs[1:] {
+		if gpuCapability(candidate) > gpuCapability(gpu) ||
+			gpuCapability(candidate) == gpuCapability(gpu) && candidate.Index < gpu.Index {
+			gpu = candidate
+		}
+	}
+	if gpu.DriverCUDAVersion == "" {
+		return target, exit.Named(exit.Unavailable, "local_gpu.compatibility_unknown",
+			"the local NVIDIA driver did not report its CUDA compatibility").
+			WithRemedy("check that `nvidia-smi` runs successfully, then retry the install")
+	}
+	target.Accelerator = "nvidia"
+	target.DriverCUDA = gpu.DriverCUDAVersion
+	target.ComputeCapability = gpu.ComputeCapability
+	return target, nil
+}
+
+func packageInstallArchitecture(arch string) string {
+	switch arch {
+	case "amd64":
+		return "x86"
+	case "arm64":
+		return "aarch64"
+	default:
+		return arch
+	}
+}
+
+func gpuCapability(gpu hostgpu.GPU) int {
+	value, _ := strconv.Atoi(strings.TrimPrefix(gpu.SM, "sm_"))
+	return value
+}
+
 func latestPackageRelease(releases []hub.ReleaseSummary) (string, *exit.Error) {
 	var chosen pep440.Version
 	name := ""
@@ -127,14 +176,18 @@ func registryPackageRef(value, release string) (hub.Ref, string, *exit.Error) {
 func downloadPackageInstallPlan(ctx context.Context, cli *Context, scratch string, ref hub.Ref,
 	release string, plan hub.PackageInstallPlan,
 ) (*install.PublishedSource, *exit.Error) {
-	if plan.Package != ref.String() || plan.Release != release ||
-		!strings.HasPrefix(plan.SourceTreeDigest, "sha256:") || len(plan.SourceTreeDigest) != 71 ||
-		len(plan.Downloads) == 0 || len(plan.Downloads) > 20_033 {
+	if plan.Profile == "" || len(plan.Downloads) == 0 || len(plan.Downloads) > 20_033 {
 		return nil, exit.Internalf("Tensorhub returned an invalid package install plan")
 	}
 	published := &install.PublishedSource{
-		Package: plan.Package, Release: plan.Release, SourceDigest: plan.SourceTreeDigest,
-		SourceDir: filepath.Join(scratch, "source"),
+		Package: ref.String(), Release: release, SourceDigest: plan.PackageRelease.Digest,
+		Selection: install.Selection{
+			Profile:           plan.Profile,
+			PlacementSet:      install.ExactDocument{Bytes: plan.PlacementSet.CanonicalBytes, Digest: plan.PlacementSet.Digest, Length: plan.PlacementSet.Length},
+			PackageRelease:    install.ExactDocument{Bytes: plan.PackageRelease.CanonicalBytes, Digest: plan.PackageRelease.Digest, Length: plan.PackageRelease.Length},
+			PackageDescriptor: install.ExactDocument{Bytes: plan.PackageDescriptor.CanonicalBytes, Digest: plan.PackageDescriptor.Digest, Length: plan.PackageDescriptor.Length},
+			Qualification:     install.ExactDocument{Bytes: plan.Qualification.CanonicalBytes, Digest: plan.Qualification.Digest, Length: plan.Qualification.Length},
+		},
 	}
 	seen := map[string]bool{}
 	type job struct {
@@ -145,15 +198,6 @@ func downloadPackageInstallPlan(ctx context.Context, cli *Context, scratch strin
 	for _, download := range plan.Downloads {
 		var dst string
 		switch download.Kind {
-		case "source":
-			clean := path.Clean(download.Path)
-			if clean != download.Path || clean == "." || strings.HasPrefix(clean, "../") ||
-				strings.HasPrefix(clean, "/") || strings.Contains(clean, `\`) {
-				return nil, exit.Internalf("Tensorhub returned unsafe package source path %q", download.Path)
-			}
-			dst = filepath.Join(published.SourceDir, filepath.FromSlash(clean))
-			published.Files++
-			published.Bytes += download.Length
 		case "project_wheel", "dependency_wheel":
 			if filepath.Base(download.Path) != download.Path || !strings.HasSuffix(download.Path, ".whl") {
 				return nil, exit.Internalf("Tensorhub returned unsafe package wheel path %q", download.Path)
@@ -179,12 +223,6 @@ func downloadPackageInstallPlan(ctx context.Context, cli *Context, scratch strin
 	if published.ProjectWheel == "" {
 		return nil, exit.Internalf("Tensorhub package install plan has no project wheel")
 	}
-	for _, required := range []string{"package.toml", "pyproject.toml", "uv.lock"} {
-		if !seen[filepath.Join(published.SourceDir, required)] {
-			return nil, exit.Internalf("Tensorhub package install plan has no %s", required)
-		}
-	}
-
 	queue := make(chan job, len(jobs))
 	results := make(chan *exit.Error, len(jobs))
 	for _, item := range jobs {

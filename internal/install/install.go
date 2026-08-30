@@ -6,6 +6,7 @@
 package install
 
 import (
+	"bytes"
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
@@ -16,11 +17,13 @@ import (
 	"strings"
 	"time"
 
+	"github.com/cozy-creator/cozy/internal/canonical"
 	"github.com/cozy-creator/cozy/internal/config"
 	"github.com/cozy-creator/cozy/internal/exit"
 	"github.com/cozy-creator/cozy/internal/home"
 	"github.com/cozy-creator/cozy/internal/launch"
 	"github.com/cozy-creator/cozy/internal/records"
+	pb "github.com/cozy-creator/cozy/protocol/cozy/worker/v1"
 )
 
 type Request struct {
@@ -42,6 +45,79 @@ type PublishedSource struct {
 	SourceDigest string
 	SourceDir    string
 	Wheels       []string
+	Selection    Selection
+}
+
+type ExactDocument struct {
+	Bytes  []byte
+	Digest string
+	Length int64
+}
+
+type Selection struct {
+	Profile           string
+	PlacementSet      ExactDocument
+	PackageRelease    ExactDocument
+	PackageDescriptor ExactDocument
+	Qualification     ExactDocument
+}
+
+func persistSelection(genDir string, gen *records.PackageInstall, selection Selection) *exit.Error {
+	if selection.Profile == "" {
+		return exit.Named(exit.Structural, "package_selection_missing",
+			"published install has no selected compatibility profile")
+	}
+	documents := []struct {
+		name   string
+		format string
+		exact  ExactDocument
+	}{
+		{"placement_set", "cozy.worker.v1.PlacementSet/3", selection.PlacementSet},
+		{"package_release", "cozy.package.release/1", selection.PackageRelease},
+		{"package_descriptor", "cozy.package.descriptor/1", selection.PackageDescriptor},
+		{"qualification", "cozy.runtime.Qualification/1", selection.Qualification},
+	}
+	cache := filepath.Join(genDir, "artifact-cache")
+	if err := os.MkdirAll(cache, 0o700); err != nil {
+		return exit.Internalf("cannot create the package artifact cache: %s", err)
+	}
+	for _, document := range documents {
+		digest, err := canonical.Raw(document.exact.Digest)
+		if err != nil || document.exact.Length != int64(len(document.exact.Bytes)) ||
+			!bytes.Equal(canonical.Digest(document.exact.Bytes), digest) {
+			return exit.Named(exit.Conflict, "package_selection_identity_mismatch",
+				"selected %s bytes do not match their digest and length", document.name)
+		}
+		object, err := canonical.ReadObject(document.exact.Bytes)
+		if err != nil || object.Str("format") != document.format {
+			return exit.Named(exit.Conflict, "package_selection_document_invalid",
+				"selected %s is not exact canonical %s bytes", document.name, document.format)
+		}
+		path := filepath.Join(cache, strings.TrimPrefix(document.exact.Digest, "sha256:"))
+		if err := os.WriteFile(path, document.exact.Bytes, 0o600); err != nil {
+			return exit.Internalf("cannot persist selected %s: %s", document.name, err)
+		}
+	}
+	set, err := canonical.Read(selection.PlacementSet.Bytes, &pb.PlacementSet{})
+	if err != nil || len(set.List("placements")) != 1 {
+		return exit.Named(exit.Conflict, "package_selection_placement_invalid",
+			"selected PlacementSet must carry exactly one placement")
+	}
+	placement := set.List("placements")[0]
+	for name, exact := range map[string]ExactDocument{
+		"package_release":    selection.PackageRelease,
+		"package_descriptor": selection.PackageDescriptor,
+		"qualification":      selection.Qualification,
+	} {
+		ref := placement.Sub(name)
+		if ref.Str("digest") != exact.Digest || ref.Int("length") != exact.Length {
+			return exit.Named(exit.Conflict, "package_selection_reference_mismatch",
+				"PlacementSet %s reference does not name the carried exact bytes", name)
+		}
+	}
+	gen.PlacementSetDigest = selection.PlacementSet.Digest
+	gen.SelectionProfile = selection.Profile
+	return nil
 }
 
 type Timing struct {
@@ -101,18 +177,18 @@ func Run(l home.Layout, st *records.Store, req Request) (*Result, *exit.Error) {
 	switch {
 	case req.Published != nil:
 		if req.Published.Package == "" || req.Published.Release == "" || req.Published.SourceDigest == "" ||
-			req.Published.SourceDir == "" || req.Published.ProjectWheel == "" {
+			req.Published.ProjectWheel == "" {
 			return fail(exit.Internalf("published package source is incomplete"))
 		}
-		sourceDir = filepath.Join(genDir, "source")
+		sourceDir = genDir
 		if err := os.MkdirAll(genDir, 0o700); err != nil {
 			return fail(exit.Internalf("cannot create package generation: %s", err))
 		}
-		if err := os.Rename(req.Published.SourceDir, sourceDir); err != nil {
-			return fail(exit.Internalf("cannot adopt downloaded package source: %s", err))
-		}
 		gen.SourceKind, gen.SourceRef, gen.SourceDigest = "tensorhub", req.Published.Package+"@"+req.Published.Release, req.Published.SourceDigest
-		gen.Package, gen.Version = req.Published.Package, req.Published.Release
+		gen.Package, gen.Version, gen.ProjectDir = req.Published.Package, req.Published.Release, genDir
+		if e := persistSelection(genDir, &gen, req.Published.Selection); e != nil {
+			return fail(e)
+		}
 		res.Files, res.Bytes = req.Published.Files, req.Published.Bytes
 	case req.Archive != "":
 		staged, err := StageArchive(req.Archive, filepath.Join(genDir, "source"))
@@ -204,8 +280,14 @@ func Run(l home.Layout, st *records.Store, req Request) (*Result, *exit.Error) {
 	res.Warnings = append(res.Warnings, env.Warnings...)
 	mark("venv")
 
-	// ---- descriptor: the release's own Runtime derives a private generation document ----
-	descriptor, e := deriveDescriptor(venvDir, sourceDir)
+	// ---- descriptor: published installs consume the exact qualified descriptor;
+	// development installs still derive their local, non-runnable surface.
+	var descriptor *launch.PackageDescriptor
+	if req.Published != nil {
+		descriptor, e = launch.DecodeDescriptor(req.Published.Selection.PackageDescriptor.Bytes)
+	} else {
+		descriptor, e = deriveDescriptor(venvDir, sourceDir)
+	}
 	if e != nil {
 		return guard(e)
 	}
@@ -217,6 +299,11 @@ func Run(l home.Layout, st *records.Store, req Request) (*Result, *exit.Error) {
 		return guard(exit.Internalf("cannot store private descriptor: %s", err))
 	}
 	gen.PackageDescriptor = descriptor.Digest
+	if req.Published != nil && descriptor.Digest != req.Published.Selection.PackageDescriptor.Digest {
+		return guard(exit.Named(exit.Conflict, "descriptor_identity_mismatch",
+			"the installed package derived descriptor %s, selected release requires %s",
+			descriptor.Digest, req.Published.Selection.PackageDescriptor.Digest))
+	}
 	mark("package_descriptor")
 
 	// Disk is measured once, here, and read back from the record forever after.

@@ -1,5 +1,7 @@
 package cli
 
+import "strings"
+
 // CLI is the complete public command grammar. Kong derives parsing and help from
 // this tree; there is no parallel command manifest or string handler registry.
 type CLI struct {
@@ -200,21 +202,36 @@ func (c *InvokeListCmd) Run(r *Runtime) error {
 }
 
 type RentalCmd struct {
-	New  RentalNewCmd  `cmd:"" help:"Start a private rental."`
-	End  RentalEndCmd  `cmd:"" help:"End a private rental and stop billing."`
-	List RentalListCmd `cmd:"" help:"List private rentals."`
+	New    RentalNewCmd    `cmd:"" help:"Start a private rental."`
+	Update RentalUpdateCmd `cmd:"" help:"Replace a rental's exact package and model selection."`
+	End    RentalEndCmd    `cmd:"" help:"End a private rental and stop billing."`
+	List   RentalListCmd   `cmd:"" help:"List private rentals."`
+}
+
+type RentalUpdateCmd struct {
+	ID             string   `arg:"" name:"rental"`
+	Package        string   `arg:"" name:"package"`
+	Models         []string `name:"model" help:"Model selection id=org/name@release#lane."`
+	IdempotencyKey string   `help:"Stable placement-update identity." required:""`
+}
+
+func (c *RentalUpdateCmd) Run(r *Runtime) error {
+	return r.call(handleRentalUpdate, []string{c.ID, c.Package}, nil, values(
+		"--models", strings.Join(c.Models, ","), "--idempotency-key", c.IdempotencyKey), true)
 }
 
 type RentalNewCmd struct {
-	SKU            string `arg:"" optional:"" name:"gpu" help:"Cozy GPU SKU, such as h200."`
-	Package        string `arg:"" optional:"" name:"package" help:"Exact package ref."`
-	IdempotencyKey string `help:"Stable paid-operation identity."`
-	Timeout        string `help:"Caller wait deadline; does not release the rental."`
+	SKU            string   `arg:"" optional:"" name:"gpu" help:"Cozy GPU SKU, such as h200."`
+	Package        string   `arg:"" optional:"" name:"package" help:"Exact package ref."`
+	IdempotencyKey string   `help:"Stable paid-operation identity."`
+	Timeout        string   `help:"Caller wait deadline; does not release the rental."`
+	Models         []string `name:"model" help:"Model selection id=org/name@release#lane."`
 }
 
 func (c *RentalNewCmd) Run(r *Runtime) error {
 	return r.call(handleRent, []string{c.SKU, c.Package}, nil, values(
-		"--idempotency-key", c.IdempotencyKey, "--timeout", c.Timeout), false)
+		"--idempotency-key", c.IdempotencyKey, "--timeout", c.Timeout,
+		"--models", strings.Join(c.Models, ",")), false)
 }
 
 type RentalEndCmd struct {

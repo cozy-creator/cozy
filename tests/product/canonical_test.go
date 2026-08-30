@@ -85,16 +85,10 @@ func TestCanonicalDocuments(t *testing.T) {
 		code string
 		msg  proto.Message
 	}{
-		"twin_duplicate_key":                        {"duplicate_key", &pb.InvocationSpec{}},
-		"twin_float":                                {"non_integer_number", &pb.InvocationSpec{}},
-		"twin_unknown_key":                          {"unknown_field", &pb.InvocationSpec{}},
-		"twin_whitespace":                           {"noncanonical_encoding", &pb.InvocationSpec{}},
-		"twin_libc_unspelled":                       {"libc_unspelled", &pb.PackageEnvironmentSpec{}},
-		"twin_model_object_set_missing":             {"model_object_set_missing", &pb.PlacementSet{}},
-		"twin_model_object_set_wrong_kind":          {"model_object_set_shape", &pb.PlacementSet{}},
-		"twin_model_object_set_zero_length":         {"model_object_set_shape", &pb.PlacementSet{}},
-		"twin_artifact_delegation_checkpoint_alias": {"unknown_field", &pb.ArtifactDelegation{}},
-		"twin_artifact_delegation_v1":               {"unknown_format", &pb.ArtifactDelegation{}},
+		"twin_duplicate_key": {"duplicate_key", &pb.InvocationSpec{}},
+		"twin_float":         {"non_integer_number", &pb.InvocationSpec{}},
+		"twin_unknown_key":   {"unknown_field", &pb.InvocationSpec{}},
+		"twin_whitespace":    {"noncanonical_encoding", &pb.InvocationSpec{}},
 	} {
 		body, err := os.ReadFile(filepath.Join(fixtureDir, "red", name+".json"))
 		must(t, err)
@@ -136,14 +130,10 @@ func messageFor(name string) proto.Message {
 		return &pb.AttemptOutcomeBody{}
 	case "cozy.worker.v1.ArtifactReceipt":
 		return &pb.ArtifactReceipt{}
-	case "cozy.worker.v1.ArtifactDelegation":
-		return &pb.ArtifactDelegation{}
 	case "cozy.worker.v1.ClaimProof":
 		return &pb.ClaimProof{}
 	case "cozy.worker.v1.PlacementSet":
 		return &pb.PlacementSet{}
-	case "cozy.worker.v1.PackageEnvironmentSpec":
-		return &pb.PackageEnvironmentSpec{}
 	case "cozy.worker.v1.WorkerSnapshotBody":
 		return &pb.WorkerSnapshotBody{}
 	}
@@ -156,7 +146,7 @@ func messageFor(name string) proto.Message {
 // `testdata/canonical/es6-numbers.txt` is Runtime's own oracle, pinned by digest.
 func TestPlacementSetNestedSpecHardcut(t *testing.T) {
 	_, err := canonical.Read([]byte(`{"format":"cozy.worker.v1.PlacementSet/2","placements":[{"spec":{}}]}`), &pb.PlacementSet{})
-	if canonical.Code(err) != "placement_nested_spec_retired" {
+	if canonical.Code(err) != "unknown_format" {
 		t.Fatalf("nested PlacementSet spec refusal = %v", err)
 	}
 }

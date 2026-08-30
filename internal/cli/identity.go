@@ -1,24 +1,15 @@
 package cli
 
 import (
-	"runtime"
 	"runtime/debug"
 
 	"github.com/cozy-creator/cozy/internal/canonical"
 	"github.com/cozy-creator/cozy/internal/config"
 )
 
-// localInvocationIdentity mints the two per-daemon identity digests every LOCAL
-// InvocationSpec rides (cl-022's guard): the execution environment's and the evaluated
-// configuration's. They used to be the orchestrator Options' empty strings, so every
-// local InvocationSpec froze `environment_spec_digest: ""` — an UNDER-SPECIFIED identity
-// persisted forever under the request's digest.
-//
-// These are digest preimages, not stored documents. A closed `kind` value separates the
-// two meanings without inventing two versioned file formats. They are frozen per daemon
-// run, never per request — a request cannot choose the environment it runs under — and
-// the config's one secret enters as its DIGEST, never raw.
-func localInvocationIdentity(cfg config.Config) (environmentSpec, configDigest string) {
+// localConfigDigest freezes the evaluated local config used by InvocationSpec.
+// Environment identity comes from the exact Hub-selected PlacementSet.
+func localConfigDigest(cfg config.Config) string {
 	build := "unknown"
 	if info, ok := debug.ReadBuildInfo(); ok {
 		if info.Main.Version != "" && info.Main.Version != "(devel)" {
@@ -30,13 +21,7 @@ func localInvocationIdentity(cfg config.Config) (environmentSpec, configDigest s
 			}
 		}
 	}
-	environmentSpec = spellOf(map[string]canonical.Value{
-		"kind":          "execution_environment",
-		"os":            runtime.GOOS,
-		"arch":          runtime.GOARCH,
-		"service_build": build,
-	})
-	configDigest = spellOf(map[string]canonical.Value{
+	return spellOf(map[string]canonical.Value{
 		"kind":             "evaluated_config",
 		"home":             cfg.Home,
 		"port":             int64(cfg.Port),
@@ -49,8 +34,8 @@ func localInvocationIdentity(cfg config.Config) (environmentSpec, configDigest s
 		// Its provenance is the config fact frozen into the child environment.
 		"tfs_source":                    cfg.TfsSource,
 		"local_rate_micro_usd_per_hour": cfg.LocalRateMicroUSDPerHour,
+		"service_build":                 build,
 	})
-	return environmentSpec, configDigest
 }
 
 func spellOf(doc map[string]canonical.Value) string {

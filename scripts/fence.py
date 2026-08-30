@@ -524,17 +524,18 @@ def check_manifest():
     if not src_path.exists():
         return ["[grammar] missing internal/cli/grammar.go"]
     source = src_path.read_text()
+    fields = re.sub(r"\s+", " ", source)
     required = (
-        "Package PackageCmd", "Model   ModelCmd", "Invoke  InvokeCmd", "Rental  RentalCmd",
-        "Up      UpCmd", "Down    DownCmd", "Unload  UnloadCmd",
-        "Search  PackageSearchCmd", "Install PackageInstallCmd", "Remove  PackageRemoveCmd",
-        "List    PackageListCmd", "Publish PackagePublishCmd",
-        "Search   ModelSearchCmd", "Download ModelDownloadCmd", "Remove   ModelRemoveCmd",
-        "List     ModelListCmd", "Publish  ModelPublishCmd",
-        "Run    InvokeRunCmd", "Cancel InvokeCancelCmd", "List   InvokeListCmd",
-        "New  RentalNewCmd", "End  RentalEndCmd", "List RentalListCmd",
+        "Package PackageCmd", "Model ModelCmd", "Invoke InvokeCmd", "Rental RentalCmd",
+        "Up UpCmd", "Down DownCmd", "Unload UnloadCmd",
+        "Search PackageSearchCmd", "Install PackageInstallCmd", "Remove PackageRemoveCmd",
+        "List PackageListCmd", "Publish PackagePublishCmd",
+        "Search ModelSearchCmd", "Download ModelDownloadCmd", "Remove ModelRemoveCmd",
+        "List ModelListCmd", "Publish ModelPublishCmd",
+        "Run InvokeRunCmd", "Cancel InvokeCancelCmd", "List InvokeListCmd",
+        "New RentalNewCmd", "Update RentalUpdateCmd", "End RentalEndCmd", "List RentalListCmd",
     )
-    bad = [f"[grammar] missing Kong command field {item!r}" for item in required if item not in source]
+    bad = [f"[grammar] missing Kong command field {item!r}" for item in required if item not in fields]
     for retired in ("StackCmd", "ExitCmd", "WorkflowCmd", "VideoCmd", "JobCmd", "CommandsCmd", "StatusCmd"):
         if retired in source:
             bad.append(f"[grammar] retired command family remains: {retired}")

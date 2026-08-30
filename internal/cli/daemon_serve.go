@@ -106,15 +106,14 @@ func serveDaemon(ctx *Context) *exit.Error {
 
 	// The two per-daemon identity digests every local InvocationSpec rides (cl-022's
 	// guard): left unset, dispatch froze empty strings into every persisted invocation.
-	environmentSpec, configDigest := localInvocationIdentity(ctx.Cfg)
+	configDigest := localConfigDigest(ctx.Cfg)
 	c, e := orchestrator.Open(orchestrator.Options{
 		Cfg: ctx.Cfg, Layout: l, Store: st, Yield: yield, Log: ctx.Out,
 		Packages: resolver, Rentals: rentals, ObserveRental: rental.ObserveWorker(st),
-		RecordRentalRefusal:   rental.RecordControlRefusal(st),
-		RentalClaimProof:      rental.ClaimProof(l),
-		ArtifactDelegations:   rental.ArtifactDelegations(l, st),
-		RelayRentalSession:    rental.RelayWorkerSession(st, client(ctx)),
-		EnvironmentSpecDigest: environmentSpec, ConfigDigest: configDigest,
+		RecordRentalRefusal: rental.RecordControlRefusal(st),
+		RentalClaimProof:    rental.ClaimProof(l),
+		RelayRentalSession:  rental.RelayWorkerSession(st, client(ctx)),
+		ConfigDigest:        configDigest,
 	})
 	if e != nil {
 		closeListeners()
