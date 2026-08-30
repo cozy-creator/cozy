@@ -169,7 +169,7 @@ func helpArgs(args []string) []string {
 	}
 	if len(args) == 1 {
 		switch args[0] {
-		case "package", "model", "invoke", "rental":
+		case "package", "model", "run":
 			return []string{args[0], "--help"}
 		}
 	}
@@ -187,7 +187,7 @@ func helpFor(ctx *kong.Context, args []string) string {
 	if ctx == nil || strings.TrimSpace(ctx.Command()) == "" {
 		if len(args) > 0 {
 			switch args[0] {
-			case "package", "model", "auth", "invoke", "rental":
+			case "package", "model", "auth", "run", "rental":
 				return "cozy help " + args[0]
 			}
 		}

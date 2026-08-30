@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"os/signal"
 	"sort"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -19,13 +20,14 @@ import (
 	"github.com/cozy-creator/cozy/internal/output"
 	"github.com/cozy-creator/cozy/internal/records"
 	"github.com/cozy-creator/cozy/internal/rental"
+	"github.com/cozy-creator/cozy/internal/rentalid"
 	"github.com/cozy-creator/cozy/internal/secret"
 )
 
 // The rental verbs (cl-015). `cozy rental new` MINTS the pod's access token, asks the hub for a
 // pod while presenting only that token's sha256, watches it provision, and PINS the
 // triple — the address, the certificate to trust, and the token it minted — so that
-// `cozy invoke run --worker <id>` can dial a worker this host never spawned.
+// `cozy run --machine <name>` can dial a worker this host never spawned.
 //
 // THE MINT IS THE POINT (#495e). The token is generated here, from this host's own
 // entropy, and what crosses to the hub is a hash. The hub provisions the pod with that
@@ -74,6 +76,11 @@ func handleRent(ctx *Context) *exit.Error {
 		return exit.Usagef("`cozy rental new %s` also needs the exact package to run", skuName).
 			WithRemedy("append org/package/vN/function").
 			WithNext("cozy rental new " + skuName + " <org/package/vN/function>")
+	}
+	machineName := strings.TrimSpace(ctx.Inv.Value("--name"))
+	if machineName != "" && !rentalid.ValidMachineName(machineName) {
+		return exit.Usagef("--name %q is not a machine name", machineName).
+			WithRemedy("use 1-32 lowercase letters, numbers, and hyphens; local is reserved")
 	}
 	reason := "cozy rental new " + skuName + " for " + packageRef
 	c := client(ctx)
@@ -191,7 +198,10 @@ func handleRent(ctx *Context) *exit.Error {
 	if e := st.AdvanceRentalOperation(operationKey, r.ID, r.State); e != nil {
 		return e
 	}
-	row := records.Rental{ID: r.ID, PackageRef: packageRef,
+	if machineName == "" {
+		machineName = rentalid.MachineName(r.ID)
+	}
+	row := records.Rental{ID: r.ID, MachineName: machineName, SKU: skuName, PackageRef: packageRef,
 		AcceleratorModel: r.AcceleratorModel, State: r.State, Hub: c.Base()}
 	if existing != nil && existing.State == "attached" {
 		stored, problem := st.RentalRow(r.ID)
@@ -309,6 +319,7 @@ func handleRent(ctx *Context) *exit.Error {
 		notes = append(notes, "the existing rental operation resumed")
 	}
 	fields := []output.Field{
+		{K: "machine", V: row.MachineName},
 		{K: "rental", V: ready.ID},
 		{K: "state", V: ready.State},
 		{K: "address", V: ready.Address},
@@ -318,11 +329,11 @@ func handleRent(ctx *Context) *exit.Error {
 		{K: "accelerator", V: ready.AcceleratorModel},
 		{K: "changed", V: !replay}, {K: "operation", V: operationKey}, {K: "replayed", V: replay},
 	}
-	rec := compactRecord(fields, "rental", "state", "gpu", "package", "changed")
+	rec := compactRecord(fields, "machine", "state", "gpu", "package", "changed")
 	rec.Notes = notes
 	rec.Next = []string{
-		"cozy invoke run <org/package/function> --worker " + ready.ID,
-		"cozy rental end " + ready.ID,
+		"cozy run <org/package/function> --machine " + row.MachineName,
+		"cozy rental end " + row.MachineName,
 	}
 	return emit(ctx, rec)
 }
@@ -345,7 +356,21 @@ func parseModelSelections(value string) ([]hub.ModelSelection, *exit.Error) {
 }
 
 func handleRentalUpdate(ctx *Context) *exit.Error {
-	id, packageRef := strings.TrimSpace(ctx.Inv.Args[0]), strings.TrimSpace(ctx.Inv.Args[1])
+	subject, packageRef := strings.TrimSpace(ctx.Inv.Args[0]), strings.TrimSpace(ctx.Inv.Args[1])
+	_, store, problem := rentalStores(ctx)
+	if problem != nil {
+		return problem
+	}
+	defer store.Close()
+	row, problem := store.RentalByMachine(subject)
+	if problem != nil {
+		return problem
+	}
+	if row == nil {
+		return exit.New(exit.NotFound, "no rented machine %q on this host", subject).
+			WithNext("cozy rental")
+	}
+	id := row.ID
 	models, problem := parseModelSelections(ctx.Inv.Value("--models"))
 	if problem != nil {
 		return problem
@@ -357,19 +382,6 @@ func handleRentalUpdate(ctx *Context) *exit.Error {
 	operationKey := strings.TrimSpace(ctx.Inv.Value("--idempotency-key"))
 	if operationKey == "" {
 		return exit.Usagef("cozy rental update requires --idempotency-key")
-	}
-	l, st, problem := rentalStores(ctx)
-	if problem != nil {
-		return problem
-	}
-	defer st.Close()
-	_ = l
-	row, problem := st.RentalRow(id)
-	if problem != nil {
-		return problem
-	}
-	if row == nil {
-		return exit.New(exit.NotFound, "no rental %s on this host", id)
 	}
 	hctx, cancel := hub.LongContext()
 	answer, problem := client(ctx).ReplaceRentalPlacement(hctx, id, body, operationKey)
@@ -391,7 +403,7 @@ func handleRentalUpdate(ctx *Context) *exit.Error {
 	if problem := rental.ValidateSelection(next); problem != nil {
 		return problem
 	}
-	if problem := st.ReplaceRentalSelection(next); problem != nil {
+	if problem := store.ReplaceRentalSelection(next); problem != nil {
 		return problem
 	}
 	ctx.Daemon = daemon.Probe(ctx.Cfg)
@@ -420,16 +432,24 @@ func emitRentalCatalog(ctx *Context, skus []hub.RentalSKU) *exit.Error {
 	for _, sku := range skus {
 		rows = append(rows, map[string]string{
 			"name": sku.Name, "model": sku.AcceleratorModel,
-			"vram":  fmt.Sprintf("%d GB", sku.VRAMGB),
-			"price": rentalPrice(sku.PriceUSDMicrosPerHour),
+			"compute": computeCapabilityText(sku.ComputeCapability),
+			"vram":    fmt.Sprintf("%d GB", sku.VRAMGB),
+			"price":   rentalPrice(sku.PriceUSDMicrosPerHour),
 		})
 	}
 	doc := output.List{
-		Name: "gpus", Fields: []string{"name", "model", "vram", "price"},
+		Name: "gpus", Fields: []string{"name", "model", "compute", "vram", "price"},
 		Rows: rows, Total: len(rows),
 		Next: []string{"cozy rental new <gpu-name> <org/package/vN/function>"},
 	}
 	return emit(ctx, doc)
+}
+
+func computeCapabilityText(value string) string {
+	if value == "" {
+		return "unknown"
+	}
+	return "sm_" + strings.ReplaceAll(value, ".", "")
 }
 
 func rentalPrice(micros int64) string {
@@ -695,37 +715,83 @@ func handleRentLs(ctx *Context) *exit.Error {
 	}
 	list := output.List{
 		Name:      "rentals",
-		Fields:    []string{"rental", "state", "package", "accelerator"},
-		AllFields: []string{"rental", "state", "package", "accelerator", "address", "media", "hub", "rented"},
+		Fields:    []string{"machine", "sku", "state", "uptime", "queued", "running", "runtime"},
+		AllFields: []string{"machine", "sku", "state", "uptime", "queued", "running", "runtime", "utilization", "rental", "package", "accelerator", "address", "media", "hub", "rented"},
 		Next:      []string{"cozy help rental new"},
 	}
 	for _, r := range rows {
+		queued, running, problem := st.RentalRunCounts(r.ID)
+		if problem != nil {
+			return problem
+		}
 		list.Rows = append(list.Rows, map[string]string{
-			"rental": r.ID, "state": r.State, "package": r.PackageRef,
+			"machine": r.MachineName, "sku": orNone(r.SKU),
+			"state": r.State, "uptime": rentalUptime(r.RentedAt),
+			"queued": strconv.Itoa(queued), "running": strconv.Itoa(running),
+			"runtime": rentalRuntime(r), "utilization": "not reported",
+			"rental": r.ID, "package": r.PackageRef,
 			"accelerator": r.AcceleratorModel, "address": r.Address,
 			"media": r.MediaAddress, "hub": r.Hub,
 			"rented": stamp(r.RentedAt),
 		})
 	}
 	if len(list.Rows) > 0 {
-		list.Next = []string{"cozy rental end " + list.Rows[0]["rental"]}
+		list.Next = []string{"cozy rental end " + list.Rows[0]["machine"]}
 	}
 	return emit(ctx, list)
+}
+
+func rentalUptime(started string) string {
+	stamp, err := time.Parse(time.RFC3339Nano, started)
+	if err != nil {
+		return "unknown"
+	}
+	d := time.Since(stamp)
+	if d < 0 {
+		d = 0
+	}
+	if d < time.Minute {
+		return "<1m"
+	}
+	return d.Round(time.Minute).String()
+}
+
+func rentalRuntime(row records.Rental) string {
+	parts := strings.Split(row.SelectionProfile, "-")
+	if len(parts) < 2 || !strings.HasPrefix(parts[0], "torch") {
+		return "unknown"
+	}
+	runtime := "torch " + strings.TrimPrefix(parts[0], "torch")
+	if parts[1] == "cpu" {
+		return runtime + " · CPU"
+	}
+	if strings.HasPrefix(parts[1], "cu") && len(parts[1]) >= 5 {
+		cuda := strings.TrimPrefix(parts[1], "cu")
+		runtime += " · CUDA " + cuda[:2] + "." + cuda[2:]
+	}
+	if row.ObservedDriverVersion != "" {
+		runtime += " · driver " + row.ObservedDriverVersion
+	}
+	return runtime
 }
 
 // handleRentRelease is idempotent and ends only on provider ABSENCE: the hub reporting the
 // rental gone (404) or `released`. Nothing local is forgotten before that, because the row
 // is the only name this host has for a pod that may still be billing.
 func handleRentRelease(ctx *Context) *exit.Error {
-	id := strings.TrimSpace(ctx.Inv.Args[0])
+	subject := strings.TrimSpace(ctx.Inv.Args[0])
 	l, st, e := rentalStores(ctx)
 	if e != nil {
 		return e
 	}
 	defer st.Close()
-	row, e := st.RentalRow(id)
+	row, e := st.RentalByMachine(subject)
 	if e != nil {
 		return e
+	}
+	id := subject
+	if row != nil {
+		id = row.ID
 	}
 	c := client(ctx)
 	if row != nil && row.Hub != c.Base() {

@@ -33,7 +33,7 @@ import (
 // client API. There is no direct-Go path from a verb to the orchestrator: `dial` is the
 // only way into any of them, and what it returns speaks HTTP to a separate process.
 //
-// ONE PRODUCT EXECUTION PATH. `cozy invoke run` is
+// ONE PRODUCT EXECUTION PATH. `cozy run` is
 //
 //	POST /v1/requests            durable request, idempotency key + body digest
 //	GET  /v1/requests/{id}/events  the attempt's own lifecycle, terminal-stop
@@ -52,7 +52,7 @@ func dial(ctx *Context) (*localapi.Client, *exit.Error) {
 
 // ----------------------------------------------------------------------------- run
 
-func handleInvokeRun(ctx *Context) *exit.Error {
+func handleRunExecute(ctx *Context) *exit.Error {
 	target, descriptor, problem := invocationTarget(ctx)
 	if problem != nil {
 		return problem
@@ -73,7 +73,7 @@ func handleInvokeRun(ctx *Context) *exit.Error {
 		}
 		return handleRun(ctx, target, callable)
 	}
-	if ctx.Inv.Value("--worker") != "" {
+	if machine := ctx.Inv.Value("--machine"); machine != "" && machine != "local" {
 		return exit.Named(exit.Usage, "rental_job_unsupported",
 			"private rental dispatch for job callables is not implemented").
 			WithRemedy("run this job locally, or choose a serving entrypoint on the rental")
@@ -98,8 +98,8 @@ func handleRun(ctx *Context, target Target, ep *launch.Entrypoint) *exit.Error {
 	// THE PAYLOAD IS TYPED AGAINST THE RECORDED SCHEMA — the surface the release's own
 	// runtime vouched for at install — so a typo costs a millisecond instead of a model
 	// load, and `steps=2` is an int because the schema says int.
-	worker := strings.TrimSpace(ctx.Inv.Value("--worker"))
-	if legacy := launch.LegacyFileTerm(ctx.Inv.Args[1:]); worker != "" && legacy != "" {
+	machine := strings.TrimSpace(ctx.Inv.Value("--machine"))
+	if legacy := launch.LegacyFileTerm(ctx.Inv.Args[1:]); machine != "" && machine != "local" && legacy != "" {
 		return exit.Named(exit.Usage, "remote_file_input_ambiguous",
 			"%s embeds file bytes into a JSON string and cannot name a remote input grant", legacy).
 			WithRemedy("use `--asset <field-path>=<file>`; the field path becomes the exact worker-protocol input id")
@@ -124,7 +124,7 @@ func handleRun(ctx *Context, target Target, ep *launch.Entrypoint) *exit.Error {
 	began := time.Now()
 	handle, e := c.Submit(api.Submission{
 		Package: target.Package, Function: target.Function, Input: input,
-		Worker: worker, LocalAssets: assets, InstallID: target.InstallID,
+		Worker: target.MachineID, LocalAssets: assets, InstallID: target.InstallID,
 	}, key)
 	if e != nil {
 		return e
@@ -138,7 +138,7 @@ func handleRun(ctx *Context, target Target, ep *launch.Entrypoint) *exit.Error {
 			{K: "changed", V: !handle.Replay},
 		}
 		rec := compactRecord(fields, "id", "target", "status", "changed")
-		rec.Next = []string{"cozy invoke cancel " + handle.RequestID}
+		rec.Next = []string{"cozy run cancel " + handle.RequestID}
 		return emit(ctx, rec)
 	}
 
@@ -170,7 +170,7 @@ func handleRun(ctx *Context, target Target, ep *launch.Entrypoint) *exit.Error {
 	return renderRun(ctx, life, terminal, stopped, saved, submitted, began)
 }
 
-func handleInvokeCancel(ctx *Context) *exit.Error {
+func handleRunCancel(ctx *Context) *exit.Error {
 	id := ctx.Inv.Args[0]
 	if strings.HasPrefix(id, "job-") {
 		return handleJobCancel(ctx)
@@ -201,7 +201,7 @@ func handleInvokeCancel(ctx *Context) *exit.Error {
 	return emit(ctx, compactRecord(fields, "id", "target", "status", "changed"))
 }
 
-func handleInvokeList(ctx *Context) *exit.Error {
+func handleRunList(ctx *Context) *exit.Error {
 	client, problem := dial(ctx)
 	if problem != nil {
 		return problem
@@ -349,8 +349,8 @@ func watch(ctx *Context, c *localapi.Client, requestID string, stream bool,
 	select {
 	case <-forced:
 		return nil, "interrupted", exit.New(exit.Canceled,
-			"stopped waiting for %s; it remains visible in `cozy invoke list`", requestID).
-			WithNext("cozy invoke list")
+			"stopped waiting for %s; it remains visible in `cozy run list`", requestID).
+			WithNext("cozy run list")
 	default:
 	}
 	reason := ""
@@ -825,6 +825,7 @@ type Target struct {
 	Package   string
 	Function  string
 	InstallID string
+	MachineID string
 }
 
 // parseTarget reads the user-facing package grammar. Versions are flags, not path
@@ -833,11 +834,11 @@ func parseTarget(raw string) (Target, *exit.Error) {
 	parts := strings.Split(strings.TrimSpace(raw), "/")
 	usage := exit.Usagef("%q is not org/package[/function]", raw).
 		WithRemedy("use org/package/function; omit /function to list the package's callables").
-		WithNext("cozy package list", "cozy help invoke run")
+		WithNext("cozy package list", "cozy help run")
 	if len(parts) == 4 && strings.HasPrefix(parts[2], "v") {
 		return Target{}, exit.Usagef("a version does not belong in the invocation path").
 			WithRemedy("use %s/%s/%s; Cozy always runs the installed release", parts[0], parts[1], parts[3]).
-			WithNext("cozy help invoke run")
+			WithNext("cozy help run")
 	}
 	if len(parts) != 2 && len(parts) != 3 {
 		return Target{}, usage
@@ -857,8 +858,8 @@ func invocationTarget(ctx *Context) (Target, *launch.PackageDescriptor, *exit.Er
 	if problem != nil {
 		return Target{}, nil, problem
 	}
-	worker := strings.TrimSpace(ctx.Inv.Value("--worker"))
-	if worker != "" {
+	machine := strings.TrimSpace(ctx.Inv.Value("--machine"))
+	if machine != "" && machine != "local" {
 		layout, problem := home.Open(ctx.Cfg.Home)
 		if problem != nil {
 			return Target{}, nil, problem
@@ -868,10 +869,33 @@ func invocationTarget(ctx *Context) (Target, *launch.PackageDescriptor, *exit.Er
 			return Target{}, nil, problem
 		}
 		defer store.Close()
-		descriptor, problem := rental.PackageDescriptor(store, worker)
+		row, problem := store.RentalByMachine(machine)
+		if problem != nil {
+			return Target{}, nil, problem
+		}
+		if row == nil {
+			return Target{}, nil, exit.New(exit.NotFound, "no rented machine %q on this host", machine).
+				WithRemedy("`cozy rental` lists this host's rented machines").
+				WithNext("cozy rental")
+		}
+		parts := strings.Split(row.PackageRef, "/")
+		if len(parts) < 2 || parts[0]+"/"+parts[1] != target.Package {
+			return Target{}, nil, exit.New(exit.NotFound,
+				"machine %s does not host package %s", row.MachineName, target.Package).
+				WithRemedy("this machine hosts %s", row.PackageRef).
+				WithNext("cozy rental")
+		}
+		target.MachineID = row.ID
+		descriptor, problem := rental.PackageDescriptor(store, row.ID)
 		return target, descriptor, problem
 	}
 	facts, problem := generationFacts(ctx, target.Package)
+	if problem != nil && problem.Code == exit.NotFound {
+		if problem = autoInstallPackage(ctx, target.Package); problem != nil {
+			return Target{}, nil, problem
+		}
+		facts, problem = generationFacts(ctx, target.Package)
+	}
 	if problem != nil {
 		return Target{}, nil, problem
 	}
@@ -884,7 +908,7 @@ func emitFunctions(ctx *Context, target Target, descriptor *launch.PackageDescri
 	for _, name := range descriptor.Names() {
 		list.Rows = append(list.Rows, map[string]string{"function": name})
 		if len(list.Next) < 2 {
-			list.Next = append(list.Next, "cozy invoke run "+target.Package+"/"+name)
+			list.Next = append(list.Next, "cozy run "+target.Package+"/"+name)
 		}
 	}
 	return emit(ctx, list)
@@ -898,9 +922,27 @@ func unknownFunction(target Target, descriptor *launch.PackageDescriptor) *exit.
 	}
 	problem.WithRemedy("available functions: %s", strings.Join(names, ", "))
 	for _, name := range names {
-		problem.WithNext("cozy invoke run " + target.Package + "/" + name)
+		problem.WithNext("cozy run " + target.Package + "/" + name)
 	}
 	return problem
+}
+
+func autoInstallPackage(ctx *Context, pkg string) *exit.Error {
+	if ctx.Mode().Human {
+		fmt.Fprintf(ctx.Err, "%s is not installed; installing it from Tensorhub...\n", pkg)
+	}
+	sub := *ctx
+	sub.Out = io.Discard
+	sub.Inv = &Invocation{
+		Args: []string{pkg}, Bools: map[string]bool{}, Values: map[string][]string{}, Mode: ctx.Mode(),
+	}
+	if problem := handleRegistryInstall(&sub); problem != nil {
+		return problem
+	}
+	if ctx.Mode().Human {
+		fmt.Fprintf(ctx.Err, "Installed %s.\n", pkg)
+	}
+	return nil
 }
 
 // generationFacts resolves the package's one active install.

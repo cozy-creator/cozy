@@ -151,6 +151,7 @@ type wireRental struct {
 }
 
 var bareSHA256Pattern = regexp.MustCompile(`^[0-9a-f]{64}$`)
+var computeCapabilityPattern = regexp.MustCompile(`^[0-9]+\.[0-9]+$`)
 
 // A persisted control snapshot is bounded to 64 MiB decoded by Tensorhub. Its
 // base64 members expand in the surrounding JSON, so the rental view gets one
@@ -286,6 +287,7 @@ func (c *Client) ReplaceRentalPlacement(ctx context.Context, id string, body []b
 type RentalSKU struct {
 	Name                  string `json:"name"`
 	AcceleratorModel      string `json:"accelerator_model"`
+	ComputeCapability     string `json:"compute_capability"`
 	VRAMGB                int64  `json:"vram_gb"`
 	PriceUSDMicrosPerHour int64  `json:"price_usd_micros_per_hour"`
 }
@@ -299,10 +301,11 @@ func (c *Client) RentalSKUs(ctx context.Context) ([]RentalSKU, *exit.Error) {
 	seen := map[string]bool{}
 	for _, sku := range out {
 		if strings.TrimSpace(sku.Name) == "" || strings.TrimSpace(sku.AcceleratorModel) == "" ||
+			!computeCapabilityPattern.MatchString(sku.ComputeCapability) ||
 			sku.VRAMGB <= 0 || sku.PriceUSDMicrosPerHour <= 0 || seen[sku.Name] {
 			return nil, exit.Named(exit.Conflict, "hub.rental_catalog_invalid",
 				"the hub returned an invalid or duplicate rental SKU %q", sku.Name).
-				WithRemedy("Tensorhub must publish unique names with model, positive VRAM, and positive Cozy price")
+				WithRemedy("Tensorhub must publish unique names with model, compute capability, positive VRAM, and positive Cozy price")
 		}
 		seen[sku.Name] = true
 	}
