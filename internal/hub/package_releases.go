@@ -10,17 +10,15 @@ import (
 	"github.com/cozy-creator/cozy/internal/exit"
 )
 
-type ObjectRef struct {
-	Digest string `json:"digest"`
-	Length int64  `json:"length"`
-}
-
 type PackageUpload struct {
 	Kind            string            `json:"kind,omitempty"`
 	Path            string            `json:"path,omitempty"`
 	URL             string            `json:"url"`
 	RequiredHeaders map[string]string `json:"required_headers"`
 	AlreadyUploaded bool              `json:"already_uploaded"`
+	// ExpiresAt is deliberately decoded so strict response validation accepts
+	// the storage grant's informational expiry. Upload execution does not need it.
+	ExpiresAt string `json:"expires_at,omitempty"`
 }
 
 type PackageProfileState struct {
@@ -43,8 +41,7 @@ type PackageUploads struct {
 
 type PackageReleaseFinalize struct {
 	CompatibleProfiles []string              `json:"compatible_profiles"`
-	Created            bool                  `json:"created"`
-	ExecutionCount     int                   `json:"execution_count"`
+	PackageExecutions  []PackageExecution    `json:"package_executions"`
 	Profiles           []PackageProfileState `json:"profiles"`
 	QualificationError string                `json:"qualification_error,omitempty"`
 	QualificationState string                `json:"qualification_state"`
@@ -52,19 +49,22 @@ type PackageReleaseFinalize struct {
 	RequiresPython     string                `json:"requires_python"`
 }
 
-func packageReleasePath(ref Ref, release string) string {
-	return resourcePath("packages", ref) + "/releases/" + url.PathEscape(release)
+type PackageExecution struct {
+	Digest   string `json:"digest"`
+	Function string `json:"function"`
+	Profile  string `json:"profile"`
+	State    string `json:"state"`
 }
 
-func packageProfilePath(ref Ref, release, profile string) string {
-	return packageReleasePath(ref, release) + "/profiles/" + url.PathEscape(profile)
+func packageReleasePath(ref Ref, release string) string {
+	return resourcePath("packages", ref) + "/releases/" + url.PathEscape(release)
 }
 
 func (c *Client) BeginPackageRelease(ctx context.Context, ref Ref, release, reason string) (PackageReleaseBegin, *exit.Error) {
 	var out PackageReleaseBegin
 	e := c.do(ctx, call{method: http.MethodPost,
 		path: packageReleasePath(ref, release), auth: true, reason: reason,
-		body: map[string]any{}}, &out)
+		body: map[string]any{}, strict: true}, &out)
 	return out, e
 }
 
@@ -74,7 +74,7 @@ func (c *Client) PackageReleaseUploads(ctx context.Context, ref Ref, release str
 	var out PackageUploads
 	e := c.do(ctx, call{method: http.MethodPost,
 		path: packageReleasePath(ref, release) + "/uploads", auth: true, reason: reason,
-		body: map[string]any{"paths": paths, "dependency_wheels": dependencyWheels}}, &out)
+		body: map[string]any{"paths": paths, "dependency_wheels": dependencyWheels}, strict: true}, &out)
 	return out, e
 }
 
@@ -82,50 +82,6 @@ func (c *Client) FinalizePackageRelease(ctx context.Context, ref Ref, release, r
 	var out PackageReleaseFinalize
 	e := c.do(ctx, call{method: http.MethodPut,
 		path: packageReleasePath(ref, release), auth: true, reason: reason,
-		body: map[string]any{}, patient: true}, &out)
-	return out, e
-}
-
-type ExactDocument struct {
-	Digest         string `json:"digest"`
-	Length         int64  `json:"length"`
-	CanonicalBytes []byte `json:"canonical_bytes_base64"`
-}
-
-type DownloadGrant struct {
-	Role      string    `json:"role"`
-	Ref       ObjectRef `json:"ref"`
-	URL       string    `json:"url"`
-	ExpiresAt string    `json:"expires_at"`
-}
-
-type BaseRealization struct {
-	Kind   string `json:"kind"`
-	Digest string `json:"digest"`
-}
-
-type LocalQualificationMaterials struct {
-	CandidateID            string          `json:"candidate_id"`
-	Profile                string          `json:"profile"`
-	LeaseID                string          `json:"lease_id"`
-	LeaseExpiresAt         string          `json:"lease_expires_at"`
-	BaseRealization        BaseRealization `json:"base_realization"`
-	PackageEnvironmentSpec ExactDocument   `json:"package_environment_spec"`
-	PackageBundle          ExactDocument   `json:"package_bundle"`
-	PackageDescriptor      ExactDocument   `json:"package_descriptor"`
-	WheelhouseManifest     ExactDocument   `json:"wheelhouse_manifest"`
-	ResolvedWheelSet       ExactDocument   `json:"resolved_wheel_set"`
-	ResolutionLock         ExactDocument   `json:"resolution_lock"`
-	Downloads              []DownloadGrant `json:"downloads"`
-}
-
-func (c *Client) PackageLocalQualificationMaterials(ctx context.Context, ref Ref, release, profile string,
-	reason string,
-) (LocalQualificationMaterials, *exit.Error) {
-	var out LocalQualificationMaterials
-	e := c.do(ctx, call{method: http.MethodPost,
-		path:  packageProfilePath(ref, release, profile) + "/install",
-		auth: true, reason: reason, byBytes: true, patient: true,
-		body: map[string]any{}}, &out)
+		body: map[string]any{}, patient: true, strict: true}, &out)
 	return out, e
 }

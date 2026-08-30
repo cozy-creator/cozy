@@ -100,24 +100,6 @@ CREATE TABLE IF NOT EXISTS pins (
   generation   TEXT    NOT NULL REFERENCES install_generations(id),
   activated_at TEXT    NOT NULL,
   PRIMARY KEY (package, major)
-)`, `
-CREATE TABLE IF NOT EXISTS managed_profile_installs (
-  install_id                    TEXT PRIMARY KEY REFERENCES install_generations(id) ON DELETE CASCADE,
-  package_release_id                   TEXT NOT NULL,
-  profile                      TEXT NOT NULL,
-  candidate_id                 TEXT NOT NULL,
-  base_realization_digest      TEXT NOT NULL,
-  wheelhouse_manifest_digest   TEXT NOT NULL,
-  environment_spec_digest      TEXT NOT NULL,
-  package_bundle_digest       TEXT NOT NULL,
-  resolved_wheel_set_digest    TEXT NOT NULL,
-  resolution_lock_digest       TEXT NOT NULL,
-	installed_receipt_digest     TEXT NOT NULL,
-	installed_receipt_length     INTEGER NOT NULL,
-	host_evidence_digest         TEXT NOT NULL,
-	lease_id                     TEXT NOT NULL,
-  lease_expires_at             TEXT NOT NULL,
-  recorded_at                  TEXT NOT NULL
 )`}, append(orchestratorSchema, append(eventSchema, rentalSchema...)...)...)
 
 // renames is the pre-launch domain hardcut expressed as a database migration instead of
@@ -128,8 +110,6 @@ var renames = []struct{ table, from, to string }{
 	{"install_generations", "endpoint", "package"},
 	{"install_generations", "descriptor", "package_descriptor"},
 	{"pins", "endpoint", "package"},
-	{"managed_profile_installs", "release_id", "package_release_id"},
-	{"managed_profile_installs", "endpoint_bundle_digest", "package_bundle_digest"},
 	{"worker_processes", "endpoint", "package"},
 	{"worker_processes", "release_id", "package_release_id"},
 	{"placement_acquisition_observations", "endpoint_started_ns", "package_started_ns"},
@@ -307,51 +287,6 @@ func scanGen(rows interface{ Scan(...any) error }) (PackageInstall, error) {
 // together or not at all. A crash before Commit leaves the previous pin — and the
 // previous generation's venv — exactly as it was.
 func (s *Store) Activate(g PackageInstall) (superseded string, e *exit.Error) {
-	return s.activate(g, nil)
-}
-
-type ManagedProfileInstall struct {
-	InstallID                string
-	PackageReleaseID         string
-	Profile                  string
-	CandidateID              string
-	BaseRealizationDigest    string
-	WheelhouseManifestDigest string
-	EnvironmentSpecDigest    string
-	PackageBundleDigest      string
-	ResolvedWheelSetDigest   string
-	ResolutionLockDigest     string
-	InstalledReceiptDigest   string
-	InstalledReceiptLength   int64
-	HostEvidenceDigest       string
-	LeaseID                  string
-	LeaseExpiresAt           string
-	RecordedAt               string
-}
-
-// ActivateManaged commits the ordinary control install/pin and its independent
-// profile realization, receipt, host evidence, and lease facts in one transaction.
-func (s *Store) ActivateManaged(g PackageInstall, facts ManagedProfileInstall) (string, *exit.Error) {
-	facts.InstallID = g.ID
-	for name, value := range map[string]string{
-		"release": facts.PackageReleaseID, "profile": facts.Profile, "candidate": facts.CandidateID,
-		"base realization": facts.BaseRealizationDigest, "wheelhouse": facts.WheelhouseManifestDigest,
-		"environment": facts.EnvironmentSpecDigest, "bundle": facts.PackageBundleDigest,
-		"resolved wheels": facts.ResolvedWheelSetDigest, "resolution lock": facts.ResolutionLockDigest,
-		"receipt": facts.InstalledReceiptDigest, "host evidence": facts.HostEvidenceDigest,
-		"lease": facts.LeaseID, "lease expiry": facts.LeaseExpiresAt,
-	} {
-		if strings.TrimSpace(value) == "" {
-			return "", exit.Internalf("managed install has no %s fact", name)
-		}
-	}
-	if facts.InstalledReceiptLength <= 0 {
-		return "", exit.Internalf("managed install has no positive receipt length")
-	}
-	return s.activate(g, &facts)
-}
-
-func (s *Store) activate(g PackageInstall, managed *ManagedProfileInstall) (superseded string, e *exit.Error) {
 	tx, err := s.db.Begin()
 	if err != nil {
 		return "", exit.Internalf("cannot begin the activation transaction: %s", err)
@@ -377,24 +312,6 @@ func (s *Store) activate(g PackageInstall, managed *ManagedProfileInstall) (supe
 		g.Packages, g.Closure, g.PackageDescriptor, g.BytesExcl, g.BytesShared, g.CreatedAt); err != nil {
 		return "", exit.Internalf("cannot insert generation %s: %s", g.ID, err)
 	}
-	if managed != nil {
-		managed.RecordedAt = g.CreatedAt
-		if _, err := tx.Exec(`INSERT INTO managed_profile_installs(
-			install_id,package_release_id,profile,candidate_id,base_realization_digest,
-			wheelhouse_manifest_digest,environment_spec_digest,
-			package_bundle_digest,resolved_wheel_set_digest,resolution_lock_digest,
-			installed_receipt_digest,installed_receipt_length,host_evidence_digest,
-			lease_id,lease_expires_at,recorded_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
-			managed.InstallID, managed.PackageReleaseID, managed.Profile, managed.CandidateID,
-			managed.BaseRealizationDigest,
-			managed.WheelhouseManifestDigest, managed.EnvironmentSpecDigest,
-			managed.PackageBundleDigest, managed.ResolvedWheelSetDigest,
-			managed.ResolutionLockDigest, managed.InstalledReceiptDigest,
-			managed.InstalledReceiptLength, managed.HostEvidenceDigest,
-			managed.LeaseID, managed.LeaseExpiresAt, managed.RecordedAt); err != nil {
-			return "", exit.Internalf("cannot insert managed profile facts for %s: %s", g.ID, err)
-		}
-	}
 	if _, err := tx.Exec(`INSERT INTO pins(package,major,generation,activated_at)
 		VALUES(?,?,?,?) ON CONFLICT(package,major) DO UPDATE SET generation=excluded.generation,
 		activated_at=excluded.activated_at`,
@@ -407,28 +324,6 @@ func (s *Store) activate(g PackageInstall, managed *ManagedProfileInstall) (supe
 			WithRemedy("the previous pin is untouched; re-run the install")
 	}
 	return prior, nil
-}
-
-func (s *Store) ManagedInstall(installID string) (*ManagedProfileInstall, *exit.Error) {
-	var out ManagedProfileInstall
-	err := s.db.QueryRow(`SELECT install_id,package_release_id,profile,candidate_id,
-		base_realization_digest,wheelhouse_manifest_digest,
-			environment_spec_digest,package_bundle_digest,resolved_wheel_set_digest,
-			resolution_lock_digest,installed_receipt_digest,installed_receipt_length,
-			host_evidence_digest,lease_id,lease_expires_at,recorded_at
-		FROM managed_profile_installs WHERE install_id=?`, installID).Scan(
-		&out.InstallID, &out.PackageReleaseID, &out.Profile, &out.CandidateID,
-		&out.BaseRealizationDigest, &out.WheelhouseManifestDigest,
-		&out.EnvironmentSpecDigest, &out.PackageBundleDigest, &out.ResolvedWheelSetDigest,
-		&out.ResolutionLockDigest, &out.InstalledReceiptDigest, &out.InstalledReceiptLength,
-		&out.HostEvidenceDigest, &out.LeaseID, &out.LeaseExpiresAt, &out.RecordedAt)
-	if errors.Is(err, sql.ErrNoRows) {
-		return nil, nil
-	}
-	if err != nil {
-		return nil, exit.Internalf("cannot read managed profile facts for %s: %s", installID, err)
-	}
-	return &out, nil
 }
 
 // ActivePin returns the pinned generation for one (package, major).

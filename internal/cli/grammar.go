@@ -56,15 +56,12 @@ type PackageInstallCmd struct {
 	Digest        string `help:"Expected source digest."`
 	Force         bool   `help:"Build and atomically replace an existing pin."`
 	AllowUnsigned bool   `help:"Allow an unverified local development source."`
-	Profile       string `help:"Qualified compatibility profile."`
-	Major         string `help:"Local serving major for a qualified release." placeholder:"vN"`
 }
 
 func (c *PackageInstallCmd) Run(r *Runtime) error {
 	return r.call(handleInstall, []string{c.Ref}, bools(
 		"--force", c.Force, "--allow-unsigned", c.AllowUnsigned), values(
-		"--from", c.From, "--dir", c.Dir, "--digest", c.Digest,
-		"--profile", c.Profile, "--major", c.Major), false)
+		"--from", c.From, "--dir", c.Dir, "--digest", c.Digest), false)
 }
 
 type PackageRemoveCmd struct {

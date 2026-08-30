@@ -1,0 +1,26 @@
+{
+  "compatible_profiles": [
+    "cpu-py311-torch213"
+  ],
+  "package_executions": [
+    {
+      "digest": "sha256:4e6fa14af107f04404713349d18bce5b8f4ec7da11c582db892b90688d854e2b",
+      "function": "generate",
+      "profile": "cpu-py311-torch213",
+      "state": "qualified"
+    }
+  ],
+  "profiles": [
+    {
+      "base_realization_kind": "base-worker-image",
+      "candidate_id": "pqc-01K5PACKAGEPROOF",
+      "profile": "cpu-py311-torch213",
+      "state": "qualified"
+    }
+  ],
+  "qualification_state": "qualified",
+  "requirements": [
+    "cozy-runtime>=0.0.3"
+  ],
+  "requires_python": ">=3.11"
+}

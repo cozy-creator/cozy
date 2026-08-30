@@ -18,6 +18,7 @@ import (
 	"github.com/cozy-creator/cozy/internal/inputasset"
 	"github.com/cozy-creator/cozy/internal/media"
 	"github.com/cozy-creator/cozy/internal/plan"
+	"github.com/cozy-creator/cozy/internal/processtree"
 	"github.com/cozy-creator/cozy/internal/records"
 	"github.com/cozy-creator/cozy/internal/secret"
 	pb "github.com/cozy-creator/cozy/protocol/cozy/worker/v1"
@@ -821,7 +822,7 @@ func (c *Orchestrator) spawnWorker(spec WorkerLaunchSpec) (string, *exit.Error) 
 	imposed = append(imposed, secret.EnvEntry("COZY_BOOTSTRAP_CREDENTIAL", bootstrap))
 	cmd.Env = c.opt.Cfg.Child(imposed...)
 	cmd.Stdout, cmd.Stderr = logFile, logFile
-	setProcessGroup(cmd)
+	processtree.Prepare(cmd)
 
 	w := newWorker(instanceID, spec)
 	w.cmd, w.logPath, w.home = cmd, logPath, workerHome
@@ -847,7 +848,7 @@ func (c *Orchestrator) spawnWorker(spec WorkerLaunchSpec) (string, *exit.Error) 
 	// where the child is created suspended and the job adopts it before it runs. Adoption
 	// FAILS CLOSED (#449): a worker that cannot be contained is ended before it executes,
 	// and the spawn refuses exactly as if the process had never started.
-	if err := adoptProcessGroup(cmd); err != nil {
+	if err := processtree.Adopt(cmd); err != nil {
 		_ = cmd.Process.Kill()
 		go func() { _ = cmd.Wait(); logFile.Close() }()
 		c.mu.Lock()
@@ -860,10 +861,10 @@ func (c *Orchestrator) spawnWorker(spec WorkerLaunchSpec) (string, *exit.Error) 
 	w.pid = cmd.Process.Pid
 	c.mu.Unlock()
 	if e := c.opt.Store.WorkerStarted(instanceID, cmd.Process.Pid, birthOf(cmd.Process.Pid)); e != nil {
-		_ = killGroup(cmd.Process.Pid, syscall.SIGKILL)
+		_ = processtree.Kill(cmd.Process.Pid, syscall.SIGKILL)
 		_ = cmd.Wait()
 		logFile.Close()
-		releaseGroup(cmd.Process.Pid)
+		processtree.Release(cmd.Process.Pid)
 		close(w.processDone)
 		close(w.attachDone)
 		c.mu.Lock()
@@ -888,7 +889,7 @@ func (c *Orchestrator) spawnWorker(spec WorkerLaunchSpec) (string, *exit.Error) 
 		logFile.Close()
 		// The process is reaped: retire its containment handle so a reused pid can
 		// never meet a stale job (Windows; a no-op where the group is a kernel fact).
-		releaseGroup(cmd.Process.Pid)
+		processtree.Release(cmd.Process.Pid)
 		c.mu.Lock()
 		current, live := c.workers[instanceID]
 		mine := live && current == w
@@ -1400,7 +1401,7 @@ func (c *Orchestrator) retireWorker(w *worker) *exit.Error {
 
 // ShutdownWorker drains and stops the WHOLE worker process group — the only yield
 // mechanism there is. An attempt is never killed to improve queue latency, and no suspend
-// path exists anywhere in this package. The wait for the process to go is `alive(pid)`,
+// path exists anywhere in this package. The wait for the process to go uses its process handle,
 // the kernel's own answer, polled until `StopGrace` is spent.
 func (c *Orchestrator) ShutdownWorker(instanceID string, grace time.Duration) {
 	c.mu.Lock()
@@ -1453,7 +1454,7 @@ func (c *Orchestrator) stopClaimedWorker(w *worker, grace time.Duration) bool {
 		// The cooperative tier: SIGTERM to the group, CTRL_BREAK to the job's console
 		// group on Windows. A failure here is loud but not an escalation by itself —
 		// the bounded wait below is what separates asking from insisting.
-		if err := killGroup(pid, syscall.SIGTERM); err != nil {
+		if err := processtree.Kill(pid, syscall.SIGTERM); err != nil {
 			c.logf("worker %s: the cooperative stop could not be delivered (%s); "+
 				"the forced tier follows the grace window", w.instanceID, err)
 		}
@@ -1467,7 +1468,7 @@ func (c *Orchestrator) stopClaimedWorker(w *worker, grace time.Duration) bool {
 				}
 			}
 		case <-timer.C:
-			_ = killGroup(pid, syscall.SIGKILL)
+			_ = processtree.Kill(pid, syscall.SIGKILL)
 			<-processDone // process reaping is an observed fact, not another timeout
 		}
 	} else if processDone != nil {
@@ -1588,7 +1589,7 @@ func (c *Orchestrator) Reconcile() (killed, forgotten int, e *exit.Error) {
 	}
 	for _, row := range rows {
 		if row.PID > 0 && birthOf(row.PID) == row.Birth && row.Birth != "" {
-			_ = killGroup(row.PID, syscall.SIGKILL)
+			_ = processtree.Kill(row.PID, syscall.SIGKILL)
 			killed++
 			c.logf("orphan worker %s (pid %d, birth %s) killed on reconcile",
 				row.InstanceID, row.PID, row.Birth)

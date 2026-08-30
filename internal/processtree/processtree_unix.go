@@ -6,37 +6,37 @@
 // and keeps holding a device.
 //
 // Unix says that with a process group: the child leads its own, and a negative pid signals
-// every member. `proc_windows.go` says the same thing with a Job Object, which is the
+// every member. `processtree_windows.go` says the same thing with a Job Object, which is the
 // analogue that exists there.
-package orchestrator
+package processtree
 
 import (
 	"os/exec"
 	"syscall"
 )
 
-// setProcessGroup makes the child the LEADER of a fresh group, before it starts. Every
+// Prepare makes the child the LEADER of a fresh group, before it starts. Every
 // process it goes on to spawn inherits the group, which is what makes one signal reach the
 // whole tree.
-func setProcessGroup(cmd *exec.Cmd) {
+func Prepare(cmd *exec.Cmd) {
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 }
 
-// adoptProcessGroup has nothing to do here: the group was established at fork. It exists
+// Adopt has nothing to do here: the group was established at fork. It exists
 // because Windows cannot attach its equivalent until the process is running, and it can
 // fail there — which is why it returns an error the spawn treats as fatal (#449).
-func adoptProcessGroup(cmd *exec.Cmd) error { return nil }
+func Adopt(cmd *exec.Cmd) error { return nil }
 
-// releaseGroup has nothing to hold here either: a Unix group is a kernel fact that dies
+// Release has nothing to hold here either: a Unix group is a kernel fact that dies
 // with its members, not a handle this process keeps.
-func releaseGroup(pid int) {}
+func Release(pid int) {}
 
-// killGroup signals the whole group. A NEGATIVE pid is the group, and that is the point:
+// Kill signals the whole group. A NEGATIVE pid is the group, and that is the point:
 // signalling the leader alone leaves its children running.
-func killGroup(pid int, sig syscall.Signal) error {
+func Kill(pid int, sig syscall.Signal) error {
 	return syscall.Kill(-pid, sig)
 }
 
 // alive asks the kernel whether the pid is still there. Signal 0 delivers nothing and
 // reports exactly that.
-func alive(pid int) bool { return syscall.Kill(pid, 0) == nil }
+func Alive(pid int) bool { return syscall.Kill(pid, 0) == nil }

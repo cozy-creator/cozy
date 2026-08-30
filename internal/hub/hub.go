@@ -191,6 +191,9 @@ type call struct {
 	// manifest route answers a canonical document verbatim, and this client must
 	// carry it the same way — nothing here re-encodes one.
 	raw *[]byte
+	// strict rejects response fields this client version does not understand.
+	// Mutating package-release routes use it as their version-skew fence.
+	strict bool
 }
 
 // WithToken returns a copy of the client carrying a credential supplied for this
@@ -390,7 +393,24 @@ func (c *Client) do(ctx context.Context, cl call, out any) *exit.Error {
 		return nil
 	}
 	if out != nil {
-		if err := json.Unmarshal(raw, out); err != nil {
+		var err error
+		if cl.strict {
+			decoder := json.NewDecoder(bytes.NewReader(raw))
+			decoder.DisallowUnknownFields()
+			err = decoder.Decode(out)
+			if err == nil {
+				var trailing any
+				if next := decoder.Decode(&trailing); next != io.EOF {
+					err = next
+					if err == nil {
+						err = errors.New("response contains more than one JSON value")
+					}
+				}
+			}
+		} else {
+			err = json.Unmarshal(raw, out)
+		}
+		if err != nil {
 			return exit.Named(exit.Internal, "hub.unreadable_answer",
 				"%s %s answered %d with a body this client cannot read: %s",
 				cl.method, cl.path, resp.StatusCode, err).

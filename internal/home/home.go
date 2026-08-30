@@ -57,10 +57,6 @@ type Layout struct {
 	// address, pod id, state — are rows in the one records authority; only what must not
 	// be readable by another user on this host lives out here as files.
 	Rentals string
-	// ManagedBases is the operator-populated immutable local equivalent of a base
-	// worker image. Cozy selects only by exact realization digest; it never resolves
-	// or builds packages into this registry during package install.
-	ManagedBases string
 }
 
 func Open(root string) (Layout, *exit.Error) {
@@ -93,8 +89,7 @@ func Open(root string) (Layout, *exit.Error) {
 	}
 	l.Publications = filepath.Join(root, "publications")
 	l.Rentals = filepath.Join(root, "rentals")
-	l.ManagedBases = filepath.Join(root, "managed-bases", "sha256")
-	for _, dir := range []string{l.Generations, l.Workers, l.Outputs, l.Triage, l.Publications, l.ManagedBases} {
+	for _, dir := range []string{l.Generations, l.Workers, l.Outputs, l.Triage, l.Publications} {
 		if err := os.MkdirAll(dir, 0o755); err != nil {
 			return Layout{}, exit.Internalf("cannot create %s: %s", dir, err)
 		}
@@ -146,10 +141,6 @@ func (l Layout) RentalCert(id string) string { return filepath.Join(l.Rentals, i
 
 // GenerationDir is where one generation's source tree and venv live.
 func (l Layout) GenerationDir(id string) string { return filepath.Join(l.Generations, id) }
-
-func (l Layout) ManagedBase(digest string) string {
-	return filepath.Join(l.ManagedBases, strings.TrimPrefix(digest, "sha256:"))
-}
 
 // WorkerDir is one worker session's own root: its journal, its log, and the binding
 // plan records the runtime resolves out of its COZY_HOME.

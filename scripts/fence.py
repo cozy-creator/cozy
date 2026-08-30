@@ -171,7 +171,7 @@ TFS_FIELD = re.compile(r"\.Tfs\b")
 # asks for the artifact index, host facts and fit verdicts. Nothing executes a model
 # through these doors — that is what the orchestrator and worker protocol are for.
 RUNTIME_SITES = {"internal/install/install.go", "internal/launch/artifacts.go",
-                 "internal/managedinstall/install.go", "internal/packagepublish/package.go"}
+                 "internal/packagepublish/package.go"}
 RUNTIME_BIN = re.compile(r'"cozy-runtime"')
 # (cl-028) The INDIRECTIONS to the same binary, which the literal above cannot see:
 # `launch.Binary()` resolves the generation venv's cozy-runtime and `launch.RuntimeCLI{}`
@@ -329,14 +329,7 @@ def check_test_boundary():
     return bad
 
 
-DOCUMENT_KINDS = {
-    # proto-007 (#616.a): the `cozy.<name>/<N>` names this repo AUTHORS, each with the one
-    # file that declares it. A format name exists only for a document that crosses a
-    # repo/process boundary AND is stored or digested. A literal outside this table is a new
-    # name without its decision row; a literal in a second file is a second declaration.
-    #
-    "cozy.local.ManagedBaseReceipt/1": "internal/managedinstall/install.go",
-}
+DOCUMENT_KINDS = {}
 # HMAC domain-separation tags are security protocol constants, not document formats. A peer repo
 # reproduces these exact bytes, so they remain single-owner fenced without inflating the document
 # count.
@@ -555,7 +548,6 @@ def check_manifest():
         bad.append("[grammar] package publish identity must come only from project metadata")
     derived_audits = {
         "internal/cli/package_releases.go": '"cozy package publish " + ref.String() + "@" + release',
-        "internal/cli/packages.go": '"cozy package install " + ref.String() + "@" + release + " for " + profiles[0]',
         "internal/cli/transfer.go": '"cozy model publish " + ref.String() + " " + snapshot',
         "internal/cli/rentals.go": '"cozy rental new " + skuName + " for " + packageRef',
     }
@@ -793,22 +785,6 @@ def check_typed_resources():
     for route in ('resourceSearchPath("packages"', 'resourceSearchPath("models"', '"/v1/models/"', '"/publications"'):
         if route not in hub_sources:
             bad.append(f"internal/hub: [resources] missing typed route prefix {route}")
-    profile_routes = pathlib.Path("internal/hub/package_releases.go").read_text()
-    if "/local-execution" in profile_routes:
-        bad.append("internal/hub/package_releases.go: [resources] retired local-execution route remains")
-    if ' + "/install"' not in profile_routes:
-        bad.append("internal/hub/package_releases.go: [resources] package install route is absent")
-
-    managed = pathlib.Path("internal/managedinstall/install.go").read_text()
-    for retired in ('"base_path"', '"index_url"', '"build_command"', 'exec.Command("uv"',
-                    'exec.Command("pip"', 'exec.Command("docker"'):
-        if retired in managed:
-            bad.append(f"internal/managedinstall/install.go: [resources] managed install contains "
-                       f"forbidden resolve/build/path input {retired}")
-    for required in ("layout.ManagedBase(grant.BaseRealization.Digest)",
-                     "cozy-environment-proof", '"cozy.local.ManagedBaseReceipt/1"'):
-        if required not in managed:
-            bad.append(f"internal/managedinstall/install.go: [resources] missing managed-local fence {required}")
     wheel_build = pathlib.Path("internal/wheel/build.go").read_text()
     if "cmd.Env = config.Frozen().Tool()" not in wheel_build:
         bad.append("internal/wheel/build.go: [env] uv build inherits the parent environment; "
