@@ -49,7 +49,7 @@ func TestPackageReleaseClientContract(t *testing.T) {
 		case r.Method == http.MethodPut && r.URL.Path == releasePath:
 			assertEmptyObject(t, r.Body)
 			_ = json.NewEncoder(w).Encode(map[string]any{"state": "committed", "qualification_state": "qualified", "package_release": map[string]any{
-				"canonical_bytes": []byte(`{"format":"cozy.package.release/2"}`),
+				"canonical_bytes": []byte(`{"format":"cozy.package.release/1"}`),
 				"digest":          "sha256:" + strings.Repeat("a", 64), "length": 35,
 			}})
 			return
@@ -223,7 +223,7 @@ func TestPackagePublishPendingWireFlowBoundsUploads(t *testing.T) {
 			_ = json.NewEncoder(w).Encode(map[string]any{"state": "pending", "uploads": uploads})
 		case r.Method == http.MethodPut && r.URL.Path == releasePath:
 			finalized.Add(1)
-			releaseBytes := []byte(`{"format":"cozy.package.release/2"}`)
+			releaseBytes := []byte(`{"format":"cozy.package.release/1"}`)
 			_ = json.NewEncoder(w).Encode(map[string]any{
 				"state": "committed", "qualification_state": "qualified", "package_release": map[string]any{
 					"canonical_bytes": releaseBytes, "digest": "sha256:" + strings.Repeat("4", 64),

@@ -90,7 +90,7 @@ func persistSelection(genDir string, gen *records.PackageInstall, selection Sele
 		exact  ExactDocument
 	}{
 		{"placement_set", "cozy.worker.v1.PlacementSet/3", selection.PlacementSet},
-		{"package_release", "cozy.package.release/2", selection.PackageRelease},
+		{"package_release", "cozy.package.release/1", selection.PackageRelease},
 		{"package_descriptor", "cozy.package.descriptor/1", selection.PackageDescriptor},
 		{"qualification", "cozy.runtime.Qualification/1", selection.Qualification},
 		{"environment_receipt", "cozy.runtime.EnvironmentReceipt/1", selection.EnvironmentReceipt},

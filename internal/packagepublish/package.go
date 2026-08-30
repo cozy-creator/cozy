@@ -49,7 +49,6 @@ type localIdentityFile struct {
 }
 
 type localIdentityDocument struct {
-	Format  string              `json:"format"`
 	Sources []localIdentityFile `json:"sources"`
 	Wheels  []localIdentityFile `json:"wheels"`
 }
@@ -137,7 +136,7 @@ func (p *Package) LocalIdentity() (string, int, int64, *exit.Error) {
 	if p.Wheel == "" || p.Root == "" {
 		return "", 0, 0, exit.Internalf("local package identity requested before its wheel build")
 	}
-	document := localIdentityDocument{Format: "cozy.local-package-build/1"}
+	document := localIdentityDocument{}
 	var sourceBytes int64
 	for _, path := range Paths(p.Files) {
 		row, problem := localIdentityFileAt(path, p.Files[path])
