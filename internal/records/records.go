@@ -127,7 +127,9 @@ var renames = []struct{ table, from, to string }{
 //	foreign_keys  the pin -> generation reference is enforced, not decorative
 //	journal_mode  WAL keeps reads independent of the single writer; it is persistent, so
 //	              an older root converts on its first open here
-const pragmas = "?_pragma=busy_timeout(5000)&_pragma=foreign_keys(1)&_pragma=journal_mode(WAL)"
+//	txlock        writers reserve the lock before reading, so two processes cannot both
+//	              read and then fail immediately while upgrading a deferred transaction
+const pragmas = "?_pragma=busy_timeout(5000)&_pragma=foreign_keys(1)&_pragma=journal_mode(WAL)&_txlock=immediate"
 
 func Open(path string) (*Store, *exit.Error) {
 	// No `file:` prefix: the driver hands an unprefixed name to SQLite verbatim, so a
