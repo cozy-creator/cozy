@@ -49,7 +49,7 @@ func Read(data []byte, m proto.Message) (Doc, error) {
 // worker-protocol (for example PackageBindingRelease). Callers must still
 // enforce their closed key set and semantic joins.
 func ReadObject(data []byte) (Doc, error) {
-	obj, err := ParseObject(data)
+	obj, err := parseObject(data)
 	if err != nil {
 		return nil, err
 	}
@@ -63,11 +63,11 @@ func ReadObject(data []byte) (Doc, error) {
 	return obj, nil
 }
 
-// ParseObject applies the bounded JSON grammar and duplicate-key refusal but
+// parseObject applies the bounded JSON grammar and duplicate-key refusal but
 // does not require compact canonical rendering. Descriptor bytes have their own
 // exact stored-byte identity and may be pretty-printed; their schema owner, not
 // this codec, decides that presentation.
-func ParseObject(data []byte) (Doc, error) {
+func parseObject(data []byte) (Doc, error) {
 	if len(data) > DocMax {
 		return nil, refuse("size_cap", "%d B over the %d B cap", len(data), DocMax)
 	}

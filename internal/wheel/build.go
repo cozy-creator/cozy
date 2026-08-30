@@ -3,29 +3,72 @@
 package wheel
 
 import (
+	"bytes"
+	"context"
+	"errors"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync"
+	"sync/atomic"
+	"syscall"
+	"time"
 
 	"github.com/cozy-creator/cozy/internal/config"
 	"github.com/cozy-creator/cozy/internal/exit"
+	"github.com/cozy-creator/cozy/internal/processtree"
 )
 
 const Tag = "py3-none-any"
 
 type Request struct {
-	Tree   string
-	OutDir string
+	Context context.Context
+	Tree    string
+	OutDir  string
 }
 
 type Result struct {
 	Path string
 }
 
+const (
+	buildActivitySample = 15 * time.Second
+	buildStillSamples   = 8
+	maxBuildLogBytes    = 1 << 20
+)
+
+var errBuildStalled = errors.New("wheel build stopped making progress")
+
+type buildLog struct {
+	mu      sync.Mutex
+	buffer  bytes.Buffer
+	written atomic.Int64
+}
+
+func (w *buildLog) Write(p []byte) (int, error) {
+	w.written.Add(int64(len(p)))
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if room := maxBuildLogBytes - w.buffer.Len(); room > 0 {
+		_, _ = w.buffer.Write(p[:min(len(p), room)])
+	}
+	return len(p), nil
+}
+
+func (w *buildLog) String() string {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return w.buffer.String()
+}
+
 // Build asks uv to build the current working tree, then validates the exact
 // wheel emitted by the project's declared build backend. Git is not involved.
 func Build(req Request) (*Result, *exit.Error) {
+	parent := req.Context
+	if parent == nil {
+		parent = context.Background()
+	}
 	root, err := filepath.Abs(req.Tree)
 	if err != nil {
 		return nil, exit.Usagef("project directory %q is not resolvable: %s", req.Tree, err)
@@ -46,17 +89,60 @@ func Build(req Request) (*Result, *exit.Error) {
 			"private wheel staging already contains %d wheel(s)", len(held))
 	}
 
-	cmd := exec.Command("uv", "build", "--wheel", "--out-dir", out,
-		"--no-build-logs", "--no-progress", root)
+	ctx, cancel := context.WithCancelCause(parent)
+	defer cancel(nil)
+	cmd := exec.CommandContext(ctx, "uv", "build", "--wheel", "--out-dir", out,
+		"--no-progress", root)
 	cmd.Env = config.Frozen().Tool()
-	body, runErr := cmd.CombinedOutput()
+	cmd.WaitDelay = 250 * time.Millisecond
+	processtree.Prepare(cmd)
+	cmd.Cancel = func() error {
+		if cmd.Process == nil {
+			return os.ErrProcessDone
+		}
+		err := processtree.Kill(cmd.Process.Pid, syscall.SIGKILL)
+		if err != nil && !processtree.Alive(cmd.Process.Pid) {
+			return os.ErrProcessDone
+		}
+		return err
+	}
+	log := &buildLog{}
+	cmd.Stdout, cmd.Stderr = log, log
+	done := make(chan struct{})
+	go monitorBuild(ctx, cancel, done, log, buildActivitySample, buildStillSamples)
+	runErr := cmd.Start()
+	var containmentErr error
+	if runErr == nil {
+		pid := cmd.Process.Pid
+		if containmentErr = processtree.Adopt(cmd); containmentErr != nil {
+			_ = cmd.Wait()
+			runErr = containmentErr
+		} else {
+			runErr = cmd.Wait()
+		}
+		processtree.Release(pid)
+	}
+	close(done)
+	body := log.String()
+	if errors.Is(context.Cause(ctx), errBuildStalled) {
+		return nil, exit.Named(exit.Deadline, "project_wheel_build_stalled",
+			"uv build stopped producing output for %s", buildActivitySample*buildStillSamples).
+			WithRemedy("run `uv build --wheel` locally and fix the build backend stage that does not finish")
+	}
+	if parent.Err() != nil {
+		return nil, exit.Named(exit.Canceled, "project_wheel_build_canceled", "uv build was canceled")
+	}
+	if containmentErr != nil {
+		return nil, exit.Named(exit.Structural, "project_wheel_builder_uncontained",
+			"cannot contain the uv build process tree: %v", containmentErr)
+	}
 	if cmd.ProcessState == nil {
 		return nil, exit.Named(exit.Structural, "project_wheel_builder_missing",
 			"cannot run uv build: %v", runErr).
 			WithRemedy("install uv; Cozy delegates standard PEP 517 wheel construction to `uv build --wheel`")
 	}
 	if cmd.ProcessState.ExitCode() != 0 {
-		detail := strings.Join(strings.Fields(string(body)), " ")
+		detail := strings.Join(strings.Fields(body), " ")
 		if detail == "" {
 			detail = runErr.Error()
 		}
@@ -74,4 +160,31 @@ func Build(req Request) (*Result, *exit.Error) {
 			"uv build output is not one regular wheel at or below %d B", MaxWheelBytes)
 	}
 	return &Result{Path: wheels[0]}, nil
+}
+
+func monitorBuild(ctx context.Context, cancel context.CancelCauseFunc, done <-chan struct{}, log *buildLog,
+	sample time.Duration, stillLimit int,
+) {
+	ticker := time.NewTicker(sample)
+	defer ticker.Stop()
+	last, still := int64(-1), 0
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-done:
+			return
+		case <-ticker.C:
+			at := log.written.Load()
+			if at > last {
+				last, still = at, 0
+				continue
+			}
+			still++
+			if still >= stillLimit {
+				cancel(errBuildStalled)
+				return
+			}
+		}
+	}
 }

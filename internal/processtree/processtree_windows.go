@@ -17,7 +17,7 @@
 // handles SIGTERM elsewhere — and KILL is TerminateJobObject. The job handle lives until
 // the process is provably gone (killed or reaped), so a reused pid can never collide with
 // a stale entry.
-package orchestrator
+package processtree
 
 import (
 	"fmt"
@@ -34,18 +34,18 @@ var jobs = struct {
 	byPID map[int]windows.Handle
 }{byPID: map[int]windows.Handle{}}
 
-// setProcessGroup gives the child its own console process group — the address CTRL_BREAK
+// Prepare gives the child its own console process group — the address CTRL_BREAK
 // needs — and creates it SUSPENDED, so the job can adopt it before it runs.
-func setProcessGroup(cmd *exec.Cmd) {
+func Prepare(cmd *exec.Cmd) {
 	cmd.SysProcAttr = &syscall.SysProcAttr{
 		CreationFlags: windows.CREATE_NEW_PROCESS_GROUP | windows.CREATE_SUSPENDED,
 	}
 }
 
-// adoptProcessGroup puts the SUSPENDED child in a fresh job object and resumes it. Any
+// Adopt puts the SUSPENDED child in a fresh job object and resumes it. Any
 // failure before the resume terminates the child and returns the error: the child has not
 // executed an instruction yet, so ending it is a clean refusal, not a kill.
-func adoptProcessGroup(cmd *exec.Cmd) error {
+func Adopt(cmd *exec.Cmd) error {
 	if cmd.Process == nil {
 		return fmt.Errorf("no process to adopt")
 	}
@@ -127,10 +127,10 @@ func resumeProcess(pid int) error {
 	return nil
 }
 
-// killGroup is the two shutdown tiers. TERM asks: a CTRL_BREAK event to the child's own
+// Kill is the two shutdown tiers. TERM asks: a CTRL_BREAK event to the child's own
 // console group, which its supervisor handles as the cooperative stop — the job stays,
 // because asking is not ending. KILL ends the whole job and retires its handle.
-func killGroup(pid int, sig syscall.Signal) error {
+func Kill(pid int, sig syscall.Signal) error {
 	if sig != syscall.SIGKILL {
 		// The cooperative tier. A detached daemon shares no console with the child, in
 		// which case this errors and the caller's bounded wait falls through to KILL —
@@ -158,11 +158,11 @@ func killGroup(pid int, sig syscall.Signal) error {
 	return windows.TerminateProcess(handle, 1)
 }
 
-// releaseGroup retires the job of a process that is already gone. Closing the handle also
+// Release retires the job of a process that is already gone. Closing the handle also
 // takes any straggling grandchildren with it (KILL_ON_JOB_CLOSE) — the same "the tree dies
 // with the worker" promise the job exists for — and frees the pid slot so a later process
 // reusing the pid can never collide with a stale job.
-func releaseGroup(pid int) {
+func Release(pid int) {
 	jobs.Lock()
 	job, ok := jobs.byPID[pid]
 	if ok {
@@ -176,7 +176,7 @@ func releaseGroup(pid int) {
 
 // alive asks whether the pid still names a running process. A handle that opens and reports
 // STILL_ACTIVE is the closest Windows has to Unix's signal 0.
-func alive(pid int) bool {
+func Alive(pid int) bool {
 	handle, err := windows.OpenProcess(windows.PROCESS_QUERY_LIMITED_INFORMATION, false, uint32(pid))
 	if err != nil {
 		return false

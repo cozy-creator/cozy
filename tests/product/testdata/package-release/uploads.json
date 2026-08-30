@@ -1,0 +1,19 @@
+{
+  "uploads": [
+    {
+      "already_uploaded": false,
+      "expires_at": "2026-08-29T18:00:00Z",
+      "kind": "source",
+      "path": "package.toml",
+      "required_headers": {},
+      "url": "https://storage.invalid/package.toml"
+    },
+    {
+      "already_uploaded": true,
+      "kind": "dependency_wheel",
+      "path": "proof_dependency-1.0.0-py3-none-any.whl",
+      "required_headers": {},
+      "url": ""
+    }
+  ]
+}

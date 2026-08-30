@@ -38,6 +38,9 @@ func handlePackagePublish(ctx *Context) *exit.Error {
 	}
 	var moved int64
 	if begun.State == "pending" {
+		if problem := pack.Build(hctx); problem != nil {
+			return problem
+		}
 		paths := packagepublish.Paths(pack.Files)
 		dependencyWheels := packagepublish.WheelFilenames(pack.DependencyWheels)
 		var uploads []hub.PackageUpload
@@ -60,14 +63,11 @@ func handlePackagePublish(ctx *Context) *exit.Error {
 	if problem != nil {
 		return problem
 	}
-	switch done.QualificationState {
-	case "pending", "qualified", "refused", "unsupported":
-	default:
-		return exit.Internalf("package finalize returned invalid qualification state %q", done.QualificationState)
+	if strings.TrimSpace(done.QualificationState) == "" {
+		return exit.Internalf("package finalize returned no qualification state")
 	}
-
 	profileRows := make([]string, 0, len(done.Profiles))
-	var candidateRows, refusalRows []string
+	var candidateRows, executionRows, refusalRows []string
 	for _, profile := range done.Profiles {
 		profileRows = append(profileRows, profile.Profile+":"+profile.State+":"+profile.BaseRealizationKind)
 		if profile.State == "qualified" {
@@ -80,16 +80,21 @@ func handlePackagePublish(ctx *Context) *exit.Error {
 			refusalRows = append(refusalRows, refusal)
 		}
 	}
+	for _, execution := range done.PackageExecutions {
+		executionRows = append(executionRows, execution.Function+"@"+execution.Profile+"="+
+			execution.State+" ("+execution.Digest+")")
+	}
 	sort.Strings(profileRows)
 	sort.Strings(candidateRows)
+	sort.Strings(executionRows)
 	sort.Strings(refusalRows)
 	fields := []output.Field{
 		{K: "package", V: ref.String()}, {K: "release", V: release},
 		{K: "status", V: "published"}, {K: "changed", V: begun.State != "committed"},
-		{K: "created", V: done.Created}, {K: "qualification", V: done.QualificationState},
+		{K: "qualification", V: done.QualificationState},
 		{K: "qualification_error", V: done.QualificationError},
 		{K: "compatible_profiles", V: done.CompatibleProfiles}, {K: "profiles", V: profileRows},
-		{K: "package_executions", V: done.ExecutionCount},
+		{K: "package_executions", V: executionRows},
 		{K: "requires_python", V: done.RequiresPython}, {K: "requirements", V: done.Requirements},
 		{K: "uploaded", V: output.Bytes(moved)}, {K: "hub", V: c.Base()},
 	}
@@ -137,6 +142,8 @@ type packageFile struct {
 	upload  hub.PackageUpload
 }
 
+const maxConcurrentPackageUploads = 16
+
 func uploadPackageFiles(ctx context.Context, pack *packagepublish.Package, wheel hub.PackageUpload,
 	uploads []hub.PackageUpload,
 ) (int64, *exit.Error) {
@@ -173,12 +180,7 @@ func uploadPackageFiles(ctx context.Context, pack *packagepublish.Package, wheel
 			len(wantSources), len(wantDependencies))
 	}
 
-	type outcome struct {
-		moved int64
-		err   *exit.Error
-	}
-	results := make(chan outcome, len(files))
-	var group sync.WaitGroup
+	pending := make([]packageFile, 0, len(files))
 	for _, file := range files {
 		if file.upload.AlreadyUploaded {
 			continue
@@ -186,16 +188,32 @@ func uploadPackageFiles(ctx context.Context, pack *packagepublish.Package, wheel
 		if file.upload.URL == "" {
 			return 0, exit.Internalf("package upload returned no URL for %s", file.subject)
 		}
+		pending = append(pending, file)
+	}
+	type outcome struct {
+		moved int64
+		err   *exit.Error
+	}
+	jobs := make(chan packageFile, len(pending))
+	results := make(chan outcome, len(pending))
+	for _, file := range pending {
+		jobs <- file
+	}
+	close(jobs)
+	var group sync.WaitGroup
+	for range min(len(pending), maxConcurrentPackageUploads) {
 		group.Add(1)
-		go func(file packageFile) {
+		go func() {
 			defer group.Done()
-			uploaded, bytes, problem := transfer.UploadPresigned(ctx, file.subject, file.path,
-				file.upload.URL, file.upload.RequiredHeaders)
-			if !uploaded {
-				bytes = 0
+			for file := range jobs {
+				uploaded, bytes, problem := transfer.UploadPresigned(ctx, file.subject, file.path,
+					file.upload.URL, file.upload.RequiredHeaders)
+				if !uploaded {
+					bytes = 0
+				}
+				results <- outcome{moved: bytes, err: problem}
 			}
-			results <- outcome{moved: bytes, err: problem}
-		}(file)
+		}()
 	}
 	group.Wait()
 	close(results)
@@ -207,13 +225,4 @@ func uploadPackageFiles(ctx context.Context, pack *packagepublish.Package, wheel
 		}
 	}
 	return moved, nil
-}
-
-func packageReleaseRef(value string) (hub.Ref, string, *exit.Error) {
-	name, release, ok := strings.Cut(strings.TrimSpace(value), "@")
-	if !ok || release == "" || strings.Contains(release, "@") || strings.ContainsAny(release, `/\\`) {
-		return hub.Ref{}, "", exit.Usagef("%q is not <org/package>@<release>", value)
-	}
-	ref, problem := hub.ParseRef(name)
-	return ref, release, problem
 }

@@ -1,9 +1,8 @@
 package producttest
 
 import (
-	"bytes"
+	"context"
 	"crypto/sha256"
-	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
@@ -14,14 +13,11 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
-	"reflect"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/cozy-creator/cozy/internal/exit"
-	"github.com/cozy-creator/cozy/internal/hub"
-	"github.com/cozy-creator/cozy/internal/managedinstall"
 	"github.com/cozy-creator/cozy/internal/packagepublish"
 	"github.com/cozy-creator/cozy/internal/records"
 	"github.com/cozy-creator/cozy/internal/wheel"
@@ -29,108 +25,16 @@ import (
 
 const weightlessRef = "cozy/weightless"
 
-func TestManagedInstallExactDependencyOverlayContract(t *testing.T) {
-	fixture := filepath.Join("testdata", "tensorhub-wheel-contract")
-	bundleBytes, err := os.ReadFile(filepath.Join(fixture, "package-bundle.json"))
-	must(t, err)
-	bundleBytes = bytes.TrimSpace(bundleBytes)
-	resolvedBytes, err := os.ReadFile(filepath.Join(fixture, "resolved-wheel-set.json"))
-	must(t, err)
-	resolvedBytes = bytes.TrimSpace(resolvedBytes)
-	exact := func(body []byte) hub.ExactDocument {
-		sum := sha256.Sum256(body)
-		return hub.ExactDocument{Digest: "sha256:" + hex.EncodeToString(sum[:]),
-			Length: int64(len(body)), CanonicalBytes: body}
-	}
-	var links struct {
-		PackageDescriptor  hub.ObjectRef `json:"package_descriptor"`
-		ResolvedWheelSet   hub.ObjectRef `json:"resolved_wheel_set"`
-		WheelhouseManifest hub.ObjectRef `json:"wheelhouse_manifest"`
-	}
-	var resolved struct {
-		ResolutionLockDigest string `json:"resolution_lock_digest"`
-		ResolutionLockLength int64  `json:"resolution_lock_length"`
-	}
-	must(t, json.Unmarshal(bundleBytes, &links))
-	must(t, json.Unmarshal(resolvedBytes, &resolved))
-	grant := hub.LocalQualificationMaterials{
-		PackageBundle:      exact(bundleBytes),
-		ResolvedWheelSet:   exact(resolvedBytes),
-		PackageDescriptor:  hub.ExactDocument{Digest: links.PackageDescriptor.Digest, Length: links.PackageDescriptor.Length},
-		WheelhouseManifest: hub.ExactDocument{Digest: links.WheelhouseManifest.Digest, Length: links.WheelhouseManifest.Length},
-		ResolutionLock:     hub.ExactDocument{Digest: resolved.ResolutionLockDigest, Length: resolved.ResolutionLockLength},
-		PackageEnvironmentSpec: hub.ExactDocument{
-			Digest: "sha256:" + strings.Repeat("1", 64), Length: 1,
-		},
-	}
-	if grant.ResolvedWheelSet.Digest != links.ResolvedWheelSet.Digest ||
-		grant.ResolvedWheelSet.Length != links.ResolvedWheelSet.Length {
-		t.Fatal("vendored Tensorhub bundle no longer binds its resolved-wheel-set vector")
-	}
-	facts, problem := managedinstall.ReleaseWheelFacts(grant, "proof/package@v1")
-	fatal(t, problem)
-	if len(facts) != 2 || facts["project_wheel"].Distribution != "proof-package" ||
-		facts["dependency_wheel/proof-custom"].Distribution != "proof-custom" {
-		t.Fatalf("managed download roles do not cover the exact overlay: %+v", facts)
-	}
-
-	for role, encodedName := range map[string]string{
-		"project_wheel":                 "project-wheel.whl.base64",
-		"dependency_wheel/proof-custom": "dependency-wheel.whl.base64",
-	} {
-		encoded, err := os.ReadFile(filepath.Join(fixture, encodedName))
-		must(t, err)
-		raw, err := base64.StdEncoding.DecodeString(strings.TrimSpace(string(encoded)))
-		must(t, err)
-		path := filepath.Join(t.TempDir(), facts[role].Filename)
-		must(t, os.WriteFile(path, raw, 0o600))
-		var inspected wheel.Fact
-		var inspection *exit.Error
-		if role == "project_wheel" {
-			inspected, inspection = wheel.Inspect(path)
-		} else {
-			inspected, inspection = wheel.InspectDependency(path)
-		}
-		fatal(t, inspection)
-		if !reflect.DeepEqual(inspected, facts[role]) {
-			t.Fatalf("%s bytes disagree with the Tensorhub WheelFact:\n got %+v\nwant %+v", role, inspected, facts[role])
-		}
-	}
-
-	rows := []map[string]any{
-		{"digest": facts["dependency_wheel/proof-custom"].Digest, "distribution": "proof-custom", "owner": "custom", "version": "1.0.0"},
-		{"digest": facts["project_wheel"].Digest, "distribution": "proof-package", "owner": "project", "version": "1.0.0"},
-	}
-	receipt := func(rows []map[string]any) []byte {
-		body, err := json.Marshal(map[string]any{
-			"base_family_digest":      grant.WheelhouseManifest.Digest,
-			"environment_spec_digest": grant.PackageEnvironmentSpec.Digest,
-			"format":                  "cozy.runtime.PackageOverlayReceipt/1", "overlay_wheels": rows,
-			"project_wheel_digest": facts["project_wheel"].Digest,
-		})
-		must(t, err)
-		return body
-	}
-	receiptPath := filepath.Join(t.TempDir(), "receipt.json")
-	must(t, os.WriteFile(receiptPath, receipt(rows), 0o600))
-	contentDigest, problem := managedinstall.VerifyOverlayReceipt(receiptPath, grant, facts)
-	fatal(t, problem)
-	if !strings.HasPrefix(contentDigest, "sha256:") {
-		t.Fatalf("overlay receipt returned malformed content identity %q", contentDigest)
-	}
-	rows[0]["owner"] = "base"
-	must(t, os.WriteFile(receiptPath, receipt(rows), 0o600))
-	if _, problem := managedinstall.VerifyOverlayReceipt(receiptPath, grant, facts); problem == nil {
-		t.Fatal("Runtime receipt changed a selected dependency owner without refusal")
-	}
-}
-
 func TestPackagePublishMetadataGrammar(t *testing.T) {
 	root := t.TempDir()
 	if code, help := runCozy(t, root, "package", "publish", "--help"); code != 0 ||
 		strings.Contains(help, "--release") || strings.Contains(help, "--dir") ||
 		strings.Contains(help, "<package>") {
 		t.Fatalf("package publish retained caller-authored identity [exit %d]\n%s", code, help)
+	}
+	if code, help := runCozy(t, root, "package", "install", "--help"); code != 0 ||
+		strings.Contains(help, "--profile") || strings.Contains(help, "--major") {
+		t.Fatalf("package install retained the unusable managed-local lane [exit %d]\n%s", code, help)
 	}
 	project := t.TempDir()
 	must(t, os.WriteFile(filepath.Join(project, "pyproject.toml"), []byte(`[project]
@@ -144,6 +48,57 @@ version = "1.0.0"
 		"package", "publish")
 	if code != 1 || !strings.Contains(out, "must declare [tool.cozy] organization") {
 		t.Fatalf("missing [tool.cozy] organization was not refused before build [exit %d]\n%s", code, out)
+	}
+}
+
+func TestPackagePublishRefusesSilentlyOmittedPrivateFiles(t *testing.T) {
+	project := t.TempDir()
+	writePublishProject(t, project, "private-package", "1.0.0", nil, "", true)
+	must(t, os.WriteFile(filepath.Join(project, ".env"), []byte("TOKEN=secret\n"), 0o600))
+	pack, problem := packagepublish.PrepareFrom(project)
+	if pack != nil {
+		pack.Close()
+	}
+	if problem == nil || problem.Name != "package_source_file_refused" {
+		t.Fatalf("private source file was silently skipped: %v", problem)
+	}
+}
+
+func TestPackagePublishCommittedReplaySkipsBuildAndCarriesFutureQualification(t *testing.T) {
+	project := t.TempDir()
+	must(t, os.Mkdir(filepath.Join(project, "replay_package"), 0o755))
+	must(t, os.WriteFile(filepath.Join(project, "replay_package", "__init__.py"), []byte("VALUE = 1\n"), 0o644))
+	must(t, os.WriteFile(filepath.Join(project, "pyproject.toml"), []byte(`[build-system]
+requires = []
+build-backend = "backend.that.does.not.exist"
+
+[project]
+name = "replay-package"
+version = "1.0.0"
+
+[tool.cozy]
+organization = "proof"
+`), 0o644))
+	must(t, os.WriteFile(filepath.Join(project, "package.toml"), []byte("[application]\nobject = \"replay_package:app\"\n"), 0o644))
+	must(t, os.WriteFile(filepath.Join(project, "uv.lock"), []byte("version = 1\n"), 0o644))
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch r.Method {
+		case http.MethodPost:
+			_, _ = io.WriteString(w, `{"project_wheel_upload":{"already_uploaded":true,"required_headers":{},"url":""},"state":"committed"}`)
+		case http.MethodPut:
+			_, _ = io.WriteString(w, `{"compatible_profiles":[],"package_executions":[],"profiles":[],"qualification_state":"future-compatible-state","requirements":[],"requires_python":""}`)
+		default:
+			http.Error(w, "unexpected method", http.StatusMethodNotAllowed)
+		}
+	}))
+	defer server.Close()
+	code, out := runCozyDir(t, t.TempDir(), project,
+		[]string{"TENSORHUB_URL=" + server.URL, "TENSORHUB_TOKEN=proof-token"}, "package", "publish")
+	if code != 0 || !strings.Contains(out, "future-compatible-state") ||
+		!strings.Contains(out, "changed:") || !strings.Contains(out, "false") {
+		t.Fatalf("committed replay built the project or rejected a future qualification state [exit %d]\n%s", code, out)
 	}
 }
 
@@ -167,12 +122,14 @@ func TestPackagePublishBuildsBoundedLocalDependencyClosure(t *testing.T) {
 	writePublishProject(t, c, "local-c", "3.0.0", nil, "", false)
 	writePublishProject(t, platformCandidate, "cozy-runtime", "0.0.3", nil, "", false) //cozy:allow distribution fixture, not executable access
 
-	pack, problem := packagepublish.PrepareFrom(a)
+	pack, problem := preparePublishPackage(a)
 	fatal(t, problem)
 	defer pack.Close()
 	wheels := map[string]string{}
 	for _, dependency := range pack.DependencyWheels {
-		wheels[dependency.Name] = dependency.Version
+		identity, problem := wheel.InspectIdentity(dependency.Path)
+		fatal(t, problem)
+		wheels[identity.Distribution] = identity.Version
 	}
 	if len(pack.DependencyWheels) != 3 || wheels["local-b"] != "2.1.0" ||
 		wheels["local-c"] != "3.0.0" || wheels["cozy-runtime"] != "0.0.3" { //cozy:allow distribution assertion, not executable access
@@ -196,7 +153,7 @@ func TestPackagePublishBuildsBoundedLocalDependencyClosure(t *testing.T) {
 
 	writePublishProject(t, a, "local-a", "1.0.0", []string{"local-b>=3"},
 		"local-b = { workspace = true }\n", true)
-	if incompatible, problem := packagepublish.PrepareFrom(a); problem == nil || problem.Name != "local_dependency_version_incompatible" {
+	if incompatible, problem := preparePublishPackage(a); problem == nil || problem.Name != "local_dependency_version_incompatible" {
 		if incompatible != nil {
 			incompatible.Close()
 		}
@@ -208,7 +165,7 @@ func TestPackagePublishBuildsBoundedLocalDependencyClosure(t *testing.T) {
 		"local-b = { workspace = true }\n", true)
 	writePublishProject(t, c, "local-c", "3.0.0", []string{"local-a==1.0.0"},
 		"local-a = { path = \"../local-a\" }\n", false)
-	if cycle, problem := packagepublish.PrepareFrom(a); problem == nil || problem.Name != "local_dependency_cycle" {
+	if cycle, problem := preparePublishPackage(a); problem == nil || problem.Name != "local_dependency_cycle" {
 		if cycle != nil {
 			cycle.Close()
 		}
@@ -229,7 +186,7 @@ func TestPackagePublishBuildsBoundedLocalDependencyClosure(t *testing.T) {
 		"shared = { path = \"../x2\" }\n", false)
 	writePublishProject(t, x1, "shared", "1", nil, "", false)
 	writePublishProject(t, x2, "shared", "2", nil, "", false)
-	if conflict, problem := packagepublish.PrepareFrom(conflictRoot); problem == nil || problem.Name != "local_dependency_duplicate" {
+	if conflict, problem := preparePublishPackage(conflictRoot); problem == nil || problem.Name != "local_dependency_duplicate" {
 		if conflict != nil {
 			conflict.Close()
 		}
@@ -251,7 +208,7 @@ func TestPackagePublishBuildsBoundedLocalDependencyClosure(t *testing.T) {
 		}
 		writePublishProject(t, filepath.Join(countParent, name), name, "1", dependencies, sources, false)
 	}
-	if counted, problem := packagepublish.PrepareFrom(countRoot); problem == nil || problem.Name != "local_dependency_count_exceeded" {
+	if counted, problem := preparePublishPackage(countRoot); problem == nil || problem.Name != "local_dependency_count_exceeded" {
 		if counted != nil {
 			counted.Close()
 		}
@@ -261,7 +218,7 @@ func TestPackagePublishBuildsBoundedLocalDependencyClosure(t *testing.T) {
 
 	directRoot := filepath.Join(t.TempDir(), "direct")
 	writePublishProject(t, directRoot, "direct-root", "1", []string{"foreign @ https://example.invalid/foreign.whl"}, "", true)
-	if direct, problem := packagepublish.PrepareFrom(directRoot); problem == nil || problem.Name != "project_dependency_direct_url_unsupported" {
+	if direct, problem := preparePublishPackage(directRoot); problem == nil || problem.Name != "project_dependency_direct_url_unsupported" {
 		if direct != nil {
 			direct.Close()
 		}
@@ -271,12 +228,24 @@ func TestPackagePublishBuildsBoundedLocalDependencyClosure(t *testing.T) {
 	gitRoot := filepath.Join(t.TempDir(), "git")
 	writePublishProject(t, gitRoot, "git-root", "1", []string{"foreign==1"},
 		"foreign = { git = \"https://example.invalid/foreign.git\" }\n", true)
-	if git, problem := packagepublish.PrepareFrom(gitRoot); problem == nil || problem.Name != "project_dependency_source_unsupported" {
+	if git, problem := preparePublishPackage(gitRoot); problem == nil || problem.Name != "project_dependency_source_unsupported" {
 		if git != nil {
 			git.Close()
 		}
 		t.Fatalf("VCS dependency source did not refuse: %v", problem)
 	}
+}
+
+func preparePublishPackage(root string) (*packagepublish.Package, *exit.Error) {
+	pack, problem := packagepublish.PrepareFrom(root)
+	if problem != nil {
+		return nil, problem
+	}
+	if problem := pack.Build(context.Background()); problem != nil {
+		pack.Close()
+		return pack, problem
+	}
+	return pack, nil
 }
 
 func writePublishProject(t *testing.T, root, name, version string, dependencies []string, sources string, publishable bool) {

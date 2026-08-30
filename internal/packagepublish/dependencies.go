@@ -1,6 +1,7 @@
 package packagepublish
 
 import (
+	"context"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -25,8 +26,6 @@ const (
 // derives its own facts from Path after upload; these fields are local checks
 // and upload addressing, not caller-authored catalog identity.
 type DependencyWheel struct {
-	Name     string
-	Version  string
 	Filename string
 	Path     string
 }
@@ -52,6 +51,7 @@ type dependencyRecord struct {
 }
 
 type dependencyCollector struct {
+	ctx    context.Context
 	stage  string
 	wheels []DependencyWheel
 	byName map[string]dependencyRecord
@@ -63,13 +63,13 @@ type dependencyCollector struct {
 
 var requirementName = regexp.MustCompile(`^[A-Za-z0-9](?:[A-Za-z0-9._-]*[A-Za-z0-9])?`)
 
-func collectLocalDependencies(root string, document projectMetadata, stage string) ([]DependencyWheel, *exit.Error) {
+func collectLocalDependencies(ctx context.Context, root string, document projectMetadata, stage string) ([]DependencyWheel, *exit.Error) {
 	canonical, problem := canonicalLocalPath(root)
 	if problem != nil {
 		return nil, problem
 	}
 	collector := &dependencyCollector{
-		stage: stage, byName: map[string]dependencyRecord{}, extras: map[string]map[string]bool{},
+		ctx: ctx, stage: stage, byName: map[string]dependencyRecord{}, extras: map[string]map[string]bool{},
 		stack: map[string]bool{canonical: true},
 	}
 	if name := normalizedProjectName(document.Project.Name); name != "" {
@@ -209,7 +209,7 @@ func (c *dependencyCollector) collectDirectory(req requirement, source string) *
 	delete(c.stack, canonical)
 
 	out := filepath.Join(c.stage, "dependencies", fmt.Sprintf("%02d-%s", len(c.wheels)+1, name))
-	built, problem := wheel.Build(wheel.Request{Tree: canonical, OutDir: out})
+	built, problem := wheel.Build(wheel.Request{Context: c.ctx, Tree: canonical, OutDir: out})
 	if problem != nil {
 		return problem
 	}
@@ -265,10 +265,7 @@ func (c *dependencyCollector) add(identity wheel.Identity, path string) *exit.Er
 			"local dependency wheels exceed %d B combined", MaxDependencyWheelBytes)
 	}
 	c.total += identity.Length
-	c.wheels = append(c.wheels, DependencyWheel{
-		Name: identity.Distribution, Version: identity.Version,
-		Filename: identity.Filename, Path: path,
-	})
+	c.wheels = append(c.wheels, DependencyWheel{Filename: identity.Filename, Path: path})
 	return nil
 }
 

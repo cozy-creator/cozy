@@ -30,6 +30,8 @@ recursively builds a separate non-editable wheel. Requested extras recursively a
 `[project.optional-dependencies]` groups. Cycles, conflicting normalized names, incompatible
 versions, more than 32 wheels, or more than 512 MiB of dependency wheels refuse before publication.
 Direct URL and VCS requirements are not accepted. Development dependency groups are ignored.
+Source custody is limited to 20,000 files and 512 MiB total; each source file is limited to 64 MiB
+and `uv.lock` to 16 MiB. The three required files must be non-empty.
 
 Creator does not infer base ownership from distribution names. It uploads every referenced local
 candidate; Tensorhub checks standard requirements against each exact base worker image, chooses its
@@ -42,7 +44,7 @@ Cozy runs `uv build --wheel` against the current tree. `uv` invokes the
 project's declared PEP 517 backend; Cozy does not maintain another Python
 package builder. Cozy verifies that every local wheel's name and version agrees with its project and
 the parent requirement. Tensorhub independently inspects the uploaded bytes and decides profile
-compatibility.
+compatibility. A build that repeatedly emits no output is stopped as stalled.
 
 Publication is one small release transaction:
 
@@ -53,11 +55,18 @@ Publication is one small release transaction:
 3. It uploads the exact files and separate wheels directly to object storage.
 4. It finalizes with `PUT /v1/packages/{org}/{name}/releases/{release}` and an empty JSON object.
 
+The open call happens before wheel construction. A committed replay therefore skips every build
+and upload. At most 16 outstanding file uploads run concurrently.
+
 Cozy sends no claimed wheel identity, digest/length manifest, descriptor, profile, GPU selection,
 model binding, or resolved dependency set. Tensorhub reads the uploaded bytes, computes their hashes
 and lengths, inspects package metadata,
 and derives compatible base worker images from its own inventory. Reopening a
 committed release is an idempotent no-upload replay.
+
+A pending retry keeps slots whose bytes Tensorhub already accepted and fills only missing slots
+from the current tree. Changing the tree during a partial publication does not replace accepted
+bytes; publish a new project version when the intended release contents changed.
 
 Finalize commits valid package custody even when no compatible base is active. In that case Cozy
 reports a successful publication with zero qualified executions. Tensorhub later reconciles the

@@ -1,0 +1,11 @@
+{
+  "project_wheel_upload": {
+    "already_uploaded": false,
+    "expires_at": "2026-08-29T18:00:00Z",
+    "required_headers": {
+      "Content-Type": "application/octet-stream"
+    },
+    "url": "https://storage.invalid/project.whl"
+  },
+  "state": "pending"
+}

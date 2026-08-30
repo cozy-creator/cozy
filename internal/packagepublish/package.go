@@ -2,6 +2,7 @@
 package packagepublish
 
 import (
+	"context"
 	"io/fs"
 	"os"
 	"path/filepath"
@@ -14,8 +15,13 @@ import (
 	"github.com/pelletier/go-toml/v2"
 )
 
-const MaxSourceBytes int64 = 512 << 20
-const maxProjectMetadataBytes = 1 << 20
+const (
+	MaxSourceBytes          int64 = 512 << 20
+	MaxSourceFileBytes      int64 = 64 << 20
+	MaxSourceFiles                = 20_000
+	maxLockBytes            int64 = 16 << 20
+	maxProjectMetadataBytes       = 1 << 20
+)
 
 var projectNameSeparator = regexp.MustCompile(`[-_.]+`)
 
@@ -25,7 +31,8 @@ type Package struct {
 	Files            map[string]string // source-relative path -> local path
 	Wheel            string
 	DependencyWheels []DependencyWheel
-	Root             string // disposable wheel output
+	Tree             string
+	Root             string // disposable wheel output, empty until Build
 	Organization     string
 	Name             string
 	Release          string
@@ -33,8 +40,9 @@ type Package struct {
 
 func (p *Package) Close() { _ = os.RemoveAll(p.Root) }
 
-// Prepare reads the current working tree and builds its wheel through the
-// project's standard PEP 517 backend. Git and commit state are irrelevant.
+// Prepare reads publication identity and source paths without executing the
+// project's build backend. The caller can therefore ask Tensorhub whether the
+// release is already committed before doing any wheel work.
 func Prepare() (*Package, *exit.Error) {
 	return PrepareFrom(".")
 }
@@ -54,36 +62,55 @@ func PrepareFrom(projectDir string) (*Package, *exit.Error) {
 	if problem != nil {
 		return nil, problem
 	}
+	return &Package{
+		Files: files, Tree: tree, Organization: metadata.Organization,
+		Name: normalizedProjectName(metadata.Name), Release: metadata.Version,
+	}, nil
+}
+
+// Build runs the standard PEP 517 backend and builds local dependency wheels.
+// It is deliberately separate from Prepare so committed replays do no builds.
+func (p *Package) Build(ctx context.Context) *exit.Error {
+	if p.Root != "" || p.Wheel != "" {
+		return exit.Internalf("package publication wheel staging was built more than once")
+	}
+	document, problem := readProjectDocument(p.Files["pyproject.toml"])
+	if problem != nil {
+		return problem
+	}
 	root, err := os.MkdirTemp("", "cozy-package-publish-")
 	if err != nil {
-		return nil, exit.Internalf("cannot create package publication staging: %s", err)
+		return exit.Internalf("cannot create package publication staging: %s", err)
 	}
-	project, problem := wheel.Build(wheel.Request{Tree: tree, OutDir: root})
+	p.Root = root
+	project, problem := wheel.Build(wheel.Request{Context: ctx, Tree: p.Tree, OutDir: root})
 	if problem != nil {
-		_ = os.RemoveAll(root)
-		return nil, problem
+		p.Close()
+		p.Root = ""
+		return problem
 	}
 	fact, problem := wheel.InspectIdentity(project.Path)
 	if problem != nil {
-		_ = os.RemoveAll(root)
-		return nil, problem
+		p.Close()
+		p.Root = ""
+		return problem
 	}
-	if normalizedProjectName(metadata.Name) != fact.Distribution || metadata.Version != fact.Version {
-		_ = os.RemoveAll(root)
-		return nil, exit.Named(exit.Validation, "project_metadata_mismatch",
+	if p.Name != fact.Distribution || p.Release != fact.Version {
+		p.Close()
+		p.Root = ""
+		return exit.Named(exit.Validation, "project_metadata_mismatch",
 			"pyproject.toml declares %s==%s but the built wheel declares %s==%s",
-			metadata.Name, metadata.Version, fact.Distribution, fact.Version).
+			p.Name, p.Release, fact.Distribution, fact.Version).
 			WithRemedy("fix the build backend so wheel identity comes from [project] name and version")
 	}
-	dependencies, problem := collectLocalDependencies(tree, document, root)
+	dependencies, problem := collectLocalDependencies(ctx, p.Tree, document, root)
 	if problem != nil {
-		_ = os.RemoveAll(root)
-		return nil, problem
+		p.Close()
+		p.Root = ""
+		return problem
 	}
-	return &Package{
-		Files: files, Wheel: project.Path, DependencyWheels: dependencies, Root: root,
-		Organization: metadata.Organization, Name: fact.Distribution, Release: fact.Version,
-	}, nil
+	p.Wheel, p.DependencyWheels = project.Path, dependencies
+	return nil
 }
 
 type projectMetadata struct {
@@ -151,6 +178,9 @@ var ignoredDir = map[string]bool{
 	".git": true, ".hg": true, ".svn": true, ".jj": true,
 	"__pycache__": true, ".mypy_cache": true, ".ruff_cache": true,
 	".pytest_cache": true, ".tox": true,
+}
+
+var refusedDir = map[string]bool{
 	".aws": true, ".ssh": true, "credentials": true, "secrets": true,
 }
 
@@ -189,6 +219,11 @@ func sourceTree(tree string) (string, map[string]string, *exit.Error) {
 			if err != nil {
 				return err
 			}
+			if refusedDir[name] {
+				return exit.Named(exit.Validation, "package_source_private_directory",
+					"package source contains private directory %s", filepath.ToSlash(rel)).
+					WithRemedy("remove credentials and secrets from the project tree before publication")
+			}
 			atRoot := !strings.Contains(filepath.ToSlash(rel), "/")
 			if ignoredDir[name] || strings.HasSuffix(name, ".egg-info") ||
 				(atRoot && ignoredRootDir[name]) {
@@ -196,7 +231,7 @@ func sourceTree(tree string) (string, map[string]string, *exit.Error) {
 			}
 			return nil
 		}
-		if ignoredFile[name] || refusedSourceFile(name) {
+		if ignoredFile[name] {
 			return nil
 		}
 		rel, err := filepath.Rel(root, file)
@@ -204,12 +239,29 @@ func sourceTree(tree string) (string, map[string]string, *exit.Error) {
 			return err
 		}
 		rel = filepath.ToSlash(rel)
+		if refusedSourceFile(name) {
+			return exit.Named(exit.Validation, "package_source_file_refused",
+				"package source contains non-publishable file %s", rel).
+				WithRemedy("remove credentials, generated bytecode, keys, and model weights from the package source tree")
+		}
 		if entry.Type()&fs.ModeSymlink != 0 {
 			return exit.Named(exit.Validation, "package_source_entry_invalid", "%s is a symlink", rel)
 		}
 		info, err := entry.Info()
 		if err != nil || !info.Mode().IsRegular() {
 			return exit.Named(exit.Validation, "package_source_entry_invalid", "%s is not a regular file", rel)
+		}
+		limit := MaxSourceFileBytes
+		if rel == "uv.lock" {
+			limit = maxLockBytes
+		}
+		if info.Size() > limit {
+			return exit.Named(exit.Validation, "package_source_file_too_large",
+				"%s is %d B; package source files may be at most %d B", rel, info.Size(), limit)
+		}
+		if len(files) >= MaxSourceFiles {
+			return exit.Named(exit.Validation, "package_source_file_count_exceeded",
+				"package source has more than %d files", MaxSourceFiles)
 		}
 		total += info.Size()
 		if total > MaxSourceBytes {
@@ -229,6 +281,10 @@ func sourceTree(tree string) (string, map[string]string, *exit.Error) {
 		if files[required] == "" {
 			return "", nil, exit.Named(exit.Validation, "package_source_required_file_missing",
 				"package source has no %s", required)
+		}
+		if info, err := os.Stat(files[required]); err != nil || info.Size() == 0 {
+			return "", nil, exit.Named(exit.Validation, "package_source_required_file_empty",
+				"package source requires a non-empty %s", required)
 		}
 	}
 	return root, files, nil

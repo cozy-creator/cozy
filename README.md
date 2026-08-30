@@ -61,9 +61,7 @@ Search the Tensorhub catalog, install a package, and inspect local installations
 ```sh
 cozy package search video
 cozy package search org/name
-cozy package install org/name@release \
-  --profile torch2.13.0-cu130-cp312-linux-x86 \
-  --major v1
+cozy package install org/name@v1 --from ./package.tar.gz
 cozy package list
 ```
 
@@ -83,6 +81,9 @@ Publishing builds the current working tree with `uv build --wheel`; Git, commits
 are not publication inputs. Standard `[project].dependencies` remain the runtime authority. Cozy
 recursively builds referenced local `[tool.uv.sources]` paths/workspace members as separate exact
 wheels in the same publication, including local dependencies activated through requested extras.
+It first asks Tensorhub whether the release is already committed, so a replay skips all wheel
+builds and uploads. Builds and uploads stop when they repeatedly make no byte progress; uploads run
+at no more than 16 files concurrently.
 Creator does not guess which names a base worker image owns: it uploads local candidates, and
 Tensorhub's exact per-profile inventory chooses a compatible base distribution instead of overlaying
 it. Tensorhub resolves indexed requirements and freezes their exact wheels. Development dependency
@@ -111,6 +112,10 @@ configure `tensorhub_token` or `TENSORHUB_TOKEN` explicitly.
 Publication succeeds even when no compatible base worker image is currently active. The package
 appears in the catalog immediately, and Tensorhub qualifies the same immutable release when a
 compatible base becomes available. Until then, invocation remains unavailable.
+
+A pending retry preserves every file already accepted by Tensorhub and uploads only missing slots
+from the current tree. If the tree changed after a partial publication, use a new project version
+instead of relying on a retry to replace already accepted bytes.
 
 Tensorhub owns serving promotion; publication does not move traffic implicitly.
 See [package publication](docs/package-publication.md) for the release contract.

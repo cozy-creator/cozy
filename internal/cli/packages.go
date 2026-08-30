@@ -2,17 +2,13 @@ package cli
 
 import (
 	"fmt"
-	"strconv"
 	"strings"
 
 	"github.com/cozy-creator/cozy/internal/config"
 	"github.com/cozy-creator/cozy/internal/exit"
 	"github.com/cozy-creator/cozy/internal/home"
-	"github.com/cozy-creator/cozy/internal/hub"
 	"github.com/cozy-creator/cozy/internal/install"
-	"github.com/cozy-creator/cozy/internal/managedinstall"
 	"github.com/cozy-creator/cozy/internal/output"
-	"github.com/cozy-creator/cozy/internal/packageprofile"
 	"github.com/cozy-creator/cozy/internal/records"
 )
 
@@ -40,9 +36,6 @@ func open(cfg config.Config, write bool) (home.Layout, *records.Store, *install.
 }
 
 func handleInstall(ctx *Context) *exit.Error {
-	if profile := strings.TrimSpace(ctx.Inv.Value("--profile")); profile != "" {
-		return handleManagedInstall(ctx, profile)
-	}
 	ref, e := install.ParseRef(ctx.Inv.Args[0])
 	if e != nil {
 		return e
@@ -98,73 +91,6 @@ func handleInstall(ctx *Context) *exit.Error {
 	rec.Notes = append(rec.Notes, res.Warnings...)
 	rec.Next = []string{"cozy package list"}
 	return emit(ctx, rec)
-}
-
-func handleManagedInstall(ctx *Context, profile string) *exit.Error {
-	if ctx.Inv.Value("--from") != "" || ctx.Inv.Value("--digest") != "" ||
-		ctx.Inv.Bool("--allow-unsigned") || ctx.Inv.Value("--dir") != "" {
-		return exit.Usagef("published --profile install cannot be combined with --from, --digest, --allow-unsigned, or editable --dir").
-			WithRemedy("a qualified release uses exact Tensorhub documents and prebuilt wheels; development source uses the separate --from/--dir lane")
-	}
-	ref, release, e := packageReleaseRef(ctx.Inv.Args[0])
-	if e != nil {
-		return e
-	}
-	profiles, e := packageprofile.NormalizeSet([]string{profile})
-	if e != nil {
-		return e
-	}
-	majorText := strings.TrimSpace(ctx.Inv.Value("--major"))
-	if !strings.HasPrefix(majorText, "v") {
-		return exit.Usagef("published --profile install needs --major vN")
-	}
-	major, err := strconv.Atoi(strings.TrimPrefix(majorText, "v"))
-	if err != nil || major <= 0 {
-		return exit.Usagef("--major %q is not vN with N greater than zero", majorText)
-	}
-	reason := "cozy package install " + ref.String() + "@" + release + " for " + profiles[0]
-	l, st, writer, e := open(ctx.Cfg, true)
-	if e != nil {
-		return e
-	}
-	defer st.Close()
-	defer writer.Unlock()
-	c := client(ctx)
-	hctx, cancel := hub.LongContext()
-	defer cancel()
-	grant, e := c.PackageLocalQualificationMaterials(hctx, ref, release, profiles[0], reason)
-	if e != nil {
-		return e
-	}
-	installed, e := managedinstall.Run(hctx, l, st, managedinstall.Request{
-		Package: ref.String(), Release: release, Major: major, Profile: profiles[0],
-		Force: ctx.Inv.Bool("--force"), Grant: grant, Config: ctx.Cfg,
-	})
-	if e != nil {
-		return e
-	}
-	g, facts := installed.Install, installed.Facts
-	fields := []output.Field{
-		{K: "package", V: g.Package}, {K: "major", V: g.Major}, {K: "release", V: g.Version},
-		{K: "status", V: "installed"}, {K: "changed", V: !installed.Idempotent},
-		{K: "profile", V: facts.Profile}, {K: "candidate", V: facts.CandidateID},
-		{K: "generation", V: g.ID}, {K: "base_realization", V: facts.BaseRealizationDigest},
-		{K: "wheelhouse", V: facts.WheelhouseManifestDigest},
-		{K: "environment", V: facts.EnvironmentSpecDigest},
-		{K: "receipt", V: facts.InstalledReceiptDigest}, {K: "host_evidence", V: facts.HostEvidenceDigest},
-		{K: "lease", V: facts.LeaseID + " until " + facts.LeaseExpiresAt},
-		{K: "disk", V: diskText(g)},
-	}
-	if installed.Superseded != "" {
-		reclaimed, problem := install.Reclaim(st, installed.Superseded)
-		if problem != nil {
-			return problem
-		}
-		fields = append(fields,
-			output.Field{K: "superseded", V: installed.Superseded},
-			output.Field{K: "reclaimed", V: output.Bytes(reclaimed)})
-	}
-	return emit(ctx, compactRecord(fields, "package", "major", "release", "profile", "status", "disk", "changed"))
 }
 
 func handleLs(ctx *Context) *exit.Error {
