@@ -69,7 +69,8 @@ func handlePackagePublish(ctx *Context) *exit.Error {
 	profileRows := make([]string, 0, len(done.Profiles))
 	var candidateRows, executionRows, refusalRows []string
 	for _, profile := range done.Profiles {
-		profileRows = append(profileRows, profile.Profile+":"+profile.State+":"+profile.BaseRealizationKind)
+		profileRows = append(profileRows, profile.Profile+":"+profile.State+":"+profile.BaseRealizationKind+"@"+
+			profile.BaseRealizationDigest)
 		if profile.State == "qualified" {
 			candidateRows = append(candidateRows, profile.Profile+"/"+profile.BaseRealizationKind+"="+profile.CandidateID)
 		} else {

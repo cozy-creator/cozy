@@ -75,7 +75,12 @@ func TestPackageReleaseClientContract(t *testing.T) {
 	}
 	finalized, problem := client.FinalizePackageRelease(context.Background(), ref, "1.0.0", "proof publish")
 	if problem != nil || finalized.QualificationState != "qualified" ||
-		len(finalized.PackageExecutions) != 1 || finalized.PackageExecutions[0].Function != "generate" {
+		len(finalized.PackageExecutions) != 1 || finalized.PackageExecutions[0].Function != "generate" ||
+		len(finalized.Profiles) != 1 ||
+		finalized.Profiles[0].BaseRealizationDigest != "index.docker.io/tensorhub/worker@sha256:"+strings.Repeat("a", 64) ||
+		finalized.Profiles[0].PackageEnvironmentSpec.Length != 501 ||
+		finalized.Profiles[0].ResolutionLock.Length != 502 ||
+		finalized.Profiles[0].ResolvedWheelSet.Length != 503 {
 		t.Fatalf("finalize response changed: %+v problem=%v", finalized, problem)
 	}
 }
