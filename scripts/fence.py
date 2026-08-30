@@ -767,6 +767,16 @@ def check_typed_resources():
             if old in text:
                 bad.append(f"{path}: [resources] retired product surface remains: {old!r}")
 
+    retired_package_noun = "end" + "point"
+    for path in (
+        pathlib.Path("docs/package-publication.md"),
+        pathlib.Path("scripts/accept.sh"),
+        pathlib.Path("internal/orchestrator/dispatch.go"),
+        pathlib.Path("internal/records/records.go"),
+    ):
+        if retired_package_noun in path.read_text().lower():
+            bad.append(f"{path}: [resources] retired package-domain vocabulary remains")
+
     manifest = pathlib.Path("internal/cli/grammar.go").read_text()
     required_commands = (
         "Search  PackageSearchCmd", "Install PackageInstallCmd", "Remove  PackageRemoveCmd",
