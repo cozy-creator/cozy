@@ -144,8 +144,12 @@ func handleRun(ctx *Context, target Target, ep *launch.Entrypoint) *exit.Error {
 
 	stream := ctx.Inv.Bool("--stream")
 	if !stream {
-		fmt.Fprintf(ctx.Err, "request %s · attempt %d · %s\n",
-			handle.RequestID, handle.Attempt, handle.Status)
+		if ctx.Mode().Full {
+			fmt.Fprintf(ctx.Err, "request %s · attempt %d · %s\n",
+				handle.RequestID, handle.Attempt, handle.Status)
+		} else {
+			fmt.Fprintf(ctx.Err, "Invoking %s/%s...\n", target.Package, target.Function)
+		}
 		if handle.Replay {
 			fmt.Fprintln(ctx.Err, "note: this key returned the existing invocation")
 		}
@@ -404,7 +408,7 @@ func (p *runProgress) on(e localapi.Event) bool {
 	if p.ctx.Mode().JSON {
 		return true // one JSON document on stdout: the run's own, at the end
 	}
-	line := progressLine(e)
+	line := progressLine(e, p.ctx.Mode().Full)
 	if line == "" || line == p.last {
 		return true
 	}
@@ -423,7 +427,7 @@ func (p *runProgress) done() {
 
 // progressLine renders one event. The runtime's own frame vocabulary is carried through
 // (`progress`, `stage`, `metric`) rather than translated into a second one.
-func progressLine(e localapi.Event) string {
+func progressLine(e localapi.Event, full bool) string {
 	kind := strings.TrimPrefix(e.Type, "request.")
 	switch kind {
 	case "progress":
@@ -435,14 +439,37 @@ func progressLine(e localapi.Event) string {
 			return "  " + kind + " " + compactValue(v)
 		}
 	case "queued":
+		if !full {
+			return "  preparing a local worker"
+		}
 		if reason, ok := e.Payload["reason"].(string); ok {
 			return "  queued — " + reason
 		}
 		return "  queued"
-	case "dispatched", "accepted", "submitted", "requeued", "attempt_failed":
-		return "  " + kind + " " + compactValue(e.Payload)
+	case "submitted":
+		if !full {
+			return ""
+		}
+	case "dispatched":
+		if !full {
+			return "  worker selected"
+		}
+	case "accepted":
+		if !full {
+			return "  running"
+		}
+	case "requeued":
+		if !full {
+			return "  retrying"
+		}
+	case "attempt_failed":
+		if !full {
+			return "  attempt failed; retrying"
+		}
+	default:
+		return ""
 	}
-	return ""
+	return "  " + kind + " " + compactValue(e.Payload)
 }
 
 func compactValue(v map[string]any) string {

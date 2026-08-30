@@ -99,7 +99,7 @@ CREATE TABLE IF NOT EXISTS pins (
   major        INTEGER NOT NULL,
   generation   TEXT    NOT NULL REFERENCES install_generations(id),
   activated_at TEXT    NOT NULL,
-  PRIMARY KEY (package, major)
+  PRIMARY KEY (package)
 )`}, append(orchestratorSchema, append(eventSchema, rentalSchema...)...)...)
 
 // renames is the pre-launch domain hardcut expressed as a database migration instead of
@@ -457,7 +457,7 @@ func (s *Store) Pins(pkg string) ([]Pin, *exit.Error) {
 // Unpin drops one pin. The generation row survives as unreferenced until gc — `rm`
 // removes the install, gc reclaims the bytes.
 func (s *Store) Unpin(pkg string, major int) *exit.Error {
-	if _, err := s.db.Exec(`DELETE FROM pins WHERE package=? AND major=?`, pkg, major); err != nil {
+	if _, err := s.db.Exec(`DELETE FROM pins WHERE package=?`, pkg); err != nil {
 		return exit.Internalf("cannot remove the pin for %s@v%d: %s", pkg, major, err)
 	}
 	return nil
@@ -466,7 +466,20 @@ func (s *Store) Unpin(pkg string, major int) *exit.Error {
 // ForgetIfUnreferenced atomically claims one generation for GC. The row goes before
 // filesystem deletion, so a failure leaves an ordinary orphan the next GC can retry.
 func (s *Store) ForgetIfUnreferenced(id string) (bool, *exit.Error) {
-	result, err := s.db.Exec(`DELETE FROM install_generations WHERE id=?
+	tx, err := s.db.Begin()
+	if err != nil {
+		return false, exit.New(exit.Conflict, "cannot begin generation %s gc: %s", id, err)
+	}
+	defer tx.Rollback()
+	if _, err := tx.Exec(`UPDATE requests SET install_id=NULL WHERE install_id=?
+		AND state NOT IN ('submitted','queued','dispatching','requeue_pending')`, id); err != nil {
+		return false, exit.New(exit.Conflict, "cannot release terminal requests from generation %s: %s", id, err)
+	}
+	if _, err := tx.Exec(`UPDATE worker_processes SET generation=NULL WHERE generation=?
+		AND state='closed'`, id); err != nil {
+		return false, exit.New(exit.Conflict, "cannot release closed workers from generation %s: %s", id, err)
+	}
+	result, err := tx.Exec(`DELETE FROM install_generations WHERE id=?
 		AND NOT EXISTS (SELECT 1 FROM pins WHERE generation=?)
 		AND NOT EXISTS (SELECT 1 FROM requests WHERE install_id=?
 		  AND state IN ('submitted','queued','dispatching','requeue_pending'))
@@ -476,5 +489,8 @@ func (s *Store) ForgetIfUnreferenced(id string) (bool, *exit.Error) {
 		return false, exit.New(exit.Conflict, "cannot claim generation %s for gc: %s", id, err)
 	}
 	n, _ := result.RowsAffected()
+	if err := tx.Commit(); err != nil {
+		return false, exit.New(exit.Conflict, "cannot commit generation %s gc: %s", id, err)
+	}
 	return n == 1, nil
 }

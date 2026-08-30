@@ -284,7 +284,7 @@ func newJobProgress(ctx *Context) *jobProgress {
 }
 
 func (p *jobProgress) on(e localapi.Event) bool {
-	line := progressLine(e)
+	line := progressLine(e, p.ctx.Mode().Full)
 	if line == "" || line == p.last {
 		return true
 	}

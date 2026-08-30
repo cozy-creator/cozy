@@ -364,6 +364,10 @@ type worker struct {
 	// waiter gets the ANSWER instead of waiting out the silence window for a worker this
 	// owner has already decided not to talk to (#505's carried-not-verified gap).
 	refusal *exit.Error
+	// desiredRefusal is the worker's permanent verdict on the exact desired revision this
+	// owner issued. It is distinct from a claim refusal and from capacity: a config or
+	// placement-set refusal can never become dispatchable by waiting longer.
+	desiredRefusal *exit.Error
 	// exitCode is the process's own disposition. RECYCLE is not a death (cr-009): a
 	// run-once job worker exits with it the moment its terminal is acknowledged, and
 	// reading that as "the worker died" turns a completed job into a failed request.
@@ -1128,9 +1132,10 @@ func (c *Orchestrator) EnsurePlacementReady(instanceID, planID string) *exit.Err
 		workerFaulted := false
 		quiet := time.Duration(0)
 		unstaged, holds := false, ""
-		var refused *exit.Error
+		var refused, desiredRefusal *exit.Error
 		if w != nil {
 			logPath, fault, code, refused = w.logPath, w.fault, w.exitCode, w.refusal
+			desiredRefusal = w.desiredRefusal
 			workerFaulted = w.faulted
 			if !w.lastReport.IsZero() {
 				quiet = time.Since(w.lastReport)
@@ -1151,6 +1156,10 @@ func (c *Orchestrator) EnsurePlacementReady(instanceID, planID string) *exit.Err
 		// network symptom for an identity fact this process already established.
 		if refused != nil {
 			return refused
+		}
+		if desiredRefusal != nil {
+			return desiredRefusal.WithRemedy(
+				"the installed package Runtime is incompatible with this Cozy build")
 		}
 		// A PLAN THE LAUNCHER NEVER STAGED CAN NEVER BECOME DISPATCHABLE (cl-022's
 		// corollary guard). The live case: submit, then an install --force moves the
