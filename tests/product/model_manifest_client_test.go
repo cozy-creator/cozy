@@ -246,7 +246,7 @@ func TestPublicationUsesReleaseLaneAndManifestOnlySeal(t *testing.T) {
 	}
 }
 
-func TestModelPublicationBatchesGrantAndSettlementRequests(t *testing.T) {
+func TestModelPublicationBatchesGrantRequestsAndFinalizesOnce(t *testing.T) {
 	const objectCount = 257
 	manifestID := "sha256:" + manifestA
 	manifest := []byte(`{}`)
@@ -286,7 +286,7 @@ func TestModelPublicationBatchesGrantAndSettlementRequests(t *testing.T) {
 	}
 	tool := &tfs.Tool{Bin: tfsPath, Root: toolDir}
 
-	var grantCalls, settleCalls atomic.Int32
+	var grantCalls atomic.Int32
 	publicationPath := "/v1/models/acme/model/publications/batch-proof"
 	var server *httptest.Server
 	server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -314,20 +314,6 @@ func TestModelPublicationBatchesGrantAndSettlementRequests(t *testing.T) {
 				t.Errorf("object upload = %q, %v", raw, err)
 			}
 			w.WriteHeader(http.StatusOK)
-		case r.Method == http.MethodPost && r.URL.Path == publicationPath+"/settle":
-			var body struct {
-				Objects []hub.SettleObject `json:"objects"`
-			}
-			if err := json.NewDecoder(r.Body).Decode(&body); err != nil || len(body.Objects) == 0 || len(body.Objects) > 128 {
-				t.Errorf("settlement batch size = %d, %v", len(body.Objects), err)
-			}
-			settleCalls.Add(1)
-			settled := make([]hub.SettledObject, 0, len(body.Objects))
-			for _, object := range body.Objects {
-				settled = append(settled, hub.SettledObject{ObjectID: object.ObjectID,
-					State: "accepted", ChecksumSource: "streamed_sha256", Conflict: object.AlreadyPresent})
-			}
-			_ = json.NewEncoder(w).Encode(map[string]any{"objects": settled})
 		case r.Method == http.MethodPost && r.URL.Path == publicationPath+"/seal":
 			_ = json.NewEncoder(w).Encode(hub.CompleteResponse{PublishID: "batch-proof",
 				Release: "1.0.0", Lane: "bf16", Manifest: hub.ManifestRef{SHA256: manifestA, Length: int64(len(manifest))},
@@ -348,8 +334,8 @@ func TestModelPublicationBatchesGrantAndSettlementRequests(t *testing.T) {
 	if problem != nil {
 		t.Fatal(problem)
 	}
-	if grantCalls.Load() != 3 || settleCalls.Load() != 3 {
-		t.Fatalf("control requests: grants=%d settle=%d, want 3 each", grantCalls.Load(), settleCalls.Load())
+	if grantCalls.Load() != 3 {
+		t.Fatalf("control requests: grants=%d, want 3", grantCalls.Load())
 	}
 	if result.Uploaded != objectCount || result.Verified != objectCount || result.Moved != objectCount {
 		t.Fatalf("publication result = %#v", result)

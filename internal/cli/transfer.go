@@ -147,7 +147,6 @@ func handleModelPublish(ctx *Context) *exit.Error {
 	fields = append(fields,
 		output.Field{K: "uploaded", V: res.Uploaded},
 		output.Field{K: "verified", V: res.Verified},
-		output.Field{K: "checksum_source", V: res.Sources},
 		output.Field{K: "manifest_length", V: res.Manifest.Length},
 		output.Field{K: "topology", V: res.TopologyDigest},
 		output.Field{K: "duplicate", V: res.Dup},

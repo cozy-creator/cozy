@@ -24,13 +24,13 @@ import (
 
 func TestPackageReleaseClientContract(t *testing.T) {
 	ref := hub.Ref{Org: "proof", Name: "package"}
-	releasePath := "/v1/packages/proof/package/releases/1.0.0"
+	publishPath := "/v1/packages/proof/package/publish/1.0.0"
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Header.Get("Authorization") != "Bearer proof-token" || r.Header.Get("X-Tensorhub-Reason") != "proof publish" {
 			t.Errorf("package mutation omitted authentication or audit reason")
 		}
 		switch {
-		case r.Method == http.MethodPost && r.URL.Path == releasePath:
+		case r.Method == http.MethodPost && r.URL.Path == publishPath:
 			var body struct {
 				Paths            []string `json:"paths"`
 				DependencyWheels []string `json:"dependency_wheels"`
@@ -46,7 +46,7 @@ func TestPackageReleaseClientContract(t *testing.T) {
 				{"kind": "dependency_wheel", "path": "proof_dependency-1.0.0-py3-none-any.whl", "url": "https://storage.invalid/dependency", "required_headers": map[string]string{}, "already_uploaded": false},
 			}})
 			return
-		case r.Method == http.MethodPut && r.URL.Path == releasePath:
+		case r.Method == http.MethodPost && r.URL.Path == publishPath+"/finalize":
 			assertEmptyObject(t, r.Body)
 			_ = json.NewEncoder(w).Encode(map[string]any{"state": "committed",
 				"qualification_state": "qualified", "release_digest": "sha256:" + strings.Repeat("a", 64)})
@@ -118,9 +118,12 @@ func TestPackageDownloadPlanContract(t *testing.T) {
 		switch r.URL.Path {
 		case "/v1/packages/proof/package":
 			_, _ = io.WriteString(w, `{"package":{"org":"proof","name":"package","created_at":"2026-08-30T00:00:00Z"},"releases":[{"release":"1.2.3","cut_at":"2026-08-30T00:00:00Z"}]}`)
-		case "/v1/packages/proof/package/releases/1.2.3/downloads":
+		case "/v1/packages/proof/package/download":
 			if r.Method != http.MethodPost {
-				t.Errorf("package selection used %s", r.Method)
+				t.Errorf("package download used %s", r.Method)
+			}
+			if release := r.URL.Query().Get("release"); release != "" && release != "1.2.3" {
+				t.Errorf("package download release = %q", release)
 			}
 			var body struct {
 				Capability      hub.PackageInstallTarget `json:"capability"`
@@ -144,7 +147,7 @@ func TestPackageDownloadPlanContract(t *testing.T) {
 			default:
 				t.Errorf("package install target omitted accelerator: %+v", body.Capability)
 			}
-			_, _ = io.WriteString(w, `{"profile":"cpu-test","placement_set":{"canonical_bytes":"e30=","digest":"sha256:`+strings.Repeat("2", 64)+`","length":2},"package_descriptor":{"canonical_bytes":"e30=","digest":"sha256:`+strings.Repeat("4", 64)+`","length":2},"qualification":{"canonical_bytes":"e30=","digest":"sha256:`+strings.Repeat("5", 64)+`","length":2},"downloads":[{"digest":"sha256:`+strings.Repeat("1", 64)+`","kind":"project_wheel","length":4,"path":"proof.whl","url":"https://storage.invalid/proof.whl"}]}`)
+			_, _ = io.WriteString(w, `{"release":"1.2.3","profile":"cpu-test","placement_set":{"canonical_bytes":"e30=","digest":"sha256:`+strings.Repeat("2", 64)+`","length":2},"package_descriptor":{"canonical_bytes":"e30=","digest":"sha256:`+strings.Repeat("4", 64)+`","length":2},"qualification":{"canonical_bytes":"e30=","digest":"sha256:`+strings.Repeat("5", 64)+`","length":2},"downloads":[{"digest":"sha256:`+strings.Repeat("1", 64)+`","kind":"project_wheel","length":4,"path":"proof.whl","url":"https://storage.invalid/proof.whl"}]}`)
 		default:
 			http.NotFound(w, r)
 		}
@@ -159,7 +162,7 @@ func TestPackageDownloadPlanContract(t *testing.T) {
 	plan, problem := client.PackageDownloads(context.Background(), ref, "1.2.3", hub.PackageInstallTarget{
 		Accelerator: "cpu", OS: "linux", Arch: "x86",
 	})
-	if problem != nil || plan.Profile != "cpu-test" ||
+	if problem != nil || plan.Release != "1.2.3" || plan.Profile != "cpu-test" ||
 		len(plan.Downloads) != 1 || plan.Downloads[0].Path != "proof.whl" {
 		t.Fatalf("package install plan changed: %+v problem=%v", plan, problem)
 	}
@@ -169,6 +172,11 @@ func TestPackageDownloadPlanContract(t *testing.T) {
 	})
 	if problem != nil {
 		t.Fatalf("NVIDIA package install target was refused: %v", problem)
+	}
+	if latest, problem := client.PackageDownloads(context.Background(), ref, "", hub.PackageInstallTarget{
+		Accelerator: "cpu", OS: "linux", Arch: "x86",
+	}); problem != nil || latest.Release != "1.2.3" {
+		t.Fatalf("latest compatible package download = %+v, %v", latest, problem)
 	}
 }
 
@@ -181,7 +189,7 @@ func TestPackagePublishPendingWireFlowBoundsUploads(t *testing.T) {
 	}
 
 	var active, peak, began, finalized atomic.Int64
-	releasePath := "/v1/packages/proof/wire-package/releases/1.0.0"
+	publishPath := "/v1/packages/proof/wire-package/publish/1.0.0"
 	var server *httptest.Server
 	server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
@@ -197,7 +205,7 @@ func TestPackagePublishPendingWireFlowBoundsUploads(t *testing.T) {
 			}
 			time.Sleep(20 * time.Millisecond)
 			w.WriteHeader(http.StatusNoContent)
-		case r.Method == http.MethodPost && r.URL.Path == releasePath:
+		case r.Method == http.MethodPost && r.URL.Path == publishPath:
 			began.Add(1)
 			var body struct {
 				Paths            []string `json:"paths"`
@@ -220,7 +228,7 @@ func TestPackagePublishPendingWireFlowBoundsUploads(t *testing.T) {
 				})
 			}
 			_ = json.NewEncoder(w).Encode(map[string]any{"state": "pending", "uploads": uploads})
-		case r.Method == http.MethodPut && r.URL.Path == releasePath:
+		case r.Method == http.MethodPost && r.URL.Path == publishPath+"/finalize":
 			finalized.Add(1)
 			_ = json.NewEncoder(w).Encode(map[string]any{
 				"state": "committed", "qualification_state": "qualified",

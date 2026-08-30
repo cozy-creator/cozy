@@ -3,8 +3,9 @@ package hub
 // Tensorhub's incremental model-publication protocol and manifest reads, as methods
 // on the ONE client. `do` still owns request construction, credentials, reasons, and
 // error mapping. A publication opens under a stable operation id, claims known object
-// transfers, settles each transfer through grant -> received -> verify, then seals the
-// exact TensorFS documents. The retired declare-whole route has no compatibility path.
+// transfers, uploads through bounded grants, then finalizes by asking Tensorhub to
+// verify the declared final objects and seal the exact TensorFS documents. The retired
+// declare-whole and per-object settlement routes have no compatibility path.
 
 import (
 	"context"
@@ -127,33 +128,6 @@ func (c *Client) GrantKnownTransfers(ctx context.Context, ref Ref, operation str
 		seen[held.ObjectID] = true
 	}
 	return out, nil
-}
-
-type SettleObject struct {
-	ObjectID       string `json:"object_id"`
-	AlreadyPresent bool   `json:"already_present,omitempty"`
-}
-
-type SettledObject struct {
-	ObjectID       string `json:"object_id"`
-	State          string `json:"state"`
-	ChecksumSource string `json:"checksum_source"`
-	Conflict       bool   `json:"conflict"`
-}
-
-func (c *Client) SettleObjects(ctx context.Context, ref Ref, operation string,
-	objects []SettleObject, reason string,
-) ([]SettledObject, *exit.Error) {
-	var out struct {
-		Objects []SettledObject `json:"objects"`
-	}
-	e := c.do(ctx, call{
-		method: http.MethodPost,
-		path:   publications(ref) + "/" + url.PathEscape(operation) + "/settle",
-		auth:   true, reason: reason, byBytes: true, patient: true,
-		body: map[string]any{"objects": objects},
-	}, &out)
-	return out.Objects, e
 }
 
 type SealPublicationRequest struct {

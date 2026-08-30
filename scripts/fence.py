@@ -793,7 +793,8 @@ def check_typed_resources():
     hub_sources = (pathlib.Path("internal/hub/hub.go").read_text() +
                    pathlib.Path("internal/hub/publish.go").read_text() +
                    pathlib.Path("internal/hub/package_releases.go").read_text())
-    for route in ('resourceSearchPath("packages"', 'resourceSearchPath("models"', '"/v1/models/"', '"/publications"'):
+    for route in ('resourceSearchPath("packages"', 'resourceSearchPath("models"', '"/v1/models/"',
+                  '"/publications"', '"/publish/"', '"/finalize"', '"/download"'):
         if route not in hub_sources:
             bad.append(f"internal/hub: [resources] missing typed route prefix {route}")
     wheel_build = pathlib.Path("internal/wheel/build.go").read_text()
