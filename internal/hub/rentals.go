@@ -25,8 +25,8 @@ import (
 //
 // The contract is the hub's and is consumed verbatim, exactly as the catalog's is:
 //
-//	GET    /v1/rental-skus           -> {skus:[{name, accelerator_model, vram_gb,
-//	                                 price_usd_micros_per_hour}]}
+//	GET    /v1/rental-skus           -> [{name, accelerator_model, compute_capability,
+//	                                 vram_gb, price_usd_micros_per_hour}]
 //	POST   /v1/rentals               {package_ref, sku,
 //	                                 media_token_sha256:<64 hex>, creator_public_key}
 //	                                 -> 202 {rental_id, state, ...}

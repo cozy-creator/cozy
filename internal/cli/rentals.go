@@ -77,9 +77,9 @@ func handleRent(ctx *Context) *exit.Error {
 			WithRemedy("append org/package/vN/function").
 			WithNext("cozy rental new " + skuName + " <org/package/vN/function>")
 	}
-	machineName := strings.TrimSpace(ctx.Inv.Value("--name"))
-	if machineName != "" && !rentalid.ValidMachineName(machineName) {
-		return exit.Usagef("--name %q is not a machine name", machineName).
+	requestedMachineName := strings.TrimSpace(ctx.Inv.Value("--name"))
+	if requestedMachineName != "" && !rentalid.ValidMachineName(requestedMachineName) {
+		return exit.Usagef("--name %q is not a machine name", requestedMachineName).
 			WithRemedy("use 1-32 lowercase letters, numbers, and hyphens; local is reserved")
 	}
 	reason := "cozy rental new " + skuName + " for " + packageRef
@@ -198,16 +198,25 @@ func handleRent(ctx *Context) *exit.Error {
 	if e := st.AdvanceRentalOperation(operationKey, r.ID, r.State); e != nil {
 		return e
 	}
+	machineName := requestedMachineName
 	if machineName == "" {
 		machineName = rentalid.MachineName(r.ID)
 	}
 	row := records.Rental{ID: r.ID, MachineName: machineName, SKU: skuName, PackageRef: packageRef,
 		AcceleratorModel: r.AcceleratorModel, State: r.State, Hub: c.Base()}
-	if existing != nil && existing.State == "attached" {
-		stored, problem := st.RentalRow(r.ID)
-		if problem != nil {
-			return problem
+	stored, problem := st.RentalRow(r.ID)
+	if problem != nil {
+		return problem
+	}
+	if stored != nil && stored.MachineName != "" {
+		if requestedMachineName != "" && requestedMachineName != stored.MachineName {
+			return exit.Named(exit.Conflict, "rental.machine_name_changed",
+				"rental %s is already named %s", r.ID, stored.MachineName).
+				WithRemedy("resume it without --name, or use --name %s", stored.MachineName)
 		}
+		row.MachineName = stored.MachineName
+	}
+	if existing != nil && existing.State == "attached" {
 		if stored == nil {
 			return exit.Named(exit.Conflict, "rental.attached_record_missing",
 				"rental operation %s is attached but rental %s has no local row", operationKey, r.ID)
@@ -280,14 +289,14 @@ func handleRent(ctx *Context) *exit.Error {
 	ctx.Daemon = daemon.Probe(ctx.Cfg)
 	if !ctx.Daemon.Up {
 		return ctx.Daemon.Unavailable().WithRemedy(
-			"the paid rental remains converging and attached on this host; start `cozy invoke list` and resume with the same --idempotency-key")
+			"the paid rental remains converging and attached on this host; start `cozy run list` and resume with the same --idempotency-key")
 	}
 	local, e := dial(ctx)
 	if e != nil {
-		return e.WithRemedy("the paid rental remains converging and attached on this host; start `cozy invoke list` and resume with the same --idempotency-key")
+		return e.WithRemedy("the paid rental remains converging and attached on this host; start `cozy run list` and resume with the same --idempotency-key")
 	}
 	if _, e := local.EnsureRental(attachable.ID); e != nil {
-		return e.WithRemedy("the paid rental remains converging and attached on this host; keep `cozy invoke list` running and resume with the same --idempotency-key")
+		return e.WithRemedy("the paid rental remains converging and attached on this host; keep `cozy run list` running and resume with the same --idempotency-key")
 	}
 	observeConvergence := func(seen hub.Rental) *exit.Error {
 		if e := sameAttachProjection(attachable, seen, secret.HashHex(token)); e != nil {
@@ -420,11 +429,11 @@ func handleRentalUpdate(ctx *Context) *exit.Error {
 		return problem
 	}
 	return emit(ctx, compactRecord([]output.Field{
-		{K: "rental", V: id}, {K: "package", V: packageRef},
+		{K: "machine", V: row.MachineName}, {K: "rental", V: id}, {K: "package", V: packageRef},
 		{K: "desired_revision", V: answer.DesiredRevision},
 		{K: "placement_set_digest", V: answer.Selection.PlacementSet.Digest},
 		{K: "worker", V: started.InstanceID},
-	}, "rental", "package", "desired_revision", "placement_set_digest"))
+	}, "machine", "package", "desired_revision", "placement_set_digest"))
 }
 
 func emitRentalCatalog(ctx *Context, skus []hub.RentalSKU) *exit.Error {
@@ -596,8 +605,8 @@ func pastDeadline(id, state string, deadline time.Time) *exit.Error {
 	}
 	return exit.New(exit.Deadline,
 		"rental %s was still %s at the --timeout you set", id, state).
-		WithRemedy("the pod is NOT released; `cozy rental list` still names it and release destroys it").
-		WithNext("cozy rental list", "cozy rental end "+id)
+		WithRemedy("the pod is NOT released; `cozy rental` still names it and release destroys it").
+		WithNext("cozy rental", "cozy rental end "+id)
 }
 
 func detailOr(detail string) string {
@@ -801,7 +810,11 @@ func handleRentRelease(ctx *Context) *exit.Error {
 	}
 	rctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
-	w := releaseWatch{ctx: ctx, c: c, id: id, rctx: rctx}
+	machine := subject
+	if row != nil {
+		machine = row.MachineName
+	}
+	w := releaseWatch{ctx: ctx, c: c, id: id, machine: machine, rctx: rctx}
 
 	seen, gone, e := w.observe()
 	if e != nil {
@@ -838,11 +851,12 @@ func handleRentRelease(ctx *Context) *exit.Error {
 }
 
 type releaseWatch struct {
-	ctx  *Context
-	c    *hub.Client
-	id   string
-	rctx context.Context
-	said string
+	ctx     *Context
+	c       *hub.Client
+	id      string
+	machine string
+	rctx    context.Context
+	said    string
 }
 
 // observe reads the rental until the hub gives a verdict. Transport faults are retried at
@@ -901,7 +915,7 @@ func (w *releaseWatch) say(state, detail string) {
 
 func (w *releaseWatch) kept(e *exit.Error) *exit.Error {
 	return e.WithRemedy("the local record is KEPT: the pod may still be running, and this row is its name here").
-		WithNext("cozy rental list", "cozy rental end "+w.id)
+		WithNext("cozy rental", "cozy rental end "+w.id)
 }
 
 func (w *releaseWatch) interrupted() *exit.Error {
@@ -932,6 +946,7 @@ func (w *releaseWatch) finish(l home.Layout, st *records.Store, operationKey str
 		notes = []string{note + "; this host held no record of it — already released"}
 	}
 	return emit(w.ctx, output.Record{Fields: []output.Field{
-		{K: "rental", V: w.id}, {K: "state", V: "ended"}, {K: "changed", V: forgotten},
+		{K: "machine", V: w.machine}, {K: "rental", V: w.id},
+		{K: "state", V: "ended"}, {K: "changed", V: forgotten},
 	}, Notes: notes})
 }

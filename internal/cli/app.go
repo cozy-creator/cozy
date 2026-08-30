@@ -2,6 +2,7 @@
 package cli
 
 import (
+	"bytes"
 	"errors"
 	"fmt"
 	"io"
@@ -96,6 +97,7 @@ func Run(args []string, stdout, stderr io.Writer) int {
 		kong.Description(description),
 		kong.Writers(stdout, stderr),
 		kong.Exit(func(code int) { helpExit = code }),
+		kong.Help(cozyHelp),
 		kong.ExplicitGroups([]kong.Group{
 			{Key: "Resources", Title: "Resources"},
 			{Key: "Work", Title: "Work"},
@@ -169,9 +171,14 @@ func helpArgs(args []string) []string {
 	}
 	if len(args) == 1 {
 		switch args[0] {
-		case "package", "model", "run":
+		case "package", "model":
 			return []string{args[0], "--help"}
+		case "run":
+			return []string{"run", "org/package/function", "--help"}
 		}
+	}
+	if len(args) == 2 && args[0] == "run" && (args[1] == "--help" || args[1] == "-h") {
+		return []string{"run", "org/package/function", args[1]}
 	}
 	if args[0] != "help" {
 		return args
@@ -179,8 +186,30 @@ func helpArgs(args []string) []string {
 	if len(args) == 1 {
 		return []string{"--help"}
 	}
+	if len(args) == 2 && args[1] == "run" {
+		return []string{"run", "org/package/function", "--help"}
+	}
 	out := append([]string(nil), args[1:]...)
 	return append(out, "--help")
+}
+
+func cozyHelp(options kong.HelpOptions, ctx *kong.Context) error {
+	var rendered bytes.Buffer
+	stdout := ctx.Stdout
+	ctx.Stdout = &rendered
+	if err := kong.DefaultHelpPrinter(options, ctx); err != nil {
+		ctx.Stdout = stdout
+		return err
+	}
+	ctx.Stdout = stdout
+	help := strings.ReplaceAll(rendered.String(), "cozy run execute", "cozy run")
+	if _, err := io.WriteString(stdout, help); err != nil {
+		return err
+	}
+	if strings.TrimSpace(ctx.Command()) == "" {
+		fmt.Fprintln(stdout, "\nPrimary command:\n  cozy run <org/package/function> [input]")
+	}
+	return nil
 }
 
 func helpFor(ctx *kong.Context, args []string) string {

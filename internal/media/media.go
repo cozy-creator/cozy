@@ -214,7 +214,7 @@ func (c *Client) call(method, path string, body []byte) (answer, []byte, *exit.E
 				"own port; a pod that runs a worker and no media server can be dialled and " +
 				"cannot be fed, and this host will not fall back to granting paths on its " +
 				"own disk that the pod cannot reach").
-			WithNext("cozy rental list")
+			WithNext("cozy rental")
 	}
 	defer response.Body.Close()
 	const maxAnswerBytes = int64(1 << 20)
@@ -323,7 +323,7 @@ func (c *Client) skew(format string, args ...any) *exit.Error {
 			"what the pod does. Nothing is uploaded to a plane whose answers this host "+
 			"cannot read: a misparsed field is worse than a refused rental.",
 			mediawire.ContractRev).
-		WithNext("cozy rental list")
+		WithNext("cozy rental")
 }
 
 // PutInput uploads one attempt input and answers the POD-LOCAL PATH it landed at. That

@@ -474,7 +474,7 @@ func (w *worker) observeJobs(n int) {
 // a slot already hosting this placement is `none`, a slot that exists without it converges
 // and is `placement_added`, and only an absent slot is spawned or connected.
 //
-// The three answers are not decoration. `cozy invoke run` and POST /v1/local/workers both need
+// The three answers are not decoration. `cozy run` and POST /v1/local/workers both need
 // to tell an idempotent no-op from a real convergence, and a boolean `resident` could only
 // tell them "it was there", which is true of both.
 func (c *Orchestrator) EnsureWorker(spec WorkerLaunchSpec) (string, WorkerChange, *exit.Error) {
@@ -975,7 +975,7 @@ func (c *Orchestrator) connectWorker(spec WorkerLaunchSpec) (string, *exit.Error
 			WithRemedy("a rented pod runs its worker and a co-resident media server " +
 				"(cl-014); this host will not fall back to granting paths on its own disk, " +
 				"because the pod cannot reach them").
-			WithNext("cozy rental list")
+			WithNext("cozy rental")
 	}
 	// THE SAME SILENCE BUDGET THE CONTROL LEG LIVES UNDER. One pod, two listeners, one
 	// standard for "has not answered": a byte plane that misses what eight report periods
@@ -1233,7 +1233,7 @@ func (c *Orchestrator) Worker(instanceID string) *WorkerFacts {
 }
 
 // Workers is every worker this daemon currently owns — the LOCAL extension module's
-// listing (cl-006) and `cozy invoke list`'s source.
+// listing (cl-006) and `cozy run list`'s source.
 func (c *Orchestrator) Workers() []WorkerFacts {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -1308,7 +1308,7 @@ type PlacementAcquisitionFacts struct {
 
 // trimEnum renders a protocol enum by its own name, minus the type prefix proto3's
 // package-level value scoping forces onto it. The NUMBERS are normative; this is for a
-// person reading `cozy invoke list`.
+// person reading `cozy run list`.
 func trimEnum(name, prefix string) string {
 	if name == "" {
 		return "UNSPECIFIED"

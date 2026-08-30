@@ -413,7 +413,7 @@ func (p *runProgress) on(e localapi.Event) bool {
 		return true
 	}
 	p.last, p.dirty = line, true
-	// stderr, deliberately: stdout carries the RESULT, so a piped `cozy invoke run` is not
+	// stderr, deliberately: stdout carries the RESULT, so a piped `cozy run` is not
 	// polluted by the progress of producing it.
 	fmt.Fprintf(p.ctx.Err, "\r\033[K%s", line)
 	return true
@@ -790,7 +790,7 @@ func renderRun(ctx *Context, life api.Lifecycle, terminal *localapi.Event, stopp
 	}
 	if life.Triage != nil {
 		e.WithRemedy("the retained triage bundle explains it").
-			WithNext("cozy invoke list --full")
+			WithNext("cozy run list --full")
 	}
 	return e
 }

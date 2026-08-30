@@ -35,7 +35,7 @@ configuration or start a background process.
 cozy
 cozy package
 cozy help package install
-cozy help invoke run
+cozy help run
 cozy -v
 ```
 
@@ -137,23 +137,25 @@ Download and publication are resumable and verify content identities before maki
 remote release visible. Digest-only downloads are refused locally because a durable local model
 must have real release and lane coordinates.
 
-## Invoke packages and jobs
+## Run packages and jobs
 
 Serving entrypoints and bounded jobs use the same command. Cozy reads the installed package descriptor
 to determine the callable lifecycle:
 
 ```sh
-cozy invoke run org/package/generate \
+cozy run org/package/generate \
   prompt="a watercolor lighthouse at dusk" \
   --out ./outputs
 
-cozy invoke run org/package/train epochs=3 --detach
-cozy invoke list
-cozy invoke cancel <invocation-or-job-id>
+cozy run org/package/train epochs=3 --detach
+cozy run list
+cozy run cancel <run-id>
 ```
 
-An attached invocation follows progress and returns its terminal result. `--detach` returns after
-durable acceptance. Reusing an explicit `--idempotency-key` safely returns the same recorded work.
+An attached run follows progress and returns its terminal result. If its local package is missing,
+Cozy installs the newest compatible release from Tensorhub before starting; the download is visible
+progress, not an interactive prompt. `--detach` returns after durable acceptance. Reusing an explicit
+`--idempotency-key` safely returns the same recorded work.
 
 Local Runtime workers start on demand. Successful serving workers may remain resident for warm
 reuse; job workers are reclaimed at terminal.
@@ -165,11 +167,12 @@ With Tensorhub configured, rent a private worker for an exact package:
 ```sh
 cozy rental new                    # Cozy GPUs, VRAM, and retail hourly prices
 cozy rental new h200 org/package/v1/generate \
+	--name studio \
   --idempotency-key <unique-key>
 
-cozy rental list
-cozy invoke run org/package/generate --worker <rental-id> prompt="moonlit lake"
-cozy rental end <rental-id>
+cozy rental                        # current rented machines
+cozy run org/package/generate --machine studio prompt="moonlit lake"
+cozy rental end studio
 ```
 
 GPU names and prices come from Tensorhub's Cozy-owned rental catalog. Creator never exposes or
@@ -262,7 +265,7 @@ cozy package search
 # - cozy/marco-polo-launch1
 
 cozy package list --fields package,version,disk
-cozy invoke list --json
+cozy run list --json
 cozy model search flux --full
 ```
 

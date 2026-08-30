@@ -62,7 +62,7 @@ func ClientCredential(l home.Layout) (secret.Value, *exit.Error) {
 		return secret.Value{}, exit.Unavailablef(
 			"no local client credential at %s", l.Client).
 			WithRemedy("the daemon writes it at launch; retry the command to auto-start or reconnect").
-			WithNext("cozy invoke list")
+			WithNext("cozy run list")
 	}
 	// The mode is CHECKED, not assumed. A credential that became group- or
 	// world-readable (an inherited umask, a careless copy) is a refusal: reading it

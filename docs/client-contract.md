@@ -261,7 +261,7 @@ A job is an ATTEMPT CLASS in the same Cozy daemon, not a second scheduler: the s
 orchestrator places and dispatches it, and the same record owner gives it an ordinal,
 settles its terminal transaction, and streams it over the same durable event route
 (`GET /v1/requests/{id}/events` — there is no second event authority anywhere, and
-`cozy invoke run` follows it).
+`cozy run` follows it).
 
 The family is local because a job's typed input trees are directories the caller already
 owns (`{"trees":["<ref>=<dir>"]}`). Client filesystem paths are not part of the proposed

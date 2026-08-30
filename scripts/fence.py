@@ -526,14 +526,14 @@ def check_manifest():
     source = src_path.read_text()
     fields = re.sub(r"\s+", " ", source)
     required = (
-        "Package PackageCmd", "Model ModelCmd", "Invoke InvokeCmd", "Rental RentalCmd",
+        "Package PackageCmd", "Model ModelCmd", "Run RunCmd", "Rental RentalCmd",
         "Up UpCmd", "Down DownCmd", "Unload UnloadCmd",
         "Search PackageSearchCmd", "Install PackageInstallCmd", "Remove PackageRemoveCmd",
         "List PackageListCmd", "Publish PackagePublishCmd",
         "Search ModelSearchCmd", "Download ModelDownloadCmd", "Remove ModelRemoveCmd",
         "List ModelListCmd", "Publish ModelPublishCmd",
-        "Run InvokeRunCmd", "Cancel InvokeCancelCmd", "List InvokeListCmd",
-        "New RentalNewCmd", "Update RentalUpdateCmd", "End RentalEndCmd", "List RentalListCmd",
+        "Execute RunExecuteCmd", "Cancel RunCancelCmd", "List RunListCmd",
+        "Current RentalListCmd", "New RentalNewCmd", "Update RentalUpdateCmd", "End RentalEndCmd",
     )
     bad = [f"[grammar] missing Kong command field {item!r}" for item in required if item not in fields]
     for retired in ("StackCmd", "ExitCmd", "WorkflowCmd", "VideoCmd", "JobCmd", "CommandsCmd", "StatusCmd"):

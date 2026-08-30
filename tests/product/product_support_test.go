@@ -70,7 +70,7 @@ func TestMain(m *testing.M) {
 
 // ---------------------------------------------------------------- the in-process owner
 
-// owner is the REAL orchestrator and record owner on a fresh root — everything `cozy invoke list`
+// owner is the REAL orchestrator and record owner on a fresh root — everything `cozy run list`
 // hosts, minus the HTTP transport a test that drives the orchestrator directly has no use
 // for.
 type owner struct {
@@ -115,7 +115,7 @@ func hostOwner(t *testing.T, name string) *owner {
 	return o
 }
 
-// close releases the root so a later `cozy invoke list` on the same root is the only owner of it.
+// close releases the root so a later `cozy run list` on the same root is the only owner of it.
 func (o *owner) close() { o.once.Do(o.closer) }
 
 // fakeSpec is a worker slot whose process is tests/support/fakeworker speaking raw protocol
