@@ -37,8 +37,9 @@ Creator does not infer base ownership from distribution names. It uploads every 
 candidate; Tensorhub checks standard requirements against each exact base worker image, chooses its
 base copy whenever compatible, and leaves that uploaded candidate out of the overlay. Tensorhub also
 resolves non-base indexed requirements and mirrors exact wheels. An overlay never shadows the base.
-Cozy skips `.env*`, credentials, VCS directories, virtual environments, caches, editor state,
-bytecode, and build output. Modified and ordinary untracked files are published normally.
+Cozy refuses `.env*`, credentials, keys, bytecode, and model-weight files instead of silently
+omitting them. It skips VCS directories, virtual environments, caches, editor state, and build
+output. Modified and ordinary untracked files are published normally.
 
 Cozy runs `uv build --wheel` against the current tree. `uv` invokes the
 project's declared PEP 517 backend; Cozy does not maintain another Python
