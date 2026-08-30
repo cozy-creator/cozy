@@ -28,7 +28,7 @@ const (
 	planFormat      = "cozy.package.EntrypointBindingPlan/1"
 	rmbFormat       = "cozy.package.ResolvedModelBinding/1"
 	bundleFormat    = "tensorhub.package_bundle/3"
-	receiptFormat   = "cozy.runtime.PackageOverlayReceipt/1"
+	receiptFormat   = "cozy.runtime.EnvironmentReceipt/1"
 	maxSnapshotSize = 64 << 20
 )
 
