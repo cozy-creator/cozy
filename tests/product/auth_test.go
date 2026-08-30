@@ -119,7 +119,7 @@ func TestEmailMachineLoginAndAutomaticReauthentication(t *testing.T) {
 	defer server.Close()
 
 	root := t.TempDir()
-	before := runAuthCozy(t, root, server.URL, "", "auth", "status", "--json")
+	before := runAuthCozy(t, root, server.URL, "", "auth", "--json")
 	if before.code != 0 || !strings.Contains(before.stdout, `"status":"not logged in"`) || before.stderr != "" {
 		t.Fatalf("status before login [exit %d]\nstdout: %s\nstderr: %s", before.code, before.stdout, before.stderr)
 	}
@@ -153,7 +153,7 @@ func TestEmailMachineLoginAndAutomaticReauthentication(t *testing.T) {
 	if second.code != 0 || !strings.Contains(second.stdout, `"status":"authenticated"`) || second.stderr != "" {
 		t.Fatalf("automatic login [exit %d]\nstdout: %s\nstderr: %s", second.code, second.stdout, second.stderr)
 	}
-	status := runAuthCozy(t, root, server.URL, "", "auth", "status", "--json")
+	status := runAuthCozy(t, root, server.URL, "", "auth", "--json")
 	if status.code != 0 || !strings.Contains(status.stdout, `"status":"logged in"`) ||
 		!strings.Contains(status.stdout, `"email":"person@example.com"`) || status.stderr != "" {
 		t.Fatalf("status after login [exit %d]\nstdout: %s\nstderr: %s", status.code, status.stdout, status.stderr)

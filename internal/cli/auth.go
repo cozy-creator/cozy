@@ -53,14 +53,16 @@ func handleAuthStatus(ctx *Context) *exit.Error {
 	cancel()
 	if problem != nil {
 		if canEnroll(problem) {
-			return emit(ctx, compactRecord([]output.Field{
+			record := compactRecord([]output.Field{
 				{K: "status", V: "not logged in"},
 				{K: "hub", V: ctx.Cfg.HubURL},
-			}, "status"))
+			}, "status")
+			record.Next = []string{"cozy auth login <email>"}
+			return emit(ctx, record)
 		}
 		return problem
 	}
-	return emitAuthSession(ctx, session, "logged in")
+	return emitAuthSession(ctx, session, "logged in", "cozy auth login <email>")
 }
 
 func canEnroll(problem *exit.Error) bool {
@@ -75,18 +77,20 @@ func canEnroll(problem *exit.Error) bool {
 	return false
 }
 
-func emitAuthSession(ctx *Context, session accountauth.Session, status string) *exit.Error {
+func emitAuthSession(ctx *Context, session accountauth.Session, status string, next ...string) *exit.Error {
 	hctx, cancel := hub.Context()
 	_, problem := client(ctx).WithToken(session.AccessToken, "machine login").CurrentUser(hctx)
 	cancel()
 	if problem != nil {
 		return problem
 	}
-	return emit(ctx, compactRecord([]output.Field{
+	record := compactRecord([]output.Field{
 		{K: "status", V: status},
 		{K: "email", V: session.Email},
 		{K: "machine", V: session.DeviceKeyID},
 		{K: "hub", V: ctx.Cfg.HubURL},
 		{K: "access_expires", V: session.ExpiresAt},
-	}, "status", "email"))
+	}, "status", "email")
+	record.Next = next
+	return emit(ctx, record)
 }
