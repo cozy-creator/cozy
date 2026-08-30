@@ -26,11 +26,21 @@ func Read(gen records.PackageInstall, cozyHome string, env []string) (*Facts, *e
 	if e != nil {
 		return nil, e
 	}
+	runtimeBin, descriptor := Binary(gen), ""
+	if gen.SourceKind == "tensorhub" {
+		runtimeBin, e = HostRuntime()
+		if e != nil {
+			return nil, e
+		}
+		descriptor = DescriptorPath(gen.Dir)
+	}
 	return &Facts{
 		Install:           gen,
 		Source:            source,
 		PackageDescriptor: d,
-		RuntimeCLI:        RuntimeCLI{Bin: Binary(gen), Dir: source, Home: cozyHome, Env: env},
+		RuntimeCLI: RuntimeCLI{
+			Bin: runtimeBin, Dir: source, Descriptor: descriptor, Home: cozyHome, Env: env,
+		},
 	}, nil
 }
 

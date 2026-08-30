@@ -214,6 +214,12 @@ func downloadPackageInstallPlan(ctx context.Context, cli *Context, scratch strin
 			} else {
 				published.Wheels = append(published.Wheels, dst)
 			}
+		case "artifact":
+			name := strings.TrimPrefix(download.Digest, "sha256:")
+			if len(name) != 64 || download.Path != name || filepath.Base(download.Path) != download.Path {
+				return nil, exit.Internalf("Tensorhub returned unsafe package artifact path %q", download.Path)
+			}
+			dst = filepath.Join(scratch, "artifacts", name)
 		default:
 			return nil, exit.Internalf("Tensorhub returned unknown package file kind %q", download.Kind)
 		}

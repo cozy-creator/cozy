@@ -37,8 +37,9 @@ const DefaultRuntimeQueryTimeout = 5 * time.Second
 // Every question this host asks the runtime goes through here, so there is one place
 // that knows how to invoke it and one place that renders its refusals.
 type RuntimeCLI struct {
-	Bin          string        // the generation venv's cozy-runtime (home.VenvTool spells the platform)
+	Bin          string        // host Runtime for published overlays; generation Runtime for source installs
 	Dir          string        // the package project root
+	Descriptor   string        // exact published descriptor; empty for editable/source installs
 	Home         string        // COZY_HOME the runtime reads its artifact index out of
 	Env          []string      // the allowlisted child environment (config.Tool)
 	QueryTimeout time.Duration // metadata-query bound; zero selects DefaultRuntimeQueryTimeout
@@ -86,7 +87,11 @@ func (r RuntimeCLI) query(out any, verb ...string) *exit.Error {
 }
 
 func (r RuntimeCLI) callContext(ctx context.Context, out any, verb ...string) *exit.Error {
-	args := append([]string{"--json", "--dir", r.Dir}, verb...)
+	args := []string{"--json", "--dir", r.Dir}
+	if r.Descriptor != "" {
+		args = append(args, "--descriptor", r.Descriptor)
+	}
+	args = append(args, verb...)
 	cmd := exec.CommandContext(ctx, r.Bin, args...)
 	if _, bounded := ctx.Deadline(); bounded {
 		// CommandContext kills the direct child at the deadline. WaitDelay also closes a

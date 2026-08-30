@@ -94,16 +94,20 @@ func MaterializeEnvironment(sourceDir, venvDir string) (*EnvironmentReceipt, *ex
 // configured Python index; source distributions and build backends are refused.
 // The author-machine tool.uv.sources paths and development lock never control a
 // registry install.
-func MaterializePublishedEnvironment(_ string, venvDir string, wheels []string) (*EnvironmentReceipt, *exit.Error) {
+func MaterializePublishedEnvironment(pythonABI, venvDir string, wheels []string) (*EnvironmentReceipt, *exit.Error) {
 	if len(wheels) == 0 {
 		return nil, exit.Internalf("published package install has no project wheel")
+	}
+	python, problem := pythonForABI(pythonABI)
+	if problem != nil {
+		return nil, problem
 	}
 	env := &EnvironmentReceipt{
 		Platform: runtime.GOOS + "/" + runtime.GOARCH,
 		UV:       toolVersion("uv", "--version"),
 	}
 	env.LinkMode = pickLinkMode(venvDir, &env.Warnings)
-	create := exec.Command("uv", "venv", "--no-progress", venvDir)
+	create := exec.Command("uv", "venv", "--no-progress", "--python", python, venvDir)
 	create.Env = config.Frozen().Tool()
 	var output strings.Builder
 	create.Stdout, create.Stderr = &output, &output
@@ -127,6 +131,19 @@ func MaterializePublishedEnvironment(_ string, venvDir string, wheels []string) 
 	env.Python = pythonVersion(venvDir)
 	env.Packages, env.Closure = closure(venvDir)
 	return env, nil
+}
+
+func pythonForABI(abi string) (string, *exit.Error) {
+	if len(abi) < 5 || !strings.HasPrefix(abi, "cp3") {
+		return "", exit.Named(exit.Structural, "published_python_abi_invalid",
+			"selected package environment has unsupported Python ABI %q", abi)
+	}
+	minor, err := strconv.Atoi(abi[3:])
+	if err != nil || minor < 8 || minor > 99 {
+		return "", exit.Named(exit.Structural, "published_python_abi_invalid",
+			"selected package environment has unsupported Python ABI %q", abi)
+	}
+	return "3." + strconv.Itoa(minor), nil
 }
 
 // Disk measures one generation exactly once, at install: bytes only this generation
