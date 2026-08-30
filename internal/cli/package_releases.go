@@ -89,41 +89,54 @@ func handlePackagePublish(ctx *Context) *exit.Error {
 	sort.Strings(candidateRows)
 	sort.Strings(executionRows)
 	sort.Strings(refusalRows)
+	replay := begun.State == "committed"
+	status := "published"
+	if replay {
+		status = "already published"
+	}
 	fields := []output.Field{
 		{K: "package", V: ref.String()}, {K: "release", V: release},
-		{K: "status", V: "published"}, {K: "changed", V: begun.State != "committed"},
-		{K: "qualification", V: done.QualificationState},
+		{K: "status", V: status}, {K: "changed", V: !replay},
+	}
+	if done.QualificationState != "qualified" {
+		fields = append(fields, output.Field{K: "qualification", V: done.QualificationState})
+	}
+	fields = append(fields, []output.Field{
 		{K: "qualification_error", V: done.QualificationError},
 		{K: "compatible_profiles", V: done.CompatibleProfiles}, {K: "profiles", V: profileRows},
-		{K: "package_executions", V: executionRows},
+		{K: "eligible_worker_profiles", V: executionRows},
 		{K: "requires_python", V: done.RequiresPython}, {K: "requirements", V: done.Requirements},
 		{K: "uploaded", V: output.Bytes(moved)}, {K: "hub", V: c.Base()},
-	}
+	}...)
 	if len(candidateRows) > 0 {
 		fields = append(fields, output.Field{K: "candidates", V: candidateRows})
 	}
 	if len(refusalRows) > 0 {
 		fields = append(fields, output.Field{K: "profile_refusals", V: refusalRows})
 	}
-	defaults := []string{"package", "release", "status", "qualification"}
-	if done.QualificationState != "qualified" {
-		defaults = append(defaults, "requires_python", "requirements", "compatible_profiles")
+	defaults := []string{"package", "release", "status"}
+	if !replay {
+		if done.QualificationState != "qualified" {
+			defaults = append(defaults, "qualification", "requires_python", "requirements", "compatible_profiles")
+		}
+		if done.QualificationState == "refused" && len(refusalRows) > 0 {
+			defaults = append(defaults, "profile_refusals")
+		}
+		if done.QualificationError != "" {
+			defaults = append(defaults, "qualification_error")
+		}
+		defaults = append(defaults, "eligible_worker_profiles", "uploaded", "changed")
 	}
-	if done.QualificationState == "refused" && len(refusalRows) > 0 {
-		defaults = append(defaults, "profile_refusals")
-	}
-	if done.QualificationError != "" {
-		defaults = append(defaults, "qualification_error")
-	}
-	defaults = append(defaults, "package_executions", "uploaded", "changed")
 	record := compactRecord(fields, defaults...)
-	switch done.QualificationState {
-	case "pending":
-		record.Notes = append(record.Notes,
-			"published successfully; Tensorhub will qualify it when a compatible base worker image becomes active")
-	case "refused", "unsupported":
-		record.Notes = append(record.Notes,
-			"published successfully, but no execution is currently eligible for placement")
+	if !replay {
+		switch done.QualificationState {
+		case "pending":
+			record.Notes = append(record.Notes,
+				"published successfully; Tensorhub will qualify it when a compatible base worker image becomes active")
+		case "refused", "unsupported":
+			record.Notes = append(record.Notes,
+				"published successfully, but no execution is currently eligible for placement")
+		}
 	}
 	return emit(ctx, record)
 }
