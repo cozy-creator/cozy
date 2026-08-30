@@ -20,8 +20,6 @@ import (
 	"github.com/cozy-creator/cozy/internal/processtree"
 )
 
-const Tag = "py3-none-any"
-
 type Request struct {
 	Context context.Context
 	Tree    string
