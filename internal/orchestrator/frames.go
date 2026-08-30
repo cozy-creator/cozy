@@ -536,9 +536,8 @@ func (c *Orchestrator) onOutcome(s *session, t *pb.AttemptOutcome) {
 			t.OutcomeDigest, len(t.OutcomeCanonicalBytes), computed)
 		return
 	}
-	// 2. The document is parsed under UNKNOWN-FIELD REFUSAL and the re-emit law. It is an
-	//    AttemptOutcomeBody/3 — a NEW document version, because artifact receipts are a
-	//    new key and a digest-fenced document is not additively versioned (th-049).
+	// 2. The document is parsed under UNKNOWN-FIELD REFUSAL and the re-emit law. It is the
+	//    sole pre-release AttemptOutcomeBody/1 shape, including exact artifact receipts.
 	doc, err := canonical.Read(t.OutcomeCanonicalBytes, &pb.AttemptOutcomeBody{})
 	if err != nil {
 		refuse("the outcome document is inadmissible (%s)", err)

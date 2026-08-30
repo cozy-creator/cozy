@@ -184,32 +184,12 @@ var explicitRepeated = map[string][]string{
 	"cozy.worker.v1.WheelFact":   {"import_roots", "tags"},
 }
 
-// docVersion is the DOCUMENT VERSION MAP. A digest-fenced document is NOT additively
-// versioned (01 §3): an unknown key REFUSES, so a new key is a NEW DOCUMENT VERSION and
-// the version rides the `format` tag. Every document is at /1 except the versions
-// declared below by worker-protocol.
-//
-// The map is read INDEPENDENTLY per language (#510g) rather than derived from the
-// binding, because the version is a property of the document's key set and not of the
-// message that happens to transport it. Without it this writer would spell an
-// AttemptOutcomeBody under `/1` and every digest it minted would name the wrong document
-// (#536e).
-var docVersion = map[string]int{
-	"cozy.worker.v1.AttemptOutcomeBody": 3,
-	"cozy.worker.v1.InvocationSpec":     2,
-	"cozy.worker.v1.PlacementSet":       3,
-	"cozy.worker.v1.WorkerSnapshotBody": 3,
-}
-
 // Format is the canonical `format` tag for one message's document: its full name plus the
-// document version.
+// sole pre-release document version. There are no compatibility aliases or version-specific
+// readers: every current document is `/1`, and every other suffix refuses.
 func Format(m proto.Message) string {
 	name := string(m.ProtoReflect().Descriptor().FullName())
-	v, ok := docVersion[name]
-	if !ok {
-		v = 1
-	}
-	return name + "/" + strconv.Itoa(v)
+	return name + "/1"
 }
 
 // Document is a message's set fields plus the `format` tag that domain-separates one

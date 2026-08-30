@@ -89,12 +89,12 @@ func persistSelection(genDir string, gen *records.PackageInstall, selection Sele
 		format string
 		exact  ExactDocument
 	}{
-		{"placement_set", "cozy.worker.v1.PlacementSet/3", selection.PlacementSet},
+		{"placement_set", "cozy.worker.v1.PlacementSet/1", selection.PlacementSet},
 		{"package_release", "cozy.package.release/1", selection.PackageRelease},
 		{"package_descriptor", "cozy.package.descriptor/1", selection.PackageDescriptor},
 		{"qualification", "cozy.runtime.Qualification/1", selection.Qualification},
 		{"environment_receipt", "cozy.runtime.EnvironmentReceipt/1", selection.EnvironmentReceipt},
-		{"wheelhouse_manifest", "WheelhouseManifest/3", selection.WheelhouseManifest},
+		{"wheelhouse_manifest", "WheelhouseManifest/1", selection.WheelhouseManifest},
 	}
 	cache := filepath.Join(genDir, "artifact-cache")
 	if err := os.MkdirAll(cache, 0o700); err != nil {

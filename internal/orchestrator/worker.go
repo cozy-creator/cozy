@@ -72,7 +72,7 @@ type DesiredPlacement struct {
 	// InstallID is the install this placement was resolved from ("" = an uninstalled dev
 	// tree). Was `Generation`, which named a protocol word this side does not own (#484).
 	InstallID string `json:"install_id"`
-	// PlacementSetBytes are the exact Hub-selected PlacementSet/3 bytes. Creator
+	// PlacementSetBytes are the exact Hub-selected PlacementSet/1 bytes. Creator
 	// validates and relays them unchanged for both a local venv and a rented pod.
 	// Entrypoints is a read-only projection used for request selection; it never
 	// participates in identity.
@@ -109,7 +109,7 @@ func PlacementFromExact(pkg, installID, digest string, data []byte,
 	doc, err := canonical.Read(data, &pb.PlacementSet{})
 	if err != nil {
 		return DesiredPlacement{}, exit.Named(exit.Conflict, "placement_set_invalid",
-			"PlacementSet is not its closed canonical /3 document: %s", err)
+			"PlacementSet is not its closed canonical /1 document: %s", err)
 	}
 	rows := doc.List("placements")
 	if len(rows) != 1 {
@@ -965,7 +965,7 @@ func newWorker(instanceID string, spec WorkerLaunchSpec) *worker {
 // with the pinned server cert and signed Creator ClaimProof (#445/proto-013).
 // The media plane remains the invocation byte path, but it is NOT a package distribution
 // path. Binding plans are ordinary artifact-grant subjects now: Tensorhub supplies their
-// locations and the worker verifies their digests while materializing PlacementSet/2.
+// locations and the worker verifies their digests while materializing PlacementSet/1.
 func (c *Orchestrator) connectWorker(spec WorkerLaunchSpec) (string, *exit.Error) {
 	instanceID := spec.InstanceID()
 	if spec.Connection.Media == nil {

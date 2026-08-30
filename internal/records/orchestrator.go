@@ -163,7 +163,7 @@ CREATE TABLE IF NOT EXISTS outputs (
   PRIMARY KEY (request_id, attempt, output_id),
   FOREIGN KEY (request_id, attempt) REFERENCES attempts(request_id, attempt)
 )`, `
--- Exact Runtime-authored ArtifactReceipt/1 documents carried by AttemptOutcomeBody/3.
+-- Exact Runtime-authored ArtifactReceipt/1 documents carried by AttemptOutcomeBody/1.
 -- They commit in the same transaction as the outcome and therefore exist before Ack.
 CREATE TABLE IF NOT EXISTS artifact_receipts (
   request_id         TEXT    NOT NULL,
@@ -1292,7 +1292,7 @@ type Output struct {
 }
 
 // ArtifactReceipt is the exact Runtime-authored ArtifactReceipt/1 identity carried by
-// AttemptOutcomeBody/3. ReceiptBytes are never parsed and reserialized for persistence.
+// AttemptOutcomeBody/1. ReceiptBytes are never parsed and reserialized for persistence.
 type ArtifactReceipt struct {
 	RequestID, OwnerScope, InvocationDigest, OutputSlot, TransactionID string
 	Attempt                                                            int64
