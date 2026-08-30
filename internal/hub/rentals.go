@@ -21,7 +21,7 @@ import (
 //
 // Creator mints one media bearer and one Ed25519 rental key before the paid ask. Only the
 // bearer hash and public key cross this API. Tensorhub cannot open either pod door: the
-// media bearer stays here and the Creator private key signs ClaimProof/ArtifactDelegation.
+// media bearer and rental private key stay here; the latter signs only ClaimProof.
 //
 // The contract is the hub's and is consumed verbatim, exactly as the catalog's is:
 //
@@ -33,7 +33,8 @@ import (
 //	GET    /v1/rentals/{id}          -> {state, worker_address, cert_pem, media_address,
 //	                                     detail, worker_id, worker_boot_id,
 //	                                     media_token_sha256:[...],
-//	                                     control_snapshot:{digest,length,canonical_bytes}}
+//	                                     selection:{profile,placement_set,package_release,
+//	                                                package_descriptor,qualification}}
 //	POST   /v1/rentals/{id}/worker-observations
 //	                                     -> renter-authenticated deterministic WorkerFrames
 //	DELETE /v1/rentals/{id}          -> 204

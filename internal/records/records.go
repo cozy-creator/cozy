@@ -124,8 +124,6 @@ var renames = []struct{ table, from, to string }{
 	{"attempts", "exec_spec_digest", "invocation_digest"},
 	{"attempts", "exec_spec", "invocation"},
 	{"rentals", "endpoint_ref", "package_ref"},
-	{"rentals", "control_snapshot_digest", "placement_set_digest"},
-	{"rentals", "control_snapshot_bytes", "placement_set_bytes"},
 }
 
 // pragmas ride the DSN rather than being executed after the open, because a pragma is a
