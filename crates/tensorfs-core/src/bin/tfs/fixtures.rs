@@ -1,15 +1,15 @@
 //! `tfs structure` — bank and match structure fixtures (tfs-008).
 //!
 //! Banking has exactly two sources and no third: TRANSCRIBED rows from real evidence, or a
-//! live header this repo actually wrote. Both end in one canonical document written by one
-//! writer, so a fixture's `topology_digest` is directly comparable with a checkpoint's.
+//! live header this repo actually wrote. Both use the same topology projection as a header,
+//! so a fixture's `topology_digest` is directly comparable with a checkpoint's.
 
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use tensorfs_core::checkpoint as ck;
 use tensorfs_core::dtype::Dtype;
-use tensorfs_core::ids::{Doc, ObjectRef};
+use tensorfs_core::ids::ObjectRef;
 use tensorfs_core::store::Store;
 use tensorfs_core::structure::{Logical, Provenance, StructureFixture, REAL, SYNTHETIC};
 
@@ -54,9 +54,8 @@ fn write_fixture(fx: &StructureFixture) -> ExitCode {
         eprintln!("{}: {e}", d.display());
         return ExitCode::FAILURE;
     }
-    let bytes = fx.canonical_bytes();
-    // The canonical bytes ARE the fixture. Round-trip before writing: a document that
-    // cannot be read back as itself must never reach the bank.
+    let bytes = fx.to_bytes();
+    // Round-trip before writing: malformed reviewed data must never reach the bank.
     if let Err(e) = StructureFixture::parse(&bytes) {
         return bail(e);
     }
@@ -68,9 +67,8 @@ fn write_fixture(fx: &StructureFixture) -> ExitCode {
     println!("banked {}", path.display());
     println!("  stamp            {}", fx.stamp());
     println!("  topology_digest  {}", fx.topology_digest());
-    println!("  object_id        {}", fx.object_id());
     println!(
-        "  {} components, {} logical keys, {} B canonical",
+        "  {} components, {} logical keys, {} B",
         fx.components.len(),
         fx.count(),
         bytes.len()

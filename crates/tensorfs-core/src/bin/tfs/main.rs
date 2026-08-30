@@ -2048,102 +2048,8 @@ fn build_corpus() -> TfsResult<(Vec<Case>, Vec<EncodingSpec>)> {
         "segments that claim more bytes than the blob has",
     ));
 
-    // --- structure fixtures + capability records (tfs-008)
-    let g = "structure";
-    let fx = tensorfs_core::structure::StructureFixture {
-        task_family: "corpus".to_string(),
-        structural_variant: "two-component".to_string(),
-        provenance: tensorfs_core::structure::Provenance {
-            kind: tensorfs_core::structure::SYNTHETIC.to_string(),
-            source: "the vector corpus".to_string(),
-            source_sha256: None,
-            note: "a minimal banked projection: two components, three logical keys".to_string(),
-        },
-        components: vec![
-            (
-                "transformer".to_string(),
-                vec![
-                    (
-                        "blocks.0.attn.to_q.weight".to_string(),
-                        tensorfs_core::structure::Logical {
-                            dtype: Dtype::Bf16,
-                            shape: vec![64, 128],
-                        },
-                    ),
-                    (
-                        "blocks.0.norm.weight".to_string(),
-                        tensorfs_core::structure::Logical {
-                            dtype: Dtype::Bf16,
-                            shape: vec![128],
-                        },
-                    ),
-                ],
-            ),
-            (
-                "vae".to_string(),
-                vec![(
-                    "decoder.conv_in.weight".to_string(),
-                    tensorfs_core::structure::Logical {
-                        dtype: Dtype::F32,
-                        shape: vec![8, 8],
-                    },
-                )],
-            ),
-        ],
-    };
-    let fx_bytes = fx.canonical_bytes();
-    cases.push(ok_case(
-        g,
-        "fixture-synthetic",
-        "structure",
-        fx_bytes.clone(),
-        "banked projection + topology_digest, provenance stated in the same bytes",
-    ));
-    cases.push(red_case(
-        "structure-red",
-        "provenance-real-undigested",
-        "structure",
-        sub(&fx_bytes, "\"kind\":\"synthetic\"", "\"kind\":\"real\""),
-        "MISSING_FIELD",
-        "a claim of realness with no source digest is unfalsifiable",
-    ));
-    cases.push(red_case(
-        "structure-red",
-        "provenance-unknown-kind",
-        "structure",
-        sub(&fx_bytes, "\"kind\":\"synthetic\"", "\"kind\":\"probably\""),
-        "UNKNOWN_FIELD",
-        "provenance is real or synthetic, never a third thing",
-    ));
-
     // --- the border's own documents (tfs-003)
     let g = "ingest";
-    let banked = tensorfs_core::ingest::fingerprint::Banked {
-        keyset_digest: tensorfs_core::ids::object_id(b"a reviewed key set"),
-        dialect: "safetensors.diffusers".to_string(),
-        task_family: "sdxl".to_string(),
-        structural_variant: "base-1.0-fp16".to_string(),
-        component: "vae".to_string(),
-        converter: "diffusers.identity/1".to_string(),
-        topology_digest: tensorfs_core::ids::object_id(b"a projected topology"),
-        logical_keys: 248,
-        provenance: tensorfs_core::structure::Provenance {
-            kind: tensorfs_core::structure::REAL.to_string(),
-            source: "stabilityai/stable-diffusion-xl-base-1.0".to_string(),
-            source_sha256: Some(tensorfs_core::sha256::hex_digest(b"the exact carrier")),
-            note: "banked from a real carrier".to_string(),
-        },
-    };
-    let reg = tensorfs_core::ingest::fingerprint::FingerprintRegistry {
-        entries: vec![banked.clone()],
-    };
-    cases.push(ok_case(
-        g,
-        "fingerprint-registry",
-        "registry",
-        reg.canonical_bytes(),
-        "a reviewed entry: the review happened when this was banked",
-    ));
     let root = tensorfs_core::ingest::transaction::IngestRoot {
         session: "e3b0c44298fc1c14".to_string(),
         tenant: "acme".to_string(),
@@ -2161,26 +2067,6 @@ fn build_corpus() -> TfsResult<(Vec<Case>, Vec<EncodingSpec>)> {
 
     // --- ingest reds
     let g = "ingest-red";
-    let mut unfalsifiable = reg.clone();
-    unfalsifiable.entries[0].provenance.source_sha256 = None;
-    cases.push(red_case(
-        g,
-        "registry-real-without-digest",
-        "registry",
-        unfalsifiable.canonical_bytes(),
-        "MISSING_FIELD",
-        "a `real` claim naming no bytes is unfalsifiable",
-    ));
-    let mut twinned = reg.clone();
-    twinned.entries.push(banked.clone());
-    cases.push(red_case(
-        g,
-        "registry-duplicate-entry",
-        "registry",
-        twinned.canonical_bytes(),
-        "DUPLICATE_KEY",
-        "one (key set, component) is banked once — twice is a review defect",
-    ));
     let mut future = root.clone();
     future.session = "not a session name".to_string();
     cases.push(red_case(

@@ -4,8 +4,8 @@
 //!
 //! * **Filenames never authorize.** Nothing here reads a path. A verdict comes from the KEY
 //!   SET and the shapes, which are the only things a publisher cannot rename away.
-//! * **A registry entry is platform-reviewed DATA, not uploader input.** Entries are banked
-//!   documents with the same closed provenance rule as tfs-008's structure fixtures: a
+//! * **A registry entry is platform-reviewed DATA, not uploader input.** Entries use the
+//!   same closed provenance rule as tfs-008's structure fixtures: a
 //!   `real` claim without its source digest is an unfalsifiable claim and refuses.
 //! * **Surviving ambiguity refuses loudly.** Two entries matching one carrier is not a
 //!   tiebreak, it is a review defect; the border names both and stops.
@@ -19,7 +19,7 @@ use crate::canon::{as_arr, as_obj, as_str, Fields, Value};
 use crate::dtype::Dtype;
 use crate::err::{refuse, Code, Result};
 use crate::header::{topology_digest_of, topology_value};
-use crate::ids::{ascii_name, check_format, hex64, object_id, Doc};
+use crate::ids::{ascii_name, hex64, object_id};
 use crate::limits;
 use crate::structure::{Provenance, REAL, SYNTHETIC};
 
@@ -193,7 +193,7 @@ pub enum Verdict {
         banked_as: Vec<String>,
     },
     /// More than one entry banks the same (key set, component): a review defect, refused
-    /// loudly by name. A parsed registry cannot contain this (the document refuses a
+    /// loudly by name. Parsed registry data cannot contain this (the parser refuses a
     /// duplicated pair); an in-memory one built by hand can.
     Ambiguous(Vec<String>),
     /// Nothing matched. A filename, a directory, or a config would all be guesses.
@@ -208,6 +208,18 @@ fn name_of(e: &Banked) -> String {
 }
 
 impl FingerprintRegistry {
+    /// Read the platform's reviewed registry data. This is configuration consumed by one
+    /// TensorFS implementation, not a stored/digested product document, so it has no format
+    /// field and no ObjectId.
+    pub fn parse(bytes: &[u8]) -> Result<Self> {
+        Self::from_value(&crate::canon::parse(bytes, limits::DOC_MAX_BYTES)?)
+    }
+
+    /// Stable output for `tfs ingest bank`; not an identity-bearing document encoding.
+    pub fn to_bytes(&self) -> Vec<u8> {
+        crate::canon::write(&self.to_value())
+    }
+
     pub fn classify(&self, fp: &Fingerprint) -> Verdict {
         let keyset: Vec<&Banked> = self
             .entries
@@ -326,17 +338,9 @@ fn provenance_from(v: &Value) -> Result<Provenance> {
     }
 }
 
-impl Doc for FingerprintRegistry {
-    const FORMAT: &'static str = "tensorfs.fingerprint_registry/1";
-    const MAX_BYTES: usize = limits::DOC_MAX_BYTES;
-
+impl FingerprintRegistry {
     fn from_value(v: &Value) -> Result<Self> {
         let mut f = Fields::new("FingerprintRegistry", v)?;
-        check_format(
-            "FingerprintRegistry",
-            as_str("FingerprintRegistry", "format", f.req("format")?)?,
-            Self::FORMAT,
-        )?;
         let mut entries = Vec::new();
         for ev in as_arr("FingerprintRegistry", "entries", f.req("entries")?)? {
             let mut e = Fields::new("Banked", ev)?;
@@ -396,33 +400,30 @@ impl Doc for FingerprintRegistry {
     }
 
     fn to_value(&self) -> Value {
-        Value::obj(vec![
-            (
-                "entries",
-                Value::arr(
-                    self.entries
-                        .iter()
-                        .map(|e| {
-                            Value::obj(vec![
-                                ("component", Value::str(e.component.clone())),
-                                ("converter", Value::str(e.converter.clone())),
-                                ("dialect", Value::str(e.dialect.clone())),
-                                ("keyset_digest", Value::str(e.keyset_digest.clone())),
-                                ("logical_keys", Value::uint(e.logical_keys)),
-                                ("provenance", provenance_value(&e.provenance)),
-                                (
-                                    "structural_variant",
-                                    Value::str(e.structural_variant.clone()),
-                                ),
-                                ("task_family", Value::str(e.task_family.clone())),
-                                ("topology_digest", Value::str(e.topology_digest.clone())),
-                            ])
-                        })
-                        .collect(),
-                ),
+        Value::obj(vec![(
+            "entries",
+            Value::arr(
+                self.entries
+                    .iter()
+                    .map(|e| {
+                        Value::obj(vec![
+                            ("component", Value::str(e.component.clone())),
+                            ("converter", Value::str(e.converter.clone())),
+                            ("dialect", Value::str(e.dialect.clone())),
+                            ("keyset_digest", Value::str(e.keyset_digest.clone())),
+                            ("logical_keys", Value::uint(e.logical_keys)),
+                            ("provenance", provenance_value(&e.provenance)),
+                            (
+                                "structural_variant",
+                                Value::str(e.structural_variant.clone()),
+                            ),
+                            ("task_family", Value::str(e.task_family.clone())),
+                            ("topology_digest", Value::str(e.topology_digest.clone())),
+                        ])
+                    })
+                    .collect(),
             ),
-            ("format", Value::str(Self::FORMAT)),
-        ])
+        )])
     }
 }
 
@@ -518,4 +519,46 @@ pub fn decode_comfy_quant(key: &str, bytes: &[u8]) -> Result<ComfyQuant> {
         format,
         full_precision_matrix_mult,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn registry() -> FingerprintRegistry {
+        FingerprintRegistry {
+            entries: vec![Banked {
+                keyset_digest: object_id(b"keys"),
+                dialect: "safetensors.diffusers".into(),
+                task_family: "test".into(),
+                structural_variant: "minimal".into(),
+                component: "model".into(),
+                converter: "identity/1".into(),
+                topology_digest: object_id(b"topology"),
+                logical_keys: 1,
+                provenance: Provenance {
+                    kind: SYNTHETIC.into(),
+                    source: "unit test".into(),
+                    source_sha256: None,
+                    note: "plain reviewed data".into(),
+                },
+            }],
+        }
+    }
+
+    #[test]
+    fn registry_is_plain_data_not_a_document_format() {
+        let registry = registry();
+        let bytes = registry.to_bytes();
+        assert!(!String::from_utf8_lossy(&bytes).contains("format"));
+        assert_eq!(FingerprintRegistry::parse(&bytes).unwrap(), registry);
+
+        let old = String::from_utf8(bytes)
+            .unwrap()
+            .replacen('{', r#"{"format":"retired","#, 1);
+        assert_eq!(
+            FingerprintRegistry::parse(old.as_bytes()).unwrap_err().code,
+            Code::UNKNOWN_FIELD
+        );
+    }
 }

@@ -282,9 +282,13 @@ impl Part {
     }
 }
 
+/// Domain separator for topology identity. This exact literal remains in the hash preimage
+/// so existing topology digests do not move; it is not a stored document format.
+pub const TOPOLOGY_IDENTITY_DOMAIN: &str = "cozytensors.topology/1";
+
 /// The ONE topology projection: component → key → logical {dtype, shape}. A real header and
-/// a banked structure fixture must produce the same bytes for the same structure, so they
-/// call the same function over the same iterator shape rather than each building a map.
+/// reviewed structure data must produce the same bytes for the same structure, so they call
+/// the same function over the same iterator shape rather than each building a map.
 pub fn topology_value<'a>(
     items: impl Iterator<Item = (&'a str, &'a str, Dtype, &'a [u64])>,
 ) -> Value {
@@ -309,7 +313,7 @@ pub fn topology_value<'a>(
                     .collect(),
             ),
         ),
-        ("projection", Value::str("cozytensors.topology/1")),
+        ("projection", Value::str(TOPOLOGY_IDENTITY_DOMAIN)),
     ])
 }
 

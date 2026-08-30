@@ -1,3 +1,0 @@
-doc: structure
-expect: mutant
-note: one byte flipped at offset 149 of sha256:f37b0dc3ad0cce9616913264aa57fdf08a11c6d442fb52a48c553260461d0781
