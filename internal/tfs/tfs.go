@@ -1,19 +1,17 @@
 // Package tfs is the ONE door to a byte-plane fact in this binary (cl-012).
 //
 // cozy-creator owns no byte plane: TensorFS does (README law 3, boundaries.md). So
-// every question about canonical bytes — what a snapshot reaches, what an object
-// hashes to, whether the store holds it, whether a whole checkpoint verifies — is
+// every question about canonical bytes — what a manifest reaches, what an object
+// hashes to, whether the store holds it, whether a whole manifest verifies — is
 // asked of the `tfs` binary and consumed as a document it produced or an identifier
 // it printed. Nothing here decodes a manifest, a header, or a tensor.
 //
-// The one document this package reads is `tensorfs.publish_closure/1`, and it reads
-// exactly two fields per entry (the object id and its length) because that list IS
-// the declaration the hub answers — the same list tensorhub's reference publisher
-// builds. The closure BYTES ride the declaration verbatim; nothing re-encodes them.
+// Machine seams return only ObjectRefs and repository rows owned by TensorFS. Cozy
+// never decodes manifest/header/repository documents or composes store paths.
 //
 // Two fences hold this (scripts/fence.py, family `tensor`): no Go decoder for a
 // canonical tensor document, and no second CAS key derivation — a path under
-// `objects/sha256/…` composed in Go would be a second spelling of TensorFS's own
+// `blobs/…` composed in Go would be a second spelling of TensorFS's own
 // layout, and the two would drift.
 package tfs
 
@@ -38,14 +36,6 @@ type Tool struct {
 	Root   string // the local CAS
 	Source string // where the binary path came from, for the remedy text
 	env    []string
-}
-
-// Root is one name in TensorFS's root authority. Cozy renders the fact but
-// never reads or composes the store's metadata files directly.
-type Root struct {
-	Name     string
-	Kind     string
-	Snapshot string
 }
 
 // Open resolves the binary and the store. A missing `tfs` is a structural refusal
@@ -120,82 +110,72 @@ type Object struct {
 	Length int64  `json:"length"`
 }
 
-type closureDoc struct {
-	Objects []struct {
-		SHA256 string `json:"sha256"`
-		Length int64  `json:"length"`
-	} `json:"objects"`
+type refRow struct {
+	Kind   string `json:"kind,omitempty"`
+	Length int64  `json:"length"`
+	Path   string `json:"path,omitempty"`
+	SHA256 string `json:"sha256"`
 }
 
-// Closure declares the exact object set a publish of this snapshot MOVES. The
-// returned bytes are the document verbatim — they ride the declaration and the hub
-// reproduces them at completion, so re-encoding them here would be the drift.
-func (t *Tool) Closure(snapshot, session, outPath string) ([]byte, []Object, *exit.Error) {
-	if _, e := t.run("cloud", "closure", t.Root, hex(snapshot), session, "--out", outPath); e != nil {
-		return nil, nil, e
-	}
-	raw, err := os.ReadFile(outPath)
+func readRefs(path string) ([]refRow, *exit.Error) {
+	raw, err := os.ReadFile(path)
 	if err != nil {
-		return nil, nil, exit.Internalf("the closure tfs wrote is unreadable: %s", err)
+		return nil, exit.Internalf("the ObjectRefs tfs wrote are unreadable: %s", err)
 	}
-	var doc closureDoc
-	if err := json.Unmarshal(raw, &doc); err != nil {
-		return nil, nil, exit.Internalf("the closure document is not readable as an object list: %s", err)
+	var rows []refRow
+	for line, text := range strings.Split(strings.TrimSpace(string(raw)), "\n") {
+		if strings.TrimSpace(text) == "" {
+			continue
+		}
+		var row refRow
+		if err := json.Unmarshal([]byte(text), &row); err != nil || len(row.SHA256) != 64 || row.Length <= 0 {
+			return nil, exit.Internalf("tfs returned an invalid ObjectRef at line %d", line+1)
+		}
+		rows = append(rows, row)
 	}
-	objs := make([]Object, 0, len(doc.Objects))
-	for _, o := range doc.Objects {
-		objs = append(objs, Object{ID: "sha256:" + o.SHA256, Length: o.Length})
-	}
-	return raw, objs, nil
+	return rows, nil
 }
 
-var attachment = regexp.MustCompile(`attachment\s+sha256:([0-9a-f]{64})`)
-
-// Header is the snapshot's TYPED header attachment. tfs names it; no pathname
-// convention is consulted here or anywhere.
-func (t *Tool) Header(snapshot string) (string, *exit.Error) {
-	out, e := t.run("snapshot", "show", t.Root, hex(snapshot))
-	if e != nil {
-		return "", e
-	}
-	m := attachment.FindStringSubmatch(out)
-	if m == nil {
-		return "", exit.Internalf("tfs snapshot show named no header attachment for %s", snapshot)
-	}
-	return m[1], nil
-}
-
-// Topology is the header's own code topology, as the declaration carries it.
-func (t *Tool) Topology(headerHex, outPath string) ([]byte, *exit.Error) {
-	if _, e := t.run("compat", "topology", t.Root, headerHex, "--out", outPath); e != nil {
+// ManifestObjects returns the sorted, distinct transitive blob closure. The
+// manifest itself lives in its typed namespace and is not one of these blob refs.
+func (t *Tool) ManifestObjects(manifestID, outPath string) ([]Object, *exit.Error) {
+	if _, e := t.run("manifest", "walk", t.Root, hex(manifestID), "--refs", outPath); e != nil {
 		return nil, e
 	}
-	raw, err := os.ReadFile(outPath)
-	if err != nil {
-		return nil, exit.Internalf("the topology tfs wrote is unreadable: %s", err)
-	}
-	return raw, nil
-}
-
-var entry = regexp.MustCompile(`file\s+\S+\s+sha256:([0-9a-f]{64}) \((\d+) B\)`)
-
-// Entries is what a snapshot manifest names DIRECTLY — documents and configs. It is
-// the first round of a fetch: with these in the store, the closure walk below can
-// compute the transitive set without any byte of the tensors having arrived.
-func (t *Tool) Entries(snapshot string) ([]Object, *exit.Error) {
-	out, e := t.run("snapshot", "show", t.Root, hex(snapshot))
+	rows, e := readRefs(outPath)
 	if e != nil {
 		return nil, e
 	}
-	var objs []Object
-	for _, m := range entry.FindAllStringSubmatch(out, -1) {
-		n, _ := strconv.ParseInt(m[2], 10, 64)
-		objs = append(objs, Object{ID: "sha256:" + m[1], Length: n})
+	objects := make([]Object, 0, len(rows))
+	for _, row := range rows {
+		objects = append(objects, Object{ID: "sha256:" + row.SHA256, Length: row.Length})
 	}
-	if len(objs) == 0 {
-		return nil, exit.Internalf("tfs snapshot show listed no file entries for %s", snapshot)
+	return objects, nil
+}
+
+// ManifestEntries inspects exact staged manifest bytes and returns direct refs.
+// HeaderID is the one cozytensors entry; TensorFS owns that cardinality rule.
+func (t *Tool) ManifestEntries(manifestPath, outPath string) (objects []Object, headerID string, e *exit.Error) {
+	if _, e := t.run("manifest", "inspect", manifestPath, "--refs", outPath); e != nil {
+		return nil, "", e
 	}
-	return objs, nil
+	rows, e := readRefs(outPath)
+	if e != nil {
+		return nil, "", e
+	}
+	for _, row := range rows {
+		objects = append(objects, Object{ID: "sha256:" + row.SHA256, Length: row.Length})
+		if row.Kind == "cozytensors" {
+			if headerID != "" {
+				return nil, "", exit.Internalf("tfs returned more than one cozytensors entry")
+			}
+			headerID = "sha256:" + row.SHA256
+		}
+	}
+	if headerID == "" {
+		return nil, "", exit.Internalf("tfs returned no cozytensors entry")
+	}
+	return objects, headerID, nil
 }
 
 var present = regexp.MustCompile(`contains:\s+(true|false)`)
@@ -222,8 +202,31 @@ func (t *Tool) Extract(id, outPath string) *exit.Error {
 	return e
 }
 
-// Admit installs one object under a declared identity: a digest-checked, no-clobber
-// write. This is how a fetched manifest enters the store — it proves itself.
+// Manifest writes exact, schema-checked bytes from the typed manifest namespace.
+func (t *Tool) Manifest(id, outPath string) *exit.Error {
+	_, e := t.run("manifest", "get", t.Root, hex(id), "--out", outPath)
+	return e
+}
+
+var admittedManifest = regexp.MustCompile(`admitted=(true|false)`)
+
+// AdmitManifest validates exact downloaded bytes and installs them in the typed
+// manifest namespace. The bool says whether this call created the object.
+func (t *Tool) AdmitManifest(path, id string, length int64) (bool, *exit.Error) {
+	out, e := t.run("manifest", "admit", t.Root, path, "--expect", id,
+		"--expect-length", strconv.FormatInt(length, 10))
+	if e != nil {
+		return false, e
+	}
+	m := admittedManifest.FindStringSubmatch(out)
+	if m == nil {
+		return false, exit.Internalf("tfs manifest admit printed no result")
+	}
+	return m[1] == "true", nil
+}
+
+// Admit installs one blob under a declared identity: a digest-checked, no-clobber
+// write.
 func (t *Tool) Admit(path, id string, length int64) *exit.Error {
 	_, e := t.run("put", t.Root, path,
 		"--expect", hex(id), "--expect-length", strconv.FormatInt(length, 10))
@@ -262,87 +265,132 @@ func (t *Tool) Fill(plan []byte, planPath string) (FillResult, *exit.Error) {
 	return FillResult{Put: put, Skipped: skipped, Refused: refused}, nil
 }
 
-var verified = regexp.MustCompile(`(\d+) tensors, (\d+) parts,(?: (\d+) assets,)? (\d+) blobs, (\d+) distinct objects`)
-
-// Verify is the whole-checkpoint proof: every byte the snapshot declares, hashed.
-// A fetch is not finished until this passes — and the root below is registered only
-// after it does, which is what "no partial visibility" means locally.
-func (t *Tool) Verify(snapshot string) (tensors, parts, objects int, e *exit.Error) {
-	out, e := t.run("snapshot", "verify", t.Root, hex(snapshot))
-	if e != nil {
-		return 0, 0, 0, e
-	}
-	m := verified.FindStringSubmatch(out)
-	if m == nil {
-		return 0, 0, 0, exit.Internalf("tfs snapshot verify printed no summary")
-	}
-	tensors, _ = strconv.Atoi(m[1])
-	parts, _ = strconv.Atoi(m[2])
-	objects, _ = strconv.Atoi(m[5])
-	return tensors, parts, objects, nil
-}
-
-// Register names a verified snapshot in the local store's root authority, and notes
-// that the hub holds it durably. `--hub-published` is durability WITHOUT pinning:
-// the note says the bytes survive elsewhere, it does not promise to keep them here.
-func (t *Tool) Register(name, snapshot string) *exit.Error {
-	if _, e := t.run("root", "register", t.Root, name, hex(snapshot)); e != nil {
-		return e
-	}
-	_, e := t.run("root", "note", t.Root, hex(snapshot), "--hub-published")
+// VerifyManifest hashes every blob reached by a manifest.
+func (t *Tool) VerifyManifest(id string) *exit.Error {
+	_, e := t.run("manifest", "verify", t.Root, hex(id))
 	return e
 }
 
-// Note records that the hub holds this snapshot, without claiming a local root. A
-// publisher's own store already had the bytes; what publishing added is durability.
-func (t *Tool) Note(snapshot string) *exit.Error {
-	_, e := t.run("root", "note", t.Root, hex(snapshot), "--hub-published")
-	return e
+// Release is one authoritative local repository row returned by TensorFS.
+type Release struct {
+	Org            string `json:"org"`
+	Name           string `json:"name"`
+	Version        string `json:"version"`
+	Lane           string `json:"lane"`
+	ManifestSHA256 string `json:"manifest_sha256"`
+	ManifestLength int64  `json:"manifest_length"`
 }
 
-// Roots lists the local root authority through TensorFS's public CLI.
-func (t *Tool) Roots() ([]Root, *exit.Error) {
-	out, problem := t.run("root", "list", t.Root)
-	if problem != nil {
-		return nil, problem
+// Releases lists repository metadata through TensorFS, never through SQLite or
+// direct traversal of repos/.
+func (t *Tool) Releases(outPath string) ([]Release, *exit.Error) {
+	if _, e := t.run("repo", "list", t.Root, "--rows", outPath); e != nil {
+		return nil, e
 	}
-	var roots []Root
-	for _, line := range strings.Split(out, "\n") {
-		fields := strings.Fields(line)
-		if len(fields) != 4 || fields[0] != "root" || !strings.HasPrefix(fields[3], "sha256:") {
+	raw, err := os.ReadFile(outPath)
+	if err != nil {
+		return nil, exit.Internalf("the repository rows tfs wrote are unreadable: %s", err)
+	}
+	var rows []Release
+	for line, text := range strings.Split(strings.TrimSpace(string(raw)), "\n") {
+		if strings.TrimSpace(text) == "" {
 			continue
 		}
-		name := fields[1]
-		if decoded, err := strconv.Unquote(name); err == nil {
-			name = decoded
+		var row Release
+		if err := json.Unmarshal([]byte(text), &row); err != nil || row.Org == "" || row.Name == "" ||
+			row.Version == "" || row.Lane == "" || len(row.ManifestSHA256) != 64 || row.ManifestLength <= 0 {
+			return nil, exit.Internalf("tfs returned an invalid repository row at line %d", line+1)
 		}
-		roots = append(roots, Root{Name: name, Kind: fields[2], Snapshot: fields[3]})
+		rows = append(rows, row)
 	}
-	return roots, nil
+	return rows, nil
 }
 
-// ReleaseRoot drops one local name. TensorFS deliberately leaves byte reclaim
-// to its later complete mark/sweep pass.
-func (t *Tool) ReleaseRoot(name string) *exit.Error {
-	_, problem := t.run("root", "release", t.Root, name)
-	return problem
+func writeJSON(path string, value any) *exit.Error {
+	raw, err := json.Marshal(value)
+	if err != nil {
+		return exit.Internalf("cannot encode the TensorFS request: %s", err)
+	}
+	if err := os.WriteFile(path, raw, 0o600); err != nil {
+		return exit.Internalf("cannot stage the TensorFS request: %s", err)
+	}
+	return nil
+}
+
+func (t *Tool) observedRepository(org, name, scratch string) (string, *exit.Error) {
+	rows, e := t.Releases(filepath.Join(scratch, "repo-list.jsonl"))
+	if e != nil {
+		return "", e
+	}
+	found := false
+	for _, row := range rows {
+		if row.Org == org && row.Name == name {
+			found = true
+			break
+		}
+	}
+	if !found {
+		return "-", nil
+	}
+	current := filepath.Join(scratch, "repo-current.json")
+	if _, e := t.run("repo", "get", t.Root, org, name, "--out", current); e != nil {
+		return "", e
+	}
+	return current, nil
+}
+
+// CommitRelease makes one verified manifest visible under the local repository.
+func (t *Tool) CommitRelease(org, name, version, lane, manifestID string, length int64, scratch string) *exit.Error {
+	current, e := t.observedRepository(org, name, scratch)
+	if e != nil {
+		return e
+	}
+	mutation := filepath.Join(scratch, "repo-put.json")
+	if e := writeJSON(mutation, map[string]any{
+		"action": "put_release", "lane": lane,
+		"manifest": map[string]any{"length": length, "sha256": hex(manifestID)},
+		"repo":     map[string]string{"name": name, "org": org}, "version": version,
+	}); e != nil {
+		return e
+	}
+	_, e = t.run("repo", "commit", t.Root, current, mutation)
+	return e
+}
+
+// DeleteRepository removes the local durable name. Blobs and manifests remain
+// until TensorFS's later reachability GC.
+func (t *Tool) DeleteRepository(org, name, scratch string) *exit.Error {
+	current, e := t.observedRepository(org, name, scratch)
+	if e != nil {
+		return e
+	}
+	if current == "-" {
+		return nil
+	}
+	mutation := filepath.Join(scratch, "repo-delete.json")
+	if e := writeJSON(mutation, map[string]any{
+		"action": "delete_repository", "repo": map[string]string{"name": name, "org": org},
+	}); e != nil {
+		return e
+	}
+	_, e = t.run("repo", "commit", t.Root, current, mutation)
+	return e
 }
 
 // hex strips the `sha256:` spelling for the argument position tfs takes bare hex in.
 func hex(id string) string { return strings.TrimPrefix(id, "sha256:") }
 
-// Snapshot normalizes a snapshot reference to the `sha256:<64 hex>` spelling, or
-// refuses. It is the one place that decides what a local ref looks like.
-func Snapshot(ref string) (string, *exit.Error) {
+// ManifestID normalizes a manifest reference to the `sha256:<64 hex>` spelling.
+func ManifestID(ref string) (string, *exit.Error) {
 	h := hex(strings.TrimSpace(ref))
 	if len(h) != 64 {
-		return "", exit.Usagef("%q is not a snapshot id", ref).
-			WithRemedy("a snapshot id is sha256:<64 hex> — `tfs ingest install` prints one, and so does `cozy model download`")
+		return "", exit.Usagef("%q is not a manifest id", ref).
+			WithRemedy("a manifest id is sha256:<64 hex> — TensorFS ingest and `cozy model download` print one")
 	}
 	for _, c := range h {
 		if !strings.ContainsRune("0123456789abcdef", c) {
-			return "", exit.Usagef("%q is not a snapshot id: %q is not a hex digit", ref, c).
-				WithRemedy("a snapshot id is sha256:<64 hex>, lowercase")
+			return "", exit.Usagef("%q is not a manifest id: %q is not a hex digit", ref, c).
+				WithRemedy("a manifest id is sha256:<64 hex>, lowercase")
 		}
 	}
 	return "sha256:" + h, nil

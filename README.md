@@ -117,7 +117,7 @@ See [package publication](docs/package-publication.md) for the release contract.
 
 ## Models
 
-Model checkpoints live in the local TensorFS store:
+Model releases live in the local TensorFS store:
 
 ```sh
 cozy model search flux
@@ -126,15 +126,16 @@ cozy model list
 cozy model remove org/model
 ```
 
-Publish an existing canonical TensorFS snapshot. The remote model name is created automatically
-when absent:
+Publish an existing canonical TensorFS manifest as one immutable release lane. The remote model
+name is created automatically when absent:
 
 ```sh
-cozy model publish org/model sha256:<snapshot>
+cozy model publish org/model sha256:<manifest> --release 1.0.0 --lane bf16
 ```
 
 Download and publication are resumable and verify content identities before making a local or
-remote root visible.
+remote release visible. Digest-only downloads are refused locally because a durable local model
+must have real release and lane coordinates.
 
 ## Invoke packages and jobs
 

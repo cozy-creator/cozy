@@ -1,4 +1,4 @@
-// Package transfer is the order of operations for moving a canonical checkpoint
+// Package transfer is the order of operations for moving a canonical manifest
 // between the local store and the hub (cl-012). It owns no bytes and no protocol:
 // TensorFS owns the byte plane (every question crosses internal/tfs) and tensorhub
 // owns the incremental publication protocol (every call crosses internal/hub). What lives here
@@ -40,11 +40,13 @@ type Publish struct {
 	Tool *tfs.Tool
 	Hub  *hub.Client
 	Ref  hub.Ref
-	// Snapshot is the local canonical snapshot being published: `sha256:<64 hex>`.
-	Snapshot string
-	Session  string
-	Reason   string
-	DryRun   bool
+	// ManifestID is the local canonical manifest being published.
+	ManifestID string
+	Release    string
+	Lane       string
+	Session    string
+	Reason     string
+	DryRun     bool
 	// Progress receives one line per phase. It is where the honest accounting is
 	// printed as the work happens; the returned Result carries the same numbers.
 	Progress func(string)
@@ -64,15 +66,13 @@ type Result struct {
 	Verified  int
 	// Moved is bytes this invocation actually put on the wire; Deduped is what the
 	// hub already held. Their sum is the artifact.
-	Moved    int64
-	Deduped  int64
-	Sources  []string
-	Root     hub.Root
-	Grade    string
-	Verdict  string
-	Dup      bool
-	MS       map[string]int64
-	Reingest int
+	Moved          int64
+	Deduped        int64
+	Sources        []string
+	Manifest       hub.ManifestRef
+	TopologyDigest string
+	Dup            bool
+	MS             map[string]int64
 }
 
 func (p *Publish) say(format string, args ...any) {
@@ -96,51 +96,40 @@ func (p *Publish) Run(ctx context.Context) (Result, *exit.Error) {
 	if err := os.MkdirAll(p.Scratch, 0o700); err != nil {
 		return res, exit.Internalf("cannot create the transfer scratch at %s: %s", p.Scratch, err)
 	}
-	closure, objects, e := p.Tool.Closure(p.Snapshot, p.Session, filepath.Join(p.Scratch, "closure.json"))
-	if e != nil {
-		return res, e
-	}
-	header, e := p.Tool.Header(p.Snapshot)
-	if e != nil {
-		return res, e
-	}
-	topology, e := p.Tool.Topology(header, filepath.Join(p.Scratch, "topology.json"))
+	objects, e := p.Tool.ManifestObjects(p.ManifestID, filepath.Join(p.Scratch, "objects.jsonl"))
 	if e != nil {
 		return res, e
 	}
 	manifestPath := filepath.Join(p.Scratch, "manifest.bin")
-	if e := p.Tool.Extract(p.Snapshot, manifestPath); e != nil {
+	if e := p.Tool.Manifest(p.ManifestID, manifestPath); e != nil {
 		return res, e
 	}
 	manifest, err := os.ReadFile(manifestPath)
 	if err != nil {
 		return res, exit.Internalf("the manifest tfs extracted is unreadable: %s", err)
 	}
-	seal := hub.SealPublicationRequest{
-		Closure:      hub.B64(closure),
-		CodeTopology: hub.B64(topology),
-		SnapshotID:   p.Snapshot,
-		Manifest:     hub.B64(manifest),
-		HeaderID:     "sha256:" + header,
-		Stamps:       []map[string]any{},
-	}
+	res.Manifest = hub.ManifestRef{SHA256: strings.TrimPrefix(p.ManifestID, "sha256:"), Length: int64(len(manifest))}
+	seal := hub.SealPublicationRequest{Manifest: hub.B64(manifest)}
 	declared := make([]hub.Object, 0, len(objects))
 	for _, o := range objects {
 		declared = append(declared, hub.Object{ID: o.ID, Length: o.Length})
 	}
 	sort.Slice(declared, func(i, j int) bool { return declared[i].ID < declared[j].ID })
 	ms["declare"] = since(t0)
-	p.say("prepared %d known object transfers (%s) from %s", len(declared), bytesOf(objects), p.Snapshot)
+	p.say("prepared %d known blob transfers (%s) from %s", len(declared), bytesOf(objects), p.ManifestID)
 
 	// 2. Open under the caller-stable operation id. Reopening returns the same durable
 	//    publication, including a committed one whose seal result can be replayed.
 	t0 = time.Now()
-	opened, e := p.Hub.OpenPublication(ctx, p.Ref, p.Session, declared, p.Reason)
+	opened, e := p.Hub.OpenPublication(ctx, p.Ref, p.Session, p.Release, p.Lane, declared, p.Reason)
 	if e != nil {
 		return res, e
 	}
 	ms["open"] = since(t0)
 	publication := opened.Publication
+	if publication.Release != p.Release || publication.Lane != p.Lane {
+		return res, exit.Internalf("publication reopened under different release coordinates")
+	}
 	res.PublishID, res.Created, res.Session = publication.Operation, opened.Created, publication.Operation
 	verb := "resumed"
 	if opened.Created {
@@ -183,7 +172,7 @@ func (p *Publish) Run(ctx context.Context) (Result, *exit.Error) {
 		default:
 			return res, exit.New(exit.Conflict,
 				"publication object %s is %s", transfer.ObjectID, transfer.State).
-				WithRemedy("repair the refused immutable snapshot publication before replaying it")
+				WithRemedy("repair the refused immutable manifest publication before replaying it")
 		}
 	}
 	p.say("publication %s: %d transfers need upload (%s) · %d already resident (%s)",
@@ -241,21 +230,13 @@ func (p *Publish) seal(ctx context.Context, request hub.SealPublicationRequest,
 		return res, e
 	}
 	ms["seal"] = since(t0)
-	res.Root, res.Dup, res.Reingest = done.Root, done.Duplicate, done.ReingestedHeldObjects
-	res.Grade, res.Verdict = done.Verifier.Grade, done.Verifier.Satisfaction
-	if res.Grade == "" {
-		res.Grade = done.Root.Grade
+	if done.PublishID != res.PublishID || done.Release != p.Release || done.Lane != p.Lane ||
+		done.Manifest != res.Manifest {
+		return res, exit.Internalf("Tensorhub committed a different publication identity")
 	}
-	for k, v := range done.MS {
-		ms["hub_"+k] = v
-	}
+	res.Manifest, res.TopologyDigest, res.Dup = done.Manifest, done.TopologyDigest, done.Duplicate
 	if res.Dup {
-		p.say("this exact publication already sealed: Tensorhub replayed the same committed root")
-	}
-	// The bytes are the hub's now. Note the durability WITHOUT pinning: publishing
-	// does not promise the local store keeps a copy.
-	if e := p.Tool.Note(p.Snapshot); e != nil {
-		return res, e
+		p.say("this exact publication already sealed: Tensorhub replayed the same release")
 	}
 	p.say("timing: %s", Timing(ms))
 	return res, nil
