@@ -66,7 +66,7 @@
 //!   tfs read tear <root> <manifest>          tear a verified blob UNDER a live lease
 //!   tfs read prove <root> <manifest>         delivered bytes vs header digests
 //!   tfs read transform                       run decomposition + the block-granularity rule
-//!   tfs checkout <root> <manifest> <dest>    disposable relative-symlink tree
+//!   tfs checkout <root> <manifest> <dest>    manifest tree; header included, payload CAS-only
 //!   tfs materialize <root> <manifest> <path> <dest>  independent ordinary-file bytes
 //!   tfs render <root> <hex>                  pretty PROJECTION of a canonical document
 //!
