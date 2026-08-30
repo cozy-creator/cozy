@@ -1,5 +1,5 @@
 //! The ingest TRANSACTION: everything a border run produces lands under an expiring
-//! quarantine root, and a separate explicit act installs it.
+//! candidate directory under `tmp/`, and a separate explicit act installs it.
 //!
 //! The property this file exists to hold: **a crash, a timeout, a rejection or a walked-away
 //! session leaves no visible checkpoint.** Candidate objects may well be in the CAS — they
@@ -91,8 +91,8 @@ impl Plain for IngestSession {
     }
 }
 
-pub fn quarantine_dir(store_root: &Path, session: &str) -> PathBuf {
-    store_root.join("ingest").join(session)
+pub fn candidate_dir(store_root: &Path, session: &str) -> PathBuf {
+    store_root.join("tmp").join("ingest").join(session)
 }
 
 /// Write the root FIRST: from this instant the session is reapable, whatever happens next.
@@ -107,7 +107,7 @@ pub fn open_root(
     ttl: u64,
 ) -> Result<(IngestSession, crate::catalog::WriterGuard)> {
     let store_root = store.root();
-    let dir = quarantine_dir(store_root, session);
+    let dir = candidate_dir(store_root, session);
     if dir.is_dir() {
         let root = read_session(store_root, session)?;
         if root.tenant != tenant || root.expires_at.saturating_sub(root.created) != ttl {
@@ -124,7 +124,7 @@ pub fn open_root(
         )?;
         return Ok((root, writer));
     }
-    fs::create_dir_all(&dir).map_err(|e| io("mkdir quarantine session", e))?;
+    fs::create_dir_all(&dir).map_err(|e| io("mkdir ingest candidate", e))?;
     let now = now_secs();
     let root = IngestSession {
         session: session.to_string(),
@@ -171,14 +171,14 @@ pub fn resume_operation(
 }
 
 pub fn write_session(store_root: &Path, root: &IngestSession) -> Result<()> {
-    let dir = quarantine_dir(store_root, &root.session);
-    fs::create_dir_all(&dir).map_err(|e| io("mkdir quarantine session", e))?;
+    let dir = candidate_dir(store_root, &root.session);
+    fs::create_dir_all(&dir).map_err(|e| io("mkdir ingest candidate", e))?;
     fs::write(dir.join("session.json"), root.canonical_bytes())
         .map_err(|e| io("write ingest session", e))
 }
 
 pub fn read_session(store_root: &Path, session: &str) -> Result<IngestSession> {
-    let p = quarantine_dir(store_root, session).join("session.json");
+    let p = candidate_dir(store_root, session).join("session.json");
     match fs::read(&p) {
         Ok(b) => IngestSession::parse(&b),
         Err(_) => refuse(
@@ -195,7 +195,7 @@ pub fn read_session(store_root: &Path, session: &str) -> Result<IngestSession> {
 /// An expired operation can be abandoned only after that marker is provably unlocked.
 pub fn reap(store: &Store, now: u64) -> Result<(Vec<String>, Vec<String>)> {
     let store_root = store.root();
-    let base = store_root.join("ingest");
+    let base = store_root.join("tmp").join("ingest");
     let (mut gone, mut kept) = (Vec::new(), Vec::new());
     let rd = match fs::read_dir(&base) {
         Ok(r) => r,
@@ -326,7 +326,7 @@ pub fn install(store: &Store, request: Install<'_>) -> Result<String> {
     };
     store.apply_repository(current.as_deref(), &mutation, &Default::default())?;
     crate::catalog::Catalog::open(store.root())?.complete_operation(session)?;
-    let _ = fs::remove_dir_all(quarantine_dir(store.root(), session));
+    let _ = fs::remove_dir_all(candidate_dir(store.root(), session));
     Ok(id)
 }
 
@@ -507,15 +507,13 @@ pub fn execute(
                                     code: e.code,
                                     detail: format!("{what}: inherit-by-reference: {}", e.detail),
                                 })?;
-                                if let Verdict::Quarantined { to, why } = v {
+                                if let Verdict::CorruptRemoved { why } = v {
                                     return refuse(
                                         Code::OBJECT_CORRUPT,
                                         format!(
                                             "{what}: inherit-by-reference names {} whose \
-                                             bytes disagree with their id (quarantined to \
-                                             {}): {why}",
-                                            s.id(),
-                                            to.display()
+                                             bytes disagree with their id and were removed: {why}",
+                                            s.id()
                                         ),
                                     );
                                 }

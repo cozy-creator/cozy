@@ -18,7 +18,7 @@
 //! anything outside `wanted` is not resuming — it is re-downloading. The split asks the
 //! store's own question (`record_valid`: may these bytes be trusted without hashing them
 //! again?) and, only when the record cannot answer, pays one rehash. Bytes that fail that
-//! rehash are QUARANTINED by `verify` and then land in `wanted`, which is why a corrupted
+//! rehash are REMOVED by `verify` and then land in `wanted`, which is why a corrupted
 //! local object heals on the next pull instead of being skipped as "already present".
 
 use crate::canon::{self, as_arr, Fields, Value};
@@ -72,9 +72,9 @@ pub enum Presence {
     Rehashed,
     /// Not installed.
     Absent,
-    /// Installed and WRONG. `verify` renamed it into `quarantine/`; the id is now free for
+    /// Installed and WRONG. `verify` removed it; the id is now free for
     /// the fetch to land at, so this is a repair, not a refusal.
-    Quarantined { why: String },
+    CorruptRemoved { why: String },
 }
 
 impl Presence {
@@ -86,7 +86,7 @@ impl Presence {
             Presence::Recorded => "recorded",
             Presence::Rehashed => "rehashed",
             Presence::Absent => "absent",
-            Presence::Quarantined { .. } => "quarantined",
+            Presence::CorruptRemoved { .. } => "corrupt_removed",
         }
     }
 }
@@ -227,8 +227,8 @@ fn manifest_presence(store: &Store, object: &ObjectRef) -> Result<Presence> {
         Err(error) if error.code == Code::OBJECT_ABSENT => Ok(Presence::Absent),
         Err(error) => {
             let why = error.to_string();
-            store.quarantine_manifest(&object.sha256)?;
-            Ok(Presence::Quarantined { why })
+            store.remove_corrupt_manifest(&object.sha256)?;
+            Ok(Presence::CorruptRemoved { why })
         }
     }
 }
@@ -241,11 +241,11 @@ fn presence(store: &Store, o: &ObjectRef) -> Result<Presence> {
     if store.record_valid(&o.sha256).is_ok() {
         return Ok(Presence::Recorded);
     }
-    // The record could not vouch. One rehash decides, and a disagreement is quarantined by
+    // The record could not vouch. One rehash decides, and a disagreement is removed by
     // `verify` itself — which is what frees the id for the re-fetch below.
     match store.verify(&o.sha256)? {
         Verdict::Verified { .. } | Verdict::Invalidated { .. } => Ok(Presence::Rehashed),
-        Verdict::Quarantined { why, .. } => Ok(Presence::Quarantined { why }),
+        Verdict::CorruptRemoved { why } => Ok(Presence::CorruptRemoved { why }),
     }
 }
 
@@ -517,7 +517,7 @@ mod tests {
     }
 
     #[test]
-    fn corrupt_manifest_is_quarantined_and_readmitted_without_touching_blobs() {
+    fn corrupt_manifest_is_removed_and_readmitted_without_touching_blobs() {
         let root = temporary("repair");
         let (store, manifest, header, manifest_bytes) = fixture(&root);
         let path = store.manifest_path(&manifest.sha256);
@@ -533,14 +533,14 @@ mod tests {
                 .find(|(object, _)| object == &manifest)
                 .unwrap()
                 .1,
-            Presence::Quarantined { .. }
+            Presence::CorruptRemoved { .. }
         ));
         assert!(!path.exists());
         assert!(store.blob_path(&header.sha256).exists());
         let grant = DeliveryGrant::mint(&plan, &manifest).unwrap();
         grant.admit(&store, &mut manifest_bytes.as_slice()).unwrap();
         plan.complete(&store).unwrap();
-        assert!(root.join(".tensorfs/quarantine/manifests").is_dir());
+        assert!(path.exists());
 
         let second = temporary("oversized-body");
         let destination = Store::init(&second).unwrap();

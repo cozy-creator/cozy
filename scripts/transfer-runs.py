@@ -58,8 +58,8 @@ def main() -> int:
             tensorfs.transfer_object(source, corrupt_destination, identity, len(raw))
         except tensorfs.errors.ObjectCorrupt:
             assert not corrupt_destination.contains(identity)
-            assert list((pathlib.Path(corrupt_destination.root) / ".tensorfs/quarantine").iterdir())
-            print("PASS an existing wrong destination is quarantined, never overwritten")
+            assert not planted_destination.exists()
+            print("PASS an existing wrong destination is removed, never treated as exact")
         else:
             raise AssertionError("wrong destination was treated as an exact skip")
 
@@ -75,8 +75,8 @@ def main() -> int:
         except tensorfs.errors.ObjectCorrupt:
             assert not corrupt_source.contains(identity)
             assert not clean_destination.contains(identity)
-            assert list((pathlib.Path(corrupt_source.root) / ".tensorfs/quarantine").iterdir())
-            print("PASS corrupt source is quarantined and never reaches destination")
+            assert not planted.exists()
+            print("PASS corrupt source is removed and never reaches destination")
         else:
             raise AssertionError("corrupt source transferred")
 

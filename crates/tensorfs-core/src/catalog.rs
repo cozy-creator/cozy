@@ -739,7 +739,7 @@ pub struct WriterGuard {
 
 impl WriterGuard {
     pub fn acquire(root: &Path) -> Result<Self> {
-        let directory = root.join(".tensorfs/writers");
+        let directory = root.join("tmp/writers");
         fs::create_dir_all(&directory).map_err(|error| io("mkdir writer markers", error))?;
         let path = directory.join(format!(
             "{}-{}.writer",
@@ -758,7 +758,7 @@ impl WriterGuard {
     }
 
     pub fn refuse_rebuild_if_live(root: &Path) -> Result<()> {
-        let directory = root.join(".tensorfs/writers");
+        let directory = root.join("tmp/writers");
         if !directory.is_dir() {
             return Ok(());
         }
@@ -808,7 +808,7 @@ mod tests {
             Code::STORE_BUSY
         );
         drop(guard);
-        let directory = root.join(".tensorfs/writers");
+        let directory = root.join("tmp/writers");
         fs::create_dir_all(&directory).unwrap();
         fs::write(directory.join("dead.writer"), b"").unwrap();
         WriterGuard::refuse_rebuild_if_live(&root).unwrap();

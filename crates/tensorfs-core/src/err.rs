@@ -126,7 +126,7 @@ codes![
     PLACEMENT_UNFIT,
     CONVERT_SIZE_CAP,
     SEAM_UNBANKED,
-    // ingest border: the quarantine transaction
+    // ingest border: the temporary candidate transaction
     QUOTA_EXHAUSTED,
     ROOT_EXPIRED,
     ROOT_ABSENT,

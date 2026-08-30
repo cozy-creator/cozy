@@ -656,9 +656,8 @@ impl PyStore {
                 d.set_item("verdict", "invalidated")?;
                 d.set_item("why", why)?;
             }
-            Verdict::Quarantined { to, why } => {
-                d.set_item("verdict", "quarantined")?;
-                d.set_item("to", to.display().to_string())?;
+            Verdict::CorruptRemoved { why } => {
+                d.set_item("verdict", "corrupt_removed")?;
                 d.set_item("why", why)?;
             }
         }

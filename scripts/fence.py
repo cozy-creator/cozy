@@ -153,7 +153,7 @@ GRAMMAR_TAGS = ["ceil_block", "elements_div", "ceil_div"]
 # legitimately carries ("pickle" is a refused dialect); an identifier is a parser.
 FOREIGN = ["safetensors", "gguf", "pickle", "unpickle", "zipfile", "ZipArchive", "npz"]
 # The border is a MODULE, not a file: carrier decode, classification, converters and the
-# quarantine transaction each own one stage, and all four are inside the same fence.
+# temporary candidate transaction each own one stage, and all four are inside the same fence.
 INGEST_OK_PREFIX = "crates/tensorfs-core/src/ingest"
 # The fence must be free to NAME what it forbids.
 SELF = {"scripts/fence.py"}
@@ -344,7 +344,7 @@ BORDER_VOCAB = ["ingest::carrier", "ingest::convert", "ingest::fingerprint", "ca
                 "fingerprint::", "convert::", "SourceHeader", "IngestProfile", "Converter",
                 "classify", "topology_fingerprint"]
 # `ingest::transaction` is deliberately NOT on that list. GC must mark the border's expiring
-# quarantine roots — they are pin root class 4 (tensorfs.md §2) — so the ROOT plane is a real
+# candidate roots — they are pin root class 4 (tensorfs.md §2) — so the ROOT plane is a real
 # seam between the two. What stays banned is the DECIDING half: carrier decode, conversion
 # planning and classification. A fence that cannot tell a root from a parser would force the
 # GC to re-implement the root reader, which is the duplication it exists to prevent.
@@ -478,6 +478,27 @@ def fence_env():
     return bad, f"runtime env reads confined to {sorted(ENV_HOME)}; env! stamps exempt"
 
 
+# ------------------------------------------------- 9. one temporary namespace
+
+def fence_temp_layout():
+    """All local transient state lives under store-root tmp; corrupt bytes are deleted."""
+    bad = []
+    roots = [ROOT / "crates", ROOT / "scripts", ROOT / "vectors", ROOT / "README.md"]
+    for root in roots:
+        paths = [root] if root.is_file() else sorted(path for path in root.rglob("*") if path.is_file())
+        for path in paths:
+            if path.resolve() == pathlib.Path(__file__).resolve() or path.suffix == ".pyc":
+                continue
+            text = path.read_text(errors="ignore").lower()
+            for spelling in (".tensorfs", "quarantine"):
+                if spelling in text:
+                    bad.append(f"{rel(path)} retains deleted temporary layout spelling {spelling!r}")
+    store = (ROOT / "crates/tensorfs-core/src/store.rs").read_text()
+    if '"checkouts", "tmp"' not in store:
+        bad.append("Store::init no longer creates the one root tmp directory")
+    return bad, "one store-root tmp directory; no corrupt-byte retention"
+
+
 # ----------------------------------------------------------------------------
 
 def rel(p):
@@ -492,7 +513,8 @@ FENCES = [("prelaunch package identity", fence_version_contract),
           ("serve path, pinned buffers, one transform", fence_serve_path),
           ("no grading below the hub", fence_grading),
           ("the staged fallback stays unbuilt", fence_staging),
-          ("env reads are flags", fence_env)]
+          ("env reads are flags", fence_env),
+          ("one temporary namespace", fence_temp_layout)]
 
 red = 0
 for title, fn in FENCES:

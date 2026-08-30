@@ -9,7 +9,7 @@ use tensorfs_core::header::{Closure, Header, Part, Tensor};
 use tensorfs_core::ids::{Doc, ObjectRef};
 use tensorfs_core::manifest::{Draft, Entry, Manifest};
 use tensorfs_core::repository::{Mutation, ReleaseEvidence, Repository};
-use tensorfs_core::store::{Fault, Store};
+use tensorfs_core::store::{Fault, Store, Verdict};
 
 fn temporary(name: &str) -> PathBuf {
     std::env::temp_dir().join(format!(
@@ -20,6 +20,34 @@ fn temporary(name: &str) -> PathBuf {
             .unwrap()
             .as_nanos()
     ))
+}
+
+#[test]
+fn one_tmp_tree_is_recreatable_and_corruption_is_not_retained() {
+    let root = temporary("tmp-layout");
+    let store = Store::init(&root).unwrap();
+    assert!(root.join("tmp").is_dir());
+
+    let bytes = b"known-good";
+    let object = ObjectRef::of(bytes);
+    store
+        .put_stream(&mut bytes.as_slice(), Some(&object), &Fault::default())
+        .unwrap();
+    let path = store.blob_path(&object.sha256);
+    let mut permissions = fs::metadata(&path).unwrap().permissions();
+    std::os::unix::fs::PermissionsExt::set_mode(&mut permissions, 0o644);
+    fs::set_permissions(&path, permissions).unwrap();
+    fs::write(&path, b"corruption").unwrap();
+    assert!(matches!(
+        store.verify(&object.sha256).unwrap(),
+        Verdict::CorruptRemoved { .. }
+    ));
+    assert!(!path.exists());
+
+    fs::remove_dir_all(root.join("tmp")).unwrap();
+    Store::open(&root).unwrap();
+    assert!(root.join("tmp").is_dir());
+    let _ = fs::remove_dir_all(root);
 }
 
 fn fixture(root: &Path) -> (ObjectRef, ReleaseEvidence) {

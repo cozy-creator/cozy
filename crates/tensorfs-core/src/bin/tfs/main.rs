@@ -13,7 +13,7 @@
 //!   tfs put <root> <file>        stream one object in (any shape)
 //!   tfs get <root> <hex>         verified read, whole or ranged
 //!   tfs contains <root> <hex>    the presence HINT, and what it is worth
-//!   tfs verify <root> <hex>      verification record or rehash; quarantine on disagreement
+//!   tfs verify <root> <hex>      verification record or rehash; remove corrupt bytes
 //!   tfs scrub <root>             one rate knob over the whole store
 //!   tfs reap <root>              age-bounded temp reap
 //!   tfs fill <root> <plan>       resumable fill: skip only verified objects
@@ -387,8 +387,8 @@ fn cmd_verify_object(root: &Path, hex: &str, f: &Flags) -> ExitCode {
             println!("RECORD INVALIDATED ({why}) — rehashed, bytes are good, record refreshed");
             ExitCode::SUCCESS
         }
-        Verdict::Quarantined { to, why } => {
-            eprintln!("QUARANTINED sha256:{hex} -> {} ({why})", to.display());
+        Verdict::CorruptRemoved { why } => {
+            eprintln!("CORRUPT REMOVED sha256:{hex} ({why})");
             ExitCode::FAILURE
         }
     }
@@ -445,15 +445,15 @@ fn cmd_scrub(root: &Path, f: &Flags) -> ExitCode {
     let r = ok!(s.scrub(rate, pass));
     let secs = t.elapsed().as_secs_f64();
     println!(
-        "scrub rate={rate} pass={pass}: scanned {} sampled {} rehashed {} quarantined {} ({:.1} MiB hashed, {secs:.3} s, {:.1} MiB/s)",
+        "scrub rate={rate} pass={pass}: scanned {} sampled {} rehashed {} corrupt-removed {} ({:.1} MiB hashed, {secs:.3} s, {:.1} MiB/s)",
         r.scanned,
         r.sampled,
         r.rehashed,
-        r.quarantined,
+        r.removed,
         r.bytes_hashed as f64 / 1048576.0,
         r.bytes_hashed as f64 / secs.max(1e-9) / 1048576.0
     );
-    ExitCode::from(if r.quarantined > 0 { 1 } else { 0 })
+    ExitCode::from(if r.removed > 0 { 1 } else { 0 })
 }
 
 fn cmd_reap(root: &Path, f: &Flags) -> ExitCode {
@@ -488,14 +488,11 @@ fn cmd_fill(root: &Path, plan: &Path, f: &Flags) -> ExitCode {
             }
             // Present but unverified. Presence alone never resumes, and no-clobber
             // admission means a corrupt squatter would silently survive a re-put — so the
-            // rehash happens HERE: good bytes resume, bad bytes are quarantined out of the
+            // rehash happens HERE: good bytes resume, bad bytes are removed and the
             // way and the object is admitted afresh.
             Err(why) if s.contains(hex) => match ok!(s.verify(hex)) {
-                Verdict::Quarantined { to, .. } => {
-                    println!(
-                        "requeue sha256:{hex} ({why}; quarantined to {})",
-                        to.display()
-                    )
+                Verdict::CorruptRemoved { .. } => {
+                    println!("requeue sha256:{hex} ({why}; corrupt bytes removed)")
                 }
                 _ => {
                     skipped += 1;
@@ -1721,7 +1718,7 @@ fn build_corpus() -> TfsResult<(Vec<Case>, Vec<EncodingSpec>)> {
         "ingest-session",
         "session",
         session.canonical_bytes(),
-        "an expiring quarantine session: a candidate is never a release",
+        "an expiring temporary session: a candidate is never a release",
     ));
 
     // --- ingest reds
