@@ -31,7 +31,7 @@ var (
 	fakeInstance = flag.String("fake-instance", "", "report an instance identity nobody spawned")
 	instanceID   = flag.String("instance-id", "", "")
 	releaseID    = flag.String("release-id", "", "")
-	arm          = flag.String("arm", "idle", "idle|badcred|badrelease|steal|badterminal|dropack|output|missing-output")
+	arm          = flag.String("arm", "idle", "idle|badcred|badrelease|steal|badterminal|dropack|output|missing-output|snapshotbarrier")
 	session      = flag.String("session", "", "a fixed worker_boot_id (the collision arm)")
 	cozyHome     = flag.String("cozy-home", "", "this worker's own root")
 	stealRequest = flag.String("request", "", "the steal arm's victim request")

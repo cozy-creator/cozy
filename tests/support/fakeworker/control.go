@@ -9,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/cozy-creator/cozy/internal/canonical"
@@ -26,10 +27,18 @@ type fakeControl struct {
 	root      string // this worker's OWN filesystem root
 	verify    func(string) bool
 
-	generation uint64
+	generation   uint64
+	snapshotSent atomic.Bool
 }
 
 func (f *fakeControl) WatchProgress(_ *pb.ProgressOpen, stream pb.WorkerControl_WatchProgressServer) error {
+	if f.arm == "snapshotbarrier" {
+		if f.snapshotSent.Load() {
+			f.say("ARM: WatchProgress opened after WorkerSnapshot")
+		} else {
+			f.say("ARM: WatchProgress opened before WorkerSnapshot")
+		}
+	}
 	<-stream.Context().Done()
 	return nil
 }
@@ -84,6 +93,9 @@ func (f *fakeControl) Control(stream pb.WorkerControl_ControlServer) error {
 	send(&pb.WorkerFrame{Msg: &pb.WorkerFrame_ClaimAck{ClaimAck: ack}})
 	f.say("ClaimAck sent: boot=%s instance=%s release=%s minor=%d",
 		f.bootID, f.instance, f.releaseID, pb.WireMinor)
+	if f.arm == "snapshotbarrier" {
+		time.Sleep(250 * time.Millisecond)
+	}
 
 	// ONE BOUNDED, DIGEST-ACKED SNAPSHOT (§5). The body is a real canonical document and
 	// the digest is over exactly its bytes, so a truncated snapshot cannot match one.
@@ -110,6 +122,7 @@ func (f *fakeControl) Control(stream pb.WorkerControl_ControlServer) error {
 		snap.RecordOwnerEpoch, snap.ControlStreamGeneration, snap.WorkerBootId = e, g, b
 	})
 	send(&pb.WorkerFrame{Msg: &pb.WorkerFrame_Snapshot{Snapshot: snap}})
+	f.snapshotSent.Store(true)
 	f.say("WorkerSnapshot %s sent (%d B); admission is CLOSED until the ack", snapshotID, len(bodyBytes))
 
 	var artifactRevision uint64

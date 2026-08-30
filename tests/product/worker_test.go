@@ -1,8 +1,10 @@
 package producttest
 
 import (
+	"bytes"
 	"encoding/hex"
 	"fmt"
+	"os"
 	"strings"
 	"sync"
 	"testing"
@@ -12,6 +14,31 @@ import (
 	"github.com/cozy-creator/cozy/internal/exit"
 	"github.com/cozy-creator/cozy/internal/records"
 )
+
+func TestProgressWatchOpensAfterSnapshotBarrier(t *testing.T) {
+	o := hostOwner(t, "snapshot-watch-order")
+	spec := fakeSpec("snapshot-watch-order", "0", "--arm", "snapshotbarrier")
+	instance, _, problem := o.c.EnsureWorker(spec)
+	fatal(t, problem)
+	fatal(t, o.c.EnsurePlacementReady(instance, planIDOf(t, spec)))
+
+	before := []byte("ARM: WatchProgress opened before WorkerSnapshot")
+	after := []byte("ARM: WatchProgress opened after WorkerSnapshot")
+	deadline := time.Now().Add(10 * time.Second)
+	for time.Now().Before(deadline) {
+		data, err := os.ReadFile(o.c.WorkerLog(instance))
+		if err == nil {
+			if bytes.Contains(data, before) {
+				t.Fatal("the lossy progress connection opened before the durable snapshot barrier")
+			}
+			if bytes.Contains(data, after) {
+				return
+			}
+		}
+		time.Sleep(25 * time.Millisecond)
+	}
+	t.Fatal("the progress connection did not open after the snapshot barrier")
+}
 
 func TestReconcilePreservesWorkerWithUnresolvedBirthIdentity(t *testing.T) {
 	o := hostOwner(t, "unresolved-birth")
