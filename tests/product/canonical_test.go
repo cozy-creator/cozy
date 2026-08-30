@@ -85,14 +85,16 @@ func TestCanonicalDocuments(t *testing.T) {
 		code string
 		msg  proto.Message
 	}{
-		"twin_duplicate_key":                {"duplicate_key", &pb.InvocationSpec{}},
-		"twin_float":                        {"non_integer_number", &pb.InvocationSpec{}},
-		"twin_unknown_key":                  {"unknown_field", &pb.InvocationSpec{}},
-		"twin_whitespace":                   {"noncanonical_encoding", &pb.InvocationSpec{}},
-		"twin_libc_unspelled":               {"libc_unspelled", &pb.PackageEnvironmentSpec{}},
-		"twin_model_object_set_missing":     {"model_object_set_missing", &pb.PlacementSet{}},
-		"twin_model_object_set_wrong_kind":  {"model_object_set_shape", &pb.PlacementSet{}},
-		"twin_model_object_set_zero_length": {"model_object_set_shape", &pb.PlacementSet{}},
+		"twin_duplicate_key":                        {"duplicate_key", &pb.InvocationSpec{}},
+		"twin_float":                                {"non_integer_number", &pb.InvocationSpec{}},
+		"twin_unknown_key":                          {"unknown_field", &pb.InvocationSpec{}},
+		"twin_whitespace":                           {"noncanonical_encoding", &pb.InvocationSpec{}},
+		"twin_libc_unspelled":                       {"libc_unspelled", &pb.PackageEnvironmentSpec{}},
+		"twin_model_object_set_missing":             {"model_object_set_missing", &pb.PlacementSet{}},
+		"twin_model_object_set_wrong_kind":          {"model_object_set_shape", &pb.PlacementSet{}},
+		"twin_model_object_set_zero_length":         {"model_object_set_shape", &pb.PlacementSet{}},
+		"twin_artifact_delegation_checkpoint_alias": {"unknown_field", &pb.ArtifactDelegation{}},
+		"twin_artifact_delegation_v1":               {"unknown_format", &pb.ArtifactDelegation{}},
 	} {
 		body, err := os.ReadFile(filepath.Join(fixtureDir, "red", name+".json"))
 		must(t, err)

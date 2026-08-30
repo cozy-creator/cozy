@@ -64,7 +64,7 @@ func ArtifactDelegations(l home.Layout, st *records.Store) orchestrator.Artifact
 			if models[index] == models[index-1] {
 				return orchestrator.ArtifactDelegation{}, exit.Named(exit.Conflict,
 					"rental.artifact_delegation_identity_duplicate",
-					"the rental control snapshot repeats model checkpoint %s", models[index])
+					"the rental control snapshot repeats model manifest %s", models[index])
 			}
 		}
 		delegationID, problem := mintDelegationID()
@@ -77,8 +77,8 @@ func ArtifactDelegations(l home.Layout, st *records.Store) orchestrator.Artifact
 		document := &pb.ArtifactDelegation{
 			RentalId: row.ID, WorkerId: request.WorkerID, WorkerBootId: request.WorkerBootID,
 			WorkerTlsCertificateDigest: pin.Digest(), Revision: row.PlacementRevision,
-			PackageReleaseIds:  packages,
-			ModelCheckpointIds: models, DelegationId: delegationID, ExpiresAtUnix: expires,
+			PackageReleaseIds: packages,
+			ModelManifestIds:  models, DelegationId: delegationID, ExpiresAtUnix: expires,
 		}
 		canonicalBytes, err := canonical.Bytes(document)
 		if err != nil {
