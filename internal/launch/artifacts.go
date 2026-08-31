@@ -3,6 +3,7 @@ package launch
 import (
 	"context"
 	"encoding/json"
+	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
@@ -10,6 +11,8 @@ import (
 
 	"github.com/cozy-creator/cozy/internal/exit"
 	"github.com/cozy-creator/cozy/internal/home"
+	"github.com/cozy-creator/cozy/internal/managedbase"
+	"github.com/cozy-creator/cozy/internal/orchestrator"
 	"github.com/cozy-creator/cozy/internal/records"
 )
 
@@ -38,6 +41,7 @@ const DefaultRuntimeQueryTimeout = 5 * time.Second
 // that knows how to invoke it and one place that renders its refusals.
 type RuntimeCLI struct {
 	Bin          string        // host Runtime for published overlays; generation Runtime for source installs
+	Prefix       []string      // exact managed-base launcher prefix; empty for source installs
 	Dir          string        // the package project root
 	Descriptor   string        // exact published descriptor; empty for editable/source installs
 	Home         string        // COZY_HOME the runtime reads its artifact index out of
@@ -55,17 +59,35 @@ func Binary(generation records.PackageInstall) string {
 	return home.VenvTool(filepath.Join(generation.Dir, "venv"), "cozy-runtime")
 }
 
-// HostRuntime is the trusted local worker implementation. Published package venvs are
-// executor overlays and deliberately omit base-owned cozy-runtime; selecting a package
-// must never select the control process that supervises it.
-func HostRuntime() (string, *exit.Error) {
-	path, err := exec.LookPath("cozy-runtime")
-	if err != nil {
-		return "", exit.Named(exit.Structural, "host_runtime_missing",
-			"this host has no cozy-runtime command on PATH").
-			WithRemedy("install the Cozy Runtime tool that ships with this Cozy release")
+// HostRuntime selects the exact package-independent managed base retained for a
+// published install. No host PATH entry can choose the control Runtime.
+func HostRuntime(generation records.PackageInstall, cozyHome, dir string, worker bool) (managedbase.Command, *exit.Error) {
+	manifestDigest, problem := selectedManifestDigest(generation)
+	if problem != nil {
+		return managedbase.Command{}, problem
 	}
-	return path, nil
+	return managedbase.RuntimeCommand(filepath.Join(cozyHome, "managed-bases"),
+		generation.SelectionProfile, manifestDigest, dir, worker)
+}
+
+func selectedManifestDigest(generation records.PackageInstall) (string, *exit.Error) {
+	path := filepath.Join(generation.Dir, "artifact-cache",
+		strings.TrimPrefix(generation.PlacementSetDigest, "sha256:"))
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		return "", exit.Named(exit.Structural, "package_selection_missing",
+			"cannot read selected PlacementSet %s: %s", generation.PlacementSetDigest, err)
+	}
+	placement, problem := orchestrator.PlacementFromExact(generation.Package, generation.ID,
+		generation.PlacementSetDigest, raw, nil)
+	if problem != nil {
+		return "", problem
+	}
+	if placement.WheelhouseManifestDigest == "" {
+		return "", exit.Named(exit.Structural, "package_selection_missing",
+			"selected PlacementSet names no WheelhouseManifest")
+	}
+	return placement.WheelhouseManifestDigest, nil
 }
 
 // json runs one verb and decodes its `--json` document.
@@ -87,7 +109,8 @@ func (r RuntimeCLI) query(out any, verb ...string) *exit.Error {
 }
 
 func (r RuntimeCLI) callContext(ctx context.Context, out any, verb ...string) *exit.Error {
-	args := []string{"--json", "--dir", r.Dir}
+	args := append([]string{}, r.Prefix...)
+	args = append(args, "--json", "--dir", r.Dir)
 	if r.Descriptor != "" {
 		args = append(args, "--descriptor", r.Descriptor)
 	}

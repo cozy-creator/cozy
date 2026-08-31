@@ -15,6 +15,7 @@ import (
 	"github.com/cozy-creator/cozy/internal/hostgpu"
 	"github.com/cozy-creator/cozy/internal/hub"
 	"github.com/cozy-creator/cozy/internal/install"
+	"github.com/cozy-creator/cozy/internal/managedbase"
 	"github.com/cozy-creator/cozy/internal/transfer"
 	pb "github.com/cozy-creator/cozy/protocol/cozy/worker/v1"
 )
@@ -44,6 +45,26 @@ func handleRegistryInstall(ctx *Context) *exit.Error {
 	if problem != nil {
 		return problem
 	}
+	layout, problem := home.Open(ctx.Cfg.Home)
+	if problem != nil {
+		return problem
+	}
+	var base *managedbase.Record
+	problem = packagePublishStage(ctx, "Preparing exact local Runtime base", func() *exit.Error {
+		var baseProblem *exit.Error
+		base, baseProblem = managedbase.Ensure(layout.ManagedBases, managedbase.Input{
+			Profile: plan.Profile,
+			Manifest: managedbase.ExactDocument{
+				Bytes:  plan.WheelhouseManifest.CanonicalBytes,
+				Digest: plan.WheelhouseManifest.Digest,
+				Length: plan.WheelhouseManifest.Length,
+			},
+		})
+		return baseProblem
+	})
+	if problem != nil {
+		return problem
+	}
 	existingLayout, existing, _, problem := open(ctx.Cfg, false)
 	if problem != nil {
 		return problem
@@ -56,13 +77,11 @@ func handleRegistryInstall(ctx *Context) *exit.Error {
 	if generation != nil && generation.SourceDigest == releaseDigest &&
 		generation.PlacementSetDigest == plan.PlacementSet.Digest {
 		defer existing.Close()
-		return emitInstallResult(ctx, existingLayout, existing, &install.Result{Gen: *generation, Idempotent: true})
+		return emitInstallResult(ctx, existingLayout, existing, &install.Result{
+			Gen: *generation, ManagedBaseID: base.BaseID, Idempotent: true,
+		})
 	}
 	existing.Close()
-	layout, problem := home.Open(ctx.Cfg.Home)
-	if problem != nil {
-		return problem
-	}
 	if err := os.MkdirAll(layout.Transfer, 0o700); err != nil {
 		return exit.Internalf("cannot create package download scratch: %s", err)
 	}
@@ -93,6 +112,7 @@ func handleRegistryInstall(ctx *Context) *exit.Error {
 	if problem != nil {
 		return problem
 	}
+	result.ManagedBaseID = base.BaseID
 	return emitInstallResult(ctx, layout, st, result)
 }
 

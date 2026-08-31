@@ -38,6 +38,10 @@ type Layout struct {
 	// verification records are (a transfer resumes from what is VERIFIED, never from
 	// what happens to be lying in a temp directory).
 	Transfer string
+	// ManagedBases is the package-independent local Runtime base store. Each
+	// generation is selected by exact Tensorhub profile + WheelhouseManifest
+	// identity; package generations only refer to it and never own it.
+	ManagedBases string
 	// Triage holds WorkerTriageBundles copied out of worker roots (cl-006). A worker
 	// root does not outlive its worker — a one-shot run deletes it — so the bundle
 	// worth keeping is kept HERE, by the client that wanted it.
@@ -73,19 +77,20 @@ func Open(root string) (Layout, *exit.Error) {
 		return Layout{}, exit.Internalf("cannot protect the private local root %s: %s", root, err)
 	}
 	l := Layout{
-		Root:        root,
-		DB:          filepath.Join(root, "records.db"),
-		Generations: filepath.Join(root, "generations"),
-		Lock:        filepath.Join(root, "writer.lock"),
-		Daemon:      filepath.Join(root, "daemon.lock"),
-		Workers:     filepath.Join(root, "workers"),
-		Outputs:     filepath.Join(root, "outputs"),
-		Inputs:      filepath.Join(root, "inputs"),
-		Uploads:     filepath.Join(root, "uploads", "sha256"),
-		CAS:         filepath.Join(root, "cas"),
-		Transfer:    filepath.Join(root, "transfer"),
-		Triage:      filepath.Join(root, "triage"),
-		Client:      filepath.Join(root, "client.cred"),
+		Root:         root,
+		DB:           filepath.Join(root, "records.db"),
+		Generations:  filepath.Join(root, "generations"),
+		Lock:         filepath.Join(root, "writer.lock"),
+		Daemon:       filepath.Join(root, "daemon.lock"),
+		Workers:      filepath.Join(root, "workers"),
+		Outputs:      filepath.Join(root, "outputs"),
+		Inputs:       filepath.Join(root, "inputs"),
+		Uploads:      filepath.Join(root, "uploads", "sha256"),
+		CAS:          filepath.Join(root, "cas"),
+		Transfer:     filepath.Join(root, "transfer"),
+		ManagedBases: filepath.Join(root, "managed-bases"),
+		Triage:       filepath.Join(root, "triage"),
+		Client:       filepath.Join(root, "client.cred"),
 	}
 	l.Publications = filepath.Join(root, "publications")
 	l.Rentals = filepath.Join(root, "rentals")
@@ -94,7 +99,7 @@ func Open(root string) (Layout, *exit.Error) {
 			return Layout{}, exit.Internalf("cannot create %s: %s", dir, err)
 		}
 	}
-	for _, dir := range []string{l.Inputs, l.Uploads} {
+	for _, dir := range []string{l.Inputs, l.Uploads, l.ManagedBases} {
 		if err := os.MkdirAll(dir, 0o700); err != nil {
 			return Layout{}, exit.Internalf("cannot create %s: %s", dir, err)
 		}

@@ -106,6 +106,9 @@ func emitInstallResult(ctx *Context, l home.Layout, st *records.Store, res *inst
 		{K: "profile", V: g.SelectionProfile},
 		{K: "placement_set", V: g.PlacementSetDigest},
 	}
+	if res.ManagedBaseID != "" {
+		fields = append(fields, output.Field{K: "managed_base", V: res.ManagedBaseID})
+	}
 	if res.Idempotent {
 		return emit(ctx, compactRecord(fields, "package", "version", "status", "changed"))
 	}

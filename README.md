@@ -10,7 +10,8 @@ The command is `cozy`.
 
 Binary releases are not published yet. Building from source currently requires Go 1.26 or
 newer. Package installation also uses `uv`; model download and publication use the `tfs`
-executable from TensorFS.
+executable from TensorFS. Published local GPU execution additionally requires Docker and
+the NVIDIA Container Toolkit.
 
 ```sh
 git clone https://github.com/cozy-creator/cozy.git
@@ -66,6 +67,14 @@ cozy package install org/name --version 1.2.3
 cozy package install .
 cozy package list
 ```
+
+A registry install asks Tensorhub to select the compatible execution profile, then prepares
+that exact package-independent base under `~/.cozy/managed-bases`. The current local floor is
+CPython 3.12, Torch 2.13 with CUDA 13.0, Cozy Runtime 0.0.11, and TensorFS 0.0.3. Creator verifies
+the selected WheelhouseManifest against the digest-pinned `tensorhub/worker` image and records
+its immutable image/config and first-party wheel identities before activating it. Later local
+runs use only that recorded image digest; a host `cozy-runtime` command on `PATH` cannot select
+the worker. An interrupted refresh leaves the previous active base receipt unchanged.
 
 An explicit directory (`.`, `..`, `./project`, `../project`, or an absolute path) creates a
 local-only editable install after a bounded source scan. Every invocation checks that live tree;

@@ -851,6 +851,36 @@ def check_python_seat():
     return bad
 
 
+def check_managed_base():
+    """Published local execution is selected by an exact managed base, never PATH."""
+    base_path = pathlib.Path("internal/managedbase/base.go")
+    command_path = pathlib.Path("internal/managedbase/command.go")
+    launch_path = pathlib.Path("internal/launch/artifacts.go")
+    if not base_path.exists() or not command_path.exists():
+        return ["[runtime-base] missing internal/managedbase production boundary"]
+    base = base_path.read_text()
+    command = command_path.read_text()
+    launch = launch_path.read_text()
+    bad = []
+    for required in (
+        'SupportedProfile = "torch2.13.0-cu130-cp312-linux-x86"',
+        '"0.0.11"', '"0.0.3"', '"2.13.0+cu130"',
+    ):
+        if required not in base:
+            bad.append(f"{base_path}: [runtime-base] missing current exact base fact {required!r}")
+    for required in ('"--pull=never"', '"/usr/bin/python"', '"cozy_runtime.cli.main"'):
+        if required not in command:
+            bad.append(f"{command_path}: [runtime-base] missing digest-pinned container launch fact {required!r}")
+    if 'filepath.Join(cozyHome, "managed-bases")' not in launch:
+        bad.append(f"{launch_path}: [runtime-base] published launch does not select from managed-bases")
+    for path in pathlib.Path("internal").rglob("*.go"):
+        text = path.read_text()
+        for forbidden in ('exec.LookPath("cozy-runtime")', 'exec.Command("cozy-runtime"'):
+            if forbidden in text:
+                bad.append(f"{path}: [runtime-base] host PATH still selects cozy-runtime")
+    return bad
+
+
 if sys.argv[1:]:
     if sys.argv[1:] == ["--help"] or sys.argv[1:] == ["-h"]:
         print(__doc__.strip())
@@ -863,7 +893,7 @@ violations = (check_sources() + check_matrix() + check_manifest() + check_secret
               + check_contract() + check_video_boundary() + check_embedded() + check_scripts()
               + check_document_kinds() + check_render_streams() + check_output_shape()
               + check_media_contract() + check_typed_resources() + check_web_boundary()
-              + check_test_boundary() + check_python_seat())
+              + check_test_boundary() + check_python_seat() + check_managed_base())
 if violations:
     print("FENCE RED (boundaries.md):", file=sys.stderr)
     for v in violations:

@@ -26,12 +26,14 @@ func Read(gen records.PackageInstall, cozyHome string, env []string) (*Facts, *e
 	if e != nil {
 		return nil, e
 	}
-	runtimeBin, descriptor := Binary(gen), ""
+	runtimeBin, runtimePrefix, descriptor := Binary(gen), []string{}, ""
 	if gen.SourceKind == "tensorhub" {
-		runtimeBin, e = HostRuntime()
+		command, problem := HostRuntime(gen, cozyHome, source, false)
+		e = problem
 		if e != nil {
 			return nil, e
 		}
+		runtimeBin, runtimePrefix = command.Bin, command.Args
 		descriptor = DescriptorPath(gen.Dir)
 	}
 	return &Facts{
@@ -39,7 +41,7 @@ func Read(gen records.PackageInstall, cozyHome string, env []string) (*Facts, *e
 		Source:            source,
 		PackageDescriptor: d,
 		RuntimeCLI: RuntimeCLI{
-			Bin: runtimeBin, Dir: source, Descriptor: descriptor, Home: cozyHome, Env: env,
+			Bin: runtimeBin, Prefix: runtimePrefix, Dir: source, Descriptor: descriptor, Home: cozyHome, Env: env,
 		},
 	}, nil
 }
@@ -109,13 +111,14 @@ func (f *Facts) Spec(devices []string) (orchestrator.WorkerLaunchSpec, *exit.Err
 			ArtifactStore: filepath.Join(filepath.Dir(filepath.Dir(f.Install.Dir)), "cas"),
 		}, nil
 	}
-	runtimeBin, e := HostRuntime()
+	command, e := HostRuntime(f.Install,
+		filepath.Dir(filepath.Dir(f.Install.Dir)), f.Source, true)
 	if e != nil {
 		return orchestrator.WorkerLaunchSpec{}, e
 	}
 	return orchestrator.WorkerLaunchSpec{
 		Placement: placement,
-		Python:    runtimeBin, Args: []string{"serve"},
+		Python:    command.Bin, Args: append(command.Args, "serve"),
 		Dir:             f.Source,
 		Devices:         devices,
 		GraceSec:        3,

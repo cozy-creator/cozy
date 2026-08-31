@@ -149,13 +149,14 @@ type Timing struct {
 }
 
 type Result struct {
-	Gen        records.PackageInstall
-	Superseded string
-	Idempotent bool
-	Timings    []Timing
-	Warnings   []string
-	Files      int
-	Bytes      int64
+	Gen           records.PackageInstall
+	ManagedBaseID string
+	Superseded    string
+	Idempotent    bool
+	Timings       []Timing
+	Warnings      []string
+	Files         int
+	Bytes         int64
 }
 
 // Run executes the whole transaction. Every refusal before Activate leaves the
