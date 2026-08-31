@@ -52,6 +52,9 @@ func dial(ctx *Context) (*localapi.Client, *exit.Error) {
 // ----------------------------------------------------------------------------- run
 
 func handleRunExecute(ctx *Context) *exit.Error {
+	if problem := validateRunPlacement(ctx); problem != nil {
+		return problem
+	}
 	target, descriptor, problem := invocationTarget(ctx)
 	if problem != nil {
 		return problem
@@ -72,14 +75,8 @@ func handleRunExecute(ctx *Context) *exit.Error {
 		}
 		return handleRun(ctx, target, callable)
 	}
-	if machine := ctx.Inv.Value("--machine"); machine != "" && machine != "local" {
-		return exit.Named(exit.Usage, "rental_job_unsupported",
-			"private rental dispatch for job callables is not implemented").
-			WithRemedy("run this job locally, or choose a serving entrypoint on the rental")
-	}
-	if ctx.Inv.Bool("--stream") || len(ctx.Inv.Values["--asset"]) > 0 ||
-		ctx.Inv.Value("--out") != "" || ctx.Inv.Value("--timeout") != "" ||
-		ctx.Inv.Value("--max-cost") != "" {
+	if ctx.Inv.Bool("--stream") || ctx.Inv.Bool("--rental") || len(ctx.Inv.Values["--asset"]) > 0 ||
+		ctx.Inv.Value("--out") != "" || ctx.Inv.Value("--timeout") != "" {
 		return exit.Usagef("the selected callable is a job and received a serving-only flag").
 			WithRemedy("jobs accept payload values, --in, --input-tree, --org, --detach, and local execution")
 	}
@@ -87,6 +84,20 @@ func handleRunExecute(ctx *Context) *exit.Error {
 		ctx.Inv.Bools["--follow"] = true
 	}
 	return handleJobSubmit(ctx, target, callable)
+}
+
+func validateRunPlacement(ctx *Context) *exit.Error {
+	local, managedRental := ctx.Inv.Bool("--local"), ctx.Inv.Bool("--rental")
+	if local && managedRental {
+		return exit.Usagef("--local and --rental are mutually exclusive").
+			WithRemedy("choose exactly one placement mode")
+	}
+	if managedRental && ctx.Cfg.RentalsMaxHourlySpendUSDMicros <= 0 {
+		return exit.Named(exit.Usage, "rental.spend_cap_required",
+			"--rental requires a positive rentals.max_hourly_spend_usd in %s", filepath.Join(ctx.Cfg.Home, "config.yaml")).
+			WithRemedy("set the fleet-wide hourly ceiling before authorizing rental spend")
+	}
+	return nil
 }
 
 func handleRun(ctx *Context, target Target, ep *launch.Entrypoint) *exit.Error {
@@ -98,16 +109,8 @@ func handleRun(ctx *Context, target Target, ep *launch.Entrypoint) *exit.Error {
 	// THE PAYLOAD IS TYPED AGAINST THE RECORDED SCHEMA — the surface the release's own
 	// runtime vouched for at install — so a typo costs a millisecond instead of a model
 	// load, and `steps=2` is an int because the schema says int.
-	machine := strings.TrimSpace(ctx.Inv.Value("--machine"))
-	maxCost, e := runMaxCost(ctx.Inv.Value("--max-cost"))
-	if e != nil {
-		return e
-	}
-	if machine != "" && maxCost > 0 {
-		return exit.Usagef("--max-cost and --machine are mutually exclusive").
-			WithRemedy("remove --machine to allow local-first automatic placement")
-	}
-	if legacy := launch.LegacyFileTerm(ctx.Inv.Args[1:]); machine != "" && machine != "local" && legacy != "" {
+	managedRental := ctx.Inv.Bool("--rental")
+	if legacy := launch.LegacyFileTerm(ctx.Inv.Args[1:]); managedRental && legacy != "" {
 		return exit.Named(exit.Usage, "remote_file_input_ambiguous",
 			"%s embeds file bytes into a JSON string and cannot name a remote input grant", legacy).
 			WithRemedy("use `--asset <field-path>=<file>`; the field path becomes the exact worker-protocol input id")
@@ -132,8 +135,8 @@ func handleRun(ctx *Context, target Target, ep *launch.Entrypoint) *exit.Error {
 	began := time.Now()
 	handle, e := c.Submit(api.Submission{
 		Package: target.Package, Function: target.Function, Input: input,
-		Worker: target.MachineID, LocalAssets: assets, InstallID: target.InstallID,
-		MaxCostUSDMicros: maxCost,
+		LocalAssets: assets, InstallID: target.InstallID,
+		Rental: managedRental,
 	}, key)
 	if e != nil {
 		return e
@@ -392,42 +395,6 @@ func runDeadline(ctx *Context) (time.Duration, *exit.Error) {
 	return d, nil
 }
 
-func runMaxCost(value string) (int64, *exit.Error) {
-	value = strings.TrimSpace(value)
-	if value == "" {
-		return 0, nil
-	}
-	whole, fraction, decimal := strings.Cut(value, ".")
-	if whole == "" || strings.Contains(fraction, ".") || len(fraction) > 6 || decimal && fraction == "" {
-		return 0, invalidMaxCost(value)
-	}
-	for _, part := range []string{whole, fraction} {
-		for _, character := range part {
-			if character < '0' || character > '9' {
-				return 0, invalidMaxCost(value)
-			}
-		}
-	}
-	if !decimal {
-		fraction = ""
-	}
-	micros := whole + fraction + strings.Repeat("0", 6-len(fraction))
-	micros = strings.TrimLeft(micros, "0")
-	if micros == "" {
-		return 0, nil
-	}
-	amount, err := strconv.ParseInt(micros, 10, 64)
-	if err != nil {
-		return 0, invalidMaxCost(value)
-	}
-	return amount, nil
-}
-
-func invalidMaxCost(value string) *exit.Error {
-	return exit.Usagef("--max-cost %q is not a non-negative USD amount", value).
-		WithRemedy("use decimal USD with at most six places, such as 2.00")
-}
-
 // progress renders the live lane. Two shapes, and they are not the same surface:
 // `--stream` is NDJSON of the typed envelope for a machine, and the default is one
 // rewritten line for a person.
@@ -491,6 +458,10 @@ func progressLine(e localapi.Event, full bool) string {
 			return "  queued — " + reason
 		}
 		return "  queued"
+	case "rentals":
+		if line, ok := e.Payload["line"].(string); ok {
+			return line
+		}
 	case "submitted":
 		if !full {
 			return ""
@@ -870,7 +841,6 @@ type Target struct {
 	Package   string
 	Function  string
 	InstallID string
-	MachineID string
 }
 
 // parseTarget reads the user-facing package grammar. Versions are flags, not path
@@ -903,29 +873,7 @@ func invocationTarget(ctx *Context) (Target, *launch.PackageDescriptor, *exit.Er
 	if problem != nil {
 		return Target{}, nil, problem
 	}
-	machine := strings.TrimSpace(ctx.Inv.Value("--machine"))
-	if machine != "" && machine != "local" {
-		layout, problem := home.Open(ctx.Cfg.Home)
-		if problem != nil {
-			return Target{}, nil, problem
-		}
-		store, problem := records.Open(layout.DB)
-		if problem != nil {
-			return Target{}, nil, problem
-		}
-		defer store.Close()
-		row, problem := store.RentalByMachine(machine)
-		if problem != nil {
-			return Target{}, nil, problem
-		}
-		if row == nil {
-			return Target{}, nil, exit.New(exit.NotFound, "no rented machine %q on this host", machine).
-				WithRemedy("`cozy rental` lists this host's rented machines").
-				WithNext("cozy rental")
-		}
-		target.MachineID = row.ID
-	}
-	if target.MachineID != "" {
+	if ctx.Inv.Bool("--rental") {
 		install, problem := installedPackage(ctx, target.Package)
 		if problem != nil {
 			return Target{}, nil, problem.WithRemedy(

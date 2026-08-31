@@ -32,9 +32,10 @@ func localConfigDigest(cfg config.Config) string {
 		"hub_token_source": cfg.HubTokenSource,
 		// The tfs VALUE stays out: an executable path is resolution rather than identity.
 		// Its provenance is the config fact frozen into the child environment.
-		"tfs_source":                    cfg.TfsSource,
-		"local_rate_micro_usd_per_hour": cfg.LocalRateMicroUSDPerHour,
-		"service_build":                 build,
+		"tfs_source":                          cfg.TfsSource,
+		"local_rate_micro_usd_per_hour":       cfg.LocalRateMicroUSDPerHour,
+		"rentals_max_hourly_spend_usd_micros": cfg.RentalsMaxHourlySpendUSDMicros,
+		"service_build":                       build,
 	})
 }
 

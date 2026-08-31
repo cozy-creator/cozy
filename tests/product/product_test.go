@@ -234,13 +234,21 @@ func TestRentalCommandsSeparateInventoryFromCatalog(t *testing.T) {
 	fatal(t, problem)
 	problem = store.RecordRental(records.Rental{
 		ID: "rnt-proof", MachineName: "studio", SKU: "h200",
-		AcceleratorModel: "NVIDIA H200 SXM", State: "ready", Hub: "https://tensorhub.test",
+		AcceleratorModel: "NVIDIA H200 SXM", HourlyRateUSDMicros: 6_000_000,
+		State: "ready", Hub: "https://tensorhub.test",
+	})
+	fatal(t, problem)
+	problem = store.RecordRental(records.Rental{
+		ID: "rnt-failed", MachineName: "failed-gpu", SKU: "small",
+		AcceleratorModel: "GPU", HourlyRateUSDMicros: 250_000,
+		State: "failed", Hub: "https://tensorhub.test",
 	})
 	fatal(t, problem)
 	store.Close()
 
 	if code, out := runCozy(t, root, "rental"); code != 0 ||
-		!strings.Contains(out, "studio") || !strings.Contains(out, "h200") {
+		!strings.Contains(out, "studio") || !strings.Contains(out, "h200") ||
+		!strings.Contains(out, "rentals: 2 remote machines running · $6.25/hour of $0.00/hour") {
 		t.Fatalf("bare rental did not show current machines [exit %d]\n%s", code, out)
 	}
 	if code, out := runCozy(t, root, "rental", "list"); code != 2 ||
@@ -266,6 +274,56 @@ func TestRentalCommandsSeparateInventoryFromCatalog(t *testing.T) {
 		"rental", "new", "--name", "studio"); code != 2 ||
 		!strings.Contains(out, "options require a GPU SKU") {
 		t.Fatalf("catalog view silently accepted rental options [exit %d]\n%s", code, out)
+	}
+}
+
+func TestRentalSpendConfigIsNestedAndExact(t *testing.T) {
+	valid := t.TempDir()
+	must(t, os.WriteFile(filepath.Join(valid, "config.yaml"), []byte(
+		"port: 0\nrentals:\n  max_hourly_spend_usd: 4.125001\n"), 0o600))
+	t.Cleanup(func() { _, _ = runCozy(t, valid, "down", "--all") })
+	if code, out := runCozy(t, valid, "rental"); code != 0 ||
+		!strings.Contains(out, "rentals: 0 remote machines running · $0.00/hour of $4.125001/hour") {
+		t.Fatalf("nested rental ceiling was not exact [exit %d]\n%s", code, out)
+	}
+
+	overPrecise := t.TempDir()
+	must(t, os.WriteFile(filepath.Join(overPrecise, "config.yaml"), []byte(
+		"rentals:\n  max_hourly_spend_usd: 4.0000001\n"), 0o600))
+	if code, out := runCozy(t, overPrecise, "rental"); code != 2 ||
+		!strings.Contains(out, "at most six decimal places") {
+		t.Fatalf("over-precise rental ceiling did not refuse [exit %d]\n%s", code, out)
+	}
+
+	deleted := t.TempDir()
+	must(t, os.WriteFile(filepath.Join(deleted, "config.yaml"), []byte(
+		"cloud:\n  max_hourly_spend_usd: 4\n"), 0o600))
+	if code, out := runCozy(t, deleted, "rental"); code != 2 ||
+		!strings.Contains(out, `unknown key "cloud"`) {
+		t.Fatalf("deleted cloud config key did not refuse [exit %d]\n%s", code, out)
+	}
+
+	posts := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodGet && r.URL.Path == "/v1/rental-skus" {
+			_ = json.NewEncoder(w).Encode([]map[string]any{{
+				"name": "gpu", "accelerator_model": "GPU", "compute_capability": "9.0",
+				"vram_gb": 80, "price_usd_micros_per_hour": 750_000,
+			}})
+			return
+		}
+		if r.Method == http.MethodPost && r.URL.Path == "/v1/rentals" {
+			posts++
+		}
+		http.NotFound(w, r)
+	}))
+	defer server.Close()
+	manual := t.TempDir()
+	must(t, os.WriteFile(filepath.Join(manual, "config.yaml"), []byte(
+		"tensorhub_url: "+server.URL+"\nrentals:\n  max_hourly_spend_usd: 0.50\n"), 0o600))
+	if code, out := runCozy(t, manual, "rental", "new", "gpu"); code == 0 ||
+		!strings.Contains(out, "would exceed") || posts != 0 {
+		t.Fatalf("manual rental crossed the fleet cap [exit %d posts=%d]\n%s", code, posts, out)
 	}
 }
 
@@ -830,17 +888,17 @@ func TestDevelopmentInstallRefreshesBeforeInvocation(t *testing.T) {
 	}
 
 	if code, out := runCozy(t, root, "run", weightlessRef+"/tile",
-		"size=32", "seed=7", "--max-cost", "1.0000001"); code != 2 ||
-		!strings.Contains(out, "at most six places") {
-		t.Fatalf("over-precise max cost did not refuse [exit %d]\n%s", code, out)
+		"size=32", "seed=7", "--local", "--rental"); code != 2 ||
+		!strings.Contains(out, "mutually exclusive") {
+		t.Fatalf("local plus rental did not refuse [exit %d]\n%s", code, out)
 	}
 	if code, out := runCozy(t, root, "run", weightlessRef+"/tile",
-		"size=32", "seed=7", "--max-cost", "2.00", "--machine", "local"); code != 2 ||
-		!strings.Contains(out, "mutually exclusive") {
-		t.Fatalf("max cost plus explicit machine did not refuse [exit %d]\n%s", code, out)
+		"size=32", "seed=7", "--machine", "local"); code != 2 ||
+		!strings.Contains(out, "unknown flag") {
+		t.Fatalf("deleted --machine did not refuse [exit %d]\n%s", code, out)
 	}
 	code, out = runCozy(t, root, "run", weightlessRef+"/tile",
-		"size=32", "seed=7", "--max-cost", "2.00", "--idempotency-key", "budget-proof", "--json")
+		"size=32", "seed=7", "--idempotency-key", "placement-proof", "--json")
 	if code != 0 || !strings.Contains(out, `"revision":"first"`) {
 		t.Fatalf("first editable invocation did not run source [exit %d]\n%s\n%s",
 			code, out, productWorkerLogs(root))
@@ -850,12 +908,8 @@ func TestDevelopmentInstallRefreshesBeforeInvocation(t *testing.T) {
 	requests, problem := store.RequestsOfKind("serving", "", 10)
 	fatal(t, problem)
 	store.Close()
-	if len(requests) == 0 || requests[0].MaxCostUSDMicros != 2_000_000 || requests[0].Worker != "" {
-		t.Fatalf("local-first rental budget was not retained exactly: %+v", requests)
-	}
-	if code, out := runCozy(t, root, "run", weightlessRef+"/tile",
-		"size=32", "seed=7", "--max-cost", "1.00", "--idempotency-key", "budget-proof"); code != 1 || !strings.Contains(out, "different body") {
-		t.Fatalf("changed budget reused one request identity [exit %d]\n%s", code, out)
+	if len(requests) == 0 || requests[0].Rental || requests[0].Worker != "" {
+		t.Fatalf("default local placement was not retained exactly: %+v", requests)
 	}
 	first := activePackageInstall(t, root)
 

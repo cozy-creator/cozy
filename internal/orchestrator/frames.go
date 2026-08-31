@@ -814,6 +814,7 @@ func (c *Orchestrator) afterAck(req records.Request, attempt records.Attempt, ho
 	}
 	c.frames.forget(req.ID)
 	c.signalClosed(requestWaitKey(req.ID), verdict)
+	c.releaseManaged(req)
 }
 
 // cleanupAttempt runs only after the outcome's bytes were mirrored, its terminal commit

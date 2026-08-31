@@ -25,7 +25,7 @@ func TestRecordsSchemaIsExactV1AndStable(t *testing.T) {
 		t.Fatalf("fresh records version = %d, want exact v1", version)
 	}
 	for _, column := range []string{
-		"max_cost_usd_micros", "package_revision_digest", "environment_digest", "config_digest",
+		"rental", "package_revision_digest", "environment_digest", "config_digest",
 	} {
 		var count int
 		must(t, db.QueryRow(`SELECT COUNT(*) FROM pragma_table_info('requests') WHERE name=?`,
@@ -33,6 +33,11 @@ func TestRecordsSchemaIsExactV1AndStable(t *testing.T) {
 		if count != 1 {
 			t.Fatalf("exact requests schema omitted %s", column)
 		}
+	}
+	var deleted int
+	must(t, db.QueryRow(`SELECT COUNT(*) FROM pragma_table_info('requests') WHERE name='max_cost_usd_micros'`).Scan(&deleted))
+	if deleted != 0 {
+		t.Fatal("exact requests schema retained max_cost_usd_micros")
 	}
 	must(t, db.Close())
 
@@ -76,6 +81,38 @@ func TestRecordsRefusesOtherVersionWithoutMutation(t *testing.T) {
 	must(t, db.QueryRow(`PRAGMA schema_version`).Scan(&after))
 	if version != 2 || after != before {
 		t.Fatalf("refused schema mutated: version=%d schema_version=%d->%d", version, before, after)
+	}
+}
+
+func TestRentalOperationReservesFleetRateAcrossStoreConnections(t *testing.T) {
+	path := t.TempDir() + "/records.db"
+	first, problem := records.Open(path)
+	fatal(t, problem)
+	defer first.Close()
+	second, problem := records.Open(path)
+	fatal(t, problem)
+	defer second.Close()
+	operation := records.RentalOperation{
+		Key: "managed-rental-one", RequestDigest: "digest-one", RequestBody: []byte(`{"sku":"gpu"}`),
+		Hub: "https://tensorhub.test", Reason: "proof", HourlyRateUSDMicros: 750_000,
+	}
+	stored, replay, problem := first.BeginRentalOperation(operation, 1_000_000)
+	if problem != nil || replay || stored.HourlyRateUSDMicros != 750_000 {
+		t.Fatalf("first reservation = %+v replay=%v problem=%v", stored, replay, problem)
+	}
+	other := operation
+	other.Key, other.RequestDigest = "managed-rental-two", "digest-two"
+	if _, _, problem := second.BeginRentalOperation(other, 1_000_000); problem == nil ||
+		problem.ErrName() != "rental.fleet_spend_cap" {
+		t.Fatalf("second connection crossed the fleet ceiling: %v", problem)
+	}
+	if stored, replay, problem = second.BeginRentalOperation(operation, 0); problem != nil || !replay {
+		t.Fatalf("existing paid operation did not resume after cap changed: %+v replay=%v problem=%v",
+			stored, replay, problem)
+	}
+	count, burn, problem := first.RentalFleetTotals()
+	if problem != nil || count != 1 || burn != 750_000 {
+		t.Fatalf("reserved fleet totals = %d, %d, %v", count, burn, problem)
 	}
 }
 
@@ -124,7 +161,7 @@ func TestRentalRecordWaitsForAnotherProcessWriter(t *testing.T) {
 	go func() {
 		if problem := store.RecordRental(records.Rental{
 			ID: "pr-lock-proof", MachineName: "lock-proof", SKU: "cpu-test",
-			State: "booting", Hub: "https://tensorhub.com",
+			HourlyRateUSDMicros: 100_000, State: "booting", Hub: "https://tensorhub.com",
 		}); problem != nil {
 			done <- problem
 			return

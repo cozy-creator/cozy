@@ -167,8 +167,8 @@ type RunExecuteCmd struct {
 	Stream         bool     `help:"Emit typed progress deltas."`
 	PayloadFile    string   `name:"in" help:"Read the whole payload from JSON." type:"path"`
 	Assets         []string `name:"asset" help:"Bind a local asset as field-path=file."`
-	Machine        string   `help:"Use one explicit local or rented machine."`
-	MaxCost        string   `help:"Maximum automatic rental spend in USD."`
+	Local          bool     `help:"Run only on this machine."`
+	Rental         bool     `help:"Run on a Creator-managed rental."`
 	IdempotencyKey string   `help:"Stable request identity for safe retries."`
 	Trees          []string `name:"input-tree" help:"Bind a job input tree as ref=directory."`
 	Org            string   `help:"Job publication organization (defaults to local)."`
@@ -178,10 +178,9 @@ type RunExecuteCmd struct {
 func (c *RunExecuteCmd) Run(r *Runtime) error {
 	args := append([]string{c.Target}, c.Input...)
 	return r.call(handleRunExecute, args, bools(
-		"--stream", c.Stream, "--detach", c.Detach), values(
+		"--stream", c.Stream, "--detach", c.Detach, "--local", c.Local, "--rental", c.Rental), values(
 		"--out", c.Out, "--timeout", c.Timeout,
-		"--in", c.PayloadFile, "--asset", c.Assets, "--machine", c.Machine,
-		"--max-cost", c.MaxCost,
+		"--in", c.PayloadFile, "--asset", c.Assets,
 		"--idempotency-key", c.IdempotencyKey, "--input", c.Trees, "--org", c.Org), true)
 }
 

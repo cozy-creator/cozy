@@ -70,8 +70,8 @@ type Submission struct {
 	// In the initial weightless remote lane it supplies only the exact logical release
 	// and request/result descriptor; no local platform facts cross the control stream.
 	InstallID string
-	// MaxCostUSDMicros authorizes automatic rental spend for this request. Zero forbids it.
-	MaxCostUSDMicros int64
+	// Rental authorizes placement on Creator-managed rented capacity.
+	Rental bool
 }
 
 const ArtifactSnapshotMime = "application/vnd.cozy.tensorfs.snapshot"
@@ -152,10 +152,10 @@ func requestRecord(s Submission) (records.Request, map[string]any, *exit.Error) 
 	bodyDigest := s.BodyDigest
 	if bodyDigest == "" {
 		identity := s.Payload
-		if s.MaxCostUSDMicros > 0 {
+		if s.Rental {
 			encoded, err := canonical.Write(map[string]canonical.Value{
-				"payload":             base64.StdEncoding.EncodeToString(s.Payload),
-				"max_cost_usd_micros": s.MaxCostUSDMicros,
+				"payload": base64.StdEncoding.EncodeToString(s.Payload),
+				"rental":  true,
 			})
 			if err != nil {
 				return records.Request{}, nil, exit.Internalf("cannot encode request budget identity: %s", err)
@@ -178,15 +178,15 @@ func requestRecord(s Submission) (records.Request, map[string]any, *exit.Error) 
 		Outputs: strings.Join(s.Outputs, ","),
 		Assets:  s.Assets, ArtifactOutputs: string(artifactBytes),
 		Kind: s.Kind, Org: s.Org, Trees: strings.Join(s.Trees, ","),
-		Worker: s.Worker, InstallID: s.InstallID, MaxCostUSDMicros: s.MaxCostUSDMicros,
+		Worker: s.Worker, InstallID: s.InstallID, Rental: s.Rental,
 	}
 	event := map[string]any{
 		"package": s.Package, "function": s.Entrypoint,
 		"body_digest": bodyDigest, "plan_id": s.PlanID, "outputs": s.Outputs,
 		"artifact_outputs": artifactOutputs,
 	}
-	if s.MaxCostUSDMicros > 0 {
-		event["max_cost_usd_micros"] = s.MaxCostUSDMicros
+	if s.Rental {
+		event["rental"] = true
 	}
 	return req, event, nil
 }
@@ -392,6 +392,28 @@ func (c *Orchestrator) Requeue(requestID, why string) {
 // longer wait. A request that queues forever behind a worker that died on boot is the
 // worst of both: no output and no answer.
 func (c *Orchestrator) selectOrStart(req records.Request) {
+	if req.Rental && req.Worker == "" {
+		if c.opt.RentalFleet == nil || c.opt.AcquireManagedRental == nil {
+			c.failQueued(req.ID, exit.Named(exit.Unavailable, "rental.acquisition_unavailable",
+				"this Cozy daemon cannot acquire managed rentals"))
+			return
+		}
+		line, problem := c.opt.RentalFleet()
+		if problem != nil {
+			c.failQueued(req.ID, problem)
+			return
+		}
+		c.emit(req.ID, "request.rentals", 0, map[string]any{"line": line})
+		rentalID, after, problem := c.opt.AcquireManagedRental(req)
+		if problem != nil {
+			c.failQueued(req.ID, problem)
+			return
+		}
+		if after != "" {
+			c.emit(req.ID, "request.rentals", 0, map[string]any{"line": after})
+		}
+		req.Worker = rentalID
+	}
 	// A JOB names its own slot — one worker per (package, job function) — so the
 	// "already starting" and "already resident" questions are asked about that slot and
 	// not about the package. Without this, submitting a job while a serving worker of
@@ -507,17 +529,7 @@ func (c *Orchestrator) selectOrStart(req records.Request) {
 	}()
 }
 
-func autoRentalGate(req records.Request, cause *exit.Error) *exit.Error {
-	if req.MaxCostUSDMicros <= 0 ||
-		(cause.Code != exit.Capacity && cause.Code != exit.Unavailable) {
-		return cause
-	}
-	return exit.Named(exit.Unavailable, "rental.package_preparation_unavailable",
-		"automatic rental is authorized up to %d USD micros, but this build cannot prepare "+
-			"the signed package/model set on a generic worker; no rental was purchased",
-		req.MaxCostUSDMicros).
-		WithRemedy("keep the request budget; package preparation must land before paid fallback is enabled")
-}
+func autoRentalGate(_ records.Request, cause *exit.Error) *exit.Error { return cause }
 
 // staged answers whether this worker was launched with the given plan id staged for it.
 // It reads what the LAUNCHER wrote, not what the worker has got around to advertising: a
@@ -650,6 +662,26 @@ func (c *Orchestrator) failQueued(requestID string, cause *exit.Error) {
 	})
 	c.logf("%s FAILED before any offer: %s", requestID, cause.Message)
 	c.signalClosed(requestWaitKey(requestID), cause)
+	if row, problem := c.opt.Store.RequestRow(requestID); problem == nil && row != nil {
+		c.releaseManaged(*row)
+	}
+}
+
+func (c *Orchestrator) releaseManaged(req records.Request) {
+	if !req.Rental || req.Worker == "" || c.opt.ReleaseManagedRental == nil {
+		return
+	}
+	go func() {
+		line, problem := c.opt.ReleaseManagedRental(req.Worker)
+		if problem != nil {
+			c.logf("managed rental %s release deferred: %s", req.Worker, problem.Message)
+			return
+		}
+		if line != "" {
+			c.emit(req.ID, "request.rentals", 0, map[string]any{"line": line})
+			c.logf("%s", line)
+		}
+	}()
 }
 
 func (c *Orchestrator) dispatch(req records.Request) (uint64, *exit.Error) {
@@ -1071,7 +1103,7 @@ func localGrantSupport(goos string) *exit.Error {
 	}
 	return exit.Named(exit.Structural, "local_file_grant_unsupported",
 		"local worker grants are not yet supported on Windows").
-		WithRemedy("use --machine with a rented machine; local file URL authorization is currently POSIX-only")
+		WithRemedy("use --rental; local file URL authorization is currently POSIX-only")
 }
 
 // remoteGrant builds the grant for an attempt that will run on a POD (cl-014/#506b).

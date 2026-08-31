@@ -48,6 +48,7 @@ for command in "package install" "model download" "auth login" "run cancel" "ren
 done
 run help run
 check "contextual Kong help works" "$([ "$CODE" = 0 ] && printf '%s' "$OUT" | grep -q 'Usage: cozy run' && echo 1 || echo 0)" "$OUT"
+check "run exposes only local or scheduler-selected rental placement" "$(printf '%s' "$OUT" | grep -q -- '--rental' && ! printf '%s' "$OUT" | grep -Eq -- '--(machine|max-cost|cloud)' && echo 1 || echo 0)" "$OUT"
 run package
 check "bare noun group shows focused help" "$([ "$CODE" = 0 ] && printf '%s' "$OUT" | grep -q 'Usage: cozy package <command>' && echo 1 || echo 0)" "$OUT"
 

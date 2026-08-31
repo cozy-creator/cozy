@@ -186,12 +186,16 @@ cozy rental new h200 --name studio \
   --idempotency-key <unique-key>
 
 cozy rental                        # current rented machines
-cozy run org/package/generate --machine studio prompt="moonlit lake"
+cozy run org/package/generate --rental prompt="moonlit lake"
 cozy rental end studio
 ```
 
 GPU names and prices come from Tensorhub's Cozy-owned rental catalog. Creator never exposes or
-reads RunPod SKU names or provider prices.
+reads RunPod SKU names or provider prices. `cozy run` is local-only by default; `--local`
+makes that explicit, while `--rental` lets Creator reuse idle manual/managed capacity or
+acquire the cheapest offered SKU that fits the configured fleet ceiling. Callers never name
+a worker. Creator-managed rentals stop after their assigned queue is fully mirrored; manual
+rentals stop only through `cozy rental end`.
 
 Rental creation sends only the SKU and introduction credential material—never a package, model,
 request, profile, image, or placement. Tensorhub readiness means the worker location and TLS identity
@@ -237,6 +241,8 @@ tensorhub_token: replace-with-your-token
 tfs: /usr/local/bin/tfs
 port: 8818
 local_rate_micro_usd_per_hour: 250000
+rentals:
+  max_hourly_spend_usd: 4.00
 ```
 
 Without a configured `port`, Cozy prefers `127.0.0.1:8818` and falls back to an available
@@ -245,8 +251,8 @@ explicitly asks the OS to select any available port.
 
 Without `tensorhub_url`, Cozy uses the standing local Tensorhub at `http://127.0.0.1:8819`.
 
-The YAML schema is strict: unknown keys, duplicate keys, nested structures, and multiple documents
-are refused. Cozy does not load a working-directory `.env` file.
+The YAML schema is strict: unknown keys, duplicate keys, undeclared nested structures, and multiple
+documents are refused. Cozy does not load a working-directory `.env` file.
 
 Supported environment variables are limited to:
 

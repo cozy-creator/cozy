@@ -40,10 +40,8 @@ type Submission struct {
 	// the daemon-owned immutable input store before the request row exists; it never
 	// crosses the worker protocol. The typed payload carries only its opaque reference.
 	LocalAssets []records.AssetBinding `json:"local_assets,omitempty"`
-	// Worker is Cozy's local addition: it pins this request to an attached rental id.
-	Worker           string `json:"worker,omitempty"`
-	MaxCostUSDMicros int64  `json:"max_cost_usd_micros,omitempty"`
-	AttemptKey       string `json:"-"`
+	Rental      bool                   `json:"rental,omitempty"`
+	AttemptKey  string                 `json:"-"`
 }
 
 // Handle is the 202 answer: the request's id and where to go next. Verbatim from the
@@ -97,17 +95,6 @@ func (s *Server) submit(w http.ResponseWriter, r *http.Request) {
 		s.refuse(w, r, http.StatusBadRequest, "invalid_request",
 			"a submission names a package and a function",
 			`{"package":"org/name","function":"denoise","input":{…}}`)
-		return
-	}
-	if sub.MaxCostUSDMicros < 0 {
-		s.refuse(w, r, http.StatusBadRequest, "invalid_request",
-			"max_cost_usd_micros must be non-negative", "omit it to forbid automatic spend")
-		return
-	}
-	if sub.Worker != "" && sub.MaxCostUSDMicros > 0 {
-		s.refuse(w, r, http.StatusBadRequest, "invalid_request",
-			"worker and max_cost_usd_micros are mutually exclusive",
-			"pin a machine or authorize automatic placement, not both")
 		return
 	}
 	if len(sub.LocalAssets) > 0 && !s.cliAuthenticated(r) {
@@ -206,8 +193,8 @@ func replaySubmission(sub Submission, recorded records.Request) orchestrator.Sub
 	}
 	return orchestrator.Submission{
 		Package: sub.Package, Entrypoint: sub.Function, Payload: payload,
-		Outputs: outputs, PlanID: planID, Worker: sub.Worker, Assets: assets,
-		InstallID: sub.InstallID, MaxCostUSDMicros: sub.MaxCostUSDMicros,
+		Outputs: outputs, PlanID: planID, Worker: recorded.Worker, Assets: assets,
+		InstallID: sub.InstallID, Rental: sub.Rental,
 	}
 }
 
@@ -236,8 +223,8 @@ func submissionDigest(spec orchestrator.Submission) (string, *exit.Error) {
 	if len(assets) > 0 {
 		doc["assets"] = assets
 	}
-	if spec.MaxCostUSDMicros > 0 {
-		doc["max_cost_usd_micros"] = spec.MaxCostUSDMicros
+	if spec.Rental {
+		doc["rental"] = true
 	}
 	// The pinned rental is NOT in it: a worker id says WHERE the same work runs, and two
 	// submissions of one key that differ only in placement are the same request. What the
@@ -297,23 +284,15 @@ func contractStatus(state string) string {
 func (s *Server) resolvePlan(sub Submission) (orchestrator.Submission, *exit.Error) {
 	out := orchestrator.Submission{
 		Package: sub.Package, Entrypoint: sub.Function, Payload: []byte(sub.Input),
-		Outputs: sub.Outputs, PlanID: sub.PlanID, Worker: sub.Worker, Assets: sub.LocalAssets,
-		MaxCostUSDMicros: sub.MaxCostUSDMicros,
+		Outputs: sub.Outputs, PlanID: sub.PlanID, Assets: sub.LocalAssets,
+		Rental: sub.Rental,
 	}
 	if len(out.Payload) == 0 {
 		out.Payload = []byte("{}")
 	}
-	// THE PIN IS RESOLVED BEFORE A ROW EXISTS. A rental this host does not hold cannot be
-	// placed on any later attempt either, so recording the request would hand the client
-	// an id for work that is already known to be unplaceable.
-	if out.Worker != "" {
-		if s.rentals == nil {
-			return out, exit.Unavailablef("this Cozy daemon attaches no remote workers")
-		}
-		_, e := s.rentals(out.Worker)
-		if e != nil {
-			return out, e
-		}
+	// A --rental request validates only immutable package metadata here. The
+	// scheduler chooses and records its worker after admission.
+	if out.Rental {
 		if s.packages == nil || sub.InstallID == "" {
 			return out, exit.Unavailablef("remote execution requires one exact local package release pin")
 		}
@@ -462,22 +441,22 @@ func (s *Server) stageAssets(assets []records.AssetBinding) ([]records.AssetBind
 // fields a local client has and a cloud one does not need to presign: the typed result,
 // the visible media by OPAQUE id, and the triage handle.
 type Lifecycle struct {
-	Kind             string         `json:"kind"`
-	RequestID        string         `json:"request_id"`
-	Status           string         `json:"status"`
-	Package          string         `json:"package"`
-	Function         string         `json:"function"`
-	Attempt          uint64         `json:"attempt"`
-	Attempts         int            `json:"attempts"`
-	ResponseURL      string         `json:"response_url"`
-	Metrics          map[string]any `json:"metrics,omitempty"`
-	ErrorType        string         `json:"error_type,omitempty"`
-	Error            string         `json:"error,omitempty"`
-	Result           any            `json:"result,omitempty"`
-	Outputs          []MediaRef     `json:"outputs"`
-	Triage           *TriageRef     `json:"triage,omitempty"`
-	MaxCostUSDMicros int64          `json:"max_cost_usd_micros,omitempty"`
-	CreatedAt        string         `json:"created_at"`
+	Kind        string         `json:"kind"`
+	RequestID   string         `json:"request_id"`
+	Status      string         `json:"status"`
+	Package     string         `json:"package"`
+	Function    string         `json:"function"`
+	Attempt     uint64         `json:"attempt"`
+	Attempts    int            `json:"attempts"`
+	ResponseURL string         `json:"response_url"`
+	Metrics     map[string]any `json:"metrics,omitempty"`
+	ErrorType   string         `json:"error_type,omitempty"`
+	Error       string         `json:"error,omitempty"`
+	Result      any            `json:"result,omitempty"`
+	Outputs     []MediaRef     `json:"outputs"`
+	Triage      *TriageRef     `json:"triage,omitempty"`
+	Rental      bool           `json:"rental,omitempty"`
+	CreatedAt   string         `json:"created_at"`
 }
 
 // MediaRef is how bytes are named in EVERY document this API emits: an opaque id and its
@@ -526,7 +505,7 @@ func (s *Server) lifecycleOf(row records.Request) Lifecycle {
 		Kind: kind, RequestID: row.ID, Status: contractStatus(row.State), Package: row.Package,
 		Function: row.Entrypoint, Attempt: uint64(row.Ordinal),
 		ResponseURL: "/v1/requests/" + row.ID, CreatedAt: row.CreatedAt,
-		Outputs: []MediaRef{}, MaxCostUSDMicros: row.MaxCostUSDMicros,
+		Outputs: []MediaRef{}, Rental: row.Rental,
 	}
 	attempts, _ := s.store.Attempts(row.ID)
 	life.Attempts = len(attempts)
