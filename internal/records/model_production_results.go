@@ -25,20 +25,20 @@ type PreparedModelSource struct {
 	ReleaseEvidence []byte `json:"release_evidence"`
 }
 
-type ModelProductionNode struct {
-	OperationID, NodeName, RequestID, State string
-	NodeIndex                               int64
+type ModelProductionStep struct {
+	OperationID, StepName, RequestID, State string
+	StepIndex                               int64
 }
 
 type ModelProductionArtifact struct {
-	OperationID, NodeName, OutputSlot, RequestID, InvocationDigest string
+	OperationID, StepName, OutputSlot, RequestID, InvocationDigest string
 	TransactionID, ReceiptDigest, ManifestID, PublicationID, State string
 	Attempt, WriterGeneration, ManifestLength                      int64
 	Receipt, ReleaseEvidence                                       []byte
 }
 
 type ModelProductionObject struct {
-	OperationID, NodeName, OutputSlot, ObjectID, SourceRef  string
+	OperationID, StepName, OutputSlot, ObjectID, SourceRef  string
 	TransferOperationID, State, SafeCode, SafeDetail        string
 	Length, GrantRevision, UpdateSequence, TransferredBytes int64
 }
@@ -208,56 +208,56 @@ func (s *Store) PreparedModelSources(operationID string) ([]PreparedModelSource,
 	return out, nil
 }
 
-func (s *Store) BeginModelProductionNode(row ModelProductionNode) (ModelProductionNode, *exit.Error) {
-	_, err := s.db.Exec(`INSERT INTO model_production_nodes
-		(operation_id,node_index,node_name,request_id,state) VALUES(?,?,?,?,?)
-		ON CONFLICT(operation_id,node_index) DO NOTHING`, row.OperationID, row.NodeIndex,
-		row.NodeName, row.RequestID, row.State)
+func (s *Store) BeginModelProductionStep(row ModelProductionStep) (ModelProductionStep, *exit.Error) {
+	_, err := s.db.Exec(`INSERT INTO model_production_steps
+		(operation_id,step_index,step_name,request_id,state) VALUES(?,?,?,?,?)
+		ON CONFLICT(operation_id,step_index) DO NOTHING`, row.OperationID, row.StepIndex,
+		row.StepName, row.RequestID, row.State)
 	if err != nil {
-		return row, exit.Internalf("cannot begin model production node %s: %s", row.NodeName, err)
+		return row, exit.Internalf("cannot begin model production step %s: %s", row.StepName, err)
 	}
-	var held ModelProductionNode
-	err = s.db.QueryRow(`SELECT operation_id,node_index,node_name,request_id,state
-		FROM model_production_nodes WHERE operation_id=? AND node_index=?`, row.OperationID,
-		row.NodeIndex).Scan(&held.OperationID, &held.NodeIndex, &held.NodeName,
+	var held ModelProductionStep
+	err = s.db.QueryRow(`SELECT operation_id,step_index,step_name,request_id,state
+		FROM model_production_steps WHERE operation_id=? AND step_index=?`, row.OperationID,
+		row.StepIndex).Scan(&held.OperationID, &held.StepIndex, &held.StepName,
 		&held.RequestID, &held.State)
 	if err != nil {
-		return row, exit.Internalf("cannot read model production node %s: %s", row.NodeName, err)
+		return row, exit.Internalf("cannot read model production step %s: %s", row.StepName, err)
 	}
-	if held.NodeName != row.NodeName || row.RequestID != "" && held.RequestID != row.RequestID {
-		return held, exit.Named(exit.Conflict, "model_production.node_conflict",
-			"model production node %d already binds different work", row.NodeIndex)
+	if held.StepName != row.StepName || row.RequestID != "" && held.RequestID != row.RequestID {
+		return held, exit.Named(exit.Conflict, "model_production.step_conflict",
+			"model production step %d already binds different work", row.StepIndex)
 	}
 	return held, nil
 }
 
-func (s *Store) ModelProductionNodeByRequest(requestID string) (*ModelProductionNode, *exit.Error) {
-	var row ModelProductionNode
-	err := s.db.QueryRow(`SELECT operation_id,node_index,node_name,request_id,state
-		FROM model_production_nodes WHERE request_id=?`, requestID).Scan(&row.OperationID,
-		&row.NodeIndex, &row.NodeName, &row.RequestID, &row.State)
+func (s *Store) ModelProductionStepByRequest(requestID string) (*ModelProductionStep, *exit.Error) {
+	var row ModelProductionStep
+	err := s.db.QueryRow(`SELECT operation_id,step_index,step_name,request_id,state
+		FROM model_production_steps WHERE request_id=?`, requestID).Scan(&row.OperationID,
+		&row.StepIndex, &row.StepName, &row.RequestID, &row.State)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, nil
 	}
 	if err != nil {
-		return nil, exit.Internalf("cannot read model production node for request %s: %s", requestID, err)
+		return nil, exit.Internalf("cannot read model production step for request %s: %s", requestID, err)
 	}
 	return &row, nil
 }
 
-func (s *Store) SetModelProductionNodeRequest(operationID string, nodeIndex int64,
-	nodeName, requestID, state string,
+func (s *Store) SetModelProductionStepRequest(operationID string, stepIndex int64,
+	stepName, requestID, state string,
 ) *exit.Error {
-	result, err := s.db.Exec(`UPDATE model_production_nodes SET request_id=?,state=?
-		WHERE operation_id=? AND node_index=? AND node_name=?
-		AND (request_id='' OR request_id=?)`, requestID, state, operationID, nodeIndex,
-		nodeName, requestID)
+	result, err := s.db.Exec(`UPDATE model_production_steps SET request_id=?,state=?
+		WHERE operation_id=? AND step_index=? AND step_name=?
+		AND (request_id='' OR request_id=?)`, requestID, state, operationID, stepIndex,
+		stepName, requestID)
 	if err != nil {
-		return exit.Internalf("cannot bind model production node request: %s", err)
+		return exit.Internalf("cannot bind model production step request: %s", err)
 	}
 	if changed, _ := result.RowsAffected(); changed != 1 {
-		return exit.Named(exit.Conflict, "model_production.node_request_conflict",
-			"model production node %s already binds different work", nodeName)
+		return exit.Named(exit.Conflict, "model_production.step_request_conflict",
+			"model production step %s already binds different work", stepName)
 	}
 	return nil
 }
@@ -271,12 +271,12 @@ func (s *Store) RecordModelProductionArtifact(artifact ModelProductionArtifact,
 	}
 	defer tx.Rollback()
 	var held ModelProductionArtifact
-	err = tx.QueryRow(`SELECT operation_id,node_name,output_slot,request_id,attempt,
+	err = tx.QueryRow(`SELECT operation_id,step_name,output_slot,request_id,attempt,
 		invocation_digest,transaction_id,writer_generation,receipt_digest,receipt,
 		manifest_id,manifest_length,release_evidence,publication_id,state
-		FROM model_production_artifacts WHERE operation_id=? AND node_name=? AND output_slot=?`,
-		artifact.OperationID, artifact.NodeName, artifact.OutputSlot).Scan(&held.OperationID,
-		&held.NodeName, &held.OutputSlot, &held.RequestID, &held.Attempt,
+		FROM model_production_artifacts WHERE operation_id=? AND step_name=? AND output_slot=?`,
+		artifact.OperationID, artifact.StepName, artifact.OutputSlot).Scan(&held.OperationID,
+		&held.StepName, &held.OutputSlot, &held.RequestID, &held.Attempt,
 		&held.InvocationDigest, &held.TransactionID, &held.WriterGeneration,
 		&held.ReceiptDigest, &held.Receipt, &held.ManifestID, &held.ManifestLength,
 		&held.ReleaseEvidence, &held.PublicationID, &held.State)
@@ -288,11 +288,11 @@ func (s *Store) RecordModelProductionArtifact(artifact ModelProductionArtifact,
 			held.ManifestLength != artifact.ManifestLength ||
 			!bytes.Equal(held.ReleaseEvidence, artifact.ReleaseEvidence) {
 			return exit.Named(exit.Conflict, "model_production.artifact_conflict",
-				"artifact receipt replay changed exact output %s.%s", artifact.NodeName, artifact.OutputSlot)
+				"artifact receipt replay changed exact output %s.%s", artifact.StepName, artifact.OutputSlot)
 		}
 		rows, queryErr := tx.Query(`SELECT object_id,length,source_ref FROM model_production_objects
-			WHERE operation_id=? AND node_name=? AND output_slot=? ORDER BY object_id`,
-			artifact.OperationID, artifact.NodeName, artifact.OutputSlot)
+			WHERE operation_id=? AND step_name=? AND output_slot=? ORDER BY object_id`,
+			artifact.OperationID, artifact.StepName, artifact.OutputSlot)
 		if queryErr != nil {
 			return exit.Internalf("cannot read replayed model production objects: %s", queryErr)
 		}
@@ -309,14 +309,14 @@ func (s *Store) RecordModelProductionArtifact(artifact ModelProductionArtifact,
 		if len(replayed) != len(objects) {
 			return exit.Named(exit.Conflict, "model_production.artifact_conflict",
 				"artifact receipt replay changed the object inventory of %s.%s",
-				artifact.NodeName, artifact.OutputSlot)
+				artifact.StepName, artifact.OutputSlot)
 		}
 		for i := range replayed {
 			if replayed[i].ObjectID != objects[i].ObjectID || replayed[i].Length != objects[i].Length ||
 				replayed[i].SourceRef != objects[i].SourceRef {
 				return exit.Named(exit.Conflict, "model_production.artifact_conflict",
 					"artifact receipt replay changed object %d of %s.%s", i,
-					artifact.NodeName, artifact.OutputSlot)
+					artifact.StepName, artifact.OutputSlot)
 			}
 		}
 		if err := tx.Commit(); err != nil {
@@ -328,10 +328,10 @@ func (s *Store) RecordModelProductionArtifact(artifact ModelProductionArtifact,
 		return exit.Internalf("cannot read model production artifact: %s", err)
 	}
 	if _, err := tx.Exec(`INSERT INTO model_production_artifacts
-		(operation_id,node_name,output_slot,request_id,attempt,invocation_digest,
+		(operation_id,step_name,output_slot,request_id,attempt,invocation_digest,
 		transaction_id,writer_generation,receipt_digest,receipt,manifest_id,manifest_length,
 		release_evidence) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)`, artifact.OperationID,
-		artifact.NodeName, artifact.OutputSlot, artifact.RequestID, artifact.Attempt,
+		artifact.StepName, artifact.OutputSlot, artifact.RequestID, artifact.Attempt,
 		artifact.InvocationDigest, artifact.TransactionID, artifact.WriterGeneration,
 		artifact.ReceiptDigest, artifact.Receipt, artifact.ManifestID, artifact.ManifestLength,
 		artifact.ReleaseEvidence); err != nil {
@@ -339,8 +339,8 @@ func (s *Store) RecordModelProductionArtifact(artifact ModelProductionArtifact,
 	}
 	for _, object := range objects {
 		if _, err := tx.Exec(`INSERT INTO model_production_objects
-			(operation_id,node_name,output_slot,object_id,length,source_ref)
-			VALUES(?,?,?,?,?,?)`, artifact.OperationID, artifact.NodeName,
+			(operation_id,step_name,output_slot,object_id,length,source_ref)
+			VALUES(?,?,?,?,?,?)`, artifact.OperationID, artifact.StepName,
 			artifact.OutputSlot, object.ObjectID, object.Length, object.SourceRef); err != nil {
 			return exit.Internalf("cannot journal model production object %s: %s", object.ObjectID, err)
 		}
@@ -352,10 +352,10 @@ func (s *Store) RecordModelProductionArtifact(artifact ModelProductionArtifact,
 }
 
 func (s *Store) ModelProductionArtifacts(operationID string) ([]ModelProductionArtifact, *exit.Error) {
-	rows, err := s.db.Query(`SELECT operation_id,node_name,output_slot,request_id,attempt,
+	rows, err := s.db.Query(`SELECT operation_id,step_name,output_slot,request_id,attempt,
 		invocation_digest,transaction_id,writer_generation,receipt_digest,receipt,
 		manifest_id,manifest_length,release_evidence,publication_id,state
-		FROM model_production_artifacts WHERE operation_id=? ORDER BY node_name,output_slot`, operationID)
+		FROM model_production_artifacts WHERE operation_id=? ORDER BY step_name,output_slot`, operationID)
 	if err != nil {
 		return nil, exit.Internalf("cannot read model production artifacts: %s", err)
 	}
@@ -363,7 +363,7 @@ func (s *Store) ModelProductionArtifacts(operationID string) ([]ModelProductionA
 	var out []ModelProductionArtifact
 	for rows.Next() {
 		var row ModelProductionArtifact
-		if err := rows.Scan(&row.OperationID, &row.NodeName, &row.OutputSlot, &row.RequestID,
+		if err := rows.Scan(&row.OperationID, &row.StepName, &row.OutputSlot, &row.RequestID,
 			&row.Attempt, &row.InvocationDigest, &row.TransactionID, &row.WriterGeneration,
 			&row.ReceiptDigest, &row.Receipt, &row.ManifestID, &row.ManifestLength,
 			&row.ReleaseEvidence, &row.PublicationID, &row.State); err != nil {
@@ -374,14 +374,14 @@ func (s *Store) ModelProductionArtifacts(operationID string) ([]ModelProductionA
 	return out, nil
 }
 
-func (s *Store) ModelProductionObjects(operationID, nodeName,
+func (s *Store) ModelProductionObjects(operationID, stepName,
 	outputSlot string,
 ) ([]ModelProductionObject, *exit.Error) {
-	rows, err := s.db.Query(`SELECT operation_id,node_name,output_slot,object_id,length,
+	rows, err := s.db.Query(`SELECT operation_id,step_name,output_slot,object_id,length,
 		source_ref,transfer_operation_id,grant_revision,update_sequence,state,
 		transferred_bytes,safe_code,safe_detail FROM model_production_objects
-		WHERE operation_id=? AND node_name=? AND output_slot=? ORDER BY object_id`,
-		operationID, nodeName, outputSlot)
+		WHERE operation_id=? AND step_name=? AND output_slot=? ORDER BY object_id`,
+		operationID, stepName, outputSlot)
 	if err != nil {
 		return nil, exit.Internalf("cannot read model production objects: %s", err)
 	}
@@ -389,7 +389,7 @@ func (s *Store) ModelProductionObjects(operationID, nodeName,
 	var out []ModelProductionObject
 	for rows.Next() {
 		var row ModelProductionObject
-		if err := rows.Scan(&row.OperationID, &row.NodeName, &row.OutputSlot, &row.ObjectID,
+		if err := rows.Scan(&row.OperationID, &row.StepName, &row.OutputSlot, &row.ObjectID,
 			&row.Length, &row.SourceRef, &row.TransferOperationID, &row.GrantRevision,
 			&row.UpdateSequence, &row.State, &row.TransferredBytes, &row.SafeCode,
 			&row.SafeDetail); err != nil {
@@ -403,11 +403,11 @@ func (s *Store) ModelProductionObjects(operationID, nodeName,
 func (s *Store) RecordModelProductionObjectStatus(row ModelProductionObject) *exit.Error {
 	result, err := s.db.Exec(`UPDATE model_production_objects SET transfer_operation_id=?,
 		grant_revision=?,update_sequence=?,state=?,transferred_bytes=?,safe_code=?,safe_detail=?
-		WHERE operation_id=? AND node_name=? AND output_slot=? AND object_id=? AND length=?
+		WHERE operation_id=? AND step_name=? AND output_slot=? AND object_id=? AND length=?
 		AND (transfer_operation_id='' OR transfer_operation_id=?)
 		AND grant_revision<=? AND (grant_revision<? OR update_sequence<=?)`,
 		row.TransferOperationID, row.GrantRevision, row.UpdateSequence, row.State,
-		row.TransferredBytes, row.SafeCode, row.SafeDetail, row.OperationID, row.NodeName,
+		row.TransferredBytes, row.SafeCode, row.SafeDetail, row.OperationID, row.StepName,
 		row.OutputSlot, row.ObjectID, row.Length, row.TransferOperationID,
 		row.GrantRevision, row.GrantRevision, row.UpdateSequence)
 	if err != nil {
@@ -420,19 +420,19 @@ func (s *Store) RecordModelProductionObjectStatus(row ModelProductionObject) *ex
 	return nil
 }
 
-func (s *Store) MarkModelProductionArtifactPublished(operationID, nodeName, outputSlot,
+func (s *Store) MarkModelProductionArtifactPublished(operationID, stepName, outputSlot,
 	publicationID string,
 ) *exit.Error {
 	result, err := s.db.Exec(`UPDATE model_production_artifacts SET publication_id=?,state='prepared'
-		WHERE operation_id=? AND node_name=? AND output_slot=?
-		AND (publication_id='' OR publication_id=?)`, publicationID, operationID, nodeName,
+		WHERE operation_id=? AND step_name=? AND output_slot=?
+		AND (publication_id='' OR publication_id=?)`, publicationID, operationID, stepName,
 		outputSlot, publicationID)
 	if err != nil {
 		return exit.Internalf("cannot record prepared model publication: %s", err)
 	}
 	if changed, _ := result.RowsAffected(); changed != 1 {
 		return exit.Named(exit.Conflict, "model_production.publication_conflict",
-			"model production output %s.%s already names another publication", nodeName, outputSlot)
+			"model production output %s.%s already names another publication", stepName, outputSlot)
 	}
 	return nil
 }

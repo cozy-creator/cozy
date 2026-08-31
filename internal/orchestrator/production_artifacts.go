@@ -24,7 +24,7 @@ type ArtifactTransferDecision struct {
 // authored the bounded grants and pod-supervisor moves bytes directly from Runtime to
 // object storage; Creator receives neither model bytes nor a bucket credential.
 func (c *Orchestrator) TransferProductionArtifact(ctx context.Context, operationID,
-	nodeName, outputSlot, rentalID, transferOperationID string,
+	stepName, outputSlot, rentalID, transferOperationID string,
 	decisions []ArtifactTransferDecision,
 ) *exit.Error {
 	artifacts, problem := c.opt.Store.ModelProductionArtifacts(operationID)
@@ -33,16 +33,16 @@ func (c *Orchestrator) TransferProductionArtifact(ctx context.Context, operation
 	}
 	var artifact *records.ModelProductionArtifact
 	for i := range artifacts {
-		if artifacts[i].NodeName == nodeName && artifacts[i].OutputSlot == outputSlot {
+		if artifacts[i].StepName == stepName && artifacts[i].OutputSlot == outputSlot {
 			artifact = &artifacts[i]
 			break
 		}
 	}
 	if artifact == nil {
 		return exit.New(exit.NotFound, "model production output %s.%s has no artifact receipt",
-			nodeName, outputSlot)
+			stepName, outputSlot)
 	}
-	objects, problem := c.opt.Store.ModelProductionObjects(operationID, nodeName, outputSlot)
+	objects, problem := c.opt.Store.ModelProductionObjects(operationID, stepName, outputSlot)
 	if problem != nil {
 		return problem
 	}
@@ -66,7 +66,7 @@ func (c *Orchestrator) TransferProductionArtifact(ctx context.Context, operation
 	}
 
 	for {
-		objects, problem = c.opt.Store.ModelProductionObjects(operationID, nodeName, outputSlot)
+		objects, problem = c.opt.Store.ModelProductionObjects(operationID, stepName, outputSlot)
 		if problem != nil {
 			return problem
 		}
@@ -154,8 +154,8 @@ func (c *Orchestrator) TransferProductionArtifact(ctx context.Context, operation
 }
 
 func (c *Orchestrator) onProductionArtifactReceipt(s *session, frame *pb.ArtifactReceiptFrame) {
-	node, problem := c.opt.Store.ModelProductionNodeByRequest(frame.RequestId)
-	if problem != nil || node == nil {
+	step, problem := c.opt.Store.ModelProductionStepByRequest(frame.RequestId)
+	if problem != nil || step == nil {
 		return
 	}
 	request, problem := c.opt.Store.RequestRow(frame.RequestId)
@@ -209,7 +209,7 @@ func (c *Orchestrator) onProductionArtifactReceipt(s *session, frame *pb.Artifac
 		manifestPresent = manifestPresent || object.ObjectId == manifestDigest &&
 			object.Length == frame.Manifest.Length
 		objects = append(objects, records.ModelProductionObject{
-			OperationID: node.OperationID, NodeName: node.NodeName, OutputSlot: frame.OutputSlot,
+			OperationID: step.OperationID, StepName: step.StepName, OutputSlot: frame.OutputSlot,
 			ObjectID: object.ObjectId, Length: int64(object.Length), SourceRef: object.SourceRef,
 		})
 	}
@@ -217,7 +217,7 @@ func (c *Orchestrator) onProductionArtifactReceipt(s *session, frame *pb.Artifac
 		return
 	}
 	problem = c.opt.Store.RecordModelProductionArtifact(records.ModelProductionArtifact{
-		OperationID: node.OperationID, NodeName: node.NodeName, OutputSlot: frame.OutputSlot,
+		OperationID: step.OperationID, StepName: step.StepName, OutputSlot: frame.OutputSlot,
 		RequestID: frame.RequestId, Attempt: int64(frame.AttemptOrdinal),
 		InvocationDigest: invocationDigest, TransactionID: frame.ArtifactTransactionId,
 		WriterGeneration: int64(frame.WriterGeneration), ReceiptDigest: receipt.ReceiptDigest,
@@ -229,17 +229,17 @@ func (c *Orchestrator) onProductionArtifactReceipt(s *session, frame *pb.Artifac
 			problem.Message)
 		return
 	}
-	c.signalProduction(node.OperationID)
+	c.signalProduction(step.OperationID)
 }
 
 func (c *Orchestrator) onProductionArtifactTransferStatus(s *session,
 	frame *pb.ArtifactTransferStatus,
 ) {
-	node, problem := c.opt.Store.ModelProductionNodeByRequest(frame.RequestId)
-	if problem != nil || node == nil || frame.Length == 0 || frame.Length > uint64(^uint64(0)>>1) {
+	step, problem := c.opt.Store.ModelProductionStepByRequest(frame.RequestId)
+	if problem != nil || step == nil || frame.Length == 0 || frame.Length > uint64(^uint64(0)>>1) {
 		return
 	}
-	artifacts, problem := c.opt.Store.ModelProductionArtifacts(node.OperationID)
+	artifacts, problem := c.opt.Store.ModelProductionArtifacts(step.OperationID)
 	if problem != nil {
 		return
 	}
@@ -264,7 +264,7 @@ func (c *Orchestrator) onProductionArtifactTransferStatus(s *session,
 		return
 	}
 	problem = c.opt.Store.RecordModelProductionObjectStatus(records.ModelProductionObject{
-		OperationID: node.OperationID, NodeName: node.NodeName, OutputSlot: frame.OutputSlot,
+		OperationID: step.OperationID, StepName: step.StepName, OutputSlot: frame.OutputSlot,
 		ObjectID: frame.ObjectId, Length: int64(frame.Length),
 		TransferOperationID: frame.OperationId, GrantRevision: int64(frame.GrantRevision),
 		UpdateSequence: int64(frame.UpdateSequence), State: state,
@@ -272,7 +272,7 @@ func (c *Orchestrator) onProductionArtifactTransferStatus(s *session,
 		SafeDetail: frame.SafeDetail,
 	})
 	if problem == nil {
-		c.signalProduction(node.OperationID)
+		c.signalProduction(step.OperationID)
 	}
 }
 

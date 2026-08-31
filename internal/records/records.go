@@ -68,7 +68,7 @@ type Pin struct {
 
 type Store struct{ db *sql.DB }
 
-const schemaVersion = 3
+const schemaVersion = 4
 
 // schema is the only records shape this pre-launch build accepts.
 var schema = append([]string{`
@@ -142,20 +142,6 @@ func Open(path string) (*Store, *exit.Error) {
 			db.Close()
 			return nil, e
 		}
-	} else if version == 1 {
-		if e := migrateOutputExports(db, path); e != nil {
-			db.Close()
-			return nil, e
-		}
-		if e := migrateRentalBaseSelection(db, path); e != nil {
-			db.Close()
-			return nil, e
-		}
-	} else if version == 2 {
-		if e := migrateRentalBaseSelection(db, path); e != nil {
-			db.Close()
-			return nil, e
-		}
 	} else if version != schemaVersion {
 		db.Close()
 		return nil, schemaReset(path,
@@ -210,145 +196,13 @@ func initialize(db *sql.DB, path string) *exit.Error {
 			return exit.Internalf("cannot initialize records schema in %s: %s", path, err)
 		}
 	}
-	if _, err := tx.Exec(`PRAGMA user_version=3`); err != nil {
+	if _, err := tx.Exec(`PRAGMA user_version=4`); err != nil {
 		return exit.Internalf("cannot stamp records schema in %s: %s", path, err)
 	}
 	if err := tx.Commit(); err != nil {
 		return exit.Internalf("cannot commit records initialization in %s: %s", path, err)
 	}
 	return nil
-}
-
-// migrateOutputExports is the one pre-launch records migration with a real durability
-// consumer: existing runs and rentals survive the addition of daemon-owned --out work.
-// The new object is created from the exact same DDL currentSchema uses, so strict schema
-// readback remains meaningful without rewriting any prior table.
-func migrateOutputExports(db *sql.DB, path string) *exit.Error {
-	tx, err := db.Begin()
-	if err != nil {
-		return exit.Internalf("cannot begin records migration in %s: %s", path, err)
-	}
-	defer tx.Rollback()
-	version, err := databaseVersion(tx)
-	if err != nil {
-		return exit.Internalf("cannot re-read records version in %s: %s", path, err)
-	}
-	if version == schemaVersion {
-		return nil
-	}
-	if version != 1 {
-		return schemaReset(path, "records database changed to user_version %d while migrating", version)
-	}
-	want, err := schemaWithoutOutputExports()
-	if err != nil {
-		return exit.Internalf("cannot derive version 1 records schema: %s", err)
-	}
-	got, err := schemaSnapshot(tx)
-	if err != nil {
-		return exit.Internalf("cannot inspect version 1 records schema in %s: %s", path, err)
-	}
-	if strings.Join(got, "\n") != strings.Join(want, "\n") {
-		return schemaReset(path, "records database schema is not the exact version 1 shape")
-	}
-	if _, err := tx.Exec(outputExportSchema); err != nil {
-		return exit.Internalf("cannot add durable output exports in %s: %s", path, err)
-	}
-	if _, err := tx.Exec(`PRAGMA user_version=2`); err != nil {
-		return exit.Internalf("cannot stamp records migration in %s: %s", path, err)
-	}
-	if err := tx.Commit(); err != nil {
-		return exit.Internalf("cannot commit records migration in %s: %s", path, err)
-	}
-	return nil
-}
-
-// migrateRentalBaseSelection adds the two exact pre-spend/frozen-family facts while retaining
-// accepted requests and paid rentals. The transaction is compared to the complete current schema
-// before commit, so any foreign version-2 mutation rolls back and refuses reset-required.
-func migrateRentalBaseSelection(db *sql.DB, path string) *exit.Error {
-	tx, err := db.Begin()
-	if err != nil {
-		return exit.Internalf("cannot begin rental base-selection migration in %s: %s", path, err)
-	}
-	defer tx.Rollback()
-	version, err := databaseVersion(tx)
-	if err != nil {
-		return exit.Internalf("cannot re-read records version in %s: %s", path, err)
-	}
-	if version == schemaVersion {
-		return nil
-	}
-	if version != 2 {
-		return schemaReset(path, "records database changed to user_version %d while migrating rental bases", version)
-	}
-	wantV2, err := historicalSchema(2)
-	if err != nil {
-		return exit.Internalf("cannot derive version 2 records schema: %s", err)
-	}
-	gotV2, err := schemaSnapshot(tx)
-	if err != nil {
-		return exit.Internalf("cannot inspect version 2 records schema in %s: %s", path, err)
-	}
-	if strings.Join(gotV2, "\n") != strings.Join(wantV2, "\n") {
-		return schemaReset(path, "records database schema is not the exact version 2 shape")
-	}
-	// SQLite appends each ADD COLUMN to the stored table definition. This order is
-	// therefore part of v3 identity: request intent first, selected rental readback second.
-	for _, statement := range []string{
-		`ALTER TABLE requests ADD COLUMN acceptable_base_manifests TEXT NOT NULL DEFAULT '[]'`,
-		`ALTER TABLE rentals ADD COLUMN wheelhouse_manifest_digest TEXT NOT NULL DEFAULT ''`,
-	} {
-		if _, err := tx.Exec(statement); err != nil {
-			return schemaReset(path, "records database cannot append exact rental base-selection facts: %s", err)
-		}
-	}
-	if _, err := tx.Exec(`PRAGMA user_version=3`); err != nil {
-		return exit.Internalf("cannot stamp rental base-selection migration in %s: %s", path, err)
-	}
-	want, err := currentSchema()
-	if err != nil {
-		return exit.Internalf("cannot derive current records schema: %s", err)
-	}
-	got, err := schemaSnapshot(tx)
-	if err != nil {
-		return exit.Internalf("cannot inspect migrated records schema in %s: %s", path, err)
-	}
-	if strings.Join(got, "\n") != strings.Join(want, "\n") {
-		return schemaReset(path, "records database did not reach the exact version 3 shape")
-	}
-	if err := tx.Commit(); err != nil {
-		return exit.Internalf("cannot commit rental base-selection migration in %s: %s", path, err)
-	}
-	return nil
-}
-
-func schemaWithoutOutputExports() ([]string, error) {
-	return historicalSchema(1)
-}
-
-// historicalSchema derives only the two exact on-disk predecessors this build migrates.
-// Both predate base selection; v1 also predates durable output exports.
-func historicalSchema(version int) ([]string, error) {
-	db, err := sql.Open("sqlite", ":memory:"+pragmas)
-	if err != nil {
-		return nil, err
-	}
-	defer db.Close()
-	for _, stmt := range schema {
-		if version == 1 && stmt == outputExportSchema {
-			continue
-		}
-		switch stmt {
-		case requestsDDL:
-			stmt = requestsV2DDL
-		case rentalsDDL:
-			stmt = rentalsV2DDL
-		}
-		if _, err := db.Exec(stmt); err != nil {
-			return nil, err
-		}
-	}
-	return schemaSnapshot(db)
 }
 
 func schemaReset(path, format string, args ...any) *exit.Error {

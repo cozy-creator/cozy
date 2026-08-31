@@ -46,7 +46,7 @@ func runRentedModelProduction(ctx *Context, runCtx context.Context, plan modelpr
 	if err != nil {
 		return exit.Internalf("cannot digest the model production restart plan: %s", err)
 	}
-	ordered, problem := plan.Production.OrderedNodes()
+	ordered, problem := plan.Production.OrderedSteps()
 	if problem != nil {
 		return problem
 	}
@@ -146,43 +146,43 @@ func runRentedModelProduction(ctx *Context, runCtx context.Context, plan modelpr
 	}
 	pins := make(map[string]modelproduction.JobPin, len(plan.Jobs))
 	for _, pin := range plan.Jobs {
-		pins[pin.Node] = pin
+		pins[pin.Step] = pin
 	}
 
-	for index, node := range ordered {
+	for index, step := range ordered {
 		if cancelProblem := productionCancellation(runCtx, store, operation.ID); cancelProblem != nil {
 			return failAndReleaseProduction(ctx, store, operation.ID, rentalID,
 				cancelProblem, progress)
 		}
-		pin, ok := pins[node.Name]
+		pin, ok := pins[step.Name]
 		if !ok {
 			return failAndReleaseProduction(ctx, store, operation.ID, rentalID,
-				exit.Internalf("model production node %s has no exact job pin", node.Name), progress)
+				exit.Internalf("model production step %s has no exact job pin", step.Name), progress)
 		}
-		packageName, function, _ := splitProductionCallable(node.Callable)
-		models := make([]orchestrator.ModelRef, 0, len(node.Models))
-		for parameter, reference := range node.Models {
+		packageName, function, _ := splitProductionCallable(step.Callable)
+		models := make([]orchestrator.ModelRef, 0, len(step.Models))
+		for parameter, reference := range step.Models {
 			manifest, ok := manifests[reference]
 			if !ok {
 				return failAndReleaseProduction(ctx, store, operation.ID, rentalID,
 					exit.Named(exit.Conflict, "model_production.input_absent",
-						"node %s input %s has no prepared Manifest", node.Name, reference), progress)
+						"step %s input %s has no prepared Manifest", step.Name, reference), progress)
 			}
 			models = append(models, orchestrator.ModelRef{Package: packageName, Slot: parameter,
 				Model: operation.ID + "/" + reference, Manifest: manifest.ID,
 				ManifestLength: manifest.Length})
 		}
 		sort.Slice(models, func(i, j int) bool { return models[i].Slot < models[j].Slot })
-		row, problem := store.BeginModelProductionNode(records.ModelProductionNode{
-			OperationID: operation.ID, NodeIndex: int64(index), NodeName: node.Name,
+		row, problem := store.BeginModelProductionStep(records.ModelProductionStep{
+			OperationID: operation.ID, StepIndex: int64(index), StepName: step.Name,
 			State: "pending",
 		})
 		if problem != nil {
 			return failAndReleaseProduction(ctx, store, operation.ID, rentalID, problem, progress)
 		}
-		nodeCompleted := row.State == "completed"
-		if !nodeCompleted {
-			progress.NodeStarting(index, node.Name, node.Callable, row.RequestID != "")
+		stepCompleted := row.State == "completed"
+		if !stepCompleted {
+			progress.StepStarting(index, step.Name, step.Callable, row.RequestID != "")
 		}
 		if row.State != "completed" {
 			handle, submitProblem := local.SubmitJob(api.JobSubmission{
@@ -190,44 +190,44 @@ func runRentedModelProduction(ctx *Context, runCtx context.Context, plan modelpr
 				Release: pin.Release, ReleaseDigest: pin.ReleaseDigest,
 				Rental: true, Worker: rentalID, Models: models,
 				Org:                   strings.Split(plan.Destination, "/")[0],
-				ProductionOperationID: operation.ID, ProductionNode: node.Name,
-				ProductionNodeIndex: int64(index),
-			}, productionRequestKey(operation.ID, node.Name))
+				ProductionOperationID: operation.ID, ProductionStep: step.Name,
+				ProductionStepIndex: int64(index),
+			}, productionRequestKey(operation.ID, step.Name))
 			if submitProblem != nil {
 				return failAndReleaseProduction(ctx, store, operation.ID, rentalID, submitProblem, progress)
 			}
 			if problem = waitProductionJob(runCtx, local, store, operation.ID, handle.JobID,
-				progress, index, node.Name); problem != nil {
+				progress, index, step.Name); problem != nil {
 				return failAndReleaseProduction(ctx, store, operation.ID, rentalID, problem, progress)
 			}
 		}
-		artifacts, problem := waitNodeArtifacts(runCtx, store, operation.ID, node.Name,
-			node.Outputs)
+		artifacts, problem := waitStepArtifacts(runCtx, store, operation.ID, step.Name,
+			step.Outputs)
 		if problem != nil {
 			return failAndReleaseProduction(ctx, store, operation.ID, rentalID, problem, progress)
 		}
 		for artifactIndex, artifact := range artifacts {
-			source := artifact.NodeName + "." + artifact.OutputSlot
+			source := artifact.StepName + "." + artifact.OutputSlot
 			if !existingArtifacts[source] {
-				progress.ArtifactAdopted(index, artifactIndex, len(artifacts), node.Name)
+				progress.ArtifactAdopted(index, artifactIndex, len(artifacts), step.Name)
 			}
 			manifest, publicationProblem := publishProductionArtifact(runCtx, ctx, local,
 				store, plan, rentalID, artifact, progress)
 			if publicationProblem != nil {
 				return failAndReleaseProduction(ctx, store, operation.ID, rentalID, publicationProblem, progress)
 			}
-			manifests[node.Name+"."+artifact.OutputSlot] = manifest
+			manifests[step.Name+"."+artifact.OutputSlot] = manifest
 		}
-		if problem = store.SetModelProductionNodeRequest(operation.ID, int64(index), node.Name,
+		if problem = store.SetModelProductionStepRequest(operation.ID, int64(index), step.Name,
 			artifacts[0].RequestID, "completed"); problem != nil {
 			return failAndReleaseProduction(ctx, store, operation.ID, rentalID, problem, progress)
 		}
-		if problem = advanceProductionNode(store, operation.ID, rentalID, int64(index+1),
+		if problem = advanceProductionStep(store, operation.ID, rentalID, int64(index+1),
 			index == len(ordered)-1); problem != nil {
 			return failAndReleaseProduction(ctx, store, operation.ID, rentalID, problem, progress)
 		}
-		if !nodeCompleted {
-			progress.NodeCompleted(index, node.Name, node.Callable)
+		if !stepCompleted {
+			progress.StepCompleted(index, step.Name, step.Callable)
 		}
 	}
 
@@ -247,7 +247,7 @@ func runRentedModelProduction(ctx *Context, runCtx context.Context, plan modelpr
 	}
 	if current != nil && current.State == "release_cut" {
 		problem = store.AdvanceModelProduction(operation.ID, "release_cut", "cleanup_pending",
-			current.NodeIndex, rentalID)
+			current.StepIndex, rentalID)
 	}
 	if problem != nil {
 		return failAndReleaseProduction(ctx, store, operation.ID, rentalID, problem, progress)
@@ -265,7 +265,7 @@ func runRentedModelProduction(ctx *Context, runCtx context.Context, plan modelpr
 	}
 	if current != nil && current.State == "cleanup_pending" {
 		problem = store.AdvanceModelProduction(operation.ID, "cleanup_pending", "completed",
-			current.NodeIndex, rentalID)
+			current.StepIndex, rentalID)
 	}
 	if problem != nil {
 		return problem
@@ -279,7 +279,7 @@ func resumeProductionCleanup(ctx *Context, store *records.Store, plan modelprodu
 ) *exit.Error {
 	if operation.State == "release_cut" {
 		if problem := store.AdvanceModelProduction(operation.ID, "release_cut", "cleanup_pending",
-			operation.NodeIndex, operation.RentalID); problem != nil {
+			operation.StepIndex, operation.RentalID); problem != nil {
 			return problem
 		}
 		operation.State = "cleanup_pending"
@@ -294,7 +294,7 @@ func resumeProductionCleanup(ctx *Context, store *records.Store, plan modelprodu
 		progress.RentalReleased(operation.RentalID)
 	}
 	if problem := store.AdvanceModelProduction(operation.ID, "cleanup_pending", "completed",
-		operation.NodeIndex, operation.RentalID); problem != nil {
+		operation.StepIndex, operation.RentalID); problem != nil {
 		return problem
 	}
 	completed, problem := store.ModelProduction(operation.ID)
@@ -425,7 +425,7 @@ func productionAcceptableBases(runCtx context.Context, ctx *Context, store *reco
 		packageName, _, valid := splitProductionCallable(pin.Callable)
 		if !valid {
 			return nil, exit.Named(exit.Structural, "model_production_callable_invalid",
-				"production node %s has invalid callable %s", pin.Node, pin.Callable)
+				"production step %s has invalid callable %s", pin.Step, pin.Callable)
 		}
 		key := packageSetKey{Package: packageName, InstallID: pin.InstallID,
 			Release: pin.Release, ReleaseDigest: pin.ReleaseDigest}
@@ -441,7 +441,7 @@ func productionAcceptableBases(runCtx context.Context, ctx *Context, store *reco
 				}
 				if revision.SourceDigest != pin.ReleaseDigest {
 					return nil, exit.Named(exit.Conflict, "model_production_package_changed",
-						"production node %s private package changed after plan acceptance", pin.Node)
+						"production step %s private package changed after plan acceptance", pin.Step)
 				}
 				accepted = compatible
 			} else {
@@ -554,7 +554,7 @@ func prepareProductionSource(runCtx context.Context, local *localclient.Client, 
 		answer <- sourceResult{result: result, problem: actionProblem}
 	}()
 	// The unary daemon exchange has no client-side event stream. Sample its durable
-	// rows at the same cadence as node state, while Progress suppresses unchanged
+	// rows at the same cadence as step state, while Progress suppresses unchanged
 	// values and all movement within an already-rendered ten-percent band.
 	ticker := time.NewTicker(2 * time.Second)
 	defer ticker.Stop()
@@ -621,7 +621,7 @@ func productionArtifactSnapshot(store *records.Store, operationID string) (map[s
 	}
 	out := make(map[string]bool, len(rows))
 	for _, row := range rows {
-		out[row.NodeName+"."+row.OutputSlot] = true
+		out[row.StepName+"."+row.OutputSlot] = true
 	}
 	return out, nil
 }
@@ -643,7 +643,7 @@ func productionSourceProgress(files []records.ModelProductionSourceFile) (transf
 }
 
 func productionResumeStage(operation records.ModelProductionOperation,
-	ordered []launch.ModelProductionNode, transferred, total int64, lanes int,
+	ordered []launch.ModelProductionStep, transferred, total int64, lanes int,
 ) string {
 	rental := operation.RentalID
 	if rental == "" {
@@ -659,16 +659,16 @@ func productionResumeStage(operation records.ModelProductionOperation,
 		}
 		return "source preparation on rental " + rental
 	case "source_prepared":
-		return fmt.Sprintf("source prepared; next is node 1/%d", len(ordered))
-	case "node_running":
+		return fmt.Sprintf("source prepared; next is step 1/%d", len(ordered))
+	case "step_running":
 		if len(ordered) == 0 {
-			return "node execution"
+			return "step execution"
 		}
-		index := max(0, min(len(ordered)-1, int(operation.NodeIndex)))
-		node := ordered[index]
-		return fmt.Sprintf("node %d/%d %s (%s)", index+1, len(ordered), node.Name, node.Callable)
+		index := max(0, min(len(ordered)-1, int(operation.StepIndex)))
+		step := ordered[index]
+		return fmt.Sprintf("step %d/%d %s (%s)", index+1, len(ordered), step.Name, step.Callable)
 	case "outputs_preparing":
-		return fmt.Sprintf("all %d nodes complete; preparing %d lane publications", len(ordered), lanes)
+		return fmt.Sprintf("all %d steps complete; preparing %d lane publications", len(ordered), lanes)
 	case "release_cut":
 		return "release cut; rental cleanup remains for " + rental
 	case "cleanup_pending":
@@ -690,13 +690,13 @@ func splitProductionCallable(value string) (string, string, bool) {
 	return parts[0] + "/" + parts[1], parts[2], true
 }
 
-func productionRequestKey(operationID, node string) string {
-	return "model-production:" + operationID + ":" + node
+func productionRequestKey(operationID, step string) string {
+	return "model-production:" + operationID + ":" + step
 }
 
 func waitProductionJob(runCtx context.Context, local *localclient.Client, store *records.Store,
-	operationID, requestID string, progress *productionProgress, nodeIndex int,
-	nodeName string,
+	operationID, requestID string, progress *productionProgress, stepIndex int,
+	stepName string,
 ) *exit.Error {
 	for {
 		operation, problem := store.ModelProduction(operationID)
@@ -712,7 +712,7 @@ func waitProductionJob(runCtx context.Context, local *localclient.Client, store 
 			return problem
 		}
 		stage, fraction, measured := productionRuntimeProgress(job)
-		progress.NodeRuntime(nodeIndex, nodeName, stage, fraction, measured)
+		progress.StepRuntime(stepIndex, stepName, stage, fraction, measured)
 		switch job.Status {
 		case "completed":
 			return nil
@@ -747,8 +747,8 @@ func productionRuntimeProgress(job api.JobState) (string, float64, bool) {
 	return stage, 0, false
 }
 
-func waitNodeArtifacts(runCtx context.Context, store *records.Store, operationID,
-	nodeName string, outputs []string,
+func waitStepArtifacts(runCtx context.Context, store *records.Store, operationID,
+	stepName string, outputs []string,
 ) ([]records.ModelProductionArtifact, *exit.Error) {
 	want := make(map[string]bool, len(outputs))
 	for _, outputSlot := range outputs {
@@ -764,7 +764,7 @@ func waitNodeArtifacts(runCtx context.Context, store *records.Store, operationID
 		}
 		found := make([]records.ModelProductionArtifact, 0, len(want))
 		for _, row := range rows {
-			if row.NodeName == nodeName && want[row.OutputSlot] {
+			if row.StepName == stepName && want[row.OutputSlot] {
 				found = append(found, row)
 			}
 		}
@@ -774,8 +774,8 @@ func waitNodeArtifacts(runCtx context.Context, store *records.Store, operationID
 		}
 		select {
 		case <-runCtx.Done():
-			return nil, exit.New(exit.Canceled, "model production interrupted waiting for node %s artifacts",
-				nodeName)
+			return nil, exit.New(exit.Canceled, "model production interrupted waiting for step %s artifacts",
+				stepName)
 		case <-time.After(500 * time.Millisecond):
 		}
 	}
@@ -785,11 +785,11 @@ func publishProductionArtifact(runCtx context.Context, ctx *Context, local *loca
 	store *records.Store, plan modelproduction.Plan, rentalID string,
 	artifact records.ModelProductionArtifact, progress *productionProgress,
 ) (productionManifest, *exit.Error) {
-	source := artifact.NodeName + "." + artifact.OutputSlot
+	source := artifact.StepName + "." + artifact.OutputSlot
 	contract, final := productionContract(plan, source)
 	if !final {
 		// Intermediate Manifests stay under the worker's adopted artifact root and
-		// feed the next node directly. Final lane closures contain their inherited
+		// feed the next step directly. Final lane closures contain their inherited
 		// bytes, so opening extra Hub publications here would add no durability to
 		// the release and would leave uncut prepared sessions behind.
 		return productionManifest{ID: artifact.ManifestID, Length: artifact.ManifestLength,
@@ -802,7 +802,7 @@ func publishProductionArtifact(runCtx context.Context, ctx *Context, local *loca
 	if problem := productionCancellation(runCtx, store, plan.ID()); problem != nil {
 		return productionManifest{}, problem
 	}
-	objects, problem := store.ModelProductionObjects(plan.ID(), artifact.NodeName,
+	objects, problem := store.ModelProductionObjects(plan.ID(), artifact.StepName,
 		artifact.OutputSlot)
 	if problem != nil {
 		return productionManifest{}, problem
@@ -813,7 +813,7 @@ func publishProductionArtifact(runCtx context.Context, ctx *Context, local *loca
 	}
 	lane := contract.LaneKey
 	progress.PublicationStarting(lane)
-	publicationOperation := productionPublicationOperation(plan.ID(), artifact.NodeName,
+	publicationOperation := productionPublicationOperation(plan.ID(), artifact.StepName,
 		artifact.OutputSlot)
 	reason := "cozy model publish " + plan.Destination + "@" + plan.Release
 	ref, parseProblem := hub.ParseRef(plan.Destination)
@@ -872,7 +872,7 @@ func publishProductionArtifact(runCtx context.Context, ctx *Context, local *loca
 		}
 		_, problem = local.ModelProductionActionContext(runCtx, plan.ID(), api.ModelProductionAction{
 			Action: "transfer_artifact", RentalID: rentalID,
-			Artifact: &api.ModelProductionArtifactAction{NodeName: artifact.NodeName,
+			Artifact: &api.ModelProductionArtifactAction{StepName: artifact.StepName,
 				OutputSlot: artifact.OutputSlot, TransferOperationID: publicationOperation,
 				Decisions: decisions},
 		})
@@ -906,7 +906,7 @@ func publishProductionArtifact(runCtx context.Context, ctx *Context, local *loca
 	if prepared.Manifest.SHA256 != strings.TrimPrefix(artifact.ManifestID, "sha256:") ||
 		prepared.Manifest.Length != artifact.ManifestLength {
 		return productionManifest{}, exit.Named(exit.Conflict, "model_production.finalize_changed",
-			"Tensorhub finalized a different Manifest for %s.%s", artifact.NodeName,
+			"Tensorhub finalized a different Manifest for %s.%s", artifact.StepName,
 			artifact.OutputSlot)
 	}
 	if prepared.TopologyDigest != contract.TopologyDigest ||
@@ -915,7 +915,7 @@ func publishProductionArtifact(runCtx context.Context, ctx *Context, local *loca
 			"model_production.contract_mismatch",
 			"Tensorhub-derived contract for lane %s does not match the reviewed production", lane)
 	}
-	if problem = store.MarkModelProductionArtifactPublished(plan.ID(), artifact.NodeName,
+	if problem = store.MarkModelProductionArtifactPublished(plan.ID(), artifact.StepName,
 		artifact.OutputSlot, prepared.PublishID); problem != nil {
 		return productionManifest{}, problem
 	}
@@ -924,8 +924,8 @@ func publishProductionArtifact(runCtx context.Context, ctx *Context, local *loca
 		Evidence: base64.StdEncoding.EncodeToString(artifact.ReleaseEvidence)}, nil
 }
 
-func productionPublicationOperation(operationID, node, slot string) string {
-	sum := sha256.Sum256([]byte(operationID + "\x00" + node + "\x00" + slot))
+func productionPublicationOperation(operationID, step, slot string) string {
+	sum := sha256.Sum256([]byte(operationID + "\x00" + step + "\x00" + slot))
 	return "model-artifact-" + hex.EncodeToString(sum[:])
 }
 
@@ -955,20 +955,20 @@ func sameStrings(left, right []string) bool {
 	return strings.Join(left, "\x00") == strings.Join(right, "\x00")
 }
 
-func advanceProductionNode(store *records.Store, operationID, rentalID string,
+func advanceProductionStep(store *records.Store, operationID, rentalID string,
 	next int64, last bool,
 ) *exit.Error {
 	current, problem := store.ModelProduction(operationID)
 	if problem != nil || current == nil {
 		return problem
 	}
-	if current.State == "node_running" && current.NodeIndex >= next ||
+	if current.State == "step_running" && current.StepIndex >= next ||
 		current.State == "outputs_preparing" || current.State == "release_cut" ||
 		current.State == "cleanup_pending" || current.State == "completed" {
 		return nil
 	}
 	if current.State == "source_prepared" {
-		if problem = store.AdvanceModelProduction(operationID, "source_prepared", "node_running",
+		if problem = store.AdvanceModelProduction(operationID, "source_prepared", "step_running",
 			0, rentalID); problem != nil {
 			return problem
 		}
@@ -977,11 +977,11 @@ func advanceProductionNode(store *records.Store, operationID, rentalID string,
 	if problem != nil || current == nil {
 		return problem
 	}
-	to := "node_running"
+	to := "step_running"
 	if last {
 		to = "outputs_preparing"
 	}
-	return store.AdvanceModelProduction(operationID, "node_running", to, next, rentalID)
+	return store.AdvanceModelProduction(operationID, "step_running", to, next, rentalID)
 }
 
 func cutProductionRelease(runCtx context.Context, ctx *Context, store *records.Store,
@@ -1009,7 +1009,7 @@ func cutProductionRelease(runCtx context.Context, ctx *Context, store *records.S
 	}
 	bySource := make(map[string]records.ModelProductionArtifact, len(artifacts))
 	for _, artifact := range artifacts {
-		bySource[artifact.NodeName+"."+artifact.OutputSlot] = artifact
+		bySource[artifact.StepName+"."+artifact.OutputSlot] = artifact
 	}
 	publicationIDs := make([]string, 0, len(plan.Production.Outputs))
 	for _, output := range plan.Production.Outputs {
@@ -1043,7 +1043,7 @@ func cutProductionRelease(runCtx context.Context, ctx *Context, store *records.S
 			"Tensorhub cut an incomplete or different model release")
 	}
 	if problem = store.AdvanceModelProduction(plan.ID(), "outputs_preparing", "release_cut",
-		current.NodeIndex, current.RentalID); problem != nil {
+		current.StepIndex, current.RentalID); problem != nil {
 		return problem
 	}
 	// Cancellation racing the unary cut is observed only after its exact response is

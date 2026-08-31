@@ -16,7 +16,7 @@ import (
 func followModelProduction(ctx *Context, client *localclient.Client,
 	state api.ModelProductionState,
 ) *exit.Error {
-	progress := NewModelProductionProgress(ctx.Err, !ctx.Mode().JSON, state.Nodes)
+	progress := NewModelProductionProgress(ctx.Err, !ctx.Mode().JSON, state.Steps)
 	if state.Changed {
 		progress.Accepted(state.ID, len(state.Lanes))
 	} else {
@@ -121,9 +121,9 @@ func modelProductionStage(state api.ModelProductionState) string {
 	case "source_preparing":
 		return "source preparation on rental " + state.Rental
 	case "source_prepared":
-		return "source prepared; node execution follows"
-	case "node_running":
-		return fmt.Sprintf("node %d/%d", min(int(state.NodeIndex)+1, state.Nodes), state.Nodes)
+		return "source prepared; step execution follows"
+	case "step_running":
+		return fmt.Sprintf("step %d/%d", min(int(state.StepIndex)+1, state.Steps), state.Steps)
 	case "outputs_preparing":
 		return "required lane publications prepared; release cut follows"
 	case "release_cut":

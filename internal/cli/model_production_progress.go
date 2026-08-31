@@ -14,17 +14,17 @@ import (
 type productionProgress struct {
 	w          io.Writer
 	enabled    bool
-	totalNodes int
+	totalSteps int
 	sourceBand int
-	nodeStage  map[int]string
-	nodeBand   map[int]int
+	stepStage  map[int]string
+	stepBand   map[int]int
 }
 
 // NewModelProductionProgress is exported only across Cozy's internal product-test
 // boundary; the public CLI surface remains the model publish command itself.
-func NewModelProductionProgress(w io.Writer, human bool, totalNodes int) *productionProgress {
-	return &productionProgress{w: w, enabled: human, totalNodes: totalNodes,
-		nodeStage: map[int]string{}, nodeBand: map[int]int{}}
+func NewModelProductionProgress(w io.Writer, human bool, totalSteps int) *productionProgress {
+	return &productionProgress{w: w, enabled: human, totalSteps: totalSteps,
+		stepStage: map[int]string{}, stepBand: map[int]int{}}
 }
 
 func (p *productionProgress) line(format string, args ...any) {
@@ -35,7 +35,7 @@ func (p *productionProgress) line(format string, args ...any) {
 }
 
 func (p *productionProgress) Accepted(id string, lanes int) {
-	p.line("Model production %s accepted: %d nodes, %d lanes.", id, p.totalNodes, lanes)
+	p.line("Model production %s accepted: %d steps, %d lanes.", id, p.totalSteps, lanes)
 }
 
 func (p *productionProgress) Resume(id, stage string) {
@@ -88,33 +88,33 @@ func (p *productionProgress) SourcePrepared(profiles int) {
 	p.line("Source: prepared %d model profiles.", profiles)
 }
 
-func (p *productionProgress) NodeStarting(index int, name, callable string, resumed bool) {
+func (p *productionProgress) StepStarting(index int, name, callable string, resumed bool) {
 	verb := "starting"
 	if resumed {
 		verb = "resuming"
 	}
-	p.line("Node %d/%d: %s %s (%s).", index+1, p.totalNodes, verb, name, callable)
+	p.line("Step %d/%d: %s %s (%s).", index+1, p.totalSteps, verb, name, callable)
 }
 
-// NodeRuntime renders only a new Runtime stage or ten-percent fraction band.
+// StepRuntime renders only a new Runtime stage or ten-percent fraction band.
 // Poll cadence and elapsed time never become user-visible progress.
-func (p *productionProgress) NodeRuntime(index int, name, stage string, fraction float64, measured bool) {
+func (p *productionProgress) StepRuntime(index int, name, stage string, fraction float64, measured bool) {
 	stage = strings.TrimSpace(stage)
-	stageChanged := stage != "" && stage != p.nodeStage[index]
+	stageChanged := stage != "" && stage != p.stepStage[index]
 	if stageChanged {
-		p.nodeStage[index] = stage
-		p.nodeBand[index] = 0
+		p.stepStage[index] = stage
+		p.stepBand[index] = 0
 	}
-	band := p.nodeBand[index]
+	band := p.stepBand[index]
 	if measured && fraction >= 0 && fraction <= 1 {
 		band = min(100, int(fraction*100)/10*10)
 	}
-	bandChanged := measured && band > p.nodeBand[index] && band > 0
+	bandChanged := measured && band > p.stepBand[index] && band > 0
 	if !stageChanged && !bandChanged {
 		return
 	}
 	if bandChanged {
-		p.nodeBand[index] = band
+		p.stepBand[index] = band
 	}
 	detail := stage
 	if detail == "" {
@@ -123,12 +123,12 @@ func (p *productionProgress) NodeRuntime(index int, name, stage string, fraction
 	if bandChanged {
 		detail = fmt.Sprintf("%s (%d%%)", detail, band)
 	}
-	p.line("Node %d/%d: %s — %s.", index+1, p.totalNodes, name, detail)
+	p.line("Step %d/%d: %s — %s.", index+1, p.totalSteps, name, detail)
 }
 
-func (p *productionProgress) ArtifactAdopted(nodeIndex, outputIndex, outputs int, nodeName string) {
-	p.line("Artifact: adopted output %d/%d for node %d/%d %s.", outputIndex+1, outputs,
-		nodeIndex+1, p.totalNodes, nodeName)
+func (p *productionProgress) ArtifactAdopted(stepIndex, outputIndex, outputs int, stepName string) {
+	p.line("Artifact: adopted output %d/%d for step %d/%d %s.", outputIndex+1, outputs,
+		stepIndex+1, p.totalSteps, stepName)
 }
 
 func (p *productionProgress) PublicationStarting(lane string) {
@@ -139,8 +139,8 @@ func (p *productionProgress) PublicationPrepared(lane string) {
 	p.line("Publication: lane %s prepared.", lane)
 }
 
-func (p *productionProgress) NodeCompleted(index int, name, callable string) {
-	p.line("Node %d/%d: completed %s (%s).", index+1, p.totalNodes, name, callable)
+func (p *productionProgress) StepCompleted(index int, name, callable string) {
+	p.line("Step %d/%d: completed %s (%s).", index+1, p.totalSteps, name, callable)
 }
 
 func (p *productionProgress) ReleaseStarting(release string, lanes []string) {

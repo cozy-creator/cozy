@@ -16,7 +16,7 @@ import (
 )
 
 type JobPin struct {
-	Node          string
+	Step          string
 	Callable      string
 	InstallID     string
 	Release       string
@@ -136,7 +136,7 @@ func (p Plan) Digest() (string, error) {
 }
 
 // ID is stable across detach/follow, attempts, rental replacement, capability
-// refresh, pricing, and replay. Descriptor identity already binds node edges,
+// refresh, pricing, and replay. Descriptor identity already binds step edges,
 // assets, resources, required outputs, lane keys, and required contracts.
 func (p Plan) ID() string {
 	if p.Instruction.Destination != "" {
@@ -157,10 +157,10 @@ func (p Plan) ID() string {
 		_, _ = hash.Write([]byte{0})
 	}
 	jobs := append([]JobPin(nil), p.Jobs...)
-	sort.Slice(jobs, func(i, j int) bool { return jobs[i].Node < jobs[j].Node })
+	sort.Slice(jobs, func(i, j int) bool { return jobs[i].Step < jobs[j].Step })
 	for _, job := range jobs {
 		for _, value := range []string{
-			job.Node, job.Callable, job.InstallID, job.Release, job.ReleaseDigest,
+			job.Step, job.Callable, job.InstallID, job.Release, job.ReleaseDigest,
 			job.DescriptorID,
 		} {
 			_, _ = io.WriteString(hash, value)

@@ -81,11 +81,11 @@ type ArtifactOutput struct {
 type ModelProduction struct {
 	Name    string                  `json:"name"`
 	Sources map[string]string       `json:"sources"`
-	Nodes   []ModelProductionNode   `json:"nodes"`
+	Steps   []ModelProductionStep   `json:"steps"`
 	Outputs []ModelProductionOutput `json:"outputs"`
 }
 
-type ModelProductionNode struct {
+type ModelProductionStep struct {
 	Name      string               `json:"name"`
 	Callable  string               `json:"callable"`
 	Models    map[string]string    `json:"models"`
@@ -308,22 +308,22 @@ func validateProductionKeys(raw json.RawMessage) error {
 	}
 	for _, rawProduction := range productions {
 		production, err := exactKeys(rawProduction,
-			[]string{"name", "sources", "nodes", "outputs"}, nil)
+			[]string{"name", "sources", "steps", "outputs"}, nil)
 		if err != nil {
 			return err
 		}
-		var nodes []json.RawMessage
-		if err := json.Unmarshal(production["nodes"], &nodes); err != nil {
+		var steps []json.RawMessage
+		if err := json.Unmarshal(production["steps"], &steps); err != nil {
 			return err
 		}
-		for _, rawNode := range nodes {
-			node, err := exactKeys(rawNode,
+		for _, rawStep := range steps {
+			step, err := exactKeys(rawStep,
 				[]string{"callable", "models", "name", "outputs"}, []string{"resources"})
 			if err != nil {
 				return err
 			}
-			if node["resources"] != nil {
-				if err := validateResourceKeys(node["resources"]); err != nil {
+			if step["resources"] != nil {
+				if err := validateResourceKeys(step["resources"]); err != nil {
 					return err
 				}
 			}
@@ -548,33 +548,33 @@ func validateProduction(production *ModelProduction) *exit.Error {
 			return badProduction(production, "has invalid source slot %q or profile %q", slot, profile)
 		}
 	}
-	if len(production.Nodes) < 1 || len(production.Nodes) > 64 {
-		return badProduction(production, "must declare 1 through 64 nodes")
+	if len(production.Steps) < 1 || len(production.Steps) > 64 {
+		return badProduction(production, "must declare 1 through 64 steps")
 	}
-	nodes := map[string]ModelProductionNode{}
+	steps := map[string]ModelProductionStep{}
 	declaredOutputs := map[string]bool{}
-	for _, node := range production.Nodes {
-		if !productionNamePattern.MatchString(node.Name) || nodes[node.Name].Name != "" ||
-			!callablePattern.MatchString(node.Callable) {
-			return badProduction(production, "has an invalid node name or callable")
+	for _, step := range production.Steps {
+		if !productionNamePattern.MatchString(step.Name) || steps[step.Name].Name != "" ||
+			!callablePattern.MatchString(step.Callable) {
+			return badProduction(production, "has an invalid step name or callable")
 		}
-		if len(node.Models) < 1 || len(node.Models) > 16 || len(node.Outputs) < 1 ||
-			len(node.Outputs) > 8 {
-			return badProduction(production, "node %s exceeds its input/output bounds", node.Name)
+		if len(step.Models) < 1 || len(step.Models) > 16 || len(step.Outputs) < 1 ||
+			len(step.Outputs) > 8 {
+			return badProduction(production, "step %s exceeds its input/output bounds", step.Name)
 		}
-		for input, reference := range node.Models {
+		for input, reference := range step.Models {
 			if !productionNamePattern.MatchString(input) || reference == "" {
-				return badProduction(production, "node %s has an invalid model edge", node.Name)
+				return badProduction(production, "step %s has an invalid model edge", step.Name)
 			}
 		}
-		for _, output := range node.Outputs {
-			key := node.Name + "." + output
+		for _, output := range step.Outputs {
+			key := step.Name + "." + output
 			if !productionNamePattern.MatchString(output) || declaredOutputs[key] {
-				return badProduction(production, "node %s has an invalid or duplicate output", node.Name)
+				return badProduction(production, "step %s has an invalid or duplicate output", step.Name)
 			}
 			declaredOutputs[key] = true
 		}
-		nodes[node.Name] = node
+		steps[step.Name] = step
 	}
 	if len(production.Outputs) < 1 || len(production.Outputs) > 16 {
 		return badProduction(production, "must declare 1 through 16 required outputs")
@@ -593,7 +593,7 @@ func validateProduction(production *ModelProduction) *exit.Error {
 			return badProduction(production, "output %s has an invalid required contract", output.Name)
 		}
 	}
-	_, problem := production.OrderedNodes()
+	_, problem := production.OrderedSteps()
 	return problem
 }
 
@@ -614,29 +614,29 @@ func badProduction(production *ModelProduction, format string, values ...any) *e
 		fmt.Sprintf(format, values...))
 }
 
-// OrderedNodes returns the declaration's one deterministic topological order.
+// OrderedSteps returns the declaration's one deterministic topological order.
 // Declaration order carries no control-flow meaning.
-func (production *ModelProduction) OrderedNodes() ([]ModelProductionNode, *exit.Error) {
-	byName := make(map[string]ModelProductionNode, len(production.Nodes))
-	dependencies := make(map[string]map[string]bool, len(production.Nodes))
-	for _, node := range production.Nodes {
-		byName[node.Name] = node
-		dependencies[node.Name] = map[string]bool{}
+func (production *ModelProduction) OrderedSteps() ([]ModelProductionStep, *exit.Error) {
+	byName := make(map[string]ModelProductionStep, len(production.Steps))
+	dependencies := make(map[string]map[string]bool, len(production.Steps))
+	for _, step := range production.Steps {
+		byName[step.Name] = step
+		dependencies[step.Name] = map[string]bool{}
 	}
-	for _, node := range production.Nodes {
-		for _, reference := range node.Models {
+	for _, step := range production.Steps {
+		for _, reference := range step.Models {
 			if _, source := production.Sources[reference]; source {
 				continue
 			}
 			owner, _, _ := strings.Cut(reference, ".")
 			if dependency, ok := byName[owner]; !ok || !contains(dependency.Outputs,
 				strings.TrimPrefix(reference, owner+".")) {
-				return nil, badProduction(production, "node %s references unknown edge %q", node.Name, reference)
+				return nil, badProduction(production, "step %s references unknown edge %q", step.Name, reference)
 			}
-			dependencies[node.Name][owner] = true
+			dependencies[step.Name][owner] = true
 		}
 	}
-	ordered := make([]ModelProductionNode, 0, len(byName))
+	ordered := make([]ModelProductionStep, 0, len(byName))
 	placed := map[string]bool{}
 	for len(ordered) < len(byName) {
 		ready := make([]string, 0)
@@ -677,7 +677,7 @@ func (production *ModelProduction) OrderedNodes() ([]ModelProductionNode, *exit.
 		retain(owner)
 	}
 	if len(required) != len(byName) {
-		return nil, badProduction(production, "contains a disconnected node")
+		return nil, badProduction(production, "contains a disconnected step")
 	}
 	return ordered, nil
 }
