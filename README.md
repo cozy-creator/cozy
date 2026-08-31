@@ -161,6 +161,11 @@ without moving model bodies or authorizing rental spend. Publication follows by 
 of the same command resumes the durable operation. Download and publication verify content identities
 before making a local or remote release visible.
 
+With `--rental`, producer and job packages resolve directly to their latest non-yanked immutable
+Tensorhub releases; their exact release and descriptor identities are pinned in the production plan.
+They do not need to be installable in the laptop's local Python environment. Local production still
+uses the ordinary installed package generations.
+
 ## Run packages and jobs
 
 Serving entrypoints and bounded jobs use the same command. Cozy reads the installed package descriptor

@@ -9,13 +9,13 @@ import (
 	"strings"
 
 	"github.com/cozy-creator/cozy/internal/api"
+	"github.com/cozy-creator/cozy/internal/canonical"
 	"github.com/cozy-creator/cozy/internal/exit"
 	"github.com/cozy-creator/cozy/internal/hub"
 	"github.com/cozy-creator/cozy/internal/launch"
 	"github.com/cozy-creator/cozy/internal/modelproduction"
 	"github.com/cozy-creator/cozy/internal/modelsource"
 	"github.com/cozy-creator/cozy/internal/output"
-	"github.com/cozy-creator/cozy/internal/records"
 	"github.com/cozy-creator/cozy/internal/tfs"
 )
 
@@ -245,23 +245,13 @@ func resolveProducerPlan(ctx *Context, raw string) (*producerPlan, *exit.Error) 
 		return nil, exit.Usagef("--producer %q is not org/package/production", raw)
 	}
 	packageName := parts[0] + "/" + parts[1]
-	install, problem := installedPackage(ctx, packageName)
-	if problem != nil {
-		return nil, problem.WithRemedy("install the exact producer package before planning its production")
-	}
-	var descriptor *launch.PackageDescriptor
-	if ctx.Inv.Bool("--rental") {
-		descriptor, problem = publishedDescriptorForInstall(client(ctx), install)
-	} else {
-		var facts *launch.Facts
-		facts, problem = launch.Read(*install, ctx.Cfg.Home, ctx.Cfg.Tool())
-		if facts != nil {
-			descriptor = facts.PackageDescriptor
-		}
-	}
+	remote := ctx.Inv.Bool("--rental")
+	packages := map[string]productionPackage{}
+	selected, problem := resolveProductionPackage(ctx, packageName, remote, packages)
 	if problem != nil {
 		return nil, problem
 	}
+	descriptor := selected.Descriptor
 	production, problem := descriptor.Production(parts[2])
 	if problem != nil {
 		return nil, problem
@@ -270,8 +260,8 @@ func resolveProducerPlan(ctx *Context, raw string) (*producerPlan, *exit.Error) 
 	if problem != nil {
 		return nil, problem
 	}
-	plan := &producerPlan{Name: raw, InstallID: install.ID, Release: install.Version,
-		ReleaseDigest: install.SourceDigest,
+	plan := &producerPlan{Name: raw, InstallID: selected.InstallID, Release: selected.Release,
+		ReleaseDigest: selected.ReleaseDigest,
 		Descriptor:    descriptor, Production: production}
 	requires := map[string]bool{}
 	for _, node := range ordered {
@@ -280,27 +270,16 @@ func resolveProducerPlan(ctx *Context, raw string) (*producerPlan, *exit.Error) 
 			return nil, exit.Named(exit.Validation, "model_production_callable_invalid",
 				"production node %s does not name one job callable", node.Name)
 		}
-		nodeInstall, installProblem := installedPackage(ctx, target.Package)
-		if installProblem != nil {
-			return nil, installProblem.WithRemedy("install every exact production job package before planning")
+		nodePackage, packageProblem := resolveProductionPackage(ctx, target.Package, remote,
+			packages)
+		if packageProblem != nil {
+			return nil, packageProblem
 		}
-		var nodeDescriptor *launch.PackageDescriptor
-		if ctx.Inv.Bool("--rental") {
-			nodeDescriptor, installProblem = publishedDescriptorForInstall(client(ctx), nodeInstall)
-		} else {
-			var facts *launch.Facts
-			facts, installProblem = launch.Read(*nodeInstall, ctx.Cfg.Home, ctx.Cfg.Tool())
-			if facts != nil {
-				nodeDescriptor = facts.PackageDescriptor
-			}
-		}
-		if installProblem != nil {
-			return nil, installProblem
-		}
+		nodeDescriptor := nodePackage.Descriptor
 		job, jobProblem := nodeDescriptor.Function(target.Function)
 		if jobProblem != nil || job.Kind != "job" {
 			return nil, exit.Named(exit.Validation, "model_production_callable_not_job",
-				"production node %s callable %s is not one installed job", node.Name, node.Callable)
+				"production node %s callable %s is not one job", node.Name, node.Callable)
 		}
 		if validation := validateProductionInvocation(node, job); validation != nil {
 			return nil, validation
@@ -315,8 +294,8 @@ func resolveProducerPlan(ctx *Context, raw string) (*producerPlan, *exit.Error) 
 			}
 		}
 		plan.Jobs = append(plan.Jobs, modelproduction.JobPin{
-			Node: node.Name, Callable: node.Callable, Release: nodeInstall.Version,
-			InstallID: nodeInstall.ID, ReleaseDigest: nodeInstall.SourceDigest,
+			Node: node.Name, Callable: node.Callable, Release: nodePackage.Release,
+			InstallID: nodePackage.InstallID, ReleaseDigest: nodePackage.ReleaseDigest,
 			DescriptorID: job.DescriptorID,
 		})
 	}
@@ -331,38 +310,82 @@ func resolveProducerPlan(ctx *Context, raw string) (*producerPlan, *exit.Error) 
 	return plan, nil
 }
 
-func publishedDescriptorForInstall(c *hub.Client,
-	install *records.PackageInstall,
-) (*launch.PackageDescriptor, *exit.Error) {
-	if install.SourceKind != "tensorhub" || !install.Verified || install.SourceDigest == "" {
-		return nil, exit.Named(exit.Validation, "model_production.package_unpublished",
-			"production package %s is not one exact Tensorhub release", install.Package)
+type productionPackage struct {
+	InstallID, Release, ReleaseDigest string
+	Descriptor                        *launch.PackageDescriptor
+}
+
+func resolveProductionPackage(ctx *Context, packageName string, remote bool,
+	cache map[string]productionPackage,
+) (productionPackage, *exit.Error) {
+	if selected, ok := cache[packageName]; ok {
+		return selected, nil
 	}
-	ref, problem := hub.ParseRef(install.Package)
+	if !remote {
+		install, problem := installedPackage(ctx, packageName)
+		if problem != nil {
+			return productionPackage{}, problem.WithRemedy(
+				"install every exact production package before running it locally")
+		}
+		facts, problem := launch.Read(*install, ctx.Cfg.Home, ctx.Cfg.Tool())
+		if problem != nil {
+			return productionPackage{}, problem
+		}
+		selected := productionPackage{InstallID: install.ID, Release: install.Version,
+			ReleaseDigest: install.SourceDigest, Descriptor: facts.PackageDescriptor}
+		cache[packageName] = selected
+		return selected, nil
+	}
+
+	ref, problem := hub.ParseRef(packageName)
 	if problem != nil {
-		return nil, problem
+		return productionPackage{}, problem
 	}
 	hctx, cancel := hub.Context()
 	defer cancel()
-	detail, problem := c.PackageRelease(hctx, ref, install.Version)
+	card, problem := client(ctx).PackageCard(hctx, ref)
 	if problem != nil {
-		return nil, problem
+		return productionPackage{}, problem
 	}
-	if detail.Release.ReleaseDigest != install.SourceDigest ||
+	if card.Package.Ref() != packageName {
+		return productionPackage{}, exit.Named(exit.Conflict,
+			"model_production.package_catalog_changed",
+			"Tensorhub returned package %s while resolving %s", card.Package.Ref(), packageName)
+	}
+	release, problem := newestPackageRelease(card.Releases)
+	if problem != nil {
+		return productionPackage{}, exit.Named(exit.NotFound,
+			"model_production.package_release_absent",
+			"Tensorhub package %s has no active immutable release", packageName)
+	}
+	detail, problem := client(ctx).PackageRelease(hctx, ref, release)
+	if problem != nil {
+		return productionPackage{}, problem
+	}
+	if detail.Release.Release != release || detail.Release.Yanked || detail.Release.YankedAt != "" ||
 		detail.Release.PackageDescriptorLength != int64(len(detail.PackageDescriptor)) {
-		return nil, exit.Named(exit.Conflict, "model_production.package_changed",
-			"Tensorhub package %s@%s no longer matches the installed exact release",
-			install.Package, install.Version)
+		return productionPackage{}, exit.Named(exit.Conflict, "model_production.package_changed",
+			"Tensorhub package %s@%s returned inconsistent immutable release metadata",
+			packageName, release)
+	}
+	if _, err := canonical.Raw(detail.Release.ReleaseDigest); err != nil {
+		return productionPackage{}, exit.Named(exit.Conflict,
+			"model_production.package_release_digest_invalid",
+			"Tensorhub package %s@%s has no exact immutable release digest",
+			packageName, release)
 	}
 	descriptor, problem := launch.DecodeDescriptor(detail.PackageDescriptor)
 	if problem != nil {
-		return nil, problem
+		return productionPackage{}, problem
 	}
 	if descriptor.Digest != detail.Release.PackageDescriptorDigest {
-		return nil, exit.Named(exit.Conflict, "model_production.descriptor_changed",
+		return productionPackage{}, exit.Named(exit.Conflict, "model_production.descriptor_changed",
 			"Tensorhub package descriptor does not match its release fact")
 	}
-	return descriptor, nil
+	selected := productionPackage{Release: release, ReleaseDigest: detail.Release.ReleaseDigest,
+		Descriptor: descriptor}
+	cache[packageName] = selected
+	return selected, nil
 }
 
 var productionResourcePattern = regexp.MustCompile(`^(sm|vram|ram)([1-9][0-9]*)(\+|g)?$`)

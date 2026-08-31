@@ -2,13 +2,121 @@ package producttest
 
 import (
 	"bytes"
+	"encoding/json"
+	"net/http"
+	"net/http/httptest"
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
 
+	"github.com/cozy-creator/cozy/internal/launch"
 	"github.com/cozy-creator/cozy/internal/modelproduction"
 	"github.com/cozy-creator/cozy/internal/records"
 )
+
+func TestRemoteModelProductionResolvesHubMetadataWithoutLocalInstall(t *testing.T) {
+	producerBytes := []byte(`{"application":"remote_producer:app","entrypoints":[],"format":"cozy.package.descriptor/1","jobs":[],"model_productions":[{"name":"build","nodes":[{"callable":"proof/remote-job/derive","models":{"source":"source"},"name":"derive","outputs":["model"],"resources":{"gpu_count":1,"placement":"single_node","requires":"sm90+,vram80g,ram64g"}}],"outputs":[{"lane_key":"bf16","name":"bf16","required_contract":{"encodings":["sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"],"topology_digest":"sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"},"source":"derive.model"}],"sources":{"source":"proof/source/1"}}]}`)
+	producer, problem := launch.DecodeDescriptor(producerBytes)
+	fatal(t, problem)
+	jobBytes := []byte(`{"application":"remote_job:app","entrypoints":[],"format":"cozy.package.descriptor/1","jobs":[{"artifact_outputs":[{"max_bytes":4096,"mime_type":"application/vnd.cozy.model-manifest","output_id":"model"}],"models":[{"class":"ProofModel","component_use":{},"path":"derive.models.source","stamps":{}}],"name":"derive","publishes":false,"request":{"fields":[]},"resources":{"gpu_count":1,"placement":"single_node","requires":"sm90+,vram80g,ram64g"},"result":{"fields":[]}}],"model_productions":[]}`)
+	job, problem := launch.DecodeDescriptor(jobBytes)
+	fatal(t, problem)
+	type fixture struct {
+		release, digest string
+		document        json.RawMessage
+		descriptor      *launch.PackageDescriptor
+	}
+	newFixture := func(release string, descriptor *launch.PackageDescriptor) fixture {
+		document := json.RawMessage(`{"format":"PackageRelease/1","release":"` + release + `"}`)
+		return fixture{release: release, digest: "sha256:" + strings.Repeat(release[:1], 64), document: document,
+			descriptor: descriptor}
+	}
+	producerRelease, jobRelease := newFixture("2.0.0", producer), newFixture("3.0.0", job)
+	writeRelease := func(w http.ResponseWriter, selected fixture) {
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"release": map[string]any{
+				"release": selected.release, "release_digest": selected.digest,
+				"package_descriptor_digest": selected.descriptor.Digest,
+				"package_descriptor_length": len(selected.descriptor.Raw),
+				"created_at":                "2026-08-31T00:00:00Z",
+			},
+			"document":           selected.document,
+			"package_descriptor": json.RawMessage(selected.descriptor.Raw),
+		})
+	}
+	requests := []string{}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requests = append(requests, r.Method+" "+r.URL.Path)
+		w.Header().Set("Content-Type", "application/json")
+		switch {
+		case r.Method == http.MethodGet && r.URL.Path == "/v1/models/resolve":
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"model": "acme/input", "release": "1.0.0", "lane": "bf16",
+				"manifest_id":   "sha256:" + strings.Repeat("d", 64),
+				"header_digest": "sha256:" + strings.Repeat("e", 64),
+				"objects":       1, "bytes": 4096,
+			})
+		case r.Method == http.MethodGet && r.URL.Path == "/v1/packages/proof/remote-producer":
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"package": map[string]any{"org": "proof", "name": "remote-producer",
+					"created_at": "2026-08-31T00:00:00Z"},
+				"releases": []map[string]any{
+					{"release": "1.0.0", "cut_at": "2026-08-31T00:00:00Z"},
+					{"release": "9.0.0", "cut_at": "2026-08-31T00:00:00Z", "yanked": true},
+					{"release": "2.0.0", "cut_at": "2026-08-31T00:00:00Z"},
+				},
+			})
+		case r.Method == http.MethodGet &&
+			r.URL.Path == "/v1/packages/proof/remote-producer/releases/2.0.0":
+			writeRelease(w, producerRelease)
+		case r.Method == http.MethodGet && r.URL.Path == "/v1/packages/proof/remote-job":
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"package": map[string]any{"org": "proof", "name": "remote-job",
+					"created_at": "2026-08-31T00:00:00Z"},
+				"releases": []map[string]any{
+					{"release": "2.0.0", "cut_at": "2026-08-31T00:00:00Z"},
+					{"release": "3.0.0", "cut_at": "2026-08-31T00:00:00Z"},
+				},
+			})
+		case r.Method == http.MethodGet &&
+			r.URL.Path == "/v1/packages/proof/remote-job/releases/3.0.0":
+			writeRelease(w, jobRelease)
+		default:
+			http.Error(w, "unexpected route", http.StatusNotFound)
+		}
+	}))
+	defer server.Close()
+
+	root := t.TempDir()
+	must(t, os.WriteFile(filepath.Join(root, "config.yaml"), []byte(
+		"tensorhub_url: "+server.URL+"\nrentals:\n  max_hourly_spend_usd: 10\n"), 0o600))
+	code, out := runCozyDir(t, root, "", []string{"PATH=/usr/bin:/bin"},
+		"--json", "--full", "model", "publish", "acme/output", "acme/input@1.0.0",
+		"--release", "1.0.0", "--producer", "proof/remote-producer/build",
+		"--rental", "--dry-run")
+	if code != 0 || !strings.Contains(out, `"status":"planned"`) ||
+		!strings.Contains(out, `"producer":"proof/remote-producer/build@2.0.0"`) {
+		t.Fatalf("metadata-only remote production [exit %d]\n%s", code, out)
+	}
+	if got := strings.Join(requests, "\n"); strings.Contains(got, "/download") ||
+		got != "GET /v1/models/resolve\nGET /v1/packages/proof/remote-producer\n"+
+			"GET /v1/packages/proof/remote-producer/releases/2.0.0\n"+
+			"GET /v1/packages/proof/remote-job\n"+
+			"GET /v1/packages/proof/remote-job/releases/3.0.0" {
+		t.Fatalf("remote production metadata routes =\n%s", got)
+	}
+	requests = nil
+	code, out = runCozyDir(t, root, "", []string{"PATH=/usr/bin:/bin"},
+		"model", "publish", "acme/output", "acme/input@1.0.0", "--release", "1.0.0",
+		"--producer", "proof/remote-producer/build", "--dry-run")
+	if code == 0 || !strings.Contains(out, "not installed") {
+		t.Fatalf("local production stopped requiring a local install [exit %d]\n%s", code, out)
+	}
+	if got := strings.Join(requests, "\n"); got != "GET /v1/models/resolve" {
+		t.Fatalf("local production unexpectedly resolved remote package metadata:\n%s", got)
+	}
+}
 
 func TestModelProductionOperationSurvivesRestartAndReplaysExactly(t *testing.T) {
 	plan := modelproduction.Plan{
