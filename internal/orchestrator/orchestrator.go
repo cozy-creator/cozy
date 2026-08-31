@@ -59,6 +59,8 @@ type Options struct {
 	ObserveRental func(RentalObservation) *exit.Error
 	// RentalClaimProof signs the exact worker/boot/TLS leaf Creator is about to claim.
 	RentalClaimProof RentalClaimProofSource
+	// RentalPackageSet signs Creator's logical package/model download authority.
+	RentalPackageSet RentalPackageSetSource
 	// ConfigDigest is the local evaluated-config identity. Environment identity
 	// comes only from the exact selected PlacementSet.
 	ConfigDigest string
@@ -66,6 +68,7 @@ type Options struct {
 }
 
 type RentalClaimProofSource func(*WorkerConnection, uint64) ([]byte, *exit.Error)
+type RentalPackageSetSource func(*WorkerConnection) ([]byte, []byte, *exit.Error)
 
 type RentalObservation struct {
 	RentalID               string

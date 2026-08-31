@@ -195,7 +195,7 @@ reads RunPod SKU names or provider prices.
 
 Rental creation sends only the SKU and introduction credential material—never a package, model,
 request, profile, image, or placement. Tensorhub readiness means the worker location and TLS identity
-are attachable. Creator then claims that worker directly and sends an empty desired state; no
+are attachable. Creator then claims that worker directly and sends a signed empty `package_set`; no
 WorkerControl frame is relayed through Tensorhub. Non-empty package/model state currently refuses
 until the signed `package_set` delegation protocol is installed; Creator does not reconstruct a
 remote CUDA/qualification closure from a local install as a fallback.

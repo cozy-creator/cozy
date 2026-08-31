@@ -48,11 +48,12 @@ func TestRentalCreatorIdentityAndClaim(t *testing.T) {
 	workerCert := testWorkerCertificate(t)
 	workerCertPath := layout.RentalCert("rnt-01K5PROTO013")
 	must(t, os.WriteFile(workerCertPath, workerCert, 0o644))
-	claimSigner := rental.ClaimProof(layout)
-	claimSignature, problem := claimSigner(&orchestrator.WorkerConnection{
+	connection := &orchestrator.WorkerConnection{
 		RentalID: "rnt-01K5PROTO013", CACert: workerCertPath,
 		WorkerID: "wrk-4070", WorkerBootID: "boot-9f21",
-	}, 41)
+	}
+	claimSigner := rental.ClaimProof(layout)
+	claimSignature, problem := claimSigner(connection, 41)
 	fatal(t, problem)
 	certificateBlock, _ := pem.Decode(workerCert)
 	certificateDigest := canonical.Digest(certificateBlock.Bytes)
@@ -73,6 +74,22 @@ func TestRentalCreatorIdentityAndClaim(t *testing.T) {
 	wantClaim := []byte(`{"format":"cozy.worker.v1.ClaimProof/1","record_owner_epoch":41,"worker_boot_id":"boot-9f21","worker_id":"wrk-4070","worker_tls_certificate_digest":"sha256:4c5b5699f2d99ebf9195c1e518d13c94539bbd4ba670a46199f6d79d58d15721"}`)
 	if !bytes.Equal(fixedClaim, wantClaim) {
 		t.Fatalf("ClaimProof differs from worker-protocol vector:\n got %s\nwant %s", fixedClaim, wantClaim)
+	}
+	delegation, signature, problem := rental.SignDownloadDelegation(layout, connection,
+		[]*pb.DownloadPackageRef{{Package: "cozy/marco-polo", Release: "1.0.0"}},
+		[]*pb.DownloadModelRef{{Model: "cozy/h3", Release: "h3-r1",
+			Manifest: "sha256:ca44423f450cd01ab33110c59560369ba918b7eb56c3d733f4c4e964c3b499e2"}},
+		time.Now().Add(30*time.Minute))
+	fatal(t, problem)
+	if len(signature) != ed25519.SignatureSize || !ed25519.Verify(public, delegation, signature) {
+		t.Fatal("download delegation was not signed by the rental Creator key")
+	}
+	doc, err := canonical.Read(delegation, &pb.DownloadDelegation{})
+	must(t, err)
+	if doc.Str("rental_id") != connection.RentalID || doc.Str("worker_id") != connection.WorkerID ||
+		doc.Str("worker_boot_id") != connection.WorkerBootID || len(doc.List("packages")) != 1 ||
+		len(doc.List("models")) != 1 {
+		t.Fatalf("download delegation lost logical or worker identity: %s", delegation)
 	}
 
 	request, problem := hub.RentalRequestBytes("cpu", strings.Repeat("1", 64),

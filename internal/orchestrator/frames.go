@@ -69,6 +69,56 @@ func (c *Orchestrator) ConvergePlacementSet(instanceID string, placements []Desi
 	return c.converge(s, w, placements)
 }
 
+// ConvergePackageSet sends Creator's signed logical package/model authority to
+// a private pod. These bytes never pass through PlacementSet or local platform
+// resolution; pod-supervisor verifies the signature and resolves downloads.
+func (c *Orchestrator) ConvergePackageSet(instanceID string, delegation, signature []byte) *exit.Error {
+	c.mu.Lock()
+	w := c.workers[instanceID]
+	var s *session
+	if w != nil {
+		s = c.sessions[w.bootID]
+	}
+	c.mu.Unlock()
+	if w == nil || w.spec.Connection == nil {
+		return exit.New(exit.NotFound, "no attached rental worker %s on this host", instanceID)
+	}
+	if s == nil {
+		return exit.Unavailablef("worker %s holds no claimed control stream", instanceID)
+	}
+	return c.convergePackageSet(s, w, delegation, signature)
+}
+
+func (c *Orchestrator) convergePackageSet(s *session, w *worker, delegation, signature []byte) *exit.Error {
+	if len(delegation) == 0 || len(signature) != 64 {
+		return exit.Named(exit.Validation, "rental.delegation_incomplete",
+			"package_set requires canonical delegation bytes and one Ed25519 signature")
+	}
+	if _, err := canonical.Read(delegation, &pb.DownloadDelegation{}); err != nil {
+		return exit.Named(exit.Validation, "rental.delegation_invalid",
+			"package_set delegation is not canonical: %s", err)
+	}
+	revision := c.nextRevision()
+	c.mu.Lock()
+	w.revision, w.desiredRefusal = revision, nil
+	c.mu.Unlock()
+	d := &pb.DesiredWorkerState{
+		RecordOwnerEpoch: recordOwnerEpoch, ControlStreamGeneration: s.generation,
+		WorkerBootId: s.bootID, Revision: revision, Posture: pb.Posture_POSTURE_ACCEPTING,
+		WireMinor: pb.WireMinor,
+		Mode: &pb.DesiredWorkerState_PackageSet{PackageSet: &pb.DesiredPackageSet{
+			DownloadDelegation:          append([]byte(nil), delegation...),
+			DownloadDelegationSignature: append([]byte(nil), signature...),
+		}},
+	}
+	if !s.send(&pb.RecordOwnerFrame{Msg: &pb.RecordOwnerFrame_DesiredState{DesiredState: d}}) {
+		return exit.Unavailablef("worker %s control stream closed before package_set send", w.instanceID)
+	}
+	c.logf("DesiredWorkerState revision=%d package_set delegation=%d B -> %s",
+		revision, len(delegation), s.bootID)
+	return nil
+}
+
 func (c *Orchestrator) converge(s *session, w *worker, placements []DesiredPlacement) *exit.Error {
 	var setBytes, digest []byte
 	if len(placements) == 1 {

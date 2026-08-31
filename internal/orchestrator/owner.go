@@ -581,6 +581,22 @@ func (c *Orchestrator) onSnapshot(w *worker, s *session, snap *pb.WorkerSnapshot
 		c.sendJobDirective(s, w)
 		return true
 	}
+	if w.spec.Connection != nil {
+		if c.opt.RentalPackageSet == nil {
+			c.logf("rental %s has no package_set signer", w.spec.Connection.RentalID)
+			return true
+		}
+		delegation, signature, problem := c.opt.RentalPackageSet(w.spec.Connection)
+		if problem != nil {
+			c.refuseClaim(w, problem)
+			return true
+		}
+		if e := c.convergePackageSet(s, w, delegation, signature); e != nil {
+			c.logf("rental %s package_set could not be issued: %s",
+				w.spec.Connection.RentalID, e.Message)
+		}
+		return true
+	}
 	placements := []DesiredPlacement(nil)
 	if w.spec.Placement.PlacementSetDigest != "" {
 		placements = []DesiredPlacement{w.spec.Placement}
