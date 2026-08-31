@@ -113,7 +113,7 @@ func registryPackageRef(value, release string) (hub.Ref, string, *exit.Error) {
 func downloadPackageInstallPlan(ctx context.Context, cli *Context, scratch string, ref hub.Ref,
 	release, releaseDigest string, plan hub.PackageDownloadPlan,
 ) (*install.PublishedSource, *exit.Error) {
-	if len(plan.Downloads) == 0 || len(plan.Downloads) > 33 {
+	if len(plan.Downloads) == 0 || len(plan.Downloads) > hub.MaxPackageInstallDownloads {
 		return nil, exit.Internalf("Tensorhub returned an invalid package install plan")
 	}
 	published := &install.PublishedSource{

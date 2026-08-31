@@ -18,6 +18,7 @@ import (
 
 	"github.com/cozy-creator/cozy/internal/config"
 	"github.com/cozy-creator/cozy/internal/hub"
+	"github.com/cozy-creator/cozy/internal/packagepublish"
 	"github.com/cozy-creator/cozy/internal/secret"
 	"github.com/cozy-creator/cozy/internal/transfer"
 )
@@ -174,6 +175,31 @@ func TestPackageDownloadPlanContract(t *testing.T) {
 	}
 	if latest, problem := client.PackageDownloads(context.Background(), ref, ""); problem != nil || latest.Release != "1.2.3" {
 		t.Fatalf("latest package download = %+v, %v", latest, problem)
+	}
+}
+
+func TestPackageDownloadPlanMirrorsPublicationWheelBoundary(t *testing.T) {
+	if hub.MaxPackageInstallDownloads != packagepublish.MaxDependencyWheels+1 {
+		t.Fatalf("package install downloads=%d, publication dependency wheels=%d",
+			hub.MaxPackageInstallDownloads, packagepublish.MaxDependencyWheels)
+	}
+	count := hub.MaxPackageInstallDownloads
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_ = json.NewEncoder(w).Encode(hub.PackageDownloadPlan{
+			Downloads: make([]hub.PackageInstallDownload, count), Release: "1.0.0",
+		})
+	}))
+	defer server.Close()
+	client := hub.New(config.Config{HubURL: server.URL}, "cozy-test")
+	ref := hub.Ref{Org: "proof", Name: "package"}
+	plan, problem := client.PackageDownloads(context.Background(), ref, "1.0.0")
+	if problem != nil || len(plan.Downloads) != hub.MaxPackageInstallDownloads {
+		t.Fatalf("maximum package install plan refused: downloads=%d problem=%v",
+			len(plan.Downloads), problem)
+	}
+	count++
+	if _, problem = client.PackageDownloads(context.Background(), ref, "1.0.0"); problem == nil || problem.Name != "hub.package_download_plan_invalid" {
+		t.Fatalf("oversized package install plan was not refused: %v", problem)
 	}
 }
 
