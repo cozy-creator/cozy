@@ -173,6 +173,14 @@ func acquireRental(ctx *Context, l home.Layout, st *records.Store, skuName, requ
 	operationKey, reason string, hourlyRateUSDMicros, fleetCapUSDMicros int64,
 	deadline time.Time, managedRequestID string,
 ) (records.Rental, hub.Rental, bool, *exit.Error) {
+	return acquireRentalContext(context.Background(), ctx, l, st, skuName, requestedMachineName,
+		operationKey, reason, hourlyRateUSDMicros, fleetCapUSDMicros, deadline, managedRequestID)
+}
+
+func acquireRentalContext(lifecycle context.Context, ctx *Context, l home.Layout,
+	st *records.Store, skuName, requestedMachineName, operationKey, reason string,
+	hourlyRateUSDMicros, fleetCapUSDMicros int64, deadline time.Time, managedRequestID string,
+) (records.Rental, hub.Rental, bool, *exit.Error) {
 	c := client(ctx)
 	existing, e := st.RentalOperation(operationKey)
 	if e != nil {
@@ -228,6 +236,9 @@ func acquireRental(ctx *Context, l home.Layout, st *records.Store, skuName, requ
 	if !replay {
 		fmt.Fprintf(ctx.Err, "  rental operation %s persisted; reuse this key to resume\n", operationKey)
 	}
+	// The create request is deliberately not canceled with the operation: a lost
+	// create answer can name a billing pod. Cancellation is sampled immediately
+	// after its durable verdict, when the rental id can be released exactly.
 	hctx, cancel := rentalCallContext(deadline)
 	remote, e := c.Rent(hctx, op.RequestBody, op.Reason, operationKey)
 	cancel()
@@ -243,6 +254,10 @@ func acquireRental(ctx *Context, l home.Layout, st *records.Store, skuName, requ
 	}
 	if e := st.AdvanceRentalOperation(operationKey, remote.ID, remote.State); e != nil {
 		return records.Rental{}, hub.Rental{}, false, e
+	}
+	if lifecycle.Err() != nil {
+		return records.Rental{}, remote, false, exit.New(exit.Canceled,
+			"rental %s was acquired after model production cancellation", remote.ID)
 	}
 	if remote.HourlyRateUSDMicros != hourlyRateUSDMicros {
 		_ = st.AdvanceRentalOperation(operationKey, remote.ID, hub.RentalReleaseRequested)
@@ -302,7 +317,7 @@ func acquireRental(ctx *Context, l home.Layout, st *records.Store, skuName, requ
 		}
 		return st.AdvanceRentalOperation(operationKey, seen.ID, seen.State)
 	}
-	attachable, e := waitRental(ctx, c, remote.ID, deadline, observe,
+	attachable, e := waitRentalContext(lifecycle, ctx, c, remote.ID, deadline, observe,
 		func(r hub.Rental) bool { return r.Attachable() })
 	if e != nil {
 		return records.Rental{}, hub.Rental{}, false, e
@@ -394,8 +409,19 @@ func rentalCallContext(deadline time.Time) (context.Context, context.CancelFunc)
 // takes, and a hub that is momentarily unreachable is asked again at the same cadence.
 func waitRental(ctx *Context, c *hub.Client, id string, deadline time.Time,
 	observe func(hub.Rental) *exit.Error, done func(hub.Rental) bool) (hub.Rental, *exit.Error) {
+	return waitRentalContext(context.Background(), ctx, c, id, deadline, observe, done)
+}
+
+func waitRentalContext(lifecycle context.Context, ctx *Context, c *hub.Client, id string,
+	deadline time.Time, observe func(hub.Rental) *exit.Error,
+	done func(hub.Rental) bool,
+) (hub.Rental, *exit.Error) {
 	said := ""
 	for {
+		if lifecycle.Err() != nil {
+			return hub.Rental{}, exit.New(exit.Canceled,
+				"rental %s acquisition was canceled", id)
+		}
 		hctx, cancel := rentalCallContext(deadline)
 		r, e := c.Rental(hctx, id)
 		cancel()
@@ -410,7 +436,12 @@ func waitRental(ctx *Context, c *hub.Client, id string, deadline time.Time,
 			if timedOut := pastDeadline(id, "unreachable", deadline); timedOut != nil {
 				return hub.Rental{}, timedOut
 			}
-			time.Sleep(pollCadence)
+			select {
+			case <-lifecycle.Done():
+				return hub.Rental{}, exit.New(exit.Canceled,
+					"rental %s acquisition was canceled", id)
+			case <-time.After(pollCadence):
+			}
 			continue
 		}
 		if e := observe(r); e != nil {
@@ -453,7 +484,12 @@ func waitRental(ctx *Context, c *hub.Client, id string, deadline time.Time,
 		if timedOut := pastDeadline(id, r.State, deadline); timedOut != nil {
 			return hub.Rental{}, timedOut
 		}
-		time.Sleep(pollCadence)
+		select {
+		case <-lifecycle.Done():
+			return hub.Rental{}, exit.New(exit.Canceled,
+				"rental %s acquisition was canceled", id)
+		case <-time.After(pollCadence):
+		}
 	}
 }
 
@@ -597,7 +633,12 @@ func handleRentRelease(ctx *Context) *exit.Error {
 		return e
 	}
 	if gone {
-		return w.finish(l, st, "", row != nil, "the hub already reported this rental gone")
+		operationKey, releaseProblem := st.RequestRentalRelease(id)
+		if releaseProblem != nil {
+			return releaseProblem
+		}
+		return w.finish(l, st, operationKey, row != nil,
+			"the hub already reported this rental gone")
 	}
 
 	operationKey, e := st.RequestRentalRelease(id)
@@ -715,6 +756,11 @@ func (w *releaseWatch) finish(l home.Layout, st *records.Store, operationKey str
 		}
 	}
 	if operationKey != "" {
+		if !had {
+			if problem := st.AdvanceRentalOperation(operationKey, w.id, hub.RentalReleased); problem != nil {
+				return problem
+			}
+		}
 		rental.ForgetPending(l, operationKey)
 	}
 	notes := []string{note + "; its media bearer, Creator key, and pinned certificate are gone from this host"}

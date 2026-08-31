@@ -5,11 +5,14 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -299,8 +302,196 @@ func TestRemoteModelProductionResolvesHubMetadataWithoutLocalInstall(t *testing.
 	}
 }
 
+func TestDetachedModelProductionResumesInDaemonAndKeepsFrozenPackagePlan(t *testing.T) {
+	producerBytes := []byte(`{"application":"remote_producer:app","entrypoints":[],"format":"cozy.package.descriptor/1","jobs":[],"model_productions":[{"name":"build","nodes":[{"callable":"proof/remote-job/derive","models":{"source":"source"},"name":"derive","outputs":["model"],"resources":{"gpu_count":1,"placement":"single_node","requires":"sm90+,vram80g,ram64g"}}],"outputs":[{"lane_key":"bf16","name":"bf16","required_contract":{"encodings":["sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"],"topology_digest":"sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"},"source":"derive.model"}],"sources":{"source":"proof/source/1"}}]}`)
+	producer, problem := launch.DecodeDescriptor(producerBytes)
+	fatal(t, problem)
+	jobBytes := []byte(`{"application":"remote_job:app","entrypoints":[],"format":"cozy.package.descriptor/1","jobs":[{"artifact_outputs":[{"max_bytes":4096,"mime_type":"application/vnd.cozy.model-manifest","output_id":"model"}],"models":[{"class":"ProofModel","component_use":{},"path":"derive.models.source","stamps":{}}],"name":"derive","publishes":false,"request":{"fields":[]},"resources":{"gpu_count":1,"placement":"single_node","requires":"sm90+,vram80g,ram64g"},"result":{"fields":[]}}],"model_productions":[]}`)
+	job, problem := launch.DecodeDescriptor(jobBytes)
+	fatal(t, problem)
+
+	var mu sync.Mutex
+	producerRelease := "2.0.0"
+	packageReads := 0
+	sourceReads := 0
+	writeRelease := func(w http.ResponseWriter, release string, descriptor *launch.PackageDescriptor) {
+		digestCharacter := release[0:1]
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"release": map[string]any{
+				"release": release, "release_digest": "sha256:" + strings.Repeat(digestCharacter, 64),
+				"package_descriptor_digest": descriptor.Digest,
+				"package_descriptor_length": len(descriptor.Raw),
+				"created_at":                "2026-08-31T00:00:00Z",
+			},
+			"document":           json.RawMessage(`{"format":"PackageRelease/1","release":"` + release + `"}`),
+			"package_descriptor": json.RawMessage(descriptor.Raw),
+		})
+	}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch {
+		case r.Method == http.MethodGet && r.URL.Path == "/v1/models/resolve":
+			mu.Lock()
+			sourceReads++
+			mu.Unlock()
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"model": "acme/input", "release": "1.0.0", "lane": "bf16",
+				"manifest_id":   "sha256:" + strings.Repeat("d", 64),
+				"header_digest": "sha256:" + strings.Repeat("e", 64),
+				"objects":       1, "bytes": 4096,
+			})
+		case r.Method == http.MethodGet && r.URL.Path == "/v1/packages/proof/remote-producer":
+			mu.Lock()
+			packageReads++
+			release := producerRelease
+			mu.Unlock()
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"package": map[string]any{"org": "proof", "name": "remote-producer",
+					"created_at": "2026-08-31T00:00:00Z"},
+				"releases": []map[string]any{{"release": release, "cut_at": "2026-08-31T00:00:00Z"}},
+			})
+		case r.Method == http.MethodGet && strings.HasPrefix(r.URL.Path,
+			"/v1/packages/proof/remote-producer/releases/"):
+			mu.Lock()
+			packageReads++
+			release := producerRelease
+			mu.Unlock()
+			writeRelease(w, release, producer)
+		case r.Method == http.MethodGet && r.URL.Path == "/v1/packages/proof/remote-job":
+			mu.Lock()
+			packageReads++
+			mu.Unlock()
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"package": map[string]any{"org": "proof", "name": "remote-job",
+					"created_at": "2026-08-31T00:00:00Z"},
+				"releases": []map[string]any{{"release": "3.0.0", "cut_at": "2026-08-31T00:00:00Z"}},
+			})
+		case r.Method == http.MethodGet && r.URL.Path == "/v1/packages/proof/remote-job/releases/3.0.0":
+			mu.Lock()
+			packageReads++
+			mu.Unlock()
+			writeRelease(w, "3.0.0", job)
+		default:
+			http.Error(w, "unexpected route "+r.Method+" "+r.URL.Path, http.StatusNotFound)
+		}
+	}))
+	defer server.Close()
+
+	root := t.TempDir()
+	must(t, os.WriteFile(filepath.Join(root, "config.yaml"), []byte(
+		"tensorhub_url: "+server.URL+"\nrentals:\n  max_hourly_spend_usd: 10\n"), 0o600))
+	args := []string{"--json", "--full", "model", "publish", "acme/output", "acme/input@1.0.0",
+		"--release", "1.0.0", "--producer", "proof/remote-producer/build", "--rental", "--detach"}
+	code, out := runCozy(t, root, args...)
+	var accepted api.ModelProductionState
+	if err := json.Unmarshal([]byte(out), &accepted); code != 0 || err != nil ||
+		!strings.HasPrefix(accepted.ID, "modelpub-") || accepted.Kind != "model-publication" {
+		t.Fatalf("detached acceptance [exit %d, parse %v]\n%s", code, err, out)
+	}
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		mu.Lock()
+		reads := sourceReads
+		mu.Unlock()
+		if reads >= 2 { // first acceptance resolution plus daemon-owned advancement refresh
+			break
+		}
+		time.Sleep(25 * time.Millisecond)
+	}
+	layout, problem := home.Open(root)
+	fatal(t, problem)
+	store, problem := records.Open(layout.DB)
+	fatal(t, problem)
+	operation, problem := store.ModelProduction(accepted.ID)
+	fatal(t, problem)
+	if operation == nil {
+		t.Fatal("detached model production was not durable")
+	}
+	plan, err := modelproduction.Parse(operation.Plan)
+	must(t, err)
+	store.Close()
+	if plan.ProducerRelease != "2.0.0" || plan.ID() != accepted.ID {
+		t.Fatalf("accepted plan = producer %s id %s", plan.ProducerRelease, plan.ID())
+	}
+	mu.Lock()
+	initialPackageReads := packageReads
+	producerRelease = "4.0.0"
+	mu.Unlock()
+	code, replayed := runCozy(t, root, args...)
+	if code != 0 || !strings.Contains(replayed, `"id":"`+accepted.ID+`"`) {
+		t.Fatalf("exact detached replay [exit %d]\n%s", code, replayed)
+	}
+	mu.Lock()
+	readsAfterReplay := packageReads
+	mu.Unlock()
+	if readsAfterReplay != initialPackageReads {
+		t.Fatalf("exact replay re-resolved package latest: reads %d -> %d", initialPackageReads, readsAfterReplay)
+	}
+	followArgs := append([]string(nil), args[:len(args)-1]...)
+	follow := exec.Command(cozyBin, followArgs...)
+	follow.Env = childEnv(t, root)
+	var followStdout, followStderr bytes.Buffer
+	follow.Stdout, follow.Stderr = &followStdout, &followStderr
+	must(t, follow.Start())
+	time.Sleep(250 * time.Millisecond)
+	must(t, follow.Process.Signal(os.Interrupt))
+	if err := follow.Wait(); err != nil || !strings.Contains(followStdout.String(), accepted.ID) ||
+		strings.TrimSpace(followStderr.String()) != "" {
+		t.Fatalf("follow detach [wait %v]\nstdout: %s\nstderr: %s",
+			err, followStdout.String(), followStderr.String())
+	}
+	store, problem = records.Open(layout.DB)
+	fatal(t, problem)
+	stillRunning, problem := store.ModelProduction(accepted.ID)
+	fatal(t, problem)
+	store.Close()
+	if stillRunning == nil || stillRunning.CancelRequested {
+		t.Fatalf("follow interrupt canceled durable work: %+v", stillRunning)
+	}
+	if code, listed := runCozy(t, root, "--json", "run", "list"); code != 0 ||
+		!strings.Contains(listed, accepted.ID) || !strings.Contains(listed, "model-publication") {
+		t.Fatalf("run list omitted model production [exit %d]\n%s", code, listed)
+	}
+
+	mu.Lock()
+	readsBeforeRestart := sourceReads
+	mu.Unlock()
+	terminateTestDaemon(t, root)
+	if code, listed := runCozy(t, root, "--json", "run", "list"); code != 0 ||
+		!strings.Contains(listed, accepted.ID) {
+		t.Fatalf("restarted daemon lost model production [exit %d]\n%s", code, listed)
+	}
+	deadline = time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		mu.Lock()
+		reads := sourceReads
+		mu.Unlock()
+		if reads > readsBeforeRestart {
+			break
+		}
+		time.Sleep(25 * time.Millisecond)
+	}
+	mu.Lock()
+	readsAfterRestart := sourceReads
+	mu.Unlock()
+	if readsAfterRestart <= readsBeforeRestart {
+		t.Fatal("restarted daemon did not resume accepted model production")
+	}
+	if code, canceled := runCozy(t, root, "--json", "run", "cancel", accepted.ID); code != 0 ||
+		!strings.Contains(canceled, `"status":"canceled"`) {
+		t.Fatalf("durable model production cancel [exit %d]\n%s", code, canceled)
+	}
+	terminateTestDaemon(t, root)
+}
+
 func TestModelProductionOperationSurvivesRestartAndReplaysExactly(t *testing.T) {
+	instruction := modelproduction.Instruction{
+		Destination: "tensorhub/minimax-h3", Release: "h3-2026-08-31",
+		Source:   "hf://MiniMaxAI/MiniMax-H3@" + strings.Repeat("a", 40),
+		Producer: "tensorhub/minimax-h3-tools/four-lane", Rental: true,
+	}
 	plan := modelproduction.Plan{
+		Instruction: instruction,
 		Destination: "tensorhub/minimax-h3", Release: "1.0.0",
 		Source:          "hf://MiniMaxAI/MiniMax-H3@" + strings.Repeat("a", 40),
 		SourceSelection: "sha256:" + strings.Repeat("b", 64),
@@ -326,21 +517,30 @@ func TestModelProductionOperationSurvivesRestartAndReplaysExactly(t *testing.T) 
 	path := filepath.Join(t.TempDir(), "records.db")
 	store, problem := records.Open(path)
 	fatal(t, problem)
-	created, replay, problem := store.BeginModelProduction(records.ModelProductionOperation{
-		ID: plan.ID(), PlanDigest: digest, Plan: data,
-	})
+	instructionBytes, err := instruction.Bytes()
+	must(t, err)
+	instructionDigest, err := instruction.Digest()
+	must(t, err)
+	created, replay, problem := store.BeginModelProductionInstruction(
+		instruction.ID(), instructionDigest, instructionBytes)
 	fatal(t, problem)
-	if replay || created.State != "accepted" || created.NodeIndex != 0 {
+	if replay || created.State != "resolving" || created.NodeIndex != 0 ||
+		!bytes.Equal(created.Plan, instructionBytes) {
 		t.Fatalf("created operation = %+v replay=%t", created, replay)
+	}
+	created, replay, problem = store.AttachModelProductionPlan(instruction.ID(), instructionDigest,
+		instructionBytes, data, digest)
+	fatal(t, problem)
+	if replay || created.State != "accepted" || !bytes.Equal(created.Plan, data) {
+		t.Fatalf("accepted operation = %+v replay=%t", created, replay)
 	}
 	store.Close()
 
 	store, problem = records.Open(path)
 	fatal(t, problem)
 	defer store.Close()
-	replayed, replay, problem := store.BeginModelProduction(records.ModelProductionOperation{
-		ID: plan.ID(), PlanDigest: digest, Plan: data,
-	})
+	replayed, replay, problem := store.BeginModelProductionInstruction(
+		instruction.ID(), instructionDigest, instructionBytes)
 	fatal(t, problem)
 	if !replay || replayed.CreatedAt != created.CreatedAt || !bytes.Equal(replayed.Plan, data) {
 		t.Fatalf("restarted replay = %+v replay=%t", replayed, replay)
@@ -355,9 +555,14 @@ func TestModelProductionOperationSurvivesRestartAndReplaysExactly(t *testing.T) 
 		current.RentalID != "rental-1" {
 		t.Fatalf("advanced operation = %+v", current)
 	}
-	if _, _, problem := store.BeginModelProduction(records.ModelProductionOperation{
-		ID: plan.ID(), PlanDigest: digest, Plan: append(data, '\n'),
-	}); problem == nil || problem.Name != "model_production.identity_conflict" {
+	changedInstruction := instruction
+	changedInstruction.Producer = "tensorhub/other/production"
+	changedBytes, err := changedInstruction.Bytes()
+	must(t, err)
+	changedDigest, err := changedInstruction.Digest()
+	must(t, err)
+	if _, _, problem := store.BeginModelProductionInstruction(plan.ID(), changedDigest,
+		changedBytes); problem == nil || problem.Name != "model_production.identity_conflict" {
 		t.Fatalf("changed replay bytes = %v", problem)
 	}
 	if problem := store.AdvanceModelProduction(plan.ID(), "node_running", "completed", 1, "rental-1"); problem == nil || problem.Name != "model_production.transition_invalid" {
@@ -369,6 +574,199 @@ func TestModelProductionOperationSurvivesRestartAndReplaysExactly(t *testing.T) 
 	if canceled == nil || canceled.State != "canceled" || !canceled.CancelRequested {
 		t.Fatalf("canceled production = %+v", canceled)
 	}
+}
+
+func TestModelProductionCancelCutOrderingAndUnattachedProviderAbsence(t *testing.T) {
+	store, problem := records.Open(filepath.Join(t.TempDir(), "records.db"))
+	fatal(t, problem)
+	makeOperation := func(release string) (string, modelproduction.Plan) {
+		instruction := modelproduction.Instruction{Destination: "acme/model", Release: release,
+			Source:   "hf://acme/model@" + strings.Repeat("a", 40),
+			Producer: "acme/tools/build", Rental: true}
+		plan := modelproduction.Plan{Instruction: instruction, Destination: instruction.Destination,
+			Release: release, Source: instruction.Source}
+		instructionBytes, err := instruction.Bytes()
+		must(t, err)
+		instructionDigest, err := instruction.Digest()
+		must(t, err)
+		_, _, problem := store.BeginModelProductionInstruction(instruction.ID(),
+			instructionDigest, instructionBytes)
+		fatal(t, problem)
+		planBytes, err := plan.Bytes()
+		must(t, err)
+		planDigest, err := plan.Digest()
+		must(t, err)
+		_, _, problem = store.AttachModelProductionPlan(instruction.ID(), instructionDigest,
+			instructionBytes, planBytes, planDigest)
+		fatal(t, problem)
+		fatal(t, store.AdvanceModelProduction(instruction.ID(), "accepted", "source_preparing", 0, "rental-proof"))
+		fatal(t, store.AdvanceModelProduction(instruction.ID(), "source_preparing", "source_prepared", 0, "rental-proof"))
+		fatal(t, store.AdvanceModelProduction(instruction.ID(), "source_prepared", "node_running", 0, "rental-proof"))
+		fatal(t, store.AdvanceModelProduction(instruction.ID(), "node_running", "outputs_preparing", 1, "rental-proof"))
+		return instruction.ID(), plan
+	}
+	beforeID, _ := makeOperation("before-cut")
+	fatal(t, store.RequestModelProductionCancel(beforeID))
+	fatal(t, store.CancelModelProduction(beforeID, "outputs_preparing", "cancel won before cut"))
+	before, problem := store.ModelProduction(beforeID)
+	fatal(t, problem)
+	if before == nil || before.State != "canceled" {
+		t.Fatalf("cancel-before-cut state = %+v", before)
+	}
+
+	afterID, _ := makeOperation("after-cut")
+	fatal(t, store.AdvanceModelProduction(afterID, "outputs_preparing", "release_cut", 1, "rental-proof"))
+	fatal(t, store.RequestModelProductionCancel(afterID))
+	fatal(t, store.AdvanceModelProduction(afterID, "release_cut", "cleanup_pending", 1, "rental-proof"))
+	fatal(t, store.AdvanceModelProduction(afterID, "cleanup_pending", "completed", 1, "rental-proof"))
+	after, problem := store.ModelProduction(afterID)
+	fatal(t, problem)
+	if after == nil || after.State != "completed" || !after.CancelRequested {
+		t.Fatalf("commit-before-cancel state = %+v", after)
+	}
+	store.Close()
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodGet && r.URL.Path == "/v1/rentals/rental-proof" {
+			http.NotFound(w, r)
+			return
+		}
+		http.Error(w, "unexpected", http.StatusInternalServerError)
+	}))
+	defer server.Close()
+	root := t.TempDir()
+	layout, problem := home.Open(root)
+	fatal(t, problem)
+	store, problem = records.Open(layout.DB)
+	fatal(t, problem)
+	_, _, problem = store.BeginRentalOperation(records.RentalOperation{
+		Key: "model-production-rental-proof", RequestDigest: "sha256:" + strings.Repeat("b", 64),
+		RequestBody: []byte(`{}`), Hub: server.URL, Reason: "model production proof",
+		HourlyRateUSDMicros: 1,
+	}, 10)
+	fatal(t, problem)
+	fatal(t, store.AdvanceRentalOperation("model-production-rental-proof", "rental-proof", "acquiring"))
+	store.Close()
+	code, out := runCozyDir(t, root, "", []string{
+		"TENSORHUB_URL=" + server.URL, "TENSORHUB_TOKEN=proof-token",
+	}, "--json", "rental", "end", "rental-proof")
+	if code != 0 || !strings.Contains(out, `"state":"ended"`) {
+		t.Fatalf("provider absence recovery [exit %d]\n%s", code, out)
+	}
+	store, problem = records.Open(layout.DB)
+	fatal(t, problem)
+	defer store.Close()
+	operation, problem := store.RentalOperation("model-production-rental-proof")
+	fatal(t, problem)
+	active, problem := store.ActiveRentalOperations()
+	fatal(t, problem)
+	if operation == nil || operation.State != "released" || len(active) != 0 {
+		t.Fatalf("provider absence did not settle operation: operation=%+v active=%+v", operation, active)
+	}
+}
+
+func TestModelProductionAmbiguousCutReplaysExactlyAfterDaemonRestart(t *testing.T) {
+	var mu sync.Mutex
+	cutBodies := []string{}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodPost && r.URL.Path == "/v1/models/acme/output/releases/ambiguous":
+			body, _ := io.ReadAll(r.Body)
+			mu.Lock()
+			cutBodies = append(cutBodies, string(body))
+			attempt := len(cutBodies)
+			mu.Unlock()
+			w.Header().Set("Content-Type", "application/json")
+			if attempt == 1 {
+				w.WriteHeader(http.StatusServiceUnavailable)
+				_, _ = io.WriteString(w, `{"error":{"code":"cut_unavailable","message":"cut response was lost"}}`)
+				return
+			}
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"operation": "modelpub-proof", "release": "ambiguous",
+				"repository_sha256": "sha256:" + strings.Repeat("f", 64), "duplicate": true,
+				"lanes": []map[string]any{{"lane": "bf16", "publication": "publish-proof"}},
+			})
+		case r.Method == http.MethodGet && r.URL.Path == "/v1/rentals/rental-cut-proof":
+			http.NotFound(w, r)
+		default:
+			http.Error(w, "unexpected "+r.Method+" "+r.URL.Path, http.StatusNotFound)
+		}
+	}))
+	defer server.Close()
+	root := t.TempDir()
+	must(t, os.WriteFile(filepath.Join(root, "config.yaml"), []byte(
+		"tensorhub_url: "+server.URL+"\ntensorhub_token: proof-token\nrentals:\n  max_hourly_spend_usd: 10\n"), 0o600))
+	layout, problem := home.Open(root)
+	fatal(t, problem)
+	store, problem := records.Open(layout.DB)
+	fatal(t, problem)
+	instruction := modelproduction.Instruction{Destination: "acme/output", Release: "ambiguous",
+		Source:   "hf://acme/model@" + strings.Repeat("a", 40),
+		Producer: "acme/tools/build", Rental: true}
+	production := &launch.ModelProduction{Name: "build", Sources: map[string]string{"source": "proof/source/1"},
+		Nodes: []launch.ModelProductionNode{{Name: "derive", Callable: "acme/job/derive",
+			Models: map[string]string{"source": "source"}, Outputs: []string{"model"}}},
+		Outputs: []launch.ModelProductionOutput{{Name: "bf16", Source: "derive.model", LaneKey: "bf16"}}}
+	plan := modelproduction.Plan{Instruction: instruction, Destination: instruction.Destination,
+		Release: instruction.Release, Source: instruction.Source, Producer: instruction.Producer,
+		Production: production, Jobs: []modelproduction.JobPin{{Node: "derive", Callable: "acme/job/derive"}}}
+	instructionBytes, err := instruction.Bytes()
+	must(t, err)
+	instructionDigest, err := instruction.Digest()
+	must(t, err)
+	_, _, problem = store.BeginModelProductionInstruction(instruction.ID(), instructionDigest,
+		instructionBytes)
+	fatal(t, problem)
+	planBytes, err := plan.Bytes()
+	must(t, err)
+	planDigest, err := plan.Digest()
+	must(t, err)
+	_, _, problem = store.AttachModelProductionPlan(instruction.ID(), instructionDigest,
+		instructionBytes, planBytes, planDigest)
+	fatal(t, problem)
+	fatal(t, store.AdvanceModelProduction(instruction.ID(), "accepted", "source_preparing", 0, "rental-cut-proof"))
+	fatal(t, store.AdvanceModelProduction(instruction.ID(), "source_preparing", "source_prepared", 0, "rental-cut-proof"))
+	fatal(t, store.AdvanceModelProduction(instruction.ID(), "source_prepared", "node_running", 0, "rental-cut-proof"))
+	fatal(t, store.AdvanceModelProduction(instruction.ID(), "node_running", "outputs_preparing", 1, "rental-cut-proof"))
+	artifact := records.ModelProductionArtifact{OperationID: instruction.ID(), NodeName: "derive",
+		OutputSlot: "model", RequestID: "job-proof", Attempt: 1,
+		InvocationDigest: "sha256:" + strings.Repeat("b", 64), TransactionID: "transaction-proof",
+		WriterGeneration: 1, ReceiptDigest: "sha256:" + strings.Repeat("c", 64),
+		Receipt: []byte(`{"format":"proof/1"}`), ManifestID: "sha256:" + strings.Repeat("d", 64),
+		ManifestLength: 128, ReleaseEvidence: []byte(`{"format":"evidence/1"}`)}
+	fatal(t, store.RecordModelProductionArtifact(artifact, nil))
+	fatal(t, store.MarkModelProductionArtifactPublished(instruction.ID(), "derive", "model", "publish-proof"))
+	store.Close()
+
+	if code, out := runCozy(t, root, "--json", "run", "list"); code != 0 ||
+		!strings.Contains(out, instruction.ID()) {
+		t.Fatalf("daemon did not adopt prepared production [exit %d]\n%s", code, out)
+	}
+	deadline := time.Now().Add(8 * time.Second)
+	for time.Now().Before(deadline) {
+		store, problem = records.Open(layout.DB)
+		fatal(t, problem)
+		operation, readProblem := store.ModelProduction(instruction.ID())
+		store.Close()
+		fatal(t, readProblem)
+		if operation != nil && operation.State == "completed" {
+			break
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+	store, problem = records.Open(layout.DB)
+	fatal(t, problem)
+	operation, problem := store.ModelProduction(instruction.ID())
+	store.Close()
+	fatal(t, problem)
+	mu.Lock()
+	bodies := append([]string(nil), cutBodies...)
+	mu.Unlock()
+	if operation == nil || operation.State != "completed" || len(bodies) != 2 || bodies[0] != bodies[1] {
+		t.Fatalf("ambiguous cut recovery = operation %+v bodies %#v", operation, bodies)
+	}
+	terminateTestDaemon(t, root)
 }
 
 func TestModelProductionJoinsNodeArtifactAndTransferBeforeReplay(t *testing.T) {

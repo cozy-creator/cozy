@@ -76,6 +76,32 @@ func handleModelPublish(ctx *Context) *exit.Error {
 			return handleDirectModelPublish(ctx)
 		}
 	}
+	instructionSource, problem := canonicalProductionSource(ctx, ctx.Inv.Args[1])
+	if problem != nil {
+		return problem
+	}
+	instruction := modelproduction.Instruction{Destination: destination.String(), Release: release,
+		Source: instructionSource, InputLane: strings.TrimSpace(ctx.Inv.Value("--lane")),
+		Producer: producerName, Rental: ctx.Inv.Bool("--rental")}
+	if !ctx.Inv.Bool("--dry-run") && ctx.Inv.Bool("--rental") && producerName != "" {
+		daemonState, _, problem := ensureDaemon(ctx)
+		if problem != nil {
+			return problem
+		}
+		ctx.Daemon = daemonState
+		local, problem := dial(ctx)
+		if problem != nil {
+			return problem
+		}
+		productionState, problem := local.SubmitModelProduction(instruction)
+		if problem != nil {
+			return problem
+		}
+		if ctx.Inv.Bool("--detach") {
+			return emitModelProductionState(ctx, productionState, true)
+		}
+		return followModelProduction(ctx, local, productionState)
+	}
 
 	source, problem := resolvePublishSource(ctx, ctx.Inv.Args[1])
 	if problem != nil {
@@ -86,6 +112,7 @@ func handleModelPublish(ctx *Context) *exit.Error {
 		return problem
 	}
 	plan := modelproduction.Plan{
+		Instruction: instruction,
 		Destination: destination.String(), Release: release,
 		Source: source.Canonical, SourceSelection: source.Selection,
 		SourceLicense: source.License, InputLane: source.Lane,
@@ -125,16 +152,39 @@ func handleModelPublish(ctx *Context) *exit.Error {
 		defaults = append(defaults, "status", "changed")
 		return emit(ctx, compactRecord(fields, defaults...))
 	}
-	if ctx.Inv.Bool("--rental") && producer != nil {
-		if ctx.Inv.Bool("--detach") {
-			return exit.Named(exit.Unavailable, "model_production.detach_unavailable",
-				"detached model production is not available in this build").
-				WithRemedy("run without --detach; the durable operation resumes from its SQLite journal after interruption")
-		}
-		return runRentedModelProduction(ctx, plan, source)
-	}
 	return exit.Named(exit.Unavailable, "model_publication_execution_unavailable",
 		"model publication %s is planned, but this build cannot yet submit its durable source publication", id)
+}
+
+func canonicalProductionSource(ctx *Context, raw string) (string, *exit.Error) {
+	raw = strings.TrimSpace(raw)
+	if strings.HasPrefix(raw, "local/") {
+		if problem := modelsource.LocalName(strings.TrimPrefix(raw, "local/")); problem != nil {
+			return "", problem
+		}
+		return raw, nil
+	}
+	cwd, err := os.Getwd()
+	if err != nil {
+		return "", exit.Internalf("cannot resolve the current directory: %s", err)
+	}
+	if parsed, problem := modelsource.Parse(raw, cwd); problem == nil {
+		return parsed.Canonical, nil
+	}
+	if !catalogModelSpelling(raw) {
+		_, problem := modelsource.Parse(raw, cwd)
+		return "", problem
+	}
+	name, release, pinned := strings.Cut(raw, "@")
+	if !pinned || strings.TrimSpace(release) == "" {
+		return "", exit.Usagef("model production source %q is not pinned to one Tensorhub release", raw).
+			WithRemedy("use org/model@release; mutable source latest cannot enter operation identity")
+	}
+	ref, problem := hub.ParseRef(name)
+	if problem != nil {
+		return "", problem
+	}
+	return ref.String() + "@" + strings.TrimSpace(release), nil
 }
 
 func resolvePublishSource(ctx *Context, raw string) (publishSource, *exit.Error) {

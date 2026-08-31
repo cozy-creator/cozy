@@ -31,6 +31,7 @@ import (
 	"github.com/cozy-creator/cozy/internal/daemon"
 	"github.com/cozy-creator/cozy/internal/exit"
 	"github.com/cozy-creator/cozy/internal/home"
+	"github.com/cozy-creator/cozy/internal/modelproduction"
 	"github.com/cozy-creator/cozy/internal/secret"
 )
 
@@ -316,4 +317,38 @@ func (c *Client) ModelProductionActionContext(ctx context.Context, id string,
 	e := c.callContext(ctx, http.MethodPost, "/v1/local/model-productions/"+url.PathEscape(id),
 		action, &result)
 	return result, e
+}
+
+func (c *Client) SubmitModelProduction(instruction modelproduction.Instruction) (
+	api.ModelProductionState, *exit.Error,
+) {
+	var state api.ModelProductionState
+	e := c.call(http.MethodPost, "/v1/local/model-productions",
+		map[string]any{"instruction": instruction}, &state)
+	return state, e
+}
+
+func (c *Client) ModelProduction(id string) (api.ModelProductionState, *exit.Error) {
+	var state api.ModelProductionState
+	e := c.call(http.MethodGet, "/v1/local/model-productions/"+url.PathEscape(id), nil, &state)
+	return state, e
+}
+
+func (c *Client) ModelProductions(status string, limit int) ([]api.ModelProductionState, *exit.Error) {
+	var out struct {
+		ModelProductions []api.ModelProductionState `json:"model_productions"`
+	}
+	path := fmt.Sprintf("/v1/local/model-productions?limit=%d", limit)
+	if status != "" {
+		path += "&status=" + url.QueryEscape(status)
+	}
+	e := c.call(http.MethodGet, path, nil, &out)
+	return out.ModelProductions, e
+}
+
+func (c *Client) CancelModelProduction(id string) (api.ModelProductionState, *exit.Error) {
+	var state api.ModelProductionState
+	e := c.call(http.MethodPost,
+		"/v1/local/model-productions/"+url.PathEscape(id)+"/cancel", nil, &state)
+	return state, e
 }

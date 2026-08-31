@@ -2,7 +2,10 @@ package records
 
 import (
 	"bytes"
+	"crypto/sha256"
 	"database/sql"
+	"encoding/hex"
+	"encoding/json"
 	"errors"
 
 	"github.com/cozy-creator/cozy/internal/exit"
@@ -166,6 +169,128 @@ func (s *Store) BeginModelProduction(operation ModelProductionOperation) (ModelP
 	return stored, false, nil
 }
 
+// BeginModelProductionInstruction records caller intent before resolving any
+// mutable package selector. While resolving, the existing plan columns hold the
+// canonical instruction bytes; AttachModelProductionPlan replaces them exactly
+// once with the frozen restart plan.
+func (s *Store) BeginModelProductionInstruction(id, digest string, instruction []byte) (
+	ModelProductionOperation, bool, *exit.Error,
+) {
+	if id == "" || digest == "" || len(instruction) == 0 {
+		return ModelProductionOperation{}, false, exit.New(exit.Validation,
+			"model production needs one id, instruction digest, and canonical instruction")
+	}
+	tx, err := s.db.Begin()
+	if err != nil {
+		return ModelProductionOperation{}, false, exit.Internalf("cannot begin model production instruction: %s", err)
+	}
+	defer tx.Rollback()
+	stored, err := scanModelProduction(tx.QueryRow(
+		`SELECT `+modelProductionCols+` FROM model_productions WHERE id=?`, id))
+	if err == nil {
+		matches := stored.State == "resolving" && stored.PlanDigest == digest &&
+			bytes.Equal(stored.Plan, instruction)
+		if stored.State != "resolving" {
+			matches = planInstructionMatches(stored.Plan, instruction, digest)
+		}
+		if !matches {
+			return ModelProductionOperation{}, false, exit.Named(exit.Conflict,
+				"model_production.identity_conflict",
+				"model production %s already binds a different canonical instruction", id)
+		}
+		if err := tx.Commit(); err != nil {
+			return ModelProductionOperation{}, false, exit.Internalf("cannot read replayed model production instruction: %s", err)
+		}
+		return stored, true, nil
+	}
+	if !errors.Is(err, sql.ErrNoRows) {
+		return ModelProductionOperation{}, false, exit.Internalf("cannot read model production instruction: %s", err)
+	}
+	stamp := now()
+	if _, err := tx.Exec(`INSERT INTO model_productions(`+modelProductionCols+`)
+		VALUES(?,?,?,?,?,?,?,?,?,?,?,?)`, id, digest, instruction, "resolving", 0, "", "", false,
+		"", "", stamp, stamp); err != nil {
+		return ModelProductionOperation{}, false, exit.Internalf("cannot record model production instruction: %s", err)
+	}
+	stored, err = scanModelProduction(tx.QueryRow(
+		`SELECT `+modelProductionCols+` FROM model_productions WHERE id=?`, id))
+	if err != nil {
+		return ModelProductionOperation{}, false, exit.Internalf("cannot read recorded model production instruction: %s", err)
+	}
+	if err := tx.Commit(); err != nil {
+		return ModelProductionOperation{}, false, exit.Internalf("cannot commit model production instruction: %s", err)
+	}
+	return stored, false, nil
+}
+
+// AttachModelProductionPlan is the first-acceptance CAS. It accepts only the
+// instruction bytes already occupying the row and makes the exact plan write-once.
+func (s *Store) AttachModelProductionPlan(id, instructionDigest string, instruction,
+	plan []byte, planDigest string,
+) (ModelProductionOperation, bool, *exit.Error) {
+	if !planInstructionMatches(plan, instruction, instructionDigest) {
+		return ModelProductionOperation{}, false, exit.Named(exit.Conflict,
+			"model_production.instruction_changed",
+			"model production plan does not embed its recorded canonical instruction")
+	}
+	tx, err := s.db.Begin()
+	if err != nil {
+		return ModelProductionOperation{}, false, exit.Internalf("cannot attach model production plan: %s", err)
+	}
+	defer tx.Rollback()
+	stored, err := scanModelProduction(tx.QueryRow(
+		`SELECT `+modelProductionCols+` FROM model_productions WHERE id=?`, id))
+	if errors.Is(err, sql.ErrNoRows) {
+		return ModelProductionOperation{}, false, exit.New(exit.NotFound,
+			"model production %s is absent", id)
+	}
+	if err != nil {
+		return ModelProductionOperation{}, false, exit.Internalf("cannot read model production before plan attach: %s", err)
+	}
+	if stored.State != "resolving" {
+		if stored.PlanDigest != planDigest || !bytes.Equal(stored.Plan, plan) {
+			return ModelProductionOperation{}, false, exit.Named(exit.Conflict,
+				"model_production.plan_conflict",
+				"model production %s already binds a different exact plan", id)
+		}
+		if err := tx.Commit(); err != nil {
+			return ModelProductionOperation{}, false, exit.Internalf("cannot read attached model production plan: %s", err)
+		}
+		return stored, true, nil
+	}
+	if stored.PlanDigest != instructionDigest || !bytes.Equal(stored.Plan, instruction) {
+		return ModelProductionOperation{}, false, exit.Named(exit.Conflict,
+			"model_production.identity_conflict",
+			"model production %s resolving row changed before plan acceptance", id)
+	}
+	if _, err := tx.Exec(`UPDATE model_productions SET plan_digest=?,plan=?,state='accepted',updated_at=?
+		WHERE id=? AND state='resolving' AND plan_digest=? AND plan=?`, planDigest, plan, now(), id,
+		instructionDigest, instruction); err != nil {
+		return ModelProductionOperation{}, false, exit.Internalf("cannot attach model production plan: %s", err)
+	}
+	stored, err = scanModelProduction(tx.QueryRow(
+		`SELECT `+modelProductionCols+` FROM model_productions WHERE id=?`, id))
+	if err != nil {
+		return ModelProductionOperation{}, false, exit.Internalf("cannot read attached model production plan: %s", err)
+	}
+	if err := tx.Commit(); err != nil {
+		return ModelProductionOperation{}, false, exit.Internalf("cannot commit model production plan: %s", err)
+	}
+	return stored, false, nil
+}
+
+func planInstructionMatches(plan, instruction []byte, digest string) bool {
+	var envelope struct {
+		Instruction json.RawMessage
+	}
+	if json.Unmarshal(plan, &envelope) != nil || len(envelope.Instruction) == 0 ||
+		!bytes.Equal(envelope.Instruction, instruction) {
+		return false
+	}
+	sum := sha256.Sum256(instruction)
+	return digest == "sha256:"+hex.EncodeToString(sum[:])
+}
+
 func (s *Store) ModelProduction(id string) (*ModelProductionOperation, *exit.Error) {
 	operation, err := scanModelProduction(s.db.QueryRow(
 		`SELECT `+modelProductionCols+` FROM model_productions WHERE id=?`, id))
@@ -190,6 +315,34 @@ func (s *Store) ActiveModelProductions() ([]ModelProductionOperation, *exit.Erro
 		row, err := scanModelProduction(rows)
 		if err != nil {
 			return nil, exit.Internalf("cannot scan active model production: %s", err)
+		}
+		out = append(out, row)
+	}
+	return out, nil
+}
+
+func (s *Store) ModelProductions(state string, limit int) ([]ModelProductionOperation, *exit.Error) {
+	if limit < 1 || limit > 500 {
+		return nil, exit.New(exit.Validation, "model production list limit is outside 1..500")
+	}
+	query := `SELECT ` + modelProductionCols + ` FROM model_productions`
+	args := []any{}
+	if state != "" && state != "any" {
+		query += ` WHERE state=?`
+		args = append(args, state)
+	}
+	query += ` ORDER BY created_at DESC,id DESC LIMIT ?`
+	args = append(args, limit)
+	rows, err := s.db.Query(query, args...)
+	if err != nil {
+		return nil, exit.Internalf("cannot list model productions: %s", err)
+	}
+	defer rows.Close()
+	var out []ModelProductionOperation
+	for rows.Next() {
+		row, err := scanModelProduction(rows)
+		if err != nil {
+			return nil, exit.Internalf("cannot scan model production: %s", err)
 		}
 		out = append(out, row)
 	}
