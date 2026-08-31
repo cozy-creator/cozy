@@ -356,6 +356,7 @@ func (c *Orchestrator) activateRecorded(req records.Request) (uint64, *exit.Erro
 		c.emit(req.ID, "request.queued", 0, map[string]any{"reason": e.Message})
 		c.logf("%s QUEUED for capacity: %s", req.ID, e.Message)
 		c.selectOrStart(req)
+		go c.drain()
 		return 0, nil
 	}
 	return attempt, nil

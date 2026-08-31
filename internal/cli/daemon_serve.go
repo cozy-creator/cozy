@@ -173,6 +173,7 @@ func serveDaemon(ctx *Context) *exit.Error {
 	<-stop
 	fmt.Fprintln(ctx.Out, "draining package processes…")
 	closeListeners()
+	fleet.close()
 	c.Close(orchestrator.StopGrace)
 	return nil
 }

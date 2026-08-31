@@ -4,6 +4,7 @@ import (
 	"database/sql"
 	"errors"
 	"strings"
+	"time"
 	"unicode"
 
 	"github.com/cozy-creator/cozy/internal/exit"
@@ -555,12 +556,52 @@ func rentalFleetTotals(q interface{ QueryRow(string, ...any) *sql.Row }) (int, i
 func (s *Store) RentalRunCounts(id string) (queued, running int, problem *exit.Error) {
 	err := s.db.QueryRow(`SELECT
 		COALESCE(SUM(CASE WHEN state IN ('submitted','queued','requeue_pending') THEN 1 ELSE 0 END),0),
-		COALESCE(SUM(CASE WHEN state IN ('dispatching','in_progress') THEN 1 ELSE 0 END),0)
-		FROM requests WHERE worker=?`, id).Scan(&queued, &running)
+		COALESCE(SUM(CASE WHEN state IN ('dispatching','in_progress') THEN 1 ELSE 0 END),0) +
+		(SELECT COUNT(*) FROM attempts a JOIN requests held ON held.id=a.request_id
+		 WHERE held.worker=? AND a.state='terminal')
+		FROM requests WHERE worker=?`, id, id).Scan(&queued, &running)
 	if err != nil {
 		return 0, 0, exit.Internalf("cannot count runs for rented machine %s: %s", id, err)
 	}
 	return queued, running, nil
+}
+
+// RentalLastSettlement returns the newest settled request assigned to one rental and
+// the time its final attempt became durable. A zero ClosedAt means the request settled
+// before an attempt crossed the terminal boundary.
+type RentalLastSettlement struct {
+	RequestID string
+	Kind      string
+	ClosedAt  time.Time
+}
+
+func (s *Store) RentalLastSettlement(id string) (RentalLastSettlement, bool, *exit.Error) {
+	var out RentalLastSettlement
+	var closedAt string
+	err := s.db.QueryRow(`SELECT r.id,r.kind,COALESCE(MAX(a.closed_at),'')
+		FROM requests r
+		LEFT JOIN attempts a ON a.request_id=r.id AND a.state IN ('terminal','closed')
+		WHERE r.worker=? AND r.rental=1
+		  AND r.state IN ('succeeded','failed','canceled','refused','abandoned')
+		GROUP BY r.id,r.kind,r.created_at
+		ORDER BY COALESCE(NULLIF(MAX(a.closed_at),''),r.created_at) DESC,r.id DESC LIMIT 1`, id).
+		Scan(&out.RequestID, &out.Kind, &closedAt)
+	if errors.Is(err, sql.ErrNoRows) {
+		return RentalLastSettlement{}, false, nil
+	}
+	if err != nil {
+		return RentalLastSettlement{}, false, exit.Internalf(
+			"cannot read the last settled request for rental %s: %s", id, err)
+	}
+	if closedAt != "" {
+		parsed, err := time.Parse(time.RFC3339Nano, closedAt)
+		if err != nil {
+			return RentalLastSettlement{}, false, exit.Internalf(
+				"rental %s has an invalid terminal timestamp: %s", id, err)
+		}
+		out.ClosedAt = parsed
+	}
+	return out, true, nil
 }
 
 // ForgetRental removes the row once the hub reports the pod gone and closes whatever
