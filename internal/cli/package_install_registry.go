@@ -249,6 +249,11 @@ type publishedDefaultBinding struct {
 func downloadPublishedPackageModels(ctx context.Context, cli *Context, root, runtimeBin string,
 	published *install.PublishedSource,
 ) *exit.Error {
+	if err := raiseOpenFileLimit(); err != nil {
+		return exit.Named(exit.Structural, "open_file_limit_unavailable",
+			"cannot raise the open-file limit for model leases: %s", err).
+			WithRemedy("allow Cozy to raise RLIMIT_NOFILE to this account's hard limit")
+	}
 	bindings, problem := publishedDefaultBindings(ctx, cli.Cfg, root, runtimeBin,
 		published.PackageConfig, published.Selection.PackageDescriptor)
 	if problem != nil || len(bindings) == 0 {
