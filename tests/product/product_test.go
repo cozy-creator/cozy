@@ -377,7 +377,7 @@ func TestPackagePublishBuildsBoundedLocalDependencyClosure(t *testing.T) {
 	c := filepath.Join(projects, "local-c")
 	platformCandidate := filepath.Join(projects, "platform-candidate")
 	writePublishProject(t, a, "local-a", "1.0.0",
-		[]string{"local-b>=2,<3", "local-b[images]>=2,<3", "cozy-runtime>=0.0.3"},
+		[]string{"local-b>=2,<3", "local-b[images]>=2,<3", "cozy-runtime>=0.0.3", "msgspec>=0.19"},
 		"local-b = [{ workspace = true, marker = \"sys_platform == 'linux'\" }, { index = \"pypi\", marker = \"sys_platform != 'linux'\" }]\ncozy-runtime = { workspace = true, editable = true }\n", true)
 	writePublishProject(t, b, "local-b", "2.1.0", nil,
 		"local-c = { path = \"../local-c\", editable = true }\nabsent-local = { path = \"../absent-local\" }\n", false)
@@ -394,9 +394,10 @@ func TestPackagePublishBuildsBoundedLocalDependencyClosure(t *testing.T) {
 		fatal(t, problem)
 		wheels[identity.Distribution] = identity.Version
 	}
-	if len(pack.DependencyWheels) != 3 || wheels["local-b"] != "2.1.0" ||
-		wheels["local-c"] != "3.0.0" || wheels["cozy-runtime"] != "0.0.3" { //cozy:allow distribution assertion, not executable access
-		t.Fatalf("local dependency closure did not include the requested extra and base-name candidate: %+v", pack.DependencyWheels)
+	if len(pack.DependencyWheels) != 2 || wheels["local-b"] != "2.1.0" ||
+		wheels["local-c"] != "3.0.0" || wheels["cozy-runtime"] != "" || //cozy:allow distribution assertion, not executable access
+		wheels["msgspec"] != "" { //cozy:allow distribution assertion, not executable access
+		t.Fatalf("local dependency closure did not include only the requested local wheels: %+v", pack.DependencyWheels)
 	}
 	for _, dependency := range pack.DependencyWheels {
 		if !strings.HasSuffix(dependency.Filename, ".whl") {
@@ -407,11 +408,10 @@ func TestPackagePublishBuildsBoundedLocalDependencyClosure(t *testing.T) {
 		}
 	}
 
-	// Creator does not guess base ownership. It uploads Runtime as candidate
-	// custody; Tensorhub's exact profile inventory must select the base copy and
-	// omit this wheel from the eventual overlay.
-	if wheels["cozy-runtime"] != "0.0.3" { //cozy:allow distribution assertion, not executable access
-		t.Fatalf("local Runtime candidate was silently discarded: %+v", pack.DependencyWheels)
+	// The closed shared-base contract omits the local source candidate. Runtime
+	// validates the requirement against the actual base before installation.
+	if wheels["cozy-runtime"] != "" { //cozy:allow distribution assertion, not executable access
+		t.Fatalf("platform-owned Runtime candidate entered the overlay: %+v", pack.DependencyWheels)
 	}
 
 	writePublishProject(t, a, "local-a", "1.0.0", []string{"local-b>=3"},
@@ -497,6 +497,118 @@ func TestPackagePublishBuildsBoundedLocalDependencyClosure(t *testing.T) {
 		}
 		t.Fatalf("VCS dependency source did not refuse: %v", problem)
 	}
+}
+
+func TestPackagePublishDownloadsLockedRegistryDependency(t *testing.T) {
+	project := copyRegistryDependencyFixture(t)
+	pack, problem := preparePublishPackage(project)
+	fatal(t, problem)
+	defer pack.Close()
+	if len(pack.DependencyWheels) != 1 {
+		t.Fatalf("registry dependency wheel count = %d, want 1", len(pack.DependencyWheels))
+	}
+	dependency, problem := wheel.InspectIdentity(pack.DependencyWheels[0].Path)
+	fatal(t, problem)
+	if dependency.Distribution != "humanize" || dependency.Version != "4.13.0" ||
+		!strings.HasSuffix(dependency.Filename, "-py3-none-any.whl") {
+		t.Fatalf("registry dependency identity = %+v", dependency)
+	}
+
+	venv := filepath.Join(t.TempDir(), "venv")
+	python, err := exec.LookPath("python3")
+	must(t, err)
+	command := exec.Command("uv", "venv", "--no-project", "--python", python, venv)
+	if output, err := command.CombinedOutput(); err != nil {
+		t.Fatalf("create offline-install proof venv: %v\n%s", err, output)
+	}
+	venvPython := filepath.Join(venv, "bin", "python")
+	command = exec.Command("uv", "pip", "install", "--python", venvPython, "--offline", "--no-index",
+		"--no-deps", pack.Wheel, pack.DependencyWheels[0].Path)
+	if output, err := command.CombinedOutput(); err != nil {
+		t.Fatalf("offline exact-wheel install: %v\n%s", err, output)
+	}
+	command = exec.Command(venvPython, "-I", "-c",
+		"from registry_dependency_proof import marco; assert marco('marco') == 'polo'")
+	if output, err := command.CombinedOutput(); err != nil {
+		t.Fatalf("offline-installed package callable: %v\n%s", err, output)
+	}
+}
+
+func TestPackagePublishRefusesUnsupportedRegistryDependencyLocks(t *testing.T) {
+	cases := []struct {
+		name, old, replacement, code string
+	}{
+		{
+			name:        "changed hash",
+			old:         "b810820b31891813b1673e8fec7f1ed3312061eab2f26e3fa192c393d11ed25f",
+			replacement: "a810820b31891813b1673e8fec7f1ed3312061eab2f26e3fa192c393d11ed25f",
+			code:        "registry_dependency_identity_mismatch",
+		},
+		{
+			name:        "foreign origin",
+			old:         "https://files.pythonhosted.org/packages/1e/c7/316e7ca04d26695ef0635dc81683d628350810eb8e9b2299fc08ba49f366/",
+			replacement: "https://packages.example.invalid/",
+			code:        "registry_dependency_origin_refused",
+		},
+		{
+			name: "alternate index", old: `registry = "https://pypi.org/simple"`,
+			replacement: `registry = "https://packages.example.invalid/simple"`,
+			code:        "registry_dependency_index_refused",
+		},
+		{
+			name: "native only", old: "humanize-4.13.0-py3-none-any.whl",
+			replacement: "humanize-4.13.0-cp312-cp312-manylinux_2_28_x86_64.whl",
+			code:        "registry_dependency_native_only",
+		},
+		{
+			name:        "source only",
+			old:         "wheels = [\n    { url = \"https://files.pythonhosted.org/packages/1e/c7/316e7ca04d26695ef0635dc81683d628350810eb8e9b2299fc08ba49f366/humanize-4.13.0-py3-none-any.whl\", hash = \"sha256:b810820b31891813b1673e8fec7f1ed3312061eab2f26e3fa192c393d11ed25f\", size = 128869, upload-time = \"2025-08-25T09:39:18.54Z\" },\n]\n",
+			replacement: "", code: "registry_dependency_source_only",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			project := copyRegistryDependencyFixture(t)
+			mutateFixtureFile(t, filepath.Join(project, "uv.lock"), tc.old, tc.replacement)
+			pack, problem := preparePublishPackage(project)
+			if pack != nil {
+				pack.Close()
+			}
+			if problem == nil || problem.Name != tc.code {
+				t.Fatalf("registry dependency refusal = %v, want %s", problem, tc.code)
+			}
+		})
+	}
+
+	t.Run("lock drift", func(t *testing.T) {
+		project := copyRegistryDependencyFixture(t)
+		mutateFixtureFile(t, filepath.Join(project, "pyproject.toml"),
+			"humanize==4.13.0", "humanize==4.12.0")
+		pack, problem := preparePublishPackage(project)
+		if pack != nil {
+			pack.Close()
+		}
+		if problem == nil || problem.Name != "registry_dependency_lock_drift" {
+			t.Fatalf("lock drift refusal = %v", problem)
+		}
+	})
+}
+
+func copyRegistryDependencyFixture(t *testing.T) string {
+	t.Helper()
+	target := t.TempDir()
+	must(t, os.CopyFS(target, os.DirFS(filepath.Join("testdata", "registry-dependency"))))
+	return target
+}
+
+func mutateFixtureFile(t *testing.T, path, old, replacement string) {
+	t.Helper()
+	raw, err := os.ReadFile(path)
+	must(t, err)
+	if strings.Count(string(raw), old) != 1 {
+		t.Fatalf("fixture mutation target occurs %d times in %s", strings.Count(string(raw), old), path)
+	}
+	must(t, os.WriteFile(path, []byte(strings.Replace(string(raw), old, replacement, 1)), 0o644))
 }
 
 func preparePublishPackage(root string) (*packagepublish.Package, *exit.Error) {
