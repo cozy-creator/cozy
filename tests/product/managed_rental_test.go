@@ -1,15 +1,27 @@
 package producttest
 
 import (
+	"bytes"
+	"crypto/sha256"
+	"encoding/json"
+	"fmt"
+	"net/http"
+	"net/http/httptest"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
 	"time"
 
+	"github.com/cozy-creator/cozy/internal/canonical"
 	"github.com/cozy-creator/cozy/internal/exit"
+	"github.com/cozy-creator/cozy/internal/media"
+	"github.com/cozy-creator/cozy/internal/mediawire"
 	"github.com/cozy-creator/cozy/internal/orchestrator"
 	"github.com/cozy-creator/cozy/internal/records"
+	"github.com/cozy-creator/cozy/internal/secret"
+	pb "github.com/cozy-creator/cozy/protocol/cozy/worker/v1"
 )
 
 func TestRentalLastSettlementDistinguishesWarmServingFromJobs(t *testing.T) {
@@ -111,7 +123,7 @@ func TestRentalRequestRequiresTheExplicitAcquisitionSeam(t *testing.T) {
 	}
 }
 
-func TestReadyManagedRentalDispatchesWithoutAnotherWorkerReport(t *testing.T) {
+func TestReadyManagedRentalDispatchesAgainAfterOutcomeAck(t *testing.T) {
 	name := "managed-rental-warm-wake"
 	root := filepath.Join(os.TempDir(), "cozy-product-test", name)
 	spec := fakeSpec("warm@pr-warm", "0", "--arm", "output", "--cozy-home", root)
@@ -133,20 +145,154 @@ func TestReadyManagedRentalDispatchesWithoutAnotherWorkerReport(t *testing.T) {
 	fatal(t, problem)
 	fatal(t, owner.c.EnsurePlacementReady(instance, planIDOf(t, spec)))
 
-	request := submission(planIDOf(t, spec), "fake/warm", "warm-rental-reuse", map[string]any{"message": "marco"})
-	request.Rental = true
-	id, attempt, problem := owner.c.Submit(request)
-	fatal(t, problem)
-	if attempt != 0 {
-		t.Fatalf("unassigned rental request dispatched attempt %d before assignment", attempt)
+	for run := 1; run <= 2; run++ {
+		request := submission(planIDOf(t, spec), "fake/warm",
+			fmt.Sprintf("warm-rental-reuse-%d", run), map[string]any{"message": "marco"})
+		request.Rental = true
+		id, attempt, problem := owner.c.Submit(request)
+		fatal(t, problem)
+		if attempt != 0 {
+			t.Fatalf("run %d: unassigned rental request dispatched attempt %d before assignment", run, attempt)
+		}
+		result, problem := owner.c.AwaitSettled(id, 5*time.Second)
+		if problem != nil || result.Status != "SUCCEEDED" || result.Attempt != 1 {
+			t.Fatalf("run %d: warm rental did not dispatch after the prior outcome ack: result=%+v problem=%v",
+				run, result, problem)
+		}
+		row, problem := owner.store.RequestRow(id)
+		if problem != nil || row == nil || row.Worker != "pr-warm" {
+			t.Fatalf("run %d: warm rental assignment = %+v problem=%v", run, row, problem)
+		}
 	}
-	result, problem := owner.c.AwaitSettled(id, 5*time.Second)
-	if problem != nil || result.Status != "SUCCEEDED" || result.Attempt != 1 {
-		t.Fatalf("warm rental did not dispatch without another report: result=%+v problem=%v", result, problem)
+}
+
+func TestDynamicRemotePackageDispatchesAgainAfterOutcomeAck(t *testing.T) {
+	spell := func(label string) string {
+		digest := sha256.Sum256([]byte(label))
+		value, _ := canonical.Spell(digest[:])
+		return value
 	}
-	row, problem := owner.store.RequestRow(id)
-	if problem != nil || row == nil || row.Worker != "pr-warm" {
-		t.Fatalf("warm rental assignment = %+v problem=%v", row, problem)
+	planID, releaseDigest := spell("dynamic plan"), spell("dynamic release")
+	environmentDigest, configDigest := spell("dynamic environment"), spell("dynamic config")
+	workerRoot := t.TempDir()
+	workerLogPath := filepath.Join(workerRoot, "worker.log")
+	workerLog, err := os.Create(workerLogPath)
+	must(t, err)
+	worker := exec.Command(fakeWorkerBin,
+		"--socket", "127.0.0.1:0", "--out", workerRoot,
+		"--arm", "dynamic-output", "--session", "boot-dynamic",
+		"--dynamic-plan", planID, "--dynamic-release", releaseDigest,
+		"--dynamic-environment", environmentDigest, "--dynamic-config", configDigest)
+	worker.Stdout, worker.Stderr = workerLog, workerLog
+	must(t, worker.Start())
+	t.Cleanup(func() {
+		if worker.Process != nil {
+			_ = worker.Process.Kill()
+		}
+		_ = worker.Wait()
+		_ = workerLog.Close()
+	})
+	readWorkerLog := func() string {
+		_ = workerLog.Sync()
+		data, _ := os.ReadFile(workerLogPath)
+		return string(data)
+	}
+	addrPath := filepath.Join(workerRoot, "control.addr")
+	var controlAddr string
+	for deadline := time.Now().Add(5 * time.Second); time.Now().Before(deadline); {
+		if raw, err := os.ReadFile(addrPath); err == nil {
+			controlAddr = strings.TrimSpace(string(raw))
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if controlAddr == "" {
+		t.Fatalf("dynamic worker did not publish its address:\n%s", readWorkerLog())
+	}
+	revision := mediawire.ContractRev
+	mediaServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch {
+		case r.Method == http.MethodGet && r.URL.Path == "/v1/health":
+			_ = json.NewEncoder(w).Encode(mediawire.Health{Service: mediawire.Service, ContractRev: &revision})
+		case r.Method == http.MethodPut && strings.HasPrefix(r.URL.Path, "/v1/inputs/"):
+			_ = json.NewEncoder(w).Encode(map[string]any{"path": "/tmp/dynamic-payload"})
+		case r.Method == http.MethodPost && strings.HasPrefix(r.URL.Path, "/v1/outputs/"):
+			_ = json.NewEncoder(w).Encode(map[string]any{"dir": "/tmp/dynamic-outputs"})
+		case r.Method == http.MethodDelete && strings.HasPrefix(r.URL.Path, "/v1/attempts/"):
+			_ = json.NewEncoder(w).Encode(map[string]any{})
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer mediaServer.Close()
+	mediaAddr := strings.TrimPrefix(mediaServer.URL, "http://")
+	connection := &orchestrator.WorkerConnection{
+		RentalID: "pr-dynamic", Addr: controlAddr, WorkerID: "local",
+		WorkerBootID: "boot-dynamic", Media: &media.Spec{
+			Addr: mediaAddr, Token: secret.New("dynamic-media-token"),
+		},
+	}
+	var owner *owner
+	owner = hostOwnerConfigured(t, "dynamic-managed-rental-warm-wake", nil,
+		func(options *orchestrator.Options) {
+			options.Rentals = func(id string) (*orchestrator.RemoteTarget, *exit.Error) {
+				if id != connection.RentalID {
+					return nil, exit.New(exit.NotFound, "no rental %s", id)
+				}
+				return &orchestrator.RemoteTarget{Connection: connection}, nil
+			}
+			options.ObserveRental = func(orchestrator.RentalObservation) *exit.Error { return nil }
+			options.RentalClaimProof = func(*orchestrator.WorkerConnection, uint64) ([]byte, *exit.Error) {
+				return []byte("dynamic-claim"), nil
+			}
+			options.RentalPackageSet = func(_ *orchestrator.WorkerConnection,
+				packages []*pb.DownloadPackageRef, models []*pb.DownloadModelRef,
+			) ([]byte, []byte, *exit.Error) {
+				delegation := &pb.DownloadDelegation{
+					ExpiresAtUnix: uint64(time.Now().Add(time.Hour).Unix()), RentalId: connection.RentalID,
+					WorkerId: connection.WorkerID, WorkerBootId: connection.WorkerBootID,
+					Packages: packages, Models: models,
+				}
+				data, _, err := canonical.Identity(delegation)
+				if err != nil {
+					return nil, nil, exit.Internalf("cannot mint test delegation: %s", err)
+				}
+				return data, bytes.Repeat([]byte{1}, 64), nil
+			}
+			options.RentalFleet = func() (string, *exit.Error) { return "rentals: dynamic", nil }
+			options.AcquireManagedRental = func(req records.Request) (string, string, *exit.Error) {
+				assigned, problem := owner.store.AssignManagedRental(req.ID, connection.RentalID)
+				if problem != nil || !assigned {
+					return "", "", problem
+				}
+				return connection.RentalID, "rentals: reused dynamic machine", nil
+			}
+		})
+
+	for run := 1; run <= 2; run++ {
+		request := orchestrator.Submission{
+			IdemKey: fmt.Sprintf("dynamic-rental-reuse-%d", run),
+			Package: "paul/marco-polo", Entrypoint: "marco", PlanID: planID,
+			Release: "1.0.4", ReleaseDigest: releaseDigest,
+			Payload: []byte(`{"message":"marco"}`), Rental: true,
+		}
+		id, attempt, problem := owner.c.Submit(request)
+		fatal(t, problem)
+		if attempt != 0 {
+			t.Fatalf("run %d: unassigned dynamic rental dispatched attempt %d", run, attempt)
+		}
+		result, problem := owner.c.AwaitSettled(id, 5*time.Second)
+		if problem != nil || result.Status != "SUCCEEDED" || result.Attempt != 1 {
+			t.Fatalf("run %d: dynamic rental did not return its warm seat: result=%+v problem=%v\nworker:\n%s",
+				run, result, problem, readWorkerLog())
+		}
+		row, problem := owner.store.RequestRow(id)
+		if problem != nil || row == nil || row.Worker != connection.RentalID ||
+			row.EnvironmentDigest != environmentDigest || row.ConfigDigest != configDigest {
+			t.Fatalf("run %d: worker-derived invocation identity was not bound: row=%+v problem=%v",
+				run, row, problem)
+		}
 	}
 }
 
