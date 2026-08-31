@@ -21,12 +21,14 @@ import (
 	"github.com/pelletier/go-toml/v2"
 )
 
-// A rental cannot replace these image-owned platform families. Ordinary libraries are
-// package-owned even when one image happens to carry a copy; Runtime compares this small
-// declared family against the actual selected base before any remote installation.
+// A rental cannot replace these image-owned platform families and their small declared native
+// closure. Other libraries stay package-owned even when one image happens to carry a copy;
+// Runtime compares these requirements against the actual selected base before installation.
 var remoteBaseRoots = map[string]bool{
 	"cozy-runtime": true, //cozy:allow base distribution identity, not executable access
 	"msgspec":      true,
+	"numpy":        true,
+	"pillow":       true,
 	"tensorfs":     true,
 	"torch":        true,
 	"torchaudio":   true,

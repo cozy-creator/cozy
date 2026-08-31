@@ -6,7 +6,13 @@ build-backend = "uv_build"
 name = "registry-dependency-proof"
 version = "1.0.0"
 requires-python = ">=3.12"
-dependencies = ["cozy-runtime==0.0.11", "humanize==4.13.0"]
+dependencies = [
+    "cozy-runtime==0.0.11",
+    "humanize==4.13.0",
+    "numpy==2.5.2",
+    "pillow==12.3.0",
+    "torch>=2.13,<3",
+]
 
 [tool.uv.build-backend]
 module-root = ""

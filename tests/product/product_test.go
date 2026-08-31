@@ -1,6 +1,7 @@
 package producttest
 
 import (
+	"archive/zip"
 	"bytes"
 	"context"
 	"encoding/json"
@@ -582,6 +583,14 @@ func TestPackagePublishDownloadsLockedRegistryDependency(t *testing.T) {
 		!strings.HasSuffix(dependency.Filename, "-py3-none-any.whl") {
 		t.Fatalf("registry dependency identity = %+v", dependency)
 	}
+	metadata := projectWheelMetadata(t, pack.Wheel)
+	for _, requirement := range []string{
+		"Requires-Dist: numpy==2.5.2", "Requires-Dist: pillow==12.3.0", "Requires-Dist: torch>=2.13,<3",
+	} {
+		if !strings.Contains(metadata, requirement) {
+			t.Fatalf("project wheel lost base compatibility requirement %q:\n%s", requirement, metadata)
+		}
+	}
 
 	venv := filepath.Join(t.TempDir(), "venv")
 	python, err := exec.LookPath("python3")
@@ -603,6 +612,26 @@ func TestPackagePublishDownloadsLockedRegistryDependency(t *testing.T) {
 	}
 }
 
+func projectWheelMetadata(t *testing.T, path string) string {
+	t.Helper()
+	archive, err := zip.OpenReader(path)
+	must(t, err)
+	defer archive.Close()
+	for _, member := range archive.File {
+		if !strings.HasSuffix(member.Name, ".dist-info/METADATA") {
+			continue
+		}
+		file, err := member.Open()
+		must(t, err)
+		raw, err := io.ReadAll(file)
+		must(t, err)
+		must(t, file.Close())
+		return string(raw)
+	}
+	t.Fatal("project wheel has no METADATA")
+	return ""
+}
+
 func TestPackagePublishRefusesUnsupportedRegistryDependencyLocks(t *testing.T) {
 	cases := []struct {
 		name, old, replacement, code string
@@ -620,9 +649,11 @@ func TestPackagePublishRefusesUnsupportedRegistryDependencyLocks(t *testing.T) {
 			code:        "registry_dependency_origin_refused",
 		},
 		{
-			name: "alternate index", old: `registry = "https://pypi.org/simple"`,
-			replacement: `registry = "https://packages.example.invalid/simple"`,
-			code:        "registry_dependency_index_refused",
+			name: "alternate index",
+			old:  "name = \"humanize\"\nversion = \"4.13.0\"\nsource = { registry = \"https://pypi.org/simple\" }",
+			replacement: "name = \"humanize\"\nversion = \"4.13.0\"\n" +
+				"source = { registry = \"https://packages.example.invalid/simple\" }",
+			code: "registry_dependency_index_refused",
 		},
 		{
 			name: "native only", old: "humanize-4.13.0-py3-none-any.whl",
