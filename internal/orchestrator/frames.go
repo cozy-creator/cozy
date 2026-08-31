@@ -92,24 +92,7 @@ func (c *Orchestrator) converge(s *session, w *worker, placements []DesiredPlace
 			return exit.Internalf("cannot mint the empty PlacementSet for %s: %s", w.instanceID, err)
 		}
 	}
-	rev := uint64(0)
-	if w.spec.Connection != nil {
-		if len(placements) != 1 || placements[0].PlacementRevision == 0 {
-			return exit.Named(exit.Structural, "remote_placement_revision_missing",
-				"attached worker %s has no Tensorhub placement revision", w.instanceID)
-		}
-		rev = placements[0].PlacementRevision
-		c.mu.Lock()
-		prior := w.revision
-		c.mu.Unlock()
-		if prior > rev {
-			return exit.Named(exit.Conflict, "remote_placement_revision_regressed",
-				"attached worker %s already holds desired revision %d, not older Tensorhub revision %d",
-				w.instanceID, prior, rev)
-		}
-	} else {
-		rev = c.nextRevision()
-	}
+	rev := c.nextRevision()
 	c.mu.Lock()
 	w.revision, w.setDigest, w.setBytes = rev, digest, setBytes
 	w.desiredRefusal = nil
@@ -143,7 +126,7 @@ func (c *Orchestrator) converge(s *session, w *worker, placements []DesiredPlace
 // worker's own last word, and the two facts the frozen wire could not tell apart —
 // "your message arrived" and "your intent is satisfied" — are now two separate readable
 // numbers (#473).
-func (c *Orchestrator) onObserved(s *session, r *pb.ObservedWorkerState, frameBytes []byte) {
+func (c *Orchestrator) onObserved(s *session, r *pb.ObservedWorkerState) {
 	var status *pb.PlacementStatus
 	var acquisition *records.PlacementAcquisition
 	var desiredRevision uint64
@@ -268,9 +251,6 @@ func (c *Orchestrator) onObserved(s *session, r *pb.ObservedWorkerState, frameBy
 		if problem := c.opt.Store.ObservePlacementAcquisition(*acquisition); problem != nil {
 			c.logf("placement acquisition observation REFUSED: %s", problem.Message)
 		}
-	}
-	if w != nil && w.spec.Connection != nil {
-		c.queueRentalSessionEvidence(s, desiredRevision, frameBytes)
 	}
 	if w != nil && w.media != nil {
 		go c.retryMediaCleanup(w)

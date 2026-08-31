@@ -112,7 +112,6 @@ func serveDaemon(ctx *Context) *exit.Error {
 		Packages: resolver, Rentals: rentals, ObserveRental: rental.ObserveWorker(st),
 		RecordRentalRefusal: rental.RecordControlRefusal(st),
 		RentalClaimProof:    rental.ClaimProof(l),
-		RelayRentalSession:  rental.RelayWorkerSession(st, client(ctx)),
 		ConfigDigest:        configDigest,
 	})
 	if e != nil {

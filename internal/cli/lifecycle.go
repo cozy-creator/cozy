@@ -224,7 +224,7 @@ func resolveRentalOperation(ctx *Context, key string) (string, *exit.Error) {
 		return "", problem
 	}
 	if problem := store.RecordRental(records.Rental{
-		ID: seen.ID, PackageRef: request.PackageRef, AcceleratorModel: seen.AcceleratorModel,
+		ID: seen.ID, SKU: request.SKU, AcceleratorModel: seen.AcceleratorModel,
 		State: seen.State, Hub: operation.Hub,
 	}); problem != nil {
 		return "", problem

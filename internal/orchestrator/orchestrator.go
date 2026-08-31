@@ -20,7 +20,6 @@
 package orchestrator
 
 import (
-	"context"
 	"fmt"
 	"io"
 	"sort"
@@ -63,12 +62,6 @@ type Options struct {
 	RecordRentalRefusal func(rentalID string, problem *exit.Error) *exit.Error
 	// RentalClaimProof signs the exact worker/boot/TLS leaf Creator is about to claim.
 	RentalClaimProof RentalClaimProofSource
-	// RelayRentalSession returns authenticated private-worker evidence to Tensorhub.
-	// This RecordOwner remains the only process that dials WorkerControl: the callback
-	// carries deterministic frame bytes over the rental-scoped HTTP authority and never
-	// grants Tensorhub a worker credential or a competing control stream.
-	RelayRentalSession RentalSessionRelay
-
 	// ConfigDigest is the local evaluated-config identity. Environment identity
 	// comes only from the exact selected PlacementSet.
 	ConfigDigest string
@@ -76,15 +69,6 @@ type Options struct {
 }
 
 type RentalClaimProofSource func(*WorkerConnection, uint64) ([]byte, *exit.Error)
-type RentalSessionEvidence struct {
-	ClaimAck        []byte
-	Snapshot        []byte
-	ObservedState   []byte
-	BootFailure     []byte
-	DesiredRevision uint64
-}
-
-type RentalSessionRelay func(context.Context, *WorkerConnection, RentalSessionEvidence) *exit.Error
 
 type RentalObservation struct {
 	RentalID               string

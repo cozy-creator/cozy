@@ -10,18 +10,14 @@ package rental
 
 import (
 	"bytes"
-	"context"
 	"errors"
 	"os"
 	"path/filepath"
 	"runtime"
-	"strings"
 
-	"github.com/cozy-creator/cozy/internal/canonical"
 	"github.com/cozy-creator/cozy/internal/exit"
 	"github.com/cozy-creator/cozy/internal/home"
 	"github.com/cozy-creator/cozy/internal/hub"
-	"github.com/cozy-creator/cozy/internal/launch"
 	"github.com/cozy-creator/cozy/internal/media"
 	"github.com/cozy-creator/cozy/internal/orchestrator"
 	"github.com/cozy-creator/cozy/internal/records"
@@ -45,10 +41,6 @@ func validID(id string) *exit.Error {
 func Attach(l home.Layout, st *records.Store, row records.Rental, cert string, token secret.Value,
 	creator CreatorIdentity) *exit.Error {
 	if e := validID(row.ID); e != nil {
-		return e
-	}
-	// Validate the exact selection BEFORE files or a dialable rental row become visible.
-	if _, e := selectedPlacement(row); e != nil {
 		return e
 	}
 	stored, e := st.RentalRow(row.ID)
@@ -218,17 +210,9 @@ func Known(st *records.Store) func(string) (*orchestrator.DesiredPlacement, *exi
 			return nil, unknown(id)
 		}
 		if row.State != hub.RentalReady {
-			refusal, problem := st.RentalRelayRefusal(id)
-			if problem != nil {
-				return nil, problem
-			}
-			if refusal != nil {
-				return nil, refusal.Error()
-			}
-			return nil, exit.Named(exit.Unavailable, "rental.convergence_pending",
-				"rental %s is %s; Tensorhub has not accepted its relayed worker convergence evidence",
-				id, row.State).
-				WithRemedy("keep `cozy run list` running so this host's RecordOwner can claim and converge the private worker")
+			return nil, exit.Named(exit.Unavailable, "rental.not_ready",
+				"rental %s is %s; Tensorhub has not published an attachable worker", id, row.State).
+				WithRemedy("`cozy rental` shows its provider lifecycle")
 		}
 		if row.Address == "" {
 			return nil, noAddress(id, row.State)
@@ -237,28 +221,8 @@ func Known(st *records.Store) func(string) (*orchestrator.DesiredPlacement, *exi
 			return nil, exit.Unavailablef("rental %s has exact control but its WorkerTarget is not attached yet", id).
 				WithRemedy("wait for `cozy rental new` to validate and atomically publish the target")
 		}
-		placement, e := selectedPlacement(*row)
-		if e != nil {
-			return nil, e
-		}
-		return &placement, nil
+		return &orchestrator.DesiredPlacement{}, nil
 	}
-}
-
-// PackageDescriptor returns the exact remote descriptor already frozen into one
-// rental. It is the CLI payload surface for --machine; no local install is read.
-func PackageDescriptor(st *records.Store, id string) (*launch.PackageDescriptor, *exit.Error) {
-	row, e := st.RentalRow(id)
-	if e != nil {
-		return nil, e
-	}
-	if row == nil {
-		return nil, unknown(id)
-	}
-	if row.CertPath == "" {
-		return nil, exit.Unavailablef("rental %s has not published its WorkerTarget", id)
-	}
-	return launch.DecodeDescriptor(row.PackageDescriptorBytes)
 }
 
 func unknown(id string) *exit.Error {
@@ -294,11 +258,6 @@ func Resolver(l home.Layout, st *records.Store) func(string) (*orchestrator.Remo
 			return nil, exit.Unavailablef("rental %s is not attached on this host", id).
 				WithRemedy("resume the original rental operation so control, certificate, and token publish together")
 		}
-		placement, e := selectedPlacement(*row)
-		if e != nil {
-			return nil, e
-		}
-		placement.PlacementRevision = row.PlacementRevision
 		token, e := MediaToken(l, id)
 		if e != nil {
 			return nil, e
@@ -329,58 +288,14 @@ func Resolver(l home.Layout, st *records.Store) func(string) (*orchestrator.Remo
 			// as a launch grant from whoever provisioned it.
 			spec.Media = &media.Spec{Addr: row.MediaAddress, Token: token, CACert: cert}
 		}
-		return &orchestrator.RemoteTarget{Connection: spec, Placement: placement}, nil
-	}
-}
-
-// RelayWorkerSession is the private-rental observation seam. The ordinary authenticated
-// Hub client carries account authority; the media bearer opens only the pod media plane.
-func RelayWorkerSession(st *records.Store, client *hub.Client) orchestrator.RentalSessionRelay {
-	return func(ctx context.Context, connection *orchestrator.WorkerConnection,
-		evidence orchestrator.RentalSessionEvidence) *exit.Error {
-		if connection == nil || connection.RentalID == "" {
-			return exit.Named(exit.Credential, "rental.worker_observation_authority_missing",
-				"the connected worker has no rental identity")
-		}
-		row, problem := st.RentalRow(connection.RentalID)
-		if problem != nil {
-			return problem
-		}
-		if row == nil {
-			return unknown(connection.RentalID)
-		}
-		if row.Hub != client.Base() {
-			return exit.Named(exit.Conflict, "rental.hub_mismatch",
-				"rental %s belongs to %s, configured hub is %s",
-				row.ID, row.Hub, client.Base())
-		}
-		answer, problem := client.ObserveWorkerSession(
-			ctx, connection.RentalID, hub.WorkerSessionObservation{
-				ClaimAck: evidence.ClaimAck, Snapshot: evidence.Snapshot,
-				ObservedState: evidence.ObservedState, BootFailure: evidence.BootFailure,
-				DesiredRevision: evidence.DesiredRevision,
-			})
-		if problem != nil {
-			if problem.Code != exit.Unavailable && problem.Code != exit.Deadline {
-				if recordProblem := st.RecordRentalRelayRefusal(row.ID, problem); recordProblem != nil {
-					return recordProblem
-				}
-			}
-			return problem
-		}
-		row.State = answer.State
-		if problem := st.RecordRental(*row); problem != nil {
-			return problem
-		}
-		return st.ClearRentalRelayRefusal(row.ID)
+		return &orchestrator.RemoteTarget{Connection: spec}, nil
 	}
 }
 
 // RecordControlRefusal makes a private-worker Claim or owner-side identity refusal durable.
-// The convergence poll already reads this authority; no separate claim-refusal table exists.
 func RecordControlRefusal(st *records.Store) func(string, *exit.Error) *exit.Error {
 	return func(rentalID string, problem *exit.Error) *exit.Error {
-		return st.RecordRentalRelayRefusal(rentalID, problem)
+		return st.RecordRentalControlRefusal(rentalID, problem)
 	}
 }
 
@@ -394,50 +309,6 @@ func ObserveWorker(st *records.Store) func(orchestrator.RentalObservation) *exit
 			observed.DeviceMemoryTotalBytes, observed.WorkerInstance, observed.WorkerID,
 			observed.WorkerBootID, observed.DeviceCount)
 	}
-}
-
-func selectedPlacement(row records.Rental) (orchestrator.DesiredPlacement, *exit.Error) {
-	if row.PlacementSetDigest == "" || len(row.PlacementSetBytes) == 0 ||
-		row.PackageDescriptorDigest == "" || len(row.PackageDescriptorBytes) == 0 ||
-		row.QualificationDigest == "" || len(row.QualificationBytes) == 0 {
-		return orchestrator.DesiredPlacement{}, exit.Named(exit.Conflict, "rental.selection_missing",
-			"rental %s has no complete exact package selection", row.ID)
-	}
-	for name, exact := range map[string]struct {
-		digest string
-		data   []byte
-	}{
-		"package_descriptor": {row.PackageDescriptorDigest, row.PackageDescriptorBytes},
-		"qualification":      {row.QualificationDigest, row.QualificationBytes},
-	} {
-		want, err := canonical.Raw(exact.digest)
-		if err != nil || !bytes.Equal(canonical.Digest(exact.data), want) {
-			return orchestrator.DesiredPlacement{}, exit.Named(exit.Conflict,
-				"rental.selection_identity_mismatch", "rental %s %s bytes do not match %s",
-				row.ID, name, exact.digest)
-		}
-	}
-	descriptor, e := launch.DecodeDescriptor(row.PackageDescriptorBytes)
-	if e != nil {
-		return orchestrator.DesiredPlacement{}, e
-	}
-	outputs := map[string][]string{}
-	for _, entrypoint := range descriptor.Entrypoints {
-		outputs[entrypoint.Name] = launch.AssetPaths(entrypoint.Result)
-	}
-	parts := strings.Split(row.PackageRef, "/")
-	pkg := row.PackageRef
-	if len(parts) >= 2 {
-		pkg = parts[0] + "/" + parts[1]
-	}
-	return orchestrator.PlacementFromExact(pkg, "", row.PlacementSetDigest,
-		row.PlacementSetBytes, outputs)
-}
-
-// ValidateSelection refuses a Hub observation before its exact bytes become durable.
-func ValidateSelection(row records.Rental) *exit.Error {
-	_, e := selectedPlacement(row)
-	return e
 }
 
 func write0600(path string, body []byte) *exit.Error {

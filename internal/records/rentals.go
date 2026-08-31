@@ -1,7 +1,6 @@
 package records
 
 import (
-	"bytes"
 	"database/sql"
 	"encoding/json"
 	"errors"
@@ -39,7 +38,6 @@ CREATE TABLE IF NOT EXISTS rentals (
   id                TEXT PRIMARY KEY,
   machine_name      TEXT NOT NULL DEFAULT '',
   sku               TEXT NOT NULL DEFAULT '',
-  package_ref      TEXT NOT NULL,
   accelerator_model TEXT NOT NULL,
   address           TEXT NOT NULL,
   cert_path         TEXT NOT NULL,
@@ -47,23 +45,6 @@ CREATE TABLE IF NOT EXISTS rentals (
   hub               TEXT NOT NULL,
   rented_at         TEXT NOT NULL,
   media_address     TEXT NOT NULL DEFAULT '',
-	  placement_set_digest TEXT NOT NULL DEFAULT '',
-	  placement_set_bytes  BLOB NOT NULL DEFAULT x'',
-	  selection_profile TEXT NOT NULL DEFAULT '',
-	  package_descriptor_digest TEXT NOT NULL DEFAULT '',
-  package_descriptor_bytes BLOB NOT NULL DEFAULT x'',
-  qualification_digest TEXT NOT NULL DEFAULT '',
-  qualification_bytes BLOB NOT NULL DEFAULT x'',
-  placement_revision      INTEGER NOT NULL DEFAULT 0,
-  observed_accelerator       TEXT NOT NULL DEFAULT '',
-  observed_accelerator_count INTEGER NOT NULL DEFAULT 0,
-  observed_backend           TEXT NOT NULL DEFAULT '',
-  observed_driver_version    TEXT NOT NULL DEFAULT '',
-  observed_backend_version   TEXT NOT NULL DEFAULT '',
-  observed_device_memory_total_bytes INTEGER NOT NULL DEFAULT 0,
-  observed_worker_instance   TEXT NOT NULL DEFAULT '',
-  observed_worker_boot_id    TEXT NOT NULL DEFAULT '',
-  observed_at                TEXT NOT NULL DEFAULT '',
   expected_worker_id         TEXT NOT NULL DEFAULT '',
   expected_worker_boot_id    TEXT NOT NULL DEFAULT ''
 )`
@@ -71,7 +52,7 @@ CREATE TABLE IF NOT EXISTS rentals (
 var rentalSchema = []string{rentalOperationsDDL, rentalsDDL, `
 CREATE UNIQUE INDEX IF NOT EXISTS rental_operation_remote
   ON rental_operations(rental_id) WHERE rental_id <> ''`, `
-CREATE TABLE IF NOT EXISTS rental_relay_refusals (
+CREATE TABLE IF NOT EXISTS rental_control_refusals (
   rental_id   TEXT PRIMARY KEY REFERENCES rentals(id) ON DELETE CASCADE,
   exit_code   INTEGER NOT NULL,
   name        TEXT NOT NULL,
@@ -89,39 +70,10 @@ func migrateRentalSchema(db *sql.DB, path string) *exit.Error {
 	if err != nil {
 		return exit.Internalf("cannot inspect the rentals schema in %s: %s", path, err)
 	}
-	if !columns["package_ref"] {
-		return exit.Internalf("cannot migrate the rentals schema in %s: package_ref is absent", path)
-	}
-	for _, retired := range []string{"package_release_digest", "package_release_bytes"} {
-		if !columns[retired] {
-			continue
-		}
-		if _, err := db.Exec(`ALTER TABLE rentals DROP COLUMN ` + retired); err != nil {
-			return exit.Internalf("cannot remove retired rentals.%s from %s: %s", retired, path, err)
-		}
-		delete(columns, retired)
-	}
 	for _, column := range []struct {
 		name string
 		ddl  string
 	}{
-		{"placement_set_digest", `TEXT NOT NULL DEFAULT ''`},
-		{"placement_set_bytes", `BLOB NOT NULL DEFAULT x''`},
-		{"placement_revision", `INTEGER NOT NULL DEFAULT 0`},
-		{"selection_profile", `TEXT NOT NULL DEFAULT ''`},
-		{"package_descriptor_digest", `TEXT NOT NULL DEFAULT ''`},
-		{"package_descriptor_bytes", `BLOB NOT NULL DEFAULT x''`},
-		{"qualification_digest", `TEXT NOT NULL DEFAULT ''`},
-		{"qualification_bytes", `BLOB NOT NULL DEFAULT x''`},
-		{"observed_accelerator", `TEXT NOT NULL DEFAULT ''`},
-		{"observed_accelerator_count", `INTEGER NOT NULL DEFAULT 0`},
-		{"observed_backend", `TEXT NOT NULL DEFAULT ''`},
-		{"observed_driver_version", `TEXT NOT NULL DEFAULT ''`},
-		{"observed_backend_version", `TEXT NOT NULL DEFAULT ''`},
-		{"observed_device_memory_total_bytes", `INTEGER NOT NULL DEFAULT 0`},
-		{"observed_worker_instance", `TEXT NOT NULL DEFAULT ''`},
-		{"observed_worker_boot_id", `TEXT NOT NULL DEFAULT ''`},
-		{"observed_at", `TEXT NOT NULL DEFAULT ''`},
 		{"expected_worker_id", `TEXT NOT NULL DEFAULT ''`},
 		{"expected_worker_boot_id", `TEXT NOT NULL DEFAULT ''`},
 		{"machine_name", `TEXT NOT NULL DEFAULT ''`},
@@ -133,6 +85,43 @@ func migrateRentalSchema(db *sql.DB, path string) *exit.Error {
 		if _, err := db.Exec(`ALTER TABLE rentals ADD COLUMN ` + column.name + ` ` + column.ddl); err != nil {
 			return exit.Internalf("cannot add rentals.%s in %s: %s", column.name, path, err)
 		}
+	}
+	kept := []string{"id", "machine_name", "sku", "accelerator_model", "address", "cert_path",
+		"state", "hub", "rented_at", "media_address", "expected_worker_id", "expected_worker_boot_id"}
+	if len(columns) != len(kept) {
+		tx, err := db.Begin()
+		if err != nil {
+			return exit.Internalf("cannot begin rentals hardcut in %s: %s", path, err)
+		}
+		defer tx.Rollback()
+		if _, err := tx.Exec(`DROP TABLE IF EXISTS rental_relay_refusals`); err != nil {
+			return exit.Internalf("cannot drop retired rental relay state in %s: %s", path, err)
+		}
+		if _, err := tx.Exec(`DROP TABLE IF EXISTS rental_control_refusals`); err != nil {
+			return exit.Internalf("cannot rebuild rental control state in %s: %s", path, err)
+		}
+		if _, err := tx.Exec(strings.Replace(rentalsDDL, "rentals (", "rentals_next (", 1)); err != nil {
+			return exit.Internalf("cannot create slim rentals table in %s: %s", path, err)
+		}
+		list := strings.Join(kept, ",")
+		if _, err := tx.Exec(`INSERT INTO rentals_next(` + list + `) SELECT ` + list + ` FROM rentals`); err != nil {
+			return exit.Internalf("cannot preserve rentals while slimming %s: %s", path, err)
+		}
+		if _, err := tx.Exec(`DROP TABLE rentals`); err != nil {
+			return exit.Internalf("cannot replace old rentals table in %s: %s", path, err)
+		}
+		if _, err := tx.Exec(`ALTER TABLE rentals_next RENAME TO rentals`); err != nil {
+			return exit.Internalf("cannot publish slim rentals table in %s: %s", path, err)
+		}
+		if err := tx.Commit(); err != nil {
+			return exit.Internalf("cannot commit rentals hardcut in %s: %s", path, err)
+		}
+	}
+	if _, err := db.Exec(`DROP TABLE IF EXISTS rental_relay_refusals`); err != nil {
+		return exit.Internalf("cannot remove retired rental relay state in %s: %s", path, err)
+	}
+	if _, err := db.Exec(rentalSchema[len(rentalSchema)-1]); err != nil {
+		return exit.Internalf("cannot create rental control refusal state in %s: %s", path, err)
 	}
 	rows, err := db.Query(`SELECT id,machine_name FROM rentals`)
 	if err != nil {
@@ -362,7 +351,6 @@ type Rental struct {
 	ID               string
 	MachineName      string
 	SKU              string
-	PackageRef       string
 	AcceleratorModel string
 	Address          string
 	CertPath         string
@@ -372,47 +360,17 @@ type Rental struct {
 	// MediaAddress is where the pod's co-resident media server answers (cl-014). It is a
 	// FACT about the pod like the control address is, so it is a row and not a file; the
 	// credential it takes is the rental's media bearer, which stays 0600 beside it.
-	MediaAddress string
-	// PlacementSetBytes are Tensorhub's exact selected desired state. They remain
-	// raw bytes so a restart relays rather than re-renders execution meaning.
-	PlacementSetDigest      string
-	PlacementSetBytes       []byte
-	SelectionProfile        string
-	PackageDescriptorDigest string
-	PackageDescriptorBytes  []byte
-	QualificationDigest     string
-	QualificationBytes      []byte
-	PlacementRevision       uint64
-	// Observed* is the remote worker's ClaimAck readback. AcceleratorModel above is
-	// only the caller's requested SKU; these fields are absent until Cozy has
-	// actually claimed the rented worker without invoking a model.
-	ObservedAccelerator            string
-	ObservedAcceleratorCount       int
-	ObservedBackend                string
-	ObservedDriverVersion          string
-	ObservedBackendVersion         string
-	ObservedDeviceMemoryTotalBytes uint64
-	ObservedWorkerInstance         string
-	ObservedWorkerBootID           string
-	ObservedAt                     string
-	ExpectedWorkerID               string
-	ExpectedWorkerBootID           string
+	MediaAddress         string
+	ExpectedWorkerID     string
+	ExpectedWorkerBootID string
 }
 
-const rentalCols = `id,machine_name,sku,package_ref,accelerator_model,address,cert_path,state,hub,rented_at,media_address,placement_set_digest,placement_set_bytes,selection_profile,package_descriptor_digest,package_descriptor_bytes,qualification_digest,qualification_bytes,placement_revision,observed_accelerator,observed_accelerator_count,observed_backend,observed_driver_version,observed_backend_version,observed_device_memory_total_bytes,observed_worker_instance,observed_worker_boot_id,observed_at,expected_worker_id,expected_worker_boot_id`
+const rentalCols = `id,machine_name,sku,accelerator_model,address,cert_path,state,hub,rented_at,media_address,expected_worker_id,expected_worker_boot_id`
 
 func scanRental(row interface{ Scan(...any) error }) (Rental, error) {
 	var r Rental
-	err := row.Scan(&r.ID, &r.MachineName, &r.SKU, &r.PackageRef, &r.AcceleratorModel, &r.Address, &r.CertPath,
+	err := row.Scan(&r.ID, &r.MachineName, &r.SKU, &r.AcceleratorModel, &r.Address, &r.CertPath,
 		&r.State, &r.Hub, &r.RentedAt, &r.MediaAddress,
-		&r.PlacementSetDigest, &r.PlacementSetBytes,
-		&r.SelectionProfile,
-		&r.PackageDescriptorDigest, &r.PackageDescriptorBytes,
-		&r.QualificationDigest, &r.QualificationBytes,
-		&r.PlacementRevision,
-		&r.ObservedAccelerator, &r.ObservedAcceleratorCount, &r.ObservedBackend,
-		&r.ObservedDriverVersion, &r.ObservedBackendVersion, &r.ObservedDeviceMemoryTotalBytes,
-		&r.ObservedWorkerInstance, &r.ObservedWorkerBootID, &r.ObservedAt,
 		&r.ExpectedWorkerID, &r.ExpectedWorkerBootID)
 	return r, err
 }
@@ -471,15 +429,6 @@ func (s *Store) recordRental(r Rental) *exit.Error {
 	if r.RentedAt == "" {
 		r.RentedAt = now()
 	}
-	if r.PlacementSetBytes == nil {
-		r.PlacementSetBytes = []byte{}
-	}
-	if r.PackageDescriptorBytes == nil {
-		r.PackageDescriptorBytes = []byte{}
-	}
-	if r.QualificationBytes == nil {
-		r.QualificationBytes = []byte{}
-	}
 	tx, err := s.db.Begin()
 	if err != nil {
 		return exit.Internalf("cannot begin recording rental %s: %s", r.ID, err)
@@ -494,7 +443,7 @@ func (s *Store) recordRental(r Rental) *exit.Error {
 		r.State = rentalStateForward(current, r.State)
 	}
 	if _, err := tx.Exec(`INSERT INTO rentals(`+rentalCols+`)
-			VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+			VALUES(?,?,?,?,?,?,?,?,?,?,?,?)
 		ON CONFLICT(id) DO UPDATE SET
 		  machine_name=CASE WHEN rentals.machine_name<>'' THEN rentals.machine_name ELSE excluded.machine_name END,
 		  sku=CASE WHEN rentals.sku<>'' THEN rentals.sku ELSE excluded.sku END,
@@ -502,46 +451,12 @@ func (s *Store) recordRental(r Rental) *exit.Error {
 		  cert_path=CASE WHEN rentals.cert_path<>'' THEN rentals.cert_path ELSE excluded.cert_path END,
 		  state=excluded.state,
 		  media_address=CASE WHEN rentals.media_address<>'' THEN rentals.media_address ELSE excluded.media_address END,
-		  placement_set_digest=CASE WHEN length(rentals.placement_set_bytes)>0
-		    THEN rentals.placement_set_digest ELSE excluded.placement_set_digest END,
-		  placement_set_bytes=CASE WHEN length(rentals.placement_set_bytes)>0
-		    THEN rentals.placement_set_bytes ELSE excluded.placement_set_bytes END,
-		  selection_profile=CASE WHEN rentals.selection_profile<>'' THEN rentals.selection_profile ELSE excluded.selection_profile END,
-		  package_descriptor_digest=CASE WHEN length(rentals.package_descriptor_bytes)>0 THEN rentals.package_descriptor_digest ELSE excluded.package_descriptor_digest END,
-		  package_descriptor_bytes=CASE WHEN length(rentals.package_descriptor_bytes)>0 THEN rentals.package_descriptor_bytes ELSE excluded.package_descriptor_bytes END,
-		  qualification_digest=CASE WHEN length(rentals.qualification_bytes)>0 THEN rentals.qualification_digest ELSE excluded.qualification_digest END,
-		  qualification_bytes=CASE WHEN length(rentals.qualification_bytes)>0 THEN rentals.qualification_bytes ELSE excluded.qualification_bytes END,
-		  placement_revision=CASE WHEN rentals.placement_revision>0
-		    THEN rentals.placement_revision ELSE excluded.placement_revision END,
-		  observed_accelerator=CASE WHEN rentals.observed_accelerator<>''
-		    THEN rentals.observed_accelerator ELSE excluded.observed_accelerator END,
-		  observed_accelerator_count=CASE WHEN rentals.observed_accelerator_count>0
-		    THEN rentals.observed_accelerator_count ELSE excluded.observed_accelerator_count END,
-		  observed_backend=CASE WHEN rentals.observed_backend<>''
-		    THEN rentals.observed_backend ELSE excluded.observed_backend END,
-		  observed_driver_version=CASE WHEN rentals.observed_driver_version<>''
-		    THEN rentals.observed_driver_version ELSE excluded.observed_driver_version END,
-		  observed_backend_version=CASE WHEN rentals.observed_backend_version<>''
-		    THEN rentals.observed_backend_version ELSE excluded.observed_backend_version END,
-		  observed_device_memory_total_bytes=CASE WHEN rentals.observed_device_memory_total_bytes>0
-		    THEN rentals.observed_device_memory_total_bytes ELSE excluded.observed_device_memory_total_bytes END,
-		  observed_worker_instance=CASE WHEN rentals.observed_worker_instance<>''
-		    THEN rentals.observed_worker_instance ELSE excluded.observed_worker_instance END,
-		  observed_worker_boot_id=CASE WHEN rentals.observed_worker_boot_id<>''
-		    THEN rentals.observed_worker_boot_id ELSE excluded.observed_worker_boot_id END,
-		  observed_at=CASE WHEN rentals.observed_at<>''
-		    THEN rentals.observed_at ELSE excluded.observed_at END,
 		  expected_worker_id=CASE WHEN rentals.expected_worker_id<>''
 		    THEN rentals.expected_worker_id ELSE excluded.expected_worker_id END,
 		  expected_worker_boot_id=CASE WHEN rentals.expected_worker_boot_id<>''
 		    THEN rentals.expected_worker_boot_id ELSE excluded.expected_worker_boot_id END`,
-		r.ID, r.MachineName, r.SKU, r.PackageRef, r.AcceleratorModel, r.Address, r.CertPath, r.State, r.Hub,
-		r.RentedAt, r.MediaAddress, r.PlacementSetDigest,
-		r.PlacementSetBytes, r.SelectionProfile, r.PackageDescriptorDigest, r.PackageDescriptorBytes, r.QualificationDigest,
-		r.QualificationBytes, r.PlacementRevision, r.ObservedAccelerator,
-		r.ObservedAcceleratorCount, r.ObservedBackend, r.ObservedDriverVersion,
-		r.ObservedBackendVersion, r.ObservedDeviceMemoryTotalBytes, r.ObservedWorkerInstance,
-		r.ObservedWorkerBootID, r.ObservedAt, r.ExpectedWorkerID, r.ExpectedWorkerBootID); err != nil {
+		r.ID, r.MachineName, r.SKU, r.AcceleratorModel, r.Address, r.CertPath, r.State, r.Hub,
+		r.RentedAt, r.MediaAddress, r.ExpectedWorkerID, r.ExpectedWorkerBootID); err != nil {
 		return exit.Internalf("cannot record rental %s: %s", r.ID, err)
 	}
 	if err := tx.Commit(); err != nil {
@@ -550,12 +465,6 @@ func (s *Store) recordRental(r Rental) *exit.Error {
 	stored, e := s.RentalRow(r.ID)
 	if e != nil {
 		return e
-	}
-	if len(r.PlacementSetBytes) > 0 && (stored == nil ||
-		stored.PlacementSetDigest != r.PlacementSetDigest ||
-		!bytes.Equal(stored.PlacementSetBytes, r.PlacementSetBytes)) {
-		return exit.Named(exit.Conflict, "rental.placement_set_conflict",
-			"rental %s already carries another exact PlacementSet", r.ID)
 	}
 	if stored == nil || stored.MachineName != r.MachineName || stored.SKU != r.SKU ||
 		r.Address != "" && stored.Address != r.Address ||
@@ -582,57 +491,11 @@ func (s *Store) RentalByMachine(name string) (*Rental, *exit.Error) {
 	return &r, nil
 }
 
-// ReplaceRentalSelection installs the Hub-authored replacement after its exact
-// desired revision is known. It is the only path allowed to change PlacementSet.
-func (s *Store) ReplaceRentalSelection(next Rental) *exit.Error {
-	current, e := s.RentalRow(next.ID)
-	if e != nil {
-		return e
-	}
-	if current == nil {
-		return exit.New(exit.NotFound, "no rental %s on this host", next.ID)
-	}
-	same := current.PackageRef == next.PackageRef && current.PlacementRevision == next.PlacementRevision &&
-		current.PlacementSetDigest == next.PlacementSetDigest &&
-		bytes.Equal(current.PlacementSetBytes, next.PlacementSetBytes)
-	if same {
-		return nil
-	}
-	if next.PlacementRevision <= current.PlacementRevision {
-		return exit.Named(exit.Conflict, "rental.placement_revision_regressed",
-			"rental %s replacement revision %d does not advance %d",
-			next.ID, next.PlacementRevision, current.PlacementRevision)
-	}
-	result, err := s.db.Exec(`UPDATE rentals SET package_ref=?,placement_set_digest=?,placement_set_bytes=?,
-			selection_profile=?,package_descriptor_digest=?,package_descriptor_bytes=?,qualification_digest=?,qualification_bytes=?,
-			placement_revision=? WHERE id=? AND placement_revision=?`,
-		next.PackageRef, next.PlacementSetDigest, next.PlacementSetBytes, next.SelectionProfile,
-		next.PackageDescriptorDigest, next.PackageDescriptorBytes, next.QualificationDigest, next.QualificationBytes,
-		next.PlacementRevision, next.ID, current.PlacementRevision)
-	if err != nil {
-		return exit.Internalf("cannot replace rental %s selection: %s", next.ID, err)
-	}
-	changed, _ := result.RowsAffected()
-	if changed != 1 {
-		return exit.Named(exit.Conflict, "rental.placement_update_raced",
-			"rental %s selection advanced concurrently", next.ID)
-	}
-	return nil
-}
-
-// ObserveRentalWorker records the actual remote worker ClaimAck before any model
-// invocation. The requested accelerator is not evidence; the worker's readback must
-// exactly agree with the SKU Tensorhub already qualified in its readiness receipt.
-// The observation is immutable for one rental so a changed machine identity refuses
-// instead of silently rewriting retained execution evidence.
+// ObserveRentalWorker validates the direct ClaimAck against Tensorhub's pinned worker
+// and requested SKU. Hardware observations are live control facts, not rental-row history.
 func (s *Store) ObserveRentalWorker(id, accelerator, backend, driverVersion,
 	backendVersion string, deviceMemory uint64, instance, workerID, bootID string, count int) *exit.Error {
-	tx, err := s.db.Begin()
-	if err != nil {
-		return exit.Internalf("cannot begin rental %s worker observation: %s", id, err)
-	}
-	defer tx.Rollback()
-	row, err := scanRental(tx.QueryRow(`SELECT `+rentalCols+` FROM rentals WHERE id=?`, id))
+	row, err := scanRental(s.db.QueryRow(`SELECT `+rentalCols+` FROM rentals WHERE id=?`, id))
 	if errors.Is(err, sql.ErrNoRows) {
 		return exit.New(exit.NotFound, "no rental %s on this host", id)
 	}
@@ -640,7 +503,7 @@ func (s *Store) ObserveRentalWorker(id, accelerator, backend, driverVersion,
 		return exit.Internalf("cannot read rental %s for worker observation: %s", id, err)
 	}
 	cpu := strings.EqualFold(row.AcceleratorModel, "CPU")
-	complete := row.State == "converging" || row.State == "ready"
+	complete := row.State == "ready" || row.State == "attached"
 	if cpu {
 		complete = complete && accelerator == "" && backend == "none" && count == 0 &&
 			driverVersion == "" && backendVersion == "" && deviceMemory == 0 &&
@@ -664,28 +527,6 @@ func (s *Store) ObserveRentalWorker(id, accelerator, backend, driverVersion,
 			"rental %s worker reports %q but the paid request selected %q",
 			id, accelerator, row.AcceleratorModel).
 			WithRemedy("release it; never invoke a model on hardware that disagrees with the paid selection")
-	}
-	if row.ObservedAt != "" && (row.ObservedAccelerator != accelerator ||
-		row.ObservedAcceleratorCount != count || row.ObservedBackend != backend ||
-		row.ObservedDriverVersion != driverVersion || row.ObservedBackendVersion != backendVersion ||
-		row.ObservedDeviceMemoryTotalBytes != deviceMemory ||
-		row.ObservedWorkerInstance != instance) {
-		return exit.Named(exit.Conflict, "rental.worker_readback_changed",
-			"rental %s now claims a different accelerator or worker identity", id).
-			WithRemedy("release it; a rental's accepted execution evidence is immutable")
-	}
-	// The worker process on the pod may restart; its boot id is the latest seen, while
-	// the hardware and instance identity above stay write-once.
-	if _, err := tx.Exec(`UPDATE rentals SET observed_accelerator=?,
-		observed_accelerator_count=?,observed_backend=?,observed_driver_version=?,
-		observed_backend_version=?,observed_device_memory_total_bytes=?,observed_worker_instance=?,
-		observed_worker_boot_id=?,observed_at=? WHERE id=?`,
-		accelerator, count, backend, driverVersion, backendVersion, deviceMemory,
-		instance, bootID, now(), id); err != nil {
-		return exit.Internalf("cannot record rental %s worker observation: %s", id, err)
-	}
-	if err := tx.Commit(); err != nil {
-		return exit.Internalf("cannot commit rental %s worker observation: %s", id, err)
 	}
 	return nil
 }
@@ -755,10 +596,9 @@ func (s *Store) RentalRunCounts(id string) (queued, running int, problem *exit.E
 	return queued, running, nil
 }
 
-// RentalRelayRefusal is the last durable non-transient private-control verdict, whether
-// the worker rejected Claim or Tensorhub rejected relayed session evidence. Without it
-// every client would continue seeing only `converging` after control had already refused.
-type RentalRelayRefusal struct {
+// RentalControlRefusal is Creator's last durable non-transient verdict on a
+// private worker Claim or identity check.
+type RentalControlRefusal struct {
 	RentalID   string
 	Code       exit.Code
 	Name       string
@@ -768,7 +608,7 @@ type RentalRelayRefusal struct {
 	ObservedAt string
 }
 
-func (r RentalRelayRefusal) Error() *exit.Error {
+func (r RentalControlRefusal) Error() *exit.Error {
 	e := exit.Named(r.Code, r.Name, "%s", r.Message)
 	if r.Remedy != "" {
 		e.WithRemedy("%s", r.Remedy)
@@ -779,7 +619,7 @@ func (r RentalRelayRefusal) Error() *exit.Error {
 	return e
 }
 
-func (s *Store) RecordRentalRelayRefusal(id string, problem *exit.Error) *exit.Error {
+func (s *Store) RecordRentalControlRefusal(id string, problem *exit.Error) *exit.Error {
 	if id == "" || problem == nil {
 		return exit.Internalf("cannot record an empty rental relay refusal")
 	}
@@ -787,7 +627,7 @@ func (s *Store) RecordRentalRelayRefusal(id string, problem *exit.Error) *exit.E
 	if err != nil {
 		return exit.Internalf("cannot encode rental %s relay refusal: %s", id, err)
 	}
-	if _, err := s.db.Exec(`INSERT INTO rental_relay_refusals(
+	if _, err := s.db.Exec(`INSERT INTO rental_control_refusals(
 		rental_id,exit_code,name,message,remedy,next_json,observed_at)
 		VALUES(?,?,?,?,?,?,?) ON CONFLICT(rental_id) DO UPDATE SET
 		exit_code=excluded.exit_code,name=excluded.name,message=excluded.message,
@@ -798,12 +638,12 @@ func (s *Store) RecordRentalRelayRefusal(id string, problem *exit.Error) *exit.E
 	return nil
 }
 
-func (s *Store) RentalRelayRefusal(id string) (*RentalRelayRefusal, *exit.Error) {
-	var row RentalRelayRefusal
+func (s *Store) RentalControlRefusal(id string) (*RentalControlRefusal, *exit.Error) {
+	var row RentalControlRefusal
 	var code int
 	var next string
 	err := s.db.QueryRow(`SELECT rental_id,exit_code,name,message,remedy,next_json,observed_at
-		FROM rental_relay_refusals WHERE rental_id=?`, id).Scan(
+		FROM rental_control_refusals WHERE rental_id=?`, id).Scan(
 		&row.RentalID, &code, &row.Name, &row.Message, &row.Remedy, &next, &row.ObservedAt)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, nil
@@ -821,8 +661,8 @@ func (s *Store) RentalRelayRefusal(id string) (*RentalRelayRefusal, *exit.Error)
 	return &row, nil
 }
 
-func (s *Store) ClearRentalRelayRefusal(id string) *exit.Error {
-	if _, err := s.db.Exec(`DELETE FROM rental_relay_refusals WHERE rental_id=?`, id); err != nil {
+func (s *Store) ClearRentalControlRefusal(id string) *exit.Error {
+	if _, err := s.db.Exec(`DELETE FROM rental_control_refusals WHERE rental_id=?`, id); err != nil {
 		return exit.Internalf("cannot clear rental %s relay refusal: %s", id, err)
 	}
 	return nil

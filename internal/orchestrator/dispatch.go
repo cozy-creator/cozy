@@ -548,11 +548,11 @@ func (c *Orchestrator) resolveFor(req records.Request) (WorkerLaunchSpec, *exit.
 		return WorkerLaunchSpec{}, exit.Named(exit.Internal, "rental.target_incomplete",
 			"rental %s resolved without a complete remote target", req.Worker)
 	}
-	spec := WorkerLaunchSpec{Placement: remote.Placement, Connection: remote.Connection}
-	// The rental IS the slot: one connected worker per rental id, its own instance
-	// namespace, and no local device envelope (the pod's card is the pod's).
-	spec.Placement.Package = pinnedPackage(spec.Placement.Package, req.Worker)
-	return spec, nil
+	return WorkerLaunchSpec{}, exit.Named(exit.Unavailable,
+		"rental.download_delegation_unavailable",
+		"rental %s is attachable, but direct package/model download delegation is not installed",
+		req.Worker).
+		WithRemedy("keep the rental; proto-013 must land before non-empty desired state can run")
 }
 
 // failQueued settles a request that can never be placed. It is a request-level terminal:

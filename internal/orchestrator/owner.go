@@ -12,7 +12,6 @@ import (
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials"
 	"google.golang.org/grpc/credentials/insecure"
-	"google.golang.org/protobuf/proto"
 
 	"github.com/cozy-creator/cozy/internal/canonical"
 	"github.com/cozy-creator/cozy/internal/exit"
@@ -44,9 +43,6 @@ type session struct {
 	generation uint64
 	instanceID string
 	out        chan *pb.RecordOwnerFrame
-	claimAck   []byte
-	snapshot   []byte
-	relay      chan RentalSessionEvidence
 }
 
 func (s *session) send(m *pb.RecordOwnerFrame) (sent bool) {
@@ -208,10 +204,6 @@ func (c *Orchestrator) converse(w *worker, addr string) error {
 	}
 	c.mu.Unlock()
 	s := &session{ctx: ctx, instanceID: w.instanceID, out: make(chan *pb.RecordOwnerFrame, 32)}
-	if w.spec.Connection != nil && c.opt.RelayRentalSession != nil {
-		s.relay = make(chan RentalSessionEvidence, 1)
-		go c.runRentalSessionRelay(s, w.spec.Connection)
-	}
 	go func() {
 		for m := range s.out {
 			if err := stream.Send(m); err != nil {
@@ -277,16 +269,9 @@ func (c *Orchestrator) converse(w *worker, addr string) error {
 			if e := c.onClaimAck(w, s, ack); e != nil {
 				return fmt.Errorf("%s", e.Message)
 			}
-			raw, e := deterministicWorkerFrame(frame)
-			if e != nil {
-				c.refuseClaim(w, e)
-				return fmt.Errorf("%s", e.Message)
-			}
-			s.claimAck = raw
 		case *pb.WorkerFrame_BootFailure:
 			c.logf("BOOT FAILURE from %s: %s (%s)", m.BootFailure.WorkerInstanceId,
 				pb.BootFailureReason_name[int32(m.BootFailure.Reason)], m.BootFailure.Detail)
-			c.relayBootFailure(s, w, frame, m.BootFailure)
 			return nil
 		case *pb.WorkerFrame_Snapshot:
 			if c.fenced(s, m.Snapshot.RecordOwnerEpoch, m.Snapshot.ControlStreamGeneration,
@@ -294,13 +279,6 @@ func (c *Orchestrator) converse(w *worker, addr string) error {
 				continue
 			}
 			if c.onSnapshot(w, s, m.Snapshot) {
-				raw, e := deterministicWorkerFrame(frame)
-				if e != nil {
-					c.logf("WorkerSnapshot %s could not be retained for rental evidence: %s",
-						m.Snapshot.SnapshotId, e.Message)
-					continue
-				}
-				s.snapshot = raw
 				// Open the lossy progress lane only after the durable recovery barrier is
 				// acknowledged. ClaimAck and WorkerSnapshot are one control transition;
 				// a second connection before that pair completes adds no useful progress
@@ -314,12 +292,7 @@ func (c *Orchestrator) converse(w *worker, addr string) error {
 			if c.fenced(s, r.RecordOwnerEpoch, r.ControlStreamGeneration, r.WorkerBootId) {
 				continue
 			}
-			raw, e := deterministicWorkerFrame(frame)
-			if e != nil {
-				c.logf("observed state could not be retained for rental evidence: %s", e.Message)
-				continue
-			}
-			c.onObserved(s, r, raw)
+			c.onObserved(s, r)
 		case *pb.WorkerFrame_AttemptAccepted:
 			a := m.AttemptAccepted
 			if c.fenced(s, a.RecordOwnerEpoch, a.ControlStreamGeneration, a.WorkerBootId) {
@@ -353,108 +326,6 @@ func (c *Orchestrator) converse(w *worker, addr string) error {
 				continue
 			}
 			c.onArtifactFinalizeResult(s, r)
-		}
-	}
-}
-
-func deterministicWorkerFrame(frame *pb.WorkerFrame) ([]byte, *exit.Error) {
-	raw, err := (proto.MarshalOptions{Deterministic: true}).Marshal(frame)
-	if err != nil {
-		return nil, exit.Internalf("cannot deterministically encode WorkerFrame evidence: %s", err)
-	}
-	return raw, nil
-}
-
-// relayBootFailure preserves the protocol's closed boot-fatal alternative. It is
-// accepted only from this claim's epoch and a named stream/boot, then sent through the
-// renter-authenticated relay. Tensorhub verifies provider OCI and Runtime provenance;
-// Cozy neither turns this into a synthetic ObservedWorkerState nor gives Hub a way to
-// dial the worker itself.
-func (c *Orchestrator) relayBootFailure(s *session, w *worker, frame *pb.WorkerFrame,
-	failure *pb.BootFailure) {
-	if w.spec.Connection == nil || c.opt.RelayRentalSession == nil ||
-		failure.RecordOwnerEpoch != recordOwnerEpoch || failure.ControlStreamGeneration == 0 ||
-		failure.WorkerBootId == "" {
-		return
-	}
-	if s.generation != 0 && c.fenced(s, failure.RecordOwnerEpoch,
-		failure.ControlStreamGeneration, failure.WorkerBootId) {
-		return
-	}
-	if e := instancePin(w, failure.WorkerInstanceId); e != nil {
-		c.refuseClaim(w, e)
-		return
-	}
-	if e := releasePin(w, failure.WorkerReleaseId); e != nil {
-		c.refuseClaim(w, e)
-		return
-	}
-	raw, e := deterministicWorkerFrame(frame)
-	if e != nil {
-		c.logf("rental %s boot failure could not be encoded: %s",
-			w.spec.Connection.RentalID, e.Message)
-		return
-	}
-	if e := c.opt.RelayRentalSession(s.ctx, w.spec.Connection,
-		RentalSessionEvidence{BootFailure: raw}); e != nil {
-		c.logf("rental %s boot failure evidence was not accepted: %s",
-			w.spec.Connection.RentalID, e.Message)
-	}
-}
-
-func (c *Orchestrator) queueRentalSessionEvidence(s *session, desired uint64, observed []byte) {
-	if s.relay == nil || desired == 0 || len(s.claimAck) == 0 || len(s.snapshot) == 0 {
-		return
-	}
-	evidence := RentalSessionEvidence{
-		ClaimAck: append([]byte(nil), s.claimAck...), Snapshot: append([]byte(nil), s.snapshot...),
-		ObservedState: append([]byte(nil), observed...), DesiredRevision: desired,
-	}
-	select {
-	case s.relay <- evidence:
-		return
-	default:
-	}
-	// Only the newest observation matters while one HTTP call is in flight. The Hub
-	// persists every accepted digest idempotently; replacing an unsent progress sample
-	// cannot erase a frame it has already learned.
-	select {
-	case <-s.relay:
-	default:
-	}
-	select {
-	case s.relay <- evidence:
-	case <-s.ctx.Done():
-	}
-}
-
-func (c *Orchestrator) runRentalSessionRelay(s *session, connection *WorkerConnection) {
-	for {
-		select {
-		case <-s.ctx.Done():
-			return
-		case evidence := <-s.relay:
-			for {
-				problem := c.opt.RelayRentalSession(s.ctx, connection, evidence)
-				if problem == nil {
-					break
-				}
-				c.logf("rental %s convergence evidence was not accepted: %s",
-					connection.RentalID, problem.Message)
-				if problem.Code != exit.Unavailable && problem.Code != exit.Deadline {
-					break
-				}
-				timer := time.NewTimer(ReportCadence)
-				select {
-				case <-s.ctx.Done():
-					timer.Stop()
-					return
-				case newer := <-s.relay:
-					timer.Stop()
-					evidence = newer
-				case <-timer.C:
-				}
-			}
 		}
 	}
 }
@@ -494,10 +365,9 @@ func (c *Orchestrator) onClaimAck(w *worker, s *session, ack *pb.ClaimAck) *exit
 		return e
 	}
 	if w.spec.Connection != nil {
-		if c.opt.ObserveRental == nil || c.opt.RelayRentalSession == nil ||
-			w.spec.Connection.RentalID == "" {
+		if c.opt.ObserveRental == nil || w.spec.Connection.RentalID == "" {
 			e := exit.Named(exit.Structural, "rental.worker_readback_unowned",
-				"the attached worker has no durable rental observation and convergence-relay owner")
+				"the attached worker has no durable rental observation owner")
 			c.refuseClaim(w, e)
 			return e
 		}
@@ -717,7 +587,11 @@ func (c *Orchestrator) onSnapshot(w *worker, s *session, snap *pb.WorkerSnapshot
 		c.sendJobDirective(s, w)
 		return true
 	}
-	if e := c.converge(s, w, []DesiredPlacement{w.spec.Placement}); e != nil {
+	placements := []DesiredPlacement(nil)
+	if w.spec.Placement.PlacementSetDigest != "" {
+		placements = []DesiredPlacement{w.spec.Placement}
+	}
+	if e := c.converge(s, w, placements); e != nil {
 		c.logf("the desired placement set for %s could not be issued: %s", w.instanceID, e.Message)
 	}
 	return true
