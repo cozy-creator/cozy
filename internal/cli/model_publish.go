@@ -84,21 +84,23 @@ func handleModelPublish(ctx *Context) *exit.Error {
 		Source: instructionSource, InputLane: strings.TrimSpace(ctx.Inv.Value("--lane")),
 		Producer: producerName, Rental: ctx.Inv.Bool("--rental")}
 	if !ctx.Inv.Bool("--dry-run") && ctx.Inv.Bool("--rental") && producerName != "" {
-		if _, _, problem := ensureDaemon(ctx); problem != nil {
+		daemonState, _, problem := ensureDaemon(ctx)
+		if problem != nil {
 			return problem
 		}
+		ctx.Daemon = daemonState
 		local, problem := dial(ctx)
 		if problem != nil {
 			return problem
 		}
-		state, problem := local.SubmitModelProduction(instruction)
+		productionState, problem := local.SubmitModelProduction(instruction)
 		if problem != nil {
 			return problem
 		}
 		if ctx.Inv.Bool("--detach") {
-			return emitModelProductionState(ctx, state, true)
+			return emitModelProductionState(ctx, productionState, true)
 		}
-		return followModelProduction(ctx, local, state)
+		return followModelProduction(ctx, local, productionState)
 	}
 
 	source, problem := resolvePublishSource(ctx, ctx.Inv.Args[1])

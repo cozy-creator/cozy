@@ -633,7 +633,12 @@ func handleRentRelease(ctx *Context) *exit.Error {
 		return e
 	}
 	if gone {
-		return w.finish(l, st, "", row != nil, "the hub already reported this rental gone")
+		operationKey, releaseProblem := st.RequestRentalRelease(id)
+		if releaseProblem != nil {
+			return releaseProblem
+		}
+		return w.finish(l, st, operationKey, row != nil,
+			"the hub already reported this rental gone")
 	}
 
 	operationKey, e := st.RequestRentalRelease(id)

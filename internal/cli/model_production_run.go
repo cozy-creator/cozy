@@ -33,9 +33,9 @@ type productionManifest struct {
 func runRentedModelProduction(ctx *Context, runCtx context.Context, plan modelproduction.Plan,
 	source publishSource,
 ) *exit.Error {
-	if plan.Production == nil || len(plan.Jobs) == 0 || len(source.Access) == 0 {
+	if plan.Production == nil || len(plan.Jobs) == 0 {
 		return exit.Named(exit.Structural, "model_production.plan_incomplete",
-			"rented model production requires a reviewed graph, exact jobs, and foreign source files")
+			"rented model production requires a reviewed graph and exact jobs")
 	}
 	planBytes, err := plan.Bytes()
 	if err != nil {
@@ -88,6 +88,16 @@ func runRentedModelProduction(ctx *Context, runCtx context.Context, plan modelpr
 	if operation.State == "release_cut" || operation.State == "cleanup_pending" {
 		return resumeProductionCleanup(ctx, store, plan, operation, replay, progress)
 	}
+	if operation.State == "outputs_preparing" {
+		if problem := cutProductionRelease(runCtx, ctx, store, plan, progress); problem != nil {
+			return problem
+		}
+		current, problem := store.ModelProduction(operation.ID)
+		if problem != nil || current == nil {
+			return problem
+		}
+		return resumeProductionCleanup(ctx, store, plan, *current, replay, progress)
+	}
 	state, _, problem := ensureDaemon(ctx)
 	if problem != nil {
 		return problem
@@ -99,6 +109,10 @@ func runRentedModelProduction(ctx *Context, runCtx context.Context, plan modelpr
 	}
 	if problem = productionCancellation(runCtx, store, operation.ID); problem != nil {
 		return failProduction(store, operation.ID, problem)
+	}
+	if len(source.Access) == 0 {
+		return exit.Named(exit.Structural, "model_production.source_capabilities_absent",
+			"rented model production requires refreshable foreign source file capabilities")
 	}
 	rentalID, problem := ensureProductionRental(runCtx, ctx, layout, store, plan, operation, progress)
 	if problem != nil {
@@ -217,6 +231,13 @@ func runRentedModelProduction(ctx *Context, runCtx context.Context, plan modelpr
 	}
 
 	if problem = cutProductionRelease(runCtx, ctx, store, plan, progress); problem != nil {
+		if problem.Name == "model_production.cut_verdict_unknown" {
+			// The cut may already be committed. Keep the exact rental/source/artifact
+			// joins intact until replay learns the verdict; releasing here would turn
+			// an ambiguous response into an unrecoverable second topology.
+			releaseOwed = false
+			return problem
+		}
 		return failAndReleaseProduction(ctx, store, operation.ID, rentalID, problem, progress)
 	}
 	current, problem := store.ModelProduction(operation.ID)

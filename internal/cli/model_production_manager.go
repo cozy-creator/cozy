@@ -177,22 +177,27 @@ func (m *modelProductionManager) advance(runCtx context.Context,
 	}
 	resolveCtx := &Context{Inv: productionInvocation(plan.Instruction), Out: io.Discard,
 		Err: m.log, Cfg: m.cfg}
-	source, problem := resolvePublishSource(resolveCtx, plan.Instruction.Source)
-	if problem != nil {
-		failProduction(m.store, operation.ID, problem)
-		return
-	}
-	if source.Canonical != plan.Source || source.Selection != plan.SourceSelection ||
-		source.License != plan.SourceLicense || source.Lane != plan.InputLane ||
-		!reflect.DeepEqual(source.Exact, plan.SourceFiles) {
-		failProduction(m.store, operation.ID, exit.Named(exit.Conflict,
-			"model_production.source_changed",
-			"refreshed source capabilities do not match the accepted source inventory"))
-		return
+	var source publishSource
+	if operation.State != "outputs_preparing" && operation.State != "release_cut" &&
+		operation.State != "cleanup_pending" {
+		var problem *exit.Error
+		source, problem = resolvePublishSource(resolveCtx, plan.Instruction.Source)
+		if problem != nil {
+			failProduction(m.store, operation.ID, problem)
+			return
+		}
+		if source.Canonical != plan.Source || source.Selection != plan.SourceSelection ||
+			source.License != plan.SourceLicense || source.Lane != plan.InputLane ||
+			!reflect.DeepEqual(source.Exact, plan.SourceFiles) {
+			failProduction(m.store, operation.ID, exit.Named(exit.Conflict,
+				"model_production.source_changed",
+				"refreshed source capabilities do not match the accepted source inventory"))
+			return
+		}
 	}
 	ctx := resolveCtx
 	for {
-		problem = runRentedModelProduction(ctx, runCtx, plan, source)
+		problem := runRentedModelProduction(ctx, runCtx, plan, source)
 		if problem == nil || problem.Name != "model_production.cut_verdict_unknown" {
 			return
 		}
