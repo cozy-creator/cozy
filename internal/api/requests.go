@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"path/filepath"
 	"sort"
 	"strconv"
 	"strings"
@@ -17,6 +18,7 @@ import (
 	"github.com/cozy-creator/cozy/internal/launch"
 	"github.com/cozy-creator/cozy/internal/orchestrator"
 	"github.com/cozy-creator/cozy/internal/records"
+	"github.com/cozy-creator/cozy/internal/resultfiles"
 	pb "github.com/cozy-creator/cozy/protocol/cozy/worker/v1"
 )
 
@@ -41,10 +43,12 @@ type Submission struct {
 	// LocalAssets is the local API's out-of-band input set. Each source path is ingested into
 	// the daemon-owned immutable input store before the request row exists; it never
 	// crosses the worker protocol. The typed payload carries only its opaque reference.
-	LocalAssets []records.AssetBinding  `json:"local_assets,omitempty"`
-	Rental      bool                    `json:"rental,omitempty"`
-	Models      []orchestrator.ModelRef `json:"models,omitempty"`
-	AttemptKey  string                  `json:"-"`
+	LocalAssets       []records.AssetBinding  `json:"local_assets,omitempty"`
+	Rental            bool                    `json:"rental,omitempty"`
+	Models            []orchestrator.ModelRef `json:"models,omitempty"`
+	OutputDirectory   string                  `json:"output_directory,omitempty"`
+	OutputPayloadHash string                  `json:"output_payload_hash,omitempty"`
+	AttemptKey        string                  `json:"-"`
 }
 
 // Handle is the 202 answer: the request's id and where to go next. Verbatim from the
@@ -59,6 +63,7 @@ type Handle struct {
 	CancelURL     string `json:"cancel_url"`
 	EventsURL     string `json:"events_url"`
 	QueuePosition *int   `json:"queue_position,omitempty"`
+	QueueDepth    *int   `json:"queue_depth,omitempty"`
 	// Replay is true when this key was already recorded: the SAME request answers, and
 	// nothing new was started. A client that retried a timed-out POST needs to know it
 	// did not create a second execution, and inferring it from equal ids is a guess.
@@ -100,9 +105,9 @@ func (s *Server) submit(w http.ResponseWriter, r *http.Request) {
 			`{"package":"org/name","function":"denoise","input":{…}}`)
 		return
 	}
-	if len(sub.LocalAssets) > 0 && !s.cliAuthenticated(r) {
+	if (len(sub.LocalAssets) > 0 || sub.OutputDirectory != "") && !s.cliAuthenticated(r) {
 		s.refuse(w, r, http.StatusForbidden, "cli_credential_required",
-			"local_assets may name host filesystem paths and require the OS-protected CLI credential",
+			"local assets and output directories require the OS-protected CLI credential",
 			"use `cozy run --asset <field-path>=<file>`; this build exposes no browser asset-upload route")
 		return
 	}
@@ -170,6 +175,9 @@ func (s *Server) submit(w http.ResponseWriter, r *http.Request) {
 	}
 	handle := s.handleOf(*row, attempt)
 	handle.Replay = !fresh
+	if handle.Replay && (handle.Status == "completed" || handle.Status == "failed" || handle.Status == "canceled") {
+		s.orchestrator.RetryOutputExport(row.ID)
+	}
 	// 202 means "this host started work", and it may not be said twice for one key.
 	// A recorded answer is a 200 with the same handle: the client already has it.
 	status := http.StatusAccepted
@@ -204,6 +212,7 @@ func replaySubmission(sub Submission, recorded records.Request) orchestrator.Sub
 		Outputs: outputs, PlanID: planID, Worker: recorded.Worker, Assets: assets,
 		InstallID: sub.InstallID, Release: sub.Release, ReleaseDigest: sub.ReleaseDigest,
 		Rental: sub.Rental, Models: models,
+		OutputExport: outputExportInput(sub),
 	}
 }
 
@@ -249,6 +258,19 @@ func submissionDigest(spec orchestrator.Submission) (string, *exit.Error) {
 		}
 		doc["models"] = models
 	}
+	if export := spec.OutputExport; export != nil {
+		rows := make([]canonical.Value, 0, len(export.Outputs))
+		for _, output := range export.Outputs {
+			rows = append(rows, map[string]canonical.Value{
+				"output_id": output.OutputID, "media_type": output.MediaType,
+				"filename": output.Filename,
+			})
+		}
+		doc["output_export"] = map[string]canonical.Value{
+			"directory": export.Directory, "payload_hash": export.PayloadHash,
+			"outputs": rows,
+		}
+	}
 	// The pinned rental is NOT in it: a worker id says WHERE the same work runs, and two
 	// submissions of one key that differ only in placement are the same request. What the
 	// row records is what a requeue re-derives; the digest is about meaning.
@@ -271,8 +293,8 @@ func (s *Server) handleOf(row records.Request, attempt uint64) Handle {
 		EventsURL: base + "/events",
 	}
 	if h.Status == "queued" {
-		if position := s.orchestrator.QueuePosition(row.ID); position > 0 {
-			h.QueuePosition = &position
+		if position, depth := s.orchestrator.QueueState(row.ID); position > 0 {
+			h.QueuePosition, h.QueueDepth = &position, &depth
 		}
 	}
 	return h
@@ -309,7 +331,8 @@ func (s *Server) resolvePlan(sub Submission) (orchestrator.Submission, *exit.Err
 		Package: sub.Package, Entrypoint: sub.Function, Payload: []byte(sub.Input),
 		Outputs: sub.Outputs, PlanID: sub.PlanID, Assets: sub.LocalAssets,
 		Release: sub.Release, ReleaseDigest: sub.ReleaseDigest, Rental: sub.Rental,
-		Models: append([]orchestrator.ModelRef(nil), sub.Models...),
+		Models:       append([]orchestrator.ModelRef(nil), sub.Models...),
+		OutputExport: outputExportInput(sub),
 	}
 	if len(out.Payload) == 0 {
 		out.Payload = []byte("{}")
@@ -336,6 +359,9 @@ func (s *Server) resolvePlan(sub Submission) (orchestrator.Submission, *exit.Err
 			out.Outputs = logical.Outputs
 		}
 		if e := validateInputs(entrypoint, &out); e != nil {
+			return out, e
+		}
+		if e := deriveOutputExport(entrypoint, &out); e != nil {
 			return out, e
 		}
 		return out, nil
@@ -387,7 +413,61 @@ func (s *Server) resolvePlan(sub Submission) (orchestrator.Submission, *exit.Err
 	if e := validateInputs(entrypoint, &out); e != nil {
 		return out, e
 	}
+	if e := deriveOutputExport(entrypoint, &out); e != nil {
+		return out, e
+	}
 	return out, nil
+}
+
+func outputExportInput(sub Submission) *records.OutputExportIntent {
+	if sub.OutputDirectory == "" && sub.OutputPayloadHash == "" {
+		return nil
+	}
+	return &records.OutputExportIntent{
+		Directory: sub.OutputDirectory, PayloadHash: sub.OutputPayloadHash,
+	}
+}
+
+func deriveOutputExport(entrypoint *launch.Entrypoint, out *orchestrator.Submission) *exit.Error {
+	intent := out.OutputExport
+	if intent == nil {
+		return nil
+	}
+	if !filepath.IsAbs(intent.Directory) || filepath.Clean(intent.Directory) != intent.Directory ||
+		len(intent.Directory) > 4096 {
+		return exit.Named(exit.Validation, "output_export_directory_malformed",
+			"output directory must be one canonical absolute path")
+	}
+	paths := launch.AssetPaths(entrypoint.Result)
+	if len(paths) != len(out.Outputs) {
+		return exit.Named(exit.Validation, "output_export_set_mismatch",
+			"package result declares %d asset paths for %d granted outputs", len(paths), len(out.Outputs))
+	}
+	granted := make(map[string]bool, len(out.Outputs))
+	for _, outputID := range out.Outputs {
+		granted[outputID] = true
+	}
+	intent.Outputs = make([]records.OutputExportEntry, 0, len(paths))
+	for _, outputID := range paths {
+		if !granted[outputID] {
+			return exit.Named(exit.Validation, "output_export_set_mismatch",
+				"result asset %s is not an exact granted output", outputID)
+		}
+		spec, ok := launch.ResultAssetSpec(entrypoint, outputID)
+		if !ok || len(spec.MediaTypes) != 1 {
+			return exit.Named(exit.Validation, "output_export_media_type_ambiguous",
+				"result asset %s must declare exactly one media type for --out", outputID)
+		}
+		filename, problem := resultfiles.Filename(
+			intent.PayloadHash, outputID, spec.MediaTypes[0], len(paths))
+		if problem != nil {
+			return problem
+		}
+		intent.Outputs = append(intent.Outputs, records.OutputExportEntry{
+			OutputID: outputID, MediaType: spec.MediaTypes[0], Filename: filename,
+		})
+	}
+	return nil
 }
 
 // validateInputs checks the payload and every local asset against the entrypoint that
@@ -464,22 +544,34 @@ func (s *Server) stageAssets(assets []records.AssetBinding) ([]records.AssetBind
 // fields a local client has and a cloud one does not need to presign: the typed result,
 // the visible media by OPAQUE id, and the triage handle.
 type Lifecycle struct {
-	Kind        string         `json:"kind"`
-	RequestID   string         `json:"request_id"`
-	Status      string         `json:"status"`
-	Package     string         `json:"package"`
-	Function    string         `json:"function"`
-	Attempt     uint64         `json:"attempt"`
-	Attempts    int            `json:"attempts"`
-	ResponseURL string         `json:"response_url"`
-	Metrics     map[string]any `json:"metrics,omitempty"`
-	ErrorType   string         `json:"error_type,omitempty"`
-	Error       string         `json:"error,omitempty"`
-	Result      any            `json:"result,omitempty"`
-	Outputs     []MediaRef     `json:"outputs"`
-	Triage      *TriageRef     `json:"triage,omitempty"`
-	Rental      bool           `json:"rental,omitempty"`
-	CreatedAt   string         `json:"created_at"`
+	Kind          string           `json:"kind"`
+	RequestID     string           `json:"request_id"`
+	Status        string           `json:"status"`
+	Package       string           `json:"package"`
+	Function      string           `json:"function"`
+	Attempt       uint64           `json:"attempt"`
+	Attempts      int              `json:"attempts"`
+	ResponseURL   string           `json:"response_url"`
+	Metrics       map[string]any   `json:"metrics,omitempty"`
+	ErrorType     string           `json:"error_type,omitempty"`
+	Error         string           `json:"error,omitempty"`
+	Result        any              `json:"result,omitempty"`
+	Outputs       []MediaRef       `json:"outputs"`
+	Triage        *TriageRef       `json:"triage,omitempty"`
+	Rental        bool             `json:"rental,omitempty"`
+	CreatedAt     string           `json:"created_at"`
+	QueuePosition *int             `json:"queue_position,omitempty"`
+	QueueDepth    *int             `json:"queue_depth,omitempty"`
+	OutputExport  *OutputExportRef `json:"output_export,omitempty"`
+}
+
+type OutputExportRef struct {
+	Directory   string   `json:"directory"`
+	PayloadHash string   `json:"payload_hash"`
+	State       string   `json:"state"`
+	ErrorCode   string   `json:"error_code,omitempty"`
+	Error       string   `json:"error,omitempty"`
+	Paths       []string `json:"paths"`
 }
 
 // MediaRef is how bytes are named in EVERY document this API emits: an opaque id and its
@@ -529,6 +621,24 @@ func (s *Server) lifecycleOf(row records.Request) Lifecycle {
 		Function: row.Entrypoint, Attempt: uint64(row.Ordinal),
 		ResponseURL: "/v1/requests/" + row.ID, CreatedAt: row.CreatedAt,
 		Outputs: []MediaRef{}, Rental: row.Rental,
+	}
+	if life.Status == "queued" {
+		if position, depth := s.orchestrator.QueueState(row.ID); position > 0 {
+			life.QueuePosition, life.QueueDepth = &position, &depth
+		}
+	}
+	if export, problem := s.store.OutputExportOf(row.ID); problem == nil && export != nil {
+		paths := make([]string, 0, len(export.Outputs))
+		for _, output := range export.Outputs {
+			paths = append(paths, filepath.Join(export.Directory, output.Filename))
+		}
+		if len(export.PublishedPaths) > 0 {
+			paths = append(paths[:0], export.PublishedPaths...)
+		}
+		life.OutputExport = &OutputExportRef{
+			Directory: export.Directory, PayloadHash: export.PayloadHash, State: export.State,
+			ErrorCode: export.ErrorCode, Error: export.SafeError, Paths: paths,
+		}
 	}
 	attempts, _ := s.store.Attempts(row.ID)
 	life.Attempts = len(attempts)

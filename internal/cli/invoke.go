@@ -12,7 +12,6 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
-	"runtime"
 	"sort"
 	"strconv"
 	"strings"
@@ -29,6 +28,7 @@ import (
 	"github.com/cozy-creator/cozy/internal/orchestrator"
 	"github.com/cozy-creator/cozy/internal/output"
 	"github.com/cozy-creator/cozy/internal/records"
+	"github.com/cozy-creator/cozy/internal/resultfiles"
 )
 
 // THE LIFECYCLE AND REQUEST VERBS (cl-010), every one of them a CLIENT of the local
@@ -58,6 +58,14 @@ func handleRunExecute(ctx *Context) *exit.Error {
 	if problem := validateRunPlacement(ctx); problem != nil {
 		return problem
 	}
+	if ctx.Inv.Bool("--stream") && !ctx.Inv.Bool("--await") {
+		return exit.Usagef("--stream requires --await").
+			WithRemedy("use --await for a terminal progress stream, or omit --stream for a short optimistic observation")
+	}
+	if ctx.Inv.Value("--timeout") != "" && !ctx.Inv.Bool("--await") {
+		return exit.Usagef("--timeout requires --await").
+			WithRemedy("a detached run has no client waiting to enforce a caller deadline")
+	}
 	target, descriptor, problem := invocationTarget(ctx)
 	if problem != nil {
 		return problem
@@ -81,7 +89,7 @@ func handleRunExecute(ctx *Context) *exit.Error {
 	if ctx.Inv.Bool("--stream") || len(ctx.Inv.Values["--asset"]) > 0 ||
 		ctx.Inv.Value("--out") != "" || ctx.Inv.Value("--timeout") != "" {
 		return exit.Usagef("the selected callable is a job and received a serving-only flag").
-			WithRemedy("jobs accept payload values, --in, --input-tree, --org, --detach, and --rental")
+			WithRemedy("jobs accept payload values, --in, --input-tree, --org, --await, and --rental")
 	}
 	if ctx.Inv.Bool("--rental") && len(callable.Models) > 0 {
 		return exit.Named(exit.Unavailable, "rental.modeled_job_unsupported",
@@ -94,7 +102,7 @@ func handleRunExecute(ctx *Context) *exit.Error {
 		return exit.Named(exit.Unavailable, "rental.job_input_tree_unsupported",
 			"remote jobs cannot grant a local input-tree directory")
 	}
-	if !ctx.Inv.Bool("--detach") {
+	if ctx.Inv.Bool("--await") {
 		ctx.Inv.Bools["--follow"] = true
 	}
 	return handleJobSubmit(ctx, target, callable)
@@ -150,6 +158,16 @@ func handleRun(ctx *Context, target Target, ep *launch.Entrypoint) *exit.Error {
 	} else if len(ctx.Inv.Values["--model"]) > 0 {
 		return exit.Usagef("--model currently selects models only for --rental execution")
 	}
+	outputDirectory := ""
+	outputIntentHash := ""
+	if requested := ctx.Inv.Value("--out"); requested != "" {
+		absolute, err := filepath.Abs(requested)
+		if err != nil {
+			return exit.Usagef("cannot resolve --out %q: %s", requested, err)
+		}
+		outputDirectory = filepath.Clean(absolute)
+		outputIntentHash = outputHash
+	}
 
 	c, e := dial(ctx)
 	if e != nil {
@@ -160,26 +178,15 @@ func handleRun(ctx *Context, target Target, ep *launch.Entrypoint) *exit.Error {
 		Package: target.Package, Function: target.Function, Input: input,
 		LocalAssets: assets, InstallID: target.InstallID,
 		Release: target.Release, ReleaseDigest: target.ReleaseDigest, Rental: managedRental,
-		Models: models,
+		Models:          models,
+		OutputDirectory: outputDirectory, OutputPayloadHash: outputIntentHash,
 	}, key)
 	if e != nil {
 		return e
 	}
 	submitted := time.Since(began)
-	if ctx.Inv.Bool("--detach") {
-		fields := []output.Field{
-			{K: "id", V: handle.RequestID}, {K: "kind", V: "invocation"},
-			{K: "target", V: target.Package + "/" + target.Function},
-			{K: "status", V: handle.Status}, {K: "attempt", V: handle.Attempt},
-			{K: "changed", V: !handle.Replay},
-		}
-		rec := compactRecord(fields, "id", "target", "status", "changed")
-		rec.Next = []string{"cozy run cancel " + handle.RequestID}
-		return emit(ctx, rec)
-	}
-
 	stream := ctx.Inv.Bool("--stream")
-	if !stream {
+	if !stream && !ctx.Mode().JSON {
 		if ctx.Mode().Full {
 			fmt.Fprintf(ctx.Err, "request %s · attempt %d · %s\n",
 				handle.RequestID, handle.Attempt, handle.Status)
@@ -194,7 +201,13 @@ func handleRun(ctx *Context, target Target, ep *launch.Entrypoint) *exit.Error {
 		}
 	}
 
-	terminal, stopped, e := watch(ctx, c, handle.RequestID, stream, deadline)
+	var terminal *localapi.Event
+	stopped := ""
+	if ctx.Inv.Bool("--await") {
+		terminal, stopped, e = watch(ctx, c, handle.RequestID, stream, deadline, began)
+	} else {
+		terminal, e = observe(ctx, c, handle.RequestID, stream, optimisticObservation, began)
+	}
 	if e != nil {
 		return e
 	}
@@ -202,10 +215,14 @@ func handleRun(ctx *Context, target Target, ep *launch.Entrypoint) *exit.Error {
 	if e != nil {
 		return e
 	}
-	saved, e := saveOutputs(ctx, c, life, outputHash)
+	if terminal == nil && !invocationSettled(life.Status) {
+		return renderSubmittedRun(ctx, life, !handle.Replay)
+	}
+	life, e = waitOutputExport(c, life)
 	if e != nil {
 		return e
 	}
+	saved := exportedOutputs(life)
 	return renderRun(ctx, life, terminal, stopped, saved, submitted, began)
 }
 
@@ -455,6 +472,118 @@ func invocationSettled(status string) bool {
 	}
 }
 
+// optimisticObservation is long enough for a warm, weightless callable to answer in the
+// foreground without turning an ordinary GPU submission into a terminal hostage. Expiry
+// never cancels the request and never predicts its duration: the daemon keeps owning it.
+const optimisticObservation = 3 * time.Second
+
+// observe follows the real event stream for one bounded optimistic window. A context
+// expiry merely detaches this client; it does not enter the cancellation path used by an
+// explicit --await. A terminal that arrives inside the window is still rendered through
+// the ordinary result/error path, including a fast refusal.
+func observe(ctx *Context, c *localapi.Client, requestID string, stream bool,
+	window time.Duration, began time.Time,
+) (*localapi.Event, *exit.Error) {
+	watchCtx, stop := context.WithTimeout(context.Background(), window)
+	defer stop()
+	lines := newProgress(ctx, stream, began)
+	terminal, problem := c.WatchContext(watchCtx, requestID, 0, lines.on)
+	lines.done()
+	return terminal, problem
+}
+
+func renderSubmittedRun(ctx *Context, life api.Lifecycle, changed bool) *exit.Error {
+	status := runStatus(life.Status)
+	fields := []output.Field{
+		{K: "run", V: life.RequestID},
+		{K: "target", V: life.Package + "/" + life.Function},
+		{K: "status", V: status},
+	}
+	defaults := []string{"target", "status"}
+	if life.QueuePosition != nil {
+		queue := strconv.Itoa(*life.QueuePosition)
+		if life.QueueDepth != nil && *life.QueueDepth >= *life.QueuePosition {
+			queue += "/" + strconv.Itoa(*life.QueueDepth)
+		}
+		fields = append(fields, output.Field{K: "queue", V: queue})
+		defaults = append(defaults, "queue")
+	}
+	if export := life.OutputExport; export != nil {
+		fields = append(fields, output.Field{K: "output", V: outputExportHint(export)})
+		defaults = append(defaults, "output")
+	}
+	fields = append(fields, output.Field{K: "changed", V: changed})
+	defaults = append(defaults, "run")
+	rec := compactRecord(fields, defaults...)
+	rec.Next = []string{"cozy run cancel " + life.RequestID}
+	return emit(ctx, rec)
+}
+
+func waitOutputExport(c *localapi.Client, life api.Lifecycle) (api.Lifecycle, *exit.Error) {
+	for life.OutputExport != nil {
+		export := life.OutputExport
+		switch export.State {
+		case "published", "skipped":
+			return life, nil
+		case "failed":
+			return life, exit.Named(exit.Unavailable, "output_export_failed",
+				"run %s completed, but output export failed: %s — %s",
+				life.RequestID, export.ErrorCode, export.Error).
+				WithRemedy("fix the recorded destination and repeat the same idempotency key; the daemon retries this durable export")
+		case "pending", "exporting":
+			time.Sleep(50 * time.Millisecond)
+			updated, problem := c.Request(life.RequestID)
+			if problem != nil {
+				return life, problem
+			}
+			life = updated
+		default:
+			return life, exit.Internalf("run %s has unknown output export state %q",
+				life.RequestID, export.State)
+		}
+	}
+	return life, nil
+}
+
+func outputExportHint(export *api.OutputExportRef) string {
+	if export == nil {
+		return ""
+	}
+	if len(export.Paths) == 1 {
+		return export.Paths[0]
+	}
+	if len(export.Paths) > 1 {
+		return strings.Join(export.Paths, ", ")
+	}
+	return filepath.Join(export.Directory, export.PayloadHash+"*")
+}
+
+func exportedOutputs(life api.Lifecycle) []map[string]string {
+	if life.OutputExport == nil || life.OutputExport.State != "published" {
+		return nil
+	}
+	paths := life.OutputExport.Paths
+	result := make([]map[string]string, 0, len(paths))
+	for index, path := range paths {
+		row := map[string]string{"path": path}
+		if index < len(life.Outputs) {
+			row["output"] = life.Outputs[index].OutputID
+			row["bytes"] = output.Bytes(life.Outputs[index].Length)
+			row["mime"] = life.Outputs[index].MimeType
+			row["digest"] = life.Outputs[index].Digest
+		}
+		result = append(result, row)
+	}
+	return result
+}
+
+func runStatus(status string) string {
+	if status == "in_progress" {
+		return "running"
+	}
+	return status
+}
+
 // watch consumes the request's own event stream to its terminal, rendering progress as
 // it goes. SIGINT does not kill this process: it CANCELS the request through the
 // orchestrator and keeps watching, because the attempt's own journaled terminal is what
@@ -464,7 +593,7 @@ func invocationSettled(status string) bool {
 // exit 10, because a caller that set a deadline wants to know the deadline is what
 // happened.
 func watch(ctx *Context, c *localapi.Client, requestID string, stream bool,
-	deadline time.Duration) (*localapi.Event, string, *exit.Error) {
+	deadline time.Duration, began time.Time) (*localapi.Event, string, *exit.Error) {
 	interrupt := make(chan os.Signal, 2)
 	signal.Notify(interrupt, syscall.SIGINT, syscall.SIGTERM)
 	defer signal.Stop(interrupt)
@@ -522,7 +651,7 @@ func watch(ctx *Context, c *localapi.Client, requestID string, stream bool,
 		}
 	}()
 
-	lines := newProgress(ctx, stream)
+	lines := newProgress(ctx, stream, began)
 	terminal, e := c.WatchContext(watchCtx, requestID, 0, lines.on)
 	lines.done()
 	select {
@@ -571,14 +700,18 @@ func runDeadline(ctx *Context) (time.Duration, *exit.Error) {
 // `--stream` is NDJSON of the typed envelope for a machine, and the default is one
 // rewritten line for a person.
 type runProgress struct {
-	ctx    *Context
-	stream bool
-	last   string
-	dirty  bool
+	ctx         *Context
+	stream      bool
+	last        string
+	dirty       bool
+	began       time.Time
+	stepStage   string
+	stepSeconds float64
+	stepSamples int
 }
 
-func newProgress(ctx *Context, stream bool) *runProgress {
-	return &runProgress{ctx: ctx, stream: stream}
+func newProgress(ctx *Context, stream bool, began time.Time) *runProgress {
+	return &runProgress{ctx: ctx, stream: stream, began: began}
 }
 
 func (p *runProgress) on(e localapi.Event) bool {
@@ -598,7 +731,7 @@ func (p *runProgress) on(e localapi.Event) bool {
 	if !p.ctx.Mode().Color && !p.ctx.Mode().Full {
 		return true
 	}
-	line := progressLine(e, p.ctx.Mode().Full)
+	line := p.line(e, p.ctx.Mode().Full)
 	if line == "" || line == p.last {
 		return true
 	}
@@ -611,6 +744,92 @@ func (p *runProgress) on(e localapi.Event) bool {
 		fmt.Fprintln(p.ctx.Err, line)
 	}
 	return true
+}
+
+func (p *runProgress) line(e localapi.Event, full bool) string {
+	if full {
+		return diagnosticProgressLine(e)
+	}
+	if strings.TrimPrefix(e.Type, "request.") != "progress" {
+		return progressLine(e, false)
+	}
+	fields, ok := e.Payload["value"].(map[string]any)
+	if !ok {
+		return humanProgress(e.Payload["value"])
+	}
+	name, _ := fields["name"].(string)
+	name = strings.TrimSpace(name)
+	fraction, fractionOK := number(fields["fraction"])
+	position, positionOK := number(fields["position"])
+	stepMS, stepOK := number(fields["step_ms"])
+	if name != "" && name != p.stepStage {
+		p.stepStage, p.stepSeconds, p.stepSamples = name, 0, 0
+	}
+	if stepOK && stepMS >= 0 {
+		p.stepSeconds += stepMS / 1000
+		p.stepSamples++
+	}
+	if !fractionOK || fraction < 0 || fraction > 1 {
+		return humanStage(map[string]any{"name": stageLabel(name)})
+	}
+	elapsed := time.Since(p.began)
+	label := stageLabel(name)
+	if label == "" {
+		label = "running"
+	}
+	bar := progressBar(fraction, 18)
+	if !positionOK || position <= 0 || fraction <= 0 {
+		return fmt.Sprintf("  %s %s %.0f%% · %s", label, bar, fraction*100, shortDuration(elapsed))
+	}
+	total := int64(position/fraction + 0.5)
+	current := int64(position)
+	if total < current {
+		total = current
+	}
+	line := fmt.Sprintf("  %s %s %d/%d", label, bar, current, total)
+	if p.stepSamples > 0 {
+		seconds := p.stepSeconds / float64(p.stepSamples)
+		if seconds > 0 {
+			line += fmt.Sprintf(" · %.2fs/step · %.2f steps/s", seconds, 1/seconds)
+			remaining := time.Duration(float64(total-current) * seconds * float64(time.Second))
+			line += fmt.Sprintf(" · elapsed %s · ETA ~%s", shortDuration(elapsed), shortDuration(remaining))
+			return line
+		}
+	}
+	return line + " · elapsed " + shortDuration(elapsed)
+}
+
+func progressBar(fraction float64, width int) string {
+	filled := int(fraction*float64(width) + 0.5)
+	if filled < 0 {
+		filled = 0
+	}
+	if filled > width {
+		filled = width
+	}
+	return "[" + strings.Repeat("=", filled) + strings.Repeat(".", width-filled) + "]"
+}
+
+func stageLabel(name string) string {
+	switch strings.TrimSpace(name) {
+	case "tokenize", "encode", "condition", "condition_text", "condition_media":
+		return "conditioning"
+	case "denoise":
+		return "denoising"
+	case "decode", "decode_image", "decode_video", "decode_audio":
+		return "decoding"
+	case "encode_png", "encode_webp", "encode_outputs":
+		return "saving"
+	default:
+		return strings.TrimSpace(name)
+	}
+}
+
+func shortDuration(value time.Duration) string {
+	if value < time.Second {
+		return fmt.Sprintf("%.1fs", value.Seconds())
+	}
+	return value.Round(time.Second).String()
 }
 
 func (p *runProgress) done() {
@@ -748,68 +967,6 @@ func compactValue(v map[string]any) string {
 	return strings.Join(parts, " ")
 }
 
-// saveOutputs fetches every accepted output by its OPAQUE id and writes it under --out.
-// The filename comes from the output's FIELD PATH plus the mime type the manifest
-// declared — the CLI composes no path a server did not name.
-func saveOutputs(ctx *Context, c *localapi.Client, life api.Lifecycle,
-	requestHash string,
-) ([]map[string]string, *exit.Error) {
-	dir := ctx.Inv.Value("--out")
-	return saveOutputsAt(c, life, dir, requestHash)
-}
-
-// saveOutputsAt is the one verified local-download path for ordinary requests and
-// accepted result downloads: every output is received through the opaque media API, hashed
-// independently, checked against the request manifest, and published as one set.
-func saveOutputsAt(c *localapi.Client, life api.Lifecycle, dir, requestHash string) (
-	[]map[string]string, *exit.Error,
-) {
-	if dir == "" || len(life.Outputs) == 0 {
-		return nil, nil
-	}
-	names, e := outputNames(life.Outputs, requestHash)
-	if e != nil {
-		return nil, e
-	}
-	return publishOutputSet(dir, life.Outputs, names, c.Media)
-}
-
-// outputNames starts every saved filename with the hash of the finalized input payload.
-// A single output is simply `<payload-hash>.<type>`; multiple outputs retain their
-// field-path identities as `<payload-hash>-<field-path>.<type>`.
-//
-// The extension still comes only from the terminal manifest's MIME type. The request hash
-// and filename stem are known before execution, but the CLI does not guess the encoding
-// of bytes that do not exist yet.
-func outputNames(outputs []api.MediaRef, requestHash string) ([]string, *exit.Error) {
-	if len(requestHash) != sha256.Size*2 || strings.Trim(requestHash, "0123456789abcdef") != "" {
-		return nil, exit.Internalf("cannot name outputs with malformed request hash %q", requestHash)
-	}
-	names := make([]string, len(outputs))
-	seenIDs, seenNames := map[string]bool{}, map[string]bool{}
-	for index, out := range outputs {
-		if out.OutputID == "" || seenIDs[out.OutputID] {
-			return nil, exit.Named(exit.Validation, "output_name_collision",
-				"the output manifest repeats or omits output id %q", out.OutputID)
-		}
-		seenIDs[out.OutputID] = true
-		if e := orchestrator.FenceOutputID(out.OutputID); e != nil {
-			return nil, e
-		}
-		stem := requestHash
-		if len(outputs) > 1 {
-			stem += "-" + out.OutputID
-		}
-		names[index] = stem + extensionOf(out.MimeType)
-		if seenNames[names[index]] {
-			return nil, exit.Named(exit.Validation, "output_name_collision",
-				"two output manifest rows resolve to %s", names[index])
-		}
-		seenNames[names[index]] = true
-	}
-	return names, nil
-}
-
 func outputPathHint(ep *launch.Entrypoint, dir, payloadHash string) string {
 	paths := launch.AssetPaths(ep.Result)
 	if len(paths) != 1 {
@@ -819,170 +976,11 @@ func outputPathHint(ep *launch.Entrypoint, dir, payloadHash string) string {
 	if !ok || len(spec.MediaTypes) != 1 {
 		return filepath.Join(dir, payloadHash+"*")
 	}
-	extension := extensionOf(spec.MediaTypes[0])
+	extension := resultfiles.Extension(spec.MediaTypes[0])
 	if extension == "" {
 		return filepath.Join(dir, payloadHash+"*")
 	}
 	return filepath.Join(dir, payloadHash+extension)
-}
-
-type mediaFetch func(mediaID string, receive func(localapi.MediaResponse) *exit.Error) *exit.Error
-
-// publishOutputSet stages every output into a temporary sibling of dir, verifies each
-// against the MANIFEST (length and digest; the response headers must agree but prove
-// nothing), makes the set durable, then publishes it. A dir that does not yet exist
-// appears in one rename; an existing dir receives the already-verified files. Any
-// failure removes the staging dir and publishes nothing.
-func publishOutputSet(dir string, outputs []api.MediaRef, names []string, fetch mediaFetch) ([]map[string]string, *exit.Error) {
-	absolute, err := filepath.Abs(dir)
-	if err != nil {
-		return nil, exit.Internalf("cannot resolve %s: %s", dir, err)
-	}
-	parent := filepath.Dir(absolute)
-	if info, err := os.Lstat(absolute); err == nil && info.IsDir() {
-		parent = absolute
-	} else if err := os.MkdirAll(parent, 0o755); err != nil {
-		return nil, exit.Internalf("cannot create %s: %s", parent, err)
-	}
-	staging, err := os.MkdirTemp(parent, "."+filepath.Base(absolute)+".staging-*")
-	if err != nil {
-		return nil, exit.Internalf("cannot stage outputs for %s: %s", dir, err)
-	}
-	published := false
-	defer func() {
-		if !published {
-			_ = os.RemoveAll(staging)
-		}
-	}()
-	saved := make([]map[string]string, 0, len(outputs))
-	for index, out := range outputs {
-		staged := filepath.Join(staging, names[index])
-		var n int64
-		var digest string
-		e := fetch(out.MediaID, func(res localapi.MediaResponse) *exit.Error {
-			if res.ContentLength >= 0 && res.ContentLength != out.Length {
-				return exit.Named(exit.Validation, "media_length_mismatch",
-					"output %s declared Content-Length %d where its manifest declared %d B",
-					out.OutputID, res.ContentLength, out.Length)
-			}
-			if res.Digest != "" && res.Digest != out.Digest {
-				return exit.Named(exit.Validation, "media_digest_mismatch",
-					"output %s served header %s where its manifest declared %s",
-					out.OutputID, res.Digest, out.Digest)
-			}
-			var e *exit.Error
-			n, digest, e = receiveVerified(staged, out.Length, out.Digest, res.Body)
-			return e
-		})
-		if e != nil {
-			return nil, e
-		}
-		saved = append(saved, map[string]string{
-			"output": out.OutputID, "path": filepath.Join(dir, names[index]), "bytes": output.Bytes(n),
-			"media_id": out.MediaID, "mime": out.MimeType, "digest": digest,
-		})
-	}
-	if e := syncDirectory(staging); e != nil {
-		return nil, e
-	}
-	if _, err := os.Lstat(absolute); os.IsNotExist(err) {
-		if err := os.Rename(staging, absolute); err != nil {
-			return nil, exit.Internalf("cannot publish verified outputs to %s: %s", dir, err)
-		}
-		published = true
-		return saved, syncDirectory(parent)
-	}
-	for _, name := range names {
-		if err := os.Rename(filepath.Join(staging, name), filepath.Join(absolute, name)); err != nil {
-			return nil, exit.Internalf("cannot publish verified output %s: %s", name, err)
-		}
-	}
-	if e := syncDirectory(absolute); e != nil {
-		return nil, e
-	}
-	published = true
-	_ = os.Remove(staging)
-	return saved, nil
-}
-
-// receiveVerified writes at most expectedLength+1 bytes to path, fsyncs, and checks the
-// exact length and independent sha256 against the manifest.
-func receiveVerified(path string, expectedLength int64, expectedDigest string,
-	body io.Reader) (int64, string, *exit.Error) {
-	f, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o644)
-	if err != nil {
-		return 0, "", exit.Internalf("cannot stage %s: %s", filepath.Base(path), err)
-	}
-	hash := sha256.New()
-	length, err := io.Copy(io.MultiWriter(f, hash), io.LimitReader(body, expectedLength+1))
-	if err == nil {
-		err = f.Sync()
-	}
-	if closeErr := f.Close(); err == nil {
-		err = closeErr
-	}
-	if err != nil {
-		return length, "", exit.Internalf("cannot stage %s: %s", filepath.Base(path), err)
-	}
-	digest := "sha256:" + hex.EncodeToString(hash.Sum(nil))
-	if length != expectedLength {
-		return length, digest, exit.Named(exit.Validation, "media_length_mismatch",
-			"output %s received %d B where its manifest declared %d B",
-			filepath.Base(path), length, expectedLength)
-	}
-	if digest != expectedDigest {
-		return length, digest, exit.Named(exit.Validation, "media_digest_mismatch",
-			"output %s received %s where its manifest declared %s",
-			filepath.Base(path), digest, expectedDigest)
-	}
-	return length, digest, nil
-}
-
-// syncTree fsyncs every directory under root, children before parents.
-func syncDirectory(path string) *exit.Error {
-	if runtime.GOOS == "windows" {
-		return nil
-	}
-	dir, err := os.Open(path)
-	if err != nil {
-		return exit.Internalf("cannot open directory for sync: %s", err)
-	}
-	err = dir.Sync()
-	_ = dir.Close()
-	if err != nil {
-		return exit.Internalf("cannot make directory %s durable: %s", path, err)
-	}
-	return nil
-}
-
-// extensionOf names a file from the type the OUTPUT MANIFEST declared. An unknown or
-// opaque type gets NO invented extension: the mime is on the record, and a guessed suffix
-// would be this client making a claim about bytes it never looked at.
-//
-// TODAY EVERY LOCAL OUTPUT IS OPAQUE, and that is a real defect one layer down rather than
-// a gap here: `cozy_runtime.internal.worker.grants` writes
-// `mime_type="application/octet-stream"` on every OutputEntry, although the asset it just
-// encoded knows its own `media_type` (cr-016's own record says the file extension comes
-// from it). So the terminal declares no type, `/v1/media` serves every output as an
-// attachment, and `--out` writes `image` rather than `image.png`. Named in cl-010's record
-// as a cr-016/cr-017 seam; the day the manifest carries the real type, this table names
-// the file and nothing else changes.
-func extensionOf(mime string) string {
-	switch mime {
-	case "image/png":
-		return ".png"
-	case "image/jpeg":
-		return ".jpg"
-	case "image/webp":
-		return ".webp"
-	case "video/mp4":
-		return ".mp4"
-	case "audio/wav":
-		return ".wav"
-	case "application/json":
-		return ".json"
-	}
-	return ""
 }
 
 // opaqueType is the type an output carries when nobody declared one.

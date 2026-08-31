@@ -232,6 +232,13 @@ func TestOneSlotWorkerQueuesSamePackageAndCancellation(t *testing.T) {
 	if workers, readProblem := o.store.LiveWorkers(); readProblem != nil || len(workers) != 1 {
 		t.Fatalf("same-package queue acquired duplicate workers: %#v (%v)", workers, readProblem)
 	}
+	for i, requestID := range waiting {
+		position, depth := o.c.QueueState(requestID)
+		if position != i+1 || depth != len(waiting) {
+			t.Fatalf("queue snapshot for %s = %d/%d, want %d/%d",
+				requestID, position, depth, i+1, len(waiting))
+		}
+	}
 
 	// Cancel the FIFO head while it has no attempt. The following request must inherit
 	// the queue head and still execute when this one-slot worker reports capacity again.

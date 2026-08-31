@@ -152,7 +152,7 @@ CREATE TABLE IF NOT EXISTS outputs (
   mime_type  TEXT    NOT NULL,
   PRIMARY KEY (request_id, attempt, output_id),
   FOREIGN KEY (request_id, attempt) REFERENCES attempts(request_id, attempt)
-)`, `
+)`, outputExportSchema, `
 -- Cozy's first-wins typed artifact disposition and Runtime completion.
 CREATE TABLE IF NOT EXISTS artifact_finalizations (
   request_id         TEXT    NOT NULL,
@@ -453,6 +453,9 @@ type Request struct {
 	// InvocationSpec. Rev5 OutputBinding has no kind, so this may never be inferred from
 	// ordinary asset outputs or from whichever receipts happen to arrive.
 	ArtifactOutputs string
+	// OutputExport is a CLI-authenticated, descriptor-derived local publication intent.
+	// It is recorded in its own durable row in the same transaction as this request.
+	OutputExport *OutputExportIntent
 }
 
 // AssetBinding ties one payload asset field to the exact local bytes the request owns.
@@ -789,7 +792,7 @@ func (s *Store) BeginRequeue(id string, max int64) (count int64, started, cancel
 // same body digest answers the SAME request; the same key with a different body is a
 // conflict, never a second execution wearing one name.
 func (s *Store) Submit(r Request) (Request, bool, *exit.Error) {
-	r, assets, models, problem := prepareRequest(r)
+	r, assets, models, exportOutputs, problem := prepareRequest(r)
 	if problem != nil {
 		return Request{}, false, problem
 	}
@@ -798,7 +801,7 @@ func (s *Store) Submit(r Request) (Request, bool, *exit.Error) {
 		return Request{}, false, exit.Internalf("cannot begin request submission: %s", err)
 	}
 	defer tx.Rollback()
-	recorded, fresh, problem := submitRequestTx(tx, r, assets, models)
+	recorded, fresh, problem := submitRequestTx(tx, r, assets, models, exportOutputs)
 	if problem != nil {
 		return Request{}, false, problem
 	}
@@ -808,7 +811,7 @@ func (s *Store) Submit(r Request) (Request, bool, *exit.Error) {
 	return recorded, fresh, nil
 }
 
-func prepareRequest(r Request) (Request, string, string, *exit.Error) {
+func prepareRequest(r Request) (Request, string, string, string, *exit.Error) {
 	r.CreatedAt = now()
 	r.State = "submitted"
 	if r.Kind == "" {
@@ -819,7 +822,7 @@ func prepareRequest(r Request) (Request, string, string, *exit.Error) {
 		var err error
 		assets, err = json.Marshal(r.Assets)
 		if err != nil {
-			return Request{}, "", "", exit.Internalf("cannot record request %s assets: %s", r.ID, err)
+			return Request{}, "", "", "", exit.Internalf("cannot record request %s assets: %s", r.ID, err)
 		}
 	}
 	models := []byte("[]")
@@ -827,13 +830,17 @@ func prepareRequest(r Request) (Request, string, string, *exit.Error) {
 		var err error
 		models, err = json.Marshal(r.Models)
 		if err != nil {
-			return Request{}, "", "", exit.Internalf("cannot record request %s models: %s", r.ID, err)
+			return Request{}, "", "", "", exit.Internalf("cannot record request %s models: %s", r.ID, err)
 		}
 	}
-	return r, string(assets), string(models), nil
+	exportOutputs, problem := prepareOutputExport(r.OutputExport)
+	if problem != nil {
+		return Request{}, "", "", "", problem
+	}
+	return r, string(assets), string(models), exportOutputs, nil
 }
 
-func submitRequestTx(tx *sql.Tx, r Request, assets, models string) (Request, bool, *exit.Error) {
+func submitRequestTx(tx *sql.Tx, r Request, assets, models, exportOutputs string) (Request, bool, *exit.Error) {
 	existing, err := scanRequest(tx.QueryRow(
 		`SELECT `+requestCols+` FROM requests WHERE idem_key=?`, r.IdemKey))
 	if err == nil {
@@ -859,6 +866,9 @@ func submitRequestTx(tx *sql.Tx, r Request, assets, models string) (Request, boo
 		nullable(r.InstallID),
 		assets, models, r.ArtifactOutputs); err != nil {
 		return Request{}, false, exit.Internalf("cannot record request %s: %s", r.ID, err)
+	}
+	if problem := recordOutputExportTx(tx, r.ID, r.OutputExport, exportOutputs); problem != nil {
+		return Request{}, false, problem
 	}
 	return r, true, nil
 }

@@ -187,13 +187,13 @@ type RunExecuteCmd struct {
 	IdempotencyKey string   `help:"Stable request identity for safe retries."`
 	Trees          []string `name:"input-tree" help:"Bind a job input tree as ref=directory."`
 	Org            string   `help:"Job publication organization (defaults to local)."`
-	Detach         bool     `help:"Return after durable acceptance instead of following."`
+	Await          bool     `help:"Wait for the terminal result instead of returning after the short optimistic observation."`
 }
 
 func (c *RunExecuteCmd) Run(r *Runtime) error {
 	args := append([]string{c.Target}, c.Input...)
 	return r.call(handleRunExecute, args, bools(
-		"--stream", c.Stream, "--detach", c.Detach, "--rental", c.Rental), values(
+		"--stream", c.Stream, "--await", c.Await, "--rental", c.Rental), values(
 		"--out", c.Out, "--timeout", c.Timeout,
 		"--in", c.PayloadFile, "--asset", c.Assets,
 		"--model", c.Models,

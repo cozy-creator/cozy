@@ -68,7 +68,7 @@ type Pin struct {
 
 type Store struct{ db *sql.DB }
 
-const schemaVersion = 1
+const schemaVersion = 2
 
 // schema is the only records shape this pre-launch build accepts.
 var schema = append([]string{`
@@ -142,6 +142,11 @@ func Open(path string) (*Store, *exit.Error) {
 			db.Close()
 			return nil, e
 		}
+	} else if version == 1 {
+		if e := migrateOutputExports(db, path); e != nil {
+			db.Close()
+			return nil, e
+		}
 	} else if version != schemaVersion {
 		db.Close()
 		return nil, schemaReset(path,
@@ -196,13 +201,73 @@ func initialize(db *sql.DB, path string) *exit.Error {
 			return exit.Internalf("cannot initialize records schema in %s: %s", path, err)
 		}
 	}
-	if _, err := tx.Exec(`PRAGMA user_version=1`); err != nil {
+	if _, err := tx.Exec(`PRAGMA user_version=2`); err != nil {
 		return exit.Internalf("cannot stamp records schema in %s: %s", path, err)
 	}
 	if err := tx.Commit(); err != nil {
 		return exit.Internalf("cannot commit records initialization in %s: %s", path, err)
 	}
 	return nil
+}
+
+// migrateOutputExports is the one pre-launch records migration with a real durability
+// consumer: existing runs and rentals survive the addition of daemon-owned --out work.
+// The new object is created from the exact same DDL currentSchema uses, so strict schema
+// readback remains meaningful without rewriting any prior table.
+func migrateOutputExports(db *sql.DB, path string) *exit.Error {
+	tx, err := db.Begin()
+	if err != nil {
+		return exit.Internalf("cannot begin records migration in %s: %s", path, err)
+	}
+	defer tx.Rollback()
+	version, err := databaseVersion(tx)
+	if err != nil {
+		return exit.Internalf("cannot re-read records version in %s: %s", path, err)
+	}
+	if version == schemaVersion {
+		return nil
+	}
+	if version != 1 {
+		return schemaReset(path, "records database changed to user_version %d while migrating", version)
+	}
+	want, err := schemaWithoutOutputExports()
+	if err != nil {
+		return exit.Internalf("cannot derive version 1 records schema: %s", err)
+	}
+	got, err := schemaSnapshot(tx)
+	if err != nil {
+		return exit.Internalf("cannot inspect version 1 records schema in %s: %s", path, err)
+	}
+	if strings.Join(got, "\n") != strings.Join(want, "\n") {
+		return schemaReset(path, "records database schema is not the exact version 1 shape")
+	}
+	if _, err := tx.Exec(outputExportSchema); err != nil {
+		return exit.Internalf("cannot add durable output exports in %s: %s", path, err)
+	}
+	if _, err := tx.Exec(`PRAGMA user_version=2`); err != nil {
+		return exit.Internalf("cannot stamp records migration in %s: %s", path, err)
+	}
+	if err := tx.Commit(); err != nil {
+		return exit.Internalf("cannot commit records migration in %s: %s", path, err)
+	}
+	return nil
+}
+
+func schemaWithoutOutputExports() ([]string, error) {
+	db, err := sql.Open("sqlite", ":memory:"+pragmas)
+	if err != nil {
+		return nil, err
+	}
+	defer db.Close()
+	for _, stmt := range schema {
+		if stmt == outputExportSchema {
+			continue
+		}
+		if _, err := db.Exec(stmt); err != nil {
+			return nil, err
+		}
+	}
+	return schemaSnapshot(db)
 }
 
 func schemaReset(path, format string, args ...any) *exit.Error {

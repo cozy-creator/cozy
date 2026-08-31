@@ -792,6 +792,12 @@ func (c *Orchestrator) onOutcome(s *session, t *pb.AttemptOutcome) {
 		c.logf("AttemptOutcome %s#%d is an exact replay of a closed outcome: re-acked, "+
 			"nothing applied twice", t.RequestId, ordinal)
 	}
+	if !requeuing {
+		// Export settlement is deliberately separate from the execution terminal. A full
+		// destination does not rewrite success into failure, and an exact replay retries
+		// this durable row without mirroring worker bytes twice.
+		c.RetryOutputExport(t.RequestId)
+	}
 
 	// Artifact decisions are independent frames, but the worker may reclaim after Ack. Send
 	// every persisted first-wins intent now and withhold Ack until their exact results land.

@@ -10,7 +10,7 @@ import (
 	"github.com/cozy-creator/cozy/internal/records"
 )
 
-func TestRecordsSchemaIsExactV1AndStable(t *testing.T) {
+func TestRecordsSchemaIsExactV2AndStable(t *testing.T) {
 	path := t.TempDir() + "/records.db"
 	store, problem := records.Open(path)
 	fatal(t, problem)
@@ -21,8 +21,8 @@ func TestRecordsSchemaIsExactV1AndStable(t *testing.T) {
 	var version, before int
 	must(t, db.QueryRow(`PRAGMA user_version`).Scan(&version))
 	must(t, db.QueryRow(`PRAGMA schema_version`).Scan(&before))
-	if version != 1 {
-		t.Fatalf("fresh records version = %d, want exact v1", version)
+	if version != 2 {
+		t.Fatalf("fresh records version = %d, want exact v2", version)
 	}
 	for _, column := range []string{
 		"rental", "package_revision_digest", "environment_digest", "config_digest",
@@ -50,7 +50,71 @@ func TestRecordsSchemaIsExactV1AndStable(t *testing.T) {
 	var after int
 	must(t, db.QueryRow(`PRAGMA schema_version`).Scan(&after))
 	if after != before {
-		t.Fatalf("exact v1 reopen performed DDL: schema_version %d -> %d", before, after)
+		t.Fatalf("exact v2 reopen performed DDL: schema_version %d -> %d", before, after)
+	}
+}
+
+func TestRecordsMigratesExactV1OutputExportAddition(t *testing.T) {
+	path := t.TempDir() + "/records.db"
+	store, problem := records.Open(path)
+	fatal(t, problem)
+	store.Close()
+
+	db, err := sql.Open("sqlite", path)
+	must(t, err)
+	_, err = db.Exec(`DROP TABLE request_output_exports; PRAGMA user_version=1`)
+	must(t, err)
+	must(t, db.Close())
+
+	store, problem = records.Open(path)
+	fatal(t, problem)
+	store.Close()
+	db, err = sql.Open("sqlite", path)
+	must(t, err)
+	defer db.Close()
+	var version, exports int
+	must(t, db.QueryRow(`PRAGMA user_version`).Scan(&version))
+	must(t, db.QueryRow(`SELECT COUNT(*) FROM sqlite_master
+		WHERE type='table' AND name='request_output_exports'`).Scan(&exports))
+	if version != 2 || exports != 1 {
+		t.Fatalf("v1 output export migration = version %d, tables %d", version, exports)
+	}
+}
+
+func TestRecordsRefusesDriftedV1WithoutMigrating(t *testing.T) {
+	path := t.TempDir() + "/records.db"
+	store, problem := records.Open(path)
+	fatal(t, problem)
+	store.Close()
+	db, err := sql.Open("sqlite", path)
+	must(t, err)
+	_, err = db.Exec(`DROP TABLE request_output_exports;
+		ALTER TABLE requests ADD COLUMN compatibility_alias TEXT;
+		PRAGMA user_version=1`)
+	must(t, err)
+	var before int
+	must(t, db.QueryRow(`PRAGMA schema_version`).Scan(&before))
+	must(t, db.Close())
+
+	opened, problem := records.Open(path)
+	if opened != nil {
+		opened.Close()
+		t.Fatal("drifted v1 records schema migrated")
+	}
+	if problem == nil || problem.ErrName() != "records.schema_reset_required" {
+		t.Fatalf("drifted v1 refusal = %#v", problem)
+	}
+	db, err = sql.Open("sqlite", path)
+	must(t, err)
+	defer db.Close()
+	var version, after, exports int
+	must(t, db.QueryRow(`PRAGMA user_version`).Scan(&version))
+	must(t, db.QueryRow(`PRAGMA schema_version`).Scan(&after))
+	must(t, db.QueryRow(`SELECT COUNT(*) FROM sqlite_master
+		WHERE type='table' AND name='request_output_exports'`).Scan(&exports))
+	if version != 1 || after != before || exports != 0 {
+		t.Fatalf("refused v1 schema mutated: version=%d schema_version=%d->%d exports=%d",
+			version, before, after, exports)
 	}
 }
 
@@ -58,7 +122,7 @@ func TestRecordsRefusesOtherVersionWithoutMutation(t *testing.T) {
 	path := t.TempDir() + "/records.db"
 	db, err := sql.Open("sqlite", path)
 	must(t, err)
-	_, err = db.Exec(`CREATE TABLE older_owner(value TEXT); PRAGMA user_version=2`)
+	_, err = db.Exec(`CREATE TABLE older_owner(value TEXT); PRAGMA user_version=3`)
 	must(t, err)
 	var before int
 	must(t, db.QueryRow(`PRAGMA schema_version`).Scan(&before))
@@ -79,7 +143,7 @@ func TestRecordsRefusesOtherVersionWithoutMutation(t *testing.T) {
 	var version, after int
 	must(t, db.QueryRow(`PRAGMA user_version`).Scan(&version))
 	must(t, db.QueryRow(`PRAGMA schema_version`).Scan(&after))
-	if version != 2 || after != before {
+	if version != 3 || after != before {
 		t.Fatalf("refused schema mutated: version=%d schema_version=%d->%d", version, before, after)
 	}
 }
@@ -116,7 +180,7 @@ func TestRentalOperationReservesFleetRateAcrossStoreConnections(t *testing.T) {
 	}
 }
 
-func TestRecordsRefusesV1ShapeDrift(t *testing.T) {
+func TestRecordsRefusesV2ShapeDrift(t *testing.T) {
 	path := t.TempDir() + "/records.db"
 	store, problem := records.Open(path)
 	fatal(t, problem)
@@ -130,10 +194,10 @@ func TestRecordsRefusesV1ShapeDrift(t *testing.T) {
 	opened, problem := records.Open(path)
 	if opened != nil {
 		opened.Close()
-		t.Fatal("drifted v1 records schema opened")
+		t.Fatal("drifted v2 records schema opened")
 	}
 	if problem == nil || problem.ErrName() != "records.schema_reset_required" {
-		t.Fatalf("drifted v1 refusal = %#v", problem)
+		t.Fatalf("drifted v2 refusal = %#v", problem)
 	}
 }
 

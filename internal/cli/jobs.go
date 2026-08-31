@@ -66,21 +66,45 @@ func handleJobSubmit(ctx *Context, target Target, job *launch.Entrypoint) *exit.
 	if e != nil {
 		return e
 	}
+	if !ctx.Mode().JSON {
+		fmt.Fprintf(ctx.Err, "Invoking %s/%s...\n", handle.Package, handle.Function)
+	}
 	if ctx.Inv.Bool("--follow") {
 		return followJob(ctx, c, handle.JobID, began)
 	}
-	fields := []output.Field{
-		{K: "id", V: handle.JobID},
-		{K: "target", V: handle.Package + "/" + handle.Function},
-		{K: "job", V: handle.JobID},
-		{K: "package", V: handle.Package},
-		{K: "function", V: handle.Function},
-		{K: "status", V: handle.Status},
-		{K: "publication", V: handle.Repo},
-		{K: "changed", V: !handle.Replay},
+	terminal, problem := observe(ctx, c, handle.JobID, false, optimisticObservation, began)
+	if problem != nil {
+		return problem
 	}
-	rec := compactRecord(fields, "id", "target", "status", "changed")
-	rec.Next = []string{"cozy run cancel " + handle.JobID}
+	state, problem := c.Job(handle.JobID)
+	if problem != nil {
+		return problem
+	}
+	if terminal != nil || settled(state.Status) {
+		return renderJobTerminal(ctx, state, terminal, began)
+	}
+	return renderSubmittedJob(ctx, state, !handle.Replay)
+}
+
+func renderSubmittedJob(ctx *Context, state api.JobState, changed bool) *exit.Error {
+	fields := []output.Field{
+		{K: "run", V: state.JobID},
+		{K: "target", V: state.Package + "/" + state.Function},
+		{K: "status", V: runStatus(state.Status)},
+	}
+	defaults := []string{"target", "status"}
+	if state.QueuePosition != nil {
+		queue := fmt.Sprint(*state.QueuePosition)
+		if state.QueueDepth != nil && *state.QueueDepth >= *state.QueuePosition {
+			queue += "/" + fmt.Sprint(*state.QueueDepth)
+		}
+		fields = append(fields, output.Field{K: "queue", V: queue})
+		defaults = append(defaults, "queue")
+	}
+	fields = append(fields, output.Field{K: "changed", V: changed})
+	defaults = append(defaults, "run")
+	rec := compactRecord(fields, defaults...)
+	rec.Next = []string{"cozy run cancel " + state.JobID}
 	return emit(ctx, rec)
 }
 
@@ -192,7 +216,7 @@ func microUSD(n int64) string {
 
 // followJob attaches to the durable lifecycle stream and exits with the TERMINAL mapping.
 //
-// A job that finished while detached still yields its terminal: the durable lane is
+// A job that finished before --await attached still yields its terminal: the durable lane is
 // replayed from cursor 0, so the terminal event is delivered even though it was appended
 // before this process existed. That is the whole reason `follow` reads the durable stream
 // rather than watching for a live frame.
@@ -245,7 +269,7 @@ func followJob(ctx *Context, c *localapi.Client, jobID string, began time.Time) 
 		}
 	}()
 
-	lines := newJobProgress(ctx)
+	lines := newProgress(ctx, false, began)
 	terminal, e := c.WatchContext(watchCtx, jobID, 0, lines.on)
 	lines.done()
 	select {
@@ -267,6 +291,12 @@ func followJob(ctx *Context, c *localapi.Client, jobID string, began time.Time) 
 	if e != nil {
 		return e
 	}
+	return renderJobTerminal(ctx, state, terminal, began)
+}
+
+func renderJobTerminal(ctx *Context, state api.JobState, terminal *localapi.Event,
+	began time.Time,
+) *exit.Error {
 	status := localapi.StreamStatus(terminal)
 	if status == "" {
 		status = state.Status
@@ -297,10 +327,10 @@ func followJob(ctx *Context, c *localapi.Client, jobID string, began time.Time) 
 		}
 		return emit(ctx, rec)
 	}
-	err := exit.Named(code, status, "job %s ended %s", jobID, status)
+	err := exit.Named(code, status, "job %s ended %s", state.JobID, status)
 	if state.Error != "" {
 		err.Message = fmt.Sprintf("job %s ended %s: %s — %s",
-			jobID, status, state.ErrorType, state.Error)
+			state.JobID, status, state.ErrorType, state.Error)
 	}
 	if state.Requeues > 0 {
 		err.WithRemedy("the orchestrator's retry projection spent %d of a %d-attempt budget "+
@@ -310,41 +340,6 @@ func followJob(ctx *Context, c *localapi.Client, jobID string, began time.Time) 
 		err.WithNext("cozy run list --full")
 	}
 	return err
-}
-
-// jobProgress renders one rewritten human line on stderr. Jobs do not expose the serving
-// `--stream` lane; final JSON remains one document on stdout.
-type jobProgress struct {
-	ctx   *Context
-	last  string
-	dirty bool
-}
-
-func newJobProgress(ctx *Context) *jobProgress {
-	return &jobProgress{ctx: ctx}
-}
-
-func (p *jobProgress) on(e localapi.Event) bool {
-	if p.ctx.Mode().JSON || (!p.ctx.Mode().Color && !p.ctx.Mode().Full) {
-		return true
-	}
-	line := progressLine(e, p.ctx.Mode().Full)
-	if line == "" || line == p.last {
-		return true
-	}
-	p.last, p.dirty = line, true
-	if p.ctx.Mode().Color {
-		fmt.Fprintf(p.ctx.Err, "\r\033[K%s", line)
-	} else {
-		fmt.Fprintln(p.ctx.Err, line)
-	}
-	return true
-}
-
-func (p *jobProgress) done() {
-	if p.dirty && p.ctx.Mode().Color {
-		fmt.Fprintln(p.ctx.Err)
-	}
 }
 
 // ---------------------------------------------------------------------- job cancel

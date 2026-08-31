@@ -178,7 +178,9 @@ after it arrives in order, across a host restart. `id:` carries the cursor on th
 **Live** events (`event_id: 0`, `payload.live: true`) are the lossy lane: never durable,
 never replayed from a cursor. The LATEST tick is replayed immediately on connect so a
 mid-run subscriber renders current state. `request.progress` carries `value` (a fraction)
-and `seq`; `request.log`, `request.stage` and `request.metric` carry the worker's own.
+and `seq`; when Runtime reports measured production coordinates, `value` is an object with
+`name`, `fraction`, `position`, and `step_ms`. `request.log`, `request.stage` and
+`request.metric` carry the worker's own.
 
 Three rules a client may rely on:
 
@@ -293,8 +295,8 @@ Two answers a job carries that a request does not:
 - **`bill`** — ABSENT unless the host was configured with an explicit local rate. There is
   no `$0.00`: a fabricated zero is a claim about money nobody measured.
 
-`queue_position` is the orchestrator's scheduling fact; `requeues`/`retry_budget` are the
-record owner's durable-attempt facts. Several jobs submitted at once queue against one
+`queue_position` and `queue_depth` are one atomic orchestrator scheduling snapshot;
+`requeues`/`retry_budget` are the record owner's durable-attempt facts. Several jobs submitted at once queue against one
 worker and drain in submission order, while the retry projection over neutral outcomes
 spends a durable budget that the settlement names when it is exhausted.
 
