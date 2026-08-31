@@ -408,9 +408,8 @@ impl Store {
             );
         }
         let classification = match mutation {
-            crate::repository::Mutation::PutRelease {
-                manifest, metadata, ..
-            } => {
+            crate::repository::Mutation::PutRelease { manifest, .. }
+            | crate::repository::Mutation::ReplaceLocal { manifest, .. } => {
                 let parsed = self.read_manifest(manifest)?;
                 for (_, entry) in parsed.entries() {
                     let object = entry.blob();
@@ -422,6 +421,11 @@ impl Store {
                         );
                     }
                 }
+                let metadata = match mutation {
+                    crate::repository::Mutation::PutRelease { metadata, .. } => metadata.as_ref(),
+                    crate::repository::Mutation::ReplaceLocal { .. } => None,
+                    _ => unreachable!("classification mutation was matched above"),
+                };
                 if let Some(metadata) = metadata {
                     let file = self.open_verified(&metadata.sha256)?;
                     if file.len() != metadata.length {

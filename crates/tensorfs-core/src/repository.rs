@@ -4,7 +4,7 @@
 
 use std::cmp::Ordering;
 
-use crate::canon::{as_arr, Fields, Value};
+use crate::canon::{as_arr, as_str, Fields, Value};
 use crate::err::{refuse, Code, Result};
 use crate::ids::{ascii_name, hex64, prefixed, Doc, ObjectRef};
 
@@ -66,6 +66,24 @@ pub struct IngestProvenance {
     pub converter_build: String,
     pub converter_recipe: ObjectRef,
     pub sources: Vec<(String, u64)>,
+    /// Canonical credential-free origin, for example hf://org/repo@<commit> or
+    /// civitai://<version>. Never a signed/access URL or a local path.
+    pub source_uri: Option<String>,
+    /// Upstream declaration retained as evidence, never a TensorFS eligibility verdict.
+    pub declared_license: Option<String>,
+}
+
+fn bounded_fact(what: &str, value: &str, max: usize) -> Result<()> {
+    if value.is_empty()
+        || value.len() > max
+        || value.chars().any(|character| character.is_control())
+    {
+        return refuse(
+            Code::SIZE_CAP,
+            format!("{what} must be 1..={max} non-control UTF-8 bytes"),
+        );
+    }
+    Ok(())
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -156,6 +174,31 @@ impl ReleaseEvidence {
                     source.done()?;
                     sources.push((digest, generation));
                 }
+                let source_uri = ingest
+                    .opt("source_uri")
+                    .map(|value| {
+                        as_str("Release.evidence.ingest", "source_uri", value).map(str::to_string)
+                    })
+                    .transpose()?;
+                if let Some(value) = &source_uri {
+                    bounded_fact("Release.evidence.ingest.source_uri", value, 2048)?;
+                    if value.contains('?') || value.contains('#') {
+                        return refuse(
+                            Code::KEY_GRAMMAR,
+                            "ingest source_uri must be canonical and query/fragment-free",
+                        );
+                    }
+                }
+                let declared_license = ingest
+                    .opt("declared_license")
+                    .map(|value| {
+                        as_str("Release.evidence.ingest", "declared_license", value)
+                            .map(str::to_string)
+                    })
+                    .transpose()?;
+                if let Some(value) = &declared_license {
+                    bounded_fact("Release.evidence.ingest.declared_license", value, 512)?;
+                }
                 ingest.done()?;
                 if sources.is_empty() || sources.len() > 256 {
                     return refuse(
@@ -174,6 +217,8 @@ impl ReleaseEvidence {
                     converter_build,
                     converter_recipe,
                     sources,
+                    source_uri,
+                    declared_license,
                 })
             })
             .transpose()?;
@@ -235,32 +280,36 @@ impl ReleaseEvidence {
             Value::str(self.classification_digest.clone()),
         )];
         if let Some(ingest) = &self.ingest {
-            fields.push((
-                "ingest",
-                Value::obj(vec![
-                    (
-                        "converter_build",
-                        Value::str(ingest.converter_build.clone()),
+            let mut ingest_fields = vec![
+                (
+                    "converter_build",
+                    Value::str(ingest.converter_build.clone()),
+                ),
+                ("converter_recipe", ingest.converter_recipe.to_value()),
+                ("source_dialect", Value::str(ingest.source_dialect.clone())),
+                (
+                    "sources",
+                    Value::arr(
+                        ingest
+                            .sources
+                            .iter()
+                            .map(|(digest, generation)| {
+                                Value::obj(vec![
+                                    ("digest", Value::str(digest.clone())),
+                                    ("generation", Value::uint(*generation)),
+                                ])
+                            })
+                            .collect(),
                     ),
-                    ("converter_recipe", ingest.converter_recipe.to_value()),
-                    ("source_dialect", Value::str(ingest.source_dialect.clone())),
-                    (
-                        "sources",
-                        Value::arr(
-                            ingest
-                                .sources
-                                .iter()
-                                .map(|(digest, generation)| {
-                                    Value::obj(vec![
-                                        ("digest", Value::str(digest.clone())),
-                                        ("generation", Value::uint(*generation)),
-                                    ])
-                                })
-                                .collect(),
-                        ),
-                    ),
-                ]),
-            ));
+                ),
+            ];
+            if let Some(value) = &ingest.source_uri {
+                ingest_fields.push(("source_uri", Value::str(value.clone())));
+            }
+            if let Some(value) = &ingest.declared_license {
+                ingest_fields.push(("declared_license", Value::str(value.clone())));
+            }
+            fields.push(("ingest", Value::obj(ingest_fields)));
         }
         if let Some(verification) = &self.verification {
             fields.push((
@@ -446,6 +495,26 @@ impl Repository {
     pub fn document_sha256(&self) -> String {
         crate::sha256::hex_digest(&self.canonical_bytes())
     }
+
+    /// Creator's local alias is an ordinary Repository at a reserved location with one
+    /// hidden release. Keep this invariant in the canonical reader, not in every client.
+    pub fn local_release(&self) -> Result<&Release> {
+        if self.repo.org != "local" || self.releases.len() != 1 {
+            return refuse(
+                Code::ATTACHMENT_CARDINALITY,
+                "a local alias must be org local with exactly one release",
+            );
+        }
+        let release = &self.releases[0];
+        if release.lane != "local" {
+            return refuse(
+                Code::KEY_GRAMMAR,
+                "a local alias release must use lane local",
+            );
+        }
+        hex64("local source selection", &release.version)?;
+        Ok(release)
+    }
 }
 
 impl Doc for Repository {
@@ -496,6 +565,14 @@ pub enum Mutation {
         version: String,
         lane: String,
     },
+    /// Device-local mutable alias. The Repository still contains an ordinary immutable
+    /// release row, but replacement atomically swaps the complete one-row document.
+    ReplaceLocal {
+        repo: RepositoryName,
+        manifest: ObjectRef,
+        version: String,
+        evidence: Box<ReleaseEvidence>,
+    },
     DeleteRepository {
         repo: RepositoryName,
     },
@@ -541,6 +618,22 @@ impl Mutation {
                 repo: RepositoryName::from_value(fields.req("repo")?)?,
                 version: fields.req_str("version")?.to_string(),
             },
+            "replace_local" => {
+                let encoded = crate::canon::as_str(
+                    "RepositoryMutation",
+                    "evidence_base64",
+                    fields.req("evidence_base64")?,
+                )?;
+                Mutation::ReplaceLocal {
+                    evidence: Box::new(ReleaseEvidence::parse(&crate::b64::decode(encoded)?)?),
+                    manifest: ObjectRef::from_value(
+                        "RepositoryMutation.manifest",
+                        fields.req("manifest")?,
+                    )?,
+                    repo: RepositoryName::from_value(fields.req("repo")?)?,
+                    version: fields.req_str("version")?.to_string(),
+                }
+            }
             "delete_repository" => Mutation::DeleteRepository {
                 repo: RepositoryName::from_value(fields.req("repo")?)?,
             },
@@ -559,6 +652,7 @@ impl Mutation {
         match self {
             Mutation::PutRelease { repo, .. }
             | Mutation::RemoveRelease { repo, .. }
+            | Mutation::ReplaceLocal { repo, .. }
             | Mutation::DeleteRepository { repo } => repo,
         }
     }
@@ -614,6 +708,12 @@ pub fn apply(
             version,
             evidence,
         } => {
+            if repo.org == "local" {
+                return refuse(
+                    Code::KEY_GRAMMAR,
+                    "local repositories require replace_local and exactly one reserved lane",
+                );
+            }
             match (evidence.as_deref(), classification_digest) {
                 (Some(evidence), Some(classification_digest)) => {
                     let derived = prefixed("classification_digest", classification_digest)?;
@@ -653,12 +753,61 @@ pub fn apply(
                     })?,
             ))
         }
-        Mutation::RemoveRelease { version, lane, .. } => {
+        Mutation::RemoveRelease {
+            repo,
+            version,
+            lane,
+        } => {
+            if repo.org == "local" {
+                return refuse(
+                    Code::KEY_GRAMMAR,
+                    "local aliases are removed as a complete repository",
+                );
+            }
             let repository = existing.ok_or_else(|| crate::err::Refusal {
                 code: Code::REPOSITORY_ABSENT,
                 detail: "cannot remove a release from an absent repository".into(),
             })?;
             Ok(Some(repository.remove_release(version, lane)?))
+        }
+        Mutation::ReplaceLocal {
+            repo,
+            manifest,
+            version,
+            evidence,
+        } => {
+            if repo.org != "local" {
+                return refuse(Code::KEY_GRAMMAR, "replace_local requires org local");
+            }
+            hex64("local source selection", version)?;
+            let derived = prefixed(
+                "classification_digest",
+                classification_digest.ok_or_else(|| crate::err::Refusal {
+                    code: Code::MISSING_FIELD,
+                    detail: "a local CozyTensors alias requires model classification".into(),
+                })?,
+            )?;
+            if evidence.classification_digest != derived {
+                return refuse(
+                    Code::TOPOLOGY_MISMATCH,
+                    format!(
+                        "local evidence classification {} differs from derived {derived}",
+                        evidence.classification_digest
+                    ),
+                );
+            }
+            let repository = Repository {
+                releases: vec![Release {
+                    evidence: Some((**evidence).clone()),
+                    lane: "local".into(),
+                    manifest: manifest.clone(),
+                    metadata: None,
+                    version: version.clone(),
+                }],
+                repo: repo.clone(),
+            };
+            repository.validate()?;
+            Ok(Some(repository))
         }
         Mutation::DeleteRepository { .. } => {
             if existing.is_none() {
@@ -778,6 +927,43 @@ mod tests {
             .canonical_bytes()
             .len()
                 < MAX_REPOSITORY_BYTES
+        );
+    }
+
+    #[test]
+    fn ingest_origin_is_bounded_credential_free_evidence() {
+        let recipe = ObjectRef {
+            sha256: "44".repeat(32),
+            length: 12,
+        };
+        let source_uri = format!("hf://org/model@{}", "88".repeat(20));
+        let evidence = ReleaseEvidence {
+            classification_digest: format!("sha256:{}", "55".repeat(32)),
+            ingest: Some(IngestProvenance {
+                source_dialect: "safetensors.diffusers".into(),
+                converter_build: format!("sha256:{}", "66".repeat(32)),
+                converter_recipe: recipe.clone(),
+                sources: vec![(format!("sha256:{}", "77".repeat(32)), 1)],
+                source_uri: Some(source_uri.clone()),
+                declared_license: Some("apache-2.0".into()),
+            }),
+            verification: Some(VerificationEvidence::ApprovedProducer {
+                implementation: format!("sha256:{}", "66".repeat(32)),
+                recipe,
+            }),
+        };
+        assert_eq!(
+            ReleaseEvidence::parse(&evidence.canonical_bytes()).unwrap(),
+            evidence
+        );
+        let with_query = String::from_utf8(evidence.canonical_bytes())
+            .unwrap()
+            .replace(&source_uri, &format!("{source_uri}?token=secret"));
+        assert_eq!(
+            ReleaseEvidence::parse(with_query.as_bytes())
+                .unwrap_err()
+                .code,
+            Code::KEY_GRAMMAR
         );
     }
 }

@@ -1381,6 +1381,7 @@ pub fn cmd_install(
     name: &str,
     version: &str,
     lane: &str,
+    flags: &Flags,
 ) -> ExitCode {
     let store = ok!(Store::open(root));
     let dir = tx::candidate_dir(store.root(), session);
@@ -1426,6 +1427,9 @@ pub fn cmd_install(
             repo,
             version,
             lane,
+            source_uri: flag(flags, "source-uri"),
+            declared_license: flag(flags, "declared-license"),
+            observed_repository: flag(flags, "observed"),
         },
     ));
     println!("installed    {id} as {org}/{name} {version} {lane}");

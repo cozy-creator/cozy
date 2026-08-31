@@ -120,6 +120,36 @@ with tempfile.TemporaryDirectory(prefix="tensorfs-transfer-") as transfer_root:
         "manifest_digest": "sha256:" + snap,
         "manifest_length": len(info["manifest"]),
     }
+    local_a = destination.replace_local(
+        None, "dev-model", "sha256:" + "11" * 32,
+        snap, len(info["manifest"]), evidence,
+    )
+    assert destination.resolve_local("dev-model") == {
+        "name": "dev-model",
+        "source_selection": "sha256:" + "11" * 32,
+        "manifest_digest": "sha256:" + snap,
+        "manifest_length": len(info["manifest"]),
+    }
+    local_b = destination.replace_local(
+        local_a, "dev-model", "sha256:" + "22" * 32,
+        snap, len(info["manifest"]), evidence,
+    )
+    assert destination.repo_get("local", "dev-model") == local_b
+    assert destination.resolve_local("dev-model")["source_selection"] == "sha256:" + "22" * 32
+    try:
+        destination.replace_local(
+            local_a, "dev-model", "sha256:" + "33" * 32,
+            snap, len(info["manifest"]), evidence,
+        )
+        raise AssertionError("stale local alias replacement succeeded")
+    except tensorfs.errors.RepositoryConflict:
+        pass
+    destination.remove_local(local_b, "dev-model")
+    try:
+        destination.resolve_local("dev-model")
+        raise AssertionError("removed local alias resolved")
+    except tensorfs.errors.RepositoryAbsent:
+        pass
     try:
         destination.resolve_release("tensorhub", "smoke", "1.0.1", "cpu")
         raise AssertionError("missing release resolved")

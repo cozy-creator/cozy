@@ -36,6 +36,10 @@
 //!   tfs repo apply <current.json|-> <mutation.json> --out <replacement> --rows <jsonl>
 //!                  put_release also requires --manifest, --header and --inventory
 //!   tfs repo commit <store> <current.json|-> <mutation.json>
+//!   tfs local resolve <store> <name>
+//!   tfs local replace <store> <name> <source-sha256> <manifest> <length>
+//!                     --observed <repository-sha256|absent> --evidence <evidence.json>
+//!   tfs local remove <store> <name> --observed <repository-sha256>
 //!   tfs key blob|manifest <sha256> | repo <org> <name>
 //!   tfs gc headers <census> --out <requests.jsonl>
 //!   tfs gc plan <census> --holds <holds.jsonl> --out <plan.jsonl>
@@ -169,6 +173,11 @@ fn main() -> ExitCode {
         ["repo", "commit", store, current, mutation] => {
             repo::cmd_repo_commit(Path::new(store), current, Path::new(mutation), &flags)
         }
+        ["local", "resolve", store, name] => repo::cmd_local_resolve(Path::new(store), name),
+        ["local", "replace", store, name, source, manifest, length] => {
+            repo::cmd_local_replace(Path::new(store), name, source, manifest, length, &flags)
+        }
+        ["local", "remove", store, name] => repo::cmd_local_remove(Path::new(store), name, &flags),
         ["key", kind, rest @ ..] => repo::cmd_key(kind, rest),
         ["gc", "headers", census] => repo::cmd_gc_headers(Path::new(census), &flags),
         ["gc", "holds", store] => repo::cmd_gc_holds(Path::new(store), &flags),
@@ -184,7 +193,7 @@ fn main() -> ExitCode {
         ["ingest-worker", r, t] => ingest::cmd_worker(Path::new(r), t, &flags),
         ["ingest", "reingest", r, h, t] => ingest::cmd_reingest(Path::new(r), h, t, &flags),
         ["ingest", "install", r, s, org, name, version, lane] => {
-            ingest::cmd_install(Path::new(r), s, org, name, version, lane)
+            ingest::cmd_install(Path::new(r), s, org, name, version, lane, &flags)
         }
         ["ingest", "restamp", r, s] => ingest::cmd_restamp(Path::new(r), s, &flags),
         ["ingest", "reap", r] => ingest::cmd_reap(Path::new(r), &flags),
