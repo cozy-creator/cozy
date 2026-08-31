@@ -1,12 +1,12 @@
 {
   "compatible_profiles": [
-    "cpu-py311-torch213"
+    "torch2.13.0-cpu-cp312-linux-x86"
   ],
   "package_executions": [
     {
       "digest": "sha256:4e6fa14af107f04404713349d18bce5b8f4ec7da11c582db892b90688d854e2b",
       "function": "generate",
-      "profile": "cpu-py311-torch213",
+      "profile": "torch2.13.0-cpu-cp312-linux-x86",
       "state": "qualified"
     }
   ],
@@ -19,7 +19,7 @@
         "digest": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
         "length": 501
       },
-      "profile": "cpu-py311-torch213",
+      "profile": "torch2.13.0-cpu-cp312-linux-x86",
       "resolution_lock": {
         "digest": "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
         "length": 502
@@ -35,5 +35,5 @@
   "requirements": [
     "cozy-runtime>=0.0.3"
   ],
-  "requires_python": ">=3.14,<3.15"
+  "requires_python": ">=3.12,<3.13"
 }

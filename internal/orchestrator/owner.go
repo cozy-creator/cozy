@@ -404,8 +404,8 @@ func (c *Orchestrator) onClaimAck(w *worker, s *session, ack *pb.ClaimAck) *exit
 		return e
 	}
 	c.mu.Lock()
+	w.declaredInstance = ack.WorkerInstanceId
 	if w.spec.Connection != nil {
-		w.remoteInstance = ack.WorkerInstanceId
 		w.remoteWorkerID = ack.WorkerId
 	}
 	// The ClaimAck is the first thing this worker said; the silence clock runs from here.
@@ -423,45 +423,21 @@ func (c *Orchestrator) onClaimAck(w *worker, s *session, ack *pb.ClaimAck) *exit
 // instancePin is the IDENTITY FENCE on a claim, and #505's carried-not-verified gap in its
 // second place.
 //
-// The check used to be one comparison against `w.instanceID` — the name of the SLOT — and
-// that is the right question for exactly one lane. A worker this host SPAWNED was handed
-// `--instance-id`, so a different name at that address is a stranger and refuses.
-//
-// A rented pod is not that. This host never spawned it, never named it, and could not
-// have: the hub provisioned the worker before any owner attached, so the pod names its own
-// instance exactly as it mints its own boot id. Demanding it answer to the slot's name was
-// this host asking a machine it does not own to have been called something else — and it
-// only ever passed because the stand-in pod declared NO instance at all, which took the
-// empty-string branch. Carried and verified were the same branch again.
-//
-// So the rule splits the same way the release pin's does. SPAWNED: a declared identity that
-// is not ours is a stranger. ATTACHED: silence cannot be attributed — a terminal from an
-// unnamed instance belongs to nobody — and what this host holds a pod to is STABILITY: the
-// identity recorded at the first claim is the identity every later claim must carry, so a
-// DIFFERENT worker arriving at the same address is caught, which is the thing the old check
-// was actually protecting.
+// Creator names a stable worker slot, not the Runtime process incarnation. Runtime mints
+// the latter just as it mints its boot id. The claim must name an incarnation, and every
+// reconnect to this slot must keep it stable.
 func instancePin(w *worker, declared string) *exit.Error {
-	if w.spec.Connection == nil {
-		if declared != "" && declared != w.instanceID {
-			return exit.Named(exit.Conflict, "worker_instance_mismatch",
-				"the worker at this address answers as instance %q and this slot is %q",
-				declared, w.instanceID)
-		}
-		return nil
-	}
 	if declared == "" {
 		return exit.Named(exit.Conflict, "worker_instance_undeclared",
-			"this pod's ClaimAck declares no worker instance, so nothing it settles could be "+
+			"this worker's ClaimAck declares no worker instance, so nothing it settles could be "+
 				"attributed to a worker at all").
-			WithRemedy("a rented pod's worker is started with an instance identity; one that " +
+			WithRemedy("a worker mints an instance identity; one that " +
 				"will not say which worker it is cannot be dispatched to")
 	}
-	if w.remoteInstance != "" && w.remoteInstance != declared {
+	if w.declaredInstance != "" && w.declaredInstance != declared {
 		return exit.Named(exit.Conflict, "worker_instance_changed",
-			"this pod answered as instance %q and now answers as %q: a DIFFERENT worker is at "+
-				"the address this rental pinned", w.remoteInstance, declared).
-			WithRemedy("release the rental; a pod whose worker identity moved under this host " +
-				"is not the machine its attempts were dispatched to")
+			"this worker answered as instance %q and now answers as %q: a different process holds the slot",
+			w.declaredInstance, declared)
 	}
 	return nil
 }

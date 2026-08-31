@@ -23,8 +23,8 @@ import (
 )
 
 const weightlessRef = "cozy/cozy-weightless-package"
-const editableRuntimeFixtureSHA = "47a4f9e86aac8bd4fdb4f9d209ea07f0762b1adf"
-const editableTensorFSFixtureSHA = "f645ee6a777cd32dca22144985099faa2276af4b"
+const editableRuntimeFixtureSHA = "9e8409c0c68c6cae75209817ad47818770cde8db"
+const editableTensorFSFixtureSHA = "6b7ee6e5cfec5f34cdee0da9398ff8a91ce451b3"
 
 func TestLiteralPayloadUsesOrdinaryScalarSyntax(t *testing.T) {
 	entrypoint := &launch.Entrypoint{
@@ -58,7 +58,7 @@ func TestPackageHasOneActiveVersion(t *testing.T) {
 	}
 	first := install("a", "1.0.0", 1)
 	second := install("b", "2.0.0", 2)
-	second.SelectionProfile = "torch2.13.0-cpu-cp314-linux-x86"
+	second.SelectionProfile = "torch2.13.0-cpu-cp312-linux-x86"
 	second.PlacementSetDigest = "sha256:" + strings.Repeat("b", 64)
 	if _, problem = store.Activate(first); problem != nil {
 		t.Fatal(problem)
