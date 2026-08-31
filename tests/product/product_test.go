@@ -221,7 +221,7 @@ func TestRunAutoInstallsAMissingLocalPackage(t *testing.T) {
 	code, out := runCozyDir(t, root, ".", []string{"TENSORHUB_URL=" + server.URL},
 		"run", "proof/missing/generate")
 	if code != 1 || !strings.Contains(out, "is not installed; installing it from Tensorhub") ||
-		!strings.Contains(out, "no non-yanked package release") || strings.Contains(out, "is not installed on this host") {
+		!strings.Contains(out, "package has no non-yanked release") || strings.Contains(out, "is not installed on this host") {
 		t.Fatalf("missing package did not enter automatic registry installation [exit %d]\n%s", code, out)
 	}
 }
