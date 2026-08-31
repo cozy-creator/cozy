@@ -582,16 +582,11 @@ func (c *Orchestrator) onSnapshot(w *worker, s *session, snap *pb.WorkerSnapshot
 		return true
 	}
 	if w.spec.Connection != nil {
-		if c.opt.RentalPackageSet == nil {
-			c.logf("rental %s has no package_set signer", w.spec.Connection.RentalID)
-			return true
-		}
-		delegation, signature, problem := c.opt.RentalPackageSet(w.spec.Connection, nil, nil)
-		if problem != nil {
-			c.refuseClaim(w, problem)
-			return true
-		}
-		if e := c.convergePackageSet(s, w, delegation, signature); e != nil {
+		c.mu.Lock()
+		packages := clonePackageRefs(w.desiredPackages)
+		models := cloneModelRefs(w.desiredModels)
+		c.mu.Unlock()
+		if e := c.issuePackageSet(s, w, packages, models); e != nil {
 			c.logf("rental %s package_set could not be issued: %s",
 				w.spec.Connection.RentalID, e.Message)
 		}

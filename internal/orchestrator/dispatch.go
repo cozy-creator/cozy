@@ -599,13 +599,9 @@ func (c *Orchestrator) resolveFor(req records.Request) (WorkerLaunchSpec, string
 	if e != nil {
 		return WorkerLaunchSpec{}, "", e
 	}
-	delegation, signature, e := c.opt.RentalPackageSet(remote.Connection,
-		[]*pb.DownloadPackageRef{{Package: logical.Package, Release: logical.Release,
-			ReleaseDigest: logical.ReleaseDigest}}, nil)
-	if e != nil {
-		return WorkerLaunchSpec{}, "", e
-	}
-	if e := c.ConvergePackageSet(instance, delegation, signature); e != nil {
+	if e := c.ConvergePackageSet(instance, []*pb.DownloadPackageRef{{
+		Package: logical.Package, Release: logical.Release, ReleaseDigest: logical.ReleaseDigest,
+	}}, nil); e != nil {
 		return WorkerLaunchSpec{}, "", e
 	}
 	spec, planID, e := c.ensureLogicalPackageReady(instance, req.Worker, logical)

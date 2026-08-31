@@ -70,10 +70,11 @@ func (c *Orchestrator) ConvergePlacementSet(instanceID string, placements []Desi
 	return c.converge(s, w, placements)
 }
 
-// ConvergePackageSet sends Creator's signed logical package/model authority to
-// a private pod. These bytes never pass through PlacementSet or local platform
-// resolution; pod-supervisor verifies the signature and resolves downloads.
-func (c *Orchestrator) ConvergePackageSet(instanceID string, delegation, signature []byte) *exit.Error {
+// ConvergePackageSet sends Creator's signed logical package/model authority to a
+// private pod. The refs never pass through PlacementSet or local platform resolution;
+// pod-supervisor verifies the signature and resolves downloads.
+func (c *Orchestrator) ConvergePackageSet(instanceID string, packages []*pb.DownloadPackageRef,
+	models []*pb.DownloadModelRef) *exit.Error {
 	c.mu.Lock()
 	w := c.workers[instanceID]
 	var s *session
@@ -87,10 +88,19 @@ func (c *Orchestrator) ConvergePackageSet(instanceID string, delegation, signatu
 	if s == nil {
 		return exit.Unavailablef("worker %s holds no claimed control stream", instanceID)
 	}
-	return c.convergePackageSet(s, w, delegation, signature)
+	return c.issuePackageSet(s, w, packages, models)
 }
 
-func (c *Orchestrator) convergePackageSet(s *session, w *worker, delegation, signature []byte) *exit.Error {
+func (c *Orchestrator) issuePackageSet(s *session, w *worker, packages []*pb.DownloadPackageRef,
+	models []*pb.DownloadModelRef) *exit.Error {
+	if c.opt.RentalPackageSet == nil {
+		return exit.Named(exit.Unavailable, "rental.package_set_signer_missing",
+			"this Cozy daemon has no package_set signer")
+	}
+	delegation, signature, problem := c.opt.RentalPackageSet(w.spec.Connection, packages, models)
+	if problem != nil {
+		return problem
+	}
 	if len(delegation) == 0 || len(signature) != 64 {
 		return exit.Named(exit.Validation, "rental.delegation_incomplete",
 			"package_set requires canonical delegation bytes and one Ed25519 signature")
@@ -102,6 +112,8 @@ func (c *Orchestrator) convergePackageSet(s *session, w *worker, delegation, sig
 	revision := c.nextRevision()
 	c.mu.Lock()
 	w.revision, w.desiredRefusal = revision, nil
+	w.desiredPackages = clonePackageRefs(packages)
+	w.desiredModels = cloneModelRefs(models)
 	c.mu.Unlock()
 	d := &pb.DesiredWorkerState{
 		RecordOwnerEpoch: recordOwnerEpoch, ControlStreamGeneration: s.generation,
@@ -118,6 +130,31 @@ func (c *Orchestrator) convergePackageSet(s *session, w *worker, delegation, sig
 	c.logf("DesiredWorkerState revision=%d package_set delegation=%d B -> %s",
 		revision, len(delegation), s.bootID)
 	return nil
+}
+
+func clonePackageRefs(in []*pb.DownloadPackageRef) []*pb.DownloadPackageRef {
+	out := make([]*pb.DownloadPackageRef, 0, len(in))
+	for _, ref := range in {
+		if ref != nil {
+			out = append(out, &pb.DownloadPackageRef{
+				Package: ref.Package, Release: ref.Release, ReleaseDigest: ref.ReleaseDigest,
+			})
+		}
+	}
+	return out
+}
+
+func cloneModelRefs(in []*pb.DownloadModelRef) []*pb.DownloadModelRef {
+	out := make([]*pb.DownloadModelRef, 0, len(in))
+	for _, ref := range in {
+		if ref != nil {
+			out = append(out, &pb.DownloadModelRef{
+				Manifest: ref.Manifest, Model: ref.Model, Release: ref.Release,
+				Package: ref.Package, Slot: ref.Slot,
+			})
+		}
+	}
+	return out
 }
 
 func (c *Orchestrator) converge(s *session, w *worker, placements []DesiredPlacement) *exit.Error {

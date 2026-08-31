@@ -351,6 +351,12 @@ type worker struct {
 	// launcher's by construction.
 	remoteInstance string
 	remoteWorkerID string
+	// desiredPackages/models are Creator's logical private-rental intent. They survive a
+	// control-stream reconnect so the new authenticated stream does not reset a loaded
+	// worker to the empty package_set. They are refs only, never download locations or a
+	// locally reconstructed placement.
+	desiredPackages []*pb.DownloadPackageRef
+	desiredModels   []*pb.DownloadModelRef
 
 	// what the worker itself reported; the orchestrator echoes, never invents
 	exited bool
