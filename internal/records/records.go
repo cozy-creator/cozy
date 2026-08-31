@@ -68,7 +68,7 @@ type Pin struct {
 
 type Store struct{ db *sql.DB }
 
-const schemaVersion = 2
+const schemaVersion = 3
 
 // schema is applied only by the unversioned -> v1 migration.
 var schema = append([]string{`
@@ -260,8 +260,20 @@ func migrate(db *sql.DB, path string) *exit.Error {
 			return exit.Internalf("cannot add requests.max_cost_usd_micros in %s: %s", path, err)
 		}
 	}
-	if _, err := tx.Exec(`PRAGMA user_version=2`); err != nil {
-		return exit.Internalf("cannot stamp records schema 2 in %s: %s", path, err)
+	for _, column := range []struct{ name, ddl string }{
+		{"package_revision_digest", `TEXT NOT NULL DEFAULT ''`},
+		{"environment_digest", `TEXT NOT NULL DEFAULT ''`},
+		{"config_digest", `TEXT NOT NULL DEFAULT ''`},
+	} {
+		if requestColumns[column.name] {
+			continue
+		}
+		if _, err := tx.Exec(`ALTER TABLE requests ADD COLUMN ` + column.name + ` ` + column.ddl); err != nil {
+			return exit.Internalf("cannot add requests.%s in %s: %s", column.name, path, err)
+		}
+	}
+	if _, err := tx.Exec(`PRAGMA user_version=3`); err != nil {
+		return exit.Internalf("cannot stamp records schema 3 in %s: %s", path, err)
 	}
 	if err := tx.Commit(); err != nil {
 		return exit.Internalf("cannot commit records schema 2 in %s: %s", path, err)

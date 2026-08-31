@@ -11,7 +11,7 @@ import (
 	"github.com/cozy-creator/cozy/internal/records"
 )
 
-func TestRecordsV2MigrationIsAtomicAndMinimal(t *testing.T) {
+func TestRecordsV3MigrationIsAtomicAndMinimal(t *testing.T) {
 	path := t.TempDir() + "/records.db"
 	store, problem := records.Open(path)
 	fatal(t, problem)
@@ -73,7 +73,7 @@ func TestRecordsV2MigrationIsAtomicAndMinimal(t *testing.T) {
 	must(t, db.QueryRow(`PRAGMA user_version`).Scan(&version))
 	must(t, db.QueryRow(`PRAGMA schema_version`).Scan(&schemaVersion))
 	must(t, db.QueryRow(`PRAGMA quick_check`).Scan(&quick))
-	if version != 2 || quick != "ok" {
+	if version != 3 || quick != "ok" {
 		t.Fatalf("migrated version/quick_check = %d/%q", version, quick)
 	}
 	retained := map[string]bool{
@@ -127,7 +127,7 @@ func TestRecordsV2MigrationIsAtomicAndMinimal(t *testing.T) {
 	var reopenedSchemaVersion int
 	must(t, db.QueryRow(`PRAGMA schema_version`).Scan(&reopenedSchemaVersion))
 	if reopenedSchemaVersion != schemaVersion {
-		t.Fatalf("v2 open performed DDL: schema_version %d -> %d", schemaVersion, reopenedSchemaVersion)
+		t.Fatalf("v3 open performed DDL: schema_version %d -> %d", schemaVersion, reopenedSchemaVersion)
 	}
 }
 
@@ -166,8 +166,10 @@ func TestRecordsV1AddsDurableRequestBudget(t *testing.T) {
 	defer db.Close()
 	var version int
 	must(t, db.QueryRow(`PRAGMA user_version`).Scan(&version))
-	if version != 2 || !tableColumnNames(t, db, "requests")["max_cost_usd_micros"] {
-		t.Fatalf("v1->v2 migration = version %d", version)
+	columns := tableColumnNames(t, db, "requests")
+	if version != 3 || !columns["max_cost_usd_micros"] || !columns["package_revision_digest"] ||
+		!columns["environment_digest"] || !columns["config_digest"] {
+		t.Fatalf("v1->v3 migration = version %d columns=%v", version, columns)
 	}
 }
 
@@ -175,7 +177,7 @@ func TestRecordsRefusesFutureSchemaWithoutMutation(t *testing.T) {
 	path := t.TempDir() + "/records.db"
 	db, err := sql.Open("sqlite", path)
 	must(t, err)
-	_, err = db.Exec(`CREATE TABLE future_owner(value TEXT); PRAGMA user_version=3`)
+	_, err = db.Exec(`CREATE TABLE future_owner(value TEXT); PRAGMA user_version=4`)
 	must(t, err)
 	var before int
 	must(t, db.QueryRow(`PRAGMA schema_version`).Scan(&before))
@@ -196,7 +198,7 @@ func TestRecordsRefusesFutureSchemaWithoutMutation(t *testing.T) {
 	var version, after int
 	must(t, db.QueryRow(`PRAGMA user_version`).Scan(&version))
 	must(t, db.QueryRow(`PRAGMA schema_version`).Scan(&after))
-	if version != 3 || after != before {
+	if version != 4 || after != before {
 		t.Fatalf("future schema mutated: version=%d schema_version=%d->%d", version, before, after)
 	}
 	var names string
