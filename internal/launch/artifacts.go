@@ -131,6 +131,17 @@ func RefreshLocalBase(cozyHome, path string, env []string) (string, *exit.Error)
 	return bin, nil
 }
 
+// RefreshGenerationBase observes the exact Runtime carried by an installed generation.
+// Production remote preflight receives these bytes from Tensorhub; product proofs use this
+// owner function to furnish an equally exact active-base response without opening another
+// Runtime execution door.
+func RefreshGenerationBase(generation records.PackageInstall, cozyHome, path string,
+	env []string,
+) *exit.Error {
+	runtime := RuntimeCLI{Bin: Binary(generation), Dir: SourceDir(generation), Home: cozyHome, Env: env}
+	return runtime.call(nil, "local-base", "--out", path)
+}
+
 // PreparedOnLocalBase verifies only byte identity: Runtime owns the manifest
 // schema and staged its exact bytes into the generation cache during preparation.
 func PreparedOnLocalBase(generation records.PackageInstall, current string) bool {

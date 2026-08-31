@@ -2,6 +2,8 @@ package producttest
 
 import (
 	"bytes"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"net/http"
@@ -30,6 +32,7 @@ func TestRentalRunAcquiresCheapestOnceAndReleasesFailedPreAttempt(t *testing.T) 
 	var createReason, deleteReason string
 	activeRentalID := "pr-managed-e2e"
 	posts, deletes := 0, 0
+	root := t.TempDir()
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		mu.Lock()
 		defer mu.Unlock()
@@ -66,6 +69,23 @@ func TestRentalRunAcquiresCheapestOnceAndReleasesFailedPreAttempt(t *testing.T) 
 				{"name": "h200", "accelerator_model": "H200", "compute_capability": "9.0", "vram_gb": 141, "minimum_ram_per_gpu_gb": 128, "price_usd_micros_per_hour": 6_000_000},
 				{"name": "cheap", "accelerator_model": "GPU C", "compute_capability": "8.9", "vram_gb": 24, "minimum_ram_per_gpu_gb": 32, "price_usd_micros_per_hour": 300_000},
 			})
+		case r.Method == http.MethodGet && r.URL.Path == "/v1/base-worker-manifests":
+			raw, err := os.ReadFile(filepath.Join(root, "active-base.json"))
+			if err != nil {
+				t.Error(err)
+				http.Error(w, "local base absent", http.StatusInternalServerError)
+				return
+			}
+			sum := sha256.Sum256(raw)
+			digest := "sha256:" + hex.EncodeToString(sum[:])
+			_ = json.NewEncoder(w).Encode([]map[string]any{{
+				"wheelhouse_manifest_digest": digest,
+				"wheelhouse_manifest":        json.RawMessage(raw),
+				"base_worker_image_digest":   digest,
+				"compatibility_profile":      map[string]any{},
+				"platform_target":            map[string]any{},
+				"activated_at":               "2026-08-31T00:00:00Z",
+			}})
 		case r.Method == http.MethodPost && r.URL.Path == "/v1/rentals":
 			posts++
 			createReason = r.Header.Get("X-Tensorhub-Reason")
@@ -119,7 +139,6 @@ func TestRentalRunAcquiresCheapestOnceAndReleasesFailedPreAttempt(t *testing.T) 
 	}))
 	defer server.Close()
 
-	root := t.TempDir()
 	must(t, os.WriteFile(filepath.Join(root, "config.yaml"), []byte(
 		"tensorhub_url: "+server.URL+"\ntensorhub_token: test-token\nport: 0\n"+
 			"rentals:\n  max_hourly_spend_usd: 7.00\n"), 0o600))
@@ -129,6 +148,8 @@ func TestRentalRunAcquiresCheapestOnceAndReleasesFailedPreAttempt(t *testing.T) 
 		t.Fatalf("fixture install [exit %d]\n%s", code, out)
 	}
 	local := activePackageInstall(t, root)
+	fatal(t, launch.RefreshGenerationBase(local, root,
+		filepath.Join(root, "active-base.json"), childEnv(t, root)))
 	descriptor, _ = os.ReadFile(launch.DescriptorPath(local.Dir))
 	decoded, problem := launch.DecodeDescriptor(descriptor)
 	fatal(t, problem)
