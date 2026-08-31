@@ -245,9 +245,14 @@ func acquireRental(ctx *Context, l home.Layout, st *records.Store, skuName, requ
 		return records.Rental{}, hub.Rental{}, false, e
 	}
 	if remote.HourlyRateUSDMicros != hourlyRateUSDMicros {
+		_ = st.AdvanceRentalOperation(operationKey, remote.ID, hub.RentalReleaseRequested)
+		hctx, cancel := hub.Context()
+		_ = c.Release(hctx, remote.ID, "locked Cozy retail rate changed")
+		cancel()
 		return records.Rental{}, hub.Rental{}, false, exit.Named(exit.Conflict, "rental.hourly_rate_changed",
 			"rental %s locked %d USD micros/hour, not catalog rate %d",
-			remote.ID, remote.HourlyRateUSDMicros, hourlyRateUSDMicros)
+			remote.ID, remote.HourlyRateUSDMicros, hourlyRateUSDMicros).
+			WithRemedy("Creator requested immediate release and retained the operation until Tensorhub proves absence")
 	}
 	machineName := requestedMachineName
 	if machineName == "" {
