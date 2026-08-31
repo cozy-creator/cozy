@@ -111,6 +111,27 @@ func TestProgressWatchOpensAfterSnapshotBarrier(t *testing.T) {
 	t.Fatal("the progress connection did not open after the snapshot barrier")
 }
 
+func TestDesiredStatePreconditionFailsWithoutReconnect(t *testing.T) {
+	o := hostOwner(t, "desired-precondition")
+	spec := fakeSpec("desired-precondition", "0", "--arm", "precondition")
+	instance, _, problem := o.c.EnsureWorker(spec)
+	fatal(t, problem)
+
+	started := time.Now()
+	problem = o.c.EnsurePlacementReady(instance, planIDOf(t, spec))
+	if problem == nil || problem.ErrName() != "worker.desired_state_refused" ||
+		!strings.Contains(problem.Message, "Runtime package preparation failed") {
+		t.Fatalf("FailedPrecondition did not reach the desired-state waiter: %v", problem)
+	}
+	if elapsed := time.Since(started); elapsed > 3*time.Second {
+		t.Fatalf("FailedPrecondition waited %s instead of failing immediately", elapsed)
+	}
+	time.Sleep(450 * time.Millisecond) // more than two former 200 ms reconnect periods
+	if claims := countEvents(o, "ClaimAck boot="); claims != 1 {
+		t.Fatalf("permanent desired-state refusal opened %d control sessions", claims)
+	}
+}
+
 func TestPackageScopedUnloadPreservesUnrelatedWarmWorker(t *testing.T) {
 	o := hostOwner(t, "package-scoped-unload")
 	for _, id := range []string{"old-editable-install", "current-editable-install"} {

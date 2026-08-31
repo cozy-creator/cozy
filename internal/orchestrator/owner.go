@@ -10,8 +10,10 @@ import (
 	"time"
 
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/credentials"
 	"google.golang.org/grpc/credentials/insecure"
+	"google.golang.org/grpc/status"
 
 	"github.com/cozy-creator/cozy/internal/canonical"
 	"github.com/cozy-creator/cozy/internal/exit"
@@ -108,6 +110,9 @@ func (c *Orchestrator) attach(w *worker) {
 		err := c.converse(w, addr)
 		if err != nil {
 			c.logf("worker %s: control stream ended: %s", w.instanceID, err)
+			if c.refusePendingDesiredState(w, err) {
+				return
+			}
 		}
 		c.mu.Lock()
 		if w.spawned.IsZero() && w.lastReport.IsZero() {
@@ -124,6 +129,28 @@ func (c *Orchestrator) attach(w *worker) {
 		// resolution (the worker republishes nothing; its listener persists), not a bound.
 		time.Sleep(200 * time.Millisecond)
 	}
+}
+
+// FailedPrecondition is the worker host's final answer when it could not apply the
+// desired revision. Redialing cannot make that exact revision acceptable, and hiding the
+// status behind reconnects leaves the request waiting for a state the worker rejected.
+func (c *Orchestrator) refusePendingDesiredState(w *worker, err error) bool {
+	if status.Code(err) != codes.FailedPrecondition {
+		return false
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if w.revision == 0 || w.acceptedRevision >= w.revision {
+		return false
+	}
+	detail := status.Convert(err).Message()
+	if len(detail) > 1024 {
+		detail = detail[:1024] + "…"
+	}
+	w.desiredRefusal = exit.Named(exit.Structural, "worker.desired_state_refused",
+		"worker rejected desired revision %d before applying it: %s",
+		w.revision, detail)
+	return true
 }
 
 // workerAddr resolves the dialable address: the remote spec's own, or the file-handoff
@@ -251,7 +278,7 @@ func (c *Orchestrator) converse(w *worker, addr string) error {
 		frame, err := stream.Recv()
 		if err != nil {
 			c.dropSession(s)
-			return fmt.Errorf("receive worker frame: %w", err)
+			return err
 		}
 		switch m := frame.Msg.(type) {
 		case *pb.WorkerFrame_ClaimAck:
