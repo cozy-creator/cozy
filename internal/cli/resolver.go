@@ -593,7 +593,7 @@ func (r *Resolver) generation(ref string) (*records.PackageInstall, *exit.Error)
 // splitMajor cuts `org/name@vN` into its parts.
 func splitMajor(ref string) (pkg string, major int, ok bool) {
 	name, suffix, cut := strings.Cut(ref, "@v")
-	if !cut {
+	if !cut || suffix == "" || len(suffix) > 1 && suffix[0] == '0' {
 		return ref, 0, false
 	}
 	n := 0

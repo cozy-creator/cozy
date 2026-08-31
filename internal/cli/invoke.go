@@ -1321,7 +1321,11 @@ func invocationTarget(ctx *Context) (Target, *launch.PackageDescriptor, *exit.Er
 	return target, facts.PackageDescriptor, nil
 }
 
-func newestPackageRelease(releases []hub.ReleaseSummary) (string, *exit.Error) {
+func newestPackageRelease(releases []hub.ReleaseSummary, majors ...int) (string, *exit.Error) {
+	wantedMajor := -1
+	if len(majors) == 1 {
+		wantedMajor = majors[0]
+	}
 	best := ""
 	bestVersion := [3]int{-1, -1, -1}
 	for _, row := range releases {
@@ -1342,10 +1346,11 @@ func newestPackageRelease(releases []hub.ReleaseSummary) (string, *exit.Error) {
 			}
 			version[i] = value
 		}
-		if valid && (version[0] > bestVersion[0] ||
-			version[0] == bestVersion[0] && version[1] > bestVersion[1] ||
-			version[0] == bestVersion[0] && version[1] == bestVersion[1] &&
-				version[2] > bestVersion[2]) {
+		if valid && (wantedMajor < 0 || version[0] == wantedMajor) &&
+			(version[0] > bestVersion[0] ||
+				version[0] == bestVersion[0] && version[1] > bestVersion[1] ||
+				version[0] == bestVersion[0] && version[1] == bestVersion[1] &&
+					version[2] > bestVersion[2]) {
 			best, bestVersion = row.Release, version
 		}
 	}
@@ -1407,6 +1412,7 @@ func generationFacts(ctx *Context, pkg string) (*launch.Facts, *exit.Error) {
 }
 
 func installedPackage(ctx *Context, pkg string) (*records.PackageInstall, *exit.Error) {
+	bare, major, hasMajor := splitMajor(pkg)
 	l, e := home.Open(ctx.Cfg.Home)
 	if e != nil {
 		return nil, e
@@ -1416,7 +1422,7 @@ func installedPackage(ctx *Context, pkg string) (*records.PackageInstall, *exit.
 		return nil, e
 	}
 	defer store.Close()
-	pins, e := store.Pins(pkg)
+	pins, e := store.Pins(bare)
 	if e != nil {
 		return nil, e
 	}
@@ -1425,8 +1431,19 @@ func installedPackage(ctx *Context, pkg string) (*records.PackageInstall, *exit.
 			WithRemedy("`cozy package list` lists what is").
 			WithNext("cozy package search "+pkg, "cozy package list")
 	}
-	chosen := pins[0]
-	for _, pin := range pins[1:] {
+	eligible := pins[:0]
+	for _, pin := range pins {
+		if !hasMajor || pin.Major == major {
+			eligible = append(eligible, pin)
+		}
+	}
+	if len(eligible) == 0 {
+		return nil, exit.New(exit.NotFound, "%s is not installed on this host", pkg).
+			WithRemedy("`cozy package list` lists installed majors").
+			WithNext("cozy package list")
+	}
+	chosen := eligible[0]
+	for _, pin := range eligible[1:] {
 		if pin.ActivatedAt > chosen.ActivatedAt {
 			chosen = pin
 		}

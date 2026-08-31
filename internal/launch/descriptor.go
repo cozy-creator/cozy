@@ -516,7 +516,7 @@ func validateEntrypoint(ep *Entrypoint) *exit.Error {
 
 var (
 	productionNamePattern   = regexp.MustCompile(`^[a-z][a-z0-9_-]{0,63}$`)
-	callablePattern         = regexp.MustCompile(`^[a-z0-9][a-z0-9._-]{0,63}/[a-z0-9][a-z0-9._-]{0,63}/[a-z][a-z0-9_-]{0,63}$`)
+	callablePattern         = regexp.MustCompile(`^[a-z0-9][a-z0-9._-]{0,63}/[a-z0-9][a-z0-9._-]{0,63}@v(?:0|[1-9][0-9]*)/[a-z][a-z0-9_-]{0,63}$`)
 	contractPattern         = regexp.MustCompile(`^[a-z0-9][a-z0-9._+-]{0,63}(?:/[a-z0-9][a-z0-9._+-]{0,63})*$`)
 	productionDigestPattern = regexp.MustCompile(`^sha256:[0-9a-f]{64}$`)
 )

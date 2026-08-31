@@ -593,11 +593,11 @@ func productionResumeStage(operation records.ModelProductionOperation,
 }
 
 func splitProductionCallable(value string) (string, string, bool) {
-	parts := strings.Split(value, "/")
-	if len(parts) != 3 {
+	target, problem := parseProductionCallable(value)
+	if problem != nil {
 		return "", "", false
 	}
-	return parts[0] + "/" + parts[1], parts[2], true
+	return target.Package, target.Function, true
 }
 
 func productionRequestKey(operationID, step string) string {

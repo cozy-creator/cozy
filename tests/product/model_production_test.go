@@ -200,9 +200,13 @@ func TestModelProductionSourceRequestHonorsCancellationContext(t *testing.T) {
 }
 
 func TestRemoteModelProductionResolvesHubMetadataWithoutLocalInstall(t *testing.T) {
-	producerBytes := []byte(`{"application":"remote_producer:app","entrypoints":[],"format":"cozy.package.descriptor/1","jobs":[],"model_productions":[{"name":"build","steps":[{"callable":"proof/remote-job/derive","models":{"source":"source"},"name":"derive","outputs":["model"],"resources":{"gpu_count":1,"placement":"single_node","requires":"sm90+,vram80g,ram64g"}}],"outputs":[{"lane_key":"bf16","name":"bf16","required_contract":{"encodings":["sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"],"topology_digest":"sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"},"source":"derive.model"}],"sources":{"source":"proof/source/1"}}]}`)
+	producerBytes := []byte(`{"application":"remote_producer:app","entrypoints":[],"format":"cozy.package.descriptor/1","jobs":[],"model_productions":[{"name":"build","steps":[{"callable":"proof/remote-job@v3/derive","models":{"source":"source"},"name":"derive","outputs":["model"],"resources":{"gpu_count":1,"placement":"single_node","requires":"sm90+,vram80g,ram64g"}}],"outputs":[{"lane_key":"bf16","name":"bf16","required_contract":{"encodings":["sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"],"topology_digest":"sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"},"source":"derive.model"}],"sources":{"source":"proof/source/1"}}]}`)
 	producer, problem := launch.DecodeDescriptor(producerBytes)
 	fatal(t, problem)
+	if _, invalid := launch.DecodeDescriptor(bytes.ReplaceAll(producerBytes,
+		[]byte("remote-job@v3"), []byte("remote-job@v03"))); invalid == nil {
+		t.Fatal("descriptor accepted a non-canonical production callable major")
+	}
 	jobBytes := []byte(`{"application":"remote_job:app","entrypoints":[],"format":"cozy.package.descriptor/1","jobs":[{"artifact_outputs":[{"max_bytes":4096,"mime_type":"application/vnd.cozy.model-manifest","output_id":"model"}],"models":[{"class":"ProofModel","component_use":{},"path":"derive.models.source","stamps":{}}],"name":"derive","publishes":false,"request":{"fields":[]},"resources":{"gpu_count":1,"placement":"single_node","requires":"sm90+,vram80g,ram64g"},"result":{"fields":[]}}],"model_productions":[]}`)
 	job, problem := launch.DecodeDescriptor(jobBytes)
 	fatal(t, problem)
@@ -230,6 +234,11 @@ func TestRemoteModelProductionResolvesHubMetadataWithoutLocalInstall(t *testing.
 		})
 	}
 	requests := []string{}
+	jobReleases := []map[string]any{
+		{"release": "2.9.0", "cut_at": "2026-08-31T00:00:00Z"},
+		{"release": "3.0.0", "cut_at": "2026-08-31T00:00:00Z"},
+		{"release": "4.0.0", "cut_at": "2026-08-31T00:00:00Z"},
+	}
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		requests = append(requests, r.Method+" "+r.URL.Path)
 		w.Header().Set("Content-Type", "application/json")
@@ -258,10 +267,7 @@ func TestRemoteModelProductionResolvesHubMetadataWithoutLocalInstall(t *testing.
 			_ = json.NewEncoder(w).Encode(map[string]any{
 				"package": map[string]any{"org": "proof", "name": "remote-job",
 					"created_at": "2026-08-31T00:00:00Z"},
-				"releases": []map[string]any{
-					{"release": "2.0.0", "cut_at": "2026-08-31T00:00:00Z"},
-					{"release": "3.0.0", "cut_at": "2026-08-31T00:00:00Z"},
-				},
+				"releases": jobReleases,
 			})
 		case r.Method == http.MethodGet &&
 			r.URL.Path == "/v1/packages/proof/remote-job/releases/3.0.0":
@@ -290,6 +296,17 @@ func TestRemoteModelProductionResolvesHubMetadataWithoutLocalInstall(t *testing.
 			"GET /v1/packages/proof/remote-job/releases/3.0.0" {
 		t.Fatalf("remote production metadata routes =\n%s", got)
 	}
+	jobReleases = []map[string]any{
+		{"release": "2.9.0", "cut_at": "2026-08-31T00:00:00Z"},
+		{"release": "4.0.0", "cut_at": "2026-08-31T00:00:00Z"},
+	}
+	requests = nil
+	code, out = runCozyDir(t, root, "", []string{"PATH=/usr/bin:/bin"},
+		"model", "publish", "acme/output", "acme/input@1.0.0", "--release", "1.0.0",
+		"--producer", "proof/remote-producer/build", "--rental", "--dry-run")
+	if code == 0 || !strings.Contains(out, "no active immutable release in v3") {
+		t.Fatalf("missing production callable major [exit %d]\n%s", code, out)
+	}
 	requests = nil
 	code, out = runCozyDir(t, root, "", []string{"PATH=/usr/bin:/bin"},
 		"model", "publish", "acme/output", "acme/input@1.0.0", "--release", "1.0.0",
@@ -303,7 +320,7 @@ func TestRemoteModelProductionResolvesHubMetadataWithoutLocalInstall(t *testing.
 }
 
 func TestDetachedModelProductionResumesInDaemonAndKeepsFrozenPackagePlan(t *testing.T) {
-	producerBytes := []byte(`{"application":"remote_producer:app","entrypoints":[],"format":"cozy.package.descriptor/1","jobs":[],"model_productions":[{"name":"build","steps":[{"callable":"proof/remote-job/derive","models":{"source":"source"},"name":"derive","outputs":["model"],"resources":{"gpu_count":1,"placement":"single_node","requires":"sm90+,vram80g,ram64g"}}],"outputs":[{"lane_key":"bf16","name":"bf16","required_contract":{"encodings":["sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"],"topology_digest":"sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"},"source":"derive.model"}],"sources":{"source":"proof/source/1"}}]}`)
+	producerBytes := []byte(`{"application":"remote_producer:app","entrypoints":[],"format":"cozy.package.descriptor/1","jobs":[],"model_productions":[{"name":"build","steps":[{"callable":"proof/remote-job@v3/derive","models":{"source":"source"},"name":"derive","outputs":["model"],"resources":{"gpu_count":1,"placement":"single_node","requires":"sm90+,vram80g,ram64g"}}],"outputs":[{"lane_key":"bf16","name":"bf16","required_contract":{"encodings":["sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"],"topology_digest":"sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"},"source":"derive.model"}],"sources":{"source":"proof/source/1"}}]}`)
 	producer, problem := launch.DecodeDescriptor(producerBytes)
 	fatal(t, problem)
 	jobBytes := []byte(`{"application":"remote_job:app","entrypoints":[],"format":"cozy.package.descriptor/1","jobs":[{"artifact_outputs":[{"max_bytes":4096,"mime_type":"application/vnd.cozy.model-manifest","output_id":"model"}],"models":[{"class":"ProofModel","component_use":{},"path":"derive.models.source","stamps":{}}],"name":"derive","publishes":false,"request":{"fields":[]},"resources":{"gpu_count":1,"placement":"single_node","requires":"sm90+,vram80g,ram64g"},"result":{"fields":[]}}],"model_productions":[]}`)
@@ -502,7 +519,7 @@ func TestModelProductionOperationSurvivesRestartAndReplaysExactly(t *testing.T) 
 		Producer: "tensorhub/minimax-h3-tools/four-lane", ProducerRelease: "1.0.0",
 		ProducerDigest:   "sha256:" + strings.Repeat("d", 64),
 		DescriptorDigest: "sha256:" + strings.Repeat("e", 64),
-		Jobs: []modelproduction.JobPin{{Step: "full", Callable: "tensorhub/minimax-h3-tools/assemble",
+		Jobs: []modelproduction.JobPin{{Step: "full", Callable: "tensorhub/minimax-h3-tools@v2/assemble",
 			Release: "1.0.0", ReleaseDigest: "sha256:" + strings.Repeat("f", 64),
 		}},
 	}
@@ -705,12 +722,12 @@ func TestModelProductionAmbiguousCutReplaysExactlyAfterDaemonRestart(t *testing.
 		Source:   "hf://acme/model@" + strings.Repeat("a", 40),
 		Producer: "acme/tools/build", Rental: true}
 	production := &launch.ModelProduction{Name: "build", Sources: map[string]string{"source": "proof/source/1"},
-		Steps: []launch.ModelProductionStep{{Name: "derive", Callable: "acme/job/derive",
+		Steps: []launch.ModelProductionStep{{Name: "derive", Callable: "acme/job@v1/derive",
 			Models: map[string]string{"source": "source"}, Outputs: []string{"model"}}},
 		Outputs: []launch.ModelProductionOutput{{Name: "bf16", Source: "derive.model", LaneKey: "bf16"}}}
 	plan := modelproduction.Plan{Instruction: instruction, Destination: instruction.Destination,
 		Release: instruction.Release, Source: instruction.Source, Producer: instruction.Producer,
-		Production: production, Jobs: []modelproduction.JobPin{{Step: "derive", Callable: "acme/job/derive"}}}
+		Production: production, Jobs: []modelproduction.JobPin{{Step: "derive", Callable: "acme/job@v1/derive"}}}
 	instructionBytes, err := instruction.Bytes()
 	must(t, err)
 	instructionDigest, err := instruction.Digest()
