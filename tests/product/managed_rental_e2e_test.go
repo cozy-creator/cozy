@@ -231,6 +231,90 @@ func TestRentalRunAcquiresCheapestOnceAndReleasesFailedPreAttempt(t *testing.T) 
 
 	mu.Lock()
 	posts, deletes, rentalRequest, createReason, deleteReason = 0, 0, nil, "", ""
+	activeRentalID = "pr-private-job-replay"
+	mu.Unlock()
+	code, out = runCozy(t, root, "run", localWeightlessRef+"/tile_job", "size=32", "seed=7",
+		"--rental", "--detach", "--idempotency-key", "private-job-replay", "--json")
+	if code != 0 || !strings.Contains(out, `"changed":true`) {
+		t.Fatalf("private job submission [exit %d]\n%s\ndaemon:\n%s", code, out, daemonOutput.String())
+	}
+	deadline = time.Now().Add(10 * time.Second)
+	request = nil
+	for time.Now().Before(deadline) {
+		store, problem = records.Open(filepath.Join(root, "records.db"))
+		fatal(t, problem)
+		rows, rowsProblem := store.RequestsOfKind("job", "", 20)
+		fatal(t, rowsProblem)
+		for i := range rows {
+			if rows[i].IdemKey == "private-job-replay" {
+				row := rows[i]
+				request = &row
+			}
+		}
+		rentalRow, _ := store.RentalRow("pr-private-job-replay")
+		store.Close()
+		mu.Lock()
+		done := posts == 1 && deletes == 1 && rentalRow == nil && request != nil && request.State == "failed"
+		mu.Unlock()
+		if done {
+			break
+		}
+		time.Sleep(25 * time.Millisecond)
+	}
+	if request == nil || request.PrivatePackageDigest == "" || request.InstallID == "" {
+		t.Fatalf("private job did not freeze its exact install/revision: %+v", request)
+	}
+	must(t, os.RemoveAll(project))
+	code, out = runCozy(t, root, "run", localWeightlessRef+"/tile_job", "size=32", "seed=7",
+		"--rental", "--detach", "--idempotency-key", "private-job-replay", "--json")
+	mu.Lock()
+	gotPosts = posts
+	mu.Unlock()
+	if code != 0 || !strings.Contains(out, `"changed":false`) || gotPosts != 1 {
+		t.Fatalf("private job replay reread source or rented again [exit %d posts=%d]\n%s",
+			code, gotPosts, out)
+	}
+	code, out = runCozy(t, root, "run", localWeightlessRef+"/tile_job", "size=64", "seed=7",
+		"--rental", "--detach", "--idempotency-key", "private-job-replay", "--json")
+	mu.Lock()
+	gotPosts = posts
+	mu.Unlock()
+	if code == 0 || !strings.Contains(out, "different body") || gotPosts != 1 {
+		t.Fatalf("changed private job payload reused the key [exit %d posts=%d]\n%s",
+			code, gotPosts, out)
+	}
+
+	// Preserve the published remote-job acquisition/release/replay acceptance beside the
+	// new private-serving case; a new transport must not erase an existing product arm.
+	var descriptorDocument map[string]any
+	must(t, json.Unmarshal(descriptor, &descriptorDocument))
+	entrypoints := descriptorDocument["entrypoints"].([]any)
+	for _, entrypoint := range entrypoints {
+		row := entrypoint.(map[string]any)
+		if row["name"] == "tile" {
+			encoded, _ := json.Marshal(row)
+			var job map[string]any
+			must(t, json.Unmarshal(encoded, &job))
+			job["name"], job["publishes"] = "tile_job", false
+			descriptorDocument["jobs"] = []any{job}
+			row["models"] = []any{map[string]any{
+				"class": "TinyModel", "path": "tile.models.model",
+				"stamps": map[string]any{}, "component_use": map[string]any{"core": []any{"tile"}},
+			}}
+			descriptorDocument["entrypoints"] = []any{row}
+		}
+	}
+	publishedDescriptor, _ := json.Marshal(descriptorDocument)
+	publishedDecoded, problem := launch.DecodeDescriptor(publishedDescriptor)
+	fatal(t, problem)
+	jobDescriptorID := publishedDecoded.Jobs[0].DescriptorID
+	if jobDescriptorID == "" {
+		t.Fatal("remote job descriptor id was not derived")
+	}
+	mu.Lock()
+	descriptor = publishedDescriptor
+	descriptorDigest = publishedDecoded.Digest
+	posts, deletes, rentalRequest, createReason, deleteReason = 0, 0, nil, "", ""
 	activeRentalID = "pr-managed-job"
 	mu.Unlock()
 	store, problem = records.Open(filepath.Join(root, "records.db"))
