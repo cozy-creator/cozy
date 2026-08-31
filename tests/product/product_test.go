@@ -864,7 +864,7 @@ func TestDevelopmentInstallRefreshesBeforeInvocation(t *testing.T) {
 		t.Fatalf("max cost plus explicit machine did not refuse [exit %d]\n%s", code, out)
 	}
 	code, out = runCozy(t, root, "run", weightlessRef+"/tile",
-		"size=32", "seed=7", "--max-cost", "2.00", "--json")
+		"size=32", "seed=7", "--max-cost", "2.00", "--idempotency-key", "budget-proof", "--json")
 	if code != 0 || !strings.Contains(out, `"revision":"first"`) {
 		t.Fatalf("first editable invocation did not run source [exit %d]\n%s\n%s",
 			code, out, productWorkerLogs(root))
@@ -876,6 +876,10 @@ func TestDevelopmentInstallRefreshesBeforeInvocation(t *testing.T) {
 	store.Close()
 	if len(requests) == 0 || requests[0].MaxCostUSDMicros != 2_000_000 || requests[0].Worker != "" {
 		t.Fatalf("local-first rental budget was not retained exactly: %+v", requests)
+	}
+	if code, out := runCozy(t, root, "run", weightlessRef+"/tile",
+		"size=32", "seed=7", "--max-cost", "1.00", "--idempotency-key", "budget-proof"); code != 1 || !strings.Contains(out, "different body") {
+		t.Fatalf("changed budget reused one request identity [exit %d]\n%s", code, out)
 	}
 	first := activePackageInstall(t, root)
 

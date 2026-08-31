@@ -164,6 +164,18 @@ func TestLocalAPIDoor(t *testing.T) {
 	if noKey.Status != http.StatusBadRequest || noKey.code() != "idempotency_key_required" {
 		t.Errorf("a submission with no Idempotency-Key: %s", noKey.brief())
 	}
+	negativeBudget := svc.call(t, "POST", "/v1/requests", map[string]any{
+		"package": "x/y", "function": "f", "max_cost_usd_micros": -1,
+	}, "Idempotency-Key", "negative-budget")
+	if negativeBudget.Status != http.StatusBadRequest || negativeBudget.code() != "invalid_request" {
+		t.Errorf("a negative rental budget reached the queue: %s", negativeBudget.brief())
+	}
+	mixedPlacement := svc.call(t, "POST", "/v1/requests", map[string]any{
+		"package": "x/y", "function": "f", "worker": "rental-1", "max_cost_usd_micros": 1,
+	}, "Idempotency-Key", "mixed-placement")
+	if mixedPlacement.Status != http.StatusBadRequest || mixedPlacement.code() != "invalid_request" {
+		t.Errorf("an explicit worker plus automatic budget reached the queue: %s", mixedPlacement.brief())
+	}
 
 	// The credential is handed over through an OS-protected file, never argv, and never
 	// appears in anything the daemon writes.
