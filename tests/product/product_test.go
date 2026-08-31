@@ -238,10 +238,17 @@ func TestRentalCommandsSeparateInventoryFromCatalog(t *testing.T) {
 		State: "ready", Hub: "https://tensorhub.test",
 	})
 	fatal(t, problem)
+	problem = store.RecordRental(records.Rental{
+		ID: "rnt-failed", MachineName: "failed-gpu", SKU: "small",
+		AcceleratorModel: "GPU", HourlyRateUSDMicros: 250_000,
+		State: "failed", Hub: "https://tensorhub.test",
+	})
+	fatal(t, problem)
 	store.Close()
 
 	if code, out := runCozy(t, root, "rental"); code != 0 ||
-		!strings.Contains(out, "studio") || !strings.Contains(out, "h200") {
+		!strings.Contains(out, "studio") || !strings.Contains(out, "h200") ||
+		!strings.Contains(out, "rentals: 2 remote machines running · $6.25/hour of $0.00/hour") {
 		t.Fatalf("bare rental did not show current machines [exit %d]\n%s", code, out)
 	}
 	if code, out := runCozy(t, root, "rental", "list"); code != 2 ||
@@ -267,6 +274,33 @@ func TestRentalCommandsSeparateInventoryFromCatalog(t *testing.T) {
 		"rental", "new", "--name", "studio"); code != 2 ||
 		!strings.Contains(out, "options require a GPU SKU") {
 		t.Fatalf("catalog view silently accepted rental options [exit %d]\n%s", code, out)
+	}
+}
+
+func TestRentalSpendConfigIsNestedAndExact(t *testing.T) {
+	valid := t.TempDir()
+	must(t, os.WriteFile(filepath.Join(valid, "config.yaml"), []byte(
+		"port: 0\nrentals:\n  max_hourly_spend_usd: 4.125001\n"), 0o600))
+	t.Cleanup(func() { _, _ = runCozy(t, valid, "down", "--all") })
+	if code, out := runCozy(t, valid, "rental"); code != 0 ||
+		!strings.Contains(out, "rentals: 0 remote machines running · $0.00/hour of $4.125001/hour") {
+		t.Fatalf("nested rental ceiling was not exact [exit %d]\n%s", code, out)
+	}
+
+	overPrecise := t.TempDir()
+	must(t, os.WriteFile(filepath.Join(overPrecise, "config.yaml"), []byte(
+		"rentals:\n  max_hourly_spend_usd: 4.0000001\n"), 0o600))
+	if code, out := runCozy(t, overPrecise, "rental"); code != 2 ||
+		!strings.Contains(out, "at most six decimal places") {
+		t.Fatalf("over-precise rental ceiling did not refuse [exit %d]\n%s", code, out)
+	}
+
+	deleted := t.TempDir()
+	must(t, os.WriteFile(filepath.Join(deleted, "config.yaml"), []byte(
+		"cloud:\n  max_hourly_spend_usd: 4\n"), 0o600))
+	if code, out := runCozy(t, deleted, "rental"); code != 2 ||
+		!strings.Contains(out, `unknown key "cloud"`) {
+		t.Fatalf("deleted cloud config key did not refuse [exit %d]\n%s", code, out)
 	}
 }
 
