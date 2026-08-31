@@ -130,6 +130,7 @@ type LogicalJob struct {
 	Outputs         []string
 	ArtifactOutputs []ArtifactOutput
 	GPUCount        int64
+	Models          []ModelRef
 }
 
 type ModelRef = records.ModelRef

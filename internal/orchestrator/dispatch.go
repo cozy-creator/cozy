@@ -128,6 +128,12 @@ func (c *Orchestrator) SubmitDetail(s Submission) (string, uint64, bool, *exit.E
 	return req.ID, attempt, true, e
 }
 
+// ActivateRecordedRequest is the second half used by model productions after
+// their node row has durably joined the freshly minted request id.
+func (c *Orchestrator) ActivateRecordedRequest(req records.Request) (uint64, *exit.Error) {
+	return c.activateRecorded(req)
+}
+
 // RecordSubmission crosses the durable ordinary-request boundary.
 func (c *Orchestrator) RecordSubmission(s Submission) (records.Request, bool, *exit.Error) {
 	req, event, e := requestRecord(s)
@@ -613,21 +619,12 @@ func (c *Orchestrator) resolveFor(req records.Request) (WorkerLaunchSpec, string
 	if e != nil {
 		return WorkerLaunchSpec{}, "", e
 	}
-	models := make([]*pb.DownloadModelRef, 0, len(logical.Models))
-	for _, model := range logical.Models {
-		models = append(models, &pb.DownloadModelRef{Package: model.Package, Slot: model.Slot,
-			Model: model.Model, Release: model.Release, Manifest: model.Manifest})
-	}
 	if e := c.ConvergePackageSet(instance, []*pb.DownloadPackageRef{{
 		Package: logical.Package, Release: logical.Release, ReleaseDigest: logical.ReleaseDigest,
-	}}, models); e != nil {
+	}}, downloadModelRefs(logical.Models)); e != nil {
 		return WorkerLaunchSpec{}, "", e
 	}
 	if req.IsJob() {
-		if len(req.Models) != 0 {
-			return WorkerLaunchSpec{}, "", exit.Named(exit.Unavailable,
-				"rental.modeled_job_unsupported", "remote jobs with model slots are not supported yet")
-		}
 		if e := c.waitPackageStaged(instance); e != nil {
 			return WorkerLaunchSpec{}, "", e
 		}
@@ -954,7 +951,20 @@ func inputBindings(req records.Request, payloadDigest string) []*pb.InputBinding
 			KindMime: asset.MediaType, Order: asset.Order,
 		})
 	}
-	order := uint32(len(req.Assets) + 1)
+	models := append([]ModelRef(nil), req.Models...)
+	sort.Slice(models, func(i, j int) bool { return models[i].Slot < models[j].Slot })
+	for _, model := range models {
+		if model.ManifestLength <= 0 {
+			continue
+		}
+		rows = append(rows, &pb.InputBinding{
+			InputId: "model:" + model.Slot, Digest: model.Manifest,
+			Length:   uint64(model.ManifestLength),
+			KindMime: "application/vnd.cozy.model-manifest",
+			Order:    uint32(len(rows)),
+		})
+	}
+	order := uint32(len(rows))
 	for _, pair := range splitList(req.Trees) {
 		ref, _, ok := strings.Cut(pair, "=")
 		if !ok {
@@ -966,6 +976,20 @@ func inputBindings(req records.Request, payloadDigest string) []*pb.InputBinding
 		order++
 	}
 	return rows
+}
+
+func downloadModelRefs(models []ModelRef) []*pb.DownloadModelRef {
+	out := make([]*pb.DownloadModelRef, 0, len(models))
+	for _, model := range models {
+		// A release-less ref is an operation-local Manifest already held by this
+		// worker's TensorFS store (source preparation or a prior node output).
+		if model.Release == "" {
+			continue
+		}
+		out = append(out, &pb.DownloadModelRef{Package: model.Package, Slot: model.Slot,
+			Model: model.Model, Release: model.Release, Manifest: model.Manifest})
+	}
+	return out
 }
 
 func invocationOutputBindings(ids []string, artifacts []ArtifactOutput, defaultMax uint64) []*pb.OutputBinding {
@@ -1190,6 +1214,14 @@ func (c *Orchestrator) remoteGrant(req records.Request, attempt uint64, w *worke
 		FileBaseUrl:   "file://" + dir,
 		ExpiresAtUnix: 0,
 		Inputs:        []*pb.InputAccess{{InputId: "payload", Url: "file://" + path}},
+	}
+	for _, model := range req.Models {
+		if model.ManifestLength <= 0 {
+			continue
+		}
+		g.Inputs = append(g.Inputs, &pb.InputAccess{
+			InputId: "model:" + model.Slot, Url: "model://" + model.Manifest,
+		})
 	}
 	for index, asset := range req.Assets {
 		path, e := w.media.PutInputFile(slot+"-input-"+strconv.Itoa(index),

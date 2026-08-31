@@ -8,6 +8,7 @@ import (
 	"strconv"
 	"strings"
 
+	"github.com/cozy-creator/cozy/internal/api"
 	"github.com/cozy-creator/cozy/internal/exit"
 	"github.com/cozy-creator/cozy/internal/hub"
 	"github.com/cozy-creator/cozy/internal/launch"
@@ -28,6 +29,7 @@ type publishSource struct {
 	Files     int
 	Bytes     int64
 	Exact     []modelproduction.SourceFile
+	Access    []api.ModelProductionSourceCapability
 }
 
 type producerPlan struct {
@@ -123,15 +125,13 @@ func handleModelPublish(ctx *Context) *exit.Error {
 		defaults = append(defaults, "status", "changed")
 		return emit(ctx, compactRecord(fields, defaults...))
 	}
-	if ctx.Inv.Bool("--rental") && len(source.Exact) > 0 {
-		return exit.Named(exit.Unavailable, "model_source_host_exchange_unavailable",
-			"model publication %s is planned, but pod-supervisor cannot yet prepare its selected foreign source files", id).
-			WithRemedy("the minor-9 PrepareModelSources host exchange must land; Creator will not download model bodies or hand a broad provider credential to the worker")
-	}
-	if producer != nil {
-		return exit.Named(exit.Unavailable, "model_job_bindings_unavailable",
-			"model publication %s is planned, but job InvocationSpec cannot yet bind exact prepared Model sources", id).
-			WithRemedy("the minor-9 job model-binding contract must land; an input-tree path is not an ArtifactSink Model capability")
+	if ctx.Inv.Bool("--rental") && producer != nil {
+		if ctx.Inv.Bool("--detach") {
+			return exit.Named(exit.Unavailable, "model_production.detach_unavailable",
+				"detached model production is not available in this build").
+				WithRemedy("run without --detach; the durable operation resumes from its SQLite journal after interruption")
+		}
+		return runRentedModelProduction(ctx, plan, source)
 	}
 	return exit.Named(exit.Unavailable, "model_publication_execution_unavailable",
 		"model publication %s is planned, but this build cannot yet submit its durable source publication", id)
@@ -193,15 +193,21 @@ func resolvePublishSource(ctx *Context, raw string) (publishSource, *exit.Error)
 			return publishSource{}, problem
 		}
 		exact := make([]modelproduction.SourceFile, 0, len(resolved.Files))
+		access := make([]api.ModelProductionSourceCapability, 0, len(resolved.Files))
+		provider := string(parsed.Kind)
 		for _, file := range resolved.Files {
 			exact = append(exact, modelproduction.SourceFile{
 				Member: file.Member, SHA256: file.SHA256, Length: file.Length,
+			})
+			access = append(access, api.ModelProductionSourceCapability{
+				Member: file.Member, ObjectID: "sha256:" + file.SHA256,
+				Length: file.Length, Provider: provider, URL: file.URL,
 			})
 		}
 		return publishSource{Canonical: resolved.Canonical,
 			Selection: "sha256:" + resolved.SelectionSHA256,
 			License:   resolved.License, Files: len(resolved.Files), Bytes: resolved.Bytes,
-			Exact: exact}, nil
+			Exact: exact, Access: access}, nil
 	}
 	if !catalogModelSpelling(raw) {
 		return publishSource{}, parseProblem
@@ -308,18 +314,10 @@ func resolveProducerPlan(ctx *Context, raw string) (*producerPlan, *exit.Error) 
 				}
 			}
 		}
-		facts, factsProblem := launch.Read(*nodeInstall, ctx.Cfg.Home, ctx.Cfg.Tool())
-		if factsProblem != nil {
-			return nil, factsProblem
-		}
-		jobFacts, factsProblem := facts.Job(target.Function)
-		if factsProblem != nil {
-			return nil, factsProblem
-		}
 		plan.Jobs = append(plan.Jobs, modelproduction.JobPin{
 			Node: node.Name, Callable: node.Callable, Release: nodeInstall.Version,
 			InstallID: nodeInstall.ID, ReleaseDigest: nodeInstall.SourceDigest,
-			DescriptorID: jobFacts.DescriptorID,
+			DescriptorID: job.DescriptorID,
 		})
 	}
 	for token := range requires {

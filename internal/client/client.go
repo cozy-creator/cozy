@@ -291,3 +291,12 @@ func (c *Client) Job(id string) (api.JobState, *exit.Error) {
 func (c *Client) CancelJob(id string) *exit.Error {
 	return c.call("POST", "/v1/local/jobs/"+id+"/cancel", nil, nil)
 }
+
+func (c *Client) ModelProductionAction(id string, action api.ModelProductionAction) (
+	api.ModelProductionActionResult, *exit.Error,
+) {
+	var result api.ModelProductionActionResult
+	e := c.call(http.MethodPost, "/v1/local/model-productions/"+url.PathEscape(id),
+		action, &result)
+	return result, e
+}

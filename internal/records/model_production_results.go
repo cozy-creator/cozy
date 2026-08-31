@@ -17,9 +17,12 @@ type ModelProductionSourceFile struct {
 }
 
 type PreparedModelSource struct {
-	OperationID, Slot, Profile, ManifestID string
-	ManifestLength                         int64
-	ReleaseEvidence                        []byte
+	OperationID     string `json:"operation_id"`
+	Slot            string `json:"slot"`
+	Profile         string `json:"profile"`
+	ManifestID      string `json:"manifest_id"`
+	ManifestLength  int64  `json:"manifest_length"`
+	ReleaseEvidence []byte `json:"release_evidence"`
 }
 
 type ModelProductionNode struct {
@@ -228,6 +231,37 @@ func (s *Store) BeginModelProductionNode(row ModelProductionNode) (ModelProducti
 	return held, nil
 }
 
+func (s *Store) ModelProductionNodeByRequest(requestID string) (*ModelProductionNode, *exit.Error) {
+	var row ModelProductionNode
+	err := s.db.QueryRow(`SELECT operation_id,node_index,node_name,request_id,state
+		FROM model_production_nodes WHERE request_id=?`, requestID).Scan(&row.OperationID,
+		&row.NodeIndex, &row.NodeName, &row.RequestID, &row.State)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, exit.Internalf("cannot read model production node for request %s: %s", requestID, err)
+	}
+	return &row, nil
+}
+
+func (s *Store) SetModelProductionNodeRequest(operationID string, nodeIndex int64,
+	nodeName, requestID, state string,
+) *exit.Error {
+	result, err := s.db.Exec(`UPDATE model_production_nodes SET request_id=?,state=?
+		WHERE operation_id=? AND node_index=? AND node_name=?
+		AND (request_id='' OR request_id=?)`, requestID, state, operationID, nodeIndex,
+		nodeName, requestID)
+	if err != nil {
+		return exit.Internalf("cannot bind model production node request: %s", err)
+	}
+	if changed, _ := result.RowsAffected(); changed != 1 {
+		return exit.Named(exit.Conflict, "model_production.node_request_conflict",
+			"model production node %s already binds different work", nodeName)
+	}
+	return nil
+}
+
 func (s *Store) RecordModelProductionArtifact(artifact ModelProductionArtifact,
 	objects []ModelProductionObject,
 ) *exit.Error {
@@ -335,4 +369,41 @@ func (s *Store) ModelProductionObjects(operationID, nodeName,
 		out = append(out, row)
 	}
 	return out, nil
+}
+
+func (s *Store) RecordModelProductionObjectStatus(row ModelProductionObject) *exit.Error {
+	result, err := s.db.Exec(`UPDATE model_production_objects SET transfer_operation_id=?,
+		grant_revision=?,update_sequence=?,state=?,transferred_bytes=?,safe_code=?,safe_detail=?
+		WHERE operation_id=? AND node_name=? AND output_slot=? AND object_id=? AND length=?
+		AND (transfer_operation_id='' OR transfer_operation_id=?)
+		AND grant_revision<=? AND (grant_revision<? OR update_sequence<=?)`,
+		row.TransferOperationID, row.GrantRevision, row.UpdateSequence, row.State,
+		row.TransferredBytes, row.SafeCode, row.SafeDetail, row.OperationID, row.NodeName,
+		row.OutputSlot, row.ObjectID, row.Length, row.TransferOperationID,
+		row.GrantRevision, row.GrantRevision, row.UpdateSequence)
+	if err != nil {
+		return exit.Internalf("cannot record model artifact transfer status: %s", err)
+	}
+	if changed, _ := result.RowsAffected(); changed != 1 {
+		return exit.Named(exit.Conflict, "model_production.artifact_status_conflict",
+			"model artifact transfer status changed identity or moved backwards")
+	}
+	return nil
+}
+
+func (s *Store) MarkModelProductionArtifactPublished(operationID, nodeName, outputSlot,
+	publicationID string,
+) *exit.Error {
+	result, err := s.db.Exec(`UPDATE model_production_artifacts SET publication_id=?,state='prepared'
+		WHERE operation_id=? AND node_name=? AND output_slot=?
+		AND (publication_id='' OR publication_id=?)`, publicationID, operationID, nodeName,
+		outputSlot, publicationID)
+	if err != nil {
+		return exit.Internalf("cannot record prepared model publication: %s", err)
+	}
+	if changed, _ := result.RowsAffected(); changed != 1 {
+		return exit.Named(exit.Conflict, "model_production.publication_conflict",
+			"model production output %s.%s already names another publication", nodeName, outputSlot)
+	}
+	return nil
 }

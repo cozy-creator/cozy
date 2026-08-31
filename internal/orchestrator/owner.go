@@ -332,6 +332,20 @@ func (c *Orchestrator) converse(w *worker, addr string) error {
 				continue
 			}
 			c.onModelSourcePrepared(s, prepared)
+		case *pb.WorkerFrame_ArtifactReceipt:
+			receipt := m.ArtifactReceipt
+			if c.fenced(s, receipt.RecordOwnerEpoch, receipt.ControlStreamGeneration,
+				receipt.WorkerBootId) {
+				continue
+			}
+			c.onProductionArtifactReceipt(s, receipt)
+		case *pb.WorkerFrame_ArtifactTransferStatus:
+			status := m.ArtifactTransferStatus
+			if c.fenced(s, status.RecordOwnerEpoch, status.ControlStreamGeneration,
+				status.WorkerBootId) {
+				continue
+			}
+			c.onProductionArtifactTransferStatus(s, status)
 		case *pb.WorkerFrame_CheckpointAck:
 			// the worker's echo of a receipt already durable here; nothing to apply
 		case *pb.WorkerFrame_ArtifactFinalizeResult:

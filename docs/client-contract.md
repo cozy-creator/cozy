@@ -258,6 +258,7 @@ URLs but remain local-scope rows in the same guarded route table.
 | `POST /v1/local/jobs` | local | yes | submit one bounded job; `Idempotency-Key`; 202 with the handle and its publication repo |
 | `GET /v1/local/jobs/{id}` | local | yes | one job: state, queue position, retry budget, publication, checkpoints, bill where a rate exists |
 | `POST /v1/local/jobs/{id}/cancel` | local | yes | request cancellation; a queued job leaves the queue, a running one gets its terminal |
+| `POST /v1/local/model-productions/{id}` | local | yes | drive one credential-free source or artifact host exchange on an attached rental |
 | `GET /{$}` | local | no | embedded localhost web UI entrypoint |
 | `GET /app.css` | local | no | embedded localhost web UI stylesheet |
 | `GET /app.js` | local | no | embedded localhost web UI script |

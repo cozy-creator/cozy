@@ -21,8 +21,9 @@ type ModelSourceCapability struct {
 }
 
 type ProductionSourceFile struct {
-	Member, ObjectID string
-	Length           int64
+	Member   string `json:"member"`
+	ObjectID string `json:"object_id"`
+	Length   int64  `json:"length"`
 }
 
 type ProductionSourcePlan struct {

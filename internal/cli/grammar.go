@@ -152,21 +152,19 @@ func (c *ModelListCmd) Run(r *Runtime) error {
 }
 
 type ModelPublishCmd struct {
-	Ref        string `arg:"" name:"model" help:"Tensorhub destination (org/name)."`
-	Source     string `arg:"" name:"source" help:"Manifest, pinned foreign source, Tensorhub model release, local alias, or explicit local file."`
-	Release    string `help:"Immutable semantic release version." required:""`
-	Producer   string `help:"Reviewed org/package/production declaration to execute."`
-	Lane       string `help:"Select an input lane when source is a Tensorhub model release."`
-	Rental     bool   `help:"Authorize one Creator-managed rental for this operation."`
-	DryRun     bool   `help:"Resolve the exact production plan without moving model bodies or spending."`
-	Detach     bool   `help:"Return after durable acceptance instead of following."`
-	TokenStdin bool   `help:"Read this invocation's hub token from stdin."`
+	Ref      string `arg:"" name:"model" help:"Tensorhub destination (org/name)."`
+	Source   string `arg:"" name:"source" help:"Manifest, pinned foreign source, Tensorhub model release, local alias, or explicit local file."`
+	Release  string `help:"Immutable semantic release version." required:""`
+	Producer string `help:"Reviewed org/package/production declaration to execute."`
+	Lane     string `help:"Select an input lane when source is a Tensorhub model release."`
+	Rental   bool   `help:"Authorize one Creator-managed rental for this operation."`
+	DryRun   bool   `help:"Resolve the exact production plan without moving model bodies or spending."`
+	Detach   bool   `help:"Return after durable acceptance instead of following."`
 }
 
 func (c *ModelPublishCmd) Run(r *Runtime) error {
 	return r.call(handleModelPublish, []string{c.Ref, c.Source}, bools(
-		"--rental", c.Rental, "--dry-run", c.DryRun, "--detach", c.Detach,
-		"--token-stdin", c.TokenStdin),
+		"--rental", c.Rental, "--dry-run", c.DryRun, "--detach", c.Detach),
 		values("--release", c.Release, "--producer", c.Producer, "--lane", c.Lane), false)
 }
 

@@ -62,8 +62,8 @@ func TestRentalRunAcquiresCheapestOnceAndReleasesFailedPreAttempt(t *testing.T) 
 			http.Error(w, "download route must be worker-only in this flow", http.StatusInternalServerError)
 		case r.Method == http.MethodGet && r.URL.Path == "/v1/rental-skus":
 			_ = json.NewEncoder(w).Encode([]map[string]any{
-				{"name": "expensive", "accelerator_model": "GPU X", "compute_capability": "9.0", "vram_gb": 80, "price_usd_micros_per_hour": 900_000},
-				{"name": "cheap", "accelerator_model": "GPU C", "compute_capability": "8.9", "vram_gb": 24, "price_usd_micros_per_hour": 300_000},
+				{"name": "expensive", "accelerator_model": "GPU X", "compute_capability": "9.0", "vram_gb": 80, "minimum_ram_per_gpu_gb": 64, "price_usd_micros_per_hour": 900_000},
+				{"name": "cheap", "accelerator_model": "GPU C", "compute_capability": "8.9", "vram_gb": 24, "minimum_ram_per_gpu_gb": 32, "price_usd_micros_per_hour": 300_000},
 			})
 		case r.Method == http.MethodPost && r.URL.Path == "/v1/rentals":
 			posts++

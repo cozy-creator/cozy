@@ -244,6 +244,7 @@ func submissionDigest(spec orchestrator.Submission) (string, *exit.Error) {
 			models = append(models, map[string]canonical.Value{
 				"package": model.Package, "slot": model.Slot, "model": model.Model,
 				"release": model.Release, "manifest": model.Manifest,
+				"manifest_length": model.ManifestLength,
 			})
 		}
 		doc["models"] = models
