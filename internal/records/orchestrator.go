@@ -53,6 +53,7 @@ CREATE TABLE IF NOT EXISTS requests (
   trees        TEXT    NOT NULL DEFAULT '',
   worker       TEXT    NOT NULL DEFAULT '',
   rental       INTEGER NOT NULL DEFAULT 0,
+  rental_required INTEGER NOT NULL DEFAULT 0,
   install_id   TEXT    REFERENCES install_generations(id),
   assets       TEXT    NOT NULL DEFAULT '[]',
   models       TEXT    NOT NULL DEFAULT '[]',
@@ -447,6 +448,8 @@ type Request struct {
 	Worker string
 	// Rental authorizes placement on Creator-managed rented capacity.
 	Rental bool
+	// RentalRequired forbids local placement for the hidden development/E2E override.
+	RentalRequired bool
 	// InstallID pins the exact immutable local metadata generation resolved before
 	// submission. The initial remote lane reads only its published release and descriptor.
 	InstallID string
@@ -499,7 +502,7 @@ type ModelRef struct {
 const requestCols = `id,idem_key,body_digest,package,entrypoint,plan_id,package_release,
 	package_revision_digest,private_package_digest,private_package_uploaded_boot_id,
 	environment_digest,config_digest,payload,outputs,
-	state,ordinal,requeues,created_at,kind,job_gpu_count,org,trees,worker,rental,
+	state,ordinal,requeues,created_at,kind,job_gpu_count,org,trees,worker,rental,rental_required,
 	COALESCE(install_id,''),assets,models,artifact_outputs`
 
 func scanRequest(row interface{ Scan(...any) error }) (Request, error) {
@@ -509,7 +512,7 @@ func scanRequest(row interface{ Scan(...any) error }) (Request, error) {
 		&r.Release, &r.PackageRevisionDigest, &r.PrivatePackageDigest,
 		&r.PrivatePackageUploadedBootID, &r.EnvironmentDigest, &r.ConfigDigest, &r.Payload, &r.Outputs,
 		&r.State, &r.Ordinal, &r.Requeues, &r.CreatedAt,
-		&r.Kind, &r.JobGPUCount, &r.Org, &r.Trees, &r.Worker, &r.Rental,
+		&r.Kind, &r.JobGPUCount, &r.Org, &r.Trees, &r.Worker, &r.Rental, &r.RentalRequired,
 		&r.InstallID, &assets, &models, &r.ArtifactOutputs)
 	if err == nil && assets != "" {
 		err = json.Unmarshal([]byte(assets), &r.Assets)
@@ -984,13 +987,14 @@ func submitRequestTx(tx *sql.Tx, r Request, assets, models, exportOutputs string
 	if _, err := tx.Exec(`INSERT INTO requests(id,idem_key,body_digest,package,entrypoint,
 		plan_id,package_release,package_revision_digest,private_package_digest,
 		private_package_uploaded_boot_id,environment_digest,config_digest,
-		payload,outputs,state,ordinal,requeues,created_at,kind,job_gpu_count,org,trees,worker,rental,install_id,assets,models,
+		payload,outputs,state,ordinal,requeues,created_at,kind,job_gpu_count,org,trees,worker,rental,rental_required,install_id,assets,models,
 		artifact_outputs)
-		VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?, ?,0,0,?,?,?,?,?,?,?,?,?,?,?)`,
+		VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?, ?,0,0,?,?,?,?,?,?,?,?,?,?,?,?)`,
 		r.ID, r.IdemKey, r.BodyDigest, r.Package, r.Entrypoint, r.PlanID,
 		r.Release, r.PackageRevisionDigest, r.PrivatePackageDigest,
 		r.PrivatePackageUploadedBootID, r.EnvironmentDigest, r.ConfigDigest, r.Payload,
 		r.Outputs, r.State, r.CreatedAt, r.Kind, r.JobGPUCount, r.Org, r.Trees, r.Worker, r.Rental,
+		r.RentalRequired,
 		nullable(r.InstallID),
 		assets, models, r.ArtifactOutputs); err != nil {
 		return Request{}, false, exit.Internalf("cannot record request %s: %s", r.ID, err)

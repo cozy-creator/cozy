@@ -47,6 +47,7 @@ type Submission struct {
 	// crosses the worker protocol. The typed payload carries only its opaque reference.
 	LocalAssets       []records.AssetBinding  `json:"local_assets,omitempty"`
 	Rental            bool                    `json:"rental,omitempty"`
+	RentalRequired    bool                    `json:"rental_required,omitempty"`
 	Models            []orchestrator.ModelRef `json:"models,omitempty"`
 	OutputDirectory   string                  `json:"output_directory,omitempty"`
 	OutputPayloadHash string                  `json:"output_payload_hash,omitempty"`
@@ -134,7 +135,7 @@ func (s *Server) submit(w http.ResponseWriter, r *http.Request) {
 		// staging object is opened merely to answer an already-recorded request.
 		spec = replaySubmission(sub, *existing)
 	} else {
-		if sub.Rental {
+		if sub.Rental || sub.RentalRequired {
 			unlock := privatepackage.Guard()
 			defer unlock()
 		}
@@ -218,7 +219,9 @@ func replaySubmission(sub Submission, recorded records.Request) orchestrator.Sub
 		Outputs: outputs, PlanID: planID, Worker: recorded.Worker, Assets: assets,
 		InstallID: sub.InstallID, Release: sub.Release, ReleaseDigest: sub.ReleaseDigest,
 		PrivatePackageDigest: recorded.PrivatePackageDigest,
-		Rental:               sub.Rental, Models: models, OutputExport: outputExportInput(sub),
+		Rental:               sub.Rental || sub.RentalRequired,
+		RentalRequired:       sub.RentalRequired,
+		Models:               models, OutputExport: outputExportInput(sub),
 	}
 }
 
@@ -250,6 +253,9 @@ func submissionDigest(spec orchestrator.Submission) (string, *exit.Error) {
 	}
 	if spec.Rental {
 		doc["rental"] = true
+	}
+	if spec.RentalRequired {
+		doc["rental_required"] = true
 	}
 	if len(spec.Models) > 0 {
 		refs := append([]orchestrator.ModelRef(nil), spec.Models...)
@@ -336,7 +342,8 @@ func (s *Server) resolvePlan(ctx context.Context, sub Submission) (orchestrator.
 	out := orchestrator.Submission{
 		Package: sub.Package, Entrypoint: sub.Function, Payload: []byte(sub.Input),
 		Outputs: sub.Outputs, PlanID: sub.PlanID, Assets: sub.LocalAssets,
-		Release: sub.Release, ReleaseDigest: sub.ReleaseDigest, Rental: sub.Rental,
+		Release: sub.Release, ReleaseDigest: sub.ReleaseDigest,
+		Rental: sub.Rental || sub.RentalRequired, RentalRequired: sub.RentalRequired,
 		Models:       append([]orchestrator.ModelRef(nil), sub.Models...),
 		OutputExport: outputExportInput(sub),
 	}

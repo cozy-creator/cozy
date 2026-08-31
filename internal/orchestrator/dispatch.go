@@ -78,6 +78,9 @@ type Submission struct {
 	InstallID string
 	// Rental authorizes placement on Creator-managed rented capacity.
 	Rental bool
+	// RentalRequired is the explicit development/E2E override that forbids local capacity.
+	// It implies Rental and survives queue/restart scheduling in the request row.
+	RentalRequired bool
 	// OutputExport is the descriptor-derived local destination requested by the CLI.
 	// It changes no execution fact and is settled independently after terminal mirror.
 	OutputExport *records.OutputExportIntent
@@ -159,6 +162,9 @@ func (c *Orchestrator) RecordSubmission(s Submission) (records.Request, bool, *e
 }
 
 func requestRecord(s Submission) (records.Request, map[string]any, *exit.Error) {
+	if s.RentalRequired {
+		s.Rental = true
+	}
 	artifactOutputs, artifactBytes, e := normalizeArtifactOutputs(s)
 	if e != nil {
 		return records.Request{}, nil, e
@@ -169,8 +175,9 @@ func requestRecord(s Submission) (records.Request, map[string]any, *exit.Error) 
 		identity := s.Payload
 		if s.Rental {
 			encoded, err := canonical.Write(map[string]canonical.Value{
-				"payload": base64.StdEncoding.EncodeToString(s.Payload),
-				"rental":  true,
+				"payload":         base64.StdEncoding.EncodeToString(s.Payload),
+				"rental":          true,
+				"rental_required": s.RentalRequired,
 			})
 			if err != nil {
 				return records.Request{}, nil, exit.Internalf("cannot encode request budget identity: %s", err)
@@ -215,7 +222,8 @@ func requestRecord(s Submission) (records.Request, map[string]any, *exit.Error) 
 		Outputs:              strings.Join(s.Outputs, ","),
 		Assets:               s.Assets, ArtifactOutputs: string(artifactBytes),
 		Kind: s.Kind, JobGPUCount: s.JobGPUCount, Org: s.Org, Trees: strings.Join(s.Trees, ","),
-		Worker: s.Worker, InstallID: s.InstallID, Rental: s.Rental, Models: s.Models,
+		Worker: s.Worker, InstallID: s.InstallID, Rental: s.Rental,
+		RentalRequired: s.RentalRequired, Models: s.Models,
 		OutputExport: s.OutputExport,
 	}
 	event := map[string]any{
@@ -225,6 +233,7 @@ func requestRecord(s Submission) (records.Request, map[string]any, *exit.Error) 
 	}
 	if s.Rental {
 		event["rental"] = true
+		event["rental_required"] = s.RentalRequired
 		event["release"] = s.Release
 		event["release_digest"] = s.ReleaseDigest
 		if s.PrivatePackageDigest != "" {
@@ -301,6 +310,16 @@ func (c *Orchestrator) logRecordedReplay(req records.Request, idempotencyKey str
 }
 
 func (c *Orchestrator) activateRecorded(req records.Request) (uint64, *exit.Error) {
+	if req.RentalRequired && req.Worker == "" {
+		c.enqueue(req.ID)
+		c.emit(req.ID, "request.queued", 0, map[string]any{
+			"reason":   "remote rental required; local capacity is intentionally skipped",
+			"position": c.QueuePosition(req.ID),
+		})
+		c.selectOrStart(req)
+		go c.drain()
+		return 0, nil
+	}
 	// A SUBMISSION NEVER OVERTAKES WORK ALREADY WAITING. Dispatching straight from submit
 	// is what keeps a warm request fast, and it is exactly what breaks FIFO when a queue
 	// exists: a request arriving while six are parked would take the free slot the head of
@@ -780,6 +799,9 @@ func (c *Orchestrator) releaseManagedNow(req records.Request) *exit.Error {
 }
 
 func (c *Orchestrator) dispatch(req records.Request) (uint64, *exit.Error) {
+	if req.RentalRequired && req.Worker == "" {
+		return 0, exit.Unavailablef("remote rental assignment is required before dispatch")
+	}
 	// PLACEMENT is the orchestrator's: the caller names the binding, and dispatch picks a
 	// worker whose placement advertises it as DISPATCHABLE now and whose admission fence
 	// is open. `pick` also returns the admission generation it OBSERVED, which is what

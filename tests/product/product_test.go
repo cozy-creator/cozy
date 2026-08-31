@@ -152,8 +152,13 @@ func TestPackagePublishMetadataGrammar(t *testing.T) {
 	if code, help := runCozy(t, root, "run", "cozy/example/function", "--help"); code != 0 ||
 		strings.Contains(help, "--version") || strings.Contains(help, "vN/function") ||
 		!strings.Contains(help, "org/package[/function]") || !strings.Contains(help, "--await") ||
-		strings.Contains(help, "--detach") || strings.Contains(help, "--wait") {
+		strings.Contains(help, "--detach") || strings.Contains(help, "--wait") ||
+		strings.Contains(help, "--force-rental") {
 		t.Fatalf("run retained versioned target grammar [exit %d]\n%s", code, help)
+	}
+	if code, out := runCozy(t, root, "run", "cozy/example/function", "--force-rental"); code != 2 || !strings.Contains(out, "rentals.max_hourly_spend_usd") ||
+		strings.Contains(out, "unknown flag") {
+		t.Fatalf("hidden force-rental flag did not enter the ordinary rental budget gate [exit %d]\n%s", code, out)
 	}
 	if code, out := runCozy(t, root, "run", "cozy/example/function", "--stream"); code != 2 ||
 		!strings.Contains(out, "--stream requires --await") {

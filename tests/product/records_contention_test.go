@@ -11,7 +11,7 @@ import (
 	"github.com/cozy-creator/cozy/internal/records"
 )
 
-func TestRecordsSchemaIsExactV6AndStable(t *testing.T) {
+func TestRecordsSchemaIsExactV7AndStable(t *testing.T) {
 	path := t.TempDir() + "/records.db"
 	store, problem := records.Open(path)
 	fatal(t, problem)
@@ -22,11 +22,11 @@ func TestRecordsSchemaIsExactV6AndStable(t *testing.T) {
 	var version, before int
 	must(t, db.QueryRow(`PRAGMA user_version`).Scan(&version))
 	must(t, db.QueryRow(`PRAGMA schema_version`).Scan(&before))
-	if version != 6 {
-		t.Fatalf("fresh records version = %d, want exact v6", version)
+	if version != 7 {
+		t.Fatalf("fresh records version = %d, want exact v7", version)
 	}
 	for _, column := range []string{
-		"rental", "package_revision_digest", "environment_digest", "config_digest",
+		"rental", "rental_required", "package_revision_digest", "environment_digest", "config_digest",
 	} {
 		var count int
 		must(t, db.QueryRow(`SELECT COUNT(*) FROM pragma_table_info('requests') WHERE name=?`,
@@ -64,12 +64,12 @@ func TestRecordsSchemaIsExactV6AndStable(t *testing.T) {
 	var after int
 	must(t, db.QueryRow(`PRAGMA schema_version`).Scan(&after))
 	if after != before {
-		t.Fatalf("exact v6 reopen performed DDL: schema_version %d -> %d", before, after)
+		t.Fatalf("exact v7 reopen performed DDL: schema_version %d -> %d", before, after)
 	}
 }
 
-func TestRecordsRefusesEveryPreV6VersionWithoutMutation(t *testing.T) {
-	for _, older := range []int{1, 2, 3, 4, 5} {
+func TestRecordsRefusesEveryPreV7VersionWithoutMutation(t *testing.T) {
+	for _, older := range []int{1, 2, 3, 4, 5, 6} {
 		t.Run(fmt.Sprintf("v%d", older), func(t *testing.T) {
 			path := t.TempDir() + "/records.db"
 			db, err := sql.Open("sqlite", path)
@@ -84,11 +84,11 @@ func TestRecordsRefusesEveryPreV6VersionWithoutMutation(t *testing.T) {
 			opened, problem := records.Open(path)
 			if opened != nil {
 				opened.Close()
-				t.Fatal("pre-v6 records schema opened")
+				t.Fatal("pre-v7 records schema opened")
 			}
 			if problem == nil || problem.ErrName() != "records.schema_reset_required" ||
 				!strings.Contains(problem.Remedy, "move") {
-				t.Fatalf("pre-v6 schema refusal = %#v", problem)
+				t.Fatalf("pre-v7 schema refusal = %#v", problem)
 			}
 			db, err = sql.Open("sqlite", path)
 			must(t, err)
