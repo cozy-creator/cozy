@@ -159,6 +159,8 @@ type Orchestrator struct {
 	// mediaCleaning prevents overlapping retries of one durable cleanup obligation. It
 	// contains only calls in flight; success is recorded on the attempt row.
 	mediaCleaning map[string]bool
+	// outputExporting serializes retries of one durable local --out obligation.
+	outputExporting map[string]bool
 	// pending is the dispatch queue: requests that have no ready worker YET. A requeue
 	// with nowhere to go WAITS for capacity instead of evaporating — the alternative is
 	// a request that quietly stops existing because a worker was still loading.
@@ -214,6 +216,7 @@ func Open(opt Options) (*Orchestrator, *exit.Error) {
 		waits:             map[string]*wait{},
 		offers:            map[string]*dispatchReservation{},
 		mediaCleaning:     map[string]bool{},
+		outputExporting:   map[string]bool{},
 		starting:          map[string]bool{},
 		ensuring:          map[string]chan struct{}{},
 		frames:            newFanout(),

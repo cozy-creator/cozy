@@ -1812,5 +1812,8 @@ func (c *Orchestrator) Reconcile() (killed, forgotten int, e *exit.Error) {
 		c.logf("%s committed and acknowledged a retry before restart; resuming its requeue", req.ID)
 		c.Requeue(req.ID, "restart-after-terminal-ack")
 	}
+	if problem := c.ResumeOutputExports(); problem != nil {
+		return killed, forgotten, problem
+	}
 	return killed, forgotten, nil
 }

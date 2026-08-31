@@ -75,6 +75,9 @@ type Submission struct {
 	InstallID string
 	// Rental authorizes placement on Creator-managed rented capacity.
 	Rental bool
+	// OutputExport is the descriptor-derived local destination requested by the CLI.
+	// It changes no execution fact and is settled independently after terminal mirror.
+	OutputExport *records.OutputExportIntent
 }
 
 const ArtifactManifestMime = "application/vnd.cozy.model-manifest"
@@ -189,6 +192,7 @@ func requestRecord(s Submission) (records.Request, map[string]any, *exit.Error) 
 		Assets:  s.Assets, ArtifactOutputs: string(artifactBytes),
 		Kind: s.Kind, JobGPUCount: s.JobGPUCount, Org: s.Org, Trees: strings.Join(s.Trees, ","),
 		Worker: s.Worker, InstallID: s.InstallID, Rental: s.Rental, Models: s.Models,
+		OutputExport: s.OutputExport,
 	}
 	event := map[string]any{
 		"package": s.Package, "function": s.Entrypoint,

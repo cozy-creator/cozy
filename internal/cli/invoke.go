@@ -158,6 +158,16 @@ func handleRun(ctx *Context, target Target, ep *launch.Entrypoint) *exit.Error {
 	} else if len(ctx.Inv.Values["--model"]) > 0 {
 		return exit.Usagef("--model currently selects models only for --rental execution")
 	}
+	outputDirectory := ""
+	outputIntentHash := ""
+	if requested := ctx.Inv.Value("--out"); requested != "" {
+		absolute, err := filepath.Abs(requested)
+		if err != nil {
+			return exit.Usagef("cannot resolve --out %q: %s", requested, err)
+		}
+		outputDirectory = filepath.Clean(absolute)
+		outputIntentHash = outputHash
+	}
 
 	c, e := dial(ctx)
 	if e != nil {
@@ -168,7 +178,8 @@ func handleRun(ctx *Context, target Target, ep *launch.Entrypoint) *exit.Error {
 		Package: target.Package, Function: target.Function, Input: input,
 		LocalAssets: assets, InstallID: target.InstallID,
 		Release: target.Release, ReleaseDigest: target.ReleaseDigest, Rental: managedRental,
-		Models: models,
+		Models:          models,
+		OutputDirectory: outputDirectory, OutputPayloadHash: outputIntentHash,
 	}, key)
 	if e != nil {
 		return e
@@ -207,10 +218,11 @@ func handleRun(ctx *Context, target Target, ep *launch.Entrypoint) *exit.Error {
 	if terminal == nil && !invocationSettled(life.Status) {
 		return renderSubmittedRun(ctx, life, !handle.Replay)
 	}
-	saved, e := saveOutputs(ctx, c, life, outputHash)
+	life, e = waitOutputExport(c, life)
 	if e != nil {
 		return e
 	}
+	saved := exportedOutputs(life)
 	return renderRun(ctx, life, terminal, stopped, saved, submitted, began)
 }
 
@@ -496,11 +508,73 @@ func renderSubmittedRun(ctx *Context, life api.Lifecycle, changed bool) *exit.Er
 		fields = append(fields, output.Field{K: "queue", V: queue})
 		defaults = append(defaults, "queue")
 	}
+	if export := life.OutputExport; export != nil {
+		fields = append(fields, output.Field{K: "output", V: outputExportHint(export)})
+		defaults = append(defaults, "output")
+	}
 	fields = append(fields, output.Field{K: "changed", V: changed})
 	defaults = append(defaults, "run")
 	rec := compactRecord(fields, defaults...)
 	rec.Next = []string{"cozy run cancel " + life.RequestID}
 	return emit(ctx, rec)
+}
+
+func waitOutputExport(c *localapi.Client, life api.Lifecycle) (api.Lifecycle, *exit.Error) {
+	for life.OutputExport != nil {
+		export := life.OutputExport
+		switch export.State {
+		case "published", "skipped":
+			return life, nil
+		case "failed":
+			return life, exit.Named(exit.Unavailable, "output_export_failed",
+				"run %s completed, but output export failed: %s — %s",
+				life.RequestID, export.ErrorCode, export.Error).
+				WithRemedy("fix the recorded destination and repeat the same idempotency key; the daemon retries this durable export")
+		case "pending", "exporting":
+			time.Sleep(50 * time.Millisecond)
+			updated, problem := c.Request(life.RequestID)
+			if problem != nil {
+				return life, problem
+			}
+			life = updated
+		default:
+			return life, exit.Internalf("run %s has unknown output export state %q",
+				life.RequestID, export.State)
+		}
+	}
+	return life, nil
+}
+
+func outputExportHint(export *api.OutputExportRef) string {
+	if export == nil {
+		return ""
+	}
+	if len(export.PublishedPaths) == 1 {
+		return export.PublishedPaths[0]
+	}
+	if len(export.PublishedPaths) > 1 {
+		return strings.Join(export.PublishedPaths, ", ")
+	}
+	return filepath.Join(export.Directory, export.PayloadHash+"*")
+}
+
+func exportedOutputs(life api.Lifecycle) []map[string]string {
+	if life.OutputExport == nil || life.OutputExport.State != "published" {
+		return nil
+	}
+	paths := life.OutputExport.PublishedPaths
+	result := make([]map[string]string, 0, len(paths))
+	for index, path := range paths {
+		row := map[string]string{"path": path}
+		if index < len(life.Outputs) {
+			row["output"] = life.Outputs[index].OutputID
+			row["bytes"] = output.Bytes(life.Outputs[index].Length)
+			row["mime"] = life.Outputs[index].MimeType
+			row["digest"] = life.Outputs[index].Digest
+		}
+		result = append(result, row)
+	}
+	return result
 }
 
 func runStatus(status string) string {
