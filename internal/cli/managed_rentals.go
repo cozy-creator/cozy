@@ -127,7 +127,7 @@ func (m *managedRentals) acquire(req records.Request) (string, string, *exit.Err
 	}
 	fmt.Fprintf(m.ctx.Out, "rentals: renting %s at %s\n", sku.Name, usdPerHour(sku.PriceUSDMicrosPerHour))
 	row, _, _, problem := acquireRental(m.ctx, m.layout, m.store, sku.Name, "",
-		"managed-rental-"+req.ID, "cozy run --rental "+req.Package,
+		"managed-rental-"+req.ID, "",
 		sku.PriceUSDMicrosPerHour, m.ctx.Cfg.RentalsMaxHourlySpendUSDMicros, time.Time{}, req.ID)
 	if problem != nil {
 		return "", "", problem
@@ -242,7 +242,7 @@ func (m *managedRentals) releaseLocked(id string) (string, *exit.Error) {
 		fmt.Fprintln(m.ctx.Out, line)
 	}
 	hctx, cancel := hub.Context()
-	problem = client(m.ctx).Release(hctx, id, "cozy run --rental queue drained")
+	problem = client(m.ctx).Release(hctx, id, "")
 	cancel()
 	if problem != nil && problem.Code != exit.NotFound {
 		return "", problem

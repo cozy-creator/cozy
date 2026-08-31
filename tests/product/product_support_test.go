@@ -130,17 +130,12 @@ func fakeSpec(name, device string, args ...string) orchestrator.WorkerLaunchSpec
 		return &pb.Ref{Digest: digest[:], Length: uint64(len(label))}
 	}
 	spelled := func(raw []byte) string { value, _ := canonical.Spell(raw); return value }
-	wheelhouse := ref("fake-wheelhouse")
 	environment := map[string]canonical.Value{
-		"wheelhouse_manifest": map[string]canonical.Value{
-			"digest": spelled(wheelhouse.Digest), "length": int64(wheelhouse.Length),
-		},
 		"wheels": []canonical.Value{},
 	}
 	environmentIdentity := map[string]canonical.Value{
-		"format":              "cozy.worker.v1.Environment/1",
-		"wheelhouse_manifest": environment["wheelhouse_manifest"],
-		"wheels":              environment["wheels"],
+		"format": "cozy.worker.v1.Environment/1",
+		"wheels": environment["wheels"],
 	}
 	environmentBytes, _ := canonical.Write(environmentIdentity)
 	entrypointIdentity := map[string]canonical.Value{
@@ -162,12 +157,10 @@ func fakeSpec(name, device string, args ...string) orchestrator.WorkerLaunchSpec
 			ProjectWheel: &pb.WheelFact{Ref: ref("fake-project-wheel"), Distribution: "fake-" + name,
 				Version: "1.0.0", Filename: "fake_" + name + "-1.0.0-py3-none-any.whl",
 				ImportRoots: []string{"fake_" + name}, Tags: []string{"py3-none-any"}}}},
-		EnvironmentDigest:        canonical.Digest(environmentBytes),
-		EnvironmentReceiptDigest: canonical.Digest([]byte("fake-receipt")),
-		PackageDescriptor:        ref("fake-descriptor"), BindingsDigest: canonical.Digest(bindingsBytes),
-		Entrypoints:   []*pb.Entrypoint{{Name: "fake", EntrypointBindingDigest: entrypointDigest}},
-		Qualification: ref("fake-qualification"),
-		Environment:   &pb.Environment{WheelhouseManifest: wheelhouse},
+		EnvironmentDigest: canonical.Digest(environmentBytes),
+		PackageDescriptor: ref("fake-descriptor"), BindingsDigest: canonical.Digest(bindingsBytes),
+		Entrypoints: []*pb.Entrypoint{{Name: "fake", EntrypointBindingDigest: entrypointDigest}},
+		Environment: &pb.Environment{},
 	}}})
 	setID := spelled(setDigest)
 	placement, problem := orchestrator.PlacementFromExact("fake/"+name, "", setID,

@@ -9,11 +9,13 @@ import (
 	"io"
 	"io/fs"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"regexp"
 	"sort"
 	"strings"
 
+	"github.com/cozy-creator/cozy/internal/config"
 	"github.com/cozy-creator/cozy/internal/exit"
 	"github.com/cozy-creator/cozy/internal/wheel"
 	"github.com/pelletier/go-toml/v2"
@@ -33,6 +35,7 @@ var projectNameSeparator = regexp.MustCompile(`[-_.]+`)
 // computes identities and package facts after the bytes arrive.
 type Package struct {
 	Files            map[string]string // source-relative path -> local path
+	Descriptor       string
 	Wheel            string
 	DependencyWheels []DependencyWheel
 	Tree             string
@@ -123,8 +126,37 @@ func (p *Package) Build(ctx context.Context) *exit.Error {
 		p.Root = ""
 		return problem
 	}
-	p.Wheel, p.DependencyWheels = project.Path, dependencies
+	descriptor, problem := describe(ctx, p.Tree, root)
+	if problem != nil {
+		p.Close()
+		p.Root = ""
+		return problem
+	}
+	p.Wheel, p.Descriptor, p.DependencyWheels = project.Path, descriptor, dependencies
 	return nil
+}
+
+func describe(ctx context.Context, tree, root string) (string, *exit.Error) {
+	cmd := exec.CommandContext(ctx, "uv", "run", "--locked", "--no-progress",
+		"cozy-runtime", "--json", "--dir", tree, "describe")
+	cmd.Dir = tree
+	cmd.Env = config.Frozen().Tool()
+	var stdout, stderr strings.Builder
+	cmd.Stdout, cmd.Stderr = &stdout, &stderr
+	if err := cmd.Run(); err != nil {
+		return "", exit.Named(exit.Validation, "package_descriptor_refused",
+			"cozy-runtime could not describe the package").WithRemedy("%s", strings.TrimSpace(stderr.String()))
+	}
+	raw := []byte(strings.TrimSpace(stdout.String()))
+	if len(raw) == 0 || len(raw) > 1<<20 || !json.Valid(raw) {
+		return "", exit.Named(exit.Structural, "package_descriptor_invalid",
+			"cozy-runtime returned an invalid package descriptor")
+	}
+	path := filepath.Join(root, "descriptor.json")
+	if err := os.WriteFile(path, raw, 0o600); err != nil {
+		return "", exit.Internalf("cannot stage package descriptor: %s", err)
+	}
+	return path, nil
 }
 
 // SourceIdentity binds an editable install to the exact publishable source tree.

@@ -24,10 +24,12 @@ import (
 // Submission is one local request. The orchestrator owns everything in it that decides
 // WHAT runs; the runtime owns everything about HOW.
 type Submission struct {
-	IdemKey    string // the caller's idempotency key
-	Package    string // org/name
-	Entrypoint string // the function
-	PlanID     string // the entrypoint_binding_plan_id this attempt binds
+	IdemKey       string // the caller's idempotency key
+	Package       string // org/name
+	Entrypoint    string // the function
+	PlanID        string // the entrypoint_binding_plan_id this attempt binds
+	Release       string // immutable remote package release; empty for local execution
+	ReleaseDigest string // exact remote release.json identity
 
 	// Payload is the request body, verbatim. It rides the DeliveryGrant as the input
 	// `payload` — a grant input, never a wire field, so refreshing the grant can never
@@ -67,8 +69,7 @@ type Submission struct {
 	// through Options.Rentals). Empty = any local worker.
 	Worker string
 	// InstallID pins a durable request to one immutable local install resolution.
-	// In the initial weightless remote lane it supplies only the exact logical release
-	// and request/result descriptor; no local platform facts cross the control stream.
+	// Remote requests instead carry Release and ReleaseDigest.
 	InstallID string
 	// Rental authorizes placement on Creator-managed rented capacity.
 	Rental bool
@@ -175,6 +176,7 @@ func requestRecord(s Submission) (records.Request, map[string]any, *exit.Error) 
 	req := records.Request{
 		ID: id, IdemKey: s.IdemKey, BodyDigest: bodyDigest,
 		Package: s.Package, Entrypoint: s.Entrypoint, PlanID: s.PlanID, Payload: s.Payload,
+		Release: s.Release, PackageRevisionDigest: s.ReleaseDigest,
 		Outputs: strings.Join(s.Outputs, ","),
 		Assets:  s.Assets, ArtifactOutputs: string(artifactBytes),
 		Kind: s.Kind, Org: s.Org, Trees: strings.Join(s.Trees, ","),
@@ -187,6 +189,8 @@ func requestRecord(s Submission) (records.Request, map[string]any, *exit.Error) 
 	}
 	if s.Rental {
 		event["rental"] = true
+		event["release"] = s.Release
+		event["release_digest"] = s.ReleaseDigest
 	}
 	return req, event, nil
 }
@@ -599,14 +603,15 @@ func (c *Orchestrator) resolveFor(req records.Request) (WorkerLaunchSpec, string
 		return WorkerLaunchSpec{}, "", exit.Named(exit.Internal, "rental.target_incomplete",
 			"rental %s resolved without a complete remote target", req.Worker)
 	}
-	if c.opt.Packages == nil || c.opt.RentalPackageSet == nil || req.InstallID == "" {
+	if c.opt.RentalPackageSet == nil || req.Release == "" ||
+		!validDigest(req.PackageRevisionDigest) || !validDigest(req.PlanID) {
 		return WorkerLaunchSpec{}, "", exit.Unavailablef(
 			"remote package preparation requires an exact release and package_set signer")
 	}
-	logical, e := c.opt.Packages.ResolveLogicalInstall(req.InstallID, req.Entrypoint)
-	if e != nil {
-		return WorkerLaunchSpec{}, "", e
-	}
+	logical := LogicalPackage{Package: req.Package, Release: req.Release,
+		ReleaseDigest: req.PackageRevisionDigest, Function: req.Entrypoint,
+		Outputs: strings.FieldsFunc(req.Outputs, func(r rune) bool { return r == ',' }),
+		PlanID:  req.PlanID}
 	instance, _, _, e := c.EnsureRental(req.Worker)
 	if e != nil {
 		return WorkerLaunchSpec{}, "", e

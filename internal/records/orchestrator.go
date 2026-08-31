@@ -51,6 +51,7 @@ CREATE TABLE IF NOT EXISTS requests (
   package     TEXT    NOT NULL,
   entrypoint   TEXT    NOT NULL,
   plan_id      TEXT    NOT NULL,
+  package_release TEXT NOT NULL DEFAULT '',
   package_revision_digest TEXT NOT NULL DEFAULT '',
   environment_digest TEXT NOT NULL DEFAULT '',
   config_digest TEXT NOT NULL DEFAULT '',
@@ -403,6 +404,7 @@ type Request struct {
 	Package    string
 	Entrypoint string
 	PlanID     string
+	Release    string
 	// A remote worker derives these invocation identities from its exact accepted
 	// Placement. They are CAS-bound with PlanID before the first offer so a retry or
 	// reconnect cannot silently change the execution named by this request.
@@ -462,7 +464,7 @@ type AssetBinding struct {
 	MaxBytes  int64  `json:"max_bytes,omitempty"`
 }
 
-const requestCols = `id,idem_key,body_digest,package,entrypoint,plan_id,
+const requestCols = `id,idem_key,body_digest,package,entrypoint,plan_id,package_release,
 	package_revision_digest,environment_digest,config_digest,payload,outputs,
 	state,ordinal,requeues,created_at,kind,org,trees,worker,rental,
 	COALESCE(install_id,''),assets,artifact_outputs`
@@ -471,7 +473,7 @@ func scanRequest(row interface{ Scan(...any) error }) (Request, error) {
 	var r Request
 	var assets string
 	err := row.Scan(&r.ID, &r.IdemKey, &r.BodyDigest, &r.Package, &r.Entrypoint, &r.PlanID,
-		&r.PackageRevisionDigest, &r.EnvironmentDigest, &r.ConfigDigest, &r.Payload, &r.Outputs,
+		&r.Release, &r.PackageRevisionDigest, &r.EnvironmentDigest, &r.ConfigDigest, &r.Payload, &r.Outputs,
 		&r.State, &r.Ordinal, &r.Requeues, &r.CreatedAt,
 		&r.Kind, &r.Org, &r.Trees, &r.Worker, &r.Rental,
 		&r.InstallID, &assets, &r.ArtifactOutputs)
@@ -505,9 +507,10 @@ func (s *Store) BindRemoteInvocation(id, planID, packageRevision, environment, c
 		return exit.Internalf("cannot bind an incomplete remote invocation identity")
 	}
 	result, err := s.db.Exec(`UPDATE requests SET plan_id=?,package_revision_digest=?,
-		environment_digest=?,config_digest=? WHERE id=? AND plan_id='' AND
-		package_revision_digest='' AND environment_digest='' AND config_digest=''`,
-		planID, packageRevision, environment, config, id)
+		environment_digest=?,config_digest=? WHERE id=? AND (plan_id='' OR plan_id=?) AND
+		(package_revision_digest='' OR package_revision_digest=?) AND
+		environment_digest='' AND config_digest=''`,
+		planID, packageRevision, environment, config, id, planID, packageRevision)
 	if err != nil {
 		return exit.Internalf("cannot bind request %s remote invocation: %s", id, err)
 	}
@@ -814,12 +817,12 @@ func submitRequestTx(tx *sql.Tx, r Request, assets string) (Request, bool, *exit
 		return Request{}, false, exit.Internalf("cannot read request %s: %s", r.IdemKey, err)
 	}
 	if _, err := tx.Exec(`INSERT INTO requests(id,idem_key,body_digest,package,entrypoint,
-		plan_id,package_revision_digest,environment_digest,config_digest,
+		plan_id,package_release,package_revision_digest,environment_digest,config_digest,
 		payload,outputs,state,ordinal,requeues,created_at,kind,org,trees,worker,rental,install_id,assets,
 		artifact_outputs)
-		VALUES(?,?,?,?,?,?,?,?,?,?,?,?,0,0,?,?,?,?,?,?,?,?,?)`,
+		VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,0,0,?,?,?,?,?,?,?,?,?)`,
 		r.ID, r.IdemKey, r.BodyDigest, r.Package, r.Entrypoint, r.PlanID,
-		r.PackageRevisionDigest, r.EnvironmentDigest, r.ConfigDigest, r.Payload,
+		r.Release, r.PackageRevisionDigest, r.EnvironmentDigest, r.ConfigDigest, r.Payload,
 		r.Outputs, r.State, r.CreatedAt, r.Kind, r.Org, r.Trees, r.Worker, r.Rental,
 		nullable(r.InstallID),
 		assets, r.ArtifactOutputs); err != nil {

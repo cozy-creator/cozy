@@ -102,7 +102,6 @@ type Launcher interface {
 	// ResolveInstall relaunches the immutable local install a durable request resolved
 	// before entering the queue, so a changed pin cannot change accepted work.
 	ResolveInstall(installID string) (WorkerLaunchSpec, *exit.Error)
-	ResolveLogicalInstall(installID, function string) (LogicalPackage, *exit.Error)
 	// ResolveJob is the JOB lane's half: `org/name` plus a job function to the spec that
 	// makes THAT job's worker resident. It is a separate method rather than a flag
 	// because the two produce different Directives and different worker slots — the
@@ -116,9 +115,9 @@ type LogicalPackage struct {
 	Package       string
 	Release       string
 	ReleaseDigest string
-	InstallID     string
 	Function      string
 	Outputs       []string
+	PlanID        string
 }
 
 // Orchestrator is the Cozy daemon's scheduling role.

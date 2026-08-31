@@ -51,7 +51,6 @@ type PackageInstall struct {
 	Packages           int
 	Closure            string // one "name==version" per line
 	PackageDescriptor  string // exact digest of the generation-private Runtime-derived descriptor
-	SelectionProfile   string // Hub-selected base-worker compatibility profile
 	PlacementSetDigest string // exact Hub-selected PlacementSet/1 stored in the artifact cache
 	BytesExcl          int64
 	BytesShared        int64
@@ -94,7 +93,6 @@ CREATE TABLE IF NOT EXISTS install_generations (
   packages      INTEGER NOT NULL,
   closure       TEXT    NOT NULL,
   package_descriptor TEXT    NOT NULL,
-  selection_profile TEXT     NOT NULL DEFAULT '',
   placement_set_digest TEXT  NOT NULL DEFAULT '',
   bytes_excl    INTEGER NOT NULL,
   bytes_shared  INTEGER NOT NULL,
@@ -278,7 +276,7 @@ func (s *Store) Close() { _ = s.db.Close() }
 var genFields = []string{
 	"id", "package", "major", "version", "source_kind", "source_ref", "source_digest",
 	"verified", "dir", "python", "runtime", "project_dir", "uv", "lock_digest", "platform", "extra", "link_mode",
-	"packages", "closure", "package_descriptor", "selection_profile", "placement_set_digest", "bytes_excl", "bytes_shared", "created_at",
+	"packages", "closure", "package_descriptor", "placement_set_digest", "bytes_excl", "bytes_shared", "created_at",
 }
 
 // genCols is the select list, optionally table-qualified for a join.
@@ -299,7 +297,7 @@ func scanGen(rows interface{ Scan(...any) error }) (PackageInstall, error) {
 	var verified int
 	err := rows.Scan(&g.ID, &g.Package, &g.Major, &g.Version, &g.SourceKind, &g.SourceRef,
 		&g.SourceDigest, &verified, &g.Dir, &g.Python, &g.Runtime, &g.ProjectDir, &g.UV, &g.LockDigest, &g.Platform,
-		&g.Extra, &g.LinkMode, &g.Packages, &g.Closure, &g.PackageDescriptor, &g.SelectionProfile, &g.PlacementSetDigest,
+		&g.Extra, &g.LinkMode, &g.Packages, &g.Closure, &g.PackageDescriptor, &g.PlacementSetDigest,
 		&g.BytesExcl, &g.BytesShared, &g.CreatedAt)
 	g.Verified = verified == 1
 	return g, err
@@ -331,7 +329,7 @@ func (s *Store) Activate(g PackageInstall) (superseded string, e *exit.Error) {
 		VALUES(`+placeholders()+`)`,
 		g.ID, g.Package, g.Major, g.Version, g.SourceKind, g.SourceRef, g.SourceDigest,
 		verified, g.Dir, g.Python, g.Runtime, g.ProjectDir, g.UV, g.LockDigest, g.Platform, g.Extra, g.LinkMode,
-		g.Packages, g.Closure, g.PackageDescriptor, g.SelectionProfile, g.PlacementSetDigest,
+		g.Packages, g.Closure, g.PackageDescriptor, g.PlacementSetDigest,
 		g.BytesExcl, g.BytesShared, g.CreatedAt); err != nil {
 		return "", exit.Internalf("cannot insert generation %s: %s", g.ID, err)
 	}

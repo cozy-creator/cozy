@@ -73,18 +73,11 @@ type Rental struct {
 	HourlyRateUSDMicros int64
 }
 
-// ExactDocument and ModelSelection are package-download DTOs. Generic rental
-// admission does not carry either type.
+// ExactDocument is the package descriptor returned with exact wheel downloads.
 type ExactDocument struct {
 	CanonicalBytes []byte `json:"canonical_bytes"`
 	Digest         string `json:"digest"`
 	Length         int64  `json:"length"`
-}
-
-type ModelSelection struct {
-	ID       string `json:"id"`
-	ModelRef string `json:"model_ref"`
-	Lane     string `json:"lane"`
 }
 
 // Ready answers whether this rental carries the whole dial triple and an observed
