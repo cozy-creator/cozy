@@ -97,23 +97,15 @@ func handleModelPublish(ctx *Context) *exit.Error {
 		if problem := modelsource.LocalName(name); problem != nil {
 			return problem
 		}
-		tool, layout, problem := localTensorFS(ctx)
+		tool, _, problem := localTensorFS(ctx)
 		if problem != nil {
 			return problem
 		}
-		if err := os.MkdirAll(layout.Transfer, 0o700); err != nil {
-			return exit.Internalf("cannot create transfer scratch: %s", err)
-		}
-		probe, err := os.MkdirTemp(layout.Transfer, "local-alias-")
-		if err != nil {
-			return exit.Internalf("cannot create local alias scratch: %s", err)
-		}
-		defer os.RemoveAll(probe)
-		row, problem := tool.ResolveLocal(name, filepath.Join(probe, "rows.jsonl"))
+		row, problem := tool.ResolveLocal(name)
 		if problem != nil {
 			return problem
 		}
-		manifestID = "sha256:" + row.ManifestSHA256
+		manifestID = row.ManifestDigest
 		evidenceRef = hub.Ref{Org: "local", Name: name}
 	} else if strings.ContainsRune(subject, os.PathSeparator) || strings.HasPrefix(subject, ".") {
 		// A path is an INGEST subject, not a publish subject (decisions #58's two-step
@@ -348,12 +340,25 @@ func handleModelRemove(ctx *Context) *exit.Error {
 		if !held[ref.String()] {
 			continue
 		}
-		repoScratch := filepath.Join(scratchDir, strings.ReplaceAll(ref.String(), "/", "-"))
-		if err := os.MkdirAll(repoScratch, 0o700); err != nil {
-			return exit.Internalf("cannot create repository-remove scratch: %s", err)
-		}
-		if problem := tool.DeleteRepository(ref.Org, ref.Name, repoScratch); problem != nil {
-			return problem
+		if ref.Org == "local" {
+			if problem := modelsource.LocalName(ref.Name); problem != nil {
+				return problem
+			}
+			alias, problem := tool.ResolveLocal(ref.Name)
+			if problem != nil {
+				return problem
+			}
+			if problem := tool.RemoveLocal(ref.Name, alias.RepositoryDigest); problem != nil {
+				return problem
+			}
+		} else {
+			repoScratch := filepath.Join(scratchDir, strings.ReplaceAll(ref.String(), "/", "-"))
+			if err := os.MkdirAll(repoScratch, 0o700); err != nil {
+				return exit.Internalf("cannot create repository-remove scratch: %s", err)
+			}
+			if problem := tool.DeleteRepository(ref.Org, ref.Name, repoScratch); problem != nil {
+				return problem
+			}
 		}
 		removed.Rows = append(removed.Rows, map[string]string{"model": ref.String()})
 		delete(held, ref.String())

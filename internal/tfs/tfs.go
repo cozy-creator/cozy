@@ -340,33 +340,57 @@ func (t *Tool) ReleaseEvidence(org, name, manifestID, outPath string) ([]byte, *
 	return evidence, nil
 }
 
-// ResolveLocal returns the one current row behind Creator's reserved local/name
-// alias. TensorFS will eventually own atomic replacement of this row; Creator
-// deliberately does not infer "current" from several immutable releases.
-func (t *Tool) ResolveLocal(name, outPath string) (Release, *exit.Error) {
-	rows, e := t.Releases(outPath)
+// LocalAlias is TensorFS's exact device-local alias projection. The repository
+// digest is the compare-and-swap observation required by replace/remove.
+type LocalAlias struct {
+	ManifestDigest   string `json:"manifest_digest"`
+	ManifestLength   int64  `json:"manifest_length"`
+	Name             string `json:"name"`
+	RepositoryDigest string `json:"repository_digest"`
+	SourceSelection  string `json:"source_selection"`
+}
+
+func parseLocalAlias(raw string) (LocalAlias, *exit.Error) {
+	var alias LocalAlias
+	if json.Unmarshal([]byte(strings.TrimSpace(raw)), &alias) != nil || alias.Name == "" ||
+		alias.ManifestLength <= 0 || !validID(alias.ManifestDigest) ||
+		!validID(alias.RepositoryDigest) || !validID(alias.SourceSelection) {
+		return LocalAlias{}, exit.Internalf("tfs returned an invalid local alias projection")
+	}
+	return alias, nil
+}
+
+func validID(value string) bool {
+	_, problem := ManifestID(value)
+	return problem == nil
+}
+
+// ResolveLocal returns the one current row behind Creator's reserved local/name alias.
+func (t *Tool) ResolveLocal(name string) (LocalAlias, *exit.Error) {
+	out, e := t.run("local", "resolve", t.Root, name)
 	if e != nil {
-		return Release{}, e
+		return LocalAlias{}, e
 	}
-	var found *Release
-	for i := range rows {
-		row := rows[i]
-		if row.Org != "local" || row.Name != name {
-			continue
-		}
-		if found != nil {
-			return Release{}, exit.Named(exit.Conflict, "model.local_alias_ambiguous",
-				"local/%s has more than one TensorFS release row", name).
-				WithRemedy("repair the local alias to one exact Manifest before using it")
-		}
-		copy := row
-		found = &copy
+	return parseLocalAlias(out)
+}
+
+// ReplaceLocal atomically swaps the complete one-row alias after TensorFS has
+// verified the exact Manifest and evidence. observed is a prior ResolveLocal
+// repository digest or "absent" for first creation.
+func (t *Tool) ReplaceLocal(name, sourceSelection, manifestID string, length int64,
+	evidencePath, observed string,
+) (LocalAlias, *exit.Error) {
+	out, e := t.run("local", "replace", t.Root, name, sourceSelection, manifestID,
+		strconv.FormatInt(length, 10), "--observed", observed, "--evidence", evidencePath)
+	if e != nil {
+		return LocalAlias{}, e
 	}
-	if found == nil {
-		return Release{}, exit.New(exit.NotFound, "local/%s is not imported", name).
-			WithNext("cozy model import <source> --name " + name)
-	}
-	return *found, nil
+	return parseLocalAlias(out)
+}
+
+func (t *Tool) RemoveLocal(name, observed string) *exit.Error {
+	_, e := t.run("local", "remove", t.Root, name, "--observed", observed)
+	return e
 }
 
 func writeJSON(path string, value any) *exit.Error {
