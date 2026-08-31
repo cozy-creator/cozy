@@ -11,6 +11,7 @@ import (
 	"github.com/cozy-creator/cozy/internal/exit"
 	"github.com/cozy-creator/cozy/internal/home"
 	"github.com/cozy-creator/cozy/internal/hub"
+	"github.com/cozy-creator/cozy/internal/modelsource"
 	"github.com/cozy-creator/cozy/internal/output"
 	"github.com/cozy-creator/cozy/internal/records"
 	"github.com/cozy-creator/cozy/internal/secret"
@@ -80,22 +81,46 @@ func handleModelPublish(ctx *Context) *exit.Error {
 	if e != nil {
 		return e
 	}
-	subject := ctx.Inv.Args[1]
-	if strings.ContainsRune(subject, os.PathSeparator) || strings.HasPrefix(subject, ".") {
-		// A path is an INGEST subject, not a publish subject (decisions #58's two-step
-		// model): the border runs where the bytes are, and only a canonical manifest
-		// is publishable. Refusing by name beats growing a second border here.
-		return exit.Usagef("%q is a path, and a path is not publishable", subject).
-			WithRemedy("ingest it first and publish the manifest id TensorFS prints").
-			WithNext("cozy help model publish")
-	}
-	manifestID, e := tfs.ManifestID(subject)
-	if e != nil {
-		return e
+	if ref.Org == "local" {
+		return exit.Usagef("local/ is reserved for private aliases and cannot be a Tensorhub destination").
+			WithRemedy("publish under your Tensorhub organization, for example alice/%s", ref.Name)
 	}
 	release, lane := strings.TrimSpace(ctx.Inv.Value("--release")), strings.TrimSpace(ctx.Inv.Value("--lane"))
 	if release == "" || lane == "" {
 		return exit.Usagef("model publish requires --release and --lane")
+	}
+	subject := ctx.Inv.Args[1]
+	var evidenceRef hub.Ref
+	var manifestID string
+	if strings.HasPrefix(subject, "local/") {
+		name := strings.TrimPrefix(subject, "local/")
+		if problem := modelsource.LocalName(name); problem != nil {
+			return problem
+		}
+		tool, _, problem := localTensorFS(ctx)
+		if problem != nil {
+			return problem
+		}
+		row, problem := tool.ResolveLocal(name)
+		if problem != nil {
+			return problem
+		}
+		manifestID = row.ManifestDigest
+		evidenceRef = hub.Ref{Org: "local", Name: name}
+	} else {
+		manifestID, e = tfs.ManifestID(subject)
+		if e != nil {
+			cwd, err := os.Getwd()
+			if err != nil {
+				return exit.Internalf("cannot resolve the current directory: %s", err)
+			}
+			if source, sourceProblem := modelsource.Parse(subject, cwd); sourceProblem == nil {
+				return exit.Named(exit.Structural, "model_source_planner_unavailable",
+					"%s is a valid model source, but this TensorFS build cannot derive its closed ingest plan", source.Canonical).
+					WithRemedy("the byte plane must supply reviewed component, encoding, and construction-order facts; Creator will not infer them from filenames")
+			}
+			return e
+		}
 	}
 	reason := "cozy model publish " + ref.String() + " " + manifestID + " --release " + release + " --lane " + lane
 	// The operation id binds the complete destination tuple without exposing an
@@ -107,7 +132,8 @@ func handleModelPublish(ctx *Context) *exit.Error {
 		return e
 	}
 	p := &transfer.Publish{
-		Tool: tool, Hub: c, Ref: ref, ManifestID: manifestID, Release: release, Lane: lane, Session: session,
+		Tool: tool, Hub: c, Ref: ref, EvidenceRef: evidenceRef,
+		ManifestID: manifestID, Release: release, Lane: lane, Session: session,
 		Reason: reason, DryRun: ctx.Inv.Bool("--dry-run"),
 		Progress: progress(ctx), Scratch: scratch(layout, manifestID),
 	}
@@ -237,13 +263,16 @@ func handleModelList(ctx *Context) *exit.Error {
 	}
 	list := output.List{
 		Name: "models", Fields: []string{"model", "release", "lane", "manifest_id"},
-		AllFields: []string{"model", "release", "lane", "manifest_id"},
+		AllFields: []string{"model", "kind", "release", "lane", "manifest_id"},
 	}
 	for _, release := range releases {
-		list.Rows = append(list.Rows, map[string]string{
-			"model": release.Org + "/" + release.Name, "release": release.Version,
-			"lane": release.Lane, "manifest_id": "sha256:" + release.ManifestSHA256,
-		})
+		row := map[string]string{"model": release.Org + "/" + release.Name,
+			"kind": "catalog", "release": release.Version, "lane": release.Lane,
+			"manifest_id": "sha256:" + release.ManifestSHA256}
+		if release.Org == "local" {
+			row["kind"], row["release"], row["lane"] = "local", "", ""
+		}
+		list.Rows = append(list.Rows, row)
 	}
 	return emit(ctx, list)
 }
@@ -313,12 +342,25 @@ func handleModelRemove(ctx *Context) *exit.Error {
 		if !held[ref.String()] {
 			continue
 		}
-		repoScratch := filepath.Join(scratchDir, strings.ReplaceAll(ref.String(), "/", "-"))
-		if err := os.MkdirAll(repoScratch, 0o700); err != nil {
-			return exit.Internalf("cannot create repository-remove scratch: %s", err)
-		}
-		if problem := tool.DeleteRepository(ref.Org, ref.Name, repoScratch); problem != nil {
-			return problem
+		if ref.Org == "local" {
+			if problem := modelsource.LocalName(ref.Name); problem != nil {
+				return problem
+			}
+			alias, problem := tool.ResolveLocal(ref.Name)
+			if problem != nil {
+				return problem
+			}
+			if problem := tool.RemoveLocal(ref.Name, alias.RepositoryDigest); problem != nil {
+				return problem
+			}
+		} else {
+			repoScratch := filepath.Join(scratchDir, strings.ReplaceAll(ref.String(), "/", "-"))
+			if err := os.MkdirAll(repoScratch, 0o700); err != nil {
+				return exit.Internalf("cannot create repository-remove scratch: %s", err)
+			}
+			if problem := tool.DeleteRepository(ref.Org, ref.Name, repoScratch); problem != nil {
+				return problem
+			}
 		}
 		removed.Rows = append(removed.Rows, map[string]string{"model": ref.String()})
 		delete(held, ref.String())

@@ -238,6 +238,8 @@ The default local root is `~/.cozy`. Configuration is read once from
 ```yaml
 tensorhub_url: https://tensorhub.example
 tensorhub_token: replace-with-your-token
+huggingface_token: hf_replace-with-your-token
+civitai_token: replace-with-your-token
 tfs: /usr/local/bin/tfs
 port: 8818
 local_rate_micro_usd_per_hour: 250000
@@ -253,11 +255,15 @@ Without `tensorhub_url`, Cozy uses the standing local Tensorhub at `http://127.0
 
 The YAML schema is strict: unknown keys, duplicate keys, undeclared nested structures, and multiple
 documents are refused. Cozy does not load a working-directory `.env` file.
+When either provider token is present, `config.yaml` must be an owner-owned regular file with mode
+`0600`; symlinks are refused.
 
 Supported environment variables are limited to:
 
 - `COZY_HOME`
 - `COZY_TFS`
+- `HF_TOKEN`
+- `CIVITAI_TOKEN`
 - `TENSORHUB_URL`
 - `TENSORHUB_TOKEN`
 

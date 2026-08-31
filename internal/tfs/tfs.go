@@ -340,6 +340,59 @@ func (t *Tool) ReleaseEvidence(org, name, manifestID, outPath string) ([]byte, *
 	return evidence, nil
 }
 
+// LocalAlias is TensorFS's exact device-local alias projection. The repository
+// digest is the compare-and-swap observation required by replace/remove.
+type LocalAlias struct {
+	ManifestDigest   string `json:"manifest_digest"`
+	ManifestLength   int64  `json:"manifest_length"`
+	Name             string `json:"name"`
+	RepositoryDigest string `json:"repository_digest"`
+	SourceSelection  string `json:"source_selection"`
+}
+
+func parseLocalAlias(raw string) (LocalAlias, *exit.Error) {
+	var alias LocalAlias
+	if json.Unmarshal([]byte(strings.TrimSpace(raw)), &alias) != nil || alias.Name == "" ||
+		alias.ManifestLength <= 0 || !validID(alias.ManifestDigest) ||
+		!validID(alias.RepositoryDigest) || !validID(alias.SourceSelection) {
+		return LocalAlias{}, exit.Internalf("tfs returned an invalid local alias projection")
+	}
+	return alias, nil
+}
+
+func validID(value string) bool {
+	_, problem := ManifestID(value)
+	return problem == nil
+}
+
+// ResolveLocal returns the one current row behind Creator's reserved local/name alias.
+func (t *Tool) ResolveLocal(name string) (LocalAlias, *exit.Error) {
+	out, e := t.run("local", "resolve", t.Root, name)
+	if e != nil {
+		return LocalAlias{}, e
+	}
+	return parseLocalAlias(out)
+}
+
+// ReplaceLocal atomically swaps the complete one-row alias after TensorFS has
+// verified the exact Manifest and evidence. observed is a prior ResolveLocal
+// repository digest or "absent" for first creation.
+func (t *Tool) ReplaceLocal(name, sourceSelection, manifestID string, length int64,
+	evidencePath, observed string,
+) (LocalAlias, *exit.Error) {
+	out, e := t.run("local", "replace", t.Root, name, sourceSelection, manifestID,
+		strconv.FormatInt(length, 10), "--observed", observed, "--evidence", evidencePath)
+	if e != nil {
+		return LocalAlias{}, e
+	}
+	return parseLocalAlias(out)
+}
+
+func (t *Tool) RemoveLocal(name, observed string) *exit.Error {
+	_, e := t.run("local", "remove", t.Root, name, "--observed", observed)
+	return e
+}
+
 func writeJSON(path string, value any) *exit.Error {
 	raw, err := json.Marshal(value)
 	if err != nil {
