@@ -15,6 +15,14 @@ mod store;
 use pyo3::prelude::*;
 use tensorfs_core::err::{refuse, Code, Result as TResult};
 
+fn python_distribution_version() -> String {
+    let cargo_version = env!("CARGO_PKG_VERSION");
+    let Some((release, development)) = cargo_version.split_once("-dev.") else {
+        return cargo_version.to_string();
+    };
+    format!("{release}.dev{development}")
+}
+
 /// The supported platforms, checked against the platform the interpreter reports.
 ///
 /// Windows has no `fcntl`, and this store's hold liveness IS an OS fact — an exclusive lock
@@ -62,7 +70,7 @@ fn _ext(m: &Bound<'_, PyModule>) -> PyResult<()> {
         .to_string();
     platform_gate(&plat).map_err(|e| errors::to_py(py, &e))?;
 
-    m.add("__version__", env!("CARGO_PKG_VERSION"))?;
+    m.add("__version__", python_distribution_version())?;
     m.add_function(wrap_pyfunction!(py_platform_gate, m)?)?;
 
     m.add_function(wrap_pyfunction!(docs::object_id, m)?)?;

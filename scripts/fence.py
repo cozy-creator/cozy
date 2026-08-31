@@ -13,7 +13,7 @@ import re
 import subprocess
 import sys
 
-from version_contract import source_version
+from version_contract import source_versions
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 
@@ -22,10 +22,13 @@ ROOT = pathlib.Path(__file__).resolve().parent.parent
 
 def fence_version_contract():
     try:
-        version = source_version()
+        cargo_version, python_version = source_versions()
     except (KeyError, OSError, ValueError) as error:
         return [str(error)], "source versions disagree"
-    return [], f"pyproject + Cargo crates agree on prelaunch version {version}"
+    return [], (
+        "current development identity is "
+        f"Cargo {cargo_version} / Python {python_version}"
+    )
 
 # ---------------------------------------------------------------- 1. dependencies
 

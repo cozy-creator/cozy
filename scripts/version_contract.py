@@ -20,6 +20,8 @@ V1_GATE = "proto-014"
 PYTHON_SPEC = ">=3.14,<3.15"
 MATURIN_SPEC = "maturin>=1.15,<2"
 PYO3_VERSION = "0.29.2"
+CURRENT_CARGO_VERSION = "0.0.3-dev.0"
+CURRENT_PYTHON_VERSION = "0.0.3.dev0"
 
 
 def python_runtime() -> str:
@@ -35,7 +37,17 @@ def _toml(path: pathlib.Path) -> dict[str, object]:
         return tomllib.load(source)
 
 
-def source_version() -> str:
+def _python_version_from_cargo(version: str) -> str:
+    base, separator, prerelease = version.partition("-")
+    if not separator:
+        return version
+    phase, dot, number = prerelease.partition(".")
+    if phase != "dev" or dot != "." or not number.isdigit():
+        raise ValueError(f"Cargo development version {version!r} is not <release>-dev.<number>")
+    return f"{base}.dev{number}"
+
+
+def source_versions() -> tuple[str, str]:
     pyproject = _toml(ROOT / "pyproject.toml")
     conformance = _toml(ROOT / "conformance/cbor/python/pyproject.toml")
     cargo = _toml(ROOT / "Cargo.toml")
@@ -53,9 +65,20 @@ def source_version() -> str:
         raise ValueError("tensorfs-py must use PyO3 0.29.2 with only abi3-py314")
     if not isinstance(python_version, str) or not isinstance(cargo_version, str):
         raise ValueError("pyproject and Cargo workspace versions must be strings")
-    if python_version != cargo_version:
+    if cargo_version != CURRENT_CARGO_VERSION:
         raise ValueError(
-            f"pyproject version {python_version!r} != Cargo workspace version {cargo_version!r}"
+            f"Cargo workspace version {cargo_version!r} != current development identity "
+            f"{CURRENT_CARGO_VERSION!r}"
+        )
+    if python_version != CURRENT_PYTHON_VERSION:
+        raise ValueError(
+            f"pyproject version {python_version!r} != current development identity "
+            f"{CURRENT_PYTHON_VERSION!r}"
+        )
+    if _python_version_from_cargo(cargo_version) != python_version:
+        raise ValueError(
+            f"Cargo version {cargo_version!r} does not normalize to Python version "
+            f"{python_version!r}"
         )
 
     for manifest in sorted((ROOT / "crates").glob("*/Cargo.toml")):
@@ -72,7 +95,11 @@ def source_version() -> str:
         raise ValueError(
             f"TensorFS remains 0.x until {V1_GATE} cuts the first public v1; got {python_version}"
         )
-    return python_version
+    return cargo_version, python_version
+
+
+def source_version() -> str:
+    return source_versions()[1]
 
 
 def wheel_version(path: pathlib.Path) -> str:
