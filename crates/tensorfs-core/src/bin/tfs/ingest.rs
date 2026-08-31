@@ -80,8 +80,8 @@ fn sources(f: &Flags) -> Result<Vec<(String, PathBuf)>, ExitCode> {
     Ok(out)
 }
 
-/// Unlabelled physical carriers for source-plan. Paths are locations only; no
-/// filename or directory segment participates in classification.
+/// Physical carriers for source-plan. A reviewed canonical member may disambiguate
+/// equal headers; paths are locations only and never participate in classification.
 #[derive(Clone, PartialEq, Eq)]
 struct CarrierInput {
     member: Option<String>,
@@ -788,7 +788,7 @@ fn profile_assignments(
     solutions
 }
 
-/// Classify unlabelled exact carriers against whole-source review facts and emit the
+/// Classify exact carrier headers plus optional reviewed members against whole-source facts and emit the
 /// sole machine input for the existing prepare/run path. A physical path is never a
 /// classification fact. If two assignments survive, no tie-break exists here.
 fn derive_source_plan(f: &Flags) -> Result<Value, ExitCode> {
@@ -1083,7 +1083,10 @@ fn read_closed_source_plan(path: &Path) -> Result<ClosedSourcePlan, ExitCode> {
                     let mut source = Fields::new("SourcePlanSource", row)?;
                     let component = source.req_str("component")?.to_string();
                     let path = PathBuf::from(source.req_str("path")?);
-                    let _source_member = source.opt("source_member");
+                    if let Some(value) = source.opt("source_member") {
+                        let member = as_str("SourcePlanSource", "source_member", value)?;
+                        fingerprint::validate_source_member(member)?;
+                    }
                     match source.req("projected")? {
                         Value::Bool(_) => {}
                         other => {
@@ -1113,8 +1116,8 @@ fn read_closed_source_plan(path: &Path) -> Result<ClosedSourcePlan, ExitCode> {
         return Err(bail(error));
     }
 
-    // Re-derive from unlabelled carrier headers and the current exact registry.
-    // This is what prevents an edited plan from assigning identical headers by hand.
+    // Re-derive from carrier headers, reviewed member labels, and the exact registry.
+    // This is what prevents an edited plan from assigning equal headers by hand.
     let mut derive_flags = vec![(
         "registry".to_string(),
         registry.to_string_lossy().to_string(),
