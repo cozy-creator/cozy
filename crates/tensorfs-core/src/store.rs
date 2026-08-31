@@ -41,8 +41,8 @@ fn io(what: impl AsRef<str>, e: std::io::Error) -> Refusal {
 
 // ---------------------------------------------------- durable verification record
 
-/// `<root>/verified/xx/yy/<hex>` — the durable fact that these exact bytes were hashed
-/// once, on admission. Bound to everything that could change underneath it.
+/// One `tensorfs_verified_blobs` row — the local cache fact that these exact bytes were hashed
+/// once. Bound to everything that could change underneath it; loss merely forces a rehash.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct VRecord {
     pub sha256: String,

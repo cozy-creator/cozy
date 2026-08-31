@@ -655,6 +655,10 @@ pub fn cmd_gc_plan(census: &Path, flags: &Flags) -> ExitCode {
         eprintln!("--holds <holds.jsonl> and --out <plan.jsonl> are required");
         return ExitCode::from(2);
     };
+    let _gc = match WriterGuard::lock_rebuild(census) {
+        Ok(guard) => guard,
+        Err(error) => return bail(error),
+    };
     let census = match Census::open(census) {
         Ok(value) => value,
         Err(error) => return bail(error),
@@ -678,9 +682,10 @@ pub fn cmd_gc_plan(census: &Path, flags: &Flags) -> ExitCode {
 }
 
 pub fn cmd_rebuild(census: &Path, flags: &Flags) -> ExitCode {
-    if let Err(error) = WriterGuard::refuse_rebuild_if_live(census) {
-        return bail(error);
-    }
+    let _rebuild = match WriterGuard::lock_rebuild(census) {
+        Ok(guard) => guard,
+        Err(error) => return bail(error),
+    };
     let census_value = match Census::open(census) {
         Ok(value) => value,
         Err(error) => return bail(error),
