@@ -60,12 +60,13 @@ type Fetch struct {
 
 // Fetched is what a fetch did.
 type Fetched struct {
-	ManifestID string
-	HeaderID   string
-	Release    string
-	Lane       string
-	Objects    int
-	Bytes      int64
+	ManifestID     string
+	ManifestLength int64
+	HeaderID       string
+	Release        string
+	Lane           string
+	Objects        int
+	Bytes          int64
 	// Moved is blob payload that came off the object plane; Held is verified blob
 	// payload skipped. The small manifest control document is reported by its own
 	// progress phase and is not mixed into blob accounting.
@@ -134,6 +135,7 @@ func (f *Fetch) Run(ctx context.Context, row hub.ModelManifest) (Fetched, *exit.
 	if e != nil {
 		return out, e
 	}
+	out.ManifestLength = int64(len(doc))
 	path := filepath.Join(f.Scratch, "manifest.bin")
 	if err := os.WriteFile(path, doc, 0o644); err != nil {
 		return out, exit.Internalf("cannot stage the manifest: %s", err)

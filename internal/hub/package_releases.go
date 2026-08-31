@@ -69,6 +69,7 @@ type PackageInstallDownload struct {
 
 type PackageDownloadPlan struct {
 	Downloads         []PackageInstallDownload `json:"downloads"`
+	PackageConfig     ExactDocument            `json:"package_config"`
 	PackageDescriptor ExactDocument            `json:"package_descriptor"`
 	Release           string                   `json:"release"`
 	ReleaseDigest     string                   `json:"release_digest"`

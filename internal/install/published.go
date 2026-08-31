@@ -44,6 +44,7 @@ func preparePublished(l home.Layout, genDir, runtimeBin string, published *Publi
 	}
 
 	args := []string{"--json", "prepare-package",
+		"--artifact-store", l.CAS,
 		"--package", published.Package,
 		"--release", published.Release,
 		"--release-digest", published.SourceDigest,
@@ -54,6 +55,13 @@ func preparePublished(l home.Layout, genDir, runtimeBin string, published *Publi
 	}
 	for _, wheel := range published.Wheels {
 		args = append(args, "--dependency-wheel", wheel.Path)
+	}
+	for _, model := range published.Models {
+		raw, err := json.Marshal(model)
+		if err != nil {
+			return nil, empty, "", nil, exit.Internalf("cannot encode selected package model: %s", err)
+		}
+		args = append(args, "--model", string(raw))
 	}
 	cmd := exec.Command(runtimeBin, args...)
 	cmd.Env = config.Frozen().Tool("COZY_HOME=" + l.Root)
