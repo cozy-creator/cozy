@@ -49,6 +49,18 @@ func terminateTestDaemon(t *testing.T, root string) {
 }
 
 func TestMain(m *testing.M) {
+	if len(os.Args) == 2 && strings.HasPrefix(os.Args[1], "--cozy-test-daemon-parent=") {
+		daemonPath := strings.TrimPrefix(os.Args[1], "--cozy-test-daemon-parent=")
+		cmd := exec.Command(daemonPath)
+		cmd.Args[0] = "cozy-daemon"
+		cmd.Stdout = io.Discard
+		cmd.Stderr = os.Stderr
+		if err := cmd.Start(); err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			os.Exit(1)
+		}
+		os.Exit(0)
+	}
 	dir, err := os.MkdirTemp("", "cozy-product-test-bin")
 	if err != nil {
 		panic(err)
