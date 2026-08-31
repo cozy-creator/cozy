@@ -52,33 +52,33 @@ func TestLocalDownloadRequiresRealReleaseCoordinates(t *testing.T) {
 	}
 }
 
-func TestLocalDownloadPreservesExactReleaseEvidence(t *testing.T) {
+func TestLocalDownloadPreservesExactCheckpointEvidence(t *testing.T) {
 	evidence := releaseEvidence()
 	encoded := base64.StdEncoding.EncodeToString(evidence)
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		_, _ = io.WriteString(w, `{"model":"acme/model","release":"1.0.0","lane":"bf16","manifest_id":"sha256:`+
-			manifestA+`","header_digest":"sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","objects":1,"bytes":7,"release_evidence_base64":"`+encoded+`"}`)
+			manifestA+`","header_digest":"sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","objects":1,"bytes":7,"checkpoint_evidence_base64":"`+encoded+`"}`)
 	}))
 	defer server.Close()
 
 	fetch := transfer.Fetch{Hub: hub.New(config.Config{HubURL: server.URL}, "test"), Spec: "acme/model@1.0.0"}
 	resolved, problem := fetch.Resolve(context.Background())
-	if problem != nil || !reflect.DeepEqual(resolved.ReleaseEvidence, evidence) {
-		t.Fatalf("resolved release evidence = %q, %v", resolved.ReleaseEvidence, problem)
+	if problem != nil || !reflect.DeepEqual(resolved.CheckpointEvidence, evidence) {
+		t.Fatalf("resolved checkpoint evidence = %q, %v", resolved.CheckpointEvidence, problem)
 	}
 }
 
-func TestLocalDownloadRejectsInvalidReleaseEvidence(t *testing.T) {
+func TestLocalDownloadRejectsInvalidCheckpointEvidence(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		_, _ = io.WriteString(w, `{"model":"acme/model","release":"1.0.0","lane":"bf16","manifest_id":"sha256:`+
-			manifestA+`","header_digest":"sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","objects":1,"bytes":7,"release_evidence_base64":"not-base64"}`)
+			manifestA+`","header_digest":"sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","objects":1,"bytes":7,"checkpoint_evidence_base64":"not-base64"}`)
 	}))
 	defer server.Close()
 
 	fetch := transfer.Fetch{Hub: hub.New(config.Config{HubURL: server.URL}, "test"), Spec: "acme/model@1.0.0"}
 	_, problem := fetch.Resolve(context.Background())
-	if problem == nil || problem.Name != "hub.release_evidence_invalid" {
-		t.Fatalf("invalid release evidence = %v", problem)
+	if problem == nil || problem.Name != "hub.checkpoint_evidence_invalid" {
+		t.Fatalf("invalid checkpoint evidence = %v", problem)
 	}
 }
 
@@ -102,39 +102,43 @@ func tfsRows(t *testing.T, rows string) *tfs.Tool {
 	return &tfs.Tool{Bin: script, Root: dir}
 }
 
-func TestLocalPublishRequiresOneExactReleaseEvidence(t *testing.T) {
+func TestLocalPublishRequiresOneExactCheckpointEvidence(t *testing.T) {
 	exact := string(releaseEvidence())
 	tool := tfsRows(t, releaseRow(exact, "a")+"\n"+releaseRow(exact, "b")+"\n")
-	evidence, problem := tool.ReleaseEvidence("acme", "model", "sha256:"+manifestA,
+	evidence, problem := tool.CheckpointEvidence("acme", "model", "sha256:"+manifestA,
 		filepath.Join(t.TempDir(), "selected.jsonl"))
 	if problem != nil || string(evidence) != exact {
 		t.Fatalf("exact repeated evidence = %q, %v", evidence, problem)
 	}
 
 	absent := tfsRows(t, "")
-	if _, problem := absent.ReleaseEvidence("acme", "model", "sha256:"+manifestA,
-		filepath.Join(t.TempDir(), "absent.jsonl")); problem == nil || problem.Name != "model.release_evidence_absent" {
+	if _, problem := absent.CheckpointEvidence("acme", "model", "sha256:"+manifestA,
+		filepath.Join(t.TempDir(), "absent.jsonl")); problem == nil || problem.Name != "model.checkpoint_evidence_absent" {
 		t.Fatalf("unrooted manifest evidence = %v", problem)
 	}
 
 	other := `{"classification_digest":"sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"}`
 	ambiguous := tfsRows(t, releaseRow(exact, "a")+"\n"+releaseRow(other, "b")+"\n")
-	if _, problem := ambiguous.ReleaseEvidence("acme", "model", "sha256:"+manifestA,
-		filepath.Join(t.TempDir(), "ambiguous.jsonl")); problem == nil || problem.Name != "model.release_evidence_ambiguous" {
+	if _, problem := ambiguous.CheckpointEvidence("acme", "model", "sha256:"+manifestA,
+		filepath.Join(t.TempDir(), "ambiguous.jsonl")); problem == nil || problem.Name != "model.checkpoint_evidence_ambiguous" {
 		t.Fatalf("ambiguous manifest evidence = %v", problem)
 	}
 }
 
-func TestLocalReleaseCommitCarriesExactEvidence(t *testing.T) {
+func TestLocalReleaseCommitRetainsCheckpointEvidenceBeforeRelease(t *testing.T) {
 	dir := t.TempDir()
-	empty, captured := filepath.Join(dir, "empty"), filepath.Join(dir, "mutation.json")
+	empty := filepath.Join(dir, "empty")
+	checkpointMutation := filepath.Join(dir, "checkpoint-mutation.json")
+	releaseMutation := filepath.Join(dir, "release-mutation.json")
 	if err := os.WriteFile(empty, nil, 0o600); err != nil {
 		t.Fatal(err)
 	}
 	script := filepath.Join(dir, "tfs")
 	body := "#!/bin/sh\n" +
 		"if [ \"$2\" = list ]; then /usr/bin/cp '" + empty + "' \"$5\"; exit; fi\n" +
-		"if [ \"$2\" = commit ]; then /usr/bin/cp \"$5\" '" + captured + "'; exit; fi\n" +
+		"if [ \"$2\" = get ]; then printf '{}' > \"$7\"; exit; fi\n" +
+		"if [ \"$2\" = commit ] && [ ! -f '" + checkpointMutation + "' ]; then /usr/bin/cp \"$5\" '" + checkpointMutation + "'; exit; fi\n" +
+		"if [ \"$2\" = commit ]; then /usr/bin/cp \"$5\" '" + releaseMutation + "'; exit; fi\n" +
 		"exit 1\n"
 	if err := os.WriteFile(script, []byte(body), 0o700); err != nil {
 		t.Fatal(err)
@@ -146,29 +150,37 @@ func TestLocalReleaseCommitCarriesExactEvidence(t *testing.T) {
 		t.Fatal(problem)
 	}
 	var mutation map[string]any
-	if raw, err := os.ReadFile(captured); err != nil {
+	if raw, err := os.ReadFile(checkpointMutation); err != nil {
 		t.Fatal(err)
 	} else if err := json.Unmarshal(raw, &mutation); err != nil {
 		t.Fatal(err)
 	}
 	if mutation["evidence_base64"] != base64.StdEncoding.EncodeToString(evidence) {
-		t.Fatalf("commit mutation evidence = %#v", mutation["evidence_base64"])
+		t.Fatalf("checkpoint mutation evidence = %#v", mutation["evidence_base64"])
+	}
+	var release map[string]any
+	if raw, err := os.ReadFile(releaseMutation); err != nil {
+		t.Fatal(err)
+	} else if err := json.Unmarshal(raw, &release); err != nil {
+		t.Fatal(err)
+	}
+	if release["action"] != "put_release" || release["evidence_base64"] != nil {
+		t.Fatalf("release mutation = %#v", release)
 	}
 	if problem := tool.CommitRelease("acme", "model", "1.0.0", "bf16",
 		"sha256:"+manifestA, 2, nil, t.TempDir()); problem == nil {
-		t.Fatal("commit accepted missing release evidence")
+		t.Fatal("commit accepted missing checkpoint evidence")
 	}
 }
 
-func TestManifestReadRoutes(t *testing.T) {
-	manifestID := "sha256:" + manifestA
+func TestReleaseLaneReadRoutes(t *testing.T) {
 	manifest := []byte(`{"entries":[]}`)
 	var calls int
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		calls++
-		wantPath := "/v1/models/acme/model/manifests/" + manifestID
+		wantPath := "/v1/models/acme/model/releases/1.0.0/lanes/bf16"
 		if calls == 1 {
-			if r.Method != http.MethodGet || r.URL.Path != wantPath {
+			if r.Method != http.MethodGet || r.URL.Path != wantPath+"/manifest" {
 				t.Fatalf("manifest request = %s %s", r.Method, r.URL.Path)
 			}
 			w.Header().Set("Content-Type", "application/json")
@@ -189,18 +201,53 @@ func TestManifestReadRoutes(t *testing.T) {
 
 	client := hub.New(config.Config{HubURL: server.URL}, "test")
 	ref := hub.Ref{Org: "acme", Name: "model"}
-	raw, problem := client.Manifest(context.Background(), ref, manifestID)
+	raw, problem := client.ReleaseManifest(context.Background(), ref, "1.0.0", "bf16")
 	if problem != nil || !reflect.DeepEqual(raw, manifest) {
 		t.Fatalf("Manifest = %q, %v", raw, problem)
 	}
-	reads, problem := client.Reads(context.Background(), ref, manifestID,
+	reads, problem := client.ReleaseReads(context.Background(), ref, "1.0.0", "bf16",
 		[]string{"sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"})
 	if problem != nil || len(reads) != 1 || reads[0].Length != 7 {
 		t.Fatalf("Reads = %#v, %v", reads, problem)
 	}
 }
 
-func TestPublicationUsesCurrentPrepareAndCutContract(t *testing.T) {
+func TestOwnerCheckpointReadRoutesAuthenticate(t *testing.T) {
+	checkpointID := "sha256:" + manifestA
+	manifest := []byte(`{"entries":[]}`)
+	var calls int
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls++
+		if r.Header.Get("Authorization") != "Bearer token" {
+			t.Fatalf("checkpoint authorization = %q", r.Header.Get("Authorization"))
+		}
+		path := "/v1/models/acme/model/checkpoints/" + checkpointID
+		if calls == 1 {
+			if r.Method != http.MethodGet || r.URL.Path != path {
+				t.Fatalf("checkpoint request = %s %s", r.Method, r.URL.Path)
+			}
+			_, _ = w.Write(manifest)
+			return
+		}
+		if r.Method != http.MethodPost || r.URL.Path != path+"/reads" {
+			t.Fatalf("checkpoint reads = %s %s", r.Method, r.URL.Path)
+		}
+		_, _ = io.WriteString(w, `{"reads":[]}`)
+	}))
+	defer server.Close()
+	client := hub.New(config.Config{HubURL: server.URL, HubToken: secret.New("token")}, "test")
+	ref := hub.Ref{Org: "acme", Name: "model"}
+	raw, problem := client.CheckpointManifest(context.Background(), ref, checkpointID)
+	if problem != nil || !bytes.Equal(raw, manifest) {
+		t.Fatalf("CheckpointManifest = %q, %v", raw, problem)
+	}
+	reads, problem := client.CheckpointReads(context.Background(), ref, checkpointID, nil)
+	if problem != nil || len(reads) != 0 {
+		t.Fatalf("CheckpointReads = %#v, %v", reads, problem)
+	}
+}
+
+func TestPublicationFinalizesCheckpointAndCutsLaneMap(t *testing.T) {
 	evidenceBase64 := base64.StdEncoding.EncodeToString(releaseEvidence())
 	var calls int
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -214,12 +261,10 @@ func TestPublicationUsesCurrentPrepareAndCutContract(t *testing.T) {
 				t.Fatalf("open request = %s %s", r.Method, r.URL.Path)
 			}
 			var body map[string]any
-			if err := json.NewDecoder(r.Body).Decode(&body); err != nil || len(body) != 3 ||
-				body["release"] != "1.0.0" || body["lane"] != nil || body["lane_key"] != namedLane ||
-				body["required_contract"] != nil {
+			if err := json.NewDecoder(r.Body).Decode(&body); err != nil || len(body) != 1 || body["objects"] == nil {
 				t.Fatalf("open body = %#v, %v", body, err)
 			}
-			_, _ = io.WriteString(w, `{"created":true,"publication":{"operation":"manifest-proof","release":"1.0.0","lane":"","lane_key":"`+namedLane+`","state":"open","objects":[{"object_id":"sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","length":7,"state":"claimed"}]}}`)
+			_, _ = io.WriteString(w, `{"created":true,"publication":{"operation":"manifest-proof","state":"open","objects":[{"object_id":"sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","length":7,"state":"claimed"}]}}`)
 		case 2:
 			if r.Method != http.MethodPost || r.URL.Path != "/v1/models/acme/model/publications/manifest-proof/grants" {
 				t.Fatalf("grant request = %s %s", r.Method, r.URL.Path)
@@ -232,23 +277,23 @@ func TestPublicationUsesCurrentPrepareAndCutContract(t *testing.T) {
 			var body map[string]any
 			if err := json.NewDecoder(r.Body).Decode(&body); err != nil || len(body) != 3 ||
 				body["manifest_id"] != "sha256:"+manifestA || body["manifest_length"] != float64(2) ||
-				body["release_evidence_base64"] != evidenceBase64 {
+				body["checkpoint_evidence_base64"] != evidenceBase64 {
 				t.Fatalf("finalize body = %#v, %v", body, err)
 			}
-			_, _ = io.WriteString(w, `{"publish_id":"manifest-proof","release":"1.0.0","lane":"`+namedLane+`","manifest":{"sha256":"`+manifestA+`","length":2},"contract":{"stamps":{},"structure":"sha256:`+topologyC+`","encoding":{"set":["bf16"]}},"topology_digest":"sha256:`+topologyC+`","objects":1,"bytes":7,"release_evidence_base64":"`+evidenceBase64+`","state":"verified/prepared","duplicate":false}`)
+			_, _ = io.WriteString(w, `{"publish_id":"manifest-proof","checkpoint_id":"sha256:`+manifestA+`","manifest":{"sha256":"`+manifestA+`","length":2},"contract":{"stamps":{},"structure":"sha256:`+topologyC+`","encoding":{"set":["bf16"]}},"topology_digest":"sha256:`+topologyC+`","objects":1,"bytes":7,"checkpoint_evidence_base64":"`+evidenceBase64+`","state":"checkpointed","duplicate":false}`)
 		case 4:
 			if r.Method != http.MethodPost || r.URL.Path != "/v1/models/acme/model/releases/1.0.0" {
 				t.Fatalf("cut request = %s %s", r.Method, r.URL.Path)
 			}
 			var body struct {
-				Operation    string   `json:"operation"`
-				Publications []string `json:"publications"`
+				Operation string            `json:"operation"`
+				Lanes     map[string]string `json:"lanes"`
 			}
 			if err := json.NewDecoder(r.Body).Decode(&body); err != nil || body.Operation != "cut-manifest-proof" ||
-				!reflect.DeepEqual(body.Publications, []string{"manifest-proof"}) {
+				!reflect.DeepEqual(body.Lanes, map[string]string{namedLane: "sha256:" + manifestA}) {
 				t.Fatalf("cut body = %#v, %v", body, err)
 			}
-			_, _ = io.WriteString(w, `{"operation":"cut-manifest-proof","release":"1.0.0","repository_sha256":"`+manifestA+`","lanes":[{"lane":"`+namedLane+`","manifest":{"sha256":"`+manifestA+`","length":2},"contract":{"stamps":{},"structure":"sha256:`+topologyC+`","encoding":{"set":["bf16"]}},"objects":1,"bytes":7,"publication":"manifest-proof"}],"duplicate":false}`)
+			_, _ = io.WriteString(w, `{"operation":"cut-manifest-proof","release":"1.0.0","repository_sha256":"`+manifestA+`","lanes":[{"lane":"`+namedLane+`","manifest":{"sha256":"`+manifestA+`","length":2},"contract":{"stamps":{},"structure":"sha256:`+topologyC+`","encoding":{"set":["bf16"]}},"objects":1,"bytes":7,"checkpoint_id":"sha256:`+manifestA+`"}],"duplicate":false}`)
 		default:
 			t.Fatalf("unexpected request %s %s", r.Method, r.URL.Path)
 		}
@@ -258,9 +303,8 @@ func TestPublicationUsesCurrentPrepareAndCutContract(t *testing.T) {
 	client := hub.New(config.Config{HubURL: server.URL, HubToken: secret.New("token")}, "test")
 	ref := hub.Ref{Org: "acme", Name: "model"}
 	opened, problem := client.OpenPublication(context.Background(), ref, "manifest-proof",
-		"1.0.0", namedLane, []hub.Object{{ID: "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", Length: 7}}, "proof")
-	if problem != nil || !opened.Created || opened.Publication.Operation != "manifest-proof" ||
-		opened.Publication.Lane != "" || opened.Publication.LaneKey != namedLane {
+		[]hub.Object{{ID: "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", Length: 7}}, "proof")
+	if problem != nil || !opened.Created || opened.Publication.Operation != "manifest-proof" {
 		t.Fatalf("OpenPublication = %#v, %v", opened, problem)
 	}
 	granted, problem := client.GrantKnownTransfers(context.Background(), ref, "manifest-proof",
@@ -268,30 +312,30 @@ func TestPublicationUsesCurrentPrepareAndCutContract(t *testing.T) {
 	if problem != nil || len(granted.Grants) != 0 || len(granted.Held) != 1 || granted.Held[0].VerifiedBytes != 7 {
 		t.Fatalf("GrantKnownTransfers = %#v, %v", granted, problem)
 	}
-	prepared, problem := client.FinalizePublication(context.Background(), ref, "manifest-proof",
+	checkpoint, problem := client.FinalizePublication(context.Background(), ref, "manifest-proof",
 		hub.FinalizePublicationRequest{ManifestID: "sha256:" + manifestA, ManifestLength: 2,
-			ReleaseEvidenceBase64: evidenceBase64}, "proof")
-	if problem != nil || prepared.Manifest.Length != 2 || prepared.Release != "1.0.0" ||
-		prepared.Lane != namedLane || prepared.ReleaseEvidenceBase64 != evidenceBase64 {
-		t.Fatalf("FinalizePublication = %#v, %v", prepared, problem)
+			CheckpointEvidenceBase64: evidenceBase64}, "proof")
+	if problem != nil || checkpoint.Manifest.Length != 2 || checkpoint.CheckpointID != "sha256:"+manifestA ||
+		checkpoint.CheckpointEvidenceBase64 != evidenceBase64 {
+		t.Fatalf("FinalizePublication = %#v, %v", checkpoint, problem)
 	}
 	cut, problem := client.CutRelease(context.Background(), ref, "1.0.0", "cut-manifest-proof",
-		[]string{"manifest-proof"}, "proof")
+		map[string]string{namedLane: checkpoint.CheckpointID}, "proof")
 	if problem != nil || cut.Operation != "cut-manifest-proof" || len(cut.Lanes) != 1 ||
-		cut.Lanes[0].Publication != "manifest-proof" || cut.Lanes[0].Lane != namedLane {
+		cut.Lanes[0].Checkpoint != checkpoint.CheckpointID || cut.Lanes[0].Lane != namedLane {
 		t.Fatalf("CutRelease = %#v, %v", cut, problem)
 	}
 }
 
 func TestPublicationResponsesRejectUnknownFields(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		_, _ = io.WriteString(w, `{"created":true,"publication":{"operation":"strict-proof","release":"1.0.0","lane":"","lane_key":"bf16","state":"open","objects":[]},"unrecognized":true}`)
+		_, _ = io.WriteString(w, `{"created":true,"publication":{"operation":"strict-proof","state":"open","objects":[]},"unrecognized":true}`)
 	}))
 	defer server.Close()
 
 	client := hub.New(config.Config{HubURL: server.URL, HubToken: secret.New("token")}, "test")
 	_, problem := client.OpenPublication(context.Background(), hub.Ref{Org: "acme", Name: "model"},
-		"strict-proof", "1.0.0", namedLane, []hub.Object{{ID: "sha256:" + manifestA, Length: 1}}, "proof")
+		"strict-proof", []hub.Object{{ID: "sha256:" + manifestA, Length: 1}}, "proof")
 	if problem == nil || problem.Name != "hub.unreadable_answer" {
 		t.Fatalf("unknown publication response field = %v", problem)
 	}
@@ -367,19 +411,15 @@ func TestModelPublicationBatchesFinalizesCutsAndReplays(t *testing.T) {
 		switch {
 		case r.Method == http.MethodPut && r.URL.Path == publicationPath:
 			call := openCalls.Add(1)
-			state, lane, objects := "open", "", transfers
+			state, objects := "open", transfers
 			if call > 1 {
-				state, lane, objects = "prepared", namedLane, append([]hub.Transfer(nil), transfers...)
-				if cutCalls.Load() > 0 {
-					state = "committed"
-				}
+				state, objects = "checkpointed", append([]hub.Transfer(nil), transfers...)
 				for i := range objects {
 					objects[i].State = "accepted"
 				}
 			}
 			_ = json.NewEncoder(w).Encode(hub.OpenPublicationResponse{Created: call == 1,
-				Publication: hub.Session{Operation: "batch-proof", Release: "1.0.0", Lane: lane,
-					LaneKey: namedLane, State: state, Objects: objects}})
+				Publication: hub.Session{Operation: "batch-proof", State: state, Objects: objects}})
 		case r.Method == http.MethodPost && r.URL.Path == publicationPath+"/grants":
 			var body struct {
 				ObjectIDs []string `json:"object_ids"`
@@ -407,12 +447,12 @@ func TestModelPublicationBatchesFinalizesCutsAndReplays(t *testing.T) {
 			w.WriteHeader(http.StatusOK)
 		case r.Method == http.MethodPost && r.URL.Path == publicationPath+"/finalize":
 			call := finalizeCalls.Add(1)
-			_ = json.NewEncoder(w).Encode(hub.PreparedPublication{PublishID: "batch-proof",
-				Release: "1.0.0", Lane: namedLane, Manifest: hub.ManifestRef{SHA256: manifestA, Length: int64(len(manifest))},
+			_ = json.NewEncoder(w).Encode(hub.CheckpointPublication{PublishID: "batch-proof",
+				CheckpointID: manifestID, Manifest: hub.ManifestRef{SHA256: manifestA, Length: int64(len(manifest))},
 				Contract: hub.Contract{Stamps: map[string][]string{}, Structure: "sha256:" + topologyC,
 					Encoding: hub.Encoding{Set: []string{"bf16"}}},
 				TopologyDigest: "sha256:" + topologyC, Objects: objectCount, Bytes: objectCount,
-				ReleaseEvidenceBase64: evidenceBase64, State: "verified/prepared", Duplicate: call > 1})
+				CheckpointEvidenceBase64: evidenceBase64, State: "checkpointed", Duplicate: call > 1})
 		case r.Method == http.MethodPost && r.URL.Path == "/v1/models/acme/model/releases/1.0.0":
 			call := cutCalls.Add(1)
 			_ = json.NewEncoder(w).Encode(hub.CutReleaseResponse{Operation: "cut-batch-proof", Release: "1.0.0",
@@ -420,7 +460,7 @@ func TestModelPublicationBatchesFinalizesCutsAndReplays(t *testing.T) {
 					Manifest: hub.ManifestRef{SHA256: manifestA, Length: int64(len(manifest))},
 					Contract: hub.Contract{Stamps: map[string][]string{}, Structure: "sha256:" + topologyC,
 						Encoding: hub.Encoding{Set: []string{"bf16"}}},
-					Objects: objectCount, Bytes: objectCount, Publication: "batch-proof"}}, Duplicate: call > 1})
+					Objects: objectCount, Bytes: objectCount, Checkpoint: manifestID}}, Duplicate: call > 1})
 		default:
 			t.Errorf("unexpected request %s %s", r.Method, r.URL.Path)
 			http.Error(w, "unexpected", http.StatusNotFound)

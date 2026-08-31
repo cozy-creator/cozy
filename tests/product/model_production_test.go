@@ -685,7 +685,7 @@ func TestModelProductionAmbiguousCutReplaysExactlyAfterDaemonRestart(t *testing.
 			_ = json.NewEncoder(w).Encode(map[string]any{
 				"operation": "modelpub-proof", "release": "ambiguous",
 				"repository_sha256": "sha256:" + strings.Repeat("f", 64), "duplicate": true,
-				"lanes": []map[string]any{{"lane": "bf16", "publication": "publish-proof"}},
+				"lanes": []map[string]any{{"lane": "bf16", "checkpoint_id": "sha256:" + strings.Repeat("d", 64)}},
 			})
 		case r.Method == http.MethodGet && r.URL.Path == "/v1/rentals/rental-cut-proof":
 			http.NotFound(w, r)
@@ -734,7 +734,7 @@ func TestModelProductionAmbiguousCutReplaysExactlyAfterDaemonRestart(t *testing.
 		InvocationDigest: "sha256:" + strings.Repeat("b", 64), TransactionID: "transaction-proof",
 		WriterGeneration: 1, ReceiptDigest: "sha256:" + strings.Repeat("c", 64),
 		Receipt: []byte(`{"format":"proof/1"}`), ManifestID: "sha256:" + strings.Repeat("d", 64),
-		ManifestLength: 128, ReleaseEvidence: []byte(`{"format":"evidence/1"}`)}
+		ManifestLength: 128, CheckpointEvidence: []byte(`{"format":"evidence/1"}`)}
 	fatal(t, store.RecordModelProductionArtifact(artifact, nil))
 	fatal(t, store.MarkModelProductionArtifactPublished(instruction.ID(), "derive", "model", "publish-proof"))
 	store.Close()
@@ -801,7 +801,7 @@ func TestModelProductionJoinsStepArtifactAndTransferBeforeReplay(t *testing.T) {
 		InvocationDigest: "sha256:" + strings.Repeat("c", 64), TransactionID: "txn-1",
 		WriterGeneration: 1, ReceiptDigest: "sha256:" + strings.Repeat("d", 64),
 		Receipt: receipt, ManifestID: "sha256:" + strings.Repeat("e", 64),
-		ManifestLength: 128, ReleaseEvidence: evidence}
+		ManifestLength: 128, CheckpointEvidence: evidence}
 	object := records.ModelProductionObject{OperationID: plan.ID(), StepName: "derive",
 		OutputSlot: "model", ObjectID: "sha256:" + strings.Repeat("f", 64),
 		Length: 256, SourceRef: "opaque-source"}

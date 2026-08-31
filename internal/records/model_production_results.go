@@ -17,12 +17,12 @@ type ModelProductionSourceFile struct {
 }
 
 type PreparedModelSource struct {
-	OperationID     string `json:"operation_id"`
-	Slot            string `json:"slot"`
-	Profile         string `json:"profile"`
-	ManifestID      string `json:"manifest_id"`
-	ManifestLength  int64  `json:"manifest_length"`
-	ReleaseEvidence []byte `json:"release_evidence"`
+	OperationID        string `json:"operation_id"`
+	Slot               string `json:"slot"`
+	Profile            string `json:"profile"`
+	ManifestID         string `json:"manifest_id"`
+	ManifestLength     int64  `json:"manifest_length"`
+	CheckpointEvidence []byte `json:"checkpoint_evidence"`
 }
 
 type ModelProductionStep struct {
@@ -34,7 +34,7 @@ type ModelProductionArtifact struct {
 	OperationID, StepName, OutputSlot, RequestID, InvocationDigest string
 	TransactionID, ReceiptDigest, ManifestID, PublicationID, State string
 	Attempt, WriterGeneration, ManifestLength                      int64
-	Receipt, ReleaseEvidence                                       []byte
+	Receipt, CheckpointEvidence                                    []byte
 }
 
 type ModelProductionObject struct {
@@ -154,15 +154,15 @@ func (s *Store) RecordPreparedModelSources(operationID string,
 		var profile, manifest string
 		var length int64
 		var evidence []byte
-		err := tx.QueryRow(`SELECT profile,manifest_id,manifest_length,release_evidence
+		err := tx.QueryRow(`SELECT profile,manifest_id,manifest_length,checkpoint_evidence
 			FROM model_production_sources WHERE operation_id=? AND slot=?`, operationID,
 			source.Slot).Scan(&profile, &manifest, &length, &evidence)
 		switch {
 		case errors.Is(err, sql.ErrNoRows):
 			if _, err := tx.Exec(`INSERT INTO model_production_sources
-				(operation_id,slot,profile,manifest_id,manifest_length,release_evidence)
+				(operation_id,slot,profile,manifest_id,manifest_length,checkpoint_evidence)
 				VALUES(?,?,?,?,?,?)`, operationID, source.Slot, source.Profile,
-				source.ManifestID, source.ManifestLength, source.ReleaseEvidence); err != nil {
+				source.ManifestID, source.ManifestLength, source.CheckpointEvidence); err != nil {
 				return exit.Internalf("cannot journal prepared model source %s: %s", source.Slot, err)
 			}
 		case err != nil:
@@ -172,13 +172,13 @@ func (s *Store) RecordPreparedModelSources(operationID string,
 				"prepared model source %s changed its requested profile", source.Slot)
 		case manifest == "":
 			if _, err := tx.Exec(`UPDATE model_production_sources SET manifest_id=?,
-				manifest_length=?,release_evidence=? WHERE operation_id=? AND slot=? AND manifest_id=''`,
-				source.ManifestID, source.ManifestLength, source.ReleaseEvidence, operationID,
+				manifest_length=?,checkpoint_evidence=? WHERE operation_id=? AND slot=? AND manifest_id=''`,
+				source.ManifestID, source.ManifestLength, source.CheckpointEvidence, operationID,
 				source.Slot); err != nil {
 				return exit.Internalf("cannot complete prepared model source %s: %s", source.Slot, err)
 			}
 		case manifest != source.ManifestID || length != source.ManifestLength ||
-			!bytes.Equal(evidence, source.ReleaseEvidence):
+			!bytes.Equal(evidence, source.CheckpointEvidence):
 			return exit.Named(exit.Conflict, "model_production.prepared_source_conflict",
 				"prepared model source %s replay changed its profile, Manifest, or evidence", source.Slot)
 		}
@@ -191,7 +191,7 @@ func (s *Store) RecordPreparedModelSources(operationID string,
 
 func (s *Store) PreparedModelSources(operationID string) ([]PreparedModelSource, *exit.Error) {
 	rows, err := s.db.Query(`SELECT operation_id,slot,profile,manifest_id,manifest_length,
-		release_evidence FROM model_production_sources WHERE operation_id=? ORDER BY slot`, operationID)
+		checkpoint_evidence FROM model_production_sources WHERE operation_id=? ORDER BY slot`, operationID)
 	if err != nil {
 		return nil, exit.Internalf("cannot read prepared model sources: %s", err)
 	}
@@ -200,7 +200,7 @@ func (s *Store) PreparedModelSources(operationID string) ([]PreparedModelSource,
 	for rows.Next() {
 		var row PreparedModelSource
 		if err := rows.Scan(&row.OperationID, &row.Slot, &row.Profile, &row.ManifestID,
-			&row.ManifestLength, &row.ReleaseEvidence); err != nil {
+			&row.ManifestLength, &row.CheckpointEvidence); err != nil {
 			return nil, exit.Internalf("cannot scan prepared model source: %s", err)
 		}
 		out = append(out, row)
@@ -273,20 +273,20 @@ func (s *Store) RecordModelProductionArtifact(artifact ModelProductionArtifact,
 	var held ModelProductionArtifact
 	err = tx.QueryRow(`SELECT operation_id,step_name,output_slot,request_id,attempt,
 		invocation_digest,transaction_id,writer_generation,receipt_digest,receipt,
-		manifest_id,manifest_length,release_evidence,publication_id,state
+		manifest_id,manifest_length,checkpoint_evidence,publication_id,state
 		FROM model_production_artifacts WHERE operation_id=? AND step_name=? AND output_slot=?`,
 		artifact.OperationID, artifact.StepName, artifact.OutputSlot).Scan(&held.OperationID,
 		&held.StepName, &held.OutputSlot, &held.RequestID, &held.Attempt,
 		&held.InvocationDigest, &held.TransactionID, &held.WriterGeneration,
 		&held.ReceiptDigest, &held.Receipt, &held.ManifestID, &held.ManifestLength,
-		&held.ReleaseEvidence, &held.PublicationID, &held.State)
+		&held.CheckpointEvidence, &held.PublicationID, &held.State)
 	if err == nil {
 		if held.RequestID != artifact.RequestID || held.Attempt != artifact.Attempt ||
 			held.InvocationDigest != artifact.InvocationDigest || held.TransactionID != artifact.TransactionID ||
 			held.WriterGeneration != artifact.WriterGeneration || held.ReceiptDigest != artifact.ReceiptDigest ||
 			!bytes.Equal(held.Receipt, artifact.Receipt) || held.ManifestID != artifact.ManifestID ||
 			held.ManifestLength != artifact.ManifestLength ||
-			!bytes.Equal(held.ReleaseEvidence, artifact.ReleaseEvidence) {
+			!bytes.Equal(held.CheckpointEvidence, artifact.CheckpointEvidence) {
 			return exit.Named(exit.Conflict, "model_production.artifact_conflict",
 				"artifact receipt replay changed exact output %s.%s", artifact.StepName, artifact.OutputSlot)
 		}
@@ -330,11 +330,11 @@ func (s *Store) RecordModelProductionArtifact(artifact ModelProductionArtifact,
 	if _, err := tx.Exec(`INSERT INTO model_production_artifacts
 		(operation_id,step_name,output_slot,request_id,attempt,invocation_digest,
 		transaction_id,writer_generation,receipt_digest,receipt,manifest_id,manifest_length,
-		release_evidence) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)`, artifact.OperationID,
+		checkpoint_evidence) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)`, artifact.OperationID,
 		artifact.StepName, artifact.OutputSlot, artifact.RequestID, artifact.Attempt,
 		artifact.InvocationDigest, artifact.TransactionID, artifact.WriterGeneration,
 		artifact.ReceiptDigest, artifact.Receipt, artifact.ManifestID, artifact.ManifestLength,
-		artifact.ReleaseEvidence); err != nil {
+		artifact.CheckpointEvidence); err != nil {
 		return exit.Internalf("cannot insert model production artifact: %s", err)
 	}
 	for _, object := range objects {
@@ -354,7 +354,7 @@ func (s *Store) RecordModelProductionArtifact(artifact ModelProductionArtifact,
 func (s *Store) ModelProductionArtifacts(operationID string) ([]ModelProductionArtifact, *exit.Error) {
 	rows, err := s.db.Query(`SELECT operation_id,step_name,output_slot,request_id,attempt,
 		invocation_digest,transaction_id,writer_generation,receipt_digest,receipt,
-		manifest_id,manifest_length,release_evidence,publication_id,state
+		manifest_id,manifest_length,checkpoint_evidence,publication_id,state
 		FROM model_production_artifacts WHERE operation_id=? ORDER BY step_name,output_slot`, operationID)
 	if err != nil {
 		return nil, exit.Internalf("cannot read model production artifacts: %s", err)
@@ -366,7 +366,7 @@ func (s *Store) ModelProductionArtifacts(operationID string) ([]ModelProductionA
 		if err := rows.Scan(&row.OperationID, &row.StepName, &row.OutputSlot, &row.RequestID,
 			&row.Attempt, &row.InvocationDigest, &row.TransactionID, &row.WriterGeneration,
 			&row.ReceiptDigest, &row.Receipt, &row.ManifestID, &row.ManifestLength,
-			&row.ReleaseEvidence, &row.PublicationID, &row.State); err != nil {
+			&row.CheckpointEvidence, &row.PublicationID, &row.State); err != nil {
 			return nil, exit.Internalf("cannot scan model production artifact: %s", err)
 		}
 		out = append(out, row)
