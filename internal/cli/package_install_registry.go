@@ -1,13 +1,20 @@
 package cli
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
+	"fmt"
+	"io"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/cozy-creator/cozy/internal/canonical"
+	"github.com/cozy-creator/cozy/internal/config"
 	"github.com/cozy-creator/cozy/internal/exit"
 	"github.com/cozy-creator/cozy/internal/home"
 	"github.com/cozy-creator/cozy/internal/hub"
@@ -31,6 +38,15 @@ func handleRegistryInstall(ctx *Context) *exit.Error {
 	}
 	if plan.Release == "" || release != "" && plan.Release != release {
 		return exit.Internalf("Tensorhub returned a changed or absent package release")
+	}
+	packageConfig, problem := exactPackageInstallDocument("package.toml", plan.PackageConfig)
+	if problem != nil {
+		return problem
+	}
+	packageDescriptor, problem := exactPackageInstallDocument(
+		"package descriptor", plan.PackageDescriptor)
+	if problem != nil {
+		return problem
 	}
 	release = plan.Release
 	if _, err := canonical.Raw(plan.ReleaseDigest); err != nil {
@@ -70,8 +86,12 @@ func handleRegistryInstall(ctx *Context) *exit.Error {
 		return exit.Internalf("cannot create package download scratch: %s", err)
 	}
 	defer os.RemoveAll(scratch)
-	published, problem := downloadPackageInstallPlan(hctx, ctx, scratch, ref, release, releaseDigest, plan)
+	published, problem := downloadPackageInstallPlan(hctx, ctx, scratch, ref, release, releaseDigest,
+		plan, packageConfig, packageDescriptor)
 	if problem != nil {
+		return problem
+	}
+	if problem := downloadPublishedPackageModels(hctx, ctx, scratch, runtimeBin, published); problem != nil {
 		return problem
 	}
 
@@ -111,17 +131,16 @@ func registryPackageRef(value, release string) (hub.Ref, string, *exit.Error) {
 }
 
 func downloadPackageInstallPlan(ctx context.Context, cli *Context, scratch string, ref hub.Ref,
-	release, releaseDigest string, plan hub.PackageDownloadPlan,
+	release, releaseDigest string, plan hub.PackageDownloadPlan, packageConfig,
+	packageDescriptor install.ExactDocument,
 ) (*install.PublishedSource, *exit.Error) {
 	if len(plan.Downloads) == 0 || len(plan.Downloads) > hub.MaxPackageInstallDownloads {
 		return nil, exit.Internalf("Tensorhub returned an invalid package install plan")
 	}
 	published := &install.PublishedSource{
 		Package: ref.String(), Release: release, SourceDigest: releaseDigest,
-		Selection: install.Selection{PackageDescriptor: install.ExactDocument{
-			Bytes: plan.PackageDescriptor.CanonicalBytes, Digest: plan.PackageDescriptor.Digest,
-			Length: plan.PackageDescriptor.Length,
-		}},
+		PackageConfig: packageConfig,
+		Selection:     install.Selection{PackageDescriptor: packageDescriptor},
 	}
 	seen := map[string]bool{}
 	type job struct {
@@ -203,4 +222,177 @@ func downloadPackageInstallPlan(ctx context.Context, cli *Context, scratch strin
 		published.Bytes += item.download.Length
 	}
 	return published, nil
+}
+
+func exactPackageInstallDocument(name string, document hub.ExactDocument) (install.ExactDocument, *exit.Error) {
+	digest, err := canonical.Raw(document.Digest)
+	if err != nil || len(digest) != 32 || document.Length != int64(len(document.CanonicalBytes)) ||
+		document.Length == 0 ||
+		!bytes.Equal(canonical.Digest(document.CanonicalBytes), digest) {
+		return install.ExactDocument{}, exit.Named(exit.Structural,
+			"hub.package_install_document_invalid",
+			"Tensorhub returned %s bytes that do not match their digest and length", name)
+	}
+	return install.ExactDocument{Bytes: append([]byte(nil), document.CanonicalBytes...),
+		Digest: document.Digest, Length: document.Length}, nil
+}
+
+type publishedDefaultBinding struct {
+	ModelBindingPath string `json:"model_binding_path"`
+	ModelParameter   string `json:"model_parameter_name"`
+	ModelClass       string `json:"model_class"`
+	Ref              string `json:"ref"`
+	Lane             string `json:"lane"`
+	Source           string `json:"source"`
+}
+
+func downloadPublishedPackageModels(ctx context.Context, cli *Context, root, runtimeBin string,
+	published *install.PublishedSource,
+) *exit.Error {
+	if err := raiseOpenFileLimit(); err != nil {
+		return exit.Named(exit.Structural, "open_file_limit_unavailable",
+			"cannot raise the open-file limit for model leases: %s", err).
+			WithRemedy("allow Cozy to raise RLIMIT_NOFILE to this account's hard limit")
+	}
+	bindings, problem := publishedDefaultBindings(ctx, cli.Cfg, root, runtimeBin,
+		published.PackageConfig, published.Selection.PackageDescriptor)
+	if problem != nil || len(bindings) == 0 {
+		return problem
+	}
+	tool, _, problem := localTensorFS(cli)
+	if problem != nil {
+		return problem
+	}
+	hubClient := client(cli)
+	for index, binding := range bindings {
+		packagePublishStatus(cli, "Downloading model %s...", binding.Ref)
+		fetch := &transfer.Fetch{
+			Tool: tool, Hub: hubClient, Spec: binding.Ref, Lane: binding.Lane,
+			Progress: progress(cli),
+			Scratch:  filepath.Join(root, "models", fmt.Sprintf("%03d", index)),
+		}
+		resolved, problem := fetch.Resolve(ctx)
+		if problem != nil {
+			return problem
+		}
+		fetched, problem := fetch.Run(ctx, resolved)
+		if problem != nil {
+			return problem
+		}
+		manifest, err := canonical.Raw(fetched.ManifestID)
+		if err != nil || len(manifest) != 32 || fetched.ManifestLength <= 0 ||
+			fetched.Release == "" || fetched.Lane == "" || fetch.Ref.String() == "" {
+			return exit.Named(exit.Structural, "model_download_result_invalid",
+				"Tensorhub returned an incomplete exact model selection for package slot %s",
+				binding.ModelBindingPath)
+		}
+		published.Models = append(published.Models, install.PublishedModel{
+			Package: published.Package, Slot: binding.ModelBindingPath, Model: fetch.Ref.String(),
+			Release: fetched.Release, Lane: fetched.Lane, Manifest: fetched.ManifestID,
+			ManifestLength: fetched.ManifestLength,
+		})
+	}
+	return nil
+}
+
+func publishedDefaultBindings(parent context.Context, cfg config.Config, root, runtimeBin string,
+	packageConfig, descriptor install.ExactDocument,
+) ([]publishedDefaultBinding, *exit.Error) {
+	metadataRoot := filepath.Join(root, "selection")
+	if err := os.MkdirAll(metadataRoot, 0o700); err != nil {
+		return nil, exit.Internalf("cannot create package selection scratch: %s", err)
+	}
+	packageConfigPath := filepath.Join(metadataRoot, "package.toml")
+	descriptorPath := filepath.Join(metadataRoot, "descriptor.json")
+	if err := os.WriteFile(packageConfigPath, packageConfig.Bytes, 0o600); err != nil {
+		return nil, exit.Internalf("cannot stage exact package.toml: %s", err)
+	}
+	if err := os.WriteFile(descriptorPath, descriptor.Bytes, 0o600); err != nil {
+		return nil, exit.Internalf("cannot stage exact package descriptor: %s", err)
+	}
+
+	queryCtx, cancel := context.WithTimeout(parent, launch.DefaultRuntimeQueryTimeout)
+	defer cancel()
+	cmd := exec.CommandContext(queryCtx, runtimeBin, "--json", "--dir", metadataRoot,
+		"--descriptor", descriptorPath, "bindings")
+	cmd.WaitDelay = 250 * time.Millisecond
+	cmd.Env = cfg.Tool("COZY_HOME=" + cfg.Home)
+	var stdout, stderr strings.Builder
+	cmd.Stdout, cmd.Stderr = &stdout, &stderr
+	err := cmd.Run()
+	if queryCtx.Err() == context.DeadlineExceeded {
+		return nil, exit.Named(exit.Deadline, "runtime_query_stalled",
+			"`cozy-runtime bindings` did not answer its metadata query within %s",
+			launch.DefaultRuntimeQueryTimeout).
+			WithRemedy("bindings must resolve package.toml against the exact descriptor without importing package code")
+	}
+	if cmd.ProcessState == nil {
+		return nil, exit.Named(exit.Structural, "runtime_missing",
+			"cannot run the trusted cozy-runtime at %s: %s", runtimeBin, err)
+	}
+	if code := cmd.ProcessState.ExitCode(); code != 0 {
+		return nil, publishedBindingsRefusal(code, stdout.String(), stderr.String())
+	}
+	var answer struct {
+		Bindings        []publishedDefaultBinding `json:"bindings"`
+		WeightlessPlans []json.RawMessage         `json:"weightless_plans,omitempty"`
+	}
+	decoder := json.NewDecoder(strings.NewReader(stdout.String()))
+	decoder.DisallowUnknownFields()
+	decodeErr := decoder.Decode(&answer)
+	var trailing any
+	if decodeErr == nil {
+		decodeErr = decoder.Decode(&trailing)
+	}
+	if decodeErr != io.EOF {
+		return nil, exit.Named(exit.Structural, "runtime_bindings_invalid",
+			"cozy-runtime returned an invalid package binding document")
+	}
+	seen := make(map[string]bool, len(answer.Bindings))
+	for _, binding := range answer.Bindings {
+		if binding.ModelBindingPath == "" || binding.ModelParameter == "" ||
+			binding.ModelClass == "" || binding.Ref == "" || binding.Lane == "" ||
+			!strings.HasPrefix(binding.Source, "package.toml:") ||
+			seen[binding.ModelBindingPath] ||
+			strings.TrimSpace(binding.Ref) != binding.Ref || strings.TrimSpace(binding.Lane) != binding.Lane {
+			return nil, exit.Named(exit.Structural, "runtime_bindings_invalid",
+				"cozy-runtime returned an incomplete or duplicate package model binding")
+		}
+		seen[binding.ModelBindingPath] = true
+	}
+	return answer.Bindings, nil
+}
+
+func publishedBindingsRefusal(code int, stdout, stderr string) *exit.Error {
+	said := strings.TrimSpace(stderr)
+	if said == "" {
+		said = strings.TrimSpace(stdout)
+	}
+	var document struct {
+		Error struct {
+			Name    string `json:"name"`
+			Message string `json:"message"`
+			Remedy  string `json:"remedy"`
+		} `json:"error"`
+	}
+	name, remedy := "runtime_bindings_refused", ""
+	if json.Unmarshal([]byte(stderr), &document) == nil && document.Error.Message != "" {
+		said, remedy = document.Error.Message, document.Error.Remedy
+		if document.Error.Name != "" {
+			name = document.Error.Name
+		}
+	}
+	exitCode := exit.Code(code)
+	if !exitCode.Valid() {
+		exitCode = exit.Internal
+	}
+	if said == "" {
+		said = "the Runtime gave no diagnostic"
+	}
+	problem := exit.Named(exitCode, name, "`cozy-runtime bindings`: %s",
+		strings.Join(strings.Fields(said), " "))
+	if remedy != "" {
+		problem.WithRemedy("%s", remedy)
+	}
+	return problem
 }

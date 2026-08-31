@@ -50,14 +50,26 @@ type LocalSource struct {
 }
 
 type PublishedSource struct {
-	Bytes        int64
-	Files        int
-	Package      string
-	ProjectWheel PublishedWheel
-	Release      string
-	SourceDigest string
-	Wheels       []PublishedWheel
-	Selection    Selection
+	Bytes         int64
+	Files         int
+	Package       string
+	PackageConfig ExactDocument
+	ProjectWheel  PublishedWheel
+	Release       string
+	SourceDigest  string
+	Wheels        []PublishedWheel
+	Models        []PublishedModel
+	Selection     Selection
+}
+
+type PublishedModel struct {
+	Lane           string `json:"lane"`
+	Manifest       string `json:"manifest"`
+	ManifestLength int64  `json:"manifest_length"`
+	Model          string `json:"model"`
+	Package        string `json:"package"`
+	Release        string `json:"release"`
+	Slot           string `json:"slot"`
 }
 
 type PublishedWheel struct {
@@ -94,6 +106,13 @@ func validatePublished(gen records.PackageInstall, published *PublishedSource) *
 		published.ProjectWheel.Digest == "" || published.ProjectWheel.Path == "" {
 		return exit.Named(exit.Conflict, "package_wheel_release_mismatch",
 			"published project wheel does not name %s@%s", gen.Package, gen.Version)
+	}
+	config := published.PackageConfig
+	configDigest, err := canonical.Raw(config.Digest)
+	if err != nil || config.Length <= 0 || config.Length != int64(len(config.Bytes)) ||
+		!bytes.Equal(canonical.Digest(config.Bytes), configDigest) {
+		return exit.Named(exit.Conflict, "package_config_identity_mismatch",
+			"published package.toml bytes do not match their digest and length")
 	}
 	return nil
 }

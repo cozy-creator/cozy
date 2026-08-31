@@ -29,6 +29,14 @@ func preparePublished(l home.Layout, genDir, runtimeBin string, published *Publi
 	if runtimeBin == "" {
 		return nil, empty, "", nil, exit.Internalf("published install has no trusted host Runtime")
 	}
+	sourceDir := filepath.Join(genDir, "source")
+	if err := os.MkdirAll(sourceDir, 0o700); err != nil {
+		return nil, empty, "", nil, exit.Internalf("cannot create package metadata directory: %s", err)
+	}
+	if err := os.WriteFile(filepath.Join(sourceDir, "package.toml"),
+		published.PackageConfig.Bytes, 0o400); err != nil {
+		return nil, empty, "", nil, exit.Internalf("cannot retain exact package.toml: %s", err)
+	}
 	cache := filepath.Join(genDir, "artifact-cache")
 	setDir := filepath.Join(cache, "sets", "package")
 	if err := os.MkdirAll(setDir, 0o700); err != nil {
@@ -44,6 +52,7 @@ func preparePublished(l home.Layout, genDir, runtimeBin string, published *Publi
 	}
 
 	args := []string{"--json", "prepare-package",
+		"--artifact-store", l.CAS,
 		"--package", published.Package,
 		"--release", published.Release,
 		"--release-digest", published.SourceDigest,
@@ -54,6 +63,13 @@ func preparePublished(l home.Layout, genDir, runtimeBin string, published *Publi
 	}
 	for _, wheel := range published.Wheels {
 		args = append(args, "--dependency-wheel", wheel.Path)
+	}
+	for _, model := range published.Models {
+		raw, err := json.Marshal(model)
+		if err != nil {
+			return nil, empty, "", nil, exit.Internalf("cannot encode selected package model: %s", err)
+		}
+		args = append(args, "--model", string(raw))
 	}
 	cmd := exec.Command(runtimeBin, args...)
 	cmd.Env = config.Frozen().Tool("COZY_HOME=" + l.Root)
