@@ -19,8 +19,8 @@ V1_GATE = "proto-014"
 PYTHON_SPEC = ">=3.12,<3.13"
 MATURIN_SPEC = "maturin>=1.15,<2"
 PYO3_VERSION = "0.29.2"
-CURRENT_CARGO_VERSION = "0.0.3-dev.0"
-CURRENT_PYTHON_VERSION = "0.0.3.dev0"
+CURRENT_CARGO_VERSION = "0.0.3"
+CURRENT_PYTHON_VERSION = "0.0.3"
 
 
 def python_runtime() -> str:
@@ -64,12 +64,12 @@ def source_versions() -> tuple[str, str]:
         raise ValueError("pyproject and Cargo workspace versions must be strings")
     if cargo_version != CURRENT_CARGO_VERSION:
         raise ValueError(
-            f"Cargo workspace version {cargo_version!r} != current development identity "
+            f"Cargo workspace version {cargo_version!r} != current release identity "
             f"{CURRENT_CARGO_VERSION!r}"
         )
     if python_version != CURRENT_PYTHON_VERSION:
         raise ValueError(
-            f"pyproject version {python_version!r} != current development identity "
+            f"pyproject version {python_version!r} != current release identity "
             f"{CURRENT_PYTHON_VERSION!r}"
         )
     if _python_version_from_cargo(cargo_version) != python_version:

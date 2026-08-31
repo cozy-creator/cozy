@@ -1,8 +1,6 @@
 # TensorFS
 
-The current source tree is the unreleased `0.0.3` development line: Cargo crates use
-`0.0.3-dev.0`, while Python metadata and wheels use its PEP 440 spelling `0.0.3.dev0`.
-The published `0.0.2` artifacts remain immutable and are not rebuilt from this tree.
+The current release is `0.0.3`.
 
 TensorFS stores every domain repository as the same graph:
 
