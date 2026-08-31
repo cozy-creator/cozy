@@ -76,6 +76,26 @@ func TestRecordsV1MigrationIsAtomicAndMinimal(t *testing.T) {
 	if version != 1 || quick != "ok" {
 		t.Fatalf("migrated version/quick_check = %d/%q", version, quick)
 	}
+	retained := map[string]bool{
+		"install_generations": true, "pins": true, "worker_processes": true,
+		"requests": true, "attempts": true, "outputs": true, "request_events": true,
+		"publications": true, "job_checkpoints": true, "artifact_finalizations": true,
+		"rental_operations": true, "rentals": true, "rental_relay_refusals": true,
+	}
+	rows, err := db.Query(`SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'`)
+	must(t, err)
+	for rows.Next() {
+		var name string
+		must(t, rows.Scan(&name))
+		if !retained[name] {
+			t.Errorf("unowned table %s survived migration", name)
+		}
+		delete(retained, name)
+	}
+	must(t, rows.Close())
+	for name := range retained {
+		t.Errorf("owned table %s is absent after migration", name)
+	}
 	for _, table := range []string{
 		"managed_profile_installs", "workflow_executions", "workflow_steps",
 		"video_compositions", "placement_acquisition_observations", "artifact_receipts",
