@@ -7,6 +7,7 @@ import (
 	"io"
 	"net/http"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -37,6 +38,18 @@ type JobSubmission struct {
 	Release       string          `json:"release,omitempty"`
 	ReleaseDigest string          `json:"release_digest,omitempty"`
 	Rental        bool            `json:"rental,omitempty"`
+	// Worker pins an internal production step to the already-attached rental that
+	// prepared its source Manifests. It is admitted only with the CLI credential.
+	Worker string `json:"worker,omitempty"`
+	// Models are exact derive-only Manifest capabilities. No path or model bytes
+	// cross this local API.
+	Models []orchestrator.ModelRef `json:"models,omitempty"`
+	// Production fields are private two-phase journal joins. They let the daemon
+	// bind the request id before dispatch, so an immediate ArtifactReceipt cannot
+	// outrun its owning model-production row.
+	ProductionOperationID string `json:"production_operation_id,omitempty"`
+	ProductionNode        string `json:"production_node,omitempty"`
+	ProductionNodeIndex   int64  `json:"production_node_index,omitempty"`
 	// Org is the publishing org whose SCRATCH repo this job lands in
 	// (`<org>/_job-<request-id>`). It defaults to `local` — a local host has no identity
 	// plane yet (decisions #229) and inventing one would be a fake account.
@@ -99,7 +112,10 @@ func (s *Server) submitJob(w http.ResponseWriter, r *http.Request) {
 	// A job's trees name HOST DIRECTORIES that become read/write worker grants — the same
 	// authority local_assets carry on /v1/requests (requests.go) — so they take the same
 	// gate: a browser bearer must never name host paths (credentials.go).
-	if len(sub.Trees) > 0 && !s.cliAuthenticated(r) {
+	production := sub.ProductionOperationID != "" || sub.ProductionNode != "" ||
+		sub.ProductionNodeIndex != 0
+	if (len(sub.Trees) > 0 || sub.Worker != "" || len(sub.Models) > 0 || production) &&
+		!s.cliAuthenticated(r) {
 		s.refuse(w, r, http.StatusForbidden, "cli_credential_required",
 			"trees name host filesystem directories and require the OS-protected CLI credential",
 			"use `cozy run --input-tree <ref>=<dir>`; this build exposes no browser tree-upload route")
@@ -122,7 +138,31 @@ func (s *Server) submitJob(w http.ResponseWriter, r *http.Request) {
 	// orchestrator records the row, queues it and makes the worker resident; several jobs
 	// submitted at once queue against ONE worker and drain in submission order
 	// (owner directive, decisions #394 / cr-019).
-	jobID, attempt, fresh, e := s.orchestrator.SubmitDetail(spec)
+	var jobID string
+	var attempt uint64
+	var fresh bool
+	if production {
+		if sub.ProductionOperationID == "" || sub.ProductionNode == "" ||
+			sub.ProductionNodeIndex < 0 {
+			s.refuse(w, r, http.StatusBadRequest, "model_production.node_identity_invalid",
+				"production job submission requires operation, node, and non-negative index", "")
+			return
+		}
+		var recorded records.Request
+		recorded, fresh, e = s.orchestrator.RecordSubmission(spec)
+		if e == nil {
+			jobID = recorded.ID
+			e = s.store.SetModelProductionNodeRequest(sub.ProductionOperationID,
+				sub.ProductionNodeIndex, sub.ProductionNode, jobID, "submitted")
+		}
+		if e == nil && fresh {
+			attempt, e = s.orchestrator.ActivateRecordedRequest(recorded)
+		} else if e == nil {
+			attempt = uint64(recorded.Ordinal)
+		}
+	} else {
+		jobID, attempt, fresh, e = s.orchestrator.SubmitDetail(spec)
+	}
 	if e != nil {
 		s.refuseTyped(w, r, e)
 		return
@@ -157,6 +197,7 @@ func (s *Server) resolveJob(sub JobSubmission) (orchestrator.Submission, *exit.E
 		Kind: "job", Package: sub.Package, Entrypoint: sub.Function,
 		Payload: []byte(sub.Input), Org: strings.TrimSpace(sub.Org),
 		Release: sub.Release, ReleaseDigest: sub.ReleaseDigest, Rental: sub.Rental,
+		Worker: sub.Worker, Models: append([]orchestrator.ModelRef(nil), sub.Models...),
 	}
 	if len(out.Payload) == 0 {
 		out.Payload = []byte("{}")
@@ -170,18 +211,23 @@ func (s *Server) resolveJob(sub JobSubmission) (orchestrator.Submission, *exit.E
 	if s.packages == nil {
 		return out, exit.Unavailablef("this Cozy daemon resolves no packages")
 	}
+	if sub.Worker != "" && !sub.Rental {
+		return out, exit.Named(exit.Validation, "rental.job_worker_without_rental",
+			"a pinned remote worker requires rental authorization")
+	}
 	if out.Rental {
 		if sub.InstallID != "" || sub.Release == "" || sub.ReleaseDigest == "" || len(sub.Trees) > 0 {
 			return out, exit.Named(exit.Validation, "rental.job_release_incomplete",
 				"remote jobs require one exact published release and no local input trees")
 		}
 		logical, problem := s.packages.ResolveRemoteJob(
-			sub.Package, sub.Release, sub.ReleaseDigest, sub.Function)
+			sub.Package, sub.Release, sub.ReleaseDigest, sub.Function, sub.Models)
 		if problem != nil {
 			return out, problem
 		}
 		out.PlanID, out.Outputs = logical.DescriptorID, logical.Outputs
 		out.ArtifactOutputs, out.JobGPUCount = logical.ArtifactOutputs, logical.GPUCount
+		out.Models = append([]orchestrator.ModelRef(nil), logical.Models...)
 		return out, nil
 	}
 	refreshed, editable, _, refreshProblem := s.refreshPackage(sub.Package)
@@ -268,6 +314,16 @@ func jobSubmissionDigest(spec orchestrator.Submission) (string, *exit.Error) {
 			"output_id": output.OutputID,
 		})
 	}
+	modelRefs := append([]orchestrator.ModelRef(nil), spec.Models...)
+	sort.Slice(modelRefs, func(i, j int) bool { return modelRefs[i].Slot < modelRefs[j].Slot })
+	models := make([]canonical.Value, 0, len(modelRefs))
+	for _, model := range modelRefs {
+		models = append(models, map[string]canonical.Value{
+			"package": model.Package, "slot": model.Slot, "model": model.Model,
+			"release": model.Release, "manifest": model.Manifest,
+			"manifest_length": model.ManifestLength,
+		})
+	}
 	doc := map[string]canonical.Value{
 		"kind":             "job",
 		"package":          spec.Package,
@@ -280,6 +336,7 @@ func jobSubmissionDigest(spec orchestrator.Submission) (string, *exit.Error) {
 		"artifact_outputs": artifactOutputs,
 		"trees":            strings.Join(spec.Trees, ","),
 		"job_gpu_count":    spec.JobGPUCount,
+		"models":           models,
 	}
 	if spec.Rental {
 		doc["rental"] = true

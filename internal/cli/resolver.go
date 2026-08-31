@@ -312,7 +312,9 @@ func (r *Resolver) ResolveRemoteRelease(pkg, release, releaseDigest, function st
 	}, entrypoint, nil
 }
 
-func (r *Resolver) ResolveRemoteJob(pkg, release, releaseDigest, function string) (
+func (r *Resolver) ResolveRemoteJob(pkg, release, releaseDigest, function string,
+	models []orchestrator.ModelRef,
+) (
 	orchestrator.LogicalJob, *exit.Error,
 ) {
 	var empty orchestrator.LogicalJob
@@ -348,9 +350,38 @@ func (r *Resolver) ResolveRemoteJob(pkg, release, releaseDigest, function string
 		return empty, exit.Named(exit.Validation, "rental.job_descriptor_invalid",
 			"%s is not a published job callable", function)
 	}
-	if len(job.Models) > 0 {
-		return empty, exit.Named(exit.Unavailable, "rental.modeled_job_unsupported",
-			"remote job %s declares model slots", function)
+	models = append([]orchestrator.ModelRef(nil), models...)
+	sort.Slice(models, func(i, j int) bool { return models[i].Slot < models[j].Slot })
+	if len(models) != len(job.Models) {
+		return empty, exit.Named(exit.Validation, "rental.job_model_selection_incomplete",
+			"remote job %s requires exactly %d model Manifest binding(s)", function, len(job.Models))
+	}
+	byParam := make(map[string]orchestrator.ModelRef, len(models))
+	for _, model := range models {
+		if model.Package != pkg || model.Slot == "" || model.Model == "" ||
+			model.ManifestLength <= 0 || model.ManifestLength > (int64(1)<<53)-1 {
+			return empty, exit.Named(exit.Validation, "rental.job_model_selection_mismatch",
+				"remote job %s carries an incomplete model Manifest binding", function)
+		}
+		if _, exists := byParam[model.Slot]; exists {
+			return empty, exit.Named(exit.Validation, "rental.job_model_selection_mismatch",
+				"remote job %s repeats model parameter %s", function, model.Slot)
+		}
+		if _, err := canonical.Raw(model.Manifest); err != nil {
+			return empty, exit.Named(exit.Validation, "rental.job_model_manifest_invalid",
+				"remote job %s model parameter %s has no exact Manifest digest", function, model.Slot)
+		}
+		byParam[model.Slot] = model
+	}
+	for _, slot := range job.Models {
+		if _, ok := byParam[slot.Param]; !ok {
+			return empty, exit.Named(exit.Validation, "rental.job_model_selection_mismatch",
+				"remote job %s does not bind model parameter %s", function, slot.Param)
+		}
+		if len(slot.Stamps) != 0 {
+			return empty, exit.Named(exit.Unavailable, "rental.job_model_stamps_unsupported",
+				"remote job %s model parameter %s uses unsupported stamps", function, slot.Param)
+		}
 	}
 	artifacts := make([]orchestrator.ArtifactOutput, 0, len(job.ArtifactOutputs))
 	outputs := launch.AssetPaths(job.Result)
@@ -363,7 +394,7 @@ func (r *Resolver) ResolveRemoteJob(pkg, release, releaseDigest, function string
 	return orchestrator.LogicalJob{
 		Package: pkg, Release: release, ReleaseDigest: releaseDigest,
 		Function: function, DescriptorID: job.DescriptorID, Outputs: outputs,
-		ArtifactOutputs: artifacts, GPUCount: job.Resources.GPUCount,
+		ArtifactOutputs: artifacts, GPUCount: job.Resources.GPUCount, Models: models,
 	}, nil
 }
 

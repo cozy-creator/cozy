@@ -479,6 +479,10 @@ type ModelRef struct {
 	Model    string `json:"model"`
 	Release  string `json:"release"`
 	Manifest string `json:"manifest"`
+	// ManifestLength is required for derive-only job Model inputs. Serving model
+	// downloads keep it zero because their catalog manifest is acquired through the
+	// package-set lane before an invocation exists.
+	ManifestLength int64 `json:"manifest_length,omitempty"`
 }
 
 const requestCols = `id,idem_key,body_digest,package,entrypoint,plan_id,package_release,

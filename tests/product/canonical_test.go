@@ -18,6 +18,7 @@ import (
 
 	"github.com/cozy-creator/cozy/internal/canonical"
 	"github.com/cozy-creator/cozy/internal/launch"
+	"github.com/cozy-creator/cozy/internal/modelproduction"
 	pb "github.com/cozy-creator/cozy/protocol/cozy/worker/v1"
 )
 
@@ -334,5 +335,76 @@ func TestCompactPackageDescriptor(t *testing.T) {
 		if _, refusal := launch.DecodeDescriptor(planted); refusal == nil {
 			t.Errorf("%s was accepted at the compact descriptor boundary", name)
 		}
+	}
+}
+
+func TestModelProductionDescriptor(t *testing.T) {
+	raw := []byte(`{"application":"producer:app","entrypoints":[],"format":"cozy.package.descriptor/1","jobs":[],"model_productions":[{"name":"two-lane","nodes":[{"callable":"tensorhub/quantize/fp8","models":{"source":"assemble.model"},"name":"quantize","outputs":["model"],"resources":{"gpu_count":1,"placement":"single_node","requires":"sm90+,vram80g"}},{"callable":"tensorhub/minimax-h3-tools/assemble","models":{"dits":"dits","shared":"shared"},"name":"assemble","outputs":["model"]}],"outputs":[{"lane_key":"bf16-full","name":"full","required_contract":{"encodings":["sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"],"topology_digest":"sha256:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"},"source":"assemble.model"},{"lane_key":"fp8-pruned","name":"fp8","required_contract":{"encodings":["sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc","sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"],"topology_digest":"sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"},"source":"quantize.model"}],"sources":{"dits":"hf/minimax-h3/native-dits-bf16","shared":"hf/minimax-h3/shared-diffusers"}}]}`)
+	descriptor, problem := launch.DecodeDescriptor(raw)
+	fatal(t, problem)
+	production, problem := descriptor.Production("two-lane")
+	fatal(t, problem)
+	ordered, problem := production.OrderedNodes()
+	fatal(t, problem)
+	if len(ordered) != 2 || ordered[0].Name != "assemble" || ordered[1].Name != "quantize" ||
+		production.Sources["dits"] != "hf/minimax-h3/native-dits-bf16" ||
+		production.Outputs[1].RequiredContract.Encodings[0] != "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc" {
+		t.Fatalf("production graph changed: %+v", production)
+	}
+	for name, planted := range map[string][]byte{
+		"retired single source": bytes.Replace(raw,
+			[]byte(`"sources":{"dits":"hf/minimax-h3/native-dits-bf16","shared":"hf/minimax-h3/shared-diffusers"}`),
+			[]byte(`"source":"dits"`), 1),
+		"profile escape": bytes.Replace(raw,
+			[]byte(`hf/minimax-h3/native-dits-bf16`), []byte(`../native-dits-bf16`), 1),
+		"unknown edge": bytes.Replace(raw,
+			[]byte(`"source":"assemble.model"`), []byte(`"source":"missing.model"`), 1),
+		"duplicate lane": bytes.Replace(raw,
+			[]byte(`"lane_key":"fp8-pruned"`), []byte(`"lane_key":"bf16-full"`), 1),
+		"zero gpu":               bytes.Replace(raw, []byte(`"gpu_count":1`), []byte(`"gpu_count":0`), 1),
+		"retired task alias":     bytes.Replace(raw, []byte(`"topology_digest":"sha256:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"`), []byte(`"structure":"h3/full","tasks":["fl2va"]`), 1),
+		"package asset in graph": bytes.Replace(raw, []byte(`"callable":"tensorhub/quantize/fp8"`), []byte(`"assets":{"plan":"assets/quant.json"},"callable":"tensorhub/quantize/fp8"`), 1),
+		"encoding aliases":       bytes.Replace(raw, []byte(`"sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"`), []byte(`"plain/1"`), 1),
+	} {
+		t.Run(name, func(t *testing.T) {
+			if _, refusal := launch.DecodeDescriptor(planted); refusal == nil {
+				t.Fatal("invalid model production was accepted")
+			}
+		})
+	}
+}
+
+func TestModelProductionOperationIdentity(t *testing.T) {
+	production := &launch.ModelProduction{Name: "four-lane", Outputs: []launch.ModelProductionOutput{
+		{LaneKey: "bf16-full"}, {LaneKey: "fp8-adaln-pruned"},
+	}, Sources: map[string]string{
+		"shared": "hf/minimax-h3/shared-diffusers", "dits": "hf/minimax-h3/native-dits-bf16",
+	}}
+	base := modelproduction.Plan{
+		Destination: "tensorhub/minimax-h3", Release: "1.0.0",
+		Source:           "hf://MiniMaxAI/MiniMax-H3@aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+		SourceSelection:  "sha256:" + strings.Repeat("b", 64),
+		Producer:         "tensorhub/minimax-h3-tools/four-lane",
+		ProducerRelease:  "1.0.0",
+		ProducerDigest:   "sha256:" + strings.Repeat("c", 64),
+		DescriptorDigest: "sha256:" + strings.Repeat("d", 64),
+		Production:       production,
+		Jobs: []modelproduction.JobPin{
+			{Node: "quantize", Callable: "tensorhub/quantize/fp8", Release: "1.2.0", ReleaseDigest: "sha256:" + strings.Repeat("e", 64)},
+			{Node: "assemble", Callable: "tensorhub/minimax-h3-tools/assemble", Release: "1.0.0", ReleaseDigest: "sha256:" + strings.Repeat("f", 64)},
+		},
+	}
+	reordered := base
+	reordered.Jobs = []modelproduction.JobPin{base.Jobs[1], base.Jobs[0]}
+	if base.ID() != reordered.ID() || !strings.HasPrefix(base.ID(), "modelpub-") {
+		t.Fatal("attempt-independent production identity is not stable")
+	}
+	changed := base
+	changed.SourceSelection = "sha256:" + strings.Repeat("0", 64)
+	if changed.ID() == base.ID() {
+		t.Fatal("changed pinned source did not move production identity")
+	}
+	if got := strings.Join(base.SourceProfiles(), ","); got != "hf/minimax-h3/native-dits-bf16,hf/minimax-h3/shared-diffusers" {
+		t.Fatalf("source profiles are not deterministic: %s", got)
 	}
 }

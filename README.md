@@ -141,17 +141,25 @@ cozy model list
 cozy model remove org/model
 ```
 
-Publish an existing canonical TensorFS manifest as one immutable release lane. `--lane` supplies
-its portable name; Tensorhub still independently derives and records the manifest contract. The
-remote model name is created automatically when absent:
+Publish a pinned source directly, or execute one package-reviewed production whose fixed outputs
+become the release's lanes. `--lane` selects only an existing input release; it never names an
+output lane. An existing canonical TensorFS manifest can still be published directly as one
+immutable release lane:
 
 ```sh
-cozy model publish org/model sha256:<manifest> --release 1.0.0 --lane bf16
+cozy model publish org/model sha256:<manifest> --release 1.0.0 --lane <derived-lane>
+
+cozy model publish tensorhub/minimax-h3 \
+  hf://MiniMaxAI/MiniMax-H3@<full-commit> \
+  --release 1.0.0 \
+  --producer tensorhub/minimax-h3-tools/four-lane \
+  --rental
 ```
 
-Download and publication are resumable and verify content identities before making a local or
-remote release visible. Digest-only downloads are refused locally because a durable local model
-must have real release and lane coordinates.
+`--dry-run` resolves the immutable source, producer, job releases, resource floors, and fixed lanes
+without moving model bodies or authorizing rental spend. Publication follows by default and a repeat
+of the same command resumes the durable operation. Download and publication verify content identities
+before making a local or remote release visible.
 
 ## Run packages and jobs
 

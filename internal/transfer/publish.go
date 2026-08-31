@@ -108,8 +108,9 @@ func (p *Publish) Run(ctx context.Context) (Result, *exit.Error) {
 	ms := map[string]int64{}
 	res.MS = ms
 
-	// 1. Prepare the exact documents and known ObjectRefs. Finalize carries the
-	//    original bytes; the transfer claim carries only sorted digest/length facts.
+	// 1. Prepare the exact evidence and known ObjectRefs. The Manifest is one of
+	//    the transferred objects; finalize names its accepted digest/length and
+	//    Tensorhub reads those custody bytes itself.
 	t0 := time.Now()
 	if err := os.MkdirAll(p.Scratch, 0o700); err != nil {
 		return res, exit.Internalf("cannot create the transfer scratch at %s: %s", p.Scratch, err)
@@ -131,18 +132,21 @@ func (p *Publish) Run(ctx context.Context) (Result, *exit.Error) {
 	if e := p.Tool.Manifest(p.ManifestID, manifestPath); e != nil {
 		return res, e
 	}
-	manifest, err := os.ReadFile(manifestPath)
+	manifestInfo, err := os.Stat(manifestPath)
 	if err != nil {
 		return res, exit.Internalf("the manifest tfs extracted is unreadable: %s", err)
 	}
-	res.Manifest = hub.ManifestRef{SHA256: strings.TrimPrefix(p.ManifestID, "sha256:"), Length: int64(len(manifest))}
+	res.Manifest = hub.ManifestRef{SHA256: strings.TrimPrefix(p.ManifestID, "sha256:"),
+		Length: manifestInfo.Size()}
 	finalize := hub.FinalizePublicationRequest{
-		Manifest: hub.B64(manifest), ReleaseEvidenceBase64: hub.B64(evidence),
+		ManifestID: p.ManifestID, ManifestLength: manifestInfo.Size(),
+		ReleaseEvidenceBase64: hub.B64(evidence),
 	}
-	declared := make([]hub.Object, 0, len(objects))
+	declared := make([]hub.Object, 0, len(objects)+1)
 	for _, o := range objects {
 		declared = append(declared, hub.Object{ID: o.ID, Length: o.Length})
 	}
+	declared = append(declared, hub.Object{ID: p.ManifestID, Length: manifestInfo.Size()})
 	sort.Slice(declared, func(i, j int) bool { return declared[i].ID < declared[j].ID })
 	ms["declare"] = since(t0)
 	p.say("prepared %d known blob transfers (%s) from %s", len(declared), bytesOf(objects), p.ManifestID)
@@ -232,8 +236,8 @@ func (p *Publish) finalizeAndCut(ctx context.Context, request hub.FinalizePublic
 	if prepared.PublishID != res.PublishID || prepared.Release != p.Release ||
 		prepared.Manifest != res.Manifest ||
 		prepared.ReleaseEvidenceBase64 != request.ReleaseEvidenceBase64 ||
-		prepared.State != "verified/prepared" || prepared.Objects != res.Totals.DeclaredObjects ||
-		prepared.Bytes != res.Totals.DeclaredBytes {
+		prepared.State != "verified/prepared" || prepared.Objects != res.Totals.DeclaredObjects-1 ||
+		prepared.Bytes != res.Totals.DeclaredBytes-res.Manifest.Length {
 		return res, exit.Internalf("Tensorhub prepared a different publication identity")
 	}
 	if prepared.Lane != p.Lane {
@@ -434,7 +438,13 @@ func (p *Publish) uploadOne(ctx context.Context, index int, transfer hub.Transfe
 
 	// The bytes leave the store through a VERIFIED read, so a publisher cannot
 	// upload what its own store silently corrupted.
-	if e := p.Tool.Extract(grant.ObjectID, staged); e != nil {
+	var e *exit.Error
+	if grant.ObjectID == p.ManifestID {
+		e = p.Tool.Manifest(grant.ObjectID, staged)
+	} else {
+		e = p.Tool.Extract(grant.ObjectID, staged)
+	}
+	if e != nil {
 		outcome.err = e
 		return outcome
 	}

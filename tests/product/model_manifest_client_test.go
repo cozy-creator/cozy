@@ -1,6 +1,7 @@
 package producttest
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/base64"
@@ -229,7 +230,8 @@ func TestPublicationUsesCurrentPrepareAndCutContract(t *testing.T) {
 				t.Fatalf("finalize request = %s %s", r.Method, r.URL.Path)
 			}
 			var body map[string]any
-			if err := json.NewDecoder(r.Body).Decode(&body); err != nil || len(body) != 2 || body["manifest"] != "e30=" ||
+			if err := json.NewDecoder(r.Body).Decode(&body); err != nil || len(body) != 3 ||
+				body["manifest_id"] != "sha256:"+manifestA || body["manifest_length"] != float64(2) ||
 				body["release_evidence_base64"] != evidenceBase64 {
 				t.Fatalf("finalize body = %#v, %v", body, err)
 			}
@@ -267,7 +269,8 @@ func TestPublicationUsesCurrentPrepareAndCutContract(t *testing.T) {
 		t.Fatalf("GrantKnownTransfers = %#v, %v", granted, problem)
 	}
 	prepared, problem := client.FinalizePublication(context.Background(), ref, "manifest-proof",
-		hub.FinalizePublicationRequest{Manifest: "e30=", ReleaseEvidenceBase64: evidenceBase64}, "proof")
+		hub.FinalizePublicationRequest{ManifestID: "sha256:" + manifestA, ManifestLength: 2,
+			ReleaseEvidenceBase64: evidenceBase64}, "proof")
 	if problem != nil || prepared.Manifest.Length != 2 || prepared.Release != "1.0.0" ||
 		prepared.Lane != namedLane || prepared.ReleaseEvidenceBase64 != evidenceBase64 {
 		t.Fatalf("FinalizePublication = %#v, %v", prepared, problem)
@@ -329,6 +332,8 @@ func TestModelPublicationBatchesFinalizesCutsAndReplays(t *testing.T) {
 		transfers = append(transfers, hub.Transfer{ObjectID: objectID, Length: 1, State: "claimed"})
 		fmt.Fprintf(&refs, `{"sha256":"%s","length":1}`+"\n", strings.TrimPrefix(objectID, "sha256:"))
 	}
+	transfers = append(transfers, hub.Transfer{ObjectID: manifestID,
+		Length: int64(len(manifest)), State: "claimed"})
 
 	toolDir := t.TempDir()
 	releasesPath := filepath.Join(toolDir, "releases.jsonl")
@@ -385,14 +390,18 @@ func TestModelPublicationBatchesFinalizesCutsAndReplays(t *testing.T) {
 			grantCalls.Add(1)
 			answer := hub.GrantResponse{Grants: make([]hub.Grant, 0, len(body.ObjectIDs))}
 			for _, objectID := range body.ObjectIDs {
-				answer.Grants = append(answer.Grants, hub.Grant{ObjectID: objectID, Length: 1,
+				length := int64(1)
+				if objectID == manifestID {
+					length = int64(len(manifest))
+				}
+				answer.Grants = append(answer.Grants, hub.Grant{ObjectID: objectID, Length: length,
 					URL: server.URL + "/objects/" + objectID})
 			}
 			_ = json.NewEncoder(w).Encode(answer)
 		case r.Method == http.MethodPut && strings.HasPrefix(r.URL.Path, "/objects/"):
 			uploadCalls.Add(1)
 			raw, err := io.ReadAll(r.Body)
-			if err != nil || string(raw) != "x" {
+			if err != nil || string(raw) != "x" && !bytes.Equal(raw, manifest) {
 				t.Errorf("object upload = %q, %v", raw, err)
 			}
 			w.WriteHeader(http.StatusOK)
@@ -427,7 +436,8 @@ func TestModelPublicationBatchesFinalizesCutsAndReplays(t *testing.T) {
 	if problem != nil {
 		t.Fatal(problem)
 	}
-	if result.Uploaded != objectCount || result.Verified != objectCount || result.Moved != objectCount {
+	if result.Uploaded != objectCount+1 || result.Verified != objectCount ||
+		result.Moved != int64(objectCount+len(manifest)) {
 		t.Fatalf("publication result = %#v", result)
 	}
 	replayed, problem := publish.Run(context.Background())
@@ -435,15 +445,16 @@ func TestModelPublicationBatchesFinalizesCutsAndReplays(t *testing.T) {
 		t.Fatal(problem)
 	}
 	if !replayed.Dup || replayed.Uploaded != 0 || replayed.Grants != 0 || replayed.Moved != 0 ||
-		replayed.Deduped != objectCount || replayed.Verified != objectCount {
+		replayed.Deduped != int64(objectCount+len(manifest)) || replayed.Verified != objectCount {
 		t.Fatalf("replayed publication result = %#v", replayed)
 	}
 	publish.DryRun = true
 	planned, problem := publish.Run(context.Background())
-	if problem != nil || planned.Uploaded != 0 || planned.Deduped != objectCount || planned.Verified != 0 {
+	if problem != nil || planned.Uploaded != 0 ||
+		planned.Deduped != int64(objectCount+len(manifest)) || planned.Verified != 0 {
 		t.Fatalf("committed dry-run result = %#v, %v", planned, problem)
 	}
-	if openCalls.Load() != 3 || grantCalls.Load() != 3 || uploadCalls.Load() != objectCount ||
+	if openCalls.Load() != 3 || grantCalls.Load() != 3 || uploadCalls.Load() != objectCount+1 ||
 		finalizeCalls.Load() != 2 || cutCalls.Load() != 2 {
 		t.Fatalf("publication calls: open=%d grants=%d uploads=%d finalize=%d cut=%d",
 			openCalls.Load(), grantCalls.Load(), uploadCalls.Load(), finalizeCalls.Load(), cutCalls.Load())

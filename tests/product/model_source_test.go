@@ -88,20 +88,19 @@ func TestProviderSecretsRequireOwnerOnlyNonsymlinkConfig(t *testing.T) {
 func TestTensorhubDestinationCannotUseLocalNamespace(t *testing.T) {
 	root := t.TempDir()
 	result := runCozyEnv([]string{"COZY_HOME=" + root, "PATH=/usr/local/bin:/usr/bin:/bin"},
-		"model", "publish", "local/model", "sha256:"+strings.Repeat("a", 64),
-		"--release", "1.0.0", "--lane", "bf16")
+		"model", "publish", "local/model", "hf://org/model@"+strings.Repeat("a", 40),
+		"--release", "1.0.0", "--dry-run")
 	if result.code != 2 || !strings.Contains(result.output, "local/ is reserved") {
 		t.Fatalf("local Tensorhub destination = exit %d\n%s", result.code, result.output)
 	}
 }
 
-func TestRecognizedForeignSourceRefusesBeforeTensorFSOrNetwork(t *testing.T) {
+func TestForeignSourceLaneRefusesBeforeNetwork(t *testing.T) {
 	root := t.TempDir()
 	result := runCozyEnv([]string{"COZY_HOME=" + root, "PATH=/usr/local/bin:/usr/bin:/bin"},
 		"model", "publish", "acme/model", "hf://org/model@"+strings.Repeat("a", 40),
 		"--release", "1.0.0", "--lane", "bf16")
-	if result.code != 1 || !strings.Contains(result.output, "closed ingest plan") ||
-		!strings.Contains(result.output, "Creator will not infer") {
+	if result.code != 2 || !strings.Contains(result.output, "--lane selects only") {
 		t.Fatalf("recognized foreign source = exit %d\n%s", result.code, result.output)
 	}
 }

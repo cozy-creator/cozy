@@ -74,7 +74,7 @@ func progress(ctx *Context) func(string) {
 	return func(line string) { _ = output.Progress(ctx.Err, line) }
 }
 
-func handleModelPublish(ctx *Context) *exit.Error {
+func handleDirectModelPublish(ctx *Context) *exit.Error {
 	ref, e := hub.ParseRef(ctx.Inv.Args[0])
 	if e != nil {
 		return e

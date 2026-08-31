@@ -100,7 +100,8 @@ type Resolver interface {
 	ResolveInstall(installID string) (orchestrator.WorkerLaunchSpec, *exit.Error)
 	ResolveRemoteRelease(pkg, release, digest, function string, models []orchestrator.ModelRef) (
 		orchestrator.LogicalPackage, *launch.Entrypoint, *exit.Error)
-	ResolveRemoteJob(pkg, release, digest, function string) (orchestrator.LogicalJob, *exit.Error)
+	ResolveRemoteJob(pkg, release, digest, function string, models []orchestrator.ModelRef) (
+		orchestrator.LogicalJob, *exit.Error)
 	Entrypoint(installID, name string) (*launch.Entrypoint, *exit.Error)
 	// Jobs names the `@job` functions one installed package registers, with the
 	// descriptor id each resolves to. The job submit route resolves a function to its
@@ -159,6 +160,7 @@ func (s *Server) Handler() (http.Handler, *exit.Error) {
 		"POST /v1/local/jobs":                        s.submitJob,
 		"GET /v1/local/jobs/{id}":                    s.getJob,
 		"POST /v1/local/jobs/{id}/cancel":            s.cancelJob,
+		"POST /v1/local/model-productions/{id}":      s.modelProductionAction,
 		"GET /{$}":                                   s.webUI,
 		"GET /app.css":                               s.webUI,
 		"GET /app.js":                                s.webUI,

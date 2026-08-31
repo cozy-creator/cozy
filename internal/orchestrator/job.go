@@ -218,6 +218,14 @@ func (c *Orchestrator) jobGrant(req records.Request, attempt uint64) (*pb.Delive
 		// ACCESS ONLY (#439): identities live in the InvocationSpec's bindings.
 		Inputs: []*pb.InputAccess{{InputId: "payload", Url: "file://" + payloadPath}},
 	}
+	for _, model := range req.Models {
+		if model.ManifestLength <= 0 {
+			continue
+		}
+		g.Inputs = append(g.Inputs, &pb.InputAccess{
+			InputId: "model:" + model.Slot, Url: "model://" + model.Manifest,
+		})
+	}
 	// THE INPUT TREES. A tree's bytes are not re-hashed at the grant: a tree is a
 	// materialized TensorFS snapshot and its verification is the store's own verified
 	// read path (law 18, tfs-007). What this side owns is that the grant NAMES it — a

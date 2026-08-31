@@ -318,6 +318,34 @@ func (c *Orchestrator) converse(w *worker, addr string) error {
 				continue
 			}
 			c.onCheckpoint(s, r)
+		case *pb.WorkerFrame_ModelSourceFileStatus:
+			status := m.ModelSourceFileStatus
+			if c.fenced(s, status.RecordOwnerEpoch, status.ControlStreamGeneration,
+				status.WorkerBootId) {
+				continue
+			}
+			c.onModelSourceFileStatus(s, status)
+		case *pb.WorkerFrame_ModelSourcePrepared:
+			prepared := m.ModelSourcePrepared
+			if c.fenced(s, prepared.RecordOwnerEpoch, prepared.ControlStreamGeneration,
+				prepared.WorkerBootId) {
+				continue
+			}
+			c.onModelSourcePrepared(s, prepared)
+		case *pb.WorkerFrame_ArtifactReceipt:
+			receipt := m.ArtifactReceipt
+			if c.fenced(s, receipt.RecordOwnerEpoch, receipt.ControlStreamGeneration,
+				receipt.WorkerBootId) {
+				continue
+			}
+			c.onProductionArtifactReceipt(s, receipt)
+		case *pb.WorkerFrame_ArtifactTransferStatus:
+			status := m.ArtifactTransferStatus
+			if c.fenced(s, status.RecordOwnerEpoch, status.ControlStreamGeneration,
+				status.WorkerBootId) {
+				continue
+			}
+			c.onProductionArtifactTransferStatus(s, status)
 		case *pb.WorkerFrame_CheckpointAck:
 			// the worker's echo of a receipt already durable here; nothing to apply
 		case *pb.WorkerFrame_ArtifactFinalizeResult:
@@ -560,10 +588,12 @@ func (c *Orchestrator) onSnapshot(w *worker, s *session, snap *pb.WorkerSnapshot
 		shortDigest(shortNone(snap.SnapshotDigest)), len(snap.SnapshotCanonicalBytes),
 		len(held), doc.Int("accepted_desired_state_revision"), doc.Int("converged_revision"))
 	if w.spec.IsJob() {
+		c.signalAllProductions()
 		_ = c.sendJobDirective(s, w)
 		return true
 	}
 	if w.spec.Connection != nil {
+		c.signalAllProductions()
 		c.mu.Lock()
 		packages := clonePackageRefs(w.desiredPackages)
 		models := cloneModelRefs(w.desiredModels)
