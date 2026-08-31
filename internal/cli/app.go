@@ -99,8 +99,11 @@ func Run(args []string, stdout, stderr io.Writer) int {
 		kong.Exit(func(code int) { helpExit = code }),
 		kong.Help(cozyHelp),
 		kong.ExplicitGroups([]kong.Group{
-			{Key: "Resources", Title: "Resources"},
-			{Key: "Work", Title: "Work"},
+			{Key: "Packages", Title: "Packages"},
+			{Key: "Models", Title: "Models"},
+			{Key: "Authentication", Title: "Authentication"},
+			{Key: "Runs", Title: "Runs"},
+			{Key: "Rentals", Title: "Rentals"},
 			{Key: "Lifecycle", Title: "Lifecycle"},
 		}),
 		kong.ConfigureHelp(kong.HelpOptions{Compact: true, FlagsLast: true, WrapUpperBound: 100}),
@@ -203,11 +206,12 @@ func cozyHelp(options kong.HelpOptions, ctx *kong.Context) error {
 	}
 	ctx.Stdout = stdout
 	help := strings.ReplaceAll(rendered.String(), "cozy run execute", "cozy run")
+	if strings.TrimSpace(ctx.Command()) == "" {
+		help = strings.Replace(help, "\nRuns\n",
+			"\nRuns\n  run <org/package/function> [input]    Run a package function on a local or rented machine.\n", 1)
+	}
 	if _, err := io.WriteString(stdout, help); err != nil {
 		return err
-	}
-	if strings.TrimSpace(ctx.Command()) == "" {
-		fmt.Fprintln(stdout, "\nPrimary command:\n  cozy run <org/package/function> [input]")
 	}
 	return nil
 }
