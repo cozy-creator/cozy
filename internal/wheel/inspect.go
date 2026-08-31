@@ -5,7 +5,10 @@ package wheel
 
 import (
 	"archive/zip"
+	"bufio"
+	"bytes"
 	"io"
+	"net/textproto"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -141,24 +144,23 @@ func wheelStructure(message string) *exit.Error {
 }
 
 func metadataIdentity(body []byte) (string, string, *exit.Error) {
+	header, err := textproto.NewReader(bufio.NewReader(bytes.NewReader(body))).ReadMIMEHeader()
+	if err != nil && err != io.EOF {
+		return "", "", wheelStructure("METADATA header block is malformed")
+	}
+	names, versions := header.Values("Name"), header.Values("Version")
+	if len(names) > 1 {
+		return "", "", wheelStructure("METADATA repeats Name")
+	}
+	if len(versions) > 1 {
+		return "", "", wheelStructure("METADATA repeats Version")
+	}
 	name, version := "", ""
-	for _, line := range strings.Split(strings.ReplaceAll(string(body), "\r\n", "\n"), "\n") {
-		key, value, ok := strings.Cut(line, ":")
-		if !ok {
-			continue
-		}
-		switch strings.ToLower(strings.TrimSpace(key)) {
-		case "name":
-			if name != "" {
-				return "", "", wheelStructure("METADATA repeats Name")
-			}
-			name = strings.TrimSpace(value)
-		case "version":
-			if version != "" {
-				return "", "", wheelStructure("METADATA repeats Version")
-			}
-			version = strings.TrimSpace(value)
-		}
+	if len(names) == 1 {
+		name = strings.TrimSpace(names[0])
+	}
+	if len(versions) == 1 {
+		version = strings.TrimSpace(versions[0])
 	}
 	if name == "" || version == "" {
 		return "", "", wheelStructure("METADATA has no exact Name and Version")
