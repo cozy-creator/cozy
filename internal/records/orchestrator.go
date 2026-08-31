@@ -62,6 +62,7 @@ CREATE TABLE IF NOT EXISTS requests (
   requeues     INTEGER NOT NULL DEFAULT 0,
   created_at   TEXT    NOT NULL,
   kind         TEXT    NOT NULL DEFAULT 'serving',
+  job_gpu_count INTEGER NOT NULL DEFAULT 0,
   org          TEXT    NOT NULL DEFAULT '',
   trees        TEXT    NOT NULL DEFAULT '',
   worker       TEXT    NOT NULL DEFAULT '',
@@ -424,7 +425,8 @@ type Request struct {
 	// whole job branch hangs off, and it lives on the request because a requeue must
 	// re-derive the same class without a client saying so again (cr-009: a job is an
 	// attempt class on the one machinery, not a second runtime).
-	Kind string
+	Kind        string
+	JobGPUCount int64
 	// Org is the publishing org a job's scratch repo is named under. Empty for serving.
 	Org string
 	// Trees are the job's typed input TREES, `ref=dir` joined by commas. Each becomes
@@ -481,7 +483,7 @@ type ModelRef struct {
 
 const requestCols = `id,idem_key,body_digest,package,entrypoint,plan_id,package_release,
 	package_revision_digest,environment_digest,config_digest,payload,outputs,
-	state,ordinal,requeues,created_at,kind,org,trees,worker,rental,
+	state,ordinal,requeues,created_at,kind,job_gpu_count,org,trees,worker,rental,
 	COALESCE(install_id,''),assets,models,artifact_outputs`
 
 func scanRequest(row interface{ Scan(...any) error }) (Request, error) {
@@ -490,7 +492,7 @@ func scanRequest(row interface{ Scan(...any) error }) (Request, error) {
 	err := row.Scan(&r.ID, &r.IdemKey, &r.BodyDigest, &r.Package, &r.Entrypoint, &r.PlanID,
 		&r.Release, &r.PackageRevisionDigest, &r.EnvironmentDigest, &r.ConfigDigest, &r.Payload, &r.Outputs,
 		&r.State, &r.Ordinal, &r.Requeues, &r.CreatedAt,
-		&r.Kind, &r.Org, &r.Trees, &r.Worker, &r.Rental,
+		&r.Kind, &r.JobGPUCount, &r.Org, &r.Trees, &r.Worker, &r.Rental,
 		&r.InstallID, &assets, &models, &r.ArtifactOutputs)
 	if err == nil && assets != "" {
 		err = json.Unmarshal([]byte(assets), &r.Assets)
@@ -844,12 +846,12 @@ func submitRequestTx(tx *sql.Tx, r Request, assets, models string) (Request, boo
 	}
 	if _, err := tx.Exec(`INSERT INTO requests(id,idem_key,body_digest,package,entrypoint,
 		plan_id,package_release,package_revision_digest,environment_digest,config_digest,
-		payload,outputs,state,ordinal,requeues,created_at,kind,org,trees,worker,rental,install_id,assets,models,
+		payload,outputs,state,ordinal,requeues,created_at,kind,job_gpu_count,org,trees,worker,rental,install_id,assets,models,
 		artifact_outputs)
-		VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,0,0,?,?,?,?,?,?,?,?,?,?)`,
+		VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,0,0,?,?,?,?,?,?,?,?,?,?,?)`,
 		r.ID, r.IdemKey, r.BodyDigest, r.Package, r.Entrypoint, r.PlanID,
 		r.Release, r.PackageRevisionDigest, r.EnvironmentDigest, r.ConfigDigest, r.Payload,
-		r.Outputs, r.State, r.CreatedAt, r.Kind, r.Org, r.Trees, r.Worker, r.Rental,
+		r.Outputs, r.State, r.CreatedAt, r.Kind, r.JobGPUCount, r.Org, r.Trees, r.Worker, r.Rental,
 		nullable(r.InstallID),
 		assets, models, r.ArtifactOutputs); err != nil {
 		return Request{}, false, exit.Internalf("cannot record request %s: %s", r.ID, err)

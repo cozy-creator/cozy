@@ -560,7 +560,7 @@ func (c *Orchestrator) onSnapshot(w *worker, s *session, snap *pb.WorkerSnapshot
 		shortDigest(shortNone(snap.SnapshotDigest)), len(snap.SnapshotCanonicalBytes),
 		len(held), doc.Int("accepted_desired_state_revision"), doc.Int("converged_revision"))
 	if w.spec.IsJob() {
-		c.sendJobDirective(s, w)
+		_ = c.sendJobDirective(s, w)
 		return true
 	}
 	if w.spec.Connection != nil {

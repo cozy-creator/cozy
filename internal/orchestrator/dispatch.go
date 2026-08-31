@@ -64,7 +64,8 @@ type Submission struct {
 	// Org is the publishing org whose scratch repo this job publishes into.
 	Org string
 	// Trees are the job's typed input TREES as `ref=dir`, one grant input each.
-	Trees []string
+	Trees       []string
+	JobGPUCount int64
 
 	// Worker pins this request to an ATTACHED remote worker (a rental id resolved
 	// through Options.Rentals). Empty = any local worker.
@@ -180,7 +181,7 @@ func requestRecord(s Submission) (records.Request, map[string]any, *exit.Error) 
 		Release: s.Release, PackageRevisionDigest: s.ReleaseDigest,
 		Outputs: strings.Join(s.Outputs, ","),
 		Assets:  s.Assets, ArtifactOutputs: string(artifactBytes),
-		Kind: s.Kind, Org: s.Org, Trees: strings.Join(s.Trees, ","),
+		Kind: s.Kind, JobGPUCount: s.JobGPUCount, Org: s.Org, Trees: strings.Join(s.Trees, ","),
 		Worker: s.Worker, InstallID: s.InstallID, Rental: s.Rental, Models: s.Models,
 	}
 	event := map[string]any{
@@ -588,11 +589,6 @@ func (c *Orchestrator) resolveFor(req records.Request) (WorkerLaunchSpec, string
 		}
 		return spec, req.PlanID, e
 	}
-	if req.IsJob() {
-		return WorkerLaunchSpec{}, "", exit.Named(exit.Structural, "remote_job_control_unavailable",
-			"a remote job cannot be resolved from a local installation").
-			WithRemedy("publish and rent an exact job control snapshot before enabling remote jobs")
-	}
 	if c.opt.Rentals == nil {
 		return WorkerLaunchSpec{}, "", exit.Unavailablef("this Cozy daemon attaches no remote workers")
 	}
@@ -626,6 +622,30 @@ func (c *Orchestrator) resolveFor(req records.Request) (WorkerLaunchSpec, string
 		Package: logical.Package, Release: logical.Release, ReleaseDigest: logical.ReleaseDigest,
 	}}, models); e != nil {
 		return WorkerLaunchSpec{}, "", e
+	}
+	if req.IsJob() {
+		if len(req.Models) != 0 {
+			return WorkerLaunchSpec{}, "", exit.Named(exit.Unavailable,
+				"rental.modeled_job_unsupported", "remote jobs with model slots are not supported yet")
+		}
+		if e := c.waitPackageStaged(instance); e != nil {
+			return WorkerLaunchSpec{}, "", e
+		}
+		artifacts, e := decodeArtifactOutputs(req.ArtifactOutputs)
+		if e != nil {
+			return WorkerLaunchSpec{}, "", e
+		}
+		spec := WorkerLaunchSpec{Connection: remote.Connection, Placement: DesiredPlacement{
+			Package: pinnedPackage(req.Package, req.Worker), Release: req.Release,
+			PackageRevisionDigest: req.PackageRevisionDigest,
+			Jobs: []*JobPlan{{Function: req.Entrypoint, DescriptorID: req.PlanID,
+				Outputs:         strings.FieldsFunc(req.Outputs, func(r rune) bool { return r == ',' }),
+				ArtifactOutputs: artifacts, RSSCap: DefaultJobRSSCap, GPUCount: req.JobGPUCount}},
+		}}
+		if e := c.ConvergeRemoteJob(instance, spec); e != nil {
+			return WorkerLaunchSpec{}, "", e
+		}
+		return spec, req.PlanID, nil
 	}
 	spec, planID, e := c.ensureLogicalPackageReady(instance, req.Worker, logical)
 	if e != nil {
@@ -876,6 +896,14 @@ func (c *Orchestrator) maxOutputBytes() uint64 {
 func (c *Orchestrator) invocationIdentity(w *worker,
 	req records.Request) (packageRevision, environment, config string, e *exit.Error) {
 	packageRevision = w.spec.Placement.PackageRevisionDigest
+	if req.IsJob() && w.spec.Connection != nil {
+		if req.PackageRevisionDigest == "" || req.PackageRevisionDigest != packageRevision {
+			return "", "", "", exit.Named(exit.Conflict,
+				"request_invocation_identity_changed",
+				"worker %s no longer matches the job release pinned to request %s", w.instanceID, req.ID)
+		}
+		return packageRevision, "", "", nil
+	}
 	environment = w.spec.Placement.EnvironmentDigest
 	if environment == "" {
 		if w.spec.Connection == nil && w.spec.Placement.SourceDigest != "" {
@@ -1102,7 +1130,7 @@ func (c *Orchestrator) grantFor(req records.Request, attempt uint64, w *worker) 
 			return nil, e
 		}
 	}
-	if req.IsJob() {
+	if req.IsJob() && w.media == nil {
 		g, _, e := c.jobGrant(req, attempt)
 		return g, e
 	}

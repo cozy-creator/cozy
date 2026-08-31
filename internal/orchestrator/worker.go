@@ -804,6 +804,46 @@ func (c *Orchestrator) ensureLogicalPackageReady(instanceID, rentalID string,
 	}
 }
 
+func (c *Orchestrator) waitPackageStaged(instanceID string) *exit.Error {
+	silent := SilentReports * ReportCadence
+	for {
+		c.mu.Lock()
+		w := c.workers[instanceID]
+		ready := w != nil && !w.exited &&
+			w.acceptedRevision >= w.revision &&
+			w.materialization == pb.MaterializationState_MATERIALIZATION_STATE_STAGED
+		gone := w == nil || w.exited
+		quiet := time.Duration(0)
+		var refused, desiredRefusal *exit.Error
+		faulted := false
+		if w != nil {
+			refused, desiredRefusal, faulted = w.refusal, w.desiredRefusal, w.faulted
+			if !w.lastReport.IsZero() {
+				quiet = time.Since(w.lastReport)
+			} else if !w.spawned.IsZero() {
+				quiet = time.Since(w.spawned)
+			}
+		}
+		c.mu.Unlock()
+		switch {
+		case ready:
+			return nil
+		case refused != nil:
+			return refused
+		case desiredRefusal != nil:
+			return desiredRefusal
+		case faulted:
+			return exit.New(exit.Failed, "the rented worker refused package preparation")
+		case gone:
+			return exit.New(exit.Failed, "the rented worker exited while preparing the package")
+		case quiet > silent:
+			return exit.Named(exit.Failed, "worker_silent",
+				"the rented worker stopped reporting while preparing the package")
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+}
+
 func validDigest(value string) bool {
 	_, err := canonical.Raw(value)
 	return err == nil
