@@ -98,7 +98,7 @@ func handleRent(ctx *Context) *exit.Error {
 	}
 	defer st.Close()
 	fleet := &managedRentals{ctx: ctx, layout: l, store: st}
-	line, e := fleet.admit(skuName)
+	line, hourlyRate, e := fleet.admit(skuName)
 	if e != nil {
 		return e
 	}
@@ -120,7 +120,7 @@ func handleRent(ctx *Context) *exit.Error {
 	}
 
 	row, attachable, replay, e := acquireRental(ctx, l, st, skuName, requestedMachineName,
-		operationKey, reason, deadline, "")
+		operationKey, reason, hourlyRate, ctx.Cfg.RentalsMaxHourlySpendUSDMicros, deadline, "")
 	if e != nil {
 		return e
 	}
@@ -170,7 +170,8 @@ func handleRent(ctx *Context) *exit.Error {
 // `cozy run --rental`. It returns only after the immutable retail rate and the
 // worker's authenticated attach projection are durable locally.
 func acquireRental(ctx *Context, l home.Layout, st *records.Store, skuName, requestedMachineName,
-	operationKey, reason string, deadline time.Time, managedRequestID string,
+	operationKey, reason string, hourlyRateUSDMicros, fleetCapUSDMicros int64,
+	deadline time.Time, managedRequestID string,
 ) (records.Rental, hub.Rental, bool, *exit.Error) {
 	c := client(ctx)
 	existing, e := st.RentalOperation(operationKey)
@@ -211,12 +212,13 @@ func acquireRental(ctx *Context, l home.Layout, st *records.Store, skuName, requ
 	digest := rentalRequestDigest(c.Base(), requestBody)
 	op, replay, e := st.BeginRentalOperation(records.RentalOperation{
 		Key: operationKey, RequestDigest: digest, RequestBody: requestBody,
-		Hub: c.Base(), Reason: reason,
-	})
+		Hub: c.Base(), Reason: reason, HourlyRateUSDMicros: hourlyRateUSDMicros,
+	}, fleetCapUSDMicros)
 	if e != nil {
 		return records.Rental{}, hub.Rental{}, false, e
 	}
-	if op.RequestDigest != digest || op.Hub != c.Base() || !bytes.Equal(op.RequestBody, requestBody) {
+	if op.RequestDigest != digest || op.Hub != c.Base() || op.HourlyRateUSDMicros != hourlyRateUSDMicros ||
+		!bytes.Equal(op.RequestBody, requestBody) {
 		return records.Rental{}, hub.Rental{}, false, exit.Named(exit.Conflict, "rental.idempotency_conflict",
 			"rental operation %s already names a different hub or request body", operationKey).
 			WithRemedy("reuse a key only for the exact same hub, GPU SKU, media token, and Creator key")
@@ -239,6 +241,11 @@ func acquireRental(ctx *Context, l home.Layout, st *records.Store, skuName, requ
 	}
 	if e := st.AdvanceRentalOperation(operationKey, remote.ID, remote.State); e != nil {
 		return records.Rental{}, hub.Rental{}, false, e
+	}
+	if remote.HourlyRateUSDMicros != hourlyRateUSDMicros {
+		return records.Rental{}, hub.Rental{}, false, exit.Named(exit.Conflict, "rental.hourly_rate_changed",
+			"rental %s locked %d USD micros/hour, not catalog rate %d",
+			remote.ID, remote.HourlyRateUSDMicros, hourlyRateUSDMicros)
 	}
 	machineName := requestedMachineName
 	if machineName == "" {

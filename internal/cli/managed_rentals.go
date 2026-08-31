@@ -2,7 +2,6 @@ package cli
 
 import (
 	"fmt"
-	"math"
 	"sort"
 	"strings"
 	"sync"
@@ -36,26 +35,26 @@ func (m *managedRentals) status() (string, *exit.Error) {
 	return m.lineLocked()
 }
 
-func (m *managedRentals) admit(skuName string) (string, *exit.Error) {
+func (m *managedRentals) admit(skuName string) (string, int64, *exit.Error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if problem := m.reconcileLocked(); problem != nil {
-		return "", problem
+		return "", 0, problem
 	}
 	line, problem := m.lineLocked()
 	if problem != nil {
-		return "", problem
+		return "", 0, problem
 	}
 	skus, problem := m.catalogLocked()
 	if problem != nil {
-		return "", problem
+		return "", 0, problem
 	}
 	for _, sku := range skus {
 		if sku.Name == skuName {
-			return line, m.admitLocked(sku)
+			return line, sku.PriceUSDMicrosPerHour, m.admitLocked(sku)
 		}
 	}
-	return "", exit.Named(exit.Validation, "rental.sku_unavailable",
+	return "", 0, exit.Named(exit.Validation, "rental.sku_unavailable",
 		"Tensorhub currently offers no rental SKU %q", skuName)
 }
 
@@ -128,7 +127,8 @@ func (m *managedRentals) acquire(req records.Request) (string, string, *exit.Err
 	}
 	fmt.Fprintf(m.ctx.Out, "rentals: renting %s at %s\n", sku.Name, usdPerHour(sku.PriceUSDMicrosPerHour))
 	row, _, _, problem := acquireRental(m.ctx, m.layout, m.store, sku.Name, "",
-		"managed-rental-"+req.ID, "cozy run --rental "+req.Package, time.Time{}, req.ID)
+		"managed-rental-"+req.ID, "cozy run --rental "+req.Package,
+		sku.PriceUSDMicrosPerHour, m.ctx.Cfg.RentalsMaxHourlySpendUSDMicros, time.Time{}, req.ID)
 	if problem != nil {
 		return "", "", problem
 	}
@@ -348,18 +348,11 @@ func (m *managedRentals) lineLocked() (string, *exit.Error) {
 }
 
 func (m *managedRentals) totalsLocked() (int, int64, *exit.Error) {
-	rows, problem := m.store.Rentals()
-	if problem != nil {
+	count, burn, problem := m.store.RentalFleetTotals()
+	if problem != nil || burn < 0 {
 		return 0, 0, problem
 	}
-	var burn int64
-	for _, row := range rows {
-		if row.HourlyRateUSDMicros <= 0 || burn > math.MaxInt64-row.HourlyRateUSDMicros {
-			return 0, 0, exit.Internalf("rental fleet hourly burn is invalid")
-		}
-		burn += row.HourlyRateUSDMicros
-	}
-	return len(rows), burn, nil
+	return count, burn, nil
 }
 
 func usdPerHour(micros int64) string {

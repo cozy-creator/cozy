@@ -26,6 +26,7 @@ CREATE TABLE IF NOT EXISTS rental_operations (
   request_body     BLOB NOT NULL,
   hub              TEXT NOT NULL,
   reason           TEXT NOT NULL,
+  hourly_rate_usd_micros INTEGER NOT NULL,
   rental_id        TEXT NOT NULL DEFAULT '',
   state            TEXT NOT NULL,
   created_at       TEXT NOT NULL,
@@ -77,47 +78,74 @@ func rentalStateForward(current, next string) string {
 // the POST: the operation key and its 0600 token survive a lost response, so retry can
 // ask for the same provider obligation instead of buying a second one.
 type RentalOperation struct {
-	Key           string
-	RequestDigest string
-	RequestBody   []byte
-	Hub           string
-	Reason        string
-	RentalID      string
-	State         string
-	CreatedAt     string
-	UpdatedAt     string
+	Key                 string
+	RequestDigest       string
+	RequestBody         []byte
+	Hub                 string
+	Reason              string
+	HourlyRateUSDMicros int64
+	RentalID            string
+	State               string
+	CreatedAt           string
+	UpdatedAt           string
 }
 
-const rentalOperationCols = `operation_key,request_digest,request_body,hub,reason,rental_id,state,created_at,updated_at`
+const rentalOperationCols = `operation_key,request_digest,request_body,hub,reason,hourly_rate_usd_micros,rental_id,state,created_at,updated_at`
 
 func scanRentalOperation(row interface{ Scan(...any) error }) (RentalOperation, error) {
 	var op RentalOperation
-	err := row.Scan(&op.Key, &op.RequestDigest, &op.RequestBody, &op.Hub, &op.Reason,
+	err := row.Scan(&op.Key, &op.RequestDigest, &op.RequestBody, &op.Hub, &op.Reason, &op.HourlyRateUSDMicros,
 		&op.RentalID, &op.State, &op.CreatedAt, &op.UpdatedAt)
 	return op, err
 }
 
 // BeginRentalOperation durably installs the caller's operation identity. A replay returns
 // the existing row; the caller compares RequestDigest before making any network call.
-func (s *Store) BeginRentalOperation(op RentalOperation) (RentalOperation, bool, *exit.Error) {
+func (s *Store) BeginRentalOperation(op RentalOperation, fleetCapUSDMicros int64) (RentalOperation, bool, *exit.Error) {
 	stamp := now()
-	res, err := s.db.Exec(`INSERT INTO rental_operations(`+rentalOperationCols+`)
-		VALUES(?,?,?,?,?,?,?,?,?) ON CONFLICT(operation_key) DO NOTHING`,
-		op.Key, op.RequestDigest, op.RequestBody, op.Hub, op.Reason,
-		op.RentalID, "pending_acquisition", stamp, stamp)
+	tx, err := s.db.Begin()
 	if err != nil {
+		return RentalOperation{}, false, exit.Internalf("cannot begin rental operation: %s", err)
+	}
+	defer tx.Rollback()
+	stored, err := scanRentalOperation(tx.QueryRow(
+		`SELECT `+rentalOperationCols+` FROM rental_operations WHERE operation_key=?`, op.Key))
+	if err == nil {
+		if err := tx.Commit(); err != nil {
+			return RentalOperation{}, false, exit.Internalf("cannot read replayed rental operation: %s", err)
+		}
+		return stored, true, nil
+	}
+	if !errors.Is(err, sql.ErrNoRows) {
+		return RentalOperation{}, false, exit.Internalf("cannot read rental operation: %s", err)
+	}
+	if op.HourlyRateUSDMicros <= 0 || fleetCapUSDMicros <= 0 {
+		return RentalOperation{}, false, exit.Named(exit.Usage, "rental.spend_cap_required",
+			"a positive locked hourly rate and rentals.max_hourly_spend_usd are required")
+	}
+	count, burn, problem := rentalFleetTotals(tx)
+	if problem != nil {
+		return RentalOperation{}, false, problem
+	}
+	if burn > fleetCapUSDMicros || op.HourlyRateUSDMicros > fleetCapUSDMicros-burn {
+		return RentalOperation{}, false, exit.Named(exit.Capacity, "rental.fleet_spend_cap",
+			"%d potentially billing rental(s) already reserve %d USD micros/hour; the next %d would exceed %d",
+			count, burn, op.HourlyRateUSDMicros, fleetCapUSDMicros)
+	}
+	if _, err := tx.Exec(`INSERT INTO rental_operations(`+rentalOperationCols+`)
+		VALUES(?,?,?,?,?,?,?,?,?,?)`, op.Key, op.RequestDigest, op.RequestBody, op.Hub, op.Reason,
+		op.HourlyRateUSDMicros, op.RentalID, "pending_acquisition", stamp, stamp); err != nil {
 		return RentalOperation{}, false, exit.Internalf("cannot record rental operation: %s", err)
 	}
-	inserted, err := res.RowsAffected()
-	if err != nil {
-		return RentalOperation{}, false, exit.Internalf("cannot read rental operation result: %s", err)
-	}
-	stored, err := scanRentalOperation(s.db.QueryRow(
+	stored, err = scanRentalOperation(tx.QueryRow(
 		`SELECT `+rentalOperationCols+` FROM rental_operations WHERE operation_key=?`, op.Key))
 	if err != nil {
 		return RentalOperation{}, false, exit.Internalf("cannot read rental operation: %s", err)
 	}
-	return stored, inserted == 0, nil
+	if err := tx.Commit(); err != nil {
+		return RentalOperation{}, false, exit.Internalf("cannot commit rental operation: %s", err)
+	}
+	return stored, false, nil
 }
 
 func (s *Store) RentalOperation(key string) (*RentalOperation, *exit.Error) {
@@ -489,6 +517,29 @@ func (s *Store) Rentals() ([]Rental, *exit.Error) {
 		out = append(out, r)
 	}
 	return out, nil
+}
+
+// RentalFleetTotals counts each potentially billing obligation once. A rental
+// operation with no local rental row covers the response-loss window; once its
+// row exists, the immutable row rate replaces that reservation in the sum.
+func (s *Store) RentalFleetTotals() (count int, hourlyRateUSDMicros int64, problem *exit.Error) {
+	return rentalFleetTotals(s.db)
+}
+
+func rentalFleetTotals(q interface{ QueryRow(string, ...any) *sql.Row }) (int, int64, *exit.Error) {
+	var count int
+	var burn int64
+	err := q.QueryRow(`SELECT COUNT(*),COALESCE(SUM(hourly_rate_usd_micros),0) FROM (
+		SELECT id AS identity,hourly_rate_usd_micros FROM rentals
+		UNION ALL
+		SELECT o.operation_key,o.hourly_rate_usd_micros FROM rental_operations o
+		LEFT JOIN rentals r ON r.id=o.rental_id
+		WHERE o.state NOT IN ('released','rejected') AND r.id IS NULL
+	)`).Scan(&count, &burn)
+	if err != nil {
+		return 0, 0, exit.Internalf("cannot total the rental fleet: %s", err)
+	}
+	return count, burn, nil
 }
 
 // RentalRunCounts derives the current queue and active-attempt counts for one machine.

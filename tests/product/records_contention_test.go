@@ -84,6 +84,38 @@ func TestRecordsRefusesOtherVersionWithoutMutation(t *testing.T) {
 	}
 }
 
+func TestRentalOperationReservesFleetRateAcrossStoreConnections(t *testing.T) {
+	path := t.TempDir() + "/records.db"
+	first, problem := records.Open(path)
+	fatal(t, problem)
+	defer first.Close()
+	second, problem := records.Open(path)
+	fatal(t, problem)
+	defer second.Close()
+	operation := records.RentalOperation{
+		Key: "managed-rental-one", RequestDigest: "digest-one", RequestBody: []byte(`{"sku":"gpu"}`),
+		Hub: "https://tensorhub.test", Reason: "proof", HourlyRateUSDMicros: 750_000,
+	}
+	stored, replay, problem := first.BeginRentalOperation(operation, 1_000_000)
+	if problem != nil || replay || stored.HourlyRateUSDMicros != 750_000 {
+		t.Fatalf("first reservation = %+v replay=%v problem=%v", stored, replay, problem)
+	}
+	other := operation
+	other.Key, other.RequestDigest = "managed-rental-two", "digest-two"
+	if _, _, problem := second.BeginRentalOperation(other, 1_000_000); problem == nil ||
+		problem.ErrName() != "rental.fleet_spend_cap" {
+		t.Fatalf("second connection crossed the fleet ceiling: %v", problem)
+	}
+	if stored, replay, problem = second.BeginRentalOperation(operation, 0); problem != nil || !replay {
+		t.Fatalf("existing paid operation did not resume after cap changed: %+v replay=%v problem=%v",
+			stored, replay, problem)
+	}
+	count, burn, problem := first.RentalFleetTotals()
+	if problem != nil || count != 1 || burn != 750_000 {
+		t.Fatalf("reserved fleet totals = %d, %d, %v", count, burn, problem)
+	}
+}
+
 func TestRecordsRefusesV1ShapeDrift(t *testing.T) {
 	path := t.TempDir() + "/records.db"
 	store, problem := records.Open(path)
