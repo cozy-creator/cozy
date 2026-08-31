@@ -21,6 +21,7 @@ func TestPublishedPackageEnvironmentsKeepPythonAndTorchIndependent(t *testing.T)
 		torch  string
 	}
 	var environments []installed
+	var oldProject, oldProjectWheel, newTorchWheel string
 	for _, fixture := range []struct {
 		name, python, torch string
 	}{
@@ -47,6 +48,12 @@ func TestPublishedPackageEnvironmentsKeepPythonAndTorchIndependent(t *testing.T)
 		torchWheel, problem := wheel.Build(wheel.Request{Context: context.Background(),
 			Tree: torchProject, OutDir: filepath.Join(root, "torch-wheel")})
 		fatal(t, problem)
+		if fixture.name == "old" {
+			oldProject, oldProjectWheel = project, projectWheel.Path
+		} else {
+			newTorchWheel = torchWheel.Path
+		}
+		must(t, os.RemoveAll(torchProject))
 
 		environment := filepath.Join(root, "environment")
 		receipt, problem := install.MaterializePublishedEnvironment(project, environment,
@@ -68,6 +75,13 @@ func TestPublishedPackageEnvironmentsKeepPythonAndTorchIndependent(t *testing.T)
 	}
 	if environments[0] == environments[1] {
 		t.Fatalf("incompatible package environments collapsed together: %+v", environments)
+	}
+	_, problem := install.MaterializePublishedEnvironment(oldProject, filepath.Join(t.TempDir(), "bad"),
+		install.PublishedWheel{Distribution: "package-old", Path: oldProjectWheel},
+		[]install.PublishedWheel{{Distribution: "torch", Path: newTorchWheel}})
+	if problem == nil || problem.Name != "package_requirement_incompatible" ||
+		!strings.Contains(problem.Message, "torch==1.0.0") {
+		t.Fatalf("true locked conflict did not name its exact requirement: %#v", problem)
 	}
 }
 

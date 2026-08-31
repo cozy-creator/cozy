@@ -105,7 +105,17 @@ func MaterializePublishedEnvironment(sourceDir, venvDir string, project Publishe
 		Platform:   runtime.GOOS + "/" + runtime.GOARCH,
 		UV:         toolVersion("uv", "--version"),
 	}
-	args := []string{"sync", "--locked", "--no-progress", "--no-install-project"}
+	if problem := runUV(sourceDir, config.Frozen().Tool(), "package_python_incompatible",
+		"the package Python requirement cannot select an interpreter",
+		"venv", "--no-progress", venvDir); problem != nil {
+		return nil, problem
+	}
+	requirements := filepath.Join(filepath.Dir(venvDir), "locked-requirements.txt")
+	// Published local/workspace sources are represented by their exact wheels, not by the
+	// author's paths. Export the committed lock without reopening those unavailable paths;
+	// the final pip check joins the wheel requirements back to this frozen registry closure.
+	args := []string{"export", "--frozen", "--no-dev", "--no-emit-project",
+		"--format", "requirements.txt", "--output-file", requirements, "--no-progress"}
 	seen := map[string]bool{}
 	for _, wheel := range dependencies {
 		name := strings.TrimSpace(wheel.Distribution)
@@ -113,10 +123,16 @@ func MaterializePublishedEnvironment(sourceDir, venvDir string, project Publishe
 			continue
 		}
 		seen[name] = true
-		args = append(args, "--no-install-package", name)
+		args = append(args, "--no-emit-package", name)
 	}
-	if problem := runUV(sourceDir, append(config.Frozen().Tool(),
-		"UV_PROJECT_ENVIRONMENT="+venvDir), args...); problem != nil {
+	if problem := runUV(sourceDir, config.Frozen().Tool(), "locked_environment_refused",
+		"the published lock cannot export its exact registry closure", args...); problem != nil {
+		return nil, problem
+	}
+	if problem := runUV(sourceDir, config.Frozen().Tool(), "locked_environment_refused",
+		"the exact registry closure is incompatible with the selected Python environment",
+		"pip", "install", "--no-deps", "--require-hashes", "--python",
+		home.VenvPython(venvDir), "--requirements", requirements); problem != nil {
 		return nil, problem
 	}
 	wheels := append([]PublishedWheel{project}, dependencies...)
@@ -125,10 +141,12 @@ func MaterializePublishedEnvironment(sourceDir, venvDir string, project Publishe
 	for _, wheel := range wheels {
 		args = append(args, wheel.Path)
 	}
-	if problem := runUV(sourceDir, config.Frozen().Tool(), args...); problem != nil {
+	if problem := runUV(sourceDir, config.Frozen().Tool(), "package_wheel_incompatible",
+		"an exact published wheel is incompatible with the selected Python environment", args...); problem != nil {
 		return nil, problem
 	}
-	if problem := runUV(sourceDir, config.Frozen().Tool(), "pip", "check", "--python",
+	if problem := runUV(sourceDir, config.Frozen().Tool(), "package_requirement_incompatible",
+		"the installed package requirements are not satisfied", "pip", "check", "--python",
 		home.VenvPython(venvDir)); problem != nil {
 		return nil, problem
 	}
@@ -137,16 +155,15 @@ func MaterializePublishedEnvironment(sourceDir, venvDir string, project Publishe
 	return env, nil
 }
 
-func runUV(dir string, env []string, args ...string) *exit.Error {
+func runUV(dir string, env []string, code, message string, args ...string) *exit.Error {
 	cmd := exec.Command("uv", args...)
 	cmd.Dir = dir
 	cmd.Env = env
 	var out strings.Builder
 	cmd.Stdout, cmd.Stderr = &out, &out
 	if err := cmd.Run(); err != nil {
-		return exit.Named(exit.Structural, "package_environment_refused",
-			"`uv %s` refused the package environment", strings.Join(args, " ")).
-			WithRemedy("uv said: %s", condense(out.String())).
+		return exit.Named(exit.Validation, code, "%s: %s", message, condense(out.String())).
+			WithRemedy("fix the named requirement or wheel and publish a new locked release").
 			WithNext("cozy help package install")
 	}
 	return nil

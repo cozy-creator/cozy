@@ -111,9 +111,6 @@ func (c *dependencyCollector) collectProject(root string, document projectMetada
 				"project dependency %q uses a direct URL", raw).
 				WithRemedy("publish the distribution to an index or use a local path/workspace source")
 		}
-		if remoteBaseRoots[req.name] {
-			continue
-		}
 		source, exists := sources[req.name]
 		if !exists {
 			c.registry = true

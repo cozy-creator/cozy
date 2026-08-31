@@ -455,8 +455,8 @@ func TestPackagePublishBuildsBoundedLocalDependencyClosure(t *testing.T) {
 		fatal(t, problem)
 		wheels[identity.Distribution] = identity.Version
 	}
-	if len(pack.DependencyWheels) != 3 || wheels["local-b"] != "2.1.0" ||
-		wheels["local-c"] != "3.0.0" || wheels["cozy-runtime"] != "" || //cozy:allow distribution assertion, not executable access
+	if len(pack.DependencyWheels) != 4 || wheels["local-b"] != "2.1.0" ||
+		wheels["local-c"] != "3.0.0" || wheels["cozy-runtime"] != "0.0.11" || //cozy:allow distribution assertion, not executable access
 		wheels["typing-extensions"] == "" { //cozy:allow distribution assertion, not executable access
 		t.Fatalf("package dependency closure omitted an ordinary library: %+v", pack.DependencyWheels)
 	}
@@ -467,12 +467,6 @@ func TestPackagePublishBuildsBoundedLocalDependencyClosure(t *testing.T) {
 		if info, err := os.Stat(dependency.Path); err != nil || !info.Mode().IsRegular() {
 			t.Fatalf("dependency wheel is not a staged regular file: %+v err=%v", dependency, err)
 		}
-	}
-
-	// The closed shared-base contract omits the local source candidate. Runtime
-	// validates the requirement against the actual base before installation.
-	if wheels["cozy-runtime"] != "" { //cozy:allow distribution assertion, not executable access
-		t.Fatalf("rental-base Runtime candidate entered the package wheels: %+v", pack.DependencyWheels)
 	}
 
 	writePublishProject(t, a, "local-a", "1.0.0", []string{"local-b>=3"},
