@@ -487,7 +487,8 @@ func publishProductionArtifact(ctx *Context, local *localclient.Client,
 	}
 	hctx, cancel = hub.LongContext()
 	prepared, problem := client(ctx).FinalizePublication(hctx, ref, publicationOperation,
-		hub.FinalizePublicationRequest{Manifest: artifact.ManifestID,
+		hub.FinalizePublicationRequest{ManifestID: artifact.ManifestID,
+			ManifestLength:        artifact.ManifestLength,
 			ReleaseEvidenceBase64: base64.StdEncoding.EncodeToString(artifact.ReleaseEvidence)}, reason)
 	cancel()
 	if problem != nil {

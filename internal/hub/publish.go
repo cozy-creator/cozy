@@ -147,7 +147,8 @@ func (c *Client) GrantKnownTransfers(ctx context.Context, ref Ref, operation str
 }
 
 type FinalizePublicationRequest struct {
-	Manifest              string `json:"manifest"`
+	ManifestID            string `json:"manifest_id"`
+	ManifestLength        int64  `json:"manifest_length"`
 	ReleaseEvidenceBase64 string `json:"release_evidence_base64"`
 }
 
