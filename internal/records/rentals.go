@@ -51,7 +51,7 @@ CREATE TABLE IF NOT EXISTS rentals (
   media_address     TEXT NOT NULL DEFAULT '',
   expected_worker_id         TEXT NOT NULL DEFAULT '',
   expected_worker_boot_id    TEXT NOT NULL DEFAULT ''
-, wheelhouse_manifest_digest TEXT NOT NULL DEFAULT '')`
+)`
 
 var rentalSchema = []string{rentalOperationsDDL, rentalsDDL, `
 CREATE UNIQUE INDEX IF NOT EXISTS rental_operation_remote
@@ -294,20 +294,19 @@ type Rental struct {
 	// MediaAddress is where the pod's co-resident media server answers (cl-014). It is a
 	// FACT about the pod like the control address is, so it is a row and not a file; the
 	// credential it takes is the rental's media bearer, which stays 0600 beside it.
-	MediaAddress             string
-	ExpectedWorkerID         string
-	ExpectedWorkerBootID     string
-	WheelhouseManifestDigest string
+	MediaAddress         string
+	ExpectedWorkerID     string
+	ExpectedWorkerBootID string
 }
 
-const rentalCols = `id,machine_name,sku,accelerator_model,hourly_rate_usd_micros,managed_request_id,address,cert_path,state,hub,rented_at,media_address,expected_worker_id,expected_worker_boot_id,wheelhouse_manifest_digest`
+const rentalCols = `id,machine_name,sku,accelerator_model,hourly_rate_usd_micros,managed_request_id,address,cert_path,state,hub,rented_at,media_address,expected_worker_id,expected_worker_boot_id`
 
 func scanRental(row interface{ Scan(...any) error }) (Rental, error) {
 	var r Rental
 	err := row.Scan(&r.ID, &r.MachineName, &r.SKU, &r.AcceleratorModel,
 		&r.HourlyRateUSDMicros, &r.ManagedRequestID, &r.Address, &r.CertPath,
 		&r.State, &r.Hub, &r.RentedAt, &r.MediaAddress,
-		&r.ExpectedWorkerID, &r.ExpectedWorkerBootID, &r.WheelhouseManifestDigest)
+		&r.ExpectedWorkerID, &r.ExpectedWorkerBootID)
 	return r, err
 }
 
@@ -379,7 +378,7 @@ func (s *Store) RecordRental(r Rental) *exit.Error {
 		r.State = rentalStateForward(current, r.State)
 	}
 	if _, err := tx.Exec(`INSERT INTO rentals(`+rentalCols+`)
-			VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+			VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)
 		ON CONFLICT(id) DO UPDATE SET
 		  machine_name=CASE WHEN rentals.machine_name<>'' THEN rentals.machine_name ELSE excluded.machine_name END,
 		  sku=CASE WHEN rentals.sku<>'' THEN rentals.sku ELSE excluded.sku END,
@@ -392,13 +391,10 @@ func (s *Store) RecordRental(r Rental) *exit.Error {
 		  expected_worker_id=CASE WHEN rentals.expected_worker_id<>''
 		    THEN rentals.expected_worker_id ELSE excluded.expected_worker_id END,
 		  expected_worker_boot_id=CASE WHEN rentals.expected_worker_boot_id<>''
-		    THEN rentals.expected_worker_boot_id ELSE excluded.expected_worker_boot_id END,
-		  wheelhouse_manifest_digest=CASE WHEN rentals.wheelhouse_manifest_digest<>''
-		    THEN rentals.wheelhouse_manifest_digest ELSE excluded.wheelhouse_manifest_digest END`,
+		    THEN rentals.expected_worker_boot_id ELSE excluded.expected_worker_boot_id END`,
 		r.ID, r.MachineName, r.SKU, r.AcceleratorModel, r.HourlyRateUSDMicros, r.ManagedRequestID,
 		r.Address, r.CertPath, r.State, r.Hub,
-		r.RentedAt, r.MediaAddress, r.ExpectedWorkerID, r.ExpectedWorkerBootID,
-		r.WheelhouseManifestDigest); err != nil {
+		r.RentedAt, r.MediaAddress, r.ExpectedWorkerID, r.ExpectedWorkerBootID); err != nil {
 		return exit.Internalf("cannot record rental %s: %s", r.ID, err)
 	}
 	stored, err := scanRental(tx.QueryRow(`SELECT `+rentalCols+` FROM rentals WHERE id=?`, r.ID))
@@ -411,11 +407,9 @@ func (s *Store) RecordRental(r Rental) *exit.Error {
 		r.MediaAddress != "" && stored.MediaAddress != r.MediaAddress ||
 		r.CertPath != "" && stored.CertPath != r.CertPath ||
 		r.ExpectedWorkerID != "" && stored.ExpectedWorkerID != r.ExpectedWorkerID ||
-		r.ExpectedWorkerBootID != "" && stored.ExpectedWorkerBootID != r.ExpectedWorkerBootID ||
-		r.WheelhouseManifestDigest != "" &&
-			stored.WheelhouseManifestDigest != r.WheelhouseManifestDigest {
+		r.ExpectedWorkerBootID != "" && stored.ExpectedWorkerBootID != r.ExpectedWorkerBootID {
 		return exit.Named(exit.Conflict, "rental.attach_projection_conflict",
-			"rental %s already carries another address, media address, certificate pin, or wheelhouse", r.ID)
+			"rental %s already carries another address, media address, certificate pin, or worker identity", r.ID)
 	}
 	if err := tx.Commit(); err != nil {
 		return exit.Internalf("cannot commit rental %s: %s", r.ID, err)

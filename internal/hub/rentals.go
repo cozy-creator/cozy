@@ -71,9 +71,8 @@ type Rental struct {
 	// MediaTokenSHA256 is the pod media plane's LIVE credential set, as hashes. It is here so this host can
 	// see that the hash of the token it minted is one the pod was provisioned with —
 	// a comparison neither end can make by saying the token.
-	MediaTokenSHA256         []string
-	HourlyRateUSDMicros      int64
-	WheelhouseManifestDigest string
+	MediaTokenSHA256    []string
+	HourlyRateUSDMicros int64
 }
 
 // ExactDocument is the package descriptor returned with exact wheel downloads.
@@ -108,23 +107,21 @@ func (r Rental) HoldsMediaHash(hash string) bool {
 
 // wireRental is the answer's own shape.
 type wireRental struct {
-	ID                       string   `json:"rental_id"`
-	State                    string   `json:"state"`
-	AcceleratorModel         string   `json:"requested_accelerator_model"`
-	WorkerAddress            string   `json:"worker_address"`
-	CertPEM                  string   `json:"cert_pem"`
-	Detail                   string   `json:"detail"`
-	MediaAddress             string   `json:"media_address"`
-	WorkerID                 string   `json:"worker_id"`
-	WorkerBootID             string   `json:"worker_boot_id"`
-	CreatorPublicKey         string   `json:"creator_public_key"`
-	MediaTokenSHA256         []string `json:"media_token_sha256"`
-	HourlyRateUSDMicros      int64    `json:"hourly_rate_usd_micros"`
-	WheelhouseManifestDigest string   `json:"wheelhouse_manifest_digest"`
+	ID                  string   `json:"rental_id"`
+	State               string   `json:"state"`
+	AcceleratorModel    string   `json:"requested_accelerator_model"`
+	WorkerAddress       string   `json:"worker_address"`
+	CertPEM             string   `json:"cert_pem"`
+	Detail              string   `json:"detail"`
+	MediaAddress        string   `json:"media_address"`
+	WorkerID            string   `json:"worker_id"`
+	WorkerBootID        string   `json:"worker_boot_id"`
+	CreatorPublicKey    string   `json:"creator_public_key"`
+	MediaTokenSHA256    []string `json:"media_token_sha256"`
+	HourlyRateUSDMicros int64    `json:"hourly_rate_usd_micros"`
 }
 
 var bareSHA256Pattern = regexp.MustCompile(`^[0-9a-f]{64}$`)
-var sha256IDPattern = regexp.MustCompile(`^sha256:[0-9a-f]{64}$`)
 var computeCapabilityPattern = regexp.MustCompile(`^[0-9]+\.[0-9]+$`)
 
 const maxRentalResponseBytes = 1 << 20
@@ -145,10 +142,9 @@ func (w wireRental) rental() Rental {
 		Address:          w.WorkerAddress, CertPEM: w.CertPEM,
 		Detail: w.Detail, MediaAddress: w.MediaAddress,
 		WorkerID: w.WorkerID, WorkerBootID: w.WorkerBootID,
-		CreatorPublicKey:         w.CreatorPublicKey,
-		MediaTokenSHA256:         w.MediaTokenSHA256,
-		HourlyRateUSDMicros:      w.HourlyRateUSDMicros,
-		WheelhouseManifestDigest: w.WheelhouseManifestDigest,
+		CreatorPublicKey:    w.CreatorPublicKey,
+		MediaTokenSHA256:    w.MediaTokenSHA256,
+		HourlyRateUSDMicros: w.HourlyRateUSDMicros,
 	}
 }
 
@@ -184,8 +180,8 @@ func RentalRequestBytes(sku, mediaTokenSHA256, creatorPublicKey string) ([]byte,
 }
 
 // ParseRentalRequestBytes reopens the exact persisted paid intent. Acquisition replay
-// derives compatibility only from these bytes; mutable caller arguments never replace
-// the package-set decision that was durably recorded before the POST.
+// derives the paid machine choice only from these bytes; mutable caller arguments never
+// replace the SKU decision that was durably recorded before the POST.
 func ParseRentalRequestBytes(raw []byte) (RentalRequest, *exit.Error) {
 	var req RentalRequest
 	decoder := json.NewDecoder(bytes.NewReader(raw))
@@ -278,10 +274,6 @@ func (w wireRental) named(what string) *exit.Error {
 		return exit.Named(exit.Conflict, "hub.rental_hourly_rate_missing",
 			"the hub %s without a positive locked Cozy retail hourly rate", what).
 			WithRemedy("upgrade Tensorhub before accepting a rental")
-	}
-	if !sha256IDPattern.MatchString(w.WheelhouseManifestDigest) {
-		return exit.Named(exit.Conflict, "hub.rental_wheelhouse_manifest_missing",
-			"the hub %s without one exact selected WheelhouseManifest digest", what)
 	}
 	return validateRentalID(w.ID)
 }

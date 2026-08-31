@@ -32,7 +32,6 @@ func TestRentalRunAcquiresCheapestOnceAndReleasesFailedPreAttempt(t *testing.T) 
 	var mu sync.Mutex
 	var descriptor []byte
 	var descriptorDigest string
-	activeManifestDigest := "sha256:" + strings.Repeat("a", 64)
 	var packageConfig, publishedWheel []byte
 	var publishedWheelFact wheel.Identity
 	var publishedWheelDigest string
@@ -178,7 +177,6 @@ func TestRentalRunAcquiresCheapestOnceAndReleasesFailedPreAttempt(t *testing.T) 
 			_ = json.NewEncoder(w).Encode(map[string]any{
 				"rental_id": activeRentalID, "state": "pending_acquisition",
 				"requested_accelerator_model": accelerator, "hourly_rate_usd_micros": rate,
-				"wheelhouse_manifest_digest": activeManifestDigest,
 			})
 		case r.Method == http.MethodDelete && r.URL.Path == "/v1/rentals/"+activeRentalID:
 			deletes++
@@ -188,13 +186,11 @@ func TestRentalRunAcquiresCheapestOnceAndReleasesFailedPreAttempt(t *testing.T) 
 			_ = json.NewEncoder(w).Encode(map[string]any{
 				"rental_id": "pr-idle-h200", "state": "ready",
 				"requested_accelerator_model": "H200", "hourly_rate_usd_micros": 6_000_000,
-				"wheelhouse_manifest_digest": activeManifestDigest,
 			})
 		case r.Method == http.MethodGet && r.URL.Path == "/v1/rentals/pr-idle-cpu-old":
 			_ = json.NewEncoder(w).Encode(map[string]any{
 				"rental_id": "pr-idle-cpu-old", "state": "ready",
 				"requested_accelerator_model": "CPU", "hourly_rate_usd_micros": 70_000,
-				"wheelhouse_manifest_digest": "sha256:" + strings.Repeat("f", 64),
 			})
 		case r.Method == http.MethodGet && r.URL.Path == "/v1/rentals/"+activeRentalID:
 			state := "ready"
@@ -208,7 +204,6 @@ func TestRentalRunAcquiresCheapestOnceAndReleasesFailedPreAttempt(t *testing.T) 
 			answer := map[string]any{
 				"rental_id": activeRentalID, "state": state,
 				"requested_accelerator_model": accelerator, "hourly_rate_usd_micros": rate,
-				"wheelhouse_manifest_digest": activeManifestDigest,
 			}
 			if state == "ready" {
 				answer["worker_address"] = "127.0.0.1:9443"
@@ -260,8 +255,7 @@ func TestRentalRunAcquiresCheapestOnceAndReleasesFailedPreAttempt(t *testing.T) 
 	fatal(t, problem)
 	fatal(t, store.RecordRental(records.Rental{ID: "pr-idle-cpu-old",
 		MachineName: "idle-cpu-old", SKU: "cpu", AcceleratorModel: "CPU",
-		HourlyRateUSDMicros: 70_000, State: "ready", Hub: server.URL,
-		WheelhouseManifestDigest: "sha256:" + strings.Repeat("f", 64)}))
+		HourlyRateUSDMicros: 70_000, State: "ready", Hub: server.URL}))
 	store.Close()
 	daemonPath := filepath.Join(root, "cozy-daemon")
 	must(t, os.Symlink(cozyBin, daemonPath))
@@ -459,7 +453,6 @@ func TestRentalRunAcquiresCheapestOnceAndReleasesFailedPreAttempt(t *testing.T) 
 	fatal(t, store.RecordRental(records.Rental{
 		ID: "pr-idle-h200", MachineName: "idle-h200", SKU: "h200", AcceleratorModel: "H200",
 		HourlyRateUSDMicros: 6_000_000, State: "ready", Hub: server.URL,
-		WheelhouseManifestDigest: activeManifestDigest,
 	}))
 	store.Close()
 	code, out = runCozy(t, root, "run", weightlessRef+"/tile_job", "size=32", "seed=7",
