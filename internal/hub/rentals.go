@@ -196,13 +196,16 @@ func (c *Client) RentalSKUs(ctx context.Context) ([]RentalSKU, *exit.Error) {
 	}
 	seen := map[string]bool{}
 	for _, sku := range out {
+		cpu := sku.AcceleratorModel == "CPU"
+		invalidCPU := cpu && (sku.ComputeCapability != "" || sku.VRAMGB != 0 || sku.MinimumRAMPerGPUGB != 0)
+		invalidGPU := !cpu && (!computeCapabilityPattern.MatchString(sku.ComputeCapability) ||
+			sku.VRAMGB <= 0 || sku.MinimumRAMPerGPUGB <= 0)
 		if strings.TrimSpace(sku.Name) == "" || strings.TrimSpace(sku.AcceleratorModel) == "" ||
-			!computeCapabilityPattern.MatchString(sku.ComputeCapability) ||
-			sku.VRAMGB <= 0 || sku.MinimumRAMPerGPUGB <= 0 ||
+			invalidCPU || invalidGPU ||
 			sku.PriceUSDMicrosPerHour <= 0 || seen[sku.Name] {
 			return nil, exit.Named(exit.Conflict, "hub.rental_catalog_invalid",
 				"the hub returned an invalid or duplicate rental SKU %q", sku.Name).
-				WithRemedy("Tensorhub must publish unique names with model, compute capability, positive VRAM/RAM, and positive Cozy price")
+				WithRemedy("Tensorhub must publish unique positive-price CPU SKUs without GPU fields, or GPU SKUs with compute capability and positive VRAM/RAM")
 		}
 		seen[sku.Name] = true
 	}

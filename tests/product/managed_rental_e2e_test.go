@@ -62,7 +62,8 @@ func TestRentalRunAcquiresCheapestOnceAndReleasesFailedPreAttempt(t *testing.T) 
 			http.Error(w, "download route must be worker-only in this flow", http.StatusInternalServerError)
 		case r.Method == http.MethodGet && r.URL.Path == "/v1/rental-skus":
 			_ = json.NewEncoder(w).Encode([]map[string]any{
-				{"name": "expensive", "accelerator_model": "GPU X", "compute_capability": "9.0", "vram_gb": 80, "minimum_ram_per_gpu_gb": 64, "price_usd_micros_per_hour": 900_000},
+				{"name": "cpu", "accelerator_model": "CPU", "price_usd_micros_per_hour": 70_000},
+				{"name": "h200", "accelerator_model": "H200", "compute_capability": "9.0", "vram_gb": 141, "minimum_ram_per_gpu_gb": 128, "price_usd_micros_per_hour": 6_000_000},
 				{"name": "cheap", "accelerator_model": "GPU C", "compute_capability": "8.9", "vram_gb": 24, "minimum_ram_per_gpu_gb": 32, "price_usd_micros_per_hour": 300_000},
 			})
 		case r.Method == http.MethodPost && r.URL.Path == "/v1/rentals":
@@ -71,23 +72,36 @@ func TestRentalRunAcquiresCheapestOnceAndReleasesFailedPreAttempt(t *testing.T) 
 			if err := json.NewDecoder(r.Body).Decode(&rentalRequest); err != nil {
 				t.Error(err)
 			}
+			accelerator, rate := "GPU C", 300_000
+			if rentalRequest["sku"] == "cpu" {
+				accelerator, rate = "CPU", 70_000
+			}
 			w.WriteHeader(http.StatusAccepted)
 			_ = json.NewEncoder(w).Encode(map[string]any{
 				"rental_id": activeRentalID, "state": "pending_acquisition",
-				"requested_accelerator_model": "GPU C", "hourly_rate_usd_micros": 300_000,
+				"requested_accelerator_model": accelerator, "hourly_rate_usd_micros": rate,
 			})
 		case r.Method == http.MethodDelete && r.URL.Path == "/v1/rentals/"+activeRentalID:
 			deletes++
 			deleteReason = r.Header.Get("X-Tensorhub-Reason")
 			w.WriteHeader(http.StatusNoContent)
+		case r.Method == http.MethodGet && r.URL.Path == "/v1/rentals/pr-idle-h200":
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"rental_id": "pr-idle-h200", "state": "ready",
+				"requested_accelerator_model": "H200", "hourly_rate_usd_micros": 6_000_000,
+			})
 		case r.Method == http.MethodGet && r.URL.Path == "/v1/rentals/"+activeRentalID:
 			state := "ready"
 			if deletes > 0 {
 				state = "released"
 			}
+			accelerator, rate := "GPU C", 300_000
+			if rentalRequest["sku"] == "cpu" {
+				accelerator, rate = "CPU", 70_000
+			}
 			answer := map[string]any{
 				"rental_id": activeRentalID, "state": state,
-				"requested_accelerator_model": "GPU C", "hourly_rate_usd_micros": 300_000,
+				"requested_accelerator_model": accelerator, "hourly_rate_usd_micros": rate,
 			}
 			if state == "ready" {
 				answer["worker_address"] = "127.0.0.1:9443"
@@ -108,7 +122,7 @@ func TestRentalRunAcquiresCheapestOnceAndReleasesFailedPreAttempt(t *testing.T) 
 	root := t.TempDir()
 	must(t, os.WriteFile(filepath.Join(root, "config.yaml"), []byte(
 		"tensorhub_url: "+server.URL+"\ntensorhub_token: test-token\nport: 0\n"+
-			"rentals:\n  max_hourly_spend_usd: 1.00\n"), 0o600))
+			"rentals:\n  max_hourly_spend_usd: 7.00\n"), 0o600))
 	t.Cleanup(func() { _, _ = runCozy(t, root, "down", "--all") })
 	project := weightlessProject(t)
 	if code, out := runCozy(t, root, "package", "install", project); code != 0 {
@@ -217,8 +231,8 @@ func TestRentalRunAcquiresCheapestOnceAndReleasesFailedPreAttempt(t *testing.T) 
 			gotCreateReason, gotDeleteReason, body)
 	}
 	wantLines := map[string]bool{
-		"rentals: 0 remote machines running · $0.00/hour of $1.00/hour": false,
-		"rentals: 1 remote machine running · $0.30/hour of $1.00/hour":  false,
+		"rentals: 0 remote machines running · $0.00/hour of $7.00/hour": false,
+		"rentals: 1 remote machine running · $0.30/hour of $7.00/hour":  false,
 	}
 	for _, event := range events {
 		if line, ok := event.Payload["line"].(string); ok {
@@ -246,6 +260,13 @@ func TestRentalRunAcquiresCheapestOnceAndReleasesFailedPreAttempt(t *testing.T) 
 	posts, deletes, rentalRequest, createReason, deleteReason = 0, 0, nil, "", ""
 	activeRentalID = "pr-managed-job"
 	mu.Unlock()
+	store, problem = records.Open(filepath.Join(root, "records.db"))
+	fatal(t, problem)
+	fatal(t, store.RecordRental(records.Rental{
+		ID: "pr-idle-h200", MachineName: "idle-h200", SKU: "h200", AcceleratorModel: "H200",
+		HourlyRateUSDMicros: 6_000_000, State: "ready", Hub: server.URL,
+	}))
+	store.Close()
 	code, out = runCozy(t, root, "run", weightlessRef+"/tile_job", "size=32", "seed=7",
 		"--rental", "--idempotency-key", "managed-job", "--json")
 	if code != 1 || !strings.Contains(out, `pinned media certificate`) {
@@ -281,6 +302,7 @@ func TestRentalRunAcquiresCheapestOnceAndReleasesFailedPreAttempt(t *testing.T) 
 	if request == nil || request.Worker != "pr-managed-job" || request.PlanID != jobDescriptorID || request.Kind != "job" ||
 		request.Release != "1.0.0" || request.PackageRevisionDigest != releaseDigest ||
 		request.JobGPUCount != 0 || len(request.Models) != 0 || gotPosts != 1 || gotDeletes != 1 ||
+		body["sku"] != "cpu" ||
 		strings.Contains(fmt.Sprint(body), weightlessRef) || strings.Contains(fmt.Sprint(body), "tile_job") {
 		t.Fatalf("remote job lifecycle request=%+v posts=%d deletes=%d body=%v",
 			request, gotPosts, gotDeletes, body)
@@ -293,4 +315,9 @@ func TestRentalRunAcquiresCheapestOnceAndReleasesFailedPreAttempt(t *testing.T) 
 	if code != 1 || !strings.Contains(out, `pinned media certificate`) || gotPosts != 1 {
 		t.Fatalf("remote job replay purchased again [exit %d posts=%d]\n%s", code, gotPosts, out)
 	}
+	store, problem = records.Open(filepath.Join(root, "records.db"))
+	fatal(t, problem)
+	_, problem = store.ForgetRental("pr-idle-h200")
+	fatal(t, problem)
+	store.Close()
 }
