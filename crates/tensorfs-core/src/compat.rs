@@ -569,11 +569,18 @@ pub fn check_compatibility(
                 verdict = mismatch(Code::ENCODING_MISMATCH, comp, key, want, got);
                 continue;
             }
-            // Encoding assignments against the PINNED registry. A spec absent from the
-            // closure is not a checkpoint at all; a spec the local pin does not alias is
+            // Encoding assignments against the PINNED registry. cozytensors/1 carries its
+            // specs inline; the optional closure remains current for standalone layout
+            // inputs. A spec absent from both is not a checkpoint at all; a spec the local pin does not alias is
             // valid data whose execution is unsupported here, and offline the two reasons
             // for that ("unregistered" vs "newer than my pin") are indistinguishable.
-            if closure.get(&t.encoding).is_none() {
+            let spec = closure.get(&t.encoding).or_else(|| {
+                header
+                    .encodings
+                    .iter()
+                    .find(|candidate| candidate.object_id() == t.encoding)
+            });
+            if spec.is_none() {
                 verdict = mismatch(Code::UNKNOWN_ENCODING, comp, key, want, got);
                 continue;
             }
@@ -581,7 +588,7 @@ pub fn check_compatibility(
                 verdict = mismatch(Code::UNKNOWN_TO_LOCAL_CAPABILITY, comp, key, want, got);
                 continue;
             }
-            let spec = closure.get(&t.encoding).unwrap();
+            let spec = spec.unwrap();
             let want_roles: Vec<&str> = spec.roles.iter().map(|(n, _)| n.as_str()).collect();
             let got_roles: Vec<&str> = t.parts.iter().map(|(n, _)| n.as_str()).collect();
             if want_roles != got_roles {
@@ -642,6 +649,84 @@ pub fn check_compatibility(
         facts,
         unconsumed,
     })
+}
+
+#[cfg(test)]
+mod inline_spec_tests {
+    use super::*;
+    use crate::header::{Closure, Header, Part, Tensor};
+
+    fn pair() -> (CodeTopology, Header, String) {
+        let spec = crate::registry::seeds()
+            .into_iter()
+            .find(|seed| seed.alias == "plain/1")
+            .unwrap()
+            .spec;
+        let encoding = spec.object_id();
+        let header = Header {
+            configs: vec![],
+            assets: vec![],
+            encodings: vec![spec],
+            components: vec![(
+                "core".into(),
+                vec![(
+                    "weight".into(),
+                    Tensor {
+                        dtype: Dtype::Bf16,
+                        shape: vec![1],
+                        encoding: encoding.clone(),
+                        parts: vec![("value".into(), Part::plan(Dtype::Bf16, vec![1], &[0, 0]))],
+                    },
+                )],
+            )],
+        };
+        let code = CodeTopology {
+            contract: crate::ids::object_id(b"inline-spec-test"),
+            components: vec![(
+                "core".into(),
+                vec![(
+                    "weight".into(),
+                    Requirement {
+                        dtype: Dtype::Bf16,
+                        shape: vec![1],
+                        accepts: Accepts::Any,
+                    },
+                )],
+            )],
+        };
+        (code, header, encoding)
+    }
+
+    #[test]
+    fn inline_header_spec_is_the_current_checkpoint_closure() {
+        let (code, header, encoding) = pair();
+        let outcome = check_compatibility(
+            &code,
+            &header,
+            &Closure::default(),
+            std::slice::from_ref(&encoding),
+            Lane::Canonical,
+            &[],
+        )
+        .unwrap();
+        assert!(outcome.satisfaction.is_satisfied());
+
+        let mut missing = header;
+        missing.encodings.clear();
+        let outcome = check_compatibility(
+            &code,
+            &missing,
+            &Closure::default(),
+            &[encoding],
+            Lane::Canonical,
+            &[],
+        )
+        .unwrap();
+        assert!(matches!(
+            outcome.satisfaction,
+            Satisfaction::Mismatch(details) if details.code == Code::UNKNOWN_ENCODING
+        ));
+    }
 }
 
 /// The direction asymmetry, in one place.
