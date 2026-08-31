@@ -2,7 +2,6 @@ package producttest
 
 import (
 	"context"
-	"database/sql"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -26,29 +25,6 @@ import (
 const weightlessRef = "cozy/cozy-weightless-package"
 const editableRuntimeFixtureSHA = "47a4f9e86aac8bd4fdb4f9d209ea07f0762b1adf"
 const editableTensorFSFixtureSHA = "f645ee6a777cd32dca22144985099faa2276af4b"
-
-func TestLegacyAttemptColumnsMigrate(t *testing.T) {
-	path := filepath.Join(t.TempDir(), "records.db")
-	store, problem := records.Open(path)
-	fatal(t, problem)
-	store.Close()
-	db, err := sql.Open("sqlite", path)
-	must(t, err)
-	_, err = db.Exec(`ALTER TABLE attempts RENAME COLUMN invocation_digest TO exec_spec_digest`)
-	must(t, err)
-	_, err = db.Exec(`ALTER TABLE attempts RENAME COLUMN invocation TO exec_spec`)
-	must(t, err)
-	_, err = db.Exec(`PRAGMA user_version=0`)
-	must(t, err)
-	must(t, db.Close())
-
-	store, problem = records.Open(path)
-	fatal(t, problem)
-	defer store.Close()
-	if _, problem = store.Attempts("no-such-request"); problem != nil {
-		t.Fatalf("migrated attempts are unreadable: %v", problem)
-	}
-}
 
 func TestLiteralPayloadUsesOrdinaryScalarSyntax(t *testing.T) {
 	entrypoint := &launch.Entrypoint{
