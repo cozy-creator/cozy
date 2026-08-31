@@ -3,6 +3,7 @@ package producttest
 import (
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 
@@ -56,6 +57,9 @@ func TestModelSourceGrammarRefusesAmbiguityAndCredentials(t *testing.T) {
 }
 
 func TestProviderSecretsRequireOwnerOnlyNonsymlinkConfig(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("POSIX owner and mode contract")
+	}
 	run := func(root string, args ...string) cozyResult {
 		return runCozyEnv([]string{"COZY_HOME=" + root, "PATH=/usr/local/bin:/usr/bin:/bin"}, args...)
 	}
