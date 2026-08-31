@@ -46,6 +46,11 @@ type Config struct {
 	HubURLSource   string
 	HubTokenSource string
 
+	HuggingFaceToken       secret.Value
+	HuggingFaceTokenSource string
+	CivitaiToken           secret.Value
+	CivitaiTokenSource     string
+
 	Tfs       string
 	TfsSource string
 
@@ -66,6 +71,8 @@ type Config struct {
 type values struct {
 	HubURL                   string `name:"tensorhub_url" default:"http://127.0.0.1:8819"`
 	HubToken                 string `name:"tensorhub_token"`
+	HuggingFaceToken         string `name:"huggingface_token"`
+	CivitaiToken             string `name:"civitai_token"`
 	Tfs                      string `name:"tfs" default:"tfs"`
 	LocalRateMicroUSDPerHour int64  `name:"local_rate_micro_usd_per_hour" default:"0"`
 	RentalsMaxHourlySpendUSD string `name:"rentals_max_hourly_spend_usd" default:"0"`
@@ -96,6 +103,8 @@ func (v *values) Validate() error {
 var fileKeys = map[string]bool{
 	"tensorhub_url":                 true,
 	"tensorhub_token":               true,
+	"huggingface_token":             true,
+	"civitai_token":                 true,
 	"tfs":                           true,
 	"local_rate_micro_usd_per_hour": true,
 	"port":                          true,
@@ -108,10 +117,12 @@ var rentalFileKeys = map[string]string{
 }
 
 var environmentNames = map[string]string{
-	"tensorhub_url":   "TENSORHUB_URL",
-	"tensorhub_token": "TENSORHUB_TOKEN",
-	"tfs":             "COZY_TFS",
-	"bootstrap":       "COZY_BOOTSTRAP_CREDENTIAL",
+	"tensorhub_url":     "TENSORHUB_URL",
+	"tensorhub_token":   "TENSORHUB_TOKEN",
+	"huggingface_token": "HF_TOKEN",
+	"civitai_token":     "CIVITAI_TOKEN",
+	"tfs":               "COZY_TFS",
+	"bootstrap":         "COZY_BOOTSTRAP_CREDENTIAL",
 }
 
 var processConfig struct {
@@ -152,6 +163,8 @@ func load() (Config, *exit.Error) {
 	}
 
 	hubToken := secret.New(input.HubToken)
+	huggingFaceToken := secret.New(input.HuggingFaceToken)
+	civitaiToken := secret.New(input.CivitaiToken)
 	c := Config{
 		Home:                           home,
 		Port:                           input.Port,
@@ -161,6 +174,10 @@ func load() (Config, *exit.Error) {
 		HubToken:                       hubToken,
 		HubURLSource:                   sourceOf("tensorhub_url", file, environment, "default"),
 		HubTokenSource:                 sourceOf("tensorhub_token", file, environment, "unset"),
+		HuggingFaceToken:               huggingFaceToken,
+		HuggingFaceTokenSource:         sourceOf("huggingface_token", file, environment, "unset"),
+		CivitaiToken:                   civitaiToken,
+		CivitaiTokenSource:             sourceOf("civitai_token", file, environment, "unset"),
 		Tfs:                            strings.TrimSpace(input.Tfs),
 		TfsSource:                      sourceOf("tfs", file, environment, "default"),
 		LocalRateMicroUSDPerHour:       input.LocalRateMicroUSDPerHour,
@@ -172,6 +189,12 @@ func load() (Config, *exit.Error) {
 	}
 	if !hubToken.Present() {
 		c.HubTokenSource = "unset"
+	}
+	if !huggingFaceToken.Present() {
+		c.HuggingFaceTokenSource = "unset"
+	}
+	if !civitaiToken.Present() {
+		c.CivitaiTokenSource = "unset"
 	}
 	return c, nil
 }
@@ -266,6 +289,10 @@ func knownFileKeys() string {
 }
 
 func readConfigFile(path string) (*resolver, *exit.Error) {
+	nameInfo, lstatErr := os.Lstat(path)
+	if lstatErr != nil && !os.IsNotExist(lstatErr) {
+		return nil, exit.Internalf("cannot inspect %s: %s", path, lstatErr)
+	}
 	file, err := os.Open(path)
 	if err != nil {
 		if os.IsNotExist(err) {
@@ -279,6 +306,16 @@ func readConfigFile(path string) (*resolver, *exit.Error) {
 	if err != nil {
 		return nil, exit.Usagef("%s is invalid: %s", path, err).
 			WithRemedy("this file admits: %s", knownFileKeys())
+	}
+	if resolved.has("huggingface_token") || resolved.has("civitai_token") {
+		openedInfo, statErr := file.Stat()
+		if statErr != nil {
+			return nil, exit.Internalf("cannot inspect opened %s: %s", path, statErr)
+		}
+		if err := validateProviderSecretFile(nameInfo, openedInfo); err != nil {
+			return nil, exit.Usagef("%s is invalid: %s", path, err).
+				WithRemedy("store provider credentials in an owner-only regular file: chmod 600 %s", path)
+		}
 	}
 	return resolved, nil
 }
