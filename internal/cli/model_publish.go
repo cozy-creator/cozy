@@ -293,7 +293,7 @@ func resolveProducerPlan(ctx *Context, raw string) (*producerPlan, *exit.Error) 
 	}
 	parts := strings.Split(raw, "/")
 	if len(parts) != 3 || parts[0] == "" || parts[1] == "" || parts[2] == "" {
-		return nil, exit.Usagef("--producer %q is not org/package/production", raw)
+		return nil, exit.Usagef("--producer %q is not org/package[@vN]/production", raw)
 	}
 	packageName := parts[0] + "/" + parts[1]
 	remote := ctx.Inv.Bool("--rental")

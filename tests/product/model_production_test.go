@@ -256,8 +256,8 @@ func TestRemoteModelProductionResolvesHubMetadataWithoutLocalInstall(t *testing.
 					"created_at": "2026-08-31T00:00:00Z"},
 				"releases": []map[string]any{
 					{"release": "1.0.0", "cut_at": "2026-08-31T00:00:00Z"},
-					{"release": "9.0.0", "cut_at": "2026-08-31T00:00:00Z", "yanked": true},
 					{"release": "2.0.0", "cut_at": "2026-08-31T00:00:00Z"},
+					{"release": "3.0.0", "cut_at": "2026-08-31T00:00:00Z"},
 				},
 			})
 		case r.Method == http.MethodGet &&
@@ -283,10 +283,10 @@ func TestRemoteModelProductionResolvesHubMetadataWithoutLocalInstall(t *testing.
 		"tensorhub_url: "+server.URL+"\nrentals:\n  max_hourly_spend_usd: 10\n"), 0o600))
 	code, out := runCozyDir(t, root, "", []string{"PATH=/usr/bin:/bin"},
 		"--json", "--full", "model", "publish", "acme/output", "acme/input@1.0.0",
-		"--release", "1.0.0", "--producer", "proof/remote-producer/build",
+		"--release", "1.0.0", "--producer", "proof/remote-producer@v2/build",
 		"--rental", "--dry-run")
 	if code != 0 || !strings.Contains(out, `"status":"planned"`) ||
-		!strings.Contains(out, `"producer":"proof/remote-producer/build@2.0.0"`) {
+		!strings.Contains(out, `"producer":"proof/remote-producer@v2/build@2.0.0"`) {
 		t.Fatalf("metadata-only remote production [exit %d]\n%s", code, out)
 	}
 	if got := strings.Join(requests, "\n"); strings.Contains(got, "/download") ||
@@ -303,14 +303,14 @@ func TestRemoteModelProductionResolvesHubMetadataWithoutLocalInstall(t *testing.
 	requests = nil
 	code, out = runCozyDir(t, root, "", []string{"PATH=/usr/bin:/bin"},
 		"model", "publish", "acme/output", "acme/input@1.0.0", "--release", "1.0.0",
-		"--producer", "proof/remote-producer/build", "--rental", "--dry-run")
+		"--producer", "proof/remote-producer@v2/build", "--rental", "--dry-run")
 	if code == 0 || !strings.Contains(out, "no active immutable release in v3") {
 		t.Fatalf("missing production callable major [exit %d]\n%s", code, out)
 	}
 	requests = nil
 	code, out = runCozyDir(t, root, "", []string{"PATH=/usr/bin:/bin"},
 		"model", "publish", "acme/output", "acme/input@1.0.0", "--release", "1.0.0",
-		"--producer", "proof/remote-producer/build", "--dry-run")
+		"--producer", "proof/remote-producer@v2/build", "--dry-run")
 	if code == 0 || !strings.Contains(out, "not installed") {
 		t.Fatalf("local production stopped requiring a local install [exit %d]\n%s", code, out)
 	}

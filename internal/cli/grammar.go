@@ -157,7 +157,7 @@ type ModelPublishCmd struct {
 	Ref      string `arg:"" name:"model" help:"Tensorhub destination (org/name)."`
 	Source   string `arg:"" name:"source" help:"Manifest, pinned foreign source, Tensorhub model release, local alias, or explicit local file."`
 	Release  string `help:"Immutable semantic release version." required:""`
-	Producer string `help:"Reviewed org/package/production declaration to execute."`
+	Producer string `help:"Reviewed org/package@vN/production declaration to execute."`
 	Lane     string `help:"Select an input lane when source is a Tensorhub model release."`
 	Rental   bool   `help:"Authorize one Creator-managed rental for this operation."`
 	DryRun   bool   `help:"Resolve the exact production plan without moving model bodies or spending."`
