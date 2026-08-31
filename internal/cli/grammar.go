@@ -155,7 +155,7 @@ type ModelPublishCmd struct {
 	Ref        string `arg:"" name:"model" help:"Model name (org/name)."`
 	Manifest   string `arg:"" name:"manifest" help:"Local sha256 manifest id."`
 	Release    string `help:"Immutable release version."`
-	Lane       string `help:"Portable release lane."`
+	Lane       string `help:"Expected server-derived release lane."`
 	DryRun     bool   `help:"Show the transfer plan without moving bytes."`
 	TokenStdin bool   `help:"Read this invocation's hub token from stdin."`
 }

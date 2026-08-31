@@ -23,8 +23,9 @@ import (
 )
 
 const (
-	manifestA = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
-	topologyC = "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+	manifestA   = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+	topologyC   = "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+	derivedLane = "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"
 )
 
 func releaseEvidence() []byte {
@@ -196,7 +197,7 @@ func TestManifestReadRoutes(t *testing.T) {
 	}
 }
 
-func TestPublicationUsesReleaseLaneAndManifestOnlySeal(t *testing.T) {
+func TestPublicationUsesCurrentPrepareAndCutContract(t *testing.T) {
 	evidenceBase64 := base64.StdEncoding.EncodeToString(releaseEvidence())
 	var calls int
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -210,21 +211,40 @@ func TestPublicationUsesReleaseLaneAndManifestOnlySeal(t *testing.T) {
 				t.Fatalf("open request = %s %s", r.Method, r.URL.Path)
 			}
 			var body map[string]any
-			if err := json.NewDecoder(r.Body).Decode(&body); err != nil || len(body) != 3 ||
-				body["release"] != "1.0.0" || body["lane"] != "bf16" {
+			if err := json.NewDecoder(r.Body).Decode(&body); err != nil || len(body) != 2 ||
+				body["release"] != "1.0.0" || body["lane"] != nil || body["lane_key"] != nil ||
+				body["required_contract"] != nil {
 				t.Fatalf("open body = %#v, %v", body, err)
 			}
-			_, _ = io.WriteString(w, `{"created":true,"publication":{"operation":"manifest-proof","release":"1.0.0","lane":"bf16","state":"open","objects":[{"object_id":"sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","length":7,"state":"claimed"}]}}`)
+			_, _ = io.WriteString(w, `{"created":true,"publication":{"operation":"manifest-proof","release":"1.0.0","lane":"","state":"open","objects":[{"object_id":"sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","length":7,"state":"claimed"}]}}`)
 		case 2:
-			if r.Method != http.MethodPost || r.URL.Path != "/v1/models/acme/model/publications/manifest-proof/seal" {
-				t.Fatalf("seal request = %s %s", r.Method, r.URL.Path)
+			if r.Method != http.MethodPost || r.URL.Path != "/v1/models/acme/model/publications/manifest-proof/grants" {
+				t.Fatalf("grant request = %s %s", r.Method, r.URL.Path)
+			}
+			_, _ = io.WriteString(w, `{"grants":[],"held":[{"transfer_id":"transfer-proof","object_id":"sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","length":7,"state":"accepted","received_bytes":7,"verified_bytes":7,"last_progress_at":"2026-08-31T00:00:00Z","accepted_at":"2026-08-31T00:00:00Z"}]}`)
+		case 3:
+			if r.Method != http.MethodPost || r.URL.Path != "/v1/models/acme/model/publications/manifest-proof/finalize" {
+				t.Fatalf("finalize request = %s %s", r.Method, r.URL.Path)
 			}
 			var body map[string]any
 			if err := json.NewDecoder(r.Body).Decode(&body); err != nil || len(body) != 2 || body["manifest"] != "e30=" ||
 				body["release_evidence_base64"] != evidenceBase64 {
-				t.Fatalf("seal body = %#v, %v", body, err)
+				t.Fatalf("finalize body = %#v, %v", body, err)
 			}
-			_, _ = io.WriteString(w, `{"publish_id":"manifest-proof","release":"1.0.0","lane":"bf16","manifest":{"sha256":"`+manifestA+`","length":2},"topology_digest":"sha256:`+topologyC+`","objects":1,"bytes":7,"release_evidence_base64":"`+evidenceBase64+`","duplicate":false}`)
+			_, _ = io.WriteString(w, `{"publish_id":"manifest-proof","release":"1.0.0","lane":"`+derivedLane+`","manifest":{"sha256":"`+manifestA+`","length":2},"contract":{"stamps":{},"structure":"sha256:`+topologyC+`","encoding":{"set":["bf16"]}},"topology_digest":"sha256:`+topologyC+`","objects":1,"bytes":7,"release_evidence_base64":"`+evidenceBase64+`","state":"verified/prepared","duplicate":false}`)
+		case 4:
+			if r.Method != http.MethodPost || r.URL.Path != "/v1/models/acme/model/releases/1.0.0" {
+				t.Fatalf("cut request = %s %s", r.Method, r.URL.Path)
+			}
+			var body struct {
+				Operation    string   `json:"operation"`
+				Publications []string `json:"publications"`
+			}
+			if err := json.NewDecoder(r.Body).Decode(&body); err != nil || body.Operation != "cut-manifest-proof" ||
+				!reflect.DeepEqual(body.Publications, []string{"manifest-proof"}) {
+				t.Fatalf("cut body = %#v, %v", body, err)
+			}
+			_, _ = io.WriteString(w, `{"operation":"cut-manifest-proof","release":"1.0.0","repository_sha256":"`+manifestA+`","lanes":[{"lane":"`+derivedLane+`","manifest":{"sha256":"`+manifestA+`","length":2},"contract":{"stamps":{},"structure":"sha256:`+topologyC+`","encoding":{"set":["bf16"]}},"objects":1,"bytes":7,"publication":"manifest-proof"}],"duplicate":false}`)
 		default:
 			t.Fatalf("unexpected request %s %s", r.Method, r.URL.Path)
 		}
@@ -234,19 +254,44 @@ func TestPublicationUsesReleaseLaneAndManifestOnlySeal(t *testing.T) {
 	client := hub.New(config.Config{HubURL: server.URL, HubToken: secret.New("token")}, "test")
 	ref := hub.Ref{Org: "acme", Name: "model"}
 	opened, problem := client.OpenPublication(context.Background(), ref, "manifest-proof",
-		"1.0.0", "bf16", []hub.Object{{ID: "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", Length: 7}}, "proof")
-	if problem != nil || !opened.Created || opened.Publication.Operation != "manifest-proof" {
+		"1.0.0", []hub.Object{{ID: "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", Length: 7}}, "proof")
+	if problem != nil || !opened.Created || opened.Publication.Operation != "manifest-proof" || opened.Publication.Lane != "" {
 		t.Fatalf("OpenPublication = %#v, %v", opened, problem)
 	}
-	done, problem := client.SealPublication(context.Background(), ref, "manifest-proof",
-		hub.SealPublicationRequest{Manifest: "e30=", ReleaseEvidenceBase64: evidenceBase64}, "proof")
-	if problem != nil || done.Manifest.Length != 2 || done.Release != "1.0.0" || done.Lane != "bf16" ||
-		done.ReleaseEvidenceBase64 != evidenceBase64 {
-		t.Fatalf("SealPublication = %#v, %v", done, problem)
+	granted, problem := client.GrantKnownTransfers(context.Background(), ref, "manifest-proof",
+		[]string{"sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"}, "proof")
+	if problem != nil || len(granted.Grants) != 0 || len(granted.Held) != 1 || granted.Held[0].VerifiedBytes != 7 {
+		t.Fatalf("GrantKnownTransfers = %#v, %v", granted, problem)
+	}
+	prepared, problem := client.FinalizePublication(context.Background(), ref, "manifest-proof",
+		hub.FinalizePublicationRequest{Manifest: "e30=", ReleaseEvidenceBase64: evidenceBase64}, "proof")
+	if problem != nil || prepared.Manifest.Length != 2 || prepared.Release != "1.0.0" ||
+		prepared.Lane != derivedLane || prepared.ReleaseEvidenceBase64 != evidenceBase64 {
+		t.Fatalf("FinalizePublication = %#v, %v", prepared, problem)
+	}
+	cut, problem := client.CutRelease(context.Background(), ref, "1.0.0", "cut-manifest-proof",
+		[]string{"manifest-proof"}, "proof")
+	if problem != nil || cut.Operation != "cut-manifest-proof" || len(cut.Lanes) != 1 ||
+		cut.Lanes[0].Publication != "manifest-proof" || cut.Lanes[0].Lane != derivedLane {
+		t.Fatalf("CutRelease = %#v, %v", cut, problem)
 	}
 }
 
-func TestModelPublicationBatchesGrantRequestsAndFinalizesOnce(t *testing.T) {
+func TestPublicationResponsesRejectUnknownFields(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = io.WriteString(w, `{"created":true,"publication":{"operation":"strict-proof","release":"1.0.0","lane":"","state":"open","objects":[]},"unrecognized":true}`)
+	}))
+	defer server.Close()
+
+	client := hub.New(config.Config{HubURL: server.URL, HubToken: secret.New("token")}, "test")
+	_, problem := client.OpenPublication(context.Background(), hub.Ref{Org: "acme", Name: "model"},
+		"strict-proof", "1.0.0", []hub.Object{{ID: "sha256:" + manifestA, Length: 1}}, "proof")
+	if problem == nil || problem.Name != "hub.unreadable_answer" {
+		t.Fatalf("unknown publication response field = %v", problem)
+	}
+}
+
+func TestModelPublicationBatchesFinalizesCutsAndReplays(t *testing.T) {
 	const objectCount = 257
 	manifestID := "sha256:" + manifestA
 	manifest := []byte(`{}`)
@@ -265,7 +310,7 @@ func TestModelPublicationBatchesGrantRequestsAndFinalizesOnce(t *testing.T) {
 	releasesPath := filepath.Join(toolDir, "releases.jsonl")
 	refsPath := filepath.Join(toolDir, "refs.jsonl")
 	manifestPath := filepath.Join(toolDir, "manifest.json")
-	if err := os.WriteFile(releasesPath, []byte(releaseRow(string(evidence), "bf16")+"\n"), 0o600); err != nil {
+	if err := os.WriteFile(releasesPath, []byte(releaseRow(string(evidence), derivedLane)+"\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	if err := os.WriteFile(refsPath, []byte(refs.String()), 0o600); err != nil {
@@ -286,14 +331,25 @@ func TestModelPublicationBatchesGrantRequestsAndFinalizesOnce(t *testing.T) {
 	}
 	tool := &tfs.Tool{Bin: tfsPath, Root: toolDir}
 
-	var grantCalls atomic.Int32
+	var openCalls, grantCalls, uploadCalls, finalizeCalls, cutCalls atomic.Int32
 	publicationPath := "/v1/models/acme/model/publications/batch-proof"
 	var server *httptest.Server
 	server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch {
 		case r.Method == http.MethodPut && r.URL.Path == publicationPath:
-			_ = json.NewEncoder(w).Encode(hub.OpenPublicationResponse{Created: true,
-				Publication: hub.Session{Operation: "batch-proof", Release: "1.0.0", Lane: "bf16", State: "open", Objects: transfers}})
+			call := openCalls.Add(1)
+			state, lane, objects := "open", "", transfers
+			if call > 1 {
+				state, lane, objects = "prepared", derivedLane, append([]hub.Transfer(nil), transfers...)
+				if cutCalls.Load() > 0 {
+					state = "committed"
+				}
+				for i := range objects {
+					objects[i].State = "accepted"
+				}
+			}
+			_ = json.NewEncoder(w).Encode(hub.OpenPublicationResponse{Created: call == 1,
+				Publication: hub.Session{Operation: "batch-proof", Release: "1.0.0", Lane: lane, State: state, Objects: objects}})
 		case r.Method == http.MethodPost && r.URL.Path == publicationPath+"/grants":
 			var body struct {
 				ObjectIDs []string `json:"object_ids"`
@@ -309,16 +365,28 @@ func TestModelPublicationBatchesGrantRequestsAndFinalizesOnce(t *testing.T) {
 			}
 			_ = json.NewEncoder(w).Encode(answer)
 		case r.Method == http.MethodPut && strings.HasPrefix(r.URL.Path, "/objects/"):
+			uploadCalls.Add(1)
 			raw, err := io.ReadAll(r.Body)
 			if err != nil || string(raw) != "x" {
 				t.Errorf("object upload = %q, %v", raw, err)
 			}
 			w.WriteHeader(http.StatusOK)
-		case r.Method == http.MethodPost && r.URL.Path == publicationPath+"/seal":
-			_ = json.NewEncoder(w).Encode(hub.CompleteResponse{PublishID: "batch-proof",
-				Release: "1.0.0", Lane: "bf16", Manifest: hub.ManifestRef{SHA256: manifestA, Length: int64(len(manifest))},
+		case r.Method == http.MethodPost && r.URL.Path == publicationPath+"/finalize":
+			call := finalizeCalls.Add(1)
+			_ = json.NewEncoder(w).Encode(hub.PreparedPublication{PublishID: "batch-proof",
+				Release: "1.0.0", Lane: derivedLane, Manifest: hub.ManifestRef{SHA256: manifestA, Length: int64(len(manifest))},
+				Contract: hub.Contract{Stamps: map[string][]string{}, Structure: "sha256:" + topologyC,
+					Encoding: hub.Encoding{Set: []string{"bf16"}}},
 				TopologyDigest: "sha256:" + topologyC, Objects: objectCount, Bytes: objectCount,
-				ReleaseEvidenceBase64: evidenceBase64})
+				ReleaseEvidenceBase64: evidenceBase64, State: "verified/prepared", Duplicate: call > 1})
+		case r.Method == http.MethodPost && r.URL.Path == "/v1/models/acme/model/releases/1.0.0":
+			call := cutCalls.Add(1)
+			_ = json.NewEncoder(w).Encode(hub.CutReleaseResponse{Operation: "cut-batch-proof", Release: "1.0.0",
+				RepositorySHA256: manifestA, Lanes: []hub.CutLane{{Lane: derivedLane,
+					Manifest: hub.ManifestRef{SHA256: manifestA, Length: int64(len(manifest))},
+					Contract: hub.Contract{Stamps: map[string][]string{}, Structure: "sha256:" + topologyC,
+						Encoding: hub.Encoding{Set: []string{"bf16"}}},
+					Objects: objectCount, Bytes: objectCount, Publication: "batch-proof"}}, Duplicate: call > 1})
 		default:
 			t.Errorf("unexpected request %s %s", r.Method, r.URL.Path)
 			http.Error(w, "unexpected", http.StatusNotFound)
@@ -329,15 +397,36 @@ func TestModelPublicationBatchesGrantRequestsAndFinalizesOnce(t *testing.T) {
 	publish := transfer.Publish{Tool: tool,
 		Hub: hub.New(config.Config{HubURL: server.URL, HubToken: secret.New("token")}, "test"),
 		Ref: hub.Ref{Org: "acme", Name: "model"}, ManifestID: manifestID,
-		Release: "1.0.0", Lane: "bf16", Session: "batch-proof", Reason: "proof", Scratch: t.TempDir()}
+		Release: "1.0.0", Lane: "wrong-lane", Session: "batch-proof", Reason: "proof", Scratch: t.TempDir()}
+	mismatched, problem := publish.Run(context.Background())
+	if problem == nil || !strings.Contains(problem.Error(), derivedLane) || cutCalls.Load() != 0 ||
+		mismatched.Uploaded != objectCount || mismatched.Moved != objectCount {
+		t.Fatalf("derived lane mismatch = %#v, %v, cut calls = %d", mismatched, problem, cutCalls.Load())
+	}
+	publish.Lane = derivedLane
 	result, problem := publish.Run(context.Background())
 	if problem != nil {
 		t.Fatal(problem)
 	}
-	if grantCalls.Load() != 3 {
-		t.Fatalf("control requests: grants=%d, want 3", grantCalls.Load())
-	}
-	if result.Uploaded != objectCount || result.Verified != objectCount || result.Moved != objectCount {
+	if result.Uploaded != 0 || result.Verified != objectCount || result.Moved != 0 || result.Deduped != objectCount {
 		t.Fatalf("publication result = %#v", result)
+	}
+	replayed, problem := publish.Run(context.Background())
+	if problem != nil {
+		t.Fatal(problem)
+	}
+	if !replayed.Dup || replayed.Uploaded != 0 || replayed.Grants != 0 || replayed.Moved != 0 ||
+		replayed.Deduped != objectCount || replayed.Verified != objectCount {
+		t.Fatalf("replayed publication result = %#v", replayed)
+	}
+	publish.DryRun = true
+	planned, problem := publish.Run(context.Background())
+	if problem != nil || planned.Uploaded != 0 || planned.Deduped != objectCount || planned.Verified != 0 {
+		t.Fatalf("committed dry-run result = %#v, %v", planned, problem)
+	}
+	if openCalls.Load() != 4 || grantCalls.Load() != 3 || uploadCalls.Load() != objectCount ||
+		finalizeCalls.Load() != 3 || cutCalls.Load() != 2 {
+		t.Fatalf("publication calls: open=%d grants=%d uploads=%d finalize=%d cut=%d",
+			openCalls.Load(), grantCalls.Load(), uploadCalls.Load(), finalizeCalls.Load(), cutCalls.Load())
 	}
 }

@@ -144,7 +144,7 @@ func handleModelPublish(ctx *Context) *exit.Error {
 		return e
 	}
 
-	status, changed := "published", res.Moved > 0
+	status, changed := "published", !res.Dup
 	if p.DryRun {
 		status, changed = "planned", false
 	}
@@ -175,6 +175,8 @@ func handleModelPublish(ctx *Context) *exit.Error {
 		output.Field{K: "verified", V: res.Verified},
 		output.Field{K: "manifest_length", V: res.Manifest.Length},
 		output.Field{K: "topology", V: res.TopologyDigest},
+		output.Field{K: "release_operation", V: res.CutOperation},
+		output.Field{K: "repository_sha256", V: res.RepositorySHA},
 		output.Field{K: "duplicate", V: res.Dup},
 	)
 	return emit(ctx, compactRecord(fields,

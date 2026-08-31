@@ -3,9 +3,9 @@ package hub
 // Tensorhub's incremental model-publication protocol and manifest reads, as methods
 // on the ONE client. `do` still owns request construction, credentials, reasons, and
 // error mapping. A publication opens under a stable operation id, claims known object
-// transfers, uploads through bounded grants, then finalizes by asking Tensorhub to
-// verify the declared final objects and seal the exact TensorFS documents. The retired
-// declare-whole and per-object settlement routes have no compatibility path.
+// transfers, uploads through bounded grants, finalizes one prepared output, then
+// cuts that output into the immutable model release. The retired declare-whole,
+// per-object settlement, and seal routes have no compatibility path.
 
 import (
 	"context"
@@ -27,11 +27,13 @@ func B64(raw []byte) string { return base64.StdEncoding.EncodeToString(raw) }
 
 // Session is the compact durable view returned by the idempotent publication PUT.
 type Session struct {
-	Operation string     `json:"operation"`
-	Release   string     `json:"release"`
-	Lane      string     `json:"lane"`
-	State     string     `json:"state"`
-	Objects   []Transfer `json:"objects"`
+	Operation        string     `json:"operation"`
+	Release          string     `json:"release"`
+	Lane             string     `json:"lane"`
+	LaneKey          string     `json:"lane_key,omitempty"`
+	RequiredContract string     `json:"required_contract,omitempty"`
+	State            string     `json:"state"`
+	Objects          []Transfer `json:"objects"`
 }
 
 // Totals is Cozy's accounting over the exact transfer rows Tensorhub returned.
@@ -51,15 +53,15 @@ type OpenPublicationResponse struct {
 	Created     bool    `json:"created"`
 }
 
-func (c *Client) OpenPublication(ctx context.Context, ref Ref, operationID, release, lane string,
+func (c *Client) OpenPublication(ctx context.Context, ref Ref, operationID, release string,
 	objects []Object, reason string,
 ) (OpenPublicationResponse, *exit.Error) {
 	var out OpenPublicationResponse
 	e := c.do(ctx, call{
 		method: http.MethodPut,
 		path:   publications(ref) + "/" + url.PathEscape(operationID), auth: true, reason: reason,
-		body:    map[string]any{"release": release, "lane": lane, "objects": objects},
-		byBytes: true, patient: true,
+		body:    map[string]any{"release": release, "objects": objects},
+		byBytes: true, patient: true, strict: true,
 	}, &out)
 	return out, e
 }
@@ -75,15 +77,29 @@ type Transfer struct {
 type Grant struct {
 	ObjectID string            `json:"object_id"`
 	Length   int64             `json:"length"`
-	Key      string            `json:"key"`
 	URL      string            `json:"url"`
 	Expires  string            `json:"expires_at"`
 	Headers  map[string]string `json:"required_headers"`
 }
 
+// HeldTransfer is Tensorhub's current durable transfer-row projection. Grants
+// return it only when a concurrent publisher accepted an object after this
+// client opened the publication.
+type HeldTransfer struct {
+	Transfer
+	TransferID     string  `json:"transfer_id"`
+	GrantExpiresAt *string `json:"grant_expires_at,omitempty"`
+	ReceivedBytes  int64   `json:"received_bytes"`
+	VerifiedBytes  int64   `json:"verified_bytes"`
+	LastProgressAt string  `json:"last_progress_at"`
+	AcceptedAt     *string `json:"accepted_at,omitempty"`
+	RefusalCode    *string `json:"refusal_code,omitempty"`
+	RefusalDetail  *string `json:"refusal_detail,omitempty"`
+}
+
 type GrantResponse struct {
-	Grants []Grant    `json:"grants"`
-	Held   []Transfer `json:"held"`
+	Grants []Grant        `json:"grants"`
+	Held   []HeldTransfer `json:"held"`
 }
 
 // GrantKnownTransfers asks for one bounded transfer batch immediately before its
@@ -96,7 +112,7 @@ func (c *Client) GrantKnownTransfers(ctx context.Context, ref Ref, operation str
 		method: http.MethodPost,
 		path:   publications(ref) + "/" + url.PathEscape(operation) + "/grants",
 		auth:   true, reason: reason, byBytes: true, patient: true,
-		body: map[string]any{"object_ids": objectIDs},
+		body: map[string]any{"object_ids": objectIDs}, strict: true,
 	}, &out)
 	if e != nil {
 		return GrantResponse{}, e
@@ -130,7 +146,7 @@ func (c *Client) GrantKnownTransfers(ctx context.Context, ref Ref, operation str
 	return out, nil
 }
 
-type SealPublicationRequest struct {
+type FinalizePublicationRequest struct {
 	Manifest              string `json:"manifest"`
 	ReleaseEvidenceBase64 string `json:"release_evidence_base64"`
 }
@@ -140,29 +156,71 @@ type ManifestRef struct {
 	Length int64  `json:"length"`
 }
 
-// CompleteResponse is the committed (release,lane)->manifest result. Exact replay
-// returns the original result with duplicate=true.
-type CompleteResponse struct {
+type Encoding struct {
+	Set []string `json:"set"`
+}
+
+type Contract struct {
+	Stamps    map[string][]string `json:"stamps"`
+	Structure string              `json:"structure"`
+	Encoding  Encoding            `json:"encoding"`
+}
+
+// PreparedPublication is the server-derived output returned by finalize. It is
+// durable and resumable, but it is not visible as a model release until CutRelease.
+type PreparedPublication struct {
 	PublishID             string      `json:"publish_id"`
 	Release               string      `json:"release"`
 	Lane                  string      `json:"lane"`
 	Manifest              ManifestRef `json:"manifest"`
+	Contract              Contract    `json:"contract"`
 	TopologyDigest        string      `json:"topology_digest"`
 	Objects               int         `json:"objects"`
 	Bytes                 int64       `json:"bytes"`
 	ReleaseEvidenceBase64 string      `json:"release_evidence_base64"`
+	State                 string      `json:"state"`
 	Duplicate             bool        `json:"duplicate"`
 }
 
-func (c *Client) SealPublication(ctx context.Context, ref Ref, operation string,
-	request SealPublicationRequest, reason string,
-) (CompleteResponse, *exit.Error) {
-	var out CompleteResponse
+func (c *Client) FinalizePublication(ctx context.Context, ref Ref, operation string,
+	request FinalizePublicationRequest, reason string,
+) (PreparedPublication, *exit.Error) {
+	var out PreparedPublication
 	e := c.do(ctx, call{
 		method: http.MethodPost,
-		path:   publications(ref) + "/" + url.PathEscape(operation) + "/seal",
+		path:   publications(ref) + "/" + url.PathEscape(operation) + "/finalize",
 		auth:   true, reason: reason, byBytes: true,
-		body: request, patient: true,
+		body: request, patient: true, strict: true,
+	}, &out)
+	return out, e
+}
+
+type CutLane struct {
+	Lane        string      `json:"lane"`
+	Manifest    ManifestRef `json:"manifest"`
+	Contract    Contract    `json:"contract"`
+	Objects     int         `json:"objects"`
+	Bytes       int64       `json:"bytes"`
+	Publication string      `json:"publication"`
+}
+
+type CutReleaseResponse struct {
+	Operation        string    `json:"operation"`
+	Release          string    `json:"release"`
+	RepositorySHA256 string    `json:"repository_sha256"`
+	Lanes            []CutLane `json:"lanes"`
+	Duplicate        bool      `json:"duplicate"`
+}
+
+func (c *Client) CutRelease(ctx context.Context, ref Ref, release, operation string,
+	publicationIDs []string, reason string,
+) (CutReleaseResponse, *exit.Error) {
+	var out CutReleaseResponse
+	e := c.do(ctx, call{
+		method: http.MethodPost,
+		path:   "/v1/models/" + ref.Org + "/" + ref.Name + "/releases/" + url.PathEscape(release),
+		auth:   true, reason: reason, patient: true, strict: true,
+		body: map[string]any{"operation": operation, "publications": publicationIDs},
 	}, &out)
 	return out, e
 }
