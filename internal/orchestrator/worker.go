@@ -743,7 +743,19 @@ func (c *Orchestrator) ensureLogicalPackageReady(instanceID, rentalID string,
 			} else if !w.spawned.IsZero() {
 				quiet = time.Since(w.spawned)
 			}
-			ready := w.dispatchable[logical.PlanID] && w.placementID != "" &&
+			planID := logical.PlanID
+			if planID == "" && len(logical.Models) > 0 {
+				for candidate, dispatchable := range w.dispatchable {
+					if dispatchable {
+						if planID != "" {
+							planID = ""
+							break
+						}
+						planID = candidate
+					}
+				}
+			}
+			ready := planID != "" && w.dispatchable[planID] && w.placementID != "" &&
 				w.serving == pb.ServingState_SERVING_STATE_DISPATCHABLE &&
 				w.acceptedRevision >= w.revision && w.convergedRevision >= w.revision
 			if ready && (!validDigest(w.packageRevisionDigest) || !validDigest(w.environmentDigest) ||
@@ -761,7 +773,6 @@ func (c *Orchestrator) ensureLogicalPackageReady(instanceID, rentalID string,
 						"worker resolved package release %s, not delegated %s",
 						w.packageRevisionDigest, logical.ReleaseDigest)
 				}
-				planID := logical.PlanID
 				w.spec.Placement = DesiredPlacement{
 					Package: pinnedPackage(logical.Package, rentalID), Release: logical.Release,
 					PackageRevisionDigest: w.packageRevisionDigest,

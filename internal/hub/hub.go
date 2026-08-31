@@ -176,6 +176,21 @@ type PackageCard struct {
 	Releases []ReleaseSummary `json:"releases"`
 }
 
+type ModelLaneSummary struct {
+	Lane       string `json:"lane"`
+	ManifestID string `json:"manifest_id"`
+}
+
+type ModelReleaseSummary struct {
+	ReleaseSummary
+	Lanes []ModelLaneSummary `json:"lanes"`
+}
+
+type ModelCard struct {
+	Model    Resource              `json:"model"`
+	Releases []ModelReleaseSummary `json:"releases"`
+}
+
 func (r Resource) Ref() string { return r.Org + "/" + r.Name }
 
 type call struct {
@@ -302,6 +317,12 @@ func (c *Client) Model(ctx context.Context, ref Ref) (Resource, *exit.Error) {
 	}
 	e := c.do(ctx, call{method: http.MethodGet, path: resourcePath("models", ref)}, &out)
 	return out.Model, e
+}
+
+func (c *Client) ModelCard(ctx context.Context, ref Ref) (ModelCard, *exit.Error) {
+	var out ModelCard
+	e := c.do(ctx, call{method: http.MethodGet, path: resourcePath("models", ref)}, &out)
+	return out, e
 }
 
 func resourcePath(collection string, ref Ref) string {

@@ -215,7 +215,9 @@ func (r *Resolver) ResolveInstall(installID string) (orchestrator.WorkerLaunchSp
 	return facts.Spec(r.Devices)
 }
 
-func (r *Resolver) ResolveRemoteRelease(pkg, release, releaseDigest, function string) (
+func (r *Resolver) ResolveRemoteRelease(pkg, release, releaseDigest, function string,
+	models []orchestrator.ModelRef,
+) (
 	orchestrator.LogicalPackage, *launch.Entrypoint, *exit.Error,
 ) {
 	var empty orchestrator.LogicalPackage
@@ -250,23 +252,63 @@ func (r *Resolver) ResolveRemoteRelease(pkg, release, releaseDigest, function st
 	if problem != nil {
 		return empty, nil, problem
 	}
-	if len(entrypoint.Models) != 0 {
-		return empty, nil, exit.Named(exit.Unavailable, "rental.logical_package_unsupported",
-			"the initial private package lane admits weightless entrypoints only")
+	if len(entrypoint.Models) > 0 && len(descriptor.Entrypoints) != 1 {
+		return empty, nil, exit.Named(exit.Unavailable, "rental.modeled_package_surface_unsupported",
+			"the first modeled rental lane requires one serving entrypoint so its worker-derived binding is unambiguous")
 	}
-	body, err := canonical.Write(map[string]canonical.Value{
-		"name": function, "slots": []canonical.Value{},
-	})
-	if err != nil {
-		return empty, nil, exit.Internalf("cannot derive remote binding identity: %s", err)
+	models = append([]orchestrator.ModelRef(nil), models...)
+	sort.Slice(models, func(i, j int) bool { return models[i].Slot < models[j].Slot })
+	if len(models) != len(entrypoint.Models) {
+		return empty, nil, exit.Named(exit.Validation, "rental.model_selection_incomplete",
+			"%s requires exactly one model for each of its %d slots", function, len(entrypoint.Models))
 	}
-	planID, err := canonical.Spell(canonical.Digest(body))
-	if err != nil {
-		return empty, nil, exit.Internalf("cannot spell remote binding identity: %s", err)
+	bySlot := make(map[string]orchestrator.ModelRef, len(models))
+	for _, model := range models {
+		if _, exists := bySlot[model.Slot]; exists {
+			return empty, nil, exit.Named(exit.Validation, "rental.model_selection_mismatch",
+				"model slot %s was selected more than once", model.Slot)
+		}
+		bySlot[model.Slot] = model
+	}
+	for _, slot := range entrypoint.Models {
+		model, selected := bySlot[slot.Path]
+		if model.Package != pkg || model.Slot != slot.Path || model.Release == "" {
+			return empty, nil, exit.Named(exit.Validation, "rental.model_selection_mismatch",
+				"model selection does not bind exact slot %s", slot.Path)
+		}
+		if !selected {
+			return empty, nil, exit.Named(exit.Validation, "rental.model_selection_mismatch",
+				"model selection does not bind exact slot %s", slot.Path)
+		}
+		if len(slot.Stamps) != 0 {
+			return empty, nil, exit.Named(exit.Unavailable, "rental.model_stamps_unsupported",
+				"model slot %s uses unsupported stamps", slot.Path)
+		}
+		if _, problem := hub.ParseRef(model.Model); problem != nil {
+			return empty, nil, problem
+		}
+		if _, err := canonical.Raw(model.Manifest); err != nil {
+			return empty, nil, exit.Named(exit.Validation, "rental.model_manifest_invalid",
+				"model selection for %s has no exact manifest", slot.Path)
+		}
+	}
+	planID := ""
+	if len(models) == 0 {
+		body, err := canonical.Write(map[string]canonical.Value{
+			"name": function, "slots": []canonical.Value{},
+		})
+		if err != nil {
+			return empty, nil, exit.Internalf("cannot derive remote binding identity: %s", err)
+		}
+		planID, err = canonical.Spell(canonical.Digest(body))
+		if err != nil {
+			return empty, nil, exit.Internalf("cannot spell remote binding identity: %s", err)
+		}
 	}
 	return orchestrator.LogicalPackage{
 		Package: pkg, Release: release, ReleaseDigest: releaseDigest,
 		Function: function, Outputs: launch.AssetPaths(entrypoint.Result), PlanID: planID,
+		Models: models,
 	}, entrypoint, nil
 }
 

@@ -22,6 +22,7 @@ import (
 
 func TestRentalRunAcquiresCheapestOnceAndReleasesFailedPreAttempt(t *testing.T) {
 	const releaseDigest = "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+	const modelManifest = "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
 	var mu sync.Mutex
 	var descriptor []byte
 	var descriptorDigest string
@@ -32,6 +33,13 @@ func TestRentalRunAcquiresCheapestOnceAndReleasesFailedPreAttempt(t *testing.T) 
 		mu.Lock()
 		defer mu.Unlock()
 		switch {
+		case r.Method == http.MethodGet && r.URL.Path == "/v1/models/cozy/tiny":
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"model": map[string]any{"org": "cozy", "name": "tiny"},
+				"releases": []map[string]any{{"release": "1.0.0", "lanes": []map[string]any{{
+					"lane": "bf16", "manifest_id": modelManifest,
+				}}}},
+			})
 		case r.Method == http.MethodGet && r.URL.Path == "/v1/packages/cozy/cozy-weightless-package/releases/1.0.0":
 			_ = json.NewEncoder(w).Encode(map[string]any{
 				"release": map[string]any{
@@ -113,6 +121,10 @@ func TestRentalRunAcquiresCheapestOnceAndReleasesFailedPreAttempt(t *testing.T) 
 	for _, entrypoint := range entrypoints {
 		row := entrypoint.(map[string]any)
 		if row["name"] == "tile" {
+			row["models"] = []any{map[string]any{
+				"class": "TinyModel", "path": "tile.models.model",
+				"stamps": map[string]any{}, "component_use": map[string]any{"core": []any{"tile"}},
+			}}
 			descriptorDocument["entrypoints"] = []any{row}
 		}
 	}
@@ -145,6 +157,7 @@ func TestRentalRunAcquiresCheapestOnceAndReleasesFailedPreAttempt(t *testing.T) 
 	}
 
 	code, out := runCozy(t, root, "run", weightlessRef+"/tile", "size=32", "seed=7",
+		"--model", "model=cozy/tiny@1.0.0#"+modelManifest,
 		"--rental", "--detach", "--idempotency-key", "managed-e2e", "--json")
 	if code != 0 || !strings.Contains(out, `"changed":true`) {
 		t.Fatalf("rental submission [exit %d]\n%s\ndaemon:\n%s", code, out, daemonOutput.String())
@@ -180,12 +193,15 @@ func TestRentalRunAcquiresCheapestOnceAndReleasesFailedPreAttempt(t *testing.T) 
 	mu.Unlock()
 	if request == nil || request.Worker != "pr-managed-e2e" || request.InstallID != "" ||
 		request.Release != "1.0.0" || request.PackageRevisionDigest != releaseDigest ||
+		len(request.Models) != 1 || request.Models[0].Package != weightlessRef ||
+		request.Models[0].Slot != "tile.models.model" || request.Models[0].Model != "cozy/tiny" ||
+		request.Models[0].Release != "1.0.0" || request.Models[0].Manifest != modelManifest ||
 		gotPosts != 1 || gotDeletes != 1 ||
 		body["sku"] != "cheap" || body["max_cost_usd_micros"] != nil || body["max_duration_seconds"] != nil {
 		t.Fatalf("managed lifecycle request=%+v posts=%d deletes=%d body=%v", request, gotPosts, gotDeletes, body)
 	}
 	if gotCreateReason != "" || gotDeleteReason != "" ||
-		strings.Contains(fmt.Sprint(body), weightlessRef) {
+		strings.Contains(fmt.Sprint(body), weightlessRef) || strings.Contains(fmt.Sprint(body), "cozy/tiny") {
 		t.Fatalf("managed rental leaked work identity in reason/body: create=%q delete=%q body=%v",
 			gotCreateReason, gotDeleteReason, body)
 	}
@@ -206,6 +222,7 @@ func TestRentalRunAcquiresCheapestOnceAndReleasesFailedPreAttempt(t *testing.T) 
 		}
 	}
 	code, out = runCozy(t, root, "run", weightlessRef+"/tile", "size=32", "seed=7",
+		"--model", "model=cozy/tiny@1.0.0#"+modelManifest,
 		"--rental", "--detach", "--idempotency-key", "managed-e2e", "--json")
 	mu.Lock()
 	gotPosts = posts

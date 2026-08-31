@@ -41,9 +41,10 @@ type Submission struct {
 	// LocalAssets is the local API's out-of-band input set. Each source path is ingested into
 	// the daemon-owned immutable input store before the request row exists; it never
 	// crosses the worker protocol. The typed payload carries only its opaque reference.
-	LocalAssets []records.AssetBinding `json:"local_assets,omitempty"`
-	Rental      bool                   `json:"rental,omitempty"`
-	AttemptKey  string                 `json:"-"`
+	LocalAssets []records.AssetBinding  `json:"local_assets,omitempty"`
+	Rental      bool                    `json:"rental,omitempty"`
+	Models      []orchestrator.ModelRef `json:"models,omitempty"`
+	AttemptKey  string                  `json:"-"`
 }
 
 // Handle is the 202 answer: the request's id and where to go next. Verbatim from the
@@ -189,6 +190,11 @@ func replaySubmission(sub Submission, recorded records.Request) orchestrator.Sub
 	}
 	assets := append([]records.AssetBinding(nil), sub.LocalAssets...)
 	sort.Slice(assets, func(i, j int) bool { return assets[i].FieldPath < assets[j].FieldPath })
+	models := append([]orchestrator.ModelRef(nil), sub.Models...)
+	if len(models) == 0 {
+		models = append(models, recorded.Models...)
+	}
+	sort.Slice(models, func(i, j int) bool { return models[i].Slot < models[j].Slot })
 	payload := []byte(sub.Input)
 	if len(payload) == 0 {
 		payload = []byte("{}")
@@ -197,7 +203,7 @@ func replaySubmission(sub Submission, recorded records.Request) orchestrator.Sub
 		Package: sub.Package, Entrypoint: sub.Function, Payload: payload,
 		Outputs: outputs, PlanID: planID, Worker: recorded.Worker, Assets: assets,
 		InstallID: sub.InstallID, Release: sub.Release, ReleaseDigest: sub.ReleaseDigest,
-		Rental: sub.Rental,
+		Rental: sub.Rental, Models: models,
 	}
 }
 
@@ -229,6 +235,18 @@ func submissionDigest(spec orchestrator.Submission) (string, *exit.Error) {
 	}
 	if spec.Rental {
 		doc["rental"] = true
+	}
+	if len(spec.Models) > 0 {
+		refs := append([]orchestrator.ModelRef(nil), spec.Models...)
+		sort.Slice(refs, func(i, j int) bool { return refs[i].Slot < refs[j].Slot })
+		models := make([]canonical.Value, 0, len(refs))
+		for _, model := range refs {
+			models = append(models, map[string]canonical.Value{
+				"package": model.Package, "slot": model.Slot, "model": model.Model,
+				"release": model.Release, "manifest": model.Manifest,
+			})
+		}
+		doc["models"] = models
 	}
 	// The pinned rental is NOT in it: a worker id says WHERE the same work runs, and two
 	// submissions of one key that differ only in placement are the same request. What the
@@ -290,6 +308,7 @@ func (s *Server) resolvePlan(sub Submission) (orchestrator.Submission, *exit.Err
 		Package: sub.Package, Entrypoint: sub.Function, Payload: []byte(sub.Input),
 		Outputs: sub.Outputs, PlanID: sub.PlanID, Assets: sub.LocalAssets,
 		Release: sub.Release, ReleaseDigest: sub.ReleaseDigest, Rental: sub.Rental,
+		Models: append([]orchestrator.ModelRef(nil), sub.Models...),
 	}
 	if len(out.Payload) == 0 {
 		out.Payload = []byte("{}")
@@ -301,7 +320,7 @@ func (s *Server) resolvePlan(sub Submission) (orchestrator.Submission, *exit.Err
 			return out, exit.Unavailablef("remote execution requires one exact Tensorhub package release")
 		}
 		logical, entrypoint, e := s.packages.ResolveRemoteRelease(
-			sub.Package, sub.Release, sub.ReleaseDigest, sub.Function)
+			sub.Package, sub.Release, sub.ReleaseDigest, sub.Function, sub.Models)
 		if e != nil {
 			return out, e
 		}
@@ -311,6 +330,7 @@ func (s *Server) resolvePlan(sub Submission) (orchestrator.Submission, *exit.Err
 				"queued remote release does not match the resolved Tensorhub release")
 		}
 		out.PlanID = logical.PlanID
+		out.Models = append([]orchestrator.ModelRef(nil), logical.Models...)
 		if len(out.Outputs) == 0 {
 			out.Outputs = logical.Outputs
 		}

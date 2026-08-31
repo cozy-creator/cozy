@@ -121,6 +121,15 @@ func handleRun(ctx *Context, target Target, ep *launch.Entrypoint) *exit.Error {
 	if e != nil {
 		return e
 	}
+	models := []orchestrator.ModelRef(nil)
+	if managedRental {
+		models, e = resolveRemoteModels(ctx, target.Package, ep, ctx.Inv.Values["--model"])
+		if e != nil {
+			return e
+		}
+	} else if len(ctx.Inv.Values["--model"]) > 0 {
+		return exit.Usagef("--model currently selects models only for --rental execution")
+	}
 
 	c, e := dial(ctx)
 	if e != nil {
@@ -135,6 +144,7 @@ func handleRun(ctx *Context, target Target, ep *launch.Entrypoint) *exit.Error {
 		Package: target.Package, Function: target.Function, Input: input,
 		LocalAssets: assets, InstallID: target.InstallID,
 		Release: target.Release, ReleaseDigest: target.ReleaseDigest, Rental: managedRental,
+		Models: models,
 	}, key)
 	if e != nil {
 		return e
@@ -178,6 +188,151 @@ func handleRun(ctx *Context, target Target, ep *launch.Entrypoint) *exit.Error {
 		return e
 	}
 	return renderRun(ctx, life, terminal, stopped, saved, submitted, began)
+}
+
+func resolveRemoteModels(ctx *Context, packageName string, ep *launch.Entrypoint,
+	specs []string,
+) ([]orchestrator.ModelRef, *exit.Error) {
+	if len(ep.Models) == 0 {
+		if len(specs) != 0 {
+			return nil, exit.Usagef("%s declares no model slots", ep.Name)
+		}
+		return nil, nil
+	}
+	if len(specs) != len(ep.Models) {
+		return nil, exit.Usagef("%s requires exactly one --model for each of its %d model slots",
+			ep.Name, len(ep.Models)).WithRemedy("use --model <slot-or-param>=org/model[@release][#manifest]")
+	}
+	resolved := make([]orchestrator.ModelRef, 0, len(specs))
+	seen := map[string]bool{}
+	for _, spec := range specs {
+		left, right, ok := strings.Cut(strings.TrimSpace(spec), "=")
+		left, right = strings.TrimSpace(left), strings.TrimSpace(right)
+		if !ok || left == "" || right == "" {
+			return nil, exit.Usagef("%q is not slot=org/model[@release][#manifest]", spec)
+		}
+		slot, problem := modelSlot(ep, left)
+		if problem != nil {
+			return nil, problem
+		}
+		if seen[slot.Path] {
+			return nil, exit.Usagef("model slot %s was bound more than once", slot.Path)
+		}
+		row, problem := resolveRemoteModel(ctx, packageName, slot.Path, right)
+		if problem != nil {
+			return nil, problem
+		}
+		seen[slot.Path] = true
+		resolved = append(resolved, row)
+	}
+	for _, slot := range ep.Models {
+		if !seen[slot.Path] {
+			return nil, exit.Usagef("model slot %s has no --model binding", slot.Path)
+		}
+	}
+	sort.Slice(resolved, func(i, j int) bool { return resolved[i].Slot < resolved[j].Slot })
+	return resolved, nil
+}
+
+func modelSlot(ep *launch.Entrypoint, asked string) (*launch.Slot, *exit.Error) {
+	var match *launch.Slot
+	for i := range ep.Models {
+		slot := &ep.Models[i]
+		if asked != slot.Path && asked != slot.Param {
+			continue
+		}
+		if match != nil {
+			return nil, exit.Usagef("model slot %q is ambiguous; use its full descriptor path", asked)
+		}
+		match = slot
+	}
+	if match == nil {
+		return nil, exit.Usagef("%q is not a model slot for %s", asked, ep.Name)
+	}
+	return match, nil
+}
+
+func resolveRemoteModel(ctx *Context, packageName, slotPath, raw string) (
+	orchestrator.ModelRef, *exit.Error,
+) {
+	var empty orchestrator.ModelRef
+	if strings.Count(raw, "#") > 1 {
+		return empty, exit.Usagef("%q carries more than one manifest", raw)
+	}
+	modelRelease, manifest, hasManifest := strings.Cut(raw, "#")
+	if hasManifest && manifest == "" {
+		return empty, exit.Usagef("%q carries an empty manifest", raw)
+	}
+	if manifest != "" {
+		if _, err := canonical.Raw(manifest); err != nil {
+			return empty, exit.Usagef("%q is not a sha256 model manifest", manifest)
+		}
+	}
+	if strings.Count(modelRelease, "@") > 1 {
+		return empty, exit.Usagef("%q carries more than one release", modelRelease)
+	}
+	modelName, release, hasRelease := strings.Cut(modelRelease, "@")
+	if hasRelease && release == "" {
+		return empty, exit.Usagef("%q carries an empty release", raw)
+	}
+	ref, problem := hub.ParseRef(modelName)
+	if problem != nil {
+		return empty, problem
+	}
+	hctx, cancel := hub.Context()
+	defer cancel()
+	card, problem := client(ctx).ModelCard(hctx, ref)
+	if problem != nil {
+		return empty, problem
+	}
+	if card.Model.Ref() != ref.String() {
+		return empty, exit.Named(exit.Conflict, "rental.model_catalog_changed",
+			"Tensorhub returned model %s while resolving %s", card.Model.Ref(), ref.String())
+	}
+	if release == "" {
+		for _, candidate := range card.Releases {
+			if !candidate.Yanked && candidate.YankedAt == "" &&
+				(release == "" || candidate.Release > release) {
+				release = candidate.Release
+			}
+		}
+	}
+	var selected *hub.ModelReleaseSummary
+	for i := range card.Releases {
+		candidate := &card.Releases[i]
+		if candidate.Release == release && !candidate.Yanked && candidate.YankedAt == "" {
+			selected = candidate
+			break
+		}
+	}
+	if selected == nil {
+		return empty, exit.New(exit.NotFound, "model %s has no available release %q", ref.String(), release)
+	}
+	manifests := map[string]bool{}
+	for _, lane := range selected.Lanes {
+		if manifest == "" || lane.ManifestID == manifest {
+			manifests[lane.ManifestID] = true
+		}
+	}
+	if manifest != "" && !manifests[manifest] {
+		return empty, exit.New(exit.NotFound, "model %s@%s does not contain manifest %s",
+			ref.String(), release, manifest)
+	}
+	if manifest == "" {
+		if len(manifests) != 1 {
+			return empty, exit.Usagef("model %s@%s has %d manifests", ref.String(), release, len(manifests)).
+				WithRemedy("append #sha256:<digest> to select one exact manifest")
+		}
+		for digest := range manifests {
+			manifest = digest
+		}
+	}
+	if _, err := canonical.Raw(manifest); err != nil {
+		return empty, exit.Named(exit.Conflict, "rental.model_manifest_invalid",
+			"Tensorhub returned an invalid manifest for %s@%s", ref.String(), release)
+	}
+	return orchestrator.ModelRef{Package: packageName, Slot: slotPath,
+		Model: ref.String(), Release: release, Manifest: manifest}, nil
 }
 
 func handleRunCancel(ctx *Context) *exit.Error {

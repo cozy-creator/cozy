@@ -39,11 +39,12 @@ func SignDownloadDelegation(l home.Layout, connection *orchestrator.WorkerConnec
 		return packages[i].Package+"\x00"+packages[i].Release < packages[j].Package+"\x00"+packages[j].Release
 	})
 	sort.Slice(models, func(i, j int) bool {
-		left := models[i].Model + "\x00" + models[i].Release + "\x00" + models[i].Manifest
-		right := models[j].Model + "\x00" + models[j].Release + "\x00" + models[j].Manifest
+		left := modelKey(models[i])
+		right := modelKey(models[j])
 		return left < right
 	})
 	prior := ""
+	delegatedPackages := map[string]bool{}
 	for _, row := range packages {
 		key := ""
 		if row != nil {
@@ -54,17 +55,17 @@ func SignDownloadDelegation(l home.Layout, connection *orchestrator.WorkerConnec
 			return nil, nil, exit.Named(exit.Validation, "rental.delegation_package_invalid",
 				"download packages must be complete, unique logical refs")
 		}
+		delegatedPackages[row.Package] = true
 		prior = key
 	}
 	prior = ""
 	for _, row := range models {
-		key := ""
-		if row != nil {
-			key = row.Model + "\x00" + row.Release + "\x00" + row.Manifest
-		}
+		key := modelKey(row)
 		_, digestErr := canonical.Raw(row.GetManifest())
 		if row == nil || strings.TrimSpace(row.Model) != row.Model || row.Model == "" ||
 			strings.TrimSpace(row.Release) != row.Release || row.Release == "" ||
+			strings.TrimSpace(row.Package) != row.Package || !delegatedPackages[row.Package] ||
+			strings.TrimSpace(row.Slot) != row.Slot || row.Slot == "" ||
 			digestErr != nil || key <= prior {
 			return nil, nil, exit.Named(exit.Validation, "rental.delegation_model_invalid",
 				"download models must be complete, unique logical refs with exact manifests")
@@ -88,6 +89,14 @@ func SignDownloadDelegation(l home.Layout, connection *orchestrator.WorkerConnec
 		return nil, nil, problem
 	}
 	return document, identity.Sign(document), nil
+}
+
+func modelKey(row *pb.DownloadModelRef) string {
+	if row == nil {
+		return ""
+	}
+	return row.Package + "\x00" + row.Slot + "\x00" + row.Model + "\x00" +
+		row.Release + "\x00" + row.Manifest
 }
 
 func PackageSetSigner(l home.Layout) orchestrator.RentalPackageSetSource {

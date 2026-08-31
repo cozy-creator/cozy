@@ -118,7 +118,10 @@ type LogicalPackage struct {
 	Function      string
 	Outputs       []string
 	PlanID        string
+	Models        []ModelRef
 }
+
+type ModelRef = records.ModelRef
 
 // Orchestrator is the Cozy daemon's scheduling role.
 type Orchestrator struct {
