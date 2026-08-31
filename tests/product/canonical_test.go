@@ -303,6 +303,9 @@ func TestPackageDescriptor(t *testing.T) {
 		"unsupported constraint": bytes.Replace(raw, []byte(`"gt":0`), []byte(`"lt":1`), 1),
 		"retired enum grammar": bytes.Replace(raw, []byte(`{"literal":["fast","quality"]}`),
 			[]byte(`{"enum":"Mode","values":["fast","quality"]}`), 1),
+		"model production omitted": bytes.Replace(raw, []byte(`,"model_productions":[]`), nil, 1),
+		"non-empty model production": bytes.Replace(raw, []byte(`"model_productions":[]`),
+			[]byte(`"model_productions":[{}]`), 1),
 	} {
 		if _, refusal := launch.DecodeDescriptor(planted); refusal == nil {
 			t.Errorf("%s was accepted at the descriptor boundary", name)

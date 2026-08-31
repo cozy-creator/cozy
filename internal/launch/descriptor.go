@@ -182,7 +182,10 @@ func validateClosedDescriptor(data []byte) error {
 	}
 	var productions []json.RawMessage
 	if err := json.Unmarshal(root["model_productions"], &productions); err != nil {
-		return err
+		return fmt.Errorf("model_productions must be an array")
+	}
+	if len(productions) != 0 {
+		return fmt.Errorf("model_productions must remain empty until Creator implements its production contract")
 	}
 	for collection, kind := range map[string]string{"entrypoints": "entrypoint", "jobs": "job"} {
 		var rows []json.RawMessage
