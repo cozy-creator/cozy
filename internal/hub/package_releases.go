@@ -1,6 +1,6 @@
 package hub
 
-// Typed package release/profile routes.
+// Typed package publication and download routes.
 
 import (
 	"context"
