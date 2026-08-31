@@ -15,7 +15,7 @@ import (
 )
 
 const (
-	MaxDependencyWheels     = 32
+	MaxDependencyWheels     = 128
 	MaxDependencyWheelBytes = 512 << 20
 	maxWorkspaceAncestors   = 32
 	maxWorkspacePatterns    = 64

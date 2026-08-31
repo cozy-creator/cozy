@@ -28,7 +28,7 @@ the dependency authority, and the lock selects exact ordinary registry wheels.
 For each runtime requirement backed by a local path or workspace member in `[tool.uv.sources]`, Cozy
 recursively builds a separate non-editable wheel. Requested extras recursively activate their matching
 `[project.optional-dependencies]` groups. Cycles, conflicting normalized names, incompatible
-versions, more than 32 wheels, or more than 512 MiB of dependency wheels refuse before publication.
+versions, more than 128 wheels, or more than 512 MiB of dependency wheels refuse before publication.
 For ordinary registry requirements, Cozy runs `uv export --locked` and downloads exact
 `py3-none-any` wheels from PyPI. Native-only, source-only, direct URL, VCS, and alternate-index
 requirements are refused. Development dependency groups are ignored.
