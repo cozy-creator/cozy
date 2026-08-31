@@ -82,17 +82,6 @@ func HostRuntime() (string, *exit.Error) {
 	return path, nil
 }
 
-// RefreshGenerationBase observes the exact Runtime carried by an installed generation.
-// Production remote preflight receives these bytes from Tensorhub; product proofs use this
-// owner function to furnish an equally exact active-base response without opening another
-// Runtime execution door.
-func RefreshGenerationBase(generation records.PackageInstall, cozyHome, path string,
-	env []string,
-) *exit.Error {
-	runtime := RuntimeCLI{Bin: Binary(generation), Dir: SourceDir(generation), Home: cozyHome, Env: env}
-	return runtime.call(nil, "local-base", "--out", path)
-}
-
 // json runs one verb and decodes its `--json` document.
 func (r RuntimeCLI) call(out any, verb ...string) *exit.Error {
 	return r.callContext(context.Background(), out, verb...)

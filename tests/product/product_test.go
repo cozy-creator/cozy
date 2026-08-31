@@ -1012,9 +1012,6 @@ func TestUpDoesNotRequireLocalRuntime(t *testing.T) {
 		t.Fatalf("remote-capable daemon required a local Runtime [exit %d]\n%s",
 			result.code, result.output)
 	}
-	if _, err := os.Stat(filepath.Join(root, "local-base.json")); !os.IsNotExist(err) {
-		t.Fatalf("up created local package state without a local install: %v", err)
-	}
 }
 
 func TestRentalCatalog(t *testing.T) {

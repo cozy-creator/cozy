@@ -64,20 +64,6 @@ func preparePublished(l home.Layout, genDir string, published *PublishedSource) 
 			"the published package environment provides no cozy-runtime").
 			WithRemedy("declare cozy-runtime in pyproject.toml and refresh uv.lock")
 	}
-	baseManifest := filepath.Join(genDir, "base-manifest.json")
-	baseCommand := exec.Command(runtimeBin, "--json", "--dir", sourceDir,
-		"local-base", "--out", baseManifest)
-	baseCommand.Env = config.Frozen().Tool("COZY_HOME=" + l.Root)
-	var baseOutput strings.Builder
-	baseCommand.Stdout, baseCommand.Stderr = &baseOutput, &baseOutput
-	baseErr := baseCommand.Run()
-	if baseCommand.ProcessState == nil {
-		return nil, empty, "", nil, exit.Internalf("cannot run %s: %s", runtimeBin, baseErr)
-	}
-	if code := baseCommand.ProcessState.ExitCode(); code != 0 {
-		return nil, empty, "", nil, metadataRefusal(code, "local-base", baseOutput.String())
-	}
-
 	args := []string{"--json", "prepare-package",
 		"--artifact-store", l.CAS,
 		"--package", published.Package,
@@ -86,7 +72,6 @@ func preparePublished(l home.Layout, genDir string, published *PublishedSource) 
 		"--project-wheel", published.ProjectWheel.Path,
 		"--artifact-cache", cache,
 		"--environment-python", home.VenvPython(venvDir),
-		"--base-manifest", baseManifest,
 	}
 	for _, wheel := range published.Wheels {
 		args = append(args, "--dependency-wheel", wheel.Path)
@@ -161,21 +146,15 @@ func preparePublished(l home.Layout, genDir string, published *PublishedSource) 
 		return nil, empty, "", nil, exit.Internalf("cannot remove prepared project-wheel view: %s", err)
 	}
 	for _, wheel := range published.Wheels {
-		if selectedDependencies[wheel.Digest] {
-			if err := os.Remove(wheel.Path); err != nil {
-				return nil, empty, "", nil, exit.Internalf(
-					"cannot remove prepared dependency-wheel view: %s", err)
-			}
-			continue
+		if !selectedDependencies[wheel.Digest] {
+			return nil, empty, "", nil, exit.Named(exit.Structural,
+				"package_placement_incomplete",
+				"cozy-runtime omitted published dependency %s from the local package placement",
+				wheel.Filename)
 		}
-		// Runtime proved this dependency is already owned by the observed base.
-		// Its arriving carrier has no execution consumer and does not survive install.
-		for _, path := range []string{wheel.Path,
-			filepath.Join(cache, strings.TrimPrefix(wheel.Digest, "sha256:"))} {
-			if err := os.Remove(path); err != nil {
-				return nil, empty, "", nil, exit.Internalf(
-					"cannot discard redundant base dependency %s: %s", wheel.Filename, err)
-			}
+		if err := os.Remove(wheel.Path); err != nil {
+			return nil, empty, "", nil, exit.Internalf(
+				"cannot remove prepared dependency-wheel view: %s", err)
 		}
 	}
 	// The placement records the exact wheel subset used by a rental base. The local

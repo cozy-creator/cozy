@@ -230,7 +230,6 @@ type WorkerLaunchSpec struct {
 	EnvironmentRoot   string       `json:"environment_root,omitempty"`
 	EnvironmentPython string       `json:"environment_python,omitempty"` // preinstalled package venv
 	ArtifactStore     string       `json:"artifact_store,omitempty"`
-	BaseManifest      string       `json:"base_manifest,omitempty"`
 	// Placement is what this worker is launched to host. LAUNCH CLAMPS THE SET TO ONE
 	// (worker-protocol header): a longer set is a typed refusal at the worker, so this
 	// side names one placement rather than pretending to a generality it cannot deliver.
@@ -979,7 +978,6 @@ func (c *Orchestrator) spawnWorker(spec WorkerLaunchSpec) (string, *exit.Error) 
 		{"--environment-root", spec.EnvironmentRoot},
 		{"--environment-python", spec.EnvironmentPython},
 		{"--artifact-store", spec.ArtifactStore},
-		{"--base-manifest", spec.BaseManifest},
 	} {
 		if option.value != "" {
 			args = append(args, option.flag, option.value)
