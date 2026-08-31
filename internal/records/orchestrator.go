@@ -815,6 +815,30 @@ func (s *Store) PrivatePackageInUse(digest, packageName, release,
 	return used != 0, nil
 }
 
+// CanceledPrivatePackages are durable transfer tombstones owed to one attached worker. Replaying
+// them on every claimed session is idempotent and finishes cleanup after a daemon/stream crash.
+func (s *Store) CanceledPrivatePackages(workerID string) ([]Request, *exit.Error) {
+	rows, err := s.db.Query(`SELECT `+requestCols+` FROM requests
+		WHERE state='canceled' AND worker=? AND private_package_digest<>''
+		ORDER BY created_at,id`, workerID)
+	if err != nil {
+		return nil, exit.Internalf("cannot read canceled private package transfers: %s", err)
+	}
+	defer rows.Close()
+	var out []Request
+	for rows.Next() {
+		row, err := scanRequest(rows)
+		if err != nil {
+			return nil, exit.Internalf("cannot scan canceled private package transfer: %s", err)
+		}
+		out = append(out, row)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, exit.Internalf("cannot finish canceled private package transfers: %s", err)
+	}
+	return out, nil
+}
+
 // SettleRequest records the request's final state. Only a terminal the orchestrator
 // ACCEPTED can settle one.
 func (s *Store) SettleRequest(id, state string) *exit.Error {

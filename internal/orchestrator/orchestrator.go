@@ -785,7 +785,7 @@ func (c *Orchestrator) CancelQueued(requestID string) *exit.Error {
 		}
 		return exit.Internalf("canceled request %s cannot be read back", requestID)
 	}
-	c.cancelPrivateTransfer(requestID)
+	abortProblem := c.cancelPrivateTransfer(requestID)
 	c.forget(requestID)
 	c.frames.forget(requestID)
 	c.logf("%s left the dispatch queue: canceled before any attempt", requestID)
@@ -798,7 +798,7 @@ func (c *Orchestrator) CancelQueued(requestID string) *exit.Error {
 	if problem := c.releaseManagedNow(*row); problem != nil {
 		return problem
 	}
-	return nil
+	return abortProblem
 }
 
 func (c *Orchestrator) forget(requestID string) {

@@ -20,6 +20,13 @@ type privateTransfer struct {
 	canceled           bool
 	files              map[string]privateTransferFile
 	status             map[string]privateTransferStatus
+	abortC             chan privateAbortStatus
+}
+
+type privateAbortStatus struct {
+	outcome pb.PrivatePackageAbortOutcome
+	code    string
+	detail  string
 }
 
 type privateTransferFile struct {
@@ -105,7 +112,8 @@ func privateSelection(operationID string, revision privatepackage.Revision) (
 	selected.Package.PrivateRevisionDigest = privateDigest
 	transfer := &privateTransfer{revision: revision.Digest, source: source,
 		files:  make(map[string]privateTransferFile, len(revision.Files)),
-		status: make(map[string]privateTransferStatus, len(revision.Files))}
+		status: make(map[string]privateTransferStatus, len(revision.Files)),
+		abortC: make(chan privateAbortStatus, 1)}
 	var prior []byte
 	var total uint64
 	projects := 0
@@ -202,12 +210,44 @@ func (c *Orchestrator) bindPrivateTransfer(instanceID, operationID string,
 	return held, nil
 }
 
-func (c *Orchestrator) cancelPrivateTransfer(operationID string) {
+func (c *Orchestrator) cancelPrivateTransfer(operationID string) *exit.Error {
 	c.mu.Lock()
-	defer c.mu.Unlock()
-	if transfer := c.privateTransfers[operationID]; transfer != nil {
-		transfer.canceled = true
-		transfer.status = nil
+	transfer := c.privateTransfers[operationID]
+	if transfer == nil {
+		c.mu.Unlock()
+		return nil
+	}
+	transfer.canceled = true
+	transfer.status = nil
+	s := c.sessions[transfer.bootID]
+	c.mu.Unlock()
+	if s == nil || s.instanceID != transfer.instanceID || s.generation != transfer.generation {
+		return exit.Unavailablef("private package transfer has no current worker session to abort")
+	}
+	privateDigest, privateErr := canonical.Raw(transfer.revision)
+	if privateErr != nil {
+		return exit.Internalf("cannot decode private package abort identity: %s", privateErr)
+	}
+	abort := &pb.PrivatePackageAbort{RecordOwnerEpoch: recordOwnerEpoch,
+		ControlStreamGeneration: s.generation, WorkerBootId: s.bootID,
+		OperationId: operationID, SourceDigest: append([]byte(nil), transfer.source...),
+		PrivateRevisionDigest: privateDigest}
+	if !s.send(&pb.RecordOwnerFrame{Msg: &pb.RecordOwnerFrame_PrivatePackageAbort{
+		PrivatePackageAbort: abort}}) {
+		return exit.Unavailablef("worker control stream closed before private package abort")
+	}
+	select {
+	case result := <-transfer.abortC:
+		if result.outcome == pb.PrivatePackageAbortOutcome_PRIVATE_PACKAGE_ABORT_OUTCOME_REFUSED {
+			return exit.Named(exit.Conflict, result.code,
+				"worker refused private package abort: %s", result.detail)
+		}
+		return nil
+	case <-s.ctx.Done():
+		return exit.Unavailablef("worker control stream closed during private package abort")
+	case <-time.After(SilentReports * ReportCadence):
+		return exit.Named(exit.Failed, "private_package_abort_silent",
+			"worker did not acknowledge private package abort")
 	}
 }
 
@@ -441,6 +481,51 @@ func (c *Orchestrator) onPrivatePackageFileStatus(current *session,
 	}
 	transfer.status[spelled] = privateTransferStatus{state: frame.State,
 		received: frame.ReceivedBytes, safeCode: frame.SafeCode, safeDetail: frame.SafeDetail}
+}
+
+func (c *Orchestrator) onPrivatePackageAbortStatus(current *session,
+	frame *pb.PrivatePackageAbortStatus,
+) {
+	c.mu.Lock()
+	transfer := c.privateTransfers[frame.OperationId]
+	if transfer == nil || current == nil || transfer.instanceID != current.instanceID ||
+		transfer.bootID != current.bootID || transfer.generation != current.generation ||
+		!bytes.Equal(frame.SourceDigest, transfer.source) {
+		c.mu.Unlock()
+		return
+	}
+	digest, err := canonical.Spell(frame.PrivateRevisionDigest)
+	if err != nil || digest != transfer.revision {
+		c.mu.Unlock()
+		return
+	}
+	channel := transfer.abortC
+	c.mu.Unlock()
+	select {
+	case channel <- privateAbortStatus{outcome: frame.Outcome, code: frame.SafeCode,
+		detail: frame.SafeDetail}:
+	default:
+	}
+}
+
+func (c *Orchestrator) replayPrivateAborts(current *session, workerID string) {
+	rows, problem := c.opt.Store.CanceledPrivatePackages(workerID)
+	if problem != nil {
+		c.logf("cannot replay private package aborts for %s: %s", workerID, problem.Message)
+		return
+	}
+	for _, row := range rows {
+		source, sourceErr := canonical.Raw(row.PackageRevisionDigest)
+		revision, revisionErr := canonical.Raw(row.PrivatePackageDigest)
+		if sourceErr != nil || revisionErr != nil {
+			c.logf("canceled request %s has invalid private abort identity", row.ID)
+			continue
+		}
+		_ = current.send(&pb.RecordOwnerFrame{Msg: &pb.RecordOwnerFrame_PrivatePackageAbort{
+			PrivatePackageAbort: &pb.PrivatePackageAbort{RecordOwnerEpoch: recordOwnerEpoch,
+				ControlStreamGeneration: current.generation, WorkerBootId: current.bootID,
+				OperationId: row.ID, SourceDigest: source, PrivateRevisionDigest: revision}}})
+	}
 }
 
 func (c *Orchestrator) issuePrivatePackageSet(s *session, w *worker,

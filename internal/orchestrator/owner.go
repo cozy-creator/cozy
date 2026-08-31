@@ -366,6 +366,13 @@ func (c *Orchestrator) converse(w *worker, addr string) error {
 				continue
 			}
 			c.onPrivatePackageFileStatus(s, status)
+		case *pb.WorkerFrame_PrivatePackageAbortStatus:
+			status := m.PrivatePackageAbortStatus
+			if c.fenced(s, status.RecordOwnerEpoch, status.ControlStreamGeneration,
+				status.WorkerBootId) {
+				continue
+			}
+			c.onPrivatePackageAbortStatus(s, status)
 		case *pb.WorkerFrame_ArtifactReceipt:
 			receipt := m.ArtifactReceipt
 			if c.fenced(s, receipt.RecordOwnerEpoch, receipt.ControlStreamGeneration,
@@ -628,6 +635,7 @@ func (c *Orchestrator) onSnapshot(w *worker, s *session, snap *pb.WorkerSnapshot
 	}
 	if w.spec.Connection != nil {
 		c.signalAllProductions()
+		c.replayPrivateAborts(s, w.spec.Connection.RentalID)
 		c.mu.Lock()
 		private := clonePrivatePackageSet(w.desiredPrivate)
 		packages := clonePackageRefs(w.desiredPackages)
