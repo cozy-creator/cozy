@@ -273,17 +273,42 @@ func ensureProductionRental(ctx *Context, layout home.Layout, store *records.Sto
 		return eligible[i].Name < eligible[j].Name
 	})
 	sku := eligible[0]
-	fleet := &managedRentals{ctx: ctx, layout: layout, store: store}
-	line, rate, problem := fleet.admit(sku.Name)
+	if operation.SelectedSKU != "" {
+		found := false
+		for _, candidate := range eligible {
+			if candidate.Name == operation.SelectedSKU {
+				sku, found = candidate, true
+				break
+			}
+		}
+		if !found {
+			return "", exit.Named(exit.Capacity, "model_production.selected_sku_unavailable",
+				"selected rental SKU %s no longer meets the production resource floor",
+				operation.SelectedSKU)
+		}
+	}
+	operationKey := "model-production-rental-" + operation.ID
+	rentalOperation, problem := store.RentalOperation(operationKey)
 	if problem != nil {
 		return "", problem
 	}
-	fmt.Fprintln(ctx.Err, line)
+	rate := sku.PriceUSDMicrosPerHour
+	if rentalOperation == nil {
+		fleet := &managedRentals{ctx: ctx, layout: layout, store: store}
+		line, admittedRate, admitProblem := fleet.admit(sku.Name)
+		if admitProblem != nil {
+			return "", admitProblem
+		}
+		fmt.Fprintln(ctx.Err, line)
+		rate = admittedRate
+	} else {
+		rate = rentalOperation.HourlyRateUSDMicros
+	}
 	if problem = store.SelectModelProductionSKU(operation.ID, sku.Name); problem != nil {
 		return "", problem
 	}
 	row, _, _, problem := acquireRental(ctx, layout, store, sku.Name, "",
-		"model-production-rental-"+operation.ID, "cozy model publish "+plan.Destination,
+		operationKey, "cozy model publish "+plan.Destination,
 		rate, ctx.Cfg.RentalsMaxHourlySpendUSDMicros, time.Time{}, "")
 	if problem != nil {
 		return "", problem
