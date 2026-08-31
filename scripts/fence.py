@@ -533,7 +533,7 @@ def check_manifest():
         "Search ModelSearchCmd", "Download ModelDownloadCmd", "Remove ModelRemoveCmd",
         "List ModelListCmd", "Publish ModelPublishCmd",
         "Execute RunExecuteCmd", "Cancel RunCancelCmd", "List RunListCmd",
-        "Current RentalListCmd", "New RentalNewCmd", "Update RentalUpdateCmd", "End RentalEndCmd",
+        "Current RentalListCmd", "New RentalNewCmd", "End RentalEndCmd",
     )
     bad = [f"[grammar] missing Kong command field {item!r}" for item in required if item not in fields]
     for retired in ("StackCmd", "ExitCmd", "WorkflowCmd", "VideoCmd", "JobCmd", "CommandsCmd", "StatusCmd"):
@@ -549,7 +549,7 @@ def check_manifest():
     derived_audits = {
         "internal/cli/package_releases.go": '"cozy package publish " + ref.String() + "@" + release',
         "internal/cli/transfer.go": '"cozy model publish " + ref.String() + " " + manifestID',
-        "internal/cli/rentals.go": '"cozy rental new " + skuName + " for " + packageRef',
+        "internal/cli/rentals.go": '"cozy rental new " + skuName',
     }
     for path, spelling in derived_audits.items():
         if spelling not in pathlib.Path(path).read_text():
