@@ -36,9 +36,9 @@ Source custody is limited to 20,000 files and 512 MiB total; each source file is
 and `uv.lock` to 16 MiB. The three required files must be non-empty.
 
 Creator omits only the remote platform families that a rental may not replace: Python, Torch,
-Runtime, TensorFS, and their platform closure. Ordinary libraries remain package-owned. Runtime
-compares those platform requirements with the base Tensorhub selected before installing the package
-environment.
+Runtime, TensorFS, and the small declared native platform closure shared by the supported Torch
+bases. Ordinary pure-Python libraries remain package-owned. Runtime compares those platform
+requirements with the base Tensorhub selected before installing the package environment.
 
 For local installation, Creator creates a normal uv venv using the release's Python requirement.
 It exports the already-committed `uv.lock` with `--frozen` because author-local source paths no
