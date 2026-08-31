@@ -30,7 +30,55 @@ type SourceFile struct {
 	Length int64  `json:"length"`
 }
 
+// Instruction is the canonical caller intent recorded before any mutable package
+// selector is resolved. Its identity deliberately excludes every resolved release,
+// descriptor, source inventory, worker, rental, price, credential, and attempt fact.
+type Instruction struct {
+	Destination string `json:"destination"`
+	Release     string `json:"release"`
+	Source      string `json:"source"`
+	InputLane   string `json:"input_lane,omitempty"`
+	Producer    string `json:"producer"`
+	Rental      bool   `json:"rental"`
+}
+
+func (i Instruction) Bytes() ([]byte, error) { return json.Marshal(i) }
+
+func ParseInstruction(data []byte) (Instruction, error) {
+	var instruction Instruction
+	decoder := json.NewDecoder(bytes.NewReader(data))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(&instruction); err != nil {
+		return instruction, err
+	}
+	var trailing any
+	if err := decoder.Decode(&trailing); err != io.EOF {
+		return instruction, fmt.Errorf("model production instruction carries trailing JSON")
+	}
+	canonical, err := instruction.Bytes()
+	if err != nil || !bytes.Equal(canonical, data) {
+		return instruction, fmt.Errorf("model production instruction is not the one canonical spelling")
+	}
+	return instruction, nil
+}
+
+func (i Instruction) Digest() (string, error) {
+	data, err := i.Bytes()
+	if err != nil {
+		return "", err
+	}
+	sum := sha256.Sum256(data)
+	return "sha256:" + hex.EncodeToString(sum[:]), nil
+}
+
+func (i Instruction) ID() string {
+	data, _ := i.Bytes()
+	sum := sha256.Sum256(append([]byte("cozy-model-production-instruction/1\x00"), data...))
+	return "modelpub-" + hex.EncodeToString(sum[:])
+}
+
 type Plan struct {
+	Instruction       Instruction
 	Destination       string
 	Release           string
 	Source            string
@@ -91,6 +139,9 @@ func (p Plan) Digest() (string, error) {
 // refresh, pricing, and replay. Descriptor identity already binds node edges,
 // assets, resources, required outputs, lane keys, and required contracts.
 func (p Plan) ID() string {
+	if p.Instruction.Destination != "" {
+		return p.Instruction.ID()
+	}
 	hash := sha256.New()
 	for _, value := range []string{
 		"cozy-model-production/1", p.Destination, p.Release, p.Source,

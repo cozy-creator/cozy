@@ -300,7 +300,13 @@ func TestRemoteModelProductionResolvesHubMetadataWithoutLocalInstall(t *testing.
 }
 
 func TestModelProductionOperationSurvivesRestartAndReplaysExactly(t *testing.T) {
+	instruction := modelproduction.Instruction{
+		Destination: "tensorhub/minimax-h3", Release: "h3-2026-08-31",
+		Source:   "hf://MiniMaxAI/MiniMax-H3@" + strings.Repeat("a", 40),
+		Producer: "tensorhub/minimax-h3-tools/four-lane", Rental: true,
+	}
 	plan := modelproduction.Plan{
+		Instruction: instruction,
 		Destination: "tensorhub/minimax-h3", Release: "1.0.0",
 		Source:          "hf://MiniMaxAI/MiniMax-H3@" + strings.Repeat("a", 40),
 		SourceSelection: "sha256:" + strings.Repeat("b", 64),
@@ -326,21 +332,30 @@ func TestModelProductionOperationSurvivesRestartAndReplaysExactly(t *testing.T) 
 	path := filepath.Join(t.TempDir(), "records.db")
 	store, problem := records.Open(path)
 	fatal(t, problem)
-	created, replay, problem := store.BeginModelProduction(records.ModelProductionOperation{
-		ID: plan.ID(), PlanDigest: digest, Plan: data,
-	})
+	instructionBytes, err := instruction.Bytes()
+	must(t, err)
+	instructionDigest, err := instruction.Digest()
+	must(t, err)
+	created, replay, problem := store.BeginModelProductionInstruction(
+		instruction.ID(), instructionDigest, instructionBytes)
 	fatal(t, problem)
-	if replay || created.State != "accepted" || created.NodeIndex != 0 {
+	if replay || created.State != "resolving" || created.NodeIndex != 0 ||
+		!bytes.Equal(created.Plan, instructionBytes) {
 		t.Fatalf("created operation = %+v replay=%t", created, replay)
+	}
+	created, replay, problem = store.AttachModelProductionPlan(instruction.ID(), instructionDigest,
+		instructionBytes, data, digest)
+	fatal(t, problem)
+	if replay || created.State != "accepted" || !bytes.Equal(created.Plan, data) {
+		t.Fatalf("accepted operation = %+v replay=%t", created, replay)
 	}
 	store.Close()
 
 	store, problem = records.Open(path)
 	fatal(t, problem)
 	defer store.Close()
-	replayed, replay, problem := store.BeginModelProduction(records.ModelProductionOperation{
-		ID: plan.ID(), PlanDigest: digest, Plan: data,
-	})
+	replayed, replay, problem := store.BeginModelProductionInstruction(
+		instruction.ID(), instructionDigest, instructionBytes)
 	fatal(t, problem)
 	if !replay || replayed.CreatedAt != created.CreatedAt || !bytes.Equal(replayed.Plan, data) {
 		t.Fatalf("restarted replay = %+v replay=%t", replayed, replay)
@@ -355,9 +370,14 @@ func TestModelProductionOperationSurvivesRestartAndReplaysExactly(t *testing.T) 
 		current.RentalID != "rental-1" {
 		t.Fatalf("advanced operation = %+v", current)
 	}
-	if _, _, problem := store.BeginModelProduction(records.ModelProductionOperation{
-		ID: plan.ID(), PlanDigest: digest, Plan: append(data, '\n'),
-	}); problem == nil || problem.Name != "model_production.identity_conflict" {
+	changedInstruction := instruction
+	changedInstruction.Producer = "tensorhub/other/production"
+	changedBytes, err := changedInstruction.Bytes()
+	must(t, err)
+	changedDigest, err := changedInstruction.Digest()
+	must(t, err)
+	if _, _, problem := store.BeginModelProductionInstruction(plan.ID(), changedDigest,
+		changedBytes); problem == nil || problem.Name != "model_production.identity_conflict" {
 		t.Fatalf("changed replay bytes = %v", problem)
 	}
 	if problem := store.AdvanceModelProduction(plan.ID(), "node_running", "completed", 1, "rental-1"); problem == nil || problem.Name != "model_production.transition_invalid" {
