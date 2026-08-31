@@ -1,6 +1,6 @@
 # TensorFS
 
-The current release is `0.0.3`.
+The current release is `0.0.4`.
 
 TensorFS stores every domain repository as the same graph:
 
@@ -134,7 +134,7 @@ tfs ingest bank <dialect> <family> <variant> <converter> \
   [--member <component>=<canonical-provider-member>]... --order <order.json>
 
 tfs ingest source-plan --carrier [<reviewed-member>=]<path>... \
-  --out <source-plan.json>
+  [--source-profile <reviewed-name>] --out <source-plan.json>
 tfs ingest plan --source-plan <source-plan.json>
 tfs ingest run <store> --source-plan <source-plan.json>
 ```
@@ -157,7 +157,9 @@ target               component=encoding,...
 The reviewed product registry is compiled into `tfs`; users do not configure or download it. The
 explicit `--registry` flag remains only for platform review and tests. A provider may present a
 superset of candidate headers. TensorFS selects one exact reviewed subset and refuses if zero or
-multiple profile assignments survive, so adapters never choose a variant by filename.
+multiple profile assignments survive, so adapters never choose a variant by filename. A reviewed
+production may name its exact required source profile; this narrows only the registry profile, while
+the same header/member proof still has to match it exactly.
 
 The plan/run consumers do not trust or reinterpret the asserted fields. They re-read the
 unlabelled carrier headers and exact registry, reproduce the unique source plan byte-for-byte, then

@@ -849,8 +849,24 @@ fn derive_source_plan(f: &Flags) -> Result<Value, ExitCode> {
         }
     }
 
+    let requested_profile = flag(f, "source-profile");
+    if let Some(name) = requested_profile {
+        if !registry
+            .source_profiles
+            .iter()
+            .any(|profile| profile.name == name)
+        {
+            eprintln!(
+                "REFUSED UNREGISTERED_FINGERPRINT: reviewed source profile {name:?} is absent"
+            );
+            return Err(ExitCode::FAILURE);
+        }
+    }
     let mut matches = Vec::new();
     for profile in &registry.source_profiles {
+        if requested_profile.is_some_and(|name| name != profile.name) {
+            continue;
+        }
         for assignments in profile_assignments(profile, &registry, &paths, &headers) {
             matches.push((profile, assignments));
             if matches.len() >= 2 {
@@ -1080,8 +1096,8 @@ fn read_closed_source_plan(path: &Path) -> Result<ClosedSourcePlan, ExitCode> {
         Ok(value) => value.to_string(),
         Err(error) => return Err(bail(error)),
     };
-    let _profile = match fields.req_str("profile") {
-        Ok(value) => value,
+    let profile = match fields.req_str("profile") {
+        Ok(value) => value.to_string(),
         Err(error) => return Err(bail(error)),
     };
     let registry = match fields.req_str("registry") {
@@ -1142,6 +1158,7 @@ fn read_closed_source_plan(path: &Path) -> Result<ClosedSourcePlan, ExitCode> {
     if registry != BUILTIN_REGISTRY {
         derive_flags.push(("registry".to_string(), registry.clone()));
     }
+    derive_flags.push(("source-profile".to_string(), profile.clone()));
     for carrier in &carriers {
         let path = carrier.path.to_string_lossy();
         derive_flags.push((
