@@ -18,6 +18,7 @@ import (
 	"github.com/cozy-creator/cozy/internal/inputasset"
 	"github.com/cozy-creator/cozy/internal/launch"
 	"github.com/cozy-creator/cozy/internal/orchestrator"
+	"github.com/cozy-creator/cozy/internal/privatepackage"
 	"github.com/cozy-creator/cozy/internal/records"
 	"github.com/cozy-creator/cozy/internal/resultfiles"
 	pb "github.com/cozy-creator/cozy/protocol/cozy/worker/v1"
@@ -133,6 +134,10 @@ func (s *Server) submit(w http.ResponseWriter, r *http.Request) {
 		// staging object is opened merely to answer an already-recorded request.
 		spec = replaySubmission(sub, *existing)
 	} else {
+		if sub.Rental {
+			unlock := privatepackage.Guard()
+			defer unlock()
+		}
 		spec, e = s.resolvePlan(r.Context(), sub)
 		if e != nil {
 			s.refuseTyped(w, r, e)

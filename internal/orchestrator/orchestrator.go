@@ -778,14 +778,26 @@ func (c *Orchestrator) CancelQueued(requestID string) *exit.Error {
 	if !applied {
 		return nil
 	}
+	row, problem := c.opt.Store.RequestRow(requestID)
+	if problem != nil || row == nil {
+		if problem != nil {
+			return problem
+		}
+		return exit.Internalf("canceled request %s cannot be read back", requestID)
+	}
+	c.cancelPrivateTransfer(requestID)
 	c.forget(requestID)
 	c.frames.forget(requestID)
 	c.logf("%s left the dispatch queue: canceled before any attempt", requestID)
 	c.signalClosed(requestWaitKey(requestID),
 		exit.New(exit.Canceled, "%s was canceled before any attempt was dispatched", requestID))
+	c.cleanupRequestAssets(*row)
 	// If this was the FIFO head, the next request inherits the scheduling question now;
 	// it must not wait for an unrelated worker report merely because the old head left.
 	c.reviveQueue()
+	if problem := c.releaseManagedNow(*row); problem != nil {
+		return problem
+	}
 	return nil
 }
 

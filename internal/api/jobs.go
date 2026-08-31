@@ -18,6 +18,7 @@ import (
 	"github.com/cozy-creator/cozy/internal/home"
 	"github.com/cozy-creator/cozy/internal/launch"
 	"github.com/cozy-creator/cozy/internal/orchestrator"
+	"github.com/cozy-creator/cozy/internal/privatepackage"
 	"github.com/cozy-creator/cozy/internal/records"
 	pb "github.com/cozy-creator/cozy/protocol/cozy/worker/v1"
 )
@@ -124,12 +125,27 @@ func (s *Server) submitJob(w http.ResponseWriter, r *http.Request) {
 			"use `cozy run --input-tree <ref>=<dir>`; this build exposes no browser tree-upload route")
 		return
 	}
-	spec, e := s.resolveJob(r.Context(), sub)
+	key := strings.TrimSpace(r.Header.Get("Idempotency-Key"))
+	existing, e := s.store.RequestByIdempotencyKey(key)
 	if e != nil {
 		s.refuseTyped(w, r, e)
 		return
 	}
-	spec.IdemKey = strings.TrimSpace(r.Header.Get("Idempotency-Key"))
+	var spec orchestrator.Submission
+	if existing != nil {
+		spec, e = replayJobSubmission(sub, *existing)
+	} else {
+		if sub.Rental {
+			unlock := privatepackage.Guard()
+			defer unlock()
+		}
+		spec, e = s.resolveJob(r.Context(), sub)
+	}
+	if e != nil {
+		s.refuseTyped(w, r, e)
+		return
+	}
+	spec.IdemKey = key
 	digest, e := jobSubmissionDigest(spec)
 	if e != nil {
 		s.refuseTyped(w, r, e)
@@ -195,6 +211,46 @@ func (s *Server) submitJob(w http.ResponseWriter, r *http.Request) {
 		status = http.StatusOK
 	}
 	s.ok(w, r, status, handle)
+}
+
+func replayJobSubmission(sub JobSubmission,
+	recorded records.Request,
+) (orchestrator.Submission, *exit.Error) {
+	payload := []byte(sub.Input)
+	if len(payload) == 0 {
+		payload = []byte("{}")
+	}
+	models := append([]orchestrator.ModelRef(nil), sub.Models...)
+	if len(models) == 0 {
+		models = append(models, recorded.Models...)
+	}
+	var artifactOutputs []orchestrator.ArtifactOutput
+	if recorded.ArtifactOutputs != "" {
+		if err := json.Unmarshal([]byte(recorded.ArtifactOutputs), &artifactOutputs); err != nil {
+			return orchestrator.Submission{}, exit.Internalf(
+				"cannot replay job %s artifact outputs: %s", recorded.ID, err)
+		}
+	}
+	outputs := []string(nil)
+	if recorded.Outputs != "" {
+		outputs = strings.Split(recorded.Outputs, ",")
+	}
+	trees := []string(nil)
+	if recorded.Trees != "" {
+		trees = strings.Split(recorded.Trees, ",")
+	}
+	org := strings.TrimSpace(sub.Org)
+	if org == "" {
+		org = recorded.Org
+	}
+	return orchestrator.Submission{Kind: "job", Package: sub.Package,
+		Entrypoint: sub.Function, Payload: payload, Org: org,
+		InstallID: recorded.InstallID, Release: recorded.Release,
+		ReleaseDigest:        recorded.PackageRevisionDigest,
+		PrivatePackageDigest: recorded.PrivatePackageDigest,
+		PlanID:               recorded.PlanID, Outputs: outputs, ArtifactOutputs: artifactOutputs,
+		JobGPUCount: recorded.JobGPUCount, Trees: trees, Worker: recorded.Worker,
+		Rental: sub.Rental, Models: models}, nil
 }
 
 // resolveJob turns package+function into the orchestrator's Submission. The

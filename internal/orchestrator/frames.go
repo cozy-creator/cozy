@@ -15,6 +15,7 @@ import (
 	"github.com/cozy-creator/cozy/internal/exit"
 	"github.com/cozy-creator/cozy/internal/inputasset"
 	"github.com/cozy-creator/cozy/internal/media"
+	"github.com/cozy-creator/cozy/internal/privatepackage"
 	"github.com/cozy-creator/cozy/internal/records"
 	pb "github.com/cozy-creator/cozy/protocol/cozy/worker/v1"
 )
@@ -852,9 +853,18 @@ func (c *Orchestrator) cleanupAttempt(req records.Request, attempt uint64, holde
 
 func (c *Orchestrator) cleanupRequestAssets(req records.Request) {
 	unlock := inputasset.Guard()
-	defer unlock()
 	if e := inputasset.DropUnowned(c.opt.Layout, c.opt.Store, req.Assets); e != nil {
 		c.logf("request %s input asset cleanup deferred: %s", req.ID, e.Message)
+	}
+	unlock()
+	if req.PrivatePackageDigest == "" {
+		return
+	}
+	unlockPrivate := privatepackage.Guard()
+	defer unlockPrivate()
+	if e := privatepackage.DropDigestUnowned(c.opt.Layout, c.opt.Store,
+		req.PrivatePackageDigest); e != nil {
+		c.logf("request %s private package cleanup deferred: %s", req.ID, e.Message)
 	}
 }
 

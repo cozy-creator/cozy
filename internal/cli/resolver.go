@@ -62,6 +62,9 @@ func (r *Resolver) PreparePrivate(ctx context.Context, installID string) (privat
 	if problem != nil {
 		return privatepackage.Revision{}, problem
 	}
+	if problem := privatepackage.Sweep(layout, r.store); problem != nil {
+		return privatepackage.Revision{}, problem
+	}
 	return privatepackage.Stage(ctx, layout, *install)
 }
 

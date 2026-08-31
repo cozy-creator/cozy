@@ -767,16 +767,25 @@ func (c *Orchestrator) releaseManaged(req records.Request) {
 		return
 	}
 	go func() {
-		line, problem := c.opt.ReleaseManagedRental(req.Worker)
-		if problem != nil {
+		if problem := c.releaseManagedNow(req); problem != nil {
 			c.logf("managed rental %s release deferred: %s", req.Worker, problem.Message)
-			return
-		}
-		if line != "" {
-			c.emit(req.ID, "request.rentals", 0, map[string]any{"line": line})
-			c.logf("%s", line)
 		}
 	}()
+}
+
+func (c *Orchestrator) releaseManagedNow(req records.Request) *exit.Error {
+	if !req.Rental || req.Worker == "" || c.opt.ReleaseManagedRental == nil {
+		return nil
+	}
+	line, problem := c.opt.ReleaseManagedRental(req.Worker)
+	if problem != nil {
+		return problem
+	}
+	if line != "" {
+		c.emit(req.ID, "request.rentals", 0, map[string]any{"line": line})
+		c.logf("%s", line)
+	}
+	return nil
 }
 
 func (c *Orchestrator) dispatch(req records.Request) (uint64, *exit.Error) {

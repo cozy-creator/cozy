@@ -17,6 +17,7 @@ import (
 	"github.com/cozy-creator/cozy/internal/exit"
 	"github.com/cozy-creator/cozy/internal/inputasset"
 	"github.com/cozy-creator/cozy/internal/media"
+	"github.com/cozy-creator/cozy/internal/privatepackage"
 	"github.com/cozy-creator/cozy/internal/processtree"
 	"github.com/cozy-creator/cozy/internal/records"
 	"github.com/cozy-creator/cozy/internal/secret"
@@ -1735,6 +1736,12 @@ func (c *Orchestrator) Reconcile() (killed, forgotten int, e *exit.Error) {
 	unlock := inputasset.Guard()
 	e = inputasset.Sweep(c.opt.Layout, c.opt.Store)
 	unlock()
+	if e != nil {
+		return 0, 0, e
+	}
+	unlockPrivate := privatepackage.Guard()
+	e = privatepackage.Sweep(c.opt.Layout, c.opt.Store)
+	unlockPrivate()
 	if e != nil {
 		return 0, 0, e
 	}
