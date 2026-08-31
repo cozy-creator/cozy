@@ -100,7 +100,7 @@ type Server struct {
 // start may require the target environment through Resolve.
 type Resolver interface {
 	RefreshEditable(pkg string) (installID string, editable, changed bool, problem *exit.Error)
-	PreparePrivate(context.Context, string, string) (privatepackage.Revision, []string, *exit.Error)
+	PreparePrivate(context.Context, string) (privatepackage.Revision, *exit.Error)
 	PrivateRevision(string, string) (privatepackage.Revision, *exit.Error)
 	ResolvePlacement(pkg string) (orchestrator.DesiredPlacement, *exit.Error)
 	ResolveInstall(installID string) (orchestrator.WorkerLaunchSpec, *exit.Error)

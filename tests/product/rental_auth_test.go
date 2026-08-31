@@ -19,7 +19,6 @@ import (
 	"github.com/cozy-creator/cozy/internal/canonical"
 	"github.com/cozy-creator/cozy/internal/home"
 	"github.com/cozy-creator/cozy/internal/hub"
-	"github.com/cozy-creator/cozy/internal/launch"
 	"github.com/cozy-creator/cozy/internal/orchestrator"
 	"github.com/cozy-creator/cozy/internal/rental"
 	pb "github.com/cozy-creator/cozy/protocol/cozy/worker/v1"
@@ -133,7 +132,7 @@ func TestRentalCreatorIdentityAndClaim(t *testing.T) {
 	}
 
 	request, problem := hub.RentalRequestBytes("cpu", strings.Repeat("1", 64),
-		identity.PublicKey(), []string{"sha256:" + strings.Repeat("2", 64)})
+		identity.PublicKey())
 	fatal(t, problem)
 	var body map[string]any
 	must(t, json.Unmarshal(request, &body))
@@ -144,27 +143,13 @@ func TestRentalCreatorIdentityAndClaim(t *testing.T) {
 	}
 	parsed, problem := hub.ParseRentalRequestBytes(request)
 	fatal(t, problem)
-	if parsed.SKU != "cpu" || len(parsed.AcceptableWheelhouseManifestDigests) != 1 ||
-		parsed.AcceptableWheelhouseManifestDigests[0] != "sha256:"+strings.Repeat("2", 64) {
+	if parsed.SKU != "cpu" || parsed.CreatorPublicKey != identity.PublicKey() ||
+		parsed.MediaTokenSHA256 != strings.Repeat("1", 64) {
 		t.Fatalf("persisted rental intent did not reopen exactly: %+v", parsed)
 	}
 	if _, problem := hub.ParseRentalRequestBytes(append(request, '\n')); problem == nil ||
 		problem.ErrName() != "rental.intent_invalid" {
 		t.Fatalf("noncanonical persisted rental intent reopened: %v", problem)
-	}
-}
-
-func TestPrivateModeControlRuntimeFloor(t *testing.T) {
-	manifest := func(version string) []byte {
-		return []byte(`{"base_distributions":[{"distribution":"cozy-runtime","version":"` + //cozy:allow base distribution capability fact, not executable access
-			version + `"}]}`)
-	}
-	if launch.PrivateModeledRuntimeFloor != "0.0.20" ||
-		launch.BaseRuntimeAtLeast(manifest("0.0.19"), launch.PrivateModeledRuntimeFloor) ||
-		!launch.BaseRuntimeAtLeast(manifest("0.0.20"), launch.PrivateModeledRuntimeFloor) ||
-		!launch.BaseRuntimeAtLeast(manifest("0.1.0"), launch.PrivateModeledRuntimeFloor) ||
-		launch.BaseRuntimeAtLeast(manifest("0.0.20-rc1"), launch.PrivateModeledRuntimeFloor) {
-		t.Fatal("private modeled Runtime capability floor admitted/refused the wrong active base")
 	}
 }
 

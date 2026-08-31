@@ -9,71 +9,13 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
-	"sort"
-	"strconv"
 	"strings"
 	"time"
 
 	"github.com/cozy-creator/cozy/internal/exit"
 	"github.com/cozy-creator/cozy/internal/home"
-	"github.com/cozy-creator/cozy/internal/privatepackage"
 	"github.com/cozy-creator/cozy/internal/records"
 )
-
-// PrivateModeledRuntimeFloor is the worker-control capability required when a private
-// package invocation carries model bindings. Keep the policy in one place: request,
-// job, and production admission must not drift to different Runtime releases.
-const PrivateModeledRuntimeFloor = "0.0.20"
-
-// BaseRuntimeAtLeast reads only the control-plane capability version from exact Hub-held
-// WheelhouseManifest bytes. Runtime still owns every overlay compatibility decision.
-func BaseRuntimeAtLeast(raw []byte, floor string) bool {
-	var manifest struct {
-		BaseDistributions []struct {
-			Distribution string `json:"distribution"`
-			Version      string `json:"version"`
-		} `json:"base_distributions"`
-	}
-	if json.Unmarshal(raw, &manifest) != nil {
-		return false
-	}
-	held := ""
-	for _, distribution := range manifest.BaseDistributions {
-		if distribution.Distribution != "cozy-runtime" {
-			continue
-		}
-		if held != "" {
-			return false
-		}
-		held = distribution.Version
-	}
-	parse := func(value string) ([3]int, bool) {
-		var version [3]int
-		parts := strings.Split(value, ".")
-		if len(parts) != len(version) {
-			return version, false
-		}
-		for index, part := range parts {
-			parsed, err := strconv.Atoi(part)
-			if err != nil || parsed < 0 || strconv.Itoa(parsed) != part {
-				return version, false
-			}
-			version[index] = parsed
-		}
-		return version, true
-	}
-	current, currentOK := parse(held)
-	required, requiredOK := parse(floor)
-	if !currentOK || !requiredOK {
-		return false
-	}
-	for index := range current {
-		if current[index] != required[index] {
-			return current[index] > required[index]
-		}
-	}
-	return true
-}
 
 // GenerationToolEnv makes one installed generation's exact Runtime discoverable through the
 // already-frozen child environment without reading ambient process state.
@@ -119,61 +61,6 @@ type RuntimeCLI struct {
 	Home         string        // COZY_HOME the runtime reads its artifact index out of
 	Env          []string      // the allowlisted child environment (config.Tool)
 	QueryTimeout time.Duration // metadata-query bound; zero selects DefaultRuntimeQueryTimeout
-}
-
-type PrivatePreflightResult struct {
-	PrivateRevisionDigest string `json:"private_revision_digest"`
-	Compatible            []struct {
-		Base string `json:"base"`
-		Path string `json:"path"`
-	} `json:"compatible"`
-}
-
-func (r RuntimeCLI) privatePreflight(ctx context.Context, requestPath string,
-	out *PrivatePreflightResult,
-) *exit.Error {
-	return r.callContext(ctx, out, "private-preflight", requestPath)
-}
-
-// PreflightPrivate is Creator's one execution door for rented-base wheel/tag/native/collision
-// policy. The resolver supplies exact already-held facts; launch owns both disposable request
-// staging and the one generation Runtime process that judges them.
-func PreflightPrivate(ctx context.Context, install records.PackageInstall,
-	revision privatepackage.Revision, bases []privatepackage.BaseManifest,
-	layout home.Layout, env []string,
-) ([]string, *exit.Error) {
-	requestPath, cleanup, problem := privatepackage.StagePreflight(layout, revision, bases)
-	if problem != nil {
-		return nil, problem
-	}
-	defer cleanup()
-	bounded, cancel := context.WithTimeout(ctx, 5*time.Minute)
-	defer cancel()
-	var result PrivatePreflightResult
-	runtime := RuntimeCLI{Bin: Binary(install), Dir: SourceDir(install), Home: layout.Root, Env: env}
-	if problem := runtime.privatePreflight(bounded, requestPath, &result); problem != nil {
-		return nil, problem
-	}
-	if result.PrivateRevisionDigest != revision.Digest || len(result.Compatible) == 0 {
-		return nil, exit.Named(exit.Conflict, "private_preflight_identity_mismatch",
-			"Runtime preflight did not admit exact private revision %s", revision.Digest)
-	}
-	provided := make(map[string]bool, len(bases))
-	for _, base := range bases {
-		provided[base.Digest] = true
-	}
-	compatible := make([]string, 0, len(result.Compatible))
-	seen := map[string]bool{}
-	for _, row := range result.Compatible {
-		if !provided[row.Base] || seen[row.Base] {
-			return nil, exit.Named(exit.Conflict, "private_preflight_base_set_mismatch",
-				"Runtime preflight returned an unknown or duplicate active base %s", row.Base)
-		}
-		seen[row.Base] = true
-		compatible = append(compatible, row.Base)
-	}
-	sort.Strings(compatible)
-	return compatible, nil
 }
 
 // Binary is the runtime a generation carries. An install already refused a generation
