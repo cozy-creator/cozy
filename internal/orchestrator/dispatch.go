@@ -30,6 +30,7 @@ type Submission struct {
 	PlanID        string // the entrypoint_binding_plan_id this attempt binds
 	Release       string // immutable remote package release; empty for local execution
 	ReleaseDigest string // exact remote release.json identity
+	Models        []ModelRef
 
 	// Payload is the request body, verbatim. It rides the DeliveryGrant as the input
 	// `payload` — a grant input, never a wire field, so refreshing the grant can never
@@ -180,7 +181,7 @@ func requestRecord(s Submission) (records.Request, map[string]any, *exit.Error) 
 		Outputs: strings.Join(s.Outputs, ","),
 		Assets:  s.Assets, ArtifactOutputs: string(artifactBytes),
 		Kind: s.Kind, Org: s.Org, Trees: strings.Join(s.Trees, ","),
-		Worker: s.Worker, InstallID: s.InstallID, Rental: s.Rental,
+		Worker: s.Worker, InstallID: s.InstallID, Rental: s.Rental, Models: s.Models,
 	}
 	event := map[string]any{
 		"package": s.Package, "function": s.Entrypoint,
@@ -604,21 +605,26 @@ func (c *Orchestrator) resolveFor(req records.Request) (WorkerLaunchSpec, string
 			"rental %s resolved without a complete remote target", req.Worker)
 	}
 	if c.opt.RentalPackageSet == nil || req.Release == "" ||
-		!validDigest(req.PackageRevisionDigest) || !validDigest(req.PlanID) {
+		!validDigest(req.PackageRevisionDigest) || (len(req.Models) == 0 && !validDigest(req.PlanID)) {
 		return WorkerLaunchSpec{}, "", exit.Unavailablef(
 			"remote package preparation requires an exact release and package_set signer")
 	}
 	logical := LogicalPackage{Package: req.Package, Release: req.Release,
 		ReleaseDigest: req.PackageRevisionDigest, Function: req.Entrypoint,
 		Outputs: strings.FieldsFunc(req.Outputs, func(r rune) bool { return r == ',' }),
-		PlanID:  req.PlanID}
+		PlanID:  req.PlanID, Models: append([]ModelRef(nil), req.Models...)}
 	instance, _, _, e := c.EnsureRental(req.Worker)
 	if e != nil {
 		return WorkerLaunchSpec{}, "", e
 	}
+	models := make([]*pb.DownloadModelRef, 0, len(logical.Models))
+	for _, model := range logical.Models {
+		models = append(models, &pb.DownloadModelRef{Package: model.Package, Slot: model.Slot,
+			Model: model.Model, Release: model.Release, Manifest: model.Manifest})
+	}
 	if e := c.ConvergePackageSet(instance, []*pb.DownloadPackageRef{{
 		Package: logical.Package, Release: logical.Release, ReleaseDigest: logical.ReleaseDigest,
-	}}, nil); e != nil {
+	}}, models); e != nil {
 		return WorkerLaunchSpec{}, "", e
 	}
 	spec, planID, e := c.ensureLogicalPackageReady(instance, req.Worker, logical)
