@@ -1,6 +1,6 @@
 # TensorFS
 
-The current release is `0.0.4`.
+The current release is `0.0.5`.
 
 TensorFS stores every domain repository as the same graph:
 
@@ -8,7 +8,7 @@ TensorFS stores every domain repository as the same graph:
 repos/<org>/<name>.json
 manifests/<aa>/<bb>/<sha256>.json
 blobs/<aa>/<bb>/<sha256>
-tensorfs.sqlite                    # five small local index/coordination/cache tables
+tensorfs.sqlite                    # seven small local index/coordination/cache tables
 checkouts/<manifest-sha256>/...    # optional disposable local view
 tmp/                               # all transient local state; delete when stopped
 ```
@@ -161,13 +161,42 @@ multiple profile assignments survive, so adapters never choose a variant by file
 production may name its exact required source profile; this narrows only the registry profile, while
 the same header/member proof still has to match it exactly.
 
-The plan/run consumers do not trust or reinterpret the asserted fields. They re-read the
-unlabelled carrier headers and exact registry, reproduce the unique source plan byte-for-byte, then
-feed its sources, target, order, and session through the existing `prepare`/isolated worker path.
+The CLI and Python facade call the same `tensorfs-core::ingest::source` planner/executor. They do not
+trust or reinterpret asserted fields: the core re-reads carrier headers and the exact registry,
+reproduces the unique source plan byte-for-byte, then executes its sources, target, order, and
+session through the ordinary streaming ingest/CAS pass.
 Editing a plan, changing carrier bytes or registry bytes, omitting an input, or supplying an
 unreviewed member refuses. Unique keysets need no member. Equal headers with no reviewed member
 admit multiple assignments and refuse; a provider adapter may supply a member only when its own
 pinned metadata binds that exact member to the downloaded path.
+
+Pod Runtime uses the compiled facade directly—never the CLI or a subprocess:
+
+```python
+prepared = store.prepare_model_source(
+    operation_id,
+    source_selection_digest,
+    [("dits", "hf/minimax-h3/native-dual-bf16/1"),
+     ("shared", "hf/minimax-h3/shared-bf16/1")],
+    [(member, object_id, length, verified_path), ...],
+    "hf://MiniMaxAI/MiniMax-H3@<commit>",
+    declared_license,
+)
+# prepared = {replayed, sources:[{slot, profile, manifest_digest, manifest_length,
+#                                 release_evidence_canonical_bytes}]}
+store.release_model_source(operation_id)
+```
+
+Inputs are sorted exact profile and verified-file rows. TensorFS binds the supervisor-verified
+ObjectRefs into operation identity and re-fences each regular non-symlink path by device, inode,
+length, and change token before and after conversion. It deliberately does not perform a second
+whole-file SHA pass: the existing streaming ingest pass hashes every admitted tensor byte into the
+CAS. All profiles prepare under one operation; only a complete sorted result set becomes replayable.
+Each row carries the existing canonical `ReleaseEvidence/1` bytes bound to its header topology,
+converter recipe, credential-free source URI/license, and approved producer. Exact replay returns
+the same Manifest and evidence bytes; changed profile/file/provenance facts conflict, and explicit
+release removes only operation holds. Access URLs, credentials, repository names, and catalog
+release identity have no argument or durable field.
 
 `repo apply` validates the exact manifest, header, and complete blob inventory before the caller may
 perform its repository CAS, then records only `(org,name,manifest_sha256)` in SQLite. Missing or
@@ -215,7 +244,8 @@ fence makes the pass delete nothing.
 All temporary admission files, ingest candidates, writer markers, and read-lease markers live under
 `tmp/`. The whole directory is disposable when no TensorFS process is running. Local writers retain
 advisory-locked marker files there, so database rebuild refuses while a writer is
-alive and reaps only markers whose lock the kernel releases. Open operations hold exact keys.
+alive and reaps only markers whose lock the kernel releases. Open source preparations and ordinary
+operations hold exact keys.
 Seven days without accepted object/byte progress only makes an operation eligible for an explicit
 abandonment after its writer is gone and its grants are revoked; time never releases holds itself.
 

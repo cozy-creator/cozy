@@ -16,6 +16,7 @@ pub mod carrier;
 pub mod convert;
 pub mod fingerprint;
 pub mod gguf;
+pub mod source;
 pub mod stamp;
 pub mod transaction;
 

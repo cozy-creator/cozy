@@ -66,6 +66,7 @@ pub fn plain_vectors() -> EncodingVectors {
 /// A registry entry: the canonical spec object plus, when it has been PRODUCER-MINED, the
 /// exact vector document whose digest the spec references. Carrying both together is what
 /// makes it impossible to ship a spec pointing at vector bytes nobody stores.
+#[derive(Clone)]
 pub struct Seed {
     pub alias: &'static str,
     pub spec: EncodingSpec,

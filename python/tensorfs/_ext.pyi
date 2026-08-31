@@ -139,6 +139,27 @@ class DerivedConfigEdit(TypedDict):
     media_type: str
     length: int
 
+class PreparedModelSource(TypedDict):
+    slot: str
+    profile: str
+    manifest_digest: str
+    manifest_length: int
+    release_evidence_canonical_bytes: bytes
+
+class PreparedModelSources(TypedDict):
+    replayed: bool
+    sources: list[PreparedModelSource]
+
+class DerivedReceipt(TypedDict):
+    transaction_id: str
+    declaration: dict[str, Any]
+    sources: list[dict[str, Any]]
+    header: dict[str, Any]
+    manifest: dict[str, Any]
+    added_objects: list[dict[str, Any]]
+    inherit_observation: dict[str, int]
+    release_evidence_canonical_bytes: bytes
+
 class DerivedWriter:
     def sources(self) -> list[dict[str, Any]]: ...
     def source_read_into(
@@ -154,7 +175,7 @@ class DerivedWriter:
         self, component: str, key: str, role: str, reader: Any
     ) -> dict[str, Any]: ...
     def add_config(self, name: str, reader: Any) -> dict[str, Any]: ...
-    def commit(self) -> dict[str, Any]: ...
+    def commit(self) -> DerivedReceipt: ...
     def fence(self) -> bool: ...
 
 class Operation:
@@ -184,6 +205,16 @@ class Store:
     def begin_operation(
         self, operation_id: str, org: str, name: str, now: int
     ) -> Operation: ...
+    def prepare_model_source(
+        self,
+        operation_id: str,
+        source_selection_digest: str,
+        profiles: Sequence[tuple[str, str]],
+        files: Sequence[tuple[str, str, int, str]],
+        source_uri: str,
+        declared_license: str,
+    ) -> PreparedModelSources: ...
+    def release_model_source(self, operation_id: str) -> None: ...
     def remove_release(
         self,
         current: bytes,
