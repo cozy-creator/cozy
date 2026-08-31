@@ -46,6 +46,7 @@ func DaemonProcess(argv0 string) bool {
 // RunDaemon owns the persistent loopback daemon. Public `up` and stateful
 // commands start this private process entrypoint.
 func RunDaemon(stdout, stderr io.Writer) int {
+	ignoreDaemonBrokenPipe()
 	cfg, problem := config.Load()
 	if problem != nil {
 		fmt.Fprintln(stderr, problem.Error())
