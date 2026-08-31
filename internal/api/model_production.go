@@ -30,8 +30,8 @@ type ModelProductionState struct {
 	Source          string   `json:"source"`
 	Producer        string   `json:"producer,omitempty"`
 	Status          string   `json:"status"`
-	NodeIndex       int64    `json:"node_index"`
-	Nodes           int      `json:"nodes"`
+	StepIndex       int64    `json:"step_index"`
+	Steps           int      `json:"steps"`
 	Lanes           []string `json:"lanes,omitempty"`
 	ManifestIDs     []string `json:"manifest_ids,omitempty"`
 	Rental          string   `json:"rental,omitempty"`
@@ -159,7 +159,7 @@ func (s *Server) modelProductionState(operation records.ModelProductionOperation
 	changed bool,
 ) (ModelProductionState, *exit.Error) {
 	state := ModelProductionState{ID: operation.ID, Kind: "model-publication",
-		Status: operation.State, NodeIndex: operation.NodeIndex, Rental: operation.RentalID,
+		Status: operation.State, StepIndex: operation.StepIndex, Rental: operation.RentalID,
 		CancelRequested: operation.CancelRequested, ErrorCode: operation.SafeCode,
 		Error: operation.SafeDetail, CreatedAt: operation.CreatedAt, UpdatedAt: operation.UpdatedAt,
 		Changed: changed}
@@ -176,7 +176,7 @@ func (s *Server) modelProductionState(operation records.ModelProductionOperation
 			return state, exit.Internalf("cannot read model production %s plan: %s", operation.ID, err)
 		}
 		state.Model, state.Release, state.Source = plan.Destination, plan.Release, plan.Source
-		state.Producer, state.Lanes, state.Nodes = plan.Producer, plan.Lanes(), len(plan.Jobs)
+		state.Producer, state.Lanes, state.Steps = plan.Producer, plan.Lanes(), len(plan.Jobs)
 	}
 	switch operation.State {
 	case "release_cut", "cleanup_pending", "completed":
@@ -235,7 +235,7 @@ type ModelProductionSourceCapability struct {
 }
 
 type ModelProductionArtifactAction struct {
-	NodeName            string                                  `json:"node_name"`
+	StepName            string                                  `json:"step_name"`
 	OutputSlot          string                                  `json:"output_slot"`
 	TransferOperationID string                                  `json:"transfer_operation_id"`
 	Decisions           []orchestrator.ArtifactTransferDecision `json:"decisions"`
@@ -315,7 +315,7 @@ func (s *Server) modelProductionAction(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		problem := s.orchestrator.TransferProductionArtifact(r.Context(), operationID,
-			action.Artifact.NodeName, action.Artifact.OutputSlot, action.RentalID,
+			action.Artifact.StepName, action.Artifact.OutputSlot, action.RentalID,
 			action.Artifact.TransferOperationID, action.Artifact.Decisions)
 		if problem != nil {
 			s.refuseTyped(w, r, problem)

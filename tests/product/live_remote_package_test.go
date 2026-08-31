@@ -48,10 +48,10 @@ func TestLiveModelProductionDescriptor(t *testing.T) {
 	fatal(t, problem)
 	production, problem := descriptor.Production("four-lane")
 	fatal(t, problem)
-	ordered, problem := production.OrderedNodes()
+	ordered, problem := production.OrderedSteps()
 	fatal(t, problem)
 	if len(ordered) != 10 || len(production.Outputs) != 4 || len(production.Sources) != 2 {
-		t.Fatalf("published production shape = %d nodes, %d outputs, %d sources",
+		t.Fatalf("published production shape = %d steps, %d outputs, %d sources",
 			len(ordered), len(production.Outputs), len(production.Sources))
 	}
 	lanes := map[string]bool{}
@@ -64,11 +64,11 @@ func TestLiveModelProductionDescriptor(t *testing.T) {
 			t.Fatalf("published production omits lane %s", lane)
 		}
 	}
-	for _, node := range ordered {
-		if !strings.HasPrefix(node.Callable, "tensorhub/minimax-h3-tools/") &&
-			!strings.HasPrefix(node.Callable, "tensorhub/quantize/") {
-			t.Fatalf("production node %s references unexpected callable %s", node.Name,
-				node.Callable)
+	for _, step := range ordered {
+		if !strings.HasPrefix(step.Callable, "tensorhub/minimax-h3-tools/") &&
+			!strings.HasPrefix(step.Callable, "tensorhub/quantize/") {
+			t.Fatalf("production step %s references unexpected callable %s", step.Name,
+				step.Callable)
 		}
 	}
 }

@@ -342,12 +342,12 @@ func TestCompactPackageDescriptor(t *testing.T) {
 }
 
 func TestModelProductionDescriptor(t *testing.T) {
-	raw := []byte(`{"application":"producer:app","entrypoints":[],"format":"cozy.package.descriptor/1","jobs":[],"model_productions":[{"name":"two-lane","nodes":[{"callable":"tensorhub/quantize/fp8","models":{"source":"assemble.model"},"name":"quantize","outputs":["model"],"resources":{"gpu_count":1,"placement":"single_node","requires":"sm90+,vram80g"}},{"callable":"tensorhub/minimax-h3-tools/assemble","models":{"dits":"dits","shared":"shared"},"name":"assemble","outputs":["model"]}],"outputs":[{"lane_key":"bf16-full","name":"full","required_contract":{"encodings":["sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"],"topology_digest":"sha256:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"},"source":"assemble.model"},{"lane_key":"fp8-pruned","name":"fp8","required_contract":{"encodings":["sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc","sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"],"topology_digest":"sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"},"source":"quantize.model"}],"sources":{"dits":"hf/minimax-h3/native-dits-bf16","shared":"hf/minimax-h3/shared-diffusers"}}]}`)
+	raw := []byte(`{"application":"producer:app","entrypoints":[],"format":"cozy.package.descriptor/1","jobs":[],"model_productions":[{"name":"two-lane","steps":[{"callable":"tensorhub/quantize/fp8","models":{"source":"assemble.model"},"name":"quantize","outputs":["model"],"resources":{"gpu_count":1,"placement":"single_node","requires":"sm90+,vram80g"}},{"callable":"tensorhub/minimax-h3-tools/assemble","models":{"dits":"dits","shared":"shared"},"name":"assemble","outputs":["model"]}],"outputs":[{"lane_key":"bf16-full","name":"full","required_contract":{"encodings":["sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"],"topology_digest":"sha256:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"},"source":"assemble.model"},{"lane_key":"fp8-pruned","name":"fp8","required_contract":{"encodings":["sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc","sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"],"topology_digest":"sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"},"source":"quantize.model"}],"sources":{"dits":"hf/minimax-h3/native-dits-bf16","shared":"hf/minimax-h3/shared-diffusers"}}]}`)
 	descriptor, problem := launch.DecodeDescriptor(raw)
 	fatal(t, problem)
 	production, problem := descriptor.Production("two-lane")
 	fatal(t, problem)
-	ordered, problem := production.OrderedNodes()
+	ordered, problem := production.OrderedSteps()
 	fatal(t, problem)
 	if len(ordered) != 2 || ordered[0].Name != "assemble" || ordered[1].Name != "quantize" ||
 		production.Sources["dits"] != "hf/minimax-h3/native-dits-bf16" ||
@@ -355,6 +355,7 @@ func TestModelProductionDescriptor(t *testing.T) {
 		t.Fatalf("production graph changed: %+v", production)
 	}
 	for name, planted := range map[string][]byte{
+		"retired nodes field": bytes.Replace(raw, []byte(`"steps":`), []byte(`"nodes":`), 1),
 		"retired single source": bytes.Replace(raw,
 			[]byte(`"sources":{"dits":"hf/minimax-h3/native-dits-bf16","shared":"hf/minimax-h3/shared-diffusers"}`),
 			[]byte(`"source":"dits"`), 1),
@@ -393,14 +394,20 @@ func TestModelProductionOperationIdentity(t *testing.T) {
 		DescriptorDigest: "sha256:" + strings.Repeat("d", 64),
 		Production:       production,
 		Jobs: []modelproduction.JobPin{
-			{Node: "quantize", Callable: "tensorhub/quantize/fp8", Release: "1.2.0", ReleaseDigest: "sha256:" + strings.Repeat("e", 64)},
-			{Node: "assemble", Callable: "tensorhub/minimax-h3-tools/assemble", Release: "1.0.0", ReleaseDigest: "sha256:" + strings.Repeat("f", 64)},
+			{Step: "quantize", Callable: "tensorhub/quantize/fp8", Release: "1.2.0", ReleaseDigest: "sha256:" + strings.Repeat("e", 64)},
+			{Step: "assemble", Callable: "tensorhub/minimax-h3-tools/assemble", Release: "1.0.0", ReleaseDigest: "sha256:" + strings.Repeat("f", 64)},
 		},
 	}
 	reordered := base
 	reordered.Jobs = []modelproduction.JobPin{base.Jobs[1], base.Jobs[0]}
 	if base.ID() != reordered.ID() || !strings.HasPrefix(base.ID(), "modelpub-") {
 		t.Fatal("attempt-independent production identity is not stable")
+	}
+	planBytes, err := base.Bytes()
+	must(t, err)
+	legacy := bytes.Replace(planBytes, []byte(`"Step":`), []byte(`"Node":`), 1)
+	if _, err := modelproduction.Parse(legacy); err == nil {
+		t.Fatal("legacy production plan JobPin.Node was accepted")
 	}
 	changed := base
 	changed.SourceSelection = "sha256:" + strings.Repeat("0", 64)

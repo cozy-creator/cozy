@@ -139,7 +139,7 @@ func handleModelPublish(ctx *Context) *exit.Error {
 				output.Field{K: "producer", V: producer.Name + "@" + producer.Release},
 				output.Field{K: "production", V: producer.Production.Name},
 				output.Field{K: "source_profiles", V: plan.SourceProfiles()},
-				output.Field{K: "nodes", V: len(producer.Jobs)},
+				output.Field{K: "steps", V: len(producer.Jobs)},
 				output.Field{K: "lanes", V: plan.Lanes()},
 				output.Field{K: "gpu_count", V: producer.GPUCount},
 				output.Field{K: "requires", V: producer.Requires},
@@ -306,7 +306,7 @@ func resolveProducerPlan(ctx *Context, raw string) (*producerPlan, *exit.Error) 
 	if problem != nil {
 		return nil, problem
 	}
-	ordered, problem := production.OrderedNodes()
+	ordered, problem := production.OrderedSteps()
 	if problem != nil {
 		return nil, problem
 	}
@@ -314,29 +314,29 @@ func resolveProducerPlan(ctx *Context, raw string) (*producerPlan, *exit.Error) 
 		ReleaseDigest: selected.ReleaseDigest,
 		Descriptor:    descriptor, Production: production}
 	requires := map[string]bool{}
-	for _, node := range ordered {
-		target, parseProblem := parseTarget(node.Callable)
+	for _, step := range ordered {
+		target, parseProblem := parseTarget(step.Callable)
 		if parseProblem != nil || target.Function == "" {
 			return nil, exit.Named(exit.Validation, "model_production_callable_invalid",
-				"production node %s does not name one job callable", node.Name)
+				"production step %s does not name one job callable", step.Name)
 		}
-		nodePackage, packageProblem := resolveProductionPackage(ctx, target.Package, remote,
+		stepPackage, packageProblem := resolveProductionPackage(ctx, target.Package, remote,
 			packages)
 		if packageProblem != nil {
 			return nil, packageProblem
 		}
-		nodeDescriptor := nodePackage.Descriptor
-		job, jobProblem := nodeDescriptor.Function(target.Function)
+		stepDescriptor := stepPackage.Descriptor
+		job, jobProblem := stepDescriptor.Function(target.Function)
 		if jobProblem != nil || job.Kind != "job" {
 			return nil, exit.Named(exit.Validation, "model_production_callable_not_job",
-				"production node %s callable %s is not one job", node.Name, node.Callable)
+				"production step %s callable %s is not one job", step.Name, step.Callable)
 		}
-		if validation := validateProductionInvocation(node, job); validation != nil {
+		if validation := validateProductionInvocation(step, job); validation != nil {
 			return nil, validation
 		}
-		gpu := max(node.Resources.GPUCount, job.Resources.GPUCount)
+		gpu := max(step.Resources.GPUCount, job.Resources.GPUCount)
 		plan.GPUCount = max(plan.GPUCount, gpu)
-		for _, value := range []string{node.Resources.Requires, job.Resources.Requires} {
+		for _, value := range []string{step.Resources.Requires, job.Resources.Requires} {
 			for _, token := range strings.Split(value, ",") {
 				if token = strings.TrimSpace(token); token != "" {
 					requires[token] = true
@@ -344,8 +344,8 @@ func resolveProducerPlan(ctx *Context, raw string) (*producerPlan, *exit.Error) 
 			}
 		}
 		plan.Jobs = append(plan.Jobs, modelproduction.JobPin{
-			Node: node.Name, Callable: node.Callable, Release: nodePackage.Release,
-			InstallID: nodePackage.InstallID, ReleaseDigest: nodePackage.ReleaseDigest,
+			Step: step.Name, Callable: step.Callable, Release: stepPackage.Release,
+			InstallID: stepPackage.InstallID, ReleaseDigest: stepPackage.ReleaseDigest,
 			DescriptorID: job.DescriptorID,
 		})
 	}
@@ -470,32 +470,32 @@ func productionResourceNeeds(gpuCount int64, requires []string) (modelproduction
 	return needs, nil
 }
 
-func validateProductionInvocation(node launch.ModelProductionNode, job *launch.Entrypoint) *exit.Error {
+func validateProductionInvocation(step launch.ModelProductionStep, job *launch.Entrypoint) *exit.Error {
 	models := map[string]bool{}
 	for _, slot := range job.Models {
 		models[slot.Param] = true
 	}
-	if !sameNames(models, keys(node.Models)) {
+	if !sameNames(models, keys(step.Models)) {
 		return exit.Named(exit.Validation, "model_production_model_inputs_mismatch",
-			"production node %s model inputs do not match job %s", node.Name, job.Name)
+			"production step %s model inputs do not match job %s", step.Name, job.Name)
 	}
 	for _, field := range job.Request.Fields {
 		if field.Wire == "required" {
 			return exit.Named(exit.Validation, "model_production_argument_missing",
-				"production node %s job %s requires argument %s", node.Name, job.Name, field.Name)
+				"production step %s job %s requires argument %s", step.Name, job.Name, field.Name)
 		}
 	}
 	outputs := map[string]bool{}
 	for _, output := range job.ArtifactOutputs {
 		outputs[output.OutputID] = true
 	}
-	wanted := make(map[string]bool, len(node.Outputs))
-	for _, output := range node.Outputs {
+	wanted := make(map[string]bool, len(step.Outputs))
+	for _, output := range step.Outputs {
 		wanted[output] = true
 	}
 	if !sameNames(outputs, wanted) {
 		return exit.Named(exit.Validation, "model_production_outputs_mismatch",
-			"production node %s outputs do not match job %s ArtifactSink slots", node.Name, job.Name)
+			"production step %s outputs do not match job %s ArtifactSink slots", step.Name, job.Name)
 	}
 	return nil
 }

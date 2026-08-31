@@ -3,6 +3,7 @@ package producttest
 import (
 	"context"
 	"database/sql"
+	"fmt"
 	"strings"
 	"testing"
 	"time"
@@ -10,7 +11,7 @@ import (
 	"github.com/cozy-creator/cozy/internal/records"
 )
 
-func TestRecordsSchemaIsExactV3AndStable(t *testing.T) {
+func TestRecordsSchemaIsExactV4AndStable(t *testing.T) {
 	path := t.TempDir() + "/records.db"
 	store, problem := records.Open(path)
 	fatal(t, problem)
@@ -21,8 +22,8 @@ func TestRecordsSchemaIsExactV3AndStable(t *testing.T) {
 	var version, before int
 	must(t, db.QueryRow(`PRAGMA user_version`).Scan(&version))
 	must(t, db.QueryRow(`PRAGMA schema_version`).Scan(&before))
-	if version != 3 {
-		t.Fatalf("fresh records version = %d, want exact v3", version)
+	if version != 4 {
+		t.Fatalf("fresh records version = %d, want exact v4", version)
 	}
 	for _, column := range []string{
 		"rental", "package_revision_digest", "environment_digest", "config_digest",
@@ -40,6 +41,19 @@ func TestRecordsSchemaIsExactV3AndStable(t *testing.T) {
 	if deleted != 0 {
 		t.Fatal("exact requests schema retained max_cost_usd_micros")
 	}
+	var steps, legacyTables, stepIndex, stepName int
+	must(t, db.QueryRow(`SELECT COUNT(*) FROM sqlite_master
+		WHERE type='table' AND name='model_production_steps'`).Scan(&steps))
+	must(t, db.QueryRow(`SELECT COUNT(*) FROM sqlite_master
+		WHERE type='table' AND name='model_production_nodes'`).Scan(&legacyTables))
+	must(t, db.QueryRow(`SELECT COUNT(*) FROM pragma_table_info('model_production_steps')
+		WHERE name='step_index'`).Scan(&stepIndex))
+	must(t, db.QueryRow(`SELECT COUNT(*) FROM pragma_table_info('model_production_steps')
+		WHERE name='step_name'`).Scan(&stepName))
+	if steps != 1 || legacyTables != 0 || stepIndex != 1 || stepName != 1 {
+		t.Fatalf("production step schema = steps:%d legacy:%d index:%d name:%d",
+			steps, legacyTables, stepIndex, stepName)
+	}
 	must(t, db.Close())
 
 	store, problem = records.Open(path)
@@ -51,156 +65,43 @@ func TestRecordsSchemaIsExactV3AndStable(t *testing.T) {
 	var after int
 	must(t, db.QueryRow(`PRAGMA schema_version`).Scan(&after))
 	if after != before {
-		t.Fatalf("exact v3 reopen performed DDL: schema_version %d -> %d", before, after)
+		t.Fatalf("exact v4 reopen performed DDL: schema_version %d -> %d", before, after)
 	}
 }
 
-func TestRecordsMigratesExactV1OutputExportAddition(t *testing.T) {
-	path := t.TempDir() + "/records.db"
-	store, problem := records.Open(path)
-	fatal(t, problem)
-	store.Close()
+func TestRecordsRefusesEveryPreV4VersionWithoutMutation(t *testing.T) {
+	for _, older := range []int{1, 2, 3} {
+		t.Run(fmt.Sprintf("v%d", older), func(t *testing.T) {
+			path := t.TempDir() + "/records.db"
+			db, err := sql.Open("sqlite", path)
+			must(t, err)
+			_, err = db.Exec(fmt.Sprintf(
+				`CREATE TABLE older_owner(value TEXT); PRAGMA user_version=%d`, older))
+			must(t, err)
+			var before int
+			must(t, db.QueryRow(`PRAGMA schema_version`).Scan(&before))
+			must(t, db.Close())
 
-	db, err := sql.Open("sqlite", path)
-	must(t, err)
-	_, err = db.Exec(`DROP TABLE request_output_exports;
-		ALTER TABLE requests DROP COLUMN acceptable_base_manifests;
-		ALTER TABLE rentals DROP COLUMN wheelhouse_manifest_digest;
-		PRAGMA user_version=1`)
-	must(t, err)
-	must(t, db.Close())
-
-	store, problem = records.Open(path)
-	fatal(t, problem)
-	store.Close()
-	db, err = sql.Open("sqlite", path)
-	must(t, err)
-	defer db.Close()
-	var version, exports int
-	must(t, db.QueryRow(`PRAGMA user_version`).Scan(&version))
-	must(t, db.QueryRow(`SELECT COUNT(*) FROM sqlite_master
-		WHERE type='table' AND name='request_output_exports'`).Scan(&exports))
-	if version != 3 || exports != 1 {
-		t.Fatalf("v1 output export migration = version %d, tables %d", version, exports)
-	}
-}
-
-func TestRecordsMigratesExactV2RentalBaseSelectionAndRetainsRows(t *testing.T) {
-	path := t.TempDir() + "/records.db"
-	store, problem := records.Open(path)
-	fatal(t, problem)
-	request, fresh, problem := store.Submit(records.Request{ID: "req-v2-retained",
-		IdemKey: "v2-retained", BodyDigest: "sha256:" + strings.Repeat("1", 64),
-		Package: "proof/package", Entrypoint: "run", Payload: []byte("{}")})
-	fatal(t, problem)
-	if !fresh || request.ID != "req-v2-retained" {
-		t.Fatalf("v2 request setup = %+v fresh=%v", request, fresh)
-	}
-	fatal(t, store.RecordRental(records.Rental{ID: "pr-v2-retained", MachineName: "v2-retained",
-		SKU: "cpu", AcceleratorModel: "CPU", HourlyRateUSDMicros: 70_000,
-		State: "ready", Hub: "https://hub.example"}))
-	store.Close()
-
-	db, err := sql.Open("sqlite", path)
-	must(t, err)
-	_, err = db.Exec(`ALTER TABLE requests DROP COLUMN acceptable_base_manifests;
-        ALTER TABLE rentals DROP COLUMN wheelhouse_manifest_digest;
-        PRAGMA user_version=2`)
-	must(t, err)
-	must(t, db.Close())
-
-	store, problem = records.Open(path)
-	fatal(t, problem)
-	heldRequest, problem := store.RequestRow("req-v2-retained")
-	fatal(t, problem)
-	heldRental, problem := store.RentalRow("pr-v2-retained")
-	fatal(t, problem)
-	if heldRequest == nil || len(heldRequest.AcceptableWheelhouseManifestDigests) != 0 ||
-		heldRental == nil || heldRental.WheelhouseManifestDigest != "" {
-		t.Fatalf("v2 retained rows changed: request=%+v rental=%+v", heldRequest, heldRental)
-	}
-	store.Close()
-	db, err = sql.Open("sqlite", path)
-	must(t, err)
-	defer db.Close()
-	for table, column := range map[string]string{
-		"requests": "acceptable_base_manifests", "rentals": "wheelhouse_manifest_digest",
-	} {
-		var position, last int
-		must(t, db.QueryRow(`SELECT cid FROM pragma_table_info(?) WHERE name=?`,
-			table, column).Scan(&position))
-		must(t, db.QueryRow(`SELECT max(cid) FROM pragma_table_info(?)`, table).Scan(&last))
-		if position != last {
-			t.Fatalf("v3 %s.%s column position = %d, want appended %d",
-				table, column, position, last)
-		}
-	}
-}
-
-func TestRecordsRefusesDriftedV1WithoutMigrating(t *testing.T) {
-	path := t.TempDir() + "/records.db"
-	store, problem := records.Open(path)
-	fatal(t, problem)
-	store.Close()
-	db, err := sql.Open("sqlite", path)
-	must(t, err)
-	_, err = db.Exec(`DROP TABLE request_output_exports;
-		ALTER TABLE requests ADD COLUMN compatibility_alias TEXT;
-		PRAGMA user_version=1`)
-	must(t, err)
-	var before int
-	must(t, db.QueryRow(`PRAGMA schema_version`).Scan(&before))
-	must(t, db.Close())
-
-	opened, problem := records.Open(path)
-	if opened != nil {
-		opened.Close()
-		t.Fatal("drifted v1 records schema migrated")
-	}
-	if problem == nil || problem.ErrName() != "records.schema_reset_required" {
-		t.Fatalf("drifted v1 refusal = %#v", problem)
-	}
-	db, err = sql.Open("sqlite", path)
-	must(t, err)
-	defer db.Close()
-	var version, after, exports int
-	must(t, db.QueryRow(`PRAGMA user_version`).Scan(&version))
-	must(t, db.QueryRow(`PRAGMA schema_version`).Scan(&after))
-	must(t, db.QueryRow(`SELECT COUNT(*) FROM sqlite_master
-		WHERE type='table' AND name='request_output_exports'`).Scan(&exports))
-	if version != 1 || after != before || exports != 0 {
-		t.Fatalf("refused v1 schema mutated: version=%d schema_version=%d->%d exports=%d",
-			version, before, after, exports)
-	}
-}
-
-func TestRecordsRefusesOtherVersionWithoutMutation(t *testing.T) {
-	path := t.TempDir() + "/records.db"
-	db, err := sql.Open("sqlite", path)
-	must(t, err)
-	_, err = db.Exec(`CREATE TABLE older_owner(value TEXT); PRAGMA user_version=3`)
-	must(t, err)
-	var before int
-	must(t, db.QueryRow(`PRAGMA schema_version`).Scan(&before))
-	must(t, db.Close())
-
-	opened, problem := records.Open(path)
-	if opened != nil {
-		opened.Close()
-		t.Fatal("noncurrent records schema opened")
-	}
-	if problem == nil || problem.ErrName() != "records.schema_reset_required" ||
-		!strings.Contains(problem.Remedy, "move") {
-		t.Fatalf("noncurrent schema refusal = %#v", problem)
-	}
-	db, err = sql.Open("sqlite", path)
-	must(t, err)
-	defer db.Close()
-	var version, after int
-	must(t, db.QueryRow(`PRAGMA user_version`).Scan(&version))
-	must(t, db.QueryRow(`PRAGMA schema_version`).Scan(&after))
-	if version != 3 || after != before {
-		t.Fatalf("refused schema mutated: version=%d schema_version=%d->%d", version, before, after)
+			opened, problem := records.Open(path)
+			if opened != nil {
+				opened.Close()
+				t.Fatal("pre-v4 records schema opened")
+			}
+			if problem == nil || problem.ErrName() != "records.schema_reset_required" ||
+				!strings.Contains(problem.Remedy, "move") {
+				t.Fatalf("pre-v4 schema refusal = %#v", problem)
+			}
+			db, err = sql.Open("sqlite", path)
+			must(t, err)
+			defer db.Close()
+			var version, after int
+			must(t, db.QueryRow(`PRAGMA user_version`).Scan(&version))
+			must(t, db.QueryRow(`PRAGMA schema_version`).Scan(&after))
+			if version != older || after != before {
+				t.Fatalf("refused v%d schema mutated: version=%d schema_version=%d->%d",
+					older, version, before, after)
+			}
+		})
 	}
 }
 

@@ -50,8 +50,8 @@ type JobSubmission struct {
 	// bind the request id before dispatch, so an immediate ArtifactReceipt cannot
 	// outrun its owning model-production row.
 	ProductionOperationID string `json:"production_operation_id,omitempty"`
-	ProductionNode        string `json:"production_node,omitempty"`
-	ProductionNodeIndex   int64  `json:"production_node_index,omitempty"`
+	ProductionStep        string `json:"production_step,omitempty"`
+	ProductionStepIndex   int64  `json:"production_step_index,omitempty"`
 	// Org is the publishing org whose SCRATCH repo this job lands in
 	// (`<org>/_job-<request-id>`). It defaults to `local` — a local host has no identity
 	// plane yet (decisions #229) and inventing one would be a fake account.
@@ -116,8 +116,8 @@ func (s *Server) submitJob(w http.ResponseWriter, r *http.Request) {
 	// A job's trees name HOST DIRECTORIES that become read/write worker grants — the same
 	// authority local_assets carry on /v1/requests (requests.go) — so they take the same
 	// gate: a browser bearer must never name host paths (credentials.go).
-	production := sub.ProductionOperationID != "" || sub.ProductionNode != "" ||
-		sub.ProductionNodeIndex != 0
+	production := sub.ProductionOperationID != "" || sub.ProductionStep != "" ||
+		sub.ProductionStepIndex != 0
 	if (len(sub.Trees) > 0 || sub.Worker != "" || len(sub.Models) > 0 || production) &&
 		!s.cliAuthenticated(r) {
 		s.refuse(w, r, http.StatusForbidden, "cli_credential_required",
@@ -161,18 +161,18 @@ func (s *Server) submitJob(w http.ResponseWriter, r *http.Request) {
 	var attempt uint64
 	var fresh bool
 	if production {
-		if sub.ProductionOperationID == "" || sub.ProductionNode == "" ||
-			sub.ProductionNodeIndex < 0 {
-			s.refuse(w, r, http.StatusBadRequest, "model_production.node_identity_invalid",
-				"production job submission requires operation, node, and non-negative index", "")
+		if sub.ProductionOperationID == "" || sub.ProductionStep == "" ||
+			sub.ProductionStepIndex < 0 {
+			s.refuse(w, r, http.StatusBadRequest, "model_production.step_identity_invalid",
+				"production job submission requires operation, step, and non-negative index", "")
 			return
 		}
 		var recorded records.Request
 		recorded, fresh, e = s.orchestrator.RecordSubmission(spec)
 		if e == nil {
 			jobID = recorded.ID
-			e = s.store.SetModelProductionNodeRequest(sub.ProductionOperationID,
-				sub.ProductionNodeIndex, sub.ProductionNode, jobID, "submitted")
+			e = s.store.SetModelProductionStepRequest(sub.ProductionOperationID,
+				sub.ProductionStepIndex, sub.ProductionStep, jobID, "submitted")
 		}
 		if e == nil && fresh {
 			attempt, e = s.orchestrator.ActivateRecordedRequest(recorded)

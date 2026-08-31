@@ -52,24 +52,6 @@ CREATE TABLE IF NOT EXISTS rentals (
   expected_worker_boot_id    TEXT NOT NULL DEFAULT ''
 , wheelhouse_manifest_digest TEXT NOT NULL DEFAULT '')`
 
-const rentalsV2DDL = `
-CREATE TABLE IF NOT EXISTS rentals (
-  id                TEXT PRIMARY KEY,
-  machine_name      TEXT NOT NULL DEFAULT '',
-  sku               TEXT NOT NULL DEFAULT '',
-  accelerator_model TEXT NOT NULL,
-  hourly_rate_usd_micros INTEGER NOT NULL,
-  managed_request_id TEXT NOT NULL DEFAULT '',
-  address           TEXT NOT NULL,
-  cert_path         TEXT NOT NULL,
-  state             TEXT NOT NULL,
-  hub               TEXT NOT NULL,
-  rented_at         TEXT NOT NULL,
-  media_address     TEXT NOT NULL DEFAULT '',
-  expected_worker_id         TEXT NOT NULL DEFAULT '',
-  expected_worker_boot_id    TEXT NOT NULL DEFAULT ''
-)`
-
 var rentalSchema = []string{rentalOperationsDDL, rentalsDDL, `
 CREATE UNIQUE INDEX IF NOT EXISTS rental_operation_remote
   ON rental_operations(rental_id) WHERE rental_id <> ''`, `

@@ -42,20 +42,20 @@ func TestModelProductionHumanProgressIsBoundedAndJSONStdoutStaysPure(t *testing.
 	}
 	progress.SourceProgress(20<<20, 100<<20)
 	progress.SourcePrepared(2)
-	progress.NodeStarting(0, "assemble-full", "tensorhub/minimax-h3-tools/assemble", false)
+	progress.StepStarting(0, "assemble-full", "tensorhub/minimax-h3-tools/assemble", false)
 	for range 100 {
-		progress.NodeRuntime(0, "assemble-full", "constructing", 0.2, true)
+		progress.StepRuntime(0, "assemble-full", "constructing", 0.2, true)
 	}
-	progress.NodeRuntime(0, "assemble-full", "verifying", 0.1, true)
+	progress.StepRuntime(0, "assemble-full", "verifying", 0.1, true)
 	progress.ArtifactAdopted(0, 0, 1, "assemble-full")
 	progress.PublicationStarting("bf16-full")
 	progress.PublicationPrepared("bf16-full")
-	progress.NodeCompleted(0, "assemble-full", "tensorhub/minimax-h3-tools/assemble")
+	progress.StepCompleted(0, "assemble-full", "tensorhub/minimax-h3-tools/assemble")
 	for index := 1; index < 10; index++ {
-		name := fmt.Sprintf("node-%d", index+1)
+		name := fmt.Sprintf("step-%d", index+1)
 		callable := fmt.Sprintf("tensorhub/minimax-h3-tools/function-%d", index+1)
-		progress.NodeStarting(index, name, callable, false)
-		progress.NodeCompleted(index, name, callable)
+		progress.StepStarting(index, name, callable, false)
+		progress.StepCompleted(index, name, callable)
 	}
 	lanes := []string{"bf16-adaln-pruned", "bf16-full", "fp8-adaln-pruned", "mxfp8-adaln-pruned"}
 	progress.ReleaseStarting("1.0.0", lanes)
@@ -65,18 +65,18 @@ func TestModelProductionHumanProgressIsBoundedAndJSONStdoutStaysPure(t *testing.
 
 	human := stderr.String()
 	for _, want := range []string{
-		"Model production modelpub-proof accepted: 10 nodes, 4 lanes.",
+		"Model production modelpub-proof accepted: 10 steps, 4 lanes.",
 		"Rental rental-1: ready (h200-sxm).",
 		"Worker: ready on rental rental-1.",
 		"Source: preparing 27 files (100.0MiB).",
 		"Source: downloaded 10.0MiB / 100.0MiB (10%).",
 		"Source: prepared 2 model profiles.",
-		"Node 1/10: starting assemble-full (tensorhub/minimax-h3-tools/assemble).",
-		"Node 1/10: assemble-full — constructing (20%).",
-		"Node 1/10: assemble-full — verifying (10%).",
-		"Artifact: adopted output 1/1 for node 1/10 assemble-full.",
+		"Step 1/10: starting assemble-full (tensorhub/minimax-h3-tools/assemble).",
+		"Step 1/10: assemble-full — constructing (20%).",
+		"Step 1/10: assemble-full — verifying (10%).",
+		"Artifact: adopted output 1/1 for step 1/10 assemble-full.",
 		"Publication: lane bf16-full prepared.",
-		"Node 1/10: completed assemble-full (tensorhub/minimax-h3-tools/assemble).",
+		"Step 1/10: completed assemble-full (tensorhub/minimax-h3-tools/assemble).",
 		"Release: 1.0.0 cut atomically with 4 lanes.",
 		"Cleanup: rental rental-1 released; provider absence confirmed.",
 	} {
@@ -91,17 +91,17 @@ func TestModelProductionHumanProgressIsBoundedAndJSONStdoutStaysPure(t *testing.
 		t.Errorf("unchanged Runtime polls emitted %d lines\n%s", count, human)
 	}
 	if count := strings.Count(human, ": starting "); count != 10 {
-		t.Errorf("ten-node production emitted %d start lines\n%s", count, human)
+		t.Errorf("ten-step production emitted %d start lines\n%s", count, human)
 	}
 	if count := strings.Count(human, ": completed "); count != 10 {
-		t.Errorf("ten-node production emitted %d completion lines\n%s", count, human)
+		t.Errorf("ten-step production emitted %d completion lines\n%s", count, human)
 	}
 
 	var disabled bytes.Buffer
 	machineProgress := cli.NewModelProductionProgress(&disabled, false, 10)
 	machineProgress.Accepted("modelpub-proof", 4)
 	machineProgress.SourceProgress(50, 100)
-	machineProgress.NodeStarting(0, "assemble-full", "tensorhub/minimax-h3-tools/assemble", false)
+	machineProgress.StepStarting(0, "assemble-full", "tensorhub/minimax-h3-tools/assemble", false)
 	machineProgress.RentalReleased("rental-1")
 	if disabled.Len() != 0 {
 		t.Fatalf("JSON-mode progress wrote to its stream: %q", disabled.String())
@@ -200,7 +200,7 @@ func TestModelProductionSourceRequestHonorsCancellationContext(t *testing.T) {
 }
 
 func TestRemoteModelProductionResolvesHubMetadataWithoutLocalInstall(t *testing.T) {
-	producerBytes := []byte(`{"application":"remote_producer:app","entrypoints":[],"format":"cozy.package.descriptor/1","jobs":[],"model_productions":[{"name":"build","nodes":[{"callable":"proof/remote-job/derive","models":{"source":"source"},"name":"derive","outputs":["model"],"resources":{"gpu_count":1,"placement":"single_node","requires":"sm90+,vram80g,ram64g"}}],"outputs":[{"lane_key":"bf16","name":"bf16","required_contract":{"encodings":["sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"],"topology_digest":"sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"},"source":"derive.model"}],"sources":{"source":"proof/source/1"}}]}`)
+	producerBytes := []byte(`{"application":"remote_producer:app","entrypoints":[],"format":"cozy.package.descriptor/1","jobs":[],"model_productions":[{"name":"build","steps":[{"callable":"proof/remote-job/derive","models":{"source":"source"},"name":"derive","outputs":["model"],"resources":{"gpu_count":1,"placement":"single_node","requires":"sm90+,vram80g,ram64g"}}],"outputs":[{"lane_key":"bf16","name":"bf16","required_contract":{"encodings":["sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"],"topology_digest":"sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"},"source":"derive.model"}],"sources":{"source":"proof/source/1"}}]}`)
 	producer, problem := launch.DecodeDescriptor(producerBytes)
 	fatal(t, problem)
 	jobBytes := []byte(`{"application":"remote_job:app","entrypoints":[],"format":"cozy.package.descriptor/1","jobs":[{"artifact_outputs":[{"max_bytes":4096,"mime_type":"application/vnd.cozy.model-manifest","output_id":"model"}],"models":[{"class":"ProofModel","component_use":{},"path":"derive.models.source","stamps":{}}],"name":"derive","publishes":false,"request":{"fields":[]},"resources":{"gpu_count":1,"placement":"single_node","requires":"sm90+,vram80g,ram64g"},"result":{"fields":[]}}],"model_productions":[]}`)
@@ -303,7 +303,7 @@ func TestRemoteModelProductionResolvesHubMetadataWithoutLocalInstall(t *testing.
 }
 
 func TestDetachedModelProductionResumesInDaemonAndKeepsFrozenPackagePlan(t *testing.T) {
-	producerBytes := []byte(`{"application":"remote_producer:app","entrypoints":[],"format":"cozy.package.descriptor/1","jobs":[],"model_productions":[{"name":"build","nodes":[{"callable":"proof/remote-job/derive","models":{"source":"source"},"name":"derive","outputs":["model"],"resources":{"gpu_count":1,"placement":"single_node","requires":"sm90+,vram80g,ram64g"}}],"outputs":[{"lane_key":"bf16","name":"bf16","required_contract":{"encodings":["sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"],"topology_digest":"sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"},"source":"derive.model"}],"sources":{"source":"proof/source/1"}}]}`)
+	producerBytes := []byte(`{"application":"remote_producer:app","entrypoints":[],"format":"cozy.package.descriptor/1","jobs":[],"model_productions":[{"name":"build","steps":[{"callable":"proof/remote-job/derive","models":{"source":"source"},"name":"derive","outputs":["model"],"resources":{"gpu_count":1,"placement":"single_node","requires":"sm90+,vram80g,ram64g"}}],"outputs":[{"lane_key":"bf16","name":"bf16","required_contract":{"encodings":["sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"],"topology_digest":"sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"},"source":"derive.model"}],"sources":{"source":"proof/source/1"}}]}`)
 	producer, problem := launch.DecodeDescriptor(producerBytes)
 	fatal(t, problem)
 	jobBytes := []byte(`{"application":"remote_job:app","entrypoints":[],"format":"cozy.package.descriptor/1","jobs":[{"artifact_outputs":[{"max_bytes":4096,"mime_type":"application/vnd.cozy.model-manifest","output_id":"model"}],"models":[{"class":"ProofModel","component_use":{},"path":"derive.models.source","stamps":{}}],"name":"derive","publishes":false,"request":{"fields":[]},"resources":{"gpu_count":1,"placement":"single_node","requires":"sm90+,vram80g,ram64g"},"result":{"fields":[]}}],"model_productions":[]}`)
@@ -502,7 +502,7 @@ func TestModelProductionOperationSurvivesRestartAndReplaysExactly(t *testing.T) 
 		Producer: "tensorhub/minimax-h3-tools/four-lane", ProducerRelease: "1.0.0",
 		ProducerDigest:   "sha256:" + strings.Repeat("d", 64),
 		DescriptorDigest: "sha256:" + strings.Repeat("e", 64),
-		Jobs: []modelproduction.JobPin{{Node: "full", Callable: "tensorhub/minimax-h3-tools/assemble",
+		Jobs: []modelproduction.JobPin{{Step: "full", Callable: "tensorhub/minimax-h3-tools/assemble",
 			Release: "1.0.0", ReleaseDigest: "sha256:" + strings.Repeat("f", 64),
 		}},
 	}
@@ -524,7 +524,7 @@ func TestModelProductionOperationSurvivesRestartAndReplaysExactly(t *testing.T) 
 	created, replay, problem := store.BeginModelProductionInstruction(
 		instruction.ID(), instructionDigest, instructionBytes)
 	fatal(t, problem)
-	if replay || created.State != "resolving" || created.NodeIndex != 0 ||
+	if replay || created.State != "resolving" || created.StepIndex != 0 ||
 		!bytes.Equal(created.Plan, instructionBytes) {
 		t.Fatalf("created operation = %+v replay=%t", created, replay)
 	}
@@ -547,11 +547,11 @@ func TestModelProductionOperationSurvivesRestartAndReplaysExactly(t *testing.T) 
 	}
 	fatal(t, store.AdvanceModelProduction(plan.ID(), "accepted", "source_preparing", 0, "rental-1"))
 	fatal(t, store.AdvanceModelProduction(plan.ID(), "source_preparing", "source_prepared", 0, "rental-1"))
-	fatal(t, store.AdvanceModelProduction(plan.ID(), "source_prepared", "node_running", 0, "rental-1"))
-	fatal(t, store.AdvanceModelProduction(plan.ID(), "node_running", "node_running", 1, "rental-1"))
+	fatal(t, store.AdvanceModelProduction(plan.ID(), "source_prepared", "step_running", 0, "rental-1"))
+	fatal(t, store.AdvanceModelProduction(plan.ID(), "step_running", "step_running", 1, "rental-1"))
 	current, problem := store.ModelProduction(plan.ID())
 	fatal(t, problem)
-	if current == nil || current.State != "node_running" || current.NodeIndex != 1 ||
+	if current == nil || current.State != "step_running" || current.StepIndex != 1 ||
 		current.RentalID != "rental-1" {
 		t.Fatalf("advanced operation = %+v", current)
 	}
@@ -565,10 +565,10 @@ func TestModelProductionOperationSurvivesRestartAndReplaysExactly(t *testing.T) 
 		changedBytes); problem == nil || problem.Name != "model_production.identity_conflict" {
 		t.Fatalf("changed replay bytes = %v", problem)
 	}
-	if problem := store.AdvanceModelProduction(plan.ID(), "node_running", "completed", 1, "rental-1"); problem == nil || problem.Name != "model_production.transition_invalid" {
+	if problem := store.AdvanceModelProduction(plan.ID(), "step_running", "completed", 1, "rental-1"); problem == nil || problem.Name != "model_production.transition_invalid" {
 		t.Fatalf("skipped release/cleanup states = %v", problem)
 	}
-	fatal(t, store.CancelModelProduction(plan.ID(), "node_running", "user interrupted"))
+	fatal(t, store.CancelModelProduction(plan.ID(), "step_running", "user interrupted"))
 	canceled, problem := store.ModelProduction(plan.ID())
 	fatal(t, problem)
 	if canceled == nil || canceled.State != "canceled" || !canceled.CancelRequested {
@@ -601,8 +601,8 @@ func TestModelProductionCancelCutOrderingAndUnattachedProviderAbsence(t *testing
 		fatal(t, problem)
 		fatal(t, store.AdvanceModelProduction(instruction.ID(), "accepted", "source_preparing", 0, "rental-proof"))
 		fatal(t, store.AdvanceModelProduction(instruction.ID(), "source_preparing", "source_prepared", 0, "rental-proof"))
-		fatal(t, store.AdvanceModelProduction(instruction.ID(), "source_prepared", "node_running", 0, "rental-proof"))
-		fatal(t, store.AdvanceModelProduction(instruction.ID(), "node_running", "outputs_preparing", 1, "rental-proof"))
+		fatal(t, store.AdvanceModelProduction(instruction.ID(), "source_prepared", "step_running", 0, "rental-proof"))
+		fatal(t, store.AdvanceModelProduction(instruction.ID(), "step_running", "outputs_preparing", 1, "rental-proof"))
 		return instruction.ID(), plan
 	}
 	beforeID, _ := makeOperation("before-cut")
@@ -705,12 +705,12 @@ func TestModelProductionAmbiguousCutReplaysExactlyAfterDaemonRestart(t *testing.
 		Source:   "hf://acme/model@" + strings.Repeat("a", 40),
 		Producer: "acme/tools/build", Rental: true}
 	production := &launch.ModelProduction{Name: "build", Sources: map[string]string{"source": "proof/source/1"},
-		Nodes: []launch.ModelProductionNode{{Name: "derive", Callable: "acme/job/derive",
+		Steps: []launch.ModelProductionStep{{Name: "derive", Callable: "acme/job/derive",
 			Models: map[string]string{"source": "source"}, Outputs: []string{"model"}}},
 		Outputs: []launch.ModelProductionOutput{{Name: "bf16", Source: "derive.model", LaneKey: "bf16"}}}
 	plan := modelproduction.Plan{Instruction: instruction, Destination: instruction.Destination,
 		Release: instruction.Release, Source: instruction.Source, Producer: instruction.Producer,
-		Production: production, Jobs: []modelproduction.JobPin{{Node: "derive", Callable: "acme/job/derive"}}}
+		Production: production, Jobs: []modelproduction.JobPin{{Step: "derive", Callable: "acme/job/derive"}}}
 	instructionBytes, err := instruction.Bytes()
 	must(t, err)
 	instructionDigest, err := instruction.Digest()
@@ -727,9 +727,9 @@ func TestModelProductionAmbiguousCutReplaysExactlyAfterDaemonRestart(t *testing.
 	fatal(t, problem)
 	fatal(t, store.AdvanceModelProduction(instruction.ID(), "accepted", "source_preparing", 0, "rental-cut-proof"))
 	fatal(t, store.AdvanceModelProduction(instruction.ID(), "source_preparing", "source_prepared", 0, "rental-cut-proof"))
-	fatal(t, store.AdvanceModelProduction(instruction.ID(), "source_prepared", "node_running", 0, "rental-cut-proof"))
-	fatal(t, store.AdvanceModelProduction(instruction.ID(), "node_running", "outputs_preparing", 1, "rental-cut-proof"))
-	artifact := records.ModelProductionArtifact{OperationID: instruction.ID(), NodeName: "derive",
+	fatal(t, store.AdvanceModelProduction(instruction.ID(), "source_prepared", "step_running", 0, "rental-cut-proof"))
+	fatal(t, store.AdvanceModelProduction(instruction.ID(), "step_running", "outputs_preparing", 1, "rental-cut-proof"))
+	artifact := records.ModelProductionArtifact{OperationID: instruction.ID(), StepName: "derive",
 		OutputSlot: "model", RequestID: "job-proof", Attempt: 1,
 		InvocationDigest: "sha256:" + strings.Repeat("b", 64), TransactionID: "transaction-proof",
 		WriterGeneration: 1, ReceiptDigest: "sha256:" + strings.Repeat("c", 64),
@@ -769,7 +769,7 @@ func TestModelProductionAmbiguousCutReplaysExactlyAfterDaemonRestart(t *testing.
 	terminateTestDaemon(t, root)
 }
 
-func TestModelProductionJoinsNodeArtifactAndTransferBeforeReplay(t *testing.T) {
+func TestModelProductionJoinsStepArtifactAndTransferBeforeReplay(t *testing.T) {
 	store, problem := records.Open(filepath.Join(t.TempDir(), "records.db"))
 	fatal(t, problem)
 	defer store.Close()
@@ -784,25 +784,25 @@ func TestModelProductionJoinsNodeArtifactAndTransferBeforeReplay(t *testing.T) {
 		ID: plan.ID(), PlanDigest: digest, Plan: data,
 	})
 	fatal(t, problem)
-	_, problem = store.BeginModelProductionNode(records.ModelProductionNode{
-		OperationID: plan.ID(), NodeIndex: 0, NodeName: "derive", State: "pending",
+	_, problem = store.BeginModelProductionStep(records.ModelProductionStep{
+		OperationID: plan.ID(), StepIndex: 0, StepName: "derive", State: "pending",
 	})
 	fatal(t, problem)
-	fatal(t, store.SetModelProductionNodeRequest(plan.ID(), 0, "derive", "job-1", "submitted"))
-	node, problem := store.ModelProductionNodeByRequest("job-1")
+	fatal(t, store.SetModelProductionStepRequest(plan.ID(), 0, "derive", "job-1", "submitted"))
+	step, problem := store.ModelProductionStepByRequest("job-1")
 	fatal(t, problem)
-	if node == nil || node.OperationID != plan.ID() || node.NodeName != "derive" {
-		t.Fatalf("node request join = %+v", node)
+	if step == nil || step.OperationID != plan.ID() || step.StepName != "derive" {
+		t.Fatalf("step request join = %+v", step)
 	}
 	receipt := []byte(`{"format":"proof/1"}`)
 	evidence := []byte(`{"format":"evidence/1"}`)
-	artifact := records.ModelProductionArtifact{OperationID: plan.ID(), NodeName: "derive",
+	artifact := records.ModelProductionArtifact{OperationID: plan.ID(), StepName: "derive",
 		OutputSlot: "model", RequestID: "job-1", Attempt: 1,
 		InvocationDigest: "sha256:" + strings.Repeat("c", 64), TransactionID: "txn-1",
 		WriterGeneration: 1, ReceiptDigest: "sha256:" + strings.Repeat("d", 64),
 		Receipt: receipt, ManifestID: "sha256:" + strings.Repeat("e", 64),
 		ManifestLength: 128, ReleaseEvidence: evidence}
-	object := records.ModelProductionObject{OperationID: plan.ID(), NodeName: "derive",
+	object := records.ModelProductionObject{OperationID: plan.ID(), StepName: "derive",
 		OutputSlot: "model", ObjectID: "sha256:" + strings.Repeat("f", 64),
 		Length: 256, SourceRef: "opaque-source"}
 	fatal(t, store.RecordModelProductionArtifact(artifact, []records.ModelProductionObject{object}))
@@ -814,7 +814,7 @@ func TestModelProductionJoinsNodeArtifactAndTransferBeforeReplay(t *testing.T) {
 		t.Fatalf("changed object inventory replay = %v", problem)
 	}
 	fatal(t, store.RecordModelProductionObjectStatus(records.ModelProductionObject{
-		OperationID: plan.ID(), NodeName: "derive", OutputSlot: "model",
+		OperationID: plan.ID(), StepName: "derive", OutputSlot: "model",
 		ObjectID: object.ObjectID, Length: object.Length, TransferOperationID: "pub-1",
 		GrantRevision: 1, UpdateSequence: 1, State: "uploaded", TransferredBytes: object.Length,
 	}))
@@ -829,7 +829,7 @@ func TestModelProductionJoinsNodeArtifactAndTransferBeforeReplay(t *testing.T) {
 		t.Fatalf("durable artifact join = artifacts=%+v objects=%+v", artifacts, objects)
 	}
 	if problem := store.RecordModelProductionObjectStatus(records.ModelProductionObject{
-		OperationID: plan.ID(), NodeName: "derive", OutputSlot: "model",
+		OperationID: plan.ID(), StepName: "derive", OutputSlot: "model",
 		ObjectID: object.ObjectID, Length: object.Length, TransferOperationID: "other",
 		GrantRevision: 1, UpdateSequence: 2, State: "uploaded", TransferredBytes: object.Length,
 	}); problem == nil || problem.Name != "model_production.artifact_status_conflict" {

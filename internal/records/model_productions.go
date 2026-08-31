@@ -17,7 +17,7 @@ CREATE TABLE IF NOT EXISTS model_productions (
   plan_digest TEXT NOT NULL,
   plan        BLOB NOT NULL,
   state       TEXT NOT NULL,
-  node_index  INTEGER NOT NULL DEFAULT 0,
+  step_index  INTEGER NOT NULL DEFAULT 0,
   rental_id   TEXT NOT NULL DEFAULT '',
   selected_sku TEXT NOT NULL DEFAULT '',
   cancel_requested INTEGER NOT NULL DEFAULT 0 CHECK(cancel_requested IN (0,1)),
@@ -48,18 +48,18 @@ CREATE TABLE IF NOT EXISTS model_production_sources (
   release_evidence BLOB NOT NULL DEFAULT x'',
   PRIMARY KEY(operation_id,slot)
 )`, `
-CREATE TABLE IF NOT EXISTS model_production_nodes (
+CREATE TABLE IF NOT EXISTS model_production_steps (
   operation_id TEXT NOT NULL REFERENCES model_productions(id),
-  node_index INTEGER NOT NULL,
-  node_name TEXT NOT NULL,
+  step_index INTEGER NOT NULL,
+  step_name TEXT NOT NULL,
   request_id TEXT NOT NULL DEFAULT '',
   state TEXT NOT NULL DEFAULT 'pending',
-  PRIMARY KEY(operation_id,node_index),
-  UNIQUE(operation_id,node_name)
+  PRIMARY KEY(operation_id,step_index),
+  UNIQUE(operation_id,step_name)
 )`, `
 CREATE TABLE IF NOT EXISTS model_production_artifacts (
   operation_id TEXT NOT NULL REFERENCES model_productions(id),
-  node_name TEXT NOT NULL,
+  step_name TEXT NOT NULL,
   output_slot TEXT NOT NULL,
   request_id TEXT NOT NULL,
   attempt INTEGER NOT NULL,
@@ -73,12 +73,12 @@ CREATE TABLE IF NOT EXISTS model_production_artifacts (
   release_evidence BLOB NOT NULL,
   publication_id TEXT NOT NULL DEFAULT '',
   state TEXT NOT NULL DEFAULT 'received',
-  PRIMARY KEY(operation_id,node_name,output_slot),
+  PRIMARY KEY(operation_id,step_name,output_slot),
   UNIQUE(request_id,attempt,output_slot)
 )`, `
 CREATE TABLE IF NOT EXISTS model_production_objects (
   operation_id TEXT NOT NULL,
-  node_name TEXT NOT NULL,
+  step_name TEXT NOT NULL,
   output_slot TEXT NOT NULL,
   object_id TEXT NOT NULL,
   length INTEGER NOT NULL CHECK(length>0),
@@ -90,9 +90,9 @@ CREATE TABLE IF NOT EXISTS model_production_objects (
   transferred_bytes INTEGER NOT NULL DEFAULT 0,
   safe_code TEXT NOT NULL DEFAULT '',
   safe_detail TEXT NOT NULL DEFAULT '',
-  PRIMARY KEY(operation_id,node_name,output_slot,object_id),
-  FOREIGN KEY(operation_id,node_name,output_slot)
-    REFERENCES model_production_artifacts(operation_id,node_name,output_slot)
+  PRIMARY KEY(operation_id,step_name,output_slot,object_id),
+  FOREIGN KEY(operation_id,step_name,output_slot)
+    REFERENCES model_production_artifacts(operation_id,step_name,output_slot)
 )`}
 
 // ModelProductionOperation is one durable source-to-release instruction. Plan
@@ -103,7 +103,7 @@ type ModelProductionOperation struct {
 	PlanDigest           string
 	Plan                 []byte
 	State                string
-	NodeIndex            int64
+	StepIndex            int64
 	RentalID             string
 	SelectedSKU          string
 	CancelRequested      bool
@@ -112,13 +112,13 @@ type ModelProductionOperation struct {
 	UpdatedAt            string
 }
 
-const modelProductionCols = `id,plan_digest,plan,state,node_index,rental_id,selected_sku,
+const modelProductionCols = `id,plan_digest,plan,state,step_index,rental_id,selected_sku,
 	cancel_requested,safe_code,safe_detail,created_at,updated_at`
 
 func scanModelProduction(row interface{ Scan(...any) error }) (ModelProductionOperation, error) {
 	var operation ModelProductionOperation
 	err := row.Scan(&operation.ID, &operation.PlanDigest, &operation.Plan, &operation.State,
-		&operation.NodeIndex, &operation.RentalID, &operation.SelectedSKU,
+		&operation.StepIndex, &operation.RentalID, &operation.SelectedSKU,
 		&operation.CancelRequested, &operation.SafeCode, &operation.SafeDetail,
 		&operation.CreatedAt, &operation.UpdatedAt)
 	return operation, err
@@ -420,16 +420,16 @@ func (s *Store) CancelModelProduction(id, from, detail string) *exit.Error {
 }
 
 // AdvanceModelProduction is a compare-and-swap over the one coarse lifecycle.
-// Node detail remains in ordinary job attempts; node_index is only the restart cursor.
-func (s *Store) AdvanceModelProduction(id, from, to string, nodeIndex int64, rentalID string) *exit.Error {
-	if !modelProductionTransition(from, to) || nodeIndex < 0 {
+// Step detail remains in ordinary job attempts; step_index is only the restart cursor.
+func (s *Store) AdvanceModelProduction(id, from, to string, stepIndex int64, rentalID string) *exit.Error {
+	if !modelProductionTransition(from, to) || stepIndex < 0 {
 		return exit.Named(exit.Validation, "model_production.transition_invalid",
-			"model production transition %s -> %s at node %d is invalid", from, to, nodeIndex)
+			"model production transition %s -> %s at step %d is invalid", from, to, stepIndex)
 	}
-	result, err := s.db.Exec(`UPDATE model_productions SET state=?,node_index=?,
+	result, err := s.db.Exec(`UPDATE model_productions SET state=?,step_index=?,
 		rental_id=CASE WHEN rental_id='' THEN ? ELSE rental_id END,updated_at=?
-		WHERE id=? AND state=? AND node_index<=? AND (rental_id='' OR ?='' OR rental_id=?)`,
-		to, nodeIndex, rentalID, now(), id, from, nodeIndex, rentalID, rentalID)
+		WHERE id=? AND state=? AND step_index<=? AND (rental_id='' OR ?='' OR rental_id=?)`,
+		to, stepIndex, rentalID, now(), id, from, stepIndex, rentalID, rentalID)
 	if err != nil {
 		return exit.Internalf("cannot advance model production %s: %s", id, err)
 	}
@@ -443,13 +443,13 @@ func (s *Store) AdvanceModelProduction(id, from, to string, nodeIndex int64, ren
 	if current == nil {
 		return exit.New(exit.NotFound, "model production %s is absent", id)
 	}
-	if current.State == to && current.NodeIndex == nodeIndex &&
+	if current.State == to && current.StepIndex == stepIndex &&
 		(rentalID == "" || current.RentalID == rentalID) {
 		return nil
 	}
 	return exit.Named(exit.Conflict, "model_production.state_conflict",
-		"model production %s is %s at node %d, not %s", id,
-		current.State, current.NodeIndex, from)
+		"model production %s is %s at step %d, not %s", id,
+		current.State, current.StepIndex, from)
 }
 
 func modelProductionTransition(from, to string) bool {
@@ -459,9 +459,9 @@ func modelProductionTransition(from, to string) bool {
 	switch from + "\x00" + to {
 	case "accepted\x00source_preparing",
 		"source_preparing\x00source_prepared",
-		"source_prepared\x00node_running",
-		"node_running\x00node_running",
-		"node_running\x00outputs_preparing",
+		"source_prepared\x00step_running",
+		"step_running\x00step_running",
+		"step_running\x00outputs_preparing",
 		"outputs_preparing\x00release_cut",
 		"release_cut\x00cleanup_pending",
 		"cleanup_pending\x00completed":

@@ -138,7 +138,7 @@ func (c *Orchestrator) SubmitDetail(s Submission) (string, uint64, bool, *exit.E
 }
 
 // ActivateRecordedRequest is the second half used by model productions after
-// their node row has durably joined the freshly minted request id.
+// their step row has durably joined the freshly minted request id.
 func (c *Orchestrator) ActivateRecordedRequest(req records.Request) (uint64, *exit.Error) {
 	return c.activateRecorded(req)
 }
@@ -1092,7 +1092,7 @@ func downloadModelRefs(models []ModelRef) []*pb.DownloadModelRef {
 	out := make([]*pb.DownloadModelRef, 0, len(models))
 	for _, model := range models {
 		// A release-less ref is an operation-local Manifest already held by this
-		// worker's TensorFS store (source preparation or a prior node output).
+		// worker's TensorFS store (source preparation or a prior step output).
 		if model.Release == "" {
 			continue
 		}
