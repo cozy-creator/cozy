@@ -14,6 +14,8 @@ import (
 	"github.com/cozy-creator/cozy/internal/canonical"
 	"github.com/cozy-creator/cozy/internal/home"
 	pb "github.com/cozy-creator/cozy/protocol/cozy/worker/v1"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 )
 
 type fakeControl struct {
@@ -199,6 +201,11 @@ func (f *fakeControl) Control(stream pb.WorkerControl_ControlServer) error {
 			}
 		case *pb.RecordOwnerFrame_DesiredState:
 			d := m.DesiredState
+			if f.arm == "precondition" {
+				f.say("ARM: refusing desired revision %d with FailedPrecondition", d.Revision)
+				return status.Error(codes.FailedPrecondition,
+					"Runtime package preparation failed: proof package is incompatible")
+			}
 			placementID, planIDs, setDigest := "", []string(nil), []byte(nil)
 			packageRevision, environmentDigest, configDigest := "", "", ""
 			if ds := d.GetPlacementSet(); ds != nil {
