@@ -1130,7 +1130,7 @@ func (c *Orchestrator) grantFor(req records.Request, attempt uint64, w *worker) 
 			return nil, e
 		}
 	}
-	if req.IsJob() {
+	if req.IsJob() && w.media == nil {
 		g, _, e := c.jobGrant(req, attempt)
 		return g, e
 	}
