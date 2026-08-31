@@ -23,7 +23,7 @@ import (
 )
 
 const weightlessRef = "cozy/cozy-weightless-package"
-const editableRuntimeFixtureSHA = "9e8409c0c68c6cae75209817ad47818770cde8db"
+const editableRuntimeFixtureSHA = "c7582e635a01e44a18c8487d0eb66992b70f7602"
 const editableTensorFSFixtureSHA = "0f49a4bf3fbe6fc8d41713b7ce9041c80161b7e6"
 
 func TestLiteralPayloadUsesOrdinaryScalarSyntax(t *testing.T) {
@@ -1139,10 +1139,10 @@ func TestDevelopmentInstallRefreshesBeforeInvocation(t *testing.T) {
 	}
 	files, err := os.ReadDir(outputDir)
 	must(t, err)
-	if len(files) != 1 || !requestOutputName(files[0].Name(), ".png") {
+	if len(files) != 1 || !requestOutputName(files[0].Name(), ".webp") {
 		t.Fatalf("first invocation did not use one request-hash filename: %v", files)
 	}
-	if !strings.Contains(stderr, filepath.Join(outputDir, strings.TrimSuffix(files[0].Name(), ".png")+"*")) {
+	if !strings.Contains(stderr, filepath.Join(outputDir, files[0].Name())) {
 		t.Fatalf("invocation did not announce its output hash before execution\n%s", stderr)
 	}
 	firstOutput := files[0].Name()
@@ -1154,7 +1154,7 @@ func TestDevelopmentInstallRefreshesBeforeInvocation(t *testing.T) {
 	files, err = os.ReadDir(outputDir)
 	must(t, err)
 	if len(files) != 2 || files[0].Name() == files[1].Name() ||
-		!requestOutputName(files[0].Name(), ".png") || !requestOutputName(files[1].Name(), ".png") {
+		!requestOutputName(files[0].Name(), ".webp") || !requestOutputName(files[1].Name(), ".webp") {
 		t.Fatalf("independent invocations did not retain two request-hash outputs: %v", files)
 	}
 	if files[0].Name() != firstOutput && files[1].Name() != firstOutput {
@@ -1170,14 +1170,34 @@ func TestDevelopmentInstallRefreshesBeforeInvocation(t *testing.T) {
 	}
 	fixed, err := os.ReadDir(fixedDir)
 	must(t, err)
-	if len(fixed) != 1 || !requestOutputName(fixed[0].Name(), ".png") {
+	if len(fixed) != 1 || !requestOutputName(fixed[0].Name(), ".webp") {
 		t.Fatalf("the same explicit payload did not resolve to one stable filename: %v", fixed)
+	}
+
+	detachedDir := filepath.Join(root, "detached-output")
+	code, stdout, stderr = runCozyStreams(t, root, "--json", "run", weightlessRef+"/tile",
+		"size=32", "seed=9", "delay_ms=4500", "--out", detachedDir)
+	if code != 0 || !strings.Contains(stdout, `"status":"running"`) ||
+		!strings.Contains(stdout, `"output":"`+detachedDir) ||
+		!strings.Contains(stdout, `.webp"`) {
+		t.Fatalf("default run did not detach with its durable WebP destination [exit %d]\nstdout:\n%s\nstderr:\n%s",
+			code, stdout, stderr)
+	}
+	deadline := time.Now().Add(10 * time.Second)
+	for {
+		detached, err := os.ReadDir(detachedDir)
+		if err == nil && len(detached) == 1 && requestOutputName(detached[0].Name(), ".webp") {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("daemon did not publish the detached WebP: %v, %v", detached, err)
+		}
+		time.Sleep(25 * time.Millisecond)
 	}
 
 	code, _, stderr = runCozyStreams(t, root, "run", weightlessRef+"/tile",
 		"size=32", "seed=7", "--full", "--await")
-	if code != 0 || !strings.Contains(stderr, "progress value=") ||
-		!strings.Contains(stderr, "metric value=") {
+	if code != 0 || !strings.Contains(stderr, "progress fraction=") {
 		t.Fatalf("--full did not retain Runtime diagnostics [exit %d]\n%s", code, stderr)
 	}
 
@@ -1290,7 +1310,7 @@ func TestModeledDevelopmentInstallRefreshesAndKeepsLastGoodSelection(t *testing.
 	}
 	code, out = runCozy(t, root, "run", "cozy/modeled-development-package/render",
 		"value=7", "--json", "--await")
-	if code != 0 || !strings.Contains(out, `"value":7`) {
+	if code != 0 || !strings.Contains(out, `"value":8`) {
 		t.Fatalf("modeled editable invocation failed [exit %d]\n%s\n%s",
 			code, out, productWorkerLogs(root))
 	}
@@ -1299,12 +1319,12 @@ func TestModeledDevelopmentInstallRefreshesAndKeepsLastGoodSelection(t *testing.
 	source := filepath.Join(project, "src", "modeled_development_package", "__init__.py")
 	body, err := os.ReadFile(source)
 	must(t, err)
-	body = []byte(strings.Replace(string(body), "return Result(payload.value)",
-		"return Result(payload.value + 1)", 1))
+	body = []byte(strings.Replace(string(body), "return Result(payload.value + model.first())",
+		"return Result(payload.value + model.first() + 1)", 1))
 	must(t, os.WriteFile(source, body, 0o644))
 	code, out = runCozy(t, root, "run", "cozy/modeled-development-package/render",
 		"value=7", "--json", "--await")
-	if code != 0 || !strings.Contains(out, `"value":8`) {
+	if code != 0 || !strings.Contains(out, `"value":9`) {
 		t.Fatalf("modeled source edit was not live on the next invocation [exit %d]\n%s\n%s",
 			code, out, productWorkerLogs(root))
 	}
@@ -1332,7 +1352,7 @@ func TestModeledDevelopmentInstallRefreshesAndKeepsLastGoodSelection(t *testing.
 	must(t, os.WriteFile(binding, goodBinding, 0o644))
 	code, out = runCozy(t, root, "run", "cozy/modeled-development-package/render",
 		"value=7", "--json", "--await")
-	if code != 0 || !strings.Contains(out, `"value":8`) {
+	if code != 0 || !strings.Contains(out, `"value":9`) {
 		t.Fatalf("restored modeled selection did not reuse last good generation [exit %d]\n%s",
 			code, out)
 	}

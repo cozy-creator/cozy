@@ -566,13 +566,12 @@ type Lifecycle struct {
 }
 
 type OutputExportRef struct {
-	Directory      string   `json:"directory"`
-	PayloadHash    string   `json:"payload_hash"`
-	State          string   `json:"state"`
-	Attempts       int64    `json:"attempts"`
-	ErrorCode      string   `json:"error_code,omitempty"`
-	Error          string   `json:"error,omitempty"`
-	PublishedPaths []string `json:"published_paths"`
+	Directory   string   `json:"directory"`
+	PayloadHash string   `json:"payload_hash"`
+	State       string   `json:"state"`
+	ErrorCode   string   `json:"error_code,omitempty"`
+	Error       string   `json:"error,omitempty"`
+	Paths       []string `json:"paths"`
 }
 
 // MediaRef is how bytes are named in EVERY document this API emits: an opaque id and its
@@ -629,10 +628,16 @@ func (s *Server) lifecycleOf(row records.Request) Lifecycle {
 		}
 	}
 	if export, problem := s.store.OutputExportOf(row.ID); problem == nil && export != nil {
+		paths := make([]string, 0, len(export.Outputs))
+		for _, output := range export.Outputs {
+			paths = append(paths, filepath.Join(export.Directory, output.Filename))
+		}
+		if len(export.PublishedPaths) > 0 {
+			paths = append(paths[:0], export.PublishedPaths...)
+		}
 		life.OutputExport = &OutputExportRef{
 			Directory: export.Directory, PayloadHash: export.PayloadHash, State: export.State,
-			Attempts: export.Attempts, ErrorCode: export.ErrorCode, Error: export.SafeError,
-			PublishedPaths: append([]string(nil), export.PublishedPaths...),
+			ErrorCode: export.ErrorCode, Error: export.SafeError, Paths: paths,
 		}
 	}
 	attempts, _ := s.store.Attempts(row.ID)

@@ -45,10 +45,11 @@ REVISION = "first"
 class TileInput(msgspec.Struct, forbid_unknown_fields=True):
     size: Annotated[int, msgspec.Meta(ge=8, le=256)] = 64
     seed: int = 13
+    delay_ms: Annotated[int, msgspec.Meta(ge=0, le=5_000)] = 0
 
 
 class TileOutput(msgspec.Struct):
-    image: ImageAsset
+    image: Annotated[ImageAsset, AssetBound(media_types=("image/webp",))]
     size: int
     pixels: int
     digest: str
@@ -81,7 +82,7 @@ class RelayOutput(msgspec.Struct):
 @app.entrypoint
 def tile(ctx: Context, payload: TileInput, out: Outputs, tel: Telemetry) -> TileOutput:
     """A deterministic RGB tile from a linear congruential sequence — real computation
-    whose output is a real PNG the runtime encodes, with nothing to load first."""
+    whose output is a real WebP the runtime encodes, with nothing to load first."""
     side = 8 if ctx.boot_warmup else payload.size
     tel.log("filling the tile", side=side, seed=payload.seed)
     tel.progress(0.25, stage="tile")
@@ -89,6 +90,12 @@ def tile(ctx: Context, payload: TileInput, out: Outputs, tel: Telemetry) -> Tile
     # proves presentation of a live Runtime stream; it does not pretend a completed run can
     # replay every transient tick.
     time.sleep(0.05)
+    remaining = payload.delay_ms
+    while remaining > 0:
+        ctx.raise_if_cancelled()
+        step = min(remaining, 25)
+        time.sleep(step / 1_000)
+        remaining -= step
     state = payload.seed & 0xFFFFFFFF
     with tel.stage("fill_pixels"):
         pixels = bytearray(side * side * 3)
@@ -101,7 +108,7 @@ def tile(ctx: Context, payload: TileInput, out: Outputs, tel: Telemetry) -> Tile
     tel.progress(1.0, stage="tile")
     tel.metric("tile_bytes", len(pixels))
     return TileOutput(
-        image=out.save_image(ImageFrame(side, side, bytes(pixels)), format="png"),
+        image=out.save_image(ImageFrame(side, side, bytes(pixels)), format="webp"),
         size=side,
         pixels=side * side,
         digest=hashlib.sha256(pixels).hexdigest(),
@@ -121,7 +128,7 @@ def refuse(payload: RefuseInput) -> TileOutput:
 def relay(
     payload: RelayInput, ctx: Context, decoder: MediaDecoder, out: Outputs
 ) -> RelayOutput:
-    """CPU-only exact workflow handoff: decode the prior accepted PNG and save it again."""
+    """CPU-only exact workflow handoff: decode the prior accepted image and save it again."""
     remaining = payload.delay_ms
     while remaining > 0:
         ctx.raise_if_cancelled()

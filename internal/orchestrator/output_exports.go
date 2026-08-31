@@ -1,8 +1,6 @@
 package orchestrator
 
 import (
-	"fmt"
-
 	"github.com/cozy-creator/cozy/internal/exit"
 	"github.com/cozy-creator/cozy/internal/records"
 	"github.com/cozy-creator/cozy/internal/resultfiles"
@@ -121,11 +119,4 @@ func (c *Orchestrator) ResumeOutputExports() *exit.Error {
 		c.RetryOutputExport(export.RequestID)
 	}
 	return nil
-}
-
-func exportSummary(export *records.OutputExport) string {
-	if export == nil {
-		return ""
-	}
-	return fmt.Sprintf("%s after %d attempt(s)", export.State, export.Attempts)
 }

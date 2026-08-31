@@ -230,6 +230,17 @@ func migrateOutputExports(db *sql.DB, path string) *exit.Error {
 	if version != 1 {
 		return schemaReset(path, "records database changed to user_version %d while migrating", version)
 	}
+	want, err := schemaWithoutOutputExports()
+	if err != nil {
+		return exit.Internalf("cannot derive version 1 records schema: %s", err)
+	}
+	got, err := schemaSnapshot(tx)
+	if err != nil {
+		return exit.Internalf("cannot inspect version 1 records schema in %s: %s", path, err)
+	}
+	if strings.Join(got, "\n") != strings.Join(want, "\n") {
+		return schemaReset(path, "records database schema is not the exact version 1 shape")
+	}
 	if _, err := tx.Exec(outputExportSchema); err != nil {
 		return exit.Internalf("cannot add durable output exports in %s: %s", path, err)
 	}
@@ -240,6 +251,23 @@ func migrateOutputExports(db *sql.DB, path string) *exit.Error {
 		return exit.Internalf("cannot commit records migration in %s: %s", path, err)
 	}
 	return nil
+}
+
+func schemaWithoutOutputExports() ([]string, error) {
+	db, err := sql.Open("sqlite", ":memory:"+pragmas)
+	if err != nil {
+		return nil, err
+	}
+	defer db.Close()
+	for _, stmt := range schema {
+		if stmt == outputExportSchema {
+			continue
+		}
+		if _, err := db.Exec(stmt); err != nil {
+			return nil, err
+		}
+	}
+	return schemaSnapshot(db)
 }
 
 func schemaReset(path, format string, args ...any) *exit.Error {
