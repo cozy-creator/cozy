@@ -27,14 +27,14 @@ The diagnostic JSON accepted by all three seats is projection-only:
 Run the two independent seats:
 
 ```bash
-uv run --python 3.14 --project conformance/cbor/python \
+uv run --python 3.12 --project conformance/cbor/python \
   python scripts/cbor-conformance.py conform
 ```
 
 Add the production Rust seat once `tfs cbor` is built:
 
 ```bash
-uv run --python 3.14 --project conformance/cbor/python \
+uv run --python 3.12 --project conformance/cbor/python \
   python scripts/cbor-conformance.py --tfs target/release/tfs conform
 ```
 
@@ -58,11 +58,11 @@ Supply an explicit order document:
 Then convert and measure codec process/size scaffolding:
 
 ```bash
-uv run --python 3.14 --project conformance/cbor/python \
+uv run --python 3.12 --project conformance/cbor/python \
   python scripts/cbor-conformance.py convert-legacy OLD_HEADER.json ORDER.json \
   --out h3-diagnostic.json
 
-uv run --python 3.14 --project conformance/cbor/python \
+uv run --python 3.12 --project conformance/cbor/python \
   python scripts/cbor-conformance.py --tfs target/release/tfs benchmark \
   h3-diagnostic.json --reps 7
 ```

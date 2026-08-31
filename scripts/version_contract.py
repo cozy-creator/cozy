@@ -7,7 +7,6 @@ import argparse
 import importlib.metadata
 import pathlib
 import sys
-import sysconfig
 import tomllib
 import zipfile
 from email.parser import BytesParser
@@ -17,7 +16,7 @@ ROOT = pathlib.Path(__file__).resolve().parent.parent
 PACKAGE = "tensorfs"
 PRELAUNCH_MAJOR = 0
 V1_GATE = "proto-014"
-PYTHON_SPEC = ">=3.14,<3.15"
+PYTHON_SPEC = ">=3.12,<3.13"
 MATURIN_SPEC = "maturin>=1.15,<2"
 PYO3_VERSION = "0.29.2"
 CURRENT_CARGO_VERSION = "0.0.3-dev.0"
@@ -25,10 +24,8 @@ CURRENT_PYTHON_VERSION = "0.0.3.dev0"
 
 
 def python_runtime() -> str:
-    if sys.implementation.name != "cpython" or sys.version_info[:2] != (3, 14):
-        raise ValueError("TensorFS tooling requires CPython 3.14")
-    if sysconfig.get_config_var("Py_GIL_DISABLED"):
-        raise ValueError("TensorFS does not support free-threaded CPython 3.14t")
+    if sys.implementation.name != "cpython" or sys.version_info[:2] != (3, 12):
+        raise ValueError("TensorFS tooling requires CPython 3.12")
     return f"CPython {sys.version_info.major}.{sys.version_info.minor}.{sys.version_info.micro}"
 
 
@@ -61,8 +58,8 @@ def source_versions() -> tuple[str, str]:
     if pyproject["build-system"]["requires"] != [MATURIN_SPEC]:  # type: ignore[index]
         raise ValueError(f"build-system must require exactly {MATURIN_SPEC}")
     pyo3 = python_crate["dependencies"]["pyo3"]  # type: ignore[index]
-    if pyo3 != {"version": PYO3_VERSION, "features": ["abi3-py314"]}:
-        raise ValueError("tensorfs-py must use PyO3 0.29.2 with only abi3-py314")
+    if pyo3 != {"version": PYO3_VERSION, "features": ["abi3-py312"]}:
+        raise ValueError("tensorfs-py must use PyO3 0.29.2 with only abi3-py312")
     if not isinstance(python_version, str) or not isinstance(cargo_version, str):
         raise ValueError("pyproject and Cargo workspace versions must be strings")
     if cargo_version != CURRENT_CARGO_VERSION:
@@ -119,8 +116,8 @@ def wheel_version(path: pathlib.Path) -> str:
     if version != expected:
         raise ValueError(f"wheel version {version!r} != source version {expected!r}")
     tags = wheel_metadata.get_all("Tag", [])
-    if not tags or any(tag.split("-")[:2] != ["cp314", "abi3"] for tag in tags):
-        raise ValueError(f"wheel tags {tags!r} are not normal CPython 3.14 abi3")
+    if not tags or any(tag.split("-")[:2] != ["cp312", "abi3"] for tag in tags):
+        raise ValueError(f"wheel tags {tags!r} are not normal CPython 3.12 abi3")
     return expected
 
 
