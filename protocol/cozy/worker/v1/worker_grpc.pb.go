@@ -270,7 +270,8 @@ var WorkerControl_ServiceDesc = grpc.ServiceDesc{
 }
 
 const (
-	RuntimePreparation_PreparePackageSet_FullMethodName = "/cozy.worker.v1.RuntimePreparation/PreparePackageSet"
+	RuntimePreparation_PreparePackageSet_FullMethodName  = "/cozy.worker.v1.RuntimePreparation/PreparePackageSet"
+	RuntimePreparation_PrepareModelSource_FullMethodName = "/cozy.worker.v1.RuntimePreparation/PrepareModelSource"
 )
 
 // RuntimePreparationClient is the client API for RuntimePreparation service.
@@ -282,6 +283,7 @@ const (
 // no Tensorhub origin, presigned URL, delegation signature, or worker TLS credential.
 type RuntimePreparationClient interface {
 	PreparePackageSet(ctx context.Context, in *PreparePackageSetRequest, opts ...grpc.CallOption) (*PreparePackageSetResult, error)
+	PrepareModelSource(ctx context.Context, in *PrepareModelSourceRequest, opts ...grpc.CallOption) (*PrepareModelSourceResult, error)
 }
 
 type runtimePreparationClient struct {
@@ -302,6 +304,16 @@ func (c *runtimePreparationClient) PreparePackageSet(ctx context.Context, in *Pr
 	return out, nil
 }
 
+func (c *runtimePreparationClient) PrepareModelSource(ctx context.Context, in *PrepareModelSourceRequest, opts ...grpc.CallOption) (*PrepareModelSourceResult, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(PrepareModelSourceResult)
+	err := c.cc.Invoke(ctx, RuntimePreparation_PrepareModelSource_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 // RuntimePreparationServer is the server API for RuntimePreparation service.
 // All implementations must embed UnimplementedRuntimePreparationServer
 // for forward compatibility.
@@ -311,6 +323,7 @@ func (c *runtimePreparationClient) PreparePackageSet(ctx context.Context, in *Pr
 // no Tensorhub origin, presigned URL, delegation signature, or worker TLS credential.
 type RuntimePreparationServer interface {
 	PreparePackageSet(context.Context, *PreparePackageSetRequest) (*PreparePackageSetResult, error)
+	PrepareModelSource(context.Context, *PrepareModelSourceRequest) (*PrepareModelSourceResult, error)
 	mustEmbedUnimplementedRuntimePreparationServer()
 }
 
@@ -323,6 +336,9 @@ type UnimplementedRuntimePreparationServer struct{}
 
 func (UnimplementedRuntimePreparationServer) PreparePackageSet(context.Context, *PreparePackageSetRequest) (*PreparePackageSetResult, error) {
 	return nil, status.Error(codes.Unimplemented, "method PreparePackageSet not implemented")
+}
+func (UnimplementedRuntimePreparationServer) PrepareModelSource(context.Context, *PrepareModelSourceRequest) (*PrepareModelSourceResult, error) {
+	return nil, status.Error(codes.Unimplemented, "method PrepareModelSource not implemented")
 }
 func (UnimplementedRuntimePreparationServer) mustEmbedUnimplementedRuntimePreparationServer() {}
 func (UnimplementedRuntimePreparationServer) testEmbeddedByValue()                            {}
@@ -363,6 +379,24 @@ func _RuntimePreparation_PreparePackageSet_Handler(srv interface{}, ctx context.
 	return interceptor(ctx, in, info, handler)
 }
 
+func _RuntimePreparation_PrepareModelSource_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(PrepareModelSourceRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(RuntimePreparationServer).PrepareModelSource(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: RuntimePreparation_PrepareModelSource_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(RuntimePreparationServer).PrepareModelSource(ctx, req.(*PrepareModelSourceRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
 // RuntimePreparation_ServiceDesc is the grpc.ServiceDesc for RuntimePreparation service.
 // It's only intended for direct use with grpc.RegisterService,
 // and not to be introspected or modified (even as a copy)
@@ -373,6 +407,10 @@ var RuntimePreparation_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "PreparePackageSet",
 			Handler:    _RuntimePreparation_PreparePackageSet_Handler,
+		},
+		{
+			MethodName: "PrepareModelSource",
+			Handler:    _RuntimePreparation_PrepareModelSource_Handler,
 		},
 	},
 	Streams:  []grpc.StreamDesc{},

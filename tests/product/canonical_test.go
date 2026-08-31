@@ -336,7 +336,7 @@ func TestCompactPackageDescriptor(t *testing.T) {
 }
 
 func TestModelProductionDescriptor(t *testing.T) {
-	raw := []byte(`{"application":"producer:app","entrypoints":[],"format":"cozy.package.descriptor/1","jobs":[],"model_productions":[{"name":"two-lane","nodes":[{"assets":{"plan":"assets/quant.json"},"callable":"tensorhub/quantize/fp8","models":{"source":"assemble.model"},"name":"quantize","outputs":["model"],"resources":{"gpu_count":1,"placement":"single_node","requires":"sm90+,vram80g"}},{"assets":{},"callable":"tensorhub/h3/assemble","models":{"dits":"dits","shared":"shared"},"name":"assemble","outputs":["model"]}],"outputs":[{"lane_key":"bf16-full","name":"full","required_contract":{"encodings":["plain/1"],"stamps":{"family":"h3"},"structure":"h3/full","tasks":["fl2va","ref2va"]},"source":"assemble.model"},{"lane_key":"fp8-pruned","name":"fp8","required_contract":{"encodings":["fp8-rowwise/1","plain/1"],"stamps":{"family":"h3"},"structure":"h3/adaln-pruned","tasks":["fl2va","ref2va"]},"source":"quantize.model"}],"sources":{"dits":"hf/minimax-h3/native-dits-bf16","shared":"hf/minimax-h3/shared-diffusers"}}]}`)
+	raw := []byte(`{"application":"producer:app","entrypoints":[],"format":"cozy.package.descriptor/1","jobs":[],"model_productions":[{"name":"two-lane","nodes":[{"callable":"tensorhub/quantize/fp8","models":{"source":"assemble.model"},"name":"quantize","outputs":["model"],"resources":{"gpu_count":1,"placement":"single_node","requires":"sm90+,vram80g"}},{"callable":"tensorhub/h3/assemble","models":{"dits":"dits","shared":"shared"},"name":"assemble","outputs":["model"]}],"outputs":[{"lane_key":"bf16-full","name":"full","required_contract":{"encodings":["sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"],"topology_digest":"sha256:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"},"source":"assemble.model"},{"lane_key":"fp8-pruned","name":"fp8","required_contract":{"encodings":["sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc","sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"],"topology_digest":"sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"},"source":"quantize.model"}],"sources":{"dits":"hf/minimax-h3/native-dits-bf16","shared":"hf/minimax-h3/shared-diffusers"}}]}`)
 	descriptor, problem := launch.DecodeDescriptor(raw)
 	fatal(t, problem)
 	production, problem := descriptor.Production("two-lane")
@@ -345,7 +345,7 @@ func TestModelProductionDescriptor(t *testing.T) {
 	fatal(t, problem)
 	if len(ordered) != 2 || ordered[0].Name != "assemble" || ordered[1].Name != "quantize" ||
 		production.Sources["dits"] != "hf/minimax-h3/native-dits-bf16" ||
-		production.Outputs[1].RequiredContract.Encodings[0] != "fp8-rowwise/1" {
+		production.Outputs[1].RequiredContract.Encodings[0] != "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc" {
 		t.Fatalf("production graph changed: %+v", production)
 	}
 	for name, planted := range map[string][]byte{
@@ -358,7 +358,10 @@ func TestModelProductionDescriptor(t *testing.T) {
 			[]byte(`"source":"assemble.model"`), []byte(`"source":"missing.model"`), 1),
 		"duplicate lane": bytes.Replace(raw,
 			[]byte(`"lane_key":"fp8-pruned"`), []byte(`"lane_key":"bf16-full"`), 1),
-		"zero gpu": bytes.Replace(raw, []byte(`"gpu_count":1`), []byte(`"gpu_count":0`), 1),
+		"zero gpu":               bytes.Replace(raw, []byte(`"gpu_count":1`), []byte(`"gpu_count":0`), 1),
+		"retired task alias":     bytes.Replace(raw, []byte(`"topology_digest":"sha256:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"`), []byte(`"structure":"h3/full","tasks":["fl2va"]`), 1),
+		"package asset in graph": bytes.Replace(raw, []byte(`"callable":"tensorhub/quantize/fp8"`), []byte(`"assets":{"plan":"assets/quant.json"},"callable":"tensorhub/quantize/fp8"`), 1),
+		"encoding aliases":       bytes.Replace(raw, []byte(`"sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"`), []byte(`"plain/1"`), 1),
 	} {
 		t.Run(name, func(t *testing.T) {
 			if _, refusal := launch.DecodeDescriptor(planted); refusal == nil {

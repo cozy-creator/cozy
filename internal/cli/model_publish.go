@@ -5,6 +5,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"sort"
+	"strconv"
 	"strings"
 
 	"github.com/cozy-creator/cozy/internal/exit"
@@ -21,6 +22,7 @@ var modelReleasePattern = regexp.MustCompile(`^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\
 type publishSource struct {
 	Canonical string
 	Selection string
+	License   string
 	Lane      string
 	Files     int
 	Bytes     int64
@@ -29,6 +31,7 @@ type publishSource struct {
 
 type producerPlan struct {
 	Name          string
+	InstallID     string
 	Release       string
 	ReleaseDigest string
 	Descriptor    *launch.PackageDescriptor
@@ -37,6 +40,7 @@ type producerPlan struct {
 	Profile       string
 	GPUCount      int64
 	Requires      []string
+	Needs         modelproduction.ResourceNeeds
 }
 
 func handleModelPublish(ctx *Context) *exit.Error {
@@ -81,13 +85,16 @@ func handleModelPublish(ctx *Context) *exit.Error {
 	}
 	plan := modelproduction.Plan{
 		Destination: destination.String(), Release: release,
-		Source: source.Canonical, SourceSelection: source.Selection, InputLane: source.Lane,
+		Source: source.Canonical, SourceSelection: source.Selection,
+		SourceLicense: source.License, InputLane: source.Lane,
 		SourceFiles: source.Exact,
 	}
 	if producer != nil {
-		plan.Producer, plan.ProducerRelease = producer.Name, producer.Release
+		plan.Producer, plan.ProducerInstallID = producer.Name, producer.InstallID
+		plan.ProducerRelease = producer.Release
 		plan.ProducerDigest, plan.DescriptorDigest = producer.ReleaseDigest, producer.Descriptor.Digest
 		plan.Production, plan.Jobs = producer.Production, producer.Jobs
+		plan.WorkerProfile, plan.Resources = producer.Profile, producer.Needs
 	}
 	id := plan.ID()
 	if ctx.Inv.Bool("--dry-run") {
@@ -194,7 +201,8 @@ func resolvePublishSource(ctx *Context, raw string) (publishSource, *exit.Error)
 		}
 		return publishSource{Canonical: resolved.Canonical,
 			Selection: "sha256:" + resolved.SelectionSHA256,
-			Files:     len(resolved.Files), Bytes: resolved.Bytes, Exact: exact}, nil
+			License:   resolved.License, Files: len(resolved.Files), Bytes: resolved.Bytes,
+			Exact: exact}, nil
 	}
 	if !catalogModelSpelling(raw) {
 		return publishSource{}, parseProblem
@@ -257,8 +265,9 @@ func resolveProducerPlan(ctx *Context, raw string) (*producerPlan, *exit.Error) 
 	if problem != nil {
 		return nil, problem
 	}
-	plan := &producerPlan{Name: raw, Release: install.Version, ReleaseDigest: install.SourceDigest,
-		Descriptor: descriptor, Production: production}
+	plan := &producerPlan{Name: raw, InstallID: install.ID, Release: install.Version,
+		ReleaseDigest: install.SourceDigest,
+		Descriptor:    descriptor, Production: production}
 	requires := map[string]bool{}
 	for _, node := range ordered {
 		target, parseProblem := parseTarget(node.Callable)
@@ -311,16 +320,61 @@ func resolveProducerPlan(ctx *Context, raw string) (*producerPlan, *exit.Error) 
 				}
 			}
 		}
+		facts, factsProblem := launch.Read(*nodeInstall, ctx.Cfg.Home, ctx.Cfg.Tool())
+		if factsProblem != nil {
+			return nil, factsProblem
+		}
+		jobFacts, factsProblem := facts.Job(target.Function)
+		if factsProblem != nil {
+			return nil, factsProblem
+		}
 		plan.Jobs = append(plan.Jobs, modelproduction.JobPin{
 			Node: node.Name, Callable: node.Callable, Release: nodeInstall.Version,
-			ReleaseDigest: nodeInstall.SourceDigest, Profile: nodeInstall.SelectionProfile,
+			InstallID: nodeInstall.ID, ReleaseDigest: nodeInstall.SourceDigest,
+			DescriptorID: jobFacts.DescriptorID, Profile: nodeInstall.SelectionProfile,
 		})
 	}
 	for token := range requires {
 		plan.Requires = append(plan.Requires, token)
 	}
 	sort.Strings(plan.Requires)
+	plan.Needs, problem = productionResourceNeeds(plan.GPUCount, plan.Requires)
+	if problem != nil {
+		return nil, problem
+	}
 	return plan, nil
+}
+
+var productionResourcePattern = regexp.MustCompile(`^(sm|vram|ram)([1-9][0-9]*)(\+|g)?$`)
+
+func productionResourceNeeds(gpuCount int64, requires []string) (modelproduction.ResourceNeeds, *exit.Error) {
+	needs := modelproduction.ResourceNeeds{GPUCount: gpuCount}
+	for _, value := range requires {
+		match := productionResourcePattern.FindStringSubmatch(strings.ToLower(value))
+		if len(match) != 4 || match[1] == "sm" && match[3] != "+" ||
+			match[1] != "sm" && match[3] != "g" {
+			return needs, exit.Named(exit.Validation, "model_production_resource_unknown",
+				"production resource requirement %q is not smN+, vramNg, or ramNg", value)
+		}
+		amount, err := strconv.ParseInt(match[2], 10, 64)
+		if err != nil {
+			return needs, exit.Named(exit.Validation, "model_production_resource_invalid",
+				"production resource requirement %q is outside the supported range", value)
+		}
+		switch match[1] {
+		case "sm":
+			needs.MinSM = max(needs.MinSM, amount)
+		case "vram":
+			needs.VRAMGB = max(needs.VRAMGB, amount)
+		case "ram":
+			needs.RAMGB = max(needs.RAMGB, amount)
+		}
+	}
+	if needs.GPUCount != 1 || needs.MinSM == 0 || needs.VRAMGB == 0 || needs.RAMGB == 0 {
+		return needs, exit.Named(exit.Validation, "model_production_resources_incomplete",
+			"rented model production requires exactly one GPU plus explicit smN+, vramNg, and ramNg floors")
+	}
+	return needs, nil
 }
 
 func validateProductionInvocation(node launch.ModelProductionNode, job *launch.Entrypoint) *exit.Error {
@@ -332,19 +386,11 @@ func validateProductionInvocation(node launch.ModelProductionNode, job *launch.E
 		return exit.Named(exit.Validation, "model_production_model_inputs_mismatch",
 			"production node %s model inputs do not match job %s", node.Name, job.Name)
 	}
-	assets := map[string]bool{}
 	for _, field := range job.Request.Fields {
-		kind, _ := job.InputKind(field.Name)
-		if kind == "asset" {
-			assets[field.Name] = true
-		} else if field.Wire == "required" {
+		if field.Wire == "required" {
 			return exit.Named(exit.Validation, "model_production_argument_missing",
-				"production node %s job %s requires non-asset argument %s", node.Name, job.Name, field.Name)
+				"production node %s job %s requires argument %s", node.Name, job.Name, field.Name)
 		}
-	}
-	if !sameNames(assets, keys(node.Assets)) {
-		return exit.Named(exit.Validation, "model_production_assets_mismatch",
-			"production node %s static assets do not match job %s", node.Name, job.Name)
 	}
 	outputs := map[string]bool{}
 	for _, output := range job.ArtifactOutputs {

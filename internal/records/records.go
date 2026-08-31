@@ -106,7 +106,8 @@ CREATE TABLE IF NOT EXISTS pins (
   generation   TEXT    NOT NULL REFERENCES install_generations(id),
   activated_at TEXT    NOT NULL,
   PRIMARY KEY (package)
-)`, modelProductionsDDL}, append(orchestratorSchema, append(eventSchema, rentalSchema...)...)...)
+)`}, append(modelProductionSchema,
+	append(orchestratorSchema, append(eventSchema, rentalSchema...)...)...)...)
 
 // pragmas ride the DSN rather than being executed after the open, because a pragma is a
 // property of a CONNECTION and database/sql may discard and redial one at any moment: a
