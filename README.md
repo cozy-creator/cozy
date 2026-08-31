@@ -120,6 +120,48 @@ package repositories use it for their exact PackageRelease while datasets and us
 it. Rebuild always recovers the repository, metadata, Manifest, and complete reached blob set;
 model headers additionally recover the diagnostic projection emitted by `store rebuild --rows`.
 
+## Reviewed source planning and ingest
+
+Foreign carrier paths never name components. A review act may bank one whole-source profile beside
+the existing fingerprint entries; the profile supplies the exact required component set, target
+encodings, and canonical construction traversal. An optional canonical provider member/slot binds a
+component only when bytes cannot distinguish it, such as byte-identical H3 DiT headers:
+
+```text
+tfs ingest bank <dialect> <family> <variant> <converter> \
+  --source <component>=<review-carrier>... --registry <registry.json> \
+  --source-profile <name> --target <component>=<encoding>... \
+  [--member <component>=<canonical-provider-member>]... --order <order.json>
+
+tfs ingest source-plan --carrier [<reviewed-member>=]<path>... \
+  --registry <registry.json> --out <source-plan.json>
+tfs ingest plan --source-plan <source-plan.json>
+tfs ingest run <store> --source-plan <source-plan.json>
+```
+
+`source-plan.json` is a bounded operational DTO, not a stored document kind. Its exact canonical
+JSON fields are:
+
+```text
+carriers             [{path, member?}]
+construction_order   [[component, canonical-output-key], ...]
+converter            reviewed converter name
+profile              reviewed source-profile name
+registry_path        absolute registry location
+registry_sha256      digest of the exact reviewed registry bytes
+session              deterministic ingest session
+sources              [{component, path, projected, source_member?}]
+target               component=encoding,...
+```
+
+The plan/run consumers do not trust or reinterpret these asserted fields. They re-read the
+unlabelled carrier headers and exact registry, reproduce the unique source plan byte-for-byte, then
+feed its sources, target, order, and session through the existing `prepare`/isolated worker path.
+Editing a plan, changing carrier bytes or registry bytes, omitting an input, or supplying an
+unreviewed member refuses. Unique keysets need no member. Equal headers with no reviewed member
+admit multiple assignments and refuse; a provider adapter may supply a member only when its own
+pinned metadata binds that exact member to the downloaded path.
+
 `repo apply` validates the exact manifest, header, and complete blob inventory before the caller may
 perform its repository CAS, then records only `(org,name,manifest_sha256)` in SQLite. Missing or
 length-mismatched bytes refuse publication. Full repo/release/object rows remain diagnostic rebuild
