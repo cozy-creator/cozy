@@ -19,10 +19,10 @@ func TestModelProductionOperationSurvivesRestartAndReplaysExactly(t *testing.T) 
 			Member: "transformer/model-00001-of-00002.safetensors",
 			SHA256: strings.Repeat("c", 64), Length: 4096,
 		}},
-		Producer: "tensorhub/h3/four-lane", ProducerRelease: "1.0.0",
+		Producer: "tensorhub/minimax-h3-tools/four-lane", ProducerRelease: "1.0.0",
 		ProducerDigest:   "sha256:" + strings.Repeat("d", 64),
 		DescriptorDigest: "sha256:" + strings.Repeat("e", 64),
-		Jobs: []modelproduction.JobPin{{Node: "full", Callable: "tensorhub/h3/assemble",
+		Jobs: []modelproduction.JobPin{{Node: "full", Callable: "tensorhub/minimax-h3-tools/assemble",
 			Release: "1.0.0", ReleaseDigest: "sha256:" + strings.Repeat("f", 64),
 		}},
 	}
@@ -73,6 +73,12 @@ func TestModelProductionOperationSurvivesRestartAndReplaysExactly(t *testing.T) 
 	}
 	if problem := store.AdvanceModelProduction(plan.ID(), "node_running", "completed", 1, "rental-1"); problem == nil || problem.Name != "model_production.transition_invalid" {
 		t.Fatalf("skipped release/cleanup states = %v", problem)
+	}
+	fatal(t, store.CancelModelProduction(plan.ID(), "node_running", "user interrupted"))
+	canceled, problem := store.ModelProduction(plan.ID())
+	fatal(t, problem)
+	if canceled == nil || canceled.State != "canceled" || !canceled.CancelRequested {
+		t.Fatalf("canceled production = %+v", canceled)
 	}
 }
 

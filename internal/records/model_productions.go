@@ -246,6 +246,26 @@ func (s *Store) FailModelProduction(id, from, code, detail string) *exit.Error {
 		"model production %s could not fail from %s", id, from)
 }
 
+func (s *Store) CancelModelProduction(id, from, detail string) *exit.Error {
+	result, err := s.db.Exec(`UPDATE model_productions SET state='canceled',safe_code='canceled',
+		safe_detail=?,cancel_requested=1,updated_at=? WHERE id=? AND state=?`, detail, now(), id, from)
+	if err != nil {
+		return exit.Internalf("cannot cancel model production %s: %s", id, err)
+	}
+	if changed, _ := result.RowsAffected(); changed == 1 {
+		return nil
+	}
+	current, problem := s.ModelProduction(id)
+	if problem != nil {
+		return problem
+	}
+	if current != nil && current.State == "canceled" {
+		return nil
+	}
+	return exit.Named(exit.Conflict, "model_production.state_conflict",
+		"model production %s could not cancel from %s", id, from)
+}
+
 // AdvanceModelProduction is a compare-and-swap over the one coarse lifecycle.
 // Node detail remains in ordinary job attempts; node_index is only the restart cursor.
 func (s *Store) AdvanceModelProduction(id, from, to string, nodeIndex int64, rentalID string) *exit.Error {

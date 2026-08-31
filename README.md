@@ -152,14 +152,14 @@ cozy model publish org/model sha256:<manifest> --release 1.0.0 --lane <derived-l
 cozy model publish tensorhub/minimax-h3 \
   hf://MiniMaxAI/MiniMax-H3@<full-commit> \
   --release 1.0.0 \
-  --producer tensorhub/h3/four-lane \
+  --producer tensorhub/minimax-h3-tools/four-lane \
   --rental
 ```
 
-`--dry-run` resolves the immutable source, producer, job releases, worker profile, resources, and
-fixed lanes without moving model bodies or authorizing rental spend. Publication follows by default;
-`--detach` returns the same durable run id. Download and publication verify content identities before
-making a local or remote release visible.
+`--dry-run` resolves the immutable source, producer, job releases, resource floors, and fixed lanes
+without moving model bodies or authorizing rental spend. Publication follows by default and a repeat
+of the same command resumes the durable operation. Download and publication verify content identities
+before making a local or remote release visible.
 
 ## Run packages and jobs
 

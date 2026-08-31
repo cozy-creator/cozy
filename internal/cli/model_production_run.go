@@ -648,7 +648,11 @@ func failProduction(store *records.Store, operationID string, cause *exit.Error)
 	current, problem := store.ModelProduction(operationID)
 	if problem == nil && current != nil && current.State != "failed" && current.State != "canceled" &&
 		current.State != "completed" {
-		_ = store.FailModelProduction(operationID, current.State, cause.Name, cause.Message)
+		if cause.Code == exit.Canceled {
+			_ = store.CancelModelProduction(operationID, current.State, cause.Message)
+		} else {
+			_ = store.FailModelProduction(operationID, current.State, cause.Name, cause.Message)
+		}
 	}
 	return cause
 }
