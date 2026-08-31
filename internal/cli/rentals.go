@@ -213,11 +213,13 @@ func acquireRental(ctx *Context, l home.Layout, st *records.Store, skuName, requ
 	op, replay, e := st.BeginRentalOperation(records.RentalOperation{
 		Key: operationKey, RequestDigest: digest, RequestBody: requestBody,
 		Hub: c.Base(), Reason: reason, HourlyRateUSDMicros: hourlyRateUSDMicros,
+		ManagedRequestID: managedRequestID,
 	}, fleetCapUSDMicros)
 	if e != nil {
 		return records.Rental{}, hub.Rental{}, false, e
 	}
 	if op.RequestDigest != digest || op.Hub != c.Base() || op.HourlyRateUSDMicros != hourlyRateUSDMicros ||
+		op.ManagedRequestID != managedRequestID ||
 		!bytes.Equal(op.RequestBody, requestBody) {
 		return records.Rental{}, hub.Rental{}, false, exit.Named(exit.Conflict, "rental.idempotency_conflict",
 			"rental operation %s already names a different hub or request body", operationKey).

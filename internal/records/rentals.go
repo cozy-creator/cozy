@@ -27,6 +27,7 @@ CREATE TABLE IF NOT EXISTS rental_operations (
   hub              TEXT NOT NULL,
   reason           TEXT NOT NULL,
   hourly_rate_usd_micros INTEGER NOT NULL,
+  managed_request_id TEXT NOT NULL DEFAULT '',
   rental_id        TEXT NOT NULL DEFAULT '',
   state            TEXT NOT NULL,
   created_at       TEXT NOT NULL,
@@ -84,17 +85,19 @@ type RentalOperation struct {
 	Hub                 string
 	Reason              string
 	HourlyRateUSDMicros int64
+	ManagedRequestID    string
 	RentalID            string
 	State               string
 	CreatedAt           string
 	UpdatedAt           string
 }
 
-const rentalOperationCols = `operation_key,request_digest,request_body,hub,reason,hourly_rate_usd_micros,rental_id,state,created_at,updated_at`
+const rentalOperationCols = `operation_key,request_digest,request_body,hub,reason,hourly_rate_usd_micros,managed_request_id,rental_id,state,created_at,updated_at`
 
 func scanRentalOperation(row interface{ Scan(...any) error }) (RentalOperation, error) {
 	var op RentalOperation
-	err := row.Scan(&op.Key, &op.RequestDigest, &op.RequestBody, &op.Hub, &op.Reason, &op.HourlyRateUSDMicros,
+	err := row.Scan(&op.Key, &op.RequestDigest, &op.RequestBody, &op.Hub, &op.Reason,
+		&op.HourlyRateUSDMicros, &op.ManagedRequestID,
 		&op.RentalID, &op.State, &op.CreatedAt, &op.UpdatedAt)
 	return op, err
 }
@@ -133,8 +136,8 @@ func (s *Store) BeginRentalOperation(op RentalOperation, fleetCapUSDMicros int64
 			count, burn, op.HourlyRateUSDMicros, fleetCapUSDMicros)
 	}
 	if _, err := tx.Exec(`INSERT INTO rental_operations(`+rentalOperationCols+`)
-		VALUES(?,?,?,?,?,?,?,?,?,?)`, op.Key, op.RequestDigest, op.RequestBody, op.Hub, op.Reason,
-		op.HourlyRateUSDMicros, op.RentalID, "pending_acquisition", stamp, stamp); err != nil {
+		VALUES(?,?,?,?,?,?,?,?,?,?,?)`, op.Key, op.RequestDigest, op.RequestBody, op.Hub, op.Reason,
+		op.HourlyRateUSDMicros, op.ManagedRequestID, op.RentalID, "pending_acquisition", stamp, stamp); err != nil {
 		return RentalOperation{}, false, exit.Internalf("cannot record rental operation: %s", err)
 	}
 	stored, err = scanRentalOperation(tx.QueryRow(

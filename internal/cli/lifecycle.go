@@ -225,7 +225,8 @@ func resolveRentalOperation(ctx *Context, key string) (string, *exit.Error) {
 	}
 	if problem := store.RecordRental(records.Rental{
 		ID: seen.ID, SKU: request.SKU, AcceleratorModel: seen.AcceleratorModel,
-		HourlyRateUSDMicros: seen.HourlyRateUSDMicros, State: seen.State, Hub: operation.Hub,
+		HourlyRateUSDMicros: seen.HourlyRateUSDMicros, ManagedRequestID: operation.ManagedRequestID,
+		State: seen.State, Hub: operation.Hub,
 	}); problem != nil {
 		return "", problem
 	}
