@@ -51,22 +51,23 @@ type dependencyRecord struct {
 }
 
 type dependencyCollector struct {
-	ctx    context.Context
-	stage  string
-	wheels []DependencyWheel
-	byName map[string]dependencyRecord
-	extras map[string]map[string]bool
-	stack  map[string]bool
-	total  int64
-	count  int
+	ctx      context.Context
+	stage    string
+	wheels   []DependencyWheel
+	byName   map[string]dependencyRecord
+	extras   map[string]map[string]bool
+	stack    map[string]bool
+	total    int64
+	count    int
+	registry bool
 }
 
 var requirementName = regexp.MustCompile(`^[A-Za-z0-9](?:[A-Za-z0-9._-]*[A-Za-z0-9])?`)
 
-func collectLocalDependencies(ctx context.Context, root string, document projectMetadata, stage string) ([]DependencyWheel, *exit.Error) {
+func collectLocalDependencies(ctx context.Context, root string, document projectMetadata, stage string) ([]DependencyWheel, bool, *exit.Error) {
 	canonical, problem := canonicalLocalPath(root)
 	if problem != nil {
-		return nil, problem
+		return nil, false, problem
 	}
 	collector := &dependencyCollector{
 		ctx: ctx, stage: stage, byName: map[string]dependencyRecord{}, extras: map[string]map[string]bool{},
@@ -76,12 +77,12 @@ func collectLocalDependencies(ctx context.Context, root string, document project
 		collector.byName[name] = dependencyRecord{source: canonical, version: document.Project.Version}
 	}
 	if problem := collector.collectProject(canonical, document, nil, true); problem != nil {
-		return nil, problem
+		return nil, false, problem
 	}
 	sort.Slice(collector.wheels, func(i, j int) bool {
 		return collector.wheels[i].Filename < collector.wheels[j].Filename
 	})
-	return collector.wheels, nil
+	return collector.wheels, collector.registry, nil
 }
 
 func (c *dependencyCollector) collectProject(root string, document projectMetadata, extras []string, includeBase bool) *exit.Error {
@@ -110,8 +111,12 @@ func (c *dependencyCollector) collectProject(root string, document projectMetada
 				"project dependency %q uses a direct URL", raw).
 				WithRemedy("publish the distribution to an index or use a local path/workspace source")
 		}
+		if platformOwnedRoots[req.name] {
+			continue
+		}
 		source, exists := sources[req.name]
 		if !exists {
+			c.registry = true
 			continue
 		}
 		if source.unsupported != "" {
