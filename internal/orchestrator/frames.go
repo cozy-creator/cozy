@@ -7,6 +7,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"time"
 
@@ -69,10 +70,11 @@ func (c *Orchestrator) ConvergePlacementSet(instanceID string, placements []Desi
 	return c.converge(s, w, placements)
 }
 
-// ConvergePackageSet sends Creator's signed logical package/model authority to
-// a private pod. These bytes never pass through PlacementSet or local platform
-// resolution; pod-supervisor verifies the signature and resolves downloads.
-func (c *Orchestrator) ConvergePackageSet(instanceID string, delegation, signature []byte) *exit.Error {
+// ConvergePackageSet sends Creator's signed logical package/model authority to a
+// private pod. The refs never pass through PlacementSet or local platform resolution;
+// pod-supervisor verifies the signature and resolves downloads.
+func (c *Orchestrator) ConvergePackageSet(instanceID string, packages []*pb.DownloadPackageRef,
+	models []*pb.DownloadModelRef) *exit.Error {
 	c.mu.Lock()
 	w := c.workers[instanceID]
 	var s *session
@@ -86,10 +88,19 @@ func (c *Orchestrator) ConvergePackageSet(instanceID string, delegation, signatu
 	if s == nil {
 		return exit.Unavailablef("worker %s holds no claimed control stream", instanceID)
 	}
-	return c.convergePackageSet(s, w, delegation, signature)
+	return c.issuePackageSet(s, w, packages, models)
 }
 
-func (c *Orchestrator) convergePackageSet(s *session, w *worker, delegation, signature []byte) *exit.Error {
+func (c *Orchestrator) issuePackageSet(s *session, w *worker, packages []*pb.DownloadPackageRef,
+	models []*pb.DownloadModelRef) *exit.Error {
+	if c.opt.RentalPackageSet == nil {
+		return exit.Named(exit.Unavailable, "rental.package_set_signer_missing",
+			"this Cozy daemon has no package_set signer")
+	}
+	delegation, signature, problem := c.opt.RentalPackageSet(w.spec.Connection, packages, models)
+	if problem != nil {
+		return problem
+	}
 	if len(delegation) == 0 || len(signature) != 64 {
 		return exit.Named(exit.Validation, "rental.delegation_incomplete",
 			"package_set requires canonical delegation bytes and one Ed25519 signature")
@@ -101,6 +112,8 @@ func (c *Orchestrator) convergePackageSet(s *session, w *worker, delegation, sig
 	revision := c.nextRevision()
 	c.mu.Lock()
 	w.revision, w.desiredRefusal = revision, nil
+	w.desiredPackages = clonePackageRefs(packages)
+	w.desiredModels = cloneModelRefs(models)
 	c.mu.Unlock()
 	d := &pb.DesiredWorkerState{
 		RecordOwnerEpoch: recordOwnerEpoch, ControlStreamGeneration: s.generation,
@@ -117,6 +130,31 @@ func (c *Orchestrator) convergePackageSet(s *session, w *worker, delegation, sig
 	c.logf("DesiredWorkerState revision=%d package_set delegation=%d B -> %s",
 		revision, len(delegation), s.bootID)
 	return nil
+}
+
+func clonePackageRefs(in []*pb.DownloadPackageRef) []*pb.DownloadPackageRef {
+	out := make([]*pb.DownloadPackageRef, 0, len(in))
+	for _, ref := range in {
+		if ref != nil {
+			out = append(out, &pb.DownloadPackageRef{
+				Package: ref.Package, Release: ref.Release, ReleaseDigest: ref.ReleaseDigest,
+			})
+		}
+	}
+	return out
+}
+
+func cloneModelRefs(in []*pb.DownloadModelRef) []*pb.DownloadModelRef {
+	out := make([]*pb.DownloadModelRef, 0, len(in))
+	for _, ref := range in {
+		if ref != nil {
+			out = append(out, &pb.DownloadModelRef{
+				Manifest: ref.Manifest, Model: ref.Model, Release: ref.Release,
+				Package: ref.Package, Slot: ref.Slot,
+			})
+		}
+	}
+	return out
 }
 
 func (c *Orchestrator) converge(s *session, w *worker, placements []DesiredPlacement) *exit.Error {
@@ -216,13 +254,28 @@ func (c *Orchestrator) onObserved(s *session, r *pb.ObservedWorkerState) {
 				w.admission = pb.AdmissionState_ADMISSION_STATE_OPEN
 			}
 		} else {
-			for _, p := range r.Placements {
-				if p.PlacementId == w.placementID {
-					status = p
+			if w.spec.Connection != nil && w.spec.Placement.PlacementSetDigest == "" &&
+				len(r.Placements) == 1 {
+				status = r.Placements[0]
+				w.placementID = status.PlacementId
+			} else {
+				for _, p := range r.Placements {
+					if p.PlacementId == w.placementID {
+						status = p
+					}
 				}
 			}
 			if status != nil {
 				w.materialization, w.serving = status.Materialization, status.Serving
+				w.packageRevisionDigest = status.PackageRevisionDigest
+				w.environmentDigest = status.EnvironmentDigest
+				w.configDigest = status.ConfigDigest
+				if w.spec.Connection != nil && w.spec.Placement.PlacementSetDigest == "" &&
+					w.spec.Placement.Package != "" {
+					w.spec.Placement.PackageRevisionDigest = status.PackageRevisionDigest
+					w.spec.Placement.EnvironmentDigest = status.EnvironmentDigest
+					w.spec.Placement.ConfigDigest = status.ConfigDigest
+				}
 				w.generation = status.ExecutorGeneration
 				w.heldSetDigest = status.PlacementSetDigest
 				w.fallbackSetDigest = status.RetainedFallbackPlacementSetDigest
@@ -233,6 +286,15 @@ func (c *Orchestrator) onObserved(s *session, r *pb.ObservedWorkerState) {
 				for _, digest := range status.MaterializableBindingDigests {
 					materializable[spellOf(digest)] = true
 				}
+				if w.spec.Connection != nil && w.spec.Placement.PlacementSetDigest == "" {
+					w.planIDs = keysOf(dispatchable)
+					for planID := range materializable {
+						if !dispatchable[planID] {
+							w.planIDs = append(w.planIDs, planID)
+						}
+					}
+					sort.Strings(w.planIDs)
+				}
 				for _, f := range status.Faults {
 					w.fault = fmt.Sprintf("%s: %s", f.Reason, brief(f.Detail, 240))
 				}
@@ -242,6 +304,7 @@ func (c *Orchestrator) onObserved(s *session, r *pb.ObservedWorkerState) {
 				// dispatchable, which is exactly true.
 				w.materialization = pb.MaterializationState_MATERIALIZATION_STATE_UNSPECIFIED
 				w.serving = pb.ServingState_SERVING_STATE_UNSPECIFIED
+				w.packageRevisionDigest, w.environmentDigest, w.configDigest = "", "", ""
 			}
 		}
 		w.dispatchable, w.materializable = dispatchable, materializable

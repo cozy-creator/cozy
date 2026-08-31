@@ -219,7 +219,6 @@ func submissionDigest(spec orchestrator.Submission) (string, *exit.Error) {
 		"kind":       "serve",
 		"package":    spec.Package,
 		"function":   spec.Entrypoint,
-		"plan_id":    spec.PlanID,
 		"install_id": spec.InstallID,
 		"input":      base64.StdEncoding.EncodeToString(spec.Payload),
 		"outputs":    strings.Join(spec.Outputs, ","),
@@ -315,9 +314,29 @@ func (s *Server) resolvePlan(sub Submission) (orchestrator.Submission, *exit.Err
 		if e != nil {
 			return out, e
 		}
-		return out, exit.Named(exit.Unavailable, "rental.download_delegation_unavailable",
-			"rental %s is attachable, but direct package/model download delegation is not installed", out.Worker).
-			WithRemedy("keep the rental; proto-013 must land before non-empty desired state can run")
+		if s.packages == nil || sub.InstallID == "" {
+			return out, exit.Unavailablef("remote execution requires one exact local package release pin")
+		}
+		logical, e := s.packages.ResolveLogicalInstall(sub.InstallID, sub.Function)
+		if e != nil {
+			return out, e
+		}
+		if logical.Package != sub.Package {
+			return out, exit.Named(exit.Conflict, "install_package_mismatch",
+				"install %s serves %s, not %s", sub.InstallID, logical.Package, sub.Package)
+		}
+		entrypoint, e := s.packages.RemoteEntrypoint(sub.InstallID, sub.Function)
+		if e != nil {
+			return out, e
+		}
+		out.InstallID = sub.InstallID
+		if len(out.Outputs) == 0 {
+			out.Outputs = logical.Outputs
+		}
+		if e := validateInputs(entrypoint, &out); e != nil {
+			return out, e
+		}
+		return out, nil
 	}
 	var placement orchestrator.DesiredPlacement
 	if s.packages == nil {

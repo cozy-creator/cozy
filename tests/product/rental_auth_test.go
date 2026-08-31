@@ -75,11 +75,11 @@ func TestRentalCreatorIdentityAndClaim(t *testing.T) {
 	if !bytes.Equal(fixedClaim, wantClaim) {
 		t.Fatalf("ClaimProof differs from worker-protocol vector:\n got %s\nwant %s", fixedClaim, wantClaim)
 	}
-	delegation, signature, problem := rental.SignDownloadDelegation(layout, connection,
-		[]*pb.DownloadPackageRef{{Package: "cozy/marco-polo", Release: "1.0.0"}},
-		[]*pb.DownloadModelRef{{Model: "cozy/h3", Release: "h3-r1",
-			Manifest: "sha256:ca44423f450cd01ab33110c59560369ba918b7eb56c3d733f4c4e964c3b499e2"}},
-		time.Now().Add(30*time.Minute))
+	packages := []*pb.DownloadPackageRef{{Package: "cozy/marco-polo", Release: "1.0.0",
+		ReleaseDigest: "sha256:bc346950b7223be1aa3ec66c239c25538d374906df532c27a039e149bb2e632a"}}
+	expires := time.Now().Add(30 * time.Minute)
+	delegation, signature, problem := rental.SignDownloadDelegation(layout, connection, packages,
+		nil, expires)
 	fatal(t, problem)
 	if len(signature) != ed25519.SignatureSize || !ed25519.Verify(public, delegation, signature) {
 		t.Fatal("download delegation was not signed by the rental Creator key")
@@ -88,8 +88,14 @@ func TestRentalCreatorIdentityAndClaim(t *testing.T) {
 	must(t, err)
 	if doc.Str("rental_id") != connection.RentalID || doc.Str("worker_id") != connection.WorkerID ||
 		doc.Str("worker_boot_id") != connection.WorkerBootID || len(doc.List("packages")) != 1 ||
-		len(doc.List("models")) != 1 {
+		len(doc.List("models")) != 0 {
 		t.Fatalf("download delegation lost logical or worker identity: %s", delegation)
+	}
+	replayed, replaySignature, problem := rental.SignDownloadDelegation(layout, connection,
+		packages, nil, expires)
+	fatal(t, problem)
+	if !bytes.Equal(replayed, delegation) || !bytes.Equal(replaySignature, signature) {
+		t.Fatal("exact logical package-set replay changed delegation bytes or signature")
 	}
 	empty, emptySignature, problem := rental.SignDownloadDelegation(layout, connection,
 		nil, nil, time.Now().Add(30*time.Minute))

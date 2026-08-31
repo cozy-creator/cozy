@@ -62,9 +62,11 @@ Any non-empty value refuses as `501 override_unresolved`; it is never silently i
 this Cozy daemon does not hold is `404` before a request row exists. The pin is not in
 the idempotency digest because it selects where the same work runs, not what the work is.
 A new rental is generic empty capacity and becomes attachable when Tensorhub publishes its
-pinned worker location. Non-empty remote work currently refuses as
-`rental.download_delegation_unavailable` until the signed `package_set` protocol is installed;
-Creator never substitutes a locally reconstructed platform qualification.
+pinned worker location. One exact weightless package release may then be queued as a signed logical
+`package_set`. The worker's existing observed-state stream supplies the derived placement and sole
+dispatchable binding digest plus exact release/environment/config identities. Tensorhub's immutable
+release detail supplies the verified request/result descriptor; Creator never substitutes a locally
+reconstructed platform qualification or PlacementSet. Model-bound packages remain deferred.
 
 `max_cost_usd_micros` is the exact non-negative automatic-rental authorization behind CLI
 `--max-cost <decimal USD>`. Zero or absence forbids paid acquisition. It is mutually exclusive

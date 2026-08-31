@@ -50,94 +50,9 @@ CREATE TABLE IF NOT EXISTS rentals (
 
 var rentalSchema = []string{rentalOperationsDDL, rentalsDDL, `
 CREATE UNIQUE INDEX IF NOT EXISTS rental_operation_remote
-  ON rental_operations(rental_id) WHERE rental_id <> ''`}
-
-// migrateRentalSchema moves older local roots forward without tying their data to the
-// executable that last wrote it. Paid-rental safety comes from preserving lifecycle rows,
-// not from comparing sqlite_master's formatting with a Go string.
-func migrateRentalSchema(tx *sql.Tx, path string) *exit.Error {
-	columns, err := tableColumns(tx, "rentals")
-	if err != nil {
-		return exit.Internalf("cannot inspect the rentals schema in %s: %s", path, err)
-	}
-	for _, column := range []struct {
-		name string
-		ddl  string
-	}{
-		{"expected_worker_id", `TEXT NOT NULL DEFAULT ''`},
-		{"expected_worker_boot_id", `TEXT NOT NULL DEFAULT ''`},
-		{"machine_name", `TEXT NOT NULL DEFAULT ''`},
-		{"sku", `TEXT NOT NULL DEFAULT ''`},
-	} {
-		if columns[column.name] {
-			continue
-		}
-		if _, err := tx.Exec(`ALTER TABLE rentals ADD COLUMN ` + column.name + ` ` + column.ddl); err != nil {
-			return exit.Internalf("cannot add rentals.%s in %s: %s", column.name, path, err)
-		}
-		columns[column.name] = true
-	}
-	kept := []string{"id", "machine_name", "sku", "accelerator_model", "address", "cert_path",
-		"state", "hub", "rented_at", "media_address", "expected_worker_id", "expected_worker_boot_id"}
-	if len(columns) != len(kept) {
-		if _, err := tx.Exec(`DROP TABLE IF EXISTS rental_relay_refusals`); err != nil {
-			return exit.Internalf("cannot drop retired rental relay state in %s: %s", path, err)
-		}
-		if _, err := tx.Exec(`DROP TABLE IF EXISTS rental_control_refusals`); err != nil {
-			return exit.Internalf("cannot drop retired rental control state in %s: %s", path, err)
-		}
-		if _, err := tx.Exec(strings.Replace(rentalsDDL, "rentals (", "rentals_next (", 1)); err != nil {
-			return exit.Internalf("cannot create slim rentals table in %s: %s", path, err)
-		}
-		list := strings.Join(kept, ",")
-		if _, err := tx.Exec(`INSERT INTO rentals_next(` + list + `) SELECT ` + list + ` FROM rentals`); err != nil {
-			return exit.Internalf("cannot preserve rentals while slimming %s: %s", path, err)
-		}
-		if _, err := tx.Exec(`DROP TABLE rentals`); err != nil {
-			return exit.Internalf("cannot replace old rentals table in %s: %s", path, err)
-		}
-		if _, err := tx.Exec(`ALTER TABLE rentals_next RENAME TO rentals`); err != nil {
-			return exit.Internalf("cannot publish slim rentals table in %s: %s", path, err)
-		}
-	}
-	if _, err := tx.Exec(`DROP TABLE IF EXISTS rental_relay_refusals`); err != nil {
-		return exit.Internalf("cannot remove retired rental relay state in %s: %s", path, err)
-	}
-	if _, err := tx.Exec(`DROP TABLE IF EXISTS rental_control_refusals`); err != nil {
-		return exit.Internalf("cannot remove retired rental control state in %s: %s", path, err)
-	}
-	rows, err := tx.Query(`SELECT id,machine_name FROM rentals`)
-	if err != nil {
-		return exit.Internalf("cannot read rental machine names in %s: %s", path, err)
-	}
-	type rentalName struct{ id, name string }
-	var names []rentalName
-	for rows.Next() {
-		var row rentalName
-		if err := rows.Scan(&row.id, &row.name); err != nil {
-			rows.Close()
-			return exit.Internalf("cannot read a rental machine name in %s: %s", path, err)
-		}
-		names = append(names, row)
-	}
-	if err := rows.Close(); err != nil {
-		return exit.Internalf("cannot finish reading rental machine names in %s: %s", path, err)
-	}
-	for _, row := range names {
-		if row.name != "" {
-			continue
-		}
-		if _, err := tx.Exec(`UPDATE rentals SET machine_name=? WHERE id=?`,
-			rentalid.MachineName(row.id), row.id); err != nil {
-			return exit.Internalf("cannot name rental %s in %s: %s", row.id, path, err)
-		}
-	}
-	if _, err := tx.Exec(`CREATE UNIQUE INDEX IF NOT EXISTS rentals_machine_name
-		ON rentals(machine_name) WHERE machine_name<>''`); err != nil {
-		return exit.Internalf("cannot index rental machine names in %s: %s", path, err)
-	}
-	return nil
-}
+  ON rental_operations(rental_id) WHERE rental_id <> ''`, `
+CREATE UNIQUE INDEX IF NOT EXISTS rentals_machine_name
+  ON rentals(machine_name) WHERE machine_name<>''`}
 
 // rentalStateRank orders the hub's lifecycle words so a delayed observation never moves a
 // row backward. Unknown words are opaque: they neither advance nor regress anything.

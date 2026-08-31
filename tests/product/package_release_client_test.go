@@ -100,6 +100,30 @@ func TestPackageReleaseYankClientContract(t *testing.T) {
 	}
 }
 
+func TestPackageReleaseDetailCarriesExactDescriptor(t *testing.T) {
+	const descriptor = `{"format":"cozy.package.descriptor/1"}`
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet || r.URL.Path != "/v1/packages/proof/package/releases/1.2.3" {
+			http.NotFound(w, r)
+			return
+		}
+		_, _ = io.WriteString(w, `{"release":{"release":"1.2.3","release_digest":"sha256:`+
+			strings.Repeat("a", 64)+`","package_descriptor_digest":"sha256:`+
+			strings.Repeat("b", 64)+`","package_descriptor_length":`+
+			strconv.Itoa(len(descriptor))+`,"created_at":"2026-08-30T00:00:00Z","committed_at":"2026-08-30T00:00:01Z"},`+
+			`"document":{},"package_descriptor":`+descriptor+`}`)
+	}))
+	defer server.Close()
+	client := hub.New(config.Config{HubURL: server.URL}, "cozy-test")
+	detail, problem := client.PackageRelease(context.Background(),
+		hub.Ref{Org: "proof", Name: "package"}, "1.2.3")
+	if problem != nil || detail.Release.Release != "1.2.3" ||
+		detail.Release.PackageDescriptorLength != int64(len(descriptor)) ||
+		string(detail.PackageDescriptor) != descriptor {
+		t.Fatalf("package release detail changed: %+v problem=%v", detail, problem)
+	}
+}
+
 func TestPackageReleaseClientRejectsUnknownResponseFields(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		_, _ = io.WriteString(w, `{"state":"committed","uploads":[],"renamed_field":true}`)

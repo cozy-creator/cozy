@@ -4,6 +4,7 @@ package hub
 
 import (
 	"context"
+	"encoding/json"
 	"net/http"
 	"net/url"
 
@@ -35,6 +36,21 @@ type PackageReleaseYank struct {
 	Release  string `json:"release"`
 	State    string `json:"state"`
 	YankedAt string `json:"yanked_at"`
+}
+
+type PackageReleaseDetail struct {
+	Release struct {
+		Release                 string `json:"release"`
+		ReleaseDigest           string `json:"release_digest"`
+		PackageDescriptorDigest string `json:"package_descriptor_digest"`
+		PackageDescriptorLength int64  `json:"package_descriptor_length"`
+		CreatedAt               string `json:"created_at"`
+		CommittedAt             string `json:"committed_at,omitempty"`
+		Yanked                  bool   `json:"yanked,omitempty"`
+		YankedAt                string `json:"yanked_at,omitempty"`
+	} `json:"release"`
+	Document          json.RawMessage `json:"document"`
+	PackageDescriptor json.RawMessage `json:"package_descriptor"`
 }
 
 type PackageInstallDownload struct {
@@ -96,6 +112,14 @@ func (c *Client) YankPackageRelease(ctx context.Context, ref Ref, release, reaso
 	e := c.do(ctx, call{method: http.MethodDelete,
 		path: packageReleasePath(ref, release), auth: true, reason: reason,
 		body: map[string]any{}, strict: true}, &out)
+	return out, e
+}
+
+func (c *Client) PackageRelease(ctx context.Context, ref Ref,
+	release string) (PackageReleaseDetail, *exit.Error) {
+	var out PackageReleaseDetail
+	e := c.do(ctx, call{method: http.MethodGet, path: packageReleasePath(ref, release),
+		strict: true, responseBytes: 16 << 20}, &out)
 	return out, e
 }
 

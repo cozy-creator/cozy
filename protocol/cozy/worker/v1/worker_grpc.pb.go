@@ -267,3 +267,113 @@ var WorkerControl_ServiceDesc = grpc.ServiceDesc{
 	},
 	Metadata: "cozy/worker/v1/worker.proto",
 }
+
+const (
+	RuntimePreparation_PreparePackageSet_FullMethodName = "/cozy.worker.v1.RuntimePreparation/PreparePackageSet"
+)
+
+// RuntimePreparationClient is the client API for RuntimePreparation service.
+//
+// For semantics around ctx use and closing/ending streaming RPCs, please refer to https://pkg.go.dev/google.golang.org/grpc/?tab=doc#ClientConn.NewStream.
+//
+// Loopback-only pod-supervisor -> Runtime preparation seam. Pod-supervisor never registers this
+// service on its external listener. Runtime receives verified local files and logical refs only:
+// no Tensorhub origin, presigned URL, delegation signature, or worker TLS credential.
+type RuntimePreparationClient interface {
+	PreparePackageSet(ctx context.Context, in *PreparePackageSetRequest, opts ...grpc.CallOption) (*PreparePackageSetResult, error)
+}
+
+type runtimePreparationClient struct {
+	cc grpc.ClientConnInterface
+}
+
+func NewRuntimePreparationClient(cc grpc.ClientConnInterface) RuntimePreparationClient {
+	return &runtimePreparationClient{cc}
+}
+
+func (c *runtimePreparationClient) PreparePackageSet(ctx context.Context, in *PreparePackageSetRequest, opts ...grpc.CallOption) (*PreparePackageSetResult, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(PreparePackageSetResult)
+	err := c.cc.Invoke(ctx, RuntimePreparation_PreparePackageSet_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+// RuntimePreparationServer is the server API for RuntimePreparation service.
+// All implementations must embed UnimplementedRuntimePreparationServer
+// for forward compatibility.
+//
+// Loopback-only pod-supervisor -> Runtime preparation seam. Pod-supervisor never registers this
+// service on its external listener. Runtime receives verified local files and logical refs only:
+// no Tensorhub origin, presigned URL, delegation signature, or worker TLS credential.
+type RuntimePreparationServer interface {
+	PreparePackageSet(context.Context, *PreparePackageSetRequest) (*PreparePackageSetResult, error)
+	mustEmbedUnimplementedRuntimePreparationServer()
+}
+
+// UnimplementedRuntimePreparationServer must be embedded to have
+// forward compatible implementations.
+//
+// NOTE: this should be embedded by value instead of pointer to avoid a nil
+// pointer dereference when methods are called.
+type UnimplementedRuntimePreparationServer struct{}
+
+func (UnimplementedRuntimePreparationServer) PreparePackageSet(context.Context, *PreparePackageSetRequest) (*PreparePackageSetResult, error) {
+	return nil, status.Error(codes.Unimplemented, "method PreparePackageSet not implemented")
+}
+func (UnimplementedRuntimePreparationServer) mustEmbedUnimplementedRuntimePreparationServer() {}
+func (UnimplementedRuntimePreparationServer) testEmbeddedByValue()                            {}
+
+// UnsafeRuntimePreparationServer may be embedded to opt out of forward compatibility for this service.
+// Use of this interface is not recommended, as added methods to RuntimePreparationServer will
+// result in compilation errors.
+type UnsafeRuntimePreparationServer interface {
+	mustEmbedUnimplementedRuntimePreparationServer()
+}
+
+func RegisterRuntimePreparationServer(s grpc.ServiceRegistrar, srv RuntimePreparationServer) {
+	// If the following call panics, it indicates UnimplementedRuntimePreparationServer was
+	// embedded by pointer and is nil.  This will cause panics if an
+	// unimplemented method is ever invoked, so we test this at initialization
+	// time to prevent it from happening at runtime later due to I/O.
+	if t, ok := srv.(interface{ testEmbeddedByValue() }); ok {
+		t.testEmbeddedByValue()
+	}
+	s.RegisterService(&RuntimePreparation_ServiceDesc, srv)
+}
+
+func _RuntimePreparation_PreparePackageSet_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(PreparePackageSetRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(RuntimePreparationServer).PreparePackageSet(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: RuntimePreparation_PreparePackageSet_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(RuntimePreparationServer).PreparePackageSet(ctx, req.(*PreparePackageSetRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+// RuntimePreparation_ServiceDesc is the grpc.ServiceDesc for RuntimePreparation service.
+// It's only intended for direct use with grpc.RegisterService,
+// and not to be introspected or modified (even as a copy)
+var RuntimePreparation_ServiceDesc = grpc.ServiceDesc{
+	ServiceName: "cozy.worker.v1.RuntimePreparation",
+	HandlerType: (*RuntimePreparationServer)(nil),
+	Methods: []grpc.MethodDesc{
+		{
+			MethodName: "PreparePackageSet",
+			Handler:    _RuntimePreparation_PreparePackageSet_Handler,
+		},
+	},
+	Streams:  []grpc.StreamDesc{},
+	Metadata: "cozy/worker/v1/worker.proto",
+}

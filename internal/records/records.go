@@ -19,6 +19,7 @@ import (
 	"database/sql"
 	"errors"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/cozy-creator/cozy/internal/exit"
@@ -68,9 +69,9 @@ type Pin struct {
 
 type Store struct{ db *sql.DB }
 
-const schemaVersion = 2
+const schemaVersion = 1
 
-// schema is applied only by the unversioned -> v1 migration.
+// schema is the only records shape this pre-launch build accepts.
 var schema = append([]string{`
 CREATE TABLE IF NOT EXISTS install_generations (
   id            TEXT PRIMARY KEY,
@@ -107,18 +108,6 @@ CREATE TABLE IF NOT EXISTS pins (
   PRIMARY KEY (package)
 )`}, append(orchestratorSchema, append(eventSchema, rentalSchema...)...)...)
 
-// renames is the pre-launch domain hardcut expressed as a database migration instead of
-// a demand that users retain the executable that wrote an older local root. SQLite keeps
-// row values, constraints, indexes and foreign-key references intact when it renames a
-// column. Every identifier here is a source constant, never caller input.
-var renames = []struct{ table, from, to string }{
-	{"install_generations", "descriptor", "package_descriptor"},
-	{"worker_processes", "release_id", "package_revision_digest"},
-	{"worker_processes", "package_release_id", "package_revision_digest"},
-	{"attempts", "exec_spec_digest", "invocation_digest"},
-	{"attempts", "exec_spec", "invocation"},
-}
-
 // pragmas ride the DSN rather than being executed after the open, because a pragma is a
 // property of a CONNECTION and database/sql may discard and redial one at any moment: a
 // re-dialled connection with foreign_keys OFF would silently accept the delete Forget
@@ -149,23 +138,23 @@ func Open(path string) (*Store, *exit.Error) {
 		db.Close()
 		return nil, exit.Internalf("cannot read the records schema version in %s: %s", path, err)
 	}
-	if version > schemaVersion {
-		db.Close()
-		return nil, exit.Named(exit.Conflict, "records.schema_newer",
-			"records database %s has schema %d; this build supports %d", path, version, schemaVersion).
-			WithRemedy("use the Cozy version that wrote this database")
-	}
-	if version < schemaVersion {
-		// WAL is persistent database state, so enable it only after a future version has
-		// been refused without mutation and before the migration takes its writer lock.
-		if _, err := db.Exec(`PRAGMA journal_mode=WAL`); err != nil {
-			db.Close()
-			return nil, exit.Internalf("cannot enable WAL for %s: %s", path, err)
-		}
-		if e := migrate(db, path); e != nil {
+	if version == 0 {
+		if e := initialize(db, path); e != nil {
 			db.Close()
 			return nil, e
 		}
+	} else if version != schemaVersion {
+		db.Close()
+		return nil, schemaReset(path,
+			"records database has user_version %d, not exact version %d", version, schemaVersion)
+	}
+	if e := verifySchema(db, path); e != nil {
+		db.Close()
+		return nil, e
+	}
+	if _, err := db.Exec(`PRAGMA journal_mode=WAL`); err != nil {
+		db.Close()
+		return nil, exit.Internalf("cannot enable WAL for %s: %s", path, err)
 	}
 	return &Store{db: db}, nil
 }
@@ -176,185 +165,112 @@ func databaseVersion(db interface{ QueryRow(string, ...any) *sql.Row }) (int, er
 	return version, err
 }
 
-func migrate(db *sql.DB, path string) *exit.Error {
-	// _txlock=immediate makes database/sql's Begin the required BEGIN IMMEDIATE.
+func initialize(db *sql.DB, path string) *exit.Error {
 	tx, err := db.Begin()
 	if err != nil {
-		return exit.Internalf("cannot begin the records migration in %s: %s", path, err)
+		return exit.Internalf("cannot begin records initialization in %s: %s", path, err)
 	}
 	defer tx.Rollback()
 	version, err := databaseVersion(tx)
 	if err != nil {
-		return exit.Internalf("cannot re-read the records schema version in %s: %s", path, err)
+		return exit.Internalf("cannot re-read records version in %s: %s", path, err)
 	}
 	if version == schemaVersion {
 		if err := tx.Commit(); err != nil {
-			return exit.Internalf("cannot finish concurrent migration adoption in %s: %s", path, err)
+			return exit.Internalf("cannot adopt concurrent records initialization in %s: %s", path, err)
 		}
 		return nil
 	}
-	if version < 0 || version > schemaVersion {
-		return exit.Named(exit.Conflict, "records.schema_newer",
-			"records database %s changed to schema %d while opening", path, version)
+	if version != 0 {
+		return schemaReset(path, "records database changed to user_version %d while opening", version)
 	}
-	if version == 0 {
-		for _, stmt := range schema {
-			if _, err := tx.Exec(stmt); err != nil {
-				return exit.Internalf("cannot apply the records schema to %s: %s", path, err)
-			}
-		}
-		if e := migrateColumnRenames(tx, path); e != nil {
-			return e
-		}
-		if e := migrateRentalSchema(tx, path); e != nil {
-			return e
-		}
-		widened := map[string]map[string]bool{}
-		for _, column := range widen {
-			columns := widened[column.table]
-			if columns == nil {
-				columns, err = tableColumns(tx, column.table)
-				if err != nil {
-					return exit.Internalf("cannot inspect %s in %s: %s", column.table, path, err)
-				}
-				widened[column.table] = columns
-			}
-			if columns[column.column] {
-				continue
-			}
-			if _, err := tx.Exec(`ALTER TABLE ` + column.table + ` ADD COLUMN ` +
-				column.column + ` ` + column.ddl); err != nil {
-				return exit.Internalf("cannot add %s.%s in %s: %s",
-					column.table, column.column, path, err)
-			}
-			columns[column.column] = true
-		}
-		for _, stmt := range normalize {
-			if _, err := tx.Exec(stmt); err != nil {
-				return exit.Internalf("cannot normalize lifecycle state in %s: %s", path, err)
-			}
-		}
-		for _, r := range rebuild {
-			var ddl string
-			err := tx.QueryRow(`SELECT COALESCE(sql,'') FROM sqlite_master
-			WHERE type='table' AND name=?`, r.table).Scan(&ddl)
-			if err != nil || !strings.Contains(ddl, r.stale) {
-				continue
-			}
-			for _, stmt := range r.steps {
-				if _, err := tx.Exec(stmt); err != nil {
-					return exit.Internalf("cannot rebuild %s in %s: %s", r.table, path, err)
-				}
-			}
-		}
-		if e := dropDeadSchema(tx, path); e != nil {
-			return e
+	var objects int
+	if err := tx.QueryRow(`SELECT COUNT(*) FROM sqlite_master
+		WHERE name NOT LIKE 'sqlite_%'`).Scan(&objects); err != nil {
+		return exit.Internalf("cannot inspect unversioned records database %s: %s", path, err)
+	}
+	if objects != 0 {
+		return schemaReset(path, "unversioned records database contains %d schema objects", objects)
+	}
+	for _, stmt := range schema {
+		if _, err := tx.Exec(stmt); err != nil {
+			return exit.Internalf("cannot initialize records schema in %s: %s", path, err)
 		}
 	}
-	requestColumns, err := tableColumns(tx, "requests")
-	if err != nil {
-		return exit.Internalf("cannot inspect requests in %s: %s", path, err)
-	}
-	if !requestColumns["max_cost_usd_micros"] {
-		if _, err := tx.Exec(`ALTER TABLE requests ADD COLUMN max_cost_usd_micros INTEGER NOT NULL DEFAULT 0`); err != nil {
-			return exit.Internalf("cannot add requests.max_cost_usd_micros in %s: %s", path, err)
-		}
-	}
-	if _, err := tx.Exec(`PRAGMA user_version=2`); err != nil {
-		return exit.Internalf("cannot stamp records schema 2 in %s: %s", path, err)
+	if _, err := tx.Exec(`PRAGMA user_version=1`); err != nil {
+		return exit.Internalf("cannot stamp records schema in %s: %s", path, err)
 	}
 	if err := tx.Commit(); err != nil {
-		return exit.Internalf("cannot commit records schema 2 in %s: %s", path, err)
+		return exit.Internalf("cannot commit records initialization in %s: %s", path, err)
 	}
 	return nil
 }
 
-func migrateColumnRenames(tx *sql.Tx, path string) *exit.Error {
-	known := map[string]map[string]bool{}
-	for _, rename := range renames {
-		columns := known[rename.table]
-		if columns == nil {
-			var err error
-			columns, err = tableColumns(tx, rename.table)
-			if err != nil {
-				return exit.Internalf("cannot inspect %s in %s: %s", rename.table, path, err)
-			}
-			known[rename.table] = columns
-		}
-		if !columns[rename.from] || columns[rename.to] {
-			continue
-		}
-		if _, err := tx.Exec(`ALTER TABLE ` + rename.table + ` RENAME COLUMN ` +
-			rename.from + ` TO ` + rename.to); err != nil {
-			return exit.Internalf("cannot rename %s.%s to %s in %s: %s",
-				rename.table, rename.from, rename.to, path, err)
-		}
-		delete(columns, rename.from)
-		columns[rename.to] = true
-	}
-	return nil
+func schemaReset(path, format string, args ...any) *exit.Error {
+	return exit.Named(exit.Conflict, "records.schema_reset_required", format, args...).
+		WithRemedy("stop Cozy, move %s aside, and start again to create the current records database", path)
 }
 
-func dropDeadSchema(tx *sql.Tx, path string) *exit.Error {
-	for _, table := range []string{
-		"workflow_steps",
-		"workflow_executions",
-		"managed_profile_installs",
-		"video_compositions",
-		"placement_acquisition_observations",
-		"artifact_receipts",
-		"rental_relay_refusals",
-		"rental_control_refusals",
-	} {
-		if _, err := tx.Exec(`DROP TABLE IF EXISTS ` + table); err != nil {
-			return exit.Internalf("cannot drop retired table %s from %s: %s", table, path, err)
-		}
-	}
-	for _, retired := range []struct {
-		table string
-		names []string
-	}{
-		{"rentals", []string{
-			"released_at", "control_snapshot_digest", "control_snapshot_length",
-			"control_snapshot_bytes", "artifact_grant_revision",
-		}},
-		{"worker_processes", []string{"incarnation", "readiness_epoch", "revision", "intake"}},
-		{"outputs", []string{"visible_at", "reclaimed_at"}},
-	} {
-		columns, err := tableColumns(tx, retired.table)
-		if err != nil {
-			return exit.Internalf("cannot inspect %s in %s: %s", retired.table, path, err)
-		}
-		for _, name := range retired.names {
-			if !columns[name] {
-				continue
-			}
-			if _, err := tx.Exec(`ALTER TABLE ` + retired.table + ` DROP COLUMN ` + name); err != nil {
-				return exit.Internalf("cannot drop retired column %s.%s from %s: %s",
-					retired.table, name, path, err)
-			}
-		}
-	}
-	return nil
+type schemaReader interface {
+	Query(string, ...any) (*sql.Rows, error)
 }
 
-func tableColumns(tx *sql.Tx, table string) (map[string]bool, error) {
-	rows, err := tx.Query(`PRAGMA table_info(` + table + `)`)
+func schemaSnapshot(db schemaReader) ([]string, error) {
+	rows, err := db.Query(`SELECT type,name,COALESCE(sql,'') FROM sqlite_master
+		WHERE name NOT LIKE 'sqlite_%' ORDER BY type,name`)
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
-	columns := map[string]bool{}
+	var out []string
 	for rows.Next() {
-		var id, notNull, primaryKey int
-		var name, columnType string
-		var defaultValue sql.NullString
-		if err := rows.Scan(&id, &name, &columnType, &notNull, &defaultValue, &primaryKey); err != nil {
+		var kind, name, ddl string
+		if err := rows.Scan(&kind, &name, &ddl); err != nil {
 			return nil, err
 		}
-		columns[name] = true
+		out = append(out, kind+"\x00"+name+"\x00"+ddl)
 	}
-	return columns, rows.Err()
+	return out, rows.Err()
+}
+
+var expectedSchema struct {
+	sync.Once
+	rows []string
+	err  error
+}
+
+func currentSchema() ([]string, error) {
+	expectedSchema.Do(func() {
+		db, err := sql.Open("sqlite", ":memory:"+pragmas)
+		if err != nil {
+			expectedSchema.err = err
+			return
+		}
+		defer db.Close()
+		for _, stmt := range schema {
+			if _, err := db.Exec(stmt); err != nil {
+				expectedSchema.err = err
+				return
+			}
+		}
+		expectedSchema.rows, expectedSchema.err = schemaSnapshot(db)
+	})
+	return expectedSchema.rows, expectedSchema.err
+}
+
+func verifySchema(db *sql.DB, path string) *exit.Error {
+	want, err := currentSchema()
+	if err != nil {
+		return exit.Internalf("cannot derive current records schema: %s", err)
+	}
+	got, err := schemaSnapshot(db)
+	if err != nil {
+		return exit.Internalf("cannot inspect records schema in %s: %s", path, err)
+	}
+	if strings.Join(got, "\n") != strings.Join(want, "\n") {
+		return schemaReset(path, "records database schema is not the exact current shape")
+	}
+	return nil
 }
 
 func (s *Store) Close() { _ = s.db.Close() }
@@ -559,14 +475,8 @@ func (s *Store) ForgetIfUnreferenced(id string) (bool, *exit.Error) {
 	defer tx.Rollback()
 	if _, err := tx.Exec(`UPDATE requests SET install_id=NULL WHERE install_id=?
 		AND state NOT IN ('submitted','queued','dispatching','requeue_pending')`, id); err != nil {
-		// Older roots gained install_id through a pre-launch NOT NULL widen and carry no
-		// foreign key on that column. Empty is their historical spelling of no install;
-		// fresh roots use nullable FK-backed identity.
-		if _, fallback := tx.Exec(`UPDATE requests SET install_id='' WHERE install_id=?
-			AND state NOT IN ('submitted','queued','dispatching','requeue_pending')`, id); fallback != nil {
-			return false, exit.New(exit.Conflict,
-				"cannot release terminal requests from generation %s: %s", id, err)
-		}
+		return false, exit.New(exit.Conflict,
+			"cannot release terminal requests from generation %s: %s", id, err)
 	}
 	if _, err := tx.Exec(`UPDATE worker_processes SET generation=NULL WHERE generation=?
 		AND state='closed'`, id); err != nil {

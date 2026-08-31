@@ -81,6 +81,7 @@ type DesiredPlacement struct {
 	PlacementSetDigest       string       `json:"placement_set_digest"`
 	PlacementSetBytes        []byte       `json:"placement_set_bytes"`
 	EnvironmentDigest        string       `json:"environment_digest"`
+	ConfigDigest             string       `json:"config_digest"`
 	WheelhouseManifestDigest string       `json:"wheelhouse_manifest_digest"`
 	Entrypoints              []Entrypoint `json:"entrypoints"`
 	PlacementIDValue         string       `json:"placement_id,omitempty"`
@@ -351,6 +352,12 @@ type worker struct {
 	// launcher's by construction.
 	remoteInstance string
 	remoteWorkerID string
+	// desiredPackages/models are Creator's logical private-rental intent. They survive a
+	// control-stream reconnect so the new authenticated stream does not reset a loaded
+	// worker to the empty package_set. They are refs only, never download locations or a
+	// locally reconstructed placement.
+	desiredPackages []*pb.DownloadPackageRef
+	desiredModels   []*pb.DownloadModelRef
 
 	// what the worker itself reported; the orchestrator echoes, never invents
 	exited bool
@@ -412,9 +419,13 @@ type worker struct {
 	// retired as dishonest — it advanced on acceptance, so a reader learned only that its
 	// own message arrived. converged < accepted is the normal, readable state of a
 	// convergence in progress or a latched failure, never an error.
-	acceptedRevision  uint64
-	convergedRevision uint64
-	acceptedSetDigest []byte
+	acceptedRevision      uint64
+	convergedRevision     uint64
+	acceptedSetDigest     []byte
+	snapshotAcknowledged  bool
+	packageRevisionDigest string
+	environmentDigest     string
+	configDigest          string
 	// The job lane uses the same reported-versus-pre-offer split as serving. jobsAvail is
 	// the effective number dispatch reads.
 	reportedJobs int
@@ -673,6 +684,15 @@ func (c *Orchestrator) EnsureRental(id string) (string, string, WorkerChange, *e
 	if target == nil || target.Connection == nil {
 		return "", "", ChangeNone, exit.Internalf("rental %s resolved no connected worker", id)
 	}
+	instance := rentalInstanceID(id)
+	c.mu.Lock()
+	live := c.workers[instance]
+	already := live != nil && !live.exited && !live.stopping && live.spec.Connection != nil &&
+		live.spec.Connection.RentalID == id
+	c.mu.Unlock()
+	if already {
+		return instance, "", ChangeNone, c.ensureWorkerClaimed(instance)
+	}
 	spec := WorkerLaunchSpec{Connection: target.Connection}
 	instance, change, problem := c.EnsureWorker(spec)
 	if problem == nil {
@@ -686,7 +706,8 @@ func (c *Orchestrator) ensureWorkerClaimed(instanceID string) *exit.Error {
 	for {
 		c.mu.Lock()
 		w := c.workers[instanceID]
-		claimed := w != nil && !w.exited && w.bootID != "" && !w.lastReport.IsZero() && w.revision > 0
+		claimed := w != nil && !w.exited && w.bootID != "" && !w.lastReport.IsZero() &&
+			w.snapshotAcknowledged
 		gone := w == nil || w.exited
 		quiet := time.Duration(0)
 		var refused *exit.Error
@@ -712,6 +733,87 @@ func (c *Orchestrator) ensureWorkerClaimed(instanceID string) *exit.Error {
 		}
 		time.Sleep(20 * time.Millisecond)
 	}
+}
+
+func (c *Orchestrator) ensureLogicalPackageReady(instanceID, rentalID string,
+	logical LogicalPackage) (WorkerLaunchSpec, string, *exit.Error) {
+	silent := SilentReports * ReportCadence
+	for {
+		c.mu.Lock()
+		w := c.workers[instanceID]
+		gone := w == nil || w.exited
+		quiet := time.Duration(0)
+		var refused, desiredRefusal *exit.Error
+		if w != nil {
+			refused, desiredRefusal = w.refusal, w.desiredRefusal
+			if !w.lastReport.IsZero() {
+				quiet = time.Since(w.lastReport)
+			} else if !w.spawned.IsZero() {
+				quiet = time.Since(w.spawned)
+			}
+			ready := len(w.dispatchable) == 1 && w.placementID != "" &&
+				w.serving == pb.ServingState_SERVING_STATE_DISPATCHABLE &&
+				w.acceptedRevision >= w.revision && w.convergedRevision >= w.revision
+			if ready && (!validDigest(w.packageRevisionDigest) || !validDigest(w.environmentDigest) ||
+				!validDigest(w.configDigest)) {
+				c.mu.Unlock()
+				return WorkerLaunchSpec{}, "", exit.Named(exit.Structural,
+					"rental.invocation_identity_invalid",
+					"worker resolved package %s without complete invocation identity", logical.Package)
+			}
+			if ready {
+				if w.packageRevisionDigest != logical.ReleaseDigest {
+					c.mu.Unlock()
+					return WorkerLaunchSpec{}, "", exit.Named(exit.Conflict,
+						"rental.package_release_changed",
+						"worker resolved package release %s, not delegated %s",
+						w.packageRevisionDigest, logical.ReleaseDigest)
+				}
+				planID := keysOf(w.dispatchable)[0]
+				w.spec.Placement = DesiredPlacement{
+					Package: pinnedPackage(logical.Package, rentalID), Release: logical.Release,
+					PackageRevisionDigest: w.packageRevisionDigest,
+					EnvironmentDigest:     w.environmentDigest, ConfigDigest: w.configDigest,
+					InstallID:        logical.InstallID,
+					PlacementIDValue: w.placementID,
+					Entrypoints: []Entrypoint{{Name: logical.Function, Digest: planID,
+						Outputs: append([]string(nil), logical.Outputs...)}},
+				}
+				w.planIDs = []string{planID}
+				spec := w.spec
+				c.mu.Unlock()
+				return spec, planID, nil
+			}
+			if w.acceptedRevision >= w.revision && w.convergedRevision >= w.revision &&
+				len(w.dispatchable) > 1 {
+				plans := strings.Join(keysOf(w.dispatchable), ", ")
+				c.mu.Unlock()
+				return WorkerLaunchSpec{}, "", exit.Named(exit.Conflict,
+					"rental.binding_ambiguous",
+					"package %s exposed multiple dispatchable bindings [%s]", logical.Package, plans).
+					WithRemedy("publish one weightless entrypoint for this initial package_set lane")
+			}
+		}
+		c.mu.Unlock()
+		switch {
+		case refused != nil:
+			return WorkerLaunchSpec{}, "", refused
+		case desiredRefusal != nil:
+			return WorkerLaunchSpec{}, "", desiredRefusal
+		case gone:
+			return WorkerLaunchSpec{}, "", exit.New(exit.Failed,
+				"the rented worker exited before making package %s ready", logical.Package)
+		case quiet > silent:
+			return WorkerLaunchSpec{}, "", exit.Named(exit.Failed, "worker_silent",
+				"the rented worker stopped reporting while preparing package %s", logical.Package)
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+}
+
+func validDigest(value string) bool {
+	_, err := canonical.Raw(value)
+	return err == nil
 }
 
 // DetachRental stops this daemon's control loop for one rented worker. It waits for an

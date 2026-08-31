@@ -110,7 +110,7 @@ func serveDaemon(ctx *Context) *exit.Error {
 	c, e := orchestrator.Open(orchestrator.Options{
 		Cfg: ctx.Cfg, Layout: l, Store: st, Yield: yield, Log: ctx.Out,
 		Packages: resolver, Rentals: rentals, ObserveRental: rental.ObserveWorker(st),
-		RentalClaimProof: rental.ClaimProof(l), RentalPackageSet: rental.EmptyPackageSet(l),
+		RentalClaimProof: rental.ClaimProof(l), RentalPackageSet: rental.PackageSetSigner(l),
 		ConfigDigest: configDigest,
 	})
 	if e != nil {

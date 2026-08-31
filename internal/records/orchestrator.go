@@ -51,6 +51,9 @@ CREATE TABLE IF NOT EXISTS requests (
   package     TEXT    NOT NULL,
   entrypoint   TEXT    NOT NULL,
   plan_id      TEXT    NOT NULL,
+  package_revision_digest TEXT NOT NULL DEFAULT '',
+  environment_digest TEXT NOT NULL DEFAULT '',
+  config_digest TEXT NOT NULL DEFAULT '',
   payload      BLOB    NOT NULL,
   outputs      TEXT    NOT NULL DEFAULT '',
   state        TEXT    NOT NULL,
@@ -166,125 +169,6 @@ CREATE TABLE IF NOT EXISTS artifact_finalizations (
   PRIMARY KEY (request_id, invocation_digest, output_slot),
   FOREIGN KEY (request_id, attempt) REFERENCES attempts(request_id, attempt)
 )`}
-
-// rebuild carries the tables whose IDENTITY changed — the one migration `ALTER TABLE`
-// cannot express. `stale` is a fragment of the OLD table's own DDL, read back out of
-// `sqlite_master`, so the rebuild is skipped on every root that already carries the new
-// shape: idempotent by observation, not by a version counter nobody maintains.
-type tableRebuild struct {
-	table string
-	stale string
-	steps []string
-}
-
-var rebuild = []tableRebuild{
-	{
-		table: "pins",
-		stale: "PRIMARY KEY (package, major)",
-		steps: []string{
-			`ALTER TABLE pins RENAME TO pins_per_major`,
-			`CREATE TABLE pins (
-  package      TEXT PRIMARY KEY,
-  major        INTEGER NOT NULL,
-  generation   TEXT NOT NULL REFERENCES install_generations(id),
-  activated_at TEXT NOT NULL
-)`,
-			`INSERT INTO pins(package,major,generation,activated_at)
- SELECT old.package,old.major,old.generation,old.activated_at
- FROM pins_per_major old
- WHERE old.rowid=(SELECT newest.rowid FROM pins_per_major newest
-                  WHERE newest.package=old.package
-                  ORDER BY newest.activated_at DESC,newest.rowid DESC LIMIT 1)`,
-			`DROP TABLE pins_per_major`,
-		},
-	},
-	{
-		table: "job_checkpoints",
-		stale: "PRIMARY KEY (request_id, operation_key, logical_key)",
-		steps: []string{
-			`ALTER TABLE job_checkpoints RENAME TO job_checkpoints_pre_attempt_key`,
-			// Recreated by `schema` on the next Open? No — this runs inside the same Open, so
-			// the new shape is created here, from the same text the schema declares.
-			`CREATE TABLE job_checkpoints (
-  request_id    TEXT    NOT NULL,
-  attempt       INTEGER NOT NULL,
-  operation_key TEXT    NOT NULL,
-  logical_key   TEXT    NOT NULL,
-  content_digest TEXT   NOT NULL,
-  receipt_id    TEXT    NOT NULL,
-  outcome       TEXT    NOT NULL,
-  recorded_at   TEXT    NOT NULL,
-  PRIMARY KEY (request_id, attempt, operation_key, logical_key),
-  FOREIGN KEY (request_id, attempt) REFERENCES attempts(request_id, attempt)
-)`,
-			// Rows whose attempt does not exist are dropped, and that is the correction, not a
-			// loss: under the new identity a checkpoint of an attempt that was never dispatched
-			// is exactly the row this key exists to make unrepresentable.
-			`INSERT INTO job_checkpoints SELECT c.* FROM job_checkpoints_pre_attempt_key c
-		   WHERE EXISTS (SELECT 1 FROM attempts a
-		                 WHERE a.request_id=c.request_id AND a.attempt=c.attempt)`,
-			`DROP TABLE job_checkpoints_pre_attempt_key`,
-		},
-	},
-	{
-		table: "artifact_finalizations",
-		stale: "decision_digest    TEXT",
-		steps: []string{
-			`ALTER TABLE artifact_finalizations RENAME TO artifact_finalizations_canonical_docs`,
-			`CREATE TABLE artifact_finalizations (
-  request_id         TEXT    NOT NULL,
-  attempt            INTEGER NOT NULL,
-  instance_id        TEXT    NOT NULL,
-  owner_scope        TEXT    NOT NULL,
-  invocation_digest  TEXT    NOT NULL,
-  output_slot        TEXT    NOT NULL,
-  disposition        TEXT    NOT NULL,
-  receipt_digest     TEXT    NOT NULL DEFAULT '',
-  scratch_root_id    TEXT    NOT NULL DEFAULT '',
-  result_outcome     TEXT    NOT NULL DEFAULT '',
-  result_receipt_digest TEXT NOT NULL DEFAULT '',
-  result_receipt_bytes  BLOB NOT NULL DEFAULT x'',
-  recorded_at        TEXT    NOT NULL,
-  completed_at       TEXT    NOT NULL DEFAULT '',
-  PRIMARY KEY (request_id, invocation_digest, output_slot),
-  FOREIGN KEY (request_id, attempt) REFERENCES attempts(request_id, attempt)
-)`,
-			`INSERT INTO artifact_finalizations(request_id,attempt,instance_id,owner_scope,
-  invocation_digest,output_slot,disposition,receipt_digest,scratch_root_id,result_outcome,
-  result_receipt_digest,result_receipt_bytes,recorded_at,completed_at)
- SELECT request_id,attempt,instance_id,owner_scope,invocation_digest,output_slot,disposition,
-  receipt_digest,scratch_root_id,result_outcome,result_receipt_digest,result_receipt_bytes,
-  recorded_at,completed_at FROM artifact_finalizations_canonical_docs`,
-			`DROP TABLE artifact_finalizations_canonical_docs`,
-		},
-	},
-}
-
-// widen carries columns added before the versioned migration existed.
-var widen = []struct{ table, column, ddl string }{
-	{"install_generations", "runtime", `TEXT NOT NULL DEFAULT ''`},
-	{"install_generations", "project_dir", `TEXT NOT NULL DEFAULT ''`},
-	{"install_generations", "selection_profile", `TEXT NOT NULL DEFAULT ''`},
-	{"install_generations", "placement_set_digest", `TEXT NOT NULL DEFAULT ''`},
-	{"requests", "kind", `TEXT NOT NULL DEFAULT 'serving'`},
-	{"requests", "worker", `TEXT NOT NULL DEFAULT ''`},
-	{"requests", "org", `TEXT NOT NULL DEFAULT ''`},
-	{"requests", "trees", `TEXT NOT NULL DEFAULT ''`},
-	{"requests", "assets", `TEXT NOT NULL DEFAULT '[]'`},
-	{"requests", "install_id", `TEXT NOT NULL DEFAULT ''`},
-	{"requests", "artifact_outputs", `TEXT NOT NULL DEFAULT '[]'`},
-	{"attempts", "media_cleaned", `INTEGER NOT NULL DEFAULT 0`},
-	{"attempts", "artifact_outputs", `TEXT NOT NULL DEFAULT '[]'`},
-}
-
-// normalize hard-cuts pre-launch lifecycle spellings whose durable meaning was refined.
-// They run once inside the v1 migration.
-var normalize = []string{
-	`UPDATE attempts SET state='offered' WHERE state='dispatching'`,
-	`UPDATE requests SET state='requeue_pending' WHERE state='queued' AND EXISTS (
-	  SELECT 1 FROM attempts a WHERE a.request_id=requests.id
-	  AND a.attempt=requests.ordinal AND a.state IN ('terminal','closed'))`,
-}
 
 func now() string { return time.Now().UTC().Format(time.RFC3339Nano) }
 
@@ -519,7 +403,13 @@ type Request struct {
 	Package    string
 	Entrypoint string
 	PlanID     string
-	Payload    []byte
+	// A remote worker derives these invocation identities from its exact accepted
+	// Placement. They are CAS-bound with PlanID before the first offer so a retry or
+	// reconnect cannot silently change the execution named by this request.
+	PackageRevisionDigest string
+	EnvironmentDigest     string
+	ConfigDigest          string
+	Payload               []byte
 	// Outputs names one destination per RESULT FIELD PATH. It lives on the request
 	// because a REQUEUE re-derives the same grant shape without a client saying so again.
 	Outputs   string
@@ -544,8 +434,8 @@ type Request struct {
 	Worker string
 	// MaxCostUSDMicros is the exact automatic-rental authorization. Zero forbids spend.
 	MaxCostUSDMicros int64
-	// InstallID pins a durable local request to the exact immutable generation
-	// resolved before submission. Remote requests leave it empty.
+	// InstallID pins the exact immutable local metadata generation resolved before
+	// submission. The initial remote lane reads only its published release and descriptor.
 	InstallID string
 	// Assets are the request's durable input-asset bindings. LocalPath points into the
 	// authority-owned immutable input store, not at the caller's original file: a requeue
@@ -572,7 +462,8 @@ type AssetBinding struct {
 	MaxBytes  int64  `json:"max_bytes,omitempty"`
 }
 
-const requestCols = `id,idem_key,body_digest,package,entrypoint,plan_id,payload,outputs,
+const requestCols = `id,idem_key,body_digest,package,entrypoint,plan_id,
+	package_revision_digest,environment_digest,config_digest,payload,outputs,
 	state,ordinal,requeues,created_at,kind,org,trees,worker,max_cost_usd_micros,
 	COALESCE(install_id,''),assets,artifact_outputs`
 
@@ -580,7 +471,8 @@ func scanRequest(row interface{ Scan(...any) error }) (Request, error) {
 	var r Request
 	var assets string
 	err := row.Scan(&r.ID, &r.IdemKey, &r.BodyDigest, &r.Package, &r.Entrypoint, &r.PlanID,
-		&r.Payload, &r.Outputs, &r.State, &r.Ordinal, &r.Requeues, &r.CreatedAt,
+		&r.PackageRevisionDigest, &r.EnvironmentDigest, &r.ConfigDigest, &r.Payload, &r.Outputs,
+		&r.State, &r.Ordinal, &r.Requeues, &r.CreatedAt,
 		&r.Kind, &r.Org, &r.Trees, &r.Worker, &r.MaxCostUSDMicros,
 		&r.InstallID, &assets, &r.ArtifactOutputs)
 	if err == nil && assets != "" {
@@ -604,6 +496,40 @@ func (s *Store) RequestRow(id string) (*Request, *exit.Error) {
 		return nil, exit.Internalf("cannot read request %s: %s", id, err)
 	}
 	return &r, nil
+}
+
+// BindRemoteInvocation records the exact invocation identity learned from the worker
+// after logical package_set resolution. The client never supplies these values.
+func (s *Store) BindRemoteInvocation(id, planID, packageRevision, environment, config string) *exit.Error {
+	if id == "" || planID == "" || packageRevision == "" || environment == "" || config == "" {
+		return exit.Internalf("cannot bind an incomplete remote invocation identity")
+	}
+	result, err := s.db.Exec(`UPDATE requests SET plan_id=?,package_revision_digest=?,
+		environment_digest=?,config_digest=? WHERE id=? AND plan_id='' AND
+		package_revision_digest='' AND environment_digest='' AND config_digest=''`,
+		planID, packageRevision, environment, config, id)
+	if err != nil {
+		return exit.Internalf("cannot bind request %s remote invocation: %s", id, err)
+	}
+	changed, err := result.RowsAffected()
+	if err != nil {
+		return exit.Internalf("cannot read request %s remote invocation binding result: %s", id, err)
+	}
+	if changed == 1 {
+		return nil
+	}
+	var heldPlan, heldPackage, heldEnvironment, heldConfig string
+	if err := s.db.QueryRow(`SELECT plan_id,package_revision_digest,environment_digest,config_digest
+		FROM requests WHERE id=?`, id).Scan(
+		&heldPlan, &heldPackage, &heldEnvironment, &heldConfig); err != nil {
+		return exit.Internalf("cannot read request %s remote invocation binding: %s", id, err)
+	}
+	if heldPlan != planID || heldPackage != packageRevision || heldEnvironment != environment ||
+		heldConfig != config {
+		return exit.Named(exit.Conflict, "request_invocation_identity_changed",
+			"request %s already binds a different worker-derived invocation identity", id)
+	}
+	return nil
 }
 
 // RequestByIdempotencyKey resolves the durable identity before a retry touches any
@@ -856,11 +782,14 @@ func submitRequestTx(tx *sql.Tx, r Request, assets string) (Request, bool, *exit
 		return Request{}, false, exit.Internalf("cannot read request %s: %s", r.IdemKey, err)
 	}
 	if _, err := tx.Exec(`INSERT INTO requests(id,idem_key,body_digest,package,entrypoint,
-		plan_id,payload,outputs,state,ordinal,requeues,created_at,kind,org,trees,worker,max_cost_usd_micros,install_id,assets,
+		plan_id,package_revision_digest,environment_digest,config_digest,
+		payload,outputs,state,ordinal,requeues,created_at,kind,org,trees,worker,max_cost_usd_micros,install_id,assets,
 		artifact_outputs)
-		VALUES(?,?,?,?,?,?,?,?,?,0,0,?,?,?,?,?,?,?,?,?)`,
-		r.ID, r.IdemKey, r.BodyDigest, r.Package, r.Entrypoint, r.PlanID, r.Payload,
-		r.Outputs, r.State, r.CreatedAt, r.Kind, r.Org, r.Trees, r.Worker, r.MaxCostUSDMicros, nullable(r.InstallID),
+		VALUES(?,?,?,?,?,?,?,?,?,?,?,?,0,0,?,?,?,?,?,?,?,?,?)`,
+		r.ID, r.IdemKey, r.BodyDigest, r.Package, r.Entrypoint, r.PlanID,
+		r.PackageRevisionDigest, r.EnvironmentDigest, r.ConfigDigest, r.Payload,
+		r.Outputs, r.State, r.CreatedAt, r.Kind, r.Org, r.Trees, r.Worker, r.MaxCostUSDMicros,
+		nullable(r.InstallID),
 		assets, r.ArtifactOutputs); err != nil {
 		return Request{}, false, exit.Internalf("cannot record request %s: %s", r.ID, err)
 	}

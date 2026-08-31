@@ -67,7 +67,8 @@ type Submission struct {
 	// through Options.Rentals). Empty = any local worker.
 	Worker string
 	// InstallID pins a durable request to one immutable local install resolution.
-	// Remote requests leave it empty.
+	// In the initial weightless remote lane it supplies only the exact logical release
+	// and request/result descriptor; no local platform facts cross the control stream.
 	InstallID string
 	// MaxCostUSDMicros authorizes automatic rental spend for this request. Zero forbids it.
 	MaxCostUSDMicros int64
@@ -421,6 +422,12 @@ func (c *Orchestrator) selectOrStart(req records.Request) {
 			continue
 		}
 		if !req.IsJob() || w.spec.Placement.Jobs[0].Function == req.Entrypoint {
+			// A private package_set request learns its binding digest from the worker.
+			// Until that happens an empty plan is neither staged nor stale; resolveFor
+			// sends the signed logical set and binds the observed answer.
+			if req.Worker != "" && req.PlanID == "" {
+				continue
+			}
 			// RESIDENCY IS ABOUT THE PLAN, not about the slot. A worker that STAGED this
 			// request's plan is already resident or loading, and its READY drains the
 			// queue — which is exactly how several submitted jobs queue against ONE
@@ -456,11 +463,14 @@ func (c *Orchestrator) selectOrStart(req records.Request) {
 			delete(c.starting, slot)
 			c.mu.Unlock()
 		}
-		spec, e := c.resolveFor(req)
+		spec, planID, e := c.resolveFor(req)
 		if e != nil {
 			done()
 			c.failQueued(req.ID, autoRentalGate(req, e))
 			return
+		}
+		if planID != "" {
+			req.PlanID = planID
 		}
 		instance, change, e := c.EnsureWorker(spec)
 		if e != nil {
@@ -531,55 +541,79 @@ func settledState(state string) bool {
 }
 
 // resolveFor keeps local package execution separate from generic rented capacity.
-// Non-empty private desired state refuses until signed package_set delegation lands.
-func (c *Orchestrator) resolveFor(req records.Request) (WorkerLaunchSpec, *exit.Error) {
+// A rented worker receives only Creator's signed logical package refs; the worker
+// resolves and reports the exact binding it made dispatchable.
+func (c *Orchestrator) resolveFor(req records.Request) (WorkerLaunchSpec, string, *exit.Error) {
 	if req.Worker == "" {
 		if c.opt.Packages == nil {
-			return WorkerLaunchSpec{}, exit.Unavailablef("this host resolves no local packages")
+			return WorkerLaunchSpec{}, "", exit.Unavailablef("this host resolves no local packages")
 		}
 		if req.InstallID != "" {
 			if req.IsJob() {
-				return c.opt.Packages.ResolveJobInstall(req.InstallID, req.Entrypoint)
+				spec, e := c.opt.Packages.ResolveJobInstall(req.InstallID, req.Entrypoint)
+				return spec, req.PlanID, e
 			}
 			spec, e := c.opt.Packages.ResolveInstall(req.InstallID)
 			if e != nil {
-				return WorkerLaunchSpec{}, e
+				return WorkerLaunchSpec{}, "", e
 			}
 			if spec.Placement.Package != req.Package {
-				return WorkerLaunchSpec{}, exit.Named(exit.Conflict,
+				return WorkerLaunchSpec{}, "", exit.Named(exit.Conflict,
 					"request_install_package_mismatch",
 					"install %s serves %s, not request package %s",
 					req.InstallID, spec.Placement.Package, req.Package)
 			}
-			return spec, nil
+			return spec, req.PlanID, nil
 		}
 		spec, e := c.opt.Packages.Resolve(req.Package)
 		if req.IsJob() {
 			spec, e = c.opt.Packages.ResolveJob(req.Package, req.Entrypoint)
 		}
-		return spec, e
+		return spec, req.PlanID, e
 	}
 	if req.IsJob() {
-		return WorkerLaunchSpec{}, exit.Named(exit.Structural, "remote_job_control_unavailable",
+		return WorkerLaunchSpec{}, "", exit.Named(exit.Structural, "remote_job_control_unavailable",
 			"a remote job cannot be resolved from a local installation").
 			WithRemedy("publish and rent an exact job control snapshot before enabling remote jobs")
 	}
 	if c.opt.Rentals == nil {
-		return WorkerLaunchSpec{}, exit.Unavailablef("this Cozy daemon attaches no remote workers")
+		return WorkerLaunchSpec{}, "", exit.Unavailablef("this Cozy daemon attaches no remote workers")
 	}
 	remote, e := c.opt.Rentals(req.Worker)
 	if e != nil {
-		return WorkerLaunchSpec{}, e
+		return WorkerLaunchSpec{}, "", e
 	}
 	if remote == nil || remote.Connection == nil {
-		return WorkerLaunchSpec{}, exit.Named(exit.Internal, "rental.target_incomplete",
+		return WorkerLaunchSpec{}, "", exit.Named(exit.Internal, "rental.target_incomplete",
 			"rental %s resolved without a complete remote target", req.Worker)
 	}
-	return WorkerLaunchSpec{}, exit.Named(exit.Unavailable,
-		"rental.download_delegation_unavailable",
-		"rental %s is attachable, but direct package/model download delegation is not installed",
-		req.Worker).
-		WithRemedy("keep the rental; proto-013 must land before non-empty desired state can run")
+	if c.opt.Packages == nil || c.opt.RentalPackageSet == nil || req.InstallID == "" {
+		return WorkerLaunchSpec{}, "", exit.Unavailablef(
+			"remote package preparation requires an exact release and package_set signer")
+	}
+	logical, e := c.opt.Packages.ResolveLogicalInstall(req.InstallID, req.Entrypoint)
+	if e != nil {
+		return WorkerLaunchSpec{}, "", e
+	}
+	instance, _, _, e := c.EnsureRental(req.Worker)
+	if e != nil {
+		return WorkerLaunchSpec{}, "", e
+	}
+	if e := c.ConvergePackageSet(instance, []*pb.DownloadPackageRef{{
+		Package: logical.Package, Release: logical.Release, ReleaseDigest: logical.ReleaseDigest,
+	}}, nil); e != nil {
+		return WorkerLaunchSpec{}, "", e
+	}
+	spec, planID, e := c.ensureLogicalPackageReady(instance, req.Worker, logical)
+	if e != nil {
+		return WorkerLaunchSpec{}, "", e
+	}
+	if e := c.opt.Store.BindRemoteInvocation(req.ID, planID,
+		spec.Placement.PackageRevisionDigest, spec.Placement.EnvironmentDigest,
+		spec.Placement.ConfigDigest); e != nil {
+		return WorkerLaunchSpec{}, "", e
+	}
+	return spec, planID, nil
 }
 
 // failQueued settles a request that can never be placed. It is a request-level terminal:
@@ -638,7 +672,7 @@ func (c *Orchestrator) dispatch(req records.Request) (uint64, *exit.Error) {
 	// the payload digest, the ORDERED input identities, the output contracts, the
 	// deadline — lives INSIDE the digest. Its key set is closed: no human model ref, no
 	// service class, no local extension has a slot.
-	environmentDigest, configDigest, e := c.invocationIdentity(w)
+	packageRevision, environmentDigest, configDigest, e := c.invocationIdentity(w, req)
 	if e != nil {
 		return 0, e
 	}
@@ -649,7 +683,7 @@ func (c *Orchestrator) dispatch(req records.Request) (uint64, *exit.Error) {
 	payloadDigest := spellOf(canonical.Digest(req.Payload))
 	outputLimit := c.maxOutputBytes()
 	spec := &pb.InvocationSpec{
-		PackageRevisionDigest: w.spec.Placement.PackageRevisionDigest,
+		PackageRevisionDigest: packageRevision,
 		// `image_digest` is GONE, renamed to what it always meant (#483): "image" is wrong
 		// for a native install with no OCI image at all. The value is the same one this
 		// daemon was frozen with — a request cannot choose the environment it runs under.
@@ -796,19 +830,29 @@ func (c *Orchestrator) maxOutputBytes() uint64 {
 
 // invocationIdentity names the environment and optional local config digest an
 // invocation on w rides.
-func (c *Orchestrator) invocationIdentity(w *worker) (environment, config string, e *exit.Error) {
+func (c *Orchestrator) invocationIdentity(w *worker,
+	req records.Request) (packageRevision, environment, config string, e *exit.Error) {
+	packageRevision = w.spec.Placement.PackageRevisionDigest
 	environment = w.spec.Placement.EnvironmentDigest
 	if environment == "" {
 		if w.spec.Connection == nil && w.spec.Placement.SourceDigest != "" {
-			return "", c.opt.ConfigDigest, nil
+			return packageRevision, "", c.opt.ConfigDigest, nil
 		}
-		return "", "", exit.Named(exit.Structural, "placement_identity_missing",
+		return "", "", "", exit.Named(exit.Structural, "placement_identity_missing",
 			"worker %s carries no selected environment digest", w.instanceID)
 	}
 	if w.spec.Connection != nil {
-		return environment, "", nil
+		if req.PackageRevisionDigest == "" || req.EnvironmentDigest == "" || req.ConfigDigest == "" ||
+			req.PackageRevisionDigest != packageRevision || req.EnvironmentDigest != environment ||
+			req.ConfigDigest != w.spec.Placement.ConfigDigest {
+			return "", "", "", exit.Named(exit.Conflict,
+				"request_invocation_identity_changed",
+				"worker %s no longer matches the invocation identity pinned to request %s",
+				w.instanceID, req.ID)
+		}
+		return req.PackageRevisionDigest, req.EnvironmentDigest, req.ConfigDigest, nil
 	}
-	return environment, c.opt.ConfigDigest, nil
+	return packageRevision, environment, c.opt.ConfigDigest, nil
 }
 
 func spellOf(raw []byte) string {
