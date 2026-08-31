@@ -207,9 +207,6 @@ func handleRm(ctx *Context) *exit.Error {
 			return e
 		}
 		for _, p := range targets {
-			if ref.HasMajor && p.Major != ref.Major {
-				continue
-			}
 			n, e := install.Remove(l, st, p.Package, p.Major)
 			if e != nil {
 				return e
@@ -240,7 +237,7 @@ func handleRm(ctx *Context) *exit.Error {
 			if problem != nil {
 				return problem
 			}
-			selected = ref.Package == generation.Package && (!ref.HasMajor || ref.Major == generation.Major)
+			selected = ref.Package == generation.Package
 			if selected {
 				break
 			}

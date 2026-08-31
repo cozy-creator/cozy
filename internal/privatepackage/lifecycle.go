@@ -84,12 +84,6 @@ func Drop(layout home.Layout, digest string) *exit.Error {
 	return nil
 }
 
-// DropUnowned removes a staged revision only after neither a live request nor the current
-// editable pin names its exact source declaration.
-func DropUnowned(layout home.Layout, store *records.Store, revision Revision) *exit.Error {
-	return DropDigestUnowned(layout, store, revision.Digest)
-}
-
 // DropDigestUnowned is the terminal/restart form: its canonical revision document supplies the
 // source declaration even if the mutable checkout or install row has already disappeared.
 func DropDigestUnowned(layout home.Layout, store *records.Store, digest string) *exit.Error {

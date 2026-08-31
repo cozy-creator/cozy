@@ -82,20 +82,6 @@ func HostRuntime() (string, *exit.Error) {
 	return path, nil
 }
 
-// RefreshLocalBase asks the trusted Runtime to observe its own CPython environment.
-// Creator stores the one returned file but never authors or interprets its inventory.
-func RefreshLocalBase(cozyHome, path string, env []string) (string, *exit.Error) {
-	bin, problem := HostRuntime()
-	if problem != nil {
-		return "", problem
-	}
-	runtime := RuntimeCLI{Bin: bin, Dir: cozyHome, Home: cozyHome, Env: env}
-	if problem := runtime.call(nil, "local-base", "--out", path); problem != nil {
-		return "", problem
-	}
-	return bin, nil
-}
-
 // RefreshGenerationBase observes the exact Runtime carried by an installed generation.
 // Production remote preflight receives these bytes from Tensorhub; product proofs use this
 // owner function to furnish an equally exact active-base response without opening another
@@ -213,43 +199,4 @@ func condense(s string) string {
 		return s[:400] + "…"
 	}
 	return s
-}
-
-// Verdict is one function's fit verdict, as the runtime's own document carries it.
-type Verdict struct {
-	Function string `json:"function"`
-	Verdict  string `json:"verdict"`
-	Rendered string `json:"rendered"`
-	Exact    bool   `json:"exact"`
-}
-
-// Fit runs `fit --json` and hands back the runtime's own HOST FACTS and VERDICTS.
-// cozy-creator renders them and derives no verdict of its own. cl-010 had to parse the
-// row RENDERING because `fit --json` faulted on that build (a slotted dataclass read
-// through `__dict__`); cr-016 fixed it, and reading the document is what deletes the
-// parser.
-func (r RuntimeCLI) Fit(function string, payload []string) (map[string]any, []Verdict, *exit.Error) {
-	var doc struct {
-		Host     map[string]any `json:"host"`
-		Verdicts []Verdict      `json:"verdicts"`
-	}
-	verb := []string{"fit"}
-	if function != "" {
-		verb = append(verb, function)
-	}
-	verb = append(verb, payload...)
-	if e := r.call(&doc, verb...); e != nil {
-		return nil, nil, e
-	}
-	return doc.Host, doc.Verdicts, nil
-}
-
-// HostFacts runs `doctor` — device/driver/CUDA tri-state, encoder capability, CAS and
-// credential presence. Host health only; it derives no fit verdict.
-func (r RuntimeCLI) HostFacts() (map[string]any, *exit.Error) {
-	var doc map[string]any
-	if e := r.call(&doc, "doctor"); e != nil {
-		return nil, e
-	}
-	return doc, nil
 }

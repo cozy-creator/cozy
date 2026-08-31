@@ -231,14 +231,6 @@ func (t *Tool) AdmitManifest(path, id string, length int64) (bool, *exit.Error) 
 	return m[1] == "true", nil
 }
 
-// Admit installs one blob under a declared identity: a digest-checked, no-clobber
-// write.
-func (t *Tool) Admit(path, id string, length int64) *exit.Error {
-	_, e := t.run("put", t.Root, path,
-		"--expect", hex(id), "--expect-length", strconv.FormatInt(length, 10))
-	return e
-}
-
 // FillResult is what one resumable install pass did.
 type FillResult struct {
 	Put     int
@@ -498,20 +490,6 @@ func validID(value string) bool {
 // ResolveLocal returns the one current row behind Creator's reserved local/name alias.
 func (t *Tool) ResolveLocal(name string) (LocalAlias, *exit.Error) {
 	out, e := t.run("local", "resolve", t.Root, name)
-	if e != nil {
-		return LocalAlias{}, e
-	}
-	return parseLocalAlias(out)
-}
-
-// ReplaceLocal atomically swaps the complete one-row alias after TensorFS has
-// verified the exact Manifest and evidence. observed is a prior ResolveLocal
-// repository digest or "absent" for first creation.
-func (t *Tool) ReplaceLocal(name, sourceSelection, manifestID string, length int64,
-	evidencePath, observed string,
-) (LocalAlias, *exit.Error) {
-	out, e := t.run("local", "replace", t.Root, name, sourceSelection, manifestID,
-		strconv.FormatInt(length, 10), "--observed", observed, "--evidence", evidencePath)
 	if e != nil {
 		return LocalAlias{}, e
 	}

@@ -463,10 +463,3 @@ func stat(path string) (int64, error) {
 	}
 	return info.Size(), nil
 }
-
-func (r reply) json(t *testing.T) map[string]any {
-	t.Helper()
-	var doc map[string]any
-	_ = json.Unmarshal(r.Body, &doc)
-	return doc
-}

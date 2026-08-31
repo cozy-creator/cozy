@@ -300,24 +300,6 @@ func (c *Orchestrator) logRecordedReplay(req records.Request, idempotencyKey str
 		req.ID, idempotencyKey, req.State, req.Ordinal)
 }
 
-// ActivateRecorded schedules one already-durable request. It is idempotent: a settled or
-// already-dispatched row needs no second activation, and Dispatch's transaction is the
-// final race fence.
-func (c *Orchestrator) ActivateRecorded(requestID string) *exit.Error {
-	req, e := c.opt.Store.RequestRow(requestID)
-	if e != nil || req == nil {
-		if e != nil {
-			return e
-		}
-		return exit.New(exit.NotFound, "no recorded request %s to activate", requestID)
-	}
-	if req.State != "submitted" && req.State != "queued" {
-		return nil
-	}
-	_, e = c.activateRecorded(*req)
-	return e
-}
-
 func (c *Orchestrator) activateRecorded(req records.Request) (uint64, *exit.Error) {
 	// A SUBMISSION NEVER OVERTAKES WORK ALREADY WAITING. Dispatching straight from submit
 	// is what keeps a warm request fast, and it is exactly what breaks FIFO when a queue
