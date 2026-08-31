@@ -41,6 +41,10 @@ type Publish struct {
 	Tool *tfs.Tool
 	Hub  *hub.Client
 	Ref  hub.Ref
+	// EvidenceRef names the local TensorFS repository that roots ManifestID.
+	// Empty uses Ref. A local/name alias can therefore publish to an unrelated
+	// remote org/name without pretending the destination already owns its bytes.
+	EvidenceRef hub.Ref
 	// ManifestID is the local canonical manifest being published.
 	ManifestID string
 	Release    string
@@ -96,7 +100,11 @@ func (p *Publish) Run(ctx context.Context) (Result, *exit.Error) {
 	if err := os.MkdirAll(p.Scratch, 0o700); err != nil {
 		return res, exit.Internalf("cannot create the transfer scratch at %s: %s", p.Scratch, err)
 	}
-	evidence, e := p.Tool.ReleaseEvidence(p.Ref.Org, p.Ref.Name, p.ManifestID,
+	evidenceRef := p.EvidenceRef
+	if evidenceRef.Org == "" {
+		evidenceRef = p.Ref
+	}
+	evidence, e := p.Tool.ReleaseEvidence(evidenceRef.Org, evidenceRef.Name, p.ManifestID,
 		filepath.Join(p.Scratch, "repo-releases.jsonl"))
 	if e != nil {
 		return res, e

@@ -340,6 +340,35 @@ func (t *Tool) ReleaseEvidence(org, name, manifestID, outPath string) ([]byte, *
 	return evidence, nil
 }
 
+// ResolveLocal returns the one current row behind Creator's reserved local/name
+// alias. TensorFS will eventually own atomic replacement of this row; Creator
+// deliberately does not infer "current" from several immutable releases.
+func (t *Tool) ResolveLocal(name, outPath string) (Release, *exit.Error) {
+	rows, e := t.Releases(outPath)
+	if e != nil {
+		return Release{}, e
+	}
+	var found *Release
+	for i := range rows {
+		row := rows[i]
+		if row.Org != "local" || row.Name != name {
+			continue
+		}
+		if found != nil {
+			return Release{}, exit.Named(exit.Conflict, "model.local_alias_ambiguous",
+				"local/%s has more than one TensorFS release row", name).
+				WithRemedy("repair the local alias to one exact Manifest before using it")
+		}
+		copy := row
+		found = &copy
+	}
+	if found == nil {
+		return Release{}, exit.New(exit.NotFound, "local/%s is not imported", name).
+			WithNext("cozy model import <source> --name " + name)
+	}
+	return *found, nil
+}
+
 func writeJSON(path string, value any) *exit.Error {
 	raw, err := json.Marshal(value)
 	if err != nil {

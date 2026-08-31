@@ -29,6 +29,7 @@ type Source struct {
 	Canonical string
 	Org       string
 	Repo      string
+	Reference string
 	Revision  string
 	VersionID uint64
 	Path      string
@@ -69,7 +70,7 @@ func parseHFURI(raw string) (Source, *exit.Error) {
 	}
 	revision = strings.ToLower(revision)
 	return Source{Kind: HuggingFace, Canonical: "hf://" + org + "/" + decodedRepo + "@" + revision,
-		Org: org, Repo: decodedRepo, Revision: revision}, nil
+		Org: org, Repo: decodedRepo, Reference: revision, Revision: revision}, nil
 }
 
 func parseCivitaiURI(raw string) (Source, *exit.Error) {
@@ -117,15 +118,22 @@ func parseHFPasted(raw string, u *url.URL) (Source, *exit.Error) {
 	if err1 != nil || err2 != nil || !portablePart(org) || !portablePart(repo) {
 		return Source{}, badSource(raw, "Hugging Face URL contains an invalid org or repo")
 	}
-	revision := ""
+	revision, reference := "", "main"
 	if len(parts) > 2 {
 		if len(parts) != 4 || parts[2] != "tree" {
 			return Source{}, badSource(raw, "use a repository or repository tree URL, not an arbitrary Hugging Face path")
 		}
-		revision, _ = url.PathUnescape(parts[3])
-		if !fullCommit(revision) {
+		reference, _ = url.PathUnescape(parts[3])
+		if reference == "" || strings.Contains(reference, "..") {
+			return Source{}, badSource(raw, "Hugging Face tree URL contains an invalid revision")
+		}
+		if fullCommit(reference) {
+			revision = reference
+		} else if reference == "main" {
 			// A branch/tag is moving. The provider resolver deliberately resolves it once.
 			revision = ""
+		} else {
+			return Source{}, badSource(raw, "a non-main Hugging Face tree URL must use its full commit")
 		}
 	}
 	canonical := "hf://" + org + "/" + repo
@@ -133,7 +141,8 @@ func parseHFPasted(raw string, u *url.URL) (Source, *exit.Error) {
 		revision = strings.ToLower(revision)
 		canonical += "@" + revision
 	}
-	return Source{Kind: HuggingFace, Canonical: canonical, Org: org, Repo: repo, Revision: revision}, nil
+	return Source{Kind: HuggingFace, Canonical: canonical, Org: org, Repo: repo,
+		Reference: reference, Revision: revision}, nil
 }
 
 func parseCivitaiPasted(raw string, u *url.URL) (Source, *exit.Error) {
