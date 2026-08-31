@@ -59,9 +59,8 @@ The `model`, `lane`, and `adapter` fields are reserved but not resolved by Cozy 
 Any non-empty value refuses as `501 override_unresolved`; it is never silently ignored.
 
 `rental: true` is the local API's only remote-placement request. It is the exact
-counterpart of CLI `--rental`; callers cannot name a worker. Default execution and
-`--local` are local-only. The two flags are mutually exclusive, and changing the mode
-changes idempotency identity.
+counterpart of CLI `--rental`; callers cannot name a worker. Default execution is
+local-only, and changing to rental mode changes idempotency identity.
 
 Creator reconciles every locally known rental with Tensorhub and sums the immutable Cozy
 retail hourly rate locked into each rental. Every potentially billing manual or managed

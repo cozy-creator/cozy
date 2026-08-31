@@ -191,8 +191,8 @@ cozy rental end studio
 ```
 
 GPU names and prices come from Tensorhub's Cozy-owned rental catalog. Creator never exposes or
-reads RunPod SKU names or provider prices. `cozy run` is local-only by default; `--local`
-makes that explicit, while `--rental` lets Creator reuse idle manual/managed capacity or
+reads RunPod SKU names or provider prices. `cozy run` is local-only by default, while
+`--rental` lets Creator reuse idle manual/managed capacity or
 acquire the cheapest offered SKU that fits the configured fleet ceiling. Callers never name
 a worker. Creator-managed rentals stop after their assigned queue is fully mirrored; manual
 rentals stop only through `cozy rental end`.

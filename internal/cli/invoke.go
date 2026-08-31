@@ -87,11 +87,7 @@ func handleRunExecute(ctx *Context) *exit.Error {
 }
 
 func validateRunPlacement(ctx *Context) *exit.Error {
-	local, managedRental := ctx.Inv.Bool("--local"), ctx.Inv.Bool("--rental")
-	if local && managedRental {
-		return exit.Usagef("--local and --rental are mutually exclusive").
-			WithRemedy("choose exactly one placement mode")
-	}
+	managedRental := ctx.Inv.Bool("--rental")
 	if managedRental && ctx.Cfg.RentalsMaxHourlySpendUSDMicros <= 0 {
 		return exit.Named(exit.Usage, "rental.spend_cap_required",
 			"--rental requires a positive rentals.max_hourly_spend_usd in %s", filepath.Join(ctx.Cfg.Home, "config.yaml")).
