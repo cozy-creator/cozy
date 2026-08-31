@@ -19,19 +19,13 @@ import (
 // ceiling, reuse decision, and paid POST. The durable rental operation and
 // request rows remain the crash-recovery authority.
 type managedRentals struct {
-	mu           sync.Mutex
-	ctx          *Context
-	layout       home.Layout
-	store        *records.Store
-	owner        *orchestrator.Orchestrator
-	idleSequence uint64
-	idleTimers   map[string]idleRelease
-	closed       bool
-}
-
-type idleRelease struct {
-	sequence uint64
-	timer    *time.Timer
+	mu         sync.Mutex
+	ctx        *Context
+	layout     home.Layout
+	store      *records.Store
+	owner      *orchestrator.Orchestrator
+	idleTimers map[string]*time.Timer
+	closed     bool
 }
 
 const managedRentalIdleGrace = 5 * time.Minute
@@ -280,29 +274,28 @@ func (m *managedRentals) scheduleIdleReleaseLocked(id string, deadline time.Time
 	}
 	m.cancelIdleReleaseLocked(id)
 	if m.idleTimers == nil {
-		m.idleTimers = map[string]idleRelease{}
+		m.idleTimers = map[string]*time.Timer{}
 	}
-	m.idleSequence++
-	sequence := m.idleSequence
-	timer := time.AfterFunc(time.Until(deadline), func() { m.releaseIdle(id, sequence) })
-	m.idleTimers[id] = idleRelease{sequence: sequence, timer: timer}
+	var timer *time.Timer
+	timer = time.AfterFunc(time.Until(deadline), func() { m.releaseIdle(id, timer) })
+	m.idleTimers[id] = timer
 }
 
 func (m *managedRentals) cancelIdleReleaseLocked(id string) {
 	if pending, ok := m.idleTimers[id]; ok {
-		pending.timer.Stop()
+		pending.Stop()
 		delete(m.idleTimers, id)
 	}
 }
 
-func (m *managedRentals) releaseIdle(id string, sequence uint64) {
+func (m *managedRentals) releaseIdle(id string, timer *time.Timer) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if m.closed {
 		return
 	}
 	pending, ok := m.idleTimers[id]
-	if !ok || pending.sequence != sequence {
+	if !ok || pending != timer {
 		return
 	}
 	delete(m.idleTimers, id)
@@ -321,7 +314,7 @@ func (m *managedRentals) close() {
 	defer m.mu.Unlock()
 	m.closed = true
 	for id, pending := range m.idleTimers {
-		pending.timer.Stop()
+		pending.Stop()
 		delete(m.idleTimers, id)
 	}
 }
