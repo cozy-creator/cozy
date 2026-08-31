@@ -729,19 +729,6 @@ func (c *Orchestrator) resolveFor(req records.Request) (WorkerLaunchSpec, string
 	if e != nil {
 		return WorkerLaunchSpec{}, "", e
 	}
-	var bind *exit.Error
-	if req.PrivatePackageDigest != "" {
-		bind = c.opt.Store.BindPrivateRemoteInvocation(req.ID, planID,
-			spec.Placement.PackageRevisionDigest, spec.Placement.EnvironmentDigest,
-			spec.Placement.ConfigDigest)
-	} else {
-		bind = c.opt.Store.BindRemoteInvocation(req.ID, planID,
-			spec.Placement.PackageRevisionDigest, spec.Placement.EnvironmentDigest,
-			spec.Placement.ConfigDigest)
-	}
-	if bind != nil {
-		return WorkerLaunchSpec{}, "", bind
-	}
 	return spec, planID, nil
 }
 
@@ -987,11 +974,18 @@ func (c *Orchestrator) maxOutputBytes() uint64 {
 }
 
 // invocationIdentity names the environment and optional local config digest an
-// invocation on w rides.
+// invocation on w rides. Remote identity becomes durable here, after a dispatchable
+// worker is selected and before the attempt ordinal is minted. Cold and warm requests
+// therefore have one writer: neither package preparation nor rental selection needs a
+// second identity path.
 func (c *Orchestrator) invocationIdentity(w *worker,
 	req records.Request) (packageRevision, environment, config string, e *exit.Error) {
-	packageRevision = w.spec.Placement.PackageRevisionDigest
-	if req.IsJob() && w.spec.Connection != nil {
+	c.mu.Lock()
+	placement, remote, instanceID := w.spec.Placement, w.spec.Connection != nil, w.instanceID
+	localConfig := w.configDigest
+	c.mu.Unlock()
+	packageRevision = placement.PackageRevisionDigest
+	if req.IsJob() && remote {
 		expected := req.PackageRevisionDigest
 		if req.PrivatePackageDigest != "" {
 			expected = req.PrivatePackageDigest
@@ -999,38 +993,55 @@ func (c *Orchestrator) invocationIdentity(w *worker,
 		if expected == "" || expected != packageRevision {
 			return "", "", "", exit.Named(exit.Conflict,
 				"request_invocation_identity_changed",
-				"worker %s no longer matches the job release pinned to request %s", w.instanceID, req.ID)
+				"worker %s no longer matches the job release pinned to request %s", instanceID, req.ID)
 		}
 		return packageRevision, "", "", nil
 	}
-	environment = w.spec.Placement.EnvironmentDigest
+	environment = placement.EnvironmentDigest
 	if environment == "" {
-		if w.spec.Connection == nil && w.spec.Placement.SourceDigest != "" {
+		if !remote && placement.SourceDigest != "" {
 			return packageRevision, "", c.opt.ConfigDigest, nil
 		}
 		return "", "", "", exit.Named(exit.Structural, "placement_identity_missing",
-			"worker %s carries no selected environment digest", w.instanceID)
+			"worker %s carries no selected environment digest", instanceID)
 	}
-	if w.spec.Connection != nil {
+	if remote {
 		expected := req.PackageRevisionDigest
 		if req.PrivatePackageDigest != "" {
 			expected = req.PrivatePackageDigest
 		}
-		if expected == "" || req.EnvironmentDigest == "" || req.ConfigDigest == "" ||
-			expected != packageRevision || req.EnvironmentDigest != environment ||
-			req.ConfigDigest != w.spec.Placement.ConfigDigest {
+		if expected == "" || expected != packageRevision {
 			return "", "", "", exit.Named(exit.Conflict,
 				"request_invocation_identity_changed",
 				"worker %s no longer matches the invocation identity pinned to request %s",
-				w.instanceID, req.ID)
+				instanceID, req.ID)
+		}
+		if req.EnvironmentDigest == "" && req.ConfigDigest == "" {
+			if req.PrivatePackageDigest != "" {
+				e = c.opt.Store.BindPrivateRemoteInvocation(req.ID, req.PlanID,
+					packageRevision, environment, placement.ConfigDigest)
+			} else {
+				e = c.opt.Store.BindRemoteInvocation(req.ID, req.PlanID,
+					packageRevision, environment, placement.ConfigDigest)
+			}
+			if e != nil {
+				return "", "", "", e
+			}
+			return packageRevision, environment, placement.ConfigDigest, nil
+		}
+		if req.EnvironmentDigest != environment || req.ConfigDigest != placement.ConfigDigest {
+			return "", "", "", exit.Named(exit.Conflict,
+				"request_invocation_identity_changed",
+				"worker %s no longer matches the invocation identity pinned to request %s",
+				instanceID, req.ID)
 		}
 		return packageRevision, req.EnvironmentDigest, req.ConfigDigest, nil
 	}
-	if !validDigest(w.configDigest) {
+	if !validDigest(localConfig) {
 		return "", "", "", exit.Named(exit.Structural, "placement_identity_missing",
-			"worker %s carries no installed package config digest", w.instanceID)
+			"worker %s carries no installed package config digest", instanceID)
 	}
-	return packageRevision, environment, w.configDigest, nil
+	return packageRevision, environment, localConfig, nil
 }
 
 func spellOf(raw []byte) string {

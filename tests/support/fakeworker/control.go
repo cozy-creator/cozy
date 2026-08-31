@@ -20,13 +20,17 @@ import (
 
 type fakeControl struct {
 	pb.UnimplementedWorkerControlServer
-	say       func(string, ...any)
-	arm       string
-	bootID    string
-	instance  string
-	releaseID string
-	root      string // this worker's OWN filesystem root
-	verify    func(string) bool
+	say                func(string, ...any)
+	arm                string
+	bootID             string
+	instance           string
+	releaseID          string
+	root               string // this worker's OWN filesystem root
+	verify             func(string) bool
+	dynamicPlan        string
+	dynamicRelease     string
+	dynamicEnvironment string
+	dynamicConfig      string
 
 	generation   uint64
 	snapshotSent atomic.Bool
@@ -126,12 +130,15 @@ func (f *fakeControl) Control(stream pb.WorkerControl_ControlServer) error {
 	f.snapshotSent.Store(true)
 	f.say("WorkerSnapshot %s sent (%d B); admission is CLOSED until the ack", snapshotID, len(bodyBytes))
 
+	dynamicSlots := uint32(1)
 	observed := func(revision uint64, placementID string, setDigest []byte, planIDs []string,
 		packageRevision, environmentDigest, configDigest string,
 	) {
 		availableSlots := uint32(2)
 		if f.arm == "delayed-output" {
 			availableSlots = 1
+		} else if f.arm == "dynamic-output" {
+			availableSlots = dynamicSlots
 		}
 		r := &pb.ObservedWorkerState{
 			AcceptedDesiredStateRevision: revision, ConvergedRevision: revision,
@@ -208,7 +215,14 @@ func (f *fakeControl) Control(stream pb.WorkerControl_ControlServer) error {
 			}
 			placementID, planIDs, setDigest := "", []string(nil), []byte(nil)
 			packageRevision, environmentDigest, configDigest := "", "", ""
-			if ds := d.GetPlacementSet(); ds != nil {
+			if f.arm == "dynamic-output" && d.GetPackageSet() != nil {
+				placementID = "plc-dynamic-package"
+				planIDs = []string{f.dynamicPlan}
+				packageRevision = f.dynamicRelease
+				environmentDigest = f.dynamicEnvironment
+				configDigest = f.dynamicConfig
+				setDigest = canonical.Digest([]byte("dynamic package set"))
+			} else if ds := d.GetPlacementSet(); ds != nil {
 				// THE BYTES ARE THE SET. Recompute BEFORE parsing a single field — a
 				// mismatch is a typed refusal with the desired state UNAPPLIED.
 				if !bytes.Equal(canonical.Digest(ds.PlacementSetCanonicalBytes), ds.PlacementSetDigest) {
@@ -272,6 +286,9 @@ func (f *fakeControl) Control(stream pb.WorkerControl_ControlServer) error {
 				accepted.RecordOwnerEpoch, accepted.ControlStreamGeneration, accepted.WorkerBootId = e, g, b
 			})
 			send(&pb.WorkerFrame{Msg: &pb.WorkerFrame_AttemptAccepted{AttemptAccepted: accepted}})
+			if f.arm == "dynamic-output" {
+				dynamicSlots = 0
+			}
 			switch f.arm {
 			case "badterminal":
 				f.badOutcomes(outcome, offer)
@@ -287,6 +304,11 @@ func (f *fakeControl) Control(stream pb.WorkerControl_ControlServer) error {
 					offer.InvocationSpecDigest, pb.OutcomeStatus_OUTCOME_STATUS_SUCCEEDED,
 					"success that omits its granted output")
 				f.say("ARM: SUCCEEDED outcome omits the granted output")
+				outcome(t)
+			case "dynamic-output":
+				t, _ := authorOutcome(offer.RequestId, offer.AttemptOrdinal,
+					offer.InvocationSpecDigest, pb.OutcomeStatus_OUTCOME_STATUS_SUCCEEDED,
+					"dynamic package result")
 				outcome(t)
 			}
 		case *pb.RecordOwnerFrame_OutcomeAck:
@@ -306,6 +328,11 @@ func (f *fakeControl) Control(stream pb.WorkerControl_ControlServer) error {
 				go func() { time.Sleep(3 * time.Second); os.Exit(0) }()
 			}
 			if f.arm == "delayed-output" {
+				observed(currentRevision, currentPlacementID, currentSetDigest, currentPlanIDs,
+					currentPackageRevision, currentEnvironmentDigest, currentConfigDigest)
+			}
+			if f.arm == "dynamic-output" {
+				dynamicSlots = 1
 				observed(currentRevision, currentPlacementID, currentSetDigest, currentPlanIDs,
 					currentPackageRevision, currentEnvironmentDigest, currentConfigDigest)
 			}
