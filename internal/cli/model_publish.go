@@ -12,6 +12,7 @@ import (
 	"github.com/cozy-creator/cozy/internal/canonical"
 	"github.com/cozy-creator/cozy/internal/exit"
 	"github.com/cozy-creator/cozy/internal/hub"
+	packageref "github.com/cozy-creator/cozy/internal/install"
 	"github.com/cozy-creator/cozy/internal/launch"
 	"github.com/cozy-creator/cozy/internal/modelproduction"
 	"github.com/cozy-creator/cozy/internal/modelsource"
@@ -292,14 +293,23 @@ func resolveProducerPlan(ctx *Context, raw string) (*producerPlan, *exit.Error) 
 	}
 	parts := strings.Split(raw, "/")
 	if len(parts) != 3 || parts[0] == "" || parts[1] == "" || parts[2] == "" {
-		return nil, exit.Usagef("--producer %q is not org/package/production", raw)
+		return nil, exit.Usagef("--producer %q is not org/package[@vN]/production", raw)
 	}
 	packageName := parts[0] + "/" + parts[1]
-	remote := ctx.Inv.Bool("--rental")
-	packages := map[string]productionPackage{}
-	selected, problem := resolveProductionPackage(ctx, packageName, remote, packages)
+	producerSelector, problem := packageref.ParseRef(packageName)
 	if problem != nil {
 		return nil, problem
+	}
+	remote := ctx.Inv.Bool("--rental")
+	packages := map[string]productionPackage{}
+	selected, problem := resolveProductionPackage(ctx, producerSelector.String(), remote, packages)
+	if problem != nil {
+		return nil, problem
+	}
+	if major, majorProblem := packageref.MajorOf(selected.Release); majorProblem == nil {
+		// Self-steps select the producer's major but must reuse the already-frozen
+		// producer release, even if the catalog advances during this one plan.
+		packages[producerSelector.Package+"@v"+strconv.Itoa(major)] = selected
 	}
 	descriptor := selected.Descriptor
 	production, problem := descriptor.Production(parts[2])
@@ -315,12 +325,12 @@ func resolveProducerPlan(ctx *Context, raw string) (*producerPlan, *exit.Error) 
 		Descriptor:    descriptor, Production: production}
 	requires := map[string]bool{}
 	for _, step := range ordered {
-		target, parseProblem := parseTarget(step.Callable)
-		if parseProblem != nil || target.Function == "" {
+		target, parseProblem := parseProductionCallable(step.Callable)
+		if parseProblem != nil {
 			return nil, exit.Named(exit.Validation, "model_production_callable_invalid",
 				"production step %s does not name one job callable", step.Name)
 		}
-		stepPackage, packageProblem := resolveProductionPackage(ctx, target.Package, remote,
+		stepPackage, packageProblem := resolveProductionPackage(ctx, target.Selector, remote,
 			packages)
 		if packageProblem != nil {
 			return nil, packageProblem
@@ -368,11 +378,16 @@ type productionPackage struct {
 func resolveProductionPackage(ctx *Context, packageName string, remote bool,
 	cache map[string]productionPackage,
 ) (productionPackage, *exit.Error) {
-	if selected, ok := cache[packageName]; ok {
+	selector, problem := packageref.ParseRef(packageName)
+	if problem != nil {
+		return productionPackage{}, problem
+	}
+	key := selector.String()
+	if selected, ok := cache[key]; ok {
 		return selected, nil
 	}
 	if !remote {
-		install, problem := installedPackage(ctx, packageName)
+		install, problem := installedPackage(ctx, key)
 		if problem != nil {
 			return productionPackage{}, problem.WithRemedy(
 				"install every exact production package before running it locally")
@@ -383,11 +398,11 @@ func resolveProductionPackage(ctx *Context, packageName string, remote bool,
 		}
 		selected := productionPackage{InstallID: install.ID, Release: install.Version,
 			ReleaseDigest: install.SourceDigest, Descriptor: facts.PackageDescriptor}
-		cache[packageName] = selected
+		cache[key] = selected
 		return selected, nil
 	}
 
-	ref, problem := hub.ParseRef(packageName)
+	ref, problem := hub.ParseRef(selector.Package)
 	if problem != nil {
 		return productionPackage{}, problem
 	}
@@ -397,16 +412,25 @@ func resolveProductionPackage(ctx *Context, packageName string, remote bool,
 	if problem != nil {
 		return productionPackage{}, problem
 	}
-	if card.Package.Ref() != packageName {
+	if card.Package.Ref() != selector.Package {
 		return productionPackage{}, exit.Named(exit.Conflict,
 			"model_production.package_catalog_changed",
-			"Tensorhub returned package %s while resolving %s", card.Package.Ref(), packageName)
+			"Tensorhub returned package %s while resolving %s", card.Package.Ref(), key)
 	}
-	release, problem := newestPackageRelease(card.Releases)
+	var release string
+	if selector.HasMajor {
+		release, problem = newestPackageRelease(card.Releases, selector.Major)
+	} else {
+		release, problem = newestPackageRelease(card.Releases)
+	}
 	if problem != nil {
+		detail := ""
+		if selector.HasMajor {
+			detail = " in v" + strconv.Itoa(selector.Major)
+		}
 		return productionPackage{}, exit.Named(exit.NotFound,
 			"model_production.package_release_absent",
-			"Tensorhub package %s has no active immutable release", packageName)
+			"Tensorhub package %s has no active immutable release%s", selector.Package, detail)
 	}
 	detail, problem := client(ctx).PackageRelease(hctx, ref, release)
 	if problem != nil {
@@ -416,13 +440,13 @@ func resolveProductionPackage(ctx *Context, packageName string, remote bool,
 		detail.Release.PackageDescriptorLength != int64(len(detail.PackageDescriptor)) {
 		return productionPackage{}, exit.Named(exit.Conflict, "model_production.package_changed",
 			"Tensorhub package %s@%s returned inconsistent immutable release metadata",
-			packageName, release)
+			selector.Package, release)
 	}
 	if _, err := canonical.Raw(detail.Release.ReleaseDigest); err != nil {
 		return productionPackage{}, exit.Named(exit.Conflict,
 			"model_production.package_release_digest_invalid",
 			"Tensorhub package %s@%s has no exact immutable release digest",
-			packageName, release)
+			selector.Package, release)
 	}
 	descriptor, problem := launch.DecodeDescriptor(detail.PackageDescriptor)
 	if problem != nil {
@@ -434,8 +458,25 @@ func resolveProductionPackage(ctx *Context, packageName string, remote bool,
 	}
 	selected := productionPackage{Release: release, ReleaseDigest: detail.Release.ReleaseDigest,
 		Descriptor: descriptor}
-	cache[packageName] = selected
+	cache[key] = selected
 	return selected, nil
+}
+
+type productionCallable struct {
+	Package, Selector, Function string
+}
+
+func parseProductionCallable(value string) (productionCallable, *exit.Error) {
+	parts := strings.Split(value, "/")
+	if len(parts) != 3 || parts[2] == "" {
+		return productionCallable{}, exit.Usagef("%q is not org/package@vN/function", value)
+	}
+	selector, problem := packageref.ParseRef(parts[0] + "/" + parts[1])
+	if problem != nil {
+		return productionCallable{}, problem
+	}
+	return productionCallable{Package: selector.Package, Selector: selector.String(),
+		Function: parts[2]}, nil
 }
 
 var productionResourcePattern = regexp.MustCompile(`^(sm|vram|ram)([1-9][0-9]*)(\+|g)?$`)

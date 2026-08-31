@@ -342,7 +342,7 @@ func TestCompactPackageDescriptor(t *testing.T) {
 }
 
 func TestModelProductionDescriptor(t *testing.T) {
-	raw := []byte(`{"application":"producer:app","entrypoints":[],"format":"cozy.package.descriptor/1","jobs":[],"model_productions":[{"name":"two-lane","steps":[{"callable":"tensorhub/quantize/fp8","models":{"source":"assemble.model"},"name":"quantize","outputs":["model"],"resources":{"gpu_count":1,"placement":"single_node","requires":"sm90+,vram80g"}},{"callable":"tensorhub/minimax-h3-tools/assemble","models":{"dits":"dits","shared":"shared"},"name":"assemble","outputs":["model"]}],"outputs":[{"lane_key":"bf16-full","name":"full","required_contract":{"encodings":["sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"],"topology_digest":"sha256:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"},"source":"assemble.model"},{"lane_key":"fp8-pruned","name":"fp8","required_contract":{"encodings":["sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc","sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"],"topology_digest":"sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"},"source":"quantize.model"}],"sources":{"dits":"hf/minimax-h3/native-dits-bf16","shared":"hf/minimax-h3/shared-diffusers"}}]}`)
+	raw := []byte(`{"application":"producer:app","entrypoints":[],"format":"cozy.package.descriptor/1","jobs":[],"model_productions":[{"name":"two-lane","steps":[{"callable":"tensorhub/quantize@v1/fp8","models":{"source":"assemble.model"},"name":"quantize","outputs":["model"],"resources":{"gpu_count":1,"placement":"single_node","requires":"sm90+,vram80g"}},{"callable":"tensorhub/minimax-h3-tools@v2/assemble","models":{"dits":"dits","shared":"shared"},"name":"assemble","outputs":["model"]}],"outputs":[{"lane_key":"bf16-full","name":"full","required_contract":{"encodings":["sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"],"topology_digest":"sha256:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"},"source":"assemble.model"},{"lane_key":"fp8-pruned","name":"fp8","required_contract":{"encodings":["sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc","sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"],"topology_digest":"sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"},"source":"quantize.model"}],"sources":{"dits":"hf/minimax-h3/native-dits-bf16","shared":"hf/minimax-h3/shared-diffusers"}}]}`)
 	descriptor, problem := launch.DecodeDescriptor(raw)
 	fatal(t, problem)
 	production, problem := descriptor.Production("two-lane")
@@ -366,8 +366,9 @@ func TestModelProductionDescriptor(t *testing.T) {
 		"duplicate lane": bytes.Replace(raw,
 			[]byte(`"lane_key":"fp8-pruned"`), []byte(`"lane_key":"bf16-full"`), 1),
 		"zero gpu":               bytes.Replace(raw, []byte(`"gpu_count":1`), []byte(`"gpu_count":0`), 1),
+		"unversioned callable":   bytes.Replace(raw, []byte(`quantize@v1/fp8`), []byte(`quantize/fp8`), 1),
 		"retired task alias":     bytes.Replace(raw, []byte(`"topology_digest":"sha256:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"`), []byte(`"structure":"h3/full","tasks":["fl2va"]`), 1),
-		"package asset in graph": bytes.Replace(raw, []byte(`"callable":"tensorhub/quantize/fp8"`), []byte(`"assets":{"plan":"assets/quant.json"},"callable":"tensorhub/quantize/fp8"`), 1),
+		"package asset in graph": bytes.Replace(raw, []byte(`"callable":"tensorhub/quantize@v1/fp8"`), []byte(`"assets":{"plan":"assets/quant.json"},"callable":"tensorhub/quantize@v1/fp8"`), 1),
 		"encoding aliases":       bytes.Replace(raw, []byte(`"sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"`), []byte(`"plain/1"`), 1),
 	} {
 		t.Run(name, func(t *testing.T) {
@@ -394,8 +395,8 @@ func TestModelProductionOperationIdentity(t *testing.T) {
 		DescriptorDigest: "sha256:" + strings.Repeat("d", 64),
 		Production:       production,
 		Jobs: []modelproduction.JobPin{
-			{Step: "quantize", Callable: "tensorhub/quantize/fp8", Release: "1.2.0", ReleaseDigest: "sha256:" + strings.Repeat("e", 64)},
-			{Step: "assemble", Callable: "tensorhub/minimax-h3-tools/assemble", Release: "1.0.0", ReleaseDigest: "sha256:" + strings.Repeat("f", 64)},
+			{Step: "quantize", Callable: "tensorhub/quantize@v1/fp8", Release: "1.2.0", ReleaseDigest: "sha256:" + strings.Repeat("e", 64)},
+			{Step: "assemble", Callable: "tensorhub/minimax-h3-tools@v2/assemble", Release: "1.0.0", ReleaseDigest: "sha256:" + strings.Repeat("f", 64)},
 		},
 	}
 	reordered := base
