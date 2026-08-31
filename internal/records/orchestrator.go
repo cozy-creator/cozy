@@ -7,7 +7,6 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
-	"sort"
 	"strings"
 	"time"
 
@@ -58,7 +57,7 @@ CREATE TABLE IF NOT EXISTS requests (
   assets       TEXT    NOT NULL DEFAULT '[]',
   models       TEXT    NOT NULL DEFAULT '[]',
   artifact_outputs TEXT NOT NULL DEFAULT '[]'
-, acceptable_base_manifests TEXT NOT NULL DEFAULT '[]')`
+)`
 
 var orchestratorSchema = []string{`
 CREATE TABLE IF NOT EXISTS worker_processes (
@@ -418,12 +417,11 @@ type Request struct {
 	PackageRevisionDigest string
 	// PrivatePackageDigest names Creator's sealed carrier set. UploadedBootID binds the
 	// completed transfer to the exact pod generation that acknowledged every file.
-	PrivatePackageDigest                string
-	PrivatePackageUploadedBootID        string
-	AcceptableWheelhouseManifestDigests []string
-	EnvironmentDigest                   string
-	ConfigDigest                        string
-	Payload                             []byte
+	PrivatePackageDigest         string
+	PrivatePackageUploadedBootID string
+	EnvironmentDigest            string
+	ConfigDigest                 string
+	Payload                      []byte
 	// Outputs names one destination per RESULT FIELD PATH. It lives on the request
 	// because a REQUEUE re-derives the same grant shape without a client saying so again.
 	Outputs   string
@@ -500,17 +498,16 @@ type ModelRef struct {
 
 const requestCols = `id,idem_key,body_digest,package,entrypoint,plan_id,package_release,
 	package_revision_digest,private_package_digest,private_package_uploaded_boot_id,
-	acceptable_base_manifests,
 	environment_digest,config_digest,payload,outputs,
 	state,ordinal,requeues,created_at,kind,job_gpu_count,org,trees,worker,rental,
 	COALESCE(install_id,''),assets,models,artifact_outputs`
 
 func scanRequest(row interface{ Scan(...any) error }) (Request, error) {
 	var r Request
-	var assets, models, acceptableBases string
+	var assets, models string
 	err := row.Scan(&r.ID, &r.IdemKey, &r.BodyDigest, &r.Package, &r.Entrypoint, &r.PlanID,
 		&r.Release, &r.PackageRevisionDigest, &r.PrivatePackageDigest,
-		&r.PrivatePackageUploadedBootID, &acceptableBases, &r.EnvironmentDigest, &r.ConfigDigest, &r.Payload, &r.Outputs,
+		&r.PrivatePackageUploadedBootID, &r.EnvironmentDigest, &r.ConfigDigest, &r.Payload, &r.Outputs,
 		&r.State, &r.Ordinal, &r.Requeues, &r.CreatedAt,
 		&r.Kind, &r.JobGPUCount, &r.Org, &r.Trees, &r.Worker, &r.Rental,
 		&r.InstallID, &assets, &models, &r.ArtifactOutputs)
@@ -519,9 +516,6 @@ func scanRequest(row interface{ Scan(...any) error }) (Request, error) {
 	}
 	if err == nil && models != "" {
 		err = json.Unmarshal([]byte(models), &r.Models)
-	}
-	if err == nil && acceptableBases != "" {
-		err = json.Unmarshal([]byte(acceptableBases), &r.AcceptableWheelhouseManifestDigests)
 	}
 	return r, err
 }
@@ -923,7 +917,7 @@ func (s *Store) BeginRequeue(id string, max int64) (count int64, started, cancel
 // same body digest answers the SAME request; the same key with a different body is a
 // conflict, never a second execution wearing one name.
 func (s *Store) Submit(r Request) (Request, bool, *exit.Error) {
-	r, assets, models, acceptableBases, exportOutputs, problem := prepareRequest(r)
+	r, assets, models, exportOutputs, problem := prepareRequest(r)
 	if problem != nil {
 		return Request{}, false, problem
 	}
@@ -932,7 +926,7 @@ func (s *Store) Submit(r Request) (Request, bool, *exit.Error) {
 		return Request{}, false, exit.Internalf("cannot begin request submission: %s", err)
 	}
 	defer tx.Rollback()
-	recorded, fresh, problem := submitRequestTx(tx, r, assets, models, acceptableBases, exportOutputs)
+	recorded, fresh, problem := submitRequestTx(tx, r, assets, models, exportOutputs)
 	if problem != nil {
 		return Request{}, false, problem
 	}
@@ -942,7 +936,7 @@ func (s *Store) Submit(r Request) (Request, bool, *exit.Error) {
 	return recorded, fresh, nil
 }
 
-func prepareRequest(r Request) (Request, string, string, string, string, *exit.Error) {
+func prepareRequest(r Request) (Request, string, string, string, *exit.Error) {
 	r.CreatedAt = now()
 	r.State = "submitted"
 	if r.Kind == "" {
@@ -953,7 +947,7 @@ func prepareRequest(r Request) (Request, string, string, string, string, *exit.E
 		var err error
 		assets, err = json.Marshal(r.Assets)
 		if err != nil {
-			return Request{}, "", "", "", "", exit.Internalf("cannot record request %s assets: %s", r.ID, err)
+			return Request{}, "", "", "", exit.Internalf("cannot record request %s assets: %s", r.ID, err)
 		}
 	}
 	models := []byte("[]")
@@ -961,50 +955,17 @@ func prepareRequest(r Request) (Request, string, string, string, string, *exit.E
 		var err error
 		models, err = json.Marshal(r.Models)
 		if err != nil {
-			return Request{}, "", "", "", "", exit.Internalf("cannot record request %s models: %s", r.ID, err)
-		}
-	}
-	acceptableBases := []byte("[]")
-	if len(r.AcceptableWheelhouseManifestDigests) > 0 {
-		if len(r.AcceptableWheelhouseManifestDigests) > 32 ||
-			!sort.StringsAreSorted(r.AcceptableWheelhouseManifestDigests) {
-			return Request{}, "", "", "", "", exit.Named(exit.Validation,
-				"rental.acceptable_base_manifests_invalid",
-				"acceptable base manifests must be 1..32 sorted exact digests")
-		}
-		prior := ""
-		for _, digest := range r.AcceptableWheelhouseManifestDigests {
-			if digest == prior || !validRequestDigest(digest) {
-				return Request{}, "", "", "", "", exit.Named(exit.Validation,
-					"rental.acceptable_base_manifests_invalid",
-					"acceptable base manifests must be unique exact digests")
-			}
-			prior = digest
-		}
-		var err error
-		acceptableBases, err = json.Marshal(r.AcceptableWheelhouseManifestDigests)
-		if err != nil {
-			return Request{}, "", "", "", "", exit.Internalf(
-				"cannot record request %s acceptable bases: %s", r.ID, err)
+			return Request{}, "", "", "", exit.Internalf("cannot record request %s models: %s", r.ID, err)
 		}
 	}
 	exportOutputs, problem := prepareOutputExport(r.OutputExport)
 	if problem != nil {
-		return Request{}, "", "", "", "", problem
+		return Request{}, "", "", "", problem
 	}
-	return r, string(assets), string(models), string(acceptableBases), exportOutputs, nil
+	return r, string(assets), string(models), exportOutputs, nil
 }
 
-func validRequestDigest(value string) bool {
-	if len(value) != 71 || !strings.HasPrefix(value, "sha256:") || value != strings.ToLower(value) {
-		return false
-	}
-	_, err := hex.DecodeString(value[7:])
-	return err == nil
-}
-
-func submitRequestTx(tx *sql.Tx, r Request, assets, models, acceptableBases,
-	exportOutputs string,
+func submitRequestTx(tx *sql.Tx, r Request, assets, models, exportOutputs string,
 ) (Request, bool, *exit.Error) {
 	existing, err := scanRequest(tx.QueryRow(
 		`SELECT `+requestCols+` FROM requests WHERE idem_key=?`, r.IdemKey))
@@ -1022,13 +983,13 @@ func submitRequestTx(tx *sql.Tx, r Request, assets, models, acceptableBases,
 	}
 	if _, err := tx.Exec(`INSERT INTO requests(id,idem_key,body_digest,package,entrypoint,
 		plan_id,package_release,package_revision_digest,private_package_digest,
-		private_package_uploaded_boot_id,acceptable_base_manifests,environment_digest,config_digest,
+		private_package_uploaded_boot_id,environment_digest,config_digest,
 		payload,outputs,state,ordinal,requeues,created_at,kind,job_gpu_count,org,trees,worker,rental,install_id,assets,models,
 		artifact_outputs)
-		VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?, ?,0,0,?,?,?,?,?,?,?,?,?,?,?)`,
+		VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?, ?,0,0,?,?,?,?,?,?,?,?,?,?,?)`,
 		r.ID, r.IdemKey, r.BodyDigest, r.Package, r.Entrypoint, r.PlanID,
 		r.Release, r.PackageRevisionDigest, r.PrivatePackageDigest,
-		r.PrivatePackageUploadedBootID, acceptableBases, r.EnvironmentDigest, r.ConfigDigest, r.Payload,
+		r.PrivatePackageUploadedBootID, r.EnvironmentDigest, r.ConfigDigest, r.Payload,
 		r.Outputs, r.State, r.CreatedAt, r.Kind, r.JobGPUCount, r.Org, r.Trees, r.Worker, r.Rental,
 		nullable(r.InstallID),
 		assets, models, r.ArtifactOutputs); err != nil {

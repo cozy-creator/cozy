@@ -218,9 +218,7 @@ func replaySubmission(sub Submission, recorded records.Request) orchestrator.Sub
 		Outputs: outputs, PlanID: planID, Worker: recorded.Worker, Assets: assets,
 		InstallID: sub.InstallID, Release: sub.Release, ReleaseDigest: sub.ReleaseDigest,
 		PrivatePackageDigest: recorded.PrivatePackageDigest,
-		AcceptableWheelhouseManifestDigests: append([]string(nil),
-			recorded.AcceptableWheelhouseManifestDigests...),
-		Rental: sub.Rental, Models: models, OutputExport: outputExportInput(sub),
+		Rental:               sub.Rental, Models: models, OutputExport: outputExportInput(sub),
 	}
 }
 
@@ -377,8 +375,6 @@ func (s *Server) resolvePlan(ctx context.Context, sub Submission) (orchestrator.
 		}
 		out.PlanID = logical.PlanID
 		out.Models = append([]orchestrator.ModelRef(nil), logical.Models...)
-		out.AcceptableWheelhouseManifestDigests = append([]string(nil),
-			logical.AcceptableWheelhouseManifestDigests...)
 		if len(out.Outputs) == 0 {
 			out.Outputs = logical.Outputs
 		}
@@ -517,18 +513,13 @@ func (s *Server) resolvePrivateServing(ctx context.Context, sub Submission,
 	if problem := validateInputs(entrypoint, &out); problem != nil {
 		return out, problem
 	}
-	requiredRuntime := ""
-	if len(out.Models) > 0 {
-		requiredRuntime = launch.PrivateModeledRuntimeFloor
-	}
-	revision, compatibleBases, problem := s.packages.PreparePrivate(ctx, installID, requiredRuntime)
+	revision, problem := s.packages.PreparePrivate(ctx, installID)
 	if problem != nil {
 		return out, problem
 	}
 	out.InstallID, out.PlanID = installID, planID
 	out.Release, out.ReleaseDigest = revision.Release, revision.SourceDigest
 	out.PrivatePackageDigest = revision.Digest
-	out.AcceptableWheelhouseManifestDigests = compatibleBases
 	if len(out.Outputs) == 0 {
 		out.Outputs = outputs
 	}

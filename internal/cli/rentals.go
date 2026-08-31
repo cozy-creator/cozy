@@ -7,7 +7,6 @@ import (
 	"encoding/hex"
 	"fmt"
 	"os/signal"
-	"sort"
 	"strconv"
 	"strings"
 	"syscall"
@@ -121,7 +120,7 @@ func handleRent(ctx *Context) *exit.Error {
 	}
 
 	row, attachable, replay, e := acquireRental(ctx, l, st, skuName, requestedMachineName,
-		operationKey, reason, hourlyRate, ctx.Cfg.RentalsMaxHourlySpendUSDMicros, deadline, "", nil)
+		operationKey, reason, hourlyRate, ctx.Cfg.RentalsMaxHourlySpendUSDMicros, deadline, "")
 	if e != nil {
 		return e
 	}
@@ -172,17 +171,15 @@ func handleRent(ctx *Context) *exit.Error {
 // worker's authenticated attach projection are durable locally.
 func acquireRental(ctx *Context, l home.Layout, st *records.Store, skuName, requestedMachineName,
 	operationKey, reason string, hourlyRateUSDMicros, fleetCapUSDMicros int64,
-	deadline time.Time, managedRequestID string, acceptableWheelhouseManifestDigests []string,
+	deadline time.Time, managedRequestID string,
 ) (records.Rental, hub.Rental, bool, *exit.Error) {
 	return acquireRentalContext(context.Background(), ctx, l, st, skuName, requestedMachineName,
-		operationKey, reason, hourlyRateUSDMicros, fleetCapUSDMicros, deadline, managedRequestID,
-		acceptableWheelhouseManifestDigests)
+		operationKey, reason, hourlyRateUSDMicros, fleetCapUSDMicros, deadline, managedRequestID)
 }
 
 func acquireRentalContext(lifecycle context.Context, ctx *Context, l home.Layout,
 	st *records.Store, skuName, requestedMachineName, operationKey, reason string,
 	hourlyRateUSDMicros, fleetCapUSDMicros int64, deadline time.Time, managedRequestID string,
-	acceptableWheelhouseManifestDigests []string,
 ) (records.Rental, hub.Rental, bool, *exit.Error) {
 	c := client(ctx)
 	existing, e := st.RentalOperation(operationKey)
@@ -220,26 +217,8 @@ func acquireRentalContext(lifecycle context.Context, ctx *Context, l home.Layout
 	if existing != nil {
 		requestBody = append([]byte(nil), existing.RequestBody...)
 	} else {
-		if len(acceptableWheelhouseManifestDigests) == 0 {
-			if managedRequestID != "" {
-				return records.Rental{}, hub.Rental{}, false, exit.Named(exit.Conflict,
-					"rental.acceptable_base_manifests_missing",
-					"managed request %s has no pre-spend compatible base set", managedRequestID)
-			}
-			hctx, cancel := hub.Context()
-			active, problem := c.ActiveBaseManifests(hctx)
-			cancel()
-			if problem != nil {
-				return records.Rental{}, hub.Rental{}, false, problem
-			}
-			for _, base := range active {
-				acceptableWheelhouseManifestDigests = append(
-					acceptableWheelhouseManifestDigests, base.WheelhouseManifestDigest)
-			}
-			sort.Strings(acceptableWheelhouseManifestDigests)
-		}
 		requestBody, e = hub.RentalRequestBytes(skuName, secret.HashHex(token),
-			creator.PublicKey(), acceptableWheelhouseManifestDigests)
+			creator.PublicKey())
 		if e != nil {
 			return records.Rental{}, hub.Rental{}, false, e
 		}
@@ -260,8 +239,7 @@ func acquireRentalContext(lifecycle context.Context, ctx *Context, l home.Layout
 			"rental operation %s already names a different hub or request body", operationKey).
 			WithRemedy("reuse a key only for the exact same hub, GPU SKU, media token, and Creator key")
 	}
-	intent, e := hub.ParseRentalRequestBytes(op.RequestBody)
-	if e != nil {
+	if _, e := hub.ParseRentalRequestBytes(op.RequestBody); e != nil {
 		return records.Rental{}, hub.Rental{}, false, e
 	}
 	if !replay {
@@ -298,18 +276,6 @@ func acquireRentalContext(lifecycle context.Context, ctx *Context, l home.Layout
 		return records.Rental{}, hub.Rental{}, false, exit.Named(exit.Conflict, "rental.hourly_rate_changed",
 			"rental %s locked %d USD micros/hour, not catalog rate %d",
 			remote.ID, remote.HourlyRateUSDMicros, hourlyRateUSDMicros).
-			WithRemedy("Creator requested immediate release and retained the operation until Tensorhub proves absence")
-	}
-	if !containsString(intent.AcceptableWheelhouseManifestDigests,
-		remote.WheelhouseManifestDigest) {
-		_ = st.AdvanceRentalOperation(operationKey, remote.ID, hub.RentalReleaseRequested)
-		hctx, cancel := hub.Context()
-		_ = c.Release(hctx, remote.ID, "selected WheelhouseManifest was not accepted")
-		cancel()
-		return records.Rental{}, hub.Rental{}, false, exit.Named(exit.Conflict,
-			"rental.wheelhouse_manifest_unacceptable",
-			"rental %s selected WheelhouseManifest %s outside the persisted compatible set",
-			remote.ID, remote.WheelhouseManifestDigest).
 			WithRemedy("Creator requested immediate release and retained the operation until Tensorhub proves absence")
 	}
 	machineName := requestedMachineName

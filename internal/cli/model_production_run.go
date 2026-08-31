@@ -20,7 +20,6 @@ import (
 	"github.com/cozy-creator/cozy/internal/modelproduction"
 	"github.com/cozy-creator/cozy/internal/orchestrator"
 	"github.com/cozy-creator/cozy/internal/output"
-	"github.com/cozy-creator/cozy/internal/privatepackage"
 	"github.com/cozy-creator/cozy/internal/records"
 )
 
@@ -380,17 +379,10 @@ func ensureProductionRental(runCtx context.Context, ctx *Context, layout home.La
 	if problem = store.SelectModelProductionSKU(operation.ID, sku.Name); problem != nil {
 		return "", problem
 	}
-	var acceptableBases []string
-	if rentalOperation == nil {
-		acceptableBases, problem = productionAcceptableBases(runCtx, ctx, store, plan)
-		if problem != nil {
-			return "", problem
-		}
-	}
 	progress.RentalSelecting(sku.Name)
 	row, _, _, problem := acquireRentalContext(runCtx, ctx, layout, store, sku.Name, "",
 		operationKey, "cozy model publish "+plan.Destination,
-		rate, ctx.Cfg.RentalsMaxHourlySpendUSDMicros, time.Time{}, "", acceptableBases)
+		rate, ctx.Cfg.RentalsMaxHourlySpendUSDMicros, time.Time{}, "")
 	if problem != nil {
 		operation, readProblem := store.RentalOperation(operationKey)
 		if readProblem == nil && operation != nil {
@@ -410,88 +402,6 @@ func ensureProductionRental(runCtx context.Context, ctx *Context, layout home.La
 		return "", problem
 	}
 	return row.ID, nil
-}
-
-func productionAcceptableBases(runCtx context.Context, ctx *Context, store *records.Store,
-	plan modelproduction.Plan,
-) ([]string, *exit.Error) {
-	resolver := NewResolver(store, ctx.Cfg)
-	type packageSetKey struct {
-		Package, InstallID, Release, ReleaseDigest string
-	}
-	byPackage := map[packageSetKey][]string{}
-	var intersection []string
-	for _, pin := range plan.Jobs {
-		packageName, _, valid := splitProductionCallable(pin.Callable)
-		if !valid {
-			return nil, exit.Named(exit.Structural, "model_production_callable_invalid",
-				"production step %s has invalid callable %s", pin.Step, pin.Callable)
-		}
-		key := packageSetKey{Package: packageName, InstallID: pin.InstallID,
-			Release: pin.Release, ReleaseDigest: pin.ReleaseDigest}
-		accepted, ok := byPackage[key]
-		if !ok {
-			if pin.InstallID != "" {
-				unlock := privatepackage.Guard()
-				revision, compatible, problem := resolver.PreparePrivate(
-					runCtx, pin.InstallID, launch.PrivateModeledRuntimeFloor)
-				unlock()
-				if problem != nil {
-					return nil, problem
-				}
-				if revision.SourceDigest != pin.ReleaseDigest {
-					return nil, exit.Named(exit.Conflict, "model_production_package_changed",
-						"production step %s private package changed after plan acceptance", pin.Step)
-				}
-				accepted = compatible
-			} else {
-				ref, problem := hub.ParseRef(packageName)
-				if problem != nil {
-					return nil, problem
-				}
-				hctx, cancel := productionHubContext(runCtx)
-				detail, problem := resolver.catalog.PackageRelease(hctx, ref, pin.Release)
-				cancel()
-				if problem != nil {
-					return nil, problem
-				}
-				accepted, problem = resolver.preflightPublished(
-					ref, pin.Release, pin.ReleaseDigest, detail)
-				if problem != nil {
-					return nil, problem
-				}
-			}
-			byPackage[key] = append([]string(nil), accepted...)
-		}
-		if intersection == nil {
-			intersection = append([]string(nil), accepted...)
-		} else {
-			keep := intersection[:0]
-			left, right := 0, 0
-			for left < len(intersection) && right < len(accepted) {
-				switch {
-				case intersection[left] < accepted[right]:
-					left++
-				case intersection[left] > accepted[right]:
-					right++
-				default:
-					keep = append(keep, intersection[left])
-					left++
-					right++
-				}
-			}
-			intersection = keep
-		}
-		if len(intersection) == 0 {
-			return nil, exit.Named(exit.Conflict, "model_production.no_compatible_base",
-				"production packages share no active compatible WheelhouseManifest")
-		}
-	}
-	if len(intersection) == 0 {
-		return nil, exit.Named(exit.Conflict, "model_production.no_compatible_base",
-			"model production has no compatible base manifest")
-	}
-	return intersection, nil
 }
 
 func computeSM(capability string) (int64, error) {

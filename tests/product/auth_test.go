@@ -163,8 +163,7 @@ func TestEmailMachineLoginAndAutomaticReauthentication(t *testing.T) {
 	manager := accountauth.New(config.Config{Home: root, HubURL: server.URL})
 	hubClient := hub.New(config.Config{HubURL: server.URL}, "cozy-product-auth-test").WithTokenSource(manager)
 	requestBody, problem := hub.RentalRequestBytes("cpu", strings.Repeat("1", 64),
-		authBase64.EncodeToString(bytes.Repeat([]byte{1}, ed25519.PublicKeySize)),
-		[]string{"sha256:" + strings.Repeat("2", 64)})
+		authBase64.EncodeToString(bytes.Repeat([]byte{1}, ed25519.PublicKeySize)))
 	if problem != nil {
 		t.Fatal(problem)
 	}

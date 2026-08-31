@@ -32,7 +32,7 @@ func TestRentalRunAcquiresCheapestOnceAndReleasesFailedPreAttempt(t *testing.T) 
 	var mu sync.Mutex
 	var descriptor []byte
 	var descriptorDigest string
-	var activeManifestDigest string
+	activeManifestDigest := "sha256:" + strings.Repeat("a", 64)
 	var packageConfig, publishedWheel []byte
 	var publishedWheelFact wheel.Identity
 	var publishedWheelDigest string
@@ -164,24 +164,6 @@ func TestRentalRunAcquiresCheapestOnceAndReleasesFailedPreAttempt(t *testing.T) 
 				{"name": "h200", "accelerator_model": "H200", "compute_capability": "9.0", "vram_gb": 141, "minimum_ram_per_gpu_gb": 128, "price_usd_micros_per_hour": 6_000_000},
 				{"name": "cheap", "accelerator_model": "GPU C", "compute_capability": "8.9", "vram_gb": 24, "minimum_ram_per_gpu_gb": 32, "price_usd_micros_per_hour": 300_000},
 			})
-		case r.Method == http.MethodGet && r.URL.Path == "/v1/base-worker-manifests":
-			raw, err := os.ReadFile(filepath.Join(root, "active-base.json"))
-			if err != nil {
-				t.Error(err)
-				http.Error(w, "local base absent", http.StatusInternalServerError)
-				return
-			}
-			sum := sha256.Sum256(raw)
-			digest := "sha256:" + hex.EncodeToString(sum[:])
-			activeManifestDigest = digest
-			_ = json.NewEncoder(w).Encode([]map[string]any{{
-				"wheelhouse_manifest_digest": digest,
-				"wheelhouse_manifest":        json.RawMessage(raw),
-				"base_worker_image_digest":   digest,
-				"compatibility_profile":      map[string]any{},
-				"platform_target":            map[string]any{},
-				"activated_at":               "2026-08-31T00:00:00Z",
-			}})
 		case r.Method == http.MethodPost && r.URL.Path == "/v1/rentals":
 			posts++
 			createReason = r.Header.Get("X-Tensorhub-Reason")
@@ -342,11 +324,8 @@ func TestRentalRunAcquiresCheapestOnceAndReleasesFailedPreAttempt(t *testing.T) 
 	if request == nil || request.Worker != "pr-managed-e2e" || request.InstallID != local.ID ||
 		request.Release != "1.0.0" || request.PackageRevisionDigest != local.SourceDigest ||
 		request.PrivatePackageDigest == "" || len(request.Models) != 0 ||
-		len(request.AcceptableWheelhouseManifestDigests) != 1 ||
-		request.AcceptableWheelhouseManifestDigests[0] != activeManifestDigest ||
 		gotPosts != 1 || gotDeletes != 1 ||
-		body["sku"] != "cpu" || fmt.Sprint(body["acceptable_wheelhouse_manifest_digests"]) !=
-		"["+activeManifestDigest+"]" ||
+		body["sku"] != "cpu" ||
 		body["max_cost_usd_micros"] != nil || body["max_duration_seconds"] != nil {
 		t.Fatalf("managed lifecycle request=%+v posts=%d deletes=%d body=%v", request, gotPosts, gotDeletes, body)
 	}
@@ -520,8 +499,6 @@ func TestRentalRunAcquiresCheapestOnceAndReleasesFailedPreAttempt(t *testing.T) 
 	if request == nil || request.Worker != "pr-managed-job" || request.PlanID != jobDescriptorID || request.Kind != "job" ||
 		request.Release != "1.0.0" || request.PackageRevisionDigest != releaseDigest ||
 		request.JobGPUCount != 0 || len(request.Models) != 0 ||
-		len(request.AcceptableWheelhouseManifestDigests) != 1 ||
-		request.AcceptableWheelhouseManifestDigests[0] != activeManifestDigest ||
 		gotPosts != 1 || gotDeletes != 1 ||
 		body["sku"] != "cpu" ||
 		strings.Contains(fmt.Sprint(body), weightlessRef) || strings.Contains(fmt.Sprint(body), "tile_job") {
@@ -536,8 +513,8 @@ func TestRentalRunAcquiresCheapestOnceAndReleasesFailedPreAttempt(t *testing.T) 
 	if code != 1 || !strings.Contains(out, `pinned media certificate`) || gotPosts != 1 {
 		t.Fatalf("remote job replay purchased again [exit %d posts=%d]\n%s", code, gotPosts, out)
 	}
-	if packageDownloads != 1 {
-		t.Fatalf("published package preflight downloads=%d, want one exact resolution", packageDownloads)
+	if packageDownloads != 0 {
+		t.Fatalf("rental selection downloaded package files before worker attachment: %d", packageDownloads)
 	}
 	if loginBegins != 1 || loginFinishes != 1 {
 		t.Fatalf("daemon machine login exchanges = begin:%d finish:%d, want one each",

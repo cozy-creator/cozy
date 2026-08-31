@@ -9,7 +9,6 @@ import (
 	"net/http"
 	"net/url"
 	"regexp"
-	"sort"
 	"strings"
 
 	"github.com/cozy-creator/cozy/internal/exit"
@@ -29,8 +28,7 @@ import (
 //
 //	GET    /v1/rental-skus           -> [{name, accelerator_model, compute_capability,
 //	                                 vram_gb, price_usd_micros_per_hour}]
-//	POST   /v1/rentals               {sku, media_token_sha256:<64 hex>, creator_public_key,
-//	                                     acceptable_wheelhouse_manifest_digests:[...]}
+//	POST   /v1/rentals               {sku, media_token_sha256:<64 hex>, creator_public_key}
 //	                                 -> 202 {rental_id, state, ...}
 //	GET    /v1/rentals/{id}          -> {state, worker_address, cert_pem, media_address,
 //	                                     detail, worker_id, worker_boot_id,
@@ -158,40 +156,25 @@ func (w wireRental) rental() Rental {
 // datacenter, offer, image, cache volume, disk, and ports do not have fields
 // here: Tensorhub resolves and selects them.
 type RentalRequest struct {
-	AcceptableWheelhouseManifestDigests []string `json:"acceptable_wheelhouse_manifest_digests"`
-	MediaTokenSHA256                    string   `json:"media_token_sha256"`
-	CreatorPublicKey                    string   `json:"creator_public_key"`
-	SKU                                 string   `json:"sku"`
+	MediaTokenSHA256 string `json:"media_token_sha256"`
+	CreatorPublicKey string `json:"creator_public_key"`
+	SKU              string `json:"sku"`
 }
 
 // RentalRequestBytes authors the exact bytes persisted before POST and replayed
 // unchanged after response loss. There is one encoder, not a digest struct plus
 // a separately marshaled transport map that can drift.
-func RentalRequestBytes(sku, mediaTokenSHA256, creatorPublicKey string,
-	acceptableWheelhouseManifestDigests []string,
-) ([]byte, *exit.Error) {
+func RentalRequestBytes(sku, mediaTokenSHA256, creatorPublicKey string) ([]byte, *exit.Error) {
 	req := RentalRequest{
-		AcceptableWheelhouseManifestDigests: append([]string(nil),
-			acceptableWheelhouseManifestDigests...),
 		SKU:              strings.TrimSpace(sku),
 		MediaTokenSHA256: strings.TrimPrefix(strings.TrimSpace(mediaTokenSHA256), "sha256:"),
 		CreatorPublicKey: strings.TrimSpace(creatorPublicKey),
 	}
 	public, publicErr := base64.RawURLEncoding.DecodeString(req.CreatorPublicKey)
-	if req.SKU == "" || len(req.AcceptableWheelhouseManifestDigests) == 0 ||
-		len(req.AcceptableWheelhouseManifestDigests) > 32 ||
-		!sort.StringsAreSorted(req.AcceptableWheelhouseManifestDigests) ||
-		!bareSHA256Pattern.MatchString(req.MediaTokenSHA256) || publicErr != nil || len(public) != 32 {
+	if req.SKU == "" || !bareSHA256Pattern.MatchString(req.MediaTokenSHA256) ||
+		publicErr != nil || len(public) != 32 {
 		return nil, exit.Named(exit.Validation, "rental.intent_incomplete",
-			"sku, compatible base set, media token hash, and one Ed25519 Creator public key are required")
-	}
-	prior := ""
-	for _, digest := range req.AcceptableWheelhouseManifestDigests {
-		if digest == prior || !sha256IDPattern.MatchString(digest) {
-			return nil, exit.Named(exit.Validation, "rental.acceptable_base_manifests_invalid",
-				"acceptable base manifests must be sorted unique exact digests")
-		}
-		prior = digest
+			"sku, media token hash, and one Ed25519 Creator public key are required")
 	}
 	raw, err := json.Marshal(req)
 	if err != nil {
@@ -216,8 +199,7 @@ func ParseRentalRequestBytes(raw []byte) (RentalRequest, *exit.Error) {
 		return RentalRequest{}, exit.Named(exit.Conflict, "rental.intent_invalid",
 			"persisted rental intent has trailing data")
 	}
-	canonical, problem := RentalRequestBytes(req.SKU, req.MediaTokenSHA256,
-		req.CreatorPublicKey, req.AcceptableWheelhouseManifestDigests)
+	canonical, problem := RentalRequestBytes(req.SKU, req.MediaTokenSHA256, req.CreatorPublicKey)
 	if problem != nil || !bytes.Equal(canonical, raw) {
 		return RentalRequest{}, exit.Named(exit.Conflict, "rental.intent_invalid",
 			"persisted rental intent is not its exact canonical request")
