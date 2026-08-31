@@ -29,6 +29,14 @@ func preparePublished(l home.Layout, genDir, runtimeBin string, published *Publi
 	if runtimeBin == "" {
 		return nil, empty, "", nil, exit.Internalf("published install has no trusted host Runtime")
 	}
+	sourceDir := filepath.Join(genDir, "source")
+	if err := os.MkdirAll(sourceDir, 0o700); err != nil {
+		return nil, empty, "", nil, exit.Internalf("cannot create package metadata directory: %s", err)
+	}
+	if err := os.WriteFile(filepath.Join(sourceDir, "package.toml"),
+		published.PackageConfig.Bytes, 0o400); err != nil {
+		return nil, empty, "", nil, exit.Internalf("cannot retain exact package.toml: %s", err)
+	}
 	cache := filepath.Join(genDir, "artifact-cache")
 	setDir := filepath.Join(cache, "sets", "package")
 	if err := os.MkdirAll(setDir, 0o700); err != nil {
