@@ -57,7 +57,7 @@
 //!                                            verified refs -> canonical header + manifest
 //!   tfs checkpoint caps                      whole-document total caps, armed live
 //!   tfs checkpoint size [n]                  uniform-form header cost at H3 cardinality
-//!   tfs ingest source-plan --carrier <path>... --registry <registry.json>
+//!   tfs ingest source-plan --carrier <path>... [--registry <operator-registry.json>]
 //!
 //! Reads and projection (tfs-005). Flags: --workers <n> --window <b> --ring <b>
 //! --hold-secs <s> --drop-unreleased --no-symlink

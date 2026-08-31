@@ -134,7 +134,7 @@ tfs ingest bank <dialect> <family> <variant> <converter> \
   [--member <component>=<canonical-provider-member>]... --order <order.json>
 
 tfs ingest source-plan --carrier [<reviewed-member>=]<path>... \
-  --registry <registry.json> --out <source-plan.json>
+  --out <source-plan.json>
 tfs ingest plan --source-plan <source-plan.json>
 tfs ingest run <store> --source-plan <source-plan.json>
 ```
@@ -147,14 +147,19 @@ carriers             [{path, member?}]
 construction_order   [[component, canonical-output-key], ...]
 converter            reviewed converter name
 profile              reviewed source-profile name
-registry_path        absolute registry location
+registry             builtin:fingerprint-registry/1, or an operator-test path
 registry_sha256      digest of the exact reviewed registry bytes
 session              deterministic ingest session
 sources              [{component, path, projected, source_member?}]
 target               component=encoding,...
 ```
 
-The plan/run consumers do not trust or reinterpret these asserted fields. They re-read the
+The reviewed product registry is compiled into `tfs`; users do not configure or download it. The
+explicit `--registry` flag remains only for platform review and tests. A provider may present a
+superset of candidate headers. TensorFS selects one exact reviewed subset and refuses if zero or
+multiple profile assignments survive, so adapters never choose a variant by filename.
+
+The plan/run consumers do not trust or reinterpret the asserted fields. They re-read the
 unlabelled carrier headers and exact registry, reproduce the unique source plan byte-for-byte, then
 feed its sources, target, order, and session through the existing `prepare`/isolated worker path.
 Editing a plan, changing carrier bytes or registry bytes, omitting an input, or supplying an

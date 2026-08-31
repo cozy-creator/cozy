@@ -195,27 +195,58 @@ fn read_carrier(p: &Path) -> tensorfs_core::err::Result<(SourceHeader, Vec<u8>)>
     Ok((h, raw))
 }
 
-fn registry_path(f: &Flags) -> PathBuf {
-    PathBuf::from(flag(f, "registry").unwrap_or("vectors/fingerprints/registry.json"))
+const BUILTIN_REGISTRY: &str = "builtin:fingerprint-registry/1";
+const BUILTIN_REGISTRY_BYTES: &[u8] =
+    include_bytes!("../../../../../vectors/fingerprints/registry.json");
+
+fn registry_bytes(f: &Flags) -> Result<(String, Vec<u8>), ExitCode> {
+    let Some(path) = flag(f, "registry") else {
+        return Ok((
+            BUILTIN_REGISTRY.to_string(),
+            BUILTIN_REGISTRY_BYTES.to_vec(),
+        ));
+    };
+    let path = match fs::canonicalize(path) {
+        Ok(path) => path,
+        Err(error) => {
+            eprintln!("REFUSED IO_FAILED: resolve source registry {path}: {error}");
+            return Err(ExitCode::FAILURE);
+        }
+    };
+    match fs::read(&path) {
+        Ok(bytes) => Ok((path.to_string_lossy().to_string(), bytes)),
+        Err(error) => {
+            eprintln!(
+                "REFUSED IO_FAILED: read source registry {}: {error}",
+                path.display()
+            );
+            Err(ExitCode::FAILURE)
+        }
+    }
+}
+
+fn registry_bytes_at(locator: &str) -> Result<Vec<u8>, ExitCode> {
+    if locator == BUILTIN_REGISTRY {
+        return Ok(BUILTIN_REGISTRY_BYTES.to_vec());
+    }
+    match fs::read(locator) {
+        Ok(bytes) => Ok(bytes),
+        Err(error) => {
+            eprintln!("REFUSED IO_FAILED: read source registry {locator}: {error}");
+            Err(ExitCode::FAILURE)
+        }
+    }
 }
 
 fn load_registry(f: &Flags) -> Result<FingerprintRegistry, ExitCode> {
-    let p = registry_path(f);
-    match fs::read(&p) {
-        Ok(b) => match FingerprintRegistry::parse(&b) {
-            Ok(r) => Ok(r),
-            Err(e) => {
-                eprintln!("REFUSED {}: {}: {}", e.code.as_str(), p.display(), e.detail);
-                Err(ExitCode::FAILURE)
-            }
-        },
-        // An ABSENT registry is not an empty one: an empty registry would authorize by
-        // silence. It refuses, and says how to fill it.
-        Err(_) => {
+    let (locator, bytes) = registry_bytes(f)?;
+    match FingerprintRegistry::parse(&bytes) {
+        Ok(registry) => Ok(registry),
+        Err(error) => {
             eprintln!(
-                "REFUSED UNREGISTERED_FINGERPRINT: no reviewed registry at {} — \
-                 bank one with `tfs ingest bank` before any carrier can be authorized",
-                p.display()
+                "REFUSED {}: {locator}: {}",
+                error.code.as_str(),
+                error.detail
             );
             Err(ExitCode::FAILURE)
         }
@@ -496,7 +527,14 @@ pub fn cmd_bank(
         );
         return ExitCode::FAILURE;
     }
-    let p = registry_path(f);
+    let Some(path) = flag(f, "registry") else {
+        eprintln!(
+            "REFUSED MISSING_FIELD: ingest bank requires an explicit --registry output; \
+             the product registry is compiled into tfs"
+        );
+        return ExitCode::FAILURE;
+    };
+    let p = PathBuf::from(path);
     let mut reg = match fs::read(&p) {
         Ok(b) => ok!(FingerprintRegistry::parse(&b)),
         Err(_) => FingerprintRegistry::default(),
@@ -702,9 +740,10 @@ fn enumerate_assignments(
         return;
     }
     if index == candidates.len() {
-        if uses.iter().all(|used| *used != CarrierUse::Unused) {
-            solutions.push(current.clone());
-        }
+        // Provider metadata may offer several variants. Classification chooses the one exact
+        // reviewed subset; forcing every candidate into the result would make the provider
+        // adapter guess by filename before TensorFS has examined the headers.
+        solutions.push(current.clone());
         return;
     }
     for (carrier, projected) in &candidates[index] {
@@ -793,23 +832,7 @@ fn profile_assignments(
 /// classification fact. If two assignments survive, no tie-break exists here.
 fn derive_source_plan(f: &Flags) -> Result<Value, ExitCode> {
     let paths = carriers(f)?;
-    let registry_path = match fs::canonicalize(registry_path(f)) {
-        Ok(path) => path,
-        Err(error) => {
-            eprintln!("REFUSED IO_FAILED: resolve source-plan registry: {error}");
-            return Err(ExitCode::FAILURE);
-        }
-    };
-    let registry_bytes = match fs::read(&registry_path) {
-        Ok(bytes) => bytes,
-        Err(error) => {
-            eprintln!(
-                "REFUSED IO_FAILED: read source-plan registry {}: {error}",
-                registry_path.display()
-            );
-            return Err(ExitCode::FAILURE);
-        }
-    };
+    let (registry_locator, registry_bytes) = registry_bytes(f)?;
     let registry = match FingerprintRegistry::parse(&registry_bytes) {
         Ok(registry) => registry,
         Err(error) => return Err(bail(error)),
@@ -947,10 +970,7 @@ fn derive_source_plan(f: &Flags) -> Result<Value, ExitCode> {
         ("construction_order", Value::arr(order_values)),
         ("converter", Value::str(prepared.plan.converter.clone())),
         ("profile", Value::str(profile.name.clone())),
-        (
-            "registry_path",
-            Value::str(registry_path.to_string_lossy().to_string()),
-        ),
+        ("registry", Value::str(registry_locator)),
         (
             "registry_sha256",
             Value::str(format!(
@@ -983,7 +1003,7 @@ pub fn cmd_source_plan(f: &Flags) -> ExitCode {
 struct ClosedSourcePlan {
     converter: String,
     order: Vec<(String, String)>,
-    registry: PathBuf,
+    registry: String,
     session: String,
     sources: Vec<(String, PathBuf)>,
     target: String,
@@ -1064,8 +1084,8 @@ fn read_closed_source_plan(path: &Path) -> Result<ClosedSourcePlan, ExitCode> {
         Ok(value) => value,
         Err(error) => return Err(bail(error)),
     };
-    let registry = match fields.req_str("registry_path") {
-        Ok(value) => PathBuf::from(value),
+    let registry = match fields.req_str("registry") {
+        Ok(value) => value.to_string(),
         Err(error) => return Err(bail(error)),
     };
     let _registry_sha256 = match fields.req_str("registry_sha256") {
@@ -1118,10 +1138,10 @@ fn read_closed_source_plan(path: &Path) -> Result<ClosedSourcePlan, ExitCode> {
 
     // Re-derive from carrier headers, reviewed member labels, and the exact registry.
     // This is what prevents an edited plan from assigning equal headers by hand.
-    let mut derive_flags = vec![(
-        "registry".to_string(),
-        registry.to_string_lossy().to_string(),
-    )];
+    let mut derive_flags = Vec::new();
+    if registry != BUILTIN_REGISTRY {
+        derive_flags.push(("registry".to_string(), registry.clone()));
+    }
     for carrier in &carriers {
         let path = carrier.path.to_string_lossy();
         derive_flags.push((
@@ -1153,24 +1173,15 @@ fn prepare_closed_source_plan(
     path: &Path,
 ) -> Result<(ClosedSourcePlan, Prepared, Flags), ExitCode> {
     let closed = read_closed_source_plan(path)?;
-    let registry_bytes = match fs::read(&closed.registry) {
-        Ok(bytes) => bytes,
-        Err(error) => {
-            eprintln!(
-                "REFUSED IO_FAILED: read source plan registry {}: {error}",
-                closed.registry.display()
-            );
-            return Err(ExitCode::FAILURE);
-        }
-    };
+    let registry_bytes = registry_bytes_at(&closed.registry)?;
     let registry = match FingerprintRegistry::parse(&registry_bytes) {
         Ok(registry) => registry,
         Err(error) => return Err(bail(error)),
     };
-    let mut flags = vec![(
-        "registry".to_string(),
-        closed.registry.to_string_lossy().to_string(),
-    )];
+    let mut flags = Vec::new();
+    if closed.registry != BUILTIN_REGISTRY {
+        flags.push(("registry".to_string(), closed.registry.clone()));
+    }
     for (component, source) in &closed.sources {
         flags.push((
             "source".to_string(),

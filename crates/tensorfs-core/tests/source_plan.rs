@@ -252,6 +252,63 @@ fn source_plan_maps_reviewed_multi_file_headers_independent_of_argument_order() 
 }
 
 #[test]
+fn source_plan_selects_a_unique_reviewed_subset_from_provider_candidates() {
+    let root = temporary("candidate-subset");
+    fs::create_dir_all(&root).unwrap();
+    let first = root.join("first.bin");
+    let second = root.join("second.bin");
+    let unrelated = root.join("unrelated.bin");
+    let registry = root.join("registry.json");
+    let order_path = root.join("order.json");
+    carrier(&first, &["weight"]);
+    carrier(&second, &["bias"]);
+    carrier(&unrelated, &["other"]);
+    order(&order_path, &[("encoder", "weight"), ("decoder", "bias")]);
+    bank(
+        &registry,
+        "candidate-subset",
+        "diffusers.identity/1",
+        "safetensors.diffusers",
+        &[("encoder", &first), ("decoder", &second)],
+        &[],
+        &order_path,
+    );
+
+    let output = source_plan(&registry, &[&unrelated, &second, &first]);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let text = String::from_utf8(output.stdout).unwrap();
+    assert_eq!(text.matches(first.to_str().unwrap()).count(), 2);
+    assert_eq!(text.matches(second.to_str().unwrap()).count(), 2);
+    assert_eq!(text.matches(unrelated.to_str().unwrap()).count(), 1);
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn source_plan_uses_the_compiled_product_registry_by_default() {
+    let root = temporary("compiled-registry");
+    fs::create_dir_all(&root).unwrap();
+    let unknown = root.join("unknown.bin");
+    carrier(&unknown, &["not.a.reviewed.model.weight"]);
+    let output = Command::new(env!("CARGO_BIN_EXE_tfs"))
+        .args(["ingest", "source-plan", "--carrier"])
+        .arg(&unknown)
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    let error = String::from_utf8(output.stderr).unwrap();
+    assert!(
+        error.contains("matches no reviewed source profile"),
+        "{error}"
+    );
+    assert!(!error.contains("no reviewed registry"), "{error}");
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
 fn source_plan_refuses_identical_header_component_permutations() {
     let root = temporary("ambiguous");
     fs::create_dir_all(&root).unwrap();
@@ -341,5 +398,70 @@ fn reviewed_members_resolve_identical_headers_and_missing_members_refuse() {
     assert!(
         String::from_utf8_lossy(&unreviewed.stderr).contains("matches no reviewed source profile")
     );
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn provider_bound_and_local_profiles_do_not_steal_each_others_candidates() {
+    let root = temporary("provider-local-split");
+    fs::create_dir_all(&root).unwrap();
+    let first = root.join("first.bin");
+    let second = root.join("second.bin");
+    let registry = root.join("registry.json");
+    let order_path = root.join("order.json");
+    carrier(&first, &["weight"]);
+    carrier(&second, &["bias"]);
+    order(&order_path, &[("encoder", "weight"), ("decoder", "bias")]);
+    bank(
+        &registry,
+        "provider-bound",
+        "diffusers.identity/1",
+        "safetensors.diffusers",
+        &[("encoder", &first), ("decoder", &second)],
+        &[
+            ("encoder", "provider/encoder"),
+            ("decoder", "provider/decoder"),
+        ],
+        &order_path,
+    );
+    bank(
+        &registry,
+        "local-unlabelled",
+        "diffusers.identity/1",
+        "safetensors.diffusers",
+        &[("encoder", &first), ("decoder", &second)],
+        &[],
+        &order_path,
+    );
+
+    let provider = Command::new(env!("CARGO_BIN_EXE_tfs"))
+        .args(["ingest", "source-plan", "--registry"])
+        .arg(&registry)
+        .args([
+            "--carrier",
+            &format!("provider/encoder={}", first.display()),
+        ])
+        .args([
+            "--carrier",
+            &format!("provider/decoder={}", second.display()),
+        ])
+        .output()
+        .unwrap();
+    assert!(provider.status.success());
+    assert!(String::from_utf8_lossy(&provider.stdout).contains(r#""profile":"provider-bound""#));
+
+    let local = source_plan(&registry, &[&first, &second]);
+    assert!(local.status.success());
+    assert!(String::from_utf8_lossy(&local.stdout).contains(r#""profile":"local-unlabelled""#));
+
+    let foreign = Command::new(env!("CARGO_BIN_EXE_tfs"))
+        .args(["ingest", "source-plan", "--registry"])
+        .arg(&registry)
+        .args(["--carrier", &format!("other/encoder={}", first.display())])
+        .args(["--carrier", &format!("other/decoder={}", second.display())])
+        .output()
+        .unwrap();
+    assert!(!foreign.status.success());
+    assert!(String::from_utf8_lossy(&foreign.stderr).contains("matches no reviewed source profile"));
     let _ = fs::remove_dir_all(root);
 }
