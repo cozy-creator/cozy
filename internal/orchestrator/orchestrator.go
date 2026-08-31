@@ -764,6 +764,9 @@ func (c *Orchestrator) CancelQueued(requestID string) *exit.Error {
 	c.logf("%s left the dispatch queue: canceled before any attempt", requestID)
 	c.signalClosed(requestWaitKey(requestID),
 		exit.New(exit.Canceled, "%s was canceled before any attempt was dispatched", requestID))
+	// If this was the FIFO head, the next request inherits the scheduling question now;
+	// it must not wait for an unrelated worker report merely because the old head left.
+	c.reviveQueue()
 	return nil
 }
 

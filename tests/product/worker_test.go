@@ -5,6 +5,7 @@ import (
 	"encoding/hex"
 	"fmt"
 	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
@@ -35,6 +36,50 @@ func (l fixedLauncher) ResolveJob(string, string) (orchestrator.WorkerLaunchSpec
 }
 func (l fixedLauncher) ResolveJobInstall(string, string) (orchestrator.WorkerLaunchSpec, *exit.Error) {
 	return l.spec, nil
+}
+
+type packageLauncher map[string]orchestrator.WorkerLaunchSpec
+
+func (l packageLauncher) resolve(pkg string) (orchestrator.WorkerLaunchSpec, *exit.Error) {
+	if spec, ok := l[pkg]; ok {
+		return spec, nil
+	}
+	return orchestrator.WorkerLaunchSpec{}, exit.New(exit.NotFound, "no fake package %s", pkg)
+}
+func (l packageLauncher) ResolvePlacement(pkg string) (orchestrator.DesiredPlacement, *exit.Error) {
+	spec, problem := l.resolve(pkg)
+	return spec.Placement, problem
+}
+func (l packageLauncher) Resolve(pkg string) (orchestrator.WorkerLaunchSpec, *exit.Error) {
+	return l.resolve(pkg)
+}
+func (l packageLauncher) ResolveInstall(string) (orchestrator.WorkerLaunchSpec, *exit.Error) {
+	return orchestrator.WorkerLaunchSpec{}, exit.New(exit.NotFound, "no fake install")
+}
+func (l packageLauncher) ResolveLogicalInstall(string, string) (orchestrator.LogicalPackage, *exit.Error) {
+	return orchestrator.LogicalPackage{}, exit.New(exit.NotFound, "no fake logical install")
+}
+func (l packageLauncher) ResolveJob(pkg, _ string) (orchestrator.WorkerLaunchSpec, *exit.Error) {
+	return l.resolve(pkg)
+}
+func (l packageLauncher) ResolveJobInstall(string, string) (orchestrator.WorkerLaunchSpec, *exit.Error) {
+	return orchestrator.WorkerLaunchSpec{}, exit.New(exit.NotFound, "no fake job install")
+}
+
+func waitRequest(t *testing.T, o *owner, requestID, state string, timeout time.Duration) *records.Request {
+	t.Helper()
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		row, problem := o.store.RequestRow(requestID)
+		fatal(t, problem)
+		if row != nil && row.State == state {
+			return row
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	row, _ := o.store.RequestRow(requestID)
+	t.Fatalf("request %s did not reach %s: %#v", requestID, state, row)
+	return nil
 }
 
 func TestProgressWatchOpensAfterSnapshotBarrier(t *testing.T) {
@@ -96,6 +141,111 @@ func TestPackageScopedUnloadPreservesUnrelatedWarmWorker(t *testing.T) {
 	}
 	if worker := o.c.Worker(currentID); worker == nil || worker.Package != "fake/editable-left" {
 		t.Fatalf("scoped unload evicted the current editable generation: %#v", worker)
+	}
+}
+
+func TestDeviceEnvelopePressureWaitsThenReclaimsIdleHolder(t *testing.T) {
+	root := filepath.Join(os.TempDir(), "cozy-product-test", "device-envelope-wait")
+	holder := fakeSpec("envelope-holder", "0", "--arm", "delayed-output", "--cozy-home", root)
+	waiter := fakeSpec("envelope-waiter", "0", "--arm", "delayed-output", "--cozy-home", root)
+	o := hostOwnerWithLauncher(t, "device-envelope-wait", packageLauncher{
+		holder.Placement.Package: holder,
+		waiter.Placement.Package: waiter,
+	})
+
+	holderInstance, _, problem := o.c.EnsureWorker(holder)
+	fatal(t, problem)
+	fatal(t, o.c.EnsurePlacementReady(holderInstance, planIDOf(t, holder)))
+	holderRequest, holderAttempt, problem := o.c.Submit(submission(
+		planIDOf(t, holder), holder.Placement.Package, "device-holder-active", map[string]any{"n": 1}))
+	fatal(t, problem)
+	fatal(t, o.c.AwaitAccepted(holderRequest, holderAttempt, 5*time.Second))
+
+	waiterRequest, waiterAttempt, problem := o.c.Submit(submission(
+		planIDOf(t, waiter), waiter.Placement.Package, "device-waiter-queued", map[string]any{"n": 2}))
+	fatal(t, problem)
+	if waiterAttempt != 0 {
+		t.Fatalf("device waiter received attempt %d while the holder was active", waiterAttempt)
+	}
+	if _, ok := waitEvent(o, waiterRequest+" remains QUEUED for the local device envelope", 2*time.Second); !ok {
+		t.Fatal("the device waiter did not remain queued behind the active holder")
+	}
+	if row := waitRequest(t, o, holderRequest, "dispatching", time.Second); row.Ordinal != 1 {
+		t.Fatalf("active holder changed while the waiter queued: %#v", row)
+	}
+	if row := waitRequest(t, o, waiterRequest, "submitted", time.Second); row.Ordinal != 0 {
+		t.Fatalf("device waiter minted work before capacity existed: %#v", row)
+	}
+	if current := o.c.Worker(holderInstance); current == nil || current.Package != holder.Placement.Package {
+		t.Fatalf("active holder was preempted under pressure: %#v", current)
+	}
+	if attempts, readProblem := o.store.Attempts(waiterRequest); readProblem != nil || len(attempts) != 0 {
+		t.Fatalf("queued waiter has attempts before capacity: %#v (%v)", attempts, readProblem)
+	}
+	// A later request for the holder's package owns only its FIFO position. It must not
+	// make the holder look active after the current attempt ends and deadlock the waiter
+	// ahead of it.
+	followerRequest, followerAttempt, problem := o.c.Submit(submission(
+		planIDOf(t, holder), holder.Placement.Package, "device-holder-follower", map[string]any{"n": 3}))
+	fatal(t, problem)
+	if followerAttempt != 0 {
+		t.Fatalf("same-package follower overtook the envelope waiter as attempt %d", followerAttempt)
+	}
+
+	if result, problem := o.c.AwaitSettled(holderRequest, 10*time.Second); problem != nil || result.Status != "SUCCEEDED" {
+		t.Fatalf("holder did not finish normally: %#v (%v)", result, problem)
+	}
+	if result, problem := o.c.AwaitSettled(waiterRequest, 10*time.Second); problem != nil || result.Status != "SUCCEEDED" {
+		t.Fatalf("waiter did not run after the holder became idle: %#v (%v)", result, problem)
+	}
+	if result, problem := o.c.AwaitSettled(followerRequest, 10*time.Second); problem != nil || result.Status != "SUCCEEDED" {
+		t.Fatalf("same-package follower did not run after the FIFO waiter: %#v (%v)", result, problem)
+	}
+	if countEvents(o, waiterRequest+" FAILED before any offer") != 0 {
+		t.Fatal("device pressure was rendered as a terminal failure")
+	}
+}
+
+func TestOneSlotWorkerQueuesSamePackageAndCancellation(t *testing.T) {
+	root := filepath.Join(os.TempDir(), "cozy-product-test", "one-slot-fifo")
+	spec := fakeSpec("one-slot", "0", "--arm", "delayed-output", "--cozy-home", root)
+	o := hostOwnerWithLauncher(t, "one-slot-fifo", packageLauncher{spec.Placement.Package: spec})
+	instance, _, problem := o.c.EnsureWorker(spec)
+	fatal(t, problem)
+	fatal(t, o.c.EnsurePlacementReady(instance, planIDOf(t, spec)))
+
+	first, attempt, problem := o.c.Submit(submission(
+		planIDOf(t, spec), spec.Placement.Package, "one-slot-0", map[string]any{"n": 0}))
+	fatal(t, problem)
+	fatal(t, o.c.AwaitAccepted(first, attempt, 5*time.Second))
+	waiting := make([]string, 3)
+	for i := range waiting {
+		waiting[i], attempt, problem = o.c.Submit(submission(
+			planIDOf(t, spec), spec.Placement.Package, fmt.Sprintf("one-slot-%d", i+1),
+			map[string]any{"n": i + 1}))
+		fatal(t, problem)
+		if attempt != 0 {
+			t.Fatalf("queued request %d received attempt %d", i, attempt)
+		}
+		waitRequest(t, o, waiting[i], "submitted", time.Second)
+	}
+	if workers, readProblem := o.store.LiveWorkers(); readProblem != nil || len(workers) != 1 {
+		t.Fatalf("same-package queue acquired duplicate workers: %#v (%v)", workers, readProblem)
+	}
+
+	// Cancel the FIFO head while it has no attempt. The following request must inherit
+	// the queue head and still execute when this one-slot worker reports capacity again.
+	fatal(t, o.c.CancelQueued(waiting[0]))
+	waitRequest(t, o, waiting[0], "canceled", time.Second)
+	if attempts, readProblem := o.store.Attempts(waiting[0]); readProblem != nil || len(attempts) != 0 {
+		t.Fatalf("canceled queued request acquired an attempt: %#v (%v)", attempts, readProblem)
+	}
+
+	for _, requestID := range append([]string{first}, waiting[1:]...) {
+		result, settleProblem := o.c.AwaitSettled(requestID, 10*time.Second)
+		if settleProblem != nil || result.Status != "SUCCEEDED" || result.Attempt != 1 {
+			t.Fatalf("%s did not execute exactly once: %#v (%v)", requestID, result, settleProblem)
+		}
 	}
 }
 

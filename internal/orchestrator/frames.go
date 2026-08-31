@@ -372,9 +372,16 @@ func (c *Orchestrator) onObserved(s *session, r *pb.ObservedWorkerState) {
 				f.Subject, f.Reason, f.Detail)
 		}
 	}
-	// DISPATCHABLE is the only state that can change the queue's answer.
+	// DISPATCHABLE is the only state that can change the queue's answer. A free local
+	// seat also re-asks the FIFO head's residency question: the head may name a different
+	// package whose launch was parked while this worker held the same device envelope.
+	// `selectOrStart` still passes through the durable holder and idle-worker fences, so a
+	// report can wake scheduling but can never authorize preemption by itself.
 	if status != nil && status.Serving == pb.ServingState_SERVING_STATE_DISPATCHABLE {
 		go c.drain()
+		if r.AvailableAttemptSlots > 0 {
+			go c.reviveQueue()
+		}
 	} else if w != nil && w.spec.IsJob() && r.GetJobCapacity().GetJobsAvailable() > 0 {
 		go c.drain()
 	}

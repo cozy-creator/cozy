@@ -1695,7 +1695,19 @@ func (c *Orchestrator) idleLocalWorkerLocked(w *worker, active []records.Request
 		}
 	}
 	for _, req := range active {
-		if req.Worker == "" && staged(w, req.PlanID) {
+		// Submitted/queued requests own a FIFO position, not this worker. Counting a
+		// same-package request behind a different-package head as active would protect
+		// the current holder forever while FIFO prevents that later request dispatching.
+		if req.State != "dispatching" && req.State != "requeue_pending" {
+			continue
+		}
+		// Binding-plan digests are content identities, not package identities. Two
+		// packages can legitimately expose byte-identical bindings; treating the plan
+		// digest alone as ownership made a queued package B protect package A's idle
+		// worker from eviction. Match the local package slot and immutable install too.
+		if req.Worker == "" && req.Package == w.spec.Placement.Package &&
+			(req.InstallID == "" || req.InstallID == w.spec.Placement.InstallID) &&
+			staged(w, req.PlanID) {
 			return false
 		}
 	}

@@ -127,13 +127,17 @@ func (f *fakeControl) Control(stream pb.WorkerControl_ControlServer) error {
 	observed := func(revision uint64, placementID string, setDigest []byte, planIDs []string,
 		packageRevision, environmentDigest, configDigest string,
 	) {
+		availableSlots := uint32(2)
+		if f.arm == "delayed-output" {
+			availableSlots = 1
+		}
 		r := &pb.ObservedWorkerState{
 			AcceptedDesiredStateRevision: revision, ConvergedRevision: revision,
 			AcceptedPlacementSetDigest: setDigest,
 			WorkerPhase:                pb.WorkerPhase_WORKER_PHASE_ONLINE,
 			AppliedWireMinor:           pb.WireMinor,
 			AdmissionState:             pb.AdmissionState_ADMISSION_STATE_OPEN,
-			AdmissionGeneration:        admissionGeneration, AvailableAttemptSlots: 2,
+			AdmissionGeneration:        admissionGeneration, AvailableAttemptSlots: availableSlots,
 		}
 		if placementID != "" {
 			var bindingDigests [][]byte
@@ -167,6 +171,10 @@ func (f *fakeControl) Control(stream pb.WorkerControl_ControlServer) error {
 	}
 
 	var dropAck *pb.AttemptOutcome
+	var currentRevision uint64
+	var currentPlacementID, currentPackageRevision, currentEnvironmentDigest, currentConfigDigest string
+	var currentSetDigest []byte
+	var currentPlanIDs []string
 	for {
 		frame, err := stream.Recv()
 		if err != nil {
@@ -220,6 +228,12 @@ func (f *fakeControl) Control(stream pb.WorkerControl_ControlServer) error {
 			}
 			f.say("DesiredWorkerState revision=%d placement=%s plans=%d", d.Revision,
 				placementID, len(planIDs))
+			currentRevision, currentPlacementID = d.Revision, placementID
+			currentSetDigest = append(currentSetDigest[:0], setDigest...)
+			currentPlanIDs = append(currentPlanIDs[:0], planIDs...)
+			currentPackageRevision = packageRevision
+			currentEnvironmentDigest = environmentDigest
+			currentConfigDigest = configDigest
 			observed(d.Revision, placementID, setDigest, planIDs,
 				packageRevision, environmentDigest, configDigest)
 		case *pb.RecordOwnerFrame_AttemptOffer:
@@ -258,6 +272,9 @@ func (f *fakeControl) Control(stream pb.WorkerControl_ControlServer) error {
 				dropAck = f.outcomeWithOutput(outcome, offer)
 			case "output":
 				f.outcomeWithOutput(outcome, offer)
+			case "delayed-output":
+				time.Sleep(500 * time.Millisecond)
+				f.outcomeWithOutput(outcome, offer)
 			case "missing-output":
 				t, _ := authorOutcome(offer.RequestId, offer.AttemptOrdinal,
 					offer.InvocationSpecDigest, pb.OutcomeStatus_OUTCOME_STATUS_SUCCEEDED,
@@ -280,6 +297,10 @@ func (f *fakeControl) Control(stream pb.WorkerControl_ControlServer) error {
 				outcome(dropAck)
 				dropAck = nil
 				go func() { time.Sleep(3 * time.Second); os.Exit(0) }()
+			}
+			if f.arm == "delayed-output" {
+				observed(currentRevision, currentPlacementID, currentSetDigest, currentPlanIDs,
+					currentPackageRevision, currentEnvironmentDigest, currentConfigDigest)
 			}
 		case *pb.RecordOwnerFrame_CancelAttempt:
 			f.say("CancelAttempt %s#%d", m.CancelAttempt.RequestId, m.CancelAttempt.AttemptOrdinal)

@@ -509,6 +509,16 @@ func (c *Orchestrator) selectOrStart(req records.Request) {
 		instance, change, e := c.EnsureWorker(spec)
 		if e != nil {
 			done()
+			// A local device grant held by another package is CAPACITY PRESSURE, not a
+			// verdict on this request. The holder may still be executing (and must never
+			// be preempted), or it may be between the terminal and the report that proves
+			// it idle. Keep the durable request on the queue; a later idle-capacity report
+			// re-enters select-or-start and the existing LRU safety fence decides whether
+			// the holder can be reclaimed.
+			if e.ErrName() == "device_envelope_held" {
+				c.logf("%s remains QUEUED for the local device envelope: %s", req.ID, e.Message)
+				return
+			}
 			c.failQueued(req.ID, autoRentalGate(req, e))
 			return
 		}
