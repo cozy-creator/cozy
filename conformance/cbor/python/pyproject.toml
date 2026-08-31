@@ -1,7 +1,7 @@
 [project]
 name = "cozytensors-cbor-conformance"
 version = "0.0.0"
-requires-python = ">=3.14,<3.15"
+requires-python = ">=3.12,<3.13"
 dependencies = ["cbor2==6.1.4"]
 
 [tool.uv]
