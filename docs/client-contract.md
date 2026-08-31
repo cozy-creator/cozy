@@ -64,8 +64,9 @@ the idempotency digest because it selects where the same work runs, not what the
 A new rental is generic empty capacity and becomes attachable when Tensorhub publishes its
 pinned worker location. One exact weightless package release may then be queued as a signed logical
 `package_set`. The worker's existing observed-state stream supplies the derived placement and sole
-dispatchable binding digest; Creator never substitutes a locally reconstructed platform
-qualification or PlacementSet. Model-bound packages remain deferred.
+dispatchable binding digest plus exact release/environment/config identities. Tensorhub's immutable
+release detail supplies the verified request/result descriptor; Creator never substitutes a locally
+reconstructed platform qualification or PlacementSet. Model-bound packages remain deferred.
 
 `max_cost_usd_micros` is the exact non-negative automatic-rental authorization behind CLI
 `--max-cost <decimal USD>`. Zero or absence forbids paid acquisition. It is mutually exclusive

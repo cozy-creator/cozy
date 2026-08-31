@@ -931,7 +931,7 @@ func invocationTarget(ctx *Context) (Target, *launch.PackageDescriptor, *exit.Er
 			return Target{}, nil, problem.WithRemedy(
 				"install the exact release metadata locally until Tensorhub release detail supplies the descriptor")
 		}
-		descriptor, problem := launch.ReadDescriptor(launch.DescriptorPath(install.Dir), install.PackageDescriptor)
+		descriptor, problem := publishedPackageDescriptor(client(ctx), install)
 		if problem != nil {
 			return Target{}, nil, problem
 		}

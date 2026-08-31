@@ -325,7 +325,7 @@ func (s *Server) resolvePlan(sub Submission) (orchestrator.Submission, *exit.Err
 			return out, exit.Named(exit.Conflict, "install_package_mismatch",
 				"install %s serves %s, not %s", sub.InstallID, logical.Package, sub.Package)
 		}
-		entrypoint, e := s.packages.Entrypoint(sub.InstallID, sub.Function)
+		entrypoint, e := s.packages.RemoteEntrypoint(sub.InstallID, sub.Function)
 		if e != nil {
 			return out, e
 		}

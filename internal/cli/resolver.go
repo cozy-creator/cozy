@@ -9,6 +9,7 @@ import (
 	"github.com/cozy-creator/cozy/internal/config"
 	"github.com/cozy-creator/cozy/internal/exit"
 	"github.com/cozy-creator/cozy/internal/home"
+	"github.com/cozy-creator/cozy/internal/hub"
 	"github.com/cozy-creator/cozy/internal/install"
 	"github.com/cozy-creator/cozy/internal/launch"
 	"github.com/cozy-creator/cozy/internal/orchestrator"
@@ -41,6 +42,8 @@ type Resolver struct {
 	// placements contain only control-plane facts. Keeping this cache distinct is the
 	// seam cl-020's verified control manifest will populate without a local venv.
 	placements map[string]orchestrator.DesiredPlacement
+	catalog    *hub.Client
+	published  map[string]*launch.PackageDescriptor
 	// Devices is the device envelope a worker this host launches may SEE.
 	Devices []string
 }
@@ -143,6 +146,8 @@ func NewResolver(store *records.Store, cfg config.Config) *Resolver {
 		store: store, cfg: cfg,
 		cache:      map[string]orchestrator.WorkerLaunchSpec{},
 		placements: map[string]orchestrator.DesiredPlacement{},
+		catalog:    hub.New(cfg, "cozy-daemon"),
+		published:  map[string]*launch.PackageDescriptor{},
 		Devices:    []string{"0"},
 	}
 }
@@ -213,7 +218,11 @@ func (r *Resolver) ResolveInstall(installID string) (orchestrator.WorkerLaunchSp
 }
 
 func (r *Resolver) ResolveLogicalInstall(installID, function string) (orchestrator.LogicalPackage, *exit.Error) {
-	install, descriptor, e := r.installDescriptor(installID)
+	install, e := r.installRecord(installID)
+	if e != nil {
+		return orchestrator.LogicalPackage{}, e
+	}
+	descriptor, e := r.publishedDescriptor(install)
 	if e != nil {
 		return orchestrator.LogicalPackage{}, e
 	}
@@ -226,16 +235,6 @@ func (r *Resolver) ResolveLogicalInstall(installID, function string) (orchestrat
 			"rental.logical_package_unsupported",
 			"private package_set currently admits one weightless entrypoint and no model slots")
 	}
-	if install.SourceKind != "tensorhub" || !install.Verified {
-		return orchestrator.LogicalPackage{}, exit.Named(exit.Unavailable,
-			"rental.package_release_unpublished",
-			"private package_set requires an immutable Tensorhub package release")
-	}
-	if _, err := canonical.Raw(install.SourceDigest); err != nil {
-		return orchestrator.LogicalPackage{}, exit.Named(exit.Structural,
-			"rental.package_release_digest_invalid",
-			"installed package %s has no valid immutable release digest", install.Package)
-	}
 	return orchestrator.LogicalPackage{
 		Package: install.Package, Release: install.Version, ReleaseDigest: install.SourceDigest,
 		InstallID: install.ID, Function: function,
@@ -246,6 +245,18 @@ func (r *Resolver) ResolveLogicalInstall(installID, function string) (orchestrat
 // Entrypoint returns one exact install's verified request/result schema.
 func (r *Resolver) Entrypoint(installID, name string) (*launch.Entrypoint, *exit.Error) {
 	_, descriptor, e := r.installDescriptor(installID)
+	if e != nil {
+		return nil, e
+	}
+	return descriptor.Function(name)
+}
+
+func (r *Resolver) RemoteEntrypoint(installID, name string) (*launch.Entrypoint, *exit.Error) {
+	install, e := r.installRecord(installID)
+	if e != nil {
+		return nil, e
+	}
+	descriptor, e := r.publishedDescriptor(install)
 	if e != nil {
 		return nil, e
 	}
@@ -276,6 +287,64 @@ func (r *Resolver) installDescriptor(installID string) (*records.PackageInstall,
 		return nil, nil, e
 	}
 	return install, descriptor, nil
+}
+
+func (r *Resolver) publishedDescriptor(install *records.PackageInstall) (*launch.PackageDescriptor,
+	*exit.Error) {
+	r.mu.Lock()
+	descriptor := r.published[install.SourceDigest]
+	r.mu.Unlock()
+	if descriptor != nil {
+		return descriptor, nil
+	}
+	descriptor, problem := publishedPackageDescriptor(r.catalog, install)
+	if problem != nil {
+		return nil, problem
+	}
+	r.mu.Lock()
+	r.published[install.SourceDigest] = descriptor
+	r.mu.Unlock()
+	return descriptor, nil
+}
+
+func publishedPackageDescriptor(c *hub.Client,
+	install *records.PackageInstall) (*launch.PackageDescriptor, *exit.Error) {
+	if install.SourceKind != "tensorhub" || !install.Verified {
+		return nil, exit.Named(exit.Unavailable, "rental.package_release_unpublished",
+			"private package_set requires an immutable Tensorhub package release")
+	}
+	if _, err := canonical.Raw(install.SourceDigest); err != nil {
+		return nil, exit.Named(exit.Structural, "rental.package_release_digest_invalid",
+			"installed package %s has no valid immutable release digest", install.Package)
+	}
+	ref, problem := hub.ParseRef(install.Package)
+	if problem != nil {
+		return nil, problem
+	}
+	ctx, cancel := hub.Context()
+	defer cancel()
+	detail, problem := c.PackageRelease(ctx, ref, install.Version)
+	if problem != nil {
+		return nil, problem
+	}
+	if detail.Release.Release != install.Version || detail.Release.ReleaseDigest != install.SourceDigest {
+		return nil, exit.Named(exit.Conflict, "rental.package_release_changed",
+			"Tensorhub release %s@%s does not match the installed immutable release pin",
+			install.Package, install.Version)
+	}
+	if detail.Release.PackageDescriptorLength != int64(len(detail.PackageDescriptor)) {
+		return nil, exit.Named(exit.Conflict, "rental.package_descriptor_length_mismatch",
+			"Tensorhub descriptor length does not match its release fact")
+	}
+	descriptor, problem := launch.DecodeDescriptor(detail.PackageDescriptor)
+	if problem != nil {
+		return nil, problem
+	}
+	if descriptor.Digest != detail.Release.PackageDescriptorDigest {
+		return nil, exit.Named(exit.Conflict, "rental.package_descriptor_digest_mismatch",
+			"Tensorhub descriptor bytes do not match their release fact")
+	}
+	return descriptor, nil
 }
 
 func (r *Resolver) installFacts(installID string) (*launch.Facts, *exit.Error) {
