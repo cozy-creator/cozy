@@ -23,9 +23,10 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode};
 use std::time::Instant;
 
-use tensorfs_core::canon::{self, Value};
+use tensorfs_core::canon::{self, as_arr, as_str, Fields, Value};
 use tensorfs_core::checkpoint as ck;
 use tensorfs_core::dtype::Dtype;
+use tensorfs_core::err::Code;
 use tensorfs_core::header::{topology_digest_of, topology_value};
 use tensorfs_core::ids::{ConfigRef, ObjectRef, Plain};
 use tensorfs_core::ingest::carrier::{self, SourceHeader};
@@ -81,22 +82,50 @@ fn sources(f: &Flags) -> Result<Vec<(String, PathBuf)>, ExitCode> {
 
 /// Unlabelled physical carriers for source-plan. Paths are locations only; no
 /// filename or directory segment participates in classification.
-fn carriers(f: &Flags) -> Result<Vec<PathBuf>, ExitCode> {
+#[derive(Clone, PartialEq, Eq)]
+struct CarrierInput {
+    member: Option<String>,
+    path: PathBuf,
+}
+
+fn carriers(f: &Flags) -> Result<Vec<CarrierInput>, ExitCode> {
     let mut out = Vec::new();
     for (key, value) in f {
         if key == "carrier" {
-            out.push(PathBuf::from(value));
+            let (member, location) = match value.split_once('=') {
+                Some((member, location)) => {
+                    if let Err(error) = fingerprint::validate_source_member(member) {
+                        return Err(bail(error));
+                    }
+                    (Some(member.to_string()), location)
+                }
+                None => (None, value.as_str()),
+            };
+            match fs::canonicalize(location) {
+                Ok(path) => out.push(CarrierInput { member, path }),
+                Err(error) => {
+                    eprintln!("REFUSED IO_FAILED: resolve carrier {location:?}: {error}");
+                    return Err(ExitCode::FAILURE);
+                }
+            }
         }
     }
     if out.is_empty() {
         eprintln!("REFUSED MISSING_FIELD: no --carrier <path> given");
         return Err(ExitCode::FAILURE);
     }
-    let mut unique = out.clone();
-    unique.sort();
-    unique.dedup();
-    if unique.len() != out.len() {
-        eprintln!("REFUSED DUPLICATE_KEY: one carrier path was supplied twice");
+    let mut paths: Vec<&PathBuf> = out.iter().map(|carrier| &carrier.path).collect();
+    paths.sort();
+    paths.dedup();
+    let mut members: Vec<&str> = out
+        .iter()
+        .filter_map(|carrier| carrier.member.as_deref())
+        .collect();
+    members.sort();
+    let member_count = members.len();
+    members.dedup();
+    if paths.len() != out.len() || members.len() != member_count {
+        eprintln!("REFUSED DUPLICATE_KEY: carrier paths and reviewed members must be unique");
         return Err(ExitCode::FAILURE);
     }
     Ok(out)
@@ -517,13 +546,18 @@ pub fn cmd_bank(
             Err(code) => return code,
         };
         let mut targets = Vec::new();
+        let mut members = Vec::new();
         for (key, value) in f {
-            if key != "target" {
+            if key != "target" && key != "member" {
                 continue;
             }
             match value.split_once('=') {
                 Some((component, encoding)) if !component.is_empty() && !encoding.is_empty() => {
-                    targets.push((component.to_string(), encoding.to_string()));
+                    if key == "target" {
+                        targets.push((component.to_string(), encoding.to_string()));
+                    } else {
+                        members.push((component.to_string(), encoding.to_string()));
+                    }
                 }
                 _ => {
                     eprintln!(
@@ -562,6 +596,22 @@ pub fn cmd_bank(
             components.push(SourceProfileComponent {
                 component: component.clone(),
                 keyset_digest: keyset_digest.clone(),
+                source_member: match members
+                    .iter()
+                    .filter(|(name, _)| name == component)
+                    .map(|(_, member)| member)
+                    .collect::<Vec<_>>()
+                    .as_slice()
+                {
+                    [] => None,
+                    [member] => Some((*member).clone()),
+                    _ => {
+                        eprintln!(
+                            "REFUSED DUPLICATE_KEY: source profile component {component:?} has more than one --member"
+                        );
+                        return ExitCode::FAILURE;
+                    }
+                },
                 target_encoding: hits[0].to_string(),
                 construction_order: order
                     .iter()
@@ -570,7 +620,12 @@ pub fn cmd_bank(
                     .collect(),
             });
         }
-        if components.len() != reviewed.len() || targets.len() != reviewed.len() {
+        if components.len() != reviewed.len()
+            || targets.len() != reviewed.len()
+            || members
+                .iter()
+                .any(|(component, _)| !reviewed.iter().any(|(name, _)| name == component))
+        {
             eprintln!(
                 "REFUSED MISSING_FIELD: source profile order, targets, and banked components must name the same exact set"
             );
@@ -596,7 +651,7 @@ pub fn cmd_bank(
         reg.merge_source_profile(profile);
     } else if f
         .iter()
-        .any(|(key, _)| matches!(key.as_str(), "target" | "order"))
+        .any(|(key, _)| matches!(key.as_str(), "target" | "member" | "order"))
     {
         eprintln!(
             "REFUSED MISSING_FIELD: --target/--order on ingest bank require --source-profile"
@@ -681,6 +736,7 @@ fn enumerate_assignments(
 fn profile_assignments(
     profile: &SourceProfile,
     registry: &FingerprintRegistry,
+    carriers: &[CarrierInput],
     headers: &[SourceHeader],
 ) -> Vec<Vec<SourceAssignment>> {
     let mut candidates = Vec::new();
@@ -693,6 +749,9 @@ fn profile_assignments(
         let projected = entry.converter == "single_file.identity/1";
         let mut hits = Vec::new();
         for (index, header) in headers.iter().enumerate() {
+            if component.source_member != carriers[index].member {
+                continue;
+            }
             let view = if projected {
                 match convert::single_file_component(&component.component, header) {
                     Ok(view) => view,
@@ -732,30 +791,44 @@ fn profile_assignments(
 /// Classify unlabelled exact carriers against whole-source review facts and emit the
 /// sole machine input for the existing prepare/run path. A physical path is never a
 /// classification fact. If two assignments survive, no tie-break exists here.
-pub fn cmd_source_plan(f: &Flags) -> ExitCode {
-    let paths = match carriers(f) {
-        Ok(paths) => paths,
-        Err(code) => return code,
+fn derive_source_plan(f: &Flags) -> Result<Value, ExitCode> {
+    let paths = carriers(f)?;
+    let registry_path = match fs::canonicalize(registry_path(f)) {
+        Ok(path) => path,
+        Err(error) => {
+            eprintln!("REFUSED IO_FAILED: resolve source-plan registry: {error}");
+            return Err(ExitCode::FAILURE);
+        }
     };
-    let registry = match load_registry(f) {
+    let registry_bytes = match fs::read(&registry_path) {
+        Ok(bytes) => bytes,
+        Err(error) => {
+            eprintln!(
+                "REFUSED IO_FAILED: read source-plan registry {}: {error}",
+                registry_path.display()
+            );
+            return Err(ExitCode::FAILURE);
+        }
+    };
+    let registry = match FingerprintRegistry::parse(&registry_bytes) {
         Ok(registry) => registry,
-        Err(code) => return code,
+        Err(error) => return Err(bail(error)),
     };
     if registry.source_profiles.is_empty() {
         eprintln!("REFUSED UNREGISTERED_FINGERPRINT: the reviewed registry has no source profiles");
-        return ExitCode::FAILURE;
+        return Err(ExitCode::FAILURE);
     }
     let mut headers = Vec::new();
-    for path in &paths {
-        match read_carrier(path) {
+    for carrier in &paths {
+        match read_carrier(&carrier.path) {
             Ok((header, _)) => headers.push(header),
-            Err(error) => return bail(error),
+            Err(error) => return Err(bail(error)),
         }
     }
 
     let mut matches = Vec::new();
     for profile in &registry.source_profiles {
-        for assignments in profile_assignments(profile, &registry, &headers) {
+        for assignments in profile_assignments(profile, &registry, &paths, &headers) {
             matches.push((profile, assignments));
             if matches.len() >= 2 {
                 break;
@@ -769,7 +842,7 @@ pub fn cmd_source_plan(f: &Flags) -> ExitCode {
         eprintln!(
             "REFUSED UNREGISTERED_FINGERPRINT: carrier set matches no reviewed source profile"
         );
-        return ExitCode::FAILURE;
+        return Err(ExitCode::FAILURE);
     }
     if matches.len() != 1 {
         let profiles: Vec<&str> = matches
@@ -779,15 +852,16 @@ pub fn cmd_source_plan(f: &Flags) -> ExitCode {
         eprintln!(
             "REFUSED AMBIGUOUS_CLASSIFICATION: carrier headers admit multiple component assignments in profiles {profiles:?}; exact provider member/slot review is required"
         );
-        return ExitCode::FAILURE;
+        return Err(ExitCode::FAILURE);
     }
-    let (profile, assignments) = matches.remove(0);
+    let (profile, mut assignments) = matches.remove(0);
+    assignments.sort_by(|a, b| a.component.cmp(&b.component));
     let sources: Vec<(String, PathBuf)> = assignments
         .iter()
         .map(|assignment| {
             (
                 assignment.component.clone(),
-                paths[assignment.carrier].clone(),
+                paths[assignment.carrier].path.clone(),
             )
         })
         .collect();
@@ -815,28 +889,29 @@ pub fn cmd_source_plan(f: &Flags) -> ExitCode {
             format!("{component}={}", path.to_string_lossy()),
         ));
     }
-    let mut prepared = match prepare_with_registry(&flags, &target, &sources, &registry) {
-        Ok(prepared) => prepared,
-        Err(code) => return code,
-    };
+    let mut prepared = prepare_with_registry(&flags, &target, &sources, &registry)?;
     if let Err(error) = prepared.plan.apply_order(&order) {
-        return bail(error);
+        return Err(bail(error));
     }
     if let Err(error) = prepared.plan.check_converts_something() {
-        return bail(error);
+        return Err(bail(error));
     }
     let session = session_of(&flags, &prepared);
     let source_values = assignments
         .iter()
         .map(|assignment| {
-            Value::obj(vec![
+            let mut fields = vec![
                 ("component", Value::str(assignment.component.clone())),
                 (
                     "path",
-                    Value::str(paths[assignment.carrier].to_string_lossy().to_string()),
+                    Value::str(paths[assignment.carrier].path.to_string_lossy().to_string()),
                 ),
                 ("projected", Value::Bool(assignment.projected)),
-            ])
+            ];
+            if let Some(member) = &paths[assignment.carrier].member {
+                fields.push(("source_member", Value::str(member.clone())));
+            }
+            Value::obj(fields)
         })
         .collect();
     let order_values = prepared
@@ -850,19 +925,311 @@ pub fn cmd_source_plan(f: &Flags) -> ExitCode {
             ])
         })
         .collect();
-    let output = Value::obj(vec![
+    Ok(Value::obj(vec![
+        (
+            "carriers",
+            Value::arr(
+                paths
+                    .iter()
+                    .map(|carrier| {
+                        let mut fields = vec![(
+                            "path",
+                            Value::str(carrier.path.to_string_lossy().to_string()),
+                        )];
+                        if let Some(member) = &carrier.member {
+                            fields.push(("member", Value::str(member.clone())));
+                        }
+                        Value::obj(fields)
+                    })
+                    .collect(),
+            ),
+        ),
         ("construction_order", Value::arr(order_values)),
         ("converter", Value::str(prepared.plan.converter.clone())),
         ("profile", Value::str(profile.name.clone())),
+        (
+            "registry_path",
+            Value::str(registry_path.to_string_lossy().to_string()),
+        ),
+        (
+            "registry_sha256",
+            Value::str(format!(
+                "sha256:{}",
+                tensorfs_core::sha256::hex_digest(&registry_bytes)
+            )),
+        ),
         ("session", Value::str(session)),
         ("sources", Value::arr(source_values)),
         ("target", Value::str(target)),
-    ]);
-    println!(
-        "{}",
-        String::from_utf8(tensorfs_core::canon::write(&output)).unwrap()
-    );
+    ]))
+}
+
+pub fn cmd_source_plan(f: &Flags) -> ExitCode {
+    let output = match derive_source_plan(f) {
+        Ok(output) => tensorfs_core::canon::write(&output),
+        Err(code) => return code,
+    };
+    if let Some(path) = flag(f, "out") {
+        if let Err(error) = fs::write(path, &output) {
+            eprintln!("REFUSED IO_FAILED: write source plan {path}: {error}");
+            return ExitCode::FAILURE;
+        }
+    } else {
+        println!("{}", String::from_utf8(output).unwrap());
+    }
     ExitCode::SUCCESS
+}
+
+struct ClosedSourcePlan {
+    converter: String,
+    order: Vec<(String, String)>,
+    registry: PathBuf,
+    session: String,
+    sources: Vec<(String, PathBuf)>,
+    target: String,
+}
+
+fn read_closed_source_plan(path: &Path) -> Result<ClosedSourcePlan, ExitCode> {
+    let bytes = match fs::read(path) {
+        Ok(bytes) => bytes,
+        Err(error) => {
+            eprintln!(
+                "REFUSED IO_FAILED: read source plan {}: {error}",
+                path.display()
+            );
+            return Err(ExitCode::FAILURE);
+        }
+    };
+    let value = match canon::parse(&bytes, limits::DOC_MAX_BYTES) {
+        Ok(value) => value,
+        Err(error) => return Err(bail(error)),
+    };
+    if canon::write(&value) != bytes {
+        eprintln!("REFUSED NON_CANONICAL: source plan bytes are not canonical JSON");
+        return Err(ExitCode::FAILURE);
+    }
+    let mut fields = match Fields::new("SourcePlan", &value) {
+        Ok(fields) => fields,
+        Err(error) => return Err(bail(error)),
+    };
+    let carriers: Vec<CarrierInput> = match fields.req("carriers").and_then(|value| {
+        as_arr("SourcePlan", "carriers", value).and_then(|values| {
+            values
+                .iter()
+                .map(|value| {
+                    let mut carrier = Fields::new("SourcePlanCarrier", value)?;
+                    let path = PathBuf::from(carrier.req_str("path")?);
+                    let member = match carrier.opt("member") {
+                        Some(value) => {
+                            Some(as_str("SourcePlanCarrier", "member", value)?.to_string())
+                        }
+                        None => None,
+                    };
+                    carrier.done()?;
+                    Ok(CarrierInput { member, path })
+                })
+                .collect()
+        })
+    }) {
+        Ok(carriers) => carriers,
+        Err(error) => return Err(bail(error)),
+    };
+    let order = match fields.req("construction_order").and_then(|value| {
+        as_arr("SourcePlan", "construction_order", value).and_then(|rows| {
+            rows.iter()
+                .map(|row| {
+                    let values = as_arr("SourcePlan", "construction_order row", row)?;
+                    if values.len() != 2 {
+                        return tensorfs_core::err::refuse(
+                            Code::WRONG_TYPE,
+                            "source plan construction-order row must have two strings",
+                        );
+                    }
+                    Ok((
+                        as_str("SourcePlan", "component", &values[0])?.to_string(),
+                        as_str("SourcePlan", "key", &values[1])?.to_string(),
+                    ))
+                })
+                .collect()
+        })
+    }) {
+        Ok(order) => order,
+        Err(error) => return Err(bail(error)),
+    };
+    let converter = match fields.req_str("converter") {
+        Ok(value) => value.to_string(),
+        Err(error) => return Err(bail(error)),
+    };
+    let _profile = match fields.req_str("profile") {
+        Ok(value) => value,
+        Err(error) => return Err(bail(error)),
+    };
+    let registry = match fields.req_str("registry_path") {
+        Ok(value) => PathBuf::from(value),
+        Err(error) => return Err(bail(error)),
+    };
+    let _registry_sha256 = match fields.req_str("registry_sha256") {
+        Ok(value) => value,
+        Err(error) => return Err(bail(error)),
+    };
+    let session = match fields.req_str("session") {
+        Ok(value) => value.to_string(),
+        Err(error) => return Err(bail(error)),
+    };
+    let sources = match fields.req("sources").and_then(|value| {
+        as_arr("SourcePlan", "sources", value).and_then(|rows| {
+            rows.iter()
+                .map(|row| {
+                    let mut source = Fields::new("SourcePlanSource", row)?;
+                    let component = source.req_str("component")?.to_string();
+                    let path = PathBuf::from(source.req_str("path")?);
+                    let _source_member = source.opt("source_member");
+                    match source.req("projected")? {
+                        Value::Bool(_) => {}
+                        other => {
+                            return tensorfs_core::err::refuse(
+                                Code::WRONG_TYPE,
+                                format!(
+                                    "SourcePlanSource.projected must be bool, got {}",
+                                    other.kind()
+                                ),
+                            )
+                        }
+                    }
+                    source.done()?;
+                    Ok((component, path))
+                })
+                .collect()
+        })
+    }) {
+        Ok(sources) => sources,
+        Err(error) => return Err(bail(error)),
+    };
+    let target = match fields.req_str("target") {
+        Ok(value) => value.to_string(),
+        Err(error) => return Err(bail(error)),
+    };
+    if let Err(error) = fields.done() {
+        return Err(bail(error));
+    }
+
+    // Re-derive from unlabelled carrier headers and the current exact registry.
+    // This is what prevents an edited plan from assigning identical headers by hand.
+    let mut derive_flags = vec![(
+        "registry".to_string(),
+        registry.to_string_lossy().to_string(),
+    )];
+    for carrier in &carriers {
+        let path = carrier.path.to_string_lossy();
+        derive_flags.push((
+            "carrier".to_string(),
+            match &carrier.member {
+                Some(member) => format!("{member}={path}"),
+                None => path.to_string(),
+            },
+        ));
+    }
+    let derived = derive_source_plan(&derive_flags)?;
+    if derived != value {
+        eprintln!(
+            "REFUSED IDENTITY_MISMATCH: source plan no longer equals the unique plan derived from its carrier headers and registry"
+        );
+        return Err(ExitCode::FAILURE);
+    }
+    Ok(ClosedSourcePlan {
+        converter,
+        order,
+        registry,
+        session,
+        sources,
+        target,
+    })
+}
+
+fn prepare_closed_source_plan(
+    path: &Path,
+) -> Result<(ClosedSourcePlan, Prepared, Flags), ExitCode> {
+    let closed = read_closed_source_plan(path)?;
+    let registry_bytes = match fs::read(&closed.registry) {
+        Ok(bytes) => bytes,
+        Err(error) => {
+            eprintln!(
+                "REFUSED IO_FAILED: read source plan registry {}: {error}",
+                closed.registry.display()
+            );
+            return Err(ExitCode::FAILURE);
+        }
+    };
+    let registry = match FingerprintRegistry::parse(&registry_bytes) {
+        Ok(registry) => registry,
+        Err(error) => return Err(bail(error)),
+    };
+    let mut flags = vec![(
+        "registry".to_string(),
+        closed.registry.to_string_lossy().to_string(),
+    )];
+    for (component, source) in &closed.sources {
+        flags.push((
+            "source".to_string(),
+            format!("{component}={}", source.to_string_lossy()),
+        ));
+    }
+    let mut prepared = prepare_with_registry(&flags, &closed.target, &closed.sources, &registry)?;
+    if let Err(error) = prepared.plan.apply_order(&closed.order) {
+        return Err(bail(error));
+    }
+    if prepared.plan.converter != closed.converter
+        || session_of(&flags, &prepared) != closed.session
+    {
+        eprintln!(
+            "REFUSED IDENTITY_MISMATCH: source plan converter/session differs from the existing prepare path"
+        );
+        return Err(ExitCode::FAILURE);
+    }
+    Ok((closed, prepared, flags))
+}
+
+pub fn cmd_plan_source(path: &Path) -> ExitCode {
+    let (_, prepared, _) = match prepare_closed_source_plan(path) {
+        Ok(result) => result,
+        Err(code) => return code,
+    };
+    print_plan(&prepared);
+    ExitCode::SUCCESS
+}
+
+pub fn cmd_run_source(root: &Path, path: &Path) -> ExitCode {
+    let (closed, _, mut flags) = match prepare_closed_source_plan(path) {
+        Ok(result) => result,
+        Err(code) => return code,
+    };
+    let order_path = root
+        .join("tmp")
+        .join(format!("source-plan-{}.order.json", closed.session));
+    if let Err(error) = fs::create_dir_all(order_path.parent().unwrap()) {
+        eprintln!("REFUSED IO_FAILED: create source-plan order directory: {error}");
+        return ExitCode::FAILURE;
+    }
+    let order = Value::arr(
+        closed
+            .order
+            .iter()
+            .map(|(component, key)| {
+                Value::arr(vec![Value::str(component.clone()), Value::str(key.clone())])
+            })
+            .collect(),
+    );
+    if let Err(error) = fs::write(&order_path, canon::write(&order)) {
+        eprintln!("REFUSED IO_FAILED: write source-plan order: {error}");
+        return ExitCode::FAILURE;
+    }
+    flags.push((
+        "order".to_string(),
+        order_path.to_string_lossy().to_string(),
+    ));
+    let result = cmd_run(root, &closed.target, &flags);
+    let _ = fs::remove_file(order_path);
+    result
 }
 
 // ------------------------------------------------------------------ plan

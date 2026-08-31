@@ -190,7 +190,21 @@ fn main() -> ExitCode {
         ["ingest", "golden"] => ingest::cmd_golden(),
         ["ingest", "bank", dia, fam, var, conv] => ingest::cmd_bank(dia, fam, var, conv, &flags),
         ["ingest", "source-plan"] => ingest::cmd_source_plan(&flags),
+        ["ingest", "plan"] => match flag(&flags, "source-plan") {
+            Some(path) => ingest::cmd_plan_source(Path::new(path)),
+            None => {
+                eprintln!("ingest plan requires a target or --source-plan <json>");
+                ExitCode::from(2)
+            }
+        },
         ["ingest", "plan", t] => ingest::cmd_plan(t, &flags),
+        ["ingest", "run", r] => match flag(&flags, "source-plan") {
+            Some(path) => ingest::cmd_run_source(Path::new(r), Path::new(path)),
+            None => {
+                eprintln!("ingest run requires a target or --source-plan <json>");
+                ExitCode::from(2)
+            }
+        },
         ["ingest", "run", r, t] => ingest::cmd_run(Path::new(r), t, &flags),
         ["ingest-worker", r, t] => ingest::cmd_worker(Path::new(r), t, &flags),
         ["ingest", "reingest", r, h, t] => ingest::cmd_reingest(Path::new(r), h, t, &flags),

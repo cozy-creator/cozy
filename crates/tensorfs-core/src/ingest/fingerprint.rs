@@ -194,6 +194,9 @@ pub struct SourceProfile {
 pub struct SourceProfileComponent {
     pub component: String,
     pub keyset_digest: String,
+    /// Optional reviewed provider/source slot. Required only when carrier bytes
+    /// cannot distinguish components (for example H3's identical DiT headers).
+    pub source_member: Option<String>,
     pub target_encoding: String,
     pub construction_order: Vec<String>,
 }
@@ -492,7 +495,7 @@ impl FingerprintRegistry {
                                             .components
                                             .iter()
                                             .map(|component| {
-                                                Value::obj(vec![
+                                                let mut fields = vec![
                                                     (
                                                         "component",
                                                         Value::str(component.component.clone()),
@@ -517,7 +520,14 @@ impl FingerprintRegistry {
                                                             component.target_encoding.clone(),
                                                         ),
                                                     ),
-                                                ])
+                                                ];
+                                                if let Some(member) = &component.source_member {
+                                                    fields.push((
+                                                        "source_member",
+                                                        Value::str(member.clone()),
+                                                    ));
+                                                }
+                                                Value::obj(fields)
                                             })
                                             .collect(),
                                     ),
@@ -569,6 +579,14 @@ fn parse_source_profiles(value: &Value) -> Result<Vec<SourceProfile>> {
                     .map(ToString::to_string)
             })
             .collect::<Result<Vec<_>>>()?;
+            let source_member = match component_fields.opt("source_member") {
+                Some(value) => {
+                    let member = as_str("SourceProfileComponent", "source_member", value)?;
+                    validate_source_member(member)?;
+                    Some(member.to_string())
+                }
+                None => None,
+            };
             component_fields.done()?;
             if construction_order.is_empty() {
                 return refuse(
@@ -588,6 +606,7 @@ fn parse_source_profiles(value: &Value) -> Result<Vec<SourceProfile>> {
             components.push(SourceProfileComponent {
                 component,
                 keyset_digest,
+                source_member,
                 target_encoding,
                 construction_order,
             });
@@ -627,6 +646,24 @@ fn parse_source_profiles(value: &Value) -> Result<Vec<SourceProfile>> {
         return refuse(Code::DUPLICATE_KEY, "source profile names must be unique");
     }
     Ok(profiles)
+}
+
+pub fn validate_source_member(member: &str) -> Result<()> {
+    if member.is_empty()
+        || member.len() > 1024
+        || !member.is_ascii()
+        || member.starts_with('/')
+        || member.contains('\\')
+        || member
+            .split('/')
+            .any(|part| part.is_empty() || part == "." || part == "..")
+    {
+        return refuse(
+            Code::KEY_GRAMMAR,
+            format!("source member {member:?} is not a safe canonical relative member"),
+        );
+    }
+    Ok(())
 }
 
 /// Decoded `__metadata__` facts the border is willing to carry as EVIDENCE STAMPS. Foreign

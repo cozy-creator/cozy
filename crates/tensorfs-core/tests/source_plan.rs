@@ -47,6 +47,7 @@ fn bank(
     converter: &str,
     dialect: &str,
     sources: &[(&str, &Path)],
+    members: &[(&str, &str)],
     order_path: &Path,
 ) {
     let mut command = Command::new(env!("CARGO_BIN_EXE_tfs"));
@@ -65,6 +66,9 @@ fn bank(
     for (component, path) in sources {
         command.args(["--source", &format!("{component}={}", path.display())]);
         command.args(["--target", &format!("{component}=plain/1")]);
+    }
+    for (component, member) in members {
+        command.args(["--member", &format!("{component}={member}")]);
     }
     let output = command.output().unwrap();
     assert!(
@@ -85,6 +89,30 @@ fn source_plan(registry: &Path, carriers: &[&Path]) -> std::process::Output {
     command.output().unwrap()
 }
 
+fn write_source_plan(registry: &Path, carriers: &[&Path], output: &Path) {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_tfs"));
+    command.args(["ingest", "source-plan", "--registry"]);
+    command.arg(registry);
+    command.args(["--out", output.to_str().unwrap()]);
+    for carrier in carriers {
+        command.args(["--carrier", carrier.to_str().unwrap()]);
+    }
+    let result = command.output().unwrap();
+    assert!(
+        result.status.success(),
+        "source-plan --out failed:\n{}{}",
+        String::from_utf8_lossy(&result.stdout),
+        String::from_utf8_lossy(&result.stderr)
+    );
+}
+
+fn string_field(path: &Path, field: &str) -> String {
+    let body = fs::read_to_string(path).unwrap();
+    let marker = format!(r#""{field}":""#);
+    let tail = body.split_once(&marker).unwrap().1;
+    tail.split_once('"').unwrap().0.to_string()
+}
+
 #[test]
 fn source_plan_maps_reviewed_single_file_components_without_its_filename() {
     let root = temporary("single");
@@ -92,6 +120,7 @@ fn source_plan_maps_reviewed_single_file_components_without_its_filename() {
     let oddly_named = root.join("nothing-about-components.bin");
     let registry = root.join("registry.json");
     let order_path = root.join("order.json");
+    let plan_path = root.join("source-plan.json");
     carrier(
         &oddly_named,
         &["model.diffusion_model.weight", "first_stage_model.weight"],
@@ -103,6 +132,7 @@ fn source_plan_maps_reviewed_single_file_components_without_its_filename() {
         "single_file.identity/1",
         "safetensors.single_file",
         &[("unet", &oddly_named), ("vae", &oddly_named)],
+        &[],
         &order_path,
     );
 
@@ -118,6 +148,17 @@ fn source_plan_maps_reviewed_single_file_components_without_its_filename() {
     assert!(text.contains(r#""component":"vae""#));
     assert_eq!(text.matches(r#""projected":true"#).count(), 2);
     assert!(text.contains(r#""target":"unet=plain/1,vae=plain/1""#));
+    write_source_plan(&registry, &[&oddly_named], &plan_path);
+    let preview = Command::new(env!("CARGO_BIN_EXE_tfs"))
+        .args(["ingest", "plan", "--source-plan"])
+        .arg(&plan_path)
+        .output()
+        .unwrap();
+    assert!(
+        preview.status.success(),
+        "closed preview failed: {}",
+        String::from_utf8_lossy(&preview.stderr)
+    );
     let _ = fs::remove_dir_all(root);
 }
 
@@ -129,6 +170,8 @@ fn source_plan_maps_reviewed_multi_file_headers_independent_of_argument_order() 
     let second = root.join("a.bin");
     let registry = root.join("registry.json");
     let order_path = root.join("order.json");
+    let plan_path = root.join("source-plan.json");
+    let store = root.join("store");
     carrier(&first, &["weight"]);
     carrier(&second, &["bias"]);
     order(&order_path, &[("encoder", "weight"), ("decoder", "bias")]);
@@ -138,6 +181,7 @@ fn source_plan_maps_reviewed_multi_file_headers_independent_of_argument_order() 
         "diffusers.identity/1",
         "safetensors.diffusers",
         &[("encoder", &first), ("decoder", &second)],
+        &[],
         &order_path,
     );
 
@@ -157,6 +201,53 @@ fn source_plan_maps_reviewed_multi_file_headers_independent_of_argument_order() 
         second.display().to_string()
     )));
     assert_eq!(text.matches(r#""projected":false"#).count(), 2);
+    write_source_plan(&registry, &[&second, &first], &plan_path);
+    assert!(Command::new(env!("CARGO_BIN_EXE_tfs"))
+        .args(["store", "init"])
+        .arg(&store)
+        .status()
+        .unwrap()
+        .success());
+    let run = Command::new(env!("CARGO_BIN_EXE_tfs"))
+        .args(["ingest", "run"])
+        .arg(&store)
+        .args(["--source-plan"])
+        .arg(&plan_path)
+        .output()
+        .unwrap();
+    assert!(
+        run.status.success(),
+        "closed run failed:\n{}{}",
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert!(String::from_utf8_lossy(&run.stdout).contains("candidate    manifest sha256:"));
+    let session = string_field(&plan_path, "session");
+    let install = Command::new(env!("CARGO_BIN_EXE_tfs"))
+        .args(["ingest", "install"])
+        .arg(&store)
+        .args([
+            &session,
+            "local",
+            "planned-model",
+            &"11".repeat(32),
+            "local",
+            "--observed",
+            "absent",
+            "--source-uri",
+            "hf://reviewed/source@1111111111111111111111111111111111111111",
+            "--declared-license",
+            "test-only",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        install.status.success(),
+        "closed install failed:\n{}{}",
+        String::from_utf8_lossy(&install.stdout),
+        String::from_utf8_lossy(&install.stderr)
+    );
+    assert!(String::from_utf8_lossy(&install.stdout).contains("installed    sha256:"));
     let _ = fs::remove_dir_all(root);
 }
 
@@ -177,6 +268,7 @@ fn source_plan_refuses_identical_header_component_permutations() {
         "diffusers.identity/1",
         "safetensors.diffusers",
         &[("left", &first), ("right", &second)],
+        &[],
         &order_path,
     );
 
@@ -187,6 +279,67 @@ fn source_plan_refuses_identical_header_component_permutations() {
     assert!(
         error.contains("provider member/slot review is required"),
         "{error}"
+    );
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn reviewed_members_resolve_identical_headers_and_missing_members_refuse() {
+    let root = temporary("reviewed-members");
+    fs::create_dir_all(&root).unwrap();
+    let first = root.join("one.bin");
+    let second = root.join("two.bin");
+    let registry = root.join("registry.json");
+    let order_path = root.join("order.json");
+    carrier(&first, &["weight"]);
+    carrier(&second, &["weight"]);
+    order(&order_path, &[("left", "weight"), ("right", "weight")]);
+    bank(
+        &registry,
+        "member-bound",
+        "diffusers.identity/1",
+        "safetensors.diffusers",
+        &[("left", &first), ("right", &second)],
+        &[("left", "provider/fl2va"), ("right", "provider/ref2va")],
+        &order_path,
+    );
+
+    let planned = Command::new(env!("CARGO_BIN_EXE_tfs"))
+        .args(["ingest", "source-plan", "--registry"])
+        .arg(&registry)
+        .args([
+            "--carrier",
+            &format!("provider/ref2va={}", second.display()),
+        ])
+        .args(["--carrier", &format!("provider/fl2va={}", first.display())])
+        .output()
+        .unwrap();
+    assert!(
+        planned.status.success(),
+        "member-bound plan failed: {}",
+        String::from_utf8_lossy(&planned.stderr)
+    );
+    let body = String::from_utf8(planned.stdout).unwrap();
+    assert!(body.contains(r#""source_member":"provider/fl2va""#));
+    assert!(body.contains(r#""source_member":"provider/ref2va""#));
+
+    let missing = source_plan(&registry, &[&first, &second]);
+    assert!(!missing.status.success());
+    assert!(String::from_utf8_lossy(&missing.stderr).contains("matches no reviewed source profile"));
+
+    let unreviewed = Command::new(env!("CARGO_BIN_EXE_tfs"))
+        .args(["ingest", "source-plan", "--registry"])
+        .arg(&registry)
+        .args(["--carrier", &format!("provider/other={}", first.display())])
+        .args([
+            "--carrier",
+            &format!("provider/ref2va={}", second.display()),
+        ])
+        .output()
+        .unwrap();
+    assert!(!unreviewed.status.success());
+    assert!(
+        String::from_utf8_lossy(&unreviewed.stderr).contains("matches no reviewed source profile")
     );
     let _ = fs::remove_dir_all(root);
 }
