@@ -17,7 +17,6 @@ import (
 	"github.com/cozy-creator/cozy/internal/launch"
 	"github.com/cozy-creator/cozy/internal/orchestrator"
 	"github.com/cozy-creator/cozy/internal/records"
-	"github.com/cozy-creator/cozy/internal/rental"
 	pb "github.com/cozy-creator/cozy/protocol/cozy/worker/v1"
 )
 
@@ -292,96 +291,64 @@ func (s *Server) resolvePlan(sub Submission) (orchestrator.Submission, *exit.Err
 	// THE PIN IS RESOLVED BEFORE A ROW EXISTS. A rental this host does not hold cannot be
 	// placed on any later attempt either, so recording the request would hand the client
 	// an id for work that is already known to be unplaceable.
-	var remotePlacement *orchestrator.DesiredPlacement
 	if out.Worker != "" {
 		if s.rentals == nil {
 			return out, exit.Unavailablef("this Cozy daemon attaches no remote workers")
 		}
-		var e *exit.Error
-		remotePlacement, e = s.rentals(out.Worker)
+		_, e := s.rentals(out.Worker)
 		if e != nil {
 			return out, e
 		}
-		if remotePlacement.Package != sub.Package {
-			return out, exit.Named(exit.Conflict, "rental.package_mismatch",
-				"rental %s carries exact control for %s, not %s", out.Worker,
-				remotePlacement.Package, sub.Package)
-		}
+		return out, exit.Named(exit.Unavailable, "rental.download_delegation_unavailable",
+			"rental %s is attachable, but direct package/model download delegation is not installed", out.Worker).
+			WithRemedy("keep the rental; proto-013 must land before non-empty desired state can run")
 	}
-	if remotePlacement != nil {
-		expected, outputs, e := placementPlan(*remotePlacement, sub.Function)
-		if e != nil {
-			return out, e
-		}
-		if out.PlanID != "" && out.PlanID != expected {
-			return out, exit.Named(exit.Conflict, "rental.plan_mismatch",
-				"rental %s binds function %s to %s, not caller-supplied %s",
-				out.Worker, sub.Function, expected, out.PlanID)
-		}
-		out.PlanID = expected
-		if len(out.Outputs) == 0 {
-			out.Outputs = outputs
-		}
-		// The rental's FROZEN descriptor is the schema; no local install is consulted.
-		descriptor, e := rental.PackageDescriptor(s.store, out.Worker)
-		if e != nil {
-			return out, e
-		}
-		entrypoint, e := descriptor.Function(sub.Function)
-		if e != nil {
-			return out, e
-		}
-		if e := validateInputs(entrypoint, &out); e != nil {
-			return out, e
-		}
+	var placement orchestrator.DesiredPlacement
+	if s.packages == nil {
+		return out, exit.Unavailablef("this Cozy daemon resolves no packages")
+	}
+	refreshed, editable, _, refreshProblem := s.refreshPackage(sub.Package)
+	if refreshProblem != nil {
+		return out, refreshProblem
+	}
+	if editable {
+		sub.InstallID = refreshed
+	}
+	var e *exit.Error
+	if sub.InstallID != "" {
+		var spec orchestrator.WorkerLaunchSpec
+		spec, e = s.packages.ResolveInstall(sub.InstallID)
+		placement = spec.Placement
 	} else {
-		var placement orchestrator.DesiredPlacement
-		if s.packages == nil {
-			return out, exit.Unavailablef("this Cozy daemon resolves no packages")
-		}
-		refreshed, editable, _, refreshProblem := s.refreshPackage(sub.Package)
-		if refreshProblem != nil {
-			return out, refreshProblem
-		}
-		if editable {
-			sub.InstallID = refreshed
-		}
-		var e *exit.Error
-		if sub.InstallID != "" {
-			var spec orchestrator.WorkerLaunchSpec
-			spec, e = s.packages.ResolveInstall(sub.InstallID)
-			placement = spec.Placement
-		} else {
-			placement, e = s.packages.ResolvePlacement(sub.Package)
-		}
-		if e != nil {
-			return out, e
-		}
-		if placement.Package != sub.Package {
-			return out, exit.Named(exit.Conflict, "install_package_mismatch",
-				"install %s serves %s, not %s", sub.InstallID, placement.Package, sub.Package)
-		}
-		planID, outputs, e := placementPlan(placement, sub.Function)
-		if e != nil {
-			return out, e
-		}
-		if out.PlanID != "" && out.PlanID != planID {
-			return out, exit.Named(exit.Conflict, "plan_mismatch",
-				"%s/%s resolves plan %s, not caller-supplied %s",
-				sub.Package, sub.Function, planID, out.PlanID)
-		}
-		out.PlanID = planID
-		out.InstallID = placement.InstallID
-		if len(out.Outputs) == 0 {
-			out.Outputs = outputs
-		}
-		entrypoint, e := s.packages.Entrypoint(placement.InstallID, sub.Function)
-		if e != nil {
-			return out, e
-		}
-		if e := validateInputs(entrypoint, &out); e != nil {
-			return out, e
-		}
+		placement, e = s.packages.ResolvePlacement(sub.Package)
+	}
+	if e != nil {
+		return out, e
+	}
+	if placement.Package != sub.Package {
+		return out, exit.Named(exit.Conflict, "install_package_mismatch",
+			"install %s serves %s, not %s", sub.InstallID, placement.Package, sub.Package)
+	}
+	planID, outputs, e := placementPlan(placement, sub.Function)
+	if e != nil {
+		return out, e
+	}
+	if out.PlanID != "" && out.PlanID != planID {
+		return out, exit.Named(exit.Conflict, "plan_mismatch",
+			"%s/%s resolves plan %s, not caller-supplied %s",
+			sub.Package, sub.Function, planID, out.PlanID)
+	}
+	out.PlanID = planID
+	out.InstallID = placement.InstallID
+	if len(out.Outputs) == 0 {
+		out.Outputs = outputs
+	}
+	entrypoint, e := s.packages.Entrypoint(placement.InstallID, sub.Function)
+	if e != nil {
+		return out, e
+	}
+	if e := validateInputs(entrypoint, &out); e != nil {
+		return out, e
 	}
 	return out, nil
 }

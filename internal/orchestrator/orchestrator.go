@@ -20,7 +20,6 @@
 package orchestrator
 
 import (
-	"context"
 	"fmt"
 	"io"
 	"sort"
@@ -58,17 +57,10 @@ type Options struct {
 	// not hardware evidence: a rented worker is not dispatchable until this callback has
 	// durably joined its actual accelerator and worker identity to the rental.
 	ObserveRental func(RentalObservation) *exit.Error
-	// RecordRentalRefusal persists this owner's non-transient verdict on a private worker
-	// before the control stream closes. Without it a rejected ClaimAck exists only in RAM.
-	RecordRentalRefusal func(rentalID string, problem *exit.Error) *exit.Error
 	// RentalClaimProof signs the exact worker/boot/TLS leaf Creator is about to claim.
 	RentalClaimProof RentalClaimProofSource
-	// RelayRentalSession returns authenticated private-worker evidence to Tensorhub.
-	// This RecordOwner remains the only process that dials WorkerControl: the callback
-	// carries deterministic frame bytes over the rental-scoped HTTP authority and never
-	// grants Tensorhub a worker credential or a competing control stream.
-	RelayRentalSession RentalSessionRelay
-
+	// RentalPackageSet signs Creator's logical package/model download authority.
+	RentalPackageSet RentalPackageSetSource
 	// ConfigDigest is the local evaluated-config identity. Environment identity
 	// comes only from the exact selected PlacementSet.
 	ConfigDigest string
@@ -76,15 +68,7 @@ type Options struct {
 }
 
 type RentalClaimProofSource func(*WorkerConnection, uint64) ([]byte, *exit.Error)
-type RentalSessionEvidence struct {
-	ClaimAck        []byte
-	Snapshot        []byte
-	ObservedState   []byte
-	BootFailure     []byte
-	DesiredRevision uint64
-}
-
-type RentalSessionRelay func(context.Context, *WorkerConnection, RentalSessionEvidence) *exit.Error
+type RentalPackageSetSource func(*WorkerConnection) ([]byte, []byte, *exit.Error)
 
 type RentalObservation struct {
 	RentalID               string

@@ -69,6 +69,56 @@ func (c *Orchestrator) ConvergePlacementSet(instanceID string, placements []Desi
 	return c.converge(s, w, placements)
 }
 
+// ConvergePackageSet sends Creator's signed logical package/model authority to
+// a private pod. These bytes never pass through PlacementSet or local platform
+// resolution; pod-supervisor verifies the signature and resolves downloads.
+func (c *Orchestrator) ConvergePackageSet(instanceID string, delegation, signature []byte) *exit.Error {
+	c.mu.Lock()
+	w := c.workers[instanceID]
+	var s *session
+	if w != nil {
+		s = c.sessions[w.bootID]
+	}
+	c.mu.Unlock()
+	if w == nil || w.spec.Connection == nil {
+		return exit.New(exit.NotFound, "no attached rental worker %s on this host", instanceID)
+	}
+	if s == nil {
+		return exit.Unavailablef("worker %s holds no claimed control stream", instanceID)
+	}
+	return c.convergePackageSet(s, w, delegation, signature)
+}
+
+func (c *Orchestrator) convergePackageSet(s *session, w *worker, delegation, signature []byte) *exit.Error {
+	if len(delegation) == 0 || len(signature) != 64 {
+		return exit.Named(exit.Validation, "rental.delegation_incomplete",
+			"package_set requires canonical delegation bytes and one Ed25519 signature")
+	}
+	if _, err := canonical.Read(delegation, &pb.DownloadDelegation{}); err != nil {
+		return exit.Named(exit.Validation, "rental.delegation_invalid",
+			"package_set delegation is not canonical: %s", err)
+	}
+	revision := c.nextRevision()
+	c.mu.Lock()
+	w.revision, w.desiredRefusal = revision, nil
+	c.mu.Unlock()
+	d := &pb.DesiredWorkerState{
+		RecordOwnerEpoch: recordOwnerEpoch, ControlStreamGeneration: s.generation,
+		WorkerBootId: s.bootID, Revision: revision, Posture: pb.Posture_POSTURE_ACCEPTING,
+		WireMinor: pb.WireMinor,
+		Mode: &pb.DesiredWorkerState_PackageSet{PackageSet: &pb.DesiredPackageSet{
+			DownloadDelegation:          append([]byte(nil), delegation...),
+			DownloadDelegationSignature: append([]byte(nil), signature...),
+		}},
+	}
+	if !s.send(&pb.RecordOwnerFrame{Msg: &pb.RecordOwnerFrame_DesiredState{DesiredState: d}}) {
+		return exit.Unavailablef("worker %s control stream closed before package_set send", w.instanceID)
+	}
+	c.logf("DesiredWorkerState revision=%d package_set delegation=%d B -> %s",
+		revision, len(delegation), s.bootID)
+	return nil
+}
+
 func (c *Orchestrator) converge(s *session, w *worker, placements []DesiredPlacement) *exit.Error {
 	var setBytes, digest []byte
 	if len(placements) == 1 {
@@ -92,24 +142,7 @@ func (c *Orchestrator) converge(s *session, w *worker, placements []DesiredPlace
 			return exit.Internalf("cannot mint the empty PlacementSet for %s: %s", w.instanceID, err)
 		}
 	}
-	rev := uint64(0)
-	if w.spec.Connection != nil {
-		if len(placements) != 1 || placements[0].PlacementRevision == 0 {
-			return exit.Named(exit.Structural, "remote_placement_revision_missing",
-				"attached worker %s has no Tensorhub placement revision", w.instanceID)
-		}
-		rev = placements[0].PlacementRevision
-		c.mu.Lock()
-		prior := w.revision
-		c.mu.Unlock()
-		if prior > rev {
-			return exit.Named(exit.Conflict, "remote_placement_revision_regressed",
-				"attached worker %s already holds desired revision %d, not older Tensorhub revision %d",
-				w.instanceID, prior, rev)
-		}
-	} else {
-		rev = c.nextRevision()
-	}
+	rev := c.nextRevision()
 	c.mu.Lock()
 	w.revision, w.setDigest, w.setBytes = rev, digest, setBytes
 	w.desiredRefusal = nil
@@ -143,7 +176,7 @@ func (c *Orchestrator) converge(s *session, w *worker, placements []DesiredPlace
 // worker's own last word, and the two facts the frozen wire could not tell apart —
 // "your message arrived" and "your intent is satisfied" — are now two separate readable
 // numbers (#473).
-func (c *Orchestrator) onObserved(s *session, r *pb.ObservedWorkerState, frameBytes []byte) {
+func (c *Orchestrator) onObserved(s *session, r *pb.ObservedWorkerState) {
 	var status *pb.PlacementStatus
 	var acquisition *records.PlacementAcquisition
 	var desiredRevision uint64
@@ -268,9 +301,6 @@ func (c *Orchestrator) onObserved(s *session, r *pb.ObservedWorkerState, frameBy
 		if problem := c.opt.Store.ObservePlacementAcquisition(*acquisition); problem != nil {
 			c.logf("placement acquisition observation REFUSED: %s", problem.Message)
 		}
-	}
-	if w != nil && w.spec.Connection != nil {
-		c.queueRentalSessionEvidence(s, desiredRevision, frameBytes)
 	}
 	if w != nil && w.media != nil {
 		go c.retryMediaCleanup(w)

@@ -26,7 +26,6 @@ import (
 	"github.com/cozy-creator/cozy/internal/orchestrator"
 	"github.com/cozy-creator/cozy/internal/output"
 	"github.com/cozy-creator/cozy/internal/records"
-	"github.com/cozy-creator/cozy/internal/rental"
 )
 
 // THE LIFECYCLE AND REQUEST VERBS (cl-010), every one of them a CLIENT of the local
@@ -878,16 +877,11 @@ func invocationTarget(ctx *Context) (Target, *launch.PackageDescriptor, *exit.Er
 				WithRemedy("`cozy rental` lists this host's rented machines").
 				WithNext("cozy rental")
 		}
-		parts := strings.Split(row.PackageRef, "/")
-		if len(parts) < 2 || parts[0]+"/"+parts[1] != target.Package {
-			return Target{}, nil, exit.New(exit.NotFound,
-				"machine %s does not host package %s", row.MachineName, target.Package).
-				WithRemedy("this machine hosts %s", row.PackageRef).
-				WithNext("cozy rental")
-		}
-		target.MachineID = row.ID
-		descriptor, problem := rental.PackageDescriptor(store, row.ID)
-		return target, descriptor, problem
+		return Target{}, nil, exit.Named(exit.Unavailable,
+			"rental.download_delegation_unavailable",
+			"machine %s is attachable, but direct package/model download delegation is not installed",
+			row.MachineName).
+			WithRemedy("keep the rental; proto-013 must land before non-empty desired state can run")
 	}
 	facts, problem := generationFacts(ctx, target.Package)
 	if problem != nil && problem.Code == exit.NotFound {

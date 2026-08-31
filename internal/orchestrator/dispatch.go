@@ -501,10 +501,8 @@ func settledState(state string) bool {
 	return false
 }
 
-// resolveFor keeps the two target authorities separate. Local work asks the
-// local launcher. A pinned rental uses the exact placement persisted from
-// Tensorhub's acquisition attempt and adds only its dial authority; it never
-// asks this machine's install to recreate remote meaning.
+// resolveFor keeps local package execution separate from generic rented capacity.
+// Non-empty private desired state refuses until signed package_set delegation lands.
 func (c *Orchestrator) resolveFor(req records.Request) (WorkerLaunchSpec, *exit.Error) {
 	if req.Worker == "" {
 		if c.opt.Packages == nil {
@@ -548,11 +546,11 @@ func (c *Orchestrator) resolveFor(req records.Request) (WorkerLaunchSpec, *exit.
 		return WorkerLaunchSpec{}, exit.Named(exit.Internal, "rental.target_incomplete",
 			"rental %s resolved without a complete remote target", req.Worker)
 	}
-	spec := WorkerLaunchSpec{Placement: remote.Placement, Connection: remote.Connection}
-	// The rental IS the slot: one connected worker per rental id, its own instance
-	// namespace, and no local device envelope (the pod's card is the pod's).
-	spec.Placement.Package = pinnedPackage(spec.Placement.Package, req.Worker)
-	return spec, nil
+	return WorkerLaunchSpec{}, exit.Named(exit.Unavailable,
+		"rental.download_delegation_unavailable",
+		"rental %s is attachable, but direct package/model download delegation is not installed",
+		req.Worker).
+		WithRemedy("keep the rental; proto-013 must land before non-empty desired state can run")
 }
 
 // failQueued settles a request that can never be placed. It is a request-level terminal:
@@ -768,8 +766,7 @@ func (c *Orchestrator) maxOutputBytes() uint64 {
 }
 
 // invocationIdentity names the environment and optional local config digest an
-// invocation on w rides. Tensorhub's frozen remote placement owns the environment;
-// model configuration is bound separately and therefore has no package-wide digest.
+// invocation on w rides.
 func (c *Orchestrator) invocationIdentity(w *worker) (environment, config string, e *exit.Error) {
 	environment = w.spec.Placement.EnvironmentDigest
 	if environment == "" {

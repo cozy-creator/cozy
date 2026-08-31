@@ -83,11 +83,7 @@ type DesiredPlacement struct {
 	EnvironmentDigest        string       `json:"environment_digest"`
 	WheelhouseManifestDigest string       `json:"wheelhouse_manifest_digest"`
 	Entrypoints              []Entrypoint `json:"entrypoints"`
-	// PlacementRevision is Tensorhub's monotonic revision for a private rental. It is
-	// the exact DesiredWorkerState.revision Cozy relays for remote placements, so Hub
-	// can compare desired, accepted, and converged without guessing a local daemon counter.
-	PlacementRevision uint64 `json:"placement_revision,omitempty"`
-	PlacementIDValue  string `json:"placement_id,omitempty"`
+	PlacementIDValue         string       `json:"placement_id,omitempty"`
 	// Hidden names the entrypoints this placement deliberately does NOT serve (#572d).
 	// Recorded so an operator reading a placement can tell "no binding was staged" from
 	// "a binding was staged and broke".
@@ -215,12 +211,10 @@ type WorkerConnection struct {
 	Media *media.Spec `json:"media,omitempty"`
 }
 
-// RemoteTarget joins one dial triple to the exact attempt-bound placement the
-// provisioned worker already staged. Connection is authority; Placement is
-// immutable execution meaning.
+// RemoteTarget is only the dial identity for generic rented capacity. Desired
+// package/model state is a later Creator-to-worker command.
 type RemoteTarget struct {
 	Connection *WorkerConnection
-	Placement  DesiredPlacement
 }
 
 // WorkerLaunchSpec is everything this owner needs to make one worker exist and host one
@@ -538,14 +532,6 @@ func (c *Orchestrator) EnsureWorker(spec WorkerLaunchSpec) (string, WorkerChange
 			return instanceID, ChangeNone, nil
 		}
 		if live.spec.Connection != nil {
-			if spec.Placement.PlacementRevision <= live.spec.Placement.PlacementRevision {
-				return instanceID, ChangeNone, exit.Named(exit.Conflict,
-					"rental.placement_revision_required",
-					"rental %s replacement revision %d does not advance %d",
-					live.spec.Connection.RentalID, spec.Placement.PlacementRevision,
-					live.spec.Placement.PlacementRevision).
-					WithRemedy("register the replacement PlacementSet with Tensorhub before sending it to the worker")
-			}
 			if e := c.ConvergePlacementSet(instanceID, []DesiredPlacement{spec.Placement}); e != nil {
 				return instanceID, ChangeNone, e
 			}
@@ -674,9 +660,8 @@ func lessRecentlyUsed(a, b *worker) bool {
 	return a.instanceID < b.instanceID
 }
 
-// EnsureRental makes an already-provisioned rental's worker resident without invoking
-// an package. This is the explicit paid-run preflight: the control claim must persist
-// actual hardware readback before a request can be submitted to the pod.
+// EnsureRental attaches one generic empty worker without selecting a package. Later
+// desired state is Creator-owned and travels directly on this control stream.
 func (c *Orchestrator) EnsureRental(id string) (string, string, WorkerChange, *exit.Error) {
 	if c.opt.Rentals == nil {
 		return "", "", ChangeNone, exit.Unavailablef("this Cozy daemon attaches no rented workers")
@@ -688,12 +673,45 @@ func (c *Orchestrator) EnsureRental(id string) (string, string, WorkerChange, *e
 	if target == nil || target.Connection == nil {
 		return "", "", ChangeNone, exit.Internalf("rental %s resolved no connected worker", id)
 	}
-	// The rental IS the slot, exactly as dispatch pins it: the same `org/name@<rental>`
-	// name, so a probe and a later pinned run share ONE connected worker.
-	spec := WorkerLaunchSpec{Placement: target.Placement, Connection: target.Connection}
-	spec.Placement.Package = pinnedPackage(spec.Placement.Package, id)
+	spec := WorkerLaunchSpec{Connection: target.Connection}
 	instance, change, problem := c.EnsureWorker(spec)
-	return instance, spec.Placement.Package, change, problem
+	if problem == nil {
+		problem = c.ensureWorkerClaimed(instance)
+	}
+	return instance, "", change, problem
+}
+
+func (c *Orchestrator) ensureWorkerClaimed(instanceID string) *exit.Error {
+	silent := SilentReports * ReportCadence
+	for {
+		c.mu.Lock()
+		w := c.workers[instanceID]
+		claimed := w != nil && !w.exited && w.bootID != "" && !w.lastReport.IsZero() && w.revision > 0
+		gone := w == nil || w.exited
+		quiet := time.Duration(0)
+		var refused *exit.Error
+		if w != nil {
+			refused = w.refusal
+			if !w.lastReport.IsZero() {
+				quiet = time.Since(w.lastReport)
+			} else if !w.spawned.IsZero() {
+				quiet = time.Since(w.spawned)
+			}
+		}
+		c.mu.Unlock()
+		switch {
+		case claimed:
+			return nil
+		case refused != nil:
+			return refused
+		case gone:
+			return exit.New(exit.Failed, "the rented worker exited before accepting this Creator claim")
+		case quiet > silent:
+			return exit.Named(exit.Failed, "worker_silent",
+				"the rented worker did not accept this Creator claim across %d report periods", SilentReports)
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
 }
 
 // DetachRental stops this daemon's control loop for one rented worker. It waits for an

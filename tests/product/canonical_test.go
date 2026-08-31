@@ -30,6 +30,7 @@ func TestCanonicalFormatsAreVersionOne(t *testing.T) {
 		&pb.AttemptOutcomeBody{},
 		&pb.ArtifactReceipt{},
 		&pb.ClaimProof{},
+		&pb.DownloadDelegation{},
 		&pb.PlacementSet{},
 		&pb.WorkerSnapshotBody{},
 	} {
@@ -148,6 +149,8 @@ func messageFor(name string) proto.Message {
 		return &pb.ArtifactReceipt{}
 	case "cozy.worker.v1.ClaimProof":
 		return &pb.ClaimProof{}
+	case "cozy.worker.v1.DownloadDelegation":
+		return &pb.DownloadDelegation{}
 	case "cozy.worker.v1.PlacementSet":
 		return &pb.PlacementSet{}
 	case "cozy.worker.v1.WorkerSnapshotBody":
