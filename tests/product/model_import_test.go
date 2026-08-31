@@ -2,8 +2,10 @@ package producttest
 
 import (
 	"context"
+	"encoding/binary"
 	"encoding/json"
 	"flag"
+	"net/http"
 	"os"
 	"path/filepath"
 	"strings"
@@ -13,6 +15,7 @@ import (
 
 	"github.com/cozy-creator/cozy/internal/exit"
 	"github.com/cozy-creator/cozy/internal/modelsource"
+	"github.com/cozy-creator/cozy/internal/tfs"
 )
 
 var liveModelImportE2E = flag.String("live-model-import-e2e", "", "real local model-import fixture JSON")
@@ -112,6 +115,132 @@ func TestLocalModelStagingHonorsCancellation(t *testing.T) {
 	_, _, problem = modelsource.StageLocal(ctx, source, filepath.Join(root, "stage"))
 	if problem == nil || problem.Code != exit.Canceled {
 		t.Fatalf("canceled local staging = %v", problem)
+	}
+}
+
+func TestLocalModelDryRunReadsOnlyTheHeader(t *testing.T) {
+	root := t.TempDir()
+	path := filepath.Join(root, "large.safetensors")
+	file, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR, 0o600)
+	must(t, err)
+	header := []byte(`{"value":{"dtype":"F32","shape":[1],"data_offsets":[0,4]}} `)
+	prefix := make([]byte, 8)
+	binary.LittleEndian.PutUint64(prefix, uint64(len(header)))
+	_, err = file.Write(append(prefix, header...))
+	must(t, err)
+	const sourceSize = int64(8 << 30)
+	must(t, file.Truncate(sourceSize))
+	_, err = file.WriteAt([]byte{0x7f}, sourceSize-1)
+	must(t, err)
+	must(t, file.Close())
+
+	source, problem := modelsource.Parse(path, root)
+	fatal(t, problem)
+	plan, staged, problem := modelsource.StageLocalHeader(context.Background(), source, filepath.Join(root, "stage"))
+	fatal(t, problem)
+	if plan.InspectedBytes != int64(8+len(header)) || plan.Bytes != sourceSize {
+		t.Fatalf("dry-run inspection = %d bytes of %d", plan.InspectedBytes, plan.Bytes)
+	}
+	stagedFile, err := os.Open(staged.Path)
+	must(t, err)
+	defer stagedFile.Close()
+	tail := []byte{0xff}
+	_, err = stagedFile.ReadAt(tail, sourceSize-1)
+	must(t, err)
+	if tail[0] != 0 {
+		t.Fatal("dry-run copied the model body into its sparse header view")
+	}
+}
+
+func TestLocalModelDryRunHonorsCancellationAndMutation(t *testing.T) {
+	root := t.TempDir()
+	path := filepath.Join(root, "moving-header.safetensors")
+	file, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR, 0o600)
+	must(t, err)
+	prefix := make([]byte, 8)
+	binary.LittleEndian.PutUint64(prefix, uint64(maxTestHeader))
+	_, err = file.Write(prefix)
+	must(t, err)
+	must(t, file.Truncate(8+maxTestHeader+4))
+	must(t, file.Close())
+	source, problem := modelsource.Parse(path, root)
+	fatal(t, problem)
+
+	canceled, cancel := context.WithCancel(context.Background())
+	cancel()
+	if _, _, problem = modelsource.StageLocalHeader(canceled, source, filepath.Join(root, "canceled")); problem == nil || problem.Code != exit.Canceled {
+		t.Fatalf("canceled dry-run staging = %v", problem)
+	}
+
+	started := make(chan struct{})
+	done := make(chan struct{})
+	stopped := make(chan struct{})
+	go func() {
+		defer close(stopped)
+		moving, openErr := os.OpenFile(path, os.O_WRONLY, 0)
+		if openErr != nil {
+			close(started)
+			return
+		}
+		defer moving.Close()
+		close(started)
+		value := byte(1)
+		for {
+			_, _ = moving.WriteAt([]byte{value}, 8+maxTestHeader-1)
+			value++
+			select {
+			case <-done:
+				return
+			default:
+			}
+		}
+	}()
+	<-started
+	_, _, problem = modelsource.StageLocalHeader(context.Background(), source, filepath.Join(root, "moving"))
+	close(done)
+	<-stopped
+	if problem == nil || problem.Name != "model_source_changed" {
+		t.Fatalf("mutating dry-run source = %v", problem)
+	}
+}
+
+const maxTestHeader = int64(64 << 20)
+
+func TestModelImportBindsRangesAndSourceSelection(t *testing.T) {
+	if !modelsource.ExactRange(http.StatusPartialContent, 8, "bytes 0-7/4096", 0, 7, 4096) {
+		t.Fatal("exact provider range was refused")
+	}
+	for name, contentRange := range map[string]string{
+		"wrong start": "bytes 8-15/4096",
+		"wrong total": "bytes 0-7/8192",
+	} {
+		t.Run(name, func(t *testing.T) {
+			if modelsource.ExactRange(http.StatusPartialContent, 8, contentRange, 0, 7, 4096) {
+				t.Fatal("mismatched provider range was accepted")
+			}
+		})
+	}
+
+	decode := func(body string) tfs.SourcePlan {
+		t.Helper()
+		var plan tfs.SourcePlan
+		must(t, json.Unmarshal([]byte(body), &plan))
+		return plan
+	}
+	base := `{"profile":"reviewed/1","registry_sha256":"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","target":"cozytensors/1","sources":[{"component":"transformer","source_member":"weights/model.safetensors","projected":false}]}`
+	if !decode(base).SameSelection(decode(base)) {
+		t.Fatal("identical source selections differ")
+	}
+	for name, changed := range map[string]string{
+		"profile": `{"profile":"other/1","registry_sha256":"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","target":"cozytensors/1","sources":[{"component":"transformer","source_member":"weights/model.safetensors","projected":false}]}`,
+		"target":  `{"profile":"reviewed/1","registry_sha256":"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","target":"other/1","sources":[{"component":"transformer","source_member":"weights/model.safetensors","projected":false}]}`,
+		"member":  `{"profile":"reviewed/1","registry_sha256":"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","target":"cozytensors/1","sources":[{"component":"transformer","source_member":"weights/other.safetensors","projected":false}]}`,
+	} {
+		t.Run(name, func(t *testing.T) {
+			if decode(base).SameSelection(decode(changed)) {
+				t.Fatalf("changed %s was accepted", name)
+			}
+		})
 	}
 }
 

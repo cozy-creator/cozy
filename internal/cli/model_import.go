@@ -66,7 +66,11 @@ func handleModelImport(ctx *Context) *exit.Error {
 	var resolver *modelsource.Resolver
 	if source.Kind == modelsource.LocalFile {
 		var staged modelsource.StagedFile
-		resolved, staged, problem = modelsource.StageLocal(runctx, source, filepath.Join(root, "files"))
+		if ctx.Inv.Bool("--dry-run") {
+			resolved, staged, problem = modelsource.StageLocalHeader(runctx, source, filepath.Join(root, "headers"))
+		} else {
+			resolved, staged, problem = modelsource.StageLocal(runctx, source, filepath.Join(root, "files"))
+		}
 		headerFiles = []modelsource.StagedFile{staged}
 	} else {
 		resolver, problem = modelsource.NewResolver(source.Kind, token)
@@ -129,6 +133,10 @@ func handleModelImport(ctx *Context) *exit.Error {
 		source.Kind != modelsource.LocalFile), fullPlanPath)
 	if problem != nil {
 		return problem
+	}
+	if !headerPlan.SameSelection(fullPlan) {
+		return exit.Named(exit.Conflict, "model_source_plan_changed",
+			"the downloaded model no longer matches the reviewed header plan")
 	}
 	manifest, problem := tool.RunSource(runctx, fullPlanPath)
 	if problem != nil {

@@ -95,7 +95,7 @@ func writeInline(target string, file File) *exit.Error {
 }
 
 func (r *Resolver) stageHeader(ctx context.Context, file File, target string) *exit.Error {
-	first, problem := r.rangeBytes(ctx, file.URL, 0, 7)
+	first, problem := r.rangeBytes(ctx, file, 0, 7)
 	if problem != nil {
 		return problem
 	}
@@ -107,7 +107,7 @@ func (r *Resolver) stageHeader(ctx context.Context, file File, target string) *e
 		return exit.Named(exit.Validation, "model_source_header_invalid",
 			"%s declares invalid header length %d", file.Member, length)
 	}
-	header, problem := r.rangeBytes(ctx, file.URL, 8, 7+length)
+	header, problem := r.rangeBytes(ctx, file, 8, 7+length)
 	if problem != nil {
 		return problem
 	}
@@ -141,17 +141,18 @@ func (r *Resolver) stageHeader(ctx context.Context, file File, target string) *e
 	return nil
 }
 
-func (r *Resolver) rangeBytes(ctx context.Context, location string, first, last int64) ([]byte, *exit.Error) {
+func (r *Resolver) rangeBytes(ctx context.Context, file File, first, last int64) ([]byte, *exit.Error) {
 	headers := make(http.Header)
 	headers.Set("Range", fmt.Sprintf("bytes=%d-%d", first, last))
-	response, problem := r.request(ctx, http.MethodGet, location, headers)
+	response, problem := r.request(ctx, http.MethodGet, file.URL, headers)
 	if problem != nil {
 		return nil, problem
 	}
 	defer response.Body.Close()
-	if response.StatusCode != http.StatusPartialContent {
+	if !ExactRange(response.StatusCode, response.ContentLength, response.Header.Get("Content-Range"),
+		first, last, file.Length) {
 		return nil, exit.Named(exit.Validation, "model_source_range_unsupported",
-			"provider did not honor a bounded header range")
+			"provider did not honor the exact bounded header range")
 	}
 	want := last - first + 1
 	body, err := io.ReadAll(io.LimitReader(response.Body, want+1))
@@ -160,6 +161,15 @@ func (r *Resolver) rangeBytes(ctx context.Context, location string, first, last 
 			"provider returned %d bytes for a %d-byte range", len(body), want)
 	}
 	return body, nil
+}
+
+// ExactRange verifies that a provider returned precisely the requested byte
+// interval from the already-resolved immutable object.
+func ExactRange(status int, contentLength int64, contentRange string, first, last, total int64) bool {
+	want := last - first + 1
+	return status == http.StatusPartialContent &&
+		contentRange == fmt.Sprintf("bytes %d-%d/%d", first, last, total) &&
+		(contentLength < 0 || contentLength == want)
 }
 
 func (r *Resolver) download(ctx context.Context, file File, target string, progress func(string)) *exit.Error {

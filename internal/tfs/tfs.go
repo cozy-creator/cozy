@@ -361,13 +361,33 @@ type SourceCarrier struct {
 }
 
 type SourcePlan struct {
-	Session string `json:"session"`
-	Sources []struct {
+	Session        string `json:"session"`
+	Profile        string `json:"profile"`
+	RegistrySHA256 string `json:"registry_sha256"`
+	Sources        []struct {
 		Component    string `json:"component"`
 		Path         string `json:"path"`
 		SourceMember string `json:"source_member,omitempty"`
+		Projected    bool   `json:"projected"`
 	} `json:"sources"`
 	Target string `json:"target"`
+}
+
+// SameSelection ignores transient paths and sessions while binding the exact
+// reviewed profile and source-to-component assignment.
+func (p SourcePlan) SameSelection(other SourcePlan) bool {
+	if p.Profile != other.Profile || p.RegistrySHA256 != other.RegistrySHA256 ||
+		p.Target != other.Target || len(p.Sources) != len(other.Sources) {
+		return false
+	}
+	for i := range p.Sources {
+		left, right := p.Sources[i], other.Sources[i]
+		if left.Component != right.Component || left.SourceMember != right.SourceMember ||
+			left.Projected != right.Projected {
+			return false
+		}
+	}
+	return true
 }
 
 // PlanSource asks TensorFS to assign exact physical carriers through its
@@ -393,7 +413,8 @@ func (t *Tool) PlanSource(registry string, carriers []SourceCarrier, outPath str
 		return SourcePlan{}, exit.Internalf("the source plan tfs wrote is unreadable: %s", err)
 	}
 	var plan SourcePlan
-	if json.Unmarshal(raw, &plan) != nil || len(plan.Session) != 16 || plan.Target == "" || len(plan.Sources) == 0 {
+	if json.Unmarshal(raw, &plan) != nil || len(plan.Session) != 16 || plan.Profile == "" ||
+		!validID(plan.RegistrySHA256) || plan.Target == "" || len(plan.Sources) == 0 {
 		return SourcePlan{}, exit.Internalf("tfs returned an invalid source plan")
 	}
 	for _, source := range plan.Sources {

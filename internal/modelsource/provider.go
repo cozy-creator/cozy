@@ -46,6 +46,7 @@ type Plan struct {
 	License         string
 	Files           []File
 	Bytes           int64
+	InspectedBytes  int64
 }
 
 type Resolver struct {
