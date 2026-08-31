@@ -38,3 +38,13 @@ func deviceOf(p string) (uint64, bool) {
 	}
 	return uint64(st.Dev), true
 }
+
+// Unix unlinks files through their parent directory. Leave read-only regular files
+// alone (they may share an inode) and restore only the directory traversal and write
+// bits needed to remove the retired tree.
+func removalMode(info fs.FileInfo) fs.FileMode {
+	if info.IsDir() {
+		return info.Mode().Perm() | 0o700
+	}
+	return info.Mode().Perm()
+}

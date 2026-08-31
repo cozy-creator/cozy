@@ -564,7 +564,7 @@ func checkCapacity(dir string, staged int64) *exit.Error {
 
 // Remove drops one install: its pin, generation row, and exclusive directory.
 // Shared TensorFS bytes are never touched here.
-func Remove(st *records.Store, pkg string, major int) (int64, *exit.Error) {
+func Remove(l home.Layout, st *records.Store, pkg string, major int) (int64, *exit.Error) {
 	pin, gen, e := st.ActivePin(pkg, major)
 	if e != nil || pin == nil {
 		return 0, e
@@ -575,24 +575,71 @@ func Remove(st *records.Store, pkg string, major int) (int64, *exit.Error) {
 	if gen == nil {
 		return 0, nil
 	}
-	return Reclaim(st, gen.ID)
+	return Reclaim(l, st, gen.ID)
 }
 
 // Reclaim removes an unpinned generation immediately. The database claim wins
-// before filesystem deletion, so a newly pinned generation is never removed.
-func Reclaim(st *records.Store, id string) (int64, *exit.Error) {
+// before filesystem deletion, so a newly pinned generation is never removed. Only
+// after that claim may the read-only published tree be made removable.
+func Reclaim(l home.Layout, st *records.Store, id string) (int64, *exit.Error) {
 	gen, problem := st.Install(id)
 	if problem != nil || gen == nil {
+		return 0, problem
+	}
+	target, problem := generationRemovalTarget(l, *gen)
+	if problem != nil {
 		return 0, problem
 	}
 	claimed, problem := st.ForgetIfUnreferenced(id)
 	if problem != nil || !claimed {
 		return 0, problem
 	}
-	if err := os.RemoveAll(gen.Dir); err != nil {
-		return 0, exit.Internalf("cannot remove generation directory %s: %s", gen.Dir, err)
+	if err := makeGenerationRemovable(target); err != nil {
+		return 0, exit.Internalf("cannot prepare retired generation directory %s for removal: %s", target, err)
+	}
+	if err := os.RemoveAll(target); err != nil {
+		return 0, exit.Internalf("cannot remove generation directory %s: %s", target, err)
 	}
 	return gen.BytesExcl, nil
+}
+
+func generationRemovalTarget(l home.Layout, gen records.PackageInstall) (string, *exit.Error) {
+	root, err := filepath.Abs(l.Generations)
+	if err != nil {
+		return "", exit.Internalf("cannot resolve the generation root %s: %s", l.Generations, err)
+	}
+	if gen.ID == "" || gen.ID == "." || gen.ID == ".." || filepath.Base(gen.ID) != gen.ID {
+		return "", exit.Internalf("refusing to remove generation with unsafe id %q", gen.ID)
+	}
+	target := filepath.Join(root, gen.ID)
+	recorded, err := filepath.Abs(gen.Dir)
+	if err != nil || filepath.Dir(target) != root || filepath.Clean(recorded) != target {
+		return "", exit.Internalf("refusing to remove generation %s outside %s", gen.ID, root)
+	}
+	return target, nil
+}
+
+func makeGenerationRemovable(root string) error {
+	return filepath.WalkDir(root, func(path string, entry os.DirEntry, walkErr error) error {
+		if walkErr != nil {
+			if os.IsNotExist(walkErr) {
+				return nil
+			}
+			return walkErr
+		}
+		if entry.Type()&os.ModeSymlink != 0 {
+			return nil
+		}
+		info, err := entry.Info()
+		if err != nil {
+			return err
+		}
+		mode := removalMode(info)
+		if mode == info.Mode().Perm() {
+			return nil
+		}
+		return os.Chmod(path, mode)
+	})
 }
 
 func newGenerationID() (string, *exit.Error) {

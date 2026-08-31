@@ -87,10 +87,10 @@ func handleDirectoryInstall(ctx *Context) *exit.Error {
 	if problem != nil {
 		return problem
 	}
-	return emitInstallResult(ctx, st, result)
+	return emitInstallResult(ctx, l, st, result)
 }
 
-func emitInstallResult(ctx *Context, st *records.Store, res *install.Result) *exit.Error {
+func emitInstallResult(ctx *Context, l home.Layout, st *records.Store, res *install.Result) *exit.Error {
 	g := res.Gen
 	fields := []output.Field{
 		{K: "package", V: g.Package}, {K: "major", V: g.Major},
@@ -114,7 +114,7 @@ func emitInstallResult(ctx *Context, st *records.Store, res *install.Result) *ex
 		output.Field{K: "timings", V: timingsText(res.Timings)},
 	)
 	if res.Superseded != "" {
-		reclaimed, problem := install.Reclaim(st, res.Superseded)
+		reclaimed, problem := install.Reclaim(l, st, res.Superseded)
 		if problem != nil {
 			res.Warnings = append(res.Warnings,
 				"the new version is active; cleanup of the prior version was deferred: "+problem.Message)
@@ -176,7 +176,7 @@ func handleLs(ctx *Context) *exit.Error {
 }
 
 func handleRm(ctx *Context) *exit.Error {
-	_, st, w, e := open(ctx.Cfg, true)
+	l, st, w, e := open(ctx.Cfg, true)
 	if e != nil {
 		return e
 	}
@@ -206,7 +206,7 @@ func handleRm(ctx *Context) *exit.Error {
 			if ref.HasMajor && p.Major != ref.Major {
 				continue
 			}
-			n, e := install.Remove(st, p.Package, p.Major)
+			n, e := install.Remove(l, st, p.Package, p.Major)
 			if e != nil {
 				return e
 			}
@@ -244,7 +244,7 @@ func handleRm(ctx *Context) *exit.Error {
 		if !selected {
 			continue
 		}
-		n, problem := install.Reclaim(st, generation.ID)
+		n, problem := install.Reclaim(l, st, generation.ID)
 		if problem != nil {
 			return problem
 		}
