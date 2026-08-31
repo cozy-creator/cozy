@@ -9,6 +9,8 @@ jobs:
         with:
           go-version: stable
       - uses: astral-sh/setup-uv@v5
+      - run: uv python install 3.12
+      - run: uv run --isolated --no-project --python 3.12 python -c "import sys; assert sys.version_info[:2] == (3, 12)"
       # CGO_ENABLED=0 is the LAW, not a default: `internal/records` drives SQLite through
       # modernc.org/sqlite and nothing in this binary is C. Building with it off here is
       # what keeps a C dependency from arriving unnoticed and silently ending the

@@ -157,6 +157,7 @@ func TestPackageDownloadPlanContract(t *testing.T) {
 				len(body.ModelSelections) != 0 {
 				t.Errorf("package selection body changed: %+v err=%v", body, err)
 			}
+			profile := "torch2.13.0-cpu-cp312-linux-x86"
 			switch body.Capability.Accelerator {
 			case "cpu":
 				if body.Capability.OS != "linux" || body.Capability.Arch != "x86" ||
@@ -164,6 +165,7 @@ func TestPackageDownloadPlanContract(t *testing.T) {
 					t.Errorf("CPU package install target changed: %+v", body.Capability)
 				}
 			case "nvidia":
+				profile = "torch2.13.0-cu130-cp312-linux-x86"
 				if body.Capability.OS != "linux" || body.Capability.Arch != "x86" ||
 					body.Capability.DriverCUDA != "13.2" || body.Capability.ComputeCapability != "8.9" {
 					t.Errorf("NVIDIA package install target changed: %+v", body.Capability)
@@ -171,7 +173,7 @@ func TestPackageDownloadPlanContract(t *testing.T) {
 			default:
 				t.Errorf("package install target omitted accelerator: %+v", body.Capability)
 			}
-			_, _ = io.WriteString(w, `{"release":"1.2.3","profile":"cpu-test","placement_set":{"canonical_bytes":"e30=","digest":"sha256:`+strings.Repeat("2", 64)+`","length":2},"package_descriptor":{"canonical_bytes":"e30=","digest":"sha256:`+strings.Repeat("4", 64)+`","length":2},"qualification":{"canonical_bytes":"e30=","digest":"sha256:`+strings.Repeat("5", 64)+`","length":2},"downloads":[{"digest":"sha256:`+strings.Repeat("1", 64)+`","kind":"project_wheel","length":4,"path":"proof.whl","url":"https://storage.invalid/proof.whl"}]}`)
+			_, _ = io.WriteString(w, `{"release":"1.2.3","profile":"`+profile+`","placement_set":{"canonical_bytes":"e30=","digest":"sha256:`+strings.Repeat("2", 64)+`","length":2},"package_descriptor":{"canonical_bytes":"e30=","digest":"sha256:`+strings.Repeat("4", 64)+`","length":2},"qualification":{"canonical_bytes":"e30=","digest":"sha256:`+strings.Repeat("5", 64)+`","length":2},"downloads":[{"digest":"sha256:`+strings.Repeat("1", 64)+`","kind":"project_wheel","length":4,"path":"proof.whl","url":"https://storage.invalid/proof.whl"}]}`)
 		default:
 			http.NotFound(w, r)
 		}
@@ -186,16 +188,16 @@ func TestPackageDownloadPlanContract(t *testing.T) {
 	plan, problem := client.PackageDownloads(context.Background(), ref, "1.2.3", hub.PackageInstallTarget{
 		Accelerator: "cpu", OS: "linux", Arch: "x86",
 	})
-	if problem != nil || plan.Release != "1.2.3" || plan.Profile != "cpu-test" ||
+	if problem != nil || plan.Release != "1.2.3" || plan.Profile != "torch2.13.0-cpu-cp312-linux-x86" ||
 		len(plan.Downloads) != 1 || plan.Downloads[0].Path != "proof.whl" {
 		t.Fatalf("package install plan changed: %+v problem=%v", plan, problem)
 	}
-	_, problem = client.PackageDownloads(context.Background(), ref, "1.2.3", hub.PackageInstallTarget{
+	nvidia, problem := client.PackageDownloads(context.Background(), ref, "1.2.3", hub.PackageInstallTarget{
 		Accelerator: "nvidia", OS: "linux", Arch: "x86",
 		DriverCUDA: "13.2", ComputeCapability: "8.9",
 	})
-	if problem != nil {
-		t.Fatalf("NVIDIA package install target was refused: %v", problem)
+	if problem != nil || nvidia.Profile != "torch2.13.0-cu130-cp312-linux-x86" {
+		t.Fatalf("NVIDIA package install target was refused or selected another profile: %+v, %v", nvidia, problem)
 	}
 	if latest, problem := client.PackageDownloads(context.Background(), ref, "", hub.PackageInstallTarget{
 		Accelerator: "cpu", OS: "linux", Arch: "x86",

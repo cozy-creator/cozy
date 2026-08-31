@@ -343,13 +343,11 @@ type worker struct {
 	attachDone  chan struct{}
 	processDone chan struct{}
 
-	// remoteInstance is the instance identity an ATTACHED pod's worker declared for
-	// itself. A pod is a machine this host never spawned, so it names its own worker the
-	// way it mints its own boot id; what this host may hold it to is that the name does
-	// not CHANGE under it. Empty for a locally spawned worker, whose identity is this
-	// launcher's by construction.
-	remoteInstance string
-	remoteWorkerID string
+	// declaredInstance is the worker's self-minted process-lifetime identity. Creator
+	// names the stable slot; every local or attached worker names its own incarnation and
+	// must keep that identity stable across a control-stream reconnect.
+	declaredInstance string
+	remoteWorkerID   string
 	// desiredPackages/models are Creator's logical private-rental intent. They survive a
 	// control-stream reconnect so the new authenticated stream does not reset a loaded
 	// worker to the empty package_set. They are refs only, never download locations or a
@@ -927,7 +925,6 @@ func (c *Orchestrator) spawnWorker(spec WorkerLaunchSpec) (string, *exit.Error) 
 	args = append(args,
 		"--socket", listen,
 		"--out", filepath.Join(root, "run"),
-		"--instance-id", instanceID,
 		"--release-id", spec.Placement.PackageRevisionDigest,
 		"--devices", strings.Join(spec.Devices, ","),
 		"--grace", strconv.FormatFloat(graceOr(spec.GraceSec), 'f', -1, 64),

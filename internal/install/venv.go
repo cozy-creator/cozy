@@ -134,16 +134,11 @@ func MaterializePublishedEnvironment(pythonABI, venvDir string, wheels []string)
 }
 
 func pythonForABI(abi string) (string, *exit.Error) {
-	if len(abi) < 5 || !strings.HasPrefix(abi, "cp3") {
+	if abi != "cp312" {
 		return "", exit.Named(exit.Structural, "published_python_abi_invalid",
-			"selected package environment has unsupported Python ABI %q", abi)
+			"selected package environment has unsupported Python ABI %q; Creator supports only cp312", abi)
 	}
-	minor, err := strconv.Atoi(abi[3:])
-	if err != nil || minor < 8 || minor > 99 {
-		return "", exit.Named(exit.Structural, "published_python_abi_invalid",
-			"selected package environment has unsupported Python ABI %q", abi)
-	}
-	return "3." + strconv.Itoa(minor), nil
+	return "3.12", nil
 }
 
 // Disk measures one generation exactly once, at install: bytes only this generation

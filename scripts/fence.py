@@ -810,6 +810,44 @@ def check_typed_resources():
     return bad
 
 
+def check_python_seat():
+    """Published environments have one hard CPython seat, never a parsed alias."""
+    path = pathlib.Path("internal/install/venv.go")
+    text = path.read_text()
+    bad = []
+    for required in ('if abi != "cp312"', 'return "3.12", nil'):
+        if required not in text:
+            bad.append(f"{path}: [python] missing exact CPython 3.12 seat {required!r}")
+    for deleted in ("cp314", "3.14"):
+        if deleted in text:
+            bad.append(f"{path}: [python] deleted Python seat remains: {deleted}")
+
+    fixtures = (
+        pathlib.Path("tests/product/testdata/build-weightless.py"),
+        pathlib.Path("tests/product/testdata/build-modeled-editable.py"),
+        pathlib.Path("tests/product/testdata/package-release/finalize.json"),
+    )
+    for fixture in fixtures:
+        body = fixture.read_text()
+        if ">=3.12,<3.13" not in body:
+            bad.append(f"{fixture}: [python] package fixture is not pinned to CPython 3.12")
+        for deleted in ("cp314", ">=3.14", "<3.15"):
+            if deleted in body:
+                bad.append(f"{fixture}: [python] deleted Python seat remains: {deleted}")
+
+    profiles = pathlib.Path("tests/product/package_release_client_test.go").read_text()
+    for expected in (
+        "torch2.13.0-cpu-cp312-linux-x86",
+        "torch2.13.0-cu130-cp312-linux-x86",
+    ):
+        if expected not in profiles:
+            bad.append(f"tests/product/package_release_client_test.go: [python] missing {expected}")
+    launcher = pathlib.Path("internal/orchestrator/worker.go").read_text()
+    if "--instance-id" in launcher:
+        bad.append("internal/orchestrator/worker.go: [python] Creator still passes Runtime's deleted --instance-id")
+    return bad
+
+
 if sys.argv[1:]:
     if sys.argv[1:] == ["--help"] or sys.argv[1:] == ["-h"]:
         print(__doc__.strip())
@@ -822,7 +860,7 @@ violations = (check_sources() + check_matrix() + check_manifest() + check_secret
               + check_contract() + check_video_boundary() + check_embedded() + check_scripts()
               + check_document_kinds() + check_render_streams() + check_output_shape()
               + check_media_contract() + check_typed_resources() + check_web_boundary()
-              + check_test_boundary())
+              + check_test_boundary() + check_python_seat())
 if violations:
     print("FENCE RED (boundaries.md):", file=sys.stderr)
     for v in violations:
@@ -841,5 +879,5 @@ print(
     f"embed({len(DENY_EMBED)} words, scripts allow@{len(PY_ALLOW)}) "
     f"contract({len(parse_go_routes(pathlib.Path('internal/api/routes.go')))} routes) "
     f"web(stub+bounded-upload+no-log) retired-planes(absent) "
-    f"resources(typed package/model, no aliases) test(tests/product only)"
+    f"resources(typed package/model, no aliases) python(cp312 only) test(tests/product only)"
 )

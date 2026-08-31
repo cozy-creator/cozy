@@ -5,7 +5,7 @@
 // Nothing here is a mock, and nothing in the orchestrator knows it exists.
 //
 // It is spawned by `tests/product` as an ordinary worker: the orchestrator
-// appends its own launch grammar (--socket/--out/--instance-id/--release-id/--devices/
+// appends its own launch grammar (--socket/--out/--release-id/--devices/
 // --grace), and `--arm` picks which of the adversary behaviours this process plays.
 package main
 
@@ -26,10 +26,8 @@ import (
 var (
 	socket = flag.String("socket", "", "the listen grant: a unix path or host:port")
 	out    = flag.String("out", "", "the run root whose control.addr publishes the bound address")
-	// --fake-instance wins over the --instance-id the orchestrator appends, so an arm can
-	// report an instance identity this owner never spawned.
+	// --fake-instance lets an arm replace the process identity this worker normally mints.
 	fakeInstance = flag.String("fake-instance", "", "report an instance identity nobody spawned")
-	instanceID   = flag.String("instance-id", "", "")
 	releaseID    = flag.String("release-id", "", "")
 	arm          = flag.String("arm", "idle", "idle|badcred|badrelease|steal|badterminal|dropack|output|missing-output|snapshotbarrier")
 	session      = flag.String("session", "", "a fixed worker_boot_id (the collision arm)")
@@ -48,7 +46,7 @@ func run() int {
 	flag.Parse()
 	instance := *fakeInstance
 	if instance == "" {
-		instance = *instanceID
+		instance = "ins-fake-" + randomHex(8)
 	}
 	release := *releaseID
 	if *arm == "badrelease" {
