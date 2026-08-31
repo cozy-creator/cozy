@@ -178,16 +178,17 @@ func parseLocal(raw, cwd string) (Source, *exit.Error) {
 	if err != nil {
 		return Source{}, badSource(raw, "local path cannot be resolved")
 	}
-	info, err := os.Stat(path)
+	info, err := os.Lstat(path)
 	if err != nil {
 		if os.IsNotExist(err) {
 			return Source{}, exit.New(exit.NotFound, "local model source %s does not exist", path)
 		}
 		return Source{}, exit.Internalf("cannot inspect local model source %s: %s", path, err)
 	}
-	if !info.Mode().IsRegular() || info.Size() <= 0 || !strings.HasSuffix(strings.ToLower(info.Name()), ".safetensors") {
+	if info.Mode()&os.ModeSymlink != 0 || !info.Mode().IsRegular() || info.Size() <= 0 ||
+		!strings.HasSuffix(strings.ToLower(info.Name()), ".safetensors") {
 		return Source{}, exit.Named(exit.Validation, "model_source_file_refused",
-			"local model source %s is not one nonempty regular .safetensors file", path)
+			"local model source %s is not one nonempty regular non-symlink .safetensors file", path)
 	}
 	return Source{Kind: LocalFile, Canonical: "file:" + filepath.ToSlash(path), Path: path, Bytes: info.Size()}, nil
 }

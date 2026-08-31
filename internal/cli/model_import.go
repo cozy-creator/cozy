@@ -56,11 +56,18 @@ func handleModelImport(ctx *Context) *exit.Error {
 	}
 	runctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
+	root := filepath.Join(layout.Transfer, "model-import-"+importOperation(name, source.Canonical))
+	if err := os.MkdirAll(root, 0o700); err != nil {
+		return exit.Internalf("cannot create model import operation: %s", err)
+	}
 
 	var resolved modelsource.Plan
+	var headerFiles []modelsource.StagedFile
 	var resolver *modelsource.Resolver
 	if source.Kind == modelsource.LocalFile {
-		resolved, problem = modelsource.ResolveLocal(source)
+		var staged modelsource.StagedFile
+		resolved, staged, problem = modelsource.StageLocal(source, filepath.Join(root, "files"))
+		headerFiles = []modelsource.StagedFile{staged}
 	} else {
 		resolver, problem = modelsource.NewResolver(source.Kind, token)
 		if problem == nil {
@@ -71,15 +78,8 @@ func handleModelImport(ctx *Context) *exit.Error {
 		return importCanceled(runctx, problem)
 	}
 
-	root := filepath.Join(layout.Transfer, "model-import-"+importOperation(name, resolved.Canonical))
-	if err := os.MkdirAll(root, 0o700); err != nil {
-		return exit.Internalf("cannot create model import operation: %s", err)
-	}
 	headerRoot := filepath.Join(root, "headers")
-	var headerFiles []modelsource.StagedFile
-	if source.Kind == modelsource.LocalFile {
-		headerFiles = []modelsource.StagedFile{{Path: source.Path, Carrier: true}}
-	} else {
+	if source.Kind != modelsource.LocalFile {
 		headerFiles, problem = resolver.Stage(runctx, resolved, headerRoot, true, progress(ctx))
 		if problem != nil {
 			return importCanceled(runctx, problem)

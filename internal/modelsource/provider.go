@@ -12,9 +12,7 @@ import (
 	"net/http"
 	"net/netip"
 	"net/url"
-	"os"
 	"path"
-	"path/filepath"
 	"sort"
 	"strconv"
 	"strings"
@@ -74,37 +72,6 @@ func (r *Resolver) Resolve(ctx context.Context, source Source) (Plan, *exit.Erro
 	default:
 		return Plan{}, exit.Internalf("provider resolver received non-provider source")
 	}
-}
-
-func ResolveLocal(source Source) (Plan, *exit.Error) {
-	if source.Kind != LocalFile {
-		return Plan{}, exit.Internalf("local resolver received a provider source")
-	}
-	file, err := os.Open(source.Path)
-	if err != nil {
-		return Plan{}, exit.New(exit.NotFound, "local model source is unreadable: %s", err)
-	}
-	before, err := file.Stat()
-	if err != nil || !before.Mode().IsRegular() || before.Size() <= 0 {
-		file.Close()
-		return Plan{}, exit.Named(exit.Validation, "model_source_file_refused",
-			"local model source is not one nonempty regular file")
-	}
-	hash := sha256.New()
-	_, hashErr := io.Copy(hash, file)
-	after, statErr := file.Stat()
-	closeErr := file.Close()
-	if hashErr != nil || statErr != nil || closeErr != nil || !os.SameFile(before, after) ||
-		before.Size() != after.Size() || before.ModTime() != after.ModTime() {
-		return Plan{}, exit.Named(exit.Conflict, "model_source_changed",
-			"local model source changed while it was being identified")
-	}
-	sha := hex.EncodeToString(hash.Sum(nil))
-	resolved := source
-	resolved.Canonical = "sha256:" + sha
-	return Plan{Source: resolved, Canonical: resolved.Canonical, SelectionSHA256: sha,
-		Files: []File{{Member: filepath.Base(source.Path), SHA256: sha, Length: before.Size(), Carrier: true}},
-		Bytes: before.Size()}, nil
 }
 
 func hardenedClient(kind Kind) *http.Client {
@@ -167,7 +134,8 @@ func allowedHost(kind Kind, host string) bool {
 			host == "hf.co" || strings.HasSuffix(host, ".hf.co") ||
 			host == "xethub.hf.co" || strings.HasSuffix(host, ".xethub.hf.co")
 	case Civitai:
-		return host == "civitai.com" || strings.HasSuffix(host, ".civitai.com")
+		return host == "civitai.com" || strings.HasSuffix(host, ".civitai.com") ||
+			host == "civitai-delivery-worker-prod.5ac0637cfd0766c97916cefa3764fbdf.r2.cloudflarestorage.com"
 	}
 	return false
 }
@@ -408,10 +376,10 @@ type civitaiVersion struct {
 }
 
 type civitaiModel struct {
-	AllowNoCredit         bool   `json:"allowNoCredit"`
-	AllowCommercialUse    string `json:"allowCommercialUse"`
-	AllowDerivatives      bool   `json:"allowDerivatives"`
-	AllowDifferentLicense bool   `json:"allowDifferentLicense"`
+	AllowNoCredit         bool     `json:"allowNoCredit"`
+	AllowCommercialUse    []string `json:"allowCommercialUse"`
+	AllowDerivatives      bool     `json:"allowDerivatives"`
+	AllowDifferentLicense bool     `json:"allowDifferentLicense"`
 }
 
 func (r *Resolver) resolveCivitai(ctx context.Context, source Source) (Plan, *exit.Error) {
@@ -455,7 +423,7 @@ func (r *Resolver) resolveCivitai(ctx context.Context, source Source) (Plan, *ex
 	}
 	sort.Slice(files, func(i, j int) bool { return files[i].Member < files[j].Member })
 	license := fmt.Sprintf("civitai:no-credit=%t;commercial=%s;derivatives=%t;different-license=%t",
-		model.AllowNoCredit, model.AllowCommercialUse, model.AllowDerivatives, model.AllowDifferentLicense)
+		model.AllowNoCredit, strings.Join(model.AllowCommercialUse, ","), model.AllowDerivatives, model.AllowDifferentLicense)
 	return finishPlan(source, license, files)
 }
 

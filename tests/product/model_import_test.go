@@ -6,7 +6,11 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
+	"time"
+
+	"github.com/cozy-creator/cozy/internal/modelsource"
 )
 
 var liveModelImportE2E = flag.String("live-model-import-e2e", "", "real local model-import fixture JSON")
@@ -41,6 +45,57 @@ func TestModelImportGrammarAndFailFastRefusals(t *testing.T) {
 		"tensorfs_registry: /tmp/operator-only.json\n"), 0o600))
 	if result := runCozyEnv([]string{"COZY_HOME=" + badConfig, "PATH=/usr/local/bin:/usr/bin:/bin"}, "rental"); result.code != 2 || !strings.Contains(result.output, `unknown key "tensorfs_registry"`) {
 		t.Fatalf("operator registry entered YAML = exit %d\n%s", result.code, result.output)
+	}
+}
+
+func TestLocalModelStagingRefusesMutationAndSymlink(t *testing.T) {
+	root := t.TempDir()
+	path := filepath.Join(root, "moving.safetensors")
+	file, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR, 0o600)
+	must(t, err)
+	must(t, file.Truncate(64<<20))
+	must(t, file.Close())
+	source, problem := modelsource.Parse(path, root)
+	fatal(t, problem)
+	started := make(chan struct{})
+	done := make(chan struct{})
+	stopped := make(chan struct{})
+	var once sync.Once
+	go func() {
+		defer close(stopped)
+		f, err := os.OpenFile(path, os.O_WRONLY, 0)
+		if err != nil {
+			close(started)
+			return
+		}
+		defer f.Close()
+		value := byte(1)
+		for {
+			_, _ = f.WriteAt([]byte{value}, 64<<20-1)
+			value++
+			once.Do(func() { close(started) })
+			select {
+			case <-done:
+				return
+			default:
+				time.Sleep(time.Millisecond)
+			}
+		}
+	}()
+	<-started
+	_, _, problem = modelsource.StageLocal(source, filepath.Join(root, "stage"))
+	close(done)
+	<-stopped
+	if problem == nil || problem.Name != "model_source_changed" {
+		t.Fatalf("mutating local source = %v", problem)
+	}
+
+	target := filepath.Join(root, "target.safetensors")
+	must(t, os.WriteFile(target, []byte("carrier"), 0o600))
+	link := filepath.Join(root, "link.safetensors")
+	must(t, os.Symlink(target, link))
+	if _, problem := modelsource.Parse(link, root); problem == nil || problem.Name != "model_source_file_refused" {
+		t.Fatalf("symlink local source = %v", problem)
 	}
 }
 
@@ -84,13 +139,32 @@ func TestLiveLocalModelImport(t *testing.T) {
 	}
 	fixture := readLiveImport(t, *liveModelImportE2E)
 	root := t.TempDir()
+	raw, err := os.ReadFile(fixture.Source)
+	must(t, err)
+	copyPath := filepath.Join(root, "source.safetensors")
+	must(t, os.WriteFile(copyPath, raw, 0o600))
+	fixture.Source = copyPath
 	env := importEnv(root, fixture)
 	if result := runCozyEnv(env, "model", "import", fixture.Source, "--name", fixture.Name, "--dry-run"); result.code != 0 || !strings.Contains(result.output, "planned") {
 		t.Fatalf("local import dry-run = exit %d\n%s", result.code, result.output)
 	}
-	if result := runCozyEnv(env, "model", "import", fixture.Source, "--name", fixture.Name); result.code != 0 || !strings.Contains(result.output, "local/"+fixture.Name) ||
-		!strings.Contains(result.output, "imported") {
-		t.Fatalf("local import = exit %d\n%s", result.code, result.output)
+	first := runCozyEnv(env, "model", "import", fixture.Source, "--name", fixture.Name, "--json")
+	if first.code != 0 || !strings.Contains(first.output, "local/"+fixture.Name) ||
+		!strings.Contains(first.output, "imported") {
+		t.Fatalf("local import = exit %d\n%s", first.code, first.output)
+	}
+	var firstResult map[string]any
+	must(t, json.Unmarshal([]byte(first.output), &firstResult))
+	raw[len(raw)-1] ^= 0xff
+	must(t, os.WriteFile(copyPath, raw, 0o600))
+	second := runCozyEnv(env, "model", "import", fixture.Source, "--name", fixture.Name, "--json")
+	if second.code != 0 {
+		t.Fatalf("local reimport = exit %d\n%s", second.code, second.output)
+	}
+	var secondResult map[string]any
+	must(t, json.Unmarshal([]byte(second.output), &secondResult))
+	if firstResult["manifest_id"] == secondResult["manifest_id"] || secondResult["changed"] != true {
+		t.Fatalf("local reimport did not atomically advance: first=%#v second=%#v", firstResult, secondResult)
 	}
 	if _, err := os.Stat(fixture.Source); err != nil {
 		t.Fatalf("local source was deleted: %v", err)
