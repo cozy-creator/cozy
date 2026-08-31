@@ -3,6 +3,7 @@
 package privatepackage
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
@@ -18,9 +19,14 @@ import (
 	"github.com/cozy-creator/cozy/internal/packagepublish"
 	"github.com/cozy-creator/cozy/internal/records"
 	"github.com/cozy-creator/cozy/internal/wheel"
+	pb "github.com/cozy-creator/cozy/protocol/cozy/worker/v1"
 )
 
-const maxFiles = packagepublish.MaxDependencyWheels + 1
+const (
+	maxFiles              = pb.MaxPrivatePackageFiles
+	privateDescriptorFile = "descriptor.json"
+	privateRevisionFile   = "revision.json"
+)
 
 type File struct {
 	Digest, Filename, Kind, Path string
@@ -28,8 +34,9 @@ type File struct {
 }
 
 type Revision struct {
-	Package, Release, SourceDigest, Digest string
-	Files                                  []File
+	Package, Release, SourceDigest, Digest, DescriptorDigest string
+	DescriptorLength                                         int64
+	Files                                                    []File
 }
 
 func Stage(ctx context.Context, layout home.Layout, install records.PackageInstall) (Revision, *exit.Error) {
@@ -66,6 +73,17 @@ func Stage(ctx context.Context, layout home.Layout, install records.PackageInsta
 			"editable source changed while its private wheel revision was being built").
 			WithRemedy("stop editing briefly and retry")
 	}
+	descriptorBytes, err := os.ReadFile(pack.Descriptor)
+	if err != nil || len(descriptorBytes) == 0 || len(descriptorBytes) > canonical.DocMax {
+		return Revision{}, exit.Named(exit.Structural, "private_package_descriptor_invalid",
+			"private package descriptor is absent or exceeds the canonical document bound")
+	}
+	normalized, normalizeErr := canonical.NormalizeJCS(descriptorBytes)
+	descriptorDigest, err := canonical.Spell(canonical.Digest(descriptorBytes))
+	if normalizeErr != nil || err != nil || !bytes.Equal(normalized, descriptorBytes) {
+		return Revision{}, exit.Named(exit.Structural, "private_package_descriptor_invalid",
+			"private package descriptor bytes are not their canonical identity")
+	}
 	paths := []string{pack.Wheel}
 	for _, dependency := range pack.DependencyWheels {
 		paths = append(paths, dependency.Path)
@@ -84,6 +102,9 @@ func Stage(ctx context.Context, layout home.Layout, install records.PackageInsta
 	if err := os.Mkdir(wheelDir, 0o700); err != nil {
 		return Revision{}, exit.Internalf("cannot create private wheel staging: %s", err)
 	}
+	if problem := copyDescriptor(descriptorBytes, filepath.Join(stage, privateDescriptorFile)); problem != nil {
+		return Revision{}, problem
+	}
 	files := make([]File, 0, len(paths))
 	for index, source := range paths {
 		kind := "dependency"
@@ -96,9 +117,20 @@ func Stage(ctx context.Context, layout home.Layout, install records.PackageInsta
 		}
 		files = append(files, file)
 	}
-	revision, problem := identity(install.Package, install.Version, sourceDigest, files)
+	revision, revisionBytes, problem := identity(install.Package, install.Version, sourceDigest,
+		descriptorDigest, int64(len(descriptorBytes)), files)
 	if problem != nil {
 		return Revision{}, problem
+	}
+	if problem := copyDescriptor(revisionBytes,
+		filepath.Join(stage, privateRevisionFile)); problem != nil {
+		return Revision{}, problem
+	}
+	if err := syncDirectory(wheelDir); err != nil {
+		return Revision{}, exit.Internalf("cannot sync private wheel staging: %s", err)
+	}
+	if err := syncDirectory(stage); err != nil {
+		return Revision{}, exit.Internalf("cannot sync private package staging: %s", err)
 	}
 	final := filepath.Join(layout.PrivatePackages, strings.TrimPrefix(revision.Digest, "sha256:"))
 	if err := os.Rename(stage, final); err != nil {
@@ -110,6 +142,9 @@ func Stage(ctx context.Context, layout home.Layout, install records.PackageInsta
 			return Revision{}, problem
 		}
 		return existing, nil
+	}
+	if err := syncDirectory(layout.PrivatePackages); err != nil {
+		return Revision{}, exit.Internalf("cannot commit private package revision: %s", err)
 	}
 	keep = true
 	for index := range revision.Files {
@@ -125,9 +160,23 @@ func Open(layout home.Layout, install records.PackageInstall, digest string) (Re
 	}
 	root := filepath.Join(layout.PrivatePackages, strings.TrimPrefix(digest, "sha256:"))
 	entries, err := os.ReadDir(root)
-	if err != nil || len(entries) != 1 || entries[0].Name() != "wheels" || !entries[0].IsDir() {
+	if err != nil || len(entries) != 3 || entries[0].Name() != privateDescriptorFile ||
+		!entries[0].Type().IsRegular() || entries[1].Name() != privateRevisionFile ||
+		!entries[1].Type().IsRegular() || entries[2].Name() != "wheels" || !entries[2].IsDir() {
 		return Revision{}, exit.Named(exit.NotFound, "private_package_revision_absent",
 			"private package revision %s is absent or incomplete", digest)
+	}
+	descriptorPath := filepath.Join(root, privateDescriptorFile)
+	descriptorBytes, err := os.ReadFile(descriptorPath)
+	if err != nil || len(descriptorBytes) == 0 || len(descriptorBytes) > canonical.DocMax {
+		return Revision{}, exit.Named(exit.Structural, "private_package_descriptor_invalid",
+			"private package descriptor is absent or exceeds the canonical document bound")
+	}
+	normalized, normalizeErr := canonical.NormalizeJCS(descriptorBytes)
+	descriptorDigest, err := canonical.Spell(canonical.Digest(descriptorBytes))
+	if normalizeErr != nil || err != nil || !bytes.Equal(normalized, descriptorBytes) {
+		return Revision{}, exit.Named(exit.Structural, "private_package_descriptor_invalid",
+			"private package descriptor bytes changed")
 	}
 	wheelDir := filepath.Join(root, "wheels")
 	wheels, err := os.ReadDir(wheelDir)
@@ -162,13 +211,19 @@ func Open(layout home.Layout, install records.PackageInstall, digest string) (Re
 		return Revision{}, exit.Named(exit.Structural, "private_package_project_wheel_count",
 			"private package revision has %d project wheels", projects)
 	}
-	revision, problem := identity(install.Package, install.Version, install.SourceDigest, files)
+	revision, revisionBytes, problem := identity(install.Package, install.Version, install.SourceDigest,
+		descriptorDigest, int64(len(descriptorBytes)), files)
 	if problem != nil {
 		return Revision{}, problem
 	}
 	if revision.Digest != digest {
 		return Revision{}, exit.Named(exit.Conflict, "private_package_revision_changed",
 			"private package revision bytes no longer match %s", digest)
+	}
+	storedRevision, err := os.ReadFile(filepath.Join(root, privateRevisionFile))
+	if err != nil || !bytes.Equal(storedRevision, revisionBytes) {
+		return Revision{}, exit.Named(exit.Conflict, "private_package_revision_changed",
+			"private package revision document no longer matches %s", digest)
 	}
 	return revision, nil
 }
@@ -204,6 +259,20 @@ func copyWheel(source, destination, kind string) (File, *exit.Error) {
 		Kind: kind, Length: written, Path: outputPath}, nil
 }
 
+func copyDescriptor(data []byte, destination string) *exit.Error {
+	output, err := os.OpenFile(destination, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o400)
+	if err != nil {
+		return exit.Internalf("cannot stage private package descriptor: %s", err)
+	}
+	written, writeErr := output.Write(data)
+	syncErr, closeErr := output.Sync(), output.Close()
+	if writeErr != nil || syncErr != nil || closeErr != nil || written != len(data) {
+		return exit.Named(exit.Structural, "private_package_descriptor_changed",
+			"private package descriptor changed while it was being staged")
+	}
+	return nil
+}
+
 func measured(path string, fact wheel.Identity, kind string) (File, *exit.Error) {
 	input, err := os.Open(path)
 	if err != nil {
@@ -219,23 +288,58 @@ func measured(path string, fact wheel.Identity, kind string) (File, *exit.Error)
 		Kind: kind, Length: length, Path: path}, nil
 }
 
-func identity(packageName, release, sourceDigest string, files []File) (Revision, *exit.Error) {
+func identity(packageName, release, sourceDigest, descriptorDigest string,
+	descriptorLength int64, files []File,
+) (Revision, []byte, *exit.Error) {
 	rows := append([]File(nil), files...)
 	sort.Slice(rows, func(i, j int) bool { return rows[i].Digest < rows[j].Digest })
-	values := make([]canonical.Value, 0, len(rows))
-	for _, file := range rows {
-		values = append(values, map[string]canonical.Value{"digest": file.Digest,
-			"filename": file.Filename, "kind": file.Kind, "length": file.Length})
+	if len(rows) == 0 || len(rows) > maxFiles {
+		return Revision{}, nil, exit.Named(exit.Structural, "private_package_revision_invalid",
+			"private package revision has an invalid wheel count")
 	}
-	raw, err := canonical.Write(map[string]canonical.Value{"package": packageName,
-		"release": release, "source_digest": sourceDigest, "wheels": values})
-	if err != nil {
-		return Revision{}, exit.Internalf("cannot encode private package identity: %s", err)
+	refs := make([]*pb.PrivatePackageFileRef, 0, len(rows))
+	for index, file := range rows {
+		digest, err := canonical.Raw(file.Digest)
+		if err != nil || file.Length <= 0 || index > 0 && rows[index-1].Digest == file.Digest {
+			return Revision{}, nil, exit.Named(exit.Structural, "private_package_file_invalid",
+				"private package file %s has an invalid or duplicate identity", file.Filename)
+		}
+		kind := pb.LocalDownloadKind_LOCAL_DOWNLOAD_KIND_DEPENDENCY_WHEEL
+		if file.Kind == "project" {
+			kind = pb.LocalDownloadKind_LOCAL_DOWNLOAD_KIND_PROJECT_WHEEL
+		} else if file.Kind != "dependency" {
+			return Revision{}, nil, exit.Named(exit.Structural, "private_package_file_invalid",
+				"private package file %s has an invalid identity", file.Filename)
+		}
+		refs = append(refs, &pb.PrivatePackageFileRef{Digest: digest, Filename: file.Filename,
+			Kind: kind, Length: uint64(file.Length)})
 	}
-	digest, err := canonical.Spell(canonical.Digest(raw))
+	source, sourceErr := canonical.Raw(sourceDigest)
+	descriptor, descriptorErr := canonical.Raw(descriptorDigest)
+	if sourceErr != nil || descriptorErr != nil || descriptorLength <= 0 {
+		return Revision{}, nil, exit.Named(exit.Structural, "private_package_revision_invalid",
+			"private package revision has invalid source or descriptor identity")
+	}
+	revisionBytes, rawDigest, err := canonical.Identity(&pb.PrivatePackageRevision{Package: packageName,
+		Release: release, SourceDigest: source, PackageDescriptor: &pb.Ref{Digest: descriptor,
+			Length: uint64(descriptorLength)}, Files: refs})
 	if err != nil {
-		return Revision{}, exit.Internalf("cannot digest private package identity: %s", err)
+		return Revision{}, nil, exit.Internalf("cannot digest private package identity: %s", err)
+	}
+	digest, err := canonical.Spell(rawDigest)
+	if err != nil {
+		return Revision{}, nil, exit.Internalf("cannot spell private package identity: %s", err)
 	}
 	return Revision{Package: packageName, Release: release, SourceDigest: sourceDigest,
-		Digest: digest, Files: rows}, nil
+		Digest: digest, DescriptorDigest: descriptorDigest, DescriptorLength: descriptorLength,
+		Files: rows}, revisionBytes, nil
+}
+
+func syncDirectory(path string) error {
+	directory, err := os.Open(path)
+	if err != nil {
+		return err
+	}
+	defer directory.Close()
+	return directory.Sync()
 }

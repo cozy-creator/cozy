@@ -13,10 +13,13 @@ import (
 )
 
 type privateTransfer struct {
-	revision string
-	source   []byte
-	files    map[string]privateTransferFile
-	status   map[string]privateTransferStatus
+	revision           string
+	source             []byte
+	instanceID, bootID string
+	generation         uint64
+	canceled           bool
+	files              map[string]privateTransferFile
+	status             map[string]privateTransferStatus
 }
 
 type privateTransferFile struct {
@@ -48,20 +51,27 @@ func (c *Orchestrator) ConvergePrivatePackage(instanceID, requestID string,
 		return problem
 	}
 	if uploadedBootID != "" && uploadedBootID != s.bootID {
-		return exit.Named(exit.Conflict, "private_package_worker_changed",
-			"request %s uploaded its private package to worker boot %s, not %s",
-			requestID, uploadedBootID, s.bootID)
+		// The exact revision remains durable, but carrier verification is boot-scoped.
+		// Re-prove every byte to the replacement pod before moving the durable boot marker.
+		uploadedBootID = ""
 	}
 	if uploadedBootID == "" {
-		if problem := c.transferPrivatePackage(instanceID, requestID, transfer); problem != nil {
-			return problem
-		}
-		w, s, problem = c.privateControl(instanceID)
-		if problem != nil {
-			return problem
-		}
-		if problem := c.opt.Store.MarkPrivatePackageUploaded(requestID, revision.Digest, s.bootID); problem != nil {
-			return problem
+		for uploadedBootID == "" {
+			if problem := c.transferPrivatePackage(instanceID, requestID, transfer); problem != nil {
+				return problem
+			}
+			w, s, problem = c.privateControl(instanceID)
+			if problem != nil {
+				return problem
+			}
+			if !c.privateTransferVerified(requestID, transfer.revision, s) {
+				continue
+			}
+			if problem := c.opt.Store.MarkPrivatePackageUploaded(requestID, revision.Digest,
+				s.bootID); problem != nil {
+				return problem
+			}
+			uploadedBootID = s.bootID
 		}
 	}
 	for {
@@ -91,6 +101,8 @@ func privateSelection(operationID string, revision privatepackage.Revision) (
 	selected := &pb.DesiredPrivatePackageSet{OperationId: operationID,
 		Package: &pb.DevelopmentPackage{Package: revision.Package, Release: revision.Release,
 			SourceDigest: source}}
+	privateDigest, _ := canonical.Raw(revision.Digest)
+	selected.Package.PrivateRevisionDigest = privateDigest
 	transfer := &privateTransfer{revision: revision.Digest, source: source,
 		files:  make(map[string]privateTransferFile, len(revision.Files)),
 		status: make(map[string]privateTransferStatus, len(revision.Files))}
@@ -131,14 +143,14 @@ func privateSelection(operationID string, revision privatepackage.Revision) (
 func (c *Orchestrator) transferPrivatePackage(instanceID, operationID string,
 	transfer *privateTransfer,
 ) *exit.Error {
-	c.mu.Lock()
-	if held := c.privateTransfers[operationID]; held != nil && held.revision != transfer.revision {
-		c.mu.Unlock()
-		return exit.Named(exit.Conflict, "private_package_revision_changed",
-			"operation %s already transfers another private package revision", operationID)
+	_, selectedSession, problem := c.privateControl(instanceID)
+	if problem != nil {
+		return problem
 	}
-	c.privateTransfers[operationID] = transfer
-	c.mu.Unlock()
+	transfer, problem = c.bindPrivateTransfer(instanceID, operationID, transfer, selectedSession)
+	if problem != nil {
+		return problem
+	}
 	for _, selected := range transferFilesInOrder(transfer) {
 		file, err := os.Open(selected.path)
 		if err != nil {
@@ -157,6 +169,67 @@ func (c *Orchestrator) transferPrivatePackage(instanceID, operationID string,
 		}
 	}
 	return nil
+}
+
+func (c *Orchestrator) bindPrivateTransfer(instanceID, operationID string,
+	selected *privateTransfer, current *session,
+) (*privateTransfer, *exit.Error) {
+	if current == nil || current.instanceID != instanceID {
+		return nil, exit.Named(exit.Conflict, "private_package_worker_changed",
+			"private package transfer changed worker session")
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	held := c.privateTransfers[operationID]
+	if held != nil && held.revision != selected.revision {
+		return nil, exit.Named(exit.Conflict, "private_package_revision_changed",
+			"operation %s already transfers another private package revision", operationID)
+	}
+	if held != nil && held.canceled {
+		return nil, exit.New(exit.Canceled,
+			"private package transfer %s was canceled", operationID)
+	}
+	if held == nil {
+		held = selected
+		c.privateTransfers[operationID] = held
+	}
+	if held.instanceID != instanceID || held.bootID != current.bootID ||
+		held.generation != current.generation {
+		held.instanceID, held.bootID, held.generation = instanceID, current.bootID,
+			current.generation
+		held.status = make(map[string]privateTransferStatus, len(held.files))
+	}
+	return held, nil
+}
+
+func (c *Orchestrator) cancelPrivateTransfer(operationID string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if transfer := c.privateTransfers[operationID]; transfer != nil {
+		transfer.canceled = true
+		transfer.status = nil
+	}
+}
+
+func (c *Orchestrator) privateTransferVerified(operationID, revision string,
+	current *session,
+) bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	transfer := c.privateTransfers[operationID]
+	if transfer == nil || transfer.revision != revision || current == nil ||
+		transfer.instanceID != current.instanceID || transfer.bootID != current.bootID ||
+		transfer.generation != current.generation {
+		return false
+	}
+	for digest, file := range transfer.files {
+		status := transfer.status[digest]
+		if status.state != pb.PrivatePackageFileState_PRIVATE_PACKAGE_FILE_STATE_VERIFIED ||
+			status.received != file.length {
+			return false
+		}
+	}
+	return true
 }
 
 func transferFilesInOrder(transfer *privateTransfer) []privateTransferFile {
@@ -180,6 +253,15 @@ func (c *Orchestrator) transferPrivateFile(instanceID, operationID string,
 ) *exit.Error {
 	spelled, _ := canonical.Spell(selected.digest)
 	for {
+		_, selectedSession, problem := c.privateControl(instanceID)
+		if problem != nil {
+			return problem
+		}
+		transfer, problem = c.bindPrivateTransfer(instanceID, operationID, transfer,
+			selectedSession)
+		if problem != nil {
+			return problem
+		}
 		status := c.privateStatus(operationID, spelled)
 		switch status.state {
 		case pb.PrivatePackageFileState_PRIVATE_PACKAGE_FILE_STATE_VERIFIED:
@@ -207,21 +289,17 @@ func (c *Orchestrator) transferPrivateFile(instanceID, operationID string,
 			return exit.Named(exit.Structural, "private_package_wheel_changed",
 				"cannot read private package wheel %s: %s", selected.filename, err)
 		}
-		_, session, problem := c.privateControl(instanceID)
-		if problem != nil {
-			return problem
-		}
 		frame := &pb.PrivatePackageFileChunk{RecordOwnerEpoch: recordOwnerEpoch,
-			ControlStreamGeneration: session.generation, WorkerBootId: session.bootID,
+			ControlStreamGeneration: selectedSession.generation, WorkerBootId: selectedSession.bootID,
 			OperationId: operationID, SourceDigest: transfer.source, Digest: selected.digest,
 			Filename: selected.filename, Kind: selected.kind, Length: selected.length,
 			Offset: status.received, Data: data}
-		if !session.send(&pb.RecordOwnerFrame{Msg: &pb.RecordOwnerFrame_PrivatePackageFileChunk{
+		if !selectedSession.send(&pb.RecordOwnerFrame{Msg: &pb.RecordOwnerFrame_PrivatePackageFileChunk{
 			PrivatePackageFileChunk: frame}}) {
 			continue
 		}
 		if problem := c.awaitPrivateProgress(instanceID, operationID, spelled,
-			status.received, session); problem != nil {
+			status.received, selectedSession); problem != nil {
 			return problem
 		}
 	}
@@ -331,14 +409,17 @@ func (c *Orchestrator) privateStatus(operationID, digest string) privateTransfer
 	return privateTransferStatus{}
 }
 
-func (c *Orchestrator) onPrivatePackageFileStatus(_ *session,
+func (c *Orchestrator) onPrivatePackageFileStatus(current *session,
 	frame *pb.PrivatePackageFileStatus,
 ) {
 	spelled, err := canonical.Spell(frame.Digest)
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	transfer := c.privateTransfers[frame.OperationId]
-	if err != nil || transfer == nil || !bytes.Equal(frame.SourceDigest, transfer.source) {
+	if err != nil || transfer == nil || transfer.canceled || current == nil ||
+		transfer.instanceID != current.instanceID || transfer.bootID != current.bootID ||
+		transfer.generation != current.generation ||
+		!bytes.Equal(frame.SourceDigest, transfer.source) {
 		return
 	}
 	expected, ok := transfer.files[spelled]
@@ -393,7 +474,8 @@ func clonePrivatePackageSet(in *pb.DesiredPrivatePackageSet) *pb.DesiredPrivateP
 	out := &pb.DesiredPrivatePackageSet{OperationId: in.OperationId}
 	if in.Package != nil {
 		out.Package = &pb.DevelopmentPackage{Package: in.Package.Package,
-			Release: in.Package.Release, SourceDigest: append([]byte(nil), in.Package.SourceDigest...)}
+			Release: in.Package.Release, SourceDigest: append([]byte(nil), in.Package.SourceDigest...),
+			PrivateRevisionDigest: append([]byte(nil), in.Package.PrivateRevisionDigest...)}
 	}
 	for _, file := range in.Files {
 		if file != nil {

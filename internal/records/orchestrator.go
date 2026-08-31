@@ -571,16 +571,15 @@ func (s *Store) BindRemoteInvocation(id, planID, packageRevision, environment, c
 }
 
 // MarkPrivatePackageUploaded crosses the durable boundary between verified carrier
-// acknowledgements and DesiredPrivatePackageSet. A reconnect may safely resend desired state;
-// a different pod boot may not inherit another worker's upload observation.
+// acknowledgements and DesiredPrivatePackageSet. The caller proves every acknowledgement belongs
+// to this exact boot/session before moving the marker; a replacement boot therefore overwrites an
+// old marker only after it has independently re-received and verified the whole revision.
 func (s *Store) MarkPrivatePackageUploaded(id, digest, bootID string) *exit.Error {
 	if id == "" || digest == "" || bootID == "" {
 		return exit.Internalf("cannot record an incomplete private package upload")
 	}
 	result, err := s.db.Exec(`UPDATE requests SET private_package_uploaded_boot_id=?
-		WHERE id=? AND private_package_digest=? AND
-		(private_package_uploaded_boot_id='' OR private_package_uploaded_boot_id=?)`,
-		bootID, id, digest, bootID)
+		WHERE id=? AND private_package_digest=?`, bootID, id, digest)
 	if err != nil {
 		return exit.Internalf("cannot record request %s private package upload: %s", id, err)
 	}
@@ -591,17 +590,17 @@ func (s *Store) MarkPrivatePackageUploaded(id, digest, bootID string) *exit.Erro
 	if changed == 1 {
 		return nil
 	}
-	var heldDigest, heldBoot string
-	if err := s.db.QueryRow(`SELECT private_package_digest,private_package_uploaded_boot_id
-		FROM requests WHERE id=?`, id).Scan(&heldDigest, &heldBoot); err != nil {
+	var heldDigest string
+	if err := s.db.QueryRow(`SELECT private_package_digest FROM requests WHERE id=?`, id).
+		Scan(&heldDigest); err != nil {
 		return exit.Internalf("cannot read request %s private package upload: %s", id, err)
 	}
 	if heldDigest != digest {
 		return exit.Named(exit.Conflict, "private_package_revision_changed",
 			"request %s already names another private package revision", id)
 	}
-	return exit.Named(exit.Conflict, "private_package_worker_changed",
-		"request %s uploaded its private package to worker boot %s, not %s", id, heldBoot, bootID)
+	return exit.Named(exit.Conflict, "private_package_request_changed",
+		"request %s cannot record its verified private package boot", id)
 }
 
 // AssignManagedRental pins one still-queued --rental request to the exact pod
@@ -789,6 +788,31 @@ func (s *Store) AssetInUse(digest string) (bool, *exit.Error) {
 		}
 	}
 	return false, nil
+}
+
+// PrivatePackageInUse keeps one exact wheel revision while executable work or the current
+// editable declaration can still select it. Terminal request rows retain audit identity but no
+// bytes; an edited pin stops retaining the superseded source revision.
+func (s *Store) PrivatePackageInUse(digest, packageName, release,
+	sourceDigest string,
+) (bool, *exit.Error) {
+	var used int
+	if err := s.db.QueryRow(`SELECT EXISTS(SELECT 1 FROM requests
+		WHERE private_package_digest=?
+		  AND state IN ('submitted','queued','dispatching','requeue_pending'))`, digest).
+		Scan(&used); err != nil {
+		return false, exit.Internalf("cannot read live private package ownership: %s", err)
+	}
+	if used != 0 {
+		return true, nil
+	}
+	if err := s.db.QueryRow(`SELECT EXISTS(
+		SELECT 1 FROM pins p JOIN install_generations g ON g.id=p.generation
+		WHERE g.package=? AND g.version=? AND g.source_kind='local' AND g.source_digest=?)`,
+		packageName, release, sourceDigest).Scan(&used); err != nil {
+		return false, exit.Internalf("cannot read current editable private package ownership: %s", err)
+	}
+	return used != 0, nil
 }
 
 // SettleRequest records the request's final state. Only a terminal the orchestrator
