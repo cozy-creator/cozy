@@ -504,7 +504,7 @@ func validateEntrypoint(ep *Entrypoint) *exit.Error {
 	seenArtifacts := map[string]bool{}
 	for _, output := range ep.ArtifactOutputs {
 		if output.OutputID == "" || seenArtifacts[output.OutputID] || output.MaxBytes == 0 ||
-			output.MaxBytes > (uint64(1)<<53)-1 || output.MimeType != orchestrator.ArtifactSnapshotMime {
+			output.MaxBytes > (uint64(1)<<53)-1 || output.MimeType != orchestrator.ArtifactManifestMime {
 			return exit.New(exit.Validation,
 				"%s has an invalid artifact output %q: slots are unique snapshot MIME rows with a 1..2^53-1 byte cap",
 				ep.Name, output.OutputID)

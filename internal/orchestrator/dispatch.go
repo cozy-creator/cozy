@@ -77,7 +77,7 @@ type Submission struct {
 	Rental bool
 }
 
-const ArtifactSnapshotMime = "application/vnd.cozy.tensorfs.snapshot"
+const ArtifactManifestMime = "application/vnd.cozy.model-manifest"
 
 // ArtifactOutput is one bounded ArtifactSink slot projected from the installed job
 // descriptor. MaxBytes bounds only newly written table/config bytes, not inherited closure.
@@ -224,10 +224,10 @@ func normalizeArtifactOutputs(s Submission) ([]ArtifactOutput, []byte, *exit.Err
 			return nil, nil, exit.Named(exit.Validation, "artifact_output_identity",
 				"artifact output slots are non-empty and unique; %q is repeated or empty", row.OutputID)
 		}
-		if row.MimeType != ArtifactSnapshotMime || row.MaxBytes == 0 || row.MaxBytes > (uint64(1)<<53)-1 {
+		if row.MimeType != ArtifactManifestMime || row.MaxBytes == 0 || row.MaxBytes > (uint64(1)<<53)-1 {
 			return nil, nil, exit.Named(exit.Validation, "artifact_output_contract",
 				"artifact output %s must declare MIME %s and a new-byte cap in 1..2^53-1",
-				row.OutputID, ArtifactSnapshotMime)
+				row.OutputID, ArtifactManifestMime)
 		}
 		ids[row.OutputID] = true
 	}

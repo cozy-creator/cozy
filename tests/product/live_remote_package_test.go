@@ -9,6 +9,7 @@ import (
 	"flag"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -27,6 +28,66 @@ import (
 )
 
 var livePackageE2E = flag.String("live-package-e2e", "", "real worker package E2E config JSON")
+var liveProductionDescriptor = flag.String("live-production-descriptor", "",
+	"exact published model-production descriptor JSON")
+var liveQuantizeDescriptor = flag.String("live-quantize-descriptor", "",
+	"exact published quantization descriptor JSON")
+
+func TestLiveModelProductionDescriptor(t *testing.T) {
+	if *liveProductionDescriptor == "" {
+		t.Skip("-live-production-descriptor is not set")
+	}
+	raw, err := os.ReadFile(*liveProductionDescriptor)
+	must(t, err)
+	descriptor, problem := launch.DecodeDescriptor(raw)
+	fatal(t, problem)
+	production, problem := descriptor.Production("four-lane")
+	fatal(t, problem)
+	ordered, problem := production.OrderedNodes()
+	fatal(t, problem)
+	if len(ordered) != 10 || len(production.Outputs) != 4 || len(production.Sources) != 2 {
+		t.Fatalf("published production shape = %d nodes, %d outputs, %d sources",
+			len(ordered), len(production.Outputs), len(production.Sources))
+	}
+	lanes := map[string]bool{}
+	for _, output := range production.Outputs {
+		lanes[output.LaneKey] = true
+	}
+	for _, lane := range []string{"bf16-full", "bf16-adaln-pruned", "fp8-adaln-pruned",
+		"mxfp8-adaln-pruned"} {
+		if !lanes[lane] {
+			t.Fatalf("published production omits lane %s", lane)
+		}
+	}
+	for _, node := range ordered {
+		if !strings.HasPrefix(node.Callable, "tensorhub/minimax-h3-tools/") &&
+			!strings.HasPrefix(node.Callable, "tensorhub/quantize/") {
+			t.Fatalf("production node %s references unexpected callable %s", node.Name,
+				node.Callable)
+		}
+	}
+}
+
+func TestLiveQuantizeDescriptor(t *testing.T) {
+	if *liveQuantizeDescriptor == "" {
+		t.Skip("-live-quantize-descriptor is not set")
+	}
+	raw, err := os.ReadFile(*liveQuantizeDescriptor)
+	must(t, err)
+	descriptor, problem := launch.DecodeDescriptor(raw)
+	fatal(t, problem)
+	if len(descriptor.Jobs) != 2 {
+		t.Fatalf("quantize descriptor has %d jobs", len(descriptor.Jobs))
+	}
+	for _, name := range []string{"fp8", "mxfp8"} {
+		job, problem := descriptor.Function(name)
+		fatal(t, problem)
+		if job.Kind != "job" || len(job.Models) != 1 || job.Models[0].Param != "source" ||
+			len(job.ArtifactOutputs) != 1 || job.ArtifactOutputs[0].OutputID != "model" {
+			t.Fatalf("quantize job %s = %+v", name, job)
+		}
+	}
+}
 
 // TestLiveRemoteMarcoPolo is the opt-in cross-repository proof. Its supplied worker must
 // be the real Tensorhub pod-supervisor hosting the real cozy-runtime; no fake WorkerControl
