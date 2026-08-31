@@ -419,15 +419,6 @@ func rentalCallContext(deadline time.Time) (context.Context, context.CancelFunc)
 	return context.WithDeadline(context.Background(), deadline)
 }
 
-// waitRental polls one rental to the caller's observed goal. Every wait here is bounded by something
-// OBSERVED: the hub's own verdict, a typed refusal, or the caller's --timeout. A rental
-// that is still acquiring or materializing is none of those, however long the provider
-// takes, and a hub that is momentarily unreachable is asked again at the same cadence.
-func waitRental(ctx *Context, c *hub.Client, id string, deadline time.Time,
-	observe func(hub.Rental) *exit.Error, done func(hub.Rental) bool) (hub.Rental, *exit.Error) {
-	return waitRentalContext(context.Background(), ctx, c, id, deadline, observe, done)
-}
-
 func waitRentalContext(lifecycle context.Context, ctx *Context, c *hub.Client, id string,
 	deadline time.Time, observe func(hub.Rental) *exit.Error,
 	done func(hub.Rental) bool,

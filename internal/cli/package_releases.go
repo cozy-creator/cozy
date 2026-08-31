@@ -140,15 +140,6 @@ func handlePackageYank(ctx *Context) *exit.Error {
 	}, "package", "release", "status"))
 }
 
-func shorten(value string, limit int) string {
-	value = strings.Join(strings.Fields(value), " ")
-	runes := []rune(value)
-	if len(runes) > limit {
-		return string(runes[:limit]) + "…"
-	}
-	return value
-}
-
 type packageFile struct {
 	subject string
 	path    string

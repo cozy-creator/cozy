@@ -1418,18 +1418,6 @@ func (c *Orchestrator) Worker(instanceID string) *WorkerFacts {
 	return &f
 }
 
-// Workers is every worker this daemon currently owns — the LOCAL extension module's
-// listing (cl-006) and `cozy run list`'s source.
-func (c *Orchestrator) Workers() []WorkerFacts {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	out := make([]WorkerFacts, 0, len(c.workers))
-	for _, w := range c.workers {
-		out = append(out, factsOf(w))
-	}
-	return out
-}
-
 func factsOf(w *worker) WorkerFacts {
 	f := WorkerFacts{
 		InstanceID: w.instanceID, Package: w.spec.Placement.Package,

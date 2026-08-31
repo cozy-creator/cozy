@@ -207,34 +207,6 @@ func (c *Client) Cancel(id string) *exit.Error {
 	return c.call("POST", "/v1/requests/"+id+"/cancel", nil, nil)
 }
 
-// MediaResponse is one media GET as the server declared it. Body is bounded by nothing
-// here: the receiver knows the manifest length and must bound its own read.
-type MediaResponse struct {
-	Body          io.Reader
-	ContentLength int64  // -1 when the server declared none
-	Digest        string // X-Cozy-Digest, a restatement of the record, not proof of transfer
-}
-
-// Media hands one output's response to `receive`. The id is OPAQUE: this client composes
-// no path and cannot ask for one.
-func (c *Client) Media(mediaID string, receive func(MediaResponse) *exit.Error) *exit.Error {
-	req, e := c.request("GET", "/v1/media/"+mediaID, nil)
-	if e != nil {
-		return e
-	}
-	res, err := c.http.Do(req)
-	if err != nil {
-		return c.unreachable(err)
-	}
-	defer res.Body.Close()
-	if res.StatusCode >= 300 {
-		data, _ := io.ReadAll(io.LimitReader(res.Body, 1<<20))
-		return Refusal(res.StatusCode, data)
-	}
-	return receive(MediaResponse{Body: res.Body, ContentLength: res.ContentLength,
-		Digest: res.Header.Get("X-Cozy-Digest")})
-}
-
 // ------------------------------------------------------------ the LOCAL extension
 
 // StartResult is the rental-claim answer.
@@ -302,12 +274,6 @@ func (c *Client) Job(id string) (api.JobState, *exit.Error) {
 // queued one leaves the queue and settles here.
 func (c *Client) CancelJob(id string) *exit.Error {
 	return c.call("POST", "/v1/local/jobs/"+id+"/cancel", nil, nil)
-}
-
-func (c *Client) ModelProductionAction(id string, action api.ModelProductionAction) (
-	api.ModelProductionActionResult, *exit.Error,
-) {
-	return c.ModelProductionActionContext(context.Background(), id, action)
 }
 
 func (c *Client) ModelProductionActionContext(ctx context.Context, id string,
