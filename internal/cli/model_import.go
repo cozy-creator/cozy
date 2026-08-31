@@ -86,7 +86,7 @@ func handleModelImport(ctx *Context) *exit.Error {
 		}
 	}
 	headerPlanPath := filepath.Join(root, "source-plan.json")
-	headerPlan, problem := tool.PlanSource(importCarriers(headerFiles,
+	headerPlan, problem := tool.PlanSource(ctx.Cfg.TensorFSRegistry, importCarriers(headerFiles,
 		source.Kind != modelsource.LocalFile), headerPlanPath)
 	if problem != nil {
 		return problem
@@ -125,7 +125,7 @@ func handleModelImport(ctx *Context) *exit.Error {
 		}
 	}
 	fullPlanPath := filepath.Join(root, "source-plan-full.json")
-	fullPlan, problem := tool.PlanSource(importCarriers(fullFiles,
+	fullPlan, problem := tool.PlanSource(ctx.Cfg.TensorFSRegistry, importCarriers(fullFiles,
 		source.Kind != modelsource.LocalFile), fullPlanPath)
 	if problem != nil {
 		return problem

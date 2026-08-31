@@ -368,8 +368,11 @@ type SourcePlan struct {
 // PlanSource asks TensorFS to assign exact physical carriers through its
 // reviewed whole-source profiles. Creator never parses tensor headers or maps
 // filenames to components.
-func (t *Tool) PlanSource(carriers []SourceCarrier, outPath string) (SourcePlan, *exit.Error) {
+func (t *Tool) PlanSource(registry string, carriers []SourceCarrier, outPath string) (SourcePlan, *exit.Error) {
 	args := []string{"ingest", "source-plan", "--out", outPath}
+	if registry != "" {
+		args = append(args, "--registry", registry)
+	}
 	for _, carrier := range carriers {
 		value := carrier.Path
 		if carrier.Member != "" {

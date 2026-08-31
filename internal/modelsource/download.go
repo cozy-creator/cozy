@@ -40,11 +40,22 @@ func (r *Resolver) Stage(ctx context.Context, plan Plan, root string, headersOnl
 			}
 		}
 	} else {
-		need = plan.Bytes
-		if need > (1<<63-1)/2 {
+		missing := int64(0)
+		for _, file := range plan.Files {
+			target := filepath.Join(root, filepath.FromSlash(file.Member))
+			if exactFile(target, file) || len(file.Inline) > 0 {
+				continue
+			}
+			landed := int64(0)
+			if info, err := os.Stat(target + ".part"); err == nil && info.Mode().IsRegular() && info.Size() < file.Length {
+				landed = info.Size()
+			}
+			missing += file.Length - landed
+		}
+		if plan.Bytes > (1<<63-1)-missing-(512<<20) {
 			return nil, exit.Named(exit.Validation, "model_source_too_large", "model source is too large")
 		}
-		need = need*2 + 512<<20
+		need = plan.Bytes + missing + 512<<20
 	}
 	if free, err := availableBytes(root); err == nil && uint64(need) > free {
 		return nil, exit.Named(exit.Capacity, "model_import_disk_shortfall",
@@ -190,7 +201,10 @@ func (r *Resolver) download(ctx context.Context, file File, target string, progr
 		_ = os.Remove(part)
 	} else if offset > 0 && response.StatusCode == http.StatusPartialContent {
 		wantPrefix := "bytes " + strconv.FormatInt(offset, 10) + "-"
-		if !strings.HasPrefix(response.Header.Get("Content-Range"), wantPrefix) {
+		contentRange := response.Header.Get("Content-Range")
+		_, total, found := strings.Cut(contentRange, "/")
+		declared, parseErr := strconv.ParseInt(total, 10, 64)
+		if !strings.HasPrefix(contentRange, wantPrefix) || !found || parseErr != nil || declared != file.Length {
 			return exit.Named(exit.Validation, "model_source_resume_mismatch",
 				"provider resumed %s at the wrong byte", file.Member)
 		}

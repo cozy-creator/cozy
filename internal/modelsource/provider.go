@@ -8,7 +8,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
-	"math"
 	"net"
 	"net/http"
 	"net/netip"
@@ -271,7 +270,7 @@ func (r *Resolver) resolveHF(ctx context.Context, source Source) (Plan, *exit.Er
 		reference = "main"
 	}
 	api := "https://huggingface.co/api/models/" + url.PathEscape(source.Org) + "/" +
-		url.PathEscape(source.Repo) + "/revision/" + url.PathEscape(reference)
+		url.PathEscape(source.Repo) + "/revision/" + url.PathEscape(reference) + "?blobs=true"
 	var metadata hfModel
 	if problem := r.json(ctx, api, &metadata); problem != nil {
 		return Plan{}, problem
@@ -436,8 +435,7 @@ func (r *Resolver) resolveCivitai(ctx context.Context, source Source) (Plan, *ex
 			continue
 		}
 		sha := strings.ToLower(remote.Hashes.SHA256)
-		predictedLength := int64(math.Round(remote.SizeKB * 1024))
-		if !validDigest(sha) || predictedLength <= 0 {
+		if !validDigest(sha) {
 			return Plan{}, exit.Named(exit.Validation, "model_source_identity_missing",
 				"Civitai file %d lacks exact SHA-256/size facts", remote.ID)
 		}
