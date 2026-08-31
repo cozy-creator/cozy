@@ -232,7 +232,7 @@ func TestPackageInstallExplicitDirectoryGrammar(t *testing.T) {
 	must(t, os.Mkdir(child, 0o755))
 	missing := filepath.Join(parent, "missing")
 	for _, path := range []string{".", "..", "./missing", "../missing", missing} {
-		code, out := runCozyDir(t, root, child, nil, "package", "install", path)
+		code, out := runCozyDir(t, root, child, nil, "package", "install", path, "--editable")
 		if code != 1 || (!strings.Contains(out, "package source has no package.toml") &&
 			!strings.Contains(out, "is not a directory")) || strings.Contains(out, "org/package") {
 			t.Fatalf("explicit directory %q entered registry resolution [exit %d]\n%s", path, code, out)
