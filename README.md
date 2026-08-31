@@ -119,9 +119,9 @@ This publishes `paul/marco-polo-package@1.0.0`; Cozy never invents a `v` prefix.
 comes from `tensorhub_url`. An enrolled machine authenticates automatically; an operator may still
 configure `tensorhub_token` or `TENSORHUB_TOKEN` explicitly.
 
-Publication succeeds even when no compatible base worker image is currently active. The package
-appears in the catalog immediately, and Tensorhub qualifies the same immutable release when a
-compatible base becomes available. Until then, invocation remains unavailable.
+Publication succeeds even when no base worker image is active. The package appears in the catalog
+immediately. On invocation, the selected worker verifies the immutable wheels against its actual
+pinned base before installing them; Tensorhub does not prequalify packages against image profiles.
 
 A pending retry preserves every file already accepted by Tensorhub and uploads only missing slots
 from the current tree. If the tree changed after a partial publication, use a new project version
