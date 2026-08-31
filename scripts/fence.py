@@ -835,7 +835,6 @@ def check_python_seat():
     fixtures = (
         pathlib.Path("tests/product/testdata/build-weightless.py"),
         pathlib.Path("tests/product/testdata/build-modeled-editable.py"),
-        pathlib.Path("tests/product/testdata/package-release/finalize.json"),
     )
     for fixture in fixtures:
         body = fixture.read_text()
