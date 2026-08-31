@@ -97,6 +97,14 @@ func TestLiveRemoteMarcoPolo(t *testing.T) {
 	store, problem := records.Open(layout.DB)
 	fatal(t, problem)
 	defer store.Close()
+	_, problem = store.Activate(records.PackageInstall{
+		ID: "live-marco", Package: live.Package, Major: 1, Version: detail.Release.Release,
+		SourceKind: "tensorhub", SourceRef: live.Package + "@" + detail.Release.Release,
+		SourceDigest: detail.Release.ReleaseDigest, Verified: true,
+		Dir: filepath.Join(root, "release-metadata"), LinkMode: "none",
+		PackageDescriptor: detail.Release.PackageDescriptorDigest,
+	})
+	fatal(t, problem)
 	connection := &orchestrator.WorkerConnection{
 		RentalID: live.RentalID, Addr: live.WorkerAddr, CACert: layout.RentalCert(live.RentalID),
 		WorkerID: live.WorkerID, WorkerBootID: live.WorkerBootID,
