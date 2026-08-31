@@ -217,7 +217,7 @@ func TestRentalRunAcquiresCheapestOnceAndReleasesFailedPreAttempt(t *testing.T) 
 		request.Release != "1.0.0" || request.PackageRevisionDigest != local.SourceDigest ||
 		request.PrivatePackageDigest == "" || len(request.Models) != 0 ||
 		gotPosts != 1 || gotDeletes != 1 ||
-		body["sku"] != "cheap" || body["max_cost_usd_micros"] != nil || body["max_duration_seconds"] != nil {
+		body["sku"] != "cpu" || body["max_cost_usd_micros"] != nil || body["max_duration_seconds"] != nil {
 		t.Fatalf("managed lifecycle request=%+v posts=%d deletes=%d body=%v", request, gotPosts, gotDeletes, body)
 	}
 	if gotCreateReason != "" || gotDeleteReason != "" ||
@@ -227,7 +227,7 @@ func TestRentalRunAcquiresCheapestOnceAndReleasesFailedPreAttempt(t *testing.T) 
 	}
 	wantLines := map[string]bool{
 		"rentals: 0 remote machines running · $0.00/hour of $7.00/hour": false,
-		"rentals: 1 remote machine running · $0.30/hour of $7.00/hour":  false,
+		"rentals: 1 remote machine running · $0.07/hour of $7.00/hour":  false,
 	}
 	for _, event := range events {
 		if line, ok := event.Payload["line"].(string); ok {
