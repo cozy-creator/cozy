@@ -397,7 +397,7 @@ func (s *Server) resolvePrivateJob(ctx context.Context, sub JobSubmission,
 	}
 	requiredRuntime := ""
 	if len(out.Models) > 0 {
-		requiredRuntime = "0.0.20"
+		requiredRuntime = launch.PrivateModeledRuntimeFloor
 	}
 	revision, compatibleBases, problem := s.packages.PreparePrivate(ctx, installID, requiredRuntime)
 	if problem != nil {

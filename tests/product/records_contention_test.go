@@ -63,7 +63,10 @@ func TestRecordsMigratesExactV1OutputExportAddition(t *testing.T) {
 
 	db, err := sql.Open("sqlite", path)
 	must(t, err)
-	_, err = db.Exec(`DROP TABLE request_output_exports; PRAGMA user_version=1`)
+	_, err = db.Exec(`DROP TABLE request_output_exports;
+		ALTER TABLE requests DROP COLUMN acceptable_base_manifests;
+		ALTER TABLE rentals DROP COLUMN wheelhouse_manifest_digest;
+		PRAGMA user_version=1`)
 	must(t, err)
 	must(t, db.Close())
 
@@ -108,7 +111,6 @@ func TestRecordsMigratesExactV2RentalBaseSelectionAndRetainsRows(t *testing.T) {
 
 	store, problem = records.Open(path)
 	fatal(t, problem)
-	defer store.Close()
 	heldRequest, problem := store.RequestRow("req-v2-retained")
 	fatal(t, problem)
 	heldRental, problem := store.RentalRow("pr-v2-retained")
@@ -116,6 +118,22 @@ func TestRecordsMigratesExactV2RentalBaseSelectionAndRetainsRows(t *testing.T) {
 	if heldRequest == nil || len(heldRequest.AcceptableWheelhouseManifestDigests) != 0 ||
 		heldRental == nil || heldRental.WheelhouseManifestDigest != "" {
 		t.Fatalf("v2 retained rows changed: request=%+v rental=%+v", heldRequest, heldRental)
+	}
+	store.Close()
+	db, err = sql.Open("sqlite", path)
+	must(t, err)
+	defer db.Close()
+	for table, column := range map[string]string{
+		"requests": "acceptable_base_manifests", "rentals": "wheelhouse_manifest_digest",
+	} {
+		var position, last int
+		must(t, db.QueryRow(`SELECT cid FROM pragma_table_info(?) WHERE name=?`,
+			table, column).Scan(&position))
+		must(t, db.QueryRow(`SELECT max(cid) FROM pragma_table_info(?)`, table).Scan(&last))
+		if position != last {
+			t.Fatalf("v3 %s.%s column position = %d, want appended %d",
+				table, column, position, last)
+		}
 	}
 }
 
@@ -225,8 +243,13 @@ func TestRecordsRefusesV2ShapeDrift(t *testing.T) {
 	store.Close()
 	db, err := sql.Open("sqlite", path)
 	must(t, err)
-	_, err = db.Exec(`ALTER TABLE requests ADD COLUMN compatibility_alias TEXT`)
+	_, err = db.Exec(`ALTER TABLE requests DROP COLUMN acceptable_base_manifests;
+		ALTER TABLE rentals DROP COLUMN wheelhouse_manifest_digest;
+		ALTER TABLE requests ADD COLUMN compatibility_alias TEXT;
+		PRAGMA user_version=2`)
 	must(t, err)
+	var before int
+	must(t, db.QueryRow(`PRAGMA schema_version`).Scan(&before))
 	must(t, db.Close())
 
 	opened, problem := records.Open(path)
@@ -236,6 +259,20 @@ func TestRecordsRefusesV2ShapeDrift(t *testing.T) {
 	}
 	if problem == nil || problem.ErrName() != "records.schema_reset_required" {
 		t.Fatalf("drifted v2 refusal = %#v", problem)
+	}
+	db, err = sql.Open("sqlite", path)
+	must(t, err)
+	defer db.Close()
+	var version, after, requestBase, rentalBase int
+	must(t, db.QueryRow(`PRAGMA user_version`).Scan(&version))
+	must(t, db.QueryRow(`PRAGMA schema_version`).Scan(&after))
+	must(t, db.QueryRow(`SELECT count(*) FROM pragma_table_info('requests')
+		WHERE name='acceptable_base_manifests'`).Scan(&requestBase))
+	must(t, db.QueryRow(`SELECT count(*) FROM pragma_table_info('rentals')
+		WHERE name='wheelhouse_manifest_digest'`).Scan(&rentalBase))
+	if version != 2 || after != before || requestBase != 0 || rentalBase != 0 {
+		t.Fatalf("refused v2 schema mutated: version=%d schema_version=%d->%d request=%d rental=%d",
+			version, before, after, requestBase, rentalBase)
 	}
 }
 

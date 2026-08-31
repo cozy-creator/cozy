@@ -260,6 +260,10 @@ func acquireRentalContext(lifecycle context.Context, ctx *Context, l home.Layout
 			"rental operation %s already names a different hub or request body", operationKey).
 			WithRemedy("reuse a key only for the exact same hub, GPU SKU, media token, and Creator key")
 	}
+	intent, e := hub.ParseRentalRequestBytes(op.RequestBody)
+	if e != nil {
+		return records.Rental{}, hub.Rental{}, false, e
+	}
 	if !replay {
 		fmt.Fprintf(ctx.Err, "  rental operation %s persisted; reuse this key to resume\n", operationKey)
 	}
@@ -294,6 +298,18 @@ func acquireRentalContext(lifecycle context.Context, ctx *Context, l home.Layout
 		return records.Rental{}, hub.Rental{}, false, exit.Named(exit.Conflict, "rental.hourly_rate_changed",
 			"rental %s locked %d USD micros/hour, not catalog rate %d",
 			remote.ID, remote.HourlyRateUSDMicros, hourlyRateUSDMicros).
+			WithRemedy("Creator requested immediate release and retained the operation until Tensorhub proves absence")
+	}
+	if !containsString(intent.AcceptableWheelhouseManifestDigests,
+		remote.WheelhouseManifestDigest) {
+		_ = st.AdvanceRentalOperation(operationKey, remote.ID, hub.RentalReleaseRequested)
+		hctx, cancel := hub.Context()
+		_ = c.Release(hctx, remote.ID, "selected WheelhouseManifest was not accepted")
+		cancel()
+		return records.Rental{}, hub.Rental{}, false, exit.Named(exit.Conflict,
+			"rental.wheelhouse_manifest_unacceptable",
+			"rental %s selected WheelhouseManifest %s outside the persisted compatible set",
+			remote.ID, remote.WheelhouseManifestDigest).
 			WithRemedy("Creator requested immediate release and retained the operation until Tensorhub proves absence")
 	}
 	machineName := requestedMachineName

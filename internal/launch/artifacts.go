@@ -20,6 +20,11 @@ import (
 	"github.com/cozy-creator/cozy/internal/records"
 )
 
+// PrivateModeledRuntimeFloor is the worker-control capability required when a private
+// package invocation carries model bindings. Keep the policy in one place: request,
+// job, and production admission must not drift to different Runtime releases.
+const PrivateModeledRuntimeFloor = "0.0.20"
+
 // BaseRuntimeAtLeast reads only the control-plane capability version from exact Hub-held
 // WheelhouseManifest bytes. Runtime still owns every overlay compatibility decision.
 func BaseRuntimeAtLeast(raw []byte, floor string) bool {

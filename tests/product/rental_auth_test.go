@@ -142,6 +142,16 @@ func TestRentalCreatorIdentityAndClaim(t *testing.T) {
 		body["model_selections"] != nil || body["renter_token_sha256"] != nil {
 		t.Fatalf("rental create authority is not the hardcut shape: %s", request)
 	}
+	parsed, problem := hub.ParseRentalRequestBytes(request)
+	fatal(t, problem)
+	if parsed.SKU != "cpu" || len(parsed.AcceptableWheelhouseManifestDigests) != 1 ||
+		parsed.AcceptableWheelhouseManifestDigests[0] != "sha256:"+strings.Repeat("2", 64) {
+		t.Fatalf("persisted rental intent did not reopen exactly: %+v", parsed)
+	}
+	if _, problem := hub.ParseRentalRequestBytes(append(request, '\n')); problem == nil ||
+		problem.ErrName() != "rental.intent_invalid" {
+		t.Fatalf("noncanonical persisted rental intent reopened: %v", problem)
+	}
 }
 
 func TestPrivateModeControlRuntimeFloor(t *testing.T) {
@@ -149,10 +159,11 @@ func TestPrivateModeControlRuntimeFloor(t *testing.T) {
 		return []byte(`{"base_distributions":[{"distribution":"cozy-runtime","version":"` + //cozy:allow base distribution capability fact, not executable access
 			version + `"}]}`)
 	}
-	if launch.BaseRuntimeAtLeast(manifest("0.0.19"), "0.0.20") ||
-		!launch.BaseRuntimeAtLeast(manifest("0.0.20"), "0.0.20") ||
-		!launch.BaseRuntimeAtLeast(manifest("0.1.0"), "0.0.20") ||
-		launch.BaseRuntimeAtLeast(manifest("0.0.20-rc1"), "0.0.20") {
+	if launch.PrivateModeledRuntimeFloor != "0.0.20" ||
+		launch.BaseRuntimeAtLeast(manifest("0.0.19"), launch.PrivateModeledRuntimeFloor) ||
+		!launch.BaseRuntimeAtLeast(manifest("0.0.20"), launch.PrivateModeledRuntimeFloor) ||
+		!launch.BaseRuntimeAtLeast(manifest("0.1.0"), launch.PrivateModeledRuntimeFloor) ||
+		launch.BaseRuntimeAtLeast(manifest("0.0.20-rc1"), launch.PrivateModeledRuntimeFloor) {
 		t.Fatal("private modeled Runtime capability floor admitted/refused the wrong active base")
 	}
 }

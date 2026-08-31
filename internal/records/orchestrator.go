@@ -28,23 +28,7 @@ import (
 //      single INSERT...SELECT...WHERE NOT EXISTS statement — atomic by construction,
 //      so two concurrent starts cannot both win.
 
-var orchestratorSchema = []string{`
-CREATE TABLE IF NOT EXISTS worker_processes (
-  instance_id     TEXT PRIMARY KEY,
-  package        TEXT    NOT NULL,
-  generation      TEXT    REFERENCES install_generations(id),
-  package_revision_digest      TEXT    NOT NULL,
-  worker_id       TEXT    NOT NULL,
-  devices         TEXT    NOT NULL,
-	pid             INTEGER NOT NULL,
-	birth           TEXT    NOT NULL,
-	session_id      TEXT,
-	state           TEXT    NOT NULL,
-  opened_at       TEXT    NOT NULL,
-  closed_at       TEXT    NOT NULL DEFAULT ''
-)`, `
-CREATE UNIQUE INDEX IF NOT EXISTS worker_session ON worker_processes(session_id)
-  WHERE session_id IS NOT NULL`, `
+const requestsDDL = `
 CREATE TABLE IF NOT EXISTS requests (
   id           TEXT PRIMARY KEY,
   idem_key     TEXT    NOT NULL UNIQUE,
@@ -74,7 +58,57 @@ CREATE TABLE IF NOT EXISTS requests (
   assets       TEXT    NOT NULL DEFAULT '[]',
   models       TEXT    NOT NULL DEFAULT '[]',
   artifact_outputs TEXT NOT NULL DEFAULT '[]'
-, acceptable_base_manifests TEXT NOT NULL DEFAULT '[]')`, `
+, acceptable_base_manifests TEXT NOT NULL DEFAULT '[]')`
+
+const requestsV2DDL = `
+CREATE TABLE IF NOT EXISTS requests (
+  id           TEXT PRIMARY KEY,
+  idem_key     TEXT    NOT NULL UNIQUE,
+  body_digest  TEXT    NOT NULL,
+  package     TEXT    NOT NULL,
+  entrypoint   TEXT    NOT NULL,
+  plan_id      TEXT    NOT NULL,
+  package_release TEXT NOT NULL DEFAULT '',
+  package_revision_digest TEXT NOT NULL DEFAULT '',
+  private_package_digest TEXT NOT NULL DEFAULT '',
+  private_package_uploaded_boot_id TEXT NOT NULL DEFAULT '',
+  environment_digest TEXT NOT NULL DEFAULT '',
+  config_digest TEXT NOT NULL DEFAULT '',
+  payload      BLOB    NOT NULL,
+  outputs      TEXT    NOT NULL DEFAULT '',
+  state        TEXT    NOT NULL,
+  ordinal      INTEGER NOT NULL DEFAULT 0,
+  requeues     INTEGER NOT NULL DEFAULT 0,
+  created_at   TEXT    NOT NULL,
+  kind         TEXT    NOT NULL DEFAULT 'serving',
+  job_gpu_count INTEGER NOT NULL DEFAULT 0,
+  org          TEXT    NOT NULL DEFAULT '',
+  trees        TEXT    NOT NULL DEFAULT '',
+  worker       TEXT    NOT NULL DEFAULT '',
+  rental       INTEGER NOT NULL DEFAULT 0,
+  install_id   TEXT    REFERENCES install_generations(id),
+  assets       TEXT    NOT NULL DEFAULT '[]',
+  models       TEXT    NOT NULL DEFAULT '[]',
+  artifact_outputs TEXT NOT NULL DEFAULT '[]'
+)`
+
+var orchestratorSchema = []string{`
+CREATE TABLE IF NOT EXISTS worker_processes (
+  instance_id     TEXT PRIMARY KEY,
+  package        TEXT    NOT NULL,
+  generation      TEXT    REFERENCES install_generations(id),
+  package_revision_digest      TEXT    NOT NULL,
+  worker_id       TEXT    NOT NULL,
+  devices         TEXT    NOT NULL,
+	pid             INTEGER NOT NULL,
+	birth           TEXT    NOT NULL,
+	session_id      TEXT,
+	state           TEXT    NOT NULL,
+  opened_at       TEXT    NOT NULL,
+  closed_at       TEXT    NOT NULL DEFAULT ''
+)`, `
+CREATE UNIQUE INDEX IF NOT EXISTS worker_session ON worker_processes(session_id)
+  WHERE session_id IS NOT NULL`, requestsDDL, `
 -- The PUBLICATION (cl-004). One row per job request, written INSIDE the terminal
 -- transaction: a publication that a terminal did not commit does not exist, which is
 -- what "killing before commit exposes no partial bundle" means as a schema property

@@ -281,25 +281,25 @@ func migrateRentalBaseSelection(db *sql.DB, path string) *exit.Error {
 	if version != 2 {
 		return schemaReset(path, "records database changed to user_version %d while migrating rental bases", version)
 	}
-	requestColumn, err := schemaColumnExists(tx, "requests", "acceptable_base_manifests")
+	wantV2, err := historicalSchema(2)
 	if err != nil {
-		return exit.Internalf("cannot inspect request base-selection column: %s", err)
+		return exit.Internalf("cannot derive version 2 records schema: %s", err)
 	}
-	rentalColumn, err := schemaColumnExists(tx, "rentals", "wheelhouse_manifest_digest")
+	gotV2, err := schemaSnapshot(tx)
 	if err != nil {
-		return exit.Internalf("cannot inspect rental base-selection column: %s", err)
+		return exit.Internalf("cannot inspect version 2 records schema in %s: %s", path, err)
 	}
-	if requestColumn != rentalColumn {
-		return schemaReset(path, "records database has a partial rental base-selection migration")
+	if strings.Join(gotV2, "\n") != strings.Join(wantV2, "\n") {
+		return schemaReset(path, "records database schema is not the exact version 2 shape")
 	}
-	if !requestColumn {
-		for _, statement := range []string{
-			`ALTER TABLE requests ADD COLUMN acceptable_base_manifests TEXT NOT NULL DEFAULT '[]'`,
-			`ALTER TABLE rentals ADD COLUMN wheelhouse_manifest_digest TEXT NOT NULL DEFAULT ''`,
-		} {
-			if _, err := tx.Exec(statement); err != nil {
-				return schemaReset(path, "records database cannot add exact rental base-selection facts: %s", err)
-			}
+	// SQLite appends each ADD COLUMN to the stored table definition. This order is
+	// therefore part of v3 identity: request intent first, selected rental readback second.
+	for _, statement := range []string{
+		`ALTER TABLE requests ADD COLUMN acceptable_base_manifests TEXT NOT NULL DEFAULT '[]'`,
+		`ALTER TABLE rentals ADD COLUMN wheelhouse_manifest_digest TEXT NOT NULL DEFAULT ''`,
+	} {
+		if _, err := tx.Exec(statement); err != nil {
+			return schemaReset(path, "records database cannot append exact rental base-selection facts: %s", err)
 		}
 	}
 	if _, err := tx.Exec(`PRAGMA user_version=3`); err != nil {
@@ -322,21 +322,27 @@ func migrateRentalBaseSelection(db *sql.DB, path string) *exit.Error {
 	return nil
 }
 
-func schemaColumnExists(tx *sql.Tx, table, column string) (bool, error) {
-	var count int
-	err := tx.QueryRow(`SELECT count(*) FROM pragma_table_info(?) WHERE name=?`, table, column).Scan(&count)
-	return count == 1, err
+func schemaWithoutOutputExports() ([]string, error) {
+	return historicalSchema(1)
 }
 
-func schemaWithoutOutputExports() ([]string, error) {
+// historicalSchema derives only the two exact on-disk predecessors this build migrates.
+// Both predate base selection; v1 also predates durable output exports.
+func historicalSchema(version int) ([]string, error) {
 	db, err := sql.Open("sqlite", ":memory:"+pragmas)
 	if err != nil {
 		return nil, err
 	}
 	defer db.Close()
 	for _, stmt := range schema {
-		if stmt == outputExportSchema {
+		if version == 1 && stmt == outputExportSchema {
 			continue
+		}
+		switch stmt {
+		case requestsDDL:
+			stmt = requestsV2DDL
+		case rentalsDDL:
+			stmt = rentalsV2DDL
 		}
 		if _, err := db.Exec(stmt); err != nil {
 			return nil, err

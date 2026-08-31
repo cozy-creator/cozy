@@ -416,20 +416,25 @@ func productionAcceptableBases(runCtx context.Context, ctx *Context, store *reco
 	plan modelproduction.Plan,
 ) ([]string, *exit.Error) {
 	resolver := NewResolver(store, ctx.Cfg)
-	byRelease := map[string][]string{}
+	type packageSetKey struct {
+		Package, InstallID, Release, ReleaseDigest string
+	}
+	byPackage := map[packageSetKey][]string{}
 	var intersection []string
 	for _, pin := range plan.Jobs {
-		accepted, ok := byRelease[pin.ReleaseDigest]
+		packageName, _, valid := splitProductionCallable(pin.Callable)
+		if !valid {
+			return nil, exit.Named(exit.Structural, "model_production_callable_invalid",
+				"production node %s has invalid callable %s", pin.Node, pin.Callable)
+		}
+		key := packageSetKey{Package: packageName, InstallID: pin.InstallID,
+			Release: pin.Release, ReleaseDigest: pin.ReleaseDigest}
+		accepted, ok := byPackage[key]
 		if !ok {
-			packageName, _, valid := splitProductionCallable(pin.Callable)
-			if !valid {
-				return nil, exit.Named(exit.Structural, "model_production_callable_invalid",
-					"production node %s has invalid callable %s", pin.Node, pin.Callable)
-			}
 			if pin.InstallID != "" {
 				unlock := privatepackage.Guard()
 				revision, compatible, problem := resolver.PreparePrivate(
-					runCtx, pin.InstallID, "0.0.20")
+					runCtx, pin.InstallID, launch.PrivateModeledRuntimeFloor)
 				unlock()
 				if problem != nil {
 					return nil, problem
@@ -456,7 +461,7 @@ func productionAcceptableBases(runCtx context.Context, ctx *Context, store *reco
 					return nil, problem
 				}
 			}
-			byRelease[pin.ReleaseDigest] = append([]string(nil), accepted...)
+			byPackage[key] = append([]string(nil), accepted...)
 		}
 		if intersection == nil {
 			intersection = append([]string(nil), accepted...)

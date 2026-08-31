@@ -1,9 +1,11 @@
 package hub
 
 import (
+	"bytes"
 	"context"
 	"encoding/base64"
 	"encoding/json"
+	"io"
 	"net/http"
 	"net/url"
 	"regexp"
@@ -27,7 +29,8 @@ import (
 //
 //	GET    /v1/rental-skus           -> [{name, accelerator_model, compute_capability,
 //	                                 vram_gb, price_usd_micros_per_hour}]
-//	POST   /v1/rentals               {sku, media_token_sha256:<64 hex>, creator_public_key}
+//	POST   /v1/rentals               {sku, media_token_sha256:<64 hex>, creator_public_key,
+//	                                     acceptable_wheelhouse_manifest_digests:[...]}
 //	                                 -> 202 {rental_id, state, ...}
 //	GET    /v1/rentals/{id}          -> {state, worker_address, cert_pem, media_address,
 //	                                     detail, worker_id, worker_boot_id,
@@ -180,7 +183,7 @@ func RentalRequestBytes(sku, mediaTokenSHA256, creatorPublicKey string,
 		!sort.StringsAreSorted(req.AcceptableWheelhouseManifestDigests) ||
 		!bareSHA256Pattern.MatchString(req.MediaTokenSHA256) || publicErr != nil || len(public) != 32 {
 		return nil, exit.Named(exit.Validation, "rental.intent_incomplete",
-			"sku, media token hash, and one Ed25519 Creator public key are required")
+			"sku, compatible base set, media token hash, and one Ed25519 Creator public key are required")
 	}
 	prior := ""
 	for _, digest := range req.AcceptableWheelhouseManifestDigests {
@@ -195,6 +198,31 @@ func RentalRequestBytes(sku, mediaTokenSHA256, creatorPublicKey string,
 		return nil, exit.Internalf("cannot encode the closed rental request: %s", err)
 	}
 	return raw, nil
+}
+
+// ParseRentalRequestBytes reopens the exact persisted paid intent. Acquisition replay
+// derives compatibility only from these bytes; mutable caller arguments never replace
+// the package-set decision that was durably recorded before the POST.
+func ParseRentalRequestBytes(raw []byte) (RentalRequest, *exit.Error) {
+	var req RentalRequest
+	decoder := json.NewDecoder(bytes.NewReader(raw))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(&req); err != nil {
+		return RentalRequest{}, exit.Named(exit.Conflict, "rental.intent_invalid",
+			"persisted rental intent is not the closed request document")
+	}
+	var trailing any
+	if err := decoder.Decode(&trailing); err != io.EOF {
+		return RentalRequest{}, exit.Named(exit.Conflict, "rental.intent_invalid",
+			"persisted rental intent has trailing data")
+	}
+	canonical, problem := RentalRequestBytes(req.SKU, req.MediaTokenSHA256,
+		req.CreatorPublicKey, req.AcceptableWheelhouseManifestDigests)
+	if problem != nil || !bytes.Equal(canonical, raw) {
+		return RentalRequest{}, exit.Named(exit.Conflict, "rental.intent_invalid",
+			"persisted rental intent is not its exact canonical request")
+	}
+	return req, nil
 }
 
 // RentalSKU is one Cozy-priced product choice. Provider offer names and prices

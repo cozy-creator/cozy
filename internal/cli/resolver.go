@@ -24,10 +24,20 @@ import (
 
 func (r *Resolver) preflightPublished(ref hub.Ref, release, releaseDigest string,
 	detail hub.PackageReleaseDetail,
-) ([]string, *exit.Error) {
+) (compatible []string, problem *exit.Error) {
 	layout, problem := home.Open(r.cfg.Home)
 	if problem != nil {
 		return nil, problem
+	}
+	releaseIdentity, releaseErr := canonical.Raw(releaseDigest)
+	descriptorIdentity, descriptorErr := canonical.Raw(detail.Release.PackageDescriptorDigest)
+	if releaseErr != nil || len(releaseIdentity) != 32 || descriptorErr != nil ||
+		len(descriptorIdentity) != 32 || detail.Release.Release != release ||
+		detail.Release.ReleaseDigest != releaseDigest ||
+		detail.Release.PackageDescriptorLength != int64(len(detail.PackageDescriptor)) ||
+		!bytes.Equal(canonical.Digest(detail.PackageDescriptor), descriptorIdentity) {
+		return nil, exit.Named(exit.Conflict, "package_preflight_release_changed",
+			"Tensorhub package detail does not match the exact accepted release")
 	}
 	ctx, cancel := hub.LongContext()
 	defer cancel()
@@ -43,13 +53,33 @@ func (r *Resolver) preflightPublished(ref hub.Ref, release, releaseDigest string
 			Bytes: append([]byte(nil), base.WheelhouseManifest...)}
 	}
 	sort.Strings(digests)
-	cacheKey := releaseDigest + "\x00" + strings.Join(digests, "\x00")
+	cacheKey := strings.Join(append([]string{ref.String(), release, releaseDigest,
+		detail.Release.PackageDescriptorDigest}, digests...), "\x00")
 	r.mu.Lock()
 	if cached, ok := r.compatibility[cacheKey]; ok {
+		ready := cached.ready
 		r.mu.Unlock()
-		return append([]string(nil), cached...), nil
+		<-ready
+		r.mu.Lock()
+		compatible = append([]string(nil), cached.compatible...)
+		problem = cached.problem
+		r.mu.Unlock()
+		return compatible, problem
 	}
+	cached := &compatibilityEntry{ready: make(chan struct{})}
+	r.compatibility[cacheKey] = cached
 	r.mu.Unlock()
+	defer func() {
+		r.mu.Lock()
+		cached.compatible = append([]string(nil), compatible...)
+		cached.problem = problem
+		if problem != nil {
+			// A transient catalog/download/Runtime failure is not an immutable answer.
+			delete(r.compatibility, cacheKey)
+		}
+		close(cached.ready)
+		r.mu.Unlock()
+	}()
 	plan, problem := r.catalog.PackageDownloads(ctx, ref, release)
 	if problem != nil {
 		return nil, problem
@@ -63,7 +93,9 @@ func (r *Resolver) preflightPublished(ref hub.Ref, release, releaseDigest string
 	if problem != nil {
 		return nil, problem
 	}
-	if plan.Release != release || plan.ReleaseDigest != releaseDigest ||
+	if detail.Release.Release != release || detail.Release.ReleaseDigest != releaseDigest ||
+		detail.Release.PackageDescriptorLength != int64(len(detail.PackageDescriptor)) ||
+		plan.Release != release || plan.ReleaseDigest != releaseDigest ||
 		packageDescriptor.Digest != detail.Release.PackageDescriptorDigest ||
 		!bytes.Equal(packageDescriptor.Bytes, detail.PackageDescriptor) {
 		return nil, exit.Named(exit.Conflict, "package_preflight_release_changed",
@@ -101,18 +133,12 @@ func (r *Resolver) preflightPublished(ref hub.Ref, release, releaseDigest string
 		return nil, problem
 	}
 	install := records.PackageInstall{Runtime: runtimeBin, SourceKind: "local", SourceRef: scratch}
-	compatible, problem := launch.PreflightPrivate(ctx, install, revision, bases,
+	compatible, problem = launch.PreflightPrivate(ctx, install, revision, bases,
 		stagedLayout, r.cfg.Tool())
 	if problem != nil {
 		return nil, problem
 	}
-	r.mu.Lock()
-	if r.compatibility[cacheKey] == nil {
-		r.compatibility[cacheKey] = append([]string(nil), compatible...)
-	}
-	cached := append([]string(nil), r.compatibility[cacheKey]...)
-	r.mu.Unlock()
-	return cached, nil
+	return compatible, nil
 }
 
 // The LOCAL module's package resolver: `org/name` -> the spec that makes its worker
@@ -137,13 +163,19 @@ type Resolver struct {
 	// and asks the runtime for its artifact index; a generation is IMMUTABLE, so doing it
 	// twice would answer the same thing twice.
 	cache         map[string]orchestrator.WorkerLaunchSpec
-	compatibility map[string][]string
+	compatibility map[string]*compatibilityEntry
 	// placements contain only control-plane facts. Keeping this cache distinct is the
 	// seam cl-020's verified control manifest will populate without a local venv.
 	placements map[string]orchestrator.DesiredPlacement
 	catalog    *hub.Client
 	// Devices is the device envelope a worker this host launches may SEE.
 	Devices []string
+}
+
+type compatibilityEntry struct {
+	ready      chan struct{}
+	compatible []string
+	problem    *exit.Error
 }
 
 // PreparePrivate freezes one editable install into exact wheels before any rental spend.
@@ -316,7 +348,7 @@ func NewResolver(store *records.Store, cfg config.Config) *Resolver {
 	return &Resolver{
 		store: store, cfg: cfg,
 		cache:         map[string]orchestrator.WorkerLaunchSpec{},
-		compatibility: map[string][]string{},
+		compatibility: map[string]*compatibilityEntry{},
 		placements:    map[string]orchestrator.DesiredPlacement{},
 		catalog:       hub.New(cfg, "cozy-daemon"),
 		Devices:       []string{"0"},

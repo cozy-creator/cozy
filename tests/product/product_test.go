@@ -3,6 +3,7 @@ package producttest
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -385,6 +386,74 @@ func TestRentalSpendConfigIsNestedAndExact(t *testing.T) {
 	if code, out := runCozy(t, manual, "rental", "new", "gpu"); code == 0 ||
 		!strings.Contains(out, "would exceed") || posts != 0 {
 		t.Fatalf("manual rental crossed the fleet cap [exit %d posts=%d]\n%s", code, posts, out)
+	}
+}
+
+func TestRentalRejectsSelectedWheelhouseOutsidePersistedSet(t *testing.T) {
+	manifest := []byte(`{"base_distributions":[]}`)
+	manifestSum := sha256.Sum256(manifest)
+	accepted := fmt.Sprintf("sha256:%x", manifestSum)
+	selected := "sha256:" + strings.Repeat("b", 64)
+	posts, deletes := 0, 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodGet && r.URL.Path == "/v1/rental-skus":
+			_ = json.NewEncoder(w).Encode([]map[string]any{{
+				"name": "cpu", "accelerator_model": "CPU", "price_usd_micros_per_hour": 70_000,
+			}})
+		case r.Method == http.MethodGet && r.URL.Path == "/v1/base-worker-manifests":
+			_ = json.NewEncoder(w).Encode([]map[string]any{{
+				"wheelhouse_manifest_digest": accepted,
+				"wheelhouse_manifest":        json.RawMessage(manifest),
+				"base_worker_image_digest":   "sha256:" + strings.Repeat("c", 64),
+				"compatibility_profile":      map[string]any{},
+				"platform_target":            map[string]any{},
+				"activated_at":               "2026-08-31T00:00:00Z",
+			}})
+		case r.Method == http.MethodPost && r.URL.Path == "/v1/rentals":
+			posts++
+			var body struct {
+				Bases []string `json:"acceptable_wheelhouse_manifest_digests"`
+			}
+			if json.NewDecoder(r.Body).Decode(&body) != nil || len(body.Bases) != 1 ||
+				body.Bases[0] != accepted {
+				t.Errorf("paid request lost exact accepted base set: %+v", body.Bases)
+			}
+			w.WriteHeader(http.StatusAccepted)
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"rental_id": "pr-wrong-base", "state": "pending_acquisition",
+				"requested_accelerator_model": "CPU", "hourly_rate_usd_micros": 70_000,
+				"wheelhouse_manifest_digest": selected,
+			})
+		case r.Method == http.MethodDelete && r.URL.Path == "/v1/rentals/pr-wrong-base":
+			deletes++
+			w.WriteHeader(http.StatusNoContent)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+
+	root := t.TempDir()
+	t.Cleanup(func() { terminateTestDaemon(t, root) })
+	must(t, os.WriteFile(filepath.Join(root, "config.yaml"), []byte(
+		"tensorhub_url: "+server.URL+"\ntensorhub_token: proof-token\n"+
+			"rentals:\n  max_hourly_spend_usd: 1.00\n"), 0o600))
+	code, out := runCozy(t, root, "rental", "new", "cpu", "--idempotency-key", "wrong-base-proof")
+	if code == 0 || !strings.Contains(out, "outside the persisted compatible set") {
+		t.Fatalf("unaccepted selected base [exit %d]\n%s", code, out)
+	}
+	store, problem := records.Open(filepath.Join(root, "records.db"))
+	fatal(t, problem)
+	defer store.Close()
+	operation, problem := store.RentalOperation("wrong-base-proof")
+	fatal(t, problem)
+	rentalRow, problem := store.RentalRow("pr-wrong-base")
+	fatal(t, problem)
+	if posts != 1 || deletes != 1 || operation == nil || operation.RentalID != "pr-wrong-base" ||
+		operation.State != "release_requested" || rentalRow != nil {
+		t.Fatalf("wrong base cleanup: posts=%d deletes=%d operation=%+v rental=%+v",
+			posts, deletes, operation, rentalRow)
 	}
 }
 
