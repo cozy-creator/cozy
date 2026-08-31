@@ -3,6 +3,7 @@ package producttest
 import (
 	"bytes"
 	"context"
+	"crypto/ed25519"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -38,13 +39,82 @@ func TestRentalRunAcquiresCheapestOnceAndReleasesFailedPreAttempt(t *testing.T) 
 	var origin string
 	var rentalRequest map[string]any
 	var createReason, deleteReason string
+	var authPublic ed25519.PublicKey
 	activeRentalID := "pr-managed-e2e"
-	posts, deletes, packageDownloads := 0, 0, 0
+	posts, deletes, packageDownloads, loginBegins, loginFinishes := 0, 0, 0, 0, 0
+	enrollmentChallenge := bytes.Repeat([]byte{0x11}, 32)
+	loginChallenge := bytes.Repeat([]byte{0x22}, 32)
+	authExpires := time.Now().UTC().Add(15 * time.Minute).Format(time.RFC3339Nano)
+	const enrollmentToken = "managed-rental-enrollment-token"
+	const daemonToken = "managed-rental-daemon-token"
 	root := t.TempDir()
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		mu.Lock()
 		defer mu.Unlock()
+		if strings.HasPrefix(r.URL.Path, "/v1/rentals") &&
+			r.Header.Get("Authorization") != "Bearer "+daemonToken {
+			t.Errorf("%s %s carried authorization %q", r.Method, r.URL.Path,
+				r.Header.Get("Authorization"))
+		}
 		switch {
+		case r.Method == http.MethodPost && r.URL.Path == "/v1/auth/device-keys/enroll/begin":
+			var body struct {
+				PublicKey string `json:"public_key"`
+			}
+			if !decodeAuthBody(t, r, &body) {
+				return
+			}
+			decoded, err := authBase64.DecodeString(body.PublicKey)
+			if err != nil || len(decoded) != ed25519.PublicKeySize {
+				t.Errorf("invalid enrollment public key: %v", err)
+				return
+			}
+			authPublic = append(ed25519.PublicKey(nil), decoded...)
+			writeAuthJSON(t, w, http.StatusAccepted, map[string]string{
+				"enrollment_id": "managed-rental-enrollment",
+				"challenge":     authBase64.EncodeToString(enrollmentChallenge),
+				"expires_at":    authExpires,
+			})
+		case r.Method == http.MethodPost && r.URL.Path == "/v1/auth/device-keys/enroll/finish":
+			var body map[string]string
+			if !decodeAuthBody(t, r, &body) {
+				return
+			}
+			if body["enrollment_id"] != "managed-rental-enrollment" || body["code"] != "123456" ||
+				!verifyAuthSignature(authPublic, "authkit.device-key-enrollment/1",
+					enrollmentChallenge, body["signature"]) {
+				t.Error("invalid managed-rental enrollment proof")
+				return
+			}
+			writeAuthToken(t, w, enrollmentToken, authExpires)
+		case r.Method == http.MethodPost && r.URL.Path == "/v1/auth/device-keys/login/begin":
+			loginBegins++
+			writeAuthJSON(t, w, http.StatusAccepted, map[string]string{
+				"challenge_id": "managed-rental-login",
+				"challenge":    authBase64.EncodeToString(loginChallenge),
+				"expires_at":   authExpires,
+			})
+		case r.Method == http.MethodPost && r.URL.Path == "/v1/auth/device-keys/login/finish":
+			var body map[string]string
+			if !decodeAuthBody(t, r, &body) {
+				return
+			}
+			if body["challenge_id"] != "managed-rental-login" ||
+				!verifyAuthSignature(authPublic, "authkit.device-key-login/1",
+					loginChallenge, body["signature"]) {
+				t.Error("invalid managed-rental login proof")
+				return
+			}
+			loginFinishes++
+			writeAuthToken(t, w, daemonToken, authExpires)
+		case r.Method == http.MethodGet && r.URL.Path == "/v1/auth/me":
+			if r.Header.Get("Authorization") != "Bearer "+enrollmentToken {
+				t.Errorf("enrollment identity read carried %q", r.Header.Get("Authorization"))
+			}
+			writeAuthJSON(t, w, http.StatusOK, map[string]any{
+				"id": "managed-rental-user", "email": "person@example.com",
+				"email_verified": true, "entitlements": []string{}, "availability": []any{},
+			})
 		case r.Method == http.MethodGet && r.URL.Path == "/v1/models/cozy/tiny":
 			_ = json.NewEncoder(w).Encode(map[string]any{
 				"model": map[string]any{"org": "cozy", "name": "tiny"},
@@ -175,8 +245,14 @@ func TestRentalRunAcquiresCheapestOnceAndReleasesFailedPreAttempt(t *testing.T) 
 	defer server.Close()
 	origin = server.URL
 
+	login := runAuthCozy(t, root, server.URL, "123456\n", "auth", "login",
+		"person@example.com", "--json")
+	if login.code != 0 {
+		t.Fatalf("managed-rental machine enrollment [exit %d]\nstdout: %s\nstderr: %s",
+			login.code, login.stdout, login.stderr)
+	}
 	must(t, os.WriteFile(filepath.Join(root, "config.yaml"), []byte(
-		"tensorhub_url: "+server.URL+"\ntensorhub_token: test-token\nport: 0\n"+
+		"tensorhub_url: "+server.URL+"\nport: 0\n"+
 			"rentals:\n  max_hourly_spend_usd: 7.00\n"), 0o600))
 	t.Cleanup(func() { _, _ = runCozy(t, root, "down", "--all") })
 	project := weightlessProject(t)
@@ -462,6 +538,22 @@ func TestRentalRunAcquiresCheapestOnceAndReleasesFailedPreAttempt(t *testing.T) 
 	}
 	if packageDownloads != 1 {
 		t.Fatalf("published package preflight downloads=%d, want one exact resolution", packageDownloads)
+	}
+	if loginBegins != 1 || loginFinishes != 1 {
+		t.Fatalf("daemon machine login exchanges = begin:%d finish:%d, want one each",
+			loginBegins, loginFinishes)
+	}
+	credentials, err := filepath.Glob(filepath.Join(root, "auth", "*.json"))
+	if err != nil || len(credentials) != 1 {
+		t.Fatalf("machine credential files = %v, error = %v", credentials, err)
+	}
+	storedCredential, err := os.ReadFile(credentials[0])
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(storedCredential), enrollmentToken) ||
+		strings.Contains(string(storedCredential), daemonToken) {
+		t.Fatal("short AuthKit access token was persisted")
 	}
 	store, problem = records.Open(filepath.Join(root, "records.db"))
 	fatal(t, problem)
