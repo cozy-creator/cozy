@@ -19,12 +19,22 @@ import (
 // ceiling, reuse decision, and paid POST. The durable rental operation and
 // request rows remain the crash-recovery authority.
 type managedRentals struct {
-	mu     sync.Mutex
-	ctx    *Context
-	layout home.Layout
-	store  *records.Store
-	owner  *orchestrator.Orchestrator
+	mu           sync.Mutex
+	ctx          *Context
+	layout       home.Layout
+	store        *records.Store
+	owner        *orchestrator.Orchestrator
+	idleGrace    time.Duration
+	idleSequence uint64
+	idleTimers   map[string]idleRelease
 }
+
+type idleRelease struct {
+	sequence uint64
+	timer    *time.Timer
+}
+
+const managedRentalIdleGrace = 5 * time.Minute
 
 func (m *managedRentals) status() (string, *exit.Error) {
 	m.mu.Lock()
@@ -104,6 +114,7 @@ func (m *managedRentals) acquire(req records.Request) (string, string, *exit.Err
 			return "", "", exit.New(exit.Canceled,
 				"request %s settled before rental assignment", req.ID)
 		}
+		m.cancelIdleReleaseLocked(row.ID)
 		line, lineProblem := m.lineLocked()
 		return row.ID, line, lineProblem
 	}
@@ -197,12 +208,12 @@ func (m *managedRentals) admitLocked(sku hub.RentalSKU) *exit.Error {
 func (m *managedRentals) release(id string) (string, *exit.Error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	return m.releaseLocked(id)
+	return m.releaseWhenIdleLocked(id)
 }
 
-// releaseOrphaned closes the only crash window after terminal acknowledgement:
-// the request is settled, but the daemon died before its managed pod disappeared.
-// An owed or running origin request is left for normal recovery.
+// releaseOrphaned resumes the post-terminal policy after a daemon restart: jobs and
+// pre-attempt failures release now, while a warm serving rental keeps only the unspent
+// remainder of its original grace. An owed or running request is left for recovery.
 func (m *managedRentals) releaseOrphaned() {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -223,15 +234,83 @@ func (m *managedRentals) releaseOrphaned() {
 		if countsProblem != nil || queued != 0 || running != 0 {
 			continue
 		}
-		origin, originProblem := m.store.RequestRow(row.ManagedRequestID)
-		if originProblem != nil || origin != nil && !settledRequest(origin.State) {
-			continue
-		}
-		line, releaseProblem := m.releaseLocked(row.ID)
+		line, releaseProblem := m.releaseWhenIdleLocked(row.ID)
 		if releaseProblem != nil {
 			fmt.Fprintf(m.ctx.Out, "managed rental %s release deferred: %s\n", row.ID, releaseProblem.Message)
 			continue
 		}
+		fmt.Fprintln(m.ctx.Out, line)
+	}
+}
+
+func (m *managedRentals) releaseWhenIdleLocked(id string) (string, *exit.Error) {
+	row, problem := m.store.RentalRow(id)
+	if problem != nil {
+		return "", problem
+	}
+	if row == nil || row.ManagedRequestID == "" {
+		return m.lineLocked()
+	}
+	queued, running, problem := m.store.RentalRunCounts(id)
+	if problem != nil {
+		return "", problem
+	}
+	if queued != 0 || running != 0 {
+		return m.lineLocked()
+	}
+	last, found, problem := m.store.RentalLastSettlement(id)
+	if problem != nil {
+		return "", problem
+	}
+	if found && last.Kind != "job" && !last.ClosedAt.IsZero() {
+		deadline := last.ClosedAt.Add(m.grace())
+		if time.Now().Before(deadline) {
+			m.scheduleIdleReleaseLocked(id, deadline)
+			return m.lineLocked()
+		}
+	}
+	return m.releaseLocked(id)
+}
+
+func (m *managedRentals) grace() time.Duration {
+	if m.idleGrace > 0 {
+		return m.idleGrace
+	}
+	return managedRentalIdleGrace
+}
+
+func (m *managedRentals) scheduleIdleReleaseLocked(id string, deadline time.Time) {
+	m.cancelIdleReleaseLocked(id)
+	if m.idleTimers == nil {
+		m.idleTimers = map[string]idleRelease{}
+	}
+	m.idleSequence++
+	sequence := m.idleSequence
+	timer := time.AfterFunc(time.Until(deadline), func() { m.releaseIdle(id, sequence) })
+	m.idleTimers[id] = idleRelease{sequence: sequence, timer: timer}
+}
+
+func (m *managedRentals) cancelIdleReleaseLocked(id string) {
+	if pending, ok := m.idleTimers[id]; ok {
+		pending.timer.Stop()
+		delete(m.idleTimers, id)
+	}
+}
+
+func (m *managedRentals) releaseIdle(id string, sequence uint64) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	pending, ok := m.idleTimers[id]
+	if !ok || pending.sequence != sequence {
+		return
+	}
+	delete(m.idleTimers, id)
+	line, problem := m.releaseWhenIdleLocked(id)
+	if problem != nil {
+		fmt.Fprintf(m.ctx.Out, "managed rental %s release deferred: %s\n", id, problem.Message)
+		return
+	}
+	if line != "" {
 		fmt.Fprintln(m.ctx.Out, line)
 	}
 }
@@ -251,6 +330,7 @@ func (m *managedRentals) releaseLocked(id string) (string, *exit.Error) {
 	if queued != 0 || running != 0 {
 		return m.lineLocked()
 	}
+	m.cancelIdleReleaseLocked(id)
 	operationKey, problem := m.store.RequestRentalRelease(id)
 	if problem != nil {
 		return "", problem
@@ -308,6 +388,7 @@ func (m *managedRentals) reconcileLocked() *exit.Error {
 	}
 	for _, row := range rows {
 		if row.State == hub.RentalReleased {
+			m.cancelIdleReleaseLocked(row.ID)
 			if m.owner != nil {
 				m.owner.DetachRental(row.ID)
 			}
@@ -324,6 +405,7 @@ func (m *managedRentals) reconcileLocked() *exit.Error {
 		cancel()
 		if observed != nil {
 			if observed.Code == exit.NotFound {
+				m.cancelIdleReleaseLocked(row.ID)
 				if m.owner != nil {
 					m.owner.DetachRental(row.ID)
 				}
@@ -339,6 +421,7 @@ func (m *managedRentals) reconcileLocked() *exit.Error {
 				"rental %s changed its locked Cozy retail rate", row.ID)
 		}
 		if remote.State == hub.RentalReleased {
+			m.cancelIdleReleaseLocked(row.ID)
 			if m.owner != nil {
 				m.owner.DetachRental(row.ID)
 			}

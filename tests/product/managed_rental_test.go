@@ -1,12 +1,67 @@
 package producttest
 
 import (
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
 
+	"github.com/cozy-creator/cozy/internal/exit"
+	"github.com/cozy-creator/cozy/internal/orchestrator"
 	"github.com/cozy-creator/cozy/internal/records"
 )
+
+func TestRentalLastSettlementDistinguishesWarmServingFromJobs(t *testing.T) {
+	store, problem := records.Open(filepath.Join(t.TempDir(), "records.db"))
+	fatal(t, problem)
+	defer store.Close()
+	fatal(t, store.AttachWorker(records.WorkerProcess{
+		InstanceID: "pr-warm", Package: "proof/package", WorkerID: "worker",
+	}))
+	serving := records.Request{
+		ID: "req-serving", IdemKey: "serving", BodyDigest: "serving-body",
+		Package: "proof/package", Entrypoint: "marco", Payload: []byte(`{}`),
+		Worker: "pr-warm", Rental: true,
+	}
+	_, fresh, problem := store.Submit(serving)
+	if problem != nil || !fresh {
+		t.Fatalf("submit serving request: fresh=%v problem=%v", fresh, problem)
+	}
+	attempt, problem := store.Dispatch(records.Attempt{
+		RequestID: serving.ID, InstanceID: "pr-warm", SessionID: "boot",
+		InvocationDigest: "invocation", InvocationCanonical: []byte(`{}`),
+	})
+	fatal(t, problem)
+	fatal(t, store.OfferDispatch(serving.ID, attempt, "boot"))
+	applied, problem := store.AcceptTerminal(records.Terminal{
+		RequestID: serving.ID, Attempt: attempt, SessionID: "boot",
+		InvocationDigest: "invocation", TerminalID: "outcome", TerminalDigest: "terminal",
+		Status: "SUCCEEDED", RequestState: "succeeded",
+	})
+	if problem != nil || !applied {
+		t.Fatalf("accept serving terminal: applied=%v problem=%v", applied, problem)
+	}
+	last, found, problem := store.RentalLastSettlement("pr-warm")
+	if problem != nil || !found || last.RequestID != serving.ID || last.Kind != "serving" || last.ClosedAt.IsZero() {
+		t.Fatalf("serving settlement = %+v found=%v problem=%v", last, found, problem)
+	}
+
+	job := records.Request{
+		ID: "req-job", IdemKey: "job", BodyDigest: "job-body", Kind: "job",
+		Package: "proof/package", Entrypoint: "quantize", Payload: []byte(`{}`),
+		Worker: "pr-warm", Rental: true,
+	}
+	_, fresh, problem = store.Submit(job)
+	if problem != nil || !fresh {
+		t.Fatalf("submit job: fresh=%v problem=%v", fresh, problem)
+	}
+	fatal(t, store.SettleRequest(job.ID, "failed"))
+	last, found, problem = store.RentalLastSettlement("pr-warm")
+	if problem != nil || !found || last.RequestID != job.ID || last.Kind != "job" || !last.ClosedAt.IsZero() {
+		t.Fatalf("job settlement = %+v found=%v problem=%v", last, found, problem)
+	}
+}
 
 func TestRentalRequestRequiresTheExplicitAcquisitionSeam(t *testing.T) {
 	owner := hostOwner(t, "managed-rental-gate")
@@ -44,6 +99,45 @@ func TestRentalRequestRequiresTheExplicitAcquisitionSeam(t *testing.T) {
 	fatal(t, problem)
 	if eventHasError(events, "rental.acquisition_unavailable") {
 		t.Fatalf("local request entered rental acquisition: %+v", events)
+	}
+}
+
+func TestReadyManagedRentalDispatchesWithoutAnotherWorkerReport(t *testing.T) {
+	name := "managed-rental-warm-wake"
+	root := filepath.Join(os.TempDir(), "cozy-product-test", name)
+	spec := fakeSpec("warm@pr-warm", "0", "--arm", "output", "--cozy-home", root)
+	var owner *owner
+	owner = hostOwnerConfigured(t, name, nil, func(options *orchestrator.Options) {
+		options.RentalFleet = func() (string, *exit.Error) { return "rentals: warm", nil }
+		options.AcquireManagedRental = func(req records.Request) (string, string, *exit.Error) {
+			assigned, problem := owner.store.AssignManagedRental(req.ID, "pr-warm")
+			if problem != nil {
+				return "", "", problem
+			}
+			if !assigned {
+				t.Fatalf("request %s was not assigned to the warm rental", req.ID)
+			}
+			return "pr-warm", "rentals: reused warm machine", nil
+		}
+	})
+	instance, _, problem := owner.c.EnsureWorker(spec)
+	fatal(t, problem)
+	fatal(t, owner.c.EnsurePlacementReady(instance, planIDOf(t, spec)))
+
+	request := submission(planIDOf(t, spec), "fake/warm", "warm-rental-reuse", map[string]any{"message": "marco"})
+	request.Rental = true
+	id, attempt, problem := owner.c.Submit(request)
+	fatal(t, problem)
+	if attempt != 0 {
+		t.Fatalf("unassigned rental request dispatched attempt %d before assignment", attempt)
+	}
+	result, problem := owner.c.AwaitSettled(id, 5*time.Second)
+	if problem != nil || result.Status != "SUCCEEDED" || result.Attempt != 1 {
+		t.Fatalf("warm rental did not dispatch without another report: result=%+v problem=%v", result, problem)
+	}
+	row, problem := owner.store.RequestRow(id)
+	if problem != nil || row == nil || row.Worker != "pr-warm" {
+		t.Fatalf("warm rental assignment = %+v problem=%v", row, problem)
 	}
 }
 
