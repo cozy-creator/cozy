@@ -15,8 +15,46 @@ import (
 	"github.com/cozy-creator/cozy/internal/exit"
 	"github.com/cozy-creator/cozy/internal/home"
 	"github.com/cozy-creator/cozy/internal/launch"
+	"github.com/cozy-creator/cozy/internal/records"
 	pb "github.com/cozy-creator/cozy/protocol/cozy/worker/v1"
 )
+
+// PublishedPreparationFile retains the bounded exact wheel inventory already verified
+// during code installation. It is not an identity document or executable authority:
+// Runtime re-verifies every wheel and authors the exact PlacementSet only after an
+// invocation selects model Manifests. A fixed file avoids rediscovering generation files.
+const PublishedPreparationFile = "package-preparation.json"
+
+type publishedPreparation struct {
+	Package      string           `json:"package"`
+	Release      string           `json:"release"`
+	SourceDigest string           `json:"source_digest"`
+	ProjectWheel PublishedWheel   `json:"project_wheel"`
+	Wheels       []PublishedWheel `json:"wheels"`
+}
+
+func hasServingModelSlots(descriptor *launch.PackageDescriptor) bool {
+	for i := range descriptor.Entrypoints {
+		if len(descriptor.Entrypoints[i].Models) > 0 {
+			return true
+		}
+	}
+	return false
+}
+
+func hasWeightlessCallable(descriptor *launch.PackageDescriptor) bool {
+	for i := range descriptor.Entrypoints {
+		if len(descriptor.Entrypoints[i].Models) == 0 {
+			return true
+		}
+	}
+	for i := range descriptor.Jobs {
+		if len(descriptor.Jobs[i].Models) == 0 {
+			return true
+		}
+	}
+	return false
+}
 
 // preparePublished materializes the release's complete frozen uv environment, then asks
 // that environment's Runtime to author its resident routing facts. Creator compares the
@@ -64,6 +102,28 @@ func preparePublished(l home.Layout, genDir string, published *PublishedSource) 
 			"the published package environment provides no cozy-runtime").
 			WithRemedy("declare cozy-runtime in pyproject.toml and refresh uv.lock")
 	}
+	descriptor, problem := describePublished(runtimeBin, sourceDir,
+		published.Selection.PackageDescriptor)
+	if problem != nil {
+		return nil, empty, "", nil, problem
+	}
+	deferredModels := len(published.Models) == 0 && hasServingModelSlots(descriptor)
+	if deferredModels {
+		inventory, err := json.Marshal(publishedPreparation{Package: published.Package,
+			Release: published.Release, SourceDigest: published.SourceDigest,
+			ProjectWheel: published.ProjectWheel, Wheels: published.Wheels})
+		if err != nil {
+			return nil, empty, "", nil, exit.Internalf("cannot encode package preparation: %s", err)
+		}
+		if err := os.WriteFile(filepath.Join(genDir, PublishedPreparationFile), inventory, 0o400); err != nil {
+			return nil, empty, "", nil, exit.Internalf(
+				"cannot retain code-only package preparation: %s", err)
+		}
+		if !hasWeightlessCallable(descriptor) {
+			return descriptor, empty, runtimeBin, environment, nil
+		}
+	}
+
 	args := []string{"--json", "prepare-package",
 		"--artifact-store", l.CAS,
 		"--package", published.Package,
@@ -116,7 +176,7 @@ func preparePublished(l home.Layout, genDir string, published *PublishedSource) 
 		return nil, empty, "", nil, exit.Named(exit.Conflict, "descriptor_mismatch",
 			"the installed package describes a different callable surface than its committed release")
 	}
-	descriptor, problem := launch.DecodeDescriptor(answer.PackageDescriptor.Bytes)
+	descriptor, problem = launch.DecodeDescriptor(answer.PackageDescriptor.Bytes)
 	if problem != nil || descriptor.Digest != answer.PackageDescriptor.Digest {
 		return nil, empty, "", nil, exit.Named(exit.Structural, "package_descriptor_invalid",
 			"cozy-runtime returned an invalid package descriptor")
@@ -137,6 +197,11 @@ func preparePublished(l home.Layout, genDir string, published *PublishedSource) 
 	placementPath := filepath.Join(cache, strings.TrimPrefix(answer.PlacementSet.Digest, "sha256:"))
 	if err := os.WriteFile(placementPath, answer.PlacementSet.Bytes, 0o600); err != nil {
 		return nil, empty, "", nil, exit.Internalf("cannot store prepared package placement: %s", err)
+	}
+	if deferredModels {
+		// Keep the bounded wheel views for a modeled invocation. This package also has a
+		// weightless callable, so its code-only PlacementSet remains immediately runnable.
+		return descriptor, answer.PlacementSet, runtimeBin, environment, nil
 	}
 	selectedDependencies := map[string]bool{}
 	for _, wheel := range prepared.Sub("environment").List("wheels") {
@@ -160,6 +225,185 @@ func preparePublished(l home.Layout, genDir string, published *PublishedSource) 
 	// The placement records the exact wheel subset used by a rental base. The local
 	// environment receipt above records the complete frozen closure this machine runs.
 	return descriptor, answer.PlacementSet, runtimeBin, environment, nil
+}
+
+func describePublished(runtimeBin, sourceDir string, committed ExactDocument) (
+	*launch.PackageDescriptor, *exit.Error,
+) {
+	cmd := exec.Command(runtimeBin, "--json", "--dir", sourceDir, "describe")
+	cmd.Env = config.Frozen().Tool()
+	var stdout, stderr strings.Builder
+	cmd.Stdout, cmd.Stderr = &stdout, &stderr
+	err := cmd.Run()
+	if cmd.ProcessState == nil {
+		return nil, exit.Internalf("cannot run %s: %s", runtimeBin, err)
+	}
+	if code := cmd.ProcessState.ExitCode(); code != 0 {
+		return nil, metadataRefusal(code, "describe", stderr.String())
+	}
+	raw := bytes.TrimSuffix([]byte(stdout.String()), []byte("\n"))
+	if !bytes.Equal(raw, committed.Bytes) {
+		return nil, exit.Named(exit.Conflict, "descriptor_mismatch",
+			"the installed package describes a different callable surface than its committed release")
+	}
+	descriptor, problem := launch.DecodeDescriptor(raw)
+	if problem != nil || descriptor.Digest != committed.Digest {
+		return nil, exit.Named(exit.Structural, "package_descriptor_invalid",
+			"cozy-runtime returned an invalid installed package descriptor")
+	}
+	return descriptor, nil
+}
+
+// PreparePublishedSelection turns one installed code/environment generation plus exact
+// invocation-selected model Manifests into Runtime's immutable PlacementSet. It never
+// resolves a human model ref and never downloads bytes; those are Creator's preceding
+// control/transfer steps. Repeating it with the same inputs returns the same digest.
+func PreparePublishedSelection(l home.Layout, gen records.PackageInstall,
+	models []PublishedModel,
+) (ExactDocument, *exit.Error) {
+	var empty ExactDocument
+	if gen.SourceKind != "tensorhub" || gen.Runtime == "" || len(models) == 0 {
+		return empty, exit.Named(exit.Structural, "package_model_selection_incomplete",
+			"install %s has no complete published model selection", gen.ID).
+			WithRemedy("select one exact model for every callable slot")
+	}
+	seedBytes, err := os.ReadFile(filepath.Join(gen.Dir, PublishedPreparationFile))
+	if err != nil {
+		return empty, exit.Named(exit.Conflict, "package_code_preparation_missing",
+			"%s was installed without reusable code-only preparation: %s", gen.Package, err).
+			WithRemedy("reinstall the package; model weights are not required for reinstall")
+	}
+	var inventory publishedPreparation
+	decoder := json.NewDecoder(bytes.NewReader(seedBytes))
+	decoder.DisallowUnknownFields()
+	decodeErr := decoder.Decode(&inventory)
+	var trailing any
+	if decodeErr == nil {
+		decodeErr = decoder.Decode(&trailing)
+	}
+	if decodeErr != io.EOF || inventory.Package != gen.Package ||
+		inventory.Release != gen.Version || inventory.SourceDigest != gen.SourceDigest ||
+		len(inventory.Wheels) > 128 {
+		return empty, exit.Named(exit.Conflict, "package_code_preparation_changed",
+			"%s code-only preparation does not match install %s", gen.Package, gen.ID)
+	}
+	cache := filepath.Join(gen.Dir, "artifact-cache")
+	setDir := filepath.Join(cache, "sets", "package")
+	wheelFrom := func(wheel PublishedWheel) (PublishedWheel, *exit.Error) {
+		digest, digestErr := canonical.Raw(wheel.Digest)
+		path := filepath.Join(setDir, wheel.Filename)
+		if digestErr != nil || len(digest) != 32 || wheel.Filename == "" ||
+			filepath.Base(wheel.Filename) != wheel.Filename || wheel.Length <= 0 ||
+			wheel.Path != path {
+			return PublishedWheel{}, exit.Named(exit.Conflict,
+				"package_code_preparation_invalid", "prepared package wheel is incomplete")
+		}
+		info, statErr := os.Stat(path)
+		if statErr != nil || !info.Mode().IsRegular() || info.Size() != wheel.Length {
+			return PublishedWheel{}, exit.Named(exit.Conflict,
+				"package_code_wheel_missing", "prepared wheel %s is absent or changed", wheel.Filename).
+				WithRemedy("reinstall the package code; no model download is required")
+		}
+		return wheel, nil
+	}
+	project, problem := wheelFrom(inventory.ProjectWheel)
+	if problem != nil {
+		return empty, problem
+	}
+	dependencies := make([]PublishedWheel, 0, len(inventory.Wheels))
+	for _, value := range inventory.Wheels {
+		wheel, problem := wheelFrom(value)
+		if problem != nil {
+			return empty, problem
+		}
+		dependencies = append(dependencies, wheel)
+	}
+	descriptorBytes, err := os.ReadFile(launch.DescriptorPath(gen.Dir))
+	if err != nil {
+		return empty, exit.New(exit.NotFound, "cannot read installed package descriptor: %s", err)
+	}
+	descriptorDigest, _ := canonical.Spell(canonical.Digest(descriptorBytes))
+	if descriptorDigest != gen.PackageDescriptor {
+		return empty, exit.Named(exit.Conflict, "package_descriptor_changed",
+			"installed package descriptor does not match %s", gen.PackageDescriptor)
+	}
+	published := &PublishedSource{Package: gen.Package, Release: gen.Version,
+		SourceDigest: gen.SourceDigest, ProjectWheel: project, Wheels: dependencies,
+		Models: append([]PublishedModel(nil), models...), Selection: Selection{
+			PackageDescriptor: ExactDocument{Bytes: descriptorBytes, Digest: descriptorDigest,
+				Length: int64(len(descriptorBytes))},
+		}}
+	return runPublishedSelection(l, gen, published)
+}
+
+func runPublishedSelection(l home.Layout, gen records.PackageInstall,
+	published *PublishedSource,
+) (ExactDocument, *exit.Error) {
+	var empty ExactDocument
+	args := []string{"--json", "prepare-package",
+		"--artifact-store", l.CAS,
+		"--package", published.Package,
+		"--release", published.Release,
+		"--release-digest", published.SourceDigest,
+		"--project-wheel", published.ProjectWheel.Path,
+		"--artifact-cache", filepath.Join(gen.Dir, "artifact-cache"),
+		"--environment-python", home.VenvPython(filepath.Join(gen.Dir, "venv")),
+	}
+	for _, wheel := range published.Wheels {
+		args = append(args, "--dependency-wheel", wheel.Path)
+	}
+	for _, model := range published.Models {
+		raw, err := json.Marshal(model)
+		if err != nil {
+			return empty, exit.Internalf("cannot encode selected package model: %s", err)
+		}
+		args = append(args, "--model", string(raw))
+	}
+	cmd := exec.Command(gen.Runtime, args...)
+	cmd.Env = config.Frozen().Tool("COZY_HOME=" + l.Root)
+	var stdout, stderr strings.Builder
+	cmd.Stdout, cmd.Stderr = &stdout, &stderr
+	err := cmd.Run()
+	if cmd.ProcessState == nil {
+		return empty, exit.Internalf("cannot run %s: %s", gen.Runtime, err)
+	}
+	if code := cmd.ProcessState.ExitCode(); code != 0 {
+		problem := metadataRefusal(code, "prepare-package", stderr.String())
+		return empty, exit.Named(problem.Code, "model_selection_incompatible",
+			"selected model does not satisfy %s: %s", gen.Package, problem.Message).
+			WithRemedy("choose a model matching the callable's slot class and stamps; %s", problem.Remedy)
+	}
+	var answer struct {
+		Package           string        `json:"package"`
+		Release           string        `json:"release"`
+		PackageDescriptor ExactDocument `json:"package_descriptor"`
+		PlacementSet      ExactDocument `json:"placement_set"`
+	}
+	decoder := json.NewDecoder(strings.NewReader(stdout.String()))
+	decoder.DisallowUnknownFields()
+	decodeErr := decoder.Decode(&answer)
+	var trailing any
+	if decodeErr == nil {
+		decodeErr = decoder.Decode(&trailing)
+	}
+	if decodeErr != io.EOF || answer.Package != gen.Package || answer.Release != gen.Version ||
+		!validRuntimeExact(answer.PackageDescriptor) || !validRuntimeExact(answer.PlacementSet) ||
+		!bytes.Equal(answer.PackageDescriptor.Bytes, published.Selection.PackageDescriptor.Bytes) {
+		return empty, exit.Named(exit.Structural, "package_prepare_invalid",
+			"cozy-runtime returned an invalid selected package preparation")
+	}
+	set, readErr := canonical.Read(answer.PlacementSet.Bytes, &pb.PlacementSet{})
+	if readErr != nil || len(set.List("placements")) != 1 ||
+		len(set.List("placements")[0].List("entrypoints")) == 0 {
+		return empty, exit.Named(exit.Structural, "package_model_selection_empty",
+			"cozy-runtime selected no runnable entrypoint for the requested model slots")
+	}
+	path := filepath.Join(gen.Dir, "artifact-cache",
+		strings.TrimPrefix(answer.PlacementSet.Digest, "sha256:"))
+	if err := os.WriteFile(path, answer.PlacementSet.Bytes, 0o600); err != nil {
+		return empty, exit.Internalf("cannot retain selected package placement: %s", err)
+	}
+	return answer.PlacementSet, nil
 }
 
 func stagePublishedWheel(cache, setDir string, wheel *PublishedWheel) *exit.Error {

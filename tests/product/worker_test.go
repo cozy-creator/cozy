@@ -30,7 +30,7 @@ func (l fixedLauncher) ResolvePlacement(string) (orchestrator.DesiredPlacement, 
 func (l fixedLauncher) Resolve(string) (orchestrator.WorkerLaunchSpec, *exit.Error) {
 	return l.spec, nil
 }
-func (l fixedLauncher) ResolveInstall(string) (orchestrator.WorkerLaunchSpec, *exit.Error) {
+func (l fixedLauncher) ResolveInstall(string, []orchestrator.ModelRef) (orchestrator.WorkerLaunchSpec, *exit.Error) {
 	return l.spec, nil
 }
 func (l fixedLauncher) PrivateRevision(string, string) (privatepackage.Revision, *exit.Error) {
@@ -61,7 +61,7 @@ func (l packageLauncher) ResolvePlacement(pkg string) (orchestrator.DesiredPlace
 func (l packageLauncher) Resolve(pkg string) (orchestrator.WorkerLaunchSpec, *exit.Error) {
 	return l.resolve(pkg)
 }
-func (l packageLauncher) ResolveInstall(string) (orchestrator.WorkerLaunchSpec, *exit.Error) {
+func (l packageLauncher) ResolveInstall(string, []orchestrator.ModelRef) (orchestrator.WorkerLaunchSpec, *exit.Error) {
 	return orchestrator.WorkerLaunchSpec{}, exit.New(exit.NotFound, "no fake install")
 }
 func (l packageLauncher) PrivateRevision(string, string) (privatepackage.Revision, *exit.Error) {

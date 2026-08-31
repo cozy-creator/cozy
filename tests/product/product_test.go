@@ -153,6 +153,8 @@ func TestPackagePublishMetadataGrammar(t *testing.T) {
 	if code, help := runCozy(t, root, "run", "cozy/example/function", "--help"); code != 0 ||
 		strings.Contains(help, "--version") || strings.Contains(help, "vN/function") ||
 		!strings.Contains(help, "org/package[/function]") || !strings.Contains(help, "--await") ||
+		!strings.Contains(help, "--model org/model@release") ||
+		!strings.Contains(help, "--model slot=org/model@release") ||
 		strings.Contains(help, "--detach") || strings.Contains(help, "--wait") ||
 		strings.Contains(help, "--force-rental") {
 		t.Fatalf("run retained versioned target grammar [exit %d]\n%s", code, help)
@@ -175,12 +177,17 @@ func TestPackagePublishMetadataGrammar(t *testing.T) {
 		t.Fatalf("package publish retained caller-authored identity [exit %d]\n%s", code, help)
 	}
 	if code, help := runCozy(t, root, "package", "install", "--help"); code != 0 ||
-		!strings.Contains(help, "--version") || !strings.Contains(help, "explicit directory") ||
+		!strings.Contains(help, "--version") || !strings.Contains(help, "--no-model-download") ||
+		!strings.Contains(help, "explicit directory") || strings.Contains(help, "--skip-cozytensors") ||
 		strings.Contains(help, "--profile") || strings.Contains(help, "--major") ||
 		strings.Contains(help, "--from") || strings.Contains(help, "--dir") ||
 		strings.Contains(help, "--digest") || strings.Contains(help, "--allow-unsigned") ||
 		strings.Contains(help, "--force") {
 		t.Fatalf("package install exposed internal source/destination flags [exit %d]\n%s", code, help)
+	}
+	if code, help := runCozy(t, root, "package", "--help"); code != 0 ||
+		strings.Contains(help, "recover") {
+		t.Fatalf("package repair command became routine package help clutter [exit %d]\n%s", code, help)
 	}
 	if code, out := runCozy(t, root, "package", "install", "cozy/example@1.2.3"); code != 2 ||
 		!strings.Contains(out, "--version 1.2.3") {

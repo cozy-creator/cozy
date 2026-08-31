@@ -103,7 +103,7 @@ type Resolver interface {
 	PreparePrivate(context.Context, string) (privatepackage.Revision, *exit.Error)
 	PrivateRevision(string, string) (privatepackage.Revision, *exit.Error)
 	ResolvePlacement(pkg string) (orchestrator.DesiredPlacement, *exit.Error)
-	ResolveInstall(installID string) (orchestrator.WorkerLaunchSpec, *exit.Error)
+	ResolveInstall(installID string, models []orchestrator.ModelRef) (orchestrator.WorkerLaunchSpec, *exit.Error)
 	ResolveRemoteRelease(pkg, release, digest, function string, models []orchestrator.ModelRef) (
 		orchestrator.LogicalPackage, *launch.Entrypoint, *exit.Error)
 	ResolveRemoteJob(pkg, release, digest, function string, models []orchestrator.ModelRef) (

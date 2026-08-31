@@ -97,6 +97,23 @@ func handleDirectoryInstall(ctx *Context) *exit.Error {
 	return emitInstallResult(ctx, l, st, result)
 }
 
+func handlePackageRecover(ctx *Context) *exit.Error {
+	layout, st, writer, problem := open(ctx.Cfg, true)
+	if problem != nil {
+		return problem
+	}
+	defer st.Close()
+	defer writer.Unlock()
+	count, problem := st.RecoverPackageInventory(ctx.Inv.Args[0], layout.Generations)
+	if problem != nil {
+		return problem
+	}
+	return emit(ctx, compactRecord([]output.Field{
+		{K: "status", V: "recovered"}, {K: "generations", V: count},
+		{K: "source", V: ctx.Inv.Args[0]}, {K: "models_changed", V: false},
+	}, "status", "generations", "models_changed"))
+}
+
 func emitInstallResult(ctx *Context, l home.Layout, st *records.Store, res *install.Result) *exit.Error {
 	g := res.Gen
 	fields := []output.Field{
@@ -111,9 +128,11 @@ func emitInstallResult(ctx *Context, l home.Layout, st *records.Store, res *inst
 		{K: "closure", V: strings.ReplaceAll(g.Closure, "\n", " ")},
 		{K: "package_descriptor", V: g.PackageDescriptor},
 		{K: "placement_set", V: g.PlacementSetDigest},
+		{K: "model_download", V: orNone(res.ModelStatus)},
+		{K: "model_download_error", V: res.ModelError},
 	}
 	if res.Idempotent {
-		return emit(ctx, compactRecord(fields, "package", "version", "status", "changed"))
+		return emit(ctx, compactRecord(fields, "package", "version", "status", "model_download", "changed"))
 	}
 	fields = append(fields,
 		output.Field{K: "staged", V: fmt.Sprintf("%d files, %s", res.Files, output.Bytes(res.Bytes))},
@@ -130,7 +149,7 @@ func emitInstallResult(ctx *Context, l home.Layout, st *records.Store, res *inst
 				output.Field{K: "reclaimed", V: output.Bytes(reclaimed)})
 		}
 	}
-	rec := compactRecord(fields, "package", "version", "status", "disk", "changed")
+	rec := compactRecord(fields, "package", "version", "status", "disk", "model_download", "changed")
 	rec.Notes = append(rec.Notes, res.Warnings...)
 	rec.Next = []string{"cozy package list"}
 	return emit(ctx, rec)

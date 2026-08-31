@@ -34,10 +34,58 @@ import (
 	"time"
 
 	"github.com/cozy-creator/cozy/internal/exit"
+	"github.com/cozy-creator/cozy/internal/flock"
 	"github.com/cozy-creator/cozy/internal/hub"
 	"github.com/cozy-creator/cozy/internal/tfs"
 	"github.com/cozy-creator/cozy/internal/units"
 )
+
+// Acquire serializes one exact Manifest transfer across processes. TensorFS's
+// repository row is the durable completion fact; the flock only elects the live mover.
+// A waiter always re-reads that row before deciding whether any network work remains.
+func (f *Fetch) Acquire(ctx context.Context, row hub.ModelManifest) (Fetched, *exit.Error) {
+	var out Fetched
+	if f.ManifestID == "" || f.Ref.String() == "/" || f.Scratch == "" {
+		return out, exit.Internalf("model acquisition lacks an exact manifest, ref, or scratch root")
+	}
+	if err := os.MkdirAll(f.Scratch, 0o700); err != nil {
+		return out, exit.Internalf("cannot create model acquisition scratch: %s", err)
+	}
+	locks := filepath.Join(filepath.Dir(f.Tool.Root), "transfer", "locks")
+	if err := os.MkdirAll(locks, 0o700); err != nil {
+		return out, exit.Internalf("cannot create model acquisition locks: %s", err)
+	}
+	lockPath := filepath.Join(locks, strings.TrimPrefix(f.ManifestID, "sha256:")+".lock")
+	file, err := os.OpenFile(lockPath, os.O_CREATE|os.O_RDWR, 0o600)
+	if err != nil {
+		return out, exit.Internalf("cannot open model acquisition lock: %s", err)
+	}
+	defer file.Close()
+	if err := flock.Wait(ctx, file); err != nil {
+		return out, exit.Named(exit.Canceled, "model_acquisition_canceled",
+			"waiting for the active model download stopped: %s", err)
+	}
+	defer flock.Release(file)
+	releases, problem := f.Tool.Releases(filepath.Join(f.Scratch, "resident-releases.jsonl"))
+	if problem != nil {
+		return out, problem
+	}
+	for _, release := range releases {
+		if release.Org != f.Ref.Org || release.Name != f.Ref.Name ||
+			release.Version != row.Release || release.Lane != row.Lane {
+			continue
+		}
+		resident := "sha256:" + release.ManifestSHA256
+		if resident != row.ManifestID {
+			return out, exit.Named(exit.Conflict, "model_local_release_changed",
+				"local %s@%s/%s resolves to %s, not selected %s",
+				f.Ref.String(), row.Release, row.Lane, resident, row.ManifestID)
+		}
+		return Fetched{ManifestID: resident, ManifestLength: release.ManifestLength,
+			Release: release.Version, Lane: release.Lane, MS: map[string]int64{}}, nil
+	}
+	return f.Run(ctx, row)
+}
 
 // Fetch is one manifest pulled into the local store.
 type Fetch struct {
@@ -301,6 +349,19 @@ func (f *Fetch) round(ctx context.Context, row hub.ModelManifest, name string, o
 		return exit.Internalf("cannot create the fetch scratch: %s", err)
 	}
 	var plan strings.Builder
+	batch := 0
+	admitted, skipped := out.Admitted, out.Skipped
+	commit := func() *exit.Error {
+		if batch == 0 {
+			return nil
+		}
+		if e := f.install(plan.String(), out); e != nil {
+			return e
+		}
+		plan.Reset()
+		batch = 0
+		return nil
+	}
 	for _, o := range want {
 		r, ok := at[o.ID]
 		if !ok {
@@ -315,15 +376,26 @@ func (f *Fetch) round(ctx context.Context, row hub.ModelManifest, name string, o
 		}
 		out.Moved += n
 		fmt.Fprintf(&plan, "%s %d %s\n", strings.TrimPrefix(o.ID, "sha256:"), o.Length, dst)
+		batch++
+		// A killed transfer keeps every completed batch in TensorFS's verified
+		// journal. Batching avoids both one giant all-or-nothing round and one process
+		// per object when a Manifest reaches thousands of shards.
+		if batch == 64 {
+			if e := commit(); e != nil {
+				return e
+			}
+		}
 	}
-	if e := f.install(name, plan.String(), out); e != nil {
+	if e := commit(); e != nil {
 		return e
 	}
+	f.say("%s: installed %d, skipped %d already verified here",
+		name, out.Admitted-admitted, out.Skipped-skipped)
 	_ = os.RemoveAll(dir)
 	return nil
 }
 
-func (f *Fetch) install(name, plan string, out *Fetched) *exit.Error {
+func (f *Fetch) install(plan string, out *Fetched) *exit.Error {
 	res, e := f.Tool.Fill([]byte(plan), filepath.Join(f.Scratch, "fill.plan"))
 	if e != nil {
 		return e
@@ -335,7 +407,6 @@ func (f *Fetch) install(name, plan string, out *Fetched) *exit.Error {
 	}
 	out.Admitted += res.Put
 	out.Skipped += res.Skipped
-	f.say("%s: installed %d, skipped %d already verified here", name, res.Put, res.Skipped)
 	return nil
 }
 

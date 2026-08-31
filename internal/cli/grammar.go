@@ -39,6 +39,7 @@ func (c *AuthLoginCmd) Run(r *Runtime) error {
 type PackageCmd struct {
 	Search  PackageSearchCmd  `cmd:"" help:"Search for AI magic."`
 	Install PackageInstallCmd `cmd:"" help:"Install a published package or explicit local directory."`
+	Recover PackageRecoverCmd `cmd:"" help:"Repair package inventory from an explicit Creator database backup." hidden:""`
 	Remove  PackageRemoveCmd  `cmd:"" help:"Delete source-code."`
 	List    PackageListCmd    `cmd:"" help:"List installed packages."`
 	Publish PackagePublishCmd `cmd:"" help:"Publish a package release."`
@@ -56,9 +57,14 @@ func (c *PackageSearchCmd) Run(r *Runtime) error {
 }
 
 type PackageInstallCmd struct {
-	Ref      string `arg:"" name:"package-or-directory" help:"Published org/name or explicit directory such as . or ./project."`
-	Version  string `help:"Install this release instead of the newest, e.g. 1.2.3."`
-	Editable bool   `help:"Keep an explicit local directory live for development."`
+	Ref             string `arg:"" name:"package-or-directory" help:"Published org/name or explicit directory such as . or ./project."`
+	Version         string `help:"Install this release instead of the newest, e.g. 1.2.3."`
+	Editable        bool   `help:"Keep an explicit local directory live for development."`
+	NoModelDownload bool   `help:"Install package code without prefetching its configured default model."`
+}
+
+type PackageRecoverCmd struct {
+	Database string `arg:"" name:"database" help:"Explicit prior Creator records database." type:"path"`
 }
 
 type PackageYankCmd struct {
@@ -71,8 +77,13 @@ func (c *PackageYankCmd) Run(r *Runtime) error {
 }
 
 func (c *PackageInstallCmd) Run(r *Runtime) error {
-	return r.call(handleInstall, []string{c.Ref}, bools("--editable", c.Editable),
+	return r.call(handleInstall, []string{c.Ref}, bools("--editable", c.Editable,
+		"--no-model-download", c.NoModelDownload),
 		values("--version", c.Version), false)
+}
+
+func (c *PackageRecoverCmd) Run(r *Runtime) error {
+	return r.call(handlePackageRecover, []string{c.Database}, nil, nil, false)
 }
 
 type PackageRemoveCmd struct {
@@ -184,7 +195,7 @@ type RunExecuteCmd struct {
 	Stream         bool     `help:"Emit typed progress deltas."`
 	PayloadFile    string   `name:"in" help:"Read the whole payload from JSON." type:"path"`
 	Assets         []string `name:"asset" help:"Bind a local asset as field-path=file."`
-	Models         []string `name:"model" help:"Bind a model as slot=org/model[@release][#manifest]."`
+	Models         []string `name:"model" help:"Bind a model: --model org/model@release for one slot; --model slot=org/model@release for named slots."`
 	Rental         bool     `help:"Run on a Creator-managed rental."`
 	ForceRental    bool     `help:"Development/testing: require a remote rental even when local capacity is ready." hidden:""`
 	IdempotencyKey string   `help:"Stable request identity for safe retries."`

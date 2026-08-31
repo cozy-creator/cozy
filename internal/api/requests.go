@@ -264,7 +264,7 @@ func submissionDigest(spec orchestrator.Submission) (string, *exit.Error) {
 		for _, model := range refs {
 			models = append(models, map[string]canonical.Value{
 				"package": model.Package, "slot": model.Slot, "model": model.Model,
-				"release": model.Release, "manifest": model.Manifest,
+				"release": model.Release, "lane": model.Lane, "manifest": model.Manifest,
 				"manifest_length": model.ManifestLength,
 			})
 		}
@@ -407,7 +407,7 @@ func (s *Server) resolvePlan(ctx context.Context, sub Submission) (orchestrator.
 	var e *exit.Error
 	if sub.InstallID != "" {
 		var spec orchestrator.WorkerLaunchSpec
-		spec, e = s.packages.ResolveInstall(sub.InstallID)
+		spec, e = s.packages.ResolveInstall(sub.InstallID, sub.Models)
 		placement = spec.Placement
 	} else {
 		placement, e = s.packages.ResolvePlacement(sub.Package)
@@ -500,7 +500,7 @@ func deriveOutputExport(entrypoint *launch.Entrypoint, out *orchestrator.Submiss
 func (s *Server) resolvePrivateServing(ctx context.Context, sub Submission,
 	out orchestrator.Submission, installID string,
 ) (orchestrator.Submission, *exit.Error) {
-	spec, problem := s.packages.ResolveInstall(installID)
+	spec, problem := s.packages.ResolveInstall(installID, sub.Models)
 	if problem != nil {
 		return out, problem
 	}

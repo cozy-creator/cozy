@@ -247,7 +247,7 @@ func (l privateLiveLauncher) ResolvePlacement(string) (orchestrator.DesiredPlace
 func (l privateLiveLauncher) Resolve(string) (orchestrator.WorkerLaunchSpec, *exit.Error) {
 	return l.unavailable()
 }
-func (l privateLiveLauncher) ResolveInstall(string) (orchestrator.WorkerLaunchSpec, *exit.Error) {
+func (l privateLiveLauncher) ResolveInstall(string, []orchestrator.ModelRef) (orchestrator.WorkerLaunchSpec, *exit.Error) {
 	return l.unavailable()
 }
 func (l privateLiveLauncher) ResolveJob(string, string) (orchestrator.WorkerLaunchSpec, *exit.Error) {

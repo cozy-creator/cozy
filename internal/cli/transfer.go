@@ -198,7 +198,7 @@ func handleModelDownload(ctx *Context) *exit.Error {
 	}
 	ref := f.Ref
 	f.Scratch = scratch(layout, row.ManifestID)
-	res, e := f.Run(hctx, row)
+	res, e := f.Acquire(hctx, row)
 	if e != nil {
 		return e
 	}

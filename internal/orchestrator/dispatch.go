@@ -620,7 +620,7 @@ func (c *Orchestrator) resolveFor(req records.Request) (WorkerLaunchSpec, string
 				spec, e := c.opt.Packages.ResolveJobInstall(req.InstallID, req.Entrypoint)
 				return spec, req.PlanID, e
 			}
-			spec, e := c.opt.Packages.ResolveInstall(req.InstallID)
+			spec, e := c.opt.Packages.ResolveInstall(req.InstallID, req.Models)
 			if e != nil {
 				return WorkerLaunchSpec{}, "", e
 			}

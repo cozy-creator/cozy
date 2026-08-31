@@ -492,6 +492,7 @@ type ModelRef struct {
 	Slot     string `json:"slot"`
 	Model    string `json:"model"`
 	Release  string `json:"release"`
+	Lane     string `json:"lane,omitempty"`
 	Manifest string `json:"manifest"`
 	// ManifestLength is required for derive-only job Model inputs. Serving model
 	// downloads keep it zero because their catalog manifest is acquired through the

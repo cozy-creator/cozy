@@ -24,6 +24,7 @@ import (
 	"github.com/cozy-creator/cozy/internal/exit"
 	"github.com/cozy-creator/cozy/internal/home"
 	"github.com/cozy-creator/cozy/internal/hub"
+	"github.com/cozy-creator/cozy/internal/install"
 	"github.com/cozy-creator/cozy/internal/launch"
 	"github.com/cozy-creator/cozy/internal/orchestrator"
 	"github.com/cozy-creator/cozy/internal/output"
@@ -155,12 +156,15 @@ func handleRun(ctx *Context, target Target, ep *launch.Entrypoint) *exit.Error {
 	}
 	models := []orchestrator.ModelRef(nil)
 	if managedRental {
-		models, e = resolveRemoteModels(ctx, target.Package, ep, ctx.Inv.Values["--model"])
+		models, e = resolveInvocationModels(ctx, target, ep, ctx.Inv.Values["--model"], true)
 		if e != nil {
 			return e
 		}
-	} else if len(ctx.Inv.Values["--model"]) > 0 {
-		return exit.Usagef("--model currently selects models only for --rental execution")
+	} else {
+		models, e = resolveInvocationModels(ctx, target, ep, ctx.Inv.Values["--model"], false)
+		if e != nil {
+			return e
+		}
 	}
 	outputDirectory := ""
 	outputIntentHash := ""
@@ -231,48 +235,245 @@ func handleRun(ctx *Context, target Target, ep *launch.Entrypoint) *exit.Error {
 	return renderRun(ctx, life, terminal, stopped, saved, submitted, began)
 }
 
-func resolveRemoteModels(ctx *Context, packageName string, ep *launch.Entrypoint,
-	specs []string,
+type invocationModelSpec struct {
+	Slot string
+	Ref  string
+	Lane string
+}
+
+// resolveInvocationModels applies the one binding ladder for both local and rented
+// execution: explicit --model, then package.toml default. Local acquisition freezes the
+// exact Manifest and length before submission; remote acquisition freezes the same
+// Manifest in the signed worker download request.
+func resolveInvocationModels(ctx *Context, target Target, ep *launch.Entrypoint,
+	raw []string, remote bool,
 ) ([]orchestrator.ModelRef, *exit.Error) {
+	if !remote && target.InstallID != "" {
+		row, problem := exactInvocationInstall(ctx, target)
+		if problem != nil {
+			return nil, problem
+		}
+		if row.SourceKind == "local" {
+			if len(raw) > 0 {
+				return nil, exit.Named(exit.Unavailable, "editable_model_override_unsupported",
+					"editable package model overrides are not available on the published-package BYOM lane").
+					WithRemedy("publish the package code, then invoke it with --model [slot=]org/model@release")
+			}
+			return nil, nil
+		}
+	}
+	selected, problem := invocationModelSpecs(ctx, target, ep, raw)
+	if problem != nil || len(selected) == 0 {
+		return nil, problem
+	}
+	if remote {
+		out := make([]orchestrator.ModelRef, 0, len(selected))
+		for _, spec := range selected {
+			row, problem := resolveRemoteModel(ctx, target.Package, spec.Slot, spec.Ref, spec.Lane)
+			if problem != nil {
+				return nil, problem
+			}
+			out = append(out, row)
+		}
+		return out, nil
+	}
+	installRow, problem := exactInvocationInstall(ctx, target)
+	if problem != nil {
+		return nil, problem
+	}
+	tool, layout, problem := localTensorFS(ctx)
+	if problem != nil {
+		return nil, problem
+	}
+	if err := os.MkdirAll(layout.Transfer, 0o700); err != nil {
+		return nil, exit.Internalf("cannot create model selection scratch: %s", err)
+	}
+	root, err := os.MkdirTemp(layout.Transfer, "invoke-models-")
+	if err != nil {
+		return nil, exit.Internalf("cannot create model selection scratch: %s", err)
+	}
+	defer os.RemoveAll(root)
+	hctx, cancel := hub.LongContext()
+	defer cancel()
+	out := make([]orchestrator.ModelRef, 0, len(selected))
+	for index, spec := range selected {
+		packagePublishStatus(ctx, "Resolving model for %s...", spec.Slot)
+		model, problem := acquirePublishedModel(hctx, ctx, tool, client(ctx), spec.Ref,
+			spec.Lane, target.Package, spec.Slot,
+			filepath.Join(root, fmt.Sprintf("%03d", index)))
+		if problem != nil {
+			return nil, problem
+		}
+		out = append(out, orchestrator.ModelRef{Package: target.Package, Slot: spec.Slot,
+			Model: model.Model, Release: model.Release, Lane: model.Lane,
+			Manifest: model.Manifest, ManifestLength: model.ManifestLength})
+	}
+	retained, retainProblem := exactInvocationInstall(ctx, target)
+	if retainProblem != nil || retained.ID != installRow.ID ||
+		retained.SourceDigest != installRow.SourceDigest {
+		return nil, exit.Named(exit.Conflict, "package_install_changed",
+			"the selected package install disappeared or changed during model acquisition").
+			WithRemedy("retry against the current installed package")
+	}
+	return out, nil
+}
+
+func invocationModelSpecs(ctx *Context, target Target, ep *launch.Entrypoint,
+	raw []string,
+) ([]invocationModelSpec, *exit.Error) {
 	if len(ep.Models) == 0 {
-		if len(specs) != 0 {
+		if len(raw) > 0 {
 			return nil, exit.Usagef("%s declares no model slots", ep.Name)
 		}
 		return nil, nil
 	}
-	if len(specs) != len(ep.Models) {
-		return nil, exit.Usagef("%s requires exactly one --model for each of its %d model slots",
-			ep.Name, len(ep.Models)).WithRemedy("use --model <slot-or-param>=org/model[@release][#manifest]")
-	}
-	resolved := make([]orchestrator.ModelRef, 0, len(specs))
-	seen := map[string]bool{}
-	for _, spec := range specs {
-		left, right, ok := strings.Cut(strings.TrimSpace(spec), "=")
+	overrides := make(map[string]string, len(raw))
+	for _, value := range raw {
+		left, right, qualified := strings.Cut(strings.TrimSpace(value), "=")
+		if !qualified {
+			if len(ep.Models) != 1 || left == "" {
+				return nil, exit.Usagef("--model %q must name one of %d model slots", value, len(ep.Models)).
+					WithRemedy("use --model <slot>=org/model@release")
+			}
+			right = left
+			left = ep.Models[0].Path
+		}
 		left, right = strings.TrimSpace(left), strings.TrimSpace(right)
-		if !ok || left == "" || right == "" {
-			return nil, exit.Usagef("%q is not slot=org/model[@release][#manifest]", spec)
+		if left == "" || right == "" {
+			return nil, exit.Usagef("%q is not [slot=]org/model@release", value)
 		}
 		slot, problem := modelSlot(ep, left)
 		if problem != nil {
 			return nil, problem
 		}
-		if seen[slot.Path] {
+		if _, exists := overrides[slot.Path]; exists {
 			return nil, exit.Usagef("model slot %s was bound more than once", slot.Path)
 		}
-		row, problem := resolveRemoteModel(ctx, packageName, slot.Path, right)
+		overrides[slot.Path] = right
+	}
+	defaults := map[string]publishedDefaultBinding{}
+	if len(overrides) < len(ep.Models) {
+		var problem *exit.Error
+		defaults, problem = invocationDefaultBindings(ctx, target)
 		if problem != nil {
 			return nil, problem
 		}
-		seen[slot.Path] = true
-		resolved = append(resolved, row)
 	}
+	out := make([]invocationModelSpec, 0, len(ep.Models))
 	for _, slot := range ep.Models {
-		if !seen[slot.Path] {
-			return nil, exit.Usagef("model slot %s has no --model binding", slot.Path)
+		if ref, ok := overrides[slot.Path]; ok {
+			out = append(out, invocationModelSpec{Slot: slot.Path, Ref: ref})
+			continue
+		}
+		binding, ok := defaults[slot.Path]
+		if !ok {
+			return nil, exit.Named(exit.NotFound, "package_default_model_unavailable",
+				"%s has no usable configured default for model slot %s", target.Package, slot.Path).
+				WithRemedy("override it explicitly: --model %s=org/model@release", slot.Param)
+		}
+		out = append(out, invocationModelSpec{Slot: slot.Path, Ref: binding.Ref, Lane: binding.Lane})
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].Slot < out[j].Slot })
+	return out, nil
+}
+
+func invocationDefaultBindings(ctx *Context, target Target) (
+	map[string]publishedDefaultBinding, *exit.Error,
+) {
+	var packageConfig, descriptor install.ExactDocument
+	runtimeBin := ""
+	if target.InstallID != "" {
+		row, problem := exactInvocationInstall(ctx, target)
+		if problem != nil {
+			return nil, problem
+		}
+		var problem2 *exit.Error
+		packageConfig, problem2 = exactInstalledDocument(filepath.Join(row.ProjectDir, "package.toml"))
+		if problem2 != nil {
+			return nil, problem2
+		}
+		descriptor, problem2 = exactInstalledDocument(launch.DescriptorPath(row.Dir))
+		if problem2 != nil {
+			return nil, problem2
+		}
+		runtimeBin = row.Runtime
+	} else {
+		ref, problem := hub.ParseRef(target.Package)
+		if problem != nil {
+			return nil, problem
+		}
+		hctx, cancel := hub.Context()
+		defer cancel()
+		plan, problem := client(ctx).PackageDownloads(hctx, ref, target.Release)
+		if problem != nil {
+			return nil, problem
+		}
+		packageConfig, problem = exactPackageInstallDocument("package.toml", plan.PackageConfig)
+		if problem != nil {
+			return nil, problem
+		}
+		descriptor, problem = exactPackageInstallDocument("package descriptor", plan.PackageDescriptor)
+		if problem != nil {
+			return nil, problem
+		}
+		runtimeBin, problem = launch.HostRuntime()
+		if problem != nil {
+			return nil, problem
 		}
 	}
-	sort.Slice(resolved, func(i, j int) bool { return resolved[i].Slot < resolved[j].Slot })
-	return resolved, nil
+	layout, problem := home.Open(ctx.Cfg.Home)
+	if problem != nil {
+		return nil, problem
+	}
+	if err := os.MkdirAll(layout.Transfer, 0o700); err != nil {
+		return nil, exit.Internalf("cannot create binding metadata scratch: %s", err)
+	}
+	root, err := os.MkdirTemp(layout.Transfer, "binding-defaults-")
+	if err != nil {
+		return nil, exit.Internalf("cannot create binding metadata scratch: %s", err)
+	}
+	defer os.RemoveAll(root)
+	rows, problem := publishedDefaultBindings(context.Background(), ctx.Cfg, root,
+		runtimeBin, packageConfig, descriptor)
+	if problem != nil {
+		return nil, exit.Named(problem.Code, "package_default_model_invalid",
+			"%s configured default model is not usable: %s", target.Package, problem.Message).
+			WithRemedy("supply --model <slot>=org/model@release to bypass the configured default")
+	}
+	out := make(map[string]publishedDefaultBinding, len(rows))
+	for _, row := range rows {
+		out[row.ModelBindingPath] = row
+	}
+	return out, nil
+}
+
+func exactInstalledDocument(path string) (install.ExactDocument, *exit.Error) {
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		return install.ExactDocument{}, exit.New(exit.NotFound, "cannot read installed metadata %s: %s", path, err)
+	}
+	digest, _ := canonical.Spell(canonical.Digest(raw))
+	return install.ExactDocument{Bytes: raw, Digest: digest, Length: int64(len(raw))}, nil
+}
+
+func exactInvocationInstall(ctx *Context, target Target) (*records.PackageInstall, *exit.Error) {
+	layout, problem := home.Open(ctx.Cfg.Home)
+	if problem != nil {
+		return nil, problem
+	}
+	store, problem := records.Open(layout.DB)
+	if problem != nil {
+		return nil, problem
+	}
+	defer store.Close()
+	row, problem := store.Install(target.InstallID)
+	if problem != nil {
+		return nil, problem
+	}
+	if row == nil || row.Package != target.Package {
+		return nil, exit.New(exit.NotFound, "installed package %s is no longer available", target.Package)
+	}
+	return row, nil
 }
 
 func modelSlot(ep *launch.Entrypoint, asked string) (*launch.Slot, *exit.Error) {
@@ -293,9 +494,12 @@ func modelSlot(ep *launch.Entrypoint, asked string) (*launch.Slot, *exit.Error) 
 	return match, nil
 }
 
-func resolveRemoteModel(ctx *Context, packageName, slotPath, raw string) (
+func resolveRemoteModel(ctx *Context, packageName, slotPath, raw, wantedLane string) (
 	orchestrator.ModelRef, *exit.Error,
 ) {
+	// A caller may narrow by Manifest spelling, but cannot introduce one: the Hub-authored
+	// release card below must contain it in an exact lane before it enters request identity
+	// or a signed worker download delegation. No caller bytes or local path are trusted.
 	var empty orchestrator.ModelRef
 	if strings.Count(raw, "#") > 1 {
 		return empty, exit.Usagef("%q carries more than one manifest", raw)
@@ -319,6 +523,11 @@ func resolveRemoteModel(ctx *Context, packageName, slotPath, raw string) (
 	ref, problem := hub.ParseRef(modelName)
 	if problem != nil {
 		return empty, problem
+	}
+	if ref.Org == "local" {
+		return empty, exit.Named(exit.Unavailable, "rental_local_model_sync_required",
+			"%s is a private local model and cannot be granted to a rented worker by path", ref.String()).
+			WithRemedy("publish it under a non-local org, or explicitly sync/upload it through the model publication workflow")
 	}
 	hctx, cancel := hub.Context()
 	defer cancel()
@@ -349,22 +558,27 @@ func resolveRemoteModel(ctx *Context, packageName, slotPath, raw string) (
 	if selected == nil {
 		return empty, exit.New(exit.NotFound, "model %s has no available release %q", ref.String(), release)
 	}
-	manifests := map[string]bool{}
+	manifestLanes := map[string][]string{}
 	for _, lane := range selected.Lanes {
-		if manifest == "" || lane.ManifestID == manifest {
-			manifests[lane.ManifestID] = true
+		if (manifest == "" || lane.ManifestID == manifest) &&
+			(wantedLane == "" || lane.Lane == wantedLane) {
+			manifestLanes[lane.ManifestID] = append(manifestLanes[lane.ManifestID], lane.Lane)
 		}
 	}
-	if manifest != "" && !manifests[manifest] {
+	if manifest != "" && len(manifestLanes[manifest]) == 0 {
 		return empty, exit.New(exit.NotFound, "model %s@%s does not contain manifest %s",
 			ref.String(), release, manifest)
 	}
+	if manifest == "" && wantedLane != "" && len(manifestLanes) == 0 {
+		return empty, exit.New(exit.NotFound, "model %s@%s has no lane %q",
+			ref.String(), release, wantedLane)
+	}
 	if manifest == "" {
-		if len(manifests) != 1 {
-			return empty, exit.Usagef("model %s@%s has %d manifests", ref.String(), release, len(manifests)).
+		if len(manifestLanes) != 1 {
+			return empty, exit.Usagef("model %s@%s has %d manifests", ref.String(), release, len(manifestLanes)).
 				WithRemedy("append #sha256:<digest> to select one exact manifest")
 		}
-		for digest := range manifests {
+		for digest := range manifestLanes {
 			manifest = digest
 		}
 	}
@@ -372,8 +586,10 @@ func resolveRemoteModel(ctx *Context, packageName, slotPath, raw string) (
 		return empty, exit.Named(exit.Conflict, "rental.model_manifest_invalid",
 			"Tensorhub returned an invalid manifest for %s@%s", ref.String(), release)
 	}
+	lanes := manifestLanes[manifest]
+	sort.Strings(lanes)
 	return orchestrator.ModelRef{Package: packageName, Slot: slotPath,
-		Model: ref.String(), Release: release, Manifest: manifest}, nil
+		Model: ref.String(), Release: release, Lane: lanes[0], Manifest: manifest}, nil
 }
 
 func handleRunCancel(ctx *Context) *exit.Error {

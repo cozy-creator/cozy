@@ -33,14 +33,16 @@ import (
 
 // Resolver is the Cozy daemon's package resolver.
 type Resolver struct {
-	mu        sync.Mutex
-	refreshMu sync.Mutex
-	store     *records.Store
-	cfg       config.Config
+	mu          sync.Mutex
+	refreshMu   sync.Mutex
+	selectionMu sync.Mutex
+	store       *records.Store
+	cfg         config.Config
 	// cache holds the specs already derived this launch. Deriving one reads a descriptor
 	// and asks the runtime for its artifact index; a generation is IMMUTABLE, so doing it
 	// twice would answer the same thing twice.
-	cache map[string]orchestrator.WorkerLaunchSpec
+	cache    map[string]orchestrator.WorkerLaunchSpec
+	selected map[string]orchestrator.WorkerLaunchSpec
 	// placements contain only control-plane facts. Keeping this cache distinct is the
 	// seam cl-020's verified control manifest will populate without a local venv.
 	placements map[string]orchestrator.DesiredPlacement
@@ -194,6 +196,7 @@ func NewResolver(store *records.Store, cfg config.Config) *Resolver {
 	return &Resolver{
 		store: store, cfg: cfg,
 		cache:      map[string]orchestrator.WorkerLaunchSpec{},
+		selected:   map[string]orchestrator.WorkerLaunchSpec{},
 		placements: map[string]orchestrator.DesiredPlacement{},
 		catalog:    hub.New(cfg, "cozy-daemon"),
 		Devices:    []string{"0"},
@@ -257,12 +260,93 @@ func (r *Resolver) Resolve(pkg string) (orchestrator.WorkerLaunchSpec, *exit.Err
 }
 
 // ResolveInstall answers from the exact immutable row a durable request retained.
-func (r *Resolver) ResolveInstall(installID string) (orchestrator.WorkerLaunchSpec, *exit.Error) {
+func (r *Resolver) ResolveInstall(installID string, models []orchestrator.ModelRef) (
+	orchestrator.WorkerLaunchSpec, *exit.Error,
+) {
 	facts, e := r.installFacts(installID)
 	if e != nil {
 		return orchestrator.WorkerLaunchSpec{}, e
 	}
-	return facts.Spec(r.Devices)
+	if len(models) == 0 {
+		if facts.Install.PlacementSetDigest == "" {
+			return orchestrator.WorkerLaunchSpec{}, exit.Named(exit.Validation,
+				"package_model_binding_required",
+				"%s is installed as code but this modeled invocation supplied no exact model binding",
+				facts.Install.Package).
+				WithRemedy("invoke through `cozy run` so package defaults resolve, or pass --model [slot=]org/model@release")
+		}
+		return facts.Spec(r.Devices)
+	}
+	key := selectedInstallKey(installID, models)
+	r.mu.Lock()
+	cached, ok := r.selected[key]
+	r.mu.Unlock()
+	if ok {
+		return cached, nil
+	}
+	r.selectionMu.Lock()
+	defer r.selectionMu.Unlock()
+	r.mu.Lock()
+	cached, ok = r.selected[key]
+	r.mu.Unlock()
+	if ok {
+		return cached, nil
+	}
+	selected := make([]install.PublishedModel, 0, len(models))
+	for _, model := range models {
+		if model.Package != facts.Install.Package || model.Slot == "" || model.Model == "" ||
+			model.Release == "" || model.Lane == "" || model.ManifestLength <= 0 {
+			return orchestrator.WorkerLaunchSpec{}, exit.Named(exit.Validation,
+				"local_model_selection_incomplete",
+				"model selection for %s does not carry exact slot/release/lane/Manifest facts",
+				facts.Install.Package)
+		}
+		selected = append(selected, install.PublishedModel{Package: model.Package, Slot: model.Slot,
+			Model: model.Model, Release: model.Release, Lane: model.Lane,
+			Manifest: model.Manifest, ManifestLength: model.ManifestLength})
+	}
+	layout, e := home.Open(r.cfg.Home)
+	if e != nil {
+		return orchestrator.WorkerLaunchSpec{}, e
+	}
+	placement, e := install.PreparePublishedSelection(layout, facts.Install, selected)
+	if e != nil {
+		return orchestrator.WorkerLaunchSpec{}, e
+	}
+	chosen := facts.Install
+	chosen.PlacementSetDigest = placement.Digest
+	selectedFacts, e := launch.Read(chosen, r.cfg.Home, r.cfg.Tool())
+	if e != nil {
+		return orchestrator.WorkerLaunchSpec{}, e
+	}
+	spec, e := selectedFacts.Spec(r.Devices)
+	if e != nil {
+		return orchestrator.WorkerLaunchSpec{}, e
+	}
+	r.mu.Lock()
+	r.selected[key] = spec
+	r.mu.Unlock()
+	return spec, nil
+}
+
+func selectedInstallKey(installID string, models []orchestrator.ModelRef) string {
+	rows := append([]orchestrator.ModelRef(nil), models...)
+	sort.Slice(rows, func(i, j int) bool { return rows[i].Slot < rows[j].Slot })
+	var key strings.Builder
+	key.WriteString(installID)
+	for _, row := range rows {
+		key.WriteByte(0)
+		key.WriteString(row.Slot)
+		key.WriteByte(0)
+		key.WriteString(row.Model)
+		key.WriteByte(0)
+		key.WriteString(row.Release)
+		key.WriteByte(0)
+		key.WriteString(row.Lane)
+		key.WriteByte(0)
+		key.WriteString(row.Manifest)
+	}
+	return key.String()
 }
 
 func (r *Resolver) ResolveRemoteRelease(pkg, release, releaseDigest, function string,

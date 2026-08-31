@@ -20,6 +20,7 @@ import (
 	"github.com/cozy-creator/cozy/internal/hub"
 	"github.com/cozy-creator/cozy/internal/install"
 	"github.com/cozy-creator/cozy/internal/launch"
+	"github.com/cozy-creator/cozy/internal/tfs"
 	"github.com/cozy-creator/cozy/internal/transfer"
 )
 
@@ -72,13 +73,22 @@ func handleRegistryInstall(ctx *Context) *exit.Error {
 	}
 	if generation != nil && generation.SourceDigest == releaseDigest {
 		defer existing.Close()
-		return emitInstallResult(ctx, existingLayout, existing, &install.Result{Gen: *generation, Idempotent: true})
+		result := &install.Result{Gen: *generation, Idempotent: true}
+		if err := os.MkdirAll(existingLayout.Transfer, 0o700); err != nil {
+			return exit.Internalf("cannot create model prefetch scratch: %s", err)
+		}
+		modelScratch, err := os.MkdirTemp(existingLayout.Transfer, "package-model-prefetch-")
+		if err != nil {
+			return exit.Internalf("cannot create model prefetch scratch: %s", err)
+		}
+		defer os.RemoveAll(modelScratch)
+		bestEffortDefaultModels(hctx, ctx, modelScratch, generation.Runtime,
+			&install.PublishedSource{Package: ref.String(), Release: release,
+				SourceDigest: releaseDigest, PackageConfig: packageConfig,
+				Selection: install.Selection{PackageDescriptor: packageDescriptor}}, result)
+		return emitInstallResult(ctx, existingLayout, existing, result)
 	}
 	existing.Close()
-	runtimeBin, problem := launch.HostRuntime()
-	if problem != nil {
-		return problem
-	}
 	layout, problem := home.Open(ctx.Cfg.Home)
 	if problem != nil {
 		return problem
@@ -96,16 +106,10 @@ func handleRegistryInstall(ctx *Context) *exit.Error {
 	if problem != nil {
 		return problem
 	}
-	if problem := downloadPublishedPackageModels(hctx, ctx, scratch, runtimeBin, published); problem != nil {
-		return problem
-	}
-
 	_, st, writer, problem := open(ctx.Cfg, true)
 	if problem != nil {
 		return problem
 	}
-	defer st.Close()
-	defer writer.Unlock()
 	var result *install.Result
 	problem = packagePublishStage(ctx, "Creating local package environment", func() *exit.Error {
 		var installProblem *exit.Error
@@ -115,9 +119,48 @@ func handleRegistryInstall(ctx *Context) *exit.Error {
 		return installProblem
 	})
 	if problem != nil {
+		st.Close()
+		writer.Unlock()
 		return problem
 	}
-	return emitInstallResult(ctx, layout, st, result)
+	st.Close()
+	writer.Unlock()
+	bestEffortDefaultModels(hctx, ctx, scratch, result.Gen.Runtime, published, result)
+	_, outputStore, outputWriter, problem := open(ctx.Cfg, true)
+	if problem != nil {
+		return problem
+	}
+	defer outputStore.Close()
+	defer outputWriter.Unlock()
+	return emitInstallResult(ctx, layout, outputStore, result)
+}
+
+func bestEffortDefaultModels(hctx context.Context, ctx *Context, root, runtimeBin string,
+	published *install.PublishedSource, result *install.Result,
+) {
+	if ctx.Inv.Bool("--no-model-download") {
+		result.ModelStatus = "skipped"
+		return
+	}
+	if runtimeBin == "" {
+		result.ModelStatus = "failed"
+		result.ModelError = "installed Runtime path is absent"
+		result.Warnings = append(result.Warnings,
+			"package code is installed; default model prefetch was skipped because its Runtime path is absent")
+		return
+	}
+	if problem := downloadPublishedPackageModels(hctx, ctx, root, runtimeBin, published); problem != nil {
+		result.ModelStatus = "failed"
+		result.ModelError = problem.ErrName() + ": " + problem.Message
+		result.Warnings = append(result.Warnings,
+			"package code is installed; default model prefetch failed: "+problem.Message)
+		return
+	}
+	if len(published.Models) == 0 {
+		result.ModelStatus = "none"
+		return
+	}
+	result.ModelStatus = "ready"
 }
 
 func registryPackageRef(value, release string) (hub.Ref, string, *exit.Error) {
@@ -255,15 +298,15 @@ type publishedDefaultBinding struct {
 func downloadPublishedPackageModels(ctx context.Context, cli *Context, root, runtimeBin string,
 	published *install.PublishedSource,
 ) *exit.Error {
-	if err := raiseOpenFileLimit(); err != nil {
-		return exit.Named(exit.Structural, "open_file_limit_unavailable",
-			"cannot raise the open-file limit for model leases: %s", err).
-			WithRemedy("allow Cozy to raise RLIMIT_NOFILE to this account's hard limit")
-	}
 	bindings, problem := publishedDefaultBindings(ctx, cli.Cfg, root, runtimeBin,
 		published.PackageConfig, published.Selection.PackageDescriptor)
 	if problem != nil || len(bindings) == 0 {
 		return problem
+	}
+	if err := raiseOpenFileLimit(); err != nil {
+		return exit.Named(exit.Structural, "open_file_limit_unavailable",
+			"cannot raise the open-file limit for model leases: %s", err).
+			WithRemedy("allow Cozy to raise RLIMIT_NOFILE to this account's hard limit")
 	}
 	tool, _, problem := localTensorFS(cli)
 	if problem != nil {
@@ -272,33 +315,99 @@ func downloadPublishedPackageModels(ctx context.Context, cli *Context, root, run
 	hubClient := client(cli)
 	for index, binding := range bindings {
 		packagePublishStatus(cli, "Downloading model %s...", binding.Ref)
-		fetch := &transfer.Fetch{
-			Tool: tool, Hub: hubClient, Spec: binding.Ref, Lane: binding.Lane,
-			Progress: progress(cli),
-			Scratch:  filepath.Join(root, "models", fmt.Sprintf("%03d", index)),
-		}
-		resolved, problem := fetch.Resolve(ctx)
+		selected, problem := acquirePublishedModel(ctx, cli, tool, hubClient,
+			binding.Ref, binding.Lane, published.Package, binding.ModelBindingPath,
+			filepath.Join(root, "models", fmt.Sprintf("%03d", index)))
 		if problem != nil {
 			return problem
 		}
-		fetched, problem := fetch.Run(ctx, resolved)
-		if problem != nil {
-			return problem
-		}
-		manifest, err := canonical.Raw(fetched.ManifestID)
-		if err != nil || len(manifest) != 32 || fetched.ManifestLength <= 0 ||
-			fetched.Release == "" || fetched.Lane == "" || fetch.Ref.String() == "" {
-			return exit.Named(exit.Structural, "model_download_result_invalid",
-				"Tensorhub returned an incomplete exact model selection for package slot %s",
-				binding.ModelBindingPath)
-		}
-		published.Models = append(published.Models, install.PublishedModel{
-			Package: published.Package, Slot: binding.ModelBindingPath, Model: fetch.Ref.String(),
-			Release: fetched.Release, Lane: fetched.Lane, Manifest: fetched.ManifestID,
-			ManifestLength: fetched.ManifestLength,
-		})
+		published.Models = append(published.Models, selected)
 	}
 	return nil
+}
+
+// acquirePublishedModel is LOCAL-FIRST. An exact TensorFS release row is sufficient
+// authority to invoke an already-installed Manifest even if Tensorhub's catalog was
+// reset or is offline. Only a local miss asks Tensorhub to resolve/download.
+func acquirePublishedModel(ctx context.Context, cli *Context, tool *tfs.Tool,
+	hubClient *hub.Client, spec, lane, packageName, slot, work string,
+) (install.PublishedModel, *exit.Error) {
+	var empty install.PublishedModel
+	if local, ok, problem := exactLocalModel(tool, spec, lane, work); problem != nil {
+		return empty, problem
+	} else if ok {
+		return install.PublishedModel{Package: packageName, Slot: slot, Model: local.Model,
+			Release: local.Release, Lane: local.Lane, Manifest: local.Manifest,
+			ManifestLength: local.ManifestLength}, nil
+	}
+	fetch := &transfer.Fetch{Tool: tool, Hub: hubClient, Spec: spec, Lane: lane,
+		Progress: progress(cli), Scratch: work}
+	resolved, problem := fetch.Resolve(ctx)
+	if problem != nil {
+		return empty, exit.Named(problem.Code, "model_resolution_unavailable",
+			"cannot resolve model %s for slot %s: %s", spec, slot, problem.Message).
+			WithRemedy("download another compatible model or override this slot with --model %s=org/model@release", slot)
+	}
+	fetched, problem := fetch.Acquire(ctx, resolved)
+	if problem != nil {
+		return empty, problem
+	}
+	manifest, err := canonical.Raw(fetched.ManifestID)
+	if err != nil || len(manifest) != 32 || fetched.ManifestLength <= 0 ||
+		fetched.Release == "" || fetched.Lane == "" || fetch.Ref.String() == "/" {
+		return empty, exit.Named(exit.Structural, "model_download_result_invalid",
+			"model acquisition returned an incomplete exact selection for package slot %s", slot)
+	}
+	return install.PublishedModel{Package: packageName, Slot: slot, Model: fetch.Ref.String(),
+		Release: fetched.Release, Lane: fetched.Lane, Manifest: fetched.ManifestID,
+		ManifestLength: fetched.ManifestLength}, nil
+}
+
+type localModelSelection struct {
+	Model, Release, Lane, Manifest string
+	ManifestLength                 int64
+}
+
+func exactLocalModel(tool *tfs.Tool, spec, lane, work string) (
+	localModelSelection, bool, *exit.Error,
+) {
+	var empty localModelSelection
+	modelRelease, manifest, hasManifest := strings.Cut(strings.TrimSpace(spec), "#")
+	modelName, release, hasRelease := strings.Cut(modelRelease, "@")
+	if !hasRelease || release == "" || hasManifest && manifest == "" {
+		return empty, false, nil
+	}
+	ref, problem := hub.ParseRef(modelName)
+	if problem != nil {
+		return empty, false, problem
+	}
+	if manifest != "" {
+		if raw, err := canonical.Raw(manifest); err != nil || len(raw) != 32 {
+			return empty, false, exit.Usagef("%q is not an exact model Manifest", manifest)
+		}
+	}
+	if err := os.MkdirAll(work, 0o700); err != nil {
+		return empty, false, exit.Internalf("cannot create model lookup scratch: %s", err)
+	}
+	rows, problem := tool.Releases(filepath.Join(work, "local-releases.jsonl"))
+	if problem != nil {
+		return empty, false, problem
+	}
+	matches := make([]localModelSelection, 0, 1)
+	for _, row := range rows {
+		rowManifest := "sha256:" + row.ManifestSHA256
+		if row.Org == ref.Org && row.Name == ref.Name && row.Version == release &&
+			(lane == "" || row.Lane == lane) && (manifest == "" || rowManifest == manifest) {
+			matches = append(matches, localModelSelection{Model: ref.String(), Release: release,
+				Lane: row.Lane, Manifest: rowManifest, ManifestLength: row.ManifestLength})
+		}
+	}
+	if len(matches) == 1 {
+		return matches[0], true, nil
+	}
+	// Zero or ambiguous local rows defer to Tensorhub's catalog resolver. In particular,
+	// never guess between two lanes merely because both are on disk.
+	return empty, false, nil
 }
 
 func publishedDefaultBindings(parent context.Context, cfg config.Config, root, runtimeBin string,

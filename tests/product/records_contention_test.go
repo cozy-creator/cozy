@@ -68,7 +68,7 @@ func TestRecordsSchemaIsExactV8AndStable(t *testing.T) {
 	}
 }
 
-func TestRecordsRefusesEveryPreV8VersionWithoutMutation(t *testing.T) {
+func TestRecordsRefusesMalformedPreV8VersionsWithoutMutation(t *testing.T) {
 	for _, older := range []int{1, 2, 3, 4, 5, 6, 7} {
 		t.Run(fmt.Sprintf("v%d", older), func(t *testing.T) {
 			path := t.TempDir() + "/records.db"

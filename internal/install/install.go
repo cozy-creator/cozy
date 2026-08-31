@@ -143,6 +143,10 @@ type Result struct {
 	Warnings   []string
 	Files      int
 	Bytes      int64
+	// ModelStatus is post-commit Creator UX, not part of the install transaction.
+	// A failed optional prefetch therefore cannot roll this successful result back.
+	ModelStatus string
+	ModelError  string
 }
 
 // Run executes the whole transaction. Every refusal before Activate leaves the

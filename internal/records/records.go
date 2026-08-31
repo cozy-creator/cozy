@@ -140,6 +140,11 @@ func Open(path string) (*Store, *exit.Error) {
 			db.Close()
 			return nil, e
 		}
+	} else if version == 6 || version == 7 {
+		if e := migrateToEight(db, path, version); e != nil {
+			db.Close()
+			return nil, e
+		}
 	} else if version != schemaVersion {
 		db.Close()
 		return nil, schemaReset(path,
@@ -154,6 +159,170 @@ func Open(path string) (*Store, *exit.Error) {
 		return nil, exit.Internalf("cannot enable WAL for %s: %s", path, err)
 	}
 	return &Store{db: db}, nil
+}
+
+// Schema 7 removed one retired rental observation; schema 6 additionally lacks the
+// default-false rental_required request column. Both released predecessors migrate in
+// place: replacing the database would lose package generations and their active pins.
+func migrateToEight(db *sql.DB, path string, sourceVersion int) *exit.Error {
+	if e := verifyPriorSchema(db, path, sourceVersion); e != nil {
+		return e
+	}
+	// Rebuild the one changed table so sqlite_master matches the closed current schema.
+	// Foreign-key rewriting on ALTER TABLE must be disabled during the swap; integrity is
+	// checked again before Open returns the store.
+	if _, err := db.Exec(`PRAGMA foreign_keys=OFF`); err != nil {
+		return exit.Internalf("cannot suspend foreign-key checks while migrating %s: %s", path, err)
+	}
+	defer db.Exec(`PRAGMA foreign_keys=ON`)
+	if _, err := db.Exec(`PRAGMA legacy_alter_table=ON`); err != nil {
+		return exit.Internalf("cannot fence table rename while migrating %s: %s", path, err)
+	}
+	defer db.Exec(`PRAGMA legacy_alter_table=OFF`)
+	tx, err := db.Begin()
+	if err != nil {
+		return exit.Internalf("cannot begin records schema migration in %s: %s", path, err)
+	}
+	defer tx.Rollback()
+	version, err := databaseVersion(tx)
+	if err != nil {
+		return exit.Internalf("cannot confirm records schema in %s: %s", path, err)
+	}
+	if version == schemaVersion {
+		return commitMigration(tx, path)
+	}
+	if version != sourceVersion {
+		return schemaReset(path, "records database changed to user_version %d while migrating", version)
+	}
+	if sourceVersion == 6 {
+		if e := migrateRequestsSix(tx, path); e != nil {
+			return e
+		}
+	}
+	if _, err := tx.Exec(`DROP INDEX rentals_machine_name`); err != nil {
+		return exit.Internalf("cannot stage rental index while migrating %s: %s", path, err)
+	}
+	if _, err := tx.Exec(`ALTER TABLE rentals RENAME TO rentals_prior`); err != nil {
+		return exit.Internalf("cannot stage rental rows while migrating %s: %s", path, err)
+	}
+	if _, err := tx.Exec(rentalsDDL); err != nil {
+		return exit.Internalf("cannot create current rentals table while migrating %s: %s", path, err)
+	}
+	if _, err := tx.Exec(`INSERT INTO rentals(` + rentalCols + `) SELECT ` + rentalCols +
+		` FROM rentals_prior`); err != nil {
+		return exit.Internalf("cannot preserve rental rows while migrating %s: %s", path, err)
+	}
+	if _, err := tx.Exec(`DROP TABLE rentals_prior`); err != nil {
+		return exit.Internalf("cannot finish rental migration in %s: %s", path, err)
+	}
+	if _, err := tx.Exec(rentalSchema[3]); err != nil {
+		return exit.Internalf("cannot restore rental index while migrating %s: %s", path, err)
+	}
+	if _, err := tx.Exec(`PRAGMA user_version=8`); err != nil {
+		return exit.Internalf("cannot stamp records migration in %s: %s", path, err)
+	}
+	if e := commitMigration(tx, path); e != nil {
+		return e
+	}
+	if _, err := db.Exec(`PRAGMA legacy_alter_table=OFF`); err != nil {
+		return exit.Internalf("cannot restore rename policy after migrating %s: %s", path, err)
+	}
+	if _, err := db.Exec(`PRAGMA foreign_keys=ON`); err != nil {
+		return exit.Internalf("cannot restore foreign keys after migrating %s: %s", path, err)
+	}
+	rows, err := db.Query(`PRAGMA foreign_key_check`)
+	if err != nil {
+		return exit.Internalf("cannot verify migrated foreign keys in %s: %s", path, err)
+	}
+	defer rows.Close()
+	if rows.Next() {
+		return exit.Named(exit.Conflict, "records.migration_foreign_key_failed",
+			"records migration in %s left an invalid foreign-key reference", path)
+	}
+	return nil
+}
+
+func migrateRequestsSix(tx *sql.Tx, path string) *exit.Error {
+	if _, err := tx.Exec(`ALTER TABLE requests RENAME TO requests_schema6`); err != nil {
+		return exit.Internalf("cannot stage request rows while migrating %s: %s", path, err)
+	}
+	if _, err := tx.Exec(requestsDDL); err != nil {
+		return exit.Internalf("cannot create current requests table while migrating %s: %s", path, err)
+	}
+	columns := `id,idem_key,body_digest,package,entrypoint,plan_id,package_release,
+		package_revision_digest,private_package_digest,private_package_uploaded_boot_id,
+		environment_digest,config_digest,payload,outputs,state,ordinal,requeues,created_at,kind,
+		job_gpu_count,org,trees,worker,rental,install_id,assets,models,artifact_outputs`
+	if _, err := tx.Exec(`INSERT INTO requests(` + columns + `) SELECT ` + columns +
+		` FROM requests_schema6`); err != nil {
+		return exit.Internalf("cannot preserve request rows while migrating %s: %s", path, err)
+	}
+	if _, err := tx.Exec(`DROP TABLE requests_schema6`); err != nil {
+		return exit.Internalf("cannot finish request migration in %s: %s", path, err)
+	}
+	return nil
+}
+
+const rentalsDDLPrior = `
+CREATE TABLE IF NOT EXISTS rentals (
+  id                TEXT PRIMARY KEY,
+  machine_name      TEXT NOT NULL DEFAULT '',
+  sku               TEXT NOT NULL DEFAULT '',
+  accelerator_model TEXT NOT NULL,
+  hourly_rate_usd_micros INTEGER NOT NULL,
+  managed_request_id TEXT NOT NULL DEFAULT '',
+  address           TEXT NOT NULL,
+  cert_path         TEXT NOT NULL,
+  state             TEXT NOT NULL,
+  hub               TEXT NOT NULL,
+  rented_at         TEXT NOT NULL,
+  media_address     TEXT NOT NULL DEFAULT '',
+  expected_worker_id         TEXT NOT NULL DEFAULT '',
+  expected_worker_boot_id    TEXT NOT NULL DEFAULT ''
+, wheelhouse_manifest_digest TEXT NOT NULL DEFAULT '')`
+
+func priorSchema(version int) ([]string, error) {
+	db, err := sql.Open("sqlite", ":memory:"+pragmas)
+	if err != nil {
+		return nil, err
+	}
+	defer db.Close()
+	priorRequests := strings.Replace(requestsDDL,
+		"  rental_required INTEGER NOT NULL DEFAULT 0,\n", "", 1)
+	for _, stmt := range schema {
+		switch {
+		case stmt == requestsDDL && version == 6:
+			stmt = priorRequests
+		case stmt == rentalsDDL:
+			stmt = rentalsDDLPrior
+		}
+		if _, err := db.Exec(stmt); err != nil {
+			return nil, err
+		}
+	}
+	return schemaSnapshot(db)
+}
+
+func verifyPriorSchema(db *sql.DB, path string, version int) *exit.Error {
+	want, err := priorSchema(version)
+	if err != nil {
+		return exit.Internalf("cannot derive schema-%d records shape: %s", version, err)
+	}
+	got, err := schemaSnapshot(db)
+	if err != nil {
+		return exit.Internalf("cannot inspect schema-%d records in %s: %s", version, path, err)
+	}
+	if strings.Join(got, "\n") != strings.Join(want, "\n") {
+		return schemaReset(path, "records database claims schema %d but is not its exact released shape", version)
+	}
+	return nil
+}
+
+func commitMigration(tx *sql.Tx, path string) *exit.Error {
+	if err := tx.Commit(); err != nil {
+		return exit.Internalf("cannot commit records schema migration in %s: %s", path, err)
+	}
+	return nil
 }
 
 func databaseVersion(db interface{ QueryRow(string, ...any) *sql.Row }) (int, error) {

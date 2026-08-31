@@ -319,7 +319,7 @@ func (s *Server) resolveJob(ctx context.Context, sub JobSubmission) (orchestrato
 	var e *exit.Error
 	if sub.InstallID != "" {
 		var spec orchestrator.WorkerLaunchSpec
-		spec, e = s.packages.ResolveInstall(sub.InstallID)
+		spec, e = s.packages.ResolveInstall(sub.InstallID, nil)
 		if e == nil && spec.Placement.Package != sub.Package {
 			e = exit.Named(exit.Conflict, "install_package_mismatch",
 				"install %s serves %s, not %s", sub.InstallID, spec.Placement.Package, sub.Package)
@@ -371,7 +371,7 @@ func (s *Server) resolvePrivateJob(ctx context.Context, sub JobSubmission,
 		return out, exit.Named(exit.Validation, "rental.job_local_tree_unsupported",
 			"remote jobs cannot grant directories from the Creator host")
 	}
-	spec, problem := s.packages.ResolveInstall(installID)
+	spec, problem := s.packages.ResolveInstall(installID, nil)
 	if problem != nil || spec.Placement.Package != sub.Package {
 		if problem != nil {
 			return out, problem
@@ -438,7 +438,7 @@ func jobSubmissionDigest(spec orchestrator.Submission) (string, *exit.Error) {
 	for _, model := range modelRefs {
 		models = append(models, map[string]canonical.Value{
 			"package": model.Package, "slot": model.Slot, "model": model.Model,
-			"release": model.Release, "manifest": model.Manifest,
+			"release": model.Release, "lane": model.Lane, "manifest": model.Manifest,
 			"manifest_length": model.ManifestLength,
 		})
 	}
