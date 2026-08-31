@@ -64,6 +64,9 @@ func (l packageLauncher) Resolve(pkg string) (orchestrator.WorkerLaunchSpec, *ex
 func (l packageLauncher) ResolveInstall(string) (orchestrator.WorkerLaunchSpec, *exit.Error) {
 	return orchestrator.WorkerLaunchSpec{}, exit.New(exit.NotFound, "no fake install")
 }
+func (l packageLauncher) PrivateRevision(string, string) (privatepackage.Revision, *exit.Error) {
+	return privatepackage.Revision{}, exit.New(exit.NotFound, "no fake private package")
+}
 func (l packageLauncher) ResolveLogicalInstall(string, string) (orchestrator.LogicalPackage, *exit.Error) {
 	return orchestrator.LogicalPackage{}, exit.New(exit.NotFound, "no fake logical install")
 }
