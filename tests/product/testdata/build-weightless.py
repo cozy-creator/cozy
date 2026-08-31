@@ -76,7 +76,7 @@ def main() -> int:
             "[project]\n"
             'name = "cozy-weightless-package"\n'
             f'version = "{args.version}"\n'
-            'requires-python = ">=3.11"\n'
+            'requires-python = ">=3.14,<3.15"\n'
             f'dependencies = ["cozy-runtime[media]=={runtime_version}"]\n\n'
             "[tool.uv.sources]\n"
             f'cozy-runtime = {{ path = "vendor/{wheels[0].name}" }}\n'

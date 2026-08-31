@@ -80,7 +80,7 @@ func TestPackageHasOneActiveVersion(t *testing.T) {
 	}
 	first := install("a", "1.0.0", 1)
 	second := install("b", "2.0.0", 2)
-	second.SelectionProfile = "torch2.13.0-cpu-cp312-linux-x86"
+	second.SelectionProfile = "torch2.13.0-cpu-cp314-linux-x86"
 	second.PlacementSetDigest = "sha256:" + strings.Repeat("b", 64)
 	if _, problem = store.Activate(first); problem != nil {
 		t.Fatal(problem)
@@ -257,7 +257,7 @@ func TestRentalCommandsSeparateInventoryFromCatalog(t *testing.T) {
 	problem = store.RecordRental(records.Rental{
 		ID: "rnt-proof", MachineName: "studio", SKU: "h200", PackageRef: "proof/example/v1/generate",
 		AcceleratorModel: "NVIDIA H200 SXM", State: "ready", Hub: "https://tensorhub.test",
-		SelectionProfile: "torch2.13.0-cu130-cp312-linux-x86", ObservedDriverVersion: "580.82",
+		SelectionProfile: "torch2.13.0-cu130-cp314-linux-x86", ObservedDriverVersion: "580.126.20",
 	})
 	fatal(t, problem)
 	store.Close()
@@ -655,8 +655,8 @@ func TestUpReportsLocalGPUCompatibility(t *testing.T) {
 	nvidiaSMI := filepath.Join(toolDir, "nvidia-smi")
 	must(t, os.WriteFile(nvidiaSMI, []byte(`#!/bin/sh
 case "$1" in
-  --query-gpu=*) printf '0,"NVIDIA, Test GPU",12288,24576,550.54,8.9\n' ;;
-  *) printf '| NVIDIA-SMI 550.54 Driver Version: 550.54 CUDA Version: 12.6 |\n' ;;
+  --query-gpu=*) printf '0,"NVIDIA, Test GPU",12288,24576,580.126.20,8.9\n' ;;
+  *) printf '| NVIDIA-SMI 580.126.20 Driver Version: 580.126.20 CUDA Version: 13.0 |\n' ;;
 esac
 `), 0o755))
 	env := childEnv(t, root, "PATH="+toolDir)
@@ -685,11 +685,11 @@ esac
 	}
 	gpu := document.GPUDetails[0]
 	if gpu.Model != "NVIDIA, Test GPU" || gpu.VRAMFreeBytes != 12<<30 ||
-		gpu.VRAMTotalBytes != 24<<30 || gpu.DriverVersion != "550.54" ||
-		gpu.DriverCUDAVersion != "12.6" || gpu.ComputeCapability != "8.9" || gpu.SM != "sm_89" {
+		gpu.VRAMTotalBytes != 24<<30 || gpu.DriverVersion != "580.126.20" ||
+		gpu.DriverCUDAVersion != "13.0" || gpu.ComputeCapability != "8.9" || gpu.SM != "sm_89" {
 		t.Fatalf("up GPU compatibility facts drifted: %+v", gpu)
 	}
-	for _, want := range []string{"NVIDIA, Test GPU", "12.0 / 24.0 GiB free", "driver 550.54", "driver CUDA 12.6", "sm_89"} {
+	for _, want := range []string{"NVIDIA, Test GPU", "12.0 / 24.0 GiB free", "driver 580.126.20", "driver CUDA 13.0", "sm_89"} {
 		if !strings.Contains(document.GPUs[0], want) {
 			t.Fatalf("up GPU summary omitted %q: %s", want, document.GPUs[0])
 		}
