@@ -86,6 +86,7 @@ fn _ext(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(docs::manifest_max_bytes, m)?)?;
     m.add_function(wrap_pyfunction!(docs::render, m)?)?;
     m.add_function(wrap_pyfunction!(docs::recanonicalize, m)?)?;
+    m.add_function(wrap_pyfunction!(docs::code_topology, m)?)?;
     m.add_class::<docs::PyClosure>()?;
 
     m.add_function(wrap_pyfunction!(store::plan, m)?)?;

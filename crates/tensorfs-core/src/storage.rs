@@ -149,6 +149,15 @@ pub struct RepoRow {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CheckpointRow {
+    pub evidence_json: Option<Vec<u8>>,
+    pub manifest_length: u64,
+    pub manifest_sha256: String,
+    pub name: String,
+    pub org: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ReleaseRow {
     pub evidence_json: Option<Vec<u8>>,
     pub header_length: Option<u64>,
@@ -208,6 +217,7 @@ pub struct ReleaseConfigRow {
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Projection {
+    pub checkpoints: Vec<CheckpointRow>,
     pub components: Vec<ReleaseComponentRow>,
     pub configs: Vec<ReleaseConfigRow>,
     pub encodings: Vec<ReleaseEncodingRow>,
@@ -226,6 +236,23 @@ impl Projection {
                 ("name", Value::str(row.name.clone())),
                 ("org", Value::str(row.org.clone())),
             ])));
+        }
+        for row in &self.checkpoints {
+            let mut fields = vec![
+                ("kind", Value::str("checkpoint")),
+                ("manifest_length", Value::uint(row.manifest_length)),
+                ("manifest_sha256", Value::str(row.manifest_sha256.clone())),
+                ("name", Value::str(row.name.clone())),
+                ("org", Value::str(row.org.clone())),
+            ];
+            if let Some(evidence) = &row.evidence_json {
+                fields.push((
+                    "evidence",
+                    crate::canon::parse_canonical(evidence, crate::repository::MAX_EVIDENCE_BYTES)
+                        .expect("validated evidence bytes"),
+                ));
+            }
+            lines.push(crate::canon::write(&Value::obj(fields)));
         }
         for row in &self.releases {
             let mut fields = vec![
@@ -316,7 +343,161 @@ pub struct Census {
     inventory: BTreeMap<String, InventoryEntry>,
 }
 
+#[derive(Debug, Clone)]
+pub struct CheckpointFacts {
+    pub header: Option<ObjectRef>,
+    pub topology_digest: Option<String>,
+    pub object_count: u64,
+    pub object_bytes: u64,
+    pub encodings: Vec<(String, Option<String>)>,
+    pub components: Vec<String>,
+    pub configs: Vec<(String, String, u64, String)>,
+}
+
 impl Census {
+    /// Validate one retained checkpoint against its exact staged Manifest, optional
+    /// CozyTensors header, and complete blob inventory. Checkpoint retention has no
+    /// release label or lane, but it carries the same closed object graph.
+    pub fn validate_checkpoint_inputs(
+        manifest_ref: &ObjectRef,
+        manifest_bytes: &[u8],
+        header_bytes: Option<&[u8]>,
+        inventory: &BTreeMap<String, InventoryEntry>,
+    ) -> Result<CheckpointFacts> {
+        if ObjectRef::of(manifest_bytes) != *manifest_ref {
+            return refuse(
+                Code::OBJECT_ID_MISMATCH,
+                "staged manifest bytes disagree with the checkpoint reference",
+            );
+        }
+        let manifest = Manifest::parse(manifest_bytes)?;
+        let header = match (manifest.header(), header_bytes) {
+            (Some(header_ref), Some(bytes)) => {
+                if ObjectRef::of(bytes) != *header_ref {
+                    return refuse(
+                        Code::OBJECT_ID_MISMATCH,
+                        "staged header bytes disagree with the manifest reference",
+                    );
+                }
+                Some(Header::parse(bytes)?)
+            }
+            (None, None) => None,
+            (Some(_), None) => {
+                return refuse(
+                    Code::MISSING_FIELD,
+                    "model checkpoint requires staged header bytes",
+                )
+            }
+            (None, Some(_)) => {
+                return refuse(
+                    Code::ATTACHMENT_CARDINALITY,
+                    "ordinary checkpoint cannot supply CozyTensors header bytes",
+                )
+            }
+        };
+        let mut objects: BTreeMap<String, (&'static str, ObjectRef)> = BTreeMap::new();
+        for (_, entry) in manifest.entries() {
+            insert_ref(
+                &mut objects,
+                if matches!(entry, Entry::CozyTensors(_)) {
+                    "header"
+                } else {
+                    "file"
+                },
+                entry.blob(),
+            )?;
+        }
+        if let Some(header) = &header {
+            for (_, config) in &header.configs {
+                insert_ref(
+                    &mut objects,
+                    "config",
+                    &ObjectRef {
+                        sha256: config.sha256.clone(),
+                        length: config.length,
+                    },
+                )?;
+            }
+            for (_, asset) in &header.assets {
+                for object in &asset.segments {
+                    insert_ref(&mut objects, "model_asset", object)?;
+                }
+            }
+            for (_, _, tensor) in header.tensors() {
+                for (_, part) in &tensor.parts {
+                    if let Body::Segments(segments) = &part.body {
+                        for object in segments {
+                            insert_ref(&mut objects, "part", object)?;
+                        }
+                    }
+                }
+            }
+        }
+        let mut object_bytes = 0u64;
+        for (kind, object) in objects.values() {
+            if inventory.get(&object.sha256).map(|entry| entry.length) != Some(object.length) {
+                return refuse(
+                    Code::OBJECT_ABSENT,
+                    format!(
+                        "{} {} is absent or length-mismatched in the blob inventory",
+                        kind,
+                        object.id()
+                    ),
+                );
+            }
+            object_bytes = object_bytes
+                .checked_add(object.length)
+                .ok_or_else(|| Refusal {
+                    code: Code::ARITH_OVERFLOW,
+                    detail: "checkpoint object bytes overflow".into(),
+                })?;
+        }
+        let mut facts = CheckpointFacts {
+            header: manifest.header().cloned(),
+            topology_digest: header.as_ref().map(Header::topology_digest),
+            object_count: objects.len() as u64,
+            object_bytes,
+            encodings: Vec::new(),
+            components: Vec::new(),
+            configs: Vec::new(),
+        };
+        if let Some(header) = header {
+            for spec in &header.encodings {
+                let encoding_id = spec.object_id();
+                let aliases: Vec<String> = crate::registry::seeds()
+                    .into_iter()
+                    .filter(|seed| seed.spec.object_id() == encoding_id)
+                    .map(|seed| seed.alias.to_string())
+                    .collect();
+                if aliases.is_empty() {
+                    facts.encodings.push((encoding_id, None));
+                } else {
+                    for alias in aliases {
+                        facts.encodings.push((encoding_id.clone(), Some(alias)));
+                    }
+                }
+            }
+            facts.components = header
+                .components
+                .iter()
+                .map(|(component, _)| component.clone())
+                .collect();
+            facts.configs = header
+                .configs
+                .iter()
+                .map(|(config, value)| {
+                    (
+                        config.clone(),
+                        value.sha256.clone(),
+                        value.length,
+                        value.media_type.clone(),
+                    )
+                })
+                .collect();
+        }
+        Ok(facts)
+    }
+
     /// Build the complete SQL projection for one release from the exact bytes staged by a
     /// publisher. This is the pre-CAS admission seam used by local and cloud publication.
     pub fn project_release_inputs(
@@ -388,6 +569,20 @@ impl Census {
             name: repository.repo.name.clone(),
             org: repository.repo.org.clone(),
         });
+        projection
+            .checkpoints
+            .extend(repository.checkpoints.iter().map(|checkpoint| {
+                CheckpointRow {
+                    evidence_json: checkpoint
+                        .evidence
+                        .as_ref()
+                        .map(|evidence| crate::canon::write(&evidence.to_value())),
+                    manifest_length: checkpoint.manifest.length,
+                    manifest_sha256: checkpoint.manifest.sha256.clone(),
+                    name: repository.repo.name.clone(),
+                    org: repository.repo.org.clone(),
+                }
+            }));
         census.project_release_with_header(repository, release, &mut projection, header_bytes)?;
         Ok(projection)
     }
@@ -420,8 +615,8 @@ impl Census {
     pub fn header_requests(&self) -> Result<Vec<InventoryEntry>> {
         let mut requests = BTreeMap::new();
         for (repository, _) in &self.repositories {
-            for release in &repository.releases {
-                let (manifest, _) = self.manifest(&release.manifest)?;
+            for checkpoint in &repository.checkpoints {
+                let (manifest, _) = self.manifest(&checkpoint.manifest)?;
                 if let Some(header) = manifest.header() {
                     insert_ref(&mut requests, "header", header)?;
                 }
@@ -447,6 +642,20 @@ impl Census {
                 name: repository.repo.name.clone(),
                 org: repository.repo.org.clone(),
             });
+            projection
+                .checkpoints
+                .extend(repository.checkpoints.iter().map(|checkpoint| {
+                    CheckpointRow {
+                        evidence_json: checkpoint
+                            .evidence
+                            .as_ref()
+                            .map(|evidence| crate::canon::write(&evidence.to_value())),
+                        manifest_length: checkpoint.manifest.length,
+                        manifest_sha256: checkpoint.manifest.sha256.clone(),
+                        name: repository.repo.name.clone(),
+                        org: repository.repo.org.clone(),
+                    }
+                }));
             for release in &repository.releases {
                 self.project_release(repository, release, &mut projection)?;
             }
@@ -468,6 +677,20 @@ impl Census {
             name: name.to_string(),
             org: org.to_string(),
         });
+        projection
+            .checkpoints
+            .extend(repository.checkpoints.iter().map(|checkpoint| {
+                CheckpointRow {
+                    evidence_json: checkpoint
+                        .evidence
+                        .as_ref()
+                        .map(|evidence| crate::canon::write(&evidence.to_value())),
+                    manifest_length: checkpoint.manifest.length,
+                    manifest_sha256: checkpoint.manifest.sha256.clone(),
+                    name: repository.repo.name.clone(),
+                    org: repository.repo.org.clone(),
+                }
+            }));
         for release in &repository.releases {
             self.project_release(repository, release, &mut projection)?;
         }
@@ -482,8 +705,8 @@ impl Census {
         }
         let mut live_manifests = BTreeSet::new();
         for repository in &self.repositories {
-            for release in &repository.0.releases {
-                live_manifests.insert(release.manifest.sha256.clone());
+            for checkpoint in &repository.0.checkpoints {
+                live_manifests.insert(checkpoint.manifest.sha256.clone());
             }
         }
         for hold in holds {
@@ -616,7 +839,15 @@ impl Census {
         header_bytes: Option<&[u8]>,
     ) -> Result<()> {
         let (manifest, _) = self.manifest(&release.manifest)?;
-        let model = match (manifest.header(), release.evidence.as_ref()) {
+        let checkpoint = repository
+            .checkpoints
+            .iter()
+            .find(|checkpoint| checkpoint.manifest == release.manifest)
+            .ok_or_else(|| Refusal {
+                code: Code::CHECKPOINT_ABSENT,
+                detail: "release checkpoint is absent from repository roots".into(),
+            })?;
+        let model = match (manifest.header(), checkpoint.evidence.as_ref()) {
             (Some(header_ref), Some(evidence)) => {
                 let header = match header_bytes {
                     Some(bytes) => {
@@ -759,7 +990,7 @@ impl Census {
             });
         }
         projection.releases.push(ReleaseRow {
-            evidence_json: release
+            evidence_json: checkpoint
                 .evidence
                 .as_ref()
                 .map(|evidence| crate::canon::write(&evidence.to_value())),
@@ -1096,19 +1327,27 @@ pub fn write_json_lines(path: &Path, lines: &[Vec<u8>]) -> Result<()> {
 pub fn repository_release_lines(root: &Path) -> Result<Vec<Vec<u8>>> {
     let mut lines = Vec::new();
     for (repository, _) in read_repositories(root)? {
-        for release in repository.releases {
+        for release in &repository.releases {
+            let checkpoint = repository
+                .checkpoints
+                .iter()
+                .find(|checkpoint| checkpoint.manifest == release.manifest)
+                .expect("validated repository release checkpoint");
             let mut fields = vec![
-                ("lane", Value::str(release.lane)),
+                ("lane", Value::str(release.lane.clone())),
                 ("manifest_length", Value::uint(release.manifest.length)),
-                ("manifest_sha256", Value::str(release.manifest.sha256)),
+                (
+                    "manifest_sha256",
+                    Value::str(release.manifest.sha256.clone()),
+                ),
                 ("name", Value::str(repository.repo.name.clone())),
                 ("org", Value::str(repository.repo.org.clone())),
-                ("version", Value::str(release.version)),
+                ("version", Value::str(release.version.clone())),
             ];
-            if let Some(evidence) = release.evidence {
+            if let Some(evidence) = &checkpoint.evidence {
                 fields.push(("evidence", evidence.to_value()));
             }
-            if let Some(metadata) = release.metadata {
+            if let Some(metadata) = &release.metadata {
                 fields.push(("metadata", metadata.to_value()));
             }
             lines.push(crate::canon::write(&Value::obj(fields)));
@@ -1124,7 +1363,8 @@ mod tests {
     use crate::header::{Closure, Header, Part, Tensor};
     use crate::manifest::{Draft, Entry};
     use crate::repository::{
-        IngestProvenance, Mutation, Release, ReleaseEvidence, RepositoryName, VerificationEvidence,
+        Checkpoint, CheckpointEvidence, IngestProvenance, Mutation, Release, RepositoryName,
+        VerificationEvidence,
     };
     use crate::store::{Fault, Store};
 
@@ -1178,14 +1418,40 @@ mod tests {
         )
     }
 
-    fn evidence(store: &Store, manifest: &ObjectRef) -> ReleaseEvidence {
+    fn evidence(store: &Store, manifest: &ObjectRef) -> CheckpointEvidence {
         let manifest = store.read_manifest(manifest).unwrap();
         let header = crate::checkpoint::load_header(store, manifest.header().unwrap()).unwrap();
-        ReleaseEvidence {
+        CheckpointEvidence {
             classification_digest: header.topology_digest(),
             ingest: None,
             verification: None,
         }
+    }
+
+    fn apply_release(
+        store: &Store,
+        observed: Option<&[u8]>,
+        release: &Mutation,
+    ) -> Result<Option<Repository>> {
+        let Mutation::PutRelease { repo, manifest, .. } = release else {
+            panic!("apply_release requires PutRelease")
+        };
+        let checkpointed = store
+            .apply_repository(
+                observed,
+                &Mutation::PutCheckpoint {
+                    repo: repo.clone(),
+                    manifest: manifest.clone(),
+                    evidence: Some(Box::new(evidence(store, manifest))),
+                },
+                &Fault::default(),
+            )?
+            .expect("put_checkpoint retains the repository");
+        store.apply_repository(
+            Some(&checkpointed.canonical_bytes()),
+            release,
+            &Fault::default(),
+        )
     }
 
     #[test]
@@ -1199,11 +1465,8 @@ mod tests {
             manifest: manifest.clone(),
             metadata: None,
             version: "1.0.0".into(),
-            evidence: Some(Box::new(evidence(&store, &manifest))),
         };
-        store
-            .apply_repository(None, &put, &Fault::default())
-            .unwrap();
+        apply_release(&store, None, &put).unwrap();
         let bytes = fs::read(store.repository_path(&repo)).unwrap();
         assert_eq!(
             store
@@ -1259,17 +1522,16 @@ mod tests {
             let barrier = barrier.clone();
             threads.push(std::thread::spawn(move || {
                 barrier.wait();
-                store.apply_repository(
+                apply_release(
+                    &store,
                     None,
                     &Mutation::PutRelease {
                         repo,
                         lane: "cpu".into(),
-                        evidence: Some(Box::new(evidence(&store, &manifest))),
                         manifest,
                         metadata: None,
                         version: version.into(),
                     },
-                    &Fault::default(),
                 )
             }));
         }
@@ -1299,18 +1561,24 @@ mod tests {
         let manifest = Manifest::parse(&manifest_bytes).unwrap();
         let header_ref = manifest.header().unwrap();
         let header_bytes = fs::read(store.blob_path(&header_ref.sha256)).unwrap();
+        let checkpoint_evidence = CheckpointEvidence {
+            classification_digest: Header::parse(&header_bytes).unwrap().topology_digest(),
+            ingest: None,
+            verification: None,
+        };
         let release = Release {
-            evidence: Some(ReleaseEvidence {
-                classification_digest: Header::parse(&header_bytes).unwrap().topology_digest(),
-                ingest: None,
-                verification: None,
-            }),
             lane: "cpu".into(),
             manifest: manifest_ref.clone(),
             metadata: None,
             version: "1.0.0".into(),
         };
         let repository = Repository::empty(repo)
+            .put_checkpoint(Checkpoint {
+                manifest: manifest_ref.clone(),
+                evidence: Some(checkpoint_evidence),
+                source_selection: None,
+            })
+            .unwrap()
             .put_release(release.clone())
             .unwrap();
         let repository_bytes = repository.canonical_bytes();
@@ -1338,8 +1606,9 @@ mod tests {
             )
             .unwrap()
             .obj;
-        let evidence_release = Release {
-            evidence: Some(ReleaseEvidence {
+        let evidence_checkpoint = Checkpoint {
+            manifest: release.manifest.clone(),
+            evidence: Some(CheckpointEvidence {
                 classification_digest: Header::parse(&header_bytes).unwrap().topology_digest(),
                 ingest: Some(IngestProvenance {
                     source_dialect: "cozytensors".into(),
@@ -1354,16 +1623,18 @@ mod tests {
                     recipe,
                 }),
             }),
-            ..release.clone()
+            source_selection: None,
         };
         let evidence_repository = Repository::empty(repository.repo.clone())
-            .put_release(evidence_release.clone())
+            .put_checkpoint(evidence_checkpoint)
+            .unwrap()
+            .put_release(release.clone())
             .unwrap();
         assert_eq!(
             Census::project_release_inputs(
                 &evidence_repository,
                 &evidence_repository.canonical_bytes(),
-                &evidence_release,
+                &release,
                 &manifest_bytes,
                 Some(&header_bytes),
                 inventory_from_tree(&root).unwrap(),
@@ -1409,20 +1680,18 @@ mod tests {
         let root = temporary("remove-ordering");
         let _ = fs::remove_dir_all(&root);
         let (store, repo, manifest) = fixture(&root);
-        store
-            .apply_repository(
-                None,
-                &Mutation::PutRelease {
-                    repo: repo.clone(),
-                    lane: "cpu".into(),
-                    manifest: manifest.clone(),
-                    metadata: None,
-                    version: "1.0.0".into(),
-                    evidence: Some(Box::new(evidence(&store, &manifest))),
-                },
-                &Fault::default(),
-            )
-            .unwrap();
+        apply_release(
+            &store,
+            None,
+            &Mutation::PutRelease {
+                repo: repo.clone(),
+                lane: "cpu".into(),
+                manifest: manifest.clone(),
+                metadata: None,
+                version: "1.0.0".into(),
+            },
+        )
+        .unwrap();
         let before_remove = fs::read(store.repository_path(&repo)).unwrap();
         store
             .apply_repository(
@@ -1439,7 +1708,6 @@ mod tests {
         let append = Mutation::PutRelease {
             repo: repo.clone(),
             lane: "cpu".into(),
-            evidence: Some(Box::new(evidence(&store, &manifest))),
             manifest,
             metadata: None,
             version: "2.0.0".into(),
@@ -1530,24 +1798,18 @@ mod tests {
         });
         assert!(gc.join().unwrap().is_empty());
 
-        store
-            .apply_repository(
-                None,
-                &Mutation::PutRelease {
-                    repo,
-                    lane: "cpu".into(),
-                    evidence: Some(Box::new(ReleaseEvidence {
-                        classification_digest: header.topology_digest(),
-                        ingest: None,
-                        verification: None,
-                    })),
-                    manifest: manifest_ref,
-                    metadata: None,
-                    version: "1.0.0".into(),
-                },
-                &Fault::default(),
-            )
-            .unwrap();
+        apply_release(
+            &store,
+            None,
+            &Mutation::PutRelease {
+                repo,
+                lane: "cpu".into(),
+                manifest: manifest_ref,
+                metadata: None,
+                version: "1.0.0".into(),
+            },
+        )
+        .unwrap();
         catalog.complete_operation("acquire-1").unwrap();
         drop(guard);
         assert!(catalog.held_keys().unwrap().is_empty());

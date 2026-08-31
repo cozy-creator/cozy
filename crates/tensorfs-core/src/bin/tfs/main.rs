@@ -34,7 +34,7 @@
 //!   tfs manifest inspect <manifest.json> --refs <jsonl>
 //!   tfs repo inspect <repo.json> --rows <jsonl>
 //!   tfs repo apply <current.json|-> <mutation.json> --out <replacement> --rows <jsonl>
-//!                  put_release also requires --manifest, --header and --inventory
+//!                  put_checkpoint and put_release require --manifest, --header and --inventory
 //!   tfs repo commit <store> <current.json|-> <mutation.json>
 //!   tfs local resolve <store> <name>
 //!   tfs local replace <store> <name> <source-sha256> <manifest> <length>

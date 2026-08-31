@@ -409,8 +409,8 @@ fn source_component<'p>(
 fn receipt<'p>(py: Python<'p>, receipt: &derived::ReceiptFacts) -> PyResult<Bound<'p, PyAny>> {
     let value = marshal(py, &receipt.to_value())?;
     value.cast::<PyDict>()?.set_item(
-        "release_evidence_canonical_bytes",
-        PyBytes::new(py, &receipt.release_evidence_canonical_bytes),
+        "checkpoint_evidence_canonical_bytes",
+        PyBytes::new(py, &receipt.checkpoint_evidence_canonical_bytes),
     )?;
     Ok(value)
 }
@@ -552,10 +552,19 @@ impl PyStore {
             )
         })?;
         let repository = Repository::parse(&bytes).or_refuse(py)?;
-        let release = repository.local_release().or_refuse(py)?;
+        let release = repository.local_checkpoint().or_refuse(py)?;
         let out = PyDict::new(py);
         out.set_item("name", name)?;
-        out.set_item("source_selection", format!("sha256:{}", release.version))?;
+        out.set_item(
+            "source_selection",
+            format!(
+                "sha256:{}",
+                release
+                    .source_selection
+                    .as_ref()
+                    .expect("validated local checkpoint")
+            ),
+        )?;
         out.set_item("manifest_digest", release.manifest.id())?;
         out.set_item("manifest_length", release.manifest.length)?;
         Ok(out)
@@ -581,7 +590,7 @@ impl PyStore {
             version: selection.trim_start_matches("sha256:").to_string(),
             manifest: obj_ref(py, manifest_id, manifest_length)?,
             evidence: Box::new(
-                tensorfs_core::repository::ReleaseEvidence::parse(evidence).or_refuse(py)?,
+                tensorfs_core::repository::CheckpointEvidence::parse(evidence).or_refuse(py)?,
             ),
         };
         let repository = py
@@ -680,8 +689,8 @@ impl PyStore {
             row.set_item("manifest_digest", source.manifest_digest)?;
             row.set_item("manifest_length", source.manifest_length)?;
             row.set_item(
-                "release_evidence_canonical_bytes",
-                PyBytes::new(py, &source.release_evidence_canonical_bytes),
+                "checkpoint_evidence_canonical_bytes",
+                PyBytes::new(py, &source.checkpoint_evidence_canonical_bytes),
             )?;
             rows.append(row)?;
         }
@@ -1219,20 +1228,32 @@ impl PyOperation {
         manifest_length: u64,
         evidence: &[u8],
     ) -> PyResult<Bound<'p, PyBytes>> {
+        let manifest = obj_ref(py, manifest_id, manifest_length)?;
+        let checkpoint = Mutation::PutCheckpoint {
+            repo: self.repo.clone(),
+            manifest: manifest.clone(),
+            evidence: Some(Box::new(
+                tensorfs_core::repository::CheckpointEvidence::parse(evidence).or_refuse(py)?,
+            )),
+        };
         let mutation = Mutation::PutRelease {
             repo: self.repo.clone(),
             version: version.to_string(),
             lane: lane.to_string(),
-            manifest: obj_ref(py, manifest_id, manifest_length)?,
+            manifest,
             metadata: None,
-            evidence: Some(Box::new(
-                tensorfs_core::repository::ReleaseEvidence::parse(evidence).or_refuse(py)?,
-            )),
         };
         let repository = py
             .detach(|| {
-                self.store
-                    .apply_repository(current, &mutation, &Fault::default())
+                let checkpointed = self
+                    .store
+                    .apply_repository(current, &checkpoint, &Fault::default())?
+                    .expect("put_checkpoint retains the repository");
+                self.store.apply_repository(
+                    Some(&checkpointed.canonical_bytes()),
+                    &mutation,
+                    &Fault::default(),
+                )
             })
             .or_refuse(py)?
             .expect("put_release retains the repository");

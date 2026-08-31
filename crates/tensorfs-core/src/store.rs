@@ -408,7 +408,8 @@ impl Store {
             );
         }
         let classification = match mutation {
-            crate::repository::Mutation::PutRelease { manifest, .. }
+            crate::repository::Mutation::PutCheckpoint { manifest, .. }
+            | crate::repository::Mutation::PutRelease { manifest, .. }
             | crate::repository::Mutation::ReplaceLocal { manifest, .. } => {
                 let parsed = self.read_manifest(manifest)?;
                 for (_, entry) in parsed.entries() {
@@ -423,7 +424,8 @@ impl Store {
                 }
                 let metadata = match mutation {
                     crate::repository::Mutation::PutRelease { metadata, .. } => metadata.as_ref(),
-                    crate::repository::Mutation::ReplaceLocal { .. } => None,
+                    crate::repository::Mutation::PutCheckpoint { .. }
+                    | crate::repository::Mutation::ReplaceLocal { .. } => None,
                     _ => unreachable!("classification mutation was matched above"),
                 };
                 if let Some(metadata) = metadata {
@@ -444,13 +446,14 @@ impl Store {
                     None => None,
                 }
             }
-            crate::repository::Mutation::RemoveRelease { .. }
+            crate::repository::Mutation::RemoveCheckpoint { .. }
+            | crate::repository::Mutation::RemoveRelease { .. }
             | crate::repository::Mutation::DeleteRepository { .. } => None,
         };
         let replacement = crate::repository::apply(observed, mutation, classification.as_deref())?;
         if let Some(repository) = &replacement {
-            for release in &repository.releases {
-                self.read_manifest(&release.manifest)?;
+            for checkpoint in &repository.checkpoints {
+                self.read_manifest(&checkpoint.manifest)?;
             }
         }
         let org = mutation.repo().org.clone();

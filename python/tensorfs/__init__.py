@@ -31,6 +31,9 @@ reason it exists (tfs-005 measured the drain at ~10%).
 from __future__ import annotations
 
 import sys as _sys
+from collections.abc import Sequence
+from dataclasses import dataclass
+from typing import Literal
 
 if _sys.implementation.name != "cpython" or _sys.version_info[:2] != (3, 12):
     raise ImportError("tensorfs requires normal GIL-enabled CPython 3.12")
@@ -39,6 +42,7 @@ del _sys
 
 from . import errors
 from ._ext import (
+    _code_topology,
     Batch,
     Closure,
     DerivedWriter,
@@ -69,6 +73,30 @@ from ._ext import (
     transfer_manifest,
 )
 
+
+@dataclass(frozen=True)
+class CodeTensor:
+    component: str
+    key: str
+    dtype: str
+    shape: Sequence[int]
+    accepts: Literal["any"] | Sequence[str]
+
+
+def code_topology(contract_digest: str, tensors: Sequence[CodeTensor]) -> bytes:
+    """Author canonical CodeTopology bytes from exact projected logical tensors."""
+    rows = [
+        (
+            tensor.component,
+            tensor.key,
+            tensor.dtype,
+            list(tensor.shape),
+            None if tensor.accepts == "any" else list(tensor.accepts),
+        )
+        for tensor in tensors
+    ]
+    return _code_topology(contract_digest, rows)
+
 #: The closed carrier/logical dtype enum and its element sizes. The ONE export of dtype
 #: knowledge: a consumer sizing a `torch.frombuffer` reads it from here, never from a
 #: table of its own.
@@ -78,12 +106,14 @@ __all__ = [
     "DTYPES",
     "Batch",
     "Closure",
+    "CodeTensor",
     "DerivedWriter",
     "Operation",
     "ReadLease",
     "ReadPlan",
     "Store",
     "__version__",
+    "code_topology",
     "dtypes",
     "doc_kinds",
     "errors",

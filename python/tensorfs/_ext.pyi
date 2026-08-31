@@ -33,6 +33,10 @@ def dtypes() -> dict[str, int]: ...
 def manifest_max_bytes() -> int: ...
 def render(data: bytes, max_bytes: int) -> str: ...
 def recanonicalize(doc: str, data: bytes) -> bytes: ...
+def _code_topology(
+    contract_digest: str,
+    tensors: Sequence[tuple[str, str, str, Sequence[int], Sequence[str] | None]],
+) -> bytes: ...
 def plan(
     header: bytes,
     traversal: Sequence[tuple[str, str]],
@@ -144,7 +148,7 @@ class PreparedModelSource(TypedDict):
     profile: str
     manifest_digest: str
     manifest_length: int
-    release_evidence_canonical_bytes: bytes
+    checkpoint_evidence_canonical_bytes: bytes
 
 class PreparedModelSources(TypedDict):
     replayed: bool
@@ -158,7 +162,7 @@ class DerivedReceipt(TypedDict):
     manifest: dict[str, Any]
     added_objects: list[dict[str, Any]]
     inherit_observation: dict[str, int]
-    release_evidence_canonical_bytes: bytes
+    checkpoint_evidence_canonical_bytes: bytes
 
 class DerivedWriter:
     def sources(self) -> list[dict[str, Any]]: ...

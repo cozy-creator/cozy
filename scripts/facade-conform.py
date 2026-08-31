@@ -42,7 +42,7 @@ def _model_source_type_surface(
         profile: str = source["profile"]
         manifest: str = source["manifest_digest"]
         length: int = source["manifest_length"]
-        evidence: bytes = source["release_evidence_canonical_bytes"]
+        evidence: bytes = source["checkpoint_evidence_canonical_bytes"]
         _ = (slot, profile, manifest, length, evidence, replayed)
     store.release_model_source("modelpub-example")
 
