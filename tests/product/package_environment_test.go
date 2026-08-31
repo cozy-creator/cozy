@@ -8,10 +8,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/cozy-creator/cozy/internal/canonical"
 	"github.com/cozy-creator/cozy/internal/install"
-	"github.com/cozy-creator/cozy/internal/launch"
-	"github.com/cozy-creator/cozy/internal/records"
 	"github.com/cozy-creator/cozy/internal/wheel"
 )
 
@@ -82,28 +79,6 @@ func TestPublishedPackageEnvironmentsKeepPythonAndTorchIndependent(t *testing.T)
 	if problem == nil || problem.Name != "package_requirement_incompatible" ||
 		!strings.Contains(problem.Message, "torch==1.0.0") {
 		t.Fatalf("true locked conflict did not name its exact requirement: %#v", problem)
-	}
-}
-
-func TestPublishedPackageIgnoresUnrelatedControlRuntimePatch(t *testing.T) {
-	root := t.TempDir()
-	generation := records.PackageInstall{
-		Dir: root, Package: "proof/package", SourceKind: "tensorhub",
-		ProjectDir: filepath.Join(root, "source"), Runtime: filepath.Join(root, "venv", "bin", "runtime-proof"),
-	}
-	descriptor := []byte(`{"application":"package:app","entrypoints":[],"format":"cozy.package.descriptor/1","jobs":[],"model_productions":[]}`)
-	digest, err := canonical.Spell(canonical.Digest(descriptor))
-	must(t, err)
-	generation.PackageDescriptor = digest
-	must(t, os.MkdirAll(filepath.Dir(launch.DescriptorPath(root)), 0o700))
-	must(t, os.WriteFile(launch.DescriptorPath(root), descriptor, 0o600))
-	must(t, os.WriteFile(filepath.Join(root, "local-base.json"), []byte(`{"runtime":"0.0.19"}`), 0o600))
-	if _, problem := launch.Read(generation, root, nil); problem != nil {
-		t.Fatalf("initial package read: %v", problem)
-	}
-	must(t, os.WriteFile(filepath.Join(root, "local-base.json"), []byte(`{"runtime":"0.0.20"}`), 0o600))
-	if _, problem := launch.Read(generation, root, nil); problem != nil {
-		t.Fatalf("compatible control Runtime patch invalidated package environment: %v", problem)
 	}
 }
 

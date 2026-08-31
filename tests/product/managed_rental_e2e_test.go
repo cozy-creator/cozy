@@ -252,8 +252,6 @@ func TestRentalRunAcquiresCheapestOnceAndReleasesFailedPreAttempt(t *testing.T) 
 		t.Fatalf("fixture install [exit %d]\n%s", code, out)
 	}
 	local := activePackageInstall(t, root)
-	fatal(t, launch.RefreshGenerationBase(local, root,
-		filepath.Join(root, "active-base.json"), childEnv(t, root)))
 	descriptor, _ = os.ReadFile(launch.DescriptorPath(local.Dir))
 	decoded, problem := launch.DecodeDescriptor(descriptor)
 	fatal(t, problem)

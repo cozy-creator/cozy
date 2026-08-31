@@ -119,6 +119,5 @@ func (f *Facts) Spec(devices []string) (orchestrator.WorkerLaunchSpec, *exit.Err
 		ArtifactCache:     cache,
 		EnvironmentPython: home.VenvPython(filepath.Join(f.Install.Dir, "venv")),
 		ArtifactStore:     filepath.Join(filepath.Dir(filepath.Dir(f.Install.Dir)), "cas"),
-		BaseManifest:      filepath.Join(f.Install.Dir, "base-manifest.json"),
 	}, nil
 }

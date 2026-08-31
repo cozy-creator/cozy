@@ -830,13 +830,32 @@ def check_python_seat():
             )
     for required in (
         '"prepare-package"',
-        '"--base-manifest"',
         '"--environment-python"',
         "MaterializePublishedEnvironment",
     ):
         if required not in text:
             bad.append(f"{path}: [python] missing full uv environment handoff {required!r}")
     install = pathlib.Path("internal/install/install.go").read_text()
+    retired_inventory = text + "\n" + "\n".join(
+        pathlib.Path(name).read_text()
+        for name in (
+            "internal/home/home.go",
+            "internal/launch/artifacts.go",
+            "internal/orchestrator/worker.go",
+        )
+    )
+    for deleted in (
+        '"local-base"',
+        '"--base-manifest"',
+        "RefreshGenerationBase",
+        "LocalBase string",
+        "BaseManifest string",
+    ):
+        if deleted in retired_inventory:
+            bad.append(
+                "internal local execution: [python] retired installed-environment "
+                f"inventory remains: {deleted}"
+            )
     for deleted in ('"--environment-root"', 'Python: "CPython 3.12"', "LinkMode", "pythonForABI"):
         if deleted in text + install:
             bad.append(f"internal/install: [python] retired shared-base install path remains: {deleted}")
