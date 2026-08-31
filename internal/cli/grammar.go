@@ -9,11 +9,11 @@ type CLI struct {
 	Full   bool     `help:"Include complete values and all available fields."`
 	Fields []string `help:"Select result fields." sep:","`
 
-	Package PackageCmd `cmd:"" group:"Resources" help:"Install the source-code that generates media."`
-	Model   ModelCmd   `cmd:"" group:"Resources" help:"Download the tensors that are the AI's mind."`
-	Auth    AuthCmd    `cmd:"" group:"Resources" help:"Authenticate this machine to Tensorhub."`
-	Run     RunCmd     `cmd:"" group:"Work" help:"Run a package function on a local or rented machine."`
-	Rental  RentalCmd  `cmd:"" group:"Work" help:"Rent a more powerful GPU in the cloud."`
+	Package PackageCmd `cmd:"" group:"Packages" help:"Install the source-code that generates media."`
+	Model   ModelCmd   `cmd:"" group:"Models" help:"Download the tensors that are the AI's mind."`
+	Auth    AuthCmd    `cmd:"" group:"Authentication" help:"Authenticate this machine to Tensorhub."`
+	Run     RunCmd     `cmd:"" group:"Runs" help:"Run a package function on a local or rented machine."`
+	Rental  RentalCmd  `cmd:"" group:"Rentals" help:"Rent a more powerful GPU in the cloud."`
 	Up      UpCmd      `cmd:"" group:"Lifecycle" help:"Start the cozy-daemon and localhost web-ui."`
 	Down    DownCmd    `cmd:"" group:"Lifecycle" help:"Stop cozy-daemon and localhost web-ui."`
 	Unload  UnloadCmd  `cmd:"" group:"Lifecycle" help:"Empty cached GPU AI models to free up VRAM."`

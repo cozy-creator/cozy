@@ -529,6 +529,21 @@ func TestDaemonWebLifecycle(t *testing.T) {
 	t.Cleanup(func() { _, _ = runCozy(t, root, "down", "--all") })
 
 	code, help := runCozy(t, root)
+	helpCode, explicitHelp := runCozy(t, root, "help")
+	if helpCode != 0 || explicitHelp != help {
+		t.Fatalf("cozy and cozy help rendered different root help [exit %d]\n%s", helpCode, explicitHelp)
+	}
+	for _, section := range []string{"Packages", "Models", "Authentication", "Runs", "Rentals", "Lifecycle"} {
+		if code != 0 || strings.Count(help, "\n"+section+"\n") != 1 {
+			t.Fatalf("bare cozy did not render one %q section [exit %d]\n%s", section, code, help)
+		}
+	}
+	if strings.Contains(help, "\nResources\n") || strings.Contains(help, "\nWork\n") {
+		t.Fatalf("bare cozy retained a combined command section\n%s", help)
+	}
+	if strings.Count(help, "run <org/package/function> [input]") != 1 || strings.Contains(help, "Primary command") {
+		t.Fatalf("bare cozy did not state the primary run command in Runs\n%s", help)
+	}
 	for _, want := range []string{
 		"Usage: cozy", "package install", "model download", "auth login", "run cancel",
 		"rental new", "up", "down", "unload",
