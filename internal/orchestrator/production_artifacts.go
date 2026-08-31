@@ -196,18 +196,24 @@ func (c *Orchestrator) onProductionArtifactReceipt(s *session, frame *pb.Artifac
 	}
 	objects := make([]records.ModelProductionObject, 0, len(frame.Objects))
 	previous := ""
+	manifestPresent := false
 	for _, object := range frame.Objects {
 		if object == nil || object.ObjectId <= previous || object.Length == 0 ||
-			object.Length > uint64(^uint64(0)>>1) {
+			object.Length > uint64(^uint64(0)>>1) || object.SourceRef == "" {
+			return
+		}
+		if _, digestErr := canonical.Raw(object.ObjectId); digestErr != nil {
 			return
 		}
 		previous = object.ObjectId
+		manifestPresent = manifestPresent || object.ObjectId == manifestDigest &&
+			object.Length == frame.Manifest.Length
 		objects = append(objects, records.ModelProductionObject{
 			OperationID: node.OperationID, NodeName: node.NodeName, OutputSlot: frame.OutputSlot,
 			ObjectID: object.ObjectId, Length: int64(object.Length), SourceRef: object.SourceRef,
 		})
 	}
-	if len(objects) == 0 {
+	if len(objects) == 0 || !manifestPresent {
 		return
 	}
 	problem = c.opt.Store.RecordModelProductionArtifact(records.ModelProductionArtifact{

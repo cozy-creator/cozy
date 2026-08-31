@@ -290,6 +290,35 @@ func (s *Store) RecordModelProductionArtifact(artifact ModelProductionArtifact,
 			return exit.Named(exit.Conflict, "model_production.artifact_conflict",
 				"artifact receipt replay changed exact output %s.%s", artifact.NodeName, artifact.OutputSlot)
 		}
+		rows, queryErr := tx.Query(`SELECT object_id,length,source_ref FROM model_production_objects
+			WHERE operation_id=? AND node_name=? AND output_slot=? ORDER BY object_id`,
+			artifact.OperationID, artifact.NodeName, artifact.OutputSlot)
+		if queryErr != nil {
+			return exit.Internalf("cannot read replayed model production objects: %s", queryErr)
+		}
+		var replayed []ModelProductionObject
+		for rows.Next() {
+			var row ModelProductionObject
+			if scanErr := rows.Scan(&row.ObjectID, &row.Length, &row.SourceRef); scanErr != nil {
+				rows.Close()
+				return exit.Internalf("cannot scan replayed model production object: %s", scanErr)
+			}
+			replayed = append(replayed, row)
+		}
+		rows.Close()
+		if len(replayed) != len(objects) {
+			return exit.Named(exit.Conflict, "model_production.artifact_conflict",
+				"artifact receipt replay changed the object inventory of %s.%s",
+				artifact.NodeName, artifact.OutputSlot)
+		}
+		for i := range replayed {
+			if replayed[i].ObjectID != objects[i].ObjectID || replayed[i].Length != objects[i].Length ||
+				replayed[i].SourceRef != objects[i].SourceRef {
+				return exit.Named(exit.Conflict, "model_production.artifact_conflict",
+					"artifact receipt replay changed object %d of %s.%s", i,
+					artifact.NodeName, artifact.OutputSlot)
+			}
+		}
 		if err := tx.Commit(); err != nil {
 			return exit.Internalf("cannot commit exact model production replay: %s", err)
 		}

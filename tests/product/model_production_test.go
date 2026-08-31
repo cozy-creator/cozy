@@ -113,6 +113,13 @@ func TestModelProductionJoinsNodeArtifactAndTransferBeforeReplay(t *testing.T) {
 		OutputSlot: "model", ObjectID: "sha256:" + strings.Repeat("f", 64),
 		Length: 256, SourceRef: "opaque-source"}
 	fatal(t, store.RecordModelProductionArtifact(artifact, []records.ModelProductionObject{object}))
+	changedObject := object
+	changedObject.SourceRef = "other-source"
+	if problem := store.RecordModelProductionArtifact(artifact,
+		[]records.ModelProductionObject{changedObject}); problem == nil ||
+		problem.Name != "model_production.artifact_conflict" {
+		t.Fatalf("changed object inventory replay = %v", problem)
+	}
 	fatal(t, store.RecordModelProductionObjectStatus(records.ModelProductionObject{
 		OperationID: plan.ID(), NodeName: "derive", OutputSlot: "model",
 		ObjectID: object.ObjectID, Length: object.Length, TransferOperationID: "pub-1",

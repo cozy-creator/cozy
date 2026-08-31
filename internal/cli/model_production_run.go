@@ -493,7 +493,7 @@ func publishProductionArtifact(ctx *Context, local *localclient.Client,
 	if problem != nil {
 		return productionManifest{}, problem
 	}
-	if prepared.Manifest.SHA256 != artifact.ManifestID ||
+	if prepared.Manifest.SHA256 != strings.TrimPrefix(artifact.ManifestID, "sha256:") ||
 		prepared.Manifest.Length != artifact.ManifestLength {
 		return productionManifest{}, exit.Named(exit.Conflict, "model_production.finalize_changed",
 			"Tensorhub finalized a different Manifest for %s.%s", artifact.NodeName,
