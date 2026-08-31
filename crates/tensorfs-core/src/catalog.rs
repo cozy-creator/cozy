@@ -836,7 +836,7 @@ mod tests {
         let root = temporary("hold-fence");
         let store = crate::store::Store::init(&root).unwrap();
         let meta = crate::meta::Meta::open(&store).unwrap();
-        let hold = meta.acquire_hold("derived-writer", "", Vec::new()).unwrap();
+        let hold = meta.acquire_hold("derived-writer").unwrap();
         assert_eq!(
             WriterGuard::lock_rebuild(&root).unwrap_err().code,
             Code::STORE_BUSY

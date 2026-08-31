@@ -108,21 +108,8 @@ impl Meta {
         read_derived(&self.connection()?)
     }
 
-    pub fn acquire_hold(&self, kind: &str, manifest: &str, objects: Vec<String>) -> Result<Hold> {
+    pub fn acquire_hold(&self, kind: &str) -> Result<Hold> {
         ascii_name("lease kind", kind, limits::MAX_NAME_BYTES)?;
-        if !manifest.is_empty() {
-            hex64("lease manifest", manifest)?;
-        }
-        if objects.len() > limits::MAX_ENTRIES {
-            return refuse(Code::COUNT_CAP, "read lease object count exceeds cap");
-        }
-        let mut objects = objects;
-        for digest in &objects {
-            hex64("lease object", digest)?;
-        }
-        objects.sort();
-        objects.dedup();
-
         let id = format!("{kind}-{}-{}", std::process::id(), now_nanos_unique());
         let path = self.lease_path(&id);
         let file = File::options()

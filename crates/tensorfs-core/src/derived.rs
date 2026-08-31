@@ -1965,7 +1965,7 @@ pub fn begin(
 
     // The writer hold is registered before source metadata is touched. It is the live
     // process proof that keeps exclusive GC out even for a source-free create.
-    let writer_hold = meta.acquire_hold("derived-writer", "", Vec::new())?;
+    let writer_hold = meta.acquire_hold("derived-writer")?;
     let sources = match resolve_sources(store, meta, &declaration) {
         Ok(sources) => sources,
         Err(error) => {
