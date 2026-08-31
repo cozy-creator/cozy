@@ -26,6 +26,7 @@ import (
 // declared family against the actual selected base before any remote installation.
 var remoteBaseRoots = map[string]bool{
 	"cozy-runtime": true, //cozy:allow base distribution identity, not executable access
+	"msgspec":      true,
 	"tensorfs":     true,
 	"torch":        true,
 	"torchaudio":   true,

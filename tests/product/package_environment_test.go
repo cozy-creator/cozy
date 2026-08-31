@@ -89,7 +89,7 @@ func TestPublishedPackageIgnoresUnrelatedControlRuntimePatch(t *testing.T) {
 	root := t.TempDir()
 	generation := records.PackageInstall{
 		Dir: root, Package: "proof/package", SourceKind: "tensorhub",
-		ProjectDir: filepath.Join(root, "source"), Runtime: filepath.Join(root, "venv", "bin", "cozy-runtime"),
+		ProjectDir: filepath.Join(root, "source"), Runtime: filepath.Join(root, "venv", "bin", "runtime-proof"),
 	}
 	descriptor := []byte(`{"application":"package:app","entrypoints":[],"format":"cozy.package.descriptor/1","jobs":[],"model_productions":[]}`)
 	digest, err := canonical.Spell(canonical.Digest(descriptor))
