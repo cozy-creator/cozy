@@ -114,6 +114,9 @@ REVEAL_SITES = {
     # header for the POD's media server. Same rule as hub/hub.go one plane over — one
     # request builder, and the raw value is read exactly where it becomes a carrier.
     "internal/media/media.go",
+    # cl-005: the local model-source client puts the selected provider token
+    # directly into that provider's Authorization header.
+    "internal/modelsource/provider.go",
 }
 
 # The contract document's own tables use `| \`METHOD /path\` | scope |`, which the CAS

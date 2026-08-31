@@ -350,6 +350,108 @@ type LocalAlias struct {
 	SourceSelection  string `json:"source_selection"`
 }
 
+type SourceCarrier struct {
+	Member string
+	Path   string
+}
+
+type SourcePlan struct {
+	Session string `json:"session"`
+	Sources []struct {
+		Component    string `json:"component"`
+		Path         string `json:"path"`
+		SourceMember string `json:"source_member,omitempty"`
+	} `json:"sources"`
+	Target string `json:"target"`
+}
+
+// PlanSource asks TensorFS to assign exact physical carriers through its
+// reviewed whole-source profiles. Creator never parses tensor headers or maps
+// filenames to components.
+func (t *Tool) PlanSource(carriers []SourceCarrier, outPath string) (SourcePlan, *exit.Error) {
+	args := []string{"ingest", "source-plan", "--out", outPath}
+	for _, carrier := range carriers {
+		value := carrier.Path
+		if carrier.Member != "" {
+			value = carrier.Member + "=" + carrier.Path
+		}
+		args = append(args, "--carrier", value)
+	}
+	if _, problem := t.run(args...); problem != nil {
+		return SourcePlan{}, problem
+	}
+	raw, err := os.ReadFile(outPath)
+	if err != nil {
+		return SourcePlan{}, exit.Internalf("the source plan tfs wrote is unreadable: %s", err)
+	}
+	var plan SourcePlan
+	if json.Unmarshal(raw, &plan) != nil || len(plan.Session) != 16 || plan.Target == "" || len(plan.Sources) == 0 {
+		return SourcePlan{}, exit.Internalf("tfs returned an invalid source plan")
+	}
+	for _, source := range plan.Sources {
+		if source.Component == "" || source.Path == "" {
+			return SourcePlan{}, exit.Internalf("tfs returned an incomplete source mapping")
+		}
+	}
+	return plan, nil
+}
+
+func (t *Tool) PreviewSource(planPath string) *exit.Error {
+	_, problem := t.run("ingest", "plan", "--source-plan", planPath)
+	return problem
+}
+
+var candidateManifest = regexp.MustCompile(`(?m)^candidate\s+manifest\s+(sha256:[0-9a-f]{64})\s*$`)
+
+func (t *Tool) RunSource(planPath string) (string, *exit.Error) {
+	out, problem := t.run("ingest", "run", t.Root, "--source-plan", planPath)
+	if problem != nil {
+		return "", problem
+	}
+	matches := candidateManifest.FindAllStringSubmatch(out, -1)
+	if len(matches) != 1 {
+		return "", exit.Internalf("tfs ingest run printed no unique candidate Manifest")
+	}
+	return matches[0][1], nil
+}
+
+// ObserveLocal returns the current compare-and-swap identity, or "absent".
+func (t *Tool) ObserveLocal(name, outPath string) (string, *exit.Error) {
+	rows, problem := t.Releases(outPath)
+	if problem != nil {
+		return "", problem
+	}
+	count := 0
+	for _, row := range rows {
+		if row.Org == "local" && row.Name == name {
+			count++
+		}
+	}
+	if count == 0 {
+		return "absent", nil
+	}
+	if count != 1 {
+		return "", exit.Named(exit.Conflict, "model.local_alias_ambiguous",
+			"local/%s has %d releases instead of exactly one", name, count)
+	}
+	alias, problem := t.ResolveLocal(name)
+	if problem != nil {
+		return "", problem
+	}
+	return alias.RepositoryDigest, nil
+}
+
+func (t *Tool) InstallLocal(session, name, sourceSelection, observed, sourceURI, license string) *exit.Error {
+	args := []string{"ingest", "install", t.Root, session, "local", name,
+		strings.TrimPrefix(sourceSelection, "sha256:"), "local", "--observed", observed,
+		"--source-uri", sourceURI}
+	if license != "" {
+		args = append(args, "--declared-license", license)
+	}
+	_, problem := t.run(args...)
+	return problem
+}
+
 func parseLocalAlias(raw string) (LocalAlias, *exit.Error) {
 	var alias LocalAlias
 	if json.Unmarshal([]byte(strings.TrimSpace(raw)), &alias) != nil || alias.Name == "" ||

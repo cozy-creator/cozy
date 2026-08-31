@@ -241,7 +241,6 @@ tensorhub_token: replace-with-your-token
 huggingface_token: hf_replace-with-your-token
 civitai_token: replace-with-your-token
 tfs: /usr/local/bin/tfs
-tensorfs_registry: /usr/local/share/tensorfs/fingerprint-registry.json
 port: 8818
 local_rate_micro_usd_per_hour: 250000
 rentals:
@@ -263,7 +262,6 @@ Supported environment variables are limited to:
 
 - `COZY_HOME`
 - `COZY_TFS`
-- `COZY_TFS_REGISTRY`
 - `HF_TOKEN`
 - `CIVITAI_TOKEN`
 - `TENSORHUB_URL`
