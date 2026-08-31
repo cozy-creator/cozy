@@ -190,6 +190,9 @@ type Orchestrator struct {
 	// Source/artifact statuses are committed before signaling; restart/reconnect rereads rows.
 	productionWake    map[string]chan struct{}
 	productionRunning map[string]bool
+	// privateTransfers is command-scoped, lossy progress over Creator's durable request
+	// row and sealed revision. A restart simply replays exact chunks from those authorities.
+	privateTransfers map[string]*privateTransfer
 }
 
 type wait struct {
@@ -224,6 +227,7 @@ func Open(opt Options) (*Orchestrator, *exit.Error) {
 		frames:            newFanout(),
 		productionWake:    make(map[string]chan struct{}),
 		productionRunning: make(map[string]bool),
+		privateTransfers:  make(map[string]*privateTransfer),
 	}
 	// The retirement watch samples on the worker report cadence. The cadence is a
 	// SAMPLING resolution, never a verdict: every verdict it acts on is the worker's own

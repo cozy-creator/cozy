@@ -125,36 +125,13 @@ func TestRentalRunAcquiresCheapestOnceAndReleasesFailedPreAttempt(t *testing.T) 
 			"rentals:\n  max_hourly_spend_usd: 7.00\n"), 0o600))
 	t.Cleanup(func() { _, _ = runCozy(t, root, "down", "--all") })
 	project := weightlessProject(t)
-	if code, out := runCozy(t, root, "package", "install", project); code != 0 {
+	if code, out := runCozy(t, root, "package", "install", project, "--editable"); code != 0 {
 		t.Fatalf("fixture install [exit %d]\n%s", code, out)
 	}
 	local := activePackageInstall(t, root)
 	descriptor, _ = os.ReadFile(launch.DescriptorPath(local.Dir))
-	var descriptorDocument map[string]any
-	must(t, json.Unmarshal(descriptor, &descriptorDocument))
-	entrypoints := descriptorDocument["entrypoints"].([]any)
-	for _, entrypoint := range entrypoints {
-		row := entrypoint.(map[string]any)
-		if row["name"] == "tile" {
-			encoded, _ := json.Marshal(row)
-			var job map[string]any
-			must(t, json.Unmarshal(encoded, &job))
-			job["name"], job["publishes"] = "tile_job", false
-			descriptorDocument["jobs"] = []any{job}
-			row["models"] = []any{map[string]any{
-				"class": "TinyModel", "path": "tile.models.model",
-				"stamps": map[string]any{}, "component_use": map[string]any{"core": []any{"tile"}},
-			}}
-			descriptorDocument["entrypoints"] = []any{row}
-		}
-	}
-	descriptor, _ = json.Marshal(descriptorDocument)
 	decoded, problem := launch.DecodeDescriptor(descriptor)
 	fatal(t, problem)
-	jobDescriptorID := decoded.Jobs[0].DescriptorID
-	if jobDescriptorID == "" {
-		t.Fatal("remote job descriptor id was not derived")
-	}
 	descriptorDigest = decoded.Digest
 	store, problem := records.Open(filepath.Join(root, "records.db"))
 	fatal(t, problem)
@@ -180,8 +157,7 @@ func TestRentalRunAcquiresCheapestOnceAndReleasesFailedPreAttempt(t *testing.T) 
 		t.Fatalf("foreground daemon did not start:\n%s", daemonOutput.String())
 	}
 
-	code, out := runCozy(t, root, "run", weightlessRef+"/tile", "size=32", "seed=7",
-		"--model", "model=cozy/tiny@1.0.0#"+modelManifest,
+	code, out := runCozy(t, root, "run", localWeightlessRef+"/tile", "size=32", "seed=7",
 		"--rental", "--idempotency-key", "managed-e2e", "--json")
 	if code != 1 || !strings.Contains(out, `pinned media certificate`) {
 		t.Fatalf("three-second observation missed the fast rental failure [exit %d]\n%s\ndaemon:\n%s",
@@ -216,17 +192,15 @@ func TestRentalRunAcquiresCheapestOnceAndReleasesFailedPreAttempt(t *testing.T) 
 	gotPosts, gotDeletes, body := posts, deletes, rentalRequest
 	gotCreateReason, gotDeleteReason := createReason, deleteReason
 	mu.Unlock()
-	if request == nil || request.Worker != "pr-managed-e2e" || request.InstallID != "" ||
-		request.Release != "1.0.0" || request.PackageRevisionDigest != releaseDigest ||
-		len(request.Models) != 1 || request.Models[0].Package != weightlessRef ||
-		request.Models[0].Slot != "tile.models.model" || request.Models[0].Model != "cozy/tiny" ||
-		request.Models[0].Release != "1.0.0" || request.Models[0].Manifest != modelManifest ||
+	if request == nil || request.Worker != "pr-managed-e2e" || request.InstallID != local.ID ||
+		request.Release != "1.0.0" || request.PackageRevisionDigest != local.SourceDigest ||
+		request.PrivatePackageDigest == "" || len(request.Models) != 0 ||
 		gotPosts != 1 || gotDeletes != 1 ||
 		body["sku"] != "cheap" || body["max_cost_usd_micros"] != nil || body["max_duration_seconds"] != nil {
 		t.Fatalf("managed lifecycle request=%+v posts=%d deletes=%d body=%v", request, gotPosts, gotDeletes, body)
 	}
 	if gotCreateReason != "" || gotDeleteReason != "" ||
-		strings.Contains(fmt.Sprint(body), weightlessRef) || strings.Contains(fmt.Sprint(body), "cozy/tiny") {
+		strings.Contains(fmt.Sprint(body), localWeightlessRef) || strings.Contains(fmt.Sprint(body), "cozy/tiny") {
 		t.Fatalf("managed rental leaked work identity in reason/body: create=%q delete=%q body=%v",
 			gotCreateReason, gotDeleteReason, body)
 	}
@@ -246,8 +220,7 @@ func TestRentalRunAcquiresCheapestOnceAndReleasesFailedPreAttempt(t *testing.T) 
 			t.Fatalf("managed lifecycle omitted %q: %+v", line, events)
 		}
 	}
-	code, out = runCozy(t, root, "run", weightlessRef+"/tile", "size=32", "seed=7",
-		"--model", "model=cozy/tiny@1.0.0#"+modelManifest,
+	code, out = runCozy(t, root, "run", localWeightlessRef+"/tile", "size=32", "seed=7",
 		"--rental", "--idempotency-key", "managed-e2e", "--json")
 	mu.Lock()
 	gotPosts = posts

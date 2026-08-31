@@ -287,7 +287,7 @@ func Run(l home.Layout, st *records.Store, req Request) (*Result, *exit.Error) {
 	gen.PlacementSetDigest = placement.Digest
 	mark("package_descriptor")
 	if req.Local != nil {
-		current, problem := packagepublish.PrepareFrom(sourceDir)
+		current, problem := packagepublish.PrepareLocalFrom(sourceDir)
 		if problem != nil {
 			return guard(exit.Named(exit.Conflict, "editable_source_changed",
 				"the editable package changed while its replacement was being prepared").
@@ -296,7 +296,7 @@ func Run(l home.Layout, st *records.Store, req Request) (*Result, *exit.Error) {
 		defer current.Close()
 		digest, _, _, problem := current.SourceIdentity()
 		if problem != nil || digest != req.Local.SourceDigest ||
-			current.Organization+"/"+current.Name != req.Local.Package || current.Release != req.Local.Release {
+			"local/"+current.Name != req.Local.Package || current.Release != req.Local.Release {
 			return guard(exit.Named(exit.Conflict, "editable_source_changed",
 				"the editable package changed while its replacement was being prepared").
 				WithRemedy("retry after the source tree is stable"))

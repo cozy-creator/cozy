@@ -39,6 +39,9 @@ func open(cfg config.Config, write bool) (home.Layout, *records.Store, *install.
 
 func handleInstall(ctx *Context) *exit.Error {
 	if explicitPackageDirectory(ctx.Inv.Args[0]) {
+		if !ctx.Inv.Bool("--editable") {
+			return exit.Usagef("an explicit package directory requires --editable")
+		}
 		return handleDirectoryInstall(ctx)
 	}
 	if ctx.Inv.Bool("--editable") {

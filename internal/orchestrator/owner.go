@@ -359,6 +359,13 @@ func (c *Orchestrator) converse(w *worker, addr string) error {
 				continue
 			}
 			c.onModelSourcePrepared(s, prepared)
+		case *pb.WorkerFrame_PrivatePackageFileStatus:
+			status := m.PrivatePackageFileStatus
+			if c.fenced(s, status.RecordOwnerEpoch, status.ControlStreamGeneration,
+				status.WorkerBootId) {
+				continue
+			}
+			c.onPrivatePackageFileStatus(s, status)
 		case *pb.WorkerFrame_ArtifactReceipt:
 			receipt := m.ArtifactReceipt
 			if c.fenced(s, receipt.RecordOwnerEpoch, receipt.ControlStreamGeneration,
@@ -622,9 +629,17 @@ func (c *Orchestrator) onSnapshot(w *worker, s *session, snap *pb.WorkerSnapshot
 	if w.spec.Connection != nil {
 		c.signalAllProductions()
 		c.mu.Lock()
+		private := clonePrivatePackageSet(w.desiredPrivate)
 		packages := clonePackageRefs(w.desiredPackages)
 		models := cloneModelRefs(w.desiredModels)
 		c.mu.Unlock()
+		if private != nil {
+			if e := c.issuePrivatePackageSet(s, w, private); e != nil {
+				c.logf("rental %s private_package_set could not be issued: %s",
+					w.spec.Connection.RentalID, e.Message)
+			}
+			return true
+		}
 		if len(packages) == 0 && len(models) == 0 {
 			return true // generic capacity stays empty until Creator actually selects work
 		}

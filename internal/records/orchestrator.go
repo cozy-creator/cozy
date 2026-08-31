@@ -53,6 +53,8 @@ CREATE TABLE IF NOT EXISTS requests (
   plan_id      TEXT    NOT NULL,
   package_release TEXT NOT NULL DEFAULT '',
   package_revision_digest TEXT NOT NULL DEFAULT '',
+  private_package_digest TEXT NOT NULL DEFAULT '',
+  private_package_uploaded_boot_id TEXT NOT NULL DEFAULT '',
   environment_digest TEXT NOT NULL DEFAULT '',
   config_digest TEXT NOT NULL DEFAULT '',
   payload      BLOB    NOT NULL,
@@ -411,9 +413,13 @@ type Request struct {
 	// Placement. They are CAS-bound with PlanID before the first offer so a retry or
 	// reconnect cannot silently change the execution named by this request.
 	PackageRevisionDigest string
-	EnvironmentDigest     string
-	ConfigDigest          string
-	Payload               []byte
+	// PrivatePackageDigest names Creator's sealed carrier set. UploadedBootID binds the
+	// completed transfer to the exact pod generation that acknowledged every file.
+	PrivatePackageDigest         string
+	PrivatePackageUploadedBootID string
+	EnvironmentDigest            string
+	ConfigDigest                 string
+	Payload                      []byte
 	// Outputs names one destination per RESULT FIELD PATH. It lives on the request
 	// because a REQUEUE re-derives the same grant shape without a client saying so again.
 	Outputs   string
@@ -489,7 +495,8 @@ type ModelRef struct {
 }
 
 const requestCols = `id,idem_key,body_digest,package,entrypoint,plan_id,package_release,
-	package_revision_digest,environment_digest,config_digest,payload,outputs,
+	package_revision_digest,private_package_digest,private_package_uploaded_boot_id,
+	environment_digest,config_digest,payload,outputs,
 	state,ordinal,requeues,created_at,kind,job_gpu_count,org,trees,worker,rental,
 	COALESCE(install_id,''),assets,models,artifact_outputs`
 
@@ -497,7 +504,8 @@ func scanRequest(row interface{ Scan(...any) error }) (Request, error) {
 	var r Request
 	var assets, models string
 	err := row.Scan(&r.ID, &r.IdemKey, &r.BodyDigest, &r.Package, &r.Entrypoint, &r.PlanID,
-		&r.Release, &r.PackageRevisionDigest, &r.EnvironmentDigest, &r.ConfigDigest, &r.Payload, &r.Outputs,
+		&r.Release, &r.PackageRevisionDigest, &r.PrivatePackageDigest,
+		&r.PrivatePackageUploadedBootID, &r.EnvironmentDigest, &r.ConfigDigest, &r.Payload, &r.Outputs,
 		&r.State, &r.Ordinal, &r.Requeues, &r.CreatedAt,
 		&r.Kind, &r.JobGPUCount, &r.Org, &r.Trees, &r.Worker, &r.Rental,
 		&r.InstallID, &assets, &models, &r.ArtifactOutputs)
@@ -560,6 +568,40 @@ func (s *Store) BindRemoteInvocation(id, planID, packageRevision, environment, c
 			"request %s already binds a different worker-derived invocation identity", id)
 	}
 	return nil
+}
+
+// MarkPrivatePackageUploaded crosses the durable boundary between verified carrier
+// acknowledgements and DesiredPrivatePackageSet. A reconnect may safely resend desired state;
+// a different pod boot may not inherit another worker's upload observation.
+func (s *Store) MarkPrivatePackageUploaded(id, digest, bootID string) *exit.Error {
+	if id == "" || digest == "" || bootID == "" {
+		return exit.Internalf("cannot record an incomplete private package upload")
+	}
+	result, err := s.db.Exec(`UPDATE requests SET private_package_uploaded_boot_id=?
+		WHERE id=? AND private_package_digest=? AND
+		(private_package_uploaded_boot_id='' OR private_package_uploaded_boot_id=?)`,
+		bootID, id, digest, bootID)
+	if err != nil {
+		return exit.Internalf("cannot record request %s private package upload: %s", id, err)
+	}
+	changed, err := result.RowsAffected()
+	if err != nil {
+		return exit.Internalf("cannot read request %s private package upload result: %s", id, err)
+	}
+	if changed == 1 {
+		return nil
+	}
+	var heldDigest, heldBoot string
+	if err := s.db.QueryRow(`SELECT private_package_digest,private_package_uploaded_boot_id
+		FROM requests WHERE id=?`, id).Scan(&heldDigest, &heldBoot); err != nil {
+		return exit.Internalf("cannot read request %s private package upload: %s", id, err)
+	}
+	if heldDigest != digest {
+		return exit.Named(exit.Conflict, "private_package_revision_changed",
+			"request %s already names another private package revision", id)
+	}
+	return exit.Named(exit.Conflict, "private_package_worker_changed",
+		"request %s uploaded its private package to worker boot %s, not %s", id, heldBoot, bootID)
 }
 
 // AssignManagedRental pins one still-queued --rental request to the exact pod
@@ -856,12 +898,14 @@ func submitRequestTx(tx *sql.Tx, r Request, assets, models, exportOutputs string
 		return Request{}, false, exit.Internalf("cannot read request %s: %s", r.IdemKey, err)
 	}
 	if _, err := tx.Exec(`INSERT INTO requests(id,idem_key,body_digest,package,entrypoint,
-		plan_id,package_release,package_revision_digest,environment_digest,config_digest,
+		plan_id,package_release,package_revision_digest,private_package_digest,
+		private_package_uploaded_boot_id,environment_digest,config_digest,
 		payload,outputs,state,ordinal,requeues,created_at,kind,job_gpu_count,org,trees,worker,rental,install_id,assets,models,
 		artifact_outputs)
-		VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,0,0,?,?,?,?,?,?,?,?,?,?,?)`,
+		VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,0,0,?,?,?,?,?,?,?,?,?,?,?)`,
 		r.ID, r.IdemKey, r.BodyDigest, r.Package, r.Entrypoint, r.PlanID,
-		r.Release, r.PackageRevisionDigest, r.EnvironmentDigest, r.ConfigDigest, r.Payload,
+		r.Release, r.PackageRevisionDigest, r.PrivatePackageDigest,
+		r.PrivatePackageUploadedBootID, r.EnvironmentDigest, r.ConfigDigest, r.Payload,
 		r.Outputs, r.State, r.CreatedAt, r.Kind, r.JobGPUCount, r.Org, r.Trees, r.Worker, r.Rental,
 		nullable(r.InstallID),
 		assets, models, r.ArtifactOutputs); err != nil {

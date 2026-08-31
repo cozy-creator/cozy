@@ -350,6 +350,9 @@ type worker struct {
 	// locally reconstructed placement.
 	desiredPackages []*pb.DownloadPackageRef
 	desiredModels   []*pb.DownloadModelRef
+	// desiredPrivate is the exact command-scoped private wheel inventory. It survives
+	// control reconnect so a prepared pod can replay its ledgered PlacementSet directly.
+	desiredPrivate *pb.DesiredPrivatePackageSet
 
 	// what the worker itself reported; the orchestrator echoes, never invents
 	exited bool

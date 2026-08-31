@@ -115,10 +115,6 @@ func Stage(ctx context.Context, layout home.Layout, install records.PackageInsta
 	for index := range revision.Files {
 		revision.Files[index].Path = filepath.Join(final, "wheels", revision.Files[index].Filename)
 	}
-	if err := os.Chmod(filepath.Join(final, "wheels"), 0o500); err != nil ||
-		os.Chmod(final, 0o500) != nil {
-		return Revision{}, exit.Internalf("cannot seal private package revision")
-	}
 	return revision, nil
 }
 

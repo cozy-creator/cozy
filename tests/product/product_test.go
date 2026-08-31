@@ -25,6 +25,7 @@ import (
 )
 
 const weightlessRef = "cozy/cozy-weightless-package"
+const localWeightlessRef = "local/cozy-weightless-package"
 const editableRuntimeFixtureSHA = "c7582e635a01e44a18c8487d0eb66992b70f7602"
 const editableTensorFSFixtureSHA = "0f49a4bf3fbe6fc8d41713b7ce9041c80161b7e6"
 
@@ -1117,7 +1118,7 @@ func TestDevelopmentInstallRefreshesBeforeInvocation(t *testing.T) {
 	})
 
 	project := weightlessProject(t)
-	code, out := runCozy(t, root, "package", "install", project)
+	code, out := runCozy(t, root, "package", "install", project, "--editable")
 	if code != 0 {
 		t.Fatalf("local directory package install [exit %d]\n%s", code, out)
 	}
@@ -1125,20 +1126,20 @@ func TestDevelopmentInstallRefreshesBeforeInvocation(t *testing.T) {
 		t.Fatalf("local install omitted its unqualified identity note\n%s", out)
 	}
 	if code, out := runCozy(t, root, "package", "list", "--full", "--json"); code != 0 ||
-		!strings.Contains(out, weightlessRef) || !strings.Contains(out, `"source":"local `) {
+		!strings.Contains(out, localWeightlessRef) || !strings.Contains(out, `"source":"local `) {
 		t.Fatalf("package list omitted the install [exit %d]\n%s", code, out)
 	}
-	if code, out := runCozy(t, root, "run", weightlessRef); code != 0 ||
+	if code, out := runCozy(t, root, "run", localWeightlessRef); code != 0 ||
 		!strings.Contains(out, "- tile") || !strings.Contains(out, "- refuse") {
 		t.Fatalf("package-only run did not list functions [exit %d]\n%s", code, out)
 	}
-	if code, out := runCozy(t, root, "run", weightlessRef+"/v1.0.0/tile"); code != 2 ||
-		!strings.Contains(out, weightlessRef+"/tile") || !strings.Contains(out, "installed release") {
+	if code, out := runCozy(t, root, "run", localWeightlessRef+"/v1.0.0/tile"); code != 2 ||
+		!strings.Contains(out, localWeightlessRef+"/tile") || !strings.Contains(out, "installed release") {
 		t.Fatalf("version-in-path remedy was not useful [exit %d]\n%s", code, out)
 	}
 
 	outputDir := filepath.Join(root, "human-run-output")
-	code, stdout, stderr := runCozyStreams(t, root, "run", weightlessRef+"/tile",
+	code, stdout, stderr := runCozyStreams(t, root, "run", localWeightlessRef+"/tile",
 		"size=32", "--out", outputDir, "--await")
 	if code != 0 {
 		t.Fatalf("human invocation failed [exit %d]\nstdout:\n%s\nstderr:\n%s", code, stdout, stderr)
@@ -1167,7 +1168,7 @@ func TestDevelopmentInstallRefreshesBeforeInvocation(t *testing.T) {
 		t.Fatalf("invocation did not announce its output hash before execution\n%s", stderr)
 	}
 	firstOutput := files[0].Name()
-	code, _, stderr = runCozyStreams(t, root, "run", weightlessRef+"/tile",
+	code, _, stderr = runCozyStreams(t, root, "run", localWeightlessRef+"/tile",
 		"size=32", "--out", outputDir)
 	if code != 0 {
 		t.Fatalf("second human invocation failed [exit %d]\n%s", code, stderr)
@@ -1183,7 +1184,7 @@ func TestDevelopmentInstallRefreshesBeforeInvocation(t *testing.T) {
 	}
 	fixedDir := filepath.Join(root, "fixed-seed-output")
 	for attempt := 0; attempt < 2; attempt++ {
-		code, _, stderr = runCozyStreams(t, root, "run", weightlessRef+"/tile",
+		code, _, stderr = runCozyStreams(t, root, "run", localWeightlessRef+"/tile",
 			"size=32", "seed=7", "--out", fixedDir)
 		if code != 0 {
 			t.Fatalf("fixed-seed invocation %d failed [exit %d]\n%s", attempt+1, code, stderr)
@@ -1196,7 +1197,7 @@ func TestDevelopmentInstallRefreshesBeforeInvocation(t *testing.T) {
 	}
 
 	detachedDir := filepath.Join(root, "detached-output")
-	code, stdout, stderr = runCozyStreams(t, root, "--json", "run", weightlessRef+"/tile",
+	code, stdout, stderr = runCozyStreams(t, root, "--json", "run", localWeightlessRef+"/tile",
 		"size=32", "seed=9", "delay_ms=4500", "--out", detachedDir)
 	if code != 0 || !strings.Contains(stdout, `"status":"running"`) ||
 		!strings.Contains(stdout, `"output":"`+detachedDir) ||
@@ -1216,20 +1217,20 @@ func TestDevelopmentInstallRefreshesBeforeInvocation(t *testing.T) {
 		time.Sleep(25 * time.Millisecond)
 	}
 
-	code, _, stderr = runCozyStreams(t, root, "run", weightlessRef+"/tile",
+	code, _, stderr = runCozyStreams(t, root, "run", localWeightlessRef+"/tile",
 		"size=32", "seed=7", "--full", "--await")
 	if code != 0 || !strings.Contains(stderr, "progress fraction=") {
 		t.Fatalf("--full did not retain Runtime diagnostics [exit %d]\n%s", code, stderr)
 	}
 
 	for _, deleted := range []string{"--local", "--cloud", "--machine"} {
-		if code, out := runCozy(t, root, "run", weightlessRef+"/tile",
+		if code, out := runCozy(t, root, "run", localWeightlessRef+"/tile",
 			"size=32", "seed=7", deleted); code != 2 ||
 			!strings.Contains(out, "unknown flag") {
 			t.Fatalf("deleted %s did not refuse [exit %d]\n%s", deleted, code, out)
 		}
 	}
-	code, out = runCozy(t, root, "run", weightlessRef+"/tile",
+	code, out = runCozy(t, root, "run", localWeightlessRef+"/tile",
 		"size=32", "seed=7", "--idempotency-key", "placement-proof", "--json", "--await")
 	if code != 0 || !strings.Contains(out, `"revision":"first"`) ||
 		!strings.Contains(out, `"digest":`) || !strings.Contains(out, `"result":`) {
@@ -1251,7 +1252,7 @@ func TestDevelopmentInstallRefreshesBeforeInvocation(t *testing.T) {
 	must(t, err)
 	body = []byte(strings.Replace(string(body), `REVISION = "first"`, `REVISION = "second"`, 1))
 	must(t, os.WriteFile(source, body, 0o644))
-	code, out = runCozy(t, root, "run", weightlessRef+"/tile",
+	code, out = runCozy(t, root, "run", localWeightlessRef+"/tile",
 		"size=32", "seed=7", "--json", "--await")
 	if code != 0 || !strings.Contains(out, `"revision":"second"`) {
 		t.Fatalf("edited body was not live on the next invocation [exit %d]\n%s", code, out)
@@ -1269,7 +1270,7 @@ func TestDevelopmentInstallRefreshesBeforeInvocation(t *testing.T) {
 	lockBytes, err := os.ReadFile(lock)
 	must(t, err)
 	must(t, os.WriteFile(lock, append(lockBytes, []byte("\n# editable lock refresh\n")...), 0o644))
-	code, out = runCozy(t, root, "run", weightlessRef+"/tile",
+	code, out = runCozy(t, root, "run", localWeightlessRef+"/tile",
 		"size=32", "seed=7", "--json", "--await")
 	if code != 0 || !strings.Contains(out, `"revision":"second"`) {
 		t.Fatalf("metadata/lock refresh did not remain runnable [exit %d]\n%s", code, out)
@@ -1282,7 +1283,7 @@ func TestDevelopmentInstallRefreshesBeforeInvocation(t *testing.T) {
 	goodMetadata, err := os.ReadFile(pyproject)
 	must(t, err)
 	must(t, os.WriteFile(pyproject, []byte("[project\n"), 0o644))
-	code, out = runCozy(t, root, "run", weightlessRef+"/tile",
+	code, out = runCozy(t, root, "run", localWeightlessRef+"/tile",
 		"size=32", "seed=7", "--json", "--await")
 	if code != 1 || !strings.Contains(out, `"code":"editable_refresh_failed"`) {
 		t.Fatalf("failed edit did not return the typed refresh refusal [exit %d]\n%s", code, out)
@@ -1292,7 +1293,7 @@ func TestDevelopmentInstallRefreshesBeforeInvocation(t *testing.T) {
 		t.Fatalf("failed refresh displaced the last good generation: %#v -> %#v", third, failed)
 	}
 	must(t, os.WriteFile(pyproject, goodMetadata, 0o644))
-	code, out = runCozy(t, root, "run", weightlessRef+"/tile",
+	code, out = runCozy(t, root, "run", localWeightlessRef+"/tile",
 		"size=32", "seed=7", "--json", "--await")
 	if code != 0 || !strings.Contains(out, `"revision":"second"`) {
 		t.Fatalf("restored source did not reuse the last good generation [exit %d]\n%s", code, out)
@@ -1325,17 +1326,17 @@ func TestModeledDevelopmentInstallRefreshesAndKeepsLastGoodSelection(t *testing.
 	})
 
 	project := modeledDevelopmentProject(t, root)
-	code, out := runCozy(t, root, "package", "install", project, "--json", "--full")
-	if code != 0 || !strings.Contains(out, `"package":"cozy/modeled-development-package"`) {
+	code, out := runCozy(t, root, "package", "install", project, "--editable", "--json", "--full")
+	if code != 0 || !strings.Contains(out, `"package":"local/modeled-development-package"`) {
 		t.Fatalf("modeled editable install failed [exit %d]\n%s", code, out)
 	}
-	code, out = runCozy(t, root, "run", "cozy/modeled-development-package/render",
+	code, out = runCozy(t, root, "run", "local/modeled-development-package/render",
 		"value=7", "--json", "--await")
 	if code != 0 || !strings.Contains(out, `"value":8`) {
 		t.Fatalf("modeled editable invocation failed [exit %d]\n%s\n%s",
 			code, out, productWorkerLogs(root))
 	}
-	first := activeInstall(t, root, "cozy/modeled-development-package")
+	first := activeInstall(t, root, "local/modeled-development-package")
 
 	source := filepath.Join(project, "src", "modeled_development_package", "__init__.py")
 	body, err := os.ReadFile(source)
@@ -1343,13 +1344,13 @@ func TestModeledDevelopmentInstallRefreshesAndKeepsLastGoodSelection(t *testing.
 	body = []byte(strings.Replace(string(body), "return Result(payload.value + model.first())",
 		"return Result(payload.value + model.first() + 1)", 1))
 	must(t, os.WriteFile(source, body, 0o644))
-	code, out = runCozy(t, root, "run", "cozy/modeled-development-package/render",
+	code, out = runCozy(t, root, "run", "local/modeled-development-package/render",
 		"value=7", "--json", "--await")
 	if code != 0 || !strings.Contains(out, `"value":9`) {
 		t.Fatalf("modeled source edit was not live on the next invocation [exit %d]\n%s\n%s",
 			code, out, productWorkerLogs(root))
 	}
-	second := activeInstall(t, root, "cozy/modeled-development-package")
+	second := activeInstall(t, root, "local/modeled-development-package")
 	if second.ID == first.ID || second.SourceDigest == first.SourceDigest {
 		t.Fatalf("modeled body edit did not advance generation: %#v -> %#v", first, second)
 	}
@@ -1360,18 +1361,18 @@ func TestModeledDevelopmentInstallRefreshesAndKeepsLastGoodSelection(t *testing.
 	brokenBinding := strings.Replace(string(goodBinding), `release = "1.0.0"`,
 		`release = "9.9.9"`, 1)
 	must(t, os.WriteFile(binding, []byte(brokenBinding), 0o644))
-	code, out = runCozy(t, root, "run", "cozy/modeled-development-package/render",
+	code, out = runCozy(t, root, "run", "local/modeled-development-package/render",
 		"value=7", "--json", "--await")
 	if code != 1 || !strings.Contains(out, `"code":"editable_refresh_failed"`) {
 		t.Fatalf("absent modeled release did not return typed last-good refusal [exit %d]\n%s",
 			code, out)
 	}
-	failed := activeInstall(t, root, "cozy/modeled-development-package")
+	failed := activeInstall(t, root, "local/modeled-development-package")
 	if failed.ID != second.ID || failed.SourceDigest != second.SourceDigest {
 		t.Fatalf("failed modeled refresh displaced last good generation: %#v -> %#v", second, failed)
 	}
 	must(t, os.WriteFile(binding, goodBinding, 0o644))
-	code, out = runCozy(t, root, "run", "cozy/modeled-development-package/render",
+	code, out = runCozy(t, root, "run", "local/modeled-development-package/render",
 		"value=7", "--json", "--await")
 	if code != 0 || !strings.Contains(out, `"value":9`) {
 		t.Fatalf("restored modeled selection did not reuse last good generation [exit %d]\n%s",
@@ -1390,7 +1391,7 @@ func productWorkerLogs(root string) string {
 }
 
 func activePackageInstall(t *testing.T, root string) records.PackageInstall {
-	return activeInstall(t, root, weightlessRef)
+	return activeInstall(t, root, localWeightlessRef)
 }
 
 func activeInstall(t *testing.T, root, packageRef string) records.PackageInstall {

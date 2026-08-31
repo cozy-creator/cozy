@@ -212,8 +212,8 @@ func replaySubmission(sub Submission, recorded records.Request) orchestrator.Sub
 		Package: sub.Package, Entrypoint: sub.Function, Payload: payload,
 		Outputs: outputs, PlanID: planID, Worker: recorded.Worker, Assets: assets,
 		InstallID: sub.InstallID, Release: sub.Release, ReleaseDigest: sub.ReleaseDigest,
-		Rental: sub.Rental, Models: models,
-		OutputExport: outputExportInput(sub),
+		PrivatePackageDigest: recorded.PrivatePackageDigest,
+		Rental:               sub.Rental, Models: models, OutputExport: outputExportInput(sub),
 	}
 }
 
@@ -509,7 +509,8 @@ func (s *Server) resolvePrivateServing(ctx context.Context, sub Submission,
 		return out, problem
 	}
 	out.InstallID, out.PlanID = installID, planID
-	out.Release, out.ReleaseDigest = revision.Release, revision.Digest
+	out.Release, out.ReleaseDigest = revision.Release, revision.SourceDigest
+	out.PrivatePackageDigest = revision.Digest
 	if len(out.Outputs) == 0 {
 		out.Outputs = outputs
 	}

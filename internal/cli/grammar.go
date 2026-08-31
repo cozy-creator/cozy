@@ -56,9 +56,9 @@ func (c *PackageSearchCmd) Run(r *Runtime) error {
 }
 
 type PackageInstallCmd struct {
-	Ref     string `arg:"" name:"package-or-directory" help:"Published org/name or explicit directory such as . or ./project."`
-	Version string `help:"Install this release instead of the newest, e.g. 1.2.3."`
-	Editable bool  `help:"Keep an explicit local directory live for development."`
+	Ref      string `arg:"" name:"package-or-directory" help:"Published org/name or explicit directory such as . or ./project."`
+	Version  string `help:"Install this release instead of the newest, e.g. 1.2.3."`
+	Editable bool   `help:"Keep an explicit local directory live for development."`
 }
 
 type PackageYankCmd struct {
@@ -71,7 +71,7 @@ func (c *PackageYankCmd) Run(r *Runtime) error {
 }
 
 func (c *PackageInstallCmd) Run(r *Runtime) error {
-	return r.call(handleInstall, []string{c.Ref}, flags("--editable", c.Editable),
+	return r.call(handleInstall, []string{c.Ref}, bools("--editable", c.Editable),
 		values("--version", c.Version), false)
 }
 

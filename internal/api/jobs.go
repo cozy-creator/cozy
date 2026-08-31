@@ -336,7 +336,8 @@ func (s *Server) resolvePrivateJob(ctx context.Context, sub JobSubmission,
 		return out, problem
 	}
 	out.InstallID = installID
-	out.Release, out.ReleaseDigest = revision.Release, revision.Digest
+	out.Release, out.ReleaseDigest = revision.Release, revision.SourceDigest
+	out.PrivatePackageDigest = revision.Digest
 	return out, nil
 }
 
