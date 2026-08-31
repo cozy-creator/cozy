@@ -131,14 +131,15 @@ func writeHumanRecord(w io.Writer, fields []Field, data map[string]any, notes, n
 	var rendered strings.Builder
 	width := 0
 	for _, field := range fields {
-		width = max(width, utf8.RuneCountInString(field.K))
+		width = max(width, utf8.RuneCountInString(humanFieldName(field.K)))
 	}
 	for _, field := range fields {
+		label := humanFieldName(field.K)
 		if values, ok := data[field.K].([]string); ok {
-			rendered.WriteString(field.K)
+			rendered.WriteString(label)
 			rendered.WriteByte(':')
 			if len(values) == 0 {
-				rendered.WriteString(strings.Repeat(" ", width-utf8.RuneCountInString(field.K)+1))
+				rendered.WriteString(strings.Repeat(" ", width-utf8.RuneCountInString(label)+1))
 				rendered.WriteString("-\n")
 				continue
 			}
@@ -150,15 +151,22 @@ func writeHumanRecord(w io.Writer, fields []Field, data map[string]any, notes, n
 			}
 			continue
 		}
-		rendered.WriteString(field.K)
+		rendered.WriteString(label)
 		rendered.WriteByte(':')
-		rendered.WriteString(strings.Repeat(" ", width-utf8.RuneCountInString(field.K)+1))
+		rendered.WriteString(strings.Repeat(" ", width-utf8.RuneCountInString(label)+1))
 		rendered.WriteString(humanValue(data[field.K], full))
 		rendered.WriteByte('\n')
 	}
 	writeHumanGuidance(&rendered, notes, next)
 	_, err := io.WriteString(w, rendered.String())
 	return err
+}
+
+func humanFieldName(name string) string {
+	if name == "queue_position" {
+		return "queue position"
+	}
+	return name
 }
 
 func writeHumanList(w io.Writer, list List, columns []string, shown []map[string]string,

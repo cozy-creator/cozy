@@ -505,8 +505,8 @@ func renderSubmittedRun(ctx *Context, life api.Lifecycle, changed bool) *exit.Er
 		if life.QueueDepth != nil && *life.QueueDepth >= *life.QueuePosition {
 			queue += "/" + strconv.Itoa(*life.QueueDepth)
 		}
-		fields = append(fields, output.Field{K: "queue", V: queue})
-		defaults = append(defaults, "queue")
+		fields = append(fields, output.Field{K: "queue_position", V: queue})
+		defaults = append(defaults, "queue_position")
 	}
 	if export := life.OutputExport; export != nil {
 		fields = append(fields, output.Field{K: "output", V: outputExportHint(export)})

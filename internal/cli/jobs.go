@@ -98,8 +98,8 @@ func renderSubmittedJob(ctx *Context, state api.JobState, changed bool) *exit.Er
 		if state.QueueDepth != nil && *state.QueueDepth >= *state.QueuePosition {
 			queue += "/" + fmt.Sprint(*state.QueueDepth)
 		}
-		fields = append(fields, output.Field{K: "queue", V: queue})
-		defaults = append(defaults, "queue")
+		fields = append(fields, output.Field{K: "queue_position", V: queue})
+		defaults = append(defaults, "queue_position")
 	}
 	fields = append(fields, output.Field{K: "changed", V: changed})
 	defaults = append(defaults, "run")

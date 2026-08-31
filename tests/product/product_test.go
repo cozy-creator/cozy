@@ -1,6 +1,7 @@
 package producttest
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -17,6 +18,7 @@ import (
 
 	"github.com/cozy-creator/cozy/internal/exit"
 	"github.com/cozy-creator/cozy/internal/launch"
+	"github.com/cozy-creator/cozy/internal/output"
 	"github.com/cozy-creator/cozy/internal/packagepublish"
 	"github.com/cozy-creator/cozy/internal/records"
 	"github.com/cozy-creator/cozy/internal/wheel"
@@ -25,6 +27,24 @@ import (
 const weightlessRef = "cozy/cozy-weightless-package"
 const editableRuntimeFixtureSHA = "c7582e635a01e44a18c8487d0eb66992b70f7602"
 const editableTensorFSFixtureSHA = "0f49a4bf3fbe6fc8d41713b7ce9041c80161b7e6"
+
+func TestHumanQueuePositionLabelKeepsMachineKey(t *testing.T) {
+	record := output.Record{Fields: []output.Field{{K: "queue_position", V: "9/9"}}}
+	var human bytes.Buffer
+	if err := record.Emit(&human, output.Mode{Human: true}); err != nil {
+		t.Fatal(err)
+	}
+	if got := human.String(); got != "queue position: 9/9\n" {
+		t.Fatalf("human queue label = %q", got)
+	}
+	var jsonOut bytes.Buffer
+	if err := record.Emit(&jsonOut, output.Mode{JSON: true}); err != nil {
+		t.Fatal(err)
+	}
+	if got := jsonOut.String(); !strings.Contains(got, `"queue_position":"9/9"`) {
+		t.Fatalf("machine queue key drifted: %s", got)
+	}
+}
 
 func TestLiteralPayloadUsesOrdinaryScalarSyntax(t *testing.T) {
 	entrypoint := &launch.Entrypoint{
