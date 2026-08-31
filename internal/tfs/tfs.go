@@ -17,6 +17,7 @@ package tfs
 
 import (
 	"bytes"
+	"context"
 	"encoding/base64"
 	"encoding/json"
 	"os"
@@ -60,7 +61,11 @@ func Open(cfg config.Config, layout home.Layout) (*Tool, *exit.Error) {
 }
 
 func (t *Tool) run(args ...string) (string, *exit.Error) {
-	cmd := exec.Command(t.Bin, args...)
+	return t.runContext(context.Background(), args...)
+}
+
+func (t *Tool) runContext(ctx context.Context, args ...string) (string, *exit.Error) {
+	cmd := exec.CommandContext(ctx, t.Bin, args...)
 	cmd.Env = t.env
 	var out, errb bytes.Buffer
 	cmd.Stdout, cmd.Stderr = &out, &errb
@@ -406,8 +411,8 @@ func (t *Tool) PreviewSource(planPath string) *exit.Error {
 
 var candidateManifest = regexp.MustCompile(`(?m)^candidate\s+manifest\s+(sha256:[0-9a-f]{64})\s*$`)
 
-func (t *Tool) RunSource(planPath string) (string, *exit.Error) {
-	out, problem := t.run("ingest", "run", t.Root, "--source-plan", planPath)
+func (t *Tool) RunSource(ctx context.Context, planPath string) (string, *exit.Error) {
+	out, problem := t.runContext(ctx, "ingest", "run", t.Root, "--source-plan", planPath)
 	if problem != nil {
 		return "", problem
 	}

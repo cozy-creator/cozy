@@ -1,6 +1,7 @@
 package modelsource
 
 import (
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"io"
@@ -13,7 +14,7 @@ import (
 // StageLocal freezes one mutable user file into the private operation tree in
 // the same pass that measures its source identity. TensorFS never reopens the
 // user path, and the original is never removed or changed.
-func StageLocal(source Source, root string) (Plan, StagedFile, *exit.Error) {
+func StageLocal(ctx context.Context, source Source, root string) (Plan, StagedFile, *exit.Error) {
 	if source.Kind != LocalFile {
 		return Plan{}, StagedFile{}, exit.Internalf("local stager received a provider source")
 	}
@@ -39,11 +40,15 @@ func StageLocal(source Source, root string) (Plan, StagedFile, *exit.Error) {
 		return Plan{}, StagedFile{}, exit.Internalf("cannot create local model staging file: %s", err)
 	}
 	hash := sha256.New()
-	written, copyErr := io.Copy(io.MultiWriter(output, hash), input)
+	written, copyErr := io.Copy(io.MultiWriter(output, hash), contextReader{ctx: ctx, reader: input})
 	after, statErr := input.Stat()
 	inputClose := input.Close()
 	syncErr := output.Sync()
 	outputClose := output.Close()
+	if ctx.Err() != nil {
+		_ = os.Remove(temporary)
+		return Plan{}, StagedFile{}, exit.New(exit.Canceled, "local model staging canceled")
+	}
 	if copyErr != nil || statErr != nil || inputClose != nil || syncErr != nil || outputClose != nil ||
 		!os.SameFile(before, after) || before.Size() != after.Size() || before.ModTime() != after.ModTime() ||
 		written != before.Size() {
@@ -62,4 +67,16 @@ func StageLocal(source Source, root string) (Plan, StagedFile, *exit.Error) {
 		Files: []File{{Member: "source.safetensors", SHA256: sha, Length: written, Carrier: true}},
 		Bytes: written}
 	return plan, StagedFile{Path: target, Carrier: true}, nil
+}
+
+type contextReader struct {
+	ctx    context.Context
+	reader io.Reader
+}
+
+func (r contextReader) Read(buffer []byte) (int, error) {
+	if err := r.ctx.Err(); err != nil {
+		return 0, err
+	}
+	return r.reader.Read(buffer)
 }

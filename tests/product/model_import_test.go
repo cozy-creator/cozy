@@ -1,6 +1,7 @@
 package producttest
 
 import (
+	"context"
 	"encoding/json"
 	"flag"
 	"os"
@@ -10,6 +11,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/cozy-creator/cozy/internal/exit"
 	"github.com/cozy-creator/cozy/internal/modelsource"
 )
 
@@ -83,7 +85,7 @@ func TestLocalModelStagingRefusesMutationAndSymlink(t *testing.T) {
 		}
 	}()
 	<-started
-	_, _, problem = modelsource.StageLocal(source, filepath.Join(root, "stage"))
+	_, _, problem = modelsource.StageLocal(context.Background(), source, filepath.Join(root, "stage"))
 	close(done)
 	<-stopped
 	if problem == nil || problem.Name != "model_source_changed" {
@@ -96,6 +98,20 @@ func TestLocalModelStagingRefusesMutationAndSymlink(t *testing.T) {
 	must(t, os.Symlink(target, link))
 	if _, problem := modelsource.Parse(link, root); problem == nil || problem.Name != "model_source_file_refused" {
 		t.Fatalf("symlink local source = %v", problem)
+	}
+}
+
+func TestLocalModelStagingHonorsCancellation(t *testing.T) {
+	root := t.TempDir()
+	path := filepath.Join(root, "source.safetensors")
+	must(t, os.WriteFile(path, []byte("carrier"), 0o600))
+	source, problem := modelsource.Parse(path, root)
+	fatal(t, problem)
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	_, _, problem = modelsource.StageLocal(ctx, source, filepath.Join(root, "stage"))
+	if problem == nil || problem.Code != exit.Canceled {
+		t.Fatalf("canceled local staging = %v", problem)
 	}
 }
 
