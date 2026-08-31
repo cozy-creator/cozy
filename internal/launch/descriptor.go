@@ -90,7 +90,6 @@ type ModelProductionNode struct {
 	Callable  string               `json:"callable"`
 	Models    map[string]string    `json:"models"`
 	Outputs   []string             `json:"outputs"`
-	Assets    map[string]string    `json:"assets"`
 	Resources ResourceRequirements `json:"resources"`
 }
 
@@ -108,10 +107,8 @@ type ModelProductionOutput struct {
 }
 
 type ModelProductionContract struct {
-	Tasks     []string          `json:"tasks"`
-	Structure string            `json:"structure"`
-	Encodings []string          `json:"encodings"`
-	Stamps    map[string]string `json:"stamps"`
+	TopologyDigest string   `json:"topology_digest"`
+	Encodings      []string `json:"encodings"`
 }
 
 // Slot is one declared model binding path — capability, never selection.
@@ -328,7 +325,7 @@ func validateProductionKeys(raw json.RawMessage) error {
 		}
 		for _, rawNode := range nodes {
 			node, err := exactKeys(rawNode,
-				[]string{"assets", "callable", "models", "name", "outputs"}, []string{"resources"})
+				[]string{"callable", "models", "name", "outputs"}, []string{"resources"})
 			if err != nil {
 				return err
 			}
@@ -349,7 +346,7 @@ func validateProductionKeys(raw json.RawMessage) error {
 				return err
 			}
 			if _, err := exactKeys(output["required_contract"],
-				[]string{"encodings", "stamps", "structure", "tasks"}, nil); err != nil {
+				[]string{"encodings", "topology_digest"}, nil); err != nil {
 				return err
 			}
 		}
@@ -525,9 +522,10 @@ func validateEntrypoint(ep *Entrypoint) *exit.Error {
 }
 
 var (
-	productionNamePattern = regexp.MustCompile(`^[a-z][a-z0-9_-]{0,63}$`)
-	callablePattern       = regexp.MustCompile(`^[a-z0-9][a-z0-9._-]{0,63}/[a-z0-9][a-z0-9._-]{0,63}/[a-z][a-z0-9_-]{0,63}$`)
-	contractPattern       = regexp.MustCompile(`^[a-z0-9][a-z0-9._+-]{0,63}(?:/[a-z0-9][a-z0-9._+-]{0,63})*$`)
+	productionNamePattern   = regexp.MustCompile(`^[a-z][a-z0-9_-]{0,63}$`)
+	callablePattern         = regexp.MustCompile(`^[a-z0-9][a-z0-9._-]{0,63}/[a-z0-9][a-z0-9._-]{0,63}/[a-z][a-z0-9_-]{0,63}$`)
+	contractPattern         = regexp.MustCompile(`^[a-z0-9][a-z0-9._+-]{0,63}(?:/[a-z0-9][a-z0-9._+-]{0,63})*$`)
+	productionDigestPattern = regexp.MustCompile(`^sha256:[0-9a-f]{64}$`)
 )
 
 func validateProductions(productions []ModelProduction) *exit.Error {
@@ -568,17 +566,12 @@ func validateProduction(production *ModelProduction) *exit.Error {
 			return badProduction(production, "has an invalid node name or callable")
 		}
 		if len(node.Models) < 1 || len(node.Models) > 16 || len(node.Outputs) < 1 ||
-			len(node.Outputs) > 8 || len(node.Assets) > 16 {
+			len(node.Outputs) > 8 {
 			return badProduction(production, "node %s exceeds its input/output bounds", node.Name)
 		}
 		for input, reference := range node.Models {
 			if !productionNamePattern.MatchString(input) || reference == "" {
 				return badProduction(production, "node %s has an invalid model edge", node.Name)
-			}
-		}
-		for input, member := range node.Assets {
-			if !productionNamePattern.MatchString(input) || !safeProductionMember(member) {
-				return badProduction(production, "node %s has an invalid static asset", node.Name)
 			}
 		}
 		for _, output := range node.Outputs {
@@ -602,42 +595,21 @@ func validateProduction(production *ModelProduction) *exit.Error {
 		}
 		outputNames[output.Name], lanes[output.LaneKey] = true, true
 		contract := output.RequiredContract
-		if !contractPattern.MatchString(contract.Structure) ||
-			!validProductionList(contract.Tasks, 32, productionNamePattern) ||
-			!validProductionList(contract.Encodings, 32, contractPattern) || len(contract.Stamps) > 32 {
+		if !productionDigestPattern.MatchString(contract.TopologyDigest) ||
+			!validProductionDigestList(contract.Encodings, 32) {
 			return badProduction(production, "output %s has an invalid required contract", output.Name)
-		}
-		for key, value := range contract.Stamps {
-			if !productionNamePattern.MatchString(key) || !productionNamePattern.MatchString(value) {
-				return badProduction(production, "output %s has an invalid contract stamp", output.Name)
-			}
 		}
 	}
 	_, problem := production.OrderedNodes()
 	return problem
 }
 
-func validProductionList(values []string, cap int, pattern *regexp.Regexp) bool {
+func validProductionDigestList(values []string, cap int) bool {
 	if len(values) < 1 || len(values) > cap {
 		return false
 	}
-	seen := map[string]bool{}
-	for _, value := range values {
-		if !pattern.MatchString(value) || seen[value] {
-			return false
-		}
-		seen[value] = true
-	}
-	return true
-}
-
-func safeProductionMember(member string) bool {
-	if member == "" || len(member) > 256 || strings.HasPrefix(member, ".") ||
-		strings.HasPrefix(member, "/") || strings.HasPrefix(member, "~") || strings.Contains(member, `\`) {
-		return false
-	}
-	for _, part := range strings.Split(member, "/") {
-		if part == "" || part == "." || part == ".." {
+	for i, value := range values {
+		if !productionDigestPattern.MatchString(value) || i > 0 && values[i-1] >= value {
 			return false
 		}
 	}

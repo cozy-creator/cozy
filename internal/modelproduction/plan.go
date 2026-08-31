@@ -4,9 +4,11 @@
 package modelproduction
 
 import (
+	"bytes"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"fmt"
 	"io"
 	"sort"
 
@@ -16,8 +18,10 @@ import (
 type JobPin struct {
 	Node          string
 	Callable      string
+	InstallID     string
 	Release       string
 	ReleaseDigest string
+	DescriptorID  string
 	Profile       string
 }
 
@@ -28,24 +32,53 @@ type SourceFile struct {
 }
 
 type Plan struct {
-	Destination      string
-	Release          string
-	Source           string
-	SourceSelection  string
-	SourceFiles      []SourceFile
-	InputLane        string
-	Producer         string
-	ProducerRelease  string
-	ProducerDigest   string
-	DescriptorDigest string
-	Production       *launch.ModelProduction
-	Jobs             []JobPin
+	Destination       string
+	Release           string
+	Source            string
+	SourceSelection   string
+	SourceLicense     string
+	SourceFiles       []SourceFile
+	InputLane         string
+	Producer          string
+	ProducerInstallID string
+	ProducerRelease   string
+	ProducerDigest    string
+	DescriptorDigest  string
+	Production        *launch.ModelProduction
+	Jobs              []JobPin
+	WorkerProfile     string
+	Resources         ResourceNeeds
+}
+
+type ResourceNeeds struct {
+	GPUCount int64 `json:"gpu_count"`
+	MinSM    int64 `json:"min_sm"`
+	VRAMGB   int64 `json:"vram_gb"`
+	RAMGB    int64 `json:"ram_gb"`
 }
 
 // Bytes is the restart record. It contains only immutable identities and
 // reviewed declarations; URLs, credentials, grants, workers, rentals, prices,
 // clocks, and attempts have no field.
 func (p Plan) Bytes() ([]byte, error) { return json.Marshal(p) }
+
+func Parse(data []byte) (Plan, error) {
+	var plan Plan
+	decoder := json.NewDecoder(bytes.NewReader(data))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(&plan); err != nil {
+		return plan, err
+	}
+	var trailing any
+	if err := decoder.Decode(&trailing); err != io.EOF {
+		return plan, fmt.Errorf("model production plan carries trailing JSON")
+	}
+	canonical, err := plan.Bytes()
+	if err != nil || !bytes.Equal(canonical, data) {
+		return plan, fmt.Errorf("model production plan is not the one canonical spelling")
+	}
+	return plan, nil
+}
 
 func (p Plan) Digest() (string, error) {
 	data, err := p.Bytes()
@@ -63,8 +96,9 @@ func (p Plan) ID() string {
 	hash := sha256.New()
 	for _, value := range []string{
 		"cozy-model-production/1", p.Destination, p.Release, p.Source,
-		p.SourceSelection, p.InputLane, p.Producer, p.ProducerRelease,
-		p.ProducerDigest, p.DescriptorDigest,
+		p.SourceSelection, p.SourceLicense, p.InputLane, p.Producer,
+		p.ProducerInstallID, p.ProducerRelease, p.ProducerDigest,
+		p.DescriptorDigest, p.WorkerProfile,
 	} {
 		_, _ = io.WriteString(hash, value)
 		_, _ = hash.Write([]byte{0})
@@ -77,11 +111,17 @@ func (p Plan) ID() string {
 	sort.Slice(jobs, func(i, j int) bool { return jobs[i].Node < jobs[j].Node })
 	for _, job := range jobs {
 		for _, value := range []string{
-			job.Node, job.Callable, job.Release, job.ReleaseDigest, job.Profile,
+			job.Node, job.Callable, job.InstallID, job.Release, job.ReleaseDigest,
+			job.DescriptorID, job.Profile,
 		} {
 			_, _ = io.WriteString(hash, value)
 			_, _ = hash.Write([]byte{0})
 		}
+	}
+	for _, value := range []int64{p.Resources.GPUCount, p.Resources.MinSM,
+		p.Resources.VRAMGB, p.Resources.RAMGB} {
+		_, _ = io.WriteString(hash, fmt.Sprint(value))
+		_, _ = hash.Write([]byte{0})
 	}
 	return "modelpub-" + hex.EncodeToString(hash.Sum(nil))
 }
