@@ -471,6 +471,16 @@ func publishProductionArtifact(ctx *Context, local *localclient.Client,
 	store *records.Store, plan modelproduction.Plan, rentalID string,
 	artifact records.ModelProductionArtifact,
 ) (productionManifest, *exit.Error) {
+	source := artifact.NodeName + "." + artifact.OutputSlot
+	contract, final := productionContract(plan, source)
+	if !final {
+		// Intermediate Manifests stay under the worker's adopted artifact root and
+		// feed the next node directly. Final lane closures contain their inherited
+		// bytes, so opening extra Hub publications here would add no durability to
+		// the release and would leave uncut prepared sessions behind.
+		return productionManifest{ID: artifact.ManifestID, Length: artifact.ManifestLength,
+			Evidence: base64.StdEncoding.EncodeToString(artifact.ReleaseEvidence)}, nil
+	}
 	if artifact.PublicationID != "" && artifact.State == "prepared" {
 		return productionManifest{ID: artifact.ManifestID, Length: artifact.ManifestLength,
 			Evidence: base64.StdEncoding.EncodeToString(artifact.ReleaseEvidence)}, nil
@@ -484,7 +494,7 @@ func publishProductionArtifact(ctx *Context, local *localclient.Client,
 	for _, object := range objects {
 		hubObjects = append(hubObjects, hub.Object{ID: object.ObjectID, Length: object.Length})
 	}
-	lane := productionLane(plan, artifact.NodeName+"."+artifact.OutputSlot)
+	lane := contract.LaneKey
 	publicationOperation := productionPublicationOperation(plan.ID(), artifact.NodeName,
 		artifact.OutputSlot)
 	reason := "cozy model publish " + plan.Destination + "@" + plan.Release
@@ -555,13 +565,11 @@ func publishProductionArtifact(ctx *Context, local *localclient.Client,
 			"Tensorhub finalized a different Manifest for %s.%s", artifact.NodeName,
 			artifact.OutputSlot)
 	}
-	if contract, final := productionContract(plan, artifact.NodeName+"."+artifact.OutputSlot); final {
-		if prepared.TopologyDigest != contract.TopologyDigest ||
-			!sameStrings(prepared.Contract.Encoding.Set, contract.Encodings) {
-			return productionManifest{}, exit.Named(exit.Conflict,
-				"model_production.contract_mismatch",
-				"Tensorhub-derived contract for lane %s does not match the reviewed production", lane)
-		}
+	if prepared.TopologyDigest != contract.TopologyDigest ||
+		!sameStrings(prepared.Contract.Encoding.Set, contract.Encodings) {
+		return productionManifest{}, exit.Named(exit.Conflict,
+			"model_production.contract_mismatch",
+			"Tensorhub-derived contract for lane %s does not match the reviewed production", lane)
 	}
 	if problem = store.MarkModelProductionArtifactPublished(plan.ID(), artifact.NodeName,
 		artifact.OutputSlot, prepared.PublishID); problem != nil {
@@ -576,29 +584,21 @@ func productionPublicationOperation(operationID, node, slot string) string {
 	return "model-artifact-" + hex.EncodeToString(sum[:])
 }
 
-func productionLane(plan modelproduction.Plan, source string) string {
-	for _, output := range plan.Production.Outputs {
-		if output.Source == source {
-			return output.LaneKey
-		}
-	}
-	sum := sha256.Sum256([]byte(source))
-	return "work-" + hex.EncodeToString(sum[:8])
-}
-
 func productionContract(plan modelproduction.Plan, source string) (
 	modelproductionContract, bool,
 ) {
 	for _, output := range plan.Production.Outputs {
 		if output.Source == source {
-			return modelproductionContract{TopologyDigest: output.RequiredContract.TopologyDigest,
-				Encodings: output.RequiredContract.Encodings}, true
+			return modelproductionContract{LaneKey: output.LaneKey,
+				TopologyDigest: output.RequiredContract.TopologyDigest,
+				Encodings:      output.RequiredContract.Encodings}, true
 		}
 	}
 	return modelproductionContract{}, false
 }
 
 type modelproductionContract struct {
+	LaneKey        string
 	TopologyDigest string
 	Encodings      []string
 }
