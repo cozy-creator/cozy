@@ -22,7 +22,6 @@ type JobPin struct {
 	Release       string
 	ReleaseDigest string
 	DescriptorID  string
-	Profile       string
 }
 
 type SourceFile struct {
@@ -46,7 +45,6 @@ type Plan struct {
 	DescriptorDigest  string
 	Production        *launch.ModelProduction
 	Jobs              []JobPin
-	WorkerProfile     string
 	Resources         ResourceNeeds
 }
 
@@ -98,7 +96,7 @@ func (p Plan) ID() string {
 		"cozy-model-production/1", p.Destination, p.Release, p.Source,
 		p.SourceSelection, p.SourceLicense, p.InputLane, p.Producer,
 		p.ProducerInstallID, p.ProducerRelease, p.ProducerDigest,
-		p.DescriptorDigest, p.WorkerProfile,
+		p.DescriptorDigest,
 	} {
 		_, _ = io.WriteString(hash, value)
 		_, _ = hash.Write([]byte{0})
@@ -112,7 +110,7 @@ func (p Plan) ID() string {
 	for _, job := range jobs {
 		for _, value := range []string{
 			job.Node, job.Callable, job.InstallID, job.Release, job.ReleaseDigest,
-			job.DescriptorID, job.Profile,
+			job.DescriptorID,
 		} {
 			_, _ = io.WriteString(hash, value)
 			_, _ = hash.Write([]byte{0})

@@ -24,7 +24,7 @@ func TestModelProductionOperationSurvivesRestartAndReplaysExactly(t *testing.T) 
 		DescriptorDigest: "sha256:" + strings.Repeat("e", 64),
 		Jobs: []modelproduction.JobPin{{Node: "full", Callable: "tensorhub/h3/assemble",
 			Release: "1.0.0", ReleaseDigest: "sha256:" + strings.Repeat("f", 64),
-			Profile: "torch2.13-cuda13"}},
+		}},
 	}
 	data, err := plan.Bytes()
 	must(t, err)

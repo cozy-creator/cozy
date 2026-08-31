@@ -390,8 +390,8 @@ func TestModelProductionOperationIdentity(t *testing.T) {
 		DescriptorDigest: "sha256:" + strings.Repeat("d", 64),
 		Production:       production,
 		Jobs: []modelproduction.JobPin{
-			{Node: "quantize", Callable: "tensorhub/quantize/fp8", Release: "1.2.0", ReleaseDigest: "sha256:" + strings.Repeat("e", 64), Profile: "torch2.13-cuda13"},
-			{Node: "assemble", Callable: "tensorhub/h3/assemble", Release: "1.0.0", ReleaseDigest: "sha256:" + strings.Repeat("f", 64), Profile: "torch2.13-cuda13"},
+			{Node: "quantize", Callable: "tensorhub/quantize/fp8", Release: "1.2.0", ReleaseDigest: "sha256:" + strings.Repeat("e", 64)},
+			{Node: "assemble", Callable: "tensorhub/h3/assemble", Release: "1.0.0", ReleaseDigest: "sha256:" + strings.Repeat("f", 64)},
 		},
 	}
 	reordered := base

@@ -14,6 +14,7 @@ import (
 	"github.com/cozy-creator/cozy/internal/modelproduction"
 	"github.com/cozy-creator/cozy/internal/modelsource"
 	"github.com/cozy-creator/cozy/internal/output"
+	"github.com/cozy-creator/cozy/internal/records"
 	"github.com/cozy-creator/cozy/internal/tfs"
 )
 
@@ -37,7 +38,6 @@ type producerPlan struct {
 	Descriptor    *launch.PackageDescriptor
 	Production    *launch.ModelProduction
 	Jobs          []modelproduction.JobPin
-	Profile       string
 	GPUCount      int64
 	Requires      []string
 	Needs         modelproduction.ResourceNeeds
@@ -94,7 +94,7 @@ func handleModelPublish(ctx *Context) *exit.Error {
 		plan.ProducerRelease = producer.Release
 		plan.ProducerDigest, plan.DescriptorDigest = producer.ReleaseDigest, producer.Descriptor.Digest
 		plan.Production, plan.Jobs = producer.Production, producer.Jobs
-		plan.WorkerProfile, plan.Resources = producer.Profile, producer.Needs
+		plan.Resources = producer.Needs
 	}
 	id := plan.ID()
 	if ctx.Inv.Bool("--dry-run") {
@@ -112,7 +112,6 @@ func handleModelPublish(ctx *Context) *exit.Error {
 				output.Field{K: "source_profiles", V: plan.SourceProfiles()},
 				output.Field{K: "nodes", V: len(producer.Jobs)},
 				output.Field{K: "lanes", V: plan.Lanes()},
-				output.Field{K: "worker_profile", V: producer.Profile},
 				output.Field{K: "gpu_count", V: producer.GPUCount},
 				output.Field{K: "requires", V: producer.Requires},
 			)
@@ -246,7 +245,7 @@ func resolveProducerPlan(ctx *Context, raw string) (*producerPlan, *exit.Error) 
 	}
 	var descriptor *launch.PackageDescriptor
 	if ctx.Inv.Bool("--rental") {
-		descriptor, problem = publishedPackageDescriptor(client(ctx), install)
+		descriptor, problem = publishedDescriptorForInstall(client(ctx), install)
 	} else {
 		var facts *launch.Facts
 		facts, problem = launch.Read(*install, ctx.Cfg.Home, ctx.Cfg.Tool())
@@ -281,7 +280,7 @@ func resolveProducerPlan(ctx *Context, raw string) (*producerPlan, *exit.Error) 
 		}
 		var nodeDescriptor *launch.PackageDescriptor
 		if ctx.Inv.Bool("--rental") {
-			nodeDescriptor, installProblem = publishedPackageDescriptor(client(ctx), nodeInstall)
+			nodeDescriptor, installProblem = publishedDescriptorForInstall(client(ctx), nodeInstall)
 		} else {
 			var facts *launch.Facts
 			facts, installProblem = launch.Read(*nodeInstall, ctx.Cfg.Home, ctx.Cfg.Tool())
@@ -299,17 +298,6 @@ func resolveProducerPlan(ctx *Context, raw string) (*producerPlan, *exit.Error) 
 		}
 		if validation := validateProductionInvocation(node, job); validation != nil {
 			return nil, validation
-		}
-		if nodeInstall.SelectionProfile == "" {
-			return nil, exit.Named(exit.Structural, "model_production_profile_absent",
-				"production job %s has no exact installed worker profile", node.Callable)
-		}
-		if plan.Profile == "" {
-			plan.Profile = nodeInstall.SelectionProfile
-		} else if plan.Profile != nodeInstall.SelectionProfile {
-			return nil, exit.Named(exit.Conflict, "model_production_profile_mismatch",
-				"production jobs select different worker profiles: %s and %s",
-				plan.Profile, nodeInstall.SelectionProfile)
 		}
 		gpu := max(node.Resources.GPUCount, job.Resources.GPUCount)
 		plan.GPUCount = max(plan.GPUCount, gpu)
@@ -331,7 +319,7 @@ func resolveProducerPlan(ctx *Context, raw string) (*producerPlan, *exit.Error) 
 		plan.Jobs = append(plan.Jobs, modelproduction.JobPin{
 			Node: node.Name, Callable: node.Callable, Release: nodeInstall.Version,
 			InstallID: nodeInstall.ID, ReleaseDigest: nodeInstall.SourceDigest,
-			DescriptorID: jobFacts.DescriptorID, Profile: nodeInstall.SelectionProfile,
+			DescriptorID: jobFacts.DescriptorID,
 		})
 	}
 	for token := range requires {
@@ -343,6 +331,40 @@ func resolveProducerPlan(ctx *Context, raw string) (*producerPlan, *exit.Error) 
 		return nil, problem
 	}
 	return plan, nil
+}
+
+func publishedDescriptorForInstall(c *hub.Client,
+	install *records.PackageInstall,
+) (*launch.PackageDescriptor, *exit.Error) {
+	if install.SourceKind != "tensorhub" || !install.Verified || install.SourceDigest == "" {
+		return nil, exit.Named(exit.Validation, "model_production.package_unpublished",
+			"production package %s is not one exact Tensorhub release", install.Package)
+	}
+	ref, problem := hub.ParseRef(install.Package)
+	if problem != nil {
+		return nil, problem
+	}
+	hctx, cancel := hub.Context()
+	defer cancel()
+	detail, problem := c.PackageRelease(hctx, ref, install.Version)
+	if problem != nil {
+		return nil, problem
+	}
+	if detail.Release.ReleaseDigest != install.SourceDigest ||
+		detail.Release.PackageDescriptorLength != int64(len(detail.PackageDescriptor)) {
+		return nil, exit.Named(exit.Conflict, "model_production.package_changed",
+			"Tensorhub package %s@%s no longer matches the installed exact release",
+			install.Package, install.Version)
+	}
+	descriptor, problem := launch.DecodeDescriptor(detail.PackageDescriptor)
+	if problem != nil {
+		return nil, problem
+	}
+	if descriptor.Digest != detail.Release.PackageDescriptorDigest {
+		return nil, exit.Named(exit.Conflict, "model_production.descriptor_changed",
+			"Tensorhub package descriptor does not match its release fact")
+	}
+	return descriptor, nil
 }
 
 var productionResourcePattern = regexp.MustCompile(`^(sm|vram|ram)([1-9][0-9]*)(\+|g)?$`)
