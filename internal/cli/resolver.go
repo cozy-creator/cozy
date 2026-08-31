@@ -1,6 +1,7 @@
 package cli
 
 import (
+	"context"
 	"sort"
 	"strings"
 	"sync"
@@ -14,6 +15,7 @@ import (
 	"github.com/cozy-creator/cozy/internal/launch"
 	"github.com/cozy-creator/cozy/internal/orchestrator"
 	"github.com/cozy-creator/cozy/internal/packagepublish"
+	"github.com/cozy-creator/cozy/internal/privatepackage"
 	"github.com/cozy-creator/cozy/internal/records"
 )
 
@@ -47,6 +49,38 @@ type Resolver struct {
 	Devices []string
 }
 
+// PreparePrivate freezes one editable install into exact wheels before any rental spend.
+func (r *Resolver) PreparePrivate(ctx context.Context, installID string) (privatepackage.Revision, *exit.Error) {
+	install, problem := r.store.Install(installID)
+	if problem != nil {
+		return privatepackage.Revision{}, problem
+	}
+	if install == nil {
+		return privatepackage.Revision{}, exit.New(exit.NotFound, "install %s does not exist", installID)
+	}
+	layout, problem := home.Open(r.cfg.Home)
+	if problem != nil {
+		return privatepackage.Revision{}, problem
+	}
+	return privatepackage.Stage(ctx, layout, *install)
+}
+
+// PrivateRevision reopens the exact staged wheel set a durable request already names.
+func (r *Resolver) PrivateRevision(installID, digest string) (privatepackage.Revision, *exit.Error) {
+	install, problem := r.store.Install(installID)
+	if problem != nil {
+		return privatepackage.Revision{}, problem
+	}
+	if install == nil {
+		return privatepackage.Revision{}, exit.New(exit.NotFound, "install %s does not exist", installID)
+	}
+	layout, problem := home.Open(r.cfg.Home)
+	if problem != nil {
+		return privatepackage.Revision{}, problem
+	}
+	return privatepackage.Open(layout, *install, digest)
+}
+
 // RefreshEditable is the daemon-owned pre-invocation fence for live source trees.
 // It snapshots the current tree, builds a complete replacement generation when it
 // moved, and swaps the active pin only after Runtime accepted the replacement.
@@ -68,15 +102,15 @@ func (r *Resolver) RefreshEditable(pkg string) (installID string, editable, chan
 			pkg, short12(current.ID)).
 			WithRemedy("%s: %s", cause.ErrName(), cause.Message)
 	}
-	pack, problem := packagepublish.PrepareFrom(current.SourceRef)
+	pack, problem := packagepublish.PrepareLocalFrom(current.SourceRef)
 	if problem != nil {
 		return refreshFailure(problem)
 	}
 	defer pack.Close()
-	if pack.Organization+"/"+pack.Name != current.Package || pack.Release != current.Version {
+	if "local/"+pack.Name != current.Package || pack.Release != current.Version {
 		return refreshFailure(exit.Named(exit.Conflict, "editable_identity_changed",
 			"editable metadata now names %s/%s@%s, not installed %s@%s",
-			pack.Organization, pack.Name, pack.Release, current.Package, current.Version).
+			"local", pack.Name, pack.Release, current.Package, current.Version).
 			WithRemedy("install the renamed package directory explicitly"))
 	}
 	digest, files, bytes, problem := pack.SourceIdentity()
@@ -104,7 +138,7 @@ func (r *Resolver) RefreshEditable(pkg string) (installID string, editable, chan
 		if current.SourceKind != "local" {
 			return current.ID, false, false, nil
 		}
-		if current.SourceRef != pack.Tree || current.Package != pack.Organization+"/"+pack.Name ||
+		if current.SourceRef != pack.Tree || current.Package != "local/"+pack.Name ||
 			current.Version != pack.Release {
 			return refreshFailure(exit.Named(exit.Conflict, "editable_refresh_raced",
 				"the active package changed while its editable source was being checked").

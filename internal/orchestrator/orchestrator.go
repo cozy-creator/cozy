@@ -31,6 +31,7 @@ import (
 	"github.com/cozy-creator/cozy/internal/config"
 	"github.com/cozy-creator/cozy/internal/exit"
 	"github.com/cozy-creator/cozy/internal/home"
+	"github.com/cozy-creator/cozy/internal/privatepackage"
 	"github.com/cozy-creator/cozy/internal/records"
 	pb "github.com/cozy-creator/cozy/protocol/cozy/worker/v1"
 )
@@ -109,6 +110,7 @@ type Launcher interface {
 	// the choice into the orchestrator, which resolves nothing.
 	ResolveJob(pkg, function string) (WorkerLaunchSpec, *exit.Error)
 	ResolveJobInstall(installID, function string) (WorkerLaunchSpec, *exit.Error)
+	PrivateRevision(installID, digest string) (privatepackage.Revision, *exit.Error)
 }
 
 type LogicalPackage struct {

@@ -41,6 +41,9 @@ func handleInstall(ctx *Context) *exit.Error {
 	if explicitPackageDirectory(ctx.Inv.Args[0]) {
 		return handleDirectoryInstall(ctx)
 	}
+	if ctx.Inv.Bool("--editable") {
+		return exit.Usagef("--editable requires an explicit package directory")
+	}
 	return handleRegistryInstall(ctx)
 }
 
@@ -57,7 +60,7 @@ func handleDirectoryInstall(ctx *Context) *exit.Error {
 		return exit.Usagef("an explicit package directory does not take registry or legacy source options").
 			WithRemedy("use `cozy package install %s` by itself", path)
 	}
-	pack, problem := packagepublish.PrepareFrom(path)
+	pack, problem := packagepublish.PrepareLocalFrom(path)
 	if problem != nil {
 		return problem
 	}
@@ -66,7 +69,7 @@ func handleDirectoryInstall(ctx *Context) *exit.Error {
 	if problem != nil {
 		return problem
 	}
-	ref, problem := install.ParseRef(pack.Organization + "/" + pack.Name)
+	ref, problem := install.ParseRef("local/" + pack.Name)
 	if problem != nil {
 		return problem
 	}

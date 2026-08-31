@@ -2,6 +2,7 @@ package api
 
 import (
 	"bytes"
+	"context"
 	"encoding/base64"
 	"encoding/json"
 	"io"
@@ -123,7 +124,7 @@ func (s *Server) submitJob(w http.ResponseWriter, r *http.Request) {
 			"use `cozy run --input-tree <ref>=<dir>`; this build exposes no browser tree-upload route")
 		return
 	}
-	spec, e := s.resolveJob(sub)
+	spec, e := s.resolveJob(r.Context(), sub)
 	if e != nil {
 		s.refuseTyped(w, r, e)
 		return
@@ -199,7 +200,7 @@ func (s *Server) submitJob(w http.ResponseWriter, r *http.Request) {
 // resolveJob turns package+function into the orchestrator's Submission. The
 // `job_descriptor_id` is resolved HERE, from the installed generation's own descriptor —
 // a client never names a digest, exactly as it never names a binding plan id.
-func (s *Server) resolveJob(sub JobSubmission) (orchestrator.Submission, *exit.Error) {
+func (s *Server) resolveJob(ctx context.Context, sub JobSubmission) (orchestrator.Submission, *exit.Error) {
 	out := orchestrator.Submission{
 		Kind: "job", Package: sub.Package, Entrypoint: sub.Function,
 		Payload: []byte(sub.Input), Org: strings.TrimSpace(sub.Org),
@@ -223,6 +224,13 @@ func (s *Server) resolveJob(sub JobSubmission) (orchestrator.Submission, *exit.E
 			"a pinned remote worker requires rental authorization")
 	}
 	if out.Rental {
+		refreshed, editable, _, refreshProblem := s.refreshPackage(sub.Package)
+		if refreshProblem != nil {
+			return out, refreshProblem
+		}
+		if editable {
+			return s.resolvePrivateJob(ctx, sub, out, refreshed)
+		}
 		if sub.InstallID != "" || sub.Release == "" || sub.ReleaseDigest == "" || len(sub.Trees) > 0 {
 			return out, exit.Named(exit.Validation, "rental.job_release_incomplete",
 				"remote jobs require one exact published release and no local input trees")
@@ -290,6 +298,45 @@ func (s *Server) resolveJob(sub JobSubmission) (orchestrator.Submission, *exit.E
 		}
 		out.Trees = append(out.Trees, ref+"="+abs)
 	}
+	return out, nil
+}
+
+func (s *Server) resolvePrivateJob(ctx context.Context, sub JobSubmission,
+	out orchestrator.Submission, installID string,
+) (orchestrator.Submission, *exit.Error) {
+	if len(sub.Trees) > 0 {
+		return out, exit.Named(exit.Validation, "rental.job_local_tree_unsupported",
+			"remote jobs cannot grant directories from the Creator host")
+	}
+	spec, problem := s.packages.ResolveInstall(installID)
+	if problem != nil || spec.Placement.Package != sub.Package {
+		if problem != nil {
+			return out, problem
+		}
+		return out, exit.Named(exit.Conflict, "install_package_mismatch",
+			"install %s serves %s, not %s", installID, spec.Placement.Package, sub.Package)
+	}
+	jobs, problem := s.packages.JobsInstall(installID)
+	if problem != nil {
+		return out, problem
+	}
+	for _, job := range jobs {
+		if job.Name != sub.Function {
+			continue
+		}
+		out.PlanID, out.Outputs = job.DescriptorID, job.Outputs
+		out.ArtifactOutputs, out.JobGPUCount = job.ArtifactOutputs, job.GPUCount
+	}
+	if out.PlanID == "" {
+		return out, exit.Named(exit.NotFound, "unknown_job",
+			"%s registers no job named %q", sub.Package, sub.Function)
+	}
+	revision, problem := s.packages.PreparePrivate(ctx, installID)
+	if problem != nil {
+		return out, problem
+	}
+	out.InstallID = installID
+	out.Release, out.ReleaseDigest = revision.Release, revision.Digest
 	return out, nil
 }
 

@@ -270,8 +270,9 @@ var WorkerControl_ServiceDesc = grpc.ServiceDesc{
 }
 
 const (
-	RuntimePreparation_PreparePackageSet_FullMethodName  = "/cozy.worker.v1.RuntimePreparation/PreparePackageSet"
-	RuntimePreparation_PrepareModelSource_FullMethodName = "/cozy.worker.v1.RuntimePreparation/PrepareModelSource"
+	RuntimePreparation_PreparePackageSet_FullMethodName     = "/cozy.worker.v1.RuntimePreparation/PreparePackageSet"
+	RuntimePreparation_PrepareModelSource_FullMethodName    = "/cozy.worker.v1.RuntimePreparation/PrepareModelSource"
+	RuntimePreparation_PreparePrivatePackage_FullMethodName = "/cozy.worker.v1.RuntimePreparation/PreparePrivatePackage"
 )
 
 // RuntimePreparationClient is the client API for RuntimePreparation service.
@@ -284,6 +285,7 @@ const (
 type RuntimePreparationClient interface {
 	PreparePackageSet(ctx context.Context, in *PreparePackageSetRequest, opts ...grpc.CallOption) (*PreparePackageSetResult, error)
 	PrepareModelSource(ctx context.Context, in *PrepareModelSourceRequest, opts ...grpc.CallOption) (*PrepareModelSourceResult, error)
+	PreparePrivatePackage(ctx context.Context, in *PreparePrivatePackageRequest, opts ...grpc.CallOption) (*PreparePackageSetResult, error)
 }
 
 type runtimePreparationClient struct {
@@ -314,6 +316,16 @@ func (c *runtimePreparationClient) PrepareModelSource(ctx context.Context, in *P
 	return out, nil
 }
 
+func (c *runtimePreparationClient) PreparePrivatePackage(ctx context.Context, in *PreparePrivatePackageRequest, opts ...grpc.CallOption) (*PreparePackageSetResult, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(PreparePackageSetResult)
+	err := c.cc.Invoke(ctx, RuntimePreparation_PreparePrivatePackage_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 // RuntimePreparationServer is the server API for RuntimePreparation service.
 // All implementations must embed UnimplementedRuntimePreparationServer
 // for forward compatibility.
@@ -324,6 +336,7 @@ func (c *runtimePreparationClient) PrepareModelSource(ctx context.Context, in *P
 type RuntimePreparationServer interface {
 	PreparePackageSet(context.Context, *PreparePackageSetRequest) (*PreparePackageSetResult, error)
 	PrepareModelSource(context.Context, *PrepareModelSourceRequest) (*PrepareModelSourceResult, error)
+	PreparePrivatePackage(context.Context, *PreparePrivatePackageRequest) (*PreparePackageSetResult, error)
 	mustEmbedUnimplementedRuntimePreparationServer()
 }
 
@@ -339,6 +352,9 @@ func (UnimplementedRuntimePreparationServer) PreparePackageSet(context.Context, 
 }
 func (UnimplementedRuntimePreparationServer) PrepareModelSource(context.Context, *PrepareModelSourceRequest) (*PrepareModelSourceResult, error) {
 	return nil, status.Error(codes.Unimplemented, "method PrepareModelSource not implemented")
+}
+func (UnimplementedRuntimePreparationServer) PreparePrivatePackage(context.Context, *PreparePrivatePackageRequest) (*PreparePackageSetResult, error) {
+	return nil, status.Error(codes.Unimplemented, "method PreparePrivatePackage not implemented")
 }
 func (UnimplementedRuntimePreparationServer) mustEmbedUnimplementedRuntimePreparationServer() {}
 func (UnimplementedRuntimePreparationServer) testEmbeddedByValue()                            {}
@@ -397,6 +413,24 @@ func _RuntimePreparation_PrepareModelSource_Handler(srv interface{}, ctx context
 	return interceptor(ctx, in, info, handler)
 }
 
+func _RuntimePreparation_PreparePrivatePackage_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(PreparePrivatePackageRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(RuntimePreparationServer).PreparePrivatePackage(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: RuntimePreparation_PreparePrivatePackage_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(RuntimePreparationServer).PreparePrivatePackage(ctx, req.(*PreparePrivatePackageRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
 // RuntimePreparation_ServiceDesc is the grpc.ServiceDesc for RuntimePreparation service.
 // It's only intended for direct use with grpc.RegisterService,
 // and not to be introspected or modified (even as a copy)
@@ -411,6 +445,10 @@ var RuntimePreparation_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "PrepareModelSource",
 			Handler:    _RuntimePreparation_PrepareModelSource_Handler,
+		},
+		{
+			MethodName: "PreparePrivatePackage",
+			Handler:    _RuntimePreparation_PreparePrivatePackage_Handler,
 		},
 	},
 	Streams:  []grpc.StreamDesc{},
