@@ -103,7 +103,6 @@ func emitInstallResult(ctx *Context, l home.Layout, st *records.Store, res *inst
 		{K: "link_mode", V: g.LinkMode}, {K: "packages", V: g.Packages},
 		{K: "closure", V: strings.ReplaceAll(g.Closure, "\n", " ")},
 		{K: "package_descriptor", V: g.PackageDescriptor},
-		{K: "profile", V: g.SelectionProfile},
 		{K: "placement_set", V: g.PlacementSetDigest},
 	}
 	if res.Idempotent {
@@ -161,7 +160,6 @@ func handleLs(ctx *Context) *exit.Error {
 			"packages":           fmt.Sprintf("%d", g.Packages),
 			"closure":            strings.ReplaceAll(g.Closure, "\n", " "),
 			"package_descriptor": g.PackageDescriptor,
-			"profile":            g.SelectionProfile,
 			"placement_set":      g.PlacementSetDigest,
 			"source":             g.SourceKind + " " + g.SourceRef,
 			"verified":           fmt.Sprintf("%t", g.Verified),

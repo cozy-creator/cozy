@@ -4,19 +4,15 @@ import (
 	"context"
 	"os"
 	"path/filepath"
-	"runtime"
-	"strconv"
 	"strings"
 	"sync"
 
 	"github.com/cozy-creator/cozy/internal/canonical"
 	"github.com/cozy-creator/cozy/internal/exit"
 	"github.com/cozy-creator/cozy/internal/home"
-	"github.com/cozy-creator/cozy/internal/hostgpu"
 	"github.com/cozy-creator/cozy/internal/hub"
 	"github.com/cozy-creator/cozy/internal/install"
 	"github.com/cozy-creator/cozy/internal/transfer"
-	pb "github.com/cozy-creator/cozy/protocol/cozy/worker/v1"
 )
 
 func handleRegistryInstall(ctx *Context) *exit.Error {
@@ -28,11 +24,7 @@ func handleRegistryInstall(ctx *Context) *exit.Error {
 	hctx, cancel := hub.LongContext()
 	defer cancel()
 	packagePublishStatus(ctx, "Resolving %s...", ref.String())
-	target, problem := localPackageInstallTarget(ctx)
-	if problem != nil {
-		return problem
-	}
-	plan, problem := c.PackageDownloads(hctx, ref, release, target)
+	plan, problem := c.PackageDownloads(hctx, ref, release)
 	if problem != nil {
 		return problem
 	}
@@ -40,10 +32,10 @@ func handleRegistryInstall(ctx *Context) *exit.Error {
 		return exit.Internalf("Tensorhub returned a changed or absent package release")
 	}
 	release = plan.Release
-	releaseDigest, problem := selectedReleaseDigest(plan.PlacementSet, ref.String(), release)
-	if problem != nil {
-		return problem
+	if _, err := canonical.Raw(plan.ReleaseDigest); err != nil {
+		return exit.Internalf("Tensorhub returned an invalid release digest")
 	}
+	releaseDigest := plan.ReleaseDigest
 	existingLayout, existing, _, problem := open(ctx.Cfg, false)
 	if problem != nil {
 		return problem
@@ -53,8 +45,7 @@ func handleRegistryInstall(ctx *Context) *exit.Error {
 		existing.Close()
 		return problem
 	}
-	if generation != nil && generation.SourceDigest == releaseDigest &&
-		generation.PlacementSetDigest == plan.PlacementSet.Digest {
+	if generation != nil && generation.SourceDigest == releaseDigest {
 		defer existing.Close()
 		return emitInstallResult(ctx, existingLayout, existing, &install.Result{Gen: *generation, Idempotent: true})
 	}
@@ -96,48 +87,6 @@ func handleRegistryInstall(ctx *Context) *exit.Error {
 	return emitInstallResult(ctx, layout, st, result)
 }
 
-func localPackageInstallTarget(ctx *Context) (hub.PackageInstallTarget, *exit.Error) {
-	target := hub.PackageInstallTarget{
-		Accelerator: "cpu", OS: runtime.GOOS, Arch: packageInstallArchitecture(runtime.GOARCH),
-	}
-	inventory := hostgpu.Probe(ctx.Cfg)
-	if len(inventory.GPUs) == 0 {
-		return target, nil
-	}
-	gpu := inventory.GPUs[0]
-	for _, candidate := range inventory.GPUs[1:] {
-		if gpuCapability(candidate) > gpuCapability(gpu) ||
-			gpuCapability(candidate) == gpuCapability(gpu) && candidate.Index < gpu.Index {
-			gpu = candidate
-		}
-	}
-	if gpu.DriverCUDAVersion == "" {
-		return target, exit.Named(exit.Unavailable, "local_gpu.compatibility_unknown",
-			"the local NVIDIA driver did not report its CUDA compatibility").
-			WithRemedy("check that `nvidia-smi` runs successfully, then retry the install")
-	}
-	target.Accelerator = "nvidia"
-	target.DriverCUDA = gpu.DriverCUDAVersion
-	target.ComputeCapability = gpu.ComputeCapability
-	return target, nil
-}
-
-func packageInstallArchitecture(arch string) string {
-	switch arch {
-	case "amd64":
-		return "x86"
-	case "arm64":
-		return "aarch64"
-	default:
-		return arch
-	}
-}
-
-func gpuCapability(gpu hostgpu.GPU) int {
-	value, _ := strconv.Atoi(strings.TrimPrefix(gpu.SM, "sm_"))
-	return value
-}
-
 func registryPackageRef(value, release string) (hub.Ref, string, *exit.Error) {
 	name := strings.TrimSpace(value)
 	if strings.Contains(name, "@") {
@@ -155,20 +104,15 @@ func registryPackageRef(value, release string) (hub.Ref, string, *exit.Error) {
 func downloadPackageInstallPlan(ctx context.Context, cli *Context, scratch string, ref hub.Ref,
 	release, releaseDigest string, plan hub.PackageDownloadPlan,
 ) (*install.PublishedSource, *exit.Error) {
-	if plan.Profile == "" || len(plan.Downloads) == 0 || len(plan.Downloads) > 20_033 {
+	if len(plan.Downloads) == 0 || len(plan.Downloads) > 33 {
 		return nil, exit.Internalf("Tensorhub returned an invalid package install plan")
 	}
 	published := &install.PublishedSource{
 		Package: ref.String(), Release: release, SourceDigest: releaseDigest,
-		Artifacts: map[string]string{},
-		Selection: install.Selection{
-			Profile:            plan.Profile,
-			PlacementSet:       install.ExactDocument{Bytes: plan.PlacementSet.CanonicalBytes, Digest: plan.PlacementSet.Digest, Length: plan.PlacementSet.Length},
-			PackageDescriptor:  install.ExactDocument{Bytes: plan.PackageDescriptor.CanonicalBytes, Digest: plan.PackageDescriptor.Digest, Length: plan.PackageDescriptor.Length},
-			Qualification:      install.ExactDocument{Bytes: plan.Qualification.CanonicalBytes, Digest: plan.Qualification.Digest, Length: plan.Qualification.Length},
-			EnvironmentReceipt: install.ExactDocument{Bytes: plan.EnvironmentReceipt.CanonicalBytes, Digest: plan.EnvironmentReceipt.Digest, Length: plan.EnvironmentReceipt.Length},
-			WheelhouseManifest: install.ExactDocument{Bytes: plan.WheelhouseManifest.CanonicalBytes, Digest: plan.WheelhouseManifest.Digest, Length: plan.WheelhouseManifest.Length},
-		},
+		Selection: install.Selection{PackageDescriptor: install.ExactDocument{
+			Bytes: plan.PackageDescriptor.CanonicalBytes, Digest: plan.PackageDescriptor.Digest,
+			Length: plan.PackageDescriptor.Length,
+		}},
 	}
 	seen := map[string]bool{}
 	type job struct {
@@ -185,20 +129,19 @@ func downloadPackageInstallPlan(ctx context.Context, cli *Context, scratch strin
 			}
 			dst = filepath.Join(scratch, "wheels", download.Path)
 			if download.Kind == "project_wheel" {
-				if published.ProjectWheel != "" {
+				if published.ProjectWheel.Path != "" {
 					return nil, exit.Internalf("Tensorhub returned more than one project wheel")
 				}
-				published.ProjectWheel = dst
-				published.ProjectWheelDigest = download.Digest
+				published.ProjectWheel = install.PublishedWheel{Digest: download.Digest,
+					Distribution: download.Distribution, Filename: download.Path,
+					ImportRoots: append([]string(nil), download.ImportRoots...), Length: download.Length,
+					Path: dst, Tags: append([]string(nil), download.Tags...), Version: download.Version}
 			} else {
-				published.Wheels = append(published.Wheels, dst)
+				published.Wheels = append(published.Wheels, install.PublishedWheel{Digest: download.Digest,
+					Distribution: download.Distribution, Filename: download.Path,
+					ImportRoots: append([]string(nil), download.ImportRoots...), Length: download.Length,
+					Path: dst, Tags: append([]string(nil), download.Tags...), Version: download.Version})
 			}
-		case "artifact":
-			name := strings.TrimPrefix(download.Digest, "sha256:")
-			if len(name) != 64 || download.Path != name || filepath.Base(download.Path) != download.Path {
-				return nil, exit.Internalf("Tensorhub returned unsafe package artifact path %q", download.Path)
-			}
-			dst = filepath.Join(scratch, "artifacts", name)
 		default:
 			return nil, exit.Internalf("Tensorhub returned unknown package file kind %q", download.Kind)
 		}
@@ -208,14 +151,8 @@ func downloadPackageInstallPlan(ctx context.Context, cli *Context, scratch strin
 		seen[dst] = true
 		jobs = append(jobs, job{download: download, dst: dst})
 	}
-	if published.ProjectWheel == "" {
+	if published.ProjectWheel.Path == "" {
 		return nil, exit.Internalf("Tensorhub package install plan has no project wheel")
-	}
-	set, err := canonical.Read(plan.PlacementSet.CanonicalBytes, &pb.PlacementSet{})
-	if err != nil || len(set.List("placements")) != 1 ||
-		set.List("placements")[0].Sub("package").Sub("project_wheel").Sub("ref").Str("digest") != published.ProjectWheelDigest {
-		return nil, exit.Named(exit.Conflict, "package_selection_project_wheel_mismatch",
-			"Tensorhub project wheel download does not match the selected PlacementSet")
 	}
 	queue := make(chan job, len(jobs))
 	results := make(chan *exit.Error, len(jobs))
@@ -253,29 +190,8 @@ func downloadPackageInstallPlan(ctx context.Context, cli *Context, scratch strin
 		return nil, firstProblem
 	}
 	for _, item := range jobs {
-		published.Artifacts[item.download.Digest] = item.dst
 		published.Files++
 		published.Bytes += item.download.Length
 	}
 	return published, nil
-}
-
-func selectedReleaseDigest(document hub.ExactDocument, pkg, release string) (string, *exit.Error) {
-	set, err := canonical.Read(document.CanonicalBytes, &pb.PlacementSet{})
-	if err != nil || len(set.List("placements")) != 1 {
-		return "", exit.Named(exit.Structural, "package_selection_placement_invalid",
-			"Tensorhub returned an invalid single-package PlacementSet")
-	}
-	fact := set.List("placements")[0].Sub("package")
-	digest := fact.Str("release_digest")
-	if fact.Str("package") != pkg || fact.Str("release") != release {
-		return "", exit.Named(exit.Conflict, "package_selection_release_mismatch",
-			"Tensorhub selected %s@%s while %s@%s was requested",
-			fact.Str("package"), fact.Str("release"), pkg, release)
-	}
-	if _, err := canonical.Raw(digest); err != nil {
-		return "", exit.Named(exit.Structural, "package_selection_release_digest_invalid",
-			"Tensorhub selected an invalid release digest")
-	}
-	return digest, nil
 }

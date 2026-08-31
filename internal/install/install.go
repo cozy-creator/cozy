@@ -49,16 +49,25 @@ type LocalSource struct {
 }
 
 type PublishedSource struct {
-	Artifacts          map[string]string
-	Bytes              int64
-	Files              int
-	Package            string
-	ProjectWheel       string
-	ProjectWheelDigest string
-	Release            string
-	SourceDigest       string
-	Wheels             []string
-	Selection          Selection
+	Bytes        int64
+	Files        int
+	Package      string
+	ProjectWheel PublishedWheel
+	Release      string
+	SourceDigest string
+	Wheels       []PublishedWheel
+	Selection    Selection
+}
+
+type PublishedWheel struct {
+	Digest       string
+	Distribution string
+	Filename     string
+	ImportRoots  []string
+	Length       int64
+	Path         string
+	Tags         []string
+	Version      string
 }
 
 type ExactDocument struct {
@@ -68,78 +77,23 @@ type ExactDocument struct {
 }
 
 type Selection struct {
-	Profile            string
-	PlacementSet       ExactDocument
-	PackageDescriptor  ExactDocument
-	Qualification      ExactDocument
-	EnvironmentReceipt ExactDocument
-	WheelhouseManifest ExactDocument
+	PackageDescriptor ExactDocument
 }
 
-func persistSelection(genDir string, gen *records.PackageInstall, published *PublishedSource) *exit.Error {
-	selection := published.Selection
-	if selection.Profile == "" {
-		return exit.Named(exit.Structural, "package_selection_missing",
-			"published install has no selected compatibility profile")
+func validatePublished(gen records.PackageInstall, published *PublishedSource) *exit.Error {
+	descriptor := published.Selection.PackageDescriptor
+	digest, err := canonical.Raw(descriptor.Digest)
+	if err != nil || descriptor.Length != int64(len(descriptor.Bytes)) ||
+		!bytes.Equal(canonical.Digest(descriptor.Bytes), digest) {
+		return exit.Named(exit.Conflict, "package_descriptor_identity_mismatch",
+			"published descriptor bytes do not match their digest and length")
 	}
-	documents := []struct {
-		name   string
-		format string
-		exact  ExactDocument
-	}{
-		{"placement_set", "cozy.worker.v1.PlacementSet/1", selection.PlacementSet},
-		{"package_descriptor", "cozy.package.descriptor/1", selection.PackageDescriptor},
-		{"qualification", "cozy.runtime.Qualification/1", selection.Qualification},
-		{"environment_receipt", "cozy.runtime.EnvironmentReceipt/1", selection.EnvironmentReceipt},
-		{"wheelhouse_manifest", "WheelhouseManifest/1", selection.WheelhouseManifest},
+	if published.ProjectWheel.Distribution != gen.Package[strings.LastIndex(gen.Package, "/")+1:] ||
+		published.ProjectWheel.Version != gen.Version ||
+		published.ProjectWheel.Digest == "" || published.ProjectWheel.Path == "" {
+		return exit.Named(exit.Conflict, "package_wheel_release_mismatch",
+			"published project wheel does not name %s@%s", gen.Package, gen.Version)
 	}
-	cache := filepath.Join(genDir, "artifact-cache")
-	if err := os.MkdirAll(cache, 0o700); err != nil {
-		return exit.Internalf("cannot create the package artifact cache: %s", err)
-	}
-	for _, document := range documents {
-		digest, err := canonical.Raw(document.exact.Digest)
-		if err != nil || document.exact.Length != int64(len(document.exact.Bytes)) ||
-			!bytes.Equal(canonical.Digest(document.exact.Bytes), digest) {
-			return exit.Named(exit.Conflict, "package_selection_identity_mismatch",
-				"selected %s bytes do not match their digest and length", document.name)
-		}
-		object, err := canonical.ReadObject(document.exact.Bytes)
-		if err != nil || object.Str("format") != document.format {
-			return exit.Named(exit.Conflict, "package_selection_document_invalid",
-				"selected %s is not exact canonical %s bytes", document.name, document.format)
-		}
-		path := filepath.Join(cache, strings.TrimPrefix(document.exact.Digest, "sha256:"))
-		if err := os.WriteFile(path, document.exact.Bytes, 0o600); err != nil {
-			return exit.Internalf("cannot persist selected %s: %s", document.name, err)
-		}
-	}
-	set, err := canonical.Read(selection.PlacementSet.Bytes, &pb.PlacementSet{})
-	if err != nil || len(set.List("placements")) != 1 {
-		return exit.Named(exit.Conflict, "package_selection_placement_invalid",
-			"selected PlacementSet must carry exactly one placement")
-	}
-	placement := set.List("placements")[0]
-	packageFact := placement.Sub("package")
-	if packageFact.Str("package") != gen.Package || packageFact.Str("release") != gen.Version ||
-		packageFact.Str("release_digest") != gen.SourceDigest ||
-		packageFact.Sub("project_wheel").Sub("ref").Str("digest") != published.ProjectWheelDigest {
-		return exit.Named(exit.Conflict, "package_selection_release_mismatch",
-			"PlacementSet package facts do not name %s@%s with release digest %s",
-			gen.Package, gen.Version, gen.SourceDigest)
-	}
-	for name, exact := range map[string]ExactDocument{
-		"package_descriptor": selection.PackageDescriptor,
-		"qualification":      selection.Qualification,
-	} {
-		ref := placement.Sub(name)
-		if ref.Str("digest") != exact.Digest || ref.Int("length") != exact.Length {
-			return exit.Named(exit.Conflict, "package_selection_reference_mismatch",
-				"PlacementSet %s reference does not name the carried exact bytes", name)
-		}
-	}
-	gen.PlacementSetDigest = selection.PlacementSet.Digest
-	gen.SelectionProfile = selection.Profile
 	return nil
 }
 
@@ -189,7 +143,7 @@ func Run(l home.Layout, st *records.Store, req Request) (*Result, *exit.Error) {
 	switch {
 	case req.Published != nil:
 		if req.Published.Package == "" || req.Published.Release == "" || req.Published.SourceDigest == "" ||
-			req.Published.ProjectWheel == "" {
+			req.Published.ProjectWheel.Path == "" {
 			return fail(exit.Internalf("published package source is incomplete"))
 		}
 		sourceDir = genDir
@@ -198,7 +152,7 @@ func Run(l home.Layout, st *records.Store, req Request) (*Result, *exit.Error) {
 		}
 		gen.SourceKind, gen.SourceRef, gen.SourceDigest = "tensorhub", req.Published.Package+"@"+req.Published.Release, req.Published.SourceDigest
 		gen.Package, gen.Version, gen.ProjectDir = req.Published.Package, req.Published.Release, genDir
-		if e := persistSelection(genDir, &gen, req.Published); e != nil {
+		if e := validatePublished(gen, req.Published); e != nil {
 			return fail(e)
 		}
 		res.Files, res.Bytes = req.Published.Files, req.Published.Bytes
@@ -267,24 +221,16 @@ func Run(l home.Layout, st *records.Store, req Request) (*Result, *exit.Error) {
 	var env *EnvironmentReceipt
 	var err *exit.Error
 	if req.Published != nil {
-		wheels := append([]string{req.Published.ProjectWheel}, req.Published.Wheels...)
-		manifest, manifestErr := canonical.ReadObject(req.Published.Selection.WheelhouseManifest.Bytes)
-		if manifestErr != nil {
-			return guard(exit.Named(exit.Structural, "published_wheelhouse_invalid",
-				"selected base worker image inventory is unreadable: %s", manifestErr))
+		wheels := []string{req.Published.ProjectWheel.Path}
+		for _, wheel := range req.Published.Wheels {
+			wheels = append(wheels, wheel.Path)
 		}
-		env, err = MaterializePublishedEnvironment(
-			manifest.Sub("compatibility_profile").Str("python_abi"), venvDir, wheels)
+		env, err = MaterializePublishedEnvironment("cp312", venvDir, wheels)
 	} else {
 		env, err = MaterializeEnvironment(sourceDir, venvDir)
 	}
 	if err != nil {
 		return guard(err)
-	}
-	if req.Published != nil {
-		if e := persistPublishedArtifacts(genDir, req.Published.Artifacts); e != nil {
-			return guard(e)
-		}
 	}
 	gen.Python, gen.UV, gen.LockDigest = env.Python, env.UV, env.LockDigest
 	gen.Platform, gen.Extra, gen.LinkMode = env.Platform, env.Extra, env.LinkMode
@@ -292,9 +238,9 @@ func Run(l home.Layout, st *records.Store, req Request) (*Result, *exit.Error) {
 	res.Warnings = append(res.Warnings, env.Warnings...)
 	mark("venv")
 
-	// ---- descriptor: published installs consume the exact selected descriptor;
-	// editable installs ask their own Runtime for the descriptor and local-only
-	// DevelopmentPackage placement in one metadata-only operation.
+	// ---- descriptor: published installs retain the exact publication descriptor;
+	// the rented worker performs the actual install/import check. Editable installs
+	// ask their own Runtime for a local-only DevelopmentPackage placement.
 	var descriptor *launch.PackageDescriptor
 	var developmentSet ExactDocument
 	if req.Published != nil {
@@ -359,36 +305,6 @@ func Run(l home.Layout, st *records.Store, req Request) (*Result, *exit.Error) {
 	res.Gen, res.Superseded = gen, superseded
 	mark("activate")
 	return res, nil
-}
-
-func persistPublishedArtifacts(genDir string, artifacts map[string]string) *exit.Error {
-	cache := filepath.Join(genDir, "artifact-cache")
-	for digest, source := range artifacts {
-		if _, err := canonical.Raw(digest); err != nil {
-			return exit.Internalf("downloaded package artifact has invalid digest %q", digest)
-		}
-		target := filepath.Join(cache, strings.TrimPrefix(digest, "sha256:"))
-		if err := os.Link(source, target); err == nil {
-			continue
-		}
-		input, err := os.Open(source)
-		if err != nil {
-			return exit.Internalf("cannot reopen downloaded package artifact: %s", err)
-		}
-		output, err := os.OpenFile(target, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
-		if err == nil {
-			_, err = io.Copy(output, input)
-		}
-		closeInput, closeOutput := input.Close(), error(nil)
-		if output != nil {
-			closeOutput = output.Close()
-		}
-		if err != nil || closeInput != nil || closeOutput != nil {
-			_ = os.Remove(target)
-			return exit.Internalf("cannot retain downloaded package artifact")
-		}
-	}
-	return nil
 }
 
 // deriveDescriptor runs the generation's own Runtime over its source. Runtime emits the
@@ -467,7 +383,7 @@ func deriveDevelopmentPlacement(venvDir, sourceDir, artifactStore string, local 
 		development.Str("source_digest") != local.SourceDigest ||
 		placement.Sub("package_descriptor").Str("digest") != answer.PackageDescriptor.Digest ||
 		placement.Sub("package_descriptor").Int("length") != answer.PackageDescriptor.Length ||
-		placement.Sub("qualification").Str("digest") != "" || placement.Str("environment_digest") != "" {
+		placement.Str("environment_digest") != "" {
 		return nil, empty, exit.Named(exit.Structural, "editable_placement_invalid",
 			"cozy-runtime development PlacementSet mixes local source with published selection facts")
 	}

@@ -78,13 +78,12 @@ type DesiredPlacement struct {
 	// validates and relays them unchanged for both a local venv and a rented pod.
 	// Entrypoints is a read-only projection used for request selection; it never
 	// participates in identity.
-	PlacementSetDigest       string       `json:"placement_set_digest"`
-	PlacementSetBytes        []byte       `json:"placement_set_bytes"`
-	EnvironmentDigest        string       `json:"environment_digest"`
-	ConfigDigest             string       `json:"config_digest"`
-	WheelhouseManifestDigest string       `json:"wheelhouse_manifest_digest"`
-	Entrypoints              []Entrypoint `json:"entrypoints"`
-	PlacementIDValue         string       `json:"placement_id,omitempty"`
+	PlacementSetDigest string       `json:"placement_set_digest"`
+	PlacementSetBytes  []byte       `json:"placement_set_bytes"`
+	EnvironmentDigest  string       `json:"environment_digest"`
+	ConfigDigest       string       `json:"config_digest"`
+	Entrypoints        []Entrypoint `json:"entrypoints"`
+	PlacementIDValue   string       `json:"placement_id,omitempty"`
 	// Hidden names the entrypoints this placement deliberately does NOT serve (#572d).
 	// Recorded so an operator reading a placement can tell "no binding was staged" from
 	// "a binding was staged and broke".
@@ -119,19 +118,17 @@ func PlacementFromExact(pkg, installID, digest string, data []byte,
 	packageFact, development := row.Sub("package"), row.Sub("development")
 	placement := DesiredPlacement{
 		Package: pkg, InstallID: installID, PlacementIDValue: row.Str("placement_id"),
-		PackageRevisionDigest:    packageFact.Str("release_digest"),
-		Release:                  packageFact.Str("release"),
-		EnvironmentDigest:        row.Str("environment_digest"),
-		WheelhouseManifestDigest: row.Sub("environment").Sub("wheelhouse_manifest").Str("digest"),
-		PlacementSetDigest:       digest, PlacementSetBytes: append([]byte(nil), data...),
+		PackageRevisionDigest: packageFact.Str("release_digest"),
+		Release:               packageFact.Str("release"),
+		EnvironmentDigest:     row.Str("environment_digest"),
+		PlacementSetDigest:    digest, PlacementSetBytes: append([]byte(nil), data...),
 	}
 	if development.Str("source_digest") != "" {
 		placement.PackageRevisionDigest = development.Str("source_digest")
 		placement.Release = development.Str("release")
 		placement.SourceDigest = development.Str("source_digest")
 		if development.Str("package") != pkg || placement.Release == "" ||
-			placement.PlacementIDValue == "" || placement.EnvironmentDigest != "" ||
-			row.Sub("qualification").Str("digest") != "" {
+			placement.PlacementIDValue == "" || placement.EnvironmentDigest != "" {
 			return DesiredPlacement{}, exit.Named(exit.Structural, "development_placement_incomplete",
 				"development PlacementSet mixes local source with published selection facts")
 		}
@@ -144,9 +141,8 @@ func PlacementFromExact(pkg, installID, digest string, data []byte,
 	environment := row.Sub("environment")
 	if placement.SourceDigest == "" {
 		environmentIdentity := map[string]canonical.Value{
-			"format":              "cozy.worker.v1.Environment/1",
-			"wheelhouse_manifest": environment["wheelhouse_manifest"],
-			"wheels":              arrayOrEmpty(environment["wheels"]),
+			"format": "cozy.worker.v1.Environment/1",
+			"wheels": arrayOrEmpty(environment["wheels"]),
 		}
 		if !digestMatches(environmentIdentity, placement.EnvironmentDigest) {
 			return DesiredPlacement{}, exit.Named(exit.Conflict, "environment_identity_mismatch",
@@ -747,7 +743,7 @@ func (c *Orchestrator) ensureLogicalPackageReady(instanceID, rentalID string,
 			} else if !w.spawned.IsZero() {
 				quiet = time.Since(w.spawned)
 			}
-			ready := len(w.dispatchable) == 1 && w.placementID != "" &&
+			ready := w.dispatchable[logical.PlanID] && w.placementID != "" &&
 				w.serving == pb.ServingState_SERVING_STATE_DISPATCHABLE &&
 				w.acceptedRevision >= w.revision && w.convergedRevision >= w.revision
 			if ready && (!validDigest(w.packageRevisionDigest) || !validDigest(w.environmentDigest) ||
@@ -765,12 +761,11 @@ func (c *Orchestrator) ensureLogicalPackageReady(instanceID, rentalID string,
 						"worker resolved package release %s, not delegated %s",
 						w.packageRevisionDigest, logical.ReleaseDigest)
 				}
-				planID := keysOf(w.dispatchable)[0]
+				planID := logical.PlanID
 				w.spec.Placement = DesiredPlacement{
 					Package: pinnedPackage(logical.Package, rentalID), Release: logical.Release,
 					PackageRevisionDigest: w.packageRevisionDigest,
 					EnvironmentDigest:     w.environmentDigest, ConfigDigest: w.configDigest,
-					InstallID:        logical.InstallID,
 					PlacementIDValue: w.placementID,
 					Entrypoints: []Entrypoint{{Name: logical.Function, Digest: planID,
 						Outputs: append([]string(nil), logical.Outputs...)}},
@@ -779,15 +774,6 @@ func (c *Orchestrator) ensureLogicalPackageReady(instanceID, rentalID string,
 				spec := w.spec
 				c.mu.Unlock()
 				return spec, planID, nil
-			}
-			if w.acceptedRevision >= w.revision && w.convergedRevision >= w.revision &&
-				len(w.dispatchable) > 1 {
-				plans := strings.Join(keysOf(w.dispatchable), ", ")
-				c.mu.Unlock()
-				return WorkerLaunchSpec{}, "", exit.Named(exit.Conflict,
-					"rental.binding_ambiguous",
-					"package %s exposed multiple dispatchable bindings [%s]", logical.Package, plans).
-					WithRemedy("publish one weightless entrypoint for this initial package_set lane")
 			}
 		}
 		c.mu.Unlock()

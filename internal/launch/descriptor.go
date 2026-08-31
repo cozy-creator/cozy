@@ -43,12 +43,13 @@ const descriptorFormat = "cozy.package.descriptor/1"
 // PackageDescriptor is the closed PackageDescriptor/1 this host reads. Unknown fields refuse;
 // Raw is normalized canonical JSON for control-plane transport and semantic identity.
 type PackageDescriptor struct {
-	Format      string          `json:"format"`
-	Application string          `json:"application"`
-	Entrypoints []Entrypoint    `json:"entrypoints"`
-	Jobs        []Entrypoint    `json:"jobs"`
-	Digest      string          `json:"-"`
-	Raw         json.RawMessage `json:"-"`
+	Format           string            `json:"format"`
+	Application      string            `json:"application"`
+	Entrypoints      []Entrypoint      `json:"entrypoints"`
+	Jobs             []Entrypoint      `json:"jobs"`
+	ModelProductions []json.RawMessage `json:"model_productions"`
+	Digest           string            `json:"-"`
+	Raw              json.RawMessage   `json:"-"`
 }
 
 // Entrypoint is one callable surface: its request schema, its declared model slots, and
@@ -174,8 +175,13 @@ func exactKeys(raw json.RawMessage, required, optional []string) (map[string]jso
 }
 
 func validateClosedDescriptor(data []byte) error {
-	root, err := exactKeys(data, []string{"application", "entrypoints", "format", "jobs"}, nil)
+	root, err := exactKeys(data,
+		[]string{"application", "entrypoints", "format", "jobs", "model_productions"}, nil)
 	if err != nil {
+		return err
+	}
+	var productions []json.RawMessage
+	if err := json.Unmarshal(root["model_productions"], &productions); err != nil {
 		return err
 	}
 	for collection, kind := range map[string]string{"entrypoints": "entrypoint", "jobs": "job"} {

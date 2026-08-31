@@ -118,8 +118,6 @@ func (f *Facts) JobSpec(function string, devices []string) (orchestrator.WorkerL
 		ArtifactCache:   cache,
 		EnvironmentRoot: filepath.Join(f.Install.Dir, "venv"),
 		ArtifactStore:   filepath.Join(filepath.Dir(filepath.Dir(f.Install.Dir)), "cas"),
-		BaseManifest: filepath.Join(cache,
-			strings.TrimPrefix(placement.WheelhouseManifestDigest, "sha256:")),
 	}
 	return spec, facts, nil
 }

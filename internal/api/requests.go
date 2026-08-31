@@ -33,9 +33,11 @@ type Submission struct {
 	Input    json.RawMessage `json:"input"`
 	// InstallID is the immutable local install selected by the CLI. It is opaque to users;
 	// omitting it asks the daemon to resolve the active package pointer.
-	InstallID string   `json:"install_id,omitempty"`
-	Outputs   []string `json:"outputs,omitempty"`
-	PlanID    string   `json:"plan_id,omitempty"`
+	InstallID     string   `json:"install_id,omitempty"`
+	Release       string   `json:"release,omitempty"`
+	ReleaseDigest string   `json:"release_digest,omitempty"`
+	Outputs       []string `json:"outputs,omitempty"`
+	PlanID        string   `json:"plan_id,omitempty"`
 	// LocalAssets is the local API's out-of-band input set. Each source path is ingested into
 	// the daemon-owned immutable input store before the request row exists; it never
 	// crosses the worker protocol. The typed payload carries only its opaque reference.
@@ -194,7 +196,8 @@ func replaySubmission(sub Submission, recorded records.Request) orchestrator.Sub
 	return orchestrator.Submission{
 		Package: sub.Package, Entrypoint: sub.Function, Payload: payload,
 		Outputs: outputs, PlanID: planID, Worker: recorded.Worker, Assets: assets,
-		InstallID: sub.InstallID, Rental: sub.Rental,
+		InstallID: sub.InstallID, Release: sub.Release, ReleaseDigest: sub.ReleaseDigest,
+		Rental: sub.Rental,
 	}
 }
 
@@ -207,8 +210,9 @@ func submissionDigest(spec orchestrator.Submission) (string, *exit.Error) {
 		"package":    spec.Package,
 		"function":   spec.Entrypoint,
 		"install_id": spec.InstallID,
-		"input":      base64.StdEncoding.EncodeToString(spec.Payload),
-		"outputs":    strings.Join(spec.Outputs, ","),
+		"release":    spec.Release, "release_digest": spec.ReleaseDigest,
+		"input":   base64.StdEncoding.EncodeToString(spec.Payload),
+		"outputs": strings.Join(spec.Outputs, ","),
 	}
 	assets := make([]canonical.Value, 0, len(spec.Assets))
 	for _, asset := range spec.Assets {
@@ -285,7 +289,7 @@ func (s *Server) resolvePlan(sub Submission) (orchestrator.Submission, *exit.Err
 	out := orchestrator.Submission{
 		Package: sub.Package, Entrypoint: sub.Function, Payload: []byte(sub.Input),
 		Outputs: sub.Outputs, PlanID: sub.PlanID, Assets: sub.LocalAssets,
-		Rental: sub.Rental,
+		Release: sub.Release, ReleaseDigest: sub.ReleaseDigest, Rental: sub.Rental,
 	}
 	if len(out.Payload) == 0 {
 		out.Payload = []byte("{}")
@@ -293,22 +297,20 @@ func (s *Server) resolvePlan(sub Submission) (orchestrator.Submission, *exit.Err
 	// A --rental request validates only immutable package metadata here. The
 	// scheduler chooses and records its worker after admission.
 	if out.Rental {
-		if s.packages == nil || sub.InstallID == "" {
-			return out, exit.Unavailablef("remote execution requires one exact local package release pin")
+		if s.packages == nil || sub.InstallID != "" || sub.Release == "" || sub.ReleaseDigest == "" {
+			return out, exit.Unavailablef("remote execution requires one exact Tensorhub package release")
 		}
-		logical, e := s.packages.ResolveLogicalInstall(sub.InstallID, sub.Function)
+		logical, entrypoint, e := s.packages.ResolveRemoteRelease(
+			sub.Package, sub.Release, sub.ReleaseDigest, sub.Function)
 		if e != nil {
 			return out, e
 		}
-		if logical.Package != sub.Package {
+		if logical.Package != sub.Package || logical.Release != sub.Release ||
+			logical.ReleaseDigest != sub.ReleaseDigest {
 			return out, exit.Named(exit.Conflict, "install_package_mismatch",
-				"install %s serves %s, not %s", sub.InstallID, logical.Package, sub.Package)
+				"queued remote release does not match the resolved Tensorhub release")
 		}
-		entrypoint, e := s.packages.RemoteEntrypoint(sub.InstallID, sub.Function)
-		if e != nil {
-			return out, e
-		}
-		out.InstallID = sub.InstallID
+		out.PlanID = logical.PlanID
 		if len(out.Outputs) == 0 {
 			out.Outputs = logical.Outputs
 		}

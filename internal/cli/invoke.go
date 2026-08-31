@@ -19,9 +19,11 @@ import (
 	"time"
 
 	"github.com/cozy-creator/cozy/internal/api"
+	"github.com/cozy-creator/cozy/internal/canonical"
 	localapi "github.com/cozy-creator/cozy/internal/client"
 	"github.com/cozy-creator/cozy/internal/exit"
 	"github.com/cozy-creator/cozy/internal/home"
+	"github.com/cozy-creator/cozy/internal/hub"
 	"github.com/cozy-creator/cozy/internal/launch"
 	"github.com/cozy-creator/cozy/internal/orchestrator"
 	"github.com/cozy-creator/cozy/internal/output"
@@ -132,7 +134,7 @@ func handleRun(ctx *Context, target Target, ep *launch.Entrypoint) *exit.Error {
 	handle, e := c.Submit(api.Submission{
 		Package: target.Package, Function: target.Function, Input: input,
 		LocalAssets: assets, InstallID: target.InstallID,
-		Rental: managedRental,
+		Release: target.Release, ReleaseDigest: target.ReleaseDigest, Rental: managedRental,
 	}, key)
 	if e != nil {
 		return e
@@ -834,9 +836,11 @@ func mintKey() string {
 
 // Target is one installed package and optional callable selected for invocation.
 type Target struct {
-	Package   string
-	Function  string
-	InstallID string
+	Package       string
+	Function      string
+	InstallID     string
+	Release       string
+	ReleaseDigest string
 }
 
 // parseTarget reads the user-facing package grammar. Versions are flags, not path
@@ -870,16 +874,37 @@ func invocationTarget(ctx *Context) (Target, *launch.PackageDescriptor, *exit.Er
 		return Target{}, nil, problem
 	}
 	if ctx.Inv.Bool("--rental") {
-		install, problem := installedPackage(ctx, target.Package)
-		if problem != nil {
-			return Target{}, nil, problem.WithRemedy(
-				"install the exact release metadata locally until Tensorhub release detail supplies the descriptor")
-		}
-		descriptor, problem := publishedPackageDescriptor(client(ctx), install)
+		ref, problem := hub.ParseRef(target.Package)
 		if problem != nil {
 			return Target{}, nil, problem
 		}
-		target.InstallID = install.ID
+		hctx, cancel := hub.Context()
+		defer cancel()
+		catalog := client(ctx)
+		card, problem := catalog.PackageCard(hctx, ref)
+		if problem != nil {
+			return Target{}, nil, problem
+		}
+		release, problem := newestPackageRelease(card.Releases)
+		if problem != nil {
+			return Target{}, nil, problem
+		}
+		detail, problem := catalog.PackageRelease(hctx, ref, release)
+		if problem != nil {
+			return Target{}, nil, problem
+		}
+		descriptor, problem := launch.DecodeDescriptor(detail.PackageDescriptor)
+		if problem != nil || descriptor.Digest != detail.Release.PackageDescriptorDigest ||
+			detail.Release.PackageDescriptorLength != int64(len(detail.PackageDescriptor)) {
+			return Target{}, nil, exit.Named(exit.Conflict, "rental.package_descriptor_invalid",
+				"Tensorhub returned an invalid package descriptor")
+		}
+		if _, err := canonical.Raw(detail.Release.ReleaseDigest); err != nil ||
+			detail.Release.Release != release {
+			return Target{}, nil, exit.Named(exit.Conflict, "rental.package_release_invalid",
+				"Tensorhub returned no immutable package release identity")
+		}
+		target.Release, target.ReleaseDigest = release, detail.Release.ReleaseDigest
 		return target, descriptor, nil
 	}
 	facts, problem := generationFacts(ctx, target.Package)
@@ -894,6 +919,40 @@ func invocationTarget(ctx *Context) (Target, *launch.PackageDescriptor, *exit.Er
 	}
 	target.InstallID = facts.Install.ID
 	return target, facts.PackageDescriptor, nil
+}
+
+func newestPackageRelease(releases []hub.ReleaseSummary) (string, *exit.Error) {
+	best := ""
+	bestVersion := [3]int{-1, -1, -1}
+	for _, row := range releases {
+		if row.Yanked || row.YankedAt != "" {
+			continue
+		}
+		parts := strings.Split(row.Release, ".")
+		if len(parts) != 3 {
+			continue
+		}
+		var version [3]int
+		valid := true
+		for i, part := range parts {
+			value, err := strconv.Atoi(part)
+			if err != nil || value < 0 || strconv.Itoa(value) != part {
+				valid = false
+				break
+			}
+			version[i] = value
+		}
+		if valid && (version[0] > bestVersion[0] ||
+			version[0] == bestVersion[0] && version[1] > bestVersion[1] ||
+			version[0] == bestVersion[0] && version[1] == bestVersion[1] &&
+				version[2] > bestVersion[2]) {
+			best, bestVersion = row.Release, version
+		}
+	}
+	if best == "" {
+		return "", exit.New(exit.NotFound, "package has no non-yanked numeric release")
+	}
+	return best, nil
 }
 
 func emitFunctions(ctx *Context, target Target, descriptor *launch.PackageDescriptor) *exit.Error {

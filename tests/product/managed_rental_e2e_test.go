@@ -3,6 +3,7 @@ package producttest
 import (
 	"bytes"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -25,6 +26,7 @@ func TestRentalRunAcquiresCheapestOnceAndReleasesFailedPreAttempt(t *testing.T) 
 	var descriptor []byte
 	var descriptorDigest string
 	var rentalRequest map[string]any
+	var createReason, deleteReason string
 	posts, deletes := 0, 0
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		mu.Lock()
@@ -40,6 +42,15 @@ func TestRentalRunAcquiresCheapestOnceAndReleasesFailedPreAttempt(t *testing.T) 
 				},
 				"document": map[string]any{}, "package_descriptor": json.RawMessage(descriptor),
 			})
+		case r.Method == http.MethodGet && r.URL.Path == "/v1/packages/cozy/cozy-weightless-package":
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"package": map[string]any{"org": "cozy", "name": "cozy-weightless-package",
+					"created_at": "2026-08-30T00:00:00Z"},
+				"releases": []map[string]any{{"release": "1.0.0", "cut_at": "2026-08-30T00:00:00Z"}},
+			})
+		case strings.HasSuffix(r.URL.Path, "/download"):
+			t.Error("remote metadata resolution called the package download route")
+			http.Error(w, "download route must be worker-only in this flow", http.StatusInternalServerError)
 		case r.Method == http.MethodGet && r.URL.Path == "/v1/rental-skus":
 			_ = json.NewEncoder(w).Encode([]map[string]any{
 				{"name": "expensive", "accelerator_model": "GPU X", "compute_capability": "9.0", "vram_gb": 80, "price_usd_micros_per_hour": 900_000},
@@ -47,6 +58,7 @@ func TestRentalRunAcquiresCheapestOnceAndReleasesFailedPreAttempt(t *testing.T) 
 			})
 		case r.Method == http.MethodPost && r.URL.Path == "/v1/rentals":
 			posts++
+			createReason = r.Header.Get("X-Tensorhub-Reason")
 			if err := json.NewDecoder(r.Body).Decode(&rentalRequest); err != nil {
 				t.Error(err)
 			}
@@ -57,6 +69,7 @@ func TestRentalRunAcquiresCheapestOnceAndReleasesFailedPreAttempt(t *testing.T) 
 			})
 		case r.Method == http.MethodDelete && r.URL.Path == "/v1/rentals/pr-managed-e2e":
 			deletes++
+			deleteReason = r.Header.Get("X-Tensorhub-Reason")
 			w.WriteHeader(http.StatusNoContent)
 		case r.Method == http.MethodGet && r.URL.Path == "/v1/rentals/pr-managed-e2e":
 			state := "ready"
@@ -107,16 +120,7 @@ func TestRentalRunAcquiresCheapestOnceAndReleasesFailedPreAttempt(t *testing.T) 
 	decoded, problem := launch.DecodeDescriptor(descriptor)
 	fatal(t, problem)
 	descriptorDigest = decoded.Digest
-	published := local
-	published.ID = "published-managed-e2e"
-	published.SourceKind = "tensorhub"
-	published.SourceRef = weightlessRef + "@1.0.0"
-	published.SourceDigest = releaseDigest
-	published.Version = "1.0.0"
-	published.Verified = true
 	store, problem := records.Open(filepath.Join(root, "records.db"))
-	fatal(t, problem)
-	_, problem = store.Activate(published)
 	fatal(t, problem)
 	store.Close()
 	daemonPath := filepath.Join(root, "cozy-daemon")
@@ -172,10 +176,18 @@ func TestRentalRunAcquiresCheapestOnceAndReleasesFailedPreAttempt(t *testing.T) 
 	}
 	mu.Lock()
 	gotPosts, gotDeletes, body := posts, deletes, rentalRequest
+	gotCreateReason, gotDeleteReason := createReason, deleteReason
 	mu.Unlock()
-	if request == nil || request.Worker != "pr-managed-e2e" || gotPosts != 1 || gotDeletes != 1 ||
+	if request == nil || request.Worker != "pr-managed-e2e" || request.InstallID != "" ||
+		request.Release != "1.0.0" || request.PackageRevisionDigest != releaseDigest ||
+		gotPosts != 1 || gotDeletes != 1 ||
 		body["sku"] != "cheap" || body["max_cost_usd_micros"] != nil || body["max_duration_seconds"] != nil {
 		t.Fatalf("managed lifecycle request=%+v posts=%d deletes=%d body=%v", request, gotPosts, gotDeletes, body)
+	}
+	if gotCreateReason != "" || gotDeleteReason != "" ||
+		strings.Contains(fmt.Sprint(body), weightlessRef) {
+		t.Fatalf("managed rental leaked work identity in reason/body: create=%q delete=%q body=%v",
+			gotCreateReason, gotDeleteReason, body)
 	}
 	wantLines := map[string]bool{
 		"rentals: 0 remote machines running · $0.00/hour of $1.00/hour": false,

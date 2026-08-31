@@ -24,7 +24,7 @@ import (
 
 const weightlessRef = "cozy/cozy-weightless-package"
 const editableRuntimeFixtureSHA = "9e8409c0c68c6cae75209817ad47818770cde8db"
-const editableTensorFSFixtureSHA = "6b7ee6e5cfec5f34cdee0da9398ff8a91ce451b3"
+const editableTensorFSFixtureSHA = "7cdb63378c9358561f9e6c51e525231c32804fb2"
 
 func TestLiteralPayloadUsesOrdinaryScalarSyntax(t *testing.T) {
 	entrypoint := &launch.Entrypoint{
@@ -58,7 +58,6 @@ func TestPackageHasOneActiveVersion(t *testing.T) {
 	}
 	first := install("a", "1.0.0", 1)
 	second := install("b", "2.0.0", 2)
-	second.SelectionProfile = "torch2.13.0-cpu-cp312-linux-x86"
 	second.PlacementSetDigest = "sha256:" + strings.Repeat("b", 64)
 	if _, problem = store.Activate(first); problem != nil {
 		t.Fatal(problem)
@@ -71,8 +70,7 @@ func TestPackageHasOneActiveVersion(t *testing.T) {
 		t.Fatalf("active pins = %+v, %v", pins, problem)
 	}
 	_, active, problem := store.ActivePackage("cozy/example")
-	if problem != nil || active == nil || active.SelectionProfile != second.SelectionProfile ||
-		active.PlacementSetDigest != second.PlacementSetDigest {
+	if problem != nil || active == nil || active.PlacementSetDigest != second.PlacementSetDigest {
 		t.Fatalf("active selection = %+v, %v", active, problem)
 	}
 }
