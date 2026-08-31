@@ -519,7 +519,7 @@ func productionSourceManifests(store *records.Store, plan modelproduction.Plan) 
 	out := make(map[string]productionManifest, len(rows))
 	for _, row := range rows {
 		out[row.Slot] = productionManifest{ID: row.ManifestID, Length: row.ManifestLength,
-			Evidence: base64.StdEncoding.EncodeToString(row.ReleaseEvidence)}
+			Evidence: base64.StdEncoding.EncodeToString(row.CheckpointEvidence)}
 	}
 	return out, nil
 }
@@ -703,11 +703,11 @@ func publishProductionArtifact(runCtx context.Context, ctx *Context, local *loca
 		// bytes, so opening extra Hub publications here would add no durability to
 		// the release and would leave uncut prepared sessions behind.
 		return productionManifest{ID: artifact.ManifestID, Length: artifact.ManifestLength,
-			Evidence: base64.StdEncoding.EncodeToString(artifact.ReleaseEvidence)}, nil
+			Evidence: base64.StdEncoding.EncodeToString(artifact.CheckpointEvidence)}, nil
 	}
 	if artifact.PublicationID != "" && artifact.State == "prepared" {
 		return productionManifest{ID: artifact.ManifestID, Length: artifact.ManifestLength,
-			Evidence: base64.StdEncoding.EncodeToString(artifact.ReleaseEvidence)}, nil
+			Evidence: base64.StdEncoding.EncodeToString(artifact.CheckpointEvidence)}, nil
 	}
 	if problem := productionCancellation(runCtx, store, plan.ID()); problem != nil {
 		return productionManifest{}, problem
@@ -732,7 +732,7 @@ func publishProductionArtifact(runCtx context.Context, ctx *Context, local *loca
 	}
 	hctx, cancel := productionHubContext(runCtx)
 	opened, problem := client(ctx).OpenPublication(hctx, ref, publicationOperation,
-		plan.Release, lane, hubObjects, reason)
+		hubObjects, reason)
 	cancel()
 	if problem != nil {
 		if runCtx.Err() != nil {
@@ -798,10 +798,10 @@ func publishProductionArtifact(runCtx context.Context, ctx *Context, local *loca
 		return productionManifest{}, problem
 	}
 	hctx, cancel = productionHubContext(runCtx)
-	prepared, problem := client(ctx).FinalizePublication(hctx, ref, publicationOperation,
+	checkpoint, problem := client(ctx).FinalizePublication(hctx, ref, publicationOperation,
 		hub.FinalizePublicationRequest{ManifestID: artifact.ManifestID,
-			ManifestLength:        artifact.ManifestLength,
-			ReleaseEvidenceBase64: base64.StdEncoding.EncodeToString(artifact.ReleaseEvidence)}, reason)
+			ManifestLength:           artifact.ManifestLength,
+			CheckpointEvidenceBase64: base64.StdEncoding.EncodeToString(artifact.CheckpointEvidence)}, reason)
 	cancel()
 	if problem != nil {
 		if runCtx.Err() != nil {
@@ -813,25 +813,26 @@ func publishProductionArtifact(runCtx context.Context, ctx *Context, local *loca
 	if problem = productionCancellation(runCtx, store, plan.ID()); problem != nil {
 		return productionManifest{}, problem
 	}
-	if prepared.Manifest.SHA256 != strings.TrimPrefix(artifact.ManifestID, "sha256:") ||
-		prepared.Manifest.Length != artifact.ManifestLength {
+	if checkpoint.CheckpointID != artifact.ManifestID ||
+		checkpoint.Manifest.SHA256 != strings.TrimPrefix(artifact.ManifestID, "sha256:") ||
+		checkpoint.Manifest.Length != artifact.ManifestLength {
 		return productionManifest{}, exit.Named(exit.Conflict, "model_production.finalize_changed",
 			"Tensorhub finalized a different Manifest for %s.%s", artifact.StepName,
 			artifact.OutputSlot)
 	}
-	if prepared.TopologyDigest != contract.TopologyDigest ||
-		!sameStrings(prepared.Contract.Encoding.Set, contract.Encodings) {
+	if checkpoint.TopologyDigest != contract.TopologyDigest ||
+		!sameStrings(checkpoint.Contract.Encoding.Set, contract.Encodings) {
 		return productionManifest{}, exit.Named(exit.Conflict,
 			"model_production.contract_mismatch",
 			"Tensorhub-derived contract for lane %s does not match the reviewed production", lane)
 	}
 	if problem = store.MarkModelProductionArtifactPublished(plan.ID(), artifact.StepName,
-		artifact.OutputSlot, prepared.PublishID); problem != nil {
+		artifact.OutputSlot, checkpoint.PublishID); problem != nil {
 		return productionManifest{}, problem
 	}
 	progress.PublicationPrepared(lane)
 	return productionManifest{ID: artifact.ManifestID, Length: artifact.ManifestLength,
-		Evidence: base64.StdEncoding.EncodeToString(artifact.ReleaseEvidence)}, nil
+		Evidence: base64.StdEncoding.EncodeToString(artifact.CheckpointEvidence)}, nil
 }
 
 func productionPublicationOperation(operationID, step, slot string) string {
@@ -921,16 +922,15 @@ func cutProductionRelease(runCtx context.Context, ctx *Context, store *records.S
 	for _, artifact := range artifacts {
 		bySource[artifact.StepName+"."+artifact.OutputSlot] = artifact
 	}
-	publicationIDs := make([]string, 0, len(plan.Production.Outputs))
+	laneCheckpoints := make(map[string]string, len(plan.Production.Outputs))
 	for _, output := range plan.Production.Outputs {
 		artifact, ok := bySource[output.Source]
-		if !ok || artifact.PublicationID == "" {
+		if !ok || artifact.PublicationID == "" || artifact.ManifestID == "" {
 			return exit.Named(exit.Conflict, "model_production.output_not_prepared",
 				"required lane %s has no prepared publication", output.LaneKey)
 		}
-		publicationIDs = append(publicationIDs, artifact.PublicationID)
+		laneCheckpoints[output.LaneKey] = artifact.ManifestID
 	}
-	sort.Strings(publicationIDs)
 	lanes := plan.Lanes()
 	progress.ReleaseStarting(plan.Release, lanes)
 	ref, parseProblem := hub.ParseRef(plan.Destination)
@@ -938,7 +938,7 @@ func cutProductionRelease(runCtx context.Context, ctx *Context, store *records.S
 		return parseProblem
 	}
 	hctx, cancel := hub.LongContext()
-	cut, problem := client(ctx).CutRelease(hctx, ref, plan.Release, plan.ID(), publicationIDs,
+	cut, problem := client(ctx).CutRelease(hctx, ref, plan.Release, plan.ID(), laneCheckpoints,
 		"cozy model publish "+plan.Destination+"@"+plan.Release)
 	cancel()
 	if problem != nil {

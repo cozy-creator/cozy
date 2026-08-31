@@ -119,7 +119,7 @@ func (p *Publish) Run(ctx context.Context) (Result, *exit.Error) {
 	if evidenceRef.Org == "" {
 		evidenceRef = p.Ref
 	}
-	evidence, e := p.Tool.ReleaseEvidence(evidenceRef.Org, evidenceRef.Name, p.ManifestID,
+	evidence, e := p.Tool.CheckpointEvidence(evidenceRef.Org, evidenceRef.Name, p.ManifestID,
 		filepath.Join(p.Scratch, "repo-releases.jsonl"))
 	if e != nil {
 		return res, e
@@ -140,7 +140,7 @@ func (p *Publish) Run(ctx context.Context) (Result, *exit.Error) {
 		Length: manifestInfo.Size()}
 	finalize := hub.FinalizePublicationRequest{
 		ManifestID: p.ManifestID, ManifestLength: manifestInfo.Size(),
-		ReleaseEvidenceBase64: hub.B64(evidence),
+		CheckpointEvidenceBase64: hub.B64(evidence),
 	}
 	declared := make([]hub.Object, 0, len(objects)+1)
 	for _, o := range objects {
@@ -149,21 +149,19 @@ func (p *Publish) Run(ctx context.Context) (Result, *exit.Error) {
 	declared = append(declared, hub.Object{ID: p.ManifestID, Length: manifestInfo.Size()})
 	sort.Slice(declared, func(i, j int) bool { return declared[i].ID < declared[j].ID })
 	ms["declare"] = since(t0)
-	p.say("prepared %d known blob transfers (%s) from %s", len(declared), bytesOf(objects), p.ManifestID)
+	p.say("declared %d known blob transfers (%s) from %s", len(declared), bytesOf(objects), p.ManifestID)
 
 	// 2. Open under the caller-stable operation id. Reopening returns the same durable
-	//    publication, including a prepared or committed one whose results can replay.
+	//    publication, including a checkpointed one whose result can replay.
 	t0 = time.Now()
-	opened, e := p.Hub.OpenPublication(ctx, p.Ref, p.Session, p.Release, p.Lane, declared, p.Reason)
+	opened, e := p.Hub.OpenPublication(ctx, p.Ref, p.Session, declared, p.Reason)
 	if e != nil {
 		return res, e
 	}
 	ms["open"] = since(t0)
 	publication := opened.Publication
-	if publication.Operation != p.Session || publication.Release != p.Release ||
-		publication.LaneKey != p.Lane || publication.RequiredContract != "" ||
-		publication.State == "open" && publication.Lane != "" {
-		return res, exit.Internalf("publication reopened under different release coordinates")
+	if publication.Operation != p.Session {
+		return res, exit.Internalf("publication reopened under a different operation")
 	}
 	res.PublishID, res.Created, res.Session = publication.Operation, opened.Created, publication.Operation
 	verb := "resumed"
@@ -171,7 +169,7 @@ func (p *Publish) Run(ctx context.Context) (Result, *exit.Error) {
 		verb = "opened"
 	}
 	p.say("%s publication %s in state %s", verb, res.PublishID, publication.State)
-	if publication.State != "open" && publication.State != "prepared" && publication.State != "committed" {
+	if publication.State != "open" && publication.State != "checkpointed" {
 		return res, exit.New(exit.Conflict, "publication %s is %s", publication.Operation, publication.State).
 			WithRemedy("use a new model publication after repairing or abandoning the refused operation")
 	}
@@ -228,48 +226,43 @@ func (p *Publish) finalizeAndCut(ctx context.Context, request hub.FinalizePublic
 	res Result, ms map[string]int64,
 ) (Result, *exit.Error) {
 	t0 := time.Now()
-	prepared, e := p.Hub.FinalizePublication(ctx, p.Ref, res.PublishID, request, p.Reason)
+	checkpoint, e := p.Hub.FinalizePublication(ctx, p.Ref, res.PublishID, request, p.Reason)
 	if e != nil {
 		return res, e
 	}
 	ms["finalize"] = since(t0)
-	if prepared.PublishID != res.PublishID || prepared.Release != p.Release ||
-		prepared.Manifest != res.Manifest ||
-		prepared.ReleaseEvidenceBase64 != request.ReleaseEvidenceBase64 ||
-		prepared.State != "verified/prepared" || prepared.Objects != res.Totals.DeclaredObjects-1 ||
-		prepared.Bytes != res.Totals.DeclaredBytes-res.Manifest.Length {
-		return res, exit.Internalf("Tensorhub prepared a different publication identity")
+	if checkpoint.PublishID != res.PublishID || checkpoint.Manifest != res.Manifest ||
+		checkpoint.CheckpointID != p.ManifestID ||
+		checkpoint.CheckpointEvidenceBase64 != request.CheckpointEvidenceBase64 ||
+		checkpoint.State != "checkpointed" || checkpoint.Objects != res.Totals.DeclaredObjects-1 ||
+		checkpoint.Bytes != res.Totals.DeclaredBytes-res.Manifest.Length {
+		return res, exit.Internalf("Tensorhub retained a different checkpoint identity")
 	}
-	if prepared.Lane != p.Lane {
-		return res, exit.New(exit.Conflict,
-			"Tensorhub derived lane %q, not the requested %q", prepared.Lane, p.Lane).
-			WithRemedy("re-run with --lane %s", prepared.Lane)
+	res.Manifest, res.TopologyDigest, res.Verified = checkpoint.Manifest, checkpoint.TopologyDigest, checkpoint.Objects
+	if checkpoint.Duplicate {
+		p.say("this exact checkpoint was already retained")
 	}
-	res.Manifest, res.TopologyDigest, res.Verified = prepared.Manifest, prepared.TopologyDigest, prepared.Objects
-	if prepared.Duplicate {
-		p.say("this exact publication was already prepared")
-	}
-	p.say("Tensorhub verified %d declared objects and prepared lane %s", res.Verified, prepared.Lane)
+	p.say("Tensorhub verified %d declared objects and retained checkpoint %s", res.Verified, checkpoint.CheckpointID)
 
 	t0 = time.Now()
 	res.CutOperation = "cut-" + res.PublishID
 	cut, e := p.Hub.CutRelease(ctx, p.Ref, p.Release, res.CutOperation,
-		[]string{res.PublishID}, p.Reason)
+		map[string]string{p.Lane: checkpoint.CheckpointID}, p.Reason)
 	if e != nil {
 		return res, e
 	}
 	ms["cut"] = since(t0)
 	if cut.Operation != res.CutOperation || cut.Release != p.Release || len(cut.Lanes) != 1 ||
-		cut.Lanes[0].Lane != prepared.Lane || cut.Lanes[0].Manifest != prepared.Manifest ||
-		cut.Lanes[0].Publication != prepared.PublishID || cut.Lanes[0].Objects != prepared.Objects ||
-		cut.Lanes[0].Bytes != prepared.Bytes {
+		cut.Lanes[0].Lane != p.Lane || cut.Lanes[0].Manifest != checkpoint.Manifest ||
+		cut.Lanes[0].Checkpoint != checkpoint.CheckpointID || cut.Lanes[0].Objects != checkpoint.Objects ||
+		cut.Lanes[0].Bytes != checkpoint.Bytes {
 		return res, exit.Internalf("Tensorhub cut a different release output")
 	}
 	res.RepositorySHA, res.Dup = cut.RepositorySHA256, cut.Duplicate
 	if res.Dup {
 		p.say("this exact release cut was already committed")
 	}
-	p.say("Tensorhub cut release %s with lane %s", p.Release, prepared.Lane)
+	p.say("Tensorhub cut release %s with lane %s", p.Release, p.Lane)
 	p.say("timing: %s", Timing(ms))
 	return res, nil
 }

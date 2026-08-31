@@ -750,7 +750,6 @@ def check_typed_resources():
         "/v1/repos",
         "/v1/resolve",
         "/v1/checkpoints",
-        "/checkpoints/",
         "/publishes",
         "cozy repo ",
         "cozy search",

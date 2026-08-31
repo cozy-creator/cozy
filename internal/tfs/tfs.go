@@ -314,10 +314,9 @@ func (t *Tool) Releases(outPath string) ([]Release, *exit.Error) {
 	return rows, nil
 }
 
-// ReleaseEvidence returns the one exact canonical evidence value attached to a
-// manifest in the named local repository. Repeating the same bytes across lanes is
-// harmless; absent or disagreeing bytes refuse rather than inventing classification.
-func (t *Tool) ReleaseEvidence(org, name, manifestID, outPath string) ([]byte, *exit.Error) {
+// CheckpointEvidence returns the exact canonical evidence attached to a retained
+// manifest. Repeated equal bytes are harmless; disagreement or absence refuses.
+func (t *Tool) CheckpointEvidence(org, name, manifestID, outPath string) ([]byte, *exit.Error) {
 	rows, e := t.Releases(outPath)
 	if e != nil {
 		return nil, e
@@ -332,13 +331,13 @@ func (t *Tool) ReleaseEvidence(org, name, manifestID, outPath string) ([]byte, *
 			continue
 		}
 		if !bytes.Equal(evidence, row.Evidence) {
-			return nil, exit.Named(exit.Conflict, "model.release_evidence_ambiguous",
+			return nil, exit.Named(exit.Conflict, "model.checkpoint_evidence_ambiguous",
 				"local repository %s/%s carries conflicting evidence for manifest %s", org, name, manifestID).
 				WithRemedy("remove the contradictory local release before publishing")
 		}
 	}
 	if evidence == nil {
-		return nil, exit.Named(exit.NotFound, "model.release_evidence_absent",
+		return nil, exit.Named(exit.NotFound, "model.checkpoint_evidence_absent",
 			"local repository %s/%s has no release for manifest %s", org, name, manifestID).
 			WithRemedy("ingest or download the manifest into this model repository before publishing it")
 	}
@@ -568,16 +567,31 @@ func (t *Tool) CommitRelease(org, name, version, lane, manifestID string, length
 	if e != nil {
 		return e
 	}
-	mutation := filepath.Join(scratch, "repo-put.json")
-	if e := writeJSON(mutation, map[string]any{
-		"action": "put_release", "lane": lane,
+	checkpointMutation := filepath.Join(scratch, "repo-put-checkpoint.json")
+	if e := writeJSON(checkpointMutation, map[string]any{
+		"action":          "put_checkpoint",
 		"evidence_base64": base64.StdEncoding.EncodeToString(evidence),
 		"manifest":        map[string]any{"length": length, "sha256": hex(manifestID)},
-		"repo":            map[string]string{"name": name, "org": org}, "version": version,
+		"repo":            map[string]string{"name": name, "org": org},
 	}); e != nil {
 		return e
 	}
-	_, e = t.run("repo", "commit", t.Root, current, mutation)
+	if _, e = t.run("repo", "commit", t.Root, current, checkpointMutation); e != nil {
+		return e
+	}
+	checkpointed := filepath.Join(scratch, "repo-checkpointed.json")
+	if _, e = t.run("repo", "get", t.Root, org, name, "--out", checkpointed); e != nil {
+		return e
+	}
+	releaseMutation := filepath.Join(scratch, "repo-put-release.json")
+	if e := writeJSON(releaseMutation, map[string]any{
+		"action": "put_release", "lane": lane,
+		"manifest": map[string]any{"length": length, "sha256": hex(manifestID)},
+		"repo":     map[string]string{"name": name, "org": org}, "version": version,
+	}); e != nil {
+		return e
+	}
+	_, e = t.run("repo", "commit", t.Root, checkpointed, releaseMutation)
 	return e
 }
 

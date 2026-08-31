@@ -190,8 +190,8 @@ func (c *Orchestrator) onProductionArtifactReceipt(s *session, frame *pb.Artifac
 		return
 	}
 	evidence, err := base64.StdEncoding.Strict().DecodeString(
-		receiptDoc.Str("release_evidence_canonical_bytes"))
-	if err != nil || len(evidence) == 0 || len(evidence) > pb.MaxReleaseEvidenceBytes {
+		receiptDoc.Str("checkpoint_evidence_canonical_bytes"))
+	if err != nil || len(evidence) == 0 || len(evidence) > pb.MaxCheckpointEvidenceBytes {
 		return
 	}
 	objects := make([]records.ModelProductionObject, 0, len(frame.Objects))
@@ -222,7 +222,7 @@ func (c *Orchestrator) onProductionArtifactReceipt(s *session, frame *pb.Artifac
 		InvocationDigest: invocationDigest, TransactionID: frame.ArtifactTransactionId,
 		WriterGeneration: int64(frame.WriterGeneration), ReceiptDigest: receipt.ReceiptDigest,
 		Receipt: receipt.ReceiptBytes, ManifestID: manifestDigest,
-		ManifestLength: int64(frame.Manifest.Length), ReleaseEvidence: evidence,
+		ManifestLength: int64(frame.Manifest.Length), CheckpointEvidence: evidence,
 	}, objects)
 	if problem != nil {
 		c.logf("ArtifactReceiptFrame %s/%s refused: %s", frame.RequestId, frame.OutputSlot,

@@ -3,8 +3,8 @@ package hub
 // Tensorhub's incremental model-publication protocol and manifest reads, as methods
 // on the ONE client. `do` still owns request construction, credentials, reasons, and
 // error mapping. A publication opens under a stable operation id, claims known object
-// transfers, uploads through bounded grants, finalizes one prepared output, then
-// cuts that output into the immutable model release. The retired declare-whole,
+// transfers, uploads through bounded grants, finalizes one owner checkpoint, then
+// maps that checkpoint into the immutable model release. The retired declare-whole,
 // per-object settlement, and seal routes have no compatibility path.
 
 import (
@@ -27,13 +27,9 @@ func B64(raw []byte) string { return base64.StdEncoding.EncodeToString(raw) }
 
 // Session is the compact durable view returned by the idempotent publication PUT.
 type Session struct {
-	Operation        string     `json:"operation"`
-	Release          string     `json:"release"`
-	Lane             string     `json:"lane"`
-	LaneKey          string     `json:"lane_key,omitempty"`
-	RequiredContract string     `json:"required_contract,omitempty"`
-	State            string     `json:"state"`
-	Objects          []Transfer `json:"objects"`
+	Operation string     `json:"operation"`
+	State     string     `json:"state"`
+	Objects   []Transfer `json:"objects"`
 }
 
 // Totals is Cozy's accounting over the exact transfer rows Tensorhub returned.
@@ -53,14 +49,14 @@ type OpenPublicationResponse struct {
 	Created     bool    `json:"created"`
 }
 
-func (c *Client) OpenPublication(ctx context.Context, ref Ref, operationID, release, laneKey string,
+func (c *Client) OpenPublication(ctx context.Context, ref Ref, operationID string,
 	objects []Object, reason string,
 ) (OpenPublicationResponse, *exit.Error) {
 	var out OpenPublicationResponse
 	e := c.do(ctx, call{
 		method: http.MethodPut,
 		path:   publications(ref) + "/" + url.PathEscape(operationID), auth: true, reason: reason,
-		body:    map[string]any{"release": release, "lane_key": laneKey, "objects": objects},
+		body:    map[string]any{"objects": objects},
 		byBytes: true, patient: true, strict: true,
 	}, &out)
 	return out, e
@@ -147,9 +143,9 @@ func (c *Client) GrantKnownTransfers(ctx context.Context, ref Ref, operation str
 }
 
 type FinalizePublicationRequest struct {
-	ManifestID            string `json:"manifest_id"`
-	ManifestLength        int64  `json:"manifest_length"`
-	ReleaseEvidenceBase64 string `json:"release_evidence_base64"`
+	ManifestID               string `json:"manifest_id"`
+	ManifestLength           int64  `json:"manifest_length"`
+	CheckpointEvidenceBase64 string `json:"checkpoint_evidence_base64"`
 }
 
 type ManifestRef struct {
@@ -167,26 +163,24 @@ type Contract struct {
 	Encoding  Encoding            `json:"encoding"`
 }
 
-// PreparedPublication is the server-derived output returned by finalize. It is
-// durable and resumable, but it is not visible as a model release until CutRelease.
-type PreparedPublication struct {
-	PublishID             string      `json:"publish_id"`
-	Release               string      `json:"release"`
-	Lane                  string      `json:"lane"`
-	Manifest              ManifestRef `json:"manifest"`
-	Contract              Contract    `json:"contract"`
-	TopologyDigest        string      `json:"topology_digest"`
-	Objects               int         `json:"objects"`
-	Bytes                 int64       `json:"bytes"`
-	ReleaseEvidenceBase64 string      `json:"release_evidence_base64"`
-	State                 string      `json:"state"`
-	Duplicate             bool        `json:"duplicate"`
+// CheckpointPublication is the durable owner-only checkpoint returned by finalize.
+type CheckpointPublication struct {
+	PublishID                string      `json:"publish_id"`
+	CheckpointID             string      `json:"checkpoint_id"`
+	Manifest                 ManifestRef `json:"manifest"`
+	Contract                 Contract    `json:"contract"`
+	TopologyDigest           string      `json:"topology_digest"`
+	Objects                  int         `json:"objects"`
+	Bytes                    int64       `json:"bytes"`
+	CheckpointEvidenceBase64 string      `json:"checkpoint_evidence_base64"`
+	State                    string      `json:"state"`
+	Duplicate                bool        `json:"duplicate"`
 }
 
 func (c *Client) FinalizePublication(ctx context.Context, ref Ref, operation string,
 	request FinalizePublicationRequest, reason string,
-) (PreparedPublication, *exit.Error) {
-	var out PreparedPublication
+) (CheckpointPublication, *exit.Error) {
+	var out CheckpointPublication
 	e := c.do(ctx, call{
 		method: http.MethodPost,
 		path:   publications(ref) + "/" + url.PathEscape(operation) + "/finalize",
@@ -197,12 +191,12 @@ func (c *Client) FinalizePublication(ctx context.Context, ref Ref, operation str
 }
 
 type CutLane struct {
-	Lane        string      `json:"lane"`
-	Manifest    ManifestRef `json:"manifest"`
-	Contract    Contract    `json:"contract"`
-	Objects     int         `json:"objects"`
-	Bytes       int64       `json:"bytes"`
-	Publication string      `json:"publication"`
+	Lane       string      `json:"lane"`
+	Manifest   ManifestRef `json:"manifest"`
+	Contract   Contract    `json:"contract"`
+	Objects    int         `json:"objects"`
+	Bytes      int64       `json:"bytes"`
+	Checkpoint string      `json:"checkpoint_id"`
 }
 
 type CutReleaseResponse struct {
@@ -214,14 +208,14 @@ type CutReleaseResponse struct {
 }
 
 func (c *Client) CutRelease(ctx context.Context, ref Ref, release, operation string,
-	publicationIDs []string, reason string,
+	lanes map[string]string, reason string,
 ) (CutReleaseResponse, *exit.Error) {
 	var out CutReleaseResponse
 	e := c.do(ctx, call{
 		method: http.MethodPost,
 		path:   "/v1/models/" + ref.Org + "/" + ref.Name + "/releases/" + url.PathEscape(release),
 		auth:   true, reason: reason, patient: true, strict: true,
-		body: map[string]any{"operation": operation, "publications": publicationIDs},
+		body: map[string]any{"operation": operation, "lanes": lanes},
 	}, &out)
 	return out, e
 }
@@ -237,28 +231,28 @@ func publications(ref Ref) string {
 
 // ModelManifest is one resolved immutable model tree.
 type ModelManifest struct {
-	Org             string `json:"org"`
-	Name            string `json:"name"`
-	Release         string `json:"release"`
-	Lane            string `json:"lane"`
-	ManifestID      string `json:"manifest_id"`
-	HeaderID        string `json:"header_digest"`
-	Objects         int    `json:"objects"`
-	Bytes           int64  `json:"bytes"`
-	ReleaseEvidence []byte `json:"-"`
+	Org                string `json:"org"`
+	Name               string `json:"name"`
+	Release            string `json:"release"`
+	Lane               string `json:"lane"`
+	ManifestID         string `json:"manifest_id"`
+	HeaderID           string `json:"header_digest"`
+	Objects            int    `json:"objects"`
+	Bytes              int64  `json:"bytes"`
+	CheckpointEvidence []byte `json:"-"`
 }
 
 // ModelResolution is Tensorhub's exact answer to a human model ref. Download never
 // lists manifests and guesses: digest or release selection happens at this route.
 type ModelResolution struct {
-	Model                 string `json:"model"`
-	Release               string `json:"release"`
-	Lane                  string `json:"lane"`
-	ManifestID            string `json:"manifest_id"`
-	HeaderID              string `json:"header_digest"`
-	Objects               int    `json:"objects"`
-	Bytes                 int64  `json:"bytes"`
-	ReleaseEvidenceBase64 string `json:"release_evidence_base64"`
+	Model                    string `json:"model"`
+	Release                  string `json:"release"`
+	Lane                     string `json:"lane"`
+	ManifestID               string `json:"manifest_id"`
+	HeaderID                 string `json:"header_digest"`
+	Objects                  int    `json:"objects"`
+	Bytes                    int64  `json:"bytes"`
+	CheckpointEvidenceBase64 string `json:"checkpoint_evidence_base64"`
 }
 
 func (c *Client) ResolveModel(ctx context.Context, spec, lane string) (ModelResolution, *exit.Error) {
@@ -275,12 +269,23 @@ func (c *Client) ResolveModel(ctx context.Context, spec, lane string) (ModelReso
 // Manifest reads the exact manifest bytes back, verbatim. They are handed straight
 // to the byte plane, which admits them only if they hash to the manifest id
 // asked for — so a hub that lied about a manifest cannot install one.
-func (c *Client) Manifest(ctx context.Context, ref Ref, manifestID string) ([]byte, *exit.Error) {
+func (c *Client) ReleaseManifest(ctx context.Context, ref Ref, release, lane string) ([]byte, *exit.Error) {
 	var raw []byte
 	e := c.do(ctx, call{
 		method: http.MethodGet,
-		path:   "/v1/models/" + ref.Org + "/" + ref.Name + "/manifests/" + manifestID,
-		raw:    &raw, byBytes: true,
+		path: "/v1/models/" + ref.Org + "/" + ref.Name + "/releases/" +
+			url.PathEscape(release) + "/lanes/" + url.PathEscape(lane) + "/manifest",
+		raw: &raw, byBytes: true,
+	}, nil)
+	return raw, e
+}
+
+func (c *Client) CheckpointManifest(ctx context.Context, ref Ref, checkpointID string) ([]byte, *exit.Error) {
+	var raw []byte
+	e := c.do(ctx, call{
+		method: http.MethodGet, auth: true,
+		path: "/v1/models/" + ref.Org + "/" + ref.Name + "/checkpoints/" + checkpointID,
+		raw:  &raw, byBytes: true,
 	}, nil)
 	return raw, e
 }
@@ -298,22 +303,35 @@ type Read struct {
 // Reads asks Tensorhub's live typed model route for download authorization over the
 // named objects of one released manifest. Cozy never constructs a bucket URL or
 // reaches storage with credentials of its own.
-func (c *Client) Reads(ctx context.Context, ref Ref, manifestID string, ids []string) ([]Read, *exit.Error) {
+func (c *Client) ReleaseReads(ctx context.Context, ref Ref, release, lane string, ids []string) ([]Read, *exit.Error) {
 	var out struct {
 		Reads []Read `json:"reads"`
 	}
 	e := c.do(ctx, call{
 		method: http.MethodPost, byBytes: true,
-		path: "/v1/models/" + ref.Org + "/" + ref.Name + "/manifests/" + manifestID + "/reads",
+		path: "/v1/models/" + ref.Org + "/" + ref.Name + "/releases/" + url.PathEscape(release) +
+			"/lanes/" + url.PathEscape(lane) + "/reads",
 		body: map[string]any{"object_ids": ids},
 	}, &out)
 	if e != nil && (e.Name == "hub.untyped_refusal" || e.Name == "route.not_found") {
 		return nil, exit.Named(exit.Unavailable, "hub.no_read_plane",
 			"the hub at %s serves no object-read route: POST %s answered %q", c.base,
-			"…/manifests/{manifest}/reads", e.Name).
+			"…/releases/{release}/lanes/{lane}/reads", e.Name).
 			WithRemedy("this hub can take custody of bytes and cannot hand them back yet; the read grant is the missing half of th-002's transfer protocol").
 			WithNext("cozy model publish <org/model> <source> --release 1.0.0 --dry-run",
 				"cozy model download --dry-run "+ref.String())
 	}
+	return out.Reads, e
+}
+
+func (c *Client) CheckpointReads(ctx context.Context, ref Ref, checkpointID string, ids []string) ([]Read, *exit.Error) {
+	var out struct {
+		Reads []Read `json:"reads"`
+	}
+	e := c.do(ctx, call{
+		method: http.MethodPost, auth: true, byBytes: true,
+		path: "/v1/models/" + ref.Org + "/" + ref.Name + "/checkpoints/" + checkpointID + "/reads",
+		body: map[string]any{"object_ids": ids},
+	}, &out)
 	return out.Reads, e
 }

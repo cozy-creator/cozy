@@ -45,7 +45,7 @@ CREATE TABLE IF NOT EXISTS model_production_sources (
   profile TEXT NOT NULL,
   manifest_id TEXT NOT NULL DEFAULT '',
   manifest_length INTEGER NOT NULL DEFAULT 0 CHECK(manifest_length>=0),
-  release_evidence BLOB NOT NULL DEFAULT x'',
+  checkpoint_evidence BLOB NOT NULL DEFAULT x'',
   PRIMARY KEY(operation_id,slot)
 )`, `
 CREATE TABLE IF NOT EXISTS model_production_steps (
@@ -70,7 +70,7 @@ CREATE TABLE IF NOT EXISTS model_production_artifacts (
   receipt BLOB NOT NULL,
   manifest_id TEXT NOT NULL,
   manifest_length INTEGER NOT NULL CHECK(manifest_length>0),
-  release_evidence BLOB NOT NULL,
+  checkpoint_evidence BLOB NOT NULL,
   publication_id TEXT NOT NULL DEFAULT '',
   state TEXT NOT NULL DEFAULT 'received',
   PRIMARY KEY(operation_id,step_name,output_slot),

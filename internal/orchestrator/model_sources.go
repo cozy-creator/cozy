@@ -285,16 +285,16 @@ func (c *Orchestrator) onModelSourcePrepared(s *session, frame *pb.ModelSourcePr
 	for _, source := range frame.Sources {
 		if source == nil || source.Manifest == nil || len(source.Manifest.Digest) != 32 ||
 			source.Manifest.Length == 0 || source.Manifest.Length > uint64(^uint64(0)>>1) ||
-			len(source.ReleaseEvidenceCanonicalBytes) == 0 ||
-			len(source.ReleaseEvidenceCanonicalBytes) > pb.MaxReleaseEvidenceBytes ||
+			len(source.CheckpointEvidenceCanonicalBytes) == 0 ||
+			len(source.CheckpointEvidenceCanonicalBytes) > pb.MaxCheckpointEvidenceBytes ||
 			expectedProfiles[source.Slot] != source.Profile {
 			return
 		}
 		rows = append(rows, records.PreparedModelSource{OperationID: frame.OperationId,
 			Slot: source.Slot, Profile: source.Profile,
-			ManifestID:      "sha256:" + hex.EncodeToString(source.Manifest.Digest),
-			ManifestLength:  int64(source.Manifest.Length),
-			ReleaseEvidence: append([]byte(nil), source.ReleaseEvidenceCanonicalBytes...)})
+			ManifestID:         "sha256:" + hex.EncodeToString(source.Manifest.Digest),
+			ManifestLength:     int64(source.Manifest.Length),
+			CheckpointEvidence: append([]byte(nil), source.CheckpointEvidenceCanonicalBytes...)})
 	}
 	if len(rows) != len(expectedProfiles) {
 		return
