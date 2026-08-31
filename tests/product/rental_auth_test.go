@@ -91,6 +91,13 @@ func TestRentalCreatorIdentityAndClaim(t *testing.T) {
 		len(doc.List("models")) != 1 {
 		t.Fatalf("download delegation lost logical or worker identity: %s", delegation)
 	}
+	empty, emptySignature, problem := rental.SignDownloadDelegation(layout, connection,
+		nil, nil, time.Now().Add(30*time.Minute))
+	fatal(t, problem)
+	if !bytes.Contains(empty, []byte(`"models":[]`)) || !bytes.Contains(empty, []byte(`"packages":[]`)) ||
+		!ed25519.Verify(public, empty, emptySignature) {
+		t.Fatalf("empty package_set authority is not explicit and signed: %s", empty)
+	}
 
 	request, problem := hub.RentalRequestBytes("cpu", strings.Repeat("1", 64),
 		identity.PublicKey(), 0, 0)
