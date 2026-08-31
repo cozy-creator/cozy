@@ -1092,6 +1092,35 @@ func TestDevelopmentInstallRefreshesBeforeInvocation(t *testing.T) {
 		t.Fatalf("version-in-path remedy was not useful [exit %d]\n%s", code, out)
 	}
 
+	outputDir := filepath.Join(root, "human-run-output")
+	code, stdout, stderr := runCozyStreams(t, root, "run", weightlessRef+"/tile",
+		"size=32", "seed=7", "--out", outputDir)
+	if code != 0 {
+		t.Fatalf("human invocation failed [exit %d]\nstdout:\n%s\nstderr:\n%s", code, stdout, stderr)
+	}
+	for _, useful := range []string{"pixels:", "revision:", "size:", "warm:", "saved:"} {
+		if !strings.Contains(stdout, useful) {
+			t.Errorf("human result omitted %q\n%s", useful, stdout)
+		}
+	}
+	for _, internal := range []string{"result:", "asset_ref", "blake2b:", "digest:"} {
+		if strings.Contains(stdout, internal) {
+			t.Errorf("human result exposed %q despite saving the output\n%s", internal, stdout)
+		}
+	}
+	for _, raw := range []string{"progress value=", "stage value=", "metric value="} {
+		if strings.Contains(stderr, raw) {
+			t.Errorf("redirected default progress exposed %q\n%s", raw, stderr)
+		}
+	}
+
+	code, _, stderr = runCozyStreams(t, root, "run", weightlessRef+"/tile",
+		"size=32", "seed=7", "--full")
+	if code != 0 || !strings.Contains(stderr, "progress value=") ||
+		!strings.Contains(stderr, "metric value=") {
+		t.Fatalf("--full did not retain Runtime diagnostics [exit %d]\n%s", code, stderr)
+	}
+
 	for _, deleted := range []string{"--local", "--cloud", "--machine"} {
 		if code, out := runCozy(t, root, "run", weightlessRef+"/tile",
 			"size=32", "seed=7", deleted); code != 2 ||
@@ -1101,7 +1130,8 @@ func TestDevelopmentInstallRefreshesBeforeInvocation(t *testing.T) {
 	}
 	code, out = runCozy(t, root, "run", weightlessRef+"/tile",
 		"size=32", "seed=7", "--idempotency-key", "placement-proof", "--json")
-	if code != 0 || !strings.Contains(out, `"revision":"first"`) {
+	if code != 0 || !strings.Contains(out, `"revision":"first"`) ||
+		!strings.Contains(out, `"digest":`) || !strings.Contains(out, `"result":`) {
 		t.Fatalf("first editable invocation did not run source [exit %d]\n%s\n%s",
 			code, out, productWorkerLogs(root))
 	}
