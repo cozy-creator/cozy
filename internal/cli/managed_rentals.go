@@ -27,6 +27,7 @@ type managedRentals struct {
 	idleGrace    time.Duration
 	idleSequence uint64
 	idleTimers   map[string]idleRelease
+	closed       bool
 }
 
 type idleRelease struct {
@@ -244,6 +245,9 @@ func (m *managedRentals) releaseOrphaned() {
 }
 
 func (m *managedRentals) releaseWhenIdleLocked(id string) (string, *exit.Error) {
+	if m.closed {
+		return m.lineLocked()
+	}
 	row, problem := m.store.RentalRow(id)
 	if problem != nil {
 		return "", problem
@@ -280,6 +284,9 @@ func (m *managedRentals) grace() time.Duration {
 }
 
 func (m *managedRentals) scheduleIdleReleaseLocked(id string, deadline time.Time) {
+	if m.closed {
+		return
+	}
 	m.cancelIdleReleaseLocked(id)
 	if m.idleTimers == nil {
 		m.idleTimers = map[string]idleRelease{}
@@ -300,6 +307,9 @@ func (m *managedRentals) cancelIdleReleaseLocked(id string) {
 func (m *managedRentals) releaseIdle(id string, sequence uint64) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	if m.closed {
+		return
+	}
 	pending, ok := m.idleTimers[id]
 	if !ok || pending.sequence != sequence {
 		return
@@ -312,6 +322,16 @@ func (m *managedRentals) releaseIdle(id string, sequence uint64) {
 	}
 	if line != "" {
 		fmt.Fprintln(m.ctx.Out, line)
+	}
+}
+
+func (m *managedRentals) close() {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.closed = true
+	for id, pending := range m.idleTimers {
+		pending.timer.Stop()
+		delete(m.idleTimers, id)
 	}
 }
 

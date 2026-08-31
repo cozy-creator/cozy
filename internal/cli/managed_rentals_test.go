@@ -106,6 +106,23 @@ func TestManagedRentalIdlePolicySurvivesRestartAndKeepsJobsEphemeral(t *testing.
 	if problem != nil || gotDeletes != 1 || row != nil {
 		t.Fatalf("job release: deletes=%d row=%+v problem=%v", gotDeletes, row, problem)
 	}
+
+	recordSettledRental(t, store, server.URL, "pr-shutdown", "serving", true)
+	shutdownFleet := &managedRentals{
+		ctx: ctx, layout: layout, store: store, idleGrace: 25 * time.Millisecond,
+	}
+	if _, problem := shutdownFleet.release("pr-shutdown"); problem != nil {
+		t.Fatal(problem)
+	}
+	shutdownFleet.close()
+	time.Sleep(75 * time.Millisecond)
+	mu.Lock()
+	gotDeletes = released["pr-shutdown"]
+	mu.Unlock()
+	row, problem = store.RentalRow("pr-shutdown")
+	if problem != nil || gotDeletes != 0 || row == nil {
+		t.Fatalf("closed fleet timer fired: deletes=%d row=%+v problem=%v", gotDeletes, row, problem)
+	}
 }
 
 func recordSettledRental(t *testing.T, store *records.Store, hub, id, kind string, terminal bool) {
@@ -154,5 +171,8 @@ func recordSettledRental(t *testing.T, store *records.Store, hub, id, kind strin
 	})
 	if problem != nil || !applied {
 		t.Fatalf("terminal %s: applied=%v problem=%v", requestID, applied, problem)
+	}
+	if problem := store.Closed(requestID, attempt); problem != nil {
+		t.Fatal(problem)
 	}
 }

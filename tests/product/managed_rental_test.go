@@ -42,6 +42,15 @@ func TestRentalLastSettlementDistinguishesWarmServingFromJobs(t *testing.T) {
 	if problem != nil || !applied {
 		t.Fatalf("accept serving terminal: applied=%v problem=%v", applied, problem)
 	}
+	queued, running, problem := store.RentalRunCounts("pr-warm")
+	if problem != nil || queued != 0 || running != 1 {
+		t.Fatalf("terminal awaiting ack counted as queued=%d running=%d problem=%v", queued, running, problem)
+	}
+	fatal(t, store.Closed(serving.ID, attempt))
+	queued, running, problem = store.RentalRunCounts("pr-warm")
+	if problem != nil || queued != 0 || running != 0 {
+		t.Fatalf("acked terminal counted as queued=%d running=%d problem=%v", queued, running, problem)
+	}
 	last, found, problem := store.RentalLastSettlement("pr-warm")
 	if problem != nil || !found || last.RequestID != serving.ID || last.Kind != "serving" || last.ClosedAt.IsZero() {
 		t.Fatalf("serving settlement = %+v found=%v problem=%v", last, found, problem)

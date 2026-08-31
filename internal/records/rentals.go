@@ -556,8 +556,10 @@ func rentalFleetTotals(q interface{ QueryRow(string, ...any) *sql.Row }) (int, i
 func (s *Store) RentalRunCounts(id string) (queued, running int, problem *exit.Error) {
 	err := s.db.QueryRow(`SELECT
 		COALESCE(SUM(CASE WHEN state IN ('submitted','queued','requeue_pending') THEN 1 ELSE 0 END),0),
-		COALESCE(SUM(CASE WHEN state IN ('dispatching','in_progress') THEN 1 ELSE 0 END),0)
-		FROM requests WHERE worker=?`, id).Scan(&queued, &running)
+		COALESCE(SUM(CASE WHEN state IN ('dispatching','in_progress') THEN 1 ELSE 0 END),0) +
+		(SELECT COUNT(*) FROM attempts a JOIN requests held ON held.id=a.request_id
+		 WHERE held.worker=? AND a.state='terminal')
+		FROM requests WHERE worker=?`, id, id).Scan(&queued, &running)
 	if err != nil {
 		return 0, 0, exit.Internalf("cannot count runs for rented machine %s: %s", id, err)
 	}
@@ -582,7 +584,7 @@ func (s *Store) RentalLastSettlement(id string) (RentalLastSettlement, bool, *ex
 		WHERE r.worker=? AND r.rental=1
 		  AND r.state IN ('succeeded','failed','canceled','refused','abandoned')
 		GROUP BY r.id,r.kind,r.created_at
-		ORDER BY r.created_at DESC,r.id DESC LIMIT 1`, id).
+		ORDER BY COALESCE(NULLIF(MAX(a.closed_at),''),r.created_at) DESC,r.id DESC LIMIT 1`, id).
 		Scan(&out.RequestID, &out.Kind, &closedAt)
 	if errors.Is(err, sql.ErrNoRows) {
 		return RentalLastSettlement{}, false, nil
