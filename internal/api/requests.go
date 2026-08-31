@@ -290,17 +290,9 @@ func (s *Server) resolvePlan(sub Submission) (orchestrator.Submission, *exit.Err
 	if len(out.Payload) == 0 {
 		out.Payload = []byte("{}")
 	}
-	// THE PIN IS RESOLVED BEFORE A ROW EXISTS. A rental this host does not hold cannot be
-	// placed on any later attempt either, so recording the request would hand the client
-	// an id for work that is already known to be unplaceable.
-	if out.Worker != "" {
-		if s.rentals == nil {
-			return out, exit.Unavailablef("this Cozy daemon attaches no remote workers")
-		}
-		_, e := s.rentals(out.Worker)
-		if e != nil {
-			return out, e
-		}
+	// A --rental request validates only immutable package metadata here. The
+	// scheduler chooses and records its worker after admission.
+	if out.Rental {
 		if s.packages == nil || sub.InstallID == "" {
 			return out, exit.Unavailablef("remote execution requires one exact local package release pin")
 		}

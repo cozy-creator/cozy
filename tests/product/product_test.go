@@ -302,6 +302,29 @@ func TestRentalSpendConfigIsNestedAndExact(t *testing.T) {
 		!strings.Contains(out, `unknown key "cloud"`) {
 		t.Fatalf("deleted cloud config key did not refuse [exit %d]\n%s", code, out)
 	}
+
+	posts := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodGet && r.URL.Path == "/v1/rental-skus" {
+			_ = json.NewEncoder(w).Encode([]map[string]any{{
+				"name": "gpu", "accelerator_model": "GPU", "compute_capability": "9.0",
+				"vram_gb": 80, "price_usd_micros_per_hour": 750_000,
+			}})
+			return
+		}
+		if r.Method == http.MethodPost && r.URL.Path == "/v1/rentals" {
+			posts++
+		}
+		http.NotFound(w, r)
+	}))
+	defer server.Close()
+	manual := t.TempDir()
+	must(t, os.WriteFile(filepath.Join(manual, "config.yaml"), []byte(
+		"tensorhub_url: "+server.URL+"\nrentals:\n  max_hourly_spend_usd: 0.50\n"), 0o600))
+	if code, out := runCozy(t, manual, "rental", "new", "gpu"); code == 0 ||
+		!strings.Contains(out, "would exceed") || posts != 0 {
+		t.Fatalf("manual rental crossed the fleet cap [exit %d posts=%d]\n%s", code, posts, out)
+	}
 }
 
 func TestPackagePublishRefusesSilentlyOmittedPrivateFiles(t *testing.T) {

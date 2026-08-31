@@ -36,6 +36,29 @@ func (m *managedRentals) status() (string, *exit.Error) {
 	return m.lineLocked()
 }
 
+func (m *managedRentals) admit(skuName string) (string, *exit.Error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if problem := m.reconcileLocked(); problem != nil {
+		return "", problem
+	}
+	line, problem := m.lineLocked()
+	if problem != nil {
+		return "", problem
+	}
+	skus, problem := m.catalogLocked()
+	if problem != nil {
+		return "", problem
+	}
+	for _, sku := range skus {
+		if sku.Name == skuName {
+			return line, m.admitLocked(sku)
+		}
+	}
+	return "", exit.Named(exit.Validation, "rental.sku_unavailable",
+		"Tensorhub currently offers no rental SKU %q", skuName)
+}
+
 func (m *managedRentals) acquire(req records.Request) (string, string, *exit.Error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -78,14 +101,7 @@ func (m *managedRentals) acquire(req records.Request) (string, string, *exit.Err
 		return row.ID, line, lineProblem
 	}
 
-	cap := m.ctx.Cfg.RentalsMaxHourlySpendUSDMicros
-	if cap <= 0 {
-		return "", "", exit.Named(exit.Usage, "rental.spend_cap_required",
-			"rentals.max_hourly_spend_usd must be positive before Creator rents a pod")
-	}
-	hctx, cancel := hub.Context()
-	skus, problem := client(m.ctx).RentalSKUs(hctx)
-	cancel()
+	skus, problem := m.catalogLocked()
 	if problem != nil {
 		return "", "", problem
 	}
@@ -99,16 +115,9 @@ func (m *managedRentals) acquire(req records.Request) (string, string, *exit.Err
 		}
 		return skus[i].Name < skus[j].Name
 	})
-	_, burn, problem := m.totalsLocked()
-	if problem != nil {
-		return "", "", problem
-	}
 	sku := skus[0]
-	if burn > cap || sku.PriceUSDMicrosPerHour > cap-burn {
-		return "", "", exit.Named(exit.Capacity, "rental.fleet_spend_cap",
-			"the cheapest rental %s at %s would exceed %s",
-			sku.Name, usdPerHour(sku.PriceUSDMicrosPerHour), usdPerHour(cap)).
-			WithRemedy("raise rentals.max_hourly_spend_usd or end another rental")
+	if problem := m.admitLocked(sku); problem != nil {
+		return "", "", problem
 	}
 	current, currentProblem := m.store.RequestRow(req.ID)
 	if currentProblem != nil {
@@ -137,6 +146,31 @@ func (m *managedRentals) acquire(req records.Request) (string, string, *exit.Err
 	}
 	line, problem := m.lineLocked()
 	return row.ID, line, problem
+}
+
+func (m *managedRentals) catalogLocked() ([]hub.RentalSKU, *exit.Error) {
+	hctx, cancel := hub.Context()
+	defer cancel()
+	return client(m.ctx).RentalSKUs(hctx)
+}
+
+func (m *managedRentals) admitLocked(sku hub.RentalSKU) *exit.Error {
+	cap := m.ctx.Cfg.RentalsMaxHourlySpendUSDMicros
+	if cap <= 0 {
+		return exit.Named(exit.Usage, "rental.spend_cap_required",
+			"rentals.max_hourly_spend_usd must be positive before Creator rents a pod")
+	}
+	_, burn, problem := m.totalsLocked()
+	if problem != nil {
+		return problem
+	}
+	if burn > cap || sku.PriceUSDMicrosPerHour > cap-burn {
+		return exit.Named(exit.Capacity, "rental.fleet_spend_cap",
+			"rental %s at %s would exceed %s",
+			sku.Name, usdPerHour(sku.PriceUSDMicrosPerHour), usdPerHour(cap)).
+			WithRemedy("raise rentals.max_hourly_spend_usd or end another rental")
+	}
+	return nil
 }
 
 func (m *managedRentals) release(id string) (string, *exit.Error) {

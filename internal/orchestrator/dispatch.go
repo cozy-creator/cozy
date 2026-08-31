@@ -662,6 +662,26 @@ func (c *Orchestrator) failQueued(requestID string, cause *exit.Error) {
 	})
 	c.logf("%s FAILED before any offer: %s", requestID, cause.Message)
 	c.signalClosed(requestWaitKey(requestID), cause)
+	if row, problem := c.opt.Store.RequestRow(requestID); problem == nil && row != nil {
+		c.releaseManaged(*row)
+	}
+}
+
+func (c *Orchestrator) releaseManaged(req records.Request) {
+	if !req.Rental || req.Worker == "" || c.opt.ReleaseManagedRental == nil {
+		return
+	}
+	go func() {
+		line, problem := c.opt.ReleaseManagedRental(req.Worker)
+		if problem != nil {
+			c.logf("managed rental %s release deferred: %s", req.Worker, problem.Message)
+			return
+		}
+		if line != "" {
+			c.emit(req.ID, "request.rentals", 0, map[string]any{"line": line})
+			c.logf("%s", line)
+		}
+	}()
 }
 
 func (c *Orchestrator) dispatch(req records.Request) (uint64, *exit.Error) {

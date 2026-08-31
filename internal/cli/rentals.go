@@ -98,7 +98,7 @@ func handleRent(ctx *Context) *exit.Error {
 	}
 	defer st.Close()
 	fleet := &managedRentals{ctx: ctx, layout: l, store: st}
-	line, e := fleet.status()
+	line, e := fleet.admit(skuName)
 	if e != nil {
 		return e
 	}
