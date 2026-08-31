@@ -2,18 +2,199 @@ package producttest
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
+	"github.com/cozy-creator/cozy/internal/api"
+	"github.com/cozy-creator/cozy/internal/cli"
+	localclient "github.com/cozy-creator/cozy/internal/client"
+	"github.com/cozy-creator/cozy/internal/config"
+	"github.com/cozy-creator/cozy/internal/daemon"
+	"github.com/cozy-creator/cozy/internal/exit"
+	"github.com/cozy-creator/cozy/internal/home"
 	"github.com/cozy-creator/cozy/internal/launch"
 	"github.com/cozy-creator/cozy/internal/modelproduction"
 	"github.com/cozy-creator/cozy/internal/records"
 )
+
+func TestModelProductionHumanProgressIsBoundedAndJSONStdoutStaysPure(t *testing.T) {
+	var stderr bytes.Buffer
+	progress := cli.NewModelProductionProgress(&stderr, true, 10)
+	progress.Accepted("modelpub-proof", 4)
+	progress.RentalSelecting("h200-sxm")
+	progress.RentalReady("rental-1", "ready", "h200-sxm")
+	progress.WorkerWaiting("rental-1")
+	progress.WorkerReady("rental-1")
+	progress.SourceStarting(27, 100<<20)
+	for range 100 {
+		progress.SourceProgress(10<<20, 100<<20)
+	}
+	progress.SourceProgress(20<<20, 100<<20)
+	progress.SourcePrepared(2)
+	progress.NodeStarting(0, "assemble-full", "tensorhub/minimax-h3-tools/assemble", false)
+	for range 100 {
+		progress.NodeRuntime(0, "assemble-full", "constructing", 0.2, true)
+	}
+	progress.NodeRuntime(0, "assemble-full", "verifying", 0.1, true)
+	progress.ArtifactAdopted(0, 0, 1, "assemble-full")
+	progress.PublicationStarting("bf16-full")
+	progress.PublicationPrepared("bf16-full")
+	progress.NodeCompleted(0, "assemble-full", "tensorhub/minimax-h3-tools/assemble")
+	for index := 1; index < 10; index++ {
+		name := fmt.Sprintf("node-%d", index+1)
+		callable := fmt.Sprintf("tensorhub/minimax-h3-tools/function-%d", index+1)
+		progress.NodeStarting(index, name, callable, false)
+		progress.NodeCompleted(index, name, callable)
+	}
+	lanes := []string{"bf16-adaln-pruned", "bf16-full", "fp8-adaln-pruned", "mxfp8-adaln-pruned"}
+	progress.ReleaseStarting("1.0.0", lanes)
+	progress.ReleaseCut("1.0.0", len(lanes))
+	progress.RentalReleaseStarting("rental-1")
+	progress.RentalReleased("rental-1")
+
+	human := stderr.String()
+	for _, want := range []string{
+		"Model production modelpub-proof accepted: 10 nodes, 4 lanes.",
+		"Rental rental-1: ready (h200-sxm).",
+		"Worker: ready on rental rental-1.",
+		"Source: preparing 27 files (100.0MiB).",
+		"Source: downloaded 10.0MiB / 100.0MiB (10%).",
+		"Source: prepared 2 model profiles.",
+		"Node 1/10: starting assemble-full (tensorhub/minimax-h3-tools/assemble).",
+		"Node 1/10: assemble-full — constructing (20%).",
+		"Node 1/10: assemble-full — verifying (10%).",
+		"Artifact: adopted output 1/1 for node 1/10 assemble-full.",
+		"Publication: lane bf16-full prepared.",
+		"Node 1/10: completed assemble-full (tensorhub/minimax-h3-tools/assemble).",
+		"Release: 1.0.0 cut atomically with 4 lanes.",
+		"Cleanup: rental rental-1 released; provider absence confirmed.",
+	} {
+		if !strings.Contains(human, want) {
+			t.Errorf("human progress omits %q\n%s", want, human)
+		}
+	}
+	if count := strings.Count(human, "Source: downloaded 10.0MiB"); count != 1 {
+		t.Errorf("unchanged source polls emitted %d lines\n%s", count, human)
+	}
+	if count := strings.Count(human, "assemble-full — constructing (20%)"); count != 1 {
+		t.Errorf("unchanged Runtime polls emitted %d lines\n%s", count, human)
+	}
+	if count := strings.Count(human, ": starting "); count != 10 {
+		t.Errorf("ten-node production emitted %d start lines\n%s", count, human)
+	}
+	if count := strings.Count(human, ": completed "); count != 10 {
+		t.Errorf("ten-node production emitted %d completion lines\n%s", count, human)
+	}
+
+	var disabled bytes.Buffer
+	machineProgress := cli.NewModelProductionProgress(&disabled, false, 10)
+	machineProgress.Accepted("modelpub-proof", 4)
+	machineProgress.SourceProgress(50, 100)
+	machineProgress.NodeStarting(0, "assemble-full", "tensorhub/minimax-h3-tools/assemble", false)
+	machineProgress.RentalReleased("rental-1")
+	if disabled.Len() != 0 {
+		t.Fatalf("JSON-mode progress wrote to its stream: %q", disabled.String())
+	}
+	var resumed bytes.Buffer
+	resumeProgress := cli.NewModelProductionProgress(&resumed, true, 10)
+	resumeProgress.SeedSourceProgress(40<<20, 100<<20)
+	resumeProgress.Resume("modelpub-proof", "source preparation has transferred 40.0MiB / 100.0MiB")
+	for range 100 {
+		resumeProgress.SourceProgress(40<<20, 100<<20)
+	}
+	resumeProgress.SourceProgress(50<<20, 100<<20)
+	if got := resumed.String(); !strings.Contains(got, "Resuming model production modelpub-proof") ||
+		strings.Contains(got, "Source: downloaded 40.0MiB") ||
+		strings.Count(got, "Source: downloaded") != 1 {
+		t.Fatalf("resume repeated already-rendered progress:\n%s", got)
+	}
+
+	root := t.TempDir()
+	source := filepath.Join(root, "source.safetensors")
+	must(t, os.WriteFile(source, []byte("model-production-json-proof"), 0o600))
+	code, stdout, jsonStderr := runCozyStreams(t, root, "--json", "model", "publish",
+		"acme/proof", source, "--release", "1.0.0", "--dry-run")
+	var document map[string]any
+	if code != 0 || json.Unmarshal([]byte(stdout), &document) != nil || document["status"] != "planned" ||
+		strings.TrimSpace(jsonStderr) != "" {
+		t.Fatalf("JSON model production output [exit %d]\nstdout: %s\nstderr: %s", code, stdout, jsonStderr)
+	}
+}
+
+func TestModelProductionCancellationReportsCleanupTruth(t *testing.T) {
+	var confirmed, pending bytes.Buffer
+	finished := cli.NewModelProductionProgress(&confirmed, true, 10)
+	finished.Cancellation("modelpub-cancel")
+	finished.RentalReleaseStarting("rental-cancel")
+	finished.RentalReleased("rental-cancel")
+	if got := confirmed.String(); !strings.Contains(got, "Cancellation: model production modelpub-cancel stopped") ||
+		!strings.Contains(got, "provider absence confirmed") {
+		t.Fatalf("confirmed cancellation cleanup changed:\n%s", got)
+	}
+	unconfirmed := cli.NewModelProductionProgress(&pending, true, 10)
+	unconfirmed.Cancellation("modelpub-cancel")
+	unconfirmed.RentalReleaseStarting("rental-cancel")
+	unconfirmed.RentalReleaseUnconfirmed("rental-cancel")
+	if got := pending.String(); !strings.Contains(got, "release is not yet confirmed") ||
+		strings.Contains(got, "provider absence confirmed") {
+		t.Fatalf("unconfirmed cancellation cleanup overstated reality:\n%s", got)
+	}
+}
+
+func TestModelProductionSourceRequestHonorsCancellationContext(t *testing.T) {
+	started, release := make(chan struct{}), make(chan struct{})
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost || !strings.HasPrefix(r.URL.Path, "/v1/local/model-productions/") {
+			http.NotFound(w, r)
+			return
+		}
+		close(started)
+		select {
+		case <-r.Context().Done():
+		case <-release:
+		}
+	}))
+	defer server.Close()
+	defer close(release)
+	root := t.TempDir()
+	layout, problem := home.Open(root)
+	fatal(t, problem)
+	_, problem = api.Mint(layout)
+	fatal(t, problem)
+	client, problem := localclient.Open(config.Config{Home: root}, daemon.State{
+		Addr: strings.TrimPrefix(server.URL, "http://"), Up: true,
+	})
+	fatal(t, problem)
+	requestCtx, cancel := context.WithCancel(context.Background())
+	result := make(chan *exit.Error, 1)
+	go func() {
+		_, callProblem := client.ModelProductionActionContext(requestCtx, "modelpub-cancel",
+			api.ModelProductionAction{Action: "prepare_source", RentalID: "rental-1"})
+		result <- callProblem
+	}()
+	select {
+	case <-started:
+	case <-time.After(2 * time.Second):
+		t.Fatal("model-production source request did not start")
+	}
+	cancel()
+	select {
+	case callProblem := <-result:
+		if callProblem == nil || callProblem.Code != exit.Canceled {
+			t.Fatalf("canceled source request = %v", callProblem)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("canceled model-production source request did not return")
+	}
+}
 
 func TestRemoteModelProductionResolvesHubMetadataWithoutLocalInstall(t *testing.T) {
 	producerBytes := []byte(`{"application":"remote_producer:app","entrypoints":[],"format":"cozy.package.descriptor/1","jobs":[],"model_productions":[{"name":"build","nodes":[{"callable":"proof/remote-job/derive","models":{"source":"source"},"name":"derive","outputs":["model"],"resources":{"gpu_count":1,"placement":"single_node","requires":"sm90+,vram80g,ram64g"}}],"outputs":[{"lane_key":"bf16","name":"bf16","required_contract":{"encodings":["sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"],"topology_digest":"sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"},"source":"derive.model"}],"sources":{"source":"proof/source/1"}}]}`)

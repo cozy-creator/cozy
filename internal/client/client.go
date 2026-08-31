@@ -18,6 +18,7 @@ package client
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -94,12 +95,22 @@ func (c *Client) request(method, path string, body any, headers ...string) (*htt
 // call issues one request and decodes `out`, or turns the typed envelope into a typed
 // CLI error. Every refusal a caller sees came from the server, spelled the server's way.
 func (c *Client) call(method, path string, body, out any, headers ...string) *exit.Error {
+	return c.callContext(context.Background(), method, path, body, out, headers...)
+}
+
+func (c *Client) callContext(ctx context.Context, method, path string, body, out any,
+	headers ...string,
+) *exit.Error {
 	req, e := c.request(method, path, body, headers...)
 	if e != nil {
 		return e
 	}
+	req = req.WithContext(ctx)
 	res, err := c.http.Do(req)
 	if err != nil {
+		if ctx.Err() != nil {
+			return exit.New(exit.Canceled, "the Cozy daemon request was canceled: %s", ctx.Err())
+		}
 		return c.unreachable(err)
 	}
 	defer res.Body.Close()
@@ -295,8 +306,14 @@ func (c *Client) CancelJob(id string) *exit.Error {
 func (c *Client) ModelProductionAction(id string, action api.ModelProductionAction) (
 	api.ModelProductionActionResult, *exit.Error,
 ) {
+	return c.ModelProductionActionContext(context.Background(), id, action)
+}
+
+func (c *Client) ModelProductionActionContext(ctx context.Context, id string,
+	action api.ModelProductionAction,
+) (api.ModelProductionActionResult, *exit.Error) {
 	var result api.ModelProductionActionResult
-	e := c.call(http.MethodPost, "/v1/local/model-productions/"+url.PathEscape(id),
+	e := c.callContext(ctx, http.MethodPost, "/v1/local/model-productions/"+url.PathEscape(id),
 		action, &result)
 	return result, e
 }
