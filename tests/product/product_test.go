@@ -23,8 +23,8 @@ import (
 )
 
 const weightlessRef = "cozy/cozy-weightless-package"
-const editableRuntimeFixtureSHA = "74334ff"
-const editableTensorFSFixtureSHA = "f645ee6a777cd32dca22144985099faa2276af4b"
+const editableRuntimeFixtureSHA = "9e8409c0c68c6cae75209817ad47818770cde8db"
+const editableTensorFSFixtureSHA = "6b7ee6e5cfec5f34cdee0da9398ff8a91ce451b3"
 
 func TestLiteralPayloadUsesOrdinaryScalarSyntax(t *testing.T) {
 	entrypoint := &launch.Entrypoint{
