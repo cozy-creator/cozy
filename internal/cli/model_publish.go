@@ -296,16 +296,20 @@ func resolveProducerPlan(ctx *Context, raw string) (*producerPlan, *exit.Error) 
 		return nil, exit.Usagef("--producer %q is not org/package[@vN]/production", raw)
 	}
 	packageName := parts[0] + "/" + parts[1]
+	producerSelector, problem := packageref.ParseRef(packageName)
+	if problem != nil {
+		return nil, problem
+	}
 	remote := ctx.Inv.Bool("--rental")
 	packages := map[string]productionPackage{}
-	selected, problem := resolveProductionPackage(ctx, packageName, remote, packages)
+	selected, problem := resolveProductionPackage(ctx, producerSelector.String(), remote, packages)
 	if problem != nil {
 		return nil, problem
 	}
 	if major, majorProblem := packageref.MajorOf(selected.Release); majorProblem == nil {
 		// Self-steps select the producer's major but must reuse the already-frozen
 		// producer release, even if the catalog advances during this one plan.
-		packages[packageName+"@v"+strconv.Itoa(major)] = selected
+		packages[producerSelector.Package+"@v"+strconv.Itoa(major)] = selected
 	}
 	descriptor := selected.Descriptor
 	production, problem := descriptor.Production(parts[2])

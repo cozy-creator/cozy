@@ -200,7 +200,7 @@ func TestModelProductionSourceRequestHonorsCancellationContext(t *testing.T) {
 }
 
 func TestRemoteModelProductionResolvesHubMetadataWithoutLocalInstall(t *testing.T) {
-	producerBytes := []byte(`{"application":"remote_producer:app","entrypoints":[],"format":"cozy.package.descriptor/1","jobs":[],"model_productions":[{"name":"build","steps":[{"callable":"proof/remote-job@v3/derive","models":{"source":"source"},"name":"derive","outputs":["model"],"resources":{"gpu_count":1,"placement":"single_node","requires":"sm90+,vram80g,ram64g"}}],"outputs":[{"lane_key":"bf16","name":"bf16","required_contract":{"encodings":["sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"],"topology_digest":"sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"},"source":"derive.model"}],"sources":{"source":"proof/source/1"}}]}`)
+	producerBytes := []byte(`{"application":"remote_producer:app","entrypoints":[],"format":"cozy.package.descriptor/1","jobs":[{"artifact_outputs":[{"max_bytes":4096,"mime_type":"application/vnd.cozy.model-manifest","output_id":"model"}],"models":[{"class":"ProofModel","component_use":{},"path":"assemble.models.source","stamps":{}}],"name":"assemble","publishes":false,"request":{"fields":[]},"resources":{"gpu_count":1,"placement":"single_node","requires":"sm90+,vram80g,ram64g"},"result":{"fields":[]}}],"model_productions":[{"name":"build","steps":[{"callable":"proof/remote-producer@v2/assemble","models":{"source":"source"},"name":"assemble","outputs":["model"],"resources":{"gpu_count":1,"placement":"single_node","requires":"sm90+,vram80g,ram64g"}},{"callable":"proof/remote-job@v3/derive","models":{"source":"assemble.model"},"name":"derive","outputs":["model"],"resources":{"gpu_count":1,"placement":"single_node","requires":"sm90+,vram80g,ram64g"}}],"outputs":[{"lane_key":"bf16","name":"bf16","required_contract":{"encodings":["sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"],"topology_digest":"sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"},"source":"derive.model"}],"sources":{"source":"proof/source/1"}}]}`)
 	producer, problem := launch.DecodeDescriptor(producerBytes)
 	fatal(t, problem)
 	if _, invalid := launch.DecodeDescriptor(bytes.ReplaceAll(producerBytes,
@@ -234,6 +234,7 @@ func TestRemoteModelProductionResolvesHubMetadataWithoutLocalInstall(t *testing.
 		})
 	}
 	requests := []string{}
+	producerCardReads := 0
 	jobReleases := []map[string]any{
 		{"release": "2.9.0", "cut_at": "2026-08-31T00:00:00Z"},
 		{"release": "3.0.0", "cut_at": "2026-08-31T00:00:00Z"},
@@ -251,14 +252,19 @@ func TestRemoteModelProductionResolvesHubMetadataWithoutLocalInstall(t *testing.
 				"objects":       1, "bytes": 4096,
 			})
 		case r.Method == http.MethodGet && r.URL.Path == "/v1/packages/proof/remote-producer":
+			producerCardReads++
+			producerReleases := []map[string]any{
+				{"release": "1.0.0", "cut_at": "2026-08-31T00:00:00Z"},
+				{"release": "2.0.0", "cut_at": "2026-08-31T00:00:00Z"},
+				{"release": "3.0.0", "cut_at": "2026-08-31T00:00:00Z"},
+			}
+			if producerCardReads > 1 {
+				producerReleases[1]["release"] = "2.0.1"
+			}
 			_ = json.NewEncoder(w).Encode(map[string]any{
 				"package": map[string]any{"org": "proof", "name": "remote-producer",
 					"created_at": "2026-08-31T00:00:00Z"},
-				"releases": []map[string]any{
-					{"release": "1.0.0", "cut_at": "2026-08-31T00:00:00Z"},
-					{"release": "2.0.0", "cut_at": "2026-08-31T00:00:00Z"},
-					{"release": "3.0.0", "cut_at": "2026-08-31T00:00:00Z"},
-				},
+				"releases": producerReleases,
 			})
 		case r.Method == http.MethodGet &&
 			r.URL.Path == "/v1/packages/proof/remote-producer/releases/2.0.0":
@@ -296,11 +302,15 @@ func TestRemoteModelProductionResolvesHubMetadataWithoutLocalInstall(t *testing.
 			"GET /v1/packages/proof/remote-job/releases/3.0.0" {
 		t.Fatalf("remote production metadata routes =\n%s", got)
 	}
+	if producerCardReads != 1 {
+		t.Fatalf("self-step re-resolved an advanced producer catalog %d times", producerCardReads)
+	}
 	jobReleases = []map[string]any{
 		{"release": "2.9.0", "cut_at": "2026-08-31T00:00:00Z"},
 		{"release": "4.0.0", "cut_at": "2026-08-31T00:00:00Z"},
 	}
 	requests = nil
+	producerCardReads = 0
 	code, out = runCozyDir(t, root, "", []string{"PATH=/usr/bin:/bin"},
 		"model", "publish", "acme/output", "acme/input@1.0.0", "--release", "1.0.0",
 		"--producer", "proof/remote-producer@v2/build", "--rental", "--dry-run")
