@@ -77,9 +77,9 @@ func handleRunExecute(ctx *Context) *exit.Error {
 			"private rental dispatch for job callables is not implemented").
 			WithRemedy("run this job locally, or choose a serving entrypoint on the rental")
 	}
-	if ctx.Inv.Bool("--stream") || len(ctx.Inv.Values["--asset"]) > 0 ||
+	if ctx.Inv.Bool("--stream") || ctx.Inv.Bool("--cloud") || len(ctx.Inv.Values["--asset"]) > 0 ||
 		ctx.Inv.Value("--out") != "" || ctx.Inv.Value("--timeout") != "" ||
-		ctx.Inv.Value("--max-cost") != "" {
+		(ctx.Inv.Value("--machine") != "" && ctx.Inv.Value("--machine") != "local") {
 		return exit.Usagef("the selected callable is a job and received a serving-only flag").
 			WithRemedy("jobs accept payload values, --in, --input-tree, --org, --detach, and local execution")
 	}
@@ -99,13 +99,21 @@ func handleRun(ctx *Context, target Target, ep *launch.Entrypoint) *exit.Error {
 	// runtime vouched for at install — so a typo costs a millisecond instead of a model
 	// load, and `steps=2` is an int because the schema says int.
 	machine := strings.TrimSpace(ctx.Inv.Value("--machine"))
-	maxCost, e := runMaxCost(ctx.Inv.Value("--max-cost"))
-	if e != nil {
-		return e
+	local, cloud := ctx.Inv.Bool("--local"), ctx.Inv.Bool("--cloud")
+	choices := 0
+	for _, chosen := range []bool{local, cloud, machine != ""} {
+		if chosen {
+			choices++
+		}
 	}
-	if machine != "" && maxCost > 0 {
-		return exit.Usagef("--max-cost and --machine are mutually exclusive").
-			WithRemedy("remove --machine to allow local-first automatic placement")
+	if choices > 1 {
+		return exit.Usagef("--local, --cloud, and --machine are mutually exclusive").
+			WithRemedy("choose exactly one placement mode")
+	}
+	if cloud && ctx.Cfg.CloudMaxHourlySpendUSDMicros <= 0 {
+		return exit.Named(exit.Usage, "cloud.spend_cap_required",
+			"--cloud requires a positive cloud.max_hourly_spend_usd in %s", filepath.Join(ctx.Cfg.Home, "config.yaml")).
+			WithRemedy("set the fleet-wide hourly ceiling before authorizing cloud spend")
 	}
 	if legacy := launch.LegacyFileTerm(ctx.Inv.Args[1:]); machine != "" && machine != "local" && legacy != "" {
 		return exit.Named(exit.Usage, "remote_file_input_ambiguous",
@@ -133,7 +141,7 @@ func handleRun(ctx *Context, target Target, ep *launch.Entrypoint) *exit.Error {
 	handle, e := c.Submit(api.Submission{
 		Package: target.Package, Function: target.Function, Input: input,
 		Worker: target.MachineID, LocalAssets: assets, InstallID: target.InstallID,
-		MaxCostUSDMicros: maxCost,
+		Cloud: cloud,
 	}, key)
 	if e != nil {
 		return e
@@ -390,42 +398,6 @@ func runDeadline(ctx *Context) (time.Duration, *exit.Error) {
 			WithRemedy("durations are Go-spelled: 30s, 5m, 1h30m")
 	}
 	return d, nil
-}
-
-func runMaxCost(value string) (int64, *exit.Error) {
-	value = strings.TrimSpace(value)
-	if value == "" {
-		return 0, nil
-	}
-	whole, fraction, decimal := strings.Cut(value, ".")
-	if whole == "" || strings.Contains(fraction, ".") || len(fraction) > 6 || decimal && fraction == "" {
-		return 0, invalidMaxCost(value)
-	}
-	for _, part := range []string{whole, fraction} {
-		for _, character := range part {
-			if character < '0' || character > '9' {
-				return 0, invalidMaxCost(value)
-			}
-		}
-	}
-	if !decimal {
-		fraction = ""
-	}
-	micros := whole + fraction + strings.Repeat("0", 6-len(fraction))
-	micros = strings.TrimLeft(micros, "0")
-	if micros == "" {
-		return 0, nil
-	}
-	amount, err := strconv.ParseInt(micros, 10, 64)
-	if err != nil {
-		return 0, invalidMaxCost(value)
-	}
-	return amount, nil
-}
-
-func invalidMaxCost(value string) *exit.Error {
-	return exit.Usagef("--max-cost %q is not a non-negative USD amount", value).
-		WithRemedy("use decimal USD with at most six places, such as 2.00")
 }
 
 // progress renders the live lane. Two shapes, and they are not the same surface:

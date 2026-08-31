@@ -64,7 +64,7 @@ CREATE TABLE IF NOT EXISTS requests (
   org          TEXT    NOT NULL DEFAULT '',
   trees        TEXT    NOT NULL DEFAULT '',
   worker       TEXT    NOT NULL DEFAULT '',
-  max_cost_usd_micros INTEGER NOT NULL DEFAULT 0,
+  cloud        INTEGER NOT NULL DEFAULT 0,
   install_id   TEXT    REFERENCES install_generations(id),
   assets       TEXT    NOT NULL DEFAULT '[]',
   artifact_outputs TEXT NOT NULL DEFAULT '[]'
@@ -432,8 +432,8 @@ type Request struct {
 	// It lives on the request because a requeue must re-derive the same placement
 	// without a client saying so again. Empty = any local worker.
 	Worker string
-	// MaxCostUSDMicros is the exact automatic-rental authorization. Zero forbids spend.
-	MaxCostUSDMicros int64
+	// Cloud authorizes placement on Creator-managed rented capacity.
+	Cloud bool
 	// InstallID pins the exact immutable local metadata generation resolved before
 	// submission. The initial remote lane reads only its published release and descriptor.
 	InstallID string
@@ -464,7 +464,7 @@ type AssetBinding struct {
 
 const requestCols = `id,idem_key,body_digest,package,entrypoint,plan_id,
 	package_revision_digest,environment_digest,config_digest,payload,outputs,
-	state,ordinal,requeues,created_at,kind,org,trees,worker,max_cost_usd_micros,
+	state,ordinal,requeues,created_at,kind,org,trees,worker,cloud,
 	COALESCE(install_id,''),assets,artifact_outputs`
 
 func scanRequest(row interface{ Scan(...any) error }) (Request, error) {
@@ -473,7 +473,7 @@ func scanRequest(row interface{ Scan(...any) error }) (Request, error) {
 	err := row.Scan(&r.ID, &r.IdemKey, &r.BodyDigest, &r.Package, &r.Entrypoint, &r.PlanID,
 		&r.PackageRevisionDigest, &r.EnvironmentDigest, &r.ConfigDigest, &r.Payload, &r.Outputs,
 		&r.State, &r.Ordinal, &r.Requeues, &r.CreatedAt,
-		&r.Kind, &r.Org, &r.Trees, &r.Worker, &r.MaxCostUSDMicros,
+		&r.Kind, &r.Org, &r.Trees, &r.Worker, &r.Cloud,
 		&r.InstallID, &assets, &r.ArtifactOutputs)
 	if err == nil && assets != "" {
 		err = json.Unmarshal([]byte(assets), &r.Assets)
@@ -783,12 +783,12 @@ func submitRequestTx(tx *sql.Tx, r Request, assets string) (Request, bool, *exit
 	}
 	if _, err := tx.Exec(`INSERT INTO requests(id,idem_key,body_digest,package,entrypoint,
 		plan_id,package_revision_digest,environment_digest,config_digest,
-		payload,outputs,state,ordinal,requeues,created_at,kind,org,trees,worker,max_cost_usd_micros,install_id,assets,
+		payload,outputs,state,ordinal,requeues,created_at,kind,org,trees,worker,cloud,install_id,assets,
 		artifact_outputs)
 		VALUES(?,?,?,?,?,?,?,?,?,?,?,?,0,0,?,?,?,?,?,?,?,?,?)`,
 		r.ID, r.IdemKey, r.BodyDigest, r.Package, r.Entrypoint, r.PlanID,
 		r.PackageRevisionDigest, r.EnvironmentDigest, r.ConfigDigest, r.Payload,
-		r.Outputs, r.State, r.CreatedAt, r.Kind, r.Org, r.Trees, r.Worker, r.MaxCostUSDMicros,
+		r.Outputs, r.State, r.CreatedAt, r.Kind, r.Org, r.Trees, r.Worker, r.Cloud,
 		nullable(r.InstallID),
 		assets, r.ArtifactOutputs); err != nil {
 		return Request{}, false, exit.Internalf("cannot record request %s: %s", r.ID, err)

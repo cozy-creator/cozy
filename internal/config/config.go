@@ -12,6 +12,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 
@@ -48,8 +49,10 @@ type Config struct {
 	Tfs       string
 	TfsSource string
 
-	LocalRateMicroUSDPerHour int64
-	LocalRateSource          string
+	LocalRateMicroUSDPerHour     int64
+	LocalRateSource              string
+	CloudMaxHourlySpendUSDMicros int64
+	CloudMaxHourlySpendSource    string
 
 	// Bootstrap is launcher-only. It is admitted from the process environment,
 	// never config.yaml, argv, or a child inheritance list.
@@ -65,6 +68,7 @@ type values struct {
 	HubToken                 string `name:"tensorhub_token"`
 	Tfs                      string `name:"tfs" default:"tfs"`
 	LocalRateMicroUSDPerHour int64  `name:"local_rate_micro_usd_per_hour" default:"0"`
+	CloudMaxHourlySpendUSD   string `name:"cloud_max_hourly_spend_usd" default:"0"`
 	Port                     int    `name:"port" default:"8818"`
 	Yield                    string `name:"yield" default:"smart" enum:"smart,always,never"`
 	Bootstrap                string `name:"bootstrap"`
@@ -80,6 +84,9 @@ func (v *values) Validate() error {
 	if v.LocalRateMicroUSDPerHour < 0 {
 		return fmt.Errorf("local_rate_micro_usd_per_hour must be non-negative")
 	}
+	if _, err := usdMicros(v.CloudMaxHourlySpendUSD); err != nil {
+		return fmt.Errorf("cloud.max_hourly_spend_usd %q is not a non-negative USD amount with at most six decimal places", v.CloudMaxHourlySpendUSD)
+	}
 	if v.Port < 0 || v.Port > 65535 {
 		return fmt.Errorf("port %d is not a TCP port or zero for automatic selection", v.Port)
 	}
@@ -93,6 +100,11 @@ var fileKeys = map[string]bool{
 	"local_rate_micro_usd_per_hour": true,
 	"port":                          true,
 	"yield":                         true,
+	"cloud":                         true,
+}
+
+var cloudFileKeys = map[string]string{
+	"max_hourly_spend_usd": "cloud_max_hourly_spend_usd",
 }
 
 var environmentNames = map[string]string{
@@ -134,23 +146,29 @@ func load() (Config, *exit.Error) {
 		return Config{}, exit.Usagef("configuration is invalid: %s", err).
 			WithRemedy("check %s and the admitted COZY_/TENSORHUB_ environment values", filepath.Join(home, FileName))
 	}
+	cloudCap, err := usdMicros(input.CloudMaxHourlySpendUSD)
+	if err != nil {
+		return Config{}, exit.Usagef("configuration is invalid: %s", err)
+	}
 
 	hubToken := secret.New(input.HubToken)
 	c := Config{
-		Home:                     home,
-		Port:                     input.Port,
-		PortSource:               sourceOf("port", file, environment, "default"),
-		Yield:                    input.Yield,
-		HubURL:                   strings.TrimRight(strings.TrimSpace(input.HubURL), "/"),
-		HubToken:                 hubToken,
-		HubURLSource:             sourceOf("tensorhub_url", file, environment, "default"),
-		HubTokenSource:           sourceOf("tensorhub_token", file, environment, "unset"),
-		Tfs:                      strings.TrimSpace(input.Tfs),
-		TfsSource:                sourceOf("tfs", file, environment, "default"),
-		LocalRateMicroUSDPerHour: input.LocalRateMicroUSDPerHour,
-		LocalRateSource:          sourceOf("local_rate_micro_usd_per_hour", file, environment, "unset"),
-		Bootstrap:                secret.New(input.Bootstrap),
-		inherited:                inherited,
+		Home:                         home,
+		Port:                         input.Port,
+		PortSource:                   sourceOf("port", file, environment, "default"),
+		Yield:                        input.Yield,
+		HubURL:                       strings.TrimRight(strings.TrimSpace(input.HubURL), "/"),
+		HubToken:                     hubToken,
+		HubURLSource:                 sourceOf("tensorhub_url", file, environment, "default"),
+		HubTokenSource:               sourceOf("tensorhub_token", file, environment, "unset"),
+		Tfs:                          strings.TrimSpace(input.Tfs),
+		TfsSource:                    sourceOf("tfs", file, environment, "default"),
+		LocalRateMicroUSDPerHour:     input.LocalRateMicroUSDPerHour,
+		LocalRateSource:              sourceOf("local_rate_micro_usd_per_hour", file, environment, "unset"),
+		CloudMaxHourlySpendUSDMicros: cloudCap,
+		CloudMaxHourlySpendSource:    sourceOf("cloud_max_hourly_spend_usd", file, environment, "unset"),
+		Bootstrap:                    secret.New(input.Bootstrap),
+		inherited:                    inherited,
 	}
 	if !hubToken.Present() {
 		c.HubTokenSource = "unset"
@@ -237,8 +255,12 @@ func sourceOf(name string, file, environment *resolver, fallback string) string 
 func knownFileKeys() string {
 	keys := make([]string, 0, len(fileKeys))
 	for key := range fileKeys {
+		if key == "cloud" {
+			continue
+		}
 		keys = append(keys, key)
 	}
+	keys = append(keys, "cloud.max_hourly_spend_usd")
 	sort.Strings(keys)
 	return strings.Join(keys, ", ")
 }
@@ -299,12 +321,56 @@ func strictYAML(reader io.Reader) (*resolver, error) {
 		if _, exists := values[key.Value]; exists {
 			return nil, fmt.Errorf("line %d names %q twice", key.Line, key.Value)
 		}
+		if key.Value == "cloud" {
+			if value.Kind != yaml.MappingNode {
+				return nil, fmt.Errorf("line %d value for %q is not a mapping", value.Line, key.Value)
+			}
+			for j := 0; j < len(value.Content); j += 2 {
+				nestedKey, nestedValue := value.Content[j], value.Content[j+1]
+				name, ok := cloudFileKeys[nestedKey.Value]
+				if nestedKey.Kind != yaml.ScalarNode || !ok {
+					return nil, fmt.Errorf("line %d names unknown key %q", nestedKey.Line, "cloud."+nestedKey.Value)
+				}
+				if _, exists := values[name]; exists {
+					return nil, fmt.Errorf("line %d names %q twice", nestedKey.Line, "cloud."+nestedKey.Value)
+				}
+				if nestedValue.Kind != yaml.ScalarNode {
+					return nil, fmt.Errorf("line %d value for %q is not a scalar", nestedValue.Line, "cloud."+nestedKey.Value)
+				}
+				values[name] = nestedValue.Value
+			}
+			continue
+		}
 		if value.Kind != yaml.ScalarNode {
 			return nil, fmt.Errorf("line %d value for %q is not a scalar", value.Line, key.Value)
 		}
 		values[key.Value] = value.Value
 	}
 	return &resolver{values: values}, nil
+}
+
+func usdMicros(value string) (int64, error) {
+	value = strings.TrimSpace(value)
+	whole, fraction, decimal := strings.Cut(value, ".")
+	if whole == "" || strings.Contains(fraction, ".") || len(fraction) > 6 || decimal && fraction == "" {
+		return 0, fmt.Errorf("invalid USD amount %q", value)
+	}
+	for _, part := range []string{whole, fraction} {
+		for _, character := range part {
+			if character < '0' || character > '9' {
+				return 0, fmt.Errorf("invalid USD amount %q", value)
+			}
+		}
+	}
+	micros := strings.TrimLeft(whole+fraction+strings.Repeat("0", 6-len(fraction)), "0")
+	if micros == "" {
+		return 0, nil
+	}
+	amount, err := strconv.ParseInt(micros, 10, 64)
+	if err != nil {
+		return 0, fmt.Errorf("invalid USD amount %q", value)
+	}
+	return amount, nil
 }
 
 // Child constructs a child process's complete environment. Imposed values win

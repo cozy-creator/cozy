@@ -70,8 +70,8 @@ type Submission struct {
 	// In the initial weightless remote lane it supplies only the exact logical release
 	// and request/result descriptor; no local platform facts cross the control stream.
 	InstallID string
-	// MaxCostUSDMicros authorizes automatic rental spend for this request. Zero forbids it.
-	MaxCostUSDMicros int64
+	// Cloud authorizes placement on Creator-managed rented capacity.
+	Cloud bool
 }
 
 const ArtifactSnapshotMime = "application/vnd.cozy.tensorfs.snapshot"
@@ -152,10 +152,10 @@ func requestRecord(s Submission) (records.Request, map[string]any, *exit.Error) 
 	bodyDigest := s.BodyDigest
 	if bodyDigest == "" {
 		identity := s.Payload
-		if s.MaxCostUSDMicros > 0 {
+		if s.Cloud {
 			encoded, err := canonical.Write(map[string]canonical.Value{
-				"payload":             base64.StdEncoding.EncodeToString(s.Payload),
-				"max_cost_usd_micros": s.MaxCostUSDMicros,
+				"payload": base64.StdEncoding.EncodeToString(s.Payload),
+				"cloud":   true,
 			})
 			if err != nil {
 				return records.Request{}, nil, exit.Internalf("cannot encode request budget identity: %s", err)
@@ -178,15 +178,15 @@ func requestRecord(s Submission) (records.Request, map[string]any, *exit.Error) 
 		Outputs: strings.Join(s.Outputs, ","),
 		Assets:  s.Assets, ArtifactOutputs: string(artifactBytes),
 		Kind: s.Kind, Org: s.Org, Trees: strings.Join(s.Trees, ","),
-		Worker: s.Worker, InstallID: s.InstallID, MaxCostUSDMicros: s.MaxCostUSDMicros,
+		Worker: s.Worker, InstallID: s.InstallID, Cloud: s.Cloud,
 	}
 	event := map[string]any{
 		"package": s.Package, "function": s.Entrypoint,
 		"body_digest": bodyDigest, "plan_id": s.PlanID, "outputs": s.Outputs,
 		"artifact_outputs": artifactOutputs,
 	}
-	if s.MaxCostUSDMicros > 0 {
-		event["max_cost_usd_micros"] = s.MaxCostUSDMicros
+	if s.Cloud {
+		event["cloud"] = true
 	}
 	return req, event, nil
 }
@@ -507,17 +507,7 @@ func (c *Orchestrator) selectOrStart(req records.Request) {
 	}()
 }
 
-func autoRentalGate(req records.Request, cause *exit.Error) *exit.Error {
-	if req.MaxCostUSDMicros <= 0 ||
-		(cause.Code != exit.Capacity && cause.Code != exit.Unavailable) {
-		return cause
-	}
-	return exit.Named(exit.Unavailable, "rental.package_preparation_unavailable",
-		"automatic rental is authorized up to %d USD micros, but this build cannot prepare "+
-			"the signed package/model set on a generic worker; no rental was purchased",
-		req.MaxCostUSDMicros).
-		WithRemedy("keep the request budget; package preparation must land before paid fallback is enabled")
-}
+func autoRentalGate(_ records.Request, cause *exit.Error) *exit.Error { return cause }
 
 // staged answers whether this worker was launched with the given plan id staged for it.
 // It reads what the LAUNCHER wrote, not what the worker has got around to advertising: a
