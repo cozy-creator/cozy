@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/rand"
 	"crypto/sha256"
+	"encoding/binary"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
@@ -114,6 +115,10 @@ func handleRun(ctx *Context, target Target, ep *launch.Entrypoint) *exit.Error {
 	if e != nil {
 		return e
 	}
+	key := ctx.Inv.Value("--idempotency-key")
+	if key == "" {
+		key = mintKey()
+	}
 
 	// THE PAYLOAD IS TYPED AGAINST THE RECORDED SCHEMA — the surface the release's own
 	// runtime vouched for at install — so a typo costs a millisecond instead of a model
@@ -132,6 +137,10 @@ func handleRun(ctx *Context, target Target, ep *launch.Entrypoint) *exit.Error {
 	if e != nil {
 		return e
 	}
+	input, outputHash, e := finalizeInputPayload(ep, input, key)
+	if e != nil {
+		return e
+	}
 	models := []orchestrator.ModelRef(nil)
 	if managedRental {
 		models, e = resolveRemoteModels(ctx, target.Package, ep, ctx.Inv.Values["--model"])
@@ -145,10 +154,6 @@ func handleRun(ctx *Context, target Target, ep *launch.Entrypoint) *exit.Error {
 	c, e := dial(ctx)
 	if e != nil {
 		return e
-	}
-	key := ctx.Inv.Value("--idempotency-key")
-	if key == "" {
-		key = mintKey()
 	}
 	began := time.Now()
 	handle, e := c.Submit(api.Submission{
@@ -180,6 +185,9 @@ func handleRun(ctx *Context, target Target, ep *launch.Entrypoint) *exit.Error {
 				handle.RequestID, handle.Attempt, handle.Status)
 		} else {
 			fmt.Fprintf(ctx.Err, "Invoking %s/%s...\n", target.Package, target.Function)
+			if dir := ctx.Inv.Value("--out"); dir != "" {
+				fmt.Fprintf(ctx.Err, "Saving outputs as %s\n", outputPathHint(ep, dir, outputHash))
+			}
 		}
 		if handle.Replay {
 			fmt.Fprintln(ctx.Err, "note: this key returned the existing invocation")
@@ -194,7 +202,7 @@ func handleRun(ctx *Context, target Target, ep *launch.Entrypoint) *exit.Error {
 	if e != nil {
 		return e
 	}
-	saved, e := saveOutputs(ctx, c, life)
+	saved, e := saveOutputs(ctx, c, life, outputHash)
 	if e != nil {
 		return e
 	}
@@ -743,32 +751,40 @@ func compactValue(v map[string]any) string {
 // saveOutputs fetches every accepted output by its OPAQUE id and writes it under --out.
 // The filename comes from the output's FIELD PATH plus the mime type the manifest
 // declared — the CLI composes no path a server did not name.
-func saveOutputs(ctx *Context, c *localapi.Client, life api.Lifecycle) ([]map[string]string, *exit.Error) {
+func saveOutputs(ctx *Context, c *localapi.Client, life api.Lifecycle,
+	requestHash string,
+) ([]map[string]string, *exit.Error) {
 	dir := ctx.Inv.Value("--out")
-	return saveOutputsAt(c, life, dir)
+	return saveOutputsAt(c, life, dir, requestHash)
 }
 
 // saveOutputsAt is the one verified local-download path for ordinary requests and
 // accepted result downloads: every output is received through the opaque media API, hashed
 // independently, checked against the request manifest, and published as one set.
-func saveOutputsAt(c *localapi.Client, life api.Lifecycle, dir string) ([]map[string]string, *exit.Error) {
+func saveOutputsAt(c *localapi.Client, life api.Lifecycle, dir, requestHash string) (
+	[]map[string]string, *exit.Error,
+) {
 	if dir == "" || len(life.Outputs) == 0 {
 		return nil, nil
 	}
-	names, e := outputNames(life.Outputs)
+	names, e := outputNames(life.Outputs, requestHash)
 	if e != nil {
 		return nil, e
 	}
 	return publishOutputSet(dir, life.Outputs, names, c.Media)
 }
 
-// outputNames names each saved file by the output's own FIELD-PATH id plus the extension
-// its declared MIME type earns — `image` -> `image.png` — so a two-output result is
-// addressable by name and a caller never has to know the manifest's order (decisions #248
-// and #375). The id is the same single path element the grant was fenced to; it is fenced
-// again here, because a client writing into the caller's own directory verifies rather
-// than trusts. An untyped output keeps its bare field path and no extension.
-func outputNames(outputs []api.MediaRef) ([]string, *exit.Error) {
+// outputNames starts every saved filename with the hash of the finalized input payload.
+// A single output is simply `<payload-hash>.<type>`; multiple outputs retain their
+// field-path identities as `<payload-hash>-<field-path>.<type>`.
+//
+// The extension still comes only from the terminal manifest's MIME type. The request hash
+// and filename stem are known before execution, but the CLI does not guess the encoding
+// of bytes that do not exist yet.
+func outputNames(outputs []api.MediaRef, requestHash string) ([]string, *exit.Error) {
+	if len(requestHash) != sha256.Size*2 || strings.Trim(requestHash, "0123456789abcdef") != "" {
+		return nil, exit.Internalf("cannot name outputs with malformed request hash %q", requestHash)
+	}
 	names := make([]string, len(outputs))
 	seenIDs, seenNames := map[string]bool{}, map[string]bool{}
 	for index, out := range outputs {
@@ -780,7 +796,11 @@ func outputNames(outputs []api.MediaRef) ([]string, *exit.Error) {
 		if e := orchestrator.FenceOutputID(out.OutputID); e != nil {
 			return nil, e
 		}
-		names[index] = out.OutputID + extensionOf(out.MimeType)
+		stem := requestHash
+		if len(outputs) > 1 {
+			stem += "-" + out.OutputID
+		}
+		names[index] = stem + extensionOf(out.MimeType)
 		if seenNames[names[index]] {
 			return nil, exit.Named(exit.Validation, "output_name_collision",
 				"two output manifest rows resolve to %s", names[index])
@@ -788,6 +808,22 @@ func outputNames(outputs []api.MediaRef) ([]string, *exit.Error) {
 		seenNames[names[index]] = true
 	}
 	return names, nil
+}
+
+func outputPathHint(ep *launch.Entrypoint, dir, payloadHash string) string {
+	paths := launch.AssetPaths(ep.Result)
+	if len(paths) != 1 {
+		return filepath.Join(dir, payloadHash+"*")
+	}
+	spec, ok := launch.ResultAssetSpec(ep, paths[0])
+	if !ok || len(spec.MediaTypes) != 1 {
+		return filepath.Join(dir, payloadHash+"*")
+	}
+	extension := extensionOf(spec.MediaTypes[0])
+	if extension == "" {
+		return filepath.Join(dir, payloadHash+"*")
+	}
+	return filepath.Join(dir, payloadHash+extension)
 }
 
 type mediaFetch func(mediaID string, receive func(localapi.MediaResponse) *exit.Error) *exit.Error
@@ -1118,6 +1154,41 @@ func mintKey() string {
 		return "idem-" + fmt.Sprint(time.Now().UnixNano())
 	}
 	return "idem-" + hex.EncodeToString(b[:])
+}
+
+// finalizeInputPayload closes the one intentional client-side default that changes
+// output identity: an omitted top-level integer `seed`. Its value is derived from the
+// already-minted idempotency key, so a normal invocation gets fresh entropy while an
+// explicit-key retry reconstructs byte-identical input instead of conflicting with its
+// recorded request. An explicitly supplied seed is never changed.
+//
+// The returned hash is SHA-256 of the exact normalized JSON bytes submitted to the daemon.
+// It therefore exists before execution and names the output independently of result bytes.
+func finalizeInputPayload(ep *launch.Entrypoint, input json.RawMessage,
+	idempotencyKey string,
+) (json.RawMessage, string, *exit.Error) {
+	var document map[string]json.RawMessage
+	if err := json.Unmarshal(input, &document); err != nil || document == nil {
+		return nil, "", exit.Internalf("cannot finalize the invocation payload: %v", err)
+	}
+	for _, field := range ep.Request.Fields {
+		if field.Name != "seed" || string(field.Type) != `"int"` {
+			continue
+		}
+		if _, supplied := document[field.Name]; !supplied {
+			digest := sha256.Sum256([]byte("cozy-seed\x00" + idempotencyKey))
+			// 53 bits stay exact in every JSON implementation used by the worker protocol.
+			seed := binary.BigEndian.Uint64(digest[:8]) & ((uint64(1) << 53) - 1)
+			document[field.Name] = json.RawMessage(strconv.FormatUint(seed, 10))
+		}
+		break
+	}
+	rendered, err := json.Marshal(document)
+	if err != nil {
+		return nil, "", exit.Internalf("cannot render the finalized invocation payload: %s", err)
+	}
+	digest := sha256.Sum256(rendered)
+	return rendered, hex.EncodeToString(digest[:]), nil
 }
 
 // ------------------------------------------------------------------- target parsing

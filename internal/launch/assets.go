@@ -148,6 +148,17 @@ func AssetSpec(ep *Entrypoint, path string) (AssetField, bool) {
 	return assetSpecAt(ep.Request, parts, AssetField{})
 }
 
+// ResultAssetSpec returns the exact asset kind, byte bound, and media types declared for
+// one result path. Unlike AssetSpec it reads the result schema; output naming uses it to
+// announce an exact destination before execution when the package declares one MIME type.
+func ResultAssetSpec(ep *Entrypoint, path string) (AssetField, bool) {
+	parts, problem := assetPath(path)
+	if problem != nil {
+		return AssetField{}, false
+	}
+	return assetSpecAt(ep.Result, parts, AssetField{})
+}
+
 func assetSpecAt(root Struct, parts []string, inherited AssetField) (AssetField, bool) {
 	if len(parts) == 0 {
 		return AssetField{}, false
