@@ -39,6 +39,13 @@ Creator omits only the remote platform families that a rental may not replace: P
 Runtime, TensorFS, and their platform closure. Ordinary libraries remain package-owned. Runtime
 compares those platform requirements with the base Tensorhub selected before installing the package
 environment.
+
+For local installation, Creator creates a normal uv venv using the release's Python requirement.
+It exports the already-committed `uv.lock` with `--frozen` because author-local source paths no
+longer exist on the consumer; those distributions come from their exact published wheels. Registry
+rows install with their lock hashes, then the project/custom wheels install without builds, and
+`uv pip check` joins the complete environment back to the wheel requirements. Publication itself
+already ran `uv export --locked`, so a mismatched project and lock never became a release.
 Cozy refuses `.env*`, credentials, keys, bytecode, and model-weight files instead of silently
 omitting them. It skips VCS directories, virtual environments, caches, editor state, and build
 output. Modified and ordinary untracked files are published normally.

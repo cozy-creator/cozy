@@ -561,11 +561,18 @@ func TestPackagePublishDownloadsLockedRegistryDependency(t *testing.T) {
 		t.Fatalf("%s: %s", problem.Message, problem.Remedy)
 	}
 	defer pack.Close()
-	if len(pack.DependencyWheels) != 1 {
-		t.Fatalf("registry dependency wheel count = %d, want 1", len(pack.DependencyWheels))
+	if len(pack.DependencyWheels) != 2 {
+		t.Fatalf("registry dependency wheel count = %d, want runtime plus humanize", len(pack.DependencyWheels))
 	}
-	dependency, problem := wheel.InspectIdentity(pack.DependencyWheels[0].Path)
-	fatal(t, problem)
+	var dependency wheel.Identity
+	var dependencyPath string
+	for _, candidate := range pack.DependencyWheels {
+		identity, inspectProblem := wheel.InspectIdentity(candidate.Path)
+		fatal(t, inspectProblem)
+		if identity.Distribution == "humanize" {
+			dependency, dependencyPath = identity, candidate.Path
+		}
+	}
 	if dependency.Distribution != "humanize" || dependency.Version != "4.13.0" ||
 		!strings.HasSuffix(dependency.Filename, "-py3-none-any.whl") {
 		t.Fatalf("registry dependency identity = %+v", dependency)
@@ -580,7 +587,7 @@ func TestPackagePublishDownloadsLockedRegistryDependency(t *testing.T) {
 	}
 	venvPython := filepath.Join(venv, "bin", "python")
 	command = exec.Command("uv", "pip", "install", "--python", venvPython, "--offline", "--no-index",
-		"--no-deps", pack.Wheel, pack.DependencyWheels[0].Path)
+		"--no-deps", pack.Wheel, dependencyPath)
 	if output, err := command.CombinedOutput(); err != nil {
 		t.Fatalf("offline exact-wheel install: %v\n%s", err, output)
 	}

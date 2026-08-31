@@ -173,6 +173,12 @@ func (r *Resolver) RefreshEditable(pkg string) (installID string, editable, chan
 	if result.Gen.ID == "" {
 		return refreshFailure(exit.Internalf("editable refresh returned no active generation"))
 	}
+	if result.Superseded != "" {
+		// Activation already committed the replacement. Reclaim the now-unpinned immutable
+		// generation just like an explicit install does; an exceptional cleanup failure must
+		// not misreport the newly active environment as a failed refresh.
+		_, _ = install.Reclaim(layout, r.store, result.Superseded)
+	}
 	return result.Gen.ID, true, !result.Idempotent, nil
 }
 

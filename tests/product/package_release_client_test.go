@@ -243,7 +243,7 @@ func TestPackagePublishPendingWireFlowBoundsUploads(t *testing.T) {
 				Paths            []string `json:"paths"`
 				DependencyWheels []string `json:"dependency_wheels"`
 			}
-			if err := json.NewDecoder(r.Body).Decode(&body); err != nil || len(body.Paths) < 50 || len(body.DependencyWheels) != 0 {
+			if err := json.NewDecoder(r.Body).Decode(&body); err != nil || len(body.Paths) < 50 || len(body.DependencyWheels) != 1 {
 				t.Errorf("Creator did not declare the complete source set: paths=%d dependencies=%v err=%v",
 					len(body.Paths), body.DependencyWheels, err)
 			}
@@ -261,6 +261,13 @@ func TestPackagePublishPendingWireFlowBoundsUploads(t *testing.T) {
 					"already_uploaded": false, "kind": "source", "path": path,
 					"required_headers": map[string]string{},
 					"url":              server.URL + "/storage/" + strconv.Itoa(i),
+				})
+			}
+			for i, path := range body.DependencyWheels {
+				uploads = append(uploads, map[string]any{
+					"already_uploaded": false, "kind": "dependency_wheel", "path": path,
+					"required_headers": map[string]string{},
+					"url":              server.URL + "/storage/dependency-" + strconv.Itoa(i),
 				})
 			}
 			_ = json.NewEncoder(w).Encode(map[string]any{"state": "pending", "uploads": uploads})
@@ -281,9 +288,9 @@ func TestPackagePublishPendingWireFlowBoundsUploads(t *testing.T) {
 	if code != 0 || !strings.Contains(out, "status:  published") ||
 		strings.Contains(out, "package_release_digest:") || strings.Contains(out, "qualification:") ||
 		!strings.Contains(out, "Building package wheel and local dependencies...") ||
-		!strings.Contains(out, "Declaring 52 source files and 0 dependency wheels...") ||
-		!strings.Contains(out, "Uploading files: 0/54") ||
-		!strings.Contains(out, "Uploading files: 54/54") ||
+		!strings.Contains(out, "Declaring 52 source files and 1 dependency wheels...") ||
+		!strings.Contains(out, "Uploading files: 0/55") ||
+		!strings.Contains(out, "Uploading files: 55/55") ||
 		!strings.Contains(out, "Committing exact package release...") {
 		t.Fatalf("pending package wire flow failed [exit %d]\n%s", code, out)
 	}
