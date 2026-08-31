@@ -281,11 +281,9 @@ func (p DesiredPlacement) EntrypointDigest(name string) (string, *exit.Error) {
 // IsJob answers the worker's mode, from the one placement it hosts.
 func (s WorkerLaunchSpec) IsJob() bool { return s.Placement.IsJob() }
 
-// InstanceID is the package's local worker SLOT identity, and it is deliberately STABLE
-// across supervisor restarts: `worker_instance_id` names one provisioned instance
-// lifetime, and outcome replay across a restart is authorized by that identity (02 §2). A
-// slot keeps its journal root, which is what lets a restarted worker report its held
-// attempts at all. A NEW install is a genuinely new instance and gets a new id.
+// InstanceID is the package's stable local worker SLOT identity. Creator's records store
+// owns attempts across child restarts; Runtime itself retains no recovery state. A NEW
+// install is a genuinely new instance and gets a new id.
 func (p DesiredPlacement) InstanceID() string {
 	slot := "slot/" + p.Package + "/" + p.InstallID
 	if p.IsJob() {
@@ -865,9 +863,8 @@ func hostsPlans(w *worker, p DesiredPlacement) bool {
 // granted an envelope cannot appear, and two concurrent starts cannot both consume one.
 func (c *Orchestrator) spawnWorker(spec WorkerLaunchSpec) (string, *exit.Error) {
 	instanceID := spec.InstanceID()
-	// The slot's root is REUSED on purpose: the worker journal under it is what a
-	// restarted worker replays as `recovered_attempts`. Wiping it would manufacture the
-	// absence this protocol refuses to manufacture.
+	// The slot root is reused for logs and local paths only. Attempt authority stays in
+	// Creator's records store; Runtime owns no durable journal under this directory.
 	root := c.opt.Layout.WorkerDir(instanceID)
 	workerHome := filepath.Join(root, "home")
 	if err := os.MkdirAll(workerHome, 0o755); err != nil {
@@ -1513,7 +1510,7 @@ func (c *Orchestrator) ShutdownWorker(instanceID string, grace time.Duration) {
 }
 
 // shutdownWorker stops exactly the worker object the caller observed. Instance ids are
-// deterministic and reused for journal recovery, so an id-only teardown can otherwise close
+// deterministic and reused across child restarts, so an id-only teardown can otherwise close
 // the replacement's row after the old process exits. The caller that wins stopping owns all
 // four acts: close control, reap process, close the row, remove the in-memory worker.
 func (c *Orchestrator) shutdownWorker(w *worker, grace time.Duration) bool {
@@ -1734,21 +1731,32 @@ func (c *Orchestrator) Reconcile() (killed, forgotten int, e *exit.Error) {
 	if len(owed) > 0 {
 		go c.reviveQueue()
 	}
-	// AND THE ATTEMPTS THAT OWE A TERMINAL. Killing an orphan is only half of a restart:
-	// the attempts it held are unsettled, and the ONE thing that can settle them is the
-	// supervisor's own journal replayed by a worker in the SAME SLOT (02 §6.2). Nothing
-	// else in this process will ask for that slot — the requests are not queued, they have
-	// ordinals — so a job dispatched moments before a `kill -9` of the orchestrator hung
-	// forever. Found live by cl-004's crash arm; cl-006's own crash section had been
-	// POSTing /v1/local/workers by hand to work around it.
+	// AND THE ATTEMPTS THAT OWE A TERMINAL. Remote rentals reconnect to pod-supervisor,
+	// whose worker-local ledger replays their exact state. Local Runtime is stateless, so
+	// Creator settles its own persisted assignment as ABANDONED and requeues it; restarting
+	// an execution child to ask it what happened would recreate the duplicate journal this
+	// boundary removes.
 	unsettled, e := c.opt.Store.Unsettled()
 	if e != nil {
 		return killed, forgotten, e
 	}
 	for _, req := range unsettled {
-		c.logf("%s holds an attempt with no terminal; making its slot resident so the "+
-			"supervisor journal replays", req.ID)
-		c.selectOrStart(req)
+		if req.Worker != "" {
+			c.logf("%s holds a remote attempt with no terminal; reconnecting to its supervisor ledger",
+				req.ID)
+			c.selectOrStart(req)
+			continue
+		}
+		attempts, problem := c.opt.Store.Attempts(req.ID)
+		if problem != nil {
+			return killed, forgotten, problem
+		}
+		for _, attempt := range attempts {
+			switch attempt.State {
+			case "preparing", "offered", "accepted", "recovered_open", "terminal":
+				c.settleLocalProcessDeath(attempt)
+			}
+		}
 	}
 	ready, e := c.opt.Store.ReadyRequeues()
 	if e != nil {
