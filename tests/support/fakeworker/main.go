@@ -29,7 +29,7 @@ var (
 	// --fake-instance lets an arm replace the process identity this worker normally mints.
 	fakeInstance = flag.String("fake-instance", "", "report an instance identity nobody spawned")
 	releaseID    = flag.String("release-id", "", "")
-	arm          = flag.String("arm", "idle", "idle|badcred|badrelease|steal|badterminal|dropack|output|missing-output|snapshotbarrier")
+	arm          = flag.String("arm", "idle", "idle|noinstance|badcred|badrelease|steal|badterminal|dropack|output|missing-output|snapshotbarrier")
 	session      = flag.String("session", "", "a fixed worker_boot_id (the collision arm)")
 	cozyHome     = flag.String("cozy-home", "", "this worker's own root")
 	stealRequest = flag.String("request", "", "the steal arm's victim request")
@@ -47,6 +47,9 @@ func run() int {
 	instance := *fakeInstance
 	if instance == "" {
 		instance = "ins-fake-" + randomHex(8)
+	}
+	if *arm == "noinstance" {
+		instance = ""
 	}
 	release := *releaseID
 	if *arm == "badrelease" {

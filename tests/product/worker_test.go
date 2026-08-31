@@ -179,9 +179,9 @@ func TestWorkerRefusals(t *testing.T) {
 		slot, name, device, want string
 		args                     []string
 	}{
-		// An instance identity this owner never spawned for that slot.
-		{"ghost", "a foreign instance identity", "7", "REFUSING the claimed worker",
-			[]string{"--arm", "idle", "--fake-instance", "ins-never-spawned"}},
+		// Runtime mints its own incarnation, but an unnamed worker cannot own outcomes.
+		{"ghost", "an undeclared instance identity", "7", "worker_instance_undeclared",
+			[]string{"--arm", "noinstance"}},
 		// The credential fence, flipped (#463): the owner presents the per-spawn bootstrap
 		// credential as Claim.proof and the worker verifies it constant-time. This worker
 		// refuses every proof, so the typed refusal must surface on the owner's side.
