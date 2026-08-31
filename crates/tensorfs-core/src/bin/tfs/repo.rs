@@ -7,7 +7,7 @@ use tensorfs_core::canon::Value;
 use tensorfs_core::catalog::{Catalog, WriterGuard};
 use tensorfs_core::err::{Code, Refusal};
 use tensorfs_core::header::{Body, Header};
-use tensorfs_core::ids::{Doc, ObjectRef};
+use tensorfs_core::ids::{hex64, prefixed, Doc, ObjectRef};
 use tensorfs_core::manifest::{Entry, Manifest};
 use tensorfs_core::repository::{self, Mutation, Repository};
 use tensorfs_core::storage::{self, Census, InventoryEntry};
@@ -236,6 +236,187 @@ pub fn cmd_repo_get(root: &Path, org: &str, name: &str, flags: &Flags) -> ExitCo
     ExitCode::SUCCESS
 }
 
+fn local_row(repository: &Repository) -> Result<Value, Refusal> {
+    let release = repository.local_release()?;
+    let row = Value::obj(vec![
+        ("manifest_digest", Value::str(release.manifest.id())),
+        ("manifest_length", Value::uint(release.manifest.length)),
+        ("name", Value::str(repository.repo.name.clone())),
+        (
+            "repository_digest",
+            Value::str(format!("sha256:{}", repository.document_sha256())),
+        ),
+        (
+            "source_selection",
+            Value::str(format!("sha256:{}", release.version)),
+        ),
+    ]);
+    Ok(row)
+}
+
+fn print_local(repository: &Repository) -> Result<(), Refusal> {
+    let row = local_row(repository)?;
+    println!(
+        "{}",
+        String::from_utf8(tensorfs_core::canon::write(&row)).unwrap()
+    );
+    Ok(())
+}
+
+fn observed_local(store: &Store, name: &str, observed: &str) -> Result<Option<Vec<u8>>, Refusal> {
+    if observed == "absent" {
+        return Ok(None);
+    }
+    let expected = prefixed("--observed", observed)?;
+    let repo = repository::RepositoryName::new("local", name)?;
+    let path = store.repository_path(&repo);
+    let bytes = read(&path)?;
+    let parsed = Repository::parse(&bytes)?;
+    local_row(&parsed)?;
+    let actual = format!("sha256:{}", parsed.document_sha256());
+    if actual != expected {
+        return Err(Refusal {
+            code: Code::REPOSITORY_CONFLICT,
+            detail: format!("observed local repository {expected}, current is {actual}"),
+        });
+    }
+    Ok(Some(bytes))
+}
+
+pub fn cmd_local_resolve(root: &Path, name: &str) -> ExitCode {
+    let store = match Store::open(root) {
+        Ok(store) => store,
+        Err(error) => return bail(error),
+    };
+    let repo = match repository::RepositoryName::new("local", name) {
+        Ok(repo) => repo,
+        Err(error) => return bail(error),
+    };
+    let path = store.repository_path(&repo);
+    let bytes = match read(&path) {
+        Ok(bytes) => bytes,
+        Err(mut error) if !path.is_file() => {
+            error.code = Code::REPOSITORY_ABSENT;
+            return bail(error);
+        }
+        Err(error) => return bail(error),
+    };
+    match Repository::parse(&bytes).and_then(|repository| print_local(&repository)) {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(error) => bail(error),
+    }
+}
+
+pub fn cmd_local_replace(
+    root: &Path,
+    name: &str,
+    source_selection: &str,
+    manifest_id: &str,
+    manifest_length: &str,
+    flags: &Flags,
+) -> ExitCode {
+    let (Some(observed), Some(evidence_path)) = (flag(flags, "observed"), flag(flags, "evidence"))
+    else {
+        eprintln!("--observed <sha256:...|absent> and --evidence <evidence.json> are required");
+        return ExitCode::from(2);
+    };
+    let store = match Store::open(root) {
+        Ok(store) => store,
+        Err(error) => return bail(error),
+    };
+    let observed = match observed_local(&store, name, observed) {
+        Ok(observed) => observed,
+        Err(error) => return bail(error),
+    };
+    let selection = match hex64(
+        "source selection",
+        source_selection.trim_start_matches("sha256:"),
+    ) {
+        Ok(selection) => selection,
+        Err(error) => return bail(error),
+    };
+    let length = match manifest_length.parse::<u64>() {
+        Ok(length) if length > 0 => length,
+        _ => {
+            return bail(Refusal {
+                code: Code::LENGTH_MISMATCH,
+                detail: "manifest length must be a positive integer".into(),
+            })
+        }
+    };
+    let evidence = match read(Path::new(evidence_path))
+        .and_then(|bytes| tensorfs_core::repository::ReleaseEvidence::parse(&bytes))
+    {
+        Ok(evidence) => evidence,
+        Err(error) => return bail(error),
+    };
+    let manifest = ObjectRef {
+        sha256: manifest_id.trim_start_matches("sha256:").to_string(),
+        length,
+    };
+    if let Err(error) = hex64("manifest", &manifest.sha256) {
+        return bail(error);
+    }
+    let mutation = Mutation::ReplaceLocal {
+        repo: match repository::RepositoryName::new("local", name) {
+            Ok(repo) => repo,
+            Err(error) => return bail(error),
+        },
+        manifest,
+        version: selection,
+        evidence: Box::new(evidence),
+    };
+    match store.apply_repository(observed.as_deref(), &mutation, &Fault::default()) {
+        Ok(Some(repository)) => match print_local(&repository) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(error) => bail(error),
+        },
+        Ok(None) => unreachable!("replace_local retains the repository"),
+        Err(error) => bail(error),
+    }
+}
+
+pub fn cmd_local_remove(root: &Path, name: &str, flags: &Flags) -> ExitCode {
+    let Some(observed) = flag(flags, "observed") else {
+        eprintln!("--observed <sha256:...> is required");
+        return ExitCode::from(2);
+    };
+    if observed == "absent" {
+        eprintln!("--observed absent is invalid for local remove");
+        return ExitCode::from(2);
+    }
+    let store = match Store::open(root) {
+        Ok(store) => store,
+        Err(error) => return bail(error),
+    };
+    let observed = match observed_local(&store, name, observed) {
+        Ok(Some(observed)) => observed,
+        Ok(None) => unreachable!("absent was rejected above"),
+        Err(error) => return bail(error),
+    };
+    let mutation = Mutation::DeleteRepository {
+        repo: match repository::RepositoryName::new("local", name) {
+            Ok(repo) => repo,
+            Err(error) => return bail(error),
+        },
+    };
+    match store.apply_repository(Some(&observed), &mutation, &Fault::default()) {
+        Ok(None) => {
+            let row = Value::obj(vec![
+                ("name", Value::str(name.to_string())),
+                ("removed", Value::Bool(true)),
+            ]);
+            println!(
+                "{}",
+                String::from_utf8(tensorfs_core::canon::write(&row)).unwrap()
+            );
+            ExitCode::SUCCESS
+        }
+        Ok(Some(_)) => unreachable!("delete repository returns none"),
+        Err(error) => bail(error),
+    }
+}
+
 pub fn cmd_repo_apply(current: &str, mutation: &Path, flags: &Flags) -> ExitCode {
     let (Some(output), Some(rows)) = (flag(flags, "out"), flag(flags, "rows")) else {
         eprintln!("--out <replacement> and --rows <jsonl> are required");
@@ -255,7 +436,7 @@ pub fn cmd_repo_apply(current: &str, mutation: &Path, flags: &Flags) -> ExitCode
     };
 
     let inputs = match &mutation {
-        Mutation::PutRelease { manifest, .. } => {
+        Mutation::PutRelease { manifest, .. } | Mutation::ReplaceLocal { manifest, .. } => {
             let (Some(manifest_path), Some(inventory_path)) =
                 (flag(flags, "manifest"), flag(flags, "inventory"))
             else {
@@ -333,6 +514,27 @@ pub fn cmd_repo_apply(current: &str, mutation: &Path, flags: &Flags) -> ExitCode
                         .iter()
                         .find(|release| &release.lane == lane && &release.version == version)
                         .expect("applied release is present");
+                    match Census::project_release_inputs(
+                        &repository,
+                        &bytes,
+                        release,
+                        &manifest,
+                        header.as_deref(),
+                        inventory,
+                    ) {
+                        Ok(projection) => projection.json_lines(),
+                        Err(error) => return bail(error),
+                    }
+                }
+                (
+                    Mutation::ReplaceLocal { version, .. },
+                    Some((manifest, header, inventory, _)),
+                ) => {
+                    let release = repository
+                        .releases
+                        .iter()
+                        .find(|release| release.lane == "local" && &release.version == version)
+                        .expect("replaced local release is present");
                     match Census::project_release_inputs(
                         &repository,
                         &bytes,

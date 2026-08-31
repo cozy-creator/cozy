@@ -89,6 +89,11 @@ tfs repo apply <current.json|-> <mutation.json> \
   --out <replacement.json> --rows <rows.jsonl>
 tfs repo commit <store> <current.json|-> <mutation.json>
 
+tfs local resolve <store> <name>
+tfs local replace <store> <name> <source-sha256> <manifest> <length> \
+  --observed <repository-sha256|absent> --evidence <evidence.json>
+tfs local remove <store> <name> --observed <repository-sha256>
+
 tfs key blob <sha256>
 tfs key manifest <sha256>
 tfs key repo <org> <name>
@@ -117,6 +122,12 @@ model headers additionally recover the diagnostic projection emitted by `store r
 perform its repository CAS, then records only `(org,name,manifest_sha256)` in SQLite. Missing or
 length-mismatched bytes refuse publication. Full repo/release/object rows remain diagnostic rebuild
 output, not duplicated database tables.
+
+`local` is the narrow Creator alias API over the same Repository bytes. Resolve emits one compact
+canonical JSON row. Replace atomically swaps the complete `repos/local/<name>.json` document to
+exactly one hidden `(source-selection, local) -> Manifest` release after verifying its closure;
+stale observed repository digests refuse. Remove deletes the complete alias. Ordinary repository
+mutations cannot append a second row under org `local`.
 
 ## Read views
 

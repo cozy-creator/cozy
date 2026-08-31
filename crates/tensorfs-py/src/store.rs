@@ -22,7 +22,7 @@ use tensorfs_core::derived::{
 };
 use tensorfs_core::err::{refuse, Code, Refusal, Result as TResult};
 use tensorfs_core::header::Header;
-use tensorfs_core::ids::{Doc, ObjectRef};
+use tensorfs_core::ids::{prefixed, Doc, ObjectRef};
 use tensorfs_core::manifest::{Entry, Manifest};
 use tensorfs_core::meta::{Hold, Meta};
 use tensorfs_core::project;
@@ -523,6 +523,84 @@ impl PyStore {
         out.set_item("manifest_digest", release.manifest.id())?;
         out.set_item("manifest_length", release.manifest.length)?;
         Ok(out)
+    }
+
+    /// Resolve Creator's one-row device-local alias. The reserved org/lane and hidden
+    /// source-selection version never become a remote catalog reference.
+    fn resolve_local<'p>(&self, py: Python<'p>, name: &str) -> PyResult<Bound<'p, PyDict>> {
+        let repo = RepositoryName::new("local", name).or_refuse(py)?;
+        let path = self.store.repository_path(&repo);
+        let bytes = std::fs::read(&path).map_err(|error| {
+            to_py(
+                py,
+                &Refusal {
+                    code: if error.kind() == std::io::ErrorKind::NotFound {
+                        Code::REPOSITORY_ABSENT
+                    } else {
+                        Code::IO_FAILED
+                    },
+                    detail: format!("read {}: {error}", path.display()),
+                },
+            )
+        })?;
+        let repository = Repository::parse(&bytes).or_refuse(py)?;
+        let release = repository.local_release().or_refuse(py)?;
+        let out = PyDict::new(py);
+        out.set_item("name", name)?;
+        out.set_item("source_selection", format!("sha256:{}", release.version))?;
+        out.set_item("manifest_digest", release.manifest.id())?;
+        out.set_item("manifest_length", release.manifest.length)?;
+        Ok(out)
+    }
+
+    /// Atomically replace the complete local alias after its exact Manifest is resident and
+    /// verified. `current` is the exact observed Repository bytes or None for creation.
+    #[pyo3(signature = (current, name, source_selection, manifest_id, manifest_length, evidence))]
+    #[allow(clippy::too_many_arguments)]
+    fn replace_local<'p>(
+        &self,
+        py: Python<'p>,
+        current: Option<&[u8]>,
+        name: &str,
+        source_selection: &str,
+        manifest_id: &str,
+        manifest_length: u64,
+        evidence: &[u8],
+    ) -> PyResult<Bound<'p, PyBytes>> {
+        let selection = prefixed("local source selection", source_selection).or_refuse(py)?;
+        let mutation = Mutation::ReplaceLocal {
+            repo: RepositoryName::new("local", name).or_refuse(py)?,
+            version: selection.trim_start_matches("sha256:").to_string(),
+            manifest: obj_ref(py, manifest_id, manifest_length)?,
+            evidence: Box::new(
+                tensorfs_core::repository::ReleaseEvidence::parse(evidence).or_refuse(py)?,
+            ),
+        };
+        let repository = py
+            .detach(|| {
+                self.store
+                    .apply_repository(current, &mutation, &Fault::default())
+            })
+            .or_refuse(py)?
+            .expect("replace_local retains the repository");
+        Ok(PyBytes::new(py, &repository.canonical_bytes()))
+    }
+
+    fn remove_local<'p>(
+        &self,
+        py: Python<'p>,
+        current: &[u8],
+        name: &str,
+    ) -> PyResult<Bound<'p, PyDict>> {
+        let mutation = Mutation::DeleteRepository {
+            repo: RepositoryName::new("local", name).or_refuse(py)?,
+        };
+        py.detach(|| {
+            self.store
+                .apply_repository(Some(current), &mutation, &Fault::default())
+        })
+        .or_refuse(py)?;
+        Ok(PyDict::new(py))
     }
 
     fn begin_operation(

@@ -16,10 +16,12 @@ use crate::checkpoint::{self as ck, build_manifest};
 use crate::dtype::checked_bytes;
 use crate::err::{refuse, Code, Refusal, Result};
 use crate::header::{Closure, Header, Part, Tensor};
-use crate::ids::{ascii_name, Doc, ObjectRef, Plain};
+use crate::ids::{ascii_name, hex64, Doc, ObjectRef, Plain};
 use crate::limits;
 use crate::manifest::Manifest;
-use crate::repository::{IngestProvenance, Mutation, RepositoryName, VerificationEvidence};
+use crate::repository::{
+    IngestProvenance, Mutation, ReleaseEvidence, RepositoryName, VerificationEvidence,
+};
 use crate::spec::EncodingSpec;
 use crate::store::{Store, Verdict};
 
@@ -250,6 +252,9 @@ pub struct Install<'a> {
     pub repo: RepositoryName,
     pub version: &'a str,
     pub lane: &'a str,
+    pub source_uri: Option<&'a str>,
+    pub declared_license: Option<&'a str>,
+    pub observed_repository: Option<&'a str>,
 }
 
 pub fn install(store: &Store, request: Install<'_>) -> Result<String> {
@@ -264,6 +269,9 @@ pub fn install(store: &Store, request: Install<'_>) -> Result<String> {
         repo,
         version,
         lane,
+        source_uri,
+        declared_license,
+        observed_repository,
     } = request;
     receipt.binds(subject, snap, header, stamp)?;
     let walk = ck::walk(store, snap)?;
@@ -289,6 +297,8 @@ pub fn install(store: &Store, request: Install<'_>) -> Result<String> {
         converter_build: profile.converter_build.clone(),
         converter_recipe: profile.converter_recipe.clone(),
         sources,
+        source_uri: source_uri.map(str::to_string),
+        declared_license: declared_license.map(str::to_string),
     };
     let verification = match &receipt.evidence {
         super::Evidence::ApprovedProducer {
@@ -306,24 +316,76 @@ pub fn install(store: &Store, request: Install<'_>) -> Result<String> {
             report: report.clone(),
         },
     };
-    let mutation = Mutation::put_ingested(
-        repo.clone(),
-        lane,
-        ObjectRef {
-            sha256: id.trim_start_matches("sha256:").to_string(),
-            length: snap.canonical_bytes().len() as u64,
-        },
-        version,
-        header.topology_digest(),
-        ingest,
-        verification,
-    );
+    let manifest = ObjectRef {
+        sha256: id.trim_start_matches("sha256:").to_string(),
+        length: snap.canonical_bytes().len() as u64,
+    };
+    let classification_digest = header.topology_digest();
+    let evidence = ReleaseEvidence {
+        classification_digest: classification_digest.clone(),
+        ingest: Some(ingest),
+        verification: Some(verification),
+    };
+    let mutation = if repo.org == "local" {
+        if lane != "local" {
+            return refuse(Code::KEY_GRAMMAR, "local ingest requires lane local");
+        }
+        hex64("local source selection", version)?;
+        Mutation::ReplaceLocal {
+            repo: repo.clone(),
+            manifest,
+            version: version.to_string(),
+            evidence: Box::new(evidence),
+        }
+    } else {
+        Mutation::PutRelease {
+            repo: repo.clone(),
+            lane: lane.to_string(),
+            manifest,
+            metadata: None,
+            version: version.to_string(),
+            evidence: Some(Box::new(evidence)),
+        }
+    };
     let path = store.repository_path(&repo);
     let current = match fs::read(&path) {
         Ok(bytes) => Some(bytes),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
         Err(error) => return Err(io("read repository before ingest install", error)),
     };
+    if repo.org == "local" {
+        let expected = observed_repository.ok_or_else(|| Refusal {
+            code: Code::MISSING_FIELD,
+            detail: "local ingest install requires --observed <sha256:...|absent>".into(),
+        })?;
+        match (expected, current.as_deref()) {
+            ("absent", None) => {}
+            ("absent", Some(_)) => {
+                return refuse(
+                    Code::REPOSITORY_CONFLICT,
+                    "local alias exists but the caller observed absence",
+                )
+            }
+            (digest, Some(bytes)) => {
+                let expected = crate::ids::prefixed("observed repository", digest)?;
+                let repository = crate::repository::Repository::parse(bytes)?;
+                repository.local_release()?;
+                let actual = format!("sha256:{}", repository.document_sha256());
+                if actual != expected {
+                    return refuse(
+                        Code::REPOSITORY_CONFLICT,
+                        format!("observed local repository {expected}, current is {actual}"),
+                    );
+                }
+            }
+            (_, None) => {
+                return refuse(
+                    Code::REPOSITORY_CONFLICT,
+                    "local alias is absent but the caller observed repository bytes",
+                )
+            }
+        }
+    }
     store.apply_repository(current.as_deref(), &mutation, &Default::default())?;
     crate::catalog::Catalog::open(store.root())?.complete_operation(session)?;
     let _ = fs::remove_dir_all(candidate_dir(store.root(), session));

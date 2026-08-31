@@ -52,6 +52,10 @@ fn one_tmp_tree_is_recreatable_and_corruption_is_not_retained() {
 
 fn fixture(root: &Path) -> (ObjectRef, ReleaseEvidence) {
     let store = Store::init(root).unwrap();
+    model_fixture(&store, [0, 0, 0, 0])
+}
+
+fn model_fixture(store: &Store, value: [u8; 4]) -> (ObjectRef, ReleaseEvidence) {
     let spec = tensorfs_core::registry::seeds()
         .into_iter()
         .find(|seed| seed.alias == "plain/1")
@@ -69,10 +73,7 @@ fn fixture(root: &Path) -> (ObjectRef, ReleaseEvidence) {
                     dtype: Dtype::F32,
                     shape: vec![1],
                     encoding: spec.object_id(),
-                    parts: vec![(
-                        "value".into(),
-                        Part::plan(Dtype::F32, vec![1], &[0, 0, 0, 0]),
-                    )],
+                    parts: vec![("value".into(), Part::plan(Dtype::F32, vec![1], &value))],
                 },
             )],
         )],
@@ -103,6 +104,122 @@ fn fixture(root: &Path) -> (ObjectRef, ReleaseEvidence) {
         .unwrap()
         .obj;
     (manifest, evidence)
+}
+
+#[test]
+fn local_alias_is_one_atomic_replaceable_release() {
+    let root = temporary("local-alias");
+    let store = Store::init(&root).unwrap();
+    let repo = tensorfs_core::repository::RepositoryName::new("local", "h3-dev").unwrap();
+    let (manifest_a, evidence_a) = model_fixture(&store, [0, 0, 0, 0]);
+    let (manifest_b, evidence_b) = model_fixture(&store, [0, 0, 128, 63]);
+    assert_ne!(manifest_a, manifest_b);
+    let mutation_a = Mutation::ReplaceLocal {
+        repo: repo.clone(),
+        manifest: manifest_a.clone(),
+        version: "11".repeat(32),
+        evidence: Box::new(evidence_a),
+    };
+    let alias_a = store
+        .apply_repository(None, &mutation_a, &Fault::default())
+        .unwrap()
+        .unwrap();
+    let bytes_a = alias_a.canonical_bytes();
+    assert_eq!(alias_a.releases.len(), 1);
+    assert_eq!(alias_a.releases[0].lane, "local");
+    assert_eq!(alias_a.releases[0].manifest, manifest_a);
+
+    let mutation_b = Mutation::ReplaceLocal {
+        repo: repo.clone(),
+        manifest: manifest_b.clone(),
+        version: "22".repeat(32),
+        evidence: Box::new(evidence_b.clone()),
+    };
+    let alias_b = store
+        .apply_repository(Some(&bytes_a), &mutation_b, &Fault::default())
+        .unwrap()
+        .unwrap();
+    assert_eq!(alias_b.releases.len(), 1);
+    assert_eq!(alias_b.releases[0].version, "22".repeat(32));
+    assert_eq!(alias_b.releases[0].manifest, manifest_b);
+    assert_eq!(
+        store
+            .apply_repository(Some(&bytes_a), &mutation_a, &Fault::default())
+            .unwrap_err()
+            .code,
+        tensorfs_core::err::Code::REPOSITORY_CONFLICT
+    );
+    assert_eq!(
+        store
+            .apply_repository(
+                Some(&alias_b.canonical_bytes()),
+                &Mutation::PutRelease {
+                    repo: repo.clone(),
+                    lane: "other".into(),
+                    manifest: manifest_b.clone(),
+                    metadata: None,
+                    version: "1.0.0".into(),
+                    evidence: None,
+                },
+                &Fault::default(),
+            )
+            .unwrap_err()
+            .code,
+        tensorfs_core::err::Code::KEY_GRAMMAR
+    );
+
+    let evidence_path = root.join("evidence.json");
+    fs::write(&evidence_path, evidence_b.canonical_bytes()).unwrap();
+    let replace = Command::new(env!("CARGO_BIN_EXE_tfs"))
+        .args([
+            "local",
+            "replace",
+            root.to_str().unwrap(),
+            "h3-dev",
+            &format!("sha256:{}", "33".repeat(32)),
+            &manifest_b.id(),
+            &manifest_b.length.to_string(),
+            "--observed",
+            &format!("sha256:{}", alias_b.document_sha256()),
+            "--evidence",
+            evidence_path.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        replace.status.success(),
+        "{}",
+        String::from_utf8_lossy(&replace.stderr)
+    );
+    assert!(String::from_utf8_lossy(&replace.stdout).contains(&format!(
+        "\"source_selection\":\"sha256:{}\"",
+        "33".repeat(32)
+    )));
+    let resolve = Command::new(env!("CARGO_BIN_EXE_tfs"))
+        .args(["local", "resolve", root.to_str().unwrap(), "h3-dev"])
+        .output()
+        .unwrap();
+    assert!(resolve.status.success());
+    assert_eq!(resolve.stdout, replace.stdout);
+    let current = Repository::parse(&fs::read(store.repository_path(&repo)).unwrap()).unwrap();
+    let digest = format!("sha256:{}", current.document_sha256());
+    let remove = Command::new(env!("CARGO_BIN_EXE_tfs"))
+        .args([
+            "local",
+            "remove",
+            root.to_str().unwrap(),
+            "h3-dev",
+            "--observed",
+            &digest,
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        remove.status.success(),
+        "{}",
+        String::from_utf8_lossy(&remove.stderr)
+    );
+    let _ = fs::remove_dir_all(root);
 }
 
 fn mutation(manifest: &ObjectRef, evidence: &ReleaseEvidence) -> Vec<u8> {

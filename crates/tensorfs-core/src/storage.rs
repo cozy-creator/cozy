@@ -1346,6 +1346,8 @@ mod tests {
                     converter_build: format!("sha256:{}", "22".repeat(32)),
                     converter_recipe: recipe.clone(),
                     sources: vec![(format!("sha256:{}", "33".repeat(32)), 1)],
+                    source_uri: None,
+                    declared_license: None,
                 }),
                 verification: Some(VerificationEvidence::ApprovedProducer {
                     implementation: format!("sha256:{}", "22".repeat(32)),
