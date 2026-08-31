@@ -117,11 +117,19 @@ func (p *Package) Build(ctx context.Context) *exit.Error {
 			p.Name, p.Release, fact.Distribution, fact.Version).
 			WithRemedy("fix the build backend so wheel identity comes from [project] name and version")
 	}
-	dependencies, problem := collectLocalDependencies(ctx, p.Tree, document, root)
+	dependencies, needsRegistry, problem := collectLocalDependencies(ctx, p.Tree, document, root)
 	if problem != nil {
 		p.Close()
 		p.Root = ""
 		return problem
+	}
+	if needsRegistry {
+		dependencies, problem = collectRegistryDependencies(ctx, p.Tree, root, dependencies)
+		if problem != nil {
+			p.Close()
+			p.Root = ""
+			return problem
+		}
 	}
 	p.Wheel, p.DependencyWheels = project.Path, dependencies
 	return nil
