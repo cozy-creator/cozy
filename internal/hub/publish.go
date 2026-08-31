@@ -311,7 +311,8 @@ func (c *Client) Reads(ctx context.Context, ref Ref, manifestID string, ids []st
 			"the hub at %s serves no object-read route: POST %s answered %q", c.base,
 			"…/manifests/{manifest}/reads", e.Name).
 			WithRemedy("this hub can take custody of bytes and cannot hand them back yet; the read grant is the missing half of th-002's transfer protocol").
-			WithNext("cozy model publish <org/model> <sha256:…>", "cozy model download --dry-run "+ref.String())
+			WithNext("cozy model publish <org/model> <source> --release 1.0.0 --dry-run",
+				"cozy model download --dry-run "+ref.String())
 	}
 	return out.Reads, e
 }

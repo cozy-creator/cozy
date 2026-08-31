@@ -551,12 +551,13 @@ def check_manifest():
         bad.append("[grammar] package publish identity must come only from project metadata")
     derived_audits = {
         "internal/cli/package_releases.go": '"cozy package publish " + ref.String() + "@" + release',
-        "internal/cli/transfer.go": '"cozy model publish " + ref.String() + " " + manifestID',
         "internal/cli/rentals.go": '"cozy rental new " + skuName',
     }
     for path, spelling in derived_audits.items():
         if spelling not in pathlib.Path(path).read_text():
             bad.append(f"[grammar] {path} no longer derives its internal audit reason from exact operation facts")
+    if '"cozy-model-production/1"' not in pathlib.Path("internal/modelproduction/plan.go").read_text():
+        bad.append("[grammar] model publication no longer derives one domain-separated operation identity")
     app = pathlib.Path("internal/cli/app.go").read_text()
     for spelling in VERSION_SPELLINGS:
         if spelling not in app:

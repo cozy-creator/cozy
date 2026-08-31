@@ -99,7 +99,7 @@ type ModelCmd struct {
 	Download ModelDownloadCmd `cmd:"" help:"Download a model into the local TensorFS store."`
 	Remove   ModelRemoveCmd   `cmd:"" help:"Remove local model repositories."`
 	List     ModelListCmd     `cmd:"" help:"List local model releases."`
-	Publish  ModelPublishCmd  `cmd:"" help:"Publish a local TensorFS manifest as one release lane."`
+	Publish  ModelPublishCmd  `cmd:"" help:"Publish a source directly or through one reviewed model production."`
 }
 
 type ModelImportCmd struct {
@@ -152,18 +152,22 @@ func (c *ModelListCmd) Run(r *Runtime) error {
 }
 
 type ModelPublishCmd struct {
-	Ref        string `arg:"" name:"model" help:"Model name (org/name)."`
-	Manifest   string `arg:"" name:"manifest" help:"Local sha256 manifest id."`
-	Release    string `help:"Immutable release version."`
-	Lane       string `help:"Expected server-derived release lane."`
-	DryRun     bool   `help:"Show the transfer plan without moving bytes."`
+	Ref        string `arg:"" name:"model" help:"Tensorhub destination (org/name)."`
+	Source     string `arg:"" name:"source" help:"Manifest, pinned foreign source, Tensorhub model release, local alias, or explicit local file."`
+	Release    string `help:"Immutable semantic release version." required:""`
+	Producer   string `help:"Reviewed org/package/production declaration to execute."`
+	Lane       string `help:"Select an input lane when source is a Tensorhub model release."`
+	Rental     bool   `help:"Authorize one Creator-managed rental for this operation."`
+	DryRun     bool   `help:"Resolve the exact production plan without moving model bodies or spending."`
+	Detach     bool   `help:"Return after durable acceptance instead of following."`
 	TokenStdin bool   `help:"Read this invocation's hub token from stdin."`
 }
 
 func (c *ModelPublishCmd) Run(r *Runtime) error {
-	return r.call(handleModelPublish, []string{c.Ref, c.Manifest}, bools(
-		"--dry-run", c.DryRun, "--token-stdin", c.TokenStdin),
-		values("--release", c.Release, "--lane", c.Lane), false)
+	return r.call(handleModelPublish, []string{c.Ref, c.Source}, bools(
+		"--rental", c.Rental, "--dry-run", c.DryRun, "--detach", c.Detach,
+		"--token-stdin", c.TokenStdin),
+		values("--release", c.Release, "--producer", c.Producer, "--lane", c.Lane), false)
 }
 
 type RunCmd struct {

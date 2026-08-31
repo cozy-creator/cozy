@@ -27,6 +27,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"regexp"
 	"sort"
 	"strings"
 
@@ -43,12 +44,13 @@ const descriptorFormat = "cozy.package.descriptor/1"
 // PackageDescriptor is the closed PackageDescriptor/1 this host reads. Unknown fields refuse;
 // Raw is normalized canonical JSON for control-plane transport and semantic identity.
 type PackageDescriptor struct {
-	Format      string          `json:"format"`
-	Application string          `json:"application"`
-	Entrypoints []Entrypoint    `json:"entrypoints"`
-	Jobs        []Entrypoint    `json:"jobs"`
-	Digest      string          `json:"-"`
-	Raw         json.RawMessage `json:"-"`
+	Format      string            `json:"format"`
+	Application string            `json:"application"`
+	Entrypoints []Entrypoint      `json:"entrypoints"`
+	Jobs        []Entrypoint      `json:"jobs"`
+	Productions []ModelProduction `json:"model_productions"`
+	Digest      string            `json:"-"`
+	Raw         json.RawMessage   `json:"-"`
 }
 
 // Entrypoint is one callable surface: its request schema, its declared model slots, and
@@ -62,16 +64,52 @@ type Entrypoint struct {
 	Publishes bool   `json:"publishes"`
 	// ArtifactOutputs is the job's explicit ArtifactSink slot set. It is separate from
 	// result asset fields because worker-protocol rev5 OutputBinding has no kind.
-	ArtifactOutputs []ArtifactOutput `json:"artifact_outputs"`
-	Resources       struct {
-		GPUCount int64 `json:"gpu_count"`
-	} `json:"resources"`
+	ArtifactOutputs []ArtifactOutput     `json:"artifact_outputs"`
+	Resources       ResourceRequirements `json:"resources"`
 }
 
 type ArtifactOutput struct {
 	OutputID string `json:"output_id"`
 	MimeType string `json:"mime_type"`
 	MaxBytes uint64 `json:"max_bytes"`
+}
+
+// ModelProduction is one bounded, static graph authored by a package. Creator
+// schedules it; Runtime never executes the declaration itself.
+type ModelProduction struct {
+	Name    string                  `json:"name"`
+	Sources map[string]string       `json:"sources"`
+	Nodes   []ModelProductionNode   `json:"nodes"`
+	Outputs []ModelProductionOutput `json:"outputs"`
+}
+
+type ModelProductionNode struct {
+	Name      string               `json:"name"`
+	Callable  string               `json:"callable"`
+	Models    map[string]string    `json:"models"`
+	Outputs   []string             `json:"outputs"`
+	Assets    map[string]string    `json:"assets"`
+	Resources ResourceRequirements `json:"resources"`
+}
+
+type ResourceRequirements struct {
+	GPUCount  int64  `json:"gpu_count"`
+	Placement string `json:"placement"`
+	Requires  string `json:"requires"`
+}
+
+type ModelProductionOutput struct {
+	Name             string                  `json:"name"`
+	Source           string                  `json:"source"`
+	LaneKey          string                  `json:"lane_key"`
+	RequiredContract ModelProductionContract `json:"required_contract"`
+}
+
+type ModelProductionContract struct {
+	Tasks     []string          `json:"tasks"`
+	Structure string            `json:"structure"`
+	Encodings []string          `json:"encodings"`
+	Stamps    map[string]string `json:"stamps"`
 }
 
 // Slot is one declared model binding path — capability, never selection.
@@ -174,7 +212,8 @@ func exactKeys(raw json.RawMessage, required, optional []string) (map[string]jso
 }
 
 func validateClosedDescriptor(data []byte) error {
-	root, err := exactKeys(data, []string{"application", "entrypoints", "format", "jobs"}, nil)
+	root, err := exactKeys(data,
+		[]string{"application", "entrypoints", "format", "jobs", "model_productions"}, nil)
 	if err != nil {
 		return err
 	}
@@ -212,21 +251,97 @@ func validateClosedDescriptor(data []byte) error {
 				}
 			}
 			if resources := callable["resources"]; resources != nil {
-				if _, err := exactKeys(resources, []string{"gpu_count"}, nil); err != nil {
+				if err := validateResourceKeys(resources); err != nil {
 					return err
 				}
-				if outputs := callable["artifact_outputs"]; outputs != nil {
-					var rows []json.RawMessage
-					if err := json.Unmarshal(outputs, &rows); err != nil {
+			}
+			if outputs := callable["artifact_outputs"]; outputs != nil {
+				var rows []json.RawMessage
+				if err := json.Unmarshal(outputs, &rows); err != nil {
+					return err
+				}
+				for _, output := range rows {
+					if _, err := exactKeys(output,
+						[]string{"max_bytes", "mime_type", "output_id"}, nil); err != nil {
 						return err
 					}
-					for _, output := range rows {
-						if _, err := exactKeys(output,
-							[]string{"max_bytes", "mime_type", "output_id"}, nil); err != nil {
-							return err
-						}
-					}
 				}
+			}
+		}
+	}
+	return validateProductionKeys(root["model_productions"])
+}
+
+func validateResourceKeys(raw json.RawMessage) error {
+	object, err := exactKeys(raw, nil, []string{"gpu_count", "placement", "requires"})
+	if err != nil {
+		return err
+	}
+	if len(object) == 0 {
+		return fmt.Errorf("resources must not be empty")
+	}
+	if value := object["gpu_count"]; value != nil {
+		var count int64
+		if json.Unmarshal(value, &count) != nil || count < 1 {
+			return fmt.Errorf("resources.gpu_count must be a positive integer")
+		}
+	}
+	if value := object["placement"]; value != nil {
+		var placement string
+		if json.Unmarshal(value, &placement) != nil ||
+			(placement != "single_node" && placement != "any") {
+			return fmt.Errorf("resources.placement must be single_node or any")
+		}
+	}
+	if value := object["requires"]; value != nil {
+		var requires string
+		if json.Unmarshal(value, &requires) != nil || strings.TrimSpace(requires) == "" {
+			return fmt.Errorf("resources.requires must be a non-empty string")
+		}
+	}
+	return nil
+}
+
+func validateProductionKeys(raw json.RawMessage) error {
+	var productions []json.RawMessage
+	if err := json.Unmarshal(raw, &productions); err != nil || len(productions) > 16 {
+		return fmt.Errorf("model_productions must be an array of at most 16 entries")
+	}
+	for _, rawProduction := range productions {
+		production, err := exactKeys(rawProduction,
+			[]string{"name", "sources", "nodes", "outputs"}, nil)
+		if err != nil {
+			return err
+		}
+		var nodes []json.RawMessage
+		if err := json.Unmarshal(production["nodes"], &nodes); err != nil {
+			return err
+		}
+		for _, rawNode := range nodes {
+			node, err := exactKeys(rawNode,
+				[]string{"assets", "callable", "models", "name", "outputs"}, []string{"resources"})
+			if err != nil {
+				return err
+			}
+			if node["resources"] != nil {
+				if err := validateResourceKeys(node["resources"]); err != nil {
+					return err
+				}
+			}
+		}
+		var outputs []json.RawMessage
+		if err := json.Unmarshal(production["outputs"], &outputs); err != nil {
+			return err
+		}
+		for _, rawOutput := range outputs {
+			output, err := exactKeys(rawOutput,
+				[]string{"lane_key", "name", "required_contract", "source"}, nil)
+			if err != nil {
+				return err
+			}
+			if _, err := exactKeys(output["required_contract"],
+				[]string{"encodings", "stamps", "structure", "tasks"}, nil); err != nil {
+				return err
 			}
 		}
 	}
@@ -382,6 +497,11 @@ func validateEntrypoint(ep *Entrypoint) *exit.Error {
 	if ep.Kind != "job" && len(ep.ArtifactOutputs) > 0 {
 		return exit.New(exit.Validation, "%s declares artifact outputs outside the job surface", ep.Name)
 	}
+	if ep.Resources.GPUCount < 0 ||
+		(ep.Resources.Placement != "" && ep.Resources.Placement != "single_node" &&
+			ep.Resources.Placement != "any") {
+		return exit.New(exit.Validation, "%s has invalid resource requirements", ep.Name)
+	}
 	seenArtifacts := map[string]bool{}
 	for _, output := range ep.ArtifactOutputs {
 		if output.OutputID == "" || seenArtifacts[output.OutputID] || output.MaxBytes == 0 ||
@@ -393,6 +513,208 @@ func validateEntrypoint(ep *Entrypoint) *exit.Error {
 		seenArtifacts[output.OutputID] = true
 	}
 	return nil
+}
+
+var (
+	productionNamePattern = regexp.MustCompile(`^[a-z][a-z0-9_-]{0,63}$`)
+	callablePattern       = regexp.MustCompile(`^[a-z0-9][a-z0-9._-]{0,63}/[a-z0-9][a-z0-9._-]{0,63}/[a-z][a-z0-9_-]{0,63}$`)
+	contractPattern       = regexp.MustCompile(`^[a-z0-9][a-z0-9._+-]{0,63}(?:/[a-z0-9][a-z0-9._+-]{0,63})*$`)
+)
+
+func validateProductions(productions []ModelProduction) *exit.Error {
+	if len(productions) > 16 {
+		return exit.New(exit.Validation, "descriptor carries more than 16 model productions")
+	}
+	seen := map[string]bool{}
+	for i := range productions {
+		production := &productions[i]
+		if !productionNamePattern.MatchString(production.Name) || seen[production.Name] {
+			return exit.New(exit.Validation, "descriptor has invalid or duplicate model production %q", production.Name)
+		}
+		seen[production.Name] = true
+		if problem := validateProduction(production); problem != nil {
+			return problem
+		}
+	}
+	return nil
+}
+
+func validateProduction(production *ModelProduction) *exit.Error {
+	if len(production.Sources) < 1 || len(production.Sources) > 16 {
+		return badProduction(production, "must declare 1 through 16 named source profiles")
+	}
+	for slot, profile := range production.Sources {
+		if !productionNamePattern.MatchString(slot) || !contractPattern.MatchString(profile) {
+			return badProduction(production, "has invalid source slot %q or profile %q", slot, profile)
+		}
+	}
+	if len(production.Nodes) < 1 || len(production.Nodes) > 64 {
+		return badProduction(production, "must declare 1 through 64 nodes")
+	}
+	nodes := map[string]ModelProductionNode{}
+	declaredOutputs := map[string]bool{}
+	for _, node := range production.Nodes {
+		if !productionNamePattern.MatchString(node.Name) || nodes[node.Name].Name != "" ||
+			!callablePattern.MatchString(node.Callable) {
+			return badProduction(production, "has an invalid node name or callable")
+		}
+		if len(node.Models) < 1 || len(node.Models) > 16 || len(node.Outputs) < 1 ||
+			len(node.Outputs) > 8 || len(node.Assets) > 16 {
+			return badProduction(production, "node %s exceeds its input/output bounds", node.Name)
+		}
+		for input, reference := range node.Models {
+			if !productionNamePattern.MatchString(input) || reference == "" {
+				return badProduction(production, "node %s has an invalid model edge", node.Name)
+			}
+		}
+		for input, member := range node.Assets {
+			if !productionNamePattern.MatchString(input) || !safeProductionMember(member) {
+				return badProduction(production, "node %s has an invalid static asset", node.Name)
+			}
+		}
+		for _, output := range node.Outputs {
+			key := node.Name + "." + output
+			if !productionNamePattern.MatchString(output) || declaredOutputs[key] {
+				return badProduction(production, "node %s has an invalid or duplicate output", node.Name)
+			}
+			declaredOutputs[key] = true
+		}
+		nodes[node.Name] = node
+	}
+	if len(production.Outputs) < 1 || len(production.Outputs) > 16 {
+		return badProduction(production, "must declare 1 through 16 required outputs")
+	}
+	outputNames, lanes := map[string]bool{}, map[string]bool{}
+	for _, output := range production.Outputs {
+		if !productionNamePattern.MatchString(output.Name) || outputNames[output.Name] ||
+			!productionNamePattern.MatchString(output.LaneKey) || lanes[output.LaneKey] ||
+			!declaredOutputs[output.Source] {
+			return badProduction(production, "has an invalid, duplicate, or unresolved required output")
+		}
+		outputNames[output.Name], lanes[output.LaneKey] = true, true
+		contract := output.RequiredContract
+		if !contractPattern.MatchString(contract.Structure) ||
+			!validProductionList(contract.Tasks, 32, productionNamePattern) ||
+			!validProductionList(contract.Encodings, 32, contractPattern) || len(contract.Stamps) > 32 {
+			return badProduction(production, "output %s has an invalid required contract", output.Name)
+		}
+		for key, value := range contract.Stamps {
+			if !productionNamePattern.MatchString(key) || !productionNamePattern.MatchString(value) {
+				return badProduction(production, "output %s has an invalid contract stamp", output.Name)
+			}
+		}
+	}
+	_, problem := production.OrderedNodes()
+	return problem
+}
+
+func validProductionList(values []string, cap int, pattern *regexp.Regexp) bool {
+	if len(values) < 1 || len(values) > cap {
+		return false
+	}
+	seen := map[string]bool{}
+	for _, value := range values {
+		if !pattern.MatchString(value) || seen[value] {
+			return false
+		}
+		seen[value] = true
+	}
+	return true
+}
+
+func safeProductionMember(member string) bool {
+	if member == "" || len(member) > 256 || strings.HasPrefix(member, ".") ||
+		strings.HasPrefix(member, "/") || strings.HasPrefix(member, "~") || strings.Contains(member, `\`) {
+		return false
+	}
+	for _, part := range strings.Split(member, "/") {
+		if part == "" || part == "." || part == ".." {
+			return false
+		}
+	}
+	return true
+}
+
+func badProduction(production *ModelProduction, format string, values ...any) *exit.Error {
+	return exit.New(exit.Validation, "model production %s: %s", production.Name,
+		fmt.Sprintf(format, values...))
+}
+
+// OrderedNodes returns the declaration's one deterministic topological order.
+// Declaration order carries no control-flow meaning.
+func (production *ModelProduction) OrderedNodes() ([]ModelProductionNode, *exit.Error) {
+	byName := make(map[string]ModelProductionNode, len(production.Nodes))
+	dependencies := make(map[string]map[string]bool, len(production.Nodes))
+	for _, node := range production.Nodes {
+		byName[node.Name] = node
+		dependencies[node.Name] = map[string]bool{}
+	}
+	for _, node := range production.Nodes {
+		for _, reference := range node.Models {
+			if _, source := production.Sources[reference]; source {
+				continue
+			}
+			owner, _, _ := strings.Cut(reference, ".")
+			if dependency, ok := byName[owner]; !ok || !contains(dependency.Outputs,
+				strings.TrimPrefix(reference, owner+".")) {
+				return nil, badProduction(production, "node %s references unknown edge %q", node.Name, reference)
+			}
+			dependencies[node.Name][owner] = true
+		}
+	}
+	ordered := make([]ModelProductionNode, 0, len(byName))
+	placed := map[string]bool{}
+	for len(ordered) < len(byName) {
+		ready := make([]string, 0)
+		for name := range byName {
+			if placed[name] {
+				continue
+			}
+			all := true
+			for dependency := range dependencies[name] {
+				all = all && placed[dependency]
+			}
+			if all {
+				ready = append(ready, name)
+			}
+		}
+		if len(ready) == 0 {
+			return nil, badProduction(production, "contains a cycle")
+		}
+		sort.Strings(ready)
+		for _, name := range ready {
+			ordered = append(ordered, byName[name])
+			placed[name] = true
+		}
+	}
+	required := map[string]bool{}
+	var retain func(string)
+	retain = func(name string) {
+		if required[name] {
+			return
+		}
+		required[name] = true
+		for dependency := range dependencies[name] {
+			retain(dependency)
+		}
+	}
+	for _, output := range production.Outputs {
+		owner, _, _ := strings.Cut(output.Source, ".")
+		retain(owner)
+	}
+	if len(required) != len(byName) {
+		return nil, badProduction(production, "contains a disconnected node")
+	}
+	return ordered, nil
+}
+
+func contains(values []string, wanted string) bool {
+	for _, value := range values {
+		if value == wanted {
+			return true
+		}
+	}
+	return false
 }
 
 // DescriptorPath is the one generation-private location for Runtime-derived bytes.
@@ -458,6 +780,9 @@ func DecodeDescriptor(data []byte) (*PackageDescriptor, *exit.Error) {
 			return nil, problem
 		}
 	}
+	if problem := validateProductions(d.Productions); problem != nil {
+		return nil, problem
+	}
 	digest, err := canonical.Spell(canonical.Digest(normalized))
 	if err != nil {
 		return nil, exit.Internalf("cannot spell descriptor digest: %s", err)
@@ -465,6 +790,22 @@ func DecodeDescriptor(data []byte) (*PackageDescriptor, *exit.Error) {
 	d.Digest = digest
 	d.Raw = normalized
 	return &d, nil
+}
+
+// Production finds one reviewed static model-production graph by name.
+func (d *PackageDescriptor) Production(name string) (*ModelProduction, *exit.Error) {
+	for i := range d.Productions {
+		if d.Productions[i].Name == name {
+			return &d.Productions[i], nil
+		}
+	}
+	available := make([]string, 0, len(d.Productions))
+	for _, production := range d.Productions {
+		available = append(available, production.Name)
+	}
+	sort.Strings(available)
+	return nil, exit.New(exit.NotFound, "this release registers no model production %q", name).
+		WithRemedy("it registers: %s", strings.Join(available, ", "))
 }
 
 // Function finds one entrypoint or job by name.
@@ -565,6 +906,17 @@ func (e *Entrypoint) TypeOfField(name string) (json.RawMessage, bool) {
 		}
 	}
 	return nil, false
+}
+
+// InputKind returns the compact descriptor kind for one request field.
+func (e *Entrypoint) InputKind(name string) (string, bool) {
+	for _, field := range e.Request.Fields {
+		if field.Name == name {
+			kind, _ := typeOf(field.Type)
+			return kind, true
+		}
+	}
+	return "", false
 }
 
 // RequestFields names every declared request field, in the author's declaration order.
