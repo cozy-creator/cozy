@@ -178,7 +178,6 @@ func (c *Orchestrator) converge(s *session, w *worker, placements []DesiredPlace
 // numbers (#473).
 func (c *Orchestrator) onObserved(s *session, r *pb.ObservedWorkerState) {
 	var status *pb.PlacementStatus
-	var acquisition *records.PlacementAcquisition
 	var desiredRevision uint64
 	c.mu.Lock()
 	w := c.workers[s.instanceID]
@@ -227,11 +226,7 @@ func (c *Orchestrator) onObserved(s *session, r *pb.ObservedWorkerState) {
 				w.generation = status.ExecutorGeneration
 				w.heldSetDigest = status.PlacementSetDigest
 				w.fallbackSetDigest = status.RetainedFallbackPlacementSetDigest
-				observed, facts := placementAcquisitionOf(w.instanceID, s.bootID, status)
-				w.acquisition = facts
-				if observed != nil {
-					acquisition = observed
-				}
+				w.acquisition = placementAcquisitionOf(status)
 				for _, digest := range status.DispatchableBindingDigests {
 					dispatchable[spellOf(digest)] = true
 				}
@@ -297,11 +292,6 @@ func (c *Orchestrator) onObserved(s *session, r *pb.ObservedWorkerState) {
 	}
 	phase := trimEnum(pb.WorkerPhase_name[int32(r.WorkerPhase)], "WORKER_PHASE_")
 	c.mu.Unlock()
-	if acquisition != nil {
-		if problem := c.opt.Store.ObservePlacementAcquisition(*acquisition); problem != nil {
-			c.logf("placement acquisition observation REFUSED: %s", problem.Message)
-		}
-	}
 	if w != nil && w.media != nil {
 		go c.retryMediaCleanup(w)
 	}
@@ -356,36 +346,23 @@ func permanentDesiredRefusal(kind pb.FaultKind) bool {
 	return false
 }
 
-func placementAcquisitionOf(instanceID, bootID string,
-	status *pb.PlacementStatus) (*records.PlacementAcquisition, PlacementAcquisitionFacts) {
+func placementAcquisitionOf(status *pb.PlacementStatus) PlacementAcquisitionFacts {
 	var facts PlacementAcquisitionFacts
 	if status == nil || status.Acquisition == nil {
-		return nil, facts
+		return facts
 	}
-	setDigest, err := canonical.Spell(status.PlacementSetDigest)
-	if err != nil {
-		return nil, facts
-	}
-	leg := func(in *pb.AcquisitionLegObservation) (records.AcquisitionLeg, AcquisitionLegFacts) {
+	leg := func(in *pb.AcquisitionLegObservation) AcquisitionLegFacts {
 		if in == nil {
-			return records.AcquisitionLeg{}, AcquisitionLegFacts{}
+			return AcquisitionLegFacts{}
 		}
-		stored := records.AcquisitionLeg{
+		return AcquisitionLegFacts{
 			StartedNS: in.StartedMonotonicNs, EndedNS: in.EndedMonotonicNs,
 			DownloadedBytes: in.DownloadedBytes, ReusedBytes: in.ReusedBytes,
 		}
-		return stored, AcquisitionLegFacts{
-			StartedNS: stored.StartedNS, EndedNS: stored.EndedNS,
-			DownloadedBytes: stored.DownloadedBytes, ReusedBytes: stored.ReusedBytes,
-		}
 	}
-	pkg, pkgFacts := leg(status.Acquisition.Package)
-	model, modelFacts := leg(status.Acquisition.Model)
-	facts.Package, facts.Model = pkgFacts, modelFacts
-	return &records.PlacementAcquisition{
-		InstanceID: instanceID, WorkerBootID: bootID, PlacementID: status.PlacementId,
-		PlacementSetDigest: setDigest, Package: pkg, Model: model,
-	}, facts
+	facts.Package = leg(status.Acquisition.Package)
+	facts.Model = leg(status.Acquisition.Model)
+	return facts
 }
 
 // progressSignature renders every axis one ObservedWorkerState reports into one
@@ -709,8 +686,8 @@ func (c *Orchestrator) onOutcome(s *session, t *pb.AttemptOutcome) {
 		TriageSubject: triage.Subject, TriageDigest: triage.Digest,
 		TriageLength: triage.Length, TriagePath: triage.Path,
 		Body: t.OutcomeCanonicalBytes, Outputs: outputs,
-		ArtifactReceipts: artifactReceipts, ArtifactFinalizations: artifactFinalizations,
-		EventType: kept.Type, EventPayload: kept.Payload,
+		ArtifactFinalizations: artifactFinalizations,
+		EventType:             kept.Type, EventPayload: kept.Payload,
 		// A requeueing request is QUEUED for its next ordinal, not failed. Writing the
 		// attempt's own status onto the request row would make the status document say
 		// `failed` for a request that is still going.

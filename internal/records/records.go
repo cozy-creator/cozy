@@ -68,8 +68,9 @@ type Pin struct {
 
 type Store struct{ db *sql.DB }
 
-// schema is applied one statement at a time, so a refusal names the one table that
-// refused rather than the whole script.
+const schemaVersion = 1
+
+// schema is applied only by the unversioned -> v1 migration.
 var schema = append([]string{`
 CREATE TABLE IF NOT EXISTS install_generations (
   id            TEXT PRIMARY KEY,
@@ -125,11 +126,9 @@ var renames = []struct{ table, from, to string }{
 //
 //	busy_timeout  transient lock contention waits instead of failing immediately
 //	foreign_keys  the pin -> generation reference is enforced, not decorative
-//	journal_mode  WAL keeps reads independent of the single writer; it is persistent, so
-//	              an older root converts on its first open here
 //	txlock        writers reserve the lock before reading, so two processes cannot both
 //	              read and then fail immediately while upgrading a deferred transaction
-const pragmas = "?_pragma=busy_timeout(5000)&_pragma=foreign_keys(1)&_pragma=journal_mode(WAL)&_txlock=immediate"
+const pragmas = "?_pragma=busy_timeout(5000)&_pragma=foreign_keys(1)&_txlock=immediate"
 
 func Open(path string) (*Store, *exit.Error) {
 	// No `file:` prefix: the driver hands an unprefixed name to SQLite verbatim, so a
@@ -145,74 +144,127 @@ func Open(path string) (*Store, *exit.Error) {
 		db.Close()
 		return nil, exit.Internalf("cannot open the local records database %s: %s", path, err)
 	}
-	for _, stmt := range schema {
-		if _, err := db.Exec(stmt); err != nil {
-			db.Close()
-			return nil, exit.Internalf("cannot apply the records schema to %s: %s", path, err)
-		}
-	}
-	if e := migrateColumnRenames(db, path); e != nil {
+	version, err := databaseVersion(db)
+	if err != nil {
 		db.Close()
-		return nil, e
+		return nil, exit.Internalf("cannot read the records schema version in %s: %s", path, err)
 	}
-	if e := migrateRentalSchema(db, path); e != nil {
+	if version > schemaVersion {
 		db.Close()
-		return nil, e
+		return nil, exit.Named(exit.Conflict, "records.schema_newer",
+			"records database %s has schema %d; this build supports %d", path, version, schemaVersion).
+			WithRemedy("use the Cozy version that wrote this database")
 	}
-	// A column added to a table an older root already created. `CREATE TABLE IF NOT
-	// EXISTS` is a no-op on that root, so the new column would never appear; adding it
-	// here is the whole migration story a pre-launch single-writer store needs. A
-	// duplicate-column answer is the statement already having been applied.
-	for _, stmt := range widen {
-		if _, err := db.Exec(stmt); err != nil && !strings.Contains(err.Error(), "duplicate column") {
+	if version == 0 {
+		// WAL is persistent database state, so enable it only after a future version has
+		// been refused without mutation and before the migration takes its writer lock.
+		if _, err := db.Exec(`PRAGMA journal_mode=WAL`); err != nil {
 			db.Close()
-			return nil, exit.Internalf("cannot widen the records schema in %s: %s", path, err)
+			return nil, exit.Internalf("cannot enable WAL for %s: %s", path, err)
 		}
-	}
-	for _, stmt := range normalize {
-		if _, err := db.Exec(stmt); err != nil {
+		if e := migrateV1(db, path); e != nil {
 			db.Close()
-			return nil, exit.Internalf("cannot normalize lifecycle state in %s: %s", path, err)
-		}
-	}
-	// A table whose IDENTITY changed. `CREATE TABLE IF NOT EXISTS` above left an older
-	// root's shape in place and no `ALTER TABLE` can move a primary key, so the rows move
-	// to a new table instead — in ONE transaction, so a kill mid-rebuild leaves the old
-	// shape whole and the next open retries it.
-	for _, r := range rebuild {
-		var ddl string
-		err := db.QueryRow(`SELECT COALESCE(sql,'') FROM sqlite_master
-			WHERE type='table' AND name=?`, r.table).Scan(&ddl)
-		if err != nil || !strings.Contains(ddl, r.stale) {
-			continue
-		}
-		tx, err := db.Begin()
-		if err != nil {
-			db.Close()
-			return nil, exit.Internalf("cannot begin the %s rebuild in %s: %s", r.table, path, err)
-		}
-		for _, stmt := range r.steps {
-			if _, err := tx.Exec(stmt); err != nil {
-				tx.Rollback()
-				db.Close()
-				return nil, exit.Internalf("cannot rebuild %s in %s: %s", r.table, path, err)
-			}
-		}
-		if err := tx.Commit(); err != nil {
-			db.Close()
-			return nil, exit.Internalf("the %s rebuild did not commit in %s: %s", r.table, path, err)
+			return nil, e
 		}
 	}
 	return &Store{db: db}, nil
 }
 
-func migrateColumnRenames(db *sql.DB, path string) *exit.Error {
+func databaseVersion(db interface{ QueryRow(string, ...any) *sql.Row }) (int, error) {
+	var version int
+	err := db.QueryRow(`PRAGMA user_version`).Scan(&version)
+	return version, err
+}
+
+func migrateV1(db *sql.DB, path string) *exit.Error {
+	// _txlock=immediate makes database/sql's Begin the required BEGIN IMMEDIATE.
+	tx, err := db.Begin()
+	if err != nil {
+		return exit.Internalf("cannot begin the records migration in %s: %s", path, err)
+	}
+	defer tx.Rollback()
+	version, err := databaseVersion(tx)
+	if err != nil {
+		return exit.Internalf("cannot re-read the records schema version in %s: %s", path, err)
+	}
+	if version == schemaVersion {
+		if err := tx.Commit(); err != nil {
+			return exit.Internalf("cannot finish concurrent migration adoption in %s: %s", path, err)
+		}
+		return nil
+	}
+	if version != 0 {
+		return exit.Named(exit.Conflict, "records.schema_newer",
+			"records database %s changed to schema %d while opening", path, version)
+	}
+	for _, stmt := range schema {
+		if _, err := tx.Exec(stmt); err != nil {
+			return exit.Internalf("cannot apply the records schema to %s: %s", path, err)
+		}
+	}
+	if e := migrateColumnRenames(tx, path); e != nil {
+		return e
+	}
+	if e := migrateRentalSchema(tx, path); e != nil {
+		return e
+	}
+	widened := map[string]map[string]bool{}
+	for _, column := range widen {
+		columns := widened[column.table]
+		if columns == nil {
+			columns, err = tableColumns(tx, column.table)
+			if err != nil {
+				return exit.Internalf("cannot inspect %s in %s: %s", column.table, path, err)
+			}
+			widened[column.table] = columns
+		}
+		if columns[column.column] {
+			continue
+		}
+		if _, err := tx.Exec(`ALTER TABLE ` + column.table + ` ADD COLUMN ` +
+			column.column + ` ` + column.ddl); err != nil {
+			return exit.Internalf("cannot add %s.%s in %s: %s",
+				column.table, column.column, path, err)
+		}
+		columns[column.column] = true
+	}
+	for _, stmt := range normalize {
+		if _, err := tx.Exec(stmt); err != nil {
+			return exit.Internalf("cannot normalize lifecycle state in %s: %s", path, err)
+		}
+	}
+	for _, r := range rebuild {
+		var ddl string
+		err := tx.QueryRow(`SELECT COALESCE(sql,'') FROM sqlite_master
+			WHERE type='table' AND name=?`, r.table).Scan(&ddl)
+		if err != nil || !strings.Contains(ddl, r.stale) {
+			continue
+		}
+		for _, stmt := range r.steps {
+			if _, err := tx.Exec(stmt); err != nil {
+				return exit.Internalf("cannot rebuild %s in %s: %s", r.table, path, err)
+			}
+		}
+	}
+	if e := dropDeadSchema(tx, path); e != nil {
+		return e
+	}
+	if _, err := tx.Exec(`PRAGMA user_version=1`); err != nil {
+		return exit.Internalf("cannot stamp records schema 1 in %s: %s", path, err)
+	}
+	if err := tx.Commit(); err != nil {
+		return exit.Internalf("cannot commit records schema 1 in %s: %s", path, err)
+	}
+	return nil
+}
+
+func migrateColumnRenames(tx *sql.Tx, path string) *exit.Error {
 	known := map[string]map[string]bool{}
 	for _, rename := range renames {
 		columns := known[rename.table]
 		if columns == nil {
 			var err error
-			columns, err = tableColumns(db, rename.table)
+			columns, err = tableColumns(tx, rename.table)
 			if err != nil {
 				return exit.Internalf("cannot inspect %s in %s: %s", rename.table, path, err)
 			}
@@ -221,7 +273,7 @@ func migrateColumnRenames(db *sql.DB, path string) *exit.Error {
 		if !columns[rename.from] || columns[rename.to] {
 			continue
 		}
-		if _, err := db.Exec(`ALTER TABLE ` + rename.table + ` RENAME COLUMN ` +
+		if _, err := tx.Exec(`ALTER TABLE ` + rename.table + ` RENAME COLUMN ` +
 			rename.from + ` TO ` + rename.to); err != nil {
 			return exit.Internalf("cannot rename %s.%s to %s in %s: %s",
 				rename.table, rename.from, rename.to, path, err)
@@ -232,8 +284,49 @@ func migrateColumnRenames(db *sql.DB, path string) *exit.Error {
 	return nil
 }
 
-func tableColumns(db *sql.DB, table string) (map[string]bool, error) {
-	rows, err := db.Query(`PRAGMA table_info(` + table + `)`)
+func dropDeadSchema(tx *sql.Tx, path string) *exit.Error {
+	for _, table := range []string{
+		"workflow_steps",
+		"workflow_executions",
+		"managed_profile_installs",
+		"video_compositions",
+		"placement_acquisition_observations",
+		"artifact_receipts",
+	} {
+		if _, err := tx.Exec(`DROP TABLE IF EXISTS ` + table); err != nil {
+			return exit.Internalf("cannot drop retired table %s from %s: %s", table, path, err)
+		}
+	}
+	for _, retired := range []struct {
+		table string
+		names []string
+	}{
+		{"rentals", []string{
+			"released_at", "control_snapshot_digest", "control_snapshot_length",
+			"control_snapshot_bytes", "artifact_grant_revision",
+		}},
+		{"worker_processes", []string{"incarnation", "readiness_epoch", "revision", "intake"}},
+		{"outputs", []string{"visible_at", "reclaimed_at"}},
+	} {
+		columns, err := tableColumns(tx, retired.table)
+		if err != nil {
+			return exit.Internalf("cannot inspect %s in %s: %s", retired.table, path, err)
+		}
+		for _, name := range retired.names {
+			if !columns[name] {
+				continue
+			}
+			if _, err := tx.Exec(`ALTER TABLE ` + retired.table + ` DROP COLUMN ` + name); err != nil {
+				return exit.Internalf("cannot drop retired column %s.%s from %s: %s",
+					retired.table, name, path, err)
+			}
+		}
+	}
+	return nil
+}
+
+func tableColumns(tx *sql.Tx, table string) (map[string]bool, error) {
+	rows, err := tx.Query(`PRAGMA table_info(` + table + `)`)
 	if err != nil {
 		return nil, err
 	}
@@ -410,25 +503,6 @@ func (s *Store) Unreferenced() ([]PackageInstall, *exit.Error) {
 			return nil, exit.Internalf("cannot read a generation record: %s", err)
 		}
 		out = append(out, g)
-	}
-	return out, nil
-}
-
-// KnownIDs is every generation id on record — the set gc compares the generations
-// directory against to find orphans a pre-activation crash left behind.
-func (s *Store) KnownIDs() (map[string]bool, *exit.Error) {
-	rows, err := s.db.Query(`SELECT id FROM install_generations`)
-	if err != nil {
-		return nil, exit.Internalf("cannot list generation ids: %s", err)
-	}
-	defer rows.Close()
-	out := map[string]bool{}
-	for rows.Next() {
-		var id string
-		if err := rows.Scan(&id); err != nil {
-			return nil, exit.Internalf("cannot read a generation id: %s", err)
-		}
-		out[id] = true
 	}
 	return out, nil
 }
