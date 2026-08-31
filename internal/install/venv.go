@@ -241,7 +241,7 @@ func declaredExtras(pyproject string) []string {
 
 var cudaVersion = regexp.MustCompile(`CUDA Version:\s*(\d+)\.(\d+)`)
 
-// hostCUDA is the driver's maximum CUDA version as cuXYZ digits (12.8 -> 128).
+// hostCUDA is the driver's maximum CUDA version as cuXYZ digits (13.0 -> 130).
 func hostCUDA() int {
 	cmd := exec.Command("nvidia-smi")
 	// The allowlisted tool environment, like every other spawn: a probe that inherited

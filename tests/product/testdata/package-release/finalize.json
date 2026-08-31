@@ -35,5 +35,5 @@
   "requirements": [
     "cozy-runtime>=0.0.3"
   ],
-  "requires_python": ">=3.11"
+  "requires_python": ">=3.14,<3.15"
 }

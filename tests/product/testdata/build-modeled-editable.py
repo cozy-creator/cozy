@@ -73,7 +73,7 @@ def main() -> int:
             "[project]\n"
             'name = "modeled-development-package"\n'
             'version = "1.0.0"\n'
-            'requires-python = ">=3.11"\n'
+            'requires-python = ">=3.14,<3.15"\n'
             f'dependencies = ["cozy-runtime[derive]=={runtime_version}", '
             f'"tensorfs=={tensorfs_version}"]\n\n'
             "[tool.uv.sources]\n"
