@@ -278,7 +278,7 @@ func (s *Server) resolveJob(ctx context.Context, sub JobSubmission) (orchestrato
 	if s.packages == nil {
 		return out, exit.Unavailablef("this Cozy daemon resolves no packages")
 	}
-	if sub.Worker != "" && !sub.Rental {
+	if sub.Worker != "" && !sub.Rental && !sub.RentalRequired {
 		return out, exit.Named(exit.Validation, "rental.job_worker_without_rental",
 			"a pinned remote worker requires rental authorization")
 	}
