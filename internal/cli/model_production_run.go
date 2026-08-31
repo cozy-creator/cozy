@@ -65,6 +65,9 @@ func runRentedModelProduction(ctx *Context, plan modelproduction.Plan,
 			"model production %s is already %s: %s", operation.ID, operation.State,
 			operation.SafeDetail)
 	}
+	if operation.State == "release_cut" || operation.State == "cleanup_pending" {
+		return resumeProductionCleanup(ctx, store, plan, operation, replay)
+	}
 	state, _, problem := ensureDaemon(ctx)
 	if problem != nil {
 		return problem
@@ -209,6 +212,33 @@ func runRentedModelProduction(ctx *Context, plan modelproduction.Plan,
 	}
 	current, _ = store.ModelProduction(operation.ID)
 	return emitCompletedProduction(ctx, plan, current, replay)
+}
+
+func resumeProductionCleanup(ctx *Context, store *records.Store, plan modelproduction.Plan,
+	operation records.ModelProductionOperation, replay bool,
+) *exit.Error {
+	if operation.State == "release_cut" {
+		if problem := store.AdvanceModelProduction(operation.ID, "release_cut", "cleanup_pending",
+			operation.NodeIndex, operation.RentalID); problem != nil {
+			return problem
+		}
+		operation.State = "cleanup_pending"
+	}
+	if operation.RentalID != "" {
+		if problem := endRentalSilently(ctx, operation.RentalID); problem != nil {
+			return problem.WithRemedy("the model release is already cut; confirm rental %s absence to finish cleanup",
+				operation.RentalID).WithNext("cozy rental end " + operation.RentalID)
+		}
+	}
+	if problem := store.AdvanceModelProduction(operation.ID, "cleanup_pending", "completed",
+		operation.NodeIndex, operation.RentalID); problem != nil {
+		return problem
+	}
+	completed, problem := store.ModelProduction(operation.ID)
+	if problem != nil {
+		return problem
+	}
+	return emitCompletedProduction(ctx, plan, completed, replay)
 }
 
 func ensureProductionRental(ctx *Context, layout home.Layout, store *records.Store,
