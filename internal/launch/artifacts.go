@@ -49,6 +49,22 @@ type RuntimeCLI struct {
 	QueryTimeout time.Duration // metadata-query bound; zero selects DefaultRuntimeQueryTimeout
 }
 
+type PrivatePreflightResult struct {
+	PrivateRevisionDigest string `json:"private_revision_digest"`
+	Compatible            []struct {
+		Base string `json:"base"`
+		Path string `json:"path"`
+	} `json:"compatible"`
+}
+
+// PrivatePreflight delegates rented-base wheel/tag/native/collision policy to the exact Runtime
+// that built this private revision. Creator supplies only Hub-authoritative active manifest bytes.
+func (r RuntimeCLI) PrivatePreflight(ctx context.Context, requestPath string,
+	out *PrivatePreflightResult,
+) *exit.Error {
+	return r.callContext(ctx, out, "private-preflight", requestPath)
+}
+
 // Binary is the runtime a generation carries. An install already refused a generation
 // whose venv provides none (cl-009's `runtime_missing`), so this is the same claim,
 // re-asserted where it is used.
