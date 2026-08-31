@@ -38,6 +38,8 @@ func TestLegacyAttemptColumnsMigrate(t *testing.T) {
 	must(t, err)
 	_, err = db.Exec(`ALTER TABLE attempts RENAME COLUMN invocation TO exec_spec`)
 	must(t, err)
+	_, err = db.Exec(`PRAGMA user_version=0`)
+	must(t, err)
 	must(t, db.Close())
 
 	store, problem = records.Open(path)

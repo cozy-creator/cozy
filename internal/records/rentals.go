@@ -55,8 +55,8 @@ CREATE UNIQUE INDEX IF NOT EXISTS rental_operation_remote
 // migrateRentalSchema moves older local roots forward without tying their data to the
 // executable that last wrote it. Paid-rental safety comes from preserving lifecycle rows,
 // not from comparing sqlite_master's formatting with a Go string.
-func migrateRentalSchema(db *sql.DB, path string) *exit.Error {
-	columns, err := tableColumns(db, "rentals")
+func migrateRentalSchema(tx *sql.Tx, path string) *exit.Error {
+	columns, err := tableColumns(tx, "rentals")
 	if err != nil {
 		return exit.Internalf("cannot inspect the rentals schema in %s: %s", path, err)
 	}
@@ -72,18 +72,14 @@ func migrateRentalSchema(db *sql.DB, path string) *exit.Error {
 		if columns[column.name] {
 			continue
 		}
-		if _, err := db.Exec(`ALTER TABLE rentals ADD COLUMN ` + column.name + ` ` + column.ddl); err != nil {
+		if _, err := tx.Exec(`ALTER TABLE rentals ADD COLUMN ` + column.name + ` ` + column.ddl); err != nil {
 			return exit.Internalf("cannot add rentals.%s in %s: %s", column.name, path, err)
 		}
+		columns[column.name] = true
 	}
 	kept := []string{"id", "machine_name", "sku", "accelerator_model", "address", "cert_path",
 		"state", "hub", "rented_at", "media_address", "expected_worker_id", "expected_worker_boot_id"}
 	if len(columns) != len(kept) {
-		tx, err := db.Begin()
-		if err != nil {
-			return exit.Internalf("cannot begin rentals hardcut in %s: %s", path, err)
-		}
-		defer tx.Rollback()
 		if _, err := tx.Exec(`DROP TABLE IF EXISTS rental_relay_refusals`); err != nil {
 			return exit.Internalf("cannot drop retired rental relay state in %s: %s", path, err)
 		}
@@ -103,17 +99,14 @@ func migrateRentalSchema(db *sql.DB, path string) *exit.Error {
 		if _, err := tx.Exec(`ALTER TABLE rentals_next RENAME TO rentals`); err != nil {
 			return exit.Internalf("cannot publish slim rentals table in %s: %s", path, err)
 		}
-		if err := tx.Commit(); err != nil {
-			return exit.Internalf("cannot commit rentals hardcut in %s: %s", path, err)
-		}
 	}
-	if _, err := db.Exec(`DROP TABLE IF EXISTS rental_relay_refusals`); err != nil {
+	if _, err := tx.Exec(`DROP TABLE IF EXISTS rental_relay_refusals`); err != nil {
 		return exit.Internalf("cannot remove retired rental relay state in %s: %s", path, err)
 	}
-	if _, err := db.Exec(`DROP TABLE IF EXISTS rental_control_refusals`); err != nil {
+	if _, err := tx.Exec(`DROP TABLE IF EXISTS rental_control_refusals`); err != nil {
 		return exit.Internalf("cannot remove retired rental control state in %s: %s", path, err)
 	}
-	rows, err := db.Query(`SELECT id,machine_name FROM rentals`)
+	rows, err := tx.Query(`SELECT id,machine_name FROM rentals`)
 	if err != nil {
 		return exit.Internalf("cannot read rental machine names in %s: %s", path, err)
 	}
@@ -134,12 +127,12 @@ func migrateRentalSchema(db *sql.DB, path string) *exit.Error {
 		if row.name != "" {
 			continue
 		}
-		if _, err := db.Exec(`UPDATE rentals SET machine_name=? WHERE id=?`,
+		if _, err := tx.Exec(`UPDATE rentals SET machine_name=? WHERE id=?`,
 			rentalid.MachineName(row.id), row.id); err != nil {
 			return exit.Internalf("cannot name rental %s in %s: %s", row.id, path, err)
 		}
 	}
-	if _, err := db.Exec(`CREATE UNIQUE INDEX IF NOT EXISTS rentals_machine_name
+	if _, err := tx.Exec(`CREATE UNIQUE INDEX IF NOT EXISTS rentals_machine_name
 		ON rentals(machine_name) WHERE machine_name<>''`); err != nil {
 		return exit.Internalf("cannot index rental machine names in %s: %s", path, err)
 	}
@@ -370,20 +363,14 @@ func scanRental(row interface{ Scan(...any) error }) (Rental, error) {
 // ready must land on the same row rather than accumulate one per poll. State only moves
 // forward: a delayed poll answering `acquiring` after `ready` was recorded is stale.
 func (s *Store) RecordRental(r Rental) *exit.Error {
-	var problem *exit.Error
-	for range 3 {
-		problem = s.recordRental(r)
-		if problem == nil || !strings.Contains(problem.Message, "SQLITE_BUSY") {
-			return problem
-		}
+	tx, err := s.db.Begin()
+	if err != nil {
+		return exit.Internalf("cannot begin recording rental %s: %s", r.ID, err)
 	}
-	return problem
-}
-
-func (s *Store) recordRental(r Rental) *exit.Error {
+	defer tx.Rollback()
 	if r.MachineName == "" || r.SKU == "" {
 		var existingName, existingSKU string
-		err := s.db.QueryRow(`SELECT machine_name,sku FROM rentals WHERE id=?`, r.ID).
+		err := tx.QueryRow(`SELECT machine_name,sku FROM rentals WHERE id=?`, r.ID).
 			Scan(&existingName, &existingSKU)
 		if err == nil {
 			if r.MachineName == "" {
@@ -405,7 +392,7 @@ func (s *Store) recordRental(r Rental) *exit.Error {
 			WithRemedy("use 1-32 lowercase letters, numbers, and hyphens; local is reserved")
 	}
 	var conflictingID string
-	err := s.db.QueryRow(`SELECT id FROM rentals
+	err = tx.QueryRow(`SELECT id FROM rentals
 		WHERE id<>? AND (id=? OR machine_name=?) LIMIT 1`,
 		r.ID, r.MachineName, r.MachineName).Scan(&conflictingID)
 	if err == nil {
@@ -419,11 +406,6 @@ func (s *Store) recordRental(r Rental) *exit.Error {
 	if r.RentedAt == "" {
 		r.RentedAt = now()
 	}
-	tx, err := s.db.Begin()
-	if err != nil {
-		return exit.Internalf("cannot begin recording rental %s: %s", r.ID, err)
-	}
-	defer tx.Rollback()
 	var current string
 	switch err := tx.QueryRow(`SELECT state FROM rentals WHERE id=?`, r.ID).Scan(&current); {
 	case errors.Is(err, sql.ErrNoRows):
@@ -449,14 +431,11 @@ func (s *Store) recordRental(r Rental) *exit.Error {
 		r.RentedAt, r.MediaAddress, r.ExpectedWorkerID, r.ExpectedWorkerBootID); err != nil {
 		return exit.Internalf("cannot record rental %s: %s", r.ID, err)
 	}
-	if err := tx.Commit(); err != nil {
-		return exit.Internalf("cannot commit rental %s: %s", r.ID, err)
+	stored, err := scanRental(tx.QueryRow(`SELECT `+rentalCols+` FROM rentals WHERE id=?`, r.ID))
+	if err != nil {
+		return exit.Internalf("cannot read back rental %s: %s", r.ID, err)
 	}
-	stored, e := s.RentalRow(r.ID)
-	if e != nil {
-		return e
-	}
-	if stored == nil || stored.MachineName != r.MachineName || stored.SKU != r.SKU ||
+	if stored.MachineName != r.MachineName || stored.SKU != r.SKU ||
 		r.Address != "" && stored.Address != r.Address ||
 		r.MediaAddress != "" && stored.MediaAddress != r.MediaAddress ||
 		r.CertPath != "" && stored.CertPath != r.CertPath ||
@@ -464,6 +443,9 @@ func (s *Store) recordRental(r Rental) *exit.Error {
 		r.ExpectedWorkerBootID != "" && stored.ExpectedWorkerBootID != r.ExpectedWorkerBootID {
 		return exit.Named(exit.Conflict, "rental.attach_projection_conflict",
 			"rental %s already carries another address, media address, or certificate pin", r.ID)
+	}
+	if err := tx.Commit(); err != nil {
+		return exit.Internalf("cannot commit rental %s: %s", r.ID, err)
 	}
 	return nil
 }

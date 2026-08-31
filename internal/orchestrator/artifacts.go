@@ -86,8 +86,8 @@ func parseArtifactReceiptRef(ref canonical.Doc) (records.ArtifactReceipt, *exit.
 	out = records.ArtifactReceipt{
 		RequestID: doc.Str("request_id"), OwnerScope: doc.Str("owner_authority_scope"),
 		InvocationDigest: doc.Str("invocation_spec_digest"), OutputSlot: doc.Str("output_slot"),
-		TransactionID: doc.Str("artifact_transaction_id"), ReceiptDigest: digest,
-		ReceiptBytes: append([]byte(nil), data...),
+		ReceiptDigest: digest,
+		ReceiptBytes:  append([]byte(nil), data...),
 	}
 	return out, nil
 }

@@ -44,22 +44,6 @@ CREATE TABLE IF NOT EXISTS worker_processes (
 )`, `
 CREATE UNIQUE INDEX IF NOT EXISTS worker_session ON worker_processes(session_id)
   WHERE session_id IS NOT NULL`, `
-CREATE TABLE IF NOT EXISTS placement_acquisition_observations (
-  instance_id                 TEXT NOT NULL,
-  worker_boot_id              TEXT NOT NULL,
-  placement_id                TEXT NOT NULL,
-  placement_set_digest        TEXT NOT NULL,
-  package_started_ns         INTEGER NOT NULL,
-  package_ended_ns           INTEGER NOT NULL,
-  package_downloaded_bytes   INTEGER NOT NULL,
-  package_reused_bytes       INTEGER NOT NULL,
-  model_started_ns            INTEGER NOT NULL,
-  model_ended_ns              INTEGER NOT NULL,
-  model_downloaded_bytes      INTEGER NOT NULL,
-  model_reused_bytes          INTEGER NOT NULL,
-  observed_at                 TEXT NOT NULL,
-  PRIMARY KEY (instance_id, worker_boot_id, placement_id, placement_set_digest)
-)`, `
 CREATE TABLE IF NOT EXISTS requests (
   id           TEXT PRIMARY KEY,
   idem_key     TEXT    NOT NULL UNIQUE,
@@ -159,23 +143,7 @@ CREATE TABLE IF NOT EXISTS outputs (
   digest     TEXT    NOT NULL,
   length     INTEGER NOT NULL,
   mime_type  TEXT    NOT NULL,
-  visible_at TEXT    NOT NULL,
   PRIMARY KEY (request_id, attempt, output_id),
-  FOREIGN KEY (request_id, attempt) REFERENCES attempts(request_id, attempt)
-)`, `
--- Exact Runtime-authored ArtifactReceipt/1 documents carried by AttemptOutcomeBody/1.
--- They commit in the same transaction as the outcome and therefore exist before Ack.
-CREATE TABLE IF NOT EXISTS artifact_receipts (
-  request_id         TEXT    NOT NULL,
-  attempt            INTEGER NOT NULL,
-  output_slot        TEXT    NOT NULL,
-  owner_scope        TEXT    NOT NULL,
-  invocation_digest  TEXT    NOT NULL,
-  transaction_id     TEXT    NOT NULL,
-  receipt_digest     TEXT    NOT NULL,
-  receipt_bytes      BLOB    NOT NULL,
-  recorded_at        TEXT    NOT NULL,
-  PRIMARY KEY (request_id, attempt, output_slot),
   FOREIGN KEY (request_id, attempt) REFERENCES attempts(request_id, attempt)
 )`, `
 -- Cozy's first-wins typed artifact disposition and Runtime completion.
@@ -291,28 +259,25 @@ var rebuild = []tableRebuild{
 	},
 }
 
-// widen carries the columns a table gained after some root already created it. Applied
-// after `schema`, and a duplicate-column answer means it is already there.
-var widen = []string{
-	`ALTER TABLE install_generations ADD COLUMN runtime TEXT NOT NULL DEFAULT ''`,
-	`ALTER TABLE install_generations ADD COLUMN project_dir TEXT NOT NULL DEFAULT ''`,
-	`ALTER TABLE install_generations ADD COLUMN selection_profile TEXT NOT NULL DEFAULT ''`,
-	`ALTER TABLE install_generations ADD COLUMN placement_set_digest TEXT NOT NULL DEFAULT ''`,
-	`ALTER TABLE requests ADD COLUMN kind TEXT NOT NULL DEFAULT 'serving'`,
-	`ALTER TABLE requests ADD COLUMN worker TEXT NOT NULL DEFAULT ''`,
-	`ALTER TABLE requests ADD COLUMN org TEXT NOT NULL DEFAULT ''`,
-	`ALTER TABLE requests ADD COLUMN trees TEXT NOT NULL DEFAULT ''`,
-	`ALTER TABLE requests ADD COLUMN assets TEXT NOT NULL DEFAULT '[]'`,
-	`ALTER TABLE requests ADD COLUMN install_id TEXT NOT NULL DEFAULT ''`,
-	`ALTER TABLE requests ADD COLUMN artifact_outputs TEXT NOT NULL DEFAULT '[]'`,
-	`ALTER TABLE attempts ADD COLUMN media_cleaned INTEGER NOT NULL DEFAULT 0`,
-	`ALTER TABLE attempts ADD COLUMN artifact_outputs TEXT NOT NULL DEFAULT '[]'`,
-	`ALTER TABLE outputs ADD COLUMN reclaimed_at TEXT NOT NULL DEFAULT ''`,
+// widen carries columns added before the versioned migration existed.
+var widen = []struct{ table, column, ddl string }{
+	{"install_generations", "runtime", `TEXT NOT NULL DEFAULT ''`},
+	{"install_generations", "project_dir", `TEXT NOT NULL DEFAULT ''`},
+	{"install_generations", "selection_profile", `TEXT NOT NULL DEFAULT ''`},
+	{"install_generations", "placement_set_digest", `TEXT NOT NULL DEFAULT ''`},
+	{"requests", "kind", `TEXT NOT NULL DEFAULT 'serving'`},
+	{"requests", "worker", `TEXT NOT NULL DEFAULT ''`},
+	{"requests", "org", `TEXT NOT NULL DEFAULT ''`},
+	{"requests", "trees", `TEXT NOT NULL DEFAULT ''`},
+	{"requests", "assets", `TEXT NOT NULL DEFAULT '[]'`},
+	{"requests", "install_id", `TEXT NOT NULL DEFAULT ''`},
+	{"requests", "artifact_outputs", `TEXT NOT NULL DEFAULT '[]'`},
+	{"attempts", "media_cleaned", `INTEGER NOT NULL DEFAULT 0`},
+	{"attempts", "artifact_outputs", `TEXT NOT NULL DEFAULT '[]'`},
 }
 
 // normalize hard-cuts pre-launch lifecycle spellings whose durable meaning was refined.
-// Each statement is idempotent and runs after every open, so an interrupted upgrade is
-// simply retried.
+// They run once inside the v1 migration.
 var normalize = []string{
 	`UPDATE attempts SET state='offered' WHERE state='dispatching'`,
 	`UPDATE requests SET state='requeue_pending' WHERE state='queued' AND EXISTS (
@@ -347,130 +312,6 @@ type WorkerProcess struct {
 	SessionID             string
 	State                 string // spawned_without_birth | spawned | registered | closed
 	OpenedAt              string
-}
-
-type AcquisitionLeg struct {
-	StartedNS, EndedNS           uint64
-	DownloadedBytes, ReusedBytes uint64
-}
-
-type PlacementAcquisition struct {
-	InstanceID, WorkerBootID, PlacementID, PlacementSetDigest string
-	Package, Model                                            AcquisitionLeg
-	ObservedAt                                                string
-}
-
-const acquisitionColumns = `instance_id,worker_boot_id,placement_id,placement_set_digest,
-	package_started_ns,package_ended_ns,package_downloaded_bytes,package_reused_bytes,
-	model_started_ns,model_ended_ns,model_downloaded_bytes,model_reused_bytes,observed_at`
-
-func scanPlacementAcquisition(row interface{ Scan(...any) error }) (PlacementAcquisition, error) {
-	var out PlacementAcquisition
-	err := row.Scan(&out.InstanceID, &out.WorkerBootID, &out.PlacementID, &out.PlacementSetDigest,
-		&out.Package.StartedNS, &out.Package.EndedNS,
-		&out.Package.DownloadedBytes, &out.Package.ReusedBytes,
-		&out.Model.StartedNS, &out.Model.EndedNS,
-		&out.Model.DownloadedBytes, &out.Model.ReusedBytes, &out.ObservedAt)
-	return out, err
-}
-
-// ObservePlacementAcquisition persists the latest worker-authored observation for one
-// exact placement spec. Counters and clock points may advance; they never move backward.
-func (s *Store) ObservePlacementAcquisition(in PlacementAcquisition) *exit.Error {
-	if in.InstanceID == "" || in.WorkerBootID == "" || in.PlacementID == "" ||
-		in.PlacementSetDigest == "" {
-		return exit.Named(exit.Conflict, "placement.acquisition_identity_missing",
-			"an acquisition observation is missing worker, boot, placement, or spec identity")
-	}
-	if err := validAcquisitionLeg("package", in.Package); err != nil {
-		return err
-	}
-	if err := validAcquisitionLeg("model", in.Model); err != nil {
-		return err
-	}
-	if in.ObservedAt == "" {
-		in.ObservedAt = now()
-	}
-	result, err := s.db.Exec(`INSERT INTO placement_acquisition_observations(`+acquisitionColumns+`)
-		VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)
-		ON CONFLICT(instance_id,worker_boot_id,placement_id,placement_set_digest)
-		DO UPDATE SET package_started_ns=excluded.package_started_ns,
-		 package_ended_ns=excluded.package_ended_ns,
-		 package_downloaded_bytes=excluded.package_downloaded_bytes,
-		 package_reused_bytes=excluded.package_reused_bytes,
-		 model_started_ns=excluded.model_started_ns,model_ended_ns=excluded.model_ended_ns,
-		 model_downloaded_bytes=excluded.model_downloaded_bytes,
-		 model_reused_bytes=excluded.model_reused_bytes,observed_at=excluded.observed_at
-		WHERE (placement_acquisition_observations.package_started_ns=0 OR
-		       (excluded.package_started_ns=placement_acquisition_observations.package_started_ns AND
-		        excluded.package_ended_ns>=placement_acquisition_observations.package_ended_ns AND
-		        (placement_acquisition_observations.package_ended_ns=0 OR
-		         excluded.package_ended_ns=placement_acquisition_observations.package_ended_ns) AND
-		        excluded.package_downloaded_bytes>=placement_acquisition_observations.package_downloaded_bytes AND
-		        excluded.package_reused_bytes>=placement_acquisition_observations.package_reused_bytes) OR
-		       (placement_acquisition_observations.package_ended_ns>0 AND
-		        excluded.package_started_ns>placement_acquisition_observations.package_ended_ns))
-		  AND (placement_acquisition_observations.model_started_ns=0 OR
-		       (excluded.model_started_ns=placement_acquisition_observations.model_started_ns AND
-		        excluded.model_ended_ns>=placement_acquisition_observations.model_ended_ns AND
-		        (placement_acquisition_observations.model_ended_ns=0 OR
-		         excluded.model_ended_ns=placement_acquisition_observations.model_ended_ns) AND
-		        excluded.model_downloaded_bytes>=placement_acquisition_observations.model_downloaded_bytes AND
-		        excluded.model_reused_bytes>=placement_acquisition_observations.model_reused_bytes) OR
-		       (placement_acquisition_observations.model_ended_ns>0 AND
-		        excluded.model_started_ns>placement_acquisition_observations.model_ended_ns))`,
-		in.InstanceID, in.WorkerBootID, in.PlacementID, in.PlacementSetDigest,
-		in.Package.StartedNS, in.Package.EndedNS, in.Package.DownloadedBytes, in.Package.ReusedBytes,
-		in.Model.StartedNS, in.Model.EndedNS, in.Model.DownloadedBytes, in.Model.ReusedBytes,
-		in.ObservedAt)
-	if err != nil {
-		return exit.Internalf("cannot persist placement acquisition observation: %s", err)
-	}
-	changed, err := result.RowsAffected()
-	if err != nil {
-		return exit.Internalf("cannot read placement acquisition result: %s", err)
-	}
-	if changed != 1 {
-		return exit.Named(exit.Conflict, "placement.acquisition_regressed",
-			"worker %s acquisition counters or clock points moved backward", in.WorkerBootID)
-	}
-	return nil
-}
-
-func validAcquisitionLeg(name string, leg AcquisitionLeg) *exit.Error {
-	if leg.StartedNS == 0 {
-		if leg.EndedNS != 0 || leg.DownloadedBytes != 0 || leg.ReusedBytes != 0 {
-			return exit.Named(exit.Conflict, "placement.acquisition_invalid",
-				"%s acquisition has counters or an end without a start", name)
-		}
-		return nil
-	}
-	if leg.EndedNS != 0 && leg.EndedNS < leg.StartedNS {
-		return exit.Named(exit.Conflict, "placement.acquisition_invalid",
-			"%s acquisition ended before it started", name)
-	}
-	const maxSQLiteInteger = uint64(1<<63 - 1)
-	if leg.StartedNS > maxSQLiteInteger || leg.EndedNS > maxSQLiteInteger ||
-		leg.DownloadedBytes > maxSQLiteInteger || leg.ReusedBytes > maxSQLiteInteger {
-		return exit.Named(exit.Conflict, "placement.acquisition_invalid",
-			"%s acquisition exceeds the durable integer range", name)
-	}
-	return nil
-}
-
-func (s *Store) PlacementAcquisition(instanceID, bootID, placementID,
-	setDigest string) (*PlacementAcquisition, *exit.Error) {
-	out, err := scanPlacementAcquisition(s.db.QueryRow(`SELECT `+acquisitionColumns+`
-		FROM placement_acquisition_observations
-		WHERE instance_id=? AND worker_boot_id=? AND placement_id=? AND placement_set_digest=?`,
-		instanceID, bootID, placementID, setDigest))
-	if errors.Is(err, sql.ErrNoRows) {
-		return nil, nil
-	}
-	if err != nil {
-		return nil, exit.Internalf("cannot read placement acquisition observation: %s", err)
-	}
-	return &out, nil
 }
 
 func deviceMark(d string) string { return "|" + d + "|" }
@@ -554,21 +395,6 @@ func (s *Store) AttachWorker(w WorkerProcess) *exit.Error {
 		w.InstanceID, w.Package, nullable(w.Generation), w.PackageRevisionDigest, w.WorkerID,
 		now()); err != nil {
 		return exit.Internalf("cannot journal the attached worker %s: %s", w.InstanceID, err)
-	}
-	return nil
-}
-
-func (s *Store) ReviseAttachedWorker(instanceID, pkg, releaseID string) *exit.Error {
-	result, err := s.db.Exec(`UPDATE worker_processes SET package=?,package_revision_digest=?
-		WHERE instance_id=? AND worker_id='remote' AND state!='closed'`,
-		pkg, releaseID, instanceID)
-	if err != nil {
-		return exit.Internalf("cannot revise attached worker %s: %s", instanceID, err)
-	}
-	changed, err := result.RowsAffected()
-	if err != nil || changed != 1 {
-		return exit.Named(exit.Conflict, "rental.worker_not_live",
-			"attached worker %s is no longer one live remote worker", instanceID)
 	}
 	return nil
 }
@@ -1291,14 +1117,12 @@ type Output struct {
 	MimeType string
 }
 
-// ArtifactReceipt is the exact Runtime-authored ArtifactReceipt/1 identity carried by
-// AttemptOutcomeBody/1. ReceiptBytes are never parsed and reserialized for persistence.
+// ArtifactReceipt is the validated Runtime-authored ArtifactReceipt/1 carried by an outcome.
 type ArtifactReceipt struct {
-	RequestID, OwnerScope, InvocationDigest, OutputSlot, TransactionID string
-	Attempt                                                            int64
-	ReceiptDigest                                                      string
-	ReceiptBytes                                                       []byte
-	RecordedAt                                                         string
+	RequestID, OwnerScope, InvocationDigest, OutputSlot string
+	Attempt                                             int64
+	ReceiptDigest                                       string
+	ReceiptBytes                                        []byte
 }
 
 // ArtifactFinalization is Cozy's durable typed first-wins disposition and Runtime completion.
@@ -1334,7 +1158,6 @@ type Terminal struct {
 	TriagePath            string
 	Body                  []byte
 	Outputs               []Output
-	ArtifactReceipts      []ArtifactReceipt
 	ArtifactFinalizations []ArtifactFinalization
 	// Event is the attempt-end lifecycle event, appended INSIDE this transaction so the
 	// stream cannot disagree with the authority about whether the request ended.
@@ -1425,26 +1248,16 @@ func (s *Store) AcceptTerminal(t Terminal) (applied bool, e *exit.Error) {
 		return false, exit.New(exit.Conflict,
 			"terminal for %s#%d refused: the attempt row is in state %q", t.RequestID, t.Attempt, state)
 	}
-	visible := now()
 	for _, o := range t.Outputs {
 		if _, err := tx.Exec(`INSERT INTO outputs(request_id,attempt,output_id,media_id,path,digest,
-			length,mime_type,visible_at) VALUES(?,?,?,?,?,?,?,?,?)`,
+			length,mime_type) VALUES(?,?,?,?,?,?,?,?)`,
 			t.RequestID, t.Attempt, o.OutputID, o.MediaID, o.Path, o.Digest, o.Length,
-			o.MimeType, visible); err != nil {
+			o.MimeType); err != nil {
 			return false, exit.Internalf("cannot publish output %s of %s#%d: %s",
 				o.OutputID, t.RequestID, t.Attempt, err)
 		}
 	}
-	for _, receipt := range t.ArtifactReceipts {
-		if _, err := tx.Exec(`INSERT INTO artifact_receipts(request_id,attempt,output_slot,
-			owner_scope,invocation_digest,transaction_id,receipt_digest,receipt_bytes,recorded_at)
-			VALUES(?,?,?,?,?,?,?,?,?)`, receipt.RequestID, receipt.Attempt, receipt.OutputSlot,
-			receipt.OwnerScope, receipt.InvocationDigest, receipt.TransactionID,
-			receipt.ReceiptDigest, receipt.ReceiptBytes, visible); err != nil {
-			return false, exit.Internalf("cannot record artifact receipt %s of %s#%d: %s",
-				receipt.OutputSlot, t.RequestID, t.Attempt, err)
-		}
-	}
+	visible := now()
 	for _, finalization := range t.ArtifactFinalizations {
 		var held ArtifactFinalization
 		err := tx.QueryRow(`SELECT attempt,instance_id,owner_scope,disposition,
@@ -1562,16 +1375,6 @@ func (s *Store) Recover(requestID string, attempt int64, sessionID string) *exit
 
 func (s *Store) AttemptRow(requestID string, attempt int64) (*Attempt, *exit.Error) {
 	rows, e := s.attemptsWhere(`request_id=? AND attempt=?`, requestID, attempt)
-	if e != nil || len(rows) == 0 {
-		return nil, e
-	}
-	return &rows[0], nil
-}
-
-// AttemptByKey is the opaque-id read: triage is retrievable by attempt key and by
-// nothing else. There is no path in the row and no way to name one.
-func (s *Store) AttemptByKey(key string) (*Attempt, *exit.Error) {
-	rows, e := s.attemptsWhere(`attempt_key=?`, key)
 	if e != nil || len(rows) == 0 {
 		return nil, e
 	}
@@ -1773,28 +1576,6 @@ func blob(b []byte) []byte {
 	return b
 }
 
-// ArtifactReceiptsOf exposes the exact bytes the terminal transaction made durable.
-func (s *Store) ArtifactReceiptsOf(requestID string, attempt int64) ([]ArtifactReceipt, *exit.Error) {
-	rows, err := s.db.Query(`SELECT request_id,attempt,owner_scope,invocation_digest,output_slot,
-		transaction_id,receipt_digest,receipt_bytes,recorded_at FROM artifact_receipts
-		WHERE request_id=? AND attempt=? ORDER BY output_slot`, requestID, attempt)
-	if err != nil {
-		return nil, exit.Internalf("cannot read artifact receipts of %s#%d: %s", requestID, attempt, err)
-	}
-	defer rows.Close()
-	out := []ArtifactReceipt{}
-	for rows.Next() {
-		var receipt ArtifactReceipt
-		if err := rows.Scan(&receipt.RequestID, &receipt.Attempt, &receipt.OwnerScope,
-			&receipt.InvocationDigest, &receipt.OutputSlot, &receipt.TransactionID,
-			&receipt.ReceiptDigest, &receipt.ReceiptBytes, &receipt.RecordedAt); err != nil {
-			return nil, exit.Internalf("cannot read an artifact receipt row: %s", err)
-		}
-		out = append(out, receipt)
-	}
-	return out, nil
-}
-
 // VisibleOutputs answers ONLY for an attempt whose terminal the orchestrator accepted.
 // The join is the invariant: an output row exists only inside the terminal transaction,
 // so "visible without a terminal" has no representation.
@@ -1805,28 +1586,6 @@ func (s *Store) VisibleOutputs(requestID string) ([]Output, *exit.Error) {
 		ORDER BY o.attempt, o.output_id`, requestID)
 	if err != nil {
 		return nil, exit.Internalf("cannot read the outputs of %s: %s", requestID, err)
-	}
-	defer rows.Close()
-	var out []Output
-	for rows.Next() {
-		var o Output
-		if err := rows.Scan(&o.OutputID, &o.MediaID, &o.Path, &o.Digest, &o.Length, &o.MimeType); err != nil {
-			return nil, exit.Internalf("cannot read an output row: %s", err)
-		}
-		out = append(out, o)
-	}
-	return out, nil
-}
-
-// VisibleOutputsOf narrows visibility to ONE attempt — what a crash arm asks when it
-// wants to know whether the bytes THAT attempt wrote ever became a result.
-func (s *Store) VisibleOutputsOf(requestID string, attempt int64) ([]Output, *exit.Error) {
-	rows, err := s.db.Query(`SELECT o.output_id,o.media_id,o.path,o.digest,o.length,o.mime_type
-		FROM outputs o JOIN attempts a ON a.request_id=o.request_id AND a.attempt=o.attempt
-		WHERE o.request_id=? AND o.attempt=? AND a.state IN ('terminal','closed')
-		ORDER BY o.output_id`, requestID, attempt)
-	if err != nil {
-		return nil, exit.Internalf("cannot read the outputs of %s#%d: %s", requestID, attempt, err)
 	}
 	defer rows.Close()
 	var out []Output
@@ -1996,32 +1755,6 @@ func (s *Store) Checkpoints(requestID string) ([]Checkpoint, *exit.Error) {
 			return nil, exit.Internalf("cannot read a checkpoint row: %s", err)
 		}
 		out = append(out, c)
-	}
-	return out, nil
-}
-
-// Counts is the durable workload summary exposed by the local API beside its live
-// package and worker counts. Serving requests and jobs are separate products in the
-// dashboard even though they share one lifecycle table and attempt authority.
-func (s *Store) Counts() (map[string]int, *exit.Error) {
-	out := map[string]int{}
-	for name, query := range map[string]string{
-		"requests": `SELECT COUNT(*) FROM requests WHERE kind='serving'`,
-		"active_requests": `SELECT COUNT(*) FROM requests WHERE kind='serving'
-			AND state IN ('submitted','queued','dispatching','requeue_pending')`,
-		"jobs": `SELECT COUNT(*) FROM requests WHERE kind='job'`,
-		"active_jobs": `SELECT COUNT(*) FROM requests WHERE kind='job'
-			AND state IN ('submitted','queued','dispatching','requeue_pending')`,
-		"attempts":           `SELECT COUNT(*) FROM attempts`,
-		"active_attempts":    `SELECT COUNT(*) FROM attempts WHERE state IN ('preparing','offered','accepted','terminal')`,
-		"recovered_attempts": `SELECT COUNT(*) FROM attempts WHERE state='recovered_open'`,
-		"outputs":            `SELECT COUNT(*) FROM outputs`,
-	} {
-		var n int
-		if err := s.db.QueryRow(query).Scan(&n); err != nil {
-			return nil, exit.Internalf("cannot read the %s count: %s", name, err)
-		}
-		out[name] = n
 	}
 	return out, nil
 }

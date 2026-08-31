@@ -3,11 +3,187 @@ package producttest
 import (
 	"context"
 	"database/sql"
+	"fmt"
+	"sync"
 	"testing"
 	"time"
 
 	"github.com/cozy-creator/cozy/internal/records"
 )
+
+func TestRecordsV1MigrationIsAtomicAndMinimal(t *testing.T) {
+	path := t.TempDir() + "/records.db"
+	store, problem := records.Open(path)
+	fatal(t, problem)
+	store.Close()
+
+	db, err := sql.Open("sqlite", path)
+	must(t, err)
+	stale := []string{
+		`PRAGMA user_version=0`,
+		`CREATE TABLE managed_profile_installs(id TEXT)`,
+		`CREATE TABLE workflow_executions(id TEXT PRIMARY KEY)`,
+		`CREATE TABLE workflow_steps(workflow_id TEXT)`,
+		`CREATE TABLE video_compositions(id TEXT)`,
+		`CREATE TABLE placement_acquisition_observations(id TEXT)`,
+		`CREATE TABLE artifact_receipts(id TEXT)`,
+		`ALTER TABLE rentals ADD COLUMN released_at TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE rentals ADD COLUMN control_snapshot_digest TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE rentals ADD COLUMN control_snapshot_length INTEGER NOT NULL DEFAULT 0`,
+		`ALTER TABLE rentals ADD COLUMN control_snapshot_bytes BLOB NOT NULL DEFAULT x''`,
+		`ALTER TABLE rentals ADD COLUMN artifact_grant_revision INTEGER NOT NULL DEFAULT 0`,
+		`ALTER TABLE worker_processes ADD COLUMN incarnation INTEGER NOT NULL DEFAULT 0`,
+		`ALTER TABLE worker_processes ADD COLUMN readiness_epoch INTEGER NOT NULL DEFAULT 0`,
+		`ALTER TABLE worker_processes ADD COLUMN revision INTEGER NOT NULL DEFAULT 0`,
+		`ALTER TABLE worker_processes ADD COLUMN intake TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE outputs ADD COLUMN visible_at TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE outputs ADD COLUMN reclaimed_at TEXT NOT NULL DEFAULT ''`,
+	}
+	for _, statement := range stale {
+		_, err = db.Exec(statement)
+		must(t, err)
+	}
+	must(t, db.Close())
+
+	var wg sync.WaitGroup
+	errs := make(chan error, 2)
+	for range 2 {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			opened, problem := records.Open(path)
+			if problem != nil {
+				errs <- problem
+				return
+			}
+			opened.Close()
+		}()
+	}
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		t.Fatal(err)
+	}
+
+	db, err = sql.Open("sqlite", path)
+	must(t, err)
+	defer db.Close()
+	var version, schemaVersion int
+	var quick string
+	must(t, db.QueryRow(`PRAGMA user_version`).Scan(&version))
+	must(t, db.QueryRow(`PRAGMA schema_version`).Scan(&schemaVersion))
+	must(t, db.QueryRow(`PRAGMA quick_check`).Scan(&quick))
+	if version != 1 || quick != "ok" {
+		t.Fatalf("migrated version/quick_check = %d/%q", version, quick)
+	}
+	retained := map[string]bool{
+		"install_generations": true, "pins": true, "worker_processes": true,
+		"requests": true, "attempts": true, "outputs": true, "request_events": true,
+		"publications": true, "job_checkpoints": true, "artifact_finalizations": true,
+		"rental_operations": true, "rentals": true,
+	}
+	rows, err := db.Query(`SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'`)
+	must(t, err)
+	for rows.Next() {
+		var name string
+		must(t, rows.Scan(&name))
+		if !retained[name] {
+			t.Errorf("unowned table %s survived migration", name)
+		}
+		delete(retained, name)
+	}
+	must(t, rows.Close())
+	for name := range retained {
+		t.Errorf("owned table %s is absent after migration", name)
+	}
+	for _, table := range []string{
+		"managed_profile_installs", "workflow_executions", "workflow_steps",
+		"video_compositions", "placement_acquisition_observations", "artifact_receipts",
+		"rental_relay_refusals", "rental_control_refusals",
+	} {
+		var count int
+		must(t, db.QueryRow(`SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name=?`, table).Scan(&count))
+		if count != 0 {
+			t.Errorf("retired table %s survived migration", table)
+		}
+	}
+	for table, columns := range map[string][]string{
+		"rentals": {"released_at", "control_snapshot_digest", "control_snapshot_length",
+			"control_snapshot_bytes", "artifact_grant_revision"},
+		"worker_processes": {"incarnation", "readiness_epoch", "revision", "intake"},
+		"outputs":          {"visible_at", "reclaimed_at"},
+	} {
+		held := tableColumnNames(t, db, table)
+		for _, column := range columns {
+			if held[column] {
+				t.Errorf("retired column %s.%s survived migration", table, column)
+			}
+		}
+	}
+
+	opened, problem := records.Open(path)
+	fatal(t, problem)
+	opened.Close()
+	var reopenedSchemaVersion int
+	must(t, db.QueryRow(`PRAGMA schema_version`).Scan(&reopenedSchemaVersion))
+	if reopenedSchemaVersion != schemaVersion {
+		t.Fatalf("v1 open performed DDL: schema_version %d -> %d", schemaVersion, reopenedSchemaVersion)
+	}
+}
+
+func TestRecordsRefusesFutureSchemaWithoutMutation(t *testing.T) {
+	path := t.TempDir() + "/records.db"
+	db, err := sql.Open("sqlite", path)
+	must(t, err)
+	_, err = db.Exec(`CREATE TABLE future_owner(value TEXT); PRAGMA user_version=2`)
+	must(t, err)
+	var before int
+	must(t, db.QueryRow(`PRAGMA schema_version`).Scan(&before))
+	must(t, db.Close())
+
+	opened, problem := records.Open(path)
+	if opened != nil {
+		opened.Close()
+		t.Fatal("future records schema opened")
+	}
+	if problem == nil || problem.ErrName() != "records.schema_newer" {
+		t.Fatalf("future schema refusal = %#v", problem)
+	}
+
+	db, err = sql.Open("sqlite", path)
+	must(t, err)
+	defer db.Close()
+	var version, after int
+	must(t, db.QueryRow(`PRAGMA user_version`).Scan(&version))
+	must(t, db.QueryRow(`PRAGMA schema_version`).Scan(&after))
+	if version != 2 || after != before {
+		t.Fatalf("future schema mutated: version=%d schema_version=%d->%d", version, before, after)
+	}
+	var names string
+	must(t, db.QueryRow(`SELECT group_concat(name, ',') FROM sqlite_master WHERE type='table'`).Scan(&names))
+	if names != "future_owner" {
+		t.Fatalf("future schema tables changed: %s", names)
+	}
+}
+
+func tableColumnNames(t *testing.T, db *sql.DB, table string) map[string]bool {
+	t.Helper()
+	rows, err := db.Query(fmt.Sprintf("PRAGMA table_info(%s)", table))
+	must(t, err)
+	defer rows.Close()
+	out := map[string]bool{}
+	for rows.Next() {
+		var id, notNull, primaryKey int
+		var name, kind string
+		var defaultValue sql.NullString
+		must(t, rows.Scan(&id, &name, &kind, &notNull, &defaultValue, &primaryKey))
+		out[name] = true
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatal(err)
+	}
+	return out
+}
 
 func TestRentalRecordWaitsForAnotherProcessWriter(t *testing.T) {
 	path := t.TempDir() + "/records.db"
