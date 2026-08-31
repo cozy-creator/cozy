@@ -84,14 +84,21 @@ def tile(ctx: Context, payload: TileInput, out: Outputs, tel: Telemetry) -> Tile
     whose output is a real PNG the runtime encodes, with nothing to load first."""
     side = 8 if ctx.boot_warmup else payload.size
     tel.log("filling the tile", side=side, seed=payload.seed)
+    tel.progress(0.25, stage="tile")
+    # Leave the real CLI enough time to observe this deliberately lossy frame. The fixture
+    # proves presentation of a live Runtime stream; it does not pretend a completed run can
+    # replay every transient tick.
+    time.sleep(0.05)
     state = payload.seed & 0xFFFFFFFF
-    pixels = bytearray(side * side * 3)
-    for i in range(0, len(pixels), 3):
-        ctx.raise_if_cancelled()
-        state = (1664525 * state + 1013904223) & 0xFFFFFFFF
-        pixels[i] = (state >> 24) & 0xFF
-        pixels[i + 1] = (state >> 16) & 0xFF
-        pixels[i + 2] = (state >> 8) & 0xFF
+    with tel.stage("fill_pixels"):
+        pixels = bytearray(side * side * 3)
+        for i in range(0, len(pixels), 3):
+            ctx.raise_if_cancelled()
+            state = (1664525 * state + 1013904223) & 0xFFFFFFFF
+            pixels[i] = (state >> 24) & 0xFF
+            pixels[i + 1] = (state >> 16) & 0xFF
+            pixels[i + 2] = (state >> 8) & 0xFF
+    tel.progress(1.0, stage="tile")
     tel.metric("tile_bytes", len(pixels))
     return TileOutput(
         image=out.save_image(ImageFrame(side, side, bytes(pixels)), format="png"),
