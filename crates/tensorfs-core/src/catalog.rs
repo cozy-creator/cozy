@@ -12,7 +12,24 @@ use crate::err::{refuse, Code, Refusal, Result};
 use crate::storage::Projection;
 
 const ABANDON_AFTER_SECS: u64 = 7 * 24 * 60 * 60;
-const SCHEMA_VERSION: u64 = 2;
+const SCHEMA_VERSION: u64 = 1;
+
+const SCHEMA: &[(&str, &[&str])] = &[
+    ("tensorfs_derived_transactions", &["id", "bytes"]),
+    ("tensorfs_holds", &["operation_id", "key", "length"]),
+    (
+        "tensorfs_operations",
+        &["id", "org", "name", "writer_marker", "last_progress_at"],
+    ),
+    (
+        "tensorfs_released_manifests",
+        &["org", "name", "manifest_sha256"],
+    ),
+    (
+        "tensorfs_verified_blobs",
+        &["sha256", "length", "dev", "ino", "mtime_s", "mtime_ns"],
+    ),
+];
 
 fn sql(what: impl AsRef<str>, error: rusqlite::Error) -> Refusal {
     Refusal {
@@ -26,6 +43,57 @@ fn io(what: impl AsRef<str>, error: std::io::Error) -> Refusal {
         code: Code::IO_FAILED,
         detail: format!("{}: {error}", what.as_ref()),
     }
+}
+
+fn verify_schema(connection: &Connection) -> Result<()> {
+    let mut statement = connection
+        .prepare(
+            "SELECT name FROM sqlite_master
+             WHERE type='table' AND name NOT LIKE 'sqlite_%' ORDER BY name",
+        )
+        .map_err(|error| sql("prepare catalog schema census", error))?;
+    let tables: Vec<String> = statement
+        .query_map([], |row| row.get(0))
+        .map_err(|error| sql("read catalog schema census", error))?
+        .collect::<std::result::Result<_, _>>()
+        .map_err(|error| sql("collect catalog schema census", error))?;
+    let expected: Vec<String> = SCHEMA.iter().map(|(name, _)| (*name).to_string()).collect();
+    if tables != expected {
+        return refuse(
+            Code::UNKNOWN_FORMAT,
+            "tensorfs.sqlite is not the exact v1 catalog; remove it and rebuild from repository files",
+        );
+    }
+    for (table, expected_columns) in SCHEMA {
+        let mut columns = connection
+            .prepare("SELECT name FROM pragma_table_info(?1) ORDER BY cid")
+            .map_err(|error| sql("prepare catalog column census", error))?;
+        let actual: Vec<String> = columns
+            .query_map([table], |row| row.get(0))
+            .map_err(|error| sql("read catalog column census", error))?
+            .collect::<std::result::Result<_, _>>()
+            .map_err(|error| sql("collect catalog column census", error))?;
+        let expected: Vec<String> = expected_columns
+            .iter()
+            .map(|name| (*name).to_string())
+            .collect();
+        let strict: u64 = connection
+            .query_row(
+                "SELECT strict FROM pragma_table_list WHERE schema='main' AND name=?1",
+                [table],
+                |row| row.get(0),
+            )
+            .map_err(|error| sql("read catalog strict-table census", error))?;
+        if actual != expected || strict != 1 {
+            return refuse(
+                Code::UNKNOWN_FORMAT,
+                format!(
+                    "tensorfs.sqlite table {table} is not the exact v1 shape; remove the catalog and rebuild from repository files"
+                ),
+            );
+        }
+    }
+    Ok(())
 }
 
 #[derive(Debug, Clone)]
@@ -42,7 +110,7 @@ impl Catalog {
         let catalog = Self {
             path: Self::path(root),
         };
-        catalog.migrate()?;
+        catalog.initialize_schema()?;
         Ok(catalog)
     }
 
@@ -68,6 +136,7 @@ impl Catalog {
                 format!("tensorfs.sqlite user_version {version} != {SCHEMA_VERSION}"),
             );
         }
+        verify_schema(&connection)?;
         Ok(catalog)
     }
 
@@ -83,15 +152,46 @@ impl Catalog {
         Ok(connection)
     }
 
-    fn migrate(&self) -> Result<()> {
+    fn initialize_schema(&self) -> Result<()> {
         let connection = self.connection()?;
+        connection
+            .execute_batch("BEGIN IMMEDIATE")
+            .map_err(|error| sql("lock catalog initialization", error))?;
         let version: u64 = connection
             .query_row("PRAGMA user_version", [], |row| row.get(0))
             .map_err(|error| sql("read catalog version", error))?;
-        match version {
-            0 => connection
-                .execute_batch(
-                "BEGIN IMMEDIATE;
+        if version == SCHEMA_VERSION {
+            connection
+                .execute_batch("COMMIT")
+                .map_err(|error| sql("commit catalog open", error))?;
+            return verify_schema(&connection);
+        }
+        if version != 0 {
+            let _ = connection.execute_batch("ROLLBACK");
+            return refuse(
+                Code::UNKNOWN_FORMAT,
+                format!(
+                    "tensorfs.sqlite user_version {version} is not supported; remove it and rebuild from repository files"
+                ),
+            );
+        }
+        let existing: u64 = connection
+            .query_row(
+                "SELECT count(*) FROM sqlite_master
+                 WHERE type='table' AND name NOT LIKE 'sqlite_%'",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(|error| sql("inspect unversioned catalog", error))?;
+        if existing != 0 {
+            let _ = connection.execute_batch("ROLLBACK");
+            return refuse(
+                Code::UNKNOWN_FORMAT,
+                "unversioned tensorfs.sqlite is not an empty new catalog; remove it and rebuild from repository files",
+            );
+        }
+        let result = connection.execute_batch(
+            "
                  CREATE TABLE tensorfs_released_manifests (
                    org TEXT NOT NULL,
                    name TEXT NOT NULL,
@@ -105,7 +205,7 @@ impl Catalog {
                    writer_marker TEXT NOT NULL,
                    last_progress_at INTEGER NOT NULL
                  ) STRICT;
-                 CREATE TABLE IF NOT EXISTS tensorfs_holds (
+                 CREATE TABLE tensorfs_holds (
                    operation_id TEXT NOT NULL,
                    key TEXT NOT NULL,
                    length INTEGER NOT NULL,
@@ -124,62 +224,15 @@ impl Catalog {
                    mtime_s INTEGER NOT NULL,
                    mtime_ns INTEGER NOT NULL
                  ) STRICT;
-                 PRAGMA user_version=2;
+                 PRAGMA user_version=1;
                  COMMIT;",
-            )
-            .map_err(|error| sql("create catalog", error)),
-            1 => connection
-                .execute_batch(
-                "BEGIN IMMEDIATE;
-                 CREATE TABLE tensorfs_released_manifests (
-                   org TEXT NOT NULL,
-                   name TEXT NOT NULL,
-                   manifest_sha256 TEXT NOT NULL,
-                   PRIMARY KEY (org,name,manifest_sha256)
-                 ) STRICT;
-                 INSERT INTO tensorfs_released_manifests(org,name,manifest_sha256)
-                   SELECT DISTINCT org,name,manifest_sha256 FROM tensorfs_releases;
-                 CREATE TABLE tensorfs_operations_v2 (
-                   id TEXT PRIMARY KEY,
-                   org TEXT NOT NULL,
-                   name TEXT NOT NULL,
-                   writer_marker TEXT NOT NULL,
-                   last_progress_at INTEGER NOT NULL
-                 ) STRICT;
-                 INSERT INTO tensorfs_operations_v2(id,org,name,writer_marker,last_progress_at)
-                   SELECT id,org,name,writer_marker,last_progress_at
-                   FROM tensorfs_operations WHERE state='open';
-                 CREATE TABLE tensorfs_holds_v2 (
-                   operation_id TEXT NOT NULL,
-                   key TEXT NOT NULL,
-                   length INTEGER NOT NULL,
-                   PRIMARY KEY (operation_id,key),
-                   FOREIGN KEY (operation_id) REFERENCES tensorfs_operations_v2(id) ON DELETE CASCADE
-                 ) STRICT;
-                 INSERT INTO tensorfs_holds_v2(operation_id,key,length)
-                   SELECT h.operation_id,h.key,h.length FROM tensorfs_holds h
-                   JOIN tensorfs_operations o ON o.id=h.operation_id WHERE o.state='open';
-                 DROP TABLE tensorfs_read_lease_objects;
-                 DROP TABLE tensorfs_read_leases;
-                 DROP TABLE tensorfs_release_encodings;
-                 DROP TABLE tensorfs_release_components;
-                 DROP TABLE tensorfs_release_configs;
-                 DROP TABLE tensorfs_release_objects;
-                 DROP TABLE tensorfs_releases;
-                 DROP TABLE tensorfs_repos;
-                 DROP TABLE tensorfs_holds;
-                 DROP TABLE tensorfs_operations;
-                 ALTER TABLE tensorfs_operations_v2 RENAME TO tensorfs_operations;
-                 ALTER TABLE tensorfs_holds_v2 RENAME TO tensorfs_holds;
-                 PRAGMA user_version=2;
-                 COMMIT;",
-            )
-            .map_err(|error| sql("migrate catalog v1 to v2", error)),
-            SCHEMA_VERSION => Ok(()),
-            _ => refuse(
-                Code::UNKNOWN_FORMAT,
-                format!("tensorfs.sqlite user_version {version} is newer than {SCHEMA_VERSION}"),
-            ),
+        );
+        match result {
+            Ok(()) => verify_schema(&connection),
+            Err(error) => {
+                let _ = connection.execute_batch("ROLLBACK");
+                Err(sql("create catalog", error))
+            }
         }
     }
 
@@ -726,77 +779,46 @@ mod tests {
     }
 
     #[test]
-    fn version_one_migrates_only_live_coordination_and_released_manifests() {
-        let root = temporary("v1-migration");
+    fn old_or_wrong_v1_catalogs_refuse_without_mutation() {
+        let root = temporary("v1-hardcut");
         fs::create_dir_all(&root).unwrap();
         let connection = rusqlite::Connection::open(Catalog::path(&root)).unwrap();
         connection
             .execute_batch(
-                "PRAGMA foreign_keys=OFF;
-                 CREATE TABLE tensorfs_repos(org TEXT,name TEXT,document_sha256 TEXT);
-                 CREATE TABLE tensorfs_releases(org TEXT,name TEXT,manifest_sha256 TEXT);
-                 CREATE TABLE tensorfs_release_objects(value TEXT);
-                 CREATE TABLE tensorfs_release_encodings(value TEXT);
-                 CREATE TABLE tensorfs_release_components(value TEXT);
-                 CREATE TABLE tensorfs_release_configs(value TEXT);
-                 CREATE TABLE tensorfs_operations(
-                   id TEXT PRIMARY KEY,org TEXT,name TEXT,state TEXT,writer_marker TEXT,
-                   last_progress_at INTEGER,accepted_objects INTEGER,accepted_bytes INTEGER);
-                 CREATE TABLE tensorfs_holds(operation_id TEXT,key TEXT,length INTEGER);
-                 CREATE TABLE tensorfs_read_leases(id TEXT);
-                 CREATE TABLE tensorfs_read_lease_objects(lease_id TEXT);
-                 CREATE TABLE tensorfs_derived_transactions(id TEXT PRIMARY KEY,bytes BLOB);
-                 CREATE TABLE tensorfs_verified_blobs(
-                   sha256 TEXT PRIMARY KEY,length INTEGER,dev TEXT,ino TEXT,
-                   mtime_s INTEGER,mtime_ns INTEGER);
-                 INSERT INTO tensorfs_releases VALUES ('org','repo','aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa');
-                 INSERT INTO tensorfs_operations VALUES ('open','org','repo','open','dead',7,1,9);
-                 INSERT INTO tensorfs_operations VALUES ('closed','org','repo','committed','dead',8,2,10);
-                 INSERT INTO tensorfs_holds VALUES ('open','blobs/aa',9);
-                 INSERT INTO tensorfs_holds VALUES ('closed','blobs/bb',10);
-                 INSERT INTO tensorfs_derived_transactions VALUES ('derived',x'7b7d');
-                 INSERT INTO tensorfs_verified_blobs VALUES ('bb',1,'1','2',3,4);
+                "CREATE TABLE legacy(value TEXT);
+                 INSERT INTO legacy VALUES ('keep-me');
                  PRAGMA user_version=1;",
             )
             .unwrap();
         drop(connection);
+        assert_eq!(
+            Catalog::initialize(&root).unwrap_err().code,
+            Code::UNKNOWN_FORMAT
+        );
+        let connection = rusqlite::Connection::open(Catalog::path(&root)).unwrap();
+        let value: String = connection
+            .query_row("SELECT value FROM legacy", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(value, "keep-me");
+        drop(connection);
 
-        let catalog = Catalog::initialize(&root).unwrap();
-        let connection = catalog.connection().unwrap();
-        let released: u64 = connection
-            .query_row(
-                "SELECT count(*) FROM tensorfs_released_manifests",
-                [],
-                |row| row.get(0),
+        fs::remove_file(Catalog::path(&root)).unwrap();
+        let connection = rusqlite::Connection::open(Catalog::path(&root)).unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE legacy(value TEXT); INSERT INTO legacy VALUES ('still-here');",
             )
             .unwrap();
-        let operations: Vec<String> = connection
-            .prepare("SELECT id FROM tensorfs_operations ORDER BY id")
-            .unwrap()
-            .query_map([], |row| row.get(0))
-            .unwrap()
-            .collect::<std::result::Result<_, _>>()
+        drop(connection);
+        assert_eq!(
+            Catalog::initialize(&root).unwrap_err().code,
+            Code::UNKNOWN_FORMAT
+        );
+        let connection = rusqlite::Connection::open(Catalog::path(&root)).unwrap();
+        let value: String = connection
+            .query_row("SELECT value FROM legacy", [], |row| row.get(0))
             .unwrap();
-        let holds: u64 = connection
-            .query_row("SELECT count(*) FROM tensorfs_holds", [], |row| row.get(0))
-            .unwrap();
-        let derived: u64 = connection
-            .query_row(
-                "SELECT count(*) FROM tensorfs_derived_transactions",
-                [],
-                |row| row.get(0),
-            )
-            .unwrap();
-        let verified: u64 = connection
-            .query_row("SELECT count(*) FROM tensorfs_verified_blobs", [], |row| {
-                row.get(0)
-            })
-            .unwrap();
-        assert_eq!(released, 1);
-        assert_eq!(operations, vec!["open"]);
-        assert_eq!(holds, 1);
-        assert_eq!(derived, 1);
-        assert_eq!(verified, 1);
+        assert_eq!(value, "still-here");
         let _ = fs::remove_dir_all(root);
     }
 
