@@ -797,7 +797,7 @@ def check_typed_resources():
                    pathlib.Path("internal/hub/publish.go").read_text() +
                    pathlib.Path("internal/hub/package_releases.go").read_text())
     for route in ('resourceSearchPath("packages"', 'resourceSearchPath("models"', '"/v1/models/"',
-                  '"/publications"', '"/publish/"', '"/finalize"', '"/download"'):
+                  '"/publications"', '"/publish/"', '"/finalize"', '"/releases/"', '"/download"'):
         if route not in hub_sources:
             bad.append(f"internal/hub: [resources] missing typed route prefix {route}")
     wheel_build = pathlib.Path("internal/wheel/build.go").read_text()
@@ -807,7 +807,7 @@ def check_typed_resources():
     retired_debug = (pathlib.Path("internal/transfer/fetch.go").read_text() +
                      pathlib.Path("internal/transfer/publish.go").read_text() +
                      pathlib.Path("internal/cli/transfer.go").read_text())
-    for retired in ("FailAfter", "--crash-after", "devKill"):
+    for retired in ("FailAfter", "--crash-after", "devKill", '"/seal"'):
         if retired in retired_debug:
             bad.append(f"internal transfer path: [resources] unreachable development kill surface remains: {retired}")
     return bad

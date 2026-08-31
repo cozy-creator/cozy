@@ -75,6 +75,8 @@ type Result struct {
 	Deduped        int64
 	Manifest       hub.ManifestRef
 	TopologyDigest string
+	CutOperation   string
+	RepositorySHA  string
 	Dup            bool
 	MS             map[string]int64
 }
@@ -86,15 +88,15 @@ func (p *Publish) say(format string, args ...any) {
 }
 
 // Run opens an incremental publication, claims the exact known-object transfers,
-// uploads only what is not already accepted, then asks Tensorhub to verify the
-// complete declared set and seal the TensorFS-authored documents. Tensorhub's rows are the only
+// uploads only what is not already accepted, finalizes the server-derived output,
+// then cuts that one publication into the release. Tensorhub's rows are the only
 // restart journal.
 func (p *Publish) Run(ctx context.Context) (Result, *exit.Error) {
 	var res Result
 	ms := map[string]int64{}
 	res.MS = ms
 
-	// 1. Prepare the exact documents and known ObjectRefs. The seal carries the
+	// 1. Prepare the exact documents and known ObjectRefs. Finalize carries the
 	//    original bytes; the transfer claim carries only sorted digest/length facts.
 	t0 := time.Now()
 	if err := os.MkdirAll(p.Scratch, 0o700); err != nil {
@@ -122,7 +124,7 @@ func (p *Publish) Run(ctx context.Context) (Result, *exit.Error) {
 		return res, exit.Internalf("the manifest tfs extracted is unreadable: %s", err)
 	}
 	res.Manifest = hub.ManifestRef{SHA256: strings.TrimPrefix(p.ManifestID, "sha256:"), Length: int64(len(manifest))}
-	seal := hub.SealPublicationRequest{
+	finalize := hub.FinalizePublicationRequest{
 		Manifest: hub.B64(manifest), ReleaseEvidenceBase64: hub.B64(evidence),
 	}
 	declared := make([]hub.Object, 0, len(objects))
@@ -134,15 +136,17 @@ func (p *Publish) Run(ctx context.Context) (Result, *exit.Error) {
 	p.say("prepared %d known blob transfers (%s) from %s", len(declared), bytesOf(objects), p.ManifestID)
 
 	// 2. Open under the caller-stable operation id. Reopening returns the same durable
-	//    publication, including a committed one whose seal result can be replayed.
+	//    publication, including a prepared or committed one whose results can replay.
 	t0 = time.Now()
-	opened, e := p.Hub.OpenPublication(ctx, p.Ref, p.Session, p.Release, p.Lane, declared, p.Reason)
+	opened, e := p.Hub.OpenPublication(ctx, p.Ref, p.Session, p.Release, declared, p.Reason)
 	if e != nil {
 		return res, e
 	}
 	ms["open"] = since(t0)
 	publication := opened.Publication
-	if publication.Release != p.Release || publication.Lane != p.Lane {
+	if publication.Operation != p.Session || publication.Release != p.Release ||
+		publication.LaneKey != "" || publication.RequiredContract != "" ||
+		publication.State == "open" && publication.Lane != "" {
 		return res, exit.Internalf("publication reopened under different release coordinates")
 	}
 	res.PublishID, res.Created, res.Session = publication.Operation, opened.Created, publication.Operation
@@ -151,17 +155,12 @@ func (p *Publish) Run(ctx context.Context) (Result, *exit.Error) {
 		verb = "opened"
 	}
 	p.say("%s publication %s in state %s", verb, res.PublishID, publication.State)
-	if publication.State != "open" {
-		for _, object := range publication.Objects {
-			res.Totals.DeclaredObjects++
-			res.Totals.DeclaredBytes += object.Length
-		}
-		res.Totals.HeldObjects = res.Totals.DeclaredObjects
-		res.Deduped = res.Totals.DeclaredBytes
-		return p.seal(ctx, seal, res, ms)
+	if publication.State != "open" && publication.State != "prepared" && publication.State != "committed" {
+		return res, exit.New(exit.Conflict, "publication %s is %s", publication.Operation, publication.State).
+			WithRemedy("use a new model publication after repairing or abandoning the refused operation")
 	}
 
-	// 3. The idempotent PUT froze and returned the exact object set.
+	// 3. The idempotent PUT froze and returned the exact object set in every state.
 	transfers := publication.Objects
 	if e := exactTransfers(declared, transfers); e != nil {
 		return res, e
@@ -206,28 +205,55 @@ func (p *Publish) Run(ctx context.Context) (Result, *exit.Error) {
 		p.say("0 bytes to upload: every transfer is ready for final verification")
 	}
 
-	return p.seal(ctx, seal, res, ms)
+	return p.finalizeAndCut(ctx, finalize, res, ms)
 }
 
-func (p *Publish) seal(ctx context.Context, request hub.SealPublicationRequest,
+func (p *Publish) finalizeAndCut(ctx context.Context, request hub.FinalizePublicationRequest,
 	res Result, ms map[string]int64,
 ) (Result, *exit.Error) {
 	t0 := time.Now()
-	done, e := p.Hub.SealPublication(ctx, p.Ref, res.PublishID, request, p.Reason)
+	prepared, e := p.Hub.FinalizePublication(ctx, p.Ref, res.PublishID, request, p.Reason)
 	if e != nil {
 		return res, e
 	}
-	ms["seal"] = since(t0)
-	if done.PublishID != res.PublishID || done.Release != p.Release || done.Lane != p.Lane ||
-		done.Manifest != res.Manifest || done.ReleaseEvidenceBase64 != request.ReleaseEvidenceBase64 {
-		return res, exit.Internalf("Tensorhub committed a different publication identity")
+	ms["finalize"] = since(t0)
+	if prepared.PublishID != res.PublishID || prepared.Release != p.Release ||
+		prepared.Manifest != res.Manifest ||
+		prepared.ReleaseEvidenceBase64 != request.ReleaseEvidenceBase64 ||
+		prepared.State != "verified/prepared" || prepared.Objects != res.Totals.DeclaredObjects ||
+		prepared.Bytes != res.Totals.DeclaredBytes {
+		return res, exit.Internalf("Tensorhub prepared a different publication identity")
 	}
-	res.Manifest, res.TopologyDigest, res.Dup = done.Manifest, done.TopologyDigest, done.Duplicate
-	res.Verified = done.Objects
+	if prepared.Lane != p.Lane {
+		return res, exit.New(exit.Conflict,
+			"Tensorhub derived lane %q, not the requested %q", prepared.Lane, p.Lane).
+			WithRemedy("re-run with --lane %s", prepared.Lane)
+	}
+	res.Manifest, res.TopologyDigest, res.Verified = prepared.Manifest, prepared.TopologyDigest, prepared.Objects
+	if prepared.Duplicate {
+		p.say("this exact publication was already prepared")
+	}
+	p.say("Tensorhub verified %d declared objects and prepared lane %s", res.Verified, prepared.Lane)
+
+	t0 = time.Now()
+	res.CutOperation = "cut-" + res.PublishID
+	cut, e := p.Hub.CutRelease(ctx, p.Ref, p.Release, res.CutOperation,
+		[]string{res.PublishID}, p.Reason)
+	if e != nil {
+		return res, e
+	}
+	ms["cut"] = since(t0)
+	if cut.Operation != res.CutOperation || cut.Release != p.Release || len(cut.Lanes) != 1 ||
+		cut.Lanes[0].Lane != prepared.Lane || cut.Lanes[0].Manifest != prepared.Manifest ||
+		cut.Lanes[0].Publication != prepared.PublishID || cut.Lanes[0].Objects != prepared.Objects ||
+		cut.Lanes[0].Bytes != prepared.Bytes {
+		return res, exit.Internalf("Tensorhub cut a different release output")
+	}
+	res.RepositorySHA, res.Dup = cut.RepositorySHA256, cut.Duplicate
 	if res.Dup {
-		p.say("this exact publication already sealed: Tensorhub replayed the same release")
+		p.say("this exact release cut was already committed")
 	}
-	p.say("Tensorhub verified %d declared uploads and committed the release", res.Verified)
+	p.say("Tensorhub cut release %s with lane %s", p.Release, prepared.Lane)
 	p.say("timing: %s", Timing(ms))
 	return res, nil
 }
