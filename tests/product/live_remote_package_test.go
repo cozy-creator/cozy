@@ -117,7 +117,7 @@ func TestLiveRemoteMarcoPolo(t *testing.T) {
 		Function: "marco", Outputs: launch.AssetPaths(entrypoint.Result),
 	}}
 	owner, problem := orchestrator.Open(orchestrator.Options{
-		Cfg: config.Config{Home: root}, Layout: layout, Store: store, Packages: launcher,
+		Cfg: config.Config{Home: root}, Layout: layout, Store: store, Packages: launcher, Log: os.Stderr,
 		Rentals: func(id string) (*orchestrator.RemoteTarget, *exit.Error) {
 			if id != live.RentalID {
 				return nil, exit.New(exit.NotFound, "unknown live rental %s", id)
