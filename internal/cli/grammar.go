@@ -95,10 +95,23 @@ func (c *PackagePublishCmd) Run(r *Runtime) error {
 
 type ModelCmd struct {
 	Search   ModelSearchCmd   `cmd:"" help:"Search the model catalog."`
+	Import   ModelImportCmd   `cmd:"" help:"Import a foreign model into local TensorFS."`
 	Download ModelDownloadCmd `cmd:"" help:"Download a model into the local TensorFS store."`
 	Remove   ModelRemoveCmd   `cmd:"" help:"Remove local model repositories."`
 	List     ModelListCmd     `cmd:"" help:"List local model releases."`
 	Publish  ModelPublishCmd  `cmd:"" help:"Publish a local TensorFS manifest as one release lane."`
+}
+
+type ModelImportCmd struct {
+	Source     string `arg:"" name:"source" help:"Pinned Hugging Face/Civitai source, allowlisted provider URL, or explicit local file."`
+	Name       string `help:"Local model name under local/." required:""`
+	DryRun     bool   `help:"Resolve and validate the import plan without moving model bodies."`
+	TokenStdin bool   `help:"Read this local import's provider token from stdin."`
+}
+
+func (c *ModelImportCmd) Run(r *Runtime) error {
+	return r.call(handleModelImport, []string{c.Source}, bools(
+		"--dry-run", c.DryRun, "--token-stdin", c.TokenStdin), values("--name", c.Name), false)
 }
 
 type ModelSearchCmd struct {
