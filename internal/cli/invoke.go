@@ -58,6 +58,14 @@ func handleRunExecute(ctx *Context) *exit.Error {
 	if problem := validateRunPlacement(ctx); problem != nil {
 		return problem
 	}
+	if ctx.Inv.Bool("--stream") && !ctx.Inv.Bool("--await") {
+		return exit.Usagef("--stream requires --await").
+			WithRemedy("use --await for a terminal progress stream, or omit --stream for a short optimistic observation")
+	}
+	if ctx.Inv.Value("--timeout") != "" && !ctx.Inv.Bool("--await") {
+		return exit.Usagef("--timeout requires --await").
+			WithRemedy("a detached run has no client waiting to enforce a caller deadline")
+	}
 	target, descriptor, problem := invocationTarget(ctx)
 	if problem != nil {
 		return problem
@@ -81,7 +89,7 @@ func handleRunExecute(ctx *Context) *exit.Error {
 	if ctx.Inv.Bool("--stream") || len(ctx.Inv.Values["--asset"]) > 0 ||
 		ctx.Inv.Value("--out") != "" || ctx.Inv.Value("--timeout") != "" {
 		return exit.Usagef("the selected callable is a job and received a serving-only flag").
-			WithRemedy("jobs accept payload values, --in, --input-tree, --org, --detach, and --rental")
+			WithRemedy("jobs accept payload values, --in, --input-tree, --org, --await, and --rental")
 	}
 	if ctx.Inv.Bool("--rental") && len(callable.Models) > 0 {
 		return exit.Named(exit.Unavailable, "rental.modeled_job_unsupported",
@@ -94,7 +102,7 @@ func handleRunExecute(ctx *Context) *exit.Error {
 		return exit.Named(exit.Unavailable, "rental.job_input_tree_unsupported",
 			"remote jobs cannot grant a local input-tree directory")
 	}
-	if !ctx.Inv.Bool("--detach") {
+	if ctx.Inv.Bool("--await") {
 		ctx.Inv.Bools["--follow"] = true
 	}
 	return handleJobSubmit(ctx, target, callable)
@@ -166,20 +174,8 @@ func handleRun(ctx *Context, target Target, ep *launch.Entrypoint) *exit.Error {
 		return e
 	}
 	submitted := time.Since(began)
-	if ctx.Inv.Bool("--detach") {
-		fields := []output.Field{
-			{K: "id", V: handle.RequestID}, {K: "kind", V: "invocation"},
-			{K: "target", V: target.Package + "/" + target.Function},
-			{K: "status", V: handle.Status}, {K: "attempt", V: handle.Attempt},
-			{K: "changed", V: !handle.Replay},
-		}
-		rec := compactRecord(fields, "id", "target", "status", "changed")
-		rec.Next = []string{"cozy run cancel " + handle.RequestID}
-		return emit(ctx, rec)
-	}
-
 	stream := ctx.Inv.Bool("--stream")
-	if !stream {
+	if !stream && !ctx.Mode().JSON {
 		if ctx.Mode().Full {
 			fmt.Fprintf(ctx.Err, "request %s · attempt %d · %s\n",
 				handle.RequestID, handle.Attempt, handle.Status)
@@ -194,13 +190,22 @@ func handleRun(ctx *Context, target Target, ep *launch.Entrypoint) *exit.Error {
 		}
 	}
 
-	terminal, stopped, e := watch(ctx, c, handle.RequestID, stream, deadline)
+	var terminal *localapi.Event
+	stopped := ""
+	if ctx.Inv.Bool("--await") {
+		terminal, stopped, e = watch(ctx, c, handle.RequestID, stream, deadline, began)
+	} else {
+		terminal, e = observe(ctx, c, handle.RequestID, stream, optimisticObservation, began)
+	}
 	if e != nil {
 		return e
 	}
 	life, e := c.Request(handle.RequestID)
 	if e != nil {
 		return e
+	}
+	if terminal == nil && !invocationSettled(life.Status) {
+		return renderSubmittedRun(ctx, life, !handle.Replay)
 	}
 	saved, e := saveOutputs(ctx, c, life, outputHash)
 	if e != nil {
@@ -455,6 +460,56 @@ func invocationSettled(status string) bool {
 	}
 }
 
+// optimisticObservation is long enough for a warm, weightless callable to answer in the
+// foreground without turning an ordinary GPU submission into a terminal hostage. Expiry
+// never cancels the request and never predicts its duration: the daemon keeps owning it.
+const optimisticObservation = 3 * time.Second
+
+// observe follows the real event stream for one bounded optimistic window. A context
+// expiry merely detaches this client; it does not enter the cancellation path used by an
+// explicit --await. A terminal that arrives inside the window is still rendered through
+// the ordinary result/error path, including a fast refusal.
+func observe(ctx *Context, c *localapi.Client, requestID string, stream bool,
+	window time.Duration, began time.Time,
+) (*localapi.Event, *exit.Error) {
+	watchCtx, stop := context.WithTimeout(context.Background(), window)
+	defer stop()
+	lines := newProgress(ctx, stream, began)
+	terminal, problem := c.WatchContext(watchCtx, requestID, 0, lines.on)
+	lines.done()
+	return terminal, problem
+}
+
+func renderSubmittedRun(ctx *Context, life api.Lifecycle, changed bool) *exit.Error {
+	status := runStatus(life.Status)
+	fields := []output.Field{
+		{K: "run", V: life.RequestID},
+		{K: "target", V: life.Package + "/" + life.Function},
+		{K: "status", V: status},
+	}
+	defaults := []string{"target", "status"}
+	if life.QueuePosition != nil {
+		queue := strconv.Itoa(*life.QueuePosition)
+		if life.QueueDepth != nil && *life.QueueDepth >= *life.QueuePosition {
+			queue += "/" + strconv.Itoa(*life.QueueDepth)
+		}
+		fields = append(fields, output.Field{K: "queue", V: queue})
+		defaults = append(defaults, "queue")
+	}
+	fields = append(fields, output.Field{K: "changed", V: changed})
+	defaults = append(defaults, "run")
+	rec := compactRecord(fields, defaults...)
+	rec.Next = []string{"cozy run cancel " + life.RequestID}
+	return emit(ctx, rec)
+}
+
+func runStatus(status string) string {
+	if status == "in_progress" {
+		return "running"
+	}
+	return status
+}
+
 // watch consumes the request's own event stream to its terminal, rendering progress as
 // it goes. SIGINT does not kill this process: it CANCELS the request through the
 // orchestrator and keeps watching, because the attempt's own journaled terminal is what
@@ -464,7 +519,7 @@ func invocationSettled(status string) bool {
 // exit 10, because a caller that set a deadline wants to know the deadline is what
 // happened.
 func watch(ctx *Context, c *localapi.Client, requestID string, stream bool,
-	deadline time.Duration) (*localapi.Event, string, *exit.Error) {
+	deadline time.Duration, began time.Time) (*localapi.Event, string, *exit.Error) {
 	interrupt := make(chan os.Signal, 2)
 	signal.Notify(interrupt, syscall.SIGINT, syscall.SIGTERM)
 	defer signal.Stop(interrupt)
@@ -522,7 +577,7 @@ func watch(ctx *Context, c *localapi.Client, requestID string, stream bool,
 		}
 	}()
 
-	lines := newProgress(ctx, stream)
+	lines := newProgress(ctx, stream, began)
 	terminal, e := c.WatchContext(watchCtx, requestID, 0, lines.on)
 	lines.done()
 	select {
@@ -571,14 +626,18 @@ func runDeadline(ctx *Context) (time.Duration, *exit.Error) {
 // `--stream` is NDJSON of the typed envelope for a machine, and the default is one
 // rewritten line for a person.
 type runProgress struct {
-	ctx    *Context
-	stream bool
-	last   string
-	dirty  bool
+	ctx         *Context
+	stream      bool
+	last        string
+	dirty       bool
+	began       time.Time
+	stepStage   string
+	stepSeconds float64
+	stepSamples int
 }
 
-func newProgress(ctx *Context, stream bool) *runProgress {
-	return &runProgress{ctx: ctx, stream: stream}
+func newProgress(ctx *Context, stream bool, began time.Time) *runProgress {
+	return &runProgress{ctx: ctx, stream: stream, began: began}
 }
 
 func (p *runProgress) on(e localapi.Event) bool {
@@ -598,7 +657,7 @@ func (p *runProgress) on(e localapi.Event) bool {
 	if !p.ctx.Mode().Color && !p.ctx.Mode().Full {
 		return true
 	}
-	line := progressLine(e, p.ctx.Mode().Full)
+	line := p.line(e, p.ctx.Mode().Full)
 	if line == "" || line == p.last {
 		return true
 	}
@@ -611,6 +670,92 @@ func (p *runProgress) on(e localapi.Event) bool {
 		fmt.Fprintln(p.ctx.Err, line)
 	}
 	return true
+}
+
+func (p *runProgress) line(e localapi.Event, full bool) string {
+	if full {
+		return diagnosticProgressLine(e)
+	}
+	if strings.TrimPrefix(e.Type, "request.") != "progress" {
+		return progressLine(e, false)
+	}
+	fields, ok := e.Payload["value"].(map[string]any)
+	if !ok {
+		return humanProgress(e.Payload["value"])
+	}
+	name, _ := fields["name"].(string)
+	name = strings.TrimSpace(name)
+	fraction, fractionOK := number(fields["fraction"])
+	position, positionOK := number(fields["position"])
+	stepMS, stepOK := number(fields["step_ms"])
+	if name != "" && name != p.stepStage {
+		p.stepStage, p.stepSeconds, p.stepSamples = name, 0, 0
+	}
+	if stepOK && stepMS >= 0 {
+		p.stepSeconds += stepMS / 1000
+		p.stepSamples++
+	}
+	if !fractionOK || fraction < 0 || fraction > 1 {
+		return humanStage(map[string]any{"name": stageLabel(name)})
+	}
+	elapsed := time.Since(p.began)
+	label := stageLabel(name)
+	if label == "" {
+		label = "running"
+	}
+	bar := progressBar(fraction, 18)
+	if !positionOK || position <= 0 || fraction <= 0 {
+		return fmt.Sprintf("  %s %s %.0f%% · %s", label, bar, fraction*100, shortDuration(elapsed))
+	}
+	total := int64(position / fraction)
+	current := int64(position)
+	if total < current {
+		total = current
+	}
+	line := fmt.Sprintf("  %s %s %d/%d", label, bar, current, total)
+	if p.stepSamples > 0 {
+		seconds := p.stepSeconds / float64(p.stepSamples)
+		if seconds > 0 {
+			line += fmt.Sprintf(" · %.2fs/step (%.2f steps/s)", seconds, 1/seconds)
+			remaining := time.Duration(float64(total-current) * seconds * float64(time.Second))
+			line += fmt.Sprintf(" · %s / ~%s", shortDuration(elapsed), shortDuration(elapsed+remaining))
+			return line
+		}
+	}
+	return line + " · " + shortDuration(elapsed)
+}
+
+func progressBar(fraction float64, width int) string {
+	filled := int(fraction*float64(width) + 0.5)
+	if filled < 0 {
+		filled = 0
+	}
+	if filled > width {
+		filled = width
+	}
+	return "[" + strings.Repeat("=", filled) + strings.Repeat(".", width-filled) + "]"
+}
+
+func stageLabel(name string) string {
+	switch strings.TrimSpace(name) {
+	case "tokenize", "encode", "condition", "condition_text", "condition_media":
+		return "conditioning"
+	case "denoise":
+		return "denoising"
+	case "decode", "decode_image", "decode_video", "decode_audio":
+		return "decoding"
+	case "encode_png", "encode_webp", "encode_outputs":
+		return "saving"
+	default:
+		return strings.TrimSpace(name)
+	}
+}
+
+func shortDuration(value time.Duration) string {
+	if value < time.Second {
+		return fmt.Sprintf("%.1fs", value.Seconds())
+	}
+	return value.Round(time.Second).String()
 }
 
 func (p *runProgress) done() {

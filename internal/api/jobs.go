@@ -61,16 +61,18 @@ type JobSubmission struct {
 
 // JobHandle is the 202 answer.
 type JobHandle struct {
-	JobID     string `json:"job_id"`
-	Status    string `json:"status"`
-	Attempt   uint64 `json:"attempt"`
-	Package   string `json:"package"`
-	Function  string `json:"function"`
-	Repo      string `json:"publication_repo"`
-	StatusURL string `json:"status_url"`
-	CancelURL string `json:"cancel_url"`
-	EventsURL string `json:"events_url"`
-	Replay    bool   `json:"idempotent_replay"`
+	JobID         string `json:"job_id"`
+	Status        string `json:"status"`
+	Attempt       uint64 `json:"attempt"`
+	Package       string `json:"package"`
+	Function      string `json:"function"`
+	Repo          string `json:"publication_repo"`
+	StatusURL     string `json:"status_url"`
+	CancelURL     string `json:"cancel_url"`
+	EventsURL     string `json:"events_url"`
+	QueuePosition *int   `json:"queue_position,omitempty"`
+	QueueDepth    *int   `json:"queue_depth,omitempty"`
+	Replay        bool   `json:"idempotent_replay"`
 }
 
 func (s *Server) submitJob(w http.ResponseWriter, r *http.Request) {
@@ -181,6 +183,11 @@ func (s *Server) submitJob(w http.ResponseWriter, r *http.Request) {
 		CancelURL: "/v1/local/jobs/" + jobID + "/cancel",
 		EventsURL: "/v1/requests/" + jobID + "/events",
 		Replay:    !fresh,
+	}
+	if handle.Status == "queued" {
+		if position, depth := s.orchestrator.QueueState(row.ID); position > 0 {
+			handle.QueuePosition, handle.QueueDepth = &position, &depth
+		}
 	}
 	status := http.StatusAccepted
 	if handle.Replay {
@@ -368,6 +375,7 @@ type JobState struct {
 	// Queued is the job's position in the dispatch queue while it waits for a worker,
 	// counted from 1. Absent once it has an attempt — a running job is not queued.
 	QueuePosition *int `json:"queue_position,omitempty"`
+	QueueDepth    *int `json:"queue_depth,omitempty"`
 	// Requeues and RetryBudget are the orchestrator's RETRY PROJECTION made visible: how
 	// much of the durable budget the neutral outcomes have already spent, and what the
 	// bound is. A settlement that exhausted it names the budget in `error`.
@@ -472,8 +480,8 @@ func (s *Server) jobStateOf(row records.Request) JobState {
 		EventsURL: "/v1/requests/" + row.ID + "/events",
 	}
 	if row.Ordinal == 0 && (row.State == "submitted" || row.State == "queued") {
-		if n := s.orchestrator.QueuePosition(row.ID); n > 0 {
-			state.QueuePosition = &n
+		if position, depth := s.orchestrator.QueueState(row.ID); position > 0 {
+			state.QueuePosition, state.QueueDepth = &position, &depth
 		}
 	}
 	attempts, _ := s.store.Attempts(row.ID)

@@ -412,14 +412,24 @@ func (c *Orchestrator) drain() {
 // position is the real thing rather than an estimate (cr-019: many queued jobs against
 // one worker drain FIFO, and a client can watch it happen).
 func (c *Orchestrator) QueuePosition(requestID string) int {
+	position, _ := c.QueueState(requestID)
+	return position
+}
+
+// QueueState returns one atomic snapshot of a waiting request's one-based position and
+// the total queue depth. Reading both under one lock matters to a client spelling 9/9:
+// two separate observations could otherwise pair a position from one queue generation
+// with a depth from another.
+func (c *Orchestrator) QueueState(requestID string) (position, depth int) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	depth = len(c.pending)
 	for i, id := range c.pending {
 		if id == requestID {
-			return i + 1
+			return i + 1, depth
 		}
 	}
-	return 0
+	return 0, depth
 }
 
 // reviveQueue re-asks select-or-start for the HEAD of the dispatch queue. It runs when

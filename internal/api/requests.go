@@ -59,6 +59,7 @@ type Handle struct {
 	CancelURL     string `json:"cancel_url"`
 	EventsURL     string `json:"events_url"`
 	QueuePosition *int   `json:"queue_position,omitempty"`
+	QueueDepth    *int   `json:"queue_depth,omitempty"`
 	// Replay is true when this key was already recorded: the SAME request answers, and
 	// nothing new was started. A client that retried a timed-out POST needs to know it
 	// did not create a second execution, and inferring it from equal ids is a guess.
@@ -271,8 +272,8 @@ func (s *Server) handleOf(row records.Request, attempt uint64) Handle {
 		EventsURL: base + "/events",
 	}
 	if h.Status == "queued" {
-		if position := s.orchestrator.QueuePosition(row.ID); position > 0 {
-			h.QueuePosition = &position
+		if position, depth := s.orchestrator.QueueState(row.ID); position > 0 {
+			h.QueuePosition, h.QueueDepth = &position, &depth
 		}
 	}
 	return h
@@ -464,22 +465,24 @@ func (s *Server) stageAssets(assets []records.AssetBinding) ([]records.AssetBind
 // fields a local client has and a cloud one does not need to presign: the typed result,
 // the visible media by OPAQUE id, and the triage handle.
 type Lifecycle struct {
-	Kind        string         `json:"kind"`
-	RequestID   string         `json:"request_id"`
-	Status      string         `json:"status"`
-	Package     string         `json:"package"`
-	Function    string         `json:"function"`
-	Attempt     uint64         `json:"attempt"`
-	Attempts    int            `json:"attempts"`
-	ResponseURL string         `json:"response_url"`
-	Metrics     map[string]any `json:"metrics,omitempty"`
-	ErrorType   string         `json:"error_type,omitempty"`
-	Error       string         `json:"error,omitempty"`
-	Result      any            `json:"result,omitempty"`
-	Outputs     []MediaRef     `json:"outputs"`
-	Triage      *TriageRef     `json:"triage,omitempty"`
-	Rental      bool           `json:"rental,omitempty"`
-	CreatedAt   string         `json:"created_at"`
+	Kind          string         `json:"kind"`
+	RequestID     string         `json:"request_id"`
+	Status        string         `json:"status"`
+	Package       string         `json:"package"`
+	Function      string         `json:"function"`
+	Attempt       uint64         `json:"attempt"`
+	Attempts      int            `json:"attempts"`
+	ResponseURL   string         `json:"response_url"`
+	Metrics       map[string]any `json:"metrics,omitempty"`
+	ErrorType     string         `json:"error_type,omitempty"`
+	Error         string         `json:"error,omitempty"`
+	Result        any            `json:"result,omitempty"`
+	Outputs       []MediaRef     `json:"outputs"`
+	Triage        *TriageRef     `json:"triage,omitempty"`
+	Rental        bool           `json:"rental,omitempty"`
+	CreatedAt     string         `json:"created_at"`
+	QueuePosition *int           `json:"queue_position,omitempty"`
+	QueueDepth    *int           `json:"queue_depth,omitempty"`
 }
 
 // MediaRef is how bytes are named in EVERY document this API emits: an opaque id and its
@@ -529,6 +532,11 @@ func (s *Server) lifecycleOf(row records.Request) Lifecycle {
 		Function: row.Entrypoint, Attempt: uint64(row.Ordinal),
 		ResponseURL: "/v1/requests/" + row.ID, CreatedAt: row.CreatedAt,
 		Outputs: []MediaRef{}, Rental: row.Rental,
+	}
+	if life.Status == "queued" {
+		if position, depth := s.orchestrator.QueueState(row.ID); position > 0 {
+			life.QueuePosition, life.QueueDepth = &position, &depth
+		}
 	}
 	attempts, _ := s.store.Attempts(row.ID)
 	life.Attempts = len(attempts)
