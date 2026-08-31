@@ -8,9 +8,8 @@
 //     Runtime at install. Reading it back costs microseconds; re-running `describe` per
 //     invocation would import the package's module graph to learn a fact already frozen.
 //     The recorded semantic digest is checked on every read.
-//   - THE ARTIFACT FACTS (store root, per-component snapshots, immutable config, variant,
-//     physical floor) come from the runtime's own local artifact index, read through
-//     `cozy-runtime list --json`. cozy-creator never composes a store path.
+//   - THE PLACEMENT FACTS come from the exact PlacementSet retained at install. Runtime owns
+//     no local model-ref index, and cozy-creator never composes a TensorFS store path.
 //   - THE SELECTION is `package.toml`'s `[bindings]` table — the author's declared
 //     default, in the runtime's own grammar and vocabulary.
 //

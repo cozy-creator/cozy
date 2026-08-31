@@ -167,8 +167,8 @@ TFS_SITES = {"internal/config/config.go", "internal/tfs/tfs.go"}
 TFS_FIELD = re.compile(r"\.Tfs\b")
 
 # (cl-010) The files that may reach a package's own cozy-runtime, and the CLOSED set
-# of verbs they may name. Publication and install derive the package descriptor once; artifacts
-# asks for the artifact index, host facts and fit verdicts. Nothing executes a model
+# of verbs they may name. Publication and install derive the package descriptor once; launch
+# may ask for host facts and fit verdicts. Nothing executes a model
 # through these doors — that is what the orchestrator and worker protocol are for.
 RUNTIME_SITES = {"internal/install/install.go", "internal/launch/artifacts.go",
                  "internal/packagepublish/package.go"}
@@ -179,7 +179,7 @@ RUNTIME_BIN = re.compile(r'"cozy-runtime"')
 # execution door the literal rule refuses; only the verification driver may (with a door).
 RUNTIME_INDIRECT = re.compile(r"launch\.Binary\s*\(|launch\.RuntimeCLI\s*\{")
 RUNTIME_INDIRECT_HOME = "internal/launch/"
-RUNTIME_VERBS_OK = {"describe", "list", "doctor", "fit", "bindings"}
+RUNTIME_VERBS_OK = {"describe", "doctor", "fit", "bindings"}
 RUNTIME_VERBS_DENY = {"run", "job", "serve", "rm", "pull", "ingest", "new"}
 
 # (cl-028) EMBEDDED SCRIPTS ARE SOURCE TOO. The impl family scans Go with string literals
