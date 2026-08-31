@@ -108,8 +108,9 @@ func TestEmailMachineLoginAndAutomaticReauthentication(t *testing.T) {
 				t.Errorf("protected hub request carried %q", r.Header.Get("Authorization"))
 				return
 			}
-			writeAuthJSON(t, w, http.StatusAccepted, map[string]string{
+			writeAuthJSON(t, w, http.StatusAccepted, map[string]any{
 				"rental_id": "rental-auth-proof", "state": "pending_acquisition",
+				"hourly_rate_usd_micros": int64(100_000),
 			})
 		default:
 			t.Errorf("unexpected auth route %s", r.URL.Path)
@@ -161,7 +162,7 @@ func TestEmailMachineLoginAndAutomaticReauthentication(t *testing.T) {
 	manager := accountauth.New(config.Config{Home: root, HubURL: server.URL})
 	hubClient := hub.New(config.Config{HubURL: server.URL}, "cozy-product-auth-test").WithTokenSource(manager)
 	requestBody, problem := hub.RentalRequestBytes("cpu", strings.Repeat("1", 64),
-		authBase64.EncodeToString(bytes.Repeat([]byte{1}, ed25519.PublicKeySize)), 0, 0)
+		authBase64.EncodeToString(bytes.Repeat([]byte{1}, ed25519.PublicKeySize)))
 	if problem != nil {
 		t.Fatal(problem)
 	}

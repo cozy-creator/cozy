@@ -70,8 +70,8 @@ type Submission struct {
 	// In the initial weightless remote lane it supplies only the exact logical release
 	// and request/result descriptor; no local platform facts cross the control stream.
 	InstallID string
-	// Cloud authorizes placement on Creator-managed rented capacity.
-	Cloud bool
+	// Rental authorizes placement on Creator-managed rented capacity.
+	Rental bool
 }
 
 const ArtifactSnapshotMime = "application/vnd.cozy.tensorfs.snapshot"
@@ -152,10 +152,10 @@ func requestRecord(s Submission) (records.Request, map[string]any, *exit.Error) 
 	bodyDigest := s.BodyDigest
 	if bodyDigest == "" {
 		identity := s.Payload
-		if s.Cloud {
+		if s.Rental {
 			encoded, err := canonical.Write(map[string]canonical.Value{
 				"payload": base64.StdEncoding.EncodeToString(s.Payload),
-				"cloud":   true,
+				"rental":  true,
 			})
 			if err != nil {
 				return records.Request{}, nil, exit.Internalf("cannot encode request budget identity: %s", err)
@@ -178,15 +178,15 @@ func requestRecord(s Submission) (records.Request, map[string]any, *exit.Error) 
 		Outputs: strings.Join(s.Outputs, ","),
 		Assets:  s.Assets, ArtifactOutputs: string(artifactBytes),
 		Kind: s.Kind, Org: s.Org, Trees: strings.Join(s.Trees, ","),
-		Worker: s.Worker, InstallID: s.InstallID, Cloud: s.Cloud,
+		Worker: s.Worker, InstallID: s.InstallID, Rental: s.Rental,
 	}
 	event := map[string]any{
 		"package": s.Package, "function": s.Entrypoint,
 		"body_digest": bodyDigest, "plan_id": s.PlanID, "outputs": s.Outputs,
 		"artifact_outputs": artifactOutputs,
 	}
-	if s.Cloud {
-		event["cloud"] = true
+	if s.Rental {
+		event["rental"] = true
 	}
 	return req, event, nil
 }
@@ -392,6 +392,28 @@ func (c *Orchestrator) Requeue(requestID, why string) {
 // longer wait. A request that queues forever behind a worker that died on boot is the
 // worst of both: no output and no answer.
 func (c *Orchestrator) selectOrStart(req records.Request) {
+	if req.Rental && req.Worker == "" {
+		if c.opt.RentalFleet == nil || c.opt.AcquireManagedRental == nil {
+			c.failQueued(req.ID, exit.Named(exit.Unavailable, "rental.acquisition_unavailable",
+				"this Cozy daemon cannot acquire managed rentals"))
+			return
+		}
+		line, problem := c.opt.RentalFleet()
+		if problem != nil {
+			c.failQueued(req.ID, problem)
+			return
+		}
+		c.emit(req.ID, "request.rentals", 0, map[string]any{"line": line})
+		rentalID, after, problem := c.opt.AcquireManagedRental(req)
+		if problem != nil {
+			c.failQueued(req.ID, problem)
+			return
+		}
+		if after != "" {
+			c.emit(req.ID, "request.rentals", 0, map[string]any{"line": after})
+		}
+		req.Worker = rentalID
+	}
 	// A JOB names its own slot — one worker per (package, job function) — so the
 	// "already starting" and "already resident" questions are asked about that slot and
 	// not about the package. Without this, submitting a job while a serving worker of
@@ -1061,7 +1083,7 @@ func localGrantSupport(goos string) *exit.Error {
 	}
 	return exit.Named(exit.Structural, "local_file_grant_unsupported",
 		"local worker grants are not yet supported on Windows").
-		WithRemedy("use --machine with a rented machine; local file URL authorization is currently POSIX-only")
+		WithRemedy("use --rental; local file URL authorization is currently POSIX-only")
 }
 
 // remoteGrant builds the grant for an attempt that will run on a POD (cl-014/#506b).

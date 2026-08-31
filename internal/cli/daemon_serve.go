@@ -107,21 +107,26 @@ func serveDaemon(ctx *Context) *exit.Error {
 	// The two per-daemon identity digests every local InvocationSpec rides (cl-022's
 	// guard): left unset, dispatch froze empty strings into every persisted invocation.
 	configDigest := localConfigDigest(ctx.Cfg)
+	fleet := &managedRentals{ctx: ctx, layout: l, store: st}
 	c, e := orchestrator.Open(orchestrator.Options{
 		Cfg: ctx.Cfg, Layout: l, Store: st, Yield: yield, Log: ctx.Out,
 		Packages: resolver, Rentals: rentals, ObserveRental: rental.ObserveWorker(st),
 		RentalClaimProof: rental.ClaimProof(l), RentalPackageSet: rental.PackageSetSigner(l),
-		ConfigDigest: configDigest,
+		RentalFleet: fleet.status, AcquireManagedRental: fleet.acquire,
+		ReleaseManagedRental: fleet.release,
+		ConfigDigest:         configDigest,
 	})
 	if e != nil {
 		closeListeners()
 		return e
 	}
+	fleet.owner = c
 	killed, forgotten, e := c.Reconcile()
 	if e != nil {
 		closeListeners()
 		return e
 	}
+	go fleet.releaseOrphaned()
 
 	// One per-launch CLI credential is handed over through a 0600 file. It is never
 	// printed, logged, or placed on argv, and dies with this process. The public web stub

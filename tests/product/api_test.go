@@ -164,17 +164,17 @@ func TestLocalAPIDoor(t *testing.T) {
 	if noKey.Status != http.StatusBadRequest || noKey.code() != "idempotency_key_required" {
 		t.Errorf("a submission with no Idempotency-Key: %s", noKey.brief())
 	}
-	negativeBudget := svc.call(t, "POST", "/v1/requests", map[string]any{
+	deletedBudget := svc.call(t, "POST", "/v1/requests", map[string]any{
 		"package": "x/y", "function": "f", "max_cost_usd_micros": -1,
-	}, "Idempotency-Key", "negative-budget")
-	if negativeBudget.Status != http.StatusBadRequest || negativeBudget.code() != "invalid_request" {
-		t.Errorf("a negative rental budget reached the queue: %s", negativeBudget.brief())
+	}, "Idempotency-Key", "deleted-budget")
+	if deletedBudget.Status != http.StatusBadRequest || deletedBudget.code() != "malformed_body" {
+		t.Errorf("deleted max_cost field reached the queue: %s", deletedBudget.brief())
 	}
-	mixedPlacement := svc.call(t, "POST", "/v1/requests", map[string]any{
-		"package": "x/y", "function": "f", "worker": "rental-1", "max_cost_usd_micros": 1,
-	}, "Idempotency-Key", "mixed-placement")
-	if mixedPlacement.Status != http.StatusBadRequest || mixedPlacement.code() != "invalid_request" {
-		t.Errorf("an explicit worker plus automatic budget reached the queue: %s", mixedPlacement.brief())
+	deletedWorker := svc.call(t, "POST", "/v1/requests", map[string]any{
+		"package": "x/y", "function": "f", "worker": "rental-1",
+	}, "Idempotency-Key", "deleted-worker")
+	if deletedWorker.Status != http.StatusBadRequest || deletedWorker.code() != "malformed_body" {
+		t.Errorf("deleted caller-selected worker reached the queue: %s", deletedWorker.brief())
 	}
 
 	// The credential is handed over through an OS-protected file, never argv, and never
@@ -197,7 +197,8 @@ func TestLocalAPIDoor(t *testing.T) {
 	fatal(t, problem)
 	fatal(t, store.RecordRental(records.Rental{
 		ID:               "rental-down-arm",
-		AcceleratorModel: "CPU", State: "ready", Hub: "https://hub.invalid",
+		AcceleratorModel: "CPU", HourlyRateUSDMicros: 100_000,
+		State: "ready", Hub: "https://hub.invalid",
 	}))
 	blocked := svc.call(t, "POST", "/v1/local/daemon/down", map[string]bool{"all": false})
 	if blocked.Status != http.StatusConflict || blocked.code() != "active_work" ||

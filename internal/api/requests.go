@@ -40,10 +40,8 @@ type Submission struct {
 	// the daemon-owned immutable input store before the request row exists; it never
 	// crosses the worker protocol. The typed payload carries only its opaque reference.
 	LocalAssets []records.AssetBinding `json:"local_assets,omitempty"`
-	// Worker is Cozy's local addition: it pins this request to an attached rental id.
-	Worker     string `json:"worker,omitempty"`
-	Cloud      bool   `json:"cloud,omitempty"`
-	AttemptKey string `json:"-"`
+	Rental      bool                   `json:"rental,omitempty"`
+	AttemptKey  string                 `json:"-"`
 }
 
 // Handle is the 202 answer: the request's id and where to go next. Verbatim from the
@@ -97,12 +95,6 @@ func (s *Server) submit(w http.ResponseWriter, r *http.Request) {
 		s.refuse(w, r, http.StatusBadRequest, "invalid_request",
 			"a submission names a package and a function",
 			`{"package":"org/name","function":"denoise","input":{…}}`)
-		return
-	}
-	if sub.Worker != "" && sub.Cloud {
-		s.refuse(w, r, http.StatusBadRequest, "invalid_request",
-			"worker and cloud are mutually exclusive",
-			"pin a machine or select cloud placement, not both")
 		return
 	}
 	if len(sub.LocalAssets) > 0 && !s.cliAuthenticated(r) {
@@ -201,8 +193,8 @@ func replaySubmission(sub Submission, recorded records.Request) orchestrator.Sub
 	}
 	return orchestrator.Submission{
 		Package: sub.Package, Entrypoint: sub.Function, Payload: payload,
-		Outputs: outputs, PlanID: planID, Worker: sub.Worker, Assets: assets,
-		InstallID: sub.InstallID, Cloud: sub.Cloud,
+		Outputs: outputs, PlanID: planID, Worker: recorded.Worker, Assets: assets,
+		InstallID: sub.InstallID, Rental: sub.Rental,
 	}
 }
 
@@ -231,8 +223,8 @@ func submissionDigest(spec orchestrator.Submission) (string, *exit.Error) {
 	if len(assets) > 0 {
 		doc["assets"] = assets
 	}
-	if spec.Cloud {
-		doc["cloud"] = true
+	if spec.Rental {
+		doc["rental"] = true
 	}
 	// The pinned rental is NOT in it: a worker id says WHERE the same work runs, and two
 	// submissions of one key that differ only in placement are the same request. What the
@@ -292,8 +284,8 @@ func contractStatus(state string) string {
 func (s *Server) resolvePlan(sub Submission) (orchestrator.Submission, *exit.Error) {
 	out := orchestrator.Submission{
 		Package: sub.Package, Entrypoint: sub.Function, Payload: []byte(sub.Input),
-		Outputs: sub.Outputs, PlanID: sub.PlanID, Worker: sub.Worker, Assets: sub.LocalAssets,
-		Cloud: sub.Cloud,
+		Outputs: sub.Outputs, PlanID: sub.PlanID, Assets: sub.LocalAssets,
+		Rental: sub.Rental,
 	}
 	if len(out.Payload) == 0 {
 		out.Payload = []byte("{}")
@@ -471,7 +463,7 @@ type Lifecycle struct {
 	Result      any            `json:"result,omitempty"`
 	Outputs     []MediaRef     `json:"outputs"`
 	Triage      *TriageRef     `json:"triage,omitempty"`
-	Cloud       bool           `json:"cloud,omitempty"`
+	Rental      bool           `json:"rental,omitempty"`
 	CreatedAt   string         `json:"created_at"`
 }
 
@@ -521,7 +513,7 @@ func (s *Server) lifecycleOf(row records.Request) Lifecycle {
 		Kind: kind, RequestID: row.ID, Status: contractStatus(row.State), Package: row.Package,
 		Function: row.Entrypoint, Attempt: uint64(row.Ordinal),
 		ResponseURL: "/v1/requests/" + row.ID, CreatedAt: row.CreatedAt,
-		Outputs: []MediaRef{}, Cloud: row.Cloud,
+		Outputs: []MediaRef{}, Rental: row.Rental,
 	}
 	attempts, _ := s.store.Attempts(row.ID)
 	life.Attempts = len(attempts)

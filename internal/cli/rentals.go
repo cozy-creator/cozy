@@ -26,7 +26,7 @@ import (
 // The rental verbs (cl-015). `cozy rental new` MINTS the pod's access token, asks the hub for a
 // pod while presenting only that token's sha256, watches it provision, and PINS the
 // triple — the address, the certificate to trust, and the token it minted — so that
-// `cozy run --machine <name>` can dial a worker this host never spawned.
+// `cozy run --rental` lets the scheduler use the attached capacity.
 //
 // THE MINT IS THE POINT (#495e). The token is generated here, from this host's own
 // entropy, and what crosses to the hub is a hash. The hub provisions the pod with that
@@ -81,7 +81,6 @@ func handleRent(ctx *Context) *exit.Error {
 			WithRemedy("use 1-32 lowercase letters, numbers, and hyphens; local is reserved")
 	}
 	reason := "cozy rental new " + skuName
-	c := client(ctx)
 	// The wait's ONLY caller-supplied bound. Absent, the wait ends on what the hub says
 	// rather than on a clock: a pod that is still booting is not a pod that has failed.
 	deadline := time.Time{}
@@ -98,6 +97,12 @@ func handleRent(ctx *Context) *exit.Error {
 		return e
 	}
 	defer st.Close()
+	fleet := &managedRentals{ctx: ctx, layout: l, store: st}
+	line, e := fleet.status()
+	if e != nil {
+		return e
+	}
+	fmt.Fprintln(ctx.Err, line)
 
 	state, _, problem := ensureDaemon(ctx)
 	if problem != nil {
@@ -114,20 +119,71 @@ func handleRent(ctx *Context) *exit.Error {
 		operationKey = mintKey()
 	}
 
-	// THE DURABLE MINT, BEFORE THE ASK. O_EXCL makes concurrent same-key callers read one
-	// media bearer and Creator key; the operation row makes a lost HTTP response resumable.
-	// hash crosses the wire.
-	existing, e := st.RentalOperation(operationKey)
+	row, attachable, replay, e := acquireRental(ctx, l, st, skuName, requestedMachineName,
+		operationKey, reason, deadline, "")
 	if e != nil {
 		return e
 	}
+
+	// Tensorhub readiness means only that this host can attach. The daemon claims the
+	// empty worker now; queued requests later send Creator-owned desired state directly.
+	ctx.Daemon = daemon.Probe(ctx.Cfg)
+	if !ctx.Daemon.Up {
+		return ctx.Daemon.Unavailable().WithRemedy(
+			"the paid rental is attached on this host; start `cozy run list` and resume with the same --idempotency-key")
+	}
+	local, e := dial(ctx)
+	if e != nil {
+		return e.WithRemedy("the paid rental is attached on this host; start `cozy run list` and resume with the same --idempotency-key")
+	}
+	if _, e := local.EnsureRental(attachable.ID); e != nil {
+		return e.WithRemedy("the paid rental is attached on this host; keep `cozy run list` running and resume with the same --idempotency-key")
+	}
+	ready := attachable
+	notes := []string{"billing continues until `cozy rental end " + ready.ID + "` confirms release"}
+	if line, problem := fleet.status(); problem == nil {
+		notes = append(notes, line)
+	}
+	if replay {
+		notes = append(notes, "the existing rental operation resumed")
+	}
+	fields := []output.Field{
+		{K: "machine", V: row.MachineName},
+		{K: "rental", V: ready.ID},
+		{K: "state", V: ready.State},
+		{K: "address", V: ready.Address},
+		{K: "media", V: ready.MediaAddress},
+		{K: "gpu", V: skuName},
+		{K: "accelerator", V: ready.AcceleratorModel},
+		{K: "changed", V: !replay}, {K: "operation", V: operationKey}, {K: "replayed", V: replay},
+	}
+	rec := compactRecord(fields, "machine", "state", "gpu", "changed")
+	rec.Notes = notes
+	rec.Next = []string{
+		"cozy run <org/package/function> --rental",
+		"cozy rental end " + row.MachineName,
+	}
+	return emit(ctx, rec)
+}
+
+// acquireRental is the one paid mutation used by both `cozy rental new` and
+// `cozy run --rental`. It returns only after the immutable retail rate and the
+// worker's authenticated attach projection are durable locally.
+func acquireRental(ctx *Context, l home.Layout, st *records.Store, skuName, requestedMachineName,
+	operationKey, reason string, deadline time.Time, managedRequestID string,
+) (records.Rental, hub.Rental, bool, *exit.Error) {
+	c := client(ctx)
+	existing, e := st.RentalOperation(operationKey)
+	if e != nil {
+		return records.Rental{}, hub.Rental{}, false, e
+	}
 	if existing != nil && (existing.State == "rejected" || existing.State == "released") {
-		return exit.Named(exit.Conflict, "rental.operation_settled",
+		return records.Rental{}, hub.Rental{}, false, exit.Named(exit.Conflict, "rental.operation_settled",
 			"rental operation %s is already %s", operationKey, existing.State).
-			WithRemedy("use a fresh --idempotency-key for a new paid rental")
+			WithRemedy("use a fresh operation key for a new paid rental")
 	}
 	if existing != nil && (existing.State == "failed" || existing.State == "release_requested") {
-		return exit.Named(exit.Conflict, "rental.release_required",
+		return records.Rental{}, hub.Rental{}, false, exit.Named(exit.Conflict, "rental.release_required",
 			"rental operation %s is %s and still names rental %s", operationKey, existing.State, existing.RentalID).
 			WithRemedy("release the existing rental before starting another operation").
 			WithNext("cozy rental end " + existing.RentalID)
@@ -146,12 +202,11 @@ func handleRent(ctx *Context) *exit.Error {
 		}
 	}
 	if e != nil {
-		return e
+		return records.Rental{}, hub.Rental{}, false, e
 	}
-	tokenHash := secret.HashHex(token)
-	requestBody, e := hub.RentalRequestBytes(skuName, tokenHash, creator.PublicKey(), 0, 0)
+	requestBody, e := hub.RentalRequestBytes(skuName, secret.HashHex(token), creator.PublicKey())
 	if e != nil {
-		return e
+		return records.Rental{}, hub.Rental{}, false, e
 	}
 	digest := rentalRequestDigest(c.Base(), requestBody)
 	op, replay, e := st.BeginRentalOperation(records.RentalOperation{
@@ -159,67 +214,72 @@ func handleRent(ctx *Context) *exit.Error {
 		Hub: c.Base(), Reason: reason,
 	})
 	if e != nil {
-		return e
+		return records.Rental{}, hub.Rental{}, false, e
 	}
 	if op.RequestDigest != digest || op.Hub != c.Base() || !bytes.Equal(op.RequestBody, requestBody) {
-		return exit.Named(exit.Conflict, "rental.idempotency_conflict",
+		return records.Rental{}, hub.Rental{}, false, exit.Named(exit.Conflict, "rental.idempotency_conflict",
 			"rental operation %s already names a different hub or request body", operationKey).
 			WithRemedy("reuse a key only for the exact same hub, GPU SKU, media token, and Creator key")
 	}
 	if !replay {
 		fmt.Fprintf(ctx.Err, "  rental operation %s persisted; reuse this key to resume\n", operationKey)
 	}
-	// The first recorded reason is derived from the immutable paid intent. Replay reads
-	// that durable value rather than accepting a second caller-controlled spelling.
-	reason = op.Reason
-
 	hctx, cancel := rentalCallContext(deadline)
-	r, e := c.Rent(hctx, op.RequestBody, reason, operationKey)
+	remote, e := c.Rent(hctx, op.RequestBody, op.Reason, operationKey)
 	cancel()
 	if e != nil {
-		// A typed 4xx answer proves this POST bought nothing. Transport, deadline,
-		// unreadable-success, and 5xx failures remain pending because the hub may have
-		// committed before the answer was lost.
 		if e.Code == exit.Credential || e.Code == exit.Validation ||
 			e.Code == exit.NotFound || e.Code == exit.Conflict {
 			if advanced := st.AdvanceRentalOperation(operationKey, "", "rejected"); advanced != nil {
-				return advanced
+				return records.Rental{}, hub.Rental{}, false, advanced
 			}
 			rental.ForgetPending(l, operationKey)
 		}
-		return e
+		return records.Rental{}, hub.Rental{}, false, e
 	}
-	if e := st.AdvanceRentalOperation(operationKey, r.ID, r.State); e != nil {
-		return e
+	if e := st.AdvanceRentalOperation(operationKey, remote.ID, remote.State); e != nil {
+		return records.Rental{}, hub.Rental{}, false, e
 	}
 	machineName := requestedMachineName
 	if machineName == "" {
-		machineName = rentalid.MachineName(r.ID)
+		machineName = rentalid.MachineName(remote.ID)
 	}
-	row := records.Rental{ID: r.ID, MachineName: machineName, SKU: skuName,
-		AcceleratorModel: r.AcceleratorModel, State: r.State, Hub: c.Base()}
-	stored, problem := st.RentalRow(r.ID)
+	row := records.Rental{
+		ID: remote.ID, MachineName: machineName, SKU: skuName,
+		AcceleratorModel: remote.AcceleratorModel, HourlyRateUSDMicros: remote.HourlyRateUSDMicros,
+		ManagedRequestID: managedRequestID, State: remote.State, Hub: c.Base(),
+	}
+	stored, problem := st.RentalRow(remote.ID)
 	if problem != nil {
-		return problem
+		return records.Rental{}, hub.Rental{}, false, problem
 	}
-	if stored != nil && stored.MachineName != "" {
+	if stored != nil {
 		if requestedMachineName != "" && requestedMachineName != stored.MachineName {
-			return exit.Named(exit.Conflict, "rental.machine_name_changed",
-				"rental %s is already named %s", r.ID, stored.MachineName).
+			return records.Rental{}, hub.Rental{}, false, exit.Named(exit.Conflict, "rental.machine_name_changed",
+				"rental %s is already named %s", remote.ID, stored.MachineName).
 				WithRemedy("resume it without --name, or use --name %s", stored.MachineName)
+		}
+		if stored.ManagedRequestID != managedRequestID {
+			return records.Rental{}, hub.Rental{}, false, exit.Named(exit.Conflict, "rental.management_changed",
+				"rental %s cannot change between manual and Creator-managed", remote.ID)
 		}
 		row.MachineName = stored.MachineName
 	}
 	if existing != nil && existing.State == "attached" {
 		if stored == nil {
-			return exit.Named(exit.Conflict, "rental.attached_record_missing",
-				"rental operation %s is attached but rental %s has no local row", operationKey, r.ID)
+			return records.Rental{}, hub.Rental{}, false, exit.Named(exit.Conflict, "rental.attached_record_missing",
+				"rental operation %s is attached but rental %s has no local row", operationKey, remote.ID)
 		}
 		row = *stored
 	} else if e := st.RecordRental(row); e != nil {
-		return e
+		return records.Rental{}, hub.Rental{}, false, e
 	}
 	observe := func(seen hub.Rental) *exit.Error {
+		if seen.HourlyRateUSDMicros != row.HourlyRateUSDMicros {
+			return exit.Named(exit.Conflict, "rental.hourly_rate_changed",
+				"rental %s changed its Cozy retail hourly rate from %d to %d USD micros",
+				seen.ID, row.HourlyRateUSDMicros, seen.HourlyRateUSDMicros)
+		}
 		row.Address, row.State = seen.Address, seen.State
 		row.MediaAddress = seen.MediaAddress
 		row.ExpectedWorkerID, row.ExpectedWorkerBootID = seen.WorkerID, seen.WorkerBootID
@@ -228,73 +288,34 @@ func handleRent(ctx *Context) *exit.Error {
 		}
 		return st.AdvanceRentalOperation(operationKey, seen.ID, seen.State)
 	}
-	attachable, e := waitRental(ctx, c, r.ID, deadline, observe,
+	attachable, e := waitRental(ctx, c, remote.ID, deadline, observe,
 		func(r hub.Rental) bool { return r.Attachable() })
 	if e != nil {
-		return e
+		return records.Rental{}, hub.Rental{}, false, e
 	}
 	row.Address, row.State = attachable.Address, attachable.State
 	row.MediaAddress = attachable.MediaAddress
 	row.ExpectedWorkerID, row.ExpectedWorkerBootID = attachable.WorkerID, attachable.WorkerBootID
 	if !attachable.HoldsMediaHash(secret.HashHex(token)) {
-		// The pod was provisioned with a credential set this host's token is not in, so
-		// dialling it would 401 and look like a network fault. The hub says which hashes
-		// are live; neither end has to say a token to find this out.
-		return exit.New(exit.Failed,
+		return records.Rental{}, hub.Rental{}, false, exit.New(exit.Failed,
 			"rental %s is attachable and its live credential set does not carry the token this host minted", attachable.ID).
 			WithRemedy("release it and rent again; a pod nobody can authenticate to still costs money").
 			WithNext("cozy rental end " + attachable.ID)
 	}
 	if attachable.CreatorPublicKey != creator.PublicKey() {
-		return exit.Named(exit.Conflict, "rental.creator_key_changed",
+		return records.Rental{}, hub.Rental{}, false, exit.Named(exit.Conflict, "rental.creator_key_changed",
 			"rental %s did not retain the Creator key sent at create", attachable.ID).
 			WithRemedy("release it; this host will not sign for a rental bound to another key")
 	}
 	if e := rental.Attach(l, st, row, attachable.CertPEM, token, creator); e != nil {
-		return e
+		return records.Rental{}, hub.Rental{}, false, e
 	}
 	row.CertPath = l.RentalCert(attachable.ID)
 	if e := st.AdvanceRentalOperation(operationKey, attachable.ID, "attached"); e != nil {
-		return e
+		return records.Rental{}, hub.Rental{}, false, e
 	}
 	rental.ForgetPending(l, operationKey)
-
-	// Tensorhub readiness means only that this host can attach. The daemon claims the
-	// empty worker now; queued requests later send Creator-owned desired state directly.
-	ctx.Daemon = daemon.Probe(ctx.Cfg)
-	if !ctx.Daemon.Up {
-		return ctx.Daemon.Unavailable().WithRemedy(
-			"the paid rental is attached on this host; start `cozy run list` and resume with the same --idempotency-key")
-	}
-	local, e := dial(ctx)
-	if e != nil {
-		return e.WithRemedy("the paid rental is attached on this host; start `cozy run list` and resume with the same --idempotency-key")
-	}
-	if _, e := local.EnsureRental(attachable.ID); e != nil {
-		return e.WithRemedy("the paid rental is attached on this host; keep `cozy run list` running and resume with the same --idempotency-key")
-	}
-	ready := attachable
-	notes := []string{"billing continues until `cozy rental end " + ready.ID + "` confirms release"}
-	if replay {
-		notes = append(notes, "the existing rental operation resumed")
-	}
-	fields := []output.Field{
-		{K: "machine", V: row.MachineName},
-		{K: "rental", V: ready.ID},
-		{K: "state", V: ready.State},
-		{K: "address", V: ready.Address},
-		{K: "media", V: ready.MediaAddress},
-		{K: "gpu", V: skuName},
-		{K: "accelerator", V: ready.AcceleratorModel},
-		{K: "changed", V: !replay}, {K: "operation", V: operationKey}, {K: "replayed", V: replay},
-	}
-	rec := compactRecord(fields, "machine", "state", "gpu", "changed")
-	rec.Notes = notes
-	rec.Next = []string{
-		"cozy run <org/package/function> --machine " + row.MachineName,
-		"cozy rental end " + row.MachineName,
-	}
-	return emit(ctx, rec)
+	return row, attachable, replay, nil
 }
 
 func emitRentalCatalog(ctx *Context, skus []hub.RentalSKU) *exit.Error {
@@ -464,11 +485,15 @@ func missingOf(r hub.Rental) string {
 }
 
 func handleRentLs(ctx *Context) *exit.Error {
-	_, st, e := rentalStores(ctx)
+	l, st, e := rentalStores(ctx)
 	if e != nil {
 		return e
 	}
 	defer st.Close()
+	line, e := (&managedRentals{ctx: ctx, layout: l, store: st}).status()
+	if e != nil {
+		return e
+	}
 	rows, e := st.Rentals()
 	if e != nil {
 		return e
@@ -478,6 +503,7 @@ func handleRentLs(ctx *Context) *exit.Error {
 		Fields:    []string{"machine", "sku", "state", "uptime", "queued", "running"},
 		AllFields: []string{"machine", "sku", "state", "uptime", "queued", "running", "utilization", "rental", "accelerator", "address", "media", "hub", "rented"},
 		Next:      []string{"cozy help rental new"},
+		Notes:     []string{line},
 	}
 	for _, r := range rows {
 		queued, running, problem := st.RentalRunCounts(r.ID)
@@ -525,6 +551,11 @@ func handleRentRelease(ctx *Context) *exit.Error {
 		return e
 	}
 	defer st.Close()
+	line, e := (&managedRentals{ctx: ctx, layout: l, store: st}).status()
+	if e != nil {
+		return e
+	}
+	fmt.Fprintln(ctx.Err, line)
 	row, e := st.RentalByMachine(subject)
 	if e != nil {
 		return e
@@ -675,6 +706,9 @@ func (w *releaseWatch) finish(l home.Layout, st *records.Store, operationKey str
 	notes := []string{note + "; its media bearer, Creator key, and pinned certificate are gone from this host"}
 	if !had {
 		notes = []string{note + "; this host held no record of it — already released"}
+	}
+	if line, problem := (&managedRentals{ctx: w.ctx, layout: l, store: st}).status(); problem == nil {
+		notes = append(notes, line)
 	}
 	return emit(w.ctx, output.Record{Fields: []output.Field{
 		{K: "machine", V: w.machine}, {K: "rental", V: w.id},

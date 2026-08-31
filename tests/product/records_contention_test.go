@@ -25,7 +25,7 @@ func TestRecordsSchemaIsExactV1AndStable(t *testing.T) {
 		t.Fatalf("fresh records version = %d, want exact v1", version)
 	}
 	for _, column := range []string{
-		"max_cost_usd_micros", "package_revision_digest", "environment_digest", "config_digest",
+		"rental", "package_revision_digest", "environment_digest", "config_digest",
 	} {
 		var count int
 		must(t, db.QueryRow(`SELECT COUNT(*) FROM pragma_table_info('requests') WHERE name=?`,
@@ -33,6 +33,11 @@ func TestRecordsSchemaIsExactV1AndStable(t *testing.T) {
 		if count != 1 {
 			t.Fatalf("exact requests schema omitted %s", column)
 		}
+	}
+	var deleted int
+	must(t, db.QueryRow(`SELECT COUNT(*) FROM pragma_table_info('requests') WHERE name='max_cost_usd_micros'`).Scan(&deleted))
+	if deleted != 0 {
+		t.Fatal("exact requests schema retained max_cost_usd_micros")
 	}
 	must(t, db.Close())
 
@@ -124,7 +129,7 @@ func TestRentalRecordWaitsForAnotherProcessWriter(t *testing.T) {
 	go func() {
 		if problem := store.RecordRental(records.Rental{
 			ID: "pr-lock-proof", MachineName: "lock-proof", SKU: "cpu-test",
-			State: "booting", Hub: "https://tensorhub.com",
+			HourlyRateUSDMicros: 100_000, State: "booting", Hub: "https://tensorhub.com",
 		}); problem != nil {
 			done <- problem
 			return

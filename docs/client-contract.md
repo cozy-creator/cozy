@@ -58,22 +58,24 @@ the active package pointer.
 The `model`, `lane`, and `adapter` fields are reserved but not resolved by Cozy yet.
 Any non-empty value refuses as `501 override_unresolved`; it is never silently ignored.
 
-`worker` is a **LOCAL ADDITION**: it pins the request to an attached rental by id. An id
-this Cozy daemon does not hold is `404` before a request row exists. The pin is not in
-the idempotency digest because it selects where the same work runs, not what the work is.
-A new rental is generic empty capacity and becomes attachable when Tensorhub publishes its
-pinned worker location. One exact weightless package release may then be queued as a signed logical
-`package_set`. The worker's existing observed-state stream supplies the derived placement and sole
-dispatchable binding digest plus exact release/environment/config identities. Tensorhub's immutable
-release detail supplies the verified request/result descriptor; Creator never substitutes a locally
-reconstructed platform qualification or PlacementSet. Model-bound packages remain deferred.
+`rental: true` is the local API's only remote-placement request. It is the exact
+counterpart of CLI `--rental`; callers cannot name a worker. Default execution and
+`--local` are local-only. The two flags are mutually exclusive, and changing the mode
+changes idempotency identity.
 
-`max_cost_usd_micros` is the exact non-negative automatic-rental authorization behind CLI
-`--max-cost <decimal USD>`. Zero or absence forbids paid acquisition. It is mutually exclusive
-with `worker`, persists with the request, and enters idempotency identity only when nonzero. Cozy
-still tries local capacity first. Until non-empty signed package/model preparation is installed,
-a local capacity miss stops at `rental.package_preparation_unavailable` before any paid rental
-request; the stored budget is not treated as permission to buy unusable empty capacity.
+Creator reconciles every locally known rental with Tensorhub and sums the immutable Cozy
+retail hourly rate locked into each rental. Every potentially billing manual or managed
+rental counts until Tensorhub confirms release or absence. A new managed rental is allowed
+only when its locked rate fits under `rentals.max_hourly_spend_usd`. Creator reuses the
+cheapest idle rental first, otherwise buys the cheapest offered SKU. Manual rentals remain
+until `cozy rental end`; Creator-managed rentals are released after all assigned requests
+are terminal, their output bytes are mirrored, and their outcome acknowledgements are sent.
+
+A generic rental becomes attachable when Tensorhub publishes its pinned worker location.
+Creator sends the exact package release as a signed logical `package_set`; the worker's
+observed-state stream supplies the derived placement, dispatchable binding, and exact
+release/environment/config identities. Tensorhub's immutable release detail supplies the
+verified request/result descriptor. Model-bound packages remain deferred.
 
 `local_assets` is the CLI-only local extension for `--asset
 <field-path>=<file>`. Each row names the exact request-schema field path plus a source

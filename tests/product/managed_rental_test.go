@@ -8,42 +8,42 @@ import (
 	"github.com/cozy-creator/cozy/internal/records"
 )
 
-func TestBudgetedRequestStopsBeforePaidRentalWithoutPackagePreparation(t *testing.T) {
-	owner := hostOwner(t, "budgeted-rental-gate")
-	budgeted := submission("sha256:plan", "proof/package", "budgeted-gate", map[string]any{})
-	budgeted.MaxCostUSDMicros = 2_000_000
-	id, attempt, problem := owner.c.Submit(budgeted)
+func TestRentalRequestRequiresTheExplicitAcquisitionSeam(t *testing.T) {
+	owner := hostOwner(t, "managed-rental-gate")
+	requested := submission("sha256:plan", "proof/package", "rental-gate", map[string]any{})
+	requested.Rental = true
+	id, attempt, problem := owner.c.Submit(requested)
 	fatal(t, problem)
 	if attempt != 0 {
-		t.Fatalf("budgeted request dispatched attempt %d without package preparation", attempt)
+		t.Fatalf("rental request dispatched attempt %d without acquisition", attempt)
 	}
 	row := waitRequestState(t, owner, id, "failed")
-	if row.MaxCostUSDMicros != 2_000_000 || row.Worker != "" {
-		t.Fatalf("budgeted request lost local-first intent: %+v", row)
+	if !row.Rental || row.Worker != "" {
+		t.Fatalf("rental request lost placement intent: %+v", row)
 	}
 	events, problem := owner.store.EventsAfter(id, 0, 100)
 	fatal(t, problem)
-	if !eventHasError(events, "rental.package_preparation_unavailable") {
-		t.Fatalf("budgeted request did not stop at the pre-purchase gate: %+v", events)
+	if !eventHasError(events, "rental.acquisition_unavailable") {
+		t.Fatalf("rental request did not stop at the acquisition seam: %+v", events)
 	}
-	changedBudget := budgeted
-	changedBudget.MaxCostUSDMicros = 1_000_000
-	if _, _, problem := owner.c.Submit(changedBudget); problem == nil ||
+	changedMode := requested
+	changedMode.Rental = false
+	if _, _, problem := owner.c.Submit(changedMode); problem == nil ||
 		!strings.Contains(problem.Message, "different body") {
-		t.Fatalf("changed budget reused one orchestrator identity: %v", problem)
+		t.Fatalf("changed placement mode reused one orchestrator identity: %v", problem)
 	}
 
-	zero := submission("sha256:plan", "proof/package", "zero-budget-gate", map[string]any{})
-	zeroID, attempt, problem := owner.c.Submit(zero)
+	local := submission("sha256:plan", "proof/package", "local-gate", map[string]any{})
+	localID, attempt, problem := owner.c.Submit(local)
 	fatal(t, problem)
 	if attempt != 0 {
-		t.Fatalf("zero-budget request dispatched attempt %d without local capacity", attempt)
+		t.Fatalf("local request dispatched attempt %d without local capacity", attempt)
 	}
-	waitRequestState(t, owner, zeroID, "failed")
-	events, problem = owner.store.EventsAfter(zeroID, 0, 100)
+	waitRequestState(t, owner, localID, "failed")
+	events, problem = owner.store.EventsAfter(localID, 0, 100)
 	fatal(t, problem)
-	if eventHasError(events, "rental.package_preparation_unavailable") {
-		t.Fatalf("zero-budget request entered automatic rental path: %+v", events)
+	if eventHasError(events, "rental.acquisition_unavailable") {
+		t.Fatalf("local request entered rental acquisition: %+v", events)
 	}
 }
 

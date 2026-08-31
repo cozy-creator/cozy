@@ -64,7 +64,7 @@ CREATE TABLE IF NOT EXISTS requests (
   org          TEXT    NOT NULL DEFAULT '',
   trees        TEXT    NOT NULL DEFAULT '',
   worker       TEXT    NOT NULL DEFAULT '',
-  cloud        INTEGER NOT NULL DEFAULT 0,
+  rental       INTEGER NOT NULL DEFAULT 0,
   install_id   TEXT    REFERENCES install_generations(id),
   assets       TEXT    NOT NULL DEFAULT '[]',
   artifact_outputs TEXT NOT NULL DEFAULT '[]'
@@ -432,8 +432,8 @@ type Request struct {
 	// It lives on the request because a requeue must re-derive the same placement
 	// without a client saying so again. Empty = any local worker.
 	Worker string
-	// Cloud authorizes placement on Creator-managed rented capacity.
-	Cloud bool
+	// Rental authorizes placement on Creator-managed rented capacity.
+	Rental bool
 	// InstallID pins the exact immutable local metadata generation resolved before
 	// submission. The initial remote lane reads only its published release and descriptor.
 	InstallID string
@@ -464,7 +464,7 @@ type AssetBinding struct {
 
 const requestCols = `id,idem_key,body_digest,package,entrypoint,plan_id,
 	package_revision_digest,environment_digest,config_digest,payload,outputs,
-	state,ordinal,requeues,created_at,kind,org,trees,worker,cloud,
+	state,ordinal,requeues,created_at,kind,org,trees,worker,rental,
 	COALESCE(install_id,''),assets,artifact_outputs`
 
 func scanRequest(row interface{ Scan(...any) error }) (Request, error) {
@@ -473,7 +473,7 @@ func scanRequest(row interface{ Scan(...any) error }) (Request, error) {
 	err := row.Scan(&r.ID, &r.IdemKey, &r.BodyDigest, &r.Package, &r.Entrypoint, &r.PlanID,
 		&r.PackageRevisionDigest, &r.EnvironmentDigest, &r.ConfigDigest, &r.Payload, &r.Outputs,
 		&r.State, &r.Ordinal, &r.Requeues, &r.CreatedAt,
-		&r.Kind, &r.Org, &r.Trees, &r.Worker, &r.Cloud,
+		&r.Kind, &r.Org, &r.Trees, &r.Worker, &r.Rental,
 		&r.InstallID, &assets, &r.ArtifactOutputs)
 	if err == nil && assets != "" {
 		err = json.Unmarshal([]byte(assets), &r.Assets)
@@ -530,6 +530,38 @@ func (s *Store) BindRemoteInvocation(id, planID, packageRevision, environment, c
 			"request %s already binds a different worker-derived invocation identity", id)
 	}
 	return nil
+}
+
+// AssignManagedRental pins one still-queued --rental request to the exact pod
+// Creator acquired for it. A cancellation that wins first leaves worker empty,
+// which tells the caller to release the otherwise-unused rental.
+func (s *Store) AssignManagedRental(id, rentalID string) (bool, *exit.Error) {
+	result, err := s.db.Exec(`UPDATE requests SET worker=? WHERE id=? AND rental=1 AND worker='' AND
+		state IN ('submitted','queued','requeue_pending')`, rentalID, id)
+	if err != nil {
+		return false, exit.Internalf("cannot assign request %s to rental %s: %s", id, rentalID, err)
+	}
+	changed, err := result.RowsAffected()
+	if err != nil {
+		return false, exit.Internalf("cannot read rental assignment for request %s: %s", id, err)
+	}
+	if changed == 1 {
+		return true, nil
+	}
+	row, problem := s.RequestRow(id)
+	if problem != nil {
+		return false, problem
+	}
+	return row != nil && row.Rental && row.Worker == rentalID &&
+		!settledRequestState(row.State), nil
+}
+
+func settledRequestState(state string) bool {
+	switch state {
+	case "succeeded", "failed", "canceled", "refused", "abandoned":
+		return true
+	}
+	return false
 }
 
 // RequestByIdempotencyKey resolves the durable identity before a retry touches any
@@ -783,12 +815,12 @@ func submitRequestTx(tx *sql.Tx, r Request, assets string) (Request, bool, *exit
 	}
 	if _, err := tx.Exec(`INSERT INTO requests(id,idem_key,body_digest,package,entrypoint,
 		plan_id,package_revision_digest,environment_digest,config_digest,
-		payload,outputs,state,ordinal,requeues,created_at,kind,org,trees,worker,cloud,install_id,assets,
+		payload,outputs,state,ordinal,requeues,created_at,kind,org,trees,worker,rental,install_id,assets,
 		artifact_outputs)
 		VALUES(?,?,?,?,?,?,?,?,?,?,?,?,0,0,?,?,?,?,?,?,?,?,?)`,
 		r.ID, r.IdemKey, r.BodyDigest, r.Package, r.Entrypoint, r.PlanID,
 		r.PackageRevisionDigest, r.EnvironmentDigest, r.ConfigDigest, r.Payload,
-		r.Outputs, r.State, r.CreatedAt, r.Kind, r.Org, r.Trees, r.Worker, r.Cloud,
+		r.Outputs, r.State, r.CreatedAt, r.Kind, r.Org, r.Trees, r.Worker, r.Rental,
 		nullable(r.InstallID),
 		assets, r.ArtifactOutputs); err != nil {
 		return Request{}, false, exit.Internalf("cannot record request %s: %s", r.ID, err)

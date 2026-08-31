@@ -26,8 +26,7 @@ import (
 //
 //	GET    /v1/rental-skus           -> [{name, accelerator_model, compute_capability,
 //	                                 vram_gb, price_usd_micros_per_hour}]
-//	POST   /v1/rentals               {sku, media_token_sha256:<64 hex>, creator_public_key,
-//	                                 max_cost_usd_micros?, max_duration_seconds?}
+//	POST   /v1/rentals               {sku, media_token_sha256:<64 hex>, creator_public_key}
 //	                                 -> 202 {rental_id, state, ...}
 //	GET    /v1/rentals/{id}          -> {state, worker_address, cert_pem, media_address,
 //	                                     detail, worker_id, worker_boot_id,
@@ -70,9 +69,8 @@ type Rental struct {
 	// MediaTokenSHA256 is the pod media plane's LIVE credential set, as hashes. It is here so this host can
 	// see that the hash of the token it minted is one the pod was provisioned with —
 	// a comparison neither end can make by saying the token.
-	MediaTokenSHA256 []string
-	MaxCostUSDMicros int64
-	MaxDurationS     int64
+	MediaTokenSHA256    []string
+	HourlyRateUSDMicros int64
 }
 
 // ExactDocument and ModelSelection are package-download DTOs. Generic rental
@@ -114,19 +112,18 @@ func (r Rental) HoldsMediaHash(hash string) bool {
 
 // wireRental is the answer's own shape.
 type wireRental struct {
-	ID               string   `json:"rental_id"`
-	State            string   `json:"state"`
-	AcceleratorModel string   `json:"requested_accelerator_model"`
-	WorkerAddress    string   `json:"worker_address"`
-	CertPEM          string   `json:"cert_pem"`
-	Detail           string   `json:"detail"`
-	MediaAddress     string   `json:"media_address"`
-	WorkerID         string   `json:"worker_id"`
-	WorkerBootID     string   `json:"worker_boot_id"`
-	CreatorPublicKey string   `json:"creator_public_key"`
-	MediaTokenSHA256 []string `json:"media_token_sha256"`
-	MaxCostUSDMicros int64    `json:"max_cost_usd_micros"`
-	MaxDurationS     int64    `json:"max_duration_seconds"`
+	ID                  string   `json:"rental_id"`
+	State               string   `json:"state"`
+	AcceleratorModel    string   `json:"requested_accelerator_model"`
+	WorkerAddress       string   `json:"worker_address"`
+	CertPEM             string   `json:"cert_pem"`
+	Detail              string   `json:"detail"`
+	MediaAddress        string   `json:"media_address"`
+	WorkerID            string   `json:"worker_id"`
+	WorkerBootID        string   `json:"worker_boot_id"`
+	CreatorPublicKey    string   `json:"creator_public_key"`
+	MediaTokenSHA256    []string `json:"media_token_sha256"`
+	HourlyRateUSDMicros int64    `json:"hourly_rate_usd_micros"`
 }
 
 var bareSHA256Pattern = regexp.MustCompile(`^[0-9a-f]{64}$`)
@@ -150,9 +147,9 @@ func (w wireRental) rental() Rental {
 		Address:          w.WorkerAddress, CertPEM: w.CertPEM,
 		Detail: w.Detail, MediaAddress: w.MediaAddress,
 		WorkerID: w.WorkerID, WorkerBootID: w.WorkerBootID,
-		CreatorPublicKey: w.CreatorPublicKey,
-		MediaTokenSHA256: w.MediaTokenSHA256,
-		MaxCostUSDMicros: w.MaxCostUSDMicros, MaxDurationS: w.MaxDurationS,
+		CreatorPublicKey:    w.CreatorPublicKey,
+		MediaTokenSHA256:    w.MediaTokenSHA256,
+		HourlyRateUSDMicros: w.HourlyRateUSDMicros,
 	}
 }
 
@@ -163,26 +160,22 @@ type RentalRequest struct {
 	SKU              string `json:"sku"`
 	MediaTokenSHA256 string `json:"media_token_sha256"`
 	CreatorPublicKey string `json:"creator_public_key"`
-	MaxCostUSDMicros int64  `json:"max_cost_usd_micros,omitempty"`
-	MaxDurationS     int64  `json:"max_duration_seconds,omitempty"`
 }
 
 // RentalRequestBytes authors the exact bytes persisted before POST and replayed
 // unchanged after response loss. There is one encoder, not a digest struct plus
 // a separately marshaled transport map that can drift.
-func RentalRequestBytes(sku, mediaTokenSHA256, creatorPublicKey string,
-	maxCostUSDMicros, maxDurationS int64) ([]byte, *exit.Error) {
+func RentalRequestBytes(sku, mediaTokenSHA256, creatorPublicKey string) ([]byte, *exit.Error) {
 	req := RentalRequest{
 		SKU:              strings.TrimSpace(sku),
 		MediaTokenSHA256: strings.TrimPrefix(strings.TrimSpace(mediaTokenSHA256), "sha256:"),
 		CreatorPublicKey: strings.TrimSpace(creatorPublicKey),
-		MaxCostUSDMicros: maxCostUSDMicros, MaxDurationS: maxDurationS,
 	}
 	public, publicErr := base64.RawURLEncoding.DecodeString(req.CreatorPublicKey)
-	if req.SKU == "" || req.MaxCostUSDMicros < 0 || req.MaxDurationS < 0 ||
+	if req.SKU == "" ||
 		!bareSHA256Pattern.MatchString(req.MediaTokenSHA256) || publicErr != nil || len(public) != 32 {
 		return nil, exit.Named(exit.Validation, "rental.intent_incomplete",
-			"sku, non-negative integer maxima, media token hash, and one Ed25519 Creator public key are required")
+			"sku, media token hash, and one Ed25519 Creator public key are required")
 	}
 	raw, err := json.Marshal(req)
 	if err != nil {
@@ -252,6 +245,11 @@ func (w wireRental) named(what string) *exit.Error {
 		return exit.Named(exit.Internal, "hub.rental_unnamed",
 			"the hub %s and named no rental_id", what).
 			WithRemedy("this route may not exist on this hub build; `cozy package search` names it and its version")
+	}
+	if w.HourlyRateUSDMicros <= 0 {
+		return exit.Named(exit.Conflict, "hub.rental_hourly_rate_missing",
+			"the hub %s without a positive locked Cozy retail hourly rate", what).
+			WithRemedy("upgrade Tensorhub before accepting a rental")
 	}
 	return validateRentalID(w.ID)
 }

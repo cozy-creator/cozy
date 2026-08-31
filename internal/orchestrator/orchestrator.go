@@ -63,6 +63,12 @@ type Options struct {
 	RentalClaimProof RentalClaimProofSource
 	// RentalPackageSet signs Creator's logical package/model download authority.
 	RentalPackageSet RentalPackageSetSource
+	// RentalFleet renders the one fleet burn line after reconciling every local
+	// rental with Tensorhub. AcquireManagedRental durably assigns one --rental
+	// request; ReleaseManagedRental tears down an idle Creator-managed pod.
+	RentalFleet          func() (string, *exit.Error)
+	AcquireManagedRental func(records.Request) (string, string, *exit.Error)
+	ReleaseManagedRental func(string) (string, *exit.Error)
 	// ConfigDigest is the local evaluated-config identity. Environment identity
 	// comes only from the exact selected PlacementSet.
 	ConfigDigest string

@@ -106,7 +106,7 @@ func TestRentalCreatorIdentityAndClaim(t *testing.T) {
 	}
 
 	request, problem := hub.RentalRequestBytes("cpu", strings.Repeat("1", 64),
-		identity.PublicKey(), 0, 0)
+		identity.PublicKey())
 	fatal(t, problem)
 	var body map[string]any
 	must(t, json.Unmarshal(request, &body))

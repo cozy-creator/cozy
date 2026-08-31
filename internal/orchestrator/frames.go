@@ -814,6 +814,19 @@ func (c *Orchestrator) afterAck(req records.Request, attempt records.Attempt, ho
 	}
 	c.frames.forget(req.ID)
 	c.signalClosed(requestWaitKey(req.ID), verdict)
+	if req.Rental && req.Worker != "" && c.opt.ReleaseManagedRental != nil {
+		go func() {
+			line, problem := c.opt.ReleaseManagedRental(req.Worker)
+			if problem != nil {
+				c.logf("managed rental %s release deferred: %s", req.Worker, problem.Message)
+				return
+			}
+			if line != "" {
+				c.emit(req.ID, "request.rentals", 0, map[string]any{"line": line})
+				c.logf("%s", line)
+			}
+		}()
+	}
 }
 
 // cleanupAttempt runs only after the outcome's bytes were mirrored, its terminal commit
