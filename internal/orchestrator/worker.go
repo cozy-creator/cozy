@@ -81,6 +81,7 @@ type DesiredPlacement struct {
 	PlacementSetDigest       string       `json:"placement_set_digest"`
 	PlacementSetBytes        []byte       `json:"placement_set_bytes"`
 	EnvironmentDigest        string       `json:"environment_digest"`
+	ConfigDigest             string       `json:"config_digest"`
 	WheelhouseManifestDigest string       `json:"wheelhouse_manifest_digest"`
 	Entrypoints              []Entrypoint `json:"entrypoints"`
 	PlacementIDValue         string       `json:"placement_id,omitempty"`
@@ -418,9 +419,12 @@ type worker struct {
 	// retired as dishonest — it advanced on acceptance, so a reader learned only that its
 	// own message arrived. converged < accepted is the normal, readable state of a
 	// convergence in progress or a latched failure, never an error.
-	acceptedRevision  uint64
-	convergedRevision uint64
-	acceptedSetDigest []byte
+	acceptedRevision      uint64
+	convergedRevision     uint64
+	acceptedSetDigest     []byte
+	packageRevisionDigest string
+	environmentDigest     string
+	configDigest          string
 	// The job lane uses the same reported-versus-pre-offer split as serving. jobsAvail is
 	// the effective number dispatch reads.
 	reportedJobs int
@@ -745,13 +749,30 @@ func (c *Orchestrator) ensureLogicalPackageReady(instanceID, rentalID string,
 			} else if !w.spawned.IsZero() {
 				quiet = time.Since(w.spawned)
 			}
-			if len(w.dispatchable) == 1 && w.placementID != "" &&
+			ready := len(w.dispatchable) == 1 && w.placementID != "" &&
 				w.serving == pb.ServingState_SERVING_STATE_DISPATCHABLE &&
-				w.acceptedRevision >= w.revision && w.convergedRevision >= w.revision {
+				w.acceptedRevision >= w.revision && w.convergedRevision >= w.revision
+			if ready && (!validDigest(w.packageRevisionDigest) || !validDigest(w.environmentDigest) ||
+				!validDigest(w.configDigest)) {
+				c.mu.Unlock()
+				return WorkerLaunchSpec{}, "", exit.Named(exit.Structural,
+					"rental.invocation_identity_invalid",
+					"worker resolved package %s without complete invocation identity", logical.Package)
+			}
+			if ready {
+				if w.packageRevisionDigest != logical.ReleaseDigest {
+					c.mu.Unlock()
+					return WorkerLaunchSpec{}, "", exit.Named(exit.Conflict,
+						"rental.package_release_changed",
+						"worker resolved package release %s, not delegated %s",
+						w.packageRevisionDigest, logical.ReleaseDigest)
+				}
 				planID := keysOf(w.dispatchable)[0]
 				w.spec.Placement = DesiredPlacement{
 					Package: pinnedPackage(logical.Package, rentalID), Release: logical.Release,
-					PackageRevisionDigest: logical.ReleaseDigest, InstallID: logical.InstallID,
+					PackageRevisionDigest: w.packageRevisionDigest,
+					EnvironmentDigest:     w.environmentDigest, ConfigDigest: w.configDigest,
+					InstallID:        logical.InstallID,
 					PlacementIDValue: w.placementID,
 					Entrypoints: []Entrypoint{{Name: logical.Function, Digest: planID,
 						Outputs: append([]string(nil), logical.Outputs...)}},
@@ -786,6 +807,11 @@ func (c *Orchestrator) ensureLogicalPackageReady(instanceID, rentalID string,
 		}
 		time.Sleep(20 * time.Millisecond)
 	}
+}
+
+func validDigest(value string) bool {
+	_, err := canonical.Raw(value)
+	return err == nil
 }
 
 // DetachRental stops this daemon's control loop for one rented worker. It waits for an

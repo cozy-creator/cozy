@@ -267,6 +267,15 @@ func (c *Orchestrator) onObserved(s *session, r *pb.ObservedWorkerState) {
 			}
 			if status != nil {
 				w.materialization, w.serving = status.Materialization, status.Serving
+				w.packageRevisionDigest = status.PackageRevisionDigest
+				w.environmentDigest = status.EnvironmentDigest
+				w.configDigest = status.ConfigDigest
+				if w.spec.Connection != nil && w.spec.Placement.PlacementSetDigest == "" &&
+					w.spec.Placement.Package != "" {
+					w.spec.Placement.PackageRevisionDigest = status.PackageRevisionDigest
+					w.spec.Placement.EnvironmentDigest = status.EnvironmentDigest
+					w.spec.Placement.ConfigDigest = status.ConfigDigest
+				}
 				w.generation = status.ExecutorGeneration
 				w.heldSetDigest = status.PlacementSetDigest
 				w.fallbackSetDigest = status.RetainedFallbackPlacementSetDigest
@@ -295,6 +304,7 @@ func (c *Orchestrator) onObserved(s *session, r *pb.ObservedWorkerState) {
 				// dispatchable, which is exactly true.
 				w.materialization = pb.MaterializationState_MATERIALIZATION_STATE_UNSPECIFIED
 				w.serving = pb.ServingState_SERVING_STATE_UNSPECIFIED
+				w.packageRevisionDigest, w.environmentDigest, w.configDigest = "", "", ""
 			}
 		}
 		w.dispatchable, w.materializable = dispatchable, materializable

@@ -608,7 +608,9 @@ func (c *Orchestrator) resolveFor(req records.Request) (WorkerLaunchSpec, string
 	if e != nil {
 		return WorkerLaunchSpec{}, "", e
 	}
-	if e := c.opt.Store.BindRequestPlan(req.ID, planID); e != nil {
+	if e := c.opt.Store.BindRemoteInvocation(req.ID, planID,
+		spec.Placement.PackageRevisionDigest, spec.Placement.EnvironmentDigest,
+		spec.Placement.ConfigDigest); e != nil {
 		return WorkerLaunchSpec{}, "", e
 	}
 	return spec, planID, nil
@@ -670,7 +672,7 @@ func (c *Orchestrator) dispatch(req records.Request) (uint64, *exit.Error) {
 	// the payload digest, the ORDERED input identities, the output contracts, the
 	// deadline — lives INSIDE the digest. Its key set is closed: no human model ref, no
 	// service class, no local extension has a slot.
-	environmentDigest, configDigest, e := c.invocationIdentity(w)
+	packageRevision, environmentDigest, configDigest, e := c.invocationIdentity(w, req)
 	if e != nil {
 		return 0, e
 	}
@@ -681,7 +683,7 @@ func (c *Orchestrator) dispatch(req records.Request) (uint64, *exit.Error) {
 	payloadDigest := spellOf(canonical.Digest(req.Payload))
 	outputLimit := c.maxOutputBytes()
 	spec := &pb.InvocationSpec{
-		PackageRevisionDigest: w.spec.Placement.PackageRevisionDigest,
+		PackageRevisionDigest: packageRevision,
 		// `image_digest` is GONE, renamed to what it always meant (#483): "image" is wrong
 		// for a native install with no OCI image at all. The value is the same one this
 		// daemon was frozen with — a request cannot choose the environment it runs under.
@@ -828,19 +830,29 @@ func (c *Orchestrator) maxOutputBytes() uint64 {
 
 // invocationIdentity names the environment and optional local config digest an
 // invocation on w rides.
-func (c *Orchestrator) invocationIdentity(w *worker) (environment, config string, e *exit.Error) {
+func (c *Orchestrator) invocationIdentity(w *worker,
+	req records.Request) (packageRevision, environment, config string, e *exit.Error) {
+	packageRevision = w.spec.Placement.PackageRevisionDigest
 	environment = w.spec.Placement.EnvironmentDigest
 	if environment == "" {
 		if w.spec.Connection == nil && w.spec.Placement.SourceDigest != "" {
-			return "", c.opt.ConfigDigest, nil
+			return packageRevision, "", c.opt.ConfigDigest, nil
 		}
-		return "", "", exit.Named(exit.Structural, "placement_identity_missing",
+		return "", "", "", exit.Named(exit.Structural, "placement_identity_missing",
 			"worker %s carries no selected environment digest", w.instanceID)
 	}
 	if w.spec.Connection != nil {
-		return environment, "", nil
+		if req.PackageRevisionDigest == "" || req.EnvironmentDigest == "" || req.ConfigDigest == "" ||
+			req.PackageRevisionDigest != packageRevision || req.EnvironmentDigest != environment ||
+			req.ConfigDigest != w.spec.Placement.ConfigDigest {
+			return "", "", "", exit.Named(exit.Conflict,
+				"request_invocation_identity_changed",
+				"worker %s no longer matches the invocation identity pinned to request %s",
+				w.instanceID, req.ID)
+		}
+		return req.PackageRevisionDigest, req.EnvironmentDigest, req.ConfigDigest, nil
 	}
-	return environment, c.opt.ConfigDigest, nil
+	return packageRevision, environment, c.opt.ConfigDigest, nil
 }
 
 func spellOf(raw []byte) string {

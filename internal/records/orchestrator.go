@@ -51,6 +51,9 @@ CREATE TABLE IF NOT EXISTS requests (
   package     TEXT    NOT NULL,
   entrypoint   TEXT    NOT NULL,
   plan_id      TEXT    NOT NULL,
+  package_revision_digest TEXT NOT NULL DEFAULT '',
+  environment_digest TEXT NOT NULL DEFAULT '',
+  config_digest TEXT NOT NULL DEFAULT '',
   payload      BLOB    NOT NULL,
   outputs      TEXT    NOT NULL DEFAULT '',
   state        TEXT    NOT NULL,
@@ -273,6 +276,9 @@ var widen = []struct{ table, column, ddl string }{
 	{"requests", "assets", `TEXT NOT NULL DEFAULT '[]'`},
 	{"requests", "install_id", `TEXT NOT NULL DEFAULT ''`},
 	{"requests", "artifact_outputs", `TEXT NOT NULL DEFAULT '[]'`},
+	{"requests", "package_revision_digest", `TEXT NOT NULL DEFAULT ''`},
+	{"requests", "environment_digest", `TEXT NOT NULL DEFAULT ''`},
+	{"requests", "config_digest", `TEXT NOT NULL DEFAULT ''`},
 	{"attempts", "media_cleaned", `INTEGER NOT NULL DEFAULT 0`},
 	{"attempts", "artifact_outputs", `TEXT NOT NULL DEFAULT '[]'`},
 }
@@ -519,7 +525,13 @@ type Request struct {
 	Package    string
 	Entrypoint string
 	PlanID     string
-	Payload    []byte
+	// A remote worker derives these invocation identities from its exact accepted
+	// Placement. They are CAS-bound with PlanID before the first offer so a retry or
+	// reconnect cannot silently change the execution named by this request.
+	PackageRevisionDigest string
+	EnvironmentDigest     string
+	ConfigDigest          string
+	Payload               []byte
 	// Outputs names one destination per RESULT FIELD PATH. It lives on the request
 	// because a REQUEUE re-derives the same grant shape without a client saying so again.
 	Outputs   string
@@ -544,8 +556,8 @@ type Request struct {
 	Worker string
 	// MaxCostUSDMicros is the exact automatic-rental authorization. Zero forbids spend.
 	MaxCostUSDMicros int64
-	// InstallID pins a durable local request to the exact immutable generation
-	// resolved before submission. Remote requests leave it empty.
+	// InstallID pins the exact immutable local metadata generation resolved before
+	// submission. The initial remote lane reads only its published release and descriptor.
 	InstallID string
 	// Assets are the request's durable input-asset bindings. LocalPath points into the
 	// authority-owned immutable input store, not at the caller's original file: a requeue
@@ -572,7 +584,8 @@ type AssetBinding struct {
 	MaxBytes  int64  `json:"max_bytes,omitempty"`
 }
 
-const requestCols = `id,idem_key,body_digest,package,entrypoint,plan_id,payload,outputs,
+const requestCols = `id,idem_key,body_digest,package,entrypoint,plan_id,
+	package_revision_digest,environment_digest,config_digest,payload,outputs,
 	state,ordinal,requeues,created_at,kind,org,trees,worker,max_cost_usd_micros,
 	COALESCE(install_id,''),assets,artifact_outputs`
 
@@ -580,7 +593,8 @@ func scanRequest(row interface{ Scan(...any) error }) (Request, error) {
 	var r Request
 	var assets string
 	err := row.Scan(&r.ID, &r.IdemKey, &r.BodyDigest, &r.Package, &r.Entrypoint, &r.PlanID,
-		&r.Payload, &r.Outputs, &r.State, &r.Ordinal, &r.Requeues, &r.CreatedAt,
+		&r.PackageRevisionDigest, &r.EnvironmentDigest, &r.ConfigDigest, &r.Payload, &r.Outputs,
+		&r.State, &r.Ordinal, &r.Requeues, &r.CreatedAt,
 		&r.Kind, &r.Org, &r.Trees, &r.Worker, &r.MaxCostUSDMicros,
 		&r.InstallID, &assets, &r.ArtifactOutputs)
 	if err == nil && assets != "" {
@@ -606,30 +620,36 @@ func (s *Store) RequestRow(id string) (*Request, *exit.Error) {
 	return &r, nil
 }
 
-// BindRequestPlan records the one binding digest learned from the worker after
-// logical package_set resolution. The client never supplies this value.
-func (s *Store) BindRequestPlan(id, planID string) *exit.Error {
-	if id == "" || planID == "" {
-		return exit.Internalf("cannot bind an empty request or plan identity")
+// BindRemoteInvocation records the exact invocation identity learned from the worker
+// after logical package_set resolution. The client never supplies these values.
+func (s *Store) BindRemoteInvocation(id, planID, packageRevision, environment, config string) *exit.Error {
+	if id == "" || planID == "" || packageRevision == "" || environment == "" || config == "" {
+		return exit.Internalf("cannot bind an incomplete remote invocation identity")
 	}
-	result, err := s.db.Exec(`UPDATE requests SET plan_id=? WHERE id=? AND plan_id=''`, planID, id)
+	result, err := s.db.Exec(`UPDATE requests SET plan_id=?,package_revision_digest=?,
+		environment_digest=?,config_digest=? WHERE id=? AND plan_id='' AND
+		package_revision_digest='' AND environment_digest='' AND config_digest=''`,
+		planID, packageRevision, environment, config, id)
 	if err != nil {
-		return exit.Internalf("cannot bind request %s plan: %s", id, err)
+		return exit.Internalf("cannot bind request %s remote invocation: %s", id, err)
 	}
 	changed, err := result.RowsAffected()
 	if err != nil {
-		return exit.Internalf("cannot read request %s plan binding result: %s", id, err)
+		return exit.Internalf("cannot read request %s remote invocation binding result: %s", id, err)
 	}
 	if changed == 1 {
 		return nil
 	}
-	var held string
-	if err := s.db.QueryRow(`SELECT plan_id FROM requests WHERE id=?`, id).Scan(&held); err != nil {
-		return exit.Internalf("cannot read request %s plan binding: %s", id, err)
+	var heldPlan, heldPackage, heldEnvironment, heldConfig string
+	if err := s.db.QueryRow(`SELECT plan_id,package_revision_digest,environment_digest,config_digest
+		FROM requests WHERE id=?`, id).Scan(
+		&heldPlan, &heldPackage, &heldEnvironment, &heldConfig); err != nil {
+		return exit.Internalf("cannot read request %s remote invocation binding: %s", id, err)
 	}
-	if held != planID {
-		return exit.Named(exit.Conflict, "request_plan_changed",
-			"request %s already binds plan %s, not %s", id, held, planID)
+	if heldPlan != planID || heldPackage != packageRevision || heldEnvironment != environment ||
+		heldConfig != config {
+		return exit.Named(exit.Conflict, "request_invocation_identity_changed",
+			"request %s already binds a different worker-derived invocation identity", id)
 	}
 	return nil
 }
@@ -884,11 +904,14 @@ func submitRequestTx(tx *sql.Tx, r Request, assets string) (Request, bool, *exit
 		return Request{}, false, exit.Internalf("cannot read request %s: %s", r.IdemKey, err)
 	}
 	if _, err := tx.Exec(`INSERT INTO requests(id,idem_key,body_digest,package,entrypoint,
-		plan_id,payload,outputs,state,ordinal,requeues,created_at,kind,org,trees,worker,max_cost_usd_micros,install_id,assets,
+		plan_id,package_revision_digest,environment_digest,config_digest,
+		payload,outputs,state,ordinal,requeues,created_at,kind,org,trees,worker,max_cost_usd_micros,install_id,assets,
 		artifact_outputs)
-		VALUES(?,?,?,?,?,?,?,?,?,0,0,?,?,?,?,?,?,?,?,?)`,
-		r.ID, r.IdemKey, r.BodyDigest, r.Package, r.Entrypoint, r.PlanID, r.Payload,
-		r.Outputs, r.State, r.CreatedAt, r.Kind, r.Org, r.Trees, r.Worker, r.MaxCostUSDMicros, nullable(r.InstallID),
+		VALUES(?,?,?,?,?,?,?,?,?,?,?,?,0,0,?,?,?,?,?,?,?,?,?)`,
+		r.ID, r.IdemKey, r.BodyDigest, r.Package, r.Entrypoint, r.PlanID,
+		r.PackageRevisionDigest, r.EnvironmentDigest, r.ConfigDigest, r.Payload,
+		r.Outputs, r.State, r.CreatedAt, r.Kind, r.Org, r.Trees, r.Worker, r.MaxCostUSDMicros,
+		nullable(r.InstallID),
 		assets, r.ArtifactOutputs); err != nil {
 		return Request{}, false, exit.Internalf("cannot record request %s: %s", r.ID, err)
 	}

@@ -4325,9 +4325,17 @@ type PlacementStatus struct {
 	Serving                            ServingState `protobuf:"varint,13,opt,name=serving,proto3,enum=cozy.worker.v1.ServingState" json:"serving,omitempty"`
 	RetainedFallbackPlacementSetDigest []byte       `protobuf:"bytes,14,opt,name=retained_fallback_placement_set_digest,json=retainedFallbackPlacementSetDigest,proto3" json:"retained_fallback_placement_set_digest,omitempty"` // class (a): predecessor set kept for restore
 	// (#474/#485c). Empty means replacement is PAUSED.
-	Acquisition   *PlacementAcquisitionObservation `protobuf:"bytes,15,opt,name=acquisition,proto3" json:"acquisition,omitempty"` // OBSERVATION ONLY for this
-	unknownFields protoimpl.UnknownFields
-	sizeCache     protoimpl.SizeCache
+	Acquisition *PlacementAcquisitionObservation `protobuf:"bytes,15,opt,name=acquisition,proto3" json:"acquisition,omitempty"` // OBSERVATION ONLY for this
+	// placement_set_digest. Never identity, readiness,
+	// convergence, or admission authority; no acceptance gate
+	// may read it. Terminal values remain visible after
+	// STAGED/DISPATCHABLE until the next acquisition for this
+	// placement starts or the placement leaves observed state.
+	PackageRevisionDigest string `protobuf:"bytes,16,opt,name=package_revision_digest,json=packageRevisionDigest,proto3" json:"package_revision_digest,omitempty"` // exact InvocationSpec package_revision_digest
+	EnvironmentDigest     string `protobuf:"bytes,17,opt,name=environment_digest,json=environmentDigest,proto3" json:"environment_digest,omitempty"`               // exact InvocationSpec environment_digest
+	ConfigDigest          string `protobuf:"bytes,18,opt,name=config_digest,json=configDigest,proto3" json:"config_digest,omitempty"`                              // exact InvocationSpec config_digest; empty config is
+	unknownFields         protoimpl.UnknownFields
+	sizeCache             protoimpl.SizeCache
 }
 
 func (x *PlacementStatus) Reset() {
@@ -4435,6 +4443,27 @@ func (x *PlacementStatus) GetAcquisition() *PlacementAcquisitionObservation {
 		return x.Acquisition
 	}
 	return nil
+}
+
+func (x *PlacementStatus) GetPackageRevisionDigest() string {
+	if x != nil {
+		return x.PackageRevisionDigest
+	}
+	return ""
+}
+
+func (x *PlacementStatus) GetEnvironmentDigest() string {
+	if x != nil {
+		return x.EnvironmentDigest
+	}
+	return ""
+}
+
+func (x *PlacementStatus) GetConfigDigest() string {
+	if x != nil {
+		return x.ConfigDigest
+	}
+	return ""
 }
 
 // Cozy-visible proof of concurrent package/model acquisition and cache reuse. Both legs use
@@ -8563,7 +8592,7 @@ const file_cozy_worker_v1_worker_proto_rawDesc = "" +
 	"\x1faccepted_desired_state_revision\x18\x13 \x01(\x04R\x1cacceptedDesiredStateRevision\x12A\n" +
 	"\x1daccepted_placement_set_digest\x18\x14 \x01(\fR\x1aacceptedPlacementSetDigest\x12-\n" +
 	"\x12converged_revision\x18\x15 \x01(\x04R\x11convergedRevision\x12>\n" +
-	"\fworker_phase\x18\x16 \x01(\x0e2\x1b.cozy.worker.v1.WorkerPhaseR\vworkerPhaseJ\x04\b\x04\x10\x05J\x04\b\x05\x10\x06J\x04\b\x06\x10\aJ\x04\b\a\x10\bJ\x04\b\f\x10\rJ\x04\b\x0e\x10\x0fJ\x04\b\x17\x10\x18J\x04\b\x18\x10\x19J\x04\b\x19\x10\x1aR\x19applied_artifact_grant_idR\x16applied_grant_revisionR\x0fartifact_intent\"\xdb\x05\n" +
+	"\fworker_phase\x18\x16 \x01(\x0e2\x1b.cozy.worker.v1.WorkerPhaseR\vworkerPhaseJ\x04\b\x04\x10\x05J\x04\b\x05\x10\x06J\x04\b\x06\x10\aJ\x04\b\a\x10\bJ\x04\b\f\x10\rJ\x04\b\x0e\x10\x0fJ\x04\b\x17\x10\x18J\x04\b\x18\x10\x19J\x04\b\x19\x10\x1aR\x19applied_artifact_grant_idR\x16applied_grant_revisionR\x0fartifact_intent\"\xe7\x06\n" +
 	"\x0fPlacementStatus\x12!\n" +
 	"\fplacement_id\x18\x01 \x01(\tR\vplacementId\x12/\n" +
 	"\x13executor_generation\x18\x04 \x01(\x04R\x12executorGeneration\x12@\n" +
@@ -8575,7 +8604,10 @@ const file_cozy_worker_v1_worker_proto_rawDesc = "" +
 	"\x0fmaterialization\x18\f \x01(\x0e2$.cozy.worker.v1.MaterializationStateR\x0fmaterialization\x126\n" +
 	"\aserving\x18\r \x01(\x0e2\x1c.cozy.worker.v1.ServingStateR\aserving\x12R\n" +
 	"&retained_fallback_placement_set_digest\x18\x0e \x01(\fR\"retainedFallbackPlacementSetDigest\x12Q\n" +
-	"\vacquisition\x18\x0f \x01(\v2/.cozy.worker.v1.PlacementAcquisitionObservationR\vacquisitionJ\x04\b\x02\x10\x03J\x04\b\x03\x10\x04J\x04\b\x05\x10\x06\"\xa7\x01\n" +
+	"\vacquisition\x18\x0f \x01(\v2/.cozy.worker.v1.PlacementAcquisitionObservationR\vacquisition\x126\n" +
+	"\x17package_revision_digest\x18\x10 \x01(\tR\x15packageRevisionDigest\x12-\n" +
+	"\x12environment_digest\x18\x11 \x01(\tR\x11environmentDigest\x12#\n" +
+	"\rconfig_digest\x18\x12 \x01(\tR\fconfigDigestJ\x04\b\x02\x10\x03J\x04\b\x03\x10\x04J\x04\b\x05\x10\x06\"\xa7\x01\n" +
 	"\x1fPlacementAcquisitionObservation\x12C\n" +
 	"\apackage\x18\x01 \x01(\v2).cozy.worker.v1.AcquisitionLegObservationR\apackage\x12?\n" +
 	"\x05model\x18\x02 \x01(\v2).cozy.worker.v1.AcquisitionLegObservationR\x05model\"\xc9\x01\n" +
