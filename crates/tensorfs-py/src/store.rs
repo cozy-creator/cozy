@@ -23,6 +23,9 @@ use tensorfs_core::derived::{
 use tensorfs_core::err::{refuse, Code, Refusal, Result as TResult};
 use tensorfs_core::header::Header;
 use tensorfs_core::ids::{prefixed, Doc, ObjectRef};
+use tensorfs_core::ingest::source::{
+    self as model_source, ModelSourceProfile, PrepareModelSource, VerifiedModelSourceFile,
+};
 use tensorfs_core::manifest::{Entry, Manifest};
 use tensorfs_core::meta::{Hold, Meta};
 use tensorfs_core::project;
@@ -404,7 +407,12 @@ fn source_component<'p>(
 }
 
 fn receipt<'p>(py: Python<'p>, receipt: &derived::ReceiptFacts) -> PyResult<Bound<'p, PyAny>> {
-    marshal(py, &receipt.to_value())
+    let value = marshal(py, &receipt.to_value())?;
+    value.cast::<PyDict>()?.set_item(
+        "release_evidence_canonical_bytes",
+        PyBytes::new(py, &receipt.release_evidence_canonical_bytes),
+    )?;
+    Ok(value)
 }
 
 // ---------------------------------------------------------------- store
@@ -623,6 +631,68 @@ impl PyStore {
             repo,
             guard: Some(guard),
         })
+    }
+
+    /// Prepare one descriptor-reviewed foreign source entirely from verified supervisor
+    /// paths. Access URLs and credentials are outside this facade and have no argument.
+    #[allow(clippy::too_many_arguments)]
+    fn prepare_model_source<'p>(
+        &self,
+        py: Python<'p>,
+        operation_id: &str,
+        source_selection_digest: &str,
+        profiles: Vec<(String, String)>,
+        files: Vec<(String, String, u64, PathBuf)>,
+        source_uri: &str,
+        declared_license: &str,
+    ) -> PyResult<Bound<'p, PyDict>> {
+        let request = PrepareModelSource {
+            operation_id: operation_id.to_string(),
+            source_selection_digest: source_selection_digest.to_string(),
+            profiles: profiles
+                .into_iter()
+                .map(|(slot, profile)| ModelSourceProfile { slot, profile })
+                .collect(),
+            files: files
+                .into_iter()
+                .map(
+                    |(member, object_id, length, path)| VerifiedModelSourceFile {
+                        member,
+                        object_id,
+                        length,
+                        path,
+                    },
+                )
+                .collect(),
+            source_uri: source_uri.to_string(),
+            declared_license: declared_license.to_string(),
+        };
+        let prepared = py
+            .detach(|| model_source::prepare_model_source(&self.store, &request))
+            .or_refuse(py)?;
+        let out = PyDict::new(py);
+        out.set_item("replayed", prepared.replayed)?;
+        let rows = PyList::empty(py);
+        for source in prepared.sources {
+            let row = PyDict::new(py);
+            row.set_item("slot", source.slot)?;
+            row.set_item("profile", source.profile)?;
+            row.set_item("manifest_digest", source.manifest_digest)?;
+            row.set_item("manifest_length", source.manifest_length)?;
+            row.set_item(
+                "release_evidence_canonical_bytes",
+                PyBytes::new(py, &source.release_evidence_canonical_bytes),
+            )?;
+            rows.append(row)?;
+        }
+        out.set_item("sources", rows)?;
+        Ok(out)
+    }
+
+    /// Drop this operation's exact CAS holds after its prepared refs were adopted or rejected.
+    fn release_model_source(&self, py: Python<'_>, operation_id: &str) -> PyResult<()> {
+        py.detach(|| model_source::release_model_source(&self.store, operation_id))
+            .or_refuse(py)
     }
 
     fn remove_release<'p>(
@@ -1030,7 +1100,7 @@ impl PyStore {
         transaction_id: &str,
     ) -> PyResult<Bound<'p, PyDict>> {
         let result = py
-            .detach(|| derived::lookup(&self.meta, transaction_id))
+            .detach(|| derived::lookup(&self.store, &self.meta, transaction_id))
             .or_refuse(py)?;
         let out = PyDict::new(py);
         match result {
@@ -1069,7 +1139,7 @@ impl PyStore {
         transaction_id: &str,
     ) -> PyResult<Bound<'p, PyDict>> {
         let result = py
-            .detach(|| derived::abandon(&self.meta, transaction_id))
+            .detach(|| derived::abandon(&self.store, &self.meta, transaction_id))
             .or_refuse(py)?;
         let out = PyDict::new(py);
         match result {
@@ -1089,9 +1159,12 @@ impl PyStore {
         transaction_id: &str,
     ) -> PyResult<Bound<'p, PyAny>> {
         let value = py
-            .detach(|| derived::dispose(&self.meta, transaction_id))
+            .detach(|| derived::dispose(&self.store, &self.meta, transaction_id))
             .or_refuse(py)?;
-        marshal(py, &value.to_value())
+        let out = marshal(py, &value.to_value())?;
+        let out_dict = out.cast::<PyDict>()?;
+        out_dict.set_item("receipt", receipt(py, value.receipt())?)?;
+        Ok(out)
     }
 
     fn __repr__(&self) -> String {

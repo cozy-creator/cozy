@@ -169,5 +169,14 @@ try:
 except tensorfs.errors.MalformedCbor as e:
     print("typed refusal :", e.code, "|", e.detail[:60])
 
+try:
+    store.prepare_model_source(
+        "wheel-source-proof", "sha256:" + "44" * 32, [], [],
+        "hf://org/model@" + "55" * 20, "other",
+    )
+    raise AssertionError("empty model source preparation succeeded")
+except tensorfs.errors.CountCap as e:
+    print("source facade :", e.code, "| one compiled planner/executor")
+
 print("SMOKE GREEN")
 PY

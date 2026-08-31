@@ -26,6 +26,21 @@ const SCHEMA: &[(&str, &[&str])] = &[
         &["org", "name", "manifest_sha256"],
     ),
     (
+        "tensorfs_source_preparations",
+        &["operation_id", "request_digest", "state"],
+    ),
+    (
+        "tensorfs_source_results",
+        &[
+            "operation_id",
+            "slot",
+            "profile",
+            "manifest_sha256",
+            "manifest_length",
+            "release_evidence",
+        ],
+    ),
+    (
         "tensorfs_verified_blobs",
         &["sha256", "length", "dev", "ino", "mtime_s", "mtime_ns"],
     ),
@@ -99,6 +114,20 @@ fn verify_schema(connection: &Connection) -> Result<()> {
 #[derive(Debug, Clone)]
 pub struct Catalog {
     path: PathBuf,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SourcePreparationResult {
+    pub slot: String,
+    pub profile: String,
+    pub manifest_sha256: String,
+    pub manifest_length: u64,
+    pub release_evidence: Vec<u8>,
+}
+
+pub enum SourcePreparation {
+    Open(WriterGuard),
+    Prepared(Vec<SourcePreparationResult>),
 }
 
 impl Catalog {
@@ -215,6 +244,20 @@ impl Catalog {
                  CREATE TABLE tensorfs_derived_transactions (
                    id TEXT PRIMARY KEY,
                    bytes BLOB NOT NULL
+                 ) STRICT;
+                 CREATE TABLE tensorfs_source_preparations (
+                   operation_id TEXT PRIMARY KEY REFERENCES tensorfs_operations(id) ON DELETE CASCADE,
+                   request_digest TEXT NOT NULL,
+                   state TEXT NOT NULL CHECK (state IN ('open','prepared'))
+                 ) STRICT;
+                 CREATE TABLE tensorfs_source_results (
+                   operation_id TEXT NOT NULL REFERENCES tensorfs_source_preparations(operation_id) ON DELETE CASCADE,
+                   slot TEXT NOT NULL,
+                   profile TEXT NOT NULL,
+                   manifest_sha256 TEXT NOT NULL,
+                   manifest_length INTEGER NOT NULL,
+                   release_evidence BLOB NOT NULL,
+                   PRIMARY KEY (operation_id,slot)
                  ) STRICT;
                  CREATE TABLE tensorfs_verified_blobs (
                    sha256 TEXT PRIMARY KEY,
@@ -356,6 +399,190 @@ impl Catalog {
             .commit()
             .map_err(|error| sql("commit operation resume", error))?;
         Ok(guard)
+    }
+
+    /// Open or replay one model-source preparation. Its semantic request is represented by
+    /// one digest only; typed callers retain the fields and re-derive that digest on retry.
+    /// URL/capability facts therefore have no column to leak into.
+    pub fn begin_source_preparation(
+        &self,
+        operation: &str,
+        request_digest: &str,
+        now: u64,
+    ) -> Result<SourcePreparation> {
+        crate::ids::ascii_name(
+            "source preparation operation",
+            operation,
+            crate::limits::MAX_NAME_BYTES,
+        )?;
+        let request_digest = crate::ids::prefixed("source preparation request", request_digest)?;
+        let guard =
+            self.resume_operation(operation, "_tensorfs", "model-source-preparation", now)?;
+        let connection = self.connection()?;
+        let existing = connection.query_row(
+            "SELECT request_digest,state FROM tensorfs_source_preparations WHERE operation_id=?1",
+            [operation],
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+        );
+        let state = match existing {
+            Ok((digest, state)) => {
+                if digest != request_digest {
+                    return refuse(
+                        Code::TRANSACTION_CONFLICT,
+                        "same model-source operation id binds a different request",
+                    );
+                }
+                state
+            }
+            Err(rusqlite::Error::QueryReturnedNoRows) => {
+                connection
+                    .execute(
+                        "INSERT INTO tensorfs_source_preparations(operation_id,request_digest,state)
+                         VALUES (?1,?2,'open')",
+                        params![operation, request_digest],
+                    )
+                    .map_err(|error| sql("record source preparation", error))?;
+                "open".to_string()
+            }
+            Err(error) => return Err(sql("read source preparation", error)),
+        };
+        if state == "prepared" {
+            drop(guard);
+            Ok(SourcePreparation::Prepared(
+                self.source_preparation_results(operation)?,
+            ))
+        } else {
+            Ok(SourcePreparation::Open(guard))
+        }
+    }
+
+    fn source_preparation_results(&self, operation: &str) -> Result<Vec<SourcePreparationResult>> {
+        let connection = self.connection()?;
+        let mut statement = connection
+            .prepare(
+                "SELECT slot,profile,manifest_sha256,manifest_length,release_evidence
+                 FROM tensorfs_source_results WHERE operation_id=?1 ORDER BY slot",
+            )
+            .map_err(|error| sql("prepare source results", error))?;
+        let rows = statement
+            .query_map([operation], |row| {
+                Ok(SourcePreparationResult {
+                    slot: row.get(0)?,
+                    profile: row.get(1)?,
+                    manifest_sha256: row.get(2)?,
+                    manifest_length: row.get(3)?,
+                    release_evidence: row.get(4)?,
+                })
+            })
+            .map_err(|error| sql("read source results", error))?
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(|error| sql("collect source results", error))?;
+        Ok(rows)
+    }
+
+    /// Publish all prepared refs to replay readers in one SQLite commit. CAS bytes and exact
+    /// holds may precede this transaction; no partial row set can become visible.
+    pub fn commit_source_preparation(
+        &self,
+        operation: &str,
+        request_digest: &str,
+        results: &[SourcePreparationResult],
+    ) -> Result<()> {
+        if results.is_empty() {
+            return refuse(
+                Code::MISSING_FIELD,
+                "source preparation produced no profiles",
+            );
+        }
+        if results.windows(2).any(|pair| pair[0].slot >= pair[1].slot) {
+            return refuse(
+                Code::SORT_ORDER,
+                "source preparation results must be sorted uniquely by slot",
+            );
+        }
+        for result in results {
+            crate::ids::ascii_name(
+                "source preparation slot",
+                &result.slot,
+                crate::limits::MAX_NAME_BYTES,
+            )?;
+            crate::ids::ascii_name(
+                "source preparation profile",
+                &result.profile,
+                crate::limits::MAX_KEY_BYTES,
+            )?;
+            crate::ids::hex64("source preparation manifest", &result.manifest_sha256)?;
+            if result.manifest_length == 0 {
+                return refuse(
+                    Code::LENGTH_MISMATCH,
+                    "source preparation Manifest has zero length",
+                );
+            }
+            crate::repository::ReleaseEvidence::parse(&result.release_evidence)?;
+        }
+        let request_digest = crate::ids::prefixed("source preparation request", request_digest)?;
+        let mut connection = self.connection()?;
+        let transaction = connection
+            .transaction()
+            .map_err(|error| sql("begin source preparation commit", error))?;
+        let (stored, state): (String, String) = transaction
+            .query_row(
+                "SELECT request_digest,state FROM tensorfs_source_preparations WHERE operation_id=?1",
+                [operation],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .map_err(|error| sql("read source preparation before commit", error))?;
+        if stored != request_digest || state != "open" {
+            return refuse(
+                Code::TRANSACTION_CONFLICT,
+                "source preparation changed before result commit",
+            );
+        }
+        for result in results {
+            transaction
+                .execute(
+                    "INSERT INTO tensorfs_source_results
+                     (operation_id,slot,profile,manifest_sha256,manifest_length,release_evidence)
+                     VALUES (?1,?2,?3,?4,?5,?6)",
+                    params![
+                        operation,
+                        result.slot,
+                        result.profile,
+                        result.manifest_sha256,
+                        result.manifest_length,
+                        result.release_evidence,
+                    ],
+                )
+                .map_err(|error| sql("insert source result", error))?;
+        }
+        transaction
+            .execute(
+                "UPDATE tensorfs_source_preparations SET state='prepared' WHERE operation_id=?1",
+                [operation],
+            )
+            .map_err(|error| sql("mark source preparation complete", error))?;
+        transaction
+            .commit()
+            .map_err(|error| sql("commit source preparation", error))
+    }
+
+    /// Explicit lifecycle release. Acquiring the operation writer lock first prevents a
+    /// caller from dropping holds under an in-flight preparation.
+    pub fn release_source_preparation(&self, operation: &str, now: u64) -> Result<()> {
+        let count: u64 = self
+            .connection()?
+            .query_row(
+                "SELECT count(*) FROM tensorfs_source_preparations WHERE operation_id=?1",
+                [operation],
+                |row| row.get(0),
+            )
+            .map_err(|error| sql("find source preparation for release", error))?;
+        if count != 1 {
+            return refuse(Code::ROOT_ABSENT, "model-source preparation is absent");
+        }
+        let _guard =
+            self.resume_operation(operation, "_tensorfs", "model-source-preparation", now)?;
+        self.complete_operation(operation)
     }
 
     /// Hold SQLite's short writer transaction across the filesystem repository replacement.
@@ -736,7 +963,7 @@ mod tests {
     }
 
     #[test]
-    fn catalog_has_five_tables_and_refuses_future_versions_without_mutation() {
+    fn catalog_has_seven_tables_and_refuses_future_versions_without_mutation() {
         let root = temporary("schema");
         fs::create_dir_all(&root).unwrap();
         let catalog = Catalog::initialize(&root).unwrap();
@@ -761,6 +988,8 @@ mod tests {
                 "tensorfs_holds",
                 "tensorfs_operations",
                 "tensorfs_released_manifests",
+                "tensorfs_source_preparations",
+                "tensorfs_source_results",
                 "tensorfs_verified_blobs",
             ]
         );

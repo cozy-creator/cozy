@@ -889,6 +889,7 @@ pub(crate) struct TransactionRow {
     pub(crate) inherited_payload_bytes: u64,
     pub(crate) header: Option<ObjectRef>,
     pub(crate) manifest: Option<ObjectRef>,
+    pub(crate) release_evidence: Option<Vec<u8>>,
 }
 
 fn part_value(part: &Part) -> Value {
@@ -1034,6 +1035,22 @@ impl TransactionRow {
             .opt("manifest")
             .map(|v| ObjectRef::from_value("DerivedTransaction.manifest", v))
             .transpose()?;
+        let release_evidence = f
+            .opt("release_evidence")
+            .map(|value| {
+                let bytes = as_str("DerivedTransaction", "release_evidence", value)?
+                    .as_bytes()
+                    .to_vec();
+                let evidence = crate::repository::ReleaseEvidence::parse(&bytes)?;
+                if evidence.ingest.is_some() || evidence.verification.is_some() {
+                    return refuse(
+                        Code::UNKNOWN_FIELD,
+                        "derived ReleaseEvidence cannot claim foreign ingest or verification",
+                    );
+                }
+                Ok(bytes)
+            })
+            .transpose()?;
         let disposition = match f.opt("disposition") {
             None => None,
             Some(value) => {
@@ -1123,6 +1140,7 @@ impl TransactionRow {
             inherited_payload_bytes,
             header,
             manifest,
+            release_evidence,
         };
         let before_parts = row.added_parts.clone();
         let before_configs = row.added_configs.clone();
@@ -1148,6 +1166,7 @@ impl TransactionRow {
                 if row.declaration.is_none()
                     || row.header.is_some()
                     || row.manifest.is_some()
+                    || row.release_evidence.is_some()
                     || row.inherited_payload_objects != 0
                     || row.inherited_payload_bytes != 0
                 {
@@ -1162,6 +1181,7 @@ impl TransactionRow {
                     || row.current_session.is_some()
                     || row.header.is_none()
                     || row.manifest.is_none()
+                    || row.release_evidence.is_none()
                     || row.inherited_payload_objects > limits::MAX_TOTAL_REFS as u64
                     || row.inherited_payload_bytes > limits::MAX_TOTAL_BYTES
                 {
@@ -1175,6 +1195,7 @@ impl TransactionRow {
                 if row.current_session.is_some()
                     || row.header.is_some()
                     || row.manifest.is_some()
+                    || row.release_evidence.is_some()
                     || !row.added_parts.is_empty()
                     || !row.added_configs.is_empty()
                     || row.inherited_payload_objects != 0
@@ -1281,6 +1302,15 @@ impl TransactionRow {
         }
         if let Some(manifest) = &self.manifest {
             fields.push(("manifest".to_string(), manifest.to_value()));
+        }
+        if let Some(evidence) = &self.release_evidence {
+            fields.push((
+                "release_evidence".to_string(),
+                Value::str(
+                    String::from_utf8(evidence.clone())
+                        .expect("canonical ReleaseEvidence is UTF-8"),
+                ),
+            ));
         }
         if let TransactionState::Committed(disposition) = &self.state {
             let value = match disposition {
@@ -2066,6 +2096,7 @@ pub fn begin(
                 inherited_payload_bytes: 0,
                 header: None,
                 manifest: None,
+                release_evidence: None,
             });
             Ok(())
         }
@@ -2342,6 +2373,7 @@ pub struct ReceiptFacts {
     pub added_objects: Vec<ObjectRef>,
     pub inherited_payload_objects: u64,
     pub inherited_payload_bytes: u64,
+    pub release_evidence_canonical_bytes: Vec<u8>,
 }
 
 impl ReceiptFacts {
@@ -2363,6 +2395,13 @@ impl ReceiptFacts {
                 ]),
             ),
             ("manifest", self.manifest.to_value()),
+            (
+                "release_evidence_canonical_bytes",
+                Value::str(
+                    String::from_utf8(self.release_evidence_canonical_bytes.clone())
+                        .expect("canonical ReleaseEvidence is UTF-8"),
+                ),
+            ),
             (
                 "sources",
                 Value::arr(
@@ -2433,7 +2472,7 @@ fn inherit_observation(header: &Header, row: &TransactionRow) -> Result<(usize, 
     Ok((inherited.len(), bytes))
 }
 
-fn receipt_from(row: &TransactionRow) -> Result<ReceiptFacts> {
+fn receipt_from(store: &Store, row: &TransactionRow) -> Result<ReceiptFacts> {
     let declaration = declaration(row)?;
     let header = row.header.clone().ok_or_else(|| Refusal {
         code: Code::ARTIFACT_INCOMPLETE,
@@ -2443,6 +2482,24 @@ fn receipt_from(row: &TransactionRow) -> Result<ReceiptFacts> {
         code: Code::ARTIFACT_INCOMPLETE,
         detail: format!("committed transaction {} has no manifest", row.id),
     })?;
+    let release_evidence_canonical_bytes = row.release_evidence.clone().ok_or_else(|| Refusal {
+        code: Code::ARTIFACT_INCOMPLETE,
+        detail: format!("committed transaction {} has no ReleaseEvidence", row.id),
+    })?;
+    let evidence = crate::repository::ReleaseEvidence::parse(&release_evidence_canonical_bytes)?;
+    if evidence.ingest.is_some() || evidence.verification.is_some() {
+        return refuse(
+            Code::UNKNOWN_FIELD,
+            "derived ReleaseEvidence cannot claim foreign ingest or verification",
+        );
+    }
+    let header_bytes = checkpoint::load_header(store, &header)?;
+    if evidence.classification_digest != header_bytes.topology_digest() {
+        return refuse(
+            Code::TOPOLOGY_MISMATCH,
+            "derived ReleaseEvidence classification differs from its final header",
+        );
+    }
     Ok(ReceiptFacts {
         transaction: row.id.clone(),
         declaration,
@@ -2452,6 +2509,7 @@ fn receipt_from(row: &TransactionRow) -> Result<ReceiptFacts> {
         added_objects: added_objects(row),
         inherited_payload_objects: row.inherited_payload_objects,
         inherited_payload_bytes: row.inherited_payload_bytes,
+        release_evidence_canonical_bytes,
     })
 }
 
@@ -2493,15 +2551,23 @@ pub fn commit(
             "the addition set changed while commit constructed the target; retry commit",
         );
     }
+    let release_evidence = crate::repository::ReleaseEvidence {
+        classification_digest: header.topology_digest(),
+        ingest: None,
+        verification: None,
+    }
+    .canonical_bytes();
+    crate::repository::ReleaseEvidence::parse(&release_evidence)?;
     row.state = TransactionState::Committed(Disposition::Pending);
     row.current_session = None;
     row.header = Some(header_ref);
     row.manifest = Some(manifest_ref);
     row.inherited_payload_objects = inherited_payload_objects as u64;
     row.inherited_payload_bytes = inherited_payload_bytes;
+    row.release_evidence = Some(release_evidence);
     let committed = row.clone();
     txn.commit()?;
-    receipt_from(&committed)
+    receipt_from(store, &committed)
 }
 
 #[derive(Debug, Clone)]
@@ -2512,7 +2578,7 @@ pub enum Lookup {
     Abandoned,
 }
 
-pub fn lookup(meta: &Meta, transaction: &str) -> Result<Lookup> {
+pub fn lookup(store: &Store, meta: &Meta, transaction: &str) -> Result<Lookup> {
     let transaction = transaction_id(transaction)?;
     let rows = meta.derived_rows()?;
     let Some(row) = rows.iter().find(|row| row.id == transaction) else {
@@ -2522,7 +2588,9 @@ pub fn lookup(meta: &Meta, transaction: &str) -> Result<Lookup> {
         TransactionState::Open => Ok(Lookup::Open {
             writer_session: row.current_session,
         }),
-        TransactionState::Committed(_) => Ok(Lookup::Committed(Box::new(receipt_from(row)?))),
+        TransactionState::Committed(_) => {
+            Ok(Lookup::Committed(Box::new(receipt_from(store, row)?)))
+        }
         TransactionState::Abandoned => Ok(Lookup::Abandoned),
     }
 }
@@ -2548,7 +2616,7 @@ pub fn fence(meta: &Meta, transaction: &str, writer_session: u64) -> Result<bool
     Ok(true)
 }
 
-pub fn abandon(meta: &Meta, transaction: &str) -> Result<Option<ReceiptFacts>> {
+pub fn abandon(store: &Store, meta: &Meta, transaction: &str) -> Result<Option<ReceiptFacts>> {
     let transaction = transaction_id(transaction)?;
     let mut txn = meta.txn()?;
     let result = match txn.rows.iter_mut().find(|row| row.id == transaction) {
@@ -2566,6 +2634,7 @@ pub fn abandon(meta: &Meta, transaction: &str) -> Result<Option<ReceiptFacts>> {
                 inherited_payload_bytes: 0,
                 header: None,
                 manifest: None,
+                release_evidence: None,
             });
             None
         }
@@ -2591,7 +2660,7 @@ pub fn abandon(meta: &Meta, transaction: &str) -> Result<Option<ReceiptFacts>> {
     };
     if let Some(row) = result {
         drop(txn);
-        return Ok(Some(receipt_from(&row)?));
+        return Ok(Some(receipt_from(store, &row)?));
     }
     txn.commit()?;
     Ok(None)
@@ -2614,9 +2683,13 @@ impl DispositionResult {
             ("receipt", self.receipt.to_value()),
         ])
     }
+
+    pub fn receipt(&self) -> &ReceiptFacts {
+        &self.receipt
+    }
 }
 
-pub fn dispose(meta: &Meta, transaction: &str) -> Result<DispositionResult> {
+pub fn dispose(store: &Store, meta: &Meta, transaction: &str) -> Result<DispositionResult> {
     let transaction = transaction_id(transaction)?;
     let mut txn = meta.txn()?;
     let index = txn
@@ -2638,7 +2711,7 @@ pub fn dispose(meta: &Meta, transaction: &str) -> Result<DispositionResult> {
             let row = txn.rows[index].clone();
             drop(txn);
             return Ok(DispositionResult {
-                receipt: receipt_from(&row)?,
+                receipt: receipt_from(store, &row)?,
                 disposition: desired,
             });
         }
@@ -2660,7 +2733,7 @@ pub fn dispose(meta: &Meta, transaction: &str) -> Result<DispositionResult> {
     let row = txn.rows[index].clone();
     txn.commit()?;
     Ok(DispositionResult {
-        receipt: receipt_from(&row)?,
+        receipt: receipt_from(store, &row)?,
         disposition: desired,
     })
 }

@@ -249,7 +249,7 @@ checksum = "adb6935a6f5c20170eeceb1a3835a49e12e19d792f6dd344ccc76a985ca5a6ca"
 
 [[package]]
 name = "tensorfs-core"
-version = "0.0.4"
+version = "0.0.5"
 dependencies = [
  "fs2",
  "minicbor",
@@ -258,7 +258,7 @@ dependencies = [
 
 [[package]]
 name = "tensorfs-py"
-version = "0.0.4"
+version = "0.0.5"
 dependencies = [
  "pyo3",
  "tensorfs-core",

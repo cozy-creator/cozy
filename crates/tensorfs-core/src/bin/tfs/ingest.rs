@@ -27,20 +27,20 @@ use tensorfs_core::canon::{self, as_arr, as_str, Fields, Value};
 use tensorfs_core::checkpoint as ck;
 use tensorfs_core::dtype::Dtype;
 use tensorfs_core::err::Code;
-use tensorfs_core::header::{topology_digest_of, topology_value};
+use tensorfs_core::header::topology_digest_of;
 use tensorfs_core::ids::{ConfigRef, ObjectRef, Plain};
 use tensorfs_core::ingest::carrier::{self, SourceHeader};
-use tensorfs_core::ingest::convert::{self, Class, Converter, Effect, Plan, Rekey, Source, Target};
+use tensorfs_core::ingest::convert::{self, Class, Effect, Rekey, Source, Target};
 use tensorfs_core::ingest::fingerprint::{
-    self, Banked, Fingerprint, FingerprintRegistry, SourceProfile, SourceProfileComponent,
+    self, Banked, FingerprintRegistry, SourceProfile, SourceProfileComponent,
 };
+use tensorfs_core::ingest::source as source_core;
 use tensorfs_core::ingest::stamp::{self, Stamp};
-use tensorfs_core::ingest::transaction::{self as tx, SourceFile};
+use tensorfs_core::ingest::transaction::{self as tx};
 use tensorfs_core::ingest::{Evidence, IngestProfile, IngestSubject, IngestVerificationReceipt};
 use tensorfs_core::limits;
 use tensorfs_core::manifest::{Draft, Entry};
 use tensorfs_core::registry;
-use tensorfs_core::spec::EncodingSpec;
 use tensorfs_core::store::Store;
 use tensorfs_core::structure::{Provenance, REAL};
 
@@ -82,11 +82,7 @@ fn sources(f: &Flags) -> Result<Vec<(String, PathBuf)>, ExitCode> {
 
 /// Physical carriers for source-plan. A reviewed canonical member may disambiguate
 /// equal headers; paths are locations only and never participate in classification.
-#[derive(Clone, PartialEq, Eq)]
-struct CarrierInput {
-    member: Option<String>,
-    path: PathBuf,
-}
+type CarrierInput = source_core::CarrierInput;
 
 fn carriers(f: &Flags) -> Result<Vec<CarrierInput>, ExitCode> {
     let mut out = Vec::new();
@@ -131,73 +127,8 @@ fn carriers(f: &Flags) -> Result<Vec<CarrierInput>, ExitCode> {
     Ok(out)
 }
 
-/// A carrier's exact source identity, without reading its 5 GB of body.
-///
-/// The header pins every key, dtype, shape and offset in the file, so a digest over the
-/// header bytes plus the file length names the exact generation. Hashing the whole artifact
-/// would be a stronger claim and a pointless one: the border is about to hash every byte it
-/// actually admits, and the ones it does not admit are not part of this identity.
-fn source_digest(h: &SourceHeader, raw_header: &[u8]) -> String {
-    tensorfs_core::ids::object_id(&canon::write(&Value::obj(vec![
-        (
-            "carrier_header_sha256",
-            Value::str(tensorfs_core::sha256::hex_digest(raw_header)),
-        ),
-        ("data_start", Value::uint(h.data_start)),
-        ("file_len", Value::uint(h.file_len)),
-        ("tensors", Value::uint(h.tensors.len() as u64)),
-    ])))
-}
-
-/// A committed header JSON — REAL evidence with no artifact behind it (the shipped H3 DiT
-/// inventory is 66 GB; its header is 486 KiB and is what the repo actually has). It goes
-/// through the exact same strict decoder, with the data region reconstructed from the
-/// declared geometry, so the evidence is decoded by the code that decodes artifacts.
-fn read_header_only(p: &Path) -> tensorfs_core::err::Result<(SourceHeader, Vec<u8>)> {
-    let json = fs::read(p).map_err(|e| tensorfs_core::err::Refusal {
-        code: tensorfs_core::err::Code::IO_FAILED,
-        detail: format!("read {}: {e}", p.display()),
-    })?;
-    let data_start = json.len() as u64 + 8;
-    let h = carrier::parse_header(&json, data_start, None)?;
-    let mut raw = (json.len() as u64).to_le_bytes().to_vec();
-    raw.extend_from_slice(&json);
-    Ok((h, raw))
-}
-
-/// Read a carrier header AND keep its exact bytes, for the identity above. A
-/// `*.index.json` is a SHARDED carrier (the official H3 trees ship 13/14-shard
-/// components) and decodes through `read_sharded` — every single-file law per shard,
-/// exact weight_map cover both directions, virtual joined offsets. Any other `.json` is
-/// committed header evidence.
-fn read_carrier(p: &Path) -> tensorfs_core::err::Result<(SourceHeader, Vec<u8>)> {
-    if p.file_name()
-        .and_then(|n| n.to_str())
-        .map(|n| n.ends_with(".index.json"))
-        .unwrap_or(false)
-    {
-        return carrier::read_sharded(p);
-    }
-    if p.extension().map(|e| e == "json").unwrap_or(false) {
-        return read_header_only(p);
-    }
-    let h = carrier::read_header(p)?;
-    let mut f = fs::File::open(p).map_err(|e| tensorfs_core::err::Refusal {
-        code: tensorfs_core::err::Code::IO_FAILED,
-        detail: format!("reopen {}: {e}", p.display()),
-    })?;
-    let mut raw = vec![0u8; h.header_bytes as usize + 8];
-    f.read_exact(&mut raw)
-        .map_err(|e| tensorfs_core::err::Refusal {
-            code: tensorfs_core::err::Code::IO_FAILED,
-            detail: format!("reread header of {}: {e}", p.display()),
-        })?;
-    Ok((h, raw))
-}
-
-const BUILTIN_REGISTRY: &str = "builtin:fingerprint-registry/1";
-const BUILTIN_REGISTRY_BYTES: &[u8] =
-    include_bytes!("../../../../../vectors/fingerprints/registry.json");
+const BUILTIN_REGISTRY: &str = source_core::BUILTIN_REGISTRY;
+const BUILTIN_REGISTRY_BYTES: &[u8] = source_core::BUILTIN_REGISTRY_BYTES;
 
 fn registry_bytes(f: &Flags) -> Result<(String, Vec<u8>), ExitCode> {
     let Some(path) = flag(f, "registry") else {
@@ -251,74 +182,6 @@ fn load_registry(f: &Flags) -> Result<FingerprintRegistry, ExitCode> {
             Err(ExitCode::FAILURE)
         }
     }
-}
-
-/// alias -> the CANDIDATE SET it names. An alias that groups several physical variants (the
-/// two `fp8-rowwise/1` scale geometries, the two `fp8-scaled-scalar/1` role sets one real
-/// artifact carries) contributes all of them: the alias is no longer ambiguous at the
-/// component, because selection happens per TENSOR from the siblings the carrier supplies.
-/// `--spec-variant` still pins ONE, which is exactly the old single-spec path.
-fn specs_of(
-    alias: &str,
-    variant: Option<usize>,
-) -> tensorfs_core::err::Result<Vec<registry::Seed>> {
-    let hits: Vec<registry::Seed> = registry::seeds()
-        .into_iter()
-        .filter(|s| s.alias == alias)
-        .collect();
-    match (hits.len(), variant) {
-        (0, _) => tensorfs_core::err::refuse(
-            tensorfs_core::err::Code::UNKNOWN_ENCODING,
-            format!("{alias:?} is not a platform alias"),
-        ),
-        (n, Some(i)) if i < n => Ok(vec![hits.into_iter().nth(i).unwrap()]),
-        (n, Some(i)) => tensorfs_core::err::refuse(
-            tensorfs_core::err::Code::UNKNOWN_ENCODING,
-            format!("{alias:?} groups {n} specs; --spec-variant {i} names none of them"),
-        ),
-        (_, None) => Ok(hits),
-    }
-}
-
-fn specs_for(t: &Target, f: &Flags) -> Result<Vec<(String, registry::Seed)>, ExitCode> {
-    let variant: Option<usize> = flag(f, "spec-variant").and_then(|s| s.parse().ok());
-    // plain/1 is always resolved: a real component is MIXED, and the tensors its producer's
-    // eligibility predicate skipped are plain storage beside the encoded ones.
-    let mut out: Vec<(String, registry::Seed)> = match specs_of("plain/1", None) {
-        Ok(s) => s.into_iter().map(|s| ("plain/1".to_string(), s)).collect(),
-        Err(e) => return Err(bail(e)),
-    };
-    for (_, alias) in &t.components {
-        if out.iter().any(|(a, _)| a == alias) {
-            continue;
-        }
-        match specs_of(alias, variant) {
-            Ok(v) => out.extend(v.into_iter().map(|s| (alias.clone(), s))),
-            Err(e) => return Err(bail(e)),
-        }
-    }
-    Ok(out)
-}
-
-/// The (alias, spec) view the planner and executor take.
-fn plain_specs(seeds: &[(String, registry::Seed)]) -> Vec<(String, EncodingSpec)> {
-    seeds
-        .iter()
-        .map(|(a, s)| (a.clone(), s.spec.clone()))
-        .collect()
-}
-
-/// The projected topology of a PLAN — computable before a byte moves, which is what lets a
-/// profile pin the exact result the conversion must produce.
-fn plan_topology(p: &Plan) -> Value {
-    topology_value(p.ops.iter().map(|o| {
-        (
-            o.component.as_str(),
-            o.out_key.as_str(),
-            o.logical_dtype,
-            o.logical_shape.as_slice(),
-        )
-    }))
 }
 
 // ------------------------------------------------------------------ marker evidence
@@ -429,7 +292,7 @@ pub fn cmd_inspect(f: &Flags) -> ExitCode {
 
     for (component, path) in &srcs {
         println!("{component}  {}", path.display());
-        let (h, raw) = ok!(read_carrier(path));
+        let (h, raw) = ok!(source_core::read_carrier(path));
         total_header += h.header_bytes;
         let fp = ok!(fingerprint::fingerprint(component, &h));
         let stamps = ok!(fingerprint::evidence_stamps(&h));
@@ -453,7 +316,7 @@ pub fn cmd_inspect(f: &Flags) -> ExitCode {
         println!("  declared     {} B of tensor bytes", h.declared_bytes());
         println!("  keyset       {}", fp.keyset_digest);
         println!("  topology     {}", fp.topology_digest);
-        println!("  source       {}", source_digest(&h, &raw));
+        println!("  source       {}", source_core::source_digest(&h, &raw));
         if !stamps.is_empty() {
             for (k, v) in &stamps {
                 println!("  stamp        {k} = {v:?}");
@@ -541,14 +404,14 @@ pub fn cmd_bank(
     };
     let mut reviewed = Vec::new();
     for (component, path) in &srcs {
-        let (full, raw) = ok!(read_carrier(path));
+        let (full, raw) = ok!(source_core::read_carrier(path));
         let h = if conv.name == "single_file.identity/1" {
             ok!(convert::single_file_component(component, &full))
         } else {
             full
         };
         let fp = ok!(fingerprint::fingerprint(component, &h));
-        let sd = source_digest(&h, &raw);
+        let sd = source_core::source_digest(&h, &raw);
         reg.merge(Banked {
             keyset_digest: fp.keyset_digest.clone(),
             dialect: dialect.to_string(),
@@ -679,9 +542,10 @@ pub fn cmd_bank(
             .map(|component| format!("{}={}", component.component, component.target_encoding))
             .collect::<Vec<_>>()
             .join(",");
-        let mut prepared = match prepare_with_registry(f, &target, &srcs, &reg) {
+        let variant = flag(f, "spec-variant").and_then(|value| value.parse().ok());
+        let mut prepared = match source_core::prepare_with_registry(&target, &srcs, &reg, variant) {
             Ok(prepared) => prepared,
-            Err(code) => return code,
+            Err(error) => return bail(error),
         };
         if let Err(error) = prepared.plan.apply_order(&order) {
             return bail(error);
@@ -714,290 +578,19 @@ pub fn cmd_bank(
 
 // ------------------------------------------------------------------ closed source plan
 
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum CarrierUse {
-    Unused,
-    Whole,
-    Projected,
-}
-
-#[derive(Clone)]
-struct SourceAssignment {
-    component: String,
-    carrier: usize,
-    projected: bool,
-}
-
-fn enumerate_assignments(
-    index: usize,
-    candidates: &[Vec<(usize, bool)>],
-    uses: &mut [CarrierUse],
-    current: &mut Vec<SourceAssignment>,
-    components: &[SourceProfileComponent],
-    solutions: &mut Vec<Vec<SourceAssignment>>,
-) {
-    if solutions.len() >= 2 {
-        return;
-    }
-    if index == candidates.len() {
-        // Provider metadata may offer several variants. Classification chooses the one exact
-        // reviewed subset; forcing every candidate into the result would make the provider
-        // adapter guess by filename before TensorFS has examined the headers.
-        solutions.push(current.clone());
-        return;
-    }
-    for (carrier, projected) in &candidates[index] {
-        let prior = uses[*carrier];
-        let allowed = if *projected {
-            matches!(prior, CarrierUse::Unused | CarrierUse::Projected)
-        } else {
-            prior == CarrierUse::Unused
-        };
-        if !allowed {
-            continue;
-        }
-        uses[*carrier] = if *projected {
-            CarrierUse::Projected
-        } else {
-            CarrierUse::Whole
-        };
-        current.push(SourceAssignment {
-            component: components[index].component.clone(),
-            carrier: *carrier,
-            projected: *projected,
-        });
-        enumerate_assignments(index + 1, candidates, uses, current, components, solutions);
-        current.pop();
-        uses[*carrier] = prior;
-    }
-}
-
-fn profile_assignments(
-    profile: &SourceProfile,
-    registry: &FingerprintRegistry,
-    carriers: &[CarrierInput],
-    headers: &[SourceHeader],
-) -> Vec<Vec<SourceAssignment>> {
-    let mut candidates = Vec::new();
-    for component in &profile.components {
-        let Some(entry) = registry.entries.iter().find(|entry| {
-            entry.component == component.component && entry.keyset_digest == component.keyset_digest
-        }) else {
-            return Vec::new();
-        };
-        let projected = entry.converter == "single_file.identity/1";
-        let mut hits = Vec::new();
-        for (index, header) in headers.iter().enumerate() {
-            if component.source_member != carriers[index].member {
-                continue;
-            }
-            let view = if projected {
-                match convert::single_file_component(&component.component, header) {
-                    Ok(view) => view,
-                    Err(_) => continue,
-                }
-            } else {
-                header.clone()
-            };
-            let fingerprint = match fingerprint::fingerprint(&component.component, &view) {
-                Ok(fingerprint) => fingerprint,
-                Err(_) => continue,
-            };
-            if fingerprint.keyset_digest == component.keyset_digest
-                && fingerprint.topology_digest == entry.topology_digest
-                && fingerprint.logical_keys as u64 == entry.logical_keys
-            {
-                hits.push((index, projected));
-            }
-        }
-        if hits.is_empty() {
-            return Vec::new();
-        }
-        candidates.push(hits);
-    }
-    let mut solutions = Vec::new();
-    enumerate_assignments(
-        0,
-        &candidates,
-        &mut vec![CarrierUse::Unused; headers.len()],
-        &mut Vec::new(),
-        &profile.components,
-        &mut solutions,
-    );
-    solutions
-}
-
-/// Classify exact carrier headers plus optional reviewed members against whole-source facts and emit the
-/// sole machine input for the existing prepare/run path. A physical path is never a
-/// classification fact. If two assignments survive, no tie-break exists here.
 fn derive_source_plan(f: &Flags) -> Result<Value, ExitCode> {
-    let paths = carriers(f)?;
+    let carriers = carriers(f)?;
     let (registry_locator, registry_bytes) = registry_bytes(f)?;
-    let registry = match FingerprintRegistry::parse(&registry_bytes) {
-        Ok(registry) => registry,
-        Err(error) => return Err(bail(error)),
-    };
-    if registry.source_profiles.is_empty() {
-        eprintln!("REFUSED UNREGISTERED_FINGERPRINT: the reviewed registry has no source profiles");
-        return Err(ExitCode::FAILURE);
-    }
-    let mut headers = Vec::new();
-    for carrier in &paths {
-        match read_carrier(&carrier.path) {
-            Ok((header, _)) => headers.push(header),
-            Err(error) => return Err(bail(error)),
-        }
-    }
-
-    let requested_profile = flag(f, "source-profile");
-    if let Some(name) = requested_profile {
-        if !registry
-            .source_profiles
-            .iter()
-            .any(|profile| profile.name == name)
-        {
-            eprintln!(
-                "REFUSED UNREGISTERED_FINGERPRINT: reviewed source profile {name:?} is absent"
-            );
-            return Err(ExitCode::FAILURE);
-        }
-    }
-    let mut matches = Vec::new();
-    for profile in &registry.source_profiles {
-        if requested_profile.is_some_and(|name| name != profile.name) {
-            continue;
-        }
-        for assignments in profile_assignments(profile, &registry, &paths, &headers) {
-            matches.push((profile, assignments));
-            if matches.len() >= 2 {
-                break;
-            }
-        }
-        if matches.len() >= 2 {
-            break;
-        }
-    }
-    if matches.is_empty() {
-        eprintln!(
-            "REFUSED UNREGISTERED_FINGERPRINT: carrier set matches no reviewed source profile"
-        );
-        return Err(ExitCode::FAILURE);
-    }
-    if matches.len() != 1 {
-        let profiles: Vec<&str> = matches
-            .iter()
-            .map(|(profile, _)| profile.name.as_str())
-            .collect();
-        eprintln!(
-            "REFUSED AMBIGUOUS_CLASSIFICATION: carrier headers admit multiple component assignments in profiles {profiles:?}; exact provider member/slot review is required"
-        );
-        return Err(ExitCode::FAILURE);
-    }
-    let (profile, mut assignments) = matches.remove(0);
-    assignments.sort_by(|a, b| a.component.cmp(&b.component));
-    let sources: Vec<(String, PathBuf)> = assignments
-        .iter()
-        .map(|assignment| {
-            (
-                assignment.component.clone(),
-                paths[assignment.carrier].path.clone(),
-            )
-        })
-        .collect();
-    let target = profile
-        .components
-        .iter()
-        .map(|component| format!("{}={}", component.component, component.target_encoding))
-        .collect::<Vec<_>>()
-        .join(",");
-    let order: Vec<(String, String)> = profile
-        .components
-        .iter()
-        .flat_map(|component| {
-            component
-                .construction_order
-                .iter()
-                .map(|key| (component.component.clone(), key.clone()))
-        })
-        .collect();
-    let mut flags = f.clone();
-    flags.retain(|(key, _)| key != "carrier" && key != "session");
-    for (component, path) in &sources {
-        flags.push((
-            "source".to_string(),
-            format!("{component}={}", path.to_string_lossy()),
-        ));
-    }
-    let mut prepared = prepare_with_registry(&flags, &target, &sources, &registry)?;
-    if let Err(error) = prepared.plan.apply_order(&order) {
-        return Err(bail(error));
-    }
-    if let Err(error) = prepared.plan.check_converts_something() {
-        return Err(bail(error));
-    }
-    let session = session_of(&flags, &prepared);
-    let source_values = assignments
-        .iter()
-        .map(|assignment| {
-            let mut fields = vec![
-                ("component", Value::str(assignment.component.clone())),
-                (
-                    "path",
-                    Value::str(paths[assignment.carrier].path.to_string_lossy().to_string()),
-                ),
-                ("projected", Value::Bool(assignment.projected)),
-            ];
-            if let Some(member) = &paths[assignment.carrier].member {
-                fields.push(("source_member", Value::str(member.clone())));
-            }
-            Value::obj(fields)
-        })
-        .collect();
-    let order_values = prepared
-        .plan
-        .ops
-        .iter()
-        .map(|operation| {
-            Value::arr(vec![
-                Value::str(operation.component.clone()),
-                Value::str(operation.out_key.clone()),
-            ])
-        })
-        .collect();
-    Ok(Value::obj(vec![
-        (
-            "carriers",
-            Value::arr(
-                paths
-                    .iter()
-                    .map(|carrier| {
-                        let mut fields = vec![(
-                            "path",
-                            Value::str(carrier.path.to_string_lossy().to_string()),
-                        )];
-                        if let Some(member) = &carrier.member {
-                            fields.push(("member", Value::str(member.clone())));
-                        }
-                        Value::obj(fields)
-                    })
-                    .collect(),
-            ),
-        ),
-        ("construction_order", Value::arr(order_values)),
-        ("converter", Value::str(prepared.plan.converter.clone())),
-        ("profile", Value::str(profile.name.clone())),
-        ("registry", Value::str(registry_locator)),
-        (
-            "registry_sha256",
-            Value::str(format!(
-                "sha256:{}",
-                tensorfs_core::sha256::hex_digest(&registry_bytes)
-            )),
-        ),
-        ("session", Value::str(session)),
-        ("sources", Value::arr(source_values)),
-        ("target", Value::str(target)),
-    ]))
+    let variant = flag(f, "spec-variant").and_then(|value| value.parse().ok());
+    source_core::plan_source(
+        &registry_locator,
+        &registry_bytes,
+        &carriers,
+        flag(f, "source-profile"),
+        variant,
+    )
+    .map(|plan| plan.value())
+    .map_err(bail)
 }
 
 pub fn cmd_source_plan(f: &Flags) -> ExitCode {
@@ -1205,12 +798,14 @@ fn prepare_closed_source_plan(
             format!("{component}={}", source.to_string_lossy()),
         ));
     }
-    let mut prepared = prepare_with_registry(&flags, &closed.target, &closed.sources, &registry)?;
+    let mut prepared =
+        source_core::prepare_with_registry(&closed.target, &closed.sources, &registry, None)
+            .map_err(bail)?;
     if let Err(error) = prepared.plan.apply_order(&closed.order) {
         return Err(bail(error));
     }
     if prepared.plan.converter != closed.converter
-        || session_of(&flags, &prepared) != closed.session
+        || source_core::session_of(&prepared) != closed.session
     {
         eprintln!(
             "REFUSED IDENTITY_MISMATCH: source plan converter/session differs from the existing prepare path"
@@ -1265,16 +860,7 @@ pub fn cmd_run_source(root: &Path, path: &Path) -> ExitCode {
 
 // ------------------------------------------------------------------ plan
 
-struct Prepared {
-    plan: Plan,
-    conv: &'static Converter,
-    seeds: Vec<(String, registry::Seed)>,
-    files: Vec<SourceFile>,
-    raws: Vec<Vec<u8>>,
-    verdicts: Vec<Banked>,
-    fps: Vec<Fingerprint>,
-    target: Target,
-}
+type Prepared = source_core::Prepared;
 
 pub(crate) fn construction_order(f: &Flags) -> Result<Vec<(String, String)>, ExitCode> {
     let path = match flag(f, "order") {
@@ -1332,107 +918,10 @@ pub(crate) fn construction_order(f: &Flags) -> Result<Vec<(String, String)>, Exi
 /// Headers in, plan out. The one function `plan`, `run` and the worker all go through, so
 /// a preview and a run cannot disagree about what was going to happen.
 fn prepare(f: &Flags, target: &str) -> Result<Prepared, ExitCode> {
-    let srcs = sources(f)?;
-    let reg = load_registry(f)?;
-    prepare_with_registry(f, target, &srcs, &reg)
-}
-
-fn prepare_with_registry(
-    f: &Flags,
-    target: &str,
-    srcs: &[(String, PathBuf)],
-    reg: &FingerprintRegistry,
-) -> Result<Prepared, ExitCode> {
-    let target = match Target::parse(target) {
-        Ok(t) => t,
-        Err(e) => return Err(bail(e)),
-    };
-    let seeds = specs_for(&target, f)?;
-    let specs = plain_specs(&seeds);
-
-    let (mut files, mut raws, mut verdicts, mut fps) =
-        (Vec::new(), Vec::new(), Vec::new(), Vec::new());
-    for (component, path) in srcs {
-        let (full, raw) = match read_carrier(path) {
-            Ok(v) => v,
-            Err(e) => return Err(bail(e)),
-        };
-        // A reviewed single-file prefix may project one component from a combined carrier.
-        // Try that closed projection first; ordinary component files fall through to their
-        // complete header. Authorization still comes only from the reviewed fingerprint.
-        let projected = convert::single_file_component(component, &full).ok();
-        let mut selected = None;
-        if let Some(view) = projected {
-            let fp = match fingerprint::fingerprint(component, &view) {
-                Ok(value) => value,
-                Err(e) => return Err(bail(e)),
-            };
-            if let Ok(banked) = reg.authorize(component, &fp) {
-                selected = Some((view, fp, banked));
-            }
-        }
-        let (h, fp, banked) = match selected {
-            Some(value) => value,
-            None => {
-                let fp = match fingerprint::fingerprint(component, &full) {
-                    Ok(value) => value,
-                    Err(e) => return Err(bail(e)),
-                };
-                let banked = match reg.authorize(component, &fp) {
-                    Ok(value) => value,
-                    Err(e) => return Err(bail(e)),
-                };
-                (full, fp, banked)
-            }
-        };
-        verdicts.push(banked);
-        fps.push(fp);
-        raws.push(raw);
-        files.push(SourceFile {
-            path: path.clone(),
-            header: h,
-        });
-    }
-
-    // One artifact, one converter. Two components whose reviewed entries disagree about
-    // the dialect is a review defect, not a merge.
-    let names: Vec<&str> = verdicts.iter().map(|b| b.converter.as_str()).collect();
-    if names.windows(2).any(|w| w[0] != w[1]) {
-        eprintln!(
-            "REFUSED AMBIGUOUS_CLASSIFICATION: the components' reviewed entries name \
-             different converters {names:?}"
-        );
-        return Err(ExitCode::FAILURE);
-    }
-    let conv = match convert::converter(names[0]) {
-        Ok(c) => c,
-        Err(e) => return Err(bail(e)),
-    };
-
-    let views: Vec<Source<'_>> = files
-        .iter()
-        .enumerate()
-        .map(|(i, sf)| Source::Carrier {
-            component: srcs[i].0.clone(),
-            file: i,
-            header: &sf.header,
-        })
-        .collect();
-    let plan = match convert::plan(conv, &views, &target, &specs, &Rekey::default()) {
-        Ok(p) => p,
-        Err(e) => return Err(bail(e)),
-    };
-    drop(views);
-    Ok(Prepared {
-        plan,
-        conv,
-        seeds,
-        files,
-        raws,
-        verdicts,
-        fps,
-        target,
-    })
+    let sources = sources(f)?;
+    let registry = load_registry(f)?;
+    let variant = flag(f, "spec-variant").and_then(|value| value.parse().ok());
+    source_core::prepare_with_registry(target, &sources, &registry, variant).map_err(bail)
 }
 
 fn print_plan(p: &Prepared) {
@@ -1481,7 +970,10 @@ fn print_plan(p: &Prepared) {
         Ok(n) => println!("declared     {n} B will be written"),
         Err(e) => println!("declared     REFUSED {}: {}", e.code.as_str(), e.detail),
     }
-    println!("topology     {}", topology_digest_of(&plan_topology(pl)));
+    println!(
+        "topology     {}",
+        topology_digest_of(&source_core::plan_topology(pl))
+    );
     println!(
         "cost         {} B of headers read, {} tensor bytes read",
         pl.header_bytes,
@@ -1587,46 +1079,9 @@ fn isolation(argv: &[String], f: &Flags) -> (Command, i64, String) {
 }
 
 fn session_of(f: &Flags, p: &Prepared) -> String {
-    if let Some(s) = flag(f, "session") {
-        return s.to_string();
-    }
-    let v = Value::obj(vec![
-        ("converter", Value::str(p.plan.converter.clone())),
-        (
-            "sources",
-            Value::arr(
-                p.files
-                    .iter()
-                    .zip(p.raws.iter())
-                    .map(|(sf, raw)| Value::str(source_digest(&sf.header, raw)))
-                    .collect(),
-            ),
-        ),
-        (
-            "topology",
-            Value::str(topology_digest_of(&plan_topology(&p.plan))),
-        ),
-        (
-            "order",
-            Value::arr(
-                p.plan
-                    .ops
-                    .iter()
-                    .map(|op| {
-                        Value::arr(vec![
-                            Value::str(op.component.clone()),
-                            Value::str(op.out_key.clone()),
-                        ])
-                    })
-                    .collect(),
-            ),
-        ),
-    ]);
-    tensorfs_core::ids::object_id(&canon::write(&v))
-        .trim_start_matches("sha256:")
-        .chars()
-        .take(16)
-        .collect()
+    flag(f, "session")
+        .map(str::to_string)
+        .unwrap_or_else(|| source_core::session_of(p))
 }
 
 /// The coordinator side of a run: it prepares and previews, then hands the whole job to an
@@ -1762,10 +1217,10 @@ pub fn cmd_worker(root: &Path, target: &str, f: &Flags) -> ExitCode {
 
     // The golden suite runs BEFORE any conversion: a converter whose own geometry does not
     // reassemble is not permitted to touch an artifact.
-    let golden = ok!(golden_suite(p.conv));
+    let golden = ok!(source_core::golden_suite(p.conv));
     println!("golden       {golden} cases reassembled bit-for-bit");
 
-    let predicted = topology_digest_of(&plan_topology(&p.plan));
+    let predicted = topology_digest_of(&source_core::plan_topology(&p.plan));
     // Qualification fixtures are build data, not model-store objects.
     for (_, seed) in &p.seeds {
         if let Some(v) = &seed.vectors {
@@ -1776,7 +1231,7 @@ pub fn cmd_worker(root: &Path, target: &str, f: &Flags) -> ExitCode {
         &store,
         &p.plan,
         &p.files,
-        &plain_specs(&p.seeds),
+        &source_core::plain_specs(&p.seeds),
         &configs,
         &session,
     ));
@@ -1862,7 +1317,7 @@ pub fn cmd_worker(root: &Path, target: &str, f: &Flags) -> ExitCode {
             .files
             .iter()
             .zip(p.raws.iter())
-            .map(|(sf, raw)| (source_digest(&sf.header, raw), 1u64))
+            .map(|(sf, raw)| (source_core::source_digest(&sf.header, raw), 1u64))
             .collect(),
         proposed_header: out.header_ref.clone(),
         // The candidate set is EVERY AND ONLY what the manifest reaches. Stamp re-walks it
@@ -1987,46 +1442,6 @@ pub fn cmd_worker(root: &Path, target: &str, f: &Flags) -> ExitCode {
 /// Under that pattern the correct head-interleaved split and the wrong flat split produce
 /// BYTE-IDENTICAL output, and the wrong-order arm silently cannot fire. A test pattern
 /// whose period shares a factor with the geometry under test proves nothing.
-fn golden_bytes(seed: &str, n: u64) -> Vec<u8> {
-    use std::io::Read;
-    let mut v = vec![0u8; n as usize];
-    crate::ckpt::Noise::new(seed, n)
-        .read_exact(&mut v)
-        .expect("keyed stream");
-    v
-}
-
-/// Every reviewed converter's geometry, exercised on real byte patterns before it is
-/// allowed near an artifact. A transform that does not reassemble its own input is the
-/// head-interleave-vs-concat error, which does not crash and serves garbage.
-fn golden_suite(c: &Converter) -> tensorfs_core::err::Result<usize> {
-    let cases = convert::golden_cases(c);
-    let mut n = 0;
-    for (name, x) in cases {
-        let src = golden_bytes(name, x.in_bytes());
-        if !x.reassembles(&src)? {
-            return tensorfs_core::err::refuse(
-                tensorfs_core::err::Code::GOLDEN_MISMATCH,
-                format!(
-                    "{}: golden case {name} does not reassemble its own input",
-                    c.name
-                ),
-            );
-        }
-        n += 1;
-    }
-    Ok(n)
-}
-
-// ------------------------------------------------------------------ re-ingest
-
-/// Re-ingest an ALREADY-CANONICAL checkpoint. This is the inherit-by-reference proof:
-/// nothing is read, nothing is hashed, nothing is uploaded — the segment references simply
-/// carry into a new header, and the CAS is asserted to already hold every one of them.
-///
-/// With no `--rekey`, the plan changes nothing at all and CONVERTS_NOTHING fires: a
-/// bit-identical copy must never stamp as a new encoding, and the existing checkpoint
-/// already IS the result. With one, the keys move and the bytes do not.
 pub fn cmd_reingest(root: &Path, header_hex: &str, target: &str, f: &Flags) -> ExitCode {
     let t0 = Instant::now();
     let store = ok!(Store::open(root));
@@ -2043,9 +1458,10 @@ pub fn cmd_reingest(root: &Path, header_hex: &str, target: &str, f: &Flags) -> E
     };
     let header = ok!(ck::load_header(&store, &href));
     let target = ok!(Target::parse(target));
-    let seeds = match specs_for(&target, f) {
+    let variant = flag(f, "spec-variant").and_then(|value| value.parse().ok());
+    let seeds = match source_core::specs_for(&target, variant) {
         Ok(s) => s,
-        Err(c) => return c,
+        Err(error) => return bail(error),
     };
     let mut rekey = Rekey::default();
     for (k, v) in f.iter() {
@@ -2067,7 +1483,7 @@ pub fn cmd_reingest(root: &Path, header_hex: &str, target: &str, f: &Flags) -> E
         conv,
         &views,
         &target,
-        &plain_specs(&seeds),
+        &source_core::plain_specs(&seeds),
         &rekey
     ));
     drop(views);
@@ -2106,7 +1522,7 @@ pub fn cmd_reingest(root: &Path, header_hex: &str, target: &str, f: &Flags) -> E
         &store,
         &plan,
         &[],
-        &plain_specs(&seeds),
+        &source_core::plain_specs(&seeds),
         &header.configs,
         &session,
     ));
@@ -2259,7 +1675,7 @@ pub fn cmd_golden() -> ExitCode {
     let (mut pass, mut red) = (0usize, 0usize);
     for c in convert::CONVERTERS.iter() {
         for (name, x) in convert::golden_cases(c) {
-            let src = golden_bytes(name, x.in_bytes());
+            let src = source_core::golden_bytes(name, x.in_bytes());
             match x.reassembles(&src) {
                 Ok(true) => {
                     pass += 1;
