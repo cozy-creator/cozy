@@ -11,6 +11,10 @@ import (
 	"github.com/cozy-creator/cozy/internal/exit"
 )
 
+// MaxPackageInstallDownloads is one project wheel plus the complete bounded
+// dependency-wheel closure accepted by package publication.
+const MaxPackageInstallDownloads = 129
+
 type PackageUpload struct {
 	Kind            string            `json:"kind,omitempty"`
 	Path            string            `json:"path,omitempty"`
@@ -124,5 +128,10 @@ func (c *Client) PackageDownloads(ctx context.Context, ref Ref, release string) 
 	e := c.do(ctx, call{method: http.MethodPost,
 		path: path, body: struct{}{}, strict: true,
 		responseBytes: 16 << 20}, &out)
+	if e == nil && (len(out.Downloads) == 0 || len(out.Downloads) > MaxPackageInstallDownloads) {
+		e = exit.Named(exit.Structural, "hub.package_download_plan_invalid",
+			"Tensorhub returned %d package wheel downloads; expected 1 through %d",
+			len(out.Downloads), MaxPackageInstallDownloads)
+	}
 	return out, e
 }
