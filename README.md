@@ -19,6 +19,10 @@ local indexes and coordination. Repository files rebuild released-manifest looku
 holds protect in-flight writes from GC; derived transactions are resumable local work; verified
 blob rows avoid rehashing unchanged files. SQL never makes repository content durable.
 
+A writable local TensorFS root has exactly one host owner. SQLite/advisory locks coordinate
+processes on that host; they are not a cross-host lock service and must not sit on NFS as shared
+mutation authority. Multi-host publication and GC use Tensorhub's R2/PostgreSQL control plane.
+
 TensorFS has exactly three stored schemas:
 
 1. Repository JSON, typed by `repos/`.
