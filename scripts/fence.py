@@ -26,7 +26,7 @@ def fence_version_contract():
     except (KeyError, OSError, ValueError) as error:
         return [str(error)], "source versions disagree"
     return [], (
-        "current development identity is "
+        "current release identity is "
         f"Cargo {cargo_version} / Python {python_version}"
     )
 
